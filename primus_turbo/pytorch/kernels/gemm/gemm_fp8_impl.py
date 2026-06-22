@@ -368,25 +368,12 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            # MXFP8 8-wave kernel (compute-only): NT only (C = a @ b^T), E4M3 operands,
-            # bf16 out. Per-1x32 E8M0 block scales (a_scale/b_scale are [M,K//32] /
-            # [N,K//32] tensors -- NOT scalar). The host preshuffle handles M % 64 and
-            # N % 64 (partial 256-block B-scale zero-padded; in-kernel buffer/SRD clamp
-            # drops OOB rows/cols). SW pipeline needs K % 128 == 0 and K_ITERS >= 2 (K >= 256).
-            supported &= a.ndim == 2 and b.ndim == 2
-            supported &= (not trans_a) and trans_b
-            supported &= a.dtype == float8_e4m3 and b.dtype == float8_e4m3
-            supported &= out_dtype == torch.bfloat16
-            if not supported:
-                return supported
-            m, k, n = a.shape[0], a.shape[1], b.shape[0]
-            supported &= (k % 128 == 0) and (k >= 256)
-            supported &= m % 64 == 0 and n % 64 == 0
-            # Block scales: [M, K//32] / [N, K//32], 1-byte E8M0 (uint8 or float8_e8m0fnu).
-            supported &= a_scale_inv.ndim == 2 and a_scale_inv.shape == (m, k // 32)
-            supported &= b_scale_inv.ndim == 2 and b_scale_inv.shape == (n, k // 32)
-            supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
-            return supported
+            # Dispatcher receives raw E8M0 scales; the FlyDSL kernel now requires
+            # quant-emitted preshuffled int32 scales. Incompatible -- return False
+            # so the dispatcher falls back to the Turbo backend. The FlyDSL mxfp8
+            # path is reached directly via gemm_mxfp8_flydsl_kernel (after quant
+            # with ScalingRecipe(preshuffle_layout=1/3)).
+            return False
 
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
         supported &= out_dtype in (torch.bfloat16, torch.float16)

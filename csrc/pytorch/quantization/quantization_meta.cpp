@@ -202,12 +202,12 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
     return {output.view(at::kFloat4_e2m1fn_x2), scale_tensor.view(at::kFloat8_e8m0fnu)};
 }
 
-std::vector<at::Tensor>
-quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype,
-                         const int64_t padding_align_size, const bool rowwise_use_2d_block,
-                         const bool colwise_use_2d_block, const bool shuffle_rowwise_scale,
-                         const bool shuffle_rowwise, const bool shuffle_colwise_scale,
-                         const bool shuffle_colwise) {
+std::vector<at::Tensor> quantize_mxfp8_dual_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
+    const bool rowwise_use_2d_block, const bool colwise_use_2d_block,
+    const bool shuffle_rowwise_scale, const bool shuffle_rowwise, const bool shuffle_colwise_scale,
+    const bool shuffle_colwise, const int64_t preshuffle_layout, const int64_t preshuffle_n_tiles,
+    const int64_t col_preshuffle_layout, const int64_t col_preshuffle_n_tiles) {
     using namespace primus_turbo::detail;
 
     std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {

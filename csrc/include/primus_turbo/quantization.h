@@ -75,6 +75,14 @@ struct ScalingRecipe {
 
     bool shuffle_scale = false;
     bool shuffle_out   = false;
+
+    // FlyDSL mxfp8 GEMM preshuffle fused into the scale write.
+    // layout: 0=off, 1=A-broadcast, 2=A-packed, 3=B-combined-broadcast, 4=B-combined-packed.
+    // n_tiles: sub-tile fanout (A: BLOCK_M//64; B: 4).
+    // pack: 1=broadcast (one E8M0 byte broadcast to all 4 bytes of i32); >1=opsel byte-pack.
+    int preshuffle_layout  = 0;
+    int preshuffle_n_tiles = 0;
+    int preshuffle_pack    = 1;
 };
 
 constexpr int FP32_MANTISSA_BITS     = 23;

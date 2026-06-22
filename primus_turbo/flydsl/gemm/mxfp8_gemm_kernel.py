@@ -781,24 +781,12 @@ def gemm_mxfp8_flydsl_kernel(
     ``trans_c=True`` returns ``out.t().contiguous()`` (mirrors the tensorwise
     FlyDSL wrapper).
 
-    Computes the per-32-K-block E8M0-scaled product with the scale folded into
-    the MFMA (``v_mfma_scale_f32_16x16x128_f8f6f4``). NT only (compute-only PR;
-    NN/TN dropped):
-      - NT (F, T): A [M,K], B [N,K] (B^T storage), C = a @ b^T.
-      - any other (trans_a, trans_b): unsupported (raises).
+    NT only (trans_a=False, trans_b=True): A [M,K], B [N,K], C = a @ b^T.
 
-    COMPUTE-ONLY: the E8M0 scales arrive RAW (no quant preshuffle) as ``a_scale``
-    [free=M, K//32] and ``b_scale`` [free=N, K//32] uint8/e8m0, and are host-preshuffled
-    here (``preshuffle_scale`` / ``preshuffle_scale_b_comb``, broadcast layout =>
-    scale_pack=1). BLOCK_M is fixed at 256 so the A-scale fanout n_tiles = 4 is constant;
-    autotune sweeps only GROUP_M / num_xcd / group_n. The quant-emitted preshuffle (drops
-    the host repack + enables opsel byte-pack) lands in the separate quant PR.
-
-    Args:
-      a, b:     float8_e4m3fn, shapes per the layout above.
-      a_scale:  raw A-operand E8M0 scale [free=M, K//32] (uint8/e8m0).
-      b_scale:  raw B-operand E8M0 scale [free=N, K//32] (uint8/e8m0).
-      out_dtype: bf16 (the kernel epilogue stores bf16).
+    The E8M0 scales are PRE-SHUFFLED by the quant kernel (no host repack):
+    ``a_scale`` is the A-operand preshuffle (layout 1, n_tiles=BLOCK_M//64=4)
+    and ``b_scale`` is the combined-B preshuffle (layout 3), both flat int32
+    buffers consumed directly by ``ScaleS2R`` / ``ScaleBComb``.
 
     Constraints: K % 128 == 0 and K >= 256; M % 64 == 0; N % 64 == 0.
     """
@@ -816,29 +804,12 @@ def gemm_mxfp8_flydsl_kernel(
         )
     assert K == Kb, f"K mismatch: a {a.shape}, b {b.shape} (layout {layout})"
     assert K % 128 == 0 and K >= 256, f"K must be a multiple of 128 and >= 256, got {K}"
-    # M (BLOCK_M=256) / N (BLOCK_N=256) need only be 64-multiples: partial output tiles
-    # are handled in-kernel by buffer/SRD clamping (data + pre-shuffled scale reads bound
-    # by num_records, StoreC bounds rows/cols), so non-256 shapes run without host repack.
     assert M % 64 == 0, f"M must be a multiple of 64 (A-scale preshuffle), got {M}"
     assert N % 64 == 0, f"N must be a multiple of 64 (combined-B scale preshuffle), got {N}"
 
-    # C is passed as 2D [M, N] (NOT flat): FlyDSL packs each shape dim as int32, so a 1D
-    # [M*N] view overflows when M*N > 2^31; StoreCPlain addresses C via its i64 per-tile
-    # re-basing, so the 2D shape is only metadata.
-    # COMPUTE-ONLY: scales arrive as RAW E8M0 [free, K//32] (free = M for A, N for B),
-    # host-preshuffled here into the kernel's broadcast layout (scale_pack=1). The fused
-    # quant-emitted preshuffle (no host repack) is deferred to the quant PR.
-    n_tiles_a = _BLOCK_M // 64
-    assert (
-        a_scale.element_size() == 1
-    ), f"a_scale must be 1-byte E8M0 (uint8/float8_e8m0fnu), got {a_scale.dtype}"
-    assert (
-        b_scale.element_size() == 1
-    ), f"b_scale must be 1-byte E8M0 (uint8/float8_e8m0fnu), got {b_scale.dtype}"
-    a_e8 = a_scale.contiguous().view(torch.uint8)
-    b_e8 = b_scale.contiguous().view(torch.uint8)
-    a_sp = preshuffle_scale(a_e8, K, n_tiles_a).view(torch.int32).reshape(-1)
-    b_sp = preshuffle_scale_b_comb(b_e8, K).view(torch.int32).reshape(-1)
+    # Scales arrive pre-shuffled from the quant kernel; just view as flat int32.
+    a_sp = a_scale.contiguous().view(torch.int32).reshape(-1)
+    b_sp = b_scale.contiguous().view(torch.int32).reshape(-1)
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)
     a8 = as_i8_flat(a)
     b8 = as_i8_flat(b)

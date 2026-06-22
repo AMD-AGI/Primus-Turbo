@@ -403,10 +403,9 @@ def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tun
     )
 
 
-# FlyDSL MXFP8 8-wave dense GEMM (compute-only): NT fwd + NT-fold bwd, E4M3 + bf16.
-# Covers aligned (m/n % 256 == 0) AND partial-tile tail (m/n % 64 == 0 but not % 256:
-# m=320, n=384) -> in-kernel buffer/SRD clamp + zero-padded host B-scale preshuffle.
-# Constraints: m % 64 == 0, n % 64 == 0, k % 128 == 0 and k >= 256.
+# MXFP8 MX_BLOCKWISE dispatcher test: FlyDSL backend requires quant-emitted preshuffled
+# scales and is not reached via the dispatcher (raw E8M0 path). Tests fall through to
+# Turbo backend via auto-dispatch (backend=None). Covers aligned + partial-tile shapes.
 @pytest.mark.parametrize("m", [256, 320, 512])
 @pytest.mark.parametrize("n", [256, 384, 1024])
 @pytest.mark.parametrize("k", [256, 512])
@@ -424,18 +423,21 @@ def test_gemm_fp8_mx_flydsl(m, n, k, format, dtype):
         format=format,
         dtype=dtype,
         granularity=ScalingGranularity.MX_BLOCKWISE,
-        backend=BackendType.FLYDSL,
+        backend=None,
         auto_tune=False,
         block_size=32,
     )
 
 
-# Direct FlyDSL MXFP8 kernel test (NT only; compute-only PR). Scales are passed RAW
-# [free=M, K//32] (A) / [free=N, K//32] (B); the kernel host-preshuffles internally.
-# Covers aligned + partial-tile tail (320/384). compute-only: scale_pack=1.
+# Direct FlyDSL MXFP8 kernel test (NT only). Scales are quant-emitted preshuffled
+# int32 (quantize_mxfp8_impl with ScalingRecipe preshuffle_layout). Covers aligned
+# + partial-tile tail (320/384). scale_pack=1 (broadcast layout).
 @pytest.mark.parametrize("m,n,k", [(256, 256, 256), (320, 384, 512)])
 def test_gemm_fp8_mx_flydsl_direct(m, n, k):
     from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        quantize_mxfp8_impl,
+    )
 
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
@@ -445,23 +447,46 @@ def test_gemm_fp8_mx_flydsl_direct(m, n, k):
 
     device = "cuda:0"
     torch.manual_seed(0)
+    n_tiles_a = 256 // 64  # BLOCK_M // 64 = 4
 
-    def mxq(x):
-        return QuantizedTensor.quantize(
-            x,
-            float8_e4m3,
-            ScalingGranularity.MX_BLOCKWISE,
-            axis=-1,
-            block_size=32,
-            scaling_recipe=ScalingRecipe(),
-        )
+    a_f = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    b_f = torch.randn(n, k, device=device, dtype=torch.bfloat16)
 
-    aq = mxq(torch.randn(m, k, device=device, dtype=torch.bfloat16))  # qdata[M,K], sc[M,K//32]
-    bq = mxq(torch.randn(n, k, device=device, dtype=torch.bfloat16))  # qdata[N,K], sc[N,K//32]
-    ref = aq.dequantize() @ bq.dequantize().t()  # [M,N] reference
+    # Quantize A: rowwise, preshuffle_layout=1 (A-broadcast), n_tiles=4
+    aq, a_sp, _, _ = quantize_mxfp8_impl(
+        a_f,
+        float8_e4m3,
+        None,
+        32,
+        with_trans=True,
+        scaling_recipe=ScalingRecipe(preshuffle_layout=1, preshuffle_n_tiles=n_tiles_a),
+        scaling_recipe_for_trans=ScalingRecipe(),
+    )
+    # Quantize B (stored as [N,K]): rowwise, preshuffle_layout=3 (B-comb-broadcast)
+    bq, b_sp, _, _ = quantize_mxfp8_impl(
+        b_f,
+        float8_e4m3,
+        None,
+        32,
+        with_trans=True,
+        scaling_recipe=ScalingRecipe(preshuffle_layout=3, preshuffle_n_tiles=4),
+        scaling_recipe_for_trans=ScalingRecipe(),
+    )
 
-    # NT: a[M,K], b[N,K] (B stored transposed)
-    out = gemm_mxfp8_flydsl_kernel(aq.qdata, aq.scale_inv, bq.qdata, bq.scale_inv, out_dtype=torch.bfloat16)
+    # Reference: dequantize via raw scales (not preshuffled)
+    aq_ref, a_sc_ref = quantize_mxfp8_impl(a_f, float8_e4m3, 1, 32)
+    bq_ref, b_sc_ref = quantize_mxfp8_impl(b_f, float8_e4m3, 1, 32)
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        dequantize_mxfp8_impl,
+    )
+
+    ref = (
+        dequantize_mxfp8_impl(aq_ref, torch.bfloat16, 1, 32, a_sc_ref)
+        @ dequantize_mxfp8_impl(bq_ref, torch.bfloat16, 1, 32, b_sc_ref).t()
+    )
+
+    # NT: a[M,K] + preshuffled A-scale (int32 flat), b[N,K] + preshuffled B-scale (int32 flat)
+    out = gemm_mxfp8_flydsl_kernel(aq, a_sp, bq, b_sp, out_dtype=torch.bfloat16)
     snr = compute_snr(ref, out)
     print(f"\n[mx_flydsl_direct nt] M={m} N={n} K={k} SNR={snr:.2f} dB")
     assert snr > 25, f"SNR too low: {snr:.2f}"
