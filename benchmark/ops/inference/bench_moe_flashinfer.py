@@ -672,7 +672,10 @@ def save_excel(path, args, cfg, tp_size, ep_size, rows):
 
     # Extra rows appended to the config sheet so the cross-backend comparability
     # caveats travel with every exported result and cannot be overlooked.
-    config_items = list(meta.items())
+    # Stringify values so the round-trip stays faithful: Excel stores bool as a
+    # distinct cell type, and since Python `bool` subclasses `int` (1 == True), a
+    # mixed bool/int column reads ints equal to 1 back as True.
+    config_items = [(k, str(v)) for k, v in meta.items()]
     config_items.append(("", ""))
     config_items.append(("KNOWN ISSUES", "cross-backend comparability vs bench_moe_aiter.py"))
     for iid, applies_to, summary in KNOWN_ISSUES:
