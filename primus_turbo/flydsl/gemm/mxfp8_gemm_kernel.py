@@ -38,11 +38,10 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     S2RLoader,
     _robust_time,
-    as_i8_flat,
     block_mn,
     ceildiv,
     compute_global_swizzle,
-    make_fp8_buffer_tensor,
+    make_fp8_buffer_tensor_rebased,
     make_row_band_resource,
     make_value_attrs,
     wait_barrier,
@@ -53,7 +52,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import buffer_ops, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -371,13 +370,25 @@ def _compile_mxfp8_nt(
         pid = xcd_remap_pid(fx.block_idx.x, num_pid_m * n_blocks, num_xcd)
         block_m, block_n = block_mn(pid, num_pid_m, n_blocks, GROUP_M, group_n)
 
-        A0_gl_offset = (block_m * BLOCK_M) * K
-        A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
-        B0_gl_offset = (block_n * BLOCK_N) * K
-        B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
+        # i64 input re-base (same as tensorwise NT): fold the per-tile row base
+        # (m_row*K, n_row*K) into the SRD base in T.index (64-bit); A/B_T are
+        # K-contiguous (foldable), so the running k*BLOCK_K offset stays small int32
+        # -> no 2^31/2^32 cap. Output StoreCPlain already re-bases per band in i64.
+        a_base = arith.index_cast(T.index, block_m * BLOCK_M) * arith.index(K)
+        b_base = arith.index_cast(T.index, block_n * BLOCK_N) * arith.index(K)
+        a_nrec = (
+            arith.index_cast(T.index, c_m) - arith.index_cast(T.index, block_m * BLOCK_M)
+        ) * arith.index(K)
+        b_nrec = (
+            arith.index_cast(T.index, c_n) - arith.index_cast(T.index, block_n * BLOCK_N)
+        ) * arith.index(K)
+        A0_gl_offset = 0
+        A1_gl_offset = LDS_BLOCK_M * K
+        B0_gl_offset = 0
+        B1_gl_offset = LDS_BLOCK_N * K
 
-        gA = make_fp8_buffer_tensor(A, F8_IR_t)
-        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+        gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
+        gB = make_fp8_buffer_tensor_rebased(B_T, F8_IR_t, b_base, b_nrec)
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -811,8 +822,11 @@ def gemm_mxfp8_flydsl_kernel(
     a_sp = a_scale.contiguous().view(torch.int32).reshape(-1)
     b_sp = b_scale.contiguous().view(torch.int32).reshape(-1)
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)
-    a8 = as_i8_flat(a)
-    b8 = as_i8_flat(b)
+    # Keep 2D int8 views (NOT flat 1D): FlyDSL marshals each shape dim as int32, so a
+    # 1D [M*K] view overflows when M*K > 2^31. The kernel addresses via i64 SRD re-base
+    # (extract_base_index reads only the base ptr), so the 2D shape is just metadata.
+    a8 = a.contiguous().view(torch.int8)
+    b8 = b.contiguous().view(torch.int8)
     # Per-shape cfg: first call benches GROUP_M/num_xcd/group_n (BLOCK_M fixed 256),
     # caches the winner by (M,N,K,layout); the same pre-shuffled a_sp feeds all candidates.
     bm, gm, xcd, gn = _autotune_mxfp8(a8, b8, out, a_sp, b_sp, M, N, K, out_dtype, layout)
