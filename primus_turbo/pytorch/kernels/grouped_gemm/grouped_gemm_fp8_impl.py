@@ -514,37 +514,45 @@ def _asm_co_module_launch(
         )
 
 
-# ── ASM .co fwd/dgrad launcher ──────────────────────────────────────────────
-_ASM_CO_FWD_CO_PATH = "/opt/asm_ggemm/combined_v5.co"
-_ASM_CO_FWD_KERNEL_NAME = "_grouped_fp8_persistent_gemm_kernel"
+# ── ASM .hsaco DGRAD launcher (optimized Triton kernels, per-shape) ──────────
+_ASM_CO_DGRAD_HSACO_DIR = os.environ.get("PRIMUS_TURBO_ASM_CO_DIR", "/opt/asm_ggemm")
+_ASM_CO_DGRAD_KERNEL_NAME = "_grouped_fp8_persistent_gemm_kernel"
+_ASM_CO_DGRAD_LDS_BYTES = 131072
 
-_ASM_CO_FWD_MODULE: ctypes.c_void_p | None = None
-_ASM_CO_FWD_FUNC: ctypes.c_void_p | None = None
+_ASM_CO_DGRAD_HSACO_PATHS: dict[int, str] = {
+    2880: os.path.join(_ASM_CO_DGRAD_HSACO_DIR, "dgrad_down_2880.hsaco"),
+    5760: os.path.join(_ASM_CO_DGRAD_HSACO_DIR, "dgrad_gate_up_5760.hsaco"),
+}
+
+_ASM_CO_DGRAD_MODULES: dict[int, ctypes.c_void_p] = {}
+_ASM_CO_DGRAD_FUNCS: dict[int, ctypes.c_void_p] = {}
 
 
-def _get_asm_co_fwd_func() -> ctypes.c_void_p:
-    """Load and cache the fwd/dgrad .co function handle."""
-    global _ASM_CO_FWD_MODULE, _ASM_CO_FWD_FUNC
-    if _ASM_CO_FWD_FUNC is None:
+def _get_asm_co_dgrad_func(k: int) -> ctypes.c_void_p:
+    """Load and cache the DGRAD .hsaco function handle keyed by K dimension."""
+    if k not in _ASM_CO_DGRAD_FUNCS:
+        path = _ASM_CO_DGRAD_HSACO_PATHS[k]
         hip = _get_libhip()
         mod = ctypes.c_void_p()
-        rc = hip.hipModuleLoad(ctypes.byref(mod), _ASM_CO_FWD_CO_PATH.encode())
+        rc = hip.hipModuleLoad(ctypes.byref(mod), path.encode())
         if rc != 0:
             hip.hipGetErrorString.restype = ctypes.c_char_p
             raise RuntimeError(
-                f"hipModuleLoad({_ASM_CO_FWD_CO_PATH}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
+                f"hipModuleLoad({path}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
             )
         func = ctypes.c_void_p()
-        rc = hip.hipModuleGetFunction(ctypes.byref(func), mod, _ASM_CO_FWD_KERNEL_NAME.encode())
+        rc = hip.hipModuleGetFunction(
+            ctypes.byref(func), mod, _ASM_CO_DGRAD_KERNEL_NAME.encode()
+        )
         if rc != 0:
             hip.hipGetErrorString.restype = ctypes.c_char_p
             raise RuntimeError(
-                f"hipModuleGetFunction({_ASM_CO_FWD_KERNEL_NAME}) failed rc={rc}: "
-                f"{hip.hipGetErrorString(rc)}"
+                f"hipModuleGetFunction({_ASM_CO_DGRAD_KERNEL_NAME}) from {path} "
+                f"failed rc={rc}: {hip.hipGetErrorString(rc)}"
             )
-        _ASM_CO_FWD_MODULE = mod
-        _ASM_CO_FWD_FUNC = func
-    return _ASM_CO_FWD_FUNC
+        _ASM_CO_DGRAD_MODULES[k] = mod
+        _ASM_CO_DGRAD_FUNCS[k] = func
+    return _ASM_CO_DGRAD_FUNCS[k]
 
 
 def _launch_asm_co_fwd_dgrad(
@@ -557,19 +565,36 @@ def _launch_asm_co_fwd_dgrad(
     out_dtype: torch.dtype,
     num_cu: int | None,
 ) -> torch.Tensor:
-    """Launch hand-tuned fwd/dgrad .co kernel via HIP module API.
+    """Launch optimized DGRAD .hsaco kernel (trans_b=True) via HIP module API.
 
-    Kernarg layout (96 bytes) matches ``asm_co_grouped_gemm_fp8`` in asm_co_grouped_gemm.cpp.
+    Uses per-shape optimized Triton kernels with tile_cumsum persistent scheduling.
+    Kernarg layout (84 bytes in 96-byte buffer):
+      7 pointers: A, B, C, A_scale, B_scale, group_offs, tile_cumsum
+      7 int32s:   G, N, K, stride_am, stride_bg, stride_bn, stride_cm
     """
     m = a.shape[0]
     k = a.shape[1]
-    e = b.shape[0]
-    n = b.shape[1] if trans_b else b.shape[2]
+    g = b.shape[0]
+    n = b.shape[1]  # trans_b=True → N is dim 1
     out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+
+    blk_m = 256
+    blk_n = 256
+    num_pid_n = (n + blk_n - 1) // blk_n
+    tile_cumsum = torch.empty(g + 1, device=a.device, dtype=torch.int32)
+    _compute_tile_cumsum_kernel[(1,)](
+        group_offs,
+        tile_cumsum,
+        g,
+        num_pid_n,
+        BLOCK_SIZE_M=blk_m,
+    )
+
+    func = _get_asm_co_dgrad_func(k)
 
     buf = ctypes.create_string_buffer(96)
     struct.pack_into(
-        "<QQQQQQ",
+        "<QQQQQQQ",
         buf,
         0,
         a.data_ptr(),
@@ -578,27 +603,28 @@ def _launch_asm_co_fwd_dgrad(
         a_scales.data_ptr(),
         b_scales.data_ptr(),
         group_offs.data_ptr(),
+        tile_cumsum.data_ptr(),
     )
     struct.pack_into(
-        "<iiiiiiii",
+        "<iiiiiii",
         buf,
-        48,
-        e,
+        56,
+        g,
         n,
         k,
-        k,
-        n * k,
-        k,
-        n,
-        1,
+        a.stride(0),       # stride_am = K
+        b.stride(0),       # stride_bg = N*K
+        b.stride(1),       # stride_bn = K (trans_b=True, B is [G,N,K])
+        out.stride(0),     # stride_cm = N
     )
 
     _asm_co_module_launch(
-        _get_asm_co_fwd_func(),
+        func,
         buf,
         num_cu,
         a.device,
-        f"fwd/dgrad K={k}, N={n}",
+        f"dgrad K={k}, N={n}",
+        lds_bytes=_ASM_CO_DGRAD_LDS_BYTES,
     )
     return out
 
@@ -607,7 +633,8 @@ class GroupedGEMMFP8ASMCOBackend(KernelBackend):
     """Hand-tuned AMDGCN assembly (.co/.hsaco) backend for FP8 grouped GEMM fwd/dgrad.
 
     Handles two code paths:
-      - DGRAD (trans_b=True): uses combined_v5.co with 6-pointer kernarg layout
+      - DGRAD (trans_b=True): uses per-shape optimized .hsaco files with 7-pointer
+        kernarg layout (includes tile_cumsum_ptr), keyed by K dimension
       - FWD   (trans_b=False): uses per-shape .hsaco files with 7-pointer kernarg
         layout (includes tile_cumsum_ptr)
 
@@ -1318,6 +1345,7 @@ def grouped_gemm_fp8_impl(
 
     # ASM_CO mode: route FWD/DGRAD to ASM only when the corresponding per-pass
     # env var is set; otherwise fall back to Triton.
+    # DGRAD uses per-shape optimized .hsaco (tile_cumsum persistent scheduling).
     if user_backend_enum == BackendType.ASM_CO:
         _pass = "DGRAD" if trans_b else "FWD"
         use_asm = (not trans_b and _asm_fwd_enabled()) or (trans_b and _asm_dgrad_enabled())
