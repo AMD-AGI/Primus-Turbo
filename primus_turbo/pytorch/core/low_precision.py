@@ -86,7 +86,7 @@ try:
     else:
         float4_e2m1fn_x2 = None
 except AttributeError:
-    raise RuntimeError("Your PyTorch build does not support FP8 types.")
+    raise RuntimeError("Your PyTorch build does not support FP8 types.") from None
 
 ###################################################
 

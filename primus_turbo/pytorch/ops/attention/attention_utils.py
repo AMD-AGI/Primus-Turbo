@@ -63,7 +63,9 @@ def _infer_qkv_format(
         if s0 >= s2 >= s1:
             return "bhsd"
 
-        assert False, f"Cannot infer qkv layout from shape {tuple(t.size())} and strides {tuple(t.stride())}"
+        raise AssertionError(
+            f"Cannot infer qkv layout from shape {tuple(t.size())} and strides {tuple(t.stride())}"
+        )
 
     assert q.ndim == 4, f"Expected 4-D tensor for q, got {q.ndim}-D"
     q_format = _infer_format(q)
@@ -79,7 +81,7 @@ def _infer_qkv_format(
     return q_format
 
 
-def block_scaling_node(tensor, use_fp8, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_f8_fwd_dtype()):
+def block_scaling_node(tensor, use_fp8, BLOCK_M=FIXED_BLOCK_M, float8_dtype=None):
     """
     Used to scale tensor in per-block mode
 
@@ -92,6 +94,8 @@ def block_scaling_node(tensor, use_fp8, BLOCK_M=FIXED_BLOCK_M, float8_dtype=get_
         fp8tensor(Tensor): tensor after blockwise quant
         unscale_tensor(Tensor): tensor for unscale quanted tensor from fp8 to bf16
     """
+    if float8_dtype is None:
+        float8_dtype = get_f8_fwd_dtype()
     if use_fp8:
         tensor = tensor.permute(0, 2, 1, 3)  # [B, H, L, D]
         B, H, L, D = tensor.shape

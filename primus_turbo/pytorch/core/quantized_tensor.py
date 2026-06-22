@@ -414,7 +414,7 @@ class QuantizedTensor(torch.Tensor):
                 scaling_recipe=self._scaling_recipe,
             )
         else:
-            assert False, "Unsupported dtype"
+            raise AssertionError("Unsupported dtype")
 
         # TODO(ruibin): fused unpad in dequantize kernel
         if out.ndim == 2:
@@ -422,7 +422,7 @@ class QuantizedTensor(torch.Tensor):
         elif out.ndim == 3:
             out = out[:, :, : self.size(-1)].contiguous()
         else:
-            assert False, "Unsupported ndim"
+            raise AssertionError("Unsupported ndim")
 
         return out
 

@@ -91,7 +91,7 @@ try:
         float8_e4m3 = jnp.float8_e4m3fnuz
         float8_e5m2 = jnp.float8_e5m2fnuz
 except AttributeError:
-    raise RuntimeError("Your JAX build does not support FP8 types.")
+    raise RuntimeError("Your JAX build does not support FP8 types.") from None
 
 ###################################################
 

@@ -48,7 +48,7 @@ def get_hf_torch_dtype(hf_config):
         try:
             torch_dtype = getattr(torch, hf_config.torch_dtype)
         except AttributeError:
-            raise ValueError(f"Invalid torch_dtype string: {hf_config.torch_dtype}")
+            raise ValueError(f"Invalid torch_dtype string: {hf_config.torch_dtype}") from None
     else:
         torch_dtype = hf_config.torch_dtype
     return torch_dtype

@@ -345,7 +345,7 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> str:
     return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
 
 
-class AutoKernelDispatcher(ABC):
+class AutoKernelDispatcher(ABC):  # noqa: B024
     """
     Base class for auto kernel dispatcher.
     """
