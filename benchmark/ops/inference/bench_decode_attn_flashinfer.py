@@ -37,8 +37,8 @@ import contextlib
 import os
 from datetime import datetime
 
-import torch
 import flashinfer
+import torch
 
 # family "gqa": num_q_heads, num_kv_heads, head_dim.
 # family "mla": num_heads, kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim
@@ -52,20 +52,52 @@ MODELS = {
     "minimax-m2.7": {"family": "gqa", "num_q_heads": 48, "num_kv_heads": 8, "head_dim": 128},
     # GLM-5.1 (MLA + DeepSeek sparse attention). Absorbed MLA decode: qk = 512+64.
     # Indexer scores full ctx with index_n_heads x index_head_dim, keeps index_topk.
-    "glm-5.1": {"family": "dsa", "num_heads": 64, "kv_lora_rank": 512, "qk_rope_head_dim": 64,
-                "qk_nope_head_dim": 128, "index_n_heads": 32, "index_head_dim": 128, "index_topk": 2048},
+    "glm-5.1": {
+        "family": "dsa",
+        "num_heads": 64,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 2048,
+    },
     # https://huggingface.co/deepseek-ai/DeepSeek-R1  (671B; MLA)
-    "deepseek-r1": {"family": "mla", "num_heads": 128, "kv_lora_rank": 512, "qk_rope_head_dim": 64,
-                    "qk_nope_head_dim": 128},
+    "deepseek-r1": {
+        "family": "mla",
+        "num_heads": 128,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+    },
     # https://huggingface.co/moonshotai/Kimi-K2.6  (1T; MLA, DeepSeek-V3 arch)
-    "kimi-k2.6": {"family": "mla", "num_heads": 64, "kv_lora_rank": 512, "qk_rope_head_dim": 64,
-                  "qk_nope_head_dim": 128},
+    "kimi-k2.6": {
+        "family": "mla",
+        "num_heads": 64,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+    },
     # https://huggingface.co/openai/gpt-oss-120b  (117B; SWA layers, window 128, attention sinks)
-    "gpt-oss-120b": {"family": "swa", "num_q_heads": 64, "num_kv_heads": 8,
-                     "qk_head_dim": 64, "v_head_dim": 64, "window": 128, "sinks": True},
+    "gpt-oss-120b": {
+        "family": "swa",
+        "num_q_heads": 64,
+        "num_kv_heads": 8,
+        "qk_head_dim": 64,
+        "v_head_dim": 64,
+        "window": 128,
+        "sinks": True,
+    },
     # https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro  (1.02T; SWA layers, window 128)
-    "mimo-v2.5-pro": {"family": "swa", "num_q_heads": 128, "num_kv_heads": 8,
-                      "qk_head_dim": 192, "v_head_dim": 128, "window": 128, "sinks": False},
+    "mimo-v2.5-pro": {
+        "family": "swa",
+        "num_q_heads": 128,
+        "num_kv_heads": 8,
+        "qk_head_dim": 192,
+        "v_head_dim": 128,
+        "window": 128,
+        "sinks": False,
+    },
 }
 
 DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32, 64, 128, 256]
@@ -242,9 +274,16 @@ def bench_gqa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu
 
     def fn():
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=query, kv_cache=kv_cache, workspace_buffer=workspace,
-            block_tables=block_tables, seq_lens=seq_lens, max_seq_len=max_ctx,
-            bmm1_scale=scale, bmm2_scale=1.0, kv_layout="HND", out=out,
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_ctx,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
+            kv_layout="HND",
+            out=out,
         )
 
     snr = None
@@ -337,10 +376,18 @@ def bench_swa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu
 
     def fn():
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q, kv_cache=kv_cache, workspace_buffer=workspace,
-            block_tables=block_tables, seq_lens=seq_lens, max_seq_len=max_ctx,
-            bmm1_scale=scale, bmm2_scale=1.0, window_left=window - 1,
-            sinks=sinks, kv_layout="HND", out=out_kernel,
+            query=q,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_ctx,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
+            window_left=window - 1,
+            sinks=sinks,
+            kv_layout="HND",
+            out=out_kernel,
         )
 
     out = out_kernel[..., :Dv]
@@ -411,9 +458,14 @@ def bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
             query=q_in.unsqueeze(1),  # [B, q_len=1, nhead, qk]
             kv_cache=kv_cache.unsqueeze(1),  # [num_blocks, 1, page_size, qk]
             workspace_buffer=workspace,
-            qk_nope_head_dim=nope, kv_lora_rank=lora, qk_rope_head_dim=rope,
-            block_tables=block_tables, seq_lens=seq_lens, max_seq_len=max_ctx,
-            bmm1_scale=scale, bmm2_scale=1.0,
+            qk_nope_head_dim=nope,
+            kv_lora_rank=lora,
+            qk_rope_head_dim=rope,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_ctx,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
         )
 
     snr = None
@@ -469,7 +521,14 @@ def _build_dsa_indexer(batch, ctx_lens_cpu, n_heads, head_dim, topk, seed, devic
 
     def fn():
         logits = deep_gemm.fp8_paged_mqa_logits(
-            q, kv, weights, seqlens_2d, block_tables, schedule_meta, max_ctx, clean_logits=False,
+            q,
+            kv,
+            weights,
+            seqlens_2d,
+            block_tables,
+            schedule_meta,
+            max_ctx,
+            clean_logits=False,
         )
         torch.topk(logits[:, :max_ctx], tk, dim=-1)  # top-k token selection
 
@@ -537,9 +596,15 @@ def bench_dsa(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
             query=q_in.unsqueeze(1),  # [B, q_len=1, nhead, qk]
             kv_cache=kv_cache.unsqueeze(1),  # [num_pages, 1, page, qk]
             workspace_buffer=workspace,
-            qk_nope_head_dim=nope, kv_lora_rank=lora, qk_rope_head_dim=rope,
-            block_tables=page_table, seq_lens=seq_lens, max_seq_len=pool_tokens,
-            bmm1_scale=scale, bmm2_scale=1.0, sparse_mla_top_k=top_k_padded,
+            qk_nope_head_dim=nope,
+            kv_lora_rank=lora,
+            qk_rope_head_dim=rope,
+            block_tables=page_table,
+            seq_lens=seq_lens,
+            max_seq_len=pool_tokens,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
+            sparse_mla_top_k=top_k_padded,
         )
 
     # Stage 1 -- fp8 indexer (scores the full context, picks top-k).
@@ -583,12 +648,25 @@ def benchmark_one(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_spre
     ctx_lens_cpu = gen_ctx_lens(batch, ctx, ctx_spread, cell_seed)
     page_seed = cell_seed + 1
     if cfg["family"] == "gqa":
-        return (*bench_gqa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu, page_seed, device, check), None)
+        return (
+            *bench_gqa(
+                batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu, page_seed, device, check
+            ),
+            None,
+        )
     if cfg["family"] == "swa":
-        return (*bench_swa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu, page_seed, device, check), None)
+        return (
+            *bench_swa(
+                batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu, page_seed, device, check
+            ),
+            None,
+        )
     if cfg["family"] == "dsa":
         return bench_dsa(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, page_seed, device, check)
-    return (*bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, page_seed, device, check), None)
+    return (
+        *bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, page_seed, device, check),
+        None,
+    )
 
 
 def head_count(cfg):
@@ -635,7 +713,9 @@ def save_excel(path, args, cfg, results):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Decode attention benchmark (FlashInfer trtllm; GQA + MLA + SWA + DSA)")
+    parser = argparse.ArgumentParser(
+        description="Decode attention benchmark (FlashInfer trtllm; GQA + MLA + SWA + DSA)"
+    )
     parser.add_argument("--model", choices=list(MODELS), default="minimax-m2.7")
     parser.add_argument("--batches", type=int, nargs="+", default=DEFAULT_BATCHES)
     parser.add_argument("--ctx", type=int, nargs="+", default=DEFAULT_CTX)
@@ -662,7 +742,9 @@ def main():
     )
     parser.set_defaults(cudagraph=True)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output", "-o", type=str, default=None, help="Save to .xlsx (auto-named if omitted).")
+    parser.add_argument(
+        "--output", "-o", type=str, default=None, help="Save to .xlsx (auto-named if omitted)."
+    )
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "This benchmark requires a GPU."
@@ -683,9 +765,13 @@ def main():
     op = _OP_BY_FAMILY[cfg["family"]]
     print()
     print(f"  Model     : {args.model}  family={cfg['family']}")
-    print(f"  Op        : flashinfer {op} (decode)  ctx_spread={args.ctx_spread}"
-          + (f"  page_size={args.page_size}" if cfg["family"] in ("gqa", "swa") else ""))
-    print(f"  Parallel  : tp={tp_size} dp={dp_size} -> attn_tp={attn_tp}  (per-rank heads={heads // attn_tp})")
+    print(
+        f"  Op        : flashinfer {op} (decode)  ctx_spread={args.ctx_spread}"
+        + (f"  page_size={args.page_size}" if cfg["family"] in ("gqa", "swa") else "")
+    )
+    print(
+        f"  Parallel  : tp={tp_size} dp={dp_size} -> attn_tp={attn_tp}  (per-rank heads={heads // attn_tp})"
+    )
     print(f"  Timing    : {'cudagraph' if args.cudagraph else 'eager'}")
     print(f"  GPU       : {torch.cuda.get_device_name(0)}")
 
@@ -694,8 +780,10 @@ def main():
     for kv_dtype in ("bf16", "fp8"):
         print(f"\n=== KV cache: {kv_dtype} ===")
         if is_dsa:
-            header = (f"{'Batch':>6} | {'Ctx':>7} | {'Tot ms':>8} | {'Tot BW':>8} | {'Tot TF':>7} | "
-                      f"{'Idx ms':>8} | {'Idx BW':>8} | {'MLA ms':>8} | {'MLA BW':>8} | {'SNR':>6}")
+            header = (
+                f"{'Batch':>6} | {'Ctx':>7} | {'Tot ms':>8} | {'Tot BW':>8} | {'Tot TF':>7} | "
+                f"{'Idx ms':>8} | {'Idx BW':>8} | {'MLA ms':>8} | {'MLA BW':>8} | {'SNR':>6}"
+            )
         else:
             header = f"{'Batch':>6} | {'Ctx':>7} | {'Time (ms)':>10} | {'KV-BW (GB/s)':>13} | {'TFLOPS':>8} | {'SNR (dB)':>8}"
         print(header)
@@ -705,28 +793,54 @@ def main():
             for ctx in args.ctx:
                 try:
                     time_ms, bw, tflops, snr, extra = benchmark_one(
-                        batch, ctx, cfg, dtype, kv_dtype, args.page_size, attn_tp,
-                        args.ctx_spread, args.seed, device, args.check
+                        batch,
+                        ctx,
+                        cfg,
+                        dtype,
+                        kv_dtype,
+                        args.page_size,
+                        attn_tp,
+                        args.ctx_spread,
+                        args.seed,
+                        device,
+                        args.check,
                     )
                     snr_str = "-" if snr is None else f"{snr:.1f}"
                     if is_dsa:
-                        print(f"{batch:>6} | {ctx:>7} | {time_ms:>8.3f} | {bw:>8.0f} | {tflops:>7.1f} | "
-                              f"{extra['idx_ms']:>8.3f} | {extra['idx_bw']:>8.0f} | "
-                              f"{extra['mla_ms']:>8.3f} | {extra['mla_bw']:>8.0f} | {snr_str:>6}")
+                        print(
+                            f"{batch:>6} | {ctx:>7} | {time_ms:>8.3f} | {bw:>8.0f} | {tflops:>7.1f} | "
+                            f"{extra['idx_ms']:>8.3f} | {extra['idx_bw']:>8.0f} | "
+                            f"{extra['mla_ms']:>8.3f} | {extra['mla_bw']:>8.0f} | {snr_str:>6}"
+                        )
                         rows.append(
-                            {"Batch": batch, "Ctx": ctx,
-                             "Total ms": round(time_ms, 3), "Total BW (GB/s)": round(bw), "Total TFLOPS": round(tflops, 1),
-                             "Idx ms": round(extra["idx_ms"], 3), "Idx BW (GB/s)": round(extra["idx_bw"]),
-                             "Idx TFLOPS": round(extra["idx_tflops"], 1),
-                             "MLA ms": round(extra["mla_ms"], 3), "MLA BW (GB/s)": round(extra["mla_bw"]),
-                             "MLA TFLOPS": round(extra["mla_tflops"], 1),
-                             "SNR (dB)": snr_str}
+                            {
+                                "Batch": batch,
+                                "Ctx": ctx,
+                                "Total ms": round(time_ms, 3),
+                                "Total BW (GB/s)": round(bw),
+                                "Total TFLOPS": round(tflops, 1),
+                                "Idx ms": round(extra["idx_ms"], 3),
+                                "Idx BW (GB/s)": round(extra["idx_bw"]),
+                                "Idx TFLOPS": round(extra["idx_tflops"], 1),
+                                "MLA ms": round(extra["mla_ms"], 3),
+                                "MLA BW (GB/s)": round(extra["mla_bw"]),
+                                "MLA TFLOPS": round(extra["mla_tflops"], 1),
+                                "SNR (dB)": snr_str,
+                            }
                         )
                     else:
-                        print(f"{batch:>6} | {ctx:>7} | {time_ms:>10.3f} | {bw:>13.0f} | {tflops:>8.1f} | {snr_str:>8}")
+                        print(
+                            f"{batch:>6} | {ctx:>7} | {time_ms:>10.3f} | {bw:>13.0f} | {tflops:>8.1f} | {snr_str:>8}"
+                        )
                         rows.append(
-                            {"Batch": batch, "Ctx": ctx, "Time (ms)": round(time_ms, 3),
-                             "KV-BW (GB/s)": round(bw), "TFLOPS": round(tflops, 1), "SNR (dB)": snr_str}
+                            {
+                                "Batch": batch,
+                                "Ctx": ctx,
+                                "Time (ms)": round(time_ms, 3),
+                                "KV-BW (GB/s)": round(bw),
+                                "TFLOPS": round(tflops, 1),
+                                "SNR (dB)": snr_str,
+                            }
                         )
                 except Exception as e:
                     msg = str(e).splitlines()[0][:60]

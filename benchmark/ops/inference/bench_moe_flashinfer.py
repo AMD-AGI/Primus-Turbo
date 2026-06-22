@@ -59,14 +59,12 @@ import os
 from datetime import datetime
 
 import torch
-import flashinfer
 from flashinfer import (
     ActivationType,
     RoutingMethodType,
     fp4_quantize,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
-    shuffle_matrix_sf_a,
 )
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
@@ -87,7 +85,12 @@ MODELS = {
     # https://huggingface.co/deepseek-ai/DeepSeek-R1  (671B total / 37B active)
     "deepseek-r1": {"hidden_size": 7168, "moe_intermediate_size": 2048, "n_routed_experts": 256, "topk": 8},
     # https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro  (1.6T total / 49B active; native fp4 experts, SwiGLU, top-6)
-    "deepseek-v4-pro": {"hidden_size": 7168, "moe_intermediate_size": 3072, "n_routed_experts": 384, "topk": 6},
+    "deepseek-v4-pro": {
+        "hidden_size": 7168,
+        "moe_intermediate_size": 3072,
+        "n_routed_experts": 384,
+        "topk": 6,
+    },
     # https://huggingface.co/moonshotai/Kimi-K2.6  (1T total / 32B active)
     "kimi-k2.6": {"hidden_size": 7168, "moe_intermediate_size": 2048, "n_routed_experts": 384, "topk": 8},
     # https://huggingface.co/zai-org/GLM-5.1  (754B total)
@@ -101,7 +104,12 @@ MODELS = {
     # https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro  (1.02T total / 42B active)
     "mimo-v2.5-pro": {"hidden_size": 6144, "moe_intermediate_size": 2048, "n_routed_experts": 384, "topk": 8},
     # https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking  (80B total / 3B active; 512 experts, top-10)
-    "qwen3-next-80b-a3b": {"hidden_size": 2048, "moe_intermediate_size": 512, "n_routed_experts": 512, "topk": 10},
+    "qwen3-next-80b-a3b": {
+        "hidden_size": 2048,
+        "moe_intermediate_size": 512,
+        "n_routed_experts": 512,
+        "topk": 10,
+    },
 }
 
 DEFAULT_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
@@ -179,7 +187,9 @@ def make_routing(num_tokens, num_experts, topk, device, variance):
     """
     weights = torch.full((num_tokens, topk), 1.0 / topk, device=device, dtype=torch.float32)
     var_max = num_experts / topk - 1.0
-    balance = 1.0 if (variance <= 0.0 or var_max <= 0.0) else 1.0 - math.sqrt(min(variance, var_max) / var_max)
+    balance = (
+        1.0 if (variance <= 0.0 or var_max <= 0.0) else 1.0 - math.sqrt(min(variance, var_max) / var_max)
+    )
 
     if balance >= 1.0:
         stride = max(1, num_experts // topk)
@@ -288,7 +298,10 @@ def _shuffle_fp4(wq, ws, num_experts, gated, num_elts_per_sf):
         )
         g1w.append(wq[i].view(torch.uint8)[pi.to(wq.device)].contiguous())
         psf = _maybe_get_cached_w3_w1_permute_indices(
-            _PERMUTE_CACHE, ws[i].view(torch.uint8), _EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf,
+            _PERMUTE_CACHE,
+            ws[i].view(torch.uint8),
+            _EPILOGUE_TILE_M,
+            num_elts_per_sf=num_elts_per_sf,
             is_gated_act_gemm=gated,
         )
         si = block_scale_interleave(ws[i].view(torch.uint8)[psf.to(ws.device)].contiguous())
@@ -413,11 +426,20 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
     # caller's w1) use [gate||up]. Reorder to [up||gate] for the kernel only.
     w1 = _swap_gate_up(w1)
     common = dict(
-        routing_logits=logits, routing_bias=None, hidden_states=hidden,
-        num_experts=num_experts, top_k=topk, n_group=None, topk_group=None,
-        intermediate_size=local_I, local_expert_offset=lo, local_num_experts=local_E,
-        routed_scaling_factor=None, routing_method_type=int(_ROUTING_METHOD),
-        activation_type=int(ActivationType.Swiglu), do_finalize=True,
+        routing_logits=logits,
+        routing_bias=None,
+        hidden_states=hidden,
+        num_experts=num_experts,
+        top_k=topk,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=local_I,
+        local_expert_offset=lo,
+        local_num_experts=local_E,
+        routed_scaling_factor=None,
+        routing_method_type=int(_ROUTING_METHOD),
+        activation_type=int(ActivationType.Swiglu),
+        do_finalize=True,
     )
 
     if quant == "none":
@@ -425,9 +447,13 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
 
         def fn():
             return trtllm_bf16_moe(
-                gemm1_weights=g1, gemm2_weights=g2,
-                use_shuffled_weight=True, weight_layout=int(WeightLayout.BlockMajorK), **common,
+                gemm1_weights=g1,
+                gemm2_weights=g2,
+                use_shuffled_weight=True,
+                weight_layout=int(WeightLayout.BlockMajorK),
+                **common,
             )
+
         return fn, _per_expert_nbytes(g1) + _per_expert_nbytes(g2)
 
     if quant in _FP4_PARAMS:
@@ -457,15 +483,29 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
 
         def fn():
             return trtllm_fp4_block_scale_moe(
-                hidden_states=hs, hidden_states_scale=hs_scale,
-                gemm1_weights=g1w, gemm1_weights_scale=g1s,
-                gemm1_bias=None, gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None,
-                gemm2_weights=g2w, gemm2_weights_scale=g2s, gemm2_bias=None,
-                output1_scale_scalar=out1, output1_scale_gate_scalar=out1, output2_scale_scalar=out2,
+                hidden_states=hs,
+                hidden_states_scale=hs_scale,
+                gemm1_weights=g1w,
+                gemm1_weights_scale=g1s,
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=g2w,
+                gemm2_weights_scale=g2s,
+                gemm2_bias=None,
+                output1_scale_scalar=out1,
+                output1_scale_gate_scalar=out1,
+                output2_scale_scalar=out2,
                 **{k: v for k, v in common.items() if k != "hidden_states"},
             )[0]
-        return fn, (_per_expert_nbytes(g1w) + _per_expert_nbytes(g2w)
-                    + _per_expert_nbytes(g1s) + _per_expert_nbytes(g2s))
+
+        return fn, (
+            _per_expert_nbytes(g1w)
+            + _per_expert_nbytes(g2w)
+            + _per_expert_nbytes(g1s)
+            + _per_expert_nbytes(g2s)
+        )
 
     if quant == "fp8_block":
         dt = fp8_dtype()
@@ -476,14 +516,23 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
 
         def fn():
             return trtllm_fp8_block_scale_moe(
-                hidden_states=hq, hidden_states_scale=hs_scale,
-                gemm1_weights=w1q, gemm1_weights_scale=w1s,
-                gemm2_weights=w2q, gemm2_weights_scale=w2s,
-                use_shuffled_weight=False, weight_layout=int(WeightLayout.MajorK),
+                hidden_states=hq,
+                hidden_states_scale=hs_scale,
+                gemm1_weights=w1q,
+                gemm1_weights_scale=w1s,
+                gemm2_weights=w2q,
+                gemm2_weights_scale=w2s,
+                use_shuffled_weight=False,
+                weight_layout=int(WeightLayout.MajorK),
                 **{k: v for k, v in common.items() if k != "hidden_states"},
             )
-        return fn, (_per_expert_nbytes(w1q) + _per_expert_nbytes(w2q)
-                    + _per_expert_nbytes(w1s) + _per_expert_nbytes(w2s))
+
+        return fn, (
+            _per_expert_nbytes(w1q)
+            + _per_expert_nbytes(w2q)
+            + _per_expert_nbytes(w1s)
+            + _per_expert_nbytes(w2s)
+        )
 
     if quant == "fp8_token":  # per-tensor fp8 (dynamic per-tensor activations)
         dt = fp8_dtype()
@@ -493,11 +542,15 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
         w1q = (w1 / s1).to(dt).contiguous()
         w2q = (w2 / s2).to(dt).contiguous()
         # Per-tensor kernel needs the same gated-act reorder + shuffle_matrix_a as bf16.
-        w1q = torch.stack([
-            shuffle_matrix_a(reorder_rows_for_gated_act_gemm(w1q[i]).view(torch.uint8), _EPILOGUE_TILE_M)
-            for i in range(local_E)]).view(dt)
-        w2q = torch.stack([
-            shuffle_matrix_a(w2q[i].view(torch.uint8), _EPILOGUE_TILE_M) for i in range(local_E)]).view(dt)
+        w1q = torch.stack(
+            [
+                shuffle_matrix_a(reorder_rows_for_gated_act_gemm(w1q[i]).view(torch.uint8), _EPILOGUE_TILE_M)
+                for i in range(local_E)
+            ]
+        ).view(dt)
+        w2q = torch.stack(
+            [shuffle_matrix_a(w2q[i].view(torch.uint8), _EPILOGUE_TILE_M) for i in range(local_E)]
+        ).view(dt)
         # Per-tensor activation scales (a1 = FC1 input, a2 = FC1-output fp8 scale).
         a1 = (hidden.abs().amax() / fmax).clamp(min=1e-12).float()
         hq = (hidden / a1).to(dt).contiguous()
@@ -509,12 +562,16 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
 
         def fn():
             return trtllm_fp8_per_tensor_scale_moe(
-                hidden_states=hq, gemm1_weights=w1q,
-                output1_scales_scalar=out1, output1_scales_gate_scalar=out1g,
-                gemm2_weights=w2q, output2_scales_scalar=out2,
+                hidden_states=hq,
+                gemm1_weights=w1q,
+                output1_scales_scalar=out1,
+                output1_scales_gate_scalar=out1g,
+                gemm2_weights=w2q,
+                output2_scales_scalar=out2,
                 use_routing_scales_on_input=False,
                 **{k: v for k, v in common.items() if k != "hidden_states"},
             )
+
         return fn, (_per_expert_nbytes(w1q) + _per_expert_nbytes(w2q))
 
     raise ValueError(f"Unknown quant: {quant}")
@@ -565,9 +622,7 @@ def benchmark_one(num_tokens, cfg, dtype, device, tp_size, ep_size, variance, qu
     # Bottleneck = heaviest-load rank; that rank's consistent triple is reported.
     r, lo, local_m, local_tokens, active_experts = max(loads, key=lambda l: l[2])
 
-    fn, per_expert_bytes = build_moe_fn(
-        quant, hidden, w1, w2, logits, E, topk, local_I, local_E, lo, device
-    )
+    fn, per_expert_bytes = build_moe_fn(quant, hidden, w1, w2, logits, E, topk, local_I, local_E, lo, device)
 
     snr = None
     if check:
@@ -647,20 +702,28 @@ def save_excel(path, args, cfg, tp_size, ep_size, rows):
 def main():
     parser = argparse.ArgumentParser(description="Inference MoE benchmark (FlashInfer trtllm fused_moe)")
     parser.add_argument(
-        "--model", choices=list(MODELS), default="deepseek-r1",
+        "--model",
+        choices=list(MODELS),
+        default="deepseek-r1",
         help="MoE model whose routed-expert shapes to benchmark.",
     )
     parser.add_argument(
-        "--quant", choices=["none", "fp8_block", "fp8_token", "fp4", "nvfp4"], default="none",
+        "--quant",
+        choices=["none", "fp8_block", "fp8_token", "fp4", "nvfp4"],
+        default="none",
         help="Quantization: none (bf16), fp8_block (per-128x128), fp8_token (per-tensor), "
-             "fp4 (mxfp4 OCP micro-scaling, aiter-comparable), nvfp4 (Blackwell flagship).",
+        "fp4 (mxfp4 OCP micro-scaling, aiter-comparable), nvfp4 (Blackwell flagship).",
     )
     parser.add_argument(
-        "--tp-size", type=int, default=1,
+        "--tp-size",
+        type=int,
+        default=1,
         help="Tensor-parallel size (shards intermediate). Mutually exclusive with --ep-size.",
     )
     parser.add_argument(
-        "--ep-size", type=int, default=1,
+        "--ep-size",
+        type=int,
+        default=1,
         help="Expert-parallel size (shards experts). Mutually exclusive with --tp-size.",
     )
     parser.add_argument(
@@ -671,7 +734,9 @@ def main():
         "mean 1 (squared coefficient of variation). 0=perfectly balanced; larger "
         "= more hot experts. Saturates at E/topk - 1 (all tokens on the same topk).",
     )
-    parser.add_argument("--tokens", type=int, nargs="+", default=DEFAULT_TOKENS, help="Token counts to sweep.")
+    parser.add_argument(
+        "--tokens", type=int, nargs="+", default=DEFAULT_TOKENS, help="Token counts to sweep."
+    )
     parser.add_argument("--check", action="store_true", help="Run the SNR correctness check (default: off).")
     parser.add_argument(
         "--no-cudagraph",
@@ -681,7 +746,9 @@ def main():
     )
     parser.set_defaults(cudagraph=True)
     parser.add_argument("--seed", type=int, default=0, help="Random seed (default: 0).")
-    parser.add_argument("--output", "-o", type=str, default=None, help="Save to .xlsx (auto-named if omitted).")
+    parser.add_argument(
+        "--output", "-o", type=str, default=None, help="Save to .xlsx (auto-named if omitted)."
+    )
     args = parser.parse_args()
     assert args.variance >= 0.0, "--variance must be >= 0"
 
@@ -701,10 +768,14 @@ def main():
 
     report = "bottleneck rank" if ep_size > 1 else "single rank"
     print()
-    print(f"  Model     : {args.model} (hidden={cfg['hidden_size']}, inter={cfg['moe_intermediate_size']}, "
-          f"experts={cfg['n_routed_experts']}, topk={cfg['topk']})")
+    print(
+        f"  Model     : {args.model} (hidden={cfg['hidden_size']}, inter={cfg['moe_intermediate_size']}, "
+        f"experts={cfg['n_routed_experts']}, topk={cfg['topk']})"
+    )
     print(f"  Precision : {args.quant}        Parallel : tp={tp_size} ep={ep_size}  variance={args.variance}")
-    print(f"  Timing    : {'cudagraph' if args.cudagraph else 'eager'}  ({report}; Imbal = slowest/fastest rank)")
+    print(
+        f"  Timing    : {'cudagraph' if args.cudagraph else 'eager'}  ({report}; Imbal = slowest/fastest rank)"
+    )
     print(f"  GPU       : {torch.cuda.get_device_name(0)}")
     print()
 
