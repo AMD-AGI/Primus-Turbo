@@ -73,7 +73,7 @@ def get_shape_from_layout(
             k.shape[1],
             k.shape[2],
         )
-        batch_v, max_seqlen_v, nheads_v, head_size_v = (
+        _, _, _, head_size_v = (
             len(cu_seqlens_k) - 1,
             max_seqlen_k,
             v.shape[1],
