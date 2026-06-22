@@ -217,10 +217,18 @@ def shuffled_pages(num_pages, seed):
 
 
 def _block_tables(ctx_lens_cpu, page_size, perm, device):
-    """Per-seq page table [batch, max_blocks] (int32), pages drawn from `perm`."""
+    """Per-seq page table [batch, max_blocks] (int32), pages drawn from `perm`.
+
+    trtllm-gen decode requires the page-table width to be a multiple of
+    128/page_size, so the table is padded out to that granularity (extra
+    columns stay 0 and are never read: seq_lens bounds the valid range). Without
+    this, ragged batches (--ctx-cv>0) whose max length is not 128-aligned trip
+    "block_num % (128 / block_size) == 0" and the cell is dropped."""
     pages_per_seq = (ctx_lens_cpu + page_size - 1) // page_size
     page_off = torch.cat([torch.zeros(1, dtype=torch.int64), pages_per_seq.cumsum(0)])
+    block_mult = max(1, 128 // page_size)
     max_blocks = int(pages_per_seq.max())
+    max_blocks = ((max_blocks + block_mult - 1) // block_mult) * block_mult
     batch = ctx_lens_cpu.numel()
     bt = torch.zeros(batch, max_blocks, device=device, dtype=torch.int32)
     for i in range(batch):
