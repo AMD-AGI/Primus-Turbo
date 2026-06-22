@@ -139,6 +139,7 @@ def _compile_grouped_nn(
     sched_schedbar: bool = False,  # True = before-mfma inner s_barrier -> sched_barrier(0) (no runtime WG sync)
     persistent: bool = True,  # True = scf.for tile loop (fixed grid, cap_cu reserves CUs); False = one tile/WG + s_endpgm over-launch guard (full-device default)
     cap_cu: int = -1,  # >0: cap grid to this many WGs (reserve device CUs for comm-compute overlap). <=0: full device.
+    i64_traverse: bool = False,  # B[K,N] traversal via per-load i64 SRD re-base (lifts G*K*n < 2^32 cap)
 ):
     """Persistent (CPU-sync-free) grouped NN dgrad. Same math as the dense NN
     kernel but a fixed grid of ``num_sms`` WGs strides over the
@@ -307,7 +308,10 @@ def _compile_grouped_nn(
             )
 
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+            # B[K,N] (per-group) is the contraction-traversal operand: i64 mode
+            # re-bases its SRD per load instead of riding the 32-bit soffset.
+            b_rebase = (B, F8_IR_t, b_base, b_nrec) if i64_traverse else None
+            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, rebase=b_rebase)
             a_s2r = S2RLoader(wave_m, N_TILES_A)
             # B transpose-load via inline-asm ds_read_b64_tr_b8: the opaque asm hides the
             # wave-coop transpose reads from the backend so it keeps load/mfma overlap
@@ -347,9 +351,9 @@ def _compile_grouped_nn(
                     rocdl.s_barrier()
 
             # Prelude.
-            b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K * c_n)
+            b_g2s.load(b_cur0, B0_gl_offset + arith.index(0 * BLOCK_K) * cn_i)
             a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
-            b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K * c_n)
+            b_g2s.load(b_cur1, B1_gl_offset + arith.index(0 * BLOCK_K) * cn_i)
             a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
             # persistent: unconditional barrier (cross-tile phase-correctness). 8w: one
             # tile per WG, so the dense divergent `if wave_m==1` barrier is correct.
@@ -359,9 +363,9 @@ def _compile_grouped_nn(
                 if wave_m == 1:
                     rocdl.s_barrier()
             wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
-            b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K * c_n)
+            b_g2s.load(b_next0, B0_gl_offset + arith.index(1 * BLOCK_K) * cn_i)
             a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-            b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K * c_n)
+            b_g2s.load(b_next1, B1_gl_offset + arith.index(1 * BLOCK_K) * cn_i)
             wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
             for k in range_constexpr(K_ITERS - 2):
@@ -374,7 +378,7 @@ def _compile_grouped_nn(
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 b1_frag = b_s2r.load(b_cur1)
-                b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K * c_n)
+                b_g2s.load(b_cur0, B0_gl_offset + arith.index((k + 2) * BLOCK_K) * cn_i)
                 _ibar()
                 rocdl.s_setprio(1)
                 c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
@@ -387,7 +391,7 @@ def _compile_grouped_nn(
                 c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
-                b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K * c_n)
+                b_g2s.load(b_cur1, B1_gl_offset + arith.index((k + 2) * BLOCK_K) * cn_i)
                 wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
                 rocdl.s_setprio(1)
                 c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
@@ -955,29 +959,33 @@ def _wgrad_body_4buf(
     SRD-clamped to 0 by the per-group num_records bound. Inline ds_read drain-removal
     works here because the body is straight-line within the (compile-time unrolled)
     chunk — the masked graded wait_barrier(2*NA+NB) is the only iter drain."""
+    # k is an i32 loop value; cast the K-step to index before scaling by the index
+    # stride AM/BNs so the product/sum stay i64 (no i32 overflow at large mg*OUT).
+    k1 = arith.index_cast(T.index, k + 1)
+    k2 = arith.index_cast(T.index, k + 2)
     b0 = b_s2r.load(b_cur0, drain=False)
     a0 = a_s2r.load(a_cur0)
-    a_g2s.load(a_next1, A1_off + (k + 1) * AM)
+    a_g2s.load(a_next1, A1_off + k1 * AM)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
     _wgrad_accum(mfma, a0, b0, acc00)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
     b1 = b_s2r.load(b_cur1)
-    b_g2s.load(b_cur0, B0_off + (k + 2) * BNs)
+    b_g2s.load(b_cur0, B0_off + k2 * BNs)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
     _wgrad_accum(mfma, a0, b1, acc01)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
     a1 = a_s2r.load(a_cur1)
-    a_g2s.load(a_cur0, A0_off + (k + 2) * AM)
+    a_g2s.load(a_cur0, A0_off + k2 * AM)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
     _wgrad_accum(mfma, a1, b0, acc10)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
-    b_g2s.load(b_cur1, B1_off + (k + 2) * BNs)
+    b_g2s.load(b_cur1, B1_off + k2 * BNs)
     wait_barrier(2 * NA + NB)
     rocdl.s_setprio(1)
     _wgrad_accum(mfma, a1, b1, acc11)
@@ -1071,13 +1079,22 @@ def _wgrad_block_mn(idx, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, gr
 
 def _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t):
     """Fold m_start*OUT into the i64 SRD base + per-group num_records (cumulative m_end*OUT
-    overflows int32 for large-G MoE); per-group offset/stride stay i32. -> (a_div, b_div)."""
+    overflows int32 for large-G MoE); per-group offset/stride stay i32.
+
+    Returns (a_div, b_div, a_rebase, b_rebase). The *_rebase tuples
+    (arg, fp8_t, base, num_records) feed G2SLoader's i64-traverse mode: A[m,OUT_M]
+    and B[m,OUT_N] both stride the contraction (token) dim, so when the per-group
+    span mg*OUT exceeds 2^32 the 32-bit soffset wraps and the SRD must re-base."""
     a_base = arith.index_cast(T.index, m_start) * arith.index(OUT_M)
     b_base = arith.index_cast(T.index, m_start) * arith.index(OUT_N)
     mg = arith.index_cast(T.index, m_end) - arith.index_cast(T.index, m_start)
-    gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, mg * arith.index(OUT_M))
-    gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, mg * arith.index(OUT_N))
-    return fx.logical_divide(gA, fx.make_layout(1, 1)), fx.logical_divide(gB, fx.make_layout(1, 1))
+    a_nrec = mg * arith.index(OUT_M)
+    b_nrec = mg * arith.index(OUT_N)
+    gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
+    gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, b_nrec)
+    a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+    b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+    return a_div, b_div, (A, F8_IR_t, a_base, a_nrec), (B, F8_IR_t, b_base, b_nrec)
 
 
 def _compile_grouped_tn_wgrad_masked(
@@ -1100,6 +1117,7 @@ def _compile_grouped_tn_wgrad_masked(
     chunk: int = 8,  # capacity-free chunked K-loop: outer runtime scf.for over
     # ceildiv(k_iters,chunk) x inner range_constexpr(chunk) of the 4-buffer body; even
     # chunk resets the ping-pong at the boundary; over-run is SRD-clamped (no host cap).
+    i64_traverse: bool = False,  # A[m,OUT_M] & B[m,OUT_N] traversal via per-load i64 SRD re-base (lifts mg*OUT < 2^32 cap)
 ):
     """Masked grouped TN wgrad: a CAPACITY-FREE chunked K-loop (outer runtime
     scf.for over ceildiv(k_iters,chunk) x inner range_constexpr(chunk) of the
@@ -1185,15 +1203,22 @@ def _compile_grouped_tn_wgrad_masked(
         wave_m = wave_id // 4
         wave_n = wave_id % 4
 
-        a_div, b_div = _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t)
+        a_div, b_div, a_rb, b_rb = _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t)
 
         gl_off_a = compute_global_swizzle_nn(lane_id, wave_id, OUT_M, N_LDS_ROUNDS)
         gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, OUT_N, N_LDS_ROUNDS)
 
         mfma = _build_mfma(N_TILES_A, N_TILES_B, cbsz, blgp, asm_mode="2" if _agpr else "3")
 
-        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
-        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
+        # A and B both stride the contraction (token) dim: re-base both SRDs per load in i64 mode.
+        a_rebase = a_rb if i64_traverse else None
+        b_rebase = b_rb if i64_traverse else None
+        a_g2s = G2SLoader(
+            a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=a_rebase
+        )
+        b_g2s = G2SLoader(
+            b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=b_rebase
+        )
         a_s2r = S2RLoaderTr(
             wave_m,
             N_TILES_A,
@@ -1224,12 +1249,15 @@ def _compile_grouped_tn_wgrad_masked(
                 A_scale, B_scale, C, (group_idx + 1) * OUT_M, OUT_N, mfma.idx, N_TILES_A, N_TILES_B, _out_ty
             )
 
-        A0_off = block_m * BLOCK_M  # relative to the m_start-folded SRD base
+        # index (i64) so A0_off + (k+2)*AM doesn't truncate to i32 when the per-group
+        # token-traversal span mg*OUT exceeds 2^31 (i64-traverse re-base needs the exact
+        # offset; the int32 path truncates back at the soffset boundary in G2SLoader).
+        A0_off = arith.index_cast(T.index, block_m * BLOCK_M)  # relative to the m_start-folded SRD base
         A1_off = A0_off + LDS_BLOCK_M
-        B0_off = block_n * BLOCK_N
+        B0_off = arith.index_cast(T.index, block_n * BLOCK_N)
         B1_off = B0_off + LDS_BLOCK_N
-        AM = BLOCK_K * OUT_M
-        BNs = BLOCK_K * OUT_N
+        AM = arith.index(BLOCK_K * OUT_M)
+        BNs = arith.index(BLOCK_K * OUT_N)
 
         # Prelude (tile 0 -> cur, tile 1 -> next).
         b_g2s.load(b_cur0, B0_off + 0 * BNs)
@@ -1360,6 +1388,7 @@ def _grouped_compile_cfg(
     bn=256,
     nt_group_n=0,
     cap_cu=-1,
+    i64_traverse=False,
 ):
     ckey = (
         "nt" if trans_b else "nn",
@@ -1378,6 +1407,7 @@ def _grouped_compile_cfg(
         bn,
         nt_group_n,
         cap_cu,
+        i64_traverse,
     )
     l = _GROUPED_LAUNCH_CACHE.get(ckey)
     if l is None:
@@ -1418,6 +1448,7 @@ def _grouped_compile_cfg(
                 sched_schedbar=sched_schedbar,
                 persistent=True,
                 cap_cu=cap_cu,
+                i64_traverse=i64_traverse,
             )
         _GROUPED_LAUNCH_CACHE[ckey] = l
     return l
@@ -1475,6 +1506,9 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
     # time on a balanced group_offs (args[6] = M_total) so a skewed first call cannot
     # bias the config pick.
     targs = _balanced_targs(args, args[6], G)
+    # NN B[K,N] per-group traversal: k*BLOCK_K*N rides the 32-bit soffset, so when the
+    # per-group span K*N (args[7]=N) reaches 2^32 fp8 re-base B's SRD per load in i64.
+    i64_tr = (not trans_b) and (K * args[7] >= 2**32)
 
     def mk(bm, xcd, gm, gn):
         if trans_b:  # NT: merged factory, non-persistent mode (intrinsic MMA, scalar store)
@@ -1512,6 +1546,7 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
             store_cshuffle=False,
             sched_schedbar=False,
             nt_vmcnt=3,
+            i64_traverse=i64_tr,
         )
 
     pm = args[6] // G
@@ -1629,6 +1664,8 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
                 store_cshuffle=True,
                 sched_schedbar=True,
                 cap_cu=(num_cu if capped else -1),
+                # NN B[K,N] per-group traversal: i64 re-base when K*N reaches 2^32 fp8.
+                i64_traverse=((not trans_b) and (K * N >= 2**32)),
             )
         entry = [launch, None]  # [raw @flyc.jit closure, flyc.compile'd object (lazy)]
         _GROUPED_AT_CACHE[at_key] = entry
@@ -1740,6 +1777,7 @@ def _compile_grouped_tn_wgrad_persistent(
     unroll_n: int = -1,  # >=2: continuous-N chunk-unroll (dense-pipeline, capacity-free); -1 = use module env default
     persistent: bool = True,  # False = TRUE non-persistent: NO outer scf.for tile loop (one tile/WG, grid=TOTAL, straight-line outer; the runtime K-loop stays). Avoids the outer tile-loop scheduling penalty.
     cap_cu: int = -1,  # persistent only: >0 caps grid to this many WGs (reserve CUs for comm overlap)
+    i64_traverse: bool = False,  # A[m,OUT_M] & B[m,OUT_N] traversal via per-load i64 SRD re-base (lifts mg*OUT < 2^32 cap)
 ):
     """PERSISTENT grouped TN wgrad (the production wgrad; fwd/dgrad are persistent
     so wgrad must be too). grid = min(G*TILES_PER_GROUP, grid_mul*num_cus); each WG
@@ -1842,10 +1880,20 @@ def _compile_grouped_tn_wgrad_persistent(
             m_end = _load_go(go_div, group_idx + 1)
             k_iters = (m_end - m_start + (BLOCK_K - 1)) // BLOCK_K
 
-            a_div, b_div = _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t)
-            a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
-            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
+            a_div, b_div, a_rb, b_rb = _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t)
+            # A and B both stride the contraction (token) dim: re-base both SRDs per load in i64 mode.
+            a_rebase = a_rb if i64_traverse else None
+            b_rebase = b_rb if i64_traverse else None
+            a_g2s = G2SLoader(
+                a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=a_rebase
+            )
+            b_g2s = G2SLoader(
+                b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=b_rebase
+            )
 
+            # i32 offsets: the persistent wgrad is dispatched only for small per-group
+            # token counts (m_total//G <= 1536), so the per-group span mg*OUT never
+            # reaches 2^31 and the 32-bit offset cannot overflow (no i64 traverse needed).
             A0_off = block_m * BLOCK_M  # relative to the m_start-folded i64 SRD base
             A1_off = A0_off + LDS_BLOCK_M
             B0_off = block_n * BLOCK_N
@@ -2026,6 +2074,7 @@ def _wgrad_compile_cfg(
     unroll_n=-1,
     persistent=True,
     cap_cu=-1,
+    i64_traverse=False,
 ):
     """Compile (or cache-hit) an asm_mma wgrad for one config. persistent=False ->
     TRUE non-persistent (no outer scf.for tile loop)."""
@@ -2042,6 +2091,7 @@ def _wgrad_compile_cfg(
         group_n,
         unroll_n,
         cap_cu,
+        i64_traverse,
     )
     l = _GROUPED_WGRAD_LAUNCH_CACHE.get(ck)
     if l is None:
@@ -2062,14 +2112,15 @@ def _wgrad_compile_cfg(
             unroll_n=unroll_n,
             persistent=persistent,
             cap_cu=cap_cu,
+            i64_traverse=i64_traverse,
         )
         _GROUPED_WGRAD_LAUNCH_CACHE[ck] = l
     return l
 
 
-def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd):
+def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd, i64_traverse=False):
     """Compile (or cache-hit) the masked chunked wgrad for one (chunk, group_m, num_xcd)."""
-    ck = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd)
+    ck = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd, i64_traverse)
     l = _GROUPED_WGRAD_LAUNCH_CACHE.get(ck)
     if l is None:
         l = _compile_grouped_tn_wgrad_masked(
@@ -2085,12 +2136,13 @@ def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num
             group_m=group_m,
             store_cshuffle=True,
             chunk=chunk,
+            i64_traverse=i64_traverse,
         )
         _GROUPED_WGRAD_LAUNCH_CACHE[ck] = l
     return l
 
 
-def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_total):
+def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_total, i64_traverse=False):
     """Per-shape wgrad autotune, balanced-timed (1.5% hysteresis). Branched on per-group
     contraction m_total/G (not m_total, so high-G MoE keeps persist): <=1536 -> 2 persistent
     candidates; else 3 masked chunked (8,4,8)/(8,0,8)/(4,4,8)."""
@@ -2100,14 +2152,18 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_tota
 
     if m_total // G <= 1536:
         cands = [
-            _wgrad_compile_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 0, unroll_n=4),
-            _wgrad_compile_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 8, unroll_n=4),
+            _wgrad_compile_cfg(
+                OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 0, unroll_n=4, i64_traverse=i64_traverse
+            ),
+            _wgrad_compile_cfg(
+                OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 8, unroll_n=4, i64_traverse=i64_traverse
+            ),
         ]
     else:
         cands = [
-            _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 8),
-            _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 0, 8),
-            _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 4, 4, 8),
+            _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 8, i64_traverse=i64_traverse),
+            _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 0, 8, i64_traverse=i64_traverse),
+            _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 4, 4, 8, i64_traverse=i64_traverse),
         ]
 
     prod = cands[0]  # correctness reference + fallback
@@ -2177,7 +2233,12 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     wargs = (lhs_i8, rhs_i8, out.view(G * OUT_M, OUT_N), lsf, rsf, go32, stream)
     launch = _GROUPED_WGRAD_AT_CACHE.get(at_key)
     if launch is None:
-        launch = _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, M_total)
+        # wgrad A[m,OUT_M] / B[m,OUT_N] stride the per-group token dim (contraction);
+        # the per-group span mg*OUT rides the 32-bit soffset. mg is runtime and one
+        # group can hold all tokens, so bound by M_total: re-base in i64 if M_total*OUT
+        # could reach 2^32 fp8.
+        i64_tr = (M_total * OUT_M >= 2**32) or (M_total * OUT_N >= 2**32)
+        launch = _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, M_total, i64_tr)
         _GROUPED_WGRAD_AT_CACHE[at_key] = launch
     launch(*wargs)
     return out
