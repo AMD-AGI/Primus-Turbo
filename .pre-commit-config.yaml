@@ -11,12 +11,17 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+      - id: check-toml
+      - id: check-ast
+      - id: check-case-conflict
       - id: check-added-large-files
       - id: check-merge-conflict
+      - id: debug-statements
+      - id: detect-private-key
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.12
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: ["--fix"]
       - id: ruff-format
   - repo: https://github.com/shellcheck-py/shellcheck-py
