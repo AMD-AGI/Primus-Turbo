@@ -17,12 +17,10 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     compute_global_swizzle,
     compute_global_swizzle_nn,
     make_fp8_buffer_tensor,
-    make_value_attrs,
     mask_a_tail,
     wait_barrier,
     xcd_remap_pid,
 )
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
@@ -44,30 +42,28 @@ TileOffsets = namedtuple("TileOffsets", "A0 A1 B0 B1 a_k_mult b_k_mult")
 Loaders = namedtuple("Loaders", "a_gmem2lds b_gmem2lds a_lds2reg b_lds2reg")
 
 # Mainloop output for the epilogue. c00..c11 = the 2x2 quadrants (BLOCK//2 split).
-AccumTile = namedtuple(
-    "AccumTile", "c00 c01 c10 c11 block_m block_n wave_m wave_n")
+AccumTile = namedtuple("AccumTile", "c00 c01 c10 c11 block_m block_n wave_m wave_n")
 
 # Compile-time shape descriptor: all derived scalars, built once by ``derive_geometry``.
 TileGeometry = namedtuple(
     "TileGeometry",
     "BLOCK_M BLOCK_N BLOCK_K K "
-    "WAVES_M WAVES_N "                                               # wave grid
-    "N_TILES_A N_TILES_B N_ACCUMS "                                  # MMA tiling
-    "LDS_BLOCK_M LDS_BLOCK_N "                                       # LDS half
+    "WAVES_M WAVES_N "  # wave grid
+    "N_TILES_A N_TILES_B N_ACCUMS "  # MMA tiling
+    "LDS_BLOCK_M LDS_BLOCK_N "  # LDS half
     "N_LDS_STEPS_A N_LDS_STEPS_B N_LDS_ROUNDS chunk_stride a_lds_size b_lds_size "  # layout LDS
-    "K_ITERS K_TAIL",                                                # K-tail
+    "K_ITERS K_TAIL",  # K-tail
 )
 
 # Per-layout LDS contribution to TileGeometry (from ``lds_geometry``).
-LdsGeometry = namedtuple(
-    "LdsGeometry", "N_LDS_STEPS_A N_LDS_STEPS_B chunk_stride a_lds_size b_lds_size")
+LdsGeometry = namedtuple("LdsGeometry", "N_LDS_STEPS_A N_LDS_STEPS_B chunk_stride a_lds_size b_lds_size")
 
 
 BLOCK_K = 128
-INST_M = INST_N = 16   # MFMA 16x16x128 instruction M/N
-WAVEFRONT = 64         # gfx950 wavefront size
-QUAD = 2               # 2x2 LDS quadrant split (BLOCK//2)
-HALVES = 2             # M/N halves per operand ring
+INST_M = INST_N = 16  # MFMA 16x16x128 instruction M/N
+WAVEFRONT = 64  # gfx950 wavefront size
+QUAD = 2  # 2x2 LDS quadrant split (BLOCK//2)
+HALVES = 2  # M/N halves per operand ring
 # TN bank-spread LDS chunk stride (1024+32) -- removes the transpose-read bank conflict.
 _LDS_CS = 1056
 # gfx950 per-workgroup LDS limit.
@@ -94,19 +90,16 @@ class TileSpec(Protocol):
     shared_storage: type  # @fx.struct LDS class
 
     # held sub-specs (each a swappable policy)
-    layout_spec: "LayoutSpec"        # operand storage: base_offsets / global_swizzle / transpose
-    # Fp8Dtype (numeric format + buffers + operand loaders)
-    dtype_spec: object
-    # Fp8MmaAtom (the MFMA instruction + its build)
-    mma_spec: object
+    layout_spec: "LayoutSpec"  # operand storage: base_offsets / global_swizzle / transpose
+    dtype_spec: "DtypeSpec"  # numeric format + typed buffers + operand loaders
+    mma_spec: "MmaSpec"  # the MFMA instruction + its build
     scheduler_spec: "SchedulerSpec"  # tile-id map + launch grid
     # PerTensorEpilogue (C store: scale + activation)
     epilogue_spec: object
     # InterleavedKPipeline (mainloop schedule + smem ring)
     pipeline_spec: object
 
-    def emit(self, *, A, B, C, A_scale, B_scale, c_m, c_n, group_base=0, lds=None,
-             epilogue_ctx=None) -> None:
+    def emit(self, *, A, B, C, A_scale, B_scale, c_m, c_n, group_base=0, lds=None, epilogue_ctx=None) -> None:
         """Splice the tile inline. group_base = B slab (0=dense); lds / epilogue_ctx = fused seams."""
         ...
 
@@ -201,8 +194,7 @@ class LayoutSpec(Protocol):
     b_transpose: bool
 
     def lds_geometry(self, *, LDS_BLOCK_M, LDS_BLOCK_N, BLOCK_K): ...
-    def base_offsets(self, geom, *, block_m, block_n,
-                     c_m, c_n, group_base=0): ...
+    def base_offsets(self, geom, *, block_m, block_n, c_m, c_n, group_base=0): ...
 
     def global_swizzle(self, geom, *, lane_id, wave_id, c_m, c_n): ...
 
@@ -239,10 +231,8 @@ class NTLayout:
     def global_swizzle(self, geom, *, lane_id, wave_id, c_m, c_n):
         """NT: both A and B row-major K-contig."""
         K, R = geom.K, geom.N_LDS_ROUNDS
-        gl_off_a = compute_global_swizzle(
-            lane_id, wave_id, K, R, preshuffled=False)
-        gl_off_b = compute_global_swizzle(
-            lane_id, wave_id, K, R, preshuffled=False)
+        gl_off_a = compute_global_swizzle(lane_id, wave_id, K, R, preshuffled=False)
+        gl_off_b = compute_global_swizzle(lane_id, wave_id, K, R, preshuffled=False)
         return gl_off_a, gl_off_b
 
 
@@ -275,8 +265,7 @@ class NNLayout:
 
     def global_swizzle(self, geom, *, lane_id, wave_id, c_m, c_n):
         K, R = geom.K, geom.N_LDS_ROUNDS
-        gl_off_a = compute_global_swizzle(
-            lane_id, wave_id, K, R, preshuffled=False)
+        gl_off_a = compute_global_swizzle(lane_id, wave_id, K, R, preshuffled=False)
         gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, R)
         return gl_off_a, gl_off_b
 
@@ -318,13 +307,56 @@ class TNLayout:
         return gl_off_a, gl_off_b
 
 
-_LAYOUT_SPECS = {"nt": NTLayout(), "nn": NNLayout(),
-                 "tn": TNLayout()}
+_LAYOUT_SPECS = {"nt": NTLayout(), "nn": NNLayout(), "tn": TNLayout()}
 
 
 # ── Operand dtype vs MMA atom: two policies (split per the dtype axis). They are
 # locked together per precision (fp8 dtype <-> fp8 MFMA), so the atom's format is
 # fed from the dtype's cbsz/blgp at build time. v1 ships fp8; bf16/fp4 add siblings.
+
+
+# Dtype policy: operand numeric format + typed buffers + the gmem->lds->reg loaders.
+# Precision-agnostic surface: any concrete numeric format (cbsz/blgp, fp4 scales, ...)
+# stays private to the implementation and is fed to its paired mma via build_mfma(dtype=).
+@runtime_checkable
+class DtypeSpec(Protocol):
+    """Operand dtype: LDS element, typed A/B buffer views, and the G2S/S2R operand
+    loaders (transpose-aware, keyed by layout). Numeric-format details are private."""
+
+    name: str
+    lds_element: object  # SharedStorage @fx.struct array element type
+    cache_key: tuple
+
+    def make_buffers(self, *, A, B): ...
+
+    def build_loaders(
+        self,
+        geom,
+        *,
+        layout,
+        a_div,
+        b_div,
+        gl_off_a,
+        gl_off_b,
+        wave_id,
+        wave_m,
+        wave_n,
+        vmcnt_hint,
+        b_inline_asm_load,
+    ): ...
+
+
+# MMA policy: the MFMA instruction (its inst_shape feeds geometry) + the atom build.
+@runtime_checkable
+class MmaSpec(Protocol):
+    """MMA atom: ``inst_shape`` (M, N, K) drives geometry; ``build_mfma`` builds the
+    concrete atom, operand formats read off the paired dtype + inplace from the layout."""
+
+    inst_shape: tuple
+    cache_key: tuple
+
+    def build_mfma(self, geom, *, layout, dtype): ...
+
 
 # The operand dtype: numeric format (E4M3/E5M2/hybrid) + typed buffers + loaders
 # (bringing operands gmem->lds->reg is the dtype's job).
@@ -333,17 +365,17 @@ class Fp8Dtype:
     typed A/B buffer views, and the G2S/S2R operand loaders."""
 
     name = "fp8"
-    lds_element = fx.Float8E4M3FN          # SharedStorage @fx.struct array element
+    lds_element = fx.Float8E4M3FN  # SharedStorage @fx.struct array element
     # loader codegen: which layouts force inline-asm S2R (TN's tr8)
     _ASM_LAYOUTS = frozenset({"tn"})
 
     def __init__(self, *, cbsz, blgp):
-        self.cbsz = cbsz       # E5M2 on srcA (else E4M3)
-        self.blgp = blgp       # E5M2 on srcB (else E4M3)
+        self.cbsz = cbsz  # E5M2 on srcA (else E4M3)
+        self.blgp = blgp  # E5M2 on srcB (else E4M3)
 
     @property
     def loader_ir_type(self):
-        return fx.Float8E4M3FN.ir_type     # G2S / S2R / make_buffers element type
+        return fx.Float8E4M3FN.ir_type  # G2S / S2R / make_buffers element type
 
     @property
     def cache_key(self):
@@ -358,29 +390,48 @@ class Fp8Dtype:
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
         return a_div, b_div
 
-    def build_loaders(self, geom, *, layout, a_div, b_div, gl_off_a, gl_off_b,
-                      wave_id, wave_m, wave_n, vmcnt_hint, b_inline_asm_load):
+    def build_loaders(
+        self,
+        geom,
+        *,
+        layout,
+        a_div,
+        b_div,
+        gl_off_a,
+        gl_off_b,
+        wave_id,
+        wave_m,
+        wave_n,
+        vmcnt_hint,
+        b_inline_asm_load,
+    ):
         """G2S + transpose-aware S2R loaders (element type = this, transpose = layout)."""
         F8 = self.loader_ir_type
         cs = geom.chunk_stride
         # loader owns the inline-asm decision (keyed by layout)
         force_inline_asm = layout.name in self._ASM_LAYOUTS
-        a_gmem2lds = G2SLoader(
-            a_div, gl_off_a, geom.N_LDS_STEPS_A, F8, wave_id, chunk_stride=cs)
-        b_gmem2lds = G2SLoader(
-            b_div, gl_off_b, geom.N_LDS_STEPS_B, F8, wave_id, chunk_stride=cs)
+        a_gmem2lds = G2SLoader(a_div, gl_off_a, geom.N_LDS_STEPS_A, F8, wave_id, chunk_stride=cs)
+        b_gmem2lds = G2SLoader(b_div, gl_off_b, geom.N_LDS_STEPS_B, F8, wave_id, chunk_stride=cs)
         if layout.a_transpose:
             a_lds2reg = S2RLoaderTr(
-                wave_m, geom.N_TILES_A, geom.LDS_BLOCK_M // 2, inline_asm=force_inline_asm,
-                vmcnt_hint=vmcnt_hint, chunk_stride=cs,
+                wave_m,
+                geom.N_TILES_A,
+                geom.LDS_BLOCK_M // 2,
+                inline_asm=force_inline_asm,
+                vmcnt_hint=vmcnt_hint,
+                chunk_stride=cs,
             )
         else:
             a_lds2reg = S2RLoader(wave_m, geom.N_TILES_A)
         if layout.b_transpose:
             b_inline = force_inline_asm or b_inline_asm_load
             b_lds2reg = S2RLoaderTr(
-                wave_n, geom.N_TILES_B, 32, inline_asm=b_inline,
-                vmcnt_hint=vmcnt_hint, chunk_stride=cs,
+                wave_n,
+                geom.N_TILES_B,
+                32,
+                inline_asm=b_inline,
+                vmcnt_hint=vmcnt_hint,
+                chunk_stride=cs,
             )
         else:
             b_lds2reg = S2RLoader(wave_n, geom.N_TILES_B)
@@ -393,7 +444,7 @@ class Fp8MmaAtom:
     """fp8 MFMA 16x16x128 atom: declares inst_shape and builds the atom; its operand
     formats come from the dtype's cbsz/blgp, its inplace mode from the layout."""
 
-    inst_shape = (16, 16, 128)            # MFMA 16x16x128 (M, N, K)
+    inst_shape = (16, 16, 128)  # MFMA 16x16x128 (M, N, K)
     # mma codegen: which layouts use asm-inplace MFMA (accum in AGPR)
     _INPLACE_LAYOUTS = frozenset({"tn"})
 
@@ -401,7 +452,9 @@ class Fp8MmaAtom:
     def cache_key(self):
         return ("mfma_16x16x128",)
 
-    def build_mfma(self, geom, *, layout, cbsz, blgp):
+    def build_mfma(self, geom, *, layout, dtype):
+        # operand fp8 fmt selectors come from the paired dtype (cbsz->srcA, blgp->srcB)
+        cbsz, blgp = dtype.cbsz, dtype.blgp
         inplace = layout.name in self._INPLACE_LAYOUTS
         mfma = Mfma16x16x128(geom.N_TILES_A, geom.N_TILES_B)
         if inplace:
@@ -411,8 +464,7 @@ class Fp8MmaAtom:
             # E5M2 / hybrid: rebuild atom with per-operand fp8 fmt (cbsz->srcA, blgp->srcB)
             _ea = fx.Float8E5M2 if cbsz else fx.Float8E4M3FN
             _eb = fx.Float8E5M2 if blgp else fx.Float8E4M3FN
-            mfma.atom = fx.make_mma_atom(
-                fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, _ea, _eb))
+            mfma.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, _ea, _eb))
         return mfma
 
 
@@ -452,7 +504,15 @@ class PerTensorEpilogue:
     def build(self, geom, *, A_scale, B_scale, C, c_m, c_n, mfma, epilogue_ctx=None):
         out_ty = fx.Float16 if self.out_fp16 else fx.BFloat16
         return StoreCPerTensor(
-            A_scale, B_scale, C, c_m, c_n, mfma.idx, geom.N_TILES_A, geom.N_TILES_B, out_ty,
+            A_scale,
+            B_scale,
+            C,
+            c_m,
+            c_n,
+            mfma.idx,
+            geom.N_TILES_A,
+            geom.N_TILES_B,
+            out_ty,
             elem_fn=self._elem_fn(),
         )
 
@@ -467,8 +527,7 @@ class PerTensorEpilogue:
         store_c.store(accum.c00, base_row + 0, base_col + 0)
         store_c.store(accum.c01, base_row + 0, base_col + LDS_BLOCK_N)
         store_c.store(accum.c10, base_row + LDS_BLOCK_M, base_col + 0)
-        store_c.store(accum.c11, base_row + LDS_BLOCK_M,
-                      base_col + LDS_BLOCK_N)
+        store_c.store(accum.c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
 
 # The mainloop axis -- stages, smem ring, and the hand-authored run().
@@ -481,9 +540,9 @@ class InterleavedKPipeline:
     # pipeline owns its per-layout mainloop schedule (drains/mask empirically tuned).
     # (wants_end_iter_drain, main_b0_no_drain, mask_a_in_tail)
     _SCHED = {
-        "nt": (True,  False, True),
+        "nt": (True, False, True),
         "nn": (False, False, True),
-        "tn": (False, True,  False),
+        "tn": (False, True, False),
     }
 
     @property
@@ -495,25 +554,44 @@ class InterleavedKPipeline:
         # halves fixed at 2 (the M/N quadrant split)
         fields = {}
         for op, size in (("A", geom.a_lds_size), ("B", geom.b_lds_size)):
-            for s in range(self.stages):       # stage-major
-                for h in range(halves):        # half-minor
+            for s in range(self.stages):  # stage-major
+                for h in range(halves):  # half-minor
                     fields[f"{op}_lds_s{s}_h{h}"] = fx.Array[lds_elem, size, 16]
         return fx.struct(type("SharedStorage", (), {"__annotations__": fields}))
 
     def rings(self, lds, halves=HALVES):
         """lds -> (a_rings, b_rings); each ``halves`` lists, ``stages`` deep, indexed ring[k%S]."""
+
         # halves fixed at 2 (the M/N quadrant split)
         def build(op):
             return tuple(
-                [getattr(lds, f"{op}_lds_s{s}_h{h}")
-                 for s in range(self.stages)]
-                for h in range(halves)
+                [getattr(lds, f"{op}_lds_s{s}_h{h}") for s in range(self.stages)] for h in range(halves)
             )
+
         return build("A"), build("B")
 
-    def run(self, geom, *, layout_name, nt_vmcnt, a_rings, b_rings, loaders, mfma,
-            A0_gl_offset, A1_gl_offset, B0_gl_offset, B1_gl_offset, a_k_mult, b_k_mult,
-            lane_id, wave_m, wave_n, block_m, block_n):
+    def run(
+        self,
+        geom,
+        *,
+        layout_name,
+        nt_vmcnt,
+        a_rings,
+        b_rings,
+        loaders,
+        mfma,
+        A0_gl_offset,
+        A1_gl_offset,
+        B0_gl_offset,
+        B1_gl_offset,
+        a_k_mult,
+        b_k_mult,
+        lane_id,
+        wave_m,
+        wave_n,
+        block_m,
+        block_n,
+    ):
         """Uniform-K pipeline: prelude -> main K-loop -> epilog1 -> epilog2 (K-tail) -> AccumTile.
         Per-layout drains/mask come from this pipeline's own _SCHED (not from the layout)."""
         S = self.stages
@@ -522,13 +600,13 @@ class InterleavedKPipeline:
         a_gmem2lds, b_gmem2lds, a_lds2reg, b_lds2reg = loaders  # G2S / S2R per operand
         N_LDS_STEPS_A = geom.N_LDS_STEPS_A
         N_LDS_STEPS_B = geom.N_LDS_STEPS_B
-        N_TILES_A = geom.N_TILES_A
-        N_TILES_B = geom.N_TILES_B
+        geom.N_TILES_A
+        geom.N_TILES_B
         N_ACCUMS = geom.N_ACCUMS
-        LDS_BLOCK_M = geom.LDS_BLOCK_M
-        LDS_BLOCK_N = geom.LDS_BLOCK_N
-        BLOCK_M = geom.BLOCK_M
-        BLOCK_N = geom.BLOCK_N
+        geom.LDS_BLOCK_M
+        geom.LDS_BLOCK_N
+        geom.BLOCK_M
+        geom.BLOCK_N
         BLOCK_K = geom.BLOCK_K
         K_ITERS = geom.K_ITERS
         K_TAIL = geom.K_TAIL
@@ -580,8 +658,7 @@ class InterleavedKPipeline:
             else:
                 b0_frag = b_lds2reg.load(b_cur0)
             a0_frag = a_lds2reg.load(a_cur0)
-            a_gmem2lds.load(a_next1, A1_gl_offset +
-                            (k + 1) * BLOCK_K * a_k_mult)
+            a_gmem2lds.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * a_k_mult)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -590,8 +667,7 @@ class InterleavedKPipeline:
             rocdl.s_barrier()
 
             b1_frag = b_lds2reg.load(b_cur1)
-            b_gmem2lds.load(b_cur0_pf, B0_gl_offset +
-                            (k + 2) * BLOCK_K * b_k_mult)
+            b_gmem2lds.load(b_cur0_pf, B0_gl_offset + (k + 2) * BLOCK_K * b_k_mult)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -600,8 +676,7 @@ class InterleavedKPipeline:
             rocdl.s_barrier()
 
             a1_frag = a_lds2reg.load(a_cur1)
-            a_gmem2lds.load(a_cur0_pf, A0_gl_offset +
-                            (k + 2) * BLOCK_K * a_k_mult)
+            a_gmem2lds.load(a_cur0_pf, A0_gl_offset + (k + 2) * BLOCK_K * a_k_mult)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -609,8 +684,7 @@ class InterleavedKPipeline:
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
-            b_gmem2lds.load(b_cur1_pf, B1_gl_offset +
-                            (k + 2) * BLOCK_K * b_k_mult)
+            b_gmem2lds.load(b_cur1_pf, B1_gl_offset + (k + 2) * BLOCK_K * b_k_mult)
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             rocdl.s_setprio(1)
@@ -619,9 +693,13 @@ class InterleavedKPipeline:
             rocdl.s_barrier()
 
             if end_iter_drain is not None and end_iter_drain >= 0:
-                _llvm.inline_asm(res=None, operands_=[],
-                                 asm_string=f"s_waitcnt vmcnt({end_iter_drain})",
-                                 constraints="", has_side_effects=True)  # end-of-iter G2S drain
+                _llvm.inline_asm(
+                    res=None,
+                    operands_=[],
+                    asm_string=f"s_waitcnt vmcnt({end_iter_drain})",
+                    constraints="",
+                    has_side_effects=True,
+                )  # end-of-iter G2S drain
 
         # Epilog 1 (k = K_ITERS - 2); the a-h1 load is the c10/c11 stale-a1 fix
         k = K_ITERS - 2
@@ -657,8 +735,7 @@ class InterleavedKPipeline:
         rocdl.s_barrier()
 
         b0_frag = b_lds2reg.load(b_next0)
-        a_gmem2lds.load(a_next1, A1_gl_offset + (k + 1) *
-                        BLOCK_K * a_k_mult)  # stale-a1 fix
+        a_gmem2lds.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * a_k_mult)  # stale-a1 fix
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -701,8 +778,7 @@ class InterleavedKPipeline:
         rocdl.s_barrier()
 
         # Hand the accumulator tile to the epilogue
-        return AccumTile(c00_frag, c01_frag, c10_frag, c11_frag,
-                         block_m, block_n, wave_m, wave_n)
+        return AccumTile(c00_frag, c01_frag, c10_frag, c11_frag, block_m, block_n, wave_m, wave_n)
 
 
 # Central legality gate (CUTLASS can_implement): host-side, emits no IR.
@@ -734,8 +810,9 @@ def derive_geometry(layout_spec, mma_spec, *, K, block_tile, warp_tile):
     # (warp_tile = the real contiguous per-wave output tile) -> 16x16 MMA.
     LDS_BLOCK_M = BLOCK_M // QUAD
     LDS_BLOCK_N = BLOCK_N // QUAD
-    assert LDS_BLOCK_M % WARP_M == 0 and LDS_BLOCK_N % WARP_N == 0, \
-        "warp_tile must divide the quadrant (BLOCK // 2) along M/N"
+    assert (
+        LDS_BLOCK_M % WARP_M == 0 and LDS_BLOCK_N % WARP_N == 0
+    ), "warp_tile must divide the quadrant (BLOCK // 2) along M/N"
     # Wave grid = CUTLASS WarpCount within a quadrant (quadrant / WarpShape) -- the
     # swappable 2x4 / 2x2 arrangement. Per-wave MMA tiles = WarpShape / instruction.
     WAVES_M = LDS_BLOCK_M // WARP_M
@@ -743,18 +820,29 @@ def derive_geometry(layout_spec, mma_spec, *, K, block_tile, warp_tile):
     N_TILES_A = WARP_M // INST_M
     N_TILES_B = WARP_N // INST_N
     # layout-specific LDS sub-geometry (TN forces >= 2 G2S rounds + bank-spread)
-    lds = layout_spec.lds_geometry(
-        LDS_BLOCK_M=LDS_BLOCK_M, LDS_BLOCK_N=LDS_BLOCK_N, BLOCK_K=BLOCK_K)
+    lds = layout_spec.lds_geometry(LDS_BLOCK_M=LDS_BLOCK_M, LDS_BLOCK_N=LDS_BLOCK_N, BLOCK_K=BLOCK_K)
     return TileGeometry(
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, K=K,
-        WAVES_M=WAVES_M, WAVES_N=WAVES_N,
-        N_TILES_A=N_TILES_A, N_TILES_B=N_TILES_B, N_ACCUMS=N_TILES_A * N_TILES_B,
-        LDS_BLOCK_M=LDS_BLOCK_M, LDS_BLOCK_N=LDS_BLOCK_N,
-        N_LDS_STEPS_A=lds.N_LDS_STEPS_A, N_LDS_STEPS_B=lds.N_LDS_STEPS_B,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        K=K,
+        WAVES_M=WAVES_M,
+        WAVES_N=WAVES_N,
+        N_TILES_A=N_TILES_A,
+        N_TILES_B=N_TILES_B,
+        N_ACCUMS=N_TILES_A * N_TILES_B,
+        LDS_BLOCK_M=LDS_BLOCK_M,
+        LDS_BLOCK_N=LDS_BLOCK_N,
+        N_LDS_STEPS_A=lds.N_LDS_STEPS_A,
+        N_LDS_STEPS_B=lds.N_LDS_STEPS_B,
         N_LDS_ROUNDS=max(lds.N_LDS_STEPS_A, lds.N_LDS_STEPS_B),
-        chunk_stride=lds.chunk_stride, a_lds_size=lds.a_lds_size, b_lds_size=lds.b_lds_size,
+        chunk_stride=lds.chunk_stride,
+        a_lds_size=lds.a_lds_size,
+        b_lds_size=lds.b_lds_size,
         # K-tail: ceil(K/128) iters; last iter length K_TAIL (0 = exact)
-        K_ITERS=(K + BLOCK_K - 1) // BLOCK_K, K_TAIL=K % BLOCK_K)
+        K_ITERS=(K + BLOCK_K - 1) // BLOCK_K,
+        K_TAIL=K % BLOCK_K,
+    )
 
 
 # Dense FP8 tile spec: geometry + held policies + shared storage.
@@ -789,8 +877,7 @@ class DenseFp8TileSpec:
         # locked together per precision. mma supplies inst_shape for geometry.
         dtype_spec = Fp8Dtype(cbsz=cbsz, blgp=blgp)
         mma_spec = Fp8MmaAtom()
-        geom = derive_geometry(
-            layout_spec, mma_spec, K=K, block_tile=block_tile, warp_tile=warp_tile)
+        geom = derive_geometry(layout_spec, mma_spec, K=K, block_tile=block_tile, warp_tile=warp_tile)
         self.geom = geom
         assert geom.N_ACCUMS > 0
         a_lds_size = geom.a_lds_size
@@ -799,8 +886,7 @@ class DenseFp8TileSpec:
         # pipeline/mainloop policy (held): schedule body + SharedStorage. Race-fix
         # flags are NOT copied here -- run() reads them off its own _SCHED at use time.
         pipeline = InterleavedKPipeline()
-        SharedStorage = pipeline.shared_storage(
-            geom, lds_elem=dtype_spec.lds_element)
+        SharedStorage = pipeline.shared_storage(geom, lds_elem=dtype_spec.lds_element)
         # LDS budget guard (gfx950 160KB): fail fast on an oversized tile
         lds_bytes = pipeline.stages * 2 * (a_lds_size + b_lds_size)
         assert lds_bytes <= _LDS_LIMIT_BYTES, (
@@ -813,8 +899,7 @@ class DenseFp8TileSpec:
         self.block_tile = block_tile
         self.warp_tile = warp_tile
         # tile-id scheduler (held); grouped specs swap in LinearNoSyncScheduler
-        self.scheduler_spec = XcdSwizzleScheduler(
-            GROUP_M=GROUP_M, group_n=group_n, num_xcd=num_xcd)
+        self.scheduler_spec = XcdSwizzleScheduler(GROUP_M=GROUP_M, group_n=group_n, num_xcd=num_xcd)
         # C-store epilogue (held); act=None -> plain scaled store
         _nodes = () if act is None else (_EPILOGUE_ACTS[act],)
         self.epilogue_spec = PerTensorEpilogue(
@@ -863,14 +948,19 @@ class DenseFp8TileSpec:
             self.b_inline_asm_load,
         )
         # held policies only; loaders are derived (built by dtype), out_fp16 rides epilogue_spec
-        for p in (self.layout_spec, self.dtype_spec, self.mma_spec, self.scheduler_spec,
-                  self.epilogue_spec, self.pipeline_spec):
+        for p in (
+            self.layout_spec,
+            self.dtype_spec,
+            self.mma_spec,
+            self.scheduler_spec,
+            self.epilogue_spec,
+            self.pipeline_spec,
+        ):
             tag += tuple(p.cache_key)
         return tag
 
     # ──────────────────────────────────────────────────────────────────
-    def emit(self, *, A, B, C, A_scale, B_scale, c_m, c_n, group_base=0, lds=None,
-             epilogue_ctx=None):
+    def emit(self, *, A, B, C, A_scale, B_scale, c_m, c_n, group_base=0, lds=None, epilogue_ctx=None):
         """Splice the tile inline: setup -> per-stage policy calls -> pipeline.
         group_base / lds / epilogue_ctx are the grouped/fused seams (dense passes none)."""
         layout = self.layout_spec
@@ -891,8 +981,7 @@ class DenseFp8TileSpec:
         wave_m = wave_id // geom.WAVES_N
         wave_n = wave_id % geom.WAVES_N
 
-        block_m, block_n = self.scheduler_spec.map(
-            geom, c_m=c_m, c_n=c_n, n_blocks=n_blocks)
+        block_m, block_n = self.scheduler_spec.map(geom, c_m=c_m, c_n=c_n, n_blocks=n_blocks)
 
         (
             A0_gl_offset,
@@ -901,14 +990,14 @@ class DenseFp8TileSpec:
             B1_gl_offset,
             a_k_mult,
             b_k_mult,
-        ) = layout.base_offsets(geom, block_m=block_m, block_n=block_n, c_m=c_m, c_n=c_n, group_base=group_base)
+        ) = layout.base_offsets(
+            geom, block_m=block_m, block_n=block_n, c_m=c_m, c_n=c_n, group_base=group_base
+        )
 
         a_div, b_div = self.dtype_spec.make_buffers(A=A, B=B)
-        gl_off_a, gl_off_b = layout.global_swizzle(
-            geom, lane_id=lane_id, wave_id=wave_id, c_m=c_m, c_n=c_n)
-        # mma owns inplace (keyed by layout); atom format fed from the dtype (cbsz/blgp)
-        mfma = self.mma_spec.build_mfma(
-            geom, layout=layout, cbsz=self.dtype_spec.cbsz, blgp=self.dtype_spec.blgp)
+        gl_off_a, gl_off_b = layout.global_swizzle(geom, lane_id=lane_id, wave_id=wave_id, c_m=c_m, c_n=c_n)
+        # mma owns inplace (keyed by layout); operand formats read off the paired dtype
+        mfma = self.mma_spec.build_mfma(geom, layout=layout, dtype=self.dtype_spec)
         # loaders = dtype x layout product (element type = dtype, transpose = layout)
         loaders = self.dtype_spec.build_loaders(
             geom,
@@ -924,8 +1013,15 @@ class DenseFp8TileSpec:
             b_inline_asm_load=self.b_inline_asm_load,
         )
         store_c = self.epilogue_spec.build(
-            geom, A_scale=A_scale, B_scale=B_scale, C=C, c_m=c_m, c_n=c_n, mfma=mfma,
-            epilogue_ctx=epilogue_ctx)
+            geom,
+            A_scale=A_scale,
+            B_scale=B_scale,
+            C=C,
+            c_m=c_m,
+            c_n=c_n,
+            mfma=mfma,
+            epilogue_ctx=epilogue_ctx,
+        )
 
         # mainloop -> accumulator tile -> epilogue store
         accum = self.pipeline_spec.run(
@@ -948,5 +1044,4 @@ class DenseFp8TileSpec:
             block_m=block_m,
             block_n=block_n,
         )
-        self.epilogue_spec.consume(
-            geom, store_c=store_c, accum=accum, epilogue_ctx=epilogue_ctx)
+        self.epilogue_spec.consume(geom, store_c=store_c, accum=accum, epilogue_ctx=epilogue_ctx)
