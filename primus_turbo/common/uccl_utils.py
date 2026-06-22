@@ -18,7 +18,7 @@ from primus_turbo.common.logger import logger
 # Required uccl release. uccl has no usable release tag, so pin a main commit.
 # Keep in sync with UCCL_VERSION/UCCL_GIT_TAG in the ci / benchmark / release workflows.
 UCCL_VERSION = "0.1.1"
-UCCL_GIT_TAG = "34bdf4f49c8e33d618b983afc34fc5bec8686cfa"  # latest main commit
+UCCL_GIT_TAG = "12fdebd8d9a40f12364239f51d74fc773c41a4a7"  # [EP] LL clean & Zero-token LL rank issues (#993)
 _UCCL_DIST_NAME = "uccl"
 _UCCL_GIT_URL = "https://github.com/uccl-project/uccl.git"
 

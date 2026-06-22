@@ -59,7 +59,7 @@ jobs:
   install-dependencies:
     runs-on: turbo-torch-ut-v2602
     env:
-        UCCL_COMMIT: 69a21407d261a8ff0f01f83bb0f5b35da059876d #  [rdma] Make CQ Ex flags configurable for NIC compatibility. (#689)
+        UCCL_COMMIT: 12fdebd8d9a40f12364239f51d74fc773c41a4a7 # [EP] LL clean & Zero-token LL rank issues (#993)
         UCCL_PY_VER: 3.12
     steps:
       - name: Print job info
