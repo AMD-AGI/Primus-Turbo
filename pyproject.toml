@@ -11,3 +11,21 @@ version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
 write_to = "primus_turbo/_version.py"
 fallback_version = "0.0.0.dev0"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = [
+    "3rdparty",
+    "build",
+    "primus_turbo/_version.py",
+    "primus_turbo/_build_info.py",
+]
+
+[tool.ruff.lint]
+select = ["F", "I", "W"]
+# F403/F405: package __init__ files use intentional star-imports for API aggregation.
+ignore = ["F403", "F405"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

@@ -42,28 +42,14 @@ jobs:
             python-version: ${{ matrix.python-version }}
       - name: Display Python version
         run: python -c "import sys; print(sys.version)"
-      - name: Install Autoflake
-        run: pip install autoflake==v2.3.1
-      - name: Run Autoflake
+      - name: Install Ruff
+        run: pip install ruff==0.15.12
+      - name: Ruff lint check
         if: always()
-        run: |
-          output=$(autoflake . --remove-all-unused-imports --remove-unused-variables --expand-star-imports --ignore-init-module-imports --recursive)
-          if [[ -n $output ]]
-          then
-            echo "Autoflake check failed: $output"
-            exit 1
-          else
-            echo "Autoflake check success."
-            exit 0
-          fi
-      - uses: isort/isort-action@v1
+        run: ruff check --output-format=github .
+      - name: Ruff format check
         if: always()
-        with:
-            configuration: "--profile black --check-only --diff"
-      - uses: psf/black@24.8.0
-        if: always()
-        with:
-          options: "--check --diff --color --verbose --line-length=110"
+        run: ruff format --check --diff .
 
   install-dependencies:
     # GPU runner job: for PRs, only run when a maintainer adds the 'ci:gpu'
