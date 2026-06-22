@@ -63,9 +63,7 @@ def _infer_qkv_format(
         if s0 >= s2 >= s1:
             return "bhsd"
 
-        assert False, (
-            f"Cannot infer qkv layout from shape {tuple(t.size())} " f"and strides {tuple(t.stride())}"
-        )
+        assert False, f"Cannot infer qkv layout from shape {tuple(t.size())} and strides {tuple(t.stride())}"
 
     assert q.ndim == 4, f"Expected 4-D tensor for q, got {q.ndim}-D"
     q_format = _infer_format(q)

@@ -338,9 +338,9 @@ class AttentionTritonFunctionCPA2A(torch.autograd.Function):
         ring_group,
     ):
         assert bias is None
-        assert (
-            dist.get_world_size(ring_group) == 1
-        ), "currently ring attention not supported for fp8, since triton implementation does not use the standard flash attention interface"
+        assert dist.get_world_size(ring_group) == 1, (
+            "currently ring attention not supported for fp8, since triton implementation does not use the standard flash attention interface"
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -538,9 +538,9 @@ class AttentionVarlenCKFunctionCPA2A(torch.autograd.Function):
             raise NotImplementedError("varlen USP supports Ulysses A2A only; ring is not supported")
         assert dropout_p == 0.0, "varlen USP does not support dropout"
         assert q.dim() == 3 and k.dim() == 3, "varlen USP expects packed [t, h, d] (thd) inputs"
-        assert (
-            q.dtype is torch.bfloat16 and k.dtype is torch.bfloat16 and v.dtype is torch.bfloat16
-        ), "varlen USP (aiter) only supports bfloat16 q/k/v"
+        assert q.dtype is torch.bfloat16 and k.dtype is torch.bfloat16 and v.dtype is torch.bfloat16, (
+            "varlen USP (aiter) only supports bfloat16 q/k/v"
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -858,11 +858,11 @@ def flash_attn_fp8_usp_func(
     # Check if config is supported
     if fp8_config.granularity != ScalingGranularity.BLOCKWISE:
         raise ValueError(
-            f"flash_attn_fp8_func only supports BLOCKWISE granularity, " f"but got {fp8_config.granularity}"
+            f"flash_attn_fp8_func only supports BLOCKWISE granularity, but got {fp8_config.granularity}"
         )
     if fp8_config.block_size != 64:
         raise ValueError(
-            f"flash_attn_fp8_func only supports block_size=64, " f"but got block_size={fp8_config.block_size}"
+            f"flash_attn_fp8_func only supports block_size=64, but got block_size={fp8_config.block_size}"
         )
 
     o = AttentionTritonFunctionCPA2A.apply(

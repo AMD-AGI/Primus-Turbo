@@ -31,7 +31,6 @@ def clean_backend_state(monkeypatch):
 
 
 class TestGlobalBackendManagerEnvVar:
-
     def test_gemm_backend_single_format(self, monkeypatch):
         """Format 1: PRIMUS_TURBO_GEMM_BACKEND=ck -> all precisions use CK."""
         monkeypatch.setenv("PRIMUS_TURBO_GEMM_BACKEND", "ck")
@@ -82,7 +81,6 @@ class TestGlobalBackendManagerEnvVar:
 
 
 class TestGlobalBackendManagerFunction:
-
     @staticmethod
     def _init_gemm_backend():
         GlobalBackendManager._gemm_backend = {p: None for p in PrecisionType}

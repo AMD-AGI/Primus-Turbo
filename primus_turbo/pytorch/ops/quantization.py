@@ -56,7 +56,6 @@ def quantize_fp8(
         return quantize_fp8_tensorwise_impl(x, out_dtype)
 
     elif granularity == ScalingGranularity.ROWWISE:
-
         return quantize_fp8_rowwise_impl(x, out_dtype, axis)
     elif granularity == ScalingGranularity.BLOCKWISE:
         assert block_size is not None, "block_size must be specified for BLOCKWISE quantization"
@@ -67,9 +66,9 @@ def quantize_fp8(
 
         return quant_fp8_blockwise_impl(x, out_dtype, axis=axis, block_size=block_size)
     elif granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert (
-            block_size == MXFP8_BLOCK_SIZE
-        ), f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+        assert block_size == MXFP8_BLOCK_SIZE, (
+            f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+        )
 
         return quantize_mxfp8_impl(
             x,
@@ -106,9 +105,9 @@ def quantize_fp8_with_trans(
             4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert (
-            block_size == MXFP8_BLOCK_SIZE
-        ), f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+        assert block_size == MXFP8_BLOCK_SIZE, (
+            f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+        )
         return quantize_mxfp8_impl(
             x,
             out_dtype,
@@ -146,9 +145,9 @@ def grouped_quantize_fp8_with_trans(
     FP8 Grouped Quantize with trans
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert (
-            block_size == MXFP8_BLOCK_SIZE
-        ), f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+        assert block_size == MXFP8_BLOCK_SIZE, (
+            f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+        )
 
         return grouped_quantize_mxfp8_impl(
             x,
@@ -193,9 +192,9 @@ def dequantize_fp8(
 
         return dequantize_fp8_rowwise_impl(x, out_dtype, axis, scale_inv)
     elif granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert (
-            block_size == MXFP8_BLOCK_SIZE
-        ), f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+        assert block_size == MXFP8_BLOCK_SIZE, (
+            f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+        )
 
         return dequantize_mxfp8_impl(x, out_dtype, axis, block_size, scale_inv)
     else:
@@ -221,9 +220,9 @@ def quantize_fp4(
             3. The block size must be 32.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert (
-            block_size == MXFP4_BLOCK_SIZE
-        ), f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
+        assert block_size == MXFP4_BLOCK_SIZE, (
+            f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
+        )
         return quantize_mxfp4_impl(
             x,
             out_dtype,
@@ -257,9 +256,9 @@ def quantize_fp4_with_trans(
             4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert (
-            block_size == MXFP4_BLOCK_SIZE
-        ), f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
+        assert block_size == MXFP4_BLOCK_SIZE, (
+            f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
+        )
         return quantize_mxfp4_impl(
             x,
             out_dtype,
@@ -293,9 +292,9 @@ def dequantize_fp4(
             3. The block size must be 32.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert (
-            block_size == MXFP4_BLOCK_SIZE
-        ), f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
+        assert block_size == MXFP4_BLOCK_SIZE, (
+            f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
+        )
 
         return dequantize_mxfp4_impl(x, out_dtype, axis, block_size, scale_inv)
     else:

@@ -849,15 +849,15 @@ def _test_grouped_gemm_fp8_hipgraph_test(
     # Verify out with group_lens2
     out2_snr = compute_snr(out_ref2, out)
     print(f"[group_lens2] Out-SNR: {out2_snr:.2f} dB")
-    assert out2_snr > snr_threshold, f"out2_snr too low"
+    assert out2_snr > snr_threshold, "out2_snr too low"
 
     a_grad_snr2 = compute_snr(a_ref2.grad, a.grad)
     print(f"[group_lens2] AGrad-SNR: {a_grad_snr2:.2f} dB")
-    assert a_grad_snr2 > snr_threshold, f"a_grad_snr2 too low"
+    assert a_grad_snr2 > snr_threshold, "a_grad_snr2 too low"
 
     b_grad_snr2 = compute_snr(b_ref2.grad, b.grad)
     print(f"[group_lens2] BGrad-SNR: {b_grad_snr2:.2f} dB")
-    assert b_grad_snr2 > snr_threshold, f"b_grad_snr2 too low"
+    assert b_grad_snr2 > snr_threshold, "b_grad_snr2 too low"
 
     del g
     torch.cuda.synchronize()

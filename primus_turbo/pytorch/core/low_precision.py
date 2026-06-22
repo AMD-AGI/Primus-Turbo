@@ -176,14 +176,14 @@ class Float8QuantConfig:
 
         if self.granularity == ScalingGranularity.MX_BLOCKWISE:
             mx_support_block_size = [MXFP8_BLOCK_SIZE]
-            assert (
-                self.block_size in mx_support_block_size
-            ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+            assert self.block_size in mx_support_block_size, (
+                f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+            )
 
             mx_support_scale_dtype = ScaleDtype.E8M0
-            assert (
-                self.scale_dtype == mx_support_scale_dtype
-            ), f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
+            assert self.scale_dtype == mx_support_scale_dtype, (
+                f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
+            )
 
 
 @dataclass
@@ -197,20 +197,20 @@ class Float4QuantConfig:
     use_preshuffle: bool = False
 
     def __post_init__(self):
-        assert (
-            self.granularity == ScalingGranularity.MX_BLOCKWISE
-        ), "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
+        assert self.granularity == ScalingGranularity.MX_BLOCKWISE, (
+            "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
+        )
 
         mx_support_block_size = [MXFP4_BLOCK_SIZE]
-        assert (
-            self.block_size in mx_support_block_size
-        ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+        assert self.block_size in mx_support_block_size, (
+            f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+        )
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
 
         mx_support_scale_dtype = ScaleDtype.E8M0
-        assert (
-            self.scale_dtype == mx_support_scale_dtype
-        ), f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
+        assert self.scale_dtype == mx_support_scale_dtype, (
+            f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
+        )
 
 
 def weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:

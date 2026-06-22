@@ -24,7 +24,6 @@ _HIPBLASLT_SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
 class GEMMHipBLASLtBackend(KernelBackend):
-
     @staticmethod
     def can_handle(
         a: torch.Tensor,
@@ -54,7 +53,6 @@ class GEMMHipBLASLtBackend(KernelBackend):
 
 
 class GEMMTritonBackend(KernelBackend):
-
     @staticmethod
     def can_handle(
         a: torch.Tensor,
@@ -136,9 +134,9 @@ def gemm_impl_meta(
     trans_c: bool,
     default_backend: int,
 ) -> torch.Tensor:
-    assert (
-        a.ndim == 2 and b.ndim == 2
-    ), f"Expected both a and b to be 2D tensors, but got a.ndim={a.ndim}, b.ndim={b.ndim}"
+    assert a.ndim == 2 and b.ndim == 2, (
+        f"Expected both a and b to be 2D tensors, but got a.ndim={a.ndim}, b.ndim={b.ndim}"
+    )
     M = a.shape[1] if trans_a else a.shape[0]
     N = b.shape[0] if trans_b else b.shape[1]
     if trans_c:

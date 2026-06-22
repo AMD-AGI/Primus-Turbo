@@ -59,9 +59,9 @@ class _MoEPermute(torch.autograd.Function):
         if use_fp8 and scaling_factor is not None:
             assert scales_per_token > 0, "scales_per_token must be > 0 when use_fp8=True"
         # backward asserts not use_fp8; catch the unsupported combo at the forward boundary.
-        assert not (
-            use_fp8 and probs is not None and tokens.requires_grad
-        ), "moe_permute: FP8 + probs backward is unsupported"
+        assert not (use_fp8 and probs is not None and tokens.requires_grad), (
+            "moe_permute: FP8 + probs backward is unsupported"
+        )
 
         # Fast path: preprocessing kernel asserts num_dispatched > 0.
         if num_dispatched == 0:

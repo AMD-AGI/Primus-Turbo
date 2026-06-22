@@ -19,9 +19,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch
+from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch, reset_runtime, setup
 from primus_turbo.jax.lax.moe import moe_dispatch_combine as mdc
-from primus_turbo.jax.lax.moe import reset_runtime, setup
 
 
 @pytest.fixture(autouse=True)

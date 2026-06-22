@@ -46,7 +46,7 @@ def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, dynamic_quantize
     assert_allclose(
         x_fp8_ref.astype(jnp.float32) * x_scale_inv_ref,
         x_fp8.astype(jnp.float32) * x_scale_inv,
-        **get_tolerances(dest_dtype)
+        **get_tolerances(dest_dtype),
     )
 
     # DeQuantize
@@ -87,5 +87,5 @@ def test_quantize_fp8_rowwise(orig_dtype, dest_dtype, axis, B, M, N, dynamic_qua
     assert_allclose(
         x_fp8_ref.astype(jnp.float32) * x_scale_inv_ref,
         x_fp8.astype(jnp.float32) * x_scale_inv,
-        **get_tolerances(dest_dtype)
+        **get_tolerances(dest_dtype),
     )

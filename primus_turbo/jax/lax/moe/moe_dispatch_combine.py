@@ -50,9 +50,6 @@ import jax.numpy as jnp
 
 from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
 from primus_turbo.jax.deep_ep.runtime import (
-    MODE_INPROC,  # re-export for callers that introspect mode (e.g. tests)
-)
-from primus_turbo.jax.deep_ep.runtime import (
     MODE_PER_PROCESS,
     NUM_MAX_NVL_PEERS,
     LaunchMode,
@@ -354,7 +351,7 @@ def setup(
     is_internode = locked_mode is MODE_PER_PROCESS and ep_size > NUM_MAX_NVL_PEERS
     if is_internode and ep_size % NUM_MAX_NVL_PEERS != 0:
         raise ValueError(
-            f"Internode mode requires ep_size %% {NUM_MAX_NVL_PEERS} == 0; " f"got ep_size={ep_size}."
+            f"Internode mode requires ep_size %% {NUM_MAX_NVL_PEERS} == 0; got ep_size={ep_size}."
         )
 
     # ----- Eager warmup -----

@@ -652,6 +652,6 @@ def test_mxfp4_sr_consecutive_calls_differ():
         scaling_recipe=sr_recipe,
     )
 
-    assert not torch.equal(
-        out1.view(torch.uint8), out2.view(torch.uint8)
-    ), "SR-quantized outputs should differ across consecutive calls"
+    assert not torch.equal(out1.view(torch.uint8), out2.view(torch.uint8)), (
+        "SR-quantized outputs should differ across consecutive calls"
+    )

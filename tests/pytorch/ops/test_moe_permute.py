@@ -4,8 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Unit tests for ``moe_permute`` / ``moe_unpermute`` (HIP MoE kernels).
-"""
+"""Unit tests for ``moe_permute`` / ``moe_unpermute`` (HIP MoE kernels)."""
 
 import pytest
 import torch

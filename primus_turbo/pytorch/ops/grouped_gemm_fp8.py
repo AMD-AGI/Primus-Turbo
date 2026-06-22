@@ -60,7 +60,6 @@ def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
 
 
 class FP8GroupedGemmBlockFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -191,7 +190,6 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
 
 
 class FP8GroupedGemmRowFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -365,7 +363,6 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
 
 
 class FP8GroupedGemmTensorFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
