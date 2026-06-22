@@ -25,8 +25,8 @@ import math
 import os
 from datetime import datetime
 
-import torch
 import aiter
+import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
 from aiter.ops.shuffle import shuffle_weight
@@ -38,7 +38,12 @@ MODELS = {
     # https://huggingface.co/deepseek-ai/DeepSeek-R1  (671B total / 37B active)
     "deepseek-r1": {"hidden_size": 7168, "moe_intermediate_size": 2048, "n_routed_experts": 256, "topk": 8},
     # https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro  (1.6T total / 49B active; native fp4 experts, SwiGLU, top-6)
-    "deepseek-v4-pro": {"hidden_size": 7168, "moe_intermediate_size": 3072, "n_routed_experts": 384, "topk": 6},
+    "deepseek-v4-pro": {
+        "hidden_size": 7168,
+        "moe_intermediate_size": 3072,
+        "n_routed_experts": 384,
+        "topk": 6,
+    },
     # https://huggingface.co/moonshotai/Kimi-K2.6  (1T total / 32B active)
     "kimi-k2.6": {"hidden_size": 7168, "moe_intermediate_size": 2048, "n_routed_experts": 384, "topk": 8},
     # https://huggingface.co/zai-org/GLM-5.1  (754B total)
@@ -52,7 +57,12 @@ MODELS = {
     # https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro  (1.02T total / 42B active)
     "mimo-v2.5-pro": {"hidden_size": 6144, "moe_intermediate_size": 2048, "n_routed_experts": 384, "topk": 8},
     # https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking  (80B total / 3B active; 512 experts, top-10)
-    "qwen3-next-80b-a3b": {"hidden_size": 2048, "moe_intermediate_size": 512, "n_routed_experts": 512, "topk": 10},
+    "qwen3-next-80b-a3b": {
+        "hidden_size": 2048,
+        "moe_intermediate_size": 512,
+        "n_routed_experts": 512,
+        "topk": 10,
+    },
 }
 
 DEFAULT_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
@@ -112,7 +122,9 @@ def make_routing(num_tokens, num_experts, topk, device, variance):
     """
     weights = torch.full((num_tokens, topk), 1.0 / topk, device=device, dtype=torch.float32)
     var_max = num_experts / topk - 1.0
-    balance = 1.0 if (variance <= 0.0 or var_max <= 0.0) else 1.0 - math.sqrt(min(variance, var_max) / var_max)
+    balance = (
+        1.0 if (variance <= 0.0 or var_max <= 0.0) else 1.0 - math.sqrt(min(variance, var_max) / var_max)
+    )
 
     if balance >= 1.0:
         stride = max(1, num_experts // topk)
@@ -531,10 +543,14 @@ def main():
 
     report = "bottleneck rank" if ep_size > 1 else "single rank"
     print()
-    print(f"  Model     : {args.model} (hidden={cfg['hidden_size']}, inter={cfg['moe_intermediate_size']}, "
-          f"experts={cfg['n_routed_experts']}, topk={cfg['topk']})")
+    print(
+        f"  Model     : {args.model} (hidden={cfg['hidden_size']}, inter={cfg['moe_intermediate_size']}, "
+        f"experts={cfg['n_routed_experts']}, topk={cfg['topk']})"
+    )
     print(f"  Precision : {args.quant}        Parallel : tp={tp_size} ep={ep_size}  variance={args.variance}")
-    print(f"  Timing    : {'cudagraph' if args.cudagraph else 'eager'}  ({report}; Imbal = slowest/fastest rank)")
+    print(
+        f"  Timing    : {'cudagraph' if args.cudagraph else 'eager'}  ({report}; Imbal = slowest/fastest rank)"
+    )
     print(f"  GPU       : {torch.cuda.get_device_name(0)}")
     print()
 

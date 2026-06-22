@@ -35,8 +35,8 @@ import contextlib
 import os
 from datetime import datetime
 
-import torch
 import aiter.mla
+import torch
 from aiter.ops.attention import paged_attention_ragged
 
 # family "gqa": num_q_heads, num_kv_heads, head_dim.
@@ -50,18 +50,39 @@ MODELS = {
     # https://huggingface.co/MiniMaxAI/MiniMax-M2.7  (229B; full GQA)
     "minimax-m2.7": {"family": "gqa", "num_q_heads": 48, "num_kv_heads": 8, "head_dim": 128},
     # GLM-5.1 (MLA + DeepSeek sparse attention). Absorbed decode: qk=576, v=512.
-    "glm-5.1": {"family": "dsa", "num_heads": 64, "kv_lora_rank": 512, "qk_rope_head_dim": 64,
-                "index_n_heads": 32, "index_head_dim": 128, "index_topk": 2048},
+    "glm-5.1": {
+        "family": "dsa",
+        "num_heads": 64,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 2048,
+    },
     # https://huggingface.co/deepseek-ai/DeepSeek-R1  (671B; MLA)
     "deepseek-r1": {"family": "mla", "num_heads": 128, "kv_lora_rank": 512, "qk_rope_head_dim": 64},
     # https://huggingface.co/moonshotai/Kimi-K2.6  (1T; MLA, DeepSeek-V3 arch)
     "kimi-k2.6": {"family": "mla", "num_heads": 64, "kv_lora_rank": 512, "qk_rope_head_dim": 64},
     # https://huggingface.co/openai/gpt-oss-120b  (117B; SWA layers, window 128, attention sinks)
-    "gpt-oss-120b": {"family": "swa", "num_q_heads": 64, "num_kv_heads": 8,
-                     "qk_head_dim": 64, "v_head_dim": 64, "window": 128, "sinks": True},
+    "gpt-oss-120b": {
+        "family": "swa",
+        "num_q_heads": 64,
+        "num_kv_heads": 8,
+        "qk_head_dim": 64,
+        "v_head_dim": 64,
+        "window": 128,
+        "sinks": True,
+    },
     # https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro  (1.02T; SWA layers, window 128)
-    "mimo-v2.5-pro": {"family": "swa", "num_q_heads": 128, "num_kv_heads": 8,
-                      "qk_head_dim": 192, "v_head_dim": 128, "window": 128, "sinks": False},
+    "mimo-v2.5-pro": {
+        "family": "swa",
+        "num_q_heads": 128,
+        "num_kv_heads": 8,
+        "qk_head_dim": 192,
+        "v_head_dim": 128,
+        "window": 128,
+        "sinks": False,
+    },
 }
 
 DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32, 64, 128, 256]
@@ -187,7 +208,9 @@ def shuffled_pages(num_pages, seed):
 # --------------------------------------------------------------------------- #
 
 
-def gqa_ref(query, key_cache, value_cache, ctx_lens, page_offsets, page_indices, scale, num_q_heads, num_kv_heads):
+def gqa_ref(
+    query, key_cache, value_cache, ctx_lens, page_offsets, page_indices, scale, num_q_heads, num_kv_heads
+):
     """Naive paged GQA decode reference (fp32). query [B, Hq, D];
     caches [num_pages, page_size, Hkv, D]; seq i uses physical pages
     page_indices[off[i]:off[i+1]] (same scattered layout the kernel sees)."""
@@ -243,9 +266,25 @@ def bench_gqa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu
 
     def fn():
         return paged_attention_ragged(
-            out, workspace, query, key_cache, value_cache, scale,
-            kv_indptr, kv_page_indices, kv_last_page_lens, page_size, max_num_partitions,
-            None, kv_cache_dtype, "NHD", 0.0, k_scale, v_scale, None, _PARTITION_SIZE,
+            out,
+            workspace,
+            query,
+            key_cache,
+            value_cache,
+            scale,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            page_size,
+            max_num_partitions,
+            None,
+            kv_cache_dtype,
+            "NHD",
+            0.0,
+            k_scale,
+            v_scale,
+            None,
+            _PARTITION_SIZE,
         )
 
     snr = None
@@ -282,7 +321,9 @@ def mla_ref(q, kv_buffer, kv_indptr, kv_indices, kv_lora_rank, scale):
     return out
 
 
-def bench_mla_triton(batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, seed, device, check, pool_tokens=None):
+def bench_mla_triton(
+    batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, seed, device, check, pool_tokens=None
+):
     """fp8 MLA decode via the triton paged kernel (newer aiter), used when the
     asm kernel has no variant for this nhead. Lazy import: unavailable -> error
     caught by the caller and marked unsupported. pool_tokens (DSA) scatters each
@@ -290,7 +331,9 @@ def bench_mla_triton(batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, seed, d
     try:
         from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla
     except ImportError as e:
-        raise RuntimeError(f"fp8 MLA unsupported for nhead={nhead} (no asm variant; triton mla unavailable)") from e
+        raise RuntimeError(
+            f"fp8 MLA unsupported for nhead={nhead} (no asm variant; triton mla unavailable)"
+        ) from e
 
     rope = qk - lora
     blk = _MLA_TRITON_BLOCK
@@ -318,10 +361,19 @@ def bench_mla_triton(batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, seed, d
 
     def fn():
         return triton_mla(
-            q=q_in, kv_buffer=kv_buffer, out=out, cu_seqlens_q=cu_seqlens_q,
-            seqused_k=seqused_k, max_seqlen_kv=int(ctx_lens_cpu.max()), block_tables=block_tables,
-            softmax_scale=scale, kv_lora_rank=lora, qk_rope_head_dim=rope, causal=True,
-            q_descale=q_descale, kv_descale=kv_descale,
+            q=q_in,
+            kv_buffer=kv_buffer,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            max_seqlen_kv=int(ctx_lens_cpu.max()),
+            block_tables=block_tables,
+            softmax_scale=scale,
+            kv_lora_rank=lora,
+            qk_rope_head_dim=rope,
+            causal=True,
+            q_descale=q_descale,
+            kv_descale=kv_descale,
         )
 
     snr = None
@@ -350,9 +402,13 @@ def bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
 
     # fp8 nhead the asm kernel lacks -> triton fallback (avoids asm SIGABRT).
     if kv_dtype == "fp8" and nhead not in _MLA_FP8_NHEADS:
-        fn, elem, snr = bench_mla_triton(batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, seed, device, check)
+        fn, elem, snr = bench_mla_triton(
+            batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, seed, device, check
+        )
     else:
-        fn, elem, snr = _bench_mla_asm(batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, kv_dtype, seed, device, check)
+        fn, elem, snr = _bench_mla_asm(
+            batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, kv_dtype, seed, device, check
+        )
 
     time_ms = _time_ms(fn)
     kv_bytes = total_tokens * qk * elem  # latent read once (K/V shared)
@@ -361,7 +417,9 @@ def bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
     return time_ms, bw_gbps, tflops, snr
 
 
-def _bench_mla_asm(batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, kv_dtype, seed, device, check, pool_tokens=None):
+def _bench_mla_asm(
+    batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, kv_dtype, seed, device, check, pool_tokens=None
+):
     """fp8/bf16 MLA decode via the asm kernel (fast path). Returns (fn, elem, snr).
     Reads ctx_lens_cpu[b] latent tokens/seq scattered across a pool of `pool_tokens`
     (defaults to the read count). DSA passes pool_tokens=full ctx so the selected
@@ -390,8 +448,19 @@ def _bench_mla_asm(batch, nhead, lora, qk, scale, ctx_lens_cpu, dtype, kv_dtype,
 
     def fn():
         return aiter.mla.mla_decode_fwd(
-            q_in, kv_view, out, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens,
-            1, _MLA_PAGE_SIZE, 1, scale, q_scale=q_scale, kv_scale=kv_scale,
+            q_in,
+            kv_view,
+            out,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            1,
+            _MLA_PAGE_SIZE,
+            1,
+            scale,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
         )
 
     snr = None
@@ -446,8 +515,15 @@ def _build_dsa_indexer(batch, ctx_lens_cpu, n_heads, head_dim, topk, seed, devic
 
     def fn():
         deepgemm_fp8_paged_mqa_logits(
-            q, kv, weights, logits, ctx32, block_tables, max_seq,
-            Preshuffle=True, KVBlockSize=page,
+            q,
+            kv,
+            weights,
+            logits,
+            ctx32,
+            block_tables,
+            max_seq,
+            Preshuffle=True,
+            KVBlockSize=page,
         )
         torch.topk(logits[:, :max_ctx], tk, dim=-1)  # top-k token selection
 
@@ -466,9 +542,13 @@ def bench_dsa(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
 
     # Stage 2 -- sparse absorbed-MLA decode over the selected tokens (SNR-checked).
     if kv_dtype == "fp8" and nhead not in _MLA_FP8_NHEADS:
-        mla_fn, elem, snr = bench_mla_triton(batch, nhead, lora, qk, scale, sel_lens, dtype, seed, device, check, pool_tokens)
+        mla_fn, elem, snr = bench_mla_triton(
+            batch, nhead, lora, qk, scale, sel_lens, dtype, seed, device, check, pool_tokens
+        )
     else:
-        mla_fn, elem, snr = _bench_mla_asm(batch, nhead, lora, qk, scale, sel_lens, dtype, kv_dtype, seed, device, check, pool_tokens)
+        mla_fn, elem, snr = _bench_mla_asm(
+            batch, nhead, lora, qk, scale, sel_lens, dtype, kv_dtype, seed, device, check, pool_tokens
+        )
 
     # Stage 1 -- fp8 indexer (scores the full context, picks top-k).
     idx_fn, idx_bytes = _build_dsa_indexer(
@@ -512,7 +592,9 @@ def bench_dsa(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
 # --------------------------------------------------------------------------- #
 
 
-def swa_ref(query, k_ref, v_ref, ctx_lens, page_offsets, page_indices, page_size, scale, Hq, Hkv, window, sinks):
+def swa_ref(
+    query, k_ref, v_ref, ctx_lens, page_offsets, page_indices, page_size, scale, Hq, Hkv, window, sinks
+):
     """Naive sliding-window decode reference (fp32). Each query attends to the
     last `window` keys. Optional per-head attention sinks add a no-value logit.
     Seq b's tokens live in physical pages page_indices[off[b]:off[b+1]]."""
@@ -592,10 +674,23 @@ def bench_swa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu
 
     def fn():
         return unified_attention(
-            q=q, k=k_in, v=v_kernel, out=out_kernel, cu_seqlens_q=cu_seqlens_q, max_seqlen_q=1,
-            seqused_k=seqused_k, max_seqlen_k=int(ctx_lens_cpu.max()), softmax_scale=scale,
-            causal=True, window_size=(window - 1, 0), block_table=block_tables, softcap=0,
-            q_descale=None, k_descale=k_descale, v_descale=v_descale, sinks=sinks,
+            q=q,
+            k=k_in,
+            v=v_kernel,
+            out=out_kernel,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            seqused_k=seqused_k,
+            max_seqlen_k=int(ctx_lens_cpu.max()),
+            softmax_scale=scale,
+            causal=True,
+            window_size=(window - 1, 0),
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
         )
 
     out = out_kernel[..., :Dv]  # slice padded v back to v_head_dim
@@ -603,7 +698,9 @@ def bench_swa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu
     if check:
         with suppress_output():
             fn()
-        ref = swa_ref(q, k_ref, v_ref, seqused_k, page_offsets, perm, page_size, scale, Hq, Hkv, window, sinks)
+        ref = swa_ref(
+            q, k_ref, v_ref, seqused_k, page_offsets, perm, page_size, scale, Hq, Hkv, window, sinks
+        )
         snr = compute_snr(ref, out.float())
 
     # Bytes/FLOPs use real dims (qk D + v_head_dim Dv), not the padded width, so
@@ -621,12 +718,25 @@ def benchmark_one(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_spre
     ctx_lens_cpu = gen_ctx_lens(batch, ctx, ctx_spread, cell_seed)
     page_seed = cell_seed + 1
     if cfg["family"] == "gqa":
-        return (*bench_gqa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu, page_seed, device, check), None)
+        return (
+            *bench_gqa(
+                batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu, page_seed, device, check
+            ),
+            None,
+        )
     if cfg["family"] == "swa":
-        return (*bench_swa(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu, page_seed, device, check), None)
+        return (
+            *bench_swa(
+                batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_lens_cpu, page_seed, device, check
+            ),
+            None,
+        )
     if cfg["family"] == "dsa":
         return bench_dsa(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, page_seed, device, check)
-    return (*bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, page_seed, device, check), None)
+    return (
+        *bench_mla(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, page_seed, device, check),
+        None,
+    )
 
 
 def head_count(cfg):
@@ -700,7 +810,9 @@ def main():
     )
     parser.set_defaults(cudagraph=True)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output", "-o", type=str, default=None, help="Save to .xlsx (auto-named if omitted).")
+    parser.add_argument(
+        "--output", "-o", type=str, default=None, help="Save to .xlsx (auto-named if omitted)."
+    )
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "This benchmark requires a GPU."
@@ -721,9 +833,13 @@ def main():
     op = _OP_BY_FAMILY[cfg["family"]]
     print()
     print(f"  Model     : {args.model}  family={cfg['family']}")
-    print(f"  Op        : aiter {op} (decode)  ctx_spread={args.ctx_spread}"
-          + (f"  page_size={args.page_size}" if cfg["family"] in ("gqa", "swa") else ""))
-    print(f"  Parallel  : tp={tp_size} dp={dp_size} -> attn_tp={attn_tp}  (per-rank heads={heads // attn_tp})")
+    print(
+        f"  Op        : aiter {op} (decode)  ctx_spread={args.ctx_spread}"
+        + (f"  page_size={args.page_size}" if cfg["family"] in ("gqa", "swa") else "")
+    )
+    print(
+        f"  Parallel  : tp={tp_size} dp={dp_size} -> attn_tp={attn_tp}  (per-rank heads={heads // attn_tp})"
+    )
     print(f"  Timing    : {'cudagraph' if args.cudagraph else 'eager'}")
     print(f"  GPU       : {torch.cuda.get_device_name(0)}")
 
@@ -732,8 +848,10 @@ def main():
     for kv_dtype in ("bf16", "fp8"):
         print(f"\n=== KV cache: {kv_dtype} ===")
         if is_dsa:
-            header = (f"{'Batch':>6} | {'Ctx':>7} | {'Tot ms':>8} | {'Tot BW':>8} | {'Tot TF':>7} | "
-                      f"{'Idx ms':>8} | {'Idx BW':>8} | {'MLA ms':>8} | {'MLA BW':>8} | {'SNR':>6}")
+            header = (
+                f"{'Batch':>6} | {'Ctx':>7} | {'Tot ms':>8} | {'Tot BW':>8} | {'Tot TF':>7} | "
+                f"{'Idx ms':>8} | {'Idx BW':>8} | {'MLA ms':>8} | {'MLA BW':>8} | {'SNR':>6}"
+            )
         else:
             header = f"{'Batch':>6} | {'Ctx':>7} | {'Time (ms)':>10} | {'KV-BW (GB/s)':>13} | {'TFLOPS':>8} | {'SNR (dB)':>8}"
         print(header)
@@ -743,28 +861,54 @@ def main():
             for ctx in args.ctx:
                 try:
                     time_ms, bw, tflops, snr, extra = benchmark_one(
-                        batch, ctx, cfg, dtype, kv_dtype, args.page_size, attn_tp,
-                        args.ctx_spread, args.seed, device, args.check
+                        batch,
+                        ctx,
+                        cfg,
+                        dtype,
+                        kv_dtype,
+                        args.page_size,
+                        attn_tp,
+                        args.ctx_spread,
+                        args.seed,
+                        device,
+                        args.check,
                     )
                     snr_str = "-" if snr is None else f"{snr:.1f}"
                     if is_dsa:
-                        print(f"{batch:>6} | {ctx:>7} | {time_ms:>8.3f} | {bw:>8.0f} | {tflops:>7.1f} | "
-                              f"{extra['idx_ms']:>8.3f} | {extra['idx_bw']:>8.0f} | "
-                              f"{extra['mla_ms']:>8.3f} | {extra['mla_bw']:>8.0f} | {snr_str:>6}")
+                        print(
+                            f"{batch:>6} | {ctx:>7} | {time_ms:>8.3f} | {bw:>8.0f} | {tflops:>7.1f} | "
+                            f"{extra['idx_ms']:>8.3f} | {extra['idx_bw']:>8.0f} | "
+                            f"{extra['mla_ms']:>8.3f} | {extra['mla_bw']:>8.0f} | {snr_str:>6}"
+                        )
                         rows.append(
-                            {"Batch": batch, "Ctx": ctx,
-                             "Total ms": round(time_ms, 3), "Total BW (GB/s)": round(bw), "Total TFLOPS": round(tflops, 1),
-                             "Idx ms": round(extra["idx_ms"], 3), "Idx BW (GB/s)": round(extra["idx_bw"]),
-                             "Idx TFLOPS": round(extra["idx_tflops"], 1),
-                             "MLA ms": round(extra["mla_ms"], 3), "MLA BW (GB/s)": round(extra["mla_bw"]),
-                             "MLA TFLOPS": round(extra["mla_tflops"], 1),
-                             "SNR (dB)": snr_str}
+                            {
+                                "Batch": batch,
+                                "Ctx": ctx,
+                                "Total ms": round(time_ms, 3),
+                                "Total BW (GB/s)": round(bw),
+                                "Total TFLOPS": round(tflops, 1),
+                                "Idx ms": round(extra["idx_ms"], 3),
+                                "Idx BW (GB/s)": round(extra["idx_bw"]),
+                                "Idx TFLOPS": round(extra["idx_tflops"], 1),
+                                "MLA ms": round(extra["mla_ms"], 3),
+                                "MLA BW (GB/s)": round(extra["mla_bw"]),
+                                "MLA TFLOPS": round(extra["mla_tflops"], 1),
+                                "SNR (dB)": snr_str,
+                            }
                         )
                     else:
-                        print(f"{batch:>6} | {ctx:>7} | {time_ms:>10.3f} | {bw:>13.0f} | {tflops:>8.1f} | {snr_str:>8}")
+                        print(
+                            f"{batch:>6} | {ctx:>7} | {time_ms:>10.3f} | {bw:>13.0f} | {tflops:>8.1f} | {snr_str:>8}"
+                        )
                         rows.append(
-                            {"Batch": batch, "Ctx": ctx, "Time (ms)": round(time_ms, 3),
-                             "KV-BW (GB/s)": round(bw), "TFLOPS": round(tflops, 1), "SNR (dB)": snr_str}
+                            {
+                                "Batch": batch,
+                                "Ctx": ctx,
+                                "Time (ms)": round(time_ms, 3),
+                                "KV-BW (GB/s)": round(bw),
+                                "TFLOPS": round(tflops, 1),
+                                "SNR (dB)": snr_str,
+                            }
                         )
                 except Exception as e:
                     msg = str(e).splitlines()[0][:60]
