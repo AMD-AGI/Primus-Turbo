@@ -12,6 +12,7 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
 from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
+from primus_turbo.flydsl.utils.gemm_helper import preshuffle_ab_flydsl
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
@@ -368,12 +369,26 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            # Dispatcher receives raw E8M0 scales; the FlyDSL kernel now requires
-            # quant-emitted preshuffled int32 scales. Incompatible -- return False
-            # so the dispatcher falls back to the Turbo backend. The FlyDSL mxfp8
-            # path is reached directly via gemm_mxfp8_flydsl_kernel (after quant
-            # with ScalingRecipe(preshuffle_layout=1/3)).
-            return False
+            # NT, E4M3, bf16 out. Accept int32 preshuffled (pass-through) or raw E8M0 2D
+            # (repacked in execute) -- lets the dispatcher autotune flydsl vs turbo.
+            supported &= a.ndim == 2 and b.ndim == 2
+            supported &= (not trans_a) and trans_b
+            supported &= a.dtype == float8_e4m3 and b.dtype == float8_e4m3
+            supported &= out_dtype == torch.bfloat16
+            if not supported:
+                return supported
+            m, k, n = a.shape[0], a.shape[1], b.shape[0]
+            supported &= (k % 128 == 0) and (k >= 256)
+            supported &= m % 64 == 0 and n % 64 == 0
+            if a_scale_inv.dtype == torch.int32:
+                # already preshuffled (flat int32): trust the producer's layout.
+                supported &= b_scale_inv.dtype == torch.int32
+            else:
+                # raw E8M0 block scales, 1 byte/elem, [M,K//32] / [N,K//32].
+                supported &= a_scale_inv.ndim == 2 and a_scale_inv.shape == (m, k // 32)
+                supported &= b_scale_inv.ndim == 2 and b_scale_inv.shape == (n, k // 32)
+                supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
+            return supported
 
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
         supported &= out_dtype in (torch.bfloat16, torch.float16)
@@ -406,16 +421,16 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         granularity: ScalingGranularity,
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            # NT only: a [M,K], b [N,K]; raw E8M0 block scales [M,K//32]/[N,K//32]
-            # (host-preshuffled inside the kernel). trans_c forwarded to the kernel.
-            return gemm_mxfp8_flydsl_kernel(
-                a,
-                a_scale_inv,
-                b,
-                b_scale_inv,
-                out_dtype=out_dtype,
-                trans_c=trans_c,
-            )
+            # NT only. int32 -> already preshuffled (pass through); raw E8M0 -> one fused
+            # FlyDSL LDS repack to preshuffled int32 (A layout-1, B-comb layout-3).
+            if a_scale_inv.dtype == torch.int32:
+                a_sp, b_sp = a_scale_inv, b_scale_inv
+            else:
+                k = a.shape[1]
+                a_sp, b_sp = preshuffle_ab_flydsl(
+                    a_scale_inv.view(torch.uint8), b_scale_inv.view(torch.uint8), k, 4
+                )
+            return gemm_mxfp8_flydsl_kernel(a, a_sp, b, b_sp, out_dtype=out_dtype, trans_c=trans_c)
         return gemm_fp8_tensorwise_flydsl_kernel(
             a,
             a_scale_inv,
