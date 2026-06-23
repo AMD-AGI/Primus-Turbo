@@ -6,16 +6,21 @@
 
 """Benchmark the fused BF16 dispatch + grouped GEMM mega kernel (EP, intra-node).
 
-Three variants on the same prologue-generated data (so it matches
+Forward variants on the same prologue-generated data (so it matches
 tests/pytorch/ops/test_mega_moe_dispatch_combine_grouped_gemm.py exactly):
 
   * gemm_only     -- grouped L1 GEMM over the dispatched pool (compute peak)   [TFLOPS]
   * dispatch_only -- cross-rank dispatch PUSH only                       [XGMI GB/s]
   * fused         -- dispatch PUSH + grouped L1 GEMM (overlap)                [TFLOPS]
 
-The test data (pool / dispatch plan / tile_to_group / expected / scoreboard) is
-built by the production ``SymmBuffer`` + ``mega_moe_prologue_impl`` -- the exact
-same path as the end-to-end test.
+Backward (always profiled) reproduces the e2e backward STEP1 of
+``mega_moe_fused.backward`` -- the fused dispatch + L2 dgrad (= dispatch_grouped_0):
+dispatch dy[T,H] + grouped NN GEMM ``pool[M,H] @ w2[g,H,I] -> d_swiglu[M,I]``.
+Same metric set as the forward (dense roofline / gemm_only / dispatch_only / fused).
+
+The inputs (pool / dispatch plan / tile_to_group / expected / scoreboard) are built
+by the production ``SymmBuffer`` + ``mega_moe_prologue_impl`` -- the exact same path
+as the end-to-end test.
 
 Run inside dev_primus (8 GPUs):
   PYTHONPATH=<...>/Primus-Turbo python benchmark/ops/bench_dispatch_grouped_gemm.py \
@@ -23,7 +28,6 @@ Run inside dev_primus (8 GPUs):
 """
 
 import argparse
-import math
 import os
 import sys
 from datetime import datetime
@@ -55,31 +59,16 @@ from primus_turbo.flydsl.mega.gemm_bf16_kernel import (  # noqa: E402
     _get_compiled_dense,
 )
 from primus_turbo.pytorch.core.backend import BackendType  # noqa: E402
-from primus_turbo.pytorch.core.symm_mem import SymmetricMemory  # noqa: E402
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_prologue_impl import (  # noqa: E402
     mega_moe_prologue_impl,
 )
 
-# single-allocation symmetric buffer shared with the production mega_fused_moe forward
-from primus_turbo.pytorch.ops.moe.mega_fused_moe import (  # noqa: E402
+# single-allocation symmetric buffer shared with the production mega_moe_fused forward
+from primus_turbo.pytorch.ops.moe.mega_moe_fused import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
 )
 
 _FLYDSL = BackendType.FLYDSL.value
-
-
-class _Symm:
-    """One extra HIP-IPC symmetric buffer: local zero-copy view + peer pointer table.
-
-    Used only for the optional backward dgrad pool (2*inter wide), which has no slot
-    in the production ``SymmBuffer`` arena."""
-
-    def __init__(self, group, shape, dtype):
-        nbytes = math.prod(shape) * dtype.itemsize
-        self.sm = SymmetricMemory(group, nbytes)
-        self.rank = group.rank()
-        self.local = self.sm.get_buffer(self.rank, shape, dtype)
-        self.ptrs = torch.tensor(self.sm.buffer_ptrs, dtype=torch.int64, device="cuda")
 
 
 def _dense_gemm_peak_ms(M, N, K, BM, BN, iters, *, group_m_cands=(4,)):
@@ -89,16 +78,16 @@ def _dense_gemm_peak_ms(M, N, K, BM, BN, iters, *, group_m_cands=(4,)):
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) / 8
     b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) / 8  # NT: B [N,K]
     c = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    dargs = (a.view(-1), b.view(-1), c.view(-1), M, N, torch.cuda.current_stream())
-    best, best_gm = float("inf"), None
-    for gm in group_m_cands:
-        launch = _compile_dense_nt(K=K, BLOCK_M=BM, BLOCK_N=BN, GROUP_M=gm, num_xcd=8)
-        compiled = _get_compiled_dense(launch, dargs)
-        t = _bench(lambda: compiled(*dargs), iters=iters)
-        if t < best:
-            best, best_gm = t, gm
+    dense_args = (a.view(-1), b.view(-1), c.view(-1), M, N, torch.cuda.current_stream())
+    best_ms, best_group_m = float("inf"), None
+    for group_m in group_m_cands:
+        launch = _compile_dense_nt(K=K, BLOCK_M=BM, BLOCK_N=BN, GROUP_M=group_m, num_xcd=8)
+        compiled = _get_compiled_dense(launch, dense_args)
+        ms = _bench(lambda: compiled(*dense_args), iters=iters)
+        if ms < best_ms:
+            best_ms, best_group_m = ms, group_m
     del a, b, c
-    return best, best_gm
+    return best_ms, best_group_m
 
 
 # --------------------------------------------------------------------------- #
@@ -116,9 +105,14 @@ def _l2_flush():
 
 
 def _bench(fn, *, reset=None, group=None, warmup=5, iters=30):
-    """Mean ms/call (CUDA events); cross-rank: barrier, reset scoreboard, barrier (else the fused scoreboard races/deadlocks)."""
-    e0 = torch.cuda.Event(enable_timing=True)
-    e1 = torch.cuda.Event(enable_timing=True)
+    """Mean ms/call (CUDA events).
+
+    Cross-rank discipline (group set): barrier BEFORE reset so every rank has
+    finished the previous fn (no in-flight peer signals), zero, then a second
+    barrier so all state is clean before any rank's fn pushes/signals a peer.
+    Skipping the pre-reset barrier races the scoreboard and can deadlock."""
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
     def _iter(measure):
         if group is not None:
@@ -132,24 +126,24 @@ def _bench(fn, *, reset=None, group=None, warmup=5, iters=30):
         if not measure:
             fn()
             return 0.0
-        e0.record()
+        start_event.record()
         fn()
-        e1.record()
+        end_event.record()
         torch.cuda.synchronize()
-        return e0.elapsed_time(e1)
+        return start_event.elapsed_time(end_event)
 
     for _ in range(warmup):
         _iter(False)
     _l2_flush()
-    total = sum(_iter(True) for _ in range(iters))
-    return total / iters
+    total_ms = sum(_iter(True) for _ in range(iters))
+    return total_ms / iters
 
 
 # --------------------------------------------------------------------------- #
-# Test-data generator (consistent with the test): build the SymmBuffer, run the
+# Input builder (consistent with the test): build the SymmBuffer, run the
 # prologue to produce the dispatch plan, then dispatch once to fill the pool.
 # --------------------------------------------------------------------------- #
-def generate(group, *, T, H, I, E, K, BM, BN, num_dispatch_cu, mode, W1, W2, base_seed=7):
+def build_inputs(group, *, T, H, I, E, K, BM, BN, num_dispatch_cu, mode, W1, W2, base_seed=7):
     rank = group.rank()
     torch.manual_seed(base_seed + rank)
     x = torch.randn((T, H), device="cuda", dtype=torch.float32).bfloat16()
@@ -167,24 +161,15 @@ def generate(group, *, T, H, I, E, K, BM, BN, num_dispatch_cu, mode, W1, W2, bas
         block_n=BN,
     )
     # L1 GEMM output (2*inter wide) has no slot in the arena -> local scratch
-    acc1 = torch.empty((symm.pool_capacity, 2 * I), dtype=torch.bfloat16, device="cuda")
+    l1_out = torch.empty((symm.pool_capacity, 2 * I), dtype=torch.bfloat16, device="cuda")
 
     # prologue -> dispatch plan tables (same path as the test/forward); the prologue
     # resets scoreboard + barrier_local in-kernel and ends with a cross-rank barrier.
-    (
-        destination,
-        start,
-        count,
-        source_offset_out,
-        source_tokens,
-        source_topk_slot,
-        source_weight,
-        tile_to_group,
-        expected,
-    ) = mega_moe_prologue_impl(
+    plan, tile_to_group, expected = mega_moe_prologue_impl(
         topk_idx,
         topk_w,
-        symm.peer_ptrs,
+        symm.buffer_base,
+        symm.buffer_offsets,
         symm.origin_rank,
         symm.origin_slot,
         symm.meta_scalars,
@@ -202,8 +187,9 @@ def generate(group, *, T, H, I, E, K, BM, BN, num_dispatch_cu, mode, W1, W2, bas
         _FLYDSL,
         no_cpu_sync=True,
     )
-    # DeepEP-style dispatch handle (kernels read plan[:5]); num_tasks == num_experts
-    plan = (destination, start, count, source_offset_out, source_tokens, source_topk_slot, source_weight)
+    # DeepEP-style dispatch plan (kernels read plan[:5]); num_tasks == num_experts
+    plan = tuple(plan)
+    destination, _start, count, _src_offset, _src_tokens, _topk_slot, _weight = plan
     num_tile_blocks = symm.meta_scalars[1:2]  # device real-tile count
     symm.assert_capacity()  # fail loudly rather than silently drop rows
 
@@ -217,14 +203,12 @@ def generate(group, *, T, H, I, E, K, BM, BN, num_dispatch_cu, mode, W1, W2, bas
         symm=symm,
         x=x,
         plan=plan,
-        acc1=acc1,
+        l1_out=l1_out,
         tile_to_group=tile_to_group,
         expected=expected,
         num_tile_blocks=num_tile_blocks,
         destination=destination,
         count=count,
-        source_offset_out=source_offset_out,
-        num_tasks=E,
         W1=W1,
         W2=W2,
     )
@@ -233,7 +217,7 @@ def generate(group, *, T, H, I, E, K, BM, BN, num_dispatch_cu, mode, W1, W2, bas
 def profile_dispatch(group, args, mode, W1, W2):
     rank = group.rank()
     BM, BN, H, I, num_dispatch_cu = args.bm, args.bn, args.hidden, args.inter, args.num_dispatch_cu
-    d = generate(
+    inp = build_inputs(
         group,
         T=args.num_tokens,
         H=H,
@@ -247,31 +231,32 @@ def profile_dispatch(group, args, mode, W1, W2):
         W1=W1,
         W2=W2,
     )
-    symm, x, plan = d.symm, d.x, d.plan
+    symm, x, plan = inp.symm, inp.x, inp.plan
     pool = symm.pool
     try:
         # GEMM work = real (padded) pool rows x N x K ; L1 NT: N=2I, K=H
-        real_tiles = int(d.num_tile_blocks[0].item())
-        M_eff, N, Kd = real_tiles * BM, 2 * I, H
-        flops = 2.0 * M_eff * N * Kd
+        real_tiles = int(inp.num_tile_blocks[0].item())
+        M_eff, N, K = real_tiles * BM, 2 * I, H
+        flops = 2.0 * M_eff * N * K
         # XGMI push bytes per rank = remote rows (dest != rank) x hidden x 2 (bf16)
-        dest_cpu = d.destination.cpu()
-        cnt_cpu = d.count.cpu()
-        remote_rows = int(cnt_cpu[dest_cpu != rank].sum().item())
+        dest_cpu, count_cpu = inp.destination.cpu(), inp.count.cpu()
+        remote_rows = int(count_cpu[dest_cpu != rank].sum().item())
         xgmi_bytes = remote_rows * H * 2
 
-        def _sb_reset():
+        def _reset_scoreboard():
             symm.scoreboard.zero_()
 
-        t_gg = _bench(
+        t_gemm = _bench(
             lambda: grouped_gemm_bf16_only(
-                pool, d.W1, d.acc1, d.tile_to_group, d.num_tile_blocks, BM=BM, BN=BN
+                pool, inp.W1, inp.l1_out, inp.tile_to_group, inp.num_tile_blocks, BM=BM, BN=BN
             ),
             iters=args.iters,
         )
         # dense single-weight GEMM of the same M_eff x N x K = the grouped-GEMM roofline
-        gm_cands = (1, 4, 8) if args.autotune else (args.dense_group_m,)
-        t_dense, dense_gm = _dense_gemm_peak_ms(M_eff, N, Kd, BM, BN, args.iters, group_m_cands=gm_cands)
+        group_m_cands = (1, 4, 8) if args.autotune else (args.dense_group_m,)
+        t_dense, dense_group_m = _dense_gemm_peak_ms(
+            M_eff, N, K, BM, BN, args.iters, group_m_cands=group_m_cands
+        )
         t_disp = _bench(
             lambda: dispatch_only(x, plan, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu),
             group=group,
@@ -284,88 +269,94 @@ def profile_dispatch(group, args, mode, W1, W2):
                 plan,
                 pool,
                 symm.pool_ptrs,
-                d.W1,
-                d.acc1,
-                d.tile_to_group,
+                inp.W1,
+                inp.l1_out,
+                inp.tile_to_group,
                 symm.scoreboard,
                 symm.scoreboard_ptrs,
-                d.expected,
-                d.num_tile_blocks,
+                inp.expected,
+                inp.num_tile_blocks,
+                symm.sb_consume,
                 BM=BM,
                 BN=BN,
                 num_dispatch_cu=num_dispatch_cu,
             ),
-            reset=_sb_reset,
+            reset=_reset_scoreboard,
             group=group,
             iters=args.iters,
         )
 
-        # ── backward NN throughput (timing only): dispatch a random dgrad[T,2I] (mirrors
-        # the forward x[T,H]) into a 2I-wide pool, then NN grouped GEMM @ W1[g,2I,H] ->
-        # bwd_out[M,H]. Same comm plan/scoreboard and FLOPs as the forward L1.
-        bwd = None
-        if args.backward:
-            T, Kb, Nb = args.num_tokens, 2 * I, H
-            dgrad = (torch.randn(T, Kb, device="cuda", dtype=torch.float32) / 8).bfloat16()
-            bwd_pool = _Symm(group, (symm.pool_capacity, Kb), torch.bfloat16)
-            bwd_out = torch.empty(symm.pool_capacity, Nb, device="cuda", dtype=torch.bfloat16)
-            try:
-                torch.cuda.synchronize()
-                group.barrier()
-                dispatch_only(dgrad, plan, bwd_pool.local, bwd_pool.ptrs, num_dispatch_cu=num_dispatch_cu)
-                torch.cuda.synchronize()
-                group.barrier()
-                t_bwd_gg = _bench(
-                    lambda: grouped_gemm_bf16_only(
-                        bwd_pool.local,
-                        d.W1,
-                        bwd_out,
-                        d.tile_to_group,
-                        d.num_tile_blocks,
-                        layout="nn",
-                        BM=BM,
-                        BN=BN,
-                    ),
-                    iters=args.iters,
-                )
-                t_bwd_fused = _bench(
-                    lambda: dispatch_grouped_gemm_bf16(
-                        dgrad,
-                        plan,
-                        bwd_pool.local,
-                        bwd_pool.ptrs,
-                        d.W1,
-                        bwd_out,
-                        d.tile_to_group,
-                        symm.scoreboard,
-                        symm.scoreboard_ptrs,
-                        d.expected,
-                        d.num_tile_blocks,
-                        layout="nn",
-                        BM=BM,
-                        BN=BN,
-                        num_dispatch_cu=num_dispatch_cu,
-                    ),
-                    reset=_sb_reset,
-                    group=group,
-                    iters=args.iters,
-                )
-            finally:
-                bwd_pool.sm.destroy()
-            bwd = {"gg_ms": t_bwd_gg, "fused_ms": t_bwd_fused}
+        # ── backward STEP1 (= e2e dispatch_grouped_0): dispatch dy[T,H] + L2 dgrad
+        # pool[M,H] @ w2[g,H,I] (NN) -> d_swiglu[M,I]. Same metric set as the forward
+        # (dense roofline / gemm_only / dispatch_only / fused). N=I, K=H; dispatch bytes
+        # equal the forward (dy is H-wide like x).
+        N_bwd = I  # backward STEP1 output width
+        flops_bwd = 2.0 * M_eff * N_bwd * K
+        dy = (torch.randn(args.num_tokens, H, device="cuda", dtype=torch.float32) / 8).bfloat16()
+        d_swiglu = torch.empty(symm.pool_capacity, N_bwd, device="cuda", dtype=torch.bfloat16)
+
+        # fill the pool with dy once for the gemm-only baseline
+        torch.cuda.synchronize()
+        group.barrier()
+        dispatch_only(dy, plan, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu)
+        torch.cuda.synchronize()
+        group.barrier()
+        t_bwd_gemm = _bench(
+            lambda: grouped_gemm_bf16_only(
+                pool, inp.W2, d_swiglu, inp.tile_to_group, inp.num_tile_blocks, layout="nn", BM=BM, BN=BN
+            ),
+            iters=args.iters,
+        )
+        t_bwd_dense, bwd_dense_group_m = _dense_gemm_peak_ms(
+            M_eff, N_bwd, K, BM, BN, args.iters, group_m_cands=group_m_cands
+        )
+        t_bwd_disp = _bench(
+            lambda: dispatch_only(dy, plan, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu),
+            group=group,
+            iters=args.iters,
+        )
+        t_bwd_fused = _bench(
+            lambda: dispatch_grouped_gemm_bf16(
+                dy,
+                plan,
+                pool,
+                symm.pool_ptrs,
+                inp.W2,
+                d_swiglu,
+                inp.tile_to_group,
+                symm.scoreboard,
+                symm.scoreboard_ptrs,
+                inp.expected,
+                inp.num_tile_blocks,
+                symm.sb_consume,
+                layout="nn",
+                BM=BM,
+                BN=BN,
+                num_dispatch_cu=num_dispatch_cu,
+            ),
+            reset=_reset_scoreboard,
+            group=group,
+            iters=args.iters,
+        )
+        bwd = {
+            "gemm_only_ms": t_bwd_gemm,
+            "dense_gemm_only_ms": t_bwd_dense,
+            "dense_gm": bwd_dense_group_m,
+            "dispatch_only_ms": t_bwd_disp,
+            "fused_ms": t_bwd_fused,
+            "flops": flops_bwd,
+        }
     finally:
         symm.destroy()  # always free symmetric buffers
     # raw per-rank timings + work; rank 0 aggregates across ranks (bottleneck = max latency)
     return {
-        "gemm_only_ms": t_gg,
+        "gemm_only_ms": t_gemm,
         "dense_gemm_only_ms": t_dense,
-        "dense_gm": dense_gm,
+        "dense_gm": dense_group_m,
         "dispatch_only_ms": t_disp,
         "fused_ms": t_fused,
         "flops": flops,
         "xgmi_bytes": xgmi_bytes,
-        "M_eff": M_eff,
-        "remote_rows": remote_rows,
         "bwd": bwd,
     }
 
@@ -382,96 +373,135 @@ def benchmark_dispatch(local_rank, world, args):
     platform, gpu_name = get_platform_info()
 
     # this rank's expert weights, built once (sliced from the deterministic global set)
-    epr = args.num_experts // world
-    W1g, W2g = _global_weights(args.num_experts, args.inter, args.hidden, "cuda")
-    W1 = W1g[rank * epr : (rank + 1) * epr].contiguous()
-    W2 = W2g[rank * epr : (rank + 1) * epr].contiguous()
-    del W1g, W2g
+    experts_per_rank = args.num_experts // world
+    W1_global, W2_global = _global_weights(args.num_experts, args.inter, args.hidden, "cuda")
+    W1 = W1_global[rank * experts_per_rank : (rank + 1) * experts_per_rank].contiguous()
+    W2 = W2_global[rank * experts_per_rank : (rank + 1) * experts_per_rank].contiguous()
+    del W1_global, W2_global
 
     modes = ["load_balanced", "round_robin"] if args.mode == "both" else [args.mode]
     rows = []
     try:
         for mode in modes:
-            r = profile_dispatch(group, args, mode, W1, W2)
-            allp = [None] * world
-            dist.all_gather_object(allp, (rank, r), group=group)
-            if rank == 0:
-                data = [p[1] for p in allp]
-                # distributed bottleneck = slowest rank (max latency); work ~ uniform (mean)
-                mx = lambda k: max(d[k] for d in data)
-                mean = lambda k: sum(d[k] for d in data) / len(data)
+            result = profile_dispatch(group, args, mode, W1, W2)
+            gathered = [None] * world
+            dist.all_gather_object(gathered, (rank, result), group=group)
+            if rank != 0:
+                torch.cuda.synchronize()
+                group.barrier()
+                continue
 
-                gg_ms, disp_ms, fused_ms = mx("gemm_only_ms"), mx("dispatch_only_ms"), mx("fused_ms")
-                dense_ms = mx("dense_gemm_only_ms")
-                flops, xgmi = mean("flops"), mean("xgmi_bytes")
-                gg_tf = flops / (gg_ms * 1e-3) / 1e12
-                dense_tf = flops / (dense_ms * 1e-3) / 1e12
-                fused_tf = flops / (fused_ms * 1e-3) / 1e12
-                disp_bw = xgmi / (disp_ms * 1e-3) / 1e9
-                # grouped GEMM vs the dense single-weight roofline (is grouped at peak?)
-                grouped_eff_pct = gg_tf / dense_tf * 100.0
-                # fused vs running gemm then comm serially, and how close to the pure-gemm
-                # roofline (comm fully hidden -> fused==gemm -> 100%):
-                #   hidden  = serial(gemm+comm) - fused      (comm time hidden under GEMM)
-                #   speedup = serial / fused                 (fused vs serial, e.g. 1.2x)
-                #   roofline= gemm / fused                   (100% = comm fully hidden)
-                serial_ms = gg_ms + disp_ms
-                hidden_ms = serial_ms - fused_ms
-                speedup = serial_ms / fused_ms
-                roofline_pct = gg_ms / fused_ms * 100.0
-                print(
-                    f"\n{'='*72}\n[dispatch] {gpu_name} EP{world} T={args.num_tokens} H={args.hidden} "
-                    f"I={args.inter} E={args.num_experts} K={args.num_topk} mode={mode} "
-                    f"(max over ranks)\n{'='*72}"
-                )
-                print(
-                    f"  dense_gemm   : {dense_ms:8.3f} ms | {dense_tf:7.1f} TFLOPS (single-weight roofline, "
-                    f"GROUP_M={data[0]['dense_gm']})"
-                )
-                print(
-                    f"  gemm_only    : {gg_ms:8.3f} ms | {gg_tf:7.1f} TFLOPS | "
-                    f"grouped/dense = {grouped_eff_pct:.1f}%"
-                )
-                print(f"  dispatch_only: {disp_ms:8.3f} ms | {disp_bw:7.1f} GB/s (XGMI, full push)")
-                print(
-                    f"  fused        : {fused_ms:8.3f} ms | {fused_tf:7.1f} TFLOPS | "
-                    f"roofline (gemm/fused) = {roofline_pct:.1f}% | speedup vs serial = {speedup:.2f}x"
-                )
-                if data[0]["bwd"] is not None:  # backward dgrad (NN), same FLOPs
-                    bgg = max(d["bwd"]["gg_ms"] for d in data)
-                    bfu = max(d["bwd"]["fused_ms"] for d in data)
-                    bgg_tf = flops / (bgg * 1e-3) / 1e12
-                    bfu_tf = flops / (bfu * 1e-3) / 1e12
-                    print(f"  bwd gemm(nn) : {bgg:8.3f} ms | {bgg_tf:7.1f} TFLOPS (NN dgrad layout)")
-                    print(
-                        f"  bwd fused(nn): {bfu:8.3f} ms | {bfu_tf:7.1f} TFLOPS | "
-                        f"roofline (gemm/fused) = {bgg/bfu*100:.1f}%"
-                    )
-                rows.append(
-                    {
-                        "Platform": platform,
-                        "GPU": gpu_name,
-                        "EP": world,
-                        "Mode": mode,
-                        "T": args.num_tokens,
-                        "H": args.hidden,
-                        "I": args.inter,
-                        "E": args.num_experts,
-                        "K": args.num_topk,
-                        "dense_gemm (ms)": f"{dense_ms:.3f}",
-                        "dense_gemm (TFLOPS)": f"{dense_tf:.1f}",
-                        "gemm_only (ms)": f"{gg_ms:.3f}",
-                        "gemm_only (TFLOPS)": f"{gg_tf:.1f}",
-                        "grouped/dense": f"{grouped_eff_pct:.1f}%",
-                        "dispatch_only (ms)": f"{disp_ms:.3f}",
-                        "dispatch_only (XGMI GB/s)": f"{disp_bw:.1f}",
-                        "fused (ms)": f"{fused_ms:.3f}",
-                        "fused (TFLOPS)": f"{fused_tf:.1f}",
-                        "comm_hidden (ms)": f"{hidden_ms:.3f}",
-                        "speedup (vs serial)": f"{speedup:.2f}x",
-                        "roofline (gemm/fused)": f"{roofline_pct:.1f}%",
-                    }
-                )
+            per_rank = [g[1] for g in gathered]
+            # distributed bottleneck = slowest rank (max latency); work ~ uniform (mean)
+            rank_max = lambda key: max(d[key] for d in per_rank)
+            rank_mean = lambda key: sum(d[key] for d in per_rank) / len(per_rank)
+
+            gemm_ms, disp_ms, fused_ms = (
+                rank_max("gemm_only_ms"),
+                rank_max("dispatch_only_ms"),
+                rank_max("fused_ms"),
+            )
+            dense_ms = rank_max("dense_gemm_only_ms")
+            flops, xgmi = rank_mean("flops"), rank_mean("xgmi_bytes")
+            gemm_tf = flops / (gemm_ms * 1e-3) / 1e12
+            dense_tf = flops / (dense_ms * 1e-3) / 1e12
+            fused_tf = flops / (fused_ms * 1e-3) / 1e12
+            disp_bw = xgmi / (disp_ms * 1e-3) / 1e9
+            # grouped GEMM vs the dense single-weight roofline (is grouped at peak?)
+            grouped_eff_pct = gemm_tf / dense_tf * 100.0
+            # fused vs running gemm then comm serially, and vs the overlap floor:
+            #   hidden  = serial(gemm+comm) - fused      (comm time hidden under GEMM)
+            #   speedup = serial / fused                 (fused vs serial, e.g. 1.2x)
+            #   roofline= max(gemm,disp) / fused         (overlap floor: the slower leg)
+            serial_ms = gemm_ms + disp_ms
+            hidden_ms = serial_ms - fused_ms
+            speedup = serial_ms / fused_ms
+            roofline_pct = max(gemm_ms, disp_ms) / fused_ms * 100.0
+            print(
+                f"\n{'='*72}\n[dispatch] {gpu_name} EP{world} T={args.num_tokens} H={args.hidden} "
+                f"I={args.inter} E={args.num_experts} K={args.num_topk} mode={mode} "
+                f"(max over ranks)\n{'='*72}"
+            )
+            print(
+                f"  dense_gemm   : {dense_ms:8.3f} ms | {dense_tf:7.1f} TFLOPS (single-weight roofline, "
+                f"GROUP_M={per_rank[0]['dense_gm']})"
+            )
+            print(
+                f"  gemm_only    : {gemm_ms:8.3f} ms | {gemm_tf:7.1f} TFLOPS | "
+                f"grouped/dense = {grouped_eff_pct:.1f}%"
+            )
+            print(f"  dispatch_only: {disp_ms:8.3f} ms | {disp_bw:7.1f} GB/s (XGMI, full push)")
+            print(
+                f"  fused        : {fused_ms:8.3f} ms | {fused_tf:7.1f} TFLOPS | "
+                f"roofline (max(gemm,disp)/fused) = {roofline_pct:.1f}% | speedup vs serial = {speedup:.2f}x"
+            )
+
+            # backward STEP1 (= dispatch_grouped_0): same metric set as the forward.
+            # N=I, K=H -> flops_bwd; dispatch bytes equal the forward (dy is H-wide).
+            bwd_max = lambda key: max(d["bwd"][key] for d in per_rank)
+            bwd_gemm_ms, bwd_disp_ms, bwd_fused_ms = (
+                bwd_max("gemm_only_ms"),
+                bwd_max("dispatch_only_ms"),
+                bwd_max("fused_ms"),
+            )
+            bwd_dense_ms = bwd_max("dense_gemm_only_ms")
+            bwd_flops = sum(d["bwd"]["flops"] for d in per_rank) / len(per_rank)
+            bwd_gemm_tf = bwd_flops / (bwd_gemm_ms * 1e-3) / 1e12
+            bwd_dense_tf = bwd_flops / (bwd_dense_ms * 1e-3) / 1e12
+            bwd_fused_tf = bwd_flops / (bwd_fused_ms * 1e-3) / 1e12
+            bwd_disp_bw = xgmi / (bwd_disp_ms * 1e-3) / 1e9
+            bwd_grouped_eff = bwd_gemm_tf / bwd_dense_tf * 100.0
+            bwd_speedup = (bwd_gemm_ms + bwd_disp_ms) / bwd_fused_ms
+            bwd_roofline = max(bwd_gemm_ms, bwd_disp_ms) / bwd_fused_ms * 100.0
+            print(f"  {'-'*68}  backward STEP1 (NN, = dispatch_grouped_0)")
+            print(
+                f"  dense_gemm   : {bwd_dense_ms:8.3f} ms | {bwd_dense_tf:7.1f} TFLOPS (single-weight roofline, "
+                f"GROUP_M={per_rank[0]['bwd']['dense_gm']})"
+            )
+            print(
+                f"  gemm_only    : {bwd_gemm_ms:8.3f} ms | {bwd_gemm_tf:7.1f} TFLOPS | "
+                f"grouped/dense = {bwd_grouped_eff:.1f}%"
+            )
+            print(f"  dispatch_only: {bwd_disp_ms:8.3f} ms | {bwd_disp_bw:7.1f} GB/s (XGMI, full push)")
+            print(
+                f"  fused        : {bwd_fused_ms:8.3f} ms | {bwd_fused_tf:7.1f} TFLOPS | "
+                f"roofline (max(gemm,disp)/fused) = {bwd_roofline:.1f}% | speedup vs serial = {bwd_speedup:.2f}x"
+            )
+            rows.append(
+                {
+                    "Platform": platform,
+                    "GPU": gpu_name,
+                    "EP": world,
+                    "Mode": mode,
+                    "T": args.num_tokens,
+                    "H": args.hidden,
+                    "I": args.inter,
+                    "E": args.num_experts,
+                    "K": args.num_topk,
+                    "dense_gemm (ms)": f"{dense_ms:.3f}",
+                    "dense_gemm (TFLOPS)": f"{dense_tf:.1f}",
+                    "gemm_only (ms)": f"{gemm_ms:.3f}",
+                    "gemm_only (TFLOPS)": f"{gemm_tf:.1f}",
+                    "grouped/dense": f"{grouped_eff_pct:.1f}%",
+                    "dispatch_only (ms)": f"{disp_ms:.3f}",
+                    "dispatch_only (XGMI GB/s)": f"{disp_bw:.1f}",
+                    "fused (ms)": f"{fused_ms:.3f}",
+                    "fused (TFLOPS)": f"{fused_tf:.1f}",
+                    "comm_hidden (ms)": f"{hidden_ms:.3f}",
+                    "speedup (vs serial)": f"{speedup:.2f}x",
+                    "roofline (max(gemm,disp)/fused)": f"{roofline_pct:.1f}%",
+                    "bwd dense_gemm (TFLOPS)": f"{bwd_dense_tf:.1f}",
+                    "bwd gemm_only (ms)": f"{bwd_gemm_ms:.3f}",
+                    "bwd gemm_only (TFLOPS)": f"{bwd_gemm_tf:.1f}",
+                    "bwd grouped/dense": f"{bwd_grouped_eff:.1f}%",
+                    "bwd dispatch_only (ms)": f"{bwd_disp_ms:.3f}",
+                    "bwd dispatch_only (XGMI GB/s)": f"{bwd_disp_bw:.1f}",
+                    "bwd fused (ms)": f"{bwd_fused_ms:.3f}",
+                    "bwd fused (TFLOPS)": f"{bwd_fused_tf:.1f}",
+                    "bwd speedup (vs serial)": f"{bwd_speedup:.2f}x",
+                    "bwd roofline (max(gemm,disp)/fused)": f"{bwd_roofline:.1f}%",
+                }
+            )
             torch.cuda.synchronize()
             group.barrier()
 
@@ -479,9 +509,9 @@ def benchmark_dispatch(local_rank, world, args):
             results = pd.DataFrame(rows)
             print("\nFinal Results:")
             print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
-            fn = args.output or f"dispatch_grouped_gemm_{datetime.now():%Y%m%d}_{gpu_name}.csv"
-            results.to_csv(fn, index=False)
-            print(f"Results saved to {fn}")
+            out_file = args.output or f"dispatch_grouped_gemm_{datetime.now():%Y%m%d}_{gpu_name}.csv"
+            results.to_csv(out_file, index=False)
+            print(f"Results saved to {out_file}")
     finally:
         dist.destroy_process_group()
 
@@ -506,11 +536,6 @@ if __name__ == "__main__":
         "--autotune",
         action="store_true",
         help="sweep dense GROUP_M {1,4,8}; default off uses --dense-group-m (best)",
-    )
-    ap.add_argument(
-        "--backward",
-        action="store_true",
-        help="also benchmark the backward dgrad (NN) fused dispatch + grouped GEMM",
     )
     ap.add_argument("--mode", choices=["load_balanced", "round_robin", "both"], default="both")
     ap.add_argument("--iters", type=int, default=30)

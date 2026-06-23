@@ -56,7 +56,8 @@ class MegaMoePrologueFlyDSLBackend(KernelBackend):
     def execute(
         topk_idx: torch.Tensor,
         topk_w,
-        peer_ptrs: torch.Tensor,
+        buffer_base: torch.Tensor,
+        buffer_offsets: torch.Tensor,
         origin_rank: torch.Tensor,
         origin_slot: torch.Tensor,
         meta_scalars: torch.Tensor,
@@ -83,7 +84,8 @@ class MegaMoePrologueFlyDSLBackend(KernelBackend):
         plan, ttg, exp, _orank, _oslot, _npb, _mnt = mega_moe_prologue(
             topk_idx,
             topk_w,
-            peer_ptrs=peer_ptrs,
+            buffer_base=buffer_base,
+            buffer_offsets=buffer_offsets,
             origin_rank=origin_rank,
             origin_slot=origin_slot,
             meta_scalars=meta_scalars,
@@ -102,8 +104,9 @@ class MegaMoePrologueFlyDSLBackend(KernelBackend):
             no_cpu_sync=bool(no_cpu_sync),
             num_cu=int(num_cu),
         )
+        # keep the plan bundled as one list (dispatch consumes it directly)
         # plan = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
-        return (*plan, ttg, exp)
+        return (list(plan), ttg, exp)
 
 
 _MEGA_MOE_PROLOGUE_BACKENDS = {
@@ -159,21 +162,11 @@ _MUTATED_ARGS = (
     "barrier_local",
 )
 
-# return order mirrors the FlyDSL primitive: the flat dispatch plan tensors
-#   (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
-# followed by tile_to_group + expected. origin tables are mutated in place; the
-# scalar returns (num_pool_blocks / max_num_token) are static -> derived by callers.
-_RET = tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]
+# return = (plan, tile_to_group, expected). The plan bundles the dispatch plan tensors
+# (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight) as one list so
+# downstream ops receive it without a per-tensor split. origin tables are mutated in
+# place; the scalar returns (num_pool_blocks / max_num_token) are static.
+_RET = tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]
 
 
 @_torch_custom_op_wrapper(
@@ -184,7 +177,8 @@ _RET = tuple[
 def mega_moe_prologue_impl(
     topk_idx: torch.Tensor,
     topk_w: Optional[torch.Tensor],
-    peer_ptrs: torch.Tensor,
+    buffer_base: torch.Tensor,
+    buffer_offsets: torch.Tensor,
     origin_rank: torch.Tensor,
     origin_slot: torch.Tensor,
     meta_scalars: torch.Tensor,
@@ -206,9 +200,10 @@ def mega_moe_prologue_impl(
 ) -> _RET:
     """Fused MoE dispatch-prologue: build the full EP dispatch plan.
 
-    Allocates + RETURNS the dispatch plan output tables (dst_rank / dst_offset /
-    count / src_offset / src_tokens / topk_slot / weight + tile_to_group / expected),
-    mirroring the FlyDSL primitive. The symmetric origin tables + device meta scalars
+    Returns ``(plan, tile_to_group, expected)``: ``plan`` bundles the dispatch plan
+    tables (dst_rank / dst_offset / count / src_offset / src_tokens / topk_slot /
+    weight) as one list, passed straight into ``dispatch_grouped_gemm_impl`` without a
+    per-tensor split. The symmetric origin tables + device meta scalars
     are mutated in place (origin writes cross-rank via raw ``*_ptrs``, untracked).
     scoreboard + barrier_local are reset inside the kernel before its final cross-rank
     barrier; sb_l2 / comb stay host-zeroed (comb is large -> faster as a full-grid memset).
@@ -223,7 +218,8 @@ def mega_moe_prologue_impl(
     kwargs = dict(
         topk_idx=topk_idx,
         topk_w=topk_w,
-        peer_ptrs=peer_ptrs,
+        buffer_base=buffer_base,
+        buffer_offsets=buffer_offsets,
         origin_rank=origin_rank,
         origin_slot=origin_slot,
         meta_scalars=meta_scalars,
@@ -251,7 +247,8 @@ def mega_moe_prologue_impl(
 def mega_moe_prologue_impl_meta(
     topk_idx: torch.Tensor,
     topk_w: Optional[torch.Tensor],
-    peer_ptrs: torch.Tensor,
+    buffer_base: torch.Tensor,
+    buffer_offsets: torch.Tensor,
     origin_rank: torch.Tensor,
     origin_slot: torch.Tensor,
     meta_scalars: torch.Tensor,
@@ -281,7 +278,7 @@ def mega_moe_prologue_impl_meta(
     def i32(n):
         return torch.empty(n, dtype=torch.int32, device=topk_idx.device)
 
-    return (
+    plan = [
         # dst_rank, dst_offset, count, src_offset
         i32(E),
         i32(E),
@@ -290,6 +287,5 @@ def mega_moe_prologue_impl_meta(
         i32(P),
         i32(P),  # src_tokens, topk_slot
         torch.empty(P, dtype=torch.float32, device=topk_idx.device),  # weight
-        i32(M),
-        i32(M),  # tile_to_group, expected
-    )
+    ]
+    return (plan, i32(M), i32(M))  # plan, tile_to_group, expected

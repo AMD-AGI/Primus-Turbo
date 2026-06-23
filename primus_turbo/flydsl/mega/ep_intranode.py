@@ -76,6 +76,22 @@ def _atomic_add_local(tensor, idx, val):
     )
 
 
+def _atomic_add_local_ret(tensor, idx, val):
+    """Relaxed atomic int32 add to ``tensor[idx]``; returns the OLD value.
+    Used by the GEMM gate's last-reader scoreboard self-reset (count consumers)."""
+    ptr = _elem_ptr_i32(tensor, idx)
+    res = _llvm.atomicrmw(
+        _llvm.AtomicBinOp.add, ptr, _unwrap_value(val), _ORD.monotonic, syncscope=None, alignment=_I4
+    )
+    return fx.arith.ArithValue(res, signed=True)
+
+
+def _st_relaxed(tensor, idx, val):
+    """Relaxed atomic int32 store of ``val`` into ``tensor[idx]`` (uncached signal reset)."""
+    ptr = _elem_ptr_i32(tensor, idx)
+    _llvm.StoreOp(_unwrap_value(val), ptr, ordering=_ORD.monotonic, syncscope=None, alignment=_I4)
+
+
 def _ld_relaxed(tensor, idx):
     """Relaxed atomic int32 load of ``tensor[idx]`` for spin polling.
     Coherence comes from the scoreboard/sb_copy living in UNCACHED memory (every

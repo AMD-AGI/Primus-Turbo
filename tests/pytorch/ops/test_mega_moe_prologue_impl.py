@@ -36,7 +36,7 @@ try:
 
     import primus_turbo.pytorch.kernels.mega_moe.mega_moe_prologue_impl  # noqa: F401  (registers op)
     from primus_turbo.pytorch.core.backend import BackendType
-    from primus_turbo.pytorch.ops.moe.mega_fused_moe import get_symm_buffer_for_mega_moe
+    from primus_turbo.pytorch.ops.moe.mega_moe_fused import get_symm_buffer_for_mega_moe
 
     _HAVE_FLYDSL = True
 except Exception as _e:  # flydsl only present inside the dev container
@@ -47,7 +47,8 @@ except Exception as _e:  # flydsl only present inside the dev container
 # tensor inputs the custom op consumes (positional, after the topk pair); the plan
 # output tables are RETURNED by the op (not passed in)
 _OP_BUFFER_KEYS = (
-    "peer_ptrs",
+    "buffer_base",
+    "buffer_offsets",
     "origin_rank",
     "origin_slot",
     "meta_scalars",
@@ -74,7 +75,7 @@ def _op_kwargs(symm, *, autotune=False):
 
 
 def _op_call(symm, topk_idx, topk_w, *, autotune=False):
-    """Invoke the custom op; returns the 9 plan output tables."""
+    """Invoke the custom op; returns (plan, tile_to_group, expected)."""
     bufs = [getattr(symm, k) for k in _OP_BUFFER_KEYS]
     return torch.ops.primus_turbo.mega_moe_prologue_impl(
         topk_idx, topk_w, *bufs, **_op_kwargs(symm, autotune=autotune)
@@ -89,8 +90,8 @@ def _validate(symm, ret, topk_idx, topk_w, group, world, rank):
         all_idx, rank, symm.num_topk, symm.num_experts, world, symm.block_m, symm.pool_capacity
     )
     w = topk_w if topk_w is not None else torch.zeros_like(topk_idx, dtype=torch.float32)
-    # the op returns the plan tables: plan(7) + tile_to_group + expected
-    plan, tile_to_group, expected = ret[:7], ret[7], ret[8]
+    # the op returns: plan (7 tensors) + tile_to_group + expected
+    plan, tile_to_group, expected = ret[0], ret[1], ret[2]
     _check_tables(
         symm,
         ref,
@@ -145,7 +146,7 @@ def _run(local_rank, world, args):
 
     def run(idx, w, *bufs):
         out = torch.ops.primus_turbo.mega_moe_prologue_impl(idx, w, *bufs, **kw)
-        return out[2].clone()  # count
+        return out[0][2].clone()  # plan[2] = count
 
     bufs = [getattr(symm, k) for k in _OP_BUFFER_KEYS]
     symm.group.barrier()
