@@ -4,30 +4,37 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Single-process (world=1) self-loopback correctness + perf test for the fused
-MoE dispatch-prologue FlyDSL kernel (``primus_turbo.flydsl.mega.mega_moe_prologue``).
+"""EP8 cross-rank correctness + perf test for the fused MoE dispatch-prologue
+FlyDSL kernel (``primus_turbo.flydsl.mega.mega_moe_prologue_kernel``).
 
-Driven through the ``MegaMoePrologue`` workspace facade (allocate once, run per
-step). world=1: every cross-rank barrier / all-gather / origin push targets this
-rank's own symmetric buffers, so the whole persistent prologue runs in one
-process with no IPC. We validate the deterministic dispatch tables exactly
-against a torch reference, validate the (atomic-ordered) scatter outputs, and
-report latency + an approximate effective bandwidth.
+Each of the ``world`` ranks routes its own ``[T, K]`` topk, then the prologue
+builds the EP dispatch plan over a single symmetric allocation (``SymmBuffer``
+from ``mega_fused_moe``, reused here): the cross-rank counts all-gather, pool
+layout, comm tasks, and the cross-rank ``origin_rank`` / ``origin_slot`` push all
+exercise real inter-rank traffic. We validate every deterministic table against a
+torch reference built from the all-gathered routing, validate the local scatter,
+and check the cross-rank origin push by source-rank counts.
 
-Run inside dev_primus:
-  PYTHONPATH=<...>/Primus-Turbo python -m pytest -s \
-      tests/pytorch/ops/test_mega_moe_prolugue.py
-or standalone:
-  PYTHONPATH=<...>/Primus-Turbo python tests/pytorch/ops/test_mega_moe_prolugue.py
+Run inside dev_primus (>=2 GPUs):
+  PYTHONPATH=<...>/Primus-Turbo python \
+      tests/pytorch/ops/test_mega_moe_prolugue.py --num-processes 8
 """
 
+from __future__ import annotations
+
 import argparse
+import os
 
 import pytest
 import torch
+import torch.distributed as dist
 
 try:
-    from primus_turbo.flydsl.mega.mega_moe_prologue import MegaMoePrologue
+    from primus_turbo.flydsl.mega.mega_moe_prologue_kernel import (
+        get_prologue_workspace,
+        mega_moe_prologue,
+    )
+    from primus_turbo.pytorch.ops.moe.mega_fused_moe import get_symm_buffer_for_mega_moe
 
     _HAVE_FLYDSL = True
 except Exception as _e:  # flydsl only present inside the dev container
@@ -36,82 +43,176 @@ except Exception as _e:  # flydsl only present inside the dev container
 
 
 # ---------------------------------------------------------------------------
-# Torch reference (world=1, rank=0)
+# Routing
 # ---------------------------------------------------------------------------
-def _reference(topk_idx, topk_w, num_tokens, num_topk, num_experts, block_m):
-    """Deterministic dispatch tables + flat valid (expert, token, slot) arrays."""
-    idx = topk_idx.to(torch.int64).cpu()  # [T, K]
-    twf = topk_w.to(torch.float32).cpu()  # [T, K]
-    T, K = num_tokens, num_topk
-    flat = idx.reshape(-1)
-    tok = torch.arange(T).view(T, 1).expand(T, K).reshape(-1)
-    slot = torch.arange(K).view(1, K).expand(T, K).reshape(-1)
-    valid = flat >= 0  # drop padding (-1) pairs
-    e_v, tok_v, slot_v = flat[valid], tok[valid], slot[valid]
+def _make_routing(num_tokens, num_topk, num_experts, seed, drop_frac=0.0):
+    assert num_topk <= num_experts, "top-k cannot exceed the expert count"
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    # distinct experts per token = prefix of a per-row random permutation
+    idx = torch.rand(num_tokens, num_experts, generator=g, device="cuda").argsort(dim=1)[:, :num_topk]
+    idx = idx.contiguous().to(torch.int64)
+    if drop_frac > 0:  # mark some pairs as padding (-1)
+        drop = torch.rand(num_tokens, num_topk, generator=g, device="cuda") < drop_frac
+        idx[drop] = -1
+    w = torch.rand(num_tokens, num_topk, dtype=torch.float32, generator=g, device="cuda")
+    return idx, w
 
-    counts = torch.bincount(e_v, minlength=num_experts).to(torch.int64)
-    padded = ((counts + block_m - 1) // block_m) * block_m
+
+# ---------------------------------------------------------------------------
+# EP reference: mirror the kernel's Phase-C table build for one rank, from the
+# all-gathered per-rank routing. C[s, e] = #pairs from source rank s to expert e.
+# ---------------------------------------------------------------------------
+def _ep_reference(all_idx, rank, num_topk, num_experts, world, block_m, pool_capacity):
+    epr = num_experts // world
+    all_idx[0].shape[0]
+    bm = block_m
+
+    counts_src = torch.zeros(world, num_experts, dtype=torch.int64)  # C[s, e]
+    for s in range(world):
+        flat = all_idx[s].reshape(-1)
+        counts_src[s] = torch.bincount(flat[flat >= 0], minlength=num_experts).to(torch.int64)
+    recv = counts_src.sum(0)  # total received per expert (all sources)
+
+    def ceil_bm(x):
+        return ((x + bm - 1) // bm) * bm
+
+    # pool_base[e]: local offset of expert e within its destination rank's pool
     pool_base = torch.zeros(num_experts, dtype=torch.int64)
-    pool_base[1:] = torch.cumsum(padded, 0)[:-1]
-    start_per_expert = pool_base.clone()  # rank=0 => no preceding ranks
-    source_off = torch.zeros(num_experts, dtype=torch.int64)
-    source_off[1:] = torch.cumsum(counts, 0)[:-1]  # k-order == expert order for world=1
-    total_rows = int(pool_base[-1] + padded[-1])
+    for dest in range(world):
+        running = 0
+        for le in range(epr):
+            e = dest * epr + le
+            pool_base[e] = running
+            running += int(ceil_bm(recv[e]))
+    # start_per_expert[e]: this rank's slice start = pool_base + rows from preceding ranks
+    preceding = counts_src[:rank].sum(0) if rank > 0 else torch.zeros(num_experts, dtype=torch.int64)
+    start_per_expert = pool_base + preceding
+
+    # comm tasks: ct index has dest = ct % world, le = ct // world
+    destination = torch.zeros(num_experts, dtype=torch.int64)
+    start = torch.zeros(num_experts, dtype=torch.int64)
+    count = torch.zeros(num_experts, dtype=torch.int64)
+    for ct in range(num_experts):
+        dest, le = ct % world, ct // world
+        e = dest * epr + le
+        destination[ct] = dest
+        start[ct] = start_per_expert[e]
+        count[ct] = counts_src[rank, e]
+    # source offsets: exclusive cumsum of this rank's counts in le-major / dest-minor order
+    source_off_out = torch.zeros(num_experts, dtype=torch.int64)  # by comm-task index
+    source_off_pe = torch.zeros(num_experts, dtype=torch.int64)  # by expert id
+    acc = 0
+    for le in range(epr):
+        for dest in range(world):
+            ct = le * world + dest
+            e = dest * epr + le
+            source_off_out[ct] = acc
+            source_off_pe[e] = acc
+            acc += int(count[ct])
+
+    # tile_to_group (local expert id, sentinel = epr) + expected (sources per block) for own experts
+    n_mblk = pool_capacity // bm
+    ttg = torch.full((n_mblk,), epr, dtype=torch.int64)
+    expected = torch.zeros(n_mblk, dtype=torch.int64)
+    total_rows = 0
+    for le in range(epr):
+        e = rank * epr + le
+        epb = int(pool_base[e])
+        padded = int(ceil_bm(recv[e]))
+        b0, nb = epb // bm, padded // bm
+        ttg[b0 : b0 + nb] = le
+        within = 0
+        for s in range(world):
+            c = int(counts_src[s, e])
+            if c > 0:
+                fb = (epb + within) // bm
+                lb = (epb + within + c - 1) // bm
+                expected[fb : lb + 1] += 1
+                within += c
+        if le == epr - 1:
+            total_rows = epb + padded
 
     return dict(
-        idx=idx,
-        twf=twf,
-        counts=counts,
-        padded=padded,
+        counts_src=counts_src,
+        recv=recv,
         pool_base=pool_base,
         start_per_expert=start_per_expert,
-        source_off=source_off,
+        destination=destination,
+        start=start,
+        count=count,
+        source_off_out=source_off_out,
+        source_off_pe=source_off_pe,
+        ttg=ttg,
+        expected=expected,
         total_rows=total_rows,
-        e_v=e_v,
-        tok_v=tok_v,
-        slot_v=slot_v,
     )
 
 
-def _check_correctness(wp, ref, num_tokens, num_experts, block_m, pool_capacity):
-    """Assert every deterministic table matches; validate the scatter outputs."""
-    g = lambda name: wp.buffers[name].cpu().to(torch.int64)
+def _check_tables(
+    symm,
+    ref,
+    plan,
+    ret_ttg,
+    ret_expected,
+    topk_idx,
+    topk_w,
+    num_topk,
+    num_experts,
+    world,
+    rank,
+    block_m,
+    pool_capacity,
+):
+    epr = num_experts // world
+    # the 5 per-expert scratch tables live packed in the prologue's cached internal
+    # workspace ([5 * E]); the plan output tables come from the prologue's RETURN
+    # (allocated internally); origin_rank/origin_slot/meta_scalars stay symmetric
+    ws = get_prologue_workspace(num_experts, device=topk_idx.device).cpu().to(torch.int64)
+    E = num_experts
+    ws_views = {
+        "send_local": ws[0:E],
+        "within_expert_counter": ws[E : 2 * E],
+        "start_per_expert": ws[2 * E : 3 * E],
+        "source_offset_per_expert": ws[3 * E : 4 * E],
+        "pool_base": ws[4 * E : 5 * E],
+    }
+    # plan = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
+    outs = {
+        "destination": plan[0],
+        "start": plan[1],
+        "count": plan[2],
+        "source_offset_out": plan[3],
+        "source_tokens": plan[4],
+        "source_topk_slot": plan[5],
+        "tile_to_group": ret_ttg,
+        "expected": ret_expected,
+    }
+    g = lambda name: (
+        ws_views[name]
+        if name in ws_views
+        else outs[name].cpu().to(torch.int64) if name in outs else getattr(symm, name).cpu().to(torch.int64)
+    )
     msgs = []
 
     def eq(name, got, want):
+        got, want = got.cpu(), want.cpu()
         ok = torch.equal(got, want)
-        msgs.append(f"  {name:24s} {'OK' if ok else 'MISMATCH'}")
-        assert ok, f"{name} mismatch\n got ={got.tolist()}\n want={want.tolist()}"
+        msgs.append(f"  {name:26s} {'OK' if ok else 'MISMATCH'}")
+        assert ok, f"{name} mismatch\n got ={got.tolist()[:32]}\n want={want.tolist()[:32]}"
 
-    # reset buffers
+    # counters self-reset to 0 after the launch
     eq("send_local(reset=0)", g("send_local"), torch.zeros(num_experts, dtype=torch.int64))
     eq("within_counter(reset=0)", g("within_expert_counter"), torch.zeros(num_experts, dtype=torch.int64))
     # deterministic dispatch tables
-    eq("count", g("count"), ref["counts"])
+    eq("count", g("count"), ref["count"])
+    eq("destination", g("destination"), ref["destination"])
     eq("pool_base", g("pool_base"), ref["pool_base"])
     eq("start_per_expert", g("start_per_expert"), ref["start_per_expert"])
-    eq("start", g("start"), ref["start_per_expert"])
-    eq("destination(all 0)", g("destination"), torch.zeros(num_experts, dtype=torch.int64))
-    eq("source_offset_out", g("source_offset_out"), ref["source_off"])
-    eq("source_offset_per_expert", g("source_offset_per_expert"), ref["source_off"])
-
-    # tile_to_group: expert id over occupied blocks, sentinel num_experts elsewhere.
-    # expected: per pool block, the number of source ranks contributing rows.
-    n_mblk = pool_capacity // block_m
-    ttg_want = torch.full((n_mblk,), num_experts, dtype=torch.int64)
-    expected_want = torch.zeros(n_mblk, dtype=torch.int64)
-    for e in range(num_experts):  # E is small (32); a per-expert loop is fine here
-        b0 = int(ref["pool_base"][e]) // block_m
-        nb = int(ref["padded"][e]) // block_m
-        ttg_want[b0 : b0 + nb] = e
-        c = int(ref["counts"][e])
-        if c > 0:
-            lb = (int(ref["pool_base"][e]) + c - 1) // block_m
-            expected_want[b0 : lb + 1] += 1
-    eq("tile_to_group", g("tile_to_group"), ttg_want)
-    eq("expected", g("expected"), expected_want)
-
-    # meta_scalars[0]=total_rows, [1]=n_mblk_rows, [2]=num_experts
+    eq("start", g("start"), ref["start"])
+    eq("source_offset_out", g("source_offset_out"), ref["source_off_out"])
+    eq("source_offset_per_expert", g("source_offset_per_expert"), ref["source_off_pe"])
+    eq("tile_to_group", g("tile_to_group"), ref["ttg"])
+    eq("expected", g("expected"), ref["expected"])
     meta = g("meta_scalars")
     eq(
         "meta_scalars[:3]",
@@ -119,35 +220,45 @@ def _check_correctness(wp, ref, num_tokens, num_experts, block_m, pool_capacity)
         torch.tensor([ref["total_rows"], ref["total_rows"] // block_m, num_experts], dtype=torch.int64),
     )
 
-    # ---- scatter: source region holds one (expert, token, slot) per valid pair ----
-    # source slots are packed densely in expert order; expert of slot s = pos_expert[s]
-    used = int(ref["counts"].sum())
-    pos_expert = torch.repeat_interleave(torch.arange(num_experts), ref["counts"])  # [used]
+    # ---- local scatter: source region holds this rank's valid (expert, token, slot) pairs ----
+    idx = topk_idx.cpu()
+    T, K = idx.shape
+    flat = idx.reshape(-1)
+    tok = torch.arange(T).view(T, 1).expand(T, K).reshape(-1)
+    slot = torch.arange(K).view(1, K).expand(T, K).reshape(-1)
+    valid = flat >= 0
+    e_v, tok_v, slot_v = flat[valid], tok[valid], slot[valid]
+    counts_r = ref["counts_src"][rank]
+    used = int(counts_r.sum())
+    # source region is ordered by source_offset_per_expert: le-major, dest-minor
+    order = torch.tensor([dest * epr + le for le in range(epr) for dest in range(world)])
+    pos_expert = torch.repeat_interleave(order, counts_r[order])
     src_tok = g("source_tokens")[:used]
     src_slot = g("source_topk_slot")[:used]
-    src_w = wp.buffers["source_weight"].cpu()[:used]
-    # within-expert order is atomic-nondeterministic -> compare the triple SET
+    src_w = plan[6].cpu()[:used]  # source_weight (f32) from the returned plan handle
     got = set(zip(pos_expert.tolist(), src_tok.tolist(), src_slot.tolist()))
-    want = set(zip(ref["e_v"].tolist(), ref["tok_v"].tolist(), ref["slot_v"].tolist()))
+    want = set(zip(e_v.tolist(), tok_v.tolist(), slot_v.tolist()))
     assert len(want) == used, "reference has duplicate (expert, token, slot) pairs"
     assert got == want, "scatter (expert, token, slot) set mismatch"
-    # routing weight matches the (token, slot) each slot was scattered with
-    assert torch.allclose(src_w, ref["twf"][src_tok, src_slot], atol=1e-6), "source_weight mismatch"
-    msgs.append(f"  {'scatter(token/slot/weight)':24s} OK")
+    assert torch.allclose(src_w, topk_w.cpu()[src_tok, src_slot], atol=1e-6), "source_weight mismatch"
+    msgs.append(f"  {'scatter(token/slot/weight)':26s} OK")
 
-    # ---- origin_rank / origin_slot: exact per-row mapping (same within-pos as source) ----
-    within = torch.arange(used) - ref["source_off"][pos_expert]  # within-expert position
-    occ_rows = ref["start_per_expert"][pos_expert] + within  # pool row of each source slot
+    # ---- cross-rank origin push: this rank received `recv` rows; verify per-source counts ----
+    recv_per_source = ref["counts_src"][:, rank * epr : (rank + 1) * epr].sum(1)  # [world]
     orank = g("origin_rank")
+    for s in range(world):
+        got_s = int((orank == s).sum())
+        assert got_s == int(
+            recv_per_source[s]
+        ), f"origin_rank from src {s}: {got_s} != {int(recv_per_source[s])}"
+    occupied = int((orank >= 0).sum())
+    assert occupied == int(recv_per_source.sum()), "origin_rank occupied count mismatch"
     oslot = g("origin_slot")
-    assert torch.equal(orank[occ_rows], torch.zeros(used, dtype=torch.int64)), "origin_rank occupied != 0"
-    assert torch.equal(oslot[occ_rows], src_slot * num_tokens + src_tok), "origin_slot mismatch"
-    pad_mask = torch.ones(pool_capacity, dtype=torch.bool)
-    pad_mask[occ_rows] = False
-    assert torch.equal(
-        orank[pad_mask], torch.full((int(pad_mask.sum()),), -1, dtype=torch.int64)
-    ), "origin_rank padding != -1"
-    msgs.append(f"  {'origin_rank/slot(per-row)':24s} OK")
+    occ = orank >= 0
+    assert (
+        int(((oslot[occ] >= 0) & (oslot[occ] < num_topk * symm.num_tokens)).sum()) == occupied
+    ), "origin_slot range"
+    msgs.append(f"  {'origin_rank/slot(cross-rank)':26s} OK")
 
     print("\n".join(msgs))
 
@@ -169,100 +280,130 @@ def _bench(fn, warmup=5, iters=50):
     return e0.elapsed_time(e1) * 1000.0 / iters  # us / launch
 
 
-def _approx_bytes(num_tokens, num_topk, num_experts, block_m, pool_capacity):
-    """Approximate global traffic moved by one prologue launch."""
-    total_pairs = num_tokens * num_topk
-    n_mblk = pool_capacity // block_m
-    init = pool_capacity * 4 + 2 * n_mblk * 4  # origin_rank + expected + tile_to_group
-    phase_a = total_pairs * 4  # topk read (low word)
-    phase_d_read = total_pairs * 4 + total_pairs * 4  # topk re-read + topk_w
-    phase_d_write = total_pairs * (4 + 4 + 4 + 4 + 4)  # src_tok/slot/w + origin_rank/slot
-    return init + phase_a + phase_d_read + phase_d_write
-
-
 # ---------------------------------------------------------------------------
-# Test entry
+# Per-process entry
 # ---------------------------------------------------------------------------
-def _make_routing(num_tokens, num_topk, num_experts, seed=7, drop_frac=0.0):
-    assert num_topk <= num_experts, "top-k cannot exceed the expert count"
-    torch.manual_seed(seed)
-    # distinct experts per token = prefix of a per-row random permutation (vectorized)
-    idx = torch.rand(num_tokens, num_experts, device="cuda").argsort(dim=1)[:, :num_topk].contiguous()
-    if drop_frac > 0:  # mark some pairs as padding (-1)
-        drop = torch.rand(num_tokens, num_topk, device="cuda") < drop_frac
-        idx[drop] = -1
-    w = torch.rand(num_tokens, num_topk, dtype=torch.float32, device="cuda")
-    return idx, w
-
-
-def _run(num_tokens, num_topk, num_experts, block_m, drop_frac, iters):
-    total_pairs = num_tokens * num_topk
-    # generous pool: every pair fits even fully imbalanced, + per-expert pad
-    pool_capacity = total_pairs + num_experts * block_m
-    pool_capacity = ((pool_capacity + block_m - 1) // block_m) * block_m
-
-    topk_idx, topk_w = _make_routing(num_tokens, num_topk, num_experts, drop_frac=drop_frac)
-    # world=1 workspace: one factory call owns the whole buffer-shape contract
-    wp = MegaMoePrologue.allocate(
-        num_tokens=num_tokens,
-        num_topk=num_topk,
-        num_experts=num_experts,
-        pool_capacity=pool_capacity,
-        world_size=1,
-        rank=0,
-        block_m=block_m,
+def _prologue_kwargs(symm):
+    """Symmetric/scratch kwargs for mega_moe_prologue; the plan output tables are
+    allocated + returned by the primitive itself (not passed in)."""
+    return dict(
+        peer_ptrs=symm.peer_ptrs,
+        origin_rank=symm.origin_rank,
+        origin_slot=symm.origin_slot,
+        meta_scalars=symm.meta_scalars,
+        grid_barrier_state=symm.grid_barrier_state,
+        profile=symm.profile,
+        scoreboard=symm.scoreboard,
+        barrier_local=symm.barrier_local,
+        num_tokens=symm.num_tokens,
+        num_topk=symm.num_topk,
+        num_experts=symm.num_experts,
+        world_size=symm.world,
+        rank=symm.rank,
+        experts_per_rank=symm.num_experts // symm.world,
+        block_m=symm.block_m,
+        pool_capacity=symm.pool_capacity,
     )
 
-    print(
-        f"\n[cfg] T={num_tokens} K={num_topk} E={num_experts} BM={block_m} "
-        f"pool_cap={pool_capacity} pairs={total_pairs} drop={drop_frac}"
+
+def _run(local_rank, world, args):
+    ip = os.getenv("MASTER_ADDR", "127.0.0.1")
+    port = int(os.getenv("MASTER_PORT", "8411"))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl", init_method=f"tcp://{ip}:{port}", world_size=world, rank=local_rank)
+    torch.set_default_device("cuda")
+    group = dist.new_group(list(range(world)))
+    rank = dist.get_rank()
+
+    T, K, E, BM = args.num_tokens, args.num_topk, args.num_experts, args.block_m
+    assert E % world == 0, "num_experts must be divisible by world_size"
+
+    # one symmetric allocation owns every prologue buffer (small hidden: prologue
+    # ignores pool/act/comb, sized only to keep the shared SymmBuffer allocation cheap)
+    symm = get_symm_buffer_for_mega_moe(
+        group,
+        num_experts=E,
+        num_max_tokens_per_rank=T,
+        num_topk=K,
+        hidden=256,
+        intermediate_hidden=256,
+        block_m=BM,
     )
+
+    topk_idx, topk_w = _make_routing(T, K, E, seed=100 + rank, drop_frac=args.drop_frac)
+    kwargs = _prologue_kwargs(symm)
+
+    if rank == 0:
+        print(
+            f"\n[cfg] world={world} T={T} K={K} E={E} BM={BM} "
+            f"pool_cap={symm.pool_capacity} drop={args.drop_frac}"
+        )
 
     # ---- correctness ----
-    result = wp.run(topk_idx, topk_w)
+    symm.group.barrier()
+    plan, tile_to_group, expected, _, _, num_pool_blocks, _ = mega_moe_prologue(topk_idx, topk_w, **kwargs)
     torch.cuda.synchronize()
-    assert result.num_pool_blocks == pool_capacity // block_m
-    assert result.comm_tasks.num_comm == num_experts
-    ref = _reference(topk_idx, topk_w, num_tokens, num_topk, num_experts, block_m)
-    _check_correctness(wp, ref, num_tokens, num_experts, block_m, pool_capacity)
+    symm.group.barrier()
+    assert num_pool_blocks == symm.pool_capacity // BM
+    assert plan[0].numel() == E  # dst_rank has one row per comm task (== num_experts)
 
-    # ---- perf: latency + effective bandwidth (workspace reuses its launch cache) ----
-    def _fn():
-        wp.run(topk_idx, topk_w)
-
-    t_us = _bench(_fn, iters=iters)
-    bytes_moved = _approx_bytes(num_tokens, num_topk, num_experts, block_m, pool_capacity)
-    bw = bytes_moved / (t_us * 1e-6) / 1e9
-    # the prologue is metadata-heavy / latency-bound (serial block-0 table build +
-    # grid/cross-rank barriers), so eff BW is informational, not a roofline target
-    print(
-        f"[perf] latency = {t_us:8.2f} us/launch  |  "
-        f"approx traffic = {bytes_moved/1e6:6.2f} MB  |  eff BW = {bw:6.1f} GB/s (latency-bound)"
+    all_idx = [torch.empty_like(topk_idx) for _ in range(world)]
+    dist.all_gather(all_idx, topk_idx, group=group)
+    all_idx = [t.cpu() for t in all_idx]
+    ref = _ep_reference(all_idx, rank, K, E, world, BM, symm.pool_capacity)
+    _check_tables(
+        symm, ref, plan, tile_to_group, expected, topk_idx, topk_w, K, E, world, rank, BM, symm.pool_capacity
     )
-    return t_us, bw
+    if rank == 0:
+        print("[mega_moe_prologue] correctness PASS (all ranks)")
+
+    # ---- perf: latency on rank 0 (cross-rank barriers synchronize the launches) ----
+    if args.iters > 0:
+
+        def _fn():
+            mega_moe_prologue(topk_idx, topk_w, **kwargs)
+
+        symm.group.barrier()
+        t_us = _bench(_fn, iters=args.iters)
+        if rank == 0:
+            print(f"[perf] latency = {t_us:8.2f} us/launch (EP{world}, latency-bound)")
+    dist.barrier(group)
+    dist.destroy_process_group()
 
 
-@pytest.mark.skipif(not _HAVE_FLYDSL, reason="flydsl not importable (run inside dev_primus)")
-@pytest.mark.parametrize("num_topk", [6, 8])
-@pytest.mark.parametrize("drop_frac", [0.0, 0.1])
-def test_mega_moe_prologue(num_topk, drop_frac):
-    torch.cuda.set_device(0)
-    _run(num_tokens=4096, num_topk=num_topk, num_experts=32, block_m=256, drop_frac=drop_frac, iters=50)
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+_WORLD = 8
 
 
-def main():
+def _build_argparser():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--num-processes", type=int, default=_WORLD)
     ap.add_argument("--num-tokens", type=int, default=4096)
     ap.add_argument("--num-topk", type=int, default=8)
     ap.add_argument("--num-experts", type=int, default=32)
     ap.add_argument("--block-m", type=int, default=256)
     ap.add_argument("--drop-frac", type=float, default=0.0)
     ap.add_argument("--iters", type=int, default=50)
-    args = ap.parse_args()
+    return ap
+
+
+@pytest.mark.skipif(not _HAVE_FLYDSL, reason="flydsl not importable (run inside dev_primus)")
+@pytest.mark.skipif(torch.cuda.device_count() < _WORLD, reason=f"needs {_WORLD} GPUs for EP{_WORLD}")
+@pytest.mark.parametrize("drop_frac", [0.0, 0.1])
+def test_mega_moe_prologue(drop_frac):
+    args = _build_argparser().parse_args(
+        ["--num-tokens", "4096", "--num-topk", "8", "--num-experts", "32", "--drop-frac", str(drop_frac)]
+    )
+    torch.multiprocessing.spawn(_run, args=(_WORLD, args), nprocs=_WORLD)
+
+
+def main():
+    args = _build_argparser().parse_args()
     if not _HAVE_FLYDSL:
         raise SystemExit(f"flydsl not importable: {_IMPORT_ERR}")
-    torch.cuda.set_device(0)
-    _run(args.num_tokens, args.num_topk, args.num_experts, args.block_m, args.drop_frac, args.iters)
+    torch.multiprocessing.spawn(_run, args=(args.num_processes, args), nprocs=args.num_processes)
     print("[mega_moe_prologue] PASS")
 
 

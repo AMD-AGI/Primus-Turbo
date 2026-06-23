@@ -18,6 +18,7 @@ from typing import Optional
 
 import torch
 
+from primus_turbo.flydsl.mega.mega_moe_prologue_kernel import mega_moe_prologue
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
@@ -29,13 +30,6 @@ from primus_turbo.pytorch.core.backend import (
 
 # topk_idx may be int32/int64; routing weight float; everything else metadata int32
 _SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
-
-
-def _flydsl_kernel():
-    """Lazy import — keep this module importable when FlyDSL is absent."""
-    from primus_turbo.flydsl.mega.mega_moe_prologue import mega_moe_prologue
-
-    return mega_moe_prologue
 
 
 class MegaMoePrologueFlyDSLBackend(KernelBackend):
@@ -62,34 +56,14 @@ class MegaMoePrologueFlyDSLBackend(KernelBackend):
     def execute(
         topk_idx: torch.Tensor,
         topk_w,
-        send_local: torch.Tensor,
-        within_expert_counter: torch.Tensor,
-        c_buffer_ptrs: torch.Tensor,
-        signal_ptrs: torch.Tensor,
-        origin_rank_ptrs: torch.Tensor,
-        origin_slot_ptrs: torch.Tensor,
-        start_per_expert: torch.Tensor,
-        source_offset_per_expert: torch.Tensor,
-        pool_base: torch.Tensor,
-        destination: torch.Tensor,
-        start: torch.Tensor,
-        count: torch.Tensor,
-        source_offset_out: torch.Tensor,
-        tile_to_group: torch.Tensor,
-        expected: torch.Tensor,
-        source_tokens: torch.Tensor,
-        source_topk_slot: torch.Tensor,
-        source_weight: torch.Tensor,
-        zero_topk_weights: torch.Tensor,
+        peer_ptrs: torch.Tensor,
         origin_rank: torch.Tensor,
         origin_slot: torch.Tensor,
         meta_scalars: torch.Tensor,
         grid_barrier_state: torch.Tensor,
-        token_rank_table: torch.Tensor,
-        dedup_src_row_ptrs: torch.Tensor,
-        dedup_src_row: torch.Tensor,
-        source_dedup: torch.Tensor,
         profile: torch.Tensor,
+        scoreboard: torch.Tensor,
+        barrier_local: torch.Tensor,
         num_tokens: int,
         num_topk: int,
         num_experts: int,
@@ -98,44 +72,25 @@ class MegaMoePrologueFlyDSLBackend(KernelBackend):
         experts_per_rank: int,
         block_m: int,
         pool_capacity: int,
-        dedup: bool,
         no_cpu_sync: bool,
+        num_cu: int = 64,
         **kwargs,
     ):
-        kernel = _flydsl_kernel()
-        # launch_cache=None: each call is a normal launch (the kernel self-resets
-        # its counters, so re-launch is idempotent and autotune-profile safe).
-        kernel(
+        # The primitive allocates + returns its plan output tables internally; pass them
+        # straight through. (launch_cache=None: each call is a normal launch; the kernel
+        # self-resets its counters, so re-launch is idempotent.) scoreboard + barrier_local
+        # are reset inside the kernel (sb_l2 / comb stay host-zeroed).
+        plan, ttg, exp, _orank, _oslot, _npb, _mnt = mega_moe_prologue(
             topk_idx,
             topk_w,
-            send_local=send_local,
-            within_expert_counter=within_expert_counter,
-            c_buffer_ptrs=c_buffer_ptrs,
-            signal_ptrs=signal_ptrs,
-            origin_rank_ptrs=origin_rank_ptrs,
-            origin_slot_ptrs=origin_slot_ptrs,
-            start_per_expert=start_per_expert,
-            source_offset_per_expert=source_offset_per_expert,
-            pool_base=pool_base,
-            destination=destination,
-            start=start,
-            count=count,
-            source_offset_out=source_offset_out,
-            tile_to_group=tile_to_group,
-            expected=expected,
-            source_tokens=source_tokens,
-            source_topk_slot=source_topk_slot,
-            source_weight=source_weight,
-            zero_topk_weights=zero_topk_weights,
+            peer_ptrs=peer_ptrs,
             origin_rank=origin_rank,
             origin_slot=origin_slot,
             meta_scalars=meta_scalars,
             grid_barrier_state=grid_barrier_state,
-            token_rank_table=token_rank_table,
-            dedup_src_row_ptrs=dedup_src_row_ptrs,
-            dedup_src_row=dedup_src_row,
-            source_dedup=source_dedup,
             profile=profile,
+            scoreboard=scoreboard,
+            barrier_local=barrier_local,
             num_tokens=int(num_tokens),
             num_topk=int(num_topk),
             num_experts=int(num_experts),
@@ -144,10 +99,11 @@ class MegaMoePrologueFlyDSLBackend(KernelBackend):
             experts_per_rank=int(experts_per_rank),
             block_m=int(block_m),
             pool_capacity=int(pool_capacity),
-            dedup=bool(dedup),
             no_cpu_sync=bool(no_cpu_sync),
+            num_cu=int(num_cu),
         )
-        return None
+        # plan = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
+        return (*plan, ttg, exp)
 
 
 _MEGA_MOE_PROLOGUE_BACKENDS = {
@@ -172,7 +128,7 @@ class MegaMoePrologueKernelDispatcher(AutoKernelDispatcher):
         rank,
         block_m,
         pool_capacity,
-        dedup,
+        num_cu=64,
         **kwargs,
     ):
         return (
@@ -183,39 +139,41 @@ class MegaMoePrologueKernelDispatcher(AutoKernelDispatcher):
             int(rank),
             int(block_m),
             int(pool_capacity),
-            bool(dedup),
+            int(num_cu),
             topk_idx.dtype,
         )
 
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
-# Buffers the kernel writes on this rank (direct or own peer-pointer row).
-# c_buffer/signal are cross-rank scratch reached only via *_ptrs -> untracked.
+# In-place buffers the kernel writes on this rank: the symmetric origin tables
+# (written cross-rank via *_ptrs), the device meta scalars, and the barrier/profile
+# scratch. The plan output tables are allocated + RETURNED (not mutated inputs).
 _MUTATED_ARGS = (
-    "send_local",
-    "within_expert_counter",
-    "start_per_expert",
-    "source_offset_per_expert",
-    "pool_base",
-    "destination",
-    "start",
-    "count",
-    "source_offset_out",
-    "tile_to_group",
-    "expected",
-    "source_tokens",
-    "source_topk_slot",
-    "source_weight",
     "origin_rank",
     "origin_slot",
     "meta_scalars",
     "grid_barrier_state",
-    "token_rank_table",
-    "dedup_src_row",
-    "source_dedup",
     "profile",
+    "scoreboard",
+    "barrier_local",
 )
+
+# return order mirrors the FlyDSL primitive: the flat dispatch plan tensors
+#   (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
+# followed by tile_to_group + expected. origin tables are mutated in place; the
+# scalar returns (num_pool_blocks / max_num_token) are static -> derived by callers.
+_RET = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
 
 
 @_torch_custom_op_wrapper(
@@ -226,34 +184,14 @@ _MUTATED_ARGS = (
 def mega_moe_prologue_impl(
     topk_idx: torch.Tensor,
     topk_w: Optional[torch.Tensor],
-    send_local: torch.Tensor,
-    within_expert_counter: torch.Tensor,
-    c_buffer_ptrs: torch.Tensor,
-    signal_ptrs: torch.Tensor,
-    origin_rank_ptrs: torch.Tensor,
-    origin_slot_ptrs: torch.Tensor,
-    start_per_expert: torch.Tensor,
-    source_offset_per_expert: torch.Tensor,
-    pool_base: torch.Tensor,
-    destination: torch.Tensor,
-    start: torch.Tensor,
-    count: torch.Tensor,
-    source_offset_out: torch.Tensor,
-    tile_to_group: torch.Tensor,
-    expected: torch.Tensor,
-    source_tokens: torch.Tensor,
-    source_topk_slot: torch.Tensor,
-    source_weight: torch.Tensor,
-    zero_topk_weights: torch.Tensor,
+    peer_ptrs: torch.Tensor,
     origin_rank: torch.Tensor,
     origin_slot: torch.Tensor,
     meta_scalars: torch.Tensor,
     grid_barrier_state: torch.Tensor,
-    token_rank_table: torch.Tensor,
-    dedup_src_row_ptrs: torch.Tensor,
-    dedup_src_row: torch.Tensor,
-    source_dedup: torch.Tensor,
     profile: torch.Tensor,
+    scoreboard: torch.Tensor,
+    barrier_local: torch.Tensor,
     num_tokens: int,
     num_topk: int,
     num_experts: int,
@@ -262,16 +200,18 @@ def mega_moe_prologue_impl(
     block_m: int,
     pool_capacity: int,
     default_backend: int,
-    dedup: bool = False,
     no_cpu_sync: bool = True,
     autotune: bool = False,
-) -> None:
-    """Fused MoE dispatch-prologue: build the full EP dispatch plan in place.
+    num_cu: int = 64,
+) -> _RET:
+    """Fused MoE dispatch-prologue: build the full EP dispatch plan.
 
-    All metadata buffers are mutated in place over caller-owned (symmetric)
-    memory; the caller MUST keep the buffers alive and may read them after the
-    call. Cross-rank writes via ``*_ptrs`` tables are raw-pointer and untracked
-    by autograd. Returns nothing — the plan lives in the mutated buffers.
+    Allocates + RETURNS the dispatch plan output tables (dst_rank / dst_offset /
+    count / src_offset / src_tokens / topk_slot / weight + tile_to_group / expected),
+    mirroring the FlyDSL primitive. The symmetric origin tables + device meta scalars
+    are mutated in place (origin writes cross-rank via raw ``*_ptrs``, untracked).
+    scoreboard + barrier_local are reset inside the kernel before its final cross-rank
+    barrier; sb_l2 / comb stay host-zeroed (comb is large -> faster as a full-grid memset).
     """
     default_backend_enum = BackendType(default_backend)
     experts_per_rank = int(num_experts) // int(world_size)
@@ -283,34 +223,14 @@ def mega_moe_prologue_impl(
     kwargs = dict(
         topk_idx=topk_idx,
         topk_w=topk_w,
-        send_local=send_local,
-        within_expert_counter=within_expert_counter,
-        c_buffer_ptrs=c_buffer_ptrs,
-        signal_ptrs=signal_ptrs,
-        origin_rank_ptrs=origin_rank_ptrs,
-        origin_slot_ptrs=origin_slot_ptrs,
-        start_per_expert=start_per_expert,
-        source_offset_per_expert=source_offset_per_expert,
-        pool_base=pool_base,
-        destination=destination,
-        start=start,
-        count=count,
-        source_offset_out=source_offset_out,
-        tile_to_group=tile_to_group,
-        expected=expected,
-        source_tokens=source_tokens,
-        source_topk_slot=source_topk_slot,
-        source_weight=source_weight,
-        zero_topk_weights=zero_topk_weights,
+        peer_ptrs=peer_ptrs,
         origin_rank=origin_rank,
         origin_slot=origin_slot,
         meta_scalars=meta_scalars,
         grid_barrier_state=grid_barrier_state,
-        token_rank_table=token_rank_table,
-        dedup_src_row_ptrs=dedup_src_row_ptrs,
-        dedup_src_row=dedup_src_row,
-        source_dedup=source_dedup,
         profile=profile,
+        scoreboard=scoreboard,
+        barrier_local=barrier_local,
         num_tokens=num_tokens,
         num_topk=num_topk,
         num_experts=num_experts,
@@ -319,46 +239,26 @@ def mega_moe_prologue_impl(
         experts_per_rank=experts_per_rank,
         block_m=block_m,
         pool_capacity=pool_capacity,
-        dedup=dedup,
         no_cpu_sync=no_cpu_sync,
         autotune=do_autotune,
+        num_cu=num_cu,
     )
 
-    MegaMoePrologueKernelDispatcher.dispatch(default_backend_enum, None, **kwargs)
+    return MegaMoePrologueKernelDispatcher.dispatch(default_backend_enum, None, **kwargs)
 
 
 @mega_moe_prologue_impl.register_fake
 def mega_moe_prologue_impl_meta(
     topk_idx: torch.Tensor,
     topk_w: Optional[torch.Tensor],
-    send_local: torch.Tensor,
-    within_expert_counter: torch.Tensor,
-    c_buffer_ptrs: torch.Tensor,
-    signal_ptrs: torch.Tensor,
-    origin_rank_ptrs: torch.Tensor,
-    origin_slot_ptrs: torch.Tensor,
-    start_per_expert: torch.Tensor,
-    source_offset_per_expert: torch.Tensor,
-    pool_base: torch.Tensor,
-    destination: torch.Tensor,
-    start: torch.Tensor,
-    count: torch.Tensor,
-    source_offset_out: torch.Tensor,
-    tile_to_group: torch.Tensor,
-    expected: torch.Tensor,
-    source_tokens: torch.Tensor,
-    source_topk_slot: torch.Tensor,
-    source_weight: torch.Tensor,
-    zero_topk_weights: torch.Tensor,
+    peer_ptrs: torch.Tensor,
     origin_rank: torch.Tensor,
     origin_slot: torch.Tensor,
     meta_scalars: torch.Tensor,
     grid_barrier_state: torch.Tensor,
-    token_rank_table: torch.Tensor,
-    dedup_src_row_ptrs: torch.Tensor,
-    dedup_src_row: torch.Tensor,
-    source_dedup: torch.Tensor,
     profile: torch.Tensor,
+    scoreboard: torch.Tensor,
+    barrier_local: torch.Tensor,
     num_tokens: int,
     num_topk: int,
     num_experts: int,
@@ -367,13 +267,29 @@ def mega_moe_prologue_impl_meta(
     block_m: int,
     pool_capacity: int,
     default_backend: int,
-    dedup: bool = False,
     no_cpu_sync: bool = True,
     autotune: bool = False,
-) -> None:
+    num_cu: int = 64,
+) -> _RET:
     assert topk_idx.dim() == 2, f"topk_idx must be 2D [T,K], got {topk_idx.shape}"
     assert topk_idx.shape[-1] == int(num_topk), "topk_idx last dim must equal num_topk"
     assert topk_idx.dtype in _SUPPORTED_INDEX_DTYPES, f"topk_idx dtype {topk_idx.dtype} unsupported"
     assert int(num_experts) % int(world_size) == 0, "num_experts must be divisible by world_size"
     assert int(pool_capacity) % int(block_m) == 0, "pool_capacity must be a multiple of block_m"
-    return None
+    E, P, M = int(num_experts), int(pool_capacity), int(pool_capacity) // int(block_m)
+
+    def i32(n):
+        return torch.empty(n, dtype=torch.int32, device=topk_idx.device)
+
+    return (
+        # dst_rank, dst_offset, count, src_offset
+        i32(E),
+        i32(E),
+        i32(E),
+        i32(E),
+        i32(P),
+        i32(P),  # src_tokens, topk_slot
+        torch.empty(P, dtype=torch.float32, device=topk_idx.device),  # weight
+        i32(M),
+        i32(M),  # tile_to_group, expected
+    )
