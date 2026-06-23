@@ -4,10 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import ctypes
-import os
-import struct
-
 import torch
 
 from primus_turbo.pytorch.core.backend import (
@@ -28,7 +24,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMVariableKKernelDispatcher,
 )
 from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
-    _compute_tile_cumsum_kernel,
+    _compute_tile_cumsum_kernel,  # noqa: F401 – re-exported for ops layer
     grouped_gemm_fp8_blockwise_triton_kernel,
     grouped_gemm_fp8_blockwise_variable_k_triton_kernel,
     grouped_gemm_fp8_rowwise_triton_kernel,
@@ -36,25 +32,25 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_fp8_tensorwise_triton_kernel,
     grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
 )
+from primus_turbo.asm_co.grouped_gemm.backends import (
+    GroupedGEMMFP8ASMCOBackend,
+    GroupedGEMMFP8VariableKASMCOBackend,
+)
+from primus_turbo.asm_co.grouped_gemm.launcher import launch_asm_co_wgrad_variable_k_beta1
 
-# ---------------------------------------------------------------------------
-# Per-pass ASM opt-in env vars.  When PRIMUS_TURBO_GROUPED_GEMM_BACKEND=ASM_CO
-# is set, each pass still runs Triton by default.  Set the corresponding var
-# to "1" to enable ASM for that specific pass.
-# ---------------------------------------------------------------------------
+_COMMON_SUPPORTED_DTYPES = (
+    (float8_e4m3, float8_e4m3, torch.float16),
+    (float8_e4m3, float8_e4m3, torch.bfloat16),
+    (float8_e5m2, float8_e5m2, torch.float16),
+    (float8_e5m2, float8_e5m2, torch.bfloat16),
+)
 
-
-def _asm_fwd_enabled() -> bool:
-    return os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_ASM_FWD", "0") == "1"
-
-
-def _asm_dgrad_enabled() -> bool:
-    return os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_ASM_DGRAD", "0") == "1"
-
-
-def _asm_wgrad_enabled() -> bool:
-    return os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_ASM_WGRAD", "0") == "1"
-
+_HYBRID_SUPPORTED_DTYPES = (
+    (float8_e4m3, float8_e5m2, torch.float16),
+    (float8_e4m3, float8_e5m2, torch.bfloat16),
+    (float8_e5m2, float8_e4m3, torch.float16),
+    (float8_e5m2, float8_e4m3, torch.bfloat16),
+)
 
 _logged_gemm_backends: set[str] = set()
 
@@ -73,21 +69,8 @@ def _log_backend_once(pass_name: str, backend: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-
-_COMMON_SUPPORTED_DTYPES = (
-    (float8_e4m3, float8_e4m3, torch.float16),
-    (float8_e4m3, float8_e4m3, torch.bfloat16),
-    (float8_e5m2, float8_e5m2, torch.float16),
-    (float8_e5m2, float8_e5m2, torch.bfloat16),
-)
-
-_HYBRID_SUPPORTED_DTYPES = (
-    (float8_e4m3, float8_e5m2, torch.float16),
-    (float8_e4m3, float8_e5m2, torch.bfloat16),
-    (float8_e5m2, float8_e4m3, torch.float16),
-    (float8_e5m2, float8_e4m3, torch.bfloat16),
-)
-
+# CK backend
+# ---------------------------------------------------------------------------
 
 class GroupedGEMMFP8CKBackend(KernelBackend):
     SUPPORTED_GRANULARITIES = {
@@ -95,7 +78,6 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
     }
-
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -136,17 +118,8 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
         **kwargs,
     ):
         return torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm_fp8(
-            a,
-            b,
-            a_scales,
-            b_scales,
-            group_lens,
-            group_offs,
-            trans_a,
-            trans_b,
-            out_dtype,
-            granularity.name,
-            num_cu,
+            a, b, a_scales, b_scales, group_lens, group_offs,
+            trans_a, trans_b, out_dtype, granularity.name, num_cu,
         )
 
 
@@ -156,7 +129,6 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
     }
-
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -207,25 +179,17 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
             lhs_scales, rhs_scales = a_scales, b_scales
             trans_lhs, trans_rhs = trans_a, trans_b
         return torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm_fp8_variable_k(
-            lhs,
-            rhs,
-            lhs_scales,
-            rhs_scales,
-            group_lens,
-            group_offs,
-            trans_lhs,
-            trans_rhs,
-            out_dtype,
-            granularity.name,
-            num_cu,
+            lhs, rhs, lhs_scales, rhs_scales, group_lens, group_offs,
+            trans_lhs, trans_rhs, out_dtype, granularity.name, num_cu,
         )
 
 
-class GroupedGEMMFP8HipblasltBackend(KernelBackend):
-    SUPPORTED_GRANULARITIES = {
-        ScalingGranularity.TENSORWISE,
-    }
+# ---------------------------------------------------------------------------
+# hipBLASLt backend
+# ---------------------------------------------------------------------------
 
+class GroupedGEMMFP8HipblasltBackend(KernelBackend):
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -266,25 +230,13 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
         maybe_pre_sync: bool = False,
     ):
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm_fp8(
-            a,
-            b,
-            a_scales,
-            b_scales,
-            group_lens,
-            group_offs,
-            trans_a,
-            trans_b,
-            out_dtype,
-            granularity.name,
-            maybe_pre_sync,
+            a, b, a_scales, b_scales, group_lens, group_offs,
+            trans_a, trans_b, out_dtype, granularity.name, maybe_pre_sync,
         )
 
 
 class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
-    SUPPORTED_GRANULARITIES = {
-        ScalingGranularity.TENSORWISE,
-    }
-
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -335,27 +287,19 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
             lhs_scales, rhs_scales = a_scales, b_scales
             trans_lhs, trans_rhs = trans_a, trans_b
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm_fp8(
-            lhs,
-            rhs,
-            lhs_scales,
-            rhs_scales,
-            group_lens,
-            group_offs,
-            trans_lhs,
-            trans_rhs,
-            out_dtype,
-            granularity.name,
-            maybe_pre_sync,
+            lhs, rhs, lhs_scales, rhs_scales, group_lens, group_offs,
+            trans_lhs, trans_rhs, out_dtype, granularity.name, maybe_pre_sync,
         )
 
+
+# ---------------------------------------------------------------------------
+# Triton backend
+# ---------------------------------------------------------------------------
 
 class GroupedGEMMFP8TritonBackend(KernelBackend):
     """Triton persistent-kernel backend for FP8 grouped GEMM (CPU-sync-free).
 
-    Supports:
-      - TENSORWISE: per-tensor scaling
-      - ROWWISE: per-row/per-col vector scaling
-      - BLOCKWISE: block-wise scaling (2D B_scales per group)
+    Supports TENSORWISE, ROWWISE, and BLOCKWISE scaling granularities.
     """
 
     SUPPORTED_GRANULARITIES = {
@@ -363,10 +307,6 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
     }
-
-    # tl.dot is dtype-agnostic and handles mixed e4m3/e5m2 FP8 natively on
-    # gfx950 via v_mfma_f32_32x32x64_f8f6f4 with per-operand cbsz/blgp
-    # modifiers, matching the hipBLASLt backend's hybrid dtype support.
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -408,489 +348,21 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
     ):
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_triton_kernel(
-                a,
-                b,
-                a_scales,
-                b_scales,
-                group_offs,
-                trans_b=trans_b,
-                out_dtype=out_dtype,
+                a, b, a_scales, b_scales, group_offs, trans_b=trans_b, out_dtype=out_dtype,
             )
         elif granularity == ScalingGranularity.ROWWISE:
             return grouped_gemm_fp8_rowwise_triton_kernel(
-                a,
-                b,
-                a_scales,
-                b_scales,
-                group_offs,
-                trans_b=trans_b,
-                out_dtype=out_dtype,
+                a, b, a_scales, b_scales, group_offs, trans_b=trans_b, out_dtype=out_dtype,
             )
         return grouped_gemm_fp8_tensorwise_triton_kernel(
-            a,
-            b,
-            a_scales,
-            b_scales,
-            group_offs,
-            trans_b=trans_b,
-            out_dtype=out_dtype,
+            a, b, a_scales, b_scales, group_offs, trans_b=trans_b, out_dtype=out_dtype,
         )
-
-
-# (K, N) shapes of the gpt-oss MoE FP8 fwd/dgrad call sites that the
-# hand-tuned combined_v5.co kernel is specialised for.
-# K = a.shape[1], N = b.shape[-2] if trans_b else b.shape[-1]
-_ASM_CO_FWD_SITES = {
-    (2880, 5760),  # gate_up_fwd
-    (2880, 2880),  # down_fwd / down_dgrad
-    (5760, 2880),  # gate_up_dgrad
-}
-
-
-# ── ASM .co shared HIP launcher infrastructure ────────────────────────────────
-_ASM_CO_THREADS = 512
-_ASM_CO_LDS_BYTES = 65536
-
-_HIP_LIB: ctypes.CDLL | None = None
-
-_HIP_LAUNCH_PARAM_BUFFER_POINTER = ctypes.c_void_p(0x01)
-_HIP_LAUNCH_PARAM_BUFFER_SIZE = ctypes.c_void_p(0x02)
-_HIP_LAUNCH_PARAM_END = ctypes.c_void_p(0x03)
-
-
-def _get_libhip() -> ctypes.CDLL:
-    global _HIP_LIB
-    if _HIP_LIB is None:
-        for name in ("libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"):
-            try:
-                _HIP_LIB = ctypes.CDLL(name)
-                break
-            except OSError:
-                continue
-        if _HIP_LIB is None:
-            raise OSError("Cannot load libamdhip64.so — not running inside a ROCm container?")
-    return _HIP_LIB
-
-
-def _asm_co_module_launch(
-    func: ctypes.c_void_p,
-    kernarg_buf: ctypes.Array,
-    num_cu: int | None,
-    device: torch.device,
-    label: str,
-    lds_bytes: int = _ASM_CO_LDS_BYTES,
-    threads: int = _ASM_CO_THREADS,
-) -> None:
-    hip = _get_libhip()
-    arg_size = ctypes.c_size_t(96)
-    config = (ctypes.c_void_p * 5)(
-        _HIP_LAUNCH_PARAM_BUFFER_POINTER,
-        ctypes.cast(kernarg_buf, ctypes.c_void_p),
-        _HIP_LAUNCH_PARAM_BUFFER_SIZE,
-        ctypes.cast(ctypes.pointer(arg_size), ctypes.c_void_p),
-        _HIP_LAUNCH_PARAM_END,
-    )
-    grid_cu = (
-        num_cu if num_cu is not None else torch.cuda.get_device_properties(device).multi_processor_count
-    )
-    stream = torch.cuda.current_stream().cuda_stream
-    rc = hip.hipModuleLaunchKernel(
-        func,
-        grid_cu,
-        1,
-        1,
-        threads,
-        1,
-        1,
-        lds_bytes,
-        ctypes.c_void_p(stream),
-        None,
-        config,
-    )
-    if rc != 0:
-        hip.hipGetErrorString.restype = ctypes.c_char_p
-        raise RuntimeError(
-            f"hipModuleLaunchKernel ({label}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
-        )
-
-
-# ── ASM .hsaco DGRAD launcher (optimized Triton kernels, per-shape) ──────────
-_ASM_CO_DGRAD_HSACO_DIR = os.environ.get("PRIMUS_TURBO_ASM_CO_DIR", "/opt/asm_ggemm")
-_ASM_CO_DGRAD_KERNEL_NAME = "_grouped_fp8_persistent_gemm_kernel"
-_ASM_CO_DGRAD_LDS_BYTES = 131072
-
-_ASM_CO_DGRAD_HSACO_PATHS: dict[int, str] = {
-    2880: os.path.join(_ASM_CO_DGRAD_HSACO_DIR, "dgrad_down_2880.hsaco"),
-    5760: os.path.join(_ASM_CO_DGRAD_HSACO_DIR, "dgrad_gate_up_5760.hsaco"),
-}
-
-_ASM_CO_DGRAD_MODULES: dict[int, ctypes.c_void_p] = {}
-_ASM_CO_DGRAD_FUNCS: dict[int, ctypes.c_void_p] = {}
-
-
-def _get_asm_co_dgrad_func(k: int) -> ctypes.c_void_p:
-    """Load and cache the DGRAD .hsaco function handle keyed by K dimension."""
-    if k not in _ASM_CO_DGRAD_FUNCS:
-        path = _ASM_CO_DGRAD_HSACO_PATHS[k]
-        hip = _get_libhip()
-        mod = ctypes.c_void_p()
-        rc = hip.hipModuleLoad(ctypes.byref(mod), path.encode())
-        if rc != 0:
-            hip.hipGetErrorString.restype = ctypes.c_char_p
-            raise RuntimeError(
-                f"hipModuleLoad({path}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
-            )
-        func = ctypes.c_void_p()
-        rc = hip.hipModuleGetFunction(
-            ctypes.byref(func), mod, _ASM_CO_DGRAD_KERNEL_NAME.encode()
-        )
-        if rc != 0:
-            hip.hipGetErrorString.restype = ctypes.c_char_p
-            raise RuntimeError(
-                f"hipModuleGetFunction({_ASM_CO_DGRAD_KERNEL_NAME}) from {path} "
-                f"failed rc={rc}: {hip.hipGetErrorString(rc)}"
-            )
-        _ASM_CO_DGRAD_MODULES[k] = mod
-        _ASM_CO_DGRAD_FUNCS[k] = func
-    return _ASM_CO_DGRAD_FUNCS[k]
-
-
-def _launch_asm_co_fwd_dgrad(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scales: torch.Tensor,
-    b_scales: torch.Tensor,
-    group_offs: torch.Tensor,
-    trans_b: bool,
-    out_dtype: torch.dtype,
-    num_cu: int | None,
-) -> torch.Tensor:
-    """Launch optimized DGRAD .hsaco kernel (trans_b=True) via HIP module API.
-
-    Uses per-shape optimized Triton kernels with tile_cumsum persistent scheduling.
-    Kernarg layout (84 bytes in 96-byte buffer):
-      7 pointers: A, B, C, A_scale, B_scale, group_offs, tile_cumsum
-      7 int32s:   G, N, K, stride_am, stride_bg, stride_bn, stride_cm
-    """
-    m = a.shape[0]
-    k = a.shape[1]
-    g = b.shape[0]
-    n = b.shape[1]  # trans_b=True → N is dim 1
-    out = torch.empty((m, n), device=a.device, dtype=out_dtype)
-
-    blk_m = 256
-    blk_n = 256
-    num_pid_n = (n + blk_n - 1) // blk_n
-    tile_cumsum = torch.empty(g + 1, device=a.device, dtype=torch.int32)
-    _compute_tile_cumsum_kernel[(1,)](
-        group_offs,
-        tile_cumsum,
-        g,
-        num_pid_n,
-        BLOCK_SIZE_M=blk_m,
-    )
-
-    func = _get_asm_co_dgrad_func(k)
-
-    buf = ctypes.create_string_buffer(96)
-    struct.pack_into(
-        "<QQQQQQQ",
-        buf,
-        0,
-        a.data_ptr(),
-        b.data_ptr(),
-        out.data_ptr(),
-        a_scales.data_ptr(),
-        b_scales.data_ptr(),
-        group_offs.data_ptr(),
-        tile_cumsum.data_ptr(),
-    )
-    struct.pack_into(
-        "<iiiiiii",
-        buf,
-        56,
-        g,
-        n,
-        k,
-        a.stride(0),       # stride_am = K
-        b.stride(0),       # stride_bg = N*K
-        b.stride(1),       # stride_bn = K (trans_b=True, B is [G,N,K])
-        out.stride(0),     # stride_cm = N
-    )
-
-    _asm_co_module_launch(
-        func,
-        buf,
-        num_cu,
-        a.device,
-        f"dgrad K={k}, N={n}",
-        lds_bytes=_ASM_CO_DGRAD_LDS_BYTES,
-    )
-    return out
-
-
-class GroupedGEMMFP8ASMCOBackend(KernelBackend):
-    """Hand-tuned AMDGCN assembly (.co/.hsaco) backend for FP8 grouped GEMM fwd/dgrad.
-
-    Handles two code paths:
-      - DGRAD (trans_b=True): uses per-shape optimized .hsaco files with 7-pointer
-        kernarg layout (includes tile_cumsum_ptr), keyed by K dimension
-      - FWD   (trans_b=False): uses per-shape .hsaco files with 7-pointer kernarg
-        layout (includes tile_cumsum_ptr)
-
-    Activated when PRIMUS_TURBO_GROUPED_GEMM_BACKEND=ASM_CO. Tensorwise scaling
-    only, E=32 experts, gpt-oss MoE shapes on MI355X (gfx950).
-    """
-
-    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
-    _first_use_dgrad: bool = True
-    _first_use_fwd: bool = True
-
-    @staticmethod
-    def can_handle(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        a_scales: torch.Tensor,
-        b_scales: torch.Tensor,
-        group_lens: torch.Tensor,
-        group_offs: torch.Tensor,
-        trans_a: bool,
-        trans_b: bool,
-        out_dtype: torch.dtype,
-        granularity: ScalingGranularity,
-        num_cu: int | None,
-        **kwargs,
-    ) -> bool:
-        supported = True
-        supported &= a.dim() == 2 and b.dim() == 3
-        supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8ASMCOBackend.SUPPORTED_DTYPES
-        supported &= granularity in GroupedGEMMFP8ASMCOBackend.SUPPORTED_GRANULARITIES
-        supported &= not trans_a
-        supported &= b.shape[0] == 32  # E
-        k = a.shape[1]
-        if trans_b:
-            n = b.shape[-2]
-            supported &= (k, n) in _ASM_CO_FWD_SITES
-        else:
-            n = b.shape[-1]
-            supported &= (k, n) in _ASM_CO_FWD_SITES_NOTRANSB
-        return supported
-
-    @staticmethod
-    def execute(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        a_scales: torch.Tensor,
-        b_scales: torch.Tensor,
-        group_lens: torch.Tensor,
-        group_offs: torch.Tensor,
-        trans_a: bool,
-        trans_b: bool,
-        out_dtype: torch.dtype,
-        granularity: ScalingGranularity,
-        num_cu: int | None,
-        **kwargs,
-    ):
-        if trans_b:
-            if GroupedGEMMFP8ASMCOBackend._first_use_dgrad:
-                GroupedGEMMFP8ASMCOBackend._first_use_dgrad = False
-                print(
-                    f"[ASM_CO] dgrad kernel first use — "
-                    f"a={tuple(a.shape)} b={tuple(b.shape)} "
-                    f"out_dtype={out_dtype} granularity={granularity.name}",
-                    flush=True,
-                )
-            return _launch_asm_co_fwd_dgrad(
-                a,
-                b,
-                a_scales,
-                b_scales,
-                group_offs,
-                trans_b,
-                out_dtype,
-                num_cu,
-            )
-        else:
-            if GroupedGEMMFP8ASMCOBackend._first_use_fwd:
-                GroupedGEMMFP8ASMCOBackend._first_use_fwd = False
-                print(
-                    f"[ASM_CO] fwd kernel first use — "
-                    f"a={tuple(a.shape)} b={tuple(b.shape)} "
-                    f"out_dtype={out_dtype} granularity={granularity.name}",
-                    flush=True,
-                )
-            return _launch_asm_co_fwd(
-                a,
-                b,
-                a_scales,
-                b_scales,
-                group_offs,
-                out_dtype,
-                num_cu,
-            )
-
-
-# ── ASM .hsaco FWD launcher (uses tile_cumsum, trans_b=False) ────────────────
-_ASM_CO_FWD_HSACO_DIR = "/opt/asm_ggemm"
-_ASM_CO_FWD_KERNEL_NAME_HSACO = "_grouped_fp8_persistent_gemm_kernel"
-_ASM_CO_FWD_LDS_BYTES = 131072
-
-_ASM_CO_FWD_SITES_NOTRANSB = {
-    (2880, 5760),  # gate_up_fwd
-    (2880, 2880),  # down_fwd
-}
-
-_ASM_CO_FWD_HSACO_PATHS: dict[int, str] = {
-    5760: os.path.join(_ASM_CO_FWD_HSACO_DIR, "reference_grouped_gemm_fwd_5760.hsaco"),
-    2880: os.path.join(_ASM_CO_FWD_HSACO_DIR, "reference_grouped_gemm_fwd_2880.hsaco"),
-}
-
-_ASM_CO_FWD_MODULES: dict[int, ctypes.c_void_p] = {}
-_ASM_CO_FWD_FUNCS: dict[int, ctypes.c_void_p] = {}
-
-
-def _get_asm_co_fwd_hsaco_func(n: int) -> ctypes.c_void_p:
-    """Load and cache the FWD .hsaco function handle keyed by N dimension."""
-    if n not in _ASM_CO_FWD_FUNCS:
-        path = _ASM_CO_FWD_HSACO_PATHS[n]
-        hip = _get_libhip()
-        mod = ctypes.c_void_p()
-        rc = hip.hipModuleLoad(ctypes.byref(mod), path.encode())
-        if rc != 0:
-            hip.hipGetErrorString.restype = ctypes.c_char_p
-            raise RuntimeError(
-                f"hipModuleLoad({path}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
-            )
-        func = ctypes.c_void_p()
-        rc = hip.hipModuleGetFunction(
-            ctypes.byref(func), mod, _ASM_CO_FWD_KERNEL_NAME_HSACO.encode()
-        )
-        if rc != 0:
-            hip.hipGetErrorString.restype = ctypes.c_char_p
-            raise RuntimeError(
-                f"hipModuleGetFunction({_ASM_CO_FWD_KERNEL_NAME_HSACO}) from {path} "
-                f"failed rc={rc}: {hip.hipGetErrorString(rc)}"
-            )
-        _ASM_CO_FWD_MODULES[n] = mod
-        _ASM_CO_FWD_FUNCS[n] = func
-    return _ASM_CO_FWD_FUNCS[n]
-
-
-def _launch_asm_co_fwd(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scales: torch.Tensor,
-    b_scales: torch.Tensor,
-    group_offs: torch.Tensor,
-    out_dtype: torch.dtype,
-    num_cu: int | None,
-) -> torch.Tensor:
-    """Launch hand-tuned FWD .hsaco kernel (trans_b=False) via HIP module API.
-
-    Kernarg layout (88 bytes, 96-byte buffer):
-      7 pointers: A, B, C, A_scale, B_scale, group_offs, tile_cumsum
-      8 int32s:   G, N, K, stride_am, stride_bg, stride_bn, stride_cm, stride_cn
-    """
-    m = a.shape[0]
-    k = a.shape[1]
-    g = b.shape[0]
-    n = b.shape[2]  # trans_b=False → N is last dim
-    out = torch.empty((m, n), device=a.device, dtype=out_dtype)
-
-    # Compute tile_cumsum on device (single-program triton kernel, no host sync)
-    blk_m = 256  # BLOCK_SIZE_M baked into .hsaco
-    blk_n = 256  # BLOCK_SIZE_N baked into .hsaco
-    num_pid_n = (n + blk_n - 1) // blk_n
-    tile_cumsum = torch.empty(g + 1, device=a.device, dtype=torch.int32)
-    _compute_tile_cumsum_kernel[(1,)](
-        group_offs,
-        tile_cumsum,
-        g,
-        num_pid_n,
-        BLOCK_SIZE_M=blk_m,
-    )
-
-    func = _get_asm_co_fwd_hsaco_func(n)
-
-    buf = ctypes.create_string_buffer(96)
-    struct.pack_into(
-        "<QQQQQQQ",
-        buf,
-        0,
-        a.data_ptr(),
-        b.data_ptr(),
-        out.data_ptr(),
-        a_scales.data_ptr(),
-        b_scales.data_ptr(),
-        group_offs.data_ptr(),
-        tile_cumsum.data_ptr(),
-    )
-    # stride_bn (=1) and stride_cn (=1) are compile-time specialized by Triton
-    # and NOT present in the kernarg buffer.
-    struct.pack_into(
-        "<iiiiii",
-        buf,
-        56,
-        g,
-        n,
-        k,
-        a.stride(0),       # stride_am = K
-        b.stride(0),       # stride_bg = K*N
-        out.stride(0),     # stride_cm = N
-    )
-
-    _asm_co_module_launch(
-        func,
-        buf,
-        num_cu,
-        a.device,
-        f"fwd K={k}, N={n}",
-        lds_bytes=_ASM_CO_FWD_LDS_BYTES,
-    )
-    return out
-
-
-class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
-    _backends = {
-        BackendType.CK: BackendEntry(GroupedGEMMFP8CKBackend),
-        BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8HipblasltBackend, autotune=False),
-        BackendType.TRITON: BackendEntry(GroupedGEMMFP8TritonBackend),
-        BackendType.ASM_CO: BackendEntry(GroupedGEMMFP8ASMCOBackend, autotune=False),
-    }
-    _cache = TuneCache(1024)
-
-    @classmethod
-    def make_key(
-        cls,
-        a,
-        b,
-        a_scales,
-        b_scales,
-        group_lens,
-        group_offs,
-        trans_a,
-        trans_b,
-        out_dtype,
-        granularity,
-        num_cu,
-        **kwargs,
-    ):
-        bs = b.shape[0]
-        m = a.shape[1] if trans_a else a.shape[0]
-        n = b.shape[-2] if trans_b else b.shape[-1]
-        k = a.shape[0] if trans_a else a.shape[1]
-        # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity
-        return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, False, granularity)
 
 
 class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
     """Triton persistent-kernel backend for FP8 variable-K grouped GEMM (backward).
 
-    Supports:
-      - TENSORWISE: per-tensor scaling
-      - ROWWISE: per-row/per-col vector scaling
-      - BLOCKWISE: 1D+1D block-wise scaling (TN/CRR layout)
+    Supports TENSORWISE, ROWWISE, and BLOCKWISE scaling granularities.
     """
 
     SUPPORTED_GRANULARITIES = {
@@ -898,9 +370,6 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
     }
-
-    # See ``GroupedGEMMFP8TritonBackend.SUPPORTED_DTYPES`` for the rationale
-    # behind including the hybrid e4m3/e5m2 pairs in the Triton backend.
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -951,373 +420,68 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
 
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
-                lhs,
-                rhs,
-                lhs_scales,
-                rhs_scales,
-                group_offs,
-                out_dtype=out_dtype,
+                lhs, rhs, lhs_scales, rhs_scales, group_offs, out_dtype=out_dtype,
             )
         elif granularity == ScalingGranularity.ROWWISE:
             return grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
-                lhs,
-                rhs,
-                lhs_scales,
-                rhs_scales,
-                group_offs,
-                out_dtype=out_dtype,
+                lhs, rhs, lhs_scales, rhs_scales, group_offs, out_dtype=out_dtype,
             )
         return grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
-            lhs,
-            rhs,
-            lhs_scales,
-            rhs_scales,
-            group_offs,
-            out_dtype=out_dtype,
+            lhs, rhs, lhs_scales, rhs_scales, group_offs, out_dtype=out_dtype,
         )
 
 
-# (OUT_M, OUT_N) shapes of the gpt-oss MoE FP8 wgrad call sites that the
-# hand-tuned variable_k_wgrad_mega.co kernel is specialised for.
-_ASM_CO_WGRAD_SITES = {
-    (2880, 5760),  # gate_up_wgrad
-    (2880, 2880),  # down_wgrad
-}
+# ---------------------------------------------------------------------------
+# Dispatchers
+# ---------------------------------------------------------------------------
 
-# ── ASM .co wgrad launcher (variable-K, dot_scaled MFMA 32x32x64) ───────────
-_ASM_CO_WGRAD_CO_PATH = "/opt/asm_ggemm/dot_scaled_v2_fixed.co"
-_ASM_CO_WGRAD_BETA1_CO_PATH = "/opt/asm_ggemm/dot_scaled_v2_beta1.co"
-_ASM_CO_WGRAD_KERNEL_NAME = "grouped_variable_k_dot_scaled_kernel"
-_ASM_CO_WGRAD_THREADS = 1024
-
-_ASM_CO_WGRAD_MODULE: ctypes.c_void_p | None = None
-_ASM_CO_WGRAD_FUNC: ctypes.c_void_p | None = None
-_ASM_CO_WGRAD_BETA1_MODULE: ctypes.c_void_p | None = None
-_ASM_CO_WGRAD_BETA1_FUNC: ctypes.c_void_p | None = None
-
-
-def _load_co_func(co_path: str, kernel_name: str) -> tuple[ctypes.c_void_p, ctypes.c_void_p]:
-    """Load a .co module and return (module, function) handles."""
-    hip = _get_libhip()
-    mod = ctypes.c_void_p()
-    rc = hip.hipModuleLoad(ctypes.byref(mod), co_path.encode())
-    if rc != 0:
-        hip.hipGetErrorString.restype = ctypes.c_char_p
-        raise RuntimeError(
-            f"hipModuleLoad({co_path}) failed rc={rc}: {hip.hipGetErrorString(rc)}"
-        )
-    func = ctypes.c_void_p()
-    rc = hip.hipModuleGetFunction(ctypes.byref(func), mod, kernel_name.encode())
-    if rc != 0:
-        hip.hipGetErrorString.restype = ctypes.c_char_p
-        raise RuntimeError(
-            f"hipModuleGetFunction({kernel_name}) from {co_path} "
-            f"failed rc={rc}: {hip.hipGetErrorString(rc)}"
-        )
-    return mod, func
-
-
-def _get_asm_co_wgrad_func() -> ctypes.c_void_p:
-    """Load and cache the variable-K wgrad .co function handle (beta=0)."""
-    global _ASM_CO_WGRAD_MODULE, _ASM_CO_WGRAD_FUNC
-    if _ASM_CO_WGRAD_FUNC is None:
-        _ASM_CO_WGRAD_MODULE, _ASM_CO_WGRAD_FUNC = _load_co_func(
-            _ASM_CO_WGRAD_CO_PATH, _ASM_CO_WGRAD_KERNEL_NAME
-        )
-    return _ASM_CO_WGRAD_FUNC
-
-
-def _get_asm_co_wgrad_beta1_func() -> ctypes.c_void_p:
-    """Load and cache the variable-K wgrad .co function handle (beta=1)."""
-    global _ASM_CO_WGRAD_BETA1_MODULE, _ASM_CO_WGRAD_BETA1_FUNC
-    if _ASM_CO_WGRAD_BETA1_FUNC is None:
-        _ASM_CO_WGRAD_BETA1_MODULE, _ASM_CO_WGRAD_BETA1_FUNC = _load_co_func(
-            _ASM_CO_WGRAD_BETA1_CO_PATH, _ASM_CO_WGRAD_KERNEL_NAME
-        )
-    return _ASM_CO_WGRAD_BETA1_FUNC
-
-
-def _launch_asm_co_wgrad_variable_k(
-    lhs: torch.Tensor,
-    rhs: torch.Tensor,
-    lhs_scale: torch.Tensor,
-    rhs_scale: torch.Tensor,
-    group_lens: torch.Tensor,
-    group_offs: torch.Tensor,
-    out_dtype: torch.dtype,
-    num_cu: int | None,
-) -> torch.Tensor:
-    """Launch hand-tuned variable-K wgrad .co kernel via HIP module API.
-
-    Kernarg layout (96 bytes) matches ``KernArgs`` in asm_co_grouped_gemm.cpp.
-    """
-    out_m = lhs.shape[1]
-    out_n = rhs.shape[1]
-    g = group_lens.shape[0]
-    out = torch.empty((g, out_m, out_n), device=lhs.device, dtype=out_dtype)
-
-    func = _get_asm_co_wgrad_func()
-
-    # The v_mfma_f32_32x32x64_f8f6f4 instruction on gfx950 applies an implicit
-    # 0.25x (2^-1 per operand) to OCP E4M3 data. Compensate by scaling each
-    # operand's scale factor by 2x (total 4x correction).
-    lhs_scale_adj = lhs_scale * 2.0
-    rhs_scale_adj = rhs_scale * 2.0
-
-    # 96-byte flat kernarg buffer (KernArgs in asm_co_grouped_gemm.cpp)
-    buf = ctypes.create_string_buffer(96)
-    struct.pack_into(
-        "<QQQQQQ",
-        buf,
-        0,
-        lhs.data_ptr(),
-        rhs.data_ptr(),
-        out.data_ptr(),
-        lhs_scale_adj.data_ptr(),
-        rhs_scale_adj.data_ptr(),
-        group_offs.data_ptr(),
-    )
-    struct.pack_into(
-        "<iiiiiiii",
-        buf,
-        48,
-        g,
-        out_m,
-        out_n,
-        lhs.stride(0),
-        rhs.stride(0),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-    )
-
-    _asm_co_module_launch(
-        func,
-        buf,
-        num_cu,
-        lhs.device,
-        f"wgrad OUT_M={out_m}, OUT_N={out_n}",
-        threads=_ASM_CO_WGRAD_THREADS,
-    )
-    return out
-
-
-def _launch_asm_co_wgrad_variable_k_beta1(
-    lhs: torch.Tensor,
-    rhs: torch.Tensor,
-    lhs_scale: torch.Tensor,
-    rhs_scale: torch.Tensor,
-    group_lens: torch.Tensor,
-    group_offs: torch.Tensor,
-    out: torch.Tensor,
-    num_cu: int | None,
-) -> None:
-    """Launch beta=1 wgrad .co: out += A^T @ B * scale (fused accumulation).
-
-    The beta=1 kernel always loads the previous C tile and adds to the scaled
-    MFMA output before storing.  ``out`` is modified in-place.
-    """
-    out_m = lhs.shape[1]
-    out_n = rhs.shape[1]
-
-    func = _get_asm_co_wgrad_beta1_func()
-
-    lhs_scale_adj = lhs_scale * 2.0
-    rhs_scale_adj = rhs_scale * 2.0
-
-    buf = ctypes.create_string_buffer(96)
-    struct.pack_into(
-        "<QQQQQQ",
-        buf,
-        0,
-        lhs.data_ptr(),
-        rhs.data_ptr(),
-        out.data_ptr(),
-        lhs_scale_adj.data_ptr(),
-        rhs_scale_adj.data_ptr(),
-        group_offs.data_ptr(),
-    )
-    struct.pack_into(
-        "<iiiiiiii",
-        buf,
-        48,
-        group_lens.shape[0],
-        out_m,
-        out_n,
-        lhs.stride(0),
-        rhs.stride(0),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-    )
-
-    _asm_co_module_launch(
-        func,
-        buf,
-        num_cu,
-        lhs.device,
-        f"wgrad_beta1 OUT_M={out_m}, OUT_N={out_n}",
-        threads=_ASM_CO_WGRAD_THREADS,
-    )
-
-
-class GroupedGEMMFP8VariableKASMCOBackend(KernelBackend):
-    """Hand-tuned AMDGCN assembly (.co) backend for FP8 variable-K grouped GEMM (wgrad).
-
-    Activated when PRIMUS_TURBO_GROUPED_GEMM_BACKEND=ASM_CO and the call
-    arrives with is_bwd=True (wgrad pass). Tensorwise scaling only,
-    E=32 experts, gpt-oss MoE shapes on MI355X (gfx950).
-    """
-
-    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
-    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
-    _first_use: bool = True
-
-    @staticmethod
-    def can_handle(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        a_scales: torch.Tensor,
-        b_scales: torch.Tensor,
-        group_lens: torch.Tensor,
-        group_offs: torch.Tensor,
-        trans_a: bool,
-        trans_b: bool,
-        trans_c: bool,
-        out_dtype: torch.dtype,
-        granularity: ScalingGranularity,
-        num_cu: int | None,
-        **kwargs,
-    ) -> bool:
-        supported = True
-        supported &= a.dim() == 2 and b.dim() == 2
-        supported &= (
-            a.dtype,
-            b.dtype,
-            out_dtype,
-        ) in GroupedGEMMFP8VariableKASMCOBackend.SUPPORTED_DTYPES
-        supported &= granularity in GroupedGEMMFP8VariableKASMCOBackend.SUPPORTED_GRANULARITIES
-        supported &= trans_a and not trans_b
-        out_m = a.shape[1]
-        out_n = b.shape[1]
-        if trans_c:
-            out_m, out_n = out_n, out_m
-        supported &= (out_m, out_n) in _ASM_CO_WGRAD_SITES
-        supported &= group_lens.shape[0] == 32  # E
-        return supported
-
-    @staticmethod
-    def execute(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        a_scales: torch.Tensor,
-        b_scales: torch.Tensor,
-        group_lens: torch.Tensor,
-        group_offs: torch.Tensor,
-        trans_a: bool,
-        trans_b: bool,
-        trans_c: bool,
-        out_dtype: torch.dtype,
-        granularity: ScalingGranularity,
-        num_cu: int | None,
-        **kwargs,
-    ):
-        if trans_c:
-            lhs, rhs = b, a
-            lhs_scales, rhs_scales = b_scales, a_scales
-        else:
-            lhs, rhs = a, b
-            lhs_scales, rhs_scales = a_scales, b_scales
-        if GroupedGEMMFP8VariableKASMCOBackend._first_use:
-            GroupedGEMMFP8VariableKASMCOBackend._first_use = False
-            print(
-                f"[ASM_CO] wgrad kernel first use — "
-                f"a={tuple(a.shape)} b={tuple(b.shape)} "
-                f"out_dtype={out_dtype} granularity={granularity.name}",
-                flush=True,
-            )
-        return _launch_asm_co_wgrad_variable_k(
-            lhs,
-            rhs,
-            lhs_scales,
-            rhs_scales,
-            group_lens,
-            group_offs,
-            out_dtype,
-            num_cu,
-        )
-
-
-    @staticmethod
-    def execute_beta1(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        a_scales: torch.Tensor,
-        b_scales: torch.Tensor,
-        group_lens: torch.Tensor,
-        group_offs: torch.Tensor,
-        trans_a: bool,
-        trans_b: bool,
-        trans_c: bool,
-        out_dtype: torch.dtype,
-        granularity: ScalingGranularity,
-        num_cu: int | None,
-        out: torch.Tensor,
-        **kwargs,
-    ):
-        """In-place fused accumulation: out += A^T @ B * scale."""
-        if trans_c:
-            lhs, rhs = b, a
-            lhs_scales, rhs_scales = b_scales, a_scales
-        else:
-            lhs, rhs = a, b
-            lhs_scales, rhs_scales = a_scales, b_scales
-        _launch_asm_co_wgrad_variable_k_beta1(
-            lhs,
-            rhs,
-            lhs_scales,
-            rhs_scales,
-            group_lens,
-            group_offs,
-            out,
-            num_cu,
-        )
-
-
-class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
+class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
-        BackendType.CK: BackendEntry(GroupedGEMMFP8VariableKCKBackend),
-        BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8VariableKHipblasltBackend, autotune=False),
-        BackendType.TRITON: BackendEntry(GroupedGEMMFP8VariableKTritonBackend),
-        BackendType.ASM_CO: BackendEntry(GroupedGEMMFP8VariableKASMCOBackend, autotune=False),
+        BackendType.CK:       BackendEntry(GroupedGEMMFP8CKBackend),
+        BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8HipblasltBackend, autotune=False),
+        BackendType.TRITON:   BackendEntry(GroupedGEMMFP8TritonBackend),
+        BackendType.ASM_CO:   BackendEntry(GroupedGEMMFP8ASMCOBackend, autotune=False),
     }
     _cache = TuneCache(1024)
 
     @classmethod
     def make_key(
-        cls,
-        a,
-        b,
-        a_scales,
-        b_scales,
-        group_lens,
-        group_offs,
-        trans_a,
-        trans_b,
-        trans_c,
-        out_dtype,
-        granularity,
-        num_cu,
-        **kwargs,
+        cls, a, b, a_scales, b_scales, group_lens, group_offs,
+        trans_a, trans_b, out_dtype, granularity, num_cu, **kwargs,
+    ):
+        bs = b.shape[0]
+        m  = a.shape[1] if trans_a else a.shape[0]
+        n  = b.shape[-2] if trans_b else b.shape[-1]
+        k  = a.shape[0] if trans_a else a.shape[1]
+        return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, False, granularity)
+
+
+class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
+    _backends = {
+        BackendType.CK:       BackendEntry(GroupedGEMMFP8VariableKCKBackend),
+        BackendType.HIPBLASLT: BackendEntry(GroupedGEMMFP8VariableKHipblasltBackend, autotune=False),
+        BackendType.TRITON:   BackendEntry(GroupedGEMMFP8VariableKTritonBackend),
+        BackendType.ASM_CO:   BackendEntry(GroupedGEMMFP8VariableKASMCOBackend, autotune=False),
+    }
+    _cache = TuneCache(1024)
+
+    @classmethod
+    def make_key(
+        cls, a, b, a_scales, b_scales, group_lens, group_offs,
+        trans_a, trans_b, trans_c, out_dtype, granularity, num_cu, **kwargs,
     ):
         bs = group_lens.shape[0]
-        m = a.shape[1] if trans_a else a.shape[0]
-        n = b.shape[-2] if trans_b else b.shape[-1]
-        k = a.shape[0] if trans_a else a.shape[1]
+        m  = a.shape[1] if trans_a else a.shape[0]
+        n  = b.shape[-2] if trans_b else b.shape[-1]
+        k  = a.shape[0] if trans_a else a.shape[1]
         if trans_c:
             m, n = n, m
         return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
 
+
+# ---------------------------------------------------------------------------
+# torch custom ops
+# ---------------------------------------------------------------------------
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
@@ -1340,38 +504,19 @@ def grouped_gemm_fp8_impl(
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
-    granularity_enum = ScalingGranularity(granularity)
+    user_backend_enum    = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    granularity_enum     = ScalingGranularity(granularity)
 
-    # ASM_CO mode: route FWD/DGRAD to ASM only when the corresponding per-pass
-    # env var is set; otherwise fall back to Triton.
-    # DGRAD uses per-shape optimized .hsaco (tile_cumsum persistent scheduling).
-    if user_backend_enum == BackendType.ASM_CO:
-        _pass = "DGRAD" if trans_b else "FWD"
-        use_asm = (not trans_b and _asm_fwd_enabled()) or (trans_b and _asm_dgrad_enabled())
-        if use_asm:
-            _log_backend_once(_pass, "ASM_CO")
-            user_backend_enum = None
-            default_backend_enum = BackendType.ASM_CO
-        else:
-            _log_backend_once(_pass, "Triton")
-            user_backend_enum = BackendType.TRITON
+    _pass = "DGRAD" if trans_b else "FWD"
+    _log_backend_once(_pass, user_backend_enum.name if user_backend_enum else default_backend_enum.name)
 
     kwargs = dict(
-        a=a,
-        b=b,
-        a_scales=a_scales,
-        b_scales=b_scales,
-        group_lens=group_lens,
-        group_offs=group_offs,
-        trans_a=trans_a,
-        trans_b=trans_b,
-        out_dtype=out_dtype,
-        granularity=granularity_enum,
-        num_cu=num_cu,
+        a=a, b=b, a_scales=a_scales, b_scales=b_scales,
+        group_lens=group_lens, group_offs=group_offs,
+        trans_a=trans_a, trans_b=trans_b,
+        out_dtype=out_dtype, granularity=granularity_enum, num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
     )
-
     return GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
 
@@ -1396,43 +541,23 @@ def grouped_gemm_fp8_variable_k_impl(
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
-    granularity_enum = ScalingGranularity(granularity)
+    user_backend_enum    = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    granularity_enum     = ScalingGranularity(granularity)
 
-    # ASM_CO mode: route WGRAD to ASM only when is_bwd=True AND the per-pass
-    # env var is set; all other paths (inference variable-K, or wgrad without
-    # the env var) use Triton.
-    if user_backend_enum == BackendType.ASM_CO:
-        if is_bwd and _asm_wgrad_enabled():
-            _log_backend_once("WGRAD", "ASM_CO")
-            user_backend_enum = None
-            default_backend_enum = BackendType.ASM_CO
-        else:
-            _log_backend_once("WGRAD", "Triton")
-            user_backend_enum = BackendType.TRITON
+    _log_backend_once("WGRAD", user_backend_enum.name if user_backend_enum else default_backend_enum.name)
 
     kwargs = dict(
-        a=a,
-        b=b,
-        a_scales=a_scales,
-        b_scales=b_scales,
-        group_lens=group_lens,
-        group_offs=group_offs,
-        trans_a=trans_a,
-        trans_b=trans_b,
-        trans_c=trans_c,
-        out_dtype=out_dtype,
-        granularity=granularity_enum,
-        num_cu=num_cu,
+        a=a, b=b, a_scales=a_scales, b_scales=b_scales,
+        group_lens=group_lens, group_offs=group_offs,
+        trans_a=trans_a, trans_b=trans_b, trans_c=trans_c,
+        out_dtype=out_dtype, granularity=granularity_enum, num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
     )
-
     return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
 
 def grouped_gemm_compute_offs(group_lens: torch.Tensor) -> torch.Tensor:
-    group_offs = torch.ops.primus_turbo_cpp_extension.grouped_gemm_compute_offs(group_lens)
-    return group_offs
+    return torch.ops.primus_turbo_cpp_extension.grouped_gemm_compute_offs(group_lens)
 
 
 @grouped_gemm_fp8_impl.register_fake
@@ -1456,12 +581,9 @@ def grouped_gemm_fp8_impl_meta(
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
     assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
     assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
-    assert out_dtype in [
-        torch.float16,
-        torch.bfloat16,
-    ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
+    assert out_dtype in [torch.float16, torch.bfloat16], \
+        f"out_dtype must be float16 or bfloat16, got {out_dtype}"
     assert trans_a == False, "Only trans_a=False is supported."
-
     m = a.shape[1] if trans_a else a.shape[0]
     n = b.shape[-2] if trans_b else b.shape[-1]
     return torch.empty((m, n), device=a.device, dtype=out_dtype)
@@ -1489,15 +611,12 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"
     assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
     assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
-    assert out_dtype in [
-        torch.float16,
-        torch.bfloat16,
-    ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
+    assert out_dtype in [torch.float16, torch.bfloat16], \
+        f"out_dtype must be float16 or bfloat16, got {out_dtype}"
     assert trans_a and not trans_b, "Only trans_a=True and trans_b=False are supported."
-
     bs = group_lens.shape[0]
-    m = a.shape[1] if trans_a else a.shape[0]
-    n = b.shape[-2] if trans_b else b.shape[-1]
+    m  = a.shape[1] if trans_a else a.shape[0]
+    n  = b.shape[-2] if trans_b else b.shape[-1]
     if trans_c:
         m, n = n, m
     return torch.empty((bs, m, n), device=a.device, dtype=out_dtype)

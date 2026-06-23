@@ -524,11 +524,11 @@ class GroupedGemmFP8TensorFunc(torch.autograd.Function):
                         lhs_scale, rhs_scale = a_scale_inv, grad_out_scale_inv
 
                     _user_be = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
-                    _asm_wgrad = os.environ.get("PRIMUS_TURBO_GROUPED_GEMM_ASM_WGRAD", "0") == "1"
-                    if _user_be == BackendType.ASM_CO and _asm_wgrad:
-                        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
+                    if _user_be == BackendType.ASM_CO:
+                        from primus_turbo.asm_co.grouped_gemm.backends import (
                             GroupedGEMMFP8VariableKASMCOBackend,
-                            ScalingGranularity,
+                        )
+                        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
                             _log_backend_once,
                         )
 
