@@ -77,6 +77,7 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
         barrier_addrs: Optional[torch.Tensor],
         topk_indices: Optional[torch.Tensor],
         num_tokens_per_rank: Optional[torch.Tensor],
+        topk_weights: Optional[torch.Tensor],
         combine_slots: int,
         topk: int,
         num_experts: int,
@@ -110,6 +111,7 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
             barrier_addrs=barrier_addrs,
             topk_indices=topk_indices,
             num_tokens_per_rank=num_tokens_per_rank,
+            topk_weights=topk_weights,
             topk=int(topk),
             num_experts=int(num_experts),
             rank=int(rank),
@@ -194,13 +196,14 @@ def grouped_gemm_combine_impl(
     barrier_addrs: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
     num_tokens_per_rank: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
     topk: int = 1,
     num_experts: int = 0,
     rank: int = 0,
     layout: str = "nt",
     BM: int = 256,
     BN: int = 256,
-    num_combine_cu: int = 32,
+    num_combine_cu: int = 64,
     num_reduce_cu: int = 0,
     nt_vmcnt: int = 3,
     waves_per_eu: int = 2,
@@ -211,10 +214,10 @@ def grouped_gemm_combine_impl(
 
     The grouped-GEMM result is written into the caller-owned ``l2y`` [pool_capacity,
     N] (also the combine PUSH source); ``sb_l2`` must be zeroed before each call.
-    Supplying ``output`` + ``num_reduce_cu > 0`` enables the 3-role topk reduce,
-    writing the final result into ``output``. Read ``l2y``/``output`` after the
-    call. Cross-rank writes via ``comb_addrs``/``barrier_addrs`` are raw-pointer
-    and untracked by autograd.
+    Supplying ``output`` enables the 3-role topk reduce (run on the empty GEMM blocks
+    plus an optional ``num_reduce_cu`` dedicated region, default 0), writing the final
+    result into ``output``. Read ``l2y``/``output`` after the call. Cross-rank writes
+    via ``comb_addrs``/``barrier_addrs`` are raw-pointer and untracked by autograd.
     """
     default_backend_enum = BackendType(default_backend)
 
@@ -238,6 +241,7 @@ def grouped_gemm_combine_impl(
         barrier_addrs=barrier_addrs,
         topk_indices=topk_indices,
         num_tokens_per_rank=num_tokens_per_rank,
+        topk_weights=topk_weights,
         combine_slots=combine_slots,
         topk=topk,
         num_experts=num_experts,
@@ -275,13 +279,14 @@ def grouped_gemm_combine_impl_meta(
     barrier_addrs: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
     num_tokens_per_rank: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
     topk: int = 1,
     num_experts: int = 0,
     rank: int = 0,
     layout: str = "nt",
     BM: int = 256,
     BN: int = 256,
-    num_combine_cu: int = 32,
+    num_combine_cu: int = 64,
     num_reduce_cu: int = 0,
     nt_vmcnt: int = 3,
     waves_per_eu: int = 2,

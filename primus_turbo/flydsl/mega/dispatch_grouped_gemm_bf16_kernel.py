@@ -14,7 +14,7 @@ and the cross-rank comm PUSH from the fp8 path is encapsulated as
 as i32 words).
 
 Role-specialized single kernel (mirrors the fp8 fused kernel):
-  * ``block_index < comm_blocks`` blocks push token rows to peer pools over XGMI
+  * ``block_index < num_dispatch_cu`` blocks push token rows to peer pools over XGMI
     and signal a per-pool-block scoreboard (``dispatch_bf16_tile``).
   * the remaining blocks each compute ONE NT output tile of the grouped GEMM
     (``A=pool[M,K]`` bf16, per-expert ``B=weight[G,N,K]`` bf16 -> ``C=out[M,N]``
@@ -170,7 +170,7 @@ def _compile(
     pool_capacity,
     BLOCK_M,
     BLOCK_N,
-    comm_blocks,
+    num_dispatch_cu,
     num_comm,
     nt_vmcnt=3,
     waves_per_eu=2,
@@ -218,7 +218,7 @@ def _compile(
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
-        comm_block_count = fx.Int32(comm_blocks)
+        comm_block_count = fx.Int32(num_dispatch_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
         # ===== COMM role resources =====
@@ -262,7 +262,7 @@ def _compile(
 
         # ── 3-role (dedup): role1 dispatch [0,D) ‖ role2 permute [D,D+P) ‖ role3 gemm.
         #    2-role (no dedup): role1 dispatch [0,D) ‖ role2 gemm. ───────────────────
-        gemm_offset = fx.Int32(comm_blocks + (permute_blocks if dedup else 0))
+        gemm_offset = fx.Int32(num_dispatch_cu + (permute_blocks if dedup else 0))
         if block_index < comm_block_count:
             # role1: dispatch PUSH (primaries over XGMI; secondaries skipped) + signal.
             local_task_count = (
@@ -370,7 +370,7 @@ def _compile(
         c_n: int,
         stream: fx.Stream = fx.Stream(None),
     ):
-        grid_size = comm_blocks + (permute_blocks if dedup else 0) + worst_case_tiles * n_blocks
+        grid_size = num_dispatch_cu + (permute_blocks if dedup else 0) + worst_case_tiles * n_blocks
         dispatch_grouped(
             INPUT_TOKENS,
             COMM_DESTINATION,
@@ -473,9 +473,9 @@ def grouped_gemm_bf16_only(
 # the comm tasks to peer pools over XGMI.
 # ───────────────────────────────────────────────────────────────────────
 @functools.lru_cache(maxsize=256)
-def _compile_dispatch_only(hidden_size, pool_capacity, comm_blocks, num_comm, waves_per_eu=2):
+def _compile_dispatch_only(hidden_size, pool_capacity, num_dispatch_cu, num_comm, waves_per_eu=2):
     # split each task across blocks_per_task blocks when tasks < blocks (saturate XGMI)
-    blocks_per_task = max(1, comm_blocks // num_comm)
+    blocks_per_task = max(1, num_dispatch_cu // num_comm)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_only_k(
@@ -489,7 +489,7 @@ def _compile_dispatch_only(hidden_size, pool_capacity, comm_blocks, num_comm, wa
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
-        comm_block_count = fx.Int32(comm_blocks)
+        comm_block_count = fx.Int32(num_dispatch_cu)
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
         destination_resource = create_buffer_resource(COMM_DESTINATION, max_size=True)
         comm_start_resource = create_buffer_resource(COMM_START, max_size=True)
@@ -545,7 +545,7 @@ def _compile_dispatch_only(hidden_size, pool_capacity, comm_blocks, num_comm, wa
             SOURCE_TOKENS,
             POOL_PTRS,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
-        ).launch(grid=(comm_blocks, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
+        ).launch(grid=(num_dispatch_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch
 
@@ -553,27 +553,26 @@ def _compile_dispatch_only(hidden_size, pool_capacity, comm_blocks, num_comm, wa
 def dispatch_only(
     # ── source activation (pushed over XGMI) ──────────────────────────
     x,  # [num_src_tokens, K] bf16
-    # ── dispatch comm plan (flat per-task metadata) ───────────────────
-    comm_dest,  # [num_comm] i32   peer rank per task
-    comm_start,  # [num_comm] i32   dst pool-row start on peer
-    comm_count,  # [num_comm] i32   rows per task
-    comm_src_offset,  # [num_comm] i32   offset into comm_src_tokens
-    comm_src_tokens,  # [total]    i32   this rank's token ids, row order
-    num_comm,  # int              number of comm tasks
+    # ── dispatch plan handle (DeepEP-style; expanded to ABI below) ─────
+    plan,  # dispatch handle tuple: (dst_rank, dst_offset, count, src_offset, src_tokens, ...)
     # ── symmetric activation pool (push target) ───────────────────────
     pool,  # [pool_capacity, K] bf16   local landing pool
     pool_ptrs,  # [world] i64   peer pool base ptrs
     # ── schedule config ───────────────────────────────────────────────
     *,
-    comm_blocks=32,
+    num_dispatch_cu=32,
 ):
     """Cross-rank dispatch PUSH only (no GEMM) — pushes ``x`` token rows to peer
     pools over XGMI. Bytes pushed per rank = (sum comm_count) * hidden * 2."""
+    # expand the plan to the device ABI (order is correctness-critical)
+    # dispatch handle (DeepEP-style tuple); num_comm derived from dst_rank
+    comm_dest, comm_start, comm_count, comm_src_offset, comm_src_tokens = plan[:5]
+    num_comm = comm_dest.numel()
     assert x.dtype == torch.bfloat16
     hidden_size = x.size(1)
     pool_capacity = pool.size(0)
     x_i32 = x.contiguous().view(torch.int32).view(-1)
-    launch = _compile_dispatch_only(hidden_size, pool_capacity, int(comm_blocks), int(num_comm))
+    launch = _compile_dispatch_only(hidden_size, pool_capacity, int(num_dispatch_cu), int(num_comm))
     launch(
         x_i32,
         comm_dest,
@@ -729,12 +728,7 @@ def _compile_dispatch_dedup_only(
 
 def dispatch_dedup_only(
     x,
-    comm_dest,
-    comm_start,
-    comm_count,
-    comm_src_offset,
-    comm_src_tokens,
-    num_comm,
+    plan,  # dispatch handle tuple: (dst_rank, dst_offset, count, src_offset, src_tokens, ...)
     pool,
     pool_ptrs,
     scoreboard,
@@ -752,6 +746,10 @@ def dispatch_dedup_only(
     """2-role cross-rank dispatch PUSH with token dedup (no GEMM): role1 pushes PRIMARY
     rows over XGMI (secondaries skipped) + signals scoreboard; role2 dest-local
     ``permute_token_tile`` copies secondaries CONCURRENTLY. Scoreboard + sb_copy zeroed first."""
+    # expand the plan to the device ABI (order is correctness-critical)
+    # dispatch handle (DeepEP-style tuple); num_comm derived from dst_rank
+    comm_dest, comm_start, comm_count, comm_src_offset, comm_src_tokens = plan[:5]
+    num_comm = comm_dest.numel()
     assert x.dtype == torch.bfloat16
     hidden_size = x.size(1)
     pool_capacity = pool.size(0)
@@ -868,9 +866,9 @@ def permute_only(
     )
 
 
-# Per-shape autotune candidates (comm_blocks, nt_vmcnt, agpr_alloc, waves_per_eu).
+# Per-shape autotune candidates (num_dispatch_cu, nt_vmcnt, agpr_alloc, waves_per_eu).
 # The comm/GEMM CU split dominates; the local push is HBM-roofline-bound so sweep
-# comm_blocks widely (incl. past 96). nt_vmcnt (G2S drain) / waves are secondary.
+# num_dispatch_cu widely (incl. past 96). nt_vmcnt (G2S drain) / waves are secondary.
 _DISPATCH_CANDIDATES = [
     (16, 3, 0, 2),
     (24, 3, 0, 2),
@@ -895,13 +893,8 @@ _DISPATCH_AUTOTUNE_CACHE: dict = {}
 def dispatch_grouped_gemm_bf16(
     # ── source activation (pushed over XGMI) ──────────────────────────
     x,  # [num_src_tokens, K] bf16
-    # ── dispatch comm plan (flat per-task metadata) ───────────────────
-    comm_dest,  # [num_comm] i32   peer rank per task
-    comm_start,  # [num_comm] i32   dst pool-row start on peer
-    comm_count,  # [num_comm] i32   rows per task
-    comm_src_offset,  # [num_comm] i32   offset into comm_src_tokens
-    comm_src_tokens,  # [total]    i32   this rank's token ids, row order
-    num_comm,  # int              number of comm tasks
+    # ── dispatch plan handle (DeepEP-style; expanded to ABI below) ─────
+    plan,  # dispatch handle tuple: (dst_rank, dst_offset, count, src_offset, src_tokens, ...)
     # ── symmetric activation pool (A operand) ─────────────────────────
     pool,  # [pool_capacity, K] bf16   local landing pool
     pool_ptrs,  # [world] i64   peer pool base ptrs
@@ -920,7 +913,7 @@ def dispatch_grouped_gemm_bf16(
     BM=256,
     BN=256,
     GROUP_M=4,
-    comm_blocks=32,
+    num_dispatch_cu=16,  # best for fused dispatch: 16 CUs saturate XGMI, rest go to GEMM
     nt_vmcnt=3,
     autotune=False,
     autotune_reset=None,
@@ -943,6 +936,10 @@ def dispatch_grouped_gemm_bf16(
     routed to >=2 experts on this dest rank crosses XGMI once (primary push); the
     redundant pool rows are filled by a dest-local ``permute_token_tile`` copy gated on
     the primary's scoreboard, then the GEMM additionally waits ``sb_copy``. Output same."""
+    # expand the plan to the device ABI (order is correctness-critical)
+    # dispatch handle (DeepEP-style tuple); num_comm derived from dst_rank
+    comm_dest, comm_start, comm_count, comm_src_offset, comm_src_tokens = plan[:5]
+    num_comm = comm_dest.numel()
     assert layout in (
         "nt",
         "nn",
@@ -1027,7 +1024,7 @@ def dispatch_grouped_gemm_bf16(
             pool_capacity,
             BM,
             BN,
-            int(comm_blocks),
+            int(num_dispatch_cu),
             int(num_comm),
             int(nt_vmcnt),
             GROUP_M=int(GROUP_M),
@@ -1060,7 +1057,7 @@ def _autotune(
     e0 = torch.cuda.Event(enable_timing=True)
     e1 = torch.cuda.Event(enable_timing=True)
     best_us, best = float("inf"), None
-    for comm_blocks, nt_vmcnt, agpr, waves in _DISPATCH_CANDIDATES:
+    for num_dispatch_cu, nt_vmcnt, agpr, waves in _DISPATCH_CANDIDATES:
         try:
             launch = _compile(
                 out_features,
@@ -1068,7 +1065,7 @@ def _autotune(
                 pool_capacity,
                 BM,
                 BN,
-                int(comm_blocks),
+                int(num_dispatch_cu),
                 num_comm,
                 int(nt_vmcnt),
                 int(waves),
@@ -1095,7 +1092,7 @@ def _autotune(
                 us_total += e0.elapsed_time(e1) * 1000.0
             us = us_total / 20
             if us < best_us:
-                best_us, best = us, (launch, (comm_blocks, nt_vmcnt, agpr, waves))
+                best_us, best = us, (launch, (num_dispatch_cu, nt_vmcnt, agpr, waves))
         except Exception:
             continue
     if best is None:
