@@ -10,119 +10,255 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from primus_turbo.pytorch.ops.activation import geglu_with_probs, swiglu_with_probs
+from primus_turbo.pytorch.ops.activation import (
+    bias_geglu_impl,
+    bias_gelu_impl,
+    bias_swiglu_impl,
+    weighted_bias_geglu_impl,
+    weighted_bias_quick_geglu_impl,
+    weighted_bias_swiglu_impl,
+)
 from tests.pytorch.test_utils import get_tolerances
 
-torch.manual_seed(42)
-random.seed(42)
+
+def _reset_seed():
+    torch.manual_seed(42)
+    random.seed(42)
 
 
-# NOTE: Align precision with torch.compile
-@torch.compile
-def swiglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
+# ── Reference implementations (plain PyTorch, fp32 intermediate) ─────────────
+
+
+def swiglu_ref(x: torch.Tensor):
     dtype = x.dtype
-    x = torch.chunk(x, 2, dim=-1)
-    res = F.silu(x[0]) * x[1]
-    return (res * probs).to(dtype)
+    x = x.float()
+    x_1, x_2 = torch.chunk(x, 2, dim=-1)
+    return (F.silu(x_1) * x_2).to(dtype)
 
 
-def generate_tokens_per_expert_list(num_experts: int, num_tokens: int):
-
-    if num_experts == 1:
-        return [num_tokens]
-
-    parts = []
-    remaining = num_tokens
-    for _ in range(num_experts - 1):
-        val = random.randint(0, remaining)
-        parts.append(val)
-        remaining -= val
-
-    parts.append(remaining)
-    return parts
-
-
-# NOTE: Align precision with torch.compile
-@torch.compile
-def geglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
+def geglu_ref(x: torch.Tensor):
     dtype = x.dtype
-    x = torch.chunk(x, 2, dim=-1)
-    res = F.gelu(x[0]) * x[1]
-    return (res * probs).to(dtype)
+    x = x.float()
+    x_1, x_2 = torch.chunk(x, 2, dim=-1)
+    return (F.gelu(x_1) * x_2).to(dtype)
 
 
-@pytest.mark.parametrize(
-    "batch_size",
-    [1, 8],
-)
-@pytest.mark.parametrize(
-    "sequence_length",
-    [
-        1,
-        128,
-        2048,
-        2025,
-        8192,
-    ],
-)
-@pytest.mark.parametrize(
-    "hidden_size",
-    [
-        128,
-        256,
-        2048,
-    ],
-)
+def weighted_swiglu_ref(x: torch.Tensor, weights: torch.Tensor):
+    dtype = x.dtype
+    x = x.float()
+    x_1, x_2 = torch.chunk(x, 2, dim=-1)
+    return (F.silu(x_1) * x_2 * weights.float()).to(dtype)
+
+
+def weighted_geglu_ref(x: torch.Tensor, weights: torch.Tensor):
+    dtype = x.dtype
+    x = x.float()
+    x_1, x_2 = torch.chunk(x, 2, dim=-1)
+    return (F.gelu(x_1) * x_2 * weights.float()).to(dtype)
+
+
+def weighted_quick_geglu_ref(x: torch.Tensor, weights: torch.Tensor, linear_offset: float = 0.0):
+    dtype = x.dtype
+    x = x.float()
+    x_1, x_2 = torch.chunk(x, 2, dim=-1)
+    return ((x_1 * torch.sigmoid(1.702 * x_1)) * (x_2 + linear_offset) * weights.float()).to(dtype)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def get_fwd_tolerances(dtype):
+    if dtype == torch.bfloat16:
+        return dict(rtol=2e-2, atol=2e-2)
+    return get_tolerances(dtype)
+
+
+def get_bwd_tolerances(dtype):
+    if dtype in (torch.bfloat16, torch.float16):
+        return dict(rtol=3.5e-1, atol=3.5e-1)
+    return get_tolerances(dtype)
+
+
+def make_row_mask(num_tokens: int, device: str):
+    """Create a row_mask with ~75% active rows."""
+    mask = torch.ones(num_tokens, device=device, dtype=torch.int64)
+    num_masked = max(1, num_tokens // 4)
+    indices = torch.randperm(num_tokens, device=device)[:num_masked]
+    mask[indices] = 0
+    return mask
+
+
+def masked_assert_close(actual, expected, row_mask, **kwargs):
+    """assert_close only on rows where row_mask != 0, ignoring masked-out rows."""
+    if row_mask is None:
+        torch.testing.assert_close(actual, expected, **kwargs)
+        return
+    bool_mask = row_mask.bool()
+    torch.testing.assert_close(actual[bool_mask], expected[bool_mask], **kwargs)
+
+
+# ── Tests: bias_gelu_impl ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("num_tokens", [1, 128, 2048])
+@pytest.mark.parametrize("hidden_size", [128, 256, 2048])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("with_tokens_per_expert", [False, True])
-@pytest.mark.parametrize("act_type", ["swiglu", "geglu"])
-def test_glu_with_probs(batch_size, sequence_length, hidden_size, dtype, with_tokens_per_expert, act_type):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    if act_type == "swiglu":
-        func = swiglu_with_probs
-        ref_func = swiglu_with_probs_ref
-    elif act_type == "geglu":
-        func = geglu_with_probs
-        ref_func = geglu_with_probs_ref
-
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("has_row_mask", [False, True])
+def test_bias_gelu_impl(num_tokens, hidden_size, dtype, has_bias, has_row_mask):
+    _reset_seed()
     device = "cuda"
 
-    probs_dtype = torch.float32
-    x = torch.randn(
-        batch_size, sequence_length, hidden_size * 2, device=device, dtype=dtype, requires_grad=True
-    )
-    probs = torch.rand(batch_size, sequence_length, device=device, dtype=probs_dtype, requires_grad=True)
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype, requires_grad=True)
+    bias = torch.randn(hidden_size, device=device, dtype=dtype) if has_bias else None
+    row_mask = make_row_mask(num_tokens, device) if has_row_mask else None
 
-    num_tokens = batch_size * sequence_length
+    x_ref = x.clone().detach().float().requires_grad_(True)
 
-    x_ref = x.view(-1, x.size(-1)).clone().detach()
-    x_ref.requires_grad_()
-    probs_ref = probs.view(-1).unsqueeze(-1).clone().detach()
-    probs_ref.requires_grad_()
+    out = bias_gelu_impl(x, bias, row_mask)
 
-    if with_tokens_per_expert:
-        num_experts = 64
-        tokens_per_expert = torch.tensor(
-            generate_tokens_per_expert_list(num_experts, num_tokens), device=device, requires_grad=False
-        )
-        row_mask = torch.zeros(num_tokens, device=device, dtype=torch.int64, requires_grad=False)
-        row_mask[: torch.sum(tokens_per_expert)] = 1
+    y_ref = x_ref + bias.float() if has_bias else x_ref
+    out_ref = F.gelu(y_ref).to(dtype)
+    if has_row_mask:
+        out_ref = out_ref * row_mask.unsqueeze(-1).to(out_ref.dtype)
+
+    masked_assert_close(out, out_ref, row_mask, **get_fwd_tolerances(dtype))
+
+    grad_out = torch.randn_like(out)
+    if has_row_mask:
+        grad_out[~row_mask.bool()] = 0
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
+    masked_assert_close(x.grad, x_ref.grad.to(dtype), row_mask, **get_bwd_tolerances(dtype))
+
+
+# ── Tests: bias_geglu_impl / bias_swiglu_impl ────────────────────────────────
+
+
+@pytest.mark.parametrize("num_tokens", [1, 128, 2048])
+@pytest.mark.parametrize("hidden_size", [128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("has_row_mask", [False, True])
+@pytest.mark.parametrize("act_type", ["geglu", "swiglu"])
+def test_bias_glu_impl(num_tokens, hidden_size, dtype, has_bias, has_row_mask, act_type):
+    _reset_seed()
+    device = "cuda"
+
+    x = torch.randn(num_tokens, hidden_size * 2, device=device, dtype=dtype, requires_grad=True)
+    bias = torch.randn(hidden_size * 2, device=device, dtype=dtype) if has_bias else None
+    row_mask = make_row_mask(num_tokens, device) if has_row_mask else None
+
+    x_ref = x.clone().detach().float().requires_grad_(True)
+
+    if act_type == "geglu":
+        out = bias_geglu_impl(x, bias, row_mask)
     else:
-        row_mask = None
+        out = bias_swiglu_impl(x, bias, row_mask)
 
-    out = func(x, probs, row_mask)
-    out_ref = ref_func(x_ref, probs_ref)
-    torch.testing.assert_close(out, out_ref, **get_tolerances(dtype))
+    y_ref = x_ref + bias.float() if has_bias else x_ref
+    y1, y2 = torch.chunk(y_ref, 2, dim=-1)
+    if act_type == "geglu":
+        out_ref = (F.gelu(y1) * y2).to(dtype)
+    else:
+        out_ref = (F.silu(y1) * y2).to(dtype)
+    if has_row_mask:
+        out_ref = out_ref * row_mask.unsqueeze(-1).to(out_ref.dtype)
 
-    out.backward(torch.ones_like(out))
-    grad_x = x.grad.clone()
-    grad_probs = probs.grad.clone()
+    masked_assert_close(out, out_ref, row_mask, **get_fwd_tolerances(dtype))
 
-    out_ref.backward(torch.ones_like(out_ref))
-    grad_x_ref = x_ref.grad.clone()
-    grad_probs_ref = probs_ref.grad.clone()
+    grad_out = torch.randn_like(out)
+    if has_row_mask:
+        grad_out[~row_mask.bool()] = 0
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
+    masked_assert_close(x.grad, x_ref.grad.to(dtype), row_mask, **get_bwd_tolerances(dtype))
 
-    torch.testing.assert_close(grad_x, grad_x_ref.view_as(grad_x), **get_tolerances(dtype))
-    torch.testing.assert_close(grad_probs, grad_probs_ref.view_as(grad_probs), **get_tolerances(probs_dtype))
+
+# ── Tests: weighted_bias_swiglu_impl / weighted_bias_geglu_impl ──────────────
+
+
+@pytest.mark.parametrize("num_tokens", [1, 64, 128])
+@pytest.mark.parametrize("hidden_size", [128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("has_row_mask", [False, True])
+@pytest.mark.parametrize("act_type", ["geglu", "swiglu"])
+def test_weighted_bias_glu_impl(num_tokens, hidden_size, dtype, has_bias, has_row_mask, act_type):
+    _reset_seed()
+    device = "cuda"
+
+    x = torch.randn(num_tokens, hidden_size * 2, device=device, dtype=dtype, requires_grad=True)
+    bias = torch.randn(hidden_size * 2, device=device, dtype=dtype) if has_bias else None
+    weights = torch.rand(num_tokens, 1, device=device, dtype=torch.float32, requires_grad=True)
+    row_mask = make_row_mask(num_tokens, device) if has_row_mask else None
+
+    x_ref = x.clone().detach().float().requires_grad_(True)
+    w_ref = weights.clone().detach().requires_grad_(True)
+
+    if act_type == "geglu":
+        out = weighted_bias_geglu_impl(x, bias, weights, row_mask)
+    else:
+        out = weighted_bias_swiglu_impl(x, bias, weights, row_mask)
+
+    y_ref = x_ref + bias.float() if has_bias else x_ref
+    y1, y2 = torch.chunk(y_ref, 2, dim=-1)
+    if act_type == "geglu":
+        act_ref = F.gelu(y1) * y2
+    else:
+        act_ref = F.silu(y1) * y2
+    out_ref = (act_ref * w_ref.float()).to(dtype)
+    if has_row_mask:
+        out_ref = out_ref * row_mask.unsqueeze(-1).to(out_ref.dtype)
+
+    masked_assert_close(out, out_ref, row_mask, **get_fwd_tolerances(dtype))
+
+    grad_out = torch.randn_like(out)
+    if has_row_mask:
+        grad_out[~row_mask.bool()] = 0
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
+    masked_assert_close(x.grad, x_ref.grad.to(dtype), row_mask, **get_bwd_tolerances(dtype))
+    masked_assert_close(weights.grad, w_ref.grad, row_mask, **get_bwd_tolerances(dtype))
+
+
+# ── Tests: weighted_bias_quick_geglu_impl ────────────────────────────────────
+
+
+@pytest.mark.parametrize("num_tokens", [16, 64, 128])
+@pytest.mark.parametrize("hidden_size", [128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("has_row_mask", [False, True])
+@pytest.mark.parametrize("linear_offset", [0.0, 1.0])
+def test_weighted_bias_quick_geglu_impl(
+    num_tokens, hidden_size, dtype, has_bias, has_row_mask, linear_offset
+):
+    _reset_seed()
+    device = "cuda"
+
+    x = torch.randn(num_tokens, hidden_size * 2, device=device, dtype=dtype, requires_grad=True)
+    bias = torch.randn(hidden_size * 2, device=device, dtype=dtype) if has_bias else None
+    weights = torch.rand(num_tokens, 1, device=device, dtype=torch.float32, requires_grad=True)
+    row_mask = make_row_mask(num_tokens, device) if has_row_mask else None
+
+    x_ref = x.clone().detach().float().requires_grad_(True)
+    w_ref = weights.clone().detach().requires_grad_(True)
+
+    out = weighted_bias_quick_geglu_impl(x, bias, weights, row_mask, linear_offset)
+
+    y_ref = x_ref + bias.float() if has_bias else x_ref
+    y1, y2 = torch.chunk(y_ref, 2, dim=-1)
+    out_ref = ((y1 * torch.sigmoid(1.702 * y1)) * (y2 + linear_offset) * w_ref.float()).to(dtype)
+    if has_row_mask:
+        out_ref = out_ref * row_mask.unsqueeze(-1).to(out_ref.dtype)
+
+    masked_assert_close(out, out_ref, row_mask, **get_fwd_tolerances(dtype))
+
+    grad_out = torch.randn_like(out)
+    if has_row_mask:
+        grad_out[~row_mask.bool()] = 0
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
+    masked_assert_close(x.grad, x_ref.grad.to(dtype), row_mask, **get_bwd_tolerances(dtype))
+    masked_assert_close(weights.grad, w_ref.grad, row_mask, **get_bwd_tolerances(dtype))
