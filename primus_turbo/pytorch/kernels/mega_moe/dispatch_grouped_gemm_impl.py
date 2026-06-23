@@ -50,11 +50,7 @@ class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
     @staticmethod
     def execute(
         x: torch.Tensor,
-        comm_dest: torch.Tensor,
-        comm_start: torch.Tensor,
-        comm_count: torch.Tensor,
-        comm_src_offset: torch.Tensor,
-        comm_src_tokens: torch.Tensor,
+        plan: list,
         pool: torch.Tensor,
         pool_ptrs: torch.Tensor,
         weight: torch.Tensor,
@@ -64,6 +60,7 @@ class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
         scoreboard_ptrs: torch.Tensor,
         expected_count: torch.Tensor,
         num_tile_blocks: torch.Tensor,
+        sb_consume: torch.Tensor,
         num_comm: int,
         layout: str,
         BM: int,
@@ -75,8 +72,7 @@ class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
         **kwargs,
     ) -> torch.Tensor:
         kernel = _flydsl_kernel()
-        # DeepEP-style dispatch handle (flat tuple); the GEMM ignores routing -> first 5 suffice
-        plan = (comm_dest, comm_start, comm_count, comm_src_offset, comm_src_tokens)
+        # DeepEP-style dispatch plan; the GEMM ignores routing -> first 5 entries suffice
         return kernel(
             x,
             plan,
@@ -89,6 +85,7 @@ class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
             scoreboard_ptrs,
             expected_count,
             num_tile_blocks,
+            sb_consume,
             layout=layout,
             BM=int(BM),
             BN=int(BN),
@@ -122,16 +119,12 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 @_torch_custom_op_wrapper(
     "primus_turbo::dispatch_grouped_gemm_impl",
-    mutates_args=("pool", "scoreboard"),
+    mutates_args=("pool", "scoreboard", "sb_consume"),
     device_types="cuda",
 )
 def dispatch_grouped_gemm_impl(
     x: torch.Tensor,
-    comm_dest: torch.Tensor,
-    comm_start: torch.Tensor,
-    comm_count: torch.Tensor,
-    comm_src_offset: torch.Tensor,
-    comm_src_tokens: torch.Tensor,
+    plan: list[torch.Tensor],
     pool: torch.Tensor,
     pool_ptrs: torch.Tensor,
     weight: torch.Tensor,
@@ -140,6 +133,7 @@ def dispatch_grouped_gemm_impl(
     scoreboard_ptrs: torch.Tensor,
     expected_count: torch.Tensor,
     num_tile_blocks: torch.Tensor,
+    sb_consume: torch.Tensor,
     num_comm: int,
     default_backend: int,
     layout: str = "nt",
@@ -152,9 +146,12 @@ def dispatch_grouped_gemm_impl(
 ) -> torch.Tensor:
     """Fused cross-rank dispatch PUSH + grouped BF16 GEMM (NT). Returns C [pool_cap, N].
 
-    ``pool``/``scoreboard`` are symmetric-memory buffers mutated in place; the
-    caller MUST zero ``scoreboard`` before each call. Cross-rank writes via
-    ``pool_ptrs``/``scoreboard_ptrs`` are raw-pointer and untracked by autograd.
+    ``plan`` is the prologue's bundled dispatch plan (DeepEP-style; first 5 entries =
+    comm dst_rank/dst_offset/count/src_offset/src_tokens). ``pool``/``scoreboard``/
+    ``sb_consume`` are symmetric-memory buffers mutated in place. The GEMM gate self-resets
+    ``scoreboard`` (and its ``sb_consume`` last-reader counter) at the end, so the caller no
+    longer pre-zeroes ``scoreboard`` -- only a one-time zero of both at buffer init. Cross-rank
+    writes via ``pool_ptrs``/``scoreboard_ptrs`` are raw-pointer and untracked by autograd.
     """
     default_backend_enum = BackendType(default_backend)
 
@@ -169,11 +166,7 @@ def dispatch_grouped_gemm_impl(
 
     kwargs = dict(
         x=x,
-        comm_dest=comm_dest,
-        comm_start=comm_start,
-        comm_count=comm_count,
-        comm_src_offset=comm_src_offset,
-        comm_src_tokens=comm_src_tokens,
+        plan=plan,
         pool=pool,
         pool_ptrs=pool_ptrs,
         weight=weight,
@@ -183,6 +176,7 @@ def dispatch_grouped_gemm_impl(
         scoreboard_ptrs=scoreboard_ptrs,
         expected_count=expected_count,
         num_tile_blocks=num_tile_blocks,
+        sb_consume=sb_consume,
         num_comm=num_comm,
         layout=layout,
         BM=BM,
@@ -200,11 +194,7 @@ def dispatch_grouped_gemm_impl(
 @dispatch_grouped_gemm_impl.register_fake
 def dispatch_grouped_gemm_impl_meta(
     x: torch.Tensor,
-    comm_dest: torch.Tensor,
-    comm_start: torch.Tensor,
-    comm_count: torch.Tensor,
-    comm_src_offset: torch.Tensor,
-    comm_src_tokens: torch.Tensor,
+    plan: list[torch.Tensor],
     pool: torch.Tensor,
     pool_ptrs: torch.Tensor,
     weight: torch.Tensor,
@@ -213,6 +203,7 @@ def dispatch_grouped_gemm_impl_meta(
     scoreboard_ptrs: torch.Tensor,
     expected_count: torch.Tensor,
     num_tile_blocks: torch.Tensor,
+    sb_consume: torch.Tensor,
     num_comm: int,
     default_backend: int,
     layout: str = "nt",

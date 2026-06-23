@@ -10,12 +10,12 @@ Mirrors ``dispatch_grouped_gemm_impl.py``: a ``torch.library.custom_op`` makes t
 FlyDSL combine kernel ``torch.compile``-traceable (opaque mutating op + fake meta),
 and an ``AutoKernelDispatcher`` selects / auto-tunes the backend. The kernel runs
 grouped BF16 GEMM into the caller-owned ``l2y`` [pool_capacity, N], pushes each
-finished row cross-rank into the origin rank's combine buffer, and (when reduce
-args are supplied) sums each token's topk rows into ``output`` — all mutated in
-place; see ``primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel``.
+finished row into a freshly-allocated combine buffer (returned), and (when reduce
+args are supplied) sums each token's topk rows into ``output``; see
+``primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel``.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -69,15 +69,18 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
         sb_l2: torch.Tensor,
         origin_rank: torch.Tensor,
         origin_slot: torch.Tensor,
-        comb_addrs: torch.Tensor,
         num_tile_blocks: torch.Tensor,
         output: Optional[torch.Tensor],
-        comb_local: Optional[torch.Tensor],
         barrier_local: Optional[torch.Tensor],
-        barrier_addrs: Optional[torch.Tensor],
         topk_indices: Optional[torch.Tensor],
         num_tokens_per_rank: Optional[torch.Tensor],
         topk_weights: Optional[torch.Tensor],
+        grad_gate: Optional[torch.Tensor],
+        comb_addrs: Optional[torch.Tensor],
+        comb_local: Optional[torch.Tensor],
+        barrier_addrs: Optional[torch.Tensor],
+        gate_addrs: Optional[torch.Tensor],
+        gate_local: Optional[torch.Tensor],
         combine_slots: int,
         topk: int,
         num_experts: int,
@@ -94,7 +97,7 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         kernel = _flydsl_kernel()
-        kernel(
+        return kernel(
             act,
             weight,
             l2y,
@@ -102,16 +105,19 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
             sb_l2,
             origin_rank,
             origin_slot,
-            comb_addrs,
             int(combine_slots),
             num_tile_blocks,
-            output=output,
+            comb_addrs=comb_addrs,
             comb_local=comb_local,
+            output=output,
             barrier_local=barrier_local,
             barrier_addrs=barrier_addrs,
             topk_indices=topk_indices,
             num_tokens_per_rank=num_tokens_per_rank,
             topk_weights=topk_weights,
+            grad_gate=grad_gate,
+            gate_addrs=gate_addrs,
+            gate_local=gate_local,
             topk=int(topk),
             num_experts=int(num_experts),
             rank=int(rank),
@@ -126,7 +132,6 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
             autotune=bool(autotune),
             autotune_reset=sb_l2.zero_,
         )
-        return None
 
 
 _GROUPED_GEMM_COMBINE_BACKENDS = {
@@ -168,9 +173,11 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 # Caller-owned buffers the kernel writes on this rank. l2y holds the grouped-GEMM
 # output (and is the combine PUSH source); sb_l2 (scoreboard) is bumped by the GEMM
-# role; output/comb_local/barrier_local are the reduce path's local targets.
-# Cross-rank writes via comb_addrs/barrier_addrs are raw-pointer untracked.
-_MUTATED_ARGS = ("l2y", "sb_l2", "output", "comb_local", "barrier_local")
+# role; output/barrier_local are the reduce path's local targets (always-present
+# positionals). comb_local/gate_local (EP symmetric receive buffers) are written via
+# raw peer pointers — untracked regardless — and are keyword-optional, so they're left
+# out of mutates_args (listing an absent optional arg breaks adinplaceorview indexing).
+_MUTATED_ARGS = ("l2y", "sb_l2", "output", "barrier_local")
 
 
 @_torch_custom_op_wrapper(
@@ -186,17 +193,20 @@ def grouped_gemm_combine_impl(
     sb_l2: torch.Tensor,
     origin_rank: torch.Tensor,
     origin_slot: torch.Tensor,
-    comb_addrs: torch.Tensor,
     num_tile_blocks: torch.Tensor,
     output: Optional[torch.Tensor],
-    comb_local: Optional[torch.Tensor],
     barrier_local: Optional[torch.Tensor],
     combine_slots: int,
     default_backend: int,
-    barrier_addrs: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
     num_tokens_per_rank: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
+    grad_gate: Optional[torch.Tensor] = None,
+    comb_addrs: Optional[torch.Tensor] = None,
+    comb_local: Optional[torch.Tensor] = None,
+    barrier_addrs: Optional[torch.Tensor] = None,
+    gate_addrs: Optional[torch.Tensor] = None,
+    gate_local: Optional[torch.Tensor] = None,
     topk: int = 1,
     num_experts: int = 0,
     rank: int = 0,
@@ -209,15 +219,21 @@ def grouped_gemm_combine_impl(
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
     autotune: bool = False,
-) -> None:
-    """Fused grouped BF16 GEMM + combine PUSH (+ optional topk reduce), in place.
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused grouped BF16 GEMM + combine PUSH (+ optional topk reduce).
 
     The grouped-GEMM result is written into the caller-owned ``l2y`` [pool_capacity,
     N] (also the combine PUSH source); ``sb_l2`` must be zeroed before each call.
     Supplying ``output`` enables the 3-role topk reduce (run on the empty GEMM blocks
     plus an optional ``num_reduce_cu`` dedicated region, default 0), writing the final
-    result into ``output``. Read ``l2y``/``output`` after the call. Cross-rank writes
-    via ``comb_addrs``/``barrier_addrs`` are raw-pointer and untracked by autograd.
+    result into ``output``. Read ``l2y``/``output`` after the call.
+
+    The combine PUSH destination + gate-grad are caller-owned via ``comb_local`` /
+    ``gate_local`` (+ the cross-rank ``comb_addrs`` / ``barrier_addrs`` / ``gate_addrs``
+    peer tables, EP). When omitted they are allocated internally and returned as
+    ``(combine_output, combine_gate)`` (single-rank self-push); each is an empty [0]
+    placeholder when the caller owns it or the gate is off (custom-op returns can't
+    be Optional, so read them only in the self-allocated path).
     """
     default_backend_enum = BackendType(default_backend)
 
@@ -233,15 +249,18 @@ def grouped_gemm_combine_impl(
         sb_l2=sb_l2,
         origin_rank=origin_rank,
         origin_slot=origin_slot,
-        comb_addrs=comb_addrs,
         num_tile_blocks=num_tile_blocks,
         output=output,
-        comb_local=comb_local,
         barrier_local=barrier_local,
-        barrier_addrs=barrier_addrs,
         topk_indices=topk_indices,
         num_tokens_per_rank=num_tokens_per_rank,
         topk_weights=topk_weights,
+        grad_gate=grad_gate,
+        comb_addrs=comb_addrs,
+        comb_local=comb_local,
+        barrier_addrs=barrier_addrs,
+        gate_addrs=gate_addrs,
+        gate_local=gate_local,
         combine_slots=combine_slots,
         topk=topk,
         num_experts=num_experts,
@@ -257,7 +276,17 @@ def grouped_gemm_combine_impl(
         autotune=do_autotune,
     )
 
-    GroupedGEMMCombineKernelDispatcher.dispatch(default_backend_enum, None, **kwargs)
+    combine_output, combine_gate = GroupedGEMMCombineKernelDispatcher.dispatch(
+        default_backend_enum, None, **kwargs
+    )
+    # custom-op returns can't be Optional -> empty placeholders when the caller owns the
+    # buffer (EP) or the gate is off; match register_fake (combine_output [0, N], gate [0]).
+    N = weight.shape[1] if layout == "nt" else weight.shape[2]
+    if combine_output is None:
+        combine_output = act.new_empty((0, N))
+    if combine_gate is None:
+        combine_gate = act.new_empty((0,), dtype=torch.float32)
+    return combine_output, combine_gate
 
 
 @grouped_gemm_combine_impl.register_fake
@@ -269,17 +298,20 @@ def grouped_gemm_combine_impl_meta(
     sb_l2: torch.Tensor,
     origin_rank: torch.Tensor,
     origin_slot: torch.Tensor,
-    comb_addrs: torch.Tensor,
     num_tile_blocks: torch.Tensor,
     output: Optional[torch.Tensor],
-    comb_local: Optional[torch.Tensor],
     barrier_local: Optional[torch.Tensor],
     combine_slots: int,
     default_backend: int,
-    barrier_addrs: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
     num_tokens_per_rank: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
+    grad_gate: Optional[torch.Tensor] = None,
+    comb_addrs: Optional[torch.Tensor] = None,
+    comb_local: Optional[torch.Tensor] = None,
+    barrier_addrs: Optional[torch.Tensor] = None,
+    gate_addrs: Optional[torch.Tensor] = None,
+    gate_local: Optional[torch.Tensor] = None,
     topk: int = 1,
     num_experts: int = 0,
     rank: int = 0,
@@ -292,11 +324,21 @@ def grouped_gemm_combine_impl_meta(
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
     autotune: bool = False,
-) -> None:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     assert act.dim() == 2, f"act must be 2D, got {act.shape}"
     assert weight.dim() == 3, f"weight must be 3D, got {weight.shape}"
     assert l2y.dim() == 2, f"l2y must be 2D, got {l2y.shape}"
     assert act.dtype in _SUPPORTED_DTYPES, f"act must be bf16, got {act.dtype}"
     assert weight.dtype in _SUPPORTED_DTYPES, f"weight must be bf16, got {weight.dtype}"
     assert layout in ("nt", "nn", "tn"), f"unknown layout {layout}"
-    return None
+    # only internally-allocated buffers are returned; empty [0] placeholder when caller-owned
+    # or gate off (custom-op returns can't be Optional). N from weight (nt: [G,N,K] / nn,tn: [G,K,N])
+    N = weight.shape[1] if layout == "nt" else weight.shape[2]
+    out_slots = int(combine_slots) if comb_local is None else 0
+    combine_output = act.new_empty((out_slots, N))
+    # gate output present iff grad_gate given AND (reduce active -> folded masked d_topk_w, OR
+    # single-rank self-push with no caller gate buffer). matches grouped_gemm_combine_bf16.
+    fold_or_selfpush = grad_gate is not None and (output is not None or gate_local is None)
+    gate_slots = int(combine_slots) if fold_or_selfpush else 0
+    combine_gate = act.new_empty((gate_slots,), dtype=torch.float32)
+    return combine_output, combine_gate

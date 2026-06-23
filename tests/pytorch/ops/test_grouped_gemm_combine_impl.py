@@ -85,12 +85,11 @@ def _ref_l2y(d, BM):
 
 
 def _alloc_io(d, BM):
-    """Uncached scoreboard, caller-owned l2y (pre-filled = ref), and a combine buffer."""
+    """Uncached scoreboard + caller-owned l2y (pre-filled = ref). The combine PUSH
+    destination is allocated + returned by the op itself (self-push, world=1)."""
     sb_l2 = _uncached_i32(int(d["num_tile_blocks"].item()))
     l2y = _ref_l2y(d, BM).bfloat16().contiguous()  # GEMM rewrites with ~identical bf16
-    comb_buf = torch.zeros(d["pool_capacity"], d["N"], device="cuda", dtype=torch.bfloat16)
-    comb_addrs = torch.tensor([comb_buf.data_ptr()], dtype=torch.int64, device="cuda")
-    return sb_l2, l2y, comb_buf, comb_addrs
+    return sb_l2, l2y
 
 
 def _cos(a, b):
@@ -106,10 +105,10 @@ def test_op_matches_reference(n_blocks):
     BM = BN = 256
     K, N = 2048, 2048
     d = _make_data(n_blocks, BM, N, K)
-    sb_l2, l2y, comb_buf, comb_addrs = _alloc_io(d, BM)
+    sb_l2, l2y = _alloc_io(d, BM)
     ref = _ref_l2y(d, BM)
 
-    torch.ops.primus_turbo.grouped_gemm_combine_impl(
+    comb_buf, _gate = torch.ops.primus_turbo.grouped_gemm_combine_impl(
         d["act"],
         d["weight"],
         l2y,
@@ -117,9 +116,7 @@ def test_op_matches_reference(n_blocks):
         sb_l2,
         d["origin_rank"],
         d["origin_slot"],
-        comb_addrs,
         d["num_tile_blocks"],
-        None,
         None,
         None,
         d["pool_capacity"],
@@ -131,7 +128,7 @@ def test_op_matches_reference(n_blocks):
     torch.cuda.synchronize()
 
     assert _cos(l2y, ref) > 0.999, f"l2y cos {_cos(l2y, ref)} too low"
-    # origin_slot[row]=row -> comb_buf[row] holds l2y[row]; combine must reproduce ref
+    # origin_slot[row]=row -> combine_output[row] holds l2y[row]; combine must reproduce ref
     assert _cos(comb_buf, ref) > 0.999, f"combine PUSH cos {_cos(comb_buf, ref)} too low"
     print(
         f"[op vs ref] n_blocks={n_blocks} l2y cos={_cos(l2y, ref):.6f} "
@@ -146,11 +143,11 @@ def test_op_torch_compile():
     BM = BN = 256
     K, N, n_blocks = 2048, 2048, 4
     d = _make_data(n_blocks, BM, N, K)
-    sb_l2, l2y, comb_buf, comb_addrs = _alloc_io(d, BM)
+    sb_l2, l2y = _alloc_io(d, BM)
     ref = _ref_l2y(d, BM)
 
     def run(act, weight, l2y, tile_to_group, origin_rank, origin_slot):
-        torch.ops.primus_turbo.grouped_gemm_combine_impl(
+        comb_buf, _gate = torch.ops.primus_turbo.grouped_gemm_combine_impl(
             act,
             weight,
             l2y,
@@ -158,9 +155,7 @@ def test_op_torch_compile():
             sb_l2,
             origin_rank,
             origin_slot,
-            comb_addrs,
             d["num_tile_blocks"],
-            None,
             None,
             None,
             d["pool_capacity"],
@@ -169,10 +164,12 @@ def test_op_torch_compile():
             BM=BM,
             BN=BN,
         )
-        return l2y.clone()
+        return l2y.clone(), comb_buf
 
     compiled = torch.compile(run, fullgraph=True)
-    out = compiled(d["act"], d["weight"], l2y, d["tile_to_group"], d["origin_rank"], d["origin_slot"])
+    out, comb_buf = compiled(
+        d["act"], d["weight"], l2y, d["tile_to_group"], d["origin_rank"], d["origin_slot"]
+    )
     torch.cuda.synchronize()
 
     assert _cos(out, ref) > 0.999, f"compiled l2y cos {_cos(out, ref)} too low"
@@ -187,7 +184,7 @@ def test_op_autotune_path():
     BM = BN = 256
     K, N, n_blocks = 2048, 2048, 4
     d = _make_data(n_blocks, BM, N, K)
-    sb_l2, l2y, comb_buf, comb_addrs = _alloc_io(d, BM)
+    sb_l2, l2y = _alloc_io(d, BM)
     ref = _ref_l2y(d, BM)
 
     torch.ops.primus_turbo.grouped_gemm_combine_impl(
@@ -198,9 +195,7 @@ def test_op_autotune_path():
         sb_l2,
         d["origin_rank"],
         d["origin_slot"],
-        comb_addrs,
         d["num_tile_blocks"],
-        None,
         None,
         None,
         d["pool_capacity"],
