@@ -9,15 +9,22 @@
 Three-role single kernel, partitioned by ``block_index`` so the comm roles get CUs first:
   * role 1 COMBINE PUSH  ``[0, num_combine_cu)``: spin on the local scoreboard, then push each
     finished L2Y row to ``comb_addrs[origin][slot]`` and raise ``barrier_addrs[origin][slot]``.
-  * role 2 TOPK REDUCE   ``[num_combine_cu, +num_reduce_cu)``: warp-per-token, spin on each
-    non-dropped slot's flag, sum the ``topk`` combine rows into ``output[token]`` (token-major).
-  * role 3 GROUPED GEMM  ``[+num_reduce_cu, ...)``: one tile per block (NT forward
-    A=act[M,K],B=weight[G,N,K]; NN dgrad B=weight[G,K,N]; TN wgrad A=act[K,M]) ->
-    L2Y[M,N], bumping the per-pool-block scoreboard. The combine PUSH reads L2Y
+  * role 2 TOPK REDUCE: warp-per-token, spin on each non-dropped slot's flag, then sum the
+    ``topk`` combine rows into ``output[token]`` (token-major). Runs on TWO sources of blocks:
+    the optional dedicated region ``[num_combine_cu, +num_reduce_cu)`` (``num_reduce_cu`` blocks,
+    default 0), PLUS every EMPTY grouped-GEMM block (``block_m >= real_tiles``). The empty blocks
+    have high ``block_index`` -> scheduled after the real GEMM tiles -> they land on the CUs freed
+    as the GEMM winds down, so the reduce overlaps the push tail instead of spinning on a few
+    dedicated CUs. Both sources grid-stride the full token range; coverage needs >= 1 empty tile
+    (guaranteed by ``pool_mult >= 2``). Running both sources together double-reduces (idempotent
+    but wasteful), so the default is empty-blocks-only (``num_reduce_cu == 0``).
+  * role 3 GROUPED GEMM  ``[gemm_base, ...)`` (``gemm_base = num_combine_cu + num_reduce_cu``):
+    one tile per block (NT forward A=act[M,K],B=weight[G,N,K]; NN dgrad B=weight[G,K,N]; TN wgrad
+    A=act[K,M]) -> L2Y[M,N], bumping the per-pool-block scoreboard. The combine PUSH reads L2Y
     M-major, so every layout works (it just changes how A/B are read).
 
-``num_reduce_cu == 0`` degenerates to the two-role GEMM + combine kernel.
-K % BLOCK_K == 0; out_features a multiple of 8 (b128 vec)."""
+With no ``output`` supplied the reduce is off and this degenerates to the two-role GEMM + combine
+kernel. K % BLOCK_K == 0; out_features a multiple of 8 (b128 vec)."""
 
 import functools
 
@@ -25,6 +32,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, range_constexpr
 from flydsl.expr.buffer_ops import (
@@ -52,7 +60,7 @@ from primus_turbo.flydsl.mega.mega_group_tile_spec import (
 )
 
 # cheap fence = s_waitcnt drain + compiler barrier; pairs with relaxed atomics (no acquire/release).
-from primus_turbo.flydsl.mega.mega_moe_prologue import _mem_fence
+from primus_turbo.flydsl.mega.mega_moe_prologue_kernel import _mem_fence
 from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs
 
 _WARP = 64  # wavefront (gfx950)
@@ -108,6 +116,10 @@ def combine_bf16_tile(
     comb_addr_res,
     barrier_addr_res=None,
     enable_barrier=False,
+    grad_gate_res=None,
+    gate_addr_res=None,
+    gate_records=0,
+    with_gate=False,
 ):
     assert block_m_size % _NUM_WARPS == 0, "block_m must be a multiple of num_warps (8)"
     # 64 lanes * 8 = 512 elems/step
@@ -156,6 +168,14 @@ def combine_bf16_tile(
                     )
                     dst = arith.select(in_tail, slot_base + col, oob_index)
                     buffer_store(tail_value, peer, dst)
+                if with_gate:
+                    # scatter the per-row gate gradient (d_topk_w) to origin[slot] (slot =
+                    # token*topk+k); same value/slot across lanes (idempotent, like the flag
+                    # store below). 1 f32, ~free vs the hidden-wide push.
+                    gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
+                    gate_addr = buffer_load(gate_addr_res, origin, vec_width=1, dtype=fx.T.i64())
+                    gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
+                    buffer_store(gate_value, gate_peer, slot)
                 if enable_barrier:
                     # drain payload stores (vmcnt), then publish the flag via a relaxed atomic
                     # store (monotonic, sys scope -> cross-rank visible; pairs with consumer load).
@@ -168,14 +188,36 @@ def combine_bf16_tile(
     return push_block
 
 
+# Plain Python (NOT ASTRewriter-transformed): emits the per-token topk accumulation.
+# Keeping the compile-time apply_weights branch here avoids a runtime scf.if inside the
+# rewritten reduce (the rewriter doesn't export vars assigned in a folded if-branch).
+def _reduce_acc(apply_weights, topk, f32_vec, topk_vals, topk_weights_res, token):
+    if apply_weights:
+        w0 = buffer_load(topk_weights_res, token * fx.Int32(topk), vec_width=1, dtype=fx.T.f32())
+        acc = fx.arith.mulf(fx.arith.extf(f32_vec, topk_vals[0]), _vector.broadcast(f32_vec, w0))
+        for j in range(topk - 1):
+            w = buffer_load(
+                topk_weights_res, token * fx.Int32(topk) + fx.Int32(j + 1), vec_width=1, dtype=fx.T.f32()
+            )
+            acc = fx.arith.addf(
+                acc, fx.arith.mulf(fx.arith.extf(f32_vec, topk_vals[j + 1]), _vector.broadcast(f32_vec, w))
+            )
+    else:
+        acc = fx.arith.extf(f32_vec, topk_vals[0])
+        for j in range(topk - 1):
+            acc = fx.arith.addf(acc, fx.arith.extf(f32_vec, topk_vals[j + 1]))
+    return acc
+
+
 # role 2: warp-per-token reduce of token-major combine [max_tokens, topk, hidden] -> output[token].
 # wait_flags=True (fused) spins on each slot's cross-rank flag first; False (standalone, data
-# already resident) skips the wait -> pure streaming reduce. Built once for each variant.
-def _make_topk_reduce(wait_flags):
+# already resident) skips the wait -> pure streaming reduce. apply_weights=True scales each
+# topk row by topk_weights[token*topk+k] (routing weight) -> weighted reduce. Built per variant.
+def _make_topk_reduce(wait_flags, apply_weights=False):
     def _topk_reduce(
         thread_index,
         base_pid,
-        num_reduce_cu,
+        total_warps,
         topk,
         out_features,
         num_experts,
@@ -185,13 +227,14 @@ def _make_topk_reduce(wait_flags):
         topk_indices_res,
         num_tokens_res,
         barrier_local,
+        topk_weights_res,
     ):
+        # total_warps: runtime worker-warp count (const for static roles, dynamic for empty blocks)
         f32_vec = fx.T.VectorType.get([_PVEC], fx.T.f32())
         bf16_vec = fx.T.VectorType.get([_PVEC], fx.T.bf16())
         num_vec_chunks = out_features // _PVEC  # b128 vec chunks per row
         lane = thread_index % fx.Int32(_WARP)
         warp_id = thread_index // fx.Int32(_WARP)
-        total_warps = fx.Int32(num_reduce_cu * _NUM_WARPS)
         global_warp_id = base_pid * fx.Int32(_NUM_WARPS) + warp_id
         num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=fx.T.i32())
 
@@ -221,9 +264,9 @@ def _make_topk_reduce(wait_flags):
                 for j in range_constexpr(topk):
                     row_off = token_row_off + fx.Int32(j * out_features) + col
                     topk_vals.append(buffer_load(comb_local_res, row_off, vec_width=_PVEC, dtype=fx.T.bf16()))
-                acc = fx.arith.extf(f32_vec, topk_vals[0])
-                for j in range_constexpr(topk - 1):
-                    acc = fx.arith.addf(acc, fx.arith.extf(f32_vec, topk_vals[j + 1]))
+                # plain-Python helper: compile-time apply_weights branch lives outside the
+                # rewritten kernel, so only the result acc crosses back into kernel scope.
+                acc = _reduce_acc(apply_weights, topk, f32_vec, topk_vals, topk_weights_res, token)
                 buffer_store(
                     fx.arith.trunc_f(bf16_vec, acc), output_res, token * fx.Int32(out_features) + col
                 )
@@ -233,8 +276,11 @@ def _make_topk_reduce(wait_flags):
     return ASTRewriter.transform(_topk_reduce)
 
 
-_topk_reduce_wait = _make_topk_reduce(True)  # fused 3-role (cross-rank flag wait)
-_topk_reduce = _make_topk_reduce(False)  # standalone reduce (pure streaming)
+@functools.lru_cache(maxsize=None)
+def _get_topk_reduce(wait_flags, apply_weights):
+    """Build (once per variant) the reduce role: wait_flags toggles the cross-rank flag
+    spin (fused vs standalone); apply_weights toggles the weighted reduce."""
+    return _make_topk_reduce(wait_flags, apply_weights)
 
 
 @functools.lru_cache(maxsize=256)
@@ -255,6 +301,8 @@ def _compile(
     agpr_alloc=0,
     out_fp16=False,
     layout="nt",
+    apply_weights=False,
+    reduce_active=False,
 ):
     K = hidden_size
     gemm_tile = _GEMM_TILE[layout]
@@ -265,10 +313,13 @@ def _compile(
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = pool_capacity // BLOCK_M
+    gemm_grid_blocks = worst_case_tiles * n_blocks  # compile-time empty+real GEMM block count
     comb_records = combine_slots * out_features * 2  # bf16 peer combine-buffer bound (bytes)
-    # role 1 raises per-slot flags only when role 2 runs
-    with_barrier = num_reduce_cu > 0
+    # role 1 raises per-slot flags whenever any reducer (dedicated or empty-block) runs
+    with_barrier = reduce_active
+    dedicated_reduce_warps = num_reduce_cu * _NUM_WARPS  # const worker-warp count for [combine,reduce)
     gemm_base = num_combine_cu + num_reduce_cu
+    topk_reduce = _get_topk_reduce(True, apply_weights)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def combine_grouped(
@@ -287,6 +338,7 @@ def _compile(
         BARRIER_LOCAL: fx.Tensor,
         TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor,
+        TOPK_WEIGHTS: fx.Tensor,
         c_n: fx.Int32,
     ):
         thread_index = fx.thread_idx.x
@@ -306,6 +358,7 @@ def _compile(
         output_res = create_buffer_resource(OUTPUT, max_size=True)
         topk_indices_res = create_buffer_resource(TOPK_INDICES, max_size=True)
         num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
+        topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
         real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
 
         push_block = combine_bf16_tile(
@@ -339,11 +392,11 @@ def _compile(
             fx.rocdl.s_waitcnt(0)
         else:
             if block_index < combine_cu + reduce_cu:
-                # ── role 2: TOPK REDUCE (no-op when num_reduce_cu == 0: region is empty) ──
-                _topk_reduce_wait(
+                # ── role 2a: DEDICATED TOPK REDUCE (no-op when num_reduce_cu == 0) ──
+                topk_reduce(
                     thread_index,
                     block_index - combine_cu,
-                    num_reduce_cu,
+                    fx.Int32(dedicated_reduce_warps),
                     topk,
                     out_features,
                     num_experts,
@@ -353,6 +406,7 @@ def _compile(
                     topk_indices_res,
                     num_tokens_res,
                     BARRIER_LOCAL,
+                    topk_weights_res,
                 )
             else:
                 # ── role 3: GROUPED GEMM (one tile -> L2Y, signal scoreboard) ──
@@ -386,6 +440,28 @@ def _compile(
                     _emit_if_then(
                         thread_index == fx.Int32(0), lambda: _atomic_add_relaxed(SB_L2, block_m, fx.Int32(1))
                     )
+                else:
+                    # role 2b: empty GEMM tiles reduce on freed CUs (overlaps the push tail)
+                    if reduce_active:
+                        empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
+                        total_empty_warps = (
+                            fx.Int32(gemm_grid_blocks) - real_tiles * fx.Int32(n_blocks)
+                        ) * fx.Int32(_NUM_WARPS)
+                        topk_reduce(
+                            thread_index,
+                            empty_ordinal,
+                            total_empty_warps,
+                            topk,
+                            out_features,
+                            num_experts,
+                            rank,
+                            comb_local_res,
+                            output_res,
+                            topk_indices_res,
+                            num_tokens_res,
+                            BARRIER_LOCAL,
+                            topk_weights_res,
+                        )
 
     @flyc.jit
     def launch(
@@ -404,6 +480,7 @@ def _compile(
         BARRIER_LOCAL,
         TOPK_INDICES,
         NUM_TOKENS_PER_RANK,
+        TOPK_WEIGHTS,
         c_n: int,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -424,6 +501,7 @@ def _compile(
             BARRIER_LOCAL,
             TOPK_INDICES,
             NUM_TOKENS_PER_RANK,
+            TOPK_WEIGHTS,
             c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -434,11 +512,12 @@ def _compile(
 # combine-PUSH-only launcher (no GEMM) -- raw combine bandwidth on a pre-filled L2Y pool.
 @functools.lru_cache(maxsize=256)
 def _compile_combine_only(
-    out_features, pool_capacity, BLOCK_M, num_combine_cu, combine_slots, waves_per_eu=2
+    out_features, pool_capacity, BLOCK_M, num_combine_cu, combine_slots, waves_per_eu=2, with_gate=False
 ):
     assert pool_capacity % BLOCK_M == 0, "pool_capacity must be a multiple of BLOCK_M"
     assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
     comb_records = combine_slots * out_features * 2
+    gate_records = combine_slots * 4  # f32 gate slots per peer
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def combine_only_k(
@@ -447,6 +526,8 @@ def _compile_combine_only(
         ORIGIN_SLOT: fx.Tensor,
         COMB_ADDRS: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
+        GRAD_GATE: fx.Tensor,
+        GATE_ADDRS: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
@@ -457,6 +538,8 @@ def _compile_combine_only(
         comb_addr_res = create_buffer_resource(COMB_ADDRS, max_size=True)
         num_tile_blocks_res = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
         real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+        grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
+        gate_addr_res = create_buffer_resource(GATE_ADDRS, max_size=True) if with_gate else None
 
         push_block = combine_bf16_tile(
             thread_index=thread_index,
@@ -468,6 +551,10 @@ def _compile_combine_only(
             origin_rank_res=origin_rank_res,
             origin_slot_res=origin_slot_res,
             comb_addr_res=comb_addr_res,
+            grad_gate_res=grad_gate_res,
+            gate_addr_res=gate_addr_res,
+            gate_records=gate_records,
+            with_gate=with_gate,
         )
 
         local_count = (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
@@ -476,7 +563,14 @@ def _compile_combine_only(
 
     @flyc.jit
     def launch(
-        L2Y, ORIGIN_RANK, ORIGIN_SLOT, COMB_ADDRS, NUM_TILE_BLOCKS, stream: fx.Stream = fx.Stream(None)
+        L2Y,
+        ORIGIN_RANK,
+        ORIGIN_SLOT,
+        COMB_ADDRS,
+        NUM_TILE_BLOCKS,
+        GRAD_GATE,
+        GATE_ADDRS,
+        stream: fx.Stream = fx.Stream(None),
     ):
         combine_only_k(
             L2Y,
@@ -484,6 +578,8 @@ def _compile_combine_only(
             ORIGIN_SLOT,
             COMB_ADDRS,
             NUM_TILE_BLOCKS,
+            GRAD_GATE,
+            GATE_ADDRS,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_combine_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -492,9 +588,12 @@ def _compile_combine_only(
 
 # topk-reduce-only launcher (no GEMM/combine) -- reduces a pre-filled token-major combine buffer.
 @functools.lru_cache(maxsize=256)
-def _compile_reduce_only(out_features, combine_slots, num_reduce_cu, topk, num_experts, rank, waves_per_eu=2):
+def _compile_reduce_only(
+    out_features, combine_slots, num_reduce_cu, topk, num_experts, rank, waves_per_eu=2, apply_weights=False
+):
     assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
     assert topk >= 1, "topk must be >= 1"
+    topk_reduce = _get_topk_reduce(False, apply_weights)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def reduce_only_k(
@@ -503,6 +602,7 @@ def _compile_reduce_only(out_features, combine_slots, num_reduce_cu, topk, num_e
         BARRIER_LOCAL: fx.Tensor,
         TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor,
+        TOPK_WEIGHTS: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
@@ -510,10 +610,11 @@ def _compile_reduce_only(out_features, combine_slots, num_reduce_cu, topk, num_e
         output_res = create_buffer_resource(OUTPUT, max_size=True)
         topk_indices_res = create_buffer_resource(TOPK_INDICES, max_size=True)
         num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
-        _topk_reduce(
+        topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
+        topk_reduce(
             thread_index,
             block_index,
-            num_reduce_cu,
+            fx.Int32(num_reduce_cu * _NUM_WARPS),
             topk,
             out_features,
             num_experts,
@@ -523,6 +624,7 @@ def _compile_reduce_only(out_features, combine_slots, num_reduce_cu, topk, num_e
             topk_indices_res,
             num_tokens_res,
             BARRIER_LOCAL,
+            topk_weights_res,
         )
 
     @flyc.jit
@@ -532,6 +634,7 @@ def _compile_reduce_only(out_features, combine_slots, num_reduce_cu, topk, num_e
         BARRIER_LOCAL,
         TOPK_INDICES,
         NUM_TOKENS_PER_RANK,
+        TOPK_WEIGHTS,
         stream: fx.Stream = fx.Stream(None),
     ):
         reduce_only_k(
@@ -540,6 +643,7 @@ def _compile_reduce_only(out_features, combine_slots, num_reduce_cu, topk, num_e
             BARRIER_LOCAL,
             TOPK_INDICES,
             NUM_TOKENS_PER_RANK,
+            TOPK_WEIGHTS,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_reduce_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -584,6 +688,7 @@ def grouped_gemm_combine_bf16(
     barrier_addrs=None,
     topk_indices=None,
     num_tokens_per_rank=None,
+    topk_weights=None,
     topk=1,
     num_experts=0,
     rank=0,
@@ -608,19 +713,21 @@ def grouped_gemm_combine_bf16(
     buffer (``comb_addrs[origin]``); ``combine_slots`` bounds each peer buffer.
     ``sb_l2`` (L2 scoreboard) must be zeroed before the call.
 
-    Role 1 (combine push) runs on ``num_combine_cu`` front blocks (default 32). When the reduce
-    arguments are supplied AND ``num_reduce_cu != 0``, role 2 (topk reduce) runs on the next
-    ``num_reduce_cu`` blocks (default 32): it reads the token-major local combine buffer
+    Role 1 (combine push) runs on ``num_combine_cu`` front blocks (default 64). Supplying
+    ``output`` enables role 2 (topk reduce): it reads the token-major local combine buffer
     ``comb_local`` [combine_slots, N] (filled by every rank's role 1, gated per slot by
     ``barrier_local`` [combine_slots] which role 1 raises through ``barrier_addrs``), sums the
-    ``topk`` rows of each of this rank's tokens, and writes ``output`` [num_tokens, N]. For the
-    token-major reduce, ``origin_slot`` must encode ``token*topk + k`` (NOT the source-order
-    slot used by the two-role path). ``topk_indices`` [num_tokens*topk] int32 (< 0 == dropped)
-    and ``num_tokens_per_rank`` [world] int32 drive the per-token loop; ``rank`` selects the row.
+    ``topk`` rows of each of this rank's tokens, and writes ``output`` [num_tokens, N]. The reduce
+    runs on the EMPTY grouped-GEMM blocks (freed CUs as the GEMM winds down) plus an optional
+    dedicated region of ``num_reduce_cu`` blocks; ``num_reduce_cu`` defaults to 0 (empty-blocks
+    only — a non-zero value double-reduces, idempotent but wasteful). For the token-major reduce,
+    ``origin_slot`` must encode ``token*topk + k`` (NOT the source-order slot used by the two-role
+    path). ``topk_indices`` [num_tokens*topk] int32 (< 0 == dropped) and ``num_tokens_per_rank``
+    [world] int32 drive the per-token loop; ``rank`` selects the row. ``topk_weights``
+    [num_tokens*topk] f32 (optional) scales each topk row -> weighted reduce.
 
-    With the reduce arguments omitted (or ``num_reduce_cu == 0``) this degenerates to the
-    two-role GEMM + combine kernel (no per-slot flags). ``autotune=True`` sweeps the
-    num_combine_cu candidates once per shape (cached)."""
+    With ``output`` omitted this degenerates to the two-role GEMM + combine kernel (no per-slot
+    flags). ``autotune=True`` sweeps the num_combine_cu candidates once per shape (cached)."""
     assert layout in ("nt", "nn", "tn"), f"unknown layout {layout}"
     assert act_bf16.dtype == torch.bfloat16 and weight_bf16.dtype == torch.bfloat16
     if layout == "tn":  # A is [K, M] (K-major)
@@ -635,11 +742,11 @@ def grouped_gemm_combine_bf16(
     out_features = N
     c_n = out_features
     if num_combine_cu is None:
-        num_combine_cu = 32
+        num_combine_cu = 64  # best for fused 3-role (bench fused3 ~2.9ms; e2e sweep 64<48<96)
 
-    # guard against silent 2-role fallback when reduce was clearly intended
+    # reduce active iff output given; num_reduce_cu only sizes the optional dedicated region (0 = empty-block only)
     assert not (output is None and num_reduce_cu), "num_reduce_cu set but output is None"
-    reduce_active = output is not None and num_reduce_cu != 0
+    reduce_active = output is not None
     if reduce_active:
         assert all(
             t is not None
@@ -647,10 +754,11 @@ def grouped_gemm_combine_bf16(
         ), "topk reduce needs comb_local/barrier_local/barrier_addrs/topk_indices/num_tokens_per_rank"
         assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"
         if num_reduce_cu is None:
-            num_reduce_cu = 32
+            num_reduce_cu = 0
     else:
         num_reduce_cu = 0
         topk = 1
+    apply_weights = reduce_active and topk_weights is not None
 
     act_flat = act_bf16.contiguous().view(-1)
     if layout == "nt":  # weight [G, N, K]
@@ -665,6 +773,7 @@ def grouped_gemm_combine_bf16(
     barrier_addrs_d = barrier_addrs if reduce_active else comb_addrs
     topk_indices_d = topk_indices.contiguous().view(-1) if reduce_active else mblk_dev
     num_tokens_d = num_tokens_per_rank if reduce_active else mblk_dev
+    topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else mblk_dev
 
     pos_args = (
         act_flat,
@@ -682,6 +791,7 @@ def grouped_gemm_combine_bf16(
         barrier_local_d,
         topk_indices_d,
         num_tokens_d,
+        topk_weights_d,
         c_n,
     )
 
@@ -698,6 +808,7 @@ def grouped_gemm_combine_bf16(
             int(num_experts),
             int(rank),
             layout,
+            bool(apply_weights),
         )
         cached = _COMBINE_AUTOTUNE_CACHE.get(key)
         if cached is None:
@@ -717,6 +828,8 @@ def grouped_gemm_combine_bf16(
                 sb_l2,
                 autotune_reset,
                 layout,
+                apply_weights,
+                reduce_active,
             )
             _COMBINE_AUTOTUNE_CACHE[key] = cached
         launch, _cfg = cached
@@ -737,6 +850,8 @@ def grouped_gemm_combine_bf16(
             int(waves_per_eu),
             int(agpr_alloc),
             layout=layout,
+            apply_weights=apply_weights,
+            reduce_active=reduce_active,
         )
     launch(*pos_args, stream=torch.cuda.current_stream())
     return l2y
@@ -758,6 +873,8 @@ def _autotune(
     sb_l2,
     reset,
     layout="nt",
+    apply_weights=False,
+    reduce_active=False,
 ):
     """Bench the num_combine_cu candidates with a per-iter scoreboard reset; return (launch, cfg)."""
     if reset is None:
@@ -784,6 +901,8 @@ def _autotune(
                 int(waves),
                 int(agpr),
                 layout=layout,
+                apply_weights=apply_weights,
+                reduce_active=reduce_active,
             )
             reset()
             launch(*pos_args, stream=stream)
@@ -813,19 +932,51 @@ def _autotune(
 
 
 def combine_only(
-    l2y, origin_rank, origin_slot, comb_addrs, combine_slots, mblk_dev, *, BM=256, num_combine_cu=None
+    l2y,
+    origin_rank,
+    origin_slot,
+    comb_addrs,
+    combine_slots,
+    mblk_dev,
+    *,
+    BM=256,
+    num_combine_cu=None,
+    grad_gate=None,
+    gate_addrs=None,
 ):
     """Combine-PUSH only (no GEMM) -- pushes the pre-filled ``l2y`` rows to the peer
-    combine buffers. For measuring raw combine bandwidth."""
+    combine buffers. For measuring raw combine bandwidth.
+
+    ``grad_gate`` [pool_capacity] f32 + ``gate_addrs`` [world] i64 (both given): also
+    scatter the per-row gate gradient to ``gate_addrs[origin][slot]`` (backward d_topk_w);
+    one f32/row by lane 0, negligible vs the hidden-wide combine push."""
     out_features = l2y.size(1)
     pool_capacity = l2y.size(0)
     if num_combine_cu is None:
         num_combine_cu = pool_capacity // BM
     l2y_flat = l2y.contiguous().view(-1)
+    with_gate = grad_gate is not None and gate_addrs is not None
     launch = _compile_combine_only(
-        out_features, pool_capacity, int(BM), int(num_combine_cu), int(combine_slots)
+        out_features,
+        pool_capacity,
+        int(BM),
+        int(num_combine_cu),
+        int(combine_slots),
+        with_gate=with_gate,
     )
-    launch(l2y_flat, origin_rank, origin_slot, comb_addrs, mblk_dev, stream=torch.cuda.current_stream())
+    # dummies satisfy the fixed kernel signature when gate is off (gated by const_expr)
+    grad_gate_arg = grad_gate if with_gate else mblk_dev
+    gate_addrs_arg = gate_addrs if with_gate else comb_addrs
+    launch(
+        l2y_flat,
+        origin_rank,
+        origin_slot,
+        comb_addrs,
+        mblk_dev,
+        grad_gate_arg,
+        gate_addrs_arg,
+        stream=torch.cuda.current_stream(),
+    )
     return l2y
 
 
@@ -841,21 +992,32 @@ def topk_reduce_only(
     num_experts,
     rank=0,
     num_reduce_cu=32,
+    topk_weights=None,
 ):
     """Topk-reduce only (no GEMM, no combine) -- sums the pre-filled token-major combine
     buffer ``comb_local`` [combine_slots, N] into ``output`` [num_tokens, N]. ``barrier_local``
-    [combine_slots] must already mark every needed slot ready (>= 0). For unit testing role 2."""
+    [combine_slots] must already mark every needed slot ready (>= 0). ``topk_weights``
+    [num_tokens*topk] f32 (optional) scales each topk row. For unit testing role 2."""
     assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"
     out_features = output.size(1)
+    apply_weights = topk_weights is not None
     launch = _compile_reduce_only(
-        out_features, int(combine_slots), int(num_reduce_cu), int(topk), int(num_experts), int(rank)
+        out_features,
+        int(combine_slots),
+        int(num_reduce_cu),
+        int(topk),
+        int(num_experts),
+        int(rank),
+        apply_weights=apply_weights,
     )
+    topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else num_tokens_per_rank
     launch(
         output.view(-1),
         comb_local.contiguous().view(-1),
         barrier_local,
         topk_indices.contiguous().view(-1),
         num_tokens_per_rank,
+        topk_weights_d,
         stream=torch.cuda.current_stream(),
     )
     return output

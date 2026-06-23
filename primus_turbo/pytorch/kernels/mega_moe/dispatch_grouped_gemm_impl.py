@@ -41,8 +41,10 @@ class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
         supported = True
         supported &= x.dim() == 2 and weight.dim() == 3 and pool.dim() == 2
         supported &= x.dtype in _SUPPORTED_DTYPES and weight.dtype in _SUPPORTED_DTYPES
-        supported &= layout == "nt"
-        supported &= weight.shape[2] == x.shape[1]  # K matches hidden
+        supported &= layout in ("nt", "nn")  # pool is M-major -> nt (fwd) / nn (dgrad)
+        # K (contraction) = hidden: NT weight [G,N,K]; NN weight [G,K,N]
+        k_idx = 2 if layout == "nt" else 1
+        supported &= weight.shape[k_idx] == x.shape[1]
         return supported
 
     @staticmethod
@@ -67,20 +69,17 @@ class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
         BM: int,
         BN: int,
         GROUP_M: int,
-        comm_blocks: int,
+        num_dispatch_cu: int,
         nt_vmcnt: int,
         autotune: bool,
         **kwargs,
     ) -> torch.Tensor:
         kernel = _flydsl_kernel()
+        # DeepEP-style dispatch handle (flat tuple); the GEMM ignores routing -> first 5 suffice
+        plan = (comm_dest, comm_start, comm_count, comm_src_offset, comm_src_tokens)
         return kernel(
             x,
-            comm_dest,
-            comm_start,
-            comm_count,
-            comm_src_offset,
-            comm_src_tokens,
-            int(num_comm),
+            plan,
             pool,
             pool_ptrs,
             weight,
@@ -94,7 +93,7 @@ class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
             BM=int(BM),
             BN=int(BN),
             GROUP_M=int(GROUP_M),
-            comm_blocks=int(comm_blocks),
+            num_dispatch_cu=int(num_dispatch_cu),
             nt_vmcnt=int(nt_vmcnt),
             autotune=bool(autotune),
             autotune_reset=scoreboard.zero_,
@@ -147,7 +146,7 @@ def dispatch_grouped_gemm_impl(
     BM: int = 256,
     BN: int = 256,
     GROUP_M: int = 4,
-    comm_blocks: int = 32,
+    num_dispatch_cu: int = 16,
     nt_vmcnt: int = 3,
     autotune: bool = False,
 ) -> torch.Tensor:
@@ -159,8 +158,9 @@ def dispatch_grouped_gemm_impl(
     """
     default_backend_enum = BackendType(default_backend)
 
-    # C freshly allocated; pool/scoreboard are mutated symmetric-mem buffers
-    N = weight.shape[1]
+    # C freshly allocated; pool/scoreboard are mutated symmetric-mem buffers.
+    # NT weight [G,N,K] -> N=shape[1]; NN (dgrad) weight [G,K,N] -> N=shape[2].
+    N = weight.shape[1] if layout == "nt" else weight.shape[2]
     output = torch.empty((pool.shape[0], N), device=x.device, dtype=x.dtype)
 
     # kernel autotune: explicit flag OR global auto-tune, never under capture
@@ -188,7 +188,7 @@ def dispatch_grouped_gemm_impl(
         BM=BM,
         BN=BN,
         GROUP_M=GROUP_M,
-        comm_blocks=comm_blocks,
+        num_dispatch_cu=num_dispatch_cu,
         nt_vmcnt=nt_vmcnt,
         autotune=do_autotune,
     )
@@ -219,7 +219,7 @@ def dispatch_grouped_gemm_impl_meta(
     BM: int = 256,
     BN: int = 256,
     GROUP_M: int = 4,
-    comm_blocks: int = 32,
+    num_dispatch_cu: int = 16,
     nt_vmcnt: int = 3,
     autotune: bool = False,
 ) -> torch.Tensor:
@@ -228,8 +228,9 @@ def dispatch_grouped_gemm_impl_meta(
     assert pool.dim() == 2, f"pool must be 2D [pool_cap,K], got {pool.shape}"
     assert x.dtype in _SUPPORTED_DTYPES, f"x must be bf16, got {x.dtype}"
     assert weight.dtype in _SUPPORTED_DTYPES, f"weight must be bf16, got {weight.dtype}"
-    assert layout == "nt", "Only layout='nt' is supported."
-    assert weight.shape[2] == x.shape[1], "weight K must match hidden size."
+    assert layout in ("nt", "nn"), "Only layout='nt' (fwd) / 'nn' (dgrad) supported."
+    k_idx = 2 if layout == "nt" else 1
+    assert weight.shape[k_idx] == x.shape[1], "weight K must match hidden size."
 
-    N = weight.shape[1]
+    N = weight.shape[1] if layout == "nt" else weight.shape[2]
     return torch.empty((pool.shape[0], N), device=x.device, dtype=x.dtype)
