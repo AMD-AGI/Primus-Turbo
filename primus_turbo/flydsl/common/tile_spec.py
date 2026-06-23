@@ -162,15 +162,15 @@ class XcdSwizzleScheduler:
 class LinearNoSyncScheduler:
     """Grouped map: linear row-major tile-id, offset past the front comm blocks."""
 
-    def __init__(self, *, num_comm_blocks):
-        self.num_comm_blocks = num_comm_blocks
+    def __init__(self, *, num_comm_cu):
+        self.num_comm_cu = num_comm_cu
 
     @property
     def cache_key(self):
-        return ("linear", self.num_comm_blocks)
+        return ("linear", self.num_comm_cu)
 
     def map(self, geom, *, c_m, c_n, n_blocks):
-        tile_index = fx.block_idx.x - fx.Int32(self.num_comm_blocks)
+        tile_index = fx.block_idx.x - fx.Int32(self.num_comm_cu)
         return tile_index // n_blocks, tile_index % n_blocks
 
     def grid(self, geom, c_m, c_n):

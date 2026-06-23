@@ -14,8 +14,9 @@ tests/pytorch/ops/test_mega_moe_dispatch_combine_grouped_gemm.py exactly):
   * fused        -- grouped L2 GEMM + combine PUSH (overlap)                  [TFLOPS]
 
 The test data (act / weight / tile_to_group / origin_rank / origin_slot / combine
-buffers) is built by ``MegaFusedMoE._prologue`` + dispatch + SwiGLU -- the exact
-same path as the test.
+buffers) is built over the production ``SymmBuffer`` (``get_symm_buffer_for_mega_moe``)
+by running ``mega_moe_prologue_impl`` + ``dispatch_grouped_gemm_impl`` + SwiGLU --
+the exact same path as the EP test.
 
 Run inside dev_primus (8 GPUs):
   PYTHONPATH=<...>/Primus-Turbo python benchmark/ops/bench_grouped_gemm_comine.py \
@@ -23,6 +24,7 @@ Run inside dev_primus (8 GPUs):
 """
 
 import argparse
+import math
 import os
 import sys
 from datetime import datetime
@@ -40,10 +42,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..")))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "tests", "pytorch", "ops")))
 
 from test_mega_moe_dispatch_combine_grouped_gemm import (  # noqa: E402
-    MegaFusedMoE,
     _global_weights,
-    _Symm,
-    _SymmSig,
     generate_routing,
 )
 
@@ -58,6 +57,36 @@ from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (  # noqa:
     combine_only,
     grouped_gemm_combine_bf16,
 )
+from primus_turbo.flydsl.mega.mega_moe_epilogue import swiglu  # noqa: E402
+from primus_turbo.pytorch.core.backend import BackendType  # noqa: E402
+from primus_turbo.pytorch.core.symm_mem import SymmetricMemory  # noqa: E402
+from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (  # noqa: E402
+    dispatch_grouped_gemm_impl,
+)
+from primus_turbo.pytorch.kernels.mega_moe.mega_moe_prologue_impl import (  # noqa: E402
+    mega_moe_prologue_impl,
+)
+
+# single-allocation symmetric buffer shared with the production forward + the EP test
+from primus_turbo.pytorch.ops.moe.mega_fused_moe import (  # noqa: E402
+    get_symm_buffer_for_mega_moe,
+)
+
+_FLYDSL = BackendType.FLYDSL.value
+
+
+class _SymmSig:
+    """Symmetric SIGNAL buffer in UNCACHED memory (per-slot flags for the 3-role reduce).
+
+    ``.local`` = this rank's uncached signal-pad view; ``.ptrs`` = per-rank signal-pad
+    base ptrs (for cross-rank raises). Uncached so relaxed cross-rank reads stay fresh."""
+
+    def __init__(self, group, shape, dtype):
+        nbytes = math.prod(shape) * dtype.itemsize
+        self.sm = SymmetricMemory(group, alloc_size=16, signal_pad_size=max(1024, nbytes))
+        self.rank = group.rank()
+        self.local = self.sm.get_signal_pad(self.rank, shape, dtype)
+        self.ptrs = self.sm.signal_pad_ptrs_dev
 
 
 def _dense_gemm_peak_ms(M, N, K, BM, BN, iters, *, group_m_cands=(4,)):
@@ -129,39 +158,119 @@ def _bench(fn, *, reset=None, group=None, warmup=5, iters=30):
 
 
 # --------------------------------------------------------------------------- #
-# Test-data generator (consistent with the test): build MegaFusedMoE, run the
+# Test-data generator (consistent with the test): get the symmetric buffer, run the
 # prologue + dispatch + SwiGLU so ``act`` is the real L2 input, then fill l2y once.
 # --------------------------------------------------------------------------- #
 def generate(group, *, T, H, I, E, K, BM, BN, mode, W1, W2, base_seed=7):
+    """Build the real L2-GEMM input by running the production prologue + dispatch +
+    SwiGLU over the cached symmetric buffer (same path as the EP test), then fill
+    ``l2_token_buffer`` once so combine_only has real rows."""
     rank = group.rank()
     torch.manual_seed(base_seed + rank)
     x = torch.randn((T, H), device="cuda", dtype=torch.float32).bfloat16()
     topk_idx, topk_w = generate_routing(T, K, E, mode, device="cuda", seed=100 + rank)
 
-    mega = MegaFusedMoE(
-        group, num_tokens=T, hidden=H, inter=I, num_experts=E, num_topk=K, W1=W1, W2=W2, BM=BM, BN=BN
+    symm = get_symm_buffer_for_mega_moe(
+        group,
+        num_experts=E,
+        num_max_tokens_per_rank=T,
+        num_topk=K,
+        hidden=H,
+        intermediate_hidden=I,
+        block_m=BM,
+        block_n=BN,
     )
-    mega._topk_idx = topk_idx  # kept for the optional 3-role reduce
 
-    res = mega._prologue(topk_idx, topk_w)  # <-- the dispatch plan (same as the test)
-    mega.assert_capacity()  # fail loudly rather than silently drop rows
-    mega._reset()
+    # 1) prologue: build the cross-rank dispatch plan; returns the plan tables.
+    # scoreboard + barrier_local are reset in-kernel by the prologue; sb_l2 + comb stay host-zeroed.
+    (
+        destination,
+        start,
+        count,
+        source_offset_out,
+        source_tokens,
+        source_topk_slot,
+        source_weight,
+        tile_to_group,
+        expected,
+    ) = mega_moe_prologue_impl(
+        topk_idx,
+        topk_w,
+        symm.peer_ptrs,
+        symm.origin_rank,
+        symm.origin_slot,
+        symm.meta_scalars,
+        symm.grid_barrier_state,
+        symm.profile,
+        symm.scoreboard,
+        symm.barrier_local,
+        T,
+        K,
+        E,
+        symm.world,
+        symm.rank,
+        symm.block_m,
+        symm.pool_capacity,
+        _FLYDSL,
+        no_cpu_sync=True,
+    )
+    num_tile_blocks = symm.meta_scalars[1:2]  # device real-tile count
+    symm.assert_capacity()  # fail loudly rather than silently drop rows
+
+    # sb_l2 is a same-rank scoreboard accumulator -> zero it (no barrier needed). comb is
+    # fully overwritten by the combine PUSH with no dropped tokens, so it needs no host zero/fence.
+    symm.sb_l2.zero_()
+
+    # 2) cross-rank dispatch PUSH + grouped L1 GEMM (NT): pool[M,H] @ W1[g,2I,H] -> l1_out
+    l1_out = dispatch_grouped_gemm_impl(
+        x,
+        destination,
+        start,
+        count,
+        source_offset_out,
+        source_tokens,
+        symm.pool,
+        symm.pool_ptrs,
+        W1,
+        tile_to_group,
+        symm.scoreboard,
+        symm.scoreboard_ptrs,
+        expected,
+        num_tile_blocks,
+        E,
+        _FLYDSL,
+        layout="nt",
+        BM=BM,
+        BN=BN,
+    )
+
+    # 3) fused SwiGLU activation -> act (L2 GEMM input)
+    act = swiglu(
+        l1_out,
+        symm.act,
+        symm.intermediate_hidden,
+        symm.pool_capacity,
+        num_tile_blocks=num_tile_blocks,
+        BM=BM,
+    )
+
+    # 4) fill l2_token_buffer once with the real rows (for combine_only)
+    grouped_gemm_bf16_only(act, W2, symm.l2_token_buffer, tile_to_group, num_tile_blocks, BM=BM, BN=BN)
     torch.cuda.synchronize()
     group.barrier()
-    torch.cuda.synchronize()
-    mega._dispatch(x, res)  # fill pool -> acc1 (autotuned, same as test)
-    act = mega._swiglu()  # L2 GEMM input
-    grouped_gemm_bf16_only(
-        act, W2, mega.l2y, res.tile_to_group, mega._num_tile_blocks, BM=BM, BN=BN
-    )  # fill l2y (real rows for combine_only)
-    torch.cuda.synchronize()
-    group.barrier()
-    return SimpleNamespace(mega=mega, act=act, res=res, W2=W2)
+    return SimpleNamespace(
+        symm=symm,
+        act=act,
+        num_tile_blocks=num_tile_blocks,
+        topk_idx=topk_idx,
+        W2=W2,
+        tile_to_group=tile_to_group,
+    )
 
 
 def profile_combine(group, args, mode, W1, W2):
     rank = group.rank()
-    BM, BN, H, I, comm_blocks = args.bm, args.bn, args.hidden, args.inter, args.comm_blocks
+    BM, BN, H, I, num_combine_cu = args.bm, args.bn, args.hidden, args.inter, args.num_combine_cu
     d = generate(
         group,
         T=args.num_tokens,
@@ -175,26 +284,27 @@ def profile_combine(group, args, mode, W1, W2):
         W1=W1,
         W2=W2,
     )
-    mega, act, res = d.mega, d.act, d.res
+    symm, act, num_tile_blocks = d.symm, d.act, d.num_tile_blocks
+    tile_to_group = d.tile_to_group  # prologue-returned expert-id-per-tile map
     sm_bar = None  # 3-role barrier symm buffer (freed in finally)
     try:
         # GEMM work = real (padded) pool rows x N x K ; L2 NT: N=H, K=I
-        real_tiles = int(mega.wp.buffers["meta_scalars"][1].item())
+        real_tiles = int(symm.meta_scalars[1].item())
         M_eff, N, Kd = real_tiles * BM, H, I
         flops = 2.0 * M_eff * N * Kd
         # XGMI combine bytes per rank = remote rows (origin_rank != rank, valid) x H x 2
-        origin = res.origin_rank
+        origin = symm.origin_rank
         remote_rows = int(((origin != rank) & (origin >= 0)).sum().item())
         xgmi_bytes = remote_rows * H * 2
 
-        comb_addrs = mega._sm_comb.ptrs
-        slots = mega.combine_slots
+        comb_addrs = symm.comb_addrs
+        slots = symm.combine_slots
 
         # L2 has small K=I -> short contraction; GROUP_M=8 reuses the per-expert weight
         # across more M-tiles than the GROUP_M=4 L1 default (best for this shape).
         t_gg = _bench(
             lambda: grouped_gemm_bf16_only(
-                act, d.W2, mega.l2y, res.tile_to_group, mega._num_tile_blocks, BM=BM, BN=BN, GROUP_M=8
+                act, d.W2, symm.l2_token_buffer, tile_to_group, num_tile_blocks, BM=BM, BN=BN, GROUP_M=8
             ),
             iters=args.iters,
         )
@@ -202,18 +312,18 @@ def profile_combine(group, args, mode, W1, W2):
         gm_cands = (1, 4, 8) if args.autotune else (args.dense_group_m,)
         t_dense, dense_gm = _dense_gemm_peak_ms(M_eff, N, Kd, BM, BN, args.iters, group_m_cands=gm_cands)
         # combine CUs: autotune sweeps {16,32,64}; default off uses the single best
-        # (--comm-blocks=32). combine_only and the fused kernel share the same candidate.
-        cu_cands = (16, 32, 48, 64, 96) if args.autotune else (comm_blocks,)
+        # (--num-combine-cu=64). combine_only and the fused kernel share the same candidate.
+        cu_cands = (16, 32, 48, 64, 96) if args.autotune else (num_combine_cu,)
         cb_sweep = {}
         for cu in cu_cands:
             cb_sweep[cu] = _bench(
                 lambda cu=cu: combine_only(
-                    mega.l2y,
-                    res.origin_rank,
-                    res.origin_slot,
+                    symm.l2_token_buffer,
+                    symm.origin_rank,
+                    symm.origin_slot,
                     comb_addrs,
                     slots,
-                    mega._num_tile_blocks,
+                    num_tile_blocks,
                     BM=BM,
                     num_combine_cu=cu,
                 ),
@@ -228,19 +338,19 @@ def profile_combine(group, args, mode, W1, W2):
                 lambda cu=cu: grouped_gemm_combine_bf16(
                     act,
                     d.W2,
-                    mega.l2y,
-                    res.tile_to_group,
-                    mega.sb_l2,
-                    res.origin_rank,
-                    res.origin_slot,
+                    symm.l2_token_buffer,
+                    tile_to_group,
+                    symm.sb_l2,
+                    symm.origin_rank,
+                    symm.origin_slot,
                     comb_addrs,
                     slots,
-                    mega._num_tile_blocks,
+                    num_tile_blocks,
                     BM=BM,
                     BN=BN,
                     num_combine_cu=cu,
                 ),
-                reset=mega.sb_l2.zero_,
+                reset=symm.sb_l2.zero_,
                 group=group,
                 iters=args.iters,
             )
@@ -252,7 +362,7 @@ def profile_combine(group, args, mode, W1, W2):
         # combine buffers as the forward; combine pushes the I-wide dact rows (I<H -> fits).
         bwd = {}
         if args.backward:
-            M_pool = mega.pool_capacity
+            M_pool = symm.pool_capacity
             dy = torch.randn(M_pool, H, device="cuda", dtype=torch.bfloat16) / 8
             bwd_l2y = torch.empty(M_pool, I, dtype=torch.bfloat16, device="cuda")
             bwd_flops = 2.0 * M_eff * I * H  # same dims as forward L2, B transposed
@@ -262,8 +372,8 @@ def profile_combine(group, args, mode, W1, W2):
                     dy,
                     d.W2,
                     bwd_l2y,
-                    res.tile_to_group,
-                    mega._num_tile_blocks,
+                    tile_to_group,
+                    num_tile_blocks,
                     layout="nn",
                     BM=BM,
                     BN=BN,
@@ -278,19 +388,19 @@ def profile_combine(group, args, mode, W1, W2):
                         dy,
                         d.W2,
                         bwd_l2y,
-                        res.tile_to_group,
-                        mega.sb_l2,
-                        res.origin_rank,
-                        res.origin_slot,
+                        tile_to_group,
+                        symm.sb_l2,
+                        symm.origin_rank,
+                        symm.origin_slot,
                         comb_addrs,
                         slots,
-                        mega._num_tile_blocks,
+                        num_tile_blocks,
                         layout="nn",
                         BM=BM,
                         BN=BN,
                         num_combine_cu=cu,
                     ),
-                    reset=mega.sb_l2.zero_,
+                    reset=symm.sb_l2.zero_,
                     group=group,
                     iters=args.iters,
                 )
@@ -305,36 +415,38 @@ def profile_combine(group, args, mode, W1, W2):
             }
             del dy, bwd_l2y
 
-        # optional 3-role (GEMM + combine + in-kernel topk reduce). PERF ONLY -- correctness is
-        # NOT expected: origin_slot is source-order (not token-major) and the fused reduce is
-        # compiler-blocked, so we pre-set the barrier ready each iter to keep role 2 from spinning.
+        # optional 3-role (GEMM + combine + in-kernel topk reduce). PERF ONLY -- this path
+        # pre-sets the barrier ready each iter (no real cross-rank wait) and applies no routing
+        # weights, so it times the fused reduce but is not numerically correct.
         t_fused3 = None
-        if args.reduce_cu > 0:
+        if args.num_reduce_cu > 0:
             T = args.num_tokens
             out3 = torch.empty(T, H, dtype=torch.bfloat16, device="cuda")
-            # per-slot completion flags in the UNCACHED signal pad -> relaxed cross-rank reads stay fresh
+            # per-slot completion flags in the UNCACHED signal pad -> relaxed cross-rank reads stay fresh.
+            # 0 == ready (role 2 waits while flag < 0); same "resident" convention as the production
+            # reduce-only path. Re-zero every iter for a clean state (sb_l2 + flags).
             sm_bar = _SymmSig(group, (slots,), torch.int32)
-            tki = mega._topk_idx.to(torch.int32).contiguous().view(-1)
+            tki = d.topk_idx.to(torch.int32).contiguous().view(-1)
             ntok = torch.full((group.size(),), T, dtype=torch.int32, device="cuda")
 
             def _reset3():
-                mega.sb_l2.zero_()
-                sm_bar.local.fill_(1)  # flags ready -> role 2 never blocks
+                symm.sb_l2.zero_()
+                sm_bar.local.zero_()
 
             t_fused3 = _bench(
                 lambda: grouped_gemm_combine_bf16(
                     act,
                     d.W2,
-                    mega.l2y,
-                    res.tile_to_group,
-                    mega.sb_l2,
-                    res.origin_rank,
-                    res.origin_slot,
+                    symm.l2_token_buffer,
+                    tile_to_group,
+                    symm.sb_l2,
+                    symm.origin_rank,
+                    symm.origin_slot,
                     comb_addrs,
                     slots,
-                    mega._num_tile_blocks,
+                    num_tile_blocks,
                     output=out3,
-                    comb_local=mega._sm_comb.local,
+                    comb_local=symm.comb,
                     barrier_local=sm_bar.local,
                     barrier_addrs=sm_bar.ptrs,
                     topk_indices=tki,
@@ -344,8 +456,8 @@ def profile_combine(group, args, mode, W1, W2):
                     rank=rank,
                     BM=BM,
                     BN=BN,
-                    num_combine_cu=comm_blocks,
-                    num_reduce_cu=args.reduce_cu,
+                    num_combine_cu=num_combine_cu,
+                    num_reduce_cu=args.num_reduce_cu,
                 ),
                 reset=_reset3,
                 group=group,
@@ -354,7 +466,7 @@ def profile_combine(group, args, mode, W1, W2):
     finally:
         if sm_bar is not None:
             sm_bar.sm.destroy()
-        mega.destroy()  # always free symmetric buffers
+        symm.destroy()  # always free the symmetric buffer (re-allocated per mode)
     # raw per-rank timings + work; rank 0 aggregates across ranks (bottleneck = max latency)
     return {
         "gemm_only_ms": t_gg,
@@ -457,7 +569,7 @@ def benchmark_combine(local_rank, world, args):
                     f3_tf = flops / (f3_ms * 1e-3) / 1e12
                     print(
                         f"  fused3 (+r2) : {f3_ms:8.3f} ms | {f3_tf:7.1f} TFLOPS | "
-                        f"vs fused = {f3_ms / fused_ms:.2f}x (reduce_cu={args.reduce_cu}, PERF ONLY)"
+                        f"vs fused = {f3_ms / fused_ms:.2f}x (num_reduce_cu={args.num_reduce_cu}, PERF ONLY)"
                     )
                     fused3_row = {
                         "fused3 (ms)": f"{f3_ms:.3f}",
@@ -536,19 +648,19 @@ if __name__ == "__main__":
     ap.add_argument("--bn", type=int, default=256)
     # 64 combine CUs is the near-optimum for the fused path in both routing modes
     # (autotune sweep {16,32,48,64,96}); default off uses this single best value.
-    ap.add_argument("--comm-blocks", type=int, default=64)
+    ap.add_argument("--num-combine-cu", type=int, default=64)
     # GROUP_M for the dense roofline reference; default = best, autotune sweeps {1,4,8}.
     ap.add_argument("--dense-group-m", type=int, default=4)
     ap.add_argument(
         "--autotune",
         action="store_true",
         help="sweep combine CUs {16,32,48,64,96} + dense GROUP_M {1,4,8}; "
-        "default off uses --comm-blocks / --dense-group-m (best)",
+        "default off uses --num-combine-cu / --dense-group-m (best)",
     )
     ap.add_argument(
-        "--reduce-cu",
+        "--num-reduce-cu",
         type=int,
-        default=0,
+        default=32,
         help="role-2 topk-reduce blocks; >0 enables the 3-role fused bench (perf only)",
     )
     ap.add_argument(
