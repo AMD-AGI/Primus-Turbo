@@ -1205,9 +1205,19 @@ def _csa_attention_pool_sparse_bwd_partial_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
+    ACCUM_ATOMIC: tl.constexpr = False,
 ):
     """Sparse CSA BWD that writes dpool contributions to a compact
-    ``[B, M, K_topk, D]`` partial buffer **without** atomics.
+    ``[B, M, K_topk, D]`` partial buffer.
+
+    When ``HEAD_Q > BLOCK_H`` the head axis is split across
+    ``cdiv(HEAD_Q, BLOCK_H)`` program blocks, all of which contribute to the
+    *same* ``DPOOL_PARTIAL[b, m, k_slot, :]`` slot (the pool gradient sums over
+    every query head). In that case ``ACCUM_ATOMIC`` must be ``True`` so the
+    per-h-block contributions are summed via ``tl.atomic_add`` (into an fp32
+    zero-initialised buffer) instead of overwriting each other with
+    ``tl.store``. With a single h-block (``HEAD_Q <= BLOCK_H``) each slot has a
+    unique owner and the plain ``tl.store`` fast path is used.
 
     Plan-5 P32: the atomic_add to the shared ``dpool[B, P, D]`` buffer
     was the dominant cost (~15 ms out of ~24 ms — see
@@ -1310,11 +1320,22 @@ def _csa_attention_pool_sparse_bwd_partial_kernel(
             + sparse_k[:, None] * stride_dpk
             + offs_d[None, :] * stride_dpd
         )
-        tl.store(
-            dpool_partial_ptrs,
-            dpool_contrib,
-            mask=(sparse_k[:, None] < K_topk) & q_active,
-        )
+        if ACCUM_ATOMIC:
+            # ``HEAD_Q > BLOCK_H``: multiple head-blocks contribute to the same
+            # (b, m, k_slot) slot — sum them (fp32 zero-initialised buffer)
+            # instead of overwriting via tl.store.
+            tl.atomic_add(
+                dpool_partial_ptrs,
+                dpool_contrib,
+                mask=(sparse_k[:, None] < K_topk) & q_active,
+                sem="relaxed",
+            )
+        else:
+            tl.store(
+                dpool_partial_ptrs,
+                dpool_contrib,
+                mask=(sparse_k[:, None] < K_topk) & q_active,
+            )
 
     # P57 R2: deferred ``sm_scale`` on the dq accumulator. Single
     # ``[BLOCK_H, BLOCK_DMODEL]`` fp32 multiply replaces the per-iter
@@ -1732,6 +1753,14 @@ def _launch_csa_attention_pool_bwd(
     perm32 = None
     bin_ptr = None
     dpool_partial = None
+    # When the head axis is split across more than one program block
+    # (HQ > sparse BLOCK_H), every h-block contributes to the same
+    # ``dpool_partial[b, m, k_slot, :]`` slot, so the partial kernel must
+    # ``atomic_add`` into an fp32 zero-initialised buffer instead of
+    # overwriting with ``tl.store`` (the source of the wrong pool gradient at
+    # HQ=64/128). A single h-block keeps the bf16 + tl.store fast path.
+    sparse_block_h = int(os.getenv("PRIMUS_TURBO_CSA_BWD_SPARSE_BLOCK_H", "32"))
+    partial_needs_atomic = triton.cdiv(HQ, sparse_block_h) > 1
     use_segreduce = use_split_sparse and os.getenv("PRIMUS_TURBO_CSA_BWD_SEGREDUCE", "1") == "1"
     if use_segreduce:
         # P57: ``dpool_partial`` defaults to the INPUT dtype when bf16
@@ -1757,6 +1786,10 @@ def _launch_csa_attention_pool_bwd(
                 partial_dtype = q.dtype
             else:
                 partial_dtype = torch.float32
+        # ``atomic_add`` across head-blocks needs an fp32 buffer (Triton bf16
+        # atomic_add is unsupported on MI355); override any bf16/fp16 choice.
+        if partial_needs_atomic:
+            partial_dtype = torch.float32
         # P57: experimental ``use_sorted_partial`` flips the partial
         # buffer layout from ``[B, M, K_topk, D]`` to
         # ``[B, MK_sorted, D]``. The downstream segreduce kernel can
@@ -1788,7 +1821,12 @@ def _launch_csa_attention_pool_bwd(
                 inv_perm32 = torch.empty_like(perm32)
                 idx_range = torch.arange(MK, device=q.device, dtype=torch.int32).unsqueeze(0).expand(B, -1)
                 inv_perm32.scatter_(1, perm.long(), idx_range)
-        dpool_partial = torch.empty((B, Sq, K_topk, D), device=q.device, dtype=partial_dtype)
+        # Atomic accumulation requires a zero-initialised buffer; the
+        # store fast path can use the cheaper uninitialised ``empty``.
+        if partial_needs_atomic:
+            dpool_partial = torch.zeros((B, Sq, K_topk, D), device=q.device, dtype=partial_dtype)
+        else:
+            dpool_partial = torch.empty((B, Sq, K_topk, D), device=q.device, dtype=partial_dtype)
 
     # Lazily set up an extra CUDA stream for the sparse pool BWD so it
     # can overlap with the local BWD launches (default-stream serial).
@@ -2313,7 +2351,7 @@ def _launch_csa_attention_pool_bwd(
         # MI355 occupancy, while fewer warps + 2 stages reduces register
         # pressure per warp (the dq[BLOCK_H, BLOCK_DMODEL]=fp32
         # accumulator dominates VGPR live range).
-        BLOCK_H = int(os.getenv("PRIMUS_TURBO_CSA_BWD_SPARSE_BLOCK_H", "32"))
+        BLOCK_H = sparse_block_h
         # Plan-5 P32: ``PRIMUS_TURBO_CSA_BWD_SEGREDUCE=1`` is now the
         # default — wins both the standalone CSA BWD microbench
         # (16.31 ms vs 24.83 ms gather/atomic) and the EP8 proxy
@@ -2595,6 +2633,7 @@ def _launch_csa_attention_pool_bwd(
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K_PARTIAL,
                 BLOCK_DMODEL=BLOCK_DMODEL,
+                ACCUM_ATOMIC=partial_needs_atomic,
                 num_warps=int(os.getenv("PRIMUS_TURBO_CSA_BWD_PARTIAL_WARPS", "4")),
                 num_stages=int(os.getenv("PRIMUS_TURBO_CSA_BWD_PARTIAL_STAGES", "3")),
             )

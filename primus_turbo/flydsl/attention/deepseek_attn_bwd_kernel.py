@@ -4,799 +4,537 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""DeepSeek-V4 dense / SWA attention BACKWARD kernel (FlyDSL, design §5).
+"""DeepSeek-V4 attention BACKWARD FlyDSL launcher (ported from Primus).
 
-MFMA INITIAL VERSION (design §5.2, backward campaign round-2): all five backward
-GEMMs run on the ``mfma_f32_16x16x32`` atom (bf16 / fp16 in, fp32 accumulate),
-replacing the round-1 scalar wave-per-row dot + ``shuffle_xor`` dataflow. The
-softmax probabilities are re-materialised from the saved fp32 ``LSE`` (no
-``[Sq, Sk]`` matrix), following standard FlashAttention-2 backward (design §5.1):
+:func:`hca_attention_bwd_flydsl_kernel` is the Primus-Turbo adapter over the
+ported FlyDSL dense / sliding-window-causal (SWA) backward kernels in
+:mod:`primus_turbo.flydsl.attention.kernels`. It runs a fully-FlyDSL three-stage
+backward (no Triton dependency):
 
-    P    = exp(scale * (Q·K) - LSE)          (re-materialised, masked)
-    Dv   = rowsum(dO * O)                     (per-query scalar; torch pre-pass)
-    dP   = dO · V
-    dS   = P * (dP - Dv)
-    dQ  += scale * dS · K
-    dK  += scale * dS · Q
-    dV  += P  · dO
-    dsink_h = -sum_t (exp(sink_h - LSE_t) * Dv_t)   (torch reduction)
+* preprocess — ``D[b,h,m] = sum_d out * dout`` (``build_swa_bwd_preprocess_module``)
+* dQ (+ dsink via atomic add) — ``build_swa_bwd_dq_module``
+* dK / dV (MQA head-loop accumulator) — ``build_swa_bwd_dkv_module``
 
-Three single-wave (64-lane) kernels, atomic-free (mirrors the Triton split BWD).
-Atom is ``A[M,K] x B[N,K] -> C[M,N]`` contracting ``K``; every contraction is a
-multiple of 32 (MFMA-atom requirement, fwd tips). ``BM = 16`` is the WG-owned row
-count, ``BN = 32`` the inner loop block and the accumulation contraction.
+Scope (the dispatcher's ``can_handle`` gates everything else to Triton): bf16,
+``D == 512``, ``swa_window > 0``, ``Sq == Sk``, MQA (``K_H == 1``), optional sink,
+``additive_mask is None`` and ``hca_local_seqlen == 0``. The HCA split-mask
+backward and the CSA backward stay on Triton — the reference does not wire any
+backward, the Primus-Turbo CSA path is MHA (the ported CSA backward kernel
+assumes MQA), and neither is covered by the FlyDSL test parametrisation; the HCA
+/ CSA backward kernel builders are vendored under ``kernels`` for a future round.
 
-* ``kernel_dsk_attn_bwd_dq``  — grid ``(Sq/16, B*HQ)``, owns ``dQ[16,512]``.
-  Loops key-blocks of 32; ``S = Q·Kᵀ`` and ``dP = dO·Vᵀ`` contract ``D = 512``,
-  the softmax / ``dS`` runs per-row (``row = lane%16``) on the LDS-staged tiles,
-  then ``dQ += dS·Kt`` contracts ``BN = 32`` (``Kt`` = host-transposed K-block).
-* ``kernel_dsk_attn_bwd_dk`` / ``..._dv`` — grid ``(Sk/16, B*HQ)``, own
-  ``dK[16,512]`` / ``dV[16,512]``. Loop query-blocks of 32; ``sᵀ = K·Qᵀ`` (and
-  ``dpᵀ = V·dOᵀ`` for dK) give the transposed score tile, the softmax indexes
-  ``lse / Dv`` by column ``m``, then ``dK += dsᵀ·Qt`` / ``dV += pᵀ·dOt`` (``Qt`` /
-  ``dOt`` host-transposed). dK and dV stay separate kernels so each accumulator
-  is ``[16,512] = 128 f32/lane`` (no spill); merging them via a D-split across
-  waves (fwd round-4 pattern) is the next round.
-
-Each WG writes a *per-query-head* ``dK/dV`` slice into ``[B, HQ, Sk, D]``; the
-launcher sums over the head axis for MQA. Host-side ``Kt / Qt / dOt`` transposes
-are cheap contiguous copies. Scope (``can_handle`` in the dispatcher): dense /
-SWA / causal, bf16/fp16, ``D = 512``, MQA / MHA, optional sink, ``additive_mask
-is None`` and ``hca_local_seqlen == 0``. HCA split-mask and CSA backward stay on
-Triton (design §5.4 defers them to a later round).
+Returns ``(dq, dk, dv, dsink)`` in the input dtype (``dsink`` is ``None`` when
+``sink is None``).
 """
 
 from __future__ import annotations
 
-import functools
+import threading
+from typing import Optional, Tuple
 
 import torch
 
-# isort: off
-import flydsl.compiler as flyc
-import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl  # noqa: F401
-from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import ArithValue
+from primus_turbo.flydsl.attention.kernels.csa_bwd_full_kernel import build_csa_bwd_full_module
+from primus_turbo.flydsl.attention.kernels.hca_bwd_dkv_pool_kernel import build_hca_bwd_dkv_pool_module
+from primus_turbo.flydsl.attention.kernels.hca_bwd_dq_pool_kernel import build_hca_bwd_dq_pool_module
+from primus_turbo.flydsl.attention.kernels.sla_bwd_dkv_kernel import build_swa_bwd_dkv_module
+from primus_turbo.flydsl.attention.kernels.sla_bwd_kernel import (
+    build_swa_bwd_dq_module,
+    build_swa_bwd_preprocess_module,
+)
 
-from primus_turbo.flydsl.attention.deepseek_attn_fwd_kernel import _get_compiled
-from primus_turbo.flydsl.utils.attn_helper import LOG2E, NEG_INF, make_value_attrs
-
-# isort: on
-
-# A score at or below this is a NEG_INF sentinel, so its softmax weight is 0.
-_MASK_THRESH = -1.0e29
-
-BM = 16  # WG-owned rows (queries for dQ, keys for dK/dV)
-BN = 32  # inner loop block + MFMA contraction for the accumulation GEMM
-
-
-def _exp2s(x):
-    return (x * fx.Float32(LOG2E)).exp2()
+_PRE_CACHE = {}
+_PRE_LOCK = threading.Lock()
+_DQ_CACHE = {}
+_DQ_LOCK = threading.Lock()
+_DKV_CACHE = {}
+_DKV_LOCK = threading.Lock()
+_DQ_POOL_CACHE = {}
+_DQ_POOL_LOCK = threading.Lock()
+_DKV_POOL_CACHE = {}
+_DKV_POOL_LOCK = threading.Lock()
 
 
-def _ceil(a, b):
-    return ((a + b - 1) // b) * b
+def _get_preprocess(head_dim, dtype_str, block_rows):
+    key = (head_dim, dtype_str, block_rows)
+    with _PRE_LOCK:
+        if key in _PRE_CACHE:
+            return _PRE_CACHE[key]
+        launch = build_swa_bwd_preprocess_module(head_dim=head_dim, dtype_str=dtype_str, block_rows=block_rows)
+        _PRE_CACHE[key] = launch
+        return launch
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# dQ kernel: WG owns BM=16 queries, loops key-blocks of BN=32
-# ─────────────────────────────────────────────────────────────────────────────
-@functools.lru_cache(maxsize=256)
-def _compile_dsk_attn_bwd_dq(
-    D: int,
+def _get_dq(num_heads, head_dim, swa_window, dtype_str, mqa_kv, has_sink):
+    key = (num_heads, head_dim, swa_window, dtype_str, mqa_kv, has_sink)
+    with _DQ_LOCK:
+        if key in _DQ_CACHE:
+            return _DQ_CACHE[key]
+        launch = build_swa_bwd_dq_module(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            swa_window=swa_window,
+            dtype_str=dtype_str,
+            mqa_kv=mqa_kv,
+            has_sink=has_sink,
+        )
+        _DQ_CACHE[key] = launch
+        return launch
+
+
+def _get_dkv(num_heads, head_dim, swa_window, dtype_str, mqa_kv):
+    key = (num_heads, head_dim, swa_window, dtype_str, mqa_kv)
+    with _DKV_LOCK:
+        if key in _DKV_CACHE:
+            return _DKV_CACHE[key]
+        launch = build_swa_bwd_dkv_module(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            swa_window=swa_window,
+            dtype_str=dtype_str,
+            mqa_kv=mqa_kv,
+        )
+        _DKV_CACHE[key] = launch
+        return launch
+
+
+def _get_dq_pool(num_heads, head_dim, pool_size, hca_local_seqlen, dtype_str, mqa_kv):
+    key = (num_heads, head_dim, pool_size, hca_local_seqlen, dtype_str, mqa_kv)
+    with _DQ_POOL_LOCK:
+        if key in _DQ_POOL_CACHE:
+            return _DQ_POOL_CACHE[key]
+        launch = build_hca_bwd_dq_pool_module(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            pool_size=pool_size,
+            hca_local_seqlen=hca_local_seqlen,
+            dtype_str=dtype_str,
+            mqa_kv=mqa_kv,
+        )
+        _DQ_POOL_CACHE[key] = launch
+        return launch
+
+
+def _get_dkv_pool(num_heads, head_dim, pool_size, hca_local_seqlen, dtype_str, mqa_kv):
+    key = (num_heads, head_dim, pool_size, hca_local_seqlen, dtype_str, mqa_kv)
+    with _DKV_POOL_LOCK:
+        if key in _DKV_POOL_CACHE:
+            return _DKV_POOL_CACHE[key]
+        launch = build_hca_bwd_dkv_pool_module(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            pool_size=pool_size,
+            hca_local_seqlen=hca_local_seqlen,
+            dtype_str=dtype_str,
+            mqa_kv=mqa_kv,
+        )
+        _DKV_POOL_CACHE[key] = launch
+        return launch
+
+
+def _run_preprocess(out: torch.Tensor, dout: torch.Tensor) -> torch.Tensor:
+    """D[b,h,m] = sum_d out * dout, fp32, via the FlyDSL preprocess kernel."""
+    B, HQ, Sq, D = out.shape
+    d_buf = torch.empty((B, HQ, Sq), device=out.device, dtype=torch.float32)
+    out_f = out.contiguous().view(-1, D)
+    dout_f = dout.contiguous().view(-1, D)
+    delta_f = d_buf.view(-1)
+    n_rows = out_f.shape[0]
+    dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
+    max_block_threads = 256
+    threads_per_row = D // 8
+    block_rows = 1
+    for br in (8, 4, 2, 1):
+        if n_rows % br == 0 and br * threads_per_row <= max_block_threads:
+            block_rows = br
+            break
+    launch = _get_preprocess(D, dtype_str, block_rows)
+    launch(out_f, dout_f, delta_f, n_rows)
+    return d_buf
+
+
+def _hca_split_mask_bwd(
+    q: torch.Tensor,  # [B, HQ, Sq, D]
+    k: torch.Tensor,  # [B, 1, Sq + P, D] (k_cat = [local | pool], MQA)
+    v: torch.Tensor,  # [B, 1, Sq + P, D]
+    out: torch.Tensor,  # [B, HQ, Sq, D]
+    dout: torch.Tensor,  # [B, HQ, Sq, D]
+    lse: torch.Tensor,  # [B, HQ, Sq] fp32 (raw, JOINT domain)
+    *,
+    sink: Optional[torch.Tensor],
+    swa_window: int,
     scale: float,
-    SWA_WINDOW: int = 0,
-    USE_CAUSAL: bool = True,
-    is_fp16: bool = False,
-    waves_per_eu: int = 2,
-):
-    assert D == 512, "MFMA backward specialises the V4-Flash head_dim D = 512"
-    elem_ty = fx.Float16 if is_fp16 else fx.BFloat16
-    SCALE = float(scale)
-
-    S_BYTES = BM * BN * 4
-    DS_BYTES = BM * BN * 2
-    OFF_DP = S_BYTES
-    OFF_DS = OFF_DP + S_BYTES
-    TOTAL = OFF_DS + DS_BYTES
-
-    @flyc.kernel(known_block_size=[64, 1, 1])
-    def kernel_dsk_attn_bwd_dq(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        KT: fx.Tensor,
-        DOUT: fx.Tensor,
-        LSE: fx.Tensor,
-        DVEC: fx.Tensor,
-        DQ: fx.Tensor,
-        seqlen_q_pad: fx.Int32,
-        seqlen_k: fx.Int32,
-        seqlen_k_pad: fx.Int32,
-        head_q: fx.Int32,
-        head_k: fx.Int32,
-        nkv: fx.Int32,
-    ):
-        pid_m = fx.block_idx.x
-        pid_bh = fx.block_idx.y
-        lane = fx.thread_idx.x % fx.Int32(64)
-        row = lane % fx.Int32(BM)
-
-        bid = pid_bh // head_q
-        qhid = pid_bh % head_q
-        khid = arith.select(head_k == head_q, qhid, fx.Int32(0))
-        kv_bh = bid * head_k + khid
-
-        q_mtiles = seqlen_q_pad // fx.Int32(BM)
-        k_ntiles = seqlen_k_pad // fx.Int32(BN)
-        qo_tile = pid_bh * q_mtiles + pid_m
-        m_glob = pid_m * fx.Int32(BM) + row
-
-        gQ = fx.rocdl.make_buffer_tensor(Q)
-        gK = fx.rocdl.make_buffer_tensor(K)
-        gV = fx.rocdl.make_buffer_tensor(V)
-        gKT = fx.rocdl.make_buffer_tensor(KT)
-        gDO = fx.rocdl.make_buffer_tensor(DOUT)
-        gL = fx.rocdl.make_buffer_tensor(LSE)
-        gD = fx.rocdl.make_buffer_tensor(DVEC)
-        gDQ = fx.rocdl.make_buffer_tensor(DQ)
-
-        alloc = fx.SharedAllocator(static=False)
-        alloc.allocate(TOTAL)
-        base = fx.recast_iter(fx.Uint8, fx.get_dyn_shared())
-        s_lds = fx.make_view(fx.recast_iter(fx.Float32, base), fx.make_layout((BM, BN), (BN, 1)))
-        dp_lds = fx.make_view(
-            fx.recast_iter(fx.Float32, fx.add_offset(base, fx.make_int_tuple(OFF_DP))),
-            fx.make_layout((BM, BN), (BN, 1)),
-        )
-        ds_lds = fx.make_view(
-            fx.recast_iter(elem_ty, fx.add_offset(base, fx.make_int_tuple(OFF_DS))),
-            fx.make_layout((BM, BN), (BN, 1)),
-        )
-
-        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, elem_ty))
-        tmma = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (1, 1, 1)))
-        thr = tmma.thr_slice(lane)
-
-        cpA = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_ty)
-        cpB = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_ty)
-        cpCf = fx.make_copy_atom(fx.UniversalCopy(32), fx.Float32)
-        ucA = fx.make_copy_atom(fx.UniversalCopy(128), elem_ty)
-        tcA = fx.make_tiled_copy_A(cpA, tmma)
-        tcB = fx.make_tiled_copy_B(cpB, tmma)
-        tcCf = fx.make_tiled_copy_C(cpCf, tmma)
-        tcPA = fx.make_tiled_copy_A(ucA, tmma)
-
-        atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        regf = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
-
-        def load_scalar(div, idx):
-            fx.copy(atom_f32, fx.slice(div, (None, idx)), regf)
-            return Vec(fx.memref_load_vec(regf))[0]
-
-        ldiv = fx.logical_divide(gL, fx.make_layout(1, 1))
-        ddiv = fx.logical_divide(gD, fx.make_layout(1, 1))
-        idx_l = pid_bh * seqlen_q_pad + m_glob
-        lse_m = load_scalar(ldiv, idx_l)
-        d_m = load_scalar(ddiv, idx_l)
-
-        bQ = fx.slice(fx.zipped_divide(gQ, fx.make_tile(BM, D)), (None, qo_tile))
-        bDO = fx.slice(fx.zipped_divide(gDO, fx.make_tile(BM, D)), (None, qo_tile))
-        fragQ = thr.make_fragment_A(bQ)
-        fragDO = thr.make_fragment_A(bDO)
-        fx.copy(cpA, tcA.get_slice(lane).partition_S(bQ), tcA.get_slice(lane).retile(fragQ))
-        fx.copy(cpA, tcA.get_slice(lane).partition_S(bDO), tcA.get_slice(lane).retile(fragDO))
-
-        bDQ = fx.slice(fx.zipped_divide(gDQ, fx.make_tile(BM, D)), (None, qo_tile))
-        fragdQ = thr.make_fragment_C(bDQ)
-        fragdQ.fill(0.0)
-
-        sp_tile = fx.slice(fx.zipped_divide(s_lds, fx.make_tile(BM, BN)), (None, fx.Int32(0)))
-        dpp_tile = fx.slice(fx.zipped_divide(dp_lds, fx.make_tile(BM, BN)), (None, fx.Int32(0)))
-        ds_tile = fx.slice(fx.zipped_divide(ds_lds, fx.make_tile(BM, BN)), (None, fx.Int32(0)))
-
-        def process_block(n_blk):
-            n0 = n_blk * fx.Int32(BN)
-            kt = kv_bh * k_ntiles + n_blk
-
-            bK = fx.slice(fx.zipped_divide(gK, fx.make_tile(BN, D)), (None, kt))
-            fragK = thr.make_fragment_B(bK)
-            fx.copy(cpB, tcB.get_slice(lane).partition_S(bK), tcB.get_slice(lane).retile(fragK))
-            fragS = thr.make_fragment_C(sp_tile)
-            fragS.fill(0.0)
-            fx.gemm(mma, fragS, fragQ, fragK, fragS)
-            fx.copy(cpCf, tcCf.get_slice(lane).retile(fragS), tcCf.get_slice(lane).partition_D(sp_tile))
-
-            bV = fx.slice(fx.zipped_divide(gV, fx.make_tile(BN, D)), (None, kt))
-            fragV = thr.make_fragment_B(bV)
-            fx.copy(cpB, tcB.get_slice(lane).partition_S(bV), tcB.get_slice(lane).retile(fragV))
-            fragdP = thr.make_fragment_C(dpp_tile)
-            fragdP.fill(0.0)
-            fx.gemm(mma, fragdP, fragDO, fragV, fragdP)
-            fx.copy(cpCf, tcCf.get_slice(lane).retile(fragdP), tcCf.get_slice(lane).partition_D(dpp_tile))
-            fx.gpu.barrier()
-
-            for c in range_constexpr(BN):
-                ki = n0 + fx.Int32(c)
-                sv = ArithValue(fx.memref_load(s_lds, [row, fx.Int32(c)])) * fx.Float32(SCALE)
-                if const_expr(SWA_WINDOW > 0):
-                    lo = m_glob - fx.Int32(SWA_WINDOW - 1)
-                    vis = (ki >= lo) & (ki <= m_glob) & (ki < seqlen_k)
-                elif const_expr(USE_CAUSAL):
-                    vis = (ki <= m_glob) & (ki < seqlen_k)
-                else:
-                    vis = ki < seqlen_k
-                sv = arith.select(vis, sv, fx.Float32(NEG_INF))
-                p = _exp2s(sv - lse_m)
-                p = arith.select(sv > fx.Float32(_MASK_THRESH), p, fx.Float32(0.0))
-                dpv = ArithValue(fx.memref_load(dp_lds, [row, fx.Int32(c)]))
-                ds = p * (dpv - d_m)
-                if const_expr(is_fp16):
-                    fx.memref_store(fx.Float16(ds), ds_lds, [row, fx.Int32(c)])
-                else:
-                    fx.memref_store(fx.BFloat16(ds), ds_lds, [row, fx.Int32(c)])
-            fx.gpu.barrier()
-
-            kt_seg = kv_bh + n_blk * nkv
-            bKt = fx.slice(fx.zipped_divide(gKT, fx.make_tile(D, BN)), (None, kt_seg))
-            fragDS = thr.make_fragment_A(ds_tile)
-            fragKt = thr.make_fragment_B(bKt)
-            fx.copy(ucA, tcPA.get_slice(lane).partition_S(ds_tile), tcPA.get_slice(lane).retile(fragDS))
-            fx.copy(cpB, tcB.get_slice(lane).partition_S(bKt), tcB.get_slice(lane).retile(fragKt))
-            fx.gemm(mma, fragdQ, fragDS, fragKt, fragdQ)
-            fx.gpu.barrier()
-
-        init = [fx.Float32(0.0)]
-        for nb, st in range(fx.Index(0), fx.Index(k_ntiles), fx.Index(1), init=init):
-            process_block(fx.Int32(nb))
-            st = (yield init)
-
-        vO = Vec(fx.memref_load_vec(fragdQ))
-        fx.memref_store_vec(vO * fx.Float32(SCALE), fragdQ)
-        cpO = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        tcO = fx.make_tiled_copy_C(cpO, tmma)
-        fx.copy(cpO, tcO.get_slice(lane).retile(fragdQ), tcO.get_slice(lane).partition_D(bDQ))
-
-    @flyc.jit
-    def launch_dq(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        KT: fx.Tensor,
-        DOUT: fx.Tensor,
-        LSE: fx.Tensor,
-        DVEC: fx.Tensor,
-        DQ: fx.Tensor,
-        seqlen_q_pad: fx.Int32,
-        seqlen_k: fx.Int32,
-        seqlen_k_pad: fx.Int32,
-        head_q: fx.Int32,
-        head_k: fx.Int32,
-        nkv: fx.Int32,
-        grid_m: fx.Int32,
-        grid_bh: fx.Int32,
-        stream: fx.Stream,
-    ):
-        kernel_dsk_attn_bwd_dq(
-            Q, K, V, KT, DOUT, LSE, DVEC, DQ,
-            seqlen_q_pad, seqlen_k, seqlen_k_pad, head_q, head_k, nkv,
-            value_attrs=make_value_attrs(waves_per_eu, 0, "64,64"),
-        ).launch(grid=(grid_m, grid_bh, 1), block=(64, 1, 1), stream=stream)
-
-    return launch_dq
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# dK kernel: WG owns BM=16 keys, loops query-blocks of BN=32 (transposed softmax)
-# ─────────────────────────────────────────────────────────────────────────────
-@functools.lru_cache(maxsize=256)
-def _compile_dsk_attn_bwd_dk(
-    D: int,
-    scale: float,
-    SWA_WINDOW: int = 0,
-    USE_CAUSAL: bool = True,
-    is_fp16: bool = False,
-    waves_per_eu: int = 2,
-):
-    assert D == 512, "MFMA backward specialises the V4-Flash head_dim D = 512"
-    elem_ty = fx.Float16 if is_fp16 else fx.BFloat16
-    SCALE = float(scale)
-
-    S_BYTES = BM * BN * 4
-    DS_BYTES = BM * BN * 2
-    OFF_DP = S_BYTES
-    OFF_DS = OFF_DP + S_BYTES
-    TOTAL = OFF_DS + DS_BYTES
-
-    @flyc.kernel(known_block_size=[64, 1, 1])
-    def kernel_dsk_attn_bwd_dk(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        QT: fx.Tensor,
-        DOUT: fx.Tensor,
-        LSE: fx.Tensor,
-        DVEC: fx.Tensor,
-        DK: fx.Tensor,
-        seqlen_q: fx.Int32,
-        seqlen_q_pad: fx.Int32,
-        seqlen_k_pad: fx.Int32,
-        head_q: fx.Int32,
-        head_k: fx.Int32,
-        nq: fx.Int32,
-    ):
-        pid_n = fx.block_idx.x
-        pid_bh = fx.block_idx.y
-        lane = fx.thread_idx.x % fx.Int32(64)
-        row = lane % fx.Int32(BM)
-
-        bid = pid_bh // head_q
-        qhid = pid_bh % head_q
-        khid = arith.select(head_k == head_q, qhid, fx.Int32(0))
-        kv_bh = bid * head_k + khid
-
-        k_mtiles = seqlen_k_pad // fx.Int32(BM)
-        q_ntiles = seqlen_q_pad // fx.Int32(BN)
-        kv_tile = kv_bh * k_mtiles + pid_n     # read shared K/V (MQA broadcast)
-        out_tile = pid_bh * k_mtiles + pid_n   # write per-query-head dK slice
-        n_glob = pid_n * fx.Int32(BM) + row
-
-        gQ = fx.rocdl.make_buffer_tensor(Q)
-        gK = fx.rocdl.make_buffer_tensor(K)
-        gV = fx.rocdl.make_buffer_tensor(V)
-        gQT = fx.rocdl.make_buffer_tensor(QT)
-        gDO = fx.rocdl.make_buffer_tensor(DOUT)
-        gL = fx.rocdl.make_buffer_tensor(LSE)
-        gD = fx.rocdl.make_buffer_tensor(DVEC)
-        gDK = fx.rocdl.make_buffer_tensor(DK)
-
-        alloc = fx.SharedAllocator(static=False)
-        alloc.allocate(TOTAL)
-        base = fx.recast_iter(fx.Uint8, fx.get_dyn_shared())
-        s_lds = fx.make_view(fx.recast_iter(fx.Float32, base), fx.make_layout((BM, BN), (BN, 1)))
-        dp_lds = fx.make_view(
-            fx.recast_iter(fx.Float32, fx.add_offset(base, fx.make_int_tuple(OFF_DP))),
-            fx.make_layout((BM, BN), (BN, 1)),
-        )
-        ds_lds = fx.make_view(
-            fx.recast_iter(elem_ty, fx.add_offset(base, fx.make_int_tuple(OFF_DS))),
-            fx.make_layout((BM, BN), (BN, 1)),
-        )
-
-        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, elem_ty))
-        tmma = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (1, 1, 1)))
-        thr = tmma.thr_slice(lane)
-
-        cpA = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_ty)
-        cpB = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_ty)
-        cpCf = fx.make_copy_atom(fx.UniversalCopy(32), fx.Float32)
-        ucA = fx.make_copy_atom(fx.UniversalCopy(128), elem_ty)
-        tcA = fx.make_tiled_copy_A(cpA, tmma)
-        tcB = fx.make_tiled_copy_B(cpB, tmma)
-        tcCf = fx.make_tiled_copy_C(cpCf, tmma)
-        tcPA = fx.make_tiled_copy_A(ucA, tmma)
-
-        atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        regf = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
-
-        def load_scalar(div, idx):
-            fx.copy(atom_f32, fx.slice(div, (None, idx)), regf)
-            return Vec(fx.memref_load_vec(regf))[0]
-
-        ldiv = fx.logical_divide(gL, fx.make_layout(1, 1))
-        ddiv = fx.logical_divide(gD, fx.make_layout(1, 1))
-
-        bK = fx.slice(fx.zipped_divide(gK, fx.make_tile(BM, D)), (None, kv_tile))
-        bV = fx.slice(fx.zipped_divide(gV, fx.make_tile(BM, D)), (None, kv_tile))
-        fragK = thr.make_fragment_A(bK)
-        fragV = thr.make_fragment_A(bV)
-        fx.copy(cpA, tcA.get_slice(lane).partition_S(bK), tcA.get_slice(lane).retile(fragK))
-        fx.copy(cpA, tcA.get_slice(lane).partition_S(bV), tcA.get_slice(lane).retile(fragV))
-
-        bDK = fx.slice(fx.zipped_divide(gDK, fx.make_tile(BM, D)), (None, out_tile))
-        fragdK = thr.make_fragment_C(bDK)
-        fragdK.fill(0.0)
-
-        sp_tile = fx.slice(fx.zipped_divide(s_lds, fx.make_tile(BM, BN)), (None, fx.Int32(0)))
-        dpp_tile = fx.slice(fx.zipped_divide(dp_lds, fx.make_tile(BM, BN)), (None, fx.Int32(0)))
-        ds_tile = fx.slice(fx.zipped_divide(ds_lds, fx.make_tile(BM, BN)), (None, fx.Int32(0)))
-
-        def process_block(m_blk):
-            m0 = m_blk * fx.Int32(BN)
-            qt = pid_bh * q_ntiles + m_blk
-
-            bQ = fx.slice(fx.zipped_divide(gQ, fx.make_tile(BN, D)), (None, qt))
-            fragQ = thr.make_fragment_B(bQ)
-            fx.copy(cpB, tcB.get_slice(lane).partition_S(bQ), tcB.get_slice(lane).retile(fragQ))
-            fragS = thr.make_fragment_C(sp_tile)
-            fragS.fill(0.0)
-            fx.gemm(mma, fragS, fragK, fragQ, fragS)
-            fx.copy(cpCf, tcCf.get_slice(lane).retile(fragS), tcCf.get_slice(lane).partition_D(sp_tile))
-
-            bDO = fx.slice(fx.zipped_divide(gDO, fx.make_tile(BN, D)), (None, qt))
-            fragDO = thr.make_fragment_B(bDO)
-            fx.copy(cpB, tcB.get_slice(lane).partition_S(bDO), tcB.get_slice(lane).retile(fragDO))
-            fragdP = thr.make_fragment_C(dpp_tile)
-            fragdP.fill(0.0)
-            fx.gemm(mma, fragdP, fragV, fragDO, fragdP)
-            fx.copy(cpCf, tcCf.get_slice(lane).retile(fragdP), tcCf.get_slice(lane).partition_D(dpp_tile))
-            fx.gpu.barrier()
-
-            for c in range_constexpr(BN):
-                mm = m0 + fx.Int32(c)
-                idx_l = pid_bh * seqlen_q_pad + mm
-                lse_m = load_scalar(ldiv, idx_l)
-                d_m = load_scalar(ddiv, idx_l)
-                sv = ArithValue(fx.memref_load(s_lds, [row, fx.Int32(c)])) * fx.Float32(SCALE)
-                if const_expr(SWA_WINDOW > 0):
-                    lo = mm - fx.Int32(SWA_WINDOW - 1)
-                    vis = (n_glob >= lo) & (n_glob <= mm) & (mm < seqlen_q)
-                elif const_expr(USE_CAUSAL):
-                    vis = (n_glob <= mm) & (mm < seqlen_q)
-                else:
-                    vis = mm < seqlen_q
-                sv = arith.select(vis, sv, fx.Float32(NEG_INF))
-                p = _exp2s(sv - lse_m)
-                p = arith.select(sv > fx.Float32(_MASK_THRESH), p, fx.Float32(0.0))
-                dpv = ArithValue(fx.memref_load(dp_lds, [row, fx.Int32(c)]))
-                ds = p * (dpv - d_m)
-                if const_expr(is_fp16):
-                    fx.memref_store(fx.Float16(ds), ds_lds, [row, fx.Int32(c)])
-                else:
-                    fx.memref_store(fx.BFloat16(ds), ds_lds, [row, fx.Int32(c)])
-            fx.gpu.barrier()
-
-            qt_seg = pid_bh + m_blk * nq
-            bQt = fx.slice(fx.zipped_divide(gQT, fx.make_tile(D, BN)), (None, qt_seg))
-            fragDS = thr.make_fragment_A(ds_tile)
-            fragQt = thr.make_fragment_B(bQt)
-            fx.copy(ucA, tcPA.get_slice(lane).partition_S(ds_tile), tcPA.get_slice(lane).retile(fragDS))
-            fx.copy(cpB, tcB.get_slice(lane).partition_S(bQt), tcB.get_slice(lane).retile(fragQt))
-            fx.gemm(mma, fragdK, fragDS, fragQt, fragdK)
-            fx.gpu.barrier()
-
-        init = [fx.Float32(0.0)]
-        for mb, st in range(fx.Index(0), fx.Index(q_ntiles), fx.Index(1), init=init):
-            process_block(fx.Int32(mb))
-            st = (yield init)
-
-        vO = Vec(fx.memref_load_vec(fragdK))
-        fx.memref_store_vec(vO * fx.Float32(SCALE), fragdK)
-        cpO = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        tcO = fx.make_tiled_copy_C(cpO, tmma)
-        fx.copy(cpO, tcO.get_slice(lane).retile(fragdK), tcO.get_slice(lane).partition_D(bDK))
-
-    @flyc.jit
-    def launch_dk(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        QT: fx.Tensor,
-        DOUT: fx.Tensor,
-        LSE: fx.Tensor,
-        DVEC: fx.Tensor,
-        DK: fx.Tensor,
-        seqlen_q: fx.Int32,
-        seqlen_q_pad: fx.Int32,
-        seqlen_k_pad: fx.Int32,
-        head_q: fx.Int32,
-        head_k: fx.Int32,
-        nq: fx.Int32,
-        grid_n: fx.Int32,
-        grid_bh: fx.Int32,
-        stream: fx.Stream,
-    ):
-        kernel_dsk_attn_bwd_dk(
-            Q, K, V, QT, DOUT, LSE, DVEC, DK,
-            seqlen_q, seqlen_q_pad, seqlen_k_pad, head_q, head_k, nq,
-            value_attrs=make_value_attrs(waves_per_eu, 0, "64,64"),
-        ).launch(grid=(grid_n, grid_bh, 1), block=(64, 1, 1), stream=stream)
-
-    return launch_dk
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# dV kernel: WG owns BM=16 keys, loops query-blocks of BN=32 (transposed softmax)
-# ─────────────────────────────────────────────────────────────────────────────
-@functools.lru_cache(maxsize=256)
-def _compile_dsk_attn_bwd_dv(
-    D: int,
-    scale: float,
-    SWA_WINDOW: int = 0,
-    USE_CAUSAL: bool = True,
-    is_fp16: bool = False,
-    waves_per_eu: int = 2,
-):
-    assert D == 512, "MFMA backward specialises the V4-Flash head_dim D = 512"
-    elem_ty = fx.Float16 if is_fp16 else fx.BFloat16
-    SCALE = float(scale)
-
-    S_BYTES = BM * BN * 4
-    P_BYTES = BM * BN * 2
-    OFF_P = S_BYTES
-    TOTAL = OFF_P + P_BYTES
-
-    @flyc.kernel(known_block_size=[64, 1, 1])
-    def kernel_dsk_attn_bwd_dv(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        DOUTT: fx.Tensor,
-        LSE: fx.Tensor,
-        DV: fx.Tensor,
-        seqlen_q: fx.Int32,
-        seqlen_q_pad: fx.Int32,
-        seqlen_k_pad: fx.Int32,
-        head_q: fx.Int32,
-        head_k: fx.Int32,
-        nq: fx.Int32,
-    ):
-        pid_n = fx.block_idx.x
-        pid_bh = fx.block_idx.y
-        lane = fx.thread_idx.x % fx.Int32(64)
-        row = lane % fx.Int32(BM)
-
-        bid = pid_bh // head_q
-        qhid = pid_bh % head_q
-        khid = arith.select(head_k == head_q, qhid, fx.Int32(0))
-        kv_bh = bid * head_k + khid
-
-        k_mtiles = seqlen_k_pad // fx.Int32(BM)
-        q_ntiles = seqlen_q_pad // fx.Int32(BN)
-        kv_tile = kv_bh * k_mtiles + pid_n
-        out_tile = pid_bh * k_mtiles + pid_n
-        n_glob = pid_n * fx.Int32(BM) + row
-
-        gQ = fx.rocdl.make_buffer_tensor(Q)
-        gK = fx.rocdl.make_buffer_tensor(K)
-        gDOT = fx.rocdl.make_buffer_tensor(DOUTT)
-        gL = fx.rocdl.make_buffer_tensor(LSE)
-        gDV = fx.rocdl.make_buffer_tensor(DV)
-
-        alloc = fx.SharedAllocator(static=False)
-        alloc.allocate(TOTAL)
-        base = fx.recast_iter(fx.Uint8, fx.get_dyn_shared())
-        s_lds = fx.make_view(fx.recast_iter(fx.Float32, base), fx.make_layout((BM, BN), (BN, 1)))
-        p_lds = fx.make_view(
-            fx.recast_iter(elem_ty, fx.add_offset(base, fx.make_int_tuple(OFF_P))),
-            fx.make_layout((BM, BN), (BN, 1)),
-        )
-
-        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, elem_ty))
-        tmma = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (1, 1, 1)))
-        thr = tmma.thr_slice(lane)
-
-        cpA = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_ty)
-        cpB = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_ty)
-        cpCf = fx.make_copy_atom(fx.UniversalCopy(32), fx.Float32)
-        ucA = fx.make_copy_atom(fx.UniversalCopy(128), elem_ty)
-        tcA = fx.make_tiled_copy_A(cpA, tmma)
-        tcB = fx.make_tiled_copy_B(cpB, tmma)
-        tcCf = fx.make_tiled_copy_C(cpCf, tmma)
-        tcPA = fx.make_tiled_copy_A(ucA, tmma)
-
-        atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        regf = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
-
-        def load_scalar(div, idx):
-            fx.copy(atom_f32, fx.slice(div, (None, idx)), regf)
-            return Vec(fx.memref_load_vec(regf))[0]
-
-        ldiv = fx.logical_divide(gL, fx.make_layout(1, 1))
-
-        bK = fx.slice(fx.zipped_divide(gK, fx.make_tile(BM, D)), (None, kv_tile))
-        fragK = thr.make_fragment_A(bK)
-        fx.copy(cpA, tcA.get_slice(lane).partition_S(bK), tcA.get_slice(lane).retile(fragK))
-
-        bDV = fx.slice(fx.zipped_divide(gDV, fx.make_tile(BM, D)), (None, out_tile))
-        fragdV = thr.make_fragment_C(bDV)
-        fragdV.fill(0.0)
-
-        sp_tile = fx.slice(fx.zipped_divide(s_lds, fx.make_tile(BM, BN)), (None, fx.Int32(0)))
-        p_tile = fx.slice(fx.zipped_divide(p_lds, fx.make_tile(BM, BN)), (None, fx.Int32(0)))
-
-        def process_block(m_blk):
-            m0 = m_blk * fx.Int32(BN)
-            qt = pid_bh * q_ntiles + m_blk
-
-            bQ = fx.slice(fx.zipped_divide(gQ, fx.make_tile(BN, D)), (None, qt))
-            fragQ = thr.make_fragment_B(bQ)
-            fx.copy(cpB, tcB.get_slice(lane).partition_S(bQ), tcB.get_slice(lane).retile(fragQ))
-            fragS = thr.make_fragment_C(sp_tile)
-            fragS.fill(0.0)
-            fx.gemm(mma, fragS, fragK, fragQ, fragS)
-            fx.copy(cpCf, tcCf.get_slice(lane).retile(fragS), tcCf.get_slice(lane).partition_D(sp_tile))
-            fx.gpu.barrier()
-
-            for c in range_constexpr(BN):
-                mm = m0 + fx.Int32(c)
-                idx_l = pid_bh * seqlen_q_pad + mm
-                lse_m = load_scalar(ldiv, idx_l)
-                sv = ArithValue(fx.memref_load(s_lds, [row, fx.Int32(c)])) * fx.Float32(SCALE)
-                if const_expr(SWA_WINDOW > 0):
-                    lo = mm - fx.Int32(SWA_WINDOW - 1)
-                    vis = (n_glob >= lo) & (n_glob <= mm) & (mm < seqlen_q)
-                elif const_expr(USE_CAUSAL):
-                    vis = (n_glob <= mm) & (mm < seqlen_q)
-                else:
-                    vis = mm < seqlen_q
-                sv = arith.select(vis, sv, fx.Float32(NEG_INF))
-                p = _exp2s(sv - lse_m)
-                p = arith.select(sv > fx.Float32(_MASK_THRESH), p, fx.Float32(0.0))
-                if const_expr(is_fp16):
-                    fx.memref_store(fx.Float16(p), p_lds, [row, fx.Int32(c)])
-                else:
-                    fx.memref_store(fx.BFloat16(p), p_lds, [row, fx.Int32(c)])
-            fx.gpu.barrier()
-
-            qt_seg = pid_bh + m_blk * nq
-            bDOt = fx.slice(fx.zipped_divide(gDOT, fx.make_tile(D, BN)), (None, qt_seg))
-            fragP = thr.make_fragment_A(p_tile)
-            fragDOt = thr.make_fragment_B(bDOt)
-            fx.copy(ucA, tcPA.get_slice(lane).partition_S(p_tile), tcPA.get_slice(lane).retile(fragP))
-            fx.copy(cpB, tcB.get_slice(lane).partition_S(bDOt), tcB.get_slice(lane).retile(fragDOt))
-            fx.gemm(mma, fragdV, fragP, fragDOt, fragdV)
-            fx.gpu.barrier()
-
-        init = [fx.Float32(0.0)]
-        for mb, st in range(fx.Index(0), fx.Index(q_ntiles), fx.Index(1), init=init):
-            process_block(fx.Int32(mb))
-            st = (yield init)
-
-        cpO = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        tcO = fx.make_tiled_copy_C(cpO, tmma)
-        fx.copy(cpO, tcO.get_slice(lane).retile(fragdV), tcO.get_slice(lane).partition_D(bDV))
-
-    @flyc.jit
-    def launch_dv(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        DOUTT: fx.Tensor,
-        LSE: fx.Tensor,
-        DV: fx.Tensor,
-        seqlen_q: fx.Int32,
-        seqlen_q_pad: fx.Int32,
-        seqlen_k_pad: fx.Int32,
-        head_q: fx.Int32,
-        head_k: fx.Int32,
-        nq: fx.Int32,
-        grid_n: fx.Int32,
-        grid_bh: fx.Int32,
-        stream: fx.Stream,
-    ):
-        kernel_dsk_attn_bwd_dv(
-            Q, K, DOUTT, LSE, DV,
-            seqlen_q, seqlen_q_pad, seqlen_k_pad, head_q, head_k, nq,
-            value_attrs=make_value_attrs(waves_per_eu, 0, "64,64"),
-        ).launch(grid=(grid_n, grid_bh, 1), block=(64, 1, 1), stream=stream)
-
-    return launch_dv
+    additive_mask: torch.Tensor,  # [Sq, P] pool-only additive mask
+    hca_local_seqlen: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """HCA split-mask backward (MQA, bf16).
+
+    The HCA forward runs one joint online softmax over the local sliding-window
+    keys (``k[:, :, :Sq]``) and the compressed pool keys (``k[:, :, Sq:Sq+P]``,
+    biased by ``additive_mask``) plus the optional sink. The gradient splits by
+    region:
+
+    * dQ = local-stream dQ (SWA dq kernel) + pool-stream dQ (pool dq kernel,
+      accumulated into the same fp32 buffer). The sink gradient comes from the
+      local dq kernel (the pool stream never touches the sink).
+    * dK / dV: the local rows from the SWA dkv kernel, the pool rows from the
+      pool dkv kernel (atomic-add into the pool slice), then concatenated.
+
+    Both streams consume the JOINT fp32 LSE / delta, so each stream's
+    ``exp(qk*scale [+bias] - lse)`` is already the correct joint probability.
+    """
+    B, HQ, Sq, D = q.shape
+    HK, Sk = k.shape[1], k.shape[2]
+    pool_size = int(Sk) - int(hca_local_seqlen)
+    if pool_size <= 0:
+        raise NotImplementedError("HCA pool backward requires Sk > hca_local_seqlen")
+    if int(hca_local_seqlen) != Sq:
+        raise NotImplementedError("HCA pool backward requires hca_local_seqlen == Sq")
+
+    dtype_str = "bf16"
+    swa_window_int = int(swa_window)
+    has_sink = sink is not None
+
+    q_c = q.contiguous()
+    k_cat = k.contiguous()
+    v_cat = v.contiguous()
+    dout_c = dout.contiguous()
+    lse_c = lse.contiguous()
+    # Pool kernels read ADD_MASK in the input element type (bf16/f16).
+    add_mask = additive_mask.to(q.dtype).contiguous()
+
+    k_local = k_cat[:, :, :Sq, :].contiguous()
+    v_local = v_cat[:, :, :Sq, :].contiguous()
+
+    d_buf = _run_preprocess(out.contiguous(), dout_c)
+
+    # ---- dQ: local stream (SWA dq + sink), then pool stream (accumulate) ----
+    dq_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
+    dsink_fp32 = torch.zeros((HQ,), device=q.device, dtype=torch.float32)
+    if has_sink:
+        sink_arg = sink.to(torch.float32) if sink.dtype != torch.float32 else sink.contiguous()
+    else:
+        sink_arg = torch.zeros((HQ,), device=q.device, dtype=torch.float32)
+
+    dq_local_launch = _get_dq(HQ, D, swa_window_int, dtype_str, True, has_sink)
+    dq_local_launch(
+        q_c,
+        k_local,
+        v_local,
+        dout_c,
+        lse_c,
+        d_buf,
+        dq_fp32,
+        dsink_fp32,
+        sink_arg,
+        int(B),
+        int(Sq),
+        int(Sq),
+    )
+
+    dq_pool_launch = _get_dq_pool(HQ, D, int(pool_size), int(hca_local_seqlen), dtype_str, True)
+    dq_pool_launch(
+        q_c,
+        k_cat,
+        v_cat,
+        dout_c,
+        lse_c,
+        d_buf,
+        dq_fp32,
+        add_mask,
+        int(B),
+        int(Sq),
+        int(Sk),
+    )
+
+    # ---- dK / dV: local stream rows, then pool stream rows (atomic-add) ----
+    dk_local_fp32 = torch.zeros((B, HK, Sq, D), device=q.device, dtype=torch.float32)
+    dv_local_fp32 = torch.zeros((B, HK, Sq, D), device=q.device, dtype=torch.float32)
+    dkv_local_launch = _get_dkv(HQ, D, swa_window_int, dtype_str, True)
+    dkv_local_launch(
+        q_c,
+        k_local,
+        v_local,
+        dout_c,
+        lse_c,
+        d_buf,
+        dk_local_fp32,
+        dv_local_fp32,
+        int(B),
+        int(Sq),
+        int(Sq),
+    )
+
+    # Pool kernel atomic-adds into rows [hca_local_seqlen, hca_local_seqlen+P)
+    # of these full-length [B, HK, Sk, D] buffers (the local rows stay zero).
+    dk_pool_fp32 = torch.zeros((B, HK, Sk, D), device=q.device, dtype=torch.float32)
+    dv_pool_fp32 = torch.zeros((B, HK, Sk, D), device=q.device, dtype=torch.float32)
+    dkv_pool_launch = _get_dkv_pool(HQ, D, int(pool_size), int(hca_local_seqlen), dtype_str, True)
+    dkv_pool_launch(
+        q_c,
+        k_cat,
+        v_cat,
+        dout_c,
+        lse_c,
+        d_buf,
+        dk_pool_fp32,
+        dv_pool_fp32,
+        add_mask,
+        int(B),
+        int(Sq),
+        int(Sk),
+    )
+
+    dk_out = torch.cat([dk_local_fp32, dk_pool_fp32[:, :, hca_local_seqlen:, :]], dim=2).to(k.dtype)
+    dv_out = torch.cat([dv_local_fp32, dv_pool_fp32[:, :, hca_local_seqlen:, :]], dim=2).to(v.dtype)
+    dq_out = dq_fp32.to(q.dtype)
+    dsink_out = dsink_fp32.to(sink.dtype) if has_sink else None
+    return dq_out, dk_out, dv_out, dsink_out
 
 
 def hca_attention_bwd_flydsl_kernel(
-    q: torch.Tensor,  # [B, H, Sq, D]
-    k: torch.Tensor,  # [B, K_H, Sk, D]
-    v: torch.Tensor,  # [B, K_H, Sk, D]
-    out: torch.Tensor,  # [B, H, Sq, D] (FWD output)
-    dout: torch.Tensor,  # [B, H, Sq, D]
-    lse: torch.Tensor,  # [B, H, Sq] fp32
+    q: torch.Tensor,  # [B, HQ, Sq, D]
+    k: torch.Tensor,  # [B, 1, Sk, D] (MQA)
+    v: torch.Tensor,  # [B, 1, Sk, D]
+    out: torch.Tensor,  # [B, HQ, Sq, D]
+    dout: torch.Tensor,  # [B, HQ, Sq, D]
+    lse: torch.Tensor,  # [B, HQ, Sq] fp32 (raw domain)
     *,
-    sink=None,  # [H] or None
+    sink: Optional[torch.Tensor],
     swa_window: int,
-    additive_mask=None,
+    additive_mask: Optional[torch.Tensor],
     scale: float,
     hca_local_seqlen: int = 0,
-):
-    """FlyDSL dense / SWA attention backward; returns ``(dq, dk, dv, dsink)``.
-
-    Mirrors the Triton ``_launch_hca_attention_bwd`` contract. Scope (gated by
-    the dispatcher ``can_handle``): dense / SWA / causal, ``D = 512``, MQA / MHA,
-    optional sink, ``additive_mask is None`` and ``hca_local_seqlen == 0`` (HCA
-    split-mask and CSA backward stay on Triton).
-    """
-    if additive_mask is not None or int(hca_local_seqlen) != 0:
-        raise ValueError(
-            "FlyDSL attention backward handles only the dense / SWA path; HCA "
-            "split-mask and additive bias stay on Triton."
-        )
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Dense / SWA backward via the ported FlyDSL kernels (MQA, bf16)."""
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("rank-4 q/k/v required")
+    if dout.shape != out.shape or out.shape != q.shape:
+        raise ValueError("shape mismatch among q / out / dout")
     B, HQ, Sq, D = q.shape
     HK, Sk = k.shape[1], k.shape[2]
-    if D != 512:
-        raise ValueError(f"FlyDSL attention backward specialises D = 512; got {D}.")
-    if q.dtype not in (torch.bfloat16, torch.float16) or not (q.dtype == k.dtype == v.dtype):
-        raise ValueError("FlyDSL attention backward requires matching bf16/fp16 q/k/v.")
+    if k.shape != (B, HK, Sk, D) or v.shape != k.shape:
+        raise ValueError("k/v shape mismatch")
+    if q.dtype != torch.bfloat16:
+        raise NotImplementedError("bf16 only")
+    if HK != 1:
+        raise NotImplementedError("FlyDSL dense backward supports MQA (K_H == 1) only")
+    if int(swa_window) <= 0:
+        raise NotImplementedError("swa_window > 0 required")
 
-    is_fp16 = q.dtype == torch.float16
-    use_causal = swa_window <= 0
-    swa_cx = int(swa_window) if swa_window > 0 else 0
+    # HCA split-mask backward: joint softmax over [local SWA | pool]. Composed
+    # from the local SWA dq/dkv kernels (fed the joint LSE) + the ported HCA
+    # pool dq/dkv kernels.
+    if additive_mask is not None and int(hca_local_seqlen) > 0:
+        return _hca_split_mask_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            sink=sink,
+            swa_window=int(swa_window),
+            scale=scale,
+            additive_mask=additive_mask,
+            hca_local_seqlen=int(hca_local_seqlen),
+        )
+    if additive_mask is not None or int(hca_local_seqlen) != 0:
+        raise NotImplementedError(
+            "HCA split-mask backward needs both additive_mask and hca_local_seqlen"
+        )
+    if Sq != Sk:
+        raise NotImplementedError("SWA requires Sq == Sk")
 
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    out = out.contiguous()
-    dout = dout.contiguous()
-    lse = lse.contiguous()
+    has_sink = sink is not None
+    swa_window_int = int(swa_window)
+    dtype_str = "bf16"
 
-    Sq_pad = _ceil(Sq, BN)
-    Sk_pad = _ceil(Sk, BN)
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    dout_c = dout.contiguous()
+    lse_c = lse.contiguous()
 
-    def pad_seq(t, target):
-        pad = target - t.shape[2]
-        return torch.nn.functional.pad(t, (0, 0, 0, pad)) if pad else t
-
-    qp = pad_seq(q, Sq_pad)
-    dop = pad_seq(dout, Sq_pad)
-    kp = pad_seq(k, Sk_pad)
-    vp = pad_seq(v, Sk_pad)
-
-    # Host-side transposes feeding the accumulation GEMMs (B operands).
-    ktp = kp.transpose(-1, -2).contiguous()   # [B, HK, D, Sk_pad]   (dQ)
-    qtp = qp.transpose(-1, -2).contiguous()   # [B, HQ, D, Sq_pad]   (dK)
-    dotp = dop.transpose(-1, -2).contiguous()  # [B, HQ, D, Sq_pad]  (dV)
-
-    # Dv_i = rowsum(dO * O) and dsink are cheap per-row reductions (torch).
-    d_vec = (dout.to(torch.float32) * out.to(torch.float32)).sum(-1)  # [B, HQ, Sq]
-    lse_p = torch.nn.functional.pad(lse, (0, Sq_pad - Sq)) if Sq_pad != Sq else lse
-    dvec_p = torch.nn.functional.pad(d_vec, (0, Sq_pad - Sq)) if Sq_pad != Sq else d_vec
-
-    dq_f32 = torch.zeros((B, HQ, Sq_pad, D), device=q.device, dtype=torch.float32)
-    dk_head = torch.zeros((B, HQ, Sk_pad, D), device=q.device, dtype=torch.float32)
-    dv_head = torch.zeros((B, HQ, Sk_pad, D), device=q.device, dtype=torch.float32)
-
-    stream = torch.cuda.current_stream()
-
-    launch_dq = _compile_dsk_attn_bwd_dq(
-        D=D, scale=float(scale), SWA_WINDOW=swa_cx, USE_CAUSAL=use_causal, is_fp16=is_fp16
-    )
-    launch_dk = _compile_dsk_attn_bwd_dk(
-        D=D, scale=float(scale), SWA_WINDOW=swa_cx, USE_CAUSAL=use_causal, is_fp16=is_fp16
-    )
-    launch_dv = _compile_dsk_attn_bwd_dv(
-        D=D, scale=float(scale), SWA_WINDOW=swa_cx, USE_CAUSAL=use_causal, is_fp16=is_fp16
-    )
-
-    dq_args = (
-        qp.reshape(-1, D), kp.reshape(-1, D), vp.reshape(-1, D), ktp.reshape(-1, Sk_pad),
-        dop.reshape(-1, D), lse_p.reshape(-1), dvec_p.reshape(-1), dq_f32.reshape(-1, D),
-        Sq_pad, Sk, Sk_pad, HQ, HK, B * HK,
-        Sq_pad // BM, B * HQ, stream,
-    )
-    _get_compiled(launch_dq, dq_args)(*dq_args)
-
-    dk_args = (
-        qp.reshape(-1, D), kp.reshape(-1, D), vp.reshape(-1, D), qtp.reshape(-1, Sq_pad),
-        dop.reshape(-1, D), lse_p.reshape(-1), dvec_p.reshape(-1), dk_head.reshape(-1, D),
-        Sq, Sq_pad, Sk_pad, HQ, HK, B * HQ,
-        Sk_pad // BM, B * HQ, stream,
-    )
-    _get_compiled(launch_dk, dk_args)(*dk_args)
-
-    dv_args = (
-        qp.reshape(-1, D), kp.reshape(-1, D), dotp.reshape(-1, Sq_pad),
-        lse_p.reshape(-1), dv_head.reshape(-1, D),
-        Sq, Sq_pad, Sk_pad, HQ, HK, B * HQ,
-        Sk_pad // BM, B * HQ, stream,
-    )
-    _get_compiled(launch_dv, dv_args)(*dv_args)
-
-    dq = dq_f32[:, :, :Sq, :].to(q.dtype)
-    dk_head = dk_head[:, :, :Sk, :]
-    dv_head = dv_head[:, :, :Sk, :]
-    if HK == 1:
-        dk = dk_head.sum(dim=1, keepdim=True).to(k.dtype)
-        dv = dv_head.sum(dim=1, keepdim=True).to(v.dtype)
+    dq_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
+    dk_fp32 = torch.zeros((B, HK, Sk, D), device=q.device, dtype=torch.float32)
+    dv_fp32 = torch.zeros((B, HK, Sk, D), device=q.device, dtype=torch.float32)
+    dsink_fp32 = torch.zeros((HQ,), device=q.device, dtype=torch.float32)
+    if has_sink:
+        sink_arg = sink.to(torch.float32) if sink.dtype != torch.float32 else sink.contiguous()
     else:
-        dk = dk_head.to(k.dtype)
-        dv = dv_head.to(v.dtype)
+        sink_arg = torch.zeros((HQ,), device=q.device, dtype=torch.float32)
 
-    if sink is not None:
-        sink_f = sink.to(torch.float32).reshape(1, HQ, 1)
-        p_sink = torch.exp(sink_f - lse)  # [B, HQ, Sq]
-        dsink = -(p_sink * d_vec).sum(dim=(0, 2)).to(sink.dtype)
+    d_buf = _run_preprocess(out.contiguous(), dout_c)
+
+    dq_launch = _get_dq(HQ, D, swa_window_int, dtype_str, True, has_sink)
+    dq_launch(
+        q_c,
+        k_c,
+        v_c,
+        dout_c,
+        lse_c,
+        d_buf,
+        dq_fp32,
+        dsink_fp32,
+        sink_arg,
+        int(B),
+        int(Sq),
+        int(Sk),
+    )
+
+    dkv_launch = _get_dkv(HQ, D, swa_window_int, dtype_str, True)
+    dkv_launch(
+        q_c,
+        k_c,
+        v_c,
+        dout_c,
+        lse_c,
+        d_buf,
+        dk_fp32,
+        dv_fp32,
+        int(B),
+        int(Sq),
+        int(Sk),
+    )
+
+    dq_out = dq_fp32.to(q.dtype)
+    dk_out = dk_fp32.to(k.dtype)
+    dv_out = dv_fp32.to(v.dtype)
+    dsink_out = dsink_fp32.to(sink.dtype) if has_sink else None
+    return dq_out, dk_out, dv_out, dsink_out
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# CSA fused backward (pre-gathered top-K), one-launch full output set
+# ───────────────────────────────────────────────────────────────────────────
+
+_CSA_BWD_CACHE = {}
+_CSA_BWD_LOCK = threading.Lock()
+
+
+def _get_csa_bwd_full(num_heads, head_dim, swa_window, dtype_str, has_sink, has_sparse, mqa_kv):
+    key = (num_heads, head_dim, swa_window, dtype_str, has_sink, has_sparse, mqa_kv)
+    with _CSA_BWD_LOCK:
+        if key in _CSA_BWD_CACHE:
+            return _CSA_BWD_CACHE[key]
+        launch = build_csa_bwd_full_module(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            swa_window=swa_window,
+            dtype_str=dtype_str,
+            has_sink=has_sink,
+            has_sparse=has_sparse,
+            block_n=32,
+            block_k=32,
+            mqa_kv=mqa_kv,
+        )
+        _CSA_BWD_CACHE[key] = launch
+        return launch
+
+
+def csa_attention_bwd_flydsl_kernel(
+    q: torch.Tensor,  # [B, HQ, Sq, D]
+    k_local: torch.Tensor,  # [B, K_H, Sq, D]   K_H in {1, HQ}
+    v_local: torch.Tensor,  # [B, K_H, Sq, D]
+    gathered: torch.Tensor,  # [B, Sq, K_topk, D]
+    sparse_mask: torch.Tensor,  # [B, Sq, K_topk]
+    out: torch.Tensor,  # [B, HQ, Sq, D]
+    dout: torch.Tensor,  # [B, HQ, Sq, D]
+    lse: torch.Tensor,  # [B, HQ, Sq] fp32 (raw domain)
+    *,
+    sink: Optional[torch.Tensor],
+    swa_window: int,
+    scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """CSA fused backward via the ported FlyDSL full kernel (gathered path).
+
+    One launch emits ``(dq, dk_local, dv_local, dgathered, dsink)``. Supports
+    both MQA (``K_H == 1``, shared local K/V) and MHA (``K_H == HQ``, per-head
+    local K/V) via the kernel's ``mqa_kv`` flag. The sparse / gathered branch is
+    head-shared, so ``dgathered`` sums over all query heads (atomic).
+    """
+    if q.dim() != 4 or k_local.dim() != 4 or v_local.dim() != 4 or gathered.dim() != 4:
+        raise ValueError("rank-4 q/k_local/v_local/gathered required")
+    if dout.shape != out.shape or out.shape != q.shape:
+        raise ValueError("shape mismatch among q / out / dout")
+    B, HQ, Sq, D = q.shape
+    K_H = k_local.shape[1]
+    K_topk = gathered.shape[2]
+    if q.dtype != torch.bfloat16:
+        raise NotImplementedError("bf16 only")
+    if D % 64 != 0:
+        raise NotImplementedError("head_dim must be a multiple of 64")
+    if K_H != 1 and K_H != HQ:
+        raise NotImplementedError(f"K_H must be 1 or {HQ}; got {K_H}")
+    if int(swa_window) <= 0:
+        raise NotImplementedError("swa_window > 0 required")
+    if K_topk <= 0:
+        raise NotImplementedError("K_topk > 0 required (K_topk == 0 short-circuits to dense)")
+
+    mqa_kv = K_H == 1
+    has_sink = sink is not None
+    has_sparse = K_topk > 0
+    dtype_str = "bf16"
+
+    q_c = q.contiguous()
+    k_c = k_local.contiguous()
+    v_c = v_local.contiguous()
+    gathered_c = gathered.contiguous()
+    dout_c = dout.contiguous()
+    lse_c = lse.contiguous()
+    # The kernel reads SPARSE_MASK in the input element type (bf16).
+    sparse_mask_c = sparse_mask.to(q.dtype).contiguous()
+
+    d_buf = _run_preprocess(out.contiguous(), dout_c)
+
+    dq_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
+    # dk_local / dv_local are always per-head [B, HQ, Sq, D] inside the kernel;
+    # the MQA caller reduces over the head axis afterwards.
+    dkl_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
+    dvl_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
+    dgathered_fp32 = torch.zeros((B, Sq, K_topk, D), device=q.device, dtype=torch.float32)
+    dsink_fp32 = torch.zeros((HQ,), device=q.device, dtype=torch.float32)
+    if has_sink:
+        sink_arg = sink.to(torch.float32) if sink.dtype != torch.float32 else sink.contiguous()
     else:
-        dsink = None
+        sink_arg = torch.zeros((HQ,), device=q.device, dtype=torch.float32)
 
-    return dq, dk, dv, dsink
+    launch = _get_csa_bwd_full(HQ, D, int(swa_window), dtype_str, has_sink, has_sparse, mqa_kv)
+    launch(
+        q_c,
+        k_c,
+        v_c,
+        gathered_c,
+        sparse_mask_c,
+        dout_c,
+        lse_c,
+        d_buf,
+        sink_arg,
+        dq_fp32,
+        dkl_fp32,
+        dvl_fp32,
+        dgathered_fp32,
+        dsink_fp32,
+        int(B),
+        int(Sq),
+        int(K_topk),
+    )
+
+    dq_out = dq_fp32.to(q.dtype)
+    if mqa_kv:
+        # Reduce the per-head local grads back to the shared [B, 1, Sq, D] head.
+        dk_out = dkl_fp32.sum(dim=1, keepdim=True).to(k_local.dtype)
+        dv_out = dvl_fp32.sum(dim=1, keepdim=True).to(v_local.dtype)
+    else:
+        dk_out = dkl_fp32.to(k_local.dtype)
+        dv_out = dvl_fp32.to(v_local.dtype)
+    dgathered_out = dgathered_fp32.to(gathered.dtype)
+    dsink_out = dsink_fp32.to(sink.dtype) if has_sink else None
+    return dq_out, dk_out, dv_out, dgathered_out, dsink_out
 
 
-__all__ = ["hca_attention_bwd_flydsl_kernel"]
+__all__ = [
+    "hca_attention_bwd_flydsl_kernel",
+    "csa_attention_bwd_flydsl_kernel",
+]

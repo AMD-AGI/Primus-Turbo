@@ -4,22 +4,31 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""FlyDSL DeepSeek-V4 attention kernels (design §10 落地文件清单).
+"""FlyDSL DeepSeek-V4 attention kernels (ported from Primus).
 
 Exposes the forward / backward launcher entry points consumed by the
-``kernels/attention/deepseek_attn_impl.py`` dispatcher. The backward launcher
-is a deferred stub (design §5.4 / §7.3 round 10) that raises until the FlyDSL
-backward is implemented; the forward is the round-1 bring-up baseline.
+``kernels/attention/deepseek_attn_impl.py`` dispatcher:
+
+* :func:`hca_attention_fwd_flydsl_kernel` — dense / SWA forward.
+* :func:`csa_attention_fwd_flydsl_kernel` — CSA fused forward (local SWA +
+  sparse top-K + optional sink), the 2.79x-over-Triton kernel.
+* :func:`hca_attention_bwd_flydsl_kernel` — dense / SWA backward (MQA, bf16).
+
+The underlying FlyDSL kernel *builders* (``build_*_module``) live in the
+``kernels`` subpackage, ported from the Primus DeepSeek-V4 ``_flydsl/kernels``
+suite.
 """
 
 from primus_turbo.flydsl.attention.deepseek_attn_bwd_kernel import (
     hca_attention_bwd_flydsl_kernel,
 )
 from primus_turbo.flydsl.attention.deepseek_attn_fwd_kernel import (
+    csa_attention_fwd_flydsl_kernel,
     hca_attention_fwd_flydsl_kernel,
 )
 
 __all__ = [
     "hca_attention_fwd_flydsl_kernel",
+    "csa_attention_fwd_flydsl_kernel",
     "hca_attention_bwd_flydsl_kernel",
 ]

@@ -177,6 +177,69 @@ def test_v4_hca_attention(dtype, B, H, S, D, swa_window, enable_sink, backend):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("B,H,S,D", [(1, 8, 256, 512)])
+@pytest.mark.parametrize("swa_window", [128])
+@pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("backend", _BACKENDS, ids=_BACKEND_IDS)
+def test_v4_hca_attention_bwd(dtype, B, H, S, D, swa_window, enable_sink, backend):
+    """HCA split-mask backward (dq/dk/dv/dsink) vs an fp32 autograd reference.
+
+    The FlyDSL HCA backward composes the local SWA dq/dkv kernels with the
+    ported HCA pool dq/dkv kernels (MQA, B=1, pool_size<=32,
+    hca_local_seqlen % 64 == 0). The forward stays on Triton (the FlyDSL HCA
+    forward is not wired), so this exercises a Triton-fwd / FlyDSL-bwd pairing
+    through the same joint-domain LSE convention.
+    """
+    _skip_if_flydsl_unsupported(backend, D)
+    torch.manual_seed(0)
+    dev = "cuda"
+    scale = D**-0.5
+    P = S // 128  # HCA pool size (2 for S=256)
+
+    q = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
+    k_local = torch.randn(B, 1, S, D, device=dev, dtype=dtype)
+    v_local = torch.randn(B, 1, S, D, device=dev, dtype=dtype)
+    pool_k = torch.randn(B, 1, P, D, device=dev, dtype=dtype)
+    pool_v = torch.randn(B, 1, P, D, device=dev, dtype=dtype)
+    # The op takes the concatenated [local | pool] K/V; make those the leaves.
+    k_cat = torch.cat([k_local, pool_k], dim=2).detach().clone().requires_grad_(True)
+    v_cat = torch.cat([v_local, pool_v], dim=2).detach().clone().requires_grad_(True)
+    sink = (
+        torch.randn(H, device=dev, dtype=dtype, requires_grad=True) if enable_sink else None
+    )
+    pool_mask = torch.zeros(S, P, device=dev, dtype=dtype)  # fully visible pool
+
+    out = hca_attention(
+        q, k_cat, v_cat, sink=sink, swa_window=swa_window, additive_mask=pool_mask,
+        attn_dropout=0.0, training=True, scale=scale, hca_local_seqlen=S, backend=backend,
+    )
+
+    # fp32 autograd reference over the joint [local_swa | pool] mask.
+    qf = q.detach().float().requires_grad_(True)
+    kf = k_cat.detach().float().requires_grad_(True)
+    vf = v_cat.detach().float().requires_grad_(True)
+    sinkf = sink.detach().float().requires_grad_(True) if enable_sink else None
+    local_mask = sliding_window_causal_mask(S, swa_window, device=dev, dtype=torch.float32)
+    joint_mask = torch.cat([local_mask, pool_mask.float()], dim=1)
+    out_ref = eager_hca_attention(
+        qf, kf.expand(B, H, S + P, D), vf.expand(B, H, S + P, D),
+        sink=sinkf, swa_window=swa_window, additive_mask=joint_mask,
+        attn_dropout=0.0, training=True, scale=scale,
+    )
+    assert compute_snr(out_ref, out) > SNR_FWD
+
+    g = torch.randn_like(out)
+    out.backward(g)
+    out_ref.backward(g.float())
+    assert compute_snr(qf.grad, q.grad) > SNR_BWD
+    assert compute_snr(kf.grad, k_cat.grad) > SNR_BWD
+    assert compute_snr(vf.grad, v_cat.grad) > SNR_BWD
+    if enable_sink:
+        assert compute_snr(sinkf.grad, sink.grad) > SNR_BWD
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "B,H,S,D",
@@ -446,6 +509,23 @@ def test_v4_csa_from_pool_real_shape(model, enable_sink):
     assert compute_snr(qr.grad, q.grad) > SNR_BWD
     assert compute_snr(kr.grad, k_local.grad) > SNR_BWD
     assert compute_snr(vr.grad, v_local.grad) > SNR_BWD
-    assert compute_snr(pr.grad, pool.grad) > SNR_BWD
     if enable_sink:
         assert compute_snr(sinkr.grad, sink.grad) > SNR_BWD
+
+    # Pool gradient: validate against an fp32 reference instead of the bf16
+    # one above. At the real index_topk (512 / 1024) each pool row is reused
+    # by hundreds of queries, so a bf16 reference accumulates dpool in bf16 and
+    # only reaches ~31 dB SNR vs fp32 truth — below SNR_BWD even for a correct
+    # kernel. The kernel accumulates dpool in fp32, so the fair comparison is
+    # against an fp32 reference (verify-accuracy: compare to higher precision).
+    pf = pool.detach().float().requires_grad_(True)
+    qf, kf, vf = q.detach().float(), k_local.detach().float(), v_local.detach().float()
+    sinkf = sink.detach().float() if enable_sink else None
+    gathered_f = pf[bidx, topk]
+    out_f = eager_csa_attention(
+        qf, kf, vf, gathered_f, sink=sinkf, swa_window=swa_window,
+        sparse_mask=torch.zeros(B, S, K_topk, device=dev, dtype=torch.float32),
+        attn_dropout=0.0, training=True, scale=scale,
+    )
+    out_f.backward(g.float())
+    assert compute_snr(pf.grad, pool.grad) > SNR_BWD

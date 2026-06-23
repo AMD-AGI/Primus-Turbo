@@ -48,6 +48,38 @@ tasks:
     args: [--deterministic]
     output: attention_deterministic_benchmark.csv
 
+  # ── DeepSeek-V4 Attention (dense / HCA / CSA) ────────────
+  # Smoke: a small single-seqlen subset (S=2048, batch=1) for routine CI runs.
+  # Keeps the csa_gathered path off the 8192 / Pro-S4096 materialisation that
+  # OOMs, and stays fast enough to run every cycle.
+  - label: dpsk_attn_smoke_triton
+    group: dpsk_attn_smoke
+    script: bench_deepseek_attention.py
+    args: [--backends, triton, --kinds, dense, hca, csa, csa_gathered, --seqlen, "2048", --batch, "1"]
+    output: dpsk_attn_smoke_triton_benchmark.csv
+
+  - label: dpsk_attn_smoke_flydsl
+    group: dpsk_attn_smoke
+    script: bench_deepseek_attention.py
+    args: [--backends, flydsl, --kinds, dense, csa, csa_gathered, --seqlen, "2048", --batch, "1"]
+    output: dpsk_attn_smoke_flydsl_benchmark.csv
+
+  # Full: the complete seqlen sweep (2048/4096/8192, batch 1/2). The
+  # csa_gathered path materialises [B,Sq,K_topk,D] and can OOM at Pro/S>=4096,
+  # so this group is for on-demand runs (``run_suite.py -g dpsk_attn_full``),
+  # not the routine cycle.
+  - label: dpsk_attn_full_triton
+    group: dpsk_attn_full
+    script: bench_deepseek_attention.py
+    args: [--backends, triton, --kinds, dense, hca, csa, csa_gathered]
+    output: dpsk_attn_full_triton_benchmark.csv
+
+  - label: dpsk_attn_full_flydsl
+    group: dpsk_attn_full
+    script: bench_deepseek_attention.py
+    args: [--backends, flydsl, --kinds, dense, csa, csa_gathered]
+    output: dpsk_attn_full_flydsl_benchmark.csv
+
   # ── GEMM BF16 ────────────────────────────────────────────
   - label: gemm_bf16_torch
     group: gemm_bf16

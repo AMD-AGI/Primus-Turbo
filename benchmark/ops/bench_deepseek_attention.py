@@ -36,7 +36,9 @@ Usage:
 """
 
 import argparse
+import csv
 import os
+from datetime import datetime
 
 import torch
 import torch.utils.benchmark as benchmark
@@ -56,6 +58,7 @@ from primus_turbo.pytorch.ops.attention import (
     eager_csa_attention,
     sliding_window_causal_mask,
     hca_attention,
+    csa_attention,
     csa_attention_from_pool,
 )
 
@@ -186,7 +189,45 @@ def _setup_csa(B, S, H, D, dtype, dev, index_topk=512, backend=None):
     return (q, k_local, v_local, pool), fwd(), fwd, ref, fwd_flops
 
 
-_SETUP = {"dense": _setup_dense, "hca": _setup_hca, "csa": _setup_csa}
+def _setup_csa_gathered(B, S, H, D, dtype, dev, index_topk=512, backend=None):
+    """CSA via the pre-gathered path (``csa_attention``). This is the form the
+    ported FlyDSL CSA forward kernel handles (the 2.79x-over-Triton kernel),
+    so ``--backends flydsl --kinds csa_gathered`` actually exercises FlyDSL
+    (the ``csa`` / from-pool kind has no FlyDSL backend and falls back)."""
+    scale = D**-0.5
+    P = S // V4_CSA_RATIO
+    K = min(index_topk, P)
+    q = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
+    k_local = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
+    v_local = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
+    gathered = torch.randn(B, S, K, D, device=dev, dtype=dtype, requires_grad=True)
+    sparse_mask = torch.zeros(B, S, K, device=dev, dtype=dtype)
+
+    def fwd():
+        return csa_attention(
+            q, k_local, v_local, gathered, sink=None, swa_window=V4_SWA_WINDOW,
+            sparse_mask=sparse_mask, attn_dropout=0.0, training=True, scale=scale, backend=backend,
+        )
+
+    def ref():
+        return eager_csa_attention(
+            q.detach(), k_local.detach(), v_local.detach(), gathered.detach(), sink=None,
+            swa_window=V4_SWA_WINDOW, sparse_mask=sparse_mask, attn_dropout=0.0,
+            training=False, scale=scale,
+        )
+
+    # local SWA window + K sparse keys.
+    eff_k = min(S, V4_SWA_WINDOW) + K
+    fwd_flops = 2 * 2 * B * H * S * eff_k * D
+    return (q, k_local, v_local, gathered), fwd(), fwd, ref, fwd_flops
+
+
+_SETUP = {
+    "dense": _setup_dense,
+    "hca": _setup_hca,
+    "csa": _setup_csa,
+    "csa_gathered": _setup_csa_gathered,
+}
 
 
 def profile_one(kind, B, S, H, D, dtype, dev, index_topk=512, backend=None):
@@ -239,7 +280,9 @@ def main():
                         help="Override the model's index_topk (CSA top-k cap).")
     parser.add_argument("--head-dim", type=int, default=V4_HEAD_DIM)
     parser.add_argument("--kinds", type=str, nargs="+", default=["dense", "hca", "csa"],
-                        choices=["dense", "hca", "csa"])
+                        choices=["dense", "hca", "csa", "csa_gathered"])
+    parser.add_argument("--output", "-o", type=str, default=None,
+                        help="Output CSV path. Default: dpsk_attn_benchmark_result_{date}_{gpu}.csv")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
     parser.add_argument("--backends", type=str, nargs="+", default=["triton"],
                         choices=["triton", "flydsl"],
@@ -255,7 +298,9 @@ def main():
 
     backends = [_BACKEND_MAP[b] for b in args.backends]
 
-    print(f"Device: {torch.cuda.get_device_name(0)}")
+    gpu_name = torch.cuda.get_device_name(0)
+    test_id = 0
+    print(f"Device: {gpu_name}")
     header = (
         f"{'model':6} {'kind':6} {'backend':8} {'B':>2} {'S':>6} {'H':>4} {'fwd_ms':>9} "
         f"{'fwdbwd_ms':>11} {'fwd_TFLOPs':>11} {'tot_TFLOPs':>11} {'SNR_dB':>8}"
@@ -283,6 +328,9 @@ def main():
                             print(f"{model:6} {kind:6} {backend.name.lower():8} {B:>2} {S:>6}  OOM")
                             torch.cuda.empty_cache()
                             continue
+                        test_id += 1
+                        r["TestID"] = test_id
+                        r["GPU"] = gpu_name
                         r["model"] = model
                         rows.append(r)
                         print(
@@ -291,7 +339,31 @@ def main():
                             f"{r['fwd_TFLOPs']:>11.1f} {r['total_TFLOPs']:>11.1f} {r['snr_dB']:>8.1f}"
                         )
                         torch.cuda.empty_cache()
+
+    _write_csv(rows, args.output, gpu_name)
     return rows
+
+
+def _write_csv(rows, output_csv, gpu_name):
+    """Write the collected rows to a CSV (TestID first, for the suite merge)."""
+    if output_csv:
+        filename = output_csv
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d")
+        filename = f"dpsk_attn_benchmark_result_{timestamp}_{gpu_name}.csv"
+    fields = [
+        "TestID", "GPU", "model", "kind", "backend", "B", "S", "H", "D",
+        "fwd_ms", "fwdbwd_ms", "fwd_TFLOPs", "total_TFLOPs", "snr_dB",
+    ]
+    out_dir = os.path.dirname(filename)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(filename, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k) for k in fields})
+    print(f"\nResults saved to {filename}")
 
 
 if __name__ == "__main__":
