@@ -8,7 +8,11 @@ from typing import Optional, Union
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -323,13 +327,44 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         # twice) and does NOT depend on tensor identity across iterations.
         fuse_a_dual = a_dtype == a_dtype_bwd and a.is_contiguous()
 
+        # When the FlyDSL backend is active on the NT-forward Linear layout
+        # (trans_b=True), emit a's column-quant result already in the (16, 16) MFMA
+        # preshuffled+transposed operand layout the TN wgrad consumes. This folds
+        # the launcher's standalone preshuffle copy (a full a_col fp8 HBM round-trip
+        # + a dedicated kernel launch per backward step) into the dual-quant store.
+        # Gated on FlyDSL actually handling this shape's wgrad (so a non-FlyDSL
+        # fallback never receives the scrambled operand), on the preshuffle layout /
+        # scale-shape-signal constraints, and on trans_b (other layouts, e.g. NN
+        # forward, route the weight grad through the plain fallback).
+        a_col_preshuffled = False
+        if fuse_a_dual and trans_b and (
+            GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        ):
+            try:
+                from primus_turbo.flydsl.gemm import flydsl_blockwise_wgrad_supported
+
+                M_w, K_w = a.shape
+                N_w = b.shape[0]
+                num_m_blocks = (M_w + config.block_size - 1) // config.block_size
+                if (
+                    K_w % 16 == 0
+                    and M_w % 32 == 0
+                    and K_w != num_m_blocks
+                    and flydsl_blockwise_wgrad_supported(K_w, N_w, M_w)
+                ):
+                    a_col_preshuffled = True
+            except Exception:
+                a_col_preshuffled = False
+
         if fuse_a_dual:
             (
                 a_fp8_row,
                 a_scale_inv_row,
                 a_fp8_col,
                 a_scale_inv_col,
-            ) = quant_fp8_blockwise_dual_impl(a, a_dtype, config.block_size)
+            ) = quant_fp8_blockwise_dual_impl(
+                a, a_dtype, config.block_size, col_preshuffled=a_col_preshuffled
+            )
         else:
             a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
                 a, a_dtype, axis=1, block_size=config.block_size
@@ -383,12 +418,32 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         # Quantize grad_out in both row-wise and column-wise directions:
         # - row-wise: for dgrad (grad_x)
         # - col-wise: for wgrad (grad_w)
+        # When the FlyDSL backend is active on the NT-forward layout
+        # (ctx.trans_b=True), request the col output in transposed [N, M] storage:
+        # the FlyDSL TN wgrad consumes grad_out^T (A = grad_out^T), so producing the
+        # col-quant tile already transposed folds the standalone elementwise
+        # transpose-copy (one full [M, N] fp8 HBM round-trip + kernel launch per
+        # backward step) into the dual-quant store. We hand the GEMM a logical
+        # [M, N] view of that buffer so dispatch/shape inference are byte-for-byte
+        # unchanged; the wgrad launcher's transpose(0,1).contiguous() then collapses
+        # to a zero-cost view of the producer's contiguous [N, M] output. Other
+        # backends (CK, ...) and other layouts require a contiguous [M, N] col
+        # operand, so the transposed-store is gated on FlyDSL + trans_b.
+        wgrad_col_transposed = ctx.trans_b and (
+            GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        )
         (
             grad_out_fp8_row,
             grad_out_scale_inv_row,
             grad_out_fp8_col,
             grad_out_scale_inv_col,
-        ) = quant_fp8_blockwise_dual_impl(grad_out, grad_out_dtype, ctx.config.block_size)
+        ) = quant_fp8_blockwise_dual_impl(
+            grad_out, grad_out_dtype, ctx.config.block_size, col_transposed=wgrad_col_transposed
+        )
+        if wgrad_col_transposed:
+            # [N, M] -> logical [M, N] view (matches the un-transposed col layout
+            # the downstream GEMM/dispatch expect); re-transposed in the launcher.
+            grad_out_fp8_col = grad_out_fp8_col.transpose(0, 1)
 
         a_grad = gemm_fp8_impl(
             grad_out_fp8_row,

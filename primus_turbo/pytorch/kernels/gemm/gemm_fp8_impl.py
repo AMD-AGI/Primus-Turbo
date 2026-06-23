@@ -10,9 +10,6 @@ import torch
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
-from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-    gemm_fp8_blockwise_flydsl_kernel,
-)
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
@@ -374,26 +371,40 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             return False
         if out_dtype not in (torch.bfloat16, torch.float16):
             return False
-        # NT / NN / TN native; TT (trans_a and trans_b) is not supported.
-        if trans_a and trans_b:
-            return False
-        # logical contraction (same for both granularities).
-        k = a.shape[0] if trans_a else a.shape[1]
-
         if granularity == ScalingGranularity.BLOCKWISE:
+            # BLOCKWISE routes to the vendored FlyDSL blockscale launcher (one
+            # parameterized kernel, per-direction launch). e4m3 * e4m3 -> bf16/fp16 only.
             if (a.dtype, b.dtype, out_dtype) not in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES_BLOCKWISE:
                 return False
-            # The pipeline needs K_ITERS = K/128 >= 2 and one 128-block per MFMA,
-            # so the contraction must be a multiple of 128 and at least 256.
-            if k < 256 or k % 128 != 0:
-                return False
-            # Per-block (not scalar) scales.
-            return a_scale_inv.numel() > 1 and b_scale_inv.numel() > 1
 
-        # TENSORWISE: any contraction handled by the native K-tail, but the
-        # software pipeline needs K_ITERS = ceil(K/128) >= 2, i.e. K >= 129.
-        # (M / N are arbitrary: the partial last output tile is bounded by the
-        # c_m / c_n StoreC clamp + the global SRD.)
+            m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+
+            # forward / NT (trans_b=True) and dgrad / NN (trans_b=False) both run
+            # on the same forward MFMA kernel (trans_a=False, trans_c=False). The
+            # launcher pre-flight enforces arch / N%16 / K%128 / tile feasibility.
+            if (not trans_a) and (not trans_c):
+                from primus_turbo.flydsl.gemm import flydsl_blockwise_gemm_supported
+
+                return flydsl_blockwise_gemm_supported(m, n, k)
+
+            # wgrad (trans_a=True, trans_b=False): dedicated 1Dx1D blockscale
+            # kernel with per-output-column scale_b. trans_c=True is the NT-forward
+            # weight grad (grad_b[N,K]); trans_c=False is the NN-forward weight
+            # grad (grad_b[K,N]), served by the same kernel + an output transpose.
+            if trans_a and (not trans_b):
+                from primus_turbo.flydsl.gemm import flydsl_blockwise_wgrad_supported
+
+                return flydsl_blockwise_wgrad_supported(m, n, k)
+
+            return False
+
+        # TENSORWISE: NT / NN / TN native; TT (trans_a and trans_b) unsupported.
+        if trans_a and trans_b:
+            return False
+        # logical contraction; the software pipeline needs K_ITERS = ceil(K/128)
+        # >= 2, i.e. K >= 129. (M / N arbitrary: the partial last output tile is
+        # bounded by the c_m / c_n StoreC clamp + the global SRD.)
+        k = a.shape[0] if trans_a else a.shape[1]
         if (a.dtype, b.dtype, out_dtype) not in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES:
             return False
         if k < 129:
@@ -414,16 +425,33 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         granularity: ScalingGranularity,
     ):
         if granularity == ScalingGranularity.BLOCKWISE:
-            return gemm_fp8_blockwise_flydsl_kernel(
-                a,
-                a_scale_inv,
-                b,
-                b_scale_inv,
-                trans_a=trans_a,
-                trans_b=trans_b,
-                out_dtype=out_dtype,
-                trans_c=trans_c,
+            # wgrad: a=a_col[M,K], b=grad_out_col[M,N], trans_a=True, trans_b=False.
+            # The launcher computes G[N,K] = grad_out^T @ a. trans_c=True (NT-forward
+            # weight grad) returns it directly as grad_b[N,K]; trans_c=False
+            # (NN-forward weight grad) needs grad_b[K,N] = a^T @ grad_out = G^T, so
+            # the same kernel output is transposed.
+            if trans_a and (not trans_b):
+                from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl_wgrad
+
+                out = gemm_fp8_blockwise_flydsl_wgrad(
+                    a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype
+                )
+                return out if trans_c else out.t().contiguous()
+
+            if trans_b:  # forward / NT: out[M,N] = (a*a_scale) @ (b*b_scale)^T
+                from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl
+
+                return gemm_fp8_blockwise_flydsl(
+                    a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype
+                )
+
+            # dgrad / NN: grad_a[M,K] = grad_out[M,N] @ b[N,K]
+            from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl_dgrad
+
+            return gemm_fp8_blockwise_flydsl_dgrad(
+                a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype
             )
+
         return gemm_fp8_tensorwise_flydsl_kernel(
             a,
             a_scale_inv,

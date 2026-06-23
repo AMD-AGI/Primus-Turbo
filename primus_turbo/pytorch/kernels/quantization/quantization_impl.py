@@ -139,8 +139,23 @@ def quant_fp8_blockwise_dual_impl(
     x: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
+    col_transposed: bool = False,
+    col_preshuffled: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor in both blockwise row and column modes in one pass.
+
+    When ``col_transposed`` is True the column-quantized FP8 output is stored
+    directly in transposed ``[N, M]`` layout (byte-identical to
+    ``x_fp8_col[M,N].transpose(0,1).contiguous()``) so a downstream TN GEMM that
+    needs ``x^T`` (the FlyDSL wgrad path consuming grad_out) can use it without a
+    separate elementwise transpose-copy. The col-scale shape ``[M//128, N]`` is
+    unchanged. The row output and row scale are unaffected.
+
+    When ``col_preshuffled`` is True the column-quantized FP8 output is stored
+    directly in the FlyDSL (16, 16) MFMA preshuffled+transposed operand layout
+    and the col-scale is stored transposed ``[N, M//128]``, so the wgrad
+    launcher's standalone preshuffle copy + scale transpose collapse to zero-cost
+    views. The two flags are mutually exclusive.
 
     NOTE: This op is registered as ``torch.library.custom_op`` (opaque to
     inductor) instead of ``triton_op`` + ``wrap_triton``. On the AMD MI300
@@ -156,15 +171,32 @@ def quant_fp8_blockwise_dual_impl(
     used by ``quant_fp8_blockwise_impl`` and
     ``quant_fp8_blockwise_for_weight_impl``.
     """
+    assert not (col_transposed and col_preshuffled), "col_transposed and col_preshuffled are mutually exclusive"
     assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
 
     M, N = x.shape
     row_scales_shape = (M, triton.cdiv(N, block_size))
-    col_scales_shape = (triton.cdiv(M, block_size), N)
+    # Col-scale buffer: transposed [N, M // block] when preshuffled (matches the
+    # wgrad operand's transposed scale), else [M // block, N].
+    col_scales_shape = (
+        (N, triton.cdiv(M, block_size)) if col_preshuffled else (triton.cdiv(M, block_size), N)
+    )
 
     x_fp8_row = torch.empty((M, N), dtype=dtype, device=x.device)
     x_scales_row = torch.empty(row_scales_shape, dtype=torch.float32, device=x.device)
-    x_fp8_col = torch.empty((M, N), dtype=dtype, device=x.device)
+    # Col FP8 buffer shape. With col_preshuffled the buffer holds the (16, 16)
+    # MFMA preshuffled+transposed operand bytes (logical [N, M]) but is allocated
+    # with the un-transposed [M, N] shape so the downstream GEMM dispatch (keyed
+    # on operand shape) is byte-for-byte unchanged; the wgrad launcher reshapes
+    # it to [N, M] and skips its standalone preshuffle copy. With col_transposed
+    # the buffer is [N, M]; otherwise [M, N].
+    if col_preshuffled:
+        col_fp8_shape = (M, N)
+    elif col_transposed:
+        col_fp8_shape = (N, M)
+    else:
+        col_fp8_shape = (M, N)
+    x_fp8_col = torch.empty(col_fp8_shape, dtype=dtype, device=x.device)
     x_scales_col = torch.empty(col_scales_shape, dtype=torch.float32, device=x.device)
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
@@ -178,6 +210,8 @@ def quant_fp8_blockwise_dual_impl(
         N,
         block_size,
         torch.finfo(dtype).max,
+        COL_TRANSPOSED=col_transposed,
+        COL_PRESHUFFLED=col_preshuffled,
     )
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 
@@ -187,14 +221,24 @@ def quant_fp8_blockwise_dual_impl_meta(
     x: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
+    col_transposed: bool = False,
+    col_preshuffled: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x.dim() == 2, "Input must be 2D"
     M, N = x.shape
     row_scales_shape = (M, triton.cdiv(N, block_size))
-    col_scales_shape = (triton.cdiv(M, block_size), N)
+    col_scales_shape = (
+        (N, triton.cdiv(M, block_size)) if col_preshuffled else (triton.cdiv(M, block_size), N)
+    )
     x_fp8_row = torch.empty((M, N), dtype=dtype, device=x.device)
     x_scales_row = torch.empty(row_scales_shape, dtype=torch.float32, device=x.device)
-    x_fp8_col = torch.empty((M, N), dtype=dtype, device=x.device)
+    if col_preshuffled:
+        col_fp8_shape = (M, N)
+    elif col_transposed:
+        col_fp8_shape = (N, M)
+    else:
+        col_fp8_shape = (M, N)
+    x_fp8_col = torch.empty(col_fp8_shape, dtype=dtype, device=x.device)
     x_scales_col = torch.empty(col_scales_shape, dtype=torch.float32, device=x.device)
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 
