@@ -148,10 +148,23 @@ class GEMMFP8CKBackend(KernelBackend):
         # check dtype
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8CKBackend.SUPPORTED_DTYPES
 
-        # TODO: check layout
-        # supported &= (trans_a, trans_b, trans_c) in GEMMFP8CKBackend.SUPPORTED_LAYOUTS
+        if trans_c:
+            lhs, rhs = b, a
+            trans_lhs, trans_rhs = (not trans_b), (not trans_a)
+        else:
+            lhs, rhs = a, b
+            trans_lhs, trans_rhs = trans_a, trans_b
 
-        # TODO: check shape
+        k = lhs.shape[0] if trans_lhs else lhs.shape[1]
+        n = rhs.shape[0] if trans_rhs else rhs.shape[1]
+
+        # NT / NN layout (transA == False): the contraction dim k must be a
+        # multiple of 32.
+        if not trans_lhs:
+            supported &= k % 32 == 0
+            # BLOCKWISE additionally requires k, n multiples of 128 and k >= 128.
+            if granularity == ScalingGranularity.BLOCKWISE:
+                supported &= (k % 128 == 0) and (n % 128 == 0) and (k >= 128)
 
         return supported
 

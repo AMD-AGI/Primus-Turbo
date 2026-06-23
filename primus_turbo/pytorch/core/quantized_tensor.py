@@ -15,6 +15,8 @@ from primus_turbo.pytorch.core.low_precision import (
     MXFP4_PADDING_ALIGN_SIZE,
     MXFP8_BLOCK_SIZE,
     MXFP8_PADDING_ALIGN_SIZE,
+    Float4QuantConfig,
+    Float8QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp4_support,
@@ -543,6 +545,43 @@ class QuantizedTensor(torch.Tensor):
         """Reshape without dequantizing (autograd-aware)."""
         return _ReshapeFunc.apply(self, shape)
 
+    @classmethod
+    def _transpose(cls, tensor: "QuantizedTensor", dim0: int, dim1: int) -> "QuantizedTensor":
+        """Return the transpose of *tensor* as a ``QuantizedTensor``.
+
+        * TENSORWISE: the scale is a single scalar, so the transpose is exact -
+          we just transpose the quantized buffer (no dequantize round-trip).
+        * ROWWISE / MX_BLOCKWISE: per-row / per-block scales do not transpose
+          trivially (a scaled row becomes a column), so we dequantize and then
+          re-quantize the transposed tensor into the (colwise) layout.
+        """
+        ndim = tensor.dim()
+        d0 = dim0 if dim0 >= 0 else dim0 + ndim
+        d1 = dim1 if dim1 >= 0 else dim1 + ndim
+        if d0 == d1:
+            return cls._make_like(tensor, data=tensor._data, scale_inv=tensor._scale_inv, shape=tensor.shape)
+
+        assert not tensor._is_grouped_tensor, "transpose is not supported for grouped QuantizedTensor"
+
+        new_shape = list(tensor.shape)
+        new_shape[d0], new_shape[d1] = new_shape[d1], new_shape[d0]
+        new_shape = torch.Size(new_shape)
+
+        if tensor._granularity == ScalingGranularity.TENSORWISE:
+            new_data = tensor._data.transpose(d0, d1).contiguous()
+            return cls._make_like(tensor, data=new_data, scale_inv=tensor._scale_inv, shape=new_shape)
+
+        # Rowwise / MX blockwise: dequantize -> transpose -> re-quantize colwise.
+        hp_t = tensor.dequantize()
+        return cls.quantize(
+            hp_t,
+            tensor._dest_dtype,
+            tensor._granularity,
+            axis=-2,
+            block_size=tensor._block_size,
+            scaling_recipe=tensor._scaling_recipe,
+        )
+
     # ------------------------------------------------------------------
     # Dispatch hooks
     # ------------------------------------------------------------------
@@ -588,6 +627,16 @@ class QuantizedTensor(torch.Tensor):
                     scale_inv=tensor._scale_inv.detach(),
                     shape=tensor.shape,
                 )
+
+        if func in (torch.ops.aten.t.default, torch.ops.aten.transpose.int):
+            tensor = args[0]
+            if isinstance(tensor, QuantizedTensor):
+                if func is torch.ops.aten.t.default:
+                    assert tensor.dim() == 2, "t() expects a 2D QuantizedTensor"
+                    dim0, dim1 = 0, 1
+                else:
+                    dim0, dim1 = args[1], args[2]
+                return cls._transpose(tensor, dim0, dim1)
 
         raise NotImplementedError(f"Unsupported dispatch: {func}")
 
@@ -645,9 +694,71 @@ class QuantizedTensorPair(NamedTuple):
     Wrapper for quantized tensors.
 
     Args:
-        data: Row-major quantized tensor.
-        data_t: Transposed quantized tensor.
+        data_rowwise: Row-wise quantized tensor.
+        data_colwise: Column-wise quantized tensor.
     """
 
-    data: QuantizedTensor
-    data_t: Optional[QuantizedTensor] = None
+    data_rowwise: QuantizedTensor
+    data_colwise: Optional[QuantizedTensor] = None
+
+
+def create_quantized_weight(
+    weight,
+    dest_dtype: torch.dtype,
+    quant_config: Union[Float4QuantConfig, Float8QuantConfig],
+    need_cache_colwise: bool = False,
+) -> Tuple[QuantizedTensor, Optional[QuantizedTensor]]:
+    def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
+        if isinstance(quant_config, Float4QuantConfig):
+            weight_scaling_recipe = ScalingRecipe(
+                use_2d_block=True,
+                shuffle_scale=quant_config.use_preshuffle,
+                shuffle_out=quant_config.use_preshuffle,
+            )
+
+        if isinstance(quant_config, Float8QuantConfig):
+            if quant_config.granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
+                weight_scaling_recipe = ScalingRecipe(use_2d_block=True)
+            else:
+                weight_scaling_recipe = ScalingRecipe()
+
+        return weight_scaling_recipe
+
+    quantized_weight_rowwise = QuantizedTensor.quantize(
+        weight,
+        dest_dtype=dest_dtype,
+        granularity=quant_config.granularity,
+        block_size=quant_config.block_size,
+        scaling_recipe=_weight_scaling_recipe(quant_config),
+        axis=-1,
+    )
+
+    quantized_weight_colwise = None
+    if need_cache_colwise:
+        granularity = quant_config.granularity
+        if granularity == ScalingGranularity.TENSORWISE:
+            quantized_weight_colwise = quantized_weight_rowwise.transpose(-2, -1)
+        elif granularity == ScalingGranularity.ROWWISE:
+            # NOTE: rowwise quantization not support transpose, so we need to quantize the transposed weight manually.
+            quantized_weight_colwise = QuantizedTensor.quantize(
+                weight.transpose(-2, -1),
+                dest_dtype=dest_dtype,
+                granularity=quant_config.granularity,
+                block_size=quant_config.block_size,
+                scaling_recipe=_weight_scaling_recipe(quant_config),
+                axis=-2,
+            )
+        elif granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
+            quantized_weight_colwise = QuantizedTensor.quantize(
+                weight,
+                dest_dtype=dest_dtype,
+                granularity=quant_config.granularity,
+                block_size=quant_config.block_size,
+                scaling_recipe=_weight_scaling_recipe(quant_config),
+                # axis=-2 means quant weight along axis 2 which will get a transposed quantized weight.
+                axis=-2,
+            )
+        else:
+            raise ValueError(f"Unsupported granularity: {granularity}")
+
+    return quantized_weight_rowwise, quantized_weight_colwise
