@@ -16,11 +16,19 @@ namespace primus_turbo::device {
 // ════════════════════════════════════════════════════════════════
 
 template <int CNT> __device__ __forceinline__ void wait_lgkmcnt() {
+#if defined(__gfx1250__)
+    asm volatile("s_wait_dscnt %0" : : "n"(CNT) : "memory");
+#else
     asm volatile("s_waitcnt lgkmcnt(%0)" : : "n"(CNT) : "memory");
+#endif
 }
 
 template <int CNT> __device__ __forceinline__ void wait_vmcnt() {
+#if defined(__gfx1250__)
+    asm volatile("s_wait_loadcnt %0" : : "n"(CNT) : "memory");
+#else
     asm volatile("s_waitcnt vmcnt(%0)" : : "n"(CNT) : "memory");
+#endif
 }
 
 // ════════════════════════════════════════════════════════════════

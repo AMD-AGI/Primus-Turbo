@@ -10,6 +10,8 @@
 
 namespace primus_turbo::pytorch {
 
+#ifdef PRIMUS_TURBO_BUILD_TURBO_BACKEND
+
 // ── MX_BLOCKWISE launch ──
 
 static at::Tensor launch_mxfp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
@@ -80,5 +82,16 @@ at::Tensor turbo_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at:
     PRIMUS_TURBO_ERROR("turbo_gemm_fp8: unsupported granularity '" + granularity + "'.");
     return at::Tensor();
 }
+
+#else // !PRIMUS_TURBO_BUILD_TURBO_BACKEND : turbo MXFP8 GEMM disabled
+
+at::Tensor turbo_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at::Tensor scaleB_inv,
+                          const at::ScalarType out_dtype, bool transA, bool transB, bool transC,
+                          const std::string &granularity) {
+    PRIMUS_TURBO_ERROR("turbo_gemm_fp8 is unavailable: turbo backend not built. "
+                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'turbo'.");
+}
+
+#endif // PRIMUS_TURBO_BUILD_TURBO_BACKEND
 
 } // namespace primus_turbo::pytorch
