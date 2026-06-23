@@ -53,9 +53,11 @@ from primus_turbo.flydsl.common.tile_spec import _emit_if_then
 # comm-PUSH + scoreboard prims (byte-agnostic; shared intra-node EP layer)
 from primus_turbo.flydsl.mega.ep_intranode import (
     _BLOCK_THREADS,
+    _atomic_add_local_ret,
     _bf16_push_geom,
     _fence_acquire,
     _ld_relaxed,
+    _st_relaxed,
     dispatch_bf16_tile,
     permute_token_tile,
 )
@@ -213,6 +215,7 @@ def _compile(
         SOURCE_DEDUP: fx.Tensor,
         DEDUP_SRC_ROW: fx.Tensor,
         SB_COPY: fx.Tensor,
+        SB_CONSUME: fx.Tensor,
         POOL_I32: fx.Tensor,
         c_n: fx.Int32,
     ):
@@ -324,6 +327,13 @@ def _compile(
                             while copy_done < fx.Int32(1):
                                 fx.rocdl.s_sleep(fx.Int32(2))
                                 copy_done = _ld_relaxed(SB_COPY, block_m)
+                        # last-reader self-reset: n_blocks GEMM blocks share SCOREBOARD[block_m];
+                        # the one whose count hits n_blocks (all readers already past the spin)
+                        # zeroes the gate + its counter for the next launch (folds out host zero).
+                        prev = _atomic_add_local_ret(SB_CONSUME, block_m, fx.Int32(1))
+                        if prev == fx.Int32(n_blocks - 1):
+                            _st_relaxed(SCOREBOARD, block_m, fx.Int32(0))
+                            _st_relaxed(SB_CONSUME, block_m, fx.Int32(0))
                     fx.gpu.barrier()
                     _fence_acquire()  # read fresh peer-pushed + locally-copied pool rows
 
@@ -366,6 +376,7 @@ def _compile(
         SOURCE_DEDUP,
         DEDUP_SRC_ROW,
         SB_COPY,
+        SB_CONSUME,
         POOL_I32,
         c_n: int,
         stream: fx.Stream = fx.Stream(None),
@@ -390,6 +401,7 @@ def _compile(
             SOURCE_DEDUP,
             DEDUP_SRC_ROW,
             SB_COPY,
+            SB_CONSUME,
             POOL_I32,
             c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
@@ -903,10 +915,11 @@ def dispatch_grouped_gemm_bf16(
     output,  # [pool_capacity, N] bf16
     tile_to_group,  # [n_mblk] i32   expert id per pool block
     # ── scoreboard handshake ──────────────────────────────────────────
-    scoreboard,  # [n_mblk] i32   local fill counter (caller zeroes)
+    scoreboard,  # [n_mblk] i32   local fill counter (kernel self-resets at gate)
     scoreboard_ptrs,  # [world] i64   peer scoreboard base ptrs
     expected_count,  # [n_mblk] i32   expected push count per block
     num_tile_blocks,  # [1] i32        real tile-block count (device)
+    sb_consume,  # [n_mblk] i32   last-reader counter (zeroed once at init; self-resets)
     # ── tile / schedule config (compile-time scalars) ─────────────────
     *,
     layout="nt",
@@ -993,6 +1006,7 @@ def dispatch_grouped_gemm_bf16(
         source_dedup_arg,
         dedup_src_row_arg,
         sb_copy_arg,
+        sb_consume,
         pool_i32,
         c_n,
     )

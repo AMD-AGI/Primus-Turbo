@@ -9,7 +9,7 @@ FlyDSL kernel (``primus_turbo.flydsl.mega.mega_moe_prologue_kernel``).
 
 Each of the ``world`` ranks routes its own ``[T, K]`` topk, then the prologue
 builds the EP dispatch plan over a single symmetric allocation (``SymmBuffer``
-from ``mega_fused_moe``, reused here): the cross-rank counts all-gather, pool
+from ``mega_moe_fused``, reused here): the cross-rank counts all-gather, pool
 layout, comm tasks, and the cross-rank ``origin_rank`` / ``origin_slot`` push all
 exercise real inter-rank traffic. We validate every deterministic table against a
 torch reference built from the all-gathered routing, validate the local scatter,
@@ -34,7 +34,7 @@ try:
         get_prologue_workspace,
         mega_moe_prologue,
     )
-    from primus_turbo.pytorch.ops.moe.mega_fused_moe import get_symm_buffer_for_mega_moe
+    from primus_turbo.pytorch.ops.moe.mega_moe_fused import get_symm_buffer_for_mega_moe
 
     _HAVE_FLYDSL = True
 except Exception as _e:  # flydsl only present inside the dev container
@@ -287,7 +287,8 @@ def _prologue_kwargs(symm):
     """Symmetric/scratch kwargs for mega_moe_prologue; the plan output tables are
     allocated + returned by the primitive itself (not passed in)."""
     return dict(
-        peer_ptrs=symm.peer_ptrs,
+        buffer_base=symm.buffer_base,
+        buffer_offsets=symm.buffer_offsets,
         origin_rank=symm.origin_rank,
         origin_slot=symm.origin_slot,
         meta_scalars=symm.meta_scalars,
