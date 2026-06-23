@@ -50,6 +50,7 @@ import jax.numpy as jnp
 
 from primus_turbo.jax.deep_ep import runtime as deep_ep_runtime
 from primus_turbo.jax.deep_ep.runtime import (
+    MODE_INPROC,  # noqa: F401  re-exported for callers that introspect mode (e.g. tests)
     MODE_PER_PROCESS,
     NUM_MAX_NVL_PEERS,
     LaunchMode,
