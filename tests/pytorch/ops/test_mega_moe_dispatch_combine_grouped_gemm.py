@@ -47,9 +47,9 @@ import primus_turbo.pytorch as turbo  # noqa: E402
 from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
 
 # fused mega MoE forward + single-allocation symmetric buffer (implementation under test)
-from primus_turbo.pytorch.ops.moe.mega_fused_moe import (  # noqa: E402
+from primus_turbo.pytorch.ops.moe.mega_moe_fused import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
-    mega_fused_moe,
+    mega_moe_fused,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,14 +96,53 @@ def bench_kineto(fn, *, warmup=5, num_tests=20, group=None, flush_l2=True):
         prof.export_chrome_trace(tmp.name)
         events = json.loads(Path(tmp.name).read_text())["traceEvents"]
 
-    # aggregate device-side kernel durations by name over the captured num_tests calls
+    # aggregate device-side kernel durations AND launch counts by name over num_tests calls
     agg: dict[str, float] = {}
+    cnt: dict[str, int] = {}
     for ev in events:
         if ev.get("cat") in ("kernel", "Kernel") and "dur" in ev:
             agg[ev["name"]] = agg.get(ev["name"], 0.0) + float(ev["dur"])
-    breakdown = [(name, dur / num_tests) for name, dur in agg.items()]
+            cnt[ev["name"]] = cnt.get(ev["name"], 0) + 1
+    # (name, avg_us_per_iter, avg_launches_per_iter)
+    breakdown = [(name, dur / num_tests, cnt[name] / num_tests) for name, dur in agg.items()]
     breakdown.sort(key=lambda t: -t[1])
     return breakdown
+
+
+def _diff_breakdown(total_breakdown, base_breakdown, *, eps=0.05):
+    """Per-kernel backward time, isolating backward = (fwd+bwd) - fwd.
+
+    Backward is gated by LAUNCH COUNT, not time: a kernel is a backward kernel
+    only if it launches MORE times in fwd+bwd than in fwd-only. This drops
+    forward-only kernels (e.g. prologue_k_0, swiglu_kernel_0) that backward never
+    calls but whose per-call device time inflates in the fwd+bwd run (each iter's
+    prologue stalls on the prior iter's backward), which a pure time-diff would
+    otherwise mis-attribute to backward. For count-confirmed backward kernels the
+    reported time is still the time diff (approximate: the two runs profile the
+    forward independently), so small diffs are noise."""
+    base_us = {name: us for name, us, _ in base_breakdown}
+    base_n = {name: n for name, _, n in base_breakdown}
+    diff_breakdown = []
+    for name, us, n in total_breakdown:
+        bwd_launches = n - base_n.get(name, 0.0)
+        if bwd_launches < 0.5:  # not launched (more) by backward -> forward-only, drop
+            continue
+        bwd_us = us - base_us.get(name, 0.0)
+        if bwd_us > eps:
+            diff_breakdown.append((name, bwd_us, bwd_launches))
+    diff_breakdown.sort(key=lambda t: -t[1])
+    return diff_breakdown
+
+
+def _print_breakdown(title, breakdown):
+    # breakdown rows are (name, us[, launches_per_iter]); launches optional
+    total_us = sum(row[1] for row in breakdown) or 1.0
+    print(title)
+    for row in breakdown:
+        name, us = row[0], row[1]
+        n = row[2] if len(row) > 2 else 1.0
+        print(f"  {us:9.3f} us  {100.0 * us / total_us:6.2f}%  x{n:4.1f}  {name[:74]}")
+    print(f"  {total_us:9.3f} us  100.00%         TOTAL")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -233,9 +272,9 @@ def _run(local_rank, world, args):
         gate_logits.scatter_(1, topk_idx, topk_w)
 
         # warmup both (no autograd anywhere in this test)
-        # mega_fused_moe fetches the cached symmetric buffer internally (same key as `symm`)
+        # mega_moe_fused fetches the cached symmetric buffer internally (same key as `symm`)
         with torch.no_grad():
-            y_mega = mega_fused_moe(group, x, topk_idx, topk_w, W1, W2, block_m=args.bm, block_n=args.bn)
+            y_mega = mega_moe_fused(group, x, topk_idx, topk_w, W1, W2, block_m=args.bm, block_n=args.bn)
             y_turbo = baseline_reference(x, topk_idx, gate_logits)
         torch.cuda.synchronize()
         group.barrier()
@@ -257,22 +296,50 @@ def _run(local_rank, world, args):
         # every rank asserts the global verdict -> a failure propagates through spawn
         # assert all(g[3] for g in gathered), f"[{mode}] gate-3 FAILED"
 
-        # ---- perf: per-kernel breakdown of the mega forward (kineto) ----
+        # ---- perf: per-kernel breakdown of the mega forward + backward (kineto) ----
+        # backward is isolated by subtraction: profile the (grad-enabled) forward and
+        # forward+backward, then diff. The same forward closure feeds both passes, so
+        # forward kernels (incl. the save_for_backward clones) cancel exactly.
         if args.perf:
-            with torch.no_grad():
-                breakdown = bench_kineto(
-                    lambda: mega_fused_moe(
-                        group, x, topk_idx, topk_w, W1, W2, block_m=args.bm, block_n=args.bn
-                    ),
-                    num_tests=args.perf_iters,
-                    group=group,
+            grad_y = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
+
+            def _forward():
+                x_leaf = x.detach().requires_grad_(True)
+                w1_leaf = W1.detach().requires_grad_(True)
+                w2_leaf = W2.detach().requires_grad_(True)
+                return mega_moe_fused(
+                    group, x_leaf, topk_idx, topk_w, w1_leaf, w2_leaf, block_m=args.bm, block_n=args.bn
                 )
+
+            fwd_breakdown = bench_kineto(_forward, num_tests=args.perf_iters, group=group)
+            fwdbwd_breakdown = bench_kineto(
+                lambda: _forward().backward(grad_y), num_tests=args.perf_iters, group=group
+            )
             if rank == 0:
-                total_us = sum(us for _, us in breakdown) or 1.0
-                print(f"[{mode}] mega per-kernel breakdown (us/call, % of GPU time):")
-                for name, us in breakdown:
-                    print(f"  {us:9.3f} us  {100.0 * us / total_us:6.2f}%  {name[:80]}")
-                print(f"  {total_us:9.3f} us  100.00%  TOTAL")
+                bwd_breakdown = _diff_breakdown(fwdbwd_breakdown, fwd_breakdown)
+                _print_breakdown(f"[{mode}] mega FORWARD per-kernel breakdown (us/call, %):", fwd_breakdown)
+                _print_breakdown(f"[{mode}] mega BACKWARD per-kernel breakdown (us/call, %):", bwd_breakdown)
+
+            # wall-clock e2e (captures host-sync/barrier cost the kineto kernel-sum filters out)
+            import time as _time
+
+            def _walltime(fn, iters=args.perf_iters, warmup=5):
+                for _ in range(warmup):
+                    fn()
+                torch.cuda.synchronize()
+                group.barrier()
+                t0 = _time.perf_counter()
+                for _ in range(iters):
+                    fn()
+                torch.cuda.synchronize()
+                return (_time.perf_counter() - t0) / iters * 1e6  # us/iter
+
+            wt_fwd = _walltime(_forward)
+            wt_fb = _walltime(lambda: _forward().backward(grad_y))
+            if rank == 0:
+                print(
+                    f"[{mode}] WALL-CLOCK us/iter: fwd={wt_fwd:.1f}  fwd+bwd={wt_fb:.1f}  bwd={wt_fb - wt_fwd:.1f}"
+                )
         torch.cuda.synchronize()
         group.barrier()
 

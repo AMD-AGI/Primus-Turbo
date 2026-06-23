@@ -45,6 +45,13 @@ from flydsl.expr.buffer_ops import (
     get_element_ptr,
 )
 
+from primus_turbo.flydsl.mega.prims import symm_at_offset
+
+# peer base table rows (order matches SymmBuffer's buffer_offsets): the cross-rank
+# sub-buffers all live in the cached buffer heap, so one [world] base table + these
+# byte offsets replaces the old [5, world] pre-offset peer_ptrs table.
+C_ROW, SIG_ROW, ORANK_ROW, OSLOT_ROW, WEIGHT_ROW = 0, 1, 2, 3, 4
+
 _BLOCK_THREADS = int(_os.environ.get("PROLOGUE_BT", "256"))  # threads per block
 # grid_blocks (== num_cu) is a caller arg (default 64). Fewer blocks => cheaper
 # sense-reversing grid_barrier (4x per launch); 48-64 is the measured sweet spot
@@ -211,28 +218,26 @@ def grid_barrier(grid_barrier_state, num_blocks: int, thread_index):
 
 
 def barrier_block(
-    peer_ptrs,
+    buffer_base,
+    buffer_offsets,
     rank: int,
     world_size: int,
     thread_index,
     block_index,
     sync_only: bool = False,
-    signal_row_off: int = 0,
 ):
     """Cross-rank barrier (only block 0 of each rank handshakes); call at kernel top level.
-    Signal base addrs live at row ``signal_row_off`` of the combined ``peer_ptrs`` table."""
+    Peer signal base addrs come from ``symm_at`` over the [world] base table + signal offset."""
     if not sync_only:
         fence_release(scope="sys")  # flush payload before cross-rank signal
     fx.gpu.barrier()  # all pushes landed before any signal
-    signal_resource = create_buffer_resource(peer_ptrs, max_size=True)
+    base_resource = create_buffer_resource(buffer_base, max_size=True)
+    offsets_resource = create_buffer_resource(buffer_offsets, max_size=True)
+    sig_off = buffer_load(offsets_resource, fx.Int32(SIG_ROW), vec_width=1, dtype=fx.T.i64())
     if block_index == fx.Int32(0):
         if thread_index < fx.Int32(world_size):
-            my_signal_base = buffer_load(
-                signal_resource, fx.Int32(signal_row_off + rank), vec_width=1, dtype=fx.T.i64()
-            )
-            peer_signal_base = buffer_load(
-                signal_resource, fx.Int32(signal_row_off) + thread_index, vec_width=1, dtype=fx.T.i64()
-            )
+            my_signal_base = symm_at_offset(base_resource, fx.Int32(rank), sig_off)
+            peer_signal_base = symm_at_offset(base_resource, thread_index, sig_off)
             atomic_add_addr(
                 my_signal_base, thread_index, fx.Int32(_FINISHED_SUM_TAG), release=False, scope="sys"
             )
@@ -269,9 +274,9 @@ def _make_prologue(
     combine_slots = num_topk * num_tokens  # per-rank combine slots (= barrier_local len)
     c_buffer_bytes = world_size * num_experts * 4
     origin_buffer_bytes = pool_capacity * 4
-    # PEER_PTRS = one [5, world] i64 table; rows are the peer base-addr kinds.
-    # WEIGHT_ROW backs the dest pool_row_weights (per-row routing weight, for bwd).
-    C_ROW, SIG_ROW, ORANK_ROW, OSLOT_ROW, WEIGHT_ROW = 0, 1, 2, 3, 4
+    # BUFFER_BASE = [world] i64 peer heap-base table; BUFFER_OFFSETS = [5] i64 byte
+    # offsets (C/SIG/ORANK/OSLOT/WEIGHT rows). symm_at(base[peer], off[kind]) reaches
+    # each peer's sub-buffer (replaces the old [5, world] pre-offset peer_ptrs table).
     # WORKSPACE = one [5 * num_experts] i32 scratch tensor; named sub-regions by offset.
     WS_SEND, WS_WITHIN = 0, num_experts
     WS_START, WS_SROFF, WS_POOLBASE = 2 * num_experts, 3 * num_experts, 4 * num_experts
@@ -280,7 +285,8 @@ def _make_prologue(
     def prologue_k(
         TOPK_INDICES: fx.Tensor,
         WORKSPACE: fx.Tensor,
-        PEER_PTRS: fx.Tensor,
+        BUFFER_BASE: fx.Tensor,
+        BUFFER_OFFSETS: fx.Tensor,
         DESTINATION: fx.Tensor,
         START: fx.Tensor,
         COUNT: fx.Tensor,
@@ -306,7 +312,13 @@ def _make_prologue(
                 buffer_store(_read_realtime(), profile_resource, fx.Int32(0))  # [PROF] t0 = start
 
         topk_resource = create_buffer_resource(TOPK_INDICES, max_size=True)
-        peer_ptrs_resource = create_buffer_resource(PEER_PTRS, max_size=True)
+        # peer heap-base table + per-kind byte offsets -> symm_at reaches peer sub-buffers
+        base_resource = create_buffer_resource(BUFFER_BASE, max_size=True)
+        offsets_resource = create_buffer_resource(BUFFER_OFFSETS, max_size=True)
+        c_off = buffer_load(offsets_resource, fx.Int32(C_ROW), vec_width=1, dtype=fx.T.i64())
+        orank_off = buffer_load(offsets_resource, fx.Int32(ORANK_ROW), vec_width=1, dtype=fx.T.i64())
+        oslot_off = buffer_load(offsets_resource, fx.Int32(OSLOT_ROW), vec_width=1, dtype=fx.T.i64())
+        weight_off = buffer_load(offsets_resource, fx.Int32(WEIGHT_ROW), vec_width=1, dtype=fx.T.i64())
         # single scratch tensor; sub-regions addressed via WS_* offsets below
         workspace_resource = create_buffer_resource(WORKSPACE, max_size=True)
         destination_resource = create_buffer_resource(DESTINATION, max_size=True)
@@ -322,9 +334,7 @@ def _make_prologue(
         meta_scalars_resource = create_buffer_resource(META_SCALARS, max_size=True)
 
         # ---- Phase 0: init this rank's origin_rank to -1; padding rows stay -1 ----
-        my_origin_rank_address = buffer_load(
-            peer_ptrs_resource, fx.Int32(ORANK_ROW * world_size + rank), vec_width=1, dtype=fx.T.i64()
-        )
+        my_origin_rank_address = symm_at_offset(base_resource, fx.Int32(rank), orank_off)
         my_origin_rank_resource = create_buffer_resource_from_addr(
             my_origin_rank_address, num_records_bytes=origin_buffer_bytes
         )
@@ -361,18 +371,11 @@ def _make_prologue(
                 buffer_store(_read_realtime(), profile_resource, fx.Int32(2))  # [PROF] after Phase A
 
         # ---- Phase B: cross-rank all_gather; B1: all ranks entered ----
-        barrier_block(
-            PEER_PTRS, rank, world_size, thread_index, block_index, True, signal_row_off=SIG_ROW * world_size
-        )
+        barrier_block(BUFFER_BASE, BUFFER_OFFSETS, rank, world_size, thread_index, block_index, True)
         if block_index == fx.Int32(0):
             # B2: push my SEND_LOCAL row into every peer's C buffer at row rank.
             for peer_rank in range(world_size):
-                peer_c_address = buffer_load(
-                    peer_ptrs_resource,
-                    fx.Int32(C_ROW * world_size + peer_rank),
-                    vec_width=1,
-                    dtype=fx.T.i64(),
-                )
+                peer_c_address = symm_at_offset(base_resource, fx.Int32(peer_rank), c_off)
                 peer_c_resource = create_buffer_resource_from_addr(
                     peer_c_address, num_records_bytes=c_buffer_bytes
                 )
@@ -389,18 +392,14 @@ def _make_prologue(
                     )
                     push_expert_index = push_expert_index + fx.Int32(block_threads)
         # B3: all ranks pushed + landed
-        barrier_block(
-            PEER_PTRS, rank, world_size, thread_index, block_index, False, signal_row_off=SIG_ROW * world_size
-        )
+        barrier_block(BUFFER_BASE, BUFFER_OFFSETS, rank, world_size, thread_index, block_index, False)
         if is_profiler_thread:  # [PROF]
             if thread_index == fx.Int32(0):  # [PROF]
                 buffer_store(_read_realtime(), profile_resource, fx.Int32(3))  # [PROF] after Phase B
 
         # ---- Phase C: serial table build on block0 (C read coherently from own buffer) ----
         if block_index == fx.Int32(0):
-            own_c_address = buffer_load(
-                peer_ptrs_resource, fx.Int32(C_ROW * world_size + rank), vec_width=1, dtype=fx.T.i64()
-            )
+            own_c_address = symm_at_offset(base_resource, fx.Int32(rank), c_off)
             # C1 parallel across destination (per-destination local-expert cumsum)
             if thread_index < fx.Int32(world_size):
                 running_pool_offset = fx.Int32(0)
@@ -562,18 +561,8 @@ def _make_prologue(
                     routing_weight, source_weight_resource, expert_source_offset + within_expert_position
                 )  # routing weight per pair
                 destination_rank = expert_id // fx.Int32(experts_per_rank)
-                peer_origin_rank_address = buffer_load(
-                    peer_ptrs_resource,
-                    fx.Int32(ORANK_ROW * world_size) + destination_rank,
-                    vec_width=1,
-                    dtype=fx.T.i64(),
-                )
-                peer_origin_slot_address = buffer_load(
-                    peer_ptrs_resource,
-                    fx.Int32(OSLOT_ROW * world_size) + destination_rank,
-                    vec_width=1,
-                    dtype=fx.T.i64(),
-                )
+                peer_origin_rank_address = symm_at_offset(base_resource, destination_rank, orank_off)
+                peer_origin_slot_address = symm_at_offset(base_resource, destination_rank, oslot_off)
                 peer_origin_rank_resource = create_buffer_resource_from_addr(
                     peer_origin_rank_address, num_records_bytes=origin_buffer_bytes
                 )
@@ -587,14 +576,9 @@ def _make_prologue(
                 buffer_store(
                     token_index * fx.Int32(num_topk) + topk_slot, peer_origin_slot_resource, destination_row
                 )
-                # ride the routing weight cross-rank to the dest pool_row_weights[dest_row]
+                # ride the routing weight cross-rank to the dest weight_recv_buf[dest_row]
                 # (same scatter as origin) -> backward gets per-pool-row weight without all_gather.
-                peer_weight_address = buffer_load(
-                    peer_ptrs_resource,
-                    fx.Int32(WEIGHT_ROW * world_size) + destination_rank,
-                    vec_width=1,
-                    dtype=fx.T.i64(),
-                )
+                peer_weight_address = symm_at_offset(base_resource, destination_rank, weight_off)
                 peer_weight_resource = create_buffer_resource_from_addr(
                     peer_weight_address, num_records_bytes=origin_buffer_bytes
                 )
@@ -632,9 +616,7 @@ def _make_prologue(
                 buffer_store(_read_realtime(), profile_resource, fx.Int32(6))  # [PROF] after Post reset
 
         # ---- Phase E: origins landed cross-rank ----
-        barrier_block(
-            PEER_PTRS, rank, world_size, thread_index, block_index, False, signal_row_off=SIG_ROW * world_size
-        )
+        barrier_block(BUFFER_BASE, BUFFER_OFFSETS, rank, world_size, thread_index, block_index, False)
         if is_profiler_thread:  # [PROF]
             if thread_index == fx.Int32(0):  # [PROF]
                 buffer_store(_read_realtime(), profile_resource, fx.Int32(7))  # [PROF] after Phase E (end)
@@ -643,7 +625,8 @@ def _make_prologue(
     def launch(
         topk_indices,
         workspace,
-        peer_ptrs,
+        buffer_base,
+        buffer_offsets,
         destination,
         start,
         count,
@@ -664,7 +647,8 @@ def _make_prologue(
         prologue_k(
             topk_indices,
             workspace,
-            peer_ptrs,
+            buffer_base,
+            buffer_offsets,
             destination,
             start,
             count,
@@ -733,7 +717,8 @@ def mega_moe_prologue(
     topk_idx,
     topk_w,
     *,
-    peer_ptrs,
+    buffer_base,
+    buffer_offsets,
     origin_rank,
     origin_slot,
     meta_scalars,
@@ -794,7 +779,8 @@ def mega_moe_prologue(
     kernel_arguments = (
         topk_int32_view,
         workspace,
-        peer_ptrs,
+        buffer_base,
+        buffer_offsets,
         destination,
         start,
         count,
