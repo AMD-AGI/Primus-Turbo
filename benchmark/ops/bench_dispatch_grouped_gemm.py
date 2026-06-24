@@ -33,6 +33,7 @@ import sys
 from datetime import datetime
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
@@ -83,7 +84,7 @@ def _dense_gemm_peak_ms(M, N, K, BM, BN, iters, *, group_m_cands=(4,)):
     for group_m in group_m_cands:
         launch = _compile_dense_nt(K=K, BLOCK_M=BM, BLOCK_N=BN, GROUP_M=group_m, num_xcd=8)
         compiled = _get_compiled_dense(launch, dense_args)
-        ms = _bench(lambda: compiled(*dense_args), iters=iters)
+        ms = bench(lambda: compiled(*dense_args), num_tests=iters)
         if ms < best_ms:
             best_ms, best_group_m = ms, group_m
     del a, b, c
@@ -94,49 +95,35 @@ def _dense_gemm_peak_ms(M, N, K, BM, BN, iters, *, group_m_cands=(4,)):
 # Bench helper: warmup, one L2 flush before the sync, then CUDA-event timing.
 # Cross-rank variants barrier each iter (and reset the scoreboard before it).
 # --------------------------------------------------------------------------- #
-_L2_FLUSH_BUF = None
 
 
-def _l2_flush():
-    global _L2_FLUSH_BUF
-    if _L2_FLUSH_BUF is None:
-        _L2_FLUSH_BUF = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int32, device="cuda")
-    _L2_FLUSH_BUF.zero_()
+def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
+    # Flush L2 cache with 256 MB data
+    torch.cuda.synchronize()
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
 
-
-def _bench(fn, *, reset=None, group=None, warmup=5, iters=30):
-    """Mean ms/call (CUDA events).
-
-    Cross-rank discipline (group set): barrier BEFORE reset so every rank has
-    finished the previous fn (no in-flight peer signals), zero, then a second
-    barrier so all state is clean before any rank's fn pushes/signals a peer.
-    Skipping the pre-reset barrier races the scoreboard and can deadlock."""
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    def _iter(measure):
-        if group is not None:
-            torch.cuda.synchronize()
-            group.barrier()  # all ranks done with previous fn
-        if reset is not None:
-            reset()
-        if group is not None:
-            torch.cuda.synchronize()
-            group.barrier()  # all scoreboards clean before any fn
-        if not measure:
-            fn()
-            return 0.0
-        start_event.record()
+    # Warmup
+    for _ in range(num_warmups):
         fn()
-        end_event.record()
-        torch.cuda.synchronize()
-        return start_event.elapsed_time(end_event)
 
-    for _ in range(warmup):
-        _iter(False)
-    _l2_flush()
-    total_ms = sum(_iter(True) for _ in range(iters))
-    return total_ms / iters
+    # Flush L2
+    cache.zero_()
+
+    # Testingv
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    for i in range(num_tests):
+        # Record
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+        if post_fn is not None:
+            post_fn()
+    torch.cuda.synchronize()
+
+    times = np.array([s.elapsed_time(e) for s, e in zip(start_events, end_events)])[1:]
+    # np.average(times), np.min(times), np.max(times)
+    return np.average(times)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,27 +230,23 @@ def profile_dispatch(group, args, mode, W1, W2):
         remote_rows = int(count_cpu[dest_cpu != rank].sum().item())
         xgmi_bytes = remote_rows * H * 2
 
-        def _reset_scoreboard():
-            symm.scoreboard.zero_()
-
-        t_gemm = _bench(
+        t_gemm = bench(
             lambda: grouped_gemm_bf16_only(
                 pool, inp.W1, inp.l1_out, inp.tile_to_group, inp.num_tile_blocks, BM=BM, BN=BN
             ),
-            iters=args.iters,
+            num_tests=args.iters,
         )
         # dense single-weight GEMM of the same M_eff x N x K = the grouped-GEMM roofline
         group_m_cands = (1, 4, 8) if args.autotune else (args.dense_group_m,)
         t_dense, dense_group_m = _dense_gemm_peak_ms(
             M_eff, N, K, BM, BN, args.iters, group_m_cands=group_m_cands
         )
-        t_disp = _bench(
+        t_disp = bench(
             lambda: dispatch_only(x, plan, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu),
-            group=group,
-            iters=args.iters,
+            num_tests=args.iters,
         )
         # fused: full XGMI push + grouped GEMM (overlap)
-        t_fused = _bench(
+        t_fused = bench(
             lambda: dispatch_grouped_gemm_bf16(
                 x,
                 plan,
@@ -281,9 +264,7 @@ def profile_dispatch(group, args, mode, W1, W2):
                 BN=BN,
                 num_dispatch_cu=num_dispatch_cu,
             ),
-            reset=_reset_scoreboard,
-            group=group,
-            iters=args.iters,
+            num_tests=args.iters,
         )
 
         # ── backward STEP1 (= e2e dispatch_grouped_0): dispatch dy[T,H] + L2 dgrad
@@ -301,21 +282,20 @@ def profile_dispatch(group, args, mode, W1, W2):
         dispatch_only(dy, plan, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu)
         torch.cuda.synchronize()
         group.barrier()
-        t_bwd_gemm = _bench(
+        t_bwd_gemm = bench(
             lambda: grouped_gemm_bf16_only(
                 pool, inp.W2, d_swiglu, inp.tile_to_group, inp.num_tile_blocks, layout="nn", BM=BM, BN=BN
             ),
-            iters=args.iters,
+            num_tests=args.iters,
         )
         t_bwd_dense, bwd_dense_group_m = _dense_gemm_peak_ms(
             M_eff, N_bwd, K, BM, BN, args.iters, group_m_cands=group_m_cands
         )
-        t_bwd_disp = _bench(
+        t_bwd_disp = bench(
             lambda: dispatch_only(dy, plan, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu),
-            group=group,
-            iters=args.iters,
+            num_tests=args.iters,
         )
-        t_bwd_fused = _bench(
+        t_bwd_fused = bench(
             lambda: dispatch_grouped_gemm_bf16(
                 dy,
                 plan,
@@ -334,9 +314,7 @@ def profile_dispatch(group, args, mode, W1, W2):
                 BN=BN,
                 num_dispatch_cu=num_dispatch_cu,
             ),
-            reset=_reset_scoreboard,
-            group=group,
-            iters=args.iters,
+            num_tests=args.iters,
         )
         bwd = {
             "gemm_only_ms": t_bwd_gemm,
@@ -430,7 +408,7 @@ def benchmark_dispatch(local_rank, world, args):
                 f"  gemm_only    : {gemm_ms:8.3f} ms | {gemm_tf:7.1f} TFLOPS | "
                 f"grouped/dense = {grouped_eff_pct:.1f}%"
             )
-            print(f"  dispatch_only: {disp_ms:8.3f} ms | {disp_bw:7.1f} GB/s (XGMI, full push)")
+            print(f"  dispatch_only: {disp_ms:8.3f} ms | {disp_bw:7.1f} GB/s (XGMI, nodeup)")
             print(
                 f"  fused        : {fused_ms:8.3f} ms | {fused_tf:7.1f} TFLOPS | "
                 f"roofline (max(gemm,disp)/fused) = {roofline_pct:.1f}% | speedup vs serial = {speedup:.2f}x"
@@ -453,7 +431,8 @@ def benchmark_dispatch(local_rank, world, args):
             bwd_grouped_eff = bwd_gemm_tf / bwd_dense_tf * 100.0
             bwd_speedup = (bwd_gemm_ms + bwd_disp_ms) / bwd_fused_ms
             bwd_roofline = max(bwd_gemm_ms, bwd_disp_ms) / bwd_fused_ms * 100.0
-            print(f"  {'-'*68}  backward STEP1 (NN, = dispatch_grouped_0)")
+            print(f"  {'-'*68}")
+            print(f"  backward STEP1 (NN, = dispatch_grouped_0)")
             print(
                 f"  dense_gemm   : {bwd_dense_ms:8.3f} ms | {bwd_dense_tf:7.1f} TFLOPS (single-weight roofline, "
                 f"GROUP_M={per_rank[0]['bwd']['dense_gm']})"
@@ -462,7 +441,7 @@ def benchmark_dispatch(local_rank, world, args):
                 f"  gemm_only    : {bwd_gemm_ms:8.3f} ms | {bwd_gemm_tf:7.1f} TFLOPS | "
                 f"grouped/dense = {bwd_grouped_eff:.1f}%"
             )
-            print(f"  dispatch_only: {bwd_disp_ms:8.3f} ms | {bwd_disp_bw:7.1f} GB/s (XGMI, full push)")
+            print(f"  dispatch_only: {bwd_disp_ms:8.3f} ms | {bwd_disp_bw:7.1f} GB/s (XGMI, nodeup)")
             print(
                 f"  fused        : {bwd_fused_ms:8.3f} ms | {bwd_fused_tf:7.1f} TFLOPS | "
                 f"roofline (max(gemm,disp)/fused) = {bwd_roofline:.1f}% | speedup vs serial = {bwd_speedup:.2f}x"

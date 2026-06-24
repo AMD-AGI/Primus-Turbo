@@ -44,6 +44,8 @@ from flydsl.expr.buffer_ops import (
     extract_base_index,
     get_element_ptr,
 )
+from flydsl.expr.primitive import get_dyn_shared
+from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.prims import symm_at_offset
 
@@ -94,6 +96,49 @@ def _mem_fence():
     """deep_ep cheap fence: s_waitcnt drain + compiler barrier, so a following
     relaxed atomic gets release/acquire ordering."""
     _llvm.inline_asm(fx.T.i32(), [], "s_waitcnt lgkmcnt(0) vmcnt(0)", "=r,~{memory}", has_side_effects=True)
+
+
+# --------------------------------------------------------------------------- #
+# LDS (workgroup) int32 scratch -- block-private histogram to slash the global
+# atomic contention in Phase A / Phase D (32 counters hit by 32768 atomics).
+# --------------------------------------------------------------------------- #
+_LDS_SCOPE = "workgroup"
+
+
+def _lds_ptr_i32(idx):
+    """addrspace-3 (LDS) ptr to int32 element ``shared[idx]`` off the dyn-shared base."""
+    base_int = _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
+    ptr = create_llvm_ptr(base_int, 3)
+    byte_off = _unwrap_value(idx * fx.Int32(_I4))
+    return get_element_ptr(ptr, byte_offset=byte_off, elem_type=fx.T.i8())
+
+
+def lds_store_i32(idx, val):
+    """Relaxed LDS store ``shared[idx] = val``."""
+    _llvm.StoreOp(
+        _unwrap_value(val), _lds_ptr_i32(idx), ordering=_ORD.monotonic, syncscope=_LDS_SCOPE, alignment=_I4
+    )
+
+
+def lds_load_i32(idx):
+    """Relaxed LDS load ``shared[idx]``."""
+    op = _llvm.LoadOp(
+        fx.T.i32(), _lds_ptr_i32(idx), ordering=_ORD.monotonic, syncscope=_LDS_SCOPE, alignment=_I4
+    )
+    return fx.arith.ArithValue(op.result, signed=True)
+
+
+def lds_atomic_add(idx, val):
+    """LDS (ds_add) atomic int32 add into ``shared[idx]``; returns OLD value."""
+    res = _llvm.atomicrmw(
+        _llvm.AtomicBinOp.add,
+        _lds_ptr_i32(idx),
+        _unwrap_value(val),
+        _ORD.monotonic,
+        syncscope=_LDS_SCOPE,
+        alignment=_I4,
+    )
+    return fx.arith.ArithValue(res, signed=True)
 
 
 # release/acquire below = relaxed atomic + `_mem_fence()` cheap-fence drain
@@ -357,14 +402,28 @@ def _make_prologue(
             if thread_index == fx.Int32(0):  # [PROF]
                 buffer_store(_read_realtime(), profile_resource, fx.Int32(1))  # [PROF] after Phase 0 init
         # ---- Phase A: histogram TOPK_INDICES -> SEND_LOCAL; read low word of int64 pair ----
+        # Block-private LDS histogram first, then one global atomic per (block, expert):
+        # cuts global atomics from total_pairs (~32K) to grid_blocks*num_experts (~2K).
+        lds_clear_index = thread_index
+        while lds_clear_index < fx.Int32(num_experts):
+            lds_store_i32(lds_clear_index, fx.Int32(0))
+            lds_clear_index = lds_clear_index + fx.Int32(block_threads)
+        fx.gpu.barrier()
         pair_index = block_index * fx.Int32(block_threads) + thread_index
         while pair_index < fx.Int32(total_pairs):
             expert_id = buffer_load(topk_resource, pair_index + pair_index, vec_width=1, dtype=fx.T.i32())
             if expert_id >= fx.Int32(0):
-                atomic_add(
-                    WORKSPACE, fx.Int32(WS_SEND) + expert_id, fx.Int32(1), release=False, scope="agent"
-                )
+                lds_atomic_add(expert_id, fx.Int32(1))
             pair_index = pair_index + fx.Int32(grid_stride)
+        fx.gpu.barrier()
+        lds_flush_index = thread_index
+        while lds_flush_index < fx.Int32(num_experts):
+            block_count = lds_load_i32(lds_flush_index)
+            if block_count > fx.Int32(0):
+                atomic_add(
+                    WORKSPACE, fx.Int32(WS_SEND) + lds_flush_index, block_count, release=False, scope="agent"
+                )
+            lds_flush_index = lds_flush_index + fx.Int32(block_threads)
         grid_barrier(GRID_BARRIER_STATE, grid_blocks, thread_index)
         if is_profiler_thread:  # [PROF]
             if thread_index == fx.Int32(0):  # [PROF]
@@ -532,6 +591,41 @@ def _make_prologue(
                 buffer_store(_read_realtime(), profile_resource, fx.Int32(4))  # [PROF] after Phase C
 
         # ---- Phase D: scatter pairs (all blocks) ----
+        # Two-pass block-private reservation: count this block's pairs per expert in
+        # LDS, reserve one contiguous global range per (block, expert) with a single
+        # global atomic, then assign positions from an LDS cursor. Cuts the global
+        # within-counter atomics from total_pairs (~32K) to grid_blocks*num_experts.
+        # Row order within an expert is arbitrary (downstream reads by row), so a
+        # block-grouped permutation is correct (validated set-wise by the test).
+        d_clear_index = thread_index
+        while d_clear_index < fx.Int32(num_experts):
+            lds_store_i32(d_clear_index, fx.Int32(0))
+            d_clear_index = d_clear_index + fx.Int32(block_threads)
+        fx.gpu.barrier()
+        count_pair_index = block_index * fx.Int32(block_threads) + thread_index
+        while count_pair_index < fx.Int32(total_pairs):
+            count_expert_id = buffer_load(
+                topk_resource, count_pair_index + count_pair_index, vec_width=1, dtype=fx.T.i32()
+            )
+            if count_expert_id >= fx.Int32(0):
+                lds_atomic_add(count_expert_id, fx.Int32(1))
+            count_pair_index = count_pair_index + fx.Int32(grid_stride)
+        fx.gpu.barrier()
+        reserve_index = thread_index
+        while reserve_index < fx.Int32(num_experts):
+            block_expert_count = lds_load_i32(reserve_index)
+            if block_expert_count > fx.Int32(0):
+                reserved_base = atomic_add(
+                    WORKSPACE,
+                    fx.Int32(WS_WITHIN) + reserve_index,
+                    block_expert_count,
+                    release=False,
+                    scope="agent",
+                )
+                lds_store_i32(fx.Int32(num_experts) + reserve_index, reserved_base)  # global base
+                lds_store_i32(reserve_index, fx.Int32(0))  # reset to per-block cursor
+            reserve_index = reserve_index + fx.Int32(block_threads)
+        fx.gpu.barrier()
         pair_index = block_index * fx.Int32(block_threads) + thread_index
         while pair_index < fx.Int32(total_pairs):
             expert_id = buffer_load(
@@ -540,9 +634,8 @@ def _make_prologue(
             if expert_id >= fx.Int32(0):
                 token_index = pair_index // fx.Int32(num_topk)
                 topk_slot = pair_index % fx.Int32(num_topk)
-                within_expert_position = atomic_add(
-                    WORKSPACE, fx.Int32(WS_WITHIN) + expert_id, fx.Int32(1), release=False, scope="agent"
-                )
+                local_position = lds_atomic_add(expert_id, fx.Int32(1))
+                within_expert_position = lds_load_i32(fx.Int32(num_experts) + expert_id) + local_position
                 expert_start = buffer_load(
                     workspace_resource, fx.Int32(WS_START) + expert_id, vec_width=1, dtype=fx.T.i32()
                 )
@@ -665,7 +758,10 @@ def _make_prologue(
             scoreboard,
             barrier_local,
         ).launch(  # [PROF]
-            grid=(grid_blocks, 1, 1), block=(block_threads, 1, 1), stream=stream
+            grid=(grid_blocks, 1, 1),
+            block=(block_threads, 1, 1),
+            stream=stream,
+            smem=2 * num_experts * 4,  # LDS int32: Phase A hist; Phase D cursor+base
         )
 
     return launch
@@ -694,6 +790,11 @@ def _compile(
         pool_capacity,
         grid_blocks=grid_blocks,
     )
+
+
+# Module-level fast-launch cache (function/stream-keyed CallState) used when the
+# caller does not supply its own launch_cache.
+_DEFAULT_LAUNCH_CACHE: dict = {}
 
 
 @functools.lru_cache(maxsize=8)
@@ -763,6 +864,11 @@ def mega_moe_prologue(
         topk_weights_flat = topk_w.to(torch.float32).contiguous().view(-1)
     else:  # no weights given -> internal zeros (topk_w is None branch)
         topk_weights_flat = torch.zeros(num_tokens * num_topk, dtype=torch.float32, device=dev)
+
+    # Default to the module-level launch cache so callers that don't pass one (e.g.
+    # the test / custom-op path) still hit the pre-packed CallState fast launch.
+    if launch_cache is None:
+        launch_cache = _DEFAULT_LAUNCH_CACHE
 
     stream = torch.cuda.current_stream()
     launch_function = _compile(
