@@ -36,6 +36,49 @@ import torch
 import triton
 import triton.language as tl
 
+_seen_vk_configs: set[tuple] = set()
+
+
+def _log_vk_kernel_config(
+    lhs, rhs, out, lhs_scale, rhs_scale, group_offs,
+    G, OUT_M, OUT_N,
+    stride_lhs_m, stride_rhs_m, stride_cg, stride_cm, stride_cn,
+    stride_lhs_n, stride_rhs_n,
+    blk_m, blk_n, blk_k, group_m, num_sms,
+    chunk_size, cache_a, cache_b, BETA_IS_ONE, num_stages_val,
+):
+    def _tensor_key(t):
+        return (tuple(t.shape), str(t.dtype))
+
+    key = (
+        _tensor_key(lhs), _tensor_key(rhs), _tensor_key(out),
+        _tensor_key(lhs_scale), _tensor_key(rhs_scale), _tensor_key(group_offs),
+        G, OUT_M, OUT_N,
+        stride_lhs_m, stride_rhs_m, stride_cg, stride_cm, stride_cn,
+        stride_lhs_n, stride_rhs_n,
+        blk_m, blk_n, blk_k, group_m, num_sms,
+        chunk_size, cache_a, cache_b, BETA_IS_ONE, num_stages_val,
+    )
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank == 0 and key not in _seen_vk_configs:
+        _seen_vk_configs.add(key)
+        print(
+            f"[grouped_vk_fp8] NEW config:\n"
+            f"  lhs={lhs.shape} {lhs.dtype}  rhs={rhs.shape} {rhs.dtype}\n"
+            f"  out={out.shape} {out.dtype}  lhs_scale={lhs_scale.shape} {lhs_scale.dtype}\n"
+            f"  rhs_scale={rhs_scale.shape} {rhs_scale.dtype}  group_offs={group_offs.shape} {group_offs.dtype}\n"
+            f"  G={G}  OUT_M={OUT_M}  OUT_N={OUT_N}\n"
+            f"  strides: lhs_m={stride_lhs_m} rhs_m={stride_rhs_m} cg={stride_cg} cm={stride_cm} cn={stride_cn}\n"
+            f"  stride_lhs_n={stride_lhs_n}  stride_rhs_n={stride_rhs_n}\n"
+            f"  BLOCK_SIZE_M={blk_m}  BLOCK_SIZE_N={blk_n}  BLOCK_SIZE_K={blk_k}\n"
+            f"  GROUP_SIZE_M={group_m}  NUM_SMS={num_sms}  NUM_XCDS={NUM_XCDS}\n"
+            f"  CHUNK_SIZE={chunk_size}  CACHE_A={cache_a}  CACHE_B={cache_b}\n"
+            f"  BETA_IS_ONE={BETA_IS_ONE}  num_stages={num_stages_val}\n"
+            f"  num_warps=8  waves_per_eu=0  matrix_instr_nonkdim=16  kpack=1",
+            flush=True,
+        )
+
+
 from primus_turbo.triton.gemm.gemm_kernel import (
     _calculate_lds_usage,
     _get_hardware,
@@ -654,7 +697,206 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     return out
 
 
-# ── Tensorwise FP8 Variable-K Backward ──
+# ── Tensorwise FP8 Variable-K Backward (dot_scaled kernel) ──
+
+
+@triton.jit()
+def _grouped_variable_k_dot_scaled_gemm_kernel(
+    LHS, RHS, C,
+    LHS_scale_ptr, RHS_scale_ptr,
+    group_offs_ptr,
+    G, OUT_M, OUT_N,
+    stride_lhs_m, stride_rhs_m,
+    stride_cg, stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
+):
+    """Variable-K grouped FP8 GEMM using tl.dot_scaled (v_mfma_f32_32x32x64_f8f6f4).
+
+    Hardcoded for the gpt-oss MoE wgrad path on MI355X:
+      - stride_lhs_n=1, stride_rhs_n=1 (row-major LHS/RHS)
+      - NUM_XCDS=8 (always multi-XCD, chiplet transform unconditional)
+      - BETA_IS_ONE=True (always fused accumulation: C[g] += result)
+
+    Both operands are e4m3fn (fnuz); the hardware decodes them as e4m3 OCP
+    (bias 7 vs 8), so each operand is 2x too large and the product 4x.
+    A combined_scale factor of lhs_scale * rhs_scale * 0.25 corrects this.
+    """
+    pid = tl.program_id(0)
+    pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
+
+    tiles_m = tl.cdiv(OUT_M, BLOCK_SIZE_M)
+    tiles_n = tl.cdiv(OUT_N, BLOCK_SIZE_N)
+    tiles_per_group = tiles_m * tiles_n
+    total_tiles = G * tiles_per_group
+
+    lhs_scale = tl.load(LHS_scale_ptr).to(tl.float32)
+    rhs_scale = tl.load(RHS_scale_ptr).to(tl.float32)
+    combined_scale = lhs_scale * rhs_scale * 0.25
+
+    num_pid_in_group = tiles_n * GROUP_SIZE_M
+
+    tl.assume(stride_lhs_m > 0)
+    tl.assume(stride_rhs_m > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    for global_tile in range(pid, total_tiles, NUM_SMS):
+        group_idx = global_tile // tiles_per_group
+        local_tile = global_tile - group_idx * tiles_per_group
+
+        swizzle_group = local_tile // num_pid_in_group
+        first_pid_m = swizzle_group * GROUP_SIZE_M
+        group_size_m = min(tiles_m - first_pid_m, GROUP_SIZE_M)
+        pid_in_group = local_tile % num_pid_in_group
+        pid_m = first_pid_m + pid_in_group % group_size_m
+        pid_n = pid_in_group // group_size_m
+
+        k_start = tl.load(group_offs_ptr + group_idx)
+        k_end = tl.load(group_offs_ptr + group_idx + 1)
+        k_len = (k_end - k_start).to(tl.int32)
+
+        rm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        rn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        rk = tl.arange(0, BLOCK_SIZE_K)
+
+        mask_m = rm < OUT_M
+        mask_n = rn < OUT_N
+
+        A_BASE = LHS + k_start * stride_lhs_m + rm[:, None] + rk[None, :] * stride_lhs_m
+        B_BASE = RHS + k_start * stride_rhs_m + rk[:, None] * stride_rhs_m + rn[None, :]
+
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        k_stride_a = BLOCK_SIZE_K * stride_lhs_m
+        k_stride_b = BLOCK_SIZE_K * stride_rhs_m
+
+        loop_k = tl.cdiv(k_len, BLOCK_SIZE_K)
+        for k in range(loop_k):
+            k_remaining = k_len - k * BLOCK_SIZE_K
+            mask_k = rk < k_remaining
+            a = tl.load(A_BASE, mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+                        cache_modifier=CACHE_MODIFIER_A)
+            b = tl.load(B_BASE, mask=mask_k[:, None] & mask_n[None, :], other=0.0,
+                        cache_modifier=CACHE_MODIFIER_B)
+            acc = tl.dot_scaled(a, None, "e4m3", b, None, "e4m3", acc=acc)
+            A_BASE += k_stride_a
+            B_BASE += k_stride_b
+
+        acc = acc * combined_scale
+
+        c_ptr = C + group_idx.to(tl.int64) * stride_cg + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+        c_mask = mask_m[:, None] & mask_n[None, :]
+
+        prev = tl.load(c_ptr, mask=c_mask, other=0.0).to(tl.float32)
+        acc = acc + prev
+
+        tl.store(c_ptr, acc.to(C.type.element_ty), mask=c_mask)
+
+
+@triton.jit()
+def _grouped_variable_k_dot_scaled_mixed_gemm_kernel(
+    LHS, RHS, C,
+    LHS_scale_ptr, RHS_scale_ptr,
+    group_offs_ptr,
+    G, OUT_M, OUT_N,
+    stride_lhs_m, stride_rhs_m,
+    stride_cg, stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    CACHE_MODIFIER_A: tl.constexpr,
+    CACHE_MODIFIER_B: tl.constexpr,
+):
+    """Variable-K grouped FP8 GEMM using tl.dot_scaled with mixed e4m3/e5m2 types.
+
+    Hardcoded for the gpt-oss MoE wgrad path on MI355X:
+      - LHS (grad_out) is e4m3fn, RHS (activations) is e5m2fn
+      - stride_lhs_n=1, stride_rhs_n=1 (row-major)
+      - NUM_XCDS=8, fused accumulation (C[g] += result)
+
+    fnuz→OCP bias correction: e4m3 (bias 8→7) = 2x, e5m2 (bias 16→15) = 2x,
+    product is 4x too large. combined_scale includes *0.25 correction.
+    """
+    pid = tl.program_id(0)
+    pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
+
+    tiles_m = tl.cdiv(OUT_M, BLOCK_SIZE_M)
+    tiles_n = tl.cdiv(OUT_N, BLOCK_SIZE_N)
+    tiles_per_group = tiles_m * tiles_n
+    total_tiles = G * tiles_per_group
+
+    lhs_scale = tl.load(LHS_scale_ptr).to(tl.float32)
+    rhs_scale = tl.load(RHS_scale_ptr).to(tl.float32)
+    combined_scale = lhs_scale * rhs_scale * 0.25
+
+    num_pid_in_group = tiles_n * GROUP_SIZE_M
+
+    tl.assume(stride_lhs_m > 0)
+    tl.assume(stride_rhs_m > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    for global_tile in range(pid, total_tiles, NUM_SMS):
+        group_idx = global_tile // tiles_per_group
+        local_tile = global_tile - group_idx * tiles_per_group
+
+        swizzle_group = local_tile // num_pid_in_group
+        first_pid_m = swizzle_group * GROUP_SIZE_M
+        group_size_m = min(tiles_m - first_pid_m, GROUP_SIZE_M)
+        pid_in_group = local_tile % num_pid_in_group
+        pid_m = first_pid_m + pid_in_group % group_size_m
+        pid_n = pid_in_group // group_size_m
+
+        k_start = tl.load(group_offs_ptr + group_idx)
+        k_end = tl.load(group_offs_ptr + group_idx + 1)
+        k_len = (k_end - k_start).to(tl.int32)
+
+        rm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        rn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        rk = tl.arange(0, BLOCK_SIZE_K)
+
+        mask_m = rm < OUT_M
+        mask_n = rn < OUT_N
+
+        A_BASE = LHS + k_start * stride_lhs_m + rm[:, None] + rk[None, :] * stride_lhs_m
+        B_BASE = RHS + k_start * stride_rhs_m + rk[:, None] * stride_rhs_m + rn[None, :]
+
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        k_stride_a = BLOCK_SIZE_K * stride_lhs_m
+        k_stride_b = BLOCK_SIZE_K * stride_rhs_m
+
+        loop_k = tl.cdiv(k_len, BLOCK_SIZE_K)
+        for k in range(loop_k):
+            k_remaining = k_len - k * BLOCK_SIZE_K
+            mask_k = rk < k_remaining
+            a = tl.load(A_BASE, mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+                        cache_modifier=CACHE_MODIFIER_A)
+            b = tl.load(B_BASE, mask=mask_k[:, None] & mask_n[None, :], other=0.0,
+                        cache_modifier=CACHE_MODIFIER_B)
+            acc = tl.dot_scaled(a, None, "e4m3", b, None, "e5m2", acc=acc)
+            A_BASE += k_stride_a
+            B_BASE += k_stride_b
+
+        acc = acc * combined_scale
+
+        c_ptr = C + group_idx.to(tl.int64) * stride_cg + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+        c_mask = mask_m[:, None] & mask_n[None, :]
+
+        prev = tl.load(c_ptr, mask=c_mask, other=0.0).to(tl.float32)
+        acc = acc + prev
+
+        tl.store(c_ptr, acc.to(C.type.element_ty), mask=c_mask)
 
 
 def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
@@ -720,7 +962,16 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
     )
 
-    _grouped_variable_k_gemm_kernel[(num_sms,)](
+    # _log_vk_kernel_config(
+    #     lhs, rhs, out, lhs_scale, rhs_scale, group_offs,
+    #     G, OUT_M, OUT_N,
+    #     lhs.stride(0), rhs.stride(0), out.stride(0), out.stride(1), out.stride(2),
+    #     lhs.stride(1), rhs.stride(1),
+    #     blk_m, blk_n, blk_k, group_m, num_sms,
+    #     chunk_size, cache_a, cache_b, BETA_IS_ONE, num_stages_val,
+    # )
+
+    _grouped_variable_k_dot_scaled_gemm_kernel[(num_sms,)](
         lhs,
         rhs,
         out,
@@ -735,8 +986,6 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        stride_lhs_n=lhs.stride(1),
-        stride_rhs_n=rhs.stride(1),
         BLOCK_SIZE_M=blk_m,
         BLOCK_SIZE_N=blk_n,
         BLOCK_SIZE_K=blk_k,
@@ -744,10 +993,8 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
-        IS_FP8=True,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
-        BETA_IS_ONE=BETA_IS_ONE,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
