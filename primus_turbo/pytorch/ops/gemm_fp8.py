@@ -186,12 +186,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             )
 
         if ctx.use_nt_layout_gemm_in_bwd:
-            quantized_grad_out_t = QuantizedTensor.quantize(
-                grad_out.t().contiguous(),
-                grad_out_dtype,
-                ctx.config.granularity,
-                axis=-1,
-            )
+            quantized_grad_out_t = quantized_grad_out.t().contiguous()
 
             b_grad = gemm_fp8_impl(
                 a_fp8_colwise,
