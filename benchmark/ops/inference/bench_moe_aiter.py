@@ -7,8 +7,10 @@
 """Inference MoE micro-benchmark for aiter's fused_moe (forward-only).
 
 Same kernel vLLM/SGLang call on ROCm: ``aiter.fused_moe.fused_moe``. Supports
-bf16 / fp8 (block, per-channel) / mxfp4 weights via --quant. Simulates one rank
-under TP (shard intermediate) or EP (shard experts).
+bf16 / fp8 (block, per-channel) / mxfp4 w4a4 / mxfp4 w4a8 weights via --quant.
+``fp4_w4a8`` (mxfp4 weight + fp8 activation) is DeepSeek-V4's deploy format -- the
+aiter ``flydsl_moe*_afp8_wfp4`` family, tuned via ``dsv4_fp8fp4_tuned_fmoe.csv``.
+Simulates one rank under TP (shard intermediate) or EP (shard experts).
 
 --variance (>=0) sets expert-load imbalance: the variance of per-expert load
 normalized to mean 1 (squared coefficient of variation). 0=perfectly balanced;
@@ -68,6 +70,7 @@ MODELS = {
 DEFAULT_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
 
 _USE_CUDAGRAPH = True  # time via CUDA-graph replay (matches SGLang/vLLM decode); set by main().
+_SHOW_KERNEL = False  # if True, don't suppress aiter output (surfaces its kernel-selection log).
 
 
 @contextlib.contextmanager
@@ -75,8 +78,15 @@ def suppress_output():
     """Silence aiter's chatty per-call stdout/stderr at the fd level.
 
     Uses os.dup2 so both print() and logging (whose handlers may hold the
-    original stream) are captured, keeping the result table readable.
+    original stream) are captured, keeping the result table readable. When
+    --show-kernel is set this becomes a no-op so aiter's
+    ``[fused_moe] using 2stage (kernelName1=...)`` line is visible -- the only
+    reliable way to confirm fp4_w4a8 dispatched to the afp8_wfp4 (w4a8) kernel
+    rather than an afp4 (w4a4) / bf16-activation fallback.
     """
+    if _SHOW_KERNEL:
+        yield
+        return
     with open(os.devnull, "w") as devnull:
         old_out, old_err = os.dup(1), os.dup(2)
         os.dup2(devnull.fileno(), 1)
@@ -196,7 +206,10 @@ def quantize_weights(w1, w2, quant):
     none      : bf16, no scales.
     fp8_block : per-128x128 block fp8 (DeepSeek convention).
     fp8_token : per-output-channel fp8 (per-token activations).
-    fp4       : mxfp4 (fp4x2 weights + e8m0 block scales).
+    fp4       : mxfp4 w4a4 (fp4x2 weights + e8m0 block scales; fp4 activations).
+    fp4_w4a8  : mxfp4 w4a8 (same fp4x2 weights, but fp8 activations -- DeepSeek-V4
+                deploy format). Weight prep is identical to fp4; only the activation
+                dtype aiter picks differs (M >= --fp8-act-bound -> fp8, else bf16).
     """
     if quant == "none":
         w1_k = shuffle_weight(w1, layout=(16, 16))
@@ -221,9 +234,14 @@ def quantize_weights(w1, w2, quant):
         w2_k = shuffle_weight(w2_q, layout=(16, 16))
         return w1_k, w2_k, w1_s, w2_s, QuantType.per_Token
 
-    if quant == "fp4":
-        # mxfp4 (a4w4): fp4x2 weights + e8m0 block scales; the kernel quantizes
-        # bf16 activations to fp4 internally. Mirrors aiter test_moe_2stage.py.
+    if quant in ("fp4", "fp4_w4a8"):
+        # mxfp4: fp4x2 weights + e8m0 (1x32) block scales. Weight prep is identical
+        # for both modes; aiter selects the *activation* dtype internally:
+        #   fp4      -> a4w4 (kernel quantizes activations to fp4 -- but note at
+        #              small M aiter may fall back to bf16 activations).
+        #   fp4_w4a8 -> a8w4 (fp8 activations) once M >= --fp8-act-bound (via
+        #              AITER_BF16_FP8_MOE_BOUND); the DeepSeek-V4 afp8_wfp4 path.
+        # Mirrors aiter test_moe_2stage.py.
         tq = aiter.get_torch_quant(QuantType.per_1x32)
 
         def _q(w):
@@ -468,9 +486,18 @@ def main():
     )
     parser.add_argument(
         "--quant",
-        choices=["none", "fp8_block", "fp8_token", "fp4"],
+        choices=["none", "fp8_block", "fp8_token", "fp4", "fp4_w4a8"],
         default="none",
-        help="Quantization: none (bf16), fp8_block (per-128x128), fp8_token (per-channel), fp4 (mxfp4).",
+        help="Quantization: none (bf16), fp8_block (per-128x128), fp8_token (per-channel), "
+        "fp4 (mxfp4 w4a4), fp4_w4a8 (mxfp4 weight + fp8 activation; DeepSeek-V4 deploy format).",
+    )
+    parser.add_argument(
+        "--fp8-act-bound",
+        type=int,
+        default=256,
+        help="fp4_w4a8 only: token-count (M) threshold above which aiter uses fp8 activations "
+        "(w4a8); below it activations stay bf16 (w4a16). Default 256 matches aiter and real "
+        "serving (decode rows -> w4a16, prefill -> w4a8). Set 0 to force uniform w4a8.",
     )
     # Parallelism (TP or EP, mutually exclusive)
     parser.add_argument(
@@ -515,6 +542,12 @@ def main():
     )
     parser.set_defaults(cudagraph=True)
     parser.add_argument(
+        "--show-kernel",
+        action="store_true",
+        help="Don't suppress aiter output, so its kernel-selection log is visible. Use to "
+        "confirm fp4_w4a8 picked an 'afp8_wfp4' (w4a8) kernel and not 'afp4' (w4a4).",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -530,10 +563,21 @@ def main():
     args = parser.parse_args()
     assert args.variance >= 0.0, "--variance must be >= 0"
 
+    if args.quant == "fp4_w4a8":
+        # aiter's fused_moe auto-selects the activation dtype for per_1x32 fp4
+        # weights: bf16 activations (w4a16) for M < bound, fp8 (the afp8_wfp4 /
+        # w4a8 path) for M >= bound. Default 256 matches aiter and real serving
+        # (decode rows stay w4a16, prefill rows go w4a8); --fp8-act-bound 0 forces
+        # uniform w4a8 across the whole sweep. aiter reads this per-call, so
+        # setting it here (after import) is effective. Use --show-kernel to
+        # confirm which rows actually dispatched to afp8_wfp4.
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = str(args.fp8_act_bound)
+
     assert torch.cuda.is_available(), "This benchmark requires a GPU."
     torch.manual_seed(args.seed)
-    global _USE_CUDAGRAPH
+    global _USE_CUDAGRAPH, _SHOW_KERNEL
     _USE_CUDAGRAPH = args.cudagraph
+    _SHOW_KERNEL = args.show_kernel
     tp_size, ep_size = args.tp_size, args.ep_size
     assert tp_size >= 1 and ep_size >= 1, "tp/ep size must be >= 1"
     assert not (tp_size > 1 and ep_size > 1), "Enable either TP or EP, not both."
