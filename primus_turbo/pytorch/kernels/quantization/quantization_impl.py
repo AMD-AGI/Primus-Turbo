@@ -418,7 +418,12 @@ def quantize_mxfp8_impl(
         scaling_recipe_for_trans = scaling_recipe
 
     if not with_trans:
-        assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
+        if x.ndim == 2:
+            assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False and x is 2D."
+        elif x.ndim == 3:
+            assert axis in (1, 2), "The axis must be 1 or 2 when with_trans is False and x is 3D."
+        else:
+            raise ValueError(f"The input tensor must be 2D or 3D but got {x.ndim}D.")
     else:
         assert axis is None, "The axis must be None when with_trans is True."
 
@@ -493,7 +498,6 @@ def grouped_quantize_mxfp8_impl(
             group_lens,
             group_offs,
             out_dtype,
-            MXFP8_PADDING_ALIGN_SIZE,
             scaling_recipe.use_2d_block,
             scaling_recipe_for_trans.use_2d_block,
             scaling_recipe.shuffle_scale,
@@ -520,16 +524,19 @@ def dequantize_mxfp8_impl(
     x: torch.Tensor, out_dtype: torch.dtype, axis: int, block_size: int, scale_inv: torch.Tensor
 ) -> torch.Tensor:
     assert x.is_contiguous(), "The x tensor must be contiguous."
-    assert x.dim() == 2, "The x must be 2D tensor."
-    assert scale_inv.dim() == 2, "The scale_inv must be 2D tensor."
+    assert x.dim() in (2, 3), "The x must be a 2D or 3D tensor."
+    assert scale_inv.dim() == x.dim(), "The scale_inv rank must match x."
     assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
-    assert axis in (0, 1), "The axis must be 0 or 1."
+    if x.dim() == 2:
+        assert axis in (0, 1), "The axis must be 0 or 1 for 2D input."
+    else:
+        assert axis in (1, 2), "The axis must be 1 or 2 for 3D input."
     SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
     assert (
         out_dtype in SUPPORTED_OUT_DTYPES
     ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
 
-    _, row_length = x.size()
+    row_length = x.size(-1)
     assert (
         row_length % block_size == 0
     ), "The last dimension of the x tensor must be divisible by the block size."

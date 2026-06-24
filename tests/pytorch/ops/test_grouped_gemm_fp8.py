@@ -595,6 +595,7 @@ def _run_grouped_gemm_fp8_quantized_tensor_test(
     assert granularity in (
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
+        ScalingGranularity.MX_BLOCKWISE,
     ), "Grouped QuantizedTensor only supports TENSORWISE and ROWWISE"
 
     GlobalBackendManager.set_grouped_gemm_backend(backend)

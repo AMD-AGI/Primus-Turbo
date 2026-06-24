@@ -48,14 +48,37 @@ at::Tensor dequantize_fp8_rowwise_meta(const at::Tensor input, const at::Tensor 
 at::Tensor dequantize_mxfp8_meta(const at::Tensor input, const at::Tensor scale_inv,
                                  const int64_t axis, const int64_t block_size,
                                  const at::ScalarType dest_dtype) {
-    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
-    PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
-    const int64_t num_rows   = input.size(0);
-    const int64_t row_length = input.size(1);
-    at::Tensor    output =
-        (axis == 1) ? at::empty({num_rows, row_length}, at::dtype(dest_dtype).device(at::kMeta))
-                       : at::empty({row_length, num_rows}, at::dtype(dest_dtype).device(at::kMeta));
-    return output;
+    PRIMUS_TURBO_CHECK(input.dim() == 2 || input.dim() == 3, "Input must be 2D or 3D");
+    PRIMUS_TURBO_CHECK(scale_inv.dim() == input.dim(), "scale_inv rank must match input");
+
+    const bool is_batched = (input.dim() == 3);
+    bool       use_rowwise;
+    int64_t    num_rows;
+    int64_t    row_length;
+    if (input.dim() == 2) {
+        PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1 for 2D input");
+        use_rowwise = (axis == 1);
+        num_rows    = input.size(0);
+        row_length  = input.size(1);
+    } else {
+        PRIMUS_TURBO_CHECK(axis == 1 || axis == 2, "Axis must be 1 or 2 for 3D input");
+        use_rowwise = (axis == 2);
+        num_rows    = input.size(0) * input.size(1);
+        row_length  = input.size(2);
+    }
+
+    at::Tensor output_2d =
+        use_rowwise ? at::empty({num_rows, row_length}, at::dtype(dest_dtype).device(at::kMeta))
+                    : at::empty({row_length, num_rows}, at::dtype(dest_dtype).device(at::kMeta));
+
+    if (is_batched) {
+        if (use_rowwise) {
+            return output_2d.reshape({input.size(0), input.size(1), row_length});
+        }
+        return output_2d.reshape({row_length, input.size(0), input.size(1)}).permute({1, 2, 0});
+    }
+
+    return output_2d;
 }
 
 at::Tensor dequantize_mxfp4_meta(const at::Tensor input, const at::Tensor scale_inv,
@@ -323,6 +346,73 @@ quantize_mxfp8_dual_meta(const at::Tensor input, const at::ScalarType dest_dtype
             colwise_output.view(dest_dtype), colwise_scale.view(at::kFloat8_e8m0fnu)};
 }
 
+std::vector<at::Tensor> grouped_quantize_mxfp8_meta(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const int64_t axis, const int64_t padding_align_size,
+    const bool use_2d_block, const bool shuffle_scale, const bool shuffle_out) {
+    using namespace primus_turbo::detail;
+    auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
+
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
+                       "Input must be BFloat16 or Half");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat8_e4m3fn || dest_dtype == at::kFloat8_e5m2,
+                       "Output must be Float8_e4m3fn or Float8_e5m2");
+    PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+    PRIMUS_TURBO_CHECK(padding_align_size == MXFP8_K_DIM_PADDING_ALIGN_SIZE,
+                       "padding_align_size must be ", MXFP8_K_DIM_PADDING_ALIGN_SIZE,
+                       " for MXFP8. But got padding_align_size=", padding_align_size);
+
+    const bool is_rowwise = (axis != 0);
+
+    constexpr int64_t ROW_ALIGN = MXFP8_GROUP_M_PADDING_ALIGN_SIZE; // = 32
+    constexpr int64_t COL_ALIGN = MXFP8_K_DIM_PADDING_ALIGN_SIZE;   // = 128
+
+    const int64_t G       = group_lens.size(0);
+    const int64_t total_M = input.size(0);
+    const int64_t N       = input.size(1);
+    const int64_t M_align = is_rowwise ? ROW_ALIGN : COL_ALIGN;
+    const int64_t M_pad   = cdiv(total_M + G * M_align, M_align) * M_align;
+    const int64_t N_pad   = cdiv(N, COL_ALIGN) * COL_ALIGN;
+
+    PRIMUS_TURBO_CHECK(N % MXFP8_BLOCK_SIZE == 0, "N must be divisible by ", MXFP8_BLOCK_SIZE);
+
+    if (shuffle_out) {
+        if (is_rowwise) {
+            PRIMUS_TURBO_CHECK(M_pad % MXFP8_SHUFFLE_BN == 0, "M_pad must be divisible by ",
+                               MXFP8_SHUFFLE_BN, " for shuffled rowwise FP8");
+        } else {
+            PRIMUS_TURBO_CHECK(N % MXFP8_SHUFFLE_BN == 0, "N must be divisible by ",
+                               MXFP8_SHUFFLE_BN, " for shuffled colwise FP8");
+        }
+    }
+
+    int64_t scale_outer = is_rowwise ? M_pad : N;
+    int64_t scale_N = is_rowwise ? cdiv(N_pad, MXFP8_BLOCK_SIZE) : cdiv(M_pad, MXFP8_BLOCK_SIZE);
+    int64_t scale_M_pad = cdiv(scale_outer, 256) * 256;
+    int64_t scale_N_pad = cdiv(scale_N, 8) * 8;
+
+    at::Tensor scale_tensor;
+    if (shuffle_scale) {
+        scale_tensor = at::empty({scale_M_pad, scale_N_pad},
+                                 at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    } else {
+        scale_tensor = at::empty({scale_outer, scale_N},
+                                 at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    }
+
+    int64_t    output_rows = is_rowwise ? M_pad : N;
+    int64_t    output_cols = is_rowwise ? N_pad : M_pad;
+    at::Tensor output      = at::empty({output_rows, output_cols},
+                                       at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+
+    auto group_lens_padded = at::empty_like(group_lens, group_lens.options().device(at::kMeta));
+    auto group_offs_padded = at::empty({G + 1}, group_offs.options().device(at::kMeta));
+
+    return {output.view(dest_dtype), scale_tensor.view(at::kFloat8_e8m0fnu), group_lens_padded,
+            group_offs_padded};
+}
+
 std::vector<at::Tensor>
 grouped_quantize_mxfp8_dual_meta(const at::Tensor input, const at::Tensor group_lens,
                                  const at::Tensor group_offs, const at::ScalarType dest_dtype,
@@ -405,7 +495,6 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
                        "Input must be BFloat16 or Half");
     PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat8_e4m3fn || dest_dtype == at::kFloat8_e5m2,
                        "Output must be Float8_e4m3fn or Float8_e5m2");
-    PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
     PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
     // Guard the public op argument against zero/negative values (would otherwise
     // divide-by-zero in cdiv below) and lock it to the expected MXFP8 constant.
@@ -413,18 +502,20 @@ std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::Sc
                        "padding_align_size must be ", MXFP8_K_DIM_PADDING_ALIGN_SIZE,
                        " for MXFP8. But got padding_align_size=", padding_align_size);
 
-    // Mirror the CUDA impl: ``axis`` is locked to {0, 1}. 2D maps axis==0 ->
-    // COLWISE / axis==1 -> ROWWISE; 3D maps axis==1 -> COLWISE, otherwise
-    // ROWWISE, with a leading group dim ``G`` and 3D views on the output.
+    // Mirror the CUDA impl: 2D uses axis in {0, 1}; 3D uses axis in {1, 2}.
+    // 2D maps axis==0 -> COLWISE / axis==1 -> ROWWISE; 3D maps axis==1 ->
+    // COLWISE / axis==2 -> ROWWISE, with a leading group dim ``G``.
     bool    is_rowwise;
     int64_t G, M, N;
     if (input.dim() == 2) {
+        PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1 for 2D input");
         is_rowwise = (axis != 0); // axis==0 -> COLWISE, axis==1 -> ROWWISE
         G          = 1;
         M          = input.size(0);
         N          = input.size(1);
     } else if (input.dim() == 3) {
-        is_rowwise = (axis != 1); // axis==1 -> COLWISE, otherwise ROWWISE
+        PRIMUS_TURBO_CHECK(axis == 1 || axis == 2, "Axis must be 1 or 2 for 3D input");
+        is_rowwise = (axis != 1); // axis==1 -> COLWISE, axis==2 -> ROWWISE
         G          = input.size(0);
         M          = input.size(1);
         N          = input.size(2);

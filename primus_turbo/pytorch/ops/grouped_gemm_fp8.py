@@ -681,7 +681,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             default_backend=BackendType.TRITON.value,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
-        return grad_a, grad_b, None, None, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None, None, None, None
 
 
 @torch._dynamo.disable(
@@ -769,6 +769,8 @@ def grouped_gemm_fp8(
         return FP8GroupedGemmBlockFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
         # MXFP8: raw tensors; quant + grouped GEMM via the Triton MX backend.
-        return FP8GroupedGemmMXFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
+        return FP8GroupedGemmMXFunc.apply(
+            a_data, b_data, a_data_t, b_data_t, group_lens, group_offs, trans_b, out_dtype, config, num_cu
+        )
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")
