@@ -35,6 +35,7 @@ import sys
 from datetime import datetime
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
@@ -134,10 +135,10 @@ def _bench(fn, *, reset=None, group=None, warmup=5, iters=30):
     finished the previous fn (no in-flight peer signals), zero, then a second
     barrier so all state is clean before any rank's fn pushes/signals a peer.
     Skipping the pre-reset barrier races the scoreboard and can deadlock."""
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
 
-    def _iter(measure):
+    def _iter(start_event=None, end_event=None):
         if group is not None:
             torch.cuda.synchronize()
             group.barrier()  # all ranks done with previous fn
@@ -146,20 +147,22 @@ def _bench(fn, *, reset=None, group=None, warmup=5, iters=30):
         if group is not None:
             torch.cuda.synchronize()
             group.barrier()  # all state clean before any fn
-        if not measure:
+        if start_event is None:
             fn()
-            return 0.0
+            return
         start_event.record()
         fn()
         end_event.record()
-        torch.cuda.synchronize()
-        return start_event.elapsed_time(end_event)
 
     for _ in range(warmup):
-        _iter(False)
+        _iter()
     _l2_flush()
-    total_ms = sum(_iter(True) for _ in range(iters))
-    return total_ms / iters
+    for i in range(iters):
+        _iter(start_events[i], end_events[i])
+    torch.cuda.synchronize()
+
+    times = np.array([s.elapsed_time(e) for s, e in zip(start_events, end_events)])[1:]
+    return np.average(times)
 
 
 # --------------------------------------------------------------------------- #
@@ -303,7 +306,7 @@ def profile_combine(group, args, mode, W1, W2):
 
         # per-slot ready flags in the UNCACHED signal pad (shared by fwd + bwd reduce).
         # 0 == ready (role 2 waits while flag < 0); pre-zeroed each iter -> no real cross-rank
-        # wait (PERF ONLY). topk tables drive the per-token reduce.
+        # wait. topk tables drive the per-token reduce.
         flag_sm = _SymmSig(group, (slots,), torch.int32)
         topk_idx_flat = inp.topk_idx.to(torch.int32).contiguous().view(-1)
         topk_w_flat = inp.topk_w.to(torch.float32).contiguous().view(-1)
@@ -579,10 +582,10 @@ def benchmark_combine(local_rank, world, args):
             # fused now = the 3-role kernel (GEMM + combine PUSH + weighted topk reduce -> y),
             # i.e. the actual e2e forward step 4 (PERF ONLY: reduce flags pre-set ready).
             print(
-                f"  fused (+r2)  : {fused_ms:8.3f} ms | {fused_tf:7.1f} TFLOPS | "
+                f"  fused : {fused_ms:8.3f} ms | {fused_tf:7.1f} TFLOPS | "
                 f"hid {hidden_ms:.3f}/{comb_ms:.3f} ms comm | speedup vs serial = {speedup:.2f}x | "
                 f"roofline (max(gemm,comb)/fused) = {roofline_pct:.1f}% | "
-                f"num_reduce_cu={args.num_reduce_cu} (PERF ONLY) | "
+                f"num_reduce_cu={args.num_reduce_cu} | "
                 f"combine_cu: {_sweep_str('fused_sweep')} ms (best={per_rank[0]['fused_cu']})"
             )
 
@@ -623,10 +626,10 @@ def benchmark_combine(local_rank, world, args):
                 f"combine_cu: {_bwd_sweep_str('comb_sweep')} ms (best={per_rank[0]['bwd']['comb_cu']})"
             )
             print(
-                f"  fused (+r2)  : {bwd_fused_ms:8.3f} ms | {bwd_fused_tf:7.1f} TFLOPS | "
+                f"  fused : {bwd_fused_ms:8.3f} ms | {bwd_fused_tf:7.1f} TFLOPS | "
                 f"hid {bwd_hidden_ms:.3f}/{bwd_comb_ms:.3f} ms comm | speedup vs serial = {bwd_speedup:.2f}x | "
                 f"roofline (max(gemm,comb)/fused) = {bwd_roofline:.1f}% | "
-                f"num_reduce_cu={args.num_reduce_cu} (PERF ONLY) | "
+                f"num_reduce_cu={args.num_reduce_cu} | "
                 f"combine_cu: {_bwd_sweep_str('fused_sweep')} ms (best={per_rank[0]['bwd']['fused_cu']})"
             )
 
@@ -704,7 +707,7 @@ if __name__ == "__main__":
         "--num-reduce-cu",
         type=int,
         default=32,
-        help="role-2 topk-reduce dedicated blocks for the fused 3-role kernel (perf only)",
+        help="role-2 topk-reduce dedicated blocks for the fused 3-role kernel",
     )
     ap.add_argument("--mode", choices=["load_balanced", "round_robin", "both"], default="both")
     ap.add_argument("--iters", type=int, default=30)
