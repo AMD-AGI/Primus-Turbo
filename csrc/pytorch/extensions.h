@@ -86,6 +86,18 @@ at::Tensor dequantize_mxfp8_meta(const at::Tensor input, const at::Tensor scale_
                                  const int64_t axis, const int64_t block_size,
                                  const at::ScalarType dest_dtype);
 
+at::Tensor grouped_dequantize_mxfp8(const at::Tensor input, const at::Tensor scale_inv,
+                                    const at::Tensor group_offs, const at::Tensor group_offs_padded,
+                                    const int64_t axis, const int64_t block_size,
+                                    const at::ScalarType   dest_dtype,
+                                    c10::optional<int64_t> total_M = c10::nullopt);
+
+at::Tensor grouped_dequantize_mxfp8_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                         const at::Tensor group_offs,
+                                         const at::Tensor group_offs_padded, const int64_t axis,
+                                         const int64_t block_size, const at::ScalarType dest_dtype,
+                                         c10::optional<int64_t> total_M = c10::nullopt);
+
 at::Tensor dequantize_mxfp4(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,
                             const int64_t block_size, const at::ScalarType dest_dtype);
 
@@ -125,6 +137,17 @@ std::vector<at::Tensor> quantize_mxfp8_dual_meta(
     const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
     const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
 
+std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarType dest_dtype,
+                                       const int64_t axis, const int64_t padding_align_size,
+                                       const bool use_2d_block, const bool shuffle_scale = false,
+                                       const bool shuffle_out = false);
+
+std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::ScalarType dest_dtype,
+                                            const int64_t axis, const int64_t padding_align_size,
+                                            const bool use_2d_block,
+                                            const bool shuffle_scale = false,
+                                            const bool shuffle_out   = false);
+
 std::vector<at::Tensor> grouped_quantize_mxfp8_dual(
     const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
     const at::ScalarType dest_dtype, const bool rowwise_use_2d_block,
@@ -139,16 +162,15 @@ std::vector<at::Tensor> grouped_quantize_mxfp8_dual_meta(
     const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
     const bool shuffle_colwise = false);
 
-std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarType dest_dtype,
-                                       const int64_t axis, const int64_t padding_align_size,
-                                       const bool use_2d_block, const bool shuffle_scale = false,
-                                       const bool shuffle_out = false);
+std::vector<at::Tensor> grouped_quantize_mxfp8(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const int64_t axis, const int64_t padding_align_size,
+    const bool use_2d_block, const bool shuffle_scale = false, const bool shuffle_out = false);
 
-std::vector<at::Tensor> quantize_mxfp8_meta(const at::Tensor input, const at::ScalarType dest_dtype,
-                                            const int64_t axis, const int64_t padding_align_size,
-                                            const bool use_2d_block,
-                                            const bool shuffle_scale = false,
-                                            const bool shuffle_out   = false);
+std::vector<at::Tensor> grouped_quantize_mxfp8_meta(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const int64_t axis, const int64_t padding_align_size,
+    const bool use_2d_block, const bool shuffle_scale = false, const bool shuffle_out = false);
 
 //==================================================================
 //  Shuffle

@@ -331,6 +331,81 @@ at::Tensor dequantize_mxfp8(const at::Tensor input, const at::Tensor scale_inv, 
     return output;
 }
 
+// De-Quantize grouped MXFP8: fused dequant + compact gather to [total_M, N].
+at::Tensor grouped_dequantize_mxfp8(const at::Tensor input, const at::Tensor scale_inv,
+                                    const at::Tensor group_offs, const at::Tensor group_offs_padded,
+                                    const int64_t axis, const int64_t block_size,
+                                    const at::ScalarType   dest_dtype,
+                                    c10::optional<int64_t> total_M) {
+    using namespace primus_turbo::detail;
+
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
+    PRIMUS_TURBO_CHECK(is_torch_fp8(input.scalar_type()), "Input must be FP8");
+    PRIMUS_TURBO_CHECK(scale_inv.is_cuda(), "scale_inv must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(scale_inv.dim() == 2, "scale_inv must be 2D");
+    PRIMUS_TURBO_CHECK(scale_inv.is_contiguous(), "scale_inv must be contiguous");
+    PRIMUS_TURBO_CHECK(scale_inv.scalar_type() == at::kFloat8_e8m0fnu ||
+                           scale_inv.dtype() == at::kByte,
+                       "scale_inv must be Float8_e8m0fnu / uint8 tensor");
+    PRIMUS_TURBO_CHECK(group_offs.is_cuda() && group_offs_padded.is_cuda(),
+                       "group_offs / group_offs_padded must be CUDA tensors");
+    PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong &&
+                           group_offs_padded.scalar_type() == at::kLong,
+                       "group tensors must be int64");
+    PRIMUS_TURBO_CHECK(group_offs.dim() == 1 && group_offs_padded.dim() == 1,
+                       "group tensors must be 1D");
+    PRIMUS_TURBO_CHECK(group_offs_padded.size(0) == group_offs.size(0),
+                       "group_offs_padded.size(0) must equal group_offs.size(0)");
+    PRIMUS_TURBO_CHECK(group_offs.size(0) >= 2,
+                       "group_offs must have length G+1 (at least one group)");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kBFloat16 || dest_dtype == at::kHalf ||
+                           dest_dtype == at::kFloat,
+                       "Output dtype must be bf16/fp16/fp32");
+    PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+    PRIMUS_TURBO_CHECK(block_size == MXFP8_BLOCK_SIZE, "block_size must be ", MXFP8_BLOCK_SIZE);
+
+    const bool    use_rowwise = (axis == 1);
+    const int64_t G           = group_offs.size(0) - 1;
+    const int64_t total_M_val =
+        total_M.has_value() ? total_M.value() : group_offs.index({G}).item<int64_t>();
+    PRIMUS_TURBO_CHECK(total_M_val > 0, "total_M must be positive");
+
+    const int64_t num_rows   = input.size(0);
+    const int64_t row_length = input.size(1);
+    PRIMUS_TURBO_CHECK(row_length % block_size == 0,
+                       "The last dimension must be divisible by block_size");
+
+    const int64_t m_padded = use_rowwise ? num_rows : row_length;
+    const int64_t n_cols   = use_rowwise ? row_length : num_rows;
+    PRIMUS_TURBO_CHECK(m_padded >= group_offs_padded.index({G}).item<int64_t>(),
+                       "Input M padded extent is smaller than group_offs_padded[", G, "]");
+
+    const int64_t scale_m = scale_inv.size(0);
+    const int64_t scale_n = scale_inv.size(1);
+
+    auto       stream = at::cuda::getCurrentCUDAStream();
+    at::Tensor output = at::empty({total_M_val, n_cols}, input.options().dtype(dest_dtype));
+
+    const uint8_t *scale_ptr = reinterpret_cast<const uint8_t *>(scale_inv.data_ptr());
+
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(output.scalar_type(), OType, {
+        TORCH_TYPE_SWITCH_FP8(input.scalar_type(), QType, {
+            grouped_dequantize_mxfp8_impl<OType, QType>(
+                reinterpret_cast<const QType *>(input.data_ptr()),
+                reinterpret_cast<OType *>(output.data_ptr()), input.stride(0), output.stride(0),
+                static_cast<int>(total_M_val), static_cast<int>(m_padded), static_cast<int>(n_cols),
+                scale_ptr, scale_inv.stride(0), scale_inv.stride(1), static_cast<int>(scale_m),
+                static_cast<int>(scale_n), group_offs.data_ptr<int64_t>(),
+                group_offs_padded.data_ptr<int64_t>(), static_cast<int>(G),
+                static_cast<int>(block_size), use_rowwise, stream);
+        });
+    });
+
+    return output;
+}
+
 // De-Quantize MXFP4 (block-scaled, E8M0 scales). ``input`` is packed FP4
 // (two E2M1 values per byte) viewed as Float4_e2m1fn_x2.
 at::Tensor dequantize_mxfp4(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,

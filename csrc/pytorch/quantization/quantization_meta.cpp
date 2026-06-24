@@ -72,6 +72,27 @@ at::Tensor dequantize_mxfp4_meta(const at::Tensor input, const at::Tensor scale_
     return output;
 }
 
+at::Tensor grouped_dequantize_mxfp8_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                         const at::Tensor group_offs,
+                                         const at::Tensor group_offs_padded, const int64_t axis,
+                                         const int64_t block_size, const at::ScalarType dest_dtype,
+                                         c10::optional<int64_t> total_M) {
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
+    PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+    PRIMUS_TURBO_CHECK(group_offs_padded.size(0) == group_offs.size(0),
+                       "group_offs_padded.size(0) must equal group_offs.size(0)");
+    PRIMUS_TURBO_CHECK(group_offs.size(0) >= 2,
+                       "group_offs must have length G+1 (at least one group)");
+
+    at::Tensor padded_output =
+        dequantize_mxfp8_meta(input, scale_inv, axis, block_size, dest_dtype);
+    const int64_t G = group_offs.size(0) - 1;
+    const int64_t total_M_val =
+        total_M.has_value() ? total_M.value() : group_offs.index({G}).item<int64_t>();
+    const int64_t n_cols = padded_output.size(1);
+    return at::empty({total_M_val, n_cols}, at::dtype(dest_dtype).device(at::kMeta));
+}
+
 std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
     const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,

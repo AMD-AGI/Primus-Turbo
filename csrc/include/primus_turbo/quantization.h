@@ -145,6 +145,20 @@ void grouped_quantize_mxfp8_dual_impl(
     int colwise_scale_M_pad, int colwise_scale_N_pad, detail::ScalingRecipe rowwise_recipe,
     detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
+template <typename IType, typename OType>
+void grouped_quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
+                                 const int64_t *group_offs, const int64_t *group_offs_padded, int G,
+                                 int total_M_padded, int N, int N_pad, int scale_stride,
+                                 int scale_N, int scale_M_pad, int scale_N_pad,
+                                 detail::ScalingRecipe recipe, hipStream_t stream);
+
+template <typename IType, typename OType>
+void grouped_quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
+                                 const int64_t *group_offs, const int64_t *group_offs_padded,
+                                 detail::QuantizeMode mode, int G, int total_M_padded, int N,
+                                 int N_pad, int scale_stride, int scale_N, int scale_M_pad,
+                                 int scale_N_pad, detail::ScalingRecipe recipe, hipStream_t stream);
+
 // *************** Grouped Padded Layout ***************
 //
 // Computes per-group padded lengths/offsets (rounded up to ``align``) on
@@ -181,6 +195,16 @@ void dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t stride_x_row,
                            const int64_t stride_scale_col, const int scale_n_rows,
                            const int scale_n_cols, const int block_size, const bool use_rowwise,
                            hipStream_t stream);
+
+// Fused grouped MXFP8 dequant: dequant padded layout and scatter to compact [total_M, N].
+template <typename OType, typename QType>
+void grouped_dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t stride_x_row,
+                                   const int64_t stride_y_row, const int total_M,
+                                   const int m_padded, const int n_cols, const uint8_t *scale_inv,
+                                   const int64_t stride_scale_row, const int64_t stride_scale_col,
+                                   const int scale_n_rows, const int scale_n_cols,
+                                   const int64_t *group_offs, const int64_t *group_offs_padded,
+                                   int G, int block_size, bool use_rowwise, hipStream_t stream);
 
 template <typename OType>
 void dequantize_mxfp4_impl(const uint8_t *x, OType *y, const int64_t stride_x_row,

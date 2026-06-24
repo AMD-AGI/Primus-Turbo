@@ -449,20 +449,25 @@ def quantize_mxfp8_impl(
 def grouped_quantize_mxfp8_impl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
+    axis: Optional[int],
     block_size: int,
     group_lens: torch.Tensor,
     group_offs: torch.Tensor,
+    with_trans: bool = False,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+) -> Union[
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]:
     """MXFP8 dual (rowwise + colwise) quantization fused with per-group M-axis
     zero-padding.
@@ -477,22 +482,38 @@ def grouped_quantize_mxfp8_impl(
     assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
 
     scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
-    scaling_recipe_for_trans = (
-        ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
-    )
 
-    return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8_dual(
-        x,
-        group_lens,
-        group_offs,
-        out_dtype,
-        scaling_recipe.use_2d_block,
-        scaling_recipe_for_trans.use_2d_block,
-        scaling_recipe.shuffle_scale,
-        scaling_recipe.shuffle_out,
-        scaling_recipe_for_trans.shuffle_scale,
-        scaling_recipe_for_trans.shuffle_out,
-    )
+    if with_trans:
+        scaling_recipe_for_trans = (
+            ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+        )
+
+        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8_dual(
+            x,
+            group_lens,
+            group_offs,
+            out_dtype,
+            MXFP8_PADDING_ALIGN_SIZE,
+            scaling_recipe.use_2d_block,
+            scaling_recipe_for_trans.use_2d_block,
+            scaling_recipe.shuffle_scale,
+            scaling_recipe.shuffle_out,
+            scaling_recipe_for_trans.shuffle_scale,
+            scaling_recipe_for_trans.shuffle_out,
+        )
+    else:
+        assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
+        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8(
+            x,
+            group_lens,
+            group_offs,
+            out_dtype,
+            axis,
+            MXFP8_PADDING_ALIGN_SIZE,
+            scaling_recipe.use_2d_block,
+            scaling_recipe.shuffle_scale,
+            scaling_recipe.shuffle_out,
+        )
 
 
 def dequantize_mxfp8_impl(
@@ -514,6 +535,36 @@ def dequantize_mxfp8_impl(
     ), "The last dimension of the x tensor must be divisible by the block size."
 
     return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp8(x, scale_inv, axis, block_size, out_dtype)
+
+
+def grouped_dequantize_mxfp8_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int,
+    scale_inv: torch.Tensor,
+    group_offs: torch.Tensor,
+    group_offs_padded: torch.Tensor,
+    total_M: Optional[int] = None,
+) -> torch.Tensor:
+    assert x.is_contiguous(), "The x tensor must be contiguous."
+    assert x.dim() == 2, "The x must be 2D tensor."
+    assert scale_inv.dim() == 2, "The scale_inv must be 2D tensor."
+    assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
+    assert axis in (0, 1), "The axis must be 0 or 1."
+    SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+    assert (
+        out_dtype in SUPPORTED_OUT_DTYPES
+    ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
+
+    _, row_length = x.size()
+    assert (
+        row_length % block_size == 0
+    ), "The last dimension of the x tensor must be divisible by the block size."
+
+    return torch.ops.primus_turbo_cpp_extension.grouped_dequantize_mxfp8(
+        x, scale_inv, group_offs, group_offs_padded, axis, block_size, out_dtype, total_M
+    )
 
 
 def quantize_mxfp4_impl(
