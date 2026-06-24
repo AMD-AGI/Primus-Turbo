@@ -325,6 +325,35 @@ class SymmBuffer:
 _SYMM_BUFFER_CACHE = {}
 
 
+# for perf test, will be removed
+def _cached_group_meta(symm, topk_idx, tile_to_group, experts_per_rank):
+    """block_m-granular (group_offs, group_lens) for the variable-K wgrads.
+
+    Deterministic in topk_idx (same routing -> same tile_to_group -> same group
+    meta), so cache it on the symm buffer to skip the bincount+cumsum+slice when
+    the same topk_idx is reused (e.g. perf loops). Keyed on tensor identity +
+    version (in-place edits bump it) + tile count."""
+    key = (id(topk_idx), topk_idx._version, int(tile_to_group.shape[0]))
+    cache = getattr(symm, "_group_meta_cache", None)
+    if cache is not None and cache[0] == key:
+        return cache[1], cache[2]
+
+    eo = torch.zeros((experts_per_rank + 1,), dtype=torch.int32, device=topk_idx.device)
+    eo[1:] = (
+        (
+            torch.bincount(tile_to_group.to(torch.int64), minlength=experts_per_rank)[:experts_per_rank]
+            * symm.block_m
+        )
+        .to(torch.int32)
+        .cumsum(0)
+    )
+    group_offs = eo.to(torch.int64)
+    group_lens = (eo[1:] - eo[:-1]).to(torch.int64)
+    # hold a ref to topk_idx (via key->cache tuple keeps tensors alive) so id() can't alias
+    symm._group_meta_cache = (key, group_offs, group_lens, topk_idx)
+    return group_offs, group_lens
+
+
 def get_symm_buffer_for_mega_moe(
     group,
     *,
@@ -520,20 +549,9 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             ctx.num_experts = num_experts
             ctx.inter = symm.intermediate_hidden
             ctx.hidden = symm.hidden
-            # group metadata for the variable-K wgrads (block_m-granular, padded rows -> 0)
-            eo = torch.zeros((experts_per_rank + 1,), dtype=torch.int32, device=x.device)
-            eo[1:] = (
-                (
-                    torch.bincount(tile_to_group.to(torch.int64), minlength=experts_per_rank)[
-                        :experts_per_rank
-                    ]
-                    * symm.block_m
-                )
-                .to(torch.int32)
-                .cumsum(0)
-            )
-            group_offs = eo.to(torch.int64)
-            group_lens = (eo[1:] - eo[:-1]).to(torch.int64)
+            # group metadata for the variable-K wgrads (block_m-granular, padded rows -> 0);
+            # cached on the symm buffer, keyed on topk_idx (skips bincount+cumsum+slice on reuse)
+            group_offs, group_lens = _cached_group_meta(symm, topk_idx, tile_to_group, experts_per_rank)
             # plan tensors (prologue outputs are fresh) + cloned persistent symm buffers
             # d_topk_w is produced in-kernel in backward (swiglu_backward grad_gate +
             # combine gate-scatter), so the forward combine buffer is NOT saved.

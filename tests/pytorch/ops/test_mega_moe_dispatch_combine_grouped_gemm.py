@@ -202,18 +202,28 @@ def make_baseline_reference(group, *, num_experts, num_topk, hidden, inter, W1, 
     )
     fc1, fc2 = W1, W2  # [epr, 2I, H], [epr, H, I]
 
-    def baseline_reference(x, topk_idx, gate_logits):
+    def _turbo_forward(x, topk_idx, gate_logits, w1, w2):
         permuted_hidden, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
             x, gate_logits, indices=topk_idx
         )
         group_lens = tokens_per_expert.to(device=x.device, dtype=torch.int64)
-        fc1_out = _turbo_gg(permuted_hidden, fc1, group_lens, trans_b=True)
+        fc1_out = _turbo_gg(permuted_hidden, w1, group_lens, trans_b=True)
         gate, up = fc1_out.chunk(2, dim=-1)
         inter = (F.silu(gate.float()) * up.float() * permuted_probs.unsqueeze(-1)).to(x.dtype)
-        fc2_out = _turbo_gg(inter, fc2, group_lens, trans_b=True)
+        fc2_out = _turbo_gg(inter, w2, group_lens, trans_b=True)
         return dispatcher.token_combine(fc2_out)
 
-    return baseline_reference
+    def baseline_reference(x, topk_idx, gate_logits):
+        return _turbo_forward(x, topk_idx, gate_logits, fc1, fc2)
+
+    # grad-enabled forward (leaf weights) for backward timing
+    def baseline_grad_forward(x, topk_idx, gate_logits):
+        x_leaf = x.detach().requires_grad_(True)
+        w1_leaf = fc1.detach().requires_grad_(True)
+        w2_leaf = fc2.detach().requires_grad_(True)
+        return _turbo_forward(x_leaf, topk_idx, gate_logits, w1_leaf, w2_leaf)
+
+    return baseline_reference, baseline_grad_forward
 
 
 def _gate3(g, ref):
@@ -249,7 +259,7 @@ def _run(local_rank, world, args):
     W2 = W2g[rank * epr : (rank + 1) * epr].contiguous()
 
     # turbo baseline + mega fused symmetric buffer (allocate once, reuse per step)
-    baseline_reference = make_baseline_reference(
+    baseline_reference, baseline_grad_forward = make_baseline_reference(
         group, num_experts=E, num_topk=K, hidden=H, inter=I, W1=W1, W2=W2
     )
     symm = get_symm_buffer_for_mega_moe(
@@ -326,6 +336,8 @@ def _run(local_rank, world, args):
             def _walltime(fn, iters=args.perf_iters, warmup=5):
                 for _ in range(warmup):
                     fn()
+
+                _l2_flush()
                 torch.cuda.synchronize()
                 group.barrier()
                 t0 = _time.perf_counter()
@@ -334,11 +346,26 @@ def _run(local_rank, world, args):
                 torch.cuda.synchronize()
                 return (_time.perf_counter() - t0) / iters * 1e6  # us/iter
 
+            def _turbo_forward_grad():
+                return baseline_grad_forward(x, topk_idx, gate_logits)
+
+            # mega wall-clock
             wt_fwd = _walltime(_forward)
             wt_fb = _walltime(lambda: _forward().backward(grad_y))
+            # turbo baseline wall-clock
+            tb_fwd = _walltime(lambda: baseline_reference(x, topk_idx, gate_logits))
+            tb_fb = _walltime(lambda: _turbo_forward_grad().backward(grad_y))
             if rank == 0:
+                wt_bwd, tb_bwd = wt_fb - wt_fwd, tb_fb - tb_fwd
                 print(
-                    f"[{mode}] WALL-CLOCK us/iter: fwd={wt_fwd:.1f}  fwd+bwd={wt_fb:.1f}  bwd={wt_fb - wt_fwd:.1f}"
+                    f"[{mode}] WALL-CLOCK us/iter (mega): fwd={wt_fwd:.1f}  fwd+bwd={wt_fb:.1f}  bwd={wt_bwd:.1f}"
+                )
+                print(
+                    f"[{mode}] WALL-CLOCK us/iter (turbo): fwd={tb_fwd:.1f}  fwd+bwd={tb_fb:.1f}  bwd={tb_bwd:.1f}"
+                )
+                print(
+                    f"[{mode}] SPEEDUP (turbo/mega): fwd={tb_fwd / wt_fwd:.3f}x  "
+                    f"bwd={tb_bwd / wt_bwd:.3f}x  e2e={tb_fb / wt_fb:.3f}x"
                 )
         torch.cuda.synchronize()
         group.barrier()
@@ -361,7 +388,7 @@ def _build_argparser():
     ap.add_argument("--bn", type=int, default=256)
     ap.add_argument("--mode", choices=["load_balanced", "round_robin", "both"], default="both")
     ap.add_argument("--perf", action="store_true")
-    ap.add_argument("--perf-iters", type=int, default=20)
+    ap.add_argument("--perf-iters", type=int, default=50)
     return ap
 
 
