@@ -543,8 +543,6 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             )
 
         if a_colwise is None:
-            # MX_BLOCKWISE requires a scaling_recipe; reuse the forward recipe
-            # for A's col-wise direction (same recipe as forward).
             quantized_a_colwise = QuantizedTensor.quantize(
                 quantized_a.dequantize(),
                 quantized_a.real_dtype,
@@ -552,6 +550,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 axis=-2,
                 block_size=config.block_size,
                 scaling_recipe=a_scaling_recipe,
+                group_lens=group_lens,
             )
         else:
             assert isinstance(a_colwise, QuantizedTensor)
