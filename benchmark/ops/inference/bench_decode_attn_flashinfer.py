@@ -29,11 +29,12 @@ attn_tp = tp_size // dp_size (SGLang DP-attention semantics).
 NOTE: targets B200/sm100 and is written against FlashInfer's documented trtllm
 API; validate kernel availability/shapes on real Blackwell hardware.
 
-    python bench_decode_attn_flashinfer.py [--model M] [--ctx-spread S] [--tp-size N] [--dp-size N] [--check]
+    python bench_decode_attn_flashinfer.py [--model M] [--ctx-cv CV] [--tp-size N] [--dp-size N] [--check]
 """
 
 import argparse
 import contextlib
+import math
 import os
 from datetime import datetime
 
@@ -187,15 +188,24 @@ def _time_ms(fn, warmup=10, iters=50, use_graph=None):
         return event_loop(fn)
 
 
-def gen_ctx_lens(batch, ctx, spread, seed):
+def gen_ctx_lens(batch, ctx, cv, seed):
     """Per-request context lengths; deterministic per cell so bf16/fp8 align.
-    spread=0 -> all equal; else uniform in [ctx*(1-s), ctx*(1+s)] (mean ~ctx)."""
-    if spread <= 0:
+
+    Lengths follow a *lognormal* distribution with mean fixed at ctx and a given
+    coefficient of variation cv (= std/mean). Real serving context lengths are
+    right-skewed/heavy-tailed (many short, a few very long), which lognormal
+    captures and a symmetric uniform spread does not. cv=0 -> all equal to ctx;
+    larger cv -> longer tail (more ragged batch). For a lognormal with log-space
+    sigma, cv = sqrt(exp(sigma^2) - 1), so sigma = sqrt(ln(1 + cv^2)); set the
+    log-mean mu = ln(ctx) - sigma^2/2 so E[len] = ctx. Each length is clamped to
+    [1, 8*ctx] to keep one tail draw from blowing up memory."""
+    if cv <= 0:
         return torch.full((batch,), ctx, dtype=torch.int64)
-    lo = max(1, round(ctx * (1 - spread)))
-    hi = max(lo, round(ctx * (1 + spread)))
+    sigma = math.sqrt(math.log(1.0 + cv * cv))
+    mu = math.log(ctx) - 0.5 * sigma * sigma
     g = torch.Generator().manual_seed(seed)
-    return torch.randint(lo, hi + 1, (batch,), generator=g, dtype=torch.int64)
+    lens = torch.exp(torch.randn(batch, generator=g) * sigma + mu)
+    return lens.round().clamp_(1, 8 * ctx).to(torch.int64)
 
 
 def shuffled_pages(num_pages, seed):
@@ -207,10 +217,18 @@ def shuffled_pages(num_pages, seed):
 
 
 def _block_tables(ctx_lens_cpu, page_size, perm, device):
-    """Per-seq page table [batch, max_blocks] (int32), pages drawn from `perm`."""
+    """Per-seq page table [batch, max_blocks] (int32), pages drawn from `perm`.
+
+    trtllm-gen decode requires the page-table width to be a multiple of
+    128/page_size, so the table is padded out to that granularity (extra
+    columns stay 0 and are never read: seq_lens bounds the valid range). Without
+    this, ragged batches (--ctx-cv>0) whose max length is not 128-aligned trip
+    "block_num % (128 / block_size) == 0" and the cell is dropped."""
     pages_per_seq = (ctx_lens_cpu + page_size - 1) // page_size
     page_off = torch.cat([torch.zeros(1, dtype=torch.int64), pages_per_seq.cumsum(0)])
+    block_mult = max(1, 128 // page_size)
     max_blocks = int(pages_per_seq.max())
+    max_blocks = ((max_blocks + block_mult - 1) // block_mult) * block_mult
     batch = ctx_lens_cpu.numel()
     bt = torch.zeros(batch, max_blocks, device=device, dtype=torch.int32)
     for i in range(batch):
@@ -643,9 +661,9 @@ def bench_dsa(batch, ctx, cfg, dtype, kv_dtype, attn_tp, ctx_lens_cpu, seed, dev
     return time_ms, bw_gbps, tflops, None, extra  # data-dependent top-k: SNR not checked
 
 
-def benchmark_one(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_spread, base_seed, device, check):
+def benchmark_one(batch, ctx, cfg, dtype, kv_dtype, page_size, attn_tp, ctx_cv, base_seed, device, check):
     cell_seed = base_seed * 1_000_003 + batch * 9973 + ctx
-    ctx_lens_cpu = gen_ctx_lens(batch, ctx, ctx_spread, cell_seed)
+    ctx_lens_cpu = gen_ctx_lens(batch, ctx, ctx_cv, cell_seed)
     page_seed = cell_seed + 1
     if cfg["family"] == "gqa":
         return (
@@ -691,7 +709,7 @@ def save_excel(path, args, cfg, results):
         "model": args.model,
         "family": cfg["family"],
         **{k: v for k, v in cfg.items() if k != "family"},
-        "ctx_spread": args.ctx_spread,
+        "ctx_cv": args.ctx_cv,
         "tp_size": args.tp_size,
         "dp_size": args.dp_size,
         "attn_tp": args.tp_size // args.dp_size,
@@ -704,7 +722,10 @@ def save_excel(path, args, cfg, results):
     if not path.endswith(".xlsx"):
         path += ".xlsx"
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        pd.DataFrame(meta.items(), columns=["field", "value"]).to_excel(
+        # Stringify values so the round-trip stays faithful: Excel stores bool as
+        # a distinct cell type, and since Python `bool` subclasses `int` (1 == True),
+        # a mixed bool/int column reads ints equal to 1 back as True.
+        pd.DataFrame([(k, str(v)) for k, v in meta.items()], columns=["field", "value"]).to_excel(
             writer, sheet_name="config", index=False
         )
         for kv_dtype, rows in results.items():
@@ -721,10 +742,12 @@ def main():
     parser.add_argument("--ctx", type=int, nargs="+", default=DEFAULT_CTX)
     parser.add_argument("--page-size", type=int, default=_GQA_PAGE_SIZE, help="GQA/SWA paged KV block size.")
     parser.add_argument(
-        "--ctx-spread",
+        "--ctx-cv",
         type=float,
         default=0.0,
-        help="Per-request context-length variation: lengths ~ uniform[ctx*(1-s), ctx*(1+s)].",
+        help="Per-request context-length dispersion: lengths ~ lognormal with mean=ctx "
+        "and coefficient of variation cv (std/mean). 0=all equal; larger=heavier right "
+        "tail (a few very long requests), the realistic serving shape.",
     )
     parser.add_argument("--tp-size", type=int, default=1, help="Global tensor-parallel size.")
     parser.add_argument(
@@ -766,7 +789,7 @@ def main():
     print()
     print(f"  Model     : {args.model}  family={cfg['family']}")
     print(
-        f"  Op        : flashinfer {op} (decode)  ctx_spread={args.ctx_spread}"
+        f"  Op        : flashinfer {op} (decode)  ctx_cv={args.ctx_cv}"
         + (f"  page_size={args.page_size}" if cfg["family"] in ("gqa", "swa") else "")
     )
     print(
@@ -800,7 +823,7 @@ def main():
                         kv_dtype,
                         args.page_size,
                         attn_tp,
-                        args.ctx_spread,
+                        args.ctx_cv,
                         args.seed,
                         device,
                         args.check,
