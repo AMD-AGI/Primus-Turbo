@@ -11,7 +11,11 @@ import torch
 _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
-from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
+from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import (
+    gemm_mxfp8_flydsl_kernel,
+    preshuffle_scale,
+    preshuffle_scale_b_comb,
+)
 from primus_turbo.flydsl.utils.gemm_helper import preshuffle_ab_flydsl
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
@@ -369,22 +373,24 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            # NT, E4M3, bf16 out. Accept int32 preshuffled (pass-through) or raw E8M0 2D
-            # (repacked in execute) -- lets the dispatcher autotune flydsl vs turbo.
+            # NT. Per-operand E4M3/E5M2 (cbsz/blgp in the MFMA), bf16/fp16 out. Accept
+            # int32 preshuffled (pass-through) or raw E8M0 2D (repacked in execute).
             supported &= a.ndim == 2 and b.ndim == 2
             supported &= (not trans_a) and trans_b
-            supported &= a.dtype == float8_e4m3 and b.dtype == float8_e4m3
-            supported &= out_dtype == torch.bfloat16
+            supported &= a.dtype in (float8_e4m3, float8_e5m2) and b.dtype in (float8_e4m3, float8_e5m2)
+            supported &= out_dtype in (torch.bfloat16, torch.float16)
             if not supported:
                 return supported
             m, k, n = a.shape[0], a.shape[1], b.shape[0]
-            supported &= (k % 128 == 0) and (k >= 256)
-            supported &= m % 64 == 0 and n % 64 == 0
+            supported &= m % 64 == 0 and n % 16 == 0
             if a_scale_inv.dtype == torch.int32:
-                # already preshuffled (flat int32): trust the producer's layout.
+                # already preshuffled (flat int32): producer aligned K to 128, >=256.
                 supported &= b_scale_inv.dtype == torch.int32
+                supported &= (k % 128 == 0) and (k >= 256)
             else:
-                # raw E8M0 block scales, 1 byte/elem, [M,K//32] / [N,K//32].
+                # raw E8M0 block scales, 1 byte/elem, [M,K//32] / [N,K//32]. K only
+                # needs %32 (MX block); execute() zero-pads K up to the kernel's tile.
+                supported &= k % 32 == 0
                 supported &= a_scale_inv.ndim == 2 and a_scale_inv.shape == (m, k // 32)
                 supported &= b_scale_inv.ndim == 2 and b_scale_inv.shape == (n, k // 32)
                 supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
@@ -427,9 +433,33 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
                 a_sp, b_sp = a_scale_inv, b_scale_inv
             else:
                 k = a.shape[1]
-                a_sp, b_sp = preshuffle_ab_flydsl(
-                    a_scale_inv.view(torch.uint8), b_scale_inv.view(torch.uint8), k, 4
-                )
+                # K-tail: the FlyDSL kernel tiles K by 128 and needs K>=256. Zero-pad K
+                # to the next valid extent; padded fp8 operands are 0 -> contribute 0
+                # (scale padded with 127=2^0, finite). MX requires K % 32 == 0.
+                k_pad = max(256, ((k + 127) // 128) * 128)
+                if k_pad != k:
+                    M_, N_ = a.shape[0], b.shape[0]
+                    ap = torch.zeros(M_, k_pad, dtype=a.dtype, device=a.device)
+                    ap[:, :k] = a
+                    a = ap
+                    bp = torch.zeros(N_, k_pad, dtype=b.dtype, device=b.device)
+                    bp[:, :k] = b
+                    b = bp
+                    asc = a_scale_inv.view(torch.uint8)
+                    bsc = b_scale_inv.view(torch.uint8)
+                    asp_ = torch.full((M_, k_pad // 32), 127, dtype=torch.uint8, device=a.device)
+                    asp_[:, : k // 32] = asc
+                    bsp_ = torch.full((N_, k_pad // 32), 127, dtype=torch.uint8, device=b.device)
+                    bsp_[:, : k // 32] = bsc
+                    a_scale_inv, b_scale_inv, k = asp_, bsp_, k_pad
+                if b.shape[0] % 64 == 0:
+                    a_sp, b_sp = preshuffle_ab_flydsl(  # fused LDS repack (N % 64 == 0)
+                        a_scale_inv.view(torch.uint8), b_scale_inv.view(torch.uint8), k, 4
+                    )
+                else:
+                    # general N (N % 16): host preshuffle (combined-B zero-pads to 256).
+                    a_sp = preshuffle_scale(a_scale_inv.view(torch.uint8), k, 4)
+                    b_sp = preshuffle_scale_b_comb(b_scale_inv.view(torch.uint8), k)
             return gemm_mxfp8_flydsl_kernel(a, a_sp, b, b_sp, out_dtype=out_dtype, trans_c=trans_c)
         return gemm_fp8_tensorwise_flydsl_kernel(
             a,

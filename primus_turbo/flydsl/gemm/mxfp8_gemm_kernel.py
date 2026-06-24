@@ -41,8 +41,8 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     block_mn,
     ceildiv,
     compute_global_swizzle,
+    StoreCPerTensor,
     make_fp8_buffer_tensor_rebased,
-    make_row_band_resource,
     make_value_attrs,
     wait_barrier,
     xcd_remap_pid,
@@ -103,7 +103,7 @@ def preshuffle_scale_b_comb(e8m0_u8, K):
     grp = block_n*4 + wave_n;  OFF = [0,16,128,144].
     """
     N, Kb = e8m0_u8.shape
-    assert Kb == K // 32 and K % 128 == 0 and N % 64 == 0
+    assert Kb == K // 32 and K % 128 == 0 and N % 16 == 0
     K128 = K // 128
     Npad = ((N + 255) // 256) * 256
     if Npad != N:
@@ -124,11 +124,12 @@ def preshuffle_scale_b_comb(e8m0_u8, K):
     return sp.contiguous()
 
 
-def _asm_mma_scale_do(a, b, c, sa, sb, opsel):
+def _asm_mma_scale_do(a, b, c, sa, sb, opsel, cbsz=0, blgp=0):
     """Inline-asm scaled MFMA v_mfma_scale_f32_16x16x128_f8f6f4. =&v early-clobber
     forces dst disjoint from srcA/srcB; opaque to the backend so it co-schedules with
     the asm ds_read_b64_tr_b8 loads. opsel (0..3) picks the packed E8M0 byte via
-    op_sel (low bit) / op_sel_hi (high bit)."""
+    op_sel (low bit) / op_sel_hi (high bit). cbsz/blgp select srcA/srcB fp8 format
+    (0=E4M3, 1=E5M2)."""
     v4f32 = ir.VectorType.get([4], ir.F32Type.get())
     lo = opsel & 1
     hi = (opsel >> 1) & 1
@@ -137,7 +138,7 @@ def _asm_mma_scale_do(a, b, c, sa, sb, opsel):
     op = _llvm.InlineAsmOp(
         res=v4f32,
         operands_=[_raw(a), _raw(b), _raw(c), _raw(sa), _raw(sb)],
-        asm_string=f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 {osel}",
+        asm_string=f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 cbsz:{cbsz} blgp:{blgp} {osel}",
         constraints=cons,
         has_side_effects=False,
     )
@@ -175,7 +176,7 @@ class MfmaScale16x16x128:
     the (scale_a, scale_b) i32 operands can be supplied per call.
     """
 
-    def __init__(self, n_tiles_a, n_tiles_b, asm_mma=False):
+    def __init__(self, n_tiles_a, n_tiles_b, asm_mma=False, cbsz=0, blgp=0):
         self.res_ty = Vec.make_type(4, fx.Float32)
         self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
@@ -185,6 +186,8 @@ class MfmaScale16x16x128:
         # (default 0); see preshuffle_scale / preshuffle_scale_pack for the layout.
         self.opsel = 0
         self.asm_mma = asm_mma
+        self.cbsz = cbsz  # srcA fp8 format: 0=E4M3, 1=E5M2
+        self.blgp = blgp  # srcB fp8 format: 0=E4M3, 1=E5M2
 
     def idx(self, i, j):
         return i * self.n_tiles_b + j
@@ -192,10 +195,10 @@ class MfmaScale16x16x128:
     def _do_mma(self, a, b, c, sa, sb):
         # operand order: a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b
         if self.asm_mma:  # inline-asm scaled MFMA (co-schedules with asm tr8 loads)
-            return _asm_mma_scale_do(a, b, c, sa, sb, self.opsel)
+            return _asm_mma_scale_do(a, b, c, sa, sb, self.opsel, self.cbsz, self.blgp)
         return rocdl.mfma_scale_f32_16x16x128_f8f6f4(
             self.res_ty,
-            [a, b, c, 0, 0, self.opsel, sa, self.opsel, sb],
+            [a, b, c, self.cbsz, self.blgp, self.opsel, sa, self.opsel, sb],
         )
 
     def call(self, a, b, c, sa, sb):
@@ -249,46 +252,6 @@ class ScaleS2R:
         return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
 
 
-class StoreCPlain:
-    """Plain FP32 accumulator -> BF16 store (no scaling; scales folded in MMA).
-
-    int64-safe: the output buffer is re-based per workgroup at its row band
-    (byte base = base_row * c_cols * 2 computed in the 64-bit ``index`` type),
-    so a single 32-bit buffer offset only spans that band — handling outputs
-    whose flat M*N exceeds 2^31 / 4GB (mirrors Triton's ptr + offset.to(int64)).
-    C is passed as a 2D [M, N] tensor so its shape packs within int32.
-    """
-
-    def __init__(self, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b):
-        self.c_rows = c_rows
-        self.c_cols = c_cols
-        self.lane_id = fx.thread_idx.x % 64
-        self.c_idx_fn = c_idx_fn
-        self.n_tiles_a = n_tiles_a
-        self.n_tiles_b = n_tiles_b
-        self.c_base = buffer_ops.extract_base_index(C)  # index = byte base address
-
-    def store(self, c_frag, base_row, base_col):
-        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
-        for ti in range_constexpr(self.n_tiles_a):
-            row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
-            for tj in range_constexpr(self.n_tiles_b):
-                col = base_col + tj * 16 + self.lane_id % 16
-                col_valid = col < self.c_cols
-                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
-                for i in range_constexpr(4):
-                    val = vec_f32[i].to(fx.BFloat16)
-                    # byte offset within band (<= BLOCK_M*c_cols*2, fits i32)
-                    off = ((row_local + i) * self.c_cols + col) * 2
-                    buffer_ops.buffer_store(
-                        val,
-                        rsrc,
-                        off,
-                        mask=col_valid,
-                        offset_is_bytes=True,
-                    )
-
-
 def _compile_mxfp8_nt(
     K: int,
     BLOCK_M: int = 256,
@@ -298,6 +261,9 @@ def _compile_mxfp8_nt(
     num_xcd: int = 8,
     waves_per_eu: int = 2,
     scale_pack: int = 1,  # 1 = broadcast scale (1-deep prefetch); >1 = opsel byte-pack
+    cbsz: int = 0,  # srcA fp8 format: 0=E4M3, 1=E5M2
+    blgp: int = 0,  # srcB fp8 format: 0=E4M3, 1=E5M2
+    out_fp16: bool = False,  # fp16 output (else bf16)
 ):
     BLOCK_K = 128
     assert GROUP_M >= 1
@@ -395,7 +361,7 @@ def _compile_mxfp8_nt(
         gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
         gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
 
-        mfma = MfmaScale16x16x128(N_TILES_A, N_TILES_B)
+        mfma = MfmaScale16x16x128(N_TILES_A, N_TILES_B, cbsz=cbsz, blgp=blgp)
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
@@ -404,7 +370,8 @@ def _compile_mxfp8_nt(
 
         sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES, pack=scale_pack)
         sb_s2r = ScaleBComb(B_scale, c_n, K, pack=scale_pack)  # one dwordx4 = b0+b1 scales
-        store_c = StoreCPlain(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        store_c = StoreCPerTensor(None, None, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
 
         # Global row/col bases for the two M / N regions (region1 = +LDS half).
         wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -691,9 +658,10 @@ def _mx_nt_gn_cands(N):
     return [g for g in (4, 8, 16) if n_blocks >= 2 * g]
 
 
-def _get_mxfp8_launch(K, bm, gm, xcd, layout="nt", N=0, gn=0):
+def _get_mxfp8_launch(K, bm, gm, xcd, layout="nt", N=0, gn=0, cbsz=0, blgp=0, out_fp16=False):
     # gn is the autotuned 2D N-band width (0 = 1D swizzle). NT only (compute-only PR).
-    lk = (K, bm, gm, xcd, layout, gn)
+    # cbsz/blgp = per-operand fp8 format (0=E4M3,1=E5M2); out_fp16 = fp16 output.
+    lk = (K, bm, gm, xcd, layout, gn, cbsz, blgp, out_fp16)
     launch = _MXFP8_LAUNCH_CACHE.get(lk)
     if launch is None:
         # NT plain-load path. scale_pack=1: opsel byte-pack needs quant-emitted packed
@@ -706,12 +674,15 @@ def _get_mxfp8_launch(K, bm, gm, xcd, layout="nt", N=0, gn=0):
             group_n=gn,
             num_xcd=xcd,
             scale_pack=1,
+            cbsz=cbsz,
+            blgp=blgp,
+            out_fp16=out_fp16,
         )
         _MXFP8_LAUNCH_CACHE[lk] = launch
     return launch
 
 
-def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt"):
+def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt", cbsz=0, blgp=0):
     """First-call micro-bench of the candidates for (M,N,K,layout); cache the
     fastest cfg by shape. Returns (BLOCK_M, GROUP_M, num_xcd, group_n). Scales are
     pre-shuffled by the quant (BLOCK_M fixed at 256), so the same a_sp/b_sp feed
@@ -722,7 +693,8 @@ def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt
     fixes that tile and sweeps the 2D N-band width group_n. gn=0 is measured in
     stage 1, so the staged pick can never regress vs the old (gn-less) NT path —
     it only captures the big-/mid-N L2-reuse win on shapes where a band helps."""
-    key = (M, N, K, out_dtype, layout)
+    key = (M, N, K, out_dtype, layout, cbsz, blgp)
+    _ofp16 = out_dtype == torch.float16
     cached = _MXFP8_AUTOTUNE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -731,7 +703,7 @@ def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt
 
     def _time_cfg(bm, gm, xcd, gn):
         try:
-            launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn)
+            launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn, cbsz=cbsz, blgp=blgp, out_fp16=_ofp16)
             args = (a8, b8, out_view, a_sp, b_sp, M, N, stream)
             launch(*args)
             torch.cuda.synchronize()
@@ -802,7 +774,11 @@ def gemm_mxfp8_flydsl_kernel(
     Constraints: K % 128 == 0 and K >= 256; M % 64 == 0; N % 64 == 0.
     """
     assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
-    assert out_dtype == torch.bfloat16, "mxfp8 FlyDSL store emits bf16 only"
+    assert out_dtype in (torch.bfloat16, torch.float16), "mxfp8 FlyDSL store emits bf16/fp16"
+    # Per-operand fp8 format -> MFMA cbsz(srcA)/blgp(srcB): 0=E4M3, 1=E5M2.
+    cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
+    blgp = 1 if b.dtype == torch.float8_e5m2 else 0
+    out_fp16 = out_dtype == torch.float16
 
     if (not trans_a) and trans_b:
         layout = "nt"
@@ -816,7 +792,9 @@ def gemm_mxfp8_flydsl_kernel(
     assert K == Kb, f"K mismatch: a {a.shape}, b {b.shape} (layout {layout})"
     assert K % 128 == 0 and K >= 256, f"K must be a multiple of 128 and >= 256, got {K}"
     assert M % 64 == 0, f"M must be a multiple of 64 (A-scale preshuffle), got {M}"
-    assert N % 64 == 0, f"N must be a multiple of 64 (combined-B scale preshuffle), got {N}"
+    # N down to %16 (MX min): combined-B preshuffle zero-pads to the next 256-multiple
+    # and StoreC masks cols >= N, so partial N-blocks are handled.
+    assert N % 16 == 0, f"N must be a multiple of 16, got {N}"
 
     # Scales arrive pre-shuffled from the quant kernel; just view as flat int32.
     a_sp = a_scale.contiguous().view(torch.int32).reshape(-1)
@@ -829,12 +807,12 @@ def gemm_mxfp8_flydsl_kernel(
     b8 = b.contiguous().view(torch.int8)
     # Per-shape cfg: first call benches GROUP_M/num_xcd/group_n (BLOCK_M fixed 256),
     # caches the winner by (M,N,K,layout); the same pre-shuffled a_sp feeds all candidates.
-    bm, gm, xcd, gn = _autotune_mxfp8(a8, b8, out, a_sp, b_sp, M, N, K, out_dtype, layout)
-    launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn)
+    bm, gm, xcd, gn = _autotune_mxfp8(a8, b8, out, a_sp, b_sp, M, N, K, out_dtype, layout, cbsz, blgp)
+    launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn, cbsz=cbsz, blgp=blgp, out_fp16=out_fp16)
     args = (a8, b8, out, a_sp, b_sp, M, N, torch.cuda.current_stream())
     # [raw, compiled]: raw for CUDA-graph capture (flyc.compile regresses under capture);
     # compiled for eager (skips per-call jit dispatch overhead). Mirrors _GROUPED_AT_CACHE.
-    at_key = (M, N, K, bm, gm, xcd, layout, gn)
+    at_key = (M, N, K, bm, gm, xcd, layout, gn, cbsz, blgp, out_fp16)
     entry = _MXFP8_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]

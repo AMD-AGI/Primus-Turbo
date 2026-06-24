@@ -443,12 +443,13 @@ class FP8GemmMXFunction(torch.autograd.Function):
         # Else (autotune / forced non-FlyDSL) -> raw-quant + dispatcher repack.
         _be = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
         _flydsl_target = _be is None or _be == BackendType.FLYDSL
-        if (
-            _flydsl_target
-            and not GlobalBackendManager.auto_tune_enabled()
-            and not isinstance(a, QuantizedTensor)
-            and not isinstance(b, QuantizedTensor)
-        ):
+        # Preshuffle fast path only when every GEMM (fwd K, bwd k-dims M and N) is
+        # aligned to the 128 tile and >= 256, so the int32 layout feeds all three
+        # directly. Otherwise (K-tail / unaligned M,N) take the raw E8M0 path so
+        # execute() can zero-pad the contraction dim (int32 can't be padded).
+        _raw_in = not isinstance(a, QuantizedTensor) and not isinstance(b, QuantizedTensor)
+        _aligned = _raw_in and all(d >= 256 and d % 128 == 0 for d in (a.shape[-1], a.shape[-2], b.shape[-2]))
+        if _flydsl_target and _aligned and not GlobalBackendManager.auto_tune_enabled() and _raw_in:
             from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
                 quantize_mxfp8_impl,
             )

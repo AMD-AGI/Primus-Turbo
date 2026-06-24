@@ -250,10 +250,15 @@ def _readfirstlane_i32(v):
 
 
 class StoreCPerTensor:
-    """Per-tensor scaled output store: out = (acc * a_scale * b_scale).to(out_ty).
+    """Scalar output store: out = (acc [* a_scale * b_scale]).to(out_ty).
 
-    Both scales are read once from length-1 buffers and applied uniformly;
-    out_ty is bf16 or fp16. Columns past c_cols clamp to an OOB index.
+    Shared by the per-tensor GEMM and the mxfp8 GEMM. ``A_scale``/``B_scale`` are
+    optional: when given, both are read once from length-1 buffers and applied
+    uniformly (per-tensor); when ``None`` the scale is already folded into the
+    accumulator by the scaled MMA (mxfp8), so the store is plain. The output is
+    re-based per row band in 64-bit index (int64-safe, M*N > 4GB) via
+    ``make_row_band_resource``; columns past c_cols clamp to an OOB index (HW SRD
+    drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
     """
 
     def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty):
@@ -264,38 +269,24 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
-        # C addressed via i64 per-tile re-basing (handles M*N > 2^31 / >4GB output);
-        # pass C as 2D so its shape packs within int32.
+        self.scaled = A_scale is not None
         self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
-        gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
-        gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
-        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
-        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
-        self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        if self.scaled:
+            gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
+            gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
+            self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+            self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+            self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
 
     def _load_scalar(self, div):
         fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def store(self, c_frag, base_row, base_col):
-        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
-        # Re-base output at this row band (i64) so the per-store byte offset stays int32;
-        # clamp band base to [0, c_rows] and num_records to the 32-bit SRD field.
-        out_b = 2  # bf16/fp16 = 2 bytes
-        cols_i = _as_index(self.c_cols)
-        row_i = _as_index(base_row)
-        rows_i = _as_index(self.c_rows)
-        row_c = arith.minui(row_i, rows_i)
-        band_base = self.c_base + row_c * cols_i * arith.index(out_b)
-        # Cap at 0x7FFFFFFF so buffer_store(mask=False) → voffset=0x7FFFFFFF is always OOB;
-        # valid tile offsets are at most BLOCK_M*c_cols*2 ≈ 30 MB << 2 GB.
-        nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0x7FFFFFFF))
-        # Pin to SGPRs: base_row derives from the group scan which the compiler marks as
-        # divergent, landing the SRD in VGPRs and waterfalling every buffer_store.
-        band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
-        nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
-        rsrc = _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
+        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div) if self.scaled else None
+        # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
@@ -303,9 +294,9 @@ class StoreCPerTensor:
                 col_valid = col < self.c_cols
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
-                    scaled = (vec_f32[i] * scale).to(self.out_ty)
-                    off = ((row_local + i) * self.c_cols + col) * out_b  # i32-small within band
-                    _buffer_ops.buffer_store(scaled, rsrc, off, mask=col_valid, offset_is_bytes=True)
+                    val = (vec_f32[i] * scale if self.scaled else vec_f32[i]).to(self.out_ty)
+                    off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
+                    _buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
 
 
 class StoreCPerTensorCShuffle:
@@ -699,16 +690,23 @@ def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
     """Buffer resource re-based at this workgroup's row band [base_row, c_rows), in
     64-bit ``index`` arith, so a 32-bit offset only spans the band (handles outputs
     whose flat M*N exceeds 2^31 / 4GB). base_row clamped to [0, c_rows] so a
-    partial/fully-OOB last row tile bases 0 records (its stores drop)."""
+    partial/fully-OOB last row tile bases 0 records (its stores drop).
+
+    base/num_records are pinned to SGPRs via ``_readfirstlane_i32``: base_row is
+    uniform across a tile's wave but the compiler's divergence analysis lands the
+    SRD in VGPRs, waterfalling every buffer_store. Pinning collapses it to scalar
+    regs (see ``_readfirstlane_i32`` / ``StoreCPerTensor``)."""
     elem = arith.index(elem_bytes)
-    cols_i = arith.index_cast(T.index, c_cols)
-    row_i = arith.index_cast(T.index, base_row)
-    rows_i = arith.index_cast(T.index, c_rows)
+    cols_i = _as_index(c_cols)
+    row_i = _as_index(base_row)
+    rows_i = _as_index(c_rows)
     row_c = arith.minui(row_i, rows_i)
     band_base = c_base + row_c * cols_i * elem
-    nrec = arith.minui((rows_i - row_c) * cols_i * elem, arith.index(0xFFFFFFFF))
-    band_base_i64 = arith.index_cast(T.i64, band_base)
-    return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec)
+    # cap at 0x7FFFFFFF so a masked-out buffer_store (voffset=0x7FFFFFFF) is always OOB
+    nrec = arith.minui((rows_i - row_c) * cols_i * elem, arith.index(0x7FFFFFFF))
+    band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
+    nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
+    return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
 
 
 def _robust_time(launch, args, warmup=250, reps=5, iters=50):
