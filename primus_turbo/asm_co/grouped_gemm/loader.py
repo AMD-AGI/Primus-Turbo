@@ -12,12 +12,11 @@ via the ``PRIMUS_TURBO_ASM_CO_DIR`` environment variable.
 
 import ctypes
 import os
+from pathlib import Path
 
 from primus_turbo.asm_co.hip_utils import load_co_func
 
 __all__ = [
-    "ASM_CO_FWD_HSACO_DIR",
-    "ASM_CO_DGRAD_HSACO_DIR",
     "get_asm_co_fwd_hsaco_func",
     "get_asm_co_dgrad_func",
     "get_asm_co_wgrad_func",
@@ -25,18 +24,30 @@ __all__ = [
 ]
 
 # ── Directory / path constants ────────────────────────────────────────────────
-# Allow overriding the binary directory via env var (same as the original impl).
-_DEFAULT_ASM_DIR = "/opt/asm_ggemm"
-ASM_CO_FWD_HSACO_DIR   = os.environ.get("PRIMUS_TURBO_ASM_CO_DIR", _DEFAULT_ASM_DIR)
-ASM_CO_DGRAD_HSACO_DIR = os.environ.get("PRIMUS_TURBO_ASM_CO_DIR", _DEFAULT_ASM_DIR)
+# Package-relative default: asm_co/asm_kernels/ sits next to asm_co/grouped_gemm/.
+_PKG_ASM_KERNELS_DIR = Path(__file__).resolve().parent.parent / "asm_kernels"
+_ENV_OVERRIDE = os.environ.get("PRIMUS_TURBO_ASM_CO_DIR")
 
 # ── Shared kernel name (baked into both FWD and DGRAD .hsaco files) ───────────
 _PERSISTENT_GEMM_KERNEL_NAME = "_grouped_fp8_persistent_gemm_kernel"
 
+
+def _resolve_path(subdir: str, filename: str, legacy_filename: str | None = None) -> str:
+    """Return the kernel binary path, honoring PRIMUS_TURBO_ASM_CO_DIR override.
+
+    When the env var is set, files are expected under a flat directory with
+    the legacy Dockerfile-era names.  Otherwise, the package-relative tree
+    structure is used directly.
+    """
+    if _ENV_OVERRIDE is not None:
+        return os.path.join(_ENV_OVERRIDE, legacy_filename or filename)
+    return str(_PKG_ASM_KERNELS_DIR / subdir / filename)
+
+
 # ── FWD .hsaco paths keyed by N dimension ────────────────────────────────────
 _ASM_CO_FWD_HSACO_PATHS: dict[int, str] = {
-    5760: os.path.join(ASM_CO_FWD_HSACO_DIR, "reference_grouped_gemm_fwd_5760.hsaco"),
-    2880: os.path.join(ASM_CO_FWD_HSACO_DIR, "reference_grouped_gemm_fwd_2880.hsaco"),
+    5760: _resolve_path("grouped_gemm_fwd", "base_gate_up_5760.hsaco", "reference_grouped_gemm_fwd_5760.hsaco"),
+    2880: _resolve_path("grouped_gemm_fwd", "base_down_2880.hsaco", "reference_grouped_gemm_fwd_2880.hsaco"),
 }
 
 _ASM_CO_FWD_MODULES: dict[int, ctypes.c_void_p] = {}
@@ -55,8 +66,8 @@ def get_asm_co_fwd_hsaco_func(n: int) -> ctypes.c_void_p:
 
 # ── DGRAD .hsaco paths keyed by K dimension ───────────────────────────────────
 _ASM_CO_DGRAD_HSACO_PATHS: dict[int, str] = {
-    2880: os.path.join(ASM_CO_DGRAD_HSACO_DIR, "dgrad_down_2880.hsaco"),
-    5760: os.path.join(ASM_CO_DGRAD_HSACO_DIR, "dgrad_gate_up_5760.hsaco"),
+    2880: _resolve_path("grouped_gemm_dgrad", "final_down_2880.hsaco", "dgrad_down_2880.hsaco"),
+    5760: _resolve_path("grouped_gemm_dgrad", "final_gate_up_5760.hsaco", "dgrad_gate_up_5760.hsaco"),
 }
 
 _ASM_CO_DGRAD_MODULES: dict[int, ctypes.c_void_p] = {}
@@ -76,8 +87,8 @@ def get_asm_co_dgrad_func(k: int) -> ctypes.c_void_p:
 # ── WGRAD .co paths (variable-K, dot_scaled MFMA 32x32x64) ──────────────────
 _ASM_CO_WGRAD_KERNEL_NAME = "grouped_variable_k_dot_scaled_kernel"
 
-_ASM_CO_WGRAD_CO_PATH      = os.path.join(_DEFAULT_ASM_DIR, "dot_scaled_v2_fixed.co")
-_ASM_CO_WGRAD_BETA1_CO_PATH = os.path.join(_DEFAULT_ASM_DIR, "dot_scaled_v2_beta1.co")
+_ASM_CO_WGRAD_CO_PATH       = _resolve_path("grouped_gemm_wgrad", "intermediate.co", "dot_scaled_v2_fixed.co")
+_ASM_CO_WGRAD_BETA1_CO_PATH = _resolve_path("grouped_gemm_wgrad", "final.co", "dot_scaled_v2_beta1.co")
 
 _ASM_CO_WGRAD_MODULE: ctypes.c_void_p | None = None
 _ASM_CO_WGRAD_FUNC:   ctypes.c_void_p | None = None

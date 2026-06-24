@@ -419,7 +419,13 @@ if __name__ == "__main__":
         name="primus_turbo",
         version=get_version(),
         packages=find_packages(exclude=["tests", "tests.*"]),
-        package_data={"primus_turbo": ["lib/*.so"]},
+        package_data={
+            "primus_turbo": [
+                "lib/*.so",
+                "asm_co/asm_kernels/**/*.co",
+                "asm_co/asm_kernels/**/*.hsaco",
+            ],
+        },
         ext_modules=ext_modules,
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,
