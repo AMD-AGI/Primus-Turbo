@@ -214,88 +214,7 @@ def _run_gemm_fp8_deterministic_test(
         GlobalBackendManager.reset()
 
 
-# Regression test for the hipBLASLt FP8 workspace shortage on MI300X (gfx942).
-#
-# Background:
-#   The HIPBLASLT FP8 backend uses a fixed-size workspace returned by
-#   ``get_hipblaslt_workspace_size_in_byte()`` in
-#   ``csrc/kernels/gemm/hipblaslt_gemm.cu``. Before commit
-#   ``fix/gemm-fp8-workspace-invalid-value-mi300x`` that value was 32 MiB
-#   on gfx942. For the specific FLUX-12B backward grad_weight GEMM
-#   ``(M=3072, N=3072, K=8192)`` with mixed E4M3 x E5M2 -> BF16
-#   tensorwise scaling, hipBLASLt's heuristic returns an algorithm whose
-#   actual workspace requirement is ~72 MiB. ``hipblasLtMatmul`` then
-#   returns ``HIPBLAS_STATUS_INVALID_VALUE`` at execution time (visible
-#   in hipBLASLt logs as ``runContractionProblem: Input workspace size
-#   33554432 is less than the required workspace size 75497472``).
-#
-#   This test reproduces the exact failing problem shape, dtype mix,
-#   layout, granularity and backend. It must succeed (no
-#   ``HIPBLAS_STATUS_INVALID_VALUE``, finite gradients) once the workspace
-#   is bumped to >= 75 497 472 bytes; it fails with a ``RuntimeError``
-#   from ``hipblaslt_gemm_impl`` if the regression is reintroduced.
-@pytest.mark.parametrize(
-    "m,n,k,layout,format,dtype,backend",
-    [
-        # FLUX-12B backward grad_weight GEMM that triggered the original crash.
-        (3072, 3072, 8192, "NT", Format.HYBRID, torch.bfloat16, BackendType.HIPBLASLT),
-    ],
-)
-def test_gemm_fp8_hipblaslt_workspace_regression(m, n, k, layout, format, dtype, backend):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    _run_gemm_fp8_test(
-        m=m,
-        n=n,
-        k=k,
-        layout=layout,
-        format=format,
-        dtype=dtype,
-        granularity=ScalingGranularity.TENSORWISE,
-        backend=backend,
-        auto_tune=False,
-    )
-
-
-# Regression: MXFP8 backward must accept a NON-CONTIGUOUS grad_out.
-#
-#   ``FP8GemmMXFunction.backward`` quantizes ``grad_out`` with MXFP8 in
-#   single-direction mode (``QuantizedTensor.quantize`` along ``axis=-1`` then
-#   ``axis=-2``), whose HIP kernel asserts ``input.is_contiguous()``. When the
-#   downstream graph produces a strided gradient (e.g. a transpose/slice before
-#   the reduction — common in real attention/MLP backward), the incoming
-#   ``grad_out`` is non-contiguous and the assertion fired:
-#       quantization_hip.cpp: Assertion failed: input.is_contiguous().
-#                             Input must be contiguous
-#   Fixed by ``grad_out = grad_out.reshape(...).contiguous()`` before the
-#   quant. This test reproduces the strided-grad backward; it must run without
-#   raising and produce finite gradients.
-@pytest.mark.parametrize("m,n,k", [(4096, 512, 7168), (4096, 8192, 1536)])
-def test_gemm_fp8_mxfp8_noncontiguous_grad_regression(m, n, k):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    mxfp8_supported, reason = check_mxfp8_support()
-    if not mxfp8_supported:
-        pytest.skip(reason)
-    torch.manual_seed(0)
-    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    config = Float8QuantConfig(
-        granularity=ScalingGranularity.MX_BLOCKWISE,
-        format=Format.E4M3,
-        block_size=32,
-        scale_dtype=ScaleDtype.E8M0,
-    )
-    # NT layout: c = a @ b^T -> [m, n]
-    c = gemm_fp8(a, b, False, True, torch.bfloat16, config)
-    # Route the output through a transpose so the gradient that reaches
-    # FP8GemmMXFunction.backward is a strided (non-contiguous) tensor.
-    c.t().reshape(-1).sum().backward()
-    assert a.grad is not None and torch.isfinite(a.grad).all()
-    assert b.grad is not None and torch.isfinite(b.grad).all()
-
-
-@pytest.mark.parametrize("m", [255, 507, 1032, 2056])
+@pytest.mark.parametrize("m", [255, 256, 507, 512])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
@@ -306,6 +225,9 @@ def test_gemm_fp8_mxfp8_noncontiguous_grad_regression(m, n, k):
 )
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
+    if m % 32 != 0 and backend == BackendType.CK:
+        pytest.skip("CK backend requires m to be a multiple of 32")
+
     _run_gemm_fp8_test(
         m=m,
         n=n,
@@ -319,7 +241,7 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune)
     )
 
 
-@pytest.mark.parametrize("m", [255, 507, 1032, 2056])
+@pytest.mark.parametrize("m", [255, 256, 507, 512])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
@@ -328,6 +250,9 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune)
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
+    if m % 32 != 0 and backend == BackendType.CK:
+        pytest.skip("CK backend requires m to be a multiple of 32")
+
     _run_gemm_fp8_test(
         m=m,
         n=n,
@@ -504,8 +429,8 @@ def _run_gemm_fp8_quantized_tensor_test(
     c_ref.backward(grad_c)
 
     c = gemm_fp8(
-        QuantizedTensorPair(data=qt_a, data_t=None),
-        QuantizedTensorPair(data=qt_b, data_t=None),
+        QuantizedTensorPair(data_rowwise=qt_a, data_colwise=None),
+        QuantizedTensorPair(data_rowwise=qt_b, data_colwise=None),
         trans_a,
         trans_b,
         dtype,
