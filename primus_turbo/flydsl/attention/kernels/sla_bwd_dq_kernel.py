@@ -999,24 +999,33 @@ def build_swa_bwd_dq_module(
                     coop_dma_k_as_v(_next_kv_start, next_buf)
                     scf.YieldOp([])
 
-            # ==== Compute dS[r] = p[r] * (dp[r] - delta) ====
-            ds_vals_lo = []
-            ds_vals_hi = []
-            for r in range_constexpr(16):
-                dp_lo = vector.extract(
-                    dp_acc_lo, static_position=[r], dynamic_position=[])
-                dp_hi = vector.extract(
-                    dp_acc_hi, static_position=[r], dynamic_position=[])
-                diff_lo = arith.SubFOp(
-                    dp_lo, delta_val, fastmath=fm_fast).result
-                diff_hi = arith.SubFOp(
-                    dp_hi, delta_val, fastmath=fm_fast).result
-                ds_lo = arith.MulFOp(
-                    p_vals_lo[r], diff_lo, fastmath=fm_fast).result
-                ds_hi = arith.MulFOp(
-                    p_vals_hi[r], diff_hi, fastmath=fm_fast).result
-                ds_vals_lo.append(ds_lo)
-                ds_vals_hi.append(ds_hi)
+            # ==== Compute dS = p * (dp - delta), vectorized over the v16f32 ====
+            # Mask-free chain: operate on the whole v16f32 MFMA accumulator
+            # with packed vector subf/mulf instead of 16x scalar
+            # extract+sub+mul per half. Bit-equivalent (same fastmath
+            # arithmetic, just packed into SIMD lanes); only the
+            # non-MFMA VALU instruction representation changes.
+            delta_splat = vector.broadcast(v16f32_type, delta_val)
+            p_vec_lo = vector.from_elements(v16f32_type, p_vals_lo)
+            p_vec_hi = vector.from_elements(v16f32_type, p_vals_hi)
+            diff_vec_lo = arith.SubFOp(
+                dp_acc_lo, delta_splat, fastmath=fm_fast).result
+            diff_vec_hi = arith.SubFOp(
+                dp_acc_hi, delta_splat, fastmath=fm_fast).result
+            ds_vec_lo = arith.MulFOp(
+                p_vec_lo, diff_vec_lo, fastmath=fm_fast).result
+            ds_vec_hi = arith.MulFOp(
+                p_vec_hi, diff_vec_hi, fastmath=fm_fast).result
+            ds_vals_lo = [
+                vector.extract(
+                    ds_vec_lo, static_position=[r], dynamic_position=[])
+                for r in range_constexpr(16)
+            ]
+            ds_vals_hi = [
+                vector.extract(
+                    ds_vec_hi, static_position=[r], dynamic_position=[])
+                for r in range_constexpr(16)
+            ]
 
             # ==== Pack dS f32 -> mfma_pack_type (bf16/f16) ====
             if const_expr(dtype_str == "bf16" and USE_K16):
