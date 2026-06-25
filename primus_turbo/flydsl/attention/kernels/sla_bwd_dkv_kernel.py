@@ -60,6 +60,7 @@ def build_swa_bwd_dkv_module(
     flat_work_group_size=None,
     block_n=None,
     block_m2=None,
+    head_splits=None,
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
@@ -138,6 +139,29 @@ def build_swa_bwd_dkv_module(
 
     NUM_HEADS = num_heads
     HEAD_DIM = head_dim
+
+    # R8 (round-3): head-dimension grid parallelization (launch-bound fix).
+    # Baseline launched grid_x = B * num_n_blocks (= 64..256 WGs for B=1),
+    # and EACH workgroup walked the full serial in-kernel head loop
+    # `for qhid in [0, NUM_HEADS)`, accumulating dk/dv f32 in VGPR carry and
+    # writing the single MQA KV slice non-atomically post-loop. That caps the
+    # kernel at 0.125-0.5 waves/SIMD on a 256-CU MI355X. HEAD_SPLITS adds a
+    # head-group axis to the grid: grid_x = B * num_n_blocks * HEAD_SPLITS and
+    # each program iterates only its NUM_HEADS // HEAD_SPLITS head sub-range,
+    # multiplying launched WGs by HEAD_SPLITS to fill the CUs. Default = full
+    # split (one head per program), mirroring round-2's proven hca_bwd_dkv_pool
+    # head-split. Because multiple head-groups now collide on the same
+    # (b, n_block) KV slice, the final dk/dv writes switch from a non-atomic
+    # store to raw_ptr_buffer_atomic_fadd into the pre-zeroed f32 DK/DV buffers.
+    if const_expr(head_splits is None):
+        HEAD_SPLITS = NUM_HEADS
+    else:
+        HEAD_SPLITS = int(head_splits)
+    assert HEAD_SPLITS >= 1
+    assert NUM_HEADS % HEAD_SPLITS == 0, (
+        f"NUM_HEADS ({NUM_HEADS}) must be divisible by HEAD_SPLITS "
+        f"({HEAD_SPLITS}).")
+    HEADS_PER_SPLIT = NUM_HEADS // HEAD_SPLITS
 
     K_STRIDE = HEAD_DIM
     K_SWZ_ROW_MASK = (K_STRIDE // 16) - 1
@@ -238,6 +262,11 @@ def build_swa_bwd_dkv_module(
         dv_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), DV)
         lse_rsrc = buffer_ops.create_buffer_resource(LSE, max_size=True)
         deltas_rsrc = buffer_ops.create_buffer_resource(DELTAS, max_size=True)
+        # R8 (round-3): dk/dv KV-slice writes become atomic_fadd because
+        # multiple head-group programs now collide on the same (b, n_block, d)
+        # addresses. DK/DV are pre-zeroed f32 buffers (launcher torch.zeros).
+        dk_rsrc = buffer_ops.create_buffer_resource(DK, max_size=True)
+        dv_rsrc = buffer_ops.create_buffer_resource(DV, max_size=True)
 
         fm_fast = arith.FastMathFlags.fast
         vxf16_type = T.vec(VEC_WIDTH, elem_type)
@@ -342,9 +371,18 @@ def build_swa_bwd_dkv_module(
         else:
             owns_mt_preds = None
 
+        # R8 (round-3): grid is (B * num_n_blocks * HEAD_SPLITS,). Decompose
+        # into (batch_idx, n_block_idx, head_group). Layout: head_group fastest,
+        # then n_block, then batch. Each program owns head sub-range
+        # [head_group*HEADS_PER_SPLIT, +HEADS_PER_SPLIT).
         num_n_blocks = (seq_len_k_v + BLOCK_N - 1) // BLOCK_N
-        n_block_idx = block_id % num_n_blocks
-        batch_idx = block_id // num_n_blocks
+        HEAD_SPLITS_idx = arith.index(HEAD_SPLITS)
+        head_group = block_id % HEAD_SPLITS_idx
+        _rest_id = block_id // HEAD_SPLITS_idx
+        n_block_idx = _rest_id % num_n_blocks
+        batch_idx = _rest_id // num_n_blocks
+        head_lo = head_group * arith.index(HEADS_PER_SPLIT)
+        head_hi = head_lo + arith.index(HEADS_PER_SPLIT)
         kv_start = n_block_idx * arith.index(BLOCK_N)
 
         load_row_in_batch = tid // THREADS_PER_ROW_LOAD
@@ -514,9 +552,11 @@ def build_swa_bwd_dkv_module(
         kv_start_i32 = arith.index_cast(T.i32, kv_start)
         lane_div_16_i32 = arith.index_cast(T.i32, lane_div_16)
 
-        NUM_HEADS_idx = arith.index(NUM_HEADS)
+        # R8 (round-3): iterate only this program's head sub-range
+        # [head_lo, head_hi) (== HEADS_PER_SPLIT heads). With the default full
+        # split (HEAD_SPLITS == NUM_HEADS) this is a single head per program.
         for qhid_constexpr_idx, h_carry, h_loop_results in scf.for_(
-            arith.index(0), NUM_HEADS_idx, arith.index(1), iter_args=outer_carry,
+            head_lo, head_hi, arith.index(1), iter_args=outer_carry,
         ):
             qhid = qhid_constexpr_idx
 
@@ -1046,6 +1086,13 @@ def build_swa_bwd_dkv_module(
         dv_finals = [outer_carry[dc] for dc in range(D_CHUNKS_LOCAL)]
         dk_finals = [outer_carry[D_CHUNKS_LOCAL + dc] for dc in range(D_CHUNKS_LOCAL)]
 
+        # R8 (round-3): atomic_fadd into the shared (b, n_block) KV slice.
+        # Multiple head-group programs (block_id % HEAD_SPLITS) now collide on
+        # the same (b, n_block, d) fp32 addresses; DK/DV are pre-zeroed f32
+        # contiguous buffers, so byte_offset = global_idx_kv * 4. Mirrors
+        # round-2's hca_bwd_dkv_pool accumulation pattern.
+        _atom_zero_i32 = arith.constant(0, type=T.i32)
+        _four_i32 = arith.constant(4, type=T.i32)
         for dc in range_constexpr(D_CHUNKS_LOCAL):
             for ii in range_constexpr(4):
                 kv_row_rel = (lane_div_16 * arith.index(4)
@@ -1067,8 +1114,17 @@ def build_swa_bwd_dkv_module(
                     dk_scaled = arith.MulFOp(
                         dk_val, c_sm_scale, fastmath=fm_fast).result
                     g_idx = global_idx_kv(kv_row_abs, d_col_abs)
-                    _gep_store_f32(dv_val, dv_ptr, g_idx)
-                    _gep_store_f32(dk_scaled, dk_ptr, g_idx)
+                    g_elem_i32 = arith.index_cast(T.i32, g_idx)
+                    byte_off_i32 = arith.MulIOp(
+                        g_elem_i32, _four_i32).result
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        dv_val, dv_rsrc, byte_off_i32,
+                        _atom_zero_i32, _atom_zero_i32,
+                    )
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        dk_scaled, dk_rsrc, byte_off_i32,
+                        _atom_zero_i32, _atom_zero_i32,
+                    )
                     scf.YieldOp([])
 
     @flyc.jit
@@ -1094,7 +1150,12 @@ def build_swa_bwd_dkv_module(
         bs_idx = arith.index_cast(T.index, batch_size)
         sk_idx = arith.index_cast(T.index, seq_len_k)
         num_n_blocks = (sk_idx + BLOCK_N - 1) // BLOCK_N
-        grid_x = bs_idx * num_n_blocks
+        # R8 (round-3): grid_x = B * num_n_blocks * HEAD_SPLITS. The serial
+        # in-kernel head loop is split across the grid (head_group fastest in
+        # block_id), multiplying launched WGs by HEAD_SPLITS to fill the CUs
+        # (launch-bound fix). Final dk/dv writes are atomic_fadd (see kernel).
+        head_splits_idx_h = arith.index(HEAD_SPLITS)
+        grid_x = bs_idx * num_n_blocks * head_splits_idx_h
 
         launcher = swa_bwd_dkv_kernel(
             Q, K, V, DOS, LSE, DELTAS, DK, DV, seq_len_q, seq_len_k,
