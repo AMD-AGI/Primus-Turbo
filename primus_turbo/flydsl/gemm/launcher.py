@@ -72,6 +72,16 @@ _TILE_CANDIDATES = (
     # barrier / prefetch / addr-gen VALU). Only the direction-aware wgrad path
     # prefers it; fwd/dgrad keep tk=128.
     (64, 256, 256),
+    # Larger-M wgrad tile for the tile_n=128-forced (K-heavy) wgrad shapes.
+    # When the output dim K is not a multiple of 256 the kernel must run
+    # tile_n=128, which pins A-fragment reuse (num_acc_n=2) so the proven
+    # tile_n=256 reuse win is unreachable. The only remaining compute lever is
+    # tile_m: doubling m_repeat 4->8 issues twice as many independent MFMA
+    # chains per wave (more ILP to hide LDS-load/MFMA latency) and amortizes
+    # the shared B-global-loads / per-output-column scale_b loads / barrier
+    # overhead over 2x output rows. Only the wgrad path with a forced
+    # tile_n=128 prefers it.
+    (128, 128, 256),
 )
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
@@ -207,6 +217,16 @@ def _select_tile(
             s += 6 if tk == 256 else 3
         else:
             s += 6 if tk == 128 else 3
+        # wgrad tile_m lever for the tile_n=128-forced (K-heavy) path. When the
+        # output dim (N arg = kernel output cols K) is not a multiple of 256 the
+        # only valid tile_n is 128, so num_acc_n is pinned at 2 and the tile_n=256
+        # reuse win is unreachable. Prefer the larger tile_m=128 variant there:
+        # it doubles the independent MFMA chains per wave (ILP to hide
+        # LDS-load/MFMA latency under the 2-wave/SIMD ceiling) and amortizes the
+        # shared B-loads / scale_b loads / barrier overhead over 2x output rows.
+        # Scoped to wgrad + tn==128 so the proven tn=256/tm=64 picks are untouched.
+        if prefer_deep_k and tn == 128 and tm == 128:
+            s += 14
         return s
 
     return max(valid, key=_score)
