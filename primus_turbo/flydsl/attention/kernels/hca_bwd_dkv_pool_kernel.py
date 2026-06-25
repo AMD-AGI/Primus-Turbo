@@ -284,13 +284,18 @@ def build_hca_bwd_dkv_pool_module(
 
         wave_n_offset = wave_id * ROWS_PER_WAVE
 
-        # R6e: grid is (B * num_m_blocks,). Decompose into (batch_idx, m_tile_idx).
-        # Layout: m_tile fastest -> consecutive programs share Q/dO batch.
+        # R7 (round-2): grid is (B * num_m_blocks * NUM_HEADS,). Decompose into
+        # (batch_idx, m_tile_idx, qhid). Layout: qhid fastest, then m_tile, then
+        # batch. One head per program -> the serial in-kernel head loop is moved
+        # onto the grid to raise occupancy (launch-bound fix).
         BM2_idx_grid = arith.index(BLOCK_M2)
         _one_idx_grid = arith.index(1)
         num_m_blocks = (seq_len_q_v + BM2_idx_grid - _one_idx_grid) // BM2_idx_grid
-        m_tile_idx = block_id % num_m_blocks
-        batch_idx = block_id // num_m_blocks
+        NUM_HEADS_idx_grid = arith.index(NUM_HEADS)
+        qhid = block_id % NUM_HEADS_idx_grid
+        _rest_id = block_id // NUM_HEADS_idx_grid
+        m_tile_idx = _rest_id % num_m_blocks
+        batch_idx = _rest_id // num_m_blocks
         m_start = m_tile_idx * BM2_idx_grid
         # Pool slice starts at HCA_LOCAL_SEQLEN and runs for POOL_SIZE keys.
         kv_start = arith.index(HCA_LOCAL)
@@ -454,15 +459,15 @@ def build_hca_bwd_dkv_pool_module(
         # ADD_MASK row stride in elements (= POOL_SIZE; bf16/f16 contiguous).
         ADD_MASK_STRIDE_M = arith.index(POOL_SIZE)
 
-        NUM_HEADS_idx = arith.index(NUM_HEADS)
-        for qhid_constexpr_idx, h_carry, h_loop_results in scf.for_(
-            arith.index(0), NUM_HEADS_idx, arith.index(1), iter_args=outer_carry,
-        ):
-            qhid = qhid_constexpr_idx
-
-            # R6e: per-program m-tile (no inner m-loop). Accumulators are head-loop carry.
-            dv_accs = [h_carry[dc] for dc in range_constexpr(D_CHUNKS)]
-            dk_accs = [h_carry[D_CHUNKS + dc] for dc in range_constexpr(D_CHUNKS)]
+        # R7 (round-2): head reduction moved onto the grid. One head per program
+        # (qhid computed from block_id above), so the serial scf.for_ over
+        # NUM_HEADS is gone. `if const_expr(True)` preserves the body indentation
+        # while removing the loop; accumulators start at zero and are
+        # atomic_fadd'd into the shared MQA pool slice at the end (unchanged).
+        if const_expr(True):
+            # R7: per-program m-tile AND per-program head. Accumulators start at 0.
+            dv_accs = [v4f32_zero for _ in range_constexpr(D_CHUNKS)]
+            dk_accs = [v4f32_zero for _ in range_constexpr(D_CHUNKS)]
 
             # R6d-A: lane_mod_16 is the per-tile q-row coord; full per-tile loop builds row below.
             q_row_abs = m_start + lane_mod_16
@@ -789,9 +794,8 @@ def build_hca_bwd_dkv_pool_module(
 
             gpu.barrier()
 
-            # R6e: yield (dv, dk) partial directly as head-loop carry; no inner m-loop.
-            yield list(new_dv_accs) + list(new_dk_accs)
-        outer_carry = list(h_loop_results)
+            # R7: head loop removed; this program's accumulators are final.
+            outer_carry = list(new_dv_accs) + list(new_dk_accs)
 
         # ---- Final: dK *= sm_scale, store ----
         dv_finals = [outer_carry[dc] for dc in range(D_CHUNKS)]
@@ -856,12 +860,17 @@ def build_hca_bwd_dkv_pool_module(
             allocator.finalize()
 
         bs_idx = arith.index_cast(T.index, batch_size)
-        # R6e: grid_x = B * num_m_blocks. Parallelize over m-tiles for B=1.
+        # R7 (round-2): grid_x = B * num_m_blocks * NUM_HEADS. The serial in-kernel
+        # head loop is moved onto the grid (one head per program), multiplying the
+        # launched block count by NUM_HEADS to fill the CUs (launch-bound fix).
+        # Decomposition in the kernel: qhid=block_id%NUM_HEADS (fastest),
+        # then m_tile, then batch.
         sq_idx_h = arith.index_cast(T.index, seq_len_q)
         BM2_idx_h = arith.index(BLOCK_M2)
         _one_idx_h = arith.index(1)
         num_m_blocks_v = (sq_idx_h + BM2_idx_h - _one_idx_h) // BM2_idx_h
-        grid_x = bs_idx * num_m_blocks_v
+        num_heads_idx_h = arith.index(NUM_HEADS)
+        grid_x = bs_idx * num_m_blocks_v * num_heads_idx_h
 
         launcher = hca_bwd_dkv_pool_kernel(
             Q, K, V, DOS, LSE, DELTAS, DK, DV, ADD_MASK,
