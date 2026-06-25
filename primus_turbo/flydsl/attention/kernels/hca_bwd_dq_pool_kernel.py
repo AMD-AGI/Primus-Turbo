@@ -973,8 +973,21 @@ def build_hca_bwd_dq_pool_module(
                 # anyway via NEG_INF, but keep numerics tidy).
                 return arith.select(bad_pred, c_zero_f, bias_f32)
 
-            p_vals_lo = []
-            p_vals_hi = []
+            # ==== Compute p = exp((qk*scale + add_bias) - LSE), VECTORIZED ====
+            # Gather the per-r ADD_MASK add_bias and the OOB/q_oob mask
+            # predicate, then apply scale-mul, bias-add, NEG_INF mask-select,
+            # lse-subtract and the exp as PACKED vector ops over the whole
+            # v16f32 accumulator (one vector exp per half instead of 16 scalar
+            # exps). Bit-equivalent to the prior scalar chain (same fastmath
+            # arithmetic, same mask predicate); the dead `qk_plus_bias` add is
+            # dropped. Only the non-MFMA VALU representation changes. Same
+            # mechanism R11 landed on swa_bwd_dq's epilogue.
+            _i1_ty = ir.IntegerType.get_signless(1)
+            _v16i1_ty = ir.VectorType.get([16], _i1_ty)
+            bias_lo_list = []
+            bias_hi_list = []
+            bad_lo_list = []
+            bad_hi_list = []
             for r in range_constexpr(16):
                 r_off_i32 = arith.constant(
                     (r % 4) + (r // 4) * 8, type=T.i32)
@@ -987,26 +1000,8 @@ def build_hca_bwd_dq_pool_module(
                     arith.CmpIPredicate.sge, pool_n_lo_i32, pool_size_i32,
                 )
                 bad_lo = arith.OrIOp(is_pool_oob_lo, q_oob).result
-
-                s_lo_f32 = vector.extract(
-                    s_acc_lo, static_position=[r], dynamic_position=[])
-                bias_lo = _load_add_bias(pool_n_lo_i32, bad_lo)
-                qk_plus_bias_lo = arith.AddFOp(
-                    s_lo_f32, bias_lo, fastmath=fm_fast).result
-                # Triton: qk = qk * sm_scale; qk = qk + add_bias.
-                # We deferred sm_scale to here: (qk + bias) is wrong; need
-                # qk*scale + bias. Re-do as: s_scaled + bias.
-                scaled_lo = arith.MulFOp(
-                    s_lo_f32, c_sm_scale, fastmath=fm_fast).result
-                scaled_plus_bias_lo = arith.AddFOp(
-                    scaled_lo, bias_lo, fastmath=fm_fast).result
-                scaled_lo_masked = arith.select(
-                    bad_lo, c_neg_inf, scaled_plus_bias_lo,
-                )
-                diff_lo = arith.SubFOp(
-                    scaled_lo_masked, lse_val, fastmath=fm_fast).result
-                p_lo = math_dialect.exp(diff_lo, fastmath=fm_fast)
-                p_vals_lo.append(p_lo)
+                bias_lo_list.append(_load_add_bias(pool_n_lo_i32, bad_lo))
+                bad_lo_list.append(bad_lo)
 
                 # --- hi half: pool_n_hi = pool_n_lo + K_SUB_N ---
                 pool_n_hi_i32 = arith.AddIOp(
@@ -1017,21 +1012,33 @@ def build_hca_bwd_dq_pool_module(
                     arith.CmpIPredicate.sge, pool_n_hi_i32, pool_size_i32,
                 )
                 bad_hi = arith.OrIOp(is_pool_oob_hi, q_oob).result
+                bias_hi_list.append(_load_add_bias(pool_n_hi_i32, bad_hi))
+                bad_hi_list.append(bad_hi)
 
-                s_hi_f32 = vector.extract(
-                    s_acc_hi, static_position=[r], dynamic_position=[])
-                bias_hi = _load_add_bias(pool_n_hi_i32, bad_hi)
-                scaled_hi = arith.MulFOp(
-                    s_hi_f32, c_sm_scale, fastmath=fm_fast).result
-                scaled_plus_bias_hi = arith.AddFOp(
-                    scaled_hi, bias_hi, fastmath=fm_fast).result
-                scaled_hi_masked = arith.select(
-                    bad_hi, c_neg_inf, scaled_plus_bias_hi,
-                )
-                diff_hi = arith.SubFOp(
-                    scaled_hi_masked, lse_val, fastmath=fm_fast).result
-                p_hi = math_dialect.exp(diff_hi, fastmath=fm_fast)
-                p_vals_hi.append(p_hi)
+            sm_splat = vector.broadcast(v16f32_type, c_sm_scale)
+            lse_splat = vector.broadcast(v16f32_type, lse_val)
+            neg_inf_splat = vector.broadcast(v16f32_type, c_neg_inf)
+            bias_vec_lo = vector.from_elements(v16f32_type, bias_lo_list)
+            bias_vec_hi = vector.from_elements(v16f32_type, bias_hi_list)
+            bad_vec_lo = vector.from_elements(_v16i1_ty, bad_lo_list)
+            bad_vec_hi = vector.from_elements(_v16i1_ty, bad_hi_list)
+
+            scaled_vec_lo = arith.MulFOp(
+                s_acc_lo, sm_splat, fastmath=fm_fast).result
+            scaled_vec_hi = arith.MulFOp(
+                s_acc_hi, sm_splat, fastmath=fm_fast).result
+            spb_vec_lo = arith.AddFOp(
+                scaled_vec_lo, bias_vec_lo, fastmath=fm_fast).result
+            spb_vec_hi = arith.AddFOp(
+                scaled_vec_hi, bias_vec_hi, fastmath=fm_fast).result
+            masked_vec_lo = arith.select(bad_vec_lo, neg_inf_splat, spb_vec_lo)
+            masked_vec_hi = arith.select(bad_vec_hi, neg_inf_splat, spb_vec_hi)
+            diff_p_lo = arith.SubFOp(
+                masked_vec_lo, lse_splat, fastmath=fm_fast).result
+            diff_p_hi = arith.SubFOp(
+                masked_vec_hi, lse_splat, fastmath=fm_fast).result
+            p_vec_lo = math_dialect.exp(diff_p_lo, fastmath=fm_fast)
+            p_vec_hi = math_dialect.exp(diff_p_hi, fastmath=fm_fast)
 
             # ==== Overwrite K LDS slot with V for GEMM2 ====
             gpu.barrier()
@@ -1071,24 +1078,31 @@ def build_hca_bwd_dq_pool_module(
                     coop_dma_k_as_v(_next_kv_start, next_buf)
                     scf.YieldOp([])
 
-            # ==== Compute dS[r] = p[r] * (dp[r] - delta) ====
-            ds_vals_lo = []
-            ds_vals_hi = []
-            for r in range_constexpr(16):
-                dp_lo = vector.extract(
-                    dp_acc_lo, static_position=[r], dynamic_position=[])
-                dp_hi = vector.extract(
-                    dp_acc_hi, static_position=[r], dynamic_position=[])
-                diff_lo = arith.SubFOp(
-                    dp_lo, delta_val, fastmath=fm_fast).result
-                diff_hi = arith.SubFOp(
-                    dp_hi, delta_val, fastmath=fm_fast).result
-                ds_lo = arith.MulFOp(
-                    p_vals_lo[r], diff_lo, fastmath=fm_fast).result
-                ds_hi = arith.MulFOp(
-                    p_vals_hi[r], diff_hi, fastmath=fm_fast).result
-                ds_vals_lo.append(ds_lo)
-                ds_vals_hi.append(ds_hi)
+            # ==== Compute dS = p * (dp - delta), VECTORIZED over the v16f32 ====
+            # Packed vector subf/mulf over the whole MFMA accumulator instead
+            # of 16x scalar extract+sub+mul per half. Bit-equivalent (same
+            # fastmath arithmetic, just packed into SIMD lanes); only the
+            # non-MFMA VALU representation changes. Per-element extract is kept
+            # only at the final bf16 ds-pack boundary the next MFMA consumes.
+            delta_splat = vector.broadcast(v16f32_type, delta_val)
+            diff_dp_lo = arith.SubFOp(
+                dp_acc_lo, delta_splat, fastmath=fm_fast).result
+            diff_dp_hi = arith.SubFOp(
+                dp_acc_hi, delta_splat, fastmath=fm_fast).result
+            ds_vec_lo = arith.MulFOp(
+                p_vec_lo, diff_dp_lo, fastmath=fm_fast).result
+            ds_vec_hi = arith.MulFOp(
+                p_vec_hi, diff_dp_hi, fastmath=fm_fast).result
+            ds_vals_lo = [
+                vector.extract(
+                    ds_vec_lo, static_position=[r], dynamic_position=[])
+                for r in range_constexpr(16)
+            ]
+            ds_vals_hi = [
+                vector.extract(
+                    ds_vec_hi, static_position=[r], dynamic_position=[])
+                for r in range_constexpr(16)
+            ]
 
             # ==== Pack dS f32 -> mfma_pack_type (bf16/f16) ====
             if const_expr(dtype_str == "bf16" and USE_K16):
