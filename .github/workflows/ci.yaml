@@ -201,7 +201,7 @@ jobs:
           command: >
             timeout -k 60s 130m
             bash -lc
-            "exec pytest -v tests/pytorch -n 8 --log-cli-level=INFO"
+            "exec pytest -v tests/pytorch -n 8 --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO"
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run deterministic tests (parallel)
@@ -213,7 +213,7 @@ jobs:
           command: >
             timeout -k 60s 55m
             bash -lc
-            "exec pytest -v tests/pytorch -n 8 --deterministic-only --log-cli-level=INFO"
+            "exec pytest -v tests/pytorch -n 8 --deterministic-only --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO"
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run distributed tests
@@ -221,7 +221,7 @@ jobs:
         with:
           timeout_minutes: 60
           max_attempts: 2
-          command: pytest -v tests/pytorch --dist-only --log-cli-level=INFO
+          command: pytest -v tests/pytorch --dist-only --timeout=600 --timeout-method=thread --log-cli-level=INFO
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
 

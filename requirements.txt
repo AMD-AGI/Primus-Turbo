@@ -5,6 +5,7 @@ ninja
 expecttest
 pytest
 pytest-xdist
+pytest-timeout
 setuptools==69.5.1
 setuptools_scm[toml]>=8
 wheel
