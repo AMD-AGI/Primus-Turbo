@@ -252,8 +252,8 @@ __global__ void grouped_dequantize_mxfp8_colwise_kernel(
 
 template <typename OType, typename QType>
 void grouped_dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t stride_x_row,
-                                   const int64_t stride_y_row, const int total_M,
-                                   const int m_padded, const int n_cols, const uint8_t *scale_inv,
+                                   const int64_t stride_y_row, const int total_M, const int n_rows,
+                                   const int n_cols, const uint8_t *scale_inv,
                                    const int64_t stride_scale_row, const int64_t stride_scale_col,
                                    const int scale_n_rows, const int scale_n_cols,
                                    const int64_t *group_offs, const int64_t *group_offs_padded,
@@ -269,11 +269,11 @@ void grouped_dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t strid
             stride_scale_col, scale_n_rows, scale_n_cols, group_offs, group_offs_padded, G,
             block_size);
     } else {
-        const dim3 grid((m_padded + BLOCK_N - 1) / BLOCK_N, (n_cols + BLOCK_M - 1) / BLOCK_M);
+        const dim3 grid((n_rows + BLOCK_N - 1) / BLOCK_N, (n_cols + BLOCK_M - 1) / BLOCK_M);
         grouped_dequantize_mxfp8_colwise_kernel<OType, QType><<<grid, block, 0, stream>>>(
-            x, y, stride_x_row, stride_y_row, total_M, m_padded, n_cols, scale_inv,
-            stride_scale_row, stride_scale_col, scale_n_rows, scale_n_cols, group_offs,
-            group_offs_padded, G, block_size);
+            x, y, stride_x_row, stride_y_row, total_M, n_rows, n_cols, scale_inv, stride_scale_row,
+            stride_scale_col, scale_n_rows, scale_n_cols, group_offs, group_offs_padded, G,
+            block_size);
     }
 }
 
@@ -327,7 +327,7 @@ DECL_DEQUANT_MXFP8_INSTANCE(dtype::float32, dtype::float8_e5m2)
 #define DECL_GROUPED_DEQUANT_MXFP8_INSTANCE(OType, QType)                                          \
     template void grouped_dequantize_mxfp8_impl<OType, QType>(                                     \
         const QType *x, OType *y, const int64_t stride_x_row, const int64_t stride_y_row,          \
-        const int total_M, const int m_padded, const int n_cols, const uint8_t *scale_inv,         \
+        const int total_M, const int n_rows, const int n_cols, const uint8_t *scale_inv,           \
         const int64_t stride_scale_row, const int64_t stride_scale_col, const int scale_n_rows,    \
         const int scale_n_cols, const int64_t *group_offs, const int64_t *group_offs_padded,       \
         int G, int block_size, bool use_rowwise, hipStream_t stream);

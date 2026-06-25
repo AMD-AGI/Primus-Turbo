@@ -966,31 +966,40 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_k
     constexpr int PASSES_PER_TILE = MXFP8_BLOCK_SIZE / ROWS_PER_PASS;
     constexpr int TOTAL_CHUNKS    = NUM_CHUNKS_M * NUM_CHUNKS_N;
 
+    constexpr int64_t  TILE_ALIGN = BLOCK_M; // = 128
     __shared__ int64_t s_group_offs_orig;
     __shared__ int64_t s_group_offs_pad;
+    __shared__ int64_t s_group_offs_pad_out;
     __shared__ int64_t s_real_end_in_pad;
     if (tid == 0) {
-        int g = -1;
+        int64_t pad_tile = 0; // running 128-aligned prefix (tile space)
+        int     g        = -1;
         for (int i = 0; i < G; ++i) {
-            if (base_m >= group_offs_padded[i] && base_m < group_offs_padded[i + 1]) {
+            const int64_t len   = group_offs[i + 1] - group_offs[i];
+            const int64_t ctile = (len + TILE_ALIGN - 1) / TILE_ALIGN * TILE_ALIGN;
+            if (base_m >= pad_tile && base_m < pad_tile + ctile) {
                 g = i;
                 break;
             }
+            pad_tile += ctile;
         }
         if (g >= 0) {
-            s_group_offs_orig = group_offs[g];
-            s_group_offs_pad  = group_offs_padded[g];
-            s_real_end_in_pad = group_offs_padded[g] + (group_offs[g + 1] - group_offs[g]);
+            s_group_offs_orig    = group_offs[g];
+            s_group_offs_pad     = pad_tile;
+            s_group_offs_pad_out = group_offs_padded[g];
+            s_real_end_in_pad    = pad_tile + (group_offs[g + 1] - group_offs[g]);
         } else {
-            s_group_offs_orig = 0;
-            s_group_offs_pad  = base_m;
-            s_real_end_in_pad = base_m;
+            s_group_offs_orig    = 0;
+            s_group_offs_pad     = base_m;
+            s_group_offs_pad_out = base_m;
+            s_real_end_in_pad    = base_m;
         }
     }
     __syncthreads();
-    const int64_t group_offs_orig = s_group_offs_orig;
-    const int64_t group_offs_pad  = s_group_offs_pad;
-    const int64_t real_end_in_pad = s_real_end_in_pad;
+    const int64_t group_offs_orig    = s_group_offs_orig;
+    const int64_t group_offs_pad     = s_group_offs_pad;
+    const int64_t group_offs_pad_out = s_group_offs_pad_out;
+    const int64_t real_end_in_pad    = s_real_end_in_pad;
 
     constexpr int       s_tile_DEPTH = kIsRowwise ? 1 : (MXFP8_BLOCK_SIZE + SMEM_PADDING);
     __shared__ uint16_t s_tile[WARPS_PER_BLOCK][MXFP8_BLOCK_SIZE][s_tile_DEPTH];
@@ -1147,45 +1156,35 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_k
                     const int global_row = tile_m + local_row;
 
                     if (global_row < real_end_in_pad) {
+                        const int64_t row_out = group_offs_pad_out +
+                                                (static_cast<int64_t>(global_row) - group_offs_pad);
                         if (global_col < N_pad) {
                             if (shuffle_out) {
                                 int shuffled_index = compute_shuffled_index<OType>(
-                                    global_row, global_col, output_packed_stride);
+                                    static_cast<int>(row_out), global_col, output_packed_stride);
                                 *reinterpret_cast<uint32_t *>(out_fp8 + shuffled_index) = fp8x4;
                             } else {
-                                *reinterpret_cast<uint32_t *>(out_fp8 +
-                                                              static_cast<int64_t>(global_row) *
-                                                                  output_packed_stride +
-                                                              global_col) = fp8x4;
+                                *reinterpret_cast<uint32_t *>(
+                                    out_fp8 + row_out * output_packed_stride + global_col) = fp8x4;
                             }
                         }
 
                         if (thread_in_row == 0) {
                             int scale_col = block_n * NUM_CHUNKS_N + chunk_n;
                             if (shuffle_scale) {
-                                if (global_row < scale_M_pad && scale_col < scale_N_pad) {
+                                if (row_out < scale_M_pad && scale_col < scale_N_pad) {
                                     int scale_index = compute_shuffle_scale_index(
-                                        global_row, scale_col, scale_N_pad);
+                                        static_cast<int>(row_out), scale_col, scale_N_pad);
                                     out_scale[scale_index] = (scale_col < scale_N)
                                                                  ? r_scale_e8m0[pass]
                                                                  : static_cast<uint8_t>(0);
                                 }
                             } else {
                                 if (scale_col < scale_N) {
-                                    out_scale[global_row * scale_stride + scale_col] =
+                                    out_scale[row_out * scale_stride + scale_col] =
                                         r_scale_e8m0[pass];
                                 }
                             }
-                        }
-                    }
-
-                    if (shuffle_scale && thread_in_row == 0 && global_row >= real_end_in_pad &&
-                        global_row < scale_M_pad) {
-                        int scale_col = block_n * NUM_CHUNKS_N + chunk_n;
-                        if (scale_col < scale_N_pad) {
-                            int scale_index =
-                                compute_shuffle_scale_index(global_row, scale_col, scale_N_pad);
-                            out_scale[scale_index] = static_cast<uint8_t>(0);
                         }
                     }
 
@@ -1672,7 +1671,7 @@ template <typename IType, typename OType>
 void grouped_quantize_mxfp8_dual_impl(
     const IType *input, OType *rowwise_output, uint8_t *rowwise_scale, OType *colwise_output,
     uint8_t *colwise_scale, const int64_t *group_offs, const int64_t *group_offs_padded_colwise,
-    const int64_t *group_offs_padded_rowwise, int G, int total_M_padded, int N, int N_pad,
+    const int64_t *group_offs_padded_rowwise, int G, int total_M, int N, int N_pad,
     int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
     int colwise_scale_M_pad, int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
@@ -1681,6 +1680,10 @@ void grouped_quantize_mxfp8_dual_impl(
     PRIMUS_TURBO_CHECK(colwise_recipe.use_rht == false, "MXFP8 not support RHT");
     PRIMUS_TURBO_CHECK(rowwise_recipe.use_sr == false, "MXFP8 not support SR");
     PRIMUS_TURBO_CHECK(colwise_recipe.use_sr == false, "MXFP8 not support SR");
+
+    // Colwise output / tile-iteration M extent is 128 (BLOCK_M) aligned per group;
+    // matches the M_pad_col the caller uses to size the colwise output tensor.
+    const int total_M_padded = (total_M + G * BLOCK_M + BLOCK_M - 1) / BLOCK_M * BLOCK_M;
 
     dim3 grid((total_M_padded + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
@@ -1751,11 +1754,13 @@ template void grouped_quantize_mxfp8_dual_impl<dtype::bfloat16, dtype::float8_e4
 template <typename IType, typename OType>
 void grouped_quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
                                  const int64_t *group_offs, const int64_t *group_offs_padded,
-                                 QuantizeMode mode, int G, int total_M_padded, int N, int N_pad,
+                                 QuantizeMode mode, int G, int total_M, int N, int N_pad,
                                  int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
                                  ScalingRecipe recipe, hipStream_t stream) {
     PRIMUS_TURBO_CHECK(recipe.use_rht == false, "MXFP8 not support RHT");
     PRIMUS_TURBO_CHECK(recipe.use_sr == false, "MXFP8 not support SR");
+
+    const int total_M_padded = (total_M + G * BLOCK_M + BLOCK_M - 1) / BLOCK_M * BLOCK_M;
 
     dim3 grid((total_M_padded + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3 block(THREADS_PER_BLOCK);
