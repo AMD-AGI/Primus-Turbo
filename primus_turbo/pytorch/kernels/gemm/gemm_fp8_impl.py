@@ -148,10 +148,23 @@ class GEMMFP8CKBackend(KernelBackend):
         # check dtype
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8CKBackend.SUPPORTED_DTYPES
 
-        # TODO: check layout
-        # supported &= (trans_a, trans_b, trans_c) in GEMMFP8CKBackend.SUPPORTED_LAYOUTS
+        if trans_c:
+            lhs, rhs = b, a
+            trans_lhs, trans_rhs = (not trans_b), (not trans_a)
+        else:
+            lhs, rhs = a, b
+            trans_lhs, trans_rhs = trans_a, trans_b
 
-        # TODO: check shape
+        k = lhs.shape[0] if trans_lhs else lhs.shape[1]
+        n = rhs.shape[0] if trans_rhs else rhs.shape[1]
+
+        # NT / NN layout (transA == False): the contraction dim k must be a
+        # multiple of 32.
+        if not trans_lhs:
+            supported &= k % 32 == 0
+            # BLOCKWISE additionally requires k, n multiples of 128 and k >= 128.
+            if granularity == ScalingGranularity.BLOCKWISE:
+                supported &= (k % 128 == 0) and (n % 128 == 0) and (k >= 128)
 
         return supported
 
@@ -370,6 +383,10 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         # StoreC clamp + the global SRD.)
         k = a.shape[0] if trans_a else a.shape[1]
         supported &= k >= 129
+        # No size cap: foldable operands (NT both, NN-A) fold their per-tile base into
+        # the i64 SRD; the traversal operands (NN-B k*n, TN k*m & k*n) that would wrap a
+        # 32-bit soffset past 2^32 fp8 are re-based per load in i64 by the wrapper (it
+        # auto-selects i64 at/above 2^32, keeping the cheaper int32 path below).
         # per-tensor scalar scale (wrapper broadcasts to vector internally)
         supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
         return supported

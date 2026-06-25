@@ -66,7 +66,7 @@ Wrap the op for model code (hold `nn.Parameter`s, reshape, call the op). Referen
 
 ```
 - [ ] Correctness first  → ../verify-accuracy/SKILL.md   (add ref in tests/pytorch/ref/, test in tests/pytorch/ops/)
-- [ ] Then performance    → ../verify-performance/SKILL.md (add/extend benchmark/ops/bench_*.py)
+- [ ] Then performance    → ../verify-performance/SKILL.md (add/extend benchmark/ops/training/bench_*.py)
 - [ ] Focused test green, then `pytest tests/pytorch/ -n 8`
 - [ ] Rebuilt if a C++ schema changed
 - [ ] Push toward HW limit → ../optimize-handoff/SKILL.md

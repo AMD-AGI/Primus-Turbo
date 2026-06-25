@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import NamedTuple, Optional, Tuple, Union
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -211,20 +211,3 @@ class Float4QuantConfig:
         assert (
             self.scale_dtype == mx_support_scale_dtype
         ), f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
-
-
-def weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
-    if isinstance(quant_config, Float4QuantConfig):
-        weight_scaling_recipe = ScalingRecipe(
-            use_2d_block=True,
-            shuffle_scale=quant_config.use_preshuffle,
-            shuffle_out=quant_config.use_preshuffle,
-        )
-
-    if isinstance(quant_config, Float8QuantConfig):
-        if quant_config.granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
-            weight_scaling_recipe = ScalingRecipe(use_2d_block=True)
-        else:
-            weight_scaling_recipe = ScalingRecipe()
-
-    return weight_scaling_recipe

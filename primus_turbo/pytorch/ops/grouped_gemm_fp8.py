@@ -13,6 +13,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Format,
     ScalingGranularity,
     ScalingRecipe,
+    check_mxfp8_support,
     float8_e4m3,
     float8_e5m2,
 )
@@ -21,6 +22,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
+from primus_turbo.pytorch.core.utils import is_gfx942
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_impl,
     grouped_gemm_fp8_variable_k_impl,
@@ -57,6 +59,15 @@ def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
     # Some upstream reductions can produce expanded zero-stride grad_out views.
     # Custom grouped GEMM kernels expect dense layouts.
     return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+
+
+def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
+    if is_gfx942():
+        return False
+
+    # NOTE: the non-NT layout gemm is not optimized for mi350/mi450.
+    # Force to use NT layout GEMM in backward for now.
+    return trans_a == False and trans_b == True
 
 
 class FP8GroupedGemmBlockFunc(torch.autograd.Function):
@@ -187,7 +198,16 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             default_backend=BackendType.TRITON.value,
         )
 
-        return grad_a, grad_b, None, None, None, None, None, None
+        return (
+            grad_a,  # a
+            grad_b,  # b
+            None,  # group_lens
+            None,  # group_offs
+            None,  # trans_b
+            None,  # out_dtype
+            None,  # config
+            None,  # num_cu
+        )
 
 
 class FP8GroupedGemmRowFunc(torch.autograd.Function):
@@ -197,8 +217,8 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         ctx,
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
-        a_t: Optional[QuantizedTensor],
-        b_t: Optional[QuantizedTensor],
+        a_colwise: Optional[QuantizedTensor],
+        b_colwise: Optional[QuantizedTensor],
         group_lens: torch.Tensor,  # [B,] int64
         group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
@@ -260,13 +280,13 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         )
 
         # Col-wise trans cache for backward. If the caller pre-quantized this
-        # and passed it via ``a_t`` / ``b_t``, reuse it directly; otherwise
+        # and passed it via ``a_colwise`` / ``b_colwise``, reuse it directly; otherwise
         # derive it (dequantize + re-quantize along the other axis), mirroring
         # FP8GemmRowFunction in gemm_fp8.py.
-        if a_t is not None:
-            quantized_a_t = a_t
+        if a_colwise is not None:
+            quantized_a_colwise = a_colwise
         else:
-            quantized_a_t = QuantizedTensor.quantize(
+            quantized_a_colwise = QuantizedTensor.quantize(
                 quantized_a.dequantize(),
                 quantized_a.real_dtype,
                 config.granularity,
@@ -275,10 +295,10 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
                 group_lens=group_lens,
             )
 
-        if b_t is not None:
-            quantized_b_t = b_t
+        if b_colwise is not None:
+            quantized_b_colwise = b_colwise
         else:
-            quantized_b_t = QuantizedTensor.quantize(
+            quantized_b_colwise = QuantizedTensor.quantize(
                 quantized_b.dequantize(),
                 quantized_b.real_dtype,
                 config.granularity,
@@ -287,10 +307,10 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             )
 
         ctx.save_for_backward(
-            quantized_a_t.qdata,
-            quantized_b_t.qdata,
-            quantized_a_t.scale_inv,
-            quantized_b_t.scale_inv,
+            quantized_a_colwise.qdata,
+            quantized_b_colwise.qdata,
+            quantized_a_colwise.scale_inv,
+            quantized_b_colwise.scale_inv,
             group_lens,
             group_offs,
         )
@@ -359,9 +379,18 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             default_backend=BackendType.TRITON.value,
         )
 
-        # Grads correspond to forward args:
-        #   (a, b, a_t, b_t, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
-        return grad_a, grad_b, None, None, None, None, None, None, None, None
+        return (
+            grad_a,  # a
+            grad_b,  # b
+            None,  # a_colwise
+            None,  # b_colwise
+            None,  # group_lens
+            None,  # group_offs
+            None,  # trans_b
+            None,  # out_dtype
+            None,  # config
+            None,  # num_cu
+        )
 
 
 class FP8GroupedGemmTensorFunc(torch.autograd.Function):
@@ -371,8 +400,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         ctx,
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
-        a_t: Optional[QuantizedTensor],
-        b_t: Optional[QuantizedTensor],
+        a_colwise: Optional[QuantizedTensor],  # not used
+        b_colwise: Optional[QuantizedTensor],
         group_lens: torch.Tensor,  # [B,] int64
         group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
@@ -380,9 +409,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         config: Float8QuantConfig,
         num_cu: int | None,
     ):
-        use_nt_layout_gemm_in_bwd = False
-        if trans_b == True:
-            use_nt_layout_gemm_in_bwd = True
+        use_nt_layout_gemm_in_bwd = _deter_use_nt_layout_gemm_in_bwd(False, trans_b)
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
@@ -417,16 +444,10 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             )
 
         if use_nt_layout_gemm_in_bwd:
-            if b_t is not None and isinstance(b_t, QuantizedTensor):
-                quantized_b_t = b_t
+            if b_colwise is not None and isinstance(b_colwise, QuantizedTensor):
+                quantized_b_colwise = b_colwise
             else:
-                quantized_b_t = QuantizedTensor.quantize(
-                    quantized_b.dequantize().transpose(-1, -2).contiguous(),
-                    quantized_b.real_dtype,
-                    config.granularity,
-                    axis=-1,
-                    block_size=config.block_size,
-                )
+                quantized_b_colwise = quantized_b.transpose(-1, -2).contiguous()
 
         out = grouped_gemm_fp8_impl(
             quantized_a.qdata,
@@ -447,9 +468,9 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         if use_nt_layout_gemm_in_bwd:
             ctx.save_for_backward(
                 quantized_a.qdata,
-                quantized_b_t.qdata,
+                quantized_b_colwise.qdata,
                 quantized_a.scale_inv,
-                quantized_b_t.scale_inv,
+                quantized_b_colwise.scale_inv,
                 group_lens,
                 group_offs,
             )
@@ -534,7 +555,18 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             default_backend=BackendType.TRITON.value,
         )
 
-        return grad_a, grad_b, None, None, None, None, None, None, None, None
+        return (
+            grad_a,  # a
+            grad_b,  # b
+            None,  # a_colwise
+            None,  # b_colwise
+            None,  # group_lens
+            None,  # group_offs
+            None,  # trans_b
+            None,  # out_dtype
+            None,  # config
+            None,  # num_cu
+        )
 
 
 class FP8GroupedGemmMXFunc(torch.autograd.Function):
@@ -551,44 +583,108 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu):
+    def forward(
+        ctx,
+        a: Union[torch.Tensor, QuantizedTensor],
+        b: Union[torch.Tensor, QuantizedTensor],
+        a_colwise: Optional[QuantizedTensor],
+        b_colwise: Optional[QuantizedTensor],
+        group_lens: torch.Tensor,  # [B,] int64
+        group_offs: torch.Tensor,  # [B + 1,] int64
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        config: Float8QuantConfig,
+        num_cu: int | None,
+    ):
+        supported_mxfp8_backend, reason = check_mxfp8_support()
+        assert supported_mxfp8_backend, reason
+
         assert config.granularity == ScalingGranularity.MX_BLOCKWISE
         assert a.ndim == 2 and b.ndim == 3
-        assert out_dtype in [torch.float16, torch.bfloat16]
         assert trans_b, "MXFP8 grouped GEMM only supports trans_b=True (NT layout)."
 
         a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
 
-        # A: fused grouped dual-quant + per-group M zero-pad (rowwise 32 / colwise
-        # 128), padded layouts computed on GPU (no D2H sync).
-        (
-            a_fp8_row,
-            a_scale_row,
-            a_fp8_col,
-            a_scale_col,
-            _,
-            group_offs_padded_rowwise,
-            _,
-            _,
-        ) = grouped_quantize_fp8_with_trans(
-            a,
-            a_dtype,
-            config.granularity,
-            group_lens,
-            group_offs,
-            block_size=config.block_size,
-            scaling_recipe=ScalingRecipe(),
-            scaling_recipe_for_trans=ScalingRecipe(),
-        )
-        # B: per-group dual-quant (rowwise (G,N,K) for fwd, colwise (G,K,N) for dgrad).
-        b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = quantize_fp8_with_trans(
-            b,
-            b_dtype,
-            config.granularity,
-            block_size=config.block_size,
-            scaling_recipe=ScalingRecipe(use_2d_block=True),
-            scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
-        )
+        a_scaling_recipe = ScalingRecipe()
+        if not isinstance(a, QuantizedTensor):
+            # NOTE: If a is not a QuantizedTensor use grouped_quantize_fp8_with_trans to avoid call dequantize.
+            (
+                a_fp8_row,
+                a_scale_row,
+                a_fp8_col,
+                a_scale_col,
+                _,
+                group_offs_padded_rowwise,
+                _,
+                _,
+            ) = grouped_quantize_fp8_with_trans(
+                a,
+                a_dtype,
+                config.granularity,
+                group_lens,
+                group_offs,
+                block_size=config.block_size,
+                scaling_recipe=ScalingRecipe(),
+                scaling_recipe_for_trans=ScalingRecipe(),
+            )
+        else:
+            quantized_a = a
+            check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
+
+            if a_colwise is None:
+                quantized_a_colwise = QuantizedTensor.quantize(
+                    quantized_a.dequantize(),
+                    quantized_a.real_dtype,
+                    config.granularity,
+                    axis=-2,
+                    block_size=config.block_size,
+                    scaling_recipe=a_scaling_recipe,
+                    group_lens=group_lens,
+                )
+            else:
+                assert isinstance(a_colwise, QuantizedTensor)
+                quantized_a_colwise = a_colwise
+
+            a_fp8_row = quantized_a.qdata
+            a_scale_row = quantized_a.scale_inv
+            a_fp8_col = quantized_a_colwise.qdata
+            a_scale_col = quantized_a_colwise.scale_inv
+
+            group_offs_padded_rowwise = quantized_a.group_offs_padded_rowwise
+
+        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        if not isinstance(b, QuantizedTensor):
+            # NOTE: If b is not a QuantizedTensor use quantize_fp8_with_trans to avoid call dequantize.
+
+            b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = quantize_fp8_with_trans(
+                b,
+                b_dtype,
+                config.granularity,
+                block_size=config.block_size,
+                scaling_recipe=ScalingRecipe(use_2d_block=True),
+                scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
+            )
+        else:
+            quantized_b = b
+            check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
+
+            if b_colwise is None:
+                quantized_b_colwise = QuantizedTensor.quantize(
+                    quantized_b.dequantize(),
+                    quantized_b.real_dtype,
+                    config.granularity,
+                    axis=-2,
+                    block_size=config.block_size,
+                    scaling_recipe=b_scaling_recipe,
+                )
+            else:
+                assert isinstance(b_colwise, QuantizedTensor)
+                quantized_b_colwise = b_colwise
+
+            b_fp8_row = quantized_b.qdata
+            b_scale_row = quantized_b.scale_inv
+            b_fp8_col = quantized_b_colwise.qdata
+            b_scale_col = quantized_b_colwise.scale_inv
 
         total_m = int(a.size(0))
         # fwd: read rowwise-padded layout (group_offs_padded_rowwise); the output
@@ -611,7 +707,14 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         )
         out = out[:total_m]
 
-        ctx.save_for_backward(a_fp8_col, a_scale_col, b_fp8_col, b_scale_col, group_lens, group_offs)
+        ctx.save_for_backward(
+            a_fp8_col,
+            a_scale_col,
+            b_fp8_col,
+            b_scale_col,
+            group_lens,
+            group_offs,
+        )
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
@@ -619,7 +722,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, grad_out: torch.Tensor):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         (a_fp8_col, a_scale_col, b_fp8_col, b_scale_col, group_lens, group_offs) = ctx.saved_tensors
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
@@ -679,7 +782,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             default_backend=BackendType.TRITON.value,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
-        return grad_a, grad_b, None, None, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None, None, None, None
 
 
 @torch._dynamo.disable(
@@ -711,7 +814,7 @@ def grouped_gemm_fp8(
         a: Input tensor A with shape [bs * m, k] (float16 or bfloat16).
             Can also be a pre-quantized :class:`QuantizedTensor` (grouped), or
             a :class:`QuantizedTensorPair` carrying both ``data`` (row-wise) and
-            the backward-direction ``data_t`` (col-wise) for ROWWISE granularity.
+            the backward-direction ``data_colwise`` (col-wise) for ROWWISE granularity.
         b: Input tensor B with shape [bs, k, n] or [bs, n, k] if trans_b (float16 or bfloat16).
             Same pre-quantized variants as ``a`` are accepted.
         group_lens: Group lengths tensor [bs] (int64)
@@ -730,30 +833,39 @@ def grouped_gemm_fp8(
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)
     if isinstance(a, QuantizedTensorPair):
-        a_data, a_data_t = a.data, a.data_t
+        a_data, a_data_colwise = a.data_rowwise, a.data_colwise
     else:
-        a_data, a_data_t = a, None
+        a_data, a_data_colwise = a, None
 
     if isinstance(b, QuantizedTensorPair):
-        b_data, b_data_t = b.data, b.data_t
+        b_data, b_data_colwise = b.data_rowwise, b.data_colwise
     else:
-        b_data, b_data_t = b, None
+        b_data, b_data_colwise = b, None
 
     if out_dtype is None:
         out_dtype = torch.promote_types(a_data.dtype, b_data.dtype)
 
     if config.granularity == ScalingGranularity.TENSORWISE:
         # TENSORWISE has a single scalar scale (no col-wise trans cache needed);
-        # the inner ``data_t`` is ignored if provided.
+        # the inner ``data_colwise`` is ignored if provided.
         return FP8GroupedGemmTensorFunc.apply(
-            a_data, b_data, a_data_t, b_data_t, group_lens, group_offs, trans_b, out_dtype, config, num_cu
+            a_data,
+            b_data,
+            a_data_colwise,
+            b_data_colwise,
+            group_lens,
+            group_offs,
+            trans_b,
+            out_dtype,
+            config,
+            num_cu,
         )
     elif config.granularity == ScalingGranularity.ROWWISE:
         return FP8GroupedGemmRowFunc.apply(
             a_data,
             b_data,
-            a_data_t,
-            b_data_t,
+            a_data_colwise,
+            b_data_colwise,
             group_lens,
             group_offs,
             trans_b,
@@ -767,6 +879,17 @@ def grouped_gemm_fp8(
         return FP8GroupedGemmBlockFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
         # MXFP8: raw tensors; quant + grouped GEMM via the Triton MX backend.
-        return FP8GroupedGemmMXFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
+        return FP8GroupedGemmMXFunc.apply(
+            a_data,
+            b_data,
+            a_data_colwise,
+            b_data_colwise,
+            group_lens,
+            group_offs,
+            trans_b,
+            out_dtype,
+            config,
+            num_cu,
+        )
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

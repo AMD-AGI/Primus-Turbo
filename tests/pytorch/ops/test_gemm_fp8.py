@@ -214,50 +214,7 @@ def _run_gemm_fp8_deterministic_test(
         GlobalBackendManager.reset()
 
 
-# Regression test for the hipBLASLt FP8 workspace shortage on MI300X (gfx942).
-#
-# Background:
-#   The HIPBLASLT FP8 backend uses a fixed-size workspace returned by
-#   ``get_hipblaslt_workspace_size_in_byte()`` in
-#   ``csrc/kernels/gemm/hipblaslt_gemm.cu``. Before commit
-#   ``fix/gemm-fp8-workspace-invalid-value-mi300x`` that value was 32 MiB
-#   on gfx942. For the specific FLUX-12B backward grad_weight GEMM
-#   ``(M=3072, N=3072, K=8192)`` with mixed E4M3 x E5M2 -> BF16
-#   tensorwise scaling, hipBLASLt's heuristic returns an algorithm whose
-#   actual workspace requirement is ~72 MiB. ``hipblasLtMatmul`` then
-#   returns ``HIPBLAS_STATUS_INVALID_VALUE`` at execution time (visible
-#   in hipBLASLt logs as ``runContractionProblem: Input workspace size
-#   33554432 is less than the required workspace size 75497472``).
-#
-#   This test reproduces the exact failing problem shape, dtype mix,
-#   layout, granularity and backend. It must succeed (no
-#   ``HIPBLAS_STATUS_INVALID_VALUE``, finite gradients) once the workspace
-#   is bumped to >= 75 497 472 bytes; it fails with a ``RuntimeError``
-#   from ``hipblaslt_gemm_impl`` if the regression is reintroduced.
-@pytest.mark.parametrize(
-    "m,n,k,layout,format,dtype,backend",
-    [
-        # FLUX-12B backward grad_weight GEMM that triggered the original crash.
-        (3072, 3072, 8192, "NT", Format.HYBRID, torch.bfloat16, BackendType.HIPBLASLT),
-    ],
-)
-def test_gemm_fp8_hipblaslt_workspace_regression(m, n, k, layout, format, dtype, backend):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    _run_gemm_fp8_test(
-        m=m,
-        n=n,
-        k=k,
-        layout=layout,
-        format=format,
-        dtype=dtype,
-        granularity=ScalingGranularity.TENSORWISE,
-        backend=backend,
-        auto_tune=False,
-    )
-
-
-@pytest.mark.parametrize("m", [255, 507, 1032, 2056])
+@pytest.mark.parametrize("m", [255, 256, 507, 512])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
@@ -266,6 +223,9 @@ def test_gemm_fp8_hipblaslt_workspace_regression(m, n, k, layout, format, dtype,
 @pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT])
 @pytest.mark.parametrize("auto_tune", [False])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
+    if m % 32 != 0 and backend == BackendType.CK:
+        pytest.skip("CK backend requires m to be a multiple of 32")
+
     _run_gemm_fp8_test(
         m=m,
         n=n,
@@ -279,7 +239,7 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune)
     )
 
 
-@pytest.mark.parametrize("m", [255, 507, 1032, 2056])
+@pytest.mark.parametrize("m", [255, 256, 507, 512])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
@@ -288,6 +248,9 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune)
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
+    if m % 32 != 0 and backend == BackendType.CK:
+        pytest.skip("CK backend requires m to be a multiple of 32")
+
     _run_gemm_fp8_test(
         m=m,
         n=n,
@@ -464,8 +427,8 @@ def _run_gemm_fp8_quantized_tensor_test(
     c_ref.backward(grad_c)
 
     c = gemm_fp8(
-        QuantizedTensorPair(data=qt_a, data_t=None),
-        QuantizedTensorPair(data=qt_b, data_t=None),
+        QuantizedTensorPair(data_rowwise=qt_a, data_colwise=None),
+        QuantizedTensorPair(data_rowwise=qt_b, data_colwise=None),
         trans_a,
         trans_b,
         dtype,

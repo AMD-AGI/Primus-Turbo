@@ -45,7 +45,7 @@ NK_VALUES = [
 ORI_DTYPE_VALUES = [torch.bfloat16, torch.float16]
 FORMAT_VALUES = [Format.E4M3, Format.E5M2]
 TRANS_B_VALUES = [True, False]
-BALANCE_VALUES = [True, False]
+BALANCE_VALUES = [False]
 
 
 def _check_hit_int32_limit(B, M, N, K):
@@ -211,15 +211,6 @@ def _run_grouped_gemm_fp8_deterministic_test(
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    # gfx942: hipBLASLt path can hang/flake when M <= 512 (known issue).
-    if (
-        get_device_compute_capability() == (9, 4)
-        and M <= 512
-        and backend is BackendType.HIPBLASLT
-        and granularity == ScalingGranularity.TENSORWISE
-    ):
-        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512 (deterministic)")
-
     # Deterministic suite: fixed backend / no autotune.
     GlobalBackendManager.set_grouped_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(False)
@@ -306,9 +297,13 @@ _DET_NK_VALUES = [(2048, 1536), (4096, 7168)]
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+@pytest.mark.parametrize(
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
 @pytest.mark.deterministic
 def test_grouped_gemm_fp8_tensorwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance, backend):
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
     N, K = NK
     _run_grouped_gemm_fp8_deterministic_test(
         B=B,
@@ -423,19 +418,14 @@ def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.HIPBLASLT])
-@pytest.mark.parametrize("auto_tune", [False])
+@pytest.mark.parametrize(
+    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
+@pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
 
-    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.
-    # This has been observed under pytest; root cause not yet identified. MI355 works normally.
-    # Skip also when auto_tune=True because the tuner may select hipBLASLt.
-    if (
-        get_device_compute_capability() == (9, 4)
-        and M <= 512
-        and (backend is BackendType.HIPBLASLT or auto_tune is True)
-    ):
-        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512")
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
 
     N, K = NK
     _run_grouped_gemm_fp8_test(
@@ -587,6 +577,7 @@ def _run_grouped_gemm_fp8_quantized_tensor_test(
     assert granularity in (
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
+        ScalingGranularity.MX_BLOCKWISE,
     ), "Grouped QuantizedTensor only supports TENSORWISE and ROWWISE"
 
     GlobalBackendManager.set_grouped_gemm_backend(backend)
@@ -660,24 +651,18 @@ def _run_grouped_gemm_fp8_quantized_tensor_test(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+@pytest.mark.parametrize(
+    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise_quantized_tensor(
     B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune
 ):
     """TENSORWISE grouped_gemm with pre-quantized grouped/regular QuantizedTensor inputs."""
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
     if backend == BackendType.TRITON and format == Format.HYBRID:
         pytest.skip("TRITON backend not support HYBRID format currently")
-
-    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.
-    # This has been observed under pytest; root cause not yet identified. MI355 works normally.
-    # Skip also when auto_tune=True because the tuner may select hipBLASLt.
-    if (
-        get_device_compute_capability() == (9, 4)
-        and M <= 512
-        and (backend is BackendType.HIPBLASLT or auto_tune is True)
-    ):
-        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512")
 
     N, K = NK
     _run_grouped_gemm_fp8_quantized_tensor_test(

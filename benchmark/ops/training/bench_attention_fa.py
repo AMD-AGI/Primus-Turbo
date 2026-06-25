@@ -7,7 +7,7 @@
 """
 Benchmark external flash-attn (Dao-AILab/flash-attention) performance.
 
-This script intentionally aligns with benchmark/ops/bench_attention_turbo.py:
+This script intentionally aligns with benchmark/ops/training/bench_attention_turbo.py:
 - Same test case generator (config.gen_attention_test_cases)
 - Same FLOPs model and TFLOPS reporting
 - Same correctness check vs PyTorch SDPA reference (SNR)

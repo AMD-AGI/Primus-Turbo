@@ -27,7 +27,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     ceildiv,
     compute_global_swizzle,
     compute_global_swizzle_nn,
-    make_fp8_buffer_tensor,
+    make_fp8_buffer_tensor_rebased,
     make_value_attrs,
     mask_a_tail,
     wait_barrier,
@@ -38,6 +38,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith
 from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr.typing import T
 
 # isort: on
 
@@ -143,13 +144,23 @@ def _compile_dense_nt(
         block_m = first_pid_m + (pid_in_group % group_size_m)
         block_n = pid_in_group // group_size_m
 
-        A0_gl_offset = (block_m * BLOCK_M) * K
-        A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
-        B0_gl_offset = (block_n * BLOCK_N) * K
-        B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
+        # i64 input re-base: fold the per-tile row base (m_row*K, n_row*K) into the
+        # SRD base; A/B_T K-contiguous (foldable), k*BLOCK_K small int32 -> no cap.
+        a_base = arith.index_cast(T.index, block_m * BLOCK_M) * arith.index(K)
+        b_base = arith.index_cast(T.index, block_n * BLOCK_N) * arith.index(K)
+        a_nrec = (
+            arith.index_cast(T.index, c_m) - arith.index_cast(T.index, block_m * BLOCK_M)
+        ) * arith.index(K)
+        b_nrec = (
+            arith.index_cast(T.index, c_n) - arith.index_cast(T.index, block_n * BLOCK_N)
+        ) * arith.index(K)
+        A0_gl_offset = 0
+        A1_gl_offset = LDS_BLOCK_M * K
+        B0_gl_offset = 0
+        B1_gl_offset = LDS_BLOCK_N * K
 
-        gA = make_fp8_buffer_tensor(A, F8_IR_t)
-        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+        gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
+        gB = make_fp8_buffer_tensor_rebased(B_T, F8_IR_t, b_base, b_nrec)
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -372,6 +383,7 @@ def _compile_dense_nn(
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # StoreCPerTensor out dtype: True -> fp16, else bf16
+    i64_traverse: bool = False,  # B[K,N] traversal via per-load i64 SRD re-base (lifts k*n < 2^32 cap)
 ):
     """NN-layout fp8 dense kernel. A [M, K], B [K, N], C [M, N].
 
@@ -458,18 +470,21 @@ def _compile_dense_nn(
         block_m = first_pid_m + (pid_in_group % group_size_m)
         block_n = pid_in_group // group_size_m
 
-        # A: same as NT.
-        A0_gl_offset = (block_m * BLOCK_M) * K
-        A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
+        # i64 input re-base. A[M,K]: fold row base (m_row*K) into SRD. B[K,N]: the
+        # k*BLOCK_K*c_n contraction is i64 per load (cn_i), capped at 4GB by num_records.
+        m_row = block_m * BLOCK_M
+        cn_i = arith.index_cast(T.index, c_n)
+        a_base = arith.index_cast(T.index, m_row) * arith.index(K)
+        a_nrec = (arith.index_cast(T.index, c_m) - arith.index_cast(T.index, m_row)) * arith.index(K)
+        b_base = arith.index_cast(T.index, block_n * BLOCK_N)
+        b_nrec = arith.index(K) * cn_i - b_base
+        A0_gl_offset = 0
+        A1_gl_offset = LDS_BLOCK_M * K
+        B0_gl_offset = 0
+        B1_gl_offset = LDS_BLOCK_N
 
-        # B: NN-specific. B is [K, N] row-major; per WG we load BLOCK_K K-rows
-        # × BLOCK_N N-cols, split into 2 N-halves of LDS_BLOCK_N each. K-iter
-        # step advances K-rows by BLOCK_K, which in element units is BLOCK_K * c_n.
-        B0_gl_offset = block_n * BLOCK_N + 0
-        B1_gl_offset = block_n * BLOCK_N + LDS_BLOCK_N
-
-        gA = make_fp8_buffer_tensor(A, F8_IR_t)
-        gB = make_fp8_buffer_tensor(B, F8_IR_t)
+        gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
+        gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, b_nrec)
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -486,7 +501,10 @@ def _compile_dense_nn(
             mfma.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, _ea, _eb))
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        # B[K,N] is the contraction-traversal operand: in i64 mode re-base its SRD
+        # per load (k_offset folds into the i64 base) instead of a 32-bit soffset.
+        b_rebase = (B, F8_IR_t, b_base, b_nrec) if i64_traverse else None
+        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, rebase=b_rebase)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoaderTr(wave_n, N_TILES_B, 32, inline_asm=b_inline_asm_load, vmcnt_hint=vmcnt_hint)
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
@@ -498,9 +516,9 @@ def _compile_dense_nn(
         c11_frag = [mfma.zero_value] * N_ACCUMS
 
         # Prelude.
-        b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K * c_n)
+        b_g2s.load(b_cur0, B0_gl_offset + arith.index(0 * BLOCK_K) * cn_i)
         a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
-        b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K * c_n)
+        b_g2s.load(b_cur1, B1_gl_offset + arith.index(0 * BLOCK_K) * cn_i)
         a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
 
         if wave_m == 1:
@@ -508,9 +526,9 @@ def _compile_dense_nn(
 
         wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
-        b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K * c_n)
+        b_g2s.load(b_next0, B0_gl_offset + arith.index(1 * BLOCK_K) * cn_i)
         a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-        b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K * c_n)
+        b_g2s.load(b_next1, B1_gl_offset + arith.index(1 * BLOCK_K) * cn_i)
 
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
@@ -528,7 +546,7 @@ def _compile_dense_nn(
             rocdl.s_barrier()
 
             b1_frag = b_s2r.load(b_cur1)
-            b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K * c_n)
+            b_g2s.load(b_cur0, B0_gl_offset + arith.index((k + 2) * BLOCK_K) * cn_i)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -545,7 +563,7 @@ def _compile_dense_nn(
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
-            b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K * c_n)
+            b_g2s.load(b_cur1, B1_gl_offset + arith.index((k + 2) * BLOCK_K) * cn_i)
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             rocdl.s_setprio(1)
@@ -676,6 +694,7 @@ def _compile_dense_tn(
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # StoreCPerTensor out dtype: True -> fp16, else bf16
+    i64_traverse: bool = False,  # A[K,M] & B[K,N] traversal via per-load i64 SRD re-base (lifts cap)
 ):
     """TN-layout fp8 dense kernel: A [K, M], B [K, N], C [M, N] = A^T @ B.
     Both A and B are K-row strided, so both go through the wave-coop
@@ -791,16 +810,21 @@ def _compile_dense_tn(
         # for one Python-selected path (1D GROUP_M or 2D band).
         block_m, block_n = _tn_block_mn(pid, num_pid_m, n_blocks, GROUP_M, group_n)
 
-        # TN A stored [K, M] row-major: stride M per K-row.
-        A0_gl_offset = block_m * BLOCK_M + 0
-        A1_gl_offset = block_m * BLOCK_M + LDS_BLOCK_M
+        # i64 input re-base. A[K,M]/B[K,N] K-row-major: fold column base into SRD; the
+        # k*BLOCK_K*c_{m,n} traversal is i64 per load (int32 wraps > 2^31), capped at 4GB.
+        cm_i = arith.index_cast(T.index, c_m)
+        cn_i = arith.index_cast(T.index, c_n)
+        a_base = arith.index_cast(T.index, block_m) * arith.index(BLOCK_M)
+        b_base = arith.index_cast(T.index, block_n) * arith.index(BLOCK_N)
+        a_nrec = arith.index(K) * cm_i - a_base
+        b_nrec = arith.index(K) * cn_i - b_base
+        A0_gl_offset = 0
+        A1_gl_offset = LDS_BLOCK_M
+        B0_gl_offset = 0
+        B1_gl_offset = LDS_BLOCK_N
 
-        # B same as NN: stored [K, N] row-major.
-        B0_gl_offset = block_n * BLOCK_N + 0
-        B1_gl_offset = block_n * BLOCK_N + LDS_BLOCK_N
-
-        gA = make_fp8_buffer_tensor(A, F8_IR_t)
-        gB = make_fp8_buffer_tensor(B, F8_IR_t)
+        gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
+        gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, b_nrec)
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -813,8 +837,16 @@ def _compile_dense_tn(
             _mm = _asm_mma_mode
             mfma._do_mma = lambda _a, _b, _c, _m=_mm: asm_mma_do(_a, _b, _c, mode=_m, cbsz=cbsz, blgp=blgp)
 
-        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
-        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
+        # TN: both A[K,M] and B[K,N] are contraction-traversal operands -> re-base
+        # both SRDs per load in i64 mode (each k_offset folds into its i64 base).
+        a_rebase = (A, F8_IR_t, a_base, a_nrec) if i64_traverse else None
+        b_rebase = (B, F8_IR_t, b_base, b_nrec) if i64_traverse else None
+        a_g2s = G2SLoader(
+            a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=a_rebase
+        )
+        b_g2s = G2SLoader(
+            b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=b_rebase
+        )
         a_s2r = S2RLoaderTr(
             wave_m,
             N_TILES_A,
@@ -835,19 +867,19 @@ def _compile_dense_tn(
         c11_frag = [mfma.zero_value] * N_ACCUMS
 
         # Prelude.
-        b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K * c_n)
-        a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K * c_m)
-        b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K * c_n)
-        a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K * c_m)
+        b_g2s.load(b_cur0, B0_gl_offset + arith.index(0 * BLOCK_K) * cn_i)
+        a_g2s.load(a_cur0, A0_gl_offset + arith.index(0 * BLOCK_K) * cm_i)
+        b_g2s.load(b_cur1, B1_gl_offset + arith.index(0 * BLOCK_K) * cn_i)
+        a_g2s.load(a_cur1, A1_gl_offset + arith.index(0 * BLOCK_K) * cm_i)
 
         if wave_m == 1:
             rocdl.s_barrier()
 
         wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
-        b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K * c_n)
-        a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K * c_m)
-        b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K * c_n)
+        b_g2s.load(b_next0, B0_gl_offset + arith.index(1 * BLOCK_K) * cn_i)
+        a_g2s.load(a_next0, A0_gl_offset + arith.index(1 * BLOCK_K) * cm_i)
+        b_g2s.load(b_next1, B1_gl_offset + arith.index(1 * BLOCK_K) * cn_i)
 
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
@@ -862,27 +894,27 @@ def _compile_dense_tn(
             # drain — c01 consumes b1 with no covering drain between.)
             b0_frag = b_s2r.load(b_cur0, drain=False)
             a0_frag = a_s2r.load(a_cur0)
-            a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
+            a_g2s.load(a_next1, A1_gl_offset + arith.index((k + 1) * BLOCK_K) * cm_i)
             rocdl.s_barrier()
             rocdl.s_setprio(1)
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
             rocdl.s_setprio(0)
             rocdl.s_barrier()
             b1_frag = b_s2r.load(b_cur1)
-            b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K * c_n)
+            b_g2s.load(b_cur0, B0_gl_offset + arith.index((k + 2) * BLOCK_K) * cn_i)
             rocdl.s_barrier()
             rocdl.s_setprio(1)
             c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
             rocdl.s_setprio(0)
             rocdl.s_barrier()
             a1_frag = a_s2r.load(a_cur1)
-            a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K * c_m)
+            a_g2s.load(a_cur0, A0_gl_offset + arith.index((k + 2) * BLOCK_K) * cm_i)
             rocdl.s_barrier()
             rocdl.s_setprio(1)
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
             rocdl.s_setprio(0)
             rocdl.s_barrier()
-            b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K * c_n)
+            b_g2s.load(b_cur1, B1_gl_offset + arith.index((k + 2) * BLOCK_K) * cn_i)
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
             rocdl.s_setprio(1)
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
@@ -915,7 +947,7 @@ def _compile_dense_tn(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
         b0_frag = b_s2r.load(b_next0)
-        a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K * c_m)
+        a_g2s.load(a_next1, A1_gl_offset + arith.index((k + 1) * BLOCK_K) * cm_i)
         rocdl.s_barrier()
         rocdl.s_setprio(1)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
@@ -1008,14 +1040,27 @@ def _get_compiled_dense(launch, args):
     return cached
 
 
+def _run_dense(entry, args):
+    """Mode-split steady-state launch. entry = [raw @flyc.jit launch, cfg, compiled].
+    Eager: run the one-time flyc.compile'd object (skips @flyc.jit's per-call drift-
+    check + arg-hash, and the per-call arg-key rebuild). Capture: run the raw closure
+    (a flyc.compile'd object regresses under CUDA-graph capture)."""
+    if torch.cuda.is_current_stream_capturing():
+        entry[0](*args)
+    else:
+        if entry[2] is None:
+            entry[2] = flyc.compile(entry[0], *args)
+        entry[2](*args)
+
+
 def _as_i8_flat(t: torch.Tensor) -> torch.Tensor:
-    # Zero-copy flat byte view. Recomputed every call (no id()-keyed cache: a
+    # Zero-copy i8 view. Recomputed every call (no id()-keyed cache: a
     # freed tensor's id + data_ptr can both be reused, and a recycled pair with a
     # different numel would alias the wrong length). The view ops are ~1us and
     # allocate nothing.
     if t.element_size() == 1 and t.dtype != torch.int8:  # fp8
-        return t.contiguous().view(torch.int8).view(-1)
-    return t.contiguous().view(-1)
+        return t.contiguous().view(torch.int8)
+    return t.contiguous()
 
 
 def _scalar_scale(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -1037,16 +1082,17 @@ _NN_CANDIDATES = [
 _NN_AUTOTUNE_CACHE: dict = {}
 
 
-def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
+def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_traverse=False):
     """First-call bench NN candidates, cache best (launch, cfg) by (M,N,K).
 
     Runtime micro-benches each (BM, GROUP_M, num_xcd, AG) candidate,
     finite-checks the output, times 2-warmup + 20-iter, and caches the
-    fastest by shape.
+    fastest by shape. ``i64_traverse`` re-bases B's SRD per load (lifts the
+    k*n < 2^32 cap; threaded to _compile_dense_nn).
     """
     import torch as _torch
 
-    key = (M, N, K, cbsz, blgp, out_fp16)
+    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
     if key in _NN_AUTOTUNE_CACHE:
         return _NN_AUTOTUNE_CACHE[key]
     out_view = args[2]
@@ -1071,6 +1117,7 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
                 cbsz=cbsz,
                 blgp=blgp,
                 out_fp16=out_fp16,
+                i64_traverse=i64_traverse,
             )
             c = _get_compiled_dense(launch, args)
             c(*args)
@@ -1092,7 +1139,7 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
             us = e0.elapsed_time(e1) * 1000.0 / 20
             if us < best_us:
                 best_us = us
-                best = (launch, (bm, gm, xcd, ag))
+                best = [launch, (bm, gm, xcd, ag), c]  # c: compiled winner (reused eager)
         except Exception:
             continue
     if best is None:
@@ -1164,7 +1211,7 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
             us = e0.elapsed_time(e1) * 1000.0 / 20
             if us < best_us:
                 best_us = us
-                best = (launch, (bm, gm, xcd, ag))
+                best = [launch, (bm, gm, xcd, ag), c]  # c: compiled winner (reused eager)
         except Exception:
             continue
     if best is None:
@@ -1182,16 +1229,17 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
 _TN_AUTOTUNE_CACHE: dict = {}
 
 
-def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
+def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_traverse=False):
     """First-call bench TN candidates, cache best (launch, cfg) by (M,N,K).
 
     1D GROUP_M=4 with num_xcd 8 vs 1 (XCD-aware PID remap); large
     (HBM-streaming) shapes expose the per-XCD L2 reuse on the hot bench,
-    L2-resident shapes pick num_xcd=1.
+    L2-resident shapes pick num_xcd=1. ``i64_traverse`` re-bases A's and B's
+    SRDs per load (lifts the k*m / k*n < 2^32 cap; threaded to _compile_dense_tn).
     """
     import torch as _torch
 
-    key = (M, N, K, cbsz, blgp, out_fp16)
+    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
     if key in _TN_AUTOTUNE_CACHE:
         return _TN_AUTOTUNE_CACHE[key]
     # Occupancy routing: BLOCK_M=BLOCK_N=256 yields ceil(M/256)*ceil(N/256)
@@ -1216,6 +1264,7 @@ def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
                 cbsz=cbsz,
                 blgp=blgp,
                 out_fp16=out_fp16,
+                i64_traverse=i64_traverse,
             )
             c = _get_compiled_dense(launch, args)
             c(*args)
@@ -1237,7 +1286,7 @@ def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
             us = e0.elapsed_time(e1) * 1000.0 / 20
             if us < best_us:
                 best_us = us
-                best = (launch, (bm, 4, 0, xcd))
+                best = [launch, (bm, 4, 0, xcd), c]  # c: compiled winner (reused eager)
         except Exception:
             continue
     if best is None:
@@ -1263,6 +1312,10 @@ def gemm_fp8_tensorwise_flydsl_kernel(
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise NotImplementedError(f"FlyDSL wrapper emits bf16 or fp16. Got {out_dtype}.")
     assert a.dim() == 2 and b.dim() == 2
+    # Element-count threshold past which a contraction-traversal operand's 32-bit
+    # soffset wraps (fp8 = 1 byte/elem). At/above it the kernel re-bases the SRD per
+    # load in i64; below it the cheaper fixed-base + 32-bit soffset path is used.
+    cap = 2**32
     # Per-operand fp8 format -> MFMA cbsz(srcA)/blgp(srcB): 0=E4M3, 1=E5M2.
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
@@ -1282,15 +1335,17 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         args = (
             _as_i8_flat(a),
             _as_i8_flat(b),
-            out.contiguous().view(-1),
+            out.contiguous(),
             a_scale_v,
             b_scale_v,
             M,
             N,
             torch.cuda.current_stream(),
         )
-        launch, _cfg = _autotune_tn_dispatch(args, M, N, K, cbsz, blgp, out_fp16)
-        _get_compiled_dense(launch, args)(*args)
+        # TN both operands traverse K: span k*m / k*n past 2^32 fp8 needs the
+        # per-load i64 SRD re-base (else the 32-bit soffset wraps).
+        i64_tr = (K * M >= cap) or (K * N >= cap)
+        _run_dense(_autotune_tn_dispatch(args, M, N, K, cbsz, blgp, out_fp16, i64_tr), args)
         if trans_c:
             return out.t().contiguous()
         return out
@@ -1310,15 +1365,16 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         args = (
             _as_i8_flat(a),
             _as_i8_flat(b),
-            out.contiguous().view(-1),
+            out.contiguous(),
             a_scale_v,
             b_scale_v,
             M,
             N,
             torch.cuda.current_stream(),
         )
-        launch, _cfg = _autotune_nn_dispatch(args, M, N, K, cbsz, blgp, out_fp16)
-        _get_compiled_dense(launch, args)(*args)
+        # NN: only B[K,N] traverses K; k*n past 2^32 fp8 needs the i64 re-base.
+        i64_tr = K * N >= cap
+        _run_dense(_autotune_nn_dispatch(args, M, N, K, cbsz, blgp, out_fp16, i64_tr), args)
     elif (not trans_a) and trans_b:
         # NT native: A [M, K], B [N, K] (B^T storage of [K, N]).
         M, K_a = a.shape
@@ -1333,15 +1389,14 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         args = (
             _as_i8_flat(a),
             _as_i8_flat(b),
-            out.contiguous().view(-1),
+            out.contiguous(),
             a_scale_v,
             b_scale_v,
             M,
             N,
             torch.cuda.current_stream(),
         )
-        launch, _cfg = _autotune_nt_dispatch(args, M, N, K, cbsz, blgp, out_fp16)
-        _get_compiled_dense(launch, args)(*args)
+        _run_dense(_autotune_nt_dispatch(args, M, N, K, cbsz, blgp, out_fp16), args)
     else:
         raise NotImplementedError(
             f"FlyDSL fp8 GEMM does not support the TT layout " f"(trans_a={trans_a}, trans_b={trans_b})."

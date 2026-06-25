@@ -15,6 +15,8 @@ from primus_turbo.pytorch.core.low_precision import (
     MXFP4_PADDING_ALIGN_SIZE,
     MXFP8_BLOCK_SIZE,
     MXFP8_PADDING_ALIGN_SIZE,
+    Float4QuantConfig,
+    Float8QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp4_support,
@@ -30,7 +32,11 @@ _SUPPORTED_QUANTIZED_GRANS = [
     ScalingGranularity.TENSORWISE,
     ScalingGranularity.MX_BLOCKWISE,
 ]
-_SUPPORTED_GROUPED_QUANTIZED_GRANS = [ScalingGranularity.ROWWISE, ScalingGranularity.TENSORWISE]
+_SUPPORTED_GROUPED_QUANTIZED_GRANS = [
+    ScalingGranularity.ROWWISE,
+    ScalingGranularity.TENSORWISE,
+    ScalingGranularity.MX_BLOCKWISE,
+]
 
 
 def _pad_inner_dim(shape, align):
@@ -149,6 +155,8 @@ class QuantizedTensor(torch.Tensor):
         orig_dtype: torch.dtype,
         dest_dtype: torch.dtype,
         granularity: ScalingGranularity,
+        orig_group_lens: Optional[torch.Tensor] = None,
+        orig_group_offs: Optional[torch.Tensor] = None,
         group_lens: Optional[torch.Tensor] = None,
         group_offs: Optional[torch.Tensor] = None,
         is_grouped_tensor: bool = False,
@@ -160,20 +168,6 @@ class QuantizedTensor(torch.Tensor):
         assert dest_dtype in _SUPPORTED_QUANTIZED_DTYPES, "Unsupported quantized dtype"
         assert data.is_contiguous(), "data must be contiguous"
         assert scale_inv.is_contiguous(), "scale_inv must be contiguous"
-
-        if is_grouped_tensor:
-            assert group_lens is not None, "group_lens must be provided for grouped tensors"
-            assert group_lens.is_cuda, "group_lens must be on CUDA"
-
-            # Materialise ``group_offs`` from ``group_lens`` only if it was not
-            # supplied (e.g. by ``__tensor_unflatten__`` / ``_make_like`` which
-            # already carry a valid cached offsets tensor).
-            if group_offs is None:
-                from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
-                    group_offs_from_lens,
-                )
-
-                group_offs = group_offs_from_lens(group_lens)
 
         self = torch.Tensor._make_wrapper_subclass(
             cls,
@@ -192,6 +186,8 @@ class QuantizedTensor(torch.Tensor):
 
         self._group_lens = group_lens
         self._group_offs = group_offs
+        self._orig_group_lens = orig_group_lens
+        self._orig_group_offs = orig_group_offs
         self._is_grouped_tensor = is_grouped_tensor
         self._quantized_axis = quantized_axis
 
@@ -235,6 +231,18 @@ class QuantizedTensor(torch.Tensor):
             assert (
                 dest_dtype in _SUPPORTED_QUANTIZED_DTYPES and dest_dtype != float4_e2m1fn_x2
             ), "Unsupported quantized dtype (FP4 not supported for grouped activations)"
+            if granularity == ScalingGranularity.MX_BLOCKWISE:
+                assert dest_dtype in [
+                    float8_e4m3,
+                    float8_e5m2,
+                ], "Unsupported quantized dtype for grouped MX_BLOCKWISE"
+
+                supported, reason = check_mxfp8_support()
+                assert (
+                    block_size == MXFP8_BLOCK_SIZE
+                ), "block_size must be MXFP8_BLOCK_SIZE for grouped MX_BLOCKWISE"
+                assert supported, reason
+                assert scaling_recipe is not None, "scaling_recipe must be provided for grouped MX_BLOCKWISE"
         else:
             assert granularity in _SUPPORTED_QUANTIZED_GRANS, f"Unsupported granularity {granularity}"
 
@@ -263,14 +271,37 @@ class QuantizedTensor(torch.Tensor):
         if granularity != ScalingGranularity.TENSORWISE:
             assert axis is not None, "axis must be provided for non-TENSORWISE granularity"
 
-        data, scale_inv = cls._quantize(
-            hp_tensor,
-            dest_dtype,
-            granularity,
-            block_size=block_size,
-            axis=axis,
-            scaling_recipe=scaling_recipe,
-        )
+        padded_group_lens = padded_group_offs = None
+        orig_group_lens = orig_group_offs = None
+        if is_grouped_tensor:
+            assert group_lens is not None, "group_lens must be provided for grouped tensors"
+            assert group_lens.is_cuda, "group_lens must be on CUDA"
+
+            from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+                group_offs_from_lens,
+            )
+
+            orig_group_lens = group_lens
+            orig_group_offs = group_offs_from_lens(group_lens)
+            data, scale_inv, padded_group_lens, padded_group_offs = cls._grouped_quantize(
+                hp_tensor,
+                dest_dtype,
+                granularity,
+                group_lens=orig_group_lens,
+                group_offs=orig_group_offs,
+                block_size=block_size,
+                axis=axis,
+                scaling_recipe=scaling_recipe,
+            )
+        else:
+            data, scale_inv = cls._quantize(
+                hp_tensor,
+                dest_dtype,
+                granularity,
+                block_size=block_size,
+                axis=axis,
+                scaling_recipe=scaling_recipe,
+            )
 
         return cls(
             data,
@@ -285,8 +316,10 @@ class QuantizedTensor(torch.Tensor):
             scaling_recipe=scaling_recipe,
             requires_grad=hp_tensor.requires_grad,
             quantized_axis=axis,
-            # grouped tensor related
-            group_lens=group_lens,
+            orig_group_lens=orig_group_lens,
+            orig_group_offs=orig_group_offs,
+            group_lens=padded_group_lens,
+            group_offs=padded_group_offs,
             is_grouped_tensor=is_grouped_tensor,
         )
 
@@ -333,6 +366,38 @@ class QuantizedTensor(torch.Tensor):
             )
             return data_, scale_inv
 
+    @classmethod
+    @torch.no_grad()
+    def _grouped_quantize(
+        cls,
+        data: torch.Tensor,
+        dest_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        block_size: Optional[int] = None,
+        axis: Optional[int] = None,
+        scaling_recipe: Optional[ScalingRecipe] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp8
+
+        axis = _normalize_axis(axis, data.ndim)
+
+        if dest_dtype in [float8_e4m3, float8_e5m2]:
+            data_, scale_inv, group_lens_padded, group_offs_padded = grouped_quantize_fp8(
+                data,
+                dest_dtype,
+                granularity,
+                group_lens=group_lens,
+                group_offs=group_offs,
+                block_size=block_size,
+                axis=axis,
+                scaling_recipe=scaling_recipe,
+            )
+            return data_, scale_inv, group_lens_padded, group_offs_padded
+
+        raise ValueError(f"Unsupported dtype {dest_dtype} for grouped quantization")
+
     # ------------------------------------------------------------------
     # Public properties
     # ------------------------------------------------------------------
@@ -351,12 +416,14 @@ class QuantizedTensor(torch.Tensor):
 
     @property
     def group_lens(self) -> torch.Tensor:
+        """Padded per-group row counts used by the quantized layout."""
         assert self._is_grouped_tensor, "This is not a grouped tensor."
 
         return self._group_lens
 
     @property
     def group_offs(self) -> torch.Tensor:
+        """Padded prefix-sum offsets into the quantized M axis."""
         assert self._is_grouped_tensor, "This is not a grouped tensor."
 
         return self._group_offs
@@ -388,12 +455,37 @@ class QuantizedTensor(torch.Tensor):
     @torch.no_grad()
     def dequantize(self) -> torch.Tensor:
         """Dequantize back to the original high-precision dtype."""
-        from primus_turbo.pytorch.ops.quantization import dequantize_fp4, dequantize_fp8
+        from primus_turbo.pytorch.ops.quantization import (
+            dequantize_fp4,
+            dequantize_fp8,
+            grouped_dequantize_fp8,
+        )
 
         axis = _normalize_axis(self._quantized_axis, self._data.ndim)
 
-        # TODO(ruibi): add support for grouped dequantization
-        if self._dest_dtype in [float8_e4m3, float8_e5m2]:
+        if self._is_grouped_tensor:
+            if self._dest_dtype in [float8_e4m3, float8_e5m2]:
+                assert (
+                    self._granularity == ScalingGranularity.MX_BLOCKWISE
+                ), "Grouped dequantization is only supported for MX_BLOCKWISE FP8"
+                assert self._group_lens is not None, "group_lens is missing"
+                assert self._group_offs is not None, "group_offs is missing"
+                assert self._orig_group_offs is not None, "orig_group_offs is missing"
+                out = grouped_dequantize_fp8(
+                    self._data,
+                    self._orig_dtype,
+                    self._granularity,
+                    self._orig_group_offs,
+                    self._group_offs,
+                    block_size=self._block_size,
+                    axis=axis,
+                    scale_inv=self._scale_inv,
+                    scaling_recipe=self._scaling_recipe,
+                    total_M=self.shape[0],  # original shape
+                )
+            else:
+                raise ValueError(f"Grouped dequantization is not supported for dtype {self._dest_dtype}")
+        elif self._dest_dtype in [float8_e4m3, float8_e5m2]:
             out = dequantize_fp8(
                 self._data,
                 self._orig_dtype,
@@ -431,6 +523,10 @@ class QuantizedTensor(torch.Tensor):
     # ------------------------------------------------------------------
     def __tensor_flatten__(self):
         tensors = {"_data": self._data, "_scale_inv": self._scale_inv}
+        if self._orig_group_lens is not None:
+            tensors["_orig_group_lens"] = self._orig_group_lens
+        if self._orig_group_offs is not None:
+            tensors["_orig_group_offs"] = self._orig_group_offs
         if self._group_lens is not None:
             tensors["_group_lens"] = self._group_lens
         if self._group_offs is not None:
@@ -460,6 +556,8 @@ class QuantizedTensor(torch.Tensor):
             granularity=metadata["_granularity"],
             block_size=metadata["_block_size"],
             scaling_recipe=metadata["_scaling_recipe"],
+            orig_group_lens=inner_tensors.get("_orig_group_lens"),
+            orig_group_offs=inner_tensors.get("_orig_group_offs"),
             group_lens=inner_tensors.get("_group_lens"),
             group_offs=inner_tensors.get("_group_offs"),
             is_grouped_tensor=metadata["_is_grouped_tensor"],
@@ -482,9 +580,9 @@ class QuantizedTensor(torch.Tensor):
         but using the supplied *data*, *scale_inv* and *shape*.  Used by
         view / reshape dispatch to avoid a dequantize round-trip.
 
-        Grouped metadata (``group_lens`` / ``group_offs`` / ``is_grouped_tensor``)
-        is propagated unchanged so packed-M views/reshapes retain their
-        grouped identity.
+        Grouped metadata (``orig_group_lens`` / ``orig_group_offs`` /
+        ``group_lens`` / ``group_offs`` / ``is_grouped_tensor``) is propagated
+        unchanged so packed-M views/reshapes retain their grouped identity.
         """
         return cls(
             data,
@@ -495,6 +593,8 @@ class QuantizedTensor(torch.Tensor):
             granularity=tensor._granularity,
             block_size=tensor._block_size,
             scaling_recipe=tensor._scaling_recipe,
+            orig_group_lens=tensor._orig_group_lens,
+            orig_group_offs=tensor._orig_group_offs,
             group_lens=tensor._group_lens,
             group_offs=tensor._group_offs,
             is_grouped_tensor=tensor._is_grouped_tensor,
@@ -543,6 +643,43 @@ class QuantizedTensor(torch.Tensor):
         """Reshape without dequantizing (autograd-aware)."""
         return _ReshapeFunc.apply(self, shape)
 
+    @classmethod
+    def _transpose(cls, tensor: "QuantizedTensor", dim0: int, dim1: int) -> "QuantizedTensor":
+        """Return the transpose of *tensor* as a ``QuantizedTensor``.
+
+        * TENSORWISE: the scale is a single scalar, so the transpose is exact -
+          we just transpose the quantized buffer (no dequantize round-trip).
+        * ROWWISE / MX_BLOCKWISE: per-row / per-block scales do not transpose
+          trivially (a scaled row becomes a column), so we dequantize and then
+          re-quantize the transposed tensor into the (colwise) layout.
+        """
+        ndim = tensor.dim()
+        d0 = dim0 if dim0 >= 0 else dim0 + ndim
+        d1 = dim1 if dim1 >= 0 else dim1 + ndim
+        if d0 == d1:
+            return cls._make_like(tensor, data=tensor._data, scale_inv=tensor._scale_inv, shape=tensor.shape)
+
+        assert not tensor._is_grouped_tensor, "transpose is not supported for grouped QuantizedTensor"
+
+        new_shape = list(tensor.shape)
+        new_shape[d0], new_shape[d1] = new_shape[d1], new_shape[d0]
+        new_shape = torch.Size(new_shape)
+
+        if tensor._granularity == ScalingGranularity.TENSORWISE:
+            new_data = tensor._data.transpose(d0, d1).contiguous()
+            return cls._make_like(tensor, data=new_data, scale_inv=tensor._scale_inv, shape=new_shape)
+
+        # Rowwise / MX blockwise: dequantize -> transpose -> re-quantize colwise.
+        hp_t = tensor.dequantize()
+        return cls.quantize(
+            hp_t,
+            tensor._dest_dtype,
+            tensor._granularity,
+            axis=-2,
+            block_size=tensor._block_size,
+            scaling_recipe=tensor._scaling_recipe,
+        )
+
     # ------------------------------------------------------------------
     # Dispatch hooks
     # ------------------------------------------------------------------
@@ -588,6 +725,16 @@ class QuantizedTensor(torch.Tensor):
                     scale_inv=tensor._scale_inv.detach(),
                     shape=tensor.shape,
                 )
+
+        if func in (torch.ops.aten.t.default, torch.ops.aten.transpose.int):
+            tensor = args[0]
+            if isinstance(tensor, QuantizedTensor):
+                if func is torch.ops.aten.t.default:
+                    assert tensor.dim() == 2, "t() expects a 2D QuantizedTensor"
+                    dim0, dim1 = 0, 1
+                else:
+                    dim0, dim1 = args[1], args[2]
+                return cls._transpose(tensor, dim0, dim1)
 
         raise NotImplementedError(f"Unsupported dispatch: {func}")
 
@@ -645,9 +792,71 @@ class QuantizedTensorPair(NamedTuple):
     Wrapper for quantized tensors.
 
     Args:
-        data: Row-major quantized tensor.
-        data_t: Transposed quantized tensor.
+        data_rowwise: Row-wise quantized tensor.
+        data_colwise: Column-wise quantized tensor.
     """
 
-    data: QuantizedTensor
-    data_t: Optional[QuantizedTensor] = None
+    data_rowwise: QuantizedTensor
+    data_colwise: Optional[QuantizedTensor] = None
+
+
+def create_quantized_weight(
+    weight,
+    dest_dtype: torch.dtype,
+    quant_config: Union[Float4QuantConfig, Float8QuantConfig],
+    need_cache_colwise: bool = False,
+) -> Tuple[QuantizedTensor, Optional[QuantizedTensor]]:
+    def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
+        if isinstance(quant_config, Float4QuantConfig):
+            weight_scaling_recipe = ScalingRecipe(
+                use_2d_block=True,
+                shuffle_scale=quant_config.use_preshuffle,
+                shuffle_out=quant_config.use_preshuffle,
+            )
+
+        if isinstance(quant_config, Float8QuantConfig):
+            if quant_config.granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
+                weight_scaling_recipe = ScalingRecipe(use_2d_block=True)
+            else:
+                weight_scaling_recipe = ScalingRecipe()
+
+        return weight_scaling_recipe
+
+    quantized_weight_rowwise = QuantizedTensor.quantize(
+        weight,
+        dest_dtype=dest_dtype,
+        granularity=quant_config.granularity,
+        block_size=quant_config.block_size,
+        scaling_recipe=_weight_scaling_recipe(quant_config),
+        axis=-1,
+    )
+
+    quantized_weight_colwise = None
+    if need_cache_colwise:
+        granularity = quant_config.granularity
+        if granularity == ScalingGranularity.TENSORWISE:
+            quantized_weight_colwise = quantized_weight_rowwise.transpose(-2, -1)
+        elif granularity == ScalingGranularity.ROWWISE:
+            # NOTE: rowwise quantization not support transpose, so we need to quantize the transposed weight manually.
+            quantized_weight_colwise = QuantizedTensor.quantize(
+                weight.transpose(-2, -1),
+                dest_dtype=dest_dtype,
+                granularity=quant_config.granularity,
+                block_size=quant_config.block_size,
+                scaling_recipe=_weight_scaling_recipe(quant_config),
+                axis=-2,
+            )
+        elif granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
+            quantized_weight_colwise = QuantizedTensor.quantize(
+                weight,
+                dest_dtype=dest_dtype,
+                granularity=quant_config.granularity,
+                block_size=quant_config.block_size,
+                scaling_recipe=_weight_scaling_recipe(quant_config),
+                # axis=-2 means quant weight along axis 2 which will get a transposed quantized weight.
+                axis=-2,
+            )
+        else:
+            raise ValueError(f"Unsupported granularity: {granularity}")
+
+    return quantized_weight_rowwise, quantized_weight_colwise
