@@ -253,10 +253,50 @@ def _hca_split_mask_bwd(
         int(Sk),
     )
 
-    # ---- dK / dV: local stream rows, then pool stream rows (atomic-add) ----
+    # ---- dK / dV: overlap the two data-independent kernels on two streams ----
+    # R10: dkv_local (swa_bwd_dkv, compute/VALU-bound) and dkv_pool
+    # (hca_bwd_dkv_pool, memory/L2-bound) are provably independent — they write
+    # DISJOINT outputs (dk_local/dv_local vs dk_pool/dv_pool) and only READ the
+    # shared preprocess outputs (q_c/k_cat/v_cat/dout_c/lse_c/d_buf). Issuing the
+    # memory-bound pool kernel on a second HIP stream concurrently with the
+    # compute-bound local kernel lets the pool's VMEM/L2 traffic hide behind the
+    # local kernel's MFMA/VALU work, raising aggregate CU/L2 utilization with
+    # zero change to either kernel's math. This is a deterministic per-launch
+    # scheduling change (no tensor-identity cache), so the overlap recurs
+    # identically on every real-training backward step.
     dk_local_fp32 = torch.zeros((B, HK, Sq, D), device=q.device, dtype=torch.float32)
     dv_local_fp32 = torch.zeros((B, HK, Sq, D), device=q.device, dtype=torch.float32)
+    # Pool kernel atomic-adds into rows [hca_local_seqlen, hca_local_seqlen+P)
+    # of these full-length [B, HK, Sk, D] buffers (the local rows stay zero).
+    dk_pool_fp32 = torch.zeros((B, HK, Sk, D), device=q.device, dtype=torch.float32)
+    dv_pool_fp32 = torch.zeros((B, HK, Sk, D), device=q.device, dtype=torch.float32)
+
     dkv_local_launch = _get_dkv(HQ, D, swa_window_int, dtype_str, True)
+    dkv_pool_launch = _get_dkv_pool(HQ, D, int(pool_size), int(hca_local_seqlen), dtype_str, True)
+
+    cur_stream = torch.cuda.current_stream(device=q.device)
+    pool_stream = torch.cuda.Stream(device=q.device)
+    # The pool stream must observe the d_buf preprocess + the dk_pool/dv_pool
+    # zero-init that were enqueued on the current stream above.
+    pool_stream.wait_stream(cur_stream)
+
+    with torch.cuda.stream(pool_stream):
+        dkv_pool_launch(
+            q_c,
+            k_cat,
+            v_cat,
+            dout_c,
+            lse_c,
+            d_buf,
+            dk_pool_fp32,
+            dv_pool_fp32,
+            add_mask,
+            int(B),
+            int(Sq),
+            int(Sk),
+            stream=pool_stream,
+        )
+
     dkv_local_launch(
         q_c,
         k_local,
@@ -269,27 +309,16 @@ def _hca_split_mask_bwd(
         int(B),
         int(Sq),
         int(Sq),
+        stream=cur_stream,
     )
 
-    # Pool kernel atomic-adds into rows [hca_local_seqlen, hca_local_seqlen+P)
-    # of these full-length [B, HK, Sk, D] buffers (the local rows stay zero).
-    dk_pool_fp32 = torch.zeros((B, HK, Sk, D), device=q.device, dtype=torch.float32)
-    dv_pool_fp32 = torch.zeros((B, HK, Sk, D), device=q.device, dtype=torch.float32)
-    dkv_pool_launch = _get_dkv_pool(HQ, D, int(pool_size), int(hca_local_seqlen), dtype_str, True)
-    dkv_pool_launch(
-        q_c,
-        k_cat,
-        v_cat,
-        dout_c,
-        lse_c,
-        d_buf,
-        dk_pool_fp32,
-        dv_pool_fp32,
-        add_mask,
-        int(B),
-        int(Sq),
-        int(Sk),
-    )
+    # Join: the current stream (which runs the trailing torch.cat) must wait for
+    # the pool kernel to finish writing dk_pool/dv_pool before they are read.
+    cur_stream.wait_stream(pool_stream)
+    # The pool buffers were allocated on the current stream but consumed on the
+    # pool stream; mark that so the caching allocator does not recycle them early.
+    dk_pool_fp32.record_stream(pool_stream)
+    dv_pool_fp32.record_stream(pool_stream)
 
     dk_out = torch.cat([dk_local_fp32, dk_pool_fp32[:, :, hca_local_seqlen:, :]], dim=2).to(k.dtype)
     dv_out = torch.cat([dv_local_fp32, dv_pool_fp32[:, :, hca_local_seqlen:, :]], dim=2).to(v.dtype)
