@@ -61,6 +61,7 @@ def build_swa_bwd_dkv_module(
     block_n=None,
     block_m2=None,
     head_splits=None,
+    num_waves=None,
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
@@ -89,8 +90,13 @@ def build_swa_bwd_dkv_module(
     # accumulator footprint. For BLOCK_N > 16 we keep the legacy N-split.
     D_SPLIT_WAVES = (BLOCK_N == 16)
     if const_expr(D_SPLIT_WAVES):
-        NUM_WAVES = 2
-        ROWS_PER_WAVE = 16  # both waves work on the same 16 rows
+        # R5: generalize the LDS-capped CU's resident workgroup from 2 to 4
+        # wavefronts. A 128-thread (2-wave) WG fills only 2 of the CU's 4
+        # SIMDs; NUM_WAVES=4 (256-thread WG) issues MFMA on all 4. Both the
+        # D-chunk partition (D_CHUNKS_LOCAL = D_CHUNKS // NUM_WAVES) and the
+        # GEMM1/GEMM3 D-contraction K-split scale with NUM_WAVES.
+        NUM_WAVES = 2 if num_waves is None else int(num_waves)
+        ROWS_PER_WAVE = 16  # all waves work on the same 16 rows
     else:
         # Legacy N-split: each wave gets BLOCK_N/NUM_WAVES rows.
         NUM_WAVES = max(1, BLOCK_N // 16)
@@ -120,6 +126,29 @@ def build_swa_bwd_dkv_module(
     # R6b: GEMM1/GEMM3 cover m_col [0..BLOCK_M2) with multiple 16-col MFMA-N tiles per ks.
     assert BLOCK_M2 % 16 == 0, f"BLOCK_M2 must be a multiple of 16 (MFMA-N), got {BLOCK_M2}"
     M_TILES = BLOCK_M2 // 16
+
+    # R5: GEMM1/GEMM3 D-contraction K-split. In D-split mode each m-tile is
+    # owned by a *group* of K_SPLIT = NUM_WAVES // M_TILES waves; the group
+    # splits the D-contraction (K_STEPS_QK steps) K_SPLIT ways and reduces the
+    # per-wave partials through an f32 LDS scratch (lds_sred) before softmax.
+    # K_SPLIT == 1 reproduces the round-3 2-wave path byte-for-byte (one wave
+    # owns each m-tile, no partial reduction); K_SPLIT == 2 (NUM_WAVES=4)
+    # halves each wave's GEMM1/GEMM3 MFMA count so all 4 SIMDs issue MFMA.
+    if const_expr(D_SPLIT_WAVES):
+        assert NUM_WAVES % M_TILES == 0, (
+            f"NUM_WAVES ({NUM_WAVES}) must be a multiple of M_TILES "
+            f"({M_TILES}) in D-split mode.")
+        K_SPLIT = NUM_WAVES // M_TILES
+        assert K_SPLIT in (1, 2), (
+            f"R5 D-split supports K_SPLIT in (1, 2); got {K_SPLIT} "
+            f"(NUM_WAVES={NUM_WAVES}, M_TILES={M_TILES}).")
+        assert K_STEPS_QK % K_SPLIT == 0, (
+            f"K_STEPS_QK ({K_STEPS_QK}) must be divisible by K_SPLIT "
+            f"({K_SPLIT}).")
+        KS_PER = K_STEPS_QK // K_SPLIT
+    else:
+        K_SPLIT = 1
+        KS_PER = K_STEPS_QK
 
     assert BLOCK_N % NUM_WAVES == 0
     assert ROWS_PER_WAVE == 16, f"ROWS_PER_WAVE must equal 16 for MFMA 16x16x32, got {ROWS_PER_WAVE}"
@@ -220,7 +249,7 @@ def build_swa_bwd_dkv_module(
         global_sym_name=(
             f"swa_bwd_dkv_smem_N{BLOCK_N}_M2_{BLOCK_M2}_W{swa_window}"
             f"_MQ{int(mqa_kv)}_QDO{int(USE_LDS_FOR_Q_DO)}"
-            f"_DS{int(D_SPLIT_WAVES)}"),
+            f"_DS{int(D_SPLIT_WAVES)}_KS{K_SPLIT}"),
     )
     lds_kv_offset = allocator._align(allocator.ptr, 16)
     LDS_V_BASE = LDS_K_TILE_SIZE
@@ -238,6 +267,20 @@ def build_swa_bwd_dkv_module(
     else:
         lds_do_offset = None
         lds_q_offset = None
+
+    # R5: f32 LDS scratch for the GEMM1/GEMM3 K-split partial reduction
+    # (K_SPLIT > 1 only). One v4f32 (= per-lane MFMA C-frag) slot per lane,
+    # per m-tile: M_TILES * WARP_SIZE * 4 fp32. ~2 KB at M_TILES=2, WARP=64.
+    # Reused for both GEMM1 (S) and GEMM3 (dP) reductions (sequenced by
+    # barriers). Allocated only when K_SPLIT > 1 so the 2-wave (K_SPLIT==1)
+    # LDS layout is byte-identical to round-3.
+    if const_expr(D_SPLIT_WAVES and K_SPLIT > 1):
+        SRED_ELEMS = M_TILES * WARP_SIZE * 4
+        lds_sred_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = lds_sred_offset + SRED_ELEMS * 4
+    else:
+        SRED_ELEMS = 0
+        lds_sred_offset = None
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def swa_bwd_dkv_kernel(
@@ -300,6 +343,9 @@ def build_swa_bwd_dkv_module(
                              shape=(LDS_DO_ELEMS,)).get()
             lds_q = SmemPtr(base_ptr, lds_q_offset, elem_type,
                             shape=(LDS_Q_ELEMS,)).get()
+        if const_expr(D_SPLIT_WAVES and K_SPLIT > 1):
+            lds_sred = SmemPtr(base_ptr, lds_sred_offset, compute_type,
+                               shape=(SRED_ELEMS,)).get()
 
         block_id = arith.index_cast(T.index, gpu.block_idx.x)
         tid = arith.index_cast(T.index, gpu.thread_idx.x)
@@ -363,13 +409,37 @@ def build_swa_bwd_dkv_module(
         # In D-split mode the owning wave runs GEMM1/softmax/pT-write/GEMM3/dsT
         # for that mt; the other wave skips. GEMM2/4 use the SHARED pT/dsT LDS.
         if const_expr(D_SPLIT_WAVES):
-            owns_mt_preds = [
-                arith.cmpi(arith.CmpIPredicate.eq, wave_id,
-                           arith.index(mt % NUM_WAVES))
-                for mt in range(M_TILES)
-            ]
+            if const_expr(K_SPLIT == 1):
+                # Round-3 mapping: wave mt%NUM_WAVES owns m-tile mt.
+                owns_mt_preds = [
+                    arith.cmpi(arith.CmpIPredicate.eq, wave_id,
+                               arith.index(mt % NUM_WAVES))
+                    for mt in range(M_TILES)
+                ]
+                kh_is_zero = None
+                sm_owner_preds = None
+            else:
+                # R5 K-split: waves [mt*K_SPLIT, (mt+1)*K_SPLIT) form m-tile
+                # mt's group (owns == wave_id // K_SPLIT == mt). Within a
+                # group kh = wave_id % K_SPLIT selects the D-contraction half;
+                # the kh==0 wave is the softmax/dsT owner that performs the
+                # partial reduction and the pT / dsT LDS writes.
+                owns_mt_preds = [
+                    arith.cmpi(arith.CmpIPredicate.eq,
+                               wave_id // K_SPLIT, arith.index(mt))
+                    for mt in range(M_TILES)
+                ]
+                kh_is_zero = arith.cmpi(
+                    arith.CmpIPredicate.eq,
+                    wave_id % K_SPLIT, arith.index(0))
+                sm_owner_preds = [
+                    arith.AndIOp(owns_mt_preds[mt], kh_is_zero).result
+                    for mt in range(M_TILES)
+                ]
         else:
             owns_mt_preds = None
+            kh_is_zero = None
+            sm_owner_preds = None
 
         # R8 (round-3): grid is (B * num_n_blocks * HEAD_SPLITS,). Decompose
         # into (batch_idx, n_block_idx, head_group). Layout: head_group fastest,
@@ -658,6 +728,37 @@ def build_swa_bwd_dkv_module(
                             do_b_packs_gemm3[mt][ks] = arith.select(
                                 in_bnd, do_raw, c_zero_mfma_pack)
 
+                # R5: GEMM1 B-frag partial helper over a constexpr ks range
+                # [ks_lo, ks_lo + KS_PER). Used by the K-split (K_SPLIT>1)
+                # path where each wave of an m-tile group covers one
+                # D-contraction half.
+                def _gemm1_partial(mt, ks_lo):
+                    acc = v4f32_zero
+                    for _ksl in range_constexpr(KS_PER):
+                        ks = ks_lo + _ksl
+                        k_pack = vector.load_op(
+                            mfma_pack_type, lds_kv, [_k_idx_wave(ks)])
+                        if const_expr(USE_LDS_FOR_Q_DO):
+                            _m_row_b = arith.index(mt * 16) + lane_mod_16
+                            _d_col_b = (arith.index(ks * K_STEP_QK)
+                                        + lane_div_16 * MFMA_LANE_K)
+                            _lds_idx_b = (_m_row_b * arith.index(LDS_Q_STRIDE)
+                                          + _d_col_b)
+                            q_pack = vector.load_op(
+                                mfma_pack_type, lds_q, [_lds_idx_b])
+                        else:
+                            q_pack = q_b_packs[mt][ks]
+                        acc = mfma_acc(k_pack, q_pack, acc)
+                    return acc
+
+                def _sred_store(mt, acc):
+                    base = arith.index(mt * WARP_SIZE * 4) + lane * arith.index(4)
+                    vector.store(acc, lds_sred, [base])
+
+                def _sred_load(mt):
+                    base = arith.index(mt * WARP_SIZE * 4) + lane * arith.index(4)
+                    return vector.load_op(v4f32_type, lds_sred, [base])
+
                 # 6N-2: de-dup GEMM1 + softmax + pT_write per mt-tile.
                 # Each mt is owned by one wave (wave_id == mt % NUM_WAVES).
                 # The owning wave runs everything; the other yields zeros.
@@ -666,7 +767,137 @@ def build_swa_bwd_dkv_module(
                 s_accs = [None for _ in range(M_TILES)]
                 pT_vals_per_tile = [None for _ in range(M_TILES)]
                 delta_per_tile = []
-                for mt in range_constexpr(M_TILES):
+
+                if const_expr(D_SPLIT_WAVES and K_SPLIT > 1):
+                    # ---- R5 K-split GEMM1: partial -> sred -> barrier ->
+                    # reduce + softmax + pT write. All NUM_WAVES waves issue
+                    # GEMM1 MFMA (each over its KS_PER-step D half), so no SIMD
+                    # is stranded during the QK^T GEMM. ----
+                    s_partial = [None for _ in range(M_TILES)]
+                    lse_per_tile = []
+                    for mt in range_constexpr(M_TILES):
+                        m_row_for_lse = (m_start + arith.index(mt * 16)
+                                         + lane_mod_16)
+                        m_row_in_bounds = arith.cmpi(
+                            arith.CmpIPredicate.slt, m_row_for_lse, seq_len_q_v)
+                        m_row_safe = arith.select(
+                            m_row_in_bounds, m_row_for_lse, arith.index(0))
+                        lse_off_i32 = arith.index_cast(
+                            T.i32, bh_base_tokens_q_of(qhid) + m_row_safe)
+                        lse_v = buffer_ops.buffer_load(
+                            lse_rsrc, lse_off_i32, vec_width=1, dtype=T.f32)
+                        delta_v = buffer_ops.buffer_load(
+                            deltas_rsrc, lse_off_i32, vec_width=1, dtype=T.f32)
+                        delta_per_tile.append(delta_v)
+                        lse_per_tile.append(lse_v)
+
+                        owns = owns_mt_preds[mt]
+                        if_p = scf.IfOp(owns, results_=[v4f32_type],
+                                        has_else=True)
+                        with ir.InsertionPoint(if_p.then_block):
+                            if_kh = scf.IfOp(kh_is_zero, results_=[v4f32_type],
+                                             has_else=True)
+                            with ir.InsertionPoint(if_kh.then_block):
+                                scf.YieldOp([_gemm1_partial(mt, 0)])
+                            with ir.InsertionPoint(if_kh.else_block):
+                                _acc1 = _gemm1_partial(mt, KS_PER)
+                                _sred_store(mt, _acc1)
+                                scf.YieldOp([_acc1])
+                            scf.YieldOp([if_kh.results[0]])
+                        with ir.InsertionPoint(if_p.else_block):
+                            scf.YieldOp([v4f32_zero])
+                        s_partial[mt] = if_p.results[0]
+
+                    # All partials (incl. kh==1 sred writes) visible to readers.
+                    gpu.barrier()
+
+                    for mt in range_constexpr(M_TILES):
+                        sm_owner = sm_owner_preds[mt]
+                        if_sm = scf.IfOp(
+                            sm_owner,
+                            results_=[v4f32_type, T.f32, T.f32, T.f32, T.f32],
+                            has_else=True)
+                        with ir.InsertionPoint(if_sm.then_block):
+                            acc = s_partial[mt]
+                            partner = _sred_load(mt)
+                            m_row_for_lse = (m_start + arith.index(mt * 16)
+                                             + lane_mod_16)
+                            lse_v = lse_per_tile[mt]
+                            m_row_abs_for_mask_i32 = arith.index_cast(
+                                T.i32, m_row_for_lse)
+                            m_oob = arith.cmpi(
+                                arith.CmpIPredicate.sge,
+                                m_row_abs_for_mask_i32, seq_len_q_i32)
+                            pT_pieces = []
+                            for ii in range_constexpr(4):
+                                ii_i32 = arith.constant(ii, type=T.i32)
+                                kv_row_rel_i32 = arith.AddIOp(
+                                    arith.MulIOp(
+                                        lane_div_16_i32,
+                                        arith.constant(4, type=T.i32)).result,
+                                    ii_i32).result
+                                kv_abs_i32 = arith.AddIOp(
+                                    arith.AddIOp(
+                                        kv_start_i32, wave_n_off_i32).result,
+                                    kv_row_rel_i32).result
+                                kv_oob = arith.cmpi(
+                                    arith.CmpIPredicate.sge,
+                                    kv_abs_i32, seq_len_k_i32)
+                                is_causal = arith.cmpi(
+                                    arith.CmpIPredicate.sgt,
+                                    kv_abs_i32, m_row_abs_for_mask_i32)
+                                kv_plus_w = arith.AddIOp(
+                                    kv_abs_i32, w_i32).result
+                                is_swa = arith.cmpi(
+                                    arith.CmpIPredicate.sle,
+                                    kv_plus_w, m_row_abs_for_mask_i32)
+                                bad = arith.OrIOp(
+                                    arith.OrIOp(
+                                        arith.OrIOp(is_causal, is_swa).result,
+                                        kv_oob).result,
+                                    m_oob).result
+                                s_ii = vector.extract(
+                                    acc, static_position=[ii],
+                                    dynamic_position=[])
+                                p_ii = vector.extract(
+                                    partner, static_position=[ii],
+                                    dynamic_position=[])
+                                s_sum = arith.AddFOp(
+                                    s_ii, p_ii, fastmath=fm_fast).result
+                                scaled = arith.MulFOp(
+                                    s_sum, c_sm_scale,
+                                    fastmath=fm_fast).result
+                                scaled_m = arith.select(
+                                    bad, c_neg_inf, scaled)
+                                diff = arith.SubFOp(
+                                    scaled_m, lse_v,
+                                    fastmath=fm_fast).result
+                                p = math_dialect.exp(diff, fastmath=fm_fast)
+                                pT_pieces.append(p)
+                                kv_row_rel = (lane_div_16 * arith.index(4)
+                                              + arith.index(ii))
+                                kv_row = wave_n_offset + kv_row_rel
+                                pt_bf16 = arith.trunc_f(elem_type, p)
+                                lds_pt_idx = (
+                                    kv_row * arith.index(LDS_PT_STRIDE)
+                                    + arith.index(mt * 16) + lane_mod_16)
+                                v1_pt = vector.from_elements(
+                                    v1_elem_type, [pt_bf16])
+                                vector.store(v1_pt, lds_pt, [lds_pt_idx])
+                            scf.YieldOp([acc] + pT_pieces)
+                        with ir.InsertionPoint(if_sm.else_block):
+                            _zero_f32 = arith.constant(0.0, type=T.f32)
+                            scf.YieldOp([v4f32_zero, _zero_f32, _zero_f32,
+                                          _zero_f32, _zero_f32])
+                        s_accs[mt] = if_sm.results[0]
+                        pT_vals_per_tile[mt] = [
+                            if_sm.results[1], if_sm.results[2],
+                            if_sm.results[3], if_sm.results[4],
+                        ]
+
+                for mt in (range_constexpr(M_TILES)
+                           if const_expr(not (D_SPLIT_WAVES and K_SPLIT > 1))
+                           else range_constexpr(0)):
                     # delta is needed by every wave (dsT compute happens after
                     # GEMM3 dp_accs[mt] is restored from LDS-broadcast / read).
                     # In de-dup mode dsT is owned by mt-owner only, so delta
@@ -924,11 +1155,90 @@ def build_swa_bwd_dkv_module(
                         new_dv_accs[dc] = mfma_acc(
                             pt_a_packs[pks], b_pack, new_dv_accs[dc])
 
+                # R5: GEMM3 (dP) B-frag partial helper over a constexpr ks
+                # range [ks_lo, ks_lo + KS_PER). Mirrors _gemm1_partial.
+                def _gemm3_partial(mt, ks_lo):
+                    acc = v4f32_zero
+                    for _ksl in range_constexpr(KS_PER):
+                        ks = ks_lo + _ksl
+                        v_pack = vector.load_op(
+                            mfma_pack_type, lds_kv, [_v_idx_wave(ks)])
+                        if const_expr(USE_LDS_FOR_Q_DO):
+                            _m_row_b = arith.index(mt * 16) + lane_mod_16
+                            _d_col_b = (arith.index(ks * K_STEP_QK)
+                                        + lane_div_16 * MFMA_LANE_K)
+                            _lds_idx_b = (_m_row_b * arith.index(LDS_DO_STRIDE)
+                                          + _d_col_b)
+                            do_pack = vector.load_op(
+                                mfma_pack_type, lds_do, [_lds_idx_b])
+                        else:
+                            do_pack = do_b_packs_gemm3[mt][ks]
+                        acc = mfma_acc(v_pack, do_pack, acc)
+                    return acc
+
                 # 6N-2: de-dup GEMM3 + dsT + dsT_write per mt-tile.
                 # The owning wave for mt does GEMM3 MFMA, dsT compute, and LDS write.
                 # The other wave skips entirely. GEMM4 readers see the full
                 # dsT via LDS broadcast after the trailing barrier.
-                if const_expr(D_SPLIT_WAVES):
+                if const_expr(D_SPLIT_WAVES and K_SPLIT > 1):
+                    # ---- R5 K-split GEMM3: partial dP -> sred -> barrier ->
+                    # reduce + dsT write. Reuses lds_sred (GEMM1's reductions
+                    # completed before the GEMM1 pT barrier). ----
+                    dp_partial = [None for _ in range(M_TILES)]
+                    for mt in range_constexpr(M_TILES):
+                        owns = owns_mt_preds[mt]
+                        if_p3 = scf.IfOp(owns, results_=[v4f32_type],
+                                         has_else=True)
+                        with ir.InsertionPoint(if_p3.then_block):
+                            if_kh3 = scf.IfOp(kh_is_zero,
+                                              results_=[v4f32_type],
+                                              has_else=True)
+                            with ir.InsertionPoint(if_kh3.then_block):
+                                scf.YieldOp([_gemm3_partial(mt, 0)])
+                            with ir.InsertionPoint(if_kh3.else_block):
+                                _dp1 = _gemm3_partial(mt, KS_PER)
+                                _sred_store(mt, _dp1)
+                                scf.YieldOp([_dp1])
+                            scf.YieldOp([if_kh3.results[0]])
+                        with ir.InsertionPoint(if_p3.else_block):
+                            scf.YieldOp([v4f32_zero])
+                        dp_partial[mt] = if_p3.results[0]
+
+                    gpu.barrier()
+
+                    for mt in range_constexpr(M_TILES):
+                        sm_owner = sm_owner_preds[mt]
+                        if_d = scf.IfOp(sm_owner, results_=[], has_else=False)
+                        with ir.InsertionPoint(if_d.then_block):
+                            acc = dp_partial[mt]
+                            partner = _sred_load(mt)
+                            for ii in range_constexpr(4):
+                                dp_ii = vector.extract(
+                                    acc, static_position=[ii],
+                                    dynamic_position=[])
+                                dp_p = vector.extract(
+                                    partner, static_position=[ii],
+                                    dynamic_position=[])
+                                dp_sum = arith.AddFOp(
+                                    dp_ii, dp_p, fastmath=fm_fast).result
+                                diff = arith.SubFOp(
+                                    dp_sum, delta_per_tile[mt],
+                                    fastmath=fm_fast).result
+                                ds_ii = arith.MulFOp(
+                                    pT_vals_per_tile[mt][ii], diff,
+                                    fastmath=fm_fast).result
+                                kv_row_rel = (lane_div_16 * arith.index(4)
+                                              + arith.index(ii))
+                                kv_row = wave_n_offset + kv_row_rel
+                                ds_bf16 = arith.trunc_f(elem_type, ds_ii)
+                                lds_pt_idx = (
+                                    kv_row * arith.index(LDS_PT_STRIDE)
+                                    + arith.index(mt * 16) + lane_mod_16)
+                                v1_ds = vector.from_elements(
+                                    v1_elem_type, [ds_bf16])
+                                vector.store(v1_ds, lds_pt, [lds_pt_idx])
+                            scf.YieldOp([])
+                elif const_expr(D_SPLIT_WAVES):
                     for mt in range_constexpr(M_TILES):
                         owns = owns_mt_preds[mt]
                         if_g3 = scf.IfOp(owns, results_=[], has_else=False)

@@ -83,6 +83,11 @@ def _get_dq(num_heads, head_dim, swa_window, dtype_str, mqa_kv, has_sink):
 
 
 def _get_dkv(num_heads, head_dim, swa_window, dtype_str, mqa_kv):
+    # R5: launch the swa_bwd_dkv kernel as a 4-wavefront (256-thread)
+    # workgroup so all 4 SIMDs of the LDS-capped CU (1 WG/CU at ~97 KB LDS)
+    # issue MFMA. num_waves=4 splits the dV/dK D-axis 4 ways and the
+    # GEMM1/GEMM3 D-contraction 2 ways per m-tile (K-split partial reduction
+    # through LDS) so no wave sits idle. Pure intra-WG parallelism change.
     key = (num_heads, head_dim, swa_window, dtype_str, mqa_kv)
     with _DKV_LOCK:
         if key in _DKV_CACHE:
@@ -93,6 +98,7 @@ def _get_dkv(num_heads, head_dim, swa_window, dtype_str, mqa_kv):
             swa_window=swa_window,
             dtype_str=dtype_str,
             mqa_kv=mqa_kv,
+            num_waves=4,
         )
         _DKV_CACHE[key] = launch
         return launch
