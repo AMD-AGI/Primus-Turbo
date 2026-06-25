@@ -102,7 +102,7 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
 
 
 class G2SLoader:
-    def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, chunk_stride=1024, rebase=None):
+    def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, chunk_stride=1024):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
@@ -114,28 +114,6 @@ class G2SLoader:
         # chunk base across LDS banks to cut transpose-read bank conflicts; the
         # read side (S2RLoaderTr) must use the same value.
         self.chunk_stride = chunk_stride
-        # i64-traversal mode. None -> the contraction K-offset rides the 32-bit
-        # soffset (caps the operand span at < 2^32 fp8). A tuple
-        # (arg_i8, fp8_ir_t, base_elems, num_records_bytes) instead re-bases the
-        # SRD per load: k_offset folds into the i64 descriptor base and soffset
-        # stays 0, lifting the cap at the cost of one re-base per load.
-        self.rebase = rebase
-
-    def _src_div(self, k_offset):
-        """(divided source tensor, soffset) for one load. int32 path returns the
-        prebuilt source and rides k_offset on soffset; i64 path folds k_offset
-        into the SRD base and returns soffset 0."""
-        if self.rebase is None:
-            return self.gl_src, k_offset
-        arg_i8, fp8_t, base_elems, nrec = self.rebase
-        off = _as_index(k_offset)
-        # Clamp the shifted num_records to >= 0: an over-launched/masked tile (grouped
-        # over-launch guard) can produce off > nrec; a signed-negative remainder would
-        # wrap to a huge unsigned SRD bound (minui in make_fp8_buffer_tensor_rebased)
-        # and read out of bounds. 0 records -> HW drops every load (matches int32 masking).
-        rem = arith.maxsi(_as_index(nrec) - off, arith.index(0))
-        g = make_fp8_buffer_tensor_rebased(arg_i8, fp8_t, _as_index(base_elems) + off, rem)
-        return fx.logical_divide(g, fx.make_layout(1, 1)), 0
 
     def _lds_dst_at(self, lds_dst, step, base_off=None):
         cs = self.chunk_stride
@@ -148,11 +126,10 @@ class G2SLoader:
         return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
     def load(self, lds_dst, k_offset, base_off=None):
-        src_div, soff = self._src_div(k_offset)
         for step in range_constexpr(self.n_load_steps):
-            src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
+            src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
             dst = self._lds_dst_at(lds_dst, step, base_off)
-            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
+            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
 
 
 def pack_i32x4_i32x8(lo, hi):
@@ -287,14 +264,10 @@ class StoreCPerTensor:
         rows_i = _as_index(self.c_rows)
         row_c = arith.minui(row_i, rows_i)
         band_base = self.c_base + row_c * cols_i * arith.index(out_b)
-        # Cap at 0x7FFFFFFF so buffer_store(mask=False) → voffset=0x7FFFFFFF is always OOB;
-        # valid tile offsets are at most BLOCK_M*c_cols*2 ≈ 30 MB << 2 GB.
-        nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0x7FFFFFFF))
-        # Pin to SGPRs: base_row derives from the group scan which the compiler marks as
-        # divergent, landing the SRD in VGPRs and waterfalling every buffer_store.
-        band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
-        nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
-        rsrc = _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
+        nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0xFFFFFFFF))
+        rsrc = _buffer_ops.create_buffer_resource_from_addr(
+            arith.index_cast(T.i64, band_base), num_records_bytes=nrec
+        )
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
@@ -377,10 +350,10 @@ class StoreCPerTensorCShuffle:
             band_row = arith.index_cast(T.index, base_row + ti * 16)
             row_c = arith.minui(band_row, rows_i)
             band_base = self.c_base + row_c * cols_i * arith.index(out_b)
-            nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0x7FFFFFFF))
-            band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
-            nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
-            rsrc = _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
+            nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0xFFFFFFFF))
+            rsrc = _buffer_ops.create_buffer_resource_from_addr(
+                arith.index_cast(T.i64, band_base), num_records_bytes=nrec
+            )
             row_in = (self.lane_id * self.EPL) // self.Cc
             col_in = (self.lane_id * self.EPL) % self.Cc
             lane_e = wave_off + row_in * self.row_stride + col_in

@@ -383,7 +383,6 @@ def _compile_dense_nn(
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # StoreCPerTensor out dtype: True -> fp16, else bf16
-    i64_traverse: bool = False,  # B[K,N] traversal via per-load i64 SRD re-base (lifts k*n < 2^32 cap)
 ):
     """NN-layout fp8 dense kernel. A [M, K], B [K, N], C [M, N].
 
@@ -501,10 +500,7 @@ def _compile_dense_nn(
             mfma.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, _ea, _eb))
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-        # B[K,N] is the contraction-traversal operand: in i64 mode re-base its SRD
-        # per load (k_offset folds into the i64 base) instead of a 32-bit soffset.
-        b_rebase = (B, F8_IR_t, b_base, b_nrec) if i64_traverse else None
-        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, rebase=b_rebase)
+        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoaderTr(wave_n, N_TILES_B, 32, inline_asm=b_inline_asm_load, vmcnt_hint=vmcnt_hint)
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
@@ -694,7 +690,6 @@ def _compile_dense_tn(
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # StoreCPerTensor out dtype: True -> fp16, else bf16
-    i64_traverse: bool = False,  # A[K,M] & B[K,N] traversal via per-load i64 SRD re-base (lifts cap)
 ):
     """TN-layout fp8 dense kernel: A [K, M], B [K, N], C [M, N] = A^T @ B.
     Both A and B are K-row strided, so both go through the wave-coop
@@ -837,16 +832,8 @@ def _compile_dense_tn(
             _mm = _asm_mma_mode
             mfma._do_mma = lambda _a, _b, _c, _m=_mm: asm_mma_do(_a, _b, _c, mode=_m, cbsz=cbsz, blgp=blgp)
 
-        # TN: both A[K,M] and B[K,N] are contraction-traversal operands -> re-base
-        # both SRDs per load in i64 mode (each k_offset folds into its i64 base).
-        a_rebase = (A, F8_IR_t, a_base, a_nrec) if i64_traverse else None
-        b_rebase = (B, F8_IR_t, b_base, b_nrec) if i64_traverse else None
-        a_g2s = G2SLoader(
-            a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=a_rebase
-        )
-        b_g2s = G2SLoader(
-            b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=b_rebase
-        )
+        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
+        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS)
         a_s2r = S2RLoaderTr(
             wave_m,
             N_TILES_A,
@@ -1082,17 +1069,16 @@ _NN_CANDIDATES = [
 _NN_AUTOTUNE_CACHE: dict = {}
 
 
-def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_traverse=False):
+def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     """First-call bench NN candidates, cache best (launch, cfg) by (M,N,K).
 
     Runtime micro-benches each (BM, GROUP_M, num_xcd, AG) candidate,
     finite-checks the output, times 2-warmup + 20-iter, and caches the
-    fastest by shape. ``i64_traverse`` re-bases B's SRD per load (lifts the
-    k*n < 2^32 cap; threaded to _compile_dense_nn).
+    fastest by shape.
     """
     import torch as _torch
 
-    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
+    key = (M, N, K, cbsz, blgp, out_fp16)
     if key in _NN_AUTOTUNE_CACHE:
         return _NN_AUTOTUNE_CACHE[key]
     out_view = args[2]
@@ -1117,7 +1103,6 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_tra
                 cbsz=cbsz,
                 blgp=blgp,
                 out_fp16=out_fp16,
-                i64_traverse=i64_traverse,
             )
             c = _get_compiled_dense(launch, args)
             c(*args)
@@ -1229,17 +1214,16 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
 _TN_AUTOTUNE_CACHE: dict = {}
 
 
-def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_traverse=False):
+def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
     """First-call bench TN candidates, cache best (launch, cfg) by (M,N,K).
 
     1D GROUP_M=4 with num_xcd 8 vs 1 (XCD-aware PID remap); large
     (HBM-streaming) shapes expose the per-XCD L2 reuse on the hot bench,
-    L2-resident shapes pick num_xcd=1. ``i64_traverse`` re-bases A's and B's
-    SRDs per load (lifts the k*m / k*n < 2^32 cap; threaded to _compile_dense_tn).
+    L2-resident shapes pick num_xcd=1.
     """
     import torch as _torch
 
-    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
+    key = (M, N, K, cbsz, blgp, out_fp16)
     if key in _TN_AUTOTUNE_CACHE:
         return _TN_AUTOTUNE_CACHE[key]
     # Occupancy routing: BLOCK_M=BLOCK_N=256 yields ceil(M/256)*ceil(N/256)
@@ -1264,7 +1248,6 @@ def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_tra
                 cbsz=cbsz,
                 blgp=blgp,
                 out_fp16=out_fp16,
-                i64_traverse=i64_traverse,
             )
             c = _get_compiled_dense(launch, args)
             c(*args)
@@ -1312,10 +1295,6 @@ def gemm_fp8_tensorwise_flydsl_kernel(
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise NotImplementedError(f"FlyDSL wrapper emits bf16 or fp16. Got {out_dtype}.")
     assert a.dim() == 2 and b.dim() == 2
-    # Element-count threshold past which a contraction-traversal operand's 32-bit
-    # soffset wraps (fp8 = 1 byte/elem). At/above it the kernel re-bases the SRD per
-    # load in i64; below it the cheaper fixed-base + 32-bit soffset path is used.
-    cap = 2**32
     # Per-operand fp8 format -> MFMA cbsz(srcA)/blgp(srcB): 0=E4M3, 1=E5M2.
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
@@ -1342,10 +1321,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
             N,
             torch.cuda.current_stream(),
         )
-        # TN both operands traverse K: span k*m / k*n past 2^32 fp8 needs the
-        # per-load i64 SRD re-base (else the 32-bit soffset wraps).
-        i64_tr = (K * M >= cap) or (K * N >= cap)
-        _run_dense(_autotune_tn_dispatch(args, M, N, K, cbsz, blgp, out_fp16, i64_tr), args)
+        _run_dense(_autotune_tn_dispatch(args, M, N, K, cbsz, blgp, out_fp16), args)
         if trans_c:
             return out.t().contiguous()
         return out
@@ -1372,9 +1348,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
             N,
             torch.cuda.current_stream(),
         )
-        # NN: only B[K,N] traverses K; k*n past 2^32 fp8 needs the i64 re-base.
-        i64_tr = K * N >= cap
-        _run_dense(_autotune_nn_dispatch(args, M, N, K, cbsz, blgp, out_fp16, i64_tr), args)
+        _run_dense(_autotune_nn_dispatch(args, M, N, K, cbsz, blgp, out_fp16), args)
     elif (not trans_a) and trans_b:
         # NT native: A [M, K], B [N, K] (B^T storage of [K, N]).
         M, K_a = a.shape
