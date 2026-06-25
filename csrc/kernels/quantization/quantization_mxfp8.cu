@@ -200,7 +200,8 @@ __device__ __forceinline__ uint32_t cvt_f32x4_to_fp8x4(float v0, float v1, float
  * scale write). Maps a source E8M0 byte at (row, kcol) of the [free, K//32]
  * scale to its int32 ``dword`` slot (+ ``jbyte`` within it for pack>1) in the
  * preshuffled layout. layout 1=A (n_tiles sub-tiles), 2=B (combined 4 sub-tiles).
- * Inverse of preshuffle_scale / preshuffle_scale_b_comb (+ _pack variants).
+ * Consumed by the FlyDSL gemm's ScaleS2R (A) / ScaleBComb (B) loaders; matches the
+ * on-GPU preshuffle_*_flydsl (gemm_helper.py) broadcast layout (pack==1).
  */
 __device__ __forceinline__ void compute_preshuffle_scale_index(int row, int kcol, int scale_N,
                                                                int layout, int n_tiles, int pack,
@@ -453,9 +454,11 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_kernel(
                                 if (global_row < scale_M_pad && scale_col < scale_N_pad) {
                                     int scale_index = compute_shuffle_scale_index(
                                         global_row, scale_col, scale_N_pad);
+                                    // Padded-K blocks: E8M0 0 (2^-127), not unit scale, to
+                                    // match AITER and suppress padded-K garbage downstream.
                                     out_scale[scale_index] = (scale_col < scale_N)
                                                                  ? r_scale_e8m0[pass]
-                                                                 : E8M0_EXPONENT_BIAS;
+                                                                 : static_cast<uint8_t>(0);
                                 }
                             } else {
                                 if (scale_col < scale_N) {
@@ -503,9 +506,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_kernel(
                                 if (global_col < scale_M_pad && scale_col < scale_N_pad) {
                                     int scale_index = compute_shuffle_scale_index(
                                         global_col, scale_col, scale_N_pad);
+                                    // Padded-K blocks: E8M0 0, not unit scale (see rowwise note).
                                     out_scale[scale_index] = (scale_col < scale_N)
                                                                  ? r_scale_e8m0[pass]
-                                                                 : E8M0_EXPONENT_BIAS;
+                                                                 : static_cast<uint8_t>(0);
                                 }
                             } else {
                                 if (scale_col < scale_N) {

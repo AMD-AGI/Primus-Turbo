@@ -651,8 +651,10 @@ std::vector<at::Tensor> quantize_mxfp8_dual(
         const int64_t K128p = (rowwise_scale_N / 4) / k_pre_pack;
         int64_t       dwords;
         if (k_pre_layout == 1) { // A: (free//(16*nt)) groups x nt sub-tiles
-            PRIMUS_TURBO_CHECK(M % (16 * preshuffle_n_tiles) == 0,
-                               "preshuffle A: free dim must be a multiple of 16*n_tiles");
+            // n_tiles>=1 first: short-circuits before %0 (UB).
+            PRIMUS_TURBO_CHECK(
+                preshuffle_n_tiles >= 1 && M % (16 * preshuffle_n_tiles) == 0,
+                "preshuffle A: free dim must be a multiple of 16*n_tiles (n_tiles>=1)");
             dwords = (M / (16 * preshuffle_n_tiles)) * K128p * 64 * preshuffle_n_tiles;
         } else { // B-comb: grp = (free/256)*4 + wn; sized by block count cdiv(free,256)*4
             PRIMUS_TURBO_CHECK(M % 64 == 0, "preshuffle B: free dim must be a multiple of 64");
@@ -694,8 +696,10 @@ std::vector<at::Tensor> quantize_mxfp8_dual(
         const int64_t K128p = (colwise_scale_N / 4) / col_k_pre_pack;
         int64_t       dwords;
         if (col_k_pre_layout == 1) { // A-layout: free=N, contract=M
-            PRIMUS_TURBO_CHECK(N % (16 * col_preshuffle_n_tiles) == 0,
-                               "col preshuffle A: free dim must be a multiple of 16*n_tiles");
+            // n_tiles>=1 first: short-circuits before %0 (UB).
+            PRIMUS_TURBO_CHECK(
+                col_preshuffle_n_tiles >= 1 && N % (16 * col_preshuffle_n_tiles) == 0,
+                "col preshuffle A: free dim must be a multiple of 16*n_tiles (n_tiles>=1)");
             dwords = (N / (16 * col_preshuffle_n_tiles)) * K128p * 64 * col_preshuffle_n_tiles;
         } else { // B-comb: grp = (free/256)*4 + wn
             PRIMUS_TURBO_CHECK(N % 64 == 0, "col preshuffle B: free dim must be a multiple of 64");

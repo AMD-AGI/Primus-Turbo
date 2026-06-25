@@ -257,17 +257,41 @@ std::vector<at::Tensor> quantize_mxfp8_dual_meta(
     const bool    is_batched = (input.dim() == 3);
     const int64_t Gout       = is_batched ? G : 1;
 
+    // FlyDSL preshuffle flat int32 scale buffer; dword count MUST match the CUDA impl
+    // (quantization.cpp) or torch.compile shape prop diverges from eager.
+    auto pre_dwords = [&](int64_t layout, int64_t n_tiles, int64_t free_dim,
+                          int64_t scale_N) -> int64_t {
+        const int64_t ki    = scale_N / 4; // K // 128
+        const bool    bc    = (layout == 1 || layout == 3);
+        const int64_t pack  = bc ? 1 : (ki % 4 == 0 ? 4 : (ki % 2 == 0 ? 2 : 1));
+        const int     klay  = (layout <= 2) ? 1 : 2;
+        const int64_t K128p = ki / pack;
+        if (klay == 1) { // A: (free//(16*nt)) groups x nt sub-tiles
+            // n_tiles>=1 first: short-circuits before %0 (UB).
+            PRIMUS_TURBO_CHECK(
+                n_tiles >= 1 && free_dim % (16 * n_tiles) == 0,
+                "preshuffle A: free dim must be a multiple of 16*n_tiles (n_tiles>=1)");
+            return (free_dim / (16 * n_tiles)) * K128p * 64 * n_tiles;
+        }
+        PRIMUS_TURBO_CHECK(free_dim % 64 == 0, "preshuffle B: free dim must be a multiple of 64");
+        return cdiv(free_dim, 256) * 4 * K128p * 64 * 4;
+    };
+
     int64_t rowwise_scale_M_pad = cdiv(M, 256) * 256;
     int64_t rowwise_scale_N     = cdiv(N_pad, MXFP8_BLOCK_SIZE);
     int64_t rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
 
+    const auto meta_opts = at::TensorOptions().dtype(at::kByte).device(at::kMeta);
     at::Tensor rowwise_scale;
-    if (shuffle_rowwise_scale) {
-        rowwise_scale = at::empty({Gout * rowwise_scale_M_pad, rowwise_scale_N_pad},
-                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    if (preshuffle_layout != 0) {
+        PRIMUS_TURBO_CHECK(!is_batched, "preshuffle: rowwise 2D only");
+        const int64_t dwords =
+            pre_dwords(preshuffle_layout, preshuffle_n_tiles, M, rowwise_scale_N);
+        rowwise_scale = at::empty({dwords * 4}, meta_opts);
+    } else if (shuffle_rowwise_scale) {
+        rowwise_scale = at::empty({Gout * rowwise_scale_M_pad, rowwise_scale_N_pad}, meta_opts);
     } else {
-        rowwise_scale = at::empty({Gout * M, rowwise_scale_N},
-                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        rowwise_scale = at::empty({Gout * M, rowwise_scale_N}, meta_opts);
     }
 
     at::Tensor rowwise_output =
@@ -278,12 +302,15 @@ std::vector<at::Tensor> quantize_mxfp8_dual_meta(
     int64_t colwise_scale_N_pad = cdiv(colwise_scale_N, 8) * 8;
 
     at::Tensor colwise_scale;
-    if (shuffle_colwise_scale) {
-        colwise_scale = at::empty({Gout * colwise_scale_M_pad, colwise_scale_N_pad},
-                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+    if (col_preshuffle_layout != 0) {
+        PRIMUS_TURBO_CHECK(!is_batched, "col preshuffle: 2D only");
+        const int64_t dwords =
+            pre_dwords(col_preshuffle_layout, col_preshuffle_n_tiles, N, colwise_scale_N);
+        colwise_scale = at::empty({dwords * 4}, meta_opts);
+    } else if (shuffle_colwise_scale) {
+        colwise_scale = at::empty({Gout * colwise_scale_M_pad, colwise_scale_N_pad}, meta_opts);
     } else {
-        colwise_scale = at::empty({Gout * N, colwise_scale_N},
-                                  at::TensorOptions().dtype(at::kByte).device(at::kMeta));
+        colwise_scale = at::empty({Gout * N, colwise_scale_N}, meta_opts);
     }
 
     at::Tensor colwise_output =
@@ -298,8 +325,13 @@ std::vector<at::Tensor> quantize_mxfp8_dual_meta(
                 colwise_scale.view({G, colwise_scale_rows, -1}).view(at::kFloat8_e8m0fnu)};
     }
 
-    return {rowwise_output.view(dest_dtype), rowwise_scale.view(at::kFloat8_e8m0fnu),
-            colwise_output.view(dest_dtype), colwise_scale.view(at::kFloat8_e8m0fnu)};
+    // Preshuffled scale buffers are flat int32 (mirrors impl).
+    const auto rscale_out = (preshuffle_layout != 0) ? rowwise_scale.view(at::kInt)
+                                                     : rowwise_scale.view(at::kFloat8_e8m0fnu);
+    const auto cscale_out = (col_preshuffle_layout != 0) ? colwise_scale.view(at::kInt)
+                                                         : colwise_scale.view(at::kFloat8_e8m0fnu);
+    return {rowwise_output.view(dest_dtype), rscale_out, colwise_output.view(dest_dtype),
+            cscale_out};
 }
 
 std::vector<at::Tensor>

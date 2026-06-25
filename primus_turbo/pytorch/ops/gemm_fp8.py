@@ -457,13 +457,12 @@ class FP8GemmMXFunction(torch.autograd.Function):
             def _R(layout):
                 return ScalingRecipe(preshuffle_layout=layout, preshuffle_n_tiles=4)
 
-            # Quant emits preshuffled int32 scales (A row=L1/col=L3, B row=L3/col=L3);
-            # route through gemm_fp8_impl -> dispatcher -> FlyDSL execute (int32 pass-
-            # through), same path as tensorwise. No direct kernel call.
+            # Quant emits preshuffled int32 scales, K-byte-packed (A L2/L4, B L4/L4 ->
+            # pack=mxfp8_scale_pack(K)); routed via gemm_fp8_impl -> FlyDSL execute.
             fp8_dtype = _get_fp8_dtype(config.format, True)
             bs = config.block_size
-            a_qd, a_sp, a_cqd, a_csp = quantize_mxfp8_impl(a, fp8_dtype, None, bs, True, _R(1), _R(3))
-            b_qd, b_sp, b_cqd, b_csp = quantize_mxfp8_impl(b, fp8_dtype, None, bs, True, _R(3), _R(3))
+            a_qd, a_sp, a_cqd, a_csp = quantize_mxfp8_impl(a, fp8_dtype, None, bs, True, _R(2), _R(4))
+            b_qd, b_sp, b_cqd, b_csp = quantize_mxfp8_impl(b, fp8_dtype, None, bs, True, _R(4), _R(4))
             out = gemm_fp8_impl(
                 a_qd,
                 a_sp,
@@ -582,7 +581,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             grad_out = grad_out.view(grad_out.shape[0], -1).contiguous()
             grad_dtype = _get_fp8_dtype(ctx.config.format, False)
             bs = ctx.config.block_size
-            g_qd, g_sp, g_cqd, g_csp = quantize_mxfp8_impl(grad_out, grad_dtype, None, bs, True, _R(1), _R(1))
+            g_qd, g_sp, g_cqd, g_csp = quantize_mxfp8_impl(grad_out, grad_dtype, None, bs, True, _R(2), _R(2))
             gran = ctx.config.granularity.value
             fly = BackendType.FLYDSL.value
             # grad_a = NT(grad_out, b_col)  grad_b = NT(grad_out_col, a_col); all via dispatcher.

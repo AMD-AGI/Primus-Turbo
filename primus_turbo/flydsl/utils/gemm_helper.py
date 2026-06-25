@@ -230,6 +230,148 @@ class Mfma16x16x128:
         return c
 
 
+# ── MXFP8 scaled MFMA + per-1x32 E8M0 scale loaders (block-scaled dense GEMM);
+#    scales are pre-shuffled by the quant / FlyDSL preshuffle.
+
+
+def _asm_mma_scale_do(a, b, c, sa, sb, opsel, cbsz=0, blgp=0):
+    """Inline-asm scaled MFMA v_mfma_scale_f32_16x16x128_f8f6f4. =&v early-clobber
+    forces dst disjoint from srcA/srcB; opaque to the backend so it co-schedules with
+    the asm ds_read_b64_tr_b8 loads. opsel (0..3) picks the packed E8M0 byte via
+    op_sel (low bit) / op_sel_hi (high bit). cbsz/blgp select srcA/srcB fp8 format
+    (0=E4M3, 1=E5M2)."""
+    v4f32 = ir.VectorType.get([4], ir.F32Type.get())
+    lo = opsel & 1
+    hi = (opsel >> 1) & 1
+    osel = f"op_sel:[{lo},{lo},0] op_sel_hi:[{hi},{hi},0]"
+    cons = "=&v,v,v,0,v,v"  # VGPR early-clobber accumulator
+    op = _llvm.InlineAsmOp(
+        res=v4f32,
+        operands_=[_raw(a), _raw(b), _raw(c), _raw(sa), _raw(sb)],
+        asm_string=f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 cbsz:{cbsz} blgp:{blgp} {osel}",
+        constraints=cons,
+        has_side_effects=False,
+    )
+    return Vec(op.result)
+
+
+class MfmaScale16x16x128:
+    """16x16x128 f8f6f4 MFMA with per-block E8M0 scale operands.
+
+    Mirrors ``Mfma16x16x128`` but routes through the raw rocdl intrinsic so
+    the (scale_a, scale_b) i32 operands can be supplied per call.
+    """
+
+    def __init__(self, n_tiles_a, n_tiles_b, asm_mma=False, cbsz=0, blgp=0):
+        self.res_ty = Vec.make_type(4, fx.Float32)
+        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        # asm_mma routes through the inline-asm scaled MFMA (see _asm_mma_scale_do).
+        # opsel picks which of the i32 scale operand's 4 E8M0 bytes the MMA reads
+        # (default 0); the byte-pack layout is emitted by the quant / FlyDSL preshuffle
+        # (C++ compute_preshuffle_scale_index pack arg).
+        self.opsel = 0
+        self.asm_mma = asm_mma
+        self.cbsz = cbsz  # srcA fp8 format: 0=E4M3, 1=E5M2
+        self.blgp = blgp  # srcB fp8 format: 0=E4M3, 1=E5M2
+
+    def idx(self, i, j):
+        return i * self.n_tiles_b + j
+
+    def _do_mma(self, a, b, c, sa, sb):
+        # operand order: a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b
+        if self.asm_mma:  # inline-asm scaled MFMA (co-schedules with asm tr8 loads)
+            return _asm_mma_scale_do(a, b, c, sa, sb, self.opsel, self.cbsz, self.blgp)
+        return rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+            self.res_ty,
+            [a, b, c, self.cbsz, self.blgp, self.opsel, sa, self.opsel, sb],
+        )
+
+    def call(self, a, b, c, sa, sb):
+        assert len(a) == self.n_tiles_a
+        assert len(b) == self.n_tiles_b
+        assert len(c) == self.n_tiles_a * self.n_tiles_b
+        assert len(sa) == self.n_tiles_a
+        assert len(sb) == self.n_tiles_b
+
+        for i in range_constexpr(self.n_tiles_a):
+            for j in range_constexpr(self.n_tiles_b):
+                c[self.idx(i, j)] = self._do_mma(a[i], b[j], c[self.idx(i, j)], sa[i], sb[j])
+        return c
+
+
+class ScaleBComb:
+    """Combined B scale loader (pairs with the combined-B preshuffle, layout 3:
+    ``preshuffle_scale_bcomb_flydsl`` / C++ ``compute_preshuffle_scale_index``).
+
+    One dwordx4 per lane returns [s0,s1,s2,s3]; (s0,s1)=b0 sub-tiles, (s2,s3)=b1.
+    """
+
+    def __init__(self, sp_tensor, dim, K, pack=1):
+        self.K128 = K // (128 * pack)  # number of K-groups (pack K-iters per i32)
+        self.lane = fx.thread_idx.x % 64
+        # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
+        # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
+        # only its valid wn groups; OOB-col reads clamp to 0 and StoreC drops them.
+        # dim%256==0 -> cdiv(dim,256)*4 == dim//64 (no change for aligned shapes).
+        nbytes = ((dim + 255) // 256) * 4 * self.K128 * 64 * 4 * 4  # int32 records
+        self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
+
+    def load(self, base, k):
+        """base: sb_base0 (b0 region col base). Returns 4 i32 (b0:0,1  b1:2,3)."""
+        grp = (base // 256) * 4 + (base % 256) // 32
+        idx = ((grp * self.K128 + k) * 64 + self.lane) * 4
+        v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
+        return [v[i].ir_value() for i in range_constexpr(4)]
+
+
+class ScaleS2R:
+    """Per-lane E8M0 scale loader for v_mfma_scale_f32_16x16x128 (preshuffled).
+
+    The 16x16x128 MFMA distributes K=128 so lane ``(g, r)`` with
+    ``g = lane//16`` (0..3) and ``r = lane%16`` holds the A/B data for matrix
+    row/col ``r`` and the 32-K micro-block ``g``. With opsel==0 the hardware
+    samples byte 0 of each lane's scale operand, so lane ``(g, r)`` just needs
+    ``scale[r, 4k+g]`` in a register.
+
+    To make that a single fully-coalesced dword load with no per-lane ALU, the
+    host pre-shuffles the raw E8M0 [DIM, K//32] into
+
+        SP[rt, k, lane] = broadcast_u8_to_u32( scale[rt*16 + lane%16, 4k + lane//16] )
+
+    laid out int32 [DIM//16, K//128, 64]. For row-tile ``rt`` and K-iter ``k``
+    the 64 lanes of a wave read 64 contiguous dwords. The A-operand preshuffle
+    (layout 1) is emitted by the quant / ``preshuffle_scale_flydsl``.
+    """
+
+    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1):
+        self.K128 = K // (128 * pack)  # number of K-groups (pack K-iters per i32)
+        self.n_tiles = n_tiles
+        self.group_span = 16 * n_tiles
+        self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
+        nbytes = (dim // self.group_span) * self.K128 * 64 * n_tiles * 4  # int32 records
+        self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
+
+    def load(self, base, k):
+        """base: runtime global row/col base for this (region, wave). Returns n_tiles i32.
+
+        One vectorized dword{n_tiles} load: the n_tiles sub-tile scales for this
+        wave at (group, k) are contiguous per lane (A-operand preshuffle layout 1).
+        """
+        grp = base // self.group_span
+        idx = ((grp * self.K128 + k) * 64 + self.lane) * self.n_tiles
+        v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
+        return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
+
+
+def mxfp8_scale_pack(K: int) -> int:
+    """K-iters' E8M0 bytes packed per i32 (opsel picks the byte). Must match the C++
+    quant ``k_pre_pack``: 4 if (K//128)%4==0, else 2 if %2==0, else 1 (1 = broadcast)."""
+    k128 = K // 128
+    return 4 if k128 % 4 == 0 else (2 if k128 % 2 == 0 else 1)
+
+
 # ── Reusable fp8 GEMM primitives (store, K-tail mask, value-attrs, AGPR MFMA, XCD
 #    remap, LDS-ptr/transpose loaders, swizzle), shared by dense and grouped.
 
@@ -629,16 +771,6 @@ class S2RLoaderTr:
         return [self._assemble(self._issue_one(lds_src, t, base_off)) for t in range_constexpr(self.n_tiles)]
 
 
-def as_i8_flat(t: torch.Tensor) -> torch.Tensor:
-    """Zero-copy flat (1D) byte view of a tensor. fp8 is reinterpreted as int8.
-    Recomputed every call (no id()-keyed cache: a freed tensor's id + data_ptr can
-    both be reused, and a recycled pair with a different numel would alias the wrong
-    length). The view ops allocate nothing."""
-    if t.element_size() == 1 and t.dtype != torch.int8:  # fp8
-        return t.contiguous().view(torch.int8).view(-1)
-    return t.contiguous().view(-1)
-
-
 def get_compiled(cache: dict, launch, args):
     """Cache compiled launcher by (id(launch), shapes/dtypes/ints).
     Caller must keep ``launch`` alive (e.g. in _MXFP8_LAUNCH_CACHE): Python recycles
@@ -885,7 +1017,8 @@ def _run_preshuffle(layout, K128, raw_i32, dim, n_grp, out):
 
 def preshuffle_scale_flydsl(e8m0, K: int, n_tiles: int = 4) -> torch.Tensor:
     """A-operand (layout 1) preshuffle. ``e8m0`` [DIM, K//32] (uint8/e8m0, DIM % 64 == 0).
-    Returns flat int32 (== preshuffle_scale(...).view(int32).reshape(-1))."""
+    Returns flat int32 broadcast layout (each i32 = one E8M0 byte mirrored to all 4
+    byte-positions); consumed by the gemm's ``ScaleS2R``."""
     DIM, Kb = e8m0.shape
     K128 = K // 128
     assert Kb == K // 32 and n_tiles == 4 and DIM % 64 == 0
@@ -896,11 +1029,13 @@ def preshuffle_scale_flydsl(e8m0, K: int, n_tiles: int = 4) -> torch.Tensor:
 
 
 def preshuffle_scale_bcomb_flydsl(e8m0, K: int) -> torch.Tensor:
-    """Combined-B (layout 3) preshuffle. ``e8m0`` [N, K//32] (uint8/e8m0, N % 64 == 0;
-    N not %256 zero-padded via OOB clamp). Returns flat int32 (== preshuffle_scale_b_comb)."""
+    """Combined-B (layout 3) preshuffle. ``e8m0`` [N, K//32] (uint8/e8m0, N % 16 == 0).
+    Returns flat int32. General-N (N % 256 != 0): the LDS-repack kernel sizes the buffer
+    by cdiv(N,256)*4 groups and masks source rows >= N (OOB -> 0 == 2^-127, dropped by the
+    gemm's StoreC col clamp), so partial 256-blocks / partial 32-col waves are handled."""
     N, Kb = e8m0.shape
     K128 = K // 128
-    assert Kb == K // 32 and N % 64 == 0
+    assert Kb == K // 32 and N % 16 == 0
     raw = e8m0.contiguous().view(torch.int32).reshape(-1)
     n_grp = ((N + 255) // 256) * 4
     out = torch.empty(n_grp * K128 * 256, dtype=torch.int32, device=e8m0.device)
@@ -910,11 +1045,15 @@ def preshuffle_scale_bcomb_flydsl(e8m0, K: int) -> torch.Tensor:
 def preshuffle_ab_flydsl(a_e8m0, b_e8m0, K: int, n_tiles: int = 4):
     """A (layout 1) + B-comb (layout 3) preshuffle in ONE fused LDS-tiled launch.
     Returns (a_sp, b_sp) flat int32. Single launch + single wrapper call avoids the
-    per-op Python/launch overhead that dominates small scale sizes."""
+    per-op Python/launch overhead that dominates small scale sizes.
+
+    A requires M % (16*n_tiles) == M % 64 == 0 (no row padding); B accepts any N % 16
+    (general-N handled by the kernel's cdiv(N,256)*4 sizing + source-row mask, see
+    ``preshuffle_scale_bcomb_flydsl``)."""
     M, Ka = a_e8m0.shape
     N, Kb = b_e8m0.shape
     K128 = K // 128
-    assert Ka == K // 32 and Kb == K // 32 and n_tiles == 4 and M % 64 == 0 and N % 64 == 0
+    assert Ka == K // 32 and Kb == K // 32 and n_tiles == 4 and M % 64 == 0 and N % 16 == 0
     a_raw = a_e8m0.contiguous().view(torch.int32).reshape(-1)
     b_raw = b_e8m0.contiguous().view(torch.int32).reshape(-1)
     a_ngrp = M // 64

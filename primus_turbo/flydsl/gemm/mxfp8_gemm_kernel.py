@@ -36,7 +36,10 @@ import torch
 # PR), so the NN/TN transpose loaders (S2RLoaderTr / swizzle_nn) are not imported.
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
+    MfmaScale16x16x128,
     S2RLoader,
+    ScaleBComb,
+    ScaleS2R,
     _robust_time,
     block_mn,
     ceildiv,
@@ -50,206 +53,10 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
-from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl.expr.typing import Vector as Vec
 
 # isort: on
-
-
-def preshuffle_scale(e8m0_u8, K, n_tiles):
-    """Host-side E8M0 scale pre-shuffle for the mxfp8 8-wave kernel (broadcast layout,
-    scale_pack=1). Pairs with ``ScaleS2R``.
-
-    ``n_tiles`` = the per-wave sub-tile fan-out the kernel loads together in one
-    vectorized dword{n_tiles} (A: BLOCK_M//64).
-
-    Input : uint8 [DIM, K//32] row-major E8M0 (DIM multiple of 16*n_tiles).
-    Output: int32 [DIM//(16*n_tiles), K//128, 64, n_tiles] where each i32 broadcasts
-        one E8M0 byte to all 4 byte-positions (opsel==0 reads byte 0; broadcast =>
-        byte-position safe). This is the no-host-repack-needed compute path; the
-        byte-packed (scale_pack>1) layout is emitted by the quant and lands in the
-        quant PR.
-    """
-    DIM, Kb = e8m0_u8.shape
-    assert Kb == K // 32 and K % 128 == 0
-    assert DIM % (16 * n_tiles) == 0, f"DIM={DIM} must be multiple of {16 * n_tiles}"
-    K128 = K // 128
-    G = DIM // (16 * n_tiles)
-    s = e8m0_u8.reshape(DIM, K128, 4)  # [DIM, k, g]
-    s = s.reshape(G, n_tiles, 16, K128, 4)  # [grp, s, r, k, g]
-    s = s.permute(0, 3, 4, 2, 1).contiguous()  # [grp, k, g, r, s]
-    s = s.reshape(G, K128, 64, n_tiles).to(torch.int32)  # lane == g*16 + r
-    sp = s | (s << 8) | (s << 16) | (s << 24)
-    return sp.contiguous()
-
-
-def preshuffle_scale_b_comb(e8m0_u8, K):
-    """Combined-B E8M0 pre-shuffle (broadcast layout, scale_pack=1). Pairs with
-    ``ScaleBComb``. Packs BOTH N-regions' (b0,b1) 4 sub-tiles for a wave into one
-    dword{4}, so the kernel issues a single dwordx4 for all B scales per K-iter.
-
-    Handles N % 64 == 0 (not just N % 256): the input is zero-padded up to the next
-    256-multiple so the buffer holds cdiv(N,256)*4 groups (matches ``ScaleBComb``'s
-    num_records sizing). Columns >= N are dropped by the StoreC col clamp and their
-    data reads clamp to 0, so the zero-padded (finite, 2^-127) scale is harmless.
-
-    A wave's 4 B sub-tiles sit at cols c+{0,16,128,144}, c = block_n*256 + wave_n*32.
-    Output int32 [cdiv(N,256)*4, K//128, 64, 4]:
-        SP[grp, k, lane, s] = broadcast( scale[c + OFF[s] + lane%16, 4k + lane//16] )
-    grp = block_n*4 + wave_n;  OFF = [0,16,128,144].
-    """
-    N, Kb = e8m0_u8.shape
-    assert Kb == K // 32 and K % 128 == 0 and N % 16 == 0
-    K128 = K // 128
-    Npad = ((N + 255) // 256) * 256
-    if Npad != N:
-        pad = torch.zeros((Npad - N, Kb), dtype=e8m0_u8.dtype, device=e8m0_u8.device)
-        e8m0_u8 = torch.cat([e8m0_u8, pad], dim=0)
-    OFF = [0, 16, 128, 144]
-    dev = e8m0_u8.device
-    s = e8m0_u8.reshape(Npad // 256, 256, K128, 4)  # [nblk, col256, k, g]
-    # col256 = wn*32 + OFF[si] + r  (bijection of 0..255)
-    wn = torch.arange(4, device=dev).view(4, 1, 1)
-    r = torch.arange(16, device=dev).view(1, 1, 16)
-    off = torch.tensor(OFF, device=dev).view(1, 4, 1)
-    colidx = (wn * 32 + off + r).reshape(-1)  # [wn,si,r] flattened
-    g = s[:, colidx, :, :].reshape(Npad // 256, 4, 4, 16, K128, 4)  # [nblk, wn, si, r, k, g]
-    g = g.permute(0, 1, 4, 5, 3, 2).contiguous()  # [nblk, wn, k, g, r, si]
-    g = g.reshape(Npad // 64, K128, 64, 4).to(torch.int32)  # grp=nblk*4+wn, lane=g*16+r
-    sp = g | (g << 8) | (g << 16) | (g << 24)
-    return sp.contiguous()
-
-
-def _asm_mma_scale_do(a, b, c, sa, sb, opsel, cbsz=0, blgp=0):
-    """Inline-asm scaled MFMA v_mfma_scale_f32_16x16x128_f8f6f4. =&v early-clobber
-    forces dst disjoint from srcA/srcB; opaque to the backend so it co-schedules with
-    the asm ds_read_b64_tr_b8 loads. opsel (0..3) picks the packed E8M0 byte via
-    op_sel (low bit) / op_sel_hi (high bit). cbsz/blgp select srcA/srcB fp8 format
-    (0=E4M3, 1=E5M2)."""
-    v4f32 = ir.VectorType.get([4], ir.F32Type.get())
-    lo = opsel & 1
-    hi = (opsel >> 1) & 1
-    osel = f"op_sel:[{lo},{lo},0] op_sel_hi:[{hi},{hi},0]"
-    cons = "=&v,v,v,0,v,v"  # VGPR early-clobber accumulator
-    op = _llvm.InlineAsmOp(
-        res=v4f32,
-        operands_=[_raw(a), _raw(b), _raw(c), _raw(sa), _raw(sb)],
-        asm_string=f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 cbsz:{cbsz} blgp:{blgp} {osel}",
-        constraints=cons,
-        has_side_effects=False,
-    )
-    return Vec(op.result)
-
-
-class ScaleBComb:
-    """Combined B scale loader (pairs with ``preshuffle_scale_b_comb``).
-
-    One dwordx4 per lane returns [s0,s1,s2,s3]; (s0,s1)=b0 sub-tiles, (s2,s3)=b1.
-    """
-
-    def __init__(self, sp_tensor, dim, K, pack=1):
-        self.K128 = K // (128 * pack)  # number of K-groups (pack K-iters per i32)
-        self.lane = fx.thread_idx.x % 64
-        # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
-        # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
-        # only its valid wn groups; OOB-col reads clamp to 0 and StoreC drops them.
-        # dim%256==0 -> cdiv(dim,256)*4 == dim//64 (no change for aligned shapes).
-        nbytes = ((dim + 255) // 256) * 4 * self.K128 * 64 * 4 * 4  # int32 records
-        self.rsrc = buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
-
-    def load(self, base, k):
-        """base: sb_base0 (b0 region col base). Returns 4 i32 (b0:0,1  b1:2,3)."""
-        grp = (base // 256) * 4 + (base % 256) // 32
-        idx = ((grp * self.K128 + k) * 64 + self.lane) * 4
-        v = Vec(buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
-        return [v[i].ir_value() for i in range_constexpr(4)]
-
-
-class MfmaScale16x16x128:
-    """16x16x128 f8f6f4 MFMA with per-block E8M0 scale operands.
-
-    Mirrors ``Mfma16x16x128`` but routes through the raw rocdl intrinsic so
-    the (scale_a, scale_b) i32 operands can be supplied per call.
-    """
-
-    def __init__(self, n_tiles_a, n_tiles_b, asm_mma=False, cbsz=0, blgp=0):
-        self.res_ty = Vec.make_type(4, fx.Float32)
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
-        self.n_tiles_a = n_tiles_a
-        self.n_tiles_b = n_tiles_b
-        # asm_mma routes through the inline-asm scaled MFMA (see _asm_mma_scale_do).
-        # opsel picks which of the i32 scale operand's 4 E8M0 bytes the MMA reads
-        # (default 0); see preshuffle_scale / preshuffle_scale_pack for the layout.
-        self.opsel = 0
-        self.asm_mma = asm_mma
-        self.cbsz = cbsz  # srcA fp8 format: 0=E4M3, 1=E5M2
-        self.blgp = blgp  # srcB fp8 format: 0=E4M3, 1=E5M2
-
-    def idx(self, i, j):
-        return i * self.n_tiles_b + j
-
-    def _do_mma(self, a, b, c, sa, sb):
-        # operand order: a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b
-        if self.asm_mma:  # inline-asm scaled MFMA (co-schedules with asm tr8 loads)
-            return _asm_mma_scale_do(a, b, c, sa, sb, self.opsel, self.cbsz, self.blgp)
-        return rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-            self.res_ty,
-            [a, b, c, self.cbsz, self.blgp, self.opsel, sa, self.opsel, sb],
-        )
-
-    def call(self, a, b, c, sa, sb):
-        assert len(a) == self.n_tiles_a
-        assert len(b) == self.n_tiles_b
-        assert len(c) == self.n_tiles_a * self.n_tiles_b
-        assert len(sa) == self.n_tiles_a
-        assert len(sb) == self.n_tiles_b
-
-        for i in range_constexpr(self.n_tiles_a):
-            for j in range_constexpr(self.n_tiles_b):
-                c[self.idx(i, j)] = self._do_mma(a[i], b[j], c[self.idx(i, j)], sa[i], sb[j])
-        return c
-
-
-class ScaleS2R:
-    """Per-lane E8M0 scale loader for v_mfma_scale_f32_16x16x128 (preshuffled).
-
-    The 16x16x128 MFMA distributes K=128 so lane ``(g, r)`` with
-    ``g = lane//16`` (0..3) and ``r = lane%16`` holds the A/B data for matrix
-    row/col ``r`` and the 32-K micro-block ``g``. With opsel==0 the hardware
-    samples byte 0 of each lane's scale operand, so lane ``(g, r)`` just needs
-    ``scale[r, 4k+g]`` in a register.
-
-    To make that a single fully-coalesced dword load with no per-lane ALU, the
-    host pre-shuffles the raw E8M0 [DIM, K//32] into
-
-        SP[rt, k, lane] = broadcast_u8_to_u32( scale[rt*16 + lane%16, 4k + lane//16] )
-
-    laid out int32 [DIM//16, K//128, 64]. For row-tile ``rt`` and K-iter ``k``
-    the 64 lanes of a wave read 64 contiguous dwords. See ``preshuffle_scale``.
-    """
-
-    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1):
-        self.K128 = K // (128 * pack)  # number of K-groups (pack K-iters per i32)
-        self.n_tiles = n_tiles
-        self.group_span = 16 * n_tiles
-        self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
-        nbytes = (dim // self.group_span) * self.K128 * 64 * n_tiles * 4  # int32 records
-        self.rsrc = buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
-
-    def load(self, base, k):
-        """base: runtime global row/col base for this (region, wave). Returns n_tiles i32.
-
-        One vectorized dword{n_tiles} load: the n_tiles sub-tile scales for this
-        wave at (group, k) are contiguous per lane (see ``preshuffle_scale``).
-        """
-        grp = base // self.group_span
-        idx = ((grp * self.K128 + k) * 64 + self.lane) * self.n_tiles
-        v = Vec(buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
-        return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
 
 
 def _compile_mxfp8_nt(
@@ -272,6 +79,8 @@ def _compile_mxfp8_nt(
     assert K % BLOCK_K == 0
 
     K_ITERS = K // BLOCK_K
+    # Packed scale groups (one i32 per `scale_pack` K-iters); bounds the prefetch.
+    _N_SGROUPS = (K_ITERS + scale_pack - 1) // scale_pack
 
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
@@ -402,12 +211,16 @@ def _compile_mxfp8_nt(
 
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
-        # scale_pack==1: 1-deep broadcast prefetch (2-deep spills: V=256 maxed). Pre-
-        # load k=0, prefetch k+1, distributed across barrier sections.
-        # scale_pack>1: opsel byte-pack -> load one i32 per `scale_pack` K-iters at the
-        # loop top (held across them), pick this iter's byte via mfma.opsel.
+        # pack==1: 1-deep broadcast prefetch (preload k=0, prefetch k+1).
+        # pack>1: opsel byte-pack -> preload group 0, prefetch group g+1 during group g's
+        # MFMAs (hides the scale VMEM load); mfma.opsel picks this iter's byte.
         if const_expr(scale_pack == 1):
             sa0 = sa_s2r.load(sa_base0, 0)
+            sa1 = sa_s2r.load(sa_base1, 0)
+            sb_all = sb_s2r.load(sb_base0, 0)
+            sb0, sb1 = sb_all[0:2], sb_all[2:4]
+        elif const_expr(scale_pack > 1):
+            sa0 = sa_s2r.load(sa_base0, 0)  # group 0 (current); prefetch g+1 in-loop
             sa1 = sa_s2r.load(sa_base1, 0)
             sb_all = sb_s2r.load(sb_base0, 0)
             sb0, sb1 = sb_all[0:2], sb_all[2:4]
@@ -415,11 +228,12 @@ def _compile_mxfp8_nt(
         for k in range_constexpr(K_ITERS - 2):
             if const_expr(scale_pack > 1):
                 mfma.opsel = k % scale_pack
-                if const_expr(k % scale_pack == 0):
-                    sa0 = sa_s2r.load(sa_base0, k // scale_pack)
-                    sa1 = sa_s2r.load(sa_base1, k // scale_pack)
-                    sb_all = sb_s2r.load(sb_base0, k // scale_pack)
-                    sb0, sb1 = sb_all[0:2], sb_all[2:4]
+                # prefetch group g+1 at group g's first iter
+                if const_expr(k % scale_pack == 0 and (k // scale_pack + 1) < _N_SGROUPS):
+                    _g1 = k // scale_pack + 1
+                    sa0n = sa_s2r.load(sa_base0, _g1)
+                    sa1n = sa_s2r.load(sa_base1, _g1)
+                    sb_alln = sb_s2r.load(sb_base0, _g1)
             else:
                 sa0n = sa_s2r.load(sa_base0, k + 1)
 
@@ -468,6 +282,13 @@ def _compile_mxfp8_nt(
             b_cur0, b_next0 = b_next0, b_cur0
             b_cur1, b_next1 = b_next1, b_cur1
             if const_expr(scale_pack == 1):
+                sa0, sa1 = sa0n, sa1n
+                sb_all = sb_alln
+                sb0, sb1 = sb_all[0:2], sb_all[2:4]
+            # pack>1: swap in prefetched group g+1 at group g's last iter
+            elif const_expr(
+                scale_pack > 1 and k % scale_pack == scale_pack - 1 and (k // scale_pack + 1) < _N_SGROUPS
+            ):
                 sa0, sa1 = sa0n, sa1n
                 sb_all = sb_alln
                 sb0, sb1 = sb_all[0:2], sb_all[2:4]
@@ -622,13 +443,6 @@ _MXFP8_NT_CANDIDATES = [
 _MXFP8_AUTOTUNE_CACHE: dict = {}  # (M,N,K,out_dtype,layout) -> (BLOCK_M, GROUP_M, num_xcd, group_n)
 
 
-def peek_mxfp8_cfg(M, N, K, out_dtype, layout="nt"):
-    """Cached (BLOCK_M, GROUP_M, num_xcd, group_n) for this shape, or None if not
-    yet benched. Lets the quant layer fuse the A-scale preshuffle (fanout
-    n_tiles = BLOCK_M//64) only once the BLOCK_M has been picked by autotune."""
-    return _MXFP8_AUTOTUNE_CACHE.get((M, N, K, out_dtype, layout))
-
-
 # Layout -> compile factory. NT only (compute-only PR: NN/TN dropped). The A-scale
 # (ScaleS2R) / B-scale (ScaleBComb) loaders are layout-invariant; the data path
 # (G2S offsets / swizzle / MMA form) lives in the compile fn.
@@ -658,14 +472,13 @@ def _mx_nt_gn_cands(N):
     return [g for g in (4, 8, 16) if n_blocks >= 2 * g]
 
 
-def _get_mxfp8_launch(K, bm, gm, xcd, layout="nt", N=0, gn=0, cbsz=0, blgp=0, out_fp16=False):
+def _get_mxfp8_launch(K, bm, gm, xcd, layout="nt", N=0, gn=0, cbsz=0, blgp=0, out_fp16=False, scale_pack=1):
     # gn is the autotuned 2D N-band width (0 = 1D swizzle). NT only (compute-only PR).
     # cbsz/blgp = per-operand fp8 format (0=E4M3,1=E5M2); out_fp16 = fp16 output.
-    lk = (K, bm, gm, xcd, layout, gn, cbsz, blgp, out_fp16)
+    # scale_pack: 1 = broadcast; >1 = opsel byte-pack (must match the scale layout).
+    lk = (K, bm, gm, xcd, layout, gn, cbsz, blgp, out_fp16, scale_pack)
     launch = _MXFP8_LAUNCH_CACHE.get(lk)
     if launch is None:
-        # NT plain-load path. scale_pack=1: opsel byte-pack needs quant-emitted packed
-        # scales (-> quant PR); the compute-only host preshuffle is broadcast (pack=1).
         launch = _LAYOUT_COMPILE[layout](
             K=K,
             BLOCK_M=bm,
@@ -673,7 +486,7 @@ def _get_mxfp8_launch(K, bm, gm, xcd, layout="nt", N=0, gn=0, cbsz=0, blgp=0, ou
             GROUP_M=gm,
             group_n=gn,
             num_xcd=xcd,
-            scale_pack=1,
+            scale_pack=scale_pack,
             cbsz=cbsz,
             blgp=blgp,
             out_fp16=out_fp16,
@@ -682,7 +495,9 @@ def _get_mxfp8_launch(K, bm, gm, xcd, layout="nt", N=0, gn=0, cbsz=0, blgp=0, ou
     return launch
 
 
-def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt", cbsz=0, blgp=0):
+def _autotune_mxfp8(
+    a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt", cbsz=0, blgp=0, scale_pack=1
+):
     """First-call micro-bench of the candidates for (M,N,K,layout); cache the
     fastest cfg by shape. Returns (BLOCK_M, GROUP_M, num_xcd, group_n). Scales are
     pre-shuffled by the quant (BLOCK_M fixed at 256), so the same a_sp/b_sp feed
@@ -693,7 +508,7 @@ def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt
     fixes that tile and sweeps the 2D N-band width group_n. gn=0 is measured in
     stage 1, so the staged pick can never regress vs the old (gn-less) NT path —
     it only captures the big-/mid-N L2-reuse win on shapes where a band helps."""
-    key = (M, N, K, out_dtype, layout, cbsz, blgp)
+    key = (M, N, K, out_dtype, layout, cbsz, blgp, scale_pack)
     _ofp16 = out_dtype == torch.float16
     cached = _MXFP8_AUTOTUNE_CACHE.get(key)
     if cached is not None:
@@ -703,7 +518,9 @@ def _autotune_mxfp8(a8, b8, out_view, a_sp, b_sp, M, N, K, out_dtype, layout="nt
 
     def _time_cfg(bm, gm, xcd, gn):
         try:
-            launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn, cbsz=cbsz, blgp=blgp, out_fp16=_ofp16)
+            launch = _get_mxfp8_launch(
+                K, bm, gm, xcd, layout, N, gn, cbsz=cbsz, blgp=blgp, out_fp16=_ofp16, scale_pack=scale_pack
+            )
             args = (a8, b8, out_view, a_sp, b_sp, M, N, stream)
             launch(*args)
             torch.cuda.synchronize()
@@ -758,6 +575,7 @@ def gemm_mxfp8_flydsl_kernel(
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
+    scale_pack: int = 1,
 ) -> torch.Tensor:
     """MXFP8 (per-1x32 E8M0 block-scaled) dense GEMM, gfx950.
 
@@ -767,11 +585,14 @@ def gemm_mxfp8_flydsl_kernel(
     NT only (trans_a=False, trans_b=True): A [M,K], B [N,K], C = a @ b^T.
 
     The E8M0 scales are PRE-SHUFFLED by the quant kernel (no host repack):
-    ``a_scale`` is the A-operand preshuffle (layout 1, n_tiles=BLOCK_M//64=4)
-    and ``b_scale`` is the combined-B preshuffle (layout 3), both flat int32
+    ``a_scale`` is the A-operand preshuffle (layout 1/2, n_tiles=BLOCK_M//64=4)
+    and ``b_scale`` is the combined-B preshuffle (layout 3/4), both flat int32
     buffers consumed directly by ``ScaleS2R`` / ``ScaleBComb``.
 
-    Constraints: K % 128 == 0 and K >= 256; M % 64 == 0; N % 64 == 0.
+    ``scale_pack`` MUST match the scale layout: 1 = broadcast, >1 =
+    ``mxfp8_scale_pack(K)`` byte-pack (mismatch reads the wrong slots).
+
+    Constraints: K % 128 == 0 and K >= 256; M % 64 == 0; N % 16 == 0.
     """
     assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
     assert out_dtype in (torch.bfloat16, torch.float16), "mxfp8 FlyDSL store emits bf16/fp16"
@@ -807,12 +628,16 @@ def gemm_mxfp8_flydsl_kernel(
     b8 = b.contiguous().view(torch.int8)
     # Per-shape cfg: first call benches GROUP_M/num_xcd/group_n (BLOCK_M fixed 256),
     # caches the winner by (M,N,K,layout); the same pre-shuffled a_sp feeds all candidates.
-    bm, gm, xcd, gn = _autotune_mxfp8(a8, b8, out, a_sp, b_sp, M, N, K, out_dtype, layout, cbsz, blgp)
-    launch = _get_mxfp8_launch(K, bm, gm, xcd, layout, N, gn, cbsz=cbsz, blgp=blgp, out_fp16=out_fp16)
+    bm, gm, xcd, gn = _autotune_mxfp8(
+        a8, b8, out, a_sp, b_sp, M, N, K, out_dtype, layout, cbsz, blgp, scale_pack=scale_pack
+    )
+    launch = _get_mxfp8_launch(
+        K, bm, gm, xcd, layout, N, gn, cbsz=cbsz, blgp=blgp, out_fp16=out_fp16, scale_pack=scale_pack
+    )
     args = (a8, b8, out, a_sp, b_sp, M, N, torch.cuda.current_stream())
     # [raw, compiled]: raw for CUDA-graph capture (flyc.compile regresses under capture);
     # compiled for eager (skips per-call jit dispatch overhead). Mirrors _GROUPED_AT_CACHE.
-    at_key = (M, N, K, bm, gm, xcd, layout, gn, cbsz, blgp, out_fp16)
+    at_key = (M, N, K, bm, gm, xcd, layout, gn, cbsz, blgp, out_fp16, scale_pack)
     entry = _MXFP8_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]
