@@ -20,6 +20,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_mxfp4_impl,
     dequantize_mxfp8_impl,
     grouped_quantize_mxfp8_impl,
+    quant_fp8_blockwise_for_weight_dual_impl,
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,

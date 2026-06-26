@@ -367,12 +367,20 @@ def gemm_fp8_blockwise_flydsl(
     per-block scales (1xK-block for the activation, 128x128 for the weight).
     """
     assert a_fp8.ndim == 2 and b_fp8.ndim == 2, "a and b must be 2D"
-    assert a_scale_inv.ndim == 2 and b_scale_inv.ndim == 2, "scales must be 2D"
+    assert a_scale_inv.ndim == 2, "a_scale must be 2D"
     assert out_dtype in (torch.bfloat16, torch.float16), "out_dtype must be bf16 or fp16"
 
     M, K = a_fp8.shape
     N, Kb = b_fp8.shape
     assert K == Kb, f"K mismatch: a has K={K}, b has K={Kb}"
+
+    # Detect the dual-quant-produced pre-shuffled weight: when the weight-quant
+    # emitted b_fp8 directly in the forward (16, 16) MFMA pre-shuffled layout, the
+    # producer passes a flattened (1D) weight scale as the signal (the GEMM dispatch
+    # ignores scale shape). In that case b_fp8 is already shuffle_b(b_fp8)-equivalent,
+    # so the standalone preshuffle copy + kernel launch is skipped. Normal callers
+    # pass the 2D [N // 128, K // 128] scale and take the shuffle_b path below.
+    b_preshuffled = b_scale_inv.dim() == 1
 
     compile_fn = _load_fwd_compile_fn()
     if compile_fn is None:
@@ -396,7 +404,11 @@ def gemm_fp8_blockwise_flydsl(
     # scale_b row-major [N // 128, K // 128] (flattened).
     a_scale_t = a_scale_inv.transpose(0, 1).contiguous().view(-1)
     b_scale_flat = b_scale_inv.contiguous().view(-1)
-    b_shuffled = shuffle_b(b_fp8)
+    if b_preshuffled:
+        # b_fp8 already carries shuffle_b(b_fp8) bytes; consume directly (zero-cost).
+        b_shuffled = b_fp8
+    else:
+        b_shuffled = shuffle_b(b_fp8)
 
     out = torch.empty((M, N), dtype=out_dtype, device=a_fp8.device)
     stream = torch.cuda.current_stream()

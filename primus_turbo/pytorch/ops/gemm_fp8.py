@@ -309,6 +309,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         config: Float8QuantConfig,
     ):
         from primus_turbo.pytorch.ops.quantization import (
+            quant_fp8_blockwise_for_weight_dual_impl,
             quant_fp8_blockwise_for_weight_impl,
             quant_fp8_blockwise_impl,
         )
@@ -372,14 +373,60 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             a_fp8_col = None
             a_scale_inv_col = None
 
-        b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
+        # When the FlyDSL backend is active on the NT-forward Linear layout
+        # (trans_b=True), fold the launcher's standalone forward weight pre-shuffle
+        # (a full [N, K] fp8 HBM round-trip via shuffle_b + a dedicated elementwise
+        # kernel launch on EVERY forward) into the weight-quant store: emit a second
+        # FP8 copy already in the (16, 16) MFMA pre-shuffled layout in the same read
+        # of `b`. The plain block2d b_fp8 is still produced and saved to ctx so the
+        # dgrad (which applies a different, transposed pre-shuffle) is byte-for-byte
+        # unchanged. The forward GEMM receives the pre-shuffled operand + a flattened
+        # (1D) weight scale as the "already pre-shuffled" signal; the forward
+        # launcher detects the 1D scale and skips shuffle_b. Gated on FlyDSL actually
+        # handling this forward shape (so a non-FlyDSL fallback never receives the
+        # scrambled operand) and on the shuffle layout divisibility. This is a
+        # kernel-side fusion recomputed fresh each forward from `b` (no tensor-id /
+        # _version / weakref cache), so it transfers 1:1 to a real training step.
+        b_fwd_preshuffled = False
+        if (
+            trans_b
+            and config.block_size == 128
+            and GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        ):
+            try:
+                from primus_turbo.flydsl.gemm import flydsl_blockwise_gemm_supported
+
+                M_a = a.shape[0]
+                N_w, K_w = b.shape  # weight [N, K]
+                if (
+                    N_w % 16 == 0
+                    and K_w % 32 == 0
+                    and flydsl_blockwise_gemm_supported(M_a, N_w, K_w)
+                ):
+                    b_fwd_preshuffled = True
+            except Exception:
+                b_fwd_preshuffled = False
+
+        if b_fwd_preshuffled:
+            b_fp8, b_fp8_ps, b_scale_inv = quant_fp8_blockwise_for_weight_dual_impl(
+                b, b_dtype, block_size=config.block_size
+            )
+            # Pre-shuffled operand + 1D scale signal -> forward launcher skips shuffle_b.
+            b_fwd_data = b_fp8_ps
+            b_fwd_scale = b_scale_inv.view(-1)
+        else:
+            b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(
+                b, b_dtype, block_size=config.block_size
+            )
+            b_fwd_data = b_fp8
+            b_fwd_scale = b_scale_inv
 
         out = gemm_fp8_impl(
             a_fp8_row,
             a_scale_inv_row,
             trans_a,
-            b_fp8,
-            b_scale_inv,
+            b_fwd_data,
+            b_fwd_scale,
             trans_b,
             out_dtype,
             False,

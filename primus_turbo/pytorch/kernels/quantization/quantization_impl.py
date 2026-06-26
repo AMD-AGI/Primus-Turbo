@@ -20,6 +20,7 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_dual_kernel,
+    quant_fp8_blockwise_for_weight_dual_kernel,
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_row_col_kernel,
@@ -325,6 +326,68 @@ def quant_fp8_blockwise_for_weight_impl_meta(
         w_fp8 = w_fp8.squeeze(0)
         w_scales = w_scales.squeeze(0)
     return w_fp8, w_scales
+
+
+@torch.library.custom_op("primus_turbo::quant_fp8_blockwise_for_weight_dual_impl", mutates_args=())
+def quant_fp8_blockwise_for_weight_dual_impl(
+    w: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """2D blockwise weight quant emitting plain + forward-preshuffled FP8 in one pass.
+
+    Returns ``(w_fp8, w_fp8_ps, w_scales)`` where:
+      - ``w_fp8``    : plain block2d FP8 [M, N]   (for ctx / dgrad)
+      - ``w_fp8_ps`` : forward (16, 16) MFMA pre-shuffled FP8 [M, N], byte-identical
+                       to ``shuffle_b(w_fp8)`` (consumed directly by the FlyDSL
+                       forward GEMM, folding away its standalone pre-shuffle copy)
+      - ``w_scales`` : per-block scale [M // block, N // block] fp32 (layout
+                       unchanged vs the plain weight quant)
+
+    Triton-only (the HIP C++ fast path has no pre-shuffled store), 2D weights only.
+    """
+    assert w.dim() == 2, "Input must be 2D"
+    if not w.is_contiguous():
+        w = w.contiguous()
+
+    M, N = w.shape
+    w_fp8 = torch.empty((M, N), dtype=dtype, device=w.device)
+    w_fp8_ps = torch.empty((M, N), dtype=dtype, device=w.device)
+    w_scales = torch.empty(
+        (ceil_div(M, block_size), ceil_div(N, block_size)),
+        dtype=torch.float32,
+        device=w.device,
+    )
+    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    quant_fp8_blockwise_for_weight_dual_kernel[grid](
+        w,
+        w_fp8,
+        w_fp8_ps,
+        w_scales,
+        M,
+        N,
+        block_size,
+        torch.finfo(dtype).max,
+    )
+    return w_fp8, w_fp8_ps, w_scales
+
+
+@quant_fp8_blockwise_for_weight_dual_impl.register_fake
+def quant_fp8_blockwise_for_weight_dual_impl_meta(
+    w: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert w.dim() == 2, "Input must be 2D"
+    M, N = w.shape
+    w_fp8 = torch.empty((M, N), dtype=dtype, device=w.device)
+    w_fp8_ps = torch.empty((M, N), dtype=dtype, device=w.device)
+    w_scales = torch.empty(
+        (ceil_div(M, block_size), ceil_div(N, block_size)),
+        dtype=torch.float32,
+        device=w.device,
+    )
+    return w_fp8, w_fp8_ps, w_scales
 
 
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_segment_m_row_col_impl", mutates_args=())
