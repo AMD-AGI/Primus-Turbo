@@ -11,15 +11,7 @@ from typing import Protocol, runtime_checkable
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr.buffer_ops import (
-    _unwrap_value,
-    buffer_load,
-    create_buffer_resource,
-    create_llvm_ptr,
-    extract_base_index,
-    get_element_ptr,
-)
+from flydsl.expr.buffer_ops import buffer_load, create_buffer_resource
 
 from primus_turbo.flydsl.common.tile_spec import (
     BLOCK_K,
@@ -34,59 +26,8 @@ from primus_turbo.flydsl.utils.gemm_helper import ceildiv, make_value_attrs
 _LAYOUT_AGPR = {"nt": 0, "nn": 0, "tn": 128}
 
 
-# ── shared scoreboard / cross-rank prims (the comm handshake; gemm_helper has none) ──
-# Both fusion kernels (dispatch push+signal, combine signal+push) use the SAME
-# release/acquire fences + relaxed atomic add / load. Vendored once here so the
-# kernels reuse them; only ``dispatch_tile`` / ``combine_tile`` stay kernel-specific.
-_ORD = _llvm.AtomicOrdering
-_I4 = 4  # int32 byte stride / atomic alignment
-
-
-def _elem_ptr_i32(tensor, idx):
-    """LLVM ptr to int32 element ``tensor[idx]``."""
-    base = create_llvm_ptr(extract_base_index(tensor, address_space=1), 1)
-    byte_off = _unwrap_value(idx * fx.Int32(_I4))
-    return get_element_ptr(base, byte_offset=byte_off, elem_type=fx.T.i8())
-
-
-def _elem_ptr_i32_from_addr(addr_i64, idx):
-    """LLVM ptr to int32 element at ``(addr_i64)[idx]`` (runtime peer base addr)."""
-    base = create_llvm_ptr(_unwrap_value(addr_i64), 1)
-    byte_off = _unwrap_value(idx * fx.Int32(_I4))
-    return get_element_ptr(base, byte_offset=byte_off, elem_type=fx.T.i8())
-
-
-def _fence_release():
-    """System-scope release fence (L2 writeback) so peers/consumers see prior stores."""
-    _llvm.fence(_ORD.release, syncscope=None)
-
-
-def _fence_acquire():
-    """System-scope acquire fence (L1 invalidate) so this wave reads fresh data."""
-    _llvm.fence(_ORD.acquire, syncscope=None)
-
-
-def _atomic_add(tensor, idx, val):
-    """Relaxed atomic int32 add into local ``tensor[idx]`` (a scoreboard signal)."""
-    ptr = _elem_ptr_i32(tensor, idx)
-    _llvm.atomicrmw(
-        _llvm.AtomicBinOp.add, ptr, _unwrap_value(val), _ORD.monotonic, syncscope=None, alignment=_I4
-    )
-
-
-def _atomic_add_addr(addr_i64, idx, val):
-    """Relaxed atomic int32 add to ``(addr_i64)[idx]`` (peer scoreboard, system scope)."""
-    ptr = _elem_ptr_i32_from_addr(addr_i64, idx)
-    _llvm.atomicrmw(
-        _llvm.AtomicBinOp.add, ptr, _unwrap_value(val), _ORD.monotonic, syncscope=None, alignment=_I4
-    )
-
-
-def _ld_relaxed(tensor, idx):
-    """Relaxed atomic int32 load of ``tensor[idx]`` for spin polling."""
-    ptr = _elem_ptr_i32(tensor, idx)
-    op = _llvm.LoadOp(fx.T.i32(), ptr, ordering=_ORD.monotonic, syncscope=None, alignment=_I4)
-    return fx.arith.ArithValue(op.result, signed=True)
+# The shared scoreboard / cross-rank pointer-atomic prims now live in ``prims``
+# (``elem_ptr`` / ``atomic_add`` / ``ld`` / ``st``); kernels import them from there.
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -140,7 +81,7 @@ class GroupFp8TileSpec(DenseFp8TileSpec):
     @staticmethod
     def group_base(group_res, block_m, K, c_n):
         """The per-expert B slab scalar for ``emit(group_base=...)``: ``g * K * c_n``
-        (fp8 elements), g = tile_to_group[block_m]. Identical slab for NT (flat
+        (fp8 elements), g = tile_to_expert[block_m]. Identical slab for NT (flat
         B[G*N,K]: g*N*K) and NN/TN (flat B[G*K,N]: g*K*N) since N==c_n; the stock
         per-layout B base / b_k_mult absorb the row-major-vs-K-strided difference.
         Called caller-side (kernel body) where block_m is already known."""
