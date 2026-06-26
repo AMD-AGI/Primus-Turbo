@@ -127,7 +127,6 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
 
 
 class empty_suppress:
-
     def __enter__(self):
         return self
 
@@ -136,7 +135,6 @@ class empty_suppress:
 
 
 class suppress_stdout_stderr:
-
     def __enter__(self):
         self.outnull_file = open(os.devnull, "w")
         self.errnull_file = open(os.devnull, "w")
@@ -206,9 +204,9 @@ def bench_kineto(
     kernel_names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
     for name in kernel_names:
-        assert (
-            sum([name in line for line in prof_lines]) == 1
-        ), f"Errors of the kernel {name} in the profiling table"
+        assert sum([name in line for line in prof_lines]) == 1, (
+            f"Errors of the kernel {name} in the profiling table"
+        )
 
     # Save chrome traces
     if trace_path is not None:

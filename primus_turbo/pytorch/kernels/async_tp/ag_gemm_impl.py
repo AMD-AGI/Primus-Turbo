@@ -106,7 +106,6 @@ def pipelined_all_gather_copy_send(
         barrier_ptrs[dst_rank] += num_ranks * 4
 
     class _CustomHandle:
-
         @staticmethod
         def wait():
             torch.cuda.current_stream().wait_event(comm_event)

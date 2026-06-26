@@ -17,7 +17,6 @@ __all__ = ["RMSNorm"]
 
 
 class RMSNorm(torch.nn.Module):
-
     def __init__(
         self,
         normalized_shape: Union[int, list[int], Size],

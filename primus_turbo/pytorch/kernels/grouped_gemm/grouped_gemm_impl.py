@@ -27,7 +27,6 @@ _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 
 class GroupedGEMMCKBackend(KernelBackend):
-
     @staticmethod
     def can_handle(
         a: torch.Tensor,

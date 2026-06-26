@@ -55,11 +55,11 @@ def test_linear_accuracy(bs, seq_len, in_features, out_features, bias, dtype, en
 
     assert torch.allclose(x1.grad, x2.grad, **get_tolerances(dtype)), "Forward output mismatch"
 
-    assert torch.allclose(
-        primus_linear.weight.grad, torch_linear.weight.grad, **get_tolerances(dtype)
-    ), "Weight grad mismatch"
+    assert torch.allclose(primus_linear.weight.grad, torch_linear.weight.grad, **get_tolerances(dtype)), (
+        "Weight grad mismatch"
+    )
 
     if bias:
-        assert torch.allclose(
-            primus_linear.bias.grad, torch_linear.bias.grad, **get_tolerances(dtype)
-        ), "Bias grad mismatch"
+        assert torch.allclose(primus_linear.bias.grad, torch_linear.bias.grad, **get_tolerances(dtype)), (
+            "Bias grad mismatch"
+        )

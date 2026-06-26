@@ -91,7 +91,7 @@ try:
         float8_e4m3 = jnp.float8_e4m3fnuz
         float8_e5m2 = jnp.float8_e5m2fnuz
 except AttributeError:
-    raise RuntimeError("Your JAX build does not support FP8 types.")
+    raise RuntimeError("Your JAX build does not support FP8 types.") from None
 
 ###################################################
 
@@ -132,9 +132,9 @@ class Float8QuantConfig:
 
         if self.granularity == ScalingGranularity.MX_BLOCKWISE:
             mx_support_block_size = [32]
-            assert (
-                self.block_size in mx_support_block_size
-            ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+            assert self.block_size in mx_support_block_size, (
+                f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+            )
 
 
 @dataclass
@@ -145,15 +145,15 @@ class Float4QuantConfig:
     block_size: Optional[int] = None
 
     def __post_init__(self):
-        assert (
-            self.granularity == ScalingGranularity.MX_BLOCKWISE
-        ), "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
+        assert self.granularity == ScalingGranularity.MX_BLOCKWISE, (
+            "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
+        )
 
         if self.block_size is None:
             self.block_size = 32
 
         mx_support_block_size = [32]
-        assert (
-            self.block_size in mx_support_block_size
-        ), f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+        assert self.block_size in mx_support_block_size, (
+            f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+        )
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"

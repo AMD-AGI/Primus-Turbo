@@ -268,7 +268,7 @@ def benchmark_gemm_turbo(
                 N = shape[1]
                 K = shape[2]
 
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 if is_fp8:
                     print(
                         f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
@@ -284,7 +284,7 @@ def benchmark_gemm_turbo(
                         f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
                         f"M: {M}, N: {N}, K: {K}, dtype: bf16"
                     )
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 try:
                     if is_fp8:

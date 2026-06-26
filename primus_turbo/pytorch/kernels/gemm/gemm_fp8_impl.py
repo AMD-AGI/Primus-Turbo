@@ -36,9 +36,9 @@ from primus_turbo.triton.gemm.gemm_fp8_kernel import (
 def get_gemm_logical_shape(
     a: torch.Tensor, b: torch.Tensor, trans_a: bool, trans_b: bool
 ) -> Tuple[int, int, int]:
-    assert (
-        a.ndim == 2 and b.ndim == 2
-    ), f"Expected both a and b to be 2D tensors, but got a.ndim={a.ndim}, b.ndim={b.ndim}"
+    assert a.ndim == 2 and b.ndim == 2, (
+        f"Expected both a and b to be 2D tensors, but got a.ndim={a.ndim}, b.ndim={b.ndim}"
+    )
     M = a.shape[1] if trans_a else a.shape[0]
     Ka = a.shape[0] if trans_a else a.shape[1]
     Kb = b.shape[1] if trans_b else b.shape[0]

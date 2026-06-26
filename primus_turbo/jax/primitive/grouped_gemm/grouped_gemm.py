@@ -136,8 +136,8 @@ def _compute_group_offs_batch_rule(args, axes):
 batching.primitive_batchers[compute_group_offs_p] = _compute_group_offs_batch_rule
 # cumsum is cheap and shape-stable, so the SPMD path needs no dynamic-slice; the
 # fancy batcher (required once spmd_axis_name is set) just reuses the plain rule.
-batching.fancy_primitive_batchers[compute_group_offs_p] = (
-    lambda axis_data, args, axes: _compute_group_offs_batch_rule(args, axes)
+batching.fancy_primitive_batchers[compute_group_offs_p] = lambda axis_data, args, axes: (
+    _compute_group_offs_batch_rule(args, axes)
 )
 
 

@@ -54,9 +54,9 @@ def _get_recv_x_scale_shape(x_scales: jnp.ndarray, num_worst_tokens: int) -> Sha
 
 
 def _get_num_rdma_ranks(ep_size: int) -> int:
-    assert (
-        ep_size % NUM_MAX_NVL_PEERS == 0
-    ), f"internode ep_size must be divisible by NUM_MAX_NVL_PEERS={NUM_MAX_NVL_PEERS}, got {ep_size}"
+    assert ep_size % NUM_MAX_NVL_PEERS == 0, (
+        f"internode ep_size must be divisible by NUM_MAX_NVL_PEERS={NUM_MAX_NVL_PEERS}, got {ep_size}"
+    )
     return ep_size // NUM_MAX_NVL_PEERS
 
 

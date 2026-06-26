@@ -218,9 +218,9 @@ def generate_summary_table(data_dir, date_str, gpus, output_file=None):
 
     summary_df = pd.DataFrame(summary_data)
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  Summary Table - GPU: {', '.join(gpus_to_process)}")
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
     print(tabulate(summary_df, headers="keys", tablefmt="grid", showindex=False))
 
     if output_file:

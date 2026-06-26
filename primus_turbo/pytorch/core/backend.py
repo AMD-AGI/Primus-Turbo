@@ -24,7 +24,7 @@ from primus_turbo.triton.utils.origami import origami_clear_caches
 
 try:
     HAVE_DEEP_EP = True
-    import deep_ep  # fmt: skip
+    import deep_ep  # noqa: F401
 except ImportError:
     HAVE_DEEP_EP = False
 
@@ -245,9 +245,9 @@ class GlobalBackendManager:
                 )
 
             if backend == BackendType.DEEP_EP:
-                assert (
-                    HAVE_DEEP_EP
-                ), "DeepEP is required for this module. Install from https://github.com/uccl-project/uccl or https://github.com/ROCm/DeepEP"
+                assert HAVE_DEEP_EP, (
+                    "DeepEP is required for this module. Install from https://github.com/uccl-project/uccl or https://github.com/ROCm/DeepEP"
+                )
             return backend
 
         return None
@@ -345,7 +345,7 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> str:
     return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
 
 
-class AutoKernelDispatcher(ABC):
+class AutoKernelDispatcher(ABC):  # noqa: B024
     """
     Base class for auto kernel dispatcher.
     """

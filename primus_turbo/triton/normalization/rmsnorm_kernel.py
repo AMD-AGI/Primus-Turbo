@@ -24,6 +24,7 @@ program over its ``ROWS_PER_BLOCK`` rows, so the partial buffer is
 huge-B shapes (e.g. q_norm in MoE attention) where ``(B, H)`` would otherwise
 cost an unreasonable amount of workspace memory.
 """
+
 from __future__ import annotations
 
 import triton

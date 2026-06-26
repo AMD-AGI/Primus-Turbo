@@ -125,9 +125,9 @@ def check_quantized_tensor(
 
     if axis is not None:
         normalized_axis = _normalize_axis(axis, quantized_tensor.qdata.ndim)
-        assert (
-            quantized_tensor.quantized_axis == normalized_axis
-        ), f"QuantizedTensor quantized_axis {quantized_tensor.quantized_axis} does not match axis={normalized_axis}"
+        assert quantized_tensor.quantized_axis == normalized_axis, (
+            f"QuantizedTensor quantized_axis {quantized_tensor.quantized_axis} does not match axis={normalized_axis}"
+        )
 
     if scaling_recipe is not None:
         assert quantized_tensor.scaling_recipe == scaling_recipe, (
@@ -226,15 +226,15 @@ class QuantizedTensor(torch.Tensor):
 
         is_grouped_tensor = group_lens is not None
         if is_grouped_tensor:
-            assert (
-                granularity in _SUPPORTED_GROUPED_QUANTIZED_GRANS
-            ), f"Unsupported grouped granularity {granularity}"
-            assert (
-                hp_tensor.ndim == 2
-            ), f"Grouped quantized tensor expects a 2D packed-M tensor, got {hp_tensor.ndim}D"
-            assert (
-                dest_dtype in _SUPPORTED_QUANTIZED_DTYPES and dest_dtype != float4_e2m1fn_x2
-            ), "Unsupported quantized dtype (FP4 not supported for grouped activations)"
+            assert granularity in _SUPPORTED_GROUPED_QUANTIZED_GRANS, (
+                f"Unsupported grouped granularity {granularity}"
+            )
+            assert hp_tensor.ndim == 2, (
+                f"Grouped quantized tensor expects a 2D packed-M tensor, got {hp_tensor.ndim}D"
+            )
+            assert dest_dtype in _SUPPORTED_QUANTIZED_DTYPES and dest_dtype != float4_e2m1fn_x2, (
+                "Unsupported quantized dtype (FP4 not supported for grouped activations)"
+            )
         else:
             assert granularity in _SUPPORTED_QUANTIZED_GRANS, f"Unsupported granularity {granularity}"
 
@@ -248,14 +248,14 @@ class QuantizedTensor(torch.Tensor):
                 if dest_dtype == float4_e2m1fn_x2:
                     supported, reason = check_mxfp4_support()
                     assert supported, reason
-                    assert (
-                        block_size == MXFP4_BLOCK_SIZE
-                    ), "block_size must be MXFP4_BLOCK_SIZE for MX_BLOCKWISE"
+                    assert block_size == MXFP4_BLOCK_SIZE, (
+                        "block_size must be MXFP4_BLOCK_SIZE for MX_BLOCKWISE"
+                    )
                 elif dest_dtype in [float8_e4m3, float8_e5m2]:
                     supported, reason = check_mxfp8_support()
-                    assert (
-                        block_size == MXFP8_BLOCK_SIZE
-                    ), "block_size must be MXFP8_BLOCK_SIZE for MX_BLOCKWISE"
+                    assert block_size == MXFP8_BLOCK_SIZE, (
+                        "block_size must be MXFP8_BLOCK_SIZE for MX_BLOCKWISE"
+                    )
                     assert supported, reason
 
                 assert scaling_recipe is not None, "scaling_recipe must be provided for MX_BLOCKWISE"
@@ -320,7 +320,7 @@ class QuantizedTensor(torch.Tensor):
             assert granularity == ScalingGranularity.MX_BLOCKWISE
             # MXFP4 single-direction kernel only supports 2D input with axis in {0, 1};
             assert data.ndim == 2, (
-                f"FP4 single-direction quantization requires a 2D tensor, " f"got {data.ndim}D."
+                f"FP4 single-direction quantization requires a 2D tensor, got {data.ndim}D."
             )
 
             data_, scale_inv = quantize_fp4(
@@ -414,7 +414,7 @@ class QuantizedTensor(torch.Tensor):
                 scaling_recipe=self._scaling_recipe,
             )
         else:
-            assert False, "Unsupported dtype"
+            raise AssertionError("Unsupported dtype")
 
         # TODO(ruibin): fused unpad in dequantize kernel
         if out.ndim == 2:
@@ -422,7 +422,7 @@ class QuantizedTensor(torch.Tensor):
         elif out.ndim == 3:
             out = out[:, :, : self.size(-1)].contiguous()
         else:
-            assert False, "Unsupported ndim"
+            raise AssertionError("Unsupported ndim")
 
         return out
 
@@ -518,7 +518,7 @@ class QuantizedTensor(torch.Tensor):
 
         packing = _get_packing_factor(tensor)
         assert padded_target_shape[-1] % packing == 0, (
-            f"padded inner dim {padded_target_shape[-1]} must be divisible by " f"packing factor {packing}"
+            f"padded inner dim {padded_target_shape[-1]} must be divisible by packing factor {packing}"
         )
         data_target_shape = (
             *padded_target_shape[:-1],

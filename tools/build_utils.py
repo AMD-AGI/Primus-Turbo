@@ -280,9 +280,9 @@ def get_gpu_arch(gpu_id: int = 0) -> str:
             check=True,
         )
     except FileNotFoundError:
-        raise RuntimeError("rocminfo not found. Please ensure ROCm is installed.")
+        raise RuntimeError("rocminfo not found. Please ensure ROCm is installed.") from None
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"rocminfo failed: {e.stderr}")
+        raise RuntimeError(f"rocminfo failed: {e.stderr}") from e
 
     matches = GPU_ARCH_PATTERN.findall(result.stdout)
 

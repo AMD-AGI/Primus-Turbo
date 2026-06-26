@@ -20,7 +20,7 @@ from primus_turbo.common.aiter_utils import (
     check_aiter_version_once,
     raise_aiter_missing,
 )
-from primus_turbo.pytorch.core.backend import KernelBackend
+from primus_turbo.pytorch.core.backend import KernelBackend, _format_kwargs
 
 _AITER_ATTN_KERNELS = None
 
@@ -80,7 +80,6 @@ _SUPPORTED_QKV_FORMATS = ["sbhd", "bshd", "bhsd"]
 
 
 class AttnFwdAiterBackend(KernelBackend):
-
     @staticmethod
     def can_handle(
         q: torch.Tensor,
@@ -199,7 +198,6 @@ class AttnFwdAiterBackend(KernelBackend):
 
 
 class AttnBwdAiterBackend(KernelBackend):
-
     @staticmethod
     def can_handle(
         dout: torch.Tensor,
@@ -523,7 +521,6 @@ def _attention_aiter_backward_impl_fake(
 
 
 class AttnFwdAiterVarlenBackend(KernelBackend):
-
     @staticmethod
     def can_handle(
         q: torch.Tensor,
@@ -608,7 +605,6 @@ class AttnFwdAiterVarlenBackend(KernelBackend):
 
 
 class AttnBwdAiterVarlenBackend(KernelBackend):
-
     @staticmethod
     def can_handle(
         dout: torch.Tensor,
