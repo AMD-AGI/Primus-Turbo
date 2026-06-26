@@ -16,3 +16,4 @@ logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
 .coverage*
+*.csv

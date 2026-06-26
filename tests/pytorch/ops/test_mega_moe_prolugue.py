@@ -5,7 +5,7 @@
 ###############################################################################
 
 """EP8 cross-rank correctness + perf test for the fused MoE dispatch-prologue
-FlyDSL kernel (``primus_turbo.flydsl.mega.mega_moe_prologue_kernel``).
+FlyDSL kernel (``primus_turbo.flydsl.mega.dispatch_prologue_kernel``).
 
 Each of the ``world`` ranks routes its own ``[T, K]`` topk, then the prologue
 builds the EP dispatch plan over a single symmetric allocation (``SymmBuffer``
@@ -30,11 +30,11 @@ import torch
 import torch.distributed as dist
 
 try:
-    from primus_turbo.flydsl.mega.mega_moe_prologue_kernel import (
-        get_prologue_workspace,
-        mega_moe_prologue,
+    from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
+        dispatch_prologue,
+        get_dispatch_prologue_workspace,
     )
-    from primus_turbo.pytorch.ops.moe.mega_moe_fused import get_symm_buffer_for_mega_moe
+    from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
 
     _HAVE_FLYDSL = True
 except Exception as _e:  # flydsl only present inside the dev container
@@ -110,7 +110,7 @@ def _ep_reference(all_idx, rank, num_topk, num_experts, world, block_m, pool_cap
             source_off_pe[e] = acc
             acc += int(count[ct])
 
-    # tile_to_group (local expert id, sentinel = epr) + expected (sources per block) for own experts
+    # tile_to_expert (local expert id, sentinel = epr) + expected (sources per block) for own experts
     n_mblk = pool_capacity // bm
     ttg = torch.full((n_mblk,), epr, dtype=torch.int64)
     expected = torch.zeros(n_mblk, dtype=torch.int64)
@@ -167,7 +167,7 @@ def _check_tables(
     # the 5 per-expert scratch tables live packed in the prologue's cached internal
     # workspace ([5 * E]); the plan output tables come from the prologue's RETURN
     # (allocated internally); origin_rank/origin_slot/meta_scalars stay symmetric
-    ws = get_prologue_workspace(num_experts, device=topk_idx.device).cpu().to(torch.int64)
+    ws = get_dispatch_prologue_workspace(num_experts, device=topk_idx.device).cpu().to(torch.int64)
     E = num_experts
     ws_views = {
         "send_local": ws[0:E],
@@ -176,15 +176,16 @@ def _check_tables(
         "source_offset_per_expert": ws[3 * E : 4 * E],
         "pool_base": ws[4 * E : 5 * E],
     }
-    # plan = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
+    # plan = (send_task_table[E,4], src_token_table[pool,2], src_token_weight[pool])
+    send_task_table, src_token_table = plan[0], plan[1]
     outs = {
-        "destination": plan[0],
-        "start": plan[1],
-        "count": plan[2],
-        "source_offset_out": plan[3],
-        "source_tokens": plan[4],
-        "source_topk_slot": plan[5],
-        "tile_to_group": ret_ttg,
+        "destination": send_task_table[:, 0],  # dst_rank
+        "start": send_task_table[:, 1],  # dst_offset
+        "count": send_task_table[:, 2],  # count
+        "source_offset_out": send_task_table[:, 3],  # src_offset
+        "source_tokens": src_token_table[:, 0],  # token id
+        "source_topk_slot": src_token_table[:, 1],  # top-k slot
+        "tile_to_expert": ret_ttg,
         "expected": ret_expected,
     }
     g = lambda name: (
@@ -211,7 +212,7 @@ def _check_tables(
     eq("start", g("start"), ref["start"])
     eq("source_offset_out", g("source_offset_out"), ref["source_off_out"])
     eq("source_offset_per_expert", g("source_offset_per_expert"), ref["source_off_pe"])
-    eq("tile_to_group", g("tile_to_group"), ref["ttg"])
+    eq("tile_to_expert", g("tile_to_expert"), ref["ttg"])
     eq("expected", g("expected"), ref["expected"])
     meta = g("meta_scalars")
     eq(
@@ -235,7 +236,7 @@ def _check_tables(
     pos_expert = torch.repeat_interleave(order, counts_r[order])
     src_tok = g("source_tokens")[:used]
     src_slot = g("source_topk_slot")[:used]
-    src_w = plan[6].cpu()[:used]  # source_weight (f32) from the returned plan handle
+    src_w = plan[2].cpu()[:used]  # src_token_weight (f32) from the returned plan handle
     got = set(zip(pos_expert.tolist(), src_tok.tolist(), src_slot.tolist()))
     want = set(zip(e_v.tolist(), tok_v.tolist(), slot_v.tolist()))
     assert len(want) == used, "reference has duplicate (expert, token, slot) pairs"
@@ -259,6 +260,52 @@ def _check_tables(
         int(((oslot[occ] >= 0) & (oslot[occ] < num_topk * symm.num_tokens)).sum()) == occupied
     ), "origin_slot range"
     msgs.append(f"  {'origin_rank/slot(cross-rank)':26s} OK")
+
+    # ---- token dedup map1 (source side): exactly one primary per (token, dst_rank) ----
+    # source_dedup[src_slot]: 1 = secondary (skips XGMI push), 0 = primary (pushes).
+    (e_v // epr)
+    sdedup = plan[3].cpu().to(torch.int64)[:used]
+    # src slots are ordered le-major dest-minor (same `pos_expert` order as the scatter);
+    # rebuild each slot's (token, dst_rank) and require exactly one primary per group.
+    src_dst_rank = (pos_expert // epr).cpu()
+    keys = src_tok * world + src_dst_rank  # (token, dst_rank) group key
+    n_src_primaries = int(torch.unique(keys).numel())
+    assert (
+        int((sdedup == 0).sum()) == n_src_primaries
+    ), f"source primaries {int((sdedup == 0).sum())} != unique (token, dst_rank) {n_src_primaries}"
+    # per-group exactly one primary (sum of primaries per key == 1)
+    order_k = torch.argsort(keys)
+    ks, ps = keys[order_k], (sdedup[order_k] == 0).to(torch.int64)
+    grp_primary = torch.zeros(n_src_primaries, dtype=torch.int64, device="cpu").index_add_(
+        0, torch.unique(ks, return_inverse=True)[1], ps
+    )
+    assert torch.equal(
+        grp_primary, torch.ones_like(grp_primary)
+    ), "a (token,dst_rank) group lacks exactly 1 primary"
+    msgs.append(f"  {'dedup source_dedup(map1)':26s} OK")
+
+    # ---- token dedup map2 (dest side): dedup_src_row links secondaries to their primary ----
+    dsr = g("dedup_src_row")
+    occ_rows = torch.nonzero(occ, as_tuple=True)[0]
+    tok_of = oslot // num_topk  # source token per occupied dest row
+    for r in occ_rows.tolist():
+        p = int(dsr[r])
+        if p < 0:
+            continue  # primary
+        assert bool(occ[p]), f"dedup_src_row[{r}]={p} points at an empty row"
+        assert int(dsr[p]) == -1, f"secondary {r} -> {p} but {p} is itself a secondary"
+        assert int(orank[r]) == int(orank[p]) and int(tok_of[r]) == int(
+            tok_of[p]
+        ), f"secondary {r} -> primary {p} mismatch (origin rank/token)"
+    # each (origin_rank, token) group received on this rank has exactly one primary
+    grp = orank[occ] * (num_topk * symm.num_tokens) + tok_of[occ]
+    inv = torch.unique(grp, return_inverse=True)[1]
+    prim = (dsr[occ] == -1).to(torch.int64)
+    per_grp = torch.zeros(int(inv.max()) + 1, dtype=torch.int64, device="cpu").index_add_(0, inv, prim)
+    assert torch.equal(
+        per_grp, torch.ones_like(per_grp)
+    ), "an (origin_rank,token) group lacks exactly 1 primary"
+    msgs.append(f"  {'dedup dedup_src_row(map2)':26s} OK")
 
     print("\n".join(msgs))
 
@@ -284,18 +331,10 @@ def _bench(fn, warmup=5, iters=50):
 # Per-process entry
 # ---------------------------------------------------------------------------
 def _prologue_kwargs(symm):
-    """Symmetric/scratch kwargs for mega_moe_prologue; the plan output tables are
-    allocated + returned by the primitive itself (not passed in)."""
+    """Kwargs for dispatch_prologue: a single SymLayout struct names every symmetric
+    sub-buffer; the plan output tables are allocated + returned by the primitive."""
     return dict(
-        buffer_base=symm.buffer_base,
-        buffer_offsets=symm.buffer_offsets,
-        origin_rank=symm.origin_rank,
-        origin_slot=symm.origin_slot,
-        meta_scalars=symm.meta_scalars,
-        grid_barrier_state=symm.grid_barrier_state,
-        profile=symm.profile,
-        scoreboard=symm.scoreboard,
-        barrier_local=symm.barrier_local,
+        sym_layout=symm.make_sym_layout(),
         num_tokens=symm.num_tokens,
         num_topk=symm.num_topk,
         num_experts=symm.num_experts,
@@ -332,6 +371,8 @@ def _run(local_rank, world, args):
     )
 
     topk_idx, topk_w = _make_routing(T, K, E, seed=100 + rank, drop_frac=args.drop_frac)
+    if getattr(args, "idx_dtype", "int64") == "int32":
+        topk_idx = topk_idx.to(torch.int32)
     kwargs = _prologue_kwargs(symm)
 
     if rank == 0:
@@ -342,27 +383,41 @@ def _run(local_rank, world, args):
 
     # ---- correctness ----
     symm.group.barrier()
-    plan, tile_to_group, expected, _, _, num_pool_blocks, _ = mega_moe_prologue(topk_idx, topk_w, **kwargs)
+    plan, tile_to_expert, tile_expected, _, _, num_pool_blocks, _ = dispatch_prologue(
+        topk_idx, topk_w, **kwargs
+    )
     torch.cuda.synchronize()
     symm.group.barrier()
     assert num_pool_blocks == symm.pool_capacity // BM
-    assert plan[0].numel() == E  # dst_rank has one row per comm task (== num_experts)
+    assert plan[0].shape == (E, 4)  # send_task_table: one row per comm task (== num_experts)
 
     all_idx = [torch.empty_like(topk_idx) for _ in range(world)]
     dist.all_gather(all_idx, topk_idx, group=group)
     all_idx = [t.cpu() for t in all_idx]
     ref = _ep_reference(all_idx, rank, K, E, world, BM, symm.pool_capacity)
     _check_tables(
-        symm, ref, plan, tile_to_group, expected, topk_idx, topk_w, K, E, world, rank, BM, symm.pool_capacity
+        symm,
+        ref,
+        plan,
+        tile_to_expert,
+        tile_expected,
+        topk_idx,
+        topk_w,
+        K,
+        E,
+        world,
+        rank,
+        BM,
+        symm.pool_capacity,
     )
     if rank == 0:
-        print("[mega_moe_prologue] correctness PASS (all ranks)")
+        print("[dispatch_prologue] correctness PASS (all ranks)")
 
     # ---- perf: latency on rank 0 (cross-rank barriers synchronize the launches) ----
     if args.iters > 0:
 
         def _fn():
-            mega_moe_prologue(topk_idx, topk_w, **kwargs)
+            dispatch_prologue(topk_idx, topk_w, **kwargs)
 
         symm.group.barrier()
         t_us = _bench(_fn, iters=args.iters)
@@ -387,6 +442,7 @@ def _build_argparser():
     ap.add_argument("--block-m", type=int, default=256)
     ap.add_argument("--drop-frac", type=float, default=0.0)
     ap.add_argument("--iters", type=int, default=50)
+    ap.add_argument("--idx-dtype", choices=["int32", "int64"], default="int64")
     return ap
 
 
@@ -405,7 +461,7 @@ def main():
     if not _HAVE_FLYDSL:
         raise SystemExit(f"flydsl not importable: {_IMPORT_ERR}")
     torch.multiprocessing.spawn(_run, args=(args.num_processes, args), nprocs=args.num_processes)
-    print("[mega_moe_prologue] PASS")
+    print("[dispatch_prologue] PASS")
 
 
 if __name__ == "__main__":
