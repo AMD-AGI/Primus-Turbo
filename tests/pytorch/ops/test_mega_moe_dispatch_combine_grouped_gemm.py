@@ -11,7 +11,7 @@ EP8 expert-parallel forward, for both load-balanced and round-robin routing.
 
 The mega pipeline wires four FlyDSL kernels over HIP-IPC symmetric memory:
 
-  1. mega_moe_prologue        -- build the cross-rank dispatch plan from topk
+  1. dispatch_prologue        -- build the cross-rank dispatch plan from topk
   2. dispatch_grouped_gemm    -- cross-rank dispatch PUSH + grouped L1 GEMM (NT)
   3. swiglu (epilogue)        -- fused SwiGLU activation
   4. grouped_gemm_combine     -- grouped L2 GEMM (NT) + cross-rank combine PUSH
@@ -44,13 +44,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 import torch.nn.functional as F  # noqa: E402
 
 import primus_turbo.pytorch as turbo  # noqa: E402
-from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
 
 # fused mega MoE forward + single-allocation symmetric buffer (implementation under test)
-from primus_turbo.pytorch.ops.moe.mega_moe_fused import (  # noqa: E402
+from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
-    mega_moe_fused,
 )
+from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
+from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) Benchmark helper: warmup, then an L2-cache flush before each timed iter.

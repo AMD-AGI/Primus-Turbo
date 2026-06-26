@@ -31,17 +31,17 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, range_constexpr
 from flydsl.expr.buffer_ops import (
-    _unwrap_value,
     buffer_load,
     buffer_store,
     create_buffer_resource,
     create_buffer_resource_from_addr,
+    extract_base_index,
 )
+from flydsl.expr.typing import AddressSpace, PointerType
 
 # GEMM tile + LDS struct shared with the dispatch path (identical compute).
 from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
@@ -54,13 +54,19 @@ from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
 # per-tile GEMM closure by layout (NT forward, NN dgrad, TN wgrad); all grouped via b_group_base
 _GEMM_TILE = {"nt": gemm_bf16_nt_tile, "nn": gemm_bf16_nn_tile, "tn": gemm_bf16_tn_tile}
 from primus_turbo.flydsl.common.tile_spec import _emit_if_then
-from primus_turbo.flydsl.mega.mega_group_tile_spec import (
-    _elem_ptr_i32,
-    _elem_ptr_i32_from_addr,
-)
 
 # cheap fence = s_waitcnt drain + compiler barrier; pairs with relaxed atomics (no acquire/release).
-from primus_turbo.flydsl.mega.mega_moe_prologue_kernel import _mem_fence
+from primus_turbo.flydsl.mega.dispatch_prologue_kernel import _mem_fence
+
+# scalar/atomic prims over a raw i64 base + element offset (scope-selectable, monotonic).
+# scope="agent" = device-wide relaxed (local scoreboard / flag); scope="sys" = system
+# (cross-rank flag publish, pairs with the agent-scope consumer load on uncached signal mem).
+from primus_turbo.flydsl.mega.prims import atomic_add, ld, st
+
+# single SymLayout struct (two-heap delta tables) names every symmetric sub-buffer;
+# the active workspace is fetched by the host wrappers (no-group call -> current buffer).
+from primus_turbo.flydsl.mega.sym_layout import SymLayout
+from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs
 
 _WARP = 64  # wavefront (gfx950)
@@ -72,43 +78,11 @@ _PVEC = 8  # bf16 elems/lane/step (16 B = b128)
 # 8 warps -> 8 concurrent peer streams per block
 _NUM_WARPS = _BLOCK_THREADS // _WARP
 
-_I4 = 4
-_ORD = _llvm.AtomicOrdering
-# device-scope scoreboard atomics (the coherence domain, not an ordering)
-_SCOPE = "agent"
 
-
-def _atomic_add_relaxed(tensor, idx, val):
-    """Relaxed (agent-scope) atomic int32 add into ``tensor[idx]`` (scoreboard done-count)."""
-    ptr = _elem_ptr_i32(tensor, idx)
-    _llvm.atomicrmw(
-        _llvm.AtomicBinOp.add, ptr, _unwrap_value(val), _ORD.monotonic, syncscope=_SCOPE, alignment=_I4
-    )
-
-
-def _ld_relaxed(tensor, idx):
-    """Relaxed (agent-scope) atomic int32 load of ``tensor[idx]`` for spin polling."""
-    ptr = _elem_ptr_i32(tensor, idx)
-    op = _llvm.LoadOp(fx.T.i32(), ptr, ordering=_ORD.monotonic, syncscope=_SCOPE, alignment=_I4)
-    return fx.arith.ArithValue(op.result, signed=True)
-
-
-def _st_relaxed_addr(addr_i64, idx, val):
-    """Relaxed system-scope atomic int32 store to ``(addr_i64)[idx]`` -- cross-rank flag
-    publish (monotonic, sys scope; pairs with the consumer's relaxed-atomic load)."""
-    ptr = _elem_ptr_i32_from_addr(addr_i64, idx)
-    _llvm.StoreOp(
-        _unwrap_value(val), ptr, ordering=_ORD.monotonic, syncscope=None, alignment=_I4
-    )  # syncscope=None == system scope
-
-
-def _st_relaxed(tensor, idx, val):
-    """Relaxed (agent-scope) atomic int32 store to ``tensor[idx]`` (local scoreboard reset)."""
-    ptr = _elem_ptr_i32(tensor, idx)
-    _llvm.StoreOp(_unwrap_value(val), ptr, ordering=_ORD.monotonic, syncscope=_SCOPE, alignment=_I4)
-
-
-# combine PUSH closure: each warp streams its row chunk to comb_addrs[origin][slot] (+flag if set).
+# combine PUSH closure: each warp streams its row chunk to the peer comb[origin][slot]
+# (+flag if set). Peer addresses are local_base + per-peer DELTA[origin] from the SymLayout's
+# two delta tables: comb/barrier live in the SIGNAL heap (signal_delta_res), combine_gate in
+# the MAIN heap (main_delta_res). One i64 delta load + add == the old absolute-base table load.
 def combine_bf16_tile(
     *,
     thread_index,
@@ -119,11 +93,13 @@ def combine_bf16_tile(
     l2y_resource,
     origin_rank_res,
     origin_slot_res,
-    comb_addr_res,
-    barrier_addr_res=None,
+    comb_base,
+    signal_delta_res,
+    barrier_base=None,
     enable_barrier=False,
     grad_gate_res=None,
-    gate_addr_res=None,
+    gate_base=None,
+    main_delta_res=None,
     gate_records=0,
     with_gate=False,
 ):
@@ -150,7 +126,7 @@ def combine_bf16_tile(
 
             def _emit_row():
                 slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
-                comb_addr = buffer_load(comb_addr_res, origin, vec_width=1, dtype=fx.T.i64())
+                comb_addr = comb_base + buffer_load(signal_delta_res, origin, vec_width=1, dtype=fx.T.i64())
                 peer = create_buffer_resource_from_addr(comb_addr, num_records_bytes=comb_records)
                 slot_base = slot * fx.Int32(out_features)
                 row_off = row * fx.Int32(out_features)
@@ -179,15 +155,17 @@ def combine_bf16_tile(
                     # token*topk+k); same value/slot across lanes (idempotent, like the flag
                     # store below). 1 f32, ~free vs the hidden-wide push.
                     gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
-                    gate_addr = buffer_load(gate_addr_res, origin, vec_width=1, dtype=fx.T.i64())
+                    gate_addr = gate_base + buffer_load(main_delta_res, origin, vec_width=1, dtype=fx.T.i64())
                     gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
                     buffer_store(gate_value, gate_peer, slot)
                 if enable_barrier:
                     # drain payload stores (vmcnt), then publish the flag via a relaxed atomic
                     # store (monotonic, sys scope -> cross-rank visible; pairs with consumer load).
-                    barrier_addr = buffer_load(barrier_addr_res, origin, vec_width=1, dtype=fx.T.i64())
+                    barrier_addr = barrier_base + buffer_load(
+                        signal_delta_res, origin, vec_width=1, dtype=fx.T.i64()
+                    )
                     _mem_fence()
-                    _st_relaxed_addr(barrier_addr, slot, fx.Int32(1))
+                    st(barrier_addr, slot, fx.Int32(1), scope="sys")
 
             _emit_if_then(origin_ok, _emit_row)
 
@@ -232,11 +210,13 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
         output_res,
         topk_indices_res,
         num_tokens_res,
-        barrier_local,
+        barrier_base,
         topk_weights_res,
         gate_local_res,
         d_topk_w_res,
     ):
+        # barrier_base: i64 base (SymLayout signal-heap ptr) or a tensor base index; ld/st
+        # scope="agent" read/reset the local per-slot flags on uncached signal memory.
         # total_warps: runtime worker-warp count (const for static roles, dynamic for empty blocks)
         f32_vec = fx.T.VectorType.get([_PVEC], fx.T.f32())
         bf16_vec = fx.T.VectorType.get([_PVEC], fx.T.bf16())
@@ -257,10 +237,10 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
                     if topk_index >= fx.Int32(0):
                         if topk_index < fx.Int32(num_experts):
                             if lane == fx.Int32(0):
-                                flag = _ld_relaxed(barrier_local, slot)
+                                flag = ld(barrier_base, slot, scope="agent")
                                 while flag < fx.Int32(0):
                                     fx.rocdl.s_sleep(fx.Int32(1))
-                                    flag = _ld_relaxed(barrier_local, slot)
+                                    flag = ld(barrier_base, slot, scope="agent")
                 _mem_fence()  # order payload reads after the flag (s_waitcnt drain)
 
             token_row_off = token * fx.Int32(topk) * fx.Int32(out_features)  # token's first combine row
@@ -290,7 +270,7 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
                     if topk_index >= fx.Int32(0):
                         if topk_index < fx.Int32(num_experts):
                             if lane == fx.Int32(0):
-                                _st_relaxed(barrier_local, slot, fx.Int32(0))
+                                st(barrier_base, slot, fx.Int32(0), scope="agent")
                     if with_gate:
                         # d_topk_w[slot] = gate_local[slot] for valid routes else 0, into a fresh
                         # buffer (folds the host combine_gate * (topk_idx>=0) mul + clone).
@@ -326,13 +306,13 @@ def _compile(
     topk,
     num_experts,
     rank,
+    num_ranks,
     nt_vmcnt=3,
     waves_per_eu=2,
     agpr_alloc=0,
     out_fp16=False,
     layout="nt",
     apply_weights=False,
-    reduce_active=False,
     with_gate=False,
 ):
     K = hidden_size
@@ -347,34 +327,25 @@ def _compile(
     gemm_grid_blocks = worst_case_tiles * n_blocks  # compile-time empty+real GEMM block count
     comb_records = combine_slots * out_features * 2  # bf16 peer combine-buffer bound (bytes)
     gate_records = combine_slots * 4  # f32 gate slots per peer (backward d_topk_w scatter)
-    # role 1 raises per-slot flags whenever any reducer (dedicated or empty-block) runs
-    with_barrier = reduce_active
+    delta_records = num_ranks * 8  # i64[num_ranks] per-peer delta table (bytes)
+    pool_records = pool_capacity * 4  # i32[pool_capacity] origin tables (bytes)
     dedicated_reduce_warps = num_reduce_cu * _NUM_WARPS  # const worker-warp count for [combine,reduce)
     gemm_base = num_combine_cu + num_reduce_cu
     topk_reduce = _get_topk_reduce(True, apply_weights, with_gate)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-    def combine_grouped(
+    def grouped_gemm_combine_kernel(
         ACT: fx.Tensor,
         WEIGHTS: fx.Tensor,
-        L2Y: fx.Tensor,
         TILE_TO_GROUP: fx.Tensor,
-        SB_L2: fx.Tensor,
-        ORIGIN_RANK: fx.Tensor,
-        ORIGIN_SLOT: fx.Tensor,
-        COMB_ADDRS: fx.Tensor,
-        BARRIER_ADDRS: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
         OUTPUT: fx.Tensor,
-        COMB_LOCAL: fx.Tensor,
-        BARRIER_LOCAL: fx.Tensor,
         TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor,
         TOPK_WEIGHTS: fx.Tensor,
         GRAD_GATE: fx.Tensor,
-        GATE_ADDRS: fx.Tensor,
-        GATE_LOCAL: fx.Tensor,
         D_TOPK_W: fx.Tensor,
+        sym_layout: SymLayout,
         c_n: fx.Int32,
     ):
         thread_index = fx.thread_idx.x
@@ -383,23 +354,53 @@ def _compile(
         reduce_cu = fx.Int32(num_reduce_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
+        # ── all cross-rank/scratch buffers come from the single SymLayout ──
+        # local region bases (i64); origin tables + comb/gate locals built as buffer resources
+        sb_l2_base = sym_layout.sb_l2_ptr
+        comb_base = sym_layout.comb_ptr
+        barrier_base = sym_layout.barrier_local_ptr
+        # L2Y = the GEMM scratch (l2_token_buffer region): role 3 writes it (C), role 1 reads
+        # it (combine PUSH source). bf16 view for the GEMM C; buffer resource for the push read.
+        l2y_ptr_ty = PointerType.get(
+            elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
+        )
+        l2y_tensor = fx.make_view(
+            fx.inttoptr(l2y_ptr_ty, sym_layout.l2_token_buffer_ptr),
+            fx.make_layout(pool_capacity * out_features, 1),
+        )
+        l2y_resource = create_buffer_resource_from_addr(
+            sym_layout.l2_token_buffer_ptr, num_records_bytes=pool_capacity * out_features * 2
+        )
+        # two per-peer DELTA tables (SIGNAL heap: comb/barrier; MAIN heap: combine_gate)
+        signal_delta_res = create_buffer_resource_from_addr(
+            sym_layout.signal_offsets_ptr, num_records_bytes=delta_records
+        )
+        origin_rank_res = create_buffer_resource_from_addr(
+            sym_layout.origin_rank_ptr, num_records_bytes=pool_records
+        )
+        origin_slot_res = create_buffer_resource_from_addr(
+            sym_layout.origin_slot_ptr, num_records_bytes=pool_records
+        )
+        comb_local_res = create_buffer_resource_from_addr(comb_base, num_records_bytes=comb_records)
+
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         num_tile_blocks_res = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
-        l2y_resource = create_buffer_resource(L2Y, max_size=True)
-        origin_rank_res = create_buffer_resource(ORIGIN_RANK, max_size=True)
-        origin_slot_res = create_buffer_resource(ORIGIN_SLOT, max_size=True)
-        comb_addr_res = create_buffer_resource(COMB_ADDRS, max_size=True)
-        barrier_addr_res = create_buffer_resource(BARRIER_ADDRS, max_size=True)
-        comb_local_res = create_buffer_resource(COMB_LOCAL, max_size=True)
         output_res = create_buffer_resource(OUTPUT, max_size=True)
         topk_indices_res = create_buffer_resource(TOPK_INDICES, max_size=True)
         num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
         real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+        # gate scatter (push to peer combine_gate) + local gate read + fresh d_topk_w (reduce fold)
         grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
-        gate_addr_res = create_buffer_resource(GATE_ADDRS, max_size=True) if with_gate else None
-        # local gate buffer (read) + fresh d_topk_w (write) for the reduce's masked-gate fold
-        gate_local_res = create_buffer_resource(GATE_LOCAL, max_size=True) if with_gate else None
+        gate_base = sym_layout.combine_gate_ptr if with_gate else None
+        main_delta_res = (
+            create_buffer_resource_from_addr(sym_layout.offsets_ptr, num_records_bytes=delta_records)
+            if with_gate
+            else None
+        )
+        gate_local_res = (
+            create_buffer_resource_from_addr(gate_base, num_records_bytes=gate_records) if with_gate else None
+        )
         d_topk_w_res = create_buffer_resource(D_TOPK_W, max_size=True) if with_gate else None
 
         push_block = combine_bf16_tile(
@@ -411,11 +412,13 @@ def _compile(
             l2y_resource=l2y_resource,
             origin_rank_res=origin_rank_res,
             origin_slot_res=origin_slot_res,
-            comb_addr_res=comb_addr_res,
-            barrier_addr_res=barrier_addr_res,
-            enable_barrier=with_barrier,
+            comb_base=comb_base,
+            signal_delta_res=signal_delta_res,
+            barrier_base=barrier_base,
+            enable_barrier=True,  # role 1 raises per-slot flags for the reduce
             grad_gate_res=grad_gate_res,
-            gate_addr_res=gate_addr_res,
+            gate_base=gate_base,
+            main_delta_res=main_delta_res,
             gate_records=gate_records,
             with_gate=with_gate,
         )
@@ -427,13 +430,13 @@ def _compile(
             for tile_iter in range(local_count):
                 block_m = block_index + tile_iter * combine_cu
                 if thread_index == fx.Int32(0):
-                    signal_count = _ld_relaxed(SB_L2, block_m)
+                    signal_count = ld(sb_l2_base, block_m, scope="agent")
                     while signal_count < fx.Int32(n_blocks):
                         fx.rocdl.s_sleep(fx.Int32(2))
-                        signal_count = _ld_relaxed(SB_L2, block_m)
+                        signal_count = ld(sb_l2_base, block_m, scope="agent")
                     # single consumer of this gate -> reset it to 0 for the next launch
                     # (all n_blocks GEMM increments already landed; folds out the host zero)
-                    _st_relaxed(SB_L2, block_m, fx.Int32(0))
+                    st(sb_l2_base, block_m, fx.Int32(0), scope="agent")
                 fx.gpu.barrier()  # broadcast thread-0's poll result to the whole block
                 push_block(block_m)
             # drain cross-rank PUSH stores before exit so the host barrier + reduce see landed data
@@ -453,7 +456,7 @@ def _compile(
                     output_res,
                     topk_indices_res,
                     num_tokens_res,
-                    BARRIER_LOCAL,
+                    barrier_base,
                     topk_weights_res,
                     gate_local_res,
                     d_topk_w_res,
@@ -471,7 +474,7 @@ def _compile(
                     gemm_tile(
                         ACT,
                         WEIGHTS,
-                        L2Y,
+                        l2y_tensor,
                         c_m_const,
                         c_n,
                         lds,
@@ -488,80 +491,62 @@ def _compile(
                     fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()  # all waves' stores landed before the signal
                     _emit_if_then(
-                        thread_index == fx.Int32(0), lambda: _atomic_add_relaxed(SB_L2, block_m, fx.Int32(1))
+                        thread_index == fx.Int32(0),
+                        lambda: atomic_add(sb_l2_base, block_m, fx.Int32(1), scope="agent"),
                     )
                 else:
                     # role 2b: empty GEMM tiles reduce on freed CUs (overlaps the push tail)
-                    if reduce_active:
-                        empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
-                        total_empty_warps = (
-                            fx.Int32(gemm_grid_blocks) - real_tiles * fx.Int32(n_blocks)
-                        ) * fx.Int32(_NUM_WARPS)
-                        topk_reduce(
-                            thread_index,
-                            empty_ordinal,
-                            total_empty_warps,
-                            topk,
-                            out_features,
-                            num_experts,
-                            rank,
-                            comb_local_res,
-                            output_res,
-                            topk_indices_res,
-                            num_tokens_res,
-                            BARRIER_LOCAL,
-                            topk_weights_res,
-                            gate_local_res,
-                            d_topk_w_res,
-                        )
+                    empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
+                    total_empty_warps = (
+                        fx.Int32(gemm_grid_blocks) - real_tiles * fx.Int32(n_blocks)
+                    ) * fx.Int32(_NUM_WARPS)
+                    topk_reduce(
+                        thread_index,
+                        empty_ordinal,
+                        total_empty_warps,
+                        topk,
+                        out_features,
+                        num_experts,
+                        rank,
+                        comb_local_res,
+                        output_res,
+                        topk_indices_res,
+                        num_tokens_res,
+                        barrier_base,
+                        topk_weights_res,
+                        gate_local_res,
+                        d_topk_w_res,
+                    )
 
     @flyc.jit
     def launch(
         ACT,
         WEIGHTS,
-        L2Y,
         TILE_TO_GROUP,
-        SB_L2,
-        ORIGIN_RANK,
-        ORIGIN_SLOT,
-        COMB_ADDRS,
-        BARRIER_ADDRS,
         NUM_TILE_BLOCKS,
         OUTPUT,
-        COMB_LOCAL,
-        BARRIER_LOCAL,
         TOPK_INDICES,
         NUM_TOKENS_PER_RANK,
         TOPK_WEIGHTS,
         GRAD_GATE,
-        GATE_ADDRS,
-        GATE_LOCAL,
         D_TOPK_W,
+        sym_layout,
         c_n: int,
         stream: fx.Stream = fx.Stream(None),
     ):
         grid_size = gemm_base + worst_case_tiles * n_blocks
-        combine_grouped(
+        grouped_gemm_combine_kernel(
             ACT,
             WEIGHTS,
-            L2Y,
             TILE_TO_GROUP,
-            SB_L2,
-            ORIGIN_RANK,
-            ORIGIN_SLOT,
-            COMB_ADDRS,
-            BARRIER_ADDRS,
             NUM_TILE_BLOCKS,
             OUTPUT,
-            COMB_LOCAL,
-            BARRIER_LOCAL,
             TOPK_INDICES,
             NUM_TOKENS_PER_RANK,
             TOPK_WEIGHTS,
             GRAD_GATE,
-            GATE_ADDRS,
-            GATE_LOCAL,
             D_TOPK_W,
+            sym_layout,
             c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -572,34 +557,53 @@ def _compile(
 # combine-PUSH-only launcher (no GEMM) -- raw combine bandwidth on a pre-filled L2Y pool.
 @functools.lru_cache(maxsize=256)
 def _compile_combine_only(
-    out_features, pool_capacity, BLOCK_M, num_combine_cu, combine_slots, waves_per_eu=2, with_gate=False
+    out_features,
+    pool_capacity,
+    BLOCK_M,
+    num_combine_cu,
+    combine_slots,
+    num_ranks,
+    waves_per_eu=2,
+    with_gate=False,
 ):
     assert pool_capacity % BLOCK_M == 0, "pool_capacity must be a multiple of BLOCK_M"
     assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
     comb_records = combine_slots * out_features * 2
     gate_records = combine_slots * 4  # f32 gate slots per peer
+    delta_records = num_ranks * 8
+    pool_records = pool_capacity * 4
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def combine_only_k(
-        L2Y: fx.Tensor,
-        ORIGIN_RANK: fx.Tensor,
-        ORIGIN_SLOT: fx.Tensor,
-        COMB_ADDRS: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
         GRAD_GATE: fx.Tensor,
-        GATE_ADDRS: fx.Tensor,
+        sym_layout: SymLayout,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         combine_cu = fx.Int32(num_combine_cu)
-        l2y_resource = create_buffer_resource(L2Y, max_size=True)
-        origin_rank_res = create_buffer_resource(ORIGIN_RANK, max_size=True)
-        origin_slot_res = create_buffer_resource(ORIGIN_SLOT, max_size=True)
-        comb_addr_res = create_buffer_resource(COMB_ADDRS, max_size=True)
+        # L2Y = the SymLayout l2_token_buffer (pre-filled GEMM scratch) -> combine PUSH source
+        l2y_resource = create_buffer_resource_from_addr(
+            sym_layout.l2_token_buffer_ptr, num_records_bytes=pool_capacity * out_features * 2
+        )
+        signal_delta_res = create_buffer_resource_from_addr(
+            sym_layout.signal_offsets_ptr, num_records_bytes=delta_records
+        )
+        origin_rank_res = create_buffer_resource_from_addr(
+            sym_layout.origin_rank_ptr, num_records_bytes=pool_records
+        )
+        origin_slot_res = create_buffer_resource_from_addr(
+            sym_layout.origin_slot_ptr, num_records_bytes=pool_records
+        )
         num_tile_blocks_res = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
         real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
         grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
-        gate_addr_res = create_buffer_resource(GATE_ADDRS, max_size=True) if with_gate else None
+        gate_base = sym_layout.combine_gate_ptr if with_gate else None
+        main_delta_res = (
+            create_buffer_resource_from_addr(sym_layout.offsets_ptr, num_records_bytes=delta_records)
+            if with_gate
+            else None
+        )
 
         push_block = combine_bf16_tile(
             thread_index=thread_index,
@@ -610,9 +614,11 @@ def _compile_combine_only(
             l2y_resource=l2y_resource,
             origin_rank_res=origin_rank_res,
             origin_slot_res=origin_slot_res,
-            comb_addr_res=comb_addr_res,
+            comb_base=sym_layout.comb_ptr,
+            signal_delta_res=signal_delta_res,
             grad_gate_res=grad_gate_res,
-            gate_addr_res=gate_addr_res,
+            gate_base=gate_base,
+            main_delta_res=main_delta_res,
             gate_records=gate_records,
             with_gate=with_gate,
         )
@@ -623,23 +629,15 @@ def _compile_combine_only(
 
     @flyc.jit
     def launch(
-        L2Y,
-        ORIGIN_RANK,
-        ORIGIN_SLOT,
-        COMB_ADDRS,
         NUM_TILE_BLOCKS,
         GRAD_GATE,
-        GATE_ADDRS,
+        sym_layout,
         stream: fx.Stream = fx.Stream(None),
     ):
         combine_only_k(
-            L2Y,
-            ORIGIN_RANK,
-            ORIGIN_SLOT,
-            COMB_ADDRS,
             NUM_TILE_BLOCKS,
             GRAD_GATE,
-            GATE_ADDRS,
+            sym_layout,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_combine_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -671,6 +669,8 @@ def _compile_reduce_only(
         topk_indices_res = create_buffer_resource(TOPK_INDICES, max_size=True)
         num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
+        # tensor base index -> prims.ld/st (agent scope) read/reset the local per-slot flags
+        barrier_base = extract_base_index(BARRIER_LOCAL, address_space=1)
         topk_reduce(
             thread_index,
             block_index,
@@ -683,7 +683,7 @@ def _compile_reduce_only(
             output_res,
             topk_indices_res,
             num_tokens_res,
-            BARRIER_LOCAL,
+            barrier_base,
             topk_weights_res,
             None,  # gate_local_res (with_gate=False -> unused)
             None,  # d_topk_w_res
@@ -733,189 +733,125 @@ _COMBINE_AUTOTUNE_CACHE: dict = {}
 
 # host-side wrappers
 def grouped_gemm_combine_bf16(
-    act_bf16,
-    weight_bf16,
-    l2y,
-    tile_to_group,
-    sb_l2,
-    origin_rank,
-    origin_slot,
-    combine_slots,
-    mblk_dev,
+    x,
+    l2_weights,
+    tile_to_expert,
+    group,
     *,
-    comb_addrs=None,
-    comb_local=None,
-    output=None,
-    barrier_local=None,
-    barrier_addrs=None,
-    topk_indices=None,
-    num_tokens_per_rank=None,
+    topk_indices,
     topk_weights=None,
     grad_gate=None,
-    gate_addrs=None,
-    gate_local=None,
-    topk=1,
-    num_experts=0,
-    rank=0,
     layout="nt",
     BM=256,
     BN=256,
-    num_combine_cu=None,
-    num_reduce_cu=None,
-    nt_vmcnt=3,
-    waves_per_eu=2,
-    agpr_alloc=0,
+    num_combine_cu=64,  # best for fused 3-role (e2e sweep 64<48<96)
+    num_reduce_cu=0,  # best: reduce on empty GEMM blocks, no dedicated region
     autotune=False,
-    autotune_reset=None,
 ):
-    """Fused grouped BF16 GEMM + combine PUSH (+ optional topk reduce), three-role.
+    """Fused grouped BF16 GEMM + combine PUSH + topk reduce, three-role.
 
-    The combine PUSH destination ``combine_output`` [combine_slots, N] bf16 (and, when
-    ``grad_gate`` is given, the gate-grad ``combine_gate`` [combine_slots] f32) are returned.
-    With ``comb_local`` / ``gate_local`` given they ARE those buffers (EP: this rank's
-    symmetric receive buffers); otherwise they are allocated here. The peer pointer tables
-    ``comb_addrs`` / ``barrier_addrs`` / ``gate_addrs`` (EP, cross-rank) default to self tables
-    built from the local buffers -> single-rank (world=1) self-push when omitted.
+    Every buffer except the operands (``x`` activation, ``l2_weights``, ``tile_to_expert``)
+    comes from the active ``get_symm_buffer_for_mega_moe()`` (the workspace the caller built
+    for this ``group``), handed to the kernel as a single ``SymLayout``. In particular the
+    GEMM output / combine PUSH source is the SymLayout ``l2_token_buffer`` (no ``l2y`` arg),
+    and the per-token reduce result ``output`` [num_tokens, N] is allocated here and returned.
 
-    ``layout`` selects the GEMM tile: NT (forward) ``act`` [M,K] / ``weight`` [G,N,K];
-    NN (dgrad) ``act`` [M,K] / ``weight`` [G,K,N]; TN (wgrad) ``act`` [K,M] / ``weight``
-    [G,K,N]. The combine PUSH reads ``l2y`` [M,N] M-major, so every layout works (it only
-    changes how A/B are read). ``l2y`` [M,N] bf16 is the local GEMM output. Per-row
-    ``origin_rank`` / ``origin_slot`` route finished rows into ``comb_addrs[origin][slot]``.
-    ``sb_l2`` (L2 scoreboard) must be zeroed before the call.
+    ``layout`` selects the GEMM tile: NT (forward) ``x`` [M,K] / ``l2_weights`` [G,N,K];
+    NN (dgrad) ``x`` [M,K] / ``l2_weights`` [G,K,N]; TN (wgrad) ``x`` [K,M] / [G,K,N]. The
+    GEMM writes ``l2_token_buffer`` [M,N] M-major (N == hidden); the SymLayout's
+    ``origin_rank``/``origin_slot`` route finished rows into the peer combine buffer. The L2
+    scoreboard (``sb_l2``) is read/reset in-kernel (folded host zero).
 
-    Role 1 (combine push) runs on ``num_combine_cu`` front blocks (default 64). Supplying
-    ``output`` enables role 2 (topk reduce): it reads the token-major ``combine_output``, gated
-    per slot by ``barrier_local`` [combine_slots] which role 1 raises (through ``barrier_addrs``),
-    sums the ``topk`` rows of each of this rank's tokens, and writes ``output`` [num_tokens, N].
-    The reduce runs on the EMPTY grouped-GEMM blocks (freed CUs as the GEMM winds down) plus an
-    optional dedicated region of ``num_reduce_cu`` blocks; ``num_reduce_cu`` defaults to 0
-    (empty-blocks only — a non-zero value double-reduces, idempotent but wasteful). For the
-    token-major reduce, ``origin_slot`` must encode ``token*topk + k`` (NOT the source-order slot
-    used by the two-role path). ``topk_indices`` [num_tokens*topk] int32 (< 0 == dropped) and
-    ``num_tokens_per_rank`` [world] int32 drive the per-token loop; ``rank`` selects the row.
-    ``topk_weights`` [num_tokens*topk] f32 (optional) scales each topk row -> weighted reduce.
+    Role 1 (combine push) runs on ``num_combine_cu`` front blocks (default 64). Role 2 (topk
+    reduce) reads the token-major combine buffer, gated per slot by the SymLayout
+    ``barrier_local`` flags role 1 raises cross-rank, sums the ``topk`` rows of each of this
+    rank's tokens into a freshly-allocated ``output`` [num_tokens, N]. The reduce runs on the
+    EMPTY grouped-GEMM blocks (freed CUs as the GEMM winds down) plus an optional dedicated
+    region of ``num_reduce_cu`` blocks (default 0; non-zero double-reduces). ``topk_indices``
+    [num_tokens*topk] int32 (< 0 == dropped) drives the per-token loop; ``topk_weights``
+    [num_tokens*topk] f32 (optional) scales each topk row -> weighted reduce (else unweighted).
 
     ``grad_gate`` [pool_capacity] f32 (given): role 1 also scatters the per-row gate gradient
-    to ``gate_addrs[origin][slot]`` (backward d_topk_w); one f32/row, negligible vs the
-    hidden-wide combine push.
+    to the peer ``combine_gate`` (backward d_topk_w); the reduce folds it into a fresh masked
+    ``d_topk_w`` [combine_slots] f32.
 
-    Returns ``(combine_output, combine_gate)`` — each is ``None`` when the caller owns the
-    buffer (``comb_local`` / ``gate_local`` given, EP) or the gate is off; only buffers
-    allocated here are returned. With ``output`` omitted this degenerates to the two-role
-    GEMM + combine kernel. ``autotune=True`` sweeps the num_combine_cu candidates per shape."""
+    Returns ``(output, d_topk_w)``: ``output`` [num_tokens, N] bf16 is the reduce result;
+    ``d_topk_w`` is the masked gate-grad fold (``None`` unless ``grad_gate`` given).
+    ``autotune=True`` sweeps the num_combine_cu candidates per shape."""
     assert layout in ("nt", "nn", "tn"), f"unknown layout {layout}"
-    assert act_bf16.dtype == torch.bfloat16 and weight_bf16.dtype == torch.bfloat16
+    assert x.dtype == torch.bfloat16 and l2_weights.dtype == torch.bfloat16
+    assert topk_indices is not None, "topk reduce needs topk_indices"
+    # active symmetric workspace (built earlier by get_symm_buffer_for_mega_moe for `group`);
+    # the single SymLayout names every symmetric sub-buffer (two-heap delta tables)
+    symm = get_symm_buffer_for_mega_moe()
+    sym_layout = symm.make_sym_layout()
     if layout == "tn":  # A is [K, M] (K-major)
-        hidden_size, pool_capacity = act_bf16.shape
+        hidden_size, pool_capacity = x.shape
     else:  # A is [M, K]
-        pool_capacity, hidden_size = act_bf16.shape
+        pool_capacity, hidden_size = x.shape
     if layout == "nt":  # weight [G, N, K]
-        G, N, K = weight_bf16.shape
+        G, N, K = l2_weights.shape
     else:  # NN / TN: weight [G, K, N]
-        G, K, N = weight_bf16.shape
+        G, K, N = l2_weights.shape
     assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
     out_features = N
     c_n = out_features
+    # the GEMM output IS the SymLayout l2_token_buffer [pool_capacity, hidden] -> N == hidden
+    assert out_features == int(
+        sym_layout.hidden
+    ), f"out_features {out_features} != SymLayout hidden {int(sym_layout.hidden)}"
+    assert pool_capacity == int(sym_layout.num_max_pool_tokens), "x rows must match SymLayout pool capacity"
     if num_combine_cu is None:
         num_combine_cu = 64  # best for fused 3-role (bench fused3 ~2.9ms; e2e sweep 64<48<96)
 
-    device = act_bf16.device
+    device = x.device
+    # dims from the SymLayout (single source of truth for the symmetric buffers)
+    combine_slots = int(sym_layout.combine_slots)
+    num_ranks = int(sym_layout.num_ranks)
+    rank = int(sym_layout.rank_idx)
+    topk = int(sym_layout.num_topk)
+    num_experts = int(sym_layout.num_experts)
+    assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"
+    num_tile_blocks = symm.meta_scalars[1:2]  # device real-tile count
+    dummy = num_tile_blocks  # placeholder for unused optional kernel tensors
 
-    def _self_table(buf):
-        return torch.tensor([buf.data_ptr()], dtype=torch.int64, device=device)
-
-    # combine PUSH destination: caller-owned receive buffer (EP) or allocated here (standalone).
-    # comb_addrs (peer push table) defaults to a self table -> world=1 self-push. Only the
-    # internally-allocated buffers are returned (returning a caller input would alias it).
-    if comb_local is not None:
-        combine_output, combine_output_ret = comb_local, None
-    else:
-        combine_output = torch.empty(combine_slots, out_features, dtype=torch.bfloat16, device=device)
-        combine_output_ret = combine_output
-    if comb_addrs is None:
-        comb_addrs = _self_table(combine_output)
-    # gate-grad scatter destination (backward d_topk_w), present iff grad_gate given
+    apply_weights = topk_weights is not None  # weighted (fwd) vs unweighted (bwd dx) reduce
     with_gate = grad_gate is not None
-    combine_gate_ret = None
-    if with_gate:
-        if gate_local is not None:
-            combine_gate = gate_local
-        else:
-            combine_gate = torch.empty(combine_slots, dtype=torch.float32, device=device)
-            combine_gate_ret = combine_gate
-        if gate_addrs is None:
-            gate_addrs = _self_table(combine_gate)
-    else:
-        combine_gate = None
 
-    # reduce active iff output given; num_reduce_cu only sizes the optional dedicated region (0 = empty-block only)
-    assert not (output is None and num_reduce_cu), "num_reduce_cu set but output is None"
-    reduce_active = output is not None
-    if reduce_active:
-        assert all(
-            t is not None for t in (barrier_local, topk_indices, num_tokens_per_rank)
-        ), "topk reduce needs barrier_local/topk_indices/num_tokens_per_rank"
-        assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"
-        if num_reduce_cu is None:
-            num_reduce_cu = 0
-        if barrier_addrs is None:
-            barrier_addrs = _self_table(barrier_local)
-    else:
-        num_reduce_cu = 0
-        topk = 1
-    apply_weights = reduce_active and topk_weights is not None
-
-    act_flat = act_bf16.contiguous().view(-1)
+    act_flat = x.contiguous().view(-1)
     if layout == "nt":  # weight [G, N, K]
-        weight_flat = weight_bf16.reshape(G * N, K).contiguous().view(-1)
+        weight_flat = l2_weights.reshape(G * N, K).contiguous().view(-1)
     else:  # NN / TN: weight [G, K, N]
-        weight_flat = weight_bf16.reshape(G * K, N).contiguous().view(-1)
-    l2y_flat = l2y.contiguous().view(-1)
-    # the reduce reads the same buffer the push fills (comb_local == combine_output)
-    output_d = output.view(-1) if reduce_active else l2y_flat
-    comb_local_d = combine_output.view(-1)
-    barrier_local_d = barrier_local if reduce_active else mblk_dev
-    barrier_addrs_d = barrier_addrs if reduce_active else comb_addrs
-    topk_indices_d = topk_indices.contiguous().view(-1) if reduce_active else mblk_dev
-    num_tokens_d = num_tokens_per_rank if reduce_active else mblk_dev
-    topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else mblk_dev
-    # gate scatter (backward d_topk_w): grad_gate given -> role 1 also pushes -> gate_addrs[origin][slot]
-    grad_gate_d = grad_gate.contiguous().view(-1) if with_gate else mblk_dev
-    gate_addrs_d = gate_addrs if with_gate else comb_addrs
-    # d_topk_w fold (backward, reduce active): the reduce reads the scattered gate buffer and
-    # writes a fresh masked d_topk_w [combine_slots] f32 (replaces the host combine_gate*(topk_idx>=0)
-    # mul + clone). Returned in the combine_gate slot. Off (dummy) for forward / non-reduce.
-    fold_gate = with_gate and reduce_active
-    gate_local_d = combine_gate.view(-1) if fold_gate else mblk_dev
-    d_topk_w = torch.empty(combine_slots, dtype=torch.float32, device=device) if fold_gate else None
-    d_topk_w_d = d_topk_w if fold_gate else mblk_dev
-    if fold_gate:
-        combine_gate_ret = d_topk_w
+        weight_flat = l2_weights.reshape(G * K, N).contiguous().view(-1)
+    # reduce result: allocated here [num_tokens, N] and returned
+    num_tokens = int(symm.num_tokens)
+    output = torch.empty(num_tokens, out_features, dtype=torch.bfloat16, device=device)
+    output_d = output.view(-1)
+    topk_indices_d = topk_indices.contiguous().view(-1)
+    num_tokens_d = symm.num_tokens_per_rank
+    topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else dummy
+    grad_gate_d = grad_gate.contiguous().view(-1) if with_gate else dummy
+    # d_topk_w fold (backward): the reduce reads the scattered combine_gate and writes a fresh
+    # masked d_topk_w [combine_slots] f32 (replaces the host combine_gate*(topk_idx>=0) mul +
+    # clone). Off (dummy) when no gate.
+    d_topk_w = torch.empty(combine_slots, dtype=torch.float32, device=device) if with_gate else None
+    d_topk_w_d = d_topk_w if with_gate else dummy
 
     pos_args = (
         act_flat,
         weight_flat,
-        l2y_flat,
-        tile_to_group,
-        sb_l2,
-        origin_rank,
-        origin_slot,
-        comb_addrs,
-        barrier_addrs_d,
-        mblk_dev,
+        tile_to_expert,
+        num_tile_blocks,
         output_d,
-        comb_local_d,
-        barrier_local_d,
         topk_indices_d,
         num_tokens_d,
         topk_weights_d,
         grad_gate_d,
-        gate_addrs_d,
-        gate_local_d,
         d_topk_w_d,
+        sym_layout,
         c_n,
     )
+    finite_view = output  # finite-check view for autotune
 
     if autotune:
         key = (
@@ -929,6 +865,7 @@ def grouped_gemm_combine_bf16(
             int(topk),
             int(num_experts),
             int(rank),
+            int(num_ranks),
             layout,
             bool(apply_weights),
             bool(with_gate),
@@ -937,7 +874,7 @@ def grouped_gemm_combine_bf16(
         if cached is None:
             cached = _autotune(
                 pos_args,
-                l2y_flat,
+                finite_view,
                 out_features,
                 hidden_size,
                 pool_capacity,
@@ -948,11 +885,10 @@ def grouped_gemm_combine_bf16(
                 int(topk),
                 int(num_experts),
                 int(rank),
-                sb_l2,
-                autotune_reset,
+                int(num_ranks),
+                symm.sb_l2,
                 layout,
                 apply_weights,
-                reduce_active,
                 with_gate,
             )
             _COMBINE_AUTOTUNE_CACHE[key] = cached
@@ -970,17 +906,14 @@ def grouped_gemm_combine_bf16(
             int(topk),
             int(num_experts),
             int(rank),
-            int(nt_vmcnt),
-            int(waves_per_eu),
-            int(agpr_alloc),
+            int(num_ranks),
             layout=layout,
             apply_weights=apply_weights,
-            reduce_active=reduce_active,
             with_gate=with_gate,
         )
     launch(*pos_args, stream=torch.cuda.current_stream())
-    # return only internally-allocated buffers; None when the caller owns them (EP)
-    return combine_output_ret, combine_gate_ret
+    # output = per-token reduce result; d_topk_w = masked gate-grad fold (None unless grad_gate)
+    return output, d_topk_w
 
 
 def _autotune(
@@ -996,16 +929,13 @@ def _autotune(
     topk,
     num_experts,
     rank,
+    num_ranks,
     sb_l2,
-    reset,
     layout="nt",
     apply_weights=False,
-    reduce_active=False,
     with_gate=False,
 ):
     """Bench the num_combine_cu candidates with a per-iter scoreboard reset; return (launch, cfg)."""
-    if reset is None:
-        reset = sb_l2.zero_
     stream = torch.cuda.current_stream()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -1024,26 +954,25 @@ def _autotune(
                 int(topk),
                 int(num_experts),
                 int(rank),
+                int(num_ranks),
                 int(nt_vmcnt),
                 int(waves),
                 int(agpr),
                 layout=layout,
                 apply_weights=apply_weights,
-                reduce_active=reduce_active,
                 with_gate=with_gate,
             )
-            reset()
             launch(*pos_args, stream=stream)
             torch.cuda.synchronize()
             if not torch.isfinite(finite_view.view(-1)[:1024].float()).all().item():
                 continue
             for _ in range(2):
-                reset()
+
                 launch(*pos_args, stream=stream)
             torch.cuda.synchronize()
             us_total = 0.0
             for _ in range(20):
-                reset()
+
                 start_event.record()
                 launch(*pos_args, stream=stream)
                 end_event.record()
@@ -1060,52 +989,45 @@ def _autotune(
 
 
 def combine_only(
-    l2y,
-    origin_rank,
-    origin_slot,
-    comb_addrs,
-    combine_slots,
-    mblk_dev,
+    group,
     *,
     BM=256,
     num_combine_cu=None,
     grad_gate=None,
-    gate_addrs=None,
 ):
-    """Combine-PUSH only (no GEMM) -- pushes the pre-filled ``l2y`` rows to the peer
-    combine buffers. For measuring raw combine bandwidth.
+    """Combine-PUSH only (no GEMM) -- pushes the pre-filled SymLayout ``l2_token_buffer``
+    rows to the peer combine buffers. For measuring raw combine bandwidth. The whole
+    symmetric workspace (L2Y source, origin tables, combine buffer, peer delta tables,
+    optional gate-grad buffer) is fetched from the active ``get_symm_buffer_for_mega_moe()``.
 
-    ``grad_gate`` [pool_capacity] f32 + ``gate_addrs`` [world] i64 (both given): also
-    scatter the per-row gate gradient to ``gate_addrs[origin][slot]`` (backward d_topk_w);
-    one f32/row by lane 0, negligible vs the hidden-wide combine push."""
-    out_features = l2y.size(1)
-    pool_capacity = l2y.size(0)
+    ``grad_gate`` [pool_capacity] f32 (given): also scatter the per-row gate gradient to
+    the peer ``combine_gate`` (backward d_topk_w); one f32/row by lane 0, negligible."""
+    symm = get_symm_buffer_for_mega_moe()
+    sym_layout = symm.make_sym_layout()
+    out_features = int(sym_layout.hidden)
+    pool_capacity = int(sym_layout.num_max_pool_tokens)
     if num_combine_cu is None:
         num_combine_cu = pool_capacity // BM
-    l2y_flat = l2y.contiguous().view(-1)
-    with_gate = grad_gate is not None and gate_addrs is not None
+    num_tile_blocks = symm.meta_scalars[1:2]
+    with_gate = grad_gate is not None
     launch = _compile_combine_only(
         out_features,
         pool_capacity,
         int(BM),
         int(num_combine_cu),
-        int(combine_slots),
+        int(sym_layout.combine_slots),
+        int(sym_layout.num_ranks),
         with_gate=with_gate,
     )
-    # dummies satisfy the fixed kernel signature when gate is off (gated by const_expr)
-    grad_gate_arg = grad_gate if with_gate else mblk_dev
-    gate_addrs_arg = gate_addrs if with_gate else comb_addrs
+    # dummy satisfies the fixed kernel signature when gate is off (gated by const_expr)
+    grad_gate_arg = grad_gate.contiguous().view(-1) if with_gate else num_tile_blocks
     launch(
-        l2y_flat,
-        origin_rank,
-        origin_slot,
-        comb_addrs,
-        mblk_dev,
+        num_tile_blocks,
         grad_gate_arg,
-        gate_addrs_arg,
+        sym_layout,
         stream=torch.cuda.current_stream(),
     )
-    return l2y
+    return symm.l2_token_buffer
 
 
 def topk_reduce_only(

@@ -22,7 +22,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import pytest
 import torch
-from flydsl.expr import Int32, Int64
 from flydsl.expr.buffer_ops import buffer_store
 
 from primus_turbo.flydsl.mega import sym_layout as SL
@@ -32,13 +31,13 @@ from primus_turbo.flydsl.mega.prims import addr_buffer_resource
 _R, _E, _T, _K = 2, 8, 16, 4
 
 
-# ---- independent re-derivation of the cuh byte offsets (NOT importing SL._off_*) ----
-def _ref_offsets(d):
-    E = d["num_experts"]
-    Epr = d["num_experts_per_rank"]
-    NPB = d["num_max_pool_blocks"]
-    R = d["num_ranks"]
-    Trecv = R * d["num_max_tokens_per_rank"]
+# ---- independent re-derivation of the cuh byte offsets (NOT importing SL internals) ----
+def _ref_offsets(sl):
+    E = int(sl.num_experts)
+    Epr = int(sl.num_experts_per_rank)
+    NPB = int(sl.num_max_pool_blocks)
+    R = int(sl.num_ranks)
+    Trecv = R * int(sl.num_max_tokens_per_rank)
     a2 = ((NPB + 1) // 2) * 2
     off = {}
     off["barrier"] = 0
@@ -49,15 +48,13 @@ def _ref_offsets(d):
     off["l2"] = off["l1"] + a2 * 4
     off["src"] = off["l2"] + NPB * 8
     off["meta"] = off["src"] + Epr * R * Trecv * 4
-    total = off["meta"] + d["num_max_pool_tokens"] * 12
+    total = off["meta"] + int(sl.num_max_pool_tokens) * 12
     total = ((total + 15) // 16) * 16
     return off, total, Trecv
 
 
 @functools.lru_cache(maxsize=None)
-def _build(dims_key):
-    dict(dims_key)
-
+def _build(shape_key):
     @flyc.kernel(known_block_size=[1, 1, 1])
     def k(ARENA: fx.Tensor, sl: SL.SymLayout):
         def w(addr, val):
@@ -85,35 +82,25 @@ def _build(dims_key):
 
 
 def _run():
-    d = SL.compute_dims(_R, _E, _T, _K)
-    nbytes = SL.get_num_bytes(d)
-    off, ref_total, Trecv = _ref_offsets(d)
+    sl0 = SL.build_sym_layout(_R, _E, _T, _K)  # base=0, just for sizing & shapes
+    nbytes = SL.get_num_bytes(sl0)
+    off, ref_total, Trecv = _ref_offsets(sl0)
 
     # ---- A: host layout sanity vs independent formulas ----
     assert nbytes == ref_total, f"get_num_bytes {nbytes} != ref {ref_total}"
-    assert d["num_experts_per_rank"] == _E // _R
-    print(f"[sym_layout host] dims={d} num_bytes={nbytes} (matches cuh formula) PASS")
+    assert int(sl0.num_experts_per_rank) == _E // _R
+    print(f"[sym_layout host] num_bytes={nbytes} (matches cuh formula) PASS")
 
     # ---- B + C: device offsets ----
     arena = torch.zeros(2 * nbytes, dtype=torch.int8, device="cuda")  # two ranks side by side
     base0 = arena.data_ptr()
     offsets = torch.tensor([0, nbytes], dtype=torch.int64, device="cuda")  # self, peer delta
-    sl = SL.SymLayout(
-        base=Int64(base0),
-        offsets_ptr=Int64(offsets.data_ptr()),
-        rank_idx=Int32(0),
-        num_ranks=d["num_ranks"],
-        num_experts=d["num_experts"],
-        num_experts_per_rank=d["num_experts_per_rank"],
-        num_max_tokens_per_rank=d["num_max_tokens_per_rank"],
-        num_max_pool_tokens=d["num_max_pool_tokens"],
-        num_max_pool_blocks=d["num_max_pool_blocks"],
-    )
-    _build(tuple(sorted(d.items())))(arena, sl, stream=torch.cuda.current_stream())
+    sl = SL.build_sym_layout(_R, _E, _T, _K, base=base0, offsets_ptr=offsets.data_ptr(), rank_idx=0)
+    _build((_R, _E, _T, _K))(arena, sl, stream=torch.cuda.current_stream())
     torch.cuda.synchronize()
 
     a32 = arena.view(torch.int32)  # index by byte_off // 4
-    Epr = d["num_experts_per_rank"]
+    Epr = int(sl.num_experts_per_rank)
     expect = {
         off["barrier"] + 2 * 4: 1001,  # grid_sync[2]
         16: 1002,  # nvl counter

@@ -3,7 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""Mega-MoE SwiGLU epilogue (FlyDSL), moved from MegaKernelFlyDSL/kernels/swiglu_flydsl.py.
+"""Mega-MoE SwiGLU epilogue kernels (FlyDSL).
 
 Fused SwiGLU forward/backward in one FlyDSL pass.  Optional features:
   - with_scale: per-row routing-weight scale (act[m,:] *= SCALE[m])
@@ -23,7 +23,9 @@ import torch
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_resource
 
-# SwiGLU clamp contract: must match the reference; override via the `clamp` arg.
+from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+
+# SwiGLU clamp contract: baked into the kernels; must match the reference.
 ACTIVATION_CLAMP = 10.0
 
 _VEC = 8
@@ -37,9 +39,7 @@ def _clampv(x, lo, hi):
     return fx.arith.minimumf(fx.arith.maximumf(x, lo), hi)
 
 
-def _make_swiglu(
-    I: int, clamp: float, with_scale: bool = False, with_bound: bool = False, BM: int = 0, GRID_X: int = 0
-):
+def _make_swiglu(I: int, with_scale: bool = False, with_bound: bool = False, BM: int = 0, GRID_X: int = 0):
     two_I = 2 * I
     assert I % _COLS_PER_BLOCK == 0, f"I={I} not divisible by {_COLS_PER_BLOCK}"
 
@@ -56,8 +56,8 @@ def _make_swiglu(
         act_rsrc = create_buffer_resource(ACT, max_size=True)
         scale_rsrc = create_buffer_resource(SCALE, max_size=True) if with_scale else None
         # loop-invariant constants (hoisted out of the per-row body)
-        lo = fx.arith.constant_vector(-float(clamp), f32v)
-        hi = fx.arith.constant_vector(float(clamp), f32v)
+        lo = fx.arith.constant_vector(-ACTIVATION_CLAMP, f32v)
+        hi = fx.arith.constant_vector(ACTIVATION_CLAMP, f32v)
         one = fx.arith.constant_vector(1.0, f32v)
         neg1 = fx.arith.constant_vector(-1.0, f32v)
 
@@ -111,7 +111,6 @@ def _make_swiglu(
 
 def _make_swiglu_bwd(
     I: int,
-    clamp: float,
     with_scale: bool = False,
     with_bound: bool = False,
     BM: int = 0,
@@ -149,8 +148,8 @@ def _make_swiglu_bwd(
         grad_gate_rsrc = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
         act_w_rsrc = create_buffer_resource(ACT_W, max_size=True) if with_act_w else None
         # loop-invariant constants (hoisted out of the per-tile body)
-        lo = fx.arith.constant_vector(-float(clamp), f32v)
-        hi = fx.arith.constant_vector(float(clamp), f32v)
+        lo = fx.arith.constant_vector(-ACTIVATION_CLAMP, f32v)
+        hi = fx.arith.constant_vector(ACTIVATION_CLAMP, f32v)
         one = fx.arith.constant_vector(1.0, f32v)
         zero = fx.arith.constant_vector(0.0, f32v)
         neg1 = fx.arith.constant_vector(-1.0, f32v)
@@ -263,6 +262,19 @@ def _make_swiglu_bwd(
 _SWIGLU_GRID_X = 8192
 
 
+def _active_symm_bounds():
+    """BM + device real-tile count from the active mega-MoE symm workspace.
+
+    Returns ``(symm.block_m, symm.meta_scalars[1:2])`` so the epilogue rides the same
+    device-bounded real-row count as the fused pipeline; ``(0, None)`` (unbounded over
+    all rows) when no workspace is active (standalone use)."""
+    try:
+        symm = get_symm_buffer_for_mega_moe()
+    except RuntimeError:
+        return 0, None
+    return symm.block_m, symm.meta_scalars[1:2]
+
+
 def _resolve_opts(scale, num_tile_blocks, dummy):
     """Resolve scale/bound flags + device tensors (dummy binds off paths) -> (with_scale, scale_d, with_bound, ntb_d, grid_x)."""
     with_scale = scale is not None
@@ -277,16 +289,13 @@ def _resolve_opts(scale, num_tile_blocks, dummy):
 
 
 @functools.lru_cache(maxsize=32)
-def _compile(
-    I: int, clamp_milli: int, with_scale: bool = False, with_bound: bool = False, BM: int = 0, GRID_X: int = 0
-):
-    return _make_swiglu(I, clamp_milli / 1000.0, with_scale, with_bound, BM, GRID_X)
+def _compile(I: int, with_scale: bool = False, with_bound: bool = False, BM: int = 0, GRID_X: int = 0):
+    return _make_swiglu(I, with_scale, with_bound, BM, GRID_X)
 
 
 @functools.lru_cache(maxsize=32)
 def _compile_bwd(
     I: int,
-    clamp_milli: int,
     with_scale: bool = False,
     with_bound: bool = False,
     BM: int = 0,
@@ -294,66 +303,61 @@ def _compile_bwd(
     with_gate: bool = False,
     with_act_w: bool = False,
 ):
-    return _make_swiglu_bwd(
-        I, clamp_milli / 1000.0, with_scale, with_bound, BM, GRID_X, with_gate, with_act_w
-    )
+    return _make_swiglu_bwd(I, with_scale, with_bound, BM, GRID_X, with_gate, with_act_w)
 
 
 def swiglu_backward(
     dact: torch.Tensor,
-    acc1: torch.Tensor,
-    I: int,
-    clamp: float = ACTIVATION_CLAMP,
+    x: torch.Tensor,
     scale: torch.Tensor | None = None,
-    num_tile_blocks: torch.Tensor | None = None,
-    BM: int = 0,
     return_gate: bool = False,
     return_act_w: bool = False,
 ):
-    """Backward SwiGLU (optional scale/bound); return_gate -> also grad_gate (empty, single store/row
-    = triton_dist dscale). return_act_w -> also act_w = (recomputed fwd act) * scale [M, I] bf16 (the
-    dW2 B operand), folding the host ``saved_act * weight`` mul; requires scale (with_gate recommended)."""
-    assert acc1.size(1) == 2 * I and dact.size(1) == I
+    """Backward SwiGLU over x[M,2I] given dact[M,I] (optional per-row scale); allocates + returns
+    dx[M,2I]. The device-bounded real-row count rides the active symm workspace. return_gate ->
+    also grad_gate (empty, single store/row = triton_dist dscale). return_act_w -> also act_w =
+    (recomputed fwd act) * scale [M, I] bf16 (the dW2 B operand), folding the host
+    ``saved_act * weight`` mul; requires scale (with_gate recommended)."""
+    M, two_I = x.shape
+    assert two_I % 2 == 0, f"x last dim must be even (gate||up), got {two_I}"
+    I = two_I // 2
+    assert dact.size(1) == I, f"dact[...,I] vs x[...,2I] mismatch: {dact.shape} {x.shape}"
     if return_act_w:
         assert scale is not None, "return_act_w needs scale (the per-row routing weight)"
-    acc1 = acc1.contiguous()
+    x = x.contiguous()
     dact = dact.contiguous()
-    M = acc1.size(0)
-    dacc1 = torch.empty((M, 2 * I), dtype=torch.bfloat16, device=acc1.device)
-    with_scale, scale_d, with_bound, ntb_d, grid_x = _resolve_opts(scale, num_tile_blocks, acc1)
+    dx = torch.empty((M, two_I), dtype=torch.bfloat16, device=x.device)
+    BM, num_tile_blocks = _active_symm_bounds()
+    with_scale, scale_d, with_bound, ntb_d, grid_x = _resolve_opts(scale, num_tile_blocks, x)
     # single-store gate grad -> empty (no zeros) is safe; dummy binds the off path.
-    grad_gate = torch.empty((M,), dtype=torch.float32, device=acc1.device) if return_gate else acc1
-    act_w = torch.empty((M, I), dtype=torch.bfloat16, device=acc1.device) if return_act_w else acc1
-    _compile_bwd(I, int(round(clamp * 1000)), with_scale, with_bound, BM, grid_x, return_gate, return_act_w)(
-        dact, acc1, dacc1, scale_d, ntb_d, grad_gate, act_w, M, stream=torch.cuda.current_stream()
+    grad_gate = torch.empty((M,), dtype=torch.float32, device=x.device) if return_gate else x
+    act_w = torch.empty((M, I), dtype=torch.bfloat16, device=x.device) if return_act_w else x
+    _compile_bwd(I, with_scale, with_bound, BM, grid_x, return_gate, return_act_w)(
+        dact, x, dx, scale_d, ntb_d, grad_gate, act_w, M, stream=torch.cuda.current_stream()
     )
     if return_gate and return_act_w:
-        return dacc1, grad_gate, act_w
+        return dx, grad_gate, act_w
     if return_gate:
-        return dacc1, grad_gate
+        return dx, grad_gate
     if return_act_w:
-        return dacc1, act_w
-    return dacc1
+        return dx, act_w
+    return dx
 
 
 def swiglu(
-    acc1: torch.Tensor,
-    act: torch.Tensor | None,
-    I: int,
-    M: int,
+    x: torch.Tensor,
     scale: torch.Tensor | None = None,
-    clamp: float = ACTIVATION_CLAMP,
     stream=None,
-    num_tile_blocks: torch.Tensor | None = None,
-    BM: int = 0,
 ) -> torch.Tensor:
-    """Fused SwiGLU over the first M rows in one FlyDSL pass; allocates `act` if None, optional scale/bound."""
+    """Fused SwiGLU over the rows of x[M,2I] in one FlyDSL pass; allocates + returns act[M,I].
+    Optional per-row scale; the device-bounded real-row count rides the active symm workspace."""
     if stream is None:
         stream = torch.cuda.current_stream()
-    if act is None:
-        act = torch.empty((acc1.size(0), I), dtype=torch.bfloat16, device=acc1.device)
-    with_scale, scale_d, with_bound, ntb_d, grid_x = _resolve_opts(scale, num_tile_blocks, acc1)
-    _compile(I, int(round(clamp * 1000)), with_scale, with_bound, BM, grid_x)(
-        acc1, act, scale_d, ntb_d, M, stream=stream
-    )
+    M, two_I = x.shape
+    assert two_I % 2 == 0, f"x last dim must be even (gate||up), got {two_I}"
+    I = two_I // 2
+    act = torch.empty((M, I), dtype=torch.bfloat16, device=x.device)
+    BM, num_tile_blocks = _active_symm_bounds()
+    with_scale, scale_d, with_bound, ntb_d, grid_x = _resolve_opts(scale, num_tile_blocks, x)
+    _compile(I, with_scale, with_bound, BM, grid_x)(x, act, scale_d, ntb_d, M, stream=stream)
     return act

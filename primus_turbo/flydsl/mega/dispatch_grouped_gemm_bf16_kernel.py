@@ -26,17 +26,22 @@ BLOCK_K (DSv3 shapes qualify) and hidden a multiple of 512 (warp push step).
 """
 
 import functools
-import os as _os
-
-import torch
-
-# [DIAG] skip the role3 sb_copy gate (measures the scatter-dependency cost; breaks correctness)
-_DIAG_SKIP_SBCOPY = int(_os.environ.get("MEGA_SKIP_SBCOPY", "0"))
+from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import arith
-from flydsl.expr.buffer_ops import buffer_load, create_buffer_resource
+from flydsl.expr.buffer_ops import (
+    buffer_load,
+    create_buffer_resource,
+    create_buffer_resource_from_addr,
+)
+from flydsl.expr.typing import AddressSpace, PointerType
+
+from primus_turbo.flydsl.common.tile_spec import _emit_if_then
+from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
 
 # shared bf16 GEMM tile + geometry/LDS helpers from the dense bf16 kernel
 from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
@@ -45,32 +50,28 @@ from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
     gemm_bf16_nt_tile,
     gemm_bf16_tn_tile,
 )
-
-# per-tile GEMM closure by layout (NT forward, NN dgrad, TN wgrad); all grouped via b_group_base
-_GEMM_TILE = {"nt": gemm_bf16_nt_tile, "nn": gemm_bf16_nn_tile, "tn": gemm_bf16_tn_tile}
-from primus_turbo.flydsl.common.tile_spec import _emit_if_then
-
-# comm-PUSH + scoreboard prims (byte-agnostic; shared intra-node EP layer)
-from primus_turbo.flydsl.mega.ep_intranode import (
-    _BLOCK_THREADS,
-    _atomic_add_local_ret,
-    _bf16_push_geom,
-    _fence_acquire,
-    _ld_relaxed,
-    _st_relaxed,
-    dispatch_bf16_tile,
-    permute_token_tile,
-)
+from primus_turbo.flydsl.mega.prims import atomic_add, ld, memory_fence, st
+from primus_turbo.flydsl.mega.sym_layout import SymLayout
+from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.utils.gemm_helper import (
     ceildiv,
     make_value_attrs,
     xcd_remap_pid,
 )
 
+# per-tile GEMM closure by layout (NT forward, NN dgrad, TN wgrad); all grouped via b_group_base
+_GEMM_TILE = {"nt": gemm_bf16_nt_tile, "nn": gemm_bf16_nn_tile, "tn": gemm_bf16_tn_tile}
+
+_BLOCK_M = 256
+
+# comm-PUSH + scoreboard prims (byte-agnostic; shared intra-node EP layer)
+
+# fused dispatch-prologue: builds the DeepEP-style handle when handle=None
+
 
 # ───────────────────────────────────────────────────────────────────────
 # Grouped GEMM-only launcher (the compute-peak baseline). Dense XCD-swizzle
-# scheduler + GROUP_M, per-expert B slab via tile_to_group.
+# scheduler + GROUP_M, per-expert B slab via tile_to_expert.
 # ───────────────────────────────────────────────────────────────────────
 @functools.lru_cache(maxsize=256)
 def compile_grouped_gemm_bf16(
@@ -179,8 +180,6 @@ def _compile(
     agpr_alloc=0,
     out_fp16=False,
     GROUP_M=1,
-    dedup=False,
-    permute_blocks=32,
     layout="nt",
 ):
     K = hidden_size
@@ -190,33 +189,21 @@ def _compile(
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = pool_capacity // BLOCK_M
-    # dest-local copy geometry (bf16 token row pushed/copied as i32 words)
-    vec_i32, hidden_i32, n_warps, cols_per_warp_i32, chunk_count = _bf16_push_geom(hidden_size)
-    assert BLOCK_M % n_warps == 0, f"BLOCK_M={BLOCK_M} must be a multiple of n_warps={n_warps}"
-    rows_per_warp = BLOCK_M // n_warps
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-    def dispatch_grouped(
+    def dispatch_grouped_gemm_kernel(
         INPUT_TOKENS: fx.Tensor,
-        COMM_DESTINATION: fx.Tensor,
-        COMM_START: fx.Tensor,
-        COMM_COUNT: fx.Tensor,
-        COMM_SOURCE_OFFSET: fx.Tensor,
-        SOURCE_TOKENS: fx.Tensor,
-        POOL_PTRS: fx.Tensor,
-        SCOREBOARD_PTRS: fx.Tensor,
-        POOL: fx.Tensor,
+        EXPERT_SEND_DST_RANK: fx.Tensor,
+        EXPERT_SEND_DST_ROW: fx.Tensor,
+        EXPERT_SEND_COUNT: fx.Tensor,
+        EXPERT_SEND_OFFSET: fx.Tensor,
+        DISPATCHED_TOKEN_IDX: fx.Tensor,
+        sym_layout: SymLayout,
         WEIGHTS: fx.Tensor,
         OUTPUT: fx.Tensor,
         TILE_TO_GROUP: fx.Tensor,
-        SCOREBOARD: fx.Tensor,
         EXPECTED: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
-        SOURCE_DEDUP: fx.Tensor,
-        DEDUP_SRC_ROW: fx.Tensor,
-        SB_COPY: fx.Tensor,
-        SB_CONSUME: fx.Tensor,
-        POOL_I32: fx.Tensor,
         c_n: fx.Int32,
     ):
         thread_index = fx.thread_idx.x
@@ -226,183 +213,145 @@ def _compile(
 
         # ===== COMM role resources =====
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
-        destination_resource = create_buffer_resource(COMM_DESTINATION, max_size=True)
-        comm_start_resource = create_buffer_resource(COMM_START, max_size=True)
-        comm_count_resource = create_buffer_resource(COMM_COUNT, max_size=True)
-        comm_source_offset_resource = create_buffer_resource(COMM_SOURCE_OFFSET, max_size=True)
-        source_tokens_resource = create_buffer_resource(SOURCE_TOKENS, max_size=True)
-        pool_address_resource = create_buffer_resource(POOL_PTRS, max_size=True)
-        scoreboard_address_resource = create_buffer_resource(SCOREBOARD_PTRS, max_size=True)
+        expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
+        expert_send_dst_row_resource = create_buffer_resource(EXPERT_SEND_DST_ROW, max_size=True)
+        expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
+        expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
+        dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
+        # pool base / peer pool / peer scoreboard all come from the SymLayout now
         # ===== GEMM role resources =====
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         expected_resource = create_buffer_resource(EXPECTED, max_size=True)
         num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
-        # ===== dedup resources (token-dedup XGMI saving) =====
-        if fx.const_expr(dedup):
-            source_dedup_resource = create_buffer_resource(SOURCE_DEDUP, max_size=True)
-            dedup_src_row_resource = create_buffer_resource(DEDUP_SRC_ROW, max_size=True)
-            sb_copy_resource = create_buffer_resource(SB_COPY, max_size=True)
-            pool_i32_resource = create_buffer_resource(POOL_I32, max_size=True)
-        else:
-            source_dedup_resource = None
 
         dispatch_tile = dispatch_bf16_tile(
             thread_index=thread_index,
             hidden_size=hidden_size,
             pool_capacity=pool_capacity,
             input_resource=input_resource,
-            destination_resource=destination_resource,
-            comm_start_resource=comm_start_resource,
-            comm_count_resource=comm_count_resource,
-            comm_source_offset_resource=comm_source_offset_resource,
-            source_tokens_resource=source_tokens_resource,
-            pool_address_resource=pool_address_resource,
+            expert_send_dst_rank_resource=expert_send_dst_rank_resource,
+            expert_send_dst_row_resource=expert_send_dst_row_resource,
+            expert_send_count_resource=expert_send_count_resource,
+            expert_send_offset_resource=expert_send_offset_resource,
+            dispatched_token_idx_resource=dispatched_token_idx_resource,
+            pool_address_resource=None,
             signal=True,
-            scoreboard_address_resource=scoreboard_address_resource,
+            scoreboard_address_resource=None,
             block_m=BLOCK_M,
-            source_dedup_resource=source_dedup_resource,
+            # two-heap delta path: local base ptr + i64[world] per-peer delta table
+            pool_base=sym_layout.pool_ptr,
+            pool_offsets_resource=create_buffer_resource_from_addr(
+                sym_layout.offsets_ptr, num_records_bytes=int(sym_layout.num_ranks) * 8
+            ),
+            scoreboard_base=sym_layout.scoreboard_ptr,
+            scoreboard_offsets_resource=create_buffer_resource_from_addr(
+                sym_layout.signal_offsets_ptr, num_records_bytes=int(sym_layout.num_ranks) * 8
+            ),
         )
 
-        # ── 3-role (dedup): role1 dispatch [0,D) ‖ role2 permute [D,D+P) ‖ role3 gemm.
-        #    2-role (no dedup): role1 dispatch [0,D) ‖ role2 gemm. ───────────────────
-        gemm_offset = fx.Int32(num_dispatch_cu + (permute_blocks if dedup else 0))
+        # ── 2-role: role1 dispatch [0,D) ‖ role2 gemm [D, grid). ───────────────────
         if block_index < comm_block_count:
-            # role1: dispatch PUSH (primaries over XGMI; secondaries skipped) + signal.
+            # role1: dispatch PUSH over XGMI + signal.
             local_task_count = (
                 fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
             ) // comm_block_count
             for task_iteration in range(local_task_count):
                 dispatch_tile(block_index + task_iteration * comm_block_count, fx.Int32(0), 1)
         else:
-            run_gemm = True
-            tile_index = block_index - gemm_offset
-            if fx.const_expr(dedup):
-                # role2: dest-local permute copy (concurrent with role1 + role3)
-                if block_index < gemm_offset:
-                    permute_token_tile(
-                        thread_index,
-                        block_index - comm_block_count,
-                        fx.Int32(permute_blocks),
-                        num_tile_blocks_resource,
-                        dedup_src_row_resource,
-                        expected_resource,
-                        SCOREBOARD,
-                        pool_i32_resource,
-                        sb_copy_resource,
-                        BLOCK_M,
-                        n_warps,
-                        rows_per_warp,
-                        chunk_count,
-                        cols_per_warp_i32,
-                        vec_i32,
-                        hidden_i32,
-                    )
-                    run_gemm = False
-            if run_gemm:
-                # role3 (dedup) / role2 (no dedup): GROUP_M tile-id map over the REAL grid.
-                real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
-                real_grid = real_tiles * fx.Int32(n_blocks)
-                if tile_index < real_grid:
-                    num_pid_in_group = fx.Int32(GROUP_M * n_blocks)
-                    group_id = tile_index // num_pid_in_group
-                    pid_in_group = tile_index % num_pid_in_group
-                    first_pid_m = group_id * fx.Int32(GROUP_M)
-                    remaining_m = real_tiles - first_pid_m
-                    group_size_m = arith.select(
-                        remaining_m < fx.Int32(GROUP_M), remaining_m, fx.Int32(GROUP_M)
-                    )
-                    block_m = first_pid_m + (pid_in_group % group_size_m)
-                    block_n = pid_in_group // group_size_m
-                    c_m_real = fx.Int32(pool_capacity)
-                    # GEMM gate: wait this block's primaries (scoreboard) and, under dedup,
-                    # the role2 secondary copies (sb_copy). No copy work here.
-                    expected_count = buffer_load(expected_resource, block_m, vec_width=1, dtype=fx.T.i32())
-                    if thread_index == fx.Int32(0):
-                        signal = _ld_relaxed(SCOREBOARD, block_m)
-                        while signal < expected_count:
-                            fx.rocdl.s_sleep(fx.Int32(2))
-                            signal = _ld_relaxed(SCOREBOARD, block_m)
-                        if fx.const_expr(dedup and not _DIAG_SKIP_SBCOPY):
-                            copy_done = _ld_relaxed(SB_COPY, block_m)
-                            while copy_done < fx.Int32(1):
-                                fx.rocdl.s_sleep(fx.Int32(2))
-                                copy_done = _ld_relaxed(SB_COPY, block_m)
-                        # last-reader self-reset: n_blocks GEMM blocks share SCOREBOARD[block_m];
-                        # the one whose count hits n_blocks (all readers already past the spin)
-                        # zeroes the gate + its counter for the next launch (folds out host zero).
-                        prev = _atomic_add_local_ret(SB_CONSUME, block_m, fx.Int32(1))
-                        if prev == fx.Int32(n_blocks - 1):
-                            _st_relaxed(SCOREBOARD, block_m, fx.Int32(0))
-                            _st_relaxed(SB_CONSUME, block_m, fx.Int32(0))
-                    fx.gpu.barrier()
-                    _fence_acquire()  # read fresh peer-pushed + locally-copied pool rows
+            # role2: GROUP_M tile-id map over the REAL grid.
+            tile_index = block_index - comm_block_count
+            real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+            real_grid = real_tiles * fx.Int32(n_blocks)
+            if tile_index < real_grid:
+                num_pid_in_group = fx.Int32(GROUP_M * n_blocks)
+                group_id = tile_index // num_pid_in_group
+                pid_in_group = tile_index % num_pid_in_group
+                first_pid_m = group_id * fx.Int32(GROUP_M)
+                remaining_m = real_tiles - first_pid_m
+                group_size_m = arith.select(remaining_m < fx.Int32(GROUP_M), remaining_m, fx.Int32(GROUP_M))
+                block_m = first_pid_m + (pid_in_group % group_size_m)
+                block_n = pid_in_group // group_size_m
+                c_m_real = fx.Int32(pool_capacity)
+                # GEMM gate: wait this block's primaries (scoreboard). No copy work here.
+                # local scoreboard reachable via the SymLayout base (same memory the
+                # dispatch role signals on peers); no separate SCOREBOARD arg needed.
+                sb_base = sym_layout.scoreboard_ptr
+                expected_count = buffer_load(expected_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                if thread_index == fx.Int32(0):
+                    signal = ld(sb_base, block_m, scope="sys")
+                    while signal < expected_count:
+                        fx.rocdl.s_sleep(fx.Int32(2))
+                        signal = ld(sb_base, block_m, scope="sys")
+                fx.gpu.barrier()
+                memory_fence("acquire", scope="sys")  # read fresh peer-pushed pool rows
 
-                    g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
-                    gbase = g_idx * fx.Int32(K) * c_n
-                    gemm_tile(
-                        POOL,
-                        WEIGHTS,
-                        OUTPUT,
-                        c_m_real,
-                        c_n,
-                        lds,
-                        block_m,
-                        block_n,
-                        K=K,
-                        BLOCK_M=BLOCK_M,
-                        BLOCK_N=BLOCK_N,
-                        out_fp16=out_fp16,
-                        nt_vmcnt=nt_vmcnt,
-                        b_group_base=gbase,
-                    )
+                g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                gbase = g_idx * fx.Int32(K) * c_n
+                # A operand: bf16 view over this rank's pool from the SymLayout base ptr
+                pool_ptr_ty = PointerType.get(
+                    elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
+                )
+                pool_tensor = fx.make_view(
+                    fx.inttoptr(pool_ptr_ty, sym_layout.pool_ptr),
+                    fx.make_layout(pool_capacity * K, 1),
+                )
+                gemm_tile(
+                    pool_tensor,
+                    WEIGHTS,
+                    OUTPUT,
+                    c_m_real,
+                    c_n,
+                    lds,
+                    block_m,
+                    block_n,
+                    K=K,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                    out_fp16=out_fp16,
+                    nt_vmcnt=nt_vmcnt,
+                    b_group_base=gbase,
+                )
+                # No SB_CONSUME: fold the reader count into the scoreboard. After each
+                # GEMM tile finishes, bump scoreboard[block_m]; the last of the n_blocks
+                # N-tiles (count reaches expected + n_blocks - 1) resets the slot to 0
+                # for the next launch. The gate stays >= expected, so readers that arrive
+                # after earlier bumps still pass; reset only fires once all have passed.
+                if thread_index == fx.Int32(0):
+                    prev = atomic_add(sb_base, block_m, fx.Int32(1), scope="sys")
+                    if prev == expected_count + fx.Int32(n_blocks - 1):
+                        st(sb_base, block_m, fx.Int32(0), scope="sys")
 
     @flyc.jit
     def launch(
         INPUT_TOKENS,
-        COMM_DESTINATION,
-        COMM_START,
-        COMM_COUNT,
-        COMM_SOURCE_OFFSET,
-        SOURCE_TOKENS,
-        POOL_PTRS,
-        SCOREBOARD_PTRS,
-        POOL,
+        EXPERT_SEND_DST_RANK,
+        EXPERT_SEND_DST_ROW,
+        EXPERT_SEND_COUNT,
+        EXPERT_SEND_OFFSET,
+        DISPATCHED_TOKEN_IDX,
+        sym_layout,
         WEIGHTS,
         OUTPUT,
         TILE_TO_GROUP,
-        SCOREBOARD,
         EXPECTED,
         NUM_TILE_BLOCKS,
-        SOURCE_DEDUP,
-        DEDUP_SRC_ROW,
-        SB_COPY,
-        SB_CONSUME,
-        POOL_I32,
         c_n: int,
         stream: fx.Stream = fx.Stream(None),
     ):
-        grid_size = num_dispatch_cu + (permute_blocks if dedup else 0) + worst_case_tiles * n_blocks
-        dispatch_grouped(
+        grid_size = num_dispatch_cu + worst_case_tiles * n_blocks
+        dispatch_grouped_gemm_kernel(
             INPUT_TOKENS,
-            COMM_DESTINATION,
-            COMM_START,
-            COMM_COUNT,
-            COMM_SOURCE_OFFSET,
-            SOURCE_TOKENS,
-            POOL_PTRS,
-            SCOREBOARD_PTRS,
-            POOL,
+            EXPERT_SEND_DST_RANK,
+            EXPERT_SEND_DST_ROW,
+            EXPERT_SEND_COUNT,
+            EXPERT_SEND_OFFSET,
+            DISPATCHED_TOKEN_IDX,
+            sym_layout,
             WEIGHTS,
             OUTPUT,
             TILE_TO_GROUP,
-            SCOREBOARD,
             EXPECTED,
             NUM_TILE_BLOCKS,
-            SOURCE_DEDUP,
-            DEDUP_SRC_ROW,
-            SB_COPY,
-            SB_CONSUME,
-            POOL_I32,
             c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -422,7 +371,7 @@ def grouped_gemm_bf16_only(
     pool,  # [M, K] bf16   A operand (pre-filled activation)
     weight,  # [G, N, K] bf16   per-expert B
     output,  # [M, N] bf16   C
-    tile_to_group,  # [n_mblk] i32   expert id per BM pool block
+    tile_to_expert,  # [n_mblk] i32   expert id per BM pool block
     num_tile_blocks,  # [1] i32        real tile-block count (device)
     # ── tile / schedule config (compile-time scalars) ─────────────────
     *,
@@ -437,7 +386,7 @@ def grouped_gemm_bf16_only(
 ):
     """Pure grouped BF16 GEMM (no dispatch) — the compute-peak baseline.
 
-    ``pool`` is A=[M,K] bf16, ``output`` is [M,N] bf16, ``tile_to_group`` maps each
+    ``pool`` is A=[M,K] bf16, ``output`` is [M,N] bf16, ``tile_to_expert`` maps each
     BM pool block -> expert. Weight layout: NT (forward) ``weight`` [G,N,K];
     NN (dgrad) / TN (wgrad) ``weight`` [G,K,N]. ``num_tile_blocks`` is the real
     tile-block count (runtime over-launch self-bound)."""
@@ -470,7 +419,7 @@ def grouped_gemm_bf16_only(
         _bf16_flat(pool),
         weight_flat,
         _bf16_flat(output),
-        tile_to_group,
+        tile_to_expert,
         num_tile_blocks,
         c_m,
         out_features,
@@ -492,22 +441,22 @@ def _compile_dispatch_only(hidden_size, pool_capacity, num_dispatch_cu, num_comm
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_only_k(
         INPUT_TOKENS: fx.Tensor,
-        COMM_DESTINATION: fx.Tensor,
-        COMM_START: fx.Tensor,
-        COMM_COUNT: fx.Tensor,
-        COMM_SOURCE_OFFSET: fx.Tensor,
-        SOURCE_TOKENS: fx.Tensor,
+        EXPERT_SEND_DST_RANK: fx.Tensor,
+        EXPERT_SEND_DST_ROW: fx.Tensor,
+        EXPERT_SEND_COUNT: fx.Tensor,
+        EXPERT_SEND_OFFSET: fx.Tensor,
+        DISPATCHED_TOKEN_IDX: fx.Tensor,
         POOL_PTRS: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         comm_block_count = fx.Int32(num_dispatch_cu)
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
-        destination_resource = create_buffer_resource(COMM_DESTINATION, max_size=True)
-        comm_start_resource = create_buffer_resource(COMM_START, max_size=True)
-        comm_count_resource = create_buffer_resource(COMM_COUNT, max_size=True)
-        comm_source_offset_resource = create_buffer_resource(COMM_SOURCE_OFFSET, max_size=True)
-        source_tokens_resource = create_buffer_resource(SOURCE_TOKENS, max_size=True)
+        expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
+        expert_send_dst_row_resource = create_buffer_resource(EXPERT_SEND_DST_ROW, max_size=True)
+        expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
+        expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
+        dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
         pool_address_resource = create_buffer_resource(POOL_PTRS, max_size=True)
 
         dispatch_tile = dispatch_bf16_tile(
@@ -515,11 +464,11 @@ def _compile_dispatch_only(hidden_size, pool_capacity, num_dispatch_cu, num_comm
             hidden_size=hidden_size,
             pool_capacity=pool_capacity,
             input_resource=input_resource,
-            destination_resource=destination_resource,
-            comm_start_resource=comm_start_resource,
-            comm_count_resource=comm_count_resource,
-            comm_source_offset_resource=comm_source_offset_resource,
-            source_tokens_resource=source_tokens_resource,
+            expert_send_dst_rank_resource=expert_send_dst_rank_resource,
+            expert_send_dst_row_resource=expert_send_dst_row_resource,
+            expert_send_count_resource=expert_send_count_resource,
+            expert_send_offset_resource=expert_send_offset_resource,
+            dispatched_token_idx_resource=dispatched_token_idx_resource,
             pool_address_resource=pool_address_resource,
             signal=False,
         )
@@ -540,21 +489,21 @@ def _compile_dispatch_only(hidden_size, pool_capacity, num_dispatch_cu, num_comm
     @flyc.jit
     def launch(
         INPUT_TOKENS,
-        COMM_DESTINATION,
-        COMM_START,
-        COMM_COUNT,
-        COMM_SOURCE_OFFSET,
-        SOURCE_TOKENS,
+        EXPERT_SEND_DST_RANK,
+        EXPERT_SEND_DST_ROW,
+        EXPERT_SEND_COUNT,
+        EXPERT_SEND_OFFSET,
+        DISPATCHED_TOKEN_IDX,
         POOL_PTRS,
         stream: fx.Stream = fx.Stream(None),
     ):
         dispatch_only_k(
             INPUT_TOKENS,
-            COMM_DESTINATION,
-            COMM_START,
-            COMM_COUNT,
-            COMM_SOURCE_OFFSET,
-            SOURCE_TOKENS,
+            EXPERT_SEND_DST_RANK,
+            EXPERT_SEND_DST_ROW,
+            EXPERT_SEND_COUNT,
+            EXPERT_SEND_OFFSET,
+            DISPATCHED_TOKEN_IDX,
             POOL_PTRS,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_dispatch_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -565,8 +514,9 @@ def _compile_dispatch_only(hidden_size, pool_capacity, num_dispatch_cu, num_comm
 def dispatch_only(
     # ── source activation (pushed over XGMI) ──────────────────────────
     x,  # [num_src_tokens, K] bf16
-    # ── dispatch plan handle (DeepEP-style; expanded to ABI below) ─────
-    plan,  # dispatch handle tuple: (dst_rank, dst_offset, count, src_offset, src_tokens, ...)
+    # ── dispatch handle handle (DeepEP-style; expanded to ABI below) ─────
+    # dispatch handle tuple: (dst_rank, dst_offset, count, src_offset, src_tokens, ...)
+    handle,
     # ── symmetric activation pool (push target) ───────────────────────
     pool,  # [pool_capacity, K] bf16   local landing pool
     pool_ptrs,  # [world] i64   peer pool base ptrs
@@ -575,11 +525,13 @@ def dispatch_only(
     num_dispatch_cu=32,
 ):
     """Cross-rank dispatch PUSH only (no GEMM) — pushes ``x`` token rows to peer
-    pools over XGMI. Bytes pushed per rank = (sum comm_count) * hidden * 2."""
-    # expand the plan to the device ABI (order is correctness-critical)
+    pools over XGMI. Bytes pushed per rank = (sum expert_send_count) * hidden * 2."""
+    # expand the handle to the device ABI (order is correctness-critical)
     # dispatch handle (DeepEP-style tuple); num_comm derived from dst_rank
-    comm_dest, comm_start, comm_count, comm_src_offset, comm_src_tokens = plan[:5]
-    num_comm = comm_dest.numel()
+    expert_send_dst_rank, expert_send_dst_row, expert_send_count, expert_send_offset, dispatched_token_idx = (
+        handle[:5]
+    )
+    num_comm = expert_send_dst_rank.numel()
     assert x.dtype == torch.bfloat16
     hidden_size = x.size(1)
     pool_capacity = pool.size(0)
@@ -587,293 +539,12 @@ def dispatch_only(
     launch = _compile_dispatch_only(hidden_size, pool_capacity, int(num_dispatch_cu), int(num_comm))
     launch(
         x_i32,
-        comm_dest,
-        comm_start,
-        comm_count,
-        comm_src_offset,
-        comm_src_tokens,
+        expert_send_dst_rank,
+        expert_send_dst_row,
+        expert_send_count,
+        expert_send_offset,
+        dispatched_token_idx,
         pool_ptrs,
-        stream=torch.cuda.current_stream(),
-    )
-
-
-# ───────────────────────────────────────────────────────────────────────
-# Dispatch-PUSH-only WITH token dedup (no GEMM): push PRIMARY rows over XGMI
-# (secondaries skipped) + dest-local permute copy of secondaries. Mirrors the
-# fused comm role exactly, minus the GEMM -> isolates the dispatch-side cost of
-# dedup (XGMI saving vs the local-copy + scoreboard overhead).
-# ───────────────────────────────────────────────────────────────────────
-@functools.lru_cache(maxsize=256)
-def _compile_dispatch_dedup_only(
-    hidden_size, pool_capacity, dispatch_blocks, permute_blocks, num_comm, BLOCK_M, waves_per_eu=2
-):
-    # 2-role: role1 (block < dispatch_blocks) pushes PRIMARY rows + signals scoreboard;
-    # role2 (block >= dispatch_blocks) permute-copies secondaries CONCURRENTLY (gated on
-    # the primary scoreboard) -> permute hides under the dispatch push (triton_dist 2-stage).
-    vec_i32, hidden_i32, n_warps, cols_per_warp_i32, chunk_count = _bf16_push_geom(hidden_size)
-    assert BLOCK_M % n_warps == 0, f"BLOCK_M={BLOCK_M} must be a multiple of n_warps={n_warps}"
-    rows_per_warp = BLOCK_M // n_warps
-
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-    def dispatch_dedup_k(
-        INPUT_TOKENS: fx.Tensor,
-        COMM_DESTINATION: fx.Tensor,
-        COMM_START: fx.Tensor,
-        COMM_COUNT: fx.Tensor,
-        COMM_SOURCE_OFFSET: fx.Tensor,
-        SOURCE_TOKENS: fx.Tensor,
-        POOL_PTRS: fx.Tensor,
-        SCOREBOARD_PTRS: fx.Tensor,
-        SCOREBOARD: fx.Tensor,
-        EXPECTED: fx.Tensor,
-        NUM_TILE_BLOCKS: fx.Tensor,
-        SOURCE_DEDUP: fx.Tensor,
-        DEDUP_SRC_ROW: fx.Tensor,
-        SB_COPY: fx.Tensor,
-        POOL_I32: fx.Tensor,
-    ):
-        thread_index = fx.thread_idx.x
-        block_index, _b, _c = fx.block_idx
-        dispatch_block_count = fx.Int32(dispatch_blocks)
-        permute_block_count = fx.Int32(permute_blocks)
-        input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
-        destination_resource = create_buffer_resource(COMM_DESTINATION, max_size=True)
-        comm_start_resource = create_buffer_resource(COMM_START, max_size=True)
-        comm_count_resource = create_buffer_resource(COMM_COUNT, max_size=True)
-        comm_source_offset_resource = create_buffer_resource(COMM_SOURCE_OFFSET, max_size=True)
-        source_tokens_resource = create_buffer_resource(SOURCE_TOKENS, max_size=True)
-        pool_address_resource = create_buffer_resource(POOL_PTRS, max_size=True)
-        scoreboard_address_resource = create_buffer_resource(SCOREBOARD_PTRS, max_size=True)
-        expected_resource = create_buffer_resource(EXPECTED, max_size=True)
-        num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
-        source_dedup_resource = create_buffer_resource(SOURCE_DEDUP, max_size=True)
-        dedup_src_row_resource = create_buffer_resource(DEDUP_SRC_ROW, max_size=True)
-        sb_copy_resource = create_buffer_resource(SB_COPY, max_size=True)
-        pool_i32_resource = create_buffer_resource(POOL_I32, max_size=True)
-
-        if block_index < dispatch_block_count:
-            # role1: push primary rows + signal scoreboard (secondaries skipped)
-            dispatch_tile = dispatch_bf16_tile(
-                thread_index=thread_index,
-                hidden_size=hidden_size,
-                pool_capacity=pool_capacity,
-                input_resource=input_resource,
-                destination_resource=destination_resource,
-                comm_start_resource=comm_start_resource,
-                comm_count_resource=comm_count_resource,
-                comm_source_offset_resource=comm_source_offset_resource,
-                source_tokens_resource=source_tokens_resource,
-                pool_address_resource=pool_address_resource,
-                signal=True,
-                scoreboard_address_resource=scoreboard_address_resource,
-                block_m=BLOCK_M,
-                source_dedup_resource=source_dedup_resource,
-            )
-            local_task_count = (
-                fx.Int32(num_comm) - block_index + dispatch_block_count - fx.Int32(1)
-            ) // dispatch_block_count
-            for task_iteration in range(local_task_count):
-                dispatch_tile(block_index + task_iteration * dispatch_block_count, fx.Int32(0), 1)
-        else:
-            # role2: dest-local permute copy of secondaries (concurrent with role1)
-            permute_block_index = block_index - dispatch_block_count
-            permute_token_tile(
-                thread_index,
-                permute_block_index,
-                permute_block_count,
-                num_tile_blocks_resource,
-                dedup_src_row_resource,
-                expected_resource,
-                SCOREBOARD,
-                pool_i32_resource,
-                sb_copy_resource,
-                BLOCK_M,
-                n_warps,
-                rows_per_warp,
-                chunk_count,
-                cols_per_warp_i32,
-                vec_i32,
-                hidden_i32,
-            )
-
-    @flyc.jit
-    def launch(
-        INPUT_TOKENS,
-        COMM_DESTINATION,
-        COMM_START,
-        COMM_COUNT,
-        COMM_SOURCE_OFFSET,
-        SOURCE_TOKENS,
-        POOL_PTRS,
-        SCOREBOARD_PTRS,
-        SCOREBOARD,
-        EXPECTED,
-        NUM_TILE_BLOCKS,
-        SOURCE_DEDUP,
-        DEDUP_SRC_ROW,
-        SB_COPY,
-        POOL_I32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        grid_size = dispatch_blocks + permute_blocks
-        dispatch_dedup_k(
-            INPUT_TOKENS,
-            COMM_DESTINATION,
-            COMM_START,
-            COMM_COUNT,
-            COMM_SOURCE_OFFSET,
-            SOURCE_TOKENS,
-            POOL_PTRS,
-            SCOREBOARD_PTRS,
-            SCOREBOARD,
-            EXPECTED,
-            NUM_TILE_BLOCKS,
-            SOURCE_DEDUP,
-            DEDUP_SRC_ROW,
-            SB_COPY,
-            POOL_I32,
-            value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
-        ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
-
-    return launch
-
-
-def dispatch_dedup_only(
-    x,
-    plan,  # dispatch handle tuple: (dst_rank, dst_offset, count, src_offset, src_tokens, ...)
-    pool,
-    pool_ptrs,
-    scoreboard,
-    scoreboard_ptrs,
-    expected_count,
-    num_tile_blocks,
-    source_dedup,
-    dedup_src_row,
-    sb_copy,
-    *,
-    BM=256,
-    dispatch_blocks=16,
-    permute_blocks=16,
-):
-    """2-role cross-rank dispatch PUSH with token dedup (no GEMM): role1 pushes PRIMARY
-    rows over XGMI (secondaries skipped) + signals scoreboard; role2 dest-local
-    ``permute_token_tile`` copies secondaries CONCURRENTLY. Scoreboard + sb_copy zeroed first."""
-    # expand the plan to the device ABI (order is correctness-critical)
-    # dispatch handle (DeepEP-style tuple); num_comm derived from dst_rank
-    comm_dest, comm_start, comm_count, comm_src_offset, comm_src_tokens = plan[:5]
-    num_comm = comm_dest.numel()
-    assert x.dtype == torch.bfloat16
-    hidden_size = x.size(1)
-    pool_capacity = pool.size(0)
-    x_i32 = x.contiguous().view(torch.int32).view(-1)
-    pool_i32 = pool.contiguous().view(torch.int32).view(-1)
-    launch = _compile_dispatch_dedup_only(
-        hidden_size, pool_capacity, int(dispatch_blocks), int(permute_blocks), int(num_comm), int(BM)
-    )
-    launch(
-        x_i32,
-        comm_dest,
-        comm_start,
-        comm_count,
-        comm_src_offset,
-        comm_src_tokens,
-        pool_ptrs,
-        scoreboard_ptrs,
-        scoreboard,
-        expected_count,
-        num_tile_blocks,
-        source_dedup,
-        dedup_src_row,
-        sb_copy,
-        pool_i32,
-        stream=torch.cuda.current_stream(),
-    )
-
-
-# ───────────────────────────────────────────────────────────────────────
-# permute_token ONLY (role2 standalone) — measures the dest-local copy bandwidth
-# in isolation (caller pre-fills the scoreboard so there is no wait).
-# ───────────────────────────────────────────────────────────────────────
-@functools.lru_cache(maxsize=256)
-def _compile_permute_only(hidden_size, pool_capacity, permute_blocks, BLOCK_M, waves_per_eu=2):
-    vec_i32, hidden_i32, n_warps, cols_per_warp_i32, chunk_count = _bf16_push_geom(hidden_size)
-    assert BLOCK_M % n_warps == 0
-    rows_per_warp = BLOCK_M // n_warps
-
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-    def permute_only_k(
-        SCOREBOARD: fx.Tensor,
-        EXPECTED: fx.Tensor,
-        NUM_TILE_BLOCKS: fx.Tensor,
-        DEDUP_SRC_ROW: fx.Tensor,
-        SB_COPY: fx.Tensor,
-        POOL_I32: fx.Tensor,
-    ):
-        thread_index = fx.thread_idx.x
-        block_index, _b, _c = fx.block_idx
-        expected_resource = create_buffer_resource(EXPECTED, max_size=True)
-        num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
-        dedup_src_row_resource = create_buffer_resource(DEDUP_SRC_ROW, max_size=True)
-        sb_copy_resource = create_buffer_resource(SB_COPY, max_size=True)
-        pool_i32_resource = create_buffer_resource(POOL_I32, max_size=True)
-        permute_token_tile(
-            thread_index,
-            block_index,
-            fx.Int32(permute_blocks),
-            num_tile_blocks_resource,
-            dedup_src_row_resource,
-            expected_resource,
-            SCOREBOARD,
-            pool_i32_resource,
-            sb_copy_resource,
-            BLOCK_M,
-            n_warps,
-            rows_per_warp,
-            chunk_count,
-            cols_per_warp_i32,
-            vec_i32,
-            hidden_i32,
-        )
-
-    @flyc.jit
-    def launch(
-        SCOREBOARD,
-        EXPECTED,
-        NUM_TILE_BLOCKS,
-        DEDUP_SRC_ROW,
-        SB_COPY,
-        POOL_I32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        permute_only_k(
-            SCOREBOARD,
-            EXPECTED,
-            NUM_TILE_BLOCKS,
-            DEDUP_SRC_ROW,
-            SB_COPY,
-            POOL_I32,
-            value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
-        ).launch(grid=(permute_blocks, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
-
-    return launch
-
-
-def permute_only(
-    scoreboard, expected_count, num_tile_blocks, dedup_src_row, sb_copy, pool, *, BM=256, permute_blocks=32
-):
-    """Run only the dest-local permute copy (role2). Pre-fill ``scoreboard`` >= expected so
-    there is no wait -> measures pure copy bandwidth."""
-    pool_capacity = pool.size(0)
-    hidden_size = pool.size(1)
-    pool_i32 = pool.contiguous().view(torch.int32).view(-1)
-    launch = _compile_permute_only(hidden_size, pool_capacity, int(permute_blocks), int(BM))
-    launch(
-        scoreboard,
-        expected_count,
-        num_tile_blocks,
-        dedup_src_row,
-        sb_copy,
-        pool_i32,
         stream=torch.cuda.current_stream(),
     )
 
@@ -891,50 +562,26 @@ _DISPATCH_CANDIDATES = [
     (64, 3, 0, 2),
     (80, 3, 0, 2),
     (96, 3, 0, 2),
-    (112, 3, 0, 2),
-    (128, 3, 0, 2),
-    (160, 3, 0, 2),
-    (48, 4, 0, 2),
-    (48, 2, 0, 2),
-    (64, 4, 0, 2),
-    (48, 3, 0, 1),
 ]
 _DISPATCH_AUTOTUNE_CACHE: dict = {}
 
 
 def dispatch_grouped_gemm_bf16(
     # ── source activation (pushed over XGMI) ──────────────────────────
-    x,  # [num_src_tokens, K] bf16
-    # ── dispatch plan handle (DeepEP-style; expanded to ABI below) ─────
-    plan,  # dispatch handle tuple: (dst_rank, dst_offset, count, src_offset, src_tokens, ...)
-    # ── symmetric activation pool (A operand) ─────────────────────────
-    pool,  # [pool_capacity, K] bf16   local landing pool
-    pool_ptrs,  # [world] i64   peer pool base ptrs
+    x: torch.Tensor,  # [num_src_tokens, K] bf16
     # ── per-expert weight (B) + output (C) ────────────────────────────
-    weight,  # [G, N, K] bf16
-    output,  # [pool_capacity, N] bf16
-    tile_to_group,  # [n_mblk] i32   expert id per pool block
-    # ── scoreboard handshake ──────────────────────────────────────────
-    scoreboard,  # [n_mblk] i32   local fill counter (kernel self-resets at gate)
-    scoreboard_ptrs,  # [world] i64   peer scoreboard base ptrs
-    expected_count,  # [n_mblk] i32   expected push count per block
-    num_tile_blocks,  # [1] i32        real tile-block count (device)
-    sb_consume,  # [n_mblk] i32   last-reader counter (zeroed once at init; self-resets)
-    # ── tile / schedule config (compile-time scalars) ─────────────────
-    *,
-    layout="nt",
+    l1_weights: torch.Tensor,  # [G, N, K] bf16
+    group: torch.distributed.group,
+    handle: Optional[Tuple] = None,
+    topk_idx: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
+    layout: str = "nt",
+    num_dispatched_tokens: Optional[int] = None,
+    num_dispatch_cu: int = 16,
+    autotune=False,  # remove in the future
     BM=256,
     BN=256,
     GROUP_M=4,
-    num_dispatch_cu=16,  # best for fused dispatch: 16 CUs saturate XGMI, rest go to GEMM
-    nt_vmcnt=3,
-    autotune=False,
-    autotune_reset=None,
-    permute_blocks=32,
-    # ── token dedup (optional XGMI saving) ────────────────────────────
-    source_dedup=None,  # [pool_cap] i32  source-indexed: 1 = secondary (skip push)
-    dedup_src_row=None,  # [pool_cap] i32  dest-indexed: -1 = primary, >=0 = copy-from row
-    sb_copy=None,  # [n_mblk] i32    local copy-done gate (caller zeroes)
 ):
     """Fused cross-rank dispatch PUSH + grouped BF16 GEMM.
 
@@ -942,77 +589,99 @@ def dispatch_grouped_gemm_bf16(
     landing pool; ``output`` [pool_cap, N] bf16. ``layout`` selects the GEMM tile:
     NT (forward) weight [G,N,K]; NN (dgrad) weight [G,K,N]. The dispatch fills the
     pool M-major, so only NT/NN are valid here -- TN needs a K-major A, use the
-    standalone ``grouped_gemm_bf16_only``. The dispatch comm plan is flat
-    (``comm_dest/start/count/src_offset/src_tokens`` + ``num_comm``). Scoreboard zeroed first.
+    standalone ``grouped_gemm_bf16_only``. The dispatch comm handle is flat
+    (``expert_send_dst_rank/start/count/src_offset/src_tokens`` + ``num_comm``). Scoreboard zeroed first.
 
-    Token dedup (all of ``source_dedup``/``dedup_src_row``/``sb_copy`` given): a token
-    routed to >=2 experts on this dest rank crosses XGMI once (primary push); the
-    redundant pool rows are filled by a dest-local ``permute_token_tile`` copy gated on
-    the primary's scoreboard, then the GEMM additionally waits ``sb_copy``. Output same."""
-    # expand the plan to the device ABI (order is correctness-critical)
-    # dispatch handle (DeepEP-style tuple); num_comm derived from dst_rank
-    comm_dest, comm_start, comm_count, comm_src_offset, comm_src_tokens = plan[:5]
-    num_comm = comm_dest.numel()
+    The symmetric workspace (pool GEMM A operand + peer pool / peer scoreboard delta
+    tables) is fetched from the active ``get_symm_buffer_for_mega_moe()`` (no-group call)
+    -- the buffer the caller already built -- so it is no longer passed as an argument.
+    ``tile_to_expert`` / ``expected_count`` are read from the handle
+    (``handle[-2]`` / ``handle[-1]``)."""
+    # active symmetric workspace (built earlier by get_symm_buffer_for_mega_moe); names
+    # the pool + signal heaps and the peer pool/scoreboard delta tables
+    symm = get_symm_buffer_for_mega_moe()
+    sym_layout = symm.make_sym_layout()
+    # no handle given -> build the handle from topk via the fused prologue. The
+    # prologue returns tile_to_expert / expected separately (not appended to handle).
+    if handle is None:
+        assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
+        assert layout == "nt", "handle=None auto-prologue is forward-only (nt); pass handle for nn/tn"
+        num_tokens = x.size(0)
+        handle, tile_to_expert, expected_count, *_ = dispatch_prologue(
+            topk_idx,
+            topk_weights,
+            sym_layout=sym_layout,
+            num_tokens=num_tokens,
+            num_topk=int(sym_layout.num_topk),
+            num_experts=int(sym_layout.num_experts),
+            world_size=int(sym_layout.num_ranks),
+            rank=int(sym_layout.rank_idx),
+            experts_per_rank=int(sym_layout.num_experts_per_rank),
+            block_m=_BLOCK_M,
+            pool_capacity=int(sym_layout.num_max_pool_tokens),
+        )
+    else:
+        # caller-supplied extended handle: tile_to_expert / expected ride at the tail
+        tile_to_expert, expected_count = handle[-2], handle[-1]
+    # expand the handle to the device ABI (order is correctness-critical)
+    expert_send_dst_rank, expert_send_dst_row, expert_send_count, expert_send_offset, dispatched_token_idx = (
+        handle[:5]
+    )
+    num_comm = expert_send_dst_rank.numel()
     assert layout in (
         "nt",
         "nn",
     ), f"fused dispatch+GEMM supports nt/nn (pool is M-major); for tn use grouped_gemm_bf16_only, got {layout}"
-    assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    assert x.dtype == torch.bfloat16 and l1_weights.dtype == torch.bfloat16
     hidden_size = x.size(1)
     if layout == "nt":  # weight [G, N, K]
-        G, N, K = weight.shape
-        weight_flat = weight.reshape(G * N, K).contiguous().view(-1)
-    else:  # NN / TN: weight [G, K, N]
-        G, K, N = weight.shape
-        weight_flat = weight.reshape(G * K, N).contiguous().view(-1)
+        G, N, K = l1_weights.shape
+        weight_flat = l1_weights.reshape(G * N, K).contiguous().view(-1)
+    else:  # NN: weight [G, K, N]
+        G, K, N = l1_weights.shape
+        weight_flat = l1_weights.reshape(G * K, N).contiguous().view(-1)
     assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
-    pool_capacity = pool.size(0)
+    # pool capacity is a compile-time scalar named by the SymLayout
+    pool_capacity = int(sym_layout.num_max_pool_tokens)
     out_features = N
     c_n = out_features
 
+    # real tile count from the active symm buffer; meta_scalars[1] = total_rows // BM.
+    # The local scoreboard is read/reset inside the kernel via sym_layout.scoreboard_ptr
+    # (gate + folded reader-count self-reset), so neither scoreboard nor sb_consume are
+    # passed. scoreboard is kept only as the autotune per-iter reset target.
+    scoreboard = symm.scoreboard
+    num_tile_blocks = symm.meta_scalars[1:2]
+    nt_vmcnt = 3
+
+    is_nosync = num_dispatched_tokens is None
+    if is_nosync:
+        output = torch.empty((pool_capacity, out_features), dtype=x.dtype, device=x.device)
+    else:
+        assert False
+
     # source tokens pushed as i32 words (bf16 viewed as int32); pool/weight read as bf16
     x_i32 = x.contiguous().view(torch.int32).view(-1)
-    pool_flat = _bf16_flat(pool)
     output_flat = _bf16_flat(output)
-
-    # dedup: pool also viewed as i32 for the dest-local copy; dummies when disabled
-    dedup = source_dedup is not None
-    assert (dedup_src_row is None) == (source_dedup is None) and (sb_copy is None) == (
-        source_dedup is None
-    ), "token dedup needs all of source_dedup/dedup_src_row/sb_copy or none"
-    pool_i32 = pool.contiguous().view(torch.int32).view(-1)
-    if dedup:
-        source_dedup_arg, dedup_src_row_arg, sb_copy_arg = source_dedup, dedup_src_row, sb_copy
-    else:
-        _dummy = x_i32[:1]  # tiny i32; never read (resources gated on dedup)
-        source_dedup_arg = dedup_src_row_arg = sb_copy_arg = _dummy
 
     pos_args = (
         x_i32,
-        comm_dest,
-        comm_start,
-        comm_count,
-        comm_src_offset,
-        comm_src_tokens,
-        pool_ptrs,
-        scoreboard_ptrs,
-        pool_flat,
+        expert_send_dst_rank,
+        expert_send_dst_row,
+        expert_send_count,
+        expert_send_offset,
+        dispatched_token_idx,
+        sym_layout,
         weight_flat,
         output_flat,
-        tile_to_group,
-        scoreboard,
+        tile_to_expert,
         expected_count,
         num_tile_blocks,
-        source_dedup_arg,
-        dedup_src_row_arg,
-        sb_copy_arg,
-        sb_consume,
-        pool_i32,
         c_n,
     )
 
     if autotune:
-        key = (out_features, hidden_size, pool_capacity, BM, BN, int(num_comm), dedup, layout)
+        key = (out_features, hidden_size, pool_capacity, BM, BN, int(num_comm), layout)
         cached = _DISPATCH_AUTOTUNE_CACHE.get(key)
         if cached is None:
             cached = _autotune(
@@ -1025,8 +694,7 @@ def dispatch_grouped_gemm_bf16(
                 BN,
                 int(num_comm),
                 scoreboard,
-                autotune_reset,
-                dedup,
+                None,  # reset=None -> _autotune uses scoreboard.zero_
                 layout,
             )
             _DISPATCH_AUTOTUNE_CACHE[key] = cached
@@ -1042,8 +710,6 @@ def dispatch_grouped_gemm_bf16(
             int(num_comm),
             int(nt_vmcnt),
             GROUP_M=int(GROUP_M),
-            dedup=dedup,
-            permute_blocks=int(permute_blocks),
             layout=layout,
         )
     launch(*pos_args, stream=torch.cuda.current_stream())
@@ -1061,7 +727,6 @@ def _autotune(
     num_comm,
     scoreboard,
     reset,
-    dedup=False,
     layout="nt",
 ):
     """Bench the candidates with a per-iter scoreboard reset; return (launch, cfg)."""
@@ -1084,7 +749,6 @@ def _autotune(
                 int(nt_vmcnt),
                 int(waves),
                 int(agpr),
-                dedup=dedup,
                 layout=layout,
             )
             reset()
