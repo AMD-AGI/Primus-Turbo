@@ -578,7 +578,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 return ScalingRecipe(preshuffle_layout=layout, preshuffle_n_tiles=4)
 
             a_cqd, a_csp, b_cqd, b_csp = ctx.saved_tensors
-            grad_out = grad_out.view(grad_out.shape[0], -1).contiguous()
+            # reshape (not view): a strided grad_out (e.g. transpose upstream) would
+            # make view() throw before .contiguous() can run.
+            grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
             grad_dtype = _get_fp8_dtype(ctx.config.format, False)
             bs = ctx.config.block_size
             g_qd, g_sp, g_cqd, g_csp = quantize_mxfp8_impl(grad_out, grad_dtype, None, bs, True, _R(2), _R(2))

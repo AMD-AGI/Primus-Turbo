@@ -337,10 +337,12 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
       - arbitrary contraction K, M and N
       (trans_c=True is supported via post-hoc output transpose; extra mem copy vs Triton.)
 
-    MX_BLOCKWISE (compute-only): NT only, E4M3 operands, bf16 out. Per-1x32 E8M0
-    block scales [M,K//32]/[N,K//32] are host-preshuffled in the mxfp8 kernel
-    wrapper (raw scales, no quant repack). K % 128 == 0 and K >= 256; M/N % 64
-    (partial output tile handled in-kernel). Routes to gemm_mxfp8_flydsl_kernel.
+    MX_BLOCKWISE (compute-only): NT only, per-operand E4M3/E5M2 (incl. hybrid),
+    bf16/fp16 out. Per-1x32 E8M0 block scales accepted in two forms (see
+    can_handle): (1) quant-emitted preshuffled int32 pass-through (producer aligned
+    M%64, K%128, K>=256), or (2) raw E8M0 2D [M,K//32]/[N,K//32] (M%16, K%32) that
+    execute() zero-pads (M->64, K->kernel tile) and LDS-repacks to preshuffled int32.
+    Routes to gemm_mxfp8_flydsl_kernel.
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.MX_BLOCKWISE}

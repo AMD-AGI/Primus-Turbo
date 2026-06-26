@@ -403,9 +403,10 @@ def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tun
     )
 
 
-# MXFP8 MX_BLOCKWISE dispatcher test: FlyDSL backend requires quant-emitted preshuffled
-# scales and is not reached via the dispatcher (raw E8M0 path). Tests fall through to
-# Turbo backend via auto-dispatch (backend=None). Covers aligned + partial-tile shapes.
+# MXFP8 MX_BLOCKWISE dispatcher test (backend=None auto-dispatch) with raw E8M0
+# scales. On gfx950 this routes to the FlyDSL backend, which handles the raw E8M0
+# path by zero-padding + LDS-repacking to preshuffled int32 in execute(); on other
+# archs FlyDSL is gated off and it falls back to Turbo. Covers aligned + partial-tile.
 @pytest.mark.parametrize("m", [256, 320, 512])
 @pytest.mark.parametrize("n", [256, 384, 1024])
 @pytest.mark.parametrize("k", [256, 512])
