@@ -134,7 +134,24 @@ def build_swa_bwd_dkv_module(
         D_CHUNKS_LOCAL = D_CHUNKS // NUM_WAVES
     else:
         D_CHUNKS_LOCAL = D_CHUNKS
-    K_STEPS_PT = BLOCK_M2 // K_STEP_QK
+    # R15: the GEMM2/GEMM4 (dV/dK) GEMMs contract over the m-tile dim
+    # (BLOCK_M2). The K=32 MFMA (mfma_f32_16x16x32_bf16) needs BLOCK_M2 to be
+    # a multiple of 32. At BLOCK_M2=16 (the occupancy-cliff tile chosen this
+    # round) the M-contraction is only 16 wide, so the dV/dK GEMMs switch to
+    # the K=16 MFMA (mfma_f32_16x16x16bf16_1k): A/B-frag = 4 bf16 per lane
+    # (lane_div_16*4 selects the K-quarter; lane_mod_16 the row/col), C-frag
+    # is the IDENTICAL 16x16 f32 / 4-per-lane layout as the K=32 MFMA, so the
+    # dV/dK accumulators, pT/dsT writes and the atomic store path are
+    # unchanged. The GEMM1/GEMM3 (QK^T / dP) contractions are over head_dim
+    # and stay on the K=32 MFMA regardless of BLOCK_M2.
+    M_CONTRACT_K16 = (BLOCK_M2 < K_STEP_QK)
+    if const_expr(M_CONTRACT_K16):
+        M_K_STEP = 16
+        M_LANE_K = 4
+    else:
+        M_K_STEP = K_STEP_QK
+        M_LANE_K = 8
+    K_STEPS_PT = BLOCK_M2 // M_K_STEP
     # R6b: GEMM1/GEMM3 cover m_col [0..BLOCK_M2) with multiple 16-col MFMA-N tiles per ks.
     assert BLOCK_M2 % 16 == 0, f"BLOCK_M2 must be a multiple of 16 (MFMA-N), got {BLOCK_M2}"
     M_TILES = BLOCK_M2 // 16
@@ -151,8 +168,15 @@ def build_swa_bwd_dkv_module(
             f"NUM_WAVES ({NUM_WAVES}) must be a multiple of M_TILES "
             f"({M_TILES}) in D-split mode.")
         K_SPLIT = NUM_WAVES // M_TILES
-        assert K_SPLIT in (1, 2), (
-            f"R5 D-split supports K_SPLIT in (1, 2); got {K_SPLIT} "
+        # R15: generalize the GEMM1/GEMM3 D-contraction K-split from the
+        # R5 2-way reduction to a 4-way reduction tree. At BLOCK_M2=16,
+        # M_TILES==1 so K_SPLIT == NUM_WAVES (4 with the orchestrator's
+        # num_waves=4): all four resident waves co-own the single m-tile
+        # and split the D-contraction four ways, reducing their partials
+        # through (K_SPLIT-1) f32 LDS scratch slots before softmax. The
+        # K_SPLIT==2 layout is unchanged (single partner slot per m-tile).
+        assert K_SPLIT in (1, 2, 4), (
+            f"R15 D-split supports K_SPLIT in (1, 2, 4); got {K_SPLIT} "
             f"(NUM_WAVES={NUM_WAVES}, M_TILES={M_TILES}).")
         assert K_STEPS_QK % K_SPLIT == 0, (
             f"K_STEPS_QK ({K_STEPS_QK}) must be divisible by K_SPLIT "
@@ -169,9 +193,11 @@ def build_swa_bwd_dkv_module(
     assert flat_work_group_size in (64, 128, 256, 512)
     assert dtype_str == "bf16", "R6b dkv currently only supports bf16."
     assert BLOCK_N % 16 == 0
-    assert BLOCK_M2 % K_STEP_QK == 0, (
-        f"BLOCK_M2 ({BLOCK_M2}) must be a multiple of MFMA K-step "
-        f"({K_STEP_QK}) for the dV/dK GEMMs.")
+    # R15: dV/dK M-contraction MFMA K-step is 32 (BLOCK_M2>=32) or 16
+    # (BLOCK_M2==16, K=16 MFMA). BLOCK_M2 must be a multiple of that step.
+    assert BLOCK_M2 % M_K_STEP == 0, (
+        f"BLOCK_M2 ({BLOCK_M2}) must be a multiple of the dV/dK MFMA "
+        f"K-step ({M_K_STEP}).")
     assert isinstance(swa_window, int) and swa_window > 0
     assert mqa_kv, "swa_bwd_dkv currently only supports MQA (HK=1)."
 
@@ -287,7 +313,11 @@ def build_swa_bwd_dkv_module(
     # barriers). Allocated only when K_SPLIT > 1 so the 2-wave (K_SPLIT==1)
     # LDS layout is byte-identical to round-3.
     if const_expr(D_SPLIT_WAVES and K_SPLIT > 1):
-        SRED_ELEMS = M_TILES * WARP_SIZE * 4
+        # R15: (K_SPLIT-1) partner slots per m-tile (each non-kh0 wave of
+        # the m-tile group stores its D-contraction partial; the kh0 wave
+        # reads all (K_SPLIT-1) and sums). K_SPLIT==2 -> 1 slot (byte-
+        # identical to R5); K_SPLIT==4 -> 3 slots per m-tile.
+        SRED_ELEMS = M_TILES * (K_SPLIT - 1) * WARP_SIZE * 4
         lds_sred_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = lds_sred_offset + SRED_ELEMS * 4
     else:
@@ -341,6 +371,24 @@ def build_swa_bwd_dkv_module(
                 v4f32_type,
                 [a, b, c],
             )
+
+        # R15: K=16 MFMA for the dV/dK M-contraction when BLOCK_M2==16.
+        # A/B-frag are 4 bf16 per lane (v4f16); the f32 C-frag (v4f32) layout
+        # matches mfma_acc exactly so accumulators are interchangeable. The
+        # legacy `_1k` ROCDL op types its bf16 operands as vector<4xi16>, so
+        # bitcast the bf16 packs to i16 before issuing (bit-exact, no convert).
+        v4i16_type = T.vec(4, T.i16)
+        def mfma_acc_k16(a, b, c):
+            a_i16 = vector.bitcast(v4i16_type, a)
+            b_i16 = vector.bitcast(v4i16_type, b)
+            return rocdl.mfma_f32_16x16x16bf16_1k(
+                v4f32_type,
+                [a_i16, b_i16, c],
+            )
+        # The dV/dK M-contraction MFMA + its lane-K pack type, selected by
+        # BLOCK_M2 (K=16 packs are v4f16; K=32 packs are the v8f16 default).
+        mfma_acc_m = mfma_acc_k16 if M_CONTRACT_K16 else mfma_acc
+        m_pack_type = v4f16_type if M_CONTRACT_K16 else mfma_pack_type
 
         # R13: sched-group-barrier interleave helpers. No-ops unless
         # SCHED_INTERLEAVE. Each helper emits one intrinsic per call at
@@ -460,6 +508,7 @@ def build_swa_bwd_dkv_module(
                     for mt in range(M_TILES)
                 ]
                 kh_is_zero = None
+                wave_kh_preds = None
                 sm_owner_preds = None
             else:
                 # R5 K-split: waves [mt*K_SPLIT, (mt+1)*K_SPLIT) form m-tile
@@ -475,6 +524,15 @@ def build_swa_bwd_dkv_module(
                 kh_is_zero = arith.cmpi(
                     arith.CmpIPredicate.eq,
                     wave_id % K_SPLIT, arith.index(0))
+                # R15: per-kh predicates for the >=4-way reduction. wave_kh
+                # selects which D-contraction slice a non-kh0 wave computed,
+                # so it stores its partial to the matching sred slot (kh-1).
+                wave_kh = wave_id % arith.index(K_SPLIT)
+                wave_kh_preds = [
+                    arith.cmpi(arith.CmpIPredicate.eq, wave_kh,
+                               arith.index(kh))
+                    for kh in range(K_SPLIT)
+                ]
                 sm_owner_preds = [
                     arith.AndIOp(owns_mt_preds[mt], kh_is_zero).result
                     for mt in range(M_TILES)
@@ -482,6 +540,7 @@ def build_swa_bwd_dkv_module(
         else:
             owns_mt_preds = None
             kh_is_zero = None
+            wave_kh_preds = None
             sm_owner_preds = None
 
         # R8 (round-3): grid is (B * num_n_blocks * HEAD_SPLITS,). Decompose
@@ -799,12 +858,19 @@ def build_swa_bwd_dkv_module(
                         KS_PER, 2 if USE_LDS_FOR_Q_DO else 1, 10 + mt)
                     return acc
 
-                def _sred_store(mt, acc):
-                    base = arith.index(mt * WARP_SIZE * 4) + lane * arith.index(4)
+                # R15: slot-indexed sred access. slot in [0, K_SPLIT-1)
+                # selects which partner wave's partial. For K_SPLIT==2 the
+                # only slot is 0 (byte-identical to R5's single-slot layout).
+                def _sred_store(mt, slot, acc):
+                    base = (arith.index((mt * (K_SPLIT - 1) + slot)
+                                        * WARP_SIZE * 4)
+                            + lane * arith.index(4))
                     vector.store(acc, lds_sred, [base])
 
-                def _sred_load(mt):
-                    base = arith.index(mt * WARP_SIZE * 4) + lane * arith.index(4)
+                def _sred_load(mt, slot):
+                    base = (arith.index((mt * (K_SPLIT - 1) + slot)
+                                        * WARP_SIZE * 4)
+                            + lane * arith.index(4))
                     return vector.load_op(v4f32_type, lds_sred, [base])
 
                 # 6N-2: de-dup GEMM1 + softmax + pT_write per mt-tile.
@@ -848,9 +914,18 @@ def build_swa_bwd_dkv_module(
                             with ir.InsertionPoint(if_kh.then_block):
                                 scf.YieldOp([_gemm1_partial(mt, 0)])
                             with ir.InsertionPoint(if_kh.else_block):
-                                _acc1 = _gemm1_partial(mt, KS_PER)
-                                _sred_store(mt, _acc1)
-                                scf.YieldOp([_acc1])
+                                # R15: kh in [1, K_SPLIT) each compute their
+                                # own D-contraction slice [kh*KS_PER, ...) and
+                                # store to partner slot (kh-1). Static dispatch
+                                # over the runtime wave_kh (only one matches).
+                                for _kh in range_constexpr(1, K_SPLIT):
+                                    if_khk = scf.IfOp(wave_kh_preds[_kh],
+                                                      results_=[], has_else=False)
+                                    with ir.InsertionPoint(if_khk.then_block):
+                                        _acck = _gemm1_partial(mt, _kh * KS_PER)
+                                        _sred_store(mt, _kh - 1, _acck)
+                                        scf.YieldOp([])
+                                scf.YieldOp([v4f32_zero])
                             scf.YieldOp([if_kh.results[0]])
                         with ir.InsertionPoint(if_p.else_block):
                             scf.YieldOp([v4f32_zero])
@@ -867,7 +942,9 @@ def build_swa_bwd_dkv_module(
                             has_else=True)
                         with ir.InsertionPoint(if_sm.then_block):
                             acc = s_partial[mt]
-                            partner = _sred_load(mt)
+                            # R15: read all (K_SPLIT-1) partner partials.
+                            partners = [_sred_load(mt, _slot)
+                                        for _slot in range(K_SPLIT - 1)]
                             m_row_for_lse = (m_start + arith.index(mt * 16)
                                              + lane_mod_16)
                             lse_v = lse_per_tile[mt]
@@ -907,11 +984,13 @@ def build_swa_bwd_dkv_module(
                                 s_ii = vector.extract(
                                     acc, static_position=[ii],
                                     dynamic_position=[])
-                                p_ii = vector.extract(
-                                    partner, static_position=[ii],
-                                    dynamic_position=[])
-                                s_sum = arith.AddFOp(
-                                    s_ii, p_ii, fastmath=fm_fast).result
+                                s_sum = s_ii
+                                for _slot in range_constexpr(K_SPLIT - 1):
+                                    p_ii = vector.extract(
+                                        partners[_slot], static_position=[ii],
+                                        dynamic_position=[])
+                                    s_sum = arith.AddFOp(
+                                        s_sum, p_ii, fastmath=fm_fast).result
                                 scaled = arith.MulFOp(
                                     s_sum, c_sm_scale,
                                     fastmath=fm_fast).result
@@ -1132,20 +1211,22 @@ def build_swa_bwd_dkv_module(
                     _sched_barrier()  # R13: bookended pT-write barrier
 
                 # ---- pT A-frag for GEMM2 (dV += pT @ DO):
-                #   A[kv_row=wave_n_offset+lane_mod_16, m_col=m_step*32+lane_div_16*8 + 0..7]
+                #   A[kv_row=wave_n_offset+lane_mod_16,
+                #     m_col=m_step*M_K_STEP + lane_div_16*M_LANE_K + 0..M_LANE_K-1]
+                # R15: M_K_STEP / M_LANE_K = 32/8 (K=32 MFMA) or 16/4 (K=16).
                 pt_a_packs = []
                 for m_step in range_constexpr(K_STEPS_PT):
                     kv_row_a = wave_n_offset + lane_mod_16
-                    m_col_a = (arith.index(m_step * K_STEP_QK)
-                               + lane_div_16 * MFMA_LANE_K)
+                    m_col_a = (arith.index(m_step * M_K_STEP)
+                               + lane_div_16 * arith.index(M_LANE_K))
                     lds_idx = (kv_row_a * arith.index(LDS_PT_STRIDE) + m_col_a)
-                    pack = vector.load_op(mfma_pack_type, lds_pt, [lds_idx])
+                    pack = vector.load_op(m_pack_type, lds_pt, [lds_idx])
                     pt_a_packs.append(pack)
 
                 # ---- GEMM2: dV += pT @ DO ----
                 # R6b GEMM2: B-frag DO[m_step*32+lane_div_16*8+k, d_col_global+lane_mod_16].
                 # R6k-1: dc_idx is wave-local; d_col_global = wave_d_col_offset + dc_idx*D_CHUNK.
-                if const_expr(USE_LDS_FOR_Q_DO):
+                if const_expr(USE_LDS_FOR_Q_DO and not M_CONTRACT_K16):
                     # R6S: tr16 LDS reads via `base + constexpr byte imm`
                     # so LLVM ISel folds the per-call delta into the LDS
                     # instruction's `offset:` immediate. Replaces the
@@ -1170,15 +1251,37 @@ def build_swa_bwd_dkv_module(
                         v_full = vector.shuffle(
                             v_lo, v_hi, [0, 1, 2, 3, 4, 5, 6, 7])
                         return vector.bitcast(mfma_pack_type, v_full)
+                elif const_expr(USE_LDS_FOR_Q_DO):
+                    # R15 K=16 path: the tr16 8-wide assembly does not map to
+                    # the K=16 B-frag (4 bf16 / lane along m). Gather the 4
+                    # M-rows directly from lds_do (already staged + zero-
+                    # filled for OOB rows by the Q/DO load), d_col fixed at
+                    # wave_d_col_offset + dc*D_CHUNK + lane_mod_16.
+                    def read_do_b_pack(m_step_idx, dc_idx):
+                        d_col = (wave_d_col_offset
+                                 + arith.index(dc_idx * D_CHUNK)
+                                 + lane_mod_16)
+                        m_base = (arith.index(m_step_idx * M_K_STEP)
+                                  + lane_div_16 * arith.index(M_LANE_K))
+                        vals = []
+                        for rk in range_constexpr(M_LANE_K):
+                            m_row_rel = m_base + arith.index(rk)
+                            lds_idx = (m_row_rel * arith.index(LDS_DO_STRIDE)
+                                       + d_col)
+                            v1 = vector.load_op(v1_elem_type, lds_do, [lds_idx])
+                            v_scalar = vector.extract(
+                                v1, static_position=[0], dynamic_position=[])
+                            vals.append(v_scalar)
+                        return vector.from_elements(m_pack_type, vals)
                 else:
                     def read_do_b_pack(m_step_idx, dc_idx):
                         d_col = (wave_d_col_offset
                                  + arith.index(dc_idx * D_CHUNK)
                                  + lane_mod_16)
-                        m_base = (arith.index(m_step_idx * K_STEP_QK)
-                                  + lane_div_16 * MFMA_LANE_K)
+                        m_base = (arith.index(m_step_idx * M_K_STEP)
+                                  + lane_div_16 * arith.index(M_LANE_K))
                         vals = []
-                        for rk in range_constexpr(MFMA_LANE_K):
+                        for rk in range_constexpr(M_LANE_K):
                             m_row_rel = m_base + arith.index(rk)
                             m_row_abs = m_start + m_row_rel
                             in_b = arith.cmpi(
@@ -1192,7 +1295,7 @@ def build_swa_bwd_dkv_module(
                                 v1, static_position=[0], dynamic_position=[])
                             v_safe = arith.select(in_b, v_scalar, c_zero_elem)
                             vals.append(v_safe)
-                        return vector.from_elements(mfma_pack_type, vals)
+                        return vector.from_elements(m_pack_type, vals)
 
                 # R6k-1: dc loops wave-local (D_CHUNKS_LOCAL); reader adds
                 # wave_d_col_offset internally.
@@ -1205,11 +1308,12 @@ def build_swa_bwd_dkv_module(
                 for dc in range_constexpr(D_CHUNKS_LOCAL):
                     for pks in range_constexpr(K_STEPS_PT):
                         b_pack = read_do_b_pack(pks, dc)
-                        new_dv_accs[dc] = mfma_acc(
+                        new_dv_accs[dc] = mfma_acc_m(
                             pt_a_packs[pks], b_pack, new_dv_accs[dc])
                 _sched_mfma_mem_pairs(
                     D_CHUNKS_LOCAL * K_STEPS_PT,
-                    2 if USE_LDS_FOR_Q_DO else MFMA_LANE_K, 2,
+                    M_LANE_K if USE_LDS_FOR_Q_DO and M_CONTRACT_K16
+                    else (2 if USE_LDS_FOR_Q_DO else M_LANE_K), 2,
                     mem_mask=(rocdl.mask_dsrd if USE_LDS_FOR_Q_DO
                               else rocdl.mask_vmem_rd))
                 _sched_setprio(0)
@@ -1259,9 +1363,15 @@ def build_swa_bwd_dkv_module(
                             with ir.InsertionPoint(if_kh3.then_block):
                                 scf.YieldOp([_gemm3_partial(mt, 0)])
                             with ir.InsertionPoint(if_kh3.else_block):
-                                _dp1 = _gemm3_partial(mt, KS_PER)
-                                _sred_store(mt, _dp1)
-                                scf.YieldOp([_dp1])
+                                # R15: 4-way dP K-split mirrors GEMM1.
+                                for _kh in range_constexpr(1, K_SPLIT):
+                                    if_khk3 = scf.IfOp(wave_kh_preds[_kh],
+                                                       results_=[], has_else=False)
+                                    with ir.InsertionPoint(if_khk3.then_block):
+                                        _dpk = _gemm3_partial(mt, _kh * KS_PER)
+                                        _sred_store(mt, _kh - 1, _dpk)
+                                        scf.YieldOp([])
+                                scf.YieldOp([v4f32_zero])
                             scf.YieldOp([if_kh3.results[0]])
                         with ir.InsertionPoint(if_p3.else_block):
                             scf.YieldOp([v4f32_zero])
@@ -1274,16 +1384,20 @@ def build_swa_bwd_dkv_module(
                         if_d = scf.IfOp(sm_owner, results_=[], has_else=False)
                         with ir.InsertionPoint(if_d.then_block):
                             acc = dp_partial[mt]
-                            partner = _sred_load(mt)
+                            # R15: sum all (K_SPLIT-1) partner dP partials.
+                            partners = [_sred_load(mt, _slot)
+                                        for _slot in range(K_SPLIT - 1)]
                             for ii in range_constexpr(4):
                                 dp_ii = vector.extract(
                                     acc, static_position=[ii],
                                     dynamic_position=[])
-                                dp_p = vector.extract(
-                                    partner, static_position=[ii],
-                                    dynamic_position=[])
-                                dp_sum = arith.AddFOp(
-                                    dp_ii, dp_p, fastmath=fm_fast).result
+                                dp_sum = dp_ii
+                                for _slot in range_constexpr(K_SPLIT - 1):
+                                    dp_p = vector.extract(
+                                        partners[_slot], static_position=[ii],
+                                        dynamic_position=[])
+                                    dp_sum = arith.AddFOp(
+                                        dp_sum, dp_p, fastmath=fm_fast).result
                                 diff = arith.SubFOp(
                                     dp_sum, delta_per_tile[mt],
                                     fastmath=fm_fast).result
@@ -1383,15 +1497,15 @@ def build_swa_bwd_dkv_module(
                 ds_a_packs = []
                 for m_step in range_constexpr(K_STEPS_PT):
                     kv_row_a = wave_n_offset + lane_mod_16
-                    m_col_a = (arith.index(m_step * K_STEP_QK)
-                               + lane_div_16 * MFMA_LANE_K)
+                    m_col_a = (arith.index(m_step * M_K_STEP)
+                               + lane_div_16 * arith.index(M_LANE_K))
                     lds_idx = (kv_row_a * arith.index(LDS_PT_STRIDE) + m_col_a)
-                    pack = vector.load_op(mfma_pack_type, lds_pt, [lds_idx])
+                    pack = vector.load_op(m_pack_type, lds_pt, [lds_idx])
                     ds_a_packs.append(pack)
 
-                # ---- GEMM4: dK += dsT @ Q  (MFMA 16x16x32) ----
+                # ---- GEMM4: dK += dsT @ Q  (MFMA 16x16x32 or 16x16x16) ----
                 # R6k-1: Q B-frag d_col = wave_d_col_offset + dc_idx*D_CHUNK + lane_mod_16.
-                if const_expr(USE_LDS_FOR_Q_DO):
+                if const_expr(USE_LDS_FOR_Q_DO and not M_CONTRACT_K16):
                     # R6S: tr16 LDS reads via `base + constexpr byte imm`
                     # (same recipe as GEMM2). Uses tr_lane_base_q_ptr.
                     def _ds_read_tr_q_imm(byte_imm):
@@ -1412,15 +1526,34 @@ def build_swa_bwd_dkv_module(
                         v_full = vector.shuffle(
                             v_lo, v_hi, [0, 1, 2, 3, 4, 5, 6, 7])
                         return vector.bitcast(mfma_pack_type, v_full)
+                elif const_expr(USE_LDS_FOR_Q_DO):
+                    # R15 K=16 path: gather the 4 M-rows of Q from lds_q
+                    # (mirrors the GEMM2 read_do_b_pack K=16 branch).
+                    def read_q_b_pack(m_step_idx, dc_idx):
+                        d_col = (wave_d_col_offset
+                                 + arith.index(dc_idx * D_CHUNK)
+                                 + lane_mod_16)
+                        m_base = (arith.index(m_step_idx * M_K_STEP)
+                                  + lane_div_16 * arith.index(M_LANE_K))
+                        vals = []
+                        for rk in range_constexpr(M_LANE_K):
+                            m_row_rel = m_base + arith.index(rk)
+                            lds_idx = (m_row_rel * arith.index(LDS_Q_STRIDE)
+                                       + d_col)
+                            v1 = vector.load_op(v1_elem_type, lds_q, [lds_idx])
+                            v_scalar = vector.extract(
+                                v1, static_position=[0], dynamic_position=[])
+                            vals.append(v_scalar)
+                        return vector.from_elements(m_pack_type, vals)
                 else:
                     def read_q_b_pack(m_step_idx, dc_idx):
                         d_col = (wave_d_col_offset
                                  + arith.index(dc_idx * D_CHUNK)
                                  + lane_mod_16)
-                        m_base = (arith.index(m_step_idx * K_STEP_QK)
-                                  + lane_div_16 * MFMA_LANE_K)
+                        m_base = (arith.index(m_step_idx * M_K_STEP)
+                                  + lane_div_16 * arith.index(M_LANE_K))
                         vals = []
-                        for rk in range_constexpr(MFMA_LANE_K):
+                        for rk in range_constexpr(M_LANE_K):
                             m_row_rel = m_base + arith.index(rk)
                             m_row_abs = m_start + m_row_rel
                             in_b = arith.cmpi(
@@ -1434,7 +1567,7 @@ def build_swa_bwd_dkv_module(
                                 v1, static_position=[0], dynamic_position=[])
                             v_safe = arith.select(in_b, v_scalar, c_zero_elem)
                             vals.append(v_safe)
-                        return vector.from_elements(mfma_pack_type, vals)
+                        return vector.from_elements(m_pack_type, vals)
 
                 # R6k-1: dc loops wave-local; reader adds wave_d_col_offset.
                 new_dk_accs = list(dk_accs)
@@ -1444,11 +1577,12 @@ def build_swa_bwd_dkv_module(
                 for dc in range_constexpr(D_CHUNKS_LOCAL):
                     for pks in range_constexpr(K_STEPS_PT):
                         q_b_pack = read_q_b_pack(pks, dc)
-                        new_dk_accs[dc] = mfma_acc(
+                        new_dk_accs[dc] = mfma_acc_m(
                             ds_a_packs[pks], q_b_pack, new_dk_accs[dc])
                 _sched_mfma_mem_pairs(
                     D_CHUNKS_LOCAL * K_STEPS_PT,
-                    2 if USE_LDS_FOR_Q_DO else MFMA_LANE_K, 4,
+                    M_LANE_K if USE_LDS_FOR_Q_DO and M_CONTRACT_K16
+                    else (2 if USE_LDS_FOR_Q_DO else M_LANE_K), 4,
                     mem_mask=(rocdl.mask_dsrd if USE_LDS_FOR_Q_DO
                               else rocdl.mask_vmem_rd))
                 _sched_setprio(0)

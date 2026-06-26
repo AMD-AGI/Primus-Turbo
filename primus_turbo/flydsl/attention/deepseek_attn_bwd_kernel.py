@@ -86,8 +86,14 @@ def _get_dkv(num_heads, head_dim, swa_window, dtype_str, mqa_kv):
     # R5: launch the swa_bwd_dkv kernel as a 4-wavefront (256-thread)
     # workgroup so all 4 SIMDs of the LDS-capped CU (1 WG/CU at ~97 KB LDS)
     # issue MFMA. num_waves=4 splits the dV/dK D-axis 4 ways and the
-    # GEMM1/GEMM3 D-contraction 2 ways per m-tile (K-split partial reduction
-    # through LDS) so no wave sits idle. Pure intra-WG parallelism change.
+    # GEMM1/GEMM3 D-contraction across waves per m-tile (K-split partial
+    # reduction through LDS) so no wave sits idle. Pure intra-WG change.
+    # R15: halve BLOCK_M2 32->16. At BLOCK_M2=16 the Q+DO LDS staging drops
+    # from ~97 KB to ~70 KB/WG, crossing the ~80 KB 2-WG/CU occupancy cliff
+    # so two workgroups become co-resident (waves/SIMD doubles). With
+    # M_TILES=1 the per-m-tile owner group is K_SPLIT=NUM_WAVES//M_TILES=4,
+    # so all four resident waves co-own the single m-tile and split the
+    # D-contraction four ways (4-way lds_sred reduction tree).
     key = (num_heads, head_dim, swa_window, dtype_str, mqa_kv)
     with _DKV_LOCK:
         if key in _DKV_CACHE:
@@ -99,6 +105,7 @@ def _get_dkv(num_heads, head_dim, swa_window, dtype_str, mqa_kv):
             dtype_str=dtype_str,
             mqa_kv=mqa_kv,
             num_waves=4,
+            block_m2=16,
             # R13: enable the gfx950 sched_group_barrier MFMA/MEM
             # cluster-pair interleave in the dominant swa_bwd_dkv inner
             # loop. Set False to restore the byte-identical pre-R13
