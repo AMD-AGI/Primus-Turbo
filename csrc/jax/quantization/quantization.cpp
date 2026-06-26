@@ -103,8 +103,8 @@ inline void compute_quantize_fp8_rowwise_bmn(const std::vector<int64_t> &shape, 
     N = prod(axis + 1, ndim);
 }
 
-// Tensorwise Quantize FP8 FFI.
-ffi::Error QuantizeFP8TensorwiseFFI(hipStream_t stream, ffi::AnyBuffer input, int64_t axis,
+// Tensorwise Quantize FP8 FFI
+ffi::Error QuantizeFP8TensorwiseFFI(hipStream_t stream, ffi::AnyBuffer input,
                                     ffi::Buffer<ffi::DataType::F32>              scale_opt,
                                     ffi::Result<ffi::AnyBuffer>                  output,
                                     ffi::Result<ffi::Buffer<ffi::DataType::F32>> scale_inv_out,
@@ -117,44 +117,19 @@ ffi::Error QuantizeFP8TensorwiseFFI(hipStream_t stream, ffi::AnyBuffer input, in
     auto          input_buf     = input.untyped_data();
     float        *scale_inv_ptr = scale_inv_out->typed_data();
 
-    auto          input_dims = input.dimensions();
-    const int64_t ndim       = static_cast<int64_t>(input_dims.size());
-    if (ndim != 2 && ndim != 3) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "quantize_fp8_tensorwise expects a 2D or 3D input");
-    }
-    const int64_t valid_axis = (axis >= 0) ? axis : ndim + axis;
-    if (valid_axis != ndim - 1 && valid_axis != ndim - 2) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "tensorwise axis must be the last or second-to-last dim");
-    }
-    const bool    do_transpose = (valid_axis == ndim - 2);
-    const int64_t M            = do_transpose ? input_dims[ndim - 2] : 1;
-    const int64_t N            = do_transpose ? input_dims[ndim - 1] : n;
-    const int64_t G            = (M * N > 0) ? n / (M * N) : 1;
-
-    auto run_quantize = [&](const float *scale_ptr) {
-        FFI_TYPE_SWITCH_FP16_BF16_FP32(input_dtype, FType, {
-            FFI_TYPE_SWITCH_FP8(output_dtype, QType, {
-                if (do_transpose) {
-                    quantize_tensorwise_transpose_impl<FType, QType>(
-                        reinterpret_cast<const FType *>(input_buf), scale_ptr,
-                        reinterpret_cast<QType *>(output_buf), G, M, N, stream);
-                } else {
-                    quantize_tensorwise_impl<FType, QType>(
-                        reinterpret_cast<const FType *>(input_buf), scale_ptr,
-                        reinterpret_cast<QType *>(output_buf), n, stream);
-                }
-            });
-        });
-    };
-
     bool has_scale = scale_opt.element_count() > 0;
 
     if (has_scale) {
         const float *scale_ptr = scale_opt.typed_data();
         compute_scale_inv_gpu(scale_ptr, scale_inv_ptr, 1, stream);
-        run_quantize(scale_ptr);
+
+        FFI_TYPE_SWITCH_FP16_BF16_FP32(input_dtype, FType, {
+            FFI_TYPE_SWITCH_FP8(output_dtype, QType, {
+                quantize_tensorwise_impl<FType, QType>(
+                    reinterpret_cast<const FType *>(input_buf), scale_ptr,
+                    reinterpret_cast<QType *>(output_buf), n, stream);
+            });
+        });
     } else {
         const int64_t amax_size      = align_size(sizeof(float));
         const int64_t reduce_ws_size = align_size(get_reduce_row_workspace_sizes<float>(1, n));
@@ -174,44 +149,27 @@ ffi::Error QuantizeFP8TensorwiseFFI(hipStream_t stream, ffi::AnyBuffer input, in
 
         compute_scale_from_amax<float>(amax_ptr, fp8_max, scale_ptr, scale_inv_ptr, 1, stream);
 
-        run_quantize(scale_ptr);
+        FFI_TYPE_SWITCH_FP16_BF16_FP32(input_dtype, FType, {
+            FFI_TYPE_SWITCH_FP8(output_dtype, QType, {
+                quantize_tensorwise_impl<FType, QType>(
+                    reinterpret_cast<const FType *>(input_buf), scale_ptr,
+                    reinterpret_cast<QType *>(output_buf), n, stream);
+            });
+        });
     }
 
     return ffi::Error::Success();
 }
 
-// Tensorwise Dequantize FP8 FFI.
-ffi::Error DequantizeFP8TensorwiseFFI(hipStream_t stream, ffi::AnyBuffer input, int64_t axis,
+// Tensorwise Dequantize FP8 FFI
+ffi::Error DequantizeFP8TensorwiseFFI(hipStream_t stream, ffi::AnyBuffer input,
                                       ffi::Buffer<ffi::DataType::F32> scale_inv,
                                       ffi::Result<ffi::AnyBuffer>     output) {
-    const int64_t n          = input.element_count();
-    auto          input_dims = input.dimensions();
-    const int64_t ndim       = static_cast<int64_t>(input_dims.size());
-    if (ndim != 2 && ndim != 3) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "dequantize_fp8_tensorwise expects a 2D or 3D input");
-    }
-    const int64_t valid_axis = (axis >= 0) ? axis : ndim + axis;
-    if (valid_axis != ndim - 1 && valid_axis != ndim - 2) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "tensorwise axis must be the last or second-to-last dim");
-    }
-    const bool    do_transpose = (valid_axis == ndim - 2);
-    const int64_t M            = do_transpose ? input_dims[ndim - 2] : 1;
-    const int64_t N            = do_transpose ? input_dims[ndim - 1] : n;
-    const int64_t G            = (M * N > 0) ? n / (M * N) : 1;
-
     FFI_TYPE_SWITCH_FP16_BF16_FP32(output->element_type(), FType, {
         FFI_TYPE_SWITCH_FP8(input.element_type(), QType, {
-            if (do_transpose) {
-                dequantize_tensorwise_transpose_impl<FType, QType>(
-                    reinterpret_cast<const QType *>(input.untyped_data()), scale_inv.typed_data(),
-                    reinterpret_cast<FType *>(output->untyped_data()), G, M, N, stream);
-            } else {
-                dequantize_tensorwise_impl<FType, QType>(
-                    reinterpret_cast<const QType *>(input.untyped_data()), scale_inv.typed_data(),
-                    reinterpret_cast<FType *>(output->untyped_data()), n, stream);
-            }
+            dequantize_tensorwise_impl<FType, QType>(
+                reinterpret_cast<const QType *>(input.untyped_data()), scale_inv.typed_data(),
+                reinterpret_cast<FType *>(output->untyped_data()), input.element_count(), stream);
         });
     });
     return ffi::Error::Success();
@@ -342,7 +300,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(QuantizeFP8TensorwiseHandler, QuantizeFP8Tensorwis
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>() // stream
                                   .Arg<ffi::AnyBuffer>()                   // input (F32/F16/BF16)
-                                  .Attr<int64_t>("axis")                   // axis
                                   .Arg<ffi::Buffer<ffi::DataType::F32>>()  // scale_opt
                                   .Ret<ffi::AnyBuffer>()                   // output (fp8)
                                   .Ret<ffi::Buffer<ffi::DataType::F32>>()  // scale_inv
@@ -353,7 +310,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(DequantizeFP8TensorwiseHandler, DequantizeFP8Tenso
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>() // stream
                                   .Arg<ffi::AnyBuffer>()                   // input (fp8)
-                                  .Attr<int64_t>("axis")                   // axis
                                   .Arg<ffi::Buffer<ffi::DataType::F32>>()  // scale_inv
                                   .Ret<ffi::AnyBuffer>()                   // output
 );

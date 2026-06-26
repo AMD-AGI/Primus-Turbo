@@ -23,6 +23,9 @@ from primus_turbo.triton.quantization.dequantization_mxfp8 import (
     dequantize_mxfp8_triton,
     grouped_dequantize_mxfp8_triton,
 )
+from primus_turbo.triton.quantization.dequantization_tensorwise import (
+    dequantize_fp8_tensorwise_triton,
+)
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_dual_kernel,
     quant_fp8_blockwise_for_weight_kernel,
@@ -35,6 +38,9 @@ from primus_turbo.triton.quantization.quantization_mxfp8 import (
     quantize_mxfp8_dual_triton,
     quantize_mxfp8_triton,
 )
+from primus_turbo.triton.quantization.quantization_tensorwise import (
+    quantize_fp8_tensorwise_triton,
+)
 
 
 def ceil_div(a, b):
@@ -42,15 +48,14 @@ def ceil_div(a, b):
 
 
 def quantize_fp8_tensorwise_impl(
-    x: torch.Tensor,
-    out_dtype: torch.dtype,
-    axis: int = -1,
+    x: torch.Tensor, out_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize FP8 Tensor-Wise. Single global scalar scale; axis=-1 keeps the
-    [M, N] layout, axis=-2 transposes it to [N, M].
+    Quantize FP8 Tensor-Wise
     """
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, axis, None)
+    if is_gfx1250():
+        return quantize_fp8_tensorwise_triton(x, out_dtype)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
     return x_fp8, scale_inv
 
 
@@ -66,14 +71,13 @@ def quantize_fp8_rowwise_impl(
     return x_fp8, scale_inv
 
 
-def dequantize_fp8_tensorwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype, scale_inv: torch.Tensor, axis: int = -1
-):
+def dequantize_fp8_tensorwise_impl(x: torch.Tensor, out_dtype: torch.dtype, scale_inv: torch.Tensor):
     """
-    DeQuantize FP8 Tensor-Wise. axis=-1 keeps the [M, N] layout, axis=-2
-    transposes it to [N, M]; scale_inv is a single global scalar.
+    DeQuantize FP8 Tensor-Wise
     """
-    return torch.ops.primus_turbo_cpp_extension.dequantize_fp8_tensorwise(x, scale_inv, out_dtype, axis)
+    if is_gfx1250():
+        return dequantize_fp8_tensorwise_triton(x, scale_inv, out_dtype)
+    return torch.ops.primus_turbo_cpp_extension.dequantize_fp8_tensorwise(x, scale_inv, out_dtype)
 
 
 def dequantize_fp8_rowwise_impl(x: torch.Tensor, out_dtype: torch.dtype, axis: int, scale_inv: torch.Tensor):
