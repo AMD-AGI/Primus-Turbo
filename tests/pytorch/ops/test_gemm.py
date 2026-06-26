@@ -200,9 +200,9 @@ def test_gemm_deterministic_subview(m, n, k, layout, dtype):
     buf_b /= buf_b.abs().max()
     b0 = torch.as_strided(buf_b, (rows_b, cols_b), (stride_b, 1), storage_offset=misalign)
 
-    assert (
-        a0.data_ptr() % (16 * elem_bytes) != 0
-    ), "test setup: a0 base pointer must NOT be 16-element-aligned"
+    assert a0.data_ptr() % (16 * elem_bytes) != 0, (
+        "test setup: a0 base pointer must NOT be 16-element-aligned"
+    )
     assert a0.stride(0) % 16 == 0, "test setup: a0 stride must be 16-aligned"
 
     # Reference output (correctness baseline uses contiguous copies)

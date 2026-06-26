@@ -34,7 +34,6 @@ __all__ = ["flash_attn_func", "flash_attn_fp8_func", "flash_attn_varlen_func"]
 
 
 class AiterFlashAttnFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -399,11 +398,11 @@ def flash_attn_fp8_func(
     # Check if config is supported
     if fp8_config.granularity != ScalingGranularity.BLOCKWISE:
         raise ValueError(
-            f"flash_attn_fp8_func only supports BLOCKWISE granularity, " f"but got {fp8_config.granularity}"
+            f"flash_attn_fp8_func only supports BLOCKWISE granularity, but got {fp8_config.granularity}"
         )
     if fp8_config.block_size != 64:
         raise ValueError(
-            f"flash_attn_fp8_func only supports block_size=64, " f"but got block_size={fp8_config.block_size}"
+            f"flash_attn_fp8_func only supports block_size=64, but got block_size={fp8_config.block_size}"
         )
 
     o = TritonFlashAttnFunc.apply(
@@ -436,7 +435,6 @@ def flash_attn_fp8_func(
 
 
 class AiterFlashAttnVarlenFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,

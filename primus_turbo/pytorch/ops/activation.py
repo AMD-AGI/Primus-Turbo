@@ -35,9 +35,9 @@ class GLUWithProbs(torch.autograd.Function):
         assert probs.dtype == torch.float32, "probs must be float32"
 
         SUPPORTED_ACT_TYPES = ["silu", "gelu"]
-        assert (
-            act_type in SUPPORTED_ACT_TYPES
-        ), f"Unsupported act_type: {act_type}. Supported types: {SUPPORTED_ACT_TYPES}"
+        assert act_type in SUPPORTED_ACT_TYPES, (
+            f"Unsupported act_type: {act_type}. Supported types: {SUPPORTED_ACT_TYPES}"
+        )
 
         if row_mask is not None:
             assert row_mask.is_cuda, "row_mask must be a CUDA tensor"

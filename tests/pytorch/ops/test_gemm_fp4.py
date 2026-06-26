@@ -518,7 +518,7 @@ def test_gemm_fp4_impl_aiter_preshuffle_parity(m, n, k):
         # Both paths converge on the same aiter.gemm_a4w4(bpreshuffle=True)
         # consuming the same byte-identical shuffled inputs -> outputs match.
         assert torch.equal(out_no_pre, out_pre), (
-            "preshuffled=True must match preshuffled=False bit-for-bit " "on the AITER backend"
+            "preshuffled=True must match preshuffled=False bit-for-bit on the AITER backend"
         )
     finally:
         GlobalBackendManager.reset()

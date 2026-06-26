@@ -8,7 +8,6 @@ __all__ = ["tokens_per_expert_to_mask"]
 
 
 class TokensPerExpertToMask(torch.autograd.Function):
-
     @classmethod
     def forward(ctx, tokens_per_expert: torch.Tensor, num_tokens: int):
         assert tokens_per_expert.is_cuda, "tokens_per_expert must be a CUDA tensor."

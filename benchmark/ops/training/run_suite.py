@@ -65,7 +65,7 @@ def load_config(config_path, groups=None, labels=None):
     for i, task in enumerate(tasks):
         missing = REQUIRED_TASK_FIELDS - task.keys()
         if missing:
-            raise ValueError(f"Task #{i} ({task.get('label', '?')}) " f"missing required fields: {missing}")
+            raise ValueError(f"Task #{i} ({task.get('label', '?')}) missing required fields: {missing}")
 
     if groups:
         group_set = set(groups)
@@ -262,7 +262,7 @@ def run_single_gpu_tasks(tasks, num_gpus, output_dir, script_dir, log_dir, total
 
         rc = entry.proc.returncode
         tag = "OK" if rc == 0 else f"FAIL(exit={rc})"
-        log(f"[{entry.task_id}/{total}] Done:  {entry.label} " f"(GPU {entry.gpu_id}, {elapsed:.0f}s, {tag})")
+        log(f"[{entry.task_id}/{total}] Done:  {entry.label} (GPU {entry.gpu_id}, {elapsed:.0f}s, {tag})")
         print_task_log(entry.label, rc, entry.log_path, elapsed)
 
         free_gpus.append(entry.gpu_id)

@@ -124,7 +124,7 @@ def benchmark(seed, report_dir_path, load_config_path=None, dump_dir_path=None):
                 results_with_gpu.append({k: "" for k in results_with_gpu[-1].keys()})
 
     report_with_cpu = report_dir / f"benchmark_{device_type}_special_func.xlsx"
-    report_with_gpu = report_dir / f"benchmark_GPU_special_func.xlsx"
+    report_with_gpu = report_dir / "benchmark_GPU_special_func.xlsx"
 
     save_to_excel(results_with_cpu, report_with_cpu)
     save_to_excel(results_with_gpu, report_with_gpu)

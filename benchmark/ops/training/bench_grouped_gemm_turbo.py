@@ -197,7 +197,7 @@ def benchmark_grouped_gemm_turbo(
         B, M, N, K = case["B"], case["M"], case["N"], case["K"]
         dtype = case["dtype"]
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         if is_fp8:
             print(
                 f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, "
@@ -205,7 +205,7 @@ def benchmark_grouped_gemm_turbo(
             )
         else:
             print(f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         try:
             if is_fp8:

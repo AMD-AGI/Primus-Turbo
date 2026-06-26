@@ -311,13 +311,13 @@ def benchmark_attention(output_csv=None, use_fp8=False, deterministic=False):
             for batch in BATCH_SIZE_LIST:
                 test_id += 1
 
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(
                     f"TestID: {test_id}, batch={batch}, seqlen={seqlen}, "
                     f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
                     f"causal={causal}, fp8={use_fp8}, deterministic={deterministic}"
                 )
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 row = {
                     "TestID": test_id,

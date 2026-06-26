@@ -6,37 +6,24 @@
 # 2. pre-commit install(the first time you download the repo, it will be cached for future use)
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.0.1
+    rev: v5.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+      - id: check-toml
+      - id: check-ast
+      - id: check-case-conflict
       - id: check-added-large-files
       - id: check-merge-conflict
-  - repo: https://github.com/pycqa/isort
-    rev: 5.11.5
+      - id: debug-statements
+      - id: detect-private-key
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
     hooks:
-      - id: isort
-        args: ["--profile", "black"]
-  - repo: https://github.com/PyCQA/autoflake
-    rev: v2.3.1
-    hooks:
-      - id: autoflake
-        args:
-          [
-            "--remove-all-unused-imports",
-            "--remove-unused-variables",
-            "--expand-star-imports",
-            "--ignore-init-module-imports",
-            "--recursive",
-            "--in-place",
-          ]
-  # Using this mirror lets us use mypyc-compiled black, which is about 2x faster
-  - repo: https://github.com/psf/black-pre-commit-mirror
-    rev: 24.8.0
-    hooks:
-      - id: black
-        args: ["--verbose", "--line-length=110"]
+      - id: ruff-check
+        args: ["--fix"]
+      - id: ruff-format
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: v0.10.0.1
     hooks:

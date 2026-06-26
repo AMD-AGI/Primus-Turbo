@@ -1399,7 +1399,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         _run_dense(_autotune_nt_dispatch(args, M, N, K, cbsz, blgp, out_fp16), args)
     else:
         raise NotImplementedError(
-            f"FlyDSL fp8 GEMM does not support the TT layout " f"(trans_a={trans_a}, trans_b={trans_b})."
+            f"FlyDSL fp8 GEMM does not support the TT layout (trans_a={trans_a}, trans_b={trans_b})."
         )
     if trans_c:
         return out.t().contiguous()

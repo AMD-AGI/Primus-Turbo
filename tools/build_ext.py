@@ -235,6 +235,7 @@ def _is_cuda_file(path: str) -> bool:
 
 def _get_rocm_gpu_rdc_flags(cflags: Optional[list[str]] = None) -> list[str]:
     has_gpu_rdc_flag = False
+    flags = []
     if cflags is not None:
         has_custom_flags = False
         for flag in cflags:
@@ -453,16 +454,16 @@ def _write_ninja_file(
             config.append(f"nvcc = {nvcc}")
 
     post_cflags = COMMON_HIP_FLAGS + post_cflags
-    flags = [f'cflags = {" ".join(cflags)}']
-    flags.append(f'post_cflags = {" ".join(post_cflags)}')
+    flags = [f"cflags = {' '.join(cflags)}"]
+    flags.append(f"post_cflags = {' '.join(post_cflags)}")
     if with_cuda:
-        flags.append(f'cuda_cflags = {" ".join(cuda_cflags)}')
-        flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
+        flags.append(f"cuda_cflags = {' '.join(cuda_cflags)}")
+        flags.append(f"cuda_post_cflags = {' '.join(cuda_post_cflags)}")
         cuda_post_cflags_gfx942, _ = _filter_compile_arch_args(cuda_post_cflags, "gfx942")
-        flags.append(f'cuda_post_cflags_gfx942 = {" ".join(cuda_post_cflags_gfx942)}')
+        flags.append(f"cuda_post_cflags_gfx942 = {' '.join(cuda_post_cflags_gfx942)}")
         cuda_post_cflags_gfx950, _ = _filter_compile_arch_args(cuda_post_cflags, "gfx950")
-        flags.append(f'cuda_post_cflags_gfx950 = {" ".join(cuda_post_cflags_gfx950)}')
-    flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
+        flags.append(f"cuda_post_cflags_gfx950 = {' '.join(cuda_post_cflags_gfx950)}")
+    flags.append(f"cuda_dlink_post_cflags = {' '.join(cuda_dlink_post_cflags)}")
 
     # Turn into absolute paths so we can emit them into the ninja build
     # file wherever it is.
@@ -510,7 +511,7 @@ def _write_ninja_file(
         cuda_devlink_out = os.path.join(os.path.dirname(objects[0]), "dlink.o")
         cuda_devlink_rule = ["rule cuda_devlink"]
         cuda_devlink_rule.append("  command = $nvcc $in -o $out $cuda_dlink_post_cflags")
-        cuda_devlink = [f'build {cuda_devlink_out}: cuda_devlink {" ".join(objects)}']
+        cuda_devlink = [f"build {cuda_devlink_out}: cuda_devlink {' '.join(objects)}"]
         objects += [cuda_devlink_out]
     else:
         cuda_devlink_rule, cuda_devlink = [], []
@@ -518,7 +519,7 @@ def _write_ninja_file(
     if library_target is not None:
         link_rule = ["rule link"]
         link_rule.append("  command = $cxx $in $ldflags -o $out")
-        link = [f'build {library_target}: link {" ".join(objects)}']
+        link = [f"build {library_target}: link {' '.join(objects)}"]
         default = [f"default {library_target}"]
     else:
         link_rule, link, default = [], [], []

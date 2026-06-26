@@ -155,19 +155,19 @@ def _check_dispatch(cx, cw, rpm, rank, world_size, num_experts):
 
     recv_size = int(rpm[world_size - 1][rank])
 
-    assert np.allclose(
-        np.amin(cx[:recv_size], axis=1), np.amax(cx[:recv_size], axis=1)
-    ), f"Rank {rank}: received tokens should be constant per row"
+    assert np.allclose(np.amin(cx[:recv_size], axis=1), np.amax(cx[:recv_size], axis=1)), (
+        f"Rank {rank}: received tokens should be constant per row"
+    )
 
     start = 0
     for src in range(world_size):
         end = int(rpm[src][rank])
-        assert (
-            cx[start:end, :].astype(np.int32) - src
-        ).sum() == 0, f"Rank {rank}: tokens from src={src} should carry value {src}"
-        assert (
-            cw[start:end, :].astype(np.int32) - src
-        ).sum() == 0, f"Rank {rank}: weights from src={src} should carry value {src}"
+        assert (cx[start:end, :].astype(np.int32) - src).sum() == 0, (
+            f"Rank {rank}: tokens from src={src} should carry value {src}"
+        )
+        assert (cw[start:end, :].astype(np.int32) - src).sum() == 0, (
+            f"Rank {rank}: weights from src={src} should carry value {src}"
+        )
         start = end
 
 
@@ -302,9 +302,9 @@ def _worker_eval_shape_after_setup(rank, world_size):
     weights_shape = jax_mod.ShapeDtypeStruct((_NUM_TOKENS, _NUM_TOPK), jnp.float32)
 
     out_shape = jax_mod.eval_shape(model_fn, x_shape, idx_shape, weights_shape)
-    assert (
-        out_shape.shape[1] == _HIDDEN
-    ), f"Rank {rank}: expected hidden dim {_HIDDEN}, got {out_shape.shape[1]}"
+    assert out_shape.shape[1] == _HIDDEN, (
+        f"Rank {rank}: expected hidden dim {_HIDDEN}, got {out_shape.shape[1]}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,6 @@ __all__ = ["moe_dispatch", "moe_combine"]
 
 
 class MoEDispatch(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -71,7 +70,6 @@ class MoEDispatch(torch.autograd.Function):
 
 
 class MoECombine(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx, x: torch.Tensor, group, handle: Tuple, async_finish=False, allocate_on_comm_stream=False

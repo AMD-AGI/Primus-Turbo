@@ -300,8 +300,7 @@ def _grouped_gemm_fp8_blockwise(a, b, group_lens, group_offs, trans_b, config, n
     This is a placeholder for future implementation.
     """
     raise NotImplementedError(
-        "BLOCKWISE quantization is not yet implemented in JAX. "
-        "Please use TENSORWISE or ROWWISE granularity."
+        "BLOCKWISE quantization is not yet implemented in JAX. Please use TENSORWISE or ROWWISE granularity."
     )
 
 

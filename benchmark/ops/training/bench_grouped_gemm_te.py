@@ -224,7 +224,7 @@ def benchmark_grouped_gemm_te(dtype_name="bf16", granularity_name="tensorwise", 
         test_id += 1
         B, M, N, K = case["B"], case["M"], case["N"], case["K"]
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         if is_fp8:
             print(
                 f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, "
@@ -232,7 +232,7 @@ def benchmark_grouped_gemm_te(dtype_name="bf16", granularity_name="tensorwise", 
             )
         else:
             print(f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         try:
             if is_fp8:

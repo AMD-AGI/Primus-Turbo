@@ -114,11 +114,11 @@ def benchmark_grouped_gemm_gmm(output_csv=None):
 
         balance = case.get("balance", True)
         balance_str = "balanced" if balance else "unbalanced"
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(
             f"TestID: {test_id}, Case: {case['Case']}, B: {B}, M: {M}, N: {N}, K: {K}, dtype: bf16, {balance_str}"
         )
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         try:
             fwd_time_ms, fwd_tflops, bwd_time_ms, bwd_tflops, correct = profile_grouped_gemm_gmm(

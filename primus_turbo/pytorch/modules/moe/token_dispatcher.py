@@ -214,7 +214,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             )
         if token_indices is not None:
             assert token_indices.dim() == 2 and token_indices.shape[0] == num_tokens, (
-                f"token_indices must be 2D with shape[0]={num_tokens}, " f"got {tuple(token_indices.shape)}"
+                f"token_indices must be 2D with shape[0]={num_tokens}, got {tuple(token_indices.shape)}"
             )
 
         probs = (

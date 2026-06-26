@@ -16,7 +16,6 @@ __all__ = ["token_permute", "token_unpermute"]
 
 
 class TokenPermuteMaskMap(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -54,9 +53,9 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         )
 
         if num_out_tokens < 0:
-            assert (
-                tokens_per_experts is not None
-            ), "tokens_per_experts must be provided to the fused permute function when num_out_tokens is -1"
+            assert tokens_per_experts is not None, (
+                "tokens_per_experts must be provided to the fused permute function when num_out_tokens is -1"
+            )
             num_out_tokens = tokens_per_experts.sum().item()
 
         use_fp8 = isinstance(inp, QuantizedTensor)
@@ -132,9 +131,9 @@ class TokenPermuteMaskMap(torch.autograd.Function):
         probs_grad = None
         if ctx.needs_input_grad[0]:
             (row_id_map,) = ctx.saved_tensors
-            assert not isinstance(
-                permuted_act_grad, QuantizedTensor
-            ), "The backward of token_permute does not support FP8."
+            assert not isinstance(permuted_act_grad, QuantizedTensor), (
+                "The backward of token_permute does not support FP8."
+            )
             act_grad, probs_grad = permutation.unpermute_with_mask_map(
                 permuted_act_grad,
                 row_id_map,
@@ -150,7 +149,6 @@ class TokenPermuteMaskMap(torch.autograd.Function):
 
 
 class TokenUnpermuteMaskMap(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -234,9 +232,9 @@ class TokenUnpermuteMaskMap(torch.autograd.Function):
                 scale_hidden_dim = None
 
             if ctx.with_probs:
-                assert (
-                    not use_fp8
-                ), "The backward of TokenUnpermutation with merging probs does not support FP8."
+                assert not use_fp8, (
+                    "The backward of TokenUnpermutation with merging probs does not support FP8."
+                )
                 act_grad, probs_grad = permutation.unpermute_with_mask_map_bwd_with_merging_probs(
                     unpermuted_act_grad,
                     row_id_map,

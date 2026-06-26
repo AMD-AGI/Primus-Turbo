@@ -9,6 +9,7 @@ Public API:
     - ``rmsnorm(x, gamma, eps=1e-6, zero_centered=False) -> y``
     - ``rmsnorm_residual(x, residual, gamma, eps=1e-6) -> (y, x_plus_r)``
 """
+
 from __future__ import annotations
 
 from typing import Tuple
@@ -31,9 +32,9 @@ class _RMSNormFunction(torch.autograd.Function):
         assert x.is_cuda and gamma.is_cuda, "rmsnorm: x and gamma must be CUDA tensors"
         orig_shape = x.shape
         H = gamma.shape[0]
-        assert (
-            orig_shape[-1] == H
-        ), f"rmsnorm: last dim of x ({orig_shape[-1]}) must equal gamma.shape[0] ({H})"
+        assert orig_shape[-1] == H, (
+            f"rmsnorm: last dim of x ({orig_shape[-1]}) must equal gamma.shape[0] ({H})"
+        )
 
         y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages = rmsnorm_fwd_impl(x, gamma, eps, zero_centered)
 
@@ -65,15 +66,14 @@ class _RMSNormFunction(torch.autograd.Function):
 
 
 class _RMSNormResidualFunction(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, x: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6):
-        assert (
-            x.is_cuda and residual.is_cuda and gamma.is_cuda
-        ), "rmsnorm_residual: x, residual and gamma must be CUDA tensors"
-        assert (
-            x.shape == residual.shape
-        ), f"rmsnorm_residual: shape mismatch {tuple(x.shape)} vs {tuple(residual.shape)}"
+        assert x.is_cuda and residual.is_cuda and gamma.is_cuda, (
+            "rmsnorm_residual: x, residual and gamma must be CUDA tensors"
+        )
+        assert x.shape == residual.shape, (
+            f"rmsnorm_residual: shape mismatch {tuple(x.shape)} vs {tuple(residual.shape)}"
+        )
         orig_shape = x.shape
         H = gamma.shape[0]
         assert orig_shape[-1] == H

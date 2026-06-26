@@ -114,7 +114,6 @@ _GRAN_CASES = [
 # Basic construction & properties (all granularities)
 # =====================================================================
 class TestQuantizedTensorBasic:
-
     @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GRAN_CASES)
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_create_and_properties(self, granularity, block_size, dest_dtype, dtype):
@@ -138,9 +137,9 @@ class TestQuantizedTensorBasic:
         qt = _make_quantized_tensor(x, granularity=granularity, dest_dtype=dest_dtype, block_size=block_size)
 
         expected = _expected_scale_shape(granularity, M, N, block_size, use_2d_block=False)
-        assert (
-            tuple(qt.scale_inv.shape) == expected
-        ), f"{granularity.name}/{dest_dtype}: expected scale shape {expected}, got {tuple(qt.scale_inv.shape)}"
+        assert tuple(qt.scale_inv.shape) == expected, (
+            f"{granularity.name}/{dest_dtype}: expected scale shape {expected}, got {tuple(qt.scale_inv.shape)}"
+        )
 
 
 # =====================================================================
@@ -200,7 +199,6 @@ _DEQUANT_CASES = [
 
 
 class TestDequantize:
-
     @pytest.mark.parametrize("granularity,block_size,dest_dtype", _DEQUANT_CASES)
     def test_dequantize_roundtrip_close(self, granularity, block_size, dest_dtype):
         """Quant -> dequant roundtrip should be close to the original within
@@ -218,7 +216,6 @@ class TestDequantize:
 # Serialisation (flatten / unflatten)
 # =====================================================================
 class TestSerialization:
-
     @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GRAN_CASES)
     def test_flatten_unflatten_roundtrip(self, granularity, block_size, dest_dtype):
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
@@ -401,7 +398,6 @@ _GROUPED_DEQUANT_CASES = [
 # Basic construction & properties
 # ---------------------------------------------------------------------
 class TestGroupedQuantizedTensorBasic:
-
     @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GROUPED_GRAN_CASES)
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_create_and_properties(self, granularity, block_size, dest_dtype, dtype):
@@ -441,9 +437,9 @@ class TestGroupedQuantizedTensorBasic:
         )
 
         expected = _expected_scale_shape(granularity, M, N, block_size, use_2d_block=False)
-        assert (
-            tuple(qt.scale_inv.shape) == expected
-        ), f"{granularity.name}/{dest_dtype}: expected scale shape {expected}, got {tuple(qt.scale_inv.shape)}"
+        assert tuple(qt.scale_inv.shape) == expected, (
+            f"{granularity.name}/{dest_dtype}: expected scale shape {expected}, got {tuple(qt.scale_inv.shape)}"
+        )
 
 
 # ---------------------------------------------------------------------
@@ -491,7 +487,6 @@ class TestGroupSpecific:
 # Dequantization accuracy
 # ---------------------------------------------------------------------
 class TestGroupedDequantize:
-
     @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GROUPED_DEQUANT_CASES)
     def test_dequantize_roundtrip_close(self, granularity, block_size, dest_dtype):
         """Quant -> dequant roundtrip should be close to the original within
@@ -516,7 +511,6 @@ class TestGroupedDequantize:
 # Serialisation (flatten / unflatten)
 # ---------------------------------------------------------------------
 class TestGroupedSerialization:
-
     @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GROUPED_GRAN_CASES)
     def test_flatten_unflatten_roundtrip(self, granularity, block_size, dest_dtype):
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
