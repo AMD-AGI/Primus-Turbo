@@ -41,7 +41,10 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
-from primus_turbo.flydsl.attention.kernels.kernels_common import dtype_to_elem_type
+from primus_turbo.flydsl.attention.kernels.kernels_common import (
+    dtype_to_elem_type,
+    ds_read_tr16_b_pack,
+)
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir
@@ -244,6 +247,8 @@ def build_hca_bwd_dkv_pool_module(
         fm_fast = arith.FastMathFlags.fast
         vxf16_type = T.vec(VEC_WIDTH, elem_type)
         v8f16_type = T.vec(8, elem_type)
+        # R17: per-lane tr16 transpose-read result type (4 bf16 / lane).
+        v4f16_type = T.vec(4, elem_type)
         # R6d-A: MFMA 16x16x32 C-frag = 4 fp32 per lane.
         v4f32_type = T.vec(4, compute_type)
         mfma_pack_type = v8f16_type
@@ -281,8 +286,43 @@ def build_hca_bwd_dkv_pool_module(
         #   C-frag: C[lane_div_16*4 + ii, lane_mod_16]  for ii in 0..3
         lane_mod_16 = lane % 16
         lane_div_16 = lane // 16
+        # R17: ds_read_tr16_b64 per-lane decomposition (matches sla_bwd_dkv).
+        tr_k_group = lane_mod_16 // arith.index(4)
+        tr_col_sub = lane_mod_16 % arith.index(4)
 
         wave_n_offset = wave_id * ROWS_PER_WAVE
+
+        # R17: Hoist a SINGLE per-lane base byte-pointer for DO/Q LDS tr16
+        # reads (mirrors sla_bwd_dkv R6S). Each ds_read_tr16_b64 then uses
+        # `base + constexpr byte imm` so LLVM ISel folds the (m_step, dc,
+        # lo/hi) deltas into the LDS instruction `offset:` immediate. This
+        # replaces the per-element scalar LDS gather (MFMA_LANE_K separate
+        # memref.load + vector.from_elements) in GEMM2/GEMM4 B-frag builders.
+        # No D-split here, so wave_d_col_offset == 0.
+        if const_expr(USE_LDS_FOR_Q_DO):
+            assert LDS_DO_STRIDE == LDS_Q_STRIDE, (
+                'R17 tr16 base+imm assumes DO and Q share STRIDE')
+            tr_lane_base_elem = (
+                lane_div_16 * arith.index(MFMA_LANE_K * LDS_DO_STRIDE)
+                + tr_k_group * arith.index(LDS_DO_STRIDE)
+                + tr_col_sub * arith.index(4)
+            )
+            tr_lane_base_byte = tr_lane_base_elem * arith.index(2)
+            tr_lane_base_i64 = arith.index_cast(T.i64, tr_lane_base_byte)
+            tr_lane_base_do_byte_i64 = arith.AddIOp(
+                tr_lane_base_i64,
+                arith.constant(lds_do_offset, type=T.i64),
+            ).result
+            tr_lane_base_q_byte_i64 = arith.AddIOp(
+                tr_lane_base_i64,
+                arith.constant(lds_q_offset, type=T.i64),
+            ).result
+            tr_lane_base_do_ptr = _llvm.IntToPtrOp(
+                _llvm_lds_ptr_ty(), tr_lane_base_do_byte_i64
+            ).result
+            tr_lane_base_q_ptr = _llvm.IntToPtrOp(
+                _llvm_lds_ptr_ty(), tr_lane_base_q_byte_i64
+            ).result
 
         # R7 (round-2): grid is (B * num_m_blocks * NUM_HEADS,). Decompose into
         # (batch_idx, m_tile_idx, qhid). Layout: qhid fastest, then m_tile, then
@@ -657,18 +697,16 @@ def build_hca_bwd_dkv_pool_module(
             # ---- GEMM2: dV += pT @ DO ----
             # R6d-A GEMM2 (dV += pT @ DO): B-frag DO[m_step*32+lane_div_16*8+k, dc*16+lane_mod_16].
             if const_expr(USE_LDS_FOR_Q_DO):
+                # R17: collapse the per-element scalar LDS gather into two
+                # hardware transpose reads (ds_read_tr16_b64). base_elem is a
+                # Python int (constexpr-unrolled) so the deltas fold into the
+                # LDS instruction `offset:` immediate. Byte-identical B-frag.
                 def read_do_b_pack(m_step_idx, dc_idx):
-                    d_col = arith.index(dc_idx * D_CHUNK) + lane_mod_16
-                    m_base = (arith.index(m_step_idx * K_STEP_QK)
-                              + lane_div_16 * MFMA_LANE_K)
-                    vals = []
-                    for rk in range_constexpr(MFMA_LANE_K):
-                        m_row = m_base + arith.index(rk)
-                        lds_idx = (m_row * arith.index(LDS_DO_STRIDE)
-                                   + d_col)
-                        val = _memref.load(lds_do, [lds_idx])
-                        vals.append(val)
-                    return vector.from_elements(mfma_pack_type, vals)
+                    base_elem = (m_step_idx * K_STEP_QK * LDS_DO_STRIDE
+                                 + dc_idx * D_CHUNK)
+                    return ds_read_tr16_b_pack(
+                        tr_lane_base_do_ptr, base_elem, LDS_DO_STRIDE,
+                        mfma_pack_type, v4f16_type)
             else:
                 def read_do_b_pack(m_step_idx, dc_idx):
                     d_col = arith.index(dc_idx * D_CHUNK) + lane_mod_16
@@ -751,18 +789,13 @@ def build_hca_bwd_dkv_pool_module(
             # ---- GEMM4: dK += dsT @ Q  (MFMA 16x16x32) ----
             # B-frag: Q[m_step*32+lane_div_16*8+k, dc*16+lane_mod_16].
             if const_expr(USE_LDS_FOR_Q_DO):
+                # R17: tr16 transpose-read recipe (same as GEMM2), Q B-frag.
                 def read_q_b_pack(m_step_idx, dc_idx):
-                    d_col = arith.index(dc_idx * D_CHUNK) + lane_mod_16
-                    m_base = (arith.index(m_step_idx * K_STEP_QK)
-                              + lane_div_16 * MFMA_LANE_K)
-                    vals = []
-                    for rk in range_constexpr(MFMA_LANE_K):
-                        m_row = m_base + arith.index(rk)
-                        lds_idx = (m_row * arith.index(LDS_Q_STRIDE)
-                                   + d_col)
-                        val = _memref.load(lds_q, [lds_idx])
-                        vals.append(val)
-                    return vector.from_elements(mfma_pack_type, vals)
+                    base_elem = (m_step_idx * K_STEP_QK * LDS_Q_STRIDE
+                                 + dc_idx * D_CHUNK)
+                    return ds_read_tr16_b_pack(
+                        tr_lane_base_q_ptr, base_elem, LDS_Q_STRIDE,
+                        mfma_pack_type, v4f16_type)
             else:
                 def read_q_b_pack(m_step_idx, dc_idx):
                     d_col = arith.index(dc_idx * D_CHUNK) + lane_mod_16
