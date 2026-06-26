@@ -15,3 +15,4 @@ agent/workspace/
 logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
+*.csv

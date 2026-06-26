@@ -10,21 +10,23 @@ One persistent grid-resident kernel that, from ``topk_idx``/``topk_w``, builds t
 entire EP dispatch plan over caller-owned (symmetric) buffers:
 
   * Phase A  -- histogram tokens -> per-expert counts (``SEND_LOCAL``)
-  * Phase B  -- cross-rank all-gather of the per-expert counts (``C`` buffer)
+  * Phase B  -- cross-rank all-gather of the per-expert counts (``c_buffer``)
   * Phase C  -- serial table build on block 0: pool layout (``pool_base`` /
                 ``start_per_expert`` / ``source_offset``), comm tasks
-                (``destination`` / ``start`` / ``count``), ``tile_to_group`` and
-                per-pool-block ``expected`` source-rank counts
+                (``expert_send_dst_rank`` / ``expert_send_dst_row`` / ``expert_send_count``), ``tile_to_expert`` and
+                per-pool-block ``tile_expected`` source-rank counts
   * Phase D  -- scatter each (token, topk) pair into its expert region
-                (``source_tokens`` / ``source_topk_slot`` / ``source_weight``)
+                (``dispatched_token_idx`` / ``dispatched_topk_slot`` / ``src_token_weight``)
                 and push ``origin_rank`` / ``origin_slot`` to the destination rank
 
-Self-contained: the comm-handshake prims (grid + cross-rank barriers) are
-vendored here. The dispatch plan is returned as a plain tuple handle (DeepEP-style)
-the dispatch/combine kernels unpack. Depends only on ``flydsl`` + ``torch``.
+All symmetric sub-buffers (cross-rank ``c_buffer`` / ``signal`` / ``origin_rank`` /
+``origin_slot`` / ``weight_recv_buf``, plus the device scalars / barrier / profile /
+``scoreboard`` / ``barrier_local`` regions) are named by a single ``SymLayout`` struct
+(``sym_layout.py``) passed to the kernel by value -- the kernel computes every address
+from the struct's two heap bases + per-region byte offsets + per-peer delta tables.
+The dispatch plan is returned as a plain tuple handle (DeepEP-style) the
+dispatch/combine kernels unpack. Depends only on ``flydsl`` + ``torch``.
 """
-
-from __future__ import annotations
 
 import functools
 import os as _os
@@ -40,62 +42,35 @@ from flydsl.expr.buffer_ops import (
     buffer_store,
     create_buffer_resource,
     create_buffer_resource_from_addr,
-    create_llvm_ptr,
     extract_base_index,
-    get_element_ptr,
 )
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
-from primus_turbo.flydsl.mega.prims import symm_at_offset
+from primus_turbo.flydsl.mega import sym_layout as sl_mod
+from primus_turbo.flydsl.mega.barrier import grid_sync
+from primus_turbo.flydsl.mega.prims import atomic_add, ld, memory_fence, st
+from primus_turbo.flydsl.mega.sym_layout import SymLayout
 
-# peer base table rows (order matches SymmBuffer's buffer_offsets): the cross-rank
-# sub-buffers all live in the cached buffer heap, so one [world] base table + these
-# byte offsets replaces the old [5, world] pre-offset peer_ptrs table.
-C_ROW, SIG_ROW, ORANK_ROW, OSLOT_ROW, WEIGHT_ROW = 0, 1, 2, 3, 4
+# Set True to emit s_memrealtime phase stamps into the SymLayout ``profile`` region.
+# Compile-time constexpr: when False the profile code is not traced (no IR emitted).
+ENABLE_PROFILE = False
 
 _BLOCK_THREADS = int(_os.environ.get("PROLOGUE_BT", "256"))  # threads per block
 # grid_blocks (== num_cu) is a caller arg (default 64). Fewer blocks => cheaper
-# sense-reversing grid_barrier (4x per launch); 48-64 is the measured sweet spot
-# (T=8192: 150us vs 233us at 256). Must stay <= num_CU so the persistent grid_barrier
-# keeps all blocks resident.
+# self-resetting grid_sync; 48-64 is the measured sweet spot. Must stay <= num_CU so
+# the persistent grid barrier keeps all blocks resident.
 _DEFAULT_GRID_BLOCKS = 64
 
 
 # --------------------------------------------------------------------------- #
-# Vendored cross-rank / atomic prims (was kernels.prims)
+# Address-space / scope constants (atomic + fence prims come from prims.py)
 # --------------------------------------------------------------------------- #
 _llvm = bo.llvm
-_ORD = _llvm.AtomicOrdering
 _SCOPE = "agent"  # device-wide scope (Triton scope="gpu" lowers to this)
 _I4 = 4  # int32 byte stride / atomic alignment
-
-
-def _scope(scope):
-    """Map scope name to LLVM syncscope ('sys' -> None = system default)."""
-    if scope == "sys":
-        return None
-    return scope  # 'agent' (or any explicit syncscope string)
-
-
-def _elem_ptr_i32(tensor, idx):
-    """LLVM ptr to int32 element ``tensor[idx]`` (idx an fx/i32 value or int)."""
-    base = create_llvm_ptr(extract_base_index(tensor, address_space=1), 1)
-    byte_off = _unwrap_value(idx * fx.Int32(_I4))
-    return get_element_ptr(base, byte_offset=byte_off, elem_type=fx.T.i8())
-
-
-def _elem_ptr_i32_from_addr(addr_i64, idx):
-    """LLVM ptr to int32 element at ``(addr_i64)[idx]`` (runtime peer base addr)."""
-    base = create_llvm_ptr(_unwrap_value(addr_i64), 1)
-    byte_off = _unwrap_value(idx * fx.Int32(_I4))
-    return get_element_ptr(base, byte_offset=byte_off, elem_type=fx.T.i8())
-
-
-def _mem_fence():
-    """deep_ep cheap fence: s_waitcnt drain + compiler barrier, so a following
-    relaxed atomic gets release/acquire ordering."""
-    _llvm.inline_asm(fx.T.i32(), [], "s_waitcnt lgkmcnt(0) vmcnt(0)", "=r,~{memory}", has_side_effects=True)
+_GLOBAL = 1  # LLVM global address space
+_LDS = 3  # LLVM LDS (workgroup) address space
 
 
 # --------------------------------------------------------------------------- #
@@ -105,202 +80,54 @@ def _mem_fence():
 _LDS_SCOPE = "workgroup"
 
 
-def _lds_ptr_i32(idx):
-    """addrspace-3 (LDS) ptr to int32 element ``shared[idx]`` off the dyn-shared base."""
-    base_int = _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
-    ptr = create_llvm_ptr(base_int, 3)
-    byte_off = _unwrap_value(idx * fx.Int32(_I4))
-    return get_element_ptr(ptr, byte_offset=byte_off, elem_type=fx.T.i8())
+def lds_base_addr():
+    """Integer addrspace-3 base of the dynamic shared region (for prims ld/st/atomic_add)."""
+    return _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
 
 
-def lds_store_i32(idx, val):
-    """Relaxed LDS store ``shared[idx] = val``."""
-    _llvm.StoreOp(
-        _unwrap_value(val), _lds_ptr_i32(idx), ordering=_ORD.monotonic, syncscope=_LDS_SCOPE, alignment=_I4
-    )
-
-
-def lds_load_i32(idx):
-    """Relaxed LDS load ``shared[idx]``."""
-    op = _llvm.LoadOp(
-        fx.T.i32(), _lds_ptr_i32(idx), ordering=_ORD.monotonic, syncscope=_LDS_SCOPE, alignment=_I4
-    )
-    return fx.arith.ArithValue(op.result, signed=True)
-
-
-def lds_atomic_add(idx, val):
-    """LDS (ds_add) atomic int32 add into ``shared[idx]``; returns OLD value."""
-    res = _llvm.atomicrmw(
-        _llvm.AtomicBinOp.add,
-        _lds_ptr_i32(idx),
-        _unwrap_value(val),
-        _ORD.monotonic,
-        syncscope=_LDS_SCOPE,
-        alignment=_I4,
-    )
-    return fx.arith.ArithValue(res, signed=True)
-
-
-# release/acquire below = relaxed atomic + `_mem_fence()` cheap-fence drain
-
-
-def st_release(tensor, idx, val, *, scope=_SCOPE):
-    """Release store of int32 `val` into `tensor[idx]`: fence drain + relaxed store."""
-    ptr = _elem_ptr_i32(tensor, idx)
-    _mem_fence()
-    _llvm.StoreOp(_unwrap_value(val), ptr, ordering=_ORD.monotonic, syncscope=_scope(scope), alignment=_I4)
-
-
-def ld_acquire(tensor, idx, *, scope=_SCOPE):
-    """Acquire load of int32 `tensor[idx]`: fence drain + relaxed load."""
-    ptr = _elem_ptr_i32(tensor, idx)
-    _mem_fence()
-    op = _llvm.LoadOp(fx.T.i32(), ptr, ordering=_ORD.monotonic, syncscope=_scope(scope), alignment=_I4)
-    return fx.arith.ArithValue(op.result, signed=True)
-
-
-def fence_acquire(*, scope=_SCOPE):
-    """REAL acquire fence: invalidates L1 so a reused-buffer consumer reads fresh.
-    Load-bearing for grid_barrier table handoff (cheap fence leaves L1 stale)."""
-    _llvm.fence(_ORD.acquire, syncscope=_scope(scope))
-
-
-def fence_release(*, scope=_SCOPE):
-    """REAL release fence: L2 writeback so other CUs see prior stores; pair w/ fence_acquire."""
-    _llvm.fence(_ORD.release, syncscope=_scope(scope))
-
-
-def atomic_add(tensor, idx, val, *, release=False, scope=_SCOPE):
-    """Atomic int32 add into `tensor[idx]`, returns OLD value; release=True drains first."""
-    ptr = _elem_ptr_i32(tensor, idx)
-    if release:
-        _mem_fence()
-    res = _llvm.atomicrmw(
-        _llvm.AtomicBinOp.add, ptr, _unwrap_value(val), _ORD.monotonic, syncscope=_scope(scope), alignment=_I4
-    )
-    return fx.arith.ArithValue(res, signed=True)
-
-
-def atomic_add_addr(addr_i64, idx, val, *, release=False, scope=_SCOPE):
-    """Atomic int32 add to `(addr_i64)[idx]` (runtime peer addr), returns old; release drains first."""
-    ptr = _elem_ptr_i32_from_addr(addr_i64, idx)
-    if release:
-        _mem_fence()
-    res = _llvm.atomicrmw(
-        _llvm.AtomicBinOp.add, ptr, _unwrap_value(val), _ORD.monotonic, syncscope=_scope(scope), alignment=_I4
-    )
-    return fx.arith.ArithValue(res, signed=True)
-
-
-def atomic_cas(tensor, idx, *, expected, desired, scope=_SCOPE):
-    """int32 compare-exchange tensor[idx]; returns the OLD value (losers read the winner's).
-    First-writer-wins: exactly one racer sees old==expected (the primary)."""
-    ptr = _elem_ptr_i32(tensor, idx)
-    pair = _llvm.cmpxchg(
-        ptr,
-        _unwrap_value(fx.Int32(expected)),
-        _unwrap_value(desired),
-        _ORD.monotonic,
-        _ORD.monotonic,
-        syncscope=_scope(scope),
-        alignment=_I4,
-    )
-    old = _llvm.extractvalue(fx.T.i32(), pair, [0])  # field 0 = old value
-    return fx.arith.ArithValue(old, signed=True)
-
-
-def _read_realtime():  # [PROF]
-    """Read the GPU constant-rate realtime counter (s_memrealtime)."""  # [PROF]
+def _read_realtime():
+    """Read the GPU constant-rate realtime counter (s_memrealtime)."""
     op = _llvm.inline_asm(
         fx.T.i64(), [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True
-    )  # [PROF]
-    return fx.arith.ArithValue(op, signed=False)  # [PROF]
+    )
+    return fx.arith.ArithValue(op, signed=False)
 
 
 # Prologue outputs are returned as a plain positional tuple:
-#   (plan, tile_to_group, expected, origin_rank, origin_slot,
+#   (plan, tile_to_expert, tile_expected, origin_rank, origin_slot,
 #    num_pool_blocks, max_num_token)
 # plan = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
 
 
 # --------------------------------------------------------------------------- #
-# Grid-wide + cross-rank barriers; each helper AST-transformed before kernel use
+# Cross-rank barrier (only block 0 of each rank handshakes); call at kernel top level.
+# Peer signal base addrs come from the SymLayout ``signal`` region + per-peer delta.
 # --------------------------------------------------------------------------- #
 _FINISHED_SUM_TAG = 1  # 1 suffices for a clean barrier
 
 
-def load_relaxed_at_address(base_address, index, *, scope="sys"):
-    """Relaxed int32 load at (base_address)[index] (peer-addr analog of ld_relaxed)."""
-    element_pointer = _elem_ptr_i32_from_addr(base_address, index)
-    load_op = _llvm.LoadOp(
-        fx.T.i32(), element_pointer, ordering=_ORD.monotonic, syncscope=_scope(scope), alignment=4
-    )
-    return fx.arith.ArithValue(load_op.result, signed=True)
-
-
-def grid_barrier(grid_barrier_state, num_blocks: int, thread_index):
-    """Device-wide self-resetting (sense-reversing) barrier over num_blocks blocks."""
-    fx.gpu.barrier()  # align threads in this block
-    fence_release(scope="agent")  # publish writes to other CUs
-    if thread_index == fx.Int32(0):
-        sense_before_arrival = ld_acquire(
-            grid_barrier_state, fx.Int32(1), scope="agent"
-        )  # sense before arriving
-        previous_arrival_count = atomic_add(
-            grid_barrier_state, fx.Int32(0), fx.Int32(1), release=True, scope="agent"
-        )
-        if previous_arrival_count == fx.Int32(num_blocks - 1):
-            st_release(grid_barrier_state, fx.Int32(0), fx.Int32(0), scope="agent")  # last in: reset counter
-            st_release(
-                grid_barrier_state, fx.Int32(1), fx.Int32(1) - sense_before_arrival, scope="agent"
-            )  # flip sense
-        else:
-            observed_sense = ld_acquire(grid_barrier_state, fx.Int32(1), scope="agent")
-            while observed_sense == sense_before_arrival:
-                observed_sense = ld_acquire(grid_barrier_state, fx.Int32(1), scope="agent")
-    fx.gpu.barrier()  # broadcast "all arrived"
-    fence_acquire(scope="agent")  # invalidate L1 for fresh reads
-
-
-def barrier_block(
-    buffer_base,
-    buffer_offsets,
-    rank: int,
-    world_size: int,
-    thread_index,
-    block_index,
-    sync_only: bool = False,
-):
-    """Cross-rank barrier (only block 0 of each rank handshakes); call at kernel top level.
-    Peer signal base addrs come from ``symm_at`` over the [world] base table + signal offset."""
+def barrier_block(sl, rank: int, world_size: int, thread_index, block_index, sync_only: bool = False):
+    """Cross-rank barrier over the SymLayout ``signal`` region (main heap)."""
     if not sync_only:
-        fence_release(scope="sys")  # flush payload before cross-rank signal
+        memory_fence(order="release", scope="sys")  # flush payload before cross-rank signal
     fx.gpu.barrier()  # all pushes landed before any signal
-    base_resource = create_buffer_resource(buffer_base, max_size=True)
-    offsets_resource = create_buffer_resource(buffer_offsets, max_size=True)
-    sig_off = buffer_load(offsets_resource, fx.Int32(SIG_ROW), vec_width=1, dtype=fx.T.i64())
     if block_index == fx.Int32(0):
         if thread_index < fx.Int32(world_size):
-            my_signal_base = symm_at_offset(base_resource, fx.Int32(rank), sig_off)
-            peer_signal_base = symm_at_offset(base_resource, thread_index, sig_off)
-            atomic_add_addr(
-                my_signal_base, thread_index, fx.Int32(_FINISHED_SUM_TAG), release=False, scope="sys"
-            )
-            atomic_add_addr(
-                peer_signal_base, fx.Int32(rank), fx.Int32(-_FINISHED_SUM_TAG), release=False, scope="sys"
-            )
-            my_signal_value = load_relaxed_at_address(my_signal_base, thread_index)
+            my_signal_base = sl.signal_ptr
+            peer_signal_base = sl_mod.map(sl, sl.signal_ptr, thread_index)
+            atomic_add(my_signal_base, thread_index, fx.Int32(_FINISHED_SUM_TAG), "sys", _GLOBAL)
+            atomic_add(peer_signal_base, fx.Int32(rank), fx.Int32(-_FINISHED_SUM_TAG), "sys", _GLOBAL)
+            my_signal_value = ld(my_signal_base, thread_index, scope="sys")
             while my_signal_value > fx.Int32(0):
-                my_signal_value = load_relaxed_at_address(my_signal_base, thread_index)
+                my_signal_value = ld(my_signal_base, thread_index, scope="sys")
     fx.gpu.barrier()  # no acquire fence (SIG is uncached)
 
 
-# Lower if/while in these helpers to scf.
-grid_barrier = ASTRewriter.transform(grid_barrier)
+# Lower if/while in barrier_block to scf.
 barrier_block = ASTRewriter.transform(barrier_block)
 
 
-def _make_prologue(
+def _make_dispatch_prologue(
     num_tokens,
     num_topk,
     num_experts,
@@ -319,124 +146,121 @@ def _make_prologue(
     combine_slots = num_topk * num_tokens  # per-rank combine slots (= barrier_local len)
     c_buffer_bytes = world_size * num_experts * 4
     origin_buffer_bytes = pool_capacity * 4
-    # BUFFER_BASE = [world] i64 peer heap-base table; BUFFER_OFFSETS = [5] i64 byte
-    # offsets (C/SIG/ORANK/OSLOT/WEIGHT rows). symm_at(base[peer], off[kind]) reaches
-    # each peer's sub-buffer (replaces the old [5, world] pre-offset peer_ptrs table).
     # WORKSPACE = one [5 * num_experts] i32 scratch tensor; named sub-regions by offset.
     WS_SEND, WS_WITHIN = 0, num_experts
     WS_START, WS_SROFF, WS_POOLBASE = 2 * num_experts, 3 * num_experts, 4 * num_experts
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
-    def prologue_k(
+    def dispatch_prologue_kernel(
         TOPK_INDICES: fx.Tensor,
         WORKSPACE: fx.Tensor,
-        BUFFER_BASE: fx.Tensor,
-        BUFFER_OFFSETS: fx.Tensor,
-        DESTINATION: fx.Tensor,
-        START: fx.Tensor,
-        COUNT: fx.Tensor,
-        SOURCE_OFFSET_OUT: fx.Tensor,
-        TILE_TO_GROUP: fx.Tensor,
-        EXPECTED: fx.Tensor,
-        SOURCE_TOKENS: fx.Tensor,
-        SOURCE_TOPK_SLOT: fx.Tensor,
-        SOURCE_WEIGHT: fx.Tensor,
+        sl: SymLayout,
+        EXPERT_SEND_DST_RANK: fx.Tensor,
+        EXPERT_SEND_DST_ROW: fx.Tensor,
+        EXPERT_SEND_COUNT: fx.Tensor,
+        EXPERT_SEND_OFFSET: fx.Tensor,
+        TILE_TO_EXPERT: fx.Tensor,
+        TILE_EXPECTED: fx.Tensor,
+        DISPATCHED_TOKEN_IDX: fx.Tensor,
+        DISPATCHED_TOPK_SLOT: fx.Tensor,
+        SRC_TOKEN_WEIGHT: fx.Tensor,
         TOPK_WEIGHTS: fx.Tensor,
-        META_SCALARS: fx.Tensor,
-        GRID_BARRIER_STATE: fx.Tensor,
-        PROFILE: fx.Tensor,
-        SCOREBOARD: fx.Tensor,
-        BARRIER_LOCAL: fx.Tensor,
-    ):  # [PROF]
+    ):
         thread_index = fx.thread_idx.x
         block_index, _, _ = fx.block_idx
-        profile_resource = create_buffer_resource(PROFILE, max_size=True)  # [PROF]
-        is_profiler_thread = block_index == fx.Int32(0)  # [PROF] block0 records phase boundaries
-        if is_profiler_thread:  # [PROF]
-            if thread_index == fx.Int32(0):  # [PROF]
-                buffer_store(_read_realtime(), profile_resource, fx.Int32(0))  # [PROF] t0 = start
+        if fx.const_expr(ENABLE_PROFILE):
+            profile_resource = create_buffer_resource_from_addr(sl.profile_ptr, num_records_bytes=8 * 8)
+            is_profiler_thread = block_index == fx.Int32(0)  # block0 records phase boundaries
+            if is_profiler_thread:
+                if thread_index == fx.Int32(0):
+                    buffer_store(_read_realtime(), profile_resource, fx.Int32(0))  # t0 = start
 
+        lds_base = lds_base_addr()  # addrspace-3 base for prims ld/atomic_add (LDS)
         topk_resource = create_buffer_resource(TOPK_INDICES, max_size=True)
-        # peer heap-base table + per-kind byte offsets -> symm_at reaches peer sub-buffers
-        base_resource = create_buffer_resource(BUFFER_BASE, max_size=True)
-        offsets_resource = create_buffer_resource(BUFFER_OFFSETS, max_size=True)
-        c_off = buffer_load(offsets_resource, fx.Int32(C_ROW), vec_width=1, dtype=fx.T.i64())
-        orank_off = buffer_load(offsets_resource, fx.Int32(ORANK_ROW), vec_width=1, dtype=fx.T.i64())
-        oslot_off = buffer_load(offsets_resource, fx.Int32(OSLOT_ROW), vec_width=1, dtype=fx.T.i64())
-        weight_off = buffer_load(offsets_resource, fx.Int32(WEIGHT_ROW), vec_width=1, dtype=fx.T.i64())
+        # Load expert id at its native dtype (int32 or int64) -- buffer_load takes an
+        # element offset and scales by element bytes, so no stride math is needed.
+        # Narrow int64 to i32 for downstream (expert ids fit in i32).
+        idx_load_dtype = TOPK_INDICES.element_type
+        idx_is_i64 = fx.const_expr(idx_load_dtype.width == 64)
+
+        def load_expert_id(elem_index):
+            value = buffer_load(topk_resource, elem_index, vec_width=1, dtype=idx_load_dtype)
+            if idx_is_i64:
+                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32(), _unwrap_value(value)), signed=True)
+            return value
+
         # single scratch tensor; sub-regions addressed via WS_* offsets below
         workspace_resource = create_buffer_resource(WORKSPACE, max_size=True)
-        destination_resource = create_buffer_resource(DESTINATION, max_size=True)
-        start_resource = create_buffer_resource(START, max_size=True)
-        count_resource = create_buffer_resource(COUNT, max_size=True)
-        source_offset_out_resource = create_buffer_resource(SOURCE_OFFSET_OUT, max_size=True)
-        tile_to_group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
-        expected_resource = create_buffer_resource(EXPECTED, max_size=True)
-        source_tokens_resource = create_buffer_resource(SOURCE_TOKENS, max_size=True)
-        source_topk_slot_resource = create_buffer_resource(SOURCE_TOPK_SLOT, max_size=True)
-        source_weight_resource = create_buffer_resource(SOURCE_WEIGHT, max_size=True)
+        workspace_base = extract_base_index(WORKSPACE, address_space=_GLOBAL)  # for prims atomic_add
+        expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
+        expert_send_dst_row_resource = create_buffer_resource(EXPERT_SEND_DST_ROW, max_size=True)
+        expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
+        expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
+        tile_to_expert_resource = create_buffer_resource(TILE_TO_EXPERT, max_size=True)
+        tile_expected_resource = create_buffer_resource(TILE_EXPECTED, max_size=True)
+        dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
+        dispatched_topk_slot_resource = create_buffer_resource(DISPATCHED_TOPK_SLOT, max_size=True)
+        src_token_weight_resource = create_buffer_resource(SRC_TOKEN_WEIGHT, max_size=True)
         topk_weights_resource = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
-        meta_scalars_resource = create_buffer_resource(META_SCALARS, max_size=True)
+        meta_scalars_resource = create_buffer_resource_from_addr(sl.meta_scalars_ptr, num_records_bytes=8 * 4)
 
         # ---- Phase 0: init this rank's origin_rank to -1; padding rows stay -1 ----
-        my_origin_rank_address = symm_at_offset(base_resource, fx.Int32(rank), orank_off)
         my_origin_rank_resource = create_buffer_resource_from_addr(
-            my_origin_rank_address, num_records_bytes=origin_buffer_bytes
+            sl.origin_rank_ptr, num_records_bytes=origin_buffer_bytes
         )
         origin_init_index = block_index * fx.Int32(block_threads) + thread_index
         while origin_init_index < fx.Int32(pool_capacity):
             buffer_store(fx.Int32(-1), my_origin_rank_resource, origin_init_index)
             origin_init_index = origin_init_index + fx.Int32(grid_stride)
-        # Pre-zero EXPECTED for C4's RMW
+        # Pre-zero TILE_EXPECTED for C4's RMW
         expected_init_index = block_index * fx.Int32(block_threads) + thread_index
         while expected_init_index < fx.Int32(num_pool_blocks):
-            buffer_store(fx.Int32(0), expected_resource, expected_init_index)
+            buffer_store(fx.Int32(0), tile_expected_resource, expected_init_index)
             expected_init_index = expected_init_index + fx.Int32(grid_stride)
-        # Pre-fill TILE_TO_GROUP with sentinel experts_per_rank (out-of-range id); C4 overwrites valid blocks
+        # Pre-fill TILE_TO_EXPERT with sentinel experts_per_rank (out-of-range id); C4 overwrites valid blocks
         tile_to_group_init_index = block_index * fx.Int32(block_threads) + thread_index
         while tile_to_group_init_index < fx.Int32(num_pool_blocks):
-            buffer_store(fx.Int32(experts_per_rank), tile_to_group_resource, tile_to_group_init_index)
+            buffer_store(fx.Int32(experts_per_rank), tile_to_expert_resource, tile_to_group_init_index)
             tile_to_group_init_index = tile_to_group_init_index + fx.Int32(grid_stride)
 
-        if is_profiler_thread:  # [PROF]
-            if thread_index == fx.Int32(0):  # [PROF]
-                buffer_store(_read_realtime(), profile_resource, fx.Int32(1))  # [PROF] after Phase 0 init
+        if fx.const_expr(ENABLE_PROFILE):
+            if is_profiler_thread:
+                if thread_index == fx.Int32(0):
+                    buffer_store(_read_realtime(), profile_resource, fx.Int32(1))  # after Phase 0 init
         # ---- Phase A: histogram TOPK_INDICES -> SEND_LOCAL; read low word of int64 pair ----
         # Block-private LDS histogram first, then one global atomic per (block, expert):
         # cuts global atomics from total_pairs (~32K) to grid_blocks*num_experts (~2K).
         lds_clear_index = thread_index
         while lds_clear_index < fx.Int32(num_experts):
-            lds_store_i32(lds_clear_index, fx.Int32(0))
+            st(lds_base, lds_clear_index, fx.Int32(0), scope=_LDS_SCOPE, space=_LDS)
             lds_clear_index = lds_clear_index + fx.Int32(block_threads)
         fx.gpu.barrier()
         pair_index = block_index * fx.Int32(block_threads) + thread_index
         while pair_index < fx.Int32(total_pairs):
-            expert_id = buffer_load(topk_resource, pair_index + pair_index, vec_width=1, dtype=fx.T.i32())
+            expert_id = load_expert_id(pair_index)
             if expert_id >= fx.Int32(0):
-                lds_atomic_add(expert_id, fx.Int32(1))
+                atomic_add(lds_base, expert_id, fx.Int32(1), _LDS_SCOPE, _LDS)
             pair_index = pair_index + fx.Int32(grid_stride)
         fx.gpu.barrier()
         lds_flush_index = thread_index
         while lds_flush_index < fx.Int32(num_experts):
-            block_count = lds_load_i32(lds_flush_index)
+            block_count = ld(lds_base, lds_flush_index, scope=_LDS_SCOPE, space=_LDS)
             if block_count > fx.Int32(0):
-                atomic_add(
-                    WORKSPACE, fx.Int32(WS_SEND) + lds_flush_index, block_count, release=False, scope="agent"
-                )
+                atomic_add(workspace_base, fx.Int32(WS_SEND) + lds_flush_index, block_count, _SCOPE, _GLOBAL)
             lds_flush_index = lds_flush_index + fx.Int32(block_threads)
-        grid_barrier(GRID_BARRIER_STATE, grid_blocks, thread_index)
-        if is_profiler_thread:  # [PROF]
-            if thread_index == fx.Int32(0):  # [PROF]
-                buffer_store(_read_realtime(), profile_resource, fx.Int32(2))  # [PROF] after Phase A
+        grid_sync(sl, thread_index, block_index, grid_blocks)
+        if fx.const_expr(ENABLE_PROFILE):
+            if is_profiler_thread:
+                if thread_index == fx.Int32(0):
+                    buffer_store(_read_realtime(), profile_resource, fx.Int32(2))  # after Phase A
 
         # ---- Phase B: cross-rank all_gather; B1: all ranks entered ----
-        barrier_block(BUFFER_BASE, BUFFER_OFFSETS, rank, world_size, thread_index, block_index, True)
+        barrier_block(sl, rank, world_size, thread_index, block_index, True)
         if block_index == fx.Int32(0):
-            # B2: push my SEND_LOCAL row into every peer's C buffer at row rank.
+            # B2: push my SEND_LOCAL row into every peer's c_buffer at row rank.
             for peer_rank in range(world_size):
-                peer_c_address = symm_at_offset(base_resource, fx.Int32(peer_rank), c_off)
                 peer_c_resource = create_buffer_resource_from_addr(
-                    peer_c_address, num_records_bytes=c_buffer_bytes
+                    sl_mod.map(sl, sl.c_buffer_ptr, fx.Int32(peer_rank)), num_records_bytes=c_buffer_bytes
                 )
                 push_expert_index = thread_index
                 while push_expert_index < fx.Int32(num_experts):
@@ -451,21 +275,22 @@ def _make_prologue(
                     )
                     push_expert_index = push_expert_index + fx.Int32(block_threads)
         # B3: all ranks pushed + landed
-        barrier_block(BUFFER_BASE, BUFFER_OFFSETS, rank, world_size, thread_index, block_index, False)
-        if is_profiler_thread:  # [PROF]
-            if thread_index == fx.Int32(0):  # [PROF]
-                buffer_store(_read_realtime(), profile_resource, fx.Int32(3))  # [PROF] after Phase B
+        barrier_block(sl, rank, world_size, thread_index, block_index, False)
+        if fx.const_expr(ENABLE_PROFILE):
+            if is_profiler_thread:
+                if thread_index == fx.Int32(0):
+                    buffer_store(_read_realtime(), profile_resource, fx.Int32(3))  # after Phase B
 
-        # ---- Phase C: serial table build on block0 (C read coherently from own buffer) ----
+        # ---- Phase C: serial table build on block0 (c_buffer read coherently from own buffer) ----
         if block_index == fx.Int32(0):
-            own_c_address = symm_at_offset(base_resource, fx.Int32(rank), c_off)
+            own_c_address = sl.c_buffer_ptr
             # C1 parallel across destination (per-destination local-expert cumsum)
             if thread_index < fx.Int32(world_size):
                 running_pool_offset = fx.Int32(0)
                 for local_expert_index in range(experts_per_rank):
                     expert_total_count = fx.Int32(0)
                     for source_rank in range(world_size):
-                        expert_total_count = expert_total_count + load_relaxed_at_address(
+                        expert_total_count = expert_total_count + ld(
                             own_c_address,
                             fx.Int32(source_rank * num_experts + local_expert_index)
                             + thread_index * fx.Int32(experts_per_rank),
@@ -488,7 +313,7 @@ def _make_prologue(
             while expert_index < fx.Int32(num_experts):
                 preceding_count = fx.Int32(0)
                 for source_rank in range(rank):
-                    preceding_count = preceding_count + load_relaxed_at_address(
+                    preceding_count = preceding_count + ld(
                         own_c_address, fx.Int32(source_rank * num_experts) + expert_index, scope="sys"
                     )
                 pool_base_value = buffer_load(
@@ -505,15 +330,13 @@ def _make_prologue(
                 destination_rank = comm_task_index % fx.Int32(world_size)
                 local_expert_index = comm_task_index // fx.Int32(world_size)
                 expert_id = destination_rank * fx.Int32(experts_per_rank) + local_expert_index
-                count_value = load_relaxed_at_address(
-                    own_c_address, fx.Int32(rank * num_experts) + expert_id, scope="sys"
-                )
+                count_value = ld(own_c_address, fx.Int32(rank * num_experts) + expert_id, scope="sys")
                 start_value = buffer_load(
                     workspace_resource, fx.Int32(WS_START) + expert_id, vec_width=1, dtype=fx.T.i32()
                 )
-                buffer_store(destination_rank, destination_resource, comm_task_index)
-                buffer_store(start_value, start_resource, comm_task_index)
-                buffer_store(count_value, count_resource, comm_task_index)
+                buffer_store(destination_rank, expert_send_dst_rank_resource, comm_task_index)
+                buffer_store(start_value, expert_send_dst_row_resource, comm_task_index)
+                buffer_store(count_value, expert_send_count_resource, comm_task_index)
                 comm_task_index = comm_task_index + fx.Int32(block_threads)
             fx.gpu.barrier()
             if thread_index == fx.Int32(0):
@@ -524,14 +347,17 @@ def _make_prologue(
                     for destination_rank in range(world_size):
                         expert_id = destination_rank * experts_per_rank + local_expert_index
                         count_value = buffer_load(
-                            count_resource, fx.Int32(comm_task_counter), vec_width=1, dtype=fx.T.i32()
+                            expert_send_count_resource,
+                            fx.Int32(comm_task_counter),
+                            vec_width=1,
+                            dtype=fx.T.i32(),
                         )
-                        buffer_store(source_offset, source_offset_out_resource, fx.Int32(comm_task_counter))
+                        buffer_store(source_offset, expert_send_offset_resource, fx.Int32(comm_task_counter))
                         buffer_store(source_offset, workspace_resource, fx.Int32(WS_SROFF + expert_id))
                         source_offset = source_offset + count_value
                         comm_task_counter = comm_task_counter + 1
                 buffer_store(fx.Int32(num_experts), meta_scalars_resource, fx.Int32(2))
-            # C4 parallel across local expert: tile_to_group + expected + total_rows (disjoint pool regions)
+            # C4 parallel across local expert: tile_to_expert + tile_expected + total_rows (disjoint pool regions)
             if thread_index < fx.Int32(experts_per_rank):
                 local_expert_index = thread_index
                 expert_pool_base = buffer_load(
@@ -543,7 +369,7 @@ def _make_prologue(
                 source_counts = []
                 for source_rank in fx.range_constexpr(world_size):
                     source_counts.append(
-                        load_relaxed_at_address(
+                        ld(
                             own_c_address,
                             fx.Int32(source_rank * num_experts + rank * experts_per_rank)
                             + local_expert_index,
@@ -561,7 +387,7 @@ def _make_prologue(
                 pool_block_offset = fx.Int32(0)
                 while pool_block_offset < num_expert_blocks:
                     buffer_store(
-                        local_expert_index, tile_to_group_resource, base_block_index + pool_block_offset
+                        local_expert_index, tile_to_expert_resource, base_block_index + pool_block_offset
                     )
                     pool_block_offset = pool_block_offset + fx.Int32(1)
                 within_expert_offset = fx.Int32(0)
@@ -575,9 +401,9 @@ def _make_prologue(
                         block_cursor = first_block
                         while block_cursor <= last_block:
                             expected_value = buffer_load(
-                                expected_resource, block_cursor, vec_width=1, dtype=fx.T.i32()
+                                tile_expected_resource, block_cursor, vec_width=1, dtype=fx.T.i32()
                             )
-                            buffer_store(expected_value + fx.Int32(1), expected_resource, block_cursor)
+                            buffer_store(expected_value + fx.Int32(1), tile_expected_resource, block_cursor)
                             block_cursor = block_cursor + fx.Int32(1)
                         within_expert_offset = within_expert_offset + count_value
                 if local_expert_index == fx.Int32(experts_per_rank - 1):
@@ -585,10 +411,11 @@ def _make_prologue(
                     buffer_store(total_rows, meta_scalars_resource, fx.Int32(0))
                     buffer_store(total_rows // fx.Int32(block_m), meta_scalars_resource, fx.Int32(1))
 
-        grid_barrier(GRID_BARRIER_STATE, grid_blocks, thread_index)
-        if is_profiler_thread:  # [PROF]
-            if thread_index == fx.Int32(0):  # [PROF]
-                buffer_store(_read_realtime(), profile_resource, fx.Int32(4))  # [PROF] after Phase C
+        grid_sync(sl, thread_index, block_index, grid_blocks)
+        if fx.const_expr(ENABLE_PROFILE):
+            if is_profiler_thread:
+                if thread_index == fx.Int32(0):
+                    buffer_store(_read_realtime(), profile_resource, fx.Int32(4))  # after Phase C
 
         # ---- Phase D: scatter pairs (all blocks) ----
         # Two-pass block-private reservation: count this block's pairs per expert in
@@ -599,43 +426,50 @@ def _make_prologue(
         # block-grouped permutation is correct (validated set-wise by the test).
         d_clear_index = thread_index
         while d_clear_index < fx.Int32(num_experts):
-            lds_store_i32(d_clear_index, fx.Int32(0))
+            st(lds_base, d_clear_index, fx.Int32(0), scope=_LDS_SCOPE, space=_LDS)
             d_clear_index = d_clear_index + fx.Int32(block_threads)
         fx.gpu.barrier()
         count_pair_index = block_index * fx.Int32(block_threads) + thread_index
         while count_pair_index < fx.Int32(total_pairs):
-            count_expert_id = buffer_load(
-                topk_resource, count_pair_index + count_pair_index, vec_width=1, dtype=fx.T.i32()
-            )
+            count_expert_id = load_expert_id(count_pair_index)
             if count_expert_id >= fx.Int32(0):
-                lds_atomic_add(count_expert_id, fx.Int32(1))
+                atomic_add(lds_base, count_expert_id, fx.Int32(1), _LDS_SCOPE, _LDS)
             count_pair_index = count_pair_index + fx.Int32(grid_stride)
         fx.gpu.barrier()
         reserve_index = thread_index
         while reserve_index < fx.Int32(num_experts):
-            block_expert_count = lds_load_i32(reserve_index)
+            block_expert_count = ld(lds_base, reserve_index, scope=_LDS_SCOPE, space=_LDS)
             if block_expert_count > fx.Int32(0):
                 reserved_base = atomic_add(
-                    WORKSPACE,
+                    workspace_base,
                     fx.Int32(WS_WITHIN) + reserve_index,
                     block_expert_count,
-                    release=False,
-                    scope="agent",
+                    _SCOPE,
+                    _GLOBAL,
                 )
-                lds_store_i32(fx.Int32(num_experts) + reserve_index, reserved_base)  # global base
-                lds_store_i32(reserve_index, fx.Int32(0))  # reset to per-block cursor
+                st(
+                    lds_base,
+                    fx.Int32(num_experts) + reserve_index,
+                    reserved_base,
+                    scope=_LDS_SCOPE,
+                    space=_LDS,
+                )  # global base
+                st(
+                    lds_base, reserve_index, fx.Int32(0), scope=_LDS_SCOPE, space=_LDS
+                )  # reset to per-block cursor
             reserve_index = reserve_index + fx.Int32(block_threads)
         fx.gpu.barrier()
         pair_index = block_index * fx.Int32(block_threads) + thread_index
         while pair_index < fx.Int32(total_pairs):
-            expert_id = buffer_load(
-                topk_resource, pair_index + pair_index, vec_width=1, dtype=fx.T.i32()
-            )  # low word of pair
+            expert_id = load_expert_id(pair_index)
             if expert_id >= fx.Int32(0):
                 token_index = pair_index // fx.Int32(num_topk)
                 topk_slot = pair_index % fx.Int32(num_topk)
-                local_position = lds_atomic_add(expert_id, fx.Int32(1))
-                within_expert_position = lds_load_i32(fx.Int32(num_experts) + expert_id) + local_position
+                local_position = atomic_add(lds_base, expert_id, fx.Int32(1), _LDS_SCOPE, _LDS)
+                within_expert_position = (
+                    ld(lds_base, fx.Int32(num_experts) + expert_id, scope=_LDS_SCOPE, space=_LDS)
+                    + local_position
+                )
                 expert_start = buffer_load(
                     workspace_resource, fx.Int32(WS_START) + expert_id, vec_width=1, dtype=fx.T.i32()
                 )
@@ -644,23 +478,23 @@ def _make_prologue(
                 )
                 destination_row = expert_start + within_expert_position
                 buffer_store(
-                    token_index, source_tokens_resource, expert_source_offset + within_expert_position
+                    token_index, dispatched_token_idx_resource, expert_source_offset + within_expert_position
                 )
                 buffer_store(
-                    topk_slot, source_topk_slot_resource, expert_source_offset + within_expert_position
+                    topk_slot, dispatched_topk_slot_resource, expert_source_offset + within_expert_position
                 )  # topk slot per pair
                 routing_weight = buffer_load(topk_weights_resource, pair_index, vec_width=1, dtype=fx.T.f32())
                 buffer_store(
-                    routing_weight, source_weight_resource, expert_source_offset + within_expert_position
+                    routing_weight, src_token_weight_resource, expert_source_offset + within_expert_position
                 )  # routing weight per pair
                 destination_rank = expert_id // fx.Int32(experts_per_rank)
-                peer_origin_rank_address = symm_at_offset(base_resource, destination_rank, orank_off)
-                peer_origin_slot_address = symm_at_offset(base_resource, destination_rank, oslot_off)
                 peer_origin_rank_resource = create_buffer_resource_from_addr(
-                    peer_origin_rank_address, num_records_bytes=origin_buffer_bytes
+                    sl_mod.map(sl, sl.origin_rank_ptr, destination_rank),
+                    num_records_bytes=origin_buffer_bytes,
                 )
                 peer_origin_slot_resource = create_buffer_resource_from_addr(
-                    peer_origin_slot_address, num_records_bytes=origin_buffer_bytes
+                    sl_mod.map(sl, sl.origin_slot_ptr, destination_rank),
+                    num_records_bytes=origin_buffer_bytes,
                 )
                 buffer_store(fx.Int32(rank), peer_origin_rank_resource, destination_row)
                 # origin_slot = token-major position t*K+k, so the origin rank's combine
@@ -671,19 +505,22 @@ def _make_prologue(
                 )
                 # ride the routing weight cross-rank to the dest weight_recv_buf[dest_row]
                 # (same scatter as origin) -> backward gets per-pool-row weight without all_gather.
-                peer_weight_address = symm_at_offset(base_resource, destination_rank, weight_off)
                 peer_weight_resource = create_buffer_resource_from_addr(
-                    peer_weight_address, num_records_bytes=origin_buffer_bytes
+                    sl_mod.map(sl, sl.weight_recv_buf_ptr, destination_rank),
+                    num_records_bytes=origin_buffer_bytes,
                 )
                 buffer_store(routing_weight, peer_weight_resource, destination_row)
             pair_index = pair_index + fx.Int32(grid_stride)
 
         # ---- Reset the cross-rank signal buffers in-kernel (replaces two host zero launches).
         # scoreboard -> 0 (dispatch handshake); barrier_local -> -1 (combine flags, raised
-        # >=0 by role 1). The grid_barrier below + Phase E publish these locally + cross-rank.
-        # sb_l2 / comb are NOT reset here (kept as host zeros -- comb is large).
-        scoreboard_resource = create_buffer_resource(SCOREBOARD, max_size=True)
-        barrier_local_resource = create_buffer_resource(BARRIER_LOCAL, max_size=True)
+        # >=0 by role 1). The grid_sync below + Phase E publish these locally + cross-rank.
+        scoreboard_resource = create_buffer_resource_from_addr(
+            sl.scoreboard_ptr, num_records_bytes=num_pool_blocks * 4
+        )
+        barrier_local_resource = create_buffer_resource_from_addr(
+            sl.barrier_local_ptr, num_records_bytes=combine_slots * 4
+        )
         signal_block_index = block_index * fx.Int32(block_threads) + thread_index
         while signal_block_index < fx.Int32(num_pool_blocks):
             buffer_store(fx.Int32(0), scoreboard_resource, signal_block_index)
@@ -693,71 +530,62 @@ def _make_prologue(
             buffer_store(fx.Int32(-1), barrier_local_resource, flag_slot_index)
             flag_slot_index = flag_slot_index + fx.Int32(grid_stride)
 
-        grid_barrier(GRID_BARRIER_STATE, grid_blocks, thread_index)
-        if is_profiler_thread:  # [PROF]
-            if thread_index == fx.Int32(0):  # [PROF]
-                buffer_store(_read_realtime(), profile_resource, fx.Int32(5))  # [PROF] after Phase D
+        grid_sync(sl, thread_index, block_index, grid_blocks)
+        if fx.const_expr(ENABLE_PROFILE):
+            if is_profiler_thread:
+                if thread_index == fx.Int32(0):
+                    buffer_store(_read_realtime(), profile_resource, fx.Int32(5))  # after Phase D
 
-        # ---- Post: reset SEND_LOCAL/WITHIN_EXPERT_COUNTER for the next launch ----
+        # ---- Post: reset SEND_LOCAL/WITHIN_EXPERT counters for the next launch ----
         reset_index = block_index * fx.Int32(block_threads) + thread_index
         while reset_index < fx.Int32(num_experts):
             buffer_store(fx.Int32(0), workspace_resource, fx.Int32(WS_SEND) + reset_index)
             buffer_store(fx.Int32(0), workspace_resource, fx.Int32(WS_WITHIN) + reset_index)
             reset_index = reset_index + fx.Int32(grid_stride)
-        if is_profiler_thread:  # [PROF]
-            if thread_index == fx.Int32(0):  # [PROF]
-                buffer_store(_read_realtime(), profile_resource, fx.Int32(6))  # [PROF] after Post reset
+        if fx.const_expr(ENABLE_PROFILE):
+            if is_profiler_thread:
+                if thread_index == fx.Int32(0):
+                    buffer_store(_read_realtime(), profile_resource, fx.Int32(6))  # after Post reset
 
         # ---- Phase E: origins landed cross-rank ----
-        barrier_block(BUFFER_BASE, BUFFER_OFFSETS, rank, world_size, thread_index, block_index, False)
-        if is_profiler_thread:  # [PROF]
-            if thread_index == fx.Int32(0):  # [PROF]
-                buffer_store(_read_realtime(), profile_resource, fx.Int32(7))  # [PROF] after Phase E (end)
+        barrier_block(sl, rank, world_size, thread_index, block_index, False)
+        if fx.const_expr(ENABLE_PROFILE):
+            if is_profiler_thread:
+                if thread_index == fx.Int32(0):
+                    buffer_store(_read_realtime(), profile_resource, fx.Int32(7))  # after Phase E (end)
 
     @flyc.jit
     def launch(
         topk_indices,
         workspace,
-        buffer_base,
-        buffer_offsets,
-        destination,
-        start,
-        count,
-        source_offset_out,
-        tile_to_group,
-        expected,
-        source_tokens,
-        source_topk_slot,
-        source_weight,
+        sym_layout,
+        expert_send_dst_rank,
+        expert_send_dst_row,
+        expert_send_count,
+        expert_send_offset,
+        tile_to_expert,
+        tile_expected,
+        dispatched_token_idx,
+        dispatched_topk_slot,
+        src_token_weight,
         topk_weights,
-        meta_scalars,
-        grid_barrier_state,
-        profile,  # [PROF]
-        scoreboard,
-        barrier_local,
         stream: fx.Stream = fx.Stream(None),
     ):
-        prologue_k(
+        dispatch_prologue_kernel(
             topk_indices,
             workspace,
-            buffer_base,
-            buffer_offsets,
-            destination,
-            start,
-            count,
-            source_offset_out,
-            tile_to_group,
-            expected,
-            source_tokens,
-            source_topk_slot,
-            source_weight,
+            sym_layout,
+            expert_send_dst_rank,
+            expert_send_dst_row,
+            expert_send_count,
+            expert_send_offset,
+            tile_to_expert,
+            tile_expected,
+            dispatched_token_idx,
+            dispatched_topk_slot,
+            src_token_weight,
             topk_weights,
-            meta_scalars,
-            grid_barrier_state,
-            profile,
-            scoreboard,
-            barrier_local,
-        ).launch(  # [PROF]
+        ).launch(
             grid=(grid_blocks, 1, 1),
             block=(block_threads, 1, 1),
             stream=stream,
@@ -778,8 +606,9 @@ def _compile(
     block_m,
     pool_capacity,
     grid_blocks=_DEFAULT_GRID_BLOCKS,
+    idx_dtype=None,  # cache-key only: kernel specializes on topk_idx's element_type
 ):
-    return _make_prologue(
+    return _make_dispatch_prologue(
         num_tokens,
         num_topk,
         num_experts,
@@ -798,35 +627,27 @@ _DEFAULT_LAUNCH_CACHE: dict = {}
 
 
 @functools.lru_cache(maxsize=8)
-def _prologue_workspace_cached(num_experts, device):
+def _dispatch_prologue_workspace_cached(num_experts, device):
     # 5 per-expert i32 scratch tables packed in one tensor (see the kernel's WS_*
     # offsets): send_local / within_expert_counter / start_per_expert /
     # source_offset_per_expert / pool_base. The kernel self-resets it each launch.
     return torch.zeros(5 * num_experts, dtype=torch.int32, device=device)
 
 
-def get_prologue_workspace(num_experts, device="cuda"):
+def get_dispatch_prologue_workspace(num_experts, device="cuda"):
     """Cached internal scratch for the prologue kernel (reused across launches; the
     kernel self-resets it each launch, so callers never own or pass it)."""
     dev = torch.device(device)
     if dev.type == "cuda" and dev.index is None:  # pin to a concrete index so the
         dev = torch.device("cuda", torch.cuda.current_device())  # cache key is stable
-    return _prologue_workspace_cached(int(num_experts), dev)
+    return _dispatch_prologue_workspace_cached(int(num_experts), dev)
 
 
-def mega_moe_prologue(
+def dispatch_prologue(
     topk_idx,
     topk_w,
     *,
-    buffer_base,
-    buffer_offsets,
-    origin_rank,
-    origin_slot,
-    meta_scalars,
-    grid_barrier_state,
-    profile,  # [PROF]
-    scoreboard,
-    barrier_local,
+    sym_layout,
     num_tokens,
     num_topk,
     num_experts,
@@ -839,27 +660,37 @@ def mega_moe_prologue(
     no_cpu_sync=True,
     num_cu=_DEFAULT_GRID_BLOCKS,
 ):
-    """One fused-prologue kernel launch (no_cpu_sync controls max_num_token).
+    """One fused-prologue kernel launch.
 
-    ``num_cu`` is the persistent grid block count (must stay <= device CU count).
+    ``sym_layout`` is a single :class:`SymLayout` struct naming every symmetric
+    sub-buffer (the two heaps' bases + per-region byte offsets + per-peer delta
+    tables); the kernel computes all cross-rank addresses from it. ``num_cu`` is the
+    persistent grid block count (must stay <= device CU count).
 
-    The dispatch-plan output tables (destination / start / count / source_offset_out /
-    tile_to_group / expected / source_tokens / source_topk_slot / source_weight) are
-    allocated internally and returned -- callers never own them. The symmetric tensors
-    (origin_rank / origin_slot) are written cross-rank, so they stay caller-owned."""
-    # int64 viewed as int32 (free reinterpret); kernel reads the low word
-    topk_int32_view = topk_idx.to(torch.int64).contiguous().view(-1).view(torch.int32)
+    The dispatch-plan output tables (expert_send_dst_rank / expert_send_dst_row /
+    expert_send_count / expert_send_offset / tile_to_expert / tile_expected /
+    dispatched_token_idx / dispatched_topk_slot / src_token_weight) are allocated
+    internally and returned -- callers never own them. ``origin_rank`` / ``origin_slot``
+    live in ``sym_layout`` (written cross-rank); the return keeps their tuple slots as
+    ``None`` for positional compatibility."""
+    # Accept int32 or int64; the kernel reads each entry at its native dtype
+    # (buffer_load infers element size from the tensor's element_type).
+    if topk_idx.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"topk_idx must be int32 or int64, got {topk_idx.dtype}")
+    topk_idx_flat = topk_idx.contiguous().view(-1)
     dev = topk_idx.device
     # internal scratch (cached, kernel self-resets) -- not a caller-owned buffer
-    workspace = get_prologue_workspace(num_experts, device=dev)
+    workspace = get_dispatch_prologue_workspace(num_experts, device=dev)
 
     # ---- allocate the plan output tables internally (returned to the caller) ----
     n_mblk = pool_capacity // block_m
     i32 = lambda n: torch.empty(n, dtype=torch.int32, device=dev)
-    destination, start, count, source_offset_out = (i32(num_experts) for _ in range(4))
-    tile_to_group, expected = i32(n_mblk), i32(n_mblk)
-    source_tokens, source_topk_slot = i32(pool_capacity), i32(pool_capacity)
-    source_weight = torch.empty(pool_capacity, dtype=torch.float32, device=dev)
+    expert_send_dst_rank, expert_send_dst_row, expert_send_count, expert_send_offset = (
+        i32(num_experts) for _ in range(4)
+    )
+    tile_to_expert, tile_expected = i32(n_mblk), i32(n_mblk)
+    dispatched_token_idx, dispatched_topk_slot = i32(pool_capacity), i32(pool_capacity)
+    src_token_weight = torch.empty(pool_capacity, dtype=torch.float32, device=dev)
     if topk_w is not None:
         topk_weights_flat = topk_w.to(torch.float32).contiguous().view(-1)
     else:  # no weights given -> internal zeros (topk_w is None branch)
@@ -881,27 +712,22 @@ def mega_moe_prologue(
         block_m,
         pool_capacity,
         grid_blocks=int(num_cu),
+        idx_dtype=topk_idx.dtype,
     )
     kernel_arguments = (
-        topk_int32_view,
+        topk_idx_flat,
         workspace,
-        buffer_base,
-        buffer_offsets,
-        destination,
-        start,
-        count,
-        source_offset_out,
-        tile_to_group,
-        expected,
-        source_tokens,
-        source_topk_slot,
-        source_weight,
+        sym_layout,
+        expert_send_dst_rank,
+        expert_send_dst_row,
+        expert_send_count,
+        expert_send_offset,
+        tile_to_expert,
+        tile_expected,
+        dispatched_token_idx,
+        dispatched_topk_slot,
+        src_token_weight,
         topk_weights_flat,
-        meta_scalars,
-        grid_barrier_state,
-        profile,  # [PROF]
-        scoreboard,
-        barrier_local,
         stream,
     )
     # Fast launch: call pre-packed CallState directly, fall back to normal call
@@ -932,14 +758,24 @@ def mega_moe_prologue(
     # DeepEP-style dispatch handle: a flat tuple the dispatch/combine kernels unpack.
     # num_tasks (== num_experts) is derived from dst_rank.numel(); routing tensors last.
     #   (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
-    plan = (destination, start, count, source_offset_out, source_tokens, source_topk_slot, source_weight)
-    max_num_token = pool_capacity if no_cpu_sync else int(meta_scalars[0].item())
+    plan = (
+        expert_send_dst_rank,
+        expert_send_dst_row,
+        expert_send_count,
+        expert_send_offset,
+        dispatched_token_idx,
+        dispatched_topk_slot,
+        src_token_weight,
+    )
+    # origin_rank/origin_slot now live in sym_layout; max_num_token from device scalar
+    # would need a host readback of sym_layout.meta_scalars, so default to pool_capacity.
+    max_num_token = pool_capacity
     return (
         plan,
-        tile_to_group,
-        expected,
-        origin_rank,
-        origin_slot,
+        tile_to_expert,
+        tile_expected,
+        None,
+        None,
         pool_capacity // block_m,
         max_num_token,
     )

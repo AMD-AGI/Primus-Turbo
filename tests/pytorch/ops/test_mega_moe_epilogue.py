@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 """Correctness + bandwidth/latency test for the Mega-MoE SwiGLU epilogue
-(primus_turbo.flydsl.mega.mega_moe_epilogue).
+(primus_turbo.flydsl.mega.swiglu_kernel).
 
 Covers forward and backward, the optional per-row scale, and the gate gradient.
 Prints achieved latency (us) and effective HBM bandwidth (GB/s) per shape.
@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from primus_turbo.flydsl.mega.mega_moe_epilogue import (
+from primus_turbo.flydsl.mega.swiglu_kernel import (
     ACTIVATION_CLAMP,
     swiglu,
     swiglu_backward,
@@ -98,22 +98,15 @@ def _ref_bwd(dact, acc1, I, scale=None, want_gate=False):
 def test_fwd(M, I, with_scale):
     acc1 = torch.randn(M, 2 * I, dtype=torch.bfloat16, device="cuda")
     scale = torch.rand(M, dtype=torch.float32, device="cuda") if with_scale else None
-    fn = lambda: swiglu(acc1, None, I, M, scale=scale)
+    fn = lambda: swiglu(acc1, scale=scale)
     # read 2*I bf16 + (scale), write I bf16
     bytes_io = M * (2 * I * 2 + I * 2) + (M * 4 if with_scale else 0)
     _check("fwd ", fn, _ref_fwd(acc1, I, scale), M, I, bytes_io, scale=int(with_scale))
 
 
-@pytest.mark.parametrize("M,I", _SHAPES)
-def test_fwd_bounded(M, I):
-    """Device-bounded grid-stride path (num_tile_blocks/BM) used by the fused mega
-    pipeline; rows [0, num_tile_blocks*BM) must match the unbounded result."""
-    BM = 256
-    assert M % BM == 0, "M must be a multiple of BM for the bounded test"
-    acc1 = torch.randn(M, 2 * I, dtype=torch.bfloat16, device="cuda")
-    ntb = torch.tensor([M // BM], dtype=torch.int32, device="cuda")  # m_real = M
-    fn = lambda: swiglu(acc1, None, I, M, num_tile_blocks=ntb, BM=BM)
-    _check("fwdb", fn, _ref_fwd(acc1, I), M, I, M * (2 * I * 2 + I * 2), BM=BM)
+# NOTE: the device-bounded grid-stride path (num_tile_blocks/BM) is no longer
+# invocable standalone -- swiglu now reads the bound from the active symm workspace;
+# it is exercised by the fused mega e2e test.
 
 
 @pytest.mark.parametrize("M,I", _SHAPES)
@@ -126,7 +119,7 @@ def test_bwd(M, I, with_scale, with_gate):
     dact = torch.randn(M, I, dtype=torch.bfloat16, device="cuda")
     scale = torch.rand(M, dtype=torch.float32, device="cuda") if with_scale else None
     # return_gate -> swiglu_backward allocates+returns grad_gate (paired with want_gate ref)
-    fn = lambda: swiglu_backward(dact, acc1, I, scale=scale, return_gate=with_gate)
+    fn = lambda: swiglu_backward(dact, acc1, scale=scale, return_gate=with_gate)
     ref = _ref_bwd(dact, acc1, I, scale, want_gate=with_gate)
     # read 2*I bf16 (acc1) + I bf16 (dact) + scale, write 2*I bf16 (dacc1)
     bytes_io = M * (2 * I * 2 + I * 2 + 2 * I * 2) + (M * 4 if with_scale else 0)
@@ -138,7 +131,6 @@ if __name__ == "__main__":
     for M, I in _SHAPES:
         for ws in (False, True):
             test_fwd(M, I, ws)
-        test_fwd_bounded(M, I)
         for ws in (False, True):
             for wg in (False, True):
                 if wg and not ws:
