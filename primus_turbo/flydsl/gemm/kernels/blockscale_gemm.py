@@ -45,6 +45,7 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from primus_turbo.flydsl.gemm.kernels._pipeline.mfma_epilogues import mfma_epilog
 from primus_turbo.flydsl.gemm.kernels._pipeline.mfma_preshuffle_pipeline import (
     _buffer_load_vec,
+    block2d_setprio_iter_sched,
     buffer_copy_gmem16_dwordx4,
     crd2idx,
     lds_store_8b_xor16,
@@ -776,13 +777,28 @@ def compile_blockscale_gemm(
                 dswr_tail = sche_iters
             dswr_start = sche_iters - dswr_tail
 
-            for sche_i in range_constexpr(sche_iters):
-                rocdl.sched_vmem(1)
-                rocdl.sched_mfma(mfma_group)
-                rocdl.sched_dsrd(1)
-                rocdl.sched_mfma(mfma_group)
-                if const_expr(sche_i >= dswr_start - 1):
-                    rocdl.sched_dswr(1)
+            if const_expr(scale_b_mode == "block2d"):
+                # Refined half-iteration ping/pong: same hint counts, but each MFMA
+                # sub-group is s_setprio-bracketed so the matrix unit holds issue
+                # priority while next-tile VMEM, DS-read, and the block-scale VALU
+                # run in the MFMA shadow. block2d (fwd / dgrad) only; the col1d
+                # (wgrad) path below is left byte-for-byte unchanged.
+                block2d_setprio_iter_sched(
+                    rocdl,
+                    range_constexpr,
+                    const_expr,
+                    sche_iters=sche_iters,
+                    mfma_group=mfma_group,
+                    dswr_start=dswr_start,
+                )
+            else:
+                for sche_i in range_constexpr(sche_iters):
+                    rocdl.sched_vmem(1)
+                    rocdl.sched_mfma(mfma_group)
+                    rocdl.sched_dsrd(1)
+                    rocdl.sched_mfma(mfma_group)
+                    if const_expr(sche_i >= dswr_start - 1):
+                        rocdl.sched_dswr(1)
             rocdl.sched_barrier(0)
 
         def prefetch_a0_pack(lds_buffer):

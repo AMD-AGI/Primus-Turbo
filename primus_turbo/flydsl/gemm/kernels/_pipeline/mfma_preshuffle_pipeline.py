@@ -513,6 +513,46 @@ def load_b_pack_k32(
     return vector.extract(v64, static_position=[0], dynamic_position=[])
 
 
+def block2d_setprio_iter_sched(
+    rocdl,
+    range_constexpr,
+    const_expr,
+    *,
+    sche_iters: int,
+    mfma_group: int,
+    dswr_start: int,
+):
+    """Finer half-iteration ping/pong schedule for the block2d (fwd / dgrad) hot loop.
+
+    Emits the SAME per-iteration scheduling-hint counts as the coarse stream
+    (``sched_vmem(1)``, two ``sched_mfma(mfma_group)`` sub-groups, ``sched_dsrd(1)``,
+    optional ``sched_dswr(1)``), but brackets each of the two MFMA sub-groups with
+    ``s_setprio`` so the matrix unit keeps issue priority across the half-iteration
+    boundary. With MFMA prioritized, the next-tile VMEM (B / scale) load, the
+    current-tile DS-read, and the fp32 block-scale bookkeeping VALU (block2d VALU is
+    ~69% of insts vs ~12% MFMA) are scheduled into the matrix-unit shadow, raising
+    MFMA busy fraction.
+
+    This is a pure scheduling / priority hint stream: it emits no data ops and no
+    waitcnt, so the GEMM result is bit-identical to the coarse schedule. The two
+    ``s_setprio``-bracketed MFMA sub-groups are the two half-iterations of the
+    refined ping/pong.
+    """
+    for sche_i in range_constexpr(sche_iters):
+        rocdl.sched_vmem(1)
+        # half-iteration A: raise priority so MFMA issue wins over shadowed VALU/mem
+        rocdl.s_setprio(1)
+        rocdl.sched_mfma(mfma_group)
+        rocdl.s_setprio(0)
+        rocdl.sched_dsrd(1)
+        # half-iteration B
+        rocdl.s_setprio(1)
+        rocdl.sched_mfma(mfma_group)
+        rocdl.s_setprio(0)
+        if const_expr(sche_i >= dswr_start - 1):
+            rocdl.sched_dswr(1)
+
+
 def tile_chunk_coord_i32(
     arith,
     *,
@@ -734,6 +774,7 @@ def xcd_remap_bx_by(
 __all__ = [
     "PreshuffleBLayout",
     "PreshuffleScaleLayout",
+    "block2d_setprio_iter_sched",
     "buffer_copy_gmem16_dwordx4",
     "lds_load_pack_k32",
     "lds_row_major_idx",
