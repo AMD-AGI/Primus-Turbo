@@ -52,8 +52,16 @@ def fused_moe_router_bkwd(
     scaling_factor: float,
 ):
     return torch.ops.primus_turbo.fused_moe_router_bkwd_triton.default(
-        g_probs, g_scores, logits, output_probs, topk_indices,
-        raw_topk_logits, out_scores, routing_map, score_function, scaling_factor,
+        g_probs,
+        g_scores,
+        logits,
+        output_probs,
+        topk_indices,
+        raw_topk_logits,
+        out_scores,
+        routing_map,
+        score_function,
+        scaling_factor,
     )
 
 
@@ -69,24 +77,26 @@ def fused_moe_router_fwd_triton(
     scaling_factor: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
+    # todo add warmup
     num_stages = 2
     num_programs = s
 
     E_ALIGNED = triton.next_power_of_2(e)
     INNER_GROUP_K_ALIGNED = triton.next_power_of_2(topk // selected_groups)
 
-    raw_topk_logits      = torch.empty((s, topk), device="cuda", dtype=logits.dtype)
-    output_topk_indices  = torch.ones((s, topk), device="cuda", dtype=torch.int64)
-    output_scores        = torch.empty((s, e), device="cuda", dtype=logits.dtype)
-    output_probs         = torch.zeros((s, e), device="cuda", dtype=logits.dtype)
-    output_routing_map   = torch.zeros((s, e), device="cuda", dtype=torch.int32)
+    raw_topk_logits = torch.empty((s, topk), device="cuda", dtype=logits.dtype)
+    output_topk_indices = torch.ones((s, topk), device="cuda", dtype=torch.int64)
+    output_scores = torch.empty((s, e), device="cuda", dtype=logits.dtype)
+
+    output_probs = torch.zeros((s, e), device="cuda", dtype=logits.dtype)
+    output_routing_map = torch.zeros((s, e), device="cuda", dtype=torch.int32)
 
     if (
         USE_ASM_ROUTER
-        and s      == ASM_CO_ROUTER_EXPECTED_S
-        and e      == ASM_CO_ROUTER_EXPECTED_E
+        and s == ASM_CO_ROUTER_EXPECTED_S
+        and e == ASM_CO_ROUTER_EXPECTED_E
         and groups == ASM_CO_ROUTER_EXPECTED_G
-        and topk   == ASM_CO_ROUTER_EXPECTED_K
+        and topk == ASM_CO_ROUTER_EXPECTED_K
         and score_function == "sigmoid"
     ):
         launch_asm_co_router(
@@ -141,7 +151,7 @@ def fused_moe_router_bkwd_triton(
     g_probs = g_probs.contiguous()
     g_scores = g_scores.contiguous()
 
-    output_g_probs  = torch.zeros_like(g_probs)
+    output_g_probs = torch.zeros_like(g_probs)
     output_g_scores = torch.empty_like(g_scores)
 
     wrap_triton(fused_scaling_group_sum_routing_backward_kernel)[(num_programs,)](
@@ -166,4 +176,5 @@ def fused_moe_router_bkwd_triton(
     )
 
     output_g_logits = output_g_probs + output_g_scores
+
     return output_g_logits

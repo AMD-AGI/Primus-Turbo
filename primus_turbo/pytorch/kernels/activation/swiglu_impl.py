@@ -24,19 +24,19 @@ from primus_turbo.asm_co.activation.launcher import (
 )
 
 
-def swiglu_fwd_with_probs(
-    x: torch.Tensor,
-    probs: torch.Tensor,
-    row_mask: Optional[torch.Tensor] = None,
-):
+def swiglu_fwd_with_probs(x: torch.Tensor, probs: torch.Tensor, row_mask: Optional[torch.Tensor] = None):
     num_tokens, double_hidden_size = x.size()
+
     probs = probs.unsqueeze(-1)
+
     out = torch.empty(num_tokens, double_hidden_size // 2, dtype=x.dtype, device=x.device)
 
     if row_mask is None:
         grid = (num_tokens,)
         swiglu_fwd_kernel[grid](
-            x, probs, out,
+            x,
+            probs,
+            out,
             num_tokens=num_tokens,
             stride_x_token=x.stride(0),
             stride_probs_token=probs.stride(0),
@@ -45,10 +45,14 @@ def swiglu_fwd_with_probs(
         )
     else:
         assert row_mask.is_cuda, "row_mask must be a CUDA tensor"
+
         BLOCK_SIZE = 8192
         grid = (BLOCK_SIZE,)
         swiglu_with_mask_fwd_kernel[grid](
-            x, probs, row_mask, out,
+            x,
+            probs,
+            row_mask,
+            out,
             num_tokens=num_tokens,
             stride_x_token=x.stride(0),
             stride_probs_token=probs.stride(0),
@@ -67,13 +71,18 @@ def swiglu_bwd_with_probs(
     row_mask: Optional[torch.Tensor] = None,
 ):
     num_tokens, hidden_size = grad_out.size()
-    grad_x     = torch.empty_like(x)
+
+    grad_x = torch.empty_like(x)
     grad_probs = torch.empty_like(probs)
 
     if row_mask is None:
         grid = (num_tokens,)
         swiglu_bwd_kernel[grid](
-            grad_out, x, probs, grad_x, grad_probs,
+            grad_out,
+            x,
+            probs,
+            grad_x,
+            grad_probs,
             num_tokens=num_tokens,
             stride_grad_out_token=grad_out.stride(0),
             stride_x_token=x.stride(0),
@@ -84,6 +93,7 @@ def swiglu_bwd_with_probs(
         )
     else:
         assert row_mask.is_cuda, "tokens_per_expert must be a CUDA tensor"
+
         BLOCK_SIZE = 8192
         grid = (BLOCK_SIZE,)
 
@@ -96,7 +106,12 @@ def swiglu_bwd_with_probs(
             launch_asm_co_swiglu_bwd(grad_out, x, probs, row_mask, grad_x, grad_probs)
         else:
             swiglu_with_mask_bwd_kernel[grid](
-                grad_out, x, probs, row_mask, grad_x, grad_probs,
+                grad_out,
+                x,
+                probs,
+                row_mask,
+                grad_x,
+                grad_probs,
                 num_tokens=num_tokens,
                 stride_grad_out_token=grad_out.stride(0),
                 stride_x_token=x.stride(0),
