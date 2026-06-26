@@ -198,9 +198,9 @@ class FusedMatmulReduceScatterTestBase(MultiProcessTestCase):
                 comm_method=comm_method,
             )
 
-            assert (
-                rs_output_native.stride() == rs_output_turbo.stride()
-            ), f"rs_output_native stride {rs_output_native.stride()} is not equal to rs_output_turbo stride {rs_output_turbo.stride()}"
+            assert rs_output_native.stride() == rs_output_turbo.stride(), (
+                f"rs_output_native stride {rs_output_native.stride()} is not equal to rs_output_turbo stride {rs_output_turbo.stride()}"
+            )
             diff = (rs_output_native - rs_output_turbo).abs().max()
             diff_mask = rs_output_native != rs_output_turbo
             print(

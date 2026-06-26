@@ -71,7 +71,6 @@ def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
 
 
 class FP8GroupedGemmBlockFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -211,7 +210,6 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
 
 
 class FP8GroupedGemmRowFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -394,7 +392,6 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
 
 
 class FP8GroupedGemmTensorFunc(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,

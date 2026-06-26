@@ -73,14 +73,14 @@ def get_shape_from_layout(
             k.shape[1],
             k.shape[2],
         )
-        batch_v, max_seqlen_v, nheads_v, head_size_v = (
+        _, _, _, head_size_v = (
             len(cu_seqlens_k) - 1,
             max_seqlen_k,
             v.shape[1],
             v.shape[2],
         )
     else:
-        assert False, "Got unsupported layout."
+        raise AssertionError("Got unsupported layout.")
 
     # assert
     assert batch_q == batch_k
@@ -97,7 +97,7 @@ def get_strides_from_layout(q, layout):
     elif layout == "bshd":
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
     else:
-        assert False, "Got unsupported layout."
+        raise AssertionError("Got unsupported layout.")
     return q_strides
 
 

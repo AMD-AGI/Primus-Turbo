@@ -8,6 +8,7 @@ Welcome! We appreciate your interest in contributing to **Primus-Turbo**. This d
   - [Table of Contents](#table-of-contents)
   - [📋 Before You Start](#-before-you-start)
   - [📂 Project Structure](#-project-structure)
+  - [🎨 Code Style \& Linting](#-code-style--linting)
   - [🌿 Branch Naming Convention](#-branch-naming-convention)
     - [Type](#type)
     - [Scope (optional)](#scope-optional)
@@ -43,6 +44,27 @@ Primus-Turbo/
 ├── tests/                 # Unit & Integration Tests
 └── benchmark/             # Performance benchmarks
 ```
+
+
+## 🎨 Code Style & Linting
+
+We use [**Ruff**](https://docs.astral.sh/ruff/) for Python linting and formatting (it replaces black / isort / autoflake), and `clang-format` for C++/HIP code. All checks run through [pre-commit](https://pre-commit.com/) and are enforced in CI.
+
+Set up once after cloning:
+```bash
+pip install -r requirements.txt
+pre-commit install
+```
+After this, the hooks run automatically on every `git commit`. To check all files manually (e.g. before opening a PR):
+```bash
+pre-commit run --all-files
+```
+You can also run Ruff directly without pre-commit:
+```bash
+ruff check --fix .   # lint + auto-fix (import sorting, unused imports, ...)
+ruff format .        # format code
+```
+Ruff rules live in `pyproject.toml`; tool versions are pinned in `.pre-commit-config.yaml` and `requirements.txt`.
 
 
 ## 🌿 Branch Naming Convention

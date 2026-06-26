@@ -202,7 +202,6 @@ class FusedAllGatherMatmulTestBase(MultiProcessTestCase):
         torch.manual_seed(42 + rank)
 
         for M, N, K, batch_size, dtype in get_llama3_70b_cfg():
-
             A_shard = torch.rand(batch_size * M // self.world_size, K, dtype=dtype, device="cuda")
             Bs = [torch.rand(K, N, dtype=dtype, device="cuda")]
 

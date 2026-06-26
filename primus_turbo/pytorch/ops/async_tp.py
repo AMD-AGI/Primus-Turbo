@@ -249,7 +249,7 @@ def fused_matmul_reduce_scatter(
 
     if comm_method == "tile" and ((M // group.size() < 256) or (M % 256) or (N % 256) or (K % 256)):
         raise ValueError(
-            f"M, N, and K must be divisible by 256, and M divided by group size must not be less than 256 when comm_method use tile."
+            "M, N, and K must be divisible by 256, and M divided by group size must not be less than 256 when comm_method use tile."
         )
 
     if rs_out is not None:
@@ -267,7 +267,7 @@ def fused_matmul_reduce_scatter(
             raise ValueError(f"Invalid dtype: output ({output.dtype}) is different with A ({A.dtype})!")
 
         if output.numel() != rs_out.numel() * group.size():
-            raise ValueError(f"output size must equal group size * rs_out size.")
+            raise ValueError("output size must equal group size * rs_out size.")
         output = output.view(-1, N)
 
     with torch.profiler.record_function(f"{comm_method}_fused_matmul_scatter_out"):

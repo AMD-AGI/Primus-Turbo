@@ -54,7 +54,6 @@ def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
 
 
 class FP8GemmTensorFunction(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -228,7 +227,6 @@ class FP8GemmTensorFunction(torch.autograd.Function):
 
 
 class FP8GemmRowFunction(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -381,7 +379,6 @@ class FP8GemmRowFunction(torch.autograd.Function):
 
 # TODO(ruibin): Add support for quantized tensor
 class FP8GemmBlockFunction(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -515,7 +512,6 @@ class FP8GemmBlockFunction(torch.autograd.Function):
 
 
 class FP8GemmMXFunction(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,

@@ -226,9 +226,7 @@ def main() -> int:
 
     print(f"{'label':<22} {'Check':<5} {'Fwd TFLOPS':>12} {'Bwd TFLOPS':>12}")
     for r in rows:
-        print(
-            f"{r['label']:<22} {r['Check']:<5} " f"{r['Forward TFLOPS']:>12.2f} {r['Backward TFLOPS']:>12.2f}"
-        )
+        print(f"{r['label']:<22} {r['Check']:<5} {r['Forward TFLOPS']:>12.2f} {r['Backward TFLOPS']:>12.2f}")
 
     pass_fwd = [r["Forward TFLOPS"] for r in rows if r["Check"] == "PASS"]
     pass_bwd = [r["Backward TFLOPS"] for r in rows if r["Check"] == "PASS"]

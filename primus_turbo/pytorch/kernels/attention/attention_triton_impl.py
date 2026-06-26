@@ -68,9 +68,9 @@ def attention_triton_forward_impl(
     use_fp8: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-    assert (
-        window_size_left == -1 and window_size_right == -1
-    ), "in triton attn kernel, window_size_left and window_size_right must be -1."
+    assert window_size_left == -1 and window_size_right == -1, (
+        "in triton attn kernel, window_size_left and window_size_right must be -1."
+    )
     assert q.is_contiguous()
     assert k.is_contiguous()
     assert v.is_contiguous()
@@ -320,9 +320,9 @@ def attention_triton_backward_impl(
     use_fp8: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-    assert (
-        window_size_left == -1 and window_size_right == -1
-    ), "in triton attn kernel, window_size_left and window_size_right must be -1."
+    assert window_size_left == -1 and window_size_right == -1, (
+        "in triton attn kernel, window_size_left and window_size_right must be -1."
+    )
 
     use_exp2 = True
     layout = "bshd"

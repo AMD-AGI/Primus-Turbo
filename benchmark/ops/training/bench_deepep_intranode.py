@@ -119,12 +119,12 @@ def benchmark_intranode(local_rank: int, num_local_ranks: int, args: argparse.Na
             num_tokens *= MBS
 
             if local_rank == 0:
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(
                     f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
                     f"num_tokens: {num_tokens}, hidden: {hidden}, num_topk: {num_topk}, num_experts: {num_experts}"
                 )
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
             try:
                 torch.manual_seed(rank)
@@ -206,7 +206,6 @@ def benchmark_intranode(local_rank: int, num_local_ranks: int, args: argparse.Na
         filename = f"deep_ep_intranode_benchmark_results_{timestamp}_{gpu_name}.csv"
 
     if local_rank == 0:
-
         results.to_csv(filename, index=False)
 
         print(f"Results saved to {filename}")

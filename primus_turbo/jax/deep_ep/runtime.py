@@ -130,7 +130,7 @@ def pin_ep_group_from_jax_mesh(mesh, axis_name: str = "expert") -> None:
             break
     if coords_my is None:
         raise RuntimeError(
-            f"jax.process_index()={my_proc} not present in mesh.devices; " "cannot derive EP group."
+            f"jax.process_index()={my_proc} not present in mesh.devices; cannot derive EP group."
         )
     ep_ranks: List[int] = []
     for v in range(devices_arr.shape[expert_axis_idx]):
@@ -229,8 +229,7 @@ class LaunchMode(IntEnum):
         if normalized == "per_process":
             return cls.PER_PROCESS
         raise ValueError(
-            f"Unsupported JAX DeepEP mode '{raw_mode}'. "
-            f"Expected one of: {[mode.mode_name for mode in cls]}"
+            f"Unsupported JAX DeepEP mode '{raw_mode}'. Expected one of: {[mode.mode_name for mode in cls]}"
         )
 
 
@@ -282,7 +281,7 @@ def auto_detect_mode() -> None:
     if jax.local_device_count() == 1 and jax.process_count() > 1:
         os.environ[_MODE_ENV_VAR] = "per_process"
         log.info(
-            "Auto-detected per_process mode " "(1 GPU per process, %d JAX processes, ep_group_size=%d)",
+            "Auto-detected per_process mode (1 GPU per process, %d JAX processes, ep_group_size=%d)",
             jax.process_count(),
             _ep_group_size_or_world(),
         )

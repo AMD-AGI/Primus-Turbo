@@ -11,3 +11,30 @@ version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
 write_to = "primus_turbo/_version.py"
 fallback_version = "0.0.0.dev0"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = [
+    "3rdparty",
+    "build",
+    "primus_turbo/_version.py",
+    "primus_turbo/_build_info.py",
+]
+
+[tool.ruff.lint]
+select = ["B", "F", "I", "W"]
+ignore = [
+    # F403/F405: package __init__ files use intentional star-imports for API aggregation.
+    "F403",
+    "F405",
+    # B905: zip(..., strict=) requires py3.10+ everywhere; revisit as a separate sweep.
+    "B905",
+    # B007: unused loop control variable is common and low-risk here.
+    "B007",
+    # B028: explicit stacklevel on every warnings.warn is noisy; skip it.
+    "B028",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

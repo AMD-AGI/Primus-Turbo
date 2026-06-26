@@ -538,14 +538,14 @@ def dequantize_mxfp8_impl(
     else:
         assert axis in (1, 2), "The axis must be 1 or 2 for 3D input."
     SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
-    assert (
-        out_dtype in SUPPORTED_OUT_DTYPES
-    ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
+    assert out_dtype in SUPPORTED_OUT_DTYPES, (
+        f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
+    )
 
     row_length = x.size(-1)
-    assert (
-        row_length % block_size == 0
-    ), "The last dimension of the x tensor must be divisible by the block size."
+    assert row_length % block_size == 0, (
+        "The last dimension of the x tensor must be divisible by the block size."
+    )
 
     return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp8(x, scale_inv, axis, block_size, out_dtype)
 
@@ -566,14 +566,14 @@ def grouped_dequantize_mxfp8_impl(
     assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
     assert axis in (0, 1), "The axis must be 0 or 1."
     SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
-    assert (
-        out_dtype in SUPPORTED_OUT_DTYPES
-    ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
+    assert out_dtype in SUPPORTED_OUT_DTYPES, (
+        f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
+    )
 
     _, row_length = x.size()
-    assert (
-        row_length % block_size == 0
-    ), "The last dimension of the x tensor must be divisible by the block size."
+    assert row_length % block_size == 0, (
+        "The last dimension of the x tensor must be divisible by the block size."
+    )
 
     return torch.ops.primus_turbo_cpp_extension.grouped_dequantize_mxfp8(
         x, scale_inv, group_offs, group_offs_padded, axis, block_size, out_dtype, total_M
@@ -657,15 +657,15 @@ def dequantize_mxfp4_impl(
     ), "The axis must be 0 or 1."
     assert x.dtype == torch.float4_e2m1fn_x2, f"The x dtype must be torch.float4_e2m1fn_x2 but got {x.dtype}."
     SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
-    assert (
-        out_dtype in SUPPORTED_OUT_DTYPES
-    ), f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
+    assert out_dtype in SUPPORTED_OUT_DTYPES, (
+        f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
+    )
 
     num_rows, row_length = x.size()
     # NOTE: x is packed in last dimension
     row_length = row_length * 2
-    assert (
-        row_length % block_size == 0
-    ), "The last dimension of the x tensor must be divisible by the block size."
+    assert row_length % block_size == 0, (
+        "The last dimension of the x tensor must be divisible by the block size."
+    )
 
     return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp4(x, scale_inv, axis, block_size, out_dtype)

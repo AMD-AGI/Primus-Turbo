@@ -134,17 +134,17 @@ def _run_dispatch_combine(
 
     restored_hidden_states = dispatcher.token_combine(permuted_local_hidden_states)
 
-    assert torch.allclose(
-        restored_hidden_states, ans
-    ), "Restored hidden states do not match original hidden states"
+    assert torch.allclose(restored_hidden_states, ans), (
+        "Restored hidden states do not match original hidden states"
+    )
 
     torch.autograd.backward(restored_hidden_states, hidden_states)
     assert torch.allclose(hidden_states.grad, ans), "Gradient does not match original hidden states"
 
     expected_device = "cuda" if deepep_use_cuda_num_tokens_per_expert else "cpu"
-    assert (
-        tokens_per_expert.device.type == expected_device
-    ), f"Expected tokens_per_expert on {expected_device}, got {tokens_per_expert.device.type}"
+    assert tokens_per_expert.device.type == expected_device, (
+        f"Expected tokens_per_expert on {expected_device}, got {tokens_per_expert.device.type}"
+    )
 
 
 @instantiate_parametrized_tests

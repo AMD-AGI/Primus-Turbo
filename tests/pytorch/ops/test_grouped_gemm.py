@@ -233,9 +233,9 @@ def test_grouped_gemm_with_zero_length_groups(B, M, N_K, dtype, trans_b, backend
 
     zero_mask = group_lens == 0
     zero_count = int(zero_mask.sum().item())
-    assert (
-        zero_count == num_zero
-    ), f"expected num_zero={num_zero}, but got {zero_count}; group_lens={group_lens}"
+    assert zero_count == num_zero, (
+        f"expected num_zero={num_zero}, but got {zero_count}; group_lens={group_lens}"
+    )
     zero_indices = torch.nonzero(zero_mask, as_tuple=False).flatten().tolist()
     print(f"zero_indices: {zero_indices}")
 

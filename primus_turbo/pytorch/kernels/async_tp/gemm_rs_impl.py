@@ -104,7 +104,7 @@ def _tiled_fused_matmul_scatter_out_impl(
     output: torch.Tensor,
     rs_output: torch.Tensor,
     out_dtype: torch.dtype,
-    stream: torch.cuda.Stream
+    stream: torch.cuda.Stream,
 ):
 
     M = input.shape[0]

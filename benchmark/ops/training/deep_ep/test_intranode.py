@@ -116,7 +116,7 @@ def test_main(
                 for with_topk in (False, True):
                     if local_rank == 0:
                         print(
-                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...',
+                            f"[testing] Running with {'FP8' if isinstance(current_x, tuple) else 'BF16'}, {'with' if with_topk else 'without'} top-k (async={async_mode}, previous={previous_mode}) ...",
                             flush=True,
                             end="",
                         )
@@ -152,9 +152,9 @@ def test_main(
 
                     # Checks
                     rank_prefix_matrix = handle[0]
-                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(
-                        0
-                    ), f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(0), (
+                        f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    )
                     assert (
                         gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
                         == recv_num_tokens_per_expert_list
@@ -276,13 +276,13 @@ def test_main(
                 best_time, best_results = t, (num_sms, nvl_chunk_size)
             if local_rank == 0:
                 print(
-                    f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
+                    f"[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else 'default'}: "
                     f"{nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL), {t * 1e6:.2f} us",
                     flush=True,
                 )
         if local_rank == 0:
             print(
-                f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL), t: {best_time * 1e6:.2f} us',
+                f"[tuning] Best dispatch ({'FP8' if isinstance(current_x, tuple) else 'BF16'}): SMs {best_results[0]}, NVL chunk {best_results[1]}, {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL), t: {best_time * 1e6:.2f} us",
                 flush=True,
             )
             print("", flush=True)
@@ -321,7 +321,7 @@ def test_main(
         t = bench(lambda: buffer.combine(**tune_args))[0]  # noqa: B023
         if local_rank == 0:
             print(
-                f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else "default"}: '
+                f"[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size if nvl_chunk_size else 'default'}: "
                 f"{combine_bf16_nvl_send_bytes / 1e9 / t:.2f} GB/s (NVL), {t * 1e6:.2f} us",
                 flush=True,
             )
@@ -342,7 +342,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     test_ll_compatibility, num_rdma_bytes = False, 0
     deep_ep = get_deep_ep_backend(args.backend)
     if test_ll_compatibility:
-        ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
+        ll_num_tokens, ll_hidden, ll_num_experts, _ll_num_topk = 16, 5120, 256, 9
         num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
             ll_num_tokens, ll_hidden, num_ranks, ll_num_experts
         )

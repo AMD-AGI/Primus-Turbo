@@ -158,7 +158,7 @@ def tune_and_verify_internode(
                 for with_topk in (False, True):
                     if local_rank == 0:
                         print(
-                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...',
+                            f"[testing] Running with {'FP8' if isinstance(current_x, tuple) else 'BF16'}, {'with' if with_topk else 'without'} top-k (async={async_mode}, previous={previous_mode}) ...",
                             flush=True,
                             end="",
                         )
@@ -195,9 +195,9 @@ def tune_and_verify_internode(
 
                     # Checks
                     recv_gbl_rank_prefix_sum = handle[-4]
-                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(
-                        0
-                    ), f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(0), (
+                        f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    )
                     assert (
                         gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
                         == recv_num_tokens_per_expert_list
@@ -393,7 +393,7 @@ def tune_and_verify_intranode(
                 for with_topk in (False, True):
                     if local_rank == 0:
                         print(
-                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...',
+                            f"[testing] Running with {'FP8' if isinstance(current_x, tuple) else 'BF16'}, {'with' if with_topk else 'without'} top-k (async={async_mode}, previous={previous_mode}) ...",
                             flush=True,
                             end="",
                         )
@@ -429,9 +429,9 @@ def tune_and_verify_intranode(
 
                     # Checks
                     rank_prefix_matrix = handle[0]
-                    assert ref_gbl_num_tokens_per_rank[rank].item() == recv_x.size(
-                        0
-                    ), f"{ref_gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    assert ref_gbl_num_tokens_per_rank[rank].item() == recv_x.size(0), (
+                        f"{ref_gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    )
                     assert (
                         ref_gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
                         == recv_num_tokens_per_expert_list

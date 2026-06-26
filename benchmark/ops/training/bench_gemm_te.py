@@ -200,7 +200,7 @@ def benchmark_gemm_te(dtype_name="bf16", granularity_name="tensorwise", output_c
                 N = shape[1]
                 K = shape[2]
 
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 if is_fp8:
                     print(
                         f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, "
@@ -208,7 +208,7 @@ def benchmark_gemm_te(dtype_name="bf16", granularity_name="tensorwise", output_c
                     )
                 else:
                     print(f"TestID: {test_id}, Case: {model_name}, MBS: {MBS}, M: {M}, N: {N}, K: {K}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 try:
                     if is_fp8:

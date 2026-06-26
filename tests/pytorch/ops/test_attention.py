@@ -103,7 +103,7 @@ def test_attention_16bit(
         v_layout = (batch, seqlen_kv, num_head_kv, head_dim_v)
         o_layout = (batch, seqlen_q, num_head_q, head_dim_v)
     else:
-        assert False, f"Unsupported qkv format: {qkv_format}"
+        raise AssertionError(f"Unsupported qkv format: {qkv_format}")
 
     query = torch.randn(q_layout, device=device, dtype=dtype, requires_grad=True)
     key = torch.randn(k_layout, device=device, dtype=dtype, requires_grad=True)
