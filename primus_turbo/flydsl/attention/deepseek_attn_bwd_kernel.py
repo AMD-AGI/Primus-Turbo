@@ -99,6 +99,11 @@ def _get_dkv(num_heads, head_dim, swa_window, dtype_str, mqa_kv):
             dtype_str=dtype_str,
             mqa_kv=mqa_kv,
             num_waves=4,
+            # R13: enable the gfx950 sched_group_barrier MFMA/MEM
+            # cluster-pair interleave in the dominant swa_bwd_dkv inner
+            # loop. Set False to restore the byte-identical pre-R13
+            # schedule (rollback).
+            sched_interleave=True,
         )
         _DKV_CACHE[key] = launch
         return launch

@@ -67,9 +67,21 @@ def build_swa_bwd_dkv_module(
     daz=True,
     layout_bhld=True,
     mqa_kv=True,
+    sched_interleave=False,
 ):
     """Build the V4 SWA backward dK/dV launcher (MQA only)."""
     gpu_arch = get_hip_arch()
+
+    # R13: explicit MFMA/MEM instruction-scheduling interleave (gfx950
+    # sched_group_barrier cluster-pairs). When False the emitted IR is
+    # byte-identical to the pre-R13 schedule (legacy rollback path);
+    # when True each dominant MFMA cluster (GEMM1/3 D-contraction
+    # partials and the GEMM2/4 AV-MMA) ends with a (1 MFMA, N LDS-read)
+    # pair pattern under a distinct sched-group id, the GEMM2/4 clusters
+    # are bracketed by s_setprio(1)/(0), and the inner-loop s_barriers
+    # are bookended by sched_barrier(0) fences so the post-RA scheduler
+    # cannot hoist MFMAs across the wavefront sync. Math is unchanged.
+    SCHED_INTERLEAVE = bool(sched_interleave)
 
     if const_expr(block_n is None):
         # R6k-1: D-split wave remap default. BLOCK_N=16 halves per-lane
@@ -329,6 +341,37 @@ def build_swa_bwd_dkv_module(
                 v4f32_type,
                 [a, b, c],
             )
+
+        # R13: sched-group-barrier interleave helpers. No-ops unless
+        # SCHED_INTERLEAVE. Each helper emits one intrinsic per call at
+        # IR-build time -- the Python loop IS the unrolled form (unlike a
+        # C++ runtime loop), so the post-RA scheduler sees the full
+        # (1 MFMA, mem_per LDS-read) x n_mfma pair sequence as a hard
+        # constraint within the enclosing scheduling region.
+        def _sched_mfma_mem_pairs(n_mfma, mem_per, group_id, mem_mask=None):
+            if const_expr(not SCHED_INTERLEAVE):
+                return
+            if const_expr(mem_mask is None):
+                mem_mask = rocdl.mask_dsrd
+            for _ in range(n_mfma):
+                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+                rocdl.sched_group_barrier(mem_mask, mem_per, group_id)
+
+        def _sched_fence():
+            if const_expr(SCHED_INTERLEAVE):
+                rocdl.sched_barrier(0)
+
+        def _sched_barrier():
+            # Bookend the wavefront sync with scheduler fences so MFMAs
+            # cannot be hoisted across the s_barrier (correctness for the
+            # dS/dKV accumulators).
+            _sched_fence()
+            gpu.barrier()
+            _sched_fence()
+
+        def _sched_setprio(prio):
+            if const_expr(SCHED_INTERLEAVE):
+                rocdl.s_setprio(prio)
 
         seq_len_q_v = arith.index_cast(T.index, seq_len_q)
         seq_len_k_v = arith.index_cast(T.index, seq_len_k)
@@ -679,7 +722,7 @@ def build_swa_bwd_dkv_module(
                                          + load_col_base)
                             vector.store(vec_do_safe, lds_do, [lds_idx_do])
                             vector.store(vec_q_safe, lds_q, [lds_idx_q])
-                    gpu.barrier()
+                    _sched_barrier()  # R13: bookended Q/DO-load barrier
 
                     # 6N-2 iter2: when D-split, q_b_packs / do_b_packs_gemm3
                     # are loaded INSIDE the per-mt scf.IfOp gates (see
@@ -749,6 +792,11 @@ def build_swa_bwd_dkv_module(
                         else:
                             q_pack = q_b_packs[mt][ks]
                         acc = mfma_acc(k_pack, q_pack, acc)
+                    # R13: interleave the KS_PER QK^T MFMAs with their LDS
+                    # B-frag reads (2 reads/MFMA when Q/DO are LDS-resident,
+                    # else 1 K-read/MFMA). Distinct group per m-tile.
+                    _sched_mfma_mem_pairs(
+                        KS_PER, 2 if USE_LDS_FOR_Q_DO else 1, 10 + mt)
                     return acc
 
                 def _sred_store(mt, acc):
@@ -809,7 +857,7 @@ def build_swa_bwd_dkv_module(
                         s_partial[mt] = if_p.results[0]
 
                     # All partials (incl. kh==1 sred writes) visible to readers.
-                    gpu.barrier()
+                    _sched_barrier()  # R13: bookended GEMM1 sred barrier
 
                     for mt in range_constexpr(M_TILES):
                         sm_owner = sm_owner_preds[mt]
@@ -1081,7 +1129,7 @@ def build_swa_bwd_dkv_module(
                 # lanes from wave 1 (and vice versa). Without a barrier
                 # wave 1 could observe wave 0's stale prior-iteration pT.
                 if const_expr(D_SPLIT_WAVES):
-                    gpu.barrier()
+                    _sched_barrier()  # R13: bookended pT-write barrier
 
                 # ---- pT A-frag for GEMM2 (dV += pT @ DO):
                 #   A[kv_row=wave_n_offset+lane_mod_16, m_col=m_step*32+lane_div_16*8 + 0..7]
@@ -1149,11 +1197,22 @@ def build_swa_bwd_dkv_module(
                 # R6k-1: dc loops wave-local (D_CHUNKS_LOCAL); reader adds
                 # wave_d_col_offset internally.
                 new_dv_accs = list(dv_accs)
+                # R13: AV-MMA cluster (dV += pT @ DO). Raise SIMD priority
+                # so the interleaved schedule isn't preempted, then force
+                # the (1 MFMA, mem-read) pair pattern over the DO B-frag
+                # loads (LDS tr16 reads when Q/DO resident, else VMEM).
+                _sched_setprio(1)
                 for dc in range_constexpr(D_CHUNKS_LOCAL):
                     for pks in range_constexpr(K_STEPS_PT):
                         b_pack = read_do_b_pack(pks, dc)
                         new_dv_accs[dc] = mfma_acc(
                             pt_a_packs[pks], b_pack, new_dv_accs[dc])
+                _sched_mfma_mem_pairs(
+                    D_CHUNKS_LOCAL * K_STEPS_PT,
+                    2 if USE_LDS_FOR_Q_DO else MFMA_LANE_K, 2,
+                    mem_mask=(rocdl.mask_dsrd if USE_LDS_FOR_Q_DO
+                              else rocdl.mask_vmem_rd))
+                _sched_setprio(0)
 
                 # R5: GEMM3 (dP) B-frag partial helper over a constexpr ks
                 # range [ks_lo, ks_lo + KS_PER). Mirrors _gemm1_partial.
@@ -1174,6 +1233,10 @@ def build_swa_bwd_dkv_module(
                         else:
                             do_pack = do_b_packs_gemm3[mt][ks]
                         acc = mfma_acc(v_pack, do_pack, acc)
+                    # R13: interleave the KS_PER dP=dO.V^T MFMAs with their
+                    # LDS B-frag reads. Distinct group per m-tile.
+                    _sched_mfma_mem_pairs(
+                        KS_PER, 2 if USE_LDS_FOR_Q_DO else 1, 30 + mt)
                     return acc
 
                 # 6N-2: de-dup GEMM3 + dsT + dsT_write per mt-tile.
@@ -1204,7 +1267,7 @@ def build_swa_bwd_dkv_module(
                             scf.YieldOp([v4f32_zero])
                         dp_partial[mt] = if_p3.results[0]
 
-                    gpu.barrier()
+                    _sched_barrier()  # R13: bookended GEMM3 sred barrier
 
                     for mt in range_constexpr(M_TILES):
                         sm_owner = sm_owner_preds[mt]
@@ -1313,7 +1376,7 @@ def build_swa_bwd_dkv_module(
 
                 # R6k-1: D-split barrier (see GEMM2 pT barrier comment).
                 if const_expr(D_SPLIT_WAVES):
-                    gpu.barrier()
+                    _sched_barrier()  # R13: bookended dsT-write barrier
 
                 # ---- dsT A-frag for GEMM4 (dK += dsT @ Q):
                 #   A[kv_row=wave_n_offset+lane_mod_16, m_col=m_step*32+lane_div_16*8 + 0..7]
@@ -1375,13 +1438,23 @@ def build_swa_bwd_dkv_module(
 
                 # R6k-1: dc loops wave-local; reader adds wave_d_col_offset.
                 new_dk_accs = list(dk_accs)
+                # R13: AV-MMA cluster (dK += dsT @ Q). Same setprio +
+                # (1 MFMA, mem-read) interleave as GEMM2.
+                _sched_setprio(1)
                 for dc in range_constexpr(D_CHUNKS_LOCAL):
                     for pks in range_constexpr(K_STEPS_PT):
                         q_b_pack = read_q_b_pack(pks, dc)
                         new_dk_accs[dc] = mfma_acc(
                             ds_a_packs[pks], q_b_pack, new_dk_accs[dc])
+                _sched_mfma_mem_pairs(
+                    D_CHUNKS_LOCAL * K_STEPS_PT,
+                    2 if USE_LDS_FOR_Q_DO else MFMA_LANE_K, 4,
+                    mem_mask=(rocdl.mask_dsrd if USE_LDS_FOR_Q_DO
+                              else rocdl.mask_vmem_rd))
+                _sched_setprio(0)
 
-                gpu.barrier()
+                # R13: bookended trailing barrier (no-op fences when off).
+                _sched_barrier()
 
                 yield list(new_dv_accs) + list(new_dk_accs)
 
