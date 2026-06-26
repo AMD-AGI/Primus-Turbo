@@ -445,18 +445,58 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             # the downstream GEMM/dispatch expect); re-transposed in the launcher.
             grad_out_fp8_col = grad_out_fp8_col.transpose(0, 1)
 
+        # --- Round 15: unlock tile_n=256 on the deep-K dgrad (NN, block2d) FlyDSL
+        # kernel via an algebraically-exact K-zero-pad of the weight operand.
+        # The dgrad selects its tile_n from the output-feature dim (= weight
+        # in_features K = b_fp8.shape[1]). When K is not a multiple of 256 the
+        # kernel is forced to tile_n=128 (num_acc_n=2), losing the proven 2x
+        # A-fragment / scale_a reuse of tile_n=256. Zero-pad the weight along K up
+        # to the next multiple of 256 and slice grad_a back: the pad columns are
+        # exactly zero, so every original grad_a column is computed bit-identically
+        # (no in-kernel tail mask). The pad is recomputed fresh each backward
+        # purely from operand shapes (K3: single-launch operand prep, no
+        # tensor-identity / _version / weakref cache), so it transfers 1:1 to a
+        # real training step. Scoped to FlyDSL + the NT-forward dgrad (ctx.trans_b)
+        # + the tile_n=128-forced shape (K % 256 != 0) so tile_n=256-legal shapes
+        # are never padded.
+        dgrad_b_fp8 = b_fp8
+        dgrad_b_scale_inv = b_scale_inv
+        dgrad_k_orig = None
+        if (
+            ctx.trans_b
+            and GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        ):
+            block_size = ctx.config.block_size
+            k_out = b_fp8.shape[1]
+            if k_out % 256 != 0 and k_out % block_size == 0:
+                k_pad = ((k_out + 255) // 256) * 256
+                pad_blocks = (k_pad - k_out) // block_size
+                # Zero-pad the fp8 weight along K (pad columns dequant to exactly 0).
+                # new_zeros preserves the fp8 dtype (F.pad does not support fp8).
+                b_fp8_padded = b_fp8.new_zeros((b_fp8.shape[0], k_pad))
+                b_fp8_padded[:, :k_out] = b_fp8
+                # Append finite (=1.0) inv-scale block(s) so 0 * 1.0 = 0 (a NaN-safe
+                # value: an inf/NaN inv-scale on the pad block could yield 0*inf=NaN).
+                scale_pad = b_scale_inv.new_ones((b_scale_inv.shape[0], pad_blocks))
+                dgrad_b_fp8 = b_fp8_padded
+                dgrad_b_scale_inv = torch.cat([b_scale_inv, scale_pad], dim=1)
+                dgrad_k_orig = k_out
+
         a_grad = gemm_fp8_impl(
             grad_out_fp8_row,
             grad_out_scale_inv_row,
             False,
-            b_fp8,
-            b_scale_inv,
+            dgrad_b_fp8,
+            dgrad_b_scale_inv,
             not ctx.trans_b,
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
             default_backend=BackendType.CK.value,
         )
+        if dgrad_k_orig is not None:
+            # Drop the padded output-feature columns (they are exactly zero).
+            a_grad = a_grad[:, :dgrad_k_orig]
 
         b_grad = gemm_fp8_impl(
             a_fp8_col,
