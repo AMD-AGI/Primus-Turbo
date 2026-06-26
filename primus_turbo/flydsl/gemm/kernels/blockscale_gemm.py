@@ -986,14 +986,14 @@ def compile_blockscale_fwd_gemm(**kwargs):
 
 
 def compile_blockscale_dgrad_gemm(**kwargs):
-    """dgrad / NN: 2D-block scale_b, L2 grouped rasterization (GROUP_M=8).
+    """dgrad / NN: 2D-block scale_b, L2 grouped rasterization (GROUP_M=16).
 
     Identical kernel to forward; the launcher feeds the transposed weight + scale
     so the general ``C[M,OUT]=A@B^T`` form computes ``grad_a[M,K]``.
     """
     kwargs.pop("scale_b_mode", None)
-    kwargs.pop("l2_group_m", None)
-    return compile_blockscale_gemm(scale_b_mode="block2d", l2_group_m=8, **kwargs)
+    l2_group_m = kwargs.pop("l2_group_m", 16)
+    return compile_blockscale_gemm(scale_b_mode="block2d", l2_group_m=l2_group_m, **kwargs)
 
 
 def compile_blockscale_wgrad_gemm(**kwargs):

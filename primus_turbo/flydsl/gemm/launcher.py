@@ -505,6 +505,7 @@ def gemm_fp8_blockwise_flydsl_dgrad(
             scale_block_k=_SCALE_BLOCK,
             out_dtype=out_dtype_str,
             use_async_copy=True,
+            l2_group_m=16,
         )
         compiled = flyc.compile(exe, out, grad_out_fp8, b_shuffled, a_scale_t, b_scale_flat, M, K, stream)
         _compiled_cache[key] = compiled
