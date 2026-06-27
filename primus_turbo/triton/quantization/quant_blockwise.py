@@ -225,20 +225,24 @@ def quant_fp8_blockwise_for_weight_kernel(
     tl.store(w_scales_ptr + scale_offs, w_scales_inv)
 
 
-# w_ptr          [M, N]            (2D weight; M=rows / out-features, N=cols / in-features)
-# w_fp8_ptr      [M, N] FP8        plain block2d (for ctx / dgrad)
-# w_fp8_ps_ptr   [M, N] FP8        forward (16, 16) MFMA pre-shuffled (byte-identical to shuffle_b)
-# w_scales_ptr   [M // BLOCK_SIZE, N // BLOCK_SIZE] FP32
+# w_ptr           [M, N]            (2D weight; M=rows / out-features, N=cols / in-features)
+# w_fp8_ptr       [M, N] FP8        plain block2d (for ctx / dgrad)
+# w_fp8_ps_ptr    [M, N] FP8        forward (16, 16) MFMA pre-shuffled (byte-identical to shuffle_b)
+# w_fp8_dgrad_ps_ptr [M, N] FP8     dgrad (NN) transposed-preshuffle (byte-identical to
+#                                   _shuffle_b_transposed(w_fp8); only written when EMIT_DGRAD_PS)
+# w_scales_ptr    [M // BLOCK_SIZE, N // BLOCK_SIZE] FP32
 @triton.jit
 def quant_fp8_blockwise_for_weight_dual_kernel(
     w_ptr,
     w_fp8_ptr,
     w_fp8_ps_ptr,
+    w_fp8_dgrad_ps_ptr,
     w_scales_ptr,
     M,
     N,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    EMIT_DGRAD_PS: tl.constexpr = False,
 ):
     """2D blockwise weight quant that emits BOTH the plain block2d FP8 weight and
     its forward (16, 16) MFMA pre-shuffled copy in a single read of ``w``.
@@ -291,6 +295,28 @@ def quant_fp8_blockwise_for_weight_dual_kernel(
         + BN_PS * (i3[None, :] + (BK_PS // KIN_PS) * (i2[None, :] + (N // BK_PS) * i0[:, None]))
     )
     tl.store(w_fp8_ps_ptr + ps_off, w_fp8_cast, mask=mask)
+
+    # Dgrad (NN) transposed-preshuffle store in the SAME read of w. Byte-identical
+    # to _shuffle_b_transposed(w_fp8) == shuffle_b(w_fp8.transpose(0, 1)), the
+    # operand the FlyDSL dgrad GEMM consumes (logical [K, N] from w [M=N_w, N=K_w]).
+    # T = w_fp8.T has shape [P=N (=K_w cols), Q=M (=N_w rows)]; shuffle_b reads
+    # T[row, col] = w_fp8[col, row] with row over P (=offs_n) and col over Q
+    # (=offs_m), so i0/i1 index offs_n (rows of T) and i2/i3/i4 index offs_m (cols
+    # of T), with Q = M. The stored tile is tl.trans(w_fp8_cast) -> [offs_n, offs_m].
+    # Folding this here eliminates the standalone per-backward-step
+    # _preshuffle_b_transposed_kernel; the dgrad GEMM's operand load is unchanged.
+    if EMIT_DGRAD_PS:
+        i0d = offs_n // BN_PS
+        i1d = offs_n % BN_PS
+        i2d = offs_m // BK_PS
+        i3d = (offs_m % BK_PS) // KIN_PS
+        i4d = offs_m % KIN_PS
+        dps_off = i4d[None, :] + KIN_PS * (
+            i1d[:, None]
+            + BN_PS * (i3d[None, :] + (BK_PS // KIN_PS) * (i2d[None, :] + (M // BK_PS) * i0d[:, None]))
+        )
+        dps_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+        tl.store(w_fp8_dgrad_ps_ptr + dps_off, tl.trans(w_fp8_cast), mask=dps_mask)
 
     # Store scale (layout unchanged vs the plain weight quant).
     scale_offs = pid_m * tl.cdiv(N, BLOCK_SIZE) + pid_n

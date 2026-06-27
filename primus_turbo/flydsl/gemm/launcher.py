@@ -469,8 +469,13 @@ def gemm_fp8_blockwise_flydsl_dgrad(
     Nb, K = b_fp8.shape  # weight [N, K] -> output dim K
     assert N == Nb, f"N mismatch: grad_out has N={N}, b has N={Nb}"
 
-    # B = b^T = [K, N]; its 2D-block scale transposes to [K // 128, N // 128].
-    b_scale_t = b_scale_inv.transpose(0, 1).contiguous()
+    # Detect the forward-emitted dgrad transposed-preshuffle weight: the producer
+    # (weight dual-quant) already wrote b_fp8 in the kernel's [K, N] (16, 16)
+    # transposed-preshuffle layout and passes the transposed weight scale flattened
+    # (1D) as the signal (the GEMM dispatch ignores scale shape). In that case the
+    # standalone _shuffle_b_transposed copy + kernel launch is skipped. Normal
+    # callers pass the 2D [N // 128, K // 128] scale and take the shuffle path below.
+    b_preshuffled = b_scale_inv.dim() == 1
 
     # Kernel dims: rows M_kernel=M, output cols N_kernel=K, contraction K_kernel=N.
     tile = _select_tile(M, K, N)
@@ -484,10 +489,18 @@ def gemm_fp8_blockwise_flydsl_dgrad(
     flyc = _flyc()
 
     a_scale_t = grad_out_scale_inv.transpose(0, 1).contiguous().view(-1)  # [N//128, M]
-    b_scale_flat = b_scale_t.contiguous().view(-1)
-    # Fuse b^T (transpose+contiguous) and the pre-shuffle into ONE copy:
-    # _shuffle_b_transposed(b_fp8) == shuffle_b(b_fp8.transpose(0, 1).contiguous()).
-    b_shuffled = _shuffle_b_transposed(b_fp8)
+    if b_preshuffled:
+        # b_fp8 is the [N, K]-shaped buffer holding the [K, N] transposed-preshuffle
+        # bytes; reinterpret it and consume the carried transposed scale directly.
+        b_shuffled = b_fp8.reshape(K, N)
+        b_scale_flat = b_scale_inv  # already [K // 128, N // 128] flattened (transposed)
+    else:
+        # B = b^T = [K, N]; its 2D-block scale transposes to [K // 128, N // 128].
+        b_scale_t = b_scale_inv.transpose(0, 1).contiguous()
+        b_scale_flat = b_scale_t.contiguous().view(-1)
+        # Fuse b^T (transpose+contiguous) and the pre-shuffle into ONE copy:
+        # _shuffle_b_transposed(b_fp8) == shuffle_b(b_fp8.transpose(0, 1).contiguous()).
+        b_shuffled = _shuffle_b_transposed(b_fp8)
 
     out = torch.empty((M, K), dtype=out_dtype, device=grad_out_fp8.device)
     stream = torch.cuda.current_stream()

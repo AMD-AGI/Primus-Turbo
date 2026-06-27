@@ -388,6 +388,15 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         # kernel-side fusion recomputed fresh each forward from `b` (no tensor-id /
         # _version / weakref cache), so it transfers 1:1 to a real training step.
         b_fwd_preshuffled = False
+        # Additionally emit the dgrad (NN) transposed-preshuffle weight layout in the
+        # SAME read of `b` (a 3rd FP8 output of the weight dual-quant), carried to
+        # backward via ctx so the dgrad path can skip its standalone per-step
+        # _preshuffle_b_transposed_kernel. Gated below on the dgrad actually running
+        # on FlyDSL without the Round-15 K-pad path (K % 256 == 0) and on the
+        # transposed-preshuffle divisibility. Recomputed fresh each forward from `b`
+        # (no tensor-id / _version / weakref cache), so it transfers 1:1 to a real
+        # training step (K4: forward intermediate carried to its own backward).
+        emit_dgrad_ps = False
         if (
             trans_b
             and config.block_size == 128
@@ -404,16 +413,31 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                     and flydsl_blockwise_gemm_supported(M_a, N_w, K_w)
                 ):
                     b_fwd_preshuffled = True
+                    # dgrad logical shape (M=M_a, N=K_w, K=N_w); only fold when it
+                    # runs on FlyDSL without K-pad and the transposed (16, 16)
+                    # preshuffle divides (rows=K_w % 16, cols=N_w % 32).
+                    if (
+                        fuse_a_dual
+                        and K_w % 256 == 0
+                        and K_w % 16 == 0
+                        and N_w % 32 == 0
+                        and flydsl_blockwise_gemm_supported(M_a, K_w, N_w)
+                    ):
+                        emit_dgrad_ps = True
             except Exception:
                 b_fwd_preshuffled = False
+                emit_dgrad_ps = False
 
+        b_fp8_dgrad_ps = None
         if b_fwd_preshuffled:
-            b_fp8, b_fp8_ps, b_scale_inv = quant_fp8_blockwise_for_weight_dual_impl(
-                b, b_dtype, block_size=config.block_size
+            b_fp8, b_fp8_ps, b_fp8_dgrad_ps, b_scale_inv = quant_fp8_blockwise_for_weight_dual_impl(
+                b, b_dtype, block_size=config.block_size, emit_dgrad_ps=emit_dgrad_ps
             )
             # Pre-shuffled operand + 1D scale signal -> forward launcher skips shuffle_b.
             b_fwd_data = b_fp8_ps
             b_fwd_scale = b_scale_inv.view(-1)
+            if not emit_dgrad_ps:
+                b_fp8_dgrad_ps = None
         else:
             b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(
                 b, b_dtype, block_size=config.block_size
@@ -433,12 +457,19 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             granularity=config.granularity.value,
             default_backend=BackendType.CK.value,
         )
+        has_dgrad_ps = fuse_a_dual and b_fp8_dgrad_ps is not None
         if fuse_a_dual:
-            ctx.save_for_backward(b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col)
+            if has_dgrad_ps:
+                ctx.save_for_backward(
+                    b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col, b_fp8_dgrad_ps
+                )
+            else:
+                ctx.save_for_backward(b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col)
             ctx.has_prequantized_a_col = True
         else:
             ctx.save_for_backward(a, b_fp8, b_scale_inv)
             ctx.has_prequantized_a_col = False
+        ctx.has_dgrad_ps = has_dgrad_ps
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
@@ -452,8 +483,12 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
+        b_fp8_dgrad_ps = None
         if ctx.has_prequantized_a_col:
-            b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col = ctx.saved_tensors
+            if getattr(ctx, "has_dgrad_ps", False):
+                b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col, b_fp8_dgrad_ps = ctx.saved_tensors
+            else:
+                b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col = ctx.saved_tensors
         else:
             a, b_fp8, b_scale_inv = ctx.saved_tensors
             a_dtype = _get_fp8_dtype(ctx.config.format, False)
@@ -509,7 +544,20 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         dgrad_b_fp8 = b_fp8
         dgrad_b_scale_inv = b_scale_inv
         dgrad_k_orig = None
-        if (
+        use_dgrad_ps = (
+            b_fp8_dgrad_ps is not None
+            and ctx.trans_b
+            and GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        )
+        if use_dgrad_ps:
+            # Consume the forward-emitted dgrad transposed-preshuffle weight. The
+            # transposed weight scale is flattened to 1D as the "already preshuffled"
+            # signal the dgrad launcher detects (it then skips _shuffle_b_transposed).
+            # Mutually exclusive with the K-pad path below (only emitted when
+            # K % 256 == 0, so the pad never triggers for this shape).
+            dgrad_b_fp8 = b_fp8_dgrad_ps
+            dgrad_b_scale_inv = b_scale_inv.transpose(0, 1).contiguous().view(-1)
+        elif (
             ctx.trans_b
             and GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
         ):

@@ -333,16 +333,25 @@ def quant_fp8_blockwise_for_weight_dual_impl(
     w: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """2D blockwise weight quant emitting plain + forward-preshuffled FP8 in one pass.
+    emit_dgrad_ps: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """2D blockwise weight quant emitting plain + fwd-preshuffled (+ optional dgrad
+    transposed-preshuffle) FP8 in one pass.
 
-    Returns ``(w_fp8, w_fp8_ps, w_scales)`` where:
-      - ``w_fp8``    : plain block2d FP8 [M, N]   (for ctx / dgrad)
-      - ``w_fp8_ps`` : forward (16, 16) MFMA pre-shuffled FP8 [M, N], byte-identical
-                       to ``shuffle_b(w_fp8)`` (consumed directly by the FlyDSL
-                       forward GEMM, folding away its standalone pre-shuffle copy)
-      - ``w_scales`` : per-block scale [M // block, N // block] fp32 (layout
-                       unchanged vs the plain weight quant)
+    Returns ``(w_fp8, w_fp8_ps, w_fp8_dgrad_ps, w_scales)`` where:
+      - ``w_fp8``          : plain block2d FP8 [M, N]   (for ctx)
+      - ``w_fp8_ps``       : forward (16, 16) MFMA pre-shuffled FP8 [M, N],
+                             byte-identical to ``shuffle_b(w_fp8)`` (consumed
+                             directly by the FlyDSL forward GEMM)
+      - ``w_fp8_dgrad_ps`` : dgrad (NN) transposed-preshuffle FP8 [M, N] buffer
+                             holding the bytes of ``_shuffle_b_transposed(w_fp8)``
+                             (== ``shuffle_b(w_fp8.transpose(0, 1))``), consumed by
+                             the FlyDSL dgrad GEMM, folding away its standalone
+                             per-backward ``_preshuffle_b_transposed_kernel``. Only
+                             materialized when ``emit_dgrad_ps`` is True; otherwise a
+                             1-element placeholder.
+      - ``w_scales``       : per-block scale [M // block, N // block] fp32 (layout
+                             unchanged vs the plain weight quant)
 
     Triton-only (the HIP C++ fast path has no pre-shuffled store), 2D weights only.
     """
@@ -353,6 +362,11 @@ def quant_fp8_blockwise_for_weight_dual_impl(
     M, N = w.shape
     w_fp8 = torch.empty((M, N), dtype=dtype, device=w.device)
     w_fp8_ps = torch.empty((M, N), dtype=dtype, device=w.device)
+    w_fp8_dgrad_ps = (
+        torch.empty((M, N), dtype=dtype, device=w.device)
+        if emit_dgrad_ps
+        else torch.empty((1,), dtype=dtype, device=w.device)
+    )
     w_scales = torch.empty(
         (ceil_div(M, block_size), ceil_div(N, block_size)),
         dtype=torch.float32,
@@ -363,13 +377,15 @@ def quant_fp8_blockwise_for_weight_dual_impl(
         w,
         w_fp8,
         w_fp8_ps,
+        w_fp8_dgrad_ps,
         w_scales,
         M,
         N,
         block_size,
         torch.finfo(dtype).max,
+        EMIT_DGRAD_PS=emit_dgrad_ps,
     )
-    return w_fp8, w_fp8_ps, w_scales
+    return w_fp8, w_fp8_ps, w_fp8_dgrad_ps, w_scales
 
 
 @quant_fp8_blockwise_for_weight_dual_impl.register_fake
@@ -377,17 +393,23 @@ def quant_fp8_blockwise_for_weight_dual_impl_meta(
     w: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    emit_dgrad_ps: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert w.dim() == 2, "Input must be 2D"
     M, N = w.shape
     w_fp8 = torch.empty((M, N), dtype=dtype, device=w.device)
     w_fp8_ps = torch.empty((M, N), dtype=dtype, device=w.device)
+    w_fp8_dgrad_ps = (
+        torch.empty((M, N), dtype=dtype, device=w.device)
+        if emit_dgrad_ps
+        else torch.empty((1,), dtype=dtype, device=w.device)
+    )
     w_scales = torch.empty(
         (ceil_div(M, block_size), ceil_div(N, block_size)),
         dtype=torch.float32,
         device=w.device,
     )
-    return w_fp8, w_fp8_ps, w_scales
+    return w_fp8, w_fp8_ps, w_fp8_dgrad_ps, w_scales
 
 
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_segment_m_row_col_impl", mutates_args=())
