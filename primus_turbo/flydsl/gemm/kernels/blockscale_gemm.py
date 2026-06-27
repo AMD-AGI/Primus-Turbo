@@ -1013,10 +1013,25 @@ def compile_blockscale_dgrad_gemm(**kwargs):
 
 
 def compile_blockscale_wgrad_gemm(**kwargs):
-    """wgrad / TN: per-output-column (1Dx1D) scale_b, plain rasterization (no L2 grouping)."""
+    """wgrad / TN: per-output-column (1Dx1D) scale_b, L2 grouped rasterization (GROUP_M=16).
+
+    Round-46: the col1d/wgrad kernel previously ran with ``l2_group_m=1`` (plain
+    row-major launch, kernel ``bs_col1d_l2g1``) while the block2d fwd/dgrad path
+    used the R4-accepted super-block grouping (``l2g16``). PROFILE round-45 marks
+    bs_col1d as the campaign's #1 latency-bound bottleneck (LDS-wait/wave 105.5 on
+    an under-populated ~2-wave grid). The grouped pid->tile rasterization already
+    implemented inside ``compile_blockscale_gemm`` (lines ~239-270) is
+    ``scale_b_mode``-agnostic and a pure tail-safe workgroup-id permutation: every
+    output tile is still computed exactly once with unchanged intra-tile
+    accumulation order, so the wgrad result stays bit-identical while consecutive
+    col1d tiles that share the same a^T / grad_out panel stay hot in the same L2
+    slice. Enabling it here mirrors the dgrad win on the one kernel that had
+    grouping disabled, and leaves per-wave VGPR/LDS footprint untouched (cannot
+    trip the occupancy wall).
+    """
     kwargs.pop("scale_b_mode", None)
-    kwargs.pop("l2_group_m", None)
-    return compile_blockscale_gemm(scale_b_mode="col1d", l2_group_m=1, **kwargs)
+    l2_group_m = kwargs.pop("l2_group_m", 16)
+    return compile_blockscale_gemm(scale_b_mode="col1d", l2_group_m=l2_group_m, **kwargs)
 
 
 __all__ = [
