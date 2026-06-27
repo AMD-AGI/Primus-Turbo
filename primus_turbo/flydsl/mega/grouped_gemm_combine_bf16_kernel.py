@@ -55,13 +55,11 @@ from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
 _GEMM_TILE = {"nt": gemm_bf16_nt_tile, "nn": gemm_bf16_nn_tile, "tn": gemm_bf16_tn_tile}
 from primus_turbo.flydsl.common.tile_spec import _emit_if_then
 
-# cheap fence = s_waitcnt drain + compiler barrier; pairs with relaxed atomics (no acquire/release).
-from primus_turbo.flydsl.mega.dispatch_prologue_kernel import _mem_fence
-
 # scalar/atomic prims over a raw i64 base + element offset (scope-selectable, monotonic).
 # scope="agent" = device-wide relaxed (local scoreboard / flag); scope="sys" = system
 # (cross-rank flag publish, pairs with the agent-scope consumer load on uncached signal mem).
-from primus_turbo.flydsl.mega.prims import atomic_add, ld, st
+# _mem_fence = cheap fence (s_waitcnt drain + compiler barrier); pairs with relaxed atomics.
+from primus_turbo.flydsl.mega.prims import _mem_fence, atomic_add, ld, st
 
 # single SymLayout struct (two-heap delta tables) names every symmetric sub-buffer;
 # the active workspace is fetched by the host wrappers (no-group call -> current buffer).
@@ -135,7 +133,13 @@ def combine_bf16_tile(
                 for c in range_constexpr(num_full_chunks):
                     col = fx.Int32(c * cols_per_step) + lane * fx.Int32(_PVEC)
                     chunk_values.append(
-                        buffer_load(l2y_resource, row_off + col, vec_width=_PVEC, dtype=fx.T.bf16())
+                        # NOTE: cache_modifier=1 (CPOL glc) = L1-bypass read. Defensive only -- the
+                        # write-through C store already puts L2Y in L2; this guards a stale resident
+                        # L1 line (write-through doesn't invalidate other CUs' L1) and is free (L2Y
+                        # is read-once). Tests pass without it.
+                        buffer_load(
+                            l2y_resource, row_off + col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=1
+                        )
                     )
                 for c in range_constexpr(num_full_chunks):
                     col = fx.Int32(c * cols_per_step) + lane * fx.Int32(_PVEC)
@@ -146,7 +150,14 @@ def combine_bf16_tile(
                     # clamp the load to an in-row column (out-of-tail would fault); store masked to OOB
                     safe_col = arith.select(in_tail, col, fx.Int32(out_features - _PVEC))
                     tail_value = buffer_load(
-                        l2y_resource, row_off + safe_col, vec_width=_PVEC, dtype=fx.T.bf16()
+                        # NOTE: cache_modifier=1 (CPOL glc) = L1-bypass read. Defensive only -- the
+                        # write-through C store already puts L2Y in L2; guards a stale resident L1
+                        # line and is free (read-once). Tests pass without it.
+                        l2y_resource,
+                        row_off + safe_col,
+                        vec_width=_PVEC,
+                        dtype=fx.T.bf16(),
+                        cache_modifier=1,
                     )
                     dst = arith.select(in_tail, slot_base + col, oob_index)
                     buffer_store(tail_value, peer, dst)
@@ -486,8 +497,12 @@ def _compile(
                         out_fp16=out_fp16,
                         nt_vmcnt=nt_vmcnt,
                         b_group_base=group_base,
+                        # NOTE: cache_modifier=16 (CPOL sc1) = write-through C store -> L2Y lands in
+                        # L2 so the role-1 push (different CU, same kernel) reads fresh, not stale L1.
+                        c_cache_modifier=16,
                     )
-                    # drain L2Y stores to L2 (coherence point)
+                    # drain L2Y stores to L2 (coherence point): CDNA L1 is write-through, so
+                    # vmcnt(0) means the rows are in L2 -- the role-1 push reads them L1-bypass.
                     fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()  # all waves' stores landed before the signal
                     _emit_if_then(

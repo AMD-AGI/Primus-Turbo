@@ -304,7 +304,7 @@ def _run(local_rank, world, args):
                 print(f"  rank={r}  {line}")
             print(f"[{mode}]", "PASS" if all(g[3] for g in gathered) else "FAIL")
         # every rank asserts the global verdict -> a failure propagates through spawn
-        # assert all(g[3] for g in gathered), f"[{mode}] gate-3 FAILED"
+        assert all(g[3] for g in gathered), f"[{mode}] gate-3 FAILED"
 
         # ---- perf: per-kernel breakdown of the mega forward + backward (kineto) ----
         # backward is isolated by subtraction: profile the (grad-enabled) forward and
