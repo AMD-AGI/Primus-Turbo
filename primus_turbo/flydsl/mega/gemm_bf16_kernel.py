@@ -43,6 +43,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.expr.buffer_ops import buffer_store, create_buffer_resource
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir import ir
@@ -245,20 +246,28 @@ class StoreCBf16:
     n = lane%32, m = (r//4)*8 + (lane//32)*4 + (r%4). Columns past c_cols clamp
     to an OOB index (HW drops the store)."""
 
-    def __init__(self, C, c_rows, c_cols, out_ty):
+    def __init__(self, C, c_rows, c_cols, out_ty, cache_modifier=0):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
         self.out_ty = out_ty
+        self.cache_modifier = cache_modifier  # nonzero -> write-through C store (cross-CU L2Y)
         c_nbytes = c_rows * c_cols * 2
         gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
         self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_ty)
         self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), out_ty)
+        # write-through path: buffer_store with a cache modifier (the copy atom can't carry one)
+        self.c_rsrc = (
+            create_buffer_resource(C, max_size=False, num_records_bytes=c_nbytes) if cache_modifier else None
+        )
 
     def _store_one(self, value, c_index):
-        fx.memref_store_vec(Vec.filled(1, value, self.out_ty), self.reg_out_1)
-        fx.copy(self.out_atom_1, self.reg_out_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+        if self.cache_modifier:
+            buffer_store(value, self.c_rsrc, fx.Int32(c_index), cache_modifier=self.cache_modifier)
+        else:
+            fx.memref_store_vec(Vec.filled(1, value, self.out_ty), self.reg_out_1)
+            fx.copy(self.out_atom_1, self.reg_out_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
 
     def store(self, c_frag, base_row, base_col):
         oob = fx.Int32(self.c_rows * self.c_cols)
@@ -352,6 +361,7 @@ def gemm_bf16_nt_tile(
     out_fp16=False,
     nt_vmcnt=3,
     b_group_base=None,
+    c_cache_modifier=0,
 ):
     g = _gemm_geom(K, BLOCK_M, BLOCK_N)
     K_ITERS = g["K_ITERS"]
@@ -416,7 +426,7 @@ def gemm_bf16_nt_tile(
     a_s2r = S2RLoaderBf16(wave_m, N_TILES_A)
     b_s2r = S2RLoaderBf16(wave_n, N_TILES_B)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    store_c = StoreCBf16(C, c_m, c_n, _out_ty)
+    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
 
     c00_frag = [mfma.zero_value] * N_ACCUMS
     c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -596,6 +606,7 @@ def _nn_tn_tile(
     out_fp16=False,
     nt_vmcnt=3,
     b_group_base=None,
+    c_cache_modifier=0,
 ):
     g = _gemm_geom(K, BLOCK_M, BLOCK_N)
     K_ITERS = g["K_ITERS"]
@@ -666,7 +677,7 @@ def _nn_tn_tile(
     a_s2r = S2RLoaderTrBf16(wave_m, N_TILES_A) if a_transpose else S2RLoaderBf16(wave_m, N_TILES_A)
     b_s2r = S2RLoaderTrBf16(wave_n, N_TILES_B)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    store_c = StoreCBf16(C, c_m, c_n, _out_ty)
+    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
 
     c00_frag = [mfma.zero_value] * N_ACCUMS
     c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -828,6 +839,7 @@ def gemm_bf16_nn_tile(
     out_fp16=False,
     nt_vmcnt=3,
     b_group_base=None,
+    c_cache_modifier=0,
 ):
     """NN tile: A [M,K] (NT), B [K,N] (transpose-read). C [M,N] = A @ B."""
     _nn_tn_tile(
@@ -849,6 +861,7 @@ def gemm_bf16_nn_tile(
         out_fp16=out_fp16,
         nt_vmcnt=nt_vmcnt,
         b_group_base=b_group_base,
+        c_cache_modifier=c_cache_modifier,
     )
 
 
