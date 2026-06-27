@@ -290,17 +290,34 @@ def quant_fp8_blockwise_for_weight_dual_kernel(
     # Folding this here eliminates the standalone per-backward-step
     # _preshuffle_b_transposed_kernel; the dgrad GEMM's operand load is unchanged.
     if EMIT_DGRAD_PS:
+        # Round-27: coalesce the dgrad-PS store. The previous form stored
+        # ``tl.trans(w_fp8_cast)`` against a 2D offset whose fast (column) axis
+        # mixed i4d/i3d/i2d, so Triton could not prove the KIN_PS=16 (=16-byte)
+        # run was a simple stride-1 axis and lowered it to per-element 1-byte
+        # scatter stores. Reshape the transposed tile so the K_inner=16 run is
+        # the explicit, fastest-varying, stride-1 trailing axis of the store --
+        # Triton then vectorizes it into dwordx4 (16-byte) transactions. Byte
+        # destinations are unchanged (m = om_outer*KIN_PS + i4d below reproduces
+        # the original i2d/i3d/i4d decomposition exactly), only the store width.
+        KOUT_PS: tl.constexpr = BLOCK_SIZE // KIN_PS  # offs_m chunks of KIN_PS per tile
         i0d = offs_n // BN_PS
         i1d = offs_n % BN_PS
-        i2d = offs_m // BK_PS
-        i3d = (offs_m % BK_PS) // KIN_PS
-        i4d = offs_m % KIN_PS
-        dps_off = i4d[None, :] + KIN_PS * (
-            i1d[:, None]
-            + BN_PS * (i3d[None, :] + (BK_PS // KIN_PS) * (i2d[None, :] + (M // BK_PS) * i0d[:, None]))
+        om_outer = tl.cast(pid_m * KOUT_PS + tl.arange(0, KOUT_PS), tl.int64)  # global offs_m // KIN_PS
+        i4d = tl.cast(tl.arange(0, KIN_PS), tl.int64)  # offs_m % KIN_PS, the contiguous run
+        i2d = om_outer // (BK_PS // KIN_PS)
+        i3d = om_outer % (BK_PS // KIN_PS)
+        dps_off = i4d[None, None, :] + KIN_PS * (
+            i1d[:, None, None]
+            + BN_PS
+            * (
+                i3d[None, :, None]
+                + (BK_PS // KIN_PS) * (i2d[None, :, None] + (M // BK_PS) * i0d[:, None, None])
+            )
         )
-        dps_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
-        tl.store(w_fp8_dgrad_ps_ptr + dps_off, tl.trans(w_fp8_cast), mask=dps_mask)
+        offs_m_3d = om_outer[None, :, None] * KIN_PS + i4d[None, None, :]
+        dps_mask = (offs_n[:, None, None] < N) & (offs_m_3d < M)
+        w_fp8_dgrad_t = tl.reshape(tl.trans(w_fp8_cast), (BLOCK_SIZE, KOUT_PS, KIN_PS))
+        tl.store(w_fp8_dgrad_ps_ptr + dps_off, w_fp8_dgrad_t, mask=dps_mask)
 
     # Plain block2d store (consumed by ctx / dgrad).
     w_fp8_ptrs = w_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]

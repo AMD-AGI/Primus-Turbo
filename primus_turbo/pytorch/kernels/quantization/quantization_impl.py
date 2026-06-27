@@ -384,9 +384,12 @@ def quant_fp8_blockwise_for_weight_dual_impl(
         block_size,
         torch.finfo(dtype).max,
         EMIT_DGRAD_PS=emit_dgrad_ps,
-        # Round-26: raise resident warps so the three FP8 stores (plain + fwd-PS +
-        # dgrad-PS transpose) have enough concurrent warps to overlap their store
-        # latency rather than serialize it on the forward weight-quant path.
+        # Round-27: the dgrad-PS store is now reshaped so its KIN_PS=16 (16-byte)
+        # run is an explicit stride-1 trailing axis, letting Triton emit dwordx4
+        # transactions instead of 1-byte scatter. num_warps=8 (from round-26) is
+        # the matching launch config: enough resident warps to issue the three
+        # FP8 stores (plain + fwd-PS + dwordx4 dgrad-PS) concurrently rather than
+        # serialize them on the forward weight-quant critical path.
         num_warps=8,
     )
     return w_fp8, w_fp8_ps, w_fp8_dgrad_ps, w_scales
