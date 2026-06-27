@@ -384,6 +384,10 @@ def quant_fp8_blockwise_for_weight_dual_impl(
         block_size,
         torch.finfo(dtype).max,
         EMIT_DGRAD_PS=emit_dgrad_ps,
+        # Round-26: raise resident warps so the three FP8 stores (plain + fwd-PS +
+        # dgrad-PS transpose) have enough concurrent warps to overlap their store
+        # latency rather than serialize it on the forward weight-quant path.
+        num_warps=8,
     )
     return w_fp8, w_fp8_ps, w_fp8_dgrad_ps, w_scales
 

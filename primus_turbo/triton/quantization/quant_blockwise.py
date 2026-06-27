@@ -271,31 +271,15 @@ def quant_fp8_blockwise_for_weight_dual_kernel(
     w_fp8_tile = tl.clamp(w_fp8_tile, min=-FP8_MAX, max=FP8_MAX)
     w_fp8_cast = w_fp8_tile.to(w_fp8_ptr.dtype.element_ty)
 
-    # Plain block2d store (consumed by ctx / dgrad).
-    w_fp8_ptrs = w_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
-    tl.store(w_fp8_ptrs, w_fp8_cast, mask=mask)
-
-    # Pre-shuffled store in the FlyDSL forward (16, 16) MFMA layout, byte-identical
-    # to shuffle_b(w_fp8) [N_shuf=M (rows), K_shuf=N (cols); BN=16, BK=32,
-    # K_inner=16 for 1-byte fp8]. shuffle_b reads element (row, col) at the 5D view
-    # index (i0, i1, i2, i3, i4) with row = i0*BN + i1, col = i2*BK + i3*K_inner + i4
-    # and writes it at permute(0, 2, 3, 1, 4); the flat offset below reproduces that
-    # exactly. Output is contiguous in runs of K_inner along the cols, so the store
-    # coalesces.
     BN_PS: tl.constexpr = 16
     BK_PS: tl.constexpr = 32
     KIN_PS: tl.constexpr = 16
-    i0 = offs_m // BN_PS
-    i1 = offs_m % BN_PS
-    i2 = offs_n // BK_PS
-    i3 = (offs_n % BK_PS) // KIN_PS
-    i4 = offs_n % KIN_PS
-    ps_off = i4[None, :] + KIN_PS * (
-        i1[:, None]
-        + BN_PS * (i3[None, :] + (BK_PS // KIN_PS) * (i2[None, :] + (N // BK_PS) * i0[:, None]))
-    )
-    tl.store(w_fp8_ps_ptr + ps_off, w_fp8_cast, mask=mask)
 
+    # Round-26: issue the high-latency dgrad (NN) transposed-preshuffle store FIRST,
+    # before the cheaper coalesced plain / fwd-PS / scale stores, so its long
+    # scattered-store + tl.trans latency overlaps the subsequent stores instead of
+    # tailing them on the forward weight-quant critical path (round-24 left it last).
+    #
     # Dgrad (NN) transposed-preshuffle store in the SAME read of w. Byte-identical
     # to _shuffle_b_transposed(w_fp8) == shuffle_b(w_fp8.transpose(0, 1)), the
     # operand the FlyDSL dgrad GEMM consumes (logical [K, N] from w [M=N_w, N=K_w]).
@@ -317,6 +301,28 @@ def quant_fp8_blockwise_for_weight_dual_kernel(
         )
         dps_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
         tl.store(w_fp8_dgrad_ps_ptr + dps_off, tl.trans(w_fp8_cast), mask=dps_mask)
+
+    # Plain block2d store (consumed by ctx / dgrad).
+    w_fp8_ptrs = w_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(w_fp8_ptrs, w_fp8_cast, mask=mask)
+
+    # Pre-shuffled store in the FlyDSL forward (16, 16) MFMA layout, byte-identical
+    # to shuffle_b(w_fp8) [N_shuf=M (rows), K_shuf=N (cols); BN=16, BK=32,
+    # K_inner=16 for 1-byte fp8]. shuffle_b reads element (row, col) at the 5D view
+    # index (i0, i1, i2, i3, i4) with row = i0*BN + i1, col = i2*BK + i3*K_inner + i4
+    # and writes it at permute(0, 2, 3, 1, 4); the flat offset below reproduces that
+    # exactly. Output is contiguous in runs of K_inner along the cols, so the store
+    # coalesces.
+    i0 = offs_m // BN_PS
+    i1 = offs_m % BN_PS
+    i2 = offs_n // BK_PS
+    i3 = (offs_n % BK_PS) // KIN_PS
+    i4 = offs_n % KIN_PS
+    ps_off = i4[None, :] + KIN_PS * (
+        i1[:, None]
+        + BN_PS * (i3[None, :] + (BK_PS // KIN_PS) * (i2[None, :] + (N // BK_PS) * i0[:, None]))
+    )
+    tl.store(w_fp8_ps_ptr + ps_off, w_fp8_cast, mask=mask)
 
     # Store scale (layout unchanged vs the plain weight quant).
     scale_offs = pid_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
