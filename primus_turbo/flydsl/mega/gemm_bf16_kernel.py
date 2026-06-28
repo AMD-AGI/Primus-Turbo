@@ -35,6 +35,7 @@ import torch
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     ceildiv,
+    make_bf16_buffer_tensor_rebased,
     make_value_attrs,
     swizzle_128,
     wait_barrier,
@@ -48,11 +49,12 @@ from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir import ir
 from flydsl.expr import arith
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.utils.arith import ArithValue
 
-from primus_turbo.flydsl.common.tile_spec import _emit_if_then
+from primus_turbo.flydsl.common.tile_spec import _emit_for, _emit_if_then
 
 # isort: on
 
@@ -142,13 +144,14 @@ class S2RLoaderTrBf16:
         self.sub_stride = sub_stride  # bf16 per (tile,ks) sub-block (>=512; pad for bank-spread)
         self.nk_sub = nk_sub
 
-    def load(self, lds_src):
+    def load(self, lds_src, base_off=0):
+        # base_off (bytes) selects the LDS double-buffer stage (matches G2SLoader).
         frag = []
         m = self.lane_id % 32
         kblk = self.lane_id // 32
         g = m // 16
         ml = m % 16
-        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr)) + base_off
         for i in range_constexpr(self.n_tiles):
             tile = self.wave_idx * self.n_tiles + i
             subs = []
@@ -281,6 +284,25 @@ class StoreCBf16:
                 row = base_row + ti * 32 + (r // 4) * 8 + m_hi + (r % 4)
                 c_index = row * self.c_cols + col
                 self._store_one(acc[r].to(self.out_ty), arith.select(col_valid, c_index, oob))
+
+    def store_trans(self, c_frag, group_idx, base_m, base_n, out_m, out_n):
+        """Transposed store: result tile (local m, local n) -> out[group, n, m] in a
+        [G*out_n, out_m] buffer (index (group*out_n + n)*out_m + m). The mma lane owns
+        one n (=lane%32) and 16 m (the transposed-contiguous dim). Coalescing comes from
+        the block_m-fastest tile schedule (neighbouring tiles write contiguous transposed
+        rows); a per-tile LDS CShuffle was tried and is perf-neutral, so kept scalar."""
+        oob = fx.Int32(self.c_rows * self.c_cols)
+        n = self.lane_id % 32
+        m_hi = (self.lane_id // 32) * 4
+        glob_n = base_n + n
+        n_valid = glob_n < out_n
+        row_base = (group_idx * out_n + glob_n) * out_m
+        for ti in range_constexpr(len(c_frag)):
+            acc = Vec(c_frag[ti])
+            for r in range_constexpr(16):
+                m = base_m + ti * 32 + (r // 4) * 8 + m_hi + (r % 4)
+                c_index = row_base + m
+                self._store_one(acc[r].to(self.out_ty), arith.select(n_valid, c_index, oob))
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -1178,4 +1200,432 @@ def gemm_bf16_tn_kernel(
         torch.cuda.current_stream(),
     )
     _get_compiled_dense(launch, args)(*args)
+    return out
+
+
+# ───────────────────────────────────────────────────────────────────────
+# TN wgrad (variable-K grouped GEMM): C[g] = lhs[g]^T @ rhs[g]. lhs [M_total,
+# OUT_M], rhs [M_total, OUT_N], out [G, OUT_M, OUT_N]. Contraction = the per-group
+# token count (runtime k_iters); OUT_M/OUT_N fixed. bf16 port of the fp8 wgrad in
+# flydsl/grouped_gemm/gemm_fp8_grouped_kernel.py, reusing the bf16 transpose-read
+# pipeline (both operands K-major -> ds_read_b64_tr_b16). Per-group SRD num_records
+# clamp handles the K-tail (over-read past the group's last token -> 0).
+# ───────────────────────────────────────────────────────────────────────
+def _wgrad_geom(BLOCK_M, BLOCK_N):
+    assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
+    N_TILES_A = BLOCK_M // 128
+    N_TILES_B = BLOCK_N // 256
+    return {
+        "N_TILES_A": N_TILES_A,
+        "N_TILES_B": N_TILES_B,
+        "N_ACCUMS": N_TILES_A * N_TILES_B,
+        "LDS_BLOCK_M": BLOCK_M // 2,
+        "LDS_BLOCK_N": BLOCK_N // 2,
+        "N_LDS_STEPS_A": (BLOCK_M // 2) // 64,
+        "N_LDS_STEPS_B": (BLOCK_N // 2) // 64,
+        "a_lds_size": (BLOCK_M // 2) * BLOCK_K,
+        "b_lds_size": (BLOCK_N // 2) * BLOCK_K,
+    }
+
+
+def _wgrad_accum_bf16(mfma, a_frags, b_frags, acc_regs):
+    """One quadrant's mma accumulate, reading/writing rmem accs in place (so the
+    value survives the runtime chunk scf.for boundary)."""
+    c = [Vec(fx.memref_load_vec(r)) for r in acc_regs]
+    c = mfma.call(a_frags, b_frags, c)
+    for idx in range_constexpr(len(acc_regs)):
+        fx.memref_store_vec(c[idx], acc_regs[idx])
+
+
+def _wgrad_body_4buf_bf16(
+    k,
+    a_g2s,
+    b_g2s,
+    a_s2r,
+    b_s2r,
+    mfma,
+    a_cur0,
+    a_cur1,
+    b_cur0,
+    b_cur1,
+    a_next0,
+    a_next1,
+    b_next0,
+    b_next1,
+    acc00,
+    acc01,
+    acc10,
+    acc11,
+    a0_off,
+    a1_off,
+    b0_off,
+    b1_off,
+    a_k_step,
+    b_k_step,
+    n_lds_steps_a,
+    n_lds_steps_b,
+):
+    """One K-tile of the 4-buffer distance-2 pipeline (bf16 port of the dense
+    NN/TN main loop): read cur tile k, prefetch tile k+1/k+2 into next/cur, mma.
+    Caller swaps cur<->next after. Over-read past the group SRD-clamped to 0."""
+    b0 = b_s2r.load(b_cur0)
+    a0 = a_s2r.load(a_cur0)
+    a_g2s.load(a_next1, a1_off + (k + 1) * a_k_step)
+    rocdl.s_barrier()
+    rocdl.s_setprio(1)
+    _wgrad_accum_bf16(mfma, a0, b0, acc00)
+    rocdl.s_setprio(0)
+    rocdl.s_barrier()
+    b1 = b_s2r.load(b_cur1)
+    b_g2s.load(b_cur0, b0_off + (k + 2) * b_k_step)
+    rocdl.s_barrier()
+    rocdl.s_setprio(1)
+    _wgrad_accum_bf16(mfma, a0, b1, acc01)
+    rocdl.s_setprio(0)
+    rocdl.s_barrier()
+    a1 = a_s2r.load(a_cur1)
+    a_g2s.load(a_cur0, a0_off + (k + 2) * a_k_step)
+    rocdl.s_barrier()
+    rocdl.s_setprio(1)
+    _wgrad_accum_bf16(mfma, a1, b0, acc10)
+    rocdl.s_setprio(0)
+    rocdl.s_barrier()
+    b_g2s.load(b_cur1, b1_off + (k + 2) * b_k_step)
+    wait_barrier(2 * n_lds_steps_a + n_lds_steps_b)
+    rocdl.s_setprio(1)
+    _wgrad_accum_bf16(mfma, a1, b1, acc11)
+    rocdl.s_setprio(0)
+    rocdl.s_barrier()
+
+
+def gemm_bf16_tn_variable_k_tile(
+    A,
+    B,
+    C,
+    group_idx,
+    block_m,
+    block_n,
+    m_start,
+    m_end,
+    lds,
+    out_m_rt,
+    out_n_rt,
+    *,
+    G,
+    OUT_M,
+    OUT_N,
+    BLOCK_M,
+    BLOCK_N,
+    out_fp16=False,
+    c_cache_modifier=0,
+    trans_c=False,
+):
+    """One wgrad output tile: C[group_idx][block_m, block_n] = lhs[g]^T @ rhs[g].
+    Runtime K-loop over the group's [m_start, m_end) tokens. Both operands are
+    K-major (token-row) so both transpose-read (tr16). 4-buffer distance-2 pipeline
+    in an even-CHUNK scf.for (the ping-pong resets at each chunk boundary).
+    trans_c stores the result transposed into a [G*OUT_N, OUT_M] buffer."""
+    CHUNK = 8  # even: 4-buffer ping-pong resets at chunk boundary (sweep: 8/16/32 perf-neutral)
+    geom = _wgrad_geom(BLOCK_M, BLOCK_N)
+    n_tiles_a = geom["N_TILES_A"]
+    n_tiles_b = geom["N_TILES_B"]
+    n_accums = geom["N_ACCUMS"]
+    lds_block_m = geom["LDS_BLOCK_M"]
+    lds_block_n = geom["LDS_BLOCK_N"]
+    n_lds_steps_a = geom["N_LDS_STEPS_A"]
+    n_lds_steps_b = geom["N_LDS_STEPS_B"]
+
+    lane_id = fx.thread_idx.x % 64
+    wave_id = fx.thread_idx.x // 64
+    wave_m = wave_id // 4
+    wave_n = wave_id % 4
+
+    # Per-group rebased SRD: base folds m_start, num_records bounds the K-tail
+    # (over-read past the group's last token -> 0).
+    group_tokens = m_end - m_start
+    bf16_ir = fx.BFloat16.ir_type
+    # base/num_records use runtime out_*_rt (compile-time OUT_* would const-fold the
+    # m_start*OUT multiply to i16 and overflow for groups past the first).
+    gA = make_bf16_buffer_tensor_rebased(
+        A, bf16_ir, m_start * out_m_rt * fx.Int32(2), group_tokens * out_m_rt * fx.Int32(2)
+    )
+    gB = make_bf16_buffer_tensor_rebased(
+        B, bf16_ir, m_start * out_n_rt * fx.Int32(2), group_tokens * out_n_rt * fx.Int32(2)
+    )
+    a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+    b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+
+    gl_off_a = compute_global_swizzle_nn_bf16(lane_id, wave_id, OUT_M, n_lds_steps_a)
+    gl_off_b = compute_global_swizzle_nn_bf16(lane_id, wave_id, OUT_N, n_lds_steps_b)
+
+    a0_off = block_m * BLOCK_M
+    a1_off = a0_off + lds_block_m
+    b0_off = block_n * BLOCK_N
+    b1_off = b0_off + lds_block_n
+    a_k_step = fx.Int32(BLOCK_K) * out_m_rt  # runtime i32 (k*a_k_step must not const-fold to i16)
+    b_k_step = fx.Int32(BLOCK_K) * out_n_rt
+
+    mfma = Mfma32x32x16(n_tiles_a, n_tiles_b)
+    a_g2s = G2SLoader(a_div, gl_off_a, n_lds_steps_a, bf16_ir, wave_id)
+    b_g2s = G2SLoader(b_div, gl_off_b, n_lds_steps_b, bf16_ir, wave_id)
+    a_s2r = S2RLoaderTrBf16(wave_m, n_tiles_a)
+    b_s2r = S2RLoaderTrBf16(wave_n, n_tiles_b)
+    out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+    if trans_c:
+        store_c = StoreCBf16(C, G * OUT_N, OUT_M, out_ty, cache_modifier=c_cache_modifier)
+    else:
+        store_c = StoreCBf16(C, G * OUT_M, OUT_N, out_ty, cache_modifier=c_cache_modifier)
+
+    acc00 = [fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float32) for _ in range(n_accums)]
+    acc01 = [fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float32) for _ in range(n_accums)]
+    acc10 = [fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float32) for _ in range(n_accums)]
+    acc11 = [fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float32) for _ in range(n_accums)]
+    for quad in (acc00, acc01, acc10, acc11):
+        for reg in quad:
+            fx.memref_store_vec(mfma.zero_value, reg)
+
+    # Per-tile entry: drain the previous tile's outstanding C stores (vmcnt 0) so the
+    # prelude's graded wait_barrier counts are relative to a clean vmcnt, + WAR barrier
+    # vs the previous tile's LDS reads (persistent grid reuses the LDS across tiles).
+    wait_barrier(0)
+    # Prelude: tile 0 -> cur, tile 1 -> next.
+    b_g2s.load(lds.B_lds_cur_0, b0_off + 0 * b_k_step)
+    a_g2s.load(lds.A_lds_cur_0, a0_off + 0 * a_k_step)
+    b_g2s.load(lds.B_lds_cur_1, b1_off + 0 * b_k_step)
+    a_g2s.load(lds.A_lds_cur_1, a1_off + 0 * a_k_step)
+    _emit_if_then(wave_m == 1, lambda: rocdl.s_barrier())
+    wait_barrier(n_lds_steps_a + n_lds_steps_b)
+    b_g2s.load(lds.B_lds_next_0, b0_off + 1 * b_k_step)
+    a_g2s.load(lds.A_lds_next_0, a0_off + 1 * a_k_step)
+    b_g2s.load(lds.B_lds_next_1, b1_off + 1 * b_k_step)
+    wait_barrier(n_lds_steps_a + 2 * n_lds_steps_b)
+
+    k_iters = (group_tokens + (BLOCK_K - 1)) // BLOCK_K
+    n_chunks = (k_iters + (CHUNK - 1)) // CHUNK
+
+    def _chunk(chunk_iv):
+        chunk_idx = ArithValue(chunk_iv)
+        a_cur0, a_cur1 = lds.A_lds_cur_0, lds.A_lds_cur_1
+        a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
+        b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
+        b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
+        for j in range_constexpr(CHUNK):
+            k = chunk_idx * CHUNK + j
+            _wgrad_body_4buf_bf16(
+                k,
+                a_g2s,
+                b_g2s,
+                a_s2r,
+                b_s2r,
+                mfma,
+                a_cur0,
+                a_cur1,
+                b_cur0,
+                b_cur1,
+                a_next0,
+                a_next1,
+                b_next0,
+                b_next1,
+                acc00,
+                acc01,
+                acc10,
+                acc11,
+                a0_off,
+                a1_off,
+                b0_off,
+                b1_off,
+                a_k_step,
+                b_k_step,
+                n_lds_steps_a,
+                n_lds_steps_b,
+            )
+            a_cur0, a_next0 = a_next0, a_cur0
+            a_cur1, a_next1 = a_next1, a_cur1
+            b_cur0, b_next0 = b_next0, b_cur0
+            b_cur1, b_next1 = b_next1, b_cur1
+
+    _emit_for(fx.Int32(0), n_chunks, fx.Int32(1), _chunk)
+
+    c00 = [Vec(fx.memref_load_vec(reg)) for reg in acc00]
+    c01 = [Vec(fx.memref_load_vec(reg)) for reg in acc01]
+    c10 = [Vec(fx.memref_load_vec(reg)) for reg in acc10]
+    c11 = [Vec(fx.memref_load_vec(reg)) for reg in acc11]
+    if trans_c:
+        local_m = block_m * BLOCK_M + wave_m * (n_tiles_a * 32)
+        local_n = block_n * BLOCK_N + wave_n * (n_tiles_b * 32)
+        store_c.store_trans(c00, group_idx, local_m + 0, local_n + 0, OUT_M, OUT_N)
+        store_c.store_trans(c01, group_idx, local_m + 0, local_n + lds_block_n, OUT_M, OUT_N)
+        store_c.store_trans(c10, group_idx, local_m + lds_block_m, local_n + 0, OUT_M, OUT_N)
+        store_c.store_trans(c11, group_idx, local_m + lds_block_m, local_n + lds_block_n, OUT_M, OUT_N)
+    else:
+        base_row = group_idx * OUT_M + block_m * BLOCK_M + wave_m * (n_tiles_a * 32)
+        base_col = block_n * BLOCK_N + wave_n * (n_tiles_b * 32)
+        store_c.store(c00, base_row + 0, base_col + 0)
+        store_c.store(c01, base_row + 0, base_col + lds_block_n)
+        store_c.store(c10, base_row + lds_block_m, base_col + 0)
+        store_c.store(c11, base_row + lds_block_m, base_col + lds_block_n)
+
+
+def load_go_i32(div, idx):
+    """Read group_offs[idx] from an int32 [G+1] buffer view (uniform across the WG)."""
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+    reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
+    fx.copy(atom, fx.slice(div, (None, fx.Int32(idx))), reg)
+    return Vec(fx.memref_load_vec(reg))[0]
+
+
+def load_go_i64(div, idx):
+    """Read group_offs[idx] from an int64 [G+1] buffer view; return i32 (values fit i32)."""
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int64)
+    reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int64)
+    fx.copy(atom, fx.slice(div, (None, fx.Int32(idx))), reg)
+    v64 = Vec(fx.memref_load_vec(reg))[0]
+    return fx.arith.ArithValue(fx.arith.trunci(fx.T.i32(), v64.ir_value()), signed=True)
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_grouped_tn_wgrad_bf16(
+    OUT_M,
+    OUT_N,
+    G,
+    BLOCK_M=256,
+    BLOCK_N=256,
+    num_xcd=8,
+    waves_per_eu=2,
+    out_fp16=False,
+    trans_c=False,
+):
+    """Persistent bf16 wgrad: fixed grid of WGs strides the (group, block_m, block_n)
+    tile space. C is the stacked [G*OUT_M, OUT_N] output ([G*OUT_N, OUT_M] if trans_c)."""
+    assert OUT_M % BLOCK_M == 0 and OUT_N % BLOCK_N == 0, "first version needs OUT dims tile-aligned"
+    N_BLOCKS_M = OUT_M // BLOCK_M
+    N_BLOCKS_N = OUT_N // BLOCK_N
+    TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
+    TOTAL = G * TILES_PER_GROUP
+    # Non-persistent grid=TOTAL (one tile/WG): correct + faster than the strided
+    # persistent loop (which has a multi-tile-per-WG accumulator-reset bug; only needed
+    # for CU-capped comm overlap, deferred).
+    import os as _osc
+
+    _flatgrid = _osc.environ.get("MEGA_WGRAD_FLATGRID", "1") == "1"
+    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)  # 4-buffer (cur/next) A+B
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def kernel(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        C: fx.Tensor,
+        group_offs: fx.Tensor,
+        out_m_rt: fx.Int32,
+        out_n_rt: fx.Int32,
+    ):
+        _ = str(fx.thread_idx.x)
+        go = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 4)
+        go_div = fx.logical_divide(go, fx.make_layout(1, 1))
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        pid = fx.block_idx.x
+        num_wgs = fx.grid_dim.x
+
+        def _do_tile(tile_idx):
+            tile = xcd_remap_pid(tile_idx, TOTAL, num_xcd)
+            group_idx = tile // TILES_PER_GROUP
+            local_tile = tile % TILES_PER_GROUP
+            if const_expr(trans_c):
+                # trans output is m-contiguous; vary block_m fastest so neighbouring
+                # tiles write contiguous transposed rows (L2/DRAM write locality).
+                block_n = local_tile // N_BLOCKS_M
+                block_m = local_tile % N_BLOCKS_M
+            else:
+                block_m = local_tile // N_BLOCKS_N
+                block_n = local_tile % N_BLOCKS_N
+            m_start = load_go_i32(go_div, group_idx)
+            m_end = load_go_i32(go_div, group_idx + 1)
+            gemm_bf16_tn_variable_k_tile(
+                A,
+                B,
+                C,
+                group_idx,
+                block_m,
+                block_n,
+                m_start,
+                m_end,
+                lds,
+                out_m_rt,
+                out_n_rt,
+                G=G,
+                OUT_M=OUT_M,
+                OUT_N=OUT_N,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                out_fp16=out_fp16,
+                trans_c=trans_c,
+            )
+
+        for tile_idx in range(pid, TOTAL, num_wgs):
+            _do_tile(tile_idx)
+
+    @flyc.jit
+    def launch(A, B, C, group_offs, out_m_rt: fx.Int32, out_n_rt: fx.Int32, stream: fx.Stream):
+        ncus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        grid_x = (
+            fx.Int32(TOTAL)
+            if _flatgrid
+            else arith.select(fx.Int32(TOTAL) < fx.Int32(ncus), fx.Int32(TOTAL), fx.Int32(ncus))
+        )
+        kernel(
+            A, B, C, group_offs, out_m_rt, out_n_rt, value_attrs=make_value_attrs(waves_per_eu, 0, "512,512")
+        ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+
+    return launch
+
+
+_WGRAD_COMPILED = {}
+
+
+def grouped_gemm_tn_wgrad_bf16(
+    lhs: torch.Tensor,  # [M_total, OUT_M] bf16
+    rhs: torch.Tensor,  # [M_total, OUT_N] bf16
+    group_offs: torch.Tensor,  # [G+1] int32
+    out_dtype: torch.dtype = torch.bfloat16,
+    BLOCK_M: int = 256,
+    BLOCK_N: int = 256,
+    num_xcd: int = 8,
+    trans_c: bool = False,
+) -> torch.Tensor:
+    """bf16 variable-K wgrad: out[g] = lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]].
+    out [G, OUT_M, OUT_N], or [G, OUT_N, OUT_M] when trans_c (= W1/W2-native layout)."""
+    assert lhs.dim() == 2 and rhs.dim() == 2 and lhs.shape[0] == rhs.shape[0]
+    assert lhs.dtype == torch.bfloat16 and rhs.dtype == torch.bfloat16
+    OUT_M = lhs.shape[1]
+    OUT_N = rhs.shape[1]
+    G = group_offs.numel() - 1
+    out_fp16 = out_dtype == torch.float16
+    out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)
+    out = torch.empty(out_shape, device=lhs.device, dtype=out_dtype)
+    go32 = group_offs.to(torch.int32) if group_offs.dtype != torch.int32 else group_offs
+    launch = _compile_grouped_tn_wgrad_bf16(
+        OUT_M,
+        OUT_N,
+        G,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_xcd=num_xcd,
+        out_fp16=out_fp16,
+        trans_c=trans_c,
+    )
+    args = (
+        lhs.contiguous().view(-1),
+        rhs.contiguous().view(-1),
+        out.view(-1),
+        go32,
+        OUT_M,
+        OUT_N,
+        torch.cuda.current_stream(),
+    )
+    key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, out_fp16, trans_c)
+    compiled = _WGRAD_COMPILED.get(key)
+    if compiled is None:
+        compiled = flyc.compile(launch, *args)
+        _WGRAD_COMPILED[key] = compiled
+    compiled(*args)
     return out

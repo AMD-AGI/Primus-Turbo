@@ -22,7 +22,10 @@ import torch
 
 from primus_turbo.flydsl.mega.sym_layout import build_sym_layout
 from primus_turbo.flydsl.mega.sym_layout import layout as _sym_region_layout
-from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
+
+# NOTE: SymmetricMemory is imported lazily inside SymmBuffer.__init__ to avoid a
+# circular import (importing the pytorch package pulls in mega_moe_fused, which
+# imports back from this module).
 
 __all__ = [
     "SymmBuffer",
@@ -91,8 +94,8 @@ def _build_layout_spec(
     spec maps ``name -> (offset, torch_dtype, numel)``."""
     experts_per_rank = num_experts // world_size
     avg_recv_tokens = num_max_tokens_per_rank * num_topk
-    pool_capacity = _align(pool_mult * avg_recv_tokens + experts_per_rank * block_m, block_m)
-    num_pool_blocks = pool_capacity // block_m
+    num_max_pool_tokens = _align(pool_mult * avg_recv_tokens + experts_per_rank * block_m, block_m)
+    num_pool_blocks = num_max_pool_tokens // block_m
     combine_slots = num_topk * num_max_tokens_per_rank
 
     sl = build_sym_layout(
@@ -102,7 +105,7 @@ def _build_layout_spec(
         num_topk,
         hidden,
         intermediate_hidden,
-        pool_capacity,
+        num_max_pool_tokens,
         num_pool_blocks,
         combine_slots,
     )
@@ -118,7 +121,7 @@ def _build_layout_spec(
         intermediate_hidden=intermediate_hidden,
         activation=activation,
         block_m=block_m,
-        pool_capacity=pool_capacity,
+        num_max_pool_tokens=num_max_pool_tokens,
         num_pool_blocks=num_pool_blocks,
         combine_slots=combine_slots,
     )
@@ -202,7 +205,7 @@ class SymmBuffer:
             block_m=block_m,
             pool_mult=pool_mult,
         )
-        # num_tokens / num_experts / hidden / pool_capacity / ...
+        # num_tokens / num_experts / hidden / num_max_pool_tokens / ...
         self.__dict__.update(meta)
         self.experts_per_rank = num_experts // self.world
         # keep the allocation sizes so the global getter can size-check + reuse
@@ -210,6 +213,8 @@ class SymmBuffer:
         self.signal_bytes = signal_bytes
 
         # one symmetric allocation: cached main buffer + uncached signal pad
+        from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
+
         self.sm = SymmetricMemory(group, alloc_size=num_bytes, signal_pad_size=signal_bytes)
         self.sm.get_buffer(self.rank, (num_bytes,), torch.int8).zero_()
         self.sm.get_signal_pad(self.rank, (signal_bytes,), torch.int8).zero_()
@@ -236,9 +241,9 @@ class SymmBuffer:
         # back-compat alias: the old layout named the grid-sync counter grid_barrier_state
         self.grid_barrier_state = self.grid_sync_count
         # reshape the matrix-shaped views
-        self.pool = self.pool.view(self.pool_capacity, self.hidden)
-        self.act = self.act.view(self.pool_capacity, self.intermediate_hidden)
-        self.l2_token_buffer = self.l2_token_buffer.view(self.pool_capacity, self.hidden)
+        self.pool = self.pool.view(self.num_max_pool_tokens, self.hidden)
+        self.act = self.act.view(self.num_max_pool_tokens, self.intermediate_hidden)
+        self.l2_token_buffer = self.l2_token_buffer.view(self.num_max_pool_tokens, self.hidden)
         self.comb = self.comb.view(self.combine_slots, self.hidden)
         # d_topk_w push slots, slot = token*topk + k -> view [num_tokens, num_topk]
         self.combine_gate = self.combine_gate.view(self.num_tokens, self.num_topk)
@@ -310,7 +315,7 @@ class SymmBuffer:
             self.num_topk,
             self.hidden,
             self.intermediate_hidden,
-            self.pool_capacity,
+            self.num_max_pool_tokens,
             self.num_pool_blocks,
             self.combine_slots,
             base=my_main,
@@ -324,9 +329,9 @@ class SymmBuffer:
     def assert_capacity(self):
         """Guard against silent pool overflow (bounded buffer_store drops OOB rows)."""
         total_rows = int(self.meta_scalars[0].item())
-        assert total_rows <= self.pool_capacity, (
-            f"rank {self.rank}: dispatched rows {total_rows} exceed pool_capacity "
-            f"{self.pool_capacity}; raise pool_mult"
+        assert total_rows <= self.num_max_pool_tokens, (
+            f"rank {self.rank}: dispatched rows {total_rows} exceed num_max_pool_tokens "
+            f"{self.num_max_pool_tokens}; raise pool_mult"
         )
 
     def destroy(self):

@@ -10,9 +10,9 @@ Thin wrapper over the FlyDSL kernel ``grouped_gemm_combine_bf16``. The kernel no
 fetches the active symmetric workspace (GEMM-output / combine PUSH source, scoreboard,
 origin tables, peer combine / barrier / gate delta tables) internally via
 ``get_symm_buffer_for_mega_moe()`` and allocates the reduce ``output`` -- so the long
-buffer-list ABI is gone. Only the operands (``act`` / ``weight`` / ``tile_to_expert``)
-plus the routing tensors (``topk_indices`` / ``topk_weights`` / ``grad_gate``) and tile
-config remain. Returns ``(output, d_topk_w)``; ``d_topk_w`` is a ``[0]`` placeholder
+buffer-list ABI is gone. Only the operands (``act`` / ``weight``) plus the dispatch
+``handle`` (slot [7] = ``tile_to_expert``), the routing tensors (``topk_indices`` /
+``topk_weights`` / ``grad_gate``) and tile config remain. Returns ``(output, d_topk_w)``; ``d_topk_w`` is a ``[0]`` placeholder
 unless ``grad_gate`` is supplied (custom-op returns can't be Optional).
 """
 
@@ -72,7 +72,7 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
     def execute(
         act: torch.Tensor,
         weight: torch.Tensor,
-        tile_to_expert: torch.Tensor,
+        handle: list,
         topk_indices: torch.Tensor,
         topk_weights: Optional[torch.Tensor],
         grad_gate: Optional[torch.Tensor],
@@ -85,11 +85,11 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         kernel = _flydsl_kernel()
-        # group=None -> kernel uses the active symm buffer for every symmetric sub-buffer.
+        # group=None -> kernel uses the active symm buffer; handle carries tile_to_expert (slot [7]).
         return kernel(
             act,
             weight,
-            tile_to_expert,
+            handle,
             None,
             topk_indices=topk_indices,
             topk_weights=topk_weights,
@@ -118,8 +118,8 @@ class GroupedGEMMCombineKernelDispatcher(AutoKernelDispatcher):
         G = weight.shape[0]
         n_idx, k_idx = (1, 2) if layout == "nt" else (2, 1)
         N, K = weight.shape[n_idx], weight.shape[k_idx]
-        pool_capacity = act.shape[1] if layout == "tn" else act.shape[0]
-        return (G, N, K, pool_capacity, BM, BN, int(num_reduce_cu), layout, act.dtype)
+        num_max_pool_tokens = act.shape[1] if layout == "tn" else act.shape[0]
+        return (G, N, K, num_max_pool_tokens, BM, BN, int(num_reduce_cu), layout, act.dtype)
 
 
 _torch_custom_op_wrapper = torch.library.custom_op
@@ -135,7 +135,7 @@ _torch_custom_op_wrapper = torch.library.custom_op
 def grouped_gemm_combine_impl(
     act: torch.Tensor,
     weight: torch.Tensor,
-    tile_to_expert: torch.Tensor,
+    handle: list[torch.Tensor],
     default_backend: int,
     topk_indices: torch.Tensor,
     topk_weights: Optional[torch.Tensor] = None,
@@ -149,6 +149,7 @@ def grouped_gemm_combine_impl(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused grouped BF16 GEMM + combine PUSH + topk reduce, three-role.
 
+    ``handle`` is the dispatch prologue tuple; slot [7] is ``tile_to_expert``.
     ``act`` @ ``weight`` (grouped by ``tile_to_expert``) writes the active symm
     ``l2_token_buffer``; role 1 pushes finished rows cross-rank, role 2 sums each token's
     ``topk`` rows into a freshly-allocated ``output`` [num_tokens, N]. The symmetric
@@ -169,7 +170,7 @@ def grouped_gemm_combine_impl(
     kwargs = dict(
         act=act,
         weight=weight,
-        tile_to_expert=tile_to_expert,
+        handle=handle,
         topk_indices=topk_indices,
         topk_weights=topk_weights,
         grad_gate=grad_gate,
@@ -192,7 +193,7 @@ def grouped_gemm_combine_impl(
 def grouped_gemm_combine_impl_meta(
     act: torch.Tensor,
     weight: torch.Tensor,
-    tile_to_expert: torch.Tensor,
+    handle: list[torch.Tensor],
     default_backend: int,
     topk_indices: torch.Tensor,
     topk_weights: Optional[torch.Tensor] = None,
