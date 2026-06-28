@@ -169,7 +169,7 @@ def dispatch_bf16_tile(
     *,
     thread_index,
     hidden_size,
-    pool_capacity,
+    num_max_pool_tokens,
     input_resource,
     expert_send_dst_rank_resource,
     expert_send_dst_row_resource,
@@ -189,7 +189,7 @@ def dispatch_bf16_tile(
     Peer addressing: pass [world] absolute ptr tables, OR the two-heap delta path
     (pool_base/pool_offsets_resource + scoreboard_base/scoreboard_offsets_resource)."""
     vec_i32, hidden_i32, n_warps, cols_per_warp_i32, chunk_count = _bf16_push_geom(hidden_size)
-    pool_record_bytes = pool_capacity * hidden_size * 2
+    pool_record_bytes = num_max_pool_tokens * hidden_size * 2
     return _make_dispatch_tile(
         thread_index=thread_index,
         n_warps=n_warps,

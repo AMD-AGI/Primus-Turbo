@@ -8,14 +8,22 @@ expert-grouped pool layout, run both, and compare. Then sweep num_expert_per_wav
 """
 
 import argparse
+import os
+import sys
 
 import torch
 
-from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_dg_kernel import (
-    grouped_gemm_bf16_dg_only,
+# grouped_gemm_bf16_only now lives in the shared bench utils (benchmark/ops)
+import primus_turbo.pytorch  # noqa: F401  (init first: dodges the mega circular import)
+
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "benchmark", "ops"))
 )
-from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (
-    grouped_gemm_bf16_only,
+
+from mega_utils import grouped_gemm_bf16_only  # noqa: E402
+
+from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_dg_kernel import (  # noqa: E402
+    grouped_gemm_bf16_dg_only,
 )
 
 

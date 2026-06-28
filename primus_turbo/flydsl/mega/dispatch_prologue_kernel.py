@@ -7,7 +7,7 @@
 """Fused MoE dispatch-prologue kernel (FlyDSL).
 
 One persistent grid-resident kernel that, from ``topk_idx``/``topk_w``, builds the
-entire EP dispatch plan over caller-owned (symmetric) buffers:
+entire EP dispatch handle over caller-owned (symmetric) buffers:
 
   * Phase A  -- histogram tokens -> per-expert counts (``SEND_LOCAL``)
   * Phase B  -- cross-rank all-gather of the per-expert counts (``c_buffer``)
@@ -24,7 +24,7 @@ All symmetric sub-buffers (cross-rank ``c_buffer`` / ``signal`` / ``origin_rank`
 ``scoreboard`` / ``barrier_local`` regions) are named by a single ``SymLayout`` struct
 (``sym_layout.py``) passed to the kernel by value -- the kernel computes every address
 from the struct's two heap bases + per-region byte offsets + per-peer delta tables.
-The dispatch plan is returned as a plain tuple handle (DeepEP-style) the
+The dispatch handle is returned as a plain tuple handle (DeepEP-style) the
 dispatch/combine kernels unpack. Depends only on ``flydsl`` + ``torch``.
 """
 
@@ -85,6 +85,11 @@ def lds_base_addr():
     return _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
 
 
+def _ext_i64(v):
+    """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
+    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
+
+
 def _read_realtime():
     """Read the GPU constant-rate realtime counter (s_memrealtime)."""
     op = _llvm.inline_asm(
@@ -94,9 +99,10 @@ def _read_realtime():
 
 
 # Prologue outputs are returned as a plain positional tuple:
-#   (plan, tile_to_expert, tile_expected, origin_rank, origin_slot,
-#    num_pool_blocks, max_num_token)
-# plan = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
+#   (handle, tile_to_expert, tile_expected, origin_rank, origin_slot,
+#    num_pool_blocks, max_num_token, num_tokens_per_expert, num_tokens_per_expert_prefix)
+# handle = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
+# num_tokens_per_expert / _prefix = block_m-padded group_len / group_offs (local experts)
 
 
 # --------------------------------------------------------------------------- #
@@ -135,17 +141,17 @@ def _make_dispatch_prologue(
     rank,
     experts_per_rank,
     block_m,
-    pool_capacity,
+    num_max_pool_tokens,
     grid_blocks=_DEFAULT_GRID_BLOCKS,
     block_threads=_BLOCK_THREADS,
 ):
     total_pairs = num_tokens * num_topk
     grid_stride = grid_blocks * block_threads
-    num_pool_blocks = pool_capacity // block_m  # pool-block capacity
+    num_pool_blocks = num_max_pool_tokens // block_m  # pool-block capacity
     # scoreboard + barrier_local reset in-kernel (folds out two host zeroing launches):
     combine_slots = num_topk * num_tokens  # per-rank combine slots (= barrier_local len)
     c_buffer_bytes = world_size * num_experts * 4
-    origin_buffer_bytes = pool_capacity * 4
+    origin_buffer_bytes = num_max_pool_tokens * 4
     # WORKSPACE = one [5 * num_experts] i32 scratch tensor; named sub-regions by offset.
     WS_SEND, WS_WITHIN = 0, num_experts
     WS_START, WS_SROFF, WS_POOLBASE = 2 * num_experts, 3 * num_experts, 4 * num_experts
@@ -165,6 +171,8 @@ def _make_dispatch_prologue(
         DISPATCHED_TOPK_SLOT: fx.Tensor,
         SRC_TOKEN_WEIGHT: fx.Tensor,
         TOPK_WEIGHTS: fx.Tensor,
+        NUM_TOKENS_PER_EXPERT: fx.Tensor,
+        NUM_TOKENS_PER_EXPERT_PREFIX: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _, _ = fx.block_idx
@@ -202,6 +210,10 @@ def _make_dispatch_prologue(
         dispatched_topk_slot_resource = create_buffer_resource(DISPATCHED_TOPK_SLOT, max_size=True)
         src_token_weight_resource = create_buffer_resource(SRC_TOKEN_WEIGHT, max_size=True)
         topk_weights_resource = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
+        num_tokens_per_expert_resource = create_buffer_resource(NUM_TOKENS_PER_EXPERT, max_size=True)
+        num_tokens_per_expert_prefix_resource = create_buffer_resource(
+            NUM_TOKENS_PER_EXPERT_PREFIX, max_size=True
+        )
         meta_scalars_resource = create_buffer_resource_from_addr(sl.meta_scalars_ptr, num_records_bytes=8 * 4)
 
         # ---- Phase 0: init this rank's origin_rank to -1; padding rows stay -1 ----
@@ -209,7 +221,7 @@ def _make_dispatch_prologue(
             sl.origin_rank_ptr, num_records_bytes=origin_buffer_bytes
         )
         origin_init_index = block_index * fx.Int32(block_threads) + thread_index
-        while origin_init_index < fx.Int32(pool_capacity):
+        while origin_init_index < fx.Int32(num_max_pool_tokens):
             buffer_store(fx.Int32(-1), my_origin_rank_resource, origin_init_index)
             origin_init_index = origin_init_index + fx.Int32(grid_stride)
         # Pre-zero TILE_EXPECTED for C4's RMW
@@ -382,6 +394,12 @@ def _make_dispatch_prologue(
                 padded_count = ((expert_total_count + fx.Int32(block_m - 1)) // fx.Int32(block_m)) * fx.Int32(
                     block_m
                 )
+                # block_m-padded per-local-expert group_len + its exclusive prefix
+                # (== expert_pool_base); mirrors host group_lens / group_offs.
+                buffer_store(_ext_i64(padded_count), num_tokens_per_expert_resource, local_expert_index)
+                buffer_store(
+                    _ext_i64(expert_pool_base), num_tokens_per_expert_prefix_resource, local_expert_index
+                )
                 num_expert_blocks = padded_count // fx.Int32(block_m)
                 base_block_index = expert_pool_base // fx.Int32(block_m)
                 pool_block_offset = fx.Int32(0)
@@ -410,6 +428,12 @@ def _make_dispatch_prologue(
                     total_rows = expert_pool_base + padded_count
                     buffer_store(total_rows, meta_scalars_resource, fx.Int32(0))
                     buffer_store(total_rows // fx.Int32(block_m), meta_scalars_resource, fx.Int32(1))
+                    # trailing prefix entry = total padded rows (group_offs[-1])
+                    buffer_store(
+                        _ext_i64(total_rows),
+                        num_tokens_per_expert_prefix_resource,
+                        fx.Int32(experts_per_rank),
+                    )
 
         grid_sync(sl, thread_index, block_index, grid_blocks)
         if fx.const_expr(ENABLE_PROFILE):
@@ -569,6 +593,8 @@ def _make_dispatch_prologue(
         dispatched_topk_slot,
         src_token_weight,
         topk_weights,
+        num_tokens_per_expert,
+        num_tokens_per_expert_prefix,
         stream: fx.Stream = fx.Stream(None),
     ):
         dispatch_prologue_kernel(
@@ -585,6 +611,8 @@ def _make_dispatch_prologue(
             dispatched_topk_slot,
             src_token_weight,
             topk_weights,
+            num_tokens_per_expert,
+            num_tokens_per_expert_prefix,
         ).launch(
             grid=(grid_blocks, 1, 1),
             block=(block_threads, 1, 1),
@@ -604,7 +632,7 @@ def _compile(
     rank,
     experts_per_rank,
     block_m,
-    pool_capacity,
+    num_max_pool_tokens,
     grid_blocks=_DEFAULT_GRID_BLOCKS,
     idx_dtype=None,  # cache-key only: kernel specializes on topk_idx's element_type
 ):
@@ -616,7 +644,7 @@ def _compile(
         rank,
         experts_per_rank,
         block_m,
-        pool_capacity,
+        num_max_pool_tokens,
         grid_blocks=grid_blocks,
     )
 
@@ -655,7 +683,7 @@ def dispatch_prologue(
     rank,
     experts_per_rank,
     block_m,
-    pool_capacity,
+    num_max_pool_tokens,
     launch_cache=None,
     no_cpu_sync=True,
     num_cu=_DEFAULT_GRID_BLOCKS,
@@ -667,12 +695,17 @@ def dispatch_prologue(
     tables); the kernel computes all cross-rank addresses from it. ``num_cu`` is the
     persistent grid block count (must stay <= device CU count).
 
-    The dispatch-plan output tables (expert_send_dst_rank / expert_send_dst_row /
+    The dispatch-handle output tables (expert_send_dst_rank / expert_send_dst_row /
     expert_send_count / expert_send_offset / tile_to_expert / tile_expected /
     dispatched_token_idx / dispatched_topk_slot / src_token_weight) are allocated
     internally and returned -- callers never own them. ``origin_rank`` / ``origin_slot``
     live in ``sym_layout`` (written cross-rank); the return keeps their tuple slots as
-    ``None`` for positional compatibility."""
+    ``None`` for positional compatibility.
+
+    The last two return values, ``num_tokens_per_expert`` (len ``experts_per_rank``) and
+    ``num_tokens_per_expert_prefix`` (len ``experts_per_rank + 1``), are the block_m-padded
+    per-local-expert group lengths and their exclusive prefix sum -- the kernel-side
+    equivalent of the host ``group_lens`` / ``group_offs`` used by the variable-K wgrads."""
     # Accept int32 or int64; the kernel reads each entry at its native dtype
     # (buffer_load infers element size from the tensor's element_type).
     if topk_idx.dtype not in (torch.int32, torch.int64):
@@ -682,15 +715,19 @@ def dispatch_prologue(
     # internal scratch (cached, kernel self-resets) -- not a caller-owned buffer
     workspace = get_dispatch_prologue_workspace(num_experts, device=dev)
 
-    # ---- allocate the plan output tables internally (returned to the caller) ----
-    n_mblk = pool_capacity // block_m
+    # ---- allocate the handle output tables internally (returned to the caller) ----
+    n_mblk = num_max_pool_tokens // block_m
     i32 = lambda n: torch.empty(n, dtype=torch.int32, device=dev)
     expert_send_dst_rank, expert_send_dst_row, expert_send_count, expert_send_offset = (
         i32(num_experts) for _ in range(4)
     )
     tile_to_expert, tile_expected = i32(n_mblk), i32(n_mblk)
-    dispatched_token_idx, dispatched_topk_slot = i32(pool_capacity), i32(pool_capacity)
-    src_token_weight = torch.empty(pool_capacity, dtype=torch.float32, device=dev)
+    dispatched_token_idx, dispatched_topk_slot = i32(num_max_pool_tokens), i32(num_max_pool_tokens)
+    src_token_weight = torch.empty(num_max_pool_tokens, dtype=torch.float32, device=dev)
+    # block_m-padded per-local-expert group_len + its prefix (len experts_per_rank+1);
+    # mirrors host group_lens / group_offs (int64 end-to-end -> no consumer cast).
+    num_tokens_per_expert = torch.empty(experts_per_rank, dtype=torch.int64, device=dev)
+    num_tokens_per_expert_prefix = torch.empty(experts_per_rank + 1, dtype=torch.int64, device=dev)
     if topk_w is not None:
         topk_weights_flat = topk_w.to(torch.float32).contiguous().view(-1)
     else:  # no weights given -> internal zeros (topk_w is None branch)
@@ -710,7 +747,7 @@ def dispatch_prologue(
         rank,
         experts_per_rank,
         block_m,
-        pool_capacity,
+        num_max_pool_tokens,
         grid_blocks=int(num_cu),
         idx_dtype=topk_idx.dtype,
     )
@@ -728,6 +765,8 @@ def dispatch_prologue(
         dispatched_topk_slot,
         src_token_weight,
         topk_weights_flat,
+        num_tokens_per_expert,
+        num_tokens_per_expert_prefix,
         stream,
     )
     # Fast launch: call pre-packed CallState directly, fall back to normal call
@@ -758,7 +797,7 @@ def dispatch_prologue(
     # DeepEP-style dispatch handle: a flat tuple the dispatch/combine kernels unpack.
     # num_tasks (== num_experts) is derived from dst_rank.numel(); routing tensors last.
     #   (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
-    plan = (
+    return (
         expert_send_dst_rank,
         expert_send_dst_row,
         expert_send_count,
@@ -766,16 +805,8 @@ def dispatch_prologue(
         dispatched_token_idx,
         dispatched_topk_slot,
         src_token_weight,
-    )
-    # origin_rank/origin_slot now live in sym_layout; max_num_token from device scalar
-    # would need a host readback of sym_layout.meta_scalars, so default to pool_capacity.
-    max_num_token = pool_capacity
-    return (
-        plan,
         tile_to_expert,
         tile_expected,
-        None,
-        None,
-        pool_capacity // block_m,
-        max_num_token,
+        num_tokens_per_expert,
+        num_tokens_per_expert_prefix,
     )

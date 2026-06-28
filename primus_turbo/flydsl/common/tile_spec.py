@@ -23,7 +23,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
+from flydsl.compiler.ast_rewriter import InsertEmptyYieldForSCFFor, ReplaceIfWithDispatch
 from flydsl.expr import arith
 from flydsl.expr import range_constexpr, rocdl
 
@@ -33,6 +33,12 @@ from flydsl.expr import range_constexpr, rocdl
 def _emit_if_then(cond, then_fn):
     """Emit a dynamic ``if cond: then_fn()`` (the body-only AST rewrite's primitive)."""
     ReplaceIfWithDispatch.scf_if_dispatch(cond, then_fn)
+
+
+def _emit_for(start, stop, step, body_fn):
+    """Emit a runtime ``for iv in range(start, stop, step): body_fn(iv)`` (scf.for) from
+    a non-rewritten helper. Loop-carry-free: the body mutates rmem/LDS in place."""
+    InsertEmptyYieldForSCFFor.scf_for_dispatch(start, stop, step, lambda iv, _names: body_fn(iv))
 
 
 # Per-tile global base offsets + k-step units (from ``base_offsets``).

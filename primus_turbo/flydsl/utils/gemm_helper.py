@@ -36,6 +36,42 @@ def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
     return fx.Tensor(fx.make_view(iter_f8, fx.get_layout(t_i8)))
 
 
+def _readfirstlane_i32(v):
+    """Force a wave-uniform-in-value i32 into an SGPR via s_readfirstlane, so the
+    per-group SRD base/num_records collapse to scalar regs (no per-store waterfall)."""
+    raw = _raw(v)
+    r = rocdl.readfirstlane(res=raw.type, src=raw)
+    rv = r.result if hasattr(r, "result") else r
+    return ArithValue(rv)
+
+
+def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_bytes):
+    """make_fp8_buffer_tensor_rebased for a 2-byte (bf16/fp16) operand: SRD base
+    advanced by ``base_bytes`` (i64), bounded by ``num_records_bytes`` (HW OOB clamp
+    -> per-group K-tail reads 0). Folds the per-group token base into the descriptor
+    so the buffer voffset/soffset stay int32 even past 2^31 elems."""
+    base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg))
+    base_off = arith.index_cast(T.i64, arith.index_cast(T.index, base_bytes))
+    base = _readfirstlane_i32(base + base_off)
+    nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
+    nrec = fx.Int64(_readfirstlane_i32(arith.index_cast(T.i64, nr)))
+    flags = _buffer_ops._get_buffer_flags()
+    base_ptr = fx.inttoptr(fx.PointerType.get(elem_ty=T.i8, address_space=1, alignment=16), base)
+    i8_buf_ty = fx.PointerType.get(elem_ty=T.i8, address_space=TargetAddressSpace.BufferDesc, alignment=16)
+    buf_ptr = fx.make_ptr(
+        i8_buf_ty, [base_ptr, fx.Int16(0).ir_value(), nrec.ir_value(), fx.Int32(flags).ir_value()]
+    )
+    lay = fx.make_layout(0x40000000, 1)  # 1D flat; HW bounds via num_records
+    iter_i8 = fx.get_iter(fx.make_view(buf_ptr, lay))
+    bf_buf_ptr_ty = fx.PointerType.get(
+        elem_ty=bf16_ir_t,
+        address_space=TargetAddressSpace.BufferDesc,
+        alignment=fx.PointerType(iter_i8.type).alignment,
+    )
+    iter_bf = fx.recast_iter(bf_buf_ptr_ty, iter_i8)
+    return fx.Tensor(fx.make_view(iter_bf, lay))
+
+
 def swizzle_128(row, col):
     offset = row * 128 + col
     swizzle = ((offset % (16 * 128)) >> 8) << 4
@@ -79,18 +115,19 @@ class G2SLoader:
         # read side (S2RLoaderTr) must use the same value.
         self.chunk_stride = chunk_stride
 
-    def _lds_dst_at(self, lds_dst, step):
+    def _lds_dst_at(self, lds_dst, step, base_off=0):
         cs = self.chunk_stride
         step_off = self.wave_id * cs + step * (self.n_waves * cs)
         base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
-        sum_i32 = base_i32 + fx.Int32(step_off)
+        sum_i32 = base_i32 + fx.Int32(step_off) + base_off
         lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
         return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
-    def load(self, lds_dst, k_offset):
+    def load(self, lds_dst, k_offset, base_off=0):
+        # base_off (bytes) selects the LDS double-buffer stage (0 or stage_bytes).
         for step in range_constexpr(self.n_load_steps):
             src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
-            dst = self._lds_dst_at(lds_dst, step)
+            dst = self._lds_dst_at(lds_dst, step, base_off)
             fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
 
 
@@ -180,8 +217,9 @@ class StoreCPerTensor:
     out_ty is bf16 or fp16. Columns past c_cols clamp to an OOB index.
     """
 
-    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty,
-                 elem_fn=None):
+    def __init__(
+        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, elem_fn=None
+    ):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
