@@ -39,6 +39,65 @@ from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8_with_trans,
 )
 
+import contextlib as _contextlib
+import contextvars as _contextvars
+
+# ---- Fused grouped wgrad-accumulate (mirrors TE GroupedLinear fuse_wgrad_accumulation) ----
+# When active, FP8GroupedGemmMXFunc.backward accumulates the mxfp8 wgrad straight into the
+# experts' fp32 main_grad (a contiguous [E,N,K] block, addressed via a view), sets
+# grad_added_to_main_grad, and returns None for the weight grad so no grad reaches the
+# expert leaves — Megatron's per-micro-batch .grad->main_grad add_ hook never fires.
+# NOTE: single-GPU / no grad-reduce. For DDP/EP grad-reduce, return a dummy wgrad + register
+# the grad-acc hook instead (see TE handle_custom_ddp_from_mcore).
+_FUSED_WGRAD_WEIGHTS = _contextvars.ContextVar("primus_turbo_fused_wgrad_weights", default=None)
+
+
+@_contextlib.contextmanager
+def fused_grouped_wgrad(weights):
+    """Activate fused wgrad->main_grad accumulation for grouped_gemm_fp8 calls inside the block.
+
+    ``weights`` is the ordered list of per-expert leaf weight params (each must carry a
+    Megatron ``main_grad`` and ``grad_added_to_main_grad`` attr); pass ``None`` to disable.
+    """
+    tok = _FUSED_WGRAD_WEIGHTS.set(weights)
+    try:
+        yield
+    finally:
+        _FUSED_WGRAD_WEIGHTS.reset(tok)
+
+
+def _expert_main_grad_view(weights):
+    """Returns (view, reverse_groups) over the experts' contiguous main_grad block, else None.
+
+    view: zero-copy POSITIVE-stride [E,N,K] fp32 view starting at the LOWEST-address
+    main_grad (PyTorch's as_strided forbids negative strides). reverse_groups is True
+    when Megatron buckets the per-expert main_grads in REVERSE expert order (expert 0 at
+    the highest address) -> then view[j] is expert (E-1-j) and the kernel writes group g
+    to slot (E-1-g). Returns None if the layout isn't one contiguous fp32 block (the
+    caller then falls back to the unfused path).
+    """
+    mgs = [getattr(w, "main_grad", None) for w in weights]
+    if any(m is None for m in mgs):
+        return None
+    E = len(mgs)
+    N, K = mgs[0].shape
+    elem = mgs[0].element_size()
+    blk = N * K * elem
+    if any(m.dtype != torch.float32 or tuple(m.shape) != (N, K) or not m.is_contiguous() for m in mgs):
+        return None
+    ptrs = [m.data_ptr() for m in mgs]
+    ascending = ptrs[0] < ptrs[-1]
+    base_t = mgs[0] if ascending else mgs[-1]  # lowest-address expert main_grad
+    base = base_t.data_ptr()
+    for i, p in enumerate(ptrs):
+        want = base + i * blk if ascending else base + (E - 1 - i) * blk
+        if p != want:
+            return None
+    if base_t.storage_offset() * elem + E * blk > base_t.untyped_storage().nbytes():
+        return None
+    view = torch.as_strided(base_t, size=(E, N, K), stride=(N * K, K, 1))
+    return view, (not ascending)
+
 __all__ = [
     "grouped_gemm_fp8",
 ]
@@ -716,6 +775,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
         ctx.total_m = total_m
+        # Fused wgrad->main_grad target (set by the fused_grouped_wgrad() context, if active).
+        ctx.fused_weights = _FUSED_WGRAD_WEIGHTS.get()
         return out
 
     @staticmethod
@@ -763,21 +824,62 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         grad_a = grad_a[: ctx.total_m]
 
         # wgrad: grad_b[g] = grad_out_col[g] @ a_col[g]^T  (variable-K over colwise-128 M_g)
-        grad_b = grouped_gemm_fp8_variable_k_impl(
-            grad_out_t_fp8,
-            a_fp8_col,
-            grad_out_t_scale,
-            a_scale_col,
-            group_lens_padded_colwise,
-            group_offs_padded_colwise,
-            trans_a=False,
-            trans_b=False,
-            trans_c=False,
-            out_dtype=ctx.out_dtype,
-            granularity=ScalingGranularity.MX_BLOCKWISE.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+        fused_weights = getattr(ctx, "fused_weights", None)
+        can_fuse = fused_weights is not None and all(
+            hasattr(w, "grad_added_to_main_grad") for w in fused_weights
         )
+        _mg = _expert_main_grad_view(fused_weights) if can_fuse else None
+        if _mg is not None:
+            mg_view, mg_reverse = _mg
+            # FUSED (mirrors TE GroupedLinear fuse_wgrad_accumulation): accumulate the wgrad
+            # straight into the experts' fp32 main_grad (the [E,N,K] block view), set
+            # grad_added_to_main_grad, and return None for grad_b so no grad reaches the
+            # expert leaves -> Megatron's main_grad.add_ hook never fires (the add_ swarm).
+            from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
+                grouped_gemm_mxfp8_variable_k_triton_kernel,
+            )
+
+            OUT_M = grad_out_t_fp8.shape[0]  # N
+            OUT_N = a_fp8_col.shape[0]  # K
+            G = group_lens_padded_colwise.shape[0]
+            grouped_gemm_mxfp8_variable_k_triton_kernel(
+                grad_out_t_fp8,
+                grad_out_t_scale,
+                a_fp8_col,
+                a_scale_col,
+                group_offs_padded_colwise,
+                OUT_M,
+                OUT_N,
+                G,
+                out_dtype=ctx.out_dtype,
+                num_cu=ctx.num_cu,
+                accumulate_out=mg_view,  # fp32 [E,N,K]; kernel does main_grad += wgrad
+                reverse_groups=mg_reverse,  # main_grad block is reverse-ordered per expert
+            )
+            for w in fused_weights:
+                w.grad_added_to_main_grad = True
+            # Return None (not a dummy): the kernel already accumulated every micro-batch's
+            # wgrad straight into main_grad, so the weight leaves need NO grad. None stops
+            # the grad at the stacked tensor -> no AccumulateGrad add_ swarm on the experts.
+            # (Single-GPU / no grad-reduce. For DDP grad-reduce, a dummy + grad_acc hook
+            # registration would be needed instead — see TE handle_custom_ddp_from_mcore.)
+            grad_b = None
+        else:
+            grad_b = grouped_gemm_fp8_variable_k_impl(
+                grad_out_t_fp8,
+                a_fp8_col,
+                grad_out_t_scale,
+                a_scale_col,
+                group_lens_padded_colwise,
+                group_offs_padded_colwise,
+                trans_a=False,
+                trans_b=False,
+                trans_c=False,
+                out_dtype=ctx.out_dtype,
+                granularity=ScalingGranularity.MX_BLOCKWISE.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.TRITON.value,
+            )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
         return grad_a, grad_b, None, None, None, None, None, None, None, None
 

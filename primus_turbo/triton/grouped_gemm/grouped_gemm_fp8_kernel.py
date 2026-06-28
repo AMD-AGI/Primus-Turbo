@@ -2289,6 +2289,8 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
     VEC: tl.constexpr,
     LHS_FMT: tl.constexpr,  # "e4m3"/"e5m2" — independent (HYBRID wgrad is
     RHS_FMT: tl.constexpr,  # e5m2 grad_out x e4m3 activation)
+    ACCUMULATE: tl.constexpr = False,  # fused wgrad: C (fp32) += acc instead of overwrite
+    REVERSE_GROUPS: tl.constexpr = False,  # write group g to slot (G-1-g) (reverse main_grad layout)
 ):
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
@@ -2350,21 +2352,43 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
             LS_BASE += (BLOCK_SIZE_K // VEC) * stride_lsk
             RS_BASE += (BLOCK_SIZE_K // VEC) * stride_rsk
 
-        c = acc.to(C.type.element_ty)
         rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         cmask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
-        C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
-        tl.store(C_, c, cmask)
+        # REVERSE_GROUPS: write group g into output slot (G-1-g). Used for the fused
+        # main_grad accumulate, where Megatron's grad buffer lays the per-expert
+        # main_grads in reverse expert order, addressed by a positive-stride [E,N,K]
+        # view from the lowest address (PyTorch as_strided forbids negative strides).
+        out_g = (G - 1 - group_idx) if REVERSE_GROUPS else group_idx
+        C_ = C + out_g.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+        if ACCUMULATE:
+            # fused wgrad accumulate into fp32 main_grad. Each (group, pid_m, pid_n)
+            # output tile is produced by exactly one program (full K-reduction in-reg,
+            # no split-K), so a plain load+add+store is race-free — no atomics.
+            prev = tl.load(C_, mask=cmask, other=0.0)
+            tl.store(C_, prev + acc, cmask)
+        else:
+            tl.store(C_, acc.to(C.type.element_ty), cmask)
 
 
 def grouped_gemm_mxfp8_variable_k_triton_kernel(
-    lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=None
+    lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=None,
+    accumulate_out=None, reverse_groups=False,
 ):
-    """C[g] (OUT_M,OUT_N) = lhs[:,g] @ rhs[:,g]^T. lhs (OUT_M,M_total), rhs (OUT_N,M_total)."""
+    """C[g] (OUT_M,OUT_N) = lhs[:,g] @ rhs[:,g]^T. lhs (OUT_M,M_total), rhs (OUT_N,M_total).
+
+    If ``accumulate_out`` is given (an fp32 [G,OUT_M,OUT_N] buffer, e.g. a contiguous
+    expert main_grad), the wgrad is fused-accumulated into it (C += result) and that
+    buffer is returned; otherwise a fresh ``out_dtype`` tensor is allocated and written.
+    """
     if is_gfx950():
         set_triton_knobs_gfx950()
-    c = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=lhs.device)
+    if accumulate_out is not None:
+        assert accumulate_out.dtype == torch.float32, "accumulate_out (main_grad) must be fp32"
+        assert tuple(accumulate_out.shape) == (G, OUT_M, OUT_N)
+        c = accumulate_out
+    else:
+        c = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=lhs.device)
     ls = lhs_scale.view(torch.uint8)
     rs = rhs_scale.view(torch.uint8)
     # Per-operand format (independent) — HYBRID wgrad pairs e5m2 grad_out with
@@ -2414,6 +2438,8 @@ def grouped_gemm_mxfp8_variable_k_triton_kernel(
         VEC=VEC_SIZE,
         LHS_FMT=lhs_fmt,
         RHS_FMT=rhs_fmt,
+        ACCUMULATE=(accumulate_out is not None),
+        REVERSE_GROUPS=reverse_groups,
         num_warps=8,
         num_stages=3,
         waves_per_eu=2,
