@@ -114,6 +114,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("hipblaslt_grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
           "ScalarType out_dtype, str granularity, bool pre_sync) -> Tensor");
+    m.def("hipblaslt_grouped_gemm_mxfp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
+          "Tensor group_lens, Tensor group_offs, Tensor group_offs_out, "
+          "ScalarType out_dtype) -> Tensor");
     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
 }
 
@@ -162,6 +165,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm);
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8);
+    m.impl("hipblaslt_grouped_gemm_mxfp8", hipblaslt_grouped_gemm_mxfp8);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -210,6 +214,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs_meta);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm_meta);
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8_meta);
+    m.impl("hipblaslt_grouped_gemm_mxfp8", hipblaslt_grouped_gemm_mxfp8_meta);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

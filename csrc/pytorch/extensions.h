@@ -293,6 +293,16 @@ at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Ten
                                            const bool transB, at::ScalarType out_dtype,
                                            const std::string &granularity, const bool pre_sync);
 
+at::Tensor hipblaslt_grouped_gemm_mxfp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                        at::Tensor &b_scales, at::Tensor &group_lens,
+                                        at::Tensor &group_offs, at::Tensor &group_offs_out,
+                                        at::ScalarType out_dtype);
+
+at::Tensor hipblaslt_grouped_gemm_mxfp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                             at::Tensor &b_scales, at::Tensor &group_lens,
+                                             at::Tensor &group_offs, at::Tensor &group_offs_out,
+                                             at::ScalarType out_dtype);
+
 at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens);

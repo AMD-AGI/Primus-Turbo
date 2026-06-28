@@ -89,6 +89,16 @@ at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Ten
     }
 }
 
+at::Tensor hipblaslt_grouped_gemm_mxfp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                             at::Tensor &b_scales, at::Tensor &group_lens,
+                                             at::Tensor &group_offs, at::Tensor &group_offs_out,
+                                             at::ScalarType out_dtype) {
+    // Over-allocated to padded input rows; caller slices [:total_m].
+    const int64_t m = a.size(0);
+    const int64_t n = b.size(1); // [E, N, K]
+    return at::empty({m, n}, at::dtype(out_dtype).device(at::kMeta));
+}
+
 at::Tensor grouped_gemm_compute_offs_meta(at::Tensor &group_lens) {
     at::Tensor group_offs =
         at::empty({group_lens.numel() + 1}, group_lens.options().device(at::kMeta));

@@ -111,6 +111,65 @@ void ck_grouped_gemm_fp8_variable_k(
 #endif // PRIMUS_TURBO_BUILD_CK_BACKEND
 
 //==================================================================
+//  hipBLASLt Grouped MXFP8 GEMM (gfx1250)
+//==================================================================
+
+// Per-group MXFP8 grouped GEMM descriptor. All host vectors are sized group_num
+// and indexed by the (host-accessible) group id. Device buffers (a_padded,
+// a_swz_scale, b_swz_scale, c_data) are pre-allocated/freed by the caller.
+// Per group g this runs the NT GEMM  D = A[mpad,K] @ B[npad,K]^T  (contraction K,
+// VEC32_UE8M0 swizzled scales), matching the dense MX op.
+struct HipblasltMXGroupedGemmParams {
+    const void *a_padded    = nullptr; // [sum(a_mpad), K] fp8 (128-padded activation / wgrad lhs)
+    const void *a_swz_scale = nullptr; // concatenated per-group groups-of-4 swizzled e8m0
+    const void *b_data      = nullptr; // [sum(b_mpad), K] fp8 (weight / wgrad rhs, 128-padded)
+    const void *b_swz_scale = nullptr; // concatenated per-group swizzled e8m0
+    void       *c_data      = nullptr; // output
+
+    hipDataType ab_type;
+    hipDataType c_type;
+
+    int64_t ldc = 0; // output row stride (real N for fwd / OUT_N for wgrad; 128-multiple)
+
+    const int64_t *group_lens_host = nullptr; // host-accessible group lens
+    const int64_t *a_row_off       = nullptr; // A row start per group (in a_padded rows)
+    const int64_t *a_scale_off     = nullptr; // element offset of group's swizzled A scale
+    const int64_t *b_row_off       = nullptr; // B row start per group (in b_data rows)
+    const int64_t *b_scale_off     = nullptr; // element offset of group's swizzled B scale
+    const int64_t *c_off_bytes     = nullptr; // byte offset of group's output block
+    const int64_t *a_mpad          = nullptr; // padded A rows (m) per group
+    const int64_t *b_mpad          = nullptr; // padded B rows (n) per group
+    const int64_t *kdim            = nullptr; // per-group contraction (fwd: K; wgrad: M_g)
+
+    int               group_num = 0;
+    hipStream_t       stream    = nullptr;
+    void             *workspace = nullptr;
+    hipblasLtHandle_t handle    = nullptr;
+};
+
+// Pack per-group real rows from a padded-block (m_pad rows) GEMM output into the
+// tight output the MoE forward expects (real rows at group_offs_out). One launch.
+void mxfp8_pack_output_grouped(const void *padded, void *tight, int64_t N, int dtype_bytes,
+                               const int *src_row_off, const int *dst_row_off, const int *row_len,
+                               const int64_t *elem_pref, int group_num, int64_t total_out_elems,
+                               hipStream_t stream);
+
+// Batched device kernels (one launch over all groups) used to prepare the MX
+// grouped GEMM inputs. Declared here so the binding can drive them.
+void mxfp8_swizzle_scale_grouped(const uint8_t *in_scale, uint8_t *out_scale, int64_t ks,
+                                 int64_t ks_pad, const int *row_in_off, const int *row_len,
+                                 const int *mpad, const int64_t *out_blk_off,
+                                 const int64_t *blk_pref, int group_num, int64_t total_out_tiles,
+                                 hipStream_t stream);
+
+void mxfp8_pad_data_grouped(const uint8_t *in_data, uint8_t *out_data, int64_t K,
+                            const int *row_in_off, const int *row_len, const int64_t *out_row_off,
+                            const int64_t *elem_pref, int group_num, int64_t total_out_elems,
+                            hipStream_t stream);
+
+void hipblaslt_grouped_gemm_mxfp8(const HipblasltMXGroupedGemmParams &params);
+
+//==================================================================
 //  hipBLASLt Grouped GEMM
 //==================================================================
 
