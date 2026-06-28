@@ -23,7 +23,8 @@ import torch
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_resource
 
-from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+# NOTE: import symm_buffer lazily inside _active_symm_bounds to avoid a circular
+# import (symm_buffer -> pytorch package init -> mega_moe_fused -> swiglu_kernel).
 
 # SwiGLU clamp contract: baked into the kernels; must match the reference.
 ACTIVATION_CLAMP = 10.0
@@ -268,6 +269,8 @@ def _active_symm_bounds():
     Returns ``(symm.block_m, symm.meta_scalars[1:2])`` so the epilogue rides the same
     device-bounded real-row count as the fused pipeline; ``(0, None)`` (unbounded over
     all rows) when no workspace is active (standalone use)."""
+    from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+
     try:
         symm = get_symm_buffer_for_mega_moe()
     except RuntimeError:

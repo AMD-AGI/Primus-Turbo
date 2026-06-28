@@ -65,7 +65,7 @@ class SymLayout:
     hidden: Constexpr[int]
     intermediate_hidden: Constexpr[int]
     num_max_pool_tokens: Constexpr[int]  # pool capacity (rows)
-    num_max_pool_blocks: Constexpr[int]  # pool_capacity // block_m
+    num_max_pool_blocks: Constexpr[int]  # num_max_pool_tokens // block_m
     combine_slots: Constexpr[int]  # num_topk * num_max_tokens_per_rank
 
 

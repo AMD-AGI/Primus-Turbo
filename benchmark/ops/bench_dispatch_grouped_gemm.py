@@ -49,14 +49,18 @@ from mega_utils import (  # noqa: E402
     dispatch_only,
     generate_input,
     global_weights,
+    grouped_gemm_bf16_only,
+    grouped_gemm_tn_wgrad_only,
     print_header,
     print_stage,
 )
 
+import primus_turbo.pytorch  # noqa: E402,F401  (fully init pytorch first: dodges the
 from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (  # noqa: E402
     dispatch_grouped_gemm_bf16,
-    grouped_gemm_bf16_only,
 )
+
+# symm_buffer<->pytorch<->swiglu circular import that the mega kernels otherwise trigger)
 
 
 def profile_dispatch(group, args, mode, W1, W2):
@@ -110,7 +114,7 @@ def profile_dispatch(group, args, mode, W1, W2):
                 x,
                 inp.W1,
                 group,
-                handle=(*handle, inp.tile_to_expert, inp.expected),
+                handle=handle,
                 layout="nt",
                 BM=BM,
                 BN=BN,
@@ -126,7 +130,7 @@ def profile_dispatch(group, args, mode, W1, W2):
         N_bwd = I  # backward STEP1 output width
         flops_bwd = 2.0 * M_eff * N_bwd * K
         dy = (torch.randn(args.num_tokens, H, device="cuda", dtype=torch.float32) / 8).bfloat16()
-        d_swiglu = torch.empty(symm.pool_capacity, N_bwd, device="cuda", dtype=torch.bfloat16)
+        d_swiglu = torch.empty(symm.num_max_pool_tokens, N_bwd, device="cuda", dtype=torch.bfloat16)
 
         # fill the pool with dy once for the gemm-only baseline
         torch.cuda.synchronize()
@@ -152,7 +156,7 @@ def profile_dispatch(group, args, mode, W1, W2):
                 dy,
                 inp.W2,
                 group,
-                handle=(*handle, inp.tile_to_expert, inp.expected),
+                handle=handle,
                 layout="nn",
                 BM=BM,
                 BN=BN,
@@ -168,6 +172,69 @@ def profile_dispatch(group, args, mode, W1, W2):
             "fused_ms": t_bwd_fused,
             "flops": flops_bwd,
         }
+
+        # group metadata shared by the variable-K wgrads: block_m-padded per-expert
+        # boundaries (padded rows contract to 0, matching mega_moe_fused).
+        experts_per_rank = args.num_experts // group.size()
+        t2e = inp.tile_to_expert[:real_tiles].to(torch.int64)
+        counts = torch.bincount(t2e, minlength=experts_per_rank)[:experts_per_rank]
+        group_offs = torch.zeros(experts_per_rank + 1, dtype=torch.int32, device="cuda")
+        group_offs[1:] = (counts * BM).to(torch.int32).cumsum(0)
+        cap = symm.num_max_pool_tokens
+        ext_handle = handle  # full prologue tuple (tile_to_expert / expected / group_offs inside)
+
+        # ── backward wgrad dW1 (TN, variable-K) — the e2e _grouped_variable_k_gemm
+        # hotspot. dW1 = pool(x)^T @ grad_l1: a/b swapped vs grad-first — lhs = pool(x)
+        # (feature H, the dispatched operand), rhs = grad_l1 (gate+up, feature 2I,
+        # resident). OUT_M = H, OUT_N = 2I. The gemm_only path matches mega_moe_fused's
+        # local grouped TN wgrad (no comm in e2e dW1); the fused column is the
+        # hypothetical dispatch+wgrad overlap story.
+        OUT_M_w1, OUT_N_w1 = H, 2 * I  # dW1: lhs feature = H (pool x), rhs feature = 2I (grad_l1)
+        flops_wg1 = 2.0 * M_eff * OUT_M_w1 * OUT_N_w1
+        x_pool = (torch.randn(cap, OUT_M_w1, device="cuda", dtype=torch.float32) / 8).bfloat16()
+        grad_pool_w1 = (torch.randn(cap, OUT_N_w1, device="cuda", dtype=torch.float32) / 8).bfloat16()
+        # trans_c: dW1 stored transposed [G, OUT_N, OUT_M] = [G, 2I, H] = W1-native layout
+        dW1 = torch.empty(experts_per_rank, OUT_N_w1, OUT_M_w1, device="cuda", dtype=torch.bfloat16)
+        # gemm_only: resident lhs/rhs pools (no comm) = the e2e local grouped TN wgrad
+        t_wg1_gemm = bench(
+            lambda: grouped_gemm_tn_wgrad_only(
+                x_pool, grad_pool_w1, group_offs, dW1, BLOCK_M=BM, BLOCK_N=BN, trans_c=True
+            ),
+            iters=args.iters,
+        )
+        # dense roofline of the same total FLOPs (one [H,2I] GEMM contracting M_eff rows)
+        t_wg1_dense, wg1_dense_group_m = dense_gemm_peak_ms(
+            OUT_M_w1, OUT_N_w1, M_eff, BM, BN, args.iters, group_m_cands=group_m_cands
+        )
+        # comm baseline = dispatch the H-wide lhs (matches the fused dispatch width)
+        t_wg1_disp = bench(
+            lambda: dispatch_only(x_pool, handle, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu),
+            iters=args.iters,
+        )
+        t_wg1_fused = bench(
+            lambda: dispatch_grouped_gemm_bf16(
+                x_pool,
+                grad_pool_w1,
+                group,
+                handle=ext_handle,
+                layout="tn",
+                num_dispatch_cu=num_dispatch_cu,
+                BM=BM,
+                BN=BN,
+                trans_c=True,
+            ),
+            iters=args.iters,
+            group=group,
+            reset=lambda: symm.scoreboard.zero_(),
+        )
+        wgrad1 = {
+            "gemm_only_ms": t_wg1_gemm,
+            "dense_gemm_only_ms": t_wg1_dense,
+            "dense_gm": wg1_dense_group_m,
+            "dispatch_only_ms": t_wg1_disp,
+            "fused_ms": t_wg1_fused,
+            "flops": flops_wg1,
+        }
     finally:
         symm.destroy()  # always free symmetric buffers
     # raw per-rank timings + work; rank 0 aggregates across ranks (bottleneck = max latency)
@@ -180,6 +247,7 @@ def profile_dispatch(group, args, mode, W1, W2):
         "flops": flops,
         "xgmi_bytes": xgmi_bytes,
         "bwd": bwd,
+        "wgrad1": wgrad1,
     }
 
 
@@ -252,6 +320,26 @@ def benchmark_dispatch(local_rank, world, args):
                 comm_tag="disp",
                 sub_header="backward STEP1 (NN, = dispatch_grouped_0)",
             )
+
+            # backward wgrad dW1 (TN, variable-K): OUT_M=2I, OUT_N=H.
+            w1_max = lambda key: max(d["wgrad1"][key] for d in per_rank)
+            w1_flops = sum(d["wgrad1"]["flops"] for d in per_rank) / len(per_rank)
+            mw1 = compute_stage_metrics(
+                gemm_ms=w1_max("gemm_only_ms"),
+                dense_ms=w1_max("dense_gemm_only_ms"),
+                dense_gm=per_rank[0]["wgrad1"]["dense_gm"],
+                comm_ms=w1_max("dispatch_only_ms"),
+                fused_ms=w1_max("fused_ms"),
+                flops=w1_flops,
+                xgmi=xgmi,
+            )
+            print_stage(
+                mw1,
+                comm_label="dispatch_only",
+                comm_unit="GB/s (XGMI, nodeup)",
+                comm_tag="disp",
+                sub_header="backward wgrad dW1 (TN, = dispatch + variable-K wgrad)",
+            )
             rows.append(
                 {
                     "Platform": platform,
@@ -285,6 +373,15 @@ def benchmark_dispatch(local_rank, world, args):
                     "bwd fused (TFLOPS)": f"{mb.fused_tf:.1f}",
                     "bwd speedup (vs serial)": f"{mb.speedup:.2f}x",
                     "bwd roofline (max(gemm,disp)/fused)": f"{mb.roofline_pct:.1f}%",
+                    "wgrad1 dense_gemm (TFLOPS)": f"{mw1.dense_tf:.1f}",
+                    "wgrad1 gemm_only (ms)": f"{mw1.gemm_ms:.3f}",
+                    "wgrad1 gemm_only (TFLOPS)": f"{mw1.gemm_tf:.1f}",
+                    "wgrad1 grouped/dense": f"{mw1.grouped_eff_pct:.1f}%",
+                    "wgrad1 dispatch_only (ms)": f"{mw1.comm_ms:.3f}",
+                    "wgrad1 fused (ms)": f"{mw1.fused_ms:.3f}",
+                    "wgrad1 fused (TFLOPS)": f"{mw1.fused_tf:.1f}",
+                    "wgrad1 speedup (vs serial)": f"{mw1.speedup:.2f}x",
+                    "wgrad1 roofline (max(gemm,disp)/fused)": f"{mw1.roofline_pct:.1f}%",
                 }
             )
             torch.cuda.synchronize()

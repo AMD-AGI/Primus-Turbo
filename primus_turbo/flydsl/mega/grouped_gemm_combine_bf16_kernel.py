@@ -244,9 +244,9 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
                 # (L1-bypass -> always fresh; no acquire fence). valid iff 0 <= topk_index < num_experts.
                 for j in range_constexpr(topk):
                     slot = token * fx.Int32(topk) + fx.Int32(j)
-                    topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i32())
-                    if topk_index >= fx.Int32(0):
-                        if topk_index < fx.Int32(num_experts):
+                    topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+                    if topk_index >= fx.Int64(0):
+                        if topk_index < fx.Int64(num_experts):
                             if lane == fx.Int32(0):
                                 flag = ld(barrier_base, slot, scope="agent")
                                 while flag < fx.Int32(0):
@@ -277,9 +277,9 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
                 # so this is deadlock-safe unlike a -1 reset. Forward re-arms -1 via the prologue.
                 for j in range_constexpr(topk):
                     slot = token * fx.Int32(topk) + fx.Int32(j)
-                    topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i32())
-                    if topk_index >= fx.Int32(0):
-                        if topk_index < fx.Int32(num_experts):
+                    topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+                    if topk_index >= fx.Int64(0):
+                        if topk_index < fx.Int64(num_experts):
                             if lane == fx.Int32(0):
                                 st(barrier_base, slot, fx.Int32(0), scope="agent")
                     if with_gate:
@@ -288,8 +288,8 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
                         if lane == fx.Int32(0):
                             gate_v = buffer_load(gate_local_res, slot, vec_width=1, dtype=fx.T.f32())
                             zero_f = fx.Float32(0.0)
-                            v1 = fx.arith.select(topk_index < fx.Int32(num_experts), gate_v, zero_f)
-                            d_val = fx.arith.select(topk_index >= fx.Int32(0), v1, zero_f)
+                            v1 = fx.arith.select(topk_index < fx.Int64(num_experts), gate_v, zero_f)
+                            d_val = fx.arith.select(topk_index >= fx.Int64(0), v1, zero_f)
                             buffer_store(d_val, d_topk_w_res, slot)
             token = token + total_warps
 
@@ -308,7 +308,7 @@ def _get_topk_reduce(wait_flags, apply_weights, with_gate=False):
 def _compile(
     out_features,
     hidden_size,
-    pool_capacity,
+    num_max_pool_tokens,
     BLOCK_M,
     BLOCK_N,
     num_combine_cu,
@@ -329,17 +329,17 @@ def _compile(
     K = hidden_size
     gemm_tile = _GEMM_TILE[layout]
     assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
-    assert pool_capacity % BLOCK_M == 0, "pool_capacity must be a multiple of BLOCK_M"
+    assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
     assert topk >= 1, "topk must be >= 1"
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
     n_blocks = out_features // BLOCK_N
-    worst_case_tiles = pool_capacity // BLOCK_M
+    worst_case_tiles = num_max_pool_tokens // BLOCK_M
     gemm_grid_blocks = worst_case_tiles * n_blocks  # compile-time empty+real GEMM block count
     comb_records = combine_slots * out_features * 2  # bf16 peer combine-buffer bound (bytes)
     gate_records = combine_slots * 4  # f32 gate slots per peer (backward d_topk_w scatter)
     delta_records = num_ranks * 8  # i64[num_ranks] per-peer delta table (bytes)
-    pool_records = pool_capacity * 4  # i32[pool_capacity] origin tables (bytes)
+    pool_records = num_max_pool_tokens * 4  # i32[num_max_pool_tokens] origin tables (bytes)
     dedicated_reduce_warps = num_reduce_cu * _NUM_WARPS  # const worker-warp count for [combine,reduce)
     gemm_base = num_combine_cu + num_reduce_cu
     topk_reduce = _get_topk_reduce(True, apply_weights, with_gate)
@@ -377,10 +377,10 @@ def _compile(
         )
         l2y_tensor = fx.make_view(
             fx.inttoptr(l2y_ptr_ty, sym_layout.l2_token_buffer_ptr),
-            fx.make_layout(pool_capacity * out_features, 1),
+            fx.make_layout(num_max_pool_tokens * out_features, 1),
         )
         l2y_resource = create_buffer_resource_from_addr(
-            sym_layout.l2_token_buffer_ptr, num_records_bytes=pool_capacity * out_features * 2
+            sym_layout.l2_token_buffer_ptr, num_records_bytes=num_max_pool_tokens * out_features * 2
         )
         # two per-peer DELTA tables (SIGNAL heap: comb/barrier; MAIN heap: combine_gate)
         signal_delta_res = create_buffer_resource_from_addr(
@@ -474,12 +474,18 @@ def _compile(
                 )
             else:
                 # ── role 3: GROUPED GEMM (one tile -> L2Y, signal scoreboard) ──
+                # naive M-major order is REQUIRED: each block_m's n_blocks tiles complete
+                # contiguously AND in numeric block_m order, so the combine role (which
+                # grid-strides block_m numerically) can stream-push each block_m mid-kernel.
+                # Any reuse swizzle (GROUP_M groups, or XCD remap) reorders block_m completion
+                # -> combine stalls on late tiles -> serializes into a 1.5x tail. Proven dead
+                # ends; the fused GEMM trades weight-L2 reuse for combine overlap on purpose.
                 gemm_tile_index = block_index - fx.Int32(gemm_base)
                 block_m = gemm_tile_index // fx.Int32(n_blocks)
                 block_n = gemm_tile_index % fx.Int32(n_blocks)
                 if block_m < real_tiles:
-                    # c_m = pool_capacity compile-time const folds the epilogue bound (~4% faster)
-                    c_m_const = fx.Int32(pool_capacity)
+                    # c_m = num_max_pool_tokens compile-time const folds the epilogue bound (~4% faster)
+                    c_m_const = fx.Int32(num_max_pool_tokens)
                     group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                     group_base = group_index * fx.Int32(K) * c_n
                     gemm_tile(
@@ -573,7 +579,7 @@ def _compile(
 @functools.lru_cache(maxsize=256)
 def _compile_combine_only(
     out_features,
-    pool_capacity,
+    num_max_pool_tokens,
     BLOCK_M,
     num_combine_cu,
     combine_slots,
@@ -581,12 +587,12 @@ def _compile_combine_only(
     waves_per_eu=2,
     with_gate=False,
 ):
-    assert pool_capacity % BLOCK_M == 0, "pool_capacity must be a multiple of BLOCK_M"
+    assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
     comb_records = combine_slots * out_features * 2
     gate_records = combine_slots * 4  # f32 gate slots per peer
     delta_records = num_ranks * 8
-    pool_records = pool_capacity * 4
+    pool_records = num_max_pool_tokens * 4
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def combine_only_k(
@@ -599,7 +605,7 @@ def _compile_combine_only(
         combine_cu = fx.Int32(num_combine_cu)
         # L2Y = the SymLayout l2_token_buffer (pre-filled GEMM scratch) -> combine PUSH source
         l2y_resource = create_buffer_resource_from_addr(
-            sym_layout.l2_token_buffer_ptr, num_records_bytes=pool_capacity * out_features * 2
+            sym_layout.l2_token_buffer_ptr, num_records_bytes=num_max_pool_tokens * out_features * 2
         )
         signal_delta_res = create_buffer_resource_from_addr(
             sym_layout.signal_offsets_ptr, num_records_bytes=delta_records
@@ -750,7 +756,7 @@ _COMBINE_AUTOTUNE_CACHE: dict = {}
 def grouped_gemm_combine_bf16(
     x,
     l2_weights,
-    tile_to_expert,
+    handle,
     group,
     *,
     topk_indices,
@@ -765,8 +771,8 @@ def grouped_gemm_combine_bf16(
 ):
     """Fused grouped BF16 GEMM + combine PUSH + topk reduce, three-role.
 
-    Every buffer except the operands (``x`` activation, ``l2_weights``, ``tile_to_expert``)
-    comes from the active ``get_symm_buffer_for_mega_moe()`` (the workspace the caller built
+    Every buffer except the operands (``x`` activation, ``l2_weights``) comes from the
+    active ``get_symm_buffer_for_mega_moe()`` (the workspace the caller built
     for this ``group``), handed to the kernel as a single ``SymLayout``. In particular the
     GEMM output / combine PUSH source is the SymLayout ``l2_token_buffer`` (no ``l2y`` arg),
     and the per-token reduce result ``output`` [num_tokens, N] is allocated here and returned.
@@ -786,7 +792,7 @@ def grouped_gemm_combine_bf16(
     [num_tokens*topk] int32 (< 0 == dropped) drives the per-token loop; ``topk_weights``
     [num_tokens*topk] f32 (optional) scales each topk row -> weighted reduce (else unweighted).
 
-    ``grad_gate`` [pool_capacity] f32 (given): role 1 also scatters the per-row gate gradient
+    ``grad_gate`` [num_max_pool_tokens] f32 (given): role 1 also scatters the per-row gate gradient
     to the peer ``combine_gate`` (backward d_topk_w); the reduce folds it into a fresh masked
     ``d_topk_w`` [combine_slots] f32.
 
@@ -796,14 +802,16 @@ def grouped_gemm_combine_bf16(
     assert layout in ("nt", "nn", "tn"), f"unknown layout {layout}"
     assert x.dtype == torch.bfloat16 and l2_weights.dtype == torch.bfloat16
     assert topk_indices is not None, "topk reduce needs topk_indices"
+    # dispatch prologue tuple: slot [7] = expert id per BM tile
+    tile_to_expert = handle[7]
     # active symmetric workspace (built earlier by get_symm_buffer_for_mega_moe for `group`);
     # the single SymLayout names every symmetric sub-buffer (two-heap delta tables)
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.make_sym_layout()
     if layout == "tn":  # A is [K, M] (K-major)
-        hidden_size, pool_capacity = x.shape
+        hidden_size, num_max_pool_tokens = x.shape
     else:  # A is [M, K]
-        pool_capacity, hidden_size = x.shape
+        num_max_pool_tokens, hidden_size = x.shape
     if layout == "nt":  # weight [G, N, K]
         G, N, K = l2_weights.shape
     else:  # NN / TN: weight [G, K, N]
@@ -811,11 +819,13 @@ def grouped_gemm_combine_bf16(
     assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
     out_features = N
     c_n = out_features
-    # the GEMM output IS the SymLayout l2_token_buffer [pool_capacity, hidden] -> N == hidden
+    # the GEMM output IS the SymLayout l2_token_buffer [num_max_pool_tokens, hidden] -> N == hidden
     assert out_features == int(
         sym_layout.hidden
     ), f"out_features {out_features} != SymLayout hidden {int(sym_layout.hidden)}"
-    assert pool_capacity == int(sym_layout.num_max_pool_tokens), "x rows must match SymLayout pool capacity"
+    assert num_max_pool_tokens == int(
+        sym_layout.num_max_pool_tokens
+    ), "x rows must match SymLayout pool capacity"
     if num_combine_cu is None:
         num_combine_cu = 64  # best for fused 3-role (bench fused3 ~2.9ms; e2e sweep 64<48<96)
 
@@ -872,7 +882,7 @@ def grouped_gemm_combine_bf16(
         key = (
             out_features,
             hidden_size,
-            pool_capacity,
+            num_max_pool_tokens,
             BM,
             BN,
             int(combine_slots),
@@ -892,7 +902,7 @@ def grouped_gemm_combine_bf16(
                 finite_view,
                 out_features,
                 hidden_size,
-                pool_capacity,
+                num_max_pool_tokens,
                 BM,
                 BN,
                 int(combine_slots),
@@ -912,7 +922,7 @@ def grouped_gemm_combine_bf16(
         launch = _compile(
             out_features,
             hidden_size,
-            pool_capacity,
+            num_max_pool_tokens,
             BM,
             BN,
             int(num_combine_cu),
@@ -936,7 +946,7 @@ def _autotune(
     finite_view,
     out_features,
     hidden_size,
-    pool_capacity,
+    num_max_pool_tokens,
     BM,
     BN,
     combine_slots,
@@ -960,7 +970,7 @@ def _autotune(
             launch = _compile(
                 out_features,
                 hidden_size,
-                pool_capacity,
+                num_max_pool_tokens,
                 BM,
                 BN,
                 int(num_combine_cu),
@@ -1015,19 +1025,19 @@ def combine_only(
     symmetric workspace (L2Y source, origin tables, combine buffer, peer delta tables,
     optional gate-grad buffer) is fetched from the active ``get_symm_buffer_for_mega_moe()``.
 
-    ``grad_gate`` [pool_capacity] f32 (given): also scatter the per-row gate gradient to
+    ``grad_gate`` [num_max_pool_tokens] f32 (given): also scatter the per-row gate gradient to
     the peer ``combine_gate`` (backward d_topk_w); one f32/row by lane 0, negligible."""
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.make_sym_layout()
     out_features = int(sym_layout.hidden)
-    pool_capacity = int(sym_layout.num_max_pool_tokens)
+    num_max_pool_tokens = int(sym_layout.num_max_pool_tokens)
     if num_combine_cu is None:
-        num_combine_cu = pool_capacity // BM
+        num_combine_cu = num_max_pool_tokens // BM
     num_tile_blocks = symm.meta_scalars[1:2]
     with_gate = grad_gate is not None
     launch = _compile_combine_only(
         out_features,
-        pool_capacity,
+        num_max_pool_tokens,
         int(BM),
         int(num_combine_cu),
         int(sym_layout.combine_slots),

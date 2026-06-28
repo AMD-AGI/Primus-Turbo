@@ -73,6 +73,33 @@ def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_byt
     return fx.Tensor(fx.make_view(iter_f8, lay))
 
 
+def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_bytes):
+    """make_fp8_buffer_tensor_rebased for a 2-byte (bf16/fp16) operand: SRD base
+    advanced by ``base_bytes`` (i64), bounded by ``num_records_bytes`` (HW OOB clamp
+    -> per-group K-tail reads 0). Folds the per-group token base into the descriptor
+    so the buffer voffset/soffset stay int32 even past 2^31 elems."""
+    base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg))
+    base_off = arith.index_cast(T.i64, arith.index_cast(T.index, base_bytes))
+    base = _readfirstlane_i32(base + base_off)
+    nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
+    nrec = fx.Int64(_readfirstlane_i32(arith.index_cast(T.i64, nr)))
+    flags = _buffer_ops._get_buffer_flags()
+    base_ptr = fx.inttoptr(fx.PointerType.get(elem_ty=T.i8, address_space=1, alignment=16), base)
+    i8_buf_ty = fx.PointerType.get(elem_ty=T.i8, address_space=TargetAddressSpace.BufferDesc, alignment=16)
+    buf_ptr = fx.make_ptr(
+        i8_buf_ty, [base_ptr, fx.Int16(0).ir_value(), nrec.ir_value(), fx.Int32(flags).ir_value()]
+    )
+    lay = fx.make_layout(0x40000000, 1)  # 1D flat; HW bounds via num_records
+    iter_i8 = fx.get_iter(fx.make_view(buf_ptr, lay))
+    bf_buf_ptr_ty = fx.PointerType.get(
+        elem_ty=bf16_ir_t,
+        address_space=TargetAddressSpace.BufferDesc,
+        alignment=fx.PointerType(iter_i8.type).alignment,
+    )
+    iter_bf = fx.recast_iter(bf_buf_ptr_ty, iter_i8)
+    return fx.Tensor(fx.make_view(iter_bf, lay))
+
+
 def swizzle_128(row, col):
     offset = row * 128 + col
     swizzle = ((offset % (16 * 128)) >> 8) << 4
@@ -404,8 +431,9 @@ class StoreCPerTensor:
     drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
     """
 
-    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty,
-                 elem_fn=None):
+    def __init__(
+        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, elem_fn=None
+    ):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64

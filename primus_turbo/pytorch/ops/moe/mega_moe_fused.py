@@ -8,7 +8,7 @@
 
 Pipeline (EP intra-node, mirrors the EP test):
 
-  1. dispatch_grouped_gemm_impl -- fused prologue (build the cross-rank dispatch plan)
+  1. dispatch_grouped_gemm_impl -- fused prologue (build the cross-rank dispatch handle)
                                    + cross-rank dispatch PUSH + grouped L1 GEMM (NT)
   3. swiglu                     -- fused SwiGLU activation
   4. grouped_gemm_combine_impl  -- grouped L2 GEMM (NT) + cross-rank combine PUSH
@@ -49,6 +49,7 @@ from primus_turbo.flydsl.mega.swiglu_kernel import swiglu, swiglu_backward
 # existing ``mega_moe_fused`` importers keep working.
 from primus_turbo.flydsl.mega.symm_buffer import (
     SymmBuffer,
+    get_symm_buffer_for_mega_moe,
     get_symm_buffer_size_for_mega_moe,
 )
 from primus_turbo.pytorch.core.backend import BackendType
@@ -56,7 +57,6 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (
-    MegaDispatchHandle,
     dispatch_grouped_gemm_impl,
 )
 from primus_turbo.pytorch.kernels.mega_moe.grouped_gemm_combine_impl import (
@@ -71,35 +71,6 @@ __all__ = [
 ]
 
 _FLYDSL = BackendType.FLYDSL.value
-
-
-# for perf test, will be removed
-def _cached_group_meta(symm, topk_idx, tile_to_expert, experts_per_rank):
-    """block_m-granular (group_offs, group_lens) for the variable-K wgrads.
-
-    Deterministic in topk_idx (same routing -> same tile_to_expert -> same group
-    meta), so cache it on the symm buffer to skip the bincount+cumsum+slice when
-    the same topk_idx is reused (e.g. perf loops). Keyed on tensor identity +
-    version (in-place edits bump it) + tile count."""
-    key = (id(topk_idx), topk_idx._version, int(tile_to_expert.shape[0]))
-    cache = getattr(symm, "_group_meta_cache", None)
-    if cache is not None and cache[0] == key:
-        return cache[1], cache[2]
-
-    eo = torch.zeros((experts_per_rank + 1,), dtype=torch.int32, device=topk_idx.device)
-    eo[1:] = (
-        (
-            torch.bincount(tile_to_expert.to(torch.int64), minlength=experts_per_rank)[:experts_per_rank]
-            * symm.block_m
-        )
-        .to(torch.int32)
-        .cumsum(0)
-    )
-    group_offs = eo.to(torch.int64)
-    group_lens = (eo[1:] - eo[:-1]).to(torch.int64)
-    # hold a ref to topk_idx (via key->cache tuple keeps tensors alive) so id() can't alias
-    symm._group_meta_cache = (key, group_offs, group_lens, topk_idx)
-    return group_offs, group_lens
 
 
 # --------------------------------------------------------------------------- #
@@ -121,15 +92,17 @@ class MegaMoEFusedFunction(torch.autograd.Function):
     def forward(ctx, x, topk_idx, topk_weights, w1, w2, group, block_m, block_n, pool_mult):
         num_tokens, hidden_size = x.shape
         num_topk = topk_idx.shape[-1]
+        # int64 end-to-end (combine reads topk i64); no-op for int64 callers, single
+        # cheap cast for int32 callers -> downstream prologue/combine never re-cast.
+        topk_idx = topk_idx.to(torch.int64)
 
         ctx.set_materialize_grads(False)
-        experts_per_rank = w1.shape[0]
 
         # 1+2) fused prologue + cross-rank dispatch PUSH + grouped L1 GEMM (NT):
         # the dispatch builds/fetches the active symm workspace, runs the fused prologue
         # (resets scoreboard -> 0 / barrier_local -> -1 in-kernel before its cross-rank
         # barrier), then dispatches pool[M,H] @ w1[g,2I,H] -> l1_out. The handle carries the
-        # comm plan + tile tables + the live symm buffer (reused in backward / read below).
+        # comm handle + tile tables + the live symm buffer (reused in backward / read below).
         # sb_l2 self-resets in the combine push role; comb is fully overwritten by the push.
         l1_out, handle = dispatch_grouped_gemm_impl(
             x,
@@ -143,10 +116,9 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             BN=block_n,
             pool_mult=pool_mult,
         )
-        symm = handle.symm
-        tile_to_expert, tile_expected = handle.tile_to_expert, handle.tile_expected
+        # handle is the flat prologue tuple: [7]=tile_to_expert, [9]=group_lens, [10]=group_offs
+        symm = get_symm_buffer_for_mega_moe()  # the active buffer the dispatch just built
         num_experts = symm.num_experts
-        plan = handle.plan
 
         # 3) fused SwiGLU activation: l1_out[M,2I] -> act[M,I] (bound rides the active symm)
         act = swiglu(l1_out)
@@ -158,9 +130,9 @@ class MegaMoEFusedFunction(torch.autograd.Function):
         y, _ = grouped_gemm_combine_impl(
             act,
             w2,
-            tile_to_expert,
+            list(handle),
             _FLYDSL,
-            topk_indices=topk_idx.to(torch.int32).contiguous().view(-1),
+            topk_indices=topk_idx.contiguous().view(-1),
             topk_weights=topk_weights.to(torch.float32).contiguous().view(-1),
             num_combine_cu=_combine_cu,
             num_reduce_cu=_reduce_cu,
@@ -181,21 +153,16 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             ctx.num_experts = num_experts
             ctx.inter = symm.intermediate_hidden
             ctx.hidden = symm.hidden
-            # group metadata for the variable-K wgrads (block_m-granular, padded rows -> 0);
-            # cached on the symm buffer, keyed on topk_idx (skips bincount+cumsum+slice on reuse)
-            group_offs, group_lens = _cached_group_meta(symm, topk_idx, tile_to_expert, experts_per_rank)
-            # plan tensors (prologue outputs are fresh) + cloned persistent symm buffers
+            # save the full prologue handle directly (slot [7]=tile_to_expert, [9]=group_lens,
+            # [10]=group_offs for the variable-K wgrads) + cloned persistent symm buffers.
             # d_topk_w is produced in-kernel in backward (swiglu_backward grad_gate +
             # combine gate-scatter), so the forward combine buffer is NOT saved.
+            ctx.handle_len = len(handle)
             ctx.save_for_backward(
-                *plan,  # bundled dispatch plan (7 tensors), rebuilt in backward
-                tile_to_expert,
-                tile_expected,
-                symm.pool.clone(),  # dispatched x in pool order (dW1 B)
+                *handle,  # full dispatch prologue tuple (reused as-is in backward)
+                x,  # raw source x; backward re-dispatches it into the pool for dW1
                 l1_out,  # swiglu input (swiglu_backward; dW2 B = act_w recomputed here)
                 dispatch_weight_in_buf,
-                group_offs,
-                group_lens,
                 w1,
                 w2,
                 topk_idx,
@@ -209,26 +176,13 @@ class MegaMoEFusedFunction(torch.autograd.Function):
         # set_materialize_grads(False) -> grad_y is None when the output got no grad
         if grad_y is None:
             return (None,) * 9
-        (
-            d0,
-            d1,
-            d2,
-            d3,
-            d4,
-            d5,
-            d6,
-            tile_to_expert,
-            tile_expected,
-            saved_pool,
-            l1_out,
-            dispatch_weight_in_buf,
-            group_offs,
-            group_lens,
-            w1,
-            w2,
-            topk_idx,
-        ) = ctx.saved_tensors
-        plan = [d0, d1, d2, d3, d4, d5, d6]  # rebuilt bundled dispatch plan
+        saved = ctx.saved_tensors
+        # the saved prologue handle (slot [7]=tile_to_expert, [9]=group_lens, [10]=group_offs)
+        # followed by the cloned symm buffers / operands.
+        handle = tuple(saved[: ctx.handle_len])
+        saved_x, l1_out, dispatch_weight_in_buf, w1, w2, topk_idx = saved[ctx.handle_len :]
+        # block_m-padded per-expert lengths / prefix for the variable-K wgrads
+        group_lens, group_offs = handle[9], handle[10]
         symm = ctx.symm
         T, K, I = ctx.num_tokens, ctx.num_topk, ctx.inter
         dy = grad_y.contiguous().to(torch.bfloat16)
@@ -240,13 +194,12 @@ class MegaMoEFusedFunction(torch.autograd.Function):
         # prologue barrier), so the reuse does not race; pool/comb are likewise freed by forward
         # long before backward reuses them. (Holds while per-iter rank skew < ~one pass.)
         # dispatch dy into the pool (-> d_l2y, unweighted), then d_swiglu = d_l2y @ w2 (NN).
-        # reuse the forward's plan (no prologue) via the rebuilt handle.
-        dy_handle = MegaDispatchHandle(plan, tile_to_expert, tile_expected, symm)
+        # reuse the forward's handle (no prologue) via the rebuilt handle tuple.
         d_swiglu, _ = dispatch_grouped_gemm_impl(
             dy,
             w2,
             _FLYDSL,
-            handle=dy_handle,
+            handle=handle,
             layout="nn",
             BM=symm.block_m,
             BN=symm.block_n,
@@ -268,6 +221,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
         )
 
         # ===== dW2 = d_l2y^T @ act_w (variable-K wgrad; weight already folded into act_w) =====
+        # handle carries int64 group meta -> no cast
         dW2 = grouped_gemm_variable_k_impl(
             d_l2y,
             act_w,
@@ -289,16 +243,19 @@ class MegaMoEFusedFunction(torch.autograd.Function):
         # the same non-dropped slots -> already 0 here) -> none need a host zero. No STEP3 barrier:
         # the STEP1 barrier already drained all ranks' forward (frees comb/barrier_local), and the
         # STEP1 cross-rank dispatch couples ranks enough for the no-wait reduce's push-before-read.
-        # CU split tunable via env; reduce runs on empty GEMM blocks so dedicated region defaults to 0
-        _combine_cu = int(os.environ.get("MEGA_COMBINE_CU", "64"))
+        # STEP3 is GEMM-bound (K=2I, twice the forward), so the combine fully hides under the
+        # GEMM with FEWER dedicated combine CUs -> the GEMM keeps more CUs. (Forward STEP4 is
+        # combine-bound and wants 64; sharing one value left ~0.4ms of GEMM CU-starvation here.)
+        # Separate env MEGA_COMBINE_CU_BWD (default 20, swept best); reduce on empty GEMM blocks.
+        _combine_cu = int(os.environ.get("MEGA_COMBINE_CU_BWD", "20"))
         _reduce_cu = int(os.environ.get("MEGA_REDUCE_CU", "0"))
         # combine scatters grad_gate; the reduce folds masked d_topk_w and returns dx [T, hidden]
         dx, d_topk_w_flat = grouped_gemm_combine_impl(
             grad_l1,
             w1,
-            tile_to_expert,
+            list(handle),
             _FLYDSL,
-            topk_indices=topk_idx.to(torch.int32).contiguous().view(-1),
+            topk_indices=topk_idx.contiguous().view(-1),
             topk_weights=None,
             grad_gate=grad_gate,
             num_combine_cu=_combine_cu,
@@ -308,17 +265,19 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             BN=symm.block_n,
         )
 
-        # ===== dW1 = grad_l1^T @ pool(x) (variable-K wgrad) =====
-        dW1 = grouped_gemm_variable_k_impl(
+        # ===== dW1 = pool(x)^T @ grad_l1 (variable-K TN wgrad) =====
+        # fwd saved raw x (not the pool clone) -> re-dispatch it into the pool and fuse the
+        # TN wgrad: dW1[g] = x_pool[g]^T @ grad_l1[g]. trans_c stores [G, 2I, H] (W1-native).
+        # tn dispatch & wgrad touch independent data; group_offs rides the handle slot [10].
+        dW1, _ = dispatch_grouped_gemm_impl(
+            saved_x,
             grad_l1,
-            saved_pool,
-            group_lens,
-            group_offs,
-            trans_a=True,
-            trans_b=False,
-            trans_c=False,
-            num_cu=None,
-            default_backend=triton_be,
+            _FLYDSL,
+            handle=handle,
+            layout="tn",
+            trans_c=True,
+            BM=symm.block_m,
+            BN=symm.block_n,
         )
 
         # d_topk_w[t,k]: produced (masked + decoupled into a fresh buffer) by the combine reduce;
