@@ -184,7 +184,16 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         # contraction = N (zero-padded to 128 by the quantizer); output free dim K
         # stays logical (kernel `% N` + `c_mask`).
         grad_a = grouped_gemm_fp4_impl(
-            go_row, b_col, go_row_s, b_col_s, group_offs, K, _pad_contraction(N), num_cu, out_dtype, group_offs
+            go_row,
+            b_col,
+            go_row_s,
+            b_col_s,
+            group_offs,
+            K,
+            _pad_contraction(N),
+            num_cu,
+            out_dtype,
+            group_offs,
         )
 
         # --- wgrad: grad_b[g] = gradO_col(rht=T) @ A_col(rht=T)^T, contract M_g -> [G, N, K] ---

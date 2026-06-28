@@ -276,9 +276,7 @@ def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, repeats
 
     device = "cuda:0"
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    print(
-        f"\n[deterministic] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, balance={balance}"
-    )
+    print(f"\n[deterministic] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, balance={balance}")
 
     a0 = torch.randn((B * M, K), dtype=dtype, device=device)
     b0 = torch.randn((B, N, K), dtype=dtype, device=device)

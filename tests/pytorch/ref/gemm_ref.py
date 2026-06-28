@@ -12,17 +12,8 @@ import torch.nn as nn
 
 def grouped_gemm_ref(a, b, seg_lens, trans_b=True):
     # NOTE: the per-group matmul is accumulated in fp32 (operands upcast, result
-    # cast back to ``a.dtype``) for two reasons:
-    #   1. Correctness: an fp32-accumulated golden is the right reference for a
-    #      low-precision (fp4/fp8) product comparison.
-    #   2. Robustness: on ROCm/hipBLASLt a *bf16* NT GEMM (row-major A @ a
-    #      transposed, column-major B) selects a kernel that reads out of bounds
-    #      for some odd group M (e.g. a 2078-row slice with N=2816, K=2048),
-    #      hard-faulting the GPU ("Memory access fault ... Reason: Unknown") in
-    #      both the fwd matmul and the autograd bwd (which re-introduces a
-    #      transposed bf16 operand). Running in fp32 dodges the bad bf16 kernel.
-    #      The product kernel under test runs on Triton, so only this reference
-    #      hit the library bug.
+    # cast back to ``a.dtype``): an fp32-accumulated golden is the right reference
+    # for a low-precision (fp4/fp8) product comparison.
     seg_lens = seg_lens.cpu().numpy()
     out = []
     start = 0

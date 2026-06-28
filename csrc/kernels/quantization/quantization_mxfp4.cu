@@ -634,12 +634,14 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
     const int64_t colwise_scale_per_group_stride = 0) {
     // Per-group offsets for batched (3D) input (no-op when launched with
     // grid_z == 1); each blockIdx.z slice quantizes one (M, N) weight group.
-    const int      g             = blockIdx.z;
+    const int g                     = blockIdx.z;
     const DType *__restrict__ input = input_base + (int64_t) g * input_per_group_stride;
-    uint8_t *__restrict__ rowwise_fp4 = rowwise_fp4_base + (int64_t) g * rowwise_fp4_per_group_stride;
+    uint8_t *__restrict__ rowwise_fp4 =
+        rowwise_fp4_base + (int64_t) g * rowwise_fp4_per_group_stride;
     uint8_t *__restrict__ rowwise_scale =
         rowwise_scale_base + (int64_t) g * rowwise_scale_per_group_stride;
-    uint8_t *__restrict__ colwise_fp4 = colwise_fp4_base + (int64_t) g * colwise_fp4_per_group_stride;
+    uint8_t *__restrict__ colwise_fp4 =
+        colwise_fp4_base + (int64_t) g * colwise_fp4_per_group_stride;
     uint8_t *__restrict__ colwise_scale =
         colwise_scale_base + (int64_t) g * colwise_scale_per_group_stride;
 
@@ -1312,7 +1314,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp4_d
 
     const int tid           = threadIdx.x;
     const int warp_id       = tid / WARP_SIZE;
-    const int lane_id        = tid % WARP_SIZE;
+    const int lane_id       = tid % WARP_SIZE;
     const int row_in_warp   = lane_id / THREADS_PER_ROW;
     const int thread_in_row = lane_id % THREADS_PER_ROW;
 
@@ -1427,9 +1429,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp4_d
 
             const int global_row = tile_m + pass * ROWS_PER_PASS + row_in_warp;
             if (global_row < real_end_in_pad) {
-                packed_uint16x4_to_floatx4<kIshalf>(r_tile[pass], r_rowwise_vals[pass][0],
-                                                    r_rowwise_vals[pass][1], r_rowwise_vals[pass][2],
-                                                    r_rowwise_vals[pass][3]);
+                packed_uint16x4_to_floatx4<kIshalf>(
+                    r_tile[pass], r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
+                    r_rowwise_vals[pass][2], r_rowwise_vals[pass][3]);
                 if constexpr (ROWWISE_USE_RHT) {
                     rht16_inplace(r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
                                   r_rowwise_vals[pass][2], r_rowwise_vals[pass][3], thread_in_row);
@@ -1485,11 +1487,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp4_d
                     uint16_t fp4x4;
                     if constexpr (ROWWISE_USE_SR) {
                         uint32_t rng = sr_hash(sr_seed ^ (blockDim.x * blockIdx.x + threadIdx.x));
-                        fp4x4 = cvt_f32x4_to_fp4x4_sr(r_rowwise_vals[pass][0],
-                                                      r_rowwise_vals[pass][1],
-                                                      r_rowwise_vals[pass][2],
-                                                      r_rowwise_vals[pass][3],
-                                                      r_rowwise_scale_native[pass], rng);
+                        fp4x4 =
+                            cvt_f32x4_to_fp4x4_sr(r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
+                                                  r_rowwise_vals[pass][2], r_rowwise_vals[pass][3],
+                                                  r_rowwise_scale_native[pass], rng);
                     } else {
                         fp4x4 = cvt_f32x4_to_fp4x4(r_rowwise_vals[pass][0], r_rowwise_vals[pass][1],
                                                    r_rowwise_vals[pass][2], r_rowwise_vals[pass][3],
@@ -1595,21 +1596,19 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp4_d
                     uint16_t fp4x4;
                     if constexpr (COLWISE_USE_SR) {
                         uint32_t rng = sr_hash(sr_seed ^ (blockDim.x * blockIdx.x + threadIdx.x));
-                        fp4x4 = cvt_f32x4_to_fp4x4_sr(r_colwise_vals[pass][0],
-                                                      r_colwise_vals[pass][1],
-                                                      r_colwise_vals[pass][2],
-                                                      r_colwise_vals[pass][3],
-                                                      r_colwise_scale_native[pass], rng);
+                        fp4x4 =
+                            cvt_f32x4_to_fp4x4_sr(r_colwise_vals[pass][0], r_colwise_vals[pass][1],
+                                                  r_colwise_vals[pass][2], r_colwise_vals[pass][3],
+                                                  r_colwise_scale_native[pass], rng);
                     } else {
                         fp4x4 = cvt_f32x4_to_fp4x4(r_colwise_vals[pass][0], r_colwise_vals[pass][1],
                                                    r_colwise_vals[pass][2], r_colwise_vals[pass][3],
                                                    r_colwise_scale_native[pass]);
                     }
 
-                    s_colwise_fp4[chunk_n][pass * ROWS_PER_PASS + row_in_warp]
-                                 [chunk_m * THREADS_PER_ROW + thread_in_row] =
-                                     (global_row_base < M_pad_col) ? fp4x4
-                                                                   : static_cast<uint16_t>(0);
+                    s_colwise_fp4[chunk_n][pass * ROWS_PER_PASS +
+                                           row_in_warp][chunk_m * THREADS_PER_ROW + thread_in_row] =
+                        (global_row_base < M_pad_col) ? fp4x4 : static_cast<uint16_t>(0);
 
                     if (thread_in_row == 0) {
                         const int scale_col = block_m * NUM_CHUNKS_M + chunk_m;
@@ -1671,12 +1670,14 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp4_d
 }
 
 template <typename DType>
-void grouped_quantize_mxfp4_dual_impl(
-    const DType *input, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
-    dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, const int64_t *group_offs,
-    const int64_t *group_offs_padded_colwise, int G, int total_M, int N, int M_pad_col, int N_pad,
-    int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N, int colwise_scale_N,
-    ScalingRecipe rowwise_recipe, ScalingRecipe colwise_recipe, hipStream_t stream) {
+void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
+                                      uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
+                                      uint8_t *colwise_scale, const int64_t *group_offs,
+                                      const int64_t *group_offs_padded_colwise, int G, int total_M,
+                                      int N, int M_pad_col, int N_pad, int rowwise_scale_stride,
+                                      int colwise_scale_stride, int rowwise_scale_N,
+                                      int colwise_scale_N, ScalingRecipe rowwise_recipe,
+                                      ScalingRecipe colwise_recipe, hipStream_t stream) {
     PRIMUS_TURBO_CHECK(rowwise_recipe.shuffle_out == false && rowwise_recipe.shuffle_scale == false,
                        "grouped MXFP4 dual does not support shuffle");
     PRIMUS_TURBO_CHECK(colwise_recipe.shuffle_out == false && colwise_recipe.shuffle_scale == false,
@@ -1686,17 +1687,17 @@ void grouped_quantize_mxfp4_dual_impl(
     dim3           block(THREADS_PER_BLOCK);
     const uint32_t sr_seed = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
 
-#define GROUPED_QUANTIZE_MXFP4_DUAL_ARGS                                                            \
+#define GROUPED_QUANTIZE_MXFP4_DUAL_ARGS                                                           \
     input, reinterpret_cast<uint8_t *>(rowwise_output), rowwise_scale,                             \
         reinterpret_cast<uint8_t *>(colwise_output), colwise_scale, group_offs,                    \
         group_offs_padded_colwise, G, N, M_pad_col, N_pad, rowwise_scale_stride,                   \
         colwise_scale_stride, rowwise_scale_N, colwise_scale_N, sr_seed
 
-#define GROUPED_QUANTIZE_MXFP4_DUAL_LAUNCH(R_RHT, C_RHT, R_2D, C_2D, R_SR, C_SR)                    \
-    grouped_quantize_mxfp4_dual_kernel<DType, R_RHT, C_RHT, R_2D, C_2D, R_SR, C_SR>                 \
+#define GROUPED_QUANTIZE_MXFP4_DUAL_LAUNCH(R_RHT, C_RHT, R_2D, C_2D, R_SR, C_SR)                   \
+    grouped_quantize_mxfp4_dual_kernel<DType, R_RHT, C_RHT, R_2D, C_2D, R_SR, C_SR>                \
         <<<grid, block, 0, stream>>>(GROUPED_QUANTIZE_MXFP4_DUAL_ARGS)
 
-#define GROUPED_DISPATCH_2D(R_RHT, C_RHT, R_SR, C_SR)                                               \
+#define GROUPED_DISPATCH_2D(R_RHT, C_RHT, R_SR, C_SR)                                              \
     if (rowwise_recipe.use_2d_block) {                                                             \
         if (colwise_recipe.use_2d_block) {                                                         \
             GROUPED_QUANTIZE_MXFP4_DUAL_LAUNCH(R_RHT, C_RHT, true, true, R_SR, C_SR);              \
@@ -1711,7 +1712,7 @@ void grouped_quantize_mxfp4_dual_impl(
         }                                                                                          \
     }
 
-#define GROUPED_DISPATCH_RHT(R_SR, C_SR)                                                            \
+#define GROUPED_DISPATCH_RHT(R_SR, C_SR)                                                           \
     if (rowwise_recipe.use_rht) {                                                                  \
         if (colwise_recipe.use_rht) {                                                              \
             GROUPED_DISPATCH_2D(true, true, R_SR, C_SR);                                           \
