@@ -19,7 +19,7 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e5m2,
 )
 from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import get_device_compute_capability, is_gfx1250
 from primus_turbo.pytorch.ops import grouped_gemm_fp8
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -978,3 +978,101 @@ def test_grouped_gemm_fp8_blockwise_zero_group_lens():
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+
+# ---------------------------------------------------------------------------
+# gfx1250 MXFP8 grouped GEMM on the hipBLASLt backend (NT-only). Exercises
+# GroupedGEMMFP8HipblasltBackend (fwd) + GroupedGEMMFP8VariableKHipblasltBackend
+# (wgrad); dgrad shares the dense hipBLASLt MX path. trans_b=True only (the
+# hipBLASLt mxfp8 GEMM is TN-layout-only on gfx1250).
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("trans_b", [True])
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp8_mx_blockwise_hipblaslt(B, M, NK, ori_dtype, format, trans_b, balance):
+    """MXFP8 grouped GEMM fwd + dgrad + wgrad on the hipBLASLt backend (gfx1250)."""
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+    if not is_gfx1250():
+        pytest.skip("hipBLASLt mxfp8 grouped GEMM is gfx1250 (TN-only)")
+    N, K = NK
+    _run_grouped_gemm_fp8_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        trans_b=trans_b,
+        balance=balance,
+        backend=BackendType.HIPBLASLT,
+        auto_tune=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fused MXFP8 grouped wgrad -> main_grad accumulate (fused_grouped_wgrad).
+# The per-expert main_grads are laid out as ONE contiguous fp32 block in REVERSE
+# expert order (mimics Megatron's grad buffer). Verifies the fused backward (1)
+# accumulates the wgrad into main_grad == the unfused grad_b, (2) sets
+# grad_added_to_main_grad, (3) leaves the expert leaves grad-free, and (4) keeps
+# dgrad (a.grad) unchanged.
+@pytest.mark.parametrize("B", [4, 8])
+@pytest.mark.parametrize("M", [256, 512])
+@pytest.mark.parametrize("NK", [(2048, 1536), (4096, 7168)])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
+def test_grouped_gemm_fp8_mx_fused_wgrad(B, M, NK, format):
+    from primus_turbo.pytorch.ops.grouped_gemm_fp8 import fused_grouped_wgrad
+
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+    N, K = NK
+    device = "cuda:0"
+    torch.manual_seed(42)
+    E = B
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    Mtot = int(group_lens.sum().item())
+    config = Float8QuantConfig(
+        format=format, granularity=ScalingGranularity.MX_BLOCKWISE, block_size=32, scale_dtype=ScaleDtype.E8M0
+    )
+
+    a = torch.randn((Mtot, K), dtype=torch.bfloat16, device=device, requires_grad=True)
+    w_init = torch.randn(E, N, K, dtype=torch.bfloat16, device=device)
+    weights = [torch.nn.Parameter(w_init[i].clone()) for i in range(E)]
+
+    # ---- unfused reference: grad_b via the standard backward ----
+    a_ref = a.detach().clone().requires_grad_(True)
+    b_ref = torch.stack([w.detach() for w in weights]).requires_grad_(True)
+    out_ref = grouped_gemm_fp8(a_ref, b_ref, group_lens, trans_b=True, config=config)
+    grad_out = torch.randn_like(out_ref)
+    out_ref.backward(grad_out)
+    wgrad_ref = b_ref.grad  # [E, N, K]
+    agrad_ref = a_ref.grad
+
+    # ---- contiguous fp32 main_grad block, REVERSE expert order (weight 0 highest addr) ----
+    block = torch.zeros(E, N, K, dtype=torch.float32, device=device)
+    for i, w in enumerate(weights):
+        w.main_grad = block[E - 1 - i]
+        w.grad_added_to_main_grad = False
+    b = torch.stack(weights)  # grad flows to the leaf weights
+
+    # ---- fused backward ----
+    with fused_grouped_wgrad(weights):
+        out = grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=config)
+        out.backward(grad_out)
+
+    for i, w in enumerate(weights):
+        assert w.grad_added_to_main_grad is True, f"expert {i} grad_added flag not set"
+        assert w.grad is None, f"expert {i} leaf got a .grad (fused path should bypass it)"
+        snr = compute_snr(wgrad_ref[i].float(), w.main_grad)
+        print(f"expert {i} fused-wgrad SNR: {snr:.2f} dB")
+        assert snr > 25, f"expert {i} fused wgrad mismatch vs unfused (SNR {snr:.2f})"
+
+    # dgrad (a.grad) must be unchanged by the wgrad fusion
+    assert compute_snr(agrad_ref, a.grad) > 25, "dgrad changed under fused wgrad"
