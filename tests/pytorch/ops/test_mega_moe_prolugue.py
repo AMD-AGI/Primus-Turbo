@@ -62,7 +62,7 @@ def _make_routing(num_tokens, num_topk, num_experts, seed, drop_frac=0.0):
 # EP reference: mirror the kernel's Phase-C table build for one rank, from the
 # all-gathered per-rank routing. C[s, e] = #pairs from source rank s to expert e.
 # ---------------------------------------------------------------------------
-def _ep_reference(all_idx, rank, num_topk, num_experts, world, block_m, pool_capacity):
+def _ep_reference(all_idx, rank, num_topk, num_experts, world, block_m, num_max_pool_tokens):
     epr = num_experts // world
     all_idx[0].shape[0]
     bm = block_m
@@ -111,7 +111,7 @@ def _ep_reference(all_idx, rank, num_topk, num_experts, world, block_m, pool_cap
             acc += int(count[ct])
 
     # tile_to_expert (local expert id, sentinel = epr) + expected (sources per block) for own experts
-    n_mblk = pool_capacity // bm
+    n_mblk = num_max_pool_tokens // bm
     ttg = torch.full((n_mblk,), epr, dtype=torch.int64)
     expected = torch.zeros(n_mblk, dtype=torch.int64)
     total_rows = 0
@@ -161,7 +161,7 @@ def _check_tables(
     world,
     rank,
     block_m,
-    pool_capacity,
+    num_max_pool_tokens,
 ):
     epr = num_experts // world
     # the 5 per-expert scratch tables live packed in the prologue's cached internal
@@ -342,7 +342,7 @@ def _prologue_kwargs(symm):
         rank=symm.rank,
         experts_per_rank=symm.num_experts // symm.world,
         block_m=symm.block_m,
-        pool_capacity=symm.pool_capacity,
+        num_max_pool_tokens=symm.num_max_pool_tokens,
     )
 
 
@@ -378,23 +378,23 @@ def _run(local_rank, world, args):
     if rank == 0:
         print(
             f"\n[cfg] world={world} T={T} K={K} E={E} BM={BM} "
-            f"pool_cap={symm.pool_capacity} drop={args.drop_frac}"
+            f"pool_cap={symm.num_max_pool_tokens} drop={args.drop_frac}"
         )
 
     # ---- correctness ----
     symm.group.barrier()
-    plan, tile_to_expert, tile_expected, _, _, num_pool_blocks, _ = dispatch_prologue(
+    plan, tile_to_expert, tile_expected, _, _, num_pool_blocks, _, *_ = dispatch_prologue(
         topk_idx, topk_w, **kwargs
     )
     torch.cuda.synchronize()
     symm.group.barrier()
-    assert num_pool_blocks == symm.pool_capacity // BM
+    assert num_pool_blocks == symm.num_max_pool_tokens // BM
     assert plan[0].shape == (E, 4)  # send_task_table: one row per comm task (== num_experts)
 
     all_idx = [torch.empty_like(topk_idx) for _ in range(world)]
     dist.all_gather(all_idx, topk_idx, group=group)
     all_idx = [t.cpu() for t in all_idx]
-    ref = _ep_reference(all_idx, rank, K, E, world, BM, symm.pool_capacity)
+    ref = _ep_reference(all_idx, rank, K, E, world, BM, symm.num_max_pool_tokens)
     _check_tables(
         symm,
         ref,
@@ -408,7 +408,7 @@ def _run(local_rank, world, args):
         world,
         rank,
         BM,
-        symm.pool_capacity,
+        symm.num_max_pool_tokens,
     )
     if rank == 0:
         print("[dispatch_prologue] correctness PASS (all ranks)")

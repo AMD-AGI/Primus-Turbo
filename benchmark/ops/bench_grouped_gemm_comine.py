@@ -49,13 +49,11 @@ from mega_utils import (  # noqa: E402
     dense_gemm_peak_ms,
     generate_input,
     global_weights,
+    grouped_gemm_bf16_only,
     print_header,
     print_stage,
 )
 
-from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (  # noqa: E402
-    grouped_gemm_bf16_only,
-)
 from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (  # noqa: E402
     combine_only,
     grouped_gemm_combine_bf16,
@@ -146,7 +144,7 @@ def profile_combine(group, args, mode, W1, W2):
                 lambda cu=cu: grouped_gemm_combine_bf16(
                     act,
                     inp.W2,
-                    tile_to_expert,
+                    inp.handle,
                     group,
                     topk_indices=topk_idx_flat,
                     topk_weights=topk_w_flat,
@@ -167,7 +165,7 @@ def profile_combine(group, args, mode, W1, W2):
         bwd_N, bwd_K = H, 2 * I  # weight [G, K=2I, N=H]
         bwd_flops = 2.0 * M_eff * bwd_N * bwd_K
         bwd_xgmi = remote_rows * H * 2  # H-wide push, equals the forward
-        grad_l1 = torch.randn(symm.pool_capacity, bwd_K, device="cuda", dtype=torch.bfloat16) / 8
+        grad_l1 = torch.randn(symm.num_max_pool_tokens, bwd_K, device="cuda", dtype=torch.bfloat16) / 8
 
         t_bwd_gemm = bench(
             lambda: grouped_gemm_bf16_only(
@@ -198,14 +196,16 @@ def profile_combine(group, args, mode, W1, W2):
                 iters=args.iters,
             )
         best_bwd_comb_cu = min(bwd_comb_sweep, key=bwd_comb_sweep.get)
-        # bwd fused = 3-role NN (GEMM + combine PUSH + unweighted dx reduce); weight rides grad_l1
+        # bwd fused = 3-role NN (GEMM + combine PUSH + unweighted dx reduce); weight rides grad_l1.
+        # GEMM-bound -> default to the low --bwd-combine-cu (more CUs for the GEMM); autotune sweeps.
+        bwd_cu_cands = cu_cands if args.autotune else (args.bwd_combine_cu,)
         bwd_fused_sweep = {}
-        for cu in cu_cands:
+        for cu in bwd_cu_cands:
             bwd_fused_sweep[cu] = bench(
                 lambda cu=cu: grouped_gemm_combine_bf16(
                     grad_l1,
                     inp.W1,
-                    tile_to_expert,
+                    inp.handle,
                     group,
                     topk_indices=topk_idx_flat,
                     topk_weights=None,
@@ -426,9 +426,12 @@ if __name__ == "__main__":
     ap.add_argument(
         "--num-reduce-cu",
         type=int,
-        default=32,
-        help="role-2 topk-reduce dedicated blocks for the fused 3-role kernel",
+        default=0,
+        help="role-2 topk-reduce dedicated blocks (0 = reduce on empty GEMM blocks = best)",
     )
+    # backward STEP3 is GEMM-bound (K=2I) -> fewer combine CUs leaves more CUs for the GEMM,
+    # the combine still hides (XGMI-BW-bound, ~16 CU saturates). Forward STEP4 stays at 64.
+    ap.add_argument("--bwd-combine-cu", type=int, default=20)
     ap.add_argument("--mode", choices=["load_balanced", "round_robin", "both"], default="both")
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--output", "-o", type=str, default=None)
