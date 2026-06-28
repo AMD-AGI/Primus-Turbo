@@ -26,10 +26,52 @@ import triton
 import triton.language as tl
 
 from primus_turbo.pytorch.core.low_precision import MXFP8_BLOCK_SIZE
+from primus_turbo.pytorch.core.utils import is_gfx1250
+
+# FP8 dtypes that use the E5M2 layout (everything else handled here is E4M3FN).
+_E5M2_DTYPES = {torch.float8_e5m2, torch.float8_e5m2fnuz}
 
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+@triton.jit
+def _fp8_to_f32(b, E5M2: tl.constexpr):
+    """Decode one FP8 code (held in a uint32 lane) to fp32 with pure integer/fp32 ops.
+
+    NOTE (gfx1250): Triton's native FP8->float path (loading a ``float8_*`` tensor, or
+    ``uint8.to(fp8, bitcast=True).to(float32)``) miscompiles on gfx1250 (wave32) and drops
+    ~half the elements of the tile (roundtrip rel_err ~= 1/sqrt(2)). Loading the raw bytes as
+    ``uint8`` and reconstructing the value with the bit-field math below avoids that broken
+    conversion entirely and is bit-exact vs. PyTorch for every finite code (plus Inf/NaN).
+    """
+    s = (b >> 7) & 0x1
+    sign = tl.where(s == 1, -1.0, 1.0)
+    if E5M2:
+        e = (b >> 2) & 0x1F
+        m = b & 0x3
+        ef = e.to(tl.float32)
+        mf = m.to(tl.float32) * 0.25  # mantissa / 2^2
+        norm = tl.exp2(ef - 15.0) * (1.0 + mf)
+        sub = tl.exp2(tl.full(b.shape, 1.0 - 15.0, tl.float32)) * mf
+        val = tl.where(e == 0, sub, norm)
+        is_inf = (e == 0x1F) & (m == 0)
+        is_nan = (e == 0x1F) & (m != 0)
+        val = tl.where(is_inf, float("inf"), val)
+        val = tl.where(is_nan, float("nan"), val)
+    else:
+        # E4M3FN (OCP): no Inf; only 0x7F / 0xFF (exp==0xF, mant==0x7) are NaN.
+        e = (b >> 3) & 0xF
+        m = b & 0x7
+        ef = e.to(tl.float32)
+        mf = m.to(tl.float32) * 0.125  # mantissa / 2^3
+        norm = tl.exp2(ef - 7.0) * (1.0 + mf)
+        sub = tl.exp2(tl.full(b.shape, 1.0 - 7.0, tl.float32)) * mf
+        val = tl.where(e == 0, sub, norm)
+        is_nan = (e == 0xF) & (m == 0x7)
+        val = tl.where(is_nan, float("nan"), val)
+    return sign * val
 
 
 # ===========================================================================
@@ -47,6 +89,8 @@ def dequantize_mxfp8_kernel(
     scale_stride,
     BLOCK_SIZE: tl.constexpr,
     ROWWISE: tl.constexpr,
+    E5M2: tl.constexpr,
+    BITDECODE: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
 ):
@@ -58,9 +102,15 @@ def dequantize_mxfp8_kernel(
     cols64 = cols.to(tl.int64)
 
     data_mask = (rows[:, None] < num_rows) & (cols[None, :] < row_length)
-    x = tl.load(x_ptr + rows64[:, None] * row_length + cols64[None, :], mask=data_mask, other=0.0).to(
-        tl.float32
-    )
+    x_off = rows64[:, None] * row_length + cols64[None, :]
+    if BITDECODE:
+        # gfx1250: x_ptr is the FP8 tensor viewed as uint8; decode manually
+        # (native Triton FP8->float miscompiles on gfx1250).
+        xb = tl.load(x_ptr + x_off, mask=data_mask, other=0).to(tl.uint32)
+        x = _fp8_to_f32(xb, E5M2)
+    else:
+        # other arches: x_ptr is the FP8 tensor; use Triton's native conversion.
+        x = tl.load(x_ptr + x_off, mask=data_mask, other=0.0).to(tl.float32)
 
     col_block = cols // BLOCK_SIZE
     scale_mask = (rows[:, None] < scale_m) & (col_block[None, :] < scale_n)
@@ -97,6 +147,8 @@ def grouped_dequantize_mxfp8_rowwise_kernel(
     scale_n,
     scale_stride,
     BLOCK_SIZE: tl.constexpr,
+    E5M2: tl.constexpr,
+    BITDECODE: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
 ):
@@ -115,7 +167,13 @@ def grouped_dequantize_mxfp8_rowwise_kernel(
         padded = tl.where(in_g, ps + (rows - s), padded)
 
     data_mask = (rows[:, None] < total_M) & (cols[None, :] < n_cols)
-    x = tl.load(x_ptr + padded[:, None] * n_cols + cols[None, :], mask=data_mask, other=0.0).to(tl.float32)
+    x_off = padded[:, None] * n_cols + cols[None, :]
+    if BITDECODE:
+        # gfx1250: decode FP8 bytes manually (native Triton FP8->float miscompiles).
+        xb = tl.load(x_ptr + x_off, mask=data_mask, other=0).to(tl.uint32)
+        x = _fp8_to_f32(xb, E5M2)
+    else:
+        x = tl.load(x_ptr + x_off, mask=data_mask, other=0.0).to(tl.float32)
 
     col_block = cols // BLOCK_SIZE
     scale_mask = (padded[:, None] < scale_m) & (col_block[None, :] < scale_n)
@@ -146,6 +204,8 @@ def grouped_dequantize_mxfp8_colwise_kernel(
     scale_n,
     scale_stride,
     BLOCK_SIZE: tl.constexpr,
+    E5M2: tl.constexpr,
+    BITDECODE: tl.constexpr,
     BN: tl.constexpr,
     BM: tl.constexpr,
 ):
@@ -168,7 +228,13 @@ def grouped_dequantize_mxfp8_colwise_kernel(
         compact = tl.where(is_real, s + local, compact)
 
     data_mask = (ns[:, None] < num_rows) & (ms_pad[None, :] < m_padded)
-    x = tl.load(x_ptr + ns[:, None] * m_padded + ms_pad[None, :], mask=data_mask, other=0.0).to(tl.float32)
+    x_off = ns[:, None] * m_padded + ms_pad[None, :]
+    if BITDECODE:
+        # gfx1250: decode FP8 bytes manually (native Triton FP8->float miscompiles).
+        xb = tl.load(x_ptr + x_off, mask=data_mask, other=0).to(tl.uint32)
+        x = _fp8_to_f32(xb, E5M2)
+    else:
+        x = tl.load(x_ptr + x_off, mask=data_mask, other=0.0).to(tl.float32)
 
     col_block = ms_pad // BLOCK_SIZE
     scale_mask = (ns[:, None] < scale_m) & (col_block[None, :] < scale_n)
@@ -216,6 +282,10 @@ def dequantize_mxfp8_triton(
     assert row_length % block_size == 0
 
     input_2d = input.reshape(num_rows, row_length)
+    # gfx1250: pass the FP8 codes as raw uint8 and bit-decode in-kernel (native Triton
+    # FP8->float miscompiles there). Other arches: pass the FP8 tensor (native convert).
+    gfx1250 = is_gfx1250()
+    x_arg = input_2d.view(torch.uint8) if gfx1250 else input_2d
     if is_batched:
         scale_2d = scale_inv.reshape(scale_inv.size(0) * scale_inv.size(1), scale_inv.size(2))
     else:
@@ -232,7 +302,7 @@ def dequantize_mxfp8_triton(
     BM, BN = 32, 128
     grid = (_cdiv(num_rows, BM), _cdiv(row_length, BN))
     dequantize_mxfp8_kernel[grid](
-        input_2d,
+        x_arg,
         out_2d,
         scale_u8,
         num_rows,
@@ -242,6 +312,8 @@ def dequantize_mxfp8_triton(
         scale_n,
         BLOCK_SIZE=block_size,
         ROWWISE=use_rowwise,
+        E5M2=input.dtype in _E5M2_DTYPES,
+        BITDECODE=gfx1250,
         BM=BM,
         BN=BN,
     )
@@ -282,6 +354,11 @@ def grouped_dequantize_mxfp8_triton(
 
     scale_u8 = scale_inv.contiguous().view(torch.uint8)
     scale_m, scale_n = scale_u8.size(0), scale_u8.size(1)
+    # gfx1250: pass FP8 codes as raw uint8 and bit-decode in-kernel (native Triton
+    # FP8->float miscompiles there). Other arches: pass the FP8 tensor (native convert).
+    gfx1250 = is_gfx1250()
+    x_arg = input.view(torch.uint8) if gfx1250 else input
+    is_e5m2 = input.dtype in _E5M2_DTYPES
 
     device = input.device
     output = torch.zeros((total_M, n_cols), device=device, dtype=dest_dtype)
@@ -290,7 +367,7 @@ def grouped_dequantize_mxfp8_triton(
         BM, BN = 32, 128
         grid = (_cdiv(total_M, BM), _cdiv(n_cols, BN))
         grouped_dequantize_mxfp8_rowwise_kernel[grid](
-            input,
+            x_arg,
             output,
             scale_u8,
             group_offs,
@@ -302,6 +379,8 @@ def grouped_dequantize_mxfp8_triton(
             scale_n,
             scale_n,
             BLOCK_SIZE=block_size,
+            E5M2=is_e5m2,
+            BITDECODE=gfx1250,
             BM=BM,
             BN=BN,
         )
@@ -309,7 +388,7 @@ def grouped_dequantize_mxfp8_triton(
         BN, BM = 32, 128
         grid = (_cdiv(num_rows, BN), _cdiv(row_length, BM))
         grouped_dequantize_mxfp8_colwise_kernel[grid](
-            input,
+            x_arg,
             output,
             scale_u8,
             group_offs,
@@ -322,6 +401,8 @@ def grouped_dequantize_mxfp8_triton(
             scale_n,
             scale_n,
             BLOCK_SIZE=block_size,
+            E5M2=is_e5m2,
+            BITDECODE=gfx1250,
             BN=BN,
             BM=BM,
         )
