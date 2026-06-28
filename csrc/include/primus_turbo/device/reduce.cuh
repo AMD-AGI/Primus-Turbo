@@ -171,12 +171,24 @@ template <template <class> class Func, typename T> PRIMUS_TURBO_DEVICE T BlockRe
  * Reference: AMD CDNA4 ISA, ds_swizzle_b32 (page 480)
  */
 
+// NOTE on the ``"memory"`` clobber below:
+//   ``ds_swizzle_b32`` is an LDS-pipe op whose result only becomes valid after
+//   ``s_waitcnt lgkmcnt(0)``. Without a ``"memory"`` clobber the compiler is
+//   free to software-pipeline / reorder consecutive swizzles (and intervening
+//   ``__shared__`` stores that bump the same ``lgkmcnt`` counter) across each
+//   other. When the producing tile's ``s_tile`` LDS stores are still in flight
+//   (the rowwise path has no ``__syncthreads`` before its reduction, unlike the
+//   colwise path) this reordering let a fraction (~1%) of per-row ``amax``
+//   reductions latch stale lane data, making the rowwise FP4 scale -- and thus
+//   the packed FP4 -- non-deterministic run-to-run. The clobber forces each
+//   swizzle+wait to act as a scheduling barrier so the reduction is bit-exact.
 PRIMUS_TURBO_DEVICE float ds_swizzle_xor1(float val) {
     float result;
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F\n\t"
                  "s_waitcnt lgkmcnt(0)"
                  : "=v"(result)
-                 : "v"(val));
+                 : "v"(val)
+                 : "memory");
     return result;
 }
 
@@ -185,7 +197,8 @@ PRIMUS_TURBO_DEVICE float ds_swizzle_xor2(float val) {
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F\n\t"
                  "s_waitcnt lgkmcnt(0)"
                  : "=v"(result)
-                 : "v"(val));
+                 : "v"(val)
+                 : "memory");
     return result;
 }
 
@@ -194,7 +207,8 @@ PRIMUS_TURBO_DEVICE float ds_swizzle_xor8(float val) {
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x201F\n\t"
                  "s_waitcnt lgkmcnt(0)"
                  : "=v"(result)
-                 : "v"(val));
+                 : "v"(val)
+                 : "memory");
     return result;
 }
 
@@ -203,7 +217,8 @@ PRIMUS_TURBO_DEVICE float ds_swizzle_xor16(float val) {
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x401F\n\t"
                  "s_waitcnt lgkmcnt(0)"
                  : "=v"(result)
-                 : "v"(val));
+                 : "v"(val)
+                 : "memory");
     return result;
 }
 
@@ -226,21 +241,36 @@ PRIMUS_TURBO_DEVICE float warp_reduce_max_8_dpp(float val) {
     uint32_t v = float_as_uint(val);
     uint32_t tmp;
 
+    // Each swizzle+wait is fused into a single ``"memory"``-clobbering asm so the
+    // compiler cannot pipeline/reorder the three reduction steps (or hoist
+    // in-flight ``__shared__`` stores between them). See the note on the
+    // ``ds_swizzle_xor*`` helpers: without this the per-row reduction is
+    // non-deterministic when the producing tile's LDS stores are still pending.
+
     // Step 1: Exchange with thread 4 positions away
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F" : "=v"(tmp) : "v"(v));
-    asm volatile("s_waitcnt lgkmcnt(0)" :::);
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F\n\t"
+                 "s_waitcnt lgkmcnt(0)"
+                 : "=v"(tmp)
+                 : "v"(v)
+                 : "memory");
     val = fmaxf(val, uint_as_float(tmp));
     v   = float_as_uint(val);
 
     // Step 2: Exchange with thread 2 positions away
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F" : "=v"(tmp) : "v"(v));
-    asm volatile("s_waitcnt lgkmcnt(0)" :::);
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F\n\t"
+                 "s_waitcnt lgkmcnt(0)"
+                 : "=v"(tmp)
+                 : "v"(v)
+                 : "memory");
     val = fmaxf(val, uint_as_float(tmp));
     v   = float_as_uint(val);
 
     // Step 3: Exchange with adjacent thread
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F" : "=v"(tmp) : "v"(v));
-    asm volatile("s_waitcnt lgkmcnt(0)" :::);
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F\n\t"
+                 "s_waitcnt lgkmcnt(0)"
+                 : "=v"(tmp)
+                 : "v"(v)
+                 : "memory");
     val = fmaxf(val, uint_as_float(tmp));
 
     return val;
