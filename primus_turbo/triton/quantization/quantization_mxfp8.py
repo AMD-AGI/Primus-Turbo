@@ -65,6 +65,57 @@ def _quantize_vals(x, scale_native, FP8_MAX: tl.constexpr):
     return tl.clamp(q, -FP8_MAX, FP8_MAX)
 
 
+@triton.jit
+def _f32_to_fp8(x, MBITS: tl.constexpr):
+    """Encode fp32 -> FP8 code (uint8 held in a uint32 lane) with pure integer/fp32 ops
+    -- the inverse of ``_fp8_to_f32``.
+
+    NOTE (gfx1250): Triton's native f32->FP8 cast (``q.to(float8_*)``) miscompiles on
+    gfx1250 (wave32) and drops lanes of the tile, the store-side twin of the
+    load-side bug worked around in ``_fp8_to_f32``. Building
+    the FP8 byte by hand and bitcast-storing it avoids the broken conversion entirely.
+    Normals use round-to-nearest-even on the fraction; subnormals round-to-nearest.
+    ``x`` is assumed already clamped to the format's finite range (see ``_quantize_vals``),
+    so there is no overflow-to-Inf to handle. Supports E4M3FN (MBITS=3) and E5M2 (MBITS=2).
+    """
+    BIAS: tl.constexpr = 15 if MBITS == 2 else 7
+    EBITS: tl.constexpr = 5 if MBITS == 2 else 4
+    # finite max exponent field: E5M2 reserves all-ones for Inf/NaN; E4M3FN has no Inf.
+    EFIELD_MAX: tl.constexpr = ((1 << EBITS) - 2) if MBITS == 2 else ((1 << EBITS) - 1)
+    MANT_MAX: tl.constexpr = (1 << MBITS) - 1
+    NSHIFT: tl.constexpr = 23 - MBITS
+    RBIAS: tl.constexpr = (1 << (NSHIFT - 1)) - 1            # round-to-nearest-even bias
+    SUB_INV: tl.constexpr = float(1 << (MBITS - 1 + BIAS))   # 1 / subnormal step
+    NAN_CODE: tl.constexpr = ((((1 << EBITS) - 1) << MBITS) | 0x1) if MBITS == 2 else 0x7F
+
+    a = tl.abs(x)
+    xb = x.to(tl.uint32, bitcast=True)
+    ab = a.to(tl.uint32, bitcast=True)
+    sign = (xb >> 31) & 0x1
+    f32m = ab & 0x7FFFFF
+    fe = ((ab >> 23) & 0xFF).to(tl.int32) - 127 + BIAS      # target biased FP8 exponent
+
+    # Normal (fe >= 1): round the 23-bit fraction down to MBITS bits, ties-to-even.
+    mr = (f32m + (RBIAS + ((f32m >> NSHIFT) & 1))) >> NSHIFT
+    carry = mr == (1 << MBITS)
+    fe_n = tl.where(carry, fe + 1, fe)
+    mr = tl.where(carry, 0, mr)
+    over = fe_n > EFIELD_MAX
+    fe_n = tl.where(over, EFIELD_MAX, fe_n)
+    mr = tl.where(over, MANT_MAX, mr)
+    code_n = (fe_n.to(tl.uint32) << MBITS) | mr.to(tl.uint32)
+
+    # Subnormal (fe <= 0): m = round(|x| / subnormal_step). m == 2^MBITS rolls up to the
+    # smallest normal (efield=1, m=0); int() of a non-negative float truncates == floor.
+    ms = tl.minimum((a * SUB_INV + 0.5).to(tl.int32), 1 << MBITS)
+    code_s = ms.to(tl.uint32)
+
+    code = tl.where(fe >= 1, code_n, code_s)
+    code = tl.where(a == 0.0, code * 0, code)
+    code = tl.where(a != a, code * 0 + NAN_CODE, code)
+    return (code | (sign << 7)).to(tl.uint8)
+
+
 # ---------------------------------------------------------------------------
 # Dense quantize (single direction)
 # ---------------------------------------------------------------------------
@@ -114,7 +165,7 @@ def quantize_mxfp8_rowwise_kernel(
     store_mask = (rows[:, None] < M) & (cols[None, :] < N_pad)
     tl.store(
         out_ptr + g * out_g_stride + rows64[:, None] * N_pad + cols64[None, :],
-        q.to(out_ptr.dtype.element_ty),
+        _f32_to_fp8(q, MBITS).to(out_ptr.dtype.element_ty, bitcast=True),
         mask=store_mask,
     )
     tl.store(
@@ -172,7 +223,7 @@ def quantize_mxfp8_colwise_kernel(
     store_mask = (ns[:, None] < N) & (ms[None, :] < M_pad)
     tl.store(
         out_ptr + g * out_g_stride + ns64[:, None] * M_pad + ms64[None, :],
-        qT.to(out_ptr.dtype.element_ty),
+        _f32_to_fp8(qT, MBITS).to(out_ptr.dtype.element_ty, bitcast=True),
         mask=store_mask,
     )
     tl.store(
@@ -252,7 +303,7 @@ def grouped_quantize_mxfp8_rowwise_kernel(
     store_mask = valid[:, None] & (cols[None, :] < N_pad)
     tl.store(
         out_ptr + rows_pad[:, None] * N_pad + cols64[None, :],
-        q.to(out_ptr.dtype.element_ty),
+        _f32_to_fp8(q, MBITS).to(out_ptr.dtype.element_ty, bitcast=True),
         mask=store_mask,
     )
     tl.store(
@@ -327,7 +378,7 @@ def grouped_quantize_mxfp8_colwise_kernel(
     store_mask = (ns[:, None] < N) & (ms_pad[None, :] < M_pad)
     tl.store(
         out_ptr + ns64[:, None] * M_pad + ms_pad[None, :],
-        qT.to(out_ptr.dtype.element_ty),
+        _f32_to_fp8(qT, MBITS).to(out_ptr.dtype.element_ty, bitcast=True),
         mask=store_mask,
     )
     tl.store(
