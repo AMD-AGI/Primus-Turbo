@@ -28,6 +28,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_dual_impl,
+    quantize_mxfp8_impl,
 )
 
 __all__ = ["gemm_fp8"]
@@ -439,6 +440,34 @@ class FP8GemmMXFunction(torch.autograd.Function):
         # Scale preshuffle is NOT done here: the quant emits raw E8M0 [dim, K//32]
         # scales and each GEMM backend implicitly preshuffles right before its own
         # kernel (FlyDSL preshuffle_ab_flydsl / turbo 16x4 / hipBLASLt vendor).
+
+        # Dual-cast path (raw bf16 inputs, no externally-provided transpose): a single
+        # dual-cast quant per operand emits BOTH the rowwise (fwd) and colwise (bwd
+        # transpose) raw E8M0 scales in one kernel -- avoids the dequant+requant a
+        # separate axis=-2 quant would cost. Operand pairing is identical to the
+        # generic path below; only the quant is fused.
+        if (
+            not isinstance(a, QuantizedTensor)
+            and not isinstance(b, QuantizedTensor)
+            and a_t is None
+            and b_t is None
+        ):
+            fp8_dtype = _get_fp8_dtype(config.format, True)
+            bs = config.block_size
+            gran = config.granularity.value
+            fly = BackendType.FLYDSL.value
+            a_qd, a_sp, a_cqd, a_csp = quantize_mxfp8_impl(a, fp8_dtype, None, bs, with_trans=True)
+            b_qd, b_sp, b_cqd, b_csp = quantize_mxfp8_impl(b, fp8_dtype, None, bs, with_trans=True)
+            out = gemm_fp8_impl(
+                a_qd, a_sp, False, b_qd, b_sp, True, out_dtype, False, granularity=gran, default_backend=fly
+            )
+            ctx.save_for_backward(a_cqd, a_csp, b_cqd, b_csp)
+            ctx.dual_cast = True
+            ctx.out_dtype = out_dtype
+            ctx.config = config
+            return out
+
+        ctx.dual_cast = False
         a_scaling_recipe = ScalingRecipe()
         if isinstance(a, QuantizedTensor):
             quantized_a = a
@@ -524,6 +553,45 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
+        if getattr(ctx, "dual_cast", False):
+            # Saved a/b colwise (transpose) raw E8M0 from forward's dual-cast. One
+            # dual-cast quant of grad_out gives both its rowwise (grad_a) and colwise
+            # (grad_b) operands. Same NT GEMMs as the generic path, fused quant.
+            a_cqd, a_csp, b_cqd, b_csp = ctx.saved_tensors
+            # reshape (not view): a strided grad_out (transpose upstream) would make
+            # the quant's contiguity assert trip.
+            grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
+            grad_dtype = _get_fp8_dtype(ctx.config.format, False)
+            bs = ctx.config.block_size
+            gran = ctx.config.granularity.value
+            fly = BackendType.FLYDSL.value
+            g_qd, g_sp, g_cqd, g_csp = quantize_mxfp8_impl(grad_out, grad_dtype, None, bs, with_trans=True)
+            grad_a = gemm_fp8_impl(
+                g_qd,
+                g_sp,
+                False,
+                b_cqd,
+                b_csp,
+                True,
+                ctx.out_dtype,
+                False,
+                granularity=gran,
+                default_backend=fly,
+            )
+            grad_b = gemm_fp8_impl(
+                g_cqd,
+                g_csp,
+                False,
+                a_cqd,
+                a_csp,
+                True,
+                ctx.out_dtype,
+                False,
+                granularity=gran,
+                default_backend=fly,
+            )
+            return grad_a, grad_b, None, None, None, None, None, None
+
         a_fp8_t, a_t_scale_inv, b_fp8_t, b_t_scale_inv = ctx.saved_tensors
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
