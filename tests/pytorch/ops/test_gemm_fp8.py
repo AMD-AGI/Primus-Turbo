@@ -431,13 +431,12 @@ def test_gemm_fp8_mx_flydsl(m, n, k, format, dtype):
 
 
 # Direct FlyDSL MXFP8 kernel test (NT only). Quant emits raw E8M0 [dim, K//32]
-# scales; the backend preshuffle (preshuffle_ab_flydsl) repacks them to the int32
-# layout the kernel consumes (A layout-1 / B-comb layout-3, broadcast). Covers
-# aligned + partial-tile tail (320/384).
+# scales; the GEMM itself fuses the A (layout-1) / B-comb (layout-3) preshuffle into
+# its launch, so the kernel takes the raw E8M0 scales directly. Covers aligned +
+# partial-tile tail (320/384).
 @pytest.mark.parametrize("m,n,k", [(256, 256, 256), (320, 384, 512)])
 def test_gemm_fp8_mx_flydsl_direct(m, n, k):
     from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
-    from primus_turbo.flydsl.utils.gemm_helper import preshuffle_ab_flydsl
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
         dequantize_mxfp8_impl,
         quantize_mxfp8_impl,
@@ -451,7 +450,6 @@ def test_gemm_fp8_mx_flydsl_direct(m, n, k):
 
     device = "cuda:0"
     torch.manual_seed(0)
-    n_tiles_a = 256 // 64  # BLOCK_M // 64 = 4
 
     a_f = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     b_f = torch.randn(n, k, device=device, dtype=torch.bfloat16)
@@ -460,16 +458,16 @@ def test_gemm_fp8_mx_flydsl_direct(m, n, k):
     aq, a_sc = quantize_mxfp8_impl(a_f, float8_e4m3, 1, 32)
     bq, b_sc = quantize_mxfp8_impl(b_f, float8_e4m3, 1, 32)
 
-    # Backend preshuffle: raw E8M0 -> int32 (A layout-1 / B-comb layout-3).
-    a_sp, b_sp = preshuffle_ab_flydsl(a_sc.view(torch.uint8), b_sc.view(torch.uint8), k, n_tiles_a)
-
     ref = (
         dequantize_mxfp8_impl(aq, torch.bfloat16, 1, 32, a_sc)
         @ dequantize_mxfp8_impl(bq, torch.bfloat16, 1, 32, b_sc).t()
     )
 
-    # NT: a[M,K] + preshuffled A-scale (int32 flat), b[N,K] + preshuffled B-scale (int32 flat)
-    out = gemm_mxfp8_flydsl_kernel(aq, a_sp, bq, b_sp, out_dtype=torch.bfloat16)
+    # NT: a[M,K] + raw E8M0 A-scale [M,K//32], b[N,K] + raw E8M0 B-scale [N,K//32];
+    # the GEMM fuses the scale preshuffle into its launch.
+    out = gemm_mxfp8_flydsl_kernel(
+        aq, a_sc.view(torch.uint8), bq, b_sc.view(torch.uint8), out_dtype=torch.bfloat16
+    )
     snr = compute_snr(ref, out)
     print(f"\n[mx_flydsl_direct nt] M={m} N={n} K={k} SNR={snr:.2f} dB")
     assert snr > 25, f"SNR too low: {snr:.2f}"

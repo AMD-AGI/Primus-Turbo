@@ -12,7 +12,6 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
 from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
-from primus_turbo.flydsl.utils.gemm_helper import preshuffle_ab_flydsl
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
@@ -460,13 +459,13 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
                 asp_ = torch.full((m_pad, k // 32), 127, dtype=torch.uint8, device=a.device)
                 asp_[:m_orig] = asc
                 a_scale_inv = asp_
-            # Fused LDS repack (FlyDSL). A needs M % 64 (padded above); B accepts any
-            # N % 16 (general-N handled by the kernel's cdiv(N,256)*4 sizing + row mask).
-            # preshuffle_ab_flydsl emits broadcast layout (pack=1).
-            a_sp, b_sp = preshuffle_ab_flydsl(
-                a_scale_inv.view(torch.uint8), b_scale_inv.view(torch.uint8), k, 4
+            # Raw E8M0 scales go straight to the GEMM: it fuses the A (layout-1) + B-comb
+            # (layout-3) LDS repack into its own launch (one @flyc.jit host stub does
+            # preshuffle then gemm on the same stream). A needs M % 64 (padded above); B
+            # accepts any N % 16 (general-N handled by the kernel's cdiv(N,256)*4 sizing).
+            out = gemm_mxfp8_flydsl_kernel(
+                a, a_scale_inv.view(torch.uint8), b, b_scale_inv.view(torch.uint8), out_dtype=out_dtype
             )
-            out = gemm_mxfp8_flydsl_kernel(a, a_sp, b, b_sp, out_dtype=out_dtype)
             if m_pad != m_orig:
                 out = out[:m_orig]
             return out.t().contiguous() if trans_c else out

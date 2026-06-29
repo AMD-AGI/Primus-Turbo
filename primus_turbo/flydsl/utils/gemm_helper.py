@@ -303,7 +303,7 @@ class MfmaScale16x16x128:
 
 class ScaleBComb:
     """Combined B scale loader (pairs with the combined-B preshuffle, layout 3:
-    ``preshuffle_scale_bcomb_flydsl`` / C++ ``compute_preshuffle_scale_index``).
+    ``build_preshuffle_ab_kernel`` B region / C++ ``compute_preshuffle_scale_index``).
 
     One dwordx4 per lane returns [s0,s1,s2,s3]; (s0,s1)=b0 sub-tiles, (s2,s3)=b1.
     """
@@ -342,7 +342,8 @@ class ScaleS2R:
 
     laid out int32 [DIM//16, K//128, 64]. For row-tile ``rt`` and K-iter ``k``
     the 64 lanes of a wave read 64 contiguous dwords. The A-operand preshuffle
-    (layout 1) is emitted by the quant / ``preshuffle_scale_flydsl``.
+    (layout 1) is produced by ``build_preshuffle_ab_kernel`` (A region), fused into
+    the mxfp8 GEMM launch.
     """
 
     def __init__(self, sp_tensor, dim, K, n_tiles):
@@ -764,26 +765,6 @@ class S2RLoaderTr:
         return [self._assemble(self._issue_one(lds_src, t, base_off)) for t in range_constexpr(self.n_tiles)]
 
 
-def get_compiled(cache: dict, launch, args):
-    """Cache compiled launcher by (id(launch), shapes/dtypes/ints).
-    Caller must keep ``launch`` alive (e.g. in _MXFP8_LAUNCH_CACHE): Python recycles
-    id() after GC, so a freed+reallocated launch at the same address returns a stale hit."""
-    key_parts = [id(launch)]
-    for a in args:
-        if isinstance(a, torch.Tensor):
-            key_parts.append((tuple(a.shape), a.dtype))
-        elif isinstance(a, int):
-            key_parts.append(a)
-        else:
-            key_parts.append(type(a).__name__)
-    key = tuple(key_parts)
-    cached = cache.get(key)
-    if cached is None:
-        cached = flyc.compile(launch, *args)
-        cache[key] = cached
-    return cached
-
-
 def block_mn(pid, num_pid_m, n_blocks, GM, GN):
     """Tile-id -> (block_m, block_n), resolved at trace time. GN==0: 1D GROUP_M
     super-row swizzle (block_m inner). GN>0: 2D band — N split into width-GN bands
@@ -857,9 +838,12 @@ def _robust_time(launch, args, warmup=250, reps=5, iters=50):
 # E8M0 scale preshuffle (FlyDSL, LDS-tiled): raw E8M0 [DIM,K//32] -> preshuffled int32.
 # Tile by k: coalesced load of 64 rows x KT cols into LDS, coalesced dwordx4 store of the
 # [KT,64,4] block (wave-lane transpose via LDS, both DRAM sides coalesced). n_tiles=4.
+#
+# The preshuffle is NOT a standalone launch: ``build_preshuffle_ab_kernel`` returns the
+# bare @flyc.kernel so the mxfp8 GEMM can launch it + the gemm kernel from ONE @flyc.jit
+# host stub (turbo-style single dispatch, scales repacked into a caller-owned workspace
+# in stream order right before the gemm reads them -- no separate Python/launch dispatch).
 
-_PRESHUF_LAUNCH_CACHE: dict = {}
-_PRESHUF_COMPILED_CACHE: dict = {}
 _PRESHUF_KT = 16  # k-tile (rows*KT dwords staged in LDS per workgroup)
 
 
@@ -920,38 +904,18 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK):
         _buffer_ops.buffer_store(vec.ir_value(), rout, ((grp * K128 + gk) * 64 + lane) * 4, mask=gk < K128)
 
 
-def _compile_preshuffle(layout: str, K128: int, KT: int = _PRESHUF_KT, BLK: int = 256):
-    is_a = layout == "a"
-    TILE = 64 * KT
-    n_kt = ceildiv(K128, KT)
+def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256):
+    """Build the fused A (layout 1) + B-comb (layout 3) scale-preshuffle @flyc.kernel.
 
-    @fx.struct
-    class Smem:
-        tile: fx.Array[fx.Int32, TILE, 16]
-
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
-    def kern(raw: fx.Tensor, sp: fx.Tensor, dim: fx.Int32, n_grp: fx.Int32):
-        bid = fx.block_idx.x
-        rin = _buffer_ops.create_buffer_resource(raw, max_size=False, num_records_bytes=dim * K128 * 4)
-        rout = _buffer_ops.create_buffer_resource(
-            sp, max_size=False, num_records_bytes=n_grp * K128 * 256 * 4
-        )
-        tile = fx.SharedAllocator().allocate(Smem).peek().tile
-        _emit_lds_repack(
-            is_a, bid // n_kt, (bid % n_kt) * KT, tile, rin, rout, dim, K128, KT, fx.thread_idx.x, BLK
-        )
-
-    @flyc.jit
-    def launch(raw: fx.Tensor, sp: fx.Tensor, dim: fx.Int32, n_grp: fx.Int32, stream: fx.Stream):
-        kern(raw, sp, dim, n_grp).launch(grid=(n_grp * n_kt, 1, 1), block=(BLK, 1, 1), stream=stream)
-
-    return launch
-
-
-def _compile_preshuffle_ab(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256):
-    # Fused A (layout 1) + B-comb (layout 3) in ONE launch. Region by block id:
-    # [0, a_blocks) -> A, [a_blocks, ..) -> B. bid is workgroup-uniform so the
-    # branch (with its LDS barrier) is divergence-free.
+    Returns ``(kern, n_kt)``. ``kern`` is a bare KernelFunction (NOT a launch): the
+    mxfp8 GEMM factory calls it inside its own @flyc.jit so the preshuffle + gemm
+    issue from a single host stub. One workgroup repacks one (group, KT-chunk) of
+    raw E8M0 [DIM, K//32] (viewed int32 [DIM, K128]) into the broadcast int32 layout
+    the gemm's ScaleS2R / ScaleBComb consume; region by block id ([0,a_blocks)->A,
+    rest->B), bid being workgroup-uniform so the branch + its LDS barrier are
+    divergence-free. n_kt = ceildiv(K128, KT) is the per-group block count; the
+    caller sizes the grid as ``a_blocks + b_ngrp * n_kt``.
+    """
     TILE = 64 * KT
     n_kt = ceildiv(K128, KT)
 
@@ -988,78 +952,4 @@ def _compile_preshuffle_ab(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256):
             bb = bid - a_blocks
             _emit_lds_repack(False, bb // n_kt, (bb % n_kt) * KT, tile, rin_b, rout_b, n, K128, KT, tid, BLK)
 
-    @flyc.jit
-    def launch(a_raw, b_raw, a_sp, b_sp, m, n, a_blocks, a_ngrp, b_ngrp, stream: fx.Stream):
-        kern(a_raw, b_raw, a_sp, b_sp, m, n, a_blocks, a_ngrp, b_ngrp).launch(
-            grid=(a_blocks + b_ngrp * n_kt, 1, 1), block=(BLK, 1, 1), stream=stream
-        )
-
-    return launch
-
-
-def _run_preshuffle(layout, K128, raw_i32, dim, n_grp, out):
-    lk = (layout, K128)
-    launch = _PRESHUF_LAUNCH_CACHE.get(lk)
-    if launch is None:
-        launch = _compile_preshuffle(layout, K128)
-        _PRESHUF_LAUNCH_CACHE[lk] = launch
-    args = (raw_i32, out, dim, n_grp, torch.cuda.current_stream())
-    get_compiled(_PRESHUF_COMPILED_CACHE, launch, args)(*args)
-    return out
-
-
-def preshuffle_scale_flydsl(e8m0, K: int, n_tiles: int = 4) -> torch.Tensor:
-    """A-operand (layout 1) preshuffle. ``e8m0`` [DIM, K//32] (uint8/e8m0, DIM % 64 == 0).
-    Returns flat int32 broadcast layout (each i32 = one E8M0 byte mirrored to all 4
-    byte-positions); consumed by the gemm's ``ScaleS2R``."""
-    DIM, Kb = e8m0.shape
-    K128 = K // 128
-    assert Kb == K // 32 and n_tiles == 4 and DIM % 64 == 0
-    raw = e8m0.contiguous().view(torch.int32).reshape(-1)
-    n_grp = DIM // 64
-    out = torch.empty(n_grp * K128 * 256, dtype=torch.int32, device=e8m0.device)
-    return _run_preshuffle("a", K128, raw, DIM, n_grp, out)
-
-
-def preshuffle_scale_bcomb_flydsl(e8m0, K: int) -> torch.Tensor:
-    """Combined-B (layout 3) preshuffle. ``e8m0`` [N, K//32] (uint8/e8m0, N % 16 == 0).
-    Returns flat int32. General-N (N % 256 != 0): the LDS-repack kernel sizes the buffer
-    by cdiv(N,256)*4 groups and masks source rows >= N (OOB -> 0 == 2^-127, dropped by the
-    gemm's StoreC col clamp), so partial 256-blocks / partial 32-col waves are handled."""
-    N, Kb = e8m0.shape
-    K128 = K // 128
-    assert Kb == K // 32 and N % 16 == 0
-    raw = e8m0.contiguous().view(torch.int32).reshape(-1)
-    n_grp = ((N + 255) // 256) * 4
-    out = torch.empty(n_grp * K128 * 256, dtype=torch.int32, device=e8m0.device)
-    return _run_preshuffle("bcomb", K128, raw, N, n_grp, out)
-
-
-def preshuffle_ab_flydsl(a_e8m0, b_e8m0, K: int, n_tiles: int = 4):
-    """A (layout 1) + B-comb (layout 3) preshuffle in ONE fused LDS-tiled launch.
-    Returns (a_sp, b_sp) flat int32. Single launch + single wrapper call avoids the
-    per-op Python/launch overhead that dominates small scale sizes.
-
-    A requires M % (16*n_tiles) == M % 64 == 0 (no row padding); B accepts any N % 16
-    (general-N handled by the kernel's cdiv(N,256)*4 sizing + source-row mask, see
-    ``preshuffle_scale_bcomb_flydsl``)."""
-    M, Ka = a_e8m0.shape
-    N, Kb = b_e8m0.shape
-    K128 = K // 128
-    assert Ka == K // 32 and Kb == K // 32 and n_tiles == 4 and M % 64 == 0 and N % 16 == 0
-    a_raw = a_e8m0.contiguous().view(torch.int32).reshape(-1)
-    b_raw = b_e8m0.contiguous().view(torch.int32).reshape(-1)
-    a_ngrp = M // 64
-    b_ngrp = ((N + 255) // 256) * 4
-    n_kt = ceildiv(K128, _PRESHUF_KT)
-    a_blocks = a_ngrp * n_kt
-    a_sp = torch.empty(a_ngrp * K128 * 256, dtype=torch.int32, device=a_e8m0.device)
-    b_sp = torch.empty(b_ngrp * K128 * 256, dtype=torch.int32, device=b_e8m0.device)
-    lk = ("ab", K128)
-    launch = _PRESHUF_LAUNCH_CACHE.get(lk)
-    if launch is None:
-        launch = _compile_preshuffle_ab(K128)
-        _PRESHUF_LAUNCH_CACHE[lk] = launch
-    args = (a_raw, b_raw, a_sp, b_sp, M, N, a_blocks, a_ngrp, b_ngrp, torch.cuda.current_stream())
-    get_compiled(_PRESHUF_COMPILED_CACHE, launch, args)(*args)
-    return a_sp, b_sp
+    return kern, n_kt
