@@ -694,12 +694,12 @@ class QuantizedTensorPair(NamedTuple):
     Wrapper for quantized tensors.
 
     Args:
-        data_rowwise: Row-wise quantized tensor.
-        data_colwise: Column-wise quantized tensor.
+        data: Row-wise quantized tensor.
+        data_t: Column-wise quantized tensor.
     """
 
-    data_rowwise: QuantizedTensor
-    data_colwise: Optional[QuantizedTensor] = None
+    data: QuantizedTensor
+    data_t: Optional[QuantizedTensor] = None
 
 
 def create_quantized_weight(
@@ -724,7 +724,7 @@ def create_quantized_weight(
 
         return weight_scaling_recipe
 
-    quantized_weight_rowwise = QuantizedTensor.quantize(
+    quantized_weight = QuantizedTensor.quantize(
         weight,
         dest_dtype=dest_dtype,
         granularity=quant_config.granularity,
@@ -733,14 +733,14 @@ def create_quantized_weight(
         axis=-1,
     )
 
-    quantized_weight_colwise = None
+    quantized_weight_t = None
     if need_cache_colwise:
         granularity = quant_config.granularity
         if granularity == ScalingGranularity.TENSORWISE:
-            quantized_weight_colwise = quantized_weight_rowwise.transpose(-2, -1)
+            quantized_weight_t = quantized_weight.transpose(-2, -1)
         elif granularity == ScalingGranularity.ROWWISE:
             # NOTE: rowwise quantization not support transpose, so we need to quantize the transposed weight manually.
-            quantized_weight_colwise = QuantizedTensor.quantize(
+            quantized_weight_t = QuantizedTensor.quantize(
                 weight.transpose(-2, -1),
                 dest_dtype=dest_dtype,
                 granularity=quant_config.granularity,
@@ -749,7 +749,7 @@ def create_quantized_weight(
                 axis=-2,
             )
         elif granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
-            quantized_weight_colwise = QuantizedTensor.quantize(
+            quantized_weight_t = QuantizedTensor.quantize(
                 weight,
                 dest_dtype=dest_dtype,
                 granularity=quant_config.granularity,
@@ -761,4 +761,4 @@ def create_quantized_weight(
         else:
             raise ValueError(f"Unsupported granularity: {granularity}")
 
-    return quantized_weight_rowwise, quantized_weight_colwise
+    return quantized_weight, quantized_weight_t

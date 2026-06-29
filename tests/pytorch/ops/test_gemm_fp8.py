@@ -429,8 +429,8 @@ def _run_gemm_fp8_quantized_tensor_test(
     c_ref.backward(grad_c)
 
     c = gemm_fp8(
-        QuantizedTensorPair(data_rowwise=qt_a, data_colwise=None),
-        QuantizedTensorPair(data_rowwise=qt_b, data_colwise=None),
+        QuantizedTensorPair(data=qt_a, data_t=None),
+        QuantizedTensorPair(data=qt_b, data_t=None),
         trans_a,
         trans_b,
         dtype,
