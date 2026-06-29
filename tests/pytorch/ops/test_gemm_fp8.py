@@ -430,13 +430,16 @@ def test_gemm_fp8_mx_flydsl(m, n, k, format, dtype):
     )
 
 
-# Direct FlyDSL MXFP8 kernel test (NT only). Scales are quant-emitted preshuffled
-# int32 (quantize_mxfp8_impl with ScalingRecipe preshuffle_layout). Covers aligned
-# + partial-tile tail (320/384). scale_pack=1 (broadcast layout).
+# Direct FlyDSL MXFP8 kernel test (NT only). Quant emits raw E8M0 [dim, K//32]
+# scales; the backend preshuffle (preshuffle_ab_flydsl) repacks them to the int32
+# layout the kernel consumes (A layout-1 / B-comb layout-3). Covers aligned +
+# partial-tile tail (320/384). scale_pack=1 (broadcast layout).
 @pytest.mark.parametrize("m,n,k", [(256, 256, 256), (320, 384, 512)])
 def test_gemm_fp8_mx_flydsl_direct(m, n, k):
     from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
+    from primus_turbo.flydsl.utils.gemm_helper import preshuffle_ab_flydsl
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        dequantize_mxfp8_impl,
         quantize_mxfp8_impl,
     )
 
@@ -453,37 +456,16 @@ def test_gemm_fp8_mx_flydsl_direct(m, n, k):
     a_f = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     b_f = torch.randn(n, k, device=device, dtype=torch.bfloat16)
 
-    # Quantize A: rowwise, preshuffle_layout=1 (A-broadcast), n_tiles=4
-    aq, a_sp, _, _ = quantize_mxfp8_impl(
-        a_f,
-        float8_e4m3,
-        None,
-        32,
-        with_trans=True,
-        scaling_recipe=ScalingRecipe(preshuffle_layout=1, preshuffle_n_tiles=n_tiles_a),
-        scaling_recipe_for_trans=ScalingRecipe(),
-    )
-    # Quantize B (stored as [N,K]): rowwise, preshuffle_layout=3 (B-comb-broadcast)
-    bq, b_sp, _, _ = quantize_mxfp8_impl(
-        b_f,
-        float8_e4m3,
-        None,
-        32,
-        with_trans=True,
-        scaling_recipe=ScalingRecipe(preshuffle_layout=3, preshuffle_n_tiles=4),
-        scaling_recipe_for_trans=ScalingRecipe(),
-    )
+    # Quantize to raw E8M0 [dim, K//32] scales (no preshuffle fused in the quant).
+    aq, a_sc = quantize_mxfp8_impl(a_f, float8_e4m3, 1, 32)
+    bq, b_sc = quantize_mxfp8_impl(b_f, float8_e4m3, 1, 32)
 
-    # Reference: dequantize via raw scales (not preshuffled)
-    aq_ref, a_sc_ref = quantize_mxfp8_impl(a_f, float8_e4m3, 1, 32)
-    bq_ref, b_sc_ref = quantize_mxfp8_impl(b_f, float8_e4m3, 1, 32)
-    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-        dequantize_mxfp8_impl,
-    )
+    # Backend preshuffle: raw E8M0 -> int32 (A layout-1 / B-comb layout-3).
+    a_sp, b_sp = preshuffle_ab_flydsl(a_sc.view(torch.uint8), b_sc.view(torch.uint8), k, n_tiles_a)
 
     ref = (
-        dequantize_mxfp8_impl(aq_ref, torch.bfloat16, 1, 32, a_sc_ref)
-        @ dequantize_mxfp8_impl(bq_ref, torch.bfloat16, 1, 32, b_sc_ref).t()
+        dequantize_mxfp8_impl(aq, torch.bfloat16, 1, 32, a_sc)
+        @ dequantize_mxfp8_impl(bq, torch.bfloat16, 1, 32, b_sc).t()
     )
 
     # NT: a[M,K] + preshuffled A-scale (int32 flat), b[N,K] + preshuffled B-scale (int32 flat)

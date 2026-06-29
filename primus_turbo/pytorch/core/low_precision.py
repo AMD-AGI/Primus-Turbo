@@ -161,12 +161,6 @@ class ScalingRecipe(NamedTuple):
     shuffle_scale: bool = False
     shuffle_out: bool = False
 
-    # FlyDSL mxfp8 GEMM preshuffle fused into scale write.
-    # preshuffle_layout: 0=off, 1=A-broadcast, 2=A-packed, 3=B-comb-broadcast, 4=B-comb-packed.
-    # preshuffle_n_tiles: sub-tile fanout (A: BLOCK_M//64 = 4; B: always 4).
-    preshuffle_layout: int = 0
-    preshuffle_n_tiles: int = 0
-
 
 @dataclass
 class Float8QuantConfig:

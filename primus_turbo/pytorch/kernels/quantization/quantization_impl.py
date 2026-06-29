@@ -433,10 +433,6 @@ def quantize_mxfp8_impl(
             scaling_recipe.shuffle_out,
             scaling_recipe_for_trans.shuffle_scale,
             scaling_recipe_for_trans.shuffle_out,
-            scaling_recipe.preshuffle_layout,
-            scaling_recipe.preshuffle_n_tiles,
-            scaling_recipe_for_trans.preshuffle_layout,
-            scaling_recipe_for_trans.preshuffle_n_tiles,
         )
     else:
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8(

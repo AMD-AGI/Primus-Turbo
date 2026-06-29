@@ -10,8 +10,6 @@ import torch
 
 from primus_turbo.pytorch.core.backend import (
     BackendType,
-    GlobalBackendManager,
-    PrecisionType,
 )
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
@@ -438,50 +436,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         assert trans_a == False and trans_b == True, "trans_a has to be False and trans_b has to be True"
 
-        # FlyDSL preshuffle fast path: FlyDSL target (MX default / set) and not
-        # autotuning -> dual-cast quant emits preshuffled int32 directly (no repack).
-        # Else (autotune / forced non-FlyDSL) -> raw-quant + dispatcher repack.
-        _be = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
-        _flydsl_target = _be is None or _be == BackendType.FLYDSL
-        # Preshuffle fast path only when every GEMM (fwd K, bwd k-dims M and N) is
-        # aligned to the 128 tile and >= 256, so the int32 layout feeds all three
-        # directly. Otherwise (K-tail / unaligned M,N) take the raw E8M0 path so
-        # execute() can zero-pad the contraction dim (int32 can't be padded).
-        _raw_in = not isinstance(a, QuantizedTensor) and not isinstance(b, QuantizedTensor)
-        _aligned = _raw_in and all(d >= 256 and d % 128 == 0 for d in (a.shape[-1], a.shape[-2], b.shape[-2]))
-        if _flydsl_target and _aligned and not GlobalBackendManager.auto_tune_enabled() and _raw_in:
-            from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-                quantize_mxfp8_impl,
-            )
-
-            def _R(layout):
-                return ScalingRecipe(preshuffle_layout=layout, preshuffle_n_tiles=4)
-
-            # Quant emits preshuffled int32 scales, K-byte-packed (A L2/L4, B L4/L4 ->
-            # pack=mxfp8_scale_pack(K)); routed via gemm_fp8_impl -> FlyDSL execute.
-            fp8_dtype = _get_fp8_dtype(config.format, True)
-            bs = config.block_size
-            a_qd, a_sp, a_cqd, a_csp = quantize_mxfp8_impl(a, fp8_dtype, None, bs, True, _R(2), _R(4))
-            b_qd, b_sp, b_cqd, b_csp = quantize_mxfp8_impl(b, fp8_dtype, None, bs, True, _R(4), _R(4))
-            out = gemm_fp8_impl(
-                a_qd,
-                a_sp,
-                False,
-                b_qd,
-                b_sp,
-                True,
-                out_dtype,
-                False,
-                granularity=config.granularity.value,
-                default_backend=BackendType.FLYDSL.value,
-            )
-            ctx.save_for_backward(a_cqd, a_csp, b_cqd, b_csp)
-            ctx.flydsl_mx = True
-            ctx.out_dtype = out_dtype
-            ctx.config = config
-            return out
-
-        ctx.flydsl_mx = False
+        # Scale preshuffle is NOT done here: the quant emits raw E8M0 [dim, K//32]
+        # scales and each GEMM backend implicitly preshuffles right before its own
+        # kernel (FlyDSL preshuffle_ab_flydsl / turbo 16x4 / hipBLASLt vendor).
         a_scaling_recipe = ScalingRecipe()
         if isinstance(a, QuantizedTensor):
             quantized_a = a
@@ -567,52 +524,6 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        # FlyDSL preshuffle fast path: grad_out dual-cast (row=L1, col=L1) -> 2 NT GEMMs.
-        # grad_a = NT(grad_out, b_col)   grad_b = NT(grad_out_col, a_col)
-        if getattr(ctx, "flydsl_mx", False):
-            from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-                quantize_mxfp8_impl,
-            )
-
-            def _R(layout):
-                return ScalingRecipe(preshuffle_layout=layout, preshuffle_n_tiles=4)
-
-            a_cqd, a_csp, b_cqd, b_csp = ctx.saved_tensors
-            # reshape (not view): a strided grad_out (e.g. transpose upstream) would
-            # make view() throw before .contiguous() can run.
-            grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
-            grad_dtype = _get_fp8_dtype(ctx.config.format, False)
-            bs = ctx.config.block_size
-            g_qd, g_sp, g_cqd, g_csp = quantize_mxfp8_impl(grad_out, grad_dtype, None, bs, True, _R(2), _R(2))
-            gran = ctx.config.granularity.value
-            fly = BackendType.FLYDSL.value
-            # grad_a = NT(grad_out, b_col)  grad_b = NT(grad_out_col, a_col); all via dispatcher.
-            grad_a = gemm_fp8_impl(
-                g_qd,
-                g_sp,
-                False,
-                b_cqd,
-                b_csp,
-                True,
-                ctx.out_dtype,
-                False,
-                granularity=gran,
-                default_backend=fly,
-            )
-            grad_b = gemm_fp8_impl(
-                g_cqd,
-                g_csp,
-                False,
-                a_cqd,
-                a_csp,
-                True,
-                ctx.out_dtype,
-                False,
-                granularity=gran,
-                default_backend=fly,
-            )
-            return grad_a, grad_b, None, None, None, None, None, None
-
         a_fp8_t, a_t_scale_inv, b_fp8_t, b_t_scale_inv = ctx.saved_tensors
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)

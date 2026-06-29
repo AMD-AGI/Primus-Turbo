@@ -431,9 +431,9 @@ _MXFP8_AT_CACHE: dict = {}  # (M, N, K, bm, gm, xcd, layout, gn) -> [raw_launch,
 # BLOCK_M=128 doubles the tiles (fills the CUs on skinny/small shapes), 256 wins big
 # square / B-streaming; GROUP_M is the per-XCD L2-reuse super-block depth.
 # BLOCK_M fixed at 256 (n_tiles_a = 256//64 = 4): the A-scale preshuffle layout is
-# bm-dependent, and scales are now emitted preshuffled by the quant (no host repack),
-# so the gemm cannot re-pack per candidate -> BLOCK_M must be constant. autotune sweeps
-# only GROUP_M / num_xcd / group_n (none of which change the scale layout).
+# bm-dependent and the backend preshuffles the raw E8M0 scales to int32 once before
+# this kernel, so the gemm cannot re-pack per candidate -> BLOCK_M must be constant.
+# autotune sweeps only GROUP_M / num_xcd / group_n (none of which change the layout).
 _MXFP8_NT_CANDIDATES = [
     (256, 4, 8),
     (256, 8, 8),
