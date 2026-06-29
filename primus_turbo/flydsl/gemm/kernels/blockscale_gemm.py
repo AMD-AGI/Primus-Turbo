@@ -45,6 +45,7 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from primus_turbo.flydsl.gemm.kernels._pipeline.mfma_epilogues import mfma_epilog
 from primus_turbo.flydsl.gemm.kernels._pipeline.mfma_preshuffle_pipeline import (
     _buffer_load_vec,
+    block2d_setprio_iter_sched,
     buffer_copy_gmem16_dwordx4,
     crd2idx,
     lds_store_8b_xor16,
@@ -776,13 +777,28 @@ def compile_blockscale_gemm(
                 dswr_tail = sche_iters
             dswr_start = sche_iters - dswr_tail
 
-            for sche_i in range_constexpr(sche_iters):
-                rocdl.sched_vmem(1)
-                rocdl.sched_mfma(mfma_group)
-                rocdl.sched_dsrd(1)
-                rocdl.sched_mfma(mfma_group)
-                if const_expr(sche_i >= dswr_start - 1):
-                    rocdl.sched_dswr(1)
+            if const_expr(scale_b_mode == "block2d"):
+                # Refined half-iteration ping/pong: same hint counts, but each MFMA
+                # sub-group is s_setprio-bracketed so the matrix unit holds issue
+                # priority while next-tile VMEM, DS-read, and the block-scale VALU
+                # run in the MFMA shadow. block2d (fwd / dgrad) only; the col1d
+                # (wgrad) path below is left byte-for-byte unchanged.
+                block2d_setprio_iter_sched(
+                    rocdl,
+                    range_constexpr,
+                    const_expr,
+                    sche_iters=sche_iters,
+                    mfma_group=mfma_group,
+                    dswr_start=dswr_start,
+                )
+            else:
+                for sche_i in range_constexpr(sche_iters):
+                    rocdl.sched_vmem(1)
+                    rocdl.sched_mfma(mfma_group)
+                    rocdl.sched_dsrd(1)
+                    rocdl.sched_mfma(mfma_group)
+                    if const_expr(sche_i >= dswr_start - 1):
+                        rocdl.sched_dswr(1)
             rocdl.sched_barrier(0)
 
         def prefetch_a0_pack(lds_buffer):
@@ -986,21 +1002,36 @@ def compile_blockscale_fwd_gemm(**kwargs):
 
 
 def compile_blockscale_dgrad_gemm(**kwargs):
-    """dgrad / NN: 2D-block scale_b, L2 grouped rasterization (GROUP_M=8).
+    """dgrad / NN: 2D-block scale_b, L2 grouped rasterization (GROUP_M=16).
 
     Identical kernel to forward; the launcher feeds the transposed weight + scale
     so the general ``C[M,OUT]=A@B^T`` form computes ``grad_a[M,K]``.
     """
     kwargs.pop("scale_b_mode", None)
-    kwargs.pop("l2_group_m", None)
-    return compile_blockscale_gemm(scale_b_mode="block2d", l2_group_m=8, **kwargs)
+    l2_group_m = kwargs.pop("l2_group_m", 16)
+    return compile_blockscale_gemm(scale_b_mode="block2d", l2_group_m=l2_group_m, **kwargs)
 
 
 def compile_blockscale_wgrad_gemm(**kwargs):
-    """wgrad / TN: per-output-column (1Dx1D) scale_b, plain rasterization (no L2 grouping)."""
+    """wgrad / TN: per-output-column (1Dx1D) scale_b, L2 grouped rasterization (GROUP_M=16).
+
+    Round-46: the col1d/wgrad kernel previously ran with ``l2_group_m=1`` (plain
+    row-major launch, kernel ``bs_col1d_l2g1``) while the block2d fwd/dgrad path
+    used the R4-accepted super-block grouping (``l2g16``). PROFILE round-45 marks
+    bs_col1d as the campaign's #1 latency-bound bottleneck (LDS-wait/wave 105.5 on
+    an under-populated ~2-wave grid). The grouped pid->tile rasterization already
+    implemented inside ``compile_blockscale_gemm`` (lines ~239-270) is
+    ``scale_b_mode``-agnostic and a pure tail-safe workgroup-id permutation: every
+    output tile is still computed exactly once with unchanged intra-tile
+    accumulation order, so the wgrad result stays bit-identical while consecutive
+    col1d tiles that share the same a^T / grad_out panel stay hot in the same L2
+    slice. Enabling it here mirrors the dgrad win on the one kernel that had
+    grouping disabled, and leaves per-wave VGPR/LDS footprint untouched (cannot
+    trip the occupancy wall).
+    """
     kwargs.pop("scale_b_mode", None)
-    kwargs.pop("l2_group_m", None)
-    return compile_blockscale_gemm(scale_b_mode="col1d", l2_group_m=1, **kwargs)
+    l2_group_m = kwargs.pop("l2_group_m", 16)
+    return compile_blockscale_gemm(scale_b_mode="col1d", l2_group_m=l2_group_m, **kwargs)
 
 
 __all__ = [

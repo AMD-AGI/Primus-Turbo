@@ -513,6 +513,71 @@ def load_b_pack_k32(
     return vector.extract(v64, static_position=[0], dynamic_position=[])
 
 
+def block2d_setprio_iter_sched(
+    rocdl,
+    range_constexpr,
+    const_expr,
+    *,
+    sche_iters: int,
+    mfma_group: int,
+    dswr_start: int,
+):
+    """Finer quarter-iteration ping/pong schedule for the block2d (fwd / dgrad) hot loop.
+
+    Emits the SAME per-iteration scheduling-hint counts as the coarse stream
+    (``sched_vmem(1)``, a total of ``2 * mfma_group`` ``sched_mfma`` hints,
+    ``sched_dsrd(1)``, optional ``sched_dswr(1)``), but splits the matrix work into
+    FOUR ``s_setprio``-bracketed ``sched_mfma`` sub-groups (``g_lo, g_hi, g_lo, g_hi``
+    with ``g_lo = mfma_group // 2`` and ``g_hi = mfma_group - g_lo``, so the four sum
+    to exactly ``2 * mfma_group``) instead of two coarse ``mfma_group`` sub-groups.
+    The next-tile VMEM (B / scale) load, the current-tile DS-read, and the optional
+    DS-write hint are interleaved BETWEEN those finer sub-groups, pushing the LDS-read
+    and fp32 block-scale bookkeeping VALU (block2d VALU is ~69% of insts vs ~12% MFMA)
+    deeper into the matrix-unit shadow and tightening MFMA issue cadence, which raises
+    MFMA busy fraction.
+
+    This is a pure scheduling / priority hint stream: it emits no data ops and no
+    waitcnt, so the GEMM result is bit-identical to the coarse schedule. When
+    ``mfma_group < 2`` (cannot be halved) the function falls back to the coarse
+    two-sub-group ping/pong so ``sched_mfma(0)`` is never emitted.
+    """
+    g_lo = mfma_group // 2
+    g_hi = mfma_group - g_lo
+    for sche_i in range_constexpr(sche_iters):
+        rocdl.sched_vmem(1)
+        if const_expr(mfma_group >= 2):
+            # quarter-iteration 1
+            rocdl.s_setprio(1)
+            rocdl.sched_mfma(g_lo)
+            rocdl.s_setprio(0)
+            # quarter-iteration 2
+            rocdl.s_setprio(1)
+            rocdl.sched_mfma(g_hi)
+            rocdl.s_setprio(0)
+            rocdl.sched_dsrd(1)
+            # quarter-iteration 3
+            rocdl.s_setprio(1)
+            rocdl.sched_mfma(g_lo)
+            rocdl.s_setprio(0)
+            if const_expr(sche_i >= dswr_start - 1):
+                rocdl.sched_dswr(1)
+            # quarter-iteration 4
+            rocdl.s_setprio(1)
+            rocdl.sched_mfma(g_hi)
+            rocdl.s_setprio(0)
+        else:
+            # mfma_group < 2: coarse two-sub-group ping/pong (no half split)
+            rocdl.s_setprio(1)
+            rocdl.sched_mfma(mfma_group)
+            rocdl.s_setprio(0)
+            rocdl.sched_dsrd(1)
+            rocdl.s_setprio(1)
+            rocdl.sched_mfma(mfma_group)
+            rocdl.s_setprio(0)
+            if const_expr(sche_i >= dswr_start - 1):
+                rocdl.sched_dswr(1)
+
+
 def tile_chunk_coord_i32(
     arith,
     *,
@@ -734,6 +799,7 @@ def xcd_remap_bx_by(
 __all__ = [
     "PreshuffleBLayout",
     "PreshuffleScaleLayout",
+    "block2d_setprio_iter_sched",
     "buffer_copy_gmem16_dwordx4",
     "lds_load_pack_k32",
     "lds_row_major_idx",

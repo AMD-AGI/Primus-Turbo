@@ -72,6 +72,16 @@ _TILE_CANDIDATES = (
     # barrier / prefetch / addr-gen VALU). Only the direction-aware wgrad path
     # prefers it; fwd/dgrad keep tk=128.
     (64, 256, 256),
+    # Larger-M wgrad tile for the tile_n=128-forced (K-heavy) wgrad shapes.
+    # When the output dim K is not a multiple of 256 the kernel must run
+    # tile_n=128, which pins A-fragment reuse (num_acc_n=2) so the proven
+    # tile_n=256 reuse win is unreachable. The only remaining compute lever is
+    # tile_m: doubling m_repeat 4->8 issues twice as many independent MFMA
+    # chains per wave (more ILP to hide LDS-load/MFMA latency) and amortizes
+    # the shared B-global-loads / per-output-column scale_b loads / barrier
+    # overhead over 2x output rows. Only the wgrad path with a forced
+    # tile_n=128 prefers it.
+    (128, 128, 256),
 )
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
@@ -207,6 +217,16 @@ def _select_tile(
             s += 6 if tk == 256 else 3
         else:
             s += 6 if tk == 128 else 3
+        # wgrad tile_m lever for the tile_n=128-forced (K-heavy) path. When the
+        # output dim (N arg = kernel output cols K) is not a multiple of 256 the
+        # only valid tile_n is 128, so num_acc_n is pinned at 2 and the tile_n=256
+        # reuse win is unreachable. Prefer the larger tile_m=128 variant there:
+        # it doubles the independent MFMA chains per wave (ILP to hide
+        # LDS-load/MFMA latency under the 2-wave/SIMD ceiling) and amortizes the
+        # shared B-loads / scale_b loads / barrier overhead over 2x output rows.
+        # Scoped to wgrad + tn==128 so the proven tn=256/tm=64 picks are untouched.
+        if prefer_deep_k and tn == 128 and tm == 128:
+            s += 14
         return s
 
     return max(valid, key=_score)
@@ -347,12 +367,20 @@ def gemm_fp8_blockwise_flydsl(
     per-block scales (1xK-block for the activation, 128x128 for the weight).
     """
     assert a_fp8.ndim == 2 and b_fp8.ndim == 2, "a and b must be 2D"
-    assert a_scale_inv.ndim == 2 and b_scale_inv.ndim == 2, "scales must be 2D"
+    assert a_scale_inv.ndim == 2, "a_scale must be 2D"
     assert out_dtype in (torch.bfloat16, torch.float16), "out_dtype must be bf16 or fp16"
 
     M, K = a_fp8.shape
     N, Kb = b_fp8.shape
     assert K == Kb, f"K mismatch: a has K={K}, b has K={Kb}"
+
+    # Detect the dual-quant-produced pre-shuffled weight: when the weight-quant
+    # emitted b_fp8 directly in the forward (16, 16) MFMA pre-shuffled layout, the
+    # producer passes a flattened (1D) weight scale as the signal (the GEMM dispatch
+    # ignores scale shape). In that case b_fp8 is already shuffle_b(b_fp8)-equivalent,
+    # so the standalone preshuffle copy + kernel launch is skipped. Normal callers
+    # pass the 2D [N // 128, K // 128] scale and take the shuffle_b path below.
+    b_preshuffled = b_scale_inv.dim() == 1
 
     compile_fn = _load_fwd_compile_fn()
     if compile_fn is None:
@@ -376,7 +404,11 @@ def gemm_fp8_blockwise_flydsl(
     # scale_b row-major [N // 128, K // 128] (flattened).
     a_scale_t = a_scale_inv.transpose(0, 1).contiguous().view(-1)
     b_scale_flat = b_scale_inv.contiguous().view(-1)
-    b_shuffled = shuffle_b(b_fp8)
+    if b_preshuffled:
+        # b_fp8 already carries shuffle_b(b_fp8) bytes; consume directly (zero-cost).
+        b_shuffled = b_fp8
+    else:
+        b_shuffled = shuffle_b(b_fp8)
 
     out = torch.empty((M, N), dtype=out_dtype, device=a_fp8.device)
     stream = torch.cuda.current_stream()
@@ -437,8 +469,13 @@ def gemm_fp8_blockwise_flydsl_dgrad(
     Nb, K = b_fp8.shape  # weight [N, K] -> output dim K
     assert N == Nb, f"N mismatch: grad_out has N={N}, b has N={Nb}"
 
-    # B = b^T = [K, N]; its 2D-block scale transposes to [K // 128, N // 128].
-    b_scale_t = b_scale_inv.transpose(0, 1).contiguous()
+    # Detect the forward-emitted dgrad transposed-preshuffle weight: the producer
+    # (weight dual-quant) already wrote b_fp8 in the kernel's [K, N] (16, 16)
+    # transposed-preshuffle layout and passes the transposed weight scale flattened
+    # (1D) as the signal (the GEMM dispatch ignores scale shape). In that case the
+    # standalone _shuffle_b_transposed copy + kernel launch is skipped. Normal
+    # callers pass the 2D [N // 128, K // 128] scale and take the shuffle path below.
+    b_preshuffled = b_scale_inv.dim() == 1
 
     # Kernel dims: rows M_kernel=M, output cols N_kernel=K, contraction K_kernel=N.
     tile = _select_tile(M, K, N)
@@ -452,10 +489,18 @@ def gemm_fp8_blockwise_flydsl_dgrad(
     flyc = _flyc()
 
     a_scale_t = grad_out_scale_inv.transpose(0, 1).contiguous().view(-1)  # [N//128, M]
-    b_scale_flat = b_scale_t.contiguous().view(-1)
-    # Fuse b^T (transpose+contiguous) and the pre-shuffle into ONE copy:
-    # _shuffle_b_transposed(b_fp8) == shuffle_b(b_fp8.transpose(0, 1).contiguous()).
-    b_shuffled = _shuffle_b_transposed(b_fp8)
+    if b_preshuffled:
+        # b_fp8 is the [N, K]-shaped buffer holding the [K, N] transposed-preshuffle
+        # bytes; reinterpret it and consume the carried transposed scale directly.
+        b_shuffled = b_fp8.reshape(K, N)
+        b_scale_flat = b_scale_inv  # already [K // 128, N // 128] flattened (transposed)
+    else:
+        # B = b^T = [K, N]; its 2D-block scale transposes to [K // 128, N // 128].
+        b_scale_t = b_scale_inv.transpose(0, 1).contiguous()
+        b_scale_flat = b_scale_t.contiguous().view(-1)
+        # Fuse b^T (transpose+contiguous) and the pre-shuffle into ONE copy:
+        # _shuffle_b_transposed(b_fp8) == shuffle_b(b_fp8.transpose(0, 1).contiguous()).
+        b_shuffled = _shuffle_b_transposed(b_fp8)
 
     out = torch.empty((M, K), dtype=out_dtype, device=grad_out_fp8.device)
     stream = torch.cuda.current_stream()
@@ -473,6 +518,7 @@ def gemm_fp8_blockwise_flydsl_dgrad(
             scale_block_k=_SCALE_BLOCK,
             out_dtype=out_dtype_str,
             use_async_copy=True,
+            l2_group_m=16,
         )
         compiled = flyc.compile(exe, out, grad_out_fp8, b_shuffled, a_scale_t, b_scale_flat, M, K, stream)
         _compiled_cache[key] = compiled

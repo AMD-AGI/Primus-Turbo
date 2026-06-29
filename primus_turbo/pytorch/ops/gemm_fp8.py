@@ -309,6 +309,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         config: Float8QuantConfig,
     ):
         from primus_turbo.pytorch.ops.quantization import (
+            quant_fp8_blockwise_for_weight_dual_impl,
             quant_fp8_blockwise_for_weight_impl,
             quant_fp8_blockwise_impl,
         )
@@ -372,26 +373,103 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             a_fp8_col = None
             a_scale_inv_col = None
 
-        b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
+        # When the FlyDSL backend is active on the NT-forward Linear layout
+        # (trans_b=True), fold the launcher's standalone forward weight pre-shuffle
+        # (a full [N, K] fp8 HBM round-trip via shuffle_b + a dedicated elementwise
+        # kernel launch on EVERY forward) into the weight-quant store: emit a second
+        # FP8 copy already in the (16, 16) MFMA pre-shuffled layout in the same read
+        # of `b`. The plain block2d b_fp8 is still produced and saved to ctx so the
+        # dgrad (which applies a different, transposed pre-shuffle) is byte-for-byte
+        # unchanged. The forward GEMM receives the pre-shuffled operand + a flattened
+        # (1D) weight scale as the "already pre-shuffled" signal; the forward
+        # launcher detects the 1D scale and skips shuffle_b. Gated on FlyDSL actually
+        # handling this forward shape (so a non-FlyDSL fallback never receives the
+        # scrambled operand) and on the shuffle layout divisibility. This is a
+        # kernel-side fusion recomputed fresh each forward from `b` (no tensor-id /
+        # _version / weakref cache), so it transfers 1:1 to a real training step.
+        b_fwd_preshuffled = False
+        # Additionally emit the dgrad (NN) transposed-preshuffle weight layout in the
+        # SAME read of `b` (a 3rd FP8 output of the weight dual-quant), carried to
+        # backward via ctx so the dgrad path can skip its standalone per-step
+        # _preshuffle_b_transposed_kernel. Gated below on the dgrad actually running
+        # on FlyDSL without the Round-15 K-pad path (K % 256 == 0) and on the
+        # transposed-preshuffle divisibility. Recomputed fresh each forward from `b`
+        # (no tensor-id / _version / weakref cache), so it transfers 1:1 to a real
+        # training step (K4: forward intermediate carried to its own backward).
+        emit_dgrad_ps = False
+        if (
+            trans_b
+            and config.block_size == 128
+            and GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        ):
+            try:
+                from primus_turbo.flydsl.gemm import flydsl_blockwise_gemm_supported
+
+                M_a = a.shape[0]
+                N_w, K_w = b.shape  # weight [N, K]
+                if (
+                    N_w % 16 == 0
+                    and K_w % 32 == 0
+                    and flydsl_blockwise_gemm_supported(M_a, N_w, K_w)
+                ):
+                    b_fwd_preshuffled = True
+                    # dgrad logical shape (M=M_a, N=K_w, K=N_w); only fold when it
+                    # runs on FlyDSL without K-pad and the transposed (16, 16)
+                    # preshuffle divides (rows=K_w % 16, cols=N_w % 32).
+                    if (
+                        fuse_a_dual
+                        and K_w % 256 == 0
+                        and K_w % 16 == 0
+                        and N_w % 32 == 0
+                        and flydsl_blockwise_gemm_supported(M_a, K_w, N_w)
+                    ):
+                        emit_dgrad_ps = True
+            except Exception:
+                b_fwd_preshuffled = False
+                emit_dgrad_ps = False
+
+        b_fp8_dgrad_ps = None
+        if b_fwd_preshuffled:
+            b_fp8, b_fp8_ps, b_fp8_dgrad_ps, b_scale_inv = quant_fp8_blockwise_for_weight_dual_impl(
+                b, b_dtype, block_size=config.block_size, emit_dgrad_ps=emit_dgrad_ps
+            )
+            # Pre-shuffled operand + 1D scale signal -> forward launcher skips shuffle_b.
+            b_fwd_data = b_fp8_ps
+            b_fwd_scale = b_scale_inv.view(-1)
+            if not emit_dgrad_ps:
+                b_fp8_dgrad_ps = None
+        else:
+            b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(
+                b, b_dtype, block_size=config.block_size
+            )
+            b_fwd_data = b_fp8
+            b_fwd_scale = b_scale_inv
 
         out = gemm_fp8_impl(
             a_fp8_row,
             a_scale_inv_row,
             trans_a,
-            b_fp8,
-            b_scale_inv,
+            b_fwd_data,
+            b_fwd_scale,
             trans_b,
             out_dtype,
             False,
             granularity=config.granularity.value,
             default_backend=BackendType.CK.value,
         )
+        has_dgrad_ps = fuse_a_dual and b_fp8_dgrad_ps is not None
         if fuse_a_dual:
-            ctx.save_for_backward(b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col)
+            if has_dgrad_ps:
+                ctx.save_for_backward(
+                    b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col, b_fp8_dgrad_ps
+                )
+            else:
+                ctx.save_for_backward(b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col)
             ctx.has_prequantized_a_col = True
         else:
             ctx.save_for_backward(a, b_fp8, b_scale_inv)
             ctx.has_prequantized_a_col = False
+        ctx.has_dgrad_ps = has_dgrad_ps
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
@@ -405,8 +483,12 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
+        b_fp8_dgrad_ps = None
         if ctx.has_prequantized_a_col:
-            b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col = ctx.saved_tensors
+            if getattr(ctx, "has_dgrad_ps", False):
+                b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col, b_fp8_dgrad_ps = ctx.saved_tensors
+            else:
+                b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col = ctx.saved_tensors
         else:
             a, b_fp8, b_scale_inv = ctx.saved_tensors
             a_dtype = _get_fp8_dtype(ctx.config.format, False)
@@ -445,18 +527,71 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             # the downstream GEMM/dispatch expect); re-transposed in the launcher.
             grad_out_fp8_col = grad_out_fp8_col.transpose(0, 1)
 
+        # --- Round 15: unlock tile_n=256 on the deep-K dgrad (NN, block2d) FlyDSL
+        # kernel via an algebraically-exact K-zero-pad of the weight operand.
+        # The dgrad selects its tile_n from the output-feature dim (= weight
+        # in_features K = b_fp8.shape[1]). When K is not a multiple of 256 the
+        # kernel is forced to tile_n=128 (num_acc_n=2), losing the proven 2x
+        # A-fragment / scale_a reuse of tile_n=256. Zero-pad the weight along K up
+        # to the next multiple of 256 and slice grad_a back: the pad columns are
+        # exactly zero, so every original grad_a column is computed bit-identically
+        # (no in-kernel tail mask). The pad is recomputed fresh each backward
+        # purely from operand shapes (K3: single-launch operand prep, no
+        # tensor-identity / _version / weakref cache), so it transfers 1:1 to a
+        # real training step. Scoped to FlyDSL + the NT-forward dgrad (ctx.trans_b)
+        # + the tile_n=128-forced shape (K % 256 != 0) so tile_n=256-legal shapes
+        # are never padded.
+        dgrad_b_fp8 = b_fp8
+        dgrad_b_scale_inv = b_scale_inv
+        dgrad_k_orig = None
+        use_dgrad_ps = (
+            b_fp8_dgrad_ps is not None
+            and ctx.trans_b
+            and GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        )
+        if use_dgrad_ps:
+            # Consume the forward-emitted dgrad transposed-preshuffle weight. The
+            # transposed weight scale is flattened to 1D as the "already preshuffled"
+            # signal the dgrad launcher detects (it then skips _shuffle_b_transposed).
+            # Mutually exclusive with the K-pad path below (only emitted when
+            # K % 256 == 0, so the pad never triggers for this shape).
+            dgrad_b_fp8 = b_fp8_dgrad_ps
+            dgrad_b_scale_inv = b_scale_inv.transpose(0, 1).contiguous().view(-1)
+        elif (
+            ctx.trans_b
+            and GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        ):
+            block_size = ctx.config.block_size
+            k_out = b_fp8.shape[1]
+            if k_out % 256 != 0 and k_out % block_size == 0:
+                k_pad = ((k_out + 255) // 256) * 256
+                pad_blocks = (k_pad - k_out) // block_size
+                # Zero-pad the fp8 weight along K (pad columns dequant to exactly 0).
+                # new_zeros preserves the fp8 dtype (F.pad does not support fp8).
+                b_fp8_padded = b_fp8.new_zeros((b_fp8.shape[0], k_pad))
+                b_fp8_padded[:, :k_out] = b_fp8
+                # Append finite (=1.0) inv-scale block(s) so 0 * 1.0 = 0 (a NaN-safe
+                # value: an inf/NaN inv-scale on the pad block could yield 0*inf=NaN).
+                scale_pad = b_scale_inv.new_ones((b_scale_inv.shape[0], pad_blocks))
+                dgrad_b_fp8 = b_fp8_padded
+                dgrad_b_scale_inv = torch.cat([b_scale_inv, scale_pad], dim=1)
+                dgrad_k_orig = k_out
+
         a_grad = gemm_fp8_impl(
             grad_out_fp8_row,
             grad_out_scale_inv_row,
             False,
-            b_fp8,
-            b_scale_inv,
+            dgrad_b_fp8,
+            dgrad_b_scale_inv,
             not ctx.trans_b,
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
             default_backend=BackendType.CK.value,
         )
+        if dgrad_k_orig is not None:
+            # Drop the padded output-feature columns (they are exactly zero).
+            a_grad = a_grad[:, :dgrad_k_orig]
 
         b_grad = gemm_fp8_impl(
             a_fp8_col,
