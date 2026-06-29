@@ -487,7 +487,12 @@ class FP8GemmMXFunction(torch.autograd.Function):
             b_col, b_col_scale = b_t.qdata, b_t.scale_inv
         else:
             b_row, b_row_scale, b_col, b_col_scale = quantize_fp8_with_trans(
-                b, fp8_dtype, granularity, block_size=block_size
+                b,
+                fp8_dtype,
+                granularity,
+                block_size=block_size,
+                scaling_recipe=b_scaling_recipe,
+                scaling_recipe_for_trans=b_scaling_recipe,
             )
 
         # NT layout
