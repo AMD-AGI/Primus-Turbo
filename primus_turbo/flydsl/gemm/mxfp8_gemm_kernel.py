@@ -601,9 +601,7 @@ def gemm_mxfp8_flydsl_kernel(
     assert K == Kb, f"K mismatch: a {a.shape}, b {b.shape}"
     assert K % 128 == 0 and K >= 256, f"K must be a multiple of 128 and >= 256, got {K}"
     assert M % 64 == 0, f"M must be a multiple of 64 (A-scale preshuffle), got {M}"
-    # N down to %16 (MX min): combined-B preshuffle zero-pads to the next 256-multiple
-    # and StoreC masks cols >= N, so partial N-blocks are handled.
-    assert N % 16 == 0, f"N must be a multiple of 16, got {N}"
+    assert N >= 1, f"N must be >= 1, got {N}"
     assert a_scale.shape[0] == M and b_scale.shape[0] == N, "scale rows must match a/b rows"
     assert a_scale.shape[1] == K // 32 and b_scale.shape[1] == K // 32, "raw E8M0 scales are [dim, K//32]"
 

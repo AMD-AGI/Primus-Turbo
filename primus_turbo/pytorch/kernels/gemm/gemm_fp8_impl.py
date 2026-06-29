@@ -337,8 +337,8 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
       (trans_c=True is supported via post-hoc output transpose; extra mem copy vs Triton.)
 
     MX_BLOCKWISE (compute-only): NT only, per-operand E4M3/E5M2 (incl. hybrid),
-    bf16/fp16 out. Per-1x32 raw E8M0 2D block scales [M,K//32]/[N,K//32] (M%16,
-    K%32); execute() zero-pads (M->64, K->kernel tile) and LDS-repacks them to the
+    bf16/fp16 out. Per-1x32 raw E8M0 2D block scales [M,K//32]/[N,K//32] (arbitrary
+    M/N, K%32); execute() zero-pads (M->64, K->kernel tile) and LDS-repacks them to the
     preshuffled int32 layout the kernel consumes (no host-side preshuffle).
     Routes to gemm_mxfp8_flydsl_kernel.
     """
@@ -380,11 +380,6 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             if not supported:
                 return supported
             m, k, n = a.shape[0], a.shape[1], b.shape[0]
-            supported &= n % 16 == 0
-            # raw E8M0 block scales, 1 byte/elem, [M,K//32] / [N,K//32]. execute()
-            # zero-pads M up to 64 and K up to the kernel tile, so only the MX
-            # minimums (M % 16, K % 32) are required here.
-            supported &= m % 16 == 0
             supported &= k % 32 == 0
             supported &= a_scale_inv.ndim == 2 and a_scale_inv.shape == (m, k // 32)
             supported &= b_scale_inv.ndim == 2 and b_scale_inv.shape == (n, k // 32)
@@ -462,7 +457,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             # Raw E8M0 scales go straight to the GEMM: it fuses the A (layout-1) + B-comb
             # (layout-3) LDS repack into its own launch (one @flyc.jit host stub does
             # preshuffle then gemm on the same stream). A needs M % 64 (padded above); B
-            # accepts any N % 16 (general-N handled by the kernel's cdiv(N,256)*4 sizing).
+            # accepts any N (general-N handled by the kernel's cdiv(N,256)*4 sizing).
             out = gemm_mxfp8_flydsl_kernel(
                 a, a_scale_inv.view(torch.uint8), b, b_scale_inv.view(torch.uint8), out_dtype=out_dtype
             )
