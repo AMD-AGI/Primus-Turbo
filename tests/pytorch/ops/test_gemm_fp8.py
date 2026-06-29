@@ -432,8 +432,8 @@ def test_gemm_fp8_mx_flydsl(m, n, k, format, dtype):
 
 # Direct FlyDSL MXFP8 kernel test (NT only). Quant emits raw E8M0 [dim, K//32]
 # scales; the backend preshuffle (preshuffle_ab_flydsl) repacks them to the int32
-# layout the kernel consumes (A layout-1 / B-comb layout-3). Covers aligned +
-# partial-tile tail (320/384). scale_pack=1 (broadcast layout).
+# layout the kernel consumes (A layout-1 / B-comb layout-3, broadcast). Covers
+# aligned + partial-tile tail (320/384).
 @pytest.mark.parametrize("m,n,k", [(256, 256, 256), (320, 384, 512)])
 def test_gemm_fp8_mx_flydsl_direct(m, n, k):
     from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel

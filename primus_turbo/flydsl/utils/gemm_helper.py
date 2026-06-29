@@ -268,9 +268,9 @@ class MfmaScale16x16x128:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         # asm_mma routes through the inline-asm scaled MFMA (see _asm_mma_scale_do).
-        # opsel picks which of the i32 scale operand's 4 E8M0 bytes the MMA reads
-        # (default 0); the byte-pack layout is emitted by the quant / FlyDSL preshuffle
-        # (C++ compute_preshuffle_scale_index pack arg).
+        # opsel picks which of the i32 scale operand's 4 E8M0 bytes the MMA reads; the
+        # FlyDSL scale preshuffle emits the broadcast layout (same byte in all 4), so
+        # opsel stays 0.
         self.opsel = 0
         self.asm_mma = asm_mma
         self.cbsz = cbsz  # srcA fp8 format: 0=E4M3, 1=E5M2
@@ -308,8 +308,8 @@ class ScaleBComb:
     One dwordx4 per lane returns [s0,s1,s2,s3]; (s0,s1)=b0 sub-tiles, (s2,s3)=b1.
     """
 
-    def __init__(self, sp_tensor, dim, K, pack=1):
-        self.K128 = K // (128 * pack)  # number of K-groups (pack K-iters per i32)
+    def __init__(self, sp_tensor, dim, K):
+        self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
         self.lane = fx.thread_idx.x % 64
         # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
         # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
@@ -345,8 +345,8 @@ class ScaleS2R:
     (layout 1) is emitted by the quant / ``preshuffle_scale_flydsl``.
     """
 
-    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1):
-        self.K128 = K // (128 * pack)  # number of K-groups (pack K-iters per i32)
+    def __init__(self, sp_tensor, dim, K, n_tiles):
+        self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
         self.n_tiles = n_tiles
         self.group_span = 16 * n_tiles
         self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
@@ -363,13 +363,6 @@ class ScaleS2R:
         idx = ((grp * self.K128 + k) * 64 + self.lane) * self.n_tiles
         v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
-
-
-def mxfp8_scale_pack(K: int) -> int:
-    """K-iters' E8M0 bytes packed per i32 (opsel picks the byte). Must match the C++
-    quant ``k_pre_pack``: 4 if (K//128)%4==0, else 2 if %2==0, else 1 (1 = broadcast)."""
-    k128 = K // 128
-    return 4 if k128 % 4 == 0 else (2 if k128 % 2 == 0 else 1)
 
 
 # ── Reusable fp8 GEMM primitives (store, K-tail mask, value-attrs, AGPR MFMA, XCD

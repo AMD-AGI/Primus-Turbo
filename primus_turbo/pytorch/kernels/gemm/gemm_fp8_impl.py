@@ -466,7 +466,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             a_sp, b_sp = preshuffle_ab_flydsl(
                 a_scale_inv.view(torch.uint8), b_scale_inv.view(torch.uint8), k, 4
             )
-            out = gemm_mxfp8_flydsl_kernel(a, a_sp, b, b_sp, out_dtype=out_dtype, trans_c=False, scale_pack=1)
+            out = gemm_mxfp8_flydsl_kernel(a, a_sp, b, b_sp, out_dtype=out_dtype)
             if m_pad != m_orig:
                 out = out[:m_orig]
             return out.t().contiguous() if trans_c else out
