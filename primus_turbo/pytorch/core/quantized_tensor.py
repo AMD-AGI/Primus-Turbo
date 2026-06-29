@@ -706,7 +706,7 @@ def create_quantized_weight(
     weight,
     dest_dtype: torch.dtype,
     quant_config: Union[Float4QuantConfig, Float8QuantConfig],
-    need_cache_colwise: bool = False,
+    need_weight_transpose_cache: bool = False,
 ) -> Tuple[QuantizedTensor, Optional[QuantizedTensor]]:
     def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
         if isinstance(quant_config, Float4QuantConfig):
@@ -734,7 +734,7 @@ def create_quantized_weight(
     )
 
     quantized_weight_t = None
-    if need_cache_colwise:
+    if need_weight_transpose_cache:
         granularity = quant_config.granularity
         if granularity == ScalingGranularity.TENSORWISE:
             quantized_weight_t = quantized_weight.transpose(-2, -1)
