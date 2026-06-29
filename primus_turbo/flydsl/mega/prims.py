@@ -12,6 +12,8 @@ Pointer / atomic / fence primitives shared by the LDS (addrspace-3) and global
 and both tensor-derived and raw symmetric peer addresses. Depends only on ``flydsl``.
 """
 
+import os
+
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
@@ -24,6 +26,19 @@ from flydsl.expr.buffer_ops import (
     create_llvm_ptr,
     get_element_ptr,
 )
+
+# Spin-wait timeout in s_memrealtime ticks (~100 MHz on gfx950 -> default ~30s).
+# Override via env for slower/faster debug; a spinning kernel printf's once per window.
+SPIN_TIMEOUT_CYCLES = int(os.environ.get("MEGA_SPIN_TIMEOUT_CYCLES", str(3_000_000_000)))
+
+
+def read_clock():
+    """Read the constant-rate GPU realtime counter (s_memrealtime); for spin-wait timeouts."""
+    op = llvm.inline_asm(
+        fx.T.i64(), [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True
+    )
+    return fx.arith.ArithValue(op, signed=False)
+
 
 # str space selector -> LLVM int address space (1 global / 3 LDS aka workgroup).
 _ADDR_SPACES = {"global": 1, "gmem": 1, "lds": 3, "shared": 3, "smem": 3}

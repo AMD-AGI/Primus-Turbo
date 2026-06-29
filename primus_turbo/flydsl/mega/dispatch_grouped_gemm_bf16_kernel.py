@@ -51,7 +51,14 @@ from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
     gemm_bf16_tn_variable_k_tile,
     load_go_i64,
 )
-from primus_turbo.flydsl.mega.prims import atomic_add, ld, memory_fence, st
+from primus_turbo.flydsl.mega.prims import (
+    SPIN_TIMEOUT_CYCLES,
+    atomic_add,
+    ld,
+    memory_fence,
+    read_clock,
+    st,
+)
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs
@@ -253,9 +260,18 @@ def _compile(
                 sb_base = sym_layout.scoreboard_ptr
                 expected_count = buffer_load(expected_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 if thread_index == fx.Int32(0):
+                    spin_start = read_clock()
                     signal = ld(sb_base, block_m, scope="sys")
                     while signal < expected_count:
                         fx.rocdl.s_sleep(fx.Int32(2))
+                        if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                            fx.printf(
+                                "MEGA dispatch GEMM gate timeout: block={} signal={} expected={}\n",
+                                block_m,
+                                signal,
+                                expected_count,
+                            )
+                            spin_start = read_clock()
                         signal = ld(sb_base, block_m, scope="sys")
                 fx.gpu.barrier()
                 memory_fence("acquire", scope="sys")  # read fresh peer-pushed pool rows

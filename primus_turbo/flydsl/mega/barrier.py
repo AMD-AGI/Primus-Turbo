@@ -16,7 +16,13 @@ import flydsl.expr as fx
 import flydsl.expr.buffer_ops as bo
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
-from primus_turbo.flydsl.mega.prims import _unwrap_scope, atomic_add, ld
+from primus_turbo.flydsl.mega.prims import (
+    SPIN_TIMEOUT_CYCLES,
+    _unwrap_scope,
+    atomic_add,
+    ld,
+    read_clock,
+)
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
 
 _llvm = bo.llvm
@@ -49,8 +55,17 @@ def grid_sync(sym_layout: SymLayout, thread_id, block_id, num_blocks):
             fx.Int32(1),
         )
         old_value = atomic_add(count_ptr, fx.Int32(0), add_value, scope="agent", release=True)
+        spin_start = read_clock()
         new_value = ld(count_ptr, fx.Int32(0), scope="agent", order="acquire")
         while ((new_value ^ old_value) & fx.Int32(_FINISH_SUM_TAG)) == fx.Int32(0):
+            if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                fx.printf(
+                    "MEGA grid_sync timeout: block={} count={} num_blocks={}\n",
+                    block_id,
+                    new_value,
+                    fx.Int32(num_blocks),
+                )
+                spin_start = read_clock()
             new_value = ld(count_ptr, fx.Int32(0), scope="agent", order="acquire")
     fx.gpu.barrier()  # broadcast "all arrived"
     fence_acquire(scope="agent")  # invalidate L1 for fresh reads

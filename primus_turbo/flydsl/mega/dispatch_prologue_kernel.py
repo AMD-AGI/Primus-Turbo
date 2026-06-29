@@ -49,7 +49,14 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega import sym_layout as sl_mod
 from primus_turbo.flydsl.mega.barrier import grid_sync
-from primus_turbo.flydsl.mega.prims import atomic_add, ld, memory_fence, st
+from primus_turbo.flydsl.mega.prims import (
+    SPIN_TIMEOUT_CYCLES,
+    atomic_add,
+    ld,
+    memory_fence,
+    read_clock,
+    st,
+)
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
 
 # Set True to emit s_memrealtime phase stamps into the SymLayout ``profile`` region.
@@ -123,8 +130,17 @@ def barrier_block(sl, rank: int, world_size: int, thread_index, block_index, syn
             peer_signal_base = sl_mod.map(sl, sl.signal_ptr, thread_index)
             atomic_add(my_signal_base, thread_index, fx.Int32(_FINISHED_SUM_TAG), "sys", _GLOBAL)
             atomic_add(peer_signal_base, fx.Int32(rank), fx.Int32(-_FINISHED_SUM_TAG), "sys", _GLOBAL)
+            spin_start = read_clock()
             my_signal_value = ld(my_signal_base, thread_index, scope="sys")
             while my_signal_value > fx.Int32(0):
+                if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                    fx.printf(
+                        "MEGA prologue barrier timeout: rank={} peer={} signal={}\n",
+                        fx.Int32(rank),
+                        thread_index,
+                        my_signal_value,
+                    )
+                    spin_start = read_clock()
                 my_signal_value = ld(my_signal_base, thread_index, scope="sys")
     fx.gpu.barrier()  # no acquire fence (SIG is uncached)
 
