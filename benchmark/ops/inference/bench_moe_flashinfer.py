@@ -14,8 +14,8 @@ FlashInfer dispatches on Blackwell (B200 / sm100):
   none      : bf16          -> trtllm_bf16_moe
   fp8_block : per-128x128    -> trtllm_fp8_block_scale_moe   (DeepSeek convention)
   fp8_token : per-tensor fp8 -> trtllm_fp8_per_tensor_scale_moe
-  fp4       : mxfp4 (OCP)    -> trtllm_fp4_block_scale_moe    (aiter-comparable)
-  nvfp4     : nvfp4          -> trtllm_fp4_block_scale_moe    (Blackwell flagship)
+  w4a16     : mxfp4 wt + bf16 act -> trtllm_fp4_block_scale_moe  (W4A16; NOT aiter-comparable)
+  nvfp4     : nvfp4 wt + nvfp4 act -> trtllm_fp4_block_scale_moe  (W4A4; compare vs aiter mxfp4)
 
 Simulates one rank under TP (shard intermediate) or EP (shard experts, via
 local_expert_offset / local_num_experts). --variance (>=0) sets expert-load
@@ -267,10 +267,18 @@ def _shuffle_bf16(w1, w2, num_experts):
     return torch.stack(g1).contiguous(), torch.stack(g2).contiguous()
 
 
-# fp4 flavors: fp4 == mxfp4 (OCP micro-scaling, e8m0 scales over 32-elt blocks,
-# bf16 activations -- directly comparable to aiter's --quant fp4) and nvfp4
-# (Blackwell flagship, fp8-e4m3 block scales over 16-elt blocks, fp4 activations).
-_FP4_PARAMS = {"fp4": dict(sf_vec=32, ue8m0=True), "nvfp4": dict(sf_vec=16, ue8m0=False)}
+# fp4-weight flavors:
+#   w4a16 == mxfp4 weights (OCP micro-scaling, e8m0 scales over 32-elt blocks)
+#     with *bf16 activations* (W4A16). NOTE: this is NOT a like-for-like match for
+#     aiter's --quant fp4, which is mxfp4 weights x *fp4 activations* (W4A4).
+#     FlashInfer's trtllm-gen FP4 MoE has no mxfp4-weight x mxfp4-act mode, so
+#     this path keeps activations in bf16; use nvfp4 below to compare against
+#     aiter's W4A4 mxfp4 numbers.
+#   nvfp4 == nvfp4 weights x nvfp4 activations (W4A4, fp8-e4m3 block scales over
+#     16-elt blocks). This is the W4A4 path -- the closest analogue to aiter's
+#     mxfp4 (W4A4) for cross-backend comparison, despite the e4m3-vs-e8m0 scale
+#     format difference.
+_FP4_PARAMS = {"w4a16": dict(sf_vec=32, ue8m0=True), "nvfp4": dict(sf_vec=16, ue8m0=False)}
 
 
 def _quant_fp4(w, num_experts, sf_vec_size, ue8m0):
@@ -475,8 +483,8 @@ def build_moe_fn(quant, hidden, w1, w2, logits, num_experts, topk, local_I, loca
             out1 = (1.0 / (w1g * a_gscale)).to(torch.float32)
             out2 = (1.0 / w2g).to(torch.float32)
         else:
-            # fp4 == mxfp4: bf16 activations (no hidden scale); per-expert global-
-            # scale corrections recover the e2m1 dequant (1/gscale).
+            # w4a16 == mxfp4 weights + bf16 activations (no hidden scale); per-
+            # expert global-scale corrections recover the e2m1 dequant (1/gscale).
             hs, hs_scale = hidden, None
             out1 = (1.0 / w1g).to(torch.float32)
             out2 = (1.0 / w2g).to(torch.float32)
@@ -740,7 +748,7 @@ def main():
     )
     parser.add_argument(
         "--quant",
-        choices=["none", "fp8_block", "fp8_token", "fp4", "nvfp4"],
+        choices=["none", "fp8_block", "fp8_token", "w4a16", "nvfp4"],
         default="none",
         help="Quantization: none (bf16), fp8_block (per-128x128), fp8_token (per-tensor), "
         "fp4 (mxfp4 OCP micro-scaling, aiter-comparable), nvfp4 (Blackwell flagship).",
