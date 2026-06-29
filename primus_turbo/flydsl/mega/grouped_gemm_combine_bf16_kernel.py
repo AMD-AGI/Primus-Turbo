@@ -59,7 +59,14 @@ from primus_turbo.flydsl.common.tile_spec import _emit_if_then
 # scope="agent" = device-wide relaxed (local scoreboard / flag); scope="sys" = system
 # (cross-rank flag publish, pairs with the agent-scope consumer load on uncached signal mem).
 # _mem_fence = cheap fence (s_waitcnt drain + compiler barrier); pairs with relaxed atomics.
-from primus_turbo.flydsl.mega.prims import _mem_fence, atomic_add, ld, st
+from primus_turbo.flydsl.mega.prims import (
+    SPIN_TIMEOUT_CYCLES,
+    _mem_fence,
+    atomic_add,
+    ld,
+    read_clock,
+    st,
+)
 
 # single SymLayout struct (two-heap delta tables) names every symmetric sub-buffer;
 # the active workspace is fetched by the host wrappers (no-group call -> current buffer).
@@ -248,9 +255,18 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
                     if topk_index >= fx.Int64(0):
                         if topk_index < fx.Int64(num_experts):
                             if lane == fx.Int32(0):
+                                spin_start = read_clock()
                                 flag = ld(barrier_base, slot, scope="agent")
                                 while flag < fx.Int32(0):
                                     fx.rocdl.s_sleep(fx.Int32(1))
+                                    if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                                        fx.printf(
+                                            "MEGA combine reduce flag timeout: rank={} token={} slot={}\n",
+                                            fx.Int32(rank),
+                                            token,
+                                            slot,
+                                        )
+                                        spin_start = read_clock()
                                     flag = ld(barrier_base, slot, scope="agent")
                 _mem_fence()  # order payload reads after the flag (s_waitcnt drain)
 
@@ -441,9 +457,18 @@ def _compile(
             for tile_iter in range(local_count):
                 block_m = block_index + tile_iter * combine_cu
                 if thread_index == fx.Int32(0):
+                    spin_start = read_clock()
                     signal_count = ld(sb_l2_base, block_m, scope="agent")
                     while signal_count < fx.Int32(n_blocks):
                         fx.rocdl.s_sleep(fx.Int32(2))
+                        if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                            fx.printf(
+                                "MEGA combine L2 gate timeout: block={} signal={} n_blocks={}\n",
+                                block_m,
+                                signal_count,
+                                fx.Int32(n_blocks),
+                            )
+                            spin_start = read_clock()
                         signal_count = ld(sb_l2_base, block_m, scope="agent")
                     # single consumer of this gate -> reset it to 0 for the next launch
                     # (all n_blocks GEMM increments already landed; folds out the host zero)
