@@ -595,35 +595,9 @@ def benchmark_one(num_tokens, cfg, dtype, device, tp_size, ep_size, variance, qu
     local_I = I // tp_size
     local_E = E // ep_size
 
-    # trtllm-gen MoE requires both hidden and (per-rank) intermediate to be a
-    # multiple of 128; gpt-oss-120b's 2880 is neither (2880 % 128 == 64), so the
-    # kernel aborts (intermediate "% 128 == 0" assert; hidden has no valid tile
-    # config / w2 shuffle asserts M % 128). vLLM and SGLang serve gpt-oss on
-    # Blackwell by *weight padding* both dims up to a multiple of 256 (2880 ->
-    # 3072) and feeding the padded shape to the same trtllm-gen FP4 kernel, then
-    # trimming the output back to the true hidden. We mirror that: round K and
-    # local_I up to 256. Padded gate/up/w2 rows and padded hidden columns are
-    # zero, so SiLU(0)*0 == 0 and the zero hidden lanes contribute nothing -- the
-    # reference runs on the same padded weights so SNR stays honest. Already-
-    # aligned models round up to themselves (no-op). FLOP/byte accounting below
-    # uses the *true* K/local_I, never the padded sizes, so padding never inflates
-    # reported throughput.
-    _ALIGN = 256
-    K_pad = ((K + _ALIGN - 1) // _ALIGN) * _ALIGN
-    local_I_pad = ((local_I + _ALIGN - 1) // _ALIGN) * _ALIGN
-
-    hidden = torch.zeros(num_tokens, K_pad, device=device, dtype=dtype)
-    hidden[:, :K] = torch.randn(num_tokens, K, device=device, dtype=dtype)
-    w1 = torch.zeros(local_E, 2 * local_I_pad, K_pad, device=device, dtype=dtype)
-    w2 = torch.zeros(local_E, K_pad, local_I_pad, device=device, dtype=dtype)
-    # Fill only the live [gate||up] / w2 blocks; padded tail/lanes stay zero. w1
-    # is [gate||up] so gate and up are padded independently (each I -> I_pad), and
-    # the K dimension is padded to K_pad as well.
-    w1[:, :local_I, :K] = torch.randn(local_E, local_I, K, device=device, dtype=dtype) / (K**0.5)
-    w1[:, local_I_pad : local_I_pad + local_I, :K] = (
-        torch.randn(local_E, local_I, K, device=device, dtype=dtype) / (K**0.5)
-    )
-    w2[:, :K, :local_I] = torch.randn(local_E, K, local_I, device=device, dtype=dtype) / (local_I**0.5)
+    hidden = torch.randn(num_tokens, K, device=device, dtype=dtype)
+    w1 = torch.randn(local_E, 2 * local_I, K, device=device, dtype=dtype) / (K**0.5)
+    w2 = torch.randn(local_E, K, local_I, device=device, dtype=dtype) / (local_I**0.5)
 
     logits, topk_weights, topk_ids = make_routing(num_tokens, E, topk, device, variance)
 
@@ -656,9 +630,7 @@ def benchmark_one(num_tokens, cfg, dtype, device, tp_size, ep_size, variance, qu
     # Bottleneck = heaviest-load rank; that rank's consistent triple is reported.
     r, lo, local_m, local_tokens, active_experts = max(loads, key=lambda l: l[2])
 
-    # Kernel sees the padded intermediate (w1/w2 are built at local_I_pad); flop/
-    # byte accounting below stays on the true local_I.
-    fn, per_expert_bytes = build_moe_fn(quant, hidden, w1, w2, logits, E, topk, local_I_pad, local_E, lo, device)
+    fn, per_expert_bytes = build_moe_fn(quant, hidden, w1, w2, logits, E, topk, local_I, local_E, lo, device)
 
     snr = None
     if check:
@@ -784,6 +756,25 @@ def main():
         help="Time with eager launches instead of CUDA-graph replay (default: cudagraph on).",
     )
     parser.set_defaults(cudagraph=True)
+    parser.add_argument(
+        "--pad128",
+        action="store_true",
+        help="Round hidden_size and moe_intermediate_size up to a multiple of 128 "
+        "(gpt-oss 2880 -> 2944). REQUIRED for gpt-oss-120b with --quant nvfp4 "
+        "(2880 is not /128, so trtllm-gen aborts without it). Aligned models are a "
+        "no-op. FLOPS/BW use the padded dims (slight over-count). Mirrors aiter's "
+        "--pad128. NOTE: not enough for --quant w4a16 on gpt-oss (the bf16-act GEMM "
+        "has no tuned 2944 config); use --pad256 for that.",
+    )
+    parser.add_argument(
+        "--pad256",
+        action="store_true",
+        help="Round hidden_size and moe_intermediate_size up to a multiple of 256 "
+        "(gpt-oss 2880 -> 3072). REQUIRED for gpt-oss-120b with --quant w4a16 "
+        "(pad128/2944 still trips getValidConfigIndices on the bf16-activation GEMM; "
+        "256 hits a tuned config). Also works for nvfp4. Mutually exclusive with "
+        "--pad128. FLOPS/BW use the padded dims (slight over-count).",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed (default: 0).")
     parser.add_argument(
         "--output", "-o", type=str, default=None, help="Save to .xlsx (auto-named if omitted)."
@@ -801,7 +792,16 @@ def main():
 
     device = "cuda"
     dtype = torch.bfloat16
-    cfg = MODELS[args.model]
+    cfg = dict(MODELS[args.model])  # copy: we may pad hidden/intermediate below
+    assert not (args.pad128 and args.pad256), "Use at most one of --pad128 / --pad256."
+    align = 256 if args.pad256 else 128 if args.pad128 else None
+    if align is not None:
+        for key in ("hidden_size", "moe_intermediate_size"):
+            orig = cfg[key]
+            padded = math.ceil(orig / align) * align
+            if padded != orig:
+                print(f"  pad{align}    : {key} {orig} -> {padded}")
+                cfg[key] = padded
     assert cfg["moe_intermediate_size"] % tp_size == 0, "intermediate not divisible by tp_size"
     assert cfg["n_routed_experts"] % ep_size == 0, "experts not divisible by ep_size"
 
