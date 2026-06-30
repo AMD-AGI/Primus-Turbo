@@ -479,11 +479,13 @@ def _get_mx_workspace(M, N, K128, device, stream):
     """Caller-owned scale workspace (a_sp/b_sp) + the preshuffle launch dims, cached
     by (M, N, K128, device, stream). a_sp/b_sp are flat int32 buffers the fused stub's
     preshuffle writes and the gemm reads; sizing mirrors the A (layout-1) / combined-B
-    (layout-3) repack (A: M//64 groups; B: cdiv(N,256)*4 groups; each group*K128*256 i32)."""
+    (layout-3) repack (A: cdiv(M,64) groups; B: cdiv(N,256)*4 groups; each group*K128*256
+    i32). cdiv for A (not M//64): a partial last 64-row group covers general (non-64) M,
+    the preshuffle masks its OOB rows to 0 and the gemm StoreC drops their output."""
     key = (M, N, K128, device, stream)
     e = _MXFP8_WS_CACHE.get(key)
     if e is None:
-        a_ngrp = M // 64
+        a_ngrp = ceildiv(M, 64)
         b_ngrp = ((N + 255) // 256) * 4
         a_blocks = a_ngrp * ceildiv(K128, _PRESHUF_KT)
         a_sp = torch.empty(a_ngrp * K128 * 256, dtype=torch.int32, device=device)
@@ -581,7 +583,8 @@ def gemm_mxfp8_flydsl_kernel(
     caller-owned int32 workspace, so there is no separate preshuffle launch and no CPU
     sync). The quant emits only raw E8M0 scales.
 
-    Constraints: K % 128 == 0 and K >= 256; M % 64 == 0; N % 16 == 0.
+    Constraints: K % 128 == 0 and K >= 256; M >= 1; N >= 1 (general M/N: the A-scale
+    preshuffle / gemm size A by cdiv(M,64) and bound the partial tail by the StoreC clamp).
     """
     assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
     assert out_dtype in (torch.bfloat16, torch.float16), "mxfp8 FlyDSL store emits bf16/fp16"
@@ -600,7 +603,7 @@ def gemm_mxfp8_flydsl_kernel(
         )
     assert K == Kb, f"K mismatch: a {a.shape}, b {b.shape}"
     assert K % 128 == 0 and K >= 256, f"K must be a multiple of 128 and >= 256, got {K}"
-    assert M % 64 == 0, f"M must be a multiple of 64 (A-scale preshuffle), got {M}"
+    assert M >= 1, f"M must be >= 1, got {M}"
     assert N >= 1, f"N must be >= 1, got {N}"
     assert a_scale.shape[0] == M and b_scale.shape[0] == N, "scale rows must match a/b rows"
     assert a_scale.shape[1] == K // 32 and b_scale.shape[1] == K // 32, "raw E8M0 scales are [dim, K//32]"

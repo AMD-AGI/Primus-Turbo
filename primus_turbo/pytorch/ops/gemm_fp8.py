@@ -534,14 +534,6 @@ class FP8GemmMXFunction(torch.autograd.Function):
         # Scale preshuffle is NOT done here: the quant emits raw E8M0 [dim, K//32]
         # scales and each GEMM backend implicitly preshuffles right before its own
         # kernel (FlyDSL fuses it into the gemm launch / turbo 16x4 / hipBLASLt vendor).
-        #
-        # Raw (high-precision) inputs take the MX dual-cast (quantize_fp8_with_trans):
-        # one kernel emits both the row-wise (fwd) and col-wise (bwd transpose)
-        # directions -- the same path the grouped MX GEMM uses, and it avoids the
-        # dequantize()+requantize a separate axis=-2 pass would cost. Pre-quantized
-        # QuantizedTensor inputs keep only their fp8 data, so the transpose direction
-        # is taken from an externally-supplied a_t / b_t or recovered via
-        # dequantize()+requantize. Operand pairing is identical in both arms.
         fp8_dtype = _get_fp8_dtype(config.format, True)
         granularity = config.granularity
         block_size = config.block_size

@@ -351,7 +351,10 @@ class ScaleS2R:
         self.n_tiles = n_tiles
         self.group_span = 16 * n_tiles
         self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
-        nbytes = (dim // self.group_span) * self.K128 * 64 * n_tiles * 4  # int32 records
+        # cdiv (not floor): a non-group_span-multiple ``dim`` (general M) still needs the
+        # partial last 64-row group resident so its valid rows read real scales; the
+        # group's OOB rows were preshuffle-masked to 0 and StoreC drops their output.
+        nbytes = ceildiv(dim, self.group_span) * self.K128 * 64 * n_tiles * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
     def load(self, base, k):
