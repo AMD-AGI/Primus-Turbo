@@ -349,6 +349,25 @@ def test_grouped_gemm_schedule_work_steal_rejects_non_triton_backend(non_triton_
     GlobalBackendManager.reset()
 
 
+@pytest.mark.parametrize("num_cu", [64, 128, 240, 256])
+def test_grouped_gemm_schedule_work_steal_rejects_num_cu(num_cu):
+    """``schedule="work_steal"`` combined with an explicit ``num_cu`` must
+    raise: the WS heuristic and per-XCD slot layout assume the persistent
+    grid spans every XCD, so partial-grid launches are unsupported at the
+    public op layer."""
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+    device = "cuda"
+    torch.manual_seed(0)
+    B, M, K, N = 4, 1024, 1280, 2560
+    a = torch.randn(B * M, K, device=device, dtype=torch.bfloat16)
+    b = torch.randn(B, N, K, device=device, dtype=torch.bfloat16)
+    group_lens = torch.full((B,), M, dtype=torch.int64, device=device)
+
+    with pytest.raises(ValueError, match="num_cu=None"):
+        grouped_gemm(a, b, group_lens, trans_b=True, num_cu=num_cu, schedule="work_steal")
+    GlobalBackendManager.reset()
+
+
 # ---------------------------------------------------------------------------
 # Kernel-level WS test: cover each ws_mode (the internal tuning knob) at the
 # low-level ``grouped_gemm_triton_kernel`` entry point. Not reachable from

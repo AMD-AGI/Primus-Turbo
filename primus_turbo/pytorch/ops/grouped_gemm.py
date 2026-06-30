@@ -131,6 +131,10 @@ def grouped_gemm(
                                           If None, it will be computed internally.
         trans_b (bool): If True, treat each b[g] as transposed.
         num_cu (int | None): Limit the number of CUs to use. None = default.
+            Must be None when ``schedule="work_steal"`` -- the work-stealing
+            kernel was designed and tested for full-device launches, and the
+            heuristic / per-XCD slot layout assume the persistent grid spans
+            every XCD. Mixing the two raises ``ValueError``.
         schedule (str): Persistent-loop scheduling. One of:
             * ``"static"`` (default): static-stride persistent kernel.
             * ``"work_steal"``: work-stealing persistent kernel with a kernel-
@@ -139,7 +143,7 @@ def grouped_gemm(
               selection of a non-Triton backend together with ``"work_steal"``
               is rejected at dispatch. Internal WS sub-modes are not exposed
               at this layer; tune via ``grouped_gemm_triton_kernel`` directly
-              when needed.
+              when needed. Requires ``num_cu=None`` (see ``num_cu`` above).
 
     Returns:
         torch.Tensor: Output of shape [sum(group_lens), N], same dtype/device as `a`.
@@ -153,6 +157,14 @@ def grouped_gemm(
         >>> out.shape
         torch.Size([96, 64])
     """
+    if schedule == "work_steal" and num_cu is not None:
+        raise ValueError(
+            f'schedule="work_steal" requires num_cu=None, got num_cu={num_cu}. '
+            "Work-stealing is designed and tested for full-device launches; the "
+            "heuristic and per-XCD slot layout assume the persistent grid spans "
+            'every XCD. Pass num_cu=None, or use schedule="static".'
+        )
+
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)
 
