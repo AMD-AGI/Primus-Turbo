@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..")))
 
 from mega_utils import (  # noqa: E402
     bench,
+    check_accuracy,
     compute_stage_metrics,
     dense_gemm_peak_ms,
     dispatch_only,
@@ -59,6 +60,7 @@ import primus_turbo.pytorch  # noqa: E402,F401  (fully init pytorch first: dodge
 from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (  # noqa: E402
     dispatch_grouped_gemm_bf16,
 )
+from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
 
 # symm_buffer<->pytorch<->swiglu circular import that the mega kernels otherwise trigger)
 
@@ -83,11 +85,34 @@ def profile_dispatch(group, args, mode, W1, W2):
     )
     symm, x, handle = inp.symm, inp.x, inp.handle
     pool = symm.pool
+
+    # one synced cross-rank op (barrier, optional scoreboard reset, barrier) so the
+    # accuracy probes run in a clean state, isolated from the timing loops.
+    def _synced(fn, reset_sb=False):
+        torch.cuda.synchronize()
+        group.barrier()
+        if reset_sb:
+            symm.scoreboard.zero_()
+            torch.cuda.synchronize()
+            group.barrier()
+        out = fn()
+        torch.cuda.synchronize()
+        group.barrier()
+        return out
+
+    acc = {}
     try:
         # GEMM work = real (padded) pool rows x N x K ; L1 NT: N=2I, K=H
         real_tiles = int(inp.num_tile_blocks[0].item())
         M_eff, N, K = real_tiles * BM, 2 * I, H
         flops = 2.0 * M_eff * N * K
+        # BM-padded per-expert row counts: pool[:M_eff] is laid out expert-major with
+        # each expert padded to a BM multiple; padding rows are zero -> contract to 0.
+        # These let turbo grouped_gemm reproduce the fused GEMM in the SAME pool layout.
+        experts_per_rank = args.num_experts // group.size()
+        t2e = inp.tile_to_expert[:real_tiles].to(torch.int64)
+        counts = torch.bincount(t2e, minlength=experts_per_rank)[:experts_per_rank]
+        padded_group_lens = (counts * BM).to(torch.int64)  # sum == M_eff
         # XGMI push bytes per rank = remote rows (dest != rank) x hidden x 2 (bf16)
         dest_cpu, count_cpu = inp.destination.cpu(), inp.count.cpu()
         remote_rows = int(count_cpu[dest_cpu != rank].sum().item())
@@ -122,6 +147,21 @@ def profile_dispatch(group, args, mode, W1, W2):
             ),
             iters=args.iters,
         )
+
+        # accuracy: fused dispatch+GEMM(NT) vs the turbo grouped_gemm reference over the
+        # same dispatched pool (pool currently holds x). turbo gg reproduces the per-expert
+        # GEMM in the SAME BM-padded pool layout via padded_group_lens, so we can compare
+        # the real (non-padding) rows directly. NT -> trans_b=True, b=W1 [G, 2I, H].
+        ref_fwd = _synced(
+            lambda: _turbo_gg(pool[:M_eff].contiguous(), inp.W1, padded_group_lens, trans_b=True)
+        )
+        fwd_fused = _synced(
+            lambda: dispatch_grouped_gemm_bf16(
+                x, inp.W1, group, handle=handle, layout="nt", BM=BM, BN=BN, num_dispatch_cu=num_dispatch_cu
+            ),
+            reset_sb=True,
+        )[0]
+        acc["fwd"] = check_accuracy(group, "fwd fused (nt)", fwd_fused[:M_eff], ref_fwd[:M_eff])
 
         # ── backward STEP1 (= e2e dispatch_grouped_0): dispatch dy[T,H] + L2 dgrad
         # pool[M,H] @ w2[g,H,I] (NN) -> d_swiglu[M,I]. Same metric set as the forward
@@ -173,13 +213,23 @@ def profile_dispatch(group, args, mode, W1, W2):
             "flops": flops_bwd,
         }
 
+        # accuracy: fused dispatch+GEMM(NN) vs the turbo grouped_gemm reference over the
+        # same dispatched pool (pool currently holds dy). NN -> trans_b=False, b=W2 [G, H, I].
+        ref_bwd = _synced(
+            lambda: _turbo_gg(pool[:M_eff].contiguous(), inp.W2, padded_group_lens, trans_b=False)
+        )
+        bwd_fused = _synced(
+            lambda: dispatch_grouped_gemm_bf16(
+                dy, inp.W2, group, handle=handle, layout="nn", BM=BM, BN=BN, num_dispatch_cu=num_dispatch_cu
+            ),
+            reset_sb=True,
+        )[0]
+        acc["bwd"] = check_accuracy(group, "bwd STEP1 fused (nn)", bwd_fused[:M_eff], ref_bwd[:M_eff])
+
         # group metadata shared by the variable-K wgrads: block_m-padded per-expert
         # boundaries (padded rows contract to 0, matching mega_moe_fused).
-        experts_per_rank = args.num_experts // group.size()
-        t2e = inp.tile_to_expert[:real_tiles].to(torch.int64)
-        counts = torch.bincount(t2e, minlength=experts_per_rank)[:experts_per_rank]
         group_offs = torch.zeros(experts_per_rank + 1, dtype=torch.int32, device="cuda")
-        group_offs[1:] = (counts * BM).to(torch.int32).cumsum(0)
+        group_offs[1:] = padded_group_lens.to(torch.int32).cumsum(0)
         cap = symm.num_max_pool_tokens
         ext_handle = handle  # full prologue tuple (tile_to_expert / expected / group_offs inside)
 
@@ -235,6 +285,39 @@ def profile_dispatch(group, args, mode, W1, W2):
             "fused_ms": t_wg1_fused,
             "flops": flops_wg1,
         }
+
+        # accuracy: fused dispatch+wgrad(TN) vs a pure-torch per-expert wgrad reference
+        # over the same dispatched pool (turbo grouped_gemm has no wgrad / trans_a path).
+        # The fused path pushes x_pool over XGMI, so the reference wgrads the DISPATCHED
+        # pool (not resident x_pool). trans_c stores dW1[e] = grad[e]^T @ x_pool[e] = [2I, H].
+        ref_dW1 = torch.zeros_like(dW1)  # empty groups -> 0 (matches the fused padded output)
+        offs_cpu = group_offs.tolist()
+
+        def _ref_wg1():
+            dispatch_only(x_pool, handle, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu)
+            torch.cuda.synchronize()
+            group.barrier()
+            for e in range(experts_per_rank):
+                s, t = offs_cpu[e], offs_cpu[e + 1]
+                if t > s:  # padded rows are zero -> contract to 0 (skip is equivalent)
+                    ref_dW1[e] = (grad_pool_w1[s:t].float().T @ pool[s:t].float()).to(dW1.dtype)
+
+        _synced(_ref_wg1)
+        wg1_fused = _synced(
+            lambda: dispatch_grouped_gemm_bf16(
+                x_pool,
+                grad_pool_w1,
+                group,
+                handle=ext_handle,
+                layout="tn",
+                num_dispatch_cu=num_dispatch_cu,
+                BM=BM,
+                BN=BN,
+                trans_c=True,
+            ),
+            reset_sb=True,
+        )[0]
+        acc["wgrad1"] = check_accuracy(group, "wgrad dW1 fused (tn)", wg1_fused, ref_dW1)
     finally:
         symm.destroy()  # always free symmetric buffers
     # raw per-rank timings + work; rank 0 aggregates across ranks (bottleneck = max latency)
@@ -248,6 +331,7 @@ def profile_dispatch(group, args, mode, W1, W2):
         "xgmi_bytes": xgmi_bytes,
         "bwd": bwd,
         "wgrad1": wgrad1,
+        "acc": acc,
     }
 
 
@@ -287,6 +371,9 @@ def benchmark_dispatch(local_rank, world, args):
             rank_mean = lambda key: sum(d[key] for d in per_rank) / len(per_rank)
 
             flops, xgmi = rank_mean("flops"), rank_mean("xgmi_bytes")
+            # fused accuracy verdicts (global worst-rank, identical on every rank)
+            acc0 = per_rank[0]["acc"]
+            fmt_acc = lambda v: "n/a" if v is None else f"{v[0]:.5f}/{'PASS' if v[2] else 'FAIL'}"
             # forward metrics in the shared layout
             m = compute_stage_metrics(
                 gemm_ms=rank_max("gemm_only_ms"),
@@ -360,6 +447,7 @@ def benchmark_dispatch(local_rank, world, args):
                     "dispatch_only (XGMI GB/s)": f"{m.comm_bw:.1f}",
                     "fused (ms)": f"{m.fused_ms:.3f}",
                     "fused (TFLOPS)": f"{m.fused_tf:.1f}",
+                    "fused acc (cos/ok)": fmt_acc(acc0.get("fwd")),
                     "comm_hidden (ms)": f"{m.hidden_ms:.3f}",
                     "speedup (vs serial)": f"{m.speedup:.2f}x",
                     "roofline (max(gemm,disp)/fused)": f"{m.roofline_pct:.1f}%",
@@ -371,6 +459,7 @@ def benchmark_dispatch(local_rank, world, args):
                     "bwd dispatch_only (XGMI GB/s)": f"{mb.comm_bw:.1f}",
                     "bwd fused (ms)": f"{mb.fused_ms:.3f}",
                     "bwd fused (TFLOPS)": f"{mb.fused_tf:.1f}",
+                    "bwd fused acc (cos/ok)": fmt_acc(acc0.get("bwd")),
                     "bwd speedup (vs serial)": f"{mb.speedup:.2f}x",
                     "bwd roofline (max(gemm,disp)/fused)": f"{mb.roofline_pct:.1f}%",
                     "wgrad1 dense_gemm (TFLOPS)": f"{mw1.dense_tf:.1f}",
@@ -380,6 +469,7 @@ def benchmark_dispatch(local_rank, world, args):
                     "wgrad1 dispatch_only (ms)": f"{mw1.comm_ms:.3f}",
                     "wgrad1 fused (ms)": f"{mw1.fused_ms:.3f}",
                     "wgrad1 fused (TFLOPS)": f"{mw1.fused_tf:.1f}",
+                    "wgrad1 fused acc (cos/ok)": fmt_acc(acc0.get("wgrad1")),
                     "wgrad1 speedup (vs serial)": f"{mw1.speedup:.2f}x",
                     "wgrad1 roofline (max(gemm,disp)/fused)": f"{mw1.roofline_pct:.1f}%",
                 }

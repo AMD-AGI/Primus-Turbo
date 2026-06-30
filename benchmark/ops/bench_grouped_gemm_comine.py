@@ -43,8 +43,14 @@ from tabulate import tabulate
 _HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..")))
 
+# Megatron-LM lives under the sibling Primus repo, not on the default path
+_MEGATRON_LM = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "Primus", "third_party", "Megatron-LM"))
+if _MEGATRON_LM not in sys.path:
+    sys.path.insert(0, _MEGATRON_LM)
+
 from mega_utils import (  # noqa: E402
     bench,
+    check_accuracy,
     compute_stage_metrics,
     dense_gemm_peak_ms,
     generate_input,
@@ -53,14 +59,49 @@ from mega_utils import (  # noqa: E402
     print_header,
     print_stage,
 )
+from megatron.core.fusions.fused_bias_swiglu import (  # noqa: E402
+    weighted_bias_swiglu_impl,
+)
 
+import primus_turbo.pytorch as turbo  # noqa: E402
 from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (  # noqa: E402
     combine_only,
     grouped_gemm_combine_bf16,
+    topk_reduce_only,
 )
+from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
 
 
-def profile_combine(group, args, mode, W1, W2):
+def make_turbo_reference(group, *, num_experts, num_topk, hidden, inter, W1, W2):
+    """Turbo (DeepEP) EP-MoE forward = the ground-truth baseline for ``y``.
+
+    Mirrors the e2e test: DeepEP token_dispatch -> grouped_gemm (NT) -> weighted
+    SwiGLU -> grouped_gemm (NT) -> token_combine. The routing weight rides the SwiGLU
+    (W2 is linear, so it equals weighting the combine input, as the mega kernel does).
+    ``gate_logits`` is the precomputed [T, E] probs (token_dispatch gathers them at
+    ``indices`` and carries them as permuted_probs)."""
+    dispatcher = turbo.modules.DeepEPTokenDispatcher(
+        num_experts=num_experts,
+        router_topk=num_topk,
+        ep_group=group,
+        permute_fusion=True,
+        deepep_num_use_cu=80,
+    )
+
+    def turbo_reference(x, topk_idx, gate_logits):
+        permuted_hidden, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
+            x, gate_logits, indices=topk_idx
+        )
+        group_lens = tokens_per_expert.to(device=x.device, dtype=torch.int64)
+        fc1_out = _turbo_gg(permuted_hidden, W1, group_lens, trans_b=True)
+        act = weighted_bias_swiglu_impl(fc1_out, None, permuted_probs.unsqueeze(-1)).to(x.dtype)
+        fc2_out = _turbo_gg(act, W2, group_lens, trans_b=True)
+        return dispatcher.token_combine(fc2_out)
+
+    return turbo_reference
+
+
+def profile_combine(group, args, mode, W1, W2, turbo_reference):
     """Forward = e2e step 4 (NT): grouped L2 GEMM + combine PUSH + weighted topk reduce -> y.
     Backward = e2e step 3 (NN, always profiled): grad_l1 @ w1 (L1 dgrad) + combine PUSH +
     dx reduce. Both report the 3-role fused kernel (``grouped_gemm_combine_bf16`` with a
@@ -105,6 +146,22 @@ def profile_combine(group, args, mode, W1, W2):
         def _reset_fused():
             symm.sb_l2.zero_()
             symm.barrier_local.zero_()
+
+        # one synced cross-rank op (barrier, optional reset, barrier) so the accuracy
+        # probes run in a clean state, isolated from the timing loops.
+        def _synced(fn, reset=None):
+            torch.cuda.synchronize()
+            group.barrier()
+            if reset is not None:
+                reset()
+                torch.cuda.synchronize()
+                group.barrier()
+            out = fn()
+            torch.cuda.synchronize()
+            group.barrier()
+            return out
+
+        acc = {}
 
         # ---- forward (e2e step 4, NT): L2 GEMM N=H, K=I ; reduce -> y[T,H] (weighted) ----
         N, K = H, I
@@ -159,6 +216,32 @@ def profile_combine(group, args, mode, W1, W2):
             )
         best_fused_cu = min(fused_sweep, key=fused_sweep.get)
         t_fused = fused_sweep[best_fused_cu]
+
+        # accuracy: fused 3-role (GEMM + combine PUSH + weighted topk reduce -> y) is the
+        # full MoE forward output for the raw input ``inp.x`` (``act`` already encodes
+        # dispatch+L1+SwiGLU of x). Reference = the turbo DeepEP full forward (ground truth,
+        # same baseline the e2e test gates on). Turbo applies the routing weight at SwiGLU,
+        # mega at the combine reduce -- equal since W2 is linear.
+        num_tokens = int(symm.num_tokens)
+        gate_logits = torch.zeros(args.num_tokens, args.num_experts, dtype=torch.float32, device="cuda")
+        gate_logits.scatter_(1, inp.topk_idx, inp.topk_weight)
+        ref_y = _synced(lambda: turbo_reference(inp.x, inp.topk_idx, gate_logits))
+        y_fused = _synced(
+            lambda: grouped_gemm_combine_bf16(
+                act,
+                inp.W2,
+                inp.handle,
+                group,
+                topk_indices=topk_idx_flat,
+                topk_weights=topk_w_flat,
+                BM=BM,
+                BN=BN,
+                num_combine_cu=num_combine_cu,
+                num_reduce_cu=args.num_reduce_cu,
+            ),
+            reset=_reset_fused,
+        )[0]
+        acc["fwd"] = check_accuracy(group, "fwd fused (nt)", y_fused, ref_y)
 
         # ---- backward (e2e step 3, NN): L1 dgrad grad_l1[M,2I] @ w1[g,2I,H] -> grad_pool[M,H],
         #      combine PUSH (H-wide) + dx reduce (unweighted -> dx[T,H]) == mega_moe_fused STEP 3.
@@ -220,6 +303,61 @@ def profile_combine(group, args, mode, W1, W2):
                 iters=args.iters,
             )
         best_bwd_cu = min(bwd_fused_sweep, key=bwd_fused_sweep.get)
+
+        # accuracy: bwd fused 3-role NN (GEMM + combine PUSH + unweighted dx reduce) vs the
+        # decoupled gemm_only(nn) + combine_only + topk_reduce_only (weight rides grad_l1).
+        ref_dx = torch.empty(num_tokens, H, device="cuda", dtype=torch.bfloat16)
+
+        def _ref_bwd():
+            symm.sb_l2.zero_()
+            grouped_gemm_bf16_only(
+                grad_l1,
+                inp.W1,
+                symm.l2_token_buffer,
+                tile_to_expert,
+                num_tile_blocks,
+                layout="nn",
+                BM=BM,
+                BN=BN,
+                GROUP_M=8,
+            )
+            torch.cuda.synchronize()
+            group.barrier()
+            combine_only(group, BM=BM, num_combine_cu=args.bwd_combine_cu)
+            torch.cuda.synchronize()
+            group.barrier()
+            symm.barrier_local.zero_()  # 0 == ready
+            topk_reduce_only(
+                ref_dx,
+                symm.comb,
+                symm.barrier_local,
+                topk_idx_flat,
+                symm.num_tokens_per_rank,
+                int(symm.combine_slots),
+                topk=int(symm.num_topk),
+                num_experts=int(symm.num_experts),
+                rank=rank,
+                topk_weights=None,  # unweighted (weight rides grad_l1)
+            )
+
+        _synced(_ref_bwd)
+        dx_fused = _synced(
+            lambda: grouped_gemm_combine_bf16(
+                grad_l1,
+                inp.W1,
+                inp.handle,
+                group,
+                topk_indices=topk_idx_flat,
+                topk_weights=None,
+                layout="nn",
+                BM=BM,
+                BN=BN,
+                num_combine_cu=args.bwd_combine_cu,
+                num_reduce_cu=args.num_reduce_cu,
+            ),
+            reset=_reset_fused,
+        )[0]
+        acc["bwd"] = check_accuracy(group, "bwd STEP3 fused (nn)", dx_fused, ref_dx)
         del grad_l1
     finally:
         symm.destroy()  # always free the symmetric buffer (re-allocated per mode)
@@ -236,6 +374,7 @@ def profile_combine(group, args, mode, W1, W2):
         "fused_cu": best_fused_cu,
         "flops": flops,
         "xgmi_bytes": xgmi_bytes,
+        "acc": acc,
         "bwd": {
             "gemm_only_ms": t_bwd_gemm,
             "dense_gemm_only_ms": t_bwd_dense,
@@ -270,11 +409,22 @@ def benchmark_combine(local_rank, world, args):
     W2 = W2_global[rank * experts_per_rank : (rank + 1) * experts_per_rank].contiguous()
     del W1_global, W2_global
 
+    # turbo (DeepEP) full-forward baseline = the accuracy ground truth (built once)
+    turbo_reference = make_turbo_reference(
+        group,
+        num_experts=args.num_experts,
+        num_topk=args.num_topk,
+        hidden=args.hidden,
+        inter=args.inter,
+        W1=W1,
+        W2=W2,
+    )
+
     modes = ["load_balanced", "round_robin"] if args.mode == "both" else [args.mode]
     rows = []
     try:
         for mode in modes:
-            result = profile_combine(group, args, mode, W1, W2)
+            result = profile_combine(group, args, mode, W1, W2, turbo_reference)
             gathered = [None] * world
             dist.all_gather_object(gathered, (rank, result), group=group)
             if rank != 0:
@@ -292,6 +442,9 @@ def benchmark_combine(local_rank, world, args):
                 return " ".join(f"{cu}->{max(d[key][cu] for d in per_rank):.3f}" for cu in cus)
 
             flops, xgmi = rank_mean("flops"), rank_mean("xgmi_bytes")
+            # fused accuracy verdicts (global worst-rank, identical on every rank)
+            acc0 = per_rank[0]["acc"]
+            fmt_acc = lambda v: "n/a" if v is None else f"{v[0]:.5f}/{'PASS' if v[2] else 'FAIL'}"
             # forward metrics in the shared layout; combine appends CU-sweep details
             m = compute_stage_metrics(
                 gemm_ms=rank_max("gemm_only_ms"),
@@ -373,6 +526,7 @@ def benchmark_combine(local_rank, world, args):
                     "combine_only (XGMI GB/s)": f"{m.comm_bw:.1f}",
                     "fused (ms)": f"{m.fused_ms:.3f}",
                     "fused (TFLOPS)": f"{m.fused_tf:.1f}",
+                    "fused acc (cos/ok)": fmt_acc(acc0.get("fwd")),
                     "comm_hidden (ms)": f"{m.hidden_ms:.3f}",
                     "speedup (vs serial)": f"{m.speedup:.2f}x",
                     "roofline (max(gemm,comb)/fused)": f"{m.roofline_pct:.1f}%",
@@ -384,6 +538,7 @@ def benchmark_combine(local_rank, world, args):
                     "bwd combine_only (XGMI GB/s)": f"{mb.comm_bw:.1f}",
                     "bwd fused (ms)": f"{mb.fused_ms:.3f}",
                     "bwd fused (TFLOPS)": f"{mb.fused_tf:.1f}",
+                    "bwd fused acc (cos/ok)": fmt_acc(acc0.get("bwd")),
                     "bwd speedup (vs serial)": f"{mb.speedup:.2f}x",
                     "bwd roofline (max(gemm,comb)/fused)": f"{mb.roofline_pct:.1f}%",
                 }

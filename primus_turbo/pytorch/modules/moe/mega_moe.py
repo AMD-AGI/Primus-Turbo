@@ -219,7 +219,9 @@ class MegaMoE(nn.Module):
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Fused dispatch -> L1 GEMM -> SwiGLU -> L2 GEMM -> combine -> reduce; returns y [T, hidden]."""
-        return mega_moe_fused(self.ep_group, x, topk_idx, topk_weights, self.w1, self.w2)
+        return mega_moe_fused(
+            self.ep_group, x, topk_idx, topk_weights, self.w1, self.w2, num_experts=self.num_experts
+        )
 
     def forward(
         self,
