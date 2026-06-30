@@ -37,6 +37,8 @@ from tests.pytorch.test_utils import compute_snr
 _WORLD = 8
 # bf16 fused kernel vs fp32 dense reference; worst rank observed ~26 dB, broken < 10 dB
 _SNR_THRESHOLD_DB = 20.0
+# backward grads: bf16-fused vs fp32 ref cos should be ~1; a correct path clears this
+_COS_THRESHOLD = 0.95
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,6 +188,30 @@ class TestMegaMoE(MultiProcessTestCase):
         self._assert_snr(y, ref, tag=f"forward top_k={top_k} shared={shared_expert}")
         dist.destroy_process_group()
 
+    def _cos(self, a, b):
+        """Cosine similarity of two tensors (flattened, fp32); min over the EP group."""
+        a, b = a.detach().float().reshape(-1), b.detach().float().reshape(-1)
+        cos = torch.tensor([float(F.cosine_similarity(a, b, dim=0))], device=self.device)
+        dist.all_reduce(cos, op=dist.ReduceOp.MIN)  # weakest rank governs
+        return float(cos.item())
+
+    def _diff_global_weights(self, c, group):
+        """Gathered global w1/w2 where ONLY this rank's shard is a differentiable leaf.
+
+        Autograd through the dense reference then yields grad exactly for the local
+        expert shard -> directly comparable to the fused op's dW1/dW2.
+        """
+        w1_local = c.moe.w1.detach().clone().requires_grad_(True)
+        w2_local = c.moe.w2.detach().clone().requires_grad_(True)
+        g1 = [torch.empty_like(c.moe.w1) for _ in range(self.world_size)]
+        g2 = [torch.empty_like(c.moe.w2) for _ in range(self.world_size)]
+        dist.all_gather(g1, c.moe.w1.detach().contiguous(), group=group)
+        dist.all_gather(g2, c.moe.w2.detach().contiguous(), group=group)
+        r = group.rank()
+        w1g = torch.cat([w1_local if i == r else g1[i] for i in range(self.world_size)], dim=0)
+        w2g = torch.cat([w2_local if i == r else g2[i] for i in range(self.world_size)], dim=0)
+        return w1_local, w2_local, w1g, w2g
+
     # ── forward + backward: output contract + every param receives a grad ─────
     @skip_if_lt_x_gpu(_WORLD)
     @parametrize("shared_expert", [False, True])
@@ -213,6 +239,48 @@ class TestMegaMoE(MultiProcessTestCase):
         for name, param in c.moe.named_parameters():
             if param.requires_grad:
                 self.assertIsNotNone(param.grad, f"gradient for {name} should exist")
+        dist.destroy_process_group()
+
+    # ── backward VALUE gradcheck: dx / dW1 / dW2 / d_topk_w vs dense reference ──
+    @skip_if_lt_x_gpu(_WORLD)
+    def test_backward_gradcheck(self):
+        self._init_process()
+        group = self._ep_group()
+        c = MegaMoETestContainer(group, hidden_size=2048, intermediate_size=1024, num_experts=32, top_k=4)
+        # routed-expert path only (expert_compute == mega_moe_fused); fixed routing so
+        # dx/dW isolate the dispatch<->combine duality and match the dense reference.
+        x = torch.randn((512, c.hidden_size), device=self.device, dtype=torch.bfloat16, requires_grad=True)
+        with torch.no_grad():
+            topk_idx, topk_w = c.moe.route(x)
+        tw = topk_w.detach().clone().requires_grad_(True)
+        # shared upstream gradient (same values for fused + reference)
+        g = torch.randn((512, c.hidden_size), device=self.device, dtype=torch.bfloat16)
+
+        # fused op grads
+        y = c.moe.expert_compute(x, topk_idx, tw)
+        dx_m, dW1_m, dW2_m, dtw_m = torch.autograd.grad(
+            y, [x, c.moe.w1, c.moe.w2, tw], grad_outputs=g, allow_unused=True
+        )
+
+        # dense fp32 reference grads (local shard differentiable inside the global weight)
+        xr = x.detach().clone().requires_grad_(True)
+        twr = topk_w.detach().clone().requires_grad_(True)
+        w1_local, w2_local, w1g, w2g = self._diff_global_weights(c, group)
+        ref = _dense_moe_reference(xr, topk_idx, twr, w1g, w2g)
+        dx_r, dW1_r, dW2_r, dtw_r = torch.autograd.grad(
+            ref, [xr, w1_local, w2_local, twr], grad_outputs=g.float(), allow_unused=True
+        )
+
+        cos = {
+            "dx": self._cos(dx_m, dx_r),
+            "dW1": self._cos(dW1_m, dW1_r),
+            "dW2": self._cos(dW2_m, dW2_r),
+            "d_topk_w": self._cos(dtw_m, dtw_r),
+        }
+        if self.rank == 0:
+            print("[gradcheck] min cos vs dense ref: " + ", ".join(f"{k}={v:.4f}" for k, v in cos.items()))
+        for k, v in cos.items():
+            self.assertGreaterEqual(v, _COS_THRESHOLD, f"[gradcheck] {k} cos {v:.4f} < {_COS_THRESHOLD}")
         dist.destroy_process_group()
 
     # ── padding_mask: padded tokens contribute a zero MoE row ─────────────────

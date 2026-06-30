@@ -43,6 +43,22 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 import torch.nn.functional as F  # noqa: E402
 
+# Megatron-LM lives under the sibling Primus repo, not on the default path
+_MEGATRON_LM = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "Primus", "third_party", "Megatron-LM")
+)
+if _MEGATRON_LM not in sys.path:
+    sys.path.insert(0, _MEGATRON_LM)
+
+from megatron.core.fusions.fused_bias_swiglu import (  # noqa: E402
+    weighted_bias_swiglu_impl,
+)
+from megatron.core.tensor_parallel.random import (  # noqa: E402
+    get_cuda_rng_tracker,
+    get_expert_parallel_rng_tracker_name,
+)
+from megatron.core.transformer.moe.moe_utils import apply_random_logits  # noqa: E402
+
 import primus_turbo.pytorch as turbo  # noqa: E402
 
 # fused mega MoE forward + single-allocation symmetric buffer (implementation under test)
@@ -99,14 +115,75 @@ def bench_kineto(fn, *, warmup=5, num_tests=20, group=None, flush_l2=True):
     # aggregate device-side kernel durations AND launch counts by name over num_tests calls
     agg: dict[str, float] = {}
     cnt: dict[str, int] = {}
+    # include memcpy (gpu_memcpy) but NOT memset (the _l2_flush memset is excluded)
     for ev in events:
-        if ev.get("cat") in ("kernel", "Kernel") and "dur" in ev:
+        if ev.get("cat") in ("kernel", "Kernel", "gpu_memcpy") and "dur" in ev:
             agg[ev["name"]] = agg.get(ev["name"], 0.0) + float(ev["dur"])
             cnt[ev["name"]] = cnt.get(ev["name"], 0) + 1
     # (name, avg_us_per_iter, avg_launches_per_iter)
     breakdown = [(name, dur / num_tests, cnt[name] / num_tests) for name, dur in agg.items()]
     breakdown.sort(key=lambda t: -t[1])
     return breakdown
+
+
+def bench_kineto_dist(fn, *, warmup=5, num_tests=50, group=None, flush_l2=False):
+    """Profile ``fn`` as a CONTINUOUS loop and return PER-CALL durations per kernel.
+
+    Unlike ``bench_kineto`` (which flushes the L2 before each call and reports the
+    per-kernel AVERAGE), this runs ``fn`` back-to-back with NO L2 flush and NO
+    per-iter sync -- mirroring a real training loop, where the backward of one
+    iter overlaps the next iter's forward and they contend for XGMI / L2. The full
+    per-call duration list lets the caller report min/avg/max/p99 to catch spikes
+    (e.g. dispatch_grouped_gemm backward jumping 4ms -> 9ms) that an average hides.
+
+    Returns {kernel_name: [dur_us, ...]} aggregating every captured call.
+    """
+    for _ in range(warmup):
+        fn()
+    if flush_l2:
+        _l2_flush()
+    torch.cuda.synchronize()
+    if group is not None:
+        group.barrier()
+
+    schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) as prof:
+        for _ in range(2):  # wait step, then active step capturing the continuous loop
+            for _ in range(num_tests):
+                fn()
+            torch.cuda.synchronize()
+            prof.step()
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as tmp:
+        prof.export_chrome_trace(tmp.name)
+        events = json.loads(Path(tmp.name).read_text())["traceEvents"]
+
+    dist_by_name: dict[str, list] = {}
+    for ev in events:
+        if ev.get("cat") in ("kernel", "Kernel", "gpu_memcpy") and "dur" in ev:
+            dist_by_name.setdefault(ev["name"], []).append(float(ev["dur"]))
+    return dist_by_name
+
+
+def _pct(vals, q):
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    i = min(len(s) - 1, int(q * (len(s) - 1) + 0.5))
+    return s[i]
+
+
+def _print_dist(title, dist_by_name, *, top=20):
+    # sort kernels by total time (sum) desc; show the per-call spread
+    rows = sorted(dist_by_name.items(), key=lambda kv: -sum(kv[1]))
+    print(title)
+    print(f"  {'min':>9} {'avg':>9} {'p50':>9} {'p90':>9} {'p99':>9} {'max':>9} {'n':>5}  kernel")
+    for name, vals in rows[:top]:
+        avg = sum(vals) / len(vals)
+        print(
+            f"  {min(vals):9.1f} {avg:9.1f} {_pct(vals, 0.5):9.1f} {_pct(vals, 0.9):9.1f} "
+            f"{_pct(vals, 0.99):9.1f} {max(vals):9.1f} {len(vals):5d}  {name[:60]}"
+        )
 
 
 def _diff_breakdown(total_breakdown, base_breakdown, *, eps=0.05):
@@ -151,13 +228,16 @@ def _print_breakdown(title, breakdown):
 def generate_routing(num_tokens, num_topk, num_experts, mode, *, device="cuda", seed=0):
     """Return (topk_idx[T,K] int64, topk_w[T,K] f32) for the requested routing mode.
 
-    load_balanced: softmax-topk of random positive scores (abs + 1).
+    load_balanced: softmax-topk of Megatron force-load-balancing random logits
+                   (apply_random_logits -> rank-seeded normal logits).
     round_robin:   experts assigned by a contiguous arange % num_experts pattern.
     """
     g = torch.Generator(device=device).manual_seed(seed)
     if mode == "load_balanced":
-        scores = torch.rand(num_tokens, num_experts, generator=g, device=device).abs() + 1
-        topk_w, topk_idx = torch.topk(scores.softmax(-1), num_topk, dim=-1)
+        # Mirror Megatron moe_router_force_load_balancing: random normal logits.
+        logits = torch.empty(num_tokens, num_experts, device=device, dtype=torch.float32)
+        logits = apply_random_logits(logits)
+        topk_w, topk_idx = torch.topk(logits.softmax(-1), num_topk, dim=-1)
         topk_idx = topk_idx.to(torch.int64)
         topk_w = topk_w.to(torch.float32)
     elif mode == "round_robin":
@@ -208,8 +288,7 @@ def make_baseline_reference(group, *, num_experts, num_topk, hidden, inter, W1, 
         )
         group_lens = tokens_per_expert.to(device=x.device, dtype=torch.int64)
         fc1_out = _turbo_gg(permuted_hidden, w1, group_lens, trans_b=True)
-        gate, up = fc1_out.chunk(2, dim=-1)
-        inter = (F.silu(gate.float()) * up.float() * permuted_probs.unsqueeze(-1)).to(x.dtype)
+        inter = weighted_bias_swiglu_impl(fc1_out, None, permuted_probs.unsqueeze(-1)).to(x.dtype)
         fc2_out = _turbo_gg(inter, w2, group_lens, trans_b=True)
         return dispatcher.token_combine(fc2_out)
 
@@ -223,7 +302,15 @@ def make_baseline_reference(group, *, num_experts, num_topk, hidden, inter, W1, 
         w2_leaf = fc2.detach().requires_grad_(True)
         return _turbo_forward(x_leaf, topk_idx, gate_logits, w1_leaf, w2_leaf)
 
-    return baseline_reference, baseline_grad_forward
+    # grad-enabled forward exposing the leaves so callers can read their grads (gradcheck)
+    def baseline_grad_forward_leaves(x, topk_idx, gate_logits):
+        x_leaf = x.detach().requires_grad_(True)
+        w1_leaf = fc1.detach().requires_grad_(True)
+        w2_leaf = fc2.detach().requires_grad_(True)
+        y = _turbo_forward(x_leaf, topk_idx, gate_logits, w1_leaf, w2_leaf)
+        return y, x_leaf, w1_leaf, w2_leaf
+
+    return baseline_reference, baseline_grad_forward, baseline_grad_forward_leaves
 
 
 def _gate3(g, ref):
@@ -246,6 +333,13 @@ def _run(local_rank, world, args):
     group = dist.new_group(list(range(world)))
     rank = dist.get_rank()
 
+    # Register a rank-specific expert-parallel RNG state so apply_random_logits()
+    # (used by generate_routing's load_balanced mode) can fork it.
+    _tracker = get_cuda_rng_tracker()
+    _ep_rng = get_expert_parallel_rng_tracker_name()
+    if _ep_rng not in _tracker.get_states():
+        _tracker.add(_ep_rng, 1024 + 100 * rank)
+
     H, I, E, K, T = args.hidden, args.inter, args.num_experts, args.num_topk, args.num_tokens
     epr = E // world
     assert E % world == 0, "num_experts must be divisible by world_size"
@@ -259,7 +353,7 @@ def _run(local_rank, world, args):
     W2 = W2g[rank * epr : (rank + 1) * epr].contiguous()
 
     # turbo baseline + mega fused symmetric buffer (allocate once, reuse per step)
-    baseline_reference, baseline_grad_forward = make_baseline_reference(
+    baseline_reference, baseline_grad_forward, baseline_grad_forward_leaves = make_baseline_reference(
         group, num_experts=E, num_topk=K, hidden=H, inter=I, W1=W1, W2=W2
     )
     symm = get_symm_buffer_for_mega_moe(
@@ -306,6 +400,173 @@ def _run(local_rank, world, args):
         # every rank asserts the global verdict -> a failure propagates through spawn
         assert all(g[3] for g in gathered), f"[{mode}] gate-3 FAILED"
 
+        # ---- probe: is the NN dgrad GEMM (d_swiglu = d_l2y @ w2) the broken stage? ----
+        if args.probe_dswiglu:
+            from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
+            from primus_turbo.pytorch.core.backend import BackendType
+            from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (
+                dispatch_grouped_gemm_impl,
+            )
+
+            with torch.no_grad():
+                # forward dispatch builds the symm pool + handle (same as mega_moe_fused STEP1+2)
+                _l1, _, _, handle = dispatch_grouped_gemm_impl(
+                    x,
+                    W1,
+                    group,
+                    BackendType.FLYDSL.value,
+                    topk_idx=topk_idx.to(torch.int64),
+                    topk_weights=topk_w,
+                    layout="nt",
+                )
+                l1_out = _l1.clone()
+                weight = symm.weight_recv_buf.clone().float()  # per-pool-row routing weight
+                dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
+                # STEP1 backward: NN dispatch of dy -> d_swiglu = d_l2y @ w2
+                d_swiglu, _, _, _ = dispatch_grouped_gemm_impl(
+                    dy,
+                    W2,
+                    group,
+                    BackendType.FLYDSL.value,
+                    handle=handle,
+                    layout="nn",
+                )
+                d_l2y = symm.pool.clone()  # pool now holds the dispatched dy rows
+                group_lens, group_offs = handle[9].tolist(), handle[10].tolist()
+                Iq = I
+
+                # (a) NN dgrad GEMM: d_swiglu = d_l2y @ w2
+                ds_ref = torch.zeros_like(d_swiglu)
+                for e in range(epr):
+                    s, L = int(group_offs[e]), int(group_lens[e])
+                    if L > 0:
+                        ds_ref[s : s + L] = (d_l2y[s : s + L].float() @ W2[e].float()).to(d_swiglu.dtype)
+
+                # (b) swiglu_backward in-situ: grad_l1 (dgate|dup) + act_w
+                grad_l1, grad_gate, act_w = swiglu_backward(
+                    d_swiglu, l1_out, scale=symm.weight_recv_buf, return_gate=True, return_act_w=True
+                )
+                gate = l1_out[:, :Iq].float()
+                up = l1_out[:, Iq:].float()
+                sig = torch.sigmoid(gate)
+                s_silu = gate * sig
+                d = d_swiglu.float() * weight.unsqueeze(-1)
+                dgate_ref = d * up * (sig * (1 + gate * (1 - sig)))
+                dup_ref = d * s_silu
+                gl1_ref = torch.cat([dgate_ref, dup_ref], dim=-1).to(grad_l1.dtype)
+                actw_ref = (s_silu * up * weight.unsqueeze(-1)).to(act_w.dtype)
+
+                mask = d_l2y.abs().sum(-1) > 0
+
+                # (c) dW1 tn-wgrad STEP4: re-dispatch x into pool, dW1[e] = grad_l1[e]^T @ x_pool[e]
+                dW1, _, _, _ = dispatch_grouped_gemm_impl(
+                    x,
+                    grad_l1,
+                    group,
+                    BackendType.FLYDSL.value,
+                    handle=handle,
+                    layout="tn",
+                    trans_c=True,
+                )
+                x_pool = symm.pool.clone()
+                xv = x_pool.abs().sum(-1) > 0  # valid (dispatched) rows
+                gl = grad_l1.float().clone()
+                gl[~xv] = 0  # invalid rows contribute nothing
+                xp = x_pool.float().clone()
+                xp[~xv] = 0
+                dW1_ref = torch.zeros_like(dW1)
+                for e in range(epr):
+                    s, L = int(group_offs[e]), int(group_lens[e])
+                    if L > 0:
+                        dW1_ref[e] = (gl[s : s + L].T @ xp[s : s + L]).to(dW1.dtype)  # [2I, H]
+
+                checks = {
+                    "d_swiglu(NN gemm)": _gate3(d_swiglu[mask], ds_ref[mask]),
+                    "act_w(swiglu_bwd)": _gate3(act_w[mask], actw_ref[mask]),
+                    "grad_l1(swiglu_bwd)": _gate3(grad_l1[mask], gl1_ref[mask]),
+                    "dW1(tn wgrad)": _gate3(dW1, dW1_ref),
+                }
+                gd = [None] * world
+                dist.all_gather_object(gd, (rank, checks, int(mask.sum())), group=group)
+                if rank == 0:
+                    print(f"[{mode}] PROBE backward stages vs torch ref (cos/rel/ok):")
+                    for r, cc, nrows in sorted(gd, key=lambda t: t[0]):
+                        line = "  ".join(f"{n}: {v[0]:.5f}/{v[1]:.4f}/{v[2]}" for n, v in cc.items())
+                        print(f"  rank={r} rows={nrows}  {line}")
+
+        # ---- backward gradcheck: mega grads vs the turbo baseline (same grad_y) ----
+        if args.bwd:
+            grad_y = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
+            # mega fused grads (fixed routing; x/W1/W2 leaves)
+            x_m = x.detach().requires_grad_(True)
+            w1_m = W1.detach().requires_grad_(True)
+            w2_m = W2.detach().requires_grad_(True)
+            y_m = mega_moe_fused(group, x_m, topk_idx, topk_w, w1_m, w2_m, block_m=args.bm, block_n=args.bn)
+            dx_m, dW1_m, dW2_m = torch.autograd.grad(y_m, [x_m, w1_m, w2_m], grad_y)
+            # turbo baseline grads (same grad_y, same local shard)
+            y_t, x_t, w1_t, w2_t = baseline_grad_forward_leaves(x, topk_idx, gate_logits)
+            dx_t, dW1_t, dW2_t = torch.autograd.grad(y_t, [x_t, w1_t, w2_t], grad_y)
+            bres = {
+                "dx": _gate3(dx_m, dx_t),
+                "dW1": _gate3(dW1_m, dW1_t),
+                "dW2": _gate3(dW2_m, dW2_t),
+            }
+            bgathered = [None] * world
+            dist.all_gather_object(bgathered, (rank, bres), group=group)
+            if rank == 0:
+                print(f"[{mode}] BACKWARD gradcheck vs turbo (cos / rel_rmse / ok):")
+                for r, rr in sorted(bgathered, key=lambda t: t[0]):
+                    line = "  ".join(f"{n}: {v[0]:.5f}/{v[1]:.4f}/{v[2]}" for n, v in rr.items())
+                    print(f"  rank={r}  {line}")
+
+        # ---- train-loop: reproduce the training case (continuous fwd+bwd, no L2 flush) ----
+        # Real training runs fwd->bwd->fwd->bwd with no sync/flush between iters, so the
+        # backward of one iter overlaps the next iter's forward and they contend for XGMI.
+        # Profile that continuous loop and report per-call min/avg/max/p99 to catch the
+        # dispatch_grouped_gemm backward spiking 4ms -> 9ms that the averaged --perf hides.
+        if args.train_loop:
+            grad_y = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
+
+            # Simulate the multi-layer training shape: run N MoE-layer forwards (all
+            # consuming the SAME well-conditioned x so routing stays balanced -- do NOT
+            # chain outputs, that diverges and deadlocks, see memory note
+            # project_mega_multilayer_hang_rootcause), keeping every autograd graph
+            # alive, then a single backward() runs all N backwards in reverse order
+            # (layer N..1). The N layers share one symm buffer (per-layer origin/meta
+            # snapshots restore it in backward), so the backward dispatch/combine of
+            # later layers overlaps earlier layers' work -- the real contention the
+            # single-layer loop lacks.
+            x_leaf = x.detach().requires_grad_(True)
+            w1_leaf = W1.detach().requires_grad_(True)
+            w2_leaf = W2.detach().requires_grad_(True)
+
+            def _train_step():
+                ys = [
+                    mega_moe_fused(
+                        group, x_leaf, topk_idx, topk_w, w1_leaf, w2_leaf, block_m=args.bm, block_n=args.bn
+                    )
+                    for _ in range(args.num_layers)
+                ]
+                # N forwards done; now N backwards back-to-back (reverse order)
+                torch.autograd.backward(ys, [grad_y] * len(ys))
+
+            mega_dist = bench_kineto_dist(
+                _train_step, num_tests=args.perf_iters, group=group, flush_l2=args.train_flush_l2
+            )
+
+            def _turbo_train_step():
+                ys = [baseline_grad_forward(x, topk_idx, gate_logits) for _ in range(args.num_layers)]
+                torch.autograd.backward(ys, [grad_y] * len(ys))
+
+            turbo_dist = bench_kineto_dist(
+                _turbo_train_step, num_tests=args.perf_iters, group=group, flush_l2=args.train_flush_l2
+            )
+            if rank == 0:
+                flush = "L2-flush ON" if args.train_flush_l2 else "no L2-flush (training-like)"
+                tag = f"{flush}, L={args.num_layers}, x{args.perf_iters} iters"
+                _print_dist(f"[{mode}] mega TRAIN-LOOP per-call dist us ({tag}):", mega_dist)
+                _print_dist(f"[{mode}] turbo TRAIN-LOOP per-call dist us ({tag}):", turbo_dist)
+
         # ---- perf: per-kernel breakdown of the mega forward + backward (kineto) ----
         # backward is isolated by subtraction: profile the (grad-enabled) forward and
         # forward+backward, then diff. The same forward closure feeds both passes, so
@@ -329,6 +590,23 @@ def _run(local_rank, world, args):
                 bwd_breakdown = _diff_breakdown(fwdbwd_breakdown, fwd_breakdown)
                 _print_breakdown(f"[{mode}] mega FORWARD per-kernel breakdown (us/call, %):", fwd_breakdown)
                 _print_breakdown(f"[{mode}] mega BACKWARD per-kernel breakdown (us/call, %):", bwd_breakdown)
+
+            # turbo (DeepEP) baseline per-kernel breakdown (same kineto path as mega)
+            def _turbo_fwd():
+                return baseline_grad_forward(x, topk_idx, gate_logits)
+
+            turbo_fwd_breakdown = bench_kineto(_turbo_fwd, num_tests=args.perf_iters, group=group)
+            turbo_fwdbwd_breakdown = bench_kineto(
+                lambda: _turbo_fwd().backward(grad_y), num_tests=args.perf_iters, group=group
+            )
+            if rank == 0:
+                turbo_bwd_breakdown = _diff_breakdown(turbo_fwdbwd_breakdown, turbo_fwd_breakdown)
+                _print_breakdown(
+                    f"[{mode}] turbo FORWARD per-kernel breakdown (us/call, %):", turbo_fwd_breakdown
+                )
+                _print_breakdown(
+                    f"[{mode}] turbo BACKWARD per-kernel breakdown (us/call, %):", turbo_bwd_breakdown
+                )
 
             # wall-clock e2e (captures host-sync/barrier cost the kineto kernel-sum filters out)
             import time as _time
@@ -388,7 +666,23 @@ def _build_argparser():
     ap.add_argument("--bn", type=int, default=256)
     ap.add_argument("--mode", choices=["load_balanced", "round_robin", "both"], default="both")
     ap.add_argument("--perf", action="store_true")
+    ap.add_argument("--bwd", action="store_true", help="run mega-vs-turbo backward gradcheck")
+    ap.add_argument("--probe-dswiglu", action="store_true", help="probe the NN dgrad GEMM d_swiglu=d_l2y@w2")
     ap.add_argument("--perf-iters", type=int, default=50)
+    ap.add_argument(
+        "--train-loop",
+        action="store_true",
+        help="continuous fwd+bwd loop (no L2 flush); per-call min/avg/max/p99 to catch bwd spikes",
+    )
+    ap.add_argument(
+        "--train-flush-l2", action="store_true", help="flush L2 each iter in --train-loop (default off)"
+    )
+    ap.add_argument(
+        "--num-layers",
+        type=int,
+        default=1,
+        help="--train-loop: stack N MoE layers (N forwards then N backwards, like training)",
+    )
     return ap
 
 

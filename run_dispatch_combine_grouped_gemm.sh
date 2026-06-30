@@ -26,7 +26,7 @@ PORT="${MASTER_PORT:-$(( 20000 + RANDOM % 20000 ))}"
 echo "[run_dispatch_combine_grouped_gemm] container=$CONTAINER repo=$REPO port=$PORT np=$NP"
 echo "[run_dispatch_combine_grouped_gemm] test=$TEST args=$*"
 
-docker exec -e PYTORCH_ROCM_ARCH=gfx950 -e REPO="$REPO" -e TEST="$TEST" \
+docker exec -e PYTHONUNBUFFERED=1 -e PYTORCH_ROCM_ARCH=gfx950 -e REPO="$REPO" -e TEST="$TEST" \
   -e MASTER_PORT="$PORT" -e NP="$NP" \
   "$CONTAINER" bash -lc '
 set -e
