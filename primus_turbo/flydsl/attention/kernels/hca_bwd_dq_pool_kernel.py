@@ -1185,23 +1185,47 @@ def build_hca_bwd_dq_pool_module(
                 _yield.append(next_buf)
             yield _yield
 
-        # ---- Final store: dQ_fp32 += dq_acc * sm_scale (load + add + store) ----
-        # Pool kernel ACCUMULATES into the existing LOCAL-stream dq buffer.
-        # Race-free because each program owns a unique (b, qhid, m_block)
-        # slice, and the launcher runs this kernel sequentially AFTER the
-        # SWA dq kernel has finished writing the LOCAL contribution.
+        # ---- Final store: dQ_pool[bf16] = dq_acc * sm_scale (packed 2xbf16) ----
+        # The pool stream writes its dQ contribution into a DEDICATED
+        # zero-init bf16 buffer (the launcher adds it onto the f32 local dq
+        # afterwards), so this epilogue is a pure STORE -- the previous f32
+        # load+add+store RMW chain is gone. Each lane owns two adjacent head-dim
+        # columns (d_col, d_col+1) for every r-pair, so the two bf16 lanes of a
+        # 32-bit packed word come from the SAME thread: a plain packed-bf16
+        # store is race-free (no atomics needed) and halves the store op count.
         dq_finals = [
             loop_results[dc] for dc in range_constexpr(D_CHUNKS)
         ]
         sm_scale_vec = vector.broadcast(v16f32_type, c_sm_scale)
 
-        def _gep_load_f32(base_ptr_, elem_idx):
+        _v2_elem_type = T.vec(2, elem_type)
+        _v1i32_type = T.vec(1, T.i32)
+
+        def _pack2_dq(f0, f1):
+            """Pack two scaled f32 dQ values into a vec(2, elem_type)."""
+            if const_expr(dtype_str == "bf16"):
+                _c16 = arith.constant(16, type=T.i32)
+                _cmask = arith.constant(0xFFFF0000, type=T.i32)
+                a = arith.ArithValue(f0).bitcast(T.i32)
+                b = arith.ArithValue(f1).bitcast(T.i32)
+                # low 16 bits = trunc(f0), high 16 bits = trunc(f1).
+                p = arith.OrIOp(arith.AndIOp(b, _cmask).result,
+                                arith.ShRUIOp(a, _c16).result).result
+                return vector.bitcast(
+                    _v2_elem_type,
+                    vector.from_elements(_v1i32_type, [p]),
+                )
+            e0 = arith.trunc_f(elem_type, f0)
+            e1 = arith.trunc_f(elem_type, f1)
+            return vector.from_elements(_v2_elem_type, [e0, e1])
+
+        def _gep_store_pack2(val, base_ptr_, elem_idx):
             idx_i64 = arith.index_cast(T.i64, elem_idx)
             gep = _llvm.GEPOp(_llvm_ptr_ty(), base_ptr_, [idx_i64],
                               rawConstantIndices=[_LLVM_GEP_DYNAMIC],
-                              elem_type=T.f32,
+                              elem_type=elem_type,
                               noWrapFlags=0)
-            return _llvm.LoadOp(T.f32, gep.result).result
+            _llvm.StoreOp(val, gep.result)
 
         _o_guard = scf.IfOp(q_in_bounds, [], has_else=False)
         with ir.InsertionPoint(_o_guard.then_block):
@@ -1209,20 +1233,20 @@ def build_hca_bwd_dq_pool_module(
                 dq_scaled = arith.MulFOp(
                     dq_finals[dc], sm_scale_vec, fastmath=fm_fast,
                 ).result
-                for r in range_constexpr(16):
-                    dq_val = vector.extract(
-                        dq_scaled,
-                        static_position=[r],
-                        dynamic_position=[],
-                    )
-                    d_row_rel = lane_div_32 * 4 + (r // 4) * 8 + (r % 4)
+                # r-pairs (2j, 2j+1) map to contiguous head-dim columns
+                # (d_col, d_col+1) with d_col even -> 32-bit-aligned packed store.
+                for j in range_constexpr(8):
+                    r0 = 2 * j
+                    r1 = 2 * j + 1
+                    dq_v0 = vector.extract(
+                        dq_scaled, static_position=[r0], dynamic_position=[])
+                    dq_v1 = vector.extract(
+                        dq_scaled, static_position=[r1], dynamic_position=[])
+                    d_row_rel = lane_div_32 * 4 + (r0 // 4) * 8 + (r0 % 4)
                     d_col = arith.index(dc * D_CHUNK) + d_row_rel
                     dq_global = global_idx_q(q_row, d_col)
-                    dq_prev = _gep_load_f32(dq_ptr, dq_global)
-                    dq_sum = arith.AddFOp(
-                        dq_val, dq_prev, fastmath=fm_fast,
-                    ).result
-                    _gep_store_f32(dq_sum, dq_ptr, dq_global)
+                    packed = _pack2_dq(dq_v0, dq_v1)
+                    _gep_store_pack2(packed, dq_ptr, dq_global)
             scf.YieldOp([])
 
     @flyc.jit

@@ -34,6 +34,10 @@ from typing import Optional, Tuple
 
 import torch
 
+from primus_turbo.flydsl.attention.kernels.csa_bwd_dkv_kernel import build_csa_bwd_dkv_module
+from primus_turbo.flydsl.attention.kernels.csa_bwd_dq_finalize_kernel import (
+    build_csa_bwd_dgathered_finalize_module,
+)
 from primus_turbo.flydsl.attention.kernels.csa_bwd_full_kernel import build_csa_bwd_full_module
 from primus_turbo.flydsl.attention.kernels.hca_bwd_dkv_pool_kernel import build_hca_bwd_dkv_pool_module
 from primus_turbo.flydsl.attention.kernels.hca_bwd_dq_pool_kernel import build_hca_bwd_dq_pool_module
@@ -232,6 +236,13 @@ def _hca_split_mask_bwd(
         int(Sq),
     )
 
+    # The pool-stream dQ kernel writes its contribution into a dedicated
+    # zero-init bf16 buffer via packed 2xbf16 stores (no f32 RMW),
+    # then we add it onto the f32 local dq. This de-serialises the pool dq
+    # epilogue (drops the load+add and halves the store op count) while keeping
+    # the f32 local-stream contract intact (dq_fp32 stays f32-accurate for the
+    # local term; only the pool term is truncated to bf16 before the merge).
+    dq_pool_bf16 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=q.dtype)
     dq_pool_launch = _get_dq_pool(HQ, D, int(pool_size), int(hca_local_seqlen), dtype_str, True)
     dq_pool_launch(
         q_c,
@@ -240,12 +251,13 @@ def _hca_split_mask_bwd(
         dout_c,
         lse_c,
         d_buf,
-        dq_fp32,
+        dq_pool_bf16,
         add_mask,
         int(B),
         int(Sq),
         int(Sk),
     )
+    dq_fp32.add_(dq_pool_bf16.to(torch.float32))
 
     # ---- dK / dV: local stream rows, then pool stream rows (atomic-add) ----
     dk_local_fp32 = torch.zeros((B, HK, Sq, D), device=q.device, dtype=torch.float32)
@@ -411,6 +423,39 @@ def hca_attention_bwd_flydsl_kernel(
 
 _CSA_BWD_CACHE = {}
 _CSA_BWD_LOCK = threading.Lock()
+# Dedicated MFMA matrix-core kernel for the LOCAL-branch dk_local / dv_local
+# contractions (split out of csa_bwd_full).
+_CSA_BWD_DKV_CACHE = {}
+_CSA_BWD_DKV_LOCK = threading.Lock()
+# dgathered split-K finalize reduce (sums the per-head-group bf16 stripes of
+# the packed-bf16 split scratch back into the fp32 dgathered).
+_CSA_BWD_DGFIN_CACHE = {}
+_CSA_BWD_DGFIN_LOCK = threading.Lock()
+
+
+# Mirror the csa_bwd_full head-grouping (head_block=4, gated on MQA and
+# HQ % 4 == 0) so the launcher can size the disjoint split scratch's group axis.
+def _csa_bwd_num_head_groups(num_heads, mqa_kv):
+    hb_req = 4
+    if mqa_kv and (int(num_heads) % hb_req == 0):
+        head_block = hb_req
+    else:
+        head_block = 1
+    return int(num_heads) // head_block
+
+
+def _get_csa_bwd_dgfinalize(head_dim, num_groups, dtype_str):
+    key = (head_dim, num_groups, dtype_str)
+    with _CSA_BWD_DGFIN_LOCK:
+        if key in _CSA_BWD_DGFIN_CACHE:
+            return _CSA_BWD_DGFIN_CACHE[key]
+        launch = build_csa_bwd_dgathered_finalize_module(
+            head_dim=head_dim,
+            num_groups=num_groups,
+            dtype_str=dtype_str,
+        )
+        _CSA_BWD_DGFIN_CACHE[key] = launch
+        return launch
 
 
 def _get_csa_bwd_full(num_heads, head_dim, swa_window, dtype_str, has_sink, has_sparse, mqa_kv):
@@ -418,6 +463,25 @@ def _get_csa_bwd_full(num_heads, head_dim, swa_window, dtype_str, has_sink, has_
     with _CSA_BWD_LOCK:
         if key in _CSA_BWD_CACHE:
             return _CSA_BWD_CACHE[key]
+        # Head-group ownership sizing along the axis that carries the dgathered
+        # atomic contention. DGATHERED is dense [B, Sq, K_topk, D] with NO head
+        # axis, so every one of the NUM_HEAD_GROUPS = HQ/HEAD_BLOCK head-group
+        # programs atomic_fadd's into the SAME [b, q, k_pos, d] word; the
+        # in-register pre-sum only collapses the HEAD_BLOCK heads WITHIN a
+        # program, leaving HQ/HEAD_BLOCK groups still serializing on the RMW and
+        # re-reading the head-shared gathered g_afrag/g_vec lines once per group.
+        # HEAD_BLOCK=4 with QROW_BLOCK=1 keeps the live VGPR footprint neutral
+        # (the dq_accs / qk-dp caches scale with the HB*QR product, 4*1 == 2*2)
+        # and keeps the LOCAL per-tile K/V reuse count identical (4 consumers
+        # either way: 4 heads x 1 row vs 2 heads x 2 rows), but (a) doubles the
+        # head-shared GATHERED line reuse within one program (g_afrag/g_vec
+        # fetched once, reused across 4 heads instead of 2 -> higher L2 hit rate
+        # on the dense gathered tensor) and (b) halves the cross-head-group
+        # dgathered atomic contention (HQ/4 contending groups instead of HQ/2 --
+        # single-owner-style in-register accumulation over twice as many heads
+        # before one atomic_fadd). Gated inside the build on mqa_kv and
+        # NUM_HEADS % 4 == 0; MHA / indivisible head counts fall back to
+        # HEAD_BLOCK=1.
         launch = build_csa_bwd_full_module(
             num_heads=num_heads,
             head_dim=head_dim,
@@ -427,9 +491,27 @@ def _get_csa_bwd_full(num_heads, head_dim, swa_window, dtype_str, has_sink, has_
             has_sparse=has_sparse,
             block_n=32,
             block_k=32,
+            qrow_block=1,
+            head_block=4,
             mqa_kv=mqa_kv,
         )
         _CSA_BWD_CACHE[key] = launch
+        return launch
+
+
+def _get_csa_bwd_dkv(num_heads, head_dim, swa_window, dtype_str, mqa_kv):
+    key = (num_heads, head_dim, swa_window, dtype_str, mqa_kv)
+    with _CSA_BWD_DKV_LOCK:
+        if key in _CSA_BWD_DKV_CACHE:
+            return _CSA_BWD_DKV_CACHE[key]
+        launch = build_csa_bwd_dkv_module(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            swa_window=swa_window,
+            dtype_str=dtype_str,
+            mqa_kv=mqa_kv,
+        )
+        _CSA_BWD_DKV_CACHE[key] = launch
         return launch
 
 
@@ -494,6 +576,14 @@ def csa_attention_bwd_flydsl_kernel(
     dkl_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
     dvl_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
     dgathered_fp32 = torch.zeros((B, Sq, K_topk, D), device=q.device, dtype=torch.float32)
+    # Warp-disjoint packed-bf16 split-K scratch for the gathered gradient.
+    # The full kernel writes its disjoint head-group stripe with a
+    # plain packed 2xbf16 store (no atomic_fadd RMW); the finalize reduce sums
+    # the NUM_HEAD_GROUPS stripes back into dgathered_fp32.
+    num_head_groups = _csa_bwd_num_head_groups(HQ, mqa_kv)
+    dgathered_split_bf16 = torch.zeros(
+        (B, Sq, K_topk, num_head_groups, D), device=q.device, dtype=q.dtype
+    )
     dsink_fp32 = torch.zeros((HQ,), device=q.device, dtype=torch.float32)
     if has_sink:
         sink_arg = sink.to(torch.float32) if sink.dtype != torch.float32 else sink.contiguous()
@@ -514,11 +604,41 @@ def csa_attention_bwd_flydsl_kernel(
         dq_fp32,
         dkl_fp32,
         dvl_fp32,
-        dgathered_fp32,
+        dgathered_split_bf16,
         dsink_fp32,
         int(B),
         int(Sq),
         int(K_topk),
+    )
+
+    # Finalize: sum the NUM_HEAD_GROUPS disjoint bf16 stripes of the split
+    # scratch into the fp32 dgathered (conflict-free element-parallel pass).
+    dgfin_launch = _get_csa_bwd_dgfinalize(D, int(num_head_groups), dtype_str)
+    dgfin_launch(
+        dgathered_split_bf16.view(-1, num_head_groups * D),
+        dgathered_fp32.view(-1, D),
+        int(B * Sq * K_topk * D),
+    )
+
+    # The LOCAL-branch dk_local / dv_local contractions
+    # (dV_local = P^T @ dO, dK_local = dS^T @ Q) are produced here by the
+    # dedicated MFMA matrix-core kernel instead of the VALU atomic path inside
+    # csa_bwd_full. Direct-stores per-head [B, HQ, Sq, D] (no atomics); the
+    # buffers were zero-initialised above and csa_bwd_full no longer writes
+    # them. Sq == Sk for the local branch.
+    dkv_launch = _get_csa_bwd_dkv(HQ, D, int(swa_window), dtype_str, mqa_kv)
+    dkv_launch(
+        q_c,
+        k_c,
+        v_c,
+        dout_c,
+        lse_c,
+        d_buf,
+        dkl_fp32,
+        dvl_fp32,
+        int(B),
+        int(Sq),
+        int(Sq),
     )
 
     dq_out = dq_fp32.to(q.dtype)

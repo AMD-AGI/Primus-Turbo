@@ -32,7 +32,7 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
-from primus_turbo.flydsl.attention.kernels.kernels_common import dtype_to_elem_type
+from primus_turbo.flydsl.attention.kernels.kernels_common import dtype_to_elem_type, mfma_f32_16x16x32
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir
@@ -192,17 +192,60 @@ def build_csa_pool_fwd_module(
         q_active = arith.cmpi(arith.CmpIPredicate.slt, pid_m, seq_len_v)
         pid_m_safe = arith.select(q_active, pid_m, arith.index(0))
 
-        # ---- Load Q for all HEAD_GROUP heads in this program ----
+        # ---- MFMA tiling constants (CDNA4 v_mfma_f32_16x16x32) ----
+        # QK^T is routed through the matrix cores: each MFMA computes a
+        # 16(key) x 16 x 32(head-dim chunk) tile with the single query row
+        # broadcast across the 16 M-rows. The 16 per-key scores land in the
+        # column-major C-layout at lanes 0..15 (agpr[0]); we read them back
+        # warp-uniform via readlane so the downstream softmax / AV path is
+        # unchanged. cbsz/abid/blgp = 0 (broadcast via per-lane Q load).
+        #
+        # The MFMA keys-as-M tiling needs the key-tile dimension to be a
+        # multiple of 16 (one 16x16x32 MFMA per key group) and the head-dim a
+        # multiple of 32 (the contraction chunk). When a tile dim is not a
+        # multiple of 16 (e.g. the default local BLOCK_N=8) we fall back to the
+        # original VALU warp-reduce QK path for that branch instead of
+        # asserting -- this keeps every representative shape correct while the
+        # sparse branch (BLOCK_K=16) still engages the matrix cores.
+        USE_MFMA_LOCAL = (HEAD_DIM % 32 == 0) and (BLOCK_N % 16 == 0)
+        USE_MFMA_SPARSE = (HEAD_DIM % 32 == 0) and (BLOCK_K % 16 == 0)
+        USE_MFMA_ANY = USE_MFMA_LOCAL or USE_MFMA_SPARSE
+        K_CHUNKS = HEAD_DIM // 32
+        N_GROUPS_LOCAL = BLOCK_N // 16 if USE_MFMA_LOCAL else 0
+        N_GROUPS_SPARSE = BLOCK_K // 16 if USE_MFMA_SPARSE else 0
+        lane_mod_16 = lane % arith.index(16)
+        lane_div_16 = lane // arith.index(16)
+        lane_mod_16_i32 = arith.index_cast(T.i32, lane_mod_16)
+        mfma_pack_ty = T.vec(8, f16_ty)
+        zero_mfma_pack = arith.constant_vector(0.0, mfma_pack_ty)
+        c_zero_mfma_acc = arith.constant_vector(0.0, T.vec(4, f32_ty))
+
+        # ---- Preload Q operands ----
+        # MFMA path: B-operand packs (register-resident, broadcast over M).
+        # B-operand layout: lane L holds B[m = L%16, k = (L//16)*8 + 0..7]. The
+        # query is broadcast across the 16 M-rows, so each pack depends only on
+        # (L//16) and the head-dim chunk, not on L%16.
+        # VALU path: per-lane f32 Q vector of D_PER_LANE elems (for warp-reduce).
         zero_f32_vec = arith.constant_vector(0.0, T.vec(D_PER_LANE, f32_ty))
+        q_b_packs_per_head = []
         q_f32_vecs = []
         for h_off in range_constexpr(HEAD_GROUP):
             qhid_h = qhid_base + arith.index(h_off)
             q_row_base = ((bid * arith.index(NUM_HEADS) + qhid_h) * seq_len_v + pid_m_safe) * arith.index(HEAD_DIM)
-            q_lane_off = q_row_base + lane * arith.index(D_PER_LANE)
-            q_vec = load_f16_v(q_ptr, q_lane_off, D_PER_LANE)
-            q_f32_vec = arith.extf(T.vec(D_PER_LANE, f32_ty), q_vec)
-            q_f32_vec = arith.select(q_active, q_f32_vec, zero_f32_vec)
-            q_f32_vecs.append(q_f32_vec)
+            if const_expr(USE_MFMA_ANY):
+                packs = []
+                for ck in range_constexpr(K_CHUNKS):
+                    q_off = q_row_base + arith.index(ck * 32) + lane_div_16 * arith.index(8)
+                    qp = load_f16_v(q_ptr, q_off, 8)
+                    qp = arith.select(q_active, qp, zero_mfma_pack)
+                    packs.append(qp)
+                q_b_packs_per_head.append(packs)
+            if const_expr(not (USE_MFMA_LOCAL and USE_MFMA_SPARSE)):
+                q_lane_off = q_row_base + lane * arith.index(D_PER_LANE)
+                q_vec = load_f16_v(q_ptr, q_lane_off, D_PER_LANE)
+                q_f32_vec = arith.extf(T.vec(D_PER_LANE, f32_ty), q_vec)
+                q_f32_vec = arith.select(q_active, q_f32_vec, zero_f32_vec)
+                q_f32_vecs.append(q_f32_vec)
 
         # ---- Constants ----
         NEG_INF_F = -1.0e30
@@ -271,58 +314,113 @@ def build_csa_pool_fwd_module(
                 seq_len_i32 = seq_len_i32.ir_value()
             w_i32 = arith.constant(int(swa_window), type=T.i32)
 
-            # Per-head QK values: [HEAD_GROUP][BLOCK_N]
+            # Per-head QK values: [HEAD_GROUP][BLOCK_N].
             qk_vals_per_head = [[] for _ in range_constexpr(HEAD_GROUP)]
-            kl_f32_cache = []
-            bad_lo_cache = []
-            for n_off in range_constexpr(BLOCK_N):
-                kv_col_i32 = arith.AddIOp(
-                    n_start_i32,
-                    arith.constant(n_off, type=T.i32),
-                ).result
-                _kv_plus_w_lo = arith.AddIOp(kv_col_i32, w_i32).result
-                is_swa_lo = arith.cmpi(
-                    arith.CmpIPredicate.sle, _kv_plus_w_lo, pid_m_i32)
-                is_causal_lo = arith.cmpi(
-                    arith.CmpIPredicate.sgt, kv_col_i32, pid_m_i32)
-                is_oob = arith.cmpi(
-                    arith.CmpIPredicate.sge, kv_col_i32, seq_len_i32)
-                bad_lo = arith.OrIOp(
-                    arith.OrIOp(is_causal_lo, is_swa_lo).result,
-                    is_oob).result
-                bad_lo_cache.append(bad_lo)
+            if const_expr(USE_MFMA_LOCAL):
+                # CDNA4 MFMA keys-as-M: each MFMA group handles 16 contiguous
+                # local keys; the head-dim D is contracted in K_CHUNKS chunks of
+                # 32. A-operand = K (lane L -> key L%16, dims (L//16)*8..),
+                # B-operand = broadcast Q.
+                for h_off in range_constexpr(HEAD_GROUP):
+                    qhid_h = qhid_base + arith.index(h_off)
+                    q_packs_h = q_b_packs_per_head[h_off]
+                    raw_scores = [None] * BLOCK_N
+                    for g in range_constexpr(N_GROUPS_LOCAL):
+                        # Per-lane key column for group: n_start + g*16 + lane%16
+                        key_col_i32 = arith.AddIOp(
+                            arith.AddIOp(n_start_i32, arith.constant(g * 16, type=T.i32)).result,
+                            lane_mod_16_i32,
+                        ).result
+                        key_is_oob = arith.cmpi(arith.CmpIPredicate.sge, key_col_i32, seq_len_i32)
+                        key_idx = arith.index_cast(T.index, key_col_i32)
+                        key_safe = arith.select(key_is_oob, arith.index(0), key_idx)
+                        # MQA: local K shared across heads. MHA (HG>1): per-head K row.
+                        if const_expr(mqa_kv):
+                            kl_row_base = (bid * seq_len_v + key_safe) * arith.index(HEAD_DIM)
+                        else:
+                            kl_row_base = ((bid * arith.index(NUM_HEADS) + qhid_h) * seq_len_v + key_safe) * arith.index(HEAD_DIM)
+                        c_acc = c_zero_mfma_acc
+                        for ck in range_constexpr(K_CHUNKS):
+                            koff = kl_row_base + arith.index(ck * 32) + lane_div_16 * arith.index(8)
+                            a_pack = load_f16_v(kl_ptr, koff, 8)
+                            c_acc = mfma_f32_16x16x32(a_pack, q_packs_h[ck], c_acc, dtype_str)
+                        # Column-major MFMA output: lane L holds agpr[k] =
+                        # C[(L//16)*4 + k, L%16]. With Q broadcast across all 16
+                        # columns the score for key row i is identical in every
+                        # column, so read it from column j=0: register k = i%4 at
+                        # lane (i//4)*16.
+                        c_regs = [
+                            vector.extract(c_acc, static_position=[r], dynamic_position=[])
+                            for r in range_constexpr(4)
+                        ]
+                        for i in range_constexpr(16):
+                            key_i = g * 16 + i
+                            raw_scores[key_i] = rocdl.readlane(
+                                f32_ty, c_regs[i % 4], arith.constant((i // 4) * 16, type=T.i32))
 
-                kv_col_idx = arith.index_cast(T.index, kv_col_i32)
-                kv_col_safe = arith.select(is_oob, arith.index(0), kv_col_idx)
-                # MQA: local K is shared across heads -> load once, reuse per head.
-                # MHA (head_group > 1): local K differs per head, so each head in
-                # the group must read its own K row (qhid_base + h_off). Loading
-                # only qhid_base for the whole group is correct only for MQA --
-                # doing so for MHA collapses every head onto head 0's K (the HG>1
-                # numerical bug; ~3 dB SNR).
-                if const_expr(mqa_kv):
-                    kl_row_base = (bid * seq_len_v + kv_col_safe) * arith.index(HEAD_DIM)
-                    kl_lane_off = kl_row_base + lane * arith.index(D_PER_LANE)
-                    kl_vec = load_f16_v(kl_ptr, kl_lane_off, D_PER_LANE)
-                    kl_f32 = arith.extf(T.vec(D_PER_LANE, f32_ty), kl_vec)
-                    for h_off in range_constexpr(HEAD_GROUP):
-                        lane_dot = vec_dot_f32(kl_f32, q_f32_vecs[h_off])
-                        qk_full = warp_reduce_sum_f32(lane_dot)
-                        qk_scaled = arith.MulFOp(qk_full, c_sm_scale_f, fastmath=fm_fast).result
+                    # Per-key causal / SWA / boundary mask (warp-uniform scalars).
+                    for n_off in range_constexpr(BLOCK_N):
+                        kv_col_i32 = arith.AddIOp(
+                            n_start_i32,
+                            arith.constant(n_off, type=T.i32),
+                        ).result
+                        _kv_plus_w_lo = arith.AddIOp(kv_col_i32, w_i32).result
+                        is_swa_lo = arith.cmpi(
+                            arith.CmpIPredicate.sle, _kv_plus_w_lo, pid_m_i32)
+                        is_causal_lo = arith.cmpi(
+                            arith.CmpIPredicate.sgt, kv_col_i32, pid_m_i32)
+                        is_oob = arith.cmpi(
+                            arith.CmpIPredicate.sge, kv_col_i32, seq_len_i32)
+                        bad_lo = arith.OrIOp(
+                            arith.OrIOp(is_causal_lo, is_swa_lo).result,
+                            is_oob).result
+                        qk_scaled = arith.MulFOp(raw_scores[n_off], c_sm_scale_f, fastmath=fm_fast).result
                         qk_masked = arith.select(bad_lo, c_neg_inf, qk_scaled)
                         qk_vals_per_head[h_off].append(qk_masked)
-                else:
-                    for h_off in range_constexpr(HEAD_GROUP):
-                        qhid_h = qhid_base + arith.index(h_off)
-                        kl_row_base = ((bid * arith.index(NUM_HEADS) + qhid_h) * seq_len_v + kv_col_safe) * arith.index(HEAD_DIM)
+            else:
+                # VALU fallback (BLOCK_N % 16 != 0, e.g. default BLOCK_N=8):
+                # per-key warp-reduce dot product over the head-dim.
+                for n_off in range_constexpr(BLOCK_N):
+                    kv_col_i32 = arith.AddIOp(
+                        n_start_i32,
+                        arith.constant(n_off, type=T.i32),
+                    ).result
+                    _kv_plus_w_lo = arith.AddIOp(kv_col_i32, w_i32).result
+                    is_swa_lo = arith.cmpi(
+                        arith.CmpIPredicate.sle, _kv_plus_w_lo, pid_m_i32)
+                    is_causal_lo = arith.cmpi(
+                        arith.CmpIPredicate.sgt, kv_col_i32, pid_m_i32)
+                    is_oob = arith.cmpi(
+                        arith.CmpIPredicate.sge, kv_col_i32, seq_len_i32)
+                    bad_lo = arith.OrIOp(
+                        arith.OrIOp(is_causal_lo, is_swa_lo).result,
+                        is_oob).result
+
+                    kv_col_idx = arith.index_cast(T.index, kv_col_i32)
+                    kv_col_safe = arith.select(is_oob, arith.index(0), kv_col_idx)
+                    if const_expr(mqa_kv):
+                        kl_row_base = (bid * seq_len_v + kv_col_safe) * arith.index(HEAD_DIM)
                         kl_lane_off = kl_row_base + lane * arith.index(D_PER_LANE)
                         kl_vec = load_f16_v(kl_ptr, kl_lane_off, D_PER_LANE)
                         kl_f32 = arith.extf(T.vec(D_PER_LANE, f32_ty), kl_vec)
-                        lane_dot = vec_dot_f32(kl_f32, q_f32_vecs[h_off])
-                        qk_full = warp_reduce_sum_f32(lane_dot)
-                        qk_scaled = arith.MulFOp(qk_full, c_sm_scale_f, fastmath=fm_fast).result
-                        qk_masked = arith.select(bad_lo, c_neg_inf, qk_scaled)
-                        qk_vals_per_head[h_off].append(qk_masked)
+                        for h_off in range_constexpr(HEAD_GROUP):
+                            lane_dot = vec_dot_f32(kl_f32, q_f32_vecs[h_off])
+                            qk_full = warp_reduce_sum_f32(lane_dot)
+                            qk_scaled = arith.MulFOp(qk_full, c_sm_scale_f, fastmath=fm_fast).result
+                            qk_masked = arith.select(bad_lo, c_neg_inf, qk_scaled)
+                            qk_vals_per_head[h_off].append(qk_masked)
+                    else:
+                        for h_off in range_constexpr(HEAD_GROUP):
+                            qhid_h = qhid_base + arith.index(h_off)
+                            kl_row_base = ((bid * arith.index(NUM_HEADS) + qhid_h) * seq_len_v + kv_col_safe) * arith.index(HEAD_DIM)
+                            kl_lane_off = kl_row_base + lane * arith.index(D_PER_LANE)
+                            kl_vec = load_f16_v(kl_ptr, kl_lane_off, D_PER_LANE)
+                            kl_f32 = arith.extf(T.vec(D_PER_LANE, f32_ty), kl_vec)
+                            lane_dot = vec_dot_f32(kl_f32, q_f32_vecs[h_off])
+                            qk_full = warp_reduce_sum_f32(lane_dot)
+                            qk_scaled = arith.MulFOp(qk_full, c_sm_scale_f, fastmath=fm_fast).result
+                            qk_masked = arith.select(bad_lo, c_neg_inf, qk_scaled)
+                            qk_vals_per_head[h_off].append(qk_masked)
 
             # Per-head softmax update
             new_m_is = []
@@ -436,8 +534,65 @@ def build_csa_pool_fwd_module(
                 if const_expr(hasattr(K_topk_i32, "ir_value")):
                     K_topk_i32 = K_topk_i32.ir_value()
 
+                # QK^T via CDNA4 MFMA over the gathered keys (keys-as-M). Each
+                # lane gathers its own slot (lane%16) of the group from POOL via
+                # TOPK; the head-dim D is contracted in K_CHUNKS chunks of 32.
+                # A slot is masked (NEG_INF) when it is out of the K-loop, < 0
+                # (the -1 pad), or >= pool_size.
                 qk_vals_sparse_per_head = [[] for _ in range_constexpr(HEAD_GROUP)]
-                for k_off in range_constexpr(BLOCK_K):
+                if const_expr(USE_MFMA_SPARSE):
+                  for h_off in range_constexpr(HEAD_GROUP):
+                    q_packs_h = q_b_packs_per_head[h_off]
+                    raw_scores = [None] * BLOCK_K
+                    invalid_flags = [None] * BLOCK_K
+                    for g in range_constexpr(N_GROUPS_SPARSE):
+                        # Per-lane gathered slot: k_pos = k_start + g*16 + lane%16
+                        k_pos_i32 = arith.AddIOp(
+                            arith.AddIOp(k_start_i32, arith.constant(g * 16, type=T.i32)).result,
+                            lane_mod_16_i32,
+                        ).result
+                        is_koob = arith.cmpi(arith.CmpIPredicate.sge, k_pos_i32, K_topk_i32)
+                        k_pos_idx = arith.index_cast(T.index, k_pos_i32)
+                        k_pos_safe = arith.select(is_koob, arith.index(0), k_pos_idx)
+                        topk_off = (bid * seq_len_v + pid_m_safe) * K_topk_v + k_pos_safe
+                        idx_i32 = load_i32_scalar(topk_ptr, topk_off)
+                        is_neg = arith.cmpi(arith.CmpIPredicate.slt, idx_i32, arith.constant(0, type=T.i32))
+                        is_ge_p = arith.cmpi(arith.CmpIPredicate.sge, idx_i32, pool_size_i32)
+                        invalid = arith.OrIOp(arith.OrIOp(is_koob, is_neg).result, is_ge_p).result
+                        idx_safe_i32 = arith.select(invalid, arith.constant(0, type=T.i32), idx_i32)
+                        idx_safe = arith.index_cast(T.index, idx_safe_i32)
+                        pool_row_base = (bid * pool_size_v + idx_safe) * arith.index(HEAD_DIM)
+                        invalid_i32 = arith.select(
+                            invalid, arith.constant(1, type=T.i32), arith.constant(0, type=T.i32))
+                        c_acc = c_zero_mfma_acc
+                        for ck in range_constexpr(K_CHUNKS):
+                            poff = pool_row_base + arith.index(ck * 32) + lane_div_16 * arith.index(8)
+                            a_pack = load_f16_v(pool_ptr, poff, 8)
+                            c_acc = mfma_f32_16x16x32(a_pack, q_packs_h[ck], c_acc, dtype_str)
+                        # Column-major MFMA output: lane L holds agpr[k] =
+                        # C[(L//16)*4 + k, L%16]. Score for gathered slot row i
+                        # (Q broadcast across columns) -> register k = i%4 at
+                        # lane (i//4)*16. The per-slot invalid flag instead lives
+                        # in the lane whose lane%16 == i (it was computed from
+                        # lane_mod_16), i.e. lane i of group 0.
+                        c_regs = [
+                            vector.extract(c_acc, static_position=[r], dynamic_position=[])
+                            for r in range_constexpr(4)
+                        ]
+                        for i in range_constexpr(16):
+                            slot_i = g * 16 + i
+                            raw_scores[slot_i] = rocdl.readlane(
+                                f32_ty, c_regs[i % 4], arith.constant((i // 4) * 16, type=T.i32))
+                            inv_i = rocdl.readlane(T.i32, invalid_i32, arith.constant(i, type=T.i32))
+                            invalid_flags[slot_i] = arith.cmpi(
+                                arith.CmpIPredicate.ne, inv_i, arith.constant(0, type=T.i32))
+                    for k_off in range_constexpr(BLOCK_K):
+                        qk_scaled = arith.MulFOp(raw_scores[k_off], c_sm_scale_f, fastmath=fm_fast).result
+                        qk_masked = arith.select(invalid_flags[k_off], c_neg_inf, qk_scaled)
+                        qk_vals_sparse_per_head[h_off].append(qk_masked)
+                else:
+                  # VALU fallback (BLOCK_K % 16 != 0): per-slot warp-reduce dot.
+                  for k_off in range_constexpr(BLOCK_K):
                     k_pos_i32 = arith.AddIOp(
                         k_start_i32,
                         arith.constant(k_off, type=T.i32),
@@ -447,9 +602,6 @@ def build_csa_pool_fwd_module(
                     k_pos_idx = arith.index_cast(T.index, k_pos_i32)
                     k_pos_safe = arith.select(is_oob, arith.index(0), k_pos_idx)
 
-                    # --- In-kernel gather: read TOPK[bid, pid_m, k_pos] then
-                    # gather POOL[bid, idx]. A slot is masked (NEG_INF) when it
-                    # is out of the K-loop, < 0 (the -1 pad), or >= pool_size. ---
                     topk_off = (bid * seq_len_v + pid_m_safe) * K_topk_v + k_pos_safe
                     idx_i32 = load_i32_scalar(topk_ptr, topk_off)
                     is_neg = arith.cmpi(arith.CmpIPredicate.slt, idx_i32, arith.constant(0, type=T.i32))
@@ -640,8 +792,17 @@ def build_csa_pool_fwd_module(
             seq_len, K_topk, pool_size,
         )
 
+        # Occupancy / resource: pin a higher waves-per-eu target on the
+        # dominant pool-fwd kernel. The AMDGPU register allocator treats
+        # rocdl.waves_per_eu as a minimum-occupancy budget and caps VGPRs at
+        # ~512/N per SIMD, so raising N from 2->3 asks the JIT to compact the
+        # long MFMA->exp2->rescale online-softmax live ranges and keep a 3rd
+        # wave/SIMD resident to hide the dependency-chain latency that the
+        # baseline 2-wave occupancy cannot. Env FLYDSL_WAVES_PER_EU can still
+        # raise it further.
+        OCC_WAVES_PER_EU_TARGET = 3
         if const_expr(waves_per_eu is not None):
-            _wpe = int(waves_per_eu)
+            _wpe = max(int(waves_per_eu), OCC_WAVES_PER_EU_TARGET)
             if const_expr(_wpe >= 1):
                 for op in ctx.gpu_module_body.operations:
                     if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
