@@ -15,7 +15,9 @@
 #include <string>
 
 #include "ck_grouped_gemm_kernel_config.h"
+#include "grouped_gemm_kernel_ws.hpp"
 #include "primus_turbo/arch.h"
+#include "primus_turbo/common.h"
 
 namespace primus_turbo {
 // clang-format off
@@ -37,6 +39,35 @@ inline void _launch_ck_grouped_kernel(const ck_tile::stream_config& stream_cfg,
                         ck_tile::cast_pointer_to_constant_address_space(args_ptr), group_num));
 }
 
+// Work-stealing variant: takes an int32 atomic counter buffer (size
+// NUM_XCDS_WS + 2; per-XCD slots first, then global slot, then done slot
+// for last-out CTA detection) and a `local_per_xcd` mode selector. The
+// buffer is zeroed once at allocation by the Python wrapper; the kernel
+// self-resets between launches (the last-out CTA zeros all slots), so no
+// per-launch zeroing is required at the C++ binding.
+//
+// The WS kernel uses `FindGroupId` for O(log G) group lookup, which reads
+// the precomputed `block_start` / `block_end` fields. Those are populated
+// by primus's `compute_grouped_gemm_args` kernel, which is extended to do
+// the per-group prefix sum during the existing args-setup pass. No
+// separate prepass kernel is needed.
+template <typename Kernel>
+inline void _launch_ck_grouped_kernel_ws(const ck_tile::stream_config& stream_cfg,
+                                         ck_tile::index_t group_num,
+                                         void* args_ptr, uint32_t num_cu,
+                                         int32_t* tile_counter_ptr,
+                                         ck_tile::index_t local_per_xcd) {
+    constexpr int kBlockPerCu = 1;
+    const dim3 blocks = Kernel::BlockSize();
+    dim3       grids  = Kernel::MaxOccupancyGridSize(stream_cfg);
+    grids.x           = std::min(grids.x, num_cu);
+    ck_tile::launch_kernel(
+        stream_cfg, ck_tile::make_kernel<kBlockPerCu>(
+                        Kernel{}, grids, blocks, 0,
+                        ck_tile::cast_pointer_to_constant_address_space(args_ptr), group_num,
+                        tile_counter_ptr, local_per_xcd));
+}
+
 class CKGroupedGemmRunnerInterFace {
 public:
     virtual ~CKGroupedGemmRunnerInterFace() = default;
@@ -44,6 +75,26 @@ public:
     virtual void run(const ck_tile::stream_config &stream_cfg,
                      const ck_tile::index_t group_num,
                      void *args_ptr, const uint32_t num_cu) = 0;
+
+    // Optional WS path. Default impl asserts; only the WS-enabled runner
+    // overrides this. Keeps the interface uniform without bifurcating the
+    // factory.
+    virtual void run_ws(const ck_tile::stream_config & /*stream_cfg*/,
+                        const ck_tile::index_t /*group_num*/,
+                        void * /*args_ptr*/, const uint32_t /*num_cu*/,
+                        int32_t * /*tile_counter_ptr*/,
+                        const ck_tile::index_t /*local_per_xcd*/) {
+        // Should be overridden by WS runners. If we land here, the dispatch
+        // table picked the wrong runner.
+        PRIMUS_TURBO_CHECK(false,
+                           "run_ws() called on a non-WS runner -- dispatch table mismatch");
+    }
+
+    // Tile shape exposed to the dispatch site so it can compute block_start /
+    // block_end (the WS kernel's FindGroupId reads them). Defaults to 0;
+    // BF16/FP16 runners override.
+    virtual int32_t m_tile() const { return 0; }
+    virtual int32_t n_tile() const { return 0; }
 };
 
 
@@ -122,7 +173,8 @@ public:
         >
     >;
 
-    using Kernel = ck_tile::GroupedGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue>;
+    using Kernel   = ck_tile::GroupedGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue>;
+    using KernelWS = ck_tile::GroupedGemmKernelWS<TilePartitioner, GemmPipeline, GemmEpilogue>;
 
 
 public:
@@ -131,6 +183,18 @@ public:
              void *args_ptr, const uint32_t num_cu) override {
         _launch_ck_grouped_kernel<Kernel>(stream_cfg, group_num, args_ptr, num_cu);
     }
+
+    void run_ws(const ck_tile::stream_config &stream_cfg,
+                const ck_tile::index_t group_num,
+                void *args_ptr, const uint32_t num_cu,
+                int32_t *tile_counter_ptr,
+                const ck_tile::index_t local_per_xcd) override {
+        _launch_ck_grouped_kernel_ws<KernelWS>(stream_cfg, group_num, args_ptr, num_cu,
+                                               tile_counter_ptr, local_per_xcd);
+    }
+
+    int32_t m_tile() const override { return TileConfig::M_Tile; }
+    int32_t n_tile() const override { return TileConfig::N_Tile; }
 };
 
 template <

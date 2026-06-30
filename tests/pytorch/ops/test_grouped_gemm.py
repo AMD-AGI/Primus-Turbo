@@ -259,12 +259,13 @@ def test_grouped_gemm_with_zero_length_groups(B, M, N_K, dtype, trans_b, backend
 # ---------------------------------------------------------------------------
 # Work-stealing tests
 #
-# Public API: ``schedule="work_steal"`` enables the work-stealing kernel on the
-# Triton backend. The integration test below uses the public API end-to-end
-# (forward + backward via autograd). Per-WS-mode kernel correctness is
-# covered by the lower-level ``grouped_gemm_triton_kernel`` test that follows
-# (the public API exposes only ``"static" | "work_steal"``; internal modes
-# ``"global" / "per-xcd" / "hierarchical"`` are kernel-level tuning knobs).
+# Public API: ``schedule="work_steal"`` enables the work-stealing kernel on
+# the Triton and CK backends. The integration tests use the public API
+# end-to-end (forward + backward via autograd). Per-ws_mode kernel
+# correctness is covered by the lower-level ``grouped_gemm_triton_kernel``
+# test that follows (the public API exposes only ``"static" | "work_steal"``;
+# internal modes ``"global" / "per-xcd" / "hierarchical"`` are kernel-level
+# tuning knobs).
 # ---------------------------------------------------------------------------
 
 
@@ -274,15 +275,16 @@ def test_grouped_gemm_with_zero_length_groups(B, M, N_K, dtype, trans_b, backend
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
-def test_grouped_gemm_schedule_work_steal_triton(B, M, N_K, dtype, balance, trans_b):
-    """``schedule="work_steal"`` on the Triton backend matches the static path
-    bit-for-bit for forward and backward (per-tile accumulator order is
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.CK])
+def test_grouped_gemm_schedule_work_steal(B, M, N_K, dtype, balance, trans_b, backend):
+    """``schedule="work_steal"`` on each WS-capable backend matches the static
+    path bit-for-bit for forward and backward (per-tile accumulator order is
     identical to the static schedule; there is no cross-tile reduction)."""
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(False)
 
     device = "cuda"
@@ -313,11 +315,12 @@ def test_grouped_gemm_schedule_work_steal_triton(B, M, N_K, dtype, balance, tran
     GlobalBackendManager.reset()
 
 
-def test_grouped_gemm_schedule_work_steal_triton_single_group():
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.CK])
+def test_grouped_gemm_schedule_work_steal_single_group(backend):
     """Single-group degenerate case (G=1): the dispatcher special-cases this
     to call non-grouped gemm; ``schedule`` must be accepted (and ignored)
     in that branch."""
-    GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
     device = "cuda"
     torch.manual_seed(0)
     M, K, N = 1024, 1280, 2560
@@ -331,12 +334,11 @@ def test_grouped_gemm_schedule_work_steal_triton_single_group():
     GlobalBackendManager.reset()
 
 
-@pytest.mark.parametrize("non_triton_backend", [BackendType.CK, BackendType.HIPBLASLT])
-def test_grouped_gemm_schedule_work_steal_rejects_non_triton_backend(non_triton_backend):
-    """Explicit selection of a non-Triton backend together with
-    ``schedule="work_steal"`` must fail at dispatch -- CK and hipblaslt advertise
-    only ``"static"`` via ``can_handle``."""
-    GlobalBackendManager.set_grouped_gemm_backend(non_triton_backend)
+def test_grouped_gemm_schedule_work_steal_rejects_hipblaslt():
+    """Explicit selection of HIPBLASLT together with ``schedule="work_steal"``
+    must fail at dispatch -- hipblaslt has no WS kernel and advertises only
+    ``"static"`` via ``can_handle``."""
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.HIPBLASLT)
     device = "cuda"
     torch.manual_seed(0)
     B, M, K, N = 4, 1024, 1280, 2560
