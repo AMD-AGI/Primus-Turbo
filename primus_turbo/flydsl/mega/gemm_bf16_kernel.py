@@ -28,6 +28,7 @@ make_value_attrs) from flydsl.utils.gemm_helper.
 """
 
 import functools
+import os
 
 import torch
 
@@ -61,6 +62,18 @@ from primus_turbo.flydsl.common.tile_spec import _emit_for, _emit_if_then
 BLOCK_K = 64  # bf16 elements per K-iter = 128 bytes (= fp8 byte row)
 INST_K = 16  # MFMA 32x32x16 instruction K
 NK_SUB = BLOCK_K // INST_K  # K-subtiles per k-iter inside one mfma.call
+INST_K32 = 32  # MFMA 16x16x32 instruction K (gfx950) — wgrad TN K=32 path
+NK_SUB32 = BLOCK_K // INST_K32  # = 2 K=32 subtiles per BLOCK_K=64 k-iter
+
+# TN wgrad warp count. Round-2 lever-1: 4 waves (down from 8) doubles the per-wave
+# output tile (8x8 16-tiles) so each transpose-read fragment feeds 2x more MFMAs,
+# raising MFMA/LDS-read 1.33 -> 2.0 to attack the LDS issue-port bound. Env override
+# MEGA_WGRAD_WAVES=8 restores the round-1 ship.
+WGRAD_WAVES = int(os.environ.get("MEGA_WGRAD_WAVES", "8"))
+WGRAD_BLOCK = WGRAD_WAVES * 64  # threads per WG for the wgrad kernel
+# Allow compiler to place spilled accumulators in AGPR (occ-1: 256 VGPR + 256 AGPR).
+# Negative => 'allow up to N' hint (NOT the disproven hand-rolled AGPR-pin engine).
+WGRAD_AGPR = int(os.environ.get("MEGA_WGRAD_AGPR", "0"))
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -203,6 +216,88 @@ class Mfma32x32x16:
 
 
 # ───────────────────────────────────────────────────────────────────────
+# MFMA 16x16x32 bf16 (gfx950). accum = 4 f32 / lane; A,B operands = 8 bf16 / lane
+# per K=32 subtile. Derived for the TN wgrad path only. Acc lane layout:
+#   c[v] = C[m = (lane//16)*4 + v, n = lane%16], v in 0..3.
+# Operand lane layout (canonical CDNA mfma_16x16x32):
+#   a[v] = A[m = lane%16, k = (lane//16)*8 + v]; b[v] = B[k=(lane//16)*8+v, n=lane%16].
+# call() loops nk_sub (=BLOCK_K/32) K=32 subtiles internally, mirroring the 32x32
+# "one call per quadrant" contract.
+# ───────────────────────────────────────────────────────────────────────
+class Mfma16x16x32:
+    def __init__(self, n_tiles_a, n_tiles_b, nk_sub=NK_SUB32):
+        self.atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
+        self.accum_type = Vec.make_type(4, fx.Float32)
+        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.n_tiles_a = n_tiles_a  # number of 16-row A m-tiles
+        self.n_tiles_b = n_tiles_b  # number of 16-col B n-tiles
+        self.nk_sub = nk_sub
+
+    def idx(self, i, j):
+        return i * self.n_tiles_b + j
+
+    def _do_mma(self, a, b, c):
+        return fly_dialect.mma_atom_call_ssa([self.accum_type], self.atom, a, b, c)
+
+    def call(self, a, b, c):
+        # a: [n_tiles_a][nk_sub] Vec(8,bf16); b: [n_tiles_b][nk_sub] Vec(8,bf16)
+        # c: [n_tiles_a*n_tiles_b] Vec(4,f32)
+        assert len(a) == self.n_tiles_a
+        assert len(b) == self.n_tiles_b
+        for i in range_constexpr(self.n_tiles_a):
+            for j in range_constexpr(self.n_tiles_b):
+                acc = c[self.idx(i, j)]
+                for ks in range_constexpr(self.nk_sub):
+                    acc = self._do_mma(a[i][ks], b[j][ks], acc)
+                c[self.idx(i, j)] = acc
+        return c
+
+
+class S2RLoaderTr16x32Bf16:
+    """K-major LDS sub-block -> 16x16x32 bf16 operand via ds_read_b64_tr_b16.
+
+    Reuses the SAME LDS byte layout written by compute_global_swizzle_nn_bf16 +
+    G2SLoader (16-K x 32-N sub-blocks, sub_stride bf16 each, 4 sub-blocks per
+    BLOCK_K=64). A K=32 subtile = two adjacent 16-K sub-blocks. Each 32-N sub-block
+    feeds TWO 16-row operand m-tiles (g16 = 0 / 1). Output (per 16-row m-tile, per
+    K=32 subtile) is Vec(8,bf16): for lane L, a[v] = A[m=L%16, k=(L//16)*8+v].
+
+    n_tiles32 = number of 16-row m-tiles owned by this wave = 2 * (32x32 n_tiles).
+    """
+
+    def __init__(self, wave_idx, n_tiles32, sub_stride=512, nk_sub=NK_SUB32):
+        self.lane_id = fx.thread_idx.x % 64
+        self.wave_idx = wave_idx
+        self.n_tiles32 = n_tiles32  # 16-row m-tiles for this wave
+        self.sub_stride = sub_stride
+        self.nk_sub = nk_sub
+
+    def load(self, lds_src, base_off=0):
+        frag = []
+        octet = self.lane_id // 16  # 0..3 -> k-octet within the K=32 subtile
+        mm = self.lane_id % 16  # output row within the 16-tile
+        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr)) + base_off
+        # octet -> (which 16-K sub-block of the K=32 pair, kblk half)
+        s_in_pair = octet // 2  # 0 or 1: first/second 16-K sub-block
+        kb = octet % 2  # 0 or 1: lower/upper 8 K of that 16-K sub-block
+        for i in range_constexpr(self.n_tiles32):
+            # m-tile i: original 32-N sub-block = i//2, row-half g16 = i%2.
+            orig_tile = self.wave_idx * self.n_tiles32 + i
+            n32_block = orig_tile // 2  # 32-N sub-block index
+            g16 = orig_tile % 2  # 0 -> rows 0..15, 1 -> rows 16..31 of the 32-N block
+            subs = []
+            for ks in range_constexpr(self.nk_sub):
+                # the two 16-K sub-blocks of this K=32 subtile
+                sub16 = (n32_block * NK_SUB + ks * 2) + s_in_pair
+                sub_base = sub16 * self.sub_stride + g16 * 256 + kb * 128 + mm * 4
+                ptr = _lds_ptr_from_i32(base_i32 + sub_base * 2)
+                r0, r1 = _packed_ds_read_tr16(ptr, [0, 64 * 2])
+                subs.append(r0.shuffle(r1, list(range(8))))
+            frag.append(subs)
+        return frag
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Shared-to-register loaders. The LDS byte layout is the fp8 flat [rows, 128B]
 # swizzle_128 layout; each lane pulls 8 contiguous bf16 (16 bytes) per K-subtile.
 # ───────────────────────────────────────────────────────────────────────
@@ -301,6 +396,39 @@ class StoreCBf16:
             acc = Vec(c_frag[ti])
             for r in range_constexpr(16):
                 m = base_m + ti * 32 + (r // 4) * 8 + m_hi + (r % 4)
+                c_index = row_base + m
+                self._store_one(acc[r].to(self.out_ty), arith.select(n_valid, c_index, oob))
+
+    def store16(self, c_frag, base_row, base_col):
+        """Coalesced store for the 16x16x32 acc layout (4 f32/lane).
+        c_frag is a list of 16x16 m-tiles; tile t covers output rows
+        [base_row + t*16 .. +15], cols [base_col .. base_col+15].
+        For lane L: n = base_col + L%16, m = base_row + t*16 + (L//16)*4 + v."""
+        oob = fx.Int32(self.c_rows * self.c_cols)
+        n = self.lane_id % 16
+        m_hi = (self.lane_id // 16) * 4
+        col = base_col + n
+        col_valid = col < self.c_cols
+        for ti in range_constexpr(len(c_frag)):
+            acc = Vec(c_frag[ti])
+            for r in range_constexpr(4):
+                row = base_row + ti * 16 + m_hi + r
+                c_index = row * self.c_cols + col
+                self._store_one(acc[r].to(self.out_ty), arith.select(col_valid, c_index, oob))
+
+    def store_trans16(self, c_frag, group_idx, base_m, base_n, out_m, out_n):
+        """Transposed store for 16x16x32 acc -> out[group, n, m] in [G*out_n, out_m].
+        Lane L owns n = base_n + L%16 and 4 m = base_m + ti*16 + (L//16)*4 + r."""
+        oob = fx.Int32(self.c_rows * self.c_cols)
+        n = self.lane_id % 16
+        m_hi = (self.lane_id // 16) * 4
+        glob_n = base_n + n
+        n_valid = glob_n < out_n
+        row_base = (group_idx * out_n + glob_n) * out_m
+        for ti in range_constexpr(len(c_frag)):
+            acc = Vec(c_frag[ti])
+            for r in range_constexpr(4):
+                m = base_m + ti * 16 + m_hi + r
                 c_index = row_base + m
                 self._store_one(acc[r].to(self.out_ty), arith.select(n_valid, c_index, oob))
 
@@ -1212,17 +1340,17 @@ def gemm_bf16_tn_kernel(
 # clamp handles the K-tail (over-read past the group's last token -> 0).
 # ───────────────────────────────────────────────────────────────────────
 def _wgrad_geom(BLOCK_M, BLOCK_N):
-    assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
+    assert BLOCK_M >= 128 and BLOCK_N >= 64 and BLOCK_M % 128 == 0 and BLOCK_N % 64 == 0
     N_TILES_A = BLOCK_M // 128
-    N_TILES_B = BLOCK_N // 256
+    N_TILES_B = max(1, BLOCK_N // 256)
     return {
         "N_TILES_A": N_TILES_A,
         "N_TILES_B": N_TILES_B,
         "N_ACCUMS": N_TILES_A * N_TILES_B,
         "LDS_BLOCK_M": BLOCK_M // 2,
         "LDS_BLOCK_N": BLOCK_N // 2,
-        "N_LDS_STEPS_A": (BLOCK_M // 2) // 64,
-        "N_LDS_STEPS_B": (BLOCK_N // 2) // 64,
+        "N_LDS_STEPS_A": (BLOCK_M // 16) // WGRAD_WAVES,
+        "N_LDS_STEPS_B": (BLOCK_N // 16) // WGRAD_WAVES,
         "a_lds_size": (BLOCK_M // 2) * BLOCK_K,
         "b_lds_size": (BLOCK_N // 2) * BLOCK_K,
     }
@@ -1328,8 +1456,8 @@ def gemm_bf16_tn_variable_k_tile(
     CHUNK = 8  # even: 4-buffer ping-pong resets at chunk boundary (sweep: 8/16/32 perf-neutral)
     geom = _wgrad_geom(BLOCK_M, BLOCK_N)
     n_tiles_a = geom["N_TILES_A"]
-    n_tiles_b = geom["N_TILES_B"]
-    n_accums = geom["N_ACCUMS"]
+    geom["N_TILES_B"]
+    geom["N_ACCUMS"]
     lds_block_m = geom["LDS_BLOCK_M"]
     lds_block_n = geom["LDS_BLOCK_N"]
     n_lds_steps_a = geom["N_LDS_STEPS_A"]
@@ -1337,8 +1465,9 @@ def gemm_bf16_tn_variable_k_tile(
 
     lane_id = fx.thread_idx.x % 64
     wave_id = fx.thread_idx.x // 64
-    wave_m = wave_id // 4
-    wave_n = wave_id % 4
+    n_wave_n = WGRAD_WAVES // 2
+    wave_m = wave_id // n_wave_n
+    wave_n = wave_id % n_wave_n
 
     # Per-group rebased SRD: base folds m_start, num_records bounds the K-tail
     # (over-read past the group's last token -> 0).
@@ -1365,21 +1494,27 @@ def gemm_bf16_tn_variable_k_tile(
     a_k_step = fx.Int32(BLOCK_K) * out_m_rt  # runtime i32 (k*a_k_step must not const-fold to i16)
     b_k_step = fx.Int32(BLOCK_K) * out_n_rt
 
-    mfma = Mfma32x32x16(n_tiles_a, n_tiles_b)
+    # 16x16x32 MFMA path (the keeper): 2x more m/n tiles (16-row/col), acc = 4 f32/lane.
+    nta16 = n_tiles_a * 2
+    ntb16 = (BLOCK_N // 16) // (2 * n_wave_n)  # n-tiles per wave (8/n_wave_n for BN=256)
+    n_accums16 = nta16 * ntb16
+    mfma = Mfma16x16x32(nta16, ntb16)
+    a_s2r = S2RLoaderTr16x32Bf16(wave_m, nta16)
+    b_s2r = S2RLoaderTr16x32Bf16(wave_n, ntb16)
+    acc_vec_n = 4
+    n_accums_eff = n_accums16
     a_g2s = G2SLoader(a_div, gl_off_a, n_lds_steps_a, bf16_ir, wave_id)
     b_g2s = G2SLoader(b_div, gl_off_b, n_lds_steps_b, bf16_ir, wave_id)
-    a_s2r = S2RLoaderTrBf16(wave_m, n_tiles_a)
-    b_s2r = S2RLoaderTrBf16(wave_n, n_tiles_b)
     out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     if trans_c:
         store_c = StoreCBf16(C, G * OUT_N, OUT_M, out_ty, cache_modifier=c_cache_modifier)
     else:
         store_c = StoreCBf16(C, G * OUT_M, OUT_N, out_ty, cache_modifier=c_cache_modifier)
 
-    acc00 = [fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float32) for _ in range(n_accums)]
-    acc01 = [fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float32) for _ in range(n_accums)]
-    acc10 = [fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float32) for _ in range(n_accums)]
-    acc11 = [fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float32) for _ in range(n_accums)]
+    acc00 = [fx.make_rmem_tensor(fx.make_layout(acc_vec_n, 1), fx.Float32) for _ in range(n_accums_eff)]
+    acc01 = [fx.make_rmem_tensor(fx.make_layout(acc_vec_n, 1), fx.Float32) for _ in range(n_accums_eff)]
+    acc10 = [fx.make_rmem_tensor(fx.make_layout(acc_vec_n, 1), fx.Float32) for _ in range(n_accums_eff)]
+    acc11 = [fx.make_rmem_tensor(fx.make_layout(acc_vec_n, 1), fx.Float32) for _ in range(n_accums_eff)]
     for quad in (acc00, acc01, acc10, acc11):
         for reg in quad:
             fx.memref_store_vec(mfma.zero_value, reg)
@@ -1409,9 +1544,10 @@ def gemm_bf16_tn_variable_k_tile(
         a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
         b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
         b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
+        _body = _wgrad_body_4buf_bf16
         for j in range_constexpr(CHUNK):
             k = chunk_idx * CHUNK + j
-            _wgrad_body_4buf_bf16(
+            _body(
                 k,
                 a_g2s,
                 b_g2s,
@@ -1450,20 +1586,31 @@ def gemm_bf16_tn_variable_k_tile(
     c01 = [Vec(fx.memref_load_vec(reg)) for reg in acc01]
     c10 = [Vec(fx.memref_load_vec(reg)) for reg in acc10]
     c11 = [Vec(fx.memref_load_vec(reg)) for reg in acc11]
+
+    # 2D (i,j) 16x16 tiles per quadrant: acc[i*ntb16+j] -> rows i*16, cols j*16.
+    def _emit_q(cfrag, q_row, q_col):
+        for i in range_constexpr(nta16):
+            for j in range_constexpr(ntb16):
+                blk = [cfrag[i * ntb16 + j]]
+                if trans_c:
+                    store_c.store_trans16(blk, group_idx, q_row + i * 16, q_col + j * 16, OUT_M, OUT_N)
+                else:
+                    store_c.store16(blk, q_row + i * 16, q_col + j * 16)
+
     if trans_c:
-        local_m = block_m * BLOCK_M + wave_m * (n_tiles_a * 32)
-        local_n = block_n * BLOCK_N + wave_n * (n_tiles_b * 32)
-        store_c.store_trans(c00, group_idx, local_m + 0, local_n + 0, OUT_M, OUT_N)
-        store_c.store_trans(c01, group_idx, local_m + 0, local_n + lds_block_n, OUT_M, OUT_N)
-        store_c.store_trans(c10, group_idx, local_m + lds_block_m, local_n + 0, OUT_M, OUT_N)
-        store_c.store_trans(c11, group_idx, local_m + lds_block_m, local_n + lds_block_n, OUT_M, OUT_N)
+        local_m = block_m * BLOCK_M + wave_m * (nta16 * 16)
+        local_n = block_n * BLOCK_N + wave_n * (ntb16 * 16)
+        _emit_q(c00, local_m + 0, local_n + 0)
+        _emit_q(c01, local_m + 0, local_n + lds_block_n)
+        _emit_q(c10, local_m + lds_block_m, local_n + 0)
+        _emit_q(c11, local_m + lds_block_m, local_n + lds_block_n)
     else:
-        base_row = group_idx * OUT_M + block_m * BLOCK_M + wave_m * (n_tiles_a * 32)
-        base_col = block_n * BLOCK_N + wave_n * (n_tiles_b * 32)
-        store_c.store(c00, base_row + 0, base_col + 0)
-        store_c.store(c01, base_row + 0, base_col + lds_block_n)
-        store_c.store(c10, base_row + lds_block_m, base_col + 0)
-        store_c.store(c11, base_row + lds_block_m, base_col + lds_block_n)
+        base_row = group_idx * OUT_M + block_m * BLOCK_M + wave_m * (nta16 * 16)
+        base_col = block_n * BLOCK_N + wave_n * (ntb16 * 16)
+        _emit_q(c00, base_row + 0, base_col + 0)
+        _emit_q(c01, base_row + 0, base_col + lds_block_n)
+        _emit_q(c10, base_row + lds_block_m, base_col + 0)
+        _emit_q(c11, base_row + lds_block_m, base_col + lds_block_n)
 
 
 def load_go_i32(div, idx):
@@ -1497,20 +1644,17 @@ def _compile_grouped_tn_wgrad_bf16(
 ):
     """Persistent bf16 wgrad: fixed grid of WGs strides the (group, block_m, block_n)
     tile space. C is the stacked [G*OUT_M, OUT_N] output ([G*OUT_N, OUT_M] if trans_c)."""
-    assert OUT_M % BLOCK_M == 0 and OUT_N % BLOCK_N == 0, "first version needs OUT dims tile-aligned"
+    assert OUT_M % BLOCK_M == 0, "OUT_M (unclamped store dim) must divide BLOCK_M"
     N_BLOCKS_M = OUT_M // BLOCK_M
-    N_BLOCKS_N = OUT_N // BLOCK_N
+    N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N  # ceil-div: last N block partial, store n-clamps
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
     # Non-persistent grid=TOTAL (one tile/WG): correct + faster than the strided
     # persistent loop (which has a multi-tile-per-WG accumulator-reset bug; only needed
     # for CU-capped comm overlap, deferred).
-    import os as _osc
-
-    _flatgrid = _osc.environ.get("MEGA_WGRAD_FLATGRID", "1") == "1"
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)  # 4-buffer (cur/next) A+B
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(known_block_size=[WGRAD_BLOCK, 1, 1])
     def kernel(
         A: fx.Tensor,
         B: fx.Tensor,
@@ -1524,7 +1668,6 @@ def _compile_grouped_tn_wgrad_bf16(
         go_div = fx.logical_divide(go, fx.make_layout(1, 1))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         pid = fx.block_idx.x
-        num_wgs = fx.grid_dim.x
 
         def _do_tile(tile_idx):
             tile = xcd_remap_pid(tile_idx, TOTAL, num_xcd)
@@ -1561,20 +1704,20 @@ def _compile_grouped_tn_wgrad_bf16(
                 trans_c=trans_c,
             )
 
-        for tile_idx in range(pid, TOTAL, num_wgs):
-            _do_tile(tile_idx)
+        _do_tile(pid)  # one tile per WG (grid = TOTAL)
 
     @flyc.jit
     def launch(A, B, C, group_offs, out_m_rt: fx.Int32, out_n_rt: fx.Int32, stream: fx.Stream):
-        ncus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-        grid_x = (
-            fx.Int32(TOTAL)
-            if _flatgrid
-            else arith.select(fx.Int32(TOTAL) < fx.Int32(ncus), fx.Int32(TOTAL), fx.Int32(ncus))
-        )
+        grid_x = fx.Int32(TOTAL)
         kernel(
-            A, B, C, group_offs, out_m_rt, out_n_rt, value_attrs=make_value_attrs(waves_per_eu, 0, "512,512")
-        ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+            A,
+            B,
+            C,
+            group_offs,
+            out_m_rt,
+            out_n_rt,
+            value_attrs=make_value_attrs(waves_per_eu, WGRAD_AGPR, f"{WGRAD_BLOCK},{WGRAD_BLOCK}"),
+        ).launch(grid=(grid_x, 1, 1), block=(WGRAD_BLOCK, 1, 1), stream=stream)
 
     return launch
 

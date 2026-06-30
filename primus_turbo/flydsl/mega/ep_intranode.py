@@ -15,7 +15,7 @@ from flydsl.expr.buffer_ops import (
 )
 
 from primus_turbo.flydsl.common.tile_spec import _emit_if_then
-from primus_turbo.flydsl.mega.prims import atomic_add, memory_fence
+from primus_turbo.flydsl.mega.prims import atomic_add
 
 _VEC = 16  # fp8 bytes per lane per push step (b128 XGMI-wide)
 _WARP = 64  # gfx950 wavefront size
@@ -129,7 +129,6 @@ def _make_dispatch_tile(
             fx.gpu.barrier()
 
             def _signal():
-                memory_fence("release", scope="sys")  # pushed rows visible before signal
                 # peer scoreboard base: delta-map when given, else ptr table
                 if scoreboard_base is None:
                     scoreboard_address = buffer_load(
