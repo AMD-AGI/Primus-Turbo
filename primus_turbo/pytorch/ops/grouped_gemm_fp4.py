@@ -36,10 +36,10 @@ from typing import Union
 
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     Float4QuantConfig,
-    Format,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp4_support,
@@ -58,26 +58,6 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
 from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
 
 __all__ = ["grouped_gemm_fp4"]
-
-_PAD = 128  # per-group M padding for the variable-K wgrad (BLOCK_SIZE_K).
-
-
-def _pad_contraction(v: int) -> int:
-    """Round a contraction length up to ``_PAD`` (=128, the GEMM BLOCK_SIZE_K).
-
-    ``quantize_fp4`` already zero-pads the quantized axis to
-    ``MXFP4_PADDING_ALIGN_SIZE`` (=128), so the row-/col-wise operands carry a
-    128-aligned contraction dim with zero-filled tail. Running the GEMM over this
-    padded length lets it accept any 32-multiple N/K: the padded region holds
-    fp4 zeros (and self-consistent E8M0 scales), contributing 0 to the dot.
-    """
-    return ((v + _PAD - 1) // _PAD) * _PAD
-
-
-def _get_fp4_dtype(format: Format):
-    if format == Format.E2M1_X2:
-        return float4_e2m1fn_x2
-    raise ValueError(f"Unsupported FP4 format: {format}")
 
 
 def _quant_weight_dual(b: torch.Tensor):
@@ -119,13 +99,12 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         N, K = int(b.shape[-2]), int(b.shape[-1])
         # MX scales cover one 32-element block, so the contraction must be a
         # 32-multiple. N/K need not be 128-multiples: the quantizer zero-pads the
-        # contraction to 128 and the GEMM runs over that padded length (see
-        # `_pad_contraction`), while free dims are handled by the kernel's `% N`
-        # wrap + `c_mask`.
+        # contraction to MXFP4_PADDING_ALIGN_SIZE (=128) and the GEMM runs over
+        # that padded length (the packed last dim already reflects it), while free
+        # dims are handled by the kernel's `% N` wrap + `c_mask`.
         assert K % MXFP4_BLOCK_SIZE == 0, f"K must be a multiple of {MXFP4_BLOCK_SIZE} (got {K})."
         assert N % MXFP4_BLOCK_SIZE == 0, f"N must be a multiple of {MXFP4_BLOCK_SIZE} (got {N})."
         total_m = int(a.size(0))
-        G = int(b.shape[0])
 
         # --- A: fused grouped dual-quant in one bf16 read. rowwise (rht=F) is the
         # tight-M fwd operand; colwise (rht=T) is the 128-padded-M wgrad operand.
@@ -142,16 +121,29 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         )
         b_row, b_row_s, b_col, b_col_s = _quant_weight_dual(b)
 
-        # contraction = K, zero-padded to 128 by the quantizer; output free dim N
-        # stays logical (kernel `% N` + `c_mask`).
+        # b_row is FP4-packed (G, N, K/2): the backend derives the (128-padded)
+        # contraction K = b.shape[-1]*2 and the free dim N = b.shape[-2]. a_row is
+        # the tight-M layout, so group_offs doubles as group_offs_out (no slice).
         out = grouped_gemm_fp4_impl(
-            a_row, b_row, a_row_s, b_row_s, group_offs, N, _pad_contraction(K), num_cu, out_dtype, group_offs
+            a_row,
+            b_row,
+            a_row_s,
+            b_row_s,
+            group_lens,
+            group_offs,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=out_dtype,
+            granularity=ScalingGranularity.MX_BLOCKWISE.value,
+            num_cu=num_cu,
+            default_backend=BackendType.TRITON.value,
+            group_offs_out=group_offs,
         )
 
         # ``group_lens`` is re-saved so backward can fuse grad_out's dual-quant the
         # same way (its per-group 128-pad layout matches ``padded_offs``).
         ctx.save_for_backward(a_col, a_col_s, b_col, b_col_s, group_lens, group_offs, padded_offs)
-        ctx.N, ctx.K, ctx.G = N, K, G
+        ctx.N = N
         ctx.total_m = total_m
         ctx.config = config
         ctx.out_dtype = out_dtype
@@ -161,7 +153,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         a_col, a_col_s, b_col, b_col_s, group_lens, group_offs, padded_offs = ctx.saved_tensors
-        N, K, G = ctx.N, ctx.K, ctx.G
+        N = ctx.N
         out_dtype, num_cu = ctx.out_dtype, ctx.num_cu
         sr = ctx.config.use_gradient_sr
 
@@ -181,24 +173,41 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         )
 
         # --- dgrad: grad_a = gradO_row(rht=T) @ B_col(rht=T)^T, contract N -> [total_m, K] ---
-        # contraction = N (zero-padded to 128 by the quantizer); output free dim K
-        # stays logical (kernel `% N` + `c_mask`).
+        # b_col is FP4-packed (G, K, N/2): the backend derives the (128-padded)
+        # contraction from the packed last dim and the free dim K = b.shape[-2].
         grad_a = grouped_gemm_fp4_impl(
             go_row,
             b_col,
             go_row_s,
             b_col_s,
+            group_lens,
             group_offs,
-            K,
-            _pad_contraction(N),
-            num_cu,
-            out_dtype,
-            group_offs,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=out_dtype,
+            granularity=ScalingGranularity.MX_BLOCKWISE.value,
+            num_cu=num_cu,
+            default_backend=BackendType.TRITON.value,
+            group_offs_out=group_offs,
         )
 
         # --- wgrad: grad_b[g] = gradO_col(rht=T) @ A_col(rht=T)^T, contract M_g -> [G, N, K] ---
+        # OUT_M = go_col.shape[0] (=N), OUT_N = a_col.shape[0] (=K), G = group count,
+        # all derived in the backend; padded_offs are the per-group M offsets.
         grad_b = grouped_gemm_fp4_variable_k_impl(
-            go_col, a_col, go_col_s, a_col_s, padded_offs, N, K, G, num_cu, out_dtype
+            go_col,
+            a_col,
+            go_col_s,
+            a_col_s,
+            group_lens,
+            padded_offs,
+            trans_a=False,
+            trans_b=False,
+            trans_c=False,
+            out_dtype=out_dtype,
+            granularity=ScalingGranularity.MX_BLOCKWISE.value,
+            num_cu=num_cu,
+            default_backend=BackendType.TRITON.value,
         )
 
         # forward args: (a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
