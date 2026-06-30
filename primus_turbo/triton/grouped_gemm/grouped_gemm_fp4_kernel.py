@@ -20,8 +20,9 @@ with E8M0 (VEC_SIZE=32) scales.
 FP4 packing notes:
   * data tensors store K/2 (resp. M/2) bytes along the contraction axis;
   * scale tensors store K/32 (resp. M/32) E8M0 bytes (one per 1x32 block);
-  * scales are stored transposed (K/32, free) / (G, K/32, free) for a coalesced
-    per-K-iter load, transposed back in-reg for tl.dot_scaled.
+  * scales are stored free-major (free, K/32) / (G, free, K/32); each K-iter
+    loads a (K/32, free) tile (coalesced) and transposes it back in-reg for
+    tl.dot_scaled.
 
 Only EVEN contraction (a multiple of BLOCK_SIZE_K = 128 logical elements) is
 supported; the FP4 quantizer pads K to 128 and the MX wrapper pads per-group M
@@ -49,8 +50,8 @@ VEC_SIZE = 32
 
 # ###########################################################################
 #  Forward (NT):   C[g] = A[g] @ B[g]^T
-#    A (total_M, K/2) fp4-packed, A_scale (K/32, total_M) e8m0
-#    B (G, N, K/2)    fp4-packed, B_scale (G, K/32, N)   e8m0
+#    A (total_M, K/2) fp4-packed, A_scale (total_M, K/32) e8m0
+#    B (G, N, K/2)    fp4-packed, B_scale (G, N, K/32)   e8m0
 # ###########################################################################
 
 
