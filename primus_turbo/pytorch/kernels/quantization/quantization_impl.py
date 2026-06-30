@@ -17,6 +17,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
+    float4_e2m1fn_x2,
 )
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_dual_kernel,
@@ -492,6 +493,63 @@ def grouped_quantize_mxfp8_impl(
         scaling_recipe.shuffle_out,
         scaling_recipe_for_trans.shuffle_scale,
         scaling_recipe_for_trans.shuffle_out,
+    )
+
+
+def grouped_quantize_mxfp4_impl(
+    x: torch.Tensor,
+    block_size: int,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    rowwise_recipe: Optional[ScalingRecipe] = None,
+    colwise_recipe: Optional[ScalingRecipe] = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Fused grouped dual (rowwise + colwise) MXFP4 quantization in one bf16 read.
+
+    One pass over the grouped activation ``x`` [total_m, N] (groups along M via
+    ``group_lens`` / ``group_offs``) emits:
+      * rowwise FP4 [total_m, N_pad/2] + E8M0 scale [total_m, N_pad/32] in the
+        tight (un-padded) M layout -- the fwd/dgrad operand (row i == input row i);
+      * colwise FP4 [N, M_pad_col/2] + E8M0 scale [N, M_pad_col/32] in the
+        128-padded per-group M layout -- the variable-K wgrad operand.
+    The per-group 128-padding offsets are computed on-GPU (no D2H sync), so the
+    op is CUDA-graph capturable.
+
+    Returns ``(rowwise_out, rowwise_scale, colwise_out, colwise_scale,
+    group_lens_padded_colwise, group_offs_padded_colwise)``.
+    """
+    mxfp4_support, reason = check_mxfp4_support()
+    assert mxfp4_support, reason
+
+    assert block_size == MXFP4_BLOCK_SIZE, f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
+
+    rowwise_recipe = ScalingRecipe() if rowwise_recipe is None else rowwise_recipe
+    colwise_recipe = ScalingRecipe() if colwise_recipe is None else colwise_recipe
+    assert not (
+        rowwise_recipe.shuffle_scale
+        or rowwise_recipe.shuffle_out
+        or colwise_recipe.shuffle_scale
+        or colwise_recipe.shuffle_out
+    ), "Grouped MXFP4 dual quant does not support shuffle layouts."
+
+    return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
+        x,
+        group_lens,
+        group_offs,
+        float4_e2m1fn_x2,
+        rowwise_recipe.use_2d_block,
+        rowwise_recipe.use_sr,
+        rowwise_recipe.use_rht,
+        colwise_recipe.use_2d_block,
+        colwise_recipe.use_sr,
+        colwise_recipe.use_rht,
     )
 
 

@@ -250,8 +250,11 @@ def quantize_fp4_with_trans(
 
     NOTE:
         For MXFP4 quantization:
-            1. The x must be 2D tensor.
-            2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
+            1. The x may be a 2D ``[M, N]`` tensor or a 3D ``[G, M, N]`` batched
+               (per-group) tensor. The MX grouped GEMM weight path calls this with
+               3D ``(G, N, K)`` weights; each group is walked by ``blockIdx.z``.
+            2. Both row-wise and col-wise outputs are produced in one pass; no
+               ``axis`` argument is taken (it is implied by the dual direction).
             3. The block size must be 32.
             4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
     """

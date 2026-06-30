@@ -15,6 +15,7 @@ from .gemm import *
 from .gemm_fp4 import *
 from .gemm_fp8 import *
 from .grouped_gemm import *
+from .grouped_gemm_fp4 import *
 from .grouped_gemm_fp8 import *
 from .moe import *
 from .normalization import *
