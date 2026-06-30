@@ -19,6 +19,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
+import torch.distributed as dist
 from flydsl.expr import arith
 from flydsl.expr.buffer_ops import buffer_load, create_buffer_resource
 
@@ -51,6 +52,8 @@ __all__ = [
     "global_weights",
     "dense_gemm_peak_ms",
     "bench",
+    "gate3",
+    "check_accuracy",
     "generate_input",
     "compute_stage_metrics",
     "print_header",
@@ -265,7 +268,7 @@ def grouped_gemm_tn_wgrad_only(
     out_dw,  # [G, OUT_M, OUT_N] bf16 ([G, OUT_N, OUT_M] if trans_c)  C = dW
     BLOCK_M=256,
     BLOCK_N=256,
-    num_xcd=4,  # 4 beats 8 by ~7% for the trans_c wgrad (better L2 grouping; swept)
+    num_xcd=1,  # xcd=1 maximizes L2 reuse on the variable-K M-reduction (+14% vs 8, +6% vs 4; swept)
     trans_c=False,
     waves_per_eu=2,
 ):
@@ -321,7 +324,8 @@ def grouped_gemm_bf16_only(
     BM=256,
     BN=256,
     GROUP_M=4,
-    num_xcd=8,
+    # xcd=1 maximizes L2 reuse of shared weight slabs (swept: +3% NT, +11% NN, +15% TN vs xcd=8)
+    num_xcd=1,
     nt_vmcnt=3,
     waves_per_eu=2,
     agpr_alloc=0,
@@ -483,6 +487,42 @@ def bench(fn, *, warmup=20, iters=30, reset=None, group=None):
     return np.average(times)
 
 
+# --------------------------------------------------------------------------- #
+# Accuracy check: single source of truth for the gate-3 (cos / rel_rmse / ok)
+# correctness verdict shared by every mega-MoE benchmark stage. Mirrors the e2e
+# test's _gate3 so a bench PASS means the same thing as the test PASS.
+# --------------------------------------------------------------------------- #
+def gate3(out, ref, *, cos_thresh=0.99, rel_thresh=0.05):
+    """(cos, rel_rmse, ok) of a kernel output vs its reference (flattened, fp32)."""
+    g, r = out.float().flatten(), ref.float().flatten()
+    cos = float(torch.dot(g, r) / (g.norm() * r.norm() + 1e-12))
+    rel = float((g - r).norm() / (r.norm() + 1e-12))
+    return cos, rel, (cos >= cos_thresh and rel <= rel_thresh)
+
+
+def check_accuracy(group, name, out, ref, *, cos_thresh=0.99, rel_thresh=0.05):
+    """Gate-3 one stage across all ranks; rank 0 prints the worst (min-cos) rank,
+    every rank returns the global verdict (worst_cos, worst_rel, all_ok) so the
+    caller can record it. None out/ref -> skipped (returns None)."""
+    if out is None or ref is None:
+        if group.rank() == 0:
+            print(f"  [check] {name:<28}: (skipped — no reference)")
+        return None
+    cos, rel, ok = gate3(out, ref, cos_thresh=cos_thresh, rel_thresh=rel_thresh)
+    world = group.size()
+    gathered = [None] * world
+    dist.all_gather_object(gathered, (group.rank(), cos, rel, ok), group=group)
+    worst = min(gathered, key=lambda t: t[1])  # lowest cos = worst rank
+    all_ok = all(g[3] for g in gathered)
+    if group.rank() == 0:
+        worst_r, worst_cos, worst_rel, _ = worst
+        print(
+            f"  [check] {name:<28}: cos={worst_cos:.5f} rel={worst_rel:.4f} "
+            f"(worst rank={worst_r}) {'PASS' if all_ok else 'FAIL'}"
+        )
+    return worst[1], worst[2], all_ok
+
+
 def dense_gemm_peak_ms(M, N, K, BM, BN, iters, *, group_m_cands=(4,)):
     """Dense NT bf16 GEMM (gemm_bf16_kernel) of the SAME M x N x K as the grouped
     GEMM -> the single-weight compute roofline. autotune sweeps GROUP_M {1,4,8};
@@ -605,6 +645,7 @@ def generate_input(group, *, kind, mode, T, H, I, E, K, BM, BN, W1, W2, num_disp
         group.barrier()
         return SimpleNamespace(
             symm=symm,
+            x=x,  # raw input tokens (for the turbo full-forward reference)
             act=act,
             handle=handle,
             num_tile_blocks=num_tile_blocks,

@@ -31,9 +31,10 @@ from typing import Optional, Tuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, const_expr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.buffer_ops import (
     buffer_load,
+    buffer_store,
     create_buffer_resource,
     create_buffer_resource_from_addr,
 )
@@ -55,7 +56,6 @@ from primus_turbo.flydsl.mega.prims import (
     SPIN_TIMEOUT_CYCLES,
     atomic_add,
     ld,
-    memory_fence,
     read_clock,
     st,
 )
@@ -74,6 +74,11 @@ def get_dummy_tensor():
 
 
 _BLOCK_M = 256
+
+# number of flat prologue slots before the appended per-layer snapshots
+# (handle tail [11..13] = dispatched_src_rank / dispatched_src_row / dispatched_meta_scalars,
+# the local clones this kernel copies device-side into the symm origin/meta regions).
+_HANDLE_PROLOGUE_LEN = 11
 
 # comm-PUSH + scoreboard prims (byte-agnostic; shared intra-node EP layer)
 
@@ -101,6 +106,7 @@ def _compile(
     layout="nt",
     trans_c=False,
     G=0,
+    has_snapshots=False,
 ):
     K = hidden_size
     is_tn = layout == "tn"
@@ -122,6 +128,14 @@ def _compile(
         n_blocks = out_features // BLOCK_N
         worst_case_tiles = num_max_pool_tokens // BLOCK_M
 
+    # device-side restore geometry: grid-strided copy of the handle-tail snapshots into
+    # the symm origin/meta regions (compile-time stride -> unrolled iteration count).
+    _grid_size = num_dispatch_cu + (TOTAL if is_tn else worst_case_tiles * n_blocks)
+    _copy_threads = _grid_size * _BLOCK_THREADS
+    _copy_iters = (num_max_pool_tokens + _copy_threads - 1) // _copy_threads
+    _meta_records = 8 * 4  # meta_scalars: 8 x i32
+    _pool_records = num_max_pool_tokens * 4  # origin_rank / origin_slot: P x i32
+
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_kernel(
         INPUT_TOKENS: fx.Tensor,
@@ -137,6 +151,9 @@ def _compile(
         EXPECTED: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
         GROUP_OFFS: fx.Tensor,
+        DISPATCHED_SRC_RANK: fx.Tensor,
+        DISPATCHED_SRC_ROW: fx.Tensor,
+        DISPATCHED_META: fx.Tensor,
         c_n: fx.Int32,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
@@ -145,6 +162,40 @@ def _compile(
         block_index, _b, _c = fx.block_idx
         comm_block_count = fx.Int32(num_dispatch_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+
+        # ── device-side restore: copy this layer's local snapshots (handle tail) into the
+        # symm origin/meta regions so the (separately launched) combine reads the right
+        # routing/meta even after a later layer clobbered the shared buffer. Barrier-free:
+        # no role below reads these symm regions in THIS kernel (origin is unused here and
+        # num_tile_blocks comes from the snapshot slice host-side), and the writes are
+        # visible to the next kernel on the stream. Grid-strided over all blocks/threads.
+        if const_expr(has_snapshots):
+            src_rank_res = create_buffer_resource(DISPATCHED_SRC_RANK, max_size=True)
+            src_row_res = create_buffer_resource(DISPATCHED_SRC_ROW, max_size=True)
+            src_meta_res = create_buffer_resource(DISPATCHED_META, max_size=True)
+            dst_rank_res = create_buffer_resource_from_addr(
+                sym_layout.origin_rank_ptr, num_records_bytes=_pool_records
+            )
+            dst_slot_res = create_buffer_resource_from_addr(
+                sym_layout.origin_slot_ptr, num_records_bytes=_pool_records
+            )
+            dst_meta_res = create_buffer_resource_from_addr(
+                sym_layout.meta_scalars_ptr, num_records_bytes=_meta_records
+            )
+            gtid = block_index * fx.Int32(_BLOCK_THREADS) + thread_index
+            for _c_it in range_constexpr(_copy_iters):
+                row = gtid + fx.Int32(_c_it * _copy_threads)
+                if row < fx.Int32(num_max_pool_tokens):
+                    buffer_store(
+                        buffer_load(src_rank_res, row, vec_width=1, dtype=fx.T.i32()), dst_rank_res, row
+                    )
+                    buffer_store(
+                        buffer_load(src_row_res, row, vec_width=1, dtype=fx.T.i32()), dst_slot_res, row
+                    )
+            if gtid < fx.Int32(8):
+                buffer_store(
+                    buffer_load(src_meta_res, gtid, vec_width=1, dtype=fx.T.i32()), dst_meta_res, gtid
+                )
 
         # ===== COMM role resources =====
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
@@ -158,6 +209,8 @@ def _compile(
         if const_expr(is_tn):
             go = fx.rocdl.make_buffer_tensor(GROUP_OFFS, max_size=False, num_records_bytes=(G + 1) * 8)
             go_div = fx.logical_divide(go, fx.make_layout(1, 1))
+            # TN wgrad also needs the per-pool-block expected count for its arrival gate.
+            expected_resource = create_buffer_resource(EXPECTED, max_size=True)
         else:
             group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
             expected_resource = create_buffer_resource(EXPECTED, max_size=True)
@@ -208,6 +261,27 @@ def _compile(
                 block_n = local % fx.Int32(N_BLOCKS_N)
                 m_start = load_go_i64(go_div, group_idx)
                 m_end = load_go_i64(go_div, group_idx + fx.Int32(1))
+                # ARRIVAL GATE: wait peers' dispatch PUSHes for this group's pool blocks
+                # before the wgrad reads the pool. The TN role previously skipped this
+                # ("independent data") and raced on stale/incomplete rows -> wrong dW1.
+                sb_base = sym_layout.scoreboard_ptr
+                pb0 = m_start // fx.Int32(BLOCK_M)
+                n_pb = m_end // fx.Int32(BLOCK_M) - pb0
+                if thread_index == fx.Int32(0):
+                    for j in range(n_pb):
+                        pbj = pb0 + j
+                        exp_c = buffer_load(expected_resource, pbj, vec_width=1, dtype=fx.T.i32())
+                        spin_start = read_clock()
+                        sig = ld(sb_base, pbj, scope="sys")
+                        while sig < exp_c:
+                            fx.rocdl.s_sleep(fx.Int32(2))
+                            if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                                fx.printf(
+                                    "MEGA tn wgrad gate timeout: pb={} sig={} exp={}\n", pbj, sig, exp_c
+                                )
+                                spin_start = read_clock()
+                            sig = ld(sb_base, pbj, scope="sys")
+                fx.gpu.barrier()
                 pool_ptr_ty = PointerType.get(
                     elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
                 )
@@ -274,7 +348,6 @@ def _compile(
                             spin_start = read_clock()
                         signal = ld(sb_base, block_m, scope="sys")
                 fx.gpu.barrier()
-                memory_fence("acquire", scope="sys")  # read fresh peer-pushed pool rows
 
                 g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 gbase = g_idx * fx.Int32(K) * c_n
@@ -327,6 +400,9 @@ def _compile(
         EXPECTED,
         NUM_TILE_BLOCKS,
         GROUP_OFFS,
+        DISPATCHED_SRC_RANK,
+        DISPATCHED_SRC_ROW,
+        DISPATCHED_META,
         c_n: int,
         out_m_rt: int,
         out_n_rt: int,
@@ -347,6 +423,9 @@ def _compile(
             EXPECTED,
             NUM_TILE_BLOCKS,
             GROUP_OFFS,
+            DISPATCHED_SRC_RANK,
+            DISPATCHED_SRC_ROW,
+            DISPATCHED_META,
             c_n,
             out_m_rt,
             out_n_rt,
@@ -389,6 +468,7 @@ def dispatch_grouped_gemm_bf16(
     BM=256,
     BN=256,
     GROUP_M=4,
+    pool_mult: int = 2,  # forward (handle=None): symm pool capacity multiplier
     trans_c: bool = False,  # tn: store dW transposed ([G, OUT_N, OUT_M] = W-native layout)
     out_dtype: torch.dtype = torch.bfloat16,  # tn output dtype
 ):
@@ -402,34 +482,57 @@ def dispatch_grouped_gemm_bf16(
     independent). The dispatch comm handle is flat
     (``expert_send_dst_rank/start/count/src_offset/src_tokens`` + ``num_comm``).
 
-    The symmetric workspace (pool GEMM A operand + peer pool / peer scoreboard delta
-    tables) is fetched from the active ``get_symm_buffer_for_mega_moe()`` (no-group call)
-    -- the buffer the caller already built -- so it is no longer passed as an argument.
-    ``tile_to_expert`` / ``expected_count`` are read from the handle
-    (``handle[-2]`` / ``handle[-1]``)."""
-    # active symmetric workspace (built earlier by get_symm_buffer_for_mega_moe); names
-    # the pool + signal heaps and the peer pool/scoreboard delta tables
-    symm = get_symm_buffer_for_mega_moe()
-    sym_layout = symm.make_sym_layout()
-    # no handle given -> build the handle from topk via the fused prologue. The
-    # prologue returns tile_to_expert / expected separately (not appended to handle).
+    The symmetric workspace (pool GEMM A operand + peer pool / peer scoreboard delta tables)
+    is owned here: forward (``handle=None``) builds/creates it from ``group`` + tensor shapes
+    via ``get_symm_buffer_for_mega_moe(group, ...)`` and appends this layer's origin/meta
+    snapshots to the returned handle tail; reuse fetches the active buffer (no-group call).
+    ``tile_to_expert`` / ``expected_count`` are read from the handle."""
+    # ── forward (handle=None): build the active symm workspace from group + shapes, run the
+    # fused prologue, and append this layer's origin/meta snapshots to the handle tail (slots
+    # [11..13] = dispatched_src_rank / dispatched_src_row / dispatched_meta_scalars). The
+    # reuse path (nn/tn) copies that tail device-side back into the symm origin/meta regions.
     if handle is None:
         assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
+        assert group is not None, "handle=None requires group to build the symm workspace"
         assert layout == "nt", "handle=None auto-prologue is forward-only (nt); pass handle for nn/tn"
-        num_tokens = x.size(0)
-        handle = dispatch_prologue(
-            topk_idx,
-            topk_weights,
-            sym_layout=sym_layout,
-            num_tokens=num_tokens,
-            num_topk=int(sym_layout.num_topk),
-            num_experts=int(sym_layout.num_experts),
-            world_size=int(sym_layout.num_ranks),
-            rank=int(sym_layout.rank_idx),
-            experts_per_rank=int(sym_layout.num_experts_per_rank),
-            block_m=_BLOCK_M,
-            num_max_pool_tokens=int(sym_layout.num_max_pool_tokens),
+        experts_per_rank = l1_weights.shape[0]
+        num_tokens, hidden = x.shape
+        num_topk = topk_idx.shape[-1]
+        symm = get_symm_buffer_for_mega_moe(
+            group,
+            num_experts=experts_per_rank * group.size(),
+            num_max_tokens_per_rank=num_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=l1_weights.shape[1] // 2,  # w1 [epr, 2I, H]
+            block_m=BM,
+            block_n=BN,
+            pool_mult=pool_mult,
         )
+        sym_layout = symm.make_sym_layout()
+        handle = tuple(
+            dispatch_prologue(
+                topk_idx,
+                topk_weights,
+                sym_layout=sym_layout,
+                num_tokens=num_tokens,
+                num_topk=num_topk,
+                num_experts=symm.num_experts,
+                world_size=symm.world,
+                rank=symm.rank,
+                experts_per_rank=experts_per_rank,
+                block_m=BM,
+                num_max_pool_tokens=symm.num_max_pool_tokens,
+            )
+        ) + (
+            symm.origin_rank.clone(),
+            symm.origin_slot.clone(),
+            symm.meta_scalars.clone(),
+        )
+    else:
+        # reuse (nn/tn dgrad/wgrad): the active buffer the forward already built
+        symm = get_symm_buffer_for_mega_moe()
+        sym_layout = symm.make_sym_layout()
 
     (
         expert_send_dst_rank,
@@ -443,6 +546,7 @@ def dispatch_grouped_gemm_bf16(
         expected_count,
         _,
         group_offs,
+        *_snapshots,  # handle tail = this layer's [src_rank, src_row, meta] local clones
     ) = handle
 
     num_comm = expert_send_dst_rank.numel()
@@ -453,6 +557,16 @@ def dispatch_grouped_gemm_bf16(
     dummy_i32 = get_dummy_tensor()
     # source tokens pushed as i32 words (bf16 viewed as int32); pool/weight read as bf16
     x_i32 = x.contiguous().view(torch.int32).view(-1)
+
+    # handle tail: this layer's local origin/meta clones. The kernel copies them device-side
+    # into the symm origin/meta regions (barrier-free) so a later combine reads the right
+    # routing/meta after a later layer clobbered the shared buffer. Absent (bench/direct) ->
+    # dummies + has_snapshots=False (kernel skips the copy, reads live symm).
+    has_snapshots = len(_snapshots) >= 3
+    if has_snapshots:
+        dispatched_src_rank, dispatched_src_row, dispatched_meta_scalars = _snapshots[:3]
+    else:
+        dispatched_src_rank = dispatched_src_row = dispatched_meta_scalars = dummy_i32
 
     if layout == "tn":
         # ── TN variable-K wgrad: dispatch x (lhs) into the pool, then
@@ -482,6 +596,9 @@ def dispatch_grouped_gemm_bf16(
             expected_count,  # EXPECTED (unused by tn)
             dummy_i32,  # NUM_TILE_BLOCKS (unused by tn)
             group_offs,  # GROUP_OFFS (int64)
+            dispatched_src_rank,
+            dispatched_src_row,
+            dispatched_meta_scalars,
             0,  # c_n (unused by tn)
             int(OUT_M),  # out_m_rt
             int(OUT_N),  # out_n_rt
@@ -498,9 +615,11 @@ def dispatch_grouped_gemm_bf16(
             layout="tn",
             trans_c=trans_c,
             G=G,
+            has_snapshots=has_snapshots,
         )
         launch(*pos_args, stream=torch.cuda.current_stream())
-        return output, handle
+        # standard 4-output API: (out, dispatch_x_in_buf, dispatch_weights_in_buf, handle)
+        return output, symm.pool, symm.weight_recv_buf, handle
 
     # ── nn/nt: dispatch x (M-major) into the pool + grouped GEMM ──
     assert layout in ("nt", "nn"), f"unsupported layout {layout}"
@@ -519,7 +638,11 @@ def dispatch_grouped_gemm_bf16(
     # (gate + folded reader-count self-reset), so neither scoreboard nor sb_consume are
     # passed. scoreboard is kept only as the autotune per-iter reset target.
     scoreboard = symm.scoreboard
-    num_tile_blocks = symm.meta_scalars[1:2]
+    # num_tile_blocks = meta_scalars[1] (= total_rows // BM). Source it from THIS layer's
+    # meta snapshot when present: the kernel device-copies the snapshot into symm.meta in the
+    # same launch, so reading the live symm slice here would race; the snapshot is the safe,
+    # already-correct local copy. The device copy still restores symm.meta for the combine.
+    num_tile_blocks = dispatched_meta_scalars[1:2] if has_snapshots else symm.meta_scalars[1:2]
     nt_vmcnt = 3
 
     is_nosync = num_dispatched_tokens is None
@@ -544,6 +667,9 @@ def dispatch_grouped_gemm_bf16(
         expected_count,
         num_tile_blocks,
         dummy_i32,  # GROUP_OFFS (unused by nn/nt)
+        dispatched_src_rank,
+        dispatched_src_row,
+        dispatched_meta_scalars,
         c_n,
         0,  # out_m_rt (unused by nn/nt)
         0,  # out_n_rt (unused by nn/nt)
@@ -580,9 +706,11 @@ def dispatch_grouped_gemm_bf16(
             int(nt_vmcnt),
             GROUP_M=int(GROUP_M),
             layout=layout,
+            has_snapshots=has_snapshots,
         )
     launch(*pos_args, stream=torch.cuda.current_stream())
-    return output, handle
+    # standard 4-output API: (out, dispatch_x_in_buf, dispatch_weights_in_buf, handle)
+    return output, symm.pool, symm.weight_recv_buf, handle
 
 
 def _autotune(
