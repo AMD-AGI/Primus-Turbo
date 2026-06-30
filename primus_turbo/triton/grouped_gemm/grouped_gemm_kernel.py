@@ -497,11 +497,20 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    # AMD pid -> XCD mapping is round-robin.
-    xcd_id = pid % NUM_XCDS
+    # AMD pid -> XCD mapping is round-robin. When the persistent grid is
+    # capped to fewer CUs than there are XCDs (NUM_SMS < NUM_XCDS), only
+    # XCD ids [0, NUM_SMS) ever issue phase-1 claims, so both the per-XCD
+    # slot count AND the phase-1 ID span must use min(NUM_SMS, NUM_XCDS).
+    # Otherwise phase 2 starts past where phase 1 actually ended and the
+    # tiles in the gap are silently dropped. The public ``grouped_gemm``
+    # API rejects num_cu != None + schedule="work_steal" so callers should
+    # never hit this branch from the high-level op, but the kernel-level
+    # entry point exposes num_cu directly -- belt-and-braces.
+    ACTIVE_XCDS: tl.constexpr = min(NUM_SMS, NUM_XCDS)
+    xcd_id = pid % ACTIVE_XCDS
     local_counter = tile_counter_ptr + xcd_id * COUNTER_STRIDE
     per_xcd = local_per_xcd.to(tl.int32)
-    phase1_total = (per_xcd * NUM_XCDS).to(tl.int32)
+    phase1_total = (per_xcd * ACTIVE_XCDS).to(tl.int32)
 
     # Single unified loop with one call site for the per-tile body.
     # (Inlining the per-tile body twice -- once per phase -- produced phase-2
@@ -1013,10 +1022,15 @@ def _grouped_variable_k_gemm_kernel_ws(
     if IS_FP8:
         scale = tl.load(LHS_scale_ptr) * tl.load(RHS_scale_ptr)
 
-    xcd_id = pid % NUM_XCDS
+    # See the forward WS kernel for the ACTIVE_XCDS rationale: when
+    # NUM_SMS < NUM_XCDS, both the per-XCD slot count and the phase-1 ID
+    # span must be capped at the active XCD count, or phase 2 skips past
+    # the gap and silently drops tiles.
+    ACTIVE_XCDS: tl.constexpr = min(NUM_SMS, NUM_XCDS)
+    xcd_id = pid % ACTIVE_XCDS
     local_counter = tile_counter_ptr + xcd_id * COUNTER_STRIDE
     per_xcd = local_per_xcd.to(tl.int32)
-    phase1_total = (per_xcd * NUM_XCDS).to(tl.int32)
+    phase1_total = (per_xcd * ACTIVE_XCDS).to(tl.int32)
 
     local_idx = tl.atomic_add(local_counter, 1, sem="relaxed", scope="gpu")
     in_phase2 = local_idx >= per_xcd

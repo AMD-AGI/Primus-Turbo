@@ -397,3 +397,33 @@ def test_grouped_gemm_triton_kernel_ws_modes(ws_mode, trans_b):
     out_ref = grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b, work_steal=False)
     out_ws = grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b, work_steal=True, ws_mode=ws_mode)
     torch.testing.assert_close(out_ref, out_ws, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("num_cu", [4, 6, 7, 8, 16])
+@pytest.mark.parametrize("ws_mode", ["per-xcd", "hierarchical"])
+def test_grouped_gemm_triton_kernel_ws_num_cu_below_num_xcds(num_cu, ws_mode):
+    """Regression: ``num_cu < NUM_XCDS`` (=8) on a per-XCD-style ws_mode used
+    to silently drop tiles in the gap between ``num_cu * per_xcd`` and
+    ``NUM_XCDS * per_xcd`` (phase-2 started past where phase-1 actually
+    ended). With the ``ACTIVE_XCDS = min(NUM_SMS, NUM_XCDS)`` fix the kernel
+    matches static at any grid size. (The public API now blocks num_cu
+    together with schedule="work_steal", but the low-level kernel entry
+    point still accepts the combination -- belt-and-braces defense.)"""
+    from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+        grouped_gemm_triton_kernel,
+    )
+
+    device = "cuda"
+    torch.manual_seed(0)
+    B, M, N, K = 4, 1024, 2048, 1408
+    a = torch.randn((B * M, K), dtype=torch.bfloat16, device=device)
+    b = torch.randn((B, N, K), dtype=torch.bfloat16, device=device)
+    group_lens = torch.full((B,), M, dtype=torch.int64, device=device)
+    group_offs = torch.zeros(B + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = torch.cumsum(group_lens, dim=0)
+
+    out_ref = grouped_gemm_triton_kernel(a, b, group_offs, trans_b=True, work_steal=False)
+    out_ws = grouped_gemm_triton_kernel(
+        a, b, group_offs, trans_b=True, num_cu=num_cu, work_steal=True, ws_mode=ws_mode
+    )
+    torch.testing.assert_close(out_ref, out_ws, rtol=0.0, atol=0.0)
