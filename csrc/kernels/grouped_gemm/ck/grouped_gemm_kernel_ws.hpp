@@ -98,11 +98,21 @@ struct GroupedGemmKernelWS
             total_tiles += TilePartitioner::GridSize(kargs_g.M, kargs_g.N) * kargs_g.k_batch;
         }
 
-        // AMD round-robin pid -> xcd_id mapping.
-        const index_t xcd_id        = blockIdx.x % NUM_XCDS_WS;
+        // AMD round-robin pid -> xcd_id mapping. When the persistent grid is
+        // capped to fewer CUs than there are XCDs (gridDim.x < NUM_XCDS_WS),
+        // only XCD ids [0, gridDim.x) ever issue phase-1 claims, so both the
+        // per-XCD slot count AND the phase-1 ID span must use
+        // min(gridDim.x, NUM_XCDS_WS). Otherwise phase 2 starts past where
+        // phase 1 actually ended and the tiles in the gap are silently
+        // dropped. The public ``grouped_gemm`` API rejects num_cu != None +
+        // schedule="work_steal", so callers should never hit this branch
+        // from the high-level op, but the kernel-level binding still exposes
+        // num_cu -- belt-and-braces.
+        const index_t active_xcds = min(static_cast<index_t>(gridDim.x), NUM_XCDS_WS);
+        const index_t xcd_id        = blockIdx.x % active_xcds;
         int32_t* const local_counter  = tile_counter_ptr + xcd_id;
         int32_t* const global_counter = tile_counter_ptr + NUM_XCDS_WS;
-        const index_t  phase1_total   = local_per_xcd * NUM_XCDS_WS;
+        const index_t  phase1_total   = local_per_xcd * active_xcds;
 
         // Single claim slot -- no speculative prefetch. Originally this kernel
         // double-buffered the next claim while the current Run was in flight,
