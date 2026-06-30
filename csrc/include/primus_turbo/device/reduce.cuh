@@ -179,6 +179,20 @@ template <template <class> class Func, typename T> PRIMUS_TURBO_DEVICE T BlockRe
  * Reference: AMD CDNA4 ISA, ds_swizzle_b32 (page 480)
  */
 
+// NOTE on the single-asm-block form below:
+//   ``ds_swizzle_b32`` is an LDS-pipe op whose result is only valid after
+//   ``s_waitcnt lgkmcnt(0)``. The swizzle and its wait MUST live in one
+//   ``asm volatile`` block with ``result`` as the output operand: that ties
+//   "result is ready" to "after the wait", so the compiler cannot hoist the
+//   consumer of ``result`` ahead of the wait. Emitting the wait as a separate
+//   operand-less asm (the compiler sees no dependency on ``result``) let the
+//   reduction read the swizzle result early -- stale lane data that made a
+//   fraction (~1%) of the rowwise per-row ``amax``, and thus the FP4 scale,
+//   non-deterministic run-to-run. The single block is the fix. No ``"memory"``
+//   clobber is needed: the swizzle is register-only (it does not order against
+//   the ``s_tile`` LDS traffic -- rowwise never reads ``s_tile`` and colwise
+//   reads it only after ``__syncthreads``), and the clobber would needlessly
+//   block memory-op scheduling around this VALU-bound reduction.
 PRIMUS_TURBO_DEVICE float ds_swizzle_xor1(float val) {
     float result;
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F\n\t" PRIMUS_TURBO_WAIT_DS_STR
@@ -230,21 +244,30 @@ PRIMUS_TURBO_DEVICE float warp_reduce_max_8_dpp(float val) {
     uint32_t v = float_as_uint(val);
     uint32_t tmp;
 
+    // Each swizzle is fused with its ``s_waitcnt lgkmcnt(0)`` in one asm block
+    // with ``tmp`` as the output operand, so the following ``fmaxf`` cannot
+    // consume ``tmp`` before the wait completes. See the note on the
+    // ``ds_swizzle_xor*`` helpers for why the single block (not a ``"memory"``
+    // clobber) is what makes the per-row reduction deterministic.
+
     // Step 1: Exchange with thread 4 positions away
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F" : "=v"(tmp) : "v"(v));
-    asm volatile(PRIMUS_TURBO_WAIT_DS_STR :::);
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F\n\t" PRIMUS_TURBO_WAIT_DS_STR
+                 : "=v"(tmp)
+                 : "v"(v));
     val = fmaxf(val, uint_as_float(tmp));
     v   = float_as_uint(val);
 
     // Step 2: Exchange with thread 2 positions away
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F" : "=v"(tmp) : "v"(v));
-    asm volatile(PRIMUS_TURBO_WAIT_DS_STR :::);
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F\n\t" PRIMUS_TURBO_WAIT_DS_STR
+                 : "=v"(tmp)
+                 : "v"(v));
     val = fmaxf(val, uint_as_float(tmp));
     v   = float_as_uint(val);
 
     // Step 3: Exchange with adjacent thread
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F" : "=v"(tmp) : "v"(v));
-    asm volatile(PRIMUS_TURBO_WAIT_DS_STR :::);
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F\n\t" PRIMUS_TURBO_WAIT_DS_STR
+                 : "=v"(tmp)
+                 : "v"(v));
     val = fmaxf(val, uint_as_float(tmp));
 
     return val;
