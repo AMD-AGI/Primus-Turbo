@@ -88,6 +88,13 @@ def _mem_fence():
     llvm.inline_asm(fx.T.i32(), [], "s_waitcnt lgkmcnt(0) vmcnt(0)", "=r,~{memory}", has_side_effects=True)
 
 
+def l2_invalidate():
+    """gfx950: invalidate this CU's L2 view so a following load re-fetches from the coherence
+    point (HBM). Pairs with a producer's write-through (sc1) store on another CU whose data is
+    in HBM but left a stale L2 line here."""
+    llvm.inline_asm(fx.T.i32(), [], "buffer_inv sc1", "=r,~{memory}", has_side_effects=True)
+
+
 def memory_fence(order=None, scope=None):
     """Standalone memory fence; defaults to the cheap deep_ep s_waitcnt drain.
 
