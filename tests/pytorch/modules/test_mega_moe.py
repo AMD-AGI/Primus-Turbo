@@ -89,18 +89,32 @@ class MegaMoETestContainer:
         self.world = ep_group.size()
         self.rank = ep_group.rank()
         self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.top_k = top_k
         device = torch.device("cuda", torch.cuda.current_device())
         self.moe = MegaMoE(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=num_experts,
-            top_k=top_k,
             ep_group=ep_group,
             shared_expert_intermediate_size=intermediate_size if shared_expert else None,
             shared_expert_gate=shared_expert,
             device=device,
             dtype=test_dtype,
         )
+        # MegaMoE is routing-free; the test owns a local gate to produce the routing
+        # decision (sigmoid score + top-k + weight-normalize), same as a native router.
+        self.gate_weight = torch.randn((num_experts, hidden_size), device=device, dtype=torch.float32)
+
+    def route(self, x, valid_mask=None):
+        """Local top-k routing -> (topk_idx [T,K] i32, topk_weights [T,K] f32)."""
+        flat = x.reshape(-1, self.hidden_size)
+        scores = torch.sigmoid(F.linear(flat.float(), self.gate_weight))  # [T, E]
+        topk_w, topk_idx = scores.topk(self.top_k, dim=-1)
+        topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
+        if valid_mask is not None:
+            topk_w = topk_w * valid_mask.to(topk_w.dtype).reshape(-1).unsqueeze(-1)
+        return topk_idx.to(torch.int32), topk_w.to(torch.float32)
 
     def gather_global_weights(self):
         """All-gather per-rank expert shards into full [E, ...] tensors."""
@@ -178,11 +192,10 @@ class TestMegaMoE(MultiProcessTestCase):
         x = torch.randn((512, c.hidden_size), device=self.device, dtype=torch.bfloat16)
 
         with torch.no_grad():
-            y, bias = c.moe(x)
-            topk_idx, topk_w = c.moe.route(x)  # router is separately tested; reuse its decision
+            topk_idx, topk_w = c.route(x)  # local routing decision reused by the reference
+            y = c.moe(x, topk_idx, topk_w)
             ref = c.reference(x, topk_idx, topk_w)
 
-        self.assertIsNone(bias, "MegaMoE must return (output, None) like Megatron MoELayer")
         self.assertEqual(y.shape, x.shape)
         self.assertEqual(y.dtype, x.dtype)
         self._assert_snr(y, ref, tag=f"forward top_k={top_k} shared={shared_expert}")
@@ -227,7 +240,9 @@ class TestMegaMoE(MultiProcessTestCase):
             shared_expert=shared_expert,
         )
         x = torch.randn((512, c.hidden_size), device=self.device, dtype=torch.bfloat16, requires_grad=True)
-        y, _ = c.moe(x)
+        with torch.no_grad():
+            topk_idx, topk_w = c.route(x)
+        y = c.moe(x, topk_idx, topk_w)
         self.assertEqual(y.shape, x.shape)
         self.assertEqual(y.dtype, torch.bfloat16)
 
@@ -251,7 +266,7 @@ class TestMegaMoE(MultiProcessTestCase):
         # dx/dW isolate the dispatch<->combine duality and match the dense reference.
         x = torch.randn((512, c.hidden_size), device=self.device, dtype=torch.bfloat16, requires_grad=True)
         with torch.no_grad():
-            topk_idx, topk_w = c.moe.route(x)
+            topk_idx, topk_w = c.route(x)
         tw = topk_w.detach().clone().requires_grad_(True)
         # shared upstream gradient (same values for fused + reference)
         g = torch.randn((512, c.hidden_size), device=self.device, dtype=torch.bfloat16)
@@ -296,7 +311,8 @@ class TestMegaMoE(MultiProcessTestCase):
         padding_mask[::3] = True
 
         with torch.no_grad():
-            y, _ = c.moe(x, padding_mask=padding_mask)
+            topk_idx, topk_w = c.route(x, ~padding_mask)  # zero padded tokens' weights
+            y = c.moe(x, topk_idx, topk_w)
         y = y.reshape(seq, c.hidden_size)
         pad = padding_mask.reshape(seq)
         self.assertEqual(float(y[pad].abs().max()), 0.0, "padded tokens must yield a zero row")
@@ -309,12 +325,12 @@ class TestMegaMoE(MultiProcessTestCase):
         self._init_process()
         group = self._ep_group()
         c = MegaMoETestContainer(group, hidden_size=2048, intermediate_size=1024, num_experts=32, top_k=4)
-        T, K, E = 256, c.moe.top_k, c.moe.num_experts
+        T, K, E = 256, c.top_k, c.num_experts
         x = torch.randn((T, c.hidden_size), device=self.device, dtype=torch.bfloat16)
         valid_mask = torch.ones(T, dtype=torch.bool, device=self.device)
         valid_mask[: T // 4] = False
         with torch.no_grad():
-            idx, w = c.moe.route(x, valid_mask)
+            idx, w = c.route(x, valid_mask)
         self.assertEqual(idx.shape, (T, K))
         self.assertEqual(w.shape, (T, K))
         self.assertEqual(idx.dtype, torch.int32)

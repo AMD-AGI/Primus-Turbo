@@ -63,6 +63,7 @@ from primus_turbo.flydsl.mega.prims import (
     SPIN_TIMEOUT_CYCLES,
     _mem_fence,
     atomic_add,
+    l2_invalidate,
     ld,
     read_clock,
     st,
@@ -287,17 +288,17 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
                 )
                 vec_idx = vec_idx + fx.Int32(_WARP)
             if wait_flags:
-                # consumed -> reset each non-dropped slot's flag to 0 (NOT -1) so the next
-                # combine needs no host barrier_local.zero_. 0 is the no-wait sentinel: a 2nd
-                # reducer (num_reduce_cu>0 double-reduce) sees 0 and proceeds (never spins),
-                # so this is deadlock-safe unlike a -1 reset. Forward re-arms -1 via the prologue.
+                # consumed -> RE-ARM each non-dropped slot's flag to -1 (the "wait" state) for the
+                # NEXT combine, so the backward STEP3 reuse needs no prologue-style re-arm (the
+                # forward reduce leaves -1). REQUIRES num_reduce_cu == 0 (single reducer): a 2nd
+                # reducer would deadlock spinning on -1.
                 for j in range_constexpr(topk):
                     slot = token * fx.Int32(topk) + fx.Int32(j)
                     topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
                     if topk_index >= fx.Int64(0):
                         if topk_index < fx.Int64(num_experts):
                             if lane == fx.Int32(0):
-                                st(barrier_base, slot, fx.Int32(0), scope="agent")
+                                st(barrier_base, slot, fx.Int32(-1), scope="agent")
                     if with_gate:
                         # d_topk_w[slot] = gate_local[slot] for valid routes else 0, into a fresh
                         # buffer (folds the host combine_gate * (topk_idx>=0) mul + clone).
@@ -474,6 +475,7 @@ def _compile(
                     # (all n_blocks GEMM increments already landed; folds out the host zero)
                     st(sb_l2_base, block_m, fx.Int32(0), scope="agent")
                 fx.gpu.barrier()  # broadcast thread-0's poll result to the whole block
+                l2_invalidate()  # re-fetch L2Y from HBM (GEMM sc1-store bypassed L2 -> stale line)
                 push_block(block_m)
             # drain cross-rank PUSH stores before exit so the host barrier + reduce see landed data
             fx.rocdl.s_waitcnt(0)
@@ -532,8 +534,9 @@ def _compile(
                         # L2 so the role-1 push (different CU, same kernel) reads fresh, not stale L1.
                         c_cache_modifier=16,
                     )
-                    # drain L2Y stores to L2 (coherence point): CDNA L1 is write-through, so
-                    # vmcnt(0) means the rows are in L2 -- the role-1 push reads them L1-bypass.
+                    # drain L2Y stores before raising sb_l2. NOTE: c_cache_modifier=16 (sc1) writes
+                    # THROUGH L2 to HBM, leaving a stale L2 line -- the role-1 push must invalidate
+                    # L2 (l2_invalidate() before push_block) to re-read fresh, else it pushes stale.
                     fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()  # all waves' stores landed before the signal
                     _emit_if_then(
