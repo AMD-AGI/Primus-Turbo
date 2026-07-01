@@ -48,6 +48,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     StoreCPerTensor,
     StoreCPerTensorCShuffle,
     _readfirstlane_i32,
+    _robust_time,
     asm_mma_do,
     ceildiv,
     compute_global_swizzle,
@@ -1476,26 +1477,6 @@ def _balanced_targs(args, m_total, G):
     for distribution-independent autotune timing."""
     bal = _balanced_group_offs(m_total, G, args[2].device)
     return args[:5] + (bal,) + args[6:]
-
-
-def _robust_time(launch, targs, warmup=250, reps=5, iters=50):
-    """Median-of-`reps` timing of launch(*targs) after `warmup` iters (the long warmup
-    reaches boost clock; short-K kernels mis-pick the config otherwise)."""
-    for _ in range(warmup):
-        launch(*targs)
-    torch.cuda.synchronize()
-    ts = []
-    for _ in range(reps):
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
-        e0.record()
-        for _ in range(iters):
-            launch(*targs)
-        e1.record()
-        torch.cuda.synchronize()
-        ts.append(e0.elapsed_time(e1) / iters)
-    ts.sort()
-    return ts[len(ts) // 2]
 
 
 def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
