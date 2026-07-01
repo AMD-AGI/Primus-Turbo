@@ -30,7 +30,7 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_dual_impl,
 )
-from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans
+from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans_flydsl
 
 __all__ = ["gemm_fp8"]
 
@@ -553,9 +553,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 )
             a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
-            a_row, a_row_scale, a_col, a_col_scale = quantize_fp8_with_trans(
-                a, fp8_dtype, granularity, block_size=block_size, scaling_recipe=a_scaling_recipe
-            )
+            a_row, a_row_scale, a_col, a_col_scale = quantize_fp8_with_trans_flydsl(a, fp8_dtype)
 
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if isinstance(b, QuantizedTensor):
@@ -572,14 +570,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 )
             b_col, b_col_scale = b_t.qdata, b_t.scale_inv
         else:
-            b_row, b_row_scale, b_col, b_col_scale = quantize_fp8_with_trans(
-                b,
-                fp8_dtype,
-                granularity,
-                block_size=block_size,
-                scaling_recipe=b_scaling_recipe,
-                scaling_recipe_for_trans=b_scaling_recipe,
-            )
+            b_row, b_row_scale, b_col, b_col_scale = quantize_fp8_with_trans_flydsl(b, fp8_dtype)
 
         # NT layout
         out = gemm_fp8_impl(
@@ -612,9 +603,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         # Dual-cast grad_out: one kernel emits both the row-wise (grad_a, NN->NT) and
         # col-wise (grad_b, TN->NT) directions -- no second single-direction pass.
-        g_row, g_row_scale, g_col, g_col_scale = quantize_fp8_with_trans(
-            grad_out, grad_out_dtype, ctx.config.granularity, block_size=ctx.config.block_size
-        )
+        g_row, g_row_scale, g_col, g_col_scale = quantize_fp8_with_trans_flydsl(grad_out, grad_out_dtype)
 
         grad_a = gemm_fp8_impl(
             g_row,

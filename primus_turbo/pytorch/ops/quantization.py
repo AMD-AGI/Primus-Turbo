@@ -121,6 +121,21 @@ def quantize_fp8_with_trans(
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
 
+def quantize_fp8_with_trans_flydsl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FlyDSL dual-cast (row-wise + transposed col-wise) MXFP8 quant -- the operand quant
+    for the FlyDSL MX GEMM (``FP8GemmMXFunction``). Mirrors ``quantize_fp8_with_trans``,
+    which stays on the HIP kernel for general / grouped quant. Emits raw row-major E8M0
+    ``[dim, K//32]`` scales (bit-identical to the HIP ``quantize_mxfp8_dual``); the FlyDSL
+    GEMM preshuffles the raw scale itself, so nothing is shuffled here. Returns
+    (row_fp8, row_scale, col_fp8, col_scale)."""
+    from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import quant_mxfp8_raw
+
+    return quant_mxfp8_raw(x.contiguous(), out_dtype, with_trans=True, axis=None)
+
+
 def grouped_quantize_fp8_with_trans(
     x: torch.Tensor,
     out_dtype: torch.dtype,
