@@ -332,35 +332,17 @@ class GEMMFP8TurboBackend(KernelBackend):
 
 
 class GEMMFP8FlyDSLBackend(KernelBackend):
-    """FlyDSL 8-wave fp8 dense GEMM backend.
+    """FlyDSL 8-wave fp8 dense GEMM backend (gfx950 only).
 
-    The underlying kernel wrapper lives in
-    ``primus_turbo.flydsl.gemm.gemm_fp8_kernel``.
+    TENSORWISE: scalar a_scale/b_scale, bf16/fp16 out, arbitrary M/N/K, layouts
+    NT/NN/TN (TT unsupported). trans_c via post-hoc transpose.
 
-    Layout support:
-      - NT (native):  trans_a=F, trans_b=T
-      - NN (native):  trans_a=F, trans_b=F
-      - TN (native):  trans_a=T, trans_b=F
-      - TT:           trans_a=T, trans_b=T   (not supported)
-
-    Constraints:
-      - TENSORWISE per-tensor scaling (a_scale / b_scale scalar)
-      - out_dtype in {bf16, fp16}
-      - arbitrary contraction K, M and N
-      (trans_c=True is supported via post-hoc output transpose; extra mem copy vs Triton.)
-
-    MX_BLOCKWISE (compute-only): NT only, per-operand E4M3/E5M2 (incl. hybrid),
-    bf16/fp16 out. Per-1x32 raw E8M0 2D block scales [M,K//32]/[N,K//32] (arbitrary
-    M/N; K a 128-multiple >=256, which the MX quant guarantees). The kernel fuses the
-    A (layout-1) + B-comb (layout-3) scale LDS-repack into its own launch and sizes A by
-    cdiv(M,64) / B by cdiv(N,256)*4, so execute() does no host-side padding.
-    Routes to gemm_mxfp8_flydsl_kernel.
+    MX_BLOCKWISE: NT only, per-operand E4M3/E5M2 (incl. hybrid), bf16/fp16 out,
+    per-1x32 raw E8M0 2D scales [M,K//32]/[N,K//32]. The kernel repacks the scales
+    to its preshuffled layout, so execute() does no host-side padding.
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.MX_BLOCKWISE}
-    # E4M3 / E5M2 / hybrid, bf16 or fp16 output. Per-operand fp8 format is threaded
-    # into the MFMA via cbsz(srcA)/blgp(srcB) (0=E4M3, 1=E5M2) and the FlyDSL
-    # MFMA_Scale atom dtype; fp16 output is produced from the f32 accumulator.
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -376,17 +358,12 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         granularity: ScalingGranularity,
     ) -> bool:
         supported = True
-        # gfx950 (CDNA4) only: the kernel uses mfma_f32_16x16x128_f8f6f4, absent
-        # on gfx942 and below. Gate here so the dispatcher never picks FlyDSL off
-        # gfx950 (the backend still imports fine on other archs).
+        # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
         supported &= get_device_compute_capability() >= (9, 5)
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            # NT. Per-operand E4M3/E5M2 (cbsz/blgp in the MFMA), bf16/fp16 out. Scales
-            # are raw E8M0 2D [M,K//32] / [N,K//32]; the kernel LDS-repacks them to the
-            # preshuffled int32 layout itself (sizing A by cdiv(M,64) / B by cdiv(N,256)*4),
-            # so execute() does no host-side padding for general M/N.
+            # NT only; raw E8M0 2D scales [M,K//32]/[N,K//32], general M/N.
             supported &= a.ndim == 2 and b.ndim == 2
             supported &= (not trans_a) and trans_b
             supported &= a.dtype in (float8_e4m3, float8_e5m2) and b.dtype in (float8_e4m3, float8_e5m2)
@@ -402,10 +379,10 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
 
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
         supported &= out_dtype in (torch.bfloat16, torch.float16)
-        # NT / NN / TN native; TT (trans_a and trans_b) is not supported.
-        supported &= not (trans_a and trans_b)
+        supported &= not (trans_a and trans_b)  # TT unsupported
+        # Software pipeline needs >= 2 K tiles: ceil(K/128) >= 2, i.e. K > 128.
         k = a.shape[0] if trans_a else a.shape[1]
-        supported &= k >= 129
+        supported &= k > 128
         supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
         return supported
 
