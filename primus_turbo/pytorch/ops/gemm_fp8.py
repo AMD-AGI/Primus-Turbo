@@ -28,6 +28,7 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_dual_impl,
 )
+from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans
 
 __all__ = ["gemm_fp8"]
 
@@ -623,20 +624,20 @@ class FP8GemmMXFunction(torch.autograd.Function):
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
         grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
 
-        grad_out_scaling_recipe = ScalingRecipe()
-        quantized_grad_out = QuantizedTensor.quantize(
+        scaling_recipe = ScalingRecipe()
+        grad_out_fp8, grad_out_scale_inv, grad_out_fp8_t, grad_out_t_scale_inv = quantize_fp8_with_trans(
             grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=-1,
-            scaling_recipe=grad_out_scaling_recipe,
+            scaling_recipe=scaling_recipe,
+            scaling_recipe_for_trans=scaling_recipe,
         )
 
         # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout.
         grad_a = gemm_fp8_impl(
-            quantized_grad_out.qdata,
-            quantized_grad_out.scale_inv,
+            grad_out_fp8,
+            grad_out_scale_inv,
             False,
             b_fp8_t,
             b_t_scale_inv,
@@ -647,20 +648,10 @@ class FP8GemmMXFunction(torch.autograd.Function):
             default_backend=BackendType.TURBO.value,
         )
 
-        grad_out_t_scaling_recipe = ScalingRecipe()
-        quantized_grad_out_t = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=-2,
-            scaling_recipe=grad_out_t_scaling_recipe,
-        )
-
         # NOTE: convert TN layout to NT layout because MXFP8 only supports NT layout.
         grad_b = gemm_fp8_impl(
-            quantized_grad_out_t.qdata,
-            quantized_grad_out_t.scale_inv,
+            grad_out_fp8_t,
+            grad_out_t_scale_inv,
             False,
             a_fp8_t,
             a_t_scale_inv,
