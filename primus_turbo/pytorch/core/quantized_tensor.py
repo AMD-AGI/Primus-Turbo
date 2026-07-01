@@ -220,7 +220,11 @@ class QuantizedTensor(torch.Tensor):
         assert hp_tensor.ndim in (2, 3), f"data must be a 2D or 3D tensor, got {hp_tensor.ndim}D"
         assert dest_dtype in _SUPPORTED_QUANTIZED_DTYPES, "Unsupported quantized dtype"
 
-        is_grouped_tensor = group_lens is not None
+        # NOTE: we treat grouped tensors as non-grouped tensors when granularity is TENSORWISE or ROWWISE.
+        is_grouped_tensor = group_lens is not None and granularity not in [
+            ScalingGranularity.TENSORWISE,
+            ScalingGranularity.ROWWISE,
+        ]
         if is_grouped_tensor:
             assert granularity in _SUPPORTED_GROUPED_QUANTIZED_GRANS, (
                 f"Unsupported grouped granularity {granularity}"
