@@ -361,28 +361,20 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
         supported &= get_device_compute_capability() >= (9, 5)
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
+        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            # NT only; raw E8M0 2D scales [M,K//32]/[N,K//32], general M/N.
-            supported &= a.ndim == 2 and b.ndim == 2
+            # NT only; per-operand E4M3/E5M2; raw E8M0 2D scales [M,K//32]/[N,K//32].
             supported &= (not trans_a) and trans_b
-            supported &= a.dtype in (float8_e4m3, float8_e5m2) and b.dtype in (float8_e4m3, float8_e5m2)
-            supported &= out_dtype in (torch.bfloat16, torch.float16)
-            if not supported:
-                return supported
-            m, k, n = a.shape[0], a.shape[1], b.shape[0]
             supported &= k % 128 == 0 and k >= 256
-            supported &= a_scale_inv.ndim == 2 and a_scale_inv.shape == (m, k // 32)
-            supported &= b_scale_inv.ndim == 2 and b_scale_inv.shape == (n, k // 32)
+            supported &= a_scale_inv.shape == (m, k // 32) and b_scale_inv.shape == (n, k // 32)
             supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
             return supported
 
-        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
-        supported &= out_dtype in (torch.bfloat16, torch.float16)
-        supported &= not (trans_a and trans_b)  # TT unsupported
-        # Software pipeline needs >= 2 K tiles: ceil(K/128) >= 2, i.e. K > 128.
-        k = a.shape[0] if trans_a else a.shape[1]
-        supported &= k > 128
+        # TENSORWISE: NT/NN/TN native (TT unsupported), scalar per-tensor scales.
+        supported &= not (trans_a and trans_b)
+        supported &= k > 128  # software pipeline needs >= 2 K tiles: ceil(K/128) >= 2
         supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
         return supported
 
