@@ -19,28 +19,11 @@ from primus_turbo.pytorch.core.low_precision import (
     check_mxfp8_support,
     float4_e2m1fn_x2,
 )
-from primus_turbo.pytorch.core.utils import is_gfx1250
-from primus_turbo.triton.quantization.dequantization_mxfp8 import (
-    dequantize_mxfp8_triton,
-    grouped_dequantize_mxfp8_triton,
-)
-from primus_turbo.triton.quantization.dequantization_tensorwise import (
-    dequantize_fp8_tensorwise_triton,
-)
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_dual_kernel,
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_row_col_kernel,
-)
-from primus_turbo.triton.quantization.quantization_mxfp8 import (
-    grouped_quantize_mxfp8_dual_triton,
-    grouped_quantize_mxfp8_triton,
-    quantize_mxfp8_dual_triton,
-    quantize_mxfp8_triton,
-)
-from primus_turbo.triton.quantization.quantization_tensorwise import (
-    quantize_fp8_tensorwise_triton,
 )
 
 
@@ -54,8 +37,8 @@ def quantize_fp8_tensorwise_impl(
     """
     Quantize FP8 Tensor-Wise
     """
-    if is_gfx1250():
-        return quantize_fp8_tensorwise_triton(x, out_dtype)
+    # if is_gfx1250():
+    #     return quantize_fp8_tensorwise_triton(x, out_dtype)
     x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
     return x_fp8, scale_inv
 
@@ -76,8 +59,8 @@ def dequantize_fp8_tensorwise_impl(x: torch.Tensor, out_dtype: torch.dtype, scal
     """
     DeQuantize FP8 Tensor-Wise
     """
-    if is_gfx1250():
-        return dequantize_fp8_tensorwise_triton(x, scale_inv, out_dtype)
+    # if is_gfx1250():
+    #     return dequantize_fp8_tensorwise_triton(x, scale_inv, out_dtype)
     return torch.ops.primus_turbo_cpp_extension.dequantize_fp8_tensorwise(x, scale_inv, out_dtype)
 
 
@@ -452,17 +435,17 @@ def quantize_mxfp8_impl(
     if with_trans:
         # gfx1250 always uses the Triton kernel; shuffle layouts are unsupported and
         # the Triton launcher raises NotImplementedError for them.
-        if is_gfx1250():
-            return quantize_mxfp8_dual_triton(
-                x,
-                out_dtype,
-                scaling_recipe.use_2d_block,
-                scaling_recipe_for_trans.use_2d_block,
-                scaling_recipe.shuffle_scale,
-                scaling_recipe.shuffle_out,
-                scaling_recipe_for_trans.shuffle_scale,
-                scaling_recipe_for_trans.shuffle_out,
-            )
+        # if is_gfx1250():
+        #     return quantize_mxfp8_dual_triton(
+        #         x,
+        #         out_dtype,
+        #         scaling_recipe.use_2d_block,
+        #         scaling_recipe_for_trans.use_2d_block,
+        #         scaling_recipe.shuffle_scale,
+        #         scaling_recipe.shuffle_out,
+        #         scaling_recipe_for_trans.shuffle_scale,
+        #         scaling_recipe_for_trans.shuffle_out,
+        #     )
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual(
             x,
             out_dtype,
@@ -475,15 +458,15 @@ def quantize_mxfp8_impl(
             scaling_recipe_for_trans.shuffle_out,
         )
     else:
-        if is_gfx1250():
-            return quantize_mxfp8_triton(
-                x,
-                out_dtype,
-                axis,
-                scaling_recipe.use_2d_block,
-                scaling_recipe.shuffle_scale,
-                scaling_recipe.shuffle_out,
-            )
+        # if is_gfx1250():
+        #     return quantize_mxfp8_triton(
+        #         x,
+        #         out_dtype,
+        #         axis,
+        #         scaling_recipe.use_2d_block,
+        #         scaling_recipe.shuffle_scale,
+        #         scaling_recipe.shuffle_out,
+        #     )
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8(
             x,
             out_dtype,
@@ -538,19 +521,19 @@ def grouped_quantize_mxfp8_impl(
         )
 
         # gfx1250 always uses the Triton kernel; shuffle layouts raise NotImplementedError.
-        if is_gfx1250():
-            return grouped_quantize_mxfp8_dual_triton(
-                x,
-                group_lens,
-                group_offs,
-                out_dtype,
-                scaling_recipe.use_2d_block,
-                scaling_recipe_for_trans.use_2d_block,
-                scaling_recipe.shuffle_scale,
-                scaling_recipe.shuffle_out,
-                scaling_recipe_for_trans.shuffle_scale,
-                scaling_recipe_for_trans.shuffle_out,
-            )
+        # if is_gfx1250():
+        #     return grouped_quantize_mxfp8_dual_triton(
+        #         x,
+        #         group_lens,
+        #         group_offs,
+        #         out_dtype,
+        #         scaling_recipe.use_2d_block,
+        #         scaling_recipe_for_trans.use_2d_block,
+        #         scaling_recipe.shuffle_scale,
+        #         scaling_recipe.shuffle_out,
+        #         scaling_recipe_for_trans.shuffle_scale,
+        #         scaling_recipe_for_trans.shuffle_out,
+        #     )
         return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8_dual(
             x,
             group_lens,
@@ -565,17 +548,17 @@ def grouped_quantize_mxfp8_impl(
         )
     else:
         assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
-        if is_gfx1250():
-            return grouped_quantize_mxfp8_triton(
-                x,
-                group_lens,
-                group_offs,
-                out_dtype,
-                axis,
-                scaling_recipe.use_2d_block,
-                scaling_recipe.shuffle_scale,
-                scaling_recipe.shuffle_out,
-            )
+        # if is_gfx1250():
+        #     return grouped_quantize_mxfp8_triton(
+        #         x,
+        #         group_lens,
+        #         group_offs,
+        #         out_dtype,
+        #         axis,
+        #         scaling_recipe.use_2d_block,
+        #         scaling_recipe.shuffle_scale,
+        #         scaling_recipe.shuffle_out,
+        #     )
         return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8(
             x,
             group_lens,
@@ -667,8 +650,8 @@ def dequantize_mxfp8_impl(
         "The last dimension of the x tensor must be divisible by the block size."
     )
 
-    if is_gfx1250():
-        return dequantize_mxfp8_triton(x, scale_inv, axis, block_size, out_dtype)
+    # if is_gfx1250():
+    #     return dequantize_mxfp8_triton(x, scale_inv, axis, block_size, out_dtype)
     return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp8(x, scale_inv, axis, block_size, out_dtype)
 
 
@@ -697,10 +680,10 @@ def grouped_dequantize_mxfp8_impl(
         "The last dimension of the x tensor must be divisible by the block size."
     )
 
-    if is_gfx1250():
-        return grouped_dequantize_mxfp8_triton(
-            x, scale_inv, group_offs, group_offs_padded, axis, block_size, out_dtype, total_M
-        )
+    # if is_gfx1250():
+    #     return grouped_dequantize_mxfp8_triton(
+    #         x, scale_inv, group_offs, group_offs_padded, axis, block_size, out_dtype, total_M
+    #     )
     return torch.ops.primus_turbo_cpp_extension.grouped_dequantize_mxfp8(
         x, scale_inv, group_offs, group_offs_padded, axis, block_size, out_dtype, total_M
     )

@@ -174,6 +174,41 @@ __device__ __forceinline__ uint32_t cvt_f32x4_to_fp8x4(float v0, float v1, float
     }
 
     return result;
+#elif defined(__gfx1250__)
+    // gfx1250 (CDNA-Next) replaces the gfx950 packed-2 `v_cvt_scalef32_pk_fp8_f32`
+    // with the packed-8 `v_cvt_scalef32_pk8_{fp8,bf8}_f32` (MI455 ISA white
+    // paper). Semantics verified on hardware to match gfx950: each output is
+    // `src[i] / scale` cast to E4M3 / E5M2, with magnitudes above the FP8 max
+    // encoding producing NaN (E4M3) / Inf (E5M2) -- so the same soft-clamp to
+    // +/-(FP8_MAX * scale) is required. We feed the 4 live values (rest 0) into
+    // the pk8 builtin and keep the low 32 bits, which pack the 4 requested FP8
+    // bytes in order.
+    using f32x8 = float __attribute__((ext_vector_type(8)));
+    using u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+
+    uint32_t result = 0;
+    if constexpr (std::is_same_v<DType, dtype::float8_e4m3>) {
+        const float lim = FP8E4M3_MAX * scale;
+        f32x8       vin;
+        vin[0] = fminf(fmaxf(v0, -lim), lim);
+        vin[1] = fminf(fmaxf(v1, -lim), lim);
+        vin[2] = fminf(fmaxf(v2, -lim), lim);
+        vin[3] = fminf(fmaxf(v3, -lim), lim);
+        vin[4] = vin[5] = vin[6] = vin[7] = 0.0f;
+        u32x2 packed                      = __builtin_amdgcn_cvt_scalef32_pk8_fp8_f32(vin, scale);
+        result                            = packed[0];
+    } else if constexpr (std::is_same_v<DType, dtype::float8_e5m2>) {
+        const float lim = FP8E5M2_MAX * scale;
+        f32x8       vin;
+        vin[0] = fminf(fmaxf(v0, -lim), lim);
+        vin[1] = fminf(fmaxf(v1, -lim), lim);
+        vin[2] = fminf(fmaxf(v2, -lim), lim);
+        vin[3] = fminf(fmaxf(v3, -lim), lim);
+        vin[4] = vin[5] = vin[6] = vin[7] = 0.0f;
+        u32x2 packed                      = __builtin_amdgcn_cvt_scalef32_pk8_bf8_f32(vin, scale);
+        result                            = packed[0];
+    }
+    return result;
 #else
     __builtin_trap();
     return 0;
