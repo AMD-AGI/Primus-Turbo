@@ -73,8 +73,13 @@ __all__ = [
 
 _FLYDSL = BackendType.FLYDSL.value
 
-# Debug-only: barrier between backward ops to test the peer-arrival spin hypothesis.
+# Debug-only: HOST barrier between backward ops to test the peer-arrival spin hypothesis.
 _BWD_BARRIER = os.environ.get("MEGA_BWD_BARRIER", "0") == "1"
+# Lightweight DEVICE cross-rank barrier before each backward cross-rank PUSH (DeepEP
+# device_sync_kernel style). The backward reuse path skips the prologue barrier, so under
+# dW2 wgrad backend: flydsl TN variable-k (default) vs Triton variable-k grouped GEMM.
+# backward dispatch comm-CU split (GEMM-bound -> fewer comm CUs frees CUs for GEMM).
+_DISPATCH_CU_BWD = int(os.environ.get("MEGA_DISPATCH_CU_BWD", "16"))
 
 
 def _bwd_barrier(group):
@@ -220,7 +225,6 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             # reuse the forward's handle (no prologue) via the rebuilt handle tuple.
             # the nn dispatch returns the pool (now holding the dispatched dy rows) as dispatch_x_in_buf
             _bwd_barrier(ctx.group)
-            # ctx.group.barrier()
             grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_impl(
                 dy,
                 w2,
@@ -228,6 +232,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 _FLYDSL,
                 handle=handle,
                 layout="nn",
+                num_dispatch_cu=_DISPATCH_CU_BWD,
             )
             _bwd_barrier(ctx.group)
 
@@ -264,18 +269,18 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             # ===== STEP 3: L1 dgrad (grad_pool = grad_l1 @ w1, NN) + combine PUSH + dx reduce =====
             # 3-role fused (mirrors forward STEP 4); the combine role also scatters grad_gate ->
             # origin combine_gate[token*topk+k] (grad_topk_weights). grad_l1 carries the weight -> unweighted reduce.
-            # sb_l2 self-resets in the combine push role; comb is fully overwritten by the push
-            # (reduce skips dropped slots); combine_gate's scatter is a per-slot overwrite (dropped
-            # pairs masked to 0 below); barrier_local self-resets to 0 in the reduce (forward consumed
-            # the same non-dropped slots -> already 0 here) -> none need a host zero. No STEP3 barrier:
-            # the STEP1 barrier already drained all ranks' forward (frees comb/barrier_local), and the
-            # STEP1 cross-rank dispatch couples ranks enough for the no-wait reduce's push-before-read.
+            # sb_l2 self-resets in the combine push role; combine_gate's scatter is a per-slot
+            # overwrite (dropped pairs masked to 0 below).
             # STEP3 is GEMM-bound (K=2I, twice the forward), so the combine fully hides under the
             # GEMM with FEWER dedicated combine CUs -> the GEMM keeps more CUs. (Forward STEP4 is
             # combine-bound and wants 64; sharing one value left ~0.4ms of GEMM CU-starvation here.)
             # Separate env MEGA_COMBINE_CU_BWD (default 20, swept best); reduce on empty GEMM blocks.
             _combine_cu = int(os.environ.get("MEGA_COMBINE_CU_BWD", "20"))
             _reduce_cu = int(os.environ.get("MEGA_REDUCE_CU", "0"))
+            # dx flag re-arm: the combine reduce re-arms barrier_local -> -1 on consume (see
+            # grouped_gemm_combine_bf16_kernel; requires num_reduce_cu == 0), so the forward reduce
+            # already left the flags in the "wait" state for this backward STEP3 reuse -- no manual
+            # prologue-style re-arm / cross-rank barrier needed here.
             # combine scatters grad_gate; the reduce folds masked grad_topk_weights and returns dx [T, hidden]
             _bwd_barrier(ctx.group)
             dx, grad_topk_weights_flat = grouped_gemm_combine_impl(
@@ -307,6 +312,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 handle=handle,
                 layout="tn",
                 trans_c=True,
+                num_dispatch_cu=_DISPATCH_CU_BWD,
             )
             _bwd_barrier(ctx.group)
 

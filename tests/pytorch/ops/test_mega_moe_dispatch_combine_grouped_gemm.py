@@ -446,6 +446,29 @@ def _run(local_rank, world, args):
                 grad_l1, grad_gate, act_w = swiglu_backward(
                     d_swiglu, l1_out, scale=symm.weight_recv_buf, return_gate=True, return_act_w=True
                 )
+                # device-time the bounded swiglu_backward in isolation (rank 0)
+                if rank == 0:
+                    m_real = int(symm.meta_scalars[1].item()) * symm.block_m
+                    for _ in range(20):
+                        swiglu_backward(
+                            d_swiglu, l1_out, scale=symm.weight_recv_buf, return_gate=True, return_act_w=True
+                        )
+                    torch.cuda.synchronize()
+                    _e0 = torch.cuda.Event(True)
+                    _e1 = torch.cuda.Event(True)
+                    _e0.record()
+                    for _ in range(100):
+                        swiglu_backward(
+                            d_swiglu, l1_out, scale=symm.weight_recv_buf, return_gate=True, return_act_w=True
+                        )
+                    _e1.record()
+                    torch.cuda.synchronize()
+                    _us = _e0.elapsed_time(_e1) / 100 * 1000
+                    print(
+                        f"[probe] swiglu_backward bounded: {_us:.1f} us  "
+                        f"ACC1.shape={tuple(l1_out.shape)} m_real={m_real}",
+                        flush=True,
+                    )
                 gate = l1_out[:, :Iq].float()
                 up = l1_out[:, Iq:].float()
                 sig = torch.sigmoid(gate)
@@ -497,19 +520,34 @@ def _run(local_rank, world, args):
         # ---- backward gradcheck: mega grads vs the turbo baseline (same grad_y) ----
         if args.bwd:
             grad_y = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
-            # mega fused grads (fixed routing; x/W1/W2 leaves)
+            # mega fused grads (fixed routing; x/W1/W2/topk_w leaves so grad_topk_weights is exercised)
             x_m = x.detach().requires_grad_(True)
             w1_m = W1.detach().requires_grad_(True)
             w2_m = W2.detach().requires_grad_(True)
-            y_m = mega_moe_fused(group, x_m, topk_idx, topk_w, w1_m, w2_m, block_m=args.bm, block_n=args.bn)
-            dx_m, dW1_m, dW2_m = torch.autograd.grad(y_m, [x_m, w1_m, w2_m], grad_y)
+            tw_m = topk_w.detach().requires_grad_(True)
+            y_m = mega_moe_fused(group, x_m, topk_idx, tw_m, w1_m, w2_m, block_m=args.bm, block_n=args.bn)
+            dx_m, dW1_m, dW2_m, dtw_m = torch.autograd.grad(y_m, [x_m, w1_m, w2_m, tw_m], grad_y)
             # turbo baseline grads (same grad_y, same local shard)
             y_t, x_t, w1_t, w2_t = baseline_grad_forward_leaves(x, topk_idx, gate_logits)
             dx_t, dW1_t, dW2_t = torch.autograd.grad(y_t, [x_t, w1_t, w2_t], grad_y)
+            # analytic grad_topk_weights ref: dtw[t,k] = <grad_y[t], o[t,k]>, o = UNWEIGHTED route
+            # output (swiglu(x@W1[e])@W2[e]); computed per-expert over the GLOBAL weights.
+            dtw_ref = torch.zeros_like(topk_w)
+            gyf = grad_y.float()
+            for e in range(E):
+                pos = (topk_idx == e).nonzero(as_tuple=False)  # [n, 2] (token, k) pairs
+                if pos.numel() == 0:
+                    continue
+                tks = pos[:, 0]
+                xe = x[tks].float()
+                gate_e, up_e = (xe @ W1g[e].float().t()).chunk(2, dim=-1)
+                o_e = (F.silu(gate_e) * up_e) @ W2g[e].float().t()  # [n, H]
+                dtw_ref[pos[:, 0], pos[:, 1]] = (gyf[tks] * o_e).sum(-1)
             bres = {
                 "dx": _gate3(dx_m, dx_t),
                 "dW1": _gate3(dW1_m, dW1_t),
                 "dW2": _gate3(dW2_m, dW2_t),
+                "dtw": _gate3(dtw_m, dtw_ref),
             }
             bgathered = [None] * world
             dist.all_gather_object(bgathered, (rank, bres), group=group)
