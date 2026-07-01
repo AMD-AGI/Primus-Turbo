@@ -106,13 +106,14 @@ class GroupedGEMMCKBackend(KernelBackend):
         resolved_lpx = 0
         if work_steal:
             ws_counter = _get_ck_ws_counter(a.device)
-            # Sync-free: derive total_tiles from tensor metadata
-            # (a.size(0), group_lens.numel()). The approximation is a lower
-            # bound on the exact value; the kernel's bounds check makes any
-            # resulting ws_local_per_xcd correctness-safe.
+            # Sync-free: derive total_tiles from tensor metadata. Use the
+            # transpose-aware M dimension (``can_handle`` already rejects
+            # trans_a=True on this backend, but keep the shape logic honest
+            # so it stays correct if that constraint is ever relaxed).
+            total_m = a.size(1) if trans_a else a.size(0)
             n = b.size(1) if trans_b else b.size(2)
             total_tiles = approximate_ck_standard_total_tiles(
-                a.size(0),
+                total_m,
                 group_lens.numel(),
                 n,
             )

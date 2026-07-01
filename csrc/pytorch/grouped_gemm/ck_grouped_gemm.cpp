@@ -120,6 +120,13 @@ at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                            "ws_counter must have at least ", kCounterSlots, " int32 slots");
         ws_counter_ptr = static_cast<int32_t *>(counter.data_ptr());
     }
+    // The CK WS kernel takes ws_local_per_xcd as int32. Reject values that
+    // would truncate silently on the cast below (int32 max ~2.1B; the heuristic
+    // returns ceil(total_tiles / 8) at most, and any WS shape that fits in
+    // int32 tile count is well under this limit -- this is a defensive check).
+    PRIMUS_TURBO_CHECK(
+        ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
+        "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
 
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
@@ -264,6 +271,11 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
                            "ws_counter must have at least ", kCounterSlots, " int32 slots");
         ws_counter_ptr = static_cast<int32_t *>(counter.data_ptr());
     }
+    // See ck_grouped_gemm(): the kernel takes ws_local_per_xcd as int32,
+    // reject values that would truncate silently on the cast below.
+    PRIMUS_TURBO_CHECK(
+        ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
+        "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
 
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
