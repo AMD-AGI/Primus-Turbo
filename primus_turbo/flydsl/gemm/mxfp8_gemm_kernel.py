@@ -49,6 +49,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     StoreCPerTensor,
     make_fp8_buffer_tensor_rebased,
     make_value_attrs,
+    run_eager_or_capture,
     wait_barrier,
     xcd_remap_pid,
 )
@@ -633,14 +634,7 @@ def gemm_mxfp8_flydsl_kernel(
     at_key = (M, N, K, bm, gm, xcd, gn, cbsz, blgp, out_fp16)
     entry = _MXFP8_AT_CACHE.get(at_key)
     if entry is None:
-        entry = [launch, None]
+        entry = [launch, None]  # [raw, compiled]; compiled filled lazily (index 1)
         _MXFP8_AT_CACHE[at_key] = entry
-    raw, compiled = entry
-    if torch.cuda.is_current_stream_capturing():
-        raw(*args)
-    else:
-        if compiled is None:
-            compiled = flyc.compile(raw, *args)
-            entry[1] = compiled
-        compiled(*args)
+    run_eager_or_capture(entry, args, 1)
     return out
