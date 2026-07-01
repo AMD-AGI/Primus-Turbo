@@ -768,6 +768,40 @@ class S2RLoaderTr:
         return [self._assemble(self._issue_one(lds_src, t, base_off)) for t in range_constexpr(self.n_tiles)]
 
 
+def get_compiled(cache: dict, launch, args):
+    """Cache compiled launcher by (id(launch), shapes/dtypes/ints).
+    Caller must keep ``launch`` alive (e.g. in _MXFP8_LAUNCH_CACHE): Python recycles
+    id() after GC, so a freed+reallocated launch at the same address returns a stale hit."""
+    key_parts = [id(launch)]
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            key_parts.append((tuple(a.shape), a.dtype))
+        elif isinstance(a, int):
+            key_parts.append(a)
+        else:
+            key_parts.append(type(a).__name__)
+    key = tuple(key_parts)
+    cached = cache.get(key)
+    if cached is None:
+        cached = flyc.compile(launch, *args)
+        cache[key] = cached
+    return cached
+
+
+def run_eager_or_capture(entry, args, compiled_idx):
+    """Mode-split steady-state launch, shared by the dense per-tensor and mxfp8
+    wrappers. ``entry[0]`` is the raw ``@flyc.jit`` launch; ``entry[compiled_idx]``
+    caches its one-time ``flyc.compile``'d object (filled lazily). Eager runs the
+    compiled object (skips @flyc.jit's per-call drift-check + arg-hash); capture
+    runs the raw closure (a compiled object regresses under CUDA-graph capture)."""
+    if torch.cuda.is_current_stream_capturing():
+        entry[0](*args)
+    else:
+        if entry[compiled_idx] is None:
+            entry[compiled_idx] = flyc.compile(entry[0], *args)
+        entry[compiled_idx](*args)
+
+
 def block_mn(pid, num_pid_m, n_blocks, GM, GN):
     """Tile-id -> (block_m, block_n), resolved at trace time. GN==0: 1D GROUP_M
     super-row swizzle (block_m inner). GN>0: 2D band — N split into width-GN bands

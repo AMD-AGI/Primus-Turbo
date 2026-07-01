@@ -27,9 +27,11 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     ceildiv,
     compute_global_swizzle,
     compute_global_swizzle_nn,
+    get_compiled,
     make_fp8_buffer_tensor_rebased,
     make_value_attrs,
     mask_a_tail,
+    run_eager_or_capture,
     wait_barrier,
     xcd_remap_pid,
 )
@@ -1023,34 +1025,14 @@ _COMPILED_DENSE_CACHE: dict = {}
 
 
 def _get_compiled_dense(launch, args):
-    """Cache compiled launcher by (shape, dtype, int-arg) tuple."""
-    key_parts = [id(launch)]
-    for a in args:
-        if isinstance(a, torch.Tensor):
-            key_parts.append((tuple(a.shape), a.dtype))
-        elif isinstance(a, int):
-            key_parts.append(a)
-        else:
-            key_parts.append(type(a).__name__)
-    key = tuple(key_parts)
-    cached = _COMPILED_DENSE_CACHE.get(key)
-    if cached is None:
-        cached = flyc.compile(launch, *args)
-        _COMPILED_DENSE_CACHE[key] = cached
-    return cached
+    """Cache compiled launcher by (shape, dtype, int-arg) tuple (shared ``get_compiled``)."""
+    return get_compiled(_COMPILED_DENSE_CACHE, launch, args)
 
 
 def _run_dense(entry, args):
-    """Mode-split steady-state launch. entry = [raw @flyc.jit launch, cfg, compiled].
-    Eager: run the one-time flyc.compile'd object (skips @flyc.jit's per-call drift-
-    check + arg-hash, and the per-call arg-key rebuild). Capture: run the raw closure
-    (a flyc.compile'd object regresses under CUDA-graph capture)."""
-    if torch.cuda.is_current_stream_capturing():
-        entry[0](*args)
-    else:
-        if entry[2] is None:
-            entry[2] = flyc.compile(entry[0], *args)
-        entry[2](*args)
+    """Mode-split steady-state launch. entry = [raw @flyc.jit launch, cfg, compiled]
+    (compiled at index 2); see the shared ``run_eager_or_capture``."""
+    run_eager_or_capture(entry, args, 2)
 
 
 def _as_i8_flat(t: torch.Tensor) -> torch.Tensor:

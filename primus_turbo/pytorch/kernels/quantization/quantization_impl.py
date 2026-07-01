@@ -13,7 +13,6 @@ from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     MXFP4_PADDING_ALIGN_SIZE,
     MXFP8_BLOCK_SIZE,
-    MXFP8_PADDING_ALIGN_SIZE,
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
@@ -423,28 +422,46 @@ def quantize_mxfp8_impl(
     else:
         assert axis is None, "The axis must be None when with_trans is True."
 
+    # MXFP8 quant runs natively on FlyDSL (raw E8M0, bit-identical to the removed HIP
+    # quantize_mxfp8 / quantize_mxfp8_dual -- verified across aligned / sub-256 / non-%128 /
+    # odd shapes). The recipe knobs the HIP kernels exposed are resolved here:
+    #   * use_2d_block: dropped -- FlyDSL always uses the finer per-1x32 block scale, which is
+    #     at least as accurate as the HIP 32x32 coarse block (FlyDSL >= HIP), so the knob is a
+    #     no-op (it does not change the FlyDSL raw scale);
+    #   * shuffle_out (fp8 data shuffle): MXFP4-only -- it has no standalone MXFP8 op and is
+    #     never set on any MXFP8 path, so it stays unsupported here.
+    # shuffle_scale is the gemm-preshuffled E8M0 layout. FlyDSL emits the *raw* row-major E8M0
+    # scale and each GEMM backend fuses its own preshuffle from it; when a caller explicitly
+    # asks for the preshuffled scale we reproduce the removed in-kernel HIP shuffle by
+    # post-applying the standalone shuffle_scale op to the raw scale. This is bit-identical to
+    # the old in-kernel shuffle: (a) shuffle_scale is the exact same permutation kernel the HIP
+    # path pinned against in-kernel shuffle (atol=0), and (b) the FlyDSL raw scale has the
+    # identical [free, contract_pad//32] shape the HIP kernel shuffled from -- row [M, Kp//32]
+    # / col [K, Mp//32] with Kp=ceil128(K), Mp=ceil128(M), and zero/padded blocks -> E8M0
+    # byte 0 in both -- so the shuffled bytes match.
+    assert not scaling_recipe.shuffle_out and not scaling_recipe_for_trans.shuffle_out, (
+        "MXFP8 has no output shuffle (shuffle_out is MXFP4-only)"
+    )
+    from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import quant_mxfp8_raw
+
+    out = quant_mxfp8_raw(x.contiguous(), out_dtype, with_trans, axis)
+
+    def _maybe_shuffle_scale(scale: torch.Tensor, do_shuffle: bool) -> torch.Tensor:
+        # Preshuffle the raw row-major E8M0 scale into the gemm-consumed [16, 16]-tiled layout.
+        # shuffle_scale requires a 2D Float8_e8m0fnu tensor; the public (non-grouped) MXFP8
+        # path here is always 2D (3D weight inputs go through grouped_quantize_mxfp8_impl).
+        if not do_shuffle:
+            return scale
+        return torch.ops.primus_turbo_cpp_extension.shuffle_scale(scale, [16, 16])
+
     if with_trans:
-        return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual(
-            x,
-            out_dtype,
-            MXFP8_PADDING_ALIGN_SIZE,
-            scaling_recipe.use_2d_block,
-            scaling_recipe_for_trans.use_2d_block,
-            scaling_recipe.shuffle_scale,
-            scaling_recipe.shuffle_out,
-            scaling_recipe_for_trans.shuffle_scale,
-            scaling_recipe_for_trans.shuffle_out,
-        )
-    else:
-        return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8(
-            x,
-            out_dtype,
-            axis,
-            MXFP8_PADDING_ALIGN_SIZE,
-            scaling_recipe.use_2d_block,
-            scaling_recipe.shuffle_scale,
-            scaling_recipe.shuffle_out,
-        )
+        row_fp8, row_scale, col_fp8, col_scale = out
+        row_scale = _maybe_shuffle_scale(row_scale, scaling_recipe.shuffle_scale)
+        col_scale = _maybe_shuffle_scale(col_scale, scaling_recipe_for_trans.shuffle_scale)
+        return row_fp8, row_scale, col_fp8, col_scale
+
+    fp8, scale = out
+    return fp8, _maybe_shuffle_scale(scale, scaling_recipe.shuffle_scale)
 
 
 def grouped_quantize_mxfp8_impl(

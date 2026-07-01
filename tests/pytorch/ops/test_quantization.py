@@ -11,7 +11,6 @@ import torch
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
-    MXFP8_BLOCK_SIZE,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp4_support,
@@ -324,6 +323,7 @@ def test_quantize_mxfp8_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
     if not mxfp8_supported:
         pytest.skip(reason)
 
+    MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
 
     x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
@@ -334,11 +334,12 @@ def test_quantize_mxfp8_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
     scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,
     )
+    # Raw E8M0 scales (no shuffle), then preshuffle them with the standalone shuffle_scale op.
     _, rowwise_scale, _, colwise_scale = quantize_fp8_with_trans(
         x_2d,
         dest_dtype,
         granularity=granularity,
-        block_size=MXFP8_BLOCK_SIZE,
+        block_size=MX_BLOCK_SIZE,
         scaling_recipe=scaling_recipe,
         scaling_recipe_for_trans=scaling_recipe,
     )
@@ -346,6 +347,9 @@ def test_quantize_mxfp8_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
     rowwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(rowwise_scale, [16, 16])
     colwise_scale_shuffle = torch.ops.primus_turbo_cpp_extension.shuffle_scale(colwise_scale, [16, 16])
 
+    # shuffle_scale=True must produce the same preshuffled layout as applying shuffle_scale to
+    # the raw scale above (the FlyDSL path post-applies the same op; this also matched the
+    # removed HIP in-kernel shuffle, which the op was pinned against at atol=0).
     scaling_recipe_with_shuffle = ScalingRecipe(
         use_2d_block=use_2d_block,
         shuffle_scale=True,
@@ -354,7 +358,7 @@ def test_quantize_mxfp8_shuffle(orig_dtype, dest_dtype, B, M, N, granularity, us
     _, rowwise_scale_shuffle_ref, _, colwise_scale_shuffle_ref = quantize_fp8_with_trans(
         x_2d,
         dest_dtype,
-        block_size=MXFP8_BLOCK_SIZE,
+        block_size=MX_BLOCK_SIZE,
         granularity=granularity,
         scaling_recipe=scaling_recipe_with_shuffle,
         scaling_recipe_for_trans=scaling_recipe_with_shuffle,
