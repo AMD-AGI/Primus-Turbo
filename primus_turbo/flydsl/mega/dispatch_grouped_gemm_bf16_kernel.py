@@ -5,6 +5,7 @@
 ###############################################################################
 
 import functools
+import os
 from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
@@ -44,6 +45,10 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_value_attrs,
     xcd_remap_pid,
 )
+
+# TN wgrad scoreboard fold-reset (default on). Off -> the scoreboard stays dirty after the
+# wgrad, hanging the NEXT reuse dispatch's gate (e.g. multi-layer back-to-back backward).
+_TN_SB_RESET = os.environ.get("MEGA_TN_SB_RESET", "1") == "1"
 
 
 @functools.lru_cache(maxsize=1)
@@ -236,6 +241,19 @@ def _make_kernel(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                 )
+                # Fold-reset the scoreboard (mirrors the NT/NN GEMM below): the TN gate only
+                # READS it, so without this the scoreboard stays at `expected` after the wgrad
+                # (never re-zeroed) and the NEXT reuse dispatch's gate spins forever -> hang.
+                # Each of the group's pool blocks is read by exactly TILES_PER_GROUP tiles; count
+                # the bumps and let the last one (prev == exp + TILES_PER_GROUP - 1) reset to 0.
+                if const_expr(_TN_SB_RESET):
+                    if thread_index == fx.Int32(0):
+                        for j in range(n_pb):
+                            pbj = pb0 + j
+                            exp_r = buffer_load(expected_resource, pbj, vec_width=1, dtype=fx.T.i32())
+                            prev = atomic_add(sb_base, pbj, fx.Int32(1), scope="sys")
+                            if prev == exp_r + fx.Int32(TILES_PER_GROUP - 1):
+                                st(sb_base, pbj, fx.Int32(0), scope="sys")
         else:
             tile_index = block_index - comm_block_count
             real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
