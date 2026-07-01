@@ -167,11 +167,6 @@ std::vector<at::Tensor> grouped_quantize_mxfp8(
     const at::ScalarType dest_dtype, const int64_t axis, const int64_t padding_align_size,
     const bool use_2d_block, const bool shuffle_scale = false, const bool shuffle_out = false);
 
-std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarType dest_dtype,
-                                       const int64_t axis, const int64_t padding_align_size,
-                                       const bool use_2d_block, const bool shuffle_scale = false,
-                                       const bool shuffle_out = false);
-
 std::vector<at::Tensor> grouped_quantize_mxfp8_meta(
     const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
     const at::ScalarType dest_dtype, const int64_t axis, const int64_t padding_align_size,
