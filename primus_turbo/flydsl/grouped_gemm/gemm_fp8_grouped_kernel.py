@@ -2737,8 +2737,8 @@ def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num
 def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_total, i64_traverse=False):
     """Per-shape wgrad autotune, balanced-timed, branched on per-group contraction
     m_total/G: <=1536 picks the faster of 2 8-wave candidates (the 4-wave prologue
-    can't amortize a short K); >1536 times the 4-wave whole-loop candidates against a
-    masked 8-wave reference (also the fallback if no 4-wave variant validates)."""
+    can't amortize a short K); >1536 times a masked 8-wave pool and the 4-wave whole-loop
+    candidates together and returns the fastest (masked is the numeric ref + fallback)."""
     out_view = args[2]
     # time on a balanced group_offs (m_total split over G) so a skewed call can't bias it.
     targs = _balanced_targs(args, m_total, G)
@@ -2764,12 +2764,21 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_tota
                 best_l, best_t = l, t
         return best_l
 
-    # Large contraction: one masked 8-wave as the untimed numeric reference + fallback.
-    prod = _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 8, i64_traverse=i64_traverse)
+    # Large contraction: pick the fastest of the masked 8-wave pool and the occ=1
+    # 4-wave whole-loop on one serialized (fixed-buffer) timing basis. 4-wave wins the
+    # large-contraction wgrad per-call by ~6-16% on production shapes, but it is timed
+    # against the best 8-wave rather than returned unconditionally, so a shape where a
+    # masked variant is faster (or where 4-wave fails the SNR guard) falls back cleanly.
+    masked = [
+        _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 8, i64_traverse=i64_traverse),
+        _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 0, 8, i64_traverse=i64_traverse),
+        _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 4, 4, 8, i64_traverse=i64_traverse),
+    ]
+    prod = masked[0]  # correctness reference + fallback
     prod(*targs)
     torch.cuda.synchronize()
     if not torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
-        return prod
+        return prod  # numeric guard: prod produced NaN/Inf -> don't time alts
     _ref = out_view.detach().clone().float()
     _rn = float((_ref * _ref).sum().item()) or 1.0
 
@@ -2778,15 +2787,18 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_tota
         e = float(((o - _ref) * (o - _ref)).sum().item())
         return (e / _rn) < (2e-2**2) and torch.isfinite(o.view(-1)[:1024]).all().item()
 
+    best_l, best_t = prod, _robust_time(prod, targs)
+    for l in masked[1:]:  # same-family masked pool: 1.5% hysteresis
+        t = _robust_time(l, targs)
+        if t < best_t * 0.985:
+            best_l, best_t = l, t
+
     # 4-wave (occ=1) whole-loop candidates (group_m, group_n, num_xcd) -- one per output-
-    # tile swizzle family: (8,4,*)/(4,4,*) are the 2D N-band swizzles that stop the grid
-    # from re-streaming the lhs/rhs stripes out of HBM on moderate-N shapes (row-major
-    # when N_BLOCKS_N<=group_n, a safe no-op on small grids), (0,0,*) is plain row-major;
-    # num_xcd is the L2-locality tile-remap factor. These 3 stay within ~1.3% of the full
-    # 8-way sweep on every production shape x m in {2048,8192}. Each is timed and gated by
-    # _ok() vs the masked reference; prod (masked) is the fallback if none validate.
+    # tile swizzle family; num_xcd is the L2-locality tile-remap factor. Each is timed on
+    # the same fixed-buffer serialized basis as the masked pool, gated by _ok() vs the
+    # masked reference, and adopted with the same 1.5% hysteresis. On production shapes the
+    # 4-wave whole-loop wins the large-contraction wgrad per-call by ~6-16%.
     _w4 = ((8, 4, 4), (4, 4, 8), (0, 0, 2))
-    b4l, b4t = None, None
     for gm, gn, xcd in _w4:
         l = _compile_grouped_tn_wgrad_4wave(
             OUT_M=OUT_M,
@@ -2804,9 +2816,9 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_tota
         if not _ok():
             continue
         t = _robust_time(l, targs)
-        if b4t is None or t < b4t:
-            b4l, b4t = l, t
-    return b4l if b4l is not None else prod
+        if t < best_t * 0.985:
+            best_l, best_t = l, t
+    return best_l
 
 
 def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
