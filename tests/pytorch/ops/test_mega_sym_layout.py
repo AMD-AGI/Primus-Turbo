@@ -71,8 +71,8 @@ def _build(shape_key):
         w(SL.get_l2_arrival_mask_ptr(sl, 3), 1008)
         w(SL.get_src_token_topk_idx_ptr(sl, 1, 1, 2), 1009)
         w(SL.get_token_src_metadata_ptr(sl, 4), 1010)
-        # map: write through a peer-translated grid-sync ptr (dst rank 1)
-        w(SL.map(sl, SL.get_grid_sync_count_ptr(sl, 0), fx.Int32(1)), 2001)
+        # sym_map: write through a peer-translated grid-sync ptr (dst rank 1)
+        w(SL.sym_map(sl, SL.get_grid_sync_count_ptr(sl, 0), fx.Int32(1)), 2001)
 
     @flyc.jit
     def launch(ARENA, sl, stream: fx.Stream = fx.Stream(None)):
