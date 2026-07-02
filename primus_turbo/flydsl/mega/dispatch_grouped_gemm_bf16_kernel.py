@@ -26,7 +26,6 @@ BLOCK_K (DSv3 shapes qualify) and hidden a multiple of 512 (warp push step).
 """
 
 import functools
-import os
 from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
@@ -43,13 +42,9 @@ from flydsl.expr.typing import AddressSpace, PointerType
 
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
-
-# shared bf16 GEMM tile + geometry/LDS helpers from the dense bf16 kernel
 from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
+    GEMM_TILE,
     _make_shared_storage,
-    gemm_bf16_nn_tile,
-    gemm_bf16_nt_tile,
-    gemm_bf16_tn_tile,
     gemm_bf16_tn_variable_k_tile,
     load_go_i64,
 )
@@ -62,14 +57,7 @@ from primus_turbo.flydsl.mega.prims import (
 )
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs
-
-# per-tile GEMM closure by layout (NT forward, NN dgrad, TN wgrad); all grouped via b_group_base
-_GEMM_TILE = {"nt": gemm_bf16_nt_tile, "nn": gemm_bf16_nn_tile, "tn": gemm_bf16_tn_tile}
-
-# TN wgrad scoreboard fold-reset (default on). Off -> the scoreboard stays dirty after the
-# wgrad, hanging the NEXT reuse dispatch's gate (e.g. multi-layer back-to-back backward).
-_TN_SB_RESET = os.environ.get("MEGA_TN_SB_RESET", "1") == "1"
+from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs, xcd_remap_pid
 
 
 @functools.lru_cache(maxsize=1)
@@ -78,22 +66,9 @@ def get_dummy_tensor():
     return torch.empty(1, dtype=torch.int32)
 
 
-_BLOCK_M = 256
-
-# number of flat prologue slots before the appended per-layer snapshots
-# (handle tail [11..13] = dispatched_src_rank / dispatched_src_row / dispatched_meta_scalars,
-# the local clones this kernel copies device-side into the symm origin/meta regions).
 _HANDLE_PROLOGUE_LEN = 11
 
-# comm-PUSH + scoreboard prims (byte-agnostic; shared intra-node EP layer)
 
-# fused dispatch-prologue: builds the DeepEP-style handle when handle=None
-
-
-# ───────────────────────────────────────────────────────────────────────
-# Fused dispatch PUSH + grouped GEMM. LINEAR no-sync tile-id map offset past the
-# comm blocks; GEMM blocks spin on the scoreboard before computing.
-# ───────────────────────────────────────────────────────────────────────
 @functools.lru_cache(maxsize=256)
 def _compile(
     out_features,
@@ -112,14 +87,13 @@ def _compile(
     trans_c=False,
     G=0,
     has_snapshots=False,
+    num_xcd=8,
 ):
     K = hidden_size
     is_tn = layout == "tn"
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
     assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     if is_tn:
-        # OUT_M = dispatched-pool feature (lhs, = hidden_size); OUT_N = rhs feature.
-        # trans_c emits C^T via operand swap (M<->N) + fast coalesced store.
         OUT_M, OUT_N = hidden_size, out_features
         OUT_M_g, OUT_N_g = (OUT_N, OUT_M) if trans_c else (OUT_M, OUT_N)
         assert OUT_M_g % BLOCK_M == 0 and OUT_N_g % BLOCK_N == 0
@@ -128,18 +102,16 @@ def _compile(
         TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
         TOTAL = G * TILES_PER_GROUP
     else:
-        gemm_tile = _GEMM_TILE[layout]
+        gemm_tile = GEMM_TILE[layout]
         assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
         n_blocks = out_features // BLOCK_N
         worst_case_tiles = num_max_pool_tokens // BLOCK_M
 
-    # device-side restore geometry: grid-strided copy of the handle-tail snapshots into
-    # the symm origin/meta regions (compile-time stride -> unrolled iteration count).
     _grid_size = num_dispatch_cu + (TOTAL if is_tn else worst_case_tiles * n_blocks)
     _copy_threads = _grid_size * _BLOCK_THREADS
     _copy_iters = (num_max_pool_tokens + _copy_threads - 1) // _copy_threads
-    _meta_records = 8 * 4  # meta_scalars: 8 x i32
-    _pool_records = num_max_pool_tokens * 4  # origin_rank / origin_slot: P x i32
+    _meta_records = 8 * 4
+    _pool_records = num_max_pool_tokens * 4
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_kernel(
@@ -168,12 +140,6 @@ def _compile(
         comm_block_count = fx.Int32(num_dispatch_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
-        # ── device-side restore: copy this layer's local snapshots (handle tail) into the
-        # symm origin/meta regions so the (separately launched) combine reads the right
-        # routing/meta even after a later layer clobbered the shared buffer. Barrier-free:
-        # no role below reads these symm regions in THIS kernel (origin is unused here and
-        # num_tile_blocks comes from the snapshot slice host-side), and the writes are
-        # visible to the next kernel on the stream. Grid-strided over all blocks/threads.
         if const_expr(has_snapshots):
             src_rank_res = create_buffer_resource(DISPATCHED_SRC_RANK, max_size=True)
             src_row_res = create_buffer_resource(DISPATCHED_SRC_ROW, max_size=True)
@@ -202,19 +168,15 @@ def _compile(
                     buffer_load(src_meta_res, gtid, vec_width=1, dtype=fx.T.i32()), dst_meta_res, gtid
                 )
 
-        # ===== COMM role resources =====
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
         expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
         expert_send_dst_row_resource = create_buffer_resource(EXPERT_SEND_DST_ROW, max_size=True)
         expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
         expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
         dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
-        # pool base / peer pool / peer scoreboard all come from the SymLayout now
-        # ===== GEMM role resources =====
         if const_expr(is_tn):
             go = fx.rocdl.make_buffer_tensor(GROUP_OFFS, max_size=False, num_records_bytes=(G + 1) * 8)
             go_div = fx.logical_divide(go, fx.make_layout(1, 1))
-            # TN wgrad also needs the per-pool-block expected count for its arrival gate.
             expected_resource = create_buffer_resource(EXPECTED, max_size=True)
         else:
             group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
@@ -235,7 +197,6 @@ def _compile(
             signal=True,
             scoreboard_address_resource=None,
             block_m=BLOCK_M,
-            # two-heap delta path: local base ptr + i64[world] per-peer delta table
             pool_base=sym_layout.pool_ptr,
             pool_offsets_resource=create_buffer_resource_from_addr(
                 sym_layout.offsets_ptr, num_records_bytes=int(sym_layout.num_ranks) * 8
@@ -246,29 +207,26 @@ def _compile(
             ),
         )
 
-        # ── 2-role: role1 dispatch [0,D) ‖ role2 gemm [D, grid). ───────────────────
         if block_index < comm_block_count:
-            # role1: dispatch PUSH over XGMI + signal.
             local_task_count = (
                 fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
             ) // comm_block_count
             for task_iteration in range(local_task_count):
                 dispatch_tile(block_index + task_iteration * comm_block_count, fx.Int32(0), 1)
         elif const_expr(is_tn):
-            # role2 (tn): variable-K wgrad. dispatch & wgrad touch independent data -> no
-            # gate/fence/fold-reset; runs immediately, fully overlapping the dispatch.
-            # empty groups (m_start==m_end) run a zero-iteration no-op.
             tile_index = block_index - comm_block_count
             if tile_index < fx.Int32(TOTAL):
                 group_idx = tile_index // fx.Int32(TILES_PER_GROUP)
-                local = tile_index % fx.Int32(TILES_PER_GROUP)
-                block_m = local // fx.Int32(N_BLOCKS_N)
-                block_n = local % fx.Int32(N_BLOCKS_N)
+                local_raw = tile_index % fx.Int32(TILES_PER_GROUP)
+                local = xcd_remap_pid(local_raw, TILES_PER_GROUP, num_xcd)
+                if const_expr(trans_c):
+                    block_n = local // fx.Int32(N_BLOCKS_M)
+                    block_m = local % fx.Int32(N_BLOCKS_M)
+                else:
+                    block_m = local // fx.Int32(N_BLOCKS_N)
+                    block_n = local % fx.Int32(N_BLOCKS_N)
                 m_start = load_go_i64(go_div, group_idx)
                 m_end = load_go_i64(go_div, group_idx + fx.Int32(1))
-                # ARRIVAL GATE: wait peers' dispatch PUSHes for this group's pool blocks
-                # before the wgrad reads the pool. The TN role previously skipped this
-                # ("independent data") and raced on stale/incomplete rows -> wrong dW1.
                 sb_base = sym_layout.scoreboard_ptr
                 pb0 = m_start // fx.Int32(BLOCK_M)
                 n_pb = m_end // fx.Int32(BLOCK_M) - pb0
@@ -294,7 +252,6 @@ def _compile(
                     fx.inttoptr(pool_ptr_ty, sym_layout.pool_ptr),
                     fx.make_layout(num_max_pool_tokens * OUT_M, 1),
                 )
-                # trans_c swaps A<->B (WEIGHTS=rhs becomes lhs) and the K-major M/N strides
                 if const_expr(trans_c):
                     gemm_a, gemm_b, rt_m, rt_n = WEIGHTS, pool_tensor, out_n_rt, out_m_rt
                 else:
@@ -318,21 +275,13 @@ def _compile(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                 )
-                # Fold-reset the scoreboard (mirrors the NT/NN GEMM below): the TN gate only
-                # READS it, so without this the scoreboard stays at `expected` after the wgrad
-                # (never re-zeroed) and the NEXT reuse dispatch's gate spins forever -> hang.
-                # Each of the group's pool blocks is read by exactly TILES_PER_GROUP tiles; count
-                # the bumps and let the last one (prev == exp + TILES_PER_GROUP - 1) reset to 0.
-                if const_expr(_TN_SB_RESET):
-                    if thread_index == fx.Int32(0):
+                if thread_index == fx.Int32(0):
+                    exp_r = buffer_load(expected_resource, pb0, vec_width=1, dtype=fx.T.i32())
+                    prev = atomic_add(sb_base, pb0, fx.Int32(1), scope="sys")
+                    if prev == exp_r + fx.Int32(TILES_PER_GROUP - 1):
                         for j in range(n_pb):
-                            pbj = pb0 + j
-                            exp_r = buffer_load(expected_resource, pbj, vec_width=1, dtype=fx.T.i32())
-                            prev = atomic_add(sb_base, pbj, fx.Int32(1), scope="sys")
-                            if prev == exp_r + fx.Int32(TILES_PER_GROUP - 1):
-                                st(sb_base, pbj, fx.Int32(0), scope="sys")
+                            st(sb_base, pb0 + j, fx.Int32(0), scope="sys")
         else:
-            # role2: GROUP_M tile-id map over the REAL grid.
             tile_index = block_index - comm_block_count
             real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
             real_grid = real_tiles * fx.Int32(n_blocks)
@@ -346,9 +295,6 @@ def _compile(
                 block_m = first_pid_m + (pid_in_group % group_size_m)
                 block_n = pid_in_group // group_size_m
                 c_m_real = fx.Int32(num_max_pool_tokens)
-                # GEMM gate: wait this block's primaries (scoreboard). No copy work here.
-                # local scoreboard reachable via the SymLayout base (same memory the
-                # dispatch role signals on peers); no separate SCOREBOARD arg needed.
                 sb_base = sym_layout.scoreboard_ptr
                 expected_count = buffer_load(expected_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 if thread_index == fx.Int32(0):
@@ -369,7 +315,6 @@ def _compile(
 
                 g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 gbase = g_idx * fx.Int32(K) * c_n
-                # A operand: bf16 view over this rank's pool from the SymLayout base ptr
                 pool_ptr_ty = PointerType.get(
                     elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
                 )
@@ -393,11 +338,6 @@ def _compile(
                     nt_vmcnt=nt_vmcnt,
                     b_group_base=gbase,
                 )
-                # No SB_CONSUME: fold the reader count into the scoreboard. After each
-                # GEMM tile finishes, bump scoreboard[block_m]; the last of the n_blocks
-                # N-tiles (count reaches expected + n_blocks - 1) resets the slot to 0
-                # for the next launch. The gate stays >= expected, so readers that arrive
-                # after earlier bumps still pass; reset only fires once all have passed.
                 if thread_index == fx.Int32(0):
                     prev = atomic_add(sb_base, block_m, fx.Int32(1), scope="sys")
                     if prev == expected_count + fx.Int32(n_blocks - 1):
@@ -453,9 +393,6 @@ def _compile(
     return launch
 
 
-# Per-shape autotune candidates (num_dispatch_cu, nt_vmcnt, agpr_alloc, waves_per_eu).
-# The comm/GEMM CU split dominates; the local push is HBM-roofline-bound so sweep
-# num_dispatch_cu widely (incl. past 96). nt_vmcnt (G2S drain) / waves are secondary.
 _DISPATCH_CANDIDATES = [
     (16, 3, 0, 2),
     (24, 3, 0, 2),
@@ -471,24 +408,21 @@ _DISPATCH_AUTOTUNE_CACHE: dict = {}
 
 
 def dispatch_grouped_gemm_bf16(
-    # ── source activation (pushed over XGMI) ──────────────────────────
-    x: torch.Tensor,  # [num_src_tokens, K] bf16
-    # ── per-expert weight (B) + output (C) ────────────────────────────
-    l1_weights: torch.Tensor,  # [G, N, K] bf16
+    x: torch.Tensor,
+    l1_weights: torch.Tensor,
     group: torch.distributed.group,
     handle: Optional[Tuple] = None,
     topk_idx: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     layout: str = "nt",
-    num_dispatched_tokens: Optional[int] = None,
     num_dispatch_cu: int = 16,
-    autotune=False,  # remove in the future
+    autotune=False,
     BM=256,
     BN=256,
     GROUP_M=4,
-    pool_mult: int = 2,  # forward (handle=None): symm pool capacity multiplier
-    trans_c: bool = False,  # tn: store dW transposed ([G, OUT_N, OUT_M] = W-native layout)
-    out_dtype: torch.dtype = torch.bfloat16,  # tn output dtype
+    pool_mult: int = 2,
+    trans_c: bool = False,
+    out_dtype: torch.dtype = torch.bfloat16,
 ):
     """Fused cross-rank dispatch PUSH + grouped BF16 GEMM (nt / nn / tn).
 
@@ -505,10 +439,6 @@ def dispatch_grouped_gemm_bf16(
     via ``get_symm_buffer_for_mega_moe(group, ...)`` and appends this layer's origin/meta
     snapshots to the returned handle tail; reuse fetches the active buffer (no-group call).
     ``tile_to_expert`` / ``expected_count`` are read from the handle."""
-    # ── forward (handle=None): build the active symm workspace from group + shapes, run the
-    # fused prologue, and append this layer's origin/meta snapshots to the handle tail (slots
-    # [11..13] = dispatched_src_rank / dispatched_src_row / dispatched_meta_scalars). The
-    # reuse path (nn/tn) copies that tail device-side back into the symm origin/meta regions.
     if handle is None:
         assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
         assert group is not None, "handle=None requires group to build the symm workspace"
@@ -522,7 +452,7 @@ def dispatch_grouped_gemm_bf16(
             num_max_tokens_per_rank=num_tokens,
             num_topk=num_topk,
             hidden=hidden,
-            intermediate_hidden=l1_weights.shape[1] // 2,  # w1 [epr, 2I, H]
+            intermediate_hidden=l1_weights.shape[1] // 2,
             block_m=BM,
             block_n=BN,
             pool_mult=pool_mult,
@@ -548,7 +478,6 @@ def dispatch_grouped_gemm_bf16(
             symm.meta_scalars.clone(),
         )
     else:
-        # reuse (nn/tn dgrad/wgrad): the active buffer the forward already built
         symm = get_symm_buffer_for_mega_moe()
         sym_layout = symm.make_sym_layout()
 
@@ -564,22 +493,16 @@ def dispatch_grouped_gemm_bf16(
         expected_count,
         _,
         group_offs,
-        *_snapshots,  # handle tail = this layer's [src_rank, src_row, meta] local clones
+        *_snapshots,
     ) = handle
 
     num_comm = expert_send_dst_rank.numel()
     assert x.dtype == torch.bfloat16 and l1_weights.dtype == torch.bfloat16
     hidden_size = x.size(1)
     num_max_pool_tokens = int(sym_layout.num_max_pool_tokens)
-    # i32 dummy for the kernel slots the active layout does not read (const-folded away)
     dummy_i32 = get_dummy_tensor()
-    # source tokens pushed as i32 words (bf16 viewed as int32); pool/weight read as bf16
     x_i32 = x.contiguous().view(torch.int32).view(-1)
 
-    # handle tail: this layer's local origin/meta clones. The kernel copies them device-side
-    # into the symm origin/meta regions (barrier-free) so a later combine reads the right
-    # routing/meta after a later layer clobbered the shared buffer. Absent (bench/direct) ->
-    # dummies + has_snapshots=False (kernel skips the copy, reads live symm).
     has_snapshots = len(_snapshots) >= 3
     if has_snapshots:
         dispatched_src_rank, dispatched_src_row, dispatched_meta_scalars = _snapshots[:3]
@@ -587,18 +510,14 @@ def dispatch_grouped_gemm_bf16(
         dispatched_src_rank = dispatched_src_row = dispatched_meta_scalars = dummy_i32
 
     if layout == "tn":
-        # ── TN variable-K wgrad: dispatch x (lhs) into the pool, then
-        # dW[g] = pool[g]^T @ rhs[g] -> [G, OUT_M, OUT_N] ([G, OUT_N, OUT_M] if trans_c).
-        # tn dispatch & wgrad touch independent data -> no scoreboard gate.
         assert group_offs is not None, "tn layout requires group_offs"
-        rhs = l1_weights  # [num_max_pool_tokens, OUT_N] resident pool-order rhs
-        OUT_M = hidden_size  # dispatched lhs feature
-        OUT_N = rhs.size(1)  # resident rhs feature
+        rhs = l1_weights
+        OUT_M = hidden_size
+        OUT_N = rhs.size(1)
         G = group_offs.numel() - 1
         out_fp16 = out_dtype == torch.float16
         out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)
         output = torch.empty(out_shape, device=x.device, dtype=out_dtype)
-        # group_offs is int64 end-to-end (no host cast); the device reads it as i64.
         assert group_offs.dtype == torch.int64, "tn group_offs must be int64"
         pos_args = (
             x_i32,
@@ -610,16 +529,16 @@ def dispatch_grouped_gemm_bf16(
             sym_layout,
             rhs.contiguous().view(-1),
             output.view(-1),
-            dummy_i32,  # TILE_TO_GROUP (unused by tn)
-            expected_count,  # EXPECTED (unused by tn)
-            dummy_i32,  # NUM_TILE_BLOCKS (unused by tn)
-            group_offs,  # GROUP_OFFS (int64)
+            dummy_i32,
+            expected_count,
+            dummy_i32,
+            group_offs,
             dispatched_src_rank,
             dispatched_src_row,
             dispatched_meta_scalars,
-            0,  # c_n (unused by tn)
-            int(OUT_M),  # out_m_rt
-            int(OUT_N),  # out_n_rt
+            0,
+            int(OUT_M),
+            int(OUT_N),
         )
         launch = _compile(
             OUT_N,
@@ -636,38 +555,24 @@ def dispatch_grouped_gemm_bf16(
             has_snapshots=has_snapshots,
         )
         launch(*pos_args, stream=torch.cuda.current_stream())
-        # standard 4-output API: (out, dispatch_x_in_buf, dispatch_weights_in_buf, handle)
         return output, symm.pool, symm.weight_recv_buf, handle
 
-    # ── nn/nt: dispatch x (M-major) into the pool + grouped GEMM ──
     assert layout in ("nt", "nn"), f"unsupported layout {layout}"
-    if layout == "nt":  # weight [G, N, K]
+    if layout == "nt":
         G, N, K = l1_weights.shape
         weight_flat = l1_weights.reshape(G * N, K).contiguous().view(-1)
-    else:  # NN: weight [G, K, N]
+    else:
         G, K, N = l1_weights.shape
         weight_flat = l1_weights.reshape(G * K, N).contiguous().view(-1)
     assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
     out_features = N
     c_n = out_features
 
-    # real tile count from the active symm buffer; meta_scalars[1] = total_rows // BM.
-    # The local scoreboard is read/reset inside the kernel via sym_layout.scoreboard_ptr
-    # (gate + folded reader-count self-reset), so neither scoreboard nor sb_consume are
-    # passed. scoreboard is kept only as the autotune per-iter reset target.
     scoreboard = symm.scoreboard
-    # num_tile_blocks = meta_scalars[1] (= total_rows // BM). Source it from THIS layer's
-    # meta snapshot when present: the kernel device-copies the snapshot into symm.meta in the
-    # same launch, so reading the live symm slice here would race; the snapshot is the safe,
-    # already-correct local copy. The device copy still restores symm.meta for the combine.
     num_tile_blocks = dispatched_meta_scalars[1:2] if has_snapshots else symm.meta_scalars[1:2]
     nt_vmcnt = 3
 
-    is_nosync = num_dispatched_tokens is None
-    if is_nosync:
-        output = torch.empty((num_max_pool_tokens, out_features), dtype=x.dtype, device=x.device)
-    else:
-        assert False
+    output = torch.empty((num_max_pool_tokens, out_features), dtype=x.dtype, device=x.device)
 
     output_flat = output.contiguous().view(-1)
 
@@ -684,13 +589,13 @@ def dispatch_grouped_gemm_bf16(
         tile_to_expert,
         expected_count,
         num_tile_blocks,
-        dummy_i32,  # GROUP_OFFS (unused by nn/nt)
+        dummy_i32,
         dispatched_src_rank,
         dispatched_src_row,
         dispatched_meta_scalars,
         c_n,
-        0,  # out_m_rt (unused by nn/nt)
-        0,  # out_n_rt (unused by nn/nt)
+        0,
+        0,
     )
 
     if autotune:
@@ -707,7 +612,7 @@ def dispatch_grouped_gemm_bf16(
                 BN,
                 int(num_comm),
                 scoreboard,
-                None,  # reset=None -> _autotune uses scoreboard.zero_
+                None,
                 layout,
             )
             _DISPATCH_AUTOTUNE_CACHE[key] = cached
@@ -727,7 +632,6 @@ def dispatch_grouped_gemm_bf16(
             has_snapshots=has_snapshots,
         )
     launch(*pos_args, stream=torch.cuda.current_stream())
-    # standard 4-output API: (out, dispatch_x_in_buf, dispatch_weights_in_buf, handle)
     return output, symm.pool, symm.weight_recv_buf, handle
 
 

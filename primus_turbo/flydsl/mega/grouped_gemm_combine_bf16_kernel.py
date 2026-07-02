@@ -43,17 +43,10 @@ from flydsl.expr.buffer_ops import (
 )
 from flydsl.expr.typing import AddressSpace, PointerType
 
-# GEMM tile + LDS struct shared with the dispatch path (identical compute).
-from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
-    _make_shared_storage,
-    gemm_bf16_nn_tile,
-    gemm_bf16_nt_tile,
-    gemm_bf16_tn_tile,
-)
-
-# per-tile GEMM closure by layout (NT forward, NN dgrad, TN wgrad); all grouped via b_group_base
-_GEMM_TILE = {"nt": gemm_bf16_nt_tile, "nn": gemm_bf16_nn_tile, "tn": gemm_bf16_tn_tile}
 from primus_turbo.flydsl.common.tile_spec import _emit_if_then
+
+# GEMM tile closure (per layout) + LDS struct shared with the dispatch path (identical compute).
+from primus_turbo.flydsl.mega.gemm_bf16_kernel import GEMM_TILE, _make_shared_storage
 
 # scalar/atomic prims over a raw i64 base + element offset (scope-selectable, monotonic).
 # scope="agent" = device-wide relaxed (local scoreboard / flag); scope="sys" = system
@@ -344,7 +337,7 @@ def _compile(
     with_gate=False,
 ):
     K = hidden_size
-    gemm_tile = _GEMM_TILE[layout]
+    gemm_tile = GEMM_TILE[layout]
     assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
     assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
