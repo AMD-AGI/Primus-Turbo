@@ -43,22 +43,20 @@ from flydsl.expr.buffer_ops import (
 )
 from flydsl.expr.typing import AddressSpace, PointerType
 
-from primus_turbo.flydsl.common.tile_spec import _emit_if_then
-
 # GEMM tile closure (per layout) + LDS struct shared with the dispatch path (identical compute).
 from primus_turbo.flydsl.mega.gemm_bf16_kernel import GEMM_TILE, _make_shared_storage
 
 # scalar/atomic prims over a raw i64 base + element offset (scope-selectable, monotonic).
 # scope="agent" = device-wide relaxed (local scoreboard / flag); scope="sys" = system
 # (cross-rank flag publish, pairs with the agent-scope consumer load on uncached signal mem).
-# _mem_fence = cheap fence (s_waitcnt drain + compiler barrier); pairs with relaxed atomics.
+# _wait_mem = drain in-flight mem ops (s_waitcnt + compiler barrier); pairs with relaxed atomics.
 from primus_turbo.flydsl.mega.prims import (
-    SPIN_TIMEOUT_CYCLES,
-    _mem_fence,
+    _wait_mem,
     atomic_add,
     l2_invalidate,
     ld,
     read_clock,
+    spin_timed_out,
     st,
 )
 
@@ -66,7 +64,7 @@ from primus_turbo.flydsl.mega.prims import (
 # the active workspace is fetched by the host wrappers (no-group call -> current buffer).
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs
+from primus_turbo.flydsl.utils.gemm_helper import _emit_if_then, make_value_attrs
 
 _WARP = 64  # wavefront (gfx950)
 # 8 waves (wave_m x wave_n = 2 x 4) -- the tile block size
@@ -176,7 +174,7 @@ def combine_bf16_tile(
                     barrier_addr = barrier_base + buffer_load(
                         signal_delta_res, origin, vec_width=1, dtype=fx.T.i64()
                     )
-                    _mem_fence()
+                    _wait_mem()
                     st(barrier_addr, slot, fx.Int32(1), scope="sys")
 
             _emit_if_then(origin_ok, _emit_row)
@@ -253,7 +251,7 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
                                 flag = ld(barrier_base, slot, scope="agent")
                                 while flag < fx.Int32(0):
                                     fx.rocdl.s_sleep(fx.Int32(1))
-                                    if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                                    if spin_timed_out(spin_start):
                                         fx.printf(
                                             "MEGA combine reduce flag timeout: rank={} token={} slot={}\n",
                                             fx.Int32(rank),
@@ -262,7 +260,7 @@ def _make_topk_reduce(wait_flags, apply_weights=False, with_gate=False):
                                         )
                                         spin_start = read_clock()
                                     flag = ld(barrier_base, slot, scope="agent")
-                _mem_fence()  # order payload reads after the flag (s_waitcnt drain)
+                _wait_mem()  # order payload reads after the flag (s_waitcnt drain)
 
             token_row_off = token * fx.Int32(topk) * fx.Int32(out_features)  # token's first combine row
             vec_idx = lane
@@ -455,7 +453,7 @@ def _compile(
                     signal_count = ld(sb_l2_base, block_m, scope="agent")
                     while signal_count < fx.Int32(n_blocks):
                         fx.rocdl.s_sleep(fx.Int32(2))
-                        if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                        if spin_timed_out(spin_start):
                             fx.printf(
                                 "MEGA combine L2 gate timeout: block={} signal={} n_blocks={}\n",
                                 block_m,

@@ -54,8 +54,8 @@ class MegaMoE(nn.Module):
         self.ep_group: torch.distributed.ProcessGroup = ep_group
         self.ep_size: int = ep_group.size()
         self.ep_rank: int = ep_group.rank()
-        assert self.ep_size > 0, "Expected non-negative expert parallel size"
-        assert num_experts % self.ep_size == 0, "num_experts must divide EP size"
+        assert self.ep_size > 0, "Expected positive expert parallel size"
+        assert num_experts % self.ep_size == 0, "num_experts must be divisible by EP size"
         self.experts_per_rank: int = num_experts // self.ep_size
         # this rank's global expert ids
         offset = self.ep_rank * self.experts_per_rank
@@ -84,7 +84,7 @@ class MegaMoE(nn.Module):
             # group-limited routing needs power-of-2 groups
             if num_groups is not None and num_groups > 1:
                 assert num_groups & (num_groups - 1) == 0, "num_groups must be a power of 2"
-                assert num_experts % num_groups == 0, "num_experts must divide num_groups"
+                assert num_experts % num_groups == 0, "num_experts must be divisible by num_groups"
                 assert topk_group is not None and 0 < topk_group <= num_groups, "invalid topk_group"
                 assert top_k % topk_group == 0, "top_k must be divisible by topk_group"
 
@@ -100,19 +100,16 @@ class MegaMoE(nn.Module):
                 if add_bias_linear
                 else None
             )
-            # aux-free balancing: counter only, trainer updates the bias
+            # aux-free balancing not supported: the fused router does not inject
+            # expert_bias into the selection score, so it would be a silent no-op
             if enable_expert_bias:
-                self.register_buffer(
-                    "expert_bias", torch.zeros((num_experts,), device=device, dtype=torch.float32)
+                raise NotImplementedError(
+                    "MegaMoE does not support enable_expert_bias (aux-loss-free balancing): "
+                    "the fused router ignores expert_bias for expert selection. "
+                    "Set moe_router_enable_expert_bias=False or use the non-fused router."
                 )
-                self.register_buffer(
-                    "local_tokens_per_expert",
-                    torch.zeros((num_experts,), device=device, dtype=torch.float32),
-                    persistent=False,
-                )
-            else:
-                self.expert_bias = None
-                self.local_tokens_per_expert = None
+            self.expert_bias = None
+            self.local_tokens_per_expert = None
         else:
             self.gate_weight = None
             self.gate_bias = None
@@ -126,6 +123,12 @@ class MegaMoE(nn.Module):
         self.w2 = nn.Parameter(
             torch.empty((self.experts_per_rank, hidden_size, intermediate_size), **factory_kwargs)
         )
+        # expert-sharded weights: exclude from dense DP all-reduce (EP>1).
+        # Megatron reads param.allreduce for DDP bucketing/optimizer grouping;
+        # untagged w1/w2 would be reduced across EP as if replicated.
+        expert_parallel = self.ep_size > 1
+        for param in (self.w1, self.w2):
+            param.allreduce = not expert_parallel
 
         # optional shared expert (replicated, run on every token)
         self.shared_expert_intermediate_size: Optional[int] = shared_expert_intermediate_size
@@ -149,11 +152,15 @@ class MegaMoE(nn.Module):
         with torch.no_grad():
             if self.gate_weight is not None:
                 (init1 or (lambda w: nn.init.kaiming_uniform_(w, a=math.sqrt(5))))(self.gate_weight)
+            # init w1/w2 independently so output_layer_init_method is honored
+            # even when init_method is None
             if init1 is not None:
                 init1(self.w1)
-                (init2 or init1)(self.w2)
             else:
                 self.w1.normal_(mean=0.0, std=2.0 / math.sqrt(self.hidden_size))
+            if init2 is not None:
+                init2(self.w2)
+            else:
                 self.w2.normal_(mean=0.0, std=2.0 / math.sqrt(self.intermediate_size))
             if self.gate_bias is not None:
                 self.gate_bias.zero_()
@@ -240,6 +247,11 @@ class MegaMoE(nn.Module):
             # route on original precision
             topk_idx, topk_weights = self.route(flat, valid_mask)
         else:
+            # external topk path does not consume padding_mask; caller must mask upstream
+            assert padding_mask is None, (
+                "padding_mask is ignored when topk_idx/topk_weights are provided; "
+                "zero out padded tokens' weights upstream"
+            )
             topk_idx = topk_idx.reshape(-1, topk_idx.shape[-1]).to(torch.int32)
             topk_weights = topk_weights.reshape(-1, topk_weights.shape[-1]).to(torch.float32)
         x = flat.to(self.dtype)
@@ -257,57 +269,6 @@ class MegaMoE(nn.Module):
             # fp32 sigmoid for numeric stability (Megatron parity)
             out = torch.sigmoid(F.linear(x, self.shared_gate_weight).float()).to(out.dtype) * out
         return out
-
-    def sharded_state_dict(
-        self,
-        prefix: str = "",
-        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
-        metadata: Optional[dict] = None,
-    ):
-        """Dist-ckpt: register EP as a real shard axis for w1/w2, rest replicated.
-
-        Without this, the MegatronModule default treats every EP rank's local
-        expert block as the same logical tensor (offset 0) -> ranks collide as
-        replicas and all experts but one are silently dropped on save.
-        """
-        # lazy Megatron deps: keep this generic module import-light
-        from megatron.core.dist_checkpointing.mapping import ShardedTensor
-        from megatron.core.transformer.utils import (
-            ensure_metadata_has_dp_cp_group,
-            make_sharded_tensors_for_checkpoint,
-        )
-        from megatron.core.utils import get_pg_rank
-
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
-        dp_cp_group = metadata["dp_cp_group"]
-        # MegaMoE is EP-only (TP=1); replicas differ only by DP rank
-        replica_id = (0, 0, get_pg_rank(dp_cp_group))
-        prepend_axis_num = len(sharded_offsets)
-
-        # collect persistent params + buffers (respects persistent flag)
-        module_sd: dict = {}
-        self._save_to_state_dict(module_sd, "", keep_vars=True)
-
-        sharded_sd: dict = {}
-        # EP-sharded expert weights: shard axis 0 into ep_size chunks
-        for name in ("w1", "w2"):
-            w = module_sd.pop(name)
-            key = f"{prefix}{name}"
-            sharded_sd[key] = ShardedTensor.from_rank_offsets(
-                key,
-                w,
-                *sharded_offsets,
-                (prepend_axis_num, self.ep_rank, self.ep_size),
-                replica_id=replica_id,
-                prepend_axis_num=prepend_axis_num,
-            )
-        # router gate/bias, expert_bias, shared expert: replicated across EP+DP
-        sharded_sd.update(
-            make_sharded_tensors_for_checkpoint(
-                module_sd, prefix, sharded_offsets=sharded_offsets, dp_cp_group=dp_cp_group
-            )
-        )
-        return sharded_sd
 
     def extra_repr(self) -> str:
         return (

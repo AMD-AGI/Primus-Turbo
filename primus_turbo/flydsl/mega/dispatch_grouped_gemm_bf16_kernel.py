@@ -49,10 +49,10 @@ from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
     load_go_i64,
 )
 from primus_turbo.flydsl.mega.prims import (
-    SPIN_TIMEOUT_CYCLES,
     atomic_add,
     ld,
     read_clock,
+    spin_timed_out,
     st,
 )
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
@@ -238,7 +238,7 @@ def _compile(
                         sig = ld(sb_base, pbj, scope="sys")
                         while sig < exp_c:
                             fx.rocdl.s_sleep(fx.Int32(2))
-                            if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                            if spin_timed_out(spin_start):
                                 fx.printf(
                                     "MEGA tn wgrad gate timeout: pb={} sig={} exp={}\n", pbj, sig, exp_c
                                 )
@@ -302,7 +302,7 @@ def _compile(
                     signal = ld(sb_base, block_m, scope="sys")
                     while signal < expected_count:
                         fx.rocdl.s_sleep(fx.Int32(2))
-                        if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
+                        if spin_timed_out(spin_start):
                             fx.printf(
                                 "MEGA dispatch GEMM gate timeout: block={} signal={} expected={}\n",
                                 block_m,

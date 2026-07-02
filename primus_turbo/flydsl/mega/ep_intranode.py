@@ -14,8 +14,8 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
-from primus_turbo.flydsl.common.tile_spec import _emit_if_then
 from primus_turbo.flydsl.mega.prims import atomic_add
+from primus_turbo.flydsl.utils.gemm_helper import _emit_if_then
 
 _VEC = 16  # fp8 bytes per lane per push step (b128 XGMI-wide)
 _WARP = 64  # gfx950 wavefront size

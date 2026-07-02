@@ -179,7 +179,7 @@ def _region_ptr(sl, name, index=0, dst_rank=None):
     return addr
 
 
-def map(sl, ptr, dst_rank):
+def sym_map(sl, ptr, dst_rank):
     """Translate a local MAIN-heap ptr ``ptr`` (i64) into peer ``dst_rank``."""
     res = addr_buffer_resource(sl.offsets_ptr, num_records_bytes=int(sl.num_ranks) * 8)
     return ptr + buffer_load(res, dst_rank, vec_width=1, dtype=fx.T.i64())
@@ -239,7 +239,7 @@ def build_sym_layout(
 # Convenience accessors: ``sym_layout.<region>_ptr`` -> this rank's i64 base ptr of that
 # region (a read-only property, so it is safe to read inside scf if/while regions -- a
 # struct method call would otherwise be treated as a state variable). Peer translation
-# uses ``map(sym_layout, sym_layout.<region>_ptr, dst_rank)`` (``map_signal`` for the
+# uses ``sym_map(sym_layout, sym_layout.<region>_ptr, dst_rank)`` (``map_signal`` for the
 # signal heap). (_specialize_type subclasses SymLayout, so these properties are inherited
 # by the per-shape specialized instances.) Names must match _main_regions / _signal_regions.
 # ---------------------------------------------------------------------------

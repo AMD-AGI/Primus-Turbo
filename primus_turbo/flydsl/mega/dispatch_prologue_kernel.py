@@ -34,7 +34,6 @@ import os as _os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr.buffer_ops import (
     _unwrap_value,
     buffer_load,
@@ -46,17 +45,9 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
-from primus_turbo.flydsl.mega import sym_layout as sl_mod
-from primus_turbo.flydsl.mega.barrier import grid_sync
-from primus_turbo.flydsl.mega.prims import (
-    SPIN_TIMEOUT_CYCLES,
-    atomic_add,
-    ld,
-    memory_fence,
-    read_clock,
-    st,
-)
-from primus_turbo.flydsl.mega.sym_layout import SymLayout
+from primus_turbo.flydsl.mega.barrier import grid_sync, xgmi_barrier
+from primus_turbo.flydsl.mega.prims import atomic_add, ld, st
+from primus_turbo.flydsl.mega.sym_layout import SymLayout, sym_map
 
 _BLOCK_THREADS = int(_os.environ.get("PROLOGUE_BT", "256"))  # threads per block
 # grid_blocks (== num_cu) is a caller arg (default 64). Fewer blocks => cheaper
@@ -96,43 +87,6 @@ def _ext_i64(v):
 #    num_pool_blocks, max_num_token, num_tokens_per_expert, num_tokens_per_expert_prefix)
 # handle = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
 # num_tokens_per_expert / _prefix = block_m-padded group_len / group_offs (local experts)
-
-
-# --------------------------------------------------------------------------- #
-# Cross-rank barrier (only block 0 of each rank handshakes); call at kernel top level.
-# Peer signal base addrs come from the SymLayout ``signal`` region + per-peer delta.
-# --------------------------------------------------------------------------- #
-_FINISHED_SUM_TAG = 1  # 1 suffices for a clean barrier
-
-
-def barrier_block(sl, rank: int, world_size: int, thread_index, block_index, sync_only: bool = False):
-    """Cross-rank barrier over the SymLayout ``signal`` region (main heap)."""
-    if not sync_only:
-        memory_fence(order="release", scope="sys")  # flush payload before cross-rank signal
-    fx.gpu.barrier()  # all pushes landed before any signal
-    if block_index == fx.Int32(0):
-        if thread_index < fx.Int32(world_size):
-            my_signal_base = sl.signal_ptr
-            peer_signal_base = sl_mod.map(sl, sl.signal_ptr, thread_index)
-            atomic_add(my_signal_base, thread_index, fx.Int32(_FINISHED_SUM_TAG), "sys", _GLOBAL)
-            atomic_add(peer_signal_base, fx.Int32(rank), fx.Int32(-_FINISHED_SUM_TAG), "sys", _GLOBAL)
-            spin_start = read_clock()
-            my_signal_value = ld(my_signal_base, thread_index, scope="sys")
-            while my_signal_value > fx.Int32(0):
-                if (read_clock() - spin_start) > fx.Int64(SPIN_TIMEOUT_CYCLES):
-                    fx.printf(
-                        "MEGA prologue barrier timeout: rank={} peer={} signal={}\n",
-                        fx.Int32(rank),
-                        thread_index,
-                        my_signal_value,
-                    )
-                    spin_start = read_clock()
-                my_signal_value = ld(my_signal_base, thread_index, scope="sys")
-    fx.gpu.barrier()  # no acquire fence (SIG is uncached)
-
-
-# Lower if/while in barrier_block to scf.
-barrier_block = ASTRewriter.transform(barrier_block)
 
 
 def _make_dispatch_prologue(
@@ -252,15 +206,17 @@ def _make_dispatch_prologue(
             if block_count > fx.Int32(0):
                 atomic_add(workspace_base, fx.Int32(WS_SEND) + lds_flush_index, block_count, _SCOPE, _GLOBAL)
             lds_flush_index = lds_flush_index + fx.Int32(block_threads)
-        grid_sync(sl, thread_index, block_index, grid_blocks)
+        grid_sync(sl, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/A:histogram")
 
         # ---- Phase B: cross-rank all_gather; B1: all ranks entered ----
-        barrier_block(sl, rank, world_size, thread_index, block_index, True)
+        xgmi_barrier(
+            sl, rank, world_size, thread_index, block_index, True, "dispatch_prologue/B1:all-entered"
+        )
         if block_index == fx.Int32(0):
             # B2: push my SEND_LOCAL row into every peer's c_buffer at row rank.
             for peer_rank in range(world_size):
                 peer_c_resource = create_buffer_resource_from_addr(
-                    sl_mod.map(sl, sl.c_buffer_ptr, fx.Int32(peer_rank)), num_records_bytes=c_buffer_bytes
+                    sym_map(sl, sl.c_buffer_ptr, fx.Int32(peer_rank)), num_records_bytes=c_buffer_bytes
                 )
                 push_expert_index = thread_index
                 while push_expert_index < fx.Int32(num_experts):
@@ -275,7 +231,9 @@ def _make_dispatch_prologue(
                     )
                     push_expert_index = push_expert_index + fx.Int32(block_threads)
         # B3: all ranks pushed + landed
-        barrier_block(sl, rank, world_size, thread_index, block_index, False)
+        xgmi_barrier(
+            sl, rank, world_size, thread_index, block_index, False, "dispatch_prologue/B3:all-gather-landed"
+        )
 
         # ---- Phase C: serial table build on block0 (c_buffer read coherently from own buffer) ----
         if block_index == fx.Int32(0):
@@ -419,7 +377,7 @@ def _make_dispatch_prologue(
                         fx.Int32(experts_per_rank),
                     )
 
-        grid_sync(sl, thread_index, block_index, grid_blocks)
+        grid_sync(sl, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/C:table-built")
 
         # ---- Phase D: scatter pairs (all blocks) ----
         # Two-pass block-private reservation: count this block's pairs per expert in
@@ -493,11 +451,11 @@ def _make_dispatch_prologue(
                 )  # routing weight per pair
                 destination_rank = expert_id // fx.Int32(experts_per_rank)
                 peer_origin_rank_resource = create_buffer_resource_from_addr(
-                    sl_mod.map(sl, sl.origin_rank_ptr, destination_rank),
+                    sym_map(sl, sl.origin_rank_ptr, destination_rank),
                     num_records_bytes=origin_buffer_bytes,
                 )
                 peer_origin_slot_resource = create_buffer_resource_from_addr(
-                    sl_mod.map(sl, sl.origin_slot_ptr, destination_rank),
+                    sym_map(sl, sl.origin_slot_ptr, destination_rank),
                     num_records_bytes=origin_buffer_bytes,
                 )
                 buffer_store(fx.Int32(rank), peer_origin_rank_resource, destination_row)
@@ -510,7 +468,7 @@ def _make_dispatch_prologue(
                 # ride the routing weight cross-rank to the dest weight_recv_buf[dest_row]
                 # (same scatter as origin) -> backward gets per-pool-row weight without all_gather.
                 peer_weight_resource = create_buffer_resource_from_addr(
-                    sl_mod.map(sl, sl.weight_recv_buf_ptr, destination_rank),
+                    sym_map(sl, sl.weight_recv_buf_ptr, destination_rank),
                     num_records_bytes=origin_buffer_bytes,
                 )
                 buffer_store(routing_weight, peer_weight_resource, destination_row)
@@ -534,7 +492,7 @@ def _make_dispatch_prologue(
             buffer_store(fx.Int32(-1), barrier_local_resource, flag_slot_index)
             flag_slot_index = flag_slot_index + fx.Int32(grid_stride)
 
-        grid_sync(sl, thread_index, block_index, grid_blocks)
+        grid_sync(sl, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/D:scatter-done")
 
         # ---- Post: reset SEND_LOCAL/WITHIN_EXPERT counters for the next launch ----
         reset_index = block_index * fx.Int32(block_threads) + thread_index
@@ -544,7 +502,9 @@ def _make_dispatch_prologue(
             reset_index = reset_index + fx.Int32(grid_stride)
 
         # ---- Phase E: origins landed cross-rank ----
-        barrier_block(sl, rank, world_size, thread_index, block_index, False)
+        xgmi_barrier(
+            sl, rank, world_size, thread_index, block_index, False, "dispatch_prologue/E:origins-landed"
+        )
 
     @flyc.jit
     def launch(
