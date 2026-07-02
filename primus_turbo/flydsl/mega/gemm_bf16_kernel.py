@@ -1772,3 +1772,8 @@ def grouped_gemm_tn_wgrad_bf16(
         _WGRAD_COMPILED[key] = compiled
     compiled(*args)
     return out
+
+
+# per-layout GEMM tile closure (NT forward / NN dgrad / TN wgrad); single source for
+# the fused dispatch + combine kernels (grouped via the b_group_base scalar seam).
+GEMM_TILE = {"nt": gemm_bf16_nt_tile, "nn": gemm_bf16_nn_tile, "tn": gemm_bf16_tn_tile}
