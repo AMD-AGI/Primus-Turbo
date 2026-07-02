@@ -851,7 +851,7 @@ grouped_quantize_mxfp8_dual(const at::Tensor input, const at::Tensor group_lens,
     PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat8_e4m3fn || dest_dtype == at::kFloat8_e5m2,
                        "Output must be Float8_e4m3fn or Float8_e5m2");
 
-    constexpr int64_t ROW_ALIGN = MXFP8_GROUP_M_PADDING_ALIGN_SIZE; // = 32
+    constexpr int64_t ROW_ALIGN = MXFP8_GROUP_M_PADDING_ALIGN_SIZE; // = 64
     constexpr int64_t COL_ALIGN = MXFP8_K_DIM_PADDING_ALIGN_SIZE;   // = 128
 
     const int64_t G         = group_lens.size(0);

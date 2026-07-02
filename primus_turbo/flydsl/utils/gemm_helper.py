@@ -308,20 +308,26 @@ class ScaleBComb:
     One dwordx4 per lane returns [s0,s1,s2,s3]; (s0,s1)=b0 sub-tiles, (s2,s3)=b1.
     """
 
-    def __init__(self, sp_tensor, dim, K):
+    def __init__(self, sp_tensor, dim, K, n_slabs=1):
         self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
         self.lane = fx.thread_idx.x % 64
         # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
         # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
         # only its valid wn groups; OOB-col reads clamp to 0 and StoreC drops them.
         # dim%256==0 -> cdiv(dim,256)*4 == dim//64 (no change for aligned shapes).
-        nbytes = ((dim + 255) // 256) * 4 * self.K128 * 64 * 4 * 4  # int32 records
+        #
+        # n_slabs>1: grouped MXFP8 B scale is [G, N, K//32]; each group's preshuffled
+        # B-comb slab is ``slab_elems`` i32 and the whole b_sp holds G of them stacked.
+        # ``load(..., slab=g)`` adds g*slab_elems to index group g (n_slabs=1 = dense).
+        self.slab_elems = ((dim + 255) // 256) * 4 * self.K128 * 64 * 4  # i32 per group
+        nbytes = self.slab_elems * n_slabs * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
-    def load(self, base, k):
-        """base: sb_base0 (b0 region col base). Returns 4 i32 (b0:0,1  b1:2,3)."""
+    def load(self, base, k, slab=0):
+        """base: sb_base0 (b0 region col base). Returns 4 i32 (b0:0,1  b1:2,3).
+        slab: per-group slab index (grouped MXFP8); 0 = dense single-tensor."""
         grp = (base // 256) * 4 + (base % 256) // 32
-        idx = ((grp * self.K128 + k) * 64 + self.lane) * 4
+        idx = ((grp * self.K128 + k) * 64 + self.lane) * 4 + slab * self.slab_elems
         v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(4)]
 
@@ -896,10 +902,16 @@ def _lds_barrier():
     )
 
 
-def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK):
+def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)); all vars local so it
     # is safe inside a workgroup-uniform kernel `if`. KT/BLK chosen so TILE=NOUT are exact
     # multiples of BLK -> no `if` guard needed (data bounds via the load/store masks).
+    #
+    # rd_base / wr_base (i32-element offsets, default 0) let the grouped MXFP8 preshuffle
+    # aim one workgroup at group g's slab of a stacked ``b_raw`` [G*N, K128] / ``b_sp``:
+    # the within-group ``grow``/``grp`` indexing (and the ``grow < dim`` mask, dim = per-
+    # group N) is unchanged; only the flat read/write element offset shifts by the group
+    # base. rd_base=wr_base=0 reproduces the dense whole-tensor behaviour exactly.
     NT = 4
     TILE = 64 * KT
     NOUT = KT * 64
@@ -916,7 +928,7 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK):
             off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
             grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
         dw = _buffer_ops.buffer_load(
-            rin, grow * K128 + gk, vec_width=1, dtype=T.i32, mask=(gk < K128) & (grow < dim)
+            rin, grow * K128 + gk + rd_base, vec_width=1, dtype=T.i32, mask=(gk < K128) & (grow < dim)
         )
         fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
             Vec.from_elements([fx.Int32(dw)], fx.Int32)
@@ -938,7 +950,9 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK):
             b = (fx.Int32(val[0]) >> sh) & fx.Int32(0xFF)
             elems.append(b | (b << fx.Int32(8)) | (b << fx.Int32(16)) | (b << fx.Int32(24)))
         vec = Vec.from_elements(elems, fx.Int32)
-        _buffer_ops.buffer_store(vec.ir_value(), rout, ((grp * K128 + gk) * 64 + lane) * 4, mask=gk < K128)
+        _buffer_ops.buffer_store(
+            vec.ir_value(), rout, ((grp * K128 + gk) * 64 + lane) * 4 + wr_base, mask=gk < K128
+        )
 
 
 def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256):

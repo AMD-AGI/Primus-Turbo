@@ -344,7 +344,7 @@ grouped_quantize_mxfp8_dual_meta(const at::Tensor input, const at::Tensor group_
     const int64_t     G         = group_lens.size(0);
     const int64_t     total_M   = input.size(0);
     const int64_t     N         = input.size(1);
-    constexpr int64_t ROW_ALIGN = MXFP8_GROUP_M_PADDING_ALIGN_SIZE; // = 32
+    constexpr int64_t ROW_ALIGN = MXFP8_GROUP_M_PADDING_ALIGN_SIZE; // = 64
     const int64_t     M_pad_col = cdiv(total_M + G * ALIGN, ALIGN) * ALIGN;
     const int64_t     M_pad_row = cdiv(total_M + G * ROW_ALIGN, ROW_ALIGN) * ROW_ALIGN;
     const int64_t     N_pad     = cdiv(N, ALIGN) * ALIGN;

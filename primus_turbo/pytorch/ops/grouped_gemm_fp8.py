@@ -7,7 +7,11 @@ from typing import Optional, Union
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -587,7 +591,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
         a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
 
-        # A: fused grouped dual-quant + per-group M zero-pad (rowwise 32 / colwise
+        # A: fused grouped dual-quant + per-group M zero-pad (rowwise 64 / colwise
         # 128), padded layouts computed on GPU (no D2H sync).
         (
             a_fp8_row,
@@ -803,7 +807,12 @@ def grouped_gemm_fp8(
         # behaviour in ``FP8GroupedGemmBlockFunc.forward``.
         return FP8GroupedGemmBlockFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
-        # MXFP8: raw tensors; quant + grouped GEMM via the Triton MX backend.
+        # MXFP8: raw tensors; grouped MX quant (shared C++ op, device-side padded, no
+        # D2H) + grouped GEMM. The autograd orchestration is backend-agnostic; the
+        # per-GEMM dispatch (grouped_gemm_fp8_impl / _variable_k_impl) routes to the
+        # user backend (FlyDSL gfx950 native NT / variable-K, else Triton MX). The
+        # FlyDSL path consumes the SAME row-major raw-E8M0 scales as Triton and only
+        # adds a scale preshuffle before its kernels.
         return FP8GroupedGemmMXFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

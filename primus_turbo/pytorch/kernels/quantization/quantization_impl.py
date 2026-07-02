@@ -469,7 +469,7 @@ def grouped_quantize_mxfp8_impl(
     zero-padding.
 
     Each per-group region of ``x`` (defined by ``group_lens`` / ``group_offs``)
-    is virtually zero-padded along M: rowwise to 32 and colwise to 128.  The
+    is virtually zero-padded along M: rowwise to 64 and colwise to 128.  The
     padded per-group layouts are computed on GPU (no D2H sync).
     """
     mxfp8_support, reason = check_mxfp8_support()

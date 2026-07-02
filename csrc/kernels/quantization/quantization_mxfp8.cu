@@ -1128,7 +1128,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_d
         }
 
         // ---------------- Rowwise: store FP8 + scale (32-padded M layout) -------
-        // Rowwise pads each group's M to MXFP8_GROUP_M_PADDING_ALIGN_SIZE (32): the
+        // Rowwise pads each group's M to MXFP8_GROUP_M_PADDING_ALIGN_SIZE (64): the
         // real row at padded-128 position ``global_row`` is scattered to its
         // 32-padded position ``row_out``.  Only real rows (< real_end_in_pad) are
         // written.  Colwise below keeps the 128-padded layout (wgrad K-reduction).

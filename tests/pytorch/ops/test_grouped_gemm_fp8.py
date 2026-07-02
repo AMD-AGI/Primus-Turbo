@@ -531,12 +531,22 @@ def test_grouped_gemm_fp8_blockwise(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance):
-    """MXFP8 grouped GEMM fwd + dgrad + wgrad on the triton backend."""
+@pytest.mark.parametrize(
+    "backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"]
+)
+def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance, backend):
+    """MXFP8 grouped GEMM fwd + dgrad + wgrad.
+
+    Triton and FlyDSL backends share the grouped MX quant (row-major raw E8M0,
+    device-side per-group padding); FlyDSL adds a scale preshuffle before its
+    native NT (fwd/dgrad) + variable-K (wgrad) kernels. FlyDSL is gfx950-only.
+    """
     N, K = NK
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
         pytest.skip(reason)
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL MXFP8 grouped GEMM needs gfx950 (mfma_scale_f32_16x16x128_f8f6f4).")
     _run_grouped_gemm_fp8_test(
         B=B,
         M=M,
@@ -547,7 +557,7 @@ def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, bal
         granularity=ScalingGranularity.MX_BLOCKWISE,
         trans_b=trans_b,
         balance=balance,
-        backend=BackendType.TRITON,
+        backend=backend,
         auto_tune=False,
     )
 

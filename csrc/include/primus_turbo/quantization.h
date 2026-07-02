@@ -66,7 +66,13 @@ constexpr int MXFP8_BLOCK_SIZE = 32;
 constexpr int MXFP4_K_DIM_PADDING_ALIGN_SIZE = 128;
 constexpr int MXFP8_K_DIM_PADDING_ALIGN_SIZE = 128;
 
-constexpr int MXFP8_GROUP_M_PADDING_ALIGN_SIZE = 32;
+// Per-group M-axis padding alignment for the grouped MXFP8 dual quant (rowwise
+// operand). 64 (not the 32 MX-scale-block minimum) so that every group's row
+// base is 64-aligned: the FlyDSL grouped MXFP8 GEMM preshuffles the raw E8M0
+// scales in 64-row blocks (ScaleS2R group_span), which requires 64-aligned group
+// starts to reuse the dense whole-tensor preshuffle. Triton reads real rows via
+// (rm % M_g) so the extra padding rows are never touched (speed-neutral).
+constexpr int MXFP8_GROUP_M_PADDING_ALIGN_SIZE = 64;
 
 struct ScalingRecipe {
     bool use_2d_block = false;
