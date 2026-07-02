@@ -173,7 +173,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 topk_indices=topk_idx.contiguous().view(-1),
                 topk_weights=None,
                 grad_gate=grad_gate,
-                num_combine_cu=20,
+                num_combine_cu=16,
                 num_reduce_cu=0,
                 layout="nn",
                 BM=ctx.block_m,

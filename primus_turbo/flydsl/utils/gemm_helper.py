@@ -9,6 +9,10 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
+from flydsl.compiler.ast_rewriter import (
+    InsertEmptyYieldForSCFFor,
+    ReplaceIfWithDispatch,
+)
 from flydsl.expr import arith
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import const_expr, range_constexpr, rocdl
@@ -20,6 +24,17 @@ from flydsl.expr.utils.arith import ArithValue
 
 def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _emit_if_then(cond, then_fn):
+    """Emit a dynamic ``if cond: then_fn()`` (the body-only AST rewrite's primitive)."""
+    ReplaceIfWithDispatch.scf_if_dispatch(cond, then_fn)
+
+
+def _emit_for(start, stop, step, body_fn):
+    """Emit a runtime ``for iv in range(start, stop, step): body_fn(iv)`` (scf.for) from
+    a non-rewritten helper. Loop-carry-free: the body mutates rmem/LDS in place."""
+    InsertEmptyYieldForSCFFor.scf_for_dispatch(start, stop, step, lambda iv, _names: body_fn(iv))
 
 
 def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):

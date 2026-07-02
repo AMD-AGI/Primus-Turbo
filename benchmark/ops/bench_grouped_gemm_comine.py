@@ -281,7 +281,7 @@ def profile_combine(group, args, mode, W1, W2, turbo_reference):
         best_bwd_comb_cu = min(bwd_comb_sweep, key=bwd_comb_sweep.get)
         # bwd fused = 3-role NN (GEMM + combine PUSH + unweighted dx reduce); weight rides grad_l1.
         # GEMM-bound -> default to the low --bwd-combine-cu (more CUs for the GEMM); autotune sweeps.
-        bwd_cu_cands = cu_cands if args.autotune else (args.bwd_combine_cu,)
+        bwd_cu_cands = cu_cands if args.autotune else (8, 16, 18, args.bwd_combine_cu, 24)
         bwd_fused_sweep = {}
         for cu in bwd_cu_cands:
             bwd_fused_sweep[cu] = bench(
