@@ -39,6 +39,21 @@ template <typename AType, typename BType, typename CType> struct GroupedGemmPara
 
     hipStream_t stream = nullptr;
     uint32_t    num_cu = 0;
+
+    // Work-stealing toggle. When true, ws_counter_ptr must point to an
+    // int32 buffer of size (NUM_XCDS_WS + 2): per-XCD slots [0..NUM_XCDS_WS-1],
+    // global slot [NUM_XCDS_WS], done slot [NUM_XCDS_WS + 1]. On MI355X that
+    // is 10 ints. The buffer is zeroed once at allocation by the Python wrapper;
+    // the kernel self-resets (the last-out CTA writes zeros), so no per-launch
+    // zeroing is required at the C++ binding. Persistent CTAs claim tiles via
+    // atomicAdd; `ws_local_per_xcd` selects the mode:
+    //   = 0                          : global-only (single counter)
+    //   = ceil(total_tiles / 8)      : per-XCD-only (8 counters, no global)
+    //   = anything in between        : hierarchical (per-XCD + global tail)
+    // See vendored grouped_gemm_kernel_ws.hpp for details.
+    bool     work_steal       = false;
+    int32_t *ws_counter_ptr   = nullptr;
+    int32_t  ws_local_per_xcd = 0;
 };
 
 template <typename AType, typename BType, typename CType>

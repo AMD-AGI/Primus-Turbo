@@ -25,7 +25,8 @@ compute_grouped_gemm_args(ck_tile::GemmTransKernelArg<> *args_ptr, const ADataTy
                           const int64_t *group_offs_ptr, const ck_tile::index_t group_num,
                           const ck_tile::index_t n, const ck_tile::index_t k,
                           const ck_tile::index_t strideA, const ck_tile::index_t strideB,
-                          const ck_tile::index_t strideC, const ck_tile::index_t k_batch) {
+                          const ck_tile::index_t strideC, const ck_tile::index_t k_batch,
+                          const ck_tile::index_t m_tile, const ck_tile::index_t n_tile) {
     const int64_t group_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (group_id >= group_num)
         return;
@@ -42,6 +43,24 @@ compute_grouped_gemm_args(ck_tile::GemmTransKernelArg<> *args_ptr, const ADataTy
     args_ptr[group_id].group_karg.stride_Bs[0] = strideB;
     args_ptr[group_id].group_karg.stride_E     = strideC;
     args_ptr[group_id].group_karg.k_batch      = k_batch;
+
+    // Prefix sum over prior groups' tile counts -> block_start. Required by the
+    // WS kernel's FindGroupId binary search (and benign for the static path,
+    // which doesn't read these fields). m_tile/n_tile are the runner's tile
+    // shape, supplied by the dispatch site. Each thread does an O(group_id)
+    // scan over `group_lens_ptr` (already populated on device); for G <= ~256
+    // total work is O(G^2) <= ~65k loads -- negligible vs the GEMM.
+    const ck_tile::index_t num_n_tiles = (n + n_tile - 1) / n_tile;
+    ck_tile::index_t       my_block_start = 0;
+    for (int64_t g = 0; g < group_id; ++g) {
+        const ck_tile::index_t M_g       = static_cast<ck_tile::index_t>(group_lens_ptr[g]);
+        const ck_tile::index_t m_tiles_g = (M_g + m_tile - 1) / m_tile;
+        my_block_start += m_tiles_g * num_n_tiles * k_batch;
+    }
+    const ck_tile::index_t my_M       = static_cast<ck_tile::index_t>(group_lens_ptr[group_id]);
+    const ck_tile::index_t my_m_tiles = (my_M + m_tile - 1) / m_tile;
+    args_ptr[group_id].block_start    = my_block_start;
+    args_ptr[group_id].block_end      = my_block_start + my_m_tiles * num_n_tiles * k_batch;
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType = float,
@@ -127,17 +146,8 @@ void ck_grouped_gemm(const CKGroupedGemmParams<ADataType, BDataType, CDataType> 
     const ck_tile::index_t strideB = params.transB ? params.k : params.n;
     const ck_tile::index_t strideC = params.n;
 
-    // Setting args
-    {
-        const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
-        const int blocks  = (params.group_num + threads - 1) / threads;
-        compute_grouped_gemm_args<ADataType, BDataType, CDataType>
-            <<<blocks, threads, 0, params.stream>>>(
-                reinterpret_cast<ck_tile::GemmTransKernelArg<> *>(params.args_ptr), params.a_ptr,
-                params.b_ptr, params.c_ptr, params.group_lens_ptr, params.group_offs_ptr,
-                params.group_num, params.n, params.k, strideA, strideB, strideC, k_batch);
-    }
-
+    // Pick the runner first -- we need its tile shape (m_tile, n_tile) to
+    // compute block_start/block_end inside `compute_grouped_gemm_args`.
     const auto stream_cfg = ck_tile::stream_config{params.stream};
     std::unique_ptr<CKGroupedGemmRunnerInterFace> runner;
     using CLayout = RowMajor;
@@ -156,7 +166,27 @@ void ck_grouped_gemm(const CKGroupedGemmParams<ADataType, BDataType, CDataType> 
     } else {
         PRIMUS_TURBO_CHECK(false, "CKGroupedGemm only support NN and NT");
     }
-    runner->run(stream_cfg, params.group_num, params.args_ptr, params.num_cu);
+
+    // Setting args (now also populates block_start/block_end via the runner's
+    // tile shape -- no separate prefix-sum kernel launch needed).
+    {
+        const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
+        const int blocks  = (params.group_num + threads - 1) / threads;
+        compute_grouped_gemm_args<ADataType, BDataType, CDataType>
+            <<<blocks, threads, 0, params.stream>>>(
+                reinterpret_cast<ck_tile::GemmTransKernelArg<> *>(params.args_ptr), params.a_ptr,
+                params.b_ptr, params.c_ptr, params.group_lens_ptr, params.group_offs_ptr,
+                params.group_num, params.n, params.k, strideA, strideB, strideC, k_batch,
+                runner->m_tile(), runner->n_tile());
+    }
+    if (params.work_steal) {
+        PRIMUS_TURBO_CHECK(params.ws_counter_ptr != nullptr,
+                           "work_steal=true requires a non-null ws_counter_ptr");
+        runner->run_ws(stream_cfg, params.group_num, params.args_ptr, params.num_cu,
+                       params.ws_counter_ptr, params.ws_local_per_xcd);
+    } else {
+        runner->run(stream_cfg, params.group_num, params.args_ptr, params.num_cu);
+    }
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
@@ -230,7 +260,8 @@ __global__ void compute_grouped_gemm_variable_k_args(
     const bool transA, const bool transB, const ck_tile::index_t group_num,
     const ck_tile::index_t m, const ck_tile::index_t n, const ck_tile::index_t strideA,
     const ck_tile::index_t strideB, const ck_tile::index_t strideC,
-    const ck_tile::index_t k_batch) {
+    const ck_tile::index_t k_batch,
+    const ck_tile::index_t m_tile, const ck_tile::index_t n_tile) {
     const int64_t group_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (group_id >= group_num)
         return;
@@ -254,6 +285,22 @@ __global__ void compute_grouped_gemm_variable_k_args(
     args_ptr[group_id].group_karg.stride_Bs[0] = strideB;
     args_ptr[group_id].group_karg.stride_E     = strideC;
     args_ptr[group_id].group_karg.k_batch      = k_batch;
+
+    // Prefix sum for block_start/block_end (variable-K: every group has the
+    // same M and N, only K varies, so the per-group tile count is uniform --
+    // unless `effective_m` is 0 for empty groups, which contributes 0 tiles).
+    // Same pattern as the forward kernel; the WS kernel's FindGroupId reads
+    // these fields.
+    const ck_tile::index_t num_n_tiles = (n + n_tile - 1) / n_tile;
+    ck_tile::index_t       my_block_start = 0;
+    for (int64_t g = 0; g < group_id; ++g) {
+        const ck_tile::index_t M_g = (group_lens_ptr[g] > 0) ? m : 0;
+        const ck_tile::index_t m_tiles_g = (M_g + m_tile - 1) / m_tile;
+        my_block_start += m_tiles_g * num_n_tiles * k_batch;
+    }
+    const ck_tile::index_t my_m_tiles = (effective_m + m_tile - 1) / m_tile;
+    args_ptr[group_id].block_start = my_block_start;
+    args_ptr[group_id].block_end   = my_block_start + my_m_tiles * num_n_tiles * k_batch;
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType,
@@ -345,17 +392,9 @@ void ck_grouped_gemm_variable_k(
     const ck_tile::index_t strideB = params.transB ? params.k : params.n;
     const ck_tile::index_t strideC = params.n;
 
-    {
-        const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
-        const int grids   = (params.group_num + threads - 1) / threads;
-        compute_grouped_gemm_variable_k_args<ADataType, BDataType, CDataType>
-            <<<grids, threads, 0, params.stream>>>(
-                reinterpret_cast<ck_tile::GemmTransKernelArg<> *>(params.args_ptr), params.a_ptr,
-                params.b_ptr, params.c_ptr, params.group_lens_ptr, params.group_offs_ptr,
-                params.transA, params.transB, params.group_num, params.m, params.n, strideA,
-                strideB, strideC, k_batch);
-    }
-
+    // Pick the runner first -- we need its tile shape (m_tile, n_tile) for
+    // the args-setup kernel to compute block_start/block_end (mirrors the
+    // forward path).
     const auto stream_cfg = ck_tile::stream_config{params.stream};
     using CLayout         = RowMajor;
     std::unique_ptr<CKGroupedGemmRunnerInterFace> runner;
@@ -368,7 +407,26 @@ void ck_grouped_gemm_variable_k(
     } else {
         PRIMUS_TURBO_CHECK(false, "CKGroupedGemm-VariableK only support TN");
     }
-    runner->run(stream_cfg, params.group_num, params.args_ptr, params.num_cu);
+
+    {
+        const int threads = std::min(MAX_THREADS_PER_BLOCK, params.group_num);
+        const int grids   = (params.group_num + threads - 1) / threads;
+        compute_grouped_gemm_variable_k_args<ADataType, BDataType, CDataType>
+            <<<grids, threads, 0, params.stream>>>(
+                reinterpret_cast<ck_tile::GemmTransKernelArg<> *>(params.args_ptr), params.a_ptr,
+                params.b_ptr, params.c_ptr, params.group_lens_ptr, params.group_offs_ptr,
+                params.transA, params.transB, params.group_num, params.m, params.n, strideA,
+                strideB, strideC, k_batch, runner->m_tile(), runner->n_tile());
+    }
+
+    if (params.work_steal) {
+        PRIMUS_TURBO_CHECK(params.ws_counter_ptr != nullptr,
+                           "work_steal=true requires a non-null ws_counter_ptr");
+        runner->run_ws(stream_cfg, params.group_num, params.args_ptr, params.num_cu,
+                       params.ws_counter_ptr, params.ws_local_per_xcd);
+    } else {
+        runner->run(stream_cfg, params.group_num, params.args_ptr, params.num_cu);
+    }
 
     // Postprocess
     {
