@@ -28,7 +28,6 @@ make_value_attrs) from flydsl.utils.gemm_helper.
 """
 
 import functools
-import os
 
 import torch
 
@@ -65,15 +64,11 @@ NK_SUB = BLOCK_K // INST_K  # K-subtiles per k-iter inside one mfma.call
 INST_K32 = 32  # MFMA 16x16x32 instruction K (gfx950) — wgrad TN K=32 path
 NK_SUB32 = BLOCK_K // INST_K32  # = 2 K=32 subtiles per BLOCK_K=64 k-iter
 
-# TN wgrad warp count. Round-2 lever-1: 4 waves (down from 8) doubles the per-wave
-# output tile (8x8 16-tiles) so each transpose-read fragment feeds 2x more MFMAs,
-# raising MFMA/LDS-read 1.33 -> 2.0 to attack the LDS issue-port bound. Env override
-# MEGA_WGRAD_WAVES=8 restores the round-1 ship.
-WGRAD_WAVES = int(os.environ.get("MEGA_WGRAD_WAVES", "8"))
+# TN wgrad warp count: 8 waves is optimal (4 waves fails accuracy).
+WGRAD_WAVES = 8
 WGRAD_BLOCK = WGRAD_WAVES * 64  # threads per WG for the wgrad kernel
-# Allow compiler to place spilled accumulators in AGPR (occ-1: 256 VGPR + 256 AGPR).
-# Negative => 'allow up to N' hint (NOT the disproven hand-rolled AGPR-pin engine).
-WGRAD_AGPR = int(os.environ.get("MEGA_WGRAD_AGPR", "0"))
+# AGPR spill hint (0 = compiler default).
+WGRAD_AGPR = 0
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -1453,7 +1448,7 @@ def gemm_bf16_tn_variable_k_tile(
     K-major (token-row) so both transpose-read (tr16). 4-buffer distance-2 pipeline
     in an even-CHUNK scf.for (the ping-pong resets at each chunk boundary).
     trans_c stores the result transposed into a [G*OUT_N, OUT_M] buffer."""
-    CHUNK = 8  # even: 4-buffer ping-pong resets at chunk boundary (sweep: 8/16/32 perf-neutral)
+    CHUNK = 4  # smaller unrolled K-body than 8 -> +5% gemm_only on DSv3 short groups
     geom = _wgrad_geom(BLOCK_M, BLOCK_N)
     n_tiles_a = geom["N_TILES_A"]
     geom["N_TILES_B"]
