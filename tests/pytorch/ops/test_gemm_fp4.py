@@ -43,7 +43,7 @@ torch.manual_seed(42)
     ],
 )
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
-@pytest.mark.parametrize("backend", [BackendType.AITER])
+@pytest.mark.parametrize("backend", [BackendType.AITER, BackendType.FLYDSL])
 @pytest.mark.parametrize("auto_tune", [False, True])
 @pytest.mark.parametrize("preshuffle", [False, True])
 def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, backend, auto_tune, preshuffle):
@@ -52,6 +52,10 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
 
     if backend == BackendType.AITER and dtype != torch.bfloat16:
         pytest.skip("AITER backend only supports bfloat16 dtype")
+
+    if backend == BackendType.FLYDSL:
+        if not (m % 256 == 0 and n % 256 == 0 and k % 256 == 0):
+            pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 256")
 
     # Skip redundant test: auto_tune is ignored when backend is explicitly specified
     if backend is not None and auto_tune:
@@ -259,12 +263,12 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E2M1_X2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.FLYDSL])
 @pytest.mark.parametrize("preshuffle", [False, True])
 def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend, preshuffle):
     """MX_BLOCKWISE gemm_fp4 with pre-quantized QuantizedTensor inputs.
 
-    HipBLASLt / default-dispatch coverage. AITER QT coverage is in
+    HipBLASLt / default-dispatch / FlyDSL coverage. AITER QT coverage is in
     :func:`test_gemm_fp4_mx_blockwise_quantized_tensor_aiter_preshuffled`
     below because AITER lacks tuned GEMM configs for these small shapes
     (default config produces near-zero SNR).
@@ -273,6 +277,8 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
         pytest.skip("Preshuffle is only supported for AITER backend")
     if backend == BackendType.AITER and dtype != torch.bfloat16:
         pytest.skip("AITER backend only supports bfloat16 dtype")
+    if backend == BackendType.FLYDSL and not (m % 256 == 0 and n % 256 == 0 and k % 256 == 0):
+        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 256")
 
     _run_gemm_fp4_mx_quantized_tensor_test(
         m=m,
