@@ -23,7 +23,6 @@ import torch.distributed as dist
 from flydsl.expr import arith
 from flydsl.expr.buffer_ops import buffer_load, create_buffer_resource
 
-from primus_turbo.flydsl.common.tile_spec import _emit_if_then
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
 from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
@@ -38,6 +37,7 @@ from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
 from primus_turbo.flydsl.mega.swiglu_kernel import swiglu
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.utils.gemm_helper import (
+    _emit_if_then,
     ceildiv,
     make_value_attrs,
     xcd_remap_pid,

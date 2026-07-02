@@ -54,7 +54,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.utils.arith import ArithValue
 
-from primus_turbo.flydsl.common.tile_spec import _emit_for, _emit_if_then
+from primus_turbo.flydsl.utils.gemm_helper import _emit_for, _emit_if_then
 
 # isort: on
 
