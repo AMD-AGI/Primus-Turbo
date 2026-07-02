@@ -258,6 +258,57 @@ class MegaMoE(nn.Module):
             out = torch.sigmoid(F.linear(x, self.shared_gate_weight).float()).to(out.dtype) * out
         return out
 
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
+        metadata: Optional[dict] = None,
+    ):
+        """Dist-ckpt: register EP as a real shard axis for w1/w2, rest replicated.
+
+        Without this, the MegatronModule default treats every EP rank's local
+        expert block as the same logical tensor (offset 0) -> ranks collide as
+        replicas and all experts but one are silently dropped on save.
+        """
+        # lazy Megatron deps: keep this generic module import-light
+        from megatron.core.dist_checkpointing.mapping import ShardedTensor
+        from megatron.core.transformer.utils import (
+            ensure_metadata_has_dp_cp_group,
+            make_sharded_tensors_for_checkpoint,
+        )
+        from megatron.core.utils import get_pg_rank
+
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        dp_cp_group = metadata["dp_cp_group"]
+        # MegaMoE is EP-only (TP=1); replicas differ only by DP rank
+        replica_id = (0, 0, get_pg_rank(dp_cp_group))
+        prepend_axis_num = len(sharded_offsets)
+
+        # collect persistent params + buffers (respects persistent flag)
+        module_sd: dict = {}
+        self._save_to_state_dict(module_sd, "", keep_vars=True)
+
+        sharded_sd: dict = {}
+        # EP-sharded expert weights: shard axis 0 into ep_size chunks
+        for name in ("w1", "w2"):
+            w = module_sd.pop(name)
+            key = f"{prefix}{name}"
+            sharded_sd[key] = ShardedTensor.from_rank_offsets(
+                key,
+                w,
+                *sharded_offsets,
+                (prepend_axis_num, self.ep_rank, self.ep_size),
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            )
+        # router gate/bias, expert_bias, shared expert: replicated across EP+DP
+        sharded_sd.update(
+            make_sharded_tensors_for_checkpoint(
+                module_sd, prefix, sharded_offsets=sharded_offsets, dp_cp_group=dp_cp_group
+            )
+        )
+        return sharded_sd
+
     def extra_repr(self) -> str:
         return (
             f"hidden_size={self.hidden_size}, intermediate_size={self.intermediate_size}, "
