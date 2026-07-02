@@ -553,6 +553,7 @@ def dispatch_grouped_gemm_bf16(
             trans_c=trans_c,
             G=G,
             has_snapshots=has_snapshots,
+            num_xcd=2,  # fused TN optimum (post-CHUNK=4): balances L2 reuse vs dispatch-overlap scatter
         )
         launch(*pos_args, stream=torch.cuda.current_stream())
         return output, symm.pool, symm.weight_recv_buf, handle
