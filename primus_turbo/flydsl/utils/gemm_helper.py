@@ -325,9 +325,16 @@ class StoreCPerTensorCShuffle:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
-        self.Cc = n_tiles_b * 16
-        self.EPL = (16 * self.Cc) // 64  # out_ty elements per lane on re-read
-        assert self.EPL * 2 == 16, f"CShuffle expects a 128b store (EPL=8 bf16); got EPL={self.EPL}"
+        self.Cc = n_tiles_b * 16  # columns in one 16-row shuffle tile
+        self.EPL = (16 * self.Cc) // 64  # out_ty elements each lane re-reads (16*Cc rows/cols / 64 lanes)
+        # One coalesced global store is 128 bits = 8 x 16b (buffer_store_dwordx4). If a
+        # lane re-reads more than that (EPL > 8 -- e.g. the 4-wave 2x2 geometry has
+        # n_tiles_b=4 -> Cc=64 -> EPL=16), emit EPL//8 back-to-back 128b stores; EPL==8
+        # (the 8-wave path) is a single store. EPL must be a multiple of 8 and fit in one row.
+        self.elems_per_store = 8  # 16b elements packed into one 128b vector store
+        assert self.EPL % self.elems_per_store == 0 and self.EPL <= self.Cc, (
+            f"CShuffle expects EPL a multiple of 8 within Cc={self.Cc}; got EPL={self.EPL}"
+        )
         # The ds_write_b16 staging + 128b re-read aliases LDS banks, but the epilogue
         # store stall is hidden behind the MMA pipeline / next-tile prologue, so anti-
         # conflict row padding is perf-neutral here and is not used.
@@ -381,14 +388,16 @@ class StoreCPerTensorCShuffle:
             nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
             rsrc = _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
             row_in = (self.lane_id * self.EPL) // self.Cc
-            col_in = (self.lane_id * self.EPL) % self.Cc
-            lane_e = wave_off + row_in * self.row_stride + col_in
-            rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
-            vec = fx.make_view(rptr, fx.make_layout(self.EPL, 1)).load()
-            gcol = base_col + col_in
-            valid = (gcol + fx.Int32(self.EPL)) <= self.c_cols
-            off = (row_in * self.c_cols + gcol) * out_b  # i32-small within band
-            _buffer_ops.buffer_store(vec, rsrc, off, mask=valid, offset_is_bytes=True)
+            col0 = (self.lane_id * self.EPL) % self.Cc
+            for sub in range_constexpr(self.EPL // self.elems_per_store):
+                col_in = col0 + sub * self.elems_per_store
+                lane_e = wave_off + row_in * self.row_stride + col_in
+                rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
+                vec = fx.make_view(rptr, fx.make_layout(self.elems_per_store, 1)).load()
+                gcol = base_col + col_in
+                valid = (gcol + fx.Int32(self.elems_per_store)) <= self.c_cols
+                off = (row_in * self.c_cols + gcol) * out_b  # i32-small within band
+                _buffer_ops.buffer_store(vec, rsrc, off, mask=valid, offset_is_bytes=True)
             S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
 
 
@@ -634,3 +643,20 @@ class S2RLoaderTr:
                 self._wait_lgkmcnt(0)
             return [self._assemble(c) for c in all_calls]
         return [self._assemble(self._issue_one(lds_src, t, base_off)) for t in range_constexpr(self.n_tiles)]
+
+    def base_addr(self, lds_src):
+        """Per-lane LDS byte address pairs for the whole-loop transpose reads.
+
+        Returns [[p0, p1]] * n_tiles: tile i's 4 ds_read_b64_tr_b8 are c0=p0[i]+0,
+        c1=p1[i]+0, c2=p0[i]+RS, c3=p1[i]+RS (RS = 8*chunk_stride), assembled in-place
+        as the 8xi32 operand (no shuffle). p0/p1 are NOT tile-strided (j_chunk carries
+        an XOR), so each tile needs its own pair."""
+        base = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        I = self.lane_id // 16
+        L_in_sg = self.lane_id % 16
+        out = []
+        for t in range_constexpr(self.n_tiles):
+            p0 = base + fx.Int32(self._ptr_off(0, t, I, L_in_sg))
+            p1 = base + fx.Int32(self._ptr_off(1, t, I, L_in_sg))
+            out.append([p0, p1])
+        return out
