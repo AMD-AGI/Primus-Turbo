@@ -33,7 +33,6 @@ import os as _os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import flydsl.expr.buffer_ops as bo
 import torch
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr.buffer_ops import (
@@ -59,10 +58,6 @@ from primus_turbo.flydsl.mega.prims import (
 )
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
 
-# Set True to emit s_memrealtime phase stamps into the SymLayout ``profile`` region.
-# Compile-time constexpr: when False the profile code is not traced (no IR emitted).
-ENABLE_PROFILE = False
-
 _BLOCK_THREADS = int(_os.environ.get("PROLOGUE_BT", "256"))  # threads per block
 # grid_blocks (== num_cu) is a caller arg (default 64). Fewer blocks => cheaper
 # self-resetting grid_sync; 48-64 is the measured sweet spot. Must stay <= num_CU so
@@ -73,7 +68,6 @@ _DEFAULT_GRID_BLOCKS = 64
 # --------------------------------------------------------------------------- #
 # Address-space / scope constants (atomic + fence prims come from prims.py)
 # --------------------------------------------------------------------------- #
-_llvm = bo.llvm
 _SCOPE = "agent"  # device-wide scope (Triton scope="gpu" lowers to this)
 _I4 = 4  # int32 byte stride / atomic alignment
 _GLOBAL = 1  # LLVM global address space
@@ -95,14 +89,6 @@ def lds_base_addr():
 def _ext_i64(v):
     """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
     return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
-
-
-def _read_realtime():
-    """Read the GPU constant-rate realtime counter (s_memrealtime)."""
-    op = _llvm.inline_asm(
-        fx.T.i64(), [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True
-    )
-    return fx.arith.ArithValue(op, signed=False)
 
 
 # Prologue outputs are returned as a plain positional tuple:
@@ -192,12 +178,6 @@ def _make_dispatch_prologue(
     ):
         thread_index = fx.thread_idx.x
         block_index, _, _ = fx.block_idx
-        if fx.const_expr(ENABLE_PROFILE):
-            profile_resource = create_buffer_resource_from_addr(sl.profile_ptr, num_records_bytes=8 * 8)
-            is_profiler_thread = block_index == fx.Int32(0)  # block0 records phase boundaries
-            if is_profiler_thread:
-                if thread_index == fx.Int32(0):
-                    buffer_store(_read_realtime(), profile_resource, fx.Int32(0))  # t0 = start
 
         lds_base = lds_base_addr()  # addrspace-3 base for prims ld/atomic_add (LDS)
         topk_resource = create_buffer_resource(TOPK_INDICES, max_size=True)
@@ -251,10 +231,6 @@ def _make_dispatch_prologue(
             buffer_store(fx.Int32(experts_per_rank), tile_to_expert_resource, tile_to_group_init_index)
             tile_to_group_init_index = tile_to_group_init_index + fx.Int32(grid_stride)
 
-        if fx.const_expr(ENABLE_PROFILE):
-            if is_profiler_thread:
-                if thread_index == fx.Int32(0):
-                    buffer_store(_read_realtime(), profile_resource, fx.Int32(1))  # after Phase 0 init
         # ---- Phase A: histogram TOPK_INDICES -> SEND_LOCAL; read low word of int64 pair ----
         # Block-private LDS histogram first, then one global atomic per (block, expert):
         # cuts global atomics from total_pairs (~32K) to grid_blocks*num_experts (~2K).
@@ -277,10 +253,6 @@ def _make_dispatch_prologue(
                 atomic_add(workspace_base, fx.Int32(WS_SEND) + lds_flush_index, block_count, _SCOPE, _GLOBAL)
             lds_flush_index = lds_flush_index + fx.Int32(block_threads)
         grid_sync(sl, thread_index, block_index, grid_blocks)
-        if fx.const_expr(ENABLE_PROFILE):
-            if is_profiler_thread:
-                if thread_index == fx.Int32(0):
-                    buffer_store(_read_realtime(), profile_resource, fx.Int32(2))  # after Phase A
 
         # ---- Phase B: cross-rank all_gather; B1: all ranks entered ----
         barrier_block(sl, rank, world_size, thread_index, block_index, True)
@@ -304,10 +276,6 @@ def _make_dispatch_prologue(
                     push_expert_index = push_expert_index + fx.Int32(block_threads)
         # B3: all ranks pushed + landed
         barrier_block(sl, rank, world_size, thread_index, block_index, False)
-        if fx.const_expr(ENABLE_PROFILE):
-            if is_profiler_thread:
-                if thread_index == fx.Int32(0):
-                    buffer_store(_read_realtime(), profile_resource, fx.Int32(3))  # after Phase B
 
         # ---- Phase C: serial table build on block0 (c_buffer read coherently from own buffer) ----
         if block_index == fx.Int32(0):
@@ -452,10 +420,6 @@ def _make_dispatch_prologue(
                     )
 
         grid_sync(sl, thread_index, block_index, grid_blocks)
-        if fx.const_expr(ENABLE_PROFILE):
-            if is_profiler_thread:
-                if thread_index == fx.Int32(0):
-                    buffer_store(_read_realtime(), profile_resource, fx.Int32(4))  # after Phase C
 
         # ---- Phase D: scatter pairs (all blocks) ----
         # Two-pass block-private reservation: count this block's pairs per expert in
@@ -571,10 +535,6 @@ def _make_dispatch_prologue(
             flag_slot_index = flag_slot_index + fx.Int32(grid_stride)
 
         grid_sync(sl, thread_index, block_index, grid_blocks)
-        if fx.const_expr(ENABLE_PROFILE):
-            if is_profiler_thread:
-                if thread_index == fx.Int32(0):
-                    buffer_store(_read_realtime(), profile_resource, fx.Int32(5))  # after Phase D
 
         # ---- Post: reset SEND_LOCAL/WITHIN_EXPERT counters for the next launch ----
         reset_index = block_index * fx.Int32(block_threads) + thread_index
@@ -582,17 +542,9 @@ def _make_dispatch_prologue(
             buffer_store(fx.Int32(0), workspace_resource, fx.Int32(WS_SEND) + reset_index)
             buffer_store(fx.Int32(0), workspace_resource, fx.Int32(WS_WITHIN) + reset_index)
             reset_index = reset_index + fx.Int32(grid_stride)
-        if fx.const_expr(ENABLE_PROFILE):
-            if is_profiler_thread:
-                if thread_index == fx.Int32(0):
-                    buffer_store(_read_realtime(), profile_resource, fx.Int32(6))  # after Post reset
 
         # ---- Phase E: origins landed cross-rank ----
         barrier_block(sl, rank, world_size, thread_index, block_index, False)
-        if fx.const_expr(ENABLE_PROFILE):
-            if is_profiler_thread:
-                if thread_index == fx.Int32(0):
-                    buffer_store(_read_realtime(), profile_resource, fx.Int32(7))  # after Phase E (end)
 
     @flyc.jit
     def launch(
