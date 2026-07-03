@@ -35,7 +35,10 @@ from primus_turbo.triton.utils.origami import (
     origama_hardware_info,
     origama_select_params,
 )
-from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
+from primus_turbo.triton.utils.triton_knobs_helper import (
+    scoped_amd_knobs,
+    set_triton_knobs_gfx950,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Hardware constants & chiplet transform
@@ -246,6 +249,7 @@ def _bf16_persistent_gemm_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@scoped_amd_knobs
 def gemm_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,

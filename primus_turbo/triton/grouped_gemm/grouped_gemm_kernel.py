@@ -37,7 +37,10 @@ import triton.language as tl
 
 from primus_turbo.pytorch.core.utils import get_num_cus, is_gfx950
 from primus_turbo.triton.utils.origami import origama_select_params
-from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
+from primus_turbo.triton.utils.triton_knobs_helper import (
+    scoped_amd_knobs,
+    set_triton_knobs_gfx950,
+)
 
 # ===============================================================================
 # Hardware constants (lazy init)
@@ -564,6 +567,7 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
                 tile_id = xcd_id * per_xcd + local_idx
 
 
+@scoped_amd_knobs
 def grouped_gemm_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1085,6 +1089,7 @@ def _grouped_variable_k_gemm_kernel_ws(
 # -- Public API -- Variable-K BF16 grouped GEMM (backward) --
 
 
+@scoped_amd_knobs
 def grouped_gemm_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,

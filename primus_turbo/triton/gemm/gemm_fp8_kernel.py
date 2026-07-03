@@ -50,7 +50,10 @@ from primus_turbo.triton.utils.origami import (
     origama_hardware_info,
     origama_select_params,
 )
-from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
+from primus_turbo.triton.utils.triton_knobs_helper import (
+    scoped_amd_knobs,
+    set_triton_knobs_gfx950,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AMD knobs helper (blockwise-specific)
@@ -255,6 +258,7 @@ def _fp8_persistent_gemm_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@scoped_amd_knobs
 def gemm_fp8_tensorwise_triton_kernel(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,
@@ -554,6 +558,7 @@ def _fp8_rowwise_persistent_gemm_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@scoped_amd_knobs
 def gemm_fp8_rowwise_triton_kernel(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,
@@ -1024,6 +1029,7 @@ _blockwise_fp8_tn_kernel = triton.autotune(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@scoped_amd_knobs
 def gemm_fp8_blockwise_triton_kernel(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,

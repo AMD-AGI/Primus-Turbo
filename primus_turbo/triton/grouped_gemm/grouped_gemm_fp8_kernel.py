@@ -54,7 +54,10 @@ from primus_turbo.triton.utils.origami import (
     origama_hardware_info,
     origama_select_params,
 )
-from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
+from primus_turbo.triton.utils.triton_knobs_helper import (
+    scoped_amd_knobs,
+    set_triton_knobs_gfx950,
+)
 
 _grouped_blockwise_warmed: set = set()
 _grouped_blockwise_vk_warmed: set = set()
@@ -498,6 +501,7 @@ def _grouped_fp8_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_tensorwise_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -612,6 +616,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
 # ── Tensorwise FP8 Variable-K Backward ──
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -853,6 +858,7 @@ def _grouped_fp8_rowwise_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_rowwise_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1111,6 +1117,7 @@ def _grouped_fp8_rowwise_variable_k_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -1707,6 +1714,7 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
 # ── Blockwise FP8 Forward Public API ──
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_blockwise_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1853,6 +1861,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
 # ── Blockwise FP8 Variable-K Backward Public API ──
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -2159,6 +2168,7 @@ def _grouped_mxfp8_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_mxfp8_triton_kernel(
     a,
     a_scale,
@@ -2358,6 +2368,7 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
         tl.store(C_, c, cmask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_mxfp8_variable_k_triton_kernel(
     lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=None
 ):
