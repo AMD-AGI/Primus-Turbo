@@ -39,8 +39,50 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
 )
 from primus_turbo.pytorch.ops.quantization import (
     grouped_quantize_fp8_with_trans,
+    grouped_quantize_fp8_with_trans_flydsl,
     quantize_fp8_with_trans,
+    quantize_fp8_with_trans_flydsl,
 )
+
+import os as _os
+
+# MX grouped A / grad_out dual-cast quant on the FlyDSL kernel (bit-compatible with the
+# HIP grouped_quantize_mxfp8_dual on read regions). Default ON off-gfx942 (the FlyDSL MX
+# gemm needs gfx950 anyway); PT_MXGG_FLYDSL_QUANT=0 forces the HIP path for A/B compare.
+_MXGG_FLYDSL_QUANT = _os.environ.get("PT_MXGG_FLYDSL_QUANT", "1") != "0" and not is_gfx942()
+
+
+def _grouped_mx_quant(a, a_dtype, granularity, group_lens, group_offs, block_size):
+    """A / grad_out grouped dual-cast MX quant: FlyDSL when enabled, else HIP. Both emit
+    the same 8-tuple (row fp8/scale, col fp8/scale, row-64/col-128 padded lens/offs)."""
+    if _MXGG_FLYDSL_QUANT:
+        return grouped_quantize_fp8_with_trans_flydsl(a, a_dtype, group_lens, group_offs)
+    return grouped_quantize_fp8_with_trans(
+        a,
+        a_dtype,
+        granularity,
+        group_lens,
+        group_offs,
+        block_size=block_size,
+        scaling_recipe=ScalingRecipe(),
+        scaling_recipe_for_trans=ScalingRecipe(),
+    )
+
+
+def _mx_quant_b(b, b_dtype, granularity, block_size):
+    """Weight [B, N, K] dual-cast MX quant: batched FlyDSL when enabled (all B experts in
+    one launch, standard MX 1x32 blocks), else the HIP use_2d_block=True reference. Both
+    return the same 4-tuple (row fp8/scale, col fp8/scale) with per-expert-identical shapes."""
+    if _MXGG_FLYDSL_QUANT:
+        return quantize_fp8_with_trans_flydsl(b, b_dtype)
+    return quantize_fp8_with_trans(
+        b,
+        b_dtype,
+        granularity,
+        block_size=block_size,
+        scaling_recipe=ScalingRecipe(use_2d_block=True),
+        scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
+    )
 
 __all__ = [
     "grouped_gemm_fp8",
@@ -570,16 +612,19 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
 
 class FP8GroupedGemmMXFunc(torch.autograd.Function):
-    """MXFP8 grouped GEMM autograd (MX_BLOCKWISE), Triton backend.
+    """MXFP8 grouped GEMM autograd (MX_BLOCKWISE), FlyDSL backend.
 
-    Same interface as the hip path; only the backend differs
-    (default_backend=TRITON).  A / grad_out use grouped dual-quant (padded
-    per-group M, dense E8M0 scale); B uses per-group dual-quant.  fwd / dgrad
-    read the padded layout (group_offs_padded_rowwise); the output is
-    over-allocated to the padded rows, group_offs_out packs each group tight,
-    and the caller slices [:total_m].  wgrad output (G, N, K) is
-    padding-independent.  When hip MX kernels land, only default_backend
-    needs to flip to TURBO.
+    default_backend=FLYDSL (native mfma_scale_f32_16x16x128_f8f6f4, gfx950):
+    the dispatcher falls back to TRITON when FlyDSL can't handle the inputs
+    (non-gfx950 or K not %128 / < 256).  On gfx950 FlyDSL is ~1.3-1.5x the
+    Triton grouped MX gemm across Llama shapes (measured), which is what lets
+    MX approach the dense gemm_fp8(mxfp8) fwd/bwd level; the remaining fwd gap
+    vs tensorwise is the HIP dual-cast quant (row+col), still ~40% of fwd.
+    A / grad_out use grouped dual-quant (padded per-group M, dense E8M0 scale);
+    B uses per-group dual-quant.  fwd / dgrad read the padded layout
+    (group_offs_padded_rowwise); the output is over-allocated to the padded
+    rows, group_offs_out packs each group tight, and the caller slices
+    [:total_m].  wgrad output (G, N, K) is padding-independent.
     """
 
     @staticmethod
@@ -602,24 +647,10 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             group_offs_padded_rowwise,
             _,
             _,
-        ) = grouped_quantize_fp8_with_trans(
-            a,
-            a_dtype,
-            config.granularity,
-            group_lens,
-            group_offs,
-            block_size=config.block_size,
-            scaling_recipe=ScalingRecipe(),
-            scaling_recipe_for_trans=ScalingRecipe(),
-        )
+        ) = _grouped_mx_quant(a, a_dtype, config.granularity, group_lens, group_offs, config.block_size)
         # B: per-group dual-quant (rowwise (G,N,K) for fwd, colwise (G,K,N) for dgrad).
-        b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = quantize_fp8_with_trans(
-            b,
-            b_dtype,
-            config.granularity,
-            block_size=config.block_size,
-            scaling_recipe=ScalingRecipe(use_2d_block=True),
-            scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
+        b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = _mx_quant_b(
+            b, b_dtype, config.granularity, config.block_size
         )
 
         total_m = int(a.size(0))
@@ -638,7 +669,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         out = out[:total_m]
@@ -665,15 +696,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             group_offs_padded_rowwise,
             group_lens_padded_colwise,
             group_offs_padded_colwise,
-        ) = grouped_quantize_fp8_with_trans(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            group_lens,
-            group_offs,
-            block_size=ctx.config.block_size,
-            scaling_recipe=ScalingRecipe(),
-            scaling_recipe_for_trans=ScalingRecipe(),
+        ) = _grouped_mx_quant(
+            grad_out, grad_out_dtype, ctx.config.granularity, group_lens, group_offs, ctx.config.block_size
         )
 
         # dgrad: grad_a = grad_out @ b_col^T  (same single NT op as fwd)
@@ -689,7 +713,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         grad_a = grad_a[: ctx.total_m]
@@ -708,7 +732,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
         return grad_a, grad_b, None, None, None, None, None, None

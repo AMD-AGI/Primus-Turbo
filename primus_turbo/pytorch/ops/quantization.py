@@ -130,10 +130,45 @@ def quantize_fp8_with_trans_flydsl(
     which stays on the HIP kernel for general / grouped quant. Emits raw row-major E8M0
     ``[dim, K//32]`` scales (bit-identical to the HIP ``quantize_mxfp8_dual``); the FlyDSL
     GEMM preshuffles the raw scale itself, so nothing is shuffled here. Returns
-    (row_fp8, row_scale, col_fp8, col_scale)."""
+    (row_fp8, row_scale, col_fp8, col_scale).
+
+    A 3D ``[B, M, K]`` batched input (grouped-gemm weight path) is quantized for all B
+    experts in ONE launch via ``quant_mxfp8_raw_batched`` (no per-expert Python loop /
+    stack); the 2D path stays on ``quant_mxfp8_raw``."""
+    if x.ndim == 3:
+        from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import quant_mxfp8_raw_batched
+
+        return quant_mxfp8_raw_batched(x.contiguous(), out_dtype, with_trans=True)
+
     from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import quant_mxfp8_raw
 
     return quant_mxfp8_raw(x.contiguous(), out_dtype, with_trans=True, axis=None)
+
+
+def grouped_quantize_fp8_with_trans_flydsl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """FlyDSL grouped dual-cast MXFP8 quant -- the A / grad_out operand quant for the
+    FlyDSL MX grouped GEMM (``FP8GroupedGemmMXFunc``). Drop-in for the HIP
+    ``grouped_quantize_fp8_with_trans`` (MX_BLOCKWISE, non-shuffle): returns the same
+    8-tuple (rowwise fp8/scale, colwise fp8/scale, then row-64/col-128 padded
+    lens/offs). Bit-compatible with the HIP ``grouped_quantize_mxfp8_dual`` on the
+    consumer-read regions; the GEMM preshuffles the raw E8M0 scale itself."""
+    from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import grouped_quant_mxfp8_raw
+
+    return grouped_quant_mxfp8_raw(x.contiguous(), group_lens, group_offs, out_dtype)
 
 
 def grouped_quantize_fp8_with_trans(
