@@ -14,6 +14,7 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
+from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -87,6 +88,12 @@ class GroupedGEMMCKBackend(KernelBackend):
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= not trans_a
         supported &= schedule in _WS_SUPPORTED_SCHEDULES
+        # The CK WS kernel needs 4 extra bytes of LDS for the atomicAdd
+        # broadcast slot, which fits on gfx950 (MI355X) but overflows
+        # gfx942's 64 KB LDS budget. The device-side WS body is stubbed
+        # out on gfx942, so refuse to dispatch WS to CK on that arch.
+        if schedule == "work_steal" and not is_gfx950():
+            supported = False
         return supported
 
     @staticmethod
@@ -156,6 +163,10 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
         supported &= schedule in _WS_SUPPORTED_SCHEDULES
+        # See GroupedGEMMCKBackend.can_handle: the CK WS kernel is
+        # gfx950-only due to LDS budget.
+        if schedule == "work_steal" and not is_gfx950():
+            supported = False
         return supported
 
     @staticmethod

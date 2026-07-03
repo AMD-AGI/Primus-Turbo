@@ -87,6 +87,23 @@ struct GroupedGemmKernelWS
         int32_t*                                   tile_counter_ptr,
         const index_t                              local_per_xcd) const
     {
+        // gfx942 has 64 KB LDS per CU and CK's 256x256x64 tile config already
+        // uses the full 64 KB. Our WS kernel adds a 4-byte ``__shared__``
+        // broadcast slot for the atomicAdd result (see s_block_id below),
+        // which pushes total LDS to 65540 bytes and hits the lld error
+        // ``local memory (65540) exceeds limit (65536)``. WS was designed
+        // and tuned for gfx950 (MI355X) where the CK static kernel leaves
+        // enough LDS headroom for the extra slot. On gfx942 we compile an
+        // empty stub; the Python dispatcher's ``can_handle`` refuses to
+        // route ``schedule="work_steal"`` to CK on gfx942, so the stub is
+        // never actually launched -- it exists only to make the gfx942
+        // device object link successfully.
+#if defined(__gfx942__)
+        (void)gemm_descs_const;
+        (void)group_count;
+        (void)tile_counter_ptr;
+        (void)local_per_xcd;
+#else
         const auto gemm_desc_ptr = reinterpret_cast<const GemmTransKernelArg<NumDTensor_>*>(
             cast_pointer_to_generic_address_space(gemm_descs_const));
 
@@ -226,6 +243,7 @@ struct GroupedGemmKernelWS
                 }
             }
         }
+#endif // !defined(__gfx942__)
     }
 };
 
