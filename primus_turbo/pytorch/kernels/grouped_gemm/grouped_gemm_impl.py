@@ -14,7 +14,22 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
-from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.core.utils import _get_device_compute_capability
+
+
+def _is_gfx950_device(device: torch.device) -> bool:
+    """Compute capability check bound to a specific tensor's device.
+
+    ``is_gfx950()`` inspects the *current* CUDA device via
+    ``torch.cuda.current_device()``, which is wrong when the tensor lives
+    on a different device than the ambient one (multi-GPU / mixed-arch
+    hosts). Route by the tensor's device instead.
+    """
+    if device.type != "cuda":
+        return False
+    return _get_device_compute_capability(device) == (9, 5)
+
+
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -92,7 +107,9 @@ class GroupedGEMMCKBackend(KernelBackend):
         # broadcast slot, which fits on gfx950 (MI355X) but overflows
         # gfx942's 64 KB LDS budget. The device-side WS body is stubbed
         # out on gfx942, so refuse to dispatch WS to CK on that arch.
-        if schedule == "work_steal" and not is_gfx950():
+        # Check the *tensor's* device (multi-GPU safe), not the ambient
+        # ``current_device()``.
+        if schedule == "work_steal" and not _is_gfx950_device(a.device):
             supported = False
         return supported
 
@@ -164,8 +181,8 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         supported &= trans_a and not trans_b
         supported &= schedule in _WS_SUPPORTED_SCHEDULES
         # See GroupedGEMMCKBackend.can_handle: the CK WS kernel is
-        # gfx950-only due to LDS budget.
-        if schedule == "work_steal" and not is_gfx950():
+        # gfx950-only due to LDS budget. Route by the tensor's device.
+        if schedule == "work_steal" and not _is_gfx950_device(a.device):
             supported = False
         return supported
 

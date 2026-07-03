@@ -115,6 +115,12 @@ at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
         PRIMUS_TURBO_CHECK(counter.scalar_type() == at::kInt,
                            "ws_counter must be int32");
         PRIMUS_TURBO_CHECK(counter.is_cuda(), "ws_counter must be on CUDA");
+        PRIMUS_TURBO_CHECK(counter.device() == a.device(),
+                           "ws_counter must be on the same CUDA device as `a` "
+                           "(counter cuda:", counter.device().index(),
+                           ", a cuda:", a.device().index(), ")");
+        PRIMUS_TURBO_CHECK(counter.is_contiguous(),
+                           "ws_counter must be contiguous");
         constexpr int64_t kCounterSlots = 8 + 2; // NUM_XCDS_WS + global + done
         PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots,
                            "ws_counter must have at least ", kCounterSlots, " int32 slots");
@@ -266,6 +272,12 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
         at::Tensor &counter = ws_counter.value();
         PRIMUS_TURBO_CHECK(counter.scalar_type() == at::kInt, "ws_counter must be int32");
         PRIMUS_TURBO_CHECK(counter.is_cuda(), "ws_counter must be on CUDA");
+        PRIMUS_TURBO_CHECK(counter.device() == a.device(),
+                           "ws_counter must be on the same CUDA device as `a` "
+                           "(counter cuda:", counter.device().index(),
+                           ", a cuda:", a.device().index(), ")");
+        PRIMUS_TURBO_CHECK(counter.is_contiguous(),
+                           "ws_counter must be contiguous");
         constexpr int64_t kCounterSlots = 8 + 2;
         PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots,
                            "ws_counter must have at least ", kCounterSlots, " int32 slots");

@@ -280,6 +280,13 @@ def test_grouped_gemm_schedule_work_steal(B, M, N_K, dtype, balance, trans_b, ba
     """``schedule="work_steal"`` on each WS-capable backend matches the static
     path bit-for-bit for forward and backward (per-tile accumulator order is
     identical to the static schedule; there is no cross-tile reduction)."""
+    # CK WS is gfx950-only (see GroupedGEMMCKBackend.can_handle): the kernel
+    # body is stubbed out on gfx942 due to the 64 KB LDS budget, and the
+    # backend advertises unsupported so the dispatcher raises. Skip the
+    # combination on non-gfx950 hardware.
+    if backend is BackendType.CK and get_device_compute_capability() != (9, 5):
+        pytest.skip("CK schedule='work_steal' is gfx950-only (LDS budget)")
+
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -431,6 +438,11 @@ def test_grouped_gemm_triton_kernel_ws_num_cu_below_num_xcds(num_cu, ws_mode):
     torch.testing.assert_close(out_ref, out_ws, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.skipif(
+    get_device_compute_capability() != (9, 5),
+    reason="CK WS kernel body is stubbed on non-gfx950 (LDS budget); the "
+    "cpp op would produce a no-op result. See GroupedGEMMCKBackend.can_handle.",
+)
 @pytest.mark.parametrize("num_cu", [4, 6, 7, 8, 16])
 def test_ck_grouped_gemm_op_ws_num_cu_below_num_xcds(num_cu):
     """Regression: ``num_cu < NUM_XCDS_WS`` (=8) on the CK WS kernel used to
