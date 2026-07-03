@@ -2221,10 +2221,13 @@ def _wgrad_wholeloop_asm(
                     out.append(ds_line(nxt_buf, tt))
             return out
 
-        # Phase barrier between the two ping-pong halves: keep vmcnt(16)/lgkmcnt(10) in
-        # flight across the boundary (a full drain regressed; a per-shape sweep of these
-        # in-flight counts never beat 16/10).
-        _ipend = "s_waitcnt vmcnt(16) lgkmcnt(10)\ns_barrier"
+        # Phase barrier between the two ping-pong halves. vmcnt MUST drain to 0 here:
+        # this half's buffer_load_lds writes the buffer the next half transpose-reads
+        # (ping-pong: half A loads buf0 while reading buf1, half B then reads buf0), so
+        # any in-flight load past the barrier lets ds_read race the still-pending LDS
+        # write -> low-fraction, run-to-run bit-nondeterministic output (SNR hides it).
+        # lgkmcnt likewise drained so the barrier is a clean LDS-coherent boundary.
+        _ipend = "s_waitcnt vmcnt(0) lgkmcnt(0)\ns_barrier"
         L = [f"s_mov_b32 ${o_cnt}, 0"]
         for p in range(4):
             L.append(f"s_mov_b32 ${o_soff[p]}, ${i_soff0[p]}")
