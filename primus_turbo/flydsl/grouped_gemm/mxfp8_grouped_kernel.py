@@ -145,59 +145,72 @@ def _wgrad_mx_body_4buf(
     rocdl.s_barrier()
 
 
-def _wgrad_fast_path(
-    k_fixed, ks0, BLOCK_K, A1off, B1off,
+def _wgrad_ssa_chunk(
+    base_k, chunk, ks0, BLOCK_K, A1off, B1off,
     a_g2s, b_g2s, a_s2r, b_s2r, sa_s2r, sb_s2r, mfma,
     a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1,
+    acc00, acc01, acc10, acc11,
     sa_base0, sa_base1, sb_base0, N_ACCUMS, N_LDS_STEPS_A, N_LDS_STEPS_B,
-    store_c, base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N,
 ):
-    """Uniform-K fast body, ported from the dense-NT sibling's ~61%-util pipeline:
-    SSA register-carried accumulators (no per-MMA memref RMW), scale software-pipelining
-    (prefetch next-iter sa/sb, MMA with current), and a fully-unrolled range_constexpr
-    K-loop (no runtime scf.for / no per-tile guard). Module-level fn so the runtime
-    per-WG dispatch (if k_iters == k_fixed) calls it with NO in-branch reassignments ->
-    the dynamic scf.if doesn't try to thread the loaders/buffers as state variables.
-    wgrad addressing: A0/B0 off 0, A1/B1 off A1off/B1off; scale index ks0+k (ScaleBComb
-    per-group, no slab). Requires k_fixed>=2 (2 epilogue steps). Stores its 4 quadrants."""
-    c00_frag = [mfma.zero_value] * N_ACCUMS
-    c01_frag = [mfma.zero_value] * N_ACCUMS
-    c10_frag = [mfma.zero_value] * N_ACCUMS
-    c11_frag = [mfma.zero_value] * N_ACCUMS
-    sa0 = sa_s2r.load(sa_base0, ks0 + 0)
-    sa1 = sa_s2r.load(sa_base1, ks0 + 0)
-    sb_all = sb_s2r.load(sb_base0, ks0 + 0)
+    """One FULL constexpr chunk (`chunk` tiles from base_k) of the wgrad K-loop, with
+    the 2x2 accumulators held in **SSA registers** across the chunk instead of the
+    per-MMA memref read-modify-write the plain body does. Seeds the SSA frags from the
+    rmem accumulators once at chunk entry and writes them back once at chunk exit, so the
+    accumulator survives the outer dynamic scf.for (via memory) while every MMA inside the
+    chunk feeds the next straight from a register (kills the memref-RMW dependency chain
+    that pinned var-K util to ~45%). Same distance-2 4-buffer prefetch/barrier schedule as
+    `_wgrad_mx_body_4buf`; scales still load inline per tile. Universal (no uniform-K
+    assumption) — the caller runs this for every FULL chunk, a guarded memref tail mops up
+    the k_iters%chunk remainder. Module-level fn so the outer dynamic loop body is a single
+    call with only buffer-swap reassigns (no obj.method / no list state) — the dynamic
+    scf.for then loop-carries just the buffer refs, never the accumulator list. Returns the
+    swapped 8 buffer refs (chunk is even -> identity restored, but return keeps it explicit)."""
+    c00 = [Vec(fx.memref_load_vec(r)) for r in acc00]
+    c01 = [Vec(fx.memref_load_vec(r)) for r in acc01]
+    c10 = [Vec(fx.memref_load_vec(r)) for r in acc10]
+    c11 = [Vec(fx.memref_load_vec(r)) for r in acc11]
+    # Scale software-pipelining: the E8M0 sa/sb for tile base_k load in the prologue, and
+    # each iter prefetches the NEXT tile's scales while MMA-ing with the current ones -> the
+    # scale S2R latency hides behind the 4 MFMAs (this, not the SSA accumulator, is what
+    # lifts var-K MFMA util toward the dense-NT sibling's). The last iter over-prefetches
+    # tile base_k+chunk's scale (loaded into sa0n/sa1n, never MMA'd -> harmless).
+    sa0 = sa_s2r.load(sa_base0, ks0 + base_k)
+    sa1 = sa_s2r.load(sa_base1, ks0 + base_k)
+    sb_all = sb_s2r.load(sb_base0, ks0 + base_k)
     sb0, sb1 = sb_all[0:2], sb_all[2:4]
-    for k in range_constexpr(k_fixed - 2):
-        sa0n = sa_s2r.load(sa_base0, ks0 + k + 1)
-        b0_frag = b_s2r.load(b_cur0)
-        a0_frag = a_s2r.load(a_cur0)
-        a_g2s.load(a_next1, A1off + (k + 1) * BLOCK_K)
+    for _j in range_constexpr(chunk):
+        k = base_k + _j
+        k1 = k + 1
+        k2 = k + 2
+        sa0n = sa_s2r.load(sa_base0, ks0 + k1)
+        b0 = b_s2r.load(b_cur0)
+        a0 = a_s2r.load(a_cur0)
+        a_g2s.load(a_next1, A1off + k1 * BLOCK_K)
         rocdl.s_barrier()
         rocdl.s_setprio(1)
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
+        c00 = mfma.call(a0, b0, c00, sa0, sb0)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
-        b1_frag = b_s2r.load(b_cur1)
-        b_g2s.load(b_cur0, 0 + (k + 2) * BLOCK_K)
-        sb_alln = sb_s2r.load(sb_base0, ks0 + k + 1)
+        b1 = b_s2r.load(b_cur1)
+        b_g2s.load(b_cur0, 0 + k2 * BLOCK_K)
+        sb_alln = sb_s2r.load(sb_base0, ks0 + k1)
         rocdl.s_barrier()
         rocdl.s_setprio(1)
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
+        c01 = mfma.call(a0, b1, c01, sa0, sb1)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
-        a1_frag = a_s2r.load(a_cur1)
-        a_g2s.load(a_cur0, 0 + (k + 2) * BLOCK_K)
-        sa1n = sa_s2r.load(sa_base1, ks0 + k + 1)
+        a1 = a_s2r.load(a_cur1)
+        a_g2s.load(a_cur0, 0 + k2 * BLOCK_K)
+        sa1n = sa_s2r.load(sa_base1, ks0 + k1)
         rocdl.s_barrier()
         rocdl.s_setprio(1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
+        c10 = mfma.call(a1, b0, c10, sa1, sb0)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
-        b_g2s.load(b_cur1, B1off + (k + 2) * BLOCK_K)
+        b_g2s.load(b_cur1, B1off + k2 * BLOCK_K)
         wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
         rocdl.s_setprio(1)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
+        c11 = mfma.call(a1, b1, c11, sa1, sb1)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
         a_cur0, a_next0 = a_next0, a_cur0
@@ -207,67 +220,12 @@ def _wgrad_fast_path(
         sa0, sa1 = sa0n, sa1n
         sb_all = sb_alln
         sb0, sb1 = sb_all[0:2], sb_all[2:4]
-    # Step k_fixed-2 (prefetch the last iter's scales; no more cur-refill).
-    sa0n = sa_s2r.load(sa_base0, ks0 + k_fixed - 1)
-    sa1n = sa_s2r.load(sa_base1, ks0 + k_fixed - 1)
-    sb_alln = sb_s2r.load(sb_base0, ks0 + k_fixed - 1)
-    b0_frag = b_s2r.load(b_cur0)
-    a0_frag = a_s2r.load(a_cur0)
-    rocdl.s_barrier()
-    rocdl.s_setprio(1)
-    c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
-    rocdl.s_setprio(0)
-    rocdl.s_barrier()
-    b1_frag = b_s2r.load(b_cur1)
-    rocdl.s_barrier()
-    rocdl.s_setprio(1)
-    c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
-    rocdl.s_setprio(0)
-    rocdl.s_barrier()
-    a1_frag = a_s2r.load(a_cur1)
-    a_g2s.load(a_next1, A1off + (k_fixed - 1) * BLOCK_K)
-    rocdl.s_barrier()
-    rocdl.s_setprio(1)
-    c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
-    rocdl.s_setprio(0)
-    rocdl.s_barrier()
-    b0_frag = b_s2r.load(b_next0)
-    rocdl.s_barrier()
-    rocdl.s_setprio(1)
-    c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
-    rocdl.s_setprio(0)
-    rocdl.s_barrier()
-    a_cur0, a_next0 = a_next0, a_cur0
-    a_cur1, a_next1 = a_next1, a_cur1
-    b_cur0, b_next0 = b_next0, b_cur0
-    b_cur1, b_next1 = b_next1, b_cur1
-    sa0, sa1 = sa0n, sa1n
-    sb_all = sb_alln
-    sb0, sb1 = sb_all[0:2], sb_all[2:4]
-    # Step k_fixed-1 (final).
-    a0_frag = a_s2r.load(a_cur0)
-    wait_barrier(0)
-    rocdl.s_setprio(1)
-    c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
-    rocdl.s_setprio(0)
-    rocdl.s_barrier()
-    b1_frag = b_s2r.load(b_cur1)
-    rocdl.s_barrier()
-    rocdl.s_setprio(1)
-    c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
-    rocdl.s_setprio(0)
-    rocdl.s_barrier()
-    a1_frag = a_s2r.load(a_cur1)
-    rocdl.s_barrier()
-    rocdl.s_setprio(1)
-    c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
-    c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
-    rocdl.s_setprio(0)
-    rocdl.s_barrier()
-    store_c.store(c00_frag, base_row + 0, base_col + 0)
-    store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-    store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-    store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+    for _i in range_constexpr(N_ACCUMS):
+        fx.memref_store_vec(c00[_i], acc00[_i])
+        fx.memref_store_vec(c01[_i], acc01[_i])
+        fx.memref_store_vec(c10[_i], acc10[_i])
+        fx.memref_store_vec(c11[_i], acc11[_i])
+    return a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1
 
 
 def _build_grouped_preshuffle_kernel(K128: int, G: int, N: int, KT: int = _PRESHUF_KT, BLK: int = 256):
@@ -977,7 +935,6 @@ def _build_grouped_mxfp8_wgrad_kernel(
     blgp: int = 0,
     out_fp16: bool = False,
     chunk: int = 8,
-    k_fixed: int = -1,
 ):
     """Grouped MXFP8 variable-K wgrad. grid = TOTAL = G * TILES(OUT_M, OUT_N)
     (compile-time, non-persistent one-tile/WG -> no device scan/guard). The
@@ -1098,10 +1055,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
             sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
             sb_base0 = b_row + wave_n_offset
 
-            # Accumulators are allocated per-path below (compile-time k_fixed branch):
-            # the uniform-K fast body uses SSA register-carried frags (like dense NT),
-            # the variable-K path uses in-place memref rmem (a runtime scf.for cannot
-            # loop-carry a Python list). Only ONE path is traced, so no register doubling.
+            # Accumulators (rmem) are allocated just before the K-loop below.
 
             # Prologue: tile 0 -> cur, tile 1 -> next (a_next1 streamed in the body's
             # first iter, matching the tensorwise wgrad distance-2 prelude). Over-read
@@ -1121,63 +1075,63 @@ def _build_grouped_mxfp8_wgrad_kernel(
             base_row = group_idx * OUT_M + a_row + wave_m_offset
             base_col = b_row + wave_n_offset
 
-            if const_expr(k_fixed >= 2):
-                # ===== Uniform-K specialization (COMPILE-TIME split; NOT a runtime branch).
-                # k_fixed>=2 means the host detected every group's k_iters == k_fixed for
-                # THIS launch (see host wrapper: offs read per eager call, capture reuses
-                # the cached value). const_expr => only this fast body is traced, so it is
-                # a fast-ONLY kernel with no memref accumulators anywhere => no register
-                # doubling. A non-uniform launch is dispatched by the host to the k_fixed=-1
-                # kernel instead (different compile key), so the fast body is never fed a
-                # group whose k != k_fixed. _wgrad_fast_path is a module-level fn => the
-                # fully-unrolled range_constexpr K-loop lives outside the dynamic-control
-                # AST-rewrite (which only fires inside the kernel body). =====
-                _wgrad_fast_path(
-                    k_fixed, ks0, BLOCK_K, A1off, B1off,
+            # rmem accumulators carry across the dynamic chunk loop via MEMORY (a dynamic
+            # scf.for can only loop-carry single MLIR values, not the Python accumulator
+            # list). Zero-init once. Universal — NO uniform-K / balance detection anywhere.
+            acc00 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range_constexpr(N_ACCUMS)]
+            acc01 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range_constexpr(N_ACCUMS)]
+            acc10 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range_constexpr(N_ACCUMS)]
+            acc11 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range_constexpr(N_ACCUMS)]
+            for q in (acc00, acc01, acc10, acc11):
+                for r in q:
+                    fx.memref_store_vec(mfma.zero_value, r)
+
+            # MAIN: every FULL chunk (k_iters//chunk of them) runs the SSA-accumulator body
+            # -- memref RMW only at the chunk boundary, not per-MMA -> ~chunk x less RMW,
+            # killing the accumulator dependency chain that pinned var-K MFMA util to ~45%.
+            # The outer loop is dynamic; its body is a single fn call whose only loop-carried
+            # values are the 8 swapped buffer refs (never the accumulator list).
+            _nfull = k_iters // chunk
+            for _c in range(_nfull):
+                (a_cur0, a_cur1, b_cur0, b_cur1,
+                 a_next0, a_next1, b_next0, b_next1) = _wgrad_ssa_chunk(
+                    _c * chunk, chunk, ks0, BLOCK_K, A1off, B1off,
                     a_g2s, b_g2s, a_s2r, b_s2r, sa_s2r, sb_s2r, mfma,
                     a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1,
+                    acc00, acc01, acc10, acc11,
                     sa_base0, sa_base1, sb_base0, N_ACCUMS, N_LDS_STEPS_A, N_LDS_STEPS_B,
-                    store_c, base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N,
                 )
-            else:
-                # ===== Variable-K baseline (memref rmem accumulators, inline so the dynamic
-                # chunked scf.for is AST-rewritten). A runtime scf.for cannot loop-carry a
-                # Python list, so the 2x2 accumulators live in in-place rmem. Per-tile
-                # (k_abs<k_iters) guard prevents over-run MMA of the next group's tokens
-                # ([OUT,M_total] token-inner -> a flat SRD num_records can't isolate
-                # token<m_end per row). =====
-                acc00 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range_constexpr(N_ACCUMS)]
-                acc01 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range_constexpr(N_ACCUMS)]
-                acc10 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range_constexpr(N_ACCUMS)]
-                acc11 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range_constexpr(N_ACCUMS)]
-                for q in (acc00, acc01, acc10, acc11):
-                    for r in q:
-                        fx.memref_store_vec(mfma.zero_value, r)
-                _nchunks = (k_iters + (chunk - 1)) // chunk
-                for _c in range(_nchunks):
-                    for _j in range_constexpr(chunk):
-                        k_abs = _c * chunk + _j
-                        if k_abs < k_iters:
-                            _wgrad_mx_body_4buf(
-                                k_abs, ks0, BLOCK_K, A1off, B1off,
-                                a_g2s, b_g2s, a_s2r, b_s2r, sa_s2r, sb_s2r, mfma,
-                                a_cur0, a_cur1, b_cur0, b_cur1,
-                                a_next0, a_next1, b_next0, b_next1,
-                                acc00, acc01, acc10, acc11,
-                                sa_base0, sa_base1, sb_base0, N_LDS_STEPS_A, N_LDS_STEPS_B,
-                            )
-                        a_cur0, a_next0 = a_next0, a_cur0
-                        a_cur1, a_next1 = a_next1, a_cur1
-                        b_cur0, b_next0 = b_next0, b_cur0
-                        b_cur1, b_next1 = b_next1, b_cur1
-                c00_frag = [Vec(fx.memref_load_vec(r)) for r in acc00]
-                c01_frag = [Vec(fx.memref_load_vec(r)) for r in acc01]
-                c10_frag = [Vec(fx.memref_load_vec(r)) for r in acc10]
-                c11_frag = [Vec(fx.memref_load_vec(r)) for r in acc11]
-                store_c.store(c00_frag, base_row + 0, base_col + 0)
-                store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-                store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-                store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+
+            # TAIL: the k_iters%chunk remainder tiles, per-tile (k_abs<k_iters) guarded,
+            # plain memref body. The guard blocks over-run MMA of the next group's tokens
+            # ([OUT,M_total] token-inner -> a flat SRD can't isolate token<m_end per row).
+            # Buffer refs are threaded explicitly out of the main loop, so chunk parity is
+            # irrelevant to correctness.
+            _tail0 = _nfull * chunk
+            for _j in range_constexpr(chunk):
+                k_abs = _tail0 + _j
+                if k_abs < k_iters:
+                    _wgrad_mx_body_4buf(
+                        k_abs, ks0, BLOCK_K, A1off, B1off,
+                        a_g2s, b_g2s, a_s2r, b_s2r, sa_s2r, sb_s2r, mfma,
+                        a_cur0, a_cur1, b_cur0, b_cur1,
+                        a_next0, a_next1, b_next0, b_next1,
+                        acc00, acc01, acc10, acc11,
+                        sa_base0, sa_base1, sb_base0, N_LDS_STEPS_A, N_LDS_STEPS_B,
+                    )
+                a_cur0, a_next0 = a_next0, a_cur0
+                a_cur1, a_next1 = a_next1, a_cur1
+                b_cur0, b_next0 = b_next0, b_cur0
+                b_cur1, b_next1 = b_next1, b_cur1
+
+            c00_frag = [Vec(fx.memref_load_vec(r)) for r in acc00]
+            c01_frag = [Vec(fx.memref_load_vec(r)) for r in acc01]
+            c10_frag = [Vec(fx.memref_load_vec(r)) for r in acc10]
+            c11_frag = [Vec(fx.memref_load_vec(r)) for r in acc11]
+            store_c.store(c00_frag, base_row + 0, base_col + 0)
+            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
         _do_tile(pid)
 
@@ -1186,17 +1140,16 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
 # ── wgrad host wrapper ───────────────────────────────────────────────────────
 
-_GWG_FUSED_CACHE: dict = {}   # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, k_fixed) -> launch
+_GWG_FUSED_CACHE: dict = {}   # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16) -> launch
 _GWG_WS_CACHE: dict = {}      # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
 _GWG_AT_CACHE: dict = {}      # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16) -> [raw, compiled]
-_GWG_KFIXED_CACHE: dict = {}  # at_key -> baked uniform-K (host-read offs once/shape; capture-safe)
 
 
-def _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, k_fixed=-1):
+def _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16):
     pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N)
     gemm_kern, BM, BN, wpe, TOTAL = _build_grouped_mxfp8_wgrad_kernel(
         OUT_M=OUT_M, OUT_N=OUT_N, G=G, BLOCK_M=bm, BLOCK_N=bn, group_m=gm, group_n=gn,
-        num_xcd=xcd, cbsz=cbsz, blgp=blgp, out_fp16=out_fp16, k_fixed=k_fixed,
+        num_xcd=xcd, cbsz=cbsz, blgp=blgp, out_fp16=out_fp16,
     )
 
     @flyc.jit
@@ -1285,37 +1238,17 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     pre_grid = a_blocks + b_ngrp * n_kt
 
     bm, bn, gm, xcd, gn = 256, 256, 4, 8, 0
-    # Uniform-K specialization: if EVERY group's padded token count gives the same
-    # per-group k_iters (>=2), bake it as compile-time k_fixed -> a fast-ONLY kernel with
-    # the NT-style fully-unrolled SSA + scale-prefetch body (~61% MFMA util), vs the
-    # memref variable-K baseline (k_fixed=-1). Derived from the ACTUAL per-group offsets
-    # (m_total includes trailing buffer padding, so m_total//G//128 over-counts).
-    #
-    # A given (OUT,OUT,M_total,G,...) shape can carry DIFFERENT token distributions across
-    # calls (and different distributions collide on M_total), so uniformity is detected
-    # per EAGER call from the offs (a tiny G+1 host read) -> a ragged launch picks the -1
-    # baseline kernel, a uniform one the fast kernel. k_fixed keys BOTH the compile cache
-    # AND the eager/capture launch entry. Under capture the host read is illegal, so the
-    # value cached at warmup is reused (a captured graph replays a fixed distribution).
-    _kf_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16)
-    _kf_override = os.environ.get("GWG_KFIXED")
-    if _kf_override is not None:
-        k_fixed = int(_kf_override)
-    elif torch.cuda.is_current_stream_capturing():
-        k_fixed = _GWG_KFIXED_CACHE.get(_kf_key, -1)
-    else:
-        _o = _go.detach().to("cpu").tolist()
-        _ki = [(_o[i + 1] - _o[i]) // 128 for i in range(G)]
-        k_fixed = _ki[0] if (len(set(_ki)) == 1 and _ki[0] >= 2) else -1
-        _GWG_KFIXED_CACHE[_kf_key] = k_fixed
-    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, k_fixed)
+    # Single universal variable-K kernel: chunk-local SSA accumulation (see kernel body /
+    # _wgrad_ssa_chunk) gives NT-class MFMA util for ANY per-group k_iters distribution.
+    # NO uniformity / balance detection anywhere -> no offs host read, capture-clean.
+    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16)
     launch = _GWG_FUSED_CACHE.get(fk)
     if launch is None:
-        launch = _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, k_fixed)
+        launch = _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16)
         _GWG_FUSED_CACHE[fk] = launch
 
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
-    at_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16, k_fixed)
+    at_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16)
     entry = _GWG_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]
