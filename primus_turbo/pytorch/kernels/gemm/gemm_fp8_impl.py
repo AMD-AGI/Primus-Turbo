@@ -395,15 +395,24 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
                 a, a_scale_inv.view(torch.uint8), b, b_scale_inv.view(torch.uint8), out_dtype=out_dtype
             )
             return out.t().contiguous() if trans_c else out
+
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scale_inv, rhs_scale_inv = b_scale_inv, a_scale_inv
+            trans_lhs, trans_rhs = (not trans_b), (not trans_a)
+        else:
+            lhs, rhs = a, b
+            lhs_scale_inv, rhs_scale_inv = a_scale_inv, b_scale_inv
+            trans_lhs, trans_rhs = trans_a, trans_b
         return gemm_fp8_tensorwise_flydsl_kernel(
-            a,
-            a_scale_inv,
-            b,
-            b_scale_inv,
-            trans_a=trans_a,
-            trans_b=trans_b,
+            lhs,
+            lhs_scale_inv,
+            rhs,
+            rhs_scale_inv,
+            trans_a=trans_lhs,
+            trans_b=trans_rhs,
             out_dtype=out_dtype,
-            trans_c=trans_c,
+            trans_c=False,
         )
 
 
