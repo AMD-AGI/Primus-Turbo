@@ -90,12 +90,35 @@ def _wgrad_mx_accum(mfma, a_frags, b_frags, acc_regs, sa, sb):
 
 
 def _wgrad_mx_body_4buf(
-    k, ks0, BLOCK_K, A1off, B1off,
-    a_g2s, b_g2s, a_s2r, b_s2r, sa_s2r, sb_s2r, mfma,
-    a_cur0, a_cur1, b_cur0, b_cur1,
-    a_next0, a_next1, b_next0, b_next1,
-    acc00, acc01, acc10, acc11,
-    sa_base0, sa_base1, sb_base0, NA, NB,
+    k,
+    ks0,
+    BLOCK_K,
+    A1off,
+    B1off,
+    a_g2s,
+    b_g2s,
+    a_s2r,
+    b_s2r,
+    sa_s2r,
+    sb_s2r,
+    mfma,
+    a_cur0,
+    a_cur1,
+    b_cur0,
+    b_cur1,
+    a_next0,
+    a_next1,
+    b_next0,
+    b_next1,
+    acc00,
+    acc01,
+    acc10,
+    acc11,
+    sa_base0,
+    sa_base1,
+    sb_base0,
+    NA,
+    NB,
 ):
     """One K-tile of the wgrad's capacity-free chunked distance-2 4-buffer pipeline
     (port of the tensorwise ``_wgrad_body_4buf`` + this kernel's dense-MX scale path).
@@ -146,11 +169,37 @@ def _wgrad_mx_body_4buf(
 
 
 def _wgrad_ssa_chunk(
-    base_k, chunk, ks0, BLOCK_K, A1off, B1off,
-    a_g2s, b_g2s, a_s2r, b_s2r, sa_s2r, sb_s2r, mfma,
-    a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1,
-    acc00, acc01, acc10, acc11,
-    sa_base0, sa_base1, sb_base0, N_ACCUMS, N_LDS_STEPS_A, N_LDS_STEPS_B,
+    base_k,
+    chunk,
+    ks0,
+    BLOCK_K,
+    A1off,
+    B1off,
+    a_g2s,
+    b_g2s,
+    a_s2r,
+    b_s2r,
+    sa_s2r,
+    sb_s2r,
+    mfma,
+    a_cur0,
+    a_cur1,
+    b_cur0,
+    b_cur1,
+    a_next0,
+    a_next1,
+    b_next0,
+    b_next1,
+    acc00,
+    acc01,
+    acc10,
+    acc11,
+    sa_base0,
+    sa_base1,
+    sb_base0,
+    N_ACCUMS,
+    N_LDS_STEPS_A,
+    N_LDS_STEPS_B,
 ):
     """One FULL constexpr chunk (`chunk` tiles from base_k) of the wgrad K-loop, with
     the 2x2 accumulators held in **SSA registers** across the chunk instead of the
@@ -262,9 +311,7 @@ def _build_grouped_preshuffle_kernel(K128: int, G: int, N: int, KT: int = _PRESH
         tid = fx.thread_idx.x
         tile = fx.SharedAllocator().allocate(Smem).peek().tile
         rin_a = _buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=m_pad * K128 * 4)
-        rin_b = _buffer_ops.create_buffer_resource(
-            b_raw, max_size=False, num_records_bytes=G * N * K128 * 4
-        )
+        rin_b = _buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=G * N * K128 * 4)
         rout_a = _buffer_ops.create_buffer_resource(
             a_sp, max_size=False, num_records_bytes=a_ngrp * K128 * 256 * 4
         )
@@ -272,7 +319,9 @@ def _build_grouped_preshuffle_kernel(K128: int, G: int, N: int, KT: int = _PRESH
             b_sp, max_size=False, num_records_bytes=G * _b_slab_i32 * 4
         )
         if bid < a_blocks:
-            _emit_lds_repack(True, bid // n_kt, (bid % n_kt) * KT, tile, rin_a, rout_a, m_pad, K128, KT, tid, BLK)
+            _emit_lds_repack(
+                True, bid // n_kt, (bid % n_kt) * KT, tile, rin_a, rout_a, m_pad, K128, KT, tid, BLK
+            )
         if bid >= a_blocks:
             bb = bid - a_blocks
             g = bb // b_blocks_pg
@@ -280,8 +329,19 @@ def _build_grouped_preshuffle_kernel(K128: int, G: int, N: int, KT: int = _PRESH
             grp = loc // n_kt
             k0 = (loc % n_kt) * KT
             _emit_lds_repack(
-                False, grp, k0, tile, rin_b, rout_b, fx.Int32(N), K128, KT, tid, BLK,
-                rd_base=g * (N * K128), wr_base=g * _b_slab_i32,
+                False,
+                grp,
+                k0,
+                tile,
+                rin_b,
+                rout_b,
+                fx.Int32(N),
+                K128,
+                KT,
+                tid,
+                BLK,
+                rd_base=g * (N * K128),
+                wr_base=g * _b_slab_i32,
             )
 
     return kern, n_kt, b_blocks_pg
@@ -342,9 +402,9 @@ def _build_grouped_mxfp8_nt_kernel(
         C: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
-        group_offs: fx.Tensor,      # padded read offsets (int32 view of int64 [G+1])
+        group_offs: fx.Tensor,  # padded read offsets (int32 view of int64 [G+1])
         group_offs_out: fx.Tensor,  # tight write offsets (int32 view of int64 [G+1])
-        c_m_pad: fx.Int32,          # padded M (A rows) -> A-scale buffer sizing
+        c_m_pad: fx.Int32,  # padded M (A rows) -> A-scale buffer sizing
         c_n: fx.Int32,
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
@@ -395,9 +455,9 @@ def _build_grouped_mxfp8_nt_kernel(
                 cum = nc
                 p2 = nx
 
-            m_start = _load_go(go_out_div, group_idx)       # tight C base
-            m_end = _load_go(go_out_div, group_idx + 1)     # tight C end (store bound)
-            m_start_pad = _load_go(go_pad_div, group_idx)   # padded A / A-scale base
+            m_start = _load_go(go_out_div, group_idx)  # tight C base
+            m_end = _load_go(go_out_div, group_idx + 1)  # tight C end (store bound)
+            m_start_pad = _load_go(go_pad_div, group_idx)  # padded A / A-scale base
             m_total_pad = _load_go(go_pad_div, G)
             local = tt - tile_start
             local_block_m, block_n = _grouped_block_mn(
@@ -602,10 +662,10 @@ def _build_grouped_mxfp8_nt_kernel(
 
 # ── Host wrapper ─────────────────────────────────────────────────────────────
 
-_GNT_FUSED_CACHE: dict = {}   # (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persist) -> launch
-_GNT_WS_CACHE: dict = {}      # (M_pad, N, K128, G, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp)
-_GNT_AT_CACHE: dict = {}      # (M_pad, N, K, G, cbsz, blgp, out_fp16, persist) -> [raw, compiled]
-_GNT_CFG_CACHE: dict = {}     # at_key -> (bm, gm, xcd, gn) chosen by autotune
+_GNT_FUSED_CACHE: dict = {}  # (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persist) -> launch
+_GNT_WS_CACHE: dict = {}  # (M_pad, N, K128, G, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp)
+_GNT_AT_CACHE: dict = {}  # (M_pad, N, K, G, cbsz, blgp, out_fp16, persist) -> [raw, compiled]
+_GNT_CFG_CACHE: dict = {}  # at_key -> (bm, gm, xcd, gn) chosen by autotune
 
 # fwd/dgrad NT autotune — modelled on the TENSORWISE GROUPED gemm autotune
 # (_autotune_np_dispatch in gemm_fp8_grouped_kernel.py), NOT the dense one: grouped
@@ -633,9 +693,9 @@ def _gnt_nt_candidates(N):
     — measured, not the TW kernel's set (grouped MX prefers a different swizzle than the
     TW grouped / dense kernels). 2D N-bands only when there are >= 2*gn 256-col N-blocks."""
     cands = [
-        (256, 4, 4, 0),   # base ref (current default)
+        (256, 4, 4, 0),  # base ref (current default)
         (256, 8, 4, 0),
-        (256, 1, 4, 0),   # gm=1, xcd=4 — wins several MX MoE shapes
+        (256, 1, 4, 0),  # gm=1, xcd=4 — wins several MX MoE shapes
         (256, 8, 8, 0),
         (256, 4, 8, 0),
     ]
@@ -734,8 +794,18 @@ def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp
     K128 = K // 128
     pre_kern, n_kt, b_blocks_pg = _build_grouped_preshuffle_kernel(K128, G, N)
     gemm_kern, BM, BN, wpe = _build_grouped_mxfp8_nt_kernel(
-        K=K, G=G, N=N, BLOCK_M=bm, BLOCK_N=_BLOCK_N, group_m=gm, group_n=gn,
-        num_xcd=xcd, cbsz=cbsz, blgp=blgp, out_fp16=out_fp16, persistent=persistent,
+        K=K,
+        G=G,
+        N=N,
+        BLOCK_M=bm,
+        BLOCK_N=_BLOCK_N,
+        group_m=gm,
+        group_n=gn,
+        num_xcd=xcd,
+        cbsz=cbsz,
+        blgp=blgp,
+        out_fp16=out_fp16,
+        persistent=persistent,
     )
 
     @flyc.jit
@@ -765,7 +835,15 @@ def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp
         else:
             grid_x = grid_upper
         gemm_kern(
-            a8, b8, C, a_sp, b_sp, group_offs, group_offs_out, c_m_pad, c_n,
+            a8,
+            b8,
+            C,
+            a_sp,
+            b_sp,
+            group_offs,
+            group_offs_out,
+            c_m_pad,
+            c_n,
             value_attrs=make_value_attrs(wpe, 0, "512,512"),
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
 
@@ -792,10 +870,10 @@ def grouped_gemm_mxfp8_flydsl_kernel(
     a_scale: "torch.Tensor",
     b: "torch.Tensor",
     b_scale: "torch.Tensor",
-    group_offs: "torch.Tensor",       # padded read offsets [G+1]
+    group_offs: "torch.Tensor",  # padded read offsets [G+1]
     N: int,
     K: int,
-    group_offs_out: "torch.Tensor",   # tight write offsets [G+1]
+    group_offs_out: "torch.Tensor",  # tight write offsets [G+1]
     out_dtype: torch.dtype = torch.bfloat16,
     num_cu: "int | None" = -1,
 ) -> "torch.Tensor":
@@ -831,8 +909,21 @@ def grouped_gemm_mxfp8_flydsl_kernel(
 
     persistent = num_cu is not None and num_cu > 0
     args = (
-        a8, b8, out, a_raw, b_raw, a_sp, b_sp, go_pad, go_out,
-        M_pad, N, a_blocks, a_ngrp, grid_upper, stream,
+        a8,
+        b8,
+        out,
+        a_raw,
+        b_raw,
+        a_sp,
+        b_sp,
+        go_pad,
+        go_out,
+        M_pad,
+        N,
+        a_blocks,
+        a_ngrp,
+        grid_upper,
+        stream,
     )
     # BLOCK_M fixed at 256 (bm=128 needs an nt=2 A-scale preshuffle layout, not built).
     # The (gm, xcd, gn) schedule is autotuned per shape (PT_MXGG_AUTOTUNE=0 → default
@@ -889,9 +980,9 @@ def _build_grouped_wgrad_preshuffle_kernel(OUT_M: int, OUT_N: int, KT: int = _PR
         b_raw: fx.Tensor,
         a_sp: fx.Tensor,
         b_sp: fx.Tensor,
-        k128: fx.Int32,       # contraction blocks = M_total // 128
-        n_kt: fx.Int32,       # ceildiv(k128, KT)
-        a_blocks: fx.Int32,   # a_ngrp * n_kt
+        k128: fx.Int32,  # contraction blocks = M_total // 128
+        n_kt: fx.Int32,  # ceildiv(k128, KT)
+        a_blocks: fx.Int32,  # a_ngrp * n_kt
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -976,13 +1067,13 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_grouped_mxfp8_wgrad(
-        A: fx.Tensor,        # LHS [OUT_M, M_total] fp8
-        B: fx.Tensor,        # RHS [OUT_N, M_total] fp8
-        C: fx.Tensor,        # [G, OUT_M, OUT_N]
+        A: fx.Tensor,  # LHS [OUT_M, M_total] fp8
+        B: fx.Tensor,  # RHS [OUT_N, M_total] fp8
+        C: fx.Tensor,  # [G, OUT_M, OUT_N]
         A_scale: fx.Tensor,  # preshuffled LHS scale (layout 1)
         B_scale: fx.Tensor,  # preshuffled RHS scale (B-comb layout 3)
         group_offs: fx.Tensor,  # padded per-group M offsets (int32 view of int64 [G+1])
-        m_total: fx.Int32,       # total padded contraction length (LHS/RHS leading dim)
+        m_total: fx.Int32,  # total padded contraction length (LHS/RHS leading dim)
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
@@ -998,8 +1089,8 @@ def _build_grouped_mxfp8_wgrad_kernel(
             )
             m_start = _load_go(go_div, group_idx)
             m_end = _load_go(go_div, group_idx + 1)
-            k_iters = (m_end - m_start) // BLOCK_K   # runtime; M_g padded to 128 -> exact
-            ks0 = m_start // BLOCK_K                  # scale K128-block base for this group
+            k_iters = (m_end - m_start) // BLOCK_K  # runtime; M_g padded to 128 -> exact
+            ks0 = m_start // BLOCK_K  # scale K128-block base for this group
 
             lane_id = fx.thread_idx.x % 64
             wave_id = fx.thread_idx.x // 64
@@ -1034,7 +1125,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
             gl_off_a = compute_global_swizzle(lane_id, wave_id, m_total, N_LDS_ROUNDS, preshuffled=False)
             gl_off_b = compute_global_swizzle(lane_id, wave_id, m_total, N_LDS_ROUNDS, preshuffled=False)
 
-            A1off = LDS_BLOCK_M * m_total   # region1 = OUT_M rows [LDS_BLOCK_M, BLOCK_M)
+            A1off = LDS_BLOCK_M * m_total  # region1 = OUT_M rows [LDS_BLOCK_M, BLOCK_M)
             B1off = LDS_BLOCK_N * m_total
 
             mfma = MfmaScale16x16x128(N_TILES_A, N_TILES_B, cbsz=cbsz, blgp=blgp)
@@ -1093,13 +1184,38 @@ def _build_grouped_mxfp8_wgrad_kernel(
             # values are the 8 swapped buffer refs (never the accumulator list).
             _nfull = k_iters // chunk
             for _c in range(_nfull):
-                (a_cur0, a_cur1, b_cur0, b_cur1,
-                 a_next0, a_next1, b_next0, b_next1) = _wgrad_ssa_chunk(
-                    _c * chunk, chunk, ks0, BLOCK_K, A1off, B1off,
-                    a_g2s, b_g2s, a_s2r, b_s2r, sa_s2r, sb_s2r, mfma,
-                    a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1,
-                    acc00, acc01, acc10, acc11,
-                    sa_base0, sa_base1, sb_base0, N_ACCUMS, N_LDS_STEPS_A, N_LDS_STEPS_B,
+                (a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1) = _wgrad_ssa_chunk(
+                    _c * chunk,
+                    chunk,
+                    ks0,
+                    BLOCK_K,
+                    A1off,
+                    B1off,
+                    a_g2s,
+                    b_g2s,
+                    a_s2r,
+                    b_s2r,
+                    sa_s2r,
+                    sb_s2r,
+                    mfma,
+                    a_cur0,
+                    a_cur1,
+                    b_cur0,
+                    b_cur1,
+                    a_next0,
+                    a_next1,
+                    b_next0,
+                    b_next1,
+                    acc00,
+                    acc01,
+                    acc10,
+                    acc11,
+                    sa_base0,
+                    sa_base1,
+                    sb_base0,
+                    N_ACCUMS,
+                    N_LDS_STEPS_A,
+                    N_LDS_STEPS_B,
                 )
 
             # TAIL: the k_iters%chunk remainder tiles, per-tile (k_abs<k_iters) guarded,
@@ -1112,12 +1228,35 @@ def _build_grouped_mxfp8_wgrad_kernel(
                 k_abs = _tail0 + _j
                 if k_abs < k_iters:
                     _wgrad_mx_body_4buf(
-                        k_abs, ks0, BLOCK_K, A1off, B1off,
-                        a_g2s, b_g2s, a_s2r, b_s2r, sa_s2r, sb_s2r, mfma,
-                        a_cur0, a_cur1, b_cur0, b_cur1,
-                        a_next0, a_next1, b_next0, b_next1,
-                        acc00, acc01, acc10, acc11,
-                        sa_base0, sa_base1, sb_base0, N_LDS_STEPS_A, N_LDS_STEPS_B,
+                        k_abs,
+                        ks0,
+                        BLOCK_K,
+                        A1off,
+                        B1off,
+                        a_g2s,
+                        b_g2s,
+                        a_s2r,
+                        b_s2r,
+                        sa_s2r,
+                        sb_s2r,
+                        mfma,
+                        a_cur0,
+                        a_cur1,
+                        b_cur0,
+                        b_cur1,
+                        a_next0,
+                        a_next1,
+                        b_next0,
+                        b_next1,
+                        acc00,
+                        acc01,
+                        acc10,
+                        acc11,
+                        sa_base0,
+                        sa_base1,
+                        sb_base0,
+                        N_LDS_STEPS_A,
+                        N_LDS_STEPS_B,
                     )
                 a_cur0, a_next0 = a_next0, a_cur0
                 a_cur1, a_next1 = a_next1, a_cur1
@@ -1140,16 +1279,25 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
 # ── wgrad host wrapper ───────────────────────────────────────────────────────
 
-_GWG_FUSED_CACHE: dict = {}   # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16) -> launch
-_GWG_WS_CACHE: dict = {}      # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
-_GWG_AT_CACHE: dict = {}      # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16) -> [raw, compiled]
+_GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16) -> launch
+_GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
+_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16) -> [raw, compiled]
 
 
 def _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16):
     pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N)
     gemm_kern, BM, BN, wpe, TOTAL = _build_grouped_mxfp8_wgrad_kernel(
-        OUT_M=OUT_M, OUT_N=OUT_N, G=G, BLOCK_M=bm, BLOCK_N=bn, group_m=gm, group_n=gn,
-        num_xcd=xcd, cbsz=cbsz, blgp=blgp, out_fp16=out_fp16,
+        OUT_M=OUT_M,
+        OUT_N=OUT_N,
+        G=G,
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        group_m=gm,
+        group_n=gn,
+        num_xcd=xcd,
+        cbsz=cbsz,
+        blgp=blgp,
+        out_fp16=out_fp16,
     )
 
     @flyc.jit
@@ -1173,7 +1321,13 @@ def _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbs
             grid=(pre_grid, 1, 1), block=(_PRESHUF_BLK, 1, 1), stream=stream
         )
         gemm_kern(
-            a8, b8, C, a_sp, b_sp, group_offs, m_total,
+            a8,
+            b8,
+            C,
+            a_sp,
+            b_sp,
+            group_offs,
+            m_total,
             value_attrs=make_value_attrs(wpe, 0, "512,512"),
         ).launch(grid=(TOTAL, 1, 1), block=(512, 1, 1), stream=stream)
 
@@ -1198,7 +1352,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     lhs_scale: "torch.Tensor",
     rhs: "torch.Tensor",
     rhs_scale: "torch.Tensor",
-    group_offs: "torch.Tensor",   # padded per-group M offsets [G+1]
+    group_offs: "torch.Tensor",  # padded per-group M offsets [G+1]
     OUT_M: int,
     OUT_N: int,
     G: int,
@@ -1244,7 +1398,9 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16)
     launch = _GWG_FUSED_CACHE.get(fk)
     if launch is None:
-        launch = _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16)
+        launch = _compile_grouped_mxfp8_wgrad_fused(
+            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16
+        )
         _GWG_FUSED_CACHE[fk] = launch
 
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
