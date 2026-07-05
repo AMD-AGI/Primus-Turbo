@@ -52,22 +52,8 @@ def _as_index(v):
     return arith.index(v) if isinstance(v, int) else arith.index_cast(T.index, v)
 
 
-def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
-    # max_size=False (no num_records_bytes): the buffer descriptor adapts to the
-    # actual tensor extent instead of baking the first call's shape into IR.
-    t_i8 = fx.rocdl.make_buffer_tensor(arg_i8, max_size=False)
-    iter_i8 = fx.get_iter(t_i8)
-    f8_buf_ptr_ty = fx.PointerType.get(
-        elem_ty=fp8_ir_t,
-        address_space=TargetAddressSpace.BufferDesc,
-        alignment=fx.PointerType(iter_i8.type).alignment,
-    )
-    iter_f8 = fx.recast_iter(f8_buf_ptr_ty, iter_i8)
-    return fx.Tensor(fx.make_view(iter_f8, fx.get_layout(t_i8)))
-
-
 def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_bytes):
-    """make_fp8_buffer_tensor with the SRD base advanced by ``base_elems`` (fp8/int8
+    """Build an fp8 BufferDesc tensor with the SRD base advanced by ``base_elems`` (fp8/int8
     = 1 byte/elem), in 64-bit. Folds a per-tile huge element offset into the
     descriptor base so the buffer voffset/soffset stay small int32 -> addresses
     inputs > 2^31 elems / > 4GB that the flat-shape pack and 32-bit voffset cannot.
