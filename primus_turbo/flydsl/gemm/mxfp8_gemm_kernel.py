@@ -41,6 +41,8 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     ScaleBComb,
     ScaleS2R,
     _PRESHUF_KT,
+    _SCALE_PACK,
+    scale_opsel,
     _robust_time,
     block_mn,
     build_preshuffle_ab_kernel,
@@ -218,6 +220,7 @@ def _build_mxfp8_nt_kernel(
         sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
         for k in range_constexpr(K_ITERS - 2):
+            mfma.opsel = scale_opsel(k)  # select packed scale byte for K-iter k
             sa0n = sa_s2r.load(sa_base0, k + 1)
 
             b0_frag = b_s2r.load(b_cur0)
@@ -267,6 +270,7 @@ def _build_mxfp8_nt_kernel(
             sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
         # Step k = K_ITERS - 2 (sa*/sb* hold scales[K_ITERS-2]; prefetch last iter)
+        mfma.opsel = scale_opsel(K_ITERS - 2)
         sa0n = sa_s2r.load(sa_base0, K_ITERS - 1)
         sa1n = sa_s2r.load(sa_base1, K_ITERS - 1)
         sb_alln = sb_s2r.load(sb_base0, K_ITERS - 1)
@@ -314,6 +318,7 @@ def _build_mxfp8_nt_kernel(
         sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
         # Step k = K_ITERS - 1 (sa*/sb* already hold scales[K_ITERS-1])
+        mfma.opsel = scale_opsel(K_ITERS - 1)
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
@@ -489,8 +494,9 @@ def _get_mx_workspace(M, N, K128, device, stream):
         a_ngrp = ceildiv(M, 64)
         b_ngrp = ((N + 255) // 256) * 4
         a_blocks = a_ngrp * ceildiv(K128, _PRESHUF_KT)
-        a_sp = torch.empty(a_ngrp * K128 * 256, dtype=torch.int32, device=device)
-        b_sp = torch.empty(b_ngrp * K128 * 256, dtype=torch.int32, device=device)
+        K128p = ceildiv(K128, _SCALE_PACK)  # packed K-groups (PACK scales / dword)
+        a_sp = torch.empty(a_ngrp * K128p * 256, dtype=torch.int32, device=device)
+        b_sp = torch.empty(b_ngrp * K128p * 256, dtype=torch.int32, device=device)
         e = (a_sp, b_sp, a_blocks, a_ngrp, b_ngrp)
         _MXFP8_WS_CACHE[key] = e
     return e

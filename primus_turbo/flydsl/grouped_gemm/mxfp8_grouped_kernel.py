@@ -50,6 +50,8 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     ScaleS2R,
     StoreCPerTensor,
     _PRESHUF_KT,
+    _SCALE_PACK,
+    scale_opsel,
     _emit_lds_repack,
     _lds_barrier,  # noqa: F401  (imported so it is a module global for the kernel)
     _readfirstlane_i32,
@@ -289,9 +291,10 @@ def _build_grouped_preshuffle_kernel(K128: int, G: int, N: int, KT: int = _PRESH
     """
     TILE = 64 * KT  # noqa: F841 (mirrors build_preshuffle_ab_kernel; sized in Smem)
     n_kt = ceildiv(K128, KT)
+    K128p = ceildiv(K128, _SCALE_PACK)  # packed K-groups (PACK scales / dword)
     b_ngrp_pg = ((N + 255) // 256) * 4
     b_blocks_pg = b_ngrp_pg * n_kt
-    _b_slab_i32 = b_ngrp_pg * K128 * 256  # per-group b_sp slab (i32 elems)
+    _b_slab_i32 = b_ngrp_pg * K128p * 256  # per-group b_sp slab (i32 elems, packed)
 
     @fx.struct
     class Smem:
@@ -313,7 +316,7 @@ def _build_grouped_preshuffle_kernel(K128: int, G: int, N: int, KT: int = _PRESH
         rin_a = _buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=m_pad * K128 * 4)
         rin_b = _buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=G * N * K128 * 4)
         rout_a = _buffer_ops.create_buffer_resource(
-            a_sp, max_size=False, num_records_bytes=a_ngrp * K128 * 256 * 4
+            a_sp, max_size=False, num_records_bytes=a_ngrp * K128p * 256 * 4
         )
         rout_b = _buffer_ops.create_buffer_resource(
             b_sp, max_size=False, num_records_bytes=G * _b_slab_i32 * 4
@@ -546,6 +549,7 @@ def _build_grouped_mxfp8_nt_kernel(
             sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
             for k in range_constexpr(K_ITERS - 2):
+                mfma.opsel = scale_opsel(k)  # select packed scale byte for K-iter k
                 sa0n = sa_s2r.load(sa_base0, k + 1)
                 b0_frag = b_s2r.load(b_cur0)
                 a0_frag = a_s2r.load(a_cur0)
@@ -586,6 +590,7 @@ def _build_grouped_mxfp8_nt_kernel(
                 sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
             # Step K_ITERS-2 (prefetch last iter's scales).
+            mfma.opsel = scale_opsel(K_ITERS - 2)
             sa0n = sa_s2r.load(sa_base0, K_ITERS - 1)
             sa1n = sa_s2r.load(sa_base1, K_ITERS - 1)
             sb_alln = sb_s2r.load(sb_base0, K_ITERS - 1, slab=group_idx)
@@ -624,6 +629,7 @@ def _build_grouped_mxfp8_nt_kernel(
             sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
             # Step K_ITERS-1.
+            mfma.opsel = scale_opsel(K_ITERS - 1)
             a0_frag = a_s2r.load(a_cur0)
             wait_barrier(0)
             rocdl.s_setprio(1)
@@ -857,9 +863,10 @@ def _get_grouped_mx_workspace(M_pad, N, K128, G, device, stream):
         a_ngrp = (M_pad + 63) // 64
         b_ngrp_pg = ((N + 255) // 256) * 4
         n_kt = (K128 + _PRESHUF_KT - 1) // _PRESHUF_KT
+        K128p = ceildiv(K128, _SCALE_PACK)  # packed K-groups (PACK scales / dword)
         a_blocks = a_ngrp * n_kt
-        a_sp = torch.empty(a_ngrp * K128 * 256, dtype=torch.int32, device=device)
-        b_sp = torch.empty(G * b_ngrp_pg * K128 * 256, dtype=torch.int32, device=device)
+        a_sp = torch.empty(a_ngrp * K128p * 256, dtype=torch.int32, device=device)
+        b_sp = torch.empty(G * b_ngrp_pg * K128p * 256, dtype=torch.int32, device=device)
         e = (a_sp, b_sp, a_blocks, a_ngrp)
         _GNT_WS_CACHE[key] = e
     return e
@@ -999,14 +1006,39 @@ def _build_grouped_wgrad_preshuffle_kernel(OUT_M: int, OUT_N: int, KT: int = _PR
         rout_b = _buffer_ops.create_buffer_resource(
             b_sp, max_size=False, num_records_bytes=fx.Int32(b_ngrp) * k128 * 256 * 4
         )
+        # wgrad contracts over tokens (m_total); each group starts at a runtime ks0 that is
+        # only 128-aligned (not PACK*128), so k%PACK is not compile-time -> op_sel can't pick
+        # the packed byte. wgrad therefore keeps the unpacked (pack=1) scale layout.
         if bid < a_blocks:
             _emit_lds_repack(
-                True, bid // n_kt, (bid % n_kt) * KT, tile, rin_a, rout_a, fx.Int32(OUT_M), k128, KT, tid, BLK
+                True,
+                bid // n_kt,
+                (bid % n_kt) * KT,
+                tile,
+                rin_a,
+                rout_a,
+                fx.Int32(OUT_M),
+                k128,
+                KT,
+                tid,
+                BLK,
+                pack=1,
             )
         if bid >= a_blocks:
             bb = bid - a_blocks
             _emit_lds_repack(
-                False, bb // n_kt, (bb % n_kt) * KT, tile, rin_b, rout_b, fx.Int32(OUT_N), k128, KT, tid, BLK
+                False,
+                bb // n_kt,
+                (bb % n_kt) * KT,
+                tile,
+                rin_b,
+                rout_b,
+                fx.Int32(OUT_N),
+                k128,
+                KT,
+                tid,
+                BLK,
+                pack=1,
             )
 
     return kern, a_ngrp, b_ngrp
@@ -1134,8 +1166,8 @@ def _build_grouped_mxfp8_wgrad_kernel(
             a_s2r = S2RLoader(wave_m, N_TILES_A)
             b_s2r = S2RLoader(wave_n, N_TILES_B)
 
-            sa_s2r = ScaleS2R(A_scale, OUT_M, m_total, SA_TILES)
-            sb_s2r = ScaleBComb(B_scale, OUT_N, m_total)
+            sa_s2r = ScaleS2R(A_scale, OUT_M, m_total, SA_TILES, pack=1)  # wgrad: unpacked scales
+            sb_s2r = ScaleBComb(B_scale, OUT_N, m_total, pack=1)
             store_c = StoreCPerTensor(
                 None, None, C, (group_idx + 1) * OUT_M, OUT_N, mfma.idx, N_TILES_A, N_TILES_B, _out_ty
             )
@@ -1340,6 +1372,7 @@ def _get_grouped_wgrad_workspace(OUT_M, OUT_N, K128, device, stream):
     if e is None:
         a_ngrp = ceildiv(OUT_M, 64)
         b_ngrp = ((OUT_N + 255) // 256) * 4
+        # wgrad keeps the unpacked (pack=1) scale layout (runtime per-group ks0 offset).
         a_sp = torch.empty(a_ngrp * K128 * 256, dtype=torch.int32, device=device)
         b_sp = torch.empty(b_ngrp * K128 * 256, dtype=torch.int32, device=device)
         e = (a_sp, b_sp)

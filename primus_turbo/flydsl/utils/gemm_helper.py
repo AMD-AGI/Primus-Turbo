@@ -4,6 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -21,6 +23,27 @@ from flydsl.expr.utils.arith import ArithValue
 
 def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+_PRESHUF_KT = 16  # scale-preshuffle k-tile (rows*KT dwords staged in LDS per workgroup)
+
+# E8M0 scale packing factor: PACK consecutive K-iters (each contributing one 32-block scale
+# byte per lane) are packed into ONE preshuffled i32 dword (bytes 0..PACK-1), shrinking the
+# preshuffle WRITE traffic and scale-buffer footprint PACK-fold. The scaled MFMA selects
+# K-iter k's byte via op_sel (= k%PACK, a compile-time immediate) at ZERO extra ALU/register
+# cost in the GEMM hot loop -- the K-loop sets ``mfma.opsel = scale_opsel(k)`` per MMA group.
+# PACK=1 reproduces the old broadcast layout bit-for-bit (byte0=scale). Paths whose K-iter is
+# not compile-time reducible (grouped wgrad: runtime per-group ks0 offset) pass pack=1.
+# Must divide _PRESHUF_KT. Env override for A/B validation only.
+_SCALE_PACK = int(os.environ.get("PT_SCALE_PACK", "4"))
+assert _PRESHUF_KT % _SCALE_PACK == 0
+
+
+def scale_opsel(k):
+    """Scaled-MFMA op_sel selecting packed K-iter ``k``'s E8M0 byte (byte k%PACK of the packed
+    scale dword; same selector for scale_a and scale_b since both share K-iter k). MUST be a
+    compile-time constant (op_sel is an instruction-immediate modifier)."""
+    return k % _SCALE_PACK
 
 
 def _as_index(v):
@@ -267,10 +290,11 @@ class MfmaScale16x16x128:
         self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
-        # asm_mma routes through the inline-asm scaled MFMA (see _asm_mma_scale_do).
-        # opsel picks which of the i32 scale operand's 4 E8M0 bytes the MMA reads; the
-        # FlyDSL scale preshuffle emits the broadcast layout (same byte in all 4), so
-        # opsel stays 0.
+        # asm_mma routes through the inline-asm scaled MFMA (see _asm_mma_scale_do). opsel
+        # picks which of the scale dword's 4 E8M0 bytes the MMA reads (same selector for A
+        # and B, since both operands share K-iter k). With the PACK>1 preshuffle each dword
+        # holds PACK K-iters; the K-loop sets ``mfma.opsel = scale_opsel(k)`` (= k%PACK, a
+        # compile-time immediate) before each MMA group. PACK==1 -> opsel stays 0.
         self.opsel = 0
         self.asm_mma = asm_mma
         self.cbsz = cbsz  # srcA fp8 format: 0=E4M3, 1=E5M2
@@ -308,8 +332,10 @@ class ScaleBComb:
     One dwordx4 per lane returns [s0,s1,s2,s3]; (s0,s1)=b0 sub-tiles, (s2,s3)=b1.
     """
 
-    def __init__(self, sp_tensor, dim, K, n_slabs=1):
+    def __init__(self, sp_tensor, dim, K, n_slabs=1, pack=_SCALE_PACK):
         self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
+        self.PACK = pack
+        self.K128p = ceildiv(self.K128, self.PACK)  # packed K-groups (PACK scales / dword)
         self.lane = fx.thread_idx.x % 64
         # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
         # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
@@ -319,15 +345,17 @@ class ScaleBComb:
         # n_slabs>1: grouped MXFP8 B scale is [G, N, K//32]; each group's preshuffled
         # B-comb slab is ``slab_elems`` i32 and the whole b_sp holds G of them stacked.
         # ``load(..., slab=g)`` adds g*slab_elems to index group g (n_slabs=1 = dense).
-        self.slab_elems = ((dim + 255) // 256) * 4 * self.K128 * 64 * 4  # i32 per group
+        self.slab_elems = ((dim + 255) // 256) * 4 * self.K128p * 64 * 4  # i32 per group
         nbytes = self.slab_elems * n_slabs * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
     def load(self, base, k, slab=0):
         """base: sb_base0 (b0 region col base). Returns 4 i32 (b0:0,1  b1:2,3).
-        slab: per-group slab index (grouped MXFP8); 0 = dense single-tensor."""
+        Reads the PACKED dword for K-group k//PACK (PACK K-iters in bytes 0..PACK-1); the
+        caller selects K-iter k's byte via MFMA op_sel (k%PACK). slab: per-group slab index."""
         grp = (base // 256) * 4 + (base % 256) // 32
-        idx = ((grp * self.K128 + k) * 64 + self.lane) * 4 + slab * self.slab_elems
+        kk = k // self.PACK
+        idx = ((grp * self.K128p + kk) * 64 + self.lane) * 4 + slab * self.slab_elems
         v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(4)]
 
@@ -352,25 +380,32 @@ class ScaleS2R:
     the mxfp8 GEMM launch.
     """
 
-    def __init__(self, sp_tensor, dim, K, n_tiles):
+    def __init__(self, sp_tensor, dim, K, n_tiles, pack=_SCALE_PACK):
         self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
+        self.PACK = pack
+        self.K128p = ceildiv(self.K128, self.PACK)  # packed K-groups (PACK scales / dword)
         self.n_tiles = n_tiles
         self.group_span = 16 * n_tiles
         self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
         # cdiv (not floor): a non-group_span-multiple ``dim`` (general M) still needs the
         # partial last 64-row group resident so its valid rows read real scales; the
         # group's OOB rows were preshuffle-masked to 0 and StoreC drops their output.
-        nbytes = ceildiv(dim, self.group_span) * self.K128 * 64 * n_tiles * 4  # int32 records
+        nbytes = ceildiv(dim, self.group_span) * self.K128p * 64 * n_tiles * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
     def load(self, base, k):
         """base: runtime global row/col base for this (region, wave). Returns n_tiles i32.
 
-        One vectorized dword{n_tiles} load: the n_tiles sub-tile scales for this
-        wave at (group, k) are contiguous per lane (A-operand preshuffle layout 1).
+        One vectorized dword{n_tiles} load of the PACKED dword for K-group k//PACK (n_tiles
+        sub-tiles contiguous per lane). The dword holds PACK K-iters' E8M0 scales in bytes
+        0..PACK-1; the caller selects K-iter k's byte via the scaled-MFMA op_sel (= k%PACK,
+        a compile-time constant) so NO extra ALU/register lands in the GEMM hot loop. ``k``
+        may be compile-time (NT: unrolled) or runtime (wgrad: chunk-loop) -> the index is
+        static or dynamic accordingly.
         """
         grp = base // self.group_span
-        idx = ((grp * self.K128 + k) * 64 + self.lane) * self.n_tiles
+        kk = k // self.PACK
+        idx = ((grp * self.K128p + kk) * 64 + self.lane) * self.n_tiles
         v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
 
@@ -887,8 +922,6 @@ def _robust_time(launch, args, warmup=250, reps=5, iters=50):
 # host stub (turbo-style single dispatch, scales repacked into a caller-owned workspace
 # in stream order right before the gemm reads them -- no separate Python/launch dispatch).
 
-_PRESHUF_KT = 16  # k-tile (rows*KT dwords staged in LDS per workgroup)
-
 
 def _lds_barrier():
     # Drain outstanding LDS writes (lgkmcnt) BEFORE the workgroup barrier, else
@@ -902,10 +935,12 @@ def _lds_barrier():
     )
 
 
-def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0):
+def _emit_lds_repack(
+    is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=_SCALE_PACK
+):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)); all vars local so it
-    # is safe inside a workgroup-uniform kernel `if`. KT/BLK chosen so TILE=NOUT are exact
-    # multiples of BLK -> no `if` guard needed (data bounds via the load/store masks).
+    # is safe inside a workgroup-uniform kernel `if`. KT/BLK chosen so TILE / packed-NOUT are
+    # exact multiples of BLK -> no `if` guard needed (data bounds via the load/store masks).
     #
     # rd_base / wr_base (i32-element offsets, default 0) let the grouped MXFP8 preshuffle
     # aim one workgroup at group g's slab of a stacked ``b_raw`` [G*N, K128] / ``b_sp``:
@@ -914,8 +949,7 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
     # base. rd_base=wr_base=0 reproduces the dense whole-tensor behaviour exactly.
     NT = 4
     TILE = 64 * KT
-    NOUT = KT * 64
-    assert TILE % BLK == 0 and NOUT % BLK == 0
+    assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
     for i in range_constexpr(TILE // BLK):
         idx = tid + i * BLK
         rr = idx // KT
@@ -934,28 +968,42 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
             Vec.from_elements([fx.Int32(dw)], fx.Int32)
         )
     _lds_barrier()
-    for j in range_constexpr(NOUT // BLK):
+    # Packed store: pack PACK consecutive K-iters (k-cols) into one output dword per lane
+    # (byte bb = k-col kkp*PACK+bb), shrinking the write & scale buffer PACK-fold. OOB
+    # k-cols were mask-loaded to 0 in LDS, so their packed bytes are 0 (reader never uses
+    # them). K128p = packed K-group count; the reader mirrors this (kk=k//PACK + MFMA op_sel).
+    PACK = pack
+    K128p = ceildiv(K128, PACK)
+    NGP = KT // PACK  # packed groups produced per KT-chunk
+    NOUTp = NGP * 64
+    for j in range_constexpr(NOUTp // BLK):
         ol = tid + j * BLK
-        kk = ol // 64
+        kkp = ol // 64
         lane = ol % 64
         r = lane % 16
         sh = (lane // 16) * fx.Int32(8)
-        gk = k0 + kk
+        gkp = (k0 // PACK) + kkp
         elems = []
         for s in range_constexpr(NT):
-            so = (s * 16 + r) * KT + kk
-            val = Vec(
-                fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(so)), fx.make_layout(1, 1)).load()
-            )
-            b = (fx.Int32(val[0]) >> sh) & fx.Int32(0xFF)
-            elems.append(b | (b << fx.Int32(8)) | (b << fx.Int32(16)) | (b << fx.Int32(24)))
+            packed = fx.Int32(0)
+            for bb in range_constexpr(PACK):
+                so = (s * 16 + r) * KT + (kkp * PACK + bb)
+                val = Vec(
+                    fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(so)), fx.make_layout(1, 1)).load()
+                )
+                b = (fx.Int32(val[0]) >> sh) & fx.Int32(0xFF)
+                packed = packed | (b << fx.Int32(bb * 8))
+            elems.append(packed)
         vec = Vec.from_elements(elems, fx.Int32)
         _buffer_ops.buffer_store(
-            vec.ir_value(), rout, ((grp * K128 + gk) * 64 + lane) * 4 + wr_base, mask=gk < K128
+            vec.ir_value(),
+            rout,
+            ((grp * K128p + gkp) * 64 + lane) * 4 + wr_base,
+            mask=(k0 + kkp * PACK) < K128,
         )
 
 
-def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256):
+def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256, pack: int = _SCALE_PACK):
     """Build the fused A (layout 1) + B-comb (layout 3) scale-preshuffle @flyc.kernel.
 
     Returns ``(kern, n_kt)``. ``kern`` is a bare KernelFunction (NOT a launch): the
@@ -969,6 +1017,7 @@ def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256)
     """
     TILE = 64 * KT
     n_kt = ceildiv(K128, KT)
+    K128p = ceildiv(K128, pack)  # packed K-groups (PACK scales / dword)
 
     @fx.struct
     class Smem:
@@ -992,15 +1041,19 @@ def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256)
         rin_a = _buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=m * K128 * 4)
         rin_b = _buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=n * K128 * 4)
         rout_a = _buffer_ops.create_buffer_resource(
-            a_sp, max_size=False, num_records_bytes=a_ngrp * K128 * 256 * 4
+            a_sp, max_size=False, num_records_bytes=a_ngrp * K128p * 256 * 4
         )
         rout_b = _buffer_ops.create_buffer_resource(
-            b_sp, max_size=False, num_records_bytes=b_ngrp * K128 * 256 * 4
+            b_sp, max_size=False, num_records_bytes=b_ngrp * K128p * 256 * 4
         )
         if bid < a_blocks:
-            _emit_lds_repack(True, bid // n_kt, (bid % n_kt) * KT, tile, rin_a, rout_a, m, K128, KT, tid, BLK)
+            _emit_lds_repack(
+                True, bid // n_kt, (bid % n_kt) * KT, tile, rin_a, rout_a, m, K128, KT, tid, BLK, pack=pack
+            )
         if bid >= a_blocks:
             bb = bid - a_blocks
-            _emit_lds_repack(False, bb // n_kt, (bb % n_kt) * KT, tile, rin_b, rout_b, n, K128, KT, tid, BLK)
+            _emit_lds_repack(
+                False, bb // n_kt, (bb % n_kt) * KT, tile, rin_b, rout_b, n, K128, KT, tid, BLK, pack=pack
+            )
 
     return kern, n_kt
