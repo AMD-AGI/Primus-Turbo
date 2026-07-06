@@ -31,6 +31,7 @@ K-tail / barrier rationale (identical here).
 """
 
 import os
+from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -2102,7 +2103,7 @@ def _compile_grouped_tn_wgrad_persistent(
 _WL_ASM_CACHE_3BUF = {}
 
 
-def _wgrad_wholeloop_asm_3buf(
+def _wholeloop_asm_3buf(
     *,
     nta,
     ntb,
@@ -2124,10 +2125,8 @@ def _wgrad_wholeloop_asm_3buf(
     nw,
     cbsz=0,
     blgp=0,
-    tail_nval=None,  # SGPR i32: count of extra single-block passes (0..5) appended after
-    # the main do-while, fused into the same inline-asm block so accumulator state
-    # carries over natively.
-    a_plain=False,  # see _wgrad_wholeloop_asm's a_plain
+    tail_nval=None,  # SGPR i32: 0..5 extra single-block passes fused into this asm block.
+    a_plain=False,  # see _wholeloop_asm_3buf's a_plain
 ):
     from functools import reduce
     from math import gcd
@@ -2153,41 +2152,35 @@ def _wgrad_wholeloop_asm_3buf(
             t_pool.append(t_pool[-1] + tiles[p])
         o_cnt = NT + ntmp
         o_wsoff = [o_cnt + 1 + p for p in range(4)]  # per-pool running gmem write soffset
-        # The tail is 5 statically unrolled gated phases (s_cmp/s_cbranch skip), not a
-        # runtime counter loop -- no extra scratch SGPR needed. Do not add an "=&s" output
-        # register here unless an instruction actually writes it: an unwritten "=&s"
-        # output is an uninitialized-output hazard that can corrupt register allocation.
+        # Tail = 5 statically-unrolled gated phases, so no extra scratch SGPR. Never add an
+        # unwritten "=&s" output here: it is an uninitialized-output hazard for regalloc.
 
+        # Ordered input-operand schema (name, width): one left-to-right walk assigns
+        # every operand index above the NT+ntmp+5 output base, in the exact order the
+        # cons input segment and the ins list are built.
         i = o_cnt + 5
-        i_base = []  # i_base[p][b] = [input idx, ...] (len nbase[p])
-        for p in range(4):
-            row = []
-            for _b in range(nbuf_p[p]):
-                row.append([i + j for j in range(nbase[p])])
-                i += nbase[p]
-            i_base.append(row)
-        i_gbase = []
-        for p in range(4):
-            i_gbase.append([i + b for b in range(nbuf_p[p])])
-            i += nbuf_p[p]
-        i_gla = [i + s for s in range(nsa)]
-        i += nsa
-        i_glb = [i + s for s in range(nsb)]
-        i += nsb
-        i_rsa = i
-        i += 1
-        i_rsb = i
-        i += 1
-        i_kstep = i
-        i += 1
-        i_kstepb = i
-        i += 1
-        i_nval = i
-        i += 1
+        _in_schema = (
+            [("base", nbase[p]) for p in range(4) for _b in range(nbuf_p[p])]
+            + [("gbase", nbuf_p[p]) for p in range(4)]
+            + [("gl_a", nsa), ("gl_b", nsb)]
+            + [("rsrc_a", 1), ("rsrc_b", 1), ("kstep", 1), ("kstep_b", 1), ("nval", 1)]
+            + ([("tail_nval", 1)] if _has_tail else [])
+            + [("soff0", 4)]
+        )
+        _blocks = []
+        for _name, _w in _in_schema:
+            _blocks.append(list(range(i, i + _w)))
+            i += _w
+        _it = iter(_blocks)
+        i_base = [[next(_it) for _b in range(nbuf_p[p])] for p in range(4)]
+        i_gbase = [next(_it) for _p in range(4)]
+        i_gla = next(_it)
+        i_glb = next(_it)
+        i_rsa, i_rsb = next(_it)[0], next(_it)[0]
+        i_kstep, i_kstepb, i_nval = next(_it)[0], next(_it)[0], next(_it)[0]
         if _has_tail:
-            i_tailval = i
-            i += 1
-        i_soff0 = [i + p for p in range(4)]
+            i_tailval = next(_it)[0]
+        i_soff0 = next(_it)
         i_ks = [i_kstep, i_kstep, i_kstepb, i_kstepb]
 
         def pool_of(tt):
@@ -2202,7 +2195,7 @@ def _wgrad_wholeloop_asm_3buf(
             vb = PIN + (tt - NT) * 8
             p0, p1 = i_base[p][buf][2 * ti], i_base[p][buf][2 * ti + 1]
             if a_plain and p < 2:
-                # plain (no-transpose) read -- see _wgrad_wholeloop_asm's a_plain.
+                # plain (no-transpose) read -- see _wholeloop_asm_3buf's a_plain.
                 return (
                     f"ds_read_b128 v[{vb}:{vb + 3}], ${p0} offset:0\n"
                     f"ds_read_b128 v[{vb + 4}:{vb + 7}], ${p1} offset:0"
@@ -2300,13 +2293,22 @@ def _wgrad_wholeloop_asm_3buf(
         _3buf_pools = [p for p in range(4) if nbuf_p[p] == 3]
         _3buf_pool = _3buf_pools[0] if _3buf_pools else None
         if _vmcnt_mode == "partial" and _3buf_pool is not None:
-            # Partial drain must leave in flight the writes of ALL 3-buffered pools, not
-            # just the first. Emit order (pools 0,1,2,3) issues the 3-buf pools last, so
-            # vmcnt(sum of their write counts) leaves exactly those writes outstanding.
+            # Partial drain keeps ALL 3-buffered pools' writes in flight; emit order
+            # (0,1,2,3) issues them last so vmcnt(sum) leaves exactly those outstanding.
             _n_outstanding = sum((nsa if p < 2 else nsb) for p in _3buf_pools)
             _ipend = f"s_waitcnt vmcnt({_n_outstanding}) lgkmcnt(0)\ns_barrier"
         else:
             _ipend = "s_waitcnt vmcnt(0) lgkmcnt(0)\ns_barrier"
+
+        def _emit_phase_block(ph, drain_line):
+            # One whole-loop phase: mfma+refill+g2s, then drain and bump each pool's soffset.
+            refill_bp = [(ph + 1) % nbuf_p[p] for p in range(4)]
+            write_bp = [ph % nbuf_p[p] for p in range(4)]
+            blk = emit_phase(refill_bp, write_bp)
+            blk.append(drain_line)
+            for p in range(4):
+                blk.append(f"s_add_u32 ${o_wsoff[p]}, ${o_wsoff[p]}, ${i_ks[p]}")
+            return blk
 
         refill0 = [(-1 + 1) % nbuf_p[p] for p in range(4)]
         L = [f"s_mov_b32 ${o_cnt}, 0"]
@@ -2316,22 +2318,14 @@ def _wgrad_wholeloop_asm_3buf(
         L.append("s_waitcnt lgkmcnt(0)")
         L.append("1:")
         for ph in range(n_phases):
-            refill_bp = [(ph + 1) % nbuf_p[p] for p in range(4)]
-            write_bp = [ph % nbuf_p[p] for p in range(4)]
-            L += emit_phase(refill_bp, write_bp)
-            L.append(_ipend)
-            for p in range(4):
-                L.append(f"s_add_u32 ${o_wsoff[p]}, ${o_wsoff[p]}, ${i_ks[p]}")
+            L += _emit_phase_block(ph, _ipend)
         L.append(f"s_add_u32 ${o_cnt}, ${o_cnt}, {n_phases}")
         L.append(f"s_cmp_lt_u32 ${o_cnt}, ${i_nval}")
         L.append("s_cbranch_scc1 1b")
 
         if _has_tail and _vmcnt_mode == "partial" and _3buf_pool is not None:
-            # The main loop's per-phase partial drain assumes there's always a next
-            # phase to finish draining outstanding loads; that breaks once the do-while
-            # exits into the tail. Force one full drain+barrier here before the tail
-            # reuses the main loop's LDS/register state. Skipped when tail_nval==0 since
-            # no tail phase runs and nothing reads the in-flight buffers.
+            # Full drain before the tail reuses the loop's LDS/regs: partial drain relies
+            # on a next phase, which is gone after loop exit. Skipped when tail_nval==0.
             L.append(f"s_cmp_eq_u32 ${i_tailval}, 0")
             L.append("s_cbranch_scc1 3f")
             L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
@@ -2339,20 +2333,13 @@ def _wgrad_wholeloop_asm_3buf(
             L.append("3:")
 
         if _has_tail:
-            # In-asm tail: up to 5 extra single-block phases fused into this asm block so
-            # accumulator state carries over natively. n_phases=6 is a multiple of every
-            # pool's nbuf_p, so the do-while exits aligned to phase j=0; these reuse the
-            # same write_bp/refill_bp formula, each gated by s_cmp/s_cbranch on tail_nval.
+            # In-asm tail: up to 5 gated single-block phases (loop exits aligned to j=0
+            # since n_phases=6), reusing the main-loop phase block, gated on tail_nval.
             for j in range(5):
-                refill_bp = [(j + 1) % nbuf_p[p] for p in range(4)]
-                write_bp = [j % nbuf_p[p] for p in range(4)]
                 skip_lbl = f"{j + 4}"  # distinct numeric local labels, unused elsewhere
                 L.append(f"s_cmp_le_u32 ${i_tailval}, {j}")  # tail_nval<=j -> no phase j
                 L.append(f"s_cbranch_scc1 {skip_lbl}f")
-                L += emit_phase(refill_bp, write_bp)
-                L.append("s_waitcnt vmcnt(0) lgkmcnt(0)\ns_barrier")
-                for p in range(4):
-                    L.append(f"s_add_u32 ${o_wsoff[p]}, ${o_wsoff[p]}, ${i_ks[p]}")
+                L += _emit_phase_block(j, "s_waitcnt vmcnt(0) lgkmcnt(0)\ns_barrier")
                 L.append(f"{skip_lbl}:")
 
         L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
@@ -2399,7 +2386,7 @@ def _wgrad_wholeloop_asm_3buf(
     return [o[qi * nq : (qi + 1) * nq] for qi in range(4)]
 
 
-def _wgrad_wholeloop_tile_3buf(
+def _wholeloop_tile_3buf(
     *,
     a_g2s,
     b_g2s,
@@ -2435,8 +2422,8 @@ def _wgrad_wholeloop_tile_3buf(
     lds_block_n,
     nval,
     do_store=True,  # False = return res, caller stores after the tail
-    tail_nval=None,  # pass through to _wgrad_wholeloop_asm_3buf
-    a_plain=False,  # see _wgrad_wholeloop_tile's a_plain/a_row_stride
+    tail_nval=None,  # pass through to _wholeloop_asm_3buf
+    a_plain=False,  # see _wholeloop_tile_3buf's a_plain/a_row_stride
     a_row_stride=None,
     b0_extra_buf=None,  # optional 3rd buffer for pool2 (B0), giving both B pools 3-deep
     # buffering instead of just pool3 (B1). None = 1-pool-3buf behavior.
@@ -2516,7 +2503,7 @@ def _wgrad_wholeloop_tile_3buf(
         rocdl.readfirstlane(T.i32, fx.Int32(B1_gl_offset) + fx.Int32(3) * kstep_b),
     ]
     acc0 = [[mfma.zero_value] * n_accums for _ in range_constexpr(4)]
-    res = _wgrad_wholeloop_asm_3buf(
+    res = _wholeloop_asm_3buf(
         nta=nta,
         ntb=ntb,
         bases=bases,
@@ -2543,10 +2530,7 @@ def _wgrad_wholeloop_tile_3buf(
     )
     if not do_store:
         return res
-    store_c.store(res[0], base_row + 0, base_col + 0)
-    store_c.store(res[1], base_row + 0, base_col + lds_block_n)
-    store_c.store(res[2], base_row + lds_block_m, base_col + 0)
-    store_c.store(res[3], base_row + lds_block_m, base_col + lds_block_n)
+    _store_quadrants(store_c, res[0], res[1], res[2], res[3], base_row, base_col, lds_block_m, lds_block_n)
     return res
 
 
@@ -2554,7 +2538,7 @@ def _wgrad_wholeloop_tile_3buf(
 # @flyc.kernel tracer processes any def nested in the traced function's own source, and
 # nesting this here previously tripped @flyc.jit's global-drift check on an unrelated
 # cache the moment the launch function was invoked more than once in one process.
-def _wgrad_do_tile_3buf(
+def _wave4_do_tile_tn(
     t,
     *,
     TOTAL,
@@ -2687,7 +2671,7 @@ def _wgrad_do_tile_3buf(
             _out_ty,
             lds.C_lds_shuffle,
             wave_id,
-            row_pad=4,  # must match _EPI_PAD in _compile_grouped_tn_wgrad_4wave's C_lds_shuffle sizing
+            row_pad=4,  # must match epi_pad in _wave4_geometry's C_lds_shuffle sizing (cshuf_n)
         )
     _common = dict(
         a_g2s=a_g2s,
@@ -2725,12 +2709,75 @@ def _wgrad_do_tile_3buf(
     )
 
     _b0x = lds.B_lds_extra_0 if os.environ.get("PT_WL_2BPOOL", "1") == "1" else None
-    _wgrad_wholeloop_tile_3buf(
+    _wholeloop_tile_3buf(
         **_common,
         nval=nval_main,
         do_store=True,
         tail_nval=tail_k_u,
         b0_extra_buf=_b0x,
+    )
+
+
+def _make_wave4_smem(*, a_lds_size, b_lds_size, cshuf_ty, cshuf_n, tail):
+    """Build the 4-wave SharedStorage @fx.struct: 8 fixed A/B triple-buffer fields then an
+    ordered tail. Field ORDER fixes LDS offsets, so each kernel passes its own tail
+    ("C"=C_lds_shuffle, "B_extra_1"/"B_extra_0"=deferred-write B buffers)."""
+    F8 = fx.Float8E4M3FN
+    ann = {
+        "A_lds_cur_0": fx.Array[F8, a_lds_size, 16],
+        "A_lds_cur_1": fx.Array[F8, a_lds_size, 16],
+        "A_lds_next_0": fx.Array[F8, a_lds_size, 16],
+        "A_lds_next_1": fx.Array[F8, a_lds_size, 16],
+        "B_lds_cur_0": fx.Array[F8, b_lds_size, 16],
+        "B_lds_cur_1": fx.Array[F8, b_lds_size, 16],
+        "B_lds_next_0": fx.Array[F8, b_lds_size, 16],
+        "B_lds_next_1": fx.Array[F8, b_lds_size, 16],
+    }
+    tail_field = {
+        "C": ("C_lds_shuffle", fx.Array[cshuf_ty, cshuf_n, 16]),
+        "B_extra_1": ("B_lds_extra_1", fx.Array[F8, b_lds_size, 16]),
+        "B_extra_0": ("B_lds_extra_0", fx.Array[F8, b_lds_size, 16]),
+    }
+    for key in tail:
+        name, ty = tail_field[key]
+        ann[name] = ty
+    return fx.struct(type("SharedStorage", (), {"__annotations__": ann}))
+
+
+_Wave4Geometry = namedtuple(
+    "_Wave4Geometry",
+    "N_WAVES N_TILES_A N_TILES_B N_ACCUMS LDS_BLOCK_M LDS_BLOCK_N "
+    "N_LDS_STEPS_A N_LDS_STEPS_B N_LDS_ROUNDS a_lds_size b_lds_size EPI_PAD cshuf_n cshuf_ty",
+)
+
+
+def _wave4_geometry(*, block_m, block_n, block_k, cs, csa, out_fp16):
+    """Derived 4-wave tile/LDS geometry shared by both grouped factories (trans_b-agnostic,
+    factory-scope Python). ``csa``/``cs`` are the A/B LDS column strides (wgrad shares one
+    _CS, dgrad uses _CSA/_CS); EPI_PAD keeps the CShuffle epilogue at 0% LDS bank conflict."""
+    n_waves = 4
+    n_tiles_a = block_m // 64
+    n_tiles_b = block_n // 64
+    lds_block_m = block_m // 2
+    lds_block_n = block_n // 2
+    n_lds_steps_a = (lds_block_m * block_k) // (256 * 16)
+    n_lds_steps_b = (lds_block_n * block_k) // (256 * 16)
+    epi_pad = 4
+    return _Wave4Geometry(
+        N_WAVES=n_waves,
+        N_TILES_A=n_tiles_a,
+        N_TILES_B=n_tiles_b,
+        N_ACCUMS=n_tiles_a * n_tiles_b,
+        LDS_BLOCK_M=lds_block_m,
+        LDS_BLOCK_N=lds_block_n,
+        N_LDS_STEPS_A=n_lds_steps_a,
+        N_LDS_STEPS_B=n_lds_steps_b,
+        N_LDS_ROUNDS=max(n_lds_steps_a, n_lds_steps_b),
+        a_lds_size=(lds_block_m * block_k) // 1024 * csa,
+        b_lds_size=(lds_block_n * block_k) // 1024 * cs,
+        EPI_PAD=epi_pad,
+        cshuf_n=n_waves * 16 * (n_tiles_b * 16 + epi_pad),
+        cshuf_ty=fx.Float16 if out_fp16 else fx.BFloat16,
     )
 
 
@@ -2750,10 +2797,9 @@ def _compile_grouped_tn_wgrad_4wave(
     vmcnt_hint: int = 2,
     cap_cu: int = -1,
 ):
-    """4-wave (occ=1) grouped TN wgrad dW[g]=A[g]^T@B[g], variable-K over per-group token
-    rows. 256x256 2x2-wave whole-loop bare-asm body drives the runtime nval (floored to a
-    multiple of 6) + in-asm fused tail; partial/over-run K-blocks are zeroed by per-group
-    SRD num_records clamp (no K-tail mask). C is [G*OUT_M, OUT_N], store clamps per group."""
+    """4-wave (occ=1) grouped TN wgrad dW[g]=A[g]^T@B[g], variable-K per group. 256x256
+    whole-loop bare-asm body: runtime nval (floored to x6) + in-asm fused tail; partial
+    K-blocks zeroed by per-group SRD num_records clamp. C=[G*OUT_M, OUT_N]."""
 
     # 2-pool (both B pools 3-buffered) is default-on; needs _CS=1024 (fit 10 buffers)
     # + scalar store. PT_WL_2BPOOL=0 falls back to 1-pool @1056.
@@ -2764,49 +2810,39 @@ def _compile_grouped_tn_wgrad_4wave(
     # below being width-parameterized. Keep this assert at 256.
     assert BLOCK_M == 256 and BLOCK_N == 256, "4-wave grouped wgrad is 256x256-only"
     assert G >= 1
-    N_WAVES = 4
-    N_TILES_A = BLOCK_M // 64
-    N_TILES_B = BLOCK_N // 64
-    N_ACCUMS = N_TILES_A * N_TILES_B
-    LDS_BLOCK_M = BLOCK_M // 2
-    LDS_BLOCK_N = BLOCK_N // 2
     # 2-pool needs _CS=1024 (fit 10 buffers); 1-pool/2-buffer keep 1056 (0 bank conflict).
     _CS = int(os.environ.get("PT_CS", "1024" if _2BPOOL else "1056"))
-    N_LDS_STEPS_A = (LDS_BLOCK_M * BLOCK_K) // (256 * 16)
-    N_LDS_STEPS_B = (LDS_BLOCK_N * BLOCK_K) // (256 * 16)
-    N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
-    a_lds_size = (LDS_BLOCK_M * BLOCK_K) // 1024 * _CS
-    b_lds_size = (LDS_BLOCK_N * BLOCK_K) // 1024 * _CS
+    # geo.cshuf_n bakes EPI_PAD=4 (row_pad=4 at the StoreCPerTensorCShuffle call sites).
+    _geo = _wave4_geometry(
+        block_m=BLOCK_M, block_n=BLOCK_N, block_k=BLOCK_K, cs=_CS, csa=_CS, out_fp16=out_fp16
+    )
+    N_WAVES = _geo.N_WAVES
+    N_TILES_A = _geo.N_TILES_A
+    N_TILES_B = _geo.N_TILES_B
+    N_ACCUMS = _geo.N_ACCUMS
+    LDS_BLOCK_M = _geo.LDS_BLOCK_M
+    LDS_BLOCK_N = _geo.LDS_BLOCK_N
+    N_LDS_STEPS_A = _geo.N_LDS_STEPS_A
+    N_LDS_STEPS_B = _geo.N_LDS_STEPS_B
+    N_LDS_ROUNDS = _geo.N_LDS_ROUNDS
+    a_lds_size = _geo.a_lds_size
+    b_lds_size = _geo.b_lds_size
+    _cshuf_n = _geo.cshuf_n
+    _cshuf_ty = _geo.cshuf_ty
     N_BLOCKS_M = (OUT_M + BLOCK_M - 1) // BLOCK_M
     N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
-    _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    # row_pad=4 drives StoreCPerTensorCShuffle's epilogue LDS bank conflict to exactly
-    # 0.0% (rocprofv3 LDSBankConflict, measured; see StoreCPerTensorCShuffle's
-    # docstring). C_lds_shuffle's allocation must grow to match (n_tiles_b*16+_EPI_PAD
-    # per row, not just n_tiles_b*16) -- this constant MUST stay in sync with the
-    # row_pad= value passed to both StoreCPerTensorCShuffle(...) call sites below.
-    _EPI_PAD = 4
-    _cshuf_n = N_WAVES * 16 * (N_TILES_B * 16 + _EPI_PAD)
 
-    @fx.struct
-    class SharedStorage:
-        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        # 2bpool mode forces scalar store (no CShuffle) to free C_lds space, so
-        # C_lds_shuffle shrinks to a stub; otherwise full size.
-        C_lds_shuffle: fx.Array[_cshuf_ty, (16 if _2BPOOL else _cshuf_n), 16]
-        B_lds_extra_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        if _2BPOOL:
-            # 2nd B-pool 3rd buffer (defer 1/2 the writes). Only fits at _CS=1024 + scalar store.
-            B_lds_extra_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+    # 2bpool forces scalar store (no CShuffle) so C_lds_shuffle shrinks to a stub and a
+    # 2nd deferred-write B buffer (B_lds_extra_0) fits (only at _CS=1024 + scalar store).
+    SharedStorage = _make_wave4_smem(
+        a_lds_size=a_lds_size,
+        b_lds_size=b_lds_size,
+        cshuf_ty=_cshuf_ty,
+        cshuf_n=(16 if _2BPOOL else _cshuf_n),
+        tail=["C", "B_extra_1"] + (["B_extra_0"] if _2BPOOL else []),
+    )
 
     @flyc.kernel(known_block_size=[256, 1, 1])
     def kernel_grouped_tn_wgrad_4wave(
@@ -2842,7 +2878,7 @@ def _compile_grouped_tn_wgrad_4wave(
         _cn = fx.Int32(OUT_N)
 
         def _do_tile_3buf(t):
-            _wgrad_do_tile_3buf(
+            _wave4_do_tile_tn(
                 t,
                 TOTAL=TOTAL,
                 num_xcd=num_xcd,
@@ -3167,6 +3203,122 @@ def _grouped_4wave_tile_scan(
     return gi, m_row, m_end, block_n, a_base, a_nrec
 
 
+# Module-level (not nested in kernel_grouped_nn_4wave's body) for the same reason as
+# _wave4_do_tile_tn: the @flyc.kernel tracer would otherwise re-trace it and trip the
+# global-drift check on repeat launches. Symmetric to the wgrad (TN) tile body.
+def _wave4_do_tile_nn(
+    t,
+    *,
+    num_xcd,
+    total_tiles,
+    go_div,
+    G,
+    BLOCK_M,
+    BLOCK_N,
+    BLOCK_K,
+    n_blocks,
+    group_m,
+    group_n,
+    K,
+    c_n,
+    F8_IR_t,
+    _out_ty,
+    N_TILES_A,
+    N_TILES_B,
+    N_ACCUMS,
+    N_LDS_STEPS_A,
+    N_LDS_STEPS_B,
+    _CS,
+    _CSA,
+    N_WAVES,
+    vmcnt_hint,
+    cbsz,
+    blgp,
+    LDS_BLOCK_M,
+    LDS_BLOCK_N,
+    NVAL,
+    TAIL,
+    A,
+    B,
+    C,
+    A_scale,
+    B_scale,
+    gl_off_a,
+    gl_off_b,
+    wave_id,
+    wave_m,
+    wave_n,
+    lds,
+):
+    gi, m_row, m_end, block_n, a_base, a_nrec = _grouped_4wave_tile_scan(
+        t, num_xcd, total_tiles, go_div, G, BLOCK_M, BLOCK_N, n_blocks, group_m, group_n, K
+    )
+    cn_i = arith.index_cast(T.index, c_n)
+    b_base = arith.index_cast(T.index, gi) * arith.index(K) * cn_i + arith.index_cast(
+        T.index, block_n * BLOCK_N
+    )
+    b_nrec = arith.index(K) * cn_i - arith.index_cast(T.index, block_n * BLOCK_N)
+    gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
+    gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, b_nrec)
+    a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+    b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+    mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
+    mfma._do_mma = lambda _a, _b, _c: asm_mma_do(_a, _b, _c, mode="2", cbsz=cbsz, blgp=blgp)
+    a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_CSA)
+    b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_CS)
+    a_s2r = S2RLoader(wave_m, N_TILES_A)
+    b_s2r = S2RLoaderTr(
+        wave_n,
+        N_TILES_B,
+        N_TILES_B * 16,
+        inline_asm=True,
+        vmcnt_hint=vmcnt_hint,
+        n_waves=N_WAVES,
+        chunk_stride=_CS,
+        width=LDS_BLOCK_N,
+    )
+    store_c = StoreCPerTensor(A_scale, B_scale, C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
+    _wholeloop_tile_3buf(
+        a_g2s=a_g2s,
+        b_g2s=b_g2s,
+        a_s2r=a_s2r,
+        b_s2r=b_s2r,
+        lds=lds,
+        gl_off_a=gl_off_a,
+        gl_off_b=gl_off_b,
+        A=A,
+        B=B,
+        a_base=a_base,
+        b_base=b_base,
+        a_nrec=a_nrec,
+        b_nrec=b_nrec,
+        c_n=c_n,
+        c_m=fx.Int32(1),
+        wave_id=wave_id,
+        mfma=mfma,
+        store_c=store_c,
+        nta=N_TILES_A,
+        ntb=N_TILES_B,
+        n_accums=N_ACCUMS,
+        nsa=N_LDS_STEPS_A,
+        nsb=N_LDS_STEPS_B,
+        block_k=BLOCK_K,
+        cs=[_CSA, _CSA, _CS, _CS],
+        nw=N_WAVES,
+        cbsz=cbsz,
+        blgp=blgp,
+        base_row=m_row + wave_m * (N_TILES_A * 16),
+        base_col=block_n * BLOCK_N + wave_n * (N_TILES_B * 16),
+        lds_block_m=LDS_BLOCK_M,
+        lds_block_n=LDS_BLOCK_N,
+        nval=fx.Int32(NVAL),
+        tail_nval=fx.Int32(TAIL),
+        a_plain=True,
+        a_row_stride=fx.Int32(K),
+        b0_extra_buf=lds.B_lds_extra_0,
+    )
+
+
 def _compile_grouped_nn_4wave(
     *, K, G, num_xcd=8, group_m=0, group_n=0, cbsz=0, blgp=0, out_fp16=False, cap_cu=-1, vmcnt_hint=2
 ):
@@ -3176,39 +3328,35 @@ def _compile_grouped_nn_4wave(
     BLOCK_M = 256
     BLOCK_N = 256
     BLOCK_K = 128
-    N_WAVES = 4
-    N_TILES_A = BLOCK_M // 64
-    N_TILES_B = BLOCK_N // 64
-    N_ACCUMS = N_TILES_A * N_TILES_B
-    LDS_BLOCK_M = BLOCK_M // 2
-    LDS_BLOCK_N = BLOCK_N // 2
     _CS = 1024
     _CSA = 1024
-    N_LDS_STEPS_A = (LDS_BLOCK_M * BLOCK_K) // (256 * 16)
-    N_LDS_STEPS_B = (LDS_BLOCK_N * BLOCK_K) // (256 * 16)
-    N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
-    a_lds_size = (LDS_BLOCK_M * BLOCK_K) // 1024 * _CSA
-    b_lds_size = (LDS_BLOCK_N * BLOCK_K) // 1024 * _CS
+    _geo = _wave4_geometry(
+        block_m=BLOCK_M, block_n=BLOCK_N, block_k=BLOCK_K, cs=_CS, csa=_CSA, out_fp16=out_fp16
+    )
+    N_WAVES = _geo.N_WAVES
+    N_TILES_A = _geo.N_TILES_A
+    N_TILES_B = _geo.N_TILES_B
+    N_ACCUMS = _geo.N_ACCUMS
+    LDS_BLOCK_M = _geo.LDS_BLOCK_M
+    LDS_BLOCK_N = _geo.LDS_BLOCK_N
+    N_LDS_STEPS_A = _geo.N_LDS_STEPS_A
+    N_LDS_STEPS_B = _geo.N_LDS_STEPS_B
+    N_LDS_ROUNDS = _geo.N_LDS_ROUNDS
+    a_lds_size = _geo.a_lds_size
+    b_lds_size = _geo.b_lds_size
+    _cshuf_ty = _geo.cshuf_ty
     _, NVAL, TAIL = _wholeloop_tail_split_3buf(
         K, BLOCK_K
     )  # 3buf FUSED: main loop in multiples of 6 + tail remainder
-    _EPI_PAD = 4
-    _cshuf_n = N_WAVES * 16 * (N_TILES_B * 16 + _EPI_PAD)
-    _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
 
-    @fx.struct
-    class SharedStorage:
-        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_extra_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_extra_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        C_lds_shuffle: fx.Array[_cshuf_ty, 16, 16]
+    # dgrad tail order differs from wgrad (B extras before C); order fixes LDS offsets.
+    SharedStorage = _make_wave4_smem(
+        a_lds_size=a_lds_size,
+        b_lds_size=b_lds_size,
+        cshuf_ty=_cshuf_ty,
+        cshuf_n=16,
+        tail=["B_extra_1", "B_extra_0", "C"],
+    )
 
     @flyc.kernel(known_block_size=[256, 1, 1])
     def kernel_grouped_nn_4wave(
@@ -3243,74 +3391,48 @@ def _compile_grouped_nn_4wave(
         gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS, wswz=False)
 
         def _do_tile(t):
-            gi, m_row, m_end, block_n, a_base, a_nrec = _grouped_4wave_tile_scan(
-                t, num_xcd, total_tiles, go_div, G, BLOCK_M, BLOCK_N, n_blocks, group_m, group_n, K
-            )
-            cn_i = arith.index_cast(T.index, c_n)
-            b_base = arith.index_cast(T.index, gi) * arith.index(K) * cn_i + arith.index_cast(
-                T.index, block_n * BLOCK_N
-            )
-            b_nrec = arith.index(K) * cn_i - arith.index_cast(T.index, block_n * BLOCK_N)
-            gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
-            gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, b_nrec)
-            a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
-            b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
-            mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
-            mfma._do_mma = lambda _a, _b, _c: asm_mma_do(_a, _b, _c, mode="2", cbsz=cbsz, blgp=blgp)
-            a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_CSA)
-            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_CS)
-            a_s2r = S2RLoader(wave_m, N_TILES_A)
-            b_s2r = S2RLoaderTr(
-                wave_n,
-                N_TILES_B,
-                N_TILES_B * 16,
-                inline_asm=True,
-                vmcnt_hint=vmcnt_hint,
-                n_waves=N_WAVES,
-                chunk_stride=_CS,
-                width=LDS_BLOCK_N,
-            )
-            store_c = StoreCPerTensor(
-                A_scale, B_scale, C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty
-            )
-            _wgrad_wholeloop_tile_3buf(
-                a_g2s=a_g2s,
-                b_g2s=b_g2s,
-                a_s2r=a_s2r,
-                b_s2r=b_s2r,
-                lds=lds,
-                gl_off_a=gl_off_a,
-                gl_off_b=gl_off_b,
-                A=A,
-                B=B,
-                a_base=a_base,
-                b_base=b_base,
-                a_nrec=a_nrec,
-                b_nrec=b_nrec,
+            _wave4_do_tile_nn(
+                t,
+                num_xcd=num_xcd,
+                total_tiles=total_tiles,
+                go_div=go_div,
+                G=G,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_K=BLOCK_K,
+                n_blocks=n_blocks,
+                group_m=group_m,
+                group_n=group_n,
+                K=K,
                 c_n=c_n,
-                c_m=fx.Int32(1),
-                wave_id=wave_id,
-                mfma=mfma,
-                store_c=store_c,
-                nta=N_TILES_A,
-                ntb=N_TILES_B,
-                n_accums=N_ACCUMS,
-                nsa=N_LDS_STEPS_A,
-                nsb=N_LDS_STEPS_B,
-                block_k=BLOCK_K,
-                cs=[_CSA, _CSA, _CS, _CS],
-                nw=N_WAVES,
+                F8_IR_t=F8_IR_t,
+                _out_ty=_out_ty,
+                N_TILES_A=N_TILES_A,
+                N_TILES_B=N_TILES_B,
+                N_ACCUMS=N_ACCUMS,
+                N_LDS_STEPS_A=N_LDS_STEPS_A,
+                N_LDS_STEPS_B=N_LDS_STEPS_B,
+                _CS=_CS,
+                _CSA=_CSA,
+                N_WAVES=N_WAVES,
+                vmcnt_hint=vmcnt_hint,
                 cbsz=cbsz,
                 blgp=blgp,
-                base_row=m_row + wave_m * (N_TILES_A * 16),
-                base_col=block_n * BLOCK_N + wave_n * (N_TILES_B * 16),
-                lds_block_m=LDS_BLOCK_M,
-                lds_block_n=LDS_BLOCK_N,
-                nval=fx.Int32(NVAL),
-                tail_nval=fx.Int32(TAIL),
-                a_plain=True,
-                a_row_stride=fx.Int32(K),
-                b0_extra_buf=lds.B_lds_extra_0,
+                LDS_BLOCK_M=LDS_BLOCK_M,
+                LDS_BLOCK_N=LDS_BLOCK_N,
+                NVAL=NVAL,
+                TAIL=TAIL,
+                A=A,
+                B=B,
+                C=C,
+                A_scale=A_scale,
+                B_scale=B_scale,
+                gl_off_a=gl_off_a,
+                gl_off_b=gl_off_b,
+                wave_id=wave_id,
+                wave_m=wave_m,
+                wave_n=wave_n,
+                lds=lds,
             )
 
         for t in range(pid, total_tiles, nsms):
