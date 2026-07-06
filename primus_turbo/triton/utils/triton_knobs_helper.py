@@ -56,16 +56,22 @@ def scoped_amd_triton_knobs(gfx942_enable: Optional[bool] = None):
     try:
         if is_gfx950():
             if _amd_knobs_available():
-                triton.knobs.amd.use_async_copy = True
-                triton.knobs.amd.scalarize_packed_fops = True
-                triton.knobs.amd.use_block_pingpong = True
+                # Only touch knobs that exist, so snapshot/restore stays
+                # symmetric and we never AttributeError on a Triton build
+                # missing one.
+                amd = triton.knobs.amd
+                for name in _AMD_KNOB_ATTRS:
+                    if hasattr(amd, name):
+                        setattr(amd, name, True)
             else:
-                os.environ["TRITON_HIP_USE_ASYNC_COPY"] = "1"
-                os.environ["AMDGCN_SCALARIZE_PACKED_FOPS"] = "1"
-                os.environ["TRITON_HIP_USE_BLOCK_PINGPONG"] = "1"
+                for name in _AMD_KNOB_ENVS:
+                    os.environ[name] = "1"
         elif gfx942_enable is not None and _amd_knobs_available():
-            triton.knobs.amd.use_async_copy = gfx942_enable
-            triton.knobs.amd.scalarize_packed_fops = gfx942_enable
+            # gfx942 touches only async_copy + scalarize (not block_pingpong).
+            amd = triton.knobs.amd
+            for name in ("use_async_copy", "scalarize_packed_fops"):
+                if hasattr(amd, name):
+                    setattr(amd, name, gfx942_enable)
         yield
     finally:
         if saved_attrs:
