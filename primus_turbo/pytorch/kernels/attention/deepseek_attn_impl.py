@@ -12,13 +12,12 @@ the per-op :class:`AutoKernelDispatcher` declares ``_backends`` + ``make_key``,
 and the public entry is a ``@torch.library.custom_op`` (with ``register_fake``)
 that resolves the backend via :meth:`AutoKernelDispatcher.dispatch`.
 
-Three forward custom_ops cover V4's three attention input forms:
+Two forward custom_ops cover V4's attention input forms:
 
 * ``deepseek_attn_fwd``          — dense (``compress_ratio == 0``) and HCA
   (``compress_ratio == 128``, split-mask); see ``ops/attention/hca_attention.py``.
-* ``deepseek_csa_attn_fwd``      — CSA from a pre-gathered top-K tensor.
-* ``deepseek_csa_pool_attn_fwd`` — CSA that gathers the sparse keys in-kernel
-  from the compressed pool.
+* ``deepseek_csa_pool_attn_fwd`` — CSA (``compress_ratio == 4``) that gathers the
+  sparse keys in-kernel from the compressed pool.
 
 Backend contract (matches the dispatcher base): ``can_handle`` must return
 ``False`` (never raise) for unsupported inputs so the dispatcher can fall back.
@@ -47,22 +46,18 @@ import torch
 # FlyDSL backend as unavailable and the dispatcher falls back to Triton.
 try:
     from primus_turbo.flydsl.attention.deepseek_attn_fwd_kernel import (
-        csa_attention_fwd_flydsl_kernel,
         csa_pool_attention_fwd_flydsl_kernel,
         hca_attention_fwd_flydsl_kernel,
     )
     from primus_turbo.flydsl.attention.deepseek_attn_bwd_kernel import (
-        csa_attention_bwd_flydsl_kernel,
         hca_attention_bwd_flydsl_kernel,
     )
 
     _FLYDSL_AVAILABLE = True
 except Exception:  # noqa: BLE001 - ImportError or any flydsl ABI/load failure
     hca_attention_fwd_flydsl_kernel = None
-    csa_attention_fwd_flydsl_kernel = None
     csa_pool_attention_fwd_flydsl_kernel = None
     hca_attention_bwd_flydsl_kernel = None
-    csa_attention_bwd_flydsl_kernel = None
     _FLYDSL_AVAILABLE = False
 
 from primus_turbo.pytorch.core.backend import (
@@ -76,8 +71,6 @@ from primus_turbo.pytorch.core.backend import (
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.triton.attention.deepseek import (
-    _launch_csa_attention_bwd,
-    _launch_csa_attention_fwd,
     _launch_csa_attention_pool_fwd,
     _launch_hca_attention_bwd,
     _launch_hca_attention_fwd,
@@ -474,282 +467,6 @@ def deepseek_attn_bwd(
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# CSA forward (pre-gathered top-K)
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class DeepSeekCSAAttnTritonBackend(KernelBackend):
-    @staticmethod
-    def can_handle(q, k_local, v_local, gathered, sparse_mask, sink, swa_window, scale) -> bool:
-        return True
-
-    @staticmethod
-    def execute(q, k_local, v_local, gathered, sparse_mask, sink, swa_window, scale):
-        return _launch_csa_attention_fwd(
-            q,
-            k_local,
-            v_local,
-            gathered,
-            sparse_mask,
-            sink=sink,
-            swa_window=swa_window,
-            scale=scale,
-        )
-
-
-class DeepSeekCSAAttnFlyDSLBackend(KernelBackend):
-    """CSA pre-gathered FlyDSL forward (ported from Primus, the 2.79x kernel).
-
-    Fuses local SWA + sparse top-K + optional sink in one online softmax. Gating:
-    gfx950, bf16 (``q.dtype == k_local.dtype == v_local.dtype == gathered.dtype``),
-    ``D == 512``, ``K_H in {1, H}``, ``swa_window > 0``, ``K_topk > 0`` and
-    ``scale == 1/sqrt(D)``.
-    """
-
-    @staticmethod
-    def can_handle(q, k_local, v_local, gathered, sparse_mask, sink, swa_window, scale) -> bool:
-        supported = _FLYDSL_AVAILABLE
-        supported &= get_device_compute_capability() >= (9, 5)
-        supported &= q.dim() == 4 and k_local.dim() == 4 and v_local.dim() == 4 and gathered.dim() == 4
-        supported &= q.dtype == torch.bfloat16
-        supported &= q.dtype == k_local.dtype == v_local.dtype == gathered.dtype
-        supported &= q.shape[-1] == 512
-        K_H = k_local.shape[1]
-        supported &= K_H == 1 or K_H == q.shape[1]
-        supported &= gathered.shape[2] > 0
-        supported &= int(swa_window) > 0
-        supported &= math.isclose(float(scale), 1.0 / math.sqrt(q.shape[-1]), rel_tol=1e-4)
-        # FlyDSL packs the flat (``view(-1)``) tensor length as int32; the
-        # gathered ``[B, Sq, K_topk, D]`` buffer is the largest and overflows
-        # at >= 2**31 elements (e.g. Pro K_topk=1024 at Sq=4096). Fall back to
-        # Triton for those shapes instead of crashing in the arg codec.
-        supported &= gathered.numel() < 2**31
-        supported &= q.numel() < 2**31
-        return supported
-
-    @staticmethod
-    def execute(q, k_local, v_local, gathered, sparse_mask, sink, swa_window, scale):
-        return csa_attention_fwd_flydsl_kernel(
-            q,
-            k_local,
-            v_local,
-            gathered,
-            sparse_mask,
-            sink,
-            int(swa_window),
-            float(scale),
-        )
-
-
-class DeepSeekCSAAttnFwdDispatcher(AutoKernelDispatcher):
-    _backends = {
-        BackendType.TRITON: BackendEntry(DeepSeekCSAAttnTritonBackend),
-        BackendType.FLYDSL: BackendEntry(DeepSeekCSAAttnFlyDSLBackend),
-    }
-    _cache = TuneCache(1024)
-
-    @classmethod
-    def make_key(cls, q, k_local, v_local, gathered, sparse_mask, sink, swa_window, **kwargs):
-        B, H, Sq, D = q.shape
-        K_topk = gathered.shape[2]
-        return (
-            B,
-            H,
-            Sq,
-            D,
-            K_topk,
-            q.dtype,
-            gathered.dtype,
-            int(swa_window),
-            sink is not None,
-            "csa_gathered",
-        )
-
-
-@_torch_custom_op_wrapper("primus_turbo::deepseek_csa_attn_fwd", mutates_args=(), device_types="cuda")
-def deepseek_csa_attn_fwd(
-    q: torch.Tensor,
-    k_local: torch.Tensor,
-    v_local: torch.Tensor,
-    gathered: torch.Tensor,
-    sparse_mask: torch.Tensor,
-    sink: Optional[torch.Tensor],
-    swa_window: int,
-    scale: float,
-    default_backend: int,
-    backend_override: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = _resolve_user_backend(backend_override)
-    kwargs = dict(
-        q=q,
-        k_local=k_local,
-        v_local=v_local,
-        gathered=gathered,
-        sparse_mask=sparse_mask,
-        sink=sink,
-        swa_window=int(swa_window),
-        scale=float(scale),
-    )
-    user_backend_enum = _fallback_if_unsupported(DeepSeekCSAAttnFwdDispatcher, user_backend_enum, kwargs)
-    return DeepSeekCSAAttnFwdDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
-
-
-@deepseek_csa_attn_fwd.register_fake
-def _deepseek_csa_attn_fwd_meta(
-    q: torch.Tensor,
-    k_local: torch.Tensor,
-    v_local: torch.Tensor,
-    gathered: torch.Tensor,
-    sparse_mask: torch.Tensor,
-    sink: Optional[torch.Tensor],
-    swa_window: int,
-    scale: float,
-    default_backend: int,
-    backend_override: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, H, Sq, _ = q.shape
-    out = torch.empty_like(q)
-    lse = torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)
-    return out, lse
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# CSA backward (pre-gathered top-K) — dispatcher selects Triton / FlyDSL
-# ───────────────────────────────────────────────────────────────────────────
-
-
-class DeepSeekCSAAttnBwdTritonBackend(KernelBackend):
-    @staticmethod
-    def can_handle(q, k_local, v_local, gathered, sparse_mask, out, dout, lse, sink, swa_window, scale) -> bool:
-        return True
-
-    @staticmethod
-    def execute(q, k_local, v_local, gathered, sparse_mask, out, dout, lse, sink, swa_window, scale):
-        return _launch_csa_attention_bwd(
-            q,
-            k_local,
-            v_local,
-            gathered,
-            sparse_mask,
-            out,
-            dout,
-            lse,
-            sink=sink,
-            swa_window=swa_window,
-            scale=scale,
-        )
-
-
-class DeepSeekCSAAttnBwdFlyDSLBackend(KernelBackend):
-    """CSA fused backward via the ported FlyDSL full kernel (gathered path).
-
-    One launch produces ``(dq, dk_local, dv_local, dgathered, dsink)``. Supports
-    MQA (``K_H == 1``) and MHA (``K_H == HQ``, the Primus-Turbo CSA local
-    branch). Gating: gfx950, bf16, ``D == 512``, ``K_H in {1, H}``,
-    ``swa_window > 0``, ``K_topk > 0``, ``scale == 1/sqrt(D)`` and the int32 arg
-    codec limit (per-tensor numel < 2**31).
-    """
-
-    @staticmethod
-    def can_handle(q, k_local, v_local, gathered, sparse_mask, out, dout, lse, sink, swa_window, scale) -> bool:
-        supported = _FLYDSL_AVAILABLE
-        supported &= get_device_compute_capability() >= (9, 5)
-        supported &= q.dim() == 4 and k_local.dim() == 4 and v_local.dim() == 4 and gathered.dim() == 4
-        supported &= q.dtype == torch.bfloat16
-        supported &= q.dtype == k_local.dtype == v_local.dtype == gathered.dtype
-        supported &= q.shape[-1] == 512
-        K_H = k_local.shape[1]
-        supported &= K_H == 1 or K_H == q.shape[1]
-        supported &= gathered.shape[2] > 0
-        supported &= int(swa_window) > 0
-        supported &= math.isclose(float(scale), 1.0 / math.sqrt(q.shape[-1]), rel_tol=1e-4)
-        supported &= gathered.numel() < 2**31
-        supported &= q.numel() < 2**31
-        return supported
-
-    @staticmethod
-    def execute(q, k_local, v_local, gathered, sparse_mask, out, dout, lse, sink, swa_window, scale):
-        return csa_attention_bwd_flydsl_kernel(
-            q,
-            k_local,
-            v_local,
-            gathered,
-            sparse_mask,
-            out,
-            dout,
-            lse,
-            sink=sink,
-            swa_window=int(swa_window),
-            scale=float(scale),
-        )
-
-
-class DeepSeekCSAAttnBwdDispatcher(AutoKernelDispatcher):
-    _backends = {
-        BackendType.TRITON: BackendEntry(DeepSeekCSAAttnBwdTritonBackend),
-        BackendType.FLYDSL: BackendEntry(DeepSeekCSAAttnBwdFlyDSLBackend),
-    }
-    _cache = TuneCache(1024)
-
-    @classmethod
-    def make_key(cls, q, k_local, v_local, gathered, sparse_mask, sink, swa_window, **kwargs):
-        B, H, Sq, D = q.shape
-        K_topk = gathered.shape[2]
-        return (
-            B,
-            H,
-            k_local.shape[1],
-            Sq,
-            D,
-            K_topk,
-            q.dtype,
-            int(swa_window),
-            sink is not None,
-            "csa_bwd",
-        )
-
-
-def deepseek_csa_attn_bwd(
-    q: torch.Tensor,
-    k_local: torch.Tensor,
-    v_local: torch.Tensor,
-    gathered: torch.Tensor,
-    sparse_mask: torch.Tensor,
-    out: torch.Tensor,
-    dout: torch.Tensor,
-    lse: torch.Tensor,
-    *,
-    sink: Optional[torch.Tensor],
-    swa_window: int,
-    scale: float,
-    backend_override: int = _NO_BACKEND_OVERRIDE,
-):
-    """CSA backward dispatch (Triton default; FlyDSL when selected/supported).
-
-    Called from ``CSAAttentionFn.backward`` (not a ``custom_op`` — the autograd
-    Function is the torch.compile boundary). Returns ``(dq, dk_local, dv_local,
-    dgathered, dsink)``. An explicitly selected FlyDSL backend that cannot handle
-    the inputs falls back to Triton (no raise)."""
-    user_backend_enum = _resolve_user_backend(int(backend_override))
-    kwargs = dict(
-        q=q,
-        k_local=k_local,
-        v_local=v_local,
-        gathered=gathered,
-        sparse_mask=sparse_mask,
-        out=out,
-        dout=dout,
-        lse=lse,
-        sink=sink,
-        swa_window=int(swa_window),
-        scale=float(scale),
-    )
-    user_backend_enum = _fallback_if_unsupported(DeepSeekCSAAttnBwdDispatcher, user_backend_enum, kwargs)
-    return DeepSeekCSAAttnBwdDispatcher.dispatch(BackendType.TRITON, user_backend_enum, **kwargs)
-
-
-# ───────────────────────────────────────────────────────────────────────────
 # CSA forward (from compressed pool, in-kernel gather)
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -898,12 +615,8 @@ def _deepseek_csa_pool_attn_fwd_meta(
 __all__ = [
     "deepseek_attn_fwd",
     "deepseek_attn_bwd",
-    "deepseek_csa_attn_fwd",
-    "deepseek_csa_attn_bwd",
     "deepseek_csa_pool_attn_fwd",
     "DeepSeekAttnFwdDispatcher",
     "DeepSeekAttnBwdDispatcher",
-    "DeepSeekCSAAttnFwdDispatcher",
-    "DeepSeekCSAAttnBwdDispatcher",
     "DeepSeekCSAPoolAttnFwdDispatcher",
 ]

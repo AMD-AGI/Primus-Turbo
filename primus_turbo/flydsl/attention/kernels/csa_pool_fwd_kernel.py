@@ -3,19 +3,17 @@
 
 """csa_pool_fwd: V4 CSA forward with in-kernel pool gather (FlyDSL per-row).
 
-Forked from ``csa_fwd_kernel`` (the pre-gathered CSA forward). Instead of a
+The sparse branch gathers each top-K key directly from the compressed ``POOL``
+``[B, P, D]`` using ``TOPK`` ``[B, Sq, K_topk]`` indices, instead of consuming a
 materialised ``GATHERED`` ``[B, Sq, K_topk, D]`` tensor + additive
-``SPARSE_MASK``, the sparse branch gathers each top-K key directly from the
-compressed ``POOL`` ``[B, P, D]`` using ``TOPK`` ``[B, Sq, K_topk]`` indices.
-This avoids materialising the ``[B, Sq, K_topk, D]`` gathered buffer, saving
-the gather pass + its memory traffic (design §4.7).
+``SPARSE_MASK``. This avoids materialising the ``[B, Sq, K_topk, D]`` gathered
+buffer, saving the gather pass + its memory traffic (design §4.7).
 
 Per the Triton reference (`_csa_attention_pool_fwd_kernel`), a slot is masked
 (``NEG_INF``) when its index is out of the K-loop, ``< 0`` (the ``-1`` pad), or
 ``>= pool_size``; otherwise the row is gathered from ``POOL[bid, idx]`` and used
-with the plain ``qk * sm_scale`` score (no additive bias). The local SWA branch,
-the online softmax, and the sink epilogue are unchanged from the pre-gathered
-kernel. ``HEAD_GROUP`` is forced to 1 here (no banking).
+with the plain ``qk * sm_scale`` score (no additive bias). ``HEAD_GROUP`` is
+forced to 1 here (no banking).
 
 Layout: BHLD (Q/K_local/V_local/O all [B, H, Sq, D]).
   - POOL: [B, P, D] (no H dim -- shared across heads).
@@ -80,9 +78,9 @@ def build_csa_pool_fwd_module(
 ):
     """Build the V4 CSA-from-pool forward per-row launcher (in-kernel gather).
 
-    Parameters mirror ``build_csa_fwd_module``; ``head_group`` is forced to 1
-    (no banking) and the sparse branch gathers from ``POOL`` via ``TOPK`` rather
-    than reading a pre-gathered tensor. ``has_sparse`` is always effectively
+    ``head_group`` is forced to 1 (no banking) and the sparse branch gathers
+    from ``POOL`` via ``TOPK`` rather than reading a pre-gathered tensor.
+    ``has_sparse`` is always effectively
     True here (the ``K_topk == 0`` case short-circuits to the dense kernel in
     the op layer).
     """

@@ -14,9 +14,9 @@ builders in :mod:`primus_turbo.flydsl.attention.kernels`:
   the reference SWA kernel): bf16, ``D == 512``, ``swa_window > 0``, ``Sq == Sk``,
   ``scale == 1/sqrt(D)``, MQA (``K_H == 1``) or MHA (``K_H == H``), and *no* sink /
   additive bias / HCA split-mask (those fall back to Triton in the dispatcher).
-* :func:`csa_attention_fwd_flydsl_kernel` — CSA fused forward (local SWA + sparse
-  top-K + optional sink) in one online softmax. Wraps
-  ``csa_fwd_kernel.build_csa_fwd_module`` (the 2.79x-over-Triton kernel).
+* :func:`csa_pool_attention_fwd_flydsl_kernel` — CSA fused forward with in-kernel
+  gather from the compressed pool (local SWA + sparse top-K + optional sink) in
+  one online softmax. Wraps ``csa_pool_fwd_kernel.build_csa_pool_fwd_module``.
 
 Both return ``(out, lse)`` where ``out`` is ``[B, H, Sq, D]`` in input dtype and
 ``lse`` is fp32 ``[B, H, Sq]`` in the raw-qk-scaled domain (``m + ln(l)``, ``m``
@@ -40,7 +40,6 @@ import torch
 os.environ.setdefault("FLYDSL_SLA_FWD_ENABLE_DMA", "1")
 os.environ.setdefault("FLYDSL_WAVES_PER_EU", "2")
 
-from primus_turbo.flydsl.attention.kernels.csa_fwd_kernel import build_csa_fwd_module
 from primus_turbo.flydsl.attention.kernels.csa_pool_fwd_kernel import build_csa_pool_fwd_module
 from primus_turbo.flydsl.attention.kernels.sla_fwd_kernel import build_swa_fwd_module
 
@@ -149,157 +148,6 @@ def hca_attention_fwd_flydsl_kernel(
         lse.view(-1),
         B,
         Sq,
-    )
-    return o_bhld, lse
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# CSA fused forward (local SWA + sparse top-K + optional sink)
-# ───────────────────────────────────────────────────────────────────────────
-
-_CSA_KERNEL_CACHE = {}
-_CSA_KERNEL_CACHE_LOCK = threading.Lock()
-
-
-def _get_csa_kernel(
-    num_heads_q, head_dim, swa_window, dtype_str, block_n, block_k, waves_per_eu, has_sink, has_sparse, mqa_kv, head_group
-):
-    key = (
-        num_heads_q,
-        head_dim,
-        swa_window,
-        dtype_str,
-        block_n,
-        block_k,
-        waves_per_eu,
-        has_sink,
-        has_sparse,
-        mqa_kv,
-        head_group,
-    )
-    with _CSA_KERNEL_CACHE_LOCK:
-        if key in _CSA_KERNEL_CACHE:
-            return _CSA_KERNEL_CACHE[key]
-        launch = build_csa_fwd_module(
-            num_heads=num_heads_q,
-            head_dim=head_dim,
-            swa_window=int(swa_window),
-            dtype_str=dtype_str,
-            waves_per_eu=waves_per_eu,
-            block_n=block_n,
-            block_k=block_k,
-            has_sink=has_sink,
-            has_sparse=has_sparse,
-            mqa_kv=mqa_kv,
-            head_group=head_group,
-        )
-        _CSA_KERNEL_CACHE[key] = launch
-        return launch
-
-
-def csa_attention_fwd_flydsl_kernel(
-    q: torch.Tensor,  # [B, H, Sq, D]
-    k_local: torch.Tensor,  # [B, K_H, Sq, D]
-    v_local: torch.Tensor,  # [B, K_H, Sq, D]
-    gathered: torch.Tensor,  # [B, Sq, K_topk, D]
-    sparse_mask: torch.Tensor,  # [B, Sq, K_topk] additive
-    sink: Optional[torch.Tensor],  # [H] or None
-    swa_window: int,
-    scale: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """CSA fused forward via the ported FlyDSL CSA kernel (the 2.79x kernel).
-
-    Returns ``(out, lse)`` with ``out`` bf16 ``[B, H, Sq, D]`` and ``lse`` fp32
-    ``[B, H, Sq]`` in the raw-qk-scaled domain (``m + ln(l)``).
-    """
-    if q.dim() != 4 or k_local.dim() != 4 or v_local.dim() != 4:
-        raise ValueError("rank-4 q/k_local/v_local required")
-    if gathered.dim() != 4:
-        raise ValueError("rank-4 gathered [B,Sq,K_topk,D] required")
-    if sparse_mask.dim() != 3:
-        raise ValueError("rank-3 sparse_mask [B,Sq,K_topk] required")
-    B, HQ, Sq, D = q.shape
-    Bk, HK, Sk, Dk = k_local.shape
-    if (Bk, Sk, Dk) != (B, Sq, D) or v_local.shape != k_local.shape:
-        raise ValueError("k_local/v_local shape mismatch w.r.t. q")
-    if HK != 1 and HK != HQ:
-        raise ValueError(f"K_H must be 1 or {HQ}; got {HK}")
-    Bg, Sqg, K_topk, Dg = gathered.shape
-    if Bg != B or Sqg != Sq or Dg != D:
-        raise ValueError(f"gathered shape mismatch {tuple(gathered.shape)}")
-    Bm, Sqm, Km = sparse_mask.shape
-    if Bm != B or Sqm != Sq or Km != K_topk:
-        raise ValueError(f"sparse_mask shape mismatch {tuple(sparse_mask.shape)}")
-    if q.dtype != torch.bfloat16:
-        raise NotImplementedError(f"bf16 only; got {q.dtype}")
-    if D != 512:
-        raise NotImplementedError(f"head_dim=512 only; got {D}")
-    if int(swa_window) <= 0:
-        raise NotImplementedError("swa_window > 0 required")
-    expected_scale = 1.0 / math.sqrt(D)
-    if not math.isclose(float(scale), expected_scale, rel_tol=1e-4):
-        raise NotImplementedError(f"only scale=1/sqrt(D) supported; got {scale}")
-
-    has_sink = sink is not None
-    has_sparse = int(K_topk) > 0
-    mqa = (HK == 1) and (HQ > 1)
-
-    if has_sink:
-        sink_fp32 = sink.float().contiguous()
-        if sink_fp32.shape != (HQ,):
-            raise ValueError(f"sink shape must be ({HQ},); got {tuple(sink_fp32.shape)}")
-    else:
-        sink_fp32 = torch.zeros((max(HQ, 1),), dtype=torch.float32, device=q.device)
-
-    q_bhld = q.contiguous()
-    k_bhld = k_local.contiguous()
-    v_bhld = v_local.contiguous()
-    o_bhld = torch.empty_like(q_bhld)
-    lse = torch.zeros((B, HQ, Sq), device=q.device, dtype=torch.float32)
-
-    if K_topk > 0:
-        gathered_c = gathered.contiguous()
-        if sparse_mask.dtype != torch.float32:
-            sparse_mask_fp32 = sparse_mask.float().contiguous()
-        else:
-            sparse_mask_fp32 = sparse_mask.contiguous()
-    else:
-        gathered_c = torch.empty((B, Sq, 1, D), dtype=q.dtype, device=q.device)
-        sparse_mask_fp32 = torch.zeros((B, Sq, 1), dtype=torch.float32, device=q.device)
-
-    block_n = int(os.environ.get("PRIMUS_V4_CSA_BLOCK_N", "8"))
-    block_k = int(os.environ.get("PRIMUS_V4_CSA_BLOCK_K", "16"))
-    waves_per_eu = int(os.environ.get("FLYDSL_WAVES_PER_EU", "2"))
-    # HEAD_GROUP is the banked head-group fusion (a program serves HG query
-    # heads). HG=2 is numerically correct for both MQA and MHA after the
-    # per-head local K/V load fix in ``csa_fwd_kernel`` (the earlier ~3 dB MHA
-    # error was the banked path reading only head 0's local K/V for the whole
-    # group, not a flydsl 0.2.0 drift). Default stays HG=1; HG=2 is opt-in via
-    # the env knob pending a forward perf sweep (the banked benefit for MHA is
-    # the head-shared gathered loads + fewer blocks, not the per-head local K/V).
-    head_group = int(os.environ.get("PRIMUS_V4_CSA_HEAD_GROUP", "1"))
-    # Dense-fallback (K_topk==0) has no head-group payoff and triggers a flyc
-    # closure-cache collision across has_sparse values; force HG=1 there.
-    if not has_sparse:
-        head_group = 1
-    if HQ % head_group != 0:
-        head_group = 1
-
-    launch = _get_csa_kernel(
-        HQ, D, int(swa_window), "bf16", block_n, block_k, waves_per_eu, has_sink, has_sparse, mqa, head_group
-    )
-    launch(
-        q_bhld.view(-1),
-        k_bhld.view(-1),
-        v_bhld.view(-1),
-        gathered_c.view(-1),
-        sparse_mask_fp32.view(-1),
-        sink_fp32.view(-1),
-        o_bhld.view(-1),
-        lse.view(-1),
-        B,
-        Sq,
-        int(K_topk),
     )
     return o_bhld, lse
 
@@ -424,6 +272,5 @@ def csa_pool_attention_fwd_flydsl_kernel(
 
 __all__ = [
     "hca_attention_fwd_flydsl_kernel",
-    "csa_attention_fwd_flydsl_kernel",
     "csa_pool_attention_fwd_flydsl_kernel",
 ]

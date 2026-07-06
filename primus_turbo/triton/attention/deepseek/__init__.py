@@ -28,19 +28,15 @@ from primus_turbo.triton.attention.deepseek.hca_attention_fwd import (
     _launch_hca_attention_fwd,
 )
 from primus_turbo.triton.attention.deepseek.csa_attention_bwd import (
-    _launch_csa_attention_bwd,
     _launch_csa_attention_pool_bwd,
 )
 from primus_turbo.triton.attention.deepseek.csa_attention_fwd import (
-    _launch_csa_attention_fwd,
     _launch_csa_attention_pool_fwd,
 )
 
 __all__ = [
     "_launch_hca_attention_fwd",
     "_launch_hca_attention_bwd",
-    "_launch_csa_attention_fwd",
     "_launch_csa_attention_pool_fwd",
-    "_launch_csa_attention_bwd",
     "_launch_csa_attention_pool_bwd",
 ]

@@ -11,8 +11,8 @@ references:
 
 * dense / SWA          (``compress_ratio == 0``)   -> ``hca_attention``
 * HCA                  (``compress_ratio == 128``)  -> ``hca_attention`` (split-mask)
-* CSA (pre-gathered)   (``compress_ratio == 4``)    -> ``csa_attention``
-* CSA (from compressed pool, in-kernel gather)      -> ``csa_attention_from_pool``
+* CSA (from compressed pool, in-kernel gather)  (``compress_ratio == 4``)
+  -> ``csa_attention_from_pool``
 
 Forward is checked by SNR vs the eager reference; backward gradients are
 checked by SNR against autograd through the eager reference.
@@ -40,7 +40,6 @@ from primus_turbo.pytorch.ops.attention import (
     eager_csa_attention,
     sliding_window_causal_mask,
     hca_attention,
-    csa_attention,
     csa_attention_from_pool,
 )
 from tests.pytorch.test_utils import compute_snr
@@ -240,59 +239,6 @@ def test_v4_hca_attention_bwd(dtype, B, H, S, D, swa_window, enable_sink, backen
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "B,H,S,D",
-    [
-        (1, 8, 256, 512),    # V4-Flash-like (toy heads)
-        (2, 4, 512, 512),    # V4-Flash-like (toy heads)
-        (1, 16, 256, 512),   # V4-Pro-like: wider head count
-    ],
-)
-@pytest.mark.parametrize("K_topk", [16, 64, 128])  # 128 covers the larger V4-Pro top-k regime
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("backend", _BACKENDS, ids=_BACKEND_IDS)
-def test_v4_csa_gathered(dtype, B, H, S, D, K_topk, enable_sink, backend):
-    _skip_if_flydsl_unsupported(backend, D)
-    torch.manual_seed(0)
-    dev = "cuda"
-    scale = D**-0.5
-    swa_window = 128
-
-    q = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
-    k_local = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
-    v_local = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
-    gathered = torch.randn(B, S, K_topk, D, device=dev, dtype=dtype, requires_grad=True)
-    sparse_mask = torch.zeros(B, S, K_topk, device=dev, dtype=dtype)
-    sink = (
-        torch.randn(H, device=dev, dtype=dtype, requires_grad=True) if enable_sink else None
-    )
-
-    qr, kr, vr, gr = (_clone_leaf(t) for t in (q, k_local, v_local, gathered))
-    sinkr = _clone_leaf(sink) if enable_sink else None
-
-    out = csa_attention(
-        q, k_local, v_local, gathered, sink=sink, swa_window=swa_window,
-        sparse_mask=sparse_mask, attn_dropout=0.0, training=True, scale=scale, backend=backend,
-    )
-    out_ref = eager_csa_attention(
-        qr, kr, vr, gr, sink=sinkr, swa_window=swa_window,
-        sparse_mask=sparse_mask, attn_dropout=0.0, training=True, scale=scale,
-    )
-    assert compute_snr(out_ref, out) > SNR_FWD
-
-    g = torch.randn_like(out)
-    out.backward(g)
-    out_ref.backward(g)
-    assert compute_snr(qr.grad, q.grad) > SNR_BWD
-    assert compute_snr(kr.grad, k_local.grad) > SNR_BWD
-    assert compute_snr(vr.grad, v_local.grad) > SNR_BWD
-    assert compute_snr(gr.grad, gathered.grad) > SNR_BWD
-    if enable_sink:
-        assert compute_snr(sinkr.grad, sink.grad) > SNR_BWD
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "B,H,S,D",
@@ -359,18 +305,19 @@ def test_v4_csa_ktopk_zero_falls_back_to_dense():
     dev = "cuda"
     dtype = torch.bfloat16
     B, H, S, D = 1, 8, 256, 512
+    P = 64
     scale = D**-0.5
     swa_window = 128
 
     q = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
     k_local = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
     v_local = torch.randn(B, H, S, D, device=dev, dtype=dtype, requires_grad=True)
-    gathered = torch.empty(B, S, 0, D, device=dev, dtype=dtype)
-    sparse_mask = torch.empty(B, S, 0, device=dev, dtype=dtype)
+    pool = torch.randn(B, P, D, device=dev, dtype=dtype, requires_grad=True)
+    topk = torch.empty(B, S, 0, device=dev, dtype=torch.int64)
 
-    out = csa_attention(
-        q, k_local, v_local, gathered, sink=None, swa_window=swa_window,
-        sparse_mask=sparse_mask, attn_dropout=0.0, training=True, scale=scale,
+    out = csa_attention_from_pool(
+        q, k_local, v_local, pool, topk_idxs=topk, sink=None, swa_window=swa_window,
+        attn_dropout=0.0, training=True, scale=scale,
     )
     out_dense = hca_attention(
         q, k_local, v_local, sink=None, swa_window=swa_window, additive_mask=None,
