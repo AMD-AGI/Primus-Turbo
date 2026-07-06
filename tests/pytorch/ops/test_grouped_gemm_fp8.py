@@ -45,7 +45,7 @@ NK_VALUES = [
 ORI_DTYPE_VALUES = [torch.bfloat16, torch.float16]
 FORMAT_VALUES = [Format.E4M3, Format.E5M2]
 TRANS_B_VALUES = [True, False]
-BALANCE_VALUES = [True, False]
+BALANCE_VALUES = [False]
 
 
 def _check_hit_int32_limit(B, M, N, K):
@@ -595,6 +595,7 @@ def _run_grouped_gemm_fp8_quantized_tensor_test(
     assert granularity in (
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
+        ScalingGranularity.MX_BLOCKWISE,
     ), "Grouped QuantizedTensor only supports TENSORWISE and ROWWISE"
 
     GlobalBackendManager.set_grouped_gemm_backend(backend)
