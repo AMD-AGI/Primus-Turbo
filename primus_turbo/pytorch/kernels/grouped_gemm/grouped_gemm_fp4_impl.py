@@ -42,8 +42,9 @@ class GroupedGEMMFP4TritonBackend(KernelBackend):
     """Triton persistent-kernel backend for MXFP4 grouped GEMM (forward / dgrad).
 
     MX_BLOCKWISE only, NT layout (trans_b=True). ``b`` is FP4-packed (G, N, K/2),
-    so the logical contraction ``K`` is ``b.shape[-1] * 2`` (already zero-padded
-    to BLOCK_SIZE_K=128 by the quantizer) and the free dim ``N`` is ``b.shape[-2]``.
+    so the logical contraction ``K`` is ``b.shape[-1] * 2`` and the free dim ``N``
+    is ``b.shape[-2]``. ``K`` only needs to be a multiple of the MX block size 32
+    (the kernel masks a partial BLOCK_SIZE_K=128 tail, e.g. gpt-oss-20b K=2880).
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.MX_BLOCKWISE}

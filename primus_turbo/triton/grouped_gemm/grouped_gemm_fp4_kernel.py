@@ -24,9 +24,10 @@ FP4 packing notes:
     loads a (K/32, free) tile (coalesced) and transposes it back in-reg for
     tl.dot_scaled.
 
-Only EVEN contraction (a multiple of BLOCK_SIZE_K = 128 logical elements) is
-supported; the FP4 quantizer pads K to 128 and the MX wrapper pads per-group M
-to 128, so this always holds in practice.
+The forward kernel masks a partial tail K-iter, so the contraction K only needs
+to be a multiple of the MX block size (VEC_SIZE = 32 logical elements), e.g.
+gpt-oss-20b K = 2880; it does not have to be a multiple of BLOCK_SIZE_K = 128.
+The variable-K (wgrad) wrapper still pads per-group M to 128.
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ def _grouped_mxfp4_persistent_gemm_kernel(
     out_offs_ptr,  # (G+1) int64 — write base along M (C, tile count)
     G,
     N,
-    K,  # logical contraction size (multiple of BLOCK_SIZE_K)
+    K,  # logical contraction size (multiple of VEC; partial BLOCK_SIZE_K tail masked)
     stride_am,
     stride_ak,  # along packed K bytes
     stride_bg,
@@ -88,6 +89,7 @@ def _grouped_mxfp4_persistent_gemm_kernel(
     CHUNK_SIZE: tl.constexpr,
     CACHE_MODIFIER: tl.constexpr,
     VEC: tl.constexpr,
+    EVEN_K: tl.constexpr,  # K is a multiple of BLOCK_SIZE_K (fast, no tail mask)
 ):
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
@@ -152,12 +154,26 @@ def _grouped_mxfp4_persistent_gemm_kernel(
         )
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        loop_k = K // BLOCK_SIZE_K
+        loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         for ki in range(0, loop_k):
-            a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)  # (BM, BK/2)
-            b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)  # (BK/2, BN)
-            a_s = tl.trans(tl.load(AS_BASE))  # (BK/32, BM) -> (BM, BK/32)
-            b_s = tl.trans(tl.load(BS_BASE))  # (BK/32, BN) -> (BN, BK/32)
+            if EVEN_K:
+                a = tl.load(tl.multiple_of(A_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)  # (BM, BK/2)
+                b = tl.load(tl.multiple_of(B_BASE, (16, 1)), cache_modifier=CACHE_MODIFIER)  # (BK/2, BN)
+                a_s = tl.trans(tl.load(AS_BASE))  # (BK/32, BM) -> (BM, BK/32)
+                b_s = tl.trans(tl.load(BS_BASE))  # (BK/32, BN) -> (BN, BK/32)
+            else:
+                # Tail iter may be partial when K is not a multiple of BLOCK_SIZE_K
+                # (e.g. gpt-oss-20b K=2880). Mask packed-K / scale rows past the real
+                # contraction: masked FP4 bytes read back 0 (zero MMA contribution)
+                # and we never read beyond the K/2 (K/32) extents. K is a multiple of
+                # VEC, so the remainder is whole 1x32 scale blocks.
+                k_rem = K - ki * BLOCK_SIZE_K  # logical elements still to reduce
+                pk = k_rem // 2  # valid packed bytes this iter
+                sk = k_rem // VEC  # valid scale entries this iter
+                a = tl.load(A_BASE, mask=rk[None, :] < pk, other=0, cache_modifier=CACHE_MODIFIER)
+                b = tl.load(B_BASE, mask=rk[:, None] < pk, other=0, cache_modifier=CACHE_MODIFIER)
+                a_s = tl.trans(tl.load(AS_BASE, mask=rks[:, None] < sk, other=0))
+                b_s = tl.trans(tl.load(BS_BASE, mask=rks[:, None] < sk, other=0))
             acc = tl.dot_scaled(a, a_s, "e2m1", b, b_s, "e2m1", acc)
             A_BASE += BK_PACK * stride_ak
             B_BASE += BK_PACK * stride_bk
@@ -189,10 +205,12 @@ def grouped_gemm_mxfp4_triton_kernel(
 
     group_offs:     read offsets along M for A / A_scale.
     group_offs_out: write offsets along M for C (defaults to group_offs).
-    K is the logical contraction size (must be a multiple of BLOCK_SIZE_K=128).
+    K is the logical contraction size (must be a multiple of the MX block size
+    VEC_SIZE=32; a partial BLOCK_SIZE_K=128 tail is masked, e.g. K=2880).
     """
     if group_offs_out is None:
         group_offs_out = group_offs
+    assert K % VEC_SIZE == 0, f"K must be a multiple of the MX block size {VEC_SIZE}, got {K}"
     if is_gfx950():
         set_triton_knobs_gfx950()
     G = b.shape[0]
@@ -243,6 +261,7 @@ def grouped_gemm_mxfp4_triton_kernel(
         CHUNK_SIZE=chunk,
         CACHE_MODIFIER=".ca",
         VEC=VEC_SIZE,
+        EVEN_K=(K % BK == 0),
         num_warps=8,
         num_stages=2,
         waves_per_eu=0,

@@ -13,8 +13,13 @@ from primus_turbo.pytorch.core.low_precision import (
     ScaleDtype,
     ScalingGranularity,
     check_mxfp4_support,
+    float4_e2m1fn_x2,
 )
 from primus_turbo.pytorch.ops.grouped_gemm_fp4 import grouped_gemm_fp4
+from primus_turbo.pytorch.ops.quantization import dequantize_fp4, quantize_fp4
+from primus_turbo.triton.grouped_gemm.grouped_gemm_fp4_kernel import (
+    grouped_gemm_mxfp4_triton_kernel,
+)
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
@@ -151,6 +156,70 @@ def test_grouped_gemm_fp4_unaligned_nk(B, M, NK, dtype, balance):
     NaN (a 0*NaN would poison the dot)."""
     N, K = NK
     _run(B, M, N, K, dtype, balance)
+
+
+# ----------------------------------------------------------------------------
+# Raw forward kernel with K NOT a multiple of BLOCK_SIZE_K=128 (gpt-oss-20b
+# K=2880). The autograd op zero-pads the contraction to 128, so only a *direct*
+# kernel call over an unpadded K exercises the EVEN_K=False tail-mask path.
+# Build 128-padded operands, then slice off the zero pad to feed the real K and
+# assert the masked run is bit-identical to the padded run (and matches a
+# dequant reference).
+# ----------------------------------------------------------------------------
+@pytest.mark.parametrize("N", [2880, 5760])
+@pytest.mark.parametrize("K", [2880, 2848])
+def test_grouped_gemm_fp4_kernel_k_not_mod128(N, K):
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+    assert K % 128 != 0 and K % 32 == 0, "test wants a 32- but not 128-multiple K"
+    device = "cuda:0"
+    torch.manual_seed(0)
+    G, M = 3, 256
+    mx = ScalingGranularity.MX_BLOCKWISE
+
+    a = torch.randn(G * M, K, device=device, dtype=torch.bfloat16) * 0.3
+    b = torch.randn(G, N, K, device=device, dtype=torch.bfloat16) * 0.3
+    a_fp4, a_s = quantize_fp4(a, float4_e2m1fn_x2, mx, block_size=32, axis=1)
+    b_fp4, b_s = quantize_fp4(b.reshape(G * N, K), float4_e2m1fn_x2, mx, block_size=32, axis=1)
+    kpad = a_fp4.shape[1] * 2  # quantizer padded K up to 128
+    b_fp4 = b_fp4.reshape(G, N, kpad // 2).contiguous()
+    b_s = b_s.reshape(G, N, kpad // 32).contiguous()
+    group_offs = torch.arange(0, G + 1, device=device, dtype=torch.int64) * M
+
+    out_pad = grouped_gemm_mxfp4_triton_kernel(
+        a_fp4, a_s, b_fp4, b_s, group_offs, N, kpad, group_offs_out=group_offs
+    )
+    pk, sk = K // 2, K // 32
+    out_k = grouped_gemm_mxfp4_triton_kernel(
+        a_fp4[:, :pk].contiguous(),
+        a_s[:, :sk].contiguous(),
+        b_fp4[:, :, :pk].contiguous(),
+        b_s[:, :, :sk].contiguous(),
+        group_offs,
+        N,
+        K,
+        group_offs_out=group_offs,
+    )
+
+    a_dq = dequantize_fp4(a_fp4, torch.bfloat16, mx, block_size=32, axis=1, scale_inv=a_s)[:, :K]
+    b_dq = dequantize_fp4(
+        b_fp4.reshape(G * N, kpad // 2),
+        torch.bfloat16,
+        mx,
+        block_size=32,
+        axis=1,
+        scale_inv=b_s.reshape(G * N, kpad // 32),
+    )[:, :K].reshape(G, N, K)
+    ref = torch.empty(G * M, N, device=device, dtype=torch.float32)
+    for g in range(G):
+        ref[g * M : (g + 1) * M] = a_dq[g * M : (g + 1) * M].float() @ b_dq[g].float().T
+
+    # the unpadded-K (masked) run must recover the 128-padded run bit-for-bit
+    assert torch.equal(out_pad, out_k), f"max|Δ|={(out_pad - out_k).abs().max().item()}"
+    snr = compute_snr(ref.to(torch.bfloat16), out_k)
+    print(f"\nN={N} K={K} kpad={kpad} SNR={snr:.2f} dB")
+    assert snr > SNR_THRESHOLD, f"snr={snr:.2f} too low"
 
 
 # ----------------------------------------------------------------------------
