@@ -4,73 +4,41 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Fused cross-rank dispatch PUSH + grouped BF16 GEMM (NT), FlyDSL.
-
-Mega analog of ``dispatch_grouped_gemm_fp8`` for bf16. The GEMM is NOT built on
-the fp8 tile-spec; instead it reuses the shared ``gemm_bf16_nt_tile`` (the dense
-bf16 software pipeline, per-tile compute closure) from ``gemm_bf16_kernel.py``,
-and the cross-rank comm PUSH from the fp8 path is encapsulated as
-``dispatch_bf16_tile`` (byte-agnostic, reused for bf16 by treating each token row
-as i32 words).
-
-Role-specialized single kernel (mirrors the fp8 fused kernel):
-  * ``block_index < num_dispatch_cu`` blocks push token rows to peer pools over XGMI
-    and signal a per-pool-block scoreboard (``dispatch_bf16_tile``).
-  * the remaining blocks each compute ONE NT output tile of the grouped GEMM
-    (``A=pool[M,K]`` bf16, per-expert ``B=weight[G,N,K]`` bf16 -> ``C=out[M,N]``
-    bf16) via ``gemm_bf16_nt_tile``, spinning on the scoreboard until their pool
-    block is filled. The comm latency hides under the MFMA-bound GEMM.
-
-NT only (the bf16 GEMM kernel implements NT only). K must be a multiple of
-BLOCK_K (DSv3 shapes qualify) and hidden a multiple of 512 (warp push step).
-"""
-
 import functools
 from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, const_expr, range_constexpr
-from flydsl.expr.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-    create_buffer_resource_from_addr,
-)
+from flydsl.expr import arith, const_expr
+from flydsl.expr.buffer_ops import _unwrap_value, buffer_load, create_buffer_resource
 from flydsl.expr.typing import AddressSpace, PointerType
 
-from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
-from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
-from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
+from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     GEMM_TILE,
     _make_shared_storage,
     gemm_bf16_tn_variable_k_tile,
     load_go_i64,
 )
-from primus_turbo.flydsl.mega.prims import (
-    atomic_add,
-    ld,
-    read_clock,
-    spin_timed_out,
-    st,
-)
+from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
+from primus_turbo.flydsl.mega.prims import ld, read_clock, spin_timed_out
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs, xcd_remap_pid
 
 
+def _i64(v):
+    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
+
+
 @functools.lru_cache(maxsize=1)
 def get_dummy_tensor():
-    """Cached 1-elem i32 placeholder for kernel slots the active layout const-folds away."""
     return torch.empty(1, dtype=torch.int32)
 
 
-_HANDLE_PROLOGUE_LEN = 11
-
-
 @functools.lru_cache(maxsize=256)
-def _compile(
+def _make_kernel(
     out_features,
     hidden_size,
     num_max_pool_tokens,
@@ -79,15 +47,13 @@ def _compile(
     num_dispatch_cu,
     num_comm,
     nt_vmcnt=3,
-    waves_per_eu=2,
-    agpr_alloc=0,
     out_fp16=False,
     GROUP_M=1,
     layout="nt",
     trans_c=False,
     G=0,
-    has_snapshots=False,
     num_xcd=8,
+    num_ranks=8,
 ):
     K = hidden_size
     is_tn = layout == "tn"
@@ -106,12 +72,7 @@ def _compile(
         assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
         n_blocks = out_features // BLOCK_N
         worst_case_tiles = num_max_pool_tokens // BLOCK_M
-
-    _grid_size = num_dispatch_cu + (TOTAL if is_tn else worst_case_tiles * n_blocks)
-    _copy_threads = _grid_size * _BLOCK_THREADS
-    _copy_iters = (num_max_pool_tokens + _copy_threads - 1) // _copy_threads
-    _meta_records = 8 * 4
-    _pool_records = num_max_pool_tokens * 4
+    NPB = num_max_pool_tokens // BLOCK_M
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_kernel(
@@ -125,48 +86,20 @@ def _compile(
         WEIGHTS: fx.Tensor,
         OUTPUT: fx.Tensor,
         TILE_TO_GROUP: fx.Tensor,
-        EXPECTED: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
         GROUP_OFFS: fx.Tensor,
-        DISPATCHED_SRC_RANK: fx.Tensor,
-        DISPATCHED_SRC_ROW: fx.Tensor,
-        DISPATCHED_META: fx.Tensor,
         c_n: fx.Int32,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
+        disp_parity: fx.Int32,
+        expected_dispatch: fx.Int32,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         comm_block_count = fx.Int32(num_dispatch_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-
-        if const_expr(has_snapshots):
-            src_rank_res = create_buffer_resource(DISPATCHED_SRC_RANK, max_size=True)
-            src_row_res = create_buffer_resource(DISPATCHED_SRC_ROW, max_size=True)
-            src_meta_res = create_buffer_resource(DISPATCHED_META, max_size=True)
-            dst_rank_res = create_buffer_resource_from_addr(
-                sym_layout.origin_rank_ptr, num_records_bytes=_pool_records
-            )
-            dst_slot_res = create_buffer_resource_from_addr(
-                sym_layout.origin_slot_ptr, num_records_bytes=_pool_records
-            )
-            dst_meta_res = create_buffer_resource_from_addr(
-                sym_layout.meta_scalars_ptr, num_records_bytes=_meta_records
-            )
-            gtid = block_index * fx.Int32(_BLOCK_THREADS) + thread_index
-            for _c_it in range_constexpr(_copy_iters):
-                row = gtid + fx.Int32(_c_it * _copy_threads)
-                if row < fx.Int32(num_max_pool_tokens):
-                    buffer_store(
-                        buffer_load(src_rank_res, row, vec_width=1, dtype=fx.T.i32()), dst_rank_res, row
-                    )
-                    buffer_store(
-                        buffer_load(src_row_res, row, vec_width=1, dtype=fx.T.i32()), dst_slot_res, row
-                    )
-            if gtid < fx.Int32(8):
-                buffer_store(
-                    buffer_load(src_meta_res, gtid, vec_width=1, dtype=fx.T.i32()), dst_meta_res, gtid
-                )
+        bank_offset = disp_parity * fx.Int32(NPB)
+        expected_dispatch_i64 = _i64(expected_dispatch)
 
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
         expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
@@ -177,42 +110,32 @@ def _compile(
         if const_expr(is_tn):
             go = fx.rocdl.make_buffer_tensor(GROUP_OFFS, max_size=False, num_records_bytes=(G + 1) * 8)
             go_div = fx.logical_divide(go, fx.make_layout(1, 1))
-            expected_resource = create_buffer_resource(EXPECTED, max_size=True)
         else:
             group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
-            expected_resource = create_buffer_resource(EXPECTED, max_size=True)
             num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
-
-        dispatch_tile = dispatch_bf16_tile(
-            thread_index=thread_index,
-            hidden_size=hidden_size,
-            num_max_pool_tokens=num_max_pool_tokens,
-            input_resource=input_resource,
-            expert_send_dst_rank_resource=expert_send_dst_rank_resource,
-            expert_send_dst_row_resource=expert_send_dst_row_resource,
-            expert_send_count_resource=expert_send_count_resource,
-            expert_send_offset_resource=expert_send_offset_resource,
-            dispatched_token_idx_resource=dispatched_token_idx_resource,
-            pool_address_resource=None,
-            signal=True,
-            scoreboard_address_resource=None,
-            block_m=BLOCK_M,
-            pool_base=sym_layout.pool_ptr,
-            pool_offsets_resource=create_buffer_resource_from_addr(
-                sym_layout.offsets_ptr, num_records_bytes=int(sym_layout.num_ranks) * 8
-            ),
-            scoreboard_base=sym_layout.scoreboard_ptr,
-            scoreboard_offsets_resource=create_buffer_resource_from_addr(
-                sym_layout.signal_offsets_ptr, num_records_bytes=int(sym_layout.num_ranks) * 8
-            ),
-        )
 
         if block_index < comm_block_count:
             local_task_count = (
                 fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
             ) // comm_block_count
             for task_iteration in range(local_task_count):
-                dispatch_tile(block_index + task_iteration * comm_block_count, fx.Int32(0), 1)
+                dispatch_bf16_tile(
+                    sym_layout,
+                    thread_index=thread_index,
+                    hidden_size=hidden_size,
+                    num_max_pool_tokens=num_max_pool_tokens,
+                    input_res=input_resource,
+                    expert_send_dst_rank_res=expert_send_dst_rank_resource,
+                    expert_send_dst_row_res=expert_send_dst_row_resource,
+                    expert_send_count_res=expert_send_count_resource,
+                    expert_send_offset_res=expert_send_offset_resource,
+                    dispatched_token_idx_res=dispatched_token_idx_resource,
+                    task_index=block_index + task_iteration * comm_block_count,
+                    signal=True,
+                    block_m=BLOCK_M,
+                    disp_parity=disp_parity,
+                    num_ranks=num_ranks,
+                )
         elif const_expr(is_tn):
             tile_index = block_index - comm_block_count
             if tile_index < fx.Int32(TOTAL):
@@ -227,23 +150,22 @@ def _compile(
                     block_n = local % fx.Int32(N_BLOCKS_N)
                 m_start = load_go_i64(go_div, group_idx)
                 m_end = load_go_i64(go_div, group_idx + fx.Int32(1))
-                sb_base = sym_layout.scoreboard_ptr
-                pb0 = m_start // fx.Int32(BLOCK_M)
-                n_pb = m_end // fx.Int32(BLOCK_M) - pb0
+                sb_base = sym_layout.dispatch_flag_ptr
+                ge_blk = bank_offset + group_idx
                 if thread_index == fx.Int32(0):
-                    for j in range(n_pb):
-                        pbj = pb0 + j
-                        exp_c = buffer_load(expected_resource, pbj, vec_width=1, dtype=fx.T.i32())
-                        spin_start = read_clock()
-                        sig = ld(sb_base, pbj, scope="sys")
-                        while sig < exp_c:
-                            fx.rocdl.s_sleep(fx.Int32(2))
-                            if spin_timed_out(spin_start):
-                                fx.printf(
-                                    "MEGA tn wgrad gate timeout: pb={} sig={} exp={}\n", pbj, sig, exp_c
-                                )
-                                spin_start = read_clock()
-                            sig = ld(sb_base, pbj, scope="sys")
+                    spin_start = read_clock()
+                    sig = ld(sb_base, ge_blk, scope="sys", dtype=fx.T.i64())
+                    while sig != expected_dispatch_i64:
+                        fx.rocdl.s_sleep(fx.Int32(2))
+                        if spin_timed_out(spin_start):
+                            fx.printf(
+                                "MEGA tn wgrad gate timeout: expert={} sig={} exp={}\n",
+                                group_idx,
+                                sig,
+                                expected_dispatch_i64,
+                            )
+                            spin_start = read_clock()
+                        sig = ld(sb_base, ge_blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
                 pool_ptr_ty = PointerType.get(
                     elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
@@ -275,12 +197,6 @@ def _compile(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                 )
-                if thread_index == fx.Int32(0):
-                    exp_r = buffer_load(expected_resource, pb0, vec_width=1, dtype=fx.T.i32())
-                    prev = atomic_add(sb_base, pb0, fx.Int32(1), scope="sys")
-                    if prev == exp_r + fx.Int32(TILES_PER_GROUP - 1):
-                        for j in range(n_pb):
-                            st(sb_base, pb0 + j, fx.Int32(0), scope="sys")
         else:
             tile_index = block_index - comm_block_count
             real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
@@ -295,25 +211,25 @@ def _compile(
                 block_m = first_pid_m + (pid_in_group % group_size_m)
                 block_n = pid_in_group // group_size_m
                 c_m_real = fx.Int32(num_max_pool_tokens)
-                sb_base = sym_layout.scoreboard_ptr
-                expected_count = buffer_load(expected_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                sb_base = sym_layout.dispatch_flag_ptr
+                g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                blk = bank_offset + g_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
-                    signal = ld(sb_base, block_m, scope="sys")
-                    while signal < expected_count:
+                    signal = ld(sb_base, blk, scope="sys", dtype=fx.T.i64())
+                    while signal != expected_dispatch_i64:
                         fx.rocdl.s_sleep(fx.Int32(2))
                         if spin_timed_out(spin_start):
                             fx.printf(
-                                "MEGA dispatch GEMM gate timeout: block={} signal={} expected={}\n",
-                                block_m,
+                                "MEGA dispatch GEMM gate timeout: expert={} signal={} expected={}\n",
+                                g_idx,
                                 signal,
-                                expected_count,
+                                expected_dispatch_i64,
                             )
                             spin_start = read_clock()
-                        signal = ld(sb_base, block_m, scope="sys")
+                        signal = ld(sb_base, blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
 
-                g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 gbase = g_idx * fx.Int32(K) * c_n
                 pool_ptr_ty = PointerType.get(
                     elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
@@ -338,10 +254,48 @@ def _compile(
                     nt_vmcnt=nt_vmcnt,
                     b_group_base=gbase,
                 )
-                if thread_index == fx.Int32(0):
-                    prev = atomic_add(sb_base, block_m, fx.Int32(1), scope="sys")
-                    if prev == expected_count + fx.Int32(n_blocks - 1):
-                        st(sb_base, block_m, fx.Int32(0), scope="sys")
+
+    grid_size = num_dispatch_cu + (TOTAL if is_tn else worst_case_tiles * n_blocks)
+    return dispatch_grouped_gemm_kernel, grid_size
+
+
+@functools.lru_cache(maxsize=256)
+def _compile(
+    out_features,
+    hidden_size,
+    num_max_pool_tokens,
+    BLOCK_M,
+    BLOCK_N,
+    num_dispatch_cu,
+    num_comm,
+    nt_vmcnt=3,
+    waves_per_eu=2,
+    agpr_alloc=0,
+    out_fp16=False,
+    GROUP_M=1,
+    layout="nt",
+    trans_c=False,
+    G=0,
+    num_xcd=8,
+    num_ranks=8,
+):
+    kernel, grid_size = _make_kernel(
+        out_features,
+        hidden_size,
+        num_max_pool_tokens,
+        BLOCK_M,
+        BLOCK_N,
+        num_dispatch_cu,
+        num_comm,
+        nt_vmcnt=nt_vmcnt,
+        out_fp16=out_fp16,
+        GROUP_M=GROUP_M,
+        layout=layout,
+        trans_c=trans_c,
+        G=G,
+        num_xcd=num_xcd,
+        num_ranks=num_ranks,
+    )
 
     @flyc.jit
     def launch(
@@ -355,19 +309,16 @@ def _compile(
         WEIGHTS,
         OUTPUT,
         TILE_TO_GROUP,
-        EXPECTED,
         NUM_TILE_BLOCKS,
         GROUP_OFFS,
-        DISPATCHED_SRC_RANK,
-        DISPATCHED_SRC_ROW,
-        DISPATCHED_META,
         c_n: int,
         out_m_rt: int,
         out_n_rt: int,
+        disp_parity: int,
+        expected_dispatch: int,
         stream: fx.Stream = fx.Stream(None),
     ):
-        grid_size = num_dispatch_cu + (TOTAL if is_tn else worst_case_tiles * n_blocks)
-        dispatch_grouped_gemm_kernel(
+        kernel(
             INPUT_TOKENS,
             EXPERT_SEND_DST_RANK,
             EXPERT_SEND_DST_ROW,
@@ -378,33 +329,84 @@ def _compile(
             WEIGHTS,
             OUTPUT,
             TILE_TO_GROUP,
-            EXPECTED,
             NUM_TILE_BLOCKS,
             GROUP_OFFS,
-            DISPATCHED_SRC_RANK,
-            DISPATCHED_SRC_ROW,
-            DISPATCHED_META,
             c_n,
             out_m_rt,
             out_n_rt,
+            disp_parity,
+            expected_dispatch,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch
 
 
-_DISPATCH_CANDIDATES = [
-    (16, 3, 0, 2),
-    (24, 3, 0, 2),
-    (32, 3, 0, 2),
-    (40, 3, 0, 2),
-    (48, 3, 0, 2),
-    (56, 3, 0, 2),
-    (64, 3, 0, 2),
-    (80, 3, 0, 2),
-    (96, 3, 0, 2),
-]
-_DISPATCH_AUTOTUNE_CACHE: dict = {}
+@flyc.jit
+def _compiled_dispatch_grouped_gemm(
+    INPUT_TOKENS,
+    EXPERT_SEND_DST_RANK,
+    EXPERT_SEND_DST_ROW,
+    EXPERT_SEND_COUNT,
+    EXPERT_SEND_OFFSET,
+    DISPATCHED_TOKEN_IDX,
+    sym_layout,
+    WEIGHTS,
+    OUTPUT,
+    TILE_TO_GROUP,
+    NUM_TILE_BLOCKS,
+    GROUP_OFFS,
+    c_n: int,
+    out_m_rt: int,
+    out_n_rt: int,
+    disp_parity: int,
+    expected_dispatch: int,
+    out_features: fx.Constexpr[int],
+    hidden_size: fx.Constexpr[int],
+    num_max_pool_tokens: fx.Constexpr[int],
+    BLOCK_M: fx.Constexpr[int],
+    BLOCK_N: fx.Constexpr[int],
+    num_comm: fx.Constexpr[int],
+    GROUP_M: fx.Constexpr[int],
+    is_nn: fx.Constexpr[bool],
+    num_ranks: fx.Constexpr[int],
+    num_dispatch_cu: fx.Constexpr[int],
+    stream: fx.Stream = fx.Stream(None),
+):
+    layout = "nn" if is_nn else "nt"
+    kernel, grid_size = _make_kernel(
+        out_features,
+        hidden_size,
+        num_max_pool_tokens,
+        BLOCK_M,
+        BLOCK_N,
+        int(num_dispatch_cu),
+        int(num_comm),
+        nt_vmcnt=3,
+        GROUP_M=int(GROUP_M),
+        layout=layout,
+        num_ranks=int(num_ranks),
+    )
+    kernel(
+        INPUT_TOKENS,
+        EXPERT_SEND_DST_RANK,
+        EXPERT_SEND_DST_ROW,
+        EXPERT_SEND_COUNT,
+        EXPERT_SEND_OFFSET,
+        DISPATCHED_TOKEN_IDX,
+        sym_layout,
+        WEIGHTS,
+        OUTPUT,
+        TILE_TO_GROUP,
+        NUM_TILE_BLOCKS,
+        GROUP_OFFS,
+        c_n,
+        out_m_rt,
+        out_n_rt,
+        disp_parity,
+        expected_dispatch,
+        value_attrs=make_value_attrs(2, 0, "512,512"),
+    ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
 
 def dispatch_grouped_gemm_bf16(
@@ -416,7 +418,6 @@ def dispatch_grouped_gemm_bf16(
     topk_weights: Optional[torch.Tensor] = None,
     layout: str = "nt",
     num_dispatch_cu: int = 16,
-    autotune=False,
     BM=256,
     BN=256,
     GROUP_M=4,
@@ -424,21 +425,6 @@ def dispatch_grouped_gemm_bf16(
     trans_c: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
 ):
-    """Fused cross-rank dispatch PUSH + grouped BF16 GEMM (nt / nn / tn).
-
-    ``x`` [num_src_tokens, K] bf16 source tokens dispatched into the pool. ``layout``
-    selects the role-2 GEMM: NT (fwd) weight [G,N,K] / NN (dgrad) weight [G,K,N] ->
-    output [pool_cap, N], per-block scoreboard gate; TN (variable-K wgrad) ``l1_weights``
-    is the resident pool-order rhs [pool_cap, OUT_N] + ``group_offs`` -> output
-    [G, OUT_M, OUT_N] ([G, OUT_N, OUT_M] if ``trans_c``), no gate (dispatch & wgrad are
-    independent). The dispatch comm handle is flat
-    (``expert_send_dst_rank/start/count/src_offset/src_tokens`` + ``num_comm``).
-
-    The symmetric workspace (pool GEMM A operand + peer pool / peer scoreboard delta tables)
-    is owned here: forward (``handle=None``) builds/creates it from ``group`` + tensor shapes
-    via ``get_symm_buffer_for_mega_moe(group, ...)`` and appends this layer's origin/meta
-    snapshots to the returned handle tail; reuse fetches the active buffer (no-group call).
-    ``tile_to_expert`` / ``expected_count`` are read from the handle."""
     if handle is None:
         assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
         assert group is not None, "handle=None requires group to build the symm workspace"
@@ -466,16 +452,12 @@ def dispatch_grouped_gemm_bf16(
                 num_tokens=num_tokens,
                 num_topk=num_topk,
                 num_experts=symm.num_experts,
-                world_size=symm.world,
+                num_ranks=symm.world,
                 rank=symm.rank,
                 experts_per_rank=experts_per_rank,
                 block_m=BM,
                 num_max_pool_tokens=symm.num_max_pool_tokens,
             )
-        ) + (
-            symm.origin_rank.clone(),
-            symm.origin_slot.clone(),
-            symm.meta_scalars.clone(),
         )
     else:
         symm = get_symm_buffer_for_mega_moe()
@@ -487,27 +469,19 @@ def dispatch_grouped_gemm_bf16(
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
-        _,
-        _,
         tile_to_expert,
-        expected_count,
+        _expected_count,
         _,
         group_offs,
-        *_snapshots,
     ) = handle
 
     num_comm = expert_send_dst_rank.numel()
+    num_ranks = symm.world
     assert x.dtype == torch.bfloat16 and l1_weights.dtype == torch.bfloat16
     hidden_size = x.size(1)
     num_max_pool_tokens = int(sym_layout.num_max_pool_tokens)
     dummy_i32 = get_dummy_tensor()
     x_i32 = x.contiguous().view(torch.int32).view(-1)
-
-    has_snapshots = len(_snapshots) >= 3
-    if has_snapshots:
-        dispatched_src_rank, dispatched_src_row, dispatched_meta_scalars = _snapshots[:3]
-    else:
-        dispatched_src_rank = dispatched_src_row = dispatched_meta_scalars = dummy_i32
 
     if layout == "tn":
         assert group_offs is not None, "tn layout requires group_offs"
@@ -519,6 +493,8 @@ def dispatch_grouped_gemm_bf16(
         out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)
         output = torch.empty(out_shape, device=x.device, dtype=out_dtype)
         assert group_offs.dtype == torch.int64, "tn group_offs must be int64"
+        # tn goes through _compile (not autotuned), advance parity here.
+        disp_parity, expected_dispatch = symm.next_dispatch()
         pos_args = (
             x_i32,
             expert_send_dst_rank,
@@ -530,15 +506,13 @@ def dispatch_grouped_gemm_bf16(
             rhs.contiguous().view(-1),
             output.view(-1),
             dummy_i32,
-            expected_count,
             dummy_i32,
             group_offs,
-            dispatched_src_rank,
-            dispatched_src_row,
-            dispatched_meta_scalars,
             0,
             int(OUT_M),
             int(OUT_N),
+            disp_parity,
+            int(expected_dispatch),
         )
         launch = _compile(
             OUT_N,
@@ -552,8 +526,8 @@ def dispatch_grouped_gemm_bf16(
             layout="tn",
             trans_c=trans_c,
             G=G,
-            has_snapshots=has_snapshots,
-            num_xcd=2,  # fused TN optimum (post-CHUNK=4): balances L2 reuse vs dispatch-overlap scatter
+            num_xcd=2,
+            num_ranks=int(num_ranks),
         )
         launch(*pos_args, stream=torch.cuda.current_stream())
         return output, symm.pool, symm.weight_recv_buf, handle
@@ -569,15 +543,13 @@ def dispatch_grouped_gemm_bf16(
     out_features = N
     c_n = out_features
 
-    scoreboard = symm.scoreboard
-    num_tile_blocks = dispatched_meta_scalars[1:2] if has_snapshots else symm.meta_scalars[1:2]
-    nt_vmcnt = 3
+    num_tile_blocks = symm.meta_scalars[1:2]
 
     output = torch.empty((num_max_pool_tokens, out_features), dtype=x.dtype, device=x.device)
-
     output_flat = output.contiguous().view(-1)
 
-    pos_args = (
+    disp_parity, expected_dispatch = symm.next_dispatch()
+    _compiled_dispatch_grouped_gemm(
         x_i32,
         expert_send_dst_rank,
         expert_send_dst_row,
@@ -588,111 +560,23 @@ def dispatch_grouped_gemm_bf16(
         weight_flat,
         output_flat,
         tile_to_expert,
-        expected_count,
         num_tile_blocks,
         dummy_i32,
-        dispatched_src_rank,
-        dispatched_src_row,
-        dispatched_meta_scalars,
         c_n,
         0,
         0,
+        disp_parity,
+        int(expected_dispatch),
+        out_features=int(out_features),
+        hidden_size=int(hidden_size),
+        num_max_pool_tokens=int(num_max_pool_tokens),
+        BLOCK_M=int(BM),
+        BLOCK_N=int(BN),
+        num_comm=int(num_comm),
+        GROUP_M=int(GROUP_M),
+        is_nn=(layout == "nn"),
+        num_ranks=int(num_ranks),
+        num_dispatch_cu=int(num_dispatch_cu),
+        stream=torch.cuda.current_stream(),
     )
-
-    if autotune:
-        key = (out_features, hidden_size, num_max_pool_tokens, BM, BN, int(num_comm), layout)
-        cached = _DISPATCH_AUTOTUNE_CACHE.get(key)
-        if cached is None:
-            cached = _autotune(
-                pos_args,
-                output_flat,
-                out_features,
-                hidden_size,
-                num_max_pool_tokens,
-                BM,
-                BN,
-                int(num_comm),
-                scoreboard,
-                None,
-                layout,
-            )
-            _DISPATCH_AUTOTUNE_CACHE[key] = cached
-        launch, _cfg = cached
-    else:
-        launch = _compile(
-            out_features,
-            hidden_size,
-            num_max_pool_tokens,
-            BM,
-            BN,
-            int(num_dispatch_cu),
-            int(num_comm),
-            int(nt_vmcnt),
-            GROUP_M=int(GROUP_M),
-            layout=layout,
-            has_snapshots=has_snapshots,
-        )
-    launch(*pos_args, stream=torch.cuda.current_stream())
     return output, symm.pool, symm.weight_recv_buf, handle
-
-
-def _autotune(
-    pos_args,
-    finite_view,
-    out_features,
-    hidden_size,
-    num_max_pool_tokens,
-    BM,
-    BN,
-    num_comm,
-    scoreboard,
-    reset,
-    layout="nt",
-):
-    """Bench the candidates with a per-iter scoreboard reset; return (launch, cfg)."""
-    if reset is None:
-        reset = scoreboard.zero_
-    stream = torch.cuda.current_stream()
-    e0 = torch.cuda.Event(enable_timing=True)
-    e1 = torch.cuda.Event(enable_timing=True)
-    best_us, best = float("inf"), None
-    for num_dispatch_cu, nt_vmcnt, agpr, waves in _DISPATCH_CANDIDATES:
-        try:
-            launch = _compile(
-                out_features,
-                hidden_size,
-                num_max_pool_tokens,
-                BM,
-                BN,
-                int(num_dispatch_cu),
-                num_comm,
-                int(nt_vmcnt),
-                int(waves),
-                int(agpr),
-                layout=layout,
-            )
-            reset()
-            launch(*pos_args, stream=stream)
-            torch.cuda.synchronize()
-            if not torch.isfinite(finite_view.view(-1)[:1024].float()).all().item():
-                continue
-            for _ in range(2):
-                reset()
-                launch(*pos_args, stream=stream)
-            torch.cuda.synchronize()
-            us_total = 0.0
-            for _ in range(20):
-                reset()
-                e0.record()
-                launch(*pos_args, stream=stream)
-                e1.record()
-                torch.cuda.synchronize()
-                us_total += e0.elapsed_time(e1) * 1000.0
-            us = us_total / 20
-            if us < best_us:
-                best_us, best = us, (launch, (num_dispatch_cu, nt_vmcnt, agpr, waves))
-        except Exception:
-            continue
-    if best is None:
-        raise RuntimeError("dispatch_grouped_gemm_bf16 autotune found no working cfg")
-    return best

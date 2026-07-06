@@ -31,11 +31,7 @@ def grid_sync(
     rank: int = -1,
     tag: str = "grid_sync",
 ):
-    """Device-wide barrier over all blocks via a split counter.
-
-    `tag` names the call site (kernel + phase) so a timeout log points at the
-    exact barrier; `rank` is baked into the message for cross-rank triage.
-    """
+    """Device-wide barrier over all blocks via a split counter."""
     fx.gpu.barrier()
     memory_fence(order="release", scope="agent")
     if thread_id == fx.Int32(0):

@@ -21,11 +21,13 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from flydsl.expr import arith
-from flydsl.expr.buffer_ops import buffer_load, create_buffer_resource
+from flydsl.expr.buffer_ops import (
+    buffer_load,
+    create_buffer_resource,
+    extract_base_index,
+)
 
-from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
-from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
-from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
+from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     _compile_dense_nt,
     _compile_grouped_tn_wgrad_bf16,
     _get_compiled_dense,
@@ -34,7 +36,17 @@ from primus_turbo.flydsl.mega.gemm_bf16_kernel import (
     gemm_bf16_nt_tile,
     gemm_bf16_tn_tile,
 )
+from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+from primus_turbo.flydsl.mega.ep_intranode import (
+    _BLOCK_THREADS,
+    _NUM_WARPS,
+    _PVEC,
+    combine_bf16_tile,
+    dispatch_bf16_tile,
+    topk_reduce_bf16_tile,
+)
 from primus_turbo.flydsl.mega.swiglu_kernel import swiglu
+from primus_turbo.flydsl.mega.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.utils.gemm_helper import (
     _emit_if_then,
@@ -65,6 +77,8 @@ __all__ = [
     "compile_grouped_gemm_bf16",
     "get_symm_buffer_for_mega_moe",
     "swiglu",
+    "combine_only",
+    "topk_reduce_only",
 ]
 
 
@@ -88,7 +102,7 @@ def compile_grouped_gemm_bf16(
     BLOCK_N=256,
     GROUP_M=1,
     num_xcd=8,
-    nt_vmcnt=3,
+    nt_vmcnt=4,  # swept: vmcnt=4 > 3 (~1% on L1 NT, gfx950)
     waves_per_eu=2,
     agpr_alloc=0,
     out_fp16=False,
@@ -176,9 +190,6 @@ def compile_grouped_gemm_bf16(
 # ───────────────────────────────────────────────────────────────────────
 @functools.lru_cache(maxsize=256)
 def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, num_comm, waves_per_eu=2):
-    # split each task across blocks_per_task blocks when tasks < blocks (saturate XGMI)
-    blocks_per_task = max(1, num_dispatch_cu // num_comm)
-
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_only_k(
         INPUT_TOKENS: fx.Tensor,
@@ -187,7 +198,7 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
         EXPERT_SEND_COUNT: fx.Tensor,
         EXPERT_SEND_OFFSET: fx.Tensor,
         DISPATCHED_TOKEN_IDX: fx.Tensor,
-        POOL_PTRS: fx.Tensor,
+        sym_layout: SymLayout,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
@@ -198,34 +209,26 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
         expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
         expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
         dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
-        pool_address_resource = create_buffer_resource(POOL_PTRS, max_size=True)
 
-        dispatch_tile = dispatch_bf16_tile(
-            thread_index=thread_index,
-            hidden_size=hidden_size,
-            num_max_pool_tokens=num_max_pool_tokens,
-            input_resource=input_resource,
-            expert_send_dst_rank_resource=expert_send_dst_rank_resource,
-            expert_send_dst_row_resource=expert_send_dst_row_resource,
-            expert_send_count_resource=expert_send_count_resource,
-            expert_send_offset_resource=expert_send_offset_resource,
-            dispatched_token_idx_resource=dispatched_token_idx_resource,
-            pool_address_resource=pool_address_resource,
-            signal=False,
-        )
-
-        if blocks_per_task > 1:
-            task_index = block_index // fx.Int32(blocks_per_task)
-            sub = block_index % fx.Int32(blocks_per_task)
-            if task_index < fx.Int32(num_comm):
-                dispatch_tile(task_index, sub, blocks_per_task)
-        else:
-            if block_index < comm_block_count:
-                local_task_count = (
-                    fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
-                ) // comm_block_count
-                for it in range(local_task_count):
-                    dispatch_tile(block_index + it * comm_block_count, fx.Int32(0), 1)
+        if block_index < comm_block_count:
+            local_task_count = (
+                fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
+            ) // comm_block_count
+            for it in range(local_task_count):
+                dispatch_bf16_tile(
+                    sym_layout,
+                    thread_index=thread_index,
+                    hidden_size=hidden_size,
+                    num_max_pool_tokens=num_max_pool_tokens,
+                    input_res=input_resource,
+                    expert_send_dst_rank_res=expert_send_dst_rank_resource,
+                    expert_send_dst_row_res=expert_send_dst_row_resource,
+                    expert_send_count_res=expert_send_count_resource,
+                    expert_send_offset_res=expert_send_offset_resource,
+                    dispatched_token_idx_res=dispatched_token_idx_resource,
+                    task_index=block_index + it * comm_block_count,
+                    signal=False,
+                )
 
     @flyc.jit
     def launch(
@@ -235,7 +238,7 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
         EXPERT_SEND_COUNT,
         EXPERT_SEND_OFFSET,
         DISPATCHED_TOKEN_IDX,
-        POOL_PTRS,
+        sym_layout,
         stream: fx.Stream = fx.Stream(None),
     ):
         dispatch_only_k(
@@ -245,7 +248,7 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
             EXPERT_SEND_COUNT,
             EXPERT_SEND_OFFSET,
             DISPATCHED_TOKEN_IDX,
-            POOL_PTRS,
+            sym_layout,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_dispatch_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -326,7 +329,7 @@ def grouped_gemm_bf16_only(
     GROUP_M=4,
     # xcd=1 maximizes L2 reuse of shared weight slabs (swept: +3% NT, +11% NN, +15% TN vs xcd=8)
     num_xcd=1,
-    nt_vmcnt=3,
+    nt_vmcnt=4,  # swept: vmcnt=4 > 3 (~1% on L1 NT, gfx950)
     waves_per_eu=2,
     agpr_alloc=0,
 ):
@@ -377,20 +380,20 @@ def grouped_gemm_bf16_only(
 def dispatch_only(
     x,  # [num_src_tokens, K] bf16
     handle,  # dispatch handle (DeepEP-style; handle[:5] = the send ABI)
-    pool,  # [pool_capacity, K] bf16   local landing pool
-    pool_ptrs,  # [world] i64   peer pool base ptrs
+    symm,  # SymmBuffer owning the peer pool + delta tables
     *,
     num_dispatch_cu=32,
 ):
     """Cross-rank dispatch PUSH only (no GEMM) — pushes ``x`` token rows to peer
-    pools over XGMI. Bytes pushed per rank = (sum expert_send_count) * hidden * 2."""
+    pools over XGMI via the two-heap delta addressing (matches the fused kernel).
+    Bytes pushed per rank = (sum expert_send_count) * hidden * 2."""
     expert_send_dst_rank, expert_send_dst_row, expert_send_count, expert_send_offset, dispatched_token_idx = (
         handle[:5]
     )
     num_comm = expert_send_dst_rank.numel()
     assert x.dtype == torch.bfloat16
     hidden_size = x.size(1)
-    pool_capacity = pool.size(0)
+    pool_capacity = symm.num_max_pool_tokens
     x_i32 = x.contiguous().view(torch.int32).view(-1)
     launch = _compile_dispatch_only(hidden_size, pool_capacity, int(num_dispatch_cu), int(num_comm))
     launch(
@@ -400,7 +403,7 @@ def dispatch_only(
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
-        pool_ptrs,
+        symm.make_sym_layout(),
         stream=torch.cuda.current_stream(),
     )
 
@@ -575,14 +578,13 @@ def _build_symm_and_plan(group, *, T, H, I, E, K, BM, BN, mode, base_seed):
         num_tokens=T,
         num_topk=K,
         num_experts=E,
-        world_size=symm.world,
+        num_ranks=symm.world,
         rank=symm.rank,
         experts_per_rank=E // symm.world,
         block_m=symm.block_m,
         num_max_pool_tokens=symm.num_max_pool_tokens,
-        no_cpu_sync=True,
     )
-    tile_to_expert, expected = handle[7], handle[8]
+    tile_to_expert, expected = handle[5], handle[6]
     num_tile_blocks = symm.meta_scalars[1:2]  # device real-tile count
     symm.assert_capacity()  # fail loudly rather than silently drop rows
     return symm, x, topk_idx, topk_weight, handle, tile_to_expert, expected, num_tile_blocks
@@ -606,7 +608,7 @@ def generate_input(group, *, kind, mode, T, H, I, E, K, BM, BN, W1, W2, num_disp
         # fill the pool (real A) via dispatch_only (peers synced by the prologue)
         torch.cuda.synchronize()
         group.barrier()
-        dispatch_only(x, handle, symm.pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu)
+        dispatch_only(x, handle, symm, num_dispatch_cu=num_dispatch_cu)
         torch.cuda.synchronize()
         group.barrier()
         return SimpleNamespace(
@@ -626,13 +628,12 @@ def generate_input(group, *, kind, mode, T, H, I, E, K, BM, BN, W1, W2, num_disp
         )
 
     if kind == "combine":
-        # sb_l2 is a same-rank scoreboard accumulator -> zero it (no barrier needed).
-        symm.sb_l2.zero_()
+        # combine scoreboard is now the monotonic parity combine_flag (never reset).
         # cross-rank dispatch PUSH (fills the pool), then grouped L1 GEMM (NT):
         # pool[M,H] @ W1[g,2I,H] -> l1_out[M,2I] (local scratch, no arena slot)
         torch.cuda.synchronize()
         group.barrier()
-        dispatch_only(x, handle, symm.pool, symm.pool_ptrs, num_dispatch_cu=32)
+        dispatch_only(x, handle, symm, num_dispatch_cu=32)
         torch.cuda.synchronize()
         group.barrier()
         l1_out = torch.empty((symm.num_max_pool_tokens, 2 * I), dtype=torch.bfloat16, device="cuda")
@@ -720,3 +721,201 @@ def print_stage(m, *, comm_label, comm_unit, comm_tag, comm_extra="", fused_extr
         f"roofline (max(gemm,{comm_tag})/fused) = {m.roofline_pct:.1f}% | "
         f"speedup vs serial = {m.speedup:.2f}x{fused_extra}"
     )
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_combine_only(
+    out_features,
+    num_max_pool_tokens,
+    BLOCK_M,
+    num_combine_cu,
+    combine_slots,
+    num_ranks,
+    waves_per_eu=2,
+    with_gate=False,
+):
+    assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
+    assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def combine_only_k(
+        NUM_TILE_BLOCKS: fx.Tensor,
+        GRAD_GATE: fx.Tensor,
+        sym_layout: SymLayout,
+    ):
+        thread_index = fx.thread_idx.x
+        block_index, _b, _c = fx.block_idx
+        combine_cu = fx.Int32(num_combine_cu)
+        num_tile_blocks_res = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
+        real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+        grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
+
+        local_count = (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
+        for tile_iter in range(local_count):
+            combine_bf16_tile(
+                sym_layout,
+                thread_index=thread_index,
+                block_m=block_index + tile_iter * combine_cu,
+                block_m_size=BLOCK_M,
+                grad_gate_res=grad_gate_res,
+                with_gate=with_gate,
+            )
+
+    @flyc.jit
+    def launch(
+        NUM_TILE_BLOCKS,
+        GRAD_GATE,
+        sym_layout,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        combine_only_k(
+            NUM_TILE_BLOCKS,
+            GRAD_GATE,
+            sym_layout,
+            value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
+        ).launch(grid=(num_combine_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
+
+    return launch
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_reduce_only(
+    out_features, combine_slots, num_reduce_cu, topk, num_experts, rank, waves_per_eu=2, apply_weights=False
+):
+    assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
+    assert topk >= 1, "topk must be >= 1"
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def reduce_only_k(
+        OUTPUT: fx.Tensor,
+        COMB_LOCAL: fx.Tensor,
+        BARRIER_LOCAL: fx.Tensor,
+        TOPK_INDICES: fx.Tensor,
+        NUM_TOKENS_PER_RANK: fx.Tensor,
+        TOPK_WEIGHTS: fx.Tensor,
+    ):
+        thread_index = fx.thread_idx.x
+        block_index, _b, _c = fx.block_idx
+        comb_local_res = create_buffer_resource(COMB_LOCAL, max_size=True)
+        output_res = create_buffer_resource(OUTPUT, max_size=True)
+        topk_indices_res = create_buffer_resource(TOPK_INDICES, max_size=True)
+        num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
+        topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
+        barrier_base = extract_base_index(BARRIER_LOCAL, address_space=1)
+        topk_reduce_bf16_tile(
+            False,
+            apply_weights,
+            False,
+            thread_index,
+            block_index,
+            fx.Int32(num_reduce_cu * _NUM_WARPS),
+            topk,
+            out_features,
+            num_experts,
+            rank,
+            comb_local_res,
+            output_res,
+            topk_indices_res,
+            num_tokens_res,
+            barrier_base,
+            fx.Int32(0),
+            topk_weights_res,
+            None,
+            None,
+            fx.Int64(0),
+        )
+
+    @flyc.jit
+    def launch(
+        OUTPUT,
+        COMB_LOCAL,
+        BARRIER_LOCAL,
+        TOPK_INDICES,
+        NUM_TOKENS_PER_RANK,
+        TOPK_WEIGHTS,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        reduce_only_k(
+            OUTPUT,
+            COMB_LOCAL,
+            BARRIER_LOCAL,
+            TOPK_INDICES,
+            NUM_TOKENS_PER_RANK,
+            TOPK_WEIGHTS,
+            value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
+        ).launch(grid=(num_reduce_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
+
+    return launch
+
+
+def combine_only(
+    group,
+    *,
+    BM=256,
+    num_combine_cu=None,
+    grad_gate=None,
+):
+    symm = get_symm_buffer_for_mega_moe()
+    sym_layout = symm.make_sym_layout()
+    out_features = int(sym_layout.hidden)
+    num_max_pool_tokens = int(sym_layout.num_max_pool_tokens)
+    if num_combine_cu is None:
+        num_combine_cu = num_max_pool_tokens // BM
+    num_tile_blocks = symm.meta_scalars[1:2]
+    with_gate = grad_gate is not None
+    launch = _compile_combine_only(
+        out_features,
+        num_max_pool_tokens,
+        int(BM),
+        int(num_combine_cu),
+        int(sym_layout.combine_slots),
+        int(sym_layout.num_ranks),
+        with_gate=with_gate,
+    )
+    grad_gate_arg = grad_gate.contiguous().view(-1) if with_gate else num_tile_blocks
+    launch(
+        num_tile_blocks,
+        grad_gate_arg,
+        sym_layout,
+        stream=torch.cuda.current_stream(),
+    )
+    return symm.l2_token_buffer
+
+
+def topk_reduce_only(
+    output,
+    comb_local,
+    barrier_local,
+    topk_indices,
+    num_tokens_per_rank,
+    combine_slots,
+    *,
+    topk,
+    num_experts,
+    rank=0,
+    num_reduce_cu=32,
+    topk_weights=None,
+):
+    assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"
+    out_features = output.size(1)
+    apply_weights = topk_weights is not None
+    launch = _compile_reduce_only(
+        out_features,
+        int(combine_slots),
+        int(num_reduce_cu),
+        int(topk),
+        int(num_experts),
+        int(rank),
+        apply_weights=apply_weights,
+    )
+    topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else num_tokens_per_rank
+    launch(
+        output.view(-1),
+        comb_local.contiguous().view(-1),
+        barrier_local,
+        topk_indices.contiguous().view(-1),
+        num_tokens_per_rank,
+        topk_weights_d,
+        stream=torch.cuda.current_stream(),
+    )
+    return output

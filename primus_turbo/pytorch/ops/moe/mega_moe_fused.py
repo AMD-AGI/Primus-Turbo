@@ -126,7 +126,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 topk_idx,
             ) = saved[ctx.handle_len :]
 
-            group_lens, group_offs = handle[9], handle[10]
+            group_lens, group_offs = handle[7], handle[8]
             num_tokens, num_topk = ctx.num_tokens, ctx.num_topk
             dy = grad_y.contiguous().to(torch.bfloat16)
             triton_be = BackendType.TRITON.value

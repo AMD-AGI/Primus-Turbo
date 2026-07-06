@@ -86,15 +86,12 @@ def profile_dispatch(group, args, mode, W1, W2):
     symm, x, handle = inp.symm, inp.x, inp.handle
     pool = symm.pool
 
-    # one synced cross-rank op (barrier, optional scoreboard reset, barrier) so the
-    # accuracy probes run in a clean state, isolated from the timing loops.
-    def _synced(fn, reset_sb=False):
+    # one synced cross-rank op (barrier, barrier) so the accuracy probes run in a
+    # clean state, isolated from the timing loops. The dispatch scoreboard is a
+    # never-reset parity double-buffer, so no signal reset is needed here.
+    def _synced(fn):
         torch.cuda.synchronize()
         group.barrier()
-        if reset_sb:
-            symm.scoreboard.zero_()
-            torch.cuda.synchronize()
-            group.barrier()
         out = fn()
         torch.cuda.synchronize()
         group.barrier()
@@ -130,7 +127,7 @@ def profile_dispatch(group, args, mode, W1, W2):
             M_eff, N, K, BM, BN, args.iters, group_m_cands=group_m_cands
         )
         t_disp = bench(
-            lambda: dispatch_only(x, handle, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu),
+            lambda: dispatch_only(x, handle, symm, num_dispatch_cu=num_dispatch_cu),
             iters=args.iters,
         )
         # fused: full XGMI push + grouped GEMM (overlap)
@@ -159,7 +156,6 @@ def profile_dispatch(group, args, mode, W1, W2):
             lambda: dispatch_grouped_gemm_bf16(
                 x, inp.W1, group, handle=handle, layout="nt", BM=BM, BN=BN, num_dispatch_cu=num_dispatch_cu
             ),
-            reset_sb=True,
         )[0]
         acc["fwd"] = check_accuracy(group, "fwd fused (nt)", fwd_fused[:M_eff], ref_fwd[:M_eff])
 
@@ -175,7 +171,7 @@ def profile_dispatch(group, args, mode, W1, W2):
         # fill the pool with dy once for the gemm-only baseline
         torch.cuda.synchronize()
         group.barrier()
-        dispatch_only(dy, handle, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu)
+        dispatch_only(dy, handle, symm, num_dispatch_cu=num_dispatch_cu)
         torch.cuda.synchronize()
         group.barrier()
         t_bwd_gemm = bench(
@@ -188,7 +184,7 @@ def profile_dispatch(group, args, mode, W1, W2):
             M_eff, N_bwd, K, BM, BN, args.iters, group_m_cands=group_m_cands
         )
         t_bwd_disp = bench(
-            lambda: dispatch_only(dy, handle, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu),
+            lambda: dispatch_only(dy, handle, symm, num_dispatch_cu=num_dispatch_cu),
             iters=args.iters,
         )
         t_bwd_fused = bench(
@@ -222,7 +218,6 @@ def profile_dispatch(group, args, mode, W1, W2):
             lambda: dispatch_grouped_gemm_bf16(
                 dy, inp.W2, group, handle=handle, layout="nn", BM=BM, BN=BN, num_dispatch_cu=num_dispatch_cu
             ),
-            reset_sb=True,
         )[0]
         acc["bwd"] = check_accuracy(group, "bwd STEP1 fused (nn)", bwd_fused[:M_eff], ref_bwd[:M_eff])
 
@@ -258,7 +253,7 @@ def profile_dispatch(group, args, mode, W1, W2):
         )
         # comm baseline = dispatch the H-wide lhs (matches the fused dispatch width)
         t_wg1_disp = bench(
-            lambda: dispatch_only(x_pool, handle, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu),
+            lambda: dispatch_only(x_pool, handle, symm, num_dispatch_cu=num_dispatch_cu),
             iters=args.iters,
         )
         t_wg1_fused = bench(
@@ -275,7 +270,6 @@ def profile_dispatch(group, args, mode, W1, W2):
             ),
             iters=args.iters,
             group=group,
-            reset=lambda: symm.scoreboard.zero_(),
         )
         wgrad1 = {
             "gemm_only_ms": t_wg1_gemm,
@@ -294,7 +288,7 @@ def profile_dispatch(group, args, mode, W1, W2):
         offs_cpu = group_offs.tolist()
 
         def _ref_wg1():
-            dispatch_only(x_pool, handle, pool, symm.pool_ptrs, num_dispatch_cu=num_dispatch_cu)
+            dispatch_only(x_pool, handle, symm, num_dispatch_cu=num_dispatch_cu)
             torch.cuda.synchronize()
             group.barrier()
             for e in range(experts_per_rank):
@@ -315,7 +309,6 @@ def profile_dispatch(group, args, mode, W1, W2):
                 BN=BN,
                 trans_c=True,
             ),
-            reset_sb=True,
         )[0]
         acc["wgrad1"] = check_accuracy(group, "wgrad dW1 fused (tn)", wg1_fused, ref_dW1)
     finally:

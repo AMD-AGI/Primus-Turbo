@@ -17,9 +17,8 @@ Run inside dev_primus:
 import argparse
 
 import torch
+from mega_utils import topk_reduce_only
 from tabulate import tabulate
-
-from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import topk_reduce_only
 
 _HBM_TBPS = 6.5  # MI355X achievable HBM bandwidth (the saturation target)
 

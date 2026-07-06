@@ -8,9 +8,8 @@
 
 Thin wrapper over the FlyDSL kernel ``dispatch_grouped_gemm_bf16``. The kernel owns the
 whole symmetric workspace: forward (no handle) builds it from ``group`` + tensor shapes,
-runs the fused prologue, and returns the handle (flat prologue tuple [0..10] plus this
-layer's origin/meta snapshot tail [11..13]); reuse (handle given) re-feeds that tuple and
-the kernel restores the snapshot tail device-side.
+runs the fused prologue, and returns the flat prologue handle tuple [0..8]; reuse (handle
+given) re-feeds that tuple.
 
 ``_dispatch_grouped_gemm`` is a ``torch.library.custom_op``. A custom op cannot take a
 ``ProcessGroup``, so the public wrapper passes the group **by name** and the op resolves it
@@ -61,7 +60,6 @@ def _dispatch_grouped_gemm(
     topk_weights: Optional[torch.Tensor],
     layout: str,
     num_dispatch_cu: int,
-    autotune: bool,
     trans_c: bool,
     out_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
@@ -80,7 +78,6 @@ def _dispatch_grouped_gemm(
         topk_weights=topk_weights,
         layout=layout,
         num_dispatch_cu=int(num_dispatch_cu),
-        autotune=bool(autotune),
         trans_c=trans_c,
         out_dtype=out_dtype,
     )
@@ -100,7 +97,6 @@ def _dispatch_grouped_gemm_meta(
     topk_weights: Optional[torch.Tensor],
     layout: str,
     num_dispatch_cu: int,
-    autotune: bool,
     trans_c: bool,
     out_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
@@ -123,16 +119,14 @@ def dispatch_grouped_gemm_impl(
     handle: tuple | None = None,
     layout: str = "nt",
     num_dispatch_cu: int = 16,
-    autotune: bool = False,
     trans_c: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
     """Fused cross-rank dispatch PUSH + grouped BF16 GEMM (nt / nn / tn).
 
     Forward (``handle=None``): the kernel builds the active symm workspace from ``group`` +
-    shapes, runs the fused prologue (incl. the origin/meta snapshot tail), and returns the
-    handle. Reuse (``handle`` given): the backward NN dgrad / TN wgrads ride the forward's
-    plan; the kernel restores the snapshot tail device-side.
+    shapes, runs the fused prologue, and returns the handle. Reuse (``handle`` given): the
+    backward NN dgrad / TN wgrads ride the forward's plan.
 
     Returns the standard 4-output API ``(output, dispatch_x_in_buf, dispatch_weights_in_buf,
     handle)`` (tiling fixed at block_m/n = 256)."""
@@ -146,7 +140,6 @@ def dispatch_grouped_gemm_impl(
         topk_weights,
         layout,
         num_dispatch_cu,
-        autotune,
         trans_c,
         out_dtype,
     )
