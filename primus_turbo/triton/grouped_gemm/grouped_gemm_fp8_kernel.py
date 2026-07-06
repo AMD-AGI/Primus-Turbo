@@ -54,10 +54,7 @@ from primus_turbo.triton.utils.origami import (
     origama_hardware_info,
     origama_select_params,
 )
-from primus_turbo.triton.utils.triton_knobs_helper import (
-    scoped_amd_knobs,
-    set_triton_knobs_gfx950,
-)
+from primus_turbo.triton.utils.triton_knobs_helper import scoped_amd_knobs
 
 _grouped_blockwise_warmed: set = set()
 _grouped_blockwise_vk_warmed: set = set()
@@ -557,8 +554,6 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size, num_sms = (
         _get_gg_fp8_tw_fwd_config(
             avg_m,
@@ -650,8 +645,6 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = get_num_cus()
 
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_tw_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
@@ -913,8 +906,6 @@ def grouped_gemm_fp8_rowwise_triton_kernel(
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_rw_fwd_config(
         avg_m,
         N,
@@ -1155,8 +1146,6 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = get_num_cus()
 
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_rw_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
@@ -1741,9 +1730,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     Returns:
         [M_total, N] output in out_dtype.
     """
-    if is_gfx950():
-        set_triton_knobs_gfx950()
-    else:
+    if not is_gfx950():
         _set_amd_knobs(enable=True)
 
     assert a.ndim == 2, f"a must be 2D, got {a.shape}"
@@ -1900,9 +1887,7 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     Returns:
         [G, OUT_M, OUT_N] output.
     """
-    if is_gfx950():
-        set_triton_knobs_gfx950()
-    else:
+    if not is_gfx950():
         _set_amd_knobs(enable=False)
 
     assert lhs.ndim == 2 and rhs.ndim == 2
@@ -2190,8 +2175,6 @@ def grouped_gemm_mxfp8_triton_kernel(
     """
     if group_offs_out is None:
         group_offs_out = group_offs
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     G = b.shape[0]
     c = torch.empty((a.shape[0], N), dtype=out_dtype, device=a.device)
     # scales come from the grouped MX quant in (free, K/VEC) layout:
@@ -2373,8 +2356,6 @@ def grouped_gemm_mxfp8_variable_k_triton_kernel(
     lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=None
 ):
     """C[g] (OUT_M,OUT_N) = lhs[:,g] @ rhs[:,g]^T. lhs (OUT_M,M_total), rhs (OUT_N,M_total)."""
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     c = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=lhs.device)
     ls = lhs_scale.view(torch.uint8)
     rs = rhs_scale.view(torch.uint8)

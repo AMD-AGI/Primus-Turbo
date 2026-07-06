@@ -50,10 +50,7 @@ from primus_turbo.triton.utils.origami import (
     origama_hardware_info,
     origama_select_params,
 )
-from primus_turbo.triton.utils.triton_knobs_helper import (
-    scoped_amd_knobs,
-    set_triton_knobs_gfx950,
-)
+from primus_turbo.triton.utils.triton_knobs_helper import scoped_amd_knobs
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AMD knobs helper (blockwise-specific)
@@ -324,8 +321,6 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_bk = B_view.stride(0)
 
     if is_gfx950():
-        set_triton_knobs_gfx950()
-
         # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts (164-entry tuning).
         block_m, block_n, block_k = 256, 256, 128
         chunk_size, waves_per_eu = 32, 0
@@ -631,8 +626,6 @@ def gemm_fp8_rowwise_triton_kernel(
     s_bk = B_view.stride(0)
 
     if is_gfx950():
-        set_triton_knobs_gfx950()
-
         # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts.
         block_m, block_n, block_k = 256, 256, 128
         chunk_size, waves_per_eu = 32, 0
@@ -1083,12 +1076,11 @@ def gemm_fp8_blockwise_triton_kernel(
     M, K = A_view.shape
     _, N = B_view.shape
 
-    # AMD knobs: gfx950 always sets the gfx950 knobs; on gfx942 NT/NN benefit
-    # from use_async_copy/scalarize_packed_fops while TN/wgrad regresses 5-8%.
+    # AMD knobs: scoped_amd_knobs enables the gfx950 knobs on gfx950; on gfx942
+    # NT/NN benefit from use_async_copy/scalarize_packed_fops while TN/wgrad
+    # regresses 5-8%.
     is_tn = trans_a and not trans_b
-    if is_gfx950():
-        set_triton_knobs_gfx950()
-    else:
+    if not is_gfx950():
         _set_amd_knobs(enable=not is_tn)
 
     # ── Layout-specialised settings.

@@ -37,10 +37,7 @@ import triton.language as tl
 
 from primus_turbo.pytorch.core.utils import get_num_cus, is_gfx950
 from primus_turbo.triton.utils.origami import origama_select_params
-from primus_turbo.triton.utils.triton_knobs_helper import (
-    scoped_amd_knobs,
-    set_triton_knobs_gfx950,
-)
+from primus_turbo.triton.utils.triton_knobs_helper import scoped_amd_knobs
 
 # ===============================================================================
 # Hardware constants (lazy init)
@@ -642,8 +639,6 @@ def grouped_gemm_triton_kernel(
     device_num_cus = get_num_cus()
     num_sms = min(num_cu, device_num_cus) if num_cu is not None and num_cu > 0 else device_num_cus
     avg_m = max(M_total // max(G, 1), 256)
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = (
         _get_gg_bf16_fwd_config(avg_m, N, K, a.dtype, b.dtype, trans_b, G, num_sms)
     )
@@ -1132,8 +1127,6 @@ def grouped_gemm_variable_k_triton_kernel(
     num_sms = min(num_cu, device_num_cus) if num_cu is not None and num_cu > 0 else device_num_cus
     dummy_scale = torch.empty(1, device=lhs.device, dtype=torch.float32)
 
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     BLOCK_M, BLOCK_N, BLOCK_K, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_bf16_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms

@@ -12,6 +12,8 @@ import os
 
 import triton
 
+from primus_turbo.pytorch.core.utils import is_gfx950
+
 # Triton ``knobs.amd`` attributes touched by the turbo GEMM kernels.
 _AMD_KNOB_ATTRS = ("use_async_copy", "scalarize_packed_fops", "use_block_pingpong")
 
@@ -27,31 +29,15 @@ def _amd_knobs_available() -> bool:
     return hasattr(triton, "knobs") and hasattr(triton.knobs, "amd")
 
 
-def set_triton_knobs_gfx950() -> None:
-    """Enable AMD compiler knobs for gfx950 (async_copy, block_pingpong, scalarize).
-
-    Must be called from inside a :func:`scoped_amd_knobs`-decorated entry point
-    so the change is reverted after the kernel compiles instead of leaking
-    process-wide.  Unlike the previous implementation this applies the knobs on
-    every call (the surrounding scope restores them afterwards).
-    """
-    if _amd_knobs_available():
-        triton.knobs.amd.use_async_copy = True
-        triton.knobs.amd.scalarize_packed_fops = True
-        triton.knobs.amd.use_block_pingpong = True
-    else:
-        os.environ["TRITON_HIP_USE_ASYNC_COPY"] = "1"
-        os.environ["AMDGCN_SCALARIZE_PACKED_FOPS"] = "1"
-        os.environ["TRITON_HIP_USE_BLOCK_PINGPONG"] = "1"
-
-
 @contextlib.contextmanager
 def scoped_amd_triton_knobs():
     """Snapshot AMD Triton compiler knobs on entry, restore them on exit.
 
-    Any knob flipping done inside the ``with`` block (via
-    :func:`set_triton_knobs_gfx950` or a local ``_set_amd_knobs``) is undone on
-    exit, so turbo's GEMM knobs never leak into other Triton kernels.
+    On gfx950 the gfx950 knobs (async_copy, scalarize_packed_fops,
+    block_pingpong) are enabled for the duration of the scope. Any further knob
+    flipping done inside the ``with`` block (e.g. a local ``_set_amd_knobs`` on
+    gfx942) is likewise undone on exit, so turbo's GEMM knobs never leak into
+    other Triton kernels.
     """
     saved_attrs = {}
     if _amd_knobs_available():
@@ -61,6 +47,15 @@ def scoped_amd_triton_knobs():
                 saved_attrs[name] = getattr(amd, name)
     saved_env = {name: os.environ.get(name) for name in _AMD_KNOB_ENVS}
     try:
+        if is_gfx950():
+            if _amd_knobs_available():
+                triton.knobs.amd.use_async_copy = True
+                triton.knobs.amd.scalarize_packed_fops = True
+                triton.knobs.amd.use_block_pingpong = True
+            else:
+                os.environ["TRITON_HIP_USE_ASYNC_COPY"] = "1"
+                os.environ["AMDGCN_SCALARIZE_PACKED_FOPS"] = "1"
+                os.environ["TRITON_HIP_USE_BLOCK_PINGPONG"] = "1"
         yield
     finally:
         if saved_attrs:
