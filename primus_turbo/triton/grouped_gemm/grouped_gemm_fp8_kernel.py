@@ -59,17 +59,6 @@ from primus_turbo.triton.utils.triton_knobs_helper import scoped_amd_knobs
 _grouped_blockwise_warmed: set = set()
 _grouped_blockwise_vk_warmed: set = set()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# AMD knobs helper
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _set_amd_knobs(enable: bool = True):
-    """Set AMD-specific Triton knobs."""
-    if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
-        triton.knobs.amd.use_async_copy = enable
-        triton.knobs.amd.scalarize_packed_fops = enable
-
 
 def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
     """FP8 grouped GEMM config from MI300X bench (out_gg_fp8_persistent_full.yaml).
@@ -1703,7 +1692,7 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
 # ── Blockwise FP8 Forward Public API ──
 
 
-@scoped_amd_knobs
+@scoped_amd_knobs(gfx942_enable=True)
 def grouped_gemm_fp8_blockwise_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1730,9 +1719,6 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     Returns:
         [M_total, N] output in out_dtype.
     """
-    if not is_gfx950():
-        _set_amd_knobs(enable=True)
-
     assert a.ndim == 2, f"a must be 2D, got {a.shape}"
     assert b.ndim == 3, f"b must be 3D, got {b.shape}"
     assert b_scales.ndim == 3, f"b_scales must be 3D, got {b_scales.shape}"
@@ -1848,7 +1834,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
 # ── Blockwise FP8 Variable-K Backward Public API ──
 
 
-@scoped_amd_knobs
+@scoped_amd_knobs(gfx942_enable=False)
 def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -1887,9 +1873,6 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     Returns:
         [G, OUT_M, OUT_N] output.
     """
-    if not is_gfx950():
-        _set_amd_knobs(enable=False)
-
     assert lhs.ndim == 2 and rhs.ndim == 2
     G = group_offs.shape[0] - 1
 

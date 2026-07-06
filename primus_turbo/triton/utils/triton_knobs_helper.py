@@ -9,6 +9,7 @@
 import contextlib
 import functools
 import os
+from typing import Optional
 
 import triton
 
@@ -30,13 +31,19 @@ def _amd_knobs_available() -> bool:
 
 
 @contextlib.contextmanager
-def scoped_amd_triton_knobs():
+def scoped_amd_triton_knobs(gfx942_enable: Optional[bool] = None):
     """Snapshot AMD Triton compiler knobs on entry, restore them on exit.
 
-    On gfx950 the gfx950 knobs (async_copy, scalarize_packed_fops,
-    block_pingpong) are enabled for the duration of the scope. Any further knob
-    flipping done inside the ``with`` block (e.g. a local ``_set_amd_knobs`` on
-    gfx942) is likewise undone on exit, so turbo's GEMM knobs never leak into
+    On gfx950 the full gfx950 knob set (async_copy, scalarize_packed_fops,
+    block_pingpong) is enabled for the duration of the scope.
+
+    On gfx942, when ``gfx942_enable`` is not None, use_async_copy /
+    scalarize_packed_fops are set to that value for the scope (NT/NN GEMMs
+    benefit, but TN/wgrad regresses ~5-8% on MI300X so those callers pass
+    ``False``); ``None`` leaves the gfx942 knobs at their defaults.
+    block_pingpong is never touched on gfx942.
+
+    All changes are restored on exit, so turbo's GEMM knobs never leak into
     other Triton kernels.
     """
     saved_attrs = {}
@@ -56,6 +63,9 @@ def scoped_amd_triton_knobs():
                 os.environ["TRITON_HIP_USE_ASYNC_COPY"] = "1"
                 os.environ["AMDGCN_SCALARIZE_PACKED_FOPS"] = "1"
                 os.environ["TRITON_HIP_USE_BLOCK_PINGPONG"] = "1"
+        elif gfx942_enable is not None and _amd_knobs_available():
+            triton.knobs.amd.use_async_copy = gfx942_enable
+            triton.knobs.amd.scalarize_packed_fops = gfx942_enable
         yield
     finally:
         if saved_attrs:
@@ -69,16 +79,24 @@ def scoped_amd_triton_knobs():
                 os.environ[name] = val
 
 
-def scoped_amd_knobs(func):
+def scoped_amd_knobs(func=None, *, gfx942_enable: Optional[bool] = None):
     """Decorator: run ``func`` under :func:`scoped_amd_triton_knobs`.
 
     Apply to every turbo GEMM / grouped-GEMM entry point that toggles AMD knobs,
     so the knobs are active only while that kernel compiles/launches.
+
+    Usable bare (``@scoped_amd_knobs``) or parametrised
+    (``@scoped_amd_knobs(gfx942_enable=True)``) to pin a fixed gfx942 per-layout
+    policy. For entry points whose layout is only known at call time (e.g. the
+    unified dense blockwise kernel that dispatches NT/NN/TN internally), use the
+    :func:`scoped_amd_triton_knobs` context manager directly instead.
     """
+    if func is None:
+        return functools.partial(scoped_amd_knobs, gfx942_enable=gfx942_enable)
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        with scoped_amd_triton_knobs():
+        with scoped_amd_triton_knobs(gfx942_enable=gfx942_enable):
             return func(*args, **kwargs)
 
     return wrapper
