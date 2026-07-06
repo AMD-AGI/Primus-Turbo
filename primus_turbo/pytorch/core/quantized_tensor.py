@@ -221,10 +221,7 @@ class QuantizedTensor(torch.Tensor):
         assert dest_dtype in _SUPPORTED_QUANTIZED_DTYPES, "Unsupported quantized dtype"
 
         # NOTE: we treat grouped tensors as non-grouped tensors when granularity is TENSORWISE or ROWWISE.
-        is_grouped_tensor = group_lens is not None and granularity not in [
-            ScalingGranularity.TENSORWISE,
-            ScalingGranularity.ROWWISE,
-        ]
+        is_grouped_tensor = group_lens is not None
         if is_grouped_tensor:
             assert granularity in _SUPPORTED_GROUPED_QUANTIZED_GRANS, (
                 f"Unsupported grouped granularity {granularity}"
@@ -285,18 +282,33 @@ class QuantizedTensor(torch.Tensor):
                 group_offs_from_lens,
             )
 
-            orig_group_lens = group_lens
-            orig_group_offs = group_offs_from_lens(group_lens)
-            data, scale_inv, padded_group_lens, padded_group_offs = cls._grouped_quantize(
-                hp_tensor,
-                dest_dtype,
-                granularity,
-                group_lens=orig_group_lens,
-                group_offs=orig_group_offs,
-                block_size=block_size,
-                axis=axis,
-                scaling_recipe=scaling_recipe,
-            )
+            if granularity in [
+                ScalingGranularity.TENSORWISE,
+                ScalingGranularity.ROWWISE,
+            ]:
+                # NOTE: we treat grouped tensors as non-grouped tensors when granularity is TENSORWISE or ROWWISE.
+                orig_group_lens = padded_group_lens = group_lens
+                orig_group_offs = padded_group_offs = group_offs_from_lens(group_lens)
+
+                data, scale_inv = cls._quantize(
+                    hp_tensor,
+                    dest_dtype,
+                    granularity,
+                    block_size=block_size,
+                    axis=axis,
+                    scaling_recipe=scaling_recipe,
+                )
+            else:
+                data, scale_inv, padded_group_lens, padded_group_offs = cls._grouped_quantize(
+                    hp_tensor,
+                    dest_dtype,
+                    granularity,
+                    group_lens=orig_group_lens,
+                    group_offs=orig_group_offs,
+                    block_size=block_size,
+                    axis=axis,
+                    scaling_recipe=scaling_recipe,
+                )
         else:
             data, scale_inv = cls._quantize(
                 hp_tensor,
@@ -457,39 +469,47 @@ class QuantizedTensor(torch.Tensor):
         return _normalize_axis(self._quantized_axis, self._data.ndim)
 
     @torch.no_grad()
-    def dequantize(self) -> torch.Tensor:
-        """Dequantize back to the original high-precision dtype."""
+    def _grouped_dequantize(self) -> torch.Tensor:
         from primus_turbo.pytorch.ops.quantization import (
-            dequantize_fp4,
-            dequantize_fp8,
             grouped_dequantize_fp8,
         )
 
         axis = _normalize_axis(self._quantized_axis, self._data.ndim)
 
-        if self._is_grouped_tensor:
-            if self._dest_dtype in [float8_e4m3, float8_e5m2]:
-                assert self._granularity == ScalingGranularity.MX_BLOCKWISE, (
-                    "Grouped dequantization is only supported for MX_BLOCKWISE FP8"
-                )
-                assert self._group_lens is not None, "group_lens is missing"
-                assert self._group_offs is not None, "group_offs is missing"
-                assert self._orig_group_offs is not None, "orig_group_offs is missing"
-                out = grouped_dequantize_fp8(
-                    self._data,
-                    self._orig_dtype,
-                    self._granularity,
-                    self._orig_group_offs,
-                    self._group_offs,
-                    block_size=self._block_size,
-                    axis=axis,
-                    scale_inv=self._scale_inv,
-                    scaling_recipe=self._scaling_recipe,
-                    total_M=self.shape[0],  # original shape
-                )
-            else:
-                raise ValueError(f"Grouped dequantization is not supported for dtype {self._dest_dtype}")
-        elif self._dest_dtype in [float8_e4m3, float8_e5m2]:
+        if self._dest_dtype in [float8_e4m3, float8_e5m2]:
+            assert self._granularity == ScalingGranularity.MX_BLOCKWISE, (
+                "Grouped dequantization is only supported for MX_BLOCKWISE FP8"
+            )
+            assert self._group_lens is not None, "group_lens is missing"
+            assert self._group_offs is not None, "group_offs is missing"
+            assert self._orig_group_offs is not None, "orig_group_offs is missing"
+            out = grouped_dequantize_fp8(
+                self._data,
+                self._orig_dtype,
+                self._granularity,
+                self._orig_group_offs,
+                self._group_offs,
+                block_size=self._block_size,
+                axis=axis,
+                scale_inv=self._scale_inv,
+                scaling_recipe=self._scaling_recipe,
+                total_M=self.shape[0],  # original shape
+            )
+        else:
+            raise ValueError(f"Grouped dequantization is not supported for dtype {self._dest_dtype}")
+
+        return out
+
+    @torch.no_grad()
+    def _dequantize(self) -> torch.Tensor:
+        from primus_turbo.pytorch.ops.quantization import (
+            dequantize_fp4,
+            dequantize_fp8,
+        )
+
+        axis = _normalize_axis(self._quantized_axis, self._data.ndim)
+
+        if self._dest_dtype in [float8_e4m3, float8_e5m2]:
             out = dequantize_fp8(
                 self._data,
                 self._orig_dtype,
@@ -511,6 +531,20 @@ class QuantizedTensor(torch.Tensor):
             )
         else:
             raise AssertionError("Unsupported dtype")
+
+        return out
+
+    def dequantize(self) -> torch.Tensor:
+        """Dequantize back to the original high-precision dtype."""
+
+        if self._is_grouped_tensor:
+            # NOTE: we treat grouped tensors as non-grouped tensors when granularity is TENSORWISE or ROWWISE.
+            if self._granularity in [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE]:
+                out = self._dequantize()
+            else:
+                out = self._grouped_dequantize()
+        else:
+            out = self._dequantize()
 
         # TODO(ruibin): fused unpad in dequantize kernel
         if out.ndim == 2:
