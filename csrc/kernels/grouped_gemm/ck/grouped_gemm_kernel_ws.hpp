@@ -144,8 +144,23 @@ struct GroupedGemmKernelWS
         __shared__ int32_t s_block_id;
 
         // -- Phase 1: per-XCD claims ----------------------------------------
+        //
+        // ``s_block_id`` is written by thread 0 and read by all threads.
+        // It needs a barrier on both sides of the write: after (so all
+        // threads see the new value -- the mid-loop ``__syncthreads()``)
+        // and before (so a straggler warp still reading the previous
+        // iteration's value isn't clobbered). On the normal path the
+        // trailing ``block_sync_lds()`` after ``Run()`` in iteration N
+        // provides the "before" for iteration N+1, but two exit paths
+        // skip that trailing barrier and let the next write race the
+        // previous read: the ``continue`` on ``block_id >= total_tiles``
+        // and the Phase-1 ``break`` that falls into Phase 2's atomicAdd.
+        // The top-of-loop ``__syncthreads()`` plugs both. Loop-exit
+        // conditions are block-uniform (derived from ``s_block_id``
+        // alone), so this barrier cannot diverge.
         while(true)
         {
+            __syncthreads();
             if(threadIdx.x == 0)
             {
                 s_block_id = atomicAdd(local_counter, 1);
@@ -181,8 +196,10 @@ struct GroupedGemmKernelWS
         }
 
         // -- Phase 2: global fallback ----------------------------------------
+        // Same top-of-loop ``__syncthreads()`` rationale as Phase 1.
         while(true)
         {
+            __syncthreads();
             if(threadIdx.x == 0)
             {
                 s_block_id = atomicAdd(global_counter, 1);
