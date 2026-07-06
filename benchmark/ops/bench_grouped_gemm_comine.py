@@ -51,6 +51,7 @@ if _MEGATRON_LM not in sys.path:
 from mega_utils import (  # noqa: E402
     bench,
     check_accuracy,
+    combine_only,
     compute_stage_metrics,
     dense_gemm_peak_ms,
     generate_input,
@@ -58,6 +59,7 @@ from mega_utils import (  # noqa: E402
     grouped_gemm_bf16_only,
     print_header,
     print_stage,
+    topk_reduce_only,
 )
 from megatron.core.fusions.fused_bias_swiglu import (  # noqa: E402
     weighted_bias_swiglu_impl,
@@ -65,9 +67,7 @@ from megatron.core.fusions.fused_bias_swiglu import (  # noqa: E402
 
 import primus_turbo.pytorch as turbo  # noqa: E402
 from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (  # noqa: E402
-    combine_only,
     grouped_gemm_combine_bf16,
-    topk_reduce_only,
 )
 from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
 
@@ -137,15 +137,12 @@ def profile_combine(group, args, mode, W1, W2, turbo_reference):
         remote_rows = int(((origin != rank) & (origin >= 0)).sum().item())
         xgmi_bytes = remote_rows * H * 2
 
-        # per-slot ready flags = symm.barrier_local (UNCACHED signal heap, shared fwd + bwd reduce).
-        # 0 == ready (role 2 waits while flag < 0); pre-zeroed each iter -> no real cross-rank
-        # wait. topk tables drive the per-token reduce.
+        # topk tables drive the per-token reduce. The fused kernel uses the monotonic
+        # parity combine_flag/reduce_flag (never reset) -> no per-iter scoreboard reset.
         topk_idx_flat = inp.topk_idx.to(torch.int32).contiguous().view(-1)
         topk_w_flat = inp.topk_weight.to(torch.float32).contiguous().view(-1)
-
-        def _reset_fused():
-            symm.sb_l2.zero_()
-            symm.barrier_local.zero_()
+        # standalone reduce ready flags (signal off in reduce_only -> unused, just valid).
+        reduce_ready = torch.zeros(int(symm.combine_slots), dtype=torch.int32, device="cuda")
 
         # one synced cross-rank op (barrier, optional reset, barrier) so the accuracy
         # probes run in a clean state, isolated from the timing loops.
@@ -202,15 +199,11 @@ def profile_combine(group, args, mode, W1, W2, turbo_reference):
                     act,
                     inp.W2,
                     inp.handle,
-                    group,
                     topk_indices=topk_idx_flat,
                     topk_weights=topk_w_flat,
                     BM=BM,
                     BN=BN,
-                    num_combine_cu=cu,
-                    num_reduce_cu=args.num_reduce_cu,
                 ),
-                reset=_reset_fused,
                 group=group,
                 iters=args.iters,
             )
@@ -231,15 +224,11 @@ def profile_combine(group, args, mode, W1, W2, turbo_reference):
                 act,
                 inp.W2,
                 inp.handle,
-                group,
                 topk_indices=topk_idx_flat,
                 topk_weights=topk_w_flat,
                 BM=BM,
                 BN=BN,
-                num_combine_cu=num_combine_cu,
-                num_reduce_cu=args.num_reduce_cu,
             ),
-            reset=_reset_fused,
         )[0]
         acc["fwd"] = check_accuracy(group, "fwd fused (nt)", y_fused, ref_y)
 
@@ -289,16 +278,12 @@ def profile_combine(group, args, mode, W1, W2, turbo_reference):
                     grad_l1,
                     inp.W1,
                     inp.handle,
-                    group,
                     topk_indices=topk_idx_flat,
                     topk_weights=None,
                     layout="nn",
                     BM=BM,
                     BN=BN,
-                    num_combine_cu=cu,
-                    num_reduce_cu=args.num_reduce_cu,
                 ),
-                reset=_reset_fused,
                 group=group,
                 iters=args.iters,
             )
@@ -309,7 +294,6 @@ def profile_combine(group, args, mode, W1, W2, turbo_reference):
         ref_dx = torch.empty(num_tokens, H, device="cuda", dtype=torch.bfloat16)
 
         def _ref_bwd():
-            symm.sb_l2.zero_()
             grouped_gemm_bf16_only(
                 grad_l1,
                 inp.W1,
@@ -326,11 +310,11 @@ def profile_combine(group, args, mode, W1, W2, turbo_reference):
             combine_only(group, BM=BM, num_combine_cu=args.bwd_combine_cu)
             torch.cuda.synchronize()
             group.barrier()
-            symm.barrier_local.zero_()  # 0 == ready
+            reduce_ready.zero_()  # 0 == ready (reduce_only does not spin)
             topk_reduce_only(
                 ref_dx,
                 symm.comb,
-                symm.barrier_local,
+                reduce_ready,
                 topk_idx_flat,
                 symm.num_tokens_per_rank,
                 int(symm.combine_slots),
@@ -346,16 +330,12 @@ def profile_combine(group, args, mode, W1, W2, turbo_reference):
                 grad_l1,
                 inp.W1,
                 inp.handle,
-                group,
                 topk_indices=topk_idx_flat,
                 topk_weights=None,
                 layout="nn",
                 BM=BM,
                 BN=BN,
-                num_combine_cu=args.bwd_combine_cu,
-                num_reduce_cu=args.num_reduce_cu,
             ),
-            reset=_reset_fused,
         )[0]
         acc["bwd"] = check_accuracy(group, "bwd STEP3 fused (nn)", dx_fused, ref_dx)
         del grad_l1

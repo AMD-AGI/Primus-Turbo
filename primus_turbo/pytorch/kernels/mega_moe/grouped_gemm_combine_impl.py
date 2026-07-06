@@ -85,21 +85,18 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         kernel = _flydsl_kernel()
-        # group=None -> kernel uses the active symm buffer; handle carries tile_to_expert (slot [7]).
+        # kernel uses the active symm buffer; handle carries tile_to_expert (slot [7]).
+        # num_combine_cu/num_reduce_cu/autotune removed: the kernel always autotunes internally.
         return kernel(
             act,
             weight,
             handle,
-            None,
             topk_indices=topk_indices,
             topk_weights=topk_weights,
             grad_gate=grad_gate,
             layout=layout,
             BM=int(BM),
             BN=int(BN),
-            num_combine_cu=int(num_combine_cu),
-            num_reduce_cu=int(num_reduce_cu),
-            autotune=bool(autotune),
         )
 
 
