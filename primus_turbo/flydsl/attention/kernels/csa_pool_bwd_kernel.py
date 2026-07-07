@@ -47,8 +47,9 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
-from primus_turbo.flydsl.attention.kernels.kernels_common import dtype_to_elem_type
+from primus_turbo.flydsl.attention.kernels.kernels_common import dtype_to_elem_type, mfma_f32_16x16x32
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf, fly as _fly, llvm as _llvm, math as math_dialect
 from flydsl.expr import const_expr  # noqa: E402
@@ -57,6 +58,7 @@ from flydsl.expr import const_expr  # noqa: E402
 KERNEL_NAME = "csa_pool_bwd_kernel"
 
 _LLVM_GEP_DYNAMIC = -2147483648
+_LOG2E_BWD = math.log2(math.e)
 
 
 def _llvm_ptr_ty():
@@ -669,5 +671,621 @@ def build_csa_pool_bwd_dpool_module(
     def _launch(*args, **kwargs):
         with CompilationContext.compile_hints(compile_hints):
             return launch_csa_pool_bwd_dpool(*args, **kwargs)
+
+    return _launch
+
+
+def build_csa_pool_bwd_dpool_mfma_module(
+    num_heads,
+    head_dim,
+    dtype_str="bf16",
+    sm_scale=None,
+    waves_per_eu=2,
+    unsafe_fp_math=True,
+    fast_fp_math=True,
+    daz=True,
+    mqa_kv=True,
+    k_block=1,
+):
+    """CSA dpool-only backward, all-MFMA (head-as-contraction).
+
+    Same contract as :func:`build_csa_pool_bwd_dpool_module` (grid signature +
+    partial buffer ``DPOOL_PART[B, Sq, K_topk, D]``, host ``index_add`` reduce),
+    but every GEMM runs on the matrix cores instead of per-head VALU dots:
+
+    * ``qk[h,k] = q[h,d] @ gathered[k,d]``   (contract d, head-as-M MFMA)
+    * ``dp[h,k] = dout[h,d] @ gathered[k,d]`` (contract d)
+    * ``part[d,k] = sum_h qT[d,h]*ds_scaled[h,k] + doutT[d,h]*p[h,k]``
+      (contract **h**, the AV-MFMA step)
+
+    Grid: ``(Sq, B)`` — one wave per ``(b, m)`` contracts ALL heads so the
+    partial stays atomic-free (unique ``(b,m,k)`` owner). ``q`` / ``dout`` are
+    staged transposed into LDS (``[D, H]``) for the output GEMM's A-operand; the
+    per-tile ``ds`` / ``p`` B-operands are staged ``[BLOCK_K, H]``. ``gathered``
+    is read straight from HBM per key (d-contiguous).
+    """
+    gpu_arch = get_hip_arch()
+    WARP_SIZE = 64
+    BLOCK_SIZE = WARP_SIZE
+    NUM_HEADS = int(num_heads)
+    HEAD_DIM = int(head_dim)
+    BLOCK_K = 16
+    assert HEAD_DIM % 32 == 0
+    assert NUM_HEADS % 16 == 0, "dpool MFMA path needs NUM_HEADS % 16 == 0"
+    K_CHUNKS = HEAD_DIM // 32       # d-contraction chunks for QK/DP
+    D_TILES = HEAD_DIM // 16        # output d-tiles
+    H_TILES = NUM_HEADS // 16       # head-tiles for QK/DP score layout
+    H_KSTEPS = (NUM_HEADS + 31) // 32  # head-contraction MFMA steps (K=32)
+    # The head-contraction GEMM contracts K=32 per step; pad the LDS head axis
+    # up to a multiple of 32 and zero the padding so the extra head slots
+    # contribute nothing (needed when NUM_HEADS % 32 != 0, e.g. small tests).
+    H_PAD = H_KSTEPS * 32
+    HAS_HPAD = H_PAD != NUM_HEADS
+    if const_expr(sm_scale is None):
+        sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    LDS_QT = HEAD_DIM * H_PAD       # qT [D, H_PAD]
+    LDS_DOT = HEAD_DIM * H_PAD      # doutT [D, H_PAD]
+    LDS_DS = BLOCK_K * H_PAD        # ds_scaled [BLOCK_K, H_PAD]
+    LDS_P = BLOCK_K * H_PAD         # p [BLOCK_K, H_PAD]
+    LDS_TOTAL = LDS_QT + LDS_DOT + LDS_DS + LDS_P
+
+    allocator = SmemAllocator(
+        None, arch=gpu_arch, global_sym_name=f"csa_dpool_mfma_smem_H{NUM_HEADS}",
+    )
+    lds_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_off + LDS_TOTAL * 2
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def csa_pool_bwd_dpool_mfma_kernel(
+        Q: fx.Tensor,
+        POOL: fx.Tensor,
+        TOPK: fx.Tensor,
+        DOUT: fx.Tensor,
+        LSE: fx.Tensor,
+        DELTA: fx.Tensor,
+        DPOOL_PART: fx.Tensor,
+        seq_len: fx.Int32,
+        K_topk: fx.Int32,
+        pool_size: fx.Int32,
+    ):
+        elem_type = dtype_to_elem_type(dtype_str)
+        f16_ty = elem_type
+        f32_ty = T.f32
+        fm_fast = arith.FastMathFlags.fast
+
+        q_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), Q)
+        pool_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), POOL)
+        topk_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), TOPK)
+        do_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), DOUT)
+        part_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), DPOOL_PART)
+        lse_rsrc = buffer_ops.create_buffer_resource(LSE, max_size=True)
+        delta_rsrc = buffer_ops.create_buffer_resource(DELTA, max_size=True)
+
+        base_ptr = allocator.get_base()
+        lds = SmemPtr(base_ptr, lds_off, elem_type, shape=(LDS_TOTAL,)).get()
+        C_QT = arith.index(0)
+        C_DOT = arith.index(LDS_QT)
+        C_DS = arith.index(LDS_QT + LDS_DOT)
+        C_P = arith.index(LDS_QT + LDS_DOT + LDS_DS)
+
+        def _gep(base_p, elem_idx, elem_t):
+            idx_i64 = arith.index_cast(T.i64, elem_idx)
+            return _llvm.GEPOp(_llvm_ptr_ty(), base_p, [idx_i64],
+                               rawConstantIndices=[_LLVM_GEP_DYNAMIC],
+                               elem_type=elem_t, noWrapFlags=0).result
+
+        def load_f16_v(base_p, elem_idx, n):
+            return _llvm.LoadOp(T.vec(n, f16_ty), _gep(base_p, elem_idx, f16_ty)).result
+
+        def load_i32_scalar(base_p, elem_idx):
+            return _llvm.LoadOp(T.i32, _gep(base_p, elem_idx, T.i32)).result
+
+        def store_f32(val, base_p, elem_idx):
+            _llvm.StoreOp(val, _gep(base_p, elem_idx, f32_ty))
+
+        def lds_store1(val, idx):
+            vector.store(vector.from_elements(T.vec(1, f16_ty), [val]), lds, [idx])
+
+        def lds_load8(idx):
+            return vector.load_op(T.vec(8, f16_ty), lds, [idx])
+
+        pid_m = arith.index_cast(T.index, gpu.block_idx.x)
+        bid = arith.index_cast(T.index, gpu.block_idx.y)
+        lane = arith.index_cast(T.index, gpu.thread_idx.x)
+
+        seq_len_v = arith.index_cast(T.index, seq_len)
+        K_topk_v = arith.index_cast(T.index, K_topk)
+        pool_size_v = arith.index_cast(T.index, pool_size)
+        pool_size_i32 = pool_size
+        if const_expr(hasattr(pool_size_i32, "ir_value")):
+            pool_size_i32 = pool_size_i32.ir_value()
+        K_topk_i32 = K_topk
+        if const_expr(hasattr(K_topk_i32, "ir_value")):
+            K_topk_i32 = K_topk_i32.ir_value()
+
+        q_active = arith.cmpi(arith.CmpIPredicate.slt, pid_m, seq_len_v)
+        pid_m_safe = arith.select(q_active, pid_m, arith.index(0))
+
+        lane_mod_16 = lane % arith.index(16)
+        lane_div_16 = lane // arith.index(16)   # group g 0..3
+        lane_mod_16_i32 = arith.index_cast(T.i32, lane_mod_16)
+        lane_div_16_i32 = arith.index_cast(T.i32, lane_div_16)
+
+        c_zero_f = arith.constant(0.0, type=f32_ty)
+        c_neg_inf = arith.constant(-1.0e30, type=f32_ty)
+        c_sm_scale_f = arith.constant(float(sm_scale), type=f32_ty)
+        c_log2e_f = arith.constant(_LOG2E_BWD, type=f32_ty)
+        zero_mfma_pack = arith.constant_vector(0.0, T.vec(8, f16_ty))
+        c_zero_mfma_acc = arith.constant_vector(0.0, T.vec(4, f32_ty))
+
+        # ── Stage qT / doutT into LDS [D, H] (transpose). Each lane loads vec8
+        # of d for a head, scatters to lds[d*H + h]. Loop all heads. ──
+        lane_d_base = lane * arith.index(8)   # 64 lanes * 8 = 512 = HEAD_DIM
+        for h in range_constexpr(NUM_HEADS):
+            row = ((bid * arith.index(NUM_HEADS) + arith.index(h)) * seq_len_v + pid_m_safe) * arith.index(HEAD_DIM)
+            qv = load_f16_v(q_ptr, row + lane_d_base, 8)
+            dv = load_f16_v(do_ptr, row + lane_d_base, 8)
+            for e in range_constexpr(8):
+                d = lane_d_base + arith.index(e)
+                dst = d * arith.index(H_PAD) + arith.index(h)
+                lds_store1(vector.extract(qv, static_position=[e], dynamic_position=[]), C_QT + dst)
+                lds_store1(vector.extract(dv, static_position=[e], dynamic_position=[]), C_DOT + dst)
+        c_zero_f16 = arith.constant(0.0, type=f16_ty)
+        if const_expr(HAS_HPAD):
+            # Zero the padding head columns [NUM_HEADS, H_PAD) of qT / doutT so
+            # the head-contraction GEMM's extra K lanes contribute nothing.
+            for hp in range_constexpr(H_PAD - NUM_HEADS):
+                h = NUM_HEADS + hp
+                for e in range_constexpr(8):
+                    d = lane_d_base + arith.index(e)
+                    dst = d * arith.index(H_PAD) + arith.index(h)
+                    lds_store1(c_zero_f16, C_QT + dst)
+                    lds_store1(c_zero_f16, C_DOT + dst)
+
+        # Q/DOUT B-operand packs for QK/DP, per head-tile: lane L -> head =
+        # ht*16 + L%16, d = ck*32 + g*8. Read straight from HBM.
+        def qdo_bpack(base_p, ht, ck):
+            head = arith.index(ht * 16) + lane_mod_16
+            row = ((bid * arith.index(NUM_HEADS) + head) * seq_len_v + pid_m_safe) * arith.index(HEAD_DIM)
+            off = row + arith.index(ck * 32) + lane_div_16 * arith.index(8)
+            return load_f16_v(base_p, off, 8)
+
+        # Validity + pool row base for global key kk (i32).
+        def key_meta(kk_i32):
+            ko = arith.cmpi(arith.CmpIPredicate.sge, kk_i32, K_topk_i32)
+            kk_idx = arith.index_cast(T.index, arith.select(ko, arith.constant(0, type=T.i32), kk_i32))
+            toff = (bid * seq_len_v + pid_m_safe) * K_topk_v + kk_idx
+            idr = load_i32_scalar(topk_ptr, toff)
+            ineg = arith.cmpi(arith.CmpIPredicate.slt, idr, arith.constant(0, type=T.i32))
+            igp = arith.cmpi(arith.CmpIPredicate.sge, idr, pool_size_i32)
+            inv = arith.OrIOp(arith.OrIOp(ko, ineg).result, igp).result
+            idx_safe = arith.index_cast(T.index, arith.select(inv, arith.constant(0, type=T.i32), idr))
+            prow = (bid * pool_size_v + idx_safe) * arith.index(HEAD_DIM)
+            return inv, prow
+
+        gpu.barrier()  # qT/doutT staged
+
+        # ── Loop over K-tiles of BLOCK_K keys ──
+        for kt in scf.for_(arith.index(0), K_topk_v, arith.index(BLOCK_K)):
+            kt_i32 = arith.index_cast(T.i32, kt)
+            gpu.barrier()  # protect ds/p LDS from previous tile's output reads
+
+            # A-operand gathered: lane L -> key = L%16, d = ck*32 + g*8.
+            key_pos_i32 = arith.AddIOp(kt_i32, lane_mod_16_i32).result
+            _inv_a, pool_row_base = key_meta(key_pos_i32)
+            g_packs = []
+            for ck in range_constexpr(K_CHUNKS):
+                poff = pool_row_base + arith.index(ck * 32) + lane_div_16 * arith.index(8)
+                g_packs.append(load_f16_v(pool_ptr, poff, 8))
+
+            # For each head-tile: QK + DP MFMA, then compute p / ds and stage.
+            for ht in range_constexpr(H_TILES):
+                qk_acc = c_zero_mfma_acc
+                dp_acc = c_zero_mfma_acc
+                for ck in range_constexpr(K_CHUNKS):
+                    qb = qdo_bpack(q_ptr, ht, ck)
+                    dob = qdo_bpack(do_ptr, ht, ck)
+                    qk_acc = mfma_f32_16x16x32(g_packs[ck], qb, qk_acc, dtype_str)
+                    dp_acc = mfma_f32_16x16x32(g_packs[ck], dob, dp_acc, dtype_str)
+                # C-layout: lane L holds [key = g*4+r, head = ht*16 + L%16].
+                head = arith.index(ht * 16) + lane_mod_16
+                lse_off = (bid * arith.index(NUM_HEADS) + head) * seq_len_v + pid_m_safe
+                lse_off_i32 = arith.index_cast(T.i32, lse_off)
+                lse_h = buffer_ops.buffer_load(lse_rsrc, lse_off_i32, vec_width=1, dtype=f32_ty)
+                delta_h = buffer_ops.buffer_load(delta_rsrc, lse_off_i32, vec_width=1, dtype=f32_ty)
+                for r in range_constexpr(4):
+                    key_r_i32 = arith.AddIOp(kt_i32, arith.AddIOp(
+                        arith.MulIOp(lane_div_16_i32, arith.constant(4, type=T.i32)).result,
+                        arith.constant(r, type=T.i32)).result).result
+                    inv_r, _pr = key_meta(key_r_i32)
+                    qk_raw = vector.extract(qk_acc, static_position=[r], dynamic_position=[])
+                    dp_raw = vector.extract(dp_acc, static_position=[r], dynamic_position=[])
+                    qk_s = arith.MulFOp(qk_raw, c_sm_scale_f, fastmath=fm_fast).result
+                    qk_s = arith.select(inv_r, c_neg_inf, qk_s)
+                    p = arith.ArithValue(arith.MulFOp(arith.SubFOp(qk_s, lse_h, fastmath=fm_fast).result, c_log2e_f, fastmath=fm_fast).result).exp2(fastmath=fm_fast)
+                    ds = arith.MulFOp(p, arith.SubFOp(dp_raw, delta_h, fastmath=fm_fast).result, fastmath=fm_fast).result
+                    ds_scaled = arith.MulFOp(ds, c_sm_scale_f, fastmath=fm_fast).result
+                    # zero invalid explicitly (p already 0, but ds uses dp_raw).
+                    ds_scaled = arith.select(inv_r, c_zero_f, ds_scaled)
+                    p = arith.select(inv_r, c_zero_f, p)
+                    # Stage into [BLOCK_K, H]: kloc = g*4+r, head = ht*16+L%16.
+                    kloc = arith.MulIOp(lane_div_16_i32, arith.constant(4, type=T.i32)).result
+                    kloc = arith.index_cast(T.index, arith.AddIOp(kloc, arith.constant(r, type=T.i32)).result)
+                    dst = kloc * arith.index(H_PAD) + head
+                    lds_store1(arith.trunc_f(f16_ty, ds_scaled), C_DS + dst)
+                    lds_store1(arith.trunc_f(f16_ty, p), C_P + dst)
+
+            gpu.barrier()  # ds/p staged
+
+            # ── Output GEMM: part[d, key] = sum_h qT[d,h]*ds[h,k] + doutT[d,h]*p[h,k]
+            # A pack qT: lane L -> d = dt*16 + L%16, head = ks*32 + g*8.
+            # B pack ds: lane L -> key = L%16, head = ks*32 + g*8.
+            for dt in range_constexpr(D_TILES):
+                part_acc = c_zero_mfma_acc
+                for ks in range_constexpr(H_KSTEPS):
+                    a_qt = (arith.index(dt * 16) + lane_mod_16) * arith.index(H_PAD) + arith.index(ks * 32) + lane_div_16 * arith.index(8)
+                    a_dot = a_qt
+                    b_off = lane_mod_16 * arith.index(H_PAD) + arith.index(ks * 32) + lane_div_16 * arith.index(8)
+                    qt_pack = lds_load8(C_QT + a_qt)
+                    ds_pack = lds_load8(C_DS + b_off)
+                    part_acc = mfma_f32_16x16x32(qt_pack, ds_pack, part_acc, dtype_str)
+                    dot_pack = lds_load8(C_DOT + a_dot)
+                    p_pack = lds_load8(C_P + b_off)
+                    part_acc = mfma_f32_16x16x32(dot_pack, p_pack, part_acc, dtype_str)
+                # C: lane L -> part[d = dt*16 + g*4+r, key = L%16].
+                key_glob = arith.AddIOp(kt_i32, lane_mod_16_i32).result
+                key_in = arith.cmpi(arith.CmpIPredicate.slt, key_glob, K_topk_i32)
+                _guard = scf.IfOp(arith.AndIOp(key_in, q_active).result, [], has_else=False)
+                with ir.InsertionPoint(_guard.then_block):
+                    key_idx = arith.index_cast(T.index, key_glob)
+                    part_row = ((bid * seq_len_v + pid_m_safe) * K_topk_v + key_idx) * arith.index(HEAD_DIM)
+                    for r in range_constexpr(4):
+                        d = arith.index(dt * 16) + lane_div_16 * arith.index(4) + arith.index(r)
+                        pv = vector.extract(part_acc, static_position=[r], dynamic_position=[])
+                        store_f32(pv, part_ptr, part_row + d)
+                    scf.YieldOp([])
+
+    @flyc.jit
+    def launch_csa_pool_bwd_dpool_mfma(
+        Q: fx.Tensor,
+        POOL: fx.Tensor,
+        TOPK: fx.Tensor,
+        DOUT: fx.Tensor,
+        LSE: fx.Tensor,
+        DELTA: fx.Tensor,
+        DPOOL_PART: fx.Tensor,
+        batch_size: fx.Int32,
+        seq_len: fx.Int32,
+        K_topk: fx.Int32,
+        pool_size: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+
+        bs_idx = arith.index_cast(T.index, batch_size)
+        sl_idx = arith.index_cast(T.index, seq_len)
+        launcher = csa_pool_bwd_dpool_mfma_kernel(
+            Q, POOL, TOPK, DOUT, LSE, DELTA, DPOOL_PART, seq_len, K_topk, pool_size,
+        )
+        if const_expr(waves_per_eu is not None):
+            for op in ctx.gpu_module_body.operations:
+                if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, int(waves_per_eu))
+        passthrough_entries = []
+        if const_expr(daz):
+            passthrough_entries.append(ir.ArrayAttr.get([
+                ir.StringAttr.get("denormal-fp-math-f32"),
+                ir.StringAttr.get("preserve-sign,preserve-sign")]))
+            passthrough_entries.append(ir.ArrayAttr.get([
+                ir.StringAttr.get("no-nans-fp-math"), ir.StringAttr.get("true")]))
+            passthrough_entries.append(ir.ArrayAttr.get([
+                ir.StringAttr.get("unsafe-fp-math"), ir.StringAttr.get("true")]))
+        for op in ctx.gpu_module_body.operations:
+            if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
+                op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
+        launcher.launch(grid=(sl_idx, bs_idx, arith.index(1)), block=(BLOCK_SIZE, 1, 1), stream=stream)
+
+    compile_hints = {"fast_fp_math": fast_fp_math, "unsafe_fp_math": unsafe_fp_math}
+
+    def _launch(*args, **kwargs):
+        with CompilationContext.compile_hints(compile_hints):
+            return launch_csa_pool_bwd_dpool_mfma(*args, **kwargs)
+
+    return _launch
+
+
+def build_csa_pool_bwd_dq_mfma_module(
+    num_heads,
+    head_dim,
+    dtype_str="bf16",
+    sm_scale=None,
+    waves_per_eu=2,
+    unsafe_fp_math=True,
+    fast_fp_math=True,
+    daz=True,
+):
+    """CSA sparse-branch dq, all-MFMA (head-as-M QK/DP + AV over keys).
+
+    Computes the sparse pool contribution to ``dq``:
+        ``dq[h,d] = scale * sum_k ds_sparse[h,k] * gathered[k,d]``
+    where ``p[h,k]=exp(qk*scale - lse_h)``, ``dp[h,k]=dout_h · gathered_k``,
+    ``ds[h,k]=p*(dp - delta_h)``. Mirrors the sparse-forward AV structure but
+    consumes the saved joint ``lse`` / preprocess ``delta`` instead of an online
+    softmax, and adds a second score GEMM for ``dp``.
+
+    Grid: ``(Sq, cdiv(HEAD_Q, 16), B)``. Writes ``dq_sparse[B, H, Sq, D]`` fp32
+    (the launcher adds it into the local-stream dq). Same head-block tiling and
+    LDS gathered^T / ds^T staging as :func:`build_csa_pool_sparse_fwd_module`.
+    """
+    gpu_arch = get_hip_arch()
+    WARP_SIZE = 64
+    BLOCK_SIZE = WARP_SIZE
+    NUM_HEADS = int(num_heads)
+    HEAD_DIM = int(head_dim)
+    BLOCK_H = 16
+    BLOCK_K = 32
+    assert HEAD_DIM % 32 == 0
+    K_CHUNKS = HEAD_DIM // 32
+    D_TILES = HEAD_DIM // 16
+    N_SUB = BLOCK_K // 16
+    if const_expr(sm_scale is None):
+        sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    LDS_GT = HEAD_DIM * BLOCK_K       # gathered^T [d, kloc]
+    LDS_DS = BLOCK_H * BLOCK_K        # ds_scaled [head, kloc]
+    LDS_TOTAL = LDS_GT + LDS_DS
+
+    allocator = SmemAllocator(
+        None, arch=gpu_arch, global_sym_name="csa_dq_mfma_smem",
+    )
+    lds_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_off + LDS_TOTAL * 2
+
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def csa_pool_bwd_dq_mfma_kernel(
+        Q: fx.Tensor,
+        POOL: fx.Tensor,
+        TOPK: fx.Tensor,
+        DOUT: fx.Tensor,
+        LSE: fx.Tensor,
+        DELTA: fx.Tensor,
+        DQ: fx.Tensor,  # [B, H, Sq, D] fp32
+        seq_len: fx.Int32,
+        K_topk: fx.Int32,
+        pool_size: fx.Int32,
+    ):
+        elem_type = dtype_to_elem_type(dtype_str)
+        f16_ty = elem_type
+        f32_ty = T.f32
+        fm_fast = arith.FastMathFlags.fast
+
+        q_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), Q)
+        pool_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), POOL)
+        topk_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), TOPK)
+        do_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), DOUT)
+        dq_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), DQ)
+        lse_rsrc = buffer_ops.create_buffer_resource(LSE, max_size=True)
+        delta_rsrc = buffer_ops.create_buffer_resource(DELTA, max_size=True)
+
+        base_ptr = allocator.get_base()
+        lds = SmemPtr(base_ptr, lds_off, elem_type, shape=(LDS_TOTAL,)).get()
+        C_DS = arith.index(LDS_GT)
+
+        def _gep(base_p, elem_idx, elem_t):
+            idx_i64 = arith.index_cast(T.i64, elem_idx)
+            return _llvm.GEPOp(_llvm_ptr_ty(), base_p, [idx_i64],
+                               rawConstantIndices=[_LLVM_GEP_DYNAMIC],
+                               elem_type=elem_t, noWrapFlags=0).result
+
+        def load_f16_v(base_p, elem_idx, n):
+            return _llvm.LoadOp(T.vec(n, f16_ty), _gep(base_p, elem_idx, f16_ty)).result
+
+        def load_i32_scalar(base_p, elem_idx):
+            return _llvm.LoadOp(T.i32, _gep(base_p, elem_idx, T.i32)).result
+
+        def store_f32(val, base_p, elem_idx):
+            _llvm.StoreOp(val, _gep(base_p, elem_idx, f32_ty))
+
+        def lds_store1(val, idx):
+            vector.store(vector.from_elements(T.vec(1, f16_ty), [val]), lds, [idx])
+
+        pid_m = arith.index_cast(T.index, gpu.block_idx.x)
+        pid_hblk = arith.index_cast(T.index, gpu.block_idx.y)
+        bid = arith.index_cast(T.index, gpu.block_idx.z)
+        lane = arith.index_cast(T.index, gpu.thread_idx.x)
+
+        seq_len_v = arith.index_cast(T.index, seq_len)
+        K_topk_v = arith.index_cast(T.index, K_topk)
+        pool_size_v = arith.index_cast(T.index, pool_size)
+        pool_size_i32 = pool_size
+        if const_expr(hasattr(pool_size_i32, "ir_value")):
+            pool_size_i32 = pool_size_i32.ir_value()
+        K_topk_i32 = K_topk
+        if const_expr(hasattr(K_topk_i32, "ir_value")):
+            K_topk_i32 = K_topk_i32.ir_value()
+
+        q_active = arith.cmpi(arith.CmpIPredicate.slt, pid_m, seq_len_v)
+        pid_m_safe = arith.select(q_active, pid_m, arith.index(0))
+
+        lane_mod_16 = lane % arith.index(16)
+        lane_div_16 = lane // arith.index(16)
+        lane_mod_16_i32 = arith.index_cast(T.i32, lane_mod_16)
+        lane_div_16_i32 = arith.index_cast(T.i32, lane_div_16)
+        h_base = pid_hblk * arith.index(BLOCK_H)
+
+        c_neg_inf = arith.constant(-1.0e30, type=f32_ty)
+        c_zero_f = arith.constant(0.0, type=f32_ty)
+        c_sm_scale_f = arith.constant(float(sm_scale), type=f32_ty)
+        c_log2e_f = arith.constant(_LOG2E_BWD, type=f32_ty)
+        zero_mfma_pack = arith.constant_vector(0.0, T.vec(8, f16_ty))
+        c_zero_mfma_acc = arith.constant_vector(0.0, T.vec(4, f32_ty))
+
+        # Q / DOUT B-operand packs (register-resident): lane L -> head = L%16, d chunk.
+        my_head = h_base + lane_mod_16
+        head_ib = arith.cmpi(arith.CmpIPredicate.slt, my_head, arith.index(NUM_HEADS))
+        head_safe = arith.select(head_ib, my_head, arith.index(0))
+        row_base = ((bid * arith.index(NUM_HEADS) + head_safe) * seq_len_v + pid_m_safe) * arith.index(HEAD_DIM)
+        valid_hq = arith.AndIOp(head_ib, q_active).result
+        q_packs = []
+        do_packs = []
+        for ck in range_constexpr(K_CHUNKS):
+            off = row_base + arith.index(ck * 32) + lane_div_16 * arith.index(8)
+            qp = load_f16_v(q_ptr, off, 8)
+            dp = load_f16_v(do_ptr, off, 8)
+            q_packs.append(arith.select(valid_hq, qp, zero_mfma_pack))
+            do_packs.append(arith.select(valid_hq, dp, zero_mfma_pack))
+
+        # lse / delta for this lane's head.
+        lse_off = (bid * arith.index(NUM_HEADS) + head_safe) * seq_len_v + pid_m_safe
+        lse_off_i32 = arith.index_cast(T.i32, lse_off)
+        lse_h = buffer_ops.buffer_load(lse_rsrc, lse_off_i32, vec_width=1, dtype=f32_ty)
+        delta_h = buffer_ops.buffer_load(delta_rsrc, lse_off_i32, vec_width=1, dtype=f32_ty)
+
+        def key_meta(kk_i32):
+            ko = arith.cmpi(arith.CmpIPredicate.sge, kk_i32, K_topk_i32)
+            kk_idx = arith.index_cast(T.index, arith.select(ko, arith.constant(0, type=T.i32), kk_i32))
+            toff = (bid * seq_len_v + pid_m_safe) * K_topk_v + kk_idx
+            idr = load_i32_scalar(topk_ptr, toff)
+            ineg = arith.cmpi(arith.CmpIPredicate.slt, idr, arith.constant(0, type=T.i32))
+            igp = arith.cmpi(arith.CmpIPredicate.sge, idr, pool_size_i32)
+            inv = arith.OrIOp(arith.OrIOp(ko, ineg).result, igp).result
+            idx_safe = arith.index_cast(T.index, arith.select(inv, arith.constant(0, type=T.i32), idr))
+            prow = (bid * pool_size_v + idx_safe) * arith.index(HEAD_DIM)
+            return inv, prow
+
+        acc = [c_zero_mfma_acc for _ in range_constexpr(D_TILES)]
+
+        for k_start, carry, results in scf.for_(
+            arith.index(0), K_topk_v, arith.index(BLOCK_K), iter_args=acc,
+        ):
+            acc = [carry[d] for d in range_constexpr(D_TILES)]
+            k_start_i32 = arith.index_cast(T.i32, k_start)
+            gpu.barrier()
+
+            for s in range_constexpr(N_SUB):
+                key_pos_i32 = arith.AddIOp(
+                    arith.AddIOp(k_start_i32, arith.constant(s * 16, type=T.i32)).result,
+                    lane_mod_16_i32).result
+                _inv_a, pool_row_base = key_meta(key_pos_i32)
+                kloc_base = arith.index(s * 16) + lane_mod_16
+                qk_acc = c_zero_mfma_acc
+                dp_acc = c_zero_mfma_acc
+                for ck in range_constexpr(K_CHUNKS):
+                    poff = pool_row_base + arith.index(ck * 32) + lane_div_16 * arith.index(8)
+                    a_pack = load_f16_v(pool_ptr, poff, 8)
+                    qk_acc = mfma_f32_16x16x32(a_pack, q_packs[ck], qk_acc, dtype_str)
+                    dp_acc = mfma_f32_16x16x32(a_pack, do_packs[ck], dp_acc, dtype_str)
+                    # Scatter gathered^T for the AV step (reuse the QK A-operand).
+                    d_base = arith.index(ck * 32) + lane_div_16 * arith.index(8)
+                    for e in range_constexpr(8):
+                        gv = vector.extract(a_pack, static_position=[e], dynamic_position=[])
+                        lds_idx = (d_base + arith.index(e)) * arith.index(BLOCK_K) + kloc_base
+                        lds_store1(gv, lds_idx)
+                # C-layout: lane L holds [key = g*4+r, head = L%16].
+                for r in range_constexpr(4):
+                    krow_i32 = arith.AddIOp(
+                        arith.AddIOp(k_start_i32, arith.constant(s * 16, type=T.i32)).result,
+                        arith.AddIOp(arith.MulIOp(lane_div_16_i32, arith.constant(4, type=T.i32)).result,
+                                     arith.constant(r, type=T.i32)).result).result
+                    inv_r, _pr = key_meta(krow_i32)
+                    qk_raw = vector.extract(qk_acc, static_position=[r], dynamic_position=[])
+                    dp_raw = vector.extract(dp_acc, static_position=[r], dynamic_position=[])
+                    qk_s = arith.MulFOp(qk_raw, c_sm_scale_f, fastmath=fm_fast).result
+                    qk_s = arith.select(inv_r, c_neg_inf, qk_s)
+                    p = arith.ArithValue(arith.MulFOp(arith.SubFOp(qk_s, lse_h, fastmath=fm_fast).result, c_log2e_f, fastmath=fm_fast).result).exp2(fastmath=fm_fast)
+                    ds = arith.MulFOp(p, arith.SubFOp(dp_raw, delta_h, fastmath=fm_fast).result, fastmath=fm_fast).result
+                    ds_scaled = arith.MulFOp(ds, c_sm_scale_f, fastmath=fm_fast).result
+                    ds_scaled = arith.select(inv_r, c_zero_f, ds_scaled)
+                    # Stage ds_scaled^T: [head = L%16, kloc = s*16 + g*4 + r].
+                    kloc = arith.AddIOp(
+                        arith.constant(s * 16, type=T.i32),
+                        arith.AddIOp(arith.MulIOp(lane_div_16_i32, arith.constant(4, type=T.i32)).result,
+                                     arith.constant(r, type=T.i32)).result).result
+                    kloc_idx = arith.index_cast(T.index, kloc)
+                    dst = C_DS + lane_mod_16 * arith.index(BLOCK_K) + kloc_idx
+                    lds_store1(arith.trunc_f(f16_ty, ds_scaled), dst)
+
+            gpu.barrier()
+
+            # AV MFMA: dq[d, head] += gathered^T[d, kloc] @ ds_scaled[kloc, head].
+            g_koff = lane_div_16 * arith.index(8)
+            b_off = C_DS + lane_mod_16 * arith.index(BLOCK_K) + g_koff
+            b_pack = vector.load_op(T.vec(8, f16_ty), lds, [b_off])
+            new_acc = []
+            for dt in range_constexpr(D_TILES):
+                a_d = arith.index(dt * 16) + lane_mod_16
+                a_idx = a_d * arith.index(BLOCK_K) + g_koff
+                a_pack = vector.load_op(T.vec(8, f16_ty), lds, [a_idx])
+                new_acc.append(mfma_f32_16x16x32(a_pack, b_pack, acc[dt], dtype_str))
+            acc = new_acc
+
+            yield acc
+
+        acc = [results[d] for d in range_constexpr(D_TILES)]
+
+        # Store dq fp32: acc[dt][r] = dq[d = dt*16 + g*4 + r, head = L%16].
+        _if = scf.IfOp(valid_hq, [], has_else=False)
+        with ir.InsertionPoint(_if.then_block):
+            dq_row_base = ((bid * arith.index(NUM_HEADS) + my_head) * seq_len_v + pid_m_safe) * arith.index(HEAD_DIM)
+            for dt in range_constexpr(D_TILES):
+                for r in range_constexpr(4):
+                    dv = vector.extract(acc[dt], static_position=[r], dynamic_position=[])
+                    d = arith.index(dt * 16) + lane_div_16 * arith.index(4) + arith.index(r)
+                    store_f32(dv, dq_ptr, dq_row_base + d)
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_csa_pool_bwd_dq_mfma(
+        Q: fx.Tensor,
+        POOL: fx.Tensor,
+        TOPK: fx.Tensor,
+        DOUT: fx.Tensor,
+        LSE: fx.Tensor,
+        DELTA: fx.Tensor,
+        DQ: fx.Tensor,
+        batch_size: fx.Int32,
+        seq_len: fx.Int32,
+        K_topk: fx.Int32,
+        pool_size: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+
+        bs_idx = arith.index_cast(T.index, batch_size)
+        sl_idx = arith.index_cast(T.index, seq_len)
+        n_hblk = (NUM_HEADS + BLOCK_H - 1) // BLOCK_H
+        launcher = csa_pool_bwd_dq_mfma_kernel(
+            Q, POOL, TOPK, DOUT, LSE, DELTA, DQ, seq_len, K_topk, pool_size,
+        )
+        if const_expr(waves_per_eu is not None):
+            for op in ctx.gpu_module_body.operations:
+                if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, int(waves_per_eu))
+        passthrough_entries = []
+        if const_expr(daz):
+            passthrough_entries.append(ir.ArrayAttr.get([
+                ir.StringAttr.get("denormal-fp-math-f32"),
+                ir.StringAttr.get("preserve-sign,preserve-sign")]))
+            passthrough_entries.append(ir.ArrayAttr.get([
+                ir.StringAttr.get("no-nans-fp-math"), ir.StringAttr.get("true")]))
+            passthrough_entries.append(ir.ArrayAttr.get([
+                ir.StringAttr.get("unsafe-fp-math"), ir.StringAttr.get("true")]))
+        for op in ctx.gpu_module_body.operations:
+            if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
+                op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
+        launcher.launch(grid=(sl_idx, arith.index(n_hblk), bs_idx), block=(BLOCK_SIZE, 1, 1), stream=stream)
+
+    compile_hints = {"fast_fp_math": fast_fp_math, "unsafe_fp_math": unsafe_fp_math}
+
+    def _launch(*args, **kwargs):
+        with CompilationContext.compile_hints(compile_hints):
+            return launch_csa_pool_bwd_dq_mfma(*args, **kwargs)
 
     return _launch

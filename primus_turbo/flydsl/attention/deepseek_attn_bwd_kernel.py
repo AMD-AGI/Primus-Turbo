@@ -36,7 +36,9 @@ from typing import Optional, Tuple
 import torch
 
 from primus_turbo.flydsl.attention.kernels.csa_pool_bwd_kernel import (
+    build_csa_pool_bwd_dpool_mfma_module,
     build_csa_pool_bwd_dpool_module,
+    build_csa_pool_bwd_dq_mfma_module,
     build_csa_pool_bwd_module,
 )
 from primus_turbo.flydsl.attention.kernels.hca_bwd_dkv_pool_kernel import build_hca_bwd_dkv_pool_module
@@ -63,15 +65,39 @@ _CSA_DPOOL_CACHE = {}
 _CSA_DPOOL_LOCK = threading.Lock()
 
 
-def _get_csa_dpool(num_heads, head_dim, dtype_str, mqa_kv, k_block):
-    key = (num_heads, head_dim, dtype_str, mqa_kv, k_block)
+_CSA_DQ_MFMA_CACHE = {}
+_CSA_DQ_MFMA_LOCK = threading.Lock()
+
+
+def _get_csa_dq_mfma(num_heads, head_dim, dtype_str):
+    key = (num_heads, head_dim, dtype_str)
+    with _CSA_DQ_MFMA_LOCK:
+        if key in _CSA_DQ_MFMA_CACHE:
+            return _CSA_DQ_MFMA_CACHE[key]
+        launch = build_csa_pool_bwd_dq_mfma_module(
+            num_heads=num_heads, head_dim=head_dim, dtype_str=dtype_str,
+        )
+        _CSA_DQ_MFMA_CACHE[key] = launch
+        return launch
+
+
+def _get_csa_dpool(num_heads, head_dim, dtype_str, mqa_kv, k_block, use_mfma=False):
+    key = (num_heads, head_dim, dtype_str, mqa_kv, k_block, use_mfma)
     with _CSA_DPOOL_LOCK:
         if key in _CSA_DPOOL_CACHE:
             return _CSA_DPOOL_CACHE[key]
-        launch = build_csa_pool_bwd_dpool_module(
-            num_heads=num_heads, head_dim=head_dim, dtype_str=dtype_str,
-            mqa_kv=mqa_kv, k_block=k_block,
-        )
+        if use_mfma:
+            # All-MFMA dpool (head-as-contraction). Same partial-buffer contract
+            # as the scalar kernel; ~56x faster on the V4-Flash width.
+            launch = build_csa_pool_bwd_dpool_mfma_module(
+                num_heads=num_heads, head_dim=head_dim, dtype_str=dtype_str,
+                mqa_kv=mqa_kv, k_block=k_block,
+            )
+        else:
+            launch = build_csa_pool_bwd_dpool_module(
+                num_heads=num_heads, head_dim=head_dim, dtype_str=dtype_str,
+                mqa_kv=mqa_kv, k_block=k_block,
+            )
         _CSA_DPOOL_CACHE[key] = launch
         return launch
 
@@ -546,20 +572,30 @@ def csa_pool_attention_bwd_flydsl_kernel(
             dk_fp32, dv_fp32,
             int(B), int(Sq), int(Sq),
         )
-        # Sparse dq: dq-only per-row kernel (store_dpool=False -> no atomics).
+        # Sparse dq: MFMA head-block kernel (dq[h,d]=scale*sum_k ds[h,k]*gathered[k,d])
+        # when HQ % 16 == 0; else the per-row scalar kernel (store_dpool=False).
         dq_sparse_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
-        sparse_launch = _get_csa_bwd(
-            HQ, D, int(swa_window), dtype_str, mqa, False,
-            has_local=False, has_sparse=True, store_dpool=False,
-        )
-        sparse_launch(
-            q_c.view(-1), kl_c.view(-1), vl_c.view(-1), pool_c.view(-1),
-            topk_i32.view(-1), dout_c.view(-1), lse_c.view(-1), d_buf.view(-1),
-            sink_arg.view(-1),
-            dq_sparse_fp32.view(-1), dk_fp32.view(-1), dv_fp32.view(-1),
-            dpool_fp32.view(-1), dsink_fp32.view(-1),
-            int(B), int(Sq), int(K_topk), int(P),
-        )
+        _dq_mfma = (HQ % 16 == 0) and os.environ.get("PRIMUS_V4_CSA_BWD_DQ_MFMA", "1") == "1"
+        if _dq_mfma:
+            dq_sparse_launch = _get_csa_dq_mfma(HQ, D, dtype_str)
+            dq_sparse_launch(
+                q_c.view(-1), pool_c.view(-1), topk_i32.view(-1), dout_c.view(-1),
+                lse_c.view(-1), d_buf.view(-1), dq_sparse_fp32.view(-1),
+                int(B), int(Sq), int(K_topk), int(P),
+            )
+        else:
+            sparse_launch = _get_csa_bwd(
+                HQ, D, int(swa_window), dtype_str, mqa, False,
+                has_local=False, has_sparse=True, store_dpool=False,
+            )
+            sparse_launch(
+                q_c.view(-1), kl_c.view(-1), vl_c.view(-1), pool_c.view(-1),
+                topk_i32.view(-1), dout_c.view(-1), lse_c.view(-1), d_buf.view(-1),
+                sink_arg.view(-1),
+                dq_sparse_fp32.view(-1), dk_fp32.view(-1), dv_fp32.view(-1),
+                dpool_fp32.view(-1), dsink_fp32.view(-1),
+                int(B), int(Sq), int(K_topk), int(P),
+            )
         dq_fp32.add_(dq_sparse_fp32)
     else:
         # MHA: monolithic per-row kernel for dq/dk/dv/dsink (no dpool here).
@@ -577,9 +613,12 @@ def csa_pool_attention_bwd_flydsl_kernel(
         )
 
     # dpool: dedicated head-summed atomic-free partial kernel + index_add reduce.
+    # The all-MFMA variant (head-as-contraction) needs HQ % 16 == 0; otherwise
+    # fall back to the scalar per-head kernel. Env can force the scalar path.
     k_block = int(os.environ.get("PRIMUS_V4_CSA_BWD_DPOOL_KBLOCK", "1"))
+    _dpool_mfma = (HQ % 16 == 0) and os.environ.get("PRIMUS_V4_CSA_BWD_DPOOL_MFMA", "1") == "1"
     dpool_part = torch.zeros((B, Sq, K_topk, D), device=q.device, dtype=torch.float32)
-    dpool_launch = _get_csa_dpool(HQ, D, dtype_str, mqa, k_block)
+    dpool_launch = _get_csa_dpool(HQ, D, dtype_str, mqa, k_block, use_mfma=_dpool_mfma)
     dpool_launch(
         q_c.view(-1), pool_c.view(-1), topk_i32.view(-1), dout_c.view(-1),
         lse_c.view(-1), d_buf.view(-1), dpool_part.view(-1),
