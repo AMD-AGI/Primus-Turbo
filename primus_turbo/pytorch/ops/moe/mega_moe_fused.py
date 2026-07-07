@@ -12,10 +12,7 @@ import torch
 from torch.distributed import ProcessGroup
 
 from primus_turbo.flydsl.mega.swiglu_kernel import swiglu, swiglu_backward
-from primus_turbo.flydsl.mega.symm_buffer import (
-    SymmBuffer,
-    get_symm_buffer_size_for_mega_moe,
-)
+from primus_turbo.flydsl.mega.symm_buffer import SymmBuffer
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_variable_k_impl,
@@ -29,7 +26,6 @@ from primus_turbo.pytorch.kernels.mega_moe.grouped_gemm_combine_impl import (
 
 __all__ = [
     "SymmBuffer",
-    "get_symm_buffer_size_for_mega_moe",
     "MegaMoEFusedFunction",
     "mega_moe_fused",
 ]
@@ -78,6 +74,8 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 BackendType.FLYDSL.value,
                 topk_indices=topk_idx.contiguous().view(-1),
                 topk_weights=topk_weights.to(torch.float32).contiguous().view(-1),
+                # fwd(nt): combine is GEMM-hidden -> MORE cu hides the drain tail. Stable-box
+                # sweep: 64=2.811ms best (16=3.32, 32=2.85, 96=2.85). Multiple of 8 (XCD count).
                 num_combine_cu=64,
                 num_reduce_cu=0,
                 layout="nt",
@@ -126,12 +124,15 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 topk_idx,
             ) = saved[ctx.handle_len :]
 
+            # handle contract (dispatch_prologue return order):
+            # [7]=num_tokens_per_expert (group_lens), [8]=prefix-sum (group_offs)
             group_lens, group_offs = handle[7], handle[8]
             num_tokens, num_topk = ctx.num_tokens, ctx.num_topk
             dy = grad_y.contiguous().to(torch.bfloat16)
-            triton_be = BackendType.TRITON.value
 
             # STEP 1: dispatch dy + L2 dgrad (grad_swiglu = dispatch_l2_grad @ w2, NN)
+            # dispatch_l2_grad aliases the symm token pool: must be consumed by
+            # dW2 below BEFORE STEP 3 / dW1 re-dispatch overwrite the pool.
             grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_impl(
                 dy,
                 w2,
@@ -139,7 +140,6 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 BackendType.FLYDSL.value,
                 handle=handle,
                 layout="nn",
-                num_dispatch_cu=16,
             )
 
             # STEP 2: SwiGLU^T (re-inject routing weight) + gate grad
@@ -161,7 +161,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 trans_b=False,
                 trans_c=False,
                 num_cu=None,
-                default_backend=triton_be,
+                default_backend=BackendType.TRITON.value,
             )
 
             # STEP 3: L1 dgrad (grad_l1 @ w1, NN) + combine PUSH + dx reduce + grad_gate scatter
@@ -173,6 +173,8 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 topk_indices=topk_idx.contiguous().view(-1),
                 topk_weights=None,
                 grad_gate=grad_gate,
+                # bwd(nn): GEMM-bound -> FEWER combine cu frees GEMM. Stable-box sweep:
+                # 16=4.122ms best (8=5.55, 24=4.14, 32=4.13, 48=4.33, 64=4.36). Mult of 8.
                 num_combine_cu=16,
                 num_reduce_cu=0,
                 layout="nn",

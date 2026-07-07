@@ -28,6 +28,9 @@ class _suppress_stdout_stderr:
     """Redirect stdout/stderr to /dev/null (silences flydsl JIT prints)."""
 
     def __enter__(self):
+        # Flush pending Python-buffered output before swapping the fd.
+        sys.stdout.flush()
+        sys.stderr.flush()
         self._outnull = open(os.devnull, "w")
         self._errnull = open(os.devnull, "w")
         self._out_fd = os.dup(sys.stdout.fileno())
@@ -37,6 +40,10 @@ class _suppress_stdout_stderr:
         return self
 
     def __exit__(self, *_):
+        # Flush buffered prints into /dev/null BEFORE restoring the real fd,
+        # else block-buffered output (stdout piped) leaks after restore.
+        sys.stdout.flush()
+        sys.stderr.flush()
         os.dup2(self._out_fd, sys.stdout.fileno())
         os.dup2(self._err_fd, sys.stderr.fileno())
         os.close(self._out_fd)

@@ -28,8 +28,12 @@ echo "[run_dispatch_combine_grouped_gemm] test=$TEST args=$*"
 
 docker exec -e PYTHONUNBUFFERED=1 -e PYTORCH_ROCM_ARCH=gfx950 -e REPO="$REPO" -e TEST="$TEST" \
   -e MASTER_PORT="$PORT" -e NP="$NP" \
+  -e MEGA_COMB_WRITE_CACHE="${MEGA_COMB_WRITE_CACHE:-}" -e MEGA_COMB_READ_CACHE="${MEGA_COMB_READ_CACHE:-}" \
+  -e MEGA_GEMM_LEGACY_VIEW="${MEGA_GEMM_LEGACY_VIEW:-}" -e MEGA_CLEAR_CACHE="${MEGA_CLEAR_CACHE:-}" \
+  -e MEGA_POOL_HEAD="${MEGA_POOL_HEAD:-}" \
   "$CONTAINER" bash -lc '
 set -e
+[ -n "${MEGA_CLEAR_CACHE:-}" ] && rm -rf /root/.flydsl /tmp/flydsl_autotune
 ulimit -l unlimited 2>/dev/null || true
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export ROCSHMEM_HEAP_SIZE=8GB

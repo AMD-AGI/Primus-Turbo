@@ -98,14 +98,6 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
     BM = 256
     BN = 256
 
-    def _set_shape(self, hidden, inter, num_experts, num_topk, num_tokens):
-        # Per-subtest shape (set from @parametrize params before spawning kernels).
-        self.HIDDEN = hidden
-        self.INTER = inter
-        self.NUM_EXPERTS = num_experts
-        self.NUM_TOPK = num_topk
-        self.NUM_TOKENS = num_tokens
-
     def setUp(self) -> None:
         super().setUp()
         self._spawn_processes()
@@ -170,7 +162,6 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
         ],
     )
     def test_forward(self, hidden, inter, num_experts, num_topk, num_tokens):
-        self._set_shape(hidden, inter, num_experts, num_topk, num_tokens)
         self._init_process()
         group = dist.group.WORLD
         x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
@@ -189,8 +180,8 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
                 topk_weight,
                 l1_weight,
                 l2_weight,
-                num_experts=self.NUM_EXPERTS,
-                num_topk=self.NUM_TOPK,
+                num_experts=num_experts,
+                num_topk=num_topk,
             )
         torch.cuda.synchronize()
         group.barrier()
@@ -209,14 +200,13 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
         ],
     )
     def test_backward(self, hidden, inter, num_experts, num_topk, num_tokens):
-        self._set_shape(hidden, inter, num_experts, num_topk, num_tokens)
         self._init_process()
         group = dist.group.WORLD
         x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
             num_tokens, hidden, inter, num_experts, num_topk
         )
         symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
-        grad_y = torch.randn((self.NUM_TOKENS, self.HIDDEN), device=self.device, dtype=torch.bfloat16)
+        grad_y = torch.randn((num_tokens, hidden), device=self.device, dtype=torch.bfloat16)
 
         # fused op grads
         x_m = x.detach().requires_grad_(True)
@@ -238,8 +228,8 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
             tw_t,
             l1_t,
             l2_t,
-            num_experts=self.NUM_EXPERTS,
-            num_topk=self.NUM_TOPK,
+            num_experts=num_experts,
+            num_topk=num_topk,
         )
         dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
 

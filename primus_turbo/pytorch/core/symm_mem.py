@@ -112,8 +112,8 @@ class SymmetricMemory:
     ):
         if alloc_size <= 0:
             raise ValueError(f"requested alloc size must be greater than 0, got {alloc_size}")
-        if signal_pad_size <= 0:
-            raise ValueError(f"requested signal_pad_size must be greater than 0, got {signal_pad_size}")
+        if signal_pad_size < 0:
+            raise ValueError(f"requested signal_pad_size must be non-negative, got {signal_pad_size}")
         if not torch.cuda.is_available():
             raise RuntimeError("SymmetricMemory requires CUDA/HIP device support.")
 
@@ -135,15 +135,16 @@ class SymmetricMemory:
         signal_pad_ptr = None
         try:
             buffer_ptr = self.lib.hipMalloc(alloc_size)
+            self.lib.hipMemset(buffer_ptr, 0, alloc_size)
+            self.buffer_ptrs = self._rendezvous(buffer_ptr)
             # signal_pad holds cross-rank flags/scoreboards: allocate UNCACHED so every
             # atomic load/store/add bypasses L1/L2 and is always fresh -> the spin-wait
             # scoreboard handshake can't read a stale cached value and deadlock.
-            signal_pad_ptr = self.lib.hipMallocUncached(self.signal_pad_size)
-            self.lib.hipMemset(buffer_ptr, 0, alloc_size)
-            self.lib.hipMemset(signal_pad_ptr, 0, self.signal_pad_size)
-
-            self.buffer_ptrs = self._rendezvous(buffer_ptr)
-            self.signal_pad_ptrs = self._rendezvous(signal_pad_ptr)
+            # size 0 skips it entirely (caller keeps all flags in the cached buffer).
+            if self.signal_pad_size > 0:
+                signal_pad_ptr = self.lib.hipMallocUncached(self.signal_pad_size)
+                self.lib.hipMemset(signal_pad_ptr, 0, self.signal_pad_size)
+                self.signal_pad_ptrs = self._rendezvous(signal_pad_ptr)
         except Exception:
             if not self.buffer_ptrs and buffer_ptr is not None:
                 self._try_free(buffer_ptr)

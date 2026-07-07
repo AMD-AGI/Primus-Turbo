@@ -53,6 +53,13 @@ WGRAD_BLOCK = WGRAD_WAVES * 64
 WGRAD_AGPR = 0
 
 
+def _i64(v):
+    # widen an i32 runtime value to i64 (avoids overflow in worst-case base offsets)
+    from flydsl.expr.buffer_ops import _unwrap_value
+
+    return ArithValue(arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
+
+
 def _gemm_geom(K, BLOCK_M, BLOCK_N):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
@@ -1021,12 +1028,12 @@ def gemm_bf16_tn_variable_k_tile(
 
     group_tokens = m_end - m_start
     bf16_ir = fx.BFloat16.ir_type
-    gA = make_bf16_buffer_tensor_rebased(
-        A, bf16_ir, m_start * out_m_rt * fx.Int32(2), group_tokens * out_m_rt * fx.Int32(2)
-    )
-    gB = make_bf16_buffer_tensor_rebased(
-        B, bf16_ir, m_start * out_n_rt * fx.Int32(2), group_tokens * out_n_rt * fx.Int32(2)
-    )
+    # base offset (m_start * OUT * 2 bytes) can exceed int32 for a worst-case pool;
+    # compute it in int64. num_records (per-group span) stays int32-small.
+    a_base_off = _i64(m_start) * fx.Int64(OUT_M * 2)
+    b_base_off = _i64(m_start) * fx.Int64(OUT_N * 2)
+    gA = make_bf16_buffer_tensor_rebased(A, bf16_ir, a_base_off, group_tokens * out_m_rt * fx.Int32(2))
+    gB = make_bf16_buffer_tensor_rebased(B, bf16_ir, b_base_off, group_tokens * out_n_rt * fx.Int32(2))
     a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
     b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 

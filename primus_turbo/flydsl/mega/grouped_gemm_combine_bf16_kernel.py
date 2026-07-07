@@ -7,11 +7,13 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl import Config, autotune
 from flydsl.expr.buffer_ops import (
     _unwrap_value,
     buffer_load,
     create_buffer_resource,
     create_buffer_resource_from_addr,
+    extract_base_index,
 )
 from flydsl.expr.typing import AddressSpace, PointerType
 
@@ -53,7 +55,8 @@ def _make_grouped_gemm_combine(
     BLOCK_M,
     BLOCK_N,
     num_combine_cu,
-    combine_slots,
+    num_reduce_cu,
+    num_combine_slots,
     topk,
     num_experts,
     rank,
@@ -72,10 +75,10 @@ def _make_grouped_gemm_combine(
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
-    gemm_grid_blocks = worst_case_tiles * n_blocks
-    comb_records = combine_slots * out_features * 2
-    gate_records = combine_slots * 4
+    comb_records = num_combine_slots * out_features * 2
+    gate_records = num_combine_slots * 4
     gemm_base = num_combine_cu
+    total_reduce_warps = num_reduce_cu * _NUM_WARPS
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -100,21 +103,32 @@ def _make_grouped_gemm_combine(
         combine_cu = fx.Int32(num_combine_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         combine_bank = combine_parity * fx.Int32(worst_case_tiles)
-        reduce_bank = combine_parity * fx.Int32(combine_slots)
+        reduce_bank = combine_parity * fx.Int32(num_combine_slots)
         expected_combine_i64 = _i64(expected_combine)
         expected_reduce_i64 = _i64(expected_reduce)
 
         combine_flag_base = sym_layout.combine_flag_ptr
-        comb_base = sym_layout.comb_ptr
+        comb_base = sym_layout.combine_token_buffer_ptr
         reduce_flag_base = sym_layout.reduce_flag_ptr
-        l2_token_buffer_ptr_ty = PointerType.get(
+        # bf16 pointer type for per-tile int64 base advance (see else branch)
+        tile_ptr_ty = PointerType.get(
             elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
         )
-        l2_token_buffer_tensor = fx.make_view(
-            fx.inttoptr(l2_token_buffer_ptr_ty, sym_layout.l2_token_buffer_ptr),
-            fx.make_layout(num_max_pool_tokens * out_features, 1),
-        )
         comb_local_res = create_buffer_resource_from_addr(comb_base, num_records_bytes=comb_records)
+        # recv-segment table for task-based (sustained-peer) combine push
+        seg_bytes = num_experts * 4
+        recv_dst_rank_res = create_buffer_resource_from_addr(
+            sym_layout.combine_recv_dst_rank_ptr, num_records_bytes=seg_bytes
+        )
+        recv_start_row_res = create_buffer_resource_from_addr(
+            sym_layout.combine_recv_start_row_ptr, num_records_bytes=seg_bytes
+        )
+        recv_count_res = create_buffer_resource_from_addr(
+            sym_layout.combine_recv_count_ptr, num_records_bytes=seg_bytes
+        )
+        origin_slot_res = create_buffer_resource_from_addr(
+            sym_layout.pool_src_slot_ptr, num_records_bytes=num_max_pool_tokens * 4
+        )
 
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         num_tile_blocks_res = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
@@ -131,57 +145,90 @@ def _make_grouped_gemm_combine(
         d_topk_w_res = create_buffer_resource(D_TOPK_W, max_size=True) if with_gate else None
 
         if block_index < combine_cu:
-            local_count = (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
-            for tile_iter in range(local_count):
-                block_m = block_index + tile_iter * combine_cu
-                if thread_index == fx.Int32(0):
-                    spin_start = read_clock()
-                    signal_count = ld(
-                        combine_flag_base, combine_bank + block_m, scope="agent", dtype=fx.T.i64()
-                    )
-                    while signal_count != expected_combine_i64:
-                        fx.rocdl.s_sleep(fx.Int32(2))
-                        if spin_timed_out(spin_start):
-                            fx.printf(
-                                "MEGA combine L2 gate timeout: block={} signal={} thr={}\n",
-                                block_m,
-                                signal_count,
-                                expected_combine_i64,
-                            )
+            # Task-based combine: stride over num_experts recv-segments; each warp
+            # sustains ONE peer per segment. Gate a segment on all GEMM tiles its
+            # rows [start_row, start_row+count) span before pushing.
+            seg_local = (fx.Int32(num_experts) - block_index + combine_cu - fx.Int32(1)) // combine_cu
+            for seg_iter in range(seg_local):
+                task_index = block_index + seg_iter * combine_cu
+                seg_start = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
+                seg_count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+                if seg_count > fx.Int32(0):
+                    t0 = seg_start // fx.Int32(BLOCK_M)
+                    t1 = (seg_start + seg_count - fx.Int32(1)) // fx.Int32(BLOCK_M)
+                    if thread_index == fx.Int32(0):
+                        tile_cursor = t0
+                        while tile_cursor <= t1:
                             spin_start = read_clock()
-                        signal_count = ld(
-                            combine_flag_base, combine_bank + block_m, scope="agent", dtype=fx.T.i64()
-                        )
-                fx.gpu.barrier()
-                l2_invalidate()
-                combine_bf16_tile(
-                    sym_layout,
-                    thread_index=thread_index,
-                    block_m=block_m,
-                    block_m_size=BLOCK_M,
-                    grad_gate_res=grad_gate_res,
-                    signal=True,
-                    epoch=expected_reduce_i64,
-                    bank_offset=reduce_bank,
-                    with_gate=with_gate,
-                )
+                            signal_count = ld(
+                                combine_flag_base, combine_bank + tile_cursor, scope="agent", dtype=fx.T.i64()
+                            )
+                            while signal_count != expected_combine_i64:
+                                fx.rocdl.s_sleep(fx.Int32(2))
+                                if spin_timed_out(spin_start):
+                                    fx.printf(
+                                        "MEGA combine(task) gate timeout: tile={} signal={} thr={}\n",
+                                        tile_cursor,
+                                        signal_count,
+                                        expected_combine_i64,
+                                    )
+                                    spin_start = read_clock()
+                                signal_count = ld(
+                                    combine_flag_base,
+                                    combine_bank + tile_cursor,
+                                    scope="agent",
+                                    dtype=fx.T.i64(),
+                                )
+                            tile_cursor = tile_cursor + fx.Int32(1)
+                    fx.gpu.barrier()
+                    l2_invalidate()
+                    combine_bf16_tile(
+                        sym_layout,
+                        thread_index=thread_index,
+                        task_index=task_index,
+                        recv_dst_rank_res=recv_dst_rank_res,
+                        recv_start_row_res=recv_start_row_res,
+                        recv_count_res=recv_count_res,
+                        origin_slot_res=origin_slot_res,
+                        grad_gate_res=grad_gate_res,
+                        signal=True,
+                        epoch=expected_reduce_i64,
+                        bank_offset=reduce_bank,
+                        with_gate=with_gate,
+                    )
             fx.rocdl.s_waitcnt(0)
         else:
             gemm_tile_index = block_index - fx.Int32(gemm_base)
             block_m = gemm_tile_index // fx.Int32(n_blocks)
             block_n = gemm_tile_index % fx.Int32(n_blocks)
             if block_m < real_tiles:
-                c_m_const = fx.Int32(num_max_pool_tokens)
+                # GEMM role: one real tile (block_m, block_n) per block (unchanged).
                 group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 group_base = group_index * fx.Int32(K) * c_n
+                # Worst-case l2 buffer (>4GB) can't be one buffer resource. Advance
+                # the ACT/l2 base to this row-block in int64 and run block_m-relative
+                # (block_m=0), keeping in-resource offsets and make_layout int32-small.
+                a_byte_off = _i64(block_m) * fx.Int64(BLOCK_M * K * 2)
+                c_byte_off = _i64(block_m) * fx.Int64(BLOCK_M * out_features * 2)
+                act_base = fx.arith.ArithValue(
+                    fx.arith.index_cast(fx.T.i64(), extract_base_index(ACT)), signed=True
+                )
+                act_tile = fx.make_view(
+                    fx.inttoptr(tile_ptr_ty, act_base + a_byte_off),
+                    fx.make_layout(BLOCK_M * K, 1),
+                )
+                l2_tile = fx.make_view(
+                    fx.inttoptr(tile_ptr_ty, sym_layout.l2_token_buffer_ptr + c_byte_off),
+                    fx.make_layout(BLOCK_M * out_features, 1),
+                )
                 gemm_tile(
-                    ACT,
+                    act_tile,
                     WEIGHTS,
-                    l2_token_buffer_tensor,
-                    c_m_const,
+                    l2_tile,
+                    fx.Int32(BLOCK_M),
                     c_n,
                     lds,
-                    block_m,
+                    fx.Int32(0),
                     block_n,
                     K=K,
                     BLOCK_M=BLOCK_M,
@@ -198,40 +245,92 @@ def _make_grouped_gemm_combine(
                     lambda: atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1), scope="agent"),
                 )
             else:
+                # Empty region: carve the first num_reduce_cu blocks for the topk
+                # reduce; the rest early-exit (no per-empty-block atomic_add).
                 empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
-                total_empty_warps = (fx.Int32(gemm_grid_blocks) - real_tiles * fx.Int32(n_blocks)) * fx.Int32(
-                    _NUM_WARPS
-                )
-                _emit_if_then(
-                    thread_index == fx.Int32(0),
-                    lambda: atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1), scope="agent"),
-                )
-                topk_reduce_bf16_tile(
-                    True,
-                    apply_weights,
-                    with_gate,
-                    thread_index,
-                    empty_ordinal,
-                    total_empty_warps,
-                    topk,
-                    out_features,
-                    num_experts,
-                    rank,
-                    comb_local_res,
-                    output_res,
-                    topk_indices_res,
-                    num_tokens_res,
-                    reduce_flag_base,
-                    reduce_bank,
-                    topk_weights_res,
-                    gate_local_res,
-                    d_topk_w_res,
-                    expected_reduce_i64,
-                )
+                if empty_ordinal < fx.Int32(num_reduce_cu):
+                    # never-reset alignment: the reduce blocks bump combine_flag for
+                    # the empty block_m (block_m in [real_tiles, worst_case_tiles))
+                    # to the cumulative expected, strided across the reduce blocks, so
+                    # a future launch where such a block_m becomes real still gates
+                    # right. Off the combine critical path; only num_reduce_cu writers.
+                    n_empty = fx.Int32(worst_case_tiles) - real_tiles
+                    reduce_stride = fx.Int32(num_reduce_cu)
+                    align_count = (n_empty - empty_ordinal + reduce_stride - fx.Int32(1)) // reduce_stride
+                    for align_iter in range(align_count):
+                        empty_block_m = real_tiles + empty_ordinal + align_iter * reduce_stride
+                        if thread_index == fx.Int32(0):
+                            atomic_add(
+                                combine_flag_base,
+                                combine_bank + empty_block_m,
+                                fx.Int64(n_blocks),
+                                scope="agent",
+                            )
+                    topk_reduce_bf16_tile(
+                        True,
+                        apply_weights,
+                        with_gate,
+                        thread_index,
+                        empty_ordinal,
+                        fx.Int32(total_reduce_warps),
+                        topk,
+                        out_features,
+                        num_experts,
+                        rank,
+                        comb_local_res,
+                        output_res,
+                        topk_indices_res,
+                        num_tokens_res,
+                        reduce_flag_base,
+                        reduce_bank,
+                        topk_weights_res,
+                        gate_local_res,
+                        d_topk_w_res,
+                        expected_reduce_i64,
+                    )
 
     return grouped_gemm_combine_kernel
 
 
+def _rewind_combine_flags(kwargs):
+    # tuning-only: rewind the two never-reset flags so each rerun matches the
+    # baked expected. combine_flag is local (GEMM writes, combine reads); reduce_flag
+    # is cross-rank (combine pushes to peers). fill -> sync -> barrier so no next-rep
+    # write lands before every rank has rewound (else counts get zeroed).
+    symm = get_symm_buffer_for_mega_moe()
+    p = int(kwargs["combine_parity"])
+    n_blocks = int(kwargs["out_features"]) // int(kwargs["BLOCK_N"])
+    wct = int(symm.num_max_pool_tokens) // int(kwargs["BLOCK_M"])
+    ncs = int(kwargs["num_combine_slots"])
+    comb_base = int(kwargs["expected_combine"]) - n_blocks
+    red_base = int(kwargs["expected_reduce"]) - 1
+    symm.combine_flag[p * wct : (p + 1) * wct].fill_(comb_base)
+    symm.reduce_flag[p * ncs : (p + 1) * ncs].fill_(red_base)
+    torch.cuda.synchronize()
+    torch.distributed.barrier(symm.group)
+
+
+@autotune(
+    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64) for rc in (128, 256, 512)],
+    # layout_code MUST be a key: nt/nn have OPPOSITE combine_cu optima (see wrapper note).
+    key=[
+        "out_features",
+        "hidden_size",
+        "num_max_pool_tokens",
+        "BLOCK_M",
+        "BLOCK_N",
+        "num_combine_slots",
+        "topk",
+        "num_experts",
+        "rank",
+        "layout_code",
+        "apply_weights",
+        "with_gate",
+        "out_fp16",
+    ],
+    warmup=0,
+    post_hook=_rewind_combine_flags,
+)
 @flyc.jit
 def _compiled_grouped_gemm_combine(
     ACT,
@@ -254,7 +353,7 @@ def _compiled_grouped_gemm_combine(
     num_max_pool_tokens: fx.Constexpr[int],
     BLOCK_M: fx.Constexpr[int],
     BLOCK_N: fx.Constexpr[int],
-    combine_slots: fx.Constexpr[int],
+    num_combine_slots: fx.Constexpr[int],
     topk: fx.Constexpr[int],
     num_experts: fx.Constexpr[int],
     rank: fx.Constexpr[int],
@@ -263,6 +362,7 @@ def _compiled_grouped_gemm_combine(
     with_gate: fx.Constexpr[bool],
     out_fp16: fx.Constexpr[bool],
     num_combine_cu: fx.Constexpr[int] = 64,
+    num_reduce_cu: fx.Constexpr[int] = 256,
     nt_vmcnt: fx.Constexpr[int] = 3,
     agpr_alloc: fx.Constexpr[int] = 0,
     waves: fx.Constexpr[int] = 2,
@@ -275,7 +375,8 @@ def _compiled_grouped_gemm_combine(
         BLOCK_M,
         BLOCK_N,
         num_combine_cu,
-        combine_slots,
+        num_reduce_cu,
+        num_combine_slots,
         topk,
         num_experts,
         rank,
@@ -345,7 +446,7 @@ def grouped_gemm_combine_bf16(
     ), "x rows must match SymLayout pool capacity"
 
     device = x.device
-    combine_slots = int(sym_layout.combine_slots)
+    num_combine_slots = int(sym_layout.num_combine_slots)
     rank = int(sym_layout.rank_idx)
     topk = int(sym_layout.num_topk)
     num_experts = int(sym_layout.num_experts)
@@ -356,7 +457,9 @@ def grouped_gemm_combine_bf16(
     apply_weights = topk_weights is not None
     with_gate = grad_gate is not None
 
-    act_flat = x.contiguous().view(-1)
+    # Pass 2D: flattening M x K overflows int32 shape ABI for worst-case pool.
+    # The kernel takes ACT's base pointer and advances it per-tile in int64.
+    act_2d = x.contiguous()
     if layout == "nt":
         weight_flat = l2_weights.reshape(G * N, K).contiguous().view(-1)
     else:
@@ -368,14 +471,17 @@ def grouped_gemm_combine_bf16(
     num_tokens_d = symm.num_tokens_per_rank
     topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else dummy
     grad_gate_d = grad_gate.contiguous().view(-1) if with_gate else dummy
-    d_topk_w = torch.empty(combine_slots, dtype=torch.float32, device=device) if with_gate else None
+    d_topk_w = torch.empty(num_combine_slots, dtype=torch.float32, device=device) if with_gate else None
     d_topk_w_d = d_topk_w if with_gate else dummy
 
     n_blocks = out_features // BN
     combine_parity, expected_combine, expected_reduce = symm.next_combine(n_blocks)
 
+    # num_combine_cu / num_reduce_cu are @autotune-swept per shape+layout (nt/nn have
+    # OPPOSITE combine_cu optima -> layout_code is in the autotune key). host next_combine
+    # above stays here; the tuning post_hook only rewinds the never-reset flags.
     _compiled_grouped_gemm_combine(
-        act_flat,
+        act_2d,
         weight_flat,
         tile_to_expert,
         num_tile_blocks,
@@ -387,15 +493,15 @@ def grouped_gemm_combine_bf16(
         d_topk_w_d,
         sym_layout,
         c_n,
-        combine_parity,
-        expected_combine,
-        expected_reduce,
+        combine_parity=combine_parity,
+        expected_combine=expected_combine,
+        expected_reduce=expected_reduce,
         out_features=out_features,
         hidden_size=hidden_size,
         num_max_pool_tokens=num_max_pool_tokens,
         BLOCK_M=BM,
         BLOCK_N=BN,
-        combine_slots=int(combine_slots),
+        num_combine_slots=int(num_combine_slots),
         topk=int(topk),
         num_experts=int(num_experts),
         rank=int(rank),

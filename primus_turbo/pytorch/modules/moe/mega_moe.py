@@ -6,6 +6,7 @@
 
 """``MegaMoE``: nn.Module wrapper over the fully fused mega MoE op."""
 
+import contextlib
 import math
 from typing import Callable, Optional, Tuple
 
@@ -38,6 +39,7 @@ class MegaMoE(nn.Module):
         score_function: str = "sigmoid",
         routed_scaling_factor: float = 1.0,
         force_load_balancing: bool = False,
+        aux_loss_fn: Optional[Callable] = None,
         add_bias_linear: bool = False,
         enable_expert_bias: bool = False,
         shared_expert_intermediate_size: Optional[int] = None,
@@ -45,6 +47,8 @@ class MegaMoE(nn.Module):
         init_method: Optional[Callable[[torch.Tensor], None]] = None,
         output_layer_init_method: Optional[Callable[[torch.Tensor], None]] = None,
         router_dtype: torch.dtype = torch.float32,
+        get_rng_state_tracker: Optional[Callable] = None,
+        rng_tracker_name: Optional[str] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = torch.bfloat16,
     ) -> None:
@@ -78,7 +82,14 @@ class MegaMoE(nn.Module):
         self.score_function: str = score_function
         self.routed_scaling_factor: float = routed_scaling_factor
         self.force_load_balancing: bool = force_load_balancing
+        # optional framework hook: attach a load-balancing aux loss to the routing
+        # weights (grad flows back to the gate logits); signature
+        # (topk_weights, aux_scores [T,E], routing_map [T,E], valid_mask [T]|None) -> topk_weights
+        self.aux_loss_fn: Optional[Callable] = aux_loss_fn
         self.router_dtype: torch.dtype = router_dtype
+        # optional framework CUDA RNG tracker for seed-consistent weight init
+        self.get_rng_state_tracker: Optional[Callable] = get_rng_state_tracker
+        self.rng_tracker_name: Optional[str] = rng_tracker_name
         if self.has_router:
             assert top_k <= num_experts, "top_k cannot exceed num_experts"
             # group-limited routing needs power-of-2 groups
@@ -109,12 +120,10 @@ class MegaMoE(nn.Module):
                     "Set moe_router_enable_expert_bias=False or use the non-fused router."
                 )
             self.expert_bias = None
-            self.local_tokens_per_expert = None
         else:
             self.gate_weight = None
             self.gate_bias = None
             self.expert_bias = None
-            self.local_tokens_per_expert = None
 
         # per-rank expert shard: w1 [g, 2I, H] (gate+up), w2 [g, H, I]
         self.w1 = nn.Parameter(
@@ -147,36 +156,46 @@ class MegaMoE(nn.Module):
 
     def reset_parameters(self) -> None:
         """Init gate + expert weights via init_method, else fan_in normal."""
+        tracker = self.get_rng_state_tracker() if self.get_rng_state_tracker is not None else None
+
+        def rng_fork(name):
+            # fork tracker region (name=None -> tracker default); no-op without a tracker
+            if tracker is None:
+                return contextlib.nullcontext()
+            return tracker.fork() if name is None else tracker.fork(name)
+
         init1 = self.init_method
         init2 = self.output_layer_init_method or self.init_method
         with torch.no_grad():
-            if self.gate_weight is not None:
-                (init1 or (lambda w: nn.init.kaiming_uniform_(w, a=math.sqrt(5))))(self.gate_weight)
-            # init w1/w2 independently so output_layer_init_method is honored
-            # even when init_method is None
-            if init1 is not None:
-                init1(self.w1)
-            else:
-                self.w1.normal_(mean=0.0, std=2.0 / math.sqrt(self.hidden_size))
-            if init2 is not None:
-                init2(self.w2)
-            else:
-                self.w2.normal_(mean=0.0, std=2.0 / math.sqrt(self.intermediate_size))
-            if self.gate_bias is not None:
-                self.gate_bias.zero_()
-            if self.expert_bias is not None:
-                self.expert_bias.zero_()
-            if self.local_tokens_per_expert is not None:
-                self.local_tokens_per_expert.zero_()
-            if self.shared_w1 is not None:
-                (init1 or (lambda w: w.normal_(std=2.0 / math.sqrt(self.hidden_size))))(self.shared_w1)
-                (init2 or (lambda w: w.normal_(std=2.0 / math.sqrt(self.shared_expert_intermediate_size))))(
-                    self.shared_w2
-                )
-                if self.shared_gate_weight is not None:
-                    (init1 or (lambda w: nn.init.kaiming_uniform_(w, a=math.sqrt(5))))(
-                        self.shared_gate_weight
-                    )
+            # replicated params: default region keeps them identical across EP ranks
+            with rng_fork(None):
+                if self.gate_weight is not None:
+                    (init1 or (lambda w: nn.init.kaiming_uniform_(w, a=math.sqrt(5))))(self.gate_weight)
+                if self.gate_bias is not None:
+                    self.gate_bias.zero_()
+                if self.expert_bias is not None:
+                    self.expert_bias.zero_()
+                if self.shared_w1 is not None:
+                    (init1 or (lambda w: w.normal_(std=2.0 / math.sqrt(self.hidden_size))))(self.shared_w1)
+                    (
+                        init2
+                        or (lambda w: w.normal_(std=2.0 / math.sqrt(self.shared_expert_intermediate_size)))
+                    )(self.shared_w2)
+                    if self.shared_gate_weight is not None:
+                        (init1 or (lambda w: nn.init.kaiming_uniform_(w, a=math.sqrt(5))))(
+                            self.shared_gate_weight
+                        )
+            # expert-sharded w1/w2: distinct region so each EP rank gets different experts.
+            # init independently so output_layer_init_method is honored when init_method is None
+            with rng_fork(self.rng_tracker_name):
+                if init1 is not None:
+                    init1(self.w1)
+                else:
+                    self.w1.normal_(mean=0.0, std=2.0 / math.sqrt(self.hidden_size))
+                if init2 is not None:
+                    init2(self.w2)
+                else:
+                    self.w2.normal_(mean=0.0, std=2.0 / math.sqrt(self.intermediate_size))
 
     def route(
         self,
@@ -193,8 +212,8 @@ class MegaMoE(nn.Module):
         if self.force_load_balancing:
             # benchmark: random logits via Megatron RandomSTE
             logits = apply_random_logits(logits)
-        # fused score fn + group-limited top-k; probs/routing_map dense [T,E]
-        _, probs, routing_map = fused_group_topk_routing_with_aux_score(
+        # fused score fn + group-limited top-k; aux_scores/probs/routing_map dense [T,E]
+        aux_scores, probs, routing_map = fused_group_topk_routing_with_aux_score(
             logits,
             self.top_k,
             self.num_groups or 1,
@@ -207,15 +226,15 @@ class MegaMoE(nn.Module):
         # zero out padded tokens so they contribute nothing through combine
         if valid_mask is not None:
             topk_weights = topk_weights * valid_mask.to(topk_weights.dtype).unsqueeze(-1)
-        # accumulate per-expert counts for aux-free balancing (skip random logits)
+        # load-balancing aux loss: framework hook attaches it to the weights so its
+        # grad flows back to the gate logits (skip for random-logits benchmarking)
         if (
-            self.local_tokens_per_expert is not None
+            self.aux_loss_fn is not None
+            and self.training
             and torch.is_grad_enabled()
             and not self.force_load_balancing
         ):
-            with torch.no_grad():
-                rmap = routing_map if valid_mask is None else routing_map & valid_mask.unsqueeze(-1)
-                self.local_tokens_per_expert += rmap.sum(dim=0).to(self.local_tokens_per_expert.dtype)
+            topk_weights = self.aux_loss_fn(topk_weights, aux_scores, routing_map, valid_mask)
         return topk_idx.to(torch.int32), topk_weights.to(torch.float32)
 
     def expert_compute(

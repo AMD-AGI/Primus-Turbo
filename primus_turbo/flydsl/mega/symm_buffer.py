@@ -1,28 +1,8 @@
 import torch
 
-from primus_turbo.flydsl.mega.sym_layout import BLOCK_M, build_sym_layout, region_bytes
-from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
+from primus_turbo.flydsl.mega.sym_layout import BLOCK_M, get_sym_layout
 
-__all__ = [
-    "SymmBuffer",
-    "get_symm_buffer_size_for_mega_moe",
-    "get_symm_buffer_for_mega_moe",
-]
-
-
-def get_symm_buffer_size_for_mega_moe(
-    world_size,
-    num_experts,
-    num_max_tokens_per_rank,
-    num_topk,
-    hidden,
-    intermediate_hidden,
-):
-    sl = build_sym_layout(
-        world_size, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
-    )
-    _, _, num_bytes, signal_bytes = region_bytes(sl)
-    return num_bytes, signal_bytes
+__all__ = ["SymmBuffer", "get_symm_buffer_for_mega_moe"]
 
 
 class SymmBuffer:
@@ -41,47 +21,53 @@ class SymmBuffer:
         self.rank = group.rank()
         self.world = group.size()
 
-        # remember the MoE shape so make_sym_layout can rebuild the device layout
-        self._shape = (
-            self.world,
-            num_experts,
-            num_max_tokens_per_rank,
-            num_topk,
-            hidden,
-            intermediate_hidden,
-        )
-        sl = build_sym_layout(*self._shape)
+        # lazy import to avoid a circular import at module load time
+        from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
-        # scalars other methods / views need (pool sizes read back from the layout)
+        meta = get_sym_layout(
+            self.world, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
+        )
+
+        # scalars other methods / views need (pool sizes read off the layout meta)
         self.block_m = BLOCK_M
         self.num_experts = num_experts
         self.num_tokens = num_max_tokens_per_rank
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
-        self.num_max_pool_tokens = int(sl.num_max_pool_tokens)
-        self.num_pool_blocks = int(sl.num_max_pool_blocks)
-        self.combine_slots = int(sl.combine_slots)
+        self.num_max_pool_tokens = meta.num_max_pool_tokens
+        self.num_pool_blocks = meta.num_max_pool_blocks
+        self.num_combine_slots = meta.num_combine_slots
 
-        main_spec, signal_spec, self.num_bytes, self.signal_bytes = region_bytes(sl)
+        self.num_bytes = meta.num_nbytes
 
-        # allocate the two IPC heaps and zero them once
-        self.sm = SymmetricMemory(group, alloc_size=self.num_bytes, signal_pad_size=self.signal_bytes)
-        self.sm.get_buffer(self.rank, (self.num_bytes,), torch.int8).zero_()
-        self.sm.get_signal_pad(self.rank, (self.signal_bytes,), torch.int8).zero_()
+        # allocate the single IPC heap and zero it once
+        self.symm_mem = SymmetricMemory(group, alloc_size=self.num_bytes, signal_pad_size=0)
+        heap = self.symm_mem.get_buffer(self.rank, (self.num_bytes,), torch.int8)
+        heap.zero_()
         self.group.barrier()
         torch.cuda.synchronize()
 
-        # expose each region as an attribute view into its heap
-        self._bind_views(main_spec, self.sm.get_buffer)
-        self._bind_views(signal_spec, self.sm.get_signal_pad)
-
-        # reshape the multi-dim regions to their logical shapes
-        self.pool = self.pool.view(self.num_max_pool_tokens, self.hidden)
-        self.act = self.act.view(self.num_max_pool_tokens, self.intermediate_hidden)
-        self.l2_token_buffer = self.l2_token_buffer.view(self.num_max_pool_tokens, self.hidden)
-        self.comb = self.comb.view(self.combine_slots, self.hidden)
-        self.combine_gate = self.combine_gate.view(self.num_tokens, self.num_topk)
+        # split the heap into named region views (declaration order == _MAIN)
+        (
+            self.dispatch_token_pool,
+            self.expert_count_buffer,
+            self.signal,
+            self.pool_src_rank,
+            self.pool_src_slot,
+            self.weight_recv_buf,
+            self.combine_gate,
+            self.meta_scalars,
+            self.grid_sync_count,
+            self.l2_token_buffer,
+            self.dispatch_flag,
+            self.combine_flag,
+            self.combine_token_buffer,
+            self.reduce_flag,
+            self.combine_recv_dst_rank,
+            self.combine_recv_start_row,
+            self.combine_recv_count,
+        ) = meta.split_buffer(heap)
 
         self.num_tokens_per_rank = torch.full(
             (self.world,), self.num_tokens, dtype=torch.int32, device="cuda"
@@ -94,13 +80,17 @@ class SymmBuffer:
         self._combine_expected = [0, 0]
         self._reduce_expected = [0, 0]
 
-        self._sym_layout = None
+        # MoE shape tuple build_sym_layout rebuilds the device handle from
+        self._shape = (
+            self.world,
+            self.num_experts,
+            self.num_tokens,
+            self.num_topk,
+            self.hidden,
+            self.intermediate_hidden,
+        )
 
-    def _bind_views(self, spec, get_heap):
-        # map each region name to a flat view sliced out of its heap
-        for name, (offset, dtype, numel) in spec.items():
-            view = get_heap(self.rank, (numel,), dtype, storage_offset=offset // dtype.itemsize)
-            setattr(self, name, view)
+        self._sym_layout = None
 
     def next_dispatch(self):
 
@@ -123,17 +113,12 @@ class SymmBuffer:
             return self._sym_layout
 
         # peer IPC deltas relative to this rank's own base pointer
-        main, signal = self.sm.buffer_ptrs, self.sm.signal_pad_ptrs
+        main = self.symm_mem.buffer_ptrs
         self._main_delta = torch.tensor([p - main[self.rank] for p in main], dtype=torch.int64, device="cuda")
-        self._signal_delta = torch.tensor(
-            [p - signal[self.rank] for p in signal], dtype=torch.int64, device="cuda"
-        )
-        self._sym_layout = build_sym_layout(
+        self._sym_layout = get_sym_layout(
             *self._shape,
             base=main[self.rank],
             offsets_ptr=self._main_delta.data_ptr(),
-            signal_base=signal[self.rank],
-            signal_offsets_ptr=self._signal_delta.data_ptr(),
             rank_idx=self.rank,
         )
         return self._sym_layout
@@ -151,7 +136,7 @@ class SymmBuffer:
         if _CURRENT_SYMM_BUFFER is self:
             _CURRENT_SYMM_BUFFER = None
         try:
-            self.sm.destroy()
+            self.symm_mem.destroy()
         except Exception:
             pass
 
@@ -180,22 +165,11 @@ def get_symm_buffer_for_mega_moe(
             )
         return _CURRENT_SYMM_BUFFER
 
-    need_bytes, need_signal_bytes = get_symm_buffer_size_for_mega_moe(
-        group.size(),
-        num_experts,
-        num_max_tokens_per_rank,
-        num_topk,
-        hidden,
-        intermediate_hidden,
-    )
-
+    need_bytes = get_sym_layout(
+        group.size(), num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
+    ).num_nbytes
     symm = _CURRENT_SYMM_BUFFER
-    if (
-        symm is None
-        or symm.group is not group
-        or symm.num_bytes < need_bytes
-        or symm.signal_bytes < need_signal_bytes
-    ):
+    if symm is None or symm.group is not group or symm.num_bytes < need_bytes:
         if symm is not None:
             symm.destroy()
         symm = SymmBuffer(

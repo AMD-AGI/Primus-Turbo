@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import flydsl.expr as fx
@@ -19,13 +20,19 @@ from primus_turbo.flydsl.mega.prims import (
     spin_timed_out,
     st,
 )
-from primus_turbo.flydsl.mega.sym_layout import SymLayout, map_signal, sym_map
+from primus_turbo.flydsl.mega.sym_layout import SymLayout, sym_map
 
 _WARP = 64
 _BLOCK_THREADS = 512
 _PVEC = 8
 _NUM_WARPS = _BLOCK_THREADS // _WARP
 _L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invalidate)
+_L1L2_BYPASS = 3  # glc|slc: skip L1+L2 -> uncached behavior for cross-rank combine buffer
+# combine push write / reduce read cache-modifier knobs (sweepable; default = uncached bypass)
+_COMB_WRITE_CACHE = int(os.environ.get("MEGA_COMB_WRITE_CACHE", str(_L1L2_BYPASS)))
+_COMB_READ_CACHE = int(os.environ.get("MEGA_COMB_READ_CACHE", str(_L1L2_BYPASS)))
+# DIAG ONLY (breaks correctness): dst_off=row (contiguous) instead of slot -> isolate remote-write scatter cost
+_COMB_CONTIG_DIAG = os.environ.get("MEGA_COMB_CONTIG_DIAG", "0") == "1"
 
 
 @ASTRewriter.transform
@@ -56,7 +63,7 @@ def dispatch_bf16_tile(
     dest_row_start = buffer_load(expert_send_dst_row_res, task_index, vec_width=1, dtype=fx.T.i32())
     source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
     token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32())
-    pool_address = sym_map(sym_layout, sym_layout.pool_ptr, dst_rank)
+    pool_address = sym_map(sym_layout, sym_layout.dispatch_token_pool_ptr, dst_rank)
 
     local_count = (token_count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
 
@@ -79,7 +86,7 @@ def dispatch_bf16_tile(
         fx.rocdl.s_waitcnt(0)
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):
-            dispatch_flag_address = map_signal(sym_layout, sym_layout.dispatch_flag_ptr, dst_rank)
+            dispatch_flag_address = sym_map(sym_layout, sym_layout.dispatch_flag_ptr, dst_rank)
             bank = (
                 fx.Int32(0)
                 if disp_parity is None
@@ -95,86 +102,76 @@ def dispatch_bf16_tile(
 def combine_bf16_tile(
     sym_layout: SymLayout,
     thread_index: fx.Int32,
-    block_m: fx.ArithValue,
-    block_m_size: int,
+    task_index: fx.ArithValue,
+    recv_dst_rank_res: fx.ArithValue,
+    recv_start_row_res: fx.ArithValue,
+    recv_count_res: fx.ArithValue,
+    origin_slot_res: fx.ArithValue,
     grad_gate_res: Optional[fx.ArithValue] = None,
     signal: bool = False,
     epoch: Optional[fx.Int64] = None,
     bank_offset: Optional[fx.Int32] = None,
     with_gate: bool = False,
 ):
+    # Task-based combine push: one recv-segment = contiguous same-origin rows ->
+    # a warp sustains ONE peer's XGMI link (mirror of dispatch_bf16_tile). dst_slot
+    # per row is still scattered (pool_src_slot), but that costs <2% (diag).
     out_features = int(sym_layout.hidden)
-    n_slots = int(sym_layout.combine_slots)
-    num_pool_tokens = int(sym_layout.num_max_pool_tokens)
-    comb_records = n_slots * out_features * 2  # bf16 peer combine-buffer bound (bytes)
-    gate_records = n_slots * 4  # f32 gate slots per peer
-
-    assert block_m_size % _NUM_WARPS == 0, "block_m must be a multiple of num_warps (8)"
+    n_slots = int(sym_layout.num_combine_slots)
+    comb_records = n_slots * out_features * 2
+    gate_records = n_slots * 4
     cols_per_step = _WARP * _PVEC
     num_full_chunks = out_features // cols_per_step
     tail_cols = out_features % cols_per_step
-    rows_per_warp = block_m_size // _NUM_WARPS
-    lane_id = thread_index % fx.Int32(_WARP)
+    row_words = out_features // 2
+    full_bytes = num_full_chunks * cols_per_step * 2
     warp_id = thread_index // fx.Int32(_WARP)
-    chunk_base = warp_id * fx.Int32(rows_per_warp)
+    lane_id = thread_index % fx.Int32(_WARP)
     l2_ptr = sym_layout.l2_token_buffer_ptr
-    row_bytes = out_features * 2
-    row_words = out_features // 2  # i32 words per row (bf16 -> 2 elems / word)
-    full_bytes = num_full_chunks * cols_per_step * 2  # the b128-aligned prefix copy_warp moves
 
-    origin_rank_res = create_buffer_resource_from_addr(
-        sym_layout.origin_rank_ptr, num_records_bytes=num_pool_tokens * 4
-    )
-    origin_slot_res = create_buffer_resource_from_addr(
-        sym_layout.origin_slot_ptr, num_records_bytes=num_pool_tokens * 4
-    )
-    if tail_cols:  # masked remainder needs whole-buffer resources (only when out_features % 512)
-        l2_token_buffer_res = create_buffer_resource_from_addr(
-            l2_ptr, num_records_bytes=num_pool_tokens * row_bytes
+    dst_rank = buffer_load(recv_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
+    start_row = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
+    count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+    comb_addr = sym_map(sym_layout, sym_layout.combine_token_buffer_ptr, dst_rank)
+
+    local_count = (count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
+    for i in range(local_count):
+        row = start_row + warp_id + i * fx.Int32(_NUM_WARPS)
+        slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
+        # DIAG: contiguous dst (row % n_slots) to measure the dst-scatter ceiling
+        dst_slot = (row % fx.Int32(n_slots)) if const_expr(_COMB_CONTIG_DIAG) else slot
+        copy_warp(
+            comb_addr,
+            l2_ptr,
+            full_bytes,
+            dst_off=dst_slot * fx.Int32(row_words),
+            src_off=row * fx.Int32(row_words),
+            store_cache=_COMB_WRITE_CACHE,
         )
-
-    base_row = block_m * fx.Int32(block_m_size) + chunk_base
-    for j in range_constexpr(rows_per_warp):
-        row = base_row + fx.Int32(j)
-        origin = buffer_load(origin_rank_res, row, vec_width=1, dtype=fx.T.i32())
-        if origin >= fx.Int32(0):
-            slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
-            comb_addr = map_signal(sym_layout, sym_layout.comb_ptr, origin)
-            # dst = peer comb (base addr), src = local L2Y (base addr); offsets in i32 words
-            copy_warp(
-                comb_addr,
-                l2_ptr,
-                full_bytes,
-                dst_off=slot * fx.Int32(row_words),
-                src_off=row * fx.Int32(row_words),
+        if const_expr(tail_cols):
+            oob_index = fx.Int32(n_slots) * fx.Int32(out_features)
+            slot_base = slot * fx.Int32(out_features)
+            row_off = row * fx.Int32(out_features)
+            l2_res = create_buffer_resource_from_addr(l2_ptr, num_records_bytes=n_slots * out_features * 2)
+            peer = create_buffer_resource_from_addr(comb_addr, num_records_bytes=comb_records)
+            col = fx.Int32(num_full_chunks * cols_per_step) + lane_id * fx.Int32(_PVEC)
+            in_tail = (lane_id * fx.Int32(_PVEC)) < fx.Int32(tail_cols)
+            safe_col = arith.select(in_tail, col, fx.Int32(out_features - _PVEC))
+            tail_value = buffer_load(
+                l2_res, row_off + safe_col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=_L1_BYPASS
             )
-            if const_expr(tail_cols):
-                oob_index = fx.Int32(n_slots) * fx.Int32(out_features)
-                slot_base = slot * fx.Int32(out_features)
-                row_off = row * fx.Int32(out_features)
-                peer = create_buffer_resource_from_addr(comb_addr, num_records_bytes=comb_records)
-                col = fx.Int32(num_full_chunks * cols_per_step) + lane_id * fx.Int32(_PVEC)
-                in_tail = (lane_id * fx.Int32(_PVEC)) < fx.Int32(tail_cols)
-                safe_col = arith.select(in_tail, col, fx.Int32(out_features - _PVEC))
-                tail_value = buffer_load(
-                    l2_token_buffer_res,
-                    row_off + safe_col,
-                    vec_width=_PVEC,
-                    dtype=fx.T.bf16(),
-                    cache_modifier=_L1_BYPASS,
-                )
-                dst = arith.select(in_tail, slot_base + col, oob_index)
-                buffer_store(tail_value, peer, dst)
-            if const_expr(with_gate):
-                gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
-                gate_addr = sym_map(sym_layout, sym_layout.combine_gate_ptr, origin)
-                gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
-                buffer_store(gate_value, gate_peer, slot)
-            if const_expr(signal):
-                bank = fx.Int32(0) if bank_offset is None else bank_offset
-                barrier_addr = map_signal(sym_layout, sym_layout.reduce_flag_ptr, origin)
-                _wait_mem()
-                st(barrier_addr, bank + slot, epoch, scope="sys")
+            dst = arith.select(in_tail, slot_base + col, oob_index)
+            buffer_store(tail_value, peer, dst, cache_modifier=_COMB_WRITE_CACHE)
+        if const_expr(with_gate):
+            gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
+            gate_addr = sym_map(sym_layout, sym_layout.combine_gate_ptr, dst_rank)
+            gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
+            buffer_store(gate_value, gate_peer, slot)
+        if const_expr(signal):
+            bank = fx.Int32(0) if bank_offset is None else bank_offset
+            barrier_addr = sym_map(sym_layout, sym_layout.reduce_flag_ptr, dst_rank)
+            _wait_mem()
+            st(barrier_addr, bank + slot, epoch, scope="sys")
 
 
 @ASTRewriter.transform
@@ -247,7 +244,15 @@ def topk_reduce_bf16_tile(
             topk_vals = []
             for j in range_constexpr(topk):
                 row_off = token_row_off + fx.Int32(j * out_features) + col
-                topk_vals.append(buffer_load(comb_local_res, row_off, vec_width=_PVEC, dtype=fx.T.bf16()))
+                topk_vals.append(
+                    buffer_load(
+                        comb_local_res,
+                        row_off,
+                        vec_width=_PVEC,
+                        dtype=fx.T.bf16(),
+                        cache_modifier=_COMB_READ_CACHE,
+                    )
+                )
             if const_expr(apply_weights):
                 weights = [
                     buffer_load(

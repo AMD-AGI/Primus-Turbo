@@ -248,6 +248,7 @@ def copy_warp(
     nbytes: int,
     dst_off: Union[int, fx.ArithValue] = 0,
     src_off: Union[int, fx.ArithValue] = 0,
+    store_cache: int = 0,
 ) -> None:
     def _addr_i64(addr: Union[int, fx.ArithValue]) -> fx.ArithValue:
         if isinstance(addr, int):
@@ -280,4 +281,4 @@ def copy_warp(
         for o in offs
     ]
     for o, v in zip(offs, vals):
-        buffer_store(v, dst, dst_off + o)
+        buffer_store(v, dst, dst_off + o, cache_modifier=store_cache)
