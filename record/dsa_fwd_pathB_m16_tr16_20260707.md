@@ -118,6 +118,22 @@ Remaining gap to gluon (~10-20%) = gluon's async_copy DMA + 2-buffer softmax‖Q
   bulk-DMA layout (a substantial further effort). Gated OFF.
 - Checkpoint of the shared-gather version: output/flydsl_v2_ckpt/dsa_fwd_tr16_kernel_shared373.py
 
+## DMA DEEP-DIVE (2026-07-07): scattered gather gets NO benefit from DMA at M=16
+Tried 4 DMA variants incl. the exact M=32-style structure (uniform per-wave lds_ptr
+via readfirstlane, one wave-batch = one full key row, implicit lane-strided 16B write,
+V_STRIDE unpadded=512, (key&3)<<4 swizzle round-tripped on QK+PV reads). ALL correct
+(47.5 dB) but 105-118 TFLOP/s standalone (vs coop 376). PIPE+DMA with the drain
+deferred past softmax_pv (proper overlap) = 102 — the DMA cost EXCEEDS the softmax_pv
+compute it overlaps, so overlap can't hide it.
+WHY (coherent w/ the whole story): M=32's DMA gives +6-16% because its BIG per-wave
+compute (32 heads, BLOCK_N=64) hides the async gather latency. M=16 has HALF the
+per-wave compute, so the same gather latency is proportionally too large to hide.
+raw_ptr_buffer_load_lds on topk-scattered rows has no raw-throughput edge over the
+coop VGPR loads (compiler coalesces the scattered loads well); DMA's only benefit is
+async overlap, which M=16 can't cash in. => 376 (coop shared gather) is the ceiling
+for this M=16 approach. Closing the last 10% to gluon would need a structurally
+different gather (or accepting M=32's larger tiles, which is a different kernel).
+
 ## FINAL STATE (2026-07-07): tr16 default = 376/330/388, 1.35-1.39x M32, 0.90x gluon
 - Best config = non-pipelined coop shared gather, QK_PF=3, AV_PF=2, NUM_WAVES=auto,
   BLOCK_K=32, DMA off, PIPE off. 138/138 tests pass. out 47.5 dB.

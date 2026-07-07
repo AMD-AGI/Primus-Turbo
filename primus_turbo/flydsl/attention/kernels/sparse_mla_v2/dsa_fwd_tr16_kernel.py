@@ -344,23 +344,37 @@ def build_dsa_fwd_tr16_module(
         def _gather(buf, k_start_i32):
             bb = _buf_base(buf)
             if const_expr(_USE_DMA):
-                assert _GTOT % BLOCK_SIZE == 0, "DMA path needs _GTOT divisible by BLOCK_SIZE"
+                # M=32-style DMA: lds_ptr is UNIFORM per wave (readfirstlane); the HW
+                # writes each lane's 16B implicitly to lds_ptr + lane*16B. Each
+                # wave-batch DMAs one full key row (64 lanes x 8 elems = 512 =
+                # HEAD_DIM = V_STRIDE). Waves split the BLOCK_K key rows.
+                # V_STRIDE == HEAD_DIM (unpadded) is required for the implicit write
+                # to land at key*V_STRIDE + lane*8.
+                assert V_STRIDE == HEAD_DIM, "DMA needs unpadded V_STRIDE"
+                _LPR = HEAD_DIM * 2 // 16  # lanes per key row = 64
+                assert _LPR == WARP_SIZE, "DMA assumes 64 lanes == one key row"
+                assert BLOCK_K % NUM_WAVES == 0
+                _NDMA = BLOCK_K // NUM_WAVES  # key rows each wave DMAs
                 _dma_size = arith.constant(16, type=T.i32)
                 _dma_z = arith.constant(0, type=T.i32)
                 _dma_aux = arith.constant(1, type=T.i32)
                 lds_base_byte = buffer_ops.extract_base_index(lds, address_space=3)
-                for gi in range_constexpr(GATHER_ITERS):
-                    slot = tid + arith.index(gi * BLOCK_SIZE)
-                    key_in_tile = slot // arith.index(_COLG)
-                    col8 = (slot % arith.index(_COLG)) * arith.index(8)
-                    swz_col = _kv_swz(key_in_tile, col8)
+                # this lane's column within a key row (0..63) -> 8 elems each
+                swiz_col = lane * arith.index(8)
+                for dki in range_constexpr(_NDMA):
+                    key_in_tile = wave_id * arith.index(_NDMA) + arith.index(dki)
+                    # uniform per-wave LDS dest: base + key_row*V_STRIDE; lane*16B added by HW
+                    v_row_elem = bb + key_in_tile * arith.index(V_STRIDE)
+                    lds_addr = lds_base_byte + (arith.index(lds_off) + v_row_elem) * arith.index(2)
+                    lds_i64 = arith.index_cast(T.i64, lds_addr)
+                    lds_lane0 = rocdl.readfirstlane(T.i64, lds_i64)
+                    lds_ptr = _llvm.IntToPtrOp(_llvm_lds_ptr_ty(), lds_lane0).result
+                    # per-lane global source: swizzle the fetched column (round-trips
+                    # with the QK/PV read swizzle). key row from topk (clamp -1 -> 0).
+                    unsw_col = _kv_swz(key_in_tile, swiz_col)
                     key_pos_i32 = arith.AddIOp(k_start_i32, arith.index_cast(T.i32, key_in_tile)).result
                     _inv_g, kv_row_base = key_meta(key_pos_i32)
-                    v_idx = bb + key_in_tile * arith.index(V_STRIDE) + col8
-                    lds_addr = lds_base_byte + (arith.index(lds_off) + v_idx) * arith.index(2)
-                    lds_i64 = arith.index_cast(T.i64, lds_addr)
-                    lds_ptr = _llvm.IntToPtrOp(_llvm_lds_ptr_ty(), lds_i64).result
-                    global_elem = kv_row_base + swz_col
+                    global_elem = kv_row_base + unsw_col
                     voffset = arith.index_cast(T.i32, global_elem * arith.index(2))
                     rocdl.raw_ptr_buffer_load_lds(kv_rsrc, lds_ptr, _dma_size, voffset, _dma_z, _dma_z, _dma_aux)
             else:
@@ -504,6 +518,8 @@ def build_dsa_fwd_tr16_module(
                 k_start_i32 = arith.index_cast(T.i32, k_start)
                 gpu.barrier()  # prior tile's readers done before overwrite
                 _gather(0, k_start_i32)
+                if const_expr(_USE_DMA):
+                    rocdl.s_waitcnt(0)  # drain async DMA before the tile is read
                 gpu.barrier()  # full shared tile visible before QK
                 owned = _qk(0, k_start_i32)
                 m_i, l_i, acc = _softmax_pv(owned, 0, m_i, l_i, acc)
@@ -548,6 +564,8 @@ def build_dsa_fwd_tr16_module(
                 # softmax(prev) VALU FIRST so it overlaps the gather's LDS writes, THEN a
                 # barrier, THEN QK(cur). PV(prev) also reads prev_buf (safe, disjoint).
                 m_i, l_i, acc = _softmax_pv(prev_scores, prev_buf, m_i, l_i, acc)
+                if const_expr(_USE_DMA):
+                    rocdl.s_waitcnt(0)  # drain the async gather (overlapped w/ softmax_pv above)
                 gpu.barrier()  # cur_buf gather visible before QK reads it
                 cur_scores = _qk(cur_buf, cur_k_i32)
                 flat_cur = [cur_scores[s][r] for s in range(N_SUB) for r in range(4)]
