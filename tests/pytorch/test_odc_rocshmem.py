@@ -18,10 +18,10 @@ call anything that needs ``rocshmem_init`` (rs_init_uid / rs_malloc / gather /
 reduce-scatter) so the test runs in a plain single-process pytest with no launcher.
 """
 
+import primus_turbo.pytorch._C as C
 import pytest
 
 import primus_turbo
-import primus_turbo.pytorch._C as C
 
 # rocSHMEM host-API symbols (mirrors _rocshmem_backend.py's ctypes surface for
 # librs_host5.so): uid bootstrap + symmetric heap + peer-ptr resolve + PE query.
