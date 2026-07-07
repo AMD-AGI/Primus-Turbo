@@ -1,0 +1,142 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+"""Pool -> fused single-latent (K==V) sparse-MLA bridge for the native-FlyDSL
+``flydsl_v2`` CSA backend.
+
+Same bridge as the ported ``triton_v2`` adapter, but the fwd/bwd kernel pair is
+the native FlyDSL sparse-MLA (``sparse_mla_{fwd,bwd}_v4_flydsl``). Maps
+Primus-Turbo's separate-K/V CSA-from-pool contract onto the single-latent kernel
+pair and maps gradients back.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+
+from .dsa_bwd import sparse_mla_bwd_v4_flydsl
+from .dsa_fwd import sparse_mla_fwd_v4_flydsl
+
+_ROPE_PAD = 64
+
+
+def _pad_topk_64(topk: torch.Tensor) -> torch.Tensor:
+    tk = topk.shape[1]
+    pad = ((tk + 63) // 64) * 64 - tk
+    if pad > 0:
+        topk = torch.cat(
+            [topk, torch.full((topk.shape[0], pad), -1, device=topk.device, dtype=topk.dtype)], dim=1
+        )
+    return topk.contiguous()
+
+
+def _build_csa_topk(topk_idxs: torch.Tensor, S: int, P: int, W: int) -> torch.Tensor:
+    """Flat topk ``[B*S, W+K]`` over the per-batch ``[local(S) ++ pool(P)]`` buffer."""
+    B, _, K = topk_idxs.shape
+    device = topk_idxs.device
+    base = (torch.arange(B, device=device) * (S + P)).view(B, 1, 1)
+
+    win_pos = torch.arange(S, device=device).view(S, 1) - W + 1 + torch.arange(W, device=device).view(1, W)
+    win_valid = win_pos >= 0
+    win_idx = base + win_pos.view(1, S, W)
+    win_idx = torch.where(win_valid.view(1, S, W), win_idx, torch.full_like(win_idx, -1))
+
+    pool_valid = topk_idxs >= 0
+    pool_idx = torch.where(pool_valid, base + S + topk_idxs, torch.full_like(topk_idxs, -1))
+
+    return torch.cat([win_idx, pool_idx], dim=2).reshape(B * S, W + K).to(torch.int32).contiguous()
+
+
+class _CSAPoolSparseMLAFlyDSLV2Fn(torch.autograd.Function):
+    """Autograd wrapper: native-FlyDSL sparse-MLA FWD/BWD for the V4 CSA layer."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        q_bh: torch.Tensor,
+        k_local_bh: torch.Tensor,
+        v_local_bh: torch.Tensor,
+        pool: torch.Tensor,
+        topk_idxs: torch.Tensor,
+        sink: Optional[torch.Tensor],
+        swa_window: int,
+        scale: float,
+    ) -> torch.Tensor:
+        B, H, S, D = q_bh.shape
+        P = pool.shape[1]
+        W = int(swa_window)
+        assert q_bh.dtype == torch.bfloat16, "flydsl_v2 sparse-MLA requires bf16"
+        assert W > 0, "flydsl_v2 sparse-MLA requires swa_window > 0"
+
+        latent = k_local_bh[:, 0, :, :]  # [B, S, D]
+
+        z_q = torch.zeros(B * S, H, _ROPE_PAD, device=q_bh.device, dtype=q_bh.dtype)
+        q_g = torch.cat([q_bh.permute(0, 2, 1, 3).reshape(B * S, H, D), z_q], dim=-1).contiguous()
+
+        kv512 = torch.cat([latent, pool], dim=1).reshape(B * (S + P), 1, D)
+        z_kv = torch.zeros(B * (S + P), 1, _ROPE_PAD, device=q_bh.device, dtype=q_bh.dtype)
+        kv_g = torch.cat([kv512, z_kv], dim=-1).contiguous()
+
+        topk_g = _pad_topk_64(_build_csa_topk(topk_idxs, S, P, W))
+
+        sink_arg = sink.float().contiguous() if sink is not None else None
+        o_g, lse = sparse_mla_fwd_v4_flydsl(
+            q_g, kv_g, topk_g, attn_sink=sink_arg, kv_lora_rank=D, scale=float(scale)
+        )
+
+        ctx.save_for_backward(q_g, kv_g, o_g, lse, topk_g, sink_arg if sink is not None else q_g.new_empty(0))
+        ctx.shapes = (B, H, S, D, P, W)
+        ctx.scale = float(scale)
+        ctx.sink_was_none = sink is None
+        return o_g.reshape(B, S, H, D).permute(0, 2, 1, 3).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_o_bh: torch.Tensor):  # type: ignore[override]
+        q_g, kv_g, o_g, lse, topk_g, sink_saved = ctx.saved_tensors
+        B, H, S, D, P, W = ctx.shapes
+        sink_arg = None if ctx.sink_was_none else sink_saved
+
+        grad_o_g = grad_o_bh.permute(0, 2, 1, 3).reshape(B * S, H, D).contiguous()
+        dq_g, dkv_g, dsink = sparse_mla_bwd_v4_flydsl(
+            q_g, kv_g, o_g, grad_o_g, topk_g, lse, attn_sink=sink_arg, kv_lora_rank=D, scale=ctx.scale
+        )
+
+        dq_bh = dq_g[:, :, :D].reshape(B, S, H, D).permute(0, 2, 1, 3).contiguous()
+        dkv512 = dkv_g[:, 0, :D].reshape(B, S + P, D)
+        dlatent = dkv512[:, :S, :]
+        dpool = dkv512[:, S:, :].contiguous()
+
+        dk_local = torch.zeros(B, H, S, D, device=dq_bh.device, dtype=dq_bh.dtype)
+        dk_local[:, 0, :, :] = dlatent.to(dq_bh.dtype)
+        dv_local = None
+
+        dsink_out = None
+        if not ctx.sink_was_none and dsink is not None:
+            dsink_out = dsink.to(sink_saved.dtype)
+
+        return dq_bh, dk_local, dv_local, dpool.to(dq_bh.dtype), None, dsink_out, None, None
+
+
+def csa_pool_attention_flydsl_v2(
+    q: torch.Tensor,
+    k_local: torch.Tensor,
+    v_local: torch.Tensor,
+    pool: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    sink: Optional[torch.Tensor],
+    swa_window: int,
+    scale: float,
+) -> torch.Tensor:
+    """CSA-from-pool via the native-FlyDSL fused single-latent sparse-MLA kernels."""
+    if k_local.shape[1] == 1:
+        H = q.shape[1]
+        k_local = k_local.expand(-1, H, -1, -1)
+        v_local = v_local.expand(-1, H, -1, -1)
+    return _CSAPoolSparseMLAFlyDSLV2Fn.apply(
+        q, k_local, v_local, pool, topk_idxs, sink, int(swa_window), float(scale)
+    )

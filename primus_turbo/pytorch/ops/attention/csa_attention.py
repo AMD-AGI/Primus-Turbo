@@ -176,6 +176,32 @@ def csa_attention_from_pool(
             backend=backend,
         )
 
+    # Fused single-latent (K==V) sparse-MLA Triton backend (upstream triton_v2).
+    # Separate self-contained autograd Function; routed here directly (it does not
+    # go through the deepseek_csa_pool_attn_{fwd,bwd} custom_op dispatcher).
+    if backend == BackendType.TRITON_V2:
+        if attn_dropout > 0.0 and training:
+            raise NotImplementedError("triton_v2 CSA does not implement attention dropout")
+        from primus_turbo.triton.attention.deepseek.sparse_mla_v2 import (
+            csa_pool_attention_triton_v2,
+        )
+
+        return csa_pool_attention_triton_v2(
+            q, k_local, v_local, pool, topk_idxs, sink, int(swa_window), float(scale)
+        )
+
+    # Fused single-latent native-FlyDSL sparse-MLA backend (flydsl_v2).
+    if backend == BackendType.FLYDSL_V2:
+        if attn_dropout > 0.0 and training:
+            raise NotImplementedError("flydsl_v2 CSA does not implement attention dropout")
+        from primus_turbo.flydsl.attention.kernels.sparse_mla_v2 import (
+            csa_pool_attention_flydsl_v2,
+        )
+
+        return csa_pool_attention_flydsl_v2(
+            q, k_local, v_local, pool, topk_idxs, sink, int(swa_window), float(scale)
+        )
+
     return CSAPoolAttentionFn.apply(
         q,
         k_local,

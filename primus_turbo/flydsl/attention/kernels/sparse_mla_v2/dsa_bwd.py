@@ -41,7 +41,6 @@ from primus_turbo.triton.attention.deepseek.sparse_mla_v2.dsa_bwd_kernels import
 
 from .dsa_bwd_dq_kernel import build_dsa_bwd_dq_module  # noqa: E402
 from .dsa_bwd_dq_m16_kernel import build_dsa_bwd_dq_m16_module  # noqa: E402
-from .dsa_bwd_dkv_interm_kernel import build_dsa_bwd_dkv_interm_module  # noqa: E402
 
 _DQ_CACHE = {}
 _DQ_LOCK = threading.Lock()
@@ -49,10 +48,6 @@ _DQ_M16_CACHE = {}
 _DQ_M16_LOCK = threading.Lock()
 _BLOCK_N = int(os.environ.get("PRIMUS_DSA_FLYDSL_BWD_BLOCK_N", "64"))
 _BLOCK_H = int(os.environ.get("PRIMUS_DSA_FLYDSL_BWD_BLOCK_H", "64"))
-
-# M=16 dQ kernel (tr16-style: shared gather + 16x16x32 + ds_read_tr dQ). Cuts the
-# M=32 dQ kernel's 3-accumulator VGPR blowup (512 VGPR / 140-196 spill). Env-gated.
-_USE_DQ_M16 = os.environ.get("PRIMUS_DSA_FLYDSL_BWD_DQ_M16", "0") == "1"
 
 
 def _get_dq_m16_kernel(num_heads, kv_lora_rank, d_qk, topk, scale):
@@ -65,23 +60,6 @@ def _get_dq_m16_kernel(num_heads, kv_lora_rank, d_qk, topk, scale):
                 topk=topk, dtype_str="bf16", sm_scale=float(scale),
             )
             _DQ_M16_CACHE[key] = launch
-        return launch
-
-
-_INTERM_CACHE = {}
-_INTERM_LOCK = threading.Lock()
-
-
-def _get_interm_kernel(num_heads, kv_lora_rank, d_qk, topk):
-    key = (num_heads, kv_lora_rank, d_qk, topk)
-    with _INTERM_LOCK:
-        launch = _INTERM_CACHE.get(key)
-        if launch is None:
-            launch = build_dsa_bwd_dkv_interm_module(
-                num_heads=num_heads, kv_lora_rank=kv_lora_rank, d_qk=d_qk,
-                topk=topk, dtype_str="bf16",
-            )
-            _INTERM_CACHE[key] = launch
         return launch
 
 
@@ -149,7 +127,9 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     dq = torch.zeros(total_tokens, num_heads, d_qk, dtype=q.dtype, device=q.device)  # rope cols stay 0
     chunk_dS = torch.empty(total_tokens, num_heads, TOPK, dtype=torch.bfloat16, device=q.device)
     chunk_P = torch.empty(total_tokens, num_heads, TOPK, dtype=torch.bfloat16, device=q.device)
-    if (os.environ.get("PRIMUS_DSA_FLYDSL_BWD_DQ_M16", "0") == "1") and (num_heads % 16 == 0) and (TOPK % 32 == 0):
+    # Default: M=16 shared-gather dQ kernel (2.9x the M=32 dQ). Falls back to the
+    # M=32 dQ kernel for shapes it can't tile (heads%16 or topk%32).
+    if (num_heads % 16 == 0) and (TOPK % 32 == 0):
         dq_launch = _get_dq_m16_kernel(int(num_heads), D, int(d_qk), int(TOPK), scale)
         dq_launch(
             q.reshape(-1),
@@ -180,57 +160,40 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
         )
 
     # ---- dKV: intermediate GEMM + CSR inverted-topk scatter-reduce ----
+    # The dkv-intermediate GEMM reuses the shared Triton kernel: it is a
+    # variable-length scatter-reduction with no MFMA content, so a FlyDSL rewrite
+    # has nothing to gain (a native M=16 port was tried and was slower).
     HAS_ROPE = False
     interm = torch.empty(total_tokens, TOPK, d_qk, dtype=torch.bfloat16, device=q.device)
-    if (os.environ.get("PRIMUS_DSA_FLYDSL_BWD_INTERM_MFMA", "0") == "1") and (num_heads % 16 == 0):
-        # Native FlyDSL M=16 head-contraction MFMA (replaces the Triton dkv-interm).
-        # rope cols of interm are never read by the gather; leave them undefined.
-        # flydsl packs a tensor's byte-size as i32, so any single arg must stay
-        # < 2^31 bytes. interm = T*TOPK*d_qk*2 can exceed that (e.g. H128 K512 ->
-        # 2.4 GB). Chunk the launch over T so each sub-tensor fits; the kernel is
-        # grid=(T,) per-token independent, so a T-slice is self-contained.
-        interm_launch = _get_interm_kernel(int(num_heads), D, int(d_qk), int(TOPK))
-        _bytes_per_tok = TOPK * d_qk * 2
-        _max_tok = max(1, (2**31 - 1) // max(_bytes_per_tok, num_heads * d_qk * 2, num_heads * TOPK * 2))
-        _t0 = 0
-        while _t0 < total_tokens:
-            _t1 = min(total_tokens, _t0 + _max_tok)
-            interm_launch(
-                q[_t0:_t1].reshape(-1), do[_t0:_t1].reshape(-1),
-                chunk_dS[_t0:_t1].reshape(-1), chunk_P[_t0:_t1].reshape(-1),
-                interm[_t0:_t1].reshape(-1), int(_t1 - _t0),
-            )
-            _t0 = _t1
-    else:
-        # BH_DKV/TK_DKV whole-top-k (R_CHUNK=TOPK) in one dKV-intermediate pass.
-        BH_DKV = int(os.environ.get("PRIMUS_DSA_DKV_BH", "32"))
-        TK_DKV = int(os.environ.get("PRIMUS_DSA_DKV_TK", "64"))
-        _NW_DKV = int(os.environ.get("PRIMUS_DSA_DKV_NW", "8"))
-        num_hg_dkv = triton.cdiv(num_heads, BH_DKV)
-        _bwd_compute_dkv_intermediate[(total_tokens,)](
-            q,
-            do,
-            chunk_dS,
-            chunk_P,
-            interm,
-            q.stride(0),
-            q.stride(1),
-            do.stride(0),
-            do.stride(1),
-            chunk_dS.stride(0),
-            chunk_dS.stride(1),
-            interm.stride(0),
-            interm.stride(1),
-            num_heads,
-            R_CHUNK=TOPK,
-            TILE_K=TK_DKV,
-            BLOCK_H=BH_DKV,
-            NUM_HG=num_hg_dkv,
-            D_V=D,
-            D_ROPE=rope_rank,
-            HAS_ROPE=HAS_ROPE,
-            num_warps=_NW_DKV,
-        )
+    # BH_DKV/TK_DKV whole-top-k (R_CHUNK=TOPK) in one dKV-intermediate pass.
+    BH_DKV = int(os.environ.get("PRIMUS_DSA_DKV_BH", "32"))
+    TK_DKV = int(os.environ.get("PRIMUS_DSA_DKV_TK", "64"))
+    _NW_DKV = int(os.environ.get("PRIMUS_DSA_DKV_NW", "8"))
+    num_hg_dkv = triton.cdiv(num_heads, BH_DKV)
+    _bwd_compute_dkv_intermediate[(total_tokens,)](
+        q,
+        do,
+        chunk_dS,
+        chunk_P,
+        interm,
+        q.stride(0),
+        q.stride(1),
+        do.stride(0),
+        do.stride(1),
+        chunk_dS.stride(0),
+        chunk_dS.stride(1),
+        interm.stride(0),
+        interm.stride(1),
+        num_heads,
+        R_CHUNK=TOPK,
+        TILE_K=TK_DKV,
+        BLOCK_H=BH_DKV,
+        NUM_HG=num_hg_dkv,
+        D_V=D,
+        D_ROPE=rope_rank,
+        HAS_ROPE=HAS_ROPE,
+        num_warps=_NW_DKV,
+    )
 
     dkv_acc = torch.zeros(num_kv, d_qk, dtype=torch.float32, device=q.device)
     inv_ptr, inv_data = _build_inverted_topk_slice(topk_p, 0, TOPK, num_kv=num_kv)

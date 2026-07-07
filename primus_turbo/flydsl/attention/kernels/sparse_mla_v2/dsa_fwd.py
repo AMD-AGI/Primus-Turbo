@@ -26,24 +26,17 @@ import torch
 
 # flydsl_v1 uses only the installed `flydsl` pip package + its own local kernel
 # modules — it does NOT need the /workspace/FlyDSL-amd source tree.
-# The pipe kernel is a superset of dsa_fwd_kernel: it adds an async global->LDS DMA
-# gather (rocdl.raw_ptr_buffer_load_lds, bypassing the VGPR staging buffer) gated by
-# `use_dma`. DMA is a bit-identical +6% on the dual (H>=128) path and is default-ON
-# there; env PRIMUS_DSA_FLYDSL_FWD_DMA=0 falls back to the VGPR-staged gather.
+# tr16 (M=16 16x16x32 QK + ds_read_tr PV + per-workgroup SHARED gather) is the
+# default forward for heads%16==0 && topk%32==0 (the V4-Flash/Pro production
+# shapes) — 1.35x the old M=32 kernel. The M=32 pipe kernel is the fallback for
+# shapes tr16 can't handle.
 from .dsa_fwd_pipe_kernel import build_dsa_fwd_module  # noqa: E402
-from .dsa_fwd_m16_kernel import build_dsa_fwd_m16_module  # noqa: E402
 from .dsa_fwd_tr16_kernel import build_dsa_fwd_tr16_module  # noqa: E402
 
 _KERNEL_CACHE = {}
 _KERNEL_CACHE_LOCK = threading.Lock()
-_M16_CACHE = {}
-_M16_LOCK = threading.Lock()
 _TR16_CACHE = {}
 _TR16_LOCK = threading.Lock()
-
-# M=16 16x16x32 QK + ds_read_tr PV (path B): combines occupancy-2 with the fast
-# hardware-transpose PV pipeline. Aims to beat gluon_v2. Env-gated for A/B.
-_USE_TR16 = os.environ.get("PRIMUS_DSA_FLYDSL_FWD_TR16", "0") == "1"
 
 
 def _get_tr16_kernel(num_heads, kv_lora_rank, d_qk, topk, has_sink, scale):
@@ -58,34 +51,9 @@ def _get_tr16_kernel(num_heads, kv_lora_rank, d_qk, topk, has_sink, scale):
             _TR16_CACHE[key] = launch
         return launch
 
-# M=16 (16x16x32) forward: occupancy-2, faster than M=32 on RANDOM topk (205 vs
-# 190) but SLOWER on the realistic [window++pool] topk the adapter builds (162 vs
-# 197 end-to-end) — the M=32 kernel's ds_read_tr V pipeline handles the
-# structured-gather locality better. Default OFF; env-gated for experiments.
-_USE_M16 = os.environ.get("PRIMUS_DSA_FLYDSL_FWD_M16", "0") == "1"
-
-
-def _get_m16_kernel(num_heads, kv_lora_rank, d_qk, topk, has_sink, scale):
-    key = (num_heads, kv_lora_rank, d_qk, topk, has_sink, round(float(scale), 8))
-    with _M16_LOCK:
-        launch = _M16_CACHE.get(key)
-        if launch is None:
-            launch = build_dsa_fwd_m16_module(
-                num_heads=num_heads, kv_lora_rank=kv_lora_rank, d_qk=d_qk,
-                topk=topk, sm_scale=float(scale), has_sink=has_sink,
-            )
-            _M16_CACHE[key] = launch
-        return launch
-
 _DEFAULT_BLOCK_N = int(os.environ.get("PRIMUS_DSA_FLYDSL_FWD_BLOCK_N", "0"))  # 0 = shape-conditional
 _DEFAULT_BLOCK_H = int(os.environ.get("PRIMUS_DSA_FLYDSL_FWD_BLOCK_H", "256"))
 _DEFAULT_WPE = int(os.environ.get("PRIMUS_DSA_FLYDSL_FWD_WPE", "2"))
-
-
-# Async DMA gather (buffer_load_lds): +6% bit-identical on the dual (H>=128) path.
-# Only valid when single_latent is off (needs the unpadded dual V layout). Env
-# override: 0 forces the VGPR-staged gather, 1 forces DMA even where auto is off.
-_DMA_ENV = os.environ.get("PRIMUS_DSA_FLYDSL_FWD_DMA", "")
 
 
 def _get_kernel(
@@ -94,12 +62,7 @@ def _get_kernel(
     block_h = min(block_h, num_heads)
     while num_heads % block_h != 0:
         block_h -= 32
-    if _DMA_ENV == "1":
-        use_dma = True
-    elif _DMA_ENV == "0":
-        use_dma = False
-    else:
-        use_dma = True  # auto: DMA on both dual (H>=128) and single_latent (H<=64)
+    use_dma = True  # async global->LDS DMA gather; bit-identical +6% on the dual path
     key = (
         num_heads,
         kv_lora_rank,
@@ -179,16 +142,10 @@ def sparse_mla_fwd_v4_flydsl(q, kv, topk_indices, attn_sink=None, kv_lora_rank=5
     o = torch.empty(total_tokens, num_heads, kv_lora_rank, dtype=q.dtype, device=q.device)
     lse = torch.empty(total_tokens, num_heads, dtype=torch.float32, device=q.device)
 
-    if (os.environ.get("PRIMUS_DSA_FLYDSL_FWD_TR16", "0") == "1") and (num_heads % 16 == 0) and (topk % 32 == 0):
+    # Default: tr16 M=16 shared-gather kernel for the production shapes. Falls
+    # back to the M=32 kernel for shapes it can't tile (heads%16 or topk%32).
+    if (num_heads % 16 == 0) and (topk % 32 == 0):
         launch = _get_tr16_kernel(int(num_heads), kv_lora_rank, int(d_qk), int(topk), has_sink, scale)
-        launch(
-            q.reshape(-1), kv.reshape(-1), topk_indices.reshape(-1), sink.reshape(-1),
-            o.reshape(-1), lse.reshape(-1), int(total_tokens),
-        )
-        return o, lse
-
-    if _USE_M16 and (num_heads % 16 == 0) and (topk % 32 == 0):
-        launch = _get_m16_kernel(int(num_heads), kv_lora_rank, int(d_qk), int(topk), has_sink, scale)
         launch(
             q.reshape(-1), kv.reshape(-1), topk_indices.reshape(-1), sink.reshape(-1),
             o.reshape(-1), lse.reshape(-1), int(total_tokens),

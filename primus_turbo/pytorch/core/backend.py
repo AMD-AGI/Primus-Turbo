@@ -66,6 +66,12 @@ class BackendType(Enum):
     DEEP_EP = auto()
     TURBO = auto()
     FLYDSL = auto()
+    # Fused single-latent (K==V) sparse-MLA Triton CSA backend, ported from
+    # upstream Primus `triton_v2` (PR #853). Selectable for the CSA-from-pool op.
+    TRITON_V2 = auto()
+    # Fused single-latent (K==V) sparse-MLA native-FlyDSL CSA backend, ported
+    # from upstream Primus `flydsl_v1` and optimized further. CSA-from-pool op.
+    FLYDSL_V2 = auto()
 
 
 class GlobalBackendManager:
