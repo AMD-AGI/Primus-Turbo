@@ -107,13 +107,12 @@ struct GroupedGemmKernelWS
         const auto gemm_desc_ptr = reinterpret_cast<const GemmTransKernelArg<NumDTensor_>*>(
             cast_pointer_to_generic_address_space(gemm_descs_const));
 
-        // Total tiles across all groups (O(G) per CTA; group_descs cached in L2).
-        index_t total_tiles = 0;
-        for(index_t g = 0; g < group_count; ++g)
-        {
-            const auto& kargs_g = gemm_desc_ptr[g].group_karg;
-            total_tiles += TilePartitioner::GridSize(kargs_g.M, kargs_g.N) * kargs_g.k_batch;
-        }
+        // Total tiles across all groups. ``block_start``/``block_end`` are
+        // populated as a prefix sum by ``compute_grouped_gemm_args`` in
+        // ck_grouped_gemm.cu, so the last group's ``block_end`` is
+        // exactly the cumulative tile count. One field read instead of
+        // an O(G) recompute per CTA.
+        const index_t total_tiles = gemm_desc_ptr[group_count - 1].block_end;
 
         // AMD round-robin pid -> xcd_id mapping. When the persistent grid is
         // capped to fewer CUs than there are XCDs (gridDim.x < NUM_XCDS_WS),
