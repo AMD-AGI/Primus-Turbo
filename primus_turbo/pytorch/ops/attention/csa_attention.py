@@ -33,10 +33,10 @@ import torch
 # (``deepseek_csa_pool_attn_fwd``).
 import primus_turbo.pytorch.kernels.attention.deepseek_attn_impl  # noqa: F401
 from primus_turbo.pytorch.core.backend import BackendType
-from primus_turbo.pytorch.ops.attention.hca_attention import hca_attention
-from primus_turbo.triton.attention.deepseek import (
-    _launch_csa_attention_pool_bwd,
+from primus_turbo.pytorch.kernels.attention.deepseek_attn_impl import (
+    deepseek_csa_pool_attn_bwd,
 )
+from primus_turbo.pytorch.ops.attention.hca_attention import hca_attention
 
 __all__ = [
     "CSAPoolAttentionFn",
@@ -94,6 +94,7 @@ class CSAPoolAttentionFn(torch.autograd.Function):
         ctx.training_mode = bool(training)
         ctx.scale = float(scale)
         ctx.sink_was_none = sink is None
+        ctx.backend_override = int(backend_override)
         return out
 
     @staticmethod
@@ -104,7 +105,7 @@ class CSAPoolAttentionFn(torch.autograd.Function):
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
-        dq, dk_local, dv_local, dpool, dsink = _launch_csa_attention_pool_bwd(
+        dq, dk_local, dv_local, dpool, dsink = deepseek_csa_pool_attn_bwd(
             q,
             k_local,
             v_local,
@@ -116,6 +117,7 @@ class CSAPoolAttentionFn(torch.autograd.Function):
             sink=sink_arg,
             swa_window=ctx.swa_window,
             scale=ctx.scale,
+            backend_override=ctx.backend_override,
         )
 
         if not ctx.needs_input_grad[0]:

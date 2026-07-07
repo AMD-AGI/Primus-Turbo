@@ -29,11 +29,16 @@ Returns ``(dq, dk, dv, dsink)`` in the input dtype (``dsink`` is ``None`` when
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Optional, Tuple
 
 import torch
 
+from primus_turbo.flydsl.attention.kernels.csa_pool_bwd_kernel import (
+    build_csa_pool_bwd_dpool_module,
+    build_csa_pool_bwd_module,
+)
 from primus_turbo.flydsl.attention.kernels.hca_bwd_dkv_pool_kernel import build_hca_bwd_dkv_pool_module
 from primus_turbo.flydsl.attention.kernels.hca_bwd_dq_pool_kernel import build_hca_bwd_dq_pool_module
 from primus_turbo.flydsl.attention.kernels.sla_bwd_dkv_kernel import build_swa_bwd_dkv_module
@@ -52,6 +57,45 @@ _DQ_POOL_CACHE = {}
 _DQ_POOL_LOCK = threading.Lock()
 _DKV_POOL_CACHE = {}
 _DKV_POOL_LOCK = threading.Lock()
+_CSA_BWD_CACHE = {}
+_CSA_BWD_LOCK = threading.Lock()
+_CSA_DPOOL_CACHE = {}
+_CSA_DPOOL_LOCK = threading.Lock()
+
+
+def _get_csa_dpool(num_heads, head_dim, dtype_str, mqa_kv, k_block):
+    key = (num_heads, head_dim, dtype_str, mqa_kv, k_block)
+    with _CSA_DPOOL_LOCK:
+        if key in _CSA_DPOOL_CACHE:
+            return _CSA_DPOOL_CACHE[key]
+        launch = build_csa_pool_bwd_dpool_module(
+            num_heads=num_heads, head_dim=head_dim, dtype_str=dtype_str,
+            mqa_kv=mqa_kv, k_block=k_block,
+        )
+        _CSA_DPOOL_CACHE[key] = launch
+        return launch
+
+
+def _get_csa_bwd(num_heads, head_dim, swa_window, dtype_str, mqa_kv, has_sink,
+                 has_local=True, has_sparse=True, store_dpool=True):
+    key = (num_heads, head_dim, swa_window, dtype_str, mqa_kv, has_sink,
+           has_local, has_sparse, store_dpool)
+    with _CSA_BWD_LOCK:
+        if key in _CSA_BWD_CACHE:
+            return _CSA_BWD_CACHE[key]
+        launch = build_csa_pool_bwd_module(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            swa_window=swa_window,
+            dtype_str=dtype_str,
+            mqa_kv=mqa_kv,
+            has_sink=has_sink,
+            has_local=has_local,
+            has_sparse=has_sparse,
+            store_dpool=store_dpool,
+        )
+        _CSA_BWD_CACHE[key] = launch
+        return launch
 
 
 def _get_preprocess(head_dim, dtype_str, block_rows):
@@ -412,6 +456,152 @@ def hca_attention_bwd_flydsl_kernel(
     return dq_out, dk_out, dv_out, dsink_out
 
 
+def csa_pool_attention_bwd_flydsl_kernel(
+    q: torch.Tensor,  # [B, H, Sq, D]
+    k_local: torch.Tensor,  # [B, HK, Sq, D]
+    v_local: torch.Tensor,  # [B, HK, Sq, D]
+    pool: torch.Tensor,  # [B, P, D]
+    topk_idxs: torch.Tensor,  # [B, Sq, K_topk]
+    out: torch.Tensor,  # [B, H, Sq, D]
+    dout: torch.Tensor,  # [B, H, Sq, D]
+    lse: torch.Tensor,  # [B, H, Sq] fp32 (raw domain)
+    *,
+    sink: Optional[torch.Tensor],
+    swa_window: int,
+    scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """CSA-from-pool backward via the FlyDSL per-row scatter-add kernel (bf16).
+
+    Returns ``(dq, dk_local, dv_local, dpool, dsink)`` in input dtype (``dsink``
+    is ``None`` when ``sink is None``). ``dpool`` is fp32-accumulated in-kernel
+    via atomic scatter-add then cast, matching the Triton reference contract.
+    """
+    if q.dim() != 4 or k_local.dim() != 4 or v_local.dim() != 4:
+        raise ValueError("rank-4 q/k_local/v_local required")
+    if pool.dim() != 3:
+        raise ValueError("rank-3 pool [B, P, D] required")
+    if topk_idxs.dim() != 3:
+        raise ValueError("rank-3 topk_idxs [B, Sq, K_topk] required")
+    if dout.shape != out.shape or out.shape != q.shape:
+        raise ValueError("shape mismatch among q / out / dout")
+    B, HQ, Sq, D = q.shape
+    HK = k_local.shape[1]
+    if HK != 1 and HK != HQ:
+        raise NotImplementedError(f"K_H must be 1 or {HQ}; got {HK}")
+    if q.dtype != torch.bfloat16:
+        raise NotImplementedError("bf16 only")
+    if int(swa_window) <= 0:
+        raise NotImplementedError("swa_window > 0 required")
+    Bp, P, Dp = pool.shape
+    K_topk = topk_idxs.shape[2]
+    if Bp != B or Dp != D or int(K_topk) <= 0:
+        raise ValueError("pool / topk_idxs shape mismatch")
+
+    dtype_str = "bf16"
+    mqa = HK == 1
+    has_sink = sink is not None
+
+    q_c = q.contiguous()
+    kl_c = k_local.contiguous()
+    vl_c = v_local.contiguous()
+    pool_c = pool.contiguous()
+    dout_c = dout.contiguous()
+    lse_c = lse.contiguous()
+    topk_i32 = topk_idxs.to(torch.int32).contiguous()
+
+    d_buf = _run_preprocess(out.contiguous(), dout_c)  # [B, HQ, Sq] fp32
+
+    dq_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
+    dk_fp32 = torch.zeros((B, HK, Sq, D), device=q.device, dtype=torch.float32)
+    dv_fp32 = torch.zeros((B, HK, Sq, D), device=q.device, dtype=torch.float32)
+    dpool_fp32 = torch.zeros((B, P, D), device=q.device, dtype=torch.float32)
+    dsink_fp32 = torch.zeros((HQ,), device=q.device, dtype=torch.float32)
+    if has_sink:
+        sink_arg = sink.to(torch.float32) if sink.dtype != torch.float32 else sink.contiguous()
+    else:
+        sink_arg = torch.zeros((HQ,), device=q.device, dtype=torch.float32)
+
+    # Split decomposition: the CSA joint softmax factors into a local SWA stream
+    # + a sparse pool stream sharing the joint LSE / delta. dpool ALWAYS uses the
+    # dedicated head-summed atomic-free partial kernel (works for MQA + MHA) to
+    # avoid the pool-row atomic contention (Sq*H*K atomics on P rows) that
+    # dominates the naive kernel.
+    #
+    # The dq/dk/dv path differs by head layout:
+    #  * MQA (K_H == 1): reuse the fast MFMA SWA dq / dkv kernels for the local
+    #    stream (fed the joint LSE, matching ``_hca_split_mask_bwd``) + the
+    #    dq-only per-row CSA sparse kernel. dsink from the SWA dq kernel.
+    #  * MHA (K_H == H): the SWA dq/dkv kernels are MQA-only, so use the
+    #    monolithic per-row CSA kernel with store_dpool=False for dq/dk/dv/dsink.
+    if mqa:
+        dq_local_launch = _get_dq(HQ, D, int(swa_window), dtype_str, True, has_sink)
+        dq_local_launch(
+            q_c, kl_c, vl_c, dout_c, lse_c, d_buf,
+            dq_fp32, dsink_fp32, sink_arg,
+            int(B), int(Sq), int(Sq),
+        )
+        dkv_local_launch = _get_dkv(HQ, D, int(swa_window), dtype_str, True)
+        dkv_local_launch(
+            q_c, kl_c, vl_c, dout_c, lse_c, d_buf,
+            dk_fp32, dv_fp32,
+            int(B), int(Sq), int(Sq),
+        )
+        # Sparse dq: dq-only per-row kernel (store_dpool=False -> no atomics).
+        dq_sparse_fp32 = torch.zeros((B, HQ, Sq, D), device=q.device, dtype=torch.float32)
+        sparse_launch = _get_csa_bwd(
+            HQ, D, int(swa_window), dtype_str, mqa, False,
+            has_local=False, has_sparse=True, store_dpool=False,
+        )
+        sparse_launch(
+            q_c.view(-1), kl_c.view(-1), vl_c.view(-1), pool_c.view(-1),
+            topk_i32.view(-1), dout_c.view(-1), lse_c.view(-1), d_buf.view(-1),
+            sink_arg.view(-1),
+            dq_sparse_fp32.view(-1), dk_fp32.view(-1), dv_fp32.view(-1),
+            dpool_fp32.view(-1), dsink_fp32.view(-1),
+            int(B), int(Sq), int(K_topk), int(P),
+        )
+        dq_fp32.add_(dq_sparse_fp32)
+    else:
+        # MHA: monolithic per-row kernel for dq/dk/dv/dsink (no dpool here).
+        mono_launch = _get_csa_bwd(
+            HQ, D, int(swa_window), dtype_str, mqa, has_sink,
+            has_local=True, has_sparse=True, store_dpool=False,
+        )
+        mono_launch(
+            q_c.view(-1), kl_c.view(-1), vl_c.view(-1), pool_c.view(-1),
+            topk_i32.view(-1), dout_c.view(-1), lse_c.view(-1), d_buf.view(-1),
+            sink_arg.view(-1),
+            dq_fp32.view(-1), dk_fp32.view(-1), dv_fp32.view(-1),
+            dpool_fp32.view(-1), dsink_fp32.view(-1),
+            int(B), int(Sq), int(K_topk), int(P),
+        )
+
+    # dpool: dedicated head-summed atomic-free partial kernel + index_add reduce.
+    k_block = int(os.environ.get("PRIMUS_V4_CSA_BWD_DPOOL_KBLOCK", "1"))
+    dpool_part = torch.zeros((B, Sq, K_topk, D), device=q.device, dtype=torch.float32)
+    dpool_launch = _get_csa_dpool(HQ, D, dtype_str, mqa, k_block)
+    dpool_launch(
+        q_c.view(-1), pool_c.view(-1), topk_i32.view(-1), dout_c.view(-1),
+        lse_c.view(-1), d_buf.view(-1), dpool_part.view(-1),
+        int(B), int(Sq), int(K_topk), int(P),
+    )
+    # Invalid slots (topk < 0 or >= P) stored 0 in the partial, so clamp their
+    # index into range for the scatter — they contribute nothing.
+    topk_flat = topk_i32.view(B, Sq * K_topk).long()
+    topk_flat = torch.where((topk_flat >= 0) & (topk_flat < P), topk_flat, torch.zeros_like(topk_flat))
+    part_flat = dpool_part.view(B, Sq * K_topk, D)
+    for b in range(B):
+        dpool_fp32[b].index_add_(0, topk_flat[b], part_flat[b])
+
+    dq_out = dq_fp32.to(q.dtype)
+    dk_out = dk_fp32.to(k_local.dtype)
+    dv_out = dv_fp32.to(v_local.dtype)
+    dpool_out = dpool_fp32.to(pool.dtype)
+    dsink_out = dsink_fp32.to(sink.dtype) if has_sink else None
+    return dq_out, dk_out, dv_out, dpool_out, dsink_out
+
+
 __all__ = [
     "hca_attention_bwd_flydsl_kernel",
+    "csa_pool_attention_bwd_flydsl_kernel",
 ]

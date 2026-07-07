@@ -41,6 +41,9 @@ os.environ.setdefault("FLYDSL_SLA_FWD_ENABLE_DMA", "1")
 os.environ.setdefault("FLYDSL_WAVES_PER_EU", "2")
 
 from primus_turbo.flydsl.attention.kernels.csa_pool_fwd_kernel import build_csa_pool_fwd_module
+from primus_turbo.flydsl.attention.kernels.csa_pool_sparse_fwd_kernel import (
+    build_csa_pool_sparse_fwd_module,
+)
 from primus_turbo.flydsl.attention.kernels.sla_fwd_kernel import build_swa_fwd_module
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -159,6 +162,117 @@ def hca_attention_fwd_flydsl_kernel(
 _CSA_POOL_KERNEL_CACHE = {}
 _CSA_POOL_KERNEL_CACHE_LOCK = threading.Lock()
 
+_CSA_SPARSE_KERNEL_CACHE = {}
+_CSA_SPARSE_KERNEL_CACHE_LOCK = threading.Lock()
+
+
+def _get_csa_sparse_kernel(num_heads_q, head_dim, dtype_str, waves_per_eu):
+    key = (num_heads_q, head_dim, dtype_str, waves_per_eu)
+    with _CSA_SPARSE_KERNEL_CACHE_LOCK:
+        if key in _CSA_SPARSE_KERNEL_CACHE:
+            return _CSA_SPARSE_KERNEL_CACHE[key]
+        launch = build_csa_pool_sparse_fwd_module(
+            num_heads=num_heads_q,
+            head_dim=head_dim,
+            dtype_str=dtype_str,
+            waves_per_eu=waves_per_eu,
+        )
+        _CSA_SPARSE_KERNEL_CACHE[key] = launch
+        return launch
+
+
+def _csa_lse_merge(o_local, lse_local, o_sparse, lse_sparse, sink):
+    """Stable joint softmax merge of the local + sparse branches (+ optional sink).
+
+    lse = ln(exp(lse_local) + exp(lse_sparse) [+ exp(sink)]); the sink enters the
+    normaliser only. out = o_local * exp(lse_local - lse) + o_sparse *
+    exp(lse_sparse - lse). Computed in fp32 for the weights, output in o dtype.
+    """
+    m = torch.maximum(lse_local, lse_sparse)
+    if sink is not None:
+        B, H, S = lse_local.shape
+        sink_bhs = sink.float().view(1, H, 1).expand(B, H, S)
+        m = torch.maximum(m, sink_bhs)
+    wl = torch.exp(lse_local - m)
+    ws = torch.exp(lse_sparse - m)
+    denom = wl + ws
+    if sink is not None:
+        denom = denom + torch.exp(sink_bhs - m)
+    inv = 1.0 / denom
+    wl = (wl * inv).unsqueeze(-1)
+    ws = (ws * inv).unsqueeze(-1)
+    out = o_local.float() * wl + o_sparse.float() * ws
+    lse = m + torch.log(denom)
+    return out.to(o_local.dtype), lse
+
+
+_csa_merge_compiled = None
+
+
+def _get_merge_fn():
+    """torch.compile the elementwise merge once (it is memory-bound; the
+    compiled fused kernel is ~8x faster than eager on the V4-Flash widths)."""
+    global _csa_merge_compiled
+    if _csa_merge_compiled is None:
+        if os.environ.get("PRIMUS_V4_CSA_MERGE_COMPILE", "1") == "1":
+            try:
+                _csa_merge_compiled = torch.compile(_csa_lse_merge)
+            except Exception:  # noqa: BLE001
+                _csa_merge_compiled = _csa_lse_merge
+        else:
+            _csa_merge_compiled = _csa_lse_merge
+    return _csa_merge_compiled
+
+
+def _csa_pool_split_forward(q, k_local, v_local, pool, topk_idxs, sink, swa_window, scale):
+    """MQA split CSA forward: local SWA + sparse head-block MFMA + LSE merge."""
+    B, HQ, Sq, D = q.shape
+    P = pool.shape[1]
+    K_topk = topk_idxs.shape[2]
+    waves_per_eu = int(os.environ.get("FLYDSL_WAVES_PER_EU", "2"))
+
+    q_c = q.contiguous()
+    pool_c = pool.contiguous()
+    topk_i32 = topk_idxs.to(torch.int32).contiguous()
+
+    # Local SWA branch (no sink; MQA K/V passed as [B, 1, Sq, D]).
+    block_m = int(os.environ.get("PRIMUS_V4_FLYDSL_BLOCK_M", "128"))
+    block_n = int(os.environ.get("PRIMUS_V4_FLYDSL_BLOCK_N", "32"))
+    fwgs_env = os.environ.get("PRIMUS_V4_FLYDSL_FWGS", "")
+    flat_work_group_size = int(fwgs_env) if fwgs_env else None
+    swa_launch = _get_swa_kernel(
+        HQ, D, int(swa_window), "bf16", block_m, block_n, waves_per_eu, True, flat_work_group_size
+    )
+    o_local = torch.empty_like(q_c)
+    lse_local = torch.zeros((B, HQ, Sq), device=q.device, dtype=torch.float32)
+    swa_launch(
+        q_c.view(-1),
+        k_local.contiguous().view(-1),
+        v_local.contiguous().view(-1),
+        o_local.view(-1),
+        lse_local.view(-1),
+        B,
+        Sq,
+    )
+
+    # Sparse pool branch (head-block MFMA, in-kernel gather).
+    sparse_launch = _get_csa_sparse_kernel(HQ, D, "bf16", waves_per_eu)
+    o_sparse = torch.empty_like(q_c)
+    lse_sparse = torch.zeros((B, HQ, Sq), device=q.device, dtype=torch.float32)
+    sparse_launch(
+        q_c.view(-1),
+        pool_c.view(-1),
+        topk_i32.view(-1),
+        o_sparse.view(-1),
+        lse_sparse.view(-1),
+        B,
+        Sq,
+        int(K_topk),
+        int(P),
+    )
+
+    return _get_merge_fn()(o_local, lse_local, o_sparse, lse_sparse, sink)
+
 
 def _get_csa_pool_kernel(num_heads_q, head_dim, swa_window, dtype_str, block_n, block_k, waves_per_eu, has_sink, mqa_kv):
     key = (num_heads_q, head_dim, swa_window, dtype_str, block_n, block_k, waves_per_eu, has_sink, mqa_kv)
@@ -231,6 +345,17 @@ def csa_pool_attention_fwd_flydsl_kernel(
 
     has_sink = sink is not None
     mqa = (HK == 1) and (HQ > 1)
+
+    # ── Split-forward path (MQA): local SWA (MFMA) + sparse head-block MFMA +
+    # host LSE merge. Mirrors the Triton P32 split. The monolithic per-row
+    # kernel is the fallback for MHA (the SWA local kernel is MQA-only) or when
+    # explicitly disabled. This is the fast path that engages the matrix cores
+    # for the sparse branch's AV step (design §4.7 / AV-MFMA).
+    _use_split = mqa and os.environ.get("PRIMUS_V4_CSA_SPLIT_FWD", "1") == "1"
+    if _use_split:
+        return _csa_pool_split_forward(
+            q, k_local, v_local, pool, topk_idxs, sink, int(swa_window), float(scale)
+        )
 
     if has_sink:
         sink_fp32 = sink.float().contiguous()
