@@ -29,6 +29,7 @@ class GroupedGemmFunc(torch.autograd.Function):
         group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
         num_cu: int | None,
+        schedule: str = "static",
     ):
         if len(group_lens) == 1:
             assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
@@ -47,11 +48,13 @@ class GroupedGemmFunc(torch.autograd.Function):
                 num_cu=num_cu,
                 default_backend=BackendType.TRITON.value,
                 maybe_pre_sync=True,
+                schedule=schedule,
             )
         ctx.save_for_backward(a, b, group_lens, group_offs)
         ctx.trans_a = False
         ctx.trans_b = trans_b
         ctx.num_cu = num_cu
+        ctx.schedule = schedule
         return out
 
     @staticmethod
@@ -91,6 +94,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_b=not ctx.trans_b,
                 num_cu=ctx.num_cu,
                 default_backend=BackendType.TRITON.value,
+                schedule=ctx.schedule,
             )
             grad_b = grouped_gemm_variable_k_impl(
                 a,
@@ -102,8 +106,9 @@ class GroupedGemmFunc(torch.autograd.Function):
                 trans_c=ctx.trans_b,
                 num_cu=ctx.num_cu,
                 default_backend=BackendType.TRITON.value,
+                schedule=ctx.schedule,
             )
-        return grad_a, grad_b, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None
 
 
 def grouped_gemm(
@@ -113,6 +118,7 @@ def grouped_gemm(
     group_offs: torch.Tensor | None = None,
     trans_b: bool = False,
     num_cu: int | None = None,
+    schedule: str = "static",
 ) -> torch.Tensor:
     """
     Grouped GEMM.
@@ -125,6 +131,19 @@ def grouped_gemm(
                                           If None, it will be computed internally.
         trans_b (bool): If True, treat each b[g] as transposed.
         num_cu (int | None): Limit the number of CUs to use. None = default.
+            Must be None when ``schedule="work_steal"`` -- the work-stealing
+            kernel was designed and tested for full-device launches, and the
+            heuristic / per-XCD slot layout assume the persistent grid spans
+            every XCD. Mixing the two raises ``ValueError``.
+        schedule (str): Persistent-loop scheduling. One of:
+            * ``"static"`` (default): static-stride persistent kernel.
+            * ``"work_steal"``: work-stealing persistent kernel with a kernel-
+              aware heuristic that picks per-XCD / global / hierarchical tile
+              claims based on tensor metadata. Triton backend only; explicit
+              selection of a non-Triton backend together with ``"work_steal"``
+              is rejected at dispatch. Internal WS sub-modes are not exposed
+              at this layer; tune via ``grouped_gemm_triton_kernel`` directly
+              when needed. Requires ``num_cu=None`` (see ``num_cu`` above).
 
     Returns:
         torch.Tensor: Output of shape [sum(group_lens), N], same dtype/device as `a`.
@@ -138,7 +157,23 @@ def grouped_gemm(
         >>> out.shape
         torch.Size([96, 64])
     """
+    if schedule == "work_steal" and num_cu is not None:
+        raise ValueError(
+            f'schedule="work_steal" requires num_cu=None, got num_cu={num_cu}. '
+            "Work-stealing is designed and tested for full-device launches; the "
+            "heuristic and per-XCD slot layout assume the persistent grid spans "
+            'every XCD. Pass num_cu=None, or use schedule="static".'
+        )
+
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)
 
-    return GroupedGemmFunc.apply(a, b, group_lens, group_offs, trans_b, num_cu)
+    return GroupedGemmFunc.apply(
+        a,
+        b,
+        group_lens,
+        group_offs,
+        trans_b,
+        num_cu,
+        schedule,
+    )

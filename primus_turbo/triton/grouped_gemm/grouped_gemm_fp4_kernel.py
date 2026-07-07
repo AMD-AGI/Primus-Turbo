@@ -35,12 +35,11 @@ import torch
 import triton
 import triton.language as tl
 
-from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     NUM_XCDS,
     _chiplet_transform_chunked,
 )
-from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
+from primus_turbo.triton.utils.triton_knobs_helper import scoped_amd_knobs
 
 # E8M0 block size: one scale per 1x32 logical-element block (same as MXFP8).
 # tl.dot_scaled consumes the "e2m1" FP4 format string (inlined in the kernels;
@@ -173,6 +172,7 @@ def _grouped_mxfp4_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_mxfp4_triton_kernel(
     a,
     a_scale,
@@ -193,8 +193,6 @@ def grouped_gemm_mxfp4_triton_kernel(
     """
     if group_offs_out is None:
         group_offs_out = group_offs
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     G = b.shape[0]
     c = torch.empty((a.shape[0], N), dtype=out_dtype, device=a.device)
     a_s = a_scale.view(torch.uint8)
@@ -360,6 +358,7 @@ def _grouped_mxfp4_variable_k_gemm_kernel(
         tl.store(C_, c, cmask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_mxfp4_variable_k_triton_kernel(
     lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=None
 ):
@@ -368,8 +367,6 @@ def grouped_gemm_mxfp4_variable_k_triton_kernel(
     lhs (OUT_M, M_total/2) fp4-packed, rhs (OUT_N, M_total/2) fp4-packed.
     go_pad: padded per-group offsets along M (each M_g a multiple of 128).
     """
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     c = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=lhs.device)
     ls = lhs_scale.view(torch.uint8)
     rs = rhs_scale.view(torch.uint8)
