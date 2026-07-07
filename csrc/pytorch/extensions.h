@@ -335,4 +335,13 @@ int64_t create_stream_with_cu_masks(const int device_id, const std::vector<uint3
 
 void destroy_stream(const int device_id, const int64_t stream_ptr);
 
+//==================================================================
+//  ODC rocSHMEM distributed backends (single-node host + multi-node GDA)
+//==================================================================
+
+#ifndef DISABLE_ROCSHMEM
+void register_odc_rocshmem_host(pybind11::module_ &m);
+void register_odc_rocshmem_gda(pybind11::module_ &m);
+#endif
+
 } // namespace primus_turbo::pytorch
