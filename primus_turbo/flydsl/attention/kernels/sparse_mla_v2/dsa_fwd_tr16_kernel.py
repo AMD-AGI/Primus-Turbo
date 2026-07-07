@@ -112,9 +112,10 @@ def build_dsa_fwd_tr16_module(
     # overhead (the dominant cost at occupancy 1). Must be a multiple of 16.
     BLOCK_K = int(os.environ.get("PRIMUS_DSA_TR16_BLOCK_K", "32"))
     assert BLOCK_K % 16 == 0
-    # QK LDS-load prefetch depth. Higher => more LDS/MFMA overlap. 3 measured best
-    # (373->376); AV prefetch depth is insensitive (kept 2).
-    _QK_PF = int(os.environ.get("PRIMUS_DSA_TR16_QK_PF", "3"))
+    # QK LDS-load prefetch depth. Higher => more LDS/MFMA overlap. 6 measured best
+    # for H128 (376->404 K512, 388->420 K2048, ~+7%); H64 flat; >=8 regresses H64
+    # (VGPR pressure from too many live A-packs). AV prefetch depth insensitive (2).
+    _QK_PF = int(os.environ.get("PRIMUS_DSA_TR16_QK_PF", "6"))
     K_CHUNKS = HEAD_DIM // 32   # QK d-contraction chunks (16)
     D_TILES = HEAD_DIM // 16    # AV output d-tiles (32)
     N_SUB = BLOCK_K // 16       # QK key sub-tiles (16 keys each)
