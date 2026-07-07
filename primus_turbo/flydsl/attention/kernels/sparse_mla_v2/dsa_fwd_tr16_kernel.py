@@ -138,7 +138,13 @@ def build_dsa_fwd_tr16_module(
     # fetch col is compensated on BOTH the QK vec8 read and the PV ds_read_tr read
     # (single shared tile serves both). Coop path keeps the +4 pad, no swizzle.
     _USE_DMA = os.environ.get("PRIMUS_DSA_TR16_DMA", "0") == "1"
-    V_STRIDE = HEAD_DIM if _USE_DMA else HEAD_DIM + 4
+    # kv-tile row pad to break ds_read_tr LDS bank conflicts. The old +4 was far too
+    # small for the transpose read stride: +16 measured +30% (H64 385->499, H128
+    # 412->542, K2048 430->578) and flips fwd to BEAT gluon on all shapes. Swept:
+    # +16 optimal (ties +48 but uses less LDS); +64 (power-of-2 alias) regresses hard;
+    # +0 collapses to 223 (full conflict). kv tile @ +16 = 32*528*2 = 33.8KB << 160KB.
+    _v_pad = int(os.environ.get("PRIMUS_DSA_TR16_V_PAD", "16"))
+    V_STRIDE = HEAD_DIM if _USE_DMA else HEAD_DIM + _v_pad
     _LDS_LIMIT = 163840
     # Optionally stage Q in LDS (frees the 64 persistent q_packs VGPR -> occ 2).
     _Q_IN_LDS = os.environ.get("PRIMUS_DSA_TR16_QLDS", "0") == "1"
