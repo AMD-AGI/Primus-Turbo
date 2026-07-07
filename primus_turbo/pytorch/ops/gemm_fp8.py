@@ -735,14 +735,14 @@ def gemm_fp8(
         config = Float8QuantConfig()
 
     if isinstance(a, QuantizedTensorPair):
-        a_data, a_data_colwise = a.data_rowwise, a.data_colwise
+        a_data, a_data_t = a.data, a.data_t
     else:
-        a_data, a_data_colwise = a, None
+        a_data, a_data_t = a, None
 
     if isinstance(b, QuantizedTensorPair):
-        b_data, b_data_colwise = b.data_rowwise, b.data_colwise
+        b_data, b_data_t = b.data, b.data_t
     else:
-        b_data, b_data_colwise = b, None
+        b_data, b_data_t = b, None
 
     assert a_data.ndim == 2, "Only 2D tensors are supported"
     assert b_data.ndim == 2, "Only 2D tensors are supported"
@@ -752,11 +752,11 @@ def gemm_fp8(
 
     if config.granularity == ScalingGranularity.TENSORWISE:
         return FP8GemmTensorFunction.apply(
-            a_data, b_data, a_data_colwise, b_data_colwise, trans_a, trans_b, out_dtype, config
+            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config
         )
     elif config.granularity == ScalingGranularity.ROWWISE:
         return FP8GemmRowFunction.apply(
-            a_data, b_data, a_data_colwise, b_data_colwise, trans_a, trans_b, out_dtype, config
+            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config
         )
     elif config.granularity == ScalingGranularity.BLOCKWISE:
         # BLOCKWISE does not yet support pre-quantized inputs; preserve the
@@ -764,7 +764,7 @@ def gemm_fp8(
         return FP8GemmBlockFunction.apply(a, b, trans_a, trans_b, out_dtype, config)
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
         return FP8GemmMXFunction.apply(
-            a_data, b_data, a_data_colwise, b_data_colwise, trans_a, trans_b, out_dtype, config
+            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config
         )
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

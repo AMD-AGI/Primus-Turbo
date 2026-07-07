@@ -792,19 +792,19 @@ class QuantizedTensorPair(NamedTuple):
     Wrapper for quantized tensors.
 
     Args:
-        data_rowwise: Row-wise quantized tensor.
-        data_colwise: Column-wise quantized tensor.
+        data: Row-wise quantized tensor.
+        data_t: Column-wise quantized tensor.
     """
 
-    data_rowwise: QuantizedTensor
-    data_colwise: Optional[QuantizedTensor] = None
+    data: QuantizedTensor
+    data_t: Optional[QuantizedTensor] = None
 
 
 def create_quantized_weight(
     weight,
     dest_dtype: torch.dtype,
     quant_config: Union[Float4QuantConfig, Float8QuantConfig],
-    need_cache_colwise: bool = False,
+    need_weight_transpose_cache: bool = False,
 ) -> Tuple[QuantizedTensor, Optional[QuantizedTensor]]:
     def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
         if isinstance(quant_config, Float4QuantConfig):
@@ -832,7 +832,7 @@ def create_quantized_weight(
     )
 
     quantized_weight_colwise = None
-    if need_cache_colwise:
+    if need_weight_transpose_cache:
         granularity = quant_config.granularity
         if granularity == ScalingGranularity.TENSORWISE:
             quantized_weight_colwise = quantized_weight_rowwise.transpose(-2, -1)
