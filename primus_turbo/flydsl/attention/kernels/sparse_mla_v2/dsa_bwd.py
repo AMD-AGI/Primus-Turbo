@@ -199,8 +199,10 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
             )
             _t0 = _t1
     else:
-        # BH_DKV=32/TK_DKV=64 whole-top-k (R_CHUNK=TOPK) in one dKV-intermediate pass.
-        BH_DKV, TK_DKV = 32, 64
+        # BH_DKV/TK_DKV whole-top-k (R_CHUNK=TOPK) in one dKV-intermediate pass.
+        BH_DKV = int(os.environ.get("PRIMUS_DSA_DKV_BH", "32"))
+        TK_DKV = int(os.environ.get("PRIMUS_DSA_DKV_TK", "64"))
+        _NW_DKV = int(os.environ.get("PRIMUS_DSA_DKV_NW", "8"))
         num_hg_dkv = triton.cdiv(num_heads, BH_DKV)
         _bwd_compute_dkv_intermediate[(total_tokens,)](
             q,
@@ -224,7 +226,7 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
             D_V=D,
             D_ROPE=rope_rank,
             HAS_ROPE=HAS_ROPE,
-            num_warps=4,
+            num_warps=_NW_DKV,
         )
 
     dkv_acc = torch.zeros(num_kv, d_qk, dtype=torch.float32, device=q.device)
