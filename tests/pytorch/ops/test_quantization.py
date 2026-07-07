@@ -136,15 +136,42 @@ def padding_size(n: int, padding_align_size: int) -> int:
     return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
 
 
+def mxfp8_padded_ref(x: torch.Tensor, axis: int, padding_align_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """Build zero-padded reference matching MXFP8 quantize/dequantize padding."""
+    if x.dim() == 2:
+        if axis == 0:
+            # Colwise: dequant output [M_pad, N].
+            pad_amt = padding_size(x.size(0), padding_align_size)
+            zeros = torch.zeros(pad_amt, x.size(1), device=x.device, dtype=dtype)
+            return torch.cat([x, zeros], dim=0)
+        # Rowwise: dequant output [M, N_pad].
+        pad_amt = padding_size(x.size(1), padding_align_size)
+        zeros = torch.zeros(x.size(0), pad_amt, device=x.device, dtype=dtype)
+        return torch.cat([x, zeros], dim=1)
+
+    # 3D batched [B, M, N]
+    if axis == 1:
+        # Colwise: quant/dequant layout [B, N, M_pad].
+        x_bn = x.transpose(1, 2).contiguous()
+        pad_amt = padding_size(x_bn.size(2), padding_align_size)
+        zeros = torch.zeros(x_bn.size(0), x_bn.size(1), pad_amt, device=x.device, dtype=dtype)
+        return torch.cat([x_bn, zeros], dim=2)
+    # Rowwise (axis == 2): dequant output [B, M, N_pad].
+    pad_amt = padding_size(x.size(2), padding_align_size)
+    zeros = torch.zeros(x.size(0), x.size(1), pad_amt, device=x.device, dtype=dtype)
+    return torch.cat([x, zeros], dim=2)
+
+
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("B", [1, 4])
 @pytest.mark.parametrize("M", [32, 64, 256, 1024])
 @pytest.mark.parametrize("N", [32, 64, 256, 1024])
 @pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("use_2d_block", [True, False])
-def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_2d_block):
+def test_quantize_mxfp8(orig_dtype, dest_dtype, batched, B, M, N, axis, granularity, use_2d_block):
     padding_align_size = 128
 
     # Skip unit test on gfx942.
@@ -155,49 +182,26 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
     MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
 
-    x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-
-    row_length = x.size(-1)
-    x_2d = x.view(-1, row_length)
-    if padding_align_size is not None:
-        if axis == 0:
-            x_2d_ref = torch.cat(
-                [
-                    x_2d,
-                    torch.zeros(
-                        padding_size(x_2d.size(0), padding_align_size),
-                        x_2d.size(1),
-                        device=x.device,
-                        dtype=orig_dtype,
-                    ),
-                ],
-                dim=axis,
-            )
-        else:
-            x_2d_ref = torch.cat(
-                [
-                    x_2d,
-                    torch.zeros(
-                        x_2d.size(0),
-                        padding_size(x_2d.size(1), padding_align_size),
-                        device=x.device,
-                        dtype=orig_dtype,
-                    ),
-                ],
-                dim=axis,
-            )
+    if batched:
+        x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
+        # 3D MXFP8: axis 1 = colwise, axis 2 = rowwise (inner-K).
+        quantize_axis = axis + 1
     else:
-        x_2d_ref = x_2d
+        x = torch.randn((M, N), device="cuda", dtype=orig_dtype)
+        # 2D MXFP8: axis 0 = colwise, axis 1 = rowwise.
+        quantize_axis = axis
+
+    x_ref = mxfp8_padded_ref(x, quantize_axis, padding_align_size, orig_dtype)
 
     scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,
     )
 
     x_fp8, x_scale_inv = quantize_fp8(
-        x_2d,
+        x,
         dest_dtype,
         granularity=granularity,
-        axis=axis,
+        axis=quantize_axis,
         block_size=MX_BLOCK_SIZE,
         scaling_recipe=scaling_recipe,
     )
@@ -208,12 +212,12 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, B, M, N, axis, granularity, use_
         orig_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,
-        axis=axis,
+        axis=quantize_axis,
         scale_inv=x_scale_inv,
         scaling_recipe=scaling_recipe,
     )
 
-    torch.testing.assert_close(x_2d_ref, out, **get_tolerances(dest_dtype))
+    torch.testing.assert_close(x_ref, out, **get_tolerances(dest_dtype))
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])

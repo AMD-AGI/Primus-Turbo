@@ -452,9 +452,8 @@ class TestGroupSpecific:
 
     @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GROUPED_GRAN_CASES)
     def test_group_lens_and_offs(self, granularity, block_size, dest_dtype):
-        """``group_lens`` is preserved; ``group_offs`` is derived as a
-        cumulative-sum (with a leading 0).  In the new implementation the
-        offsets are eagerly materialised inside ``__new__``.
+        """Compact ``_orig_group_lens`` / ``_orig_group_offs`` are preserved;
+        padded ``group_lens`` / ``group_offs`` come from the quantize kernel.
         """
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
         group_lens = _make_group_lens()
@@ -466,10 +465,10 @@ class TestGroupSpecific:
             group_lens=group_lens,
         )
 
-        assert torch.equal(qt.group_lens, group_lens)
-        # ``group_offs`` matches a fresh prefix-sum.
-        assert torch.equal(qt.group_offs, group_offs_from_lens(group_lens))
-        # And it is already materialised (no lazy fallback needed).
+        assert torch.equal(qt._orig_group_lens, group_lens)
+        assert torch.equal(qt._orig_group_offs, group_offs_from_lens(group_lens))
+        assert qt._orig_group_offs is not None
+        assert qt._group_lens is not None
         assert qt._group_offs is not None
 
     def test_uneven_group_lens(self):
@@ -479,8 +478,8 @@ class TestGroupSpecific:
         assert int(lens.sum().item()) == M
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
         qt = _make_quantized_tensor(x, granularity=ScalingGranularity.ROWWISE, group_lens=lens)
-        assert torch.equal(qt.group_lens, lens)
-        assert torch.equal(qt.group_offs, group_offs_from_lens(lens))
+        assert torch.equal(qt._orig_group_lens, lens)
+        assert torch.equal(qt._orig_group_offs, group_offs_from_lens(lens))
 
 
 # ---------------------------------------------------------------------
@@ -528,9 +527,9 @@ class TestGroupedSerialization:
         # Inner-tensor keys: data/scale + grouped buffers.
         assert "_data" in keys
         assert "_scale_inv" in keys
+        assert "_orig_group_lens" in keys
+        assert "_orig_group_offs" in keys
         assert "_group_lens" in keys
-        # ``_group_offs`` is eagerly materialised in ``__new__`` and must
-        # therefore be part of the flatten payload.
         assert "_group_offs" in keys
 
         # Metadata: includes scaling_recipe and the grouped predicate.
@@ -554,6 +553,8 @@ class TestGroupedSerialization:
         assert torch.equal(qt2._data, qt._data)
         assert torch.equal(qt2._scale_inv, qt._scale_inv)
         # group metadata round-trips: lens preserved and offs preserved.
+        assert torch.equal(qt2._orig_group_lens, qt._orig_group_lens)
+        assert torch.equal(qt2._orig_group_offs, qt._orig_group_offs)
         assert torch.equal(qt2.group_lens, qt.group_lens)
         assert torch.equal(qt2.group_offs, qt.group_offs)
 
@@ -606,13 +607,8 @@ class TestGroupedViewFunc:
 
     @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GROUPED_GRAN_CASES)
     def test_view_group_metadata_propagated(self, granularity, block_size, dest_dtype):
-        """``group_lens`` / ``group_offs`` flow through ``_make_like`` —
-        the viewed wrapper shares the same tensors as the source.
-
-        Since ``__new__`` now eagerly materialises ``_group_offs``, both the
-        source and the viewed wrapper already hold the same offsets tensor
-        and pointer identity is preserved through ``_make_like``.
-        """
+        """Grouped metadata flows through ``_make_like`` — the viewed wrapper
+        shares the same compact / padded tensors as the source."""
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
         group_lens = _make_group_lens()
         qt = _make_quantized_tensor(
@@ -625,5 +621,7 @@ class TestGroupedViewFunc:
 
         viewed = qt.view(M, N)
 
+        assert viewed._orig_group_lens.data_ptr() == qt._orig_group_lens.data_ptr()
+        assert viewed._orig_group_offs.data_ptr() == qt._orig_group_offs.data_ptr()
         assert viewed.group_lens.data_ptr() == qt.group_lens.data_ptr()
         assert viewed.group_offs.data_ptr() == qt.group_offs.data_ptr()

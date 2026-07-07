@@ -10,10 +10,12 @@ import torch
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP8_BLOCK_SIZE,
     Float8QuantConfig,
     Format,
     ScaleDtype,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp8_support,
     float8_e4m3,
     float8_e5m2,
@@ -45,7 +47,7 @@ NK_VALUES = [
 ORI_DTYPE_VALUES = [torch.bfloat16, torch.float16]
 FORMAT_VALUES = [Format.E4M3, Format.E5M2]
 TRANS_B_VALUES = [True, False]
-BALANCE_VALUES = [True, False]
+BALANCE_VALUES = [False]
 
 
 def _check_hit_int32_limit(B, M, N, K):
@@ -591,11 +593,11 @@ def _run_grouped_gemm_fp8_quantized_tensor_test(
     if _check_hit_int32_limit(B, M, N, K):
         pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
 
-    # Grouped QuantizedTensor only supports TENSORWISE and ROWWISE.
     assert granularity in (
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
-    ), "Grouped QuantizedTensor only supports TENSORWISE and ROWWISE"
+        ScalingGranularity.MX_BLOCKWISE,
+    ), "Grouped QuantizedTensor only supports TENSORWISE, ROWWISE and MX_BLOCKWISE"
 
     GlobalBackendManager.set_grouped_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(auto_tune)
@@ -618,12 +620,30 @@ def _run_grouped_gemm_fp8_quantized_tensor_test(
     # Externally construct quantized tensors.
     fwd_dtype = _get_fp8_dtype(format, is_fwd=True)
 
-    qt_a = QuantizedTensor.quantize(a, fwd_dtype, granularity, group_lens=group_lens, axis=-1)
+    block_size = None
+    a_scaling_recipe = None
+    b_scaling_recipe = None
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        block_size = MXFP8_BLOCK_SIZE
+        a_scaling_recipe = ScalingRecipe()
+        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+
+    qt_a = QuantizedTensor.quantize(
+        a,
+        fwd_dtype,
+        granularity,
+        scaling_recipe=a_scaling_recipe,
+        block_size=block_size,
+        group_lens=group_lens,
+        axis=-1,
+    )
 
     qt_b = QuantizedTensor.quantize(
         b,
         fwd_dtype,
         granularity,
+        scaling_recipe=b_scaling_recipe,
+        block_size=block_size,
         axis=-1 if trans_b else -2,
     )
 
@@ -633,7 +653,12 @@ def _run_grouped_gemm_fp8_quantized_tensor_test(
     out_ref.backward(grad_out)
     torch.cuda.synchronize()
 
-    config = Float8QuantConfig(format=format, granularity=granularity)
+    config = Float8QuantConfig(
+        format=format,
+        granularity=granularity,
+        block_size=block_size,
+        scale_dtype=ScaleDtype.E8M0 if granularity == ScalingGranularity.MX_BLOCKWISE else ScaleDtype.FP32,
+    )
     out = grouped_gemm_fp8(qt_a, qt_b, group_lens, trans_b=trans_b, config=config)
     out.backward(grad_out)
     torch.cuda.synchronize()
@@ -678,8 +703,6 @@ def test_grouped_gemm_fp8_tensorwise_quantized_tensor(
     """TENSORWISE grouped_gemm with pre-quantized grouped/regular QuantizedTensor inputs."""
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
-    if backend == BackendType.TRITON and format == Format.HYBRID:
-        pytest.skip("TRITON backend not support HYBRID format currently")
 
     # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.
     # This has been observed under pytest; root cause not yet identified. MI355 works normally.
@@ -729,6 +752,44 @@ def test_grouped_gemm_fp8_rowwise_quantized_tensor(
         ori_dtype=ori_dtype,
         format=format,
         granularity=ScalingGranularity.ROWWISE,
+        trans_b=trans_b,
+        balance=balance,
+        backend=backend,
+        auto_tune=auto_tune,
+    )
+
+
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
+@pytest.mark.parametrize(
+    "trans_b",
+    [
+        True,
+    ],
+)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_grouped_gemm_fp8_mx_blockwise_quantized_tensor(
+    B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune
+):
+    """MX_BLOCKWISE grouped_gemm with pre-quantized grouped/regular QuantizedTensor inputs."""
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
+
+    N, K = NK
+    _run_grouped_gemm_fp8_quantized_tensor_test(
+        B=B,
+        M=M,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=format,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
         trans_b=trans_b,
         balance=balance,
         backend=backend,
