@@ -1068,3 +1068,78 @@ def test_grouped_gemm_fp8_blockwise_zero_group_lens():
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+
+def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
+    """Fill and free caching-allocator blocks of ``shape`` with ``sentinel`` so a
+    subsequent same-shape allocation reuses a dirty (non-zero) block instead of a
+    fresh, driver-zeroed page. Lets us detect output regions the kernel never wrote."""
+    blocks = [torch.full(shape, sentinel, dtype=dtype, device=device) for _ in range(n)]
+    for x in blocks:
+        x.add_(0.0)
+    del blocks
+
+
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize(
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
+def test_grouped_gemm_fp8_padded_rows_zero_init(ori_dtype, trans_b, backend):
+    """issue #397: the FP8 grouped-GEMM forward only writes output rows
+    ``[0, sum(group_lens))``. When ``M_total = a.size(0) > sum(group_lens)`` the
+    trailing rows must be zero-initialized, not leftover caching-allocator garbage
+    (frequently NaN/Inf, which non-deterministically corrupts MoE gradients).
+
+    This is not hypothetical: the MoE token dispatcher run with
+    ``permute_max_token_num > 0`` (fixed-capacity permute, used to drop the
+    device->host sync for CUDA-graph / static-shape capture) over-allocates the
+    permuted activation buffer to a fixed capacity, so the real token count
+    ``sum(group_lens)`` is strictly less than ``a.size(0)`` (see
+    ``moe_permute``: ``permuted_tokens = torch.empty((num_permuted_tokens, H))``).
+
+    All four backends skip the trailing rows (each writes only ``[0, sum)``), so
+    all four must zero-init the output; this test covers every one.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
+
+    torch.manual_seed(42)
+    device = "cuda:0"
+    G, K, N = 8, 2048, 2880
+    group_lens = torch.tensor([4096, 0, 3072, 0, 0, 5120, 0, 0], dtype=torch.int64, device=device)
+    S = int(group_lens.sum())
+    PAD = 224
+    M_total = S + PAD  # simulate FP8-padded activation rows
+    sentinel = 12288.0  # exactly representable in bf16 and fp16
+    print(f"\nori_dtype={ori_dtype}, trans_b={trans_b}, backend={backend}, S={S}, M_total={M_total}")
+
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    config = Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE)
+
+    b_shape = (G, N, K) if trans_b else (G, K, N)
+    a = torch.randn((M_total, K), dtype=ori_dtype, device=device)
+    b = torch.randn(b_shape, dtype=ori_dtype, device=device)
+
+    # Warm up (JIT/autotune), then poison the pool so any unwritten padding rows
+    # surface the sentinel instead of a fresh zeroed page.
+    grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+    torch.cuda.synchronize()
+    _poison_alloc_pool((M_total, N), ori_dtype, device, sentinel)
+
+    out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+    torch.cuda.synchronize()
+
+    pad_rows = out[S:M_total]
+    assert torch.isfinite(pad_rows).all(), f"{backend.name}: padding rows non-finite (#397)"
+    torch.testing.assert_close(
+        pad_rows,
+        torch.zeros_like(pad_rows),
+        rtol=0.0,
+        atol=0.0,
+        msg=f"{backend.name}: padding rows [{S}:{M_total}] must be zero-initialized (#397)",
+    )
+
+    GlobalBackendManager.reset()

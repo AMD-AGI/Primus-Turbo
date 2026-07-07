@@ -40,6 +40,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic import (
     resolve_ck_ws_local_per_xcd,
 )
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+    grouped_gemm_output_tail_kernel,
     grouped_gemm_triton_kernel,
     grouped_gemm_variable_k_triton_kernel,
 )
@@ -495,7 +496,9 @@ def grouped_gemm_impl(
         schedule=schedule,
     )
 
-    return GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = grouped_gemm_output_tail_kernel(out, group_offs)
+    return out
 
 
 @_torch_custom_op_wrapper("primus_turbo::grouped_gemm_variable_k_impl", mutates_args=(), device_types="cuda")
