@@ -830,12 +830,12 @@ def grouped_gemm_fp8(
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)
     if isinstance(a, QuantizedTensorPair):
-        a_data, a_data_t = a.data_rowwise, a.data_t
+        a_data, a_data_t = a.data, a.data_t
     else:
         a_data, a_data_t = a, None
 
     if isinstance(b, QuantizedTensorPair):
-        b_data, b_data_t = b.data_rowwise, b.data_t
+        b_data, b_data_t = b.data, b.data_t
     else:
         b_data, b_data_t = b, None
 

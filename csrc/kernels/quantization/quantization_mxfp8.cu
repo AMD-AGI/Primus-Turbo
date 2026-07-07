@@ -625,13 +625,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
     // 4 warps process 4 chunks in parallel.
     for (int round = 0; round < TOTAL_CHUNKS; round += WARPS_PER_BLOCK) {
         const int chunk_idx = round + warp_id;
-        if (chunk_idx >= TOTAL_CHUNKS)
-            break;
+        const bool warp_active = (chunk_idx < TOTAL_CHUNKS);
 
-        const int chunk_m = chunk_idx / NUM_CHUNKS_N;
-        const int chunk_n = chunk_idx % NUM_CHUNKS_N;
+        const int chunk_m = warp_active ? (chunk_idx / NUM_CHUNKS_N) : 0;
+        const int chunk_n = warp_active ? (chunk_idx % NUM_CHUNKS_N) : 0;
         const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
         const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
+        if (warp_active) {
 
         // ================================================================
         // Load Tile: Global → smem + packed regs
@@ -783,7 +783,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
         }
 
         // Colwise quantization read val from smem. Need  wait smem write to finish.
+        } // end if (warp_active)
         __syncthreads();
+        if (warp_active) {
 
         // ================================================================
         // Colwise Quantization (Vertical Processing)
@@ -900,6 +902,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
                 }
             }
         }
+        } // end if (warp_active)
     }
 
     // ========================================================================
@@ -1379,13 +1382,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_d
 
     for (int round = 0; round < TOTAL_CHUNKS; round += WARPS_PER_BLOCK) {
         const int chunk_idx = round + warp_id;
-        if (chunk_idx >= TOTAL_CHUNKS)
-            break;
+        const bool warp_active = (chunk_idx < TOTAL_CHUNKS);
 
-        const int chunk_m = chunk_idx / NUM_CHUNKS_N;
-        const int chunk_n = chunk_idx % NUM_CHUNKS_N;
+        const int chunk_m = warp_active ? (chunk_idx / NUM_CHUNKS_N) : 0;
+        const int chunk_n = warp_active ? (chunk_idx % NUM_CHUNKS_N) : 0;
         const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
         const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
+        if (warp_active) {
 
         // ---------------- Load tile (input row remap + zero pad) -----------------
         uint64_t r_tile[PASSES_PER_TILE];
@@ -1534,7 +1537,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_d
             }
         }
 
+        } // end if (warp_active)
         __syncthreads();
+        if (warp_active) {
 
         // ---------------- Colwise: amax + scale (with zero-amax safe path) -------
         float r_colwise_vals[PASSES_PER_TILE][ELEMS_PER_THREAD];
@@ -1647,6 +1652,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_d
                 }
             }
         }
+        } // end if (warp_active)
     }
 
     // Coalesced colwise FP8/scale write-out from LDS (non-shuffle path).

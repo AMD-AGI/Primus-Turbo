@@ -315,6 +315,10 @@ def get_common_flags():
     cxx_flags += offload_arch_list  # hipcc needs --offload-arch for CK headers in .cpp files
     nvcc_flags += macro_arch_list
     nvcc_flags += offload_arch_list
+    # With -fgpu-rdc the final device code is produced at the --hip-link step, which
+    # must also receive --offload-arch or it defaults to gfx906. Propagate it to the
+    # linker so libprimus_turbo_kernels.so embeds the requested arch (e.g. gfx1250).
+    extra_link_args += offload_arch_list
 
     # Composable-Kernel / MFMA backend: define the guard macro only when the backend is built.
     if build_ck_backend():
