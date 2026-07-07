@@ -777,6 +777,9 @@ def test_grouped_gemm_fp8_mx_blockwise_quantized_tensor(
     B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune
 ):
     """MX_BLOCKWISE grouped_gemm with pre-quantized grouped/regular QuantizedTensor inputs."""
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
 
     N, K = NK
     _run_grouped_gemm_fp8_quantized_tensor_test(
