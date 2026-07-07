@@ -222,8 +222,14 @@ def build_dsa_bwd_dq_m16_module(
         def store_f16(val, base_p, elem_idx):
             _llvm.StoreOp(val, _gep(base_p, elem_idx, f16_ty))
 
+        def store_f16_v(val_vec, base_p, elem_idx):
+            _llvm.StoreOp(val_vec, _gep(base_p, elem_idx, f16_ty))
+
         def lds_store1(val, idx):
             vector.store(vector.from_elements(T.vec(1, f16_ty), [val]), lds, [idx])
+
+        def lds_store_v4(val_vec, idx):
+            vector.store(val_vec, lds, [idx])
 
         tok = arith.index_cast(T.index, gpu.block_idx.x)
         pid_wg_hblk = arith.index_cast(T.index, gpu.block_idx.y)
@@ -403,6 +409,8 @@ def build_dsa_bwd_dq_m16_module(
                 s_regs = [vector.extract(s_acc, static_position=[r], dynamic_position=[]) for r in range_constexpr(4)]
                 dp_regs = [vector.extract(dp_acc, static_position=[r], dynamic_position=[]) for r in range_constexpr(4)]
                 ds_row = []
+                ds16_row = []
+                p16_row = []
                 for r in range_constexpr(4):
                     # this lane/r owns key = s*16 + (L//16)*4 + r; head = L%16
                     kloc_i32 = arith.AddIOp(
@@ -419,19 +427,27 @@ def build_dsa_bwd_dq_m16_module(
                     dp_md = arith.SubFOp(dp_regs[r], delta_val, fastmath=fm_fast).result
                     ds_r = arith.MulFOp(arith.MulFOp(p_r, dp_md, fastmath=fm_fast).result, c_sm_scale_f, fastmath=fm_fast).result
                     ds_row.append(ds_r)
-                    # store dS, P to [T,H,TOPK] for the dKV kernel (per owned key)
-                    kloc_idx = arith.index_cast(T.index, kloc_i32)
-                    kv_pos = k_start + kloc_idx
-                    dsp_idx = (tok_safe * NH + my_head) * TOPK_I + kv_pos
-                    _if_st = scf.IfOp(q_valid, [], has_else=False)
-                    with ir.InsertionPoint(_if_st.then_block):
-                        store_f16(arith.trunc_f(f16_ty, ds_r), ds_ptr, dsp_idx)
-                        store_f16(arith.trunc_f(f16_ty, p_r), pout_ptr, dsp_idx)
-                        scf.YieldOp([])
-                    # also store dS into LDS p-region (B-operand for the dQ AV MFMA)
-                    lds_pidx = c_lds_p + lane_mod_16 * arith.index(BLOCK_K) + kloc_idx
-                    lds_store1(arith.trunc_f(f16_ty, ds_r), lds_pidx)
+                    ds16_row.append(arith.trunc_f(f16_ty, ds_r))
+                    p16_row.append(arith.trunc_f(f16_ty, p_r))
                 ds_owned.append(ds_row)
+                # The 4 keys r=0..3 are CONTIGUOUS (key = ...+r) in HBM [T,H,TOPK] and
+                # LDS p-region -> coalesce the 8 scalar stores into vec4 stores.
+                ds_vec = vector.from_elements(T.vec(4, f16_ty), ds16_row)
+                p_vec = vector.from_elements(T.vec(4, f16_ty), p16_row)
+                kloc0_i32 = arith.AddIOp(
+                    arith.constant(s * 16, type=T.i32),
+                    arith.MulIOp(lane_div_16_i32, arith.constant(4, type=T.i32)).result).result
+                kloc0_idx = arith.index_cast(T.index, kloc0_i32)
+                kv_pos0 = k_start + kloc0_idx
+                dsp_idx0 = (tok_safe * NH + my_head) * TOPK_I + kv_pos0
+                _if_st = scf.IfOp(q_valid, [], has_else=False)
+                with ir.InsertionPoint(_if_st.then_block):
+                    store_f16_v(ds_vec, ds_ptr, dsp_idx0)
+                    store_f16_v(p_vec, pout_ptr, dsp_idx0)
+                    scf.YieldOp([])
+                # dS into LDS p-region (B-operand for the dQ AV MFMA), vec4 contiguous
+                lds_pidx0 = c_lds_p + lane_mod_16 * arith.index(BLOCK_K) + kloc0_idx
+                lds_store_v4(ds_vec, lds_pidx0)
 
             _lds_fence()
 
