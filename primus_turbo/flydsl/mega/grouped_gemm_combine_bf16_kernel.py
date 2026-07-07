@@ -29,8 +29,8 @@ from primus_turbo.flydsl.mega.prims import (
     read_clock,
     spin_timed_out,
 )
-from primus_turbo.flydsl.mega.sym_layout import SymLayout
-from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.tune_utils import _suppress_stdout_stderr
 from primus_turbo.flydsl.utils.gemm_helper import _emit_if_then, make_value_attrs
 
 _WARP = 64
@@ -107,9 +107,9 @@ def _make_grouped_gemm_combine(
         expected_combine_i64 = _i64(expected_combine)
         expected_reduce_i64 = _i64(expected_reduce)
 
-        combine_flag_base = sym_layout.combine_flag_ptr
-        comb_base = sym_layout.combine_token_buffer_ptr
-        reduce_flag_base = sym_layout.reduce_flag_ptr
+        combine_flag_base = sym_layout.combine_flag
+        comb_base = sym_layout.combine_token_buffer
+        reduce_flag_base = sym_layout.reduce_flag
         # bf16 pointer type for per-tile int64 base advance (see else branch)
         tile_ptr_ty = PointerType.get(
             elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
@@ -118,16 +118,16 @@ def _make_grouped_gemm_combine(
         # recv-segment table for task-based (sustained-peer) combine push
         seg_bytes = num_experts * 4
         recv_dst_rank_res = create_buffer_resource_from_addr(
-            sym_layout.combine_recv_dst_rank_ptr, num_records_bytes=seg_bytes
+            sym_layout.combine_recv_dst_rank, num_records_bytes=seg_bytes
         )
         recv_start_row_res = create_buffer_resource_from_addr(
-            sym_layout.combine_recv_start_row_ptr, num_records_bytes=seg_bytes
+            sym_layout.combine_recv_start_row, num_records_bytes=seg_bytes
         )
         recv_count_res = create_buffer_resource_from_addr(
-            sym_layout.combine_recv_count_ptr, num_records_bytes=seg_bytes
+            sym_layout.combine_recv_count, num_records_bytes=seg_bytes
         )
         origin_slot_res = create_buffer_resource_from_addr(
-            sym_layout.pool_src_slot_ptr, num_records_bytes=num_max_pool_tokens * 4
+            sym_layout.pool_src_slot, num_records_bytes=num_max_pool_tokens * 4
         )
 
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
@@ -138,7 +138,7 @@ def _make_grouped_gemm_combine(
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
         real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
         grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
-        gate_base = sym_layout.combine_gate_ptr if with_gate else None
+        gate_base = sym_layout.combine_gate if with_gate else None
         gate_local_res = (
             create_buffer_resource_from_addr(gate_base, num_records_bytes=gate_records) if with_gate else None
         )
@@ -218,7 +218,7 @@ def _make_grouped_gemm_combine(
                     fx.make_layout(BLOCK_M * K, 1),
                 )
                 l2_tile = fx.make_view(
-                    fx.inttoptr(tile_ptr_ty, sym_layout.l2_token_buffer_ptr + c_byte_off),
+                    fx.inttoptr(tile_ptr_ty, sym_layout.l2_token_buffer + c_byte_off),
                     fx.make_layout(BLOCK_M * out_features, 1),
                 )
                 gemm_tile(
@@ -311,7 +311,7 @@ def _rewind_combine_flags(kwargs):
 
 
 @autotune(
-    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64) for rc in (128, 256, 512)],
+    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64) for rc in (256, 512)],
     # layout_code MUST be a key: nt/nn have OPPOSITE combine_cu optima (see wrapper note).
     key=[
         "out_features",
@@ -329,6 +329,7 @@ def _rewind_combine_flags(kwargs):
         "out_fp16",
     ],
     warmup=0,
+    rep=5,
     post_hook=_rewind_combine_flags,
 )
 @flyc.jit
@@ -426,7 +427,7 @@ def grouped_gemm_combine_bf16(
     assert topk_indices is not None, "topk reduce needs topk_indices"
     tile_to_expert = handle[5]
     symm = get_symm_buffer_for_mega_moe()
-    sym_layout = symm.make_sym_layout()
+    sym_layout = symm.get_sym_layout()
     if layout == "tn":
         hidden_size, num_max_pool_tokens = x.shape
     else:
@@ -480,35 +481,36 @@ def grouped_gemm_combine_bf16(
     # num_combine_cu / num_reduce_cu are @autotune-swept per shape+layout (nt/nn have
     # OPPOSITE combine_cu optima -> layout_code is in the autotune key). host next_combine
     # above stays here; the tuning post_hook only rewinds the never-reset flags.
-    _compiled_grouped_gemm_combine(
-        act_2d,
-        weight_flat,
-        tile_to_expert,
-        num_tile_blocks,
-        output_d,
-        topk_indices_d,
-        num_tokens_d,
-        topk_weights_d,
-        grad_gate_d,
-        d_topk_w_d,
-        sym_layout,
-        c_n,
-        combine_parity=combine_parity,
-        expected_combine=expected_combine,
-        expected_reduce=expected_reduce,
-        out_features=out_features,
-        hidden_size=hidden_size,
-        num_max_pool_tokens=num_max_pool_tokens,
-        BLOCK_M=BM,
-        BLOCK_N=BN,
-        num_combine_slots=int(num_combine_slots),
-        topk=int(topk),
-        num_experts=int(num_experts),
-        rank=int(rank),
-        layout_code=_LAYOUT_CODES[layout],
-        apply_weights=bool(apply_weights),
-        with_gate=bool(with_gate),
-        out_fp16=False,
-        stream=torch.cuda.current_stream(),
-    )
+    with _suppress_stdout_stderr():
+        _compiled_grouped_gemm_combine(
+            act_2d,
+            weight_flat,
+            tile_to_expert,
+            num_tile_blocks,
+            output_d,
+            topk_indices_d,
+            num_tokens_d,
+            topk_weights_d,
+            grad_gate_d,
+            d_topk_w_d,
+            sym_layout,
+            c_n,
+            combine_parity=combine_parity,
+            expected_combine=expected_combine,
+            expected_reduce=expected_reduce,
+            out_features=out_features,
+            hidden_size=hidden_size,
+            num_max_pool_tokens=num_max_pool_tokens,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            num_combine_slots=int(num_combine_slots),
+            topk=int(topk),
+            num_experts=int(num_experts),
+            rank=int(rank),
+            layout_code=_LAYOUT_CODES[layout],
+            apply_weights=bool(apply_weights),
+            with_gate=bool(with_gate),
+            out_fp16=False,
+            stream=torch.cuda.current_stream(),
+        )
     return output, d_topk_w

@@ -266,6 +266,7 @@ def _compiled_swiglu(
         Config(grid_x=grid_x, block_threads=block_threads)
         for grid_x, block_threads in itertools.product((2048, 4096), (256, 5120))
     ],
+    rep=5,
     key=["I", "with_scale", "with_bound", "BM", "with_gate", "with_act_w"],
 )
 @flyc.jit

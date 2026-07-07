@@ -29,8 +29,7 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
 from primus_turbo.flydsl.mega.prims import ld, read_clock, spin_timed_out
-from primus_turbo.flydsl.mega.sym_layout import SymLayout
-from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.tune_utils import _suppress_stdout_stderr
 from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs, xcd_remap_pid
 
@@ -156,7 +155,7 @@ def _make_kernel(
                     block_n = local % fx.Int32(N_BLOCKS_N)
                 m_start = load_go_i64(go_div, group_idx)
                 m_end = load_go_i64(go_div, group_idx + fx.Int32(1))
-                sb_base = sym_layout.dispatch_flag_ptr
+                sb_base = sym_layout.dispatch_flag
                 ge_blk = bank_offset + group_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
@@ -177,7 +176,7 @@ def _make_kernel(
                     elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
                 )
                 pool_tensor = fx.make_view(
-                    fx.inttoptr(pool_ptr_ty, sym_layout.dispatch_token_pool_ptr),
+                    fx.inttoptr(pool_ptr_ty, sym_layout.dispatch_token_pool),
                     fx.make_layout(num_max_pool_tokens * OUT_M, 1),
                 )
                 if const_expr(trans_c):
@@ -216,7 +215,7 @@ def _make_kernel(
                 group_size_m = arith.select(remaining_m < fx.Int32(GROUP_M), remaining_m, fx.Int32(GROUP_M))
                 block_m = first_pid_m + (pid_in_group % group_size_m)
                 block_n = pid_in_group // group_size_m
-                sb_base = sym_layout.dispatch_flag_ptr
+                sb_base = sym_layout.dispatch_flag
                 g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 blk = bank_offset + g_idx
                 if thread_index == fx.Int32(0):
@@ -243,7 +242,7 @@ def _make_kernel(
                 a_byte_off = _i64(block_m) * fx.Int64(BLOCK_M * K * 2)
                 c_byte_off = _i64(block_m) * fx.Int64(BLOCK_M * out_features * 2)
                 pool_tensor = fx.make_view(
-                    fx.inttoptr(pool_ptr_ty, sym_layout.dispatch_token_pool_ptr + a_byte_off),
+                    fx.inttoptr(pool_ptr_ty, sym_layout.dispatch_token_pool + a_byte_off),
                     fx.make_layout(BLOCK_M * K, 1),
                 )
                 out_base = fx.arith.ArithValue(
@@ -274,89 +273,6 @@ def _make_kernel(
     return dispatch_grouped_gemm_kernel, grid_size
 
 
-@functools.lru_cache(maxsize=256)
-def _compile(
-    out_features,
-    hidden_size,
-    num_max_pool_tokens,
-    BLOCK_M,
-    BLOCK_N,
-    num_dispatch_cu,
-    num_comm,
-    nt_vmcnt=3,
-    waves_per_eu=2,
-    agpr_alloc=0,
-    out_fp16=False,
-    GROUP_M=1,
-    layout="nt",
-    trans_c=False,
-    G=0,
-    num_xcd=8,
-    num_ranks=8,
-):
-    kernel, grid_size = _make_kernel(
-        out_features,
-        hidden_size,
-        num_max_pool_tokens,
-        BLOCK_M,
-        BLOCK_N,
-        num_dispatch_cu,
-        num_comm,
-        nt_vmcnt=nt_vmcnt,
-        out_fp16=out_fp16,
-        GROUP_M=GROUP_M,
-        layout=layout,
-        trans_c=trans_c,
-        G=G,
-        num_xcd=num_xcd,
-        num_ranks=num_ranks,
-    )
-
-    @flyc.jit
-    def launch(
-        INPUT_TOKENS,
-        EXPERT_SEND_DST_RANK,
-        EXPERT_SEND_DST_ROW,
-        EXPERT_SEND_COUNT,
-        EXPERT_SEND_OFFSET,
-        DISPATCHED_TOKEN_IDX,
-        sym_layout,
-        WEIGHTS,
-        OUTPUT,
-        TILE_TO_GROUP,
-        NUM_TILE_BLOCKS,
-        GROUP_OFFS,
-        c_n: int,
-        out_m_rt: int,
-        out_n_rt: int,
-        disp_parity: int,
-        expected_dispatch: int,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        kernel(
-            INPUT_TOKENS,
-            EXPERT_SEND_DST_RANK,
-            EXPERT_SEND_DST_ROW,
-            EXPERT_SEND_COUNT,
-            EXPERT_SEND_OFFSET,
-            DISPATCHED_TOKEN_IDX,
-            sym_layout,
-            WEIGHTS,
-            OUTPUT,
-            TILE_TO_GROUP,
-            NUM_TILE_BLOCKS,
-            GROUP_OFFS,
-            c_n,
-            out_m_rt,
-            out_n_rt,
-            disp_parity,
-            expected_dispatch,
-            value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
-        ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
-
-    return launch
-
-
 def _rewind_dispatch_flag(kwargs):
     # tuning-only: rewind never-reset flag so each rerun matches baked expected
     symm = get_symm_buffer_for_mega_moe()
@@ -371,7 +287,7 @@ def _rewind_dispatch_flag(kwargs):
 
 
 @autotune(
-    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=v) for cu in (16, 32, 64) for v in (3, 4)],
+    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=4) for cu in (16, 64)],
     key=[
         "out_features",
         "hidden_size",
@@ -380,10 +296,13 @@ def _rewind_dispatch_flag(kwargs):
         "BLOCK_N",
         "num_comm",
         "GROUP_M",
-        "is_nn",
+        "layout_code",
+        "trans_c",
+        "G",
         "num_ranks",
     ],
     warmup=0,
+    rep=5,
     post_hook=_rewind_dispatch_flag,
 )
 @flyc.jit
@@ -412,13 +331,18 @@ def _compiled_dispatch_grouped_gemm(
     BLOCK_N: fx.Constexpr[int],
     num_comm: fx.Constexpr[int],
     GROUP_M: fx.Constexpr[int],
-    is_nn: fx.Constexpr[bool],
+    layout_code: fx.Constexpr[int],
+    trans_c: fx.Constexpr[bool],
+    G: fx.Constexpr[int],
+    out_fp16: fx.Constexpr[bool],
     num_ranks: fx.Constexpr[int],
     num_dispatch_cu: fx.Constexpr[int],
     nt_vmcnt: fx.Constexpr[int],
     stream: fx.Stream = fx.Stream(None),
 ):
-    layout = "nn" if is_nn else "nt"
+    # layout_code: 0=nt, 1=nn, 2=tn; tn uses 2 XCDs, nt/nn use 8
+    layout = ("nt", "nn", "tn")[int(layout_code)]
+    num_xcd = 2 if layout == "tn" else 8
     kernel, grid_size = _make_kernel(
         out_features,
         hidden_size,
@@ -428,8 +352,12 @@ def _compiled_dispatch_grouped_gemm(
         int(num_dispatch_cu),
         int(num_comm),
         nt_vmcnt=int(nt_vmcnt),
+        out_fp16=bool(out_fp16),
         GROUP_M=int(GROUP_M),
         layout=layout,
+        trans_c=bool(trans_c),
+        G=int(G),
+        num_xcd=num_xcd,
         num_ranks=int(num_ranks),
     )
     kernel(
@@ -462,7 +390,6 @@ def dispatch_grouped_gemm_bf16(
     topk_idx: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     layout: str = "nt",
-    num_dispatch_cu: int = 16,
     BM=256,
     BN=256,
     GROUP_M=4,
@@ -488,7 +415,7 @@ def dispatch_grouped_gemm_bf16(
             block_n=BN,
             pool_mult=pool_mult,
         )
-        sym_layout = symm.make_sym_layout()
+        sym_layout = symm.get_sym_layout()
         handle = tuple(
             dispatch_prologue(
                 topk_idx,
@@ -506,7 +433,7 @@ def dispatch_grouped_gemm_bf16(
         )
     else:
         symm = get_symm_buffer_for_mega_moe()
-        sym_layout = symm.make_sym_layout()
+        sym_layout = symm.get_sym_layout()
 
     (
         expert_send_dst_rank,
@@ -516,8 +443,8 @@ def dispatch_grouped_gemm_bf16(
         dispatched_token_idx,
         tile_to_expert,
         _expected_count,
-        _,
-        group_offs,
+        _num_tokens_per_expert,
+        num_tokens_per_expert_prefix,
     ) = handle
 
     num_comm = expert_send_dst_rank.numel()
@@ -528,69 +455,42 @@ def dispatch_grouped_gemm_bf16(
     dummy_i32 = get_dummy_tensor()
     x_i32 = x.contiguous().view(torch.int32).view(-1)
 
+    assert layout in ("nt", "nn", "tn"), f"unsupported layout {layout}"
+    out_fp16 = out_dtype == torch.float16
+    layout_code = {"nt": 0, "nn": 1, "tn": 2}[layout]
+
+    # per-layout operand/output prep; all three share one launch below.
     if layout == "tn":
-        assert group_offs is not None, "tn layout requires group_offs"
+        # tn wgrad: WEIGHTS=rhs activation, contract against the token pool; C is per-group.
+        assert num_tokens_per_expert_prefix is not None, "tn layout requires num_tokens_per_expert_prefix"
+        assert (
+            num_tokens_per_expert_prefix.dtype == torch.int64
+        ), "tn num_tokens_per_expert_prefix must be int64"
         rhs = l1_weights
-        OUT_M = hidden_size
-        OUT_N = rhs.size(1)
-        G = group_offs.numel() - 1
-        out_fp16 = out_dtype == torch.float16
+        OUT_M, OUT_N = hidden_size, rhs.size(
+            1
+        )  # _make_kernel wants (out_features, hidden_size)=(OUT_N, OUT_M)
+        G = num_tokens_per_expert_prefix.numel() - 1
         out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)
         output = torch.empty(out_shape, device=x.device, dtype=out_dtype)
-        assert group_offs.dtype == torch.int64, "tn group_offs must be int64"
-        # tn goes through _compile (not autotuned), advance parity here.
-        disp_parity, expected_dispatch = symm.next_dispatch()
-        pos_args = (
-            x_i32,
-            expert_send_dst_rank,
-            expert_send_dst_row,
-            expert_send_count,
-            expert_send_offset,
-            dispatched_token_idx,
-            sym_layout,
-            rhs.contiguous(),
-            output.view(-1),
-            dummy_i32,
-            dummy_i32,
-            group_offs,
-            0,
-            int(OUT_M),
-            int(OUT_N),
-            disp_parity,
-            int(expected_dispatch),
-        )
-        launch = _compile(
-            OUT_N,
-            OUT_M,
-            num_max_pool_tokens,
-            BM,
-            BN,
-            int(num_dispatch_cu),
-            int(num_comm),
-            out_fp16=out_fp16,
-            layout="tn",
-            trans_c=trans_c,
-            G=G,
-            num_xcd=2,
-            num_ranks=int(num_ranks),
-        )
-        launch(*pos_args, stream=torch.cuda.current_stream())
-        return output, symm.dispatch_token_pool, symm.weight_recv_buf, handle
-
-    assert layout in ("nt", "nn"), f"unsupported layout {layout}"
-    if layout == "nt":
-        G, N, K = l1_weights.shape
-        weight_flat = l1_weights.reshape(G * N, K).contiguous().view(-1)
+        weight_arg, output_arg = rhs.contiguous(), output.view(-1)
+        tile_arg, num_tile_arg, group_offs_arg = dummy_i32, dummy_i32, num_tokens_per_expert_prefix
+        c_n, out_m_rt, out_n_rt = 0, int(OUT_M), int(OUT_N)
+        out_features_ce, hidden_size_ce = OUT_N, OUT_M
     else:
-        G, K, N = l1_weights.shape
-        weight_flat = l1_weights.reshape(G * K, N).contiguous().view(-1)
-    assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
-    out_features = N
-    c_n = out_features
-
-    num_tile_blocks = symm.meta_scalars[1:2]
-
-    output = torch.empty((num_max_pool_tokens, out_features), dtype=x.dtype, device=x.device)
+        if layout == "nt":
+            G, N, K = l1_weights.shape
+            weight_flat = l1_weights.reshape(G * N, K).contiguous().view(-1)
+        else:
+            G, K, N = l1_weights.shape
+            weight_flat = l1_weights.reshape(G * K, N).contiguous().view(-1)
+        assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
+        output = torch.empty((num_max_pool_tokens, N), dtype=x.dtype, device=x.device)
+        weight_arg, output_arg = weight_flat, output
+        tile_arg, num_tile_arg, group_offs_arg = tile_to_expert, symm.meta_scalars[1:2], dummy_i32
+        c_n, out_m_rt, out_n_rt = N, 0, 0
+        out_features_ce, hidden_size_ce = N, hidden_size
+        G, trans_c = 0, False  # nt/nn grid uses worst_case_tiles; C never transposed
 
     disp_parity, expected_dispatch = symm.next_dispatch()
 
@@ -603,24 +503,27 @@ def dispatch_grouped_gemm_bf16(
             expert_send_offset,
             dispatched_token_idx,
             sym_layout,
-            weight_flat,
-            output,
-            tile_to_expert,
-            num_tile_blocks,
-            dummy_i32,
+            weight_arg,
+            output_arg,
+            tile_arg,
+            num_tile_arg,
+            group_offs_arg,
             c_n,
-            0,
-            0,
+            out_m_rt,
+            out_n_rt,
             disp_parity=disp_parity,
             expected_dispatch=int(expected_dispatch),
-            out_features=int(out_features),
-            hidden_size=int(hidden_size),
+            out_features=int(out_features_ce),
+            hidden_size=int(hidden_size_ce),
             num_max_pool_tokens=int(num_max_pool_tokens),
             BLOCK_M=int(BM),
             BLOCK_N=int(BN),
             num_comm=int(num_comm),
             GROUP_M=int(GROUP_M),
-            is_nn=(layout == "nn"),
+            layout_code=int(layout_code),
+            trans_c=bool(trans_c),
+            G=int(G),
+            out_fp16=bool(out_fp16),
             num_ranks=int(num_ranks),
             stream=torch.cuda.current_stream(),
         )

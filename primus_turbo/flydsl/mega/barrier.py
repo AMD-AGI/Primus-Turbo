@@ -14,7 +14,7 @@ from primus_turbo.flydsl.mega.prims import (
     read_clock,
     spin_timed_out,
 )
-from primus_turbo.flydsl.mega.sym_layout import SymLayout, sym_map
+from primus_turbo.flydsl.mega.symm_buffer import SymLayout, sym_map
 
 # grid_sync counter layout: the low bits accumulate per-block arrivals and
 # bit 25 is the phase flag the last block flips. Requires num_blocks < 2^25.
@@ -42,10 +42,10 @@ def grid_sync(
             fx.Int32(1),
         )
         old_value = atomic_add(
-            sym_layout.grid_sync_count_ptr, fx.Int32(0), add_value, scope="agent", order="release"
+            sym_layout.grid_sync_count, fx.Int32(0), add_value, scope="agent", order="release"
         )
         spin_start = read_clock()
-        new_value = ld(sym_layout.grid_sync_count_ptr, fx.Int32(0), scope="agent", order="acquire")
+        new_value = ld(sym_layout.grid_sync_count, fx.Int32(0), scope="agent", order="acquire")
         # spin until the phase bit toggles relative to our arrival snapshot
         while ((new_value ^ old_value) & _PHASE_MASK) == fx.Int32(0):
             if spin_timed_out(spin_start):
@@ -58,7 +58,7 @@ def grid_sync(
                     fx.Int32(num_blocks),
                 )
                 spin_start = read_clock()
-            new_value = ld(sym_layout.grid_sync_count_ptr, fx.Int32(0), scope="agent", order="acquire")
+            new_value = ld(sym_layout.grid_sync_count, fx.Int32(0), scope="agent", order="acquire")
     fx.gpu.barrier()
     memory_fence(order="acquire", scope="agent")
 
@@ -79,15 +79,15 @@ def xgmi_barrier(
     fx.gpu.barrier()
     if block_id == fx.Int32(0):
         if thread_id < fx.Int32(world_size):
-            atomic_add(sym_layout.signal_ptr, thread_id, fx.Int32(1), scope="sys")
+            atomic_add(sym_layout.signal, thread_id, fx.Int32(1), scope="sys")
             atomic_add(
-                sym_map(sym_layout, sym_layout.signal_ptr, thread_id),
+                sym_map(sym_layout, sym_layout.signal, thread_id),
                 fx.Int32(rank),
                 fx.Int32(-1),
                 scope="sys",
             )
             spin_start = read_clock()
-            my_signal_value = ld(sym_layout.signal_ptr, thread_id, scope="sys")
+            my_signal_value = ld(sym_layout.signal, thread_id, scope="sys")
             while my_signal_value > fx.Int32(0):
                 if spin_timed_out(spin_start):
                     # rank/tag are compile-time constants, baked into the format string
@@ -98,5 +98,5 @@ def xgmi_barrier(
                         my_signal_value,
                     )
                     spin_start = read_clock()
-                my_signal_value = ld(sym_layout.signal_ptr, thread_id, scope="sys")
+                my_signal_value = ld(sym_layout.signal, thread_id, scope="sys")
     fx.gpu.barrier()

@@ -381,7 +381,7 @@ def _run(local_rank, world, args):
         # warmup both (no autograd anywhere in this test)
         # mega_moe_fused fetches the cached symmetric buffer internally (same key as `symm`)
         with torch.no_grad():
-            y_mega = mega_moe_fused(group, x, topk_idx, topk_w, W1, W2, block_m=args.bm, block_n=args.bn)
+            y_mega = mega_moe_fused(group, x, topk_idx, topk_w, W1, W2)
             y_turbo = baseline_reference(x, topk_idx, gate_logits)
         torch.cuda.synchronize()
         group.barrier()
@@ -407,9 +407,7 @@ def _run(local_rank, world, args):
         if args.probe_dswiglu:
             from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
             from primus_turbo.pytorch.core.backend import BackendType
-            from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (
-                dispatch_grouped_gemm_impl,
-            )
+            from primus_turbo.pytorch.kernels.mega_moe import dispatch_grouped_gemm_impl
 
             with torch.no_grad():
                 # forward dispatch builds the symm pool + handle (same as mega_moe_fused STEP1+2)
@@ -528,7 +526,7 @@ def _run(local_rank, world, args):
             w1_m = W1.detach().requires_grad_(True)
             w2_m = W2.detach().requires_grad_(True)
             tw_m = topk_w.detach().requires_grad_(True)
-            y_m = mega_moe_fused(group, x_m, topk_idx, tw_m, w1_m, w2_m, block_m=args.bm, block_n=args.bn)
+            y_m = mega_moe_fused(group, x_m, topk_idx, tw_m, w1_m, w2_m)
             dx_m, dW1_m, dW2_m, dtw_m = torch.autograd.grad(y_m, [x_m, w1_m, w2_m, tw_m], grad_y)
             # turbo baseline grads (same grad_y, same local shard)
             y_t, x_t, w1_t, w2_t = baseline_grad_forward_leaves(x, topk_idx, gate_logits)
@@ -583,9 +581,7 @@ def _run(local_rank, world, args):
 
             def _train_step():
                 ys = [
-                    mega_moe_fused(
-                        group, x_leaf, topk_idx, topk_w, w1_leaf, w2_leaf, block_m=args.bm, block_n=args.bn
-                    )
+                    mega_moe_fused(group, x_leaf, topk_idx, topk_w, w1_leaf, w2_leaf)
                     for _ in range(args.num_layers)
                 ]
                 # N forwards done; now N backwards back-to-back (reverse order)
@@ -619,9 +615,7 @@ def _run(local_rank, world, args):
                 x_leaf = x.detach().requires_grad_(True)
                 w1_leaf = W1.detach().requires_grad_(True)
                 w2_leaf = W2.detach().requires_grad_(True)
-                return mega_moe_fused(
-                    group, x_leaf, topk_idx, topk_w, w1_leaf, w2_leaf, block_m=args.bm, block_n=args.bn
-                )
+                return mega_moe_fused(group, x_leaf, topk_idx, topk_w, w1_leaf, w2_leaf)
 
             fwd_breakdown = bench_kineto(_forward, num_tests=args.perf_iters, group=group)
             fwdbwd_breakdown = bench_kineto(

@@ -27,7 +27,7 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.barrier import grid_sync, xgmi_barrier
 from primus_turbo.flydsl.mega.prims import atomic_add, ld, st
-from primus_turbo.flydsl.mega.sym_layout import SymLayout, sym_map
+from primus_turbo.flydsl.mega.symm_buffer import SymLayout, sym_map
 from primus_turbo.flydsl.mega.tune_utils import _suppress_stdout_stderr
 
 
@@ -100,21 +100,21 @@ def _make_dispatch_prologue(
         num_tokens_per_expert_prefix_resource = create_buffer_resource(
             NUM_TOKENS_PER_EXPERT_PREFIX, max_size=True
         )
-        meta_scalars_resource = create_buffer_resource_from_addr(sl.meta_scalars_ptr, num_records_bytes=8 * 4)
+        meta_scalars_resource = create_buffer_resource_from_addr(sl.meta_scalars, num_records_bytes=8 * 4)
 
         my_origin_rank_resource = create_buffer_resource_from_addr(
-            sl.pool_src_rank_ptr, num_records_bytes=origin_buffer_bytes
+            sl.pool_src_rank, num_records_bytes=origin_buffer_bytes
         )
         # combine recv-segment table: one (local_expert, source_rank) entry each
         seg_table_bytes = num_experts * 4
         combine_recv_dst_rank_resource = create_buffer_resource_from_addr(
-            sl.combine_recv_dst_rank_ptr, num_records_bytes=seg_table_bytes
+            sl.combine_recv_dst_rank, num_records_bytes=seg_table_bytes
         )
         combine_recv_start_row_resource = create_buffer_resource_from_addr(
-            sl.combine_recv_start_row_ptr, num_records_bytes=seg_table_bytes
+            sl.combine_recv_start_row, num_records_bytes=seg_table_bytes
         )
         combine_recv_count_resource = create_buffer_resource_from_addr(
-            sl.combine_recv_count_ptr, num_records_bytes=seg_table_bytes
+            sl.combine_recv_count, num_records_bytes=seg_table_bytes
         )
         origin_init_index = block_index * fx.Int32(block_threads) + thread_index
         while origin_init_index < fx.Int32(num_max_pool_tokens):
@@ -151,7 +151,7 @@ def _make_dispatch_prologue(
         if block_index == fx.Int32(0):
             for peer_rank in range(num_ranks):
                 peer_c_resource = create_buffer_resource_from_addr(
-                    sym_map(sl, sl.expert_count_buffer_ptr, fx.Int32(peer_rank)),
+                    sym_map(sl, sl.expert_count_buffer, fx.Int32(peer_rank)),
                     num_records_bytes=c_buffer_bytes,
                 )
                 push_expert_index = thread_index
@@ -171,7 +171,7 @@ def _make_dispatch_prologue(
         )
 
         if block_index == fx.Int32(0):
-            own_c_address = sl.expert_count_buffer_ptr
+            own_c_address = sl.expert_count_buffer
             if thread_index < fx.Int32(num_ranks):
                 running_pool_offset = fx.Int32(0)
                 for local_expert_index in range(experts_per_rank):
@@ -360,15 +360,15 @@ def _make_dispatch_prologue(
                 destination_rank = expert_id // fx.Int32(experts_per_rank)
                 # Symmetric buffers on the destination rank.
                 peer_origin_rank_resource = create_buffer_resource_from_addr(
-                    sym_map(sl, sl.pool_src_rank_ptr, destination_rank),
+                    sym_map(sl, sl.pool_src_rank, destination_rank),
                     num_records_bytes=origin_buffer_bytes,
                 )
                 peer_origin_slot_resource = create_buffer_resource_from_addr(
-                    sym_map(sl, sl.pool_src_slot_ptr, destination_rank),
+                    sym_map(sl, sl.pool_src_slot, destination_rank),
                     num_records_bytes=origin_buffer_bytes,
                 )
                 peer_weight_resource = create_buffer_resource_from_addr(
-                    sym_map(sl, sl.weight_recv_buf_ptr, destination_rank),
+                    sym_map(sl, sl.weight_recv_buf, destination_rank),
                     num_records_bytes=origin_buffer_bytes,
                 )
                 buffer_store(fx.Int32(rank), peer_origin_rank_resource, destination_row)
@@ -413,6 +413,7 @@ def get_dispatch_prologue_workspace(num_experts, device="cuda"):
         Config(num_cu=num_cu, num_threads=num_threads)
         for num_cu, num_threads in itertools.product((32, 64, 96), (256, 512, 1024))
     ],
+    rep=5,
     # Retune per shape; topk_idx dtype auto-joins the key via the tensor arg.
     key=[
         "num_tokens",

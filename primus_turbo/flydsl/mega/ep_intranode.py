@@ -20,17 +20,13 @@ from primus_turbo.flydsl.mega.prims import (
     spin_timed_out,
     st,
 )
-from primus_turbo.flydsl.mega.sym_layout import SymLayout, sym_map
+from primus_turbo.flydsl.mega.symm_buffer import SymLayout, sym_map
 
 _WARP = 64
 _BLOCK_THREADS = 512
 _PVEC = 8
 _NUM_WARPS = _BLOCK_THREADS // _WARP
 _L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invalidate)
-_L1L2_BYPASS = 3  # glc|slc: skip L1+L2 -> uncached behavior for cross-rank combine buffer
-# combine push write / reduce read cache-modifier knobs (sweepable; default = uncached bypass)
-_COMB_WRITE_CACHE = int(os.environ.get("MEGA_COMB_WRITE_CACHE", str(_L1L2_BYPASS)))
-_COMB_READ_CACHE = int(os.environ.get("MEGA_COMB_READ_CACHE", str(_L1L2_BYPASS)))
 # DIAG ONLY (breaks correctness): dst_off=row (contiguous) instead of slot -> isolate remote-write scatter cost
 _COMB_CONTIG_DIAG = os.environ.get("MEGA_COMB_CONTIG_DIAG", "0") == "1"
 
@@ -63,7 +59,7 @@ def dispatch_bf16_tile(
     dest_row_start = buffer_load(expert_send_dst_row_res, task_index, vec_width=1, dtype=fx.T.i32())
     source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
     token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32())
-    pool_address = sym_map(sym_layout, sym_layout.dispatch_token_pool_ptr, dst_rank)
+    pool_address = sym_map(sym_layout, sym_layout.dispatch_token_pool, dst_rank)
 
     local_count = (token_count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
 
@@ -86,7 +82,7 @@ def dispatch_bf16_tile(
         fx.rocdl.s_waitcnt(0)
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):
-            dispatch_flag_address = sym_map(sym_layout, sym_layout.dispatch_flag_ptr, dst_rank)
+            dispatch_flag_address = sym_map(sym_layout, sym_layout.dispatch_flag, dst_rank)
             bank = (
                 fx.Int32(0)
                 if disp_parity is None
@@ -127,12 +123,12 @@ def combine_bf16_tile(
     full_bytes = num_full_chunks * cols_per_step * 2
     warp_id = thread_index // fx.Int32(_WARP)
     lane_id = thread_index % fx.Int32(_WARP)
-    l2_ptr = sym_layout.l2_token_buffer_ptr
+    l2_ptr = sym_layout.l2_token_buffer
 
     dst_rank = buffer_load(recv_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
     start_row = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
     count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
-    comb_addr = sym_map(sym_layout, sym_layout.combine_token_buffer_ptr, dst_rank)
+    comb_addr = sym_map(sym_layout, sym_layout.combine_token_buffer, dst_rank)
 
     local_count = (count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
     for i in range(local_count):
@@ -146,7 +142,7 @@ def combine_bf16_tile(
             full_bytes,
             dst_off=dst_slot * fx.Int32(row_words),
             src_off=row * fx.Int32(row_words),
-            store_cache=_COMB_WRITE_CACHE,
+            store_cache=3,  # glc|slc: L1+L2 bypass for cross-rank combine push
         )
         if const_expr(tail_cols):
             oob_index = fx.Int32(n_slots) * fx.Int32(out_features)
@@ -161,15 +157,15 @@ def combine_bf16_tile(
                 l2_res, row_off + safe_col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=_L1_BYPASS
             )
             dst = arith.select(in_tail, slot_base + col, oob_index)
-            buffer_store(tail_value, peer, dst, cache_modifier=_COMB_WRITE_CACHE)
+            buffer_store(tail_value, peer, dst, cache_modifier=3)  # glc|slc: L1+L2 bypass
         if const_expr(with_gate):
             gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
-            gate_addr = sym_map(sym_layout, sym_layout.combine_gate_ptr, dst_rank)
+            gate_addr = sym_map(sym_layout, sym_layout.combine_gate, dst_rank)
             gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
             buffer_store(gate_value, gate_peer, slot)
         if const_expr(signal):
             bank = fx.Int32(0) if bank_offset is None else bank_offset
-            barrier_addr = sym_map(sym_layout, sym_layout.reduce_flag_ptr, dst_rank)
+            barrier_addr = sym_map(sym_layout, sym_layout.reduce_flag, dst_rank)
             _wait_mem()
             st(barrier_addr, bank + slot, epoch, scope="sys")
 
@@ -250,7 +246,7 @@ def topk_reduce_bf16_tile(
                         row_off,
                         vec_width=_PVEC,
                         dtype=fx.T.bf16(),
-                        cache_modifier=_COMB_READ_CACHE,
+                        cache_modifier=3,  # glc|slc: L1+L2 bypass (avoid stale L2 on slot reuse)
                     )
                 )
             if const_expr(apply_weights):

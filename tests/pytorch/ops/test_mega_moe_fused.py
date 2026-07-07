@@ -170,9 +170,7 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
         symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
 
         with torch.no_grad():
-            y_mega = mega_moe_fused(
-                group, x, topk_idx, topk_weight, l1_weight, l2_weight, block_m=self.BM, block_n=self.BN
-            )
+            y_mega = mega_moe_fused(group, x, topk_idx, topk_weight, l1_weight, l2_weight)
             y_turbo = baseline_reference(
                 group,
                 x,
@@ -213,7 +211,7 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
         l1_m = l1_weight.detach().requires_grad_(True)
         l2_m = l2_weight.detach().requires_grad_(True)
         tw_m = topk_weight.detach().requires_grad_(True)
-        y_m = mega_moe_fused(group, x_m, topk_idx, tw_m, l1_m, l2_m, block_m=self.BM, block_n=self.BN)
+        y_m = mega_moe_fused(group, x_m, topk_idx, tw_m, l1_m, l2_m)
         dx_m, dl1_m, dl2_m, dtw_m = torch.autograd.grad(y_m, [x_m, l1_m, l2_m, tw_m], grad_y)
 
         # turbo reference grads: topk_weight flows through scatter, so dtw is compared directly
