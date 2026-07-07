@@ -153,6 +153,16 @@ def build_dsa_bwd_dq_m16_module(
         NUM_WAVES -= 1
     BLOCK_SIZE = NUM_WAVES * WARP_SIZE
     N_WG_HBLK = N_HBLK // NUM_WAVES  # head-block groups along grid.y
+    # Adaptive occupancy: when a workgroup already holds many waves (e.g. H64 packs
+    # 4 head-blocks into one CTA), forcing waves_per_eu=2 makes the scheduler try to
+    # co-resident 2 CTAs (8 waves) per EU, which thrashes the 256-VGPR dQ acc/spill.
+    # wpe=1 lets each many-wave CTA own the EU alone -> H64 dQ 3.8->2.7ms. Few-wave
+    # CTAs (H128 -> 2 waves) still benefit from wpe=2. Env override wins.
+    _wpe_env = os.environ.get("PRIMUS_DSA_BWD_DQ_WPE", "")
+    if _wpe_env:
+        waves_per_eu = int(_wpe_env)
+    elif NUM_WAVES >= 4:
+        waves_per_eu = 1
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(HEAD_DIM)
 
