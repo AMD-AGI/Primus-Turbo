@@ -114,7 +114,7 @@ def build_dsa_bwd_dq_m16_module(
     assert BLOCK_K % 16 == 0
     # QK HBM-load prefetch depth. Lower => fewer transient VGPR (better occupancy),
     # higher => more VMEM/MFMA overlap. 2 is the M=32 kernel's sweet spot.
-    _QK_PF = int(os.environ.get("PRIMUS_DSA_TR16_QK_PF", "2"))
+    _QK_PF = int(os.environ.get("PRIMUS_DSA_BWD_DQ_QK_PF", "1"))
     K_CHUNKS = HEAD_DIM // 32   # QK d-contraction chunks (16)
     D_TILES = HEAD_DIM // 16    # AV output d-tiles (32)
     N_SUB = BLOCK_K // 16       # QK key sub-tiles (16 keys each)
