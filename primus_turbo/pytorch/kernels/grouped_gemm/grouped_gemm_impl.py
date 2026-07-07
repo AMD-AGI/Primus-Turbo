@@ -25,6 +25,16 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
 
 _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
+# Supported schedule values exposed at the public op layer.
+#   "static"      -- static-stride persistent kernel (default).
+#   "work_steal"  -- work-stealing persistent kernel with the kernel-aware
+#                    heuristic that picks the WS sub-mode (per-XCD /
+#                    global / hierarchical) from tensor metadata.
+#                    Triton backend only in this build.
+_SUPPORTED_SCHEDULES: tuple[str, ...] = ("static", "work_steal")
+_TRITON_SUPPORTED_SCHEDULES: tuple[str, ...] = ("static", "work_steal")
+_NON_WS_SUPPORTED_SCHEDULES: tuple[str, ...] = ("static",)
+
 
 class GroupedGEMMCKBackend(KernelBackend):
     @staticmethod
@@ -36,12 +46,14 @@ class GroupedGEMMCKBackend(KernelBackend):
         trans_a: bool,
         trans_b: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= not trans_a
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
         return supported
 
     @staticmethod
@@ -53,6 +65,7 @@ class GroupedGEMMCKBackend(KernelBackend):
         trans_a: bool,
         trans_b: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> torch.Tensor:
         return torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm(
@@ -71,12 +84,14 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         trans_b: bool,
         trans_c: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
         return supported
 
     @staticmethod
@@ -89,6 +104,7 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         trans_b: bool,
         trans_c: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> torch.Tensor:
         if trans_c:
@@ -112,12 +128,14 @@ class GroupedGEMMHipblasltBackend(KernelBackend):
         trans_a: bool,
         trans_b: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= not trans_a
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
         return supported
 
     @staticmethod
@@ -130,6 +148,8 @@ class GroupedGEMMHipblasltBackend(KernelBackend):
         trans_b: bool,
         num_cu: int | None,
         maybe_pre_sync: bool = False,
+        schedule: str = "static",
+        **kwargs,
     ) -> torch.Tensor:
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm(
             a, b, group_lens, group_offs, trans_a, trans_b, maybe_pre_sync
@@ -147,12 +167,14 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         trans_b: bool,
         trans_c: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
         return supported
 
     @staticmethod
@@ -166,6 +188,8 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
         maybe_pre_sync: bool = False,
+        schedule: str = "static",
+        **kwargs,
     ) -> torch.Tensor:
         if trans_c:
             lhs, rhs = b, a
@@ -191,12 +215,14 @@ class GroupedGEMMTritonBackend(KernelBackend):
         trans_a: bool,
         trans_b: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= not trans_a
+        supported &= schedule in _TRITON_SUPPORTED_SCHEDULES
         return supported
 
     @staticmethod
@@ -208,9 +234,18 @@ class GroupedGEMMTritonBackend(KernelBackend):
         trans_a: bool,
         trans_b: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> torch.Tensor:
-        return grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b)
+        return grouped_gemm_triton_kernel(
+            a,
+            b,
+            group_offs,
+            trans_b=trans_b,
+            num_cu=num_cu,
+            work_steal=(schedule == "work_steal"),
+            ws_mode="auto",
+        )
 
 
 _GROUPED_GEMM_BACKENDS = {
@@ -233,12 +268,14 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
         trans_b: bool,
         trans_c: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
+        supported &= schedule in _TRITON_SUPPORTED_SCHEDULES
         return supported
 
     @staticmethod
@@ -251,13 +288,21 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
         trans_b: bool,
         trans_c: bool,
         num_cu: int | None,
+        schedule: str = "static",
         **kwargs,
     ) -> torch.Tensor:
         if trans_c:
             lhs, rhs = b, a
         else:
             lhs, rhs = a, b
-        return grouped_gemm_variable_k_triton_kernel(lhs, rhs, group_offs)
+        return grouped_gemm_variable_k_triton_kernel(
+            lhs,
+            rhs,
+            group_offs,
+            num_cu=num_cu,
+            work_steal=(schedule == "work_steal"),
+            ws_mode="auto",
+        )
 
 
 _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
@@ -312,6 +357,7 @@ def grouped_gemm_impl(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
+    schedule: str = "static",
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
@@ -325,6 +371,7 @@ def grouped_gemm_impl(
         trans_b=trans_b,
         num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
+        schedule=schedule,
     )
 
     return GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
@@ -342,6 +389,7 @@ def grouped_gemm_variable_k_impl(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
+    schedule: str = "static",
 ) -> torch.Tensor:
     default_backend_enum = BackendType(default_backend)
     user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
@@ -355,6 +403,7 @@ def grouped_gemm_variable_k_impl(
         trans_c=trans_c,
         num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
+        schedule=schedule,
     )
     return GroupedGEMMVariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
 
@@ -370,6 +419,7 @@ def grouped_gemm_impl_meta(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
+    schedule: str = "static",
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
@@ -394,6 +444,7 @@ def grouped_gemm_variable_k_impl_meta(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
+    schedule: str = "static",
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"

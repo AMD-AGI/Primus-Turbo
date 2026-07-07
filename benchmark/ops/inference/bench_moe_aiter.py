@@ -521,6 +521,14 @@ def main():
         help="Random seed for reproducible weights/routing (default: 0).",
     )
     parser.add_argument(
+        "--pad128",
+        action="store_true",
+        help="Round hidden_size and moe_intermediate_size up to a multiple of 128 "
+        "(pads gpt-oss 2880 -> 2944) so the shape hits a tuned kernel instead of the "
+        "crash-prone atomic FlyDSL fallback; lets cudagraph capture. FLOPS/BW use the "
+        "padded dims (slight over-count).",
+    )
+    parser.add_argument(
         "--output",
         "-o",
         type=str,
@@ -540,7 +548,14 @@ def main():
 
     device = "cuda"
     dtype = torch.bfloat16
-    cfg = MODELS[args.model]
+    cfg = dict(MODELS[args.model])
+    if args.pad128:
+        for key in ("hidden_size", "moe_intermediate_size"):
+            orig = cfg[key]
+            padded = math.ceil(orig / 128) * 128
+            if padded != orig:
+                print(f"  pad128    : {key} {orig} -> {padded}")
+                cfg[key] = padded
     assert cfg["moe_intermediate_size"] % tp_size == 0, "intermediate not divisible by tp_size"
     assert cfg["n_routed_experts"] % ep_size == 0, "experts not divisible by ep_size"
 

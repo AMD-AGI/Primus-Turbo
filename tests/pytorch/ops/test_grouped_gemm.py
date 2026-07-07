@@ -254,3 +254,176 @@ def test_grouped_gemm_with_zero_length_groups(B, M, N_K, dtype, trans_b, backend
         )
 
     GlobalBackendManager.reset()
+
+
+# ---------------------------------------------------------------------------
+# Work-stealing tests
+#
+# Public API: ``schedule="work_steal"`` enables the work-stealing kernel on the
+# Triton backend. The integration test below uses the public API end-to-end
+# (forward + backward via autograd). Per-WS-mode kernel correctness is
+# covered by the lower-level ``grouped_gemm_triton_kernel`` test that follows
+# (the public API exposes only ``"static" | "work_steal"``; internal modes
+# ``"global" / "per-xcd" / "hierarchical"`` are kernel-level tuning knobs).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("B", [4, 8])
+@pytest.mark.parametrize("M", [1024, 4096])
+@pytest.mark.parametrize("N_K", [(2048, 1536), (4096, 7168)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.parametrize("trans_b", [True, False])
+def test_grouped_gemm_schedule_work_steal_triton(B, M, N_K, dtype, balance, trans_b):
+    """``schedule="work_steal"`` on the Triton backend matches the static path
+    bit-for-bit for forward and backward (per-tile accumulator order is
+    identical to the static schedule; there is no cross-tile reduction)."""
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+    GlobalBackendManager.set_auto_tune(False)
+
+    device = "cuda"
+    N, K = N_K
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+
+    b_shape = (B, N, K) if trans_b else (B, K, N)
+    a0 = torch.randn((B * M, K), dtype=torch.float32, device=device).to(dtype)
+    b0 = torch.randn(b_shape, dtype=torch.float32, device=device).to(dtype)
+
+    # Static reference
+    a_ref = a0.clone().requires_grad_(True)
+    b_ref = b0.clone().requires_grad_(True)
+    out_ref = grouped_gemm(a_ref, b_ref, group_lens, trans_b=trans_b, schedule="static")
+    grad_out = torch.randn_like(out_ref)
+    out_ref.backward(grad_out)
+
+    # Work-stealing
+    a_ws = a0.clone().requires_grad_(True)
+    b_ws = b0.clone().requires_grad_(True)
+    out_ws = grouped_gemm(a_ws, b_ws, group_lens, trans_b=trans_b, schedule="work_steal")
+    out_ws.backward(grad_out)
+
+    torch.testing.assert_close(out_ref, out_ws, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(a_ref.grad, a_ws.grad, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(b_ref.grad, b_ws.grad, rtol=0.0, atol=0.0)
+
+    GlobalBackendManager.reset()
+
+
+def test_grouped_gemm_schedule_work_steal_triton_single_group():
+    """Single-group degenerate case (G=1): the dispatcher special-cases this
+    to call non-grouped gemm; ``schedule`` must be accepted (and ignored)
+    in that branch."""
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+    device = "cuda"
+    torch.manual_seed(0)
+    M, K, N = 1024, 1280, 2560
+    a = torch.randn(M, K, device=device, dtype=torch.bfloat16, requires_grad=True)
+    b = torch.randn(1, N, K, device=device, dtype=torch.bfloat16, requires_grad=True)
+    group_lens = torch.tensor([M], dtype=torch.int64, device=device)
+
+    out_ws = grouped_gemm(a, b, group_lens, trans_b=True, schedule="work_steal")
+    out_ref = a @ b.squeeze(0).t()
+    torch.testing.assert_close(out_ref, out_ws, **get_tolerances(torch.bfloat16))
+    GlobalBackendManager.reset()
+
+
+@pytest.mark.parametrize("non_triton_backend", [BackendType.CK, BackendType.HIPBLASLT])
+def test_grouped_gemm_schedule_work_steal_rejects_non_triton_backend(non_triton_backend):
+    """Explicit selection of a non-Triton backend together with
+    ``schedule="work_steal"`` must fail at dispatch -- CK and hipblaslt advertise
+    only ``"static"`` via ``can_handle``."""
+    GlobalBackendManager.set_grouped_gemm_backend(non_triton_backend)
+    device = "cuda"
+    torch.manual_seed(0)
+    B, M, K, N = 4, 1024, 1280, 2560
+    a = torch.randn(B * M, K, device=device, dtype=torch.bfloat16)
+    b = torch.randn(B, N, K, device=device, dtype=torch.bfloat16)
+    group_lens = torch.full((B,), M, dtype=torch.int64, device=device)
+
+    with pytest.raises(ValueError, match="cannot handle"):
+        grouped_gemm(a, b, group_lens, trans_b=True, schedule="work_steal")
+    GlobalBackendManager.reset()
+
+
+@pytest.mark.parametrize("num_cu", [64, 128, 240, 256])
+def test_grouped_gemm_schedule_work_steal_rejects_num_cu(num_cu):
+    """``schedule="work_steal"`` combined with an explicit ``num_cu`` must
+    raise: the WS heuristic and per-XCD slot layout assume the persistent
+    grid spans every XCD, so partial-grid launches are unsupported at the
+    public op layer."""
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+    device = "cuda"
+    torch.manual_seed(0)
+    B, M, K, N = 4, 1024, 1280, 2560
+    a = torch.randn(B * M, K, device=device, dtype=torch.bfloat16)
+    b = torch.randn(B, N, K, device=device, dtype=torch.bfloat16)
+    group_lens = torch.full((B,), M, dtype=torch.int64, device=device)
+
+    with pytest.raises(ValueError, match="num_cu=None"):
+        grouped_gemm(a, b, group_lens, trans_b=True, num_cu=num_cu, schedule="work_steal")
+    GlobalBackendManager.reset()
+
+
+# ---------------------------------------------------------------------------
+# Kernel-level WS test: cover each ws_mode (the internal tuning knob) at the
+# low-level ``grouped_gemm_triton_kernel`` entry point. Not reachable from
+# the public API, which exposes only ``"static" | "work_steal"``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ws_mode", ["auto", "global", "per-xcd", "hierarchical"])
+@pytest.mark.parametrize("trans_b", [True, False])
+def test_grouped_gemm_triton_kernel_ws_modes(ws_mode, trans_b):
+    """Each WS mode produces bit-identical output to the static-stride kernel
+    at the low-level Triton entry point."""
+    from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+        grouped_gemm_triton_kernel,
+    )
+
+    device = "cuda"
+    torch.manual_seed(0)
+    B, M, N, K = 4, 4096, 2048, 1536
+    a = torch.randn((B * M, K), dtype=torch.bfloat16, device=device)
+    b_shape = (B, N, K) if trans_b else (B, K, N)
+    b = torch.randn(b_shape, dtype=torch.bfloat16, device=device)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=True).to(device)
+    group_offs = torch.zeros(B + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = torch.cumsum(group_lens, dim=0)
+
+    out_ref = grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b, work_steal=False)
+    out_ws = grouped_gemm_triton_kernel(a, b, group_offs, trans_b=trans_b, work_steal=True, ws_mode=ws_mode)
+    torch.testing.assert_close(out_ref, out_ws, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("num_cu", [4, 6, 7, 8, 16])
+@pytest.mark.parametrize("ws_mode", ["per-xcd", "hierarchical"])
+def test_grouped_gemm_triton_kernel_ws_num_cu_below_num_xcds(num_cu, ws_mode):
+    """Regression: ``num_cu < NUM_XCDS`` (=8) on a per-XCD-style ws_mode used
+    to silently drop tiles in the gap between ``num_cu * per_xcd`` and
+    ``NUM_XCDS * per_xcd`` (phase-2 started past where phase-1 actually
+    ended). With the ``ACTIVE_XCDS = min(NUM_SMS, NUM_XCDS)`` fix the kernel
+    matches static at any grid size. (The public API now blocks num_cu
+    together with schedule="work_steal", but the low-level kernel entry
+    point still accepts the combination -- belt-and-braces defense.)"""
+    from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+        grouped_gemm_triton_kernel,
+    )
+
+    device = "cuda"
+    torch.manual_seed(0)
+    B, M, N, K = 4, 1024, 2048, 1408
+    a = torch.randn((B * M, K), dtype=torch.bfloat16, device=device)
+    b = torch.randn((B, N, K), dtype=torch.bfloat16, device=device)
+    group_lens = torch.full((B,), M, dtype=torch.int64, device=device)
+    group_offs = torch.zeros(B + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = torch.cumsum(group_lens, dim=0)
+
+    out_ref = grouped_gemm_triton_kernel(a, b, group_offs, trans_b=True, work_steal=False)
+    out_ws = grouped_gemm_triton_kernel(
+        a, b, group_offs, trans_b=True, num_cu=num_cu, work_steal=True, ws_mode=ws_mode
+    )
+    torch.testing.assert_close(out_ref, out_ws, rtol=0.0, atol=0.0)

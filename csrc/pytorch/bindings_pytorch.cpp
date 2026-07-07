@@ -55,6 +55,10 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
     m.def("dequantize_mxfp4(Tensor input, Tensor scale_inv, int axis, int block_size, "
           "ScalarType dest_dtype) -> Tensor");
+    m.def("grouped_quantize_mxfp4_dual(Tensor input, Tensor group_lens, Tensor group_offs, "
+          "ScalarType dest_dtype, "
+          "bool rowwise_use_2d_block, bool rowwise_use_sr, bool rowwise_use_rht, "
+          "bool colwise_use_2d_block, bool colwise_use_sr, bool colwise_use_rht) -> Tensor[]");
 
     // ********* MXFP8 Quantization *********
     m.def("quantize_mxfp8_dual(Tensor input, ScalarType dest_dtype, "
@@ -139,6 +143,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual);
     m.impl("quantize_mxfp4", quantize_mxfp4);
     m.impl("dequantize_mxfp4", dequantize_mxfp4);
+    m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual);
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual);
@@ -188,6 +193,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual_meta);
     m.impl("quantize_mxfp4", quantize_mxfp4_meta);
     m.impl("dequantize_mxfp4", dequantize_mxfp4_meta);
+    m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual_meta);
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual_meta);

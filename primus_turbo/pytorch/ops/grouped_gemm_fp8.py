@@ -274,8 +274,8 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         ctx,
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
-        a_colwise: Optional[QuantizedTensor],
-        b_colwise: Optional[QuantizedTensor],
+        a_t: Optional[QuantizedTensor],
+        b_t: Optional[QuantizedTensor],
         group_lens: torch.Tensor,  # [B,] int64
         group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
@@ -337,13 +337,13 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         )
 
         # Col-wise trans cache for backward. If the caller pre-quantized this
-        # and passed it via ``a_colwise`` / ``b_colwise``, reuse it directly; otherwise
+        # and passed it via ``a_t`` / ``b_t``, reuse it directly; otherwise
         # derive it (dequantize + re-quantize along the other axis), mirroring
         # FP8GemmRowFunction in gemm_fp8.py.
-        if a_colwise is not None:
-            quantized_a_colwise = a_colwise
+        if a_t is not None:
+            quantized_a_t = a_t
         else:
-            quantized_a_colwise = QuantizedTensor.quantize(
+            quantized_a_t = QuantizedTensor.quantize(
                 quantized_a.dequantize(),
                 quantized_a.real_dtype,
                 config.granularity,
@@ -352,10 +352,10 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
                 group_lens=group_lens,
             )
 
-        if b_colwise is not None:
-            quantized_b_colwise = b_colwise
+        if b_t is not None:
+            quantized_b_t = b_t
         else:
-            quantized_b_colwise = QuantizedTensor.quantize(
+            quantized_b_t = QuantizedTensor.quantize(
                 quantized_b.dequantize(),
                 quantized_b.real_dtype,
                 config.granularity,
@@ -364,10 +364,10 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             )
 
         ctx.save_for_backward(
-            quantized_a_colwise.qdata,
-            quantized_b_colwise.qdata,
-            quantized_a_colwise.scale_inv,
-            quantized_b_colwise.scale_inv,
+            quantized_a_t.qdata,
+            quantized_b_t.qdata,
+            quantized_a_t.scale_inv,
+            quantized_b_t.scale_inv,
             group_lens,
             group_offs,
         )
@@ -439,8 +439,8 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         return (
             grad_a,  # a
             grad_b,  # b
-            None,  # a_colwise
-            None,  # b_colwise
+            None,  # a_t
+            None,  # b_t
             None,  # group_lens
             None,  # group_offs
             None,  # trans_b
@@ -456,8 +456,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         ctx,
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
-        a_colwise: Optional[QuantizedTensor],  # not used
-        b_colwise: Optional[QuantizedTensor],
+        a_t: Optional[QuantizedTensor],  # not used
+        b_t: Optional[QuantizedTensor],
         group_lens: torch.Tensor,  # [B,] int64
         group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
@@ -500,10 +500,10 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             )
 
         if use_nt_layout_gemm_in_bwd:
-            if b_colwise is not None and isinstance(b_colwise, QuantizedTensor):
-                quantized_b_colwise = b_colwise
+            if b_t is not None and isinstance(b_t, QuantizedTensor):
+                quantized_b_t = b_t
             else:
-                quantized_b_colwise = quantized_b.transpose(-1, -2).contiguous()
+                quantized_b_t = quantized_b.transpose(-1, -2).contiguous()
 
         out = grouped_gemm_fp8_impl(
             quantized_a.qdata,
@@ -524,9 +524,9 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         if use_nt_layout_gemm_in_bwd:
             ctx.save_for_backward(
                 quantized_a.qdata,
-                quantized_b_colwise.qdata,
+                quantized_b_t.qdata,
                 quantized_a.scale_inv,
-                quantized_b_colwise.scale_inv,
+                quantized_b_t.scale_inv,
                 group_lens,
                 group_offs,
             )
@@ -614,8 +614,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         return (
             grad_a,  # a
             grad_b,  # b
-            None,  # a_colwise
-            None,  # b_colwise
+            None,  # a_t
+            None,  # b_t
             None,  # group_lens
             None,  # group_offs
             None,  # trans_b
@@ -643,8 +643,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         ctx,
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
-        a_colwise: Optional[QuantizedTensor],
-        b_colwise: Optional[QuantizedTensor],
+        a_t: Optional[QuantizedTensor],
+        b_t: Optional[QuantizedTensor],
         group_lens: torch.Tensor,  # [B,] int64
         group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
@@ -687,8 +687,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             quantized_a = a
             check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
 
-            if a_colwise is None:
-                quantized_a_colwise = QuantizedTensor.quantize(
+            if a_t is None:
+                quantized_a_t = QuantizedTensor.quantize(
                     quantized_a.dequantize(),
                     quantized_a.real_dtype,
                     config.granularity,
@@ -698,15 +698,15 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                     group_lens=group_lens,
                 )
             else:
-                assert isinstance(a_colwise, QuantizedTensor)
-                quantized_a_colwise = a_colwise
+                assert isinstance(a_t, QuantizedTensor)
+                quantized_a_t = a_t
 
             a_fp8_row = quantized_a.qdata
             a_scale_row = quantized_a.scale_inv
-            a_fp8_col = quantized_a_colwise.qdata
-            a_scale_col = quantized_a_colwise.scale_inv
+            a_fp8_col = quantized_a_t.qdata
+            a_scale_col = quantized_a_t.scale_inv
 
-            group_offs_padded_rowwise = quantized_a.group_offs_padded_rowwise
+            group_offs_padded_rowwise = quantized_a.group_offs
 
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if not isinstance(b, QuantizedTensor):
@@ -724,8 +724,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             quantized_b = b
             check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
 
-            if b_colwise is None:
-                quantized_b_colwise = QuantizedTensor.quantize(
+            if b_t is None:
+                quantized_b_t = QuantizedTensor.quantize(
                     quantized_b.dequantize(),
                     quantized_b.real_dtype,
                     config.granularity,
@@ -734,13 +734,13 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                     scaling_recipe=b_scaling_recipe,
                 )
             else:
-                assert isinstance(b_colwise, QuantizedTensor)
-                quantized_b_colwise = b_colwise
+                assert isinstance(b_t, QuantizedTensor)
+                quantized_b_t = b_t
 
             b_fp8_row = quantized_b.qdata
             b_scale_row = quantized_b.scale_inv
-            b_fp8_col = quantized_b_colwise.qdata
-            b_scale_col = quantized_b_colwise.scale_inv
+            b_fp8_col = quantized_b_t.qdata
+            b_scale_col = quantized_b_t.scale_inv
 
         total_m = int(a.size(0))
         # fwd: read rowwise-padded layout (group_offs_padded_rowwise); the output
@@ -932,12 +932,12 @@ def grouped_gemm_fp8(
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)
     if isinstance(a, QuantizedTensorPair):
-        a_data, a_data_t = a.data, a.data_t
+        a_data, a_data_t = a.data_rowwise, a.data_t
     else:
         a_data, a_data_t = a, None
 
     if isinstance(b, QuantizedTensorPair):
-        b_data, b_data_t = b.data, b.data_t
+        b_data, b_data_t = b.data_rowwise, b.data_t
     else:
         b_data, b_data_t = b, None
 

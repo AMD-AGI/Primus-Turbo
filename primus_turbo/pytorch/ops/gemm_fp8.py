@@ -8,7 +8,9 @@ from typing import Optional, Union
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -59,8 +61,8 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         ctx,
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
-        a_colwise: Optional[QuantizedTensor],
-        b_colwise: Optional[QuantizedTensor],
+        a_t: Optional[QuantizedTensor],
+        b_t: Optional[QuantizedTensor],
         trans_a: bool,
         trans_b: bool,
         out_dtype: torch.dtype,
@@ -82,10 +84,10 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             )
 
         if use_nt_layout_gemm_in_bwd:
-            if a_colwise is not None and isinstance(a_colwise, QuantizedTensor):
-                quantized_a_colwise = a_colwise
+            if a_t is not None and isinstance(a_t, QuantizedTensor):
+                quantized_a_t = a_t
             else:
-                quantized_a_colwise = quantized_a.t().contiguous()
+                quantized_a_t = quantized_a.t().contiguous()
 
         if isinstance(b, QuantizedTensor):
             quantized_b = b
@@ -101,10 +103,10 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             )
 
         if use_nt_layout_gemm_in_bwd:
-            if b_colwise is not None and isinstance(b_colwise, QuantizedTensor):
-                quantized_b_colwise = b_colwise
+            if b_t is not None and isinstance(b_t, QuantizedTensor):
+                quantized_b_t = b_t
             else:
-                quantized_b_colwise = quantized_b.t().contiguous()
+                quantized_b_t = quantized_b.t().contiguous()
 
         out = gemm_fp8_impl(
             quantized_a.qdata,
@@ -121,10 +123,10 @@ class FP8GemmTensorFunction(torch.autograd.Function):
 
         if use_nt_layout_gemm_in_bwd:
             ctx.save_for_backward(
-                quantized_a_colwise.qdata,
-                quantized_a_colwise.scale_inv,
-                quantized_b_colwise.qdata,
-                quantized_b_colwise.scale_inv,
+                quantized_a_t.qdata,
+                quantized_a_t.scale_inv,
+                quantized_b_t.qdata,
+                quantized_b_t.scale_inv,
             )
         else:
             ctx.save_for_backward(
@@ -145,7 +147,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             grad_out = grad_out.contiguous()
 
         if ctx.use_nt_layout_gemm_in_bwd:
-            a_fp8_colwise, a_colwise_scale_inv, b_fp8_colwise, b_colwise_scale_inv = ctx.saved_tensors
+            a_fp8_t, a_t_scale_inv, b_fp8_t, b_t_scale_inv = ctx.saved_tensors
         else:
             a_fp8, a_scale_inv, b_fp8, b_scale_inv = ctx.saved_tensors
 
@@ -163,8 +165,8 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 quantized_grad_out.qdata,
                 quantized_grad_out.scale_inv,
                 False,
-                b_fp8_colwise,
-                b_colwise_scale_inv,
+                b_fp8_t,
+                b_t_scale_inv,
                 True,
                 ctx.out_dtype,
                 False,
@@ -189,8 +191,8 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             quantized_grad_out_t = quantized_grad_out.t().contiguous()
 
             b_grad = gemm_fp8_impl(
-                a_fp8_colwise,
-                a_colwise_scale_inv,
+                a_fp8_t,
+                a_t_scale_inv,
                 False,
                 quantized_grad_out_t.qdata,
                 quantized_grad_out_t.scale_inv,
@@ -217,8 +219,8 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         return (
             a_grad,  # a
             b_grad,  # b
-            None,  # a_colwise
-            None,  # b_colwise
+            None,  # a_t
+            None,  # b_t
             None,  # trans_a
             None,  # trans_b
             None,  # out_dtype
@@ -232,8 +234,8 @@ class FP8GemmRowFunction(torch.autograd.Function):
         ctx,
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
-        a_colwise: Optional[QuantizedTensor],
-        b_colwise: Optional[QuantizedTensor],
+        a_t: Optional[QuantizedTensor],
+        b_t: Optional[QuantizedTensor],
         trans_a: bool,
         trans_b: bool,
         out_dtype: torch.dtype,
@@ -254,8 +256,8 @@ class FP8GemmRowFunction(torch.autograd.Function):
                 block_size=config.block_size,
             )
 
-        if a_colwise is None:
-            quantized_a_colwise = QuantizedTensor.quantize(
+        if a_t is None:
+            quantized_a_t = QuantizedTensor.quantize(
                 quantized_a.dequantize(),
                 quantized_a.real_dtype,
                 config.granularity,
@@ -263,8 +265,8 @@ class FP8GemmRowFunction(torch.autograd.Function):
                 block_size=config.block_size,
             )
         else:
-            assert isinstance(a_colwise, QuantizedTensor)
-            quantized_a_colwise = a_colwise
+            assert isinstance(a_t, QuantizedTensor)
+            quantized_a_t = a_t
 
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, axis=-1 if trans_b else -2)
@@ -279,8 +281,8 @@ class FP8GemmRowFunction(torch.autograd.Function):
                 block_size=config.block_size,
             )
 
-        if b_colwise is None:
-            quantized_b_colwise = QuantizedTensor.quantize(
+        if b_t is None:
+            quantized_b_t = QuantizedTensor.quantize(
                 quantized_b.dequantize(),
                 quantized_b.real_dtype,
                 config.granularity,
@@ -288,8 +290,8 @@ class FP8GemmRowFunction(torch.autograd.Function):
                 block_size=config.block_size,
             )
         else:
-            assert isinstance(b_colwise, QuantizedTensor)
-            quantized_b_colwise = b_colwise
+            assert isinstance(b_t, QuantizedTensor)
+            quantized_b_t = b_t
 
         out = gemm_fp8_impl(
             quantized_a.qdata,
@@ -305,10 +307,10 @@ class FP8GemmRowFunction(torch.autograd.Function):
         )
 
         ctx.save_for_backward(
-            quantized_a_colwise.qdata,
-            quantized_a_colwise.scale_inv,
-            quantized_b_colwise.qdata,
-            quantized_b_colwise.scale_inv,
+            quantized_a_t.qdata,
+            quantized_a_t.scale_inv,
+            quantized_b_t.qdata,
+            quantized_b_t.scale_inv,
         )
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
@@ -322,7 +324,7 @@ class FP8GemmRowFunction(torch.autograd.Function):
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
-        a_fp8_colwise, a_colwise_scale_inv, b_fp8_colwise, b_colwise_scale_inv = ctx.saved_tensors
+        a_fp8_t, a_t_scale_inv, b_fp8_t, b_t_scale_inv = ctx.saved_tensors
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
         quantized_grad_out = QuantizedTensor.quantize(
@@ -338,8 +340,8 @@ class FP8GemmRowFunction(torch.autograd.Function):
             quantized_grad_out.qdata,
             quantized_grad_out.scale_inv,
             False,
-            b_fp8_colwise,
-            b_colwise_scale_inv,
+            b_fp8_t,
+            b_t_scale_inv,
             not ctx.trans_b,
             ctx.out_dtype,
             ctx.trans_a,
@@ -353,8 +355,8 @@ class FP8GemmRowFunction(torch.autograd.Function):
 
         # TN
         b_grad = gemm_fp8_impl(
-            a_fp8_colwise,
-            a_colwise_scale_inv,
+            a_fp8_t,
+            a_t_scale_inv,
             not ctx.trans_a,
             quantized_grad_out_t.qdata,
             quantized_grad_out_t.scale_inv,
@@ -368,8 +370,8 @@ class FP8GemmRowFunction(torch.autograd.Function):
         return (
             a_grad,  # a
             b_grad,  # b
-            None,  # a_colwise
-            None,  # b_colwise
+            None,  # a_t
+            None,  # b_t
             None,  # trans_a
             None,  # trans_b
             None,  # out_dtype
@@ -517,8 +519,8 @@ class FP8GemmMXFunction(torch.autograd.Function):
         ctx,
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
-        a_colwise: Optional[QuantizedTensor],
-        b_colwise: Optional[QuantizedTensor],
+        a_t: Optional[QuantizedTensor],
+        b_t: Optional[QuantizedTensor],
         trans_a: bool,
         trans_b: bool,
         out_dtype: torch.dtype,
@@ -529,89 +531,71 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         assert trans_a == False and trans_b == True, "trans_a has to be False and trans_b has to be True"
 
+        # Scale preshuffle is NOT done here: the quant emits raw E8M0 [dim, K//32]
+        # scales and each GEMM backend implicitly preshuffles right before its own
+        # kernel (FlyDSL fuses it into the gemm launch / turbo 16x4 / hipBLASLt vendor).
+        fp8_dtype = _get_fp8_dtype(config.format, True)
+        granularity = config.granularity
+        block_size = config.block_size
+
         a_scaling_recipe = ScalingRecipe()
         if isinstance(a, QuantizedTensor):
-            quantized_a = a
-            check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
+            check_quantized_tensor(a, config, axis=-1, scaling_recipe=a_scaling_recipe)
+            a_row, a_row_scale = a.qdata, a.scale_inv
+            if a_t is None:
+                a_t = QuantizedTensor.quantize(
+                    a.dequantize(),
+                    a.real_dtype,
+                    granularity,
+                    axis=-2,
+                    block_size=block_size,
+                    scaling_recipe=a_scaling_recipe,
+                )
+            a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
-            a_dtype = _get_fp8_dtype(config.format, True)
-            quantized_a = QuantizedTensor.quantize(
-                a,
-                a_dtype,
-                config.granularity,
-                axis=-1,
-                block_size=config.block_size,
-                scaling_recipe=a_scaling_recipe,
+            a_row, a_row_scale, a_col, a_col_scale = quantize_fp8_with_trans(
+                a, fp8_dtype, granularity, block_size=block_size, scaling_recipe=a_scaling_recipe
             )
-
-        if a_colwise is None:
-            # MX_BLOCKWISE requires a scaling_recipe; reuse the forward recipe
-            # for A's col-wise direction (same recipe as forward).
-            quantized_a_colwise = QuantizedTensor.quantize(
-                quantized_a.dequantize(),
-                quantized_a.real_dtype,
-                config.granularity,
-                axis=-2,
-                block_size=config.block_size,
-                scaling_recipe=a_scaling_recipe,
-            )
-        else:
-            assert isinstance(a_colwise, QuantizedTensor)
-            quantized_a_colwise = a_colwise
 
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if isinstance(b, QuantizedTensor):
-            quantized_b = b
-            check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
+            check_quantized_tensor(b, config, axis=-1, scaling_recipe=b_scaling_recipe)
+            b_row, b_row_scale = b.qdata, b.scale_inv
+            if b_t is None:
+                b_t = QuantizedTensor.quantize(
+                    b.dequantize(),
+                    b.real_dtype,
+                    granularity,
+                    axis=-2,
+                    block_size=block_size,
+                    scaling_recipe=b_scaling_recipe,
+                )
+            b_col, b_col_scale = b_t.qdata, b_t.scale_inv
         else:
-            b_dtype = _get_fp8_dtype(config.format, True)
-            quantized_b = QuantizedTensor.quantize(
+            b_row, b_row_scale, b_col, b_col_scale = quantize_fp8_with_trans(
                 b,
-                b_dtype,
-                config.granularity,
-                axis=-1,
-                block_size=config.block_size,
+                fp8_dtype,
+                granularity,
+                block_size=block_size,
                 scaling_recipe=b_scaling_recipe,
+                scaling_recipe_for_trans=b_scaling_recipe,
             )
-
-        if b_colwise is None:
-            # MX_BLOCKWISE requires a scaling_recipe; reuse the forward recipe
-            # for B's col-wise direction (same recipe as forward).
-            quantized_b_colwise = QuantizedTensor.quantize(
-                quantized_b.dequantize(),
-                quantized_b.real_dtype,
-                config.granularity,
-                axis=-2,
-                block_size=config.block_size,
-                scaling_recipe=b_scaling_recipe,
-            )
-        else:
-            assert isinstance(b_colwise, QuantizedTensor)
-            quantized_b_colwise = b_colwise
 
         # NT layout
         out = gemm_fp8_impl(
-            quantized_a.qdata,
-            quantized_a.scale_inv,
+            a_row,
+            a_row_scale,
             False,
-            quantized_b.qdata,
-            quantized_b.scale_inv,
+            b_row,
+            b_row_scale,
             True,
             out_dtype,
             False,
-            granularity=config.granularity.value,
-            default_backend=BackendType.TURBO.value,
+            granularity=granularity.value,
+            default_backend=BackendType.FLYDSL.value,
         )
 
-        ctx.save_for_backward(
-            quantized_a_colwise.qdata,
-            quantized_a_colwise.scale_inv,
-            quantized_b_colwise.qdata,
-            quantized_b_colwise.scale_inv,
-        )
-
-        ctx.trans_a = trans_a
-        ctx.trans_b = trans_b
+        ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
         ctx.out_dtype = out_dtype
         ctx.config = config
 
@@ -619,54 +603,50 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        a_fp8_colwise, a_colwise_scale_inv, b_fp8_colwise, b_colwise_scale_inv = ctx.saved_tensors
+        a_col, a_col_scale, b_col, b_col_scale = ctx.saved_tensors
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
+        # reshape (not view): the dual-cast quant kernel asserts a contiguous input;
+        # a strided grad_out (e.g. a transpose/slice upstream) would trip it.
         grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
 
-        scaling_recipe = ScalingRecipe()
-        grad_out_fp8, grad_out_scale_inv, grad_out_fp8_t, grad_out_t_scale_inv = quantize_fp8_with_trans(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            scaling_recipe=scaling_recipe,
-            scaling_recipe_for_trans=scaling_recipe,
+        # Dual-cast grad_out: one kernel emits both the row-wise (grad_a, NN->NT) and
+        # col-wise (grad_b, TN->NT) directions -- no second single-direction pass.
+        g_row, g_row_scale, g_col, g_col_scale = quantize_fp8_with_trans(
+            grad_out, grad_out_dtype, ctx.config.granularity, block_size=ctx.config.block_size
         )
 
-        # NOTE: convert NN layout to NT layout because MXFP8 only supports NT layout.
         grad_a = gemm_fp8_impl(
-            grad_out_fp8,
-            grad_out_scale_inv,
+            g_row,
+            g_row_scale,
             False,
-            b_fp8_colwise,
-            b_colwise_scale_inv,
+            b_col,
+            b_col_scale,
             True,
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TURBO.value,
+            default_backend=BackendType.FLYDSL.value,
         )
 
-        # NOTE: convert TN layout to NT layout because MXFP8 only supports NT layout.
         grad_b = gemm_fp8_impl(
-            grad_out_fp8_t,
-            grad_out_t_scale_inv,
+            g_col,
+            g_col_scale,
             False,
-            a_fp8_colwise,
-            a_colwise_scale_inv,
+            a_col,
+            a_col_scale,
             True,
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.TURBO.value,
+            default_backend=BackendType.FLYDSL.value,
         )
 
         return (
             grad_a,  # a
             grad_b,  # b
-            None,  # a_colwise
-            None,  # b_colwise
+            None,  # a_t
+            None,  # b_t
             None,  # trans_a
             None,  # trans_b
             None,  # out_dtype

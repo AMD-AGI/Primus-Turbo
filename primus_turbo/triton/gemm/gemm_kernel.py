@@ -35,7 +35,7 @@ from primus_turbo.triton.utils.origami import (
     origama_hardware_info,
     origama_select_params,
 )
-from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
+from primus_turbo.triton.utils.triton_knobs_helper import scoped_amd_knobs
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Hardware constants & chiplet transform
@@ -246,6 +246,7 @@ def _bf16_persistent_gemm_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@scoped_amd_knobs
 def gemm_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -313,8 +314,6 @@ def gemm_triton_kernel(
     s_bk = B_view.stride(0)
 
     if is_gfx950():
-        set_triton_knobs_gfx950()
-
         # gfx950 BF16 config from 164-entry tuning data.
         # TN layout with large K → BLK_K=64, stages=2; all other cases → 32/3.
         # Small TN (K≤3584, dims≤16384, min dim≤4608) stays on 32/3.

@@ -54,21 +54,10 @@ from primus_turbo.triton.utils.origami import (
     origama_hardware_info,
     origama_select_params,
 )
-from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
+from primus_turbo.triton.utils.triton_knobs_helper import scoped_amd_knobs
 
 _grouped_blockwise_warmed: set = set()
 _grouped_blockwise_vk_warmed: set = set()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AMD knobs helper
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _set_amd_knobs(enable: bool = True):
-    """Set AMD-specific Triton knobs."""
-    if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
-        triton.knobs.amd.use_async_copy = enable
-        triton.knobs.amd.scalarize_packed_fops = enable
 
 
 def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
@@ -498,6 +487,7 @@ def _grouped_fp8_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_tensorwise_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -553,8 +543,6 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size, num_sms = (
         _get_gg_fp8_tw_fwd_config(
             avg_m,
@@ -612,6 +600,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
 # ── Tensorwise FP8 Variable-K Backward ──
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -645,8 +634,6 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = get_num_cus()
 
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_tw_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
@@ -853,6 +840,7 @@ def _grouped_fp8_rowwise_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_rowwise_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -907,8 +895,6 @@ def grouped_gemm_fp8_rowwise_triton_kernel(
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = get_num_cus()
     avg_m = max(M_total // max(G, 1), 256)
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_rw_fwd_config(
         avg_m,
         N,
@@ -1111,6 +1097,7 @@ def _grouped_fp8_rowwise_variable_k_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -1148,8 +1135,6 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = get_num_cus()
 
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
     blk_m, blk_n, blk_k, group_m, cache_a, cache_b, num_stages_val, chunk_size = _get_gg_fp8_rw_vk_config(
         OUT_M, OUT_N, avg_m_g, lhs.dtype, rhs.dtype, G, num_sms
@@ -1707,6 +1692,7 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
 # ── Blockwise FP8 Forward Public API ──
 
 
+@scoped_amd_knobs(gfx942_enable=True)
 def grouped_gemm_fp8_blockwise_triton_kernel(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1733,11 +1719,6 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
     Returns:
         [M_total, N] output in out_dtype.
     """
-    if is_gfx950():
-        set_triton_knobs_gfx950()
-    else:
-        _set_amd_knobs(enable=True)
-
     assert a.ndim == 2, f"a must be 2D, got {a.shape}"
     assert b.ndim == 3, f"b must be 3D, got {b.shape}"
     assert b_scales.ndim == 3, f"b_scales must be 3D, got {b_scales.shape}"
@@ -1853,6 +1834,7 @@ def grouped_gemm_fp8_blockwise_triton_kernel(
 # ── Blockwise FP8 Variable-K Backward Public API ──
 
 
+@scoped_amd_knobs(gfx942_enable=False)
 def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -1891,11 +1873,6 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     Returns:
         [G, OUT_M, OUT_N] output.
     """
-    if is_gfx950():
-        set_triton_knobs_gfx950()
-    else:
-        _set_amd_knobs(enable=False)
-
     assert lhs.ndim == 2 and rhs.ndim == 2
     G = group_offs.shape[0] - 1
 
@@ -2159,6 +2136,7 @@ def _grouped_mxfp8_persistent_gemm_kernel(
         tl.store(C_, c, c_mask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_mxfp8_triton_kernel(
     a,
     a_scale,
@@ -2180,8 +2158,6 @@ def grouped_gemm_mxfp8_triton_kernel(
     """
     if group_offs_out is None:
         group_offs_out = group_offs
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     G = b.shape[0]
     c = torch.empty((a.shape[0], N), dtype=out_dtype, device=a.device)
     # scales come from the grouped MX quant in (free, K/VEC) layout:
@@ -2371,6 +2347,7 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
             tl.store(C_, acc.to(C.type.element_ty), cmask)
 
 
+@scoped_amd_knobs
 def grouped_gemm_mxfp8_variable_k_triton_kernel(
     lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=None,
     accumulate_out=None, reverse_groups=False,
@@ -2381,8 +2358,6 @@ def grouped_gemm_mxfp8_variable_k_triton_kernel(
     expert main_grad), the wgrad is fused-accumulated into it (C += result) and that
     buffer is returned; otherwise a fresh ``out_dtype`` tensor is allocated and written.
     """
-    if is_gfx950():
-        set_triton_knobs_gfx950()
     if accumulate_out is not None:
         assert accumulate_out.dtype == torch.float32, "accumulate_out (main_grad) must be fp32"
         assert tuple(accumulate_out.shape) == (G, OUT_M, OUT_N)

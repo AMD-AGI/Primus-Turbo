@@ -259,7 +259,7 @@ def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     M_actual = x_2d.size(0)
     N_actual = x_2d.size(1)
 
-    x_fp8_rowwise, x_scale_inv_rowwise, x_fp8_colwise, x_scale_inv_colwise = quantize_fp8_with_trans(
+    x_fp8_rowwise, x_scale_inv_rowwise, x_fp8_t, x_scale_inv_colwise = quantize_fp8_with_trans(
         x_2d,
         dest_dtype,
         granularity=granularity,
@@ -309,7 +309,7 @@ def test_quantize_mxfp8_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     )
 
     out_colwise = dequantize_fp8(
-        x_fp8_colwise,
+        x_fp8_t,
         orig_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,

@@ -494,7 +494,6 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
                        "Input must be BFloat16 or Half");
-    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
     PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
     PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2.");
     // Guard the public op argument against zero/negative values (would otherwise
@@ -503,8 +502,23 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
                        "padding_align_size must be ", MXFP4_K_DIM_PADDING_ALIGN_SIZE,
                        " for MXFP4. But got padding_align_size=", padding_align_size);
 
-    const int64_t M = input.size(0);
-    const int64_t N = input.size(1);
+    // Mirror ``quantize_mxfp8_dual``: 2D keeps ``G == 1`` and the original 2D
+    // output layout; 3D (batched, e.g. the MX grouped GEMM weight ``[G, N, K]``)
+    // carries a leading group dim on every per-group buffer and returns 3D views.
+    int64_t G, M, N;
+    if (input.dim() == 2) {
+        G = 1;
+        M = input.size(0);
+        N = input.size(1);
+    } else if (input.dim() == 3) {
+        G = input.size(0);
+        M = input.size(1);
+        N = input.size(2);
+    } else {
+        PRIMUS_TURBO_ERROR("Input must be 2D or 3D");
+    }
+    const bool    is_batched = (input.dim() == 3);
+    const int64_t Gout       = is_batched ? G : 1;
 
     const int64_t M_pad = cdiv(M, padding_align_size) * padding_align_size;
     const int64_t N_pad = cdiv(N, padding_align_size) * padding_align_size;
@@ -530,18 +544,18 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     int64_t    rowwise_scale_stride = 1;
     at::Tensor rowwise_scale;
     if (shuffle_rowwise_scale) {
-        rowwise_scale        = at::full({rowwise_scale_M_pad, rowwise_scale_N_pad}, /*scale pad=*/0,
-                                        at::TensorOptions().dtype(at::kByte).device(device));
+        rowwise_scale = at::full({Gout * rowwise_scale_M_pad, rowwise_scale_N_pad}, /*scale pad=*/0,
+                                 at::TensorOptions().dtype(at::kByte).device(device));
         rowwise_scale_stride = rowwise_scale.stride(0);
     } else {
-        rowwise_scale =
-            at::empty({M, rowwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+        rowwise_scale        = at::empty({Gout * M, rowwise_scale_N},
+                                         at::TensorOptions().dtype(at::kByte).device(device));
         rowwise_scale_stride = rowwise_scale_N;
     }
 
     // packed 2 fp4 values in N dimension
     at::Tensor rowwise_output =
-        at::empty({M, N_pad / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+        at::empty({Gout * M, N_pad / 2}, at::TensorOptions().dtype(at::kByte).device(device));
 
     int64_t colwise_scale_M_pad = cdiv(N, 256) * 256;
     int64_t colwise_scale_N     = cdiv(M_pad, MXFP4_BLOCK_SIZE);
@@ -550,18 +564,18 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     at::Tensor colwise_scale;
     int        colwise_scale_stride = 1;
     if (shuffle_colwise_scale) {
-        colwise_scale        = at::full({colwise_scale_M_pad, colwise_scale_N_pad}, /*scale pad=*/0,
-                                        at::TensorOptions().dtype(at::kByte).device(device));
+        colwise_scale = at::full({Gout * colwise_scale_M_pad, colwise_scale_N_pad}, /*scale pad=*/0,
+                                 at::TensorOptions().dtype(at::kByte).device(device));
         colwise_scale_stride = colwise_scale.stride(0);
     } else {
-        colwise_scale =
-            at::empty({N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+        colwise_scale        = at::empty({Gout * N, colwise_scale_N},
+                                         at::TensorOptions().dtype(at::kByte).device(device));
         colwise_scale_stride = colwise_scale_N;
     }
 
     // packed 2 fp4 values in N dimension
     at::Tensor colwise_output =
-        at::empty({N, M_pad / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+        at::empty({Gout * N, M_pad / 2}, at::TensorOptions().dtype(at::kByte).device(device));
 
     TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), DType, {
         quantize_mxfp4_dual_impl<DType>(
@@ -569,7 +583,7 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
             reinterpret_cast<dtype::float4x2_e2m1 *>(rowwise_output.data_ptr()),
             rowwise_scale.data_ptr<uint8_t>(),
             reinterpret_cast<dtype::float4x2_e2m1 *>(colwise_output.data_ptr()),
-            colwise_scale.data_ptr<uint8_t>(), M, N, M_pad, N_pad, rowwise_scale_stride,
+            colwise_scale.data_ptr<uint8_t>(), G, M, N, M_pad, N_pad, rowwise_scale_stride,
             colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N,
             colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,
             ScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht,
@@ -578,6 +592,15 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
                           shuffle_colwise_scale, shuffle_colwise),
             stream);
     });
+
+    if (is_batched) {
+        const int64_t rowwise_scale_rows = shuffle_rowwise_scale ? rowwise_scale_M_pad : M;
+        const int64_t colwise_scale_rows = shuffle_colwise_scale ? colwise_scale_M_pad : N;
+        return {rowwise_output.view({G, M, N_pad / 2}).view(at::kFloat4_e2m1fn_x2),
+                rowwise_scale.view({G, rowwise_scale_rows, -1}).view(at::kFloat8_e8m0fnu),
+                colwise_output.view({G, N, M_pad / 2}).view(at::kFloat4_e2m1fn_x2),
+                colwise_scale.view({G, colwise_scale_rows, -1}).view(at::kFloat8_e8m0fnu)};
+    }
 
     return {rowwise_output.view(at::kFloat4_e2m1fn_x2), rowwise_scale.view(at::kFloat8_e8m0fnu),
             colwise_output.view(at::kFloat4_e2m1fn_x2), colwise_scale.view(at::kFloat8_e8m0fnu)};
@@ -1134,6 +1157,100 @@ grouped_quantize_mxfp8_dual(const at::Tensor input, const at::Tensor group_lens,
     return {rowwise_output.view(dest_dtype), rowwise_scale.view(at::kFloat8_e8m0fnu),
             colwise_output.view(dest_dtype), colwise_scale.view(at::kFloat8_e8m0fnu),
             group_lens_padded_rowwise,       group_offs_padded_rowwise,
+            group_lens_padded_colwise,       group_offs_padded_colwise};
+}
+
+// Fused single-pass grouped dual (rowwise + colwise) MXFP4 quant for grouped GEMM.
+// One bf16/fp16 read of grouped activation ``input`` [total_M, N] (groups along M
+// via ``group_offs``) emits, in one pass:
+//   * rowwise FP4 [total_M, N_pad/2] + E8M0 scale [total_M, N_pad/32] in the tight
+//     (un-padded) M layout -- the fwd/dgrad operand (row i == input row i);
+//   * colwise FP4 [N, M_pad_col/2] + E8M0 scale [N, M_pad_col/32] in the 128-padded
+//     per-group M layout -- the variable-K wgrad operand.
+// ``M_pad_col`` is the static upper bound ``total_M + G*128`` so the output shapes
+// never depend on the runtime group distribution (CUDA-graph capturable, no D2H).
+// Shuffle layouts are unused by the grouped MXFP4 GEMM, so they are not exposed.
+std::vector<at::Tensor>
+grouped_quantize_mxfp4_dual(const at::Tensor input, const at::Tensor group_lens,
+                            const at::Tensor group_offs, const at::ScalarType dest_dtype,
+                            const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+                            const bool rowwise_use_rht, const bool colwise_use_2d_block,
+                            const bool colwise_use_sr, const bool colwise_use_rht) {
+    using namespace primus_turbo::detail;
+
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
+                       "Input must be BFloat16 or Half");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    PRIMUS_TURBO_CHECK(group_lens.is_cuda() && group_offs.is_cuda(),
+                       "group_lens / group_offs must be CUDA tensors");
+    PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong &&
+                           group_offs.scalar_type() == at::kLong,
+                       "group_lens / group_offs must be int64");
+    PRIMUS_TURBO_CHECK(group_lens.dim() == 1 && group_offs.dim() == 1,
+                       "group_lens / group_offs must be 1D");
+    PRIMUS_TURBO_CHECK(group_offs.size(0) == group_lens.size(0) + 1,
+                       "group_offs.size(0) must equal group_lens.size(0) + 1");
+    PRIMUS_TURBO_CHECK(group_lens.size(0) >= 1, "must have at least one group");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2");
+
+    constexpr int64_t COL_ALIGN = MXFP4_K_DIM_PADDING_ALIGN_SIZE; // = 128
+
+    const int64_t G         = group_lens.size(0);
+    const int64_t total_M   = input.size(0);
+    const int64_t N         = input.size(1);
+    const int64_t M_pad_col = cdiv(total_M + G * COL_ALIGN, COL_ALIGN) * COL_ALIGN;
+    const int64_t N_pad     = cdiv(N, COL_ALIGN) * COL_ALIGN;
+
+    PRIMUS_TURBO_CHECK(N % MXFP4_BLOCK_SIZE == 0, "N must be divisible by ", MXFP4_BLOCK_SIZE);
+
+    auto device = input.device();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // colwise (wgrad A): 128-padded per-group M layout; also drives the kernel
+    // grid + tile->group mapping (BLOCK_M = 128).
+    auto group_lens_padded_colwise = at::empty_like(group_lens);
+    auto group_offs_padded_colwise = at::empty({G + 1}, group_offs.options());
+    primus_turbo::compute_padded_layout_gpu(
+        group_lens.data_ptr<int64_t>(), group_lens_padded_colwise.data_ptr<int64_t>(),
+        group_offs_padded_colwise.data_ptr<int64_t>(), static_cast<int>(G), COL_ALIGN, stream);
+
+    // Rowwise (fwd/dgrad A): tight M layout (total_M rows, row i == input row i).
+    int64_t    rowwise_scale_N      = cdiv(N_pad, MXFP4_BLOCK_SIZE);
+    int64_t    rowwise_scale_stride = rowwise_scale_N;
+    at::Tensor rowwise_scale =
+        at::empty({total_M, rowwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+    at::Tensor rowwise_output =
+        at::empty({total_M, N_pad / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+
+    // Colwise (wgrad A): 128-padded M layout (M_pad_col upper bound).
+    int64_t    colwise_scale_N      = cdiv(M_pad_col, MXFP4_BLOCK_SIZE);
+    int64_t    colwise_scale_stride = colwise_scale_N;
+    at::Tensor colwise_scale =
+        at::empty({N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+    at::Tensor colwise_output =
+        at::empty({N, M_pad_col / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), IType, {
+        grouped_quantize_mxfp4_dual_impl<IType>(
+            reinterpret_cast<IType *>(input.data_ptr()),
+            reinterpret_cast<dtype::float4x2_e2m1 *>(rowwise_output.data_ptr()),
+            rowwise_scale.data_ptr<uint8_t>(),
+            reinterpret_cast<dtype::float4x2_e2m1 *>(colwise_output.data_ptr()),
+            colwise_scale.data_ptr<uint8_t>(), group_offs.data_ptr<int64_t>(),
+            group_offs_padded_colwise.data_ptr<int64_t>(), static_cast<int>(G),
+            static_cast<int>(total_M), static_cast<int>(N), static_cast<int>(M_pad_col),
+            static_cast<int>(N_pad), static_cast<int>(rowwise_scale_stride),
+            static_cast<int>(colwise_scale_stride), static_cast<int>(rowwise_scale_N),
+            static_cast<int>(colwise_scale_N),
+            ScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht, false, false),
+            ScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht, false, false),
+            stream);
+    });
+
+    return {rowwise_output.view(dest_dtype), rowwise_scale.view(at::kFloat8_e8m0fnu),
+            colwise_output.view(dest_dtype), colwise_scale.view(at::kFloat8_e8m0fnu),
             group_lens_padded_colwise,       group_offs_padded_colwise};
 }
 

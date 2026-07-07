@@ -4,7 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
@@ -228,6 +230,145 @@ class Mfma16x16x128:
         return c
 
 
+# ── MXFP8 scaled MFMA + per-1x32 E8M0 scale loaders (block-scaled dense GEMM);
+#    scales are pre-shuffled by the quant / FlyDSL preshuffle.
+
+
+def _asm_mma_scale_do(a, b, c, sa, sb, opsel, cbsz=0, blgp=0):
+    """Inline-asm scaled MFMA v_mfma_scale_f32_16x16x128_f8f6f4. =&v early-clobber
+    forces dst disjoint from srcA/srcB; opaque to the backend so it co-schedules with
+    the asm ds_read_b64_tr_b8 loads. opsel (0..3) picks the packed E8M0 byte via
+    op_sel (low bit) / op_sel_hi (high bit). cbsz/blgp select srcA/srcB fp8 format
+    (0=E4M3, 1=E5M2)."""
+    v4f32 = ir.VectorType.get([4], ir.F32Type.get())
+    lo = opsel & 1
+    hi = (opsel >> 1) & 1
+    osel = f"op_sel:[{lo},{lo},0] op_sel_hi:[{hi},{hi},0]"
+    cons = "=&v,v,v,0,v,v"  # VGPR early-clobber accumulator
+    op = _llvm.InlineAsmOp(
+        res=v4f32,
+        operands_=[_raw(a), _raw(b), _raw(c), _raw(sa), _raw(sb)],
+        asm_string=f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 cbsz:{cbsz} blgp:{blgp} {osel}",
+        constraints=cons,
+        has_side_effects=False,
+    )
+    return Vec(op.result)
+
+
+class MfmaScale16x16x128:
+    """16x16x128 f8f6f4 MFMA with per-block E8M0 scale operands.
+
+    Mirrors ``Mfma16x16x128`` but routes through the raw rocdl intrinsic so
+    the (scale_a, scale_b) i32 operands can be supplied per call.
+    """
+
+    def __init__(self, n_tiles_a, n_tiles_b, asm_mma=False, cbsz=0, blgp=0):
+        self.res_ty = Vec.make_type(4, fx.Float32)
+        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        # asm_mma routes through the inline-asm scaled MFMA (see _asm_mma_scale_do).
+        # opsel picks which of the i32 scale operand's 4 E8M0 bytes the MMA reads; the
+        # FlyDSL scale preshuffle emits the broadcast layout (same byte in all 4), so
+        # opsel stays 0.
+        self.opsel = 0
+        self.asm_mma = asm_mma
+        self.cbsz = cbsz  # srcA fp8 format: 0=E4M3, 1=E5M2
+        self.blgp = blgp  # srcB fp8 format: 0=E4M3, 1=E5M2
+
+    def idx(self, i, j):
+        return i * self.n_tiles_b + j
+
+    def _do_mma(self, a, b, c, sa, sb):
+        # operand order: a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b
+        if self.asm_mma:  # inline-asm scaled MFMA (co-schedules with asm tr8 loads)
+            return _asm_mma_scale_do(a, b, c, sa, sb, self.opsel, self.cbsz, self.blgp)
+        return rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+            self.res_ty,
+            [a, b, c, self.cbsz, self.blgp, self.opsel, sa, self.opsel, sb],
+        )
+
+    def call(self, a, b, c, sa, sb):
+        assert len(a) == self.n_tiles_a
+        assert len(b) == self.n_tiles_b
+        assert len(c) == self.n_tiles_a * self.n_tiles_b
+        assert len(sa) == self.n_tiles_a
+        assert len(sb) == self.n_tiles_b
+
+        for i in range_constexpr(self.n_tiles_a):
+            for j in range_constexpr(self.n_tiles_b):
+                c[self.idx(i, j)] = self._do_mma(a[i], b[j], c[self.idx(i, j)], sa[i], sb[j])
+        return c
+
+
+class ScaleBComb:
+    """Combined B scale loader (pairs with the combined-B preshuffle, layout 3:
+    ``build_preshuffle_ab_kernel`` B region / C++ ``compute_preshuffle_scale_index``).
+
+    One dwordx4 per lane returns [s0,s1,s2,s3]; (s0,s1)=b0 sub-tiles, (s2,s3)=b1.
+    """
+
+    def __init__(self, sp_tensor, dim, K):
+        self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
+        self.lane = fx.thread_idx.x % 64
+        # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
+        # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
+        # only its valid wn groups; OOB-col reads clamp to 0 and StoreC drops them.
+        # dim%256==0 -> cdiv(dim,256)*4 == dim//64 (no change for aligned shapes).
+        nbytes = ((dim + 255) // 256) * 4 * self.K128 * 64 * 4 * 4  # int32 records
+        self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
+
+    def load(self, base, k):
+        """base: sb_base0 (b0 region col base). Returns 4 i32 (b0:0,1  b1:2,3)."""
+        grp = (base // 256) * 4 + (base % 256) // 32
+        idx = ((grp * self.K128 + k) * 64 + self.lane) * 4
+        v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
+        return [v[i].ir_value() for i in range_constexpr(4)]
+
+
+class ScaleS2R:
+    """Per-lane E8M0 scale loader for v_mfma_scale_f32_16x16x128 (preshuffled).
+
+    The 16x16x128 MFMA distributes K=128 so lane ``(g, r)`` with
+    ``g = lane//16`` (0..3) and ``r = lane%16`` holds the A/B data for matrix
+    row/col ``r`` and the 32-K micro-block ``g``. With opsel==0 the hardware
+    samples byte 0 of each lane's scale operand, so lane ``(g, r)`` just needs
+    ``scale[r, 4k+g]`` in a register.
+
+    To make that a single fully-coalesced dword load with no per-lane ALU, the
+    host pre-shuffles the raw E8M0 [DIM, K//32] into
+
+        SP[rt, k, lane] = broadcast_u8_to_u32( scale[rt*16 + lane%16, 4k + lane//16] )
+
+    laid out int32 [DIM//16, K//128, 64]. For row-tile ``rt`` and K-iter ``k``
+    the 64 lanes of a wave read 64 contiguous dwords. The A-operand preshuffle
+    (layout 1) is produced by ``build_preshuffle_ab_kernel`` (A region), fused into
+    the mxfp8 GEMM launch.
+    """
+
+    def __init__(self, sp_tensor, dim, K, n_tiles):
+        self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
+        self.n_tiles = n_tiles
+        self.group_span = 16 * n_tiles
+        self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
+        # cdiv (not floor): a non-group_span-multiple ``dim`` (general M) still needs the
+        # partial last 64-row group resident so its valid rows read real scales; the
+        # group's OOB rows were preshuffle-masked to 0 and StoreC drops their output.
+        nbytes = ceildiv(dim, self.group_span) * self.K128 * 64 * n_tiles * 4  # int32 records
+        self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
+
+    def load(self, base, k):
+        """base: runtime global row/col base for this (region, wave). Returns n_tiles i32.
+
+        One vectorized dword{n_tiles} load: the n_tiles sub-tile scales for this
+        wave at (group, k) are contiguous per lane (A-operand preshuffle layout 1).
+        """
+        grp = base // self.group_span
+        idx = ((grp * self.K128 + k) * 64 + self.lane) * self.n_tiles
+        v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
+        return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
+
+
 # ── Reusable fp8 GEMM primitives (store, K-tail mask, value-attrs, AGPR MFMA, XCD
 #    remap, LDS-ptr/transpose loaders, swizzle), shared by dense and grouped.
 
@@ -248,10 +389,15 @@ def _readfirstlane_i32(v):
 
 
 class StoreCPerTensor:
-    """Per-tensor scaled output store: out = (acc * a_scale * b_scale).to(out_ty).
+    """Scalar output store: out = (acc [* a_scale * b_scale]).to(out_ty).
 
-    Both scales are read once from length-1 buffers and applied uniformly;
-    out_ty is bf16 or fp16. Columns past c_cols clamp to an OOB index.
+    Shared by the per-tensor GEMM and the mxfp8 GEMM. ``A_scale``/``B_scale`` are
+    optional: when given, both are read once from length-1 buffers and applied
+    uniformly (per-tensor); when ``None`` the scale is already folded into the
+    accumulator by the scaled MMA (mxfp8), so the store is plain. The output is
+    re-based per row band in 64-bit index (int64-safe, M*N > 4GB) via
+    ``make_row_band_resource``; columns past c_cols clamp to an OOB index (HW SRD
+    drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
     """
 
     def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty):
@@ -262,38 +408,24 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
-        # C addressed via i64 per-tile re-basing (handles M*N > 2^31 / >4GB output);
-        # pass C as 2D so its shape packs within int32.
+        self.scaled = A_scale is not None
         self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
-        gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
-        gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
-        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
-        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
-        self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        if self.scaled:
+            gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
+            gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
+            self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+            self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+            self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
 
     def _load_scalar(self, div):
         fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def store(self, c_frag, base_row, base_col):
-        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
-        # Re-base output at this row band (i64) so the per-store byte offset stays int32;
-        # clamp band base to [0, c_rows] and num_records to the 32-bit SRD field.
-        out_b = 2  # bf16/fp16 = 2 bytes
-        cols_i = _as_index(self.c_cols)
-        row_i = _as_index(base_row)
-        rows_i = _as_index(self.c_rows)
-        row_c = arith.minui(row_i, rows_i)
-        band_base = self.c_base + row_c * cols_i * arith.index(out_b)
-        # Cap at 0x7FFFFFFF so buffer_store(mask=False) → voffset=0x7FFFFFFF is always OOB;
-        # valid tile offsets are at most BLOCK_M*c_cols*2 ≈ 30 MB << 2 GB.
-        nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0x7FFFFFFF))
-        # Pin to SGPRs: base_row derives from the group scan which the compiler marks as
-        # divergent, landing the SRD in VGPRs and waterfalling every buffer_store.
-        band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
-        nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
-        rsrc = _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
+        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div) if self.scaled else None
+        # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
@@ -301,9 +433,9 @@ class StoreCPerTensor:
                 col_valid = col < self.c_cols
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
-                    scaled = (vec_f32[i] * scale).to(self.out_ty)
-                    off = ((row_local + i) * self.c_cols + col) * out_b  # i32-small within band
-                    _buffer_ops.buffer_store(scaled, rsrc, off, mask=col_valid, offset_is_bytes=True)
+                    val = (vec_f32[i] * scale if self.scaled else vec_f32[i]).to(self.out_ty)
+                    off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
+                    _buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
 
 
 class StoreCPerTensorCShuffle:
@@ -634,3 +766,193 @@ class S2RLoaderTr:
                 self._wait_lgkmcnt(0)
             return [self._assemble(c) for c in all_calls]
         return [self._assemble(self._issue_one(lds_src, t, base_off)) for t in range_constexpr(self.n_tiles)]
+
+
+def block_mn(pid, num_pid_m, n_blocks, GM, GN):
+    """Tile-id -> (block_m, block_n), resolved at trace time. GN==0: 1D GROUP_M
+    super-row swizzle (block_m inner). GN>0: 2D band — N split into width-GN bands
+    with GROUP_M inside each, keeping both A and B slabs L2-resident. Bijection."""
+    if GN > 0:
+        band_tiles = num_pid_m * GN
+        band = pid // band_tiles
+        pid_in_band = pid % band_tiles
+        band_n0 = band * GN
+        rem_n = n_blocks - band_n0
+        band_w = arith.select(rem_n < GN, rem_n, fx.Int32(GN))
+        nig = GM * band_w
+        gid = pid_in_band // nig
+        pig = pid_in_band % nig
+        fpm = gid * GM
+        rem_m = num_pid_m - fpm
+        gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
+        return fpm + (pig % gsm), band_n0 + (pig // gsm)
+    nig = GM * n_blocks
+    gid = pid // nig
+    pig = pid % nig
+    fpm = gid * GM
+    rem_m = num_pid_m - fpm
+    gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
+    return fpm + (pig % gsm), pig // gsm
+
+
+def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
+    """Buffer resource re-based at this workgroup's row band [base_row, c_rows), in
+    64-bit ``index`` arith, so a 32-bit offset only spans the band (handles outputs
+    whose flat M*N exceeds 2^31 / 4GB). base_row clamped to [0, c_rows] so a
+    partial/fully-OOB last row tile bases 0 records (its stores drop).
+
+    base/num_records are pinned to SGPRs via ``_readfirstlane_i32``: base_row is
+    uniform across a tile's wave but the compiler's divergence analysis lands the
+    SRD in VGPRs, waterfalling every buffer_store. Pinning collapses it to scalar
+    regs (see ``_readfirstlane_i32`` / ``StoreCPerTensor``)."""
+    elem = arith.index(elem_bytes)
+    cols_i = _as_index(c_cols)
+    row_i = _as_index(base_row)
+    rows_i = _as_index(c_rows)
+    row_c = arith.minui(row_i, rows_i)
+    band_base = c_base + row_c * cols_i * elem
+    # cap at 0x7FFFFFFF so a masked-out buffer_store (voffset=0x7FFFFFFF) is always OOB
+    nrec = arith.minui((rows_i - row_c) * cols_i * elem, arith.index(0x7FFFFFFF))
+    band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
+    nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
+    return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
+
+
+def _robust_time(launch, args, warmup=250, reps=5, iters=50):
+    """Median-of-`reps` timing of launch(*args) after `warmup` iters.
+    The long warmup reaches boost clock; short-K kernels mis-pick configs otherwise."""
+    for _ in range(warmup):
+        launch(*args)
+    torch.cuda.synchronize()
+    ts = []
+    for _ in range(reps):
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(iters):
+            launch(*args)
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) / iters)
+    ts.sort()
+    return ts[len(ts) // 2]
+
+
+# E8M0 scale preshuffle (FlyDSL, LDS-tiled): raw E8M0 [DIM,K//32] -> preshuffled int32.
+# Tile by k: coalesced load of 64 rows x KT cols into LDS, coalesced dwordx4 store of the
+# [KT,64,4] block (wave-lane transpose via LDS, both DRAM sides coalesced). n_tiles=4.
+#
+# The preshuffle is NOT a standalone launch: ``build_preshuffle_ab_kernel`` returns the
+# bare @flyc.kernel so the mxfp8 GEMM can launch it + the gemm kernel from ONE @flyc.jit
+# host stub (turbo-style single dispatch, scales repacked into a caller-owned workspace
+# in stream order right before the gemm reads them -- no separate Python/launch dispatch).
+
+_PRESHUF_KT = 16  # k-tile (rows*KT dwords staged in LDS per workgroup)
+
+
+def _lds_barrier():
+    # Drain outstanding LDS writes (lgkmcnt) BEFORE the workgroup barrier, else
+    # readers may observe stale LDS (a bare s_barrier doesn't wait on ds_write).
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="s_waitcnt lgkmcnt(0)\ns_barrier",
+        constraints="",
+        has_side_effects=True,
+    )
+
+
+def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK):
+    # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)); all vars local so it
+    # is safe inside a workgroup-uniform kernel `if`. KT/BLK chosen so TILE=NOUT are exact
+    # multiples of BLK -> no `if` guard needed (data bounds via the load/store masks).
+    NT = 4
+    TILE = 64 * KT
+    NOUT = KT * 64
+    assert TILE % BLK == 0 and NOUT % BLK == 0
+    for i in range_constexpr(TILE // BLK):
+        idx = tid + i * BLK
+        rr = idx // KT
+        kk = idx % KT
+        gk = k0 + kk
+        if is_a:
+            grow = grp * 64 + rr  # A: rows grp*64 + (s*16+r)
+        else:
+            s = rr // 16  # B-comb: row = nblk*256 + wn*32 + OFF[s] + rinner
+            off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
+            grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
+        dw = _buffer_ops.buffer_load(
+            rin, grow * K128 + gk, vec_width=1, dtype=T.i32, mask=(gk < K128) & (grow < dim)
+        )
+        fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
+            Vec.from_elements([fx.Int32(dw)], fx.Int32)
+        )
+    _lds_barrier()
+    for j in range_constexpr(NOUT // BLK):
+        ol = tid + j * BLK
+        kk = ol // 64
+        lane = ol % 64
+        r = lane % 16
+        sh = (lane // 16) * fx.Int32(8)
+        gk = k0 + kk
+        elems = []
+        for s in range_constexpr(NT):
+            so = (s * 16 + r) * KT + kk
+            val = Vec(
+                fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(so)), fx.make_layout(1, 1)).load()
+            )
+            b = (fx.Int32(val[0]) >> sh) & fx.Int32(0xFF)
+            elems.append(b | (b << fx.Int32(8)) | (b << fx.Int32(16)) | (b << fx.Int32(24)))
+        vec = Vec.from_elements(elems, fx.Int32)
+        _buffer_ops.buffer_store(vec.ir_value(), rout, ((grp * K128 + gk) * 64 + lane) * 4, mask=gk < K128)
+
+
+def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256):
+    """Build the fused A (layout 1) + B-comb (layout 3) scale-preshuffle @flyc.kernel.
+
+    Returns ``(kern, n_kt)``. ``kern`` is a bare KernelFunction (NOT a launch): the
+    mxfp8 GEMM factory calls it inside its own @flyc.jit so the preshuffle + gemm
+    issue from a single host stub. One workgroup repacks one (group, KT-chunk) of
+    raw E8M0 [DIM, K//32] (viewed int32 [DIM, K128]) into the broadcast int32 layout
+    the gemm's ScaleS2R / ScaleBComb consume; region by block id ([0,a_blocks)->A,
+    rest->B), bid being workgroup-uniform so the branch + its LDS barrier are
+    divergence-free. n_kt = ceildiv(K128, KT) is the per-group block count; the
+    caller sizes the grid as ``a_blocks + b_ngrp * n_kt``.
+    """
+    TILE = 64 * KT
+    n_kt = ceildiv(K128, KT)
+
+    @fx.struct
+    class Smem:
+        tile: fx.Array[fx.Int32, TILE, 16]
+
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def kern(
+        a_raw: fx.Tensor,
+        b_raw: fx.Tensor,
+        a_sp: fx.Tensor,
+        b_sp: fx.Tensor,
+        m: fx.Int32,
+        n: fx.Int32,
+        a_blocks: fx.Int32,
+        a_ngrp: fx.Int32,
+        b_ngrp: fx.Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        tile = fx.SharedAllocator().allocate(Smem).peek().tile
+        rin_a = _buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=m * K128 * 4)
+        rin_b = _buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=n * K128 * 4)
+        rout_a = _buffer_ops.create_buffer_resource(
+            a_sp, max_size=False, num_records_bytes=a_ngrp * K128 * 256 * 4
+        )
+        rout_b = _buffer_ops.create_buffer_resource(
+            b_sp, max_size=False, num_records_bytes=b_ngrp * K128 * 256 * 4
+        )
+        if bid < a_blocks:
+            _emit_lds_repack(True, bid // n_kt, (bid % n_kt) * KT, tile, rin_a, rout_a, m, K128, KT, tid, BLK)
+        if bid >= a_blocks:
+            bb = bid - a_blocks
+            _emit_lds_repack(False, bb // n_kt, (bb % n_kt) * KT, tile, rin_b, rout_b, n, K128, KT, tid, BLK)
+
+    return kern, n_kt

@@ -50,22 +50,10 @@ from primus_turbo.triton.utils.origami import (
     origama_hardware_info,
     origama_select_params,
 )
-from primus_turbo.triton.utils.triton_knobs_helper import set_triton_knobs_gfx950
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AMD knobs helper (blockwise-specific)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _set_amd_knobs(enable: bool = True):
-    """Set AMD-specific Triton knobs.
-    NOTE: use_async_copy and scalarize_packed_fops HURT CRR/TN performance
-    by ~5-8% on MI300X. Only enable for NT/RCR and NN/RRR.
-    """
-    if hasattr(triton, "knobs") and hasattr(triton.knobs, "amd"):
-        triton.knobs.amd.use_async_copy = enable
-        triton.knobs.amd.scalarize_packed_fops = enable
-
+from primus_turbo.triton.utils.triton_knobs_helper import (
+    scoped_amd_knobs,
+    scoped_amd_triton_knobs,
+)
 
 # ###########################################################################
 #
@@ -255,6 +243,7 @@ def _fp8_persistent_gemm_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@scoped_amd_knobs
 def gemm_fp8_tensorwise_triton_kernel(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,
@@ -320,8 +309,6 @@ def gemm_fp8_tensorwise_triton_kernel(
     s_bk = B_view.stride(0)
 
     if is_gfx950():
-        set_triton_knobs_gfx950()
-
         # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts (164-entry tuning).
         block_m, block_n, block_k = 256, 256, 128
         chunk_size, waves_per_eu = 32, 0
@@ -554,6 +541,7 @@ def _fp8_rowwise_persistent_gemm_kernel(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@scoped_amd_knobs
 def gemm_fp8_rowwise_triton_kernel(
     a: torch.Tensor,
     a_scale_inv: torch.Tensor,
@@ -626,8 +614,6 @@ def gemm_fp8_rowwise_triton_kernel(
     s_bk = B_view.stride(0)
 
     if is_gfx950():
-        set_triton_knobs_gfx950()
-
         # gfx950 FP8: uniform 256×256×128 / stages=2 across all layouts.
         block_m, block_n, block_k = 256, 256, 128
         chunk_size, waves_per_eu = 32, 0
@@ -1071,33 +1057,25 @@ def gemm_fp8_blockwise_triton_kernel(
     if (trans_a, trans_b) not in {(False, True), (False, False), (True, False)}:
         raise ValueError(f"Unsupported layout for blockwise FP8 Triton: trans_a={trans_a}, trans_b={trans_b}")
 
+    is_tn = trans_a and not trans_b
+
     # ── Operand views: always [M, K] @ [K, N] inside the kernel.
     A_view = a.T if trans_a else a
     B_view = b.T if trans_b else b
     M, K = A_view.shape
     _, N = B_view.shape
 
-    # AMD knobs: gfx950 always sets the gfx950 knobs; on gfx942 NT/NN benefit
-    # from use_async_copy/scalarize_packed_fops while TN/wgrad regresses 5-8%.
-    is_tn = trans_a and not trans_b
-    if is_gfx950():
-        set_triton_knobs_gfx950()
-    else:
-        _set_amd_knobs(enable=not is_tn)
-
-    # ── Layout-specialised settings.
-    # The only true per-layout differences are: how A/B scales are laid out
-    # for the kernel, which autotune wrapper owns the search space/cache, and
-    # the three constexpr flags (SCALE_2D_B / EVEN_K / TRANS_C_STORE).
+    # ── Layout-specialised settings. The only true per-layout differences are:
+    # how A/B scales are laid out, which autotune wrapper owns the search
+    # space/cache, and the three constexpr flags (SCALE_2D_B/EVEN_K/TRANS_C_STORE).
     #
     # TN safety notes (Round-6 P2-#7.6):
-    #   * `TRANS_C_STORE=True` lets the BF16 epilogue coalesce into dwordx4
-    #     under the `(N, M)` output buffer; without it the wgrad path emits
+    #   * TRANS_C_STORE=True lets the BF16 epilogue coalesce into dwordx4 under
+    #     the (N, M) output buffer; without it the wgrad path emits
     #     64×buffer_store_short per tile.
-    #   * `EVEN_K=False` keeps the mask-load path for the dual strided-K
-    #     loads, the matched-pair safety net for the Triton 3.7
-    #     `Begin <= End` LLVM-backend assertion (the TN autotune wrapper
-    #     already drops `num_stages=3`).
+    #   * EVEN_K=False keeps the mask-load path for the dual strided-K loads, the
+    #     matched-pair safety net for the Triton 3.7 `Begin <= End` LLVM-backend
+    #     assertion (the TN autotune wrapper already drops num_stages=3).
     if not trans_a and trans_b:
         # NT
         A_scales_arg = a_scale_inv.T.contiguous()  # [K//128, M]
@@ -1142,31 +1120,35 @@ def gemm_fp8_blockwise_triton_kernel(
     num_k = (K + 127) // 128
     NUM_SMS = ((M + 127) // 128) * ((N + 127) // 128)
 
-    autotune_kernel[(NUM_SMS,)](
-        A_view,
-        B_view,
-        out,
-        A_scales_arg,
-        B_scales_arg,
-        M,
-        N,
-        K,
-        A_view.stride(0),
-        A_view.stride(1),
-        B_view.stride(0),
-        B_view.stride(1),
-        stride_cm,
-        stride_cn,
-        stride_as_k,
-        stride_as_m,
-        stride_bs_0,
-        stride_bs_1,
-        NUM_SMS,
-        num_k,
-        A_K_CONTIGUOUS=not trans_a,
-        B_K_CONTIGUOUS=trans_b,
-        SCALE_2D_B=SCALE_2D_B,
-        EVEN_K=EVEN_K,
-        TRANS_C_STORE=TRANS_C_STORE,
-    )
+    # gfx950 enables its full knob set for the scope; gfx942 enables
+    # use_async_copy/scalarize_packed_fops only for NT/NN (TN/wgrad regresses
+    # ~5-8%). The scope restores every knob on exit.
+    with scoped_amd_triton_knobs(gfx942_enable=not is_tn):
+        autotune_kernel[(NUM_SMS,)](
+            A_view,
+            B_view,
+            out,
+            A_scales_arg,
+            B_scales_arg,
+            M,
+            N,
+            K,
+            A_view.stride(0),
+            A_view.stride(1),
+            B_view.stride(0),
+            B_view.stride(1),
+            stride_cm,
+            stride_cn,
+            stride_as_k,
+            stride_as_m,
+            stride_bs_0,
+            stride_bs_1,
+            NUM_SMS,
+            num_k,
+            A_K_CONTIGUOUS=not trans_a,
+            B_K_CONTIGUOUS=trans_b,
+            SCALE_2D_B=SCALE_2D_B,
+            EVEN_K=EVEN_K,
+            TRANS_C_STORE=TRANS_C_STORE,
+        )
     return out

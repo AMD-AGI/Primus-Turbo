@@ -106,7 +106,7 @@ constexpr int E8M0_EXPONENT_BIAS = 127;
 template <typename DType>
 void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
                               uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
-                              uint8_t *colwise_scale, int M, int N, int M_pad, int N_pad,
+                              uint8_t *colwise_scale, int G, int M, int N, int M_pad, int N_pad,
                               int rowwise_scale_stride, int colwise_scale_stride,
                               int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad,
                               int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
@@ -151,6 +151,16 @@ void grouped_quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *sca
                                  detail::QuantizeMode mode, int G, int total_M, int N, int N_pad,
                                  int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
                                  detail::ScalingRecipe recipe, hipStream_t stream);
+
+template <typename DType>
+void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
+                                      uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
+                                      uint8_t *colwise_scale, const int64_t *group_offs,
+                                      const int64_t *group_offs_padded_colwise, int G, int total_M,
+                                      int N, int M_pad_col, int N_pad, int rowwise_scale_stride,
+                                      int colwise_scale_stride, int rowwise_scale_N,
+                                      int colwise_scale_N, detail::ScalingRecipe rowwise_recipe,
+                                      detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
 // *************** Grouped Padded Layout ***************
 //

@@ -11,12 +11,15 @@ import torch.nn as nn
 
 
 def grouped_gemm_ref(a, b, seg_lens, trans_b=True):
+    # NOTE: the per-group matmul is accumulated in fp32 (operands upcast, result
+    # cast back to ``a.dtype``): an fp32-accumulated golden is the right reference
+    # for a low-precision (fp4/fp8) product comparison.
     seg_lens = seg_lens.cpu().numpy()
     out = []
     start = 0
     for i, size in enumerate(seg_lens):
         rhs = b[i, :, :].t() if trans_b else b[i, :, :]
-        out.append(a[start : start + size, :] @ rhs)
+        out.append((a[start : start + size, :].float() @ rhs.float()).to(a.dtype))
         start += size
     return torch.cat(out)
 

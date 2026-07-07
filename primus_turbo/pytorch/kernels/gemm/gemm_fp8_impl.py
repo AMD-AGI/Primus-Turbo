@@ -11,6 +11,7 @@ import torch
 _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
+from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
@@ -331,28 +332,17 @@ class GEMMFP8TurboBackend(KernelBackend):
 
 
 class GEMMFP8FlyDSLBackend(KernelBackend):
-    """FlyDSL 8-wave fp8 dense GEMM backend.
+    """FlyDSL 8-wave fp8 dense GEMM backend (gfx950 only).
 
-    The underlying kernel wrapper lives in
-    ``primus_turbo.flydsl.gemm.gemm_fp8_kernel``.
+    TENSORWISE: scalar a_scale/b_scale, bf16/fp16 out, arbitrary M/N/K, layouts
+    NT/NN/TN (TT unsupported). trans_c via post-hoc transpose.
 
-    Layout support:
-      - NT (native):  trans_a=F, trans_b=T
-      - NN (native):  trans_a=F, trans_b=F
-      - TN (native):  trans_a=T, trans_b=F
-      - TT:           trans_a=T, trans_b=T   (not supported)
-
-    Constraints:
-      - TENSORWISE per-tensor scaling (a_scale / b_scale scalar)
-      - out_dtype in {bf16, fp16}
-      - arbitrary contraction K, M and N
-      (trans_c=True is supported via post-hoc output transpose; extra mem copy vs Triton.)
+    MX_BLOCKWISE: NT only, per-operand E4M3/E5M2 (incl. hybrid), bf16/fp16 out,
+    per-1x32 raw E8M0 2D scales [M,K//32]/[N,K//32]. The kernel repacks the scales
+    to its preshuffled layout, so execute() does no host-side padding.
     """
 
-    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
-    # E4M3 / E5M2 / hybrid, bf16 or fp16 output. Per-operand fp8 format is threaded
-    # into the MFMA via cbsz(srcA)/blgp(srcB) (0=E4M3, 1=E5M2) and the FlyDSL
-    # MFMA_Scale atom dtype; fp16 output is produced from the f32 accumulator.
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.MX_BLOCKWISE}
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -368,26 +358,23 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         granularity: ScalingGranularity,
     ) -> bool:
         supported = True
-        # gfx950 (CDNA4) only: the kernel uses mfma_f32_16x16x128_f8f6f4, absent
-        # on gfx942 and below. Gate here so the dispatcher never picks FlyDSL off
-        # gfx950 (the backend still imports fine on other archs).
+        # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
         supported &= get_device_compute_capability() >= (9, 5)
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
-        supported &= out_dtype in (torch.bfloat16, torch.float16)
-        # NT / NN / TN native; TT (trans_a and trans_b) is not supported.
+        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            # NT only; per-operand E4M3/E5M2; raw E8M0 2D scales [M,K//32]/[N,K//32].
+            supported &= (not trans_a) and trans_b
+            supported &= k % 128 == 0 and k >= 256
+            supported &= a_scale_inv.shape == (m, k // 32) and b_scale_inv.shape == (n, k // 32)
+            supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
+            return supported
+
+        # TENSORWISE: NT/NN/TN native (TT unsupported), scalar per-tensor scales.
         supported &= not (trans_a and trans_b)
-        # Contraction K: any value handled by the native K-tail, but the software
-        # pipeline needs K_ITERS = ceil(K/128) >= 2, i.e. K >= 129. (M / N are
-        # arbitrary: the partial last output tile is bounded by the c_m / c_n
-        # StoreC clamp + the global SRD.)
-        k = a.shape[0] if trans_a else a.shape[1]
-        supported &= k >= 129
-        # No size cap: foldable operands (NT both, NN-A) fold their per-tile base into
-        # the i64 SRD; the traversal operands (NN-B k*n, TN k*m & k*n) that would wrap a
-        # 32-bit soffset past 2^32 fp8 are re-based per load in i64 by the wrapper (it
-        # auto-selects i64 at/above 2^32, keeping the cheaper int32 path below).
-        # per-tensor scalar scale (wrapper broadcasts to vector internally)
+        supported &= k > 128  # software pipeline needs >= 2 K tiles: ceil(K/128) >= 2
         supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
         return supported
 
@@ -403,15 +390,29 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            out = gemm_mxfp8_flydsl_kernel(
+                a, a_scale_inv.view(torch.uint8), b, b_scale_inv.view(torch.uint8), out_dtype=out_dtype
+            )
+            return out.t().contiguous() if trans_c else out
+
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scale_inv, rhs_scale_inv = b_scale_inv, a_scale_inv
+            trans_lhs, trans_rhs = (not trans_b), (not trans_a)
+        else:
+            lhs, rhs = a, b
+            lhs_scale_inv, rhs_scale_inv = a_scale_inv, b_scale_inv
+            trans_lhs, trans_rhs = trans_a, trans_b
         return gemm_fp8_tensorwise_flydsl_kernel(
-            a,
-            a_scale_inv,
-            b,
-            b_scale_inv,
-            trans_a=trans_a,
-            trans_b=trans_b,
+            lhs,
+            lhs_scale_inv,
+            rhs,
+            rhs_scale_inv,
+            trans_a=trans_lhs,
+            trans_b=trans_rhs,
             out_dtype=out_dtype,
-            trans_c=trans_c,
+            trans_c=False,
         )
 
 

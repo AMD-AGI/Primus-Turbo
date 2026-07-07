@@ -37,8 +37,8 @@ using namespace primus_turbo::detail;
 // ============================================================================
 
 // Hardware architecture parameters
-constexpr int WARP_SIZE         = THREADS_PER_WARP; // AMD wavefront size
-constexpr int THREADS_PER_BLOCK = 256;              // 4 warps per block
+constexpr int WARP_SIZE         = THREADS_PER_WARP; // 64 on gfx942/950, 32 on gfx1250
+constexpr int THREADS_PER_BLOCK = 256;              // WARPS_PER_BLOCK warps per block (4 or 8)
 constexpr int WARPS_PER_BLOCK   = THREADS_PER_BLOCK / WARP_SIZE;
 
 // Tile dimensions for main kernel loop
@@ -175,35 +175,39 @@ __device__ __forceinline__ uint32_t cvt_f32x4_to_fp8x4(float v0, float v1, float
 
     return result;
 #elif defined(__gfx1250__)
-    // gfx1250 (MI400 / CDNA-next) does not implement the scaled f32->fp8 convert
-    // (fp8-cvt-scale-insts is absent on this target), so v_cvt_scalef32_pk_fp8_f32
-    // cannot be used here. The E8M0 scale is a power of two, so dividing by it in
-    // FP32 is exact; we apply it manually and pack with the unscaled
-    // v_cvt_pk_{fp8,bf8}_f32 ops. The clamp keeps |v/scale| within the FP8 range
-    // (cvt_pk_*_f32 has no saturation), matching the gfx950 soft-clamp semantics.
-    uint32_t    result = 0;
-    int         packed = 0;
-    const float v0s    = v0 / scale;
-    const float v1s    = v1 / scale;
-    const float v2s    = v2 / scale;
-    const float v3s    = v3 / scale;
+    // gfx1250 (CDNA-Next) replaces the gfx950 packed-2 `v_cvt_scalef32_pk_fp8_f32`
+    // with the packed-8 `v_cvt_scalef32_pk8_{fp8,bf8}_f32` (MI455 ISA white
+    // paper). Semantics verified on hardware to match gfx950: each output is
+    // `src[i] / scale` cast to E4M3 / E5M2, with magnitudes above the FP8 max
+    // encoding producing NaN (E4M3) / Inf (E5M2) -- so the same soft-clamp to
+    // +/-(FP8_MAX * scale) is required. We feed the 4 live values (rest 0) into
+    // the pk8 builtin and keep the low 32 bits, which pack the 4 requested FP8
+    // bytes in order.
+    using f32x8 = float __attribute__((ext_vector_type(8)));
+    using u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+
+    uint32_t result = 0;
     if constexpr (std::is_same_v<DType, dtype::float8_e4m3>) {
-        const float c0 = fminf(fmaxf(v0s, -FP8E4M3_MAX), FP8E4M3_MAX);
-        const float c1 = fminf(fmaxf(v1s, -FP8E4M3_MAX), FP8E4M3_MAX);
-        const float c2 = fminf(fmaxf(v2s, -FP8E4M3_MAX), FP8E4M3_MAX);
-        const float c3 = fminf(fmaxf(v3s, -FP8E4M3_MAX), FP8E4M3_MAX);
-        // word_sel=false -> bytes [0,1] = (c0,c1); word_sel=true -> bytes [2,3] = (c2,c3)
-        packed = __builtin_amdgcn_cvt_pk_fp8_f32(c0, c1, packed, false);
-        packed = __builtin_amdgcn_cvt_pk_fp8_f32(c2, c3, packed, true);
+        const float lim = FP8E4M3_MAX * scale;
+        f32x8       vin;
+        vin[0] = fminf(fmaxf(v0, -lim), lim);
+        vin[1] = fminf(fmaxf(v1, -lim), lim);
+        vin[2] = fminf(fmaxf(v2, -lim), lim);
+        vin[3] = fminf(fmaxf(v3, -lim), lim);
+        vin[4] = vin[5] = vin[6] = vin[7] = 0.0f;
+        u32x2 packed                      = __builtin_amdgcn_cvt_scalef32_pk8_fp8_f32(vin, scale);
+        result                            = packed[0];
     } else if constexpr (std::is_same_v<DType, dtype::float8_e5m2>) {
-        const float c0 = fminf(fmaxf(v0s, -FP8E5M2_MAX), FP8E5M2_MAX);
-        const float c1 = fminf(fmaxf(v1s, -FP8E5M2_MAX), FP8E5M2_MAX);
-        const float c2 = fminf(fmaxf(v2s, -FP8E5M2_MAX), FP8E5M2_MAX);
-        const float c3 = fminf(fmaxf(v3s, -FP8E5M2_MAX), FP8E5M2_MAX);
-        packed         = __builtin_amdgcn_cvt_pk_bf8_f32(c0, c1, packed, false);
-        packed         = __builtin_amdgcn_cvt_pk_bf8_f32(c2, c3, packed, true);
+        const float lim = FP8E5M2_MAX * scale;
+        f32x8       vin;
+        vin[0] = fminf(fmaxf(v0, -lim), lim);
+        vin[1] = fminf(fmaxf(v1, -lim), lim);
+        vin[2] = fminf(fmaxf(v2, -lim), lim);
+        vin[3] = fminf(fmaxf(v3, -lim), lim);
+        vin[4] = vin[5] = vin[6] = vin[7] = 0.0f;
+        u32x2 packed                      = __builtin_amdgcn_cvt_scalef32_pk8_bf8_f32(vin, scale);
+        result                            = packed[0];
     }
-    result = static_cast<uint32_t>(packed);
     return result;
 #else
     __builtin_trap();
@@ -616,27 +620,20 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
     __shared__ uint8_t s_colwise_scale[NUM_CHUNKS_N][MXFP8_BLOCK_SIZE][NUM_CHUNKS_M];
 
     // ========================================================================
-    // Main Loop - Each Warp Processes One 32x32 Chunk Independently
+    // Main Loop - Each active warp processes one 32x32 chunk per round
     // ========================================================================
-    // 4 warps process 4 chunks in parallel.
+    // TOTAL_CHUNKS warps do the work; remaining warps stay idle but must
+    // participate in every block __syncthreads() (gfx1250: WARP_SIZE=32 =>
+    // WARPS_PER_BLOCK=8 while TOTAL_CHUNKS=4).
     for (int round = 0; round < TOTAL_CHUNKS; round += WARPS_PER_BLOCK) {
         const int chunk_idx = round + warp_id;
-        // On wave32 targets (e.g. gfx1250) WARPS_PER_BLOCK (= THREADS_PER_BLOCK /
-        // WARP_SIZE) can exceed TOTAL_CHUNKS, so some warps have no chunk. They must
-        // NOT `break`: the colwise read is gated by the block-wide __syncthreads()
-        // below, and the post-loop coalesced write-out has another barrier. If idle
-        // warps skip the in-loop barrier they desync the barrier count and race ahead
-        // to read s_colwise_* before the active warps have written it (manifesting as
-        // garbage in the upper half of the colwise output). Keep every warp in
-        // lockstep on the barriers and guard only the actual work with warp_active.
-        const bool warp_active = (chunk_idx < TOTAL_CHUNKS);
+        if (chunk_idx < TOTAL_CHUNKS) {
 
-        const int chunk_m = warp_active ? (chunk_idx / NUM_CHUNKS_N) : 0;
-        const int chunk_n = warp_active ? (chunk_idx % NUM_CHUNKS_N) : 0;
-        const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
-        const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
+            const int chunk_m = chunk_idx / NUM_CHUNKS_N;
+            const int chunk_n = chunk_idx % NUM_CHUNKS_N;
+            const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
+            const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
 
-        if (warp_active) {
             // ================================================================
             // Load Tile: Global → smem + packed regs
             // ================================================================
@@ -793,13 +790,17 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
                 }
             }
 
-        } // end if (warp_active): load + rowwise
+        } // chunk_idx < TOTAL_CHUNKS: load + rowwise
 
-        // Colwise quantization read val from smem. Need  wait smem write to finish.
-        // Uniform barrier: ALL warps (including idle ones) must arrive.
+        // Colwise reads s_tile; all threads must sync after rowwise/load.
         __syncthreads();
 
-        if (warp_active) {
+        if (chunk_idx < TOTAL_CHUNKS) {
+            const int chunk_m = chunk_idx / NUM_CHUNKS_N;
+            const int chunk_n = chunk_idx % NUM_CHUNKS_N;
+            const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
+            const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
+
             // ================================================================
             // Colwise Quantization (Vertical Processing)
             // Step 1: Read smem (transposed) + compute per-col r_amax
@@ -887,15 +888,16 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
                             r_colwise_vals[pass][2], r_colwise_vals[pass][3],
                             r_colwise_scale_native[pass]);
 
-                        if (global_row_base < M_pad) {
-                            if (shuffle_colwise) {
+                        if (shuffle_colwise) {
+                            if (global_row_base < M_pad) {
                                 int shuffled_idx = compute_shuffled_index<OType>(
                                     global_col, global_row_base, M_packed);
                                 *reinterpret_cast<uint32_t *>(colwise_fp8 + shuffled_idx) = fp8x4;
-                            } else {
-                                s_colwise_fp8[chunk_n][pass * ROWS_PER_PASS + row_in_warp]
-                                             [chunk_m * THREADS_PER_ROW + thread_in_row] = fp8x4;
                             }
+                        } else {
+                            s_colwise_fp8[chunk_n][pass * ROWS_PER_PASS + row_in_warp]
+                                         [chunk_m * THREADS_PER_ROW + thread_in_row] =
+                                             (global_row_base < M_pad) ? fp8x4 : 0u;
                         }
 
                         if (thread_in_row == 0) {
@@ -918,7 +920,11 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp8_dual_kern
                     }
                 }
             }
-        } // end if (warp_active): colwise
+        } // chunk_idx < TOTAL_CHUNKS: colwise
+
+        if (!shuffle_colwise || !shuffle_colwise_scale) {
+            __syncthreads();
+        }
     }
 
     // ========================================================================
@@ -1398,17 +1404,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_d
 
     for (int round = 0; round < TOTAL_CHUNKS; round += WARPS_PER_BLOCK) {
         const int chunk_idx = round + warp_id;
-        // See quantize_mxfp8_dual_kernel: idle warps (wave32, WARPS_PER_BLOCK >
-        // TOTAL_CHUNKS) must not `break` or they desync the in-loop / post-loop
-        // barriers and race ahead to read s_colwise_* before it is written.
-        const bool warp_active = (chunk_idx < TOTAL_CHUNKS);
+        if (chunk_idx < TOTAL_CHUNKS) {
 
-        const int chunk_m = warp_active ? (chunk_idx / NUM_CHUNKS_N) : 0;
-        const int chunk_n = warp_active ? (chunk_idx % NUM_CHUNKS_N) : 0;
-        const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
-        const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
+            const int chunk_m = chunk_idx / NUM_CHUNKS_N;
+            const int chunk_n = chunk_idx % NUM_CHUNKS_N;
+            const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
+            const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
 
-        if (warp_active) {
             // ---------------- Load tile (input row remap + zero pad) -----------------
             uint64_t r_tile[PASSES_PER_TILE];
             {
@@ -1561,12 +1563,17 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_d
                 }
             }
 
-        } // end if (warp_active): load + rowwise
+        } // chunk_idx < TOTAL_CHUNKS: load + rowwise
 
         // Uniform barrier: ALL warps (including idle ones) must arrive.
         __syncthreads();
 
-        if (warp_active) {
+        if (chunk_idx < TOTAL_CHUNKS) {
+            const int chunk_m = chunk_idx / NUM_CHUNKS_N;
+            const int chunk_n = chunk_idx % NUM_CHUNKS_N;
+            const int tile_m  = base_m + chunk_m * MXFP8_BLOCK_SIZE;
+            const int tile_n  = base_n + chunk_n * MXFP8_BLOCK_SIZE;
+
             // ---------------- Colwise: amax + scale (with zero-amax safe path) -------
             float r_colwise_vals[PASSES_PER_TILE][ELEMS_PER_THREAD];
             float r_colwise_amax[PASSES_PER_TILE];
@@ -1650,15 +1657,16 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_d
                             r_colwise_vals[pass][2], r_colwise_vals[pass][3],
                             r_colwise_scale_native[pass]);
 
-                        if (global_row_base < M_pad) {
-                            if (shuffle_colwise) {
+                        if (shuffle_colwise) {
+                            if (global_row_base < M_pad) {
                                 int shuffled_idx = compute_shuffled_index<OType>(
                                     global_col, global_row_base, M_packed);
                                 *reinterpret_cast<uint32_t *>(colwise_fp8 + shuffled_idx) = fp8x4;
-                            } else {
-                                s_colwise_fp8[chunk_n][pass * ROWS_PER_PASS + row_in_warp]
-                                             [chunk_m * THREADS_PER_ROW + thread_in_row] = fp8x4;
                             }
+                        } else {
+                            s_colwise_fp8[chunk_n][pass * ROWS_PER_PASS + row_in_warp]
+                                         [chunk_m * THREADS_PER_ROW + thread_in_row] =
+                                             (global_row_base < M_pad) ? fp8x4 : 0u;
                         }
 
                         if (thread_in_row == 0) {
@@ -1681,7 +1689,11 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp8_d
                     }
                 }
             }
-        } // end if (warp_active): colwise
+        } // chunk_idx < TOTAL_CHUNKS: colwise
+
+        if (!shuffle_colwise || !shuffle_colwise_scale) {
+            __syncthreads();
+        }
     }
 
     // Coalesced colwise FP8/scale write-out from LDS (non-shuffle path).
