@@ -476,3 +476,98 @@ def test_v4_csa_from_pool_real_shape(model, enable_sink):
     )
     out_f.backward(g.float())
     assert compute_snr(pf.grad, pool.grad) > SNR_BWD
+
+
+# ---------------------------------------------------------------------------
+# Fused single-latent sparse-MLA v2 path (the `flydsl_turbo` benchmark backend).
+#
+# The tests above exercise the SPLIT CSA path (csa_attention_from_pool with
+# separate k_local/v_local/pool). The Primus benchmark bench_v4_attention.py
+# instead drives the FUSED single-latent (K==V) sparse-MLA kernels directly:
+#   sparse_mla_{fwd,bwd}_v4_flydsl(q, kv, topk, attn_sink, kv_lora_rank, scale)
+# with kv = [local latent ++ pool] and topk = [SWA window ++ pool], zero rope pad.
+# That entry point (tr16 fwd + M=16 dq bwd + the LDS-pad / interm-tiling perf
+# work) had NO direct unit test — this guards it against regression across the
+# real V4 shapes, INCLUDING the large-topk V4-Pro CSA case (topk=1152) where the
+# dKV-intermediate tensor exceeds 2^31 elements. Reference = the same-repo Triton
+# v2 fused kernel (independently validated); we compare fwd out + dq + dkv by SNR.
+# NOTE gluon_v2 is intentionally NOT the reference: its dKV uses a different
+# accumulation convention at large topk (norm differs ~1.7x), so turbo and Triton
+# agree with each other but not with gluon — that is a gluon-convention artifact,
+# not a turbo bug.
+# ---------------------------------------------------------------------------
+_ROPE_V2 = 64
+
+
+def _build_v4form_fused(*, cr, H, S, D, seed=0):
+    """Mirror bench_v4_attention._build_gluon_v4form: V4-form fused inputs."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    dev, dt = "cuda", torch.bfloat16
+    W = 128
+    latent = torch.randn(S, D, generator=g, device=dev, dtype=dt)
+    q512 = torch.randn(S, H, D, generator=g, device=dev, dtype=dt)
+    z_q = torch.zeros(S, H, _ROPE_V2, device=dev, dtype=dt)
+    q_g = torch.cat([q512, z_q], dim=-1).contiguous()
+    sink = torch.randn(H, generator=g, device=dev, dtype=torch.float32) * 0.1
+    do = torch.randn(S, H, D, generator=g, device=dev, dtype=dt)
+
+    ti = torch.arange(S, device=dev).view(S, 1)
+    win = ti - W + 1 + torch.arange(W, device=dev).view(1, W)
+    win = torch.where(win >= 0, win, torch.full_like(win, -1))
+
+    if cr == 0:
+        kv512 = latent.unsqueeze(1)
+        topk = win
+    else:
+        P = max(S // cr, 1)
+        pool = torch.randn(P, D, generator=g, device=dev, dtype=dt)
+        kv512 = torch.cat([latent, pool], dim=0).unsqueeze(1)
+        if cr == 4:
+            K = min(1024 if H == 128 else 512, P)
+            sp = torch.randint(0, P, (S, K), generator=g, device=dev)
+            pool_topk = S + sp
+        else:  # cr == 128 HCA full causal pool
+            ps = torch.arange(P, device=dev).view(1, P)
+            vis = ((ps + 1) * cr - 1) <= ti
+            pool_topk = torch.where(vis, S + ps, torch.full_like(ps.expand(S, P), -1))
+        topk = torch.cat([win, pool_topk], dim=1)
+
+    tk = topk.shape[1]
+    pad = ((tk + 63) // 64) * 64 - tk
+    if pad > 0:
+        topk = torch.cat([topk, torch.full((S, pad), -1, device=dev, dtype=topk.dtype)], dim=1)
+    topk_g = topk.to(torch.int32).contiguous()
+    z_kv = torch.zeros(kv512.shape[0], 1, _ROPE_V2, device=dev, dtype=dt)
+    kv_g = torch.cat([kv512, z_kv], dim=-1).contiguous()
+    return q_g, kv_g, topk_g, sink, do
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("H", [64, 128], ids=["flash", "pro"])
+@pytest.mark.parametrize("cr", [0, 4, 128], ids=["swa", "csa", "hca"])
+def test_v4_sparse_mla_v2_fused_flydsl_vs_triton(H, cr):
+    """flydsl (tr16 fwd + M=16 dq bwd) vs same-repo Triton v2 fused reference,
+    on the real V4-form shapes the benchmark uses (S=4096). Guards the fused
+    entry point incl. V4-Pro CSA topk=1152 (interm > 2^31 elems)."""
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL sparse-MLA requires gfx950 (CDNA4).")
+    from primus_turbo.flydsl.attention.kernels.sparse_mla_v2.dsa_fwd import sparse_mla_fwd_v4_flydsl
+    from primus_turbo.flydsl.attention.kernels.sparse_mla_v2.dsa_bwd import sparse_mla_bwd_v4_flydsl
+    from primus_turbo.triton.attention.deepseek.sparse_mla_v2.dsa_fwd import sparse_mla_fwd_v4_triton
+    from primus_turbo.triton.attention.deepseek.sparse_mla_v2.dsa_bwd import sparse_mla_bwd_v4_triton
+
+    import math
+    D, S = 512, 4096
+    q, kv, topk, sink, do = _build_v4form_fused(cr=cr, H=H, S=S, D=D)
+    scale = 1.0 / math.sqrt(D)
+
+    of, lf = sparse_mla_fwd_v4_flydsl(q, kv, topk, attn_sink=sink, kv_lora_rank=D, scale=scale)
+    ot, lt = sparse_mla_fwd_v4_triton(q, kv, topk, attn_sink=sink, kv_lora_rank=D, scale=scale)
+    assert compute_snr(ot, of) > SNR_FWD, f"fwd out SNR too low (H{H} cr{cr})"
+
+    dqf, dkvf, dsf = sparse_mla_bwd_v4_flydsl(q, kv, of, do, topk, lf, attn_sink=sink, kv_lora_rank=D, scale=scale)
+    dqt, dkvt, dst = sparse_mla_bwd_v4_triton(q, kv, ot, do, topk, lt, attn_sink=sink, kv_lora_rank=D, scale=scale)
+    assert compute_snr(dqt[:, :, :D], dqf[:, :, :D]) > SNR_BWD, f"dq SNR too low (H{H} cr{cr})"
+    assert compute_snr(dkvt[..., :D], dkvf[..., :D]) > SNR_BWD, f"dkv SNR too low (H{H} cr{cr})"
+    if dsf is not None and dst is not None:
+        assert compute_snr(dst, dsf) > SNR_BWD, f"dsink SNR too low (H{H} cr{cr})"
