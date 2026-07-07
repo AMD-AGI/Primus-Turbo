@@ -112,10 +112,15 @@ def build_dsa_bwd_dq_m16_module(
     # overhead (the dominant cost at occupancy 1). Must be a multiple of 16.
     BLOCK_K = int(os.environ.get("PRIMUS_DSA_TR16_BLOCK_K", "32"))
     assert BLOCK_K % 16 == 0
-    # QK HBM-load prefetch depth. Lower => fewer transient VGPR (better occupancy),
-    # higher => more VMEM/MFMA overlap. 2 is the M=32 kernel's sweet spot.
-    _QK_PF = int(os.environ.get("PRIMUS_DSA_BWD_DQ_QK_PF", "1"))
+    # QK LDS A-operand prefetch depth for GEMM1. These are LDS reads (kv already
+    # gathered), NOT HBM, so they cost only transient VGPR — and the kernel is
+    # bubble-bound (IPC 1.0 vs gluon 1.3, occupancy LDS-capped so more waves won't
+    # help). FULL hoist (PF == K_CHUNKS) issues all 16 ds_reads before the dependent
+    # MFMA chain, eliminating the per-chunk load->MFMA stall: H128 dQ 5.2->3.7ms,
+    # H64 2.65->1.87ms (~30%). Default = full hoist; env can lower it.
     K_CHUNKS = HEAD_DIM // 32   # QK d-contraction chunks (16)
+    _QK_PF = int(os.environ.get("PRIMUS_DSA_BWD_DQ_QK_PF", str(K_CHUNKS)))
+    _QK_PF = min(_QK_PF, K_CHUNKS)
     D_TILES = HEAD_DIM // 16    # AV output d-tiles (32)
     N_SUB = BLOCK_K // 16       # QK key sub-tiles (16 keys each)
     N_AVSUB = BLOCK_K // 32     # AV key sub-blocks (32-key contraction each)
@@ -510,6 +515,8 @@ def build_dsa_bwd_dq_m16_module(
 
             # ==== GEMM2: dQ += dS @ K  (K==V shared tile, ds_read_tr; dS is B-op) ====
             # No online-softmax rescale (dQ accumulates directly across tiles).
+            # AV_PF=2 is optimal: unlike GEMM1, more prefetch here regresses (the 32
+            # acc[dt] chains + ds_read_tr prefetch already saturate VGPR).
             _AV_PF = 2
             for avs in range_constexpr(N_AVSUB):
                 b_pack = _b_pack(avs)  # dS pack from LDS p-region
