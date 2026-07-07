@@ -148,7 +148,13 @@ def build_dsa_bwd_dq_m16_module(
     if _wv_env >= 1:
         NUM_WAVES = _wv_env
     else:
-        NUM_WAVES = max(1, min(N_HBLK, (_LDS_LIMIT - _shared_kv_bytes) // _per_wave_lds_bytes))
+        # LDS budget alone allows up to 8 waves/CTA at H128, but 8 waves oversubscribe
+        # the shared-gather barriers + 256-VGPR dQ acc and REGRESS (H128 dQ 7.2ms @8
+        # vs 5.3ms @4). Cap at 4: enough waves to hide MFMA/LDS latency (gluon's 4-warp
+        # template) without CTA-level contention. Measured optimum for H64 (N_HBLK=4)
+        # and H128 (N_HBLK=8 -> 4 waves x 2 grid.y groups).
+        _WAVE_CAP = 4
+        NUM_WAVES = max(1, min(N_HBLK, _WAVE_CAP, (_LDS_LIMIT - _shared_kv_bytes) // _per_wave_lds_bytes))
     while N_HBLK % NUM_WAVES != 0:
         NUM_WAVES -= 1
     BLOCK_SIZE = NUM_WAVES * WARP_SIZE
