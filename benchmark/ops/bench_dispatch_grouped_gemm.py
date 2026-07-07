@@ -175,7 +175,6 @@ def _make_fused_call(ctx, lhs, rhs, layout, *, trans_c=False):
         layout=layout,
         BM=args.bm,
         BN=args.bn,
-        num_dispatch_cu=args.num_dispatch_cu,
         trans_c=trans_c,
     )
 

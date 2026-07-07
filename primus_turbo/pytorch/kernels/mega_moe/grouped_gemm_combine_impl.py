@@ -75,7 +75,7 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
     ):
         kernel = _flydsl_kernel()
         # handle[5] = tile_to_expert; symm buffer + autotune are kernel-internal.
-        # num_combine_cu/num_reduce_cu forwarded (0/None -> kernel's per-layout default).
+        # num_combine_cu/num_reduce_cu are @autotune-swept inside the kernel, not forwarded here.
         return kernel(
             act,
             weight,
@@ -86,8 +86,6 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
             layout=layout,
             BM=int(BM),
             BN=int(BN),
-            num_combine_cu=int(num_combine_cu) or None,
-            num_reduce_cu=int(num_reduce_cu) or None,
         )
 
 

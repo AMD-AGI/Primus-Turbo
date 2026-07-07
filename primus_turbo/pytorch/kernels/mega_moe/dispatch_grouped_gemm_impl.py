@@ -22,17 +22,8 @@ from primus_turbo.pytorch.core.backend import (
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
 
-def _flydsl_kernel():
-    """Lazy import — keep this module importable when FlyDSL is absent."""
-    from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (
-        dispatch_grouped_gemm_bf16,
-    )
-
-    return dispatch_grouped_gemm_bf16
-
-
 class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
-    """FlyDSL fused cross-rank dispatch PUSH + grouped BF16 GEMM (nt / nn / tn)."""
+    """FlyDSL fused cross-rank dispatch + grouped BF16 GEMM (nt / nn / tn)."""
 
     @staticmethod
     def can_handle(
@@ -58,12 +49,15 @@ class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
         topk_idx: Optional[torch.Tensor],
         topk_weights: Optional[torch.Tensor],
         layout: str,
-        num_dispatch_cu: int,
         trans_c: bool,
         out_dtype: torch.dtype,
         **kwargs,
     ):
-        kernel = _flydsl_kernel()
+        # lazy import — keep this module importable when FlyDSL is absent
+        from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (
+            dispatch_grouped_gemm_bf16 as kernel,
+        )
+
         # forward: handle=None builds the symm workspace; reuse: re-feed the tuple.
         in_handle = tuple(handle) if len(handle) > 0 else None
         out, dispatch_x_in_buf, dispatch_weights_in_buf, full_handle = kernel(
@@ -74,7 +68,6 @@ class DispatchGroupedGEMMFlyDSLBackend(KernelBackend):
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             layout=layout,
-            num_dispatch_cu=int(num_dispatch_cu),
             trans_c=trans_c,
             out_dtype=out_dtype,
         )
@@ -94,16 +87,16 @@ class DispatchGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
     _cache = TuneCache(1024)
 
     @classmethod
-    def make_key(cls, x, l1_weights, layout, num_dispatch_cu, **kwargs):
+    def make_key(cls, x, l1_weights, layout, **kwargs):
         num_tokens = x.shape[0]
         if layout == "tn":
             # tn: l1_weights is a 2D activation (pool_rows, N)
             pool_rows, N = l1_weights.shape
-            return (pool_rows, N, num_tokens, int(num_dispatch_cu), layout, x.dtype)
+            return (pool_rows, N, num_tokens, layout, x.dtype)
         G = l1_weights.shape[0]
         n_idx, k_idx = (1, 2) if layout == "nt" else (2, 1)
         N, K = l1_weights.shape[n_idx], l1_weights.shape[k_idx]
-        return (G, N, K, num_tokens, int(num_dispatch_cu), layout, x.dtype)
+        return (G, N, K, num_tokens, layout, x.dtype)
 
 
 _torch_custom_op_wrapper = torch.library.custom_op
@@ -123,7 +116,6 @@ def _dispatch_grouped_gemm(
     topk_idx: Optional[torch.Tensor],
     topk_weights: Optional[torch.Tensor],
     layout: str,
-    num_dispatch_cu: int,
     trans_c: bool,
     out_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
@@ -138,7 +130,6 @@ def _dispatch_grouped_gemm(
         topk_idx=topk_idx,
         topk_weights=topk_weights,
         layout=layout,
-        num_dispatch_cu=num_dispatch_cu,
         trans_c=trans_c,
         out_dtype=out_dtype,
     )
@@ -155,7 +146,6 @@ def _dispatch_grouped_gemm_meta(
     topk_idx: Optional[torch.Tensor],
     topk_weights: Optional[torch.Tensor],
     layout: str,
-    num_dispatch_cu: int,
     trans_c: bool,
     out_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
@@ -180,7 +170,6 @@ def dispatch_grouped_gemm_impl(
     topk_weights: torch.Tensor | None = None,
     handle: tuple | None = None,
     layout: str = "nt",
-    num_dispatch_cu: int = 16,
     trans_c: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
@@ -194,7 +183,6 @@ def dispatch_grouped_gemm_impl(
         topk_idx,
         topk_weights,
         layout,
-        num_dispatch_cu,
         trans_c,
         out_dtype,
     )

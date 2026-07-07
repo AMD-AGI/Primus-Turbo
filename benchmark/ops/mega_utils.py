@@ -52,8 +52,7 @@ from primus_turbo.flydsl.mega.ep_intranode import (
     topk_reduce_bf16_tile,
 )
 from primus_turbo.flydsl.mega.swiglu_kernel import swiglu
-from primus_turbo.flydsl.mega.sym_layout import SymLayout
-from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.utils.gemm_helper import (
     _emit_if_then,
     ceildiv,
@@ -445,7 +444,7 @@ def dispatch_only(
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
-        symm.make_sym_layout(),
+        symm.get_sym_layout(),
         stream=torch.cuda.current_stream(),
     )
 
@@ -605,7 +604,7 @@ def _build_symm_and_plan(group, *, T, H, I, E, K, BLOCK_M, BLOCK_N, base_seed):
     handle = dispatch_prologue(
         topk_idx,
         topk_weight,
-        sym_layout=symm.make_sym_layout(),
+        sym_layout=symm.get_sym_layout(),
         num_tokens=T,
         num_topk=K,
         num_experts=E,
@@ -975,7 +974,7 @@ def combine_only(
     grad_gate=None,
 ):
     symm = get_symm_buffer_for_mega_moe()
-    sym_layout = symm.make_sym_layout()
+    sym_layout = symm.get_sym_layout()
     out_features = int(sym_layout.hidden)
     num_max_pool_tokens = int(sym_layout.num_max_pool_tokens)
     if num_combine_cu is None:
