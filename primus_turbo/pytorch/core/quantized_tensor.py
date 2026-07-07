@@ -299,6 +299,9 @@ class QuantizedTensor(torch.Tensor):
                     scaling_recipe=scaling_recipe,
                 )
             else:
+                orig_group_lens = group_lens
+                orig_group_offs = group_offs_from_lens(group_lens)
+
                 data, scale_inv, padded_group_lens, padded_group_offs = cls._grouped_quantize(
                     hp_tensor,
                     dest_dtype,
