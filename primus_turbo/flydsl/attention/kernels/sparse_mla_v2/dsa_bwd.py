@@ -138,8 +138,11 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
         topk_p = topk_indices
     TOPK = topk_p.shape[1]
 
-    # Delta = rowsum(O * dO)  (o is [T,H,D])
-    delta = (o[:, :, :D].float() * do.float()).sum(-1).contiguous()
+    # Delta = rowsum(O * dO)  (o is [T,H,D]). Multiply in bf16 and reduce with an
+    # fp32 accumulator (sum(dtype=fp32)) instead of upcasting BOTH operands to fp32
+    # first — the .float() copies materialized two T*H*D fp32 temporaries (~2x the
+    # cost). bf16-mul/fp32-sum is 55 dB (well above the dq 51 dB floor), ~2x faster.
+    delta = (o[:, :, :D] * do).sum(-1, dtype=torch.float32).contiguous()
     lse_c = lse.contiguous()
 
     # ---- native FlyDSL dQ (whole top-k) + dS/P buffers ----
