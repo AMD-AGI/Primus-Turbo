@@ -112,9 +112,9 @@ def build_dsa_fwd_tr16_module(
     # overhead (the dominant cost at occupancy 1). Must be a multiple of 16.
     BLOCK_K = int(os.environ.get("PRIMUS_DSA_TR16_BLOCK_K", "32"))
     assert BLOCK_K % 16 == 0
-    # QK HBM-load prefetch depth. Lower => fewer transient VGPR (better occupancy),
-    # higher => more VMEM/MFMA overlap. 2 is the M=32 kernel's sweet spot.
-    _QK_PF = int(os.environ.get("PRIMUS_DSA_TR16_QK_PF", "2"))
+    # QK LDS-load prefetch depth. Higher => more LDS/MFMA overlap. 3 measured best
+    # (373->376); AV prefetch depth is insensitive (kept 2).
+    _QK_PF = int(os.environ.get("PRIMUS_DSA_TR16_QK_PF", "3"))
     K_CHUNKS = HEAD_DIM // 32   # QK d-contraction chunks (16)
     D_TILES = HEAD_DIM // 16    # AV output d-tiles (32)
     N_SUB = BLOCK_K // 16       # QK key sub-tiles (16 keys each)
@@ -318,33 +318,32 @@ def build_dsa_fwd_tr16_module(
             kv_row = arith.index_cast(T.index, arith.select(inv, arith.constant(0, type=T.i32), idr))
             return inv, kv_row * DQK
 
-        m_i = c_neg_inf
-        l_i = c_zero_f
-        acc = [c_zero_acc for _ in range_constexpr(D_TILES)]
+        # ---- factored tile primitives (buf = kv LDS buffer element base) ----
+        _COLG = HEAD_DIM // 8  # vec8 groups per key row (64)
+        _GTOT = BLOCK_K * _COLG
+        GATHER_ITERS = (_GTOT + BLOCK_SIZE - 1) // BLOCK_SIZE
+        _AV_PF = int(os.environ.get("PRIMUS_DSA_TR16_AV_PF", "2"))
+        g_koff = lane_div_16 * arith.index(8)
+        tr_k_group = (lane % arith.index(16)) // arith.index(4)
+        tr_col_sub = lane % arith.index(4)
+        v_krow = lane_div_16 * arith.index(8) + tr_k_group
 
-        for k_start, carry, results in scf.for_(
-            arith.index(0), TOPK_I, arith.index(BLOCK_K), iter_args=[m_i, l_i] + acc,
-        ):
-            m_i = carry[0]
-            l_i = carry[1]
-            acc = [carry[2 + d] for d in range_constexpr(D_TILES)]
-            k_start_i32 = arith.index_cast(T.i32, k_start)
+        def _buf_base(buf):
+            if isinstance(buf, int):
+                return arith.index(buf * LDS_KV_ONE)
+            return buf * arith.index(LDS_KV_ONE)
 
-            # ---- SHARED gather of this tile's kv into LDS (once per workgroup).
-            # Row-major kv[key][d]; all BLOCK_SIZE threads cooperate. Unit of work =
-            # one vec8 (8 d-cols) of one key row. -1 topk rows zeroed (masked).
-            _COLG = HEAD_DIM // 8  # vec8 groups per key row (64)
-            _GTOT = BLOCK_K * _COLG
-            GATHER_ITERS = (_GTOT + BLOCK_SIZE - 1) // BLOCK_SIZE
-            gpu.barrier()  # ensure prior tile's readers are done before overwrite
+        def _ds_read_tr_v4(elem_idx):
+            byte = elem_idx * arith.index(2) + arith.index(lds_off)
+            byte_i64 = arith.index_cast(T.i64, byte)
+            ptr = _llvm.IntToPtrOp(_llvm_lds_ptr_ty(), byte_i64).result
+            return rocdl.ds_read_tr16_b64(T.vec(4, f16_ty), ptr).result
+
+        # ---- SHARED gather of tile k_start's kv into LDS buffer `buf`. Row-major
+        # kv[key][d]; all BLOCK_SIZE threads cooperate; -1 topk rows zeroed/clamped.
+        def _gather(buf, k_start_i32):
+            bb = _buf_base(buf)
             if const_expr(_USE_DMA):
-                # Async global->LDS DMA (raw_ptr_buffer_load_lds), bypassing VGPRs.
-                # Each thread fires a 16B (vec8) load; LDS dest is implicit per-lane
-                # (base + lane*16B). Swizzle (key&3)<<4 on the GLOBAL fetch col,
-                # compensated on the QK + PV reads. Unpadded V_STRIDE==HEAD_DIM.
-                # Branchless (GATHER_ITERS is exact: _GTOT % BLOCK_SIZE == 0).
-                # Invalid (-1) topk rows clamp to global row 0; harmless because the
-                # additive -inf validity mask zeroes those columns in softmax.
                 assert _GTOT % BLOCK_SIZE == 0, "DMA path needs _GTOT divisible by BLOCK_SIZE"
                 _dma_size = arith.constant(16, type=T.i32)
                 _dma_z = arith.constant(0, type=T.i32)
@@ -356,15 +355,14 @@ def build_dsa_fwd_tr16_module(
                     col8 = (slot % arith.index(_COLG)) * arith.index(8)
                     swz_col = _kv_swz(key_in_tile, col8)
                     key_pos_i32 = arith.AddIOp(k_start_i32, arith.index_cast(T.i32, key_in_tile)).result
-                    _inv_g, kv_row_base = key_meta(key_pos_i32)  # already clamps -1 -> row 0
-                    v_idx = kv_lds_base + key_in_tile * arith.index(V_STRIDE) + col8
+                    _inv_g, kv_row_base = key_meta(key_pos_i32)
+                    v_idx = bb + key_in_tile * arith.index(V_STRIDE) + col8
                     lds_addr = lds_base_byte + (arith.index(lds_off) + v_idx) * arith.index(2)
                     lds_i64 = arith.index_cast(T.i64, lds_addr)
                     lds_ptr = _llvm.IntToPtrOp(_llvm_lds_ptr_ty(), lds_i64).result
                     global_elem = kv_row_base + swz_col
                     voffset = arith.index_cast(T.i32, global_elem * arith.index(2))
                     rocdl.raw_ptr_buffer_load_lds(kv_rsrc, lds_ptr, _dma_size, voffset, _dma_z, _dma_z, _dma_aux)
-                rocdl.s_waitcnt(0)  # drain the async DMA before LDS reads
             else:
                 for gi in range_constexpr(GATHER_ITERS):
                     slot = tid + arith.index(gi * BLOCK_SIZE)
@@ -376,26 +374,23 @@ def build_dsa_fwd_tr16_module(
                     koff = kv_row_base + col8
                     vec = load_f16_v(kv_ptr, koff, 8)
                     vec = arith.select(in_range, vec, zero_pack)
-                    v_idx = kv_lds_base + key_in_tile * arith.index(V_STRIDE) + col8
+                    v_idx = bb + key_in_tile * arith.index(V_STRIDE) + col8
                     _if_g = scf.IfOp(in_range, [], has_else=False)
                     with ir.InsertionPoint(_if_g.then_block):
                         vector.store(vec, lds, [v_idx])
                         scf.YieldOp([])
-            gpu.barrier()  # all waves see the full shared tile before QK reads
 
-            owned_scores = []
+        # ---- QK: read kv from buffer `buf`, MFMA against Q, return scaled/masked
+        # scores (N_SUB x 4 per-lane fp32). This is the MATRIX phase to overlap.
+        def _qk(buf, k_start_i32):
+            bb = _buf_base(buf)
+            owned = []
             for s in range_constexpr(N_SUB):
-                key_pos_i32 = arith.AddIOp(
-                    arith.AddIOp(k_start_i32, arith.constant(s * 16, type=T.i32)).result,
-                    lane_mod_16_i32).result
                 kloc_base = arith.index(s * 16) + lane_mod_16
-                # QK A-operand now read from the SHARED LDS kv tile (row-major
-                # kv[key][d]): lane L -> key = s*16 + L%16, d = ck*32 + (L//16)*8 + e.
-                # This is the same row-major layout PV's ds_read_tr reads.
                 def _load_a(ck):
                     base_col = arith.index(ck * 32) + lane_div_16 * arith.index(8)
                     col = _kv_swz(kloc_base, base_col) if const_expr(_USE_DMA) else base_col
-                    a_idx = kv_lds_base + kloc_base * arith.index(V_STRIDE) + col
+                    a_idx = bb + kloc_base * arith.index(V_STRIDE) + col
                     return vector.load_op(T.vec(8, f16_ty), lds, [a_idx])
                 a_packs = [None] * K_CHUNKS
                 for p in range_constexpr(_QK_PF):
@@ -417,8 +412,13 @@ def build_dsa_fwd_tr16_module(
                     sc = arith.MulFOp(c_regs[r], c_sm_scale_f, fastmath=fm_fast).result
                     sc = arith.select(inv_r, c_neg_inf, sc)
                     s_row.append(sc)
-                owned_scores.append(s_row)
+                owned.append(s_row)
+            return owned
 
+        # ---- softmax(owned_scores) + PV (reads kv from buffer `buf`). Returns
+        # updated (m_i, l_i, acc). VALU (softmax) + MATRIX (PV) phase.
+        def _softmax_pv(owned_scores, buf, m_i, l_i, acc):
+            bb = _buf_base(buf)
             m_tile_local = owned_scores[0][0]
             for s in range_constexpr(N_SUB):
                 for r in range_constexpr(4):
@@ -452,30 +452,10 @@ def build_dsa_fwd_tr16_module(
                     p_f16 = arith.trunc_f(f16_ty, p_owned[s][r])
                     lds_pidx = c_lds_p + lane_mod_16 * arith.index(BLOCK_K) + kloc_idx
                     lds_store1(p_f16, lds_pidx)
-
             _lds_fence()
 
-            g_koff = lane_div_16 * arith.index(8)
             alpha_vec = vector.broadcast(T.vec(4, f32_ty), alpha)
 
-            # ds_read_tr lane decomposition for the row-major V tile. HW 4x4
-            # transpose: result[L][e] = V[src][L%4], src=(L//16)*16+e*4+(L%16)//4.
-            # Address so result = A[d=dt*16+L%16, key=(L//16)*8+e]:
-            #   k_row = (L//16)*8 + (L%16)//4 ; d_col = dt*16 + (L%4)*4
-            # va gives keys g*8+0..3; a second read at +4 keys gives g*8+4..7;
-            # shuffle to the full vec8 A-operand (32-key contraction chunk).
-            tr_k_group = (lane % arith.index(16)) // arith.index(4)
-            tr_col_sub = lane % arith.index(4)
-            v_krow = lane_div_16 * arith.index(8) + tr_k_group
-
-            def _ds_read_tr_v4(elem_idx):
-                byte = elem_idx * arith.index(2) + arith.index(lds_off)
-                byte_i64 = arith.index_cast(T.i64, byte)
-                ptr = _llvm.IntToPtrOp(_llvm_lds_ptr_ty(), byte_i64).result
-                return rocdl.ds_read_tr16_b64(T.vec(4, f16_ty), ptr).result
-
-            # AV over N_AVSUB 32-key sub-blocks (each 16x16x32 contracts 32 keys).
-            # avs offsets the p B-operand (kloc) and the V read (key row) by 32.
             def _b_pack(avs):
                 b_pidx = c_lds_p + lane_mod_16 * arith.index(BLOCK_K) + arith.index(avs * 32) + g_koff
                 return vector.load_op(T.vec(8, f16_ty), lds, [b_pidx])
@@ -484,26 +464,18 @@ def build_dsa_fwd_tr16_module(
                 k_row_a = arith.index(avs * 32) + v_krow
                 d_col = arith.index(dt * 16) + tr_col_sub * arith.index(4)
                 if const_expr(_USE_DMA):
-                    # va reads keys g*8+tr; vb reads +4 keys. +4 flips key&3, so each
-                    # read needs its own swizzle mask.
                     k_row_b = k_row_a + arith.index(4)
-                    base_a = kv_lds_base + k_row_a * arith.index(V_STRIDE) + _kv_swz(k_row_a, d_col)
-                    base_b = kv_lds_base + k_row_b * arith.index(V_STRIDE) + _kv_swz(k_row_b, d_col)
+                    base_a = bb + k_row_a * arith.index(V_STRIDE) + _kv_swz(k_row_a, d_col)
+                    base_b = bb + k_row_b * arith.index(V_STRIDE) + _kv_swz(k_row_b, d_col)
                     va = _ds_read_tr_v4(base_a)
                     vb = _ds_read_tr_v4(base_b)
                 else:
-                    base = kv_lds_base + k_row_a * arith.index(V_STRIDE) + d_col
+                    base = bb + k_row_a * arith.index(V_STRIDE) + d_col
                     va = _ds_read_tr_v4(base)
                     vb = _ds_read_tr_v4(base + arith.index(4 * V_STRIDE))
                 return vector.shuffle(va, vb, [0, 1, 2, 3, 4, 5, 6, 7])
 
-            # Online-softmax rescale of the running O accumulators once, before this
-            # tile's PV (all AV sub-blocks then accumulate into the rescaled acc).
             acc = [arith.MulFOp(acc[dt], alpha_vec, fastmath=fm_fast).result for dt in range_constexpr(D_TILES)]
-
-            # Small prefetch depth (2): overlap the next d-tile's ds_read_tr with
-            # the current MFMA without blowing VGPR (hoisting all 32 regressed occ).
-            _AV_PF = 2
             for avs in range_constexpr(N_AVSUB):
                 b_pack = _b_pack(avs)
                 av_pf = [None] * D_TILES
@@ -515,12 +487,79 @@ def build_dsa_fwd_tr16_module(
                     if const_expr(dt + _AV_PF < D_TILES):
                         av_pf[dt + _AV_PF] = _av_a(avs, dt + _AV_PF)
                 acc = new_acc
+            return m_i, l_i, acc
 
-            yield [m_i, l_i] + acc
+        m_i = c_neg_inf
+        l_i = c_zero_f
+        acc = [c_zero_acc for _ in range_constexpr(D_TILES)]
 
-        m_i = results[0]
-        l_i = results[1]
-        acc = [results[2 + d] for d in range_constexpr(D_TILES)]
+        if const_expr(not _PIPELINE):
+            # ---- non-pipelined driver (default): gather; barrier; QK; softmax+PV.
+            for k_start, carry, results in scf.for_(
+                arith.index(0), TOPK_I, arith.index(BLOCK_K), iter_args=[m_i, l_i] + acc,
+            ):
+                m_i = carry[0]
+                l_i = carry[1]
+                acc = [carry[2 + d] for d in range_constexpr(D_TILES)]
+                k_start_i32 = arith.index_cast(T.i32, k_start)
+                gpu.barrier()  # prior tile's readers done before overwrite
+                _gather(0, k_start_i32)
+                gpu.barrier()  # full shared tile visible before QK
+                owned = _qk(0, k_start_i32)
+                m_i, l_i, acc = _softmax_pv(owned, 0, m_i, l_i, acc)
+                yield [m_i, l_i] + acc
+            m_i = results[0]
+            l_i = results[1]
+            acc = [results[2 + d] for d in range_constexpr(D_TILES)]
+        else:
+            # ---- software-pipelined driver: overlap softmax(t) VALU + QK(t+1)
+            # MFMA. 2 kv buffers (parity by tile). PV of tile t reads buf[t%2] via
+            # ds_read_tr, so tile t+1's gather goes into buf[(t+1)%2] (disjoint).
+            # Prologue: gather(0)->buf0; QK(0)->prev.
+            _k0 = arith.constant(0, type=T.i32)
+            _gather(0, _k0)
+            gpu.barrier()
+            prev_scores = _qk(0, _k0)
+            prev_k = _k0
+            # main loop t = 0 .. NUM_TILES-2: gather(t+1)->buf[(t+1)%2];
+            #   QK(t+1)->cur; softmax+PV(prev=t) reads buf[t%2]; promote.
+            NUM_TILES = TOPK // BLOCK_K
+            flat_prev = [prev_scores[s][r] for s in range(N_SUB) for r in range(4)]
+            for t, carry, results in scf.for_(
+                arith.index(0), arith.index(NUM_TILES - 1), arith.index(1),
+                iter_args=[m_i, l_i] + acc + flat_prev + [arith.index_cast(T.index, prev_k)],
+            ):
+                m_i = carry[0]
+                l_i = carry[1]
+                acc = [carry[2 + d] for d in range_constexpr(D_TILES)]
+                _pf = carry[2 + D_TILES: 2 + D_TILES + N_SUB * 4]
+                prev_scores = [[_pf[s * 4 + r] for r in range(4)] for s in range(N_SUB)]
+                prev_k_i32 = arith.index_cast(T.i32, carry[2 + D_TILES + N_SUB * 4])
+                cur_buf = (t + arith.index(1)) % arith.index(2)
+                prev_buf = t % arith.index(2)
+                cur_k_i32 = arith.index_cast(T.i32, (t + arith.index(1)) * arith.index(BLOCK_K))
+                # Barrier: prior iter's PV finished reading cur_buf (it was prev_buf two
+                # iters ago) before this gather overwrites it; also makes the prologue/
+                # previous gather visible. Single barrier per iter (vs 2 non-pipe).
+                gpu.barrier()
+                _gather(cur_buf, cur_k_i32)
+                # QK(t+1) MFMA reads cur_buf (just gathered) -- needs gather visible, but
+                # softmax_pv(prev) reads prev_buf (disjoint, already visible). Emit
+                # softmax(prev) VALU FIRST so it overlaps the gather's LDS writes, THEN a
+                # barrier, THEN QK(cur). PV(prev) also reads prev_buf (safe, disjoint).
+                m_i, l_i, acc = _softmax_pv(prev_scores, prev_buf, m_i, l_i, acc)
+                gpu.barrier()  # cur_buf gather visible before QK reads it
+                cur_scores = _qk(cur_buf, cur_k_i32)
+                flat_cur = [cur_scores[s][r] for s in range(N_SUB) for r in range(4)]
+                yield [m_i, l_i] + acc + flat_cur + [(t + arith.index(1)) * arith.index(BLOCK_K)]
+            m_i = results[0]
+            l_i = results[1]
+            acc = [results[2 + d] for d in range_constexpr(D_TILES)]
+            _pf = results[2 + D_TILES: 2 + D_TILES + N_SUB * 4]
+            last_scores = [[_pf[s * 4 + r] for r in range(4)] for s in range(N_SUB)]
+            last_buf = (results[2 + D_TILES + N_SUB * 4] // arith.index(BLOCK_K)) % arith.index(2)
+            # epilogue: softmax+PV of the last tile.
+            m_i, l_i, acc = _softmax_pv(last_scores, last_buf, m_i, l_i, acc)
 
         # ---- sink fold (scaled domain) + normalize + store ----
         # NOTE: owned_scores are already scaled (c_regs * sm_scale), so m_i is in

@@ -103,11 +103,30 @@ Remaining gap to gluon (~10-20%) = gluon's async_copy DMA + 2-buffer softmax‖Q
   SLOW standalone (118) — 2048 tiny 16B descriptors/tile with per-descriptor topk
   lookup. DMA only pays off when OVERLAPPED against compute (needs the pipeline), so
   it's gated OFF pending Step 3. This matches how gluon uses async_copy.
-- Step 3 (2-buffer softmax(t)||QK(t+1) + DMA overlap pipeline, PRIMUS_DSA_TR16_PIPE):
-  scaffolding in place (NBUF=2 LDS double-buffer, fits 72KB). The loop restructure
-  (loop-carried QK score regs + buffer parity through scf.for, prologue/epilogue peel,
-  s_waitcnt groups) is the remaining work to close the last 10-20% to gluon.
-- Checkpoint of the 373 version: output/flydsl_v2_ckpt/dsa_fwd_tr16_kernel_shared373.py
+- Step 3 (2-buffer softmax(t)||QK(t+1) pipeline, PRIMUS_DSA_TR16_PIPE=1): IMPLEMENTED
+  + CORRECT (47.5 dB). Loop-carried QK score regs + buffer parity through scf.for +
+  prologue/epilogue peel, 2 kv LDS buffers. Overlaps softmax(prev) VALU with the
+  gather LDS writes + QK(cur) MFMA. Perf = 372/333/394 — essentially TIED with the
+  non-pipelined 376/330/388 (H128 K2048 marginally better). Why no gain: the coop
+  gather is SYNCHRONOUS (VGPR->LDS store), so the 2 workgroup barriers/tile it needs
+  cost as much as the overlap saves. True gather overlap requires async DMA.
+- Step 3+DMA (PIPE=1 DMA=1, the actual gluon config): CORRECT but 106 TFLOP/s. My DMA
+  gather issues 2048 tiny per-(key,8-col) raw_ptr_buffer_load_lds descriptors/tile,
+  each with its own topk lookup + address calc — vs gluon's async_copy which issues
+  large contiguous per-D-column-block buffer_load_to_shared. My DMA structure is the
+  bottleneck, not the pipeline. Fixing it = redesign the gather to gluon's column-major
+  bulk-DMA layout (a substantial further effort). Gated OFF.
+- Checkpoint of the shared-gather version: output/flydsl_v2_ckpt/dsa_fwd_tr16_kernel_shared373.py
+
+## FINAL STATE (2026-07-07): tr16 default = 376/330/388, 1.35-1.39x M32, 0.90x gluon
+- Best config = non-pipelined coop shared gather, QK_PF=3, AV_PF=2, NUM_WAVES=auto,
+  BLOCK_K=32, DMA off, PIPE off. 138/138 tests pass. out 47.5 dB.
+- Gated experiments left in-tree (all default OFF): PRIMUS_DSA_TR16_DMA (slow, needs
+  bulk-DMA redesign), PRIMUS_DSA_TR16_PIPE (correct, nets ~0 without async gather),
+  PRIMUS_DSA_TR16_QLDS (occ-2 but slower). Knobs: QK_PF, AV_PF, BLOCK_K, M16_WAVES.
+- To close the last 10% to gluon: redesign the DMA gather to gluon's contiguous
+  column-major async_copy (large per-D-block buffer_load_to_shared, not per-8-elem),
+  THEN the PIPE overlap becomes real. That's the clear next lever.
 
 ## What's still missing (why the OLD naked number was NOT a fair M=16 test)
 tr16 as first built differs from gluon in THREE ways, all of which gluon needs:
