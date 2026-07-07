@@ -225,6 +225,9 @@ def build_dsa_fwd_tr16_module(
         def lds_store1(val, idx):
             vector.store(vector.from_elements(T.vec(1, f16_ty), [val]), lds, [idx])
 
+        def lds_store_v4(val_vec, idx):
+            vector.store(val_vec, lds, [idx])
+
         tok = arith.index_cast(T.index, gpu.block_idx.x)
         pid_wg_hblk = arith.index_cast(T.index, gpu.block_idx.y)
         tid = arith.index_cast(T.index, gpu.thread_idx.x)
@@ -457,15 +460,16 @@ def build_dsa_fwd_tr16_module(
             m_i = m_new
 
             for s in range_constexpr(N_SUB):
-                for r in range_constexpr(4):
-                    kloc = arith.AddIOp(
-                        arith.constant(s * 16, type=T.i32),
-                        arith.AddIOp(arith.MulIOp(lane_div_16_i32, arith.constant(4, type=T.i32)).result,
-                                     arith.constant(r, type=T.i32)).result).result
-                    kloc_idx = arith.index_cast(T.index, kloc)
-                    p_f16 = arith.trunc_f(f16_ty, p_owned[s][r])
-                    lds_pidx = c_lds_p + lane_mod_16 * arith.index(BLOCK_K) + kloc_idx
-                    lds_store1(p_f16, lds_pidx)
+                # r=0..3 map to contiguous kloc (base + r) in the LDS p-region ->
+                # coalesce the 4 scalar stores into a single vec4 store (hot loop).
+                p4 = vector.from_elements(
+                    T.vec(4, f16_ty), [arith.trunc_f(f16_ty, p_owned[s][r]) for r in range_constexpr(4)])
+                kloc0 = arith.AddIOp(
+                    arith.constant(s * 16, type=T.i32),
+                    arith.MulIOp(lane_div_16_i32, arith.constant(4, type=T.i32)).result).result
+                kloc0_idx = arith.index_cast(T.index, kloc0)
+                lds_pidx0 = c_lds_p + lane_mod_16 * arith.index(BLOCK_K) + kloc0_idx
+                lds_store_v4(p4, lds_pidx0)
             _lds_fence()
 
             alpha_vec = vector.broadcast(T.vec(4, f32_ty), alpha)
