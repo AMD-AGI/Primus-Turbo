@@ -647,7 +647,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             a_fp8_col = quantized_a_t.qdata
             a_scale_col = quantized_a_t.scale_inv
 
-            group_offs_padded_rowwise = quantized_a.group_offs_padded_rowwise
+            group_offs_padded_rowwise = quantized_a.group_offs
 
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if not isinstance(b, QuantizedTensor):
