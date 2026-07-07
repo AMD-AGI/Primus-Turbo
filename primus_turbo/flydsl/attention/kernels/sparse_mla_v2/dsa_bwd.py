@@ -41,11 +41,35 @@ from primus_turbo.triton.attention.deepseek.sparse_mla_v2.dsa_bwd_kernels import
 
 from .dsa_bwd_dq_kernel import build_dsa_bwd_dq_module  # noqa: E402
 from .dsa_bwd_dq_m16_kernel import build_dsa_bwd_dq_m16_module  # noqa: E402
+from .dsa_bwd_dkv_interm_v2_kernel import build_dsa_bwd_dkv_interm_v2_module  # noqa: E402
 
 _DQ_CACHE = {}
 _DQ_LOCK = threading.Lock()
 _DQ_M16_CACHE = {}
 _DQ_M16_LOCK = threading.Lock()
+_INTERM_CACHE = {}
+_INTERM_LOCK = threading.Lock()
+
+# Native FlyDSL dkv-intermediate (multi-wave). Correct (55.6 dB, == triton) and 6x
+# faster than the old single-wave port, but at the production TOPK (window++pool, e.g.
+# 1024/2560) it is 0.70-0.84x of triton's head-gated TILE_K=128 config — the D_V-split
+# multi-wave layout can't use TILE_K>=128 without spilling the per-wave accumulator, so
+# it amortizes the per-tile Q/dO re-read worse than triton. Kept env-gated OFF; it is a
+# correct, triton-version-independent fallback. Triton interm stays the default.
+_USE_FLYDSL_INTERM = os.environ.get("PRIMUS_DSA_FLYDSL_BWD_INTERM_V2", "0") == "1"
+
+
+def _get_interm_v2_kernel(num_heads, kv_lora_rank, d_qk, topk):
+    key = (num_heads, kv_lora_rank, d_qk, topk)
+    with _INTERM_LOCK:
+        launch = _INTERM_CACHE.get(key)
+        if launch is None:
+            launch = build_dsa_bwd_dkv_interm_v2_module(
+                num_heads=num_heads, kv_lora_rank=kv_lora_rank, d_qk=d_qk,
+                topk=topk, dtype_str="bf16",
+            )
+            _INTERM_CACHE[key] = launch
+        return launch
 _BLOCK_N = int(os.environ.get("PRIMUS_DSA_FLYDSL_BWD_BLOCK_N", "64"))
 _BLOCK_H = int(os.environ.get("PRIMUS_DSA_FLYDSL_BWD_BLOCK_H", "64"))
 
@@ -179,34 +203,55 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
         _bh_def, _tk_def, _nw_def = 16, (128 if TOPK % 128 == 0 else 64), 4
     else:
         _bh_def, _tk_def, _nw_def = 32, 64, 8
-    BH_DKV = int(os.environ.get("PRIMUS_DSA_DKV_BH", str(_bh_def)))
-    TK_DKV = int(os.environ.get("PRIMUS_DSA_DKV_TK", str(_tk_def)))
-    _NW_DKV = int(os.environ.get("PRIMUS_DSA_DKV_NW", str(_nw_def)))
-    num_hg_dkv = triton.cdiv(num_heads, BH_DKV)
-    _bwd_compute_dkv_intermediate[(total_tokens,)](
-        q,
-        do,
-        chunk_dS,
-        chunk_P,
-        interm,
-        q.stride(0),
-        q.stride(1),
-        do.stride(0),
-        do.stride(1),
-        chunk_dS.stride(0),
-        chunk_dS.stride(1),
-        interm.stride(0),
-        interm.stride(1),
-        num_heads,
-        R_CHUNK=TOPK,
-        TILE_K=TK_DKV,
-        BLOCK_H=BH_DKV,
-        NUM_HG=num_hg_dkv,
-        D_V=D,
-        D_ROPE=rope_rank,
-        HAS_ROPE=HAS_ROPE,
-        num_warps=_NW_DKV,
-    )
+    # Native FlyDSL multi-wave interm when it can tile this shape; else Triton.
+    _interm_ok = _USE_FLYDSL_INTERM and (num_heads % 16 == 0) and (TOPK % 32 == 0)
+    if _interm_ok:
+        interm_launch = _get_interm_v2_kernel(int(num_heads), int(D), int(d_qk), int(TOPK))
+        # flydsl packs a tensor's BYTE size as i32 -> chunk T so each launch's largest
+        # tensor (interm = TOPK*d_qk*2 per token) stays < 2^31 bytes.
+        _bpt = TOPK * d_qk * 2
+        _maxt = max(1, (2**31 - 1) // max(_bpt, num_heads * d_qk * 2, num_heads * TOPK * 2))
+        t0 = 0
+        while t0 < total_tokens:
+            t1 = min(total_tokens, t0 + _maxt)
+            interm_launch(
+                q[t0:t1].reshape(-1),
+                do[t0:t1].reshape(-1),
+                chunk_dS[t0:t1].reshape(-1),
+                chunk_P[t0:t1].reshape(-1),
+                interm[t0:t1].reshape(-1),
+                int(t1 - t0),
+            )
+            t0 = t1
+    else:
+        BH_DKV = int(os.environ.get("PRIMUS_DSA_DKV_BH", str(_bh_def)))
+        TK_DKV = int(os.environ.get("PRIMUS_DSA_DKV_TK", str(_tk_def)))
+        _NW_DKV = int(os.environ.get("PRIMUS_DSA_DKV_NW", str(_nw_def)))
+        num_hg_dkv = triton.cdiv(num_heads, BH_DKV)
+        _bwd_compute_dkv_intermediate[(total_tokens,)](
+            q,
+            do,
+            chunk_dS,
+            chunk_P,
+            interm,
+            q.stride(0),
+            q.stride(1),
+            do.stride(0),
+            do.stride(1),
+            chunk_dS.stride(0),
+            chunk_dS.stride(1),
+            interm.stride(0),
+            interm.stride(1),
+            num_heads,
+            R_CHUNK=TOPK,
+            TILE_K=TK_DKV,
+            BLOCK_H=BH_DKV,
+            NUM_HG=num_hg_dkv,
+            D_V=D,
+            D_ROPE=rope_rank,
+            HAS_ROPE=HAS_ROPE,
+            num_warps=_NW_DKV,
+        )
 
     dkv_acc = torch.zeros(num_kv, d_qk, dtype=torch.float32, device=q.device)
     inv_ptr, inv_data = _build_inverted_topk_slice(topk_p, 0, TOPK, num_kv=num_kv)
