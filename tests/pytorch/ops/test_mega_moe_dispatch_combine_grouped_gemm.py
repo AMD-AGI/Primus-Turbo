@@ -347,10 +347,13 @@ def _run(local_rank, world, args):
 
     modes = ["load_balanced", "round_robin"] if args.mode == "both" else [args.mode]
 
-    # global weights (shared across ranks), sliced to this rank's experts
-    W1g, W2g = _global_weights(E, I, H, "cuda")
-    W1 = W1g[rank * epr : (rank + 1) * epr].contiguous()
-    W2 = W2g[rank * epr : (rank + 1) * epr].contiguous()
+    # global weights (shared across ranks), sliced to this rank's experts.
+    # Build on CPU and move only this rank's slice to GPU: the full 256-expert set
+    # is ~22GB, which OOMs when a co-tenant occupies a GPU; the slice is ~2.8GB.
+    W1g, W2g = _global_weights(E, I, H, "cpu")
+    W1 = W1g[rank * epr : (rank + 1) * epr].contiguous().cuda()
+    W2 = W2g[rank * epr : (rank + 1) * epr].contiguous().cuda()
+    del W1g, W2g
 
     # turbo baseline + mega fused symmetric buffer (allocate once, reuse per step)
     baseline_reference, baseline_grad_forward, baseline_grad_forward_leaves = make_baseline_reference(
@@ -431,7 +434,7 @@ def _run(local_rank, world, args):
                     handle=handle,
                     layout="nn",
                 )
-                d_l2y = symm.pool.clone()  # pool now holds the dispatched dy rows
+                d_l2y = symm.dispatch_token_pool.clone()  # pool now holds the dispatched dy rows
                 group_lens, group_offs = handle[9].tolist(), handle[10].tolist()
                 Iq = I
 
@@ -491,7 +494,7 @@ def _run(local_rank, world, args):
                     layout="tn",
                     trans_c=True,
                 )
-                x_pool = symm.pool.clone()
+                x_pool = symm.dispatch_token_pool.clone()
                 xv = x_pool.abs().sum(-1) > 0  # valid (dispatched) rows
                 gl = grad_l1.float().clone()
                 gl[~xv] = 0  # invalid rows contribute nothing

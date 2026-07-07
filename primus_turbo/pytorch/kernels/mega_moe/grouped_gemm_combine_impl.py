@@ -4,17 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Fused grouped GEMM + combine PUSH + topk reduce as a torch custom op.
-
-Thin wrapper over the FlyDSL kernel ``grouped_gemm_combine_bf16``. The kernel now
-fetches the active symmetric workspace (GEMM-output / combine PUSH source, scoreboard,
-origin tables, peer combine / barrier / gate delta tables) internally via
-``get_symm_buffer_for_mega_moe()`` and allocates the reduce ``output`` -- so the long
-buffer-list ABI is gone. Only the operands (``act`` / ``weight``) plus the dispatch
-``handle`` (slot [7] = ``tile_to_expert``), the routing tensors (``topk_indices`` /
-``topk_weights`` / ``grad_gate``) and tile config remain. Returns ``(output, d_topk_w)``; ``d_topk_w`` is a ``[0]`` placeholder
-unless ``grad_gate`` is supplied (custom-op returns can't be Optional).
-"""
+"""Fused grouped GEMM + combine PUSH + topk reduce custom op (wraps grouped_gemm_combine_bf16)."""
 
 from typing import Optional, Tuple
 
@@ -24,7 +14,6 @@ from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
     BackendType,
-    GlobalBackendManager,
     KernelBackend,
     TuneCache,
 )
@@ -85,8 +74,8 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         kernel = _flydsl_kernel()
-        # kernel uses the active symm buffer; handle carries tile_to_expert (slot [7]).
-        # num_combine_cu/num_reduce_cu/autotune removed: the kernel always autotunes internally.
+        # handle[5] = tile_to_expert; symm buffer + autotune are kernel-internal.
+        # num_combine_cu/num_reduce_cu forwarded (0/None -> kernel's per-layout default).
         return kernel(
             act,
             weight,
@@ -97,6 +86,8 @@ class GroupedGEMMCombineFlyDSLBackend(KernelBackend):
             layout=layout,
             BM=int(BM),
             BN=int(BN),
+            num_combine_cu=int(num_combine_cu) or None,
+            num_reduce_cu=int(num_reduce_cu) or None,
         )
 
 
@@ -144,26 +135,11 @@ def grouped_gemm_combine_impl(
     num_reduce_cu: int = 0,
     autotune: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fused grouped BF16 GEMM + combine PUSH + topk reduce, three-role.
-
-    ``handle`` is the dispatch prologue tuple; slot [7] is ``tile_to_expert``.
-    ``act`` @ ``weight`` (grouped by ``tile_to_expert``) writes the active symm
-    ``l2_token_buffer``; role 1 pushes finished rows cross-rank, role 2 sums each token's
-    ``topk`` rows into a freshly-allocated ``output`` [num_tokens, N]. The symmetric
-    workspace (scoreboard, origin tables, peer combine / barrier / gate delta tables) is
-    fetched from the active ``get_symm_buffer_for_mega_moe()``; ``topk_weights`` (fwd)
-    scales the reduce, ``grad_gate`` (bwd) drives the gate-grad scatter + masked fold.
-
-    Returns ``(output, d_topk_w)``: ``output`` [num_tokens, N] bf16 is the reduce result;
-    ``d_topk_w`` [combine_slots] f32 is the masked gate-grad fold, or a ``[0]`` placeholder
-    when ``grad_gate`` is omitted (custom-op returns can't be Optional).
-    """
+    """Fused grouped BF16 GEMM + combine PUSH + topk reduce; returns (output, d_topk_w)."""
     default_backend_enum = BackendType(default_backend)
 
-    # kernel autotune: explicit flag OR global auto-tune, never under capture
-    do_autotune = autotune or GlobalBackendManager.auto_tune_enabled()
-    do_autotune = do_autotune and not AutoKernelDispatcher._is_graph_capturing()
-
+    # num_combine_cu/num_reduce_cu forwarded to the kernel (0 -> per-layout default);
+    # MEGA_GGC_* env still overrides for sweeps. autotune is kernel-internal.
     kwargs = dict(
         act=act,
         weight=weight,
@@ -176,7 +152,7 @@ def grouped_gemm_combine_impl(
         BN=BN,
         num_combine_cu=num_combine_cu,
         num_reduce_cu=num_reduce_cu,
-        autotune=do_autotune,
+        autotune=autotune,
     )
 
     output, d_topk_w = GroupedGEMMCombineKernelDispatcher.dispatch(default_backend_enum, None, **kwargs)
@@ -207,10 +183,10 @@ def grouped_gemm_combine_impl_meta(
     assert act.dtype in _SUPPORTED_DTYPES, f"act must be bf16, got {act.dtype}"
     assert weight.dtype in _SUPPORTED_DTYPES, f"weight must be bf16, got {weight.dtype}"
     assert layout in ("nt", "nn", "tn"), f"unknown layout {layout}"
-    # output [num_tokens, N] + d_topk_w [combine_slots or 0] sized from active symm (N from weight)
+    # output [num_tokens, N] + d_topk_w [num_combine_slots or 0] sized from active symm (N from weight)
     N = weight.shape[1] if layout == "nt" else weight.shape[2]
     symm = _active_symm()
     output = act.new_empty((int(symm.num_tokens), N), dtype=torch.bfloat16)
-    gate_slots = int(symm.combine_slots) if grad_gate is not None else 0
+    gate_slots = int(symm.num_combine_slots) if grad_gate is not None else 0
     d_topk_w = act.new_empty((gate_slots,), dtype=torch.float32)
     return output, d_topk_w
