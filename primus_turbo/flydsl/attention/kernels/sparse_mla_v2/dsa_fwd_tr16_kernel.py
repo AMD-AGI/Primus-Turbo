@@ -156,6 +156,11 @@ def build_dsa_fwd_tr16_module(
     N_WG_HBLK = N_HBLK // NUM_WAVES  # head-block groups along grid.y
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    # Two-phase coop gather (hoist all VMEM loads before LDS stores) wins when the
+    # workgroup has few waves (thread-starved, gather latency-bound): H64=4 waves
+    # +13%. H128=8 waves is thread-saturated -> the extra live VGPR regresses it.
+    _hg_env = os.environ.get("PRIMUS_DSA_TR16_HOIST_GATHER", "")
+    _HOIST_GATHER = (int(_hg_env) == 1) if _hg_env else (NUM_WAVES <= 4)
 
     # Software pipeline: double-buffer the SHARED kv tile so the async DMA gather of
     # tile t+1 overlaps the compute (QK+softmax+PV) of tile t (gluon's lever). Only
@@ -381,6 +386,32 @@ def build_dsa_fwd_tr16_module(
                     global_elem = kv_row_base + unsw_col
                     voffset = arith.index_cast(T.i32, global_elem * arith.index(2))
                     rocdl.raw_ptr_buffer_load_lds(kv_rsrc, lds_ptr, _dma_size, voffset, _dma_z, _dma_z, _dma_aux)
+            elif const_expr(_HOIST_GATHER):
+                # Two-phase coop gather: issue ALL VMEM loads (topk-indexed kv rows)
+                # first, then do all the LDS stores. Decouples the per-iter dependent
+                # chain (topk-load -> kv-load -> store) so many VMEM loads are in
+                # flight at once. Wins when threads<work (H64: 256 threads / 4 waves,
+                # GATHER_ITERS=8) where the gather is latency-bound: +13% (331->376).
+                # H128 (8 waves, 512 threads) is already thread-saturated -> the extra
+                # live VGPR from holding all loads regresses it, so gate on NUM_WAVES.
+                _loaded = []
+                for gi in range_constexpr(GATHER_ITERS):
+                    slot = tid + arith.index(gi * BLOCK_SIZE)
+                    in_range = arith.cmpi(arith.CmpIPredicate.slt, slot, arith.index(_GTOT))
+                    key_in_tile = slot // arith.index(_COLG)
+                    col8 = (slot % arith.index(_COLG)) * arith.index(8)
+                    key_pos_i32 = arith.AddIOp(k_start_i32, arith.index_cast(T.i32, key_in_tile)).result
+                    _inv_g, kv_row_base = key_meta(key_pos_i32)
+                    koff = kv_row_base + col8
+                    vec = load_f16_v(kv_ptr, koff, 8)
+                    vec = arith.select(in_range, vec, zero_pack)
+                    v_idx = bb + key_in_tile * arith.index(V_STRIDE) + col8
+                    _loaded.append((vec, v_idx, in_range))
+                for vec, v_idx, in_range in _loaded:
+                    _if_g = scf.IfOp(in_range, [], has_else=False)
+                    with ir.InsertionPoint(_if_g.then_block):
+                        vector.store(vec, lds, [v_idx])
+                        scf.YieldOp([])
             else:
                 for gi in range_constexpr(GATHER_ITERS):
                     slot = tid + arith.index(gi * BLOCK_SIZE)
