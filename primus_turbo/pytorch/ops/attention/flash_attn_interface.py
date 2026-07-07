@@ -220,6 +220,70 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         )
 
 
+class FlyDSLFlashAttnFunc(torch.autograd.Function):
+    """FlyDSL flash-attention autograd Function (gfx950).
+
+    Both directions use native FlyDSL kernels (bshd, bf16/fp16, GQA, causal
+    full-attention). Forward is the vendored single-variant BLOCK_M=128 dense
+    kernel; backward is the deterministic split (delta + dQ Q-outer + dK/dV
+    KV-outer), which recomputes P from the saved LSE and owns each output tile in
+    a single work-group (no float atomics). Restricted to the shapes the kernels
+    support (no dropout / bias / alibi / sink / sliding window); callers select it
+    explicitly and the aiter and triton paths are untouched.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, dropout_p, softmax_scale, causal, window_size, return_lse, is_grad_enabled):
+        # Lazy import so environments without the FlyDSL compiler still load the
+        # aiter/triton backends (this module hard-imports those at top).
+        from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+            attention_flydsl_forward_impl,
+        )
+
+        assert dropout_p == 0.0, "FlyDSL flash-attn does not support dropout"
+        assert tuple(window_size) == (-1, -1), (
+            "FlyDSL flash-attn supports full attention only (no sliding window)"
+        )
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        out, lse = attention_flydsl_forward_impl(
+            q.contiguous(), k.contiguous(), v.contiguous(), float(softmax_scale), bool(causal)
+        )
+
+        is_grad = is_grad_enabled and any(x.requires_grad for x in (q, k, v))
+        if is_grad:
+            ctx.save_for_backward(q, k, v, out, lse)
+            ctx.softmax_scale = float(softmax_scale)
+            ctx.causal = bool(causal)
+
+        if return_lse:
+            return out, lse
+        return out
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+            attention_flydsl_backward_impl,
+        )
+
+        q, k, v, out, lse = ctx.saved_tensors
+        dq, dk, dv = attention_flydsl_backward_impl(
+            dout.contiguous(), q, k, v, out, lse, ctx.softmax_scale, ctx.causal
+        )
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class TritonFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -337,8 +401,29 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink: Optional[torch.Tensor] = None,
+    backend: str = "aiter",
 ):
     qkv_format = _infer_qkv_format(q, k, v)
+
+    if backend == "flydsl":
+        # FlyDSL backend: bshd only, full causal attention, no bias/alibi/sink/
+        # dropout/return_softmax. The aiter/triton paths below are unaffected.
+        assert qkv_format == "bshd", "FlyDSL flash-attn backend requires bshd q/k/v"
+        assert bias is None and alibi_slopes is None and sink is None, (
+            "FlyDSL flash-attn backend does not support bias/alibi/sink"
+        )
+        assert not return_attn_probs, "FlyDSL flash-attn backend does not return attn probs"
+        return FlyDSLFlashAttnFunc.apply(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            return_lse,
+            torch.is_grad_enabled(),
+        )
 
     result = AiterFlashAttnFunc.apply(
         q,
