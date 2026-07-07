@@ -166,8 +166,12 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     HAS_ROPE = False
     interm = torch.empty(total_tokens, TOPK, d_qk, dtype=torch.bfloat16, device=q.device)
     # BH_DKV/TK_DKV whole-top-k (R_CHUNK=TOPK) in one dKV-intermediate pass.
-    BH_DKV = int(os.environ.get("PRIMUS_DSA_DKV_BH", "32"))
-    TK_DKV = int(os.environ.get("PRIMUS_DSA_DKV_TK", "64"))
+    # BH16/TK128/nw8 measured ~14-25% faster than BH32/TK64 across H64/H128 K512/K2048
+    # (interm H128K512 1669->1338us, H64 1059->800us, K2048 6630->5730us). TK128 needs
+    # TOPK%128==0 (V4 production K512/K2048 both qualify); fall back to TK64 otherwise.
+    _tk_default = 128 if (TOPK % 128 == 0) else 64
+    BH_DKV = int(os.environ.get("PRIMUS_DSA_DKV_BH", "16"))
+    TK_DKV = int(os.environ.get("PRIMUS_DSA_DKV_TK", str(_tk_default)))
     _NW_DKV = int(os.environ.get("PRIMUS_DSA_DKV_NW", "8"))
     num_hg_dkv = triton.cdiv(num_heads, BH_DKV)
     _bwd_compute_dkv_intermediate[(total_tokens,)](
