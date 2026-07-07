@@ -171,7 +171,13 @@ def build_dsa_fwd_tr16_module(
     #        (BLOCK_H*BLOCK_K) ++ optional Q (BLOCK_H*Q_STRIDE) ].
     LDS_KV_ONE = BLOCK_K * V_STRIDE
     LDS_KV = NBUF * LDS_KV_ONE
-    LDS_P = BLOCK_H * BLOCK_K
+    # p-region row stride. Plain BLOCK_K (32) is a power of 2 -> consecutive heads
+    # (lane_mod_16 rows) alias the same LDS banks (measured 52% bank-conflict at H64,
+    # LDS-wait/busy=2.0). Pad the stride to break the aliasing: +4 measured best across
+    # all shapes (H64 376->385, H128 404->413, K2048 420->429; +8 close 2nd, +32 i.e.
+    # power-of-2=64 regresses hard, confirming banks). Env override for A/B sweep.
+    P_STRIDE = int(os.environ.get("PRIMUS_DSA_TR16_P_STRIDE", str(BLOCK_K + 4)))
+    LDS_P = BLOCK_H * P_STRIDE
     LDS_Q = BLOCK_H * Q_STRIDE if _Q_IN_LDS else 0
     LDS_PER_WAVE = LDS_P + LDS_Q
     LDS_TOTAL = LDS_KV + NUM_WAVES * LDS_PER_WAVE
@@ -500,14 +506,14 @@ def build_dsa_fwd_tr16_module(
                     arith.constant(s * 16, type=T.i32),
                     arith.MulIOp(lane_div_16_i32, arith.constant(4, type=T.i32)).result).result
                 kloc0_idx = arith.index_cast(T.index, kloc0)
-                lds_pidx0 = c_lds_p + lane_mod_16 * arith.index(BLOCK_K) + kloc0_idx
+                lds_pidx0 = c_lds_p + lane_mod_16 * arith.index(P_STRIDE) + kloc0_idx
                 lds_store_v4(p4, lds_pidx0)
             _lds_fence()
 
             alpha_vec = vector.broadcast(T.vec(4, f32_ty), alpha)
 
             def _b_pack(avs):
-                b_pidx = c_lds_p + lane_mod_16 * arith.index(BLOCK_K) + arith.index(avs * 32) + g_koff
+                b_pidx = c_lds_p + lane_mod_16 * arith.index(P_STRIDE) + arith.index(avs * 32) + g_koff
                 return vector.load_op(T.vec(8, f16_ty), lds, [b_pidx])
 
             def _av_a(avs, dt):
