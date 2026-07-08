@@ -8,7 +8,7 @@ Forked from flash_attn_fwd_kernel.py: reuses the verified forward machine
 PV-aligned registers, ds_read_tr16_b64 hardware transpose read, causal per-lane
 select, wave64 peer reduce) and only swaps the epilogue for the backward math.
 
-Two build modes (Q-outer, one work-group owns one q-tile -> single write, no
+Three build modes (Q-outer, one work-group owns one q-tile -> single write, no
 float atomics -> deterministic):
 
   mode="delta": delta[b,hq,s] = sum_j P_ij * dP_ij   (fp32 P, fp32 accumulate).
@@ -22,6 +22,15 @@ float atomics -> deterministic):
       transposed (ds_read_tr) as the "V" A-operand and dS as the "P" B-operand;
       for head_dim=64 the K-swizzle equals the forward V-swizzle so that read
       path is reused verbatim. Result [D,q] is stored transposed like O.
+
+  mode="fused_dq_delta": folds the delta and dq passes into one kv-loop so S/P/dP
+      are recomputed once (not twice), removing the whole delta kernel's exp2
+      pass. Uses the identity dQ = sm*(A - delta*B) with, accumulated in one pass,
+      delta_i = sum_j P_ij*dP_ij, A_i = sum_j (P_ij*dP_ij) k_j, B_i = sum_j P_ij k_j.
+      A and B feed their P/(P*dP) B-operands through an error-free double-bf16 split
+      (Phi/Plo, Chi/Clo; K single bf16) so the epilogue subtraction survives the
+      near-diagonal catastrophic cancellation. Writes both dQ (transposed) and the
+      recomputed fp32 delta (for the downstream dkdv kernel).
 
 Target: gfx950 only (32x32x16 bf16 MFMA, ds_read_tr16_b64, permlane32_swap +
 cvt_pk_bf16_f32 store). bf16, causal, GQA/MQA (num_kv_heads <= num_heads).
@@ -86,8 +95,8 @@ def build_flash_attn_bwd_module(
     mode="dq",
     enable_dma=True,
 ):
-    """Build one backward launcher. ``mode`` in {"delta", "dq"}."""
-    assert mode in ("delta", "dq"), mode
+    """Build one backward launcher. ``mode`` in {"delta", "dq", "fused_dq_delta"}."""
+    assert mode in ("delta", "dq", "fused_dq_delta"), mode
     assert causal, "backward kernel is causal-only for the GPT-OSS campaign"
     gpu_arch = get_hip_arch()
     assert gpu_arch.startswith("gfx950"), "backward kernel targets gfx950"
@@ -157,6 +166,8 @@ def build_flash_attn_bwd_module(
     allocator.ptr = lds_off + LDS_TOTAL * 2
 
     IS_DQ = mode == "dq"
+    IS_DELTA = mode == "delta"
+    IS_FUSED = mode == "fused_dq_delta"
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def flash_attn_bwd_kernel(
@@ -281,6 +292,22 @@ def build_flash_attn_bwd_module(
                 Vec.from_elements([fx.Int32(_raw(p)) for p in pairs], fx.Int32).bitcast(elem_dtype).ir_value()
             )
 
+        def _split_pack_v8(f32_vals):
+            # Error-free double-bf16 split of one 8-slot B-operand group: top = RNE
+            # bf16(x), bot = RNE bf16(x - f32(top)). Feeding both through separate bf16
+            # MFMAs (K@top + K@bot) recovers x to ~f32 accuracy, so the fused epilogue
+            # dQ = sm*(A - delta*B) survives the near-diagonal catastrophic cancellation
+            # that a single-bf16 A/B would suffer. bot is derived from the SAME top so
+            # top+bot == x bit-consistently (no rounding mismatch).
+            top = [fx.Float32(_raw(f32_vals[i])).to(elem_dtype) for i in range_constexpr(8)]
+            bot = []
+            for i in range_constexpr(8):
+                top_f32 = elem_dtype(_raw(top[i])).to(fx.Float32)
+                bot.append(fx.Float32(_fsub(f32_vals[i], top_f32)).to(elem_dtype))
+            top_pack = Vec.from_elements(top, elem_dtype).ir_value()
+            bot_pack = Vec.from_elements(bot, elem_dtype).ir_value()
+            return top_pack, bot_pack
+
         # ---- K XOR swizzle (d64-general): col ^ ((row & (K_STRIDE//16-1)) << 4). ----
         def _k_swizzle(row_idx, col_idx):
             mask = (row_idx & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
@@ -323,10 +350,11 @@ def build_flash_attn_bwd_module(
             delta_in_rsrc = buffer_ops.create_buffer_resource(
                 DELTA, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
             )
+        if const_expr(IS_DQ or IS_FUSED):
             dq_rsrc = buffer_ops.create_buffer_resource(
                 DQ, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
             )
-        else:
+        if const_expr(IS_DELTA or IS_FUSED):
             delta_out_rsrc = buffer_ops.create_buffer_resource(
                 DELTA, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
             )
@@ -468,12 +496,19 @@ def build_flash_attn_bwd_module(
         # ---- Loop-carried init ----
         if const_expr(IS_DQ):
             init_args = [c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
+        elif const_expr(IS_FUSED):
+            # [A_accs(D_CHUNKS), B_accs(D_CHUNKS), delta] carried in one kv pass.
+            init_args = [c_zero_v16f32 for _ in range_constexpr(2 * D_CHUNKS)] + [c_zero_f]
         else:
             init_args = [c_zero_f]
 
         def _kv_body(kv_start, inner_iter_args, apply_mask):
             if const_expr(IS_DQ):
                 dq_accs = [inner_iter_args[i] for i in range_constexpr(D_CHUNKS)]
+            elif const_expr(IS_FUSED):
+                a_accs = [inner_iter_args[i] for i in range_constexpr(D_CHUNKS)]
+                b_accs = [inner_iter_args[D_CHUNKS + i] for i in range_constexpr(D_CHUNKS)]
+                delta_acc = inner_iter_args[2 * D_CHUNKS]
             else:
                 # A single loop-carried value can arrive unwrapped (not a list).
                 delta_acc = (
@@ -505,9 +540,10 @@ def build_flash_attn_bwd_module(
             # unmasked, so the caller skips the compare+select there (apply_mask=False).
             kv_start_i32 = fx.Int32(kv_start)
             lane_off_i32 = fx.Int32(lane_div_32) * fx.Int32(4)
-            p_lo = []
-            p_hi = []
-            for r in range_constexpr(16):
+
+            def _p_exp2(r):
+                # P[r] = exp2(sm*log2e*S[r] + lse) with the causal mask on diagonal
+                # tiles only. Returns (p_lo_r, p_hi_r) for the two 32-kv sub-blocks.
                 if const_expr(apply_mask):
                     off = (r // 4) * 8 + (r % 4)
                     kv_col = kv_start_i32 + lane_off_i32 + fx.Int32(off)
@@ -518,21 +554,76 @@ def build_flash_attn_bwd_module(
                     s_hi_r = s_hi[r]
                 diff_lo = fmath.fma(s_lo_r, c_sm_scale_log2e, neg_lse_log2e, fastmath=fm_fast)
                 diff_hi = fmath.fma(s_hi_r, c_sm_scale_log2e, neg_lse_log2e, fastmath=fm_fast)
-                p_lo.append(ArithValue(diff_lo).exp2(fastmath=fm_fast))
-                p_hi.append(ArithValue(diff_hi).exp2(fastmath=fm_fast))
+                return (
+                    ArithValue(diff_lo).exp2(fastmath=fm_fast),
+                    ArithValue(diff_hi).exp2(fastmath=fm_fast),
+                )
 
-            dp_lo = [Vec(dp_lo_acc)[r] for r in range_constexpr(16)]
-            dp_hi = [Vec(dp_hi_acc)[r] for r in range_constexpr(16)]
+            if const_expr(not IS_FUSED):
+                p_lo = []
+                p_hi = []
+                for r in range_constexpr(16):
+                    plo_r, phi_r = _p_exp2(r)
+                    p_lo.append(plo_r)
+                    p_hi.append(phi_r)
+                dp_lo = [Vec(dp_lo_acc)[r] for r in range_constexpr(16)]
+                dp_hi = [Vec(dp_hi_acc)[r] for r in range_constexpr(16)]
 
             # Build the loop-carried yield args conditionally, then yield ONCE at the
             # tail (a single scf.yield per loop body, mirroring the forward).
-            if const_expr(not IS_DQ):
+            if const_expr(IS_DELTA):
                 local = c_zero_f
                 for r in range_constexpr(16):
                     local = _fadd(local, _fmul(p_lo[r], dp_lo[r]))
                     local = _fadd(local, _fmul(p_hi[r], dp_hi[r]))
                 delta_acc = _fadd(delta_acc, local)
                 return [delta_acc]
+            elif const_expr(IS_FUSED):
+                # One pass accumulates delta=sum_j P*dP, A=sum_j (P*dP)*K, B=sum_j P*K
+                # (dQ = sm*(A - delta*B)). To keep VGPR pressure low (dual A/B
+                # accumulators already cost 2x dq's), process one 8-slot group at a
+                # time: exp2 -> C=P*dP -> double-bf16 split -> GEMM2 immediately, so
+                # only the current group's packs stay live (not all 16 at once).
+                local = c_zero_f
+                for pks in range_constexpr(PV_K_STEPS):
+                    base = pks * 8
+                    plo_g = []
+                    phi_g = []
+                    clo_g = []
+                    chi_g = []
+                    for i in range_constexpr(8):
+                        r = base + i
+                        plo, phi = _p_exp2(r)
+                        clo = _fmul(plo, Vec(dp_lo_acc)[r])
+                        chi = _fmul(phi, Vec(dp_hi_acc)[r])
+                        local = _fadd(local, clo)
+                        local = _fadd(local, chi)
+                        plo_g.append(plo)
+                        phi_g.append(phi)
+                        clo_g.append(clo)
+                        chi_g.append(chi)
+                    plo_t, plo_b = _split_pack_v8(plo_g)
+                    phi_t, phi_b = _split_pack_v8(phi_g)
+                    clo_t, clo_b = _split_pack_v8(clo_g)
+                    chi_t, chi_b = _split_pack_v8(chi_g)
+                    # GEMM2: A[D,q] += K^T @ C ; B[D,q] += K^T @ P (K transpose-read
+                    # as "V"; C/P double-bf16 packs as "P"). K read per (dc, pks).
+                    for dc in range_constexpr(D_CHUNKS):
+                        k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
+                        a_accs[dc] = mfma_acc(k_lo, clo_t, a_accs[dc])
+                        a_accs[dc] = mfma_acc(k_lo, clo_b, a_accs[dc])
+                        a_accs[dc] = mfma_acc(k_hi, chi_t, a_accs[dc])
+                        a_accs[dc] = mfma_acc(k_hi, chi_b, a_accs[dc])
+                        b_accs[dc] = mfma_acc(k_lo, plo_t, b_accs[dc])
+                        b_accs[dc] = mfma_acc(k_lo, plo_b, b_accs[dc])
+                        b_accs[dc] = mfma_acc(k_hi, phi_t, b_accs[dc])
+                        b_accs[dc] = mfma_acc(k_hi, phi_b, b_accs[dc])
+                delta_acc = _fadd(delta_acc, local)
+                return (
+                    [a_accs[i] for i in range_constexpr(D_CHUNKS)]
+                    + [b_accs[i] for i in range_constexpr(D_CHUNKS)]
+                    + [delta_acc]
+                )
             else:
                 ds_lo = []
                 ds_hi = []
@@ -572,7 +663,7 @@ def build_flash_attn_bwd_module(
             loop_results = yield _kv_body(kv_start, inner_iter_args, True)
 
         # ---- Epilogue ----
-        if const_expr(not IS_DQ):
+        if const_expr(IS_DELTA):
             delta_final = loop_results[0] if isinstance(loop_results, (list, tuple)) else loop_results
             delta_full = _fadd(delta_final, reduction_peer(delta_final))
             if lane_div_32 == fx.Index(0):
@@ -584,7 +675,35 @@ def build_flash_attn_bwd_module(
                     offset_is_bytes=True,
                 )
         else:
-            dq_finals = [loop_results[dc] for dc in range_constexpr(D_CHUNKS)]
+            if const_expr(IS_FUSED):
+                # delta = sum_j P*dP (peer-reduce over the kv split held by lane+-32);
+                # both lane halves then hold the full delta for their q=lane_mod_32.
+                a_finals = [loop_results[dc] for dc in range_constexpr(D_CHUNKS)]
+                b_finals = [loop_results[D_CHUNKS + dc] for dc in range_constexpr(D_CHUNKS)]
+                delta_final = loop_results[2 * D_CHUNKS]
+                delta_full = _fadd(delta_final, reduction_peer(delta_final))
+                if lane_div_32 == fx.Index(0):
+                    buffer_ops.buffer_store(
+                        fx.Float32(delta_full),
+                        delta_out_rsrc,
+                        _lse_elem * fx.Index(4),
+                        mask=ArithValue(q_row < seq_len_v),
+                        offset_is_bytes=True,
+                    )
+                # dQ = sm*(A - delta*B). The accumulators are [M=D, N=q] with N=q ==
+                # lane_mod_32, so delta_full (per-q, per-lane) is constant across the 16
+                # D-registers -> a single scalar multiply per register.
+                dq_finals = []
+                for dc in range_constexpr(D_CHUNKS):
+                    a_v = Vec(a_finals[dc])
+                    b_v = Vec(b_finals[dc])
+                    vals = [
+                        fx.Float32(_fsub(a_v[r], _fmul(delta_full, b_v[r])))
+                        for r in range_constexpr(16)
+                    ]
+                    dq_finals.append(Vec.from_elements(vals, fx.Float32).ir_value())
+            else:
+                dq_finals = [loop_results[dc] for dc in range_constexpr(D_CHUNKS)]
             sm_vec = Vec.from_elements([fx.Float32(sm_scale)], fx.Float32).broadcast_to(16)
             v_o = [Vec(dq_finals[dc]) * sm_vec for dc in range_constexpr(D_CHUNKS)]
 

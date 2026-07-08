@@ -191,8 +191,8 @@ def _attention_flydsl_forward_impl_fake(
 
 
 def _get_bwd_launchers(num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_scale):
-    """Build (once, per head config) the three deterministic split-backward
-    launchers: delta (Q-outer sum_j P.dP), dQ (Q-outer), dK/dV (KV-outer)."""
+    """Build (once, per head config) the two deterministic split-backward launchers:
+    fused dQ+delta (Q-outer, one S/P/dP pass) and dK/dV (KV-outer)."""
     key = (num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_scale)
     launchers = _BWD_LAUNCHER_CACHE.get(key)
     if launchers is None:
@@ -204,12 +204,13 @@ def _get_bwd_launchers(num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_
             sm_scale=sm_scale,
             num_kv_heads=num_kv_heads,
         )
-        # delta/dq are lighter than dkdv (fewer accumulators -> VGPR headroom); 3
-        # waves/EU hides latency best here (2<3>4; dkdv stays at its default 2).
-        delta_launch = build_flash_attn_bwd_module(mode="delta", waves_per_eu=3, **common)
-        dq_launch = build_flash_attn_bwd_module(mode="dq", waves_per_eu=3, **common)
+        # Fused dQ+delta computes S/P/dP once (removing the standalone delta kernel's
+        # whole exp2 pass) via dQ = sm*(A - delta*B) with double-bf16 A/B operands. The
+        # extra A/B accumulators raise VGPR (~occ 3->2), so waves_per_eu=2 keeps the
+        # 256-VGPR occ-2 ceiling and avoids spill; dkdv stays at its default 2.
+        fused_launch = build_flash_attn_bwd_module(mode="fused_dq_delta", waves_per_eu=2, **common)
         dkdv_launch = build_flash_attn_bwd_dkdv_module(q_split=_DKDV_Q_SPLIT, **common)
-        launchers = (delta_launch, dq_launch, dkdv_launch)
+        launchers = (fused_launch, dkdv_launch)
         _BWD_LAUNCHER_CACHE[key] = launchers
     return launchers, key
 
@@ -255,25 +256,21 @@ def attention_flydsl_backward_impl(
     # exp2 addend and drop the inner-loop mul (see _NEG_LOG2E note above).
     lse = lse.contiguous().mul(_NEG_LOG2E)
 
-    (delta_launch, dq_launch, dkdv_launch), key = _get_bwd_launchers(
+    (fused_launch, dkdv_launch), key = _get_bwd_launchers(
         Hq, Hkv, D, bool(causal), _dtype_str(q.dtype), float(softmax_scale)
     )
 
-    # delta[B,Hq,S] fp32 is a shared scratch: the delta kernel writes the
-    # consistent fp32 sum_j P.dP that both dQ and dK/dV read (so all three see the
-    # same dS -> exact near-diagonal cancellation for dQ). NOTE: the cheap identity
-    # delta_i = rowsum(dO_i . O_i) is mathematically exact but its bf16-epsilon
-    # mismatch with dq's MFMA-recomputed P.dP breaks the per-row dS cancellation,
-    # so the exact-arithmetic kernel is required.
+    # delta[B,Hq,S] fp32 is a shared scratch: the fused kernel writes the consistent
+    # fp32 sum_j P.dP (same recomputed P as dQ) that dK/dV reads, so all see the same
+    # dS -> exact near-diagonal cancellation. NOTE: the cheap identity delta_i =
+    # rowsum(dO_i . O_i) is mathematically exact but its bf16-epsilon mismatch with the
+    # MFMA-recomputed P.dP breaks the per-row cancellation, so it is not used.
     delta = torch.empty((B, Hq, S), dtype=torch.float32, device=q.device)
     dq = torch.empty((B, S, Hq, D), dtype=q.dtype, device=q.device)
     # dK/dV are written into a per-split workspace [B, Q_SPLIT, S, Hkv, D]; the
     # split-K partials are reduced slot-wise below (fixed order -> deterministic).
     ws_dk = torch.empty((B, _DKDV_Q_SPLIT, S, Hkv, D), dtype=k.dtype, device=q.device)
     ws_dv = torch.empty((B, _DKDV_Q_SPLIT, S, Hkv, D), dtype=v.dtype, device=q.device)
-    # delta-mode kernel keeps DQ in its arg list but never reads it; pass a 1-elem
-    # placeholder so the buffer descriptor is valid.
-    dq_placeholder = torch.empty((1,), dtype=q.dtype, device=q.device)
 
     stream = torch.cuda.current_stream()
     qf, kf, vf, dof, lsef, deltaf = (
@@ -285,8 +282,9 @@ def attention_flydsl_backward_impl(
         delta.view(-1),
     )
 
-    _run_bwd(delta_launch, key, "delta", (qf, kf, vf, dof, lsef, deltaf, dq_placeholder, B, S, stream), B, S)
-    _run_bwd(dq_launch, key, "dq", (qf, kf, vf, dof, lsef, deltaf, dq.view(-1), B, S, stream), B, S)
+    # Fused: one S/P/dP pass emits both dQ and the fp32 delta for dkdv (deletes the
+    # standalone delta kernel's exp2 pass).
+    _run_bwd(fused_launch, key, "fused", (qf, kf, vf, dof, lsef, deltaf, dq.view(-1), B, S, stream), B, S)
     _run_bwd(
         dkdv_launch,
         key,
