@@ -62,6 +62,12 @@ _MAIN_DTYPES = {
     "act": torch.bfloat16,
     "l2_token_buffer": torch.bfloat16,
     "src_token_topk_idx": torch.int32,
+    # mxfp8 forward-only (present only when use_mxfp8=1)
+    "pool_fp8": torch.float8_e4m3fn,
+    "pool_scale": torch.uint8,  # raw E8M0 byte
+    "act_fp8": torch.float8_e4m3fn,
+    "act_scale": torch.uint8,  # raw E8M0 byte
+    "pool_scale_ps": torch.int32,  # E8M0 in ScaleS2R broadcast layout (fused quant-in-push)
 }
 _SIGNAL_DTYPES = {
     "_ipc_barrier": torch.int32,
@@ -84,6 +90,7 @@ def _build_layout_spec(
     *,
     block_m=256,
     pool_mult=2,
+    use_mxfp8=False,
 ):
     """Size both heaps directly from ``sym_layout``; attach torch dtypes for the views.
 
@@ -108,6 +115,7 @@ def _build_layout_spec(
         num_max_pool_tokens,
         num_pool_blocks,
         combine_slots,
+        use_mxfp8=int(bool(use_mxfp8)),
     )
     main_off, sig_off, num_bytes, signal_bytes = _sym_region_layout(sl)
     main_spec = {n: (off, _MAIN_DTYPES[n], numel) for n, (off, _it, numel) in main_off.items()}
@@ -124,6 +132,7 @@ def _build_layout_spec(
         num_max_pool_tokens=num_max_pool_tokens,
         num_pool_blocks=num_pool_blocks,
         combine_slots=combine_slots,
+        use_mxfp8=bool(use_mxfp8),
     )
     return main_spec, signal_spec, num_bytes, signal_bytes, meta
 
@@ -139,6 +148,7 @@ def get_symm_buffer_size_for_mega_moe(
     *,
     block_m=256,
     pool_mult=2,
+    use_mxfp8=False,
 ):
     """Size the single symmetric buffer for one fused mega MoE forward.
 
@@ -164,6 +174,7 @@ def get_symm_buffer_size_for_mega_moe(
         activation,
         block_m=block_m,
         pool_mult=pool_mult,
+        use_mxfp8=use_mxfp8,
     )
     return num_bytes, slice_input_buffers, signal_bytes, meta
 
@@ -188,12 +199,14 @@ class SymmBuffer:
         block_m=256,
         block_n=256,
         pool_mult=2,
+        use_mxfp8=False,
     ):
         self.group = group
         self.rank = group.rank()
         self.world = group.size()
         self.block_m = block_m
         self.block_n = block_n
+        self.use_mxfp8 = bool(use_mxfp8)
 
         slice_input_buffers, signal_spec, num_bytes, signal_bytes, meta = _build_layout_spec(
             self.world,
@@ -204,6 +217,7 @@ class SymmBuffer:
             intermediate_hidden,
             block_m=block_m,
             pool_mult=pool_mult,
+            use_mxfp8=use_mxfp8,
         )
         # num_tokens / num_experts / hidden / num_max_pool_tokens / ...
         self.__dict__.update(meta)
@@ -244,6 +258,12 @@ class SymmBuffer:
         self.pool = self.pool.view(self.num_max_pool_tokens, self.hidden)
         self.act = self.act.view(self.num_max_pool_tokens, self.intermediate_hidden)
         self.l2_token_buffer = self.l2_token_buffer.view(self.num_max_pool_tokens, self.hidden)
+        if self.use_mxfp8:
+            # fp8 token/act pool + raw E8M0 block scales (block=32 along the hidden/K dim).
+            self.pool_fp8 = self.pool_fp8.view(self.num_max_pool_tokens, self.hidden)
+            self.pool_scale = self.pool_scale.view(self.num_max_pool_tokens, self.hidden // 32)
+            self.act_fp8 = self.act_fp8.view(self.num_max_pool_tokens, self.intermediate_hidden)
+            self.act_scale = self.act_scale.view(self.num_max_pool_tokens, self.intermediate_hidden // 32)
         self.comb = self.comb.view(self.combine_slots, self.hidden)
         # d_topk_w push slots, slot = token*topk + k -> view [num_tokens, num_topk]
         self.combine_gate = self.combine_gate.view(self.num_tokens, self.num_topk)
@@ -264,6 +284,10 @@ class SymmBuffer:
             )
 
         self.pool_ptrs = _peer_ptr_table(buffer_ptrs, slice_input_buffers["pool"][0])
+        if self.use_mxfp8:
+            # peer tables for the fp8 dispatch push (token bytes + raw E8M0 scale bytes)
+            self.pool_fp8_ptrs = _peer_ptr_table(buffer_ptrs, slice_input_buffers["pool_fp8"][0])
+            self.pool_scale_ptrs = _peer_ptr_table(buffer_ptrs, slice_input_buffers["pool_scale"][0])
         # prologue addressing via prims.symm_at: one [world] i64 peer heap-base table +
         # a [5] i64 byte-offset table (rows = c_buffer / signal / origin_rank / origin_slot
         # / weight_recv_buf). Replaces the old [5, world] pre-offset peer_ptrs table.
@@ -318,6 +342,7 @@ class SymmBuffer:
             self.num_max_pool_tokens,
             self.num_pool_blocks,
             self.combine_slots,
+            use_mxfp8=int(self.use_mxfp8),
             base=my_main,
             offsets_ptr=self._main_delta.data_ptr(),
             signal_base=my_signal,
@@ -360,6 +385,7 @@ def get_symm_buffer_for_mega_moe(
     block_m=256,
     block_n=256,
     pool_mult=2,
+    use_mxfp8=False,
 ) -> SymmBuffer:
     """Get (allocate or reuse) the single global symmetric buffer for a fused mega MoE.
 
@@ -387,6 +413,7 @@ def get_symm_buffer_for_mega_moe(
         intermediate_hidden,
         block_m=block_m,
         pool_mult=pool_mult,
+        use_mxfp8=use_mxfp8,
     )
 
     symm = _CURRENT_SYMM_BUFFER
@@ -396,6 +423,7 @@ def get_symm_buffer_for_mega_moe(
         or symm.group is not group
         or symm.num_bytes < need_bytes
         or symm.signal_bytes < need_signal_bytes
+        or bool(getattr(symm, "use_mxfp8", False)) != bool(use_mxfp8)
     ):
         if symm is not None:
             symm.destroy()
@@ -409,6 +437,7 @@ def get_symm_buffer_for_mega_moe(
             block_m=block_m,
             block_n=block_n,
             pool_mult=pool_mult,
+            use_mxfp8=use_mxfp8,
         )
         _CURRENT_SYMM_BUFFER = symm
     return symm

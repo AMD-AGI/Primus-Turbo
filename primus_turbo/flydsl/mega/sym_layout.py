@@ -67,6 +67,9 @@ class SymLayout:
     num_max_pool_tokens: Constexpr[int]  # pool capacity (rows)
     num_max_pool_blocks: Constexpr[int]  # num_max_pool_tokens // block_m
     combine_slots: Constexpr[int]  # num_topk * num_max_tokens_per_rank
+    # mxfp8 forward: append fp8 pool/act data + raw E8M0 block-scale regions (1 = on).
+    # Appended AFTER every bf16 region so the bf16 (use_mxfp8=0) byte layout is unchanged.
+    use_mxfp8: Constexpr[int]
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +81,7 @@ def _main_regions(sl):
     P, H, I = int(sl.num_max_pool_tokens), int(sl.hidden), int(sl.intermediate_hidden)
     CS = int(sl.combine_slots)
     EPR, T = int(sl.num_experts_per_rank), int(sl.num_max_tokens_per_rank)
-    return [
+    regions = [
         ("pool", _BF16, P * H),
         ("c_buffer", _I32, R * E),
         ("signal", _I32, R),
@@ -99,6 +102,23 @@ def _main_regions(sl):
         # every preceding region keeps its byte offset.
         ("src_token_topk_idx", _I32, EPR * R * R * T),
     ]
+    # mxfp8 forward-only regions (fp8 = 1B/elem, E8M0 scale = 1B / 32 K-elems). Appended
+    # last (offset-stable). Pushed cross-rank by dispatch (pool_*) / written by SwiGLU
+    # (act_*); read as A operands by the grouped mxfp8 GEMM (which preshuffles internally).
+    if int(getattr(sl, "use_mxfp8", 0)):
+        # pool_scale_ps: fused quant-in-push writes the pool E8M0 scale directly in the
+        # ScaleS2R broadcast layout-1 (int32, ceildiv(P,64)*(H//128)*256), so the fused L1
+        # GEMM reads it with ScaleS2R (no preshuffle pass). The raw ``pool_scale`` is kept
+        # for the decoupled fp8 path (push raw -> grouped GEMM preshuffles internally).
+        ps_i32 = ((P + 63) // 64) * (H // 128) * 256
+        regions += [
+            ("pool_fp8", 1, P * H),
+            ("pool_scale", 1, P * (H // 32)),
+            ("act_fp8", 1, P * I),
+            ("act_scale", 1, P * (I // 32)),
+            ("pool_scale_ps", _I32, ps_i32),
+        ]
+    return regions
 
 
 def _signal_regions(sl):
@@ -205,6 +225,7 @@ def build_sym_layout(
     num_max_pool_blocks,
     combine_slots,
     *,
+    use_mxfp8=0,
     base=0,
     offsets_ptr=0,
     signal_base=0,
@@ -232,6 +253,7 @@ def build_sym_layout(
         num_max_pool_tokens=int(num_max_pool_tokens),
         num_max_pool_blocks=int(num_max_pool_blocks),
         combine_slots=int(combine_slots),
+        use_mxfp8=int(use_mxfp8),
     )
 
 
@@ -258,6 +280,12 @@ _REGION_ACCESSORS = (
     "act",
     "l2_token_buffer",
     "src_token_topk_idx",
+    # mxfp8-only (the property raises if read when use_mxfp8=0, i.e. the region is absent)
+    "pool_fp8",
+    "pool_scale",
+    "act_fp8",
+    "act_scale",
+    "pool_scale_ps",
     "scoreboard",
     "sb_consume",
     "sb_l2",

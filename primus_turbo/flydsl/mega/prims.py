@@ -89,6 +89,14 @@ def l2_invalidate():
     llvm.inline_asm(fx.T.i32(), [], "buffer_inv sc1", "=r,~{memory}", has_side_effects=True)
 
 
+def l2_writeback():
+    # Device-scope release: write dirty L2 back to the coherent point + wait, so a peer
+    # (or another XCD's) reader sees the writes. Pairs with l2_invalidate on the reader.
+    llvm.inline_asm(
+        fx.T.i32(), [], "buffer_wbl2 sc1\n\ts_waitcnt vmcnt(0)", "=r,~{memory}", has_side_effects=True
+    )
+
+
 def memory_fence(order=None, scope=None):
     order_enum = _unwrap_order(order)
     if order_enum == llvm.AtomicOrdering.monotonic:
