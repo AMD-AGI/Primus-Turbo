@@ -233,8 +233,18 @@ def build_flash_attn_bwd_module(
             batch_q_tile_id = _bid_rest // GQA_GROUP_SIZE
             q_head_idx = kv_head_idx * GQA_GROUP_SIZE + _q_in_group
         num_q_tiles = (seq_len_v + BLOCK_M - 1) // BLOCK_M
-        q_tile_idx = batch_q_tile_id % num_q_tiles
+        _qt_disp = batch_q_tile_id % num_q_tiles
         batch_idx = batch_q_tile_id // num_q_tiles
+        # Causal load-balance two-pointer interleave (mirrors the forward kernel):
+        # a q-tile's kv-loop length grows with q_tile_idx (tile 0 -> 1 kv-block,
+        # tile N-1 -> N), so natural dispatch runs only the heaviest tiles at the
+        # tail (low occupancy). Reorder dispatch to (0, N-1, 1, N-2, ...) so
+        # concurrent work-groups mix light+heavy loads. Bijection over q-tiles ->
+        # each output tile still computed by exactly one WG (corr/det-neutral);
+        # kv_head stays the fastest block_id axis so the XCD/L2 remap is untouched.
+        _qt_half = _qt_disp // fx.Index(2)
+        _qt_is_odd = ArithValue(_qt_disp % fx.Index(2) == fx.Index(1))
+        q_tile_idx = fx.Index(_qt_is_odd.select(num_q_tiles - fx.Index(1) - _qt_half, _qt_half))
         q_start = q_tile_idx * BLOCK_M
 
         # Fold the per-batch element offset into the raw KV pointers (0-based rows).
