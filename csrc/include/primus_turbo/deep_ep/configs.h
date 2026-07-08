@@ -91,11 +91,11 @@ inline static bool is_enable_cheap_fence() {
 
 // When set to 1, EP dispatch/combine kernels run on the caller's current
 // CUDA stream instead of the Buffer's internal comm stream.
-// Default: 0.
+// Default: 1.
 inline static bool is_ep_force_current_stream() {
     static uint32_t val = []() {
         const char *v = std::getenv("PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM");
-        return v ? static_cast<uint32_t>(std::stoi(v)) : 0;
+        return v ? static_cast<uint32_t>(std::stoi(v)) : 1;
     }();
     return val != 0;
 }
