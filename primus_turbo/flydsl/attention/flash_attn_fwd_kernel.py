@@ -704,10 +704,6 @@ def build_flash_attn_fwd_module(
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
         c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
-        # Lazy-rescale headroom (exp2 units): keep the old softmax basis while the
-        # tile max stays within 2^8 of it (dualwave DUALWAVE_SWP_LAZY_RESCALE).
-        c_lazy_thr = fx.Float32(8.0)
-        _expect_true_i1 = arith.constant(1, type=ir.IntegerType.get_signless(1))
         c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
         width_i32 = fx.Int32(WARP_SIZE)
         shuf_32_i32 = fx.Int32(32)
@@ -1019,59 +1015,50 @@ def build_flash_attn_fwd_module(
                             c_neg_inf, s_raw_hi[r]
                         )
 
-                local_max = s_raw_lo[0]
-                for r in range_constexpr(15):
-                    local_max = _fmax(local_max, s_raw_lo[r + 1])
-                for r in range_constexpr(16):
-                    local_max = _fmax(local_max, s_raw_hi[r])
-                peer_max = reduction_peer(local_max)
-                row_max = _fmax(local_max, peer_max)
-                m_new_raw = _fmax(m_running, row_max)
-
-                # ==== Lazy (late) O rescale — ported from the dualwave
-                # DUALWAVE_SWP_LAZY_RESCALE lever. When this tile's new row-max does
-                # not exceed the running softmax basis by more than c_lazy_thr (exp2
-                # units) for EVERY lane in the wave, keep the old basis: skip the O/l
-                # rescale and compute this tile's P against m_running (P then stays
-                # <= 2^thr, well inside f32). The final /l normalization cancels the
-                # basis, so it is mathematically exact (only the rounding order
-                # changes); the branch is uniform (ballot == exec) and data
-                # -deterministic, so the determinism gate is unaffected. This removes
-                # the O-accumulator rescale (2x v16f32 mul) from the critical softmax
-                # dependency chain on the majority of KV tiles (the running max is
-                # stable after the first few). corr_vec is only needed by the gfx942
-                # (non-HW-TR) interleaved-rescale path.
+                # ==== Softmax basis: seed-once then freeze (VALU-issue lever) ====
+                # PMC shows this kernel is regular-VALU-issue-bound (exp2 ~10% of
+                # VALU); the per-tile row-max reduction (31 fmax + peer) is the
+                # largest cuttable regular-VALU block. The ported lazy-rescale kept
+                # the basis across tiles but still recomputed the max EVERY tile to
+                # decide whether to rescale -- and for realistic score spreads a
+                # rescale needs a >2^8 jump over the basis (~5.5 sigma), which never
+                # happens after the first tile, so that max was dead VALU. Here the
+                # basis is computed ONLY on the first KV subtile (m_running is the
+                # -inf init only there; uniform ballot == exec branch) and frozen
+                # afterwards. O/l are never rescaled (basis never changes), so the
+                # output is bit-identical to the never-rescale path; the /l
+                # normalization cancels the basis and P = exp2(s - basis0) stays far
+                # inside f32 (score spread << 127 log2 units). Determinism holds: the
+                # branch is data-independent (loop-position only). gfx942 (non-HW-TR)
+                # keeps the original per-tile interleaved rescale.
                 if const_expr(USE_HW_TR):
-                    diff_up_scaled = _fmul(_fsub(m_new_raw, m_running), c_sm_scale_log2e)
-                    below = ArithValue(fx.Float32(diff_up_scaled) <= c_lazy_thr)
-                    _ballot = rocdl.ballot(T.i64, _raw(below))
-                    all_below = arith.cmpi(arith.CmpIPredicate.eq, _raw(_ballot), _read_exec_i64())
-                    all_below = llvm.intr_expect(all_below, _expect_true_i1)
-                    _cur = [_raw(o_accs[dc]) for dc in range_constexpr(D_CHUNKS)] + [
-                        _raw(l_running),
-                        _raw(m_running),
-                    ]
-                    _res_types = [v.type for v in _cur]
-                    _if = scf.IfOp(all_below, _res_types, has_else=True, loc=ir.Location.unknown())
+                    _need_seed = ArithValue(fx.Float32(m_running) == c_neg_inf)
+                    _bf = rocdl.ballot(T.i64, _raw(_need_seed))
+                    _seed = arith.cmpi(arith.CmpIPredicate.eq, _raw(_bf), _read_exec_i64())
+                    _if = scf.IfOp(_seed, [_raw(c_zero_f).type], has_else=True, loc=ir.Location.unknown())
                     with ir.InsertionPoint(_if.regions[0].blocks[0]):
-                        scf.YieldOp(_cur)
+                        _lmax = s_raw_lo[0]
+                        for r in range_constexpr(15):
+                            _lmax = _fmax(_lmax, s_raw_lo[r + 1])
+                        for r in range_constexpr(16):
+                            _lmax = _fmax(_lmax, s_raw_hi[r])
+                        _rmax = _fmax(_lmax, reduction_peer(_lmax))
+                        scf.YieldOp([_raw(_rmax)])
                     if len(_if.regions[1].blocks) == 0:
                         _if.regions[1].blocks.append(*[])
                     with ir.InsertionPoint(_if.regions[1].blocks[0]):
-                        _corr = ArithValue(_fsub(c_zero_f, diff_up_scaled)).exp2(fastmath=fm_fast)
-                        _corr_vec = Vec.from_elements([_corr], fx.Float32).broadcast_to(16)
-                        _scaled = [
-                            _raw(_fmul(Vec(o_accs[dc]), _corr_vec)) for dc in range_constexpr(D_CHUNKS)
-                        ]
-                        _l_sc = _raw(_fmul(_corr, l_running))
-                        scf.YieldOp(_scaled + [_l_sc, _raw(m_new_raw)])
-                    _r = list(_if.results)
-                    for dc in range_constexpr(D_CHUNKS):
-                        o_accs[dc] = _r[dc]
-                    l_running = _r[D_CHUNKS]
-                    m_basis = _r[D_CHUNKS + 1]
+                        scf.YieldOp([_raw(m_running)])
+                    m_basis = fx.Float32(list(_if.results)[0])
                     corr_vec = None
                 else:
+                    local_max = s_raw_lo[0]
+                    for r in range_constexpr(15):
+                        local_max = _fmax(local_max, s_raw_lo[r + 1])
+                    for r in range_constexpr(16):
+                        local_max = _fmax(local_max, s_raw_hi[r])
+                    peer_max = reduction_peer(local_max)
+                    row_max = _fmax(local_max, peer_max)
+                    m_new_raw = _fmax(m_running, row_max)
                     diff_m_raw = _fsub(m_running, m_new_raw)
                     diff_m_scaled = _fmul(diff_m_raw, c_sm_scale_log2e)
                     corr = ArithValue(diff_m_scaled).exp2(fastmath=fm_fast)
