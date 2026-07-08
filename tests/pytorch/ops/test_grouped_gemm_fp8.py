@@ -1085,11 +1085,11 @@ def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
 @pytest.mark.parametrize(
     "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
 )
-def test_grouped_gemm_fp8_padded_rows_zero_init(ori_dtype, trans_b, backend):
-    """issue #397: the FP8 grouped-GEMM forward only writes output rows
-    ``[0, sum(group_lens))``. When ``M_total = a.size(0) > sum(group_lens)`` the
-    trailing rows must be zero-initialized, not leftover caching-allocator garbage
-    (frequently NaN/Inf, which non-deterministically corrupts MoE gradients).
+def test_grouped_gemm_fp8_padded_tail_zeroed(ori_dtype, trans_b, backend):
+    """The FP8 grouped-GEMM forward only writes output rows ``[0, sum(group_lens))``.
+    When ``M_total = a.size(0) > sum(group_lens)`` the uncovered tail must be zeroed
+    by the post-op, not left as caching-allocator garbage (frequently NaN/Inf,
+    which non-deterministically corrupts MoE gradients).
 
     This is not hypothetical: the MoE token dispatcher run with
     ``permute_max_token_num > 0`` (fixed-capacity permute, used to drop the
@@ -1099,7 +1099,7 @@ def test_grouped_gemm_fp8_padded_rows_zero_init(ori_dtype, trans_b, backend):
     ``moe_permute``: ``permuted_tokens = torch.empty((num_permuted_tokens, H))``).
 
     All four backends skip the trailing rows (each writes only ``[0, sum)``), so
-    all four must zero-init the output; this test covers every one.
+    the shared post-op must zero the tail; this test covers every backend.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -1132,14 +1132,14 @@ def test_grouped_gemm_fp8_padded_rows_zero_init(ori_dtype, trans_b, backend):
     out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
     torch.cuda.synchronize()
 
-    pad_rows = out[S:M_total]
-    assert torch.isfinite(pad_rows).all(), f"{backend.name}: padding rows non-finite (#397)"
+    pad_tail = out[S:M_total]
+    assert torch.isfinite(pad_tail).all(), f"{backend.name}: padding tail non-finite"
     torch.testing.assert_close(
-        pad_rows,
-        torch.zeros_like(pad_rows),
+        pad_tail,
+        torch.zeros_like(pad_tail),
         rtol=0.0,
         atol=0.0,
-        msg=f"{backend.name}: padding rows [{S}:{M_total}] must be zero-initialized (#397)",
+        msg=f"{backend.name}: padding tail [{S}:{M_total}] must be zeroed",
     )
 
     GlobalBackendManager.reset()
