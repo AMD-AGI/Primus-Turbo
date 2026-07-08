@@ -147,7 +147,13 @@ def build_flash_attn_bwd_module(
     K_STRIDE = HEAD_DIM
     LDS_TILE = BLOCK_N * K_STRIDE
     LDS_V_BASE = LDS_TILE
-    LDS_TOTAL = 2 * LDS_TILE
+    # Fused dual-tile: keep a 2nd K copy in fp16 (LDS_K16_BASE) alongside the bf16
+    # K/V tiles. GEMM1 (S=K@Q^T) reads the bf16 K tile; GEMM2's A/B fp16 MFMA reads
+    # this fp16 tile via a transpose-read directly, dropping the per-read bf16->fp16
+    # conversion from the VALU-issue-bound loop (host pre-casts the small K tensor).
+    USE_K16 = mode == "fused_dq_delta"
+    LDS_K16_BASE = 2 * LDS_TILE
+    LDS_TOTAL = (3 if USE_K16 else 2) * LDS_TILE
 
     VEC_WIDTH = 16
     assert HEAD_DIM % VEC_WIDTH == 0
@@ -179,6 +185,7 @@ def build_flash_attn_bwd_module(
         LSE: fx.Tensor,
         DELTA: fx.Tensor,
         DQ: fx.Tensor,
+        K16: fx.Tensor,
         seq_len: fx.Int32,
     ):
         elem_dtype = dtype_to_elem_type(dtype_str)
@@ -238,6 +245,16 @@ def build_flash_attn_bwd_module(
             byte_i64 = fx.Int64(byte_offset)
             ptr = buffer_ops.create_llvm_ptr(byte_i64, address_space=3)
             return rocdl.ds_read_tr16_b64(v4f16_type, ptr).result
+
+        # Same 16-bit transpose read, typed as real fp16, for the fused dual-tile
+        # fp16 K copy (bit-level reinterpret: the DMA wrote fp16 bit patterns there).
+        v4realf16_type = Vec.make_type(4, _f16)
+
+        def ds_read_tr_realf16(lds_elem_idx):
+            byte_offset = lds_elem_idx * 2 + lds_off
+            byte_i64 = fx.Int64(byte_offset)
+            ptr = buffer_ops.create_llvm_ptr(byte_i64, address_space=3)
+            return rocdl.ds_read_tr16_b64(v4realf16_type, ptr).result
 
         wave_q_offset = wave_id * ROWS_PER_WAVE
 
@@ -380,6 +397,12 @@ def build_flash_attn_bwd_module(
             v_rsrc = buffer_ops.create_buffer_resource(
                 V, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_kv_batch_byte_off
             )
+            if const_expr(USE_K16):
+                # fp16 K copy (same [B,S,Hkv,D] layout, 2 bytes/elem -> identical
+                # byte math and swizzle as the bf16 K DMA).
+                k16_rsrc = buffer_ops.create_buffer_resource(
+                    K16, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_kv_batch_byte_off
+                )
             lds_base_idx = buffer_ops.extract_base_index(lds, address_space=3)
             DMA_BYTES = 16
             DMA_BATCH_BYTES = BLOCK_SIZE * DMA_BYTES
@@ -501,6 +524,23 @@ def build_flash_attn_bwd_module(
             vh = Vec(vh_a).shuffle(Vec(vh_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
             return vl, vh
 
+        def _read_k16_tr(step_idx):
+            """Transpose-read the fp16 K copy (LDS_K16_BASE) -> A-operand [M=D, ctr=kv]
+            as real fp16, fed to mfma_f16 directly (no bf16->fp16 conversion)."""
+            dc, pks = _steps[step_idx]
+            d_col = fx.Index(dc * D_CHUNK) + tr_col_half * 16 + tr_col_sub * 4
+            k_row = fx.Index(pks * PV_K_STEP) + lane_div_32 * 4 + tr_k_group
+            d_col_eff = _k_swizzle(k_row, d_col)
+            lds_lo = fx.Index(LDS_K16_BASE) + k_row * K_STRIDE + d_col_eff
+            lds_hi = lds_lo + fx.Index(K_SUB_N * K_STRIDE)
+            vl_a = ds_read_tr_realf16(lds_lo)
+            vl_b = ds_read_tr_realf16(lds_lo + fx.Index(8 * K_STRIDE))
+            vl = Vec(vl_a).shuffle(Vec(vl_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+            vh_a = ds_read_tr_realf16(lds_hi)
+            vh_b = ds_read_tr_realf16(lds_hi + fx.Index(8 * K_STRIDE))
+            vh = Vec(vh_a).shuffle(Vec(vh_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+            return vl, vh
+
         # ---- Loop-carried init ----
         if const_expr(IS_DQ):
             init_args = [c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
@@ -529,6 +569,8 @@ def build_flash_attn_bwd_module(
             if const_expr(ENABLE_DMA):
                 coop_dma_tile(k_rsrc, lds_base_idx, kv_start)
                 coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(LDS_V_BASE * 2), kv_start)
+                if const_expr(USE_K16):
+                    coop_dma_tile(k16_rsrc, lds_base_idx + fx.Index(LDS_K16_BASE * 2), kv_start)
                 rocdl.s_waitcnt(0)
             else:
                 _coop_load(k_ptr, fx.Index(0), kv_start)
@@ -615,12 +657,16 @@ def build_flash_attn_bwd_module(
                     clo_p = _to_f16_v8(clo_g)
                     chi_p = _to_f16_v8(chi_g)
                     # GEMM2: A[D,q] += K^T @ C ; B[D,q] += K^T @ P (K transpose-read
-                    # as "V"; C/P single-fp16 packs as "P"). K read per (dc, pks) and
-                    # converted bf16->fp16. One MFMA per sub-block (no double-bf16 bot).
+                    # as "V"; C/P single-fp16 packs as "P"). K read fp16 (dual-tile,
+                    # no conversion). One MFMA per sub-block (no double-bf16 bot).
                     for dc in range_constexpr(D_CHUNKS):
-                        k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
-                        k_lo = _k_to_f16(k_lo)
-                        k_hi = _k_to_f16(k_hi)
+                        if const_expr(ENABLE_DMA):
+                            # Dual-tile: read the fp16 K copy directly (no conversion).
+                            k_lo, k_hi = _read_k16_tr(dc * PV_K_STEPS + pks)
+                        else:
+                            k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
+                            k_lo = _k_to_f16(k_lo)
+                            k_hi = _k_to_f16(k_hi)
                         a_accs[dc] = mfma_f16(k_lo, clo_p, a_accs[dc])
                         a_accs[dc] = mfma_f16(k_hi, chi_p, a_accs[dc])
                         b_accs[dc] = mfma_f16(k_lo, plo_p, b_accs[dc])
@@ -755,6 +801,7 @@ def build_flash_attn_bwd_module(
         LSE: fx.Tensor,
         DELTA: fx.Tensor,
         DQ: fx.Tensor,
+        K16: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stream: fx.Stream,
@@ -786,6 +833,7 @@ def build_flash_attn_bwd_module(
             LSE,
             DELTA,
             DQ,
+            K16,
             seq_len,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,

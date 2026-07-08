@@ -274,6 +274,13 @@ def attention_flydsl_backward_impl(
     ws_dk = torch.empty((B, _DKDV_Q_SPLIT, S, Hkv, D), dtype=k.dtype, device=q.device)
     ws_dv = torch.empty((B, _DKDV_Q_SPLIT, S, Hkv, D), dtype=v.dtype, device=q.device)
 
+    # Dual-tile fp16 K: the fused kernel's GEMM2 A/B use fp16 MFMA. Pre-casting the
+    # small K tensor here (Hkv=8, ~8x smaller than Q) lets the kernel DMA a 2nd fp16
+    # K tile straight into LDS and drop the per-read in-loop bf16->fp16 conversion
+    # from the VALU-issue-bound loop. bf16->fp16 is exact-then-RNE, so the fp16 K is
+    # bit-identical to the in-kernel conversion -> numerically unchanged vs #1a.
+    k16 = k.to(torch.float16)
+
     stream = torch.cuda.current_stream()
     qf, kf, vf, dof, lsef, deltaf = (
         q.view(-1),
@@ -286,7 +293,14 @@ def attention_flydsl_backward_impl(
 
     # Fused: one S/P/dP pass emits both dQ and the fp32 delta for dkdv (deletes the
     # standalone delta kernel's exp2 pass).
-    _run_bwd(fused_launch, key, "fused", (qf, kf, vf, dof, lsef, deltaf, dq.view(-1), B, S, stream), B, S)
+    _run_bwd(
+        fused_launch,
+        key,
+        "fused",
+        (qf, kf, vf, dof, lsef, deltaf, dq.view(-1), k16.view(-1), B, S, stream),
+        B,
+        S,
+    )
     _run_bwd(
         dkdv_launch,
         key,
