@@ -205,9 +205,11 @@ def _get_bwd_launchers(num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_
             num_kv_heads=num_kv_heads,
         )
         # Fused dQ+delta computes S/P/dP once (removing the standalone delta kernel's
-        # whole exp2 pass) via dQ = sm*(A - delta*B) with double-bf16 A/B operands. The
-        # extra A/B accumulators raise VGPR (~occ 3->2), so waves_per_eu=2 keeps the
-        # 256-VGPR occ-2 ceiling and avoids spill; dkdv stays at its default 2.
+        # whole exp2 pass) via dQ = sm*(A - delta*B) with single-fp16 A/B operands
+        # (10-bit mantissa = tf32, enough for the near-diagonal dS cancellation; half
+        # the double-bf16 pack+MFMA cost). The extra A/B accumulators raise VGPR
+        # (~occ 3->2), so waves_per_eu=2 keeps the 256-VGPR occ-2 ceiling and avoids
+        # spill; dkdv stays at its default 2.
         fused_launch = build_flash_attn_bwd_module(mode="fused_dq_delta", waves_per_eu=2, **common)
         dkdv_launch = build_flash_attn_bwd_dkdv_module(q_split=_DKDV_Q_SPLIT, **common)
         launchers = (fused_launch, dkdv_launch)

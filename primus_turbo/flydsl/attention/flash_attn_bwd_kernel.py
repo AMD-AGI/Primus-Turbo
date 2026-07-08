@@ -27,9 +27,10 @@ float atomics -> deterministic):
       are recomputed once (not twice), removing the whole delta kernel's exp2
       pass. Uses the identity dQ = sm*(A - delta*B) with, accumulated in one pass,
       delta_i = sum_j P_ij*dP_ij, A_i = sum_j (P_ij*dP_ij) k_j, B_i = sum_j P_ij k_j.
-      A and B feed their P/(P*dP) B-operands through an error-free double-bf16 split
-      (Phi/Plo, Chi/Clo; K single bf16) so the epilogue subtraction survives the
-      near-diagonal catastrophic cancellation. Writes both dQ (transposed) and the
+      A and B feed their P/(P*dP) B-operands (and the transpose-read K) as single fp16
+      (10-bit mantissa = tf32) so the epilogue subtraction survives the near-diagonal
+      catastrophic cancellation at half the double-bf16 pack+MFMA cost (single-bf16's
+      8-bit mantissa fails the s8192 dq gate). Writes both dQ (transposed) and the
       recomputed fp32 delta (for the downstream dkdv kernel).
 
 Target: gfx950 only (32x32x16 bf16 MFMA, ds_read_tr16_b64, permlane32_swap +
@@ -207,6 +208,14 @@ def build_flash_attn_bwd_module(
         def mfma_acc(a, b, c):
             return _mfma(rocdl.mfma_f32_32x32x16_bf16, a, b, c)
 
+        _f16 = fx.Float16
+
+        def mfma_f16(a, b, c):
+            # Single-fp16 MFMA (K=16, same throughput/accumulator layout as the bf16
+            # 32x32x16). Used by the fused dQ+delta A/B GEMM2 where fp16's 10-bit
+            # mantissa (= tf32) is enough for the near-diagonal dS cancellation.
+            return _mfma(rocdl.mfma_f32_32x32x16_f16, a, b, c)
+
         seq_len_v = fx.Index(seq_len)
 
         base_ptr = allocator.get_base()
@@ -292,21 +301,20 @@ def build_flash_attn_bwd_module(
                 Vec.from_elements([fx.Int32(_raw(p)) for p in pairs], fx.Int32).bitcast(elem_dtype).ir_value()
             )
 
-        def _split_pack_v8(f32_vals):
-            # Error-free double-bf16 split of one 8-slot B-operand group: top = RNE
-            # bf16(x), bot = RNE bf16(x - f32(top)). Feeding both through separate bf16
-            # MFMAs (K@top + K@bot) recovers x to ~f32 accuracy, so the fused epilogue
-            # dQ = sm*(A - delta*B) survives the near-diagonal catastrophic cancellation
-            # that a single-bf16 A/B would suffer. bot is derived from the SAME top so
-            # top+bot == x bit-consistently (no rounding mismatch).
-            top = [fx.Float32(_raw(f32_vals[i])).to(elem_dtype) for i in range_constexpr(8)]
-            bot = []
-            for i in range_constexpr(8):
-                top_f32 = elem_dtype(_raw(top[i])).to(fx.Float32)
-                bot.append(fx.Float32(_fsub(f32_vals[i], top_f32)).to(elem_dtype))
-            top_pack = Vec.from_elements(top, elem_dtype).ir_value()
-            bot_pack = Vec.from_elements(bot, elem_dtype).ir_value()
-            return top_pack, bot_pack
+        def _to_f16_v8(f32_vals):
+            # Single-fp16 pack of one 8-slot B-operand group (no bot half). fp16 keeps
+            # a 10-bit mantissa (= tf32), enough to preserve the near-diagonal dS
+            # cancellation that single-bf16 (8-bit) breaks, at half the double-bf16
+            # pack+MFMA cost.
+            return Vec.from_elements(
+                [fx.Float32(_raw(f32_vals[i])).to(_f16) for i in range_constexpr(8)], _f16
+            ).ir_value()
+
+        def _k_to_f16(kv8):
+            # Convert the transpose-read bf16 K sub-tile to fp16 for the fp16 MFMA.
+            # Must round-trip through f32 (a direct bf16->f16 arith.truncf is not
+            # lowered on this toolchain).
+            return Vec(kv8).to(fx.Float32).to(_f16).ir_value()
 
         # ---- K XOR swizzle (d64-general): col ^ ((row & (K_STRIDE//16-1)) << 4). ----
         def _k_swizzle(row_idx, col_idx):
@@ -582,8 +590,8 @@ def build_flash_attn_bwd_module(
                 # One pass accumulates delta=sum_j P*dP, A=sum_j (P*dP)*K, B=sum_j P*K
                 # (dQ = sm*(A - delta*B)). To keep VGPR pressure low (dual A/B
                 # accumulators already cost 2x dq's), process one 8-slot group at a
-                # time: exp2 -> C=P*dP -> double-bf16 split -> GEMM2 immediately, so
-                # only the current group's packs stay live (not all 16 at once).
+                # time: exp2 -> C=P*dP -> fp16 pack -> GEMM2 immediately, so only the
+                # current group's packs stay live (not all 16 at once).
                 local = c_zero_f
                 for pks in range_constexpr(PV_K_STEPS):
                     base = pks * 8
@@ -602,22 +610,21 @@ def build_flash_attn_bwd_module(
                         phi_g.append(phi)
                         clo_g.append(clo)
                         chi_g.append(chi)
-                    plo_t, plo_b = _split_pack_v8(plo_g)
-                    phi_t, phi_b = _split_pack_v8(phi_g)
-                    clo_t, clo_b = _split_pack_v8(clo_g)
-                    chi_t, chi_b = _split_pack_v8(chi_g)
+                    plo_p = _to_f16_v8(plo_g)
+                    phi_p = _to_f16_v8(phi_g)
+                    clo_p = _to_f16_v8(clo_g)
+                    chi_p = _to_f16_v8(chi_g)
                     # GEMM2: A[D,q] += K^T @ C ; B[D,q] += K^T @ P (K transpose-read
-                    # as "V"; C/P double-bf16 packs as "P"). K read per (dc, pks).
+                    # as "V"; C/P single-fp16 packs as "P"). K read per (dc, pks) and
+                    # converted bf16->fp16. One MFMA per sub-block (no double-bf16 bot).
                     for dc in range_constexpr(D_CHUNKS):
                         k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
-                        a_accs[dc] = mfma_acc(k_lo, clo_t, a_accs[dc])
-                        a_accs[dc] = mfma_acc(k_lo, clo_b, a_accs[dc])
-                        a_accs[dc] = mfma_acc(k_hi, chi_t, a_accs[dc])
-                        a_accs[dc] = mfma_acc(k_hi, chi_b, a_accs[dc])
-                        b_accs[dc] = mfma_acc(k_lo, plo_t, b_accs[dc])
-                        b_accs[dc] = mfma_acc(k_lo, plo_b, b_accs[dc])
-                        b_accs[dc] = mfma_acc(k_hi, phi_t, b_accs[dc])
-                        b_accs[dc] = mfma_acc(k_hi, phi_b, b_accs[dc])
+                        k_lo = _k_to_f16(k_lo)
+                        k_hi = _k_to_f16(k_hi)
+                        a_accs[dc] = mfma_f16(k_lo, clo_p, a_accs[dc])
+                        a_accs[dc] = mfma_f16(k_hi, chi_p, a_accs[dc])
+                        b_accs[dc] = mfma_f16(k_lo, plo_p, b_accs[dc])
+                        b_accs[dc] = mfma_f16(k_hi, phi_p, b_accs[dc])
                 delta_acc = _fadd(delta_acc, local)
                 return (
                     [a_accs[i] for i in range_constexpr(D_CHUNKS)]
