@@ -1561,8 +1561,7 @@ def _compile_mxfp4_fused(K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, 
     order. ksplit>1 writes K/ksplit partials into a [ksplit*M, N] workspace C (the host sums
     the row bands outside the stub)."""
     K128 = K // 128
-    pre_a = _build_mxfp4_preshuffle_kernel(0)
-    pre_b = _build_mxfp4_preshuffle_kernel(1)
+    pre_ab = _build_mxfp4_preshuffle_kernel_ab()
     gemm_kern, BM, BN, _ks, gemm_value_attrs = _build_mxfp4_gemm_kernel(
         K=K,
         group_m=gm,
@@ -1590,16 +1589,15 @@ def _compile_mxfp4_fused(K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, 
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
-        # 1) A + 2) B scale preshuffle (raw E8M0 -> packed int32 in A_scale/B_scale ws).
-        # grid = ceildiv(dim*K128 / NG, BLK); dim*K128 is divisible by NG so this equals
-        # ceildiv(dim*K128, NG*BLK).
-        pre_a(A_raw, A_scale, c_m, fx.Int32(K128)).launch(
-            grid=(ceildiv(c_m * fx.Int32(K128), _PGRID), 1, 1),
-            block=(_MXFP4_PRESHUF_BLK, 1, 1),
-            stream=stream,
-        )
-        pre_b(B_raw, B_scale, c_n, fx.Int32(K128)).launch(
-            grid=(ceildiv(c_n * fx.Int32(K128), _PGRID), 1, 1),
+        # 1) A + B scale preshuffle in ONE launch (raw E8M0 -> packed int32 in the
+        # A_scale/B_scale ws). Blocks [0, grid_a) do A, [grid_a, grid_a+grid_b) do B; the
+        # kernel segment-selects operand/dim/grp per block. grid = ceildiv(dim*K128, NG*BLK)
+        # per operand (dim*K128 divisible by NG). Merging drops one in-stream kernel launch
+        # + inter-kernel gap per GEMM (6->3 preshuffle launches per training step).
+        grid_a = ceildiv(c_m * fx.Int32(K128), _PGRID)
+        grid_b = ceildiv(c_n * fx.Int32(K128), _PGRID)
+        pre_ab(A_raw, A_scale, B_raw, B_scale, c_m, c_n, fx.Int32(K128), grid_a).launch(
+            grid=(grid_a + grid_b, 1, 1),
             block=(_MXFP4_PRESHUF_BLK, 1, 1),
             stream=stream,
         )
@@ -1658,25 +1656,52 @@ def _mxfp4_grp_from(wi, r_region, mode):
     return 4 * (wi // 2) + (wi % 2) + 2 * r_region
 
 
-def _build_mxfp4_preshuffle_kernel(mode):
-    # mode: 0 = A operand, 1 = B operand (matches the GEMM's ScaleS2RPacked A/B layout).
-    # Returns the BARE @flyc.kernel issued by the fused GEMM stub (_compile_mxfp4_fused).
-    # Each thread emits all NG=4 g_byte output
-    # dwords for one (wi, kk, r, last), loading the NG-shared 4 source int32 ONCE instead of
-    # NG times (a naive one-dword-per-thread kernel has 4x cross-thread read amplification:
-    # the four g_byte threads reload the same 4 rows). Grid is 1/NG the size; HBM read ~4x lower.
+def _build_mxfp4_preshuffle_kernel_ab():
+    # Merged A+B scale preshuffle: ONE grid repacks BOTH operands so the fused GEMM stub
+    # issues a single preshuffle launch instead of two separate A/B launches -> one fewer
+    # in-stream kernel launch + inter-kernel gap per GEMM (3 GEMMs/step => 6->3 preshuffle
+    # launches per training step), a larger relative win on the small-M/small-N shapes where
+    # the fixed per-step launch overhead is a bigger fraction of runtime.
+    #
+    # Blocks [0, grid_a) do the A operand (mode 0); blocks [grid_a, grid_a+grid_b) do the B
+    # operand (mode 1). The A/B group map, the source/dest buffer resources and the operand
+    # dim are all selected per-segment from the workgroup-uniform block index (readfirstlane
+    # -> SGPR -> SCC arith.select, mirrors the COOP rsrc select), so there is no per-thread
+    # divergence. The per-thread packing math is identical to the single-operand map above
+    # (see the _mxfp4_grp_from / packed-layout comment); only the segment routing is added.
     n_sub = 2
     nd = 4
     NG = _MXFP4_PRESHUF_NG
 
     @flyc.kernel(known_block_size=[_MXFP4_PRESHUF_BLK, 1, 1])
-    def kern(raw: fx.Tensor, out: fx.Tensor, dim: fx.Int32, K128: fx.Int32):
+    def kern(
+        a_raw: fx.Tensor,
+        a_out: fx.Tensor,
+        b_raw: fx.Tensor,
+        b_out: fx.Tensor,
+        dim_a: fx.Int32,
+        dim_b: fx.Int32,
+        K128: fx.Int32,
+        grid_a: fx.Int32,
+    ):
         KK = K128 // n_sub  # K/256
-        total = dim * K128  # output int32 dwords
+        # workgroup-uniform block index -> SGPR so the segment cond is SCC (scalar), which
+        # lets arith.select route the SGPR buffer descriptors (a VGPR rsrc is invalid).
+        bid = rocdl.readfirstlane(T.i32, fx.block_idx.x)
+        is_b = bid >= grid_a
+        local_bid = arith.select(is_b, bid - grid_a, bid)
+        dim = arith.select(is_b, dim_b, dim_a)
+        # Per-segment source/dest resources (each carries its own num_records bound).
+        a_rin = buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=dim_a * K128 * 4)
+        a_rout = buffer_ops.create_buffer_resource(a_out, max_size=False, num_records_bytes=dim_a * K128 * 4)
+        b_rin = buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=dim_b * K128 * 4)
+        b_rout = buffer_ops.create_buffer_resource(b_out, max_size=False, num_records_bytes=dim_b * K128 * 4)
+        rin = arith.select(is_b, b_rin, a_rin)
+        rout = arith.select(is_b, b_rout, a_rout)
+
+        gid4 = local_bid * _MXFP4_PRESHUF_BLK + fx.thread_idx.x
+        total = dim * K128  # output int32 dwords for the active operand
         total4 = total // NG  # threads (one per g_byte group)
-        gid4 = fx.block_idx.x * _MXFP4_PRESHUF_BLK + fx.thread_idx.x
-        rin = buffer_ops.create_buffer_resource(raw, max_size=False, num_records_bytes=dim * K128 * 4)
-        rout = buffer_ops.create_buffer_resource(out, max_size=False, num_records_bytes=dim * K128 * 4)
 
         last = gid4 % nd
         e1 = gid4 // nd
@@ -1688,8 +1713,9 @@ def _build_mxfp4_preshuffle_kernel(mode):
         r_region = last // n_sub
         s = last % n_sub
         k128 = kk * n_sub + s
-        grp = _mxfp4_grp_from(wi, r_region, mode)
-        # base output dword (g_byte=0); the g-th g_byte lands at base + g*64
+        # both group maps computed, segment-selected (mode branch is a trace-time Python if
+        # inside _mxfp4_grp_from, so both variants are emitted then chosen at runtime).
+        grp = arith.select(is_b, _mxfp4_grp_from(wi, r_region, 1), _mxfp4_grp_from(wi, r_region, 0))
         base = ((wi * KK + kk) * 64 + r) * nd + last
 
         dws = [fx.Int32(0)] * nd
