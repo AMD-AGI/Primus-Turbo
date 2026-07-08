@@ -26,7 +26,10 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import (
+    flydsl_can_build,
+    get_device_compute_capability,
+)
 from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_triton_kernel,
     gemm_fp8_rowwise_triton_kernel,
@@ -370,13 +373,41 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             supported &= k % 128 == 0 and k >= 256
             supported &= a_scale_inv.shape == (m, k // 32) and b_scale_inv.shape == (n, k // 32)
             supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
-            return supported
+        else:
+            # TENSORWISE: NT/NN/TN native (TT unsupported), scalar per-tensor scales.
+            supported &= not (trans_a and trans_b)
+            supported &= k > 128  # software pipeline needs >= 2 K tiles: ceil(K/128) >= 2
+            supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
 
-        # TENSORWISE: NT/NN/TN native (TT unsupported), scalar per-tensor scales.
-        supported &= not (trans_a and trans_b)
-        supported &= k > 128  # software pipeline needs >= 2 K tiles: ceil(K/128) >= 2
-        supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
-        return supported
+        if not supported:
+            return False
+        # Build/run probe the FlyDSL kernel for this shape once; if it errors,
+        # report unsupported so the dispatcher falls back to Triton.
+        key = (
+            "gemm_fp8",
+            (m, n, k),
+            a.dtype,
+            b.dtype,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity,
+        )
+        return flydsl_can_build(
+            key,
+            lambda: GEMMFP8FlyDSLBackend.execute(
+                a=a,
+                a_scale_inv=a_scale_inv,
+                trans_a=trans_a,
+                b=b,
+                b_scale_inv=b_scale_inv,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=trans_c,
+                granularity=granularity,
+            ),
+        )
 
     @staticmethod
     def execute(

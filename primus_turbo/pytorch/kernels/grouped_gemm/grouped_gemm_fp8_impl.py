@@ -19,7 +19,10 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import (
+    flydsl_can_build,
+    get_device_compute_capability,
+)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -462,7 +465,39 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
         supported &= get_device_compute_capability() >= (9, 5)
         # K-loop needs ceil(K/128) >= 2, i.e. contraction K >= 129.
         supported &= a.shape[1] >= 129
-        return supported
+
+        if not supported:
+            return False
+        # Build/run probe the FlyDSL kernel for this shape once; if it errors,
+        # report unsupported so the dispatcher falls back to Triton.
+        key = (
+            "gg_fp8",
+            tuple(a.shape),
+            tuple(b.shape),
+            a.dtype,
+            b.dtype,
+            out_dtype,
+            trans_b,
+            granularity,
+            num_cu,
+        )
+        return flydsl_can_build(
+            key,
+            lambda: GroupedGEMMFP8FlyDSLBackend.execute(
+                a=a,
+                b=b,
+                a_scales=a_scales,
+                b_scales=b_scales,
+                group_lens=group_lens,
+                group_offs=group_offs,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                granularity=granularity,
+                num_cu=num_cu,
+                **kwargs,
+            ),
+        )
 
     @staticmethod
     def execute(
@@ -681,7 +716,42 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         supported &= a_scales.numel() == 1 and b_scales.numel() == 1
         # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4.
         supported &= get_device_compute_capability() >= (9, 5)
-        return supported
+
+        if not supported:
+            return False
+        # Build/run probe the FlyDSL kernel for this shape once; if it errors,
+        # report unsupported so the dispatcher falls back to Triton.
+        key = (
+            "gg_fp8_vk",
+            tuple(a.shape),
+            tuple(b.shape),
+            a.dtype,
+            b.dtype,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity,
+            num_cu,
+        )
+        return flydsl_can_build(
+            key,
+            lambda: GroupedGEMMFP8VariableKFlyDSLBackend.execute(
+                a=a,
+                b=b,
+                a_scales=a_scales,
+                b_scales=b_scales,
+                group_lens=group_lens,
+                group_offs=group_offs,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                trans_c=trans_c,
+                out_dtype=out_dtype,
+                granularity=granularity,
+                num_cu=num_cu,
+                **kwargs,
+            ),
+        )
 
     @staticmethod
     def execute(
