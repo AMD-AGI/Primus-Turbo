@@ -8,6 +8,12 @@ from typing import Optional, Union
 
 import torch
 
+from primus_turbo.flydsl.quant.mxfp4_quant_kernel import (
+    dual2_eligible,
+    dual_eligible,
+    flydsl_dual_quant,
+    flydsl_dual_quant2,
+)
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float4QuantConfig,
@@ -22,8 +28,144 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     check_quantized_tensor,
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import gemm_fp4_impl
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    quantize_mxfp4_impl,
+)
 
 __all__ = ["gemm_fp4"]
+
+
+def _quantize_mxfp4_row_col(x, fp4_dtype, config, row_recipe, col_recipe):
+    """Fused rowwise + colwise MXFP4 quant in a single bf16 read.
+
+    Returns ``(row_qt, col_qt)`` QuantizedTensors equivalent to two separate
+    ``QuantizedTensor.quantize`` calls (``axis=1`` with ``row_recipe`` and
+    ``axis=0`` with ``col_recipe``) but issued as one dual quant kernel -- one
+    activation read and one launch instead of two, and the colwise output uses
+    the dual kernel's coalesced LDS store. Output layouts are identical to the
+    per-direction calls. This optimizes quantization independently; it does not
+    fuse quant into the GEMM.
+    """
+    # FlyDSL fused dual (bit-exact vs C++ for 2d=F / SR-off / unshuffled recipes
+    # with 128/256-aligned dims) -- one compiled launch (~3us dispatch) instead of
+    # the C++ op (~6us). Falls back to the C++ dual for every other case (e.g. the
+    # 2d-block weight cast). This optimizes quant only; no quant<->gemm fusion.
+    use_flydsl = (
+        x.dtype == torch.bfloat16
+        and x.dim() == 2
+        and x.is_contiguous()
+        and dual_eligible(x.size(0), x.size(1), row_recipe, col_recipe)
+    )
+    if use_flydsl:
+        row_data, row_scale, col_data, col_scale = flydsl_dual_quant(
+            x,
+            fp4_dtype,
+            row_recipe.use_rht,
+            col_recipe.use_rht,
+            row_recipe.use_2d_block,
+            col_recipe.use_2d_block,
+        )
+    else:
+        row_data, row_scale, col_data, col_scale = quantize_mxfp4_impl(
+            x,
+            fp4_dtype,
+            None,
+            config.block_size,
+            with_trans=True,
+            scaling_recipe=row_recipe,
+            scaling_recipe_for_trans=col_recipe,
+        )
+    return _make_row_col_qt(
+        x.size(),
+        x.dtype,
+        fp4_dtype,
+        config,
+        row_recipe,
+        col_recipe,
+        row_data,
+        row_scale,
+        col_data,
+        col_scale,
+    )
+
+
+def _make_row_col_qt(
+    x_size,
+    x_dtype,
+    fp4_dtype,
+    config,
+    row_recipe,
+    col_recipe,
+    row_data,
+    row_scale,
+    col_data,
+    col_scale,
+):
+    """Wrap fused row/col quant outputs into the (row_qt, col_qt) pair."""
+    row_qt = QuantizedTensor(
+        row_data,
+        row_scale,
+        shape=x_size,
+        orig_dtype=x_dtype,
+        dest_dtype=fp4_dtype,
+        granularity=config.granularity,
+        block_size=config.block_size,
+        scaling_recipe=row_recipe,
+        requires_grad=False,
+        quantized_axis=1,
+    )
+    col_qt = QuantizedTensor(
+        col_data,
+        col_scale,
+        shape=x_size,
+        orig_dtype=x_dtype,
+        dest_dtype=fp4_dtype,
+        granularity=config.granularity,
+        block_size=config.block_size,
+        scaling_recipe=col_recipe,
+        requires_grad=False,
+        quantized_axis=0,
+    )
+    return row_qt, col_qt
+
+
+def _quantize_mxfp4_row_col_ab(a, b, fp4_dtype, config, recipes):
+    """Merged A+B rowwise+colwise MXFP4 quant in one kernel launch (quant-only,
+    no quant<->GEMM fusion). Returns ``(a_row_qt, a_col_qt, b_row_qt, b_col_qt)``,
+    or ``None`` if not eligible so the caller falls back to two separate duals."""
+    a_row_rec, a_t_rec, b_row_rec, b_t_rec = recipes
+    ok = (
+        a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+        and a.dim() == 2
+        and b.dim() == 2
+        and a.is_contiguous()
+        and b.is_contiguous()
+        and dual2_eligible(
+            a.size(0),
+            a.size(1),
+            b.size(0),
+            b.size(1),
+            a_row_rec,
+            a_t_rec,
+            b_row_rec,
+            b_t_rec,
+        )
+    )
+    if not ok:
+        return None
+    a_recipes = (a_row_rec.use_rht, a_t_rec.use_rht, a_row_rec.use_2d_block, a_t_rec.use_2d_block)
+    b_recipes = (b_row_rec.use_rht, b_t_rec.use_rht, b_row_rec.use_2d_block, b_t_rec.use_2d_block)
+    (a_ro, a_rs, a_co, a_cs), (b_ro, b_rs, b_co, b_cs) = flydsl_dual_quant2(
+        a, b, fp4_dtype, a_recipes, b_recipes
+    )
+    a_row_qt, a_col_qt = _make_row_col_qt(
+        a.size(), a.dtype, fp4_dtype, config, a_row_rec, a_t_rec, a_ro, a_rs, a_co, a_cs
+    )
+    b_row_qt, b_col_qt = _make_row_col_qt(
+        b.size(), b.dtype, fp4_dtype, config, b_row_rec, b_t_rec, b_ro, b_rs, b_co, b_cs
+    )
+    return a_row_qt, a_col_qt, b_row_qt, b_col_qt
 
 
 class FP4GemmMXFunction(torch.autograd.Function):
@@ -54,7 +196,13 @@ class FP4GemmMXFunction(torch.autograd.Function):
         assert supported_mxfp4_backend, reason
 
         preshuffle = config.use_preshuffle
+        fp4_dtype = FP4GemmMXFunction.get_fp4_dtype(config.format)
 
+        # Recipes for the four cast directions. The rowwise (axis=1) casts feed
+        # the fwd GEMM; the colwise (axis=0) + RHT casts are the backward
+        # (a_t / b_t) operands. When a raw tensor is available and no external
+        # transpose was supplied, both casts share a single bf16 read via the
+        # dual quantizer (see ``_quantize_mxfp4_row_col``).
         a_scaling_recipe = ScalingRecipe(
             use_2d_block=False,
             use_sr=False,
@@ -62,20 +210,13 @@ class FP4GemmMXFunction(torch.autograd.Function):
             shuffle_scale=preshuffle,
             shuffle_out=False,
         )
-        if isinstance(a, QuantizedTensor):
-            check_quantized_tensor(a, config, scaling_recipe=a_scaling_recipe)
-            a_fp4 = a
-        else:
-            a_dtype = FP4GemmMXFunction.get_fp4_dtype(config.format)
-            a_fp4 = QuantizedTensor.quantize(
-                a,
-                a_dtype,
-                config.granularity,
-                block_size=config.block_size,
-                scaling_recipe=a_scaling_recipe,
-                axis=1,
-            )
-
+        a_t_scaling_recipe = ScalingRecipe(
+            use_2d_block=False,
+            use_sr=False,
+            use_rht=True,
+            shuffle_scale=preshuffle,
+            shuffle_out=preshuffle,
+        )
         b_scaling_recipe = ScalingRecipe(
             use_2d_block=True,
             use_sr=False,
@@ -83,19 +224,74 @@ class FP4GemmMXFunction(torch.autograd.Function):
             shuffle_scale=preshuffle,
             shuffle_out=preshuffle,
         )
-        if isinstance(b, QuantizedTensor):
-            check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
-            b_fp4 = b
-        else:
-            b_dtype = FP4GemmMXFunction.get_fp4_dtype(config.format)
-            b_fp4 = QuantizedTensor.quantize(
+        b_t_scaling_recipe = ScalingRecipe(
+            use_2d_block=True,
+            use_sr=False,
+            use_rht=True,
+            shuffle_scale=preshuffle,
+            shuffle_out=preshuffle,
+        )
+
+        # ---- Merged A+B dual: when both operands are raw bf16 and eligible, run
+        # all four casts (A row/col + B row/col) in ONE grid launch, saving a host
+        # dispatch per fwd step. Quant-only; no quant<->gemm fusion. ----
+        quantized_a_t = None
+        quantized_b_t = None
+        a_fp4 = None
+        b_fp4 = None
+        if (
+            not isinstance(a, QuantizedTensor)
+            and a_t is None
+            and not isinstance(b, QuantizedTensor)
+            and b_t is None
+        ):
+            merged = _quantize_mxfp4_row_col_ab(
+                a,
                 b,
-                b_dtype,
-                config.granularity,
-                block_size=config.block_size,
-                scaling_recipe=b_scaling_recipe,
-                axis=1,
+                fp4_dtype,
+                config,
+                (a_scaling_recipe, a_t_scaling_recipe, b_scaling_recipe, b_t_scaling_recipe),
             )
+            if merged is not None:
+                a_fp4, quantized_a_t, b_fp4, quantized_b_t = merged
+
+        # ---- A: rowwise fwd operand (+ fused colwise/RHT a_t when possible) ----
+        if a_fp4 is None:
+            if not isinstance(a, QuantizedTensor) and a_t is None:
+                a_fp4, quantized_a_t = _quantize_mxfp4_row_col(
+                    a, fp4_dtype, config, a_scaling_recipe, a_t_scaling_recipe
+                )
+            elif isinstance(a, QuantizedTensor):
+                check_quantized_tensor(a, config, scaling_recipe=a_scaling_recipe)
+                a_fp4 = a
+            else:
+                a_fp4 = QuantizedTensor.quantize(
+                    a,
+                    fp4_dtype,
+                    config.granularity,
+                    block_size=config.block_size,
+                    scaling_recipe=a_scaling_recipe,
+                    axis=1,
+                )
+
+        # ---- B: rowwise fwd operand (+ fused colwise/RHT b_t when possible) ----
+        if b_fp4 is None:
+            if not isinstance(b, QuantizedTensor) and b_t is None:
+                b_fp4, quantized_b_t = _quantize_mxfp4_row_col(
+                    b, fp4_dtype, config, b_scaling_recipe, b_t_scaling_recipe
+                )
+            elif isinstance(b, QuantizedTensor):
+                check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
+                b_fp4 = b
+            else:
+                b_fp4 = QuantizedTensor.quantize(
+                    b,
+                    fp4_dtype,
+                    config.granularity,
+                    block_size=config.block_size,
+                    scaling_recipe=b_scaling_recipe,
+                    axis=1,
+                )
 
         # NT layout
         out = gemm_fp4_impl(
@@ -122,45 +318,35 @@ class FP4GemmMXFunction(torch.autograd.Function):
         # gives garbage. When a raw high-precision tensor was passed in,
         # re-quantize from it directly; this matches what
         # ``_quantize_mxfp4_dual`` would do under one fused op.
-        if a_t is not None:
-            quantized_a_t = a_t
-        else:
-            a_t_scaling_recipe = ScalingRecipe(
-                use_2d_block=False,
-                use_sr=False,
-                use_rht=True,
-                shuffle_scale=preshuffle,
-                shuffle_out=preshuffle,
-            )
-            a_for_t = a if not isinstance(a, QuantizedTensor) else a_fp4.dequantize()
-            quantized_a_t = QuantizedTensor.quantize(
-                a_for_t,
-                a_fp4.real_dtype,
-                config.granularity,
-                block_size=config.block_size,
-                axis=0,
-                scaling_recipe=a_t_scaling_recipe,
-            )
+        # ``quantized_a_t`` / ``quantized_b_t`` are already set when the dual
+        # fast path ran above; otherwise derive the colwise/RHT transpose here.
+        if quantized_a_t is None:
+            if a_t is not None:
+                quantized_a_t = a_t
+            else:
+                a_for_t = a if not isinstance(a, QuantizedTensor) else a_fp4.dequantize()
+                quantized_a_t = QuantizedTensor.quantize(
+                    a_for_t,
+                    a_fp4.real_dtype,
+                    config.granularity,
+                    block_size=config.block_size,
+                    axis=0,
+                    scaling_recipe=a_t_scaling_recipe,
+                )
 
-        if b_t is not None:
-            quantized_b_t = b_t
-        else:
-            b_t_scaling_recipe = ScalingRecipe(
-                use_2d_block=True,
-                use_sr=False,
-                use_rht=True,
-                shuffle_scale=preshuffle,
-                shuffle_out=preshuffle,
-            )
-            b_for_t = b if not isinstance(b, QuantizedTensor) else b_fp4.dequantize()
-            quantized_b_t = QuantizedTensor.quantize(
-                b_for_t,
-                b_fp4.real_dtype,
-                config.granularity,
-                block_size=config.block_size,
-                axis=0,
-                scaling_recipe=b_t_scaling_recipe,
-            )
+        if quantized_b_t is None:
+            if b_t is not None:
+                quantized_b_t = b_t
+            else:
+                b_for_t = b if not isinstance(b, QuantizedTensor) else b_fp4.dequantize()
+                quantized_b_t = QuantizedTensor.quantize(
+                    b_for_t,
+                    b_fp4.real_dtype,
+                    config.granularity,
+                    block_size=config.block_size,
+                    axis=0,
+                    scaling_recipe=b_t_scaling_recipe,
+                )
         ctx.save_for_backward(
             quantized_a_t.qdata, quantized_a_t.scale_inv, quantized_b_t.qdata, quantized_b_t.scale_inv
         )
@@ -186,19 +372,29 @@ class FP4GemmMXFunction(torch.autograd.Function):
         preshuffle = ctx.config.use_preshuffle
         default_backend = (BackendType.AITER if preshuffle else BackendType.HIPBLASLT).value
 
-        quantized_grad_out = QuantizedTensor.quantize(
+        # grad_out feeds two GEMMs: rowwise (dgrad, grad_a) and colwise (wgrad,
+        # grad_b). Both casts use the same RHT/SR recipe on the same grad_out, so
+        # fuse them into one bf16 read via the dual quantizer.
+        grad_out_scaling_recipe = ScalingRecipe(
+            use_2d_block=False,
+            use_sr=ctx.config.use_gradient_sr,
+            use_rht=True,
+            shuffle_scale=preshuffle,
+            shuffle_out=False,
+        )
+        grad_out_t_scaling_recipe = ScalingRecipe(
+            use_2d_block=False,
+            use_sr=ctx.config.use_gradient_sr,
+            use_rht=True,
+            shuffle_scale=preshuffle,
+            shuffle_out=False,
+        )
+        quantized_grad_out, quantized_grad_out_t = _quantize_mxfp4_row_col(
             grad_out,
             grad_out_dtype,
-            ctx.config.granularity,
-            axis=1,
-            block_size=ctx.config.block_size,
-            scaling_recipe=ScalingRecipe(
-                use_2d_block=False,
-                use_sr=ctx.config.use_gradient_sr,
-                use_rht=True,
-                shuffle_scale=preshuffle,
-                shuffle_out=False,
-            ),
+            ctx.config,
+            grad_out_scaling_recipe,
+            grad_out_t_scaling_recipe,
         )
 
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
@@ -214,22 +410,6 @@ class FP4GemmMXFunction(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             default_backend=default_backend,
             preshuffled=preshuffle,
-        )
-
-        grad_out_t_scaling_recipe = ScalingRecipe(
-            use_2d_block=False,
-            use_sr=ctx.config.use_gradient_sr,
-            use_rht=True,
-            shuffle_scale=preshuffle,
-            shuffle_out=False,
-        )
-        quantized_grad_out_t = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            block_size=ctx.config.block_size,
-            axis=0,
-            scaling_recipe=grad_out_t_scaling_recipe,
         )
 
         # NOTE: convert TN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
