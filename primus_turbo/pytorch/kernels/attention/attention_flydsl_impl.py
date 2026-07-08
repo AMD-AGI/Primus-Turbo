@@ -211,7 +211,15 @@ def _get_bwd_launchers(num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_
         # (~occ 3->2), so waves_per_eu=2 keeps the 256-VGPR occ-2 ceiling and avoids
         # spill; dkdv stays at its default 2.
         fused_launch = build_flash_attn_bwd_module(mode="fused_dq_delta", waves_per_eu=2, **common)
-        dkdv_launch = build_flash_attn_bwd_dkdv_module(q_split=_DKDV_Q_SPLIT, **common)
+        # dkdv recomputes P with crude Schraudolph 2^x (fast_exp2): dK/dV have no
+        # near-diagonal dS cancellation (dk/dv cos 0.9994 vs exact 0.99999, l2
+        # 0.018 << 0.05 gate, s8192-verified), so trading exact exp2 for 3 full-
+        # rate VALU ops cuts dkdv's ~18% exp2 wall time. NOT applied to fwd/dq:
+        # their LSE-normalized near-diagonal dq needs sum_j P_ij=1 to fp precision
+        # and Schraudolph is non-multiplicative (would flip dq to cos -0.16).
+        dkdv_launch = build_flash_attn_bwd_dkdv_module(
+            q_split=_DKDV_Q_SPLIT, fast_exp2=True, **common
+        )
         launchers = (fused_launch, dkdv_launch)
         _BWD_LAUNCHER_CACHE[key] = launchers
     return launchers, key

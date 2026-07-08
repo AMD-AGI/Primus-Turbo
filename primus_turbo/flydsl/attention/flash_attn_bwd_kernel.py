@@ -882,6 +882,7 @@ def build_flash_attn_bwd_dkdv_module(
     daz=True,
     q_split=2,
     enable_dma=True,
+    fast_exp2=False,
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
 
@@ -1197,6 +1198,25 @@ def build_flash_attn_bwd_dkdv_module(
         c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
         c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
 
+        # Crude Schraudolph 2^x (fast_exp2): reinterpret the integer
+        # x*2^23 + (127*2^23 + magic) as f32 -> piecewise-linear 2^x, replacing the
+        # quarter-rate v_exp with 3 full-rate ops (max+fma+fptosi+bitcast). The
+        # maximumf clamp bounds the int convert AND is the all-mask guard (masked
+        # -inf -> 2^-88=0, no exp2(-inf)=NaN; pitfalls/04). dK/dV tolerate the
+        # ~1-3% P error (no near-diagonal cancellation), unlike the dq/LSE path.
+        _c_exp2_floor = fx.Float32(-87.0)
+        _c_exp2_scale = fx.Float32(float(1 << 23))
+        _c_exp2_bias = fx.Float32(float(127 * (1 << 23) - 486411))
+        _compute_type = fx.Float32.ir_type
+
+        def _exp2_of(diff):
+            if const_expr(fast_exp2):
+                xc = ArithValue(diff).maximumf(_c_exp2_floor)
+                scaled = fmath.fma(xc, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
+                i = arith.fptosi(fx.Int32.ir_type, _raw(scaled))
+                return ArithValue(i).bitcast(_compute_type)
+            return ArithValue(diff).exp2(fastmath=fm_fast)
+
         # A-operand read (Q/dO from LDS, M=q=lane_mod_32) for the S/dP GEMMs.
         a_swz_mask = (lane_mod_32 & fx.Index(Q_STRIDE // 16 - 1)) << fx.Index(4)
 
@@ -1340,12 +1360,8 @@ def build_flash_attn_bwd_dkdv_module(
                             s_hi_r = s_hi[r]
                         # lse_lo/lse_hi arrive pre-scaled by -log2e (host), so they are
                         # the exp2 addend directly -> no (-log2e)*lse mul per q-slot.
-                        plo = ArithValue(fmath.fma(s_lo_r, c_sm_scale_log2e, lse_lo, fastmath=fm_fast)).exp2(
-                            fastmath=fm_fast
-                        )
-                        phi = ArithValue(fmath.fma(s_hi_r, c_sm_scale_log2e, lse_hi, fastmath=fm_fast)).exp2(
-                            fastmath=fm_fast
-                        )
+                        plo = _exp2_of(fmath.fma(s_lo_r, c_sm_scale_log2e, lse_lo, fastmath=fm_fast))
+                        phi = _exp2_of(fmath.fma(s_hi_r, c_sm_scale_log2e, lse_hi, fastmath=fm_fast))
                         plo_g.append(plo)
                         phi_g.append(phi)
                         dslo_g.append(_fmul(plo, _fsub(dp_lo[r], dl_lo)))
