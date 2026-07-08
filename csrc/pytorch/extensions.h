@@ -248,19 +248,32 @@ at::Tensor turbo_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
 
 at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                            at::Tensor &group_offs, const bool transA, const bool transB,
-                           c10::optional<int64_t> num_cu);
+                           c10::optional<int64_t>    num_cu,
+                           const bool                work_steal,
+                           c10::optional<at::Tensor> ws_counter,
+                           int64_t                   ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                 at::Tensor &group_offs, const bool transA, const bool transB,
-                                c10::optional<int64_t> num_cu);
+                                c10::optional<int64_t>    num_cu,
+                                const bool                work_steal,
+                                c10::optional<at::Tensor> ws_counter,
+                                int64_t                   ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
-                                      c10::optional<int64_t> num_cu);
+                                      c10::optional<int64_t>    num_cu,
+                                      const bool                work_steal,
+                                      c10::optional<at::Tensor> ws_counter,
+                                      int64_t                   ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                            at::Tensor &group_offs, const bool transA,
-                                           const bool transB, c10::optional<int64_t> num_cu);
+                                           const bool                transB,
+                                           c10::optional<int64_t>    num_cu,
+                                           const bool                work_steal,
+                                           c10::optional<at::Tensor> ws_counter,
+                                           int64_t                   ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                at::Tensor &b_scales, at::Tensor &group_lens, at::Tensor &group_offs,

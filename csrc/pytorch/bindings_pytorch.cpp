@@ -104,9 +104,11 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
 
     // ********* Grouped Gemm *********
     m.def("ck_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, bool transA, "
-          "bool transB, int? num_cu=None) -> Tensor");
+          "bool transB, int? num_cu=None, bool work_steal=False, Tensor? ws_counter=None, "
+          "int ws_local_per_xcd=0) -> Tensor");
     m.def("ck_grouped_gemm_variable_k(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
-          "bool transA, bool transB, int? num_cu=None) -> Tensor");
+          "bool transA, bool transB, int? num_cu=None, bool work_steal=False, "
+          "Tensor? ws_counter=None, int ws_local_per_xcd=0) -> Tensor");
     m.def("ck_grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
           "ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");

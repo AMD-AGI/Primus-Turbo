@@ -259,12 +259,13 @@ def test_grouped_gemm_with_zero_length_groups(B, M, N_K, dtype, trans_b, backend
 # ---------------------------------------------------------------------------
 # Work-stealing tests
 #
-# Public API: ``schedule="work_steal"`` enables the work-stealing kernel on the
-# Triton backend. The integration test below uses the public API end-to-end
-# (forward + backward via autograd). Per-WS-mode kernel correctness is
-# covered by the lower-level ``grouped_gemm_triton_kernel`` test that follows
-# (the public API exposes only ``"static" | "work_steal"``; internal modes
-# ``"global" / "per-xcd" / "hierarchical"`` are kernel-level tuning knobs).
+# Public API: ``schedule="work_steal"`` enables the work-stealing kernel on
+# the Triton and CK backends. The integration tests use the public API
+# end-to-end (forward + backward via autograd). Per-ws_mode kernel
+# correctness is covered by the lower-level ``grouped_gemm_triton_kernel``
+# test that follows (the public API exposes only ``"static" | "work_steal"``;
+# internal modes ``"global" / "per-xcd" / "hierarchical"`` are kernel-level
+# tuning knobs).
 # ---------------------------------------------------------------------------
 
 
@@ -274,15 +275,23 @@ def test_grouped_gemm_with_zero_length_groups(B, M, N_K, dtype, trans_b, backend
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
-def test_grouped_gemm_schedule_work_steal_triton(B, M, N_K, dtype, balance, trans_b):
-    """``schedule="work_steal"`` on the Triton backend matches the static path
-    bit-for-bit for forward and backward (per-tile accumulator order is
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.CK])
+def test_grouped_gemm_schedule_work_steal(B, M, N_K, dtype, balance, trans_b, backend):
+    """``schedule="work_steal"`` on each WS-capable backend matches the static
+    path bit-for-bit for forward and backward (per-tile accumulator order is
     identical to the static schedule; there is no cross-tile reduction)."""
+    # CK WS is gfx950-only (see GroupedGEMMCKBackend.can_handle): the kernel
+    # body is stubbed out on gfx942 due to the 64 KB LDS budget, and the
+    # backend advertises unsupported so the dispatcher raises. Skip the
+    # combination on non-gfx950 hardware.
+    if backend is BackendType.CK and get_device_compute_capability() != (9, 5):
+        pytest.skip("CK schedule='work_steal' is gfx950-only (LDS budget)")
+
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(False)
 
     device = "cuda"
@@ -313,11 +322,12 @@ def test_grouped_gemm_schedule_work_steal_triton(B, M, N_K, dtype, balance, tran
     GlobalBackendManager.reset()
 
 
-def test_grouped_gemm_schedule_work_steal_triton_single_group():
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.CK])
+def test_grouped_gemm_schedule_work_steal_single_group(backend):
     """Single-group degenerate case (G=1): the dispatcher special-cases this
     to call non-grouped gemm; ``schedule`` must be accepted (and ignored)
     in that branch."""
-    GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
     device = "cuda"
     torch.manual_seed(0)
     M, K, N = 1024, 1280, 2560
@@ -331,12 +341,11 @@ def test_grouped_gemm_schedule_work_steal_triton_single_group():
     GlobalBackendManager.reset()
 
 
-@pytest.mark.parametrize("non_triton_backend", [BackendType.CK, BackendType.HIPBLASLT])
-def test_grouped_gemm_schedule_work_steal_rejects_non_triton_backend(non_triton_backend):
-    """Explicit selection of a non-Triton backend together with
-    ``schedule="work_steal"`` must fail at dispatch -- CK and hipblaslt advertise
-    only ``"static"`` via ``can_handle``."""
-    GlobalBackendManager.set_grouped_gemm_backend(non_triton_backend)
+def test_grouped_gemm_schedule_work_steal_rejects_hipblaslt():
+    """Explicit selection of HIPBLASLT together with ``schedule="work_steal"``
+    must fail at dispatch -- hipblaslt has no WS kernel and advertises only
+    ``"static"`` via ``can_handle``."""
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.HIPBLASLT)
     device = "cuda"
     torch.manual_seed(0)
     B, M, K, N = 4, 1024, 1280, 2560
@@ -425,5 +434,53 @@ def test_grouped_gemm_triton_kernel_ws_num_cu_below_num_xcds(num_cu, ws_mode):
     out_ref = grouped_gemm_triton_kernel(a, b, group_offs, trans_b=True, work_steal=False)
     out_ws = grouped_gemm_triton_kernel(
         a, b, group_offs, trans_b=True, num_cu=num_cu, work_steal=True, ws_mode=ws_mode
+    )
+    torch.testing.assert_close(out_ref, out_ws, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(
+    get_device_compute_capability() != (9, 5),
+    reason="CK WS kernel body is stubbed on non-gfx950 (LDS budget); the "
+    "cpp op would produce a no-op result. See GroupedGEMMCKBackend.can_handle.",
+)
+@pytest.mark.parametrize("num_cu", [4, 6, 7, 8, 16])
+def test_ck_grouped_gemm_op_ws_num_cu_below_num_xcds(num_cu):
+    """Regression: ``num_cu < NUM_XCDS_WS`` (=8) on the CK WS kernel used to
+    silently drop tiles in the gap between ``num_cu * per_xcd`` and
+    ``NUM_XCDS_WS * per_xcd`` (phase 2 starting past where phase 1 actually
+    ended). With the ``active_xcds = min(gridDim.x, NUM_XCDS_WS)`` fix the
+    kernel matches static at any grid size. Mirrors the equivalent Triton
+    regression in ``test_grouped_gemm_triton_kernel_ws_num_cu_below_num_xcds``.
+    (The public API rejects num_cu != None + schedule="work_steal", but the
+    cpp op ``ck_grouped_gemm`` still accepts the combination -- belt-and-
+    braces.)"""
+    from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
+        _get_ck_ws_counter,
+    )
+    from primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic import (
+        approximate_ck_standard_total_tiles,
+        resolve_ck_ws_local_per_xcd,
+    )
+
+    device = "cuda"
+    torch.manual_seed(0)
+    B, M, N, K = 4, 1024, 2048, 1408
+    a = torch.randn((B * M, K), dtype=torch.bfloat16, device=device)
+    b = torch.randn((B, N, K), dtype=torch.bfloat16, device=device)
+    group_lens = torch.full((B,), M, dtype=torch.int64, device=device)
+    group_offs = torch.zeros(B + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = torch.cumsum(group_lens, dim=0)
+
+    # Static reference (no WS).
+    out_ref = torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm(
+        a, b, group_lens, group_offs, False, True, num_cu, False, None, 0
+    )
+    # Force a per-XCD-style local_per_xcd so phase 1 actually runs and the
+    # gap bug (pre-fix) would surface.
+    total_tiles = approximate_ck_standard_total_tiles(a.size(0), B, N)
+    local_per_xcd = resolve_ck_ws_local_per_xcd("per-xcd", total_tiles, num_cu, kernel_kind="standard")
+    counter = _get_ck_ws_counter(a.device)
+    out_ws = torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm(
+        a, b, group_lens, group_offs, False, True, num_cu, True, counter, local_per_xcd
     )
     torch.testing.assert_close(out_ref, out_ws, rtol=0.0, atol=0.0)
