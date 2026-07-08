@@ -3,6 +3,8 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+import contextlib as _contextlib
+import contextvars as _contextvars
 from typing import Optional, Union
 
 import torch
@@ -38,9 +40,6 @@ from primus_turbo.pytorch.ops.quantization import (
     grouped_quantize_fp8_with_trans,
     quantize_fp8_with_trans,
 )
-
-import contextlib as _contextlib
-import contextvars as _contextvars
 
 # ---- Fused grouped wgrad-accumulate (mirrors TE GroupedLinear fuse_wgrad_accumulation) ----
 # When active, FP8GroupedGemmMXFunc.backward accumulates the mxfp8 wgrad straight into the
@@ -97,6 +96,7 @@ def _expert_main_grad_view(weights):
         return None
     view = torch.as_strided(base_t, size=(E, N, K), stride=(N * K, K, 1))
     return view, (not ascending)
+
 
 __all__ = [
     "grouped_gemm_fp8",
@@ -932,12 +932,12 @@ def grouped_gemm_fp8(
     if group_offs is None:
         group_offs = group_offs_from_lens(group_lens)
     if isinstance(a, QuantizedTensorPair):
-        a_data, a_data_t = a.data_rowwise, a.data_t
+        a_data, a_data_t = a.data, a.data_t
     else:
         a_data, a_data_t = a, None
 
     if isinstance(b, QuantizedTensorPair):
-        b_data, b_data_t = b.data_rowwise, b.data_t
+        b_data, b_data_t = b.data, b.data_t
     else:
         b_data, b_data_t = b, None
 
