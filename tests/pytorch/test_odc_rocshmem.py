@@ -5,9 +5,11 @@
 """Smoke test for the migrated ODC rocSHMEM backends.
 
 The single-node host-API backend (originally librs_host5.so) and the multi-node
-GPU-direct backend (originally librs_host_gda.so) were migrated into Turbo's _C
-extension as the ``odc_rocshmem_host`` / ``odc_rocshmem_gda`` pybind submodules
-(see csrc/pytorch/dist/odc_rocshmem_*.cpp). Both are compiled behind
+GPU-direct backend (originally librs_host_gda.so) were migrated into Turbo. The
+implementations live in the kernels library (csrc/kernels/odc_rocshmem/*.cu,
+declared in primus_turbo/odc_rocshmem/api.h); thin pybind bindings in
+csrc/pytorch/dist/odc_rocshmem_*.cpp re-expose them as the ``odc_rocshmem_host`` /
+``odc_rocshmem_gda`` submodules of _C. Both are compiled behind
 ``#ifndef DISABLE_ROCSHMEM``: on a toolchain without rocSHMEM the submodules are
 simply absent from _C, so every test here skips instead of failing.
 

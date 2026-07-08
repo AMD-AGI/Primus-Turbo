@@ -300,6 +300,15 @@ def build_kernels_extension():
     extra_flags["extra_link_args"] += [
         "-shared",
         "-Wl,-soname,libprimus_turbo_kernels.so",
+        # [experiment A] Force a single device-LTO partition so the rocSHMEM
+        # device runtime (default context) and the ODC GDA device kernels stay
+        # in ONE device-LTO unit. The default multi-partition device link
+        # (--lto-partitions=8 + -amdgpu-internalize-symbols) splits the rocSHMEM
+        # device default context away from the ODC kernels -> device getmem reads
+        # zero -> dual-node grad_norm=0. Keeping them in one partition mirrors the
+        # single-TU pinfix .so that works.
+        "-Xoffload-linker",
+        "--lto-partitions=1",
     ]
 
     kernels_source_files = Path(PROJECT_ROOT / "csrc" / "kernels")
@@ -351,24 +360,9 @@ def build_torch_extension():
         *extra_flags.get("extra_link_args", []),
     ]
 
-    rocshmem_include_dirs = []
-    rocshmem_library_dirs = []
     if ROCSHMEM_LIBRARY is None:
         extra_flags["extra_compile_args"]["nvcc"].append("-DDISABLE_ROCSHMEM")
         extra_flags["extra_compile_args"]["cxx"].append("-DDISABLE_ROCSHMEM")
-    else:
-        # The ODC rocSHMEM dist backends live under csrc/pytorch/ and are compiled
-        # into this _C extension, so it needs rocSHMEM/MPI includes + link args
-        # (mirrors build_kernels_extension); otherwise rocshmem/rocshmem.hpp is not
-        # found and the rocshmem device symbols stay undefined at link time.
-        rocshmem_include_dirs.extend(ROCSHMEM_LIBRARY.include_dirs)
-        rocshmem_library_dirs.extend(ROCSHMEM_LIBRARY.library_dirs)
-        extra_flags["extra_link_args"].extend(ROCSHMEM_LIBRARY.extra_link_args)
-        if (
-            "-fgpu-rdc" in ROCSHMEM_LIBRARY.extra_link_args
-            or "--hip-link" in ROCSHMEM_LIBRARY.extra_link_args
-        ):
-            extra_flags["extra_compile_args"]["nvcc"] += ["-fgpu-rdc"]
 
     # CPP
     pytorch_csrc_source_files = Path(PROJECT_ROOT / "csrc" / "pytorch")
@@ -381,9 +375,7 @@ def build_torch_extension():
             Path(PROJECT_ROOT / "csrc"),
             Path(PROJECT_ROOT / "csrc" / "include"),
             Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
-            *rocshmem_include_dirs,
         ],
-        library_dirs=rocshmem_library_dirs,
         **extra_flags,
     )
 
@@ -404,22 +396,9 @@ def build_jax_extension():
         *extra_flags.get("extra_link_args", []),
     ]
 
-    rocshmem_include_dirs = []
-    rocshmem_library_dirs = []
     if ROCSHMEM_LIBRARY is None:
         extra_flags["extra_compile_args"]["nvcc"].append("-DDISABLE_ROCSHMEM")
         extra_flags["extra_compile_args"]["cxx"].append("-DDISABLE_ROCSHMEM")
-    else:
-        # Mirror build_kernels_extension: wire rocSHMEM/MPI includes + link args so
-        # any rocSHMEM-guarded csrc/jax sources compile and link on the enabled path.
-        rocshmem_include_dirs.extend(ROCSHMEM_LIBRARY.include_dirs)
-        rocshmem_library_dirs.extend(ROCSHMEM_LIBRARY.library_dirs)
-        extra_flags["extra_link_args"].extend(ROCSHMEM_LIBRARY.extra_link_args)
-        if (
-            "-fgpu-rdc" in ROCSHMEM_LIBRARY.extra_link_args
-            or "--hip-link" in ROCSHMEM_LIBRARY.extra_link_args
-        ):
-            extra_flags["extra_compile_args"]["nvcc"] += ["-fgpu-rdc"]
 
     # CPP
     jax_csrc_source_files = Path(PROJECT_ROOT / "csrc" / "jax")
@@ -434,9 +413,7 @@ def build_jax_extension():
             Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
             ffi.include_dir(),
             pybind11.get_include(),
-            *rocshmem_include_dirs,
         ],
-        library_dirs=rocshmem_library_dirs,
         **extra_flags,
     )
 
