@@ -264,7 +264,7 @@ def _compiled_swiglu(
     M: int,
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
-    stream: fx.Stream = fx.Stream(None),
+    stream: fx.Stream,
 ):
     cols_per_block = _VEC * block_threads
     kernel = _make_swiglu(I, bool(with_scale), bool(with_bound), BM, grid_x, block_threads)
@@ -302,7 +302,7 @@ def _compiled_swiglu_bwd(
     M: int,
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
-    stream: fx.Stream = fx.Stream(None),
+    stream: fx.Stream,
 ):
     cols_per_block = _VEC * block_threads
     kernel = _make_swiglu_bwd(

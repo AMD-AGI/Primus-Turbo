@@ -351,12 +351,12 @@ def _compiled_grouped_gemm_combine(
     apply_weights: fx.Constexpr[bool],
     with_gate: fx.Constexpr[bool],
     out_fp16: fx.Constexpr[bool],
+    stream: fx.Stream,
     num_combine_cu: fx.Constexpr[int] = 64,
     num_reduce_cu: fx.Constexpr[int] = 256,
     nt_vmcnt: fx.Constexpr[int] = 3,
     agpr_alloc: fx.Constexpr[int] = 0,
     waves: fx.Constexpr[int] = 2,
-    stream: fx.Stream = fx.Stream(None),
 ):
     kernel = _make_grouped_gemm_combine(
         out_features,

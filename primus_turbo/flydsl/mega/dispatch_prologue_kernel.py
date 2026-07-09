@@ -450,7 +450,7 @@ def _compiled_dispatch_prologue(
     num_max_pool_tokens: fx.Constexpr[int],
     num_cu: fx.Constexpr[int],
     num_threads: fx.Constexpr[int],
-    stream: fx.Stream = fx.Stream(None),
+    stream: fx.Stream,
 ):
     kernel = _make_dispatch_prologue(
         num_tokens,

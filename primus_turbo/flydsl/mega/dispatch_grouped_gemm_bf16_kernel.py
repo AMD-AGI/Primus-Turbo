@@ -334,7 +334,7 @@ def _compiled_dispatch_grouped_gemm(
     num_ranks: fx.Constexpr[int],
     num_dispatch_cu: fx.Constexpr[int],
     nt_vmcnt: fx.Constexpr[int],
-    stream: fx.Stream = fx.Stream(None),
+    stream: fx.Stream,
 ):
     # layout_code: 0=nt, 1=nn, 2=tn; tn uses 2 XCDs, nt/nn use 8
     layout = ("nt", "nn", "tn")[int(layout_code)]
