@@ -290,7 +290,7 @@ def _stage_bwd(runner, ctx):
 
     # GEMM-bound (K=2I) -> fewer combine CUs (--bwd-combine-cu) leaves more for the GEMM
     spec = StageSpec(
-        name="bwd STEP3 fused (nn)",
+        name="bwd dgrad fused (nn)",
         flops=flops,
         dense_dims=(ctx.M_eff, N, K),
         gemm_fn=lambda: grouped_gemm_bf16_only(
@@ -380,7 +380,7 @@ def benchmark_combine(local_rank, world, args):
                 comm_label="combine_only",
                 comm_unit="GB/s (XGMI)",
                 comm_tag="comb",
-                sub_header="backward STEP3 (NN, = mega_moe_fused STEP 3)",
+                sub_header="backward dgrad (NN, = mega_moe_fused STEP 3)",
             )
             row = {
                 "Platform": platform,
@@ -440,9 +440,7 @@ if __name__ == "__main__":
         action="store_true",
         help="sweep dense GROUP_M {1,4,8}; default off uses --dense-group-m (best)",
     )
-    # backward STEP3 is GEMM-bound (K=2I) -> fewer combine CUs leaves more for the GEMM.
-    # MUST be a multiple of 8 (XCD count): non-multiples spread blocks unevenly across
-    # the 8 XCDs' XGMI paths -> ~25% BW loss (20->252 GB/s vs 16->339, 24->327).
+    # bwd dgrad GEMM-bound; must be multiple of 8 (XCD count) or ~25% XGMI BW loss
     parser.add_argument("--bwd-combine-cu", type=int, default=16)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--output", "-o", type=str, default=None)

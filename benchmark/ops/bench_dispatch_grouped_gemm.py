@@ -33,7 +33,7 @@ from mega_utils import (  # noqa: E402
     dispatch_only,
     generate_input,
     grouped_gemm_bf16_only,
-    grouped_gemm_tn_wgrad_only,
+    grouped_gemm_variable_k_only,
     print_header,
     print_stage,
     stage_columns,
@@ -286,7 +286,7 @@ def _stage_bwd_wgrad(runner, ctx):
         flops=flops,
         # dense roofline of the same total FLOPs (one [H,2I] GEMM contracting M_eff rows)
         dense_dims=(M_out, N_out, ctx.M_eff),
-        gemm_fn=lambda: grouped_gemm_tn_wgrad_only(
+        gemm_fn=lambda: grouped_gemm_variable_k_only(
             x_pool, grad_pool, ctx.group_offs, dW1, BLOCK_M=args.bm, BLOCK_N=args.bn, trans_c=True
         ),
         dispatch_fn=_make_dispatch_call(ctx, x_pool),

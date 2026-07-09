@@ -20,7 +20,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST="tests/pytorch/ops/test_mega_moe_dispatch_combine_grouped_gemm.py"
 NP="${NP:-8}"
 # Fresh rendezvous port each run: a stale process from a prior killed/hung run
-# holding the default port wedges every subsequent launch (looks like 卡死).
+# holding the default port wedges every subsequent launch (looks like a hang).
 PORT="${MASTER_PORT:-$(( 20000 + RANDOM % 20000 ))}"
 
 echo "[run_dispatch_combine_grouped_gemm] container=$CONTAINER repo=$REPO port=$PORT np=$NP"

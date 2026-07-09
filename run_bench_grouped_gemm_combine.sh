@@ -1,12 +1,12 @@
 #!/bin/bash
-# Run fused BF16 dispatch + grouped GEMM bench in dev_primus (extra args passthrough).
+# Run fused BF16 grouped GEMM + combine bench in dev_primus (extra args passthrough).
 set -euo pipefail
 
 # dev_primus is machine-specific; override via CONTAINER=... if named differently.
 CONTAINER=${CONTAINER:-dev_primus}
 REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 NP=${NP:-8}
-PORT=${MASTER_PORT:-8501}
+PORT=${MASTER_PORT:-8503}
 
 docker exec "$CONTAINER" bash -lc "
   set -e
@@ -16,5 +16,5 @@ docker exec "$CONTAINER" bash -lc "
   export ROCSHMEM_HEAP_SIZE=8GB PYTORCH_ROCM_ARCH=gfx950
   export MASTER_PORT=$PORT
   export PYTHONPATH='$REPO'
-  python bench_dispatch_grouped_gemm.py --num-processes $NP $*
+  python bench_grouped_gemm_combine.py --num-processes $NP $*
 "

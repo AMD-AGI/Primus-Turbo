@@ -34,13 +34,11 @@ from flydsl.expr.typing import AddressSpace, PointerType
 
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     _compile_dense_nt,
-    _compile_grouped_tn_wgrad_bf16,
+    _compile_grouped_variable_k_bf16,
     _get_compiled_dense,
     _i64,
     _make_shared_storage,
-    gemm_bf16_nn_tile,
-    gemm_bf16_nt_tile,
-    gemm_bf16_tn_tile,
+    gemm_bf16_tile,
 )
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
 from primus_turbo.flydsl.mega.ep_intranode import (
@@ -54,14 +52,10 @@ from primus_turbo.flydsl.mega.ep_intranode import (
 from primus_turbo.flydsl.mega.swiglu_kernel import swiglu
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.utils.gemm_helper import (
-    _emit_if_then,
     ceildiv,
     make_value_attrs,
     xcd_remap_pid,
 )
-
-# per-tile GEMM closure by layout (NT forward, NN dgrad, TN wgrad); grouped via b_group_base
-_GEMM_TILE = {"nt": gemm_bf16_nt_tile, "nn": gemm_bf16_nn_tile, "tn": gemm_bf16_tn_tile}
 
 # re-export so benchmarks can import everything mega from one place
 __all__ = [
@@ -83,7 +77,7 @@ __all__ = [
     "dispatch_only",
     "dispatch_prologue",
     "grouped_gemm_bf16_only",
-    "grouped_gemm_tn_wgrad_only",
+    "grouped_gemm_variable_k_only",
     "compile_grouped_gemm_bf16",
     "get_symm_buffer_for_mega_moe",
     "swiglu",
@@ -117,7 +111,8 @@ def compile_grouped_gemm_bf16(
     combo. Grid over-launched to the padded pool; each block early-exits past the
     real tile range. Returns the flyc launch callable."""
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
-    gemm_tile = _GEMM_TILE[layout]
+    # per-tile GEMM closure by layout (NT forward, NN dgrad, TN wgrad); grouped via b_group_base
+    gemm_tile = functools.partial(gemm_bf16_tile, layout)
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def grouped_gemm_k(
@@ -207,7 +202,8 @@ def compile_grouped_gemm_bf16(
                     b_group_base=gbase,
                 )
 
-        _emit_if_then(fx.block_idx.x < real_grid, _emit)
+        if fx.block_idx.x < real_grid:
+            _emit()
 
     @flyc.jit
     def launch(
@@ -302,13 +298,13 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
 # --------------------------------------------------------------------------- #
 # Grouped TN wgrad (variable-K) GEMM-only baseline over dispatched pools:
 # dW[g] = lhs_pool[g]^T @ rhs_pool[g], out [G, OUT_M, OUT_N]. The compute core is
-# the canonical _compile_grouped_tn_wgrad_bf16 (gemm_bf16_kernel); the fused
+# the canonical _compile_grouped_variable_k_bf16 (gemm_bf16_kernel); the fused
 # dispatch+wgrad path lives in dispatch_grouped_gemm_bf16(layout="tn").
 # --------------------------------------------------------------------------- #
-def grouped_gemm_tn_wgrad_only(
+def grouped_gemm_variable_k_only(
     lhs_pool,  # [M_pool, OUT_M] bf16   dispatched lhs (e.g. recomputed activation)
     rhs_pool,  # [M_pool, OUT_N] bf16   dispatched rhs (e.g. dY)
-    group_offs,  # [G+1] int32           per-group token boundaries in the pool
+    num_tokens_per_expert_prefix,  # [G+1] int64   per-group token boundaries in the pool
     out_dw,  # [G, OUT_M, OUT_N] bf16 ([G, OUT_N, OUT_M] if trans_c)  C = dW
     BLOCK_M=256,
     BLOCK_N=256,
@@ -318,18 +314,23 @@ def grouped_gemm_tn_wgrad_only(
 ):
     """GEMM-only grouped TN wgrad over dispatched pools (no comm). dW[g] =
     lhs_pool[offs[g]:offs[g+1]]^T @ rhs_pool[offs[g]:offs[g+1]] (transposed if trans_c)."""
-    G = group_offs.numel() - 1
+    G = num_tokens_per_expert_prefix.numel() - 1
     OUT_M = lhs_pool.shape[1]
     OUT_N = rhs_pool.shape[1]
     out_fp16 = out_dw.dtype == torch.float16
-    group_offs_i32 = group_offs.to(torch.int32) if group_offs.dtype != torch.int32 else group_offs
+    # prefix offsets must be int64
+    prefix_i64 = (
+        num_tokens_per_expert_prefix
+        if num_tokens_per_expert_prefix.dtype == torch.int64
+        else num_tokens_per_expert_prefix.to(torch.int64)
+    )
     # trans_c: produce C^T = rhs^T @ lhs by swapping operands (both K-major, symmetric)
     # so the result lands [G, OUT_N, OUT_M] via the FAST coalesced normal store.
     if trans_c:
         lhs_e, rhs_e, OUT_M_e, OUT_N_e = rhs_pool, lhs_pool, OUT_N, OUT_M
     else:
         lhs_e, rhs_e, OUT_M_e, OUT_N_e = lhs_pool, rhs_pool, OUT_M, OUT_N
-    launch = _compile_grouped_tn_wgrad_bf16(
+    launch = _compile_grouped_variable_k_bf16(
         OUT_M_e,
         OUT_N_e,
         G,
@@ -345,7 +346,7 @@ def grouped_gemm_tn_wgrad_only(
         lhs_e.contiguous(),
         rhs_e.contiguous(),
         out_dw.view(-1),  # output: view (not contiguous) so writes hit the real buffer
-        group_offs_i32,
+        prefix_i64,
         OUT_M_e,
         OUT_N_e,
         torch.cuda.current_stream(),
@@ -595,8 +596,6 @@ def _build_symm_and_plan(group, *, T, H, I, E, K, BLOCK_M, BLOCK_N, base_seed):
         num_topk=K,
         hidden=H,
         intermediate_hidden=I,
-        block_m=BLOCK_M,
-        block_n=BLOCK_N,
     )
     # prologue -> the flat dispatch handle (same path as the test); resets scoreboard +
     # barrier_local in-kernel and ends with a cross-rank barrier. The handle IS the full
@@ -928,16 +927,16 @@ def _compile_combine_only_task(out_features, num_experts, num_combine_cu, waves_
         combine_cu = fx.Int32(num_combine_cu)
         seg_bytes = num_experts * 4
         recv_dst_rank_res = create_buffer_resource_from_addr(
-            sym_layout.combine_recv_dst_rank_ptr, num_records_bytes=seg_bytes
+            sym_layout.combine_recv_dst_rank, num_records_bytes=seg_bytes
         )
         recv_start_row_res = create_buffer_resource_from_addr(
-            sym_layout.combine_recv_start_row_ptr, num_records_bytes=seg_bytes
+            sym_layout.combine_recv_start_row, num_records_bytes=seg_bytes
         )
         recv_count_res = create_buffer_resource_from_addr(
-            sym_layout.combine_recv_count_ptr, num_records_bytes=seg_bytes
+            sym_layout.combine_recv_count, num_records_bytes=seg_bytes
         )
         origin_slot_res = create_buffer_resource_from_addr(
-            sym_layout.pool_src_slot_ptr, num_records_bytes=int(sym_layout.num_max_pool_tokens) * 4
+            sym_layout.pool_src_slot, num_records_bytes=int(sym_layout.num_max_pool_tokens) * 4
         )
         grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
 
