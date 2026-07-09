@@ -1245,20 +1245,25 @@ def build_flash_attn_bwd_dkdv_module(
         c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
 
         # Crude Schraudolph 2^x (fast_exp2): reinterpret the integer
-        # x*2^23 + (127*2^23 + magic) as f32 -> piecewise-linear 2^x, replacing the
-        # quarter-rate v_exp with 3 full-rate ops (max+fma+fptosi+bitcast). The
-        # maximumf clamp bounds the int convert AND is the all-mask guard (masked
-        # -inf -> 2^-88=0, no exp2(-inf)=NaN; pitfalls/04). dK/dV tolerate the
-        # ~1-3% P error (no near-diagonal cancellation), unlike the dq/LSE path.
-        _c_exp2_floor = fx.Float32(-87.0)
+        # (s*sm*log2e + lse)*2^23 + (127*2^23 + magic) as f32 -> piecewise-linear
+        # 2^x (bitcast(fptosi(arg*2^23 + bias))).
         _c_exp2_scale = fx.Float32(float(1 << 23))
         _c_exp2_bias = fx.Float32(float(127 * (1 << 23) - 486411))
+        _c_scaled_floor = fx.Float32(-87.0 * float(1 << 23) + float(127 * (1 << 23) - 486411))
         _compute_type = fx.Float32.ir_type
 
-        def _exp2_of(diff):
+        def _p_of(s_r, lse_t, apply_mask):
+            diff = fmath.fma(s_r, c_sm_scale_log2e, lse_t, fastmath=fm_fast)
             if const_expr(fast_exp2):
-                xc = ArithValue(diff).maximumf(_c_exp2_floor)
-                scaled = fmath.fma(xc, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
+                # Schraudolph 2^x: bitcast(fptosi(arg*2^23 + bias)). The floor clamp
+                # is only load-bearing for masked slots (select -> -inf -> scaled
+                # -inf -> maximumf(floor) -> 2^-87=0; pitfalls/04). In the mask-free
+                # bulk, causal-valid softmax args are bounded (arg = log2e*(s*sm-lse),
+                # lse ~= rowmax + log(N) => arg rarely < -30 >> -87), so scaled stays
+                # positive and the clamp is a no-op -> dropped, saving a v_max/slot.
+                scaled = fmath.fma(diff, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
+                if const_expr(apply_mask):
+                    scaled = ArithValue(scaled).maximumf(_c_scaled_floor)
                 i = arith.fptosi(fx.Int32.ir_type, _raw(scaled))
                 return ArithValue(i).bitcast(_compute_type)
             return ArithValue(diff).exp2(fastmath=fm_fast)
@@ -1404,10 +1409,9 @@ def build_flash_attn_bwd_dkdv_module(
                         else:
                             s_lo_r = s_lo[r]
                             s_hi_r = s_hi[r]
-                        # lse_lo/lse_hi arrive pre-scaled by -log2e (host), so they are
-                        # the exp2 addend directly -> no (-log2e)*lse mul per q-slot.
-                        plo = _exp2_of(fmath.fma(s_lo_r, c_sm_scale_log2e, lse_lo, fastmath=fm_fast))
-                        phi = _exp2_of(fmath.fma(s_hi_r, c_sm_scale_log2e, lse_hi, fastmath=fm_fast))
+                        # lse arrives pre-scaled by -log2e on the host (see impl).
+                        plo = _p_of(s_lo_r, lse_lo, apply_mask)
+                        phi = _p_of(s_hi_r, lse_hi, apply_mask)
                         plo_g.append(plo)
                         phi_g.append(phi)
                         dslo_g.append(_fmul(plo, _fsub(dp_lo[r], dl_lo)))
