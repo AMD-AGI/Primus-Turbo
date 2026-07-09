@@ -15,3 +15,12 @@ agent/workspace/
 logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
+dist/
+.claude/
+REVIEW_PROMPT.md
+# benchmark profiler / kernel-trace outputs
+benchmark/ops/pmc_out*/
+benchmark/ops/kt/
+benchmark/ops/kt_out/
+# benchmark CSV result files
+benchmark/ops/*.csv

@@ -3,8 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""Mega-MoE SwiGLU epilogue kernels (FlyDSL).
-"""
+"""Mega-MoE SwiGLU epilogue kernels (FlyDSL)."""
 from __future__ import annotations
 
 import itertools
@@ -33,6 +32,15 @@ _VEC = 8
 _WARP = 64
 
 
+def _prune_swiglu_configs(configs, sig_args):
+    # Drop configs whose column tile does not evenly tile I (silent no-op launch).
+    I = sig_args.get("I")
+    if I is None:
+        return configs
+    keep = [c for c in configs if I % (_VEC * c.kwargs["block_threads"]) == 0]
+    return keep or configs
+
+
 def _clampv(x, lo, hi):
     return fx.arith.minimumf(fx.arith.maximumf(x, lo), hi)
 
@@ -59,6 +67,7 @@ def _make_swiglu(I: int, with_scale: bool, with_bound: bool, BM: int, grid_x: in
         neg1 = fx.arith.constant_vector(-1.0, f32v)
 
         def compute_row(m):
+            # i32 offset: assumes M*two_I < 2^31 elements (holds for all EP pool sizes).
             row_base = m * fx.Int32(two_I)
             gate = buffer_load(acc_rsrc, row_base + col, vec_width=_VEC, dtype=fx.T.bf16())
             up = buffer_load(acc_rsrc, row_base + fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16())
@@ -160,6 +169,7 @@ def _make_swiglu_bwd(
             mu = fx.arith.select(fx.arith.cmpf(fx.arith.CmpFPredicate.OEQ, up, uc), one, zero)
             dgate = fx.arith.trunc_f(bf16v, fx.arith.mulf(dgc, mg))
             dup = fx.arith.trunc_f(bf16v, fx.arith.mulf(duc, mu))
+            # Padding rows write garbage dx here; upstream must zero Xpad to keep dW1 clean.
             buffer_store(dgate, dacc_rsrc, row_base + col)
             buffer_store(dup, dacc_rsrc, row_base + fx.Int32(I) + col)
 
@@ -203,6 +213,8 @@ def _make_swiglu_bwd(
                             )
                         )
                     buffer_store(total, grad_gate_rsrc, m)
+                # Guard LDS before next loop iteration overwrites it (WAR).
+                fx.gpu.barrier()
             else:
                 compute_tile(m, block_index_y * fx.Int32(cols_per_block) + thread_index * fx.Int32(_VEC))
 
@@ -233,9 +245,10 @@ def _active_symm_bounds():
 @autotune(
     configs=[
         Config(grid_x=grid_x, block_threads=block_threads)
-        for grid_x, block_threads in itertools.product((2048, 4096), (256, 5120))
+        for grid_x, block_threads in itertools.product((1024, 2048, 4096), (256, 512))
     ],
     key=["I", "with_scale", "with_bound", "BM"],
+    prune_configs_by=_prune_swiglu_configs,
 )
 @flyc.jit
 def _compiled_swiglu(
@@ -264,10 +277,11 @@ def _compiled_swiglu(
 @autotune(
     configs=[
         Config(grid_x=grid_x, block_threads=block_threads)
-        for grid_x, block_threads in itertools.product((2048, 4096), (256, 5120))
+        for grid_x, block_threads in itertools.product((2048, 4096), (256, 512))
     ],
     rep=5,
     key=["I", "with_scale", "with_bound", "BM", "with_gate", "with_act_w"],
+    prune_configs_by=_prune_swiglu_configs,
 )
 @flyc.jit
 def _compiled_swiglu_bwd(

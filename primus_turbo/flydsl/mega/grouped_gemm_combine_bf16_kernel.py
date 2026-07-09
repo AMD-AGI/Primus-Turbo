@@ -4,12 +4,13 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl import Config, autotune
 from flydsl.expr.buffer_ops import (
-    _unwrap_value,
     buffer_load,
     create_buffer_resource,
     create_buffer_resource_from_addr,
@@ -17,13 +18,17 @@ from flydsl.expr.buffer_ops import (
 )
 from flydsl.expr.typing import AddressSpace, PointerType
 
-from primus_turbo.flydsl.gemm.gemm_bf16_kernel import GEMM_TILE, _make_shared_storage
+from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
+    _make_shared_storage,
+    gemm_bf16_tile,
+)
 from primus_turbo.flydsl.mega.ep_intranode import (
     combine_bf16_tile,
     topk_reduce_bf16_tile,
 )
 from primus_turbo.flydsl.mega.prims import (
     atomic_add,
+    cast,
     l2_invalidate,
     ld,
     read_clock,
@@ -31,14 +36,13 @@ from primus_turbo.flydsl.mega.prims import (
 )
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.tune_utils import _suppress_stdout_stderr
-from primus_turbo.flydsl.utils.gemm_helper import _emit_if_then, make_value_attrs
+from primus_turbo.flydsl.utils.gemm_helper import (
+    make_bf16_fp16_tile_tensor,
+    make_value_attrs,
+)
 
 _WARP = 64
 _BLOCK_THREADS = 512
-
-
-def _i64(v):
-    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
 
 
 _PVEC = 8
@@ -67,7 +71,7 @@ def _make_grouped_gemm_combine(
     with_gate=False,
 ):
     K = hidden_size
-    gemm_tile = GEMM_TILE[layout]
+    gemm_tile = functools.partial(gemm_bf16_tile, layout)
     assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
     assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
@@ -78,7 +82,6 @@ def _make_grouped_gemm_combine(
     comb_records = num_combine_slots * out_features * 2
     gate_records = num_combine_slots * 4
     gemm_base = num_combine_cu
-    total_reduce_warps = num_reduce_cu * _NUM_WARPS
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -104,8 +107,8 @@ def _make_grouped_gemm_combine(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         combine_bank = combine_parity * fx.Int32(worst_case_tiles)
         reduce_bank = combine_parity * fx.Int32(num_combine_slots)
-        expected_combine_i64 = _i64(expected_combine)
-        expected_reduce_i64 = _i64(expected_reduce)
+        expected_combine_i64 = cast(expected_combine, fx.T.i64())
+        expected_reduce_i64 = cast(expected_reduce, fx.T.i64())
 
         combine_flag_base = sym_layout.combine_flag
         comb_base = sym_layout.combine_token_buffer
@@ -145,9 +148,7 @@ def _make_grouped_gemm_combine(
         d_topk_w_res = create_buffer_resource(D_TOPK_W, max_size=True) if with_gate else None
 
         if block_index < combine_cu:
-            # Task-based combine: stride over num_experts recv-segments; each warp
-            # sustains ONE peer per segment. Gate a segment on all GEMM tiles its
-            # rows [start_row, start_row+count) span before pushing.
+            # Task-based combine: one warp per recv-segment, gated on its spanned GEMM tiles.
             seg_local = (fx.Int32(num_experts) - block_index + combine_cu - fx.Int32(1)) // combine_cu
             for seg_iter in range(seg_local):
                 task_index = block_index + seg_iter * combine_cu
@@ -205,26 +206,21 @@ def _make_grouped_gemm_combine(
                 # GEMM role: one real tile (block_m, block_n) per block (unchanged).
                 group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 group_base = group_index * fx.Int32(K) * c_n
-                # Worst-case l2 buffer (>4GB) can't be one buffer resource. Advance
-                # the ACT/l2 base to this row-block in int64 and run block_m-relative
-                # (block_m=0), keeping in-resource offsets and make_layout int32-small.
-                a_byte_off = _i64(block_m) * fx.Int64(BLOCK_M * K * 2)
-                c_byte_off = _i64(block_m) * fx.Int64(BLOCK_M * out_features * 2)
+                # A base = ACT tensor; C base = l2_token_buffer (int64 symm addr).
                 act_base = fx.arith.ArithValue(
                     fx.arith.index_cast(fx.T.i64(), extract_base_index(ACT)), signed=True
                 )
-                act_tile = fx.make_view(
-                    fx.inttoptr(tile_ptr_ty, act_base + a_byte_off),
-                    fx.make_layout(BLOCK_M * K, 1),
-                )
-                l2_tile = fx.make_view(
-                    fx.inttoptr(tile_ptr_ty, sym_layout.l2_token_buffer + c_byte_off),
-                    fx.make_layout(BLOCK_M * out_features, 1),
-                )
+                # Fold each per-tile base in int64 (worst-case pool >4GB) so voffset stays
+                # int32, then address tile-local (block_m=0). A: precise bound;
+                # C: HW num_records bounds via 0x40000000 flat layout.
+                a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
+                c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
+                A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
+                C_tile = make_bf16_fp16_tile_tensor(sym_layout.l2_token_buffer, c_off, 0x40000000)
                 gemm_tile(
-                    act_tile,
+                    A_tile,
                     WEIGHTS,
-                    l2_tile,
+                    C_tile,
                     fx.Int32(BLOCK_M),
                     c_n,
                     lds,
@@ -240,20 +236,13 @@ def _make_grouped_gemm_combine(
                 )
                 fx.rocdl.s_waitcnt(0)
                 fx.gpu.barrier()
-                _emit_if_then(
-                    thread_index == fx.Int32(0),
-                    lambda: atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1), scope="agent"),
-                )
+                if thread_index == fx.Int32(0):
+                    atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1), scope="agent")
             else:
-                # Empty region: carve the first num_reduce_cu blocks for the topk
-                # reduce; the rest early-exit (no per-empty-block atomic_add).
+                # Empty region: first num_reduce_cu blocks do topk reduce, rest early-exit.
                 empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
                 if empty_ordinal < fx.Int32(num_reduce_cu):
-                    # never-reset alignment: the reduce blocks bump combine_flag for
-                    # the empty block_m (block_m in [real_tiles, worst_case_tiles))
-                    # to the cumulative expected, strided across the reduce blocks, so
-                    # a future launch where such a block_m becomes real still gates
-                    # right. Off the combine critical path; only num_reduce_cu writers.
+                    # Never-reset alignment: reduce blocks bump empty block_m's combine_flag to cumulative expected.
                     n_empty = fx.Int32(worst_case_tiles) - real_tiles
                     reduce_stride = fx.Int32(num_reduce_cu)
                     align_count = (n_empty - empty_ordinal + reduce_stride - fx.Int32(1)) // reduce_stride
@@ -266,13 +255,18 @@ def _make_grouped_gemm_combine(
                                 fx.Int64(n_blocks),
                                 scope="agent",
                             )
+
+                    n_reduce_tiles = n_empty * fx.Int32(n_blocks)
+                    active_reduce_blocks = fx.arith.select(
+                        n_reduce_tiles < fx.Int32(num_reduce_cu), n_reduce_tiles, fx.Int32(num_reduce_cu)
+                    )
                     topk_reduce_bf16_tile(
                         True,
                         apply_weights,
                         with_gate,
                         thread_index,
                         empty_ordinal,
-                        fx.Int32(total_reduce_warps),
+                        active_reduce_blocks * fx.Int32(_NUM_WARPS),
                         topk,
                         out_features,
                         num_experts,
@@ -458,8 +452,7 @@ def grouped_gemm_combine_bf16(
     apply_weights = topk_weights is not None
     with_gate = grad_gate is not None
 
-    # Pass 2D: flattening M x K overflows int32 shape ABI for worst-case pool.
-    # The kernel takes ACT's base pointer and advances it per-tile in int64.
+    # Pass 2D: kernel advances ACT base per-tile in int64 (flat MxK overflows int32 ABI).
     act_2d = x.contiguous()
     if layout == "nt":
         weight_flat = l2_weights.reshape(G * N, K).contiguous().view(-1)
@@ -478,9 +471,7 @@ def grouped_gemm_combine_bf16(
     n_blocks = out_features // BN
     combine_parity, expected_combine, expected_reduce = symm.next_combine(n_blocks)
 
-    # num_combine_cu / num_reduce_cu are @autotune-swept per shape+layout (nt/nn have
-    # OPPOSITE combine_cu optima -> layout_code is in the autotune key). host next_combine
-    # above stays here; the tuning post_hook only rewinds the never-reset flags.
+    # num_combine_cu / num_reduce_cu are tunable per shape+layout (nt/nn optima differ).
     with _suppress_stdout_stderr():
         _compiled_grouped_gemm_combine(
             act_2d,

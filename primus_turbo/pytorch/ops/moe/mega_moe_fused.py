@@ -11,15 +11,11 @@ from typing import Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
-from primus_turbo.flydsl.mega.swiglu_kernel import swiglu, swiglu_backward
 from primus_turbo.flydsl.mega.symm_buffer import SymmBuffer
 from primus_turbo.pytorch.core.backend import BackendType
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
-    grouped_gemm_variable_k_impl,
-)
 from primus_turbo.pytorch.kernels.mega_moe import (
-    dispatch_grouped_gemm_impl,
-    grouped_gemm_combine_impl,
+    mega_moe_backward_impl,
+    mega_moe_forward_impl,
 )
 
 __all__ = [
@@ -43,6 +39,21 @@ class MegaMoEFusedFunction(torch.autograd.Function):
         group: ProcessGroup,
     ) -> torch.Tensor:
         with torch.profiler.record_function("mega_moe_forward"):
+            # Validate at the op boundary so failures point here, not deep in FlyDSL.
+            assert (
+                x.dim() == 2 and x.is_cuda and x.dtype == torch.bfloat16
+            ), f"x must be 2D bf16 CUDA, got {x.shape}/{x.dtype}"
+            assert w1.is_cuda and w2.is_cuda, "w1/w2 must be CUDA tensors"
+            assert (
+                x.device == w1.device == w2.device == topk_idx.device == topk_weights.device
+            ), "all inputs must share one device"
+            assert (
+                topk_idx.shape[0] == topk_weights.shape[0] == x.shape[0]
+            ), f"token count mismatch: x={x.shape[0]} idx={topk_idx.shape[0]} w={topk_weights.shape[0]}"
+            assert (
+                topk_idx.shape[-1] == topk_weights.shape[-1]
+            ), f"num_topk mismatch: idx={topk_idx.shape[-1]} w={topk_weights.shape[-1]}"
+
             num_tokens = x.shape[0]
             num_topk = topk_idx.shape[-1]
             # int64 end-to-end (combine reads topk i64)
@@ -50,29 +61,16 @@ class MegaMoEFusedFunction(torch.autograd.Function):
 
             ctx.set_materialize_grads(False)
 
-            # fused prologue + cross-rank dispatch PUSH + grouped L1 GEMM (NT)
-            l1_out, _, dispatch_weights_in_buf, handle = dispatch_grouped_gemm_impl(
+            # fused MoE forward: dispatch grouped L1 GEMM (NT) + SwiGLU + grouped L2 GEMM combine (NT)
+            y, l1_out, dispatch_weights_in_buf, _, _, handle = mega_moe_forward_impl(
                 x,
                 w1,
-                group,
-                BackendType.FLYDSL.value,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                layout="nt",
-            )
-
-            act = swiglu(l1_out)
-
-            y, _ = grouped_gemm_combine_impl(
-                act,
                 w2,
-                list(handle),
+                group,
+                topk_idx,
+                topk_weights,
+                "nt",
                 BackendType.FLYDSL.value,
-                topk_indices=topk_idx.contiguous().view(-1),
-                topk_weights=topk_weights.to(torch.float32).contiguous().view(-1),
-                num_combine_cu=64,
-                num_reduce_cu=0,
-                layout="nt",
             )
 
             # stash everything backward needs
@@ -114,77 +112,29 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 topk_idx,
             ) = saved[ctx.handle_len :]
 
-            # handle contract (dispatch_prologue return order):
-            # [7]=num_tokens_per_expert, [8]=num_tokens_per_expert_prefix
-            num_tokens_per_expert, num_tokens_per_expert_prefix = handle[7], handle[8]
-            num_tokens, num_topk = ctx.num_tokens, ctx.num_topk
-            dy = grad_y.contiguous().to(torch.bfloat16)
-
-            grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_impl(
-                dy,
-                w2,
-                ctx.group,
-                BackendType.FLYDSL.value,
-                handle=handle,
-                layout="nn",
-            )
-
-            # SwiGLU^T (re-inject routing weight) + gate grad
-            grad_l1, grad_gate, act_weighted = swiglu_backward(
-                grad_swiglu,
-                l1_out,
-                scale=dispatch_weights_in_buf,
-                return_gate=True,
-                return_act_w=True,
-            )
-
-            # dW2 = dispatch_l2_grad^T @ act_weighted (variable-K wgrad)
-            dW2 = grouped_gemm_variable_k_impl(
-                dispatch_l2_grad,
-                act_weighted,
-                num_tokens_per_expert,
-                num_tokens_per_expert_prefix,
-                trans_a=True,
-                trans_b=False,
-                trans_c=False,
-                num_cu=None,
-                default_backend=BackendType.TRITON.value,
-            )
-
-            # L1 dgrad (grad_l1 @ w1, NN) + combine PUSH + dx reduce + grad_gate scatter
-            dx, grad_topk_weights_flat = grouped_gemm_combine_impl(
-                grad_l1,
-                w1,
-                list(handle),
-                BackendType.FLYDSL.value,
-                topk_indices=topk_idx.contiguous().view(-1),
-                topk_weights=None,
-                grad_gate=grad_gate,
-                num_combine_cu=16,
-                num_reduce_cu=0,
-                layout="nn",
-            )
-
-            # dW1 = pool(x)^T @ grad_l1 (variable-K TN wgrad; re-dispatch saved x)
-            dW1, _, _, _ = dispatch_grouped_gemm_impl(
+            # fused MoE backward: L2 dgrad (nn) + SwiGLU^T + dW2 + L1 dgrad combine (nn) + dW1 (tn)
+            dx, grad_topk_weights, dW1, dW2 = mega_moe_backward_impl(
+                grad_y,
                 saved_x,
-                grad_l1,
+                l1_out,
+                dispatch_weights_in_buf,
+                w1,
+                w2,
+                topk_idx,
+                handle,
                 ctx.group,
+                ctx.num_tokens,
+                ctx.num_topk,
                 BackendType.FLYDSL.value,
-                handle=handle,
-                layout="tn",
-                trans_c=True,
             )
 
-            # reshape the combine-reduce gate output to [num_tokens, num_topk]
-            grad_topk_weights = grad_topk_weights_flat.view(num_tokens, num_topk)
             # grads for (x, topk_idx, topk_weights, w1, w2, group)
             return (
                 dx,
                 None,
                 grad_topk_weights,
-                dW1.to(w1.dtype),
-                dW2.to(w2.dtype),
+                dW1,
+                dW2,
                 None,
             )
 

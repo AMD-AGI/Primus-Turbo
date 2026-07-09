@@ -11,15 +11,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl.compiler.ast_rewriter import (
-    InsertEmptyYieldForSCFFor,
-    ReplaceIfWithDispatch,
-)
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.buffer_ops import buffer_store, create_buffer_resource
-from flydsl.expr.typing import T
+from flydsl.expr.typing import AddressSpace, PointerType, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 
@@ -32,17 +28,6 @@ def _as_index(v):
     # c_rows/c_cols may be a runtime value (dense/grouped NT/NN: N, m_end) or a
     # compile-time int (wgrad CShuffle: OUT_N). Coerce both to an MLIR index.
     return arith.index(v) if isinstance(v, int) else arith.index_cast(T.index, v)
-
-
-def _emit_if_then(cond, then_fn):
-    """Emit a dynamic ``if cond: then_fn()`` (the body-only AST rewrite's primitive)."""
-    ReplaceIfWithDispatch.scf_if_dispatch(cond, then_fn)
-
-
-def _emit_for(start, stop, step, body_fn):
-    """Emit a runtime ``for iv in range(start, stop, step): body_fn(iv)`` (scf.for) from
-    a non-rewritten helper. Loop-carry-free: the body mutates rmem/LDS in place."""
-    InsertEmptyYieldForSCFFor.scf_for_dispatch(start, stop, step, lambda iv, _names: body_fn(iv))
 
 
 def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
@@ -114,6 +99,15 @@ def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_byte
     )
     iter_bf = fx.recast_iter(bf_buf_ptr_ty, iter_i8)
     return fx.Tensor(fx.make_view(iter_bf, lay))
+
+
+def make_bf16_fp16_tile_tensor(base_i64, byte_offset, elems):
+    """Per-tile 2-byte (bf16/fp16) global view with base rebased by ``byte_offset`` in
+    int64 (keeps per-lane voffset int32 past a >4GB pool). Returns a plain global view;
+    the caller feeds it straight to gemm_tile, so the nt_tile API stays unchanged."""
+    ptr_ty = PointerType.get(elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16)
+    tile_ptr = fx.inttoptr(ptr_ty, base_i64 + byte_offset)
+    return fx.make_view(tile_ptr, fx.make_layout(elems, 1))
 
 
 def swizzle_128(row, col, width=128):

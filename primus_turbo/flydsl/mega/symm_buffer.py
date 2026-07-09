@@ -1,5 +1,8 @@
+import warnings
 from collections import namedtuple
+from dataclasses import dataclass
 from functools import lru_cache
+from math import prod
 
 import flydsl.expr as fx
 import torch
@@ -9,10 +12,17 @@ from flydsl.expr.typing import Constexpr
 
 from primus_turbo.flydsl.mega.prims import addr_buffer_resource
 
-__all__ = ["SymmBuffer", "get_symm_buffer_for_mega_moe", "SymLayout", "sym_map", "make_sym_layout_type"]
+__all__ = [
+    "SymmBuffer",
+    "get_symm_buffer_for_mega_moe",
+    "SymLayout",
+    "sym_map",
+    "make_sym_layout_type",
+    "make_sym_layout_meta",
+    "LayoutConfig",
+]
 
 BLOCK_M = 256  # pool-block granularity (fixed policy)
-HEAP_ALIGN = 256  # every region starts on a 256B boundary
 TOKEN_DTYPE = torch.bfloat16  # dispatched-token dtype for the pool / L2 / combine buffers
 
 
@@ -31,23 +41,57 @@ def get_num_max_pool_tokens(
     )
 
 
+# --- layout config: pure dimensions, decoupled from IPC allocation -------------
+
+
+@dataclass(frozen=True)
+class LayoutConfig:
+    """All dims the RegionSpecs and SymLayout need. Pure data -> sizing is testable without IPC."""
+
+    num_ranks: int
+    num_experts: int
+    num_experts_per_rank: int
+    num_max_tokens_per_rank: int
+    num_topk: int
+    hidden: int
+    intermediate_hidden: int
+    num_max_pool_tokens: int
+    num_max_pool_blocks: int
+    num_combine_slots: int
+
+    @classmethod
+    def build(
+        cls, num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
+    ) -> "LayoutConfig":
+        """Derive the full config (pool capacity, block count, combine slots) from raw MoE dims."""
+        assert num_experts % num_ranks == 0, f"num_experts {num_experts} not divisible by ranks {num_ranks}"
+        num_experts_per_rank = num_experts // num_ranks
+        num_max_pool_tokens = get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank
+        )
+        return cls(
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_experts_per_rank=num_experts_per_rank,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=intermediate_hidden,
+            num_max_pool_tokens=num_max_pool_tokens,
+            num_max_pool_blocks=num_max_pool_tokens // BLOCK_M,
+            num_combine_slots=num_max_tokens_per_rank * num_topk,
+        )
+
+
 # --- heap layout description ---------------------------------------------------
 
 
 class RegionSpec:
-    """Blueprint for one heap region, declared as a class field; ``shape=None`` keeps it flat.
 
-    ``numel`` and ``shape`` are functions of a config exposing the shape dims as attributes (the
-    owning SymmBuffer), since the dims aren't known until a buffer is sized -- a spec reads as
-    ``RegionSpec(torch.int32, lambda c: c.num_ranks * c.num_experts)``. ``dtype`` may be the
-    dispatched-token dtype or a fixed dtype. A spec carries no address; placing it against a
-    config yields a :class:`PlacedRegion`.
-    """
-
-    def __init__(self, dtype: torch.dtype, numel, shape=None):
+    def __init__(self, dtype: torch.dtype, shape: tuple):
         self.dtype = dtype
-        self.numel = numel
-        self.shape = shape
+        self.shape = tuple(shape)
+        self.numel = prod(self.shape)
 
     def __set_name__(self, owner, name):
         self.name = name
@@ -77,42 +121,41 @@ class _SymLayoutMetaBase(metaclass=_LayoutMeta):
 
     @classmethod
     def region_names(cls) -> tuple:
-        """Region field names, as declared -- available without a config (dims don't affect names)."""
+        """Region field names, in declaration order."""
         return tuple(spec.name for spec in cls._region_specs)
 
     @classmethod
-    def placed_regions(cls, cfg):
-        """Every region resolved to its 256B-aligned offset for ``cfg`` (declaration order).
-
-        ``cfg`` is any object exposing the shape dims as attributes (the owning SymmBuffer).
-        """
+    def placed_regions(cls):
+        """Regions resolved to 256B-aligned byte offsets (declaration order)."""
         placed, cursor = [], 0
         for spec in cls._region_specs:
-            cursor = align_up(cursor, HEAP_ALIGN)
-            numel = spec.numel(cfg)
-            shape = spec.shape(cfg) if spec.shape is not None else (numel,)
-            nbytes = numel * spec.dtype.itemsize
-            placed.append(PlacedRegion(spec.name, cursor, spec.dtype, shape, nbytes))
+            cursor = align_up(cursor, BLOCK_M)
+            nbytes = spec.numel * spec.dtype.itemsize
+            placed.append(PlacedRegion(spec.name, cursor, spec.dtype, spec.shape, nbytes))
             cursor += nbytes
         return tuple(placed)
 
     @classmethod
-    def num_nbytes(cls, cfg) -> int:
-        """Total 256B-aligned heap size for ``cfg``, for allocation."""
-        last = cls.placed_regions(cfg)[-1]
-        return align_up(last.offset + last.nbytes, HEAP_ALIGN)
+    def num_nbytes(cls) -> int:
+        """Total 256B-aligned heap size, for allocation."""
+        last = cls.placed_regions()[-1]
+        return align_up(last.offset + last.nbytes, BLOCK_M)
 
     @classmethod
-    def split_buffer(cls, buffer: "torch.Tensor", cfg):
-        """Split a flat int8 IPC heap into one non-owning tensor per region.
+    def describe(cls) -> str:
+        """Human-readable dump of the resolved heap layout (region / offset / bytes) -- for debugging IPC memory."""
+        lines = [f"{cls.__name__} heap layout ({cls.num_nbytes()} bytes total):"]
+        for p in cls.placed_regions():
+            lines.append(f"  {p.name:<24} @ {p.offset:>10}  {p.nbytes:>12} B  {p.dtype} {tuple(p.shape)}")
+        return "\n".join(lines)
 
-        Each view sits at its 256B-aligned offset, typed and reshaped to its region; each has its
-        own Storage (like get_buffer) so it aliases the heap without tripping torch alias checks.
-        """
+    @classmethod
+    def split_buffer(cls, buffer: "torch.Tensor"):
+        """Split a flat int8 IPC heap into one non-owning typed tensor view per region."""
         from primus_turbo.pytorch.core.symm_mem import _tensor_from_device_ptr
 
-        placed = cls.placed_regions(cfg)
-        total_bytes = cls.num_nbytes(cfg)
+        placed = cls.placed_regions()
+        total_bytes = cls.num_nbytes()
         buffer_nbytes = buffer.numel() * buffer.element_size()
         assert buffer_nbytes >= total_bytes, f"buffer too small: {buffer_nbytes} < {total_bytes} bytes"
         base_addr, device_index = buffer.data_ptr(), buffer.device.index
@@ -122,35 +165,43 @@ class _SymLayoutMetaBase(metaclass=_LayoutMeta):
         return _region_views_type(cls.region_names())(*views)
 
 
-class SymLayoutMeta(_SymLayoutMetaBase):
-    """The symmetric-memory heap layout -- the single source of truth for regions (name, dtype, size)."""
+@lru_cache(maxsize=None)
+def make_sym_layout_meta(token_dtype: torch.dtype, layout_config: LayoutConfig):
+    """Build the heap-layout meta for a token dtype + a concrete LayoutConfig.
 
-    dispatch_token_pool = RegionSpec(
-        TOKEN_DTYPE, lambda c: c.num_max_pool_tokens * c.hidden, lambda c: (c.num_max_pool_tokens, c.hidden)
-    )
-    expert_count_buffer = RegionSpec(torch.int32, lambda c: c.num_ranks * c.num_experts)
-    signal = RegionSpec(torch.int32, lambda c: c.num_ranks)
-    pool_src_rank = RegionSpec(torch.int32, lambda c: c.num_max_pool_tokens)
-    pool_src_slot = RegionSpec(torch.int32, lambda c: c.num_max_pool_tokens)
-    weight_recv_buf = RegionSpec(torch.float32, lambda c: c.num_max_pool_tokens)
-    combine_gate = RegionSpec(
-        torch.float32, lambda c: c.num_combine_slots, lambda c: (c.num_max_tokens_per_rank, c.num_topk)
-    )
-    meta_scalars = RegionSpec(torch.int32, lambda c: 8)
-    grid_sync_count = RegionSpec(torch.int32, lambda c: 2)
-    l2_token_buffer = RegionSpec(
-        TOKEN_DTYPE, lambda c: c.num_max_pool_tokens * c.hidden, lambda c: (c.num_max_pool_tokens, c.hidden)
-    )
-    dispatch_flag = RegionSpec(torch.int64, lambda c: 2 * c.num_max_pool_blocks)
-    combine_flag = RegionSpec(torch.int64, lambda c: 2 * c.num_max_pool_blocks)
-    combine_token_buffer = RegionSpec(
-        TOKEN_DTYPE, lambda c: c.num_combine_slots * c.hidden, lambda c: (c.num_combine_slots, c.hidden)
-    )
-    reduce_flag = RegionSpec(torch.int64, lambda c: 2 * c.num_combine_slots)
-    # combine recv-segment table: one entry per (local_expert, source_rank).
-    combine_recv_dst_rank = RegionSpec(torch.int32, lambda c: c.num_experts)
-    combine_recv_start_row = RegionSpec(torch.int32, lambda c: c.num_experts)
-    combine_recv_count = RegionSpec(torch.int32, lambda c: c.num_experts)
+    Every region shape reads its dims from ``cfg`` directly (e.g. ``cfg.num_max_pool_tokens``) --
+    no magic strings, so a reader sees exactly which LayoutConfig dim sizes each region. The three
+    token buffers follow ``token_dtype``; every other region has a fixed dtype. Declaration
+    order == memory order.
+    """
+    cfg = layout_config
+
+    # regular class body: the metaclass collects RegionSpecs in declaration order (== memory order)
+    class SymLayoutMeta(_SymLayoutMetaBase):
+        # token buffers: dtype follows the template parameter
+        dispatch_token_pool = RegionSpec(token_dtype, (cfg.num_max_pool_tokens, cfg.hidden))
+        expert_count_buffer = RegionSpec(torch.int32, (cfg.num_ranks, cfg.num_experts))
+        signal = RegionSpec(torch.int32, (cfg.num_ranks,))
+        pool_src_rank = RegionSpec(torch.int32, (cfg.num_max_pool_tokens,))
+        pool_src_slot = RegionSpec(torch.int32, (cfg.num_max_pool_tokens,))
+        weight_recv_buf = RegionSpec(torch.float32, (cfg.num_max_pool_tokens,))
+        combine_gate = RegionSpec(torch.float32, (cfg.num_max_tokens_per_rank, cfg.num_topk))
+        meta_scalars = RegionSpec(torch.int32, (8,))
+        grid_sync_count = RegionSpec(torch.int32, (2,))
+        l2_token_buffer = RegionSpec(token_dtype, (cfg.num_max_pool_tokens, cfg.hidden))
+        # flags: double-buffered, flat 1-D (host slices two banks of X out of 2*X)
+        dispatch_flag = RegionSpec(torch.int64, (2 * cfg.num_max_pool_blocks,))
+        combine_flag = RegionSpec(torch.int64, (2 * cfg.num_max_pool_blocks,))
+        combine_token_buffer = RegionSpec(token_dtype, (cfg.num_combine_slots, cfg.hidden))
+        reduce_flag = RegionSpec(torch.int64, (2 * cfg.num_combine_slots,))
+        # combine recv-segment table: one entry per (local_expert, source_rank)
+        combine_recv_dst_rank = RegionSpec(torch.int32, (cfg.num_experts,))
+        combine_recv_start_row = RegionSpec(torch.int32, (cfg.num_experts,))
+        combine_recv_count = RegionSpec(torch.int32, (cfg.num_experts,))
+
+    SymLayoutMeta.token_dtype = token_dtype
+    SymLayoutMeta.cfg = cfg
+    return SymLayoutMeta
 
 
 # --- SymLayout: the flydsl kernel handle over an allocated heap -----------------
@@ -158,9 +209,7 @@ class SymLayoutMeta(_SymLayoutMetaBase):
 
 @struct
 class SymLayout:
-    """Kernel handle over an allocated heap: an offsets table + this rank + the Constexpr shape
-    dims. :func:`make_sym_layout_type` extends a copy of this with one Int64 pointer field per
-    heap region; kernels annotate with this base type (ABI keys off the actual value's type)."""
+    """Kernel handle over a heap: offsets table + rank + Constexpr shape dims (region ptrs added by make_sym_layout_type)."""
 
     offsets_ptr: Int64
     rank_idx: Int32
@@ -188,8 +237,7 @@ SymLayout.map = lambda self, ptr, dst_rank: sym_map(self, ptr, dst_rank)
 
 @lru_cache(maxsize=None)
 def make_sym_layout_type(region_names: tuple):
-    """Extend the base SymLayout with one Int64 field per region (each holds its absolute
-    ``base + offset`` pointer, read in a kernel as ``sym_layout.<region>``)."""
+    """Extend base SymLayout with one Int64 base+offset pointer field per region."""
     fields = [slice(fd.name, fd.type_spec) for fd in SymLayout.__dsl_field_defs__]
     fields += [slice(name, Int64) for name in region_names]
     layout_type = struct[tuple(fields)]
@@ -209,10 +257,13 @@ class SymmBuffer:
         num_topk,
         hidden,
         intermediate_hidden,
+        token_dtype=TOKEN_DTYPE,
     ):
         self.group = group
         self.rank = group.rank()
         self.world = group.size()
+        self.token_dtype = token_dtype
+        # dtype is part of the identity: a different token dtype needs a different heap
         self.key = (
             self.world,
             int(num_experts),
@@ -220,57 +271,49 @@ class SymmBuffer:
             int(num_topk),
             int(hidden),
             int(intermediate_hidden),
+            token_dtype,
         )
 
         # lazy import to avoid a circular import at module load time
         from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
-        # shape dims (raw + derived); the region size lambdas and the SymLayout read these off self
-        assert num_experts % self.world == 0, f"num_experts {num_experts} not divisible by ranks {self.world}"
-        self.block_m = BLOCK_M
-        self.num_ranks = self.world
-        self.num_experts = int(num_experts)
-        self.num_experts_per_rank = self.num_experts // self.world
-        self.num_max_tokens_per_rank = int(num_max_tokens_per_rank)
-        self.num_topk = int(num_topk)
-        self.hidden = int(hidden)
-        self.intermediate_hidden = int(intermediate_hidden)
-        self.num_max_pool_tokens = get_num_max_pool_tokens(
-            self.world, self.num_max_tokens_per_rank, self.num_topk, self.num_experts_per_rank
+        # pure layout config: single source of truth for every region dim
+        self.cfg = LayoutConfig.build(
+            num_ranks=self.world,
+            num_experts=int(num_experts),
+            num_max_tokens_per_rank=int(num_max_tokens_per_rank),
+            num_topk=int(num_topk),
+            hidden=int(hidden),
+            intermediate_hidden=int(intermediate_hidden),
         )
-        self.num_max_pool_blocks = self.num_max_pool_tokens // BLOCK_M
-        self.num_combine_slots = self.num_max_tokens_per_rank * self.num_topk
-        self.num_tokens = self.num_max_tokens_per_rank  # back-compat alias
+        # dtype-templated heap layout built from cfg (token buffers follow token_dtype)
+        self.meta = make_sym_layout_meta(token_dtype, self.cfg)
+        # expose dims as attributes for back-compat consumers (symm.hidden, symm.num_max_pool_tokens, ...)
+        self.block_m = BLOCK_M
+        self.num_ranks = self.cfg.num_ranks
+        self.num_experts = self.cfg.num_experts
+        self.num_experts_per_rank = self.cfg.num_experts_per_rank
+        self.num_max_tokens_per_rank = self.cfg.num_max_tokens_per_rank
+        self.num_topk = self.cfg.num_topk
+        self.hidden = self.cfg.hidden
+        self.intermediate_hidden = self.cfg.intermediate_hidden
+        self.num_max_pool_tokens = self.cfg.num_max_pool_tokens
+        self.num_max_pool_blocks = self.cfg.num_max_pool_blocks
+        self.num_combine_slots = self.cfg.num_combine_slots
+        self.num_tokens = self.cfg.num_max_tokens_per_rank  # back-compat alias
 
-        self.num_bytes = SymLayoutMeta.num_nbytes(self)
+        self.num_bytes = self.meta.num_nbytes()
 
-        # allocate the single IPC heap and zero it once
+        # allocate the single IPC heap (SymmetricMemory already memsets it to 0 on alloc)
         self.symm_mem = SymmetricMemory(group, alloc_size=self.num_bytes, signal_pad_size=0)
         heap = self.symm_mem.get_buffer(self.rank, (self.num_bytes,), torch.int8)
-        heap.zero_()
         self.group.barrier()
         torch.cuda.synchronize()
 
-        # split the heap into named region views (declaration order == memory order)
-        (
-            self.dispatch_token_pool,
-            self.expert_count_buffer,
-            self.signal,
-            self.pool_src_rank,
-            self.pool_src_slot,
-            self.weight_recv_buf,
-            self.combine_gate,
-            self.meta_scalars,
-            self.grid_sync_count,
-            self.l2_token_buffer,
-            self.dispatch_flag,
-            self.combine_flag,
-            self.combine_token_buffer,
-            self.reduce_flag,
-            self.combine_recv_dst_rank,
-            self.combine_recv_start_row,
-            self.combine_recv_count,
-        ) = SymLayoutMeta.split_buffer(heap, self)
+        # split the heap into named region views and bind by name (no positional coupling)
+        views = self.meta.split_buffer(heap)
+        for name in self.meta.region_names():
+            setattr(self, name, getattr(views, name))
 
         self.num_tokens_per_rank = torch.full(
             (self.world,), self.num_tokens, dtype=torch.int32, device="cuda"
@@ -311,8 +354,8 @@ class SymmBuffer:
 
         # extend the base SymLayout with this heap's regions, then fill dims + region base pointers
         base = main[self.rank]
-        region_ptrs = {p.name: Int64(base + int(p.offset)) for p in SymLayoutMeta.placed_regions(self)}
-        layout_type = make_sym_layout_type(SymLayoutMeta.region_names())
+        region_ptrs = {p.name: Int64(base + int(p.offset)) for p in self.meta.placed_regions()}
+        layout_type = make_sym_layout_type(self.meta.region_names())
         self._sym_layout = layout_type(
             offsets_ptr=Int64(self._main_delta.data_ptr()),
             rank_idx=Int32(self.rank),
@@ -338,14 +381,26 @@ class SymmBuffer:
             f"{self.num_max_pool_tokens}; raise pool policy"
         )
 
+    def describe(self) -> str:
+        """Dump this heap's resolved region layout (offsets / bytes) -- for debugging IPC memory."""
+        return self.meta.describe()
+
+    def __repr__(self) -> str:
+        return (
+            f"SymmBuffer(rank={self.rank}/{self.world}, num_experts={self.num_experts}, "
+            f"num_max_tokens_per_rank={self.num_max_tokens_per_rank}, num_topk={self.num_topk}, "
+            f"hidden={self.hidden}, num_max_pool_tokens={self.num_max_pool_tokens}, "
+            f"num_bytes={self.num_bytes})"
+        )
+
     def destroy(self):
         global _CURRENT_SYMM_BUFFER
         if _CURRENT_SYMM_BUFFER is self:
             _CURRENT_SYMM_BUFFER = None
         try:
             self.symm_mem.destroy()
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.warn(f"SymmBuffer.destroy: symm_mem teardown failed: {e}")
 
 
 _CURRENT_SYMM_BUFFER = None
@@ -359,12 +414,11 @@ def get_symm_buffer_for_mega_moe(
     num_topk=None,
     hidden=None,
     intermediate_hidden=None,
-    block_m=256,  # accepted for backward-compat; pool sizing is fixed policy
-    block_n=256,
-    pool_mult=2,
+    token_dtype=TOKEN_DTYPE,  # dispatched-token dtype: bf16 (default) or fp8
 ) -> SymmBuffer:
 
     global _CURRENT_SYMM_BUFFER
+    # note: block sizes are a fixed policy (BLOCK_M/BLOCK_N == 256), not a per-call knob
     if group is None:
         if _CURRENT_SYMM_BUFFER is None:
             raise RuntimeError(
@@ -379,6 +433,7 @@ def get_symm_buffer_for_mega_moe(
         int(num_topk),
         int(hidden),
         int(intermediate_hidden),
+        token_dtype,
     )
     symm = _CURRENT_SYMM_BUFFER
     if symm is None or symm.group is not group or symm.key != key:
@@ -391,6 +446,7 @@ def get_symm_buffer_for_mega_moe(
             num_topk=num_topk,
             hidden=hidden,
             intermediate_hidden=intermediate_hidden,
+            token_dtype=token_dtype,
         )
         _CURRENT_SYMM_BUFFER = symm
     return symm

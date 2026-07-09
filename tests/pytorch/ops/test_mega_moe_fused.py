@@ -163,31 +163,36 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
     )
     def test_forward(self, hidden, inter, num_experts, num_topk, num_tokens):
         self._init_process()
-        group = dist.group.WORLD
-        x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
-            num_tokens, hidden, inter, num_experts, num_topk
-        )
-        symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
-
-        with torch.no_grad():
-            y_mega = mega_moe_fused(group, x, topk_idx, topk_weight, l1_weight, l2_weight)
-            y_turbo = baseline_reference(
-                group,
-                x,
-                topk_idx,
-                topk_weight,
-                l1_weight,
-                l2_weight,
-                num_experts=num_experts,
-                num_topk=num_topk,
+        symm = None
+        try:
+            group = dist.group.WORLD
+            x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
+                num_tokens, hidden, inter, num_experts, num_topk
             )
-        torch.cuda.synchronize()
-        group.barrier()
-        symm.assert_capacity()
+            symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
 
-        self._assert_snr(y_mega, y_turbo, tag="forward")
-        symm.destroy()
-        dist.destroy_process_group()
+            with torch.no_grad():
+                y_mega = mega_moe_fused(group, x, topk_idx, topk_weight, l1_weight, l2_weight)
+                y_turbo = baseline_reference(
+                    group,
+                    x,
+                    topk_idx,
+                    topk_weight,
+                    l1_weight,
+                    l2_weight,
+                    num_experts=num_experts,
+                    num_topk=num_topk,
+                )
+            torch.cuda.synchronize()
+            group.barrier()
+            symm.assert_capacity()
+
+            self._assert_snr(y_mega, y_turbo, tag="forward")
+        finally:
+            # release symm buffer + PG even on assertion failure
+            if symm is not None:
+                symm.destroy()
+            dist.destroy_process_group()
 
     # ── backward: dl1 / dl2 / d_topk_weight vs reference (dx reported, see note) ──
     @skip_if_lt_x_gpu(8)
@@ -199,45 +204,52 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
     )
     def test_backward(self, hidden, inter, num_experts, num_topk, num_tokens):
         self._init_process()
-        group = dist.group.WORLD
-        x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
-            num_tokens, hidden, inter, num_experts, num_topk
-        )
-        symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
-        grad_y = torch.randn((num_tokens, hidden), device=self.device, dtype=torch.bfloat16)
+        symm = None
+        try:
+            group = dist.group.WORLD
+            x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
+                num_tokens, hidden, inter, num_experts, num_topk
+            )
+            symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
+            grad_y = torch.randn((num_tokens, hidden), device=self.device, dtype=torch.bfloat16)
 
-        # fused op grads
-        x_m = x.detach().requires_grad_(True)
-        l1_m = l1_weight.detach().requires_grad_(True)
-        l2_m = l2_weight.detach().requires_grad_(True)
-        tw_m = topk_weight.detach().requires_grad_(True)
-        y_m = mega_moe_fused(group, x_m, topk_idx, tw_m, l1_m, l2_m)
-        dx_m, dl1_m, dl2_m, dtw_m = torch.autograd.grad(y_m, [x_m, l1_m, l2_m, tw_m], grad_y)
+            # fused op grads
+            x_m = x.detach().requires_grad_(True)
+            l1_m = l1_weight.detach().requires_grad_(True)
+            l2_m = l2_weight.detach().requires_grad_(True)
+            tw_m = topk_weight.detach().requires_grad_(True)
+            y_m = mega_moe_fused(group, x_m, topk_idx, tw_m, l1_m, l2_m)
+            dx_m, dl1_m, dl2_m, dtw_m = torch.autograd.grad(y_m, [x_m, l1_m, l2_m, tw_m], grad_y)
 
-        # turbo reference grads: topk_weight flows through scatter, so dtw is compared directly
-        x_t = x.detach().requires_grad_(True)
-        l1_t = l1_weight.detach().requires_grad_(True)
-        l2_t = l2_weight.detach().requires_grad_(True)
-        tw_t = topk_weight.detach().requires_grad_(True)
-        y_t = baseline_reference(
-            group,
-            x_t,
-            topk_idx,
-            tw_t,
-            l1_t,
-            l2_t,
-            num_experts=num_experts,
-            num_topk=num_topk,
-        )
-        dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
+            # turbo reference grads: topk_weight flows through scatter, so dtw is compared directly
+            x_t = x.detach().requires_grad_(True)
+            l1_t = l1_weight.detach().requires_grad_(True)
+            l2_t = l2_weight.detach().requires_grad_(True)
+            tw_t = topk_weight.detach().requires_grad_(True)
+            y_t = baseline_reference(
+                group,
+                x_t,
+                topk_idx,
+                tw_t,
+                l1_t,
+                l2_t,
+                num_experts=num_experts,
+                num_topk=num_topk,
+            )
+            dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
 
-        # dx reported but not asserted: known pre-existing dispatch<->combine dx bug vs turbo
-        self._snr(dx_m, dx_t, tag="dx (reported only)")
-        self._assert_snr(dl1_m, dl1_t, tag="dl1_weight")
-        self._assert_snr(dl2_m, dl2_t, tag="dl2_weight")
-        self._assert_snr(dtw_m, dtw_t, tag="dtw")
-        symm.destroy()
-        dist.destroy_process_group()
+            # dx now asserted: the dispatch<->combine dx discrepancy was root-caused to a
+            # stale-L2 read in the combine gate path and fixed in ep_intranode (glc|slc on the
+            # gate store/load). Routing here is balanced (random top-k), where dx is solid.
+            self._assert_snr(dx_m, dx_t, tag="dx")
+            self._assert_snr(dl1_m, dl1_t, tag="dl1_weight")
+            self._assert_snr(dl2_m, dl2_t, tag="dl2_weight")
+            self._assert_snr(dtw_m, dtw_t, tag="dtw")
+        finally:
+            # release symm buffer + PG even on assertion failure
+            if symm is not None:
+                symm.destroy()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

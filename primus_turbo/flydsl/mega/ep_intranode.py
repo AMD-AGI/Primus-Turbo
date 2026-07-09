@@ -1,4 +1,3 @@
-import os
 from typing import Optional
 
 import flydsl.expr as fx
@@ -27,8 +26,6 @@ _BLOCK_THREADS = 512
 _PVEC = 8
 _NUM_WARPS = _BLOCK_THREADS // _WARP
 _L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invalidate)
-# DIAG ONLY (breaks correctness): dst_off=row (contiguous) instead of slot -> isolate remote-write scatter cost
-_COMB_CONTIG_DIAG = os.environ.get("MEGA_COMB_CONTIG_DIAG", "0") == "1"
 
 
 @ASTRewriter.transform
@@ -88,8 +85,7 @@ def dispatch_bf16_tile(
                 if disp_parity is None
                 else disp_parity * fx.Int32(int(sym_layout.num_max_pool_blocks))
             )
-            # DeepEP parity: every (source,expert) task (incl. zero-token) bumps the dst expert
-            # counter +1 -> each expert accumulates exactly `world` per launch (host-predictable).
+            # DeepEP parity: each task bumps dst expert counter +1 (host-predictable)
             local_expert = task_index // fx.Int32(num_ranks)
             atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
 
@@ -109,9 +105,7 @@ def combine_bf16_tile(
     bank_offset: Optional[fx.Int32] = None,
     with_gate: bool = False,
 ):
-    # Task-based combine push: one recv-segment = contiguous same-origin rows ->
-    # a warp sustains ONE peer's XGMI link (mirror of dispatch_bf16_tile). dst_slot
-    # per row is still scattered (pool_src_slot), but that costs <2% (diag).
+    # Task-based combine push: one warp sustains one peer's XGMI link (scattered dst_slot)
     out_features = int(sym_layout.hidden)
     n_slots = int(sym_layout.num_combine_slots)
     comb_records = n_slots * out_features * 2
@@ -134,15 +128,13 @@ def combine_bf16_tile(
     for i in range(local_count):
         row = start_row + warp_id + i * fx.Int32(_NUM_WARPS)
         slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
-        # DIAG: contiguous dst (row % n_slots) to measure the dst-scatter ceiling
-        dst_slot = (row % fx.Int32(n_slots)) if const_expr(_COMB_CONTIG_DIAG) else slot
         copy_warp(
             comb_addr,
             l2_ptr,
             full_bytes,
-            dst_off=dst_slot * fx.Int32(row_words),
+            dst_off=slot * fx.Int32(row_words),
             src_off=row * fx.Int32(row_words),
-            store_cache=3,  # glc|slc: L1+L2 bypass for cross-rank combine push
+            store_cache_modifier=3,  # glc|slc: L1+L2 bypass for cross-rank combine push
         )
         if const_expr(tail_cols):
             oob_index = fx.Int32(n_slots) * fx.Int32(out_features)
@@ -162,7 +154,7 @@ def combine_bf16_tile(
             gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
             gate_addr = sym_map(sym_layout, sym_layout.combine_gate, dst_rank)
             gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
-            buffer_store(gate_value, gate_peer, slot)
+            buffer_store(gate_value, gate_peer, slot, cache_modifier=3)  # glc|slc: match token push
         if const_expr(signal):
             bank = fx.Int32(0) if bank_offset is None else bank_offset
             barrier_addr = sym_map(sym_layout, sym_layout.reduce_flag, dst_rank)
@@ -211,6 +203,9 @@ def topk_reduce_bf16_tile(
                     if topk_index < fx.Int64(num_experts):
                         if lane_id == fx.Int32(0):
                             spin_start = read_clock()
+                            # TODO(author): reduce_flag is written scope="sys" by combine_bf16_tile
+                            # but read scope="agent" here. Keeping agent (proven working); raising to
+                            # sys deadlocks autotune on gfx950 -- confirm the intended scope on hardware.
                             flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
                             while flag != epoch:
                                 fx.rocdl.s_sleep(fx.Int32(1))
@@ -230,6 +225,7 @@ def topk_reduce_bf16_tile(
                                         epoch,
                                     )
                                     spin_start = read_clock()
+                                # re-read the flag each spin iteration (MUST stay inside the while)
                                 flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
             _wait_mem()
 
@@ -269,7 +265,9 @@ def topk_reduce_bf16_tile(
                 slot = token * fx.Int32(topk) + fx.Int32(j)
                 topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
                 if lane_id == fx.Int32(0):
-                    gate_v = buffer_load(gate_local_res, slot, vec_width=1, dtype=fx.T.f32())
+                    gate_v = buffer_load(
+                        gate_local_res, slot, vec_width=1, dtype=fx.T.f32(), cache_modifier=3
+                    )  # glc|slc: avoid stale L2 on slot reuse (match token read)
                     zero_f = fx.Float32(0.0)
                     v1 = fx.arith.select(topk_index < fx.Int64(num_experts), gate_v, zero_f)
                     d_val = fx.arith.select(topk_index >= fx.Int64(0), v1, zero_f)

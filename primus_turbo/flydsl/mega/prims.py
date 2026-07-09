@@ -1,13 +1,9 @@
-from typing import Callable, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm
-from flydsl.compiler.ast_rewriter import (
-    InsertEmptyYieldForSCFFor,
-    ReplaceIfWithDispatch,
-)
 from flydsl.expr import range_constexpr
 from flydsl.expr.buffer_ops import (
     _create_i32_constant,
@@ -23,20 +19,6 @@ from flydsl.expr.buffer_ops import (
 _WARP = 64
 _COPY_VEC_I32 = 4  # 4 i32 = 16 B (b128) per lane per step
 _I32_BYTES = 4  # word stride: i32-word offset -> byte address
-_COPY_LOAD_CACHE = 1  # streaming (NT) load hint for the warp copy
-
-
-def _emit_for(stop: Union[int, fx.ArithValue], body: Callable[[fx.ArithValue], None]) -> None:
-    # Runtime `for i in range(stop): body(i)` (scf.for) from a non-rewritten helper.
-    InsertEmptyYieldForSCFFor.scf_for_dispatch(
-        fx.Int32(0), stop, fx.Int32(1), lambda iv, _names: body(fx.arith.ArithValue(iv, signed=True))
-    )
-
-
-def _emit_if_then(cond: fx.ArithValue, then_fn: Callable[[], None]) -> None:
-    # Dynamic `if cond: then_fn()` (the body-only AST rewrite's primitive).
-    ReplaceIfWithDispatch.scf_if_dispatch(cond, then_fn)
-
 
 # Watchdog budget for cross-rank / grid spin loops (realtime clock cycles).
 SPIN_TIMEOUT_CYCLES = 3_000_000_000
@@ -55,6 +37,38 @@ def spin_timed_out(spin_start: fx.ArithValue, timeout: int = SPIN_TIMEOUT_CYCLES
     # The loop itself can't live here: the AST rewriter must see the while/if
     # control flow inline, and spin_start is loop-carried.
     return (read_clock() - spin_start) > fx.Int64(timeout)
+
+
+def cast(val: Union[int, fx.ArithValue], dtype) -> fx.ArithValue:
+    # Cast a scalar to dtype, picking the right widen/narrow/convert op.
+    if hasattr(dtype, "ir_type"):
+        dtype = dtype.ir_type
+    signed = getattr(val, "signed", True)
+    src = _as_value(val)  # bare python int -> i32 constant
+    src_ty = src.type
+    if src_ty == dtype:
+        return fx.arith.ArithValue(src, signed=signed)
+
+    src_int, dst_int = isinstance(src_ty, ir.IntegerType), isinstance(dtype, ir.IntegerType)
+    src_idx, dst_idx = isinstance(src_ty, ir.IndexType), isinstance(dtype, ir.IndexType)
+    src_flt, dst_flt = isinstance(src_ty, ir.FloatType), isinstance(dtype, ir.FloatType)
+
+    if src_idx or dst_idx:
+        op = std_arith.IndexCastOp(dtype, src)
+    elif src_int and dst_int:
+        if dtype.width > src_ty.width:
+            op = (std_arith.ExtSIOp if signed else std_arith.ExtUIOp)(dtype, src)
+        else:
+            op = std_arith.TruncIOp(dtype, src)
+    elif src_flt and dst_flt:
+        op = (std_arith.ExtFOp if dtype.width > src_ty.width else std_arith.TruncFOp)(dtype, src)
+    elif src_int and dst_flt:
+        op = (std_arith.SIToFPOp if signed else std_arith.UIToFPOp)(dtype, src)
+    elif src_flt and dst_int:
+        op = (std_arith.FPToSIOp if signed else std_arith.FPToUIOp)(dtype, src)
+    else:
+        raise ValueError(f"cannot cast {src_ty} to {dtype}")
+    return fx.arith.ArithValue(op.result, signed=signed)
 
 
 _ADDR_SPACES = {"global": 1, "gmem": 1, "lds": 3, "shared": 3, "smem": 3}
@@ -248,7 +262,8 @@ def copy_warp(
     nbytes: int,
     dst_off: Union[int, fx.ArithValue] = 0,
     src_off: Union[int, fx.ArithValue] = 0,
-    store_cache: int = 0,
+    load_cache_modifier: int = 1,
+    store_cache_modifier: int = 0,
 ) -> None:
     def _addr_i64(addr: Union[int, fx.ArithValue]) -> fx.ArithValue:
         if isinstance(addr, int):
@@ -276,9 +291,9 @@ def copy_warp(
     offs = [fx.Int32(c * cols) + lane_off for c in range_constexpr(nbytes // 4 // cols)]
     vals = [
         buffer_load(
-            src, src_off + o, vec_width=_COPY_VEC_I32, dtype=fx.T.i32(), cache_modifier=_COPY_LOAD_CACHE
+            src, src_off + o, vec_width=_COPY_VEC_I32, dtype=fx.T.i32(), cache_modifier=load_cache_modifier
         )
         for o in offs
     ]
     for o, v in zip(offs, vals):
-        buffer_store(v, dst, dst_off + o, cache_modifier=store_cache)
+        buffer_store(v, dst, dst_off + o, cache_modifier=store_cache_modifier)
