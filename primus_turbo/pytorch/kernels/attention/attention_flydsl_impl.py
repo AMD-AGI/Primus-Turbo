@@ -207,8 +207,16 @@ def _attention_flydsl_forward_impl_fake(
 
 
 def _get_bwd_launchers(num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_scale):
-    """Build (once, per head config) the two deterministic split-backward launchers:
-    fused dQ+delta (Q-outer, one S/P/dP pass) and dK/dV (KV-outer)."""
+    """Build (once, per head config) the three deterministic split-backward launchers:
+    delta (Q-outer sum_j P.dP), dQ (Q-outer) and dK/dV (KV-outer).
+
+    dQ uses the CK/aiter-consistent path: dS = P .* (dP - delta) is formed in fp32
+    (the near-diagonal cancellation happens before any narrowing), then packed to a
+    SINGLE bf16 operand for the dQ = dS @ K MFMA with an fp32 accumulator -- i.e. the
+    whole backward is bf16-in / fp32-accumulate, matching the reference backends. This
+    replaces the earlier fused A - delta*B kernel that fed fp16 (tf32-mantissa) MFMA
+    operands to survive the cancellation; the split form keeps the cancellation in
+    fp32 so bf16 operands suffice and no fp16 (or the fp16 K copy) is needed."""
     key = (num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_scale)
     launchers = _BWD_LAUNCHER_CACHE.get(key)
     if launchers is None:
@@ -220,31 +228,26 @@ def _get_bwd_launchers(num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_
             sm_scale=sm_scale,
             num_kv_heads=num_kv_heads,
         )
-        # Fused dQ+delta computes S/P/dP once (removing the standalone delta kernel's
-        # whole exp2 pass) via dQ = sm*(A - delta*B) with single-fp16 A/B operands
-        # (10-bit mantissa = tf32, enough for the near-diagonal dS cancellation; half
-        # the double-bf16 pack+MFMA cost). The extra A/B accumulators raise VGPR
-        # (~occ 3->2), so waves_per_eu=2 keeps the 256-VGPR occ-2 ceiling and avoids
-        # spill; dkdv stays at its default 2.
-        # fast_exp2=True: recompute P with crude Schraudolph 2^x AND renormalize
-        # P = P~/rowsum(P~) in the epilogue. The renorm makes sum_j P=1 exact, so the
-        # near-diagonal dS cancellation (dq) is decoupled from the exp approximation
-        # (Schraudolph is non-multiplicative -> without renorm dq flips to cos -0.16).
-        # This cuts the fused kernel's ~26% exp2 wall time; the delta it writes for
-        # dkdv is the renormalized (true) delta.
-        fused_launch = build_flash_attn_bwd_module(
-            mode="fused_dq_delta", waves_per_eu=2, fast_exp2=True, **common
+        # delta[b,hq,s] = sum_j P.dP (consistent fp32 P recomputed from LSE). With
+        # fast_exp2 the recompute is the unnormalized Schraudolph P~, so the kernel
+        # also sums R = sum_j P~ and writes the renormalized true delta = (sum_j
+        # P~.dP)/R (negated, for dkdv's accumulator fold). The dQ kernel recomputes
+        # the same P~/R bit-identically, so its dS cancellation stays exact.
+        delta_launch = build_flash_attn_bwd_module(
+            mode="delta", fast_exp2=True, **common
         )
+        # dQ = sm/R * sum_j dS~_j @ K with dS~ = P~ .* (dP - delta_true) formed in
+        # fp32 then truncated to a single bf16 operand (CK/aiter dtype: bf16 MFMA in,
+        # fp32 accumulate). inv_r = 1/rowsum(P~) is applied once in the epilogue.
+        dq_launch = build_flash_attn_bwd_module(mode="dq", fast_exp2=True, **common)
         # dkdv recomputes P with crude Schraudolph 2^x (fast_exp2): dK/dV have no
         # near-diagonal dS cancellation (dk/dv cos 0.9994 vs exact 0.99999, l2
         # 0.018 << 0.05 gate, s8192-verified), so trading exact exp2 for 3 full-
-        # rate VALU ops cuts dkdv's ~18% exp2 wall time. NOT applied to fwd/dq:
-        # their LSE-normalized near-diagonal dq needs sum_j P_ij=1 to fp precision
-        # and Schraudolph is non-multiplicative (would flip dq to cos -0.16).
+        # rate VALU ops cuts dkdv's ~18% exp2 wall time.
         dkdv_launch = build_flash_attn_bwd_dkdv_module(
             q_split=_DKDV_Q_SPLIT, fast_exp2=True, **common
         )
-        launchers = (fused_launch, dkdv_launch)
+        launchers = (delta_launch, dq_launch, dkdv_launch)
         _BWD_LAUNCHER_CACHE[key] = launchers
     return launchers, key
 
@@ -293,28 +296,23 @@ def attention_flydsl_backward_impl(
     # (lse*2^23 + bias); see _S23_SCALE/_S23_BIAS note above.
     lse_s23 = lse.mul(_S23_SCALE).add_(_S23_BIAS)
 
-    (fused_launch, dkdv_launch), key = _get_bwd_launchers(
+    (delta_launch, dq_launch, dkdv_launch), key = _get_bwd_launchers(
         Hq, Hkv, D, bool(causal), _dtype_str(q.dtype), float(softmax_scale)
     )
 
-    # delta[B,Hq,S] fp32 is a shared scratch: the fused kernel writes the consistent
-    # fp32 sum_j P.dP (same recomputed P as dQ) that dK/dV reads, so all see the same
-    # dS -> exact near-diagonal cancellation. NOTE: the cheap identity delta_i =
-    # rowsum(dO_i . O_i) is mathematically exact but its bf16-epsilon mismatch with the
-    # MFMA-recomputed P.dP breaks the per-row cancellation, so it is not used.
+    # delta[B,Hq,S] fp32 is a shared scratch: the delta kernel writes the consistent
+    # fp32 (renormalized) sum_j P.dP (same recomputed P~/R as dQ) that both dQ and
+    # dK/dV read, so all see the same dS -> exact near-diagonal cancellation. NOTE:
+    # the cheap identity delta_i = rowsum(dO_i . O_i) is mathematically exact but its
+    # bf16-epsilon mismatch with the MFMA-recomputed P.dP breaks the per-row
+    # cancellation, so it is not used. It is stored negated (dkdv folds -delta into
+    # its dP accumulator; dQ adds it back: dP - delta_true = dP + delta_stored).
     delta = torch.empty((B, Hq, S), dtype=torch.float32, device=q.device)
     dq = torch.empty((B, S, Hq, D), dtype=q.dtype, device=q.device)
     # dK/dV are written into a per-split workspace [B, Q_SPLIT, S, Hkv, D]; the
     # split-K partials are reduced slot-wise below (fixed order -> deterministic).
     ws_dk = torch.empty((B, _DKDV_Q_SPLIT, S, Hkv, D), dtype=k.dtype, device=q.device)
     ws_dv = torch.empty((B, _DKDV_Q_SPLIT, S, Hkv, D), dtype=v.dtype, device=q.device)
-
-    # Dual-tile fp16 K: the fused kernel's GEMM2 A/B use fp16 MFMA. Pre-casting the
-    # small K tensor here (Hkv=8, ~8x smaller than Q) lets the kernel DMA a 2nd fp16
-    # K tile straight into LDS and drop the per-read in-loop bf16->fp16 conversion
-    # from the VALU-issue-bound loop. bf16->fp16 is exact-then-RNE, so the fp16 K is
-    # bit-identical to the in-kernel conversion -> numerically unchanged vs #1a.
-    k16 = k.to(torch.float16)
 
     stream = torch.cuda.current_stream()
     qf, kf, vf, dof, lse_s23f, deltaf = (
@@ -325,14 +323,25 @@ def attention_flydsl_backward_impl(
         lse_s23.view(-1),
         delta.view(-1),
     )
+    dqf = dq.view(-1)
 
-    # Fused: one S/P/dP pass emits both dQ and the fp32 delta for dkdv (deletes the
-    # standalone delta kernel's exp2 pass). Both kernels share the s23-prescaled LSE.
+    # The delta/dQ kernels share the flash_attn_bwd signature (Q,K,V,DO,LSE,DELTA,
+    # DQ,K16,...); the K16 fp16-tile slot is unused by these bf16-only modes, so the
+    # bf16 K buffer is passed as a harmless placeholder. delta must run first (dQ and
+    # dkdv both read its consistent -delta_true).
     _run_bwd(
-        fused_launch,
+        delta_launch,
         key,
-        "fused",
-        (qf, kf, vf, dof, lse_s23f, deltaf, dq.view(-1), k16.view(-1), B, S, stream),
+        "delta",
+        (qf, kf, vf, dof, lse_s23f, deltaf, dqf, kf, B, S, stream),
+        B,
+        S,
+    )
+    _run_bwd(
+        dq_launch,
+        key,
+        "dq",
+        (qf, kf, vf, dof, lse_s23f, deltaf, dqf, kf, B, S, stream),
         B,
         S,
     )

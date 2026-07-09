@@ -570,7 +570,11 @@ def build_flash_attn_bwd_module(
 
         # ---- Loop-carried init ----
         if const_expr(IS_DQ):
+            # dQ accumulators; +rowsum(P~) when fast_exp2 so the epilogue can
+            # renormalize dQ = sm/R * dQ~ (P~ is the unnormalized Schraudolph prob).
             init_args = [c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
+            if const_expr(fast_exp2):
+                init_args = init_args + [c_zero_f]
         elif const_expr(IS_FUSED):
             # [A_accs(D_CHUNKS), B_accs(D_CHUNKS), delta(, rowsum)] in one kv pass.
             # fast_exp2 adds a rowsum(P~) accumulator so the epilogue can renormalize
@@ -579,17 +583,26 @@ def build_flash_attn_bwd_module(
             if const_expr(fast_exp2):
                 init_args = init_args + [c_zero_f]
         else:
+            # delta mode: delta_acc; +rowsum(P~) when fast_exp2 (renorm to true delta).
             init_args = [c_zero_f]
+            if const_expr(fast_exp2):
+                init_args = init_args + [c_zero_f]
 
         def _kv_body(kv_start, inner_iter_args, apply_mask):
             if const_expr(IS_DQ):
                 dq_accs = [inner_iter_args[i] for i in range_constexpr(D_CHUNKS)]
+                if const_expr(fast_exp2):
+                    r_acc = inner_iter_args[D_CHUNKS]
             elif const_expr(IS_FUSED):
                 a_accs = [inner_iter_args[i] for i in range_constexpr(D_CHUNKS)]
                 b_accs = [inner_iter_args[D_CHUNKS + i] for i in range_constexpr(D_CHUNKS)]
                 delta_acc = inner_iter_args[2 * D_CHUNKS]
                 if const_expr(fast_exp2):
                     r_acc = inner_iter_args[2 * D_CHUNKS + 1]
+            elif const_expr(fast_exp2):
+                # delta mode + fast_exp2: [delta_acc, rowsum(P~)] (always a 2-list).
+                delta_acc = inner_iter_args[0]
+                r_acc = inner_iter_args[1]
             else:
                 # A single loop-carried value can arrive unwrapped (not a list).
                 delta_acc = (
@@ -646,6 +659,12 @@ def build_flash_attn_bwd_module(
                     p_hi.append(phi_r)
                 dp_lo = [Vec(dp_lo_acc)[r] for r in range_constexpr(16)]
                 dp_hi = [Vec(dp_hi_acc)[r] for r in range_constexpr(16)]
+                # rowsum(P~) for the fast_exp2 renorm (delta & dq share the recompute,
+                # so R is bit-identical between the two kernels -> exact cancellation).
+                if const_expr(fast_exp2):
+                    r_local = c_zero_f
+                    for r in range_constexpr(16):
+                        r_local = _fadd(r_local, _fadd(p_lo[r], p_hi[r]))
 
             # Build the loop-carried yield args conditionally, then yield ONCE at the
             # tail (a single scf.yield per loop body, mirroring the forward).
@@ -655,6 +674,9 @@ def build_flash_attn_bwd_module(
                     local = _fadd(local, _fmul(p_lo[r], dp_lo[r]))
                     local = _fadd(local, _fmul(p_hi[r], dp_hi[r]))
                 delta_acc = _fadd(delta_acc, local)
+                if const_expr(fast_exp2):
+                    r_acc = _fadd(r_acc, r_local)
+                    return [delta_acc, r_acc]
                 return [delta_acc]
             elif const_expr(IS_FUSED):
                 # One pass accumulates delta=sum_j P*dP, A=sum_j (P*dP)*K, B=sum_j P*K
@@ -715,11 +737,16 @@ def build_flash_attn_bwd_module(
                     _fused_yield = _fused_yield + [r_acc]
                 return _fused_yield
             else:
+                # dS = P~ .* (dP - delta_true). The delta buffer stores -delta_true
+                # (negated for dkdv's accumulator fold), so dP - delta_true = dP +
+                # delta_val. The subtraction is fp32 (near-diagonal cancellation done
+                # before the bf16 pack), so the dQ GEMM below is pure bf16 (CK-style:
+                # fp32 dS -> bf16 operand -> fp32 accumulate, no fp16 operand).
                 ds_lo = []
                 ds_hi = []
                 for r in range_constexpr(16):
-                    ds_lo.append(_fmul(p_lo[r], _fsub(dp_lo[r], delta_val)))
-                    ds_hi.append(_fmul(p_hi[r], _fsub(dp_hi[r], delta_val)))
+                    ds_lo.append(_fmul(p_lo[r], _fadd(dp_lo[r], delta_val)))
+                    ds_hi.append(_fmul(p_hi[r], _fadd(dp_hi[r], delta_val)))
                 ds_packs_lo = []
                 ds_packs_hi = []
                 for pks in range_constexpr(PV_K_STEPS):
@@ -738,6 +765,9 @@ def build_flash_attn_bwd_module(
                     if const_expr(si + 1 < TOTAL_PV):
                         k_lo_cur = k_lo_nxt
                         k_hi_cur = k_hi_nxt
+                if const_expr(fast_exp2):
+                    r_acc = _fadd(r_acc, r_local)
+                    return [dq_accs[i] for i in range_constexpr(D_CHUNKS)] + [r_acc]
                 return [dq_accs[i] for i in range_constexpr(D_CHUNKS)]
 
         # Split the causal kv-loop: [0, q_start) is fully below the diagonal (no
@@ -754,11 +784,25 @@ def build_flash_attn_bwd_module(
 
         # ---- Epilogue ----
         if const_expr(IS_DELTA):
-            delta_final = loop_results[0] if isinstance(loop_results, (list, tuple)) else loop_results
+            if const_expr(fast_exp2):
+                delta_final = loop_results[0]
+                r_final = loop_results[1]
+            else:
+                delta_final = (
+                    loop_results[0] if isinstance(loop_results, (list, tuple)) else loop_results
+                )
             delta_full = _fadd(delta_final, reduction_peer(delta_final))
+            # With fast_exp2 the recomputed P~ is the unnormalized Schraudolph prob
+            # (rowsum R != 1); renormalize to the true delta = (sum_j P~*dP)/R so the
+            # dq kernel's near-diagonal cancellation (which recomputes the same R) is
+            # exact. Store -delta so dkdv folds it straight into its dP accumulator.
+            if const_expr(fast_exp2):
+                r_full = _fadd(r_final, reduction_peer(r_final))
+                inv_r = rocdl.rcp(T.f32, _raw(r_full))
+                delta_full = _fmul(delta_full, inv_r)
             if lane_div_32 == fx.Index(0):
                 buffer_ops.buffer_store(
-                    fx.Float32(delta_full),
+                    fx.Float32(_fsub(c_zero_f, delta_full)),
                     delta_out_rsrc,
                     _lse_elem * fx.Index(4),
                     mask=ArithValue(q_row < seq_len_v),
@@ -809,8 +853,19 @@ def build_flash_attn_bwd_module(
                     dq_finals.append(Vec.from_elements(vals, fx.Float32).ir_value())
                 sm_vec = Vec.from_elements([dq_scale], fx.Float32).broadcast_to(16)
             else:
+                # dq mode: dQ~ = sum_j dS~_j @ K accumulated in the loop. With
+                # fast_exp2 the dS used the unnormalized P~, so renormalize with
+                # inv_r = 1/rowsum(P~) (per-q, factors out of the GEMM -> a single
+                # epilogue scalar): dQ = sm * inv_r * dQ~.
                 dq_finals = [loop_results[dc] for dc in range_constexpr(D_CHUNKS)]
-                sm_vec = Vec.from_elements([fx.Float32(sm_scale)], fx.Float32).broadcast_to(16)
+                if const_expr(fast_exp2):
+                    r_final = loop_results[D_CHUNKS]
+                    r_full = _fadd(r_final, reduction_peer(r_final))
+                    inv_r = rocdl.rcp(T.f32, _raw(r_full))
+                    dq_scale = fx.Float32(_fmul(fx.Float32(sm_scale), fx.Float32(inv_r)))
+                else:
+                    dq_scale = fx.Float32(sm_scale)
+                sm_vec = Vec.from_elements([dq_scale], fx.Float32).broadcast_to(16)
             v_o = [Vec(dq_finals[dc]) * sm_vec for dc in range_constexpr(D_CHUNKS)]
 
             pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
