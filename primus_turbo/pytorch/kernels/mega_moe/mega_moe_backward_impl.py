@@ -11,12 +11,22 @@ from typing import List, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
+from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (
+    dispatch_grouped_gemm_bf16,
+)
+from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (
+    grouped_gemm_combine_bf16,
+)
+from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
     BackendType,
     KernelBackend,
     TuneCache,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
+    grouped_gemm_variable_k_impl,
 )
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
@@ -58,17 +68,6 @@ class MegaMoEBackwardFlyDSLBackend(KernelBackend):
         num_topk: int,
         **kwargs,
     ):
-        # lazy import — keep this module importable when FlyDSL is absent
-        from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (
-            dispatch_grouped_gemm_bf16,
-        )
-        from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (
-            grouped_gemm_combine_bf16,
-        )
-        from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
-        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
-            grouped_gemm_variable_k_impl,
-        )
 
         # ABI guard: catch a kernel return-order change loudly.
         assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"

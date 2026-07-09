@@ -62,7 +62,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             ctx.set_materialize_grads(False)
 
             # fused MoE forward: dispatch grouped L1 GEMM (NT) + SwiGLU + grouped L2 GEMM combine (NT)
-            y, l1_out, dispatch_weights_in_buf, _, _, handle = mega_moe_forward_impl(
+            y, l1_out, dispatch_weights_in_buf, handle = mega_moe_forward_impl(
                 x,
                 w1,
                 w2,
@@ -81,15 +81,14 @@ class MegaMoEFusedFunction(torch.autograd.Function):
                 ctx.group = group
                 ctx.num_tokens = num_tokens
                 ctx.num_topk = num_topk
-                ctx.handle_len = len(handle)
                 ctx.save_for_backward(
-                    *handle,
                     x,
                     l1_out,
                     dispatch_weights_in_buf,
                     w1,
                     w2,
                     topk_idx,
+                    *handle,
                 )
             return y
 
@@ -101,16 +100,8 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             # grad_y is None when the output got no grad
             if grad_y is None:
                 return (None,) * 6
-            saved = ctx.saved_tensors
-            handle = tuple(saved[: ctx.handle_len])
-            (
-                saved_x,
-                l1_out,
-                dispatch_weights_in_buf,
-                w1,
-                w2,
-                topk_idx,
-            ) = saved[ctx.handle_len :]
+            saved_x, l1_out, dispatch_weights_in_buf, w1, w2, topk_idx, *handle = ctx.saved_tensors
+            handle = tuple(handle)
 
             # fused MoE backward: L2 dgrad (nn) + SwiGLU^T + dW2 + L1 dgrad combine (nn) + dW1 (tn)
             dx, grad_topk_weights, dW1, dW2 = mega_moe_backward_impl(

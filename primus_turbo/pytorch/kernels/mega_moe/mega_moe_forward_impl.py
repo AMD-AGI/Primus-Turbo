@@ -11,6 +11,13 @@ from typing import List, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
+from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (
+    dispatch_grouped_gemm_bf16,
+)
+from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (
+    grouped_gemm_combine_bf16,
+)
+from primus_turbo.flydsl.mega.swiglu_kernel import swiglu
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
@@ -23,8 +30,6 @@ _SUPPORTED_DTYPES = (torch.bfloat16,)
 
 # dispatch handle layout (see dispatch_prologue_kernel.py return order).
 _HANDLE_LEN = 9
-_H_NUM_TOKENS_PER_EXPERT = 7
-_H_NUM_TOKENS_PER_EXPERT_PREFIX = 8
 
 
 class MegaMoEForwardFlyDSLBackend(KernelBackend):
@@ -54,14 +59,6 @@ class MegaMoEForwardFlyDSLBackend(KernelBackend):
         layout: str,
         **kwargs,
     ):
-        # lazy import — keep this module importable when FlyDSL is absent
-        from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (
-            dispatch_grouped_gemm_bf16,
-        )
-        from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (
-            grouped_gemm_combine_bf16,
-        )
-        from primus_turbo.flydsl.mega.swiglu_kernel import swiglu
 
         # int64 end-to-end (combine reads topk i64)
         topk_idx = topk_idx.to(torch.int64)
@@ -91,15 +88,10 @@ class MegaMoEForwardFlyDSLBackend(KernelBackend):
 
         # ABI guard: catch a kernel return-order change loudly.
         assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
-        # clone: also returned inside handle -> break aliasing (custom-op forbids aliased returns)
-        num_tokens_per_expert = handle[_H_NUM_TOKENS_PER_EXPERT].clone()
-        num_tokens_per_expert_prefix = handle[_H_NUM_TOKENS_PER_EXPERT_PREFIX].clone()
         return (
             y,
             l1_out,
             dispatch_weights_in_buf,
-            num_tokens_per_expert,
-            num_tokens_per_expert_prefix,
             list(handle),
         )
 
@@ -146,7 +138,7 @@ def _mega_moe_forward(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     layout: str,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
     group = _resolve_process_group(group_name)
     default_backend_enum = BackendType(default_backend)
 
@@ -172,7 +164,7 @@ def _mega_moe_forward_meta(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     layout: str,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
     # eager-only path (EP rendezvous can't be traced); approximate meta for completeness.
     N2 = w2.shape[1] if layout == "nt" else w2.shape[2]
     two_I = w1.shape[1] if layout == "nt" else w1.shape[2]
@@ -180,9 +172,7 @@ def _mega_moe_forward_meta(
     y = x.new_empty((num_tokens, N2), dtype=torch.bfloat16)
     l1_out = x.new_empty((0, two_I), dtype=torch.bfloat16)
     dispatch_weights_in_buf = x.new_empty((0,), dtype=torch.float32)
-    num_tokens_per_expert = x.new_empty((0,), dtype=torch.int32)
-    num_tokens_per_expert_prefix = x.new_empty((0,), dtype=torch.int32)
-    return y, l1_out, dispatch_weights_in_buf, num_tokens_per_expert, num_tokens_per_expert_prefix, []
+    return y, l1_out, dispatch_weights_in_buf, []
 
 
 def mega_moe_forward_impl(
@@ -194,18 +184,15 @@ def mega_moe_forward_impl(
     topk_weights: torch.Tensor,
     layout: str,
     default_backend: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
     """Fused MoE forward (dispatch grouped GEMM + SwiGLU + grouped GEMM combine).
 
-    Returns (y, l1_out, dispatch_weights_in_buf, num_tokens_per_expert,
-    num_tokens_per_expert_prefix, handle).
+    Returns (y, l1_out, dispatch_weights_in_buf, handle).
     """
     (
         y,
         l1_out,
         dispatch_weights_in_buf,
-        num_tokens_per_expert,
-        num_tokens_per_expert_prefix,
         handle,
     ) = _mega_moe_forward(
         x,
@@ -221,7 +208,5 @@ def mega_moe_forward_impl(
         y,
         l1_out,
         dispatch_weights_in_buf,
-        num_tokens_per_expert,
-        num_tokens_per_expert_prefix,
         tuple(handle),
     )

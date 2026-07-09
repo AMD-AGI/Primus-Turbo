@@ -333,121 +333,6 @@ def _run(local_rank, world, args):
         # every rank asserts the global verdict -> a failure propagates through spawn
         assert all(g[3] for g in gathered), f"[{mode}] gate-3 FAILED"
 
-        # ---- probe: is the NN dgrad GEMM (d_swiglu = d_l2y @ w2) the broken stage? ----
-        if args.probe_dswiglu:
-            from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
-            from primus_turbo.pytorch.core.backend import BackendType
-            from primus_turbo.pytorch.kernels.mega_moe import dispatch_grouped_gemm_impl
-
-            with torch.no_grad():
-                # forward dispatch builds the symm pool + handle
-                _l1, _, _, handle = dispatch_grouped_gemm_impl(
-                    x,
-                    W1,
-                    group,
-                    BackendType.FLYDSL.value,
-                    topk_idx=topk_idx.to(torch.int64),
-                    topk_weights=topk_w,
-                    layout="nt",
-                )
-                l1_out = _l1.clone()
-                weight = symm.weight_recv_buf.clone().float()  # per-pool-row routing weight
-                dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
-                # STEP1 backward: NN dispatch of dy -> d_swiglu = d_l2y @ w2
-                d_swiglu, _, _, _ = dispatch_grouped_gemm_impl(
-                    dy,
-                    W2,
-                    group,
-                    BackendType.FLYDSL.value,
-                    handle=handle,
-                    layout="nn",
-                )
-                d_l2y = symm.dispatch_token_pool.clone()  # pool now holds the dispatched dy rows
-                group_lens, group_offs = handle[9].tolist(), handle[10].tolist()
-                Iq = I
-
-                # (a) NN dgrad GEMM: d_swiglu = d_l2y @ w2
-                ds_ref = torch.zeros_like(d_swiglu)
-                for e in range(epr):
-                    s, L = int(group_offs[e]), int(group_lens[e])
-                    if L > 0:
-                        ds_ref[s : s + L] = (d_l2y[s : s + L].float() @ W2[e].float()).to(d_swiglu.dtype)
-
-                # (b) swiglu_backward in-situ: grad_l1 (dgate|dup) + act_w
-                grad_l1, grad_gate, act_w = swiglu_backward(
-                    d_swiglu, l1_out, scale=symm.weight_recv_buf, return_gate=True, return_act_w=True
-                )
-                # device-time the bounded swiglu_backward in isolation (rank 0)
-                if rank == 0:
-                    m_real = int(symm.meta_scalars[1].item()) * symm.block_m
-                    for _ in range(20):
-                        swiglu_backward(
-                            d_swiglu, l1_out, scale=symm.weight_recv_buf, return_gate=True, return_act_w=True
-                        )
-                    torch.cuda.synchronize()
-                    _e0 = torch.cuda.Event(True)
-                    _e1 = torch.cuda.Event(True)
-                    _e0.record()
-                    for _ in range(100):
-                        swiglu_backward(
-                            d_swiglu, l1_out, scale=symm.weight_recv_buf, return_gate=True, return_act_w=True
-                        )
-                    _e1.record()
-                    torch.cuda.synchronize()
-                    _us = _e0.elapsed_time(_e1) / 100 * 1000
-                    print(
-                        f"[probe] swiglu_backward bounded: {_us:.1f} us  "
-                        f"ACC1.shape={tuple(l1_out.shape)} m_real={m_real}",
-                        flush=True,
-                    )
-                gate = l1_out[:, :Iq].float()
-                up = l1_out[:, Iq:].float()
-                sig = torch.sigmoid(gate)
-                s_silu = gate * sig
-                d = d_swiglu.float() * weight.unsqueeze(-1)
-                dgate_ref = d * up * (sig * (1 + gate * (1 - sig)))
-                dup_ref = d * s_silu
-                gl1_ref = torch.cat([dgate_ref, dup_ref], dim=-1).to(grad_l1.dtype)
-                actw_ref = (s_silu * up * weight.unsqueeze(-1)).to(act_w.dtype)
-
-                mask = d_l2y.abs().sum(-1) > 0
-
-                # (c) dW1 tn-wgrad STEP4: re-dispatch x into pool, dW1[e] = grad_l1[e]^T @ x_pool[e]
-                dW1, _, _, _ = dispatch_grouped_gemm_impl(
-                    x,
-                    grad_l1,
-                    group,
-                    BackendType.FLYDSL.value,
-                    handle=handle,
-                    layout="tn",
-                    trans_c=True,
-                )
-                x_pool = symm.dispatch_token_pool.clone()
-                xv = x_pool.abs().sum(-1) > 0  # valid (dispatched) rows
-                gl = grad_l1.float().clone()
-                gl[~xv] = 0  # invalid rows contribute nothing
-                xp = x_pool.float().clone()
-                xp[~xv] = 0
-                dW1_ref = torch.zeros_like(dW1)
-                for e in range(epr):
-                    s, L = int(group_offs[e]), int(group_lens[e])
-                    if L > 0:
-                        dW1_ref[e] = (gl[s : s + L].T @ xp[s : s + L]).to(dW1.dtype)  # [2I, H]
-
-                checks = {
-                    "d_swiglu(NN gemm)": _gate3(d_swiglu[mask], ds_ref[mask]),
-                    "act_w(swiglu_bwd)": _gate3(act_w[mask], actw_ref[mask]),
-                    "grad_l1(swiglu_bwd)": _gate3(grad_l1[mask], gl1_ref[mask]),
-                    "dW1(tn wgrad)": _gate3(dW1, dW1_ref),
-                }
-                gd = [None] * world
-                dist.all_gather_object(gd, (rank, checks, int(mask.sum())), group=group)
-                if rank == 0:
-                    print(f"[{mode}] PROBE backward stages vs torch ref (cos/rel/ok):")
-                    for r, cc, nrows in sorted(gd, key=lambda t: t[0]):
-                        line = "  ".join(f"{n}: {v[0]:.5f}/{v[1]:.4f}/{v[2]}" for n, v in cc.items())
-                        print(f"  rank={r} rows={nrows}  {line}")
-
         # ---- backward gradcheck: mega grads vs the turbo baseline (same grad_y) ----
         if args.bwd:
             grad_y = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
@@ -630,7 +515,6 @@ def _build_argparser():
     ap.add_argument("--mode", choices=["load_balanced", "round_robin", "both"], default="both")
     ap.add_argument("--perf", action="store_true")
     ap.add_argument("--bwd", action="store_true", help="run mega-vs-turbo backward gradcheck")
-    ap.add_argument("--probe-dswiglu", action="store_true", help="probe the NN dgrad GEMM d_swiglu=d_l2y@w2")
     ap.add_argument("--perf-iters", type=int, default=50)
     ap.add_argument(
         "--train-loop",
