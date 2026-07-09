@@ -37,8 +37,8 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_segment_m_row_col_impl,
 )
 from primus_turbo.pytorch.ops.quantization import (
-    grouped_quantize_fp8_with_trans,
-    quantize_fp8_with_trans,
+    grouped_quantize_fp8_with_trans_flydsl,
+    quantize_fp8_with_trans_flydsl,
 )
 
 __all__ = [
@@ -606,7 +606,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
         a_scaling_recipe = ScalingRecipe()
         if not isinstance(a, QuantizedTensor):
-            # NOTE: If a is not a QuantizedTensor use grouped_quantize_fp8_with_trans to avoid call dequantize.
+            # NOTE: If a is not a QuantizedTensor use grouped_quantize_fp8_with_trans_flydsl to avoid call dequantize.
             (
                 a_fp8_row,
                 a_scale_row,
@@ -616,16 +616,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 group_offs_padded_rowwise,
                 _,
                 _,
-            ) = grouped_quantize_fp8_with_trans(
-                a,
-                a_dtype,
-                config.granularity,
-                group_lens,
-                group_offs,
-                block_size=config.block_size,
-                scaling_recipe=a_scaling_recipe,
-                scaling_recipe_for_trans=a_scaling_recipe,
-            )
+            ) = grouped_quantize_fp8_with_trans_flydsl(a, a_dtype, group_lens, group_offs)
         else:
             quantized_a = a
             check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
@@ -653,16 +644,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if not isinstance(b, QuantizedTensor):
-            # NOTE: If b is not a QuantizedTensor use quantize_fp8_with_trans to avoid call dequantize.
-
-            b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = quantize_fp8_with_trans(
-                b,
-                b_dtype,
-                config.granularity,
-                block_size=config.block_size,
-                scaling_recipe=ScalingRecipe(use_2d_block=True),
-                scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
-            )
+            # NOTE: If b is not a QuantizedTensor use quantize_fp8_with_trans_flydsl to avoid call dequantize.
+            b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = quantize_fp8_with_trans_flydsl(b, b_dtype)
         else:
             quantized_b = b
             check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
@@ -735,16 +718,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             group_offs_padded_rowwise,
             group_lens_padded_colwise,
             group_offs_padded_colwise,
-        ) = grouped_quantize_fp8_with_trans(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            group_lens,
-            group_offs,
-            block_size=ctx.config.block_size,
-            scaling_recipe=ScalingRecipe(),
-            scaling_recipe_for_trans=ScalingRecipe(),
-        )
+        ) = grouped_quantize_fp8_with_trans_flydsl(grad_out, grad_out_dtype, group_lens, group_offs)
 
         # dgrad: grad_a = grad_out @ b_col^T  (same single NT op as fwd)
         grad_a = grouped_gemm_fp8_impl(
