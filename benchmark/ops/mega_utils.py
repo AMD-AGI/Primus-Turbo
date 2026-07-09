@@ -206,9 +206,7 @@ def compile_grouped_gemm_bf16(
             _emit()
 
     @flyc.jit
-    def launch(
-        A, B, C, TILE_TO_GROUP, NUM_TILE_BLOCKS, c_m: int, c_n: int, stream: fx.Stream = fx.Stream(None)
-    ):
+    def launch(A, B, C, TILE_TO_GROUP, NUM_TILE_BLOCKS, c_m: int, c_n: int, stream: fx.Stream):
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
         grouped_gemm_k(
             A,
@@ -279,7 +277,7 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
         EXPERT_SEND_OFFSET,
         DISPATCHED_TOKEN_IDX,
         sym_layout,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         dispatch_only_k(
             INPUT_TOKENS,
@@ -897,7 +895,7 @@ def _compile_reduce_only(
         TOPK_INDICES,
         NUM_TOKENS_PER_RANK,
         TOPK_WEIGHTS,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         reduce_only_k(
             OUTPUT,
@@ -955,7 +953,7 @@ def _compile_combine_only_task(out_features, num_experts, num_combine_cu, waves_
             )
 
     @flyc.jit
-    def launch(GRAD_GATE, sym_layout, stream: fx.Stream = fx.Stream(None)):
+    def launch(GRAD_GATE, sym_layout, stream: fx.Stream):
         combine_task_k(
             GRAD_GATE,
             sym_layout,
