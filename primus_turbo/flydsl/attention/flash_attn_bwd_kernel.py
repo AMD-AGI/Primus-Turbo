@@ -352,12 +352,34 @@ def build_flash_attn_bwd_module(
             # lowered on this toolchain).
             return Vec(kv8).to(fx.Float32).to(_f16).ir_value()
 
-        # ---- K XOR swizzle (d64-general): col ^ ((row & (K_STRIDE//16-1)) << 4). ----
-        def _k_swizzle(row_idx, col_idx):
-            mask = (row_idx & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
-            return col_idx ^ mask
+        # ---- LDS bank-conflict swizzles (d64, gfx950 64 banks). A K/V row = 64 elems
+        # = 32 dwords, so same-parity rows share a 32-bank half; the 16 same-parity
+        # rows must be spread across the 8 aligned 16 B slots of that half to hit the
+        # b128 2-way floor. Two masks because the two tiles are read differently:
+        #   * K is BOTH normal-read (S=K@Q^T) AND transpose-read (dQ=K^T@dS). The
+        #     ds_read_tr16_b64 network only tolerates a 16-elem-granular mask, which on
+        #     d64 (4 blocks) cannot spread same-parity rows past 2 offsets -> stuck at
+        #     the legacy (row&3)<<4 (4-8 way). Keep legacy for K.
+        #   * V is normal-read ONLY (dP=V@dO^T), so it can use the finer 8-elem-granular
+        #     ((row//2)%8)*8 mask -> 8 distinct offsets -> 2-way. This halves the GEMM's
+        #     normal-read bank conflicts (measured ~60% of LDS-active cycles).
+        # Both round-trip (XOR self-inverse; period divides K_SUB_N=32 so lo/hi reads
+        # share the lane_mod_32 mask). D128 keeps the legacy mask for both.
+        def _k_bank_mask(row_idx):
+            return (row_idx & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
 
-        def _coop_load(src_ptr, base, tile_start):
+        def _v_bank_mask(row_idx):
+            if const_expr(K_STRIDE == 64):
+                return ((row_idx >> fx.Index(1)) & fx.Index(7)) << fx.Index(3)
+            return (row_idx & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
+
+        def _k_swizzle(row_idx, col_idx):
+            return col_idx ^ _k_bank_mask(row_idx)
+
+        def _v_swizzle(row_idx, col_idx):
+            return col_idx ^ _v_bank_mask(row_idx)
+
+        def _coop_load(src_ptr, base, tile_start, swizzle=_k_swizzle):
             """Cooperative row-major XOR-swizzled load of a BLOCK_N x head_dim tile."""
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
@@ -366,12 +388,12 @@ def build_flash_attn_bwd_module(
                 if const_expr(KV_NEEDS_GUARD):
                     if load_row_in_batch < fx.Index(BLOCK_N):
                         g_idx = global_idx_kv(row_idx, load_col_base)
-                        swz_col = _k_swizzle(lds_row, load_col_base)
+                        swz_col = swizzle(lds_row, load_col_base)
                         vec = _load_global_vec(src_ptr, g_idx, VEC_WIDTH)
                         Vec(vec).store(lds, [base + lds_row * K_STRIDE + swz_col])
                 else:
                     g_idx = global_idx_kv(row_idx, load_col_base)
-                    swz_col = _k_swizzle(lds_row, load_col_base)
+                    swz_col = swizzle(lds_row, load_col_base)
                     vec = _load_global_vec(src_ptr, g_idx, VEC_WIDTH)
                     Vec(vec).store(lds, [base + lds_row * K_STRIDE + swz_col])
 
@@ -434,7 +456,7 @@ def build_flash_attn_bwd_module(
             _dma_off = fx.Int32(0)
             _dma_aux = fx.Int32(1)
 
-            def coop_dma_tile(src_rsrc, lds_byte_base, tile_start):
+            def coop_dma_tile(src_rsrc, lds_byte_base, tile_start, bank_mask=_k_bank_mask):
                 """DMA a BLOCK_N x head_dim K/V tile into the swizzled LDS layout."""
                 for d in range_constexpr(NUM_DMA_KV):
                     lds_addr = (
@@ -446,7 +468,7 @@ def build_flash_attn_bwd_module(
                     lds_ptr = buffer_ops.create_llvm_ptr(lds_lane0, address_space=3)
                     row_in_tile = tid // LANES_PER_KV_ROW + fx.Index(d * ROWS_PER_DMA_BATCH)
                     swiz_col_f16 = (tid % LANES_PER_KV_ROW) * (DMA_BYTES // 2)
-                    xor_mask = (row_in_tile & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
+                    xor_mask = bank_mask(row_in_tile)
                     unsw_col_f16 = swiz_col_f16 ^ xor_mask
                     col_byte = unsw_col_f16 * 2
                     global_row = tile_start + row_in_tile
@@ -531,23 +553,24 @@ def build_flash_attn_bwd_module(
         _q_end = q_start + BLOCK_M
         kv_upper = fx.Index(ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v))
 
-        k_swz_mask = (lane_mod_32 & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
+        k_swz_mask = _k_bank_mask(lane_mod_32)
+        v_swz_mask = _v_bank_mask(lane_mod_32)
 
-        def _a_idx_lo(a_base, ks):
+        def _a_idx_lo(a_base, ks, swz_mask):
             col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
-            return a_base + lane_mod_32 * K_STRIDE + (col ^ k_swz_mask)
+            return a_base + lane_mod_32 * K_STRIDE + (col ^ swz_mask)
 
-        def _a_idx_hi(a_base, ks):
+        def _a_idx_hi(a_base, ks, swz_mask):
             col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
-            return a_base + fx.Index(K_SUB_N * K_STRIDE) + lane_mod_32 * K_STRIDE + (col ^ k_swz_mask)
+            return a_base + fx.Index(K_SUB_N * K_STRIDE) + lane_mod_32 * K_STRIDE + (col ^ swz_mask)
 
-        def _gemm_kq(a_base, b_packs):
+        def _gemm_kq(a_base, b_packs, swz_mask=k_swz_mask):
             """GEMM1 template: acc[M=rows, N=q] = A[rows,D] @ B[q,D]^T over D."""
             acc_lo = c_zero_v16f32
             acc_hi = c_zero_v16f32
             for ks in range_constexpr(K_STEPS_QK):
-                a_lo = Vec.load(mfma_pack_type, lds, [_a_idx_lo(a_base, ks)])
-                a_hi = Vec.load(mfma_pack_type, lds, [_a_idx_hi(a_base, ks)])
+                a_lo = Vec.load(mfma_pack_type, lds, [_a_idx_lo(a_base, ks, swz_mask)])
+                a_hi = Vec.load(mfma_pack_type, lds, [_a_idx_hi(a_base, ks, swz_mask)])
                 acc_lo = mfma_acc(a_lo, b_packs[ks], acc_lo)
                 acc_hi = mfma_acc(a_hi, b_packs[ks], acc_hi)
             return acc_lo, acc_hi
@@ -629,24 +652,30 @@ def build_flash_attn_bwd_module(
                     inner_iter_args[0] if isinstance(inner_iter_args, (list, tuple)) else inner_iter_args
                 )
 
-            # WAR guard: the single K/V LDS region is overwritten each iteration
-            # (no double buffer), so wait for the previous iteration's LDS reads.
+            # WAR guard: the single K/V LDS region is overwritten each iteration (no
+            # double buffer), so wait for the previous iteration's LDS reads. s_barrier
+            # alone only syncs wave *execution*, not outstanding lgkmcnt (ds_read) ops;
+            # drain them first so the next DMA can't overwrite LDS mid-read. (The legacy
+            # bank-conflict-serialized reads hid this WAR hazard; the finer V swizzle
+            # issues reads fast enough to expose it as run-to-run nondeterminism.)
+            rocdl.s_waitcnt(0)
             gpu.barrier()
             if const_expr(ENABLE_DMA):
                 coop_dma_tile(k_rsrc, lds_base_idx, kv_start)
-                coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(LDS_V_BASE * 2), kv_start)
+                coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(LDS_V_BASE * 2), kv_start, _v_bank_mask)
                 if const_expr(USE_K16):
                     coop_dma_tile(k16_rsrc, lds_base_idx + fx.Index(LDS_K16_BASE * 2), kv_start)
                 rocdl.s_waitcnt(0)
             else:
                 _coop_load(k_ptr, fx.Index(0), kv_start)
-                _coop_load(v_ptr, fx.Index(LDS_V_BASE), kv_start)
+                _coop_load(v_ptr, fx.Index(LDS_V_BASE), kv_start, _v_swizzle)
             gpu.barrier()
 
             # GEMM1: S[kv,q] = K @ Q^T
             s_lo_acc, s_hi_acc = _gemm_kq(fx.Index(0), q_b_packs)
-            # dP[kv,q] = V @ dO^T (same template, V as "K", dO as "Q")
-            dp_lo_acc, dp_hi_acc = _gemm_kq(fx.Index(LDS_V_BASE), do_b_packs)
+            # dP[kv,q] = V @ dO^T (same template, V as "K", dO as "Q"). V is normal-read
+            # only, so it uses the finer 8-granular v_swz_mask (2-way vs K's stuck 8-way).
+            dp_lo_acc, dp_hi_acc = _gemm_kq(fx.Index(LDS_V_BASE), do_b_packs, v_swz_mask)
 
             s_lo = [Vec(s_lo_acc)[r] for r in range_constexpr(16)]
             s_hi = [Vec(s_hi_acc)[r] for r in range_constexpr(16)]
