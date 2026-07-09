@@ -456,6 +456,22 @@ def gen_attention_test_cases():
     return test_cases
 
 
+def gen_moe_test_cases():
+    """Generate mega-MoE test cases (one per MoE model) for the fused EP benchmarks."""
+    test_cases = []
+    for name, config in MoEModelConfigs.items():
+        test_cases.append(
+            {
+                "Case": name,
+                "hidden": config["hidden_size"],
+                "inter": config["moe_intermediate_size"],
+                "num_experts": config["num_experts"],
+                "num_topk": config["num_topk"],
+            }
+        )
+    return test_cases
+
+
 def gen_deepep_test_cases():
     # From MoE models (for MLA and other attention variants)
     test_cases = []

@@ -12,7 +12,6 @@ import itertools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl import Config, autotune
 from flydsl.expr.buffer_ops import (
     _unwrap_value,
     buffer_load,
@@ -27,7 +26,11 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 from primus_turbo.flydsl.mega.barrier import grid_sync, xgmi_barrier
 from primus_turbo.flydsl.mega.prims import atomic_add, ld, st
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, sym_map
-from primus_turbo.flydsl.mega.tune_utils import _suppress_stdout_stderr
+from primus_turbo.flydsl.mega.tune_utils import (
+    Config,
+    _suppress_stdout_stderr,
+    autotune,
+)
 
 
 def _make_dispatch_prologue(

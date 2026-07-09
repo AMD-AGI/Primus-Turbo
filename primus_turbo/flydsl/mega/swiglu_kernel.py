@@ -13,7 +13,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.expr.math as fmath
 import torch
-from flydsl import Config, autotune
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr.buffer_ops import (
     _unwrap_value,
@@ -25,7 +24,11 @@ from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.prims import ld, st
-from primus_turbo.flydsl.mega.tune_utils import _suppress_stdout_stderr
+from primus_turbo.flydsl.mega.tune_utils import (
+    Config,
+    _suppress_stdout_stderr,
+    autotune,
+)
 
 ACTIVATION_CLAMP = 10.0
 

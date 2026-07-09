@@ -10,7 +10,6 @@ from typing import Optional, Tuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl import Config, autotune
 from flydsl.expr import arith, const_expr
 from flydsl.expr.buffer_ops import (
     buffer_load,
@@ -28,7 +27,11 @@ from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
 from primus_turbo.flydsl.mega.prims import cast, ld, read_clock, spin_timed_out
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.mega.tune_utils import _suppress_stdout_stderr
+from primus_turbo.flydsl.mega.tune_utils import (
+    Config,
+    _suppress_stdout_stderr,
+    autotune,
+)
 from primus_turbo.flydsl.utils.gemm_helper import (
     make_bf16_fp16_tile_tensor,
     make_value_attrs,

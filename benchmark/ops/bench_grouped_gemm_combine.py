@@ -10,6 +10,7 @@ import argparse
 import os
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
@@ -17,7 +18,7 @@ from typing import Any, Callable
 import pandas as pd
 import torch
 import torch.distributed as dist
-from config import get_platform_info
+from config import gen_moe_test_cases, get_platform_info
 from tabulate import tabulate
 
 # repo root (primus_turbo) on the path so the shared mega_utils + kernels import
@@ -32,8 +33,10 @@ if _MEGATRON_LM not in sys.path:
 from mega_utils import (  # noqa: E402
     BF16_BYTES,
     aggregate_stage_metrics,
+    apply_case,
     bench,
     check_accuracy,
+    checks_verdict,
     combine_only,
     dense_gemm_peak_ms,
     generate_input,
@@ -43,6 +46,7 @@ from mega_utils import (  # noqa: E402
     stage_columns,
     sync_ranks,
     topk_reduce_only,
+    turbo_csv_row,
 )
 from megatron.core.fusions.fused_bias_swiglu import (  # noqa: E402
     weighted_bias_swiglu_impl,
@@ -339,7 +343,80 @@ def profile_combine(group, args, turbo_reference):
     }
 
 
+# Models the fused grouped-GEMM + combine path cannot run yet (skipped in the sweep).
+# Per-model isolation (run_sweep) already contains any crash/deadlock; this list just
+# fast-skips known flydsl tiling gaps: moe_intermediate_size not a multiple of the GEMM
+# tile (BN=256) -> "All autotune configs failed" (DeepSeek-V2-Lite I=1408, MoE-1T
+# I=1920). DeepSeek-V2 also fails autotune here (caught at run time as [skip]).
+# TODO(mega): support a tail/remainder N tile so these odd intermediate sizes run.
+UNSUPPORTED = {"DeepSeek-V2-Lite", "MoE-1T"}
+
+
+def _report_case(platform, gpu_name, world, args, case_name, per_rank):
+    """rank-0: aggregate one case's per-rank results -> (rich_row, csv_row); prints the detail block."""
+    rank0_checks = per_rank[0]["checks"]
+    # distributed bottleneck = slowest rank (max latency); work ~ uniform (mean)
+    xgmi = statistics.mean([res["xgmi_bytes"] for res in per_rank])
+    agg_fwd = aggregate_stage_metrics(per_rank, "fwd", xgmi)
+    agg_bwd = aggregate_stage_metrics(per_rank, "bwd", xgmi)
+
+    print_header("combine", gpu_name, world, args, case=case_name)
+    # fused = 3-role (GEMM + combine PUSH + weighted topk reduce -> y) == e2e forward step 4
+    print_stage(agg_fwd, comm_label="combine_only", comm_unit="GB/s (XGMI)", comm_tag="comb")
+    print_stage(
+        agg_bwd,
+        comm_label="combine_only",
+        comm_unit="GB/s (XGMI)",
+        comm_tag="comb",
+        sub_header="backward dgrad (NN, = mega_moe_fused STEP 3)",
+    )
+    rich_row = {
+        "Platform": platform,
+        "GPU": gpu_name,
+        "Case": case_name,
+        "EP": world,
+        "T": args.num_tokens,
+        "H": args.hidden,
+        "I": args.inter,
+        "E": args.num_experts,
+        "K": args.num_topk,
+        **stage_columns(
+            "",
+            agg_fwd,
+            rank0_checks.get("fwd"),
+            comm_label="combine_only",
+            comm_short="comb",
+            dense_ms=True,
+            xgmi=True,
+            hidden=True,
+        ),
+        **stage_columns(
+            "bwd ",
+            agg_bwd,
+            rank0_checks.get("bwd"),
+            comm_label="combine_only",
+            comm_short="comb",
+            xgmi=True,
+        ),
+    }
+    # saved CSV follows the gemm_turbo convention; Backward = dgrad (NN)
+    csv_row = turbo_csv_row(
+        platform,
+        gpu_name,
+        world,
+        args,
+        case=case_name,
+        check=checks_verdict(rank0_checks),
+        fwd=agg_fwd,
+        bwd_stages=[agg_bwd],
+    )
+    return rich_row, csv_row
+
+
 def benchmark_combine(local_rank, world, args):
+    """Run ONE model case (args geometry already applied). Runs in its own spawn so a
+    crash/deadlock is isolated to this model and never wedges the rest of the sweep.
+    rank 0 appends its row to the shared CSV (header written for the first row)."""
     master_addr = os.getenv("MASTER_ADDR", "127.0.0.1")
     port = int(os.getenv("MASTER_PORT", "8483"))
     torch.cuda.set_device(local_rank)
@@ -351,83 +428,91 @@ def benchmark_combine(local_rank, world, args):
     group = dist.new_group(list(range(world)))
     rank = dist.get_rank()
     platform, gpu_name = get_platform_info()
+    name = args.case_name
 
-    # turbo (DeepEP) full-forward baseline = the accuracy ground truth; dispatcher built once here
-    turbo_reference = make_turbo_reference(
-        group,
-        num_experts=args.num_experts,
-        num_topk=args.num_topk,
-        hidden=args.hidden,
-        inter=args.inter,
-    )
     try:
+        # turbo (DeepEP) full-forward baseline = the accuracy ground truth (per-model geometry)
+        turbo_reference = make_turbo_reference(
+            group,
+            num_experts=args.num_experts,
+            num_topk=args.num_topk,
+            hidden=args.hidden,
+            inter=args.inter,
+        )
         result = profile_combine(group, args, turbo_reference)
-        # all_gather_object fills per_rank[i] from rank i (already rank-ordered)
-        per_rank = [None] * world
+        per_rank = [None] * world  # all_gather_object fills per_rank[i] from rank i
         dist.all_gather_object(per_rank, result, group=group)
         if rank == 0:
-            rank0_checks = per_rank[0]["checks"]
-            # distributed bottleneck = slowest rank (max latency); work ~ uniform (mean)
-            xgmi = statistics.mean([res["xgmi_bytes"] for res in per_rank])
-            agg_fwd = aggregate_stage_metrics(per_rank, "fwd", xgmi)
-            agg_bwd = aggregate_stage_metrics(per_rank, "bwd", xgmi)
-
-            print_header("combine", gpu_name, world, args)
-            # fused = 3-role (GEMM + combine PUSH + weighted topk reduce -> y) == e2e forward step 4
-            print_stage(agg_fwd, comm_label="combine_only", comm_unit="GB/s (XGMI)", comm_tag="comb")
-            print_stage(
-                agg_bwd,
-                comm_label="combine_only",
-                comm_unit="GB/s (XGMI)",
-                comm_tag="comb",
-                sub_header="backward dgrad (NN, = mega_moe_fused STEP 3)",
-            )
-            row = {
-                "Platform": platform,
-                "GPU": gpu_name,
-                "EP": world,
-                "T": args.num_tokens,
-                "H": args.hidden,
-                "I": args.inter,
-                "E": args.num_experts,
-                "K": args.num_topk,
-                **stage_columns(
-                    "",
-                    agg_fwd,
-                    rank0_checks.get("fwd"),
-                    comm_label="combine_only",
-                    comm_short="comb",
-                    dense_ms=True,
-                    xgmi=True,
-                    hidden=True,
-                ),
-                **stage_columns(
-                    "bwd ",
-                    agg_bwd,
-                    rank0_checks.get("bwd"),
-                    comm_label="combine_only",
-                    comm_short="comb",
-                    xgmi=True,
-                ),
-            }
-            results = pd.DataFrame([row])
-            print("\nFinal Results:")
-            print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
-            out_file = args.output or f"grouped_gemm_combine_{datetime.now():%Y%m%d}_{gpu_name}.csv"
-            results.to_csv(out_file, index=False)
-            print(f"Results saved to {out_file}")
+            _, csv_row = _report_case(platform, gpu_name, world, args, name, per_rank)
+            out_file = args.output
+            header = (not os.path.exists(out_file)) or os.path.getsize(out_file) == 0
+            pd.DataFrame([csv_row]).to_csv(out_file, mode="a", header=header, index=False)
+            print(f"[{name}] appended to {out_file}")
         sync_ranks(group)
     finally:
         dist.destroy_process_group()
 
 
+def _join_with_timeout(ctx, timeout_s):
+    """Block until every child of ``ctx`` exits; terminate + raise on timeout (deadlock guard).
+
+    ctx.join(timeout) returns True when all done and re-raises on a child error; a
+    hung (deadlocked) case never returns, so we cap total wall-clock and kill it."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if ctx.join(timeout=5):  # raises ProcessExited/RaisedException on child failure
+            return
+        if time.monotonic() >= deadline:
+            for p in ctx.processes:
+                if p.is_alive():
+                    p.terminate()
+            for p in ctx.processes:
+                p.join(10)
+            raise TimeoutError(f"case exceeded {timeout_s}s (killed)")
+
+
+def run_sweep(args):
+    """Drive the per-model sweep: one fresh 8-proc spawn per MoE model so a crash or
+    deadlock is isolated. Each model appends its row to a single shared CSV."""
+    cases = gen_moe_test_cases()
+    # resolve the output path once so per-model appends land in the same file
+    out_file = args.output or f"grouped_gemm_combine_{datetime.now():%Y%m%d}_{get_platform_info()[1]}.csv"
+    args.output = out_file
+    if os.path.exists(out_file):  # fresh file so appends don't mix with a stale run
+        os.remove(out_file)
+
+    base_port = int(os.getenv("MASTER_PORT", "8483"))
+    nprocs = args.num_processes
+    for idx, case in enumerate(cases):
+        name = case["Case"]
+        if name in UNSUPPORTED:
+            print(f"[skip] {name}: unsupported by mega combine (see UNSUPPORTED TODO)")
+            continue
+        apply_case(args, case)
+        args.case_name = name
+        os.environ["MASTER_PORT"] = str(base_port + idx)  # unique port avoids TIME_WAIT reuse
+        print(f"\n{'#'*72}\n# combine sweep [{idx + 1}/{len(cases)}]: {name}\n{'#'*72}")
+        try:
+            ctx = torch.multiprocessing.spawn(
+                benchmark_combine, args=(nprocs, args), nprocs=nprocs, join=False
+            )
+            _join_with_timeout(ctx, args.case_timeout)
+        except Exception as e:  # noqa: BLE001  isolate a per-model crash/deadlock; keep sweeping
+            print(f"[skip] {name}: subprocess failed: {e!r}")
+
+    if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+        df = pd.read_csv(out_file)
+        print("\nFinal Results:")
+        print(tabulate(df, headers="keys", tablefmt="grid", showindex=False))
+        print(f"Results saved to {out_file}")
+    else:
+        print("No supported models produced results.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark fused BF16 grouped GEMM + combine")
     parser.add_argument("--num-processes", type=int, default=8)
-    parser.add_argument("--hidden", type=int, default=7168)  # DeepSeek-V3
-    parser.add_argument("--inter", type=int, default=2048)
-    parser.add_argument("--num-experts", type=int, default=256)
-    parser.add_argument("--num-topk", type=int, default=8)
+    # H/I/E/K come from each MoE model case (config.gen_moe_test_cases); no CLI knob
     parser.add_argument("--num-tokens", type=int, default=8192)
     parser.add_argument("--bm", type=int, default=256)
     parser.add_argument("--bn", type=int, default=256)
@@ -444,5 +529,7 @@ if __name__ == "__main__":
     parser.add_argument("--bwd-combine-cu", type=int, default=16)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--output", "-o", type=str, default=None)
+    # per-model wall-clock guard; a model exceeding it is terminated and skipped (deadlock safety)
+    parser.add_argument("--case-timeout", type=int, default=900)
     args = parser.parse_args()
-    torch.multiprocessing.spawn(benchmark_combine, args=(args.num_processes, args), nprocs=args.num_processes)
+    run_sweep(args)
