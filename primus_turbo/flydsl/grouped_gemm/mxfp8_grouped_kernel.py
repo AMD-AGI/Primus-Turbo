@@ -861,7 +861,7 @@ def grouped_gemm_mxfp8_flydsl_kernel(
     group_offs: "torch.Tensor",  # padded read offsets [G+1]
     N: int,
     K: int,
-    group_offs_out: "torch.Tensor",  # tight write offsets [G+1]
+    group_offs_out: "torch.Tensor | None" = None,  # tight write offsets [G+1]; None => group_offs
     out_dtype: torch.dtype = torch.bfloat16,
     num_cu: "int | None" = -1,
 ) -> "torch.Tensor":
@@ -883,6 +883,9 @@ def grouped_gemm_mxfp8_flydsl_kernel(
     out = torch.empty((M_pad, N), dtype=out_dtype, device=a.device)
 
     _go_pad = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
+    # None => write in the padded read layout (matches the Triton MX grouped wrapper).
+    if group_offs_out is None:
+        group_offs_out = group_offs
     _go_out = group_offs_out if group_offs_out.dtype == torch.int64 else group_offs_out.to(torch.int64)
     go_pad = _go_pad.view(torch.int32)
     go_out = _go_out.view(torch.int32)
