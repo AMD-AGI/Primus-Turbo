@@ -16,7 +16,6 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
     extract_base_index,
 )
-from flydsl.expr.typing import AddressSpace, PointerType
 
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     _make_shared_storage,
@@ -113,10 +112,6 @@ def _make_grouped_gemm_combine(
         combine_flag_base = sym_layout.combine_flag
         comb_base = sym_layout.combine_token_buffer
         reduce_flag_base = sym_layout.reduce_flag
-        # bf16 pointer type for per-tile int64 base advance (see else branch)
-        tile_ptr_ty = PointerType.get(
-            elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
-        )
         comb_local_res = create_buffer_resource_from_addr(comb_base, num_records_bytes=comb_records)
         # recv-segment table for task-based (sustained-peer) combine push
         seg_bytes = num_experts * 4
@@ -433,12 +428,12 @@ def grouped_gemm_combine_bf16(
     assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
     out_features = N
     c_n = out_features
-    assert out_features == int(
-        sym_layout.hidden
-    ), f"out_features {out_features} != SymLayout hidden {int(sym_layout.hidden)}"
-    assert num_max_pool_tokens == int(
-        sym_layout.num_max_pool_tokens
-    ), "x rows must match SymLayout pool capacity"
+    assert out_features == int(sym_layout.hidden), (
+        f"out_features {out_features} != SymLayout hidden {int(sym_layout.hidden)}"
+    )
+    assert num_max_pool_tokens == int(sym_layout.num_max_pool_tokens), (
+        "x rows must match SymLayout pool capacity"
+    )
 
     device = x.device
     num_combine_slots = int(sym_layout.num_combine_slots)

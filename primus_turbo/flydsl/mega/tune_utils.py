@@ -4,8 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Kineto-based device-time benchmark (``bench_kineto``) used by the autotuner.
-"""
+"""Kineto-based device-time benchmark (``bench_kineto``) used by the autotuner."""
 
 import os
 import sys

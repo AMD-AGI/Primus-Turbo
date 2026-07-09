@@ -40,19 +40,19 @@ class MegaMoEFusedFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         with torch.profiler.record_function("mega_moe_forward"):
             # Validate at the op boundary so failures point here, not deep in FlyDSL.
-            assert (
-                x.dim() == 2 and x.is_cuda and x.dtype == torch.bfloat16
-            ), f"x must be 2D bf16 CUDA, got {x.shape}/{x.dtype}"
+            assert x.dim() == 2 and x.is_cuda and x.dtype == torch.bfloat16, (
+                f"x must be 2D bf16 CUDA, got {x.shape}/{x.dtype}"
+            )
             assert w1.is_cuda and w2.is_cuda, "w1/w2 must be CUDA tensors"
-            assert (
-                x.device == w1.device == w2.device == topk_idx.device == topk_weights.device
-            ), "all inputs must share one device"
-            assert (
-                topk_idx.shape[0] == topk_weights.shape[0] == x.shape[0]
-            ), f"token count mismatch: x={x.shape[0]} idx={topk_idx.shape[0]} w={topk_weights.shape[0]}"
-            assert (
-                topk_idx.shape[-1] == topk_weights.shape[-1]
-            ), f"num_topk mismatch: idx={topk_idx.shape[-1]} w={topk_weights.shape[-1]}"
+            assert x.device == w1.device == w2.device == topk_idx.device == topk_weights.device, (
+                "all inputs must share one device"
+            )
+            assert topk_idx.shape[0] == topk_weights.shape[0] == x.shape[0], (
+                f"token count mismatch: x={x.shape[0]} idx={topk_idx.shape[0]} w={topk_weights.shape[0]}"
+            )
+            assert topk_idx.shape[-1] == topk_weights.shape[-1], (
+                f"num_topk mismatch: idx={topk_idx.shape[-1]} w={topk_weights.shape[-1]}"
+            )
 
             num_tokens = x.shape[0]
             num_topk = topk_idx.shape[-1]

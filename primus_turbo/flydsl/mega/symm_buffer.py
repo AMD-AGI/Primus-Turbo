@@ -87,7 +87,6 @@ class LayoutConfig:
 
 
 class RegionSpec:
-
     def __init__(self, dtype: torch.dtype, shape: tuple):
         self.dtype = dtype
         self.shape = tuple(shape)
@@ -247,7 +246,6 @@ def make_sym_layout_type(region_names: tuple):
 
 
 class SymmBuffer:
-
     def __init__(
         self,
         group,

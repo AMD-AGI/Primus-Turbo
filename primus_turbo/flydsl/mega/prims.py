@@ -93,7 +93,7 @@ def _unwrap_space(space: Union[int, str]) -> int:
     try:
         return _ADDR_SPACES[space]
     except KeyError:
-        raise ValueError(f"bad space {space!r}; expected one of {sorted(_ADDR_SPACES)} or an int")
+        raise ValueError(f"bad space {space!r}; expected one of {sorted(_ADDR_SPACES)} or an int") from None
 
 
 def _unwrap_order(order: Optional[str]) -> llvm.AtomicOrdering:
@@ -102,7 +102,9 @@ def _unwrap_order(order: Optional[str]) -> llvm.AtomicOrdering:
     try:
         return _ATOMIC_ORDERINGS[order]
     except KeyError:
-        raise ValueError(f"bad order {order!r}; expected None or one of {sorted(_ATOMIC_ORDERINGS)}")
+        raise ValueError(
+            f"bad order {order!r}; expected None or one of {sorted(_ATOMIC_ORDERINGS)}"
+        ) from None
 
 
 def _wait_mem() -> None:

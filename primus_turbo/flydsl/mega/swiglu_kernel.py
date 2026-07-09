@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 """Mega-MoE SwiGLU epilogue kernels (FlyDSL)."""
+
 from __future__ import annotations
 
 import itertools

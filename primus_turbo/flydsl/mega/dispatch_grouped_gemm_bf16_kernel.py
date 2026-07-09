@@ -455,12 +455,13 @@ def dispatch_grouped_gemm_bf16(
     if layout == "tn":
         # tn wgrad: WEIGHTS=rhs activation, contract against the token pool; C is per-group.
         assert num_tokens_per_expert_prefix is not None, "tn layout requires num_tokens_per_expert_prefix"
-        assert (
-            num_tokens_per_expert_prefix.dtype == torch.int64
-        ), "tn num_tokens_per_expert_prefix must be int64"
+        assert num_tokens_per_expert_prefix.dtype == torch.int64, (
+            "tn num_tokens_per_expert_prefix must be int64"
+        )
         rhs = l1_weights
-        OUT_M, OUT_N = hidden_size, rhs.size(
-            1
+        OUT_M, OUT_N = (
+            hidden_size,
+            rhs.size(1),
         )  # _make_kernel wants (out_features, hidden_size)=(OUT_N, OUT_M)
         G = num_tokens_per_expert_prefix.numel() - 1
         out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)

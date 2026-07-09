@@ -1273,7 +1273,6 @@ class S2RLoaderBf16(_S2RLoaderBf16):
 
 
 class StoreCBf16:
-
     def __init__(self, C, c_rows, c_cols, out_ty, cache_modifier=0):
         self.c_rows = c_rows
         self.c_cols = c_cols

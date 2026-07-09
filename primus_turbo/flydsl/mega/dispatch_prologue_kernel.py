@@ -4,8 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Fused MoE dispatch-prologue kernel (FlyDSL).
-"""
+"""Fused MoE dispatch-prologue kernel (FlyDSL)."""
 
 import functools
 import itertools
