@@ -34,6 +34,9 @@ ignore = [
     "B007",
     # B028: explicit stacklevel on every warnings.warn is noisy; skip it.
     "B028",
+    # B008: flydsl launch wrappers take a `stream: fx.Stream = fx.Stream(None)`
+    # default (the current/default stream); this call-in-default is intentional.
+    "B008",
 ]
 
 [tool.ruff.lint.per-file-ignores]

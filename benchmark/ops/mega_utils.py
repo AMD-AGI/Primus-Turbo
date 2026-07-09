@@ -569,7 +569,7 @@ def dense_gemm_peak_ms(M, N, K, BLOCK_M, BLOCK_N, iters, *, group_m_cands=(4,)):
     for group_m in group_m_cands:
         launch = _compile_dense_nt(K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, GROUP_M=group_m, num_xcd=8)
         compiled = _get_compiled_dense(launch, dense_args)
-        ms = bench(lambda: compiled(*dense_args), iters=iters)
+        ms = bench(lambda c=compiled: c(*dense_args), iters=iters)
         if ms < best_ms:
             best_ms, best_group_m = ms, group_m
     del a, b, c
@@ -804,9 +804,9 @@ def stage_columns(prefix, m, check, *, comm_label, comm_short, dense_ms=False, x
 def print_header(tag, gpu_name, world, args):
     """Common '===' header line shared by both benchmarks."""
     print(
-        f"\n{'='*72}\n[{tag}] {gpu_name} EP{world} T={args.num_tokens} H={args.hidden} "
+        f"\n{'=' * 72}\n[{tag}] {gpu_name} EP{world} T={args.num_tokens} H={args.hidden} "
         f"I={args.inter} E={args.num_experts} K={args.num_topk} "
-        f"(max over ranks)\n{'='*72}"
+        f"(max over ranks)\n{'=' * 72}"
     )
 
 
@@ -818,7 +818,7 @@ def print_stage(m, *, comm_label, comm_unit, comm_tag, comm_extra="", fused_extr
     comm_tag   : 'disp' | 'comb'                     (roofline formula text)
     comm_extra / fused_extra : kernel-specific suffixes (e.g. CU sweep strings)."""
     if sub_header is not None:
-        print(f"  {'-'*68}  {sub_header}")
+        print(f"  {'-' * 68}  {sub_header}")
     print(
         f"  dense_gemm   : {m.dense_ms:8.3f} ms | {m.dense_tf:7.1f} TFLOPS "
         f"(single-weight roofline, GROUP_M={m.dense_gm})"
