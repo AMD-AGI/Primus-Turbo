@@ -23,15 +23,19 @@ float atomics -> deterministic):
       for head_dim=64 the K-swizzle equals the forward V-swizzle so that read
       path is reused verbatim. Result [D,q] is stored transposed like O.
 
-  mode="fused_dq_delta": folds the delta and dq passes into one kv-loop so S/P/dP
-      are recomputed once (not twice), removing the whole delta kernel's exp2
-      pass. Uses the identity dQ = sm*(A - delta*B) with, accumulated in one pass,
-      delta_i = sum_j P_ij*dP_ij, A_i = sum_j (P_ij*dP_ij) k_j, B_i = sum_j P_ij k_j.
-      A and B feed their P/(P*dP) B-operands (and the transpose-read K) as single fp16
-      (10-bit mantissa = tf32) so the epilogue subtraction survives the near-diagonal
-      catastrophic cancellation at half the double-bf16 pack+MFMA cost (single-bf16's
-      8-bit mantissa fails the s8192 dq gate). Writes both dQ (transposed) and the
-      recomputed fp32 delta (for the downstream dkdv kernel).
+  mode="fused_dq_delta": folds delta and dq into one kv-loop so S/P/dP are recomputed
+      once. dQ = sm/R*(A - (delta/R)*B) with, in one pass, A_i = sum_j C_ij k_j,
+      B_i = sum_j P_ij k_j, and a scalar reduce. Two variants:
+      * identity_center=True (production): C = P*(dP - delta_id) is CENTERED by a
+        precomputed identity delta_id = rowsum(O.dO) read from DELTA, so C is small
+        and the A/B GEMM2 uses plain bf16 operands; the scalar becomes the residual
+        rho = sum_j P*(dP-delta_id) and the epilogue's (rho/R)*B correction recovers
+        the exact consistent dq. No delta is written (delta_id already serves dkdv);
+        this eliminates the separate S/dP delta pass entirely.
+      * identity_center=False (legacy): C = P*dP is UNCENTERED, so A/B feed single
+        fp16 (tf32, 10-bit mantissa) operands to survive the near-diagonal
+        catastrophic cancellation (single-bf16's 8-bit fails); writes the recomputed
+        fp32 delta for the downstream dkdv kernel.
 
 Target: gfx950 only (32x32x16 bf16 MFMA, ds_read_tr16_b64, permlane32_swap +
 cvt_pk_bf16_f32 store). bf16, causal, GQA/MQA (num_kv_heads <= num_heads).
@@ -96,9 +100,21 @@ def build_flash_attn_bwd_module(
     mode="dq",
     enable_dma=True,
     fast_exp2=False,
+    identity_center=False,
 ):
-    """Build one backward launcher. ``mode`` in {"delta", "dq", "fused_dq_delta"}."""
+    """Build one backward launcher. ``mode`` in {"delta", "dq", "fused_dq_delta"}.
+
+    ``identity_center`` (fused mode only): instead of computing delta in-kernel and
+    forming the uncentered A = sum_j (P*dP)*k (which needs fp16/tf32 operands to
+    survive the near-diagonal cancellation), read a precomputed identity delta
+    delta_id = rowsum_d(O*dO) from DELTA and center in-loop: C = P*(dP - delta_id).
+    Because dP-delta_id is already small, the A/B GEMM2 uses plain bf16 operands.
+    The residual rho = sum_j P*(dP-delta_id) then corrects the epilogue exactly:
+    dQ = sm/R * (A - (rho/R)*B), recovering the consistent dq WITHOUT the separate
+    delta pass (delta kernel eliminated; DELTA is filled cheaply on the host / by an
+    O.dO pass and reused by dkdv). No delta is written back."""
     assert mode in ("delta", "dq", "fused_dq_delta"), mode
+    assert not identity_center or mode == "fused_dq_delta", "identity_center is fused-only"
     assert causal, "backward kernel is causal-only for the GPT-OSS campaign"
     gpu_arch = get_hip_arch()
     assert gpu_arch.startswith("gfx950"), "backward kernel targets gfx950"
@@ -152,7 +168,9 @@ def build_flash_attn_bwd_module(
     # K/V tiles. GEMM1 (S=K@Q^T) reads the bf16 K tile; GEMM2's A/B fp16 MFMA reads
     # this fp16 tile via a transpose-read directly, dropping the per-read bf16->fp16
     # conversion from the VALU-issue-bound loop (host pre-casts the small K tensor).
-    USE_K16 = mode == "fused_dq_delta"
+    # identity_center fuses with plain bf16 operands (centered A survives bf16), so
+    # it needs no separate fp16 K copy; only the legacy uncentered fused path does.
+    USE_K16 = mode == "fused_dq_delta" and not identity_center
     LDS_K16_BASE = 2 * LDS_TILE
     LDS_TOTAL = (3 if USE_K16 else 2) * LDS_TILE
 
@@ -372,7 +390,7 @@ def build_flash_attn_bwd_module(
         lse_rsrc = buffer_ops.create_buffer_resource(
             LSE, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
         )
-        if const_expr(IS_DQ):
+        if const_expr(IS_DQ or (IS_FUSED and identity_center)):
             delta_in_rsrc = buffer_ops.create_buffer_resource(
                 DELTA, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
             )
@@ -380,7 +398,7 @@ def build_flash_attn_bwd_module(
             dq_rsrc = buffer_ops.create_buffer_resource(
                 DQ, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
             )
-        if const_expr(IS_DELTA or IS_FUSED):
+        if const_expr((IS_DELTA or IS_FUSED) and not (IS_FUSED and identity_center)):
             delta_out_rsrc = buffer_ops.create_buffer_resource(
                 DELTA, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
             )
@@ -462,7 +480,9 @@ def build_flash_attn_bwd_module(
         # ---- Load LSE (and delta for dq) for this lane's q_row. ----
         _lse_elem = q_head_idx * seq_len_v + q_row
         lse_val = fx.Float32(buffer_ops.buffer_load(lse_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32))
-        if const_expr(IS_DQ):
+        if const_expr(IS_DQ or (IS_FUSED and identity_center)):
+            # DELTA holds -delta_id (negated, matching the dkdv fold convention), so
+            # dP - delta_id == dP + delta_val in the loop below.
             delta_val = fx.Float32(
                 buffer_ops.buffer_load(delta_in_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32)
             )
@@ -687,6 +707,12 @@ def build_flash_attn_bwd_module(
                 local = c_zero_f
                 if const_expr(fast_exp2):
                     r_local = c_zero_f
+                # identity_center: C = P*(dP - delta_id) (dP + delta_val, delta_val =
+                # -delta_id) so A accumulates the centered dS and `local` becomes the
+                # residual rho = sum_j P*(dP-delta_id); operands are plain bf16.
+                # legacy: C = P*dP (uncentered), `local` is delta = sum_j P*dP; fp16.
+                _pack8 = bf16_trunc_pack_v8 if identity_center else _to_f16_v8
+                _mfma_ab = mfma_acc if identity_center else mfma_f16
                 for pks in range_constexpr(PV_K_STEPS):
                     base = pks * 8
                     plo_g = []
@@ -696,8 +722,14 @@ def build_flash_attn_bwd_module(
                     for i in range_constexpr(8):
                         r = base + i
                         plo, phi = _p_exp2(r)
-                        clo = _fmul(plo, Vec(dp_lo_acc)[r])
-                        chi = _fmul(phi, Vec(dp_hi_acc)[r])
+                        if const_expr(identity_center):
+                            dp_lo_r = _fadd(Vec(dp_lo_acc)[r], delta_val)
+                            dp_hi_r = _fadd(Vec(dp_hi_acc)[r], delta_val)
+                        else:
+                            dp_lo_r = Vec(dp_lo_acc)[r]
+                            dp_hi_r = Vec(dp_hi_acc)[r]
+                        clo = _fmul(plo, dp_lo_r)
+                        chi = _fmul(phi, dp_hi_r)
                         local = _fadd(local, clo)
                         local = _fadd(local, chi)
                         if const_expr(fast_exp2):
@@ -707,25 +739,27 @@ def build_flash_attn_bwd_module(
                         phi_g.append(phi)
                         clo_g.append(clo)
                         chi_g.append(chi)
-                    plo_p = _to_f16_v8(plo_g)
-                    phi_p = _to_f16_v8(phi_g)
-                    clo_p = _to_f16_v8(clo_g)
-                    chi_p = _to_f16_v8(chi_g)
+                    plo_p = _pack8(plo_g)
+                    phi_p = _pack8(phi_g)
+                    clo_p = _pack8(clo_g)
+                    chi_p = _pack8(chi_g)
                     # GEMM2: A[D,q] += K^T @ C ; B[D,q] += K^T @ P (K transpose-read
-                    # as "V"; C/P single-fp16 packs as "P"). K read fp16 (dual-tile,
-                    # no conversion). One MFMA per sub-block (no double-bf16 bot).
+                    # as "V"; C/P packs as "P"). identity_center reads the bf16 K tile
+                    # directly; the legacy fp16 path reads the dual-tile fp16 K copy.
                     for dc in range_constexpr(D_CHUNKS):
-                        if const_expr(ENABLE_DMA):
+                        if const_expr(identity_center):
+                            k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
+                        elif const_expr(ENABLE_DMA):
                             # Dual-tile: read the fp16 K copy directly (no conversion).
                             k_lo, k_hi = _read_k16_tr(dc * PV_K_STEPS + pks)
                         else:
                             k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
                             k_lo = _k_to_f16(k_lo)
                             k_hi = _k_to_f16(k_hi)
-                        a_accs[dc] = mfma_f16(k_lo, clo_p, a_accs[dc])
-                        a_accs[dc] = mfma_f16(k_hi, chi_p, a_accs[dc])
-                        b_accs[dc] = mfma_f16(k_lo, plo_p, b_accs[dc])
-                        b_accs[dc] = mfma_f16(k_hi, phi_p, b_accs[dc])
+                        a_accs[dc] = _mfma_ab(k_lo, clo_p, a_accs[dc])
+                        a_accs[dc] = _mfma_ab(k_hi, chi_p, a_accs[dc])
+                        b_accs[dc] = _mfma_ab(k_lo, plo_p, b_accs[dc])
+                        b_accs[dc] = _mfma_ab(k_hi, phi_p, b_accs[dc])
                 delta_acc = _fadd(delta_acc, local)
                 _fused_yield = (
                     [a_accs[i] for i in range_constexpr(D_CHUNKS)]
@@ -828,17 +862,22 @@ def build_flash_attn_bwd_module(
                     dq_scale = fx.Float32(_fmul(fx.Float32(sm_scale), fx.Float32(inv_r)))
                 else:
                     dq_scale = fx.Float32(sm_scale)
-                if lane_div_32 == fx.Index(0):
-                    # Store -delta: dkdv folds it into its dP MFMA accumulator init
-                    # (dP - delta = dO@V^T + (-delta)), removing its per-element dS
-                    # subtract. dQ below still uses the positive delta_full.
-                    buffer_ops.buffer_store(
-                        fx.Float32(_fsub(c_zero_f, delta_full)),
-                        delta_out_rsrc,
-                        _lse_elem * fx.Index(4),
-                        mask=ArithValue(q_row < seq_len_v),
-                        offset_is_bytes=True,
-                    )
+                if const_expr(not identity_center):
+                    if lane_div_32 == fx.Index(0):
+                        # Store -delta: dkdv folds it into its dP MFMA accumulator init
+                        # (dP - delta = dO@V^T + (-delta)), removing its per-element dS
+                        # subtract. dQ below still uses the positive delta_full.
+                        buffer_ops.buffer_store(
+                            fx.Float32(_fsub(c_zero_f, delta_full)),
+                            delta_out_rsrc,
+                            _lse_elem * fx.Index(4),
+                            mask=ArithValue(q_row < seq_len_v),
+                            offset_is_bytes=True,
+                        )
+                # identity_center: delta_full is now rho/R (peer-reduced sum_j
+                # P~*(dP-delta_id), renormalized), so A - delta_full*B == A - (rho/R)*B
+                # exactly recovers the consistent dq; DELTA already holds delta_id (for
+                # dkdv) and is not overwritten.
                 # dQ = dq_scale*(A - delta*B). The accumulators are [M=D, N=q] with
                 # N=q == lane_mod_32, so delta_full (per-q, per-lane) is constant across
                 # the 16 D-registers -> a single scalar multiply per register.
@@ -971,6 +1010,126 @@ def build_flash_attn_bwd_module(
     def _compile(*args):
         with CompilationContext.compile_hints(_hints):
             return flyc.compile(launch_flash_attn_bwd, *args)
+
+    _launch.compile = _compile
+    return _launch
+
+
+def build_flash_attn_bwd_odo_module(
+    num_heads,
+    head_dim,
+    dtype_str="bf16",
+    num_kv_heads=None,
+    causal=True,
+    sm_scale=None,
+    waves_per_eu=8,
+    block=256,
+):
+    """Identity-delta ("odo") kernel: DELTA[b,hq,s] = -sum_d O[b,s,hq,d]*dO[b,s,hq,d].
+
+    Memory-bound O.dO row-reduce that replaces the torch (out*dout).sum(-1): one
+    thread owns one (b,s,hq) row, reads its D-vector of O and dO (coalesced bf16
+    buffer loads), multiplies and sums in fp32, negates (the dkdv/dq fold convention
+    stores -delta_id) and scatter-stores the scalar to the transposed [B,Hq,S] delta.
+    delta_id is only a centering value (the fused dq kernel corrects rho/R*B exactly),
+    so the bf16*bf16 product with fp32 accumulate is enough precision."""
+    assert dtype_str == "bf16", "odo kernel targets bf16"
+    gpu_arch = get_hip_arch()
+    assert gpu_arch.startswith("gfx950"), "odo kernel targets gfx950"
+    elem_dtype = dtype_to_elem_type(dtype_str)
+    HEAD_DIM = head_dim
+    NUM_HEADS_Q = num_heads
+    VEC = 8
+    assert HEAD_DIM % VEC == 0
+    NVEC = HEAD_DIM // VEC
+    BLOCK = block
+
+    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    def flash_attn_bwd_odo_kernel(
+        O: fx.Tensor,
+        DO: fx.Tensor,
+        DELTA: fx.Tensor,
+        batch_size: fx.Int32,
+        seq_len: fx.Int32,
+    ):
+        elem_dtype_l = elem_dtype
+        fm = fx.arith.FastMathFlags.fast
+
+        def _fadd(a, b):
+            return arith.addf(_raw(a), _raw(b), fastmath=fm)
+
+        def _fmul(a, b):
+            return arith.mulf(_raw(a), _raw(b), fastmath=fm)
+
+        c_zero_f = fx.Float32(0.0)
+
+        bid = fx.Index(gpu.block_idx.x)
+        tid = fx.Index(gpu.thread_idx.x)
+        row = bid * fx.Index(BLOCK) + tid
+        sl = fx.Index(seq_len)
+        total = fx.Index(batch_size) * sl * fx.Index(NUM_HEADS_Q)
+        in_range = ArithValue(row < total)
+        # OOB rows fold to row 0 for the loads; the store is masked off. (The buffer
+        # descriptor also OOB-guards, but clamping keeps the offset well-formed.)
+        row_c = fx.Index(in_range.select(row, fx.Index(0)))
+
+        o_rsrc = buffer_ops.create_buffer_resource(O, max_size=True)
+        do_rsrc = buffer_ops.create_buffer_resource(DO, max_size=True)
+        delta_rsrc = buffer_ops.create_buffer_resource(DELTA, max_size=True)
+
+        base = row_c * fx.Index(HEAD_DIM)
+        acc = fx.Float32(0.0)
+        for c in range_constexpr(NVEC):
+            off = base + fx.Index(c * VEC)
+            ov = buffer_ops.buffer_load(o_rsrc, off, vec_width=VEC, dtype=elem_dtype_l)
+            dv = buffer_ops.buffer_load(do_rsrc, off, vec_width=VEC, dtype=elem_dtype_l)
+            prod = Vec(ov).to(fx.Float32) * Vec(dv).to(fx.Float32)
+            for i in range_constexpr(VEC):
+                acc = _fadd(acc, Vec(prod)[i])
+
+        # row = ((b*S + s)*Hq + hq)  ->  delta[b,hq,s] at (b*Hq + hq)*S + s.
+        hq = row_c % fx.Index(NUM_HEADS_Q)
+        tmp = row_c // fx.Index(NUM_HEADS_Q)
+        s = tmp % sl
+        b = tmp // sl
+        delta_off = (b * fx.Index(NUM_HEADS_Q) + hq) * sl + s
+        neg_acc = arith.subf(_raw(c_zero_f), _raw(acc), fastmath=fm)
+        buffer_ops.buffer_store(
+            fx.Float32(neg_acc),
+            delta_rsrc,
+            delta_off * fx.Index(4),
+            mask=in_range,
+            offset_is_bytes=True,
+        )
+
+    @flyc.jit
+    def launch_flash_attn_bwd_odo(
+        O: fx.Tensor,
+        DO: fx.Tensor,
+        DELTA: fx.Tensor,
+        batch_size: fx.Int32,
+        seq_len: fx.Int32,
+        stream: fx.Stream,
+    ):
+        total = fx.Index(batch_size) * fx.Index(seq_len) * fx.Index(NUM_HEADS_Q)
+        grid_x = (total + fx.Index(BLOCK - 1)) // fx.Index(BLOCK)
+        flash_attn_bwd_odo_kernel(
+            O,
+            DO,
+            DELTA,
+            batch_size,
+            seq_len,
+            value_attrs={
+                "rocdl.waves_per_eu": waves_per_eu,
+                "rocdl.flat_work_group_size": f"{int(BLOCK)},{int(BLOCK)}",
+            },
+        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
+
+    def _launch(*args, **kwargs):
+        return launch_flash_attn_bwd_odo(*args, **kwargs)
+
+    def _compile(*args):
+        return flyc.compile(launch_flash_attn_bwd_odo, *args)
 
     _launch.compile = _compile
     return _launch
