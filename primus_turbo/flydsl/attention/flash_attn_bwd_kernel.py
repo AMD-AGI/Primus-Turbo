@@ -789,8 +789,11 @@ def build_flash_attn_bwd_module(
                 else:
                     dq_scale = fx.Float32(sm_scale)
                 if lane_div_32 == fx.Index(0):
+                    # Store -delta: dkdv folds it into its dP MFMA accumulator init
+                    # (dP - delta = dO@V^T + (-delta)), removing its per-element dS
+                    # subtract. dQ below still uses the positive delta_full.
                     buffer_ops.buffer_store(
-                        fx.Float32(delta_full),
+                        fx.Float32(_fsub(c_zero_f, delta_full)),
                         delta_out_rsrc,
                         _lse_elem * fx.Index(4),
                         mask=ArithValue(q_row < seq_len_v),
@@ -1287,10 +1290,11 @@ def build_flash_attn_bwd_dkdv_module(
             col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
             return a_base + fx.Index(Q_SUB * Q_STRIDE) + lane_mod_32 * Q_STRIDE + (col ^ a_swz_mask)
 
-        def _gemm_qk(a_base, b_packs):
-            """S[q,kv]=A(streamed,M=q)@B(owned,N=kv)^T over D."""
-            acc_lo = c_zero_v16f32
-            acc_hi = c_zero_v16f32
+        def _gemm_qk(a_base, b_packs, init_lo=None, init_hi=None):
+            """S[q,kv]=A(streamed,M=q)@B(owned,N=kv)^T over D. init_lo/hi pre-load
+            the MFMA accumulator (used to fold -delta into the dP GEMM for free)."""
+            acc_lo = c_zero_v16f32 if init_lo is None else init_lo
+            acc_hi = c_zero_v16f32 if init_hi is None else init_hi
             for ks in range_constexpr(K_STEPS_QK):
                 a_lo = Vec.load(mfma_pack_type, lds, [_a_idx_lo(a_base, ks)])
                 a_hi = Vec.load(mfma_pack_type, lds, [_a_idx_hi(a_base, ks)])
@@ -1357,17 +1361,35 @@ def build_flash_attn_bwd_dkdv_module(
                     _coop_load(do_ptr, fx.Index(LDS_DO_BASE), q_start, q_head)  # noqa: B023
                 gpu.barrier()
 
-                # GEMM1a S[q,kv]=Q@K^T ; GEMM1b dP[q,kv]=dO@V^T.
+                q_start_i32 = fx.Int32(q_start)
+                lane_off_i32 = fx.Int32(lane_div_32) * fx.Int32(4)
+
+                # Pre-load -delta[q] (stored negated by the fused kernel) into the dP
+                # MFMA accumulator: dP - delta = dO@V^T + (-delta) is produced by the
+                # GEMM itself, so the per-element dS subtract (32 v_sub/q-body on this
+                # VALU-issue-bound kernel) is removed. The 4 vec4 loads at q-offsets
+                # {0,8,16,24} land in acc-register order (see _q_off).
+                def _neg_delta_acc(sub):  # noqa: B023
+                    vals = []
+                    for blk in range_constexpr(4):
+                        base = _lse_head_base + fx.Index(  # noqa: B023
+                            ArithValue(q_start_i32 + lane_off_i32 + fx.Int32(sub + 8 * blk))
+                        )
+                        vec = buffer_ops.buffer_load(delta_rsrc, base, vec_width=4, dtype=fx.Float32)
+                        for i in range_constexpr(4):
+                            vals.append(fx.Float32(Vec(vec)[i]))
+                    return Vec.from_elements(vals, fx.Float32)
+
+                # GEMM1a S[q,kv]=Q@K^T ; GEMM1b dP[q,kv]=dO@V^T (accumulator=-delta).
                 s_lo_acc, s_hi_acc = _gemm_qk(fx.Index(0), k_b_packs)
-                dp_lo_acc, dp_hi_acc = _gemm_qk(fx.Index(LDS_DO_BASE), v_b_packs)
+                dp_lo_acc, dp_hi_acc = _gemm_qk(
+                    fx.Index(LDS_DO_BASE), v_b_packs, _neg_delta_acc(0), _neg_delta_acc(Q_SUB)
+                )
 
                 s_lo = [Vec(s_lo_acc)[r] for r in range_constexpr(16)]
                 s_hi = [Vec(s_hi_acc)[r] for r in range_constexpr(16)]
                 dp_lo = [Vec(dp_lo_acc)[r] for r in range_constexpr(16)]
                 dp_hi = [Vec(dp_hi_acc)[r] for r in range_constexpr(16)]
-
-                q_start_i32 = fx.Int32(q_start)
-                lane_off_i32 = fx.Int32(lane_div_32) * fx.Int32(4)
                 # Compute+pack P/dS one 8-slot group at a time, and issue that
                 # group's lse/delta vec4 loads inside the same step (16 q-slots per
                 # lane = 4 contiguous runs of 4 -> one 16B vec4 load each). Only one
@@ -1381,8 +1403,6 @@ def build_flash_attn_bwd_dkdv_module(
                 for pks in range_constexpr(PV_K_STEPS):
                     lse_lo_g = [None] * 8
                     lse_hi_g = [None] * 8
-                    dl_lo_g = [None] * 8
-                    dl_hi_g = [None] * 8
                     for gg in range_constexpr(2):
                         g = 2 * pks + gg
                         base_lo = _lse_head_base + fx.Index(  # noqa: B023
@@ -1391,13 +1411,9 @@ def build_flash_attn_bwd_dkdv_module(
                         base_hi = base_lo + fx.Index(Q_SUB)
                         lse_lo_vec = buffer_ops.buffer_load(lse_rsrc, base_lo, vec_width=4, dtype=fx.Float32)
                         lse_hi_vec = buffer_ops.buffer_load(lse_rsrc, base_hi, vec_width=4, dtype=fx.Float32)
-                        dl_lo_vec = buffer_ops.buffer_load(delta_rsrc, base_lo, vec_width=4, dtype=fx.Float32)
-                        dl_hi_vec = buffer_ops.buffer_load(delta_rsrc, base_hi, vec_width=4, dtype=fx.Float32)
                         for i in range_constexpr(4):
                             lse_lo_g[4 * gg + i] = fx.Float32(Vec(lse_lo_vec)[i])
                             lse_hi_g[4 * gg + i] = fx.Float32(Vec(lse_hi_vec)[i])
-                            dl_lo_g[4 * gg + i] = fx.Float32(Vec(dl_lo_vec)[i])
-                            dl_hi_g[4 * gg + i] = fx.Float32(Vec(dl_hi_vec)[i])
                     plo_g = []
                     phi_g = []
                     dslo_g = []
@@ -1408,8 +1424,6 @@ def build_flash_attn_bwd_dkdv_module(
                         q_slot_hi_i32 = q_slot_lo_i32 + fx.Int32(Q_SUB)
                         lse_lo = lse_lo_g[i]
                         lse_hi = lse_hi_g[i]
-                        dl_lo = dl_lo_g[i]
-                        dl_hi = dl_hi_g[i]
                         # causal mask (only the diagonal q-block per split needs it).
                         if const_expr(apply_mask):
                             s_lo_r = ArithValue(kv_row_i32 > q_slot_lo_i32).select(c_neg_inf, s_lo[r])
@@ -1422,8 +1436,9 @@ def build_flash_attn_bwd_dkdv_module(
                         phi = _p_of(s_hi_r, lse_hi, apply_mask)
                         plo_g.append(plo)
                         phi_g.append(phi)
-                        dslo_g.append(_fmul(plo, _fsub(dp_lo[r], dl_lo)))
-                        dshi_g.append(_fmul(phi, _fsub(dp_hi[r], dl_hi)))
+                        # dp_lo/hi already hold (dO@V^T - delta) via the acc init.
+                        dslo_g.append(_fmul(plo, dp_lo[r]))
+                        dshi_g.append(_fmul(phi, dp_hi[r]))
                     p_packs_lo[pks] = bf16_trunc_pack_v8(plo_g)
                     p_packs_hi[pks] = bf16_trunc_pack_v8(phi_g)
                     ds_packs_lo[pks] = bf16_trunc_pack_v8(dslo_g)
