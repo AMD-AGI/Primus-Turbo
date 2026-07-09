@@ -533,8 +533,9 @@ def test_grouped_gemm_fp8_blockwise(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance):
-    """MXFP8 grouped GEMM fwd + dgrad + wgrad on the triton backend."""
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
+def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance, backend):
+    """MXFP8 grouped GEMM fwd + dgrad + wgrad."""
     N, K = NK
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
@@ -549,7 +550,7 @@ def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, bal
         granularity=ScalingGranularity.MX_BLOCKWISE,
         trans_b=trans_b,
         balance=balance,
-        backend=BackendType.TRITON,
+        backend=backend,
         auto_tune=False,
     )
 
