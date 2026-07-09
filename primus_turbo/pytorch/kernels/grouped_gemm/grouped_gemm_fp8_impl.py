@@ -427,10 +427,12 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
 
 
 class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
-    """FlyDSL fp8 grouped GEMM backend (gfx950, per-tensor / TENSORWISE only).
+    """FlyDSL fp8 grouped GEMM backend (gfx950).
 
-    M-grouped operator: forward (trans_b=True, NT) + dgrad (trans_b=False, NN).
-    Uses the FlyDSL mfma_f32_16x16x128_f8f6f4 kernel (gfx950-only).
+    M-grouped operator. Granularities:
+      - TENSORWISE: forward (trans_b=True, NT) + dgrad (trans_b=False, NN).
+      - MX_BLOCKWISE: NT only (trans_b=True), per-1x32 raw E8M0 scales.
+    Uses the FlyDSL mfma[_scale]_f32_16x16x128_f8f6f4 kernel (gfx950-only).
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.MX_BLOCKWISE}
@@ -672,11 +674,12 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
 
 
 class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
-    """FlyDSL fp8 variable-K grouped GEMM backend (gfx950, per-tensor only).
+    """FlyDSL fp8 variable-K grouped GEMM backend (gfx950).
 
     wgrad: C[g] = lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]], contraction
-    = m_g (variable per group) via a runtime scf.for K-loop. Uses the FlyDSL
-    mfma_f32_16x16x128_f8f6f4 TN kernel (gfx950-only).
+    = m_g (variable per group) via a runtime scf.for K-loop. Supports TENSORWISE
+    (trans_a=True, TN) and MX_BLOCKWISE (non-transposed operands, TN) via the
+    FlyDSL mfma[_scale]_f32_16x16x128_f8f6f4 TN kernel (gfx950-only).
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.MX_BLOCKWISE}
