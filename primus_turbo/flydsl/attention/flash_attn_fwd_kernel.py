@@ -764,12 +764,21 @@ def build_flash_attn_fwd_module(
         if const_expr(_use_dma_dbuf):
             init_args.append(fx.Index(0))
             coop_dma_k(fx.Index(0), buf_id=0)
+        # gfx950 frozen-basis path: the exp2 addend neg_max_arg is loop-invariant
+        # after the tile-0 seed, so carry it (compute once in the seed branch) to
+        # drop the per-tile mul/sub/fma recompute off the pre-exp2 critical path.
+        if const_expr(USE_HW_TR):
+            init_args.append(c_zero_f)
 
         def _kv_outer_body(kv_block_start, inner_iter_args, apply_mask):
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
             o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
             _cur_buf_id = inner_iter_args[2 + D_CHUNKS] if _use_dma_dbuf else None
+            if const_expr(USE_HW_TR):
+                neg_max_arg_carried = inner_iter_args[2 + D_CHUNKS + (1 if _use_dma_dbuf else 0)]
+            else:
+                neg_max_arg_carried = None
             preload_k_count = NUM_PREFETCH_K if NUM_PREFETCH_K < N_SUBTILES else N_SUBTILES
 
             if const_expr(ENABLE_PREFETCH_3BUF):
@@ -1060,11 +1069,21 @@ def build_flash_attn_fwd_module(
                 # inside f32 (score spread << 127 log2 units). Determinism holds: the
                 # branch is data-independent (loop-position only). gfx942 (non-HW-TR)
                 # keeps the original per-tile interleaved rescale.
+                def _prescale_addend(m_b):
+                    # Prescale the exp2 addend from the (frozen) basis. fast_exp2 folds
+                    # *2^23+bias in so _exp2_of is a single fma; exact keeps plain -max.
+                    _sm = _fmul(c_sm_scale_log2e, m_b)
+                    _nsm = _fsub(c_zero_f, _sm)
+                    if const_expr(fast_exp2):
+                        return fmath.fma(_nsm, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
+                    return _nsm
+
                 if const_expr(USE_HW_TR):
                     _need_seed = ArithValue(fx.Float32(m_running) == c_neg_inf)
                     _bf = rocdl.ballot(T.i64, _raw(_need_seed))
                     _seed = arith.cmpi(arith.CmpIPredicate.eq, _raw(_bf), _read_exec_i64())
-                    _if = scf.IfOp(_seed, [_raw(c_zero_f).type], has_else=True, loc=ir.Location.unknown())
+                    _f32ty = _raw(c_zero_f).type
+                    _if = scf.IfOp(_seed, [_f32ty, _f32ty], has_else=True, loc=ir.Location.unknown())
                     with ir.InsertionPoint(_if.regions[0].blocks[0]):
                         _lmax = s_raw_lo[0]
                         for r in range_constexpr(15):
@@ -1072,12 +1091,14 @@ def build_flash_attn_fwd_module(
                         for r in range_constexpr(16):
                             _lmax = _fmax(_lmax, s_raw_hi[r])
                         _rmax = _fmax(_lmax, reduction_peer(_lmax))
-                        scf.YieldOp([_raw(_rmax)])
+                        scf.YieldOp([_raw(_rmax), _raw(_prescale_addend(_rmax))])
                     if len(_if.regions[1].blocks) == 0:
                         _if.regions[1].blocks.append(*[])
                     with ir.InsertionPoint(_if.regions[1].blocks[0]):
-                        scf.YieldOp([_raw(m_running)])
-                    m_basis = fx.Float32(list(_if.results)[0])
+                        scf.YieldOp([_raw(m_running), _raw(_prescale_addend(m_running))])
+                    _res = list(_if.results)
+                    m_basis = fx.Float32(_res[0])
+                    neg_max_arg = fx.Float32(_res[1])
                     corr_vec = None
                 else:
                     local_max = s_raw_lo[0]
@@ -1095,28 +1116,42 @@ def build_flash_attn_fwd_module(
                     o_accs[0] = _fmul(Vec(o_accs[0]), corr_vec)
                     l_running = _fmul(corr, l_running)
                     m_basis = m_new_raw
+                    neg_max_arg = _prescale_addend(m_basis)
 
-                scaled_max = _fmul(c_sm_scale_log2e, m_basis)
-                neg_scaled_max = _fsub(c_zero_f, scaled_max)
-                # Prescale the exp2 addend once per tile (shared by the 32 evals of
-                # this q-row) so _exp2_of collapses to a single fma (see its comment).
-                # fast_exp2 folds *2^23+bias in; the exact path keeps the plain neg-max.
-                if const_expr(fast_exp2):
-                    neg_max_arg = fmath.fma(neg_scaled_max, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
-                else:
-                    neg_max_arg = neg_scaled_max
+                # ==== exp2 P + grouped pack (VGPR-liveness: cap live f32 P) ====
+                # Interleave the Schraudolph exp2 with the bf16/fp16 pack one MFMA
+                # pack group at a time, so only PV_GRP f32 P values are live at once
+                # instead of all 32 (which previously coexisted with the 16-VGPR
+                # packed operands). local_sum accumulates in-flight.
+                PV_GRP = 16 // PV_K_STEPS
 
-                p_vals_lo = []
-                p_vals_hi = []
+                def _pack_grp(grp_f32):
+                    if const_expr(dtype_str == "bf16" and not USE_K16):
+                        return bf16_trunc_pack_v4(grp_f32)
+                    if const_expr(dtype_str == "bf16" and USE_K16):
+                        return bf16_trunc_pack_v8(grp_f32)
+                    p_f16 = [fx.Float32(x).to(elem_dtype) for x in grp_f32]
+                    return Vec.from_elements(p_f16, elem_dtype).ir_value()
+
                 local_sum = c_zero_f
-                for r in range_constexpr(16):
-                    p_lo = _exp2_of(s_raw_lo[r], neg_max_arg, apply_clamp=apply_mask)
-                    p_vals_lo.append(p_lo)
-                    local_sum = _fadd(local_sum, p_lo)
-                for r in range_constexpr(16):
-                    p_hi = _exp2_of(s_raw_hi[r], neg_max_arg, apply_clamp=apply_mask)
-                    p_vals_hi.append(p_hi)
-                    local_sum = _fadd(local_sum, p_hi)
+                p_packs_lo = []
+                p_packs_hi = []
+                for pks in range_constexpr(PV_K_STEPS):
+                    base = pks * PV_GRP
+                    grp_lo = []
+                    for j in range_constexpr(PV_GRP):
+                        p_lo = _exp2_of(s_raw_lo[base + j], neg_max_arg, apply_clamp=apply_mask)
+                        grp_lo.append(p_lo)
+                        local_sum = _fadd(local_sum, p_lo)
+                    p_packs_lo.append(_pack_grp(grp_lo))
+                for pks in range_constexpr(PV_K_STEPS):
+                    base = pks * PV_GRP
+                    grp_hi = []
+                    for j in range_constexpr(PV_GRP):
+                        p_hi = _exp2_of(s_raw_hi[base + j], neg_max_arg, apply_clamp=apply_mask)
+                        grp_hi.append(p_hi)
+                        local_sum = _fadd(local_sum, p_hi)
+                    p_packs_hi.append(_pack_grp(grp_hi))
 
                 peer_sum = reduction_peer(local_sum)
                 tile_sum = _fadd(local_sum, peer_sum)
@@ -1148,91 +1183,6 @@ def build_flash_attn_fwd_module(
                     coop_store_v_lds(_v_vecs_prefetch, v_slot)
                     rocdl.sched_group_barrier(rocdl.mask_dswr, 1, 0)
                     gpu.barrier()
-
-                # ==== Build P packs for lo and hi halves ====
-                if const_expr(dtype_str == "bf16" and not USE_K16):
-                    p_packs_lo = []
-                    p_packs_hi = []
-                    for pks in range_constexpr(PV_K_STEPS):
-                        p_base = pks * 4
-                        p_packs_lo.append(bf16_trunc_pack_v4(p_vals_lo[p_base : p_base + 4]))
-                        p_packs_hi.append(bf16_trunc_pack_v4(p_vals_hi[p_base : p_base + 4]))
-                elif const_expr(dtype_str == "bf16" and USE_K16):
-                    p_packs_lo = []
-                    p_packs_hi = []
-                    for pks in range_constexpr(PV_K_STEPS):
-                        p_base = pks * 8
-                        p_packs_lo.append(bf16_trunc_pack_v8(p_vals_lo[p_base : p_base + 8]))
-                        p_packs_hi.append(bf16_trunc_pack_v8(p_vals_hi[p_base : p_base + 8]))
-                else:
-                    p_f16_lo = []
-                    p_f16_hi = []
-                    for r in range_constexpr(16):
-                        p_f16_lo.append(fx.Float32(p_vals_lo[r]).to(elem_dtype))
-                        p_f16_hi.append(fx.Float32(p_vals_hi[r]).to(elem_dtype))
-
-                    if const_expr(USE_K16):
-                        p_packs_lo = []
-                        p_packs_hi = []
-                        for pks in range_constexpr(PV_K_STEPS):
-                            p_base = pks * 8
-                            p_packs_lo.append(
-                                Vec.from_elements(
-                                    [
-                                        p_f16_lo[p_base + 0],
-                                        p_f16_lo[p_base + 1],
-                                        p_f16_lo[p_base + 2],
-                                        p_f16_lo[p_base + 3],
-                                        p_f16_lo[p_base + 4],
-                                        p_f16_lo[p_base + 5],
-                                        p_f16_lo[p_base + 6],
-                                        p_f16_lo[p_base + 7],
-                                    ],
-                                    elem_dtype,
-                                ).ir_value()
-                            )
-                            p_packs_hi.append(
-                                Vec.from_elements(
-                                    [
-                                        p_f16_hi[p_base + 0],
-                                        p_f16_hi[p_base + 1],
-                                        p_f16_hi[p_base + 2],
-                                        p_f16_hi[p_base + 3],
-                                        p_f16_hi[p_base + 4],
-                                        p_f16_hi[p_base + 5],
-                                        p_f16_hi[p_base + 6],
-                                        p_f16_hi[p_base + 7],
-                                    ],
-                                    elem_dtype,
-                                ).ir_value()
-                            )
-                    else:
-                        p_packs_lo = []
-                        p_packs_hi = []
-                        for pks in range_constexpr(PV_K_STEPS):
-                            p_base = pks * 4
-                            p_packs_lo.append(
-                                Vec.from_elements(
-                                    [
-                                        p_f16_lo[p_base],
-                                        p_f16_lo[p_base + 1],
-                                        p_f16_lo[p_base + 2],
-                                        p_f16_lo[p_base + 3],
-                                    ],
-                                    elem_dtype,
-                                ).ir_value()
-                            )
-                            p_packs_hi.append(
-                                Vec.from_elements(
-                                    [
-                                        p_f16_hi[p_base],
-                                        p_f16_hi[p_base + 1],
-                                        p_f16_hi[p_base + 2],
-                                        p_f16_hi[p_base + 3],
-                                    ],
-                                    elem_dtype,
-                                ).ir_value()
-                            )
 
                 # Build flat (dc, pks) schedule for interleaved GEMM2.
                 _steps = [(dc, pks) for dc in range(D_CHUNKS) for pks in range(PV_K_STEPS)]
@@ -1293,6 +1243,8 @@ def build_flash_attn_fwd_module(
                     _yield_args.append(fx.Index(1) - _cur_buf_id)
                 else:
                     _yield_args.append(_cur_buf_id)
+            if const_expr(USE_HW_TR):
+                _yield_args.append(neg_max_arg)
             return _yield_args
 
         # Split the causal kv-loop at the diagonal: [0, q_start) is fully below the
