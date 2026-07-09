@@ -291,33 +291,33 @@ def build_flash_attn_fwd_module(
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
 
-        # Crude Schraudolph 2^x (fast_exp2): reinterpret the int bits of
-        # x*2^23 + (127*2^23 + magic) as f32 -> piecewise-linear 2^x, trading the
-        # quarter-rate v_exp for 3 full-rate ops (max+fma+fptosi+bitcast). maximumf
-        # clamps the int convert AND guards the all-mask -inf (-> 2^-87=0, no
-        # exp2(-inf)=NaN; pitfalls/04). Safe in the forward because O = sum P*V / l
-        # self-normalizes (the /l cancels the approx scale); the resulting LSE is
-        # approximate but the backward's fused dQ renormalizes P internally, so the
-        # near-diagonal dS cancellation is independent of the forward exp precision.
-        _c_exp2_floor = fx.Float32(-87.0)
+        # Crude Schraudolph 2^x (fast_exp2): P = bitcast(fptosi((s*sm*log2e - sm*
+        # log2e*m)*2^23 + bias)) -> piecewise-linear 2^x. The (-sm*log2e*m)*2^23 +
+        # bias addend is prescaled ONCE per kv-tile (neg_max_s23, shared by the tile's
+        # 32 exp2 evals for this q-row), so _exp2_of folds its two fmas into one:
+        # scaled = s*(sm*log2e*2^23) + neg_max_s23 -> fptosi. Safe in the forward
+        # because O = sum P*V / l self-normalizes (the /l cancels the approx scale);
+        # the LSE is approximate but the backward's fused dQ renormalizes P internally,
+        # so the near-diagonal dS cancellation is independent of the fwd exp precision.
         _c_exp2_scale = fx.Float32(float(1 << 23))
         _c_exp2_bias = fx.Float32(float(127 * (1 << 23) - 486411))
+        _c_scaled_scale = fx.Float32(sm_scale * _LOG2E * float(1 << 23))
+        _c_scaled_floor = fx.Float32(-87.0 * float(1 << 23) + float(127 * (1 << 23) - 486411))
 
-        def _exp2_of(diff, apply_clamp=True):
+        def _exp2_of(s_r, neg_max_s23, apply_clamp=True):
             if const_expr(fast_exp2):
-                # maximumf clamps the int convert AND guards the masked -inf
-                # (-> 2^-87=0, no exp2(-inf)=NaN; pitfalls/04). It is only load-
-                # bearing on masked (diagonal) tiles; below-diagonal softmax args
-                # are bounded (diff = log2e*(s*sm - m) >> -87), so the clamp is a
-                # no-op there and is dropped (saves a v_max/slot; same treatment
-                # as the bwd fused/dkdv kernels).
+                # maximumf guards the masked -inf (masked s_r=-inf -> scaled -inf ->
+                # maximumf(floor) -> 2^-87=0, no exp2(-inf)=NaN; pitfalls/04), so it is
+                # load-bearing only on masked (diagonal) tiles; the below-diagonal bulk
+                # has bounded args (>> -87) so the clamp is dropped there.
+                scaled = fmath.fma(s_r, _c_scaled_scale, neg_max_s23, fastmath=fm_fast)
                 if const_expr(apply_clamp):
-                    xc = ArithValue(diff).maximumf(_c_exp2_floor)
-                else:
-                    xc = ArithValue(diff)
-                scaled = fmath.fma(xc, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
+                    scaled = ArithValue(scaled).maximumf(_c_scaled_floor)
                 i = arith.fptosi(fx.Int32.ir_type, _raw(scaled))
                 return ArithValue(i).bitcast(compute_type)
+            # Exact path (fast_exp2=False) reconstructs the plain diff = sm*log2e*
+            # (s - m) from the un-prescaled neg_max passed by the caller.
+            diff = fmath.fma(s_r, c_sm_scale_log2e, neg_max_s23, fastmath=fm_fast)
             return ArithValue(diff).exp2(fastmath=fm_fast)
 
         def mfma_acc(a, b, c):
@@ -1098,18 +1098,23 @@ def build_flash_attn_fwd_module(
 
                 scaled_max = _fmul(c_sm_scale_log2e, m_basis)
                 neg_scaled_max = _fsub(c_zero_f, scaled_max)
+                # Prescale the exp2 addend once per tile (shared by the 32 evals of
+                # this q-row) so _exp2_of collapses to a single fma (see its comment).
+                # fast_exp2 folds *2^23+bias in; the exact path keeps the plain neg-max.
+                if const_expr(fast_exp2):
+                    neg_max_arg = fmath.fma(neg_scaled_max, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
+                else:
+                    neg_max_arg = neg_scaled_max
 
                 p_vals_lo = []
                 p_vals_hi = []
                 local_sum = c_zero_f
                 for r in range_constexpr(16):
-                    diff_lo = fmath.fma(s_raw_lo[r], c_sm_scale_log2e, neg_scaled_max, fastmath=fm_fast)
-                    p_lo = _exp2_of(diff_lo, apply_clamp=apply_mask)
+                    p_lo = _exp2_of(s_raw_lo[r], neg_max_arg, apply_clamp=apply_mask)
                     p_vals_lo.append(p_lo)
                     local_sum = _fadd(local_sum, p_lo)
                 for r in range_constexpr(16):
-                    diff_hi = fmath.fma(s_raw_hi[r], c_sm_scale_log2e, neg_scaled_max, fastmath=fm_fast)
-                    p_hi = _exp2_of(diff_hi, apply_clamp=apply_mask)
+                    p_hi = _exp2_of(s_raw_hi[r], neg_max_arg, apply_clamp=apply_mask)
                     p_vals_hi.append(p_hi)
                     local_sum = _fadd(local_sum, p_hi)
 

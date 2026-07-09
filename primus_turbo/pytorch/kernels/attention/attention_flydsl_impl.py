@@ -57,6 +57,15 @@ import torch
 # LSE; only this internal backward copy is pre-scaled.
 _NEG_LOG2E = -_host_math.log2(_host_math.e)
 
+# The dkdv kernel recomputes P with a crude Schraudolph 2^x collapsed to a single
+# fma: scaled = s*(sm*log2e*2^23) + (lse*2^23 + bias). Pre-scaling that addend
+# (lse*2^23 + bias) on the host, once per bwd call, lets _p_of drop one of its two
+# per-slot fmas on the VALU-issue-bound dkdv kernel. Must match the kernel's
+# _c_scaled_scale/_c_scaled_floor Schraudolph constants (2^23 scale, 127*2^23-magic
+# bias). Only dkdv consumes it; the fused kernel keeps the plain -log2e lse.
+_S23_SCALE = float(1 << 23)
+_S23_BIAS = float(127 * (1 << 23) - 486411)
+
 from primus_turbo.flydsl.attention.flash_attn_bwd_kernel import (
     build_flash_attn_bwd_dkdv_module,
     build_flash_attn_bwd_module,
@@ -280,6 +289,9 @@ def attention_flydsl_backward_impl(
     # Pre-scale LSE by -log2e once (host) so the kernels use it directly in the
     # exp2 addend and drop the inner-loop mul (see _NEG_LOG2E note above).
     lse = lse.contiguous().mul(_NEG_LOG2E)
+    # dkdv folds its Schraudolph 2^x into one fma with this s23-prescaled addend
+    # (lse*2^23 + bias); see _S23_SCALE/_S23_BIAS note above.
+    lse_s23 = lse.mul(_S23_SCALE).add_(_S23_BIAS)
 
     (fused_launch, dkdv_launch), key = _get_bwd_launchers(
         Hq, Hkv, D, bool(causal), _dtype_str(q.dtype), float(softmax_scale)
@@ -305,22 +317,22 @@ def attention_flydsl_backward_impl(
     k16 = k.to(torch.float16)
 
     stream = torch.cuda.current_stream()
-    qf, kf, vf, dof, lsef, deltaf = (
+    qf, kf, vf, dof, lse_s23f, deltaf = (
         q.view(-1),
         k.view(-1),
         v.view(-1),
         dout.view(-1),
-        lse.view(-1),
+        lse_s23.view(-1),
         delta.view(-1),
     )
 
     # Fused: one S/P/dP pass emits both dQ and the fp32 delta for dkdv (deletes the
-    # standalone delta kernel's exp2 pass).
+    # standalone delta kernel's exp2 pass). Both kernels share the s23-prescaled LSE.
     _run_bwd(
         fused_launch,
         key,
         "fused",
-        (qf, kf, vf, dof, lsef, deltaf, dq.view(-1), k16.view(-1), B, S, stream),
+        (qf, kf, vf, dof, lse_s23f, deltaf, dq.view(-1), k16.view(-1), B, S, stream),
         B,
         S,
     )
@@ -328,7 +340,7 @@ def attention_flydsl_backward_impl(
         dkdv_launch,
         key,
         "dkdv",
-        (qf, kf, vf, dof, lsef, deltaf, ws_dk.view(-1), ws_dv.view(-1), B, S, stream),
+        (qf, kf, vf, dof, lse_s23f, deltaf, ws_dk.view(-1), ws_dv.view(-1), B, S, stream),
         B,
         S,
     )

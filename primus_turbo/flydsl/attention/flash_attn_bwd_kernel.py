@@ -471,39 +471,37 @@ def build_flash_attn_bwd_module(
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
         c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
-        # LSE arrives pre-scaled by -log2e from the host, so it is the exp2 addend
-        # directly: P = exp2(s*sm*log2e + lse). Saves the (-log2e)*lse mul.
-        neg_lse_log2e = lse_val
+        # LSE arrives host-prescaled as lse_s23 = (-log2e*lse)*2^23 + bias, i.e. the
+        # Schraudolph exp2 addend already scaled by 2^23, so _exp2_of folds its two
+        # fmas into one: scaled = s*(sm*log2e*2^23) + lse_s23 -> fptosi.
+        lse_s23_val = lse_val
         c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
         width_i32 = fx.Int32(WARP_SIZE)
         shuf_32_i32 = fx.Int32(32)
 
-        # Crude Schraudolph 2^x (fast_exp2): reinterpret the integer bits of
-        # x*2^23 + (127*2^23 + magic) as f32 -> piecewise-linear 2^x, trading the
-        # quarter-rate v_exp for 3 full-rate ops (max+fma+fptosi+bitcast). maximumf
-        # clamps the int convert AND guards the all-mask -inf (-> 2^-87=0, no
-        # exp2(-inf)=NaN; pitfalls/04). Only the fused kernel uses it: its epilogue
-        # renormalizes P = P~/rowsum(P~), restoring sum_j P=1 so the near-diagonal
-        # dS cancellation stays exact and dq accuracy is decoupled from the exp approx.
-        _c_exp2_floor = fx.Float32(-87.0)
-        _c_exp2_scale = fx.Float32(float(1 << 23))
-        _c_exp2_bias = fx.Float32(float(127 * (1 << 23) - 486411))
+        # Crude Schraudolph 2^x (fast_exp2): P~ = bitcast(fptosi((s*sm*log2e + lse)*
+        # 2^23 + bias)). With lse host-prescaled to lse_s23 (see lse_s23_val above),
+        # _exp2_of collapses to a SINGLE fma: scaled = s*(sm*log2e*2^23) + lse_s23,
+        # trading the quarter-rate v_exp for 2 full-rate ops (fma+fptosi+bitcast).
+        # The epilogue renormalizes P = P~/rowsum(P~), restoring sum_j P=1 so the
+        # near-diagonal dS cancellation stays exact (dq decoupled from the exp approx).
+        _c_scaled_scale = fx.Float32(sm_scale * _LOG2E * float(1 << 23))
+        _c_scaled_floor = fx.Float32(-87.0 * float(1 << 23) + float(127 * (1 << 23) - 486411))
         _exp2_compute_type = fx.Float32.ir_type
 
-        def _exp2_of(diff, apply_mask):
+        def _exp2_of(s_r, lse_t, apply_mask):
             if const_expr(fast_exp2):
-                # maximumf clamps the int convert AND guards the all-mask -inf, so
-                # it is only load-bearing on masked (diagonal) tiles. In the mask-
-                # free bulk, causal-valid softmax args are bounded (diff = log2e*
-                # (s*sm-lse) >> -87), so the clamp is a no-op there and is dropped
-                # (saves a v_max/slot; same treatment as the dkdv kernel).
+                # maximumf guards the all-mask -inf (masked s_r=-inf -> scaled -inf
+                # -> maximumf(floor) -> 2^-87=0, no exp2(-inf)=NaN; pitfalls/04), so
+                # it is load-bearing only on masked (diagonal) tiles. The mask-free
+                # bulk has bounded args (>> -87) so the clamp is dropped there.
+                scaled = fmath.fma(s_r, _c_scaled_scale, lse_t, fastmath=fm_fast)
                 if const_expr(apply_mask):
-                    xc = ArithValue(diff).maximumf(_c_exp2_floor)
-                else:
-                    xc = ArithValue(diff)
-                scaled = fmath.fma(xc, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
+                    scaled = ArithValue(scaled).maximumf(_c_scaled_floor)
                 i = arith.fptosi(fx.Int32.ir_type, _raw(scaled))
                 return ArithValue(i).bitcast(_exp2_compute_type)
+            # Exact path (fast_exp2=False, unused) expects lse_t = plain -log2e*lse.
+            diff = fmath.fma(s_r, c_sm_scale_log2e, lse_t, fastmath=fm_fast)
             return ArithValue(diff).exp2(fastmath=fm_fast)
 
         def reduction_peer(v_f32):
@@ -637,9 +635,7 @@ def build_flash_attn_bwd_module(
                 else:
                     s_lo_r = s_lo[r]
                     s_hi_r = s_hi[r]
-                diff_lo = fmath.fma(s_lo_r, c_sm_scale_log2e, neg_lse_log2e, fastmath=fm_fast)
-                diff_hi = fmath.fma(s_hi_r, c_sm_scale_log2e, neg_lse_log2e, fastmath=fm_fast)
-                return (_exp2_of(diff_lo, apply_mask), _exp2_of(diff_hi, apply_mask))
+                return (_exp2_of(s_lo_r, lse_s23_val, apply_mask), _exp2_of(s_hi_r, lse_s23_val, apply_mask))
 
             if const_expr(not IS_FUSED):
                 p_lo = []
@@ -1255,28 +1251,30 @@ def build_flash_attn_bwd_dkdv_module(
         c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
         c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
 
-        # Crude Schraudolph 2^x (fast_exp2): reinterpret the integer
-        # (s*sm*log2e + lse)*2^23 + (127*2^23 + magic) as f32 -> piecewise-linear
-        # 2^x (bitcast(fptosi(arg*2^23 + bias))).
-        _c_exp2_scale = fx.Float32(float(1 << 23))
-        _c_exp2_bias = fx.Float32(float(127 * (1 << 23) - 486411))
+        # Crude Schraudolph 2^x (fast_exp2): P = bitcast(fptosi((s*sm*log2e + lse)*
+        # 2^23 + bias)). The (lse*2^23 + bias) addend is pre-scaled on the host (see
+        # attention_flydsl_impl), so _p_of collapses to a SINGLE fma
+        # scaled = s*(sm*log2e*2^23) + lse_s23 -> fptosi: the diff fma and the
+        # Schraudolph *2^23+bias fma fold into one. lse_t is a plain loaded addend
+        # (not an in-kernel prescale), keeping it a clean fma(var,const,loaded)->fptosi.
+        _c_scaled_scale = fx.Float32(sm_scale * _LOG2E * float(1 << 23))
         _c_scaled_floor = fx.Float32(-87.0 * float(1 << 23) + float(127 * (1 << 23) - 486411))
         _compute_type = fx.Float32.ir_type
 
         def _p_of(s_r, lse_t, apply_mask):
-            diff = fmath.fma(s_r, c_sm_scale_log2e, lse_t, fastmath=fm_fast)
             if const_expr(fast_exp2):
-                # Schraudolph 2^x: bitcast(fptosi(arg*2^23 + bias)). The floor clamp
-                # is only load-bearing for masked slots (select -> -inf -> scaled
-                # -inf -> maximumf(floor) -> 2^-87=0; pitfalls/04). In the mask-free
-                # bulk, causal-valid softmax args are bounded (arg = log2e*(s*sm-lse),
-                # lse ~= rowmax + log(N) => arg rarely < -30 >> -87), so scaled stays
-                # positive and the clamp is a no-op -> dropped, saving a v_max/slot.
-                scaled = fmath.fma(diff, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
+                # The floor clamp is load-bearing only on masked (diagonal) slots
+                # (masked s_r=-inf -> scaled -inf -> maximumf(floor) -> 2^-87=0;
+                # pitfalls/04). In the mask-free bulk causal-valid softmax args are
+                # bounded (>> -87), so the clamp is a no-op there and is dropped.
+                scaled = fmath.fma(s_r, _c_scaled_scale, lse_t, fastmath=fm_fast)
                 if const_expr(apply_mask):
                     scaled = ArithValue(scaled).maximumf(_c_scaled_floor)
                 i = arith.fptosi(fx.Int32.ir_type, _raw(scaled))
                 return ArithValue(i).bitcast(_compute_type)
+            # Exact path (fast_exp2=False, unused in the campaign) expects lse_t to be
+            # the plain -log2e*lse, not the s23-prescaled addend.
+            diff = fmath.fma(s_r, c_sm_scale_log2e, lse_t, fastmath=fm_fast)
             return ArithValue(diff).exp2(fastmath=fm_fast)
 
         # A-operand read (Q/dO from LDS, M=q=lane_mod_32) for the S/dP GEMMs.
