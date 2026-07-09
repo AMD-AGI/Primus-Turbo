@@ -148,7 +148,7 @@ __global__ void rs_acc_kernel_pipe(float *acc, const char *input_sym, size_t seg
 // hipMalloc(qps, sizeof(QueuePair)*num_pes)). So N host-created contexts give N
 // QPs per peer-connection. These ctx variants round-robin blocks across a pool of
 // `nctx` contexts (ctxs[blockIdx % nctx]) so concurrent cross-node getmem_wg use
-// distinct QPs -> more NIC/RDMA concurrency. Selected only when ODC_GDA_NUM_QP>1;
+// distinct QPs -> more NIC/RDMA concurrency. Selected only when PRIMUS_TURBO_ODC_GDA_NUM_QP>1;
 // NUM_QP==1 keeps the original default-context path byte-for-byte.
 __global__ void gather_kernel_ctx(char *target, const char *src, size_t nbytes, const int *peers,
                                   int n_peers, size_t stride_bytes, rocshmem_ctx_t *ctxs,
@@ -196,7 +196,7 @@ static int g_initialized = 0;
 static int g_env_block = -1;
 static int env_block() {
     if (g_env_block < 0) {
-        const char *e = getenv("ODC_GDA_BLOCK");
+        const char *e = getenv("PRIMUS_TURBO_ODC_GDA_BLOCK");
         g_env_block   = e ? atoi(e) : 256;
         if (g_env_block < 32)
             g_env_block = 32;
@@ -208,7 +208,7 @@ static int env_block() {
 static int g_env_pipe = -1;
 static int env_pipe() { // reduce-scatter peer-pipeline batch depth (1 = original serial)
     if (g_env_pipe < 0) {
-        const char *e = getenv("ODC_GDA_PIPE");
+        const char *e = getenv("PRIMUS_TURBO_ODC_GDA_PIPE");
         g_env_pipe    = e ? atoi(e) : 1;
         if (g_env_pipe < 1)
             g_env_pipe = 1;
@@ -220,7 +220,7 @@ static int env_pipe() { // reduce-scatter peer-pipeline batch depth (1 = origina
 static int g_env_numqp = -1;
 static int env_numqp() {
     if (g_env_numqp < 0) {
-        const char *e = getenv("ODC_GDA_NUM_QP");
+        const char *e = getenv("PRIMUS_TURBO_ODC_GDA_NUM_QP");
         g_env_numqp   = e ? atoi(e) : 1;
         if (g_env_numqp < 1)
             g_env_numqp = 1;
