@@ -675,25 +675,25 @@ _GNT_AT_CACHE: dict = {}  # (M_pad, N, K, G, cbsz, blgp, out_fp16, persist) -> [
 _GNT_CFG_CACHE: dict = {}  # at_key -> (bm, gm, xcd, gn) chosen by autotune
 
 # fwd/dgrad NT autotune: balanced-distribution timing so the cached config depends only
-# on the static shape. PT_MXGG_AUTOTUNE=0 -> fixed base cfg; MX_DISABLE_NT_GN drops the
-# 2D N-band candidates.
+# on the static shape. PT_MXGG_AUTOTUNE=0 -> fixed base cfg.
 _GNT_AUTOTUNE = os.environ.get("PT_MXGG_AUTOTUNE", "1") != "0"
 _GNT_NT_DEFAULT_CFG = (256, 4, 4, 0)  # (BLOCK_M, GROUP_M, num_xcd, group_n); cand[0] = base ref
 
 
 def _gnt_nt_candidates(N):
-    """Flat (bm,gm,xcd,gn) autotune candidate list; cand[0] is the base reference."""
-    cands = [
-        (256, 4, 4, 0),  # base ref (current default)
-        (256, 8, 4, 0),
-        (256, 1, 4, 0),  # gm=1, xcd=4 — wins several MX MoE shapes
-        (256, 8, 8, 0),
-        (256, 4, 8, 0),
+    """Flat (bm,gm,xcd,gn) autotune candidate list (4 max); cand[0] is the base reference.
+
+    Trimmed 2026-07-09 from 5-7 to 4 via per-candidate AT_DBG timings across the MoE
+    bench shapes (mi355x_vs_b200_grouped_gemm_fp8_tensorwise.md): the 2D N-band (gn>0)
+    and (256,8,8,0) candidates never won on any fwd/dgrad shape, so only gm/xcd swizzles
+    are kept.
+    """
+    return [
+        (256, 4, 4, 0),  # base ref (default); wins the large majority of shapes
+        (256, 8, 4, 0),  # gm=8 — wins dsv3-GateUP fwd (M=2048)
+        (256, 4, 8, 0),  # xcd=8 — wins qwen3-Down fwd (M=2048)
+        (256, 1, 4, 0),  # gm=1 — wins several other MX MoE shapes (off-bench)
     ]
-    if not os.environ.get("MX_DISABLE_NT_GN"):
-        n_blocks = (N + _BLOCK_N - 1) // _BLOCK_N
-        cands += [(256, 8, 4, g) for g in (8, 16) if n_blocks >= 2 * g]
-    return cands
 
 
 def _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent):
