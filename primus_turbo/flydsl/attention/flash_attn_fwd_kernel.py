@@ -101,6 +101,7 @@ def build_flash_attn_fwd_module(
     daz=True,
     path_tag="auto",
     enable_dma=None,
+    fast_exp2=False,
 ):
     """Build a single-variant dense FlyDSL forward flash-attention launcher.
 
@@ -289,6 +290,26 @@ def build_flash_attn_fwd_module(
 
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
+
+        # Crude Schraudolph 2^x (fast_exp2): reinterpret the int bits of
+        # x*2^23 + (127*2^23 + magic) as f32 -> piecewise-linear 2^x, trading the
+        # quarter-rate v_exp for 3 full-rate ops (max+fma+fptosi+bitcast). maximumf
+        # clamps the int convert AND guards the all-mask -inf (-> 2^-87=0, no
+        # exp2(-inf)=NaN; pitfalls/04). Safe in the forward because O = sum P*V / l
+        # self-normalizes (the /l cancels the approx scale); the resulting LSE is
+        # approximate but the backward's fused dQ renormalizes P internally, so the
+        # near-diagonal dS cancellation is independent of the forward exp precision.
+        _c_exp2_floor = fx.Float32(-87.0)
+        _c_exp2_scale = fx.Float32(float(1 << 23))
+        _c_exp2_bias = fx.Float32(float(127 * (1 << 23) - 486411))
+
+        def _exp2_of(diff):
+            if const_expr(fast_exp2):
+                xc = ArithValue(diff).maximumf(_c_exp2_floor)
+                scaled = fmath.fma(xc, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
+                i = arith.fptosi(fx.Int32.ir_type, _raw(scaled))
+                return ArithValue(i).bitcast(compute_type)
+            return ArithValue(diff).exp2(fastmath=fm_fast)
 
         def mfma_acc(a, b, c):
             if const_expr(dtype_str == "bf16"):
@@ -1075,12 +1096,12 @@ def build_flash_attn_fwd_module(
                 local_sum = c_zero_f
                 for r in range_constexpr(16):
                     diff_lo = fmath.fma(s_raw_lo[r], c_sm_scale_log2e, neg_scaled_max, fastmath=fm_fast)
-                    p_lo = ArithValue(diff_lo).exp2(fastmath=fm_fast)
+                    p_lo = _exp2_of(diff_lo)
                     p_vals_lo.append(p_lo)
                     local_sum = _fadd(local_sum, p_lo)
                 for r in range_constexpr(16):
                     diff_hi = fmath.fma(s_raw_hi[r], c_sm_scale_log2e, neg_scaled_max, fastmath=fm_fast)
-                    p_hi = ArithValue(diff_hi).exp2(fastmath=fm_fast)
+                    p_hi = _exp2_of(diff_hi)
                     p_vals_hi.append(p_hi)
                     local_sum = _fadd(local_sum, p_hi)
 

@@ -117,6 +117,13 @@ def _get_fwd_launcher(num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_s
             # correctness/determinism are unaffected.
             enable_dma=True,
             path_tag="N128",
+            # Crude Schraudolph 2^x for the softmax P (fwd exp2 ~= 32% of the fwd
+            # wall). Safe: O = sum P*V / l self-normalizes so the fwd output stays
+            # accurate (cos ~0.9994); the approximate LSE it produces is consumed by
+            # the backward, whose fused dQ renormalizes P internally (sum_j P=1), so
+            # the near-diagonal dS cancellation is decoupled from the exp precision.
+            # Verified s8192 per-kernel dq/dk/dv cos>0.98 + det green.
+            fast_exp2=True,
         )
         _FWD_LAUNCHER_CACHE[key] = launch
     return launch, key
@@ -210,7 +217,15 @@ def _get_bwd_launchers(num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_
         # the double-bf16 pack+MFMA cost). The extra A/B accumulators raise VGPR
         # (~occ 3->2), so waves_per_eu=2 keeps the 256-VGPR occ-2 ceiling and avoids
         # spill; dkdv stays at its default 2.
-        fused_launch = build_flash_attn_bwd_module(mode="fused_dq_delta", waves_per_eu=2, **common)
+        # fast_exp2=True: recompute P with crude Schraudolph 2^x AND renormalize
+        # P = P~/rowsum(P~) in the epilogue. The renorm makes sum_j P=1 exact, so the
+        # near-diagonal dS cancellation (dq) is decoupled from the exp approximation
+        # (Schraudolph is non-multiplicative -> without renorm dq flips to cos -0.16).
+        # This cuts the fused kernel's ~26% exp2 wall time; the delta it writes for
+        # dkdv is the renormalized (true) delta.
+        fused_launch = build_flash_attn_bwd_module(
+            mode="fused_dq_delta", waves_per_eu=2, fast_exp2=True, **common
+        )
         # dkdv recomputes P with crude Schraudolph 2^x (fast_exp2): dK/dV have no
         # near-diagonal dS cancellation (dk/dv cos 0.9994 vs exact 0.99999, l2
         # 0.018 << 0.05 gate, s8192-verified), so trading exact exp2 for 3 full-
