@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional
 import pandas as pd
 import torch
 import torch.distributed as dist
-from config import get_platform_info
+from config import gen_moe_test_cases, get_platform_info
 from tabulate import tabulate
 
 # repo root (primus_turbo) on the path so the shared mega_utils + kernels import
@@ -27,8 +27,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..")))
 from mega_utils import (  # noqa: E402
     BF16_BYTES,
     aggregate_stage_metrics,
+    all_ranks_ok,
+    apply_case,
     bench,
     check_accuracy,
+    checks_verdict,
     dense_gemm_peak_ms,
     dispatch_only,
     generate_input,
@@ -38,6 +41,7 @@ from mega_utils import (  # noqa: E402
     print_stage,
     stage_columns,
     sync_ranks,
+    turbo_csv_row,
 )
 
 # import primus_turbo.pytorch first to dodge the mega kernels' circular import
@@ -325,6 +329,89 @@ def profile_dispatch_grouped_gemm(group, args):
     }
 
 
+# Models the fused dispatch+grouped-GEMM path cannot run yet (skipped in the sweep).
+# TODO(mega): moe_intermediate_size not a multiple of the GEMM tile (BN=256) ->
+# "All autotune configs failed" (DeepSeek-V2-Lite I=1408, MoE-1T I=1920). Support
+# a tail/remainder N tile so these odd intermediate sizes can run.
+UNSUPPORTED = {"DeepSeek-V2-Lite", "MoE-1T"}
+
+
+def _report_case(platform, gpu_name, world, args, case_name, per_rank):
+    """rank-0: aggregate one case's per-rank results -> (rich_row, csv_row); prints the detail block."""
+    # distributed bottleneck = slowest rank (max latency); work ~ uniform (mean)
+    xgmi = statistics.mean([res["xgmi_bytes"] for res in per_rank])
+    rank0_checks = per_rank[0]["checks"]
+
+    agg_fwd = aggregate_stage_metrics(per_rank, "fwd", xgmi)
+    agg_bwd = aggregate_stage_metrics(per_rank, "bwd", xgmi)
+    agg_wgrad = aggregate_stage_metrics(per_rank, "wgrad", xgmi)
+
+    print_header("dispatch", gpu_name, world, args, case=case_name)
+    print_stage(agg_fwd, comm_label="dispatch_only", comm_unit="GB/s (XGMI, nodeup)", comm_tag="disp")
+    print_stage(
+        agg_bwd,
+        comm_label="dispatch_only",
+        comm_unit="GB/s (XGMI, nodeup)",
+        comm_tag="disp",
+        sub_header="backward dgrad (NN, = dispatch_grouped_0)",
+    )
+    print_stage(
+        agg_wgrad,
+        comm_label="dispatch_only",
+        comm_unit="GB/s (XGMI, nodeup)",
+        comm_tag="disp",
+        sub_header="backward wgrad dW1 (TN, = dispatch + variable-K wgrad)",
+    )
+    rich_row = {
+        "Platform": platform,
+        "GPU": gpu_name,
+        "Case": case_name,
+        "EP": world,
+        "T": args.num_tokens,
+        "H": args.hidden,
+        "I": args.inter,
+        "E": args.num_experts,
+        "K": args.num_topk,
+        **stage_columns(
+            "",
+            agg_fwd,
+            rank0_checks.get("fwd"),
+            comm_label="dispatch_only",
+            comm_short="disp",
+            dense_ms=True,
+            xgmi=True,
+            hidden=True,
+        ),
+        **stage_columns(
+            "bwd ",
+            agg_bwd,
+            rank0_checks.get("bwd"),
+            comm_label="dispatch_only",
+            comm_short="disp",
+            xgmi=True,
+        ),
+        **stage_columns(
+            "wgrad ",
+            agg_wgrad,
+            rank0_checks.get("wgrad"),
+            comm_label="dispatch_only",
+            comm_short="disp",
+        ),
+    }
+    # saved CSV follows the gemm_turbo convention; Backward = dgrad + wgrad
+    csv_row = turbo_csv_row(
+        platform,
+        gpu_name,
+        world,
+        args,
+        case=case_name,
+        check=checks_verdict(rank0_checks),
+        fwd=agg_fwd,
+        bwd_stages=[agg_bwd, agg_wgrad],
+    )
+    return rich_row, csv_row
+
+
 def benchmark_dispatch_grouped_gemm(local_rank, world, args):
     master_addr = os.getenv("MASTER_ADDR", "127.0.0.1")
     port = int(os.getenv("MASTER_PORT", "8481"))
@@ -339,75 +426,40 @@ def benchmark_dispatch_grouped_gemm(local_rank, world, args):
     platform, gpu_name = get_platform_info()
 
     try:
-        result = profile_dispatch_grouped_gemm(group, args)
-        # all_gather_object fills per_rank[i] from rank i (already rank-ordered)
-        per_rank = [None] * world
-        dist.all_gather_object(per_rank, result, group=group)
-        if rank == 0:
-            # distributed bottleneck = slowest rank (max latency); work ~ uniform (mean)
-            xgmi = statistics.mean([res["xgmi_bytes"] for res in per_rank])
-            rank0_checks = per_rank[0]["checks"]
+        rich_rows, csv_rows = [], []
+        # sweep every MoE model (gemm_turbo-style); unsupported cases are skipped
+        for case in gen_moe_test_cases():
+            name = case["Case"]
+            if name in UNSUPPORTED:
+                if rank == 0:
+                    print(f"[skip] {name}: unsupported by mega dispatch (see UNSUPPORTED TODO)")
+                continue
+            apply_case(args, case)
+            sync_ranks(group)
+            ok, result = True, None
+            try:
+                result = profile_dispatch_grouped_gemm(group, args)
+            except Exception as e:  # noqa: BLE001  probe: skip cases the kernel can't run
+                ok = False
+                if rank == 0:
+                    print(f"[skip] {name}: {e!r}")
+            # collective agreement so every rank skips a failed case together (no hang)
+            if not all_ranks_ok(group, ok):
+                sync_ranks(group)
+                continue
+            per_rank = [None] * world  # all_gather_object fills per_rank[i] from rank i
+            dist.all_gather_object(per_rank, result, group=group)
+            if rank == 0:
+                rich_row, csv_row = _report_case(platform, gpu_name, world, args, name, per_rank)
+                rich_rows.append(rich_row)
+                csv_rows.append(csv_row)
+            sync_ranks(group)
 
-            agg_fwd = aggregate_stage_metrics(per_rank, "fwd", xgmi)
-            agg_bwd = aggregate_stage_metrics(per_rank, "bwd", xgmi)
-            agg_wgrad = aggregate_stage_metrics(per_rank, "wgrad", xgmi)
-
-            print_header("dispatch", gpu_name, world, args)
-            print_stage(agg_fwd, comm_label="dispatch_only", comm_unit="GB/s (XGMI, nodeup)", comm_tag="disp")
-            print_stage(
-                agg_bwd,
-                comm_label="dispatch_only",
-                comm_unit="GB/s (XGMI, nodeup)",
-                comm_tag="disp",
-                sub_header="backward dgrad (NN, = dispatch_grouped_0)",
-            )
-            print_stage(
-                agg_wgrad,
-                comm_label="dispatch_only",
-                comm_unit="GB/s (XGMI, nodeup)",
-                comm_tag="disp",
-                sub_header="backward wgrad dW1 (TN, = dispatch + variable-K wgrad)",
-            )
-            row = {
-                "Platform": platform,
-                "GPU": gpu_name,
-                "EP": world,
-                "T": args.num_tokens,
-                "H": args.hidden,
-                "I": args.inter,
-                "E": args.num_experts,
-                "K": args.num_topk,
-                **stage_columns(
-                    "",
-                    agg_fwd,
-                    rank0_checks.get("fwd"),
-                    comm_label="dispatch_only",
-                    comm_short="disp",
-                    dense_ms=True,
-                    xgmi=True,
-                    hidden=True,
-                ),
-                **stage_columns(
-                    "bwd ",
-                    agg_bwd,
-                    rank0_checks.get("bwd"),
-                    comm_label="dispatch_only",
-                    comm_short="disp",
-                    xgmi=True,
-                ),
-                **stage_columns(
-                    "wgrad ",
-                    agg_wgrad,
-                    rank0_checks.get("wgrad"),
-                    comm_label="dispatch_only",
-                    comm_short="disp",
-                ),
-            }
-            results = pd.DataFrame([row])
+        if rank == 0 and csv_rows:
             print("\nFinal Results:")
-            print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
+            print(tabulate(pd.DataFrame(rich_rows), headers="keys", tablefmt="grid", showindex=False))
             out_file = args.output or f"dispatch_grouped_gemm_{datetime.now():%Y%m%d}_{gpu_name}.csv"
-            results.to_csv(out_file, index=False)
+            pd.DataFrame(csv_rows).to_csv(out_file, index=False)
             print(f"Results saved to {out_file}")
         sync_ranks(group)
     finally:
@@ -417,10 +469,7 @@ def benchmark_dispatch_grouped_gemm(local_rank, world, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark fused BF16 dispatch + grouped GEMM")
     parser.add_argument("--num-processes", type=int, default=8)
-    parser.add_argument("--hidden", type=int, default=7168)  # DeepSeek-V3
-    parser.add_argument("--inter", type=int, default=2048)
-    parser.add_argument("--num-experts", type=int, default=256)
-    parser.add_argument("--num-topk", type=int, default=8)
+    # H/I/E/K come from each MoE model case (config.gen_moe_test_cases); no CLI knob
     parser.add_argument("--num-tokens", type=int, default=8192)
     parser.add_argument("--bm", type=int, default=256)
     parser.add_argument("--bn", type=int, default=256)

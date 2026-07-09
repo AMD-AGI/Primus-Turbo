@@ -72,6 +72,10 @@ __all__ = [
     "reduce_across_ranks",
     "aggregate_stage_metrics",
     "stage_columns",
+    "turbo_csv_row",
+    "checks_verdict",
+    "apply_case",
+    "all_ranks_ok",
     "print_header",
     "print_stage",
     "dispatch_only",
@@ -84,6 +88,25 @@ __all__ = [
     "combine_only",
     "topk_reduce_only",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Per-model sweep helpers: both mega benchmarks iterate config.gen_moe_test_cases,
+# sizing each run from one MoE model and skipping cases the kernel can't run.
+# --------------------------------------------------------------------------- #
+def apply_case(args, case):
+    """Set per-model geometry (H/I/E/K) on args from a gen_moe_test_cases entry."""
+    args.hidden = case["hidden"]
+    args.inter = case["inter"]
+    args.num_experts = case["num_experts"]
+    args.num_topk = case["num_topk"]
+
+
+def all_ranks_ok(group, ok):
+    """Collective AND of a per-rank bool; lets every rank skip an unsupported case together."""
+    flags = [None] * group.size()
+    dist.all_gather_object(flags, ok, group=group)
+    return all(flags)
 
 
 # --------------------------------------------------------------------------- #
@@ -725,6 +748,7 @@ def compute_stage_metrics(*, gemm_ms, dense_ms, dense_gm, comm_ms, fused_ms, flo
     roofline= max(gemm,comm) / fused         (overlap floor: the slower leg)"""
     serial_ms = gemm_ms + comm_ms
     return SimpleNamespace(
+        flops=flops,
         gemm_ms=gemm_ms,
         gemm_tf=flops / (gemm_ms * 1e-3) / 1e12,
         dense_ms=dense_ms,
@@ -799,10 +823,47 @@ def stage_columns(prefix, m, check, *, comm_label, comm_short, dense_ms=False, x
     return cols
 
 
-def print_header(tag, gpu_name, world, args):
+def checks_verdict(checks):
+    """Reduce a stage->AccuracyCheck dict to one PASS/FAIL (None checks ignored)."""
+    graded = [c for c in checks.values() if c is not None]
+    if not graded:
+        return "n/a"
+    return "PASS" if all(c.ok for c in graded) else "FAIL"
+
+
+def turbo_csv_row(platform, gpu_name, world, args, *, case, check, fwd, bwd_stages):
+    """Compact gemm_turbo-style CSV row: config + split Forward/Backward Time+TFLOPS.
+
+    case       : model case name (shared mega model, e.g. DeepSeek-V3).
+    fwd        : forward stage metrics namespace.
+    bwd_stages : backward stage namespaces summed into one Backward figure
+                 (dispatch: dgrad + wgrad; combine: dgrad only)."""
+    bwd_ms = sum(m.fused_ms for m in bwd_stages)
+    bwd_flops = sum(m.flops for m in bwd_stages)
+    bwd_tf = bwd_flops / (bwd_ms * 1e-3) / 1e12 if bwd_ms > 0 else 0.0
+    return {
+        "Platform": platform,
+        "GPU": gpu_name,
+        "Case": case,
+        "EP": world,
+        "T": args.num_tokens,
+        "H": args.hidden,
+        "I": args.inter,
+        "E": args.num_experts,
+        "K": args.num_topk,
+        "Check": check,
+        "Forward Time (ms)": f"{fwd.fused_ms:.3f}",
+        "Forward TFLOPS": f"{fwd.fused_tf:.1f}",
+        "Backward Time (ms)": f"{bwd_ms:.3f}",
+        "Backward TFLOPS": f"{bwd_tf:.1f}",
+    }
+
+
+def print_header(tag, gpu_name, world, args, *, case=None):
     """Common '===' header line shared by both benchmarks."""
+    case_tag = f" {case}" if case else ""
     print(
-        f"\n{'=' * 72}\n[{tag}] {gpu_name} EP{world} T={args.num_tokens} H={args.hidden} "
+        f"\n{'='*72}\n[{tag}]{case_tag} {gpu_name} EP{world} T={args.num_tokens} H={args.hidden} "
         f"I={args.inter} E={args.num_experts} K={args.num_topk} "
         f"(max over ranks)\n{'=' * 72}"
     )
