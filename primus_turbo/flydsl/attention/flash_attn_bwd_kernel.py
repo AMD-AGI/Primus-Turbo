@@ -490,9 +490,17 @@ def build_flash_attn_bwd_module(
         _c_exp2_bias = fx.Float32(float(127 * (1 << 23) - 486411))
         _exp2_compute_type = fx.Float32.ir_type
 
-        def _exp2_of(diff):
+        def _exp2_of(diff, apply_mask):
             if const_expr(fast_exp2):
-                xc = ArithValue(diff).maximumf(_c_exp2_floor)
+                # maximumf clamps the int convert AND guards the all-mask -inf, so
+                # it is only load-bearing on masked (diagonal) tiles. In the mask-
+                # free bulk, causal-valid softmax args are bounded (diff = log2e*
+                # (s*sm-lse) >> -87), so the clamp is a no-op there and is dropped
+                # (saves a v_max/slot; same treatment as the dkdv kernel).
+                if const_expr(apply_mask):
+                    xc = ArithValue(diff).maximumf(_c_exp2_floor)
+                else:
+                    xc = ArithValue(diff)
                 scaled = fmath.fma(xc, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
                 i = arith.fptosi(fx.Int32.ir_type, _raw(scaled))
                 return ArithValue(i).bitcast(_exp2_compute_type)
@@ -631,7 +639,7 @@ def build_flash_attn_bwd_module(
                     s_hi_r = s_hi[r]
                 diff_lo = fmath.fma(s_lo_r, c_sm_scale_log2e, neg_lse_log2e, fastmath=fm_fast)
                 diff_hi = fmath.fma(s_hi_r, c_sm_scale_log2e, neg_lse_log2e, fastmath=fm_fast)
-                return (_exp2_of(diff_lo), _exp2_of(diff_hi))
+                return (_exp2_of(diff_lo, apply_mask), _exp2_of(diff_hi, apply_mask))
 
             if const_expr(not IS_FUSED):
                 p_lo = []

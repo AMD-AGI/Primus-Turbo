@@ -303,9 +303,18 @@ def build_flash_attn_fwd_module(
         _c_exp2_scale = fx.Float32(float(1 << 23))
         _c_exp2_bias = fx.Float32(float(127 * (1 << 23) - 486411))
 
-        def _exp2_of(diff):
+        def _exp2_of(diff, apply_clamp=True):
             if const_expr(fast_exp2):
-                xc = ArithValue(diff).maximumf(_c_exp2_floor)
+                # maximumf clamps the int convert AND guards the masked -inf
+                # (-> 2^-87=0, no exp2(-inf)=NaN; pitfalls/04). It is only load-
+                # bearing on masked (diagonal) tiles; below-diagonal softmax args
+                # are bounded (diff = log2e*(s*sm - m) >> -87), so the clamp is a
+                # no-op there and is dropped (saves a v_max/slot; same treatment
+                # as the bwd fused/dkdv kernels).
+                if const_expr(apply_clamp):
+                    xc = ArithValue(diff).maximumf(_c_exp2_floor)
+                else:
+                    xc = ArithValue(diff)
                 scaled = fmath.fma(xc, _c_exp2_scale, _c_exp2_bias, fastmath=fm_fast)
                 i = arith.fptosi(fx.Int32.ir_type, _raw(scaled))
                 return ArithValue(i).bitcast(compute_type)
@@ -756,8 +765,7 @@ def build_flash_attn_fwd_module(
             init_args.append(fx.Index(0))
             coop_dma_k(fx.Index(0), buf_id=0)
 
-        loop_results = init_args
-        for kv_block_start, inner_iter_args in range(0, kv_upper, BLOCK_N_OUT, init=init_args):
+        def _kv_outer_body(kv_block_start, inner_iter_args, apply_mask):
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
             o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
@@ -865,9 +873,9 @@ def build_flash_attn_fwd_module(
                 if const_expr(CAUSAL):
                     kv_start_i32 = fx.Int32(kv_start)
                     lane_div_32_i32 = fx.Int32(lane_div_32)
-                    q_start_i32 = fx.Int32(q_start)
-                    max_kv_col_i32 = kv_start_i32 + fx.Int32(BLOCK_N - 1)
-                    tile_needs_mask = max_kv_col_i32 > q_start_i32
+                    # Compile-time (caller-split): below-diagonal blocks pass
+                    # apply_mask=False and skip the compare+select entirely.
+                    tile_needs_mask = apply_mask
                     s_raw_lo_0 = s_raw_lo[0]
                     s_raw_lo_1 = s_raw_lo[1]
                     s_raw_lo_2 = s_raw_lo[2]
@@ -1096,12 +1104,12 @@ def build_flash_attn_fwd_module(
                 local_sum = c_zero_f
                 for r in range_constexpr(16):
                     diff_lo = fmath.fma(s_raw_lo[r], c_sm_scale_log2e, neg_scaled_max, fastmath=fm_fast)
-                    p_lo = _exp2_of(diff_lo)
+                    p_lo = _exp2_of(diff_lo, apply_clamp=apply_mask)
                     p_vals_lo.append(p_lo)
                     local_sum = _fadd(local_sum, p_lo)
                 for r in range_constexpr(16):
                     diff_hi = fmath.fma(s_raw_hi[r], c_sm_scale_log2e, neg_scaled_max, fastmath=fm_fast)
-                    p_hi = _exp2_of(diff_hi)
+                    p_hi = _exp2_of(diff_hi, apply_clamp=apply_mask)
                     p_vals_hi.append(p_hi)
                     local_sum = _fadd(local_sum, p_hi)
 
@@ -1280,7 +1288,26 @@ def build_flash_attn_fwd_module(
                     _yield_args.append(fx.Index(1) - _cur_buf_id)
                 else:
                     _yield_args.append(_cur_buf_id)
-            loop_results = yield _yield_args
+            return _yield_args
+
+        # Split the causal kv-loop at the diagonal: [0, q_start) is fully below the
+        # diagonal (no mask, no exp2 clamp), [q_start, kv_upper) straddles it (mask
+        # + clamp). q_start = q_tile_idx * BLOCK_M is a multiple of BLOCK_N_OUT, so
+        # the split is exact and reproduces the per-tile tile_needs_mask decision.
+        # This drops the mask compare+select AND the exp2 v_max clamp from every
+        # below-diagonal outer block (the large majority), mirroring the bwd fused
+        # kernel. buf_id/m/l/o loop-carry threads through both loops unchanged, and
+        # the last unmasked iteration's DMA prefetch feeds the first masked tile.
+        loop_results = init_args
+        if const_expr(CAUSAL):
+            for kv_block_start, inner_iter_args in range(0, q_start, BLOCK_N_OUT, init=init_args):
+                loop_results = yield _kv_outer_body(kv_block_start, inner_iter_args, False)
+            _tail_init = loop_results if isinstance(loop_results, (list, tuple)) else [loop_results]
+            for kv_block_start, inner_iter_args in range(q_start, kv_upper, BLOCK_N_OUT, init=_tail_init):
+                loop_results = yield _kv_outer_body(kv_block_start, inner_iter_args, True)
+        else:
+            for kv_block_start, inner_iter_args in range(0, kv_upper, BLOCK_N_OUT, init=init_args):
+                loop_results = yield _kv_outer_body(kv_block_start, inner_iter_args, True)
 
         # ---- Normalize and store O (128-bit buffer_store_dwordx4) ----
         # gfx950: pack 4 f32 -> 2 bf16 dwords (cvt_pk_bf16_f32), permlane32_swap fuses
