@@ -287,6 +287,15 @@ def build_kernels_extension():
     extra_flags["extra_link_args"] += [
         "-shared",
         "-Wl,-soname,libprimus_turbo_kernels.so",
+        # [experiment A] Force a single device-LTO partition so the rocSHMEM
+        # device runtime (default context) and the ODC GDA device kernels stay
+        # in ONE device-LTO unit. The default multi-partition device link
+        # (--lto-partitions=8 + -amdgpu-internalize-symbols) splits the rocSHMEM
+        # device default context away from the ODC kernels -> device getmem reads
+        # zero -> dual-node grad_norm=0. Keeping them in one partition mirrors the
+        # single-TU pinfix .so that works.
+        "-Xoffload-linker",
+        "--lto-partitions=1",
     ]
 
     kernels_source_files = Path(PROJECT_ROOT / "csrc" / "kernels")
