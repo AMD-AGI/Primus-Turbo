@@ -497,14 +497,23 @@ def build_flash_attn_fwd_module(
         def v_buf_base(buf_id):
             return fx.Index(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
 
-        # ---- K XOR swizzle: col ^ ((row & (K_STRIDE//16 - 1)) << 4) at 16-element
-        # granularity. The mask MUST be derived from K_STRIDE (=head_dim): a
-        # hardcoded 0x7 assumes a 128-wide row and, for head_dim=64, sets bit 6 so
-        # col^mask overflows the 64-wide LDS row and aliases the next K row -> silent
-        # data corruption (d64 fwd cos ~0.8). D64 -> &3, D128 -> &7 (shape-general).
+        # ---- K LDS bank-conflict swizzle (gfx950, 64 banks, bf16 b128 reads) ----
+        # A d64 K row is 64 elems = 128 B = 32 dwords, so on 64 banks same-parity
+        # rows share a 32-bank half; the 16 same-parity rows must be spread across
+        # all 8 aligned 16 B (8-elem) slots of that half to hit the b128 2-way floor.
+        # The legacy (row & 3) << 4 mask gives only TWO distinct values per parity
+        # -> 8 rows collapse onto one 16 B slot = 8-way conflict (measured ~60% of
+        # LDS-active cycles). ((row>>1) & 7) << 3 (= ((row//2)%8)*8 elems) yields 8
+        # distinct aligned offsets -> 2-way. Applied identically on the read, the DMA
+        # global fetch and the (unused-under-DMA) VGPR write paths (XOR self-inverse,
+        # so store@(c^mask) + read^mask round-trips). D128 keeps the legacy mask.
+        def _k_bank_mask(row_idx):
+            if const_expr(K_STRIDE == 64):
+                return ((row_idx // fx.Index(2)) % fx.Index(8)) * fx.Index(8)
+            return (row_idx & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
+
         def _k_swizzle(row_idx, col_idx):
-            mask = (row_idx & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
-            return col_idx ^ mask
+            return col_idx ^ _k_bank_mask(row_idx)
 
         # ---- Cooperative K load (row-major, XOR-swizzled) ----
         def coop_load_k(tile_start, buf_id=0):
@@ -645,9 +654,9 @@ def build_flash_attn_fwd_module(
 
                     row_in_tile = tid // LANES_PER_K_ROW + fx.Index(d * ROWS_PER_DMA_BATCH)
                     swiz_col_f16 = (tid % LANES_PER_K_ROW) * (DMA_BYTES // 2)
-                    # head_dim-general K swizzle mask (see _k_swizzle): 0x7 assumes a
-                    # 128-wide row and corrupts d64 by aliasing into the next K row.
-                    xor_mask = (row_in_tile & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
+                    # Same bank-conflict swizzle as the read path (see _k_bank_mask):
+                    # store logical col c at physical c^mask so read^mask round-trips.
+                    xor_mask = _k_bank_mask(row_in_tile)
                     unsw_col_f16 = swiz_col_f16 ^ xor_mask
                     col_byte = unsw_col_f16 * 2
                     global_row = tile_start + row_in_tile  # 0-based: batch base folded into k/v_rsrc
@@ -832,10 +841,9 @@ def build_flash_attn_fwd_module(
 
                 # ==== GEMM1: bulk-read all K packs, then pipeline MFMAs ====
                 k_hi_offset = K_SUB_N * K_STRIDE
-                # XOR swizzle: col ^ ((row & (K_STRIDE//16 - 1)) << 4) avoids LDS bank
-                # conflicts. Must match _k_swizzle on the write side: a hardcoded 0x7
-                # corrupts d64 (reads from an aliased K row). D64 -> &3, D128 -> &7.
-                k_swz_mask = (lane_mod_32 & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
+                # Bank-conflict swizzle (see _k_bank_mask): must match the write/DMA
+                # side exactly (XOR self-inverse). d64 -> ((row//2)%8)*8 (2-way floor).
+                k_swz_mask = _k_bank_mask(lane_mod_32)
 
                 # k_base/k_swz_mask/k_hi_offset are rebound once per kv_sub iteration and
                 # both helpers are only ever called within that same iteration (never
