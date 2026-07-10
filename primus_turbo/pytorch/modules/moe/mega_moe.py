@@ -119,11 +119,12 @@ class MegaMoE(nn.Module):
                     "the fused router ignores expert_bias for expert selection. "
                     "Set moe_router_enable_expert_bias=False or use the non-fused router."
                 )
-            self.expert_bias = None
         else:
             self.gate_weight = None
             self.gate_bias = None
-            self.expert_bias = None
+        # No expert_bias attribute on purpose: Megatron duck-types expert_bias +
+        # local_tokens_per_expert together in _update_router_expert_bias; exposing
+        # only expert_bias (unimplemented) would trip that loop.
 
         # per-rank expert shard: w1 [g, 2I, H] (gate+up), w2 [g, H, I]
         self.w1 = nn.Parameter(
@@ -132,12 +133,6 @@ class MegaMoE(nn.Module):
         self.w2 = nn.Parameter(
             torch.empty((self.experts_per_rank, hidden_size, intermediate_size), **factory_kwargs)
         )
-        # expert-sharded weights: exclude from dense DP all-reduce (EP>1).
-        # Megatron reads param.allreduce for DDP bucketing/optimizer grouping;
-        # untagged w1/w2 would be reduced across EP as if replicated.
-        expert_parallel = self.ep_size > 1
-        for param in (self.w1, self.w2):
-            param.allreduce = not expert_parallel
 
         # optional shared expert (replicated, run on every token)
         self.shared_expert_intermediate_size: Optional[int] = shared_expert_intermediate_size
@@ -173,8 +168,6 @@ class MegaMoE(nn.Module):
                     (init1 or (lambda w: nn.init.kaiming_uniform_(w, a=math.sqrt(5))))(self.gate_weight)
                 if self.gate_bias is not None:
                     self.gate_bias.zero_()
-                if self.expert_bias is not None:
-                    self.expert_bias.zero_()
                 if self.shared_w1 is not None:
                     (init1 or (lambda w: w.normal_(std=2.0 / math.sqrt(self.hidden_size))))(self.shared_w1)
                     (

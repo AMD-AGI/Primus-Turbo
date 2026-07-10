@@ -489,7 +489,7 @@ def _compiled_dispatch_prologue(
     )
 
 
-def dispatch_prologue(
+def dispatch_prologue_flydsl_kernel(
     topk_idx,
     topk_weight,
     *,

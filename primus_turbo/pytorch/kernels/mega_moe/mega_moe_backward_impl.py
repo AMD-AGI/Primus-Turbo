@@ -11,13 +11,11 @@ from typing import List, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (
-    dispatch_grouped_gemm_bf16,
+from primus_turbo.flydsl.mega import (
+    dispatch_grouped_gemm_bf16_flydsl_kernel,
+    grouped_gemm_combine_bf16_flydsl_kernel,
+    swiglu_backward_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (
-    grouped_gemm_combine_bf16,
-)
-from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
@@ -31,7 +29,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
-# dispatch handle layout (see dispatch_prologue_kernel.py return order).
+# dispatch handle layout (see dispatch_prologue_flydsl_kernel.py return order).
 _HANDLE_LEN = 9
 _H_NUM_TOKENS_PER_EXPERT = 7
 _H_NUM_TOKENS_PER_EXPERT_PREFIX = 8
@@ -80,7 +78,7 @@ class MegaMoEBackwardFlyDSLBackend(KernelBackend):
         dy = grad_y.contiguous().to(torch.bfloat16)
 
         # L2 dgrad: cross-rank dispatch PUSH + grouped GEMM (nn)
-        grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_bf16(
+        grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(
             dy,
             w2,
             group,
@@ -89,7 +87,7 @@ class MegaMoEBackwardFlyDSLBackend(KernelBackend):
         )
 
         # SwiGLU^T (re-inject routing weight) + gate grad
-        grad_l1, grad_gate, act_weighted = swiglu_backward(
+        grad_l1, grad_gate, act_weighted = swiglu_backward_flydsl_kernel(
             grad_swiglu,
             l1_out,
             scale=dispatch_weights_in_buf,
@@ -111,7 +109,7 @@ class MegaMoEBackwardFlyDSLBackend(KernelBackend):
         )
 
         # L1 dgrad (grad_l1 @ w1, nn) + combine PUSH + dx reduce + grad_gate scatter
-        dx, grad_topk_weights_flat = grouped_gemm_combine_bf16(
+        dx, grad_topk_weights_flat = grouped_gemm_combine_bf16_flydsl_kernel(
             grad_l1,
             w1,
             handle,
@@ -122,7 +120,7 @@ class MegaMoEBackwardFlyDSLBackend(KernelBackend):
         )
 
         # dW1 = pool(x)^T @ grad_l1 (variable-K tn wgrad; re-dispatch saved x)
-        dW1, _, _, _ = dispatch_grouped_gemm_bf16(
+        dW1, _, _, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(
             saved_x,
             grad_l1,
             group,

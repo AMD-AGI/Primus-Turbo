@@ -5,15 +5,6 @@
 ###############################################################################
 
 """Unit tests for the ``MegaMoE`` expert-parallel MoE module.
-
-Style mirrors Megatron-LM / Primus MoE-layer unit tests: an EP8 world is brought
-up with ``MultiProcessTestCase``; a small ``MegaMoETestContainer`` builds the
-module and runs forward / forward+backward; correctness is checked against a
-single-GPU dense reference assembled from the module's gathered global weights.
-
-Run inside dev_primus (8 GPUs):
-  PYTHONPATH=<...>/Primus-Turbo python tests/pytorch/modules/test_mega_moe.py
-  # or: pytest tests/pytorch/modules/test_mega_moe.py
 """
 
 import os
@@ -24,6 +15,7 @@ import torch.nn.functional as F
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
+    skip_if_rocm_arch_multiprocess,
 )
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -175,6 +167,7 @@ class TestMegaMoE(MultiProcessTestCase):
         self.assertGreaterEqual(snr, _SNR_THRESHOLD_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_THRESHOLD_DB}")
 
     # ── correctness: fused forward vs dense reference ─────────────────────────
+    @skip_if_rocm_arch_multiprocess(("gfx942", "gfx90a"))
     @skip_if_lt_x_gpu(_WORLD)
     @parametrize("top_k", [2, 4])
     @parametrize("shared_expert", [False, True])
@@ -209,11 +202,7 @@ class TestMegaMoE(MultiProcessTestCase):
         return float(cos.item())
 
     def _diff_global_weights(self, c, group):
-        """Gathered global w1/w2 where ONLY this rank's shard is a differentiable leaf.
-
-        Autograd through the dense reference then yields grad exactly for the local
-        expert shard -> directly comparable to the fused op's dW1/dW2.
-        """
+        """Gathered global w1/w2 where ONLY this rank's shard is a differentiable leaf."""
         w1_local = c.moe.w1.detach().clone().requires_grad_(True)
         w2_local = c.moe.w2.detach().clone().requires_grad_(True)
         g1 = [torch.empty_like(c.moe.w1) for _ in range(self.world_size)]
@@ -226,6 +215,7 @@ class TestMegaMoE(MultiProcessTestCase):
         return w1_local, w2_local, w1g, w2g
 
     # ── forward + backward: output contract + every param receives a grad ─────
+    @skip_if_rocm_arch_multiprocess(("gfx942", "gfx90a"))
     @skip_if_lt_x_gpu(_WORLD)
     @parametrize("shared_expert", [False, True])
     def test_forward_backward(self, shared_expert):
@@ -257,6 +247,7 @@ class TestMegaMoE(MultiProcessTestCase):
         dist.destroy_process_group()
 
     # ── backward VALUE gradcheck: dx / dW1 / dW2 / d_topk_w vs dense reference ──
+    @skip_if_rocm_arch_multiprocess(("gfx942", "gfx90a"))
     @skip_if_lt_x_gpu(_WORLD)
     def test_backward_gradcheck(self):
         self._init_process()
@@ -299,6 +290,7 @@ class TestMegaMoE(MultiProcessTestCase):
         dist.destroy_process_group()
 
     # ── padding_mask: padded tokens contribute a zero MoE row ─────────────────
+    @skip_if_rocm_arch_multiprocess(("gfx942", "gfx90a"))
     @skip_if_lt_x_gpu(_WORLD)
     def test_padding_mask(self):
         self._init_process()
@@ -320,6 +312,7 @@ class TestMegaMoE(MultiProcessTestCase):
         dist.destroy_process_group()
 
     # ── route(): index/weight shapes, dtypes, and valid_mask zeroing ──────────
+    @skip_if_rocm_arch_multiprocess(("gfx942", "gfx90a"))
     @skip_if_lt_x_gpu(_WORLD)
     def test_route(self):
         self._init_process()

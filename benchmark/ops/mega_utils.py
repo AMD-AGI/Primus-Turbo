@@ -40,7 +40,10 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
 )
-from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+from primus_turbo.flydsl.mega import (
+    dispatch_prologue_flydsl_kernel,
+    swiglu_flydsl_kernel,
+)
 from primus_turbo.flydsl.mega.ep_intranode import (
     _BLOCK_THREADS,
     _NUM_WARPS,
@@ -49,7 +52,6 @@ from primus_turbo.flydsl.mega.ep_intranode import (
     dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.swiglu_kernel import swiglu
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.utils.gemm_helper import (
     ceildiv,
@@ -79,12 +81,12 @@ __all__ = [
     "print_header",
     "print_stage",
     "dispatch_only",
-    "dispatch_prologue",
+    "dispatch_prologue_flydsl_kernel",
     "grouped_gemm_bf16_only",
     "grouped_gemm_variable_k_only",
     "compile_grouped_gemm_bf16",
     "get_symm_buffer_for_mega_moe",
-    "swiglu",
+    "swiglu_flydsl_kernel",
     "combine_only",
     "topk_reduce_only",
 ]
@@ -111,7 +113,7 @@ def all_ranks_ok(group, ok):
 
 # --------------------------------------------------------------------------- #
 # Bench-only baselines (moved here from the kernel module so the kernel file keeps
-# only the fused dispatch_grouped_gemm_bf16): the grouped-GEMM / dispatch-only /
+# only the fused dispatch_grouped_gemm_bf16_flydsl_kernel): the grouped-GEMM / dispatch-only /
 # variable-K TN wgrad compute peaks, plus their thin host wrappers.
 # --------------------------------------------------------------------------- #
 # Grouped GEMM-only launcher (the compute-peak baseline). Dense XCD-swizzle
@@ -280,7 +282,6 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
                     sym_layout,
                     thread_index=thread_index,
                     hidden_size=hidden_size,
-                    num_max_pool_tokens=num_max_pool_tokens,
                     input_res=input_res,
                     expert_send_dst_rank_res=expert_send_dst_rank_res,
                     expert_send_dst_row_res=expert_send_dst_row_res,
@@ -320,7 +321,7 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
 # Grouped TN wgrad (variable-K) GEMM-only baseline over dispatched pools:
 # dW[g] = lhs_pool[g]^T @ rhs_pool[g], out [G, OUT_M, OUT_N]. The compute core is
 # the canonical _compile_grouped_variable_k_bf16 (gemm_bf16_kernel); the fused
-# dispatch+wgrad path lives in dispatch_grouped_gemm_bf16(layout="tn").
+# dispatch+wgrad path lives in dispatch_grouped_gemm_bf16_flydsl_kernel(layout="tn").
 # --------------------------------------------------------------------------- #
 def grouped_gemm_variable_k_only(
     lhs_pool,  # [M_pool, OUT_M] bf16   dispatched lhs (e.g. recomputed activation)
@@ -621,7 +622,7 @@ def _build_symm_and_plan(group, *, T, H, I, E, K, BLOCK_M, BLOCK_N, base_seed):
     # prologue -> the flat dispatch handle (same path as the test); resets scoreboard +
     # barrier_local in-kernel and ends with a cross-rank barrier. The handle IS the full
     # prologue tuple (tile_to_expert / tile_expected / group_offs ride at fixed indices).
-    handle = dispatch_prologue(
+    handle = dispatch_prologue_flydsl_kernel(
         topk_idx,
         topk_weight,
         sym_layout=symm.get_sym_layout(),
@@ -713,7 +714,7 @@ def generate_input(group, *, kind, T, H, I, E, K, BLOCK_M, BLOCK_N, num_dispatch
             BLOCK_N=BLOCK_N,
         )
         # fused SwiGLU activation -> act (L2 GEMM input)
-        act = swiglu(l1_out)
+        act = swiglu_flydsl_kernel(l1_out)
         # fill l2_token_buffer once with the real rows (for combine_only)
         grouped_gemm_bf16_only(
             act, W2, symm.l2_token_buffer, tile_to_expert, num_tile_blocks, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N

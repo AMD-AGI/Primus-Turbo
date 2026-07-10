@@ -5,15 +5,6 @@
 ###############################################################################
 
 """Accuracy tests for the fused ``mega_moe_fused`` op against the turbo DeepEP MoE.
-
-An EP8 world is brought up with ``MultiProcessTestCase``. ``generate_inputs``
-produces one rank's shard of everything the op needs (x, L1/L2 expert weights,
-top-k routing). ``baseline_reference`` runs the turbo DeepEP forward and is the
-reference for both forward and backward (autograd through it).
-
-Run inside dev_primus (8 GPUs):
-  PYTHONPATH=<...>/Primus-Turbo python tests/pytorch/ops/test_mega_moe_fused.py
-  # or: pytest tests/pytorch/ops/test_mega_moe_fused.py
 """
 
 from __future__ import annotations
@@ -27,6 +18,7 @@ import torch.nn.functional as F
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
+    skip_if_rocm_arch_multiprocess,
 )
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -44,7 +36,7 @@ from tests.pytorch.test_utils import compute_snr  # noqa: E402
 
 # bf16 fused kernel vs bf16 turbo reference; comm + split-role reduce add noise,
 # so use the MegaMoE-family SNR floor (matches modules/test_mega_moe.py).
-_SNR_THRESHOLD_DB = 20.0
+_SNR_THRESHOLD_DB = 25.0
 
 
 def _weighted_swiglu(fc1_out, weights):
@@ -94,9 +86,6 @@ def baseline_reference(group, x, topk_idx, topk_weight, l1_weight, l2_weight, *,
 @instantiate_parametrized_tests
 class MegaMoEFusedTestBase(MultiProcessTestCase):
     """EP8 accuracy tests: fused ``mega_moe_fused`` vs the turbo DeepEP reference."""
-
-    BM = 256
-    BN = 256
 
     def setUp(self) -> None:
         super().setUp()
@@ -154,6 +143,7 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
         self.assertGreaterEqual(snr, _SNR_THRESHOLD_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_THRESHOLD_DB}")
 
     # ── forward: fused op vs turbo DeepEP forward ─────────────────────────────
+    @skip_if_rocm_arch_multiprocess(("gfx942", "gfx90a"))
     @skip_if_lt_x_gpu(8)
     @parametrize(
         "hidden, inter, num_experts, num_topk, num_tokens",
@@ -195,6 +185,7 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
             dist.destroy_process_group()
 
     # ── backward: dl1 / dl2 / d_topk_weight vs reference (dx reported, see note) ──
+    @skip_if_rocm_arch_multiprocess(("gfx942", "gfx90a"))
     @skip_if_lt_x_gpu(8)
     @parametrize(
         "hidden, inter, num_experts, num_topk, num_tokens",

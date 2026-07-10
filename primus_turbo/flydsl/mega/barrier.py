@@ -51,7 +51,7 @@ def grid_sync(
             if spin_timed_out(spin_start):
                 # tag/rank are compile-time constants, baked into the format string
                 fx.printf(
-                    "[MEGA rank=" + str(rank) + " " + tag + "] grid_sync STUCK: waiting on peer blocks; "
+                    "[MEGA rank=" + str(rank) + " " + tag + "] grid_sync stuck: waiting on peer blocks; "
                     "this block={} arrived_count={} expected_num_blocks={}\n",
                     block_id,
                     new_value,
@@ -92,7 +92,7 @@ def xgmi_barrier(
                 if spin_timed_out(spin_start):
                     # rank/tag are compile-time constants, baked into the format string
                     fx.printf(
-                        "[MEGA rank=" + str(rank) + " " + tag + "] xgmi_barrier STUCK: "
+                        "[MEGA rank=" + str(rank) + " " + tag + "] xgmi_barrier stuck: "
                         "peer={} has not arrived (outstanding signal={})\n",
                         thread_id,
                         my_signal_value,

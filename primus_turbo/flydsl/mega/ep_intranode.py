@@ -33,7 +33,6 @@ def dispatch_bf16_tile(
     sym_layout: SymLayout,
     thread_index: fx.Int32,
     hidden_size: int,
-    num_max_pool_tokens: int,
     input_res: fx.ArithValue,
     expert_send_dst_rank_res: fx.ArithValue,
     expert_send_dst_row_res: fx.ArithValue,
@@ -230,6 +229,14 @@ def topk_reduce_bf16_tile(
             _wait_mem()
 
         token_row_off = token * fx.Int32(topk) * fx.Int32(out_features)
+        # Prefetch per-slot validity (scalar, once per token).
+        valid = []
+        for j in range_constexpr(topk):
+            idx = buffer_load(
+                topk_indices_res, token * fx.Int32(topk) + fx.Int32(j), vec_width=1, dtype=fx.T.i64()
+            )
+            valid.append((idx >= fx.Int64(0)) & (idx < fx.Int64(num_experts)))
+        zero_vec = fx.arith.constant_vector(0.0, f32_vec)
         vec_idx = lane_id
         while vec_idx < fx.Int32(num_vec_chunks):
             col = vec_idx * fx.Int32(_PVEC)
@@ -257,6 +264,7 @@ def topk_reduce_bf16_tile(
                 term = fx.arith.extf(f32_vec, topk_vals[j])
                 if const_expr(apply_weights):
                     term = fx.arith.mulf(term, _vector.broadcast(f32_vec, weights[j]))
+                term = fx.arith.select(valid[j], term, zero_vec)
                 acc = term if acc is None else fx.arith.addf(acc, term)
             buffer_store(fx.arith.trunc_f(bf16_vec, acc), output_res, token * fx.Int32(out_features) + col)
             vec_idx = vec_idx + fx.Int32(_WARP)

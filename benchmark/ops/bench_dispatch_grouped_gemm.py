@@ -46,8 +46,8 @@ from mega_utils import (  # noqa: E402
 
 # import primus_turbo.pytorch first to dodge the mega kernels' circular import
 import primus_turbo.pytorch  # noqa: E402,F401
-from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (  # noqa: E402
-    dispatch_grouped_gemm_bf16,
+from primus_turbo.flydsl.mega import (  # noqa: E402
+    dispatch_grouped_gemm_bf16_flydsl_kernel,
 )
 from primus_turbo.pytorch.ops import grouped_gemm as turbo_grouped_gemm  # noqa: E402
 
@@ -171,7 +171,7 @@ def _make_context(group, args):
 def _make_fused_call(ctx, lhs, rhs, layout, *, trans_c=False):
     """Build the fused dispatch+GEMM call; stages differ only in operands / layout / trans_c."""
     args = ctx.args
-    return lambda: dispatch_grouped_gemm_bf16(
+    return lambda: dispatch_grouped_gemm_bf16_flydsl_kernel(
         lhs,
         rhs,
         ctx.group,

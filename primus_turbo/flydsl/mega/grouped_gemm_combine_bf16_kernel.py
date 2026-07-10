@@ -303,7 +303,7 @@ def _rewind_combine_flags(kwargs):
 
 
 @autotune(
-    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64) for rc in (256, 512)],
+    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64) for rc in (256,)],
     # layout_code MUST be a key: nt/nn have OPPOSITE combine_cu optima (see wrapper note).
     key=[
         "out_features",
@@ -402,7 +402,7 @@ def _compiled_grouped_gemm_combine(
     ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
 
-def grouped_gemm_combine_bf16(
+def grouped_gemm_combine_bf16_flydsl_kernel(
     x,
     l2_weights,
     handle,

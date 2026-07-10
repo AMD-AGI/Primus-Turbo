@@ -11,13 +11,11 @@ from typing import List, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (
-    dispatch_grouped_gemm_bf16,
+from primus_turbo.flydsl.mega import (
+    dispatch_grouped_gemm_bf16_flydsl_kernel,
+    grouped_gemm_combine_bf16_flydsl_kernel,
+    swiglu_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (
-    grouped_gemm_combine_bf16,
-)
-from primus_turbo.flydsl.mega.swiglu_kernel import swiglu
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
@@ -28,7 +26,7 @@ from primus_turbo.pytorch.core.backend import (
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
-# dispatch handle layout (see dispatch_prologue_kernel.py return order).
+# dispatch handle layout (see dispatch_prologue_flydsl_kernel.py return order).
 _HANDLE_LEN = 9
 
 
@@ -64,7 +62,7 @@ class MegaMoEForwardFlyDSLBackend(KernelBackend):
         topk_idx = topk_idx.to(torch.int64)
 
         # fused prologue + cross-rank dispatch PUSH + grouped L1 GEMM (nt)
-        l1_out, _, dispatch_weights_in_buf, handle = dispatch_grouped_gemm_bf16(
+        l1_out, _, dispatch_weights_in_buf, handle = dispatch_grouped_gemm_bf16_flydsl_kernel(
             x,
             w1,
             group,
@@ -74,10 +72,10 @@ class MegaMoEForwardFlyDSLBackend(KernelBackend):
             layout=layout,
         )
 
-        act = swiglu(l1_out)
+        act = swiglu_flydsl_kernel(l1_out)
 
         # fused grouped L2 GEMM + combine PUSH + topk reduce
-        y, _ = grouped_gemm_combine_bf16(
+        y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
             act,
             w2,
             handle,

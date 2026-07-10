@@ -54,8 +54,8 @@ from megatron.core.fusions.fused_bias_swiglu import (  # noqa: E402
 
 import primus_turbo.pytorch  # noqa: E402,F401  # load full pkg first to break the circular import
 import primus_turbo.pytorch as turbo  # noqa: E402
-from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (  # noqa: E402
-    grouped_gemm_combine_bf16,
+from primus_turbo.flydsl.mega import (  # noqa: E402
+    grouped_gemm_combine_bf16_flydsl_kernel,
 )
 from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
 
@@ -209,7 +209,7 @@ def _make_context(group, args, turbo_reference):
 def _make_fused_call(ctx, lhs, rhs, *, layout="nt", topk_weights):
     """Build the fused GEMM + combine PUSH + topk-reduce call (3-role); stages differ in operands / layout / weights."""
     args = ctx.args
-    return lambda: grouped_gemm_combine_bf16(
+    return lambda: grouped_gemm_combine_bf16_flydsl_kernel(
         lhs,
         rhs,
         ctx.inp.handle,

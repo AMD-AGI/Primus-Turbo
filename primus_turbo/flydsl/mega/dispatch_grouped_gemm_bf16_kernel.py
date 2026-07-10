@@ -23,7 +23,9 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     gemm_bf16_tile,
     gemm_bf16_variable_k_tile,
 )
-from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
+    dispatch_prologue_flydsl_kernel,
+)
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
 from primus_turbo.flydsl.mega.prims import cast, ld, read_clock, spin_timed_out
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
@@ -131,7 +133,6 @@ def _make_kernel(
                     sym_layout,
                     thread_index=thread_index,
                     hidden_size=hidden_size,
-                    num_max_pool_tokens=num_max_pool_tokens,
                     input_res=input_resource,
                     expert_send_dst_rank_res=expert_send_dst_rank_resource,
                     expert_send_dst_row_res=expert_send_dst_row_resource,
@@ -140,7 +141,6 @@ def _make_kernel(
                     dispatched_token_idx_res=dispatched_token_idx_resource,
                     task_index=block_index + task_iteration * comm_block_count,
                     signal=True,
-                    block_m=BLOCK_M,
                     disp_parity=disp_parity,
                     num_ranks=num_ranks,
                 )
@@ -381,7 +381,7 @@ def _compiled_dispatch_grouped_gemm(
     ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
 
-def dispatch_grouped_gemm_bf16(
+def dispatch_grouped_gemm_bf16_flydsl_kernel(
     x: torch.Tensor,
     l1_weights: torch.Tensor,
     group: torch.distributed.group,
@@ -412,7 +412,7 @@ def dispatch_grouped_gemm_bf16(
         )
         sym_layout = symm.get_sym_layout()
         handle = tuple(
-            dispatch_prologue(
+            dispatch_prologue_flydsl_kernel(
                 topk_idx,
                 topk_weights,
                 sym_layout=sym_layout,
