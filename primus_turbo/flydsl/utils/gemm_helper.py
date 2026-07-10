@@ -905,6 +905,22 @@ def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
     return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
 
 
+def make_row_band_resource_div(c_base, base_row, c_rows, c_cols, elem_bytes):
+    """Divergent-``base_row`` variant of ``make_row_band_resource`` (each lane owns a distinct
+    row, e.g. the transposed col-major store): same 64-bit re-base but the SRD base is a VGPR
+    so the buffer op WATERFALLS. Use only when ``base_row`` is genuinely per-lane; prefer the
+    SGPR-pinned ``make_row_band_resource`` otherwise. base_row past c_rows -> 0 records (drop)."""
+    elem = arith.index(elem_bytes)
+    cols_i = _as_index(c_cols)
+    row_i = _as_index(base_row)
+    rows_i = _as_index(c_rows)
+    row_c = arith.minui(row_i, rows_i)
+    band_base = c_base + row_c * cols_i * elem
+    nrec = arith.minui((rows_i - row_c) * cols_i * elem, arith.index(0x7FFFFFFF))
+    band_base_i64 = arith.index_cast(T.i64, band_base)
+    return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec)
+
+
 def _robust_time(launch, args, warmup=250, reps=5, iters=50):
     """Median-of-`reps` timing of launch(*args) after `warmup` iters.
     The long warmup reaches boost clock; short-K kernels mis-pick configs otherwise."""

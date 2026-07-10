@@ -4,23 +4,14 @@
 # See LICENSE for license information.
 ###############################################################################
 
-# Dual-cast mxfp8 quant emitting raw E8M0 scales. Tile [bm x bk] (bm*bk==8192), 512
-# threads/block: all 512 coalesced-load bm×bk input -> LDS, then halves run concurrently:
-#   ROW half (0..255):   fp8 + raw E8M0 row scale                  -> Qr, ASp
-#   COL half (256..511): cast fp8 + stage bm M-bytes/K-col -> LDS; raw E8M0 col scale -> AtSp
-# then all 512 threads re-read the staged LDS and write the transposed col fp8 -> AtQd with
-# coalesced bm-byte bursts (the transposed store is the bandwidth bottleneck; staging through
-# LDS turns each K-col's scattered per-lane store into one wide burst).
-#
-# Outputs are bit-identical to the removed HIP quantize_mxfp8 / quantize_mxfp8_dual:
-#   Qr   [Mp, Kp]   fp8 e4m3/e5m2  -- row cast (fwd A operand)
-#   ASp  raw E8M0   row scale [Mp, Kp//32], 1 byte/block, row-major (viewed as uint8)
-#   AtQd [Kp, Mp]   fp8 e4m3/e5m2  -- col cast (bwd at operand, stored transposed)
-#   AtSp raw E8M0   col scale [Kp, Mp//32], 1 byte/block, row-major (viewed as uint8)
-# A scale dword packs 4 adjacent blocks; when those come from different workgroups each is
-# written with a native byte store (BUFFER_STORE_BYTE -- byte-granular, no dword RMW), so
-# the writers don't race. The gemm-side preshuffle (layout-1 A / b-comb) is fused inside
-# each GEMM launch, NOT here.
+# Dual-cast mxfp8 quant emitting raw E8M0 scales. Tile [bm x bk] (=16*nth threads): all threads
+# coalesced-load the input -> LDS, then the two halves run concurrently -- ROW half writes fp8 +
+# row E8M0 (Qr/ASp), COL half casts + stages the transpose in LDS for a coalesced write-back
+# (AtQd) + col E8M0 (AtSp). Bit-identical to the HIP quantize_mxfp8_dual:
+#   Qr [Mp,Kp] fp8 row cast / ASp row E8M0 [Mp,Kp//32]
+#   AtQd [Kp,Mp] fp8 col cast (transposed) / AtSp col E8M0 [Kp,Mp//32]
+# Scales are raw row-major (1 byte/block, dword-packed; cross-workgroup dwords use byte stores to
+# avoid RMW races). GEMM-side preshuffle is fused in the GEMM launch, not here.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
@@ -31,7 +22,7 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.utils.gemm_helper import make_row_band_resource
+from primus_turbo.flydsl.utils.gemm_helper import make_row_band_resource, make_row_band_resource_div
 
 _CM = 1  # glc: bypass L2 on output stores
 
@@ -85,16 +76,11 @@ def _raw_scale_dword(free, blk, scale_n):
 
 
 def _store_scale(buf, buf_bytes, dword, jbyte, e8_i32, pack, ok=None, cm=_CM, base_byte=0):
-    """Write one E8M0 scale. pack==1: broadcast to all 4 bytes of i32[dword] (each dword is
-    owned by a single workgroup -> a plain dword store is safe). pack>1: the dword is
-    byte-packed across writers in DIFFERENT workgroups, so write the single byte with a
-    native byte store (BUFFER_STORE_BYTE -- byte-granular, no dword RMW; the L2 byte-write-
-    mask merges the writers' bytes). ``ok`` (K-tail predicate) masks the write when the
-    32-col block is past K (pack==1 redirects the offset OOB; pack>1 uses the store mask).
-
-    ``base_byte`` (batched quant): a per-batch byte base added to the byte offset so B
-    stacked scale buffers share one resource. It is dword-aligned per batch (the per-batch
-    scale byte count is a multiple of 4), so it never breaks the dword-packing invariant."""
+    """Write one E8M0 scale byte. pack==1: broadcast to all 4 bytes of i32[dword] (dword owned by
+    one workgroup -> plain dword store). pack>1: native byte store (BUFFER_STORE_BYTE, no dword
+    RMW) so ``pack`` bytes packed from DIFFERENT workgroups don't race. ``ok`` masks the K-tail
+    (pack==1 redirects the offset OOB; pack>1 uses the store mask). ``base_byte`` (batched):
+    per-batch dword-aligned byte base so B scale buffers share one resource."""
     I32 = fx.Int32
     _has_base = not (isinstance(base_byte, int) and base_byte == 0)
     if pack == 1:
@@ -106,12 +92,8 @@ def _store_scale(buf, buf_bytes, dword, jbyte, e8_i32, pack, ok=None, cm=_CM, ba
             off = off + (base_byte >> I32(2))  # base_byte is dword-aligned
         bo.buffer_store(bcast, rsrc, off, cache_modifier=cm)
     else:
-        # pack>1: write the single E8M0 byte at its exact byte offset with a native byte
-        # store (BUFFER_STORE_BYTE is byte-granular -- the L2 byte-write-mask merges, with
-        # no dword read-modify-write), so the ``pack`` bytes of one dword that come from
-        # DIFFERENT workgroups don't race. This replaces a cross-workgroup atomicrmw whose
-        # serialisation across CUs dominated the col-scale write (the 4 col bytes of a dword
-        # are produced by 4 distinct M-block workgroups). ``ok`` (K-tail) masks the store OOB.
+        # pack>1: byte-granular store (L2 byte-write-mask merges, no dword RMW) so the dword's
+        # bytes from different M-block workgroups don't need a cross-CU atomicrmw. ``ok`` masks OOB.
         rsrc = bo.create_buffer_resource(buf, max_size=False, num_records_bytes=I32(buf_bytes))
         byte_off = (dword << I32(2)) | jbyte
         if _has_base:
@@ -167,16 +149,11 @@ def compile_qdual(
     bk=128,
     nth=512,
 ):
-    """Compile the dual-cast mxfp8 quant. Tile [bm x bk] with the constraint bm*bk==16*nth so
-    both halves map cleanly onto nth//2 threads each; the transposed COL fp8 is staged through LDS
-    and written back with coalesced bursts. The two tile shapes trade which output gets a
-    full 128B cache-line write:
-      (bm=64,  bk=128): COL burst 64B (half line),  ROW write run 128B (full line)  <- default
-      (bm=128, bk=64) : COL burst 128B (full line), ROW write run 64B  (half line)
-    pad_extra pads the LDS row stride to break the bank conflict the COL half hits reading 32
-    M-values at stride bk; grid_swz uses a column-major pid so co-resident workgroups write
-    distinct AtQd M-stripes (anti DRAM-channel camping). Kp%128==0 => bk in {64,128} divides
-    Kp => no K-tail. Output is bit-identical across all configs."""
+    """Compile the dual-cast mxfp8 quant. Tile [bm x bk] with bm*bk==16*nth (each half maps to
+    nth//2 threads); the transposed COL fp8 is staged through LDS + written back coalesced. Tile
+    shape trades which output gets the full 128B write burst (bm=64,bk=128: ROW full/COL half;
+    bm=128,bk=64: COL full/ROW half). pad_extra breaks the COL-read LDS bank conflict; grid_swz
+    uses column-major pids (anti DRAM-channel camping). Output is bit-identical across configs."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
@@ -225,8 +202,8 @@ def compile_qdual(
         br, bk = _decode_pid(pid, I32(NBK), I32(NBM), grid_swz)
         rx = make_row_band_resource(bo.extract_base_index(X), z, I32(M), I32(K), 2)
         gbase = (br * I32(BMv)) * I32(K) + bk * I32(BKv)
-        # 128-bit (vec8 bf16 = 16B) load path when K%8==0: every 8-col block lies on one side of
-        # the K-pad boundary, so a single masked base redirect is exact. Halves load/LDS-fill insns.
+        # vec8 (16B) load path when K%8==0: each 8-col block is one side of the K-pad boundary, so
+        # a single masked base redirect is exact -- halves the load/LDS-fill instruction count.
         USE_V8 = (not SCMASK) and (K % 8 == 0)
         if USE_V8:
             VPR8 = BKv // 8
@@ -373,37 +350,28 @@ _RAW_QDUAL_CACHE: dict = {}
 
 
 def _qdual_tile_cfg(M, K, Mp, Kp):
-    """Per-shape tile config for compile_qdual (all bit-identical). Measured on MI355X
-    (gfx950) over Llama shapes: the bm=128,bk=128 big tile (1024 threads) is the default --
-    BOTH ROW and COL fp8 get full 128B cache-line write bursts, beating the old bm=64 default
-    (half-line COL) 1.07-1.17x. The write-burst granularity, not occupancy, is the limiter.
-    Exception: large-K small-M (Kp>=8192, Mp<=4096) still prefers bm=128,bk=64 + grid swizzle
-    (anti DRAM-channel camping). PT_QDUAL_CFG='bm,bk,nth' overrides for A/B."""
+    """Per-shape tile config for compile_qdual (all bit-identical; measured on MI355X/gfx950 over
+    Llama shapes). Default bm=128,bk=128 (1024 thr): BOTH ROW and COL get full 128B write bursts,
+    beating the bm=64 half-line-COL default 1.07-1.17x (write-burst granularity is the limiter,
+    not occupancy). Large-K small-M (Kp>=8192, Mp<=4096) prefers bm=128,bk=64 + grid swizzle (anti
+    DRAM-channel camping). PT_QDUAL_CFG='bm,bk,nth' overrides for A/B."""
     import os
 
-    _ov = os.environ.get("PT_QDUAL_CFG")  # "bm,bk,nth" A/B override (e.g. "128,128,1024")
+    _ov = os.environ.get("PT_QDUAL_CFG")
     if _ov:
         b, k, n = (int(x) for x in _ov.split(","))
         return dict(bm=b, bk=k, nth=n, pad_extra=4)
     if Kp >= 8192 and Mp <= 4096:
-        # large-K, small-M: grid swizzle (anti DRAM-channel camping) beats the big tile.
         return dict(bm=128, bk=64, pad_extra=4, grid_swz=True)
-    # bm=128,bk=128 (1024 threads, tile=16384): BOTH ROW and COL get full 128B cache-line
-    # write bursts. Beats the bm=64 half-line-COL default 1.07-1.12x despite lower occupancy
-    # (write-burst granularity, not occupancy, is the limiter -- measured on gfx950).
     return dict(bm=128, bk=128, nth=1024, pad_extra=4)
 
 
 # ============================================================================
-# Batched dense dual-cast quant — the same [bm x bk] tile / dual-cast body as
-# ``compile_qdual`` but with a batch dimension so all B experts of a uniform
-# [B, M, K] weight are quantized in ONE launch (grid = B * NBM * NBK). Replaces
-# the per-expert Python loop + torch.stack in ``quant_mxfp8_raw``'s ndim==3 path
-# (8x launch + stack overhead -> single launch). Every expert shares identical
-# M,K,Mp,Kp so NO group search is needed (uniform): each workgroup just rebases
-# the input band + the 4 output bands by its batch id, and adds a per-batch
-# dword-aligned byte base to the scale stores. Output is per-expert bit-identical
-# to ``compile_qdual`` (standard MX 1x32 blocks), hence to the Python-loop path.
+# Batched dense dual-cast quant: same [bm x bk] tile / dual-cast body as ``compile_qdual`` plus a
+# batch dim so all B experts of a uniform [B, M, K] weight are quantized in ONE launch (grid =
+# B*NBM*NBK), replacing the per-expert Python loop + stack. Uniform shapes -> no group search;
+# each workgroup rebases the input + 4 output bands by batch id + adds a per-batch scale byte base.
+# Per-expert bit-identical to ``compile_qdual``.
 
 
 def compile_qdual_batched(
@@ -452,13 +420,10 @@ def compile_qdual_batched(
     assert DWPC % 4 == 0
     SCALEN_ROW = Kp // 32
     SCALEN_COL = Mp // 32
-    # Real-dim (unpadded-row) output so no host .contiguous() copy is needed: row buffers
-    # hold M real rows (row fp8 [B,M,Kp], row scale [B,M,Kp//32]); col buffers hold K real
-    # rows (col fp8 [B,K,Mp], col scale [B,K,Mp//32]). Row/col-tile padding rows (grow>=M /
-    # gc>=K) are HW-dropped by the per-batch band num_records; the scale byte stores add an
-    # explicit boundary mask so they can't spill into the next batch's scale slot. Per-batch
-    # scale byte counts are dword-aligned (Kp//32, Mp//32 are multiples of 4), so the
-    # per-batch base_byte keeps the dword-packing invariant.
+    # Real-dim (unpadded-row) outputs -> no host .contiguous() copy: row buffers hold M real rows,
+    # col buffers K real rows; tile padding rows HW-drop via the per-batch band num_records, and the
+    # scale byte stores add a boundary mask so they can't spill into the next batch. Per-batch scale
+    # byte counts are dword-aligned (Kp//32, Mp//32 mult of 4) -> base_byte keeps dword-packing.
     PB_A_BYTES = M * (Kp // 32)
     PB_AT_BYTES = K * (Mp // 32)
     SP_A_BYTES = PB_A_BYTES * B
@@ -493,8 +458,8 @@ def compile_qdual_batched(
             bo.extract_base_index(X), batch * I32(M), (batch + I32(1)) * I32(M), I32(K), 2
         )
         gbase = (br * I32(BMv)) * I32(K) + bk * I32(BKv)
-        # 128-bit (vec8 bf16 = 16B) load path when K%8==0: every 8-col block lies on one side of
-        # the K-pad boundary, so a single masked base redirect is exact. Halves load/LDS-fill insns.
+        # vec8 (16B) load path when K%8==0: each 8-col block is one side of the K-pad boundary, so
+        # a single masked base redirect is exact -- halves the load/LDS-fill instruction count.
         USE_V8 = (not SCMASK) and (K % 8 == 0)
         if USE_V8:
             VPR8 = BKv // 8
@@ -698,19 +663,13 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype):
 
 
 # ============================================================================
-# Grouped dual-cast quant (per-group M zero-pad, offs-driven) — FlyDSL replacement
-# for the HIP ``grouped_quantize_mxfp8_dual``.  Bit-compatible with the HIP output
-# contract (raw row/col-major E8M0, no preshuffle):
-#   rowwise_output [M_pad_row, N_pad]  fp8  -- real row -> row-64-padded per-group slot
-#   rowwise_scale  [M_pad_row, N_pad//32]  e8m0 (row-major)
-#   colwise_output [N, M_pad_col]      fp8  (transposed) -- col-128-padded per-group
-#   colwise_scale  [N, M_pad_col//32]  e8m0 (row-major)
-# Grid tiles the col-128 padded M extent (BM=128 => every 128-row tile lives in one
-# group, since padded col offsets are 128-aligned).  Within a tile the real rows are
-# remapped from the TIGHT input (group_offs[g]) and scattered to the row-64 layout
-# (group_offs_padded_rowwise[g]); pad rows are zero data / E8M0=127 scale (matching
-# the HIP zero-amax safe path).  fp8 for zero data is 0x00; consumers read only the
-# padded-offs regions.
+# Grouped dual-cast quant (per-group M zero-pad, offs-driven) -- FlyDSL replacement for the HIP
+# ``grouped_quantize_mxfp8_dual``, bit-compatible (raw row/col-major E8M0, no preshuffle):
+#   rowwise_output [M_pad_row, N_pad] fp8 / rowwise_scale [M_pad_row, N_pad//32] e8m0
+#   colwise_output [N, M_pad_col] fp8 (transposed) / colwise_scale [N, M_pad_col//32] e8m0
+# Grid tiles the col-128 padded M extent (bm divides 128 => each tile lives in one group). Real
+# rows are remapped from the TIGHT input to the row-64 / col-128 output; pad rows are zero data /
+# E8M0=127 (HIP zero-amax safe path); consumers read only the padded-offs regions.
 
 
 def _load_i32_at(div, idx):
@@ -731,6 +690,16 @@ def _e8_or_one(amax, ep):
     return (amax == fx.Float32(0.0)).select(I32(127), ep + I32(127))
 
 
+def _col_store_res(band, base_index, tile_feat_base, gc, feat_local, num_feat, stride, tail_off):
+    """64-bit-re-based SRD + i32 voffset for the col-major [num_feat, stride] store, picked at
+    trace time (a kernel ``if`` would be rewritten to scf.if and drop the branch-local rsrc).
+    band: uniform feature-band base (cheap, needs BKv*stride < 2^31); else per-feature-row
+    divergent base (waterfalls, any size). gc>=num_feat bases 0 records -> HW drop."""
+    if band:
+        return make_row_band_resource(base_index, tile_feat_base, num_feat, stride, 1), feat_local * stride + tail_off
+    return make_row_band_resource_div(base_index, gc, num_feat, stride, 1), tail_off
+
+
 def compile_grouped_qdual(
     total_M,
     N,
@@ -741,25 +710,19 @@ def compile_grouped_qdual(
     out_fp8="e4m3",
     pad_extra=4,
 ):
-    """Compile the grouped dual-cast mxfp8 quant.  Tile [bm=64 x bk=128] (bm*bk==8192,
-    512 threads) == the fast dense qdual config; bm=64 divides the 128-aligned col-pad
-    boundaries so each grid tile stays inside one group.  Per-tile group metadata (RB/RO/RE,
-    int32 [NBM] indexed by M-tile) is computed by a fused prologue kernel (``meta``, NBM
-    threads doing the O(G) group search ONCE), so the main kernel does 3 uniform scalar
-    loads instead of a per-thread O(G) search AND the host does zero per-call metadata ops
-    (the search-on-host cost ~80-120us of tiny torch launches).  Both kernels launch
-    back-to-back on the stream inside one jit stub (like the gemm's fused preshuffle).
-    Shapes are baked (cached per (total_M, N, G, M_pad_row, M_pad_col, dtype, out))."""
+    """Compile the grouped dual-cast mxfp8 quant. Tile [bm=64 x bk=128] (== the fast dense qdual
+    config; bm=64 divides the 128-aligned col-pad boundaries so each tile stays in one group).
+    Per-tile group metadata (RB/RO/RE/RIE [NBM]) is computed by a fused ``meta`` prologue (O(G)
+    search once per tile) so the main kernel does uniform scalar loads and the host does zero
+    per-call metadata ops. pad/meta/kern launch back-to-back in one jit stub. Shapes are baked."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
     N_pad = _ceil128(N)
     assert N % 32 == 0
     assert M_pad_col % 128 == 0 and M_pad_row % 64 == 0
-    # bm=64, bk=128 (512 threads): the robust grouped choice. NB the bm=128 big-tile that wins
-    # 1.08-1.12x for the *dense* qdual is neutral/worse here -- the grouped kernel's 4 per-tile
-    # scalar metadata loads (RB/RO/RE/RIE) need occupancy to hide, and bm=128 (1 block/CU) starves
-    # that. bm divides the 128-aligned col-pad boundaries (128 % bm == 0) => every tile in one group.
+    # bm=64,bk=128 (512 thr): the robust grouped choice -- the bm=128 dense big-tile is neutral/
+    # worse here (the 4 per-tile scalar metadata loads need occupancy to hide, bm=128 starves it).
     import os
 
     _ov = os.environ.get("PT_GQDUAL_CFG")  # "bm,bk,nth" A/B override
@@ -782,18 +745,18 @@ def compile_grouped_qdual(
     assert DWPC % 4 == 0
     SCALEN_ROW = N_pad // 32
     SCALEN_COL = M_pad_col // 32
-    SP_A_BYTES = raw_scale_int32(M_pad_row, N_pad) * 4
-    SP_AT_BYTES = raw_scale_int32(N, M_pad_col) * 4
+    # Transposed-store re-base: cheap feature-band when the i32 voffset (< BKv*stride) can't
+    # overflow, else per-feature-row divergent (waterfalls) for any size. See _col_store_res.
+    COL_DATA_BAND = BKv * M_pad_col < (1 << 31)
+    COL_SCALE_BAND = BKv * SCALEN_COL < (1 << 31)
     META_BLK = 256
     META_GRID = (NBM + META_BLK - 1) // META_BLK
 
     @flyc.kernel(known_block_size=[1, 1, 1])
     def pad(GO: fx.Tensor, LR: fx.Tensor, ORow: fx.Tensor, LC: fx.Tensor, OCol: fx.Tensor):
-        # Fused padded-layout prologue (1 thread, mirrors HIP compute_padded_layout_gpu):
-        # from the tight int64 offs [G+1] fill lens_row/offs_row (64-aligned) and
-        # lens_col/offs_col (128-aligned). Replaces ~7 tiny torch launches (~31us) that the
-        # host wrapper used to do (ceil + 2x cumsum + fills). int64 written as (low=val,
-        # high=0) int32 pairs (token offsets < 2^31). Outputs double as meta's GR/GC inputs.
+        # Fused padded-layout prologue (1 thread, mirrors HIP compute_padded_layout_gpu): from the
+        # tight int64 offs fill lens/offs_row (64-aligned) + lens/offs_col (128-aligned), replacing
+        # ~7 tiny torch launches. int64 written as (low=val, high=0) i32 pairs (offsets < 2^31).
         I32 = fx.Int32
         z = I32(0)
         go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
@@ -836,15 +799,10 @@ def compile_grouped_qdual(
         RE: fx.Tensor,
         RIE: fx.Tensor,
     ):
-        # Prologue: one thread per M-tile bt does the O(G) group search over the int32-view
-        # int64 offs (GO tight / GR row-64 / GC col-128) and writes the tile's (RB,RO,RE,RIE):
-        #   RB  = go_orig_g + mrel   (abs input row for the tile's local row 0)
-        #   RO  = go_row_g  + mrel   (row-64 output base for local row 0)
-        #   RE  = go_col_g  + M_g    (real-row end in col-pad space); OOB tile -> base_m (no rows)
-        #   RIE = go_orig_g1         (abs INPUT row end of this group); OOB tile -> 0 (0 rows).
-        #         Lets the main kernel bound its input buffer band to [RB, RIE) so rows past the
-        #         group HW-drop -> the hot load loop drops its per-vec4 (grow<real_end) select.
-        # bt>=NBM (last block tail) OOB-drops on the [NBM]-record store.
+        # Prologue: one thread per M-tile bt does the O(G) group search over the int32-view int64
+        # offs and writes (RB,RO,RE,RIE): RB=abs input row of local row 0, RO=row-64 output base,
+        # RE=real-row end in col-pad space (OOB tile -> base_m), RIE=abs input row end of the group
+        # (bounds the input band so past-group rows HW-drop). bt>=NBM OOB-drops on the store.
         I32 = fx.Int32
         bt = fx.block_idx.x * I32(META_BLK) + fx.thread_idx.x
         base_m = bt * I32(BMv)
@@ -929,12 +887,12 @@ def compile_grouped_qdual(
         in_end = _load_i32_at(rie_div, br)  # abs input row end of this group (go_orig_g1)
 
         # ---- load tile: remap TIGHT input row -> LDS, zero pad rows / OOB cols ----
-        # Input band bounded to THIS group's real input rows [in_rebase, in_end): local rows
-        # past the group HW-drop (return 0), so the hot load loop needs NO (grow<real_end)
-        # select (that select made every vec4 addr depend on the RE global load -> serialized).
+        # Input band bounded to THIS group's real rows [in_rebase, in_end): rows past the group
+        # HW-drop -> the hot load loop needs no per-vec4 (grow<real_end) select (which would make
+        # every addr depend on the RE global load -> serialized).
         rx = make_row_band_resource(bo.extract_base_index(X), in_rebase, in_end, I32(N), 2)
-        # 128-bit (vec8 bf16 = 16B) loads + LDS fill: N%32==0 (asserted) => every 8-col block
-        # lies on one side of the N-pad boundary, so a single masked base redirect is exact.
+        # vec8 (16B) loads: N%32==0 => each 8-col block is one side of the N-pad boundary, so a
+        # single masked base redirect is exact.
         VPR8 = BKv // 8
         ITERS8 = BMv * BKv // 8 // NTHv
         for ls in range_constexpr(ITERS8):
@@ -946,7 +904,6 @@ def compile_grouped_qdual(
             ioff = lr * I32(N) + fcol
             if LMASK:
                 ioff = (fcol < I32(N)).select(ioff, I32(0x7FFFFFFF))
-            # rows past the group are HW-dropped by the bounded band (see rx above).
             v = bo.buffer_load(rx, ioff, vec_width=8, dtype=BF)
             p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
             fx.make_view(p, fx.make_layout(8, 1)).store(Vec(v))
@@ -974,28 +931,37 @@ def compile_grouped_qdual(
                 a = fm.absf(chunks[i]).reduce("max")
                 amax = (amax > a).select(amax, a)
             grow = base_m + row
-            row_out = rowbase_out + row
             row_ok = grow < real_end
             gcol0 = bkc * I32(BKv) + kb * I32(32)
             ep = _ep(amax, va, ep_sub)
             inv = F32(1.0) / fm.exp2(ep.to(F32))
-            rqr = make_row_band_resource(bo.extract_base_index(Qr), z, I32(M_pad_row), I32(N_pad), 1)
+            # Re-base Qr at this tile's output row so the i32 voffset spans only the tile
+            # (base-0 row_out*N_pad overflows once M_pad_row*N_pad > 2^31).
+            rqr = make_row_band_resource(bo.extract_base_index(Qr), rowbase_out, I32(M_pad_row), I32(N_pad), 1)
             words = []
             for wi in range_constexpr(8):
                 qf = chunks[wi] * inv
                 word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
                 word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
                 words.append(word)
-            # Coalesce the 8 per-32-block fp8 words (32 contiguous cols) into 2 vec4 (16B)
-            # stores instead of 8 scalar 4B stores -> 4x fewer store instructions.
-            row_byte0 = row_out * I32(N_pad) + gcol0
+            # Coalesce 8 fp8 words (32 contiguous cols) into 2 vec4 (16B) stores.
+            row_byte0 = row * I32(N_pad) + gcol0  # local row within the [rowbase_out, ...) band
             for v in range_constexpr(2):
                 off = row_ok.select(row_byte0 + I32(16 * v), I32(0x7FFFFFFF))
                 v4 = Vec.from_elements(words[4 * v : 4 * v + 4], fx.Int32)
                 bo.buffer_store(v4.ir_value(), rqr, off, cache_modifier=_CM, offset_is_bytes=True)
             kcol = bkc * I32(BKv // 32) + kb
-            dword, jbyte = _raw_scale_dword(row_out, kcol, SCALEN_ROW)
-            _store_scale(ASp, SP_A_BYTES, dword, jbyte, _e8_or_one(amax, ep), 4, ok=row_ok, cm=_CM)
+            # Row scale byte matrix [M_pad_row, SCALEN_ROW]: same re-base at rowbase_out.
+            rasp = make_row_band_resource(bo.extract_base_index(ASp), rowbase_out, I32(M_pad_row), I32(SCALEN_ROW), 1)
+            e8b = _e8_or_one(amax, ep)
+            bo.buffer_store(
+                ArithValue(e8b & I32(255)).trunci(_T.i8),
+                rasp,
+                row * I32(SCALEN_ROW) + kcol,
+                mask=row_ok,
+                offset_is_bytes=True,
+                cache_modifier=_CM,
+            )
         else:
             # COL half: (c, mblk) = (lt//NMB, lt%NMB); c = feature col, mblk = M-block of 32.
             c = lt // I32(NMB)
@@ -1021,14 +987,25 @@ def compile_grouped_qdual(
                 )
             gc = bkc * I32(BKv) + c
             mcol = br * I32(BMv // 32) + mblk
-            dword_bc, jbyte_bc = _raw_scale_dword(gc, mcol, SCALEN_COL)
-            _store_scale(AtSp, SP_AT_BYTES, dword_bc, jbyte_bc, _e8_or_one(camax, cep), 4, None, cm=_CM)
+            # Col scale byte matrix [N, SCALEN_COL], transposed re-base (base-0 overflows once
+            # N*SCALEN_COL > 2^31).
+            ce8b = _e8_or_one(camax, cep)
+            catsp, csoff = _col_store_res(
+                COL_SCALE_BAND, bo.extract_base_index(AtSp), bkc * I32(BKv), gc, c, I32(N), I32(SCALEN_COL), mcol
+            )
+            bo.buffer_store(
+                ArithValue(ce8b & I32(255)).trunci(_T.i8),
+                catsp,
+                csoff,
+                offset_is_bytes=True,
+                cache_modifier=_CM,
+            )
         _llvm.inline_asm(
             res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)", constraints="", has_side_effects=True
         )
         rocdl.s_barrier()
-        # Coalesced transposed col write from the LDS stage (identical to dense).
-        raqd = make_row_band_resource(bo.extract_base_index(AtQd), z, I32(N), I32(M_pad_col), 1)
+        # Coalesced transposed col write from the LDS stage. AtQd is col-major [N, M_pad_col],
+        # transposed re-base (base-0 gc*M_pad_col overflows once N*M_pad_col > 2^31).
         for it in range_constexpr(CW_ITERS_V):
             lo = (t + I32(it * NTHv)) * I32(4)
             cc = lo // I32(DWPC)
@@ -1036,10 +1013,20 @@ def compile_grouped_qdual(
             rp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(lo))
             v4 = Vec(fx.make_view(rp, fx.make_layout(4, 1)).load())
             gc = bkc * I32(BKv) + cc
+            raqd, off = _col_store_res(
+                COL_DATA_BAND,
+                bo.extract_base_index(AtQd),
+                bkc * I32(BKv),
+                gc,
+                cc,
+                I32(N),
+                I32(M_pad_col),
+                base_m + dwi0 * I32(4),
+            )
             bo.buffer_store(
                 v4.ir_value(),
                 raqd,
-                gc * I32(M_pad_col) + base_m + dwi0 * I32(4),
+                off,
                 cache_modifier=_CM,
                 offset_is_bytes=True,
             )
@@ -1080,13 +1067,10 @@ _GROUPED_QDUAL_CACHE: dict = {}
 
 
 def quant_mxfp8_raw(x, out_dtype):
-    """FlyDSL raw-E8M0 dual-cast mxfp8 quant, bit-for-bit matching the C++
-    quantize_mxfp8_dual layout for an ARBITRARY 2D [M,K] input -- NO host padding. The kernel
-    masks the real dims and writes the consumer's aligned buffers (fp8 [M,Kp] row / [K,Mp]
-    col with Kp=ceil(K/128)*128, Mp=ceil(M/128)*128; scales plain row-major E8M0
-    [free, contract//32], 1 byte/block) viewed as float8_e8m0fnu -- exactly what
-    QuantizedTensor / dequantize_mxfp8 consume. Returns (row_fp8, row_scale, col_fp8,
-    col_scale)."""
+    """FlyDSL raw-E8M0 dual-cast mxfp8 quant for an ARBITRARY 2D [M,K] input (NO host padding),
+    bit-for-bit matching the C++ quantize_mxfp8_dual layout: fp8 [M,Kp] row / [K,Mp] col
+    (Kp=ceil(K/128)*128, Mp=ceil(M/128)*128) + plain row-major E8M0 scales [free, contract//32]
+    viewed as float8_e8m0fnu. Returns (row_fp8, row_scale, col_fp8, col_scale)."""
     import flydsl.compiler as _flyc
     import torch
 
@@ -1134,11 +1118,10 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
        group_lens_padded_rowwise [G], group_offs_padded_rowwise [G+1],
        group_lens_padded_colwise [G], group_offs_padded_colwise [G+1]).
 
-    ``x`` [total_M, N] bf16/fp16 contiguous; ``group_lens`` [G] / ``group_offs`` [G+1]
-    int64 GPU (tight).  M_pad_row / M_pad_col use the host upper bounds (cdiv(total_M +
-    G*align, align)*align) exactly like the HIP op, so the grid over-covers and OOB
-    tiles emit all-zero fp8 / E8M0=127 scale.  The padded per-group lens/offs are the
-    torch cumsum of the 64/128-rounded lens (GPU only, no D2H)."""
+    ``x`` [total_M, N] bf16/fp16 contiguous; ``group_lens`` [G] / ``group_offs`` [G+1] int64 GPU
+    (tight). M_pad_row / M_pad_col use the host upper bounds (cdiv(total_M + G*align, align)*align)
+    like the HIP op, so the grid over-covers and OOB tiles emit all-zero fp8 / E8M0=127. The padded
+    per-group lens/offs are filled on-device by the fused ``pad`` prologue (no D2H)."""
     import flydsl.compiler as _flyc
     import torch
 
@@ -1151,9 +1134,8 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     M_pad_col = ((total_M + G * 128) + 127) // 128 * 128
     out_fp8 = "e5m2" if out_dtype == torch.float8_e5m2 else "e4m3"
 
-    # Padded per-group lens/offs are computed ON-DEVICE by the fused ``pad`` prologue (from
-    # the tight offs), NOT here -- the old host cumsum/ceil was ~7 tiny torch launches (~31us,
-    # profiled). Allocate uninitialized; ``pad`` fills them before ``meta``/``kern`` read them.
+    # Padded per-group lens/offs are filled ON-DEVICE by the fused ``pad`` prologue (replacing ~7
+    # tiny host torch launches). Allocate uninitialized; ``pad`` fills them before meta/kern read.
     lens_row = torch.empty(G, dtype=torch.int64, device=x.device)
     lens_col = torch.empty(G, dtype=torch.int64, device=x.device)
     offs_row = torch.empty(G + 1, dtype=torch.int64, device=x.device)
@@ -1164,9 +1146,8 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     ASp = torch.empty(raw_scale_int32(M_pad_row, N_pad), dtype=torch.int32, device=x.device)
     AtSp = torch.empty(raw_scale_int32(N, M_pad_col), dtype=torch.int32, device=x.device)
 
-    # int32 views of the int64 [G+1] offs (free reinterpret; token offsets < 2^31 so the low
-    # word carries the value). The fused ``meta`` prologue reads these and fills RB/RO/RE
-    # per M-tile on-device -- no per-call host metadata ops (searchsorted/gather cost ~80us).
+    # int32 views of the int64 [G+1] offs (low word carries the value; token offsets < 2^31). The
+    # fused ``meta`` prologue reads these + fills RB/RO/RE/RIE on-device (no host metadata ops).
     go = group_offs.to(torch.int64).view(torch.int32)
     gr = offs_row.view(torch.int32)
     gc = offs_col.view(torch.int32)
