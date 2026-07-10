@@ -491,7 +491,7 @@ def run_sweep(args):
         apply_case(args, case)
         args.case_name = name
         os.environ["MASTER_PORT"] = str(base_port + idx)  # unique port avoids TIME_WAIT reuse
-        print(f"\n{'#'*72}\n# combine sweep [{idx + 1}/{len(cases)}]: {name}\n{'#'*72}")
+        print(f"\n{'#' * 72}\n# combine sweep [{idx + 1}/{len(cases)}]: {name}\n{'#' * 72}")
         try:
             ctx = torch.multiprocessing.spawn(
                 benchmark_combine, args=(nprocs, args), nprocs=nprocs, join=False

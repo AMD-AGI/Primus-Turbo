@@ -4,8 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""EP-safe autotuner: flydsl's Autotuner with concurrency-safe disk cache I/O.
-"""
+"""EP-safe autotuner: flydsl's Autotuner with concurrency-safe disk cache I/O."""
 
 import json
 import os

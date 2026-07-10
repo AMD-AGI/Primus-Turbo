@@ -4,8 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Accuracy tests for the fused ``mega_moe_fused`` op against the turbo DeepEP MoE.
-"""
+"""Accuracy tests for the fused ``mega_moe_fused`` op against the turbo DeepEP MoE."""
 
 from __future__ import annotations
 
