@@ -4,8 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Unit tests for the ``MegaMoE`` expert-parallel MoE module.
-"""
+"""Unit tests for the ``MegaMoE`` expert-parallel MoE module."""
 
 import os
 

@@ -864,7 +864,7 @@ def print_header(tag, gpu_name, world, args, *, case=None):
     """Common '===' header line shared by both benchmarks."""
     case_tag = f" {case}" if case else ""
     print(
-        f"\n{'='*72}\n[{tag}]{case_tag} {gpu_name} EP{world} T={args.num_tokens} H={args.hidden} "
+        f"\n{'=' * 72}\n[{tag}]{case_tag} {gpu_name} EP{world} T={args.num_tokens} H={args.hidden} "
         f"I={args.inter} E={args.num_experts} K={args.num_topk} "
         f"(max over ranks)\n{'=' * 72}"
     )
