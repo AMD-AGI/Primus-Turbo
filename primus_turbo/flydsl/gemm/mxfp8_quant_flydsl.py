@@ -696,7 +696,9 @@ def _col_store_res(band, base_index, tile_feat_base, gc, feat_local, num_feat, s
     band: uniform feature-band base (cheap, needs BKv*stride < 2^31); else per-feature-row
     divergent base (waterfalls, any size). gc>=num_feat bases 0 records -> HW drop."""
     if band:
-        return make_row_band_resource(base_index, tile_feat_base, num_feat, stride, 1), feat_local * stride + tail_off
+        return make_row_band_resource(
+            base_index, tile_feat_base, num_feat, stride, 1
+        ), feat_local * stride + tail_off
     return make_row_band_resource_div(base_index, gc, num_feat, stride, 1), tail_off
 
 
@@ -937,7 +939,9 @@ def compile_grouped_qdual(
             inv = F32(1.0) / fm.exp2(ep.to(F32))
             # Re-base Qr at this tile's output row so the i32 voffset spans only the tile
             # (base-0 row_out*N_pad overflows once M_pad_row*N_pad > 2^31).
-            rqr = make_row_band_resource(bo.extract_base_index(Qr), rowbase_out, I32(M_pad_row), I32(N_pad), 1)
+            rqr = make_row_band_resource(
+                bo.extract_base_index(Qr), rowbase_out, I32(M_pad_row), I32(N_pad), 1
+            )
             words = []
             for wi in range_constexpr(8):
                 qf = chunks[wi] * inv
@@ -952,7 +956,9 @@ def compile_grouped_qdual(
                 bo.buffer_store(v4.ir_value(), rqr, off, cache_modifier=_CM, offset_is_bytes=True)
             kcol = bkc * I32(BKv // 32) + kb
             # Row scale byte matrix [M_pad_row, SCALEN_ROW]: same re-base at rowbase_out.
-            rasp = make_row_band_resource(bo.extract_base_index(ASp), rowbase_out, I32(M_pad_row), I32(SCALEN_ROW), 1)
+            rasp = make_row_band_resource(
+                bo.extract_base_index(ASp), rowbase_out, I32(M_pad_row), I32(SCALEN_ROW), 1
+            )
             e8b = _e8_or_one(amax, ep)
             bo.buffer_store(
                 ArithValue(e8b & I32(255)).trunci(_T.i8),
@@ -991,7 +997,14 @@ def compile_grouped_qdual(
             # N*SCALEN_COL > 2^31).
             ce8b = _e8_or_one(camax, cep)
             catsp, csoff = _col_store_res(
-                COL_SCALE_BAND, bo.extract_base_index(AtSp), bkc * I32(BKv), gc, c, I32(N), I32(SCALEN_COL), mcol
+                COL_SCALE_BAND,
+                bo.extract_base_index(AtSp),
+                bkc * I32(BKv),
+                gc,
+                c,
+                I32(N),
+                I32(SCALEN_COL),
+                mcol,
             )
             bo.buffer_store(
                 ArithValue(ce8b & I32(255)).trunci(_T.i8),
