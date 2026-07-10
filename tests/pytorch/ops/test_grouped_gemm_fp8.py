@@ -1086,21 +1086,8 @@ def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
     "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
 )
 def test_grouped_gemm_fp8_padded_tail_zeroed(ori_dtype, trans_b, backend):
-    """The FP8 grouped-GEMM forward only writes output rows ``[0, sum(group_lens))``.
-    When ``M_total = a.size(0) > sum(group_lens)`` the uncovered tail must be zeroed
-    by the post-op, not left as caching-allocator garbage (frequently NaN/Inf,
-    which non-deterministically corrupts MoE gradients).
-
-    This is not hypothetical: the MoE token dispatcher run with
-    ``permute_max_token_num > 0`` (fixed-capacity permute, used to drop the
-    device->host sync for CUDA-graph / static-shape capture) over-allocates the
-    permuted activation buffer to a fixed capacity, so the real token count
-    ``sum(group_lens)`` is strictly less than ``a.size(0)`` (see
-    ``moe_permute``: ``permuted_tokens = torch.empty((num_permuted_tokens, H))``).
-
-    All four backends skip the trailing rows (each writes only ``[0, sum)``), so
-    the shared post-op must zero the tail; this test covers every backend.
-    """
+    """Over-allocated output tail [sum(group_lens):M_total] must be zeroed, not left as
+    caching-allocator garbage."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
