@@ -564,10 +564,12 @@ def build_flash_attn_bwd_module(
             col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
             return a_base + fx.Index(K_SUB_N * K_STRIDE) + lane_mod_32 * K_STRIDE + (col ^ swz_mask)
 
-        def _gemm_kq(a_base, b_packs, swz_mask=k_swz_mask):
-            """GEMM1 template: acc[M=rows, N=q] = A[rows,D] @ B[q,D]^T over D."""
-            acc_lo = c_zero_v16f32
-            acc_hi = c_zero_v16f32
+        def _gemm_kq(a_base, b_packs, swz_mask=k_swz_mask, init=None):
+            """GEMM1 template: acc[M=rows, N=q] = A[rows,D] @ B[q,D]^T over D. `init`
+            pre-loads BOTH MFMA accumulators (used to fold the per-q delta-center add
+            into the dP GEMM for free, mirroring dkdv's _neg_delta_acc)."""
+            acc_lo = c_zero_v16f32 if init is None else init
+            acc_hi = c_zero_v16f32 if init is None else init
             for ks in range_constexpr(K_STEPS_QK):
                 a_lo = Vec.load(mfma_pack_type, lds, [_a_idx_lo(a_base, ks, swz_mask)])
                 a_hi = Vec.load(mfma_pack_type, lds, [_a_idx_hi(a_base, ks, swz_mask)])
@@ -675,7 +677,15 @@ def build_flash_attn_bwd_module(
             s_lo_acc, s_hi_acc = _gemm_kq(fx.Index(0), q_b_packs)
             # dP[kv,q] = V @ dO^T (same template, V as "K", dO as "Q"). V is normal-read
             # only, so it uses the finer 8-granular v_swz_mask (2-way vs K's stuck 8-way).
-            dp_lo_acc, dp_hi_acc = _gemm_kq(fx.Index(LDS_V_BASE), do_b_packs, v_swz_mask)
+            # identity_center: pre-load the accumulator with the per-q delta_val (uniform
+            # over this lane's 16 kv elements) so dp_acc = dO@V^T + delta_val comes out of
+            # the MFMA directly -> the per-element dS-centering add below is removed. Same
+            # deterministic re-association class as P3/H1 (fp add-order shift only).
+            if const_expr(IS_FUSED and identity_center):
+                _dp_init = Vec.from_elements([delta_val], fx.Float32).broadcast_to(16).ir_value()
+                dp_lo_acc, dp_hi_acc = _gemm_kq(fx.Index(LDS_V_BASE), do_b_packs, v_swz_mask, init=_dp_init)
+            else:
+                dp_lo_acc, dp_hi_acc = _gemm_kq(fx.Index(LDS_V_BASE), do_b_packs, v_swz_mask)
 
             s_lo = [Vec(s_lo_acc)[r] for r in range_constexpr(16)]
             s_hi = [Vec(s_hi_acc)[r] for r in range_constexpr(16)]
@@ -727,6 +737,80 @@ def build_flash_attn_bwd_module(
                     r_acc = _fadd(r_acc, r_local)
                     return [delta_acc, r_acc]
                 return [delta_acc]
+            elif const_expr(IS_FUSED and identity_center and not apply_mask):
+                # Vectorized bulk (below-diagonal) fused path. Same math as the scalar
+                # branch below, but each 8-slot group is carried as vector<8xf32> so the
+                # elementwise softmax/dS ops (exp2 fma, dP centering add, C=P*dP mul,
+                # rowsum/rho reductions) lower to packed v_pk_* instead of scalar
+                # v_add/v_mul/v_fma -> cuts VALU issues on this VALU-issue-bound kernel.
+                # The exp2 approx and C=P*dP are strictly elementwise, so plo/phi/clo/chi
+                # are bit-identical to the scalar path (A/B GEMM operands unchanged); only
+                # the scalar rho/R reductions are re-associated (still deterministic ->
+                # det gate holds; cos/l2 unaffected within margin). apply_mask handled by
+                # the scalar branch (diagonal tiles only; the maximumf floor clamp is a
+                # no-op off-diagonal). identity_center only (plain bf16 operands).
+                v8i32_ty = Vec.make_type(8, fx.Int32)
+                lse_v8 = Vec.from_elements([lse_s23_val], fx.Float32).broadcast_to(8).ir_value()
+                scale_v8 = Vec.filled(8, sm_scale * _LOG2E * float(1 << 23), fx.Float32).ir_value()
+
+                def _slice8(acc, base):
+                    v = Vec(acc)
+                    return v.shuffle(v, [base + j for j in range_constexpr(8)]).ir_value()
+
+                def _exp2_v8(s_v8):
+                    scaled = fmath.fma(_raw(s_v8), scale_v8, lse_v8, fastmath=fm_fast)
+                    i = arith.fptosi(v8i32_ty, _raw(scaled))
+                    return Vec(i).bitcast(fx.Float32).ir_value()
+
+                def _hred8(v8):
+                    v = Vec(v8)
+                    s4 = Vec(_fadd(v.shuffle(v, [0, 1, 2, 3]).ir_value(), v.shuffle(v, [4, 5, 6, 7]).ir_value()))
+                    s2 = Vec(_fadd(s4.shuffle(s4, [0, 1]).ir_value(), s4.shuffle(s4, [2, 3]).ir_value()))
+                    return _fadd(s2[0], s2[1])
+
+                # Accumulate the per-group C/P sums as vector<8xf32> across the PV_K
+                # steps and reduce ONCE at the tail, instead of an _hred8 per step:
+                # sum_pks hred8(g_pks) == hred8(sum_pks g_pks) (re-associated the same
+                # way P3's rho/R reduction already is -> deterministic, det gate holds;
+                # cos/l2 unaffected within margin). Trades PV_K_STEPS-1 extra v8 adds
+                # for PV_K_STEPS-1 fewer narrowing-shuffle reductions on this partly
+                # VALU-issue-bound kernel.
+                c_sum_v8 = None
+                p_sum_v8 = None
+                for pks in range_constexpr(PV_K_STEPS):
+                    base = pks * 8
+                    plo_v = _exp2_v8(_slice8(s_lo_acc, base))
+                    phi_v = _exp2_v8(_slice8(s_hi_acc, base))
+                    # dp_lo/hi_acc already hold (dO@V^T + delta_val) via the GEMM acc init.
+                    clo_v = _fmul(plo_v, _slice8(dp_lo_acc, base))
+                    chi_v = _fmul(phi_v, _slice8(dp_hi_acc, base))
+                    c_g = _fadd(clo_v, chi_v)
+                    c_sum_v8 = c_g if c_sum_v8 is None else _fadd(c_sum_v8, c_g)
+                    if const_expr(fast_exp2):
+                        p_g = _fadd(plo_v, phi_v)
+                        p_sum_v8 = p_g if p_sum_v8 is None else _fadd(p_sum_v8, p_g)
+                    plo_p = bf16_trunc_pack_v8([Vec(plo_v)[i] for i in range_constexpr(8)])
+                    phi_p = bf16_trunc_pack_v8([Vec(phi_v)[i] for i in range_constexpr(8)])
+                    clo_p = bf16_trunc_pack_v8([Vec(clo_v)[i] for i in range_constexpr(8)])
+                    chi_p = bf16_trunc_pack_v8([Vec(chi_v)[i] for i in range_constexpr(8)])
+                    for dc in range_constexpr(D_CHUNKS):
+                        k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
+                        a_accs[dc] = mfma_acc(k_lo, clo_p, a_accs[dc])
+                        a_accs[dc] = mfma_acc(k_hi, chi_p, a_accs[dc])
+                        b_accs[dc] = mfma_acc(k_lo, plo_p, b_accs[dc])
+                        b_accs[dc] = mfma_acc(k_hi, phi_p, b_accs[dc])
+                delta_acc = _fadd(delta_acc, _hred8(c_sum_v8))
+                if const_expr(fast_exp2):
+                    r_local = _hred8(p_sum_v8)
+                _fused_yield = (
+                    [a_accs[i] for i in range_constexpr(D_CHUNKS)]
+                    + [b_accs[i] for i in range_constexpr(D_CHUNKS)]
+                    + [delta_acc]
+                )
+                if const_expr(fast_exp2):
+                    r_acc = _fadd(r_acc, r_local)
+                    _fused_yield = _fused_yield + [r_acc]
+                return _fused_yield
             elif const_expr(IS_FUSED):
                 # One pass accumulates delta=sum_j P*dP, A=sum_j (P*dP)*K, B=sum_j P*K
                 # (dQ = sm*(A - delta*B)). To keep VGPR pressure low (dual A/B
@@ -751,12 +835,10 @@ def build_flash_attn_bwd_module(
                     for i in range_constexpr(8):
                         r = base + i
                         plo, phi = _p_exp2(r)
-                        if const_expr(identity_center):
-                            dp_lo_r = _fadd(Vec(dp_lo_acc)[r], delta_val)
-                            dp_hi_r = _fadd(Vec(dp_hi_acc)[r], delta_val)
-                        else:
-                            dp_lo_r = Vec(dp_lo_acc)[r]
-                            dp_hi_r = Vec(dp_hi_acc)[r]
+                        # identity_center: delta_val is folded into the dP GEMM acc init
+                        # (see above), so dp_lo/hi_acc already hold dO@V^T + delta_val.
+                        dp_lo_r = Vec(dp_lo_acc)[r]
+                        dp_hi_r = Vec(dp_hi_acc)[r]
                         clo = _fmul(plo, dp_lo_r)
                         chi = _fmul(phi, dp_hi_r)
                         local = _fadd(local, clo)
@@ -1051,7 +1133,7 @@ def build_flash_attn_bwd_odo_module(
     num_kv_heads=None,
     causal=True,
     sm_scale=None,
-    waves_per_eu=8,
+    waves_per_eu=4,
     block=256,
 ):
     """Identity-delta ("odo") kernel: DELTA[b,hq,s] = -sum_d O[b,s,hq,d]*dO[b,s,hq,d].
@@ -1061,7 +1143,13 @@ def build_flash_attn_bwd_odo_module(
     buffer loads), multiplies and sums in fp32, negates (the dkdv/dq fold convention
     stores -delta_id) and scatter-stores the scalar to the transposed [B,Hq,S] delta.
     delta_id is only a centering value (the fused dq kernel corrects rho/R*B exactly),
-    so the bf16*bf16 product with fp32 accumulate is enough precision."""
+    so the bf16*bf16 product with fp32 accumulate is enough precision.
+
+    waves_per_eu=4 (not 8): the row's O/dO loads are hoisted ahead of the reduction
+    (below) so all NVEC*2 dwordx4 loads are in flight before the first is consumed,
+    which needs ~80 VGPR. At the old wpe=8 (64-VGPR budget) that spilled (116 B
+    scratch) and the loads still drained one pair at a time (latency-exposed, ~35%
+    HBM BW); wpe=4 (128-VGPR budget) fits with 0 spill -> odo ~60us -> ~31us."""
     assert dtype_str == "bf16", "odo kernel targets bf16"
     gpu_arch = get_hip_arch()
     assert gpu_arch.startswith("gfx950"), "odo kernel targets gfx950"
@@ -1107,12 +1195,21 @@ def build_flash_attn_bwd_odo_module(
         delta_rsrc = buffer_ops.create_buffer_resource(DELTA, max_size=True)
 
         base = row_c * fx.Index(HEAD_DIM)
-        acc = fx.Float32(0.0)
+        # Hoist the whole row's O/dO loads ahead of the reduction so all NVEC*2
+        # dwordx4 loads are issued (and in flight) before the first is consumed.
+        # The original per-iter load->use pattern drained one pair at a time
+        # (one s_waitcnt per load), exposing the load latency (~35% of HBM BW on
+        # this memory-bound row-reduce). Same product/accumulate order -> the
+        # fp32 sum is bit-identical (det-safe) and it stays an exact O*dO.
+        ovs = []
+        dvs = []
         for c in range_constexpr(NVEC):
             off = base + fx.Index(c * VEC)
-            ov = buffer_ops.buffer_load(o_rsrc, off, vec_width=VEC, dtype=elem_dtype_l)
-            dv = buffer_ops.buffer_load(do_rsrc, off, vec_width=VEC, dtype=elem_dtype_l)
-            prod = Vec(ov).to(fx.Float32) * Vec(dv).to(fx.Float32)
+            ovs.append(buffer_ops.buffer_load(o_rsrc, off, vec_width=VEC, dtype=elem_dtype_l))
+            dvs.append(buffer_ops.buffer_load(do_rsrc, off, vec_width=VEC, dtype=elem_dtype_l))
+        acc = fx.Float32(0.0)
+        for c in range_constexpr(NVEC):
+            prod = Vec(ovs[c]).to(fx.Float32) * Vec(dvs[c]).to(fx.Float32)
             for i in range_constexpr(VEC):
                 acc = _fadd(acc, Vec(prod)[i])
 
@@ -1641,60 +1738,111 @@ def build_flash_attn_bwd_dkdv_module(
                 p_packs_hi = [None] * PV_K_STEPS
                 ds_packs_lo = [None] * PV_K_STEPS
                 ds_packs_hi = [None] * PV_K_STEPS
-                for pks in range_constexpr(PV_K_STEPS):
-                    lse_lo_g = [None] * 8
-                    lse_hi_g = [None] * 8
-                    for gg in range_constexpr(2):
-                        g = 2 * pks + gg
-                        base_lo = _lse_head_base + fx.Index(  # noqa: B023
-                            ArithValue(q_start_i32 + lane_off_i32 + fx.Int32(8 * g))
+                if const_expr(not apply_mask):
+                    # Vectorized bulk (below-diagonal) path: carry each 8-slot group as
+                    # vector<8xf32> so the elementwise exp2 fma and dS=P*dP mul lower to
+                    # packed v_pk_* instead of scalar v_fma/v_mul on this VALU-heavy
+                    # kernel. exp2 and the mul are strictly elementwise, so P/dS (hence
+                    # dK/dV) are bit-identical to the scalar path (mask-free only; the
+                    # diagonal q-block keeps the scalar select branch below).
+                    v8i32_ty = Vec.make_type(8, fx.Int32)
+                    scale_v8 = Vec.filled(8, sm_scale * _LOG2E * float(1 << 23), fx.Float32).ir_value()
+
+                    def _slice8(acc, base):
+                        v = Vec(acc)
+                        return v.shuffle(v, [base + j for j in range_constexpr(8)]).ir_value()
+
+                    def _exp2_v8(s_v8, lse_v8):
+                        scaled = fmath.fma(_raw(s_v8), scale_v8, _raw(lse_v8), fastmath=fm_fast)
+                        i = arith.fptosi(v8i32_ty, _raw(scaled))
+                        return Vec(i).bitcast(fx.Float32).ir_value()
+
+                    for pks in range_constexpr(PV_K_STEPS):
+                        base = pks * 8
+                        # Two contiguous vec4 runs per 8-slot group (q-offsets {0..3, 8..11}
+                        # for lo; +Q_SUB for hi) -> shuffle into one v8 lse operand.
+                        b0 = _lse_head_base + fx.Index(  # noqa: B023
+                            ArithValue(q_start_i32 + lane_off_i32 + fx.Int32(8 * (2 * pks)))
                         )
-                        base_hi = base_lo + fx.Index(Q_SUB)
-                        lse_lo_vec = buffer_ops.buffer_load(lse_rsrc, base_lo, vec_width=4, dtype=fx.Float32)
-                        lse_hi_vec = buffer_ops.buffer_load(lse_rsrc, base_hi, vec_width=4, dtype=fx.Float32)
-                        for i in range_constexpr(4):
-                            lse_lo_g[4 * gg + i] = fx.Float32(Vec(lse_lo_vec)[i])
-                            lse_hi_g[4 * gg + i] = fx.Float32(Vec(lse_hi_vec)[i])
-                    plo_g = []
-                    phi_g = []
-                    dslo_g = []
-                    dshi_g = []
-                    for i in range_constexpr(8):
-                        r = pks * 8 + i
-                        q_slot_lo_i32 = q_start_i32 + lane_off_i32 + fx.Int32(_q_off[r])
-                        q_slot_hi_i32 = q_slot_lo_i32 + fx.Int32(Q_SUB)
-                        lse_lo = lse_lo_g[i]
-                        lse_hi = lse_hi_g[i]
-                        # causal mask (only the diagonal q-block per split needs it).
-                        if const_expr(apply_mask):
-                            s_lo_r = ArithValue(kv_row_i32 > q_slot_lo_i32).select(c_neg_inf, s_lo[r])
-                            s_hi_r = ArithValue(kv_row_i32 > q_slot_hi_i32).select(c_neg_inf, s_hi[r])
-                        else:
-                            s_lo_r = s_lo[r]
-                            s_hi_r = s_hi[r]
-                        # lse arrives pre-scaled by -log2e on the host (see impl).
-                        plo = _p_of(s_lo_r, lse_lo, apply_mask)
-                        phi = _p_of(s_hi_r, lse_hi, apply_mask)
-                        plo_g.append(plo)
-                        phi_g.append(phi)
+                        b1 = _lse_head_base + fx.Index(  # noqa: B023
+                            ArithValue(q_start_i32 + lane_off_i32 + fx.Int32(8 * (2 * pks + 1)))
+                        )
+                        ll0 = buffer_ops.buffer_load(lse_rsrc, b0, vec_width=4, dtype=fx.Float32)
+                        ll1 = buffer_ops.buffer_load(lse_rsrc, b1, vec_width=4, dtype=fx.Float32)
+                        lh0 = buffer_ops.buffer_load(lse_rsrc, b0 + fx.Index(Q_SUB), vec_width=4, dtype=fx.Float32)
+                        lh1 = buffer_ops.buffer_load(lse_rsrc, b1 + fx.Index(Q_SUB), vec_width=4, dtype=fx.Float32)
+                        idx8 = [0, 1, 2, 3, 4, 5, 6, 7]
+                        lse_lo_v8 = Vec(ll0).shuffle(Vec(ll1), idx8).ir_value()
+                        lse_hi_v8 = Vec(lh0).shuffle(Vec(lh1), idx8).ir_value()
+                        plo_v = _exp2_v8(_slice8(s_lo_acc, base), lse_lo_v8)
+                        phi_v = _exp2_v8(_slice8(s_hi_acc, base), lse_hi_v8)
                         # dp_lo/hi already hold (dO@V^T - delta) via the acc init.
-                        dslo_g.append(_fmul(plo, dp_lo[r]))
-                        dshi_g.append(_fmul(phi, dp_hi[r]))
-                    p_packs_lo[pks] = bf16_trunc_pack_v8(plo_g)
-                    p_packs_hi[pks] = bf16_trunc_pack_v8(phi_g)
-                    ds_packs_lo[pks] = bf16_trunc_pack_v8(dslo_g)
-                    ds_packs_hi[pks] = bf16_trunc_pack_v8(dshi_g)
+                        dslo_v = _fmul(plo_v, _slice8(dp_lo_acc, base))
+                        dshi_v = _fmul(phi_v, _slice8(dp_hi_acc, base))
+                        p_packs_lo[pks] = bf16_trunc_pack_v8([Vec(plo_v)[i] for i in range_constexpr(8)])
+                        p_packs_hi[pks] = bf16_trunc_pack_v8([Vec(phi_v)[i] for i in range_constexpr(8)])
+                        ds_packs_lo[pks] = bf16_trunc_pack_v8([Vec(dslo_v)[i] for i in range_constexpr(8)])
+                        ds_packs_hi[pks] = bf16_trunc_pack_v8([Vec(dshi_v)[i] for i in range_constexpr(8)])
+                else:
+                    for pks in range_constexpr(PV_K_STEPS):
+                        lse_lo_g = [None] * 8
+                        lse_hi_g = [None] * 8
+                        for gg in range_constexpr(2):
+                            g = 2 * pks + gg
+                            base_lo = _lse_head_base + fx.Index(  # noqa: B023
+                                ArithValue(q_start_i32 + lane_off_i32 + fx.Int32(8 * g))
+                            )
+                            base_hi = base_lo + fx.Index(Q_SUB)
+                            lse_lo_vec = buffer_ops.buffer_load(lse_rsrc, base_lo, vec_width=4, dtype=fx.Float32)
+                            lse_hi_vec = buffer_ops.buffer_load(lse_rsrc, base_hi, vec_width=4, dtype=fx.Float32)
+                            for i in range_constexpr(4):
+                                lse_lo_g[4 * gg + i] = fx.Float32(Vec(lse_lo_vec)[i])
+                                lse_hi_g[4 * gg + i] = fx.Float32(Vec(lse_hi_vec)[i])
+                        plo_g = []
+                        phi_g = []
+                        dslo_g = []
+                        dshi_g = []
+                        for i in range_constexpr(8):
+                            r = pks * 8 + i
+                            q_slot_lo_i32 = q_start_i32 + lane_off_i32 + fx.Int32(_q_off[r])
+                            q_slot_hi_i32 = q_slot_lo_i32 + fx.Int32(Q_SUB)
+                            lse_lo = lse_lo_g[i]
+                            lse_hi = lse_hi_g[i]
+                            # causal mask (only the diagonal q-block per split needs it).
+                            if const_expr(apply_mask):
+                                s_lo_r = ArithValue(kv_row_i32 > q_slot_lo_i32).select(c_neg_inf, s_lo[r])
+                                s_hi_r = ArithValue(kv_row_i32 > q_slot_hi_i32).select(c_neg_inf, s_hi[r])
+                            else:
+                                s_lo_r = s_lo[r]
+                                s_hi_r = s_hi[r]
+                            # lse arrives pre-scaled by -log2e on the host (see impl).
+                            plo = _p_of(s_lo_r, lse_lo, apply_mask)
+                            phi = _p_of(s_hi_r, lse_hi, apply_mask)
+                            plo_g.append(plo)
+                            phi_g.append(phi)
+                            # dp_lo/hi already hold (dO@V^T - delta) via the acc init.
+                            dslo_g.append(_fmul(plo, dp_lo[r]))
+                            dshi_g.append(_fmul(phi, dp_hi[r]))
+                        p_packs_lo[pks] = bf16_trunc_pack_v8(plo_g)
+                        p_packs_hi[pks] = bf16_trunc_pack_v8(phi_g)
+                        ds_packs_lo[pks] = bf16_trunc_pack_v8(dslo_g)
+                        ds_packs_hi[pks] = bf16_trunc_pack_v8(dshi_g)
 
                 # GEMM2a dV^T[D,kv] += dO_tr @ P ; GEMM2b dK^T[D,kv] += Q_tr @ dS.
                 do_lo_cur, do_hi_cur = _read_tr(fx.Index(LDS_DO_BASE), 0)
                 q_lo_cur, q_hi_cur = _read_tr(fx.Index(0), 0)
                 for si in range_constexpr(TOTAL_PV):
                     dc, pks = _steps[si]
+                    # P2: split the depth-1 prefetch so the dO transpose-read is issued
+                    # before the dV MFMAs and the Q transpose-read between the dV and dK
+                    # MFMAs -> spreads the 8 ds_read_tr16 across more MFMA-shadow issue
+                    # slots (vs all 4 reads up-front). Pure reorder -> det/corr-neutral.
                     if const_expr(si + 1 < TOTAL_PV):
                         do_lo_nxt, do_hi_nxt = _read_tr(fx.Index(LDS_DO_BASE), si + 1)
-                        q_lo_nxt, q_hi_nxt = _read_tr(fx.Index(0), si + 1)
                     dv_cur[dc] = mfma_acc(do_lo_cur, p_packs_lo[pks], dv_cur[dc])
                     dv_cur[dc] = mfma_acc(do_hi_cur, p_packs_hi[pks], dv_cur[dc])
+                    if const_expr(si + 1 < TOTAL_PV):
+                        q_lo_nxt, q_hi_nxt = _read_tr(fx.Index(0), si + 1)
                     dk_cur[dc] = mfma_acc(q_lo_cur, ds_packs_lo[pks], dk_cur[dc])
                     dk_cur[dc] = mfma_acc(q_hi_cur, ds_packs_hi[pks], dk_cur[dc])
                     if const_expr(si + 1 < TOTAL_PV):
