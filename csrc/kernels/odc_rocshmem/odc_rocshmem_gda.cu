@@ -34,8 +34,10 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <rocshmem/rocshmem.hpp>
 
+#include "primus_turbo/macros.h"
 #include "primus_turbo/odc_rocshmem/api.h"
 
 namespace primus_turbo::odc_rocshmem::gda {
@@ -249,12 +251,13 @@ static int             gda_ensure_ctxs(int nqp) {
         }
     }
     if (g_dev_ctxs)
-        hipFree(g_dev_ctxs);
+        PRIMUS_TURBO_CHECK_HIP(hipFree(g_dev_ctxs));
     if (hipMalloc(&g_dev_ctxs, sizeof(rocshmem_ctx_t) * nqp) != hipSuccess) {
         free(host);
         return -2;
     }
-    hipMemcpy(g_dev_ctxs, host, sizeof(rocshmem_ctx_t) * nqp, hipMemcpyHostToDevice);
+    PRIMUS_TURBO_CHECK_HIP(
+        hipMemcpy(g_dev_ctxs, host, sizeof(rocshmem_ctx_t) * nqp, hipMemcpyHostToDevice));
     g_dev_nctx = nqp;
     free(host);
     return 0;
@@ -267,11 +270,11 @@ int rs_uid_bytes() {
 void rs_get_uid(char *out) {
     rocshmem_uniqueid_t uid;
     rocshmem_get_uniqueid(&uid);
-    memcpy(out, uid.data(), sizeof(uid));
+    std::memcpy(out, uid.data(), sizeof(uid));
 }
 void rs_init_uid(int rank, int nranks, const char *bytes) {
     rocshmem_uniqueid_t uid;
-    memcpy(uid.data(), bytes, sizeof(uid));
+    std::memcpy(uid.data(), bytes, sizeof(uid));
     rocshmem_init_attr_t attr;
     rocshmem_set_attr_uniqueid_args(rank, nranks, &uid, &attr);
     rocshmem_init_attr(ROCSHMEM_INIT_WITH_UNIQUEID, &attr);
@@ -304,16 +307,16 @@ void rs_finalize() {
 
 // host<->device copy + memset helpers (used by the standalone kernel numeric test)
 void gda_h2d(long long dptr, const void *host, size_t nbytes) {
-    hipMemcpy((void *) dptr, host, nbytes, hipMemcpyHostToDevice);
-    hipDeviceSynchronize();
+    PRIMUS_TURBO_CHECK_HIP(hipMemcpy((void *) dptr, host, nbytes, hipMemcpyHostToDevice));
+    PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
 }
 void gda_d2h(long long dptr, void *host, size_t nbytes) {
-    hipMemcpy(host, (void *) dptr, nbytes, hipMemcpyDeviceToHost);
-    hipDeviceSynchronize();
+    PRIMUS_TURBO_CHECK_HIP(hipMemcpy(host, (void *) dptr, nbytes, hipMemcpyDeviceToHost));
+    PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
 }
 void gda_memset(long long dptr, int val, size_t nbytes) {
-    hipMemset((void *) dptr, val, nbytes);
-    hipDeviceSynchronize();
+    PRIMUS_TURBO_CHECK_HIP(hipMemset((void *) dptr, val, nbytes));
+    PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
 }
 
 // Staging copy that ends in a SYSTEM-scope fence so the written symmetric buffer
@@ -405,7 +408,7 @@ int gda_hdp_init() {
     if (g_n_gpu == 0)
         return -1;
     int dev = 0;
-    hipGetDevice(&dev);
+    PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&dev));
     int                 idx = (dev >= 0 && dev < g_n_gpu) ? dev : 0;
     hsa_amd_hdp_flush_t hdp;
     hsa_status_t        s = hsa_agent_get_info(g_gpu_agents[idx],
@@ -432,12 +435,13 @@ int gda_gather(long long target, long long src, size_t nbytes, const int *peers_
     if (n_peers <= 0)
         return 0;
     int *d_peers = nullptr;
-    hipMalloc(&d_peers, n_peers * sizeof(int));
-    hipMemcpy(d_peers, peers_host, n_peers * sizeof(int), hipMemcpyHostToDevice);
+    PRIMUS_TURBO_CHECK_HIP(hipMalloc(&d_peers, n_peers * sizeof(int)));
+    PRIMUS_TURBO_CHECK_HIP(
+        hipMemcpy(d_peers, peers_host, n_peers * sizeof(int), hipMemcpyHostToDevice));
     int blk = env_block(), nqp = env_numqp();
     if (nqp > 1) {
         if (gda_ensure_ctxs(nqp) != 0) {
-            hipFree(d_peers);
+            PRIMUS_TURBO_CHECK_HIP(hipFree(d_peers));
             return -999;
         }
         gather_kernel_ctx<<<dim3(n_peers), dim3(blk), 0, 0>>>((char *) target, (const char *) src,
@@ -448,7 +452,7 @@ int gda_gather(long long target, long long src, size_t nbytes, const int *peers_
                                                           nbytes, d_peers, n_peers, stride_bytes);
     }
     hipError_t e = hipDeviceSynchronize();
-    hipFree(d_peers);
+    PRIMUS_TURBO_CHECK_HIP(hipFree(d_peers));
     return (int) e;
 }
 
@@ -585,26 +589,27 @@ int gda_microbench(int n, int reps, int do_quiet) {
     int *d_err = nullptr;
     if (hipMalloc(&d_err, sizeof(int)) != hipSuccess)
         return -102;
-    hipMemset(d_err, 0, sizeof(int));
+    PRIMUS_TURBO_CHECK_HIP(hipMemset(d_err, 0, sizeof(int)));
     int total_err = 0;
     for (int r = 0; r < reps; ++r) {
         // each rep writes a DIFFERENT value so a stale read (old rep's value) is caught
         int myval = me * 1000 + r;
         mb_fill<<<1, 256>>>(local, myval, n);
-        hipDeviceSynchronize();
+        PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
         rocshmem_barrier_all();
-        hipMemset(d_err, 0, sizeof(int));
+        PRIMUS_TURBO_CHECK_HIP(hipMemset(d_err, 0, sizeof(int)));
         // THE TEST: get peer's local (== peer*1000+r) into scratch, then check it in a
         // SEPARATE kernel on the same stream with NO host sync between them.
         mb_get<<<1, 256, 0, 0>>>(scratch, local, peer, n, do_quiet);
         mb_check<<<1, 256, 0, 0>>>(scratch, peer * 1000 + r, n, d_err);
-        hipDeviceSynchronize(); // single sync only to READ the result, after both kernels
+        PRIMUS_TURBO_CHECK_HIP(
+            hipDeviceSynchronize()); // single sync only to READ the result, after both kernels
         int err = 0;
-        hipMemcpy(&err, d_err, sizeof(int), hipMemcpyDeviceToHost);
+        PRIMUS_TURBO_CHECK_HIP(hipMemcpy(&err, d_err, sizeof(int), hipMemcpyDeviceToHost));
         total_err += err;
         rocshmem_barrier_all();
     }
-    hipFree(d_err);
+    PRIMUS_TURBO_CHECK_HIP(hipFree(d_err));
     return total_err;
 }
 
@@ -625,13 +630,14 @@ int gda_gather_async(long long target, long long src, size_t nbytes, const int *
         return 0;
     if (g_gather_npeers != n_peers) {
         if (g_gather_peers)
-            hipFree(g_gather_peers);
+            PRIMUS_TURBO_CHECK_HIP(hipFree(g_gather_peers));
         if (hipMalloc(&g_gather_peers, n_peers * sizeof(int)) != hipSuccess)
             return -1;
         g_gather_npeers = n_peers;
     }
     hipStream_t s = (hipStream_t) stream;
-    hipMemcpyAsync(g_gather_peers, peers_host, n_peers * sizeof(int), hipMemcpyHostToDevice, s);
+    PRIMUS_TURBO_CHECK_HIP(hipMemcpyAsync(g_gather_peers, peers_host, n_peers * sizeof(int),
+                                          hipMemcpyHostToDevice, s));
     gather_kernel<<<dim3(n_peers), dim3(256), 0, s>>>((char *) target, (const char *) src, nbytes,
                                                       g_gather_peers, n_peers, stride_bytes);
     return (int) hipGetLastError(); // NO sync (overlap); caller orders via stream
