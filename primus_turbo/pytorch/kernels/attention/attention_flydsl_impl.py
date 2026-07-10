@@ -60,6 +60,7 @@ import torch
 #   0: the legacy consistent path (separate delta kernel recomputes P.dP + dq kernel).
 # Kept as an env toggle for A/B comparison and rollback.
 _BWD_IDENTITY_DELTA = _os.environ.get("FLYDSL_BWD_IDENTITY_DELTA", "1") == "1"
+_BWD_DQ_16X16 = _os.environ.get("FLYDSL_BWD_DQ_32X32", "0") != "1"
 
 # Backward kernels compute P = exp2(s*sm*log2e - log2e*lse). Folding the (-log2e)
 # scale of LSE into a single host multiply (once per bwd call) removes the
@@ -79,6 +80,7 @@ _S23_BIAS = float(127 * (1 << 23) - 486411)
 
 from primus_turbo.flydsl.attention.flash_attn_bwd_kernel import (
     build_flash_attn_bwd_dkdv_module,
+    build_flash_attn_bwd_dq_module,
     build_flash_attn_bwd_module,
     build_flash_attn_bwd_odo_module,
 )
@@ -251,9 +253,14 @@ def _get_bwd_launchers(num_heads, num_kv_heads, head_dim, causal, dtype_str, sm_
             delta_launch = build_flash_attn_bwd_odo_module(
                 num_heads=num_heads, head_dim=head_dim, num_kv_heads=num_kv_heads
             )
-            dq_launch = build_flash_attn_bwd_module(
-                mode="fused_dq_delta", fast_exp2=True, identity_center=True, **common
-            )
+            # 16x16x32 q-outer dQ kernel (mirror of the dkdv rewrite). Falls back to
+            # the 32x32x16 fused kernel via FLYDSL_BWD_DQ_32X32=1 for A/B / rollback.
+            if _BWD_DQ_16X16:
+                dq_launch = build_flash_attn_bwd_dq_module(fast_exp2=True, **common)
+            else:
+                dq_launch = build_flash_attn_bwd_module(
+                    mode="fused_dq_delta", fast_exp2=True, identity_center=True, **common
+                )
         else:
             # delta[b,hq,s] = sum_j P.dP (consistent fp32 P recomputed from LSE). With
             # fast_exp2 the recompute is the unnormalized Schraudolph P~, so the kernel
