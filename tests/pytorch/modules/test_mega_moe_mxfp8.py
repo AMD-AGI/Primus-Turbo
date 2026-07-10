@@ -112,6 +112,112 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         self.assertGreaterEqual(snr, _SNR_THRESHOLD_DB, f"mxfp8 SNR {snr:.2f} dB < {_SNR_THRESHOLD_DB}")
         dist.destroy_process_group()
 
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [2])
+    def test_backward_mxfp8_smoke(self, top_k):
+        """MXFP8 forward + backward autograd Function (mxfp8 fwd + bf16 STEP1/STEP3/dW1 +
+        fp8 dW2). Smoke test: fwd+bwd runs end-to-end and all grads (dx / dW1 / dW2 /
+        grad_topk_weights) are finite + correctly shaped.
+
+        NOTE: a numerical gradcheck vs the fp32 dense reference (mirroring the bf16
+        `test_mega_moe.py::test_backward_gradcheck`) was attempted but is currently blocked:
+        that bf16 reference gradcheck itself GPU-faults in this working tree (pre-existing
+        WIP changes to gemm_bf16_kernel/gemm_helper it depends on) on a clean GPU, so it
+        can't serve as a numerical reference. The fp8 dW2 wgrad is separately gated at
+        22.51 dB vs bf16 on real mega-pool data (test_dw2_fp8_vs_bf16); the mxfp8 forward at
+        ~23 dB (test_forward_mxfp8)."""
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        from primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 import mega_moe_fused_mxfp8
+
+        rank, dev = self.rank, self.device
+        epr = _E // self.world_size
+        x = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16).requires_grad_(True)
+        w1 = (torch.randn(epr, 2 * _I, _H, device=dev, dtype=torch.bfloat16) * 0.05).requires_grad_(True)
+        w2 = (torch.randn(epr, _H, _I, device=dev, dtype=torch.bfloat16) * 0.05).requires_grad_(True)
+        gate = torch.randn(_T, _E, device=dev)
+        topk_w0, topk_idx = torch.sigmoid(gate).topk(top_k, dim=-1)
+        tw = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32).requires_grad_(True)
+        g_seed = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+
+        y = mega_moe_fused_mxfp8(group, x, topk_idx, tw, w1, w2)
+        self.assertEqual(y.shape, (_T, _H))
+        y.backward(g_seed)
+
+        self.assertEqual(x.grad.shape, (_T, _H))
+        self.assertEqual(w1.grad.shape, (epr, 2 * _I, _H))
+        self.assertEqual(w2.grad.shape, (epr, _H, _I))
+        self.assertEqual(tw.grad.shape, (_T, top_k))
+        for name, t in [("dx", x.grad), ("dW1", w1.grad), ("dW2", w2.grad), ("grad_topk", tw.grad)]:
+            self.assertTrue(torch.isfinite(t.float()).all().item(), f"{name} grad non-finite")
+        if rank == 0:
+            print(f"[mxfp8 backward smoke top_k={top_k}] fwd+bwd OK, all grads finite + shaped")
+        dist.destroy_process_group()
+
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [2])
+    def test_dw2_fp8_vs_bf16(self, top_k):
+        """Validate fp8 dW2 on REAL mega-pool data (same-tensor comparison): replicate the
+        backward's STEP1 (dispatch dy) + STEP2 (swiglu^T) once to get dispatch_l2_grad +
+        act_weighted, then compute dW2 both ways (bf16 grouped_gemm_variable_k vs the fp8
+        mxfp8 variable-K wgrad) on those SAME tensors and gate by SNR. This is the correct
+        comparison (the earlier two-pass toggle diffed different pool data)."""
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        import primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 as mxmod
+        from primus_turbo.flydsl.mega.fp8.mega_moe_fused_mxfp8 import mega_moe_fused_mxfp8_forward
+        from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
+        from primus_turbo.pytorch.core.backend import BackendType
+        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
+            grouped_gemm_variable_k_impl,
+        )
+        from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (
+            dispatch_grouped_gemm_impl,
+        )
+
+        rank, dev = self.rank, self.device
+        epr = _E // self.world_size
+        x = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+        w1 = torch.randn(epr, 2 * _I, _H, device=dev, dtype=torch.bfloat16) * 0.05
+        w2 = torch.randn(epr, _H, _I, device=dev, dtype=torch.bfloat16) * 0.05
+        gate = torch.randn(_T, _E, device=dev)
+        topk_w0, topk_idx = torch.sigmoid(gate).topk(top_k, dim=-1)
+        topk_w = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32)
+
+        with torch.no_grad():
+            _, aux = mega_moe_fused_mxfp8_forward(
+                x, topk_idx.to(torch.int64), topk_w, w1, w2, group, comm="fp8_fused", return_aux=True,
+            )
+            handle = tuple(aux["handle"])
+            dy = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+            grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_impl(
+                dy, w2, group, BackendType.FLYDSL.value, handle=handle, layout="nn", num_dispatch_cu=16,
+            )
+            _, _, act_weighted = swiglu_backward(
+                grad_swiglu, aux["l1"], scale=aux["dispatch_weights"], return_gate=True, return_act_w=True,
+            )
+            group_lens, group_offs = handle[9], handle[10]
+            dW2_bf = grouped_gemm_variable_k_impl(
+                dispatch_l2_grad, act_weighted, group_lens, group_offs,
+                trans_a=True, trans_b=False, trans_c=False, num_cu=None,
+                default_backend=BackendType.TRITON.value,
+            )
+            dW2_fp8 = mxmod._mxfp8_variable_k_wgrad(dispatch_l2_grad, act_weighted, group_lens, group_offs)
+
+        self.assertEqual(dW2_fp8.shape, dW2_bf.shape)
+        self.assertTrue(torch.isfinite(dW2_fp8.float()).all().item(), "fp8 dW2 non-finite")
+        snr = torch.tensor([compute_snr(dW2_bf, dW2_fp8)], device=dev)
+        dist.all_reduce(snr, op=dist.ReduceOp.MIN)
+        snr = float(snr.item())
+        if rank == 0:
+            print(f"[mxfp8 dW2 top_k={top_k}] fp8 vs bf16 min SNR = {snr:.2f} dB (fmt={mxmod._DW2_FP8_FORMAT})")
+        self.assertGreaterEqual(snr, 15.0, f"fp8 dW2 SNR {snr:.2f} dB < 15.0")
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     run_tests()

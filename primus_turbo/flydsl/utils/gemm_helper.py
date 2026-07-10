@@ -447,7 +447,8 @@ class StoreCPerTensor:
     """
 
     def __init__(
-        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, elem_fn=None
+        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, elem_fn=None,
+        cache_modifier=0,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
@@ -456,11 +457,23 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
+        # CPOL on the C store: 0 = default; 16 (sc1) = write-through to HBM (a fused combine
+        # reader on another CU/XCD reads fresh after an l2_invalidate). Free per-store vs a
+        # device-wide l2_writeback.
+        self.cache_modifier = cache_modifier
         # Optional f32->f32 epilogue node chain (bias/act), applied post-scale
         # pre-cast. None -> plain scaled store (identical IR).
         self.elem_fn = elem_fn
         self.scaled = A_scale is not None
         self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
+        # write-through path (cache_modifier set): a full-C buffer resource + absolute element
+        # index (the row-band + byte-offset path can't carry a cache modifier). Mirrors
+        # StoreCBf16; OOB columns store to an out-of-range element the HW SRD drops.
+        self.c_full_rsrc = (
+            _buffer_ops.create_buffer_resource(C, max_size=False, num_records_bytes=c_rows * c_cols * 2)
+            if cache_modifier
+            else None
+        )
         if self.scaled:
             gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
             gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
@@ -475,6 +488,24 @@ class StoreCPerTensor:
 
     def store(self, c_frag, base_row, base_col):
         scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div) if self.scaled else None
+        if self.cache_modifier:
+            oob = self.c_rows * self.c_cols  # absolute element sink for OOB cols (HW SRD drop)
+            for ti in range_constexpr(self.n_tiles_a):
+                row_local = ti * 16 + (self.lane_id // 16) * 4
+                for tj in range_constexpr(self.n_tiles_b):
+                    col = base_col + tj * 16 + self.lane_id % 16
+                    col_valid = col < self.c_cols
+                    vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                    for i in range_constexpr(4):
+                        v = vec_f32[i] * scale if self.scaled else vec_f32[i]
+                        if self.elem_fn is not None:
+                            v = self.elem_fn(v)
+                        c_index = (base_row + row_local + i) * self.c_cols + col
+                        _buffer_ops.buffer_store(
+                            v.to(self.out_ty), self.c_full_rsrc, arith.select(col_valid, c_index, oob),
+                            cache_modifier=self.cache_modifier,
+                        )
+            return
         # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         for ti in range_constexpr(self.n_tiles_a):

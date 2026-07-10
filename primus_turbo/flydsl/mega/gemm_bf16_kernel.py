@@ -507,6 +507,7 @@ def gemm_bf16_nt_tile(
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
+    store_c=None,
 ):
     g = _gemm_geom(K, BLOCK_M, BLOCK_N)
     K_ITERS = g["K_ITERS"]
@@ -571,7 +572,9 @@ def gemm_bf16_nt_tile(
     a_s2r = S2RLoaderBf16(wave_m, N_TILES_A)
     b_s2r = S2RLoaderBf16(wave_n, N_TILES_B)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
+    # ``store_c`` override lets a fused kernel inject a quantizing epilogue (fp8 L2Y).
+    if store_c is None:
+        store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
 
     c00_frag = [mfma.zero_value] * N_ACCUMS
     c01_frag = [mfma.zero_value] * N_ACCUMS

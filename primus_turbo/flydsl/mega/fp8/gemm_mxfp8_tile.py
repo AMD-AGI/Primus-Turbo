@@ -125,6 +125,7 @@ def gemm_mxfp8_nt_tile(
     out_fp16=False,
     nt_vmcnt=3,
     preshuffled=False,
+    c_cache_modifier=0,  # 16 (sc1) = write-through C store for a fused combine reader
 ):
     """One NT mxfp8 output tile. ``A`` = fp8 pool [c_m, K] (int8 Tensor view);
     ``B_T`` = fp8 weights [G*c_n, K] (int8 Tensor view); ``C`` = bf16 [c_m, c_n];
@@ -205,7 +206,9 @@ def gemm_mxfp8_nt_tile(
         def load_sb(k):
             return sb_s2r.load(sb_base0, k), sb_s2r.load(sb_base1, k)
 
-    store_c = StoreCPerTensor(None, None, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
+    store_c = StoreCPerTensor(
+        None, None, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty, cache_modifier=c_cache_modifier
+    )
 
     wave_m_offset = wave_m * (N_TILES_A * 16)
     wave_n_offset = wave_n * (N_TILES_B * 16)

@@ -9,17 +9,13 @@
 Comm modes for the cross-rank dispatch:
 
 * ``comm="fp8_fused"`` (DEFAULT, fastest): a 3-stage single-kernel pipeline
-  (``dispatch_grouped_gemm_mxfp8_cleanpush(preshuffle_role=True)``): the comm role CLEAN-pushes
-  pre-quantized fp8 tokens + raw E8M0 scales cross-rank (coalesced, XGMI-saturating); a
-  dedicated preshuffle role transposes each pool-block's A-scale raw->broadcast ONCE
-  (non-redundant); the L1 grouped mxfp8 GEMM consumes the broadcast scale -- comm / preshuffle
-  / gemm all overlapped and gated per pool-block by the sys-scope scoreboard (a sentinel hands
-  the block off from the preshuffle role to the gemm). Beats the decoupled path and the bf16
-  fused kernel. Cross-rank/cross-XCD visibility is carried by device-scope L2 write-back /
-  invalidate fences in-kernel (no host sync + standalone L2 invalidate).
-* ``comm="fp8_fused_qip"`` (diagnostic): the older quant-in-push fused kernel
-  (``dispatch_grouped_gemm_mxfp8``) -- the comm role quantizes bf16 x AND writes the broadcast
-  scale over XGMI (scattered), which exposes the comm; kept for comparison only.
+  (``dispatch_grouped_gemm_mxfp8``): the comm role CLEAN-pushes pre-quantized fp8 tokens + raw
+  E8M0 scales cross-rank (coalesced, XGMI-saturating); a dedicated preshuffle role transposes
+  each pool-block's A-scale raw->broadcast ONCE (non-redundant); the L1 grouped mxfp8 GEMM
+  consumes the broadcast scale -- comm / preshuffle / gemm all overlapped and gated per
+  pool-block by the sys-scope scoreboard (a sentinel hands the block off from the preshuffle
+  role to the gemm). Beats the decoupled path and the bf16 fused kernel. Cross-rank/cross-XCD
+  visibility is carried by device-scope L2 write-back / invalidate fences in-kernel.
 * ``comm="fp8"`` (decoupled, validated ~23 dB): quantize tokens to fp8 +
   E8M0 scales on the source rank and PUSH fp8 over XGMI into the peer ``pool_fp8`` /
   ``pool_scale`` (half the dispatch bytes vs bf16). The L1 grouped mxfp8 GEMM reads
@@ -47,7 +43,9 @@ from primus_turbo.flydsl.mega.fp8.dispatch_fp8_push_kernel import (
 )
 from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
     dispatch_grouped_gemm_mxfp8,
-    dispatch_grouped_gemm_mxfp8_cleanpush,
+)
+from primus_turbo.flydsl.mega.fp8.grouped_gemm_combine_mxfp8_kernel import (
+    grouped_gemm_combine_mxfp8,
 )
 from primus_turbo.flydsl.mega.fp8.grouped_gemm_mxfp8_kernel import (
     grouped_gemm_mxfp8_flydsl_kernel,
@@ -55,10 +53,6 @@ from primus_turbo.flydsl.mega.fp8.grouped_gemm_mxfp8_kernel import (
 from primus_turbo.flydsl.mega.fp8.quant import (
     quantize_grouped_weight_mxfp8,
     quantize_rowwise_mxfp8,
-)
-from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (
-    combine_only,
-    topk_reduce_only,
 )
 from primus_turbo.flydsl.mega.swiglu_kernel import swiglu
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
@@ -78,20 +72,30 @@ def mega_moe_fused_mxfp8_forward(
     block_n: int = 256,
     num_combine_cu: int | None = None,
     comm: str = "fp8_fused",
-) -> torch.Tensor:
+    return_aux: bool = False,
+):
     """Fused mega MoE forward, mxfp8 compute. Returns y[T, H] bf16.
 
     ``x`` [T, H] bf16 source tokens; ``topk_idx``/``topk_weights`` [T, K]; ``w1`` [G, 2I, H]
     and ``w2`` [G, H, I] this rank's expert weights (bf16). ``comm`` selects the cross-rank
     dispatch: ``fp8_fused`` (default, 3-stage clean-push + preshuffle-role + gemm pipeline),
-    ``fp8_fused_qip`` (quant-in-push diagnostic), ``fp8`` (decoupled), or ``bf16``.
+    ``fp8`` (decoupled), or ``bf16``.
     Requires H % 1024 == 0 (fp8 push) / % 256 (weight N), I % 1024 == 0 (SwiGLU), K % 128.
-    """
+
+    ``return_aux`` (fp8_fused only): also return the backward intermediates the mega mxfp8
+    autograd Function needs -- ``(y, {handle, l1, dispatch_weights})`` -- where
+    ``dispatch_weights`` is the per-pool-row routing weight (``symm.weight_recv_buf`` cloned
+    before the L2 combine reuses the buffer). ``w1``/``w2`` are NOT detached in this mode
+    (the Function owns the graph)."""
     assert x.dtype == torch.bfloat16
     assert w1.dtype == torch.bfloat16 and w2.dtype == torch.bfloat16
-    # forward-only: detach (mxfp8 quant of an autograd Parameter trips the quant op)
-    w1 = w1.detach()
-    w2 = w2.detach()
+    if return_aux:
+        assert comm == "fp8_fused", "return_aux is only wired for comm='fp8_fused'"
+    else:
+        # forward-only: detach (mxfp8 quant of an autograd Parameter trips the quant op)
+        w1 = w1.detach()
+        w2 = w2.detach()
+    _aux_dispatch_weights = None
     G = w1.shape[0]
     world = group.size()
     T, H = x.shape
@@ -100,10 +104,13 @@ def mega_moe_fused_mxfp8_forward(
     topk_idx64 = topk_idx.to(torch.int64)
     l1 = None  # set by the fused fp8 dispatch+L1 path; else computed after the comm branch
 
-    if comm in ("fp8_fused", "fp8_fused_qip"):
-        # milestone-2 FUSED: one kernel pushes fp8 tokens + E8M0 scales cross-rank AND computes
-        # the L1 grouped mxfp8 GEMM, gated per pool-block by the sys-scope scoreboard (no host
-        # sync + L2 invalidate: the scoreboard acquire carries the peer-write visibility).
+    if comm == "fp8_fused":
+        # FUSED (3-stage pipeline): quant tokens ONCE, then one kernel CLEAN-pushes the raw fp8
+        # + E8M0 cross-rank (coalesced), a preshuffle role transposes each pool-block's A-scale
+        # raw->broadcast once (non-redundant), and the L1 grouped mxfp8 GEMM consumes it --
+        # comm/preshuffle/gemm overlapped, gated per pool-block by the sys-scope scoreboard
+        # (no host sync + L2 invalidate: the scoreboard acquire + device-scope fences carry
+        # peer-write visibility). Fastest fp8 fused path.
         symm = get_symm_buffer_for_mega_moe(
             group, num_experts=G * world, num_max_tokens_per_rank=T, num_topk=K,
             hidden=H, intermediate_hidden=I, block_m=block_m, block_n=block_n, use_mxfp8=True,
@@ -117,21 +124,20 @@ def mega_moe_fused_mxfp8_forward(
             )
         )
         w1q, w1s = quantize_grouped_weight_mxfp8(w1)
-        if comm == "fp8_fused":
-            # DEFAULT fused: quant tokens once, CLEAN push the raw fp8 + E8M0 (coalesced,
-            # XGMI-saturating), a dedicated preshuffle role transposes each block_m's A-scale
-            # raw->broadcast ONCE (non-redundant), then the preshuffled L1 GEMM consumes it --
-            # 3-stage comm/preshuffle/gemm pipeline, all overlapped (fastest fp8 fused path).
-            xq, xs = quantize_rowwise_mxfp8(x)
-            l1 = dispatch_grouped_gemm_mxfp8_cleanpush(
-                xq, xs, w1q, w1s, handle, sym_layout, symm, BM=block_m, BN=block_n,
-                preshuffle_role=True,
-            )
-        else:  # fp8_fused_qip: quant-in-push (diagnostic; the comm role quantizes bf16 x AND
-            # writes broadcast scale over XGMI -- slower comm, kept for comparison only).
-            l1 = dispatch_grouped_gemm_mxfp8(
-                x, w1q, w1s, handle, sym_layout, symm, BM=block_m, BN=block_n
-            )
+        xq, xs = quantize_rowwise_mxfp8(x)
+        # zero the scoreboard (cross-rank, barrier-bracketed) so the per-pool-block sentinel
+        # handoff (preshuffle role -> gemm role) starts clean before any peer signals it.
+        torch.cuda.synchronize()
+        group.barrier()
+        symm.scoreboard.zero_()
+        torch.cuda.synchronize()
+        group.barrier()
+        l1 = dispatch_grouped_gemm_mxfp8(
+            xq, xs, w1q, w1s, handle, sym_layout, symm, BM=block_m, BN=block_n
+        )
+        if return_aux:
+            # per-pool-row routing weight (prologue-scattered); clone before L2 reuses the buffer
+            _aux_dispatch_weights = symm.weight_recv_buf.clone()
     elif comm == "fp8":
         # quantize-then-push: fp8 tokens + E8M0 scales cross-rank into pool_fp8/pool_scale
         symm = get_symm_buffer_for_mega_moe(
@@ -175,26 +181,22 @@ def mega_moe_fused_mxfp8_forward(
     act = swiglu(l1)
     aq, as_ = quantize_rowwise_mxfp8(act)
     w2q, w2s = quantize_grouped_weight_mxfp8(w2)
-    l2 = grouped_gemm_mxfp8_flydsl_kernel(aq, as_, w2q, w2s, group_offs, out_dtype=torch.bfloat16)
-    symm.l2_token_buffer.copy_(l2)
 
-    # combine (bf16): cross-rank PUSH of l2_token_buffer then weighted top-k reduce
+    # FUSED L2: one 3-role kernel does the grouped mxfp8 L2 GEMM -> cross-rank combine PUSH ->
+    # weighted top-k reduce (mirror of the L1 fused kernel: compute -> comm). Init the L2
+    # scoreboard (0) + reduce flags (-1, the "wait" state) cross-rank before the kernel signals
+    # them, then it returns the per-token output directly.
     torch.cuda.synchronize()
     group.barrier()
-    if comm == "fp8":
-        # combine reads origin_rank/origin_slot (cached main heap, written cross-rank by the
-        # prologue); L1/L2 re-cached them, so invalidate L2 before the combine PUSH reads them.
-        l2_invalidate_all()
-    combine_only(group, BM=block_m, num_combine_cu=num_combine_cu)
+    symm.sb_l2.zero_()
+    symm.barrier_local.fill_(-1)
     torch.cuda.synchronize()
     group.barrier()
-    symm.barrier_local.zero_()
-
-    y = torch.empty((int(symm.num_tokens), H), dtype=torch.bfloat16, device=x.device)
-    topk_reduce_only(
-        y, symm.comb, symm.barrier_local,
-        topk_idx.to(torch.int32).contiguous().view(-1), symm.num_tokens_per_rank,
-        int(symm.combine_slots), topk=int(symm.num_topk), num_experts=int(symm.num_experts),
-        rank=int(symm.rank), topk_weights=topk_weights.to(torch.float32).contiguous().view(-1),
+    y = grouped_gemm_combine_mxfp8(
+        aq, as_, w2q, w2s, handle, group,
+        topk_indices=topk_idx64, topk_weights=topk_weights.to(torch.float32),
+        BM=block_m, BN=block_n, num_combine_cu=(num_combine_cu if num_combine_cu is not None else 64),
     )
+    if return_aux:
+        return y, {"handle": handle, "l1": l1, "dispatch_weights": _aux_dispatch_weights}
     return y
