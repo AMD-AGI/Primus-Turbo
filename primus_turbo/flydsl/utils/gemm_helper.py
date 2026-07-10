@@ -662,6 +662,203 @@ class StoreCPerTensorCShuffle:
             S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
 
 
+class StoreCQuantMxfp8CShuffle:
+    """CShuffle epilogue that QUANTIZES the f32 accumulators to per-1x32 E8M0 mxfp8 on the
+    LDS re-read. Stages each 16-row sub-tile row-major into per-wave LDS (like
+    ``StoreCPerTensorCShuffle``), then re-reads ``EPL`` CONTIGUOUS columns per lane -> the
+    1x32-along-N block amax is a cheap 4-lane reduction (2 shuffles) instead of the direct
+    MFMA layout's 32-lane butterfly (5 shuffles), and the fp8 payload is a COALESCED store
+    instead of scattered bytes. Reuses ``StoreCQuantFp8``'s E8M0/cvt math.
+
+    Requires Cc = n_tiles_b*16 == 32 (one 1x32 block == one shuffle-tile row; N_TILES_B=2,
+    the mega L2 tile). Writes ``C_fp8`` [c_rows, c_cols] fp8 + ``C_scale`` [c_rows, c_cols//32]
+    E8M0 byte. This measures the efficient in-GEMM mxfp8 quant placement for fp8-combine."""
+
+    def __init__(self, C_fp8, C_scale, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, c_lds, wave_id):
+        self.c_rows = c_rows
+        self.c_cols = c_cols
+        self.lane_id = fx.thread_idx.x % 64
+        self.wave_id = wave_id
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        self.out_ty = out_ty
+        self.Cc = n_tiles_b * 16
+        assert self.Cc == 32, f"StoreCQuantMxfp8CShuffle requires Cc==32 (N_TILES_B=2), got {self.Cc}"
+        self.EPL = (16 * self.Cc) // 64  # = 8 contiguous cols/lane
+        self.row_stride = self.Cc
+        self.wave_lds_elems = 16 * self.row_stride
+        self.c_lds = c_lds
+        self.fp8 = _buffer_ops.create_buffer_resource(C_fp8, max_size=True)
+        self.scale = _buffer_ops.create_buffer_resource(C_scale, max_size=True)
+        # bf16 staging pointer (align 2 store, align 16 read), mirroring StoreCPerTensorCShuffle.
+        self._store_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 2)
+        self._read_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 16)
+
+    def store(self, c_frag, base_row, base_col):
+        lds_base = fx.Int32(fx.ptrtoint(self.c_lds.ptr))
+        wave_off = self.wave_id * self.wave_lds_elems
+        for ti in range_constexpr(self.n_tiles_a):
+            # stage this 16-row sub-tile row-major into per-wave LDS (bf16)
+            for tj in range_constexpr(self.n_tiles_b):
+                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                lds_col = tj * 16 + self.lane_id % 16
+                for i in range_constexpr(4):
+                    lds_row = (self.lane_id // 16) * 4 + i
+                    e = wave_off + lds_row * self.row_stride + lds_col
+                    ptr = fx.inttoptr(self._store_ptr_t, lds_base + e * 2)
+                    ptr.store(vec_f32[i].to(self.out_ty))
+            S2RLoaderTr._wait_lgkmcnt(0)
+            # re-read EPL=8 contiguous cols of one row per lane; 4 lanes cover one 1x32 block
+            row_in = (self.lane_id * self.EPL) // self.Cc      # = lane//4
+            col0 = (self.lane_id * self.EPL) % self.Cc         # = (lane%4)*8
+            lane_e = wave_off + row_in * self.row_stride + col0
+            rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
+            vec = Vec(fx.make_view(rptr, fx.make_layout(self.EPL, 1)).load())  # 8 bf16
+            f = [fx.arith.ArithValue(vec[j].to(fx.Float32)) for j in range_constexpr(self.EPL)]
+            # within-lane |max| over the 8 owned values
+            av = fx.arith.ArithValue(
+                (fx.arith.ArithValue(f[0]).bitcast(fx.T.i32()) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32())
+            )
+            for j in range_constexpr(1, self.EPL):
+                aj = fx.arith.ArithValue(
+                    (f[j].bitcast(fx.T.i32()) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32())
+                )
+                av = fx.arith.ArithValue(fx.arith.maximumf(av, aj))
+            # 4-lane amax (the 4 consecutive lanes owning this row's 32-col block)
+            for sh in (1, 2):
+                peer = fx.arith.ArithValue(av.shuffle_xor(sh, 64))
+                av = fx.arith.ArithValue(fx.arith.maximumf(av, peer))
+            # E8M0 scale (mirror StoreCQuantFp8), target 2^8
+            amax_bits = av.bitcast(fx.T.i32())
+            t = amax_bits + fx.Int32(1 << 19)
+            exp = ((t >> fx.Int32(23)) & fx.Int32(0x1FF)) - fx.Int32(127 + 8)
+            exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
+            exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
+            biased = fx.arith.ArithValue(exp) + fx.Int32(127)
+            scale = (biased << fx.Int32(23)).bitcast(fx.T.f32())
+            inv = fx.Float32(1.0) / fx.arith.ArithValue(scale)
+            neglim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(-448.0)))
+            poslim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(448.0)))
+            # cvt 8 vals -> 2 packed i32 (4 fp8/word), coalesced 64b store
+            words = []
+            for jw in range_constexpr(self.EPL // 4):
+                q = [
+                    fx.arith.ArithValue(
+                        fx.arith.minimumf(fx.arith.maximumf(f[jw * 4 + k] * inv, neglim), poslim)
+                    )
+                    for k in range_constexpr(4)
+                ]
+                w = rocdl.cvt_pk_fp8_f32(fx.T.i32(), q[0], q[1], fx.Int32(0), False)
+                w = rocdl.cvt_pk_fp8_f32(fx.T.i32(), q[2], q[3], w, True)
+                words.append(w)
+            base_row_i = base_row + ti * 16 + row_in
+            gcol = base_col + col0
+            fp8_idx = (base_row_i * fx.Int32(self.c_cols) + gcol) // fx.Int32(4)  # i32-word index
+            _buffer_ops.buffer_store(
+                Vec.from_elements(words, fx.Int32).ir_value(), self.fp8, fp8_idx, cache_modifier=16
+            )
+            # one E8M0 byte per 1x32 block: the lane owning col0==0 writes it
+            def _emit_scale():
+                sb = fx.arith.ArithValue(biased).trunci(fx.T.i8())
+                _buffer_ops.buffer_store(
+                    sb, self.scale, base_row_i * fx.Int32(self.c_cols // 32) + gcol // fx.Int32(32),
+                    cache_modifier=16,
+                )
+
+            _emit_if_then(col0 == fx.Int32(0), _emit_scale)
+
+
+class StoreCQuantMxfp8CShuffle32:
+    """CShuffle mxfp8-quant epilogue for the **Mfma32x32x16** accumulator layout (16 acc/lane,
+    1 col = lane%32; row = base_row + ti*32 + (r//4)*8 + (lane//32)*4 + (r%4)). Drop-in for
+    ``StoreCQuantFp8`` (same ``store(c_frag, base_row, base_col)``), but instead of the 32-lane
+    butterfly + scattered byte stores, it stages each 32x32 tile row-major into per-wave LDS,
+    re-reads 16 CONTIGUOUS N-cols per lane -> the 1x32-along-N block amax is a 2-lane reduce
+    (1 shuffle) + a coalesced 128b fp8 store. Writes ``C_fp8`` [c_rows*hidden] fp8 (row-major)
+    + ``C_scale`` [c_rows*hidden//32] E8M0 byte. Needs a per-wave ``c_lds`` (32*32 bf16/wave)."""
+
+    def __init__(self, l2y_fp8_res, l2y_scale_res, hidden, c_lds, wave_id):
+        self.fp8 = l2y_fp8_res      # buffer resource over the fp8 L2Y [c_rows*hidden]
+        self.scale = l2y_scale_res  # buffer resource over the E8M0 [c_rows*hidden//32]
+        self.H = hidden
+        self.lane_id = fx.thread_idx.x % 64
+        self.wave_id = wave_id
+        self.c_lds = c_lds
+        self.Cc = 32                       # 32 cols/tile = one 1x32 block
+        self.wave_lds_elems = 32 * self.Cc  # one 32x32 tile per wave
+        self.EPL = (32 * self.Cc) // 64     # = 16 contiguous cols/lane on re-read
+        self._store_ptr_t = fx.PointerType.get(fx.BFloat16.ir_type, 2, 2)
+        self._read_ptr_t = fx.PointerType.get(fx.BFloat16.ir_type, 2, 16)
+
+    def store(self, c_frag, base_row, base_col):
+        lds_base = fx.Int32(fx.ptrtoint(self.c_lds.ptr))
+        wave_off = self.wave_id * self.wave_lds_elems
+        n = self.lane_id % fx.Int32(32)
+        m_hi = (self.lane_id // fx.Int32(32)) * fx.Int32(4)
+        for ti in range_constexpr(len(c_frag)):
+            acc = Vec(c_frag[ti])
+            # stage this 32x32 tile row-major into the per-wave LDS region (bf16)
+            for r in range_constexpr(16):
+                m_local = fx.Int32((r // 4) * 8 + (r % 4)) + m_hi  # 0..31
+                e = fx.Int32(wave_off) + m_local * fx.Int32(self.Cc) + n
+                ptr = fx.inttoptr(self._store_ptr_t, lds_base + e * fx.Int32(2))
+                ptr.store(acc[r].to(fx.BFloat16))
+            S2RLoaderTr._wait_lgkmcnt(0)
+            # re-read 16 contiguous cols of one row per lane; 2 lanes cover one 1x32 block
+            row_in = self.lane_id // fx.Int32(2)
+            col0 = (self.lane_id % fx.Int32(2)) * fx.Int32(16)
+            lane_e = fx.Int32(wave_off) + row_in * fx.Int32(self.Cc) + col0
+            rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * fx.Int32(2))
+            vec = Vec(fx.make_view(rptr, fx.make_layout(self.EPL, 1)).load())  # 16 bf16
+            f = [fx.arith.ArithValue(vec[j].to(fx.Float32)) for j in range_constexpr(self.EPL)]
+            av = fx.arith.ArithValue(
+                (f[0].bitcast(fx.T.i32()) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32())
+            )
+            for j in range_constexpr(1, self.EPL):
+                aj = fx.arith.ArithValue((f[j].bitcast(fx.T.i32()) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32()))
+                av = fx.arith.ArithValue(fx.arith.maximumf(av, aj))
+            # 2-lane amax (the 2 lanes owning this row's 32-col block)
+            peer = fx.arith.ArithValue(av.shuffle_xor(1, 64))
+            av = fx.arith.ArithValue(fx.arith.maximumf(av, peer))
+            amax_bits = av.bitcast(fx.T.i32())
+            t = amax_bits + fx.Int32(1 << 19)
+            exp = ((t >> fx.Int32(23)) & fx.Int32(0x1FF)) - fx.Int32(127 + 8)
+            exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
+            exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
+            biased = fx.arith.ArithValue(exp) + fx.Int32(127)
+            scale = (biased << fx.Int32(23)).bitcast(fx.T.f32())
+            inv = fx.Float32(1.0) / fx.arith.ArithValue(scale)
+            neglim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(-448.0)))
+            poslim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(448.0)))
+            words = []
+            for jw in range_constexpr(self.EPL // 4):
+                q = [
+                    fx.arith.ArithValue(
+                        fx.arith.minimumf(fx.arith.maximumf(f[jw * 4 + k] * inv, neglim), poslim)
+                    )
+                    for k in range_constexpr(4)
+                ]
+                w = rocdl.cvt_pk_fp8_f32(fx.T.i32(), q[0], q[1], fx.Int32(0), False)
+                w = rocdl.cvt_pk_fp8_f32(fx.T.i32(), q[2], q[3], w, True)
+                words.append(w)
+            base_row_i = base_row + ti * 32 + row_in
+            gcol = base_col + col0
+            fp8_idx = (base_row_i * fx.Int32(self.H) + gcol) // fx.Int32(4)  # i32-word index
+            _buffer_ops.buffer_store(
+                Vec.from_elements(words, fx.Int32).ir_value(), self.fp8, fp8_idx, cache_modifier=16
+            )
+
+            def _emit_scale():
+                sb = fx.arith.ArithValue(biased).trunci(fx.T.i8())
+                _buffer_ops.buffer_store(
+                    sb, self.scale, base_row_i * fx.Int32(self.H // 32) + gcol // fx.Int32(32),
+                    cache_modifier=16,
+                )
+
+            _emit_if_then(col0 == fx.Int32(0), _emit_scale)
+
+
 def _a_tail_mask_vec(lane_id, r):
     """Per-lane i32x8 byte-mask zeroing A-fragment bytes whose K-column >= r
     (r in [1,128)). AND-ing it into the A frag drops the K-tail terms (a_k=0)

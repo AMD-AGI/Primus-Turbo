@@ -27,13 +27,14 @@ With no ``output`` supplied the reduce is off and this degenerates to the two-ro
 kernel. K % BLOCK_K == 0; out_features a multiple of 8 (b128 vec)."""
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import arith, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -351,6 +352,11 @@ def _compile(
     dedicated_reduce_warps = num_reduce_cu * _NUM_WARPS  # const worker-warp count for [combine,reduce)
     gemm_base = num_combine_cu + num_reduce_cu
     topk_reduce = _get_topk_reduce(True, apply_weights, with_gate)
+    # PT_COMBINE_NO_REDUCE (debug/isolation, default off): compile out the topk reduce role
+    # (dedicated + empty-block) so the kernel measures ONLY the GEMM (produce L2Y) + combine PUSH
+    # (XGMI copy to peer). Isolates the produce+transmit half from the cross-rank reduce +
+    # producer-consumer sync. Requires num_reduce_cu==0.
+    _no_reduce = os.environ.get("PT_COMBINE_NO_REDUCE", "0") == "1"
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -471,79 +477,68 @@ def _compile(
             # drain cross-rank PUSH stores before exit so the host barrier + reduce see landed data
             fx.rocdl.s_waitcnt(0)
         else:
-            if block_index < combine_cu + reduce_cu:
-                # ── role 2a: DEDICATED TOPK REDUCE (no-op when num_reduce_cu == 0) ──
-                topk_reduce(
-                    thread_index,
-                    block_index - combine_cu,
-                    fx.Int32(dedicated_reduce_warps),
-                    topk,
-                    out_features,
-                    num_experts,
-                    rank,
-                    comb_local_res,
-                    output_res,
-                    topk_indices_res,
-                    num_tokens_res,
-                    barrier_base,
-                    topk_weights_res,
-                    gate_local_res,
-                    d_topk_w_res,
+            # ── role 3: GROUPED GEMM (one tile -> L2Y, signal scoreboard) ──
+            # naive M-major order is REQUIRED: each block_m's n_blocks tiles complete
+            # contiguously AND in numeric block_m order, so the combine role (which
+            # grid-strides block_m numerically) can stream-push each block_m mid-kernel.
+            # Any reuse swizzle (GROUP_M groups, or XCD remap) reorders block_m completion
+            # -> combine stalls on late tiles -> serializes into a 1.5x tail. Proven dead
+            # ends; the fused GEMM trades weight-L2 reuse for combine overlap on purpose.
+            # gemm_tile_index/block_m/block_n computed ONCE here (unconditional) so they always
+            # carry a value before the dynamic ifs below (the scf.if rewriter cannot yield a
+            # None-initialized var assigned only inside a branch). Negative for dedicated-reduce
+            # blocks (block_index in [combine_cu, gemm_base)) -> harmless, unused on that path.
+            gemm_tile_index = block_index - fx.Int32(gemm_base)
+            block_m = gemm_tile_index // fx.Int32(n_blocks)
+            block_n = gemm_tile_index % fx.Int32(n_blocks)
+
+            def _do_gemm_tile(block_m, block_n):
+                # c_m = num_max_pool_tokens compile-time const folds the epilogue bound (~4% faster)
+                c_m_const = fx.Int32(num_max_pool_tokens)
+                group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                group_base = group_index * fx.Int32(K) * c_n
+                gemm_tile(
+                    ACT,
+                    WEIGHTS,
+                    l2y_tensor,
+                    c_m_const,
+                    c_n,
+                    lds,
+                    block_m,
+                    block_n,
+                    K=K,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                    out_fp16=out_fp16,
+                    nt_vmcnt=nt_vmcnt,
+                    b_group_base=group_base,
+                    # NOTE: cache_modifier=16 (CPOL sc1) = write-through C store -> L2Y lands in
+                    # L2 so the role-1 push (different CU, same kernel) reads fresh, not stale L1.
+                    c_cache_modifier=16,
                 )
-            else:
-                # ── role 3: GROUPED GEMM (one tile -> L2Y, signal scoreboard) ──
-                # naive M-major order is REQUIRED: each block_m's n_blocks tiles complete
-                # contiguously AND in numeric block_m order, so the combine role (which
-                # grid-strides block_m numerically) can stream-push each block_m mid-kernel.
-                # Any reuse swizzle (GROUP_M groups, or XCD remap) reorders block_m completion
-                # -> combine stalls on late tiles -> serializes into a 1.5x tail. Proven dead
-                # ends; the fused GEMM trades weight-L2 reuse for combine overlap on purpose.
-                gemm_tile_index = block_index - fx.Int32(gemm_base)
-                block_m = gemm_tile_index // fx.Int32(n_blocks)
-                block_n = gemm_tile_index % fx.Int32(n_blocks)
+                # drain L2Y stores before raising sb_l2. NOTE: c_cache_modifier=16 (sc1) writes
+                # THROUGH L2 to HBM, leaving a stale L2 line -- the role-1 push must invalidate
+                # L2 (l2_invalidate() before push_block) to re-read fresh, else it pushes stale.
+                fx.rocdl.s_waitcnt(0)
+                fx.gpu.barrier()  # all waves' stores landed before the signal
+                _emit_if_then(
+                    thread_index == fx.Int32(0),
+                    lambda: atomic_add(sb_l2_base, block_m, fx.Int32(1), scope="agent"),
+                )
+
+            if const_expr(_no_reduce):
+                # ISOLATION (PT_COMBINE_NO_REDUCE): no reduce role. num_reduce_cu==0 so
+                # gemm_base==combine_cu; all else-blocks are GEMM tiles (real -> produce L2Y +
+                # signal; empty -> idle). Measures GEMM produce + combine PUSH only.
                 if block_m < real_tiles:
-                    # c_m = num_max_pool_tokens compile-time const folds the epilogue bound (~4% faster)
-                    c_m_const = fx.Int32(num_max_pool_tokens)
-                    group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
-                    group_base = group_index * fx.Int32(K) * c_n
-                    gemm_tile(
-                        ACT,
-                        WEIGHTS,
-                        l2y_tensor,
-                        c_m_const,
-                        c_n,
-                        lds,
-                        block_m,
-                        block_n,
-                        K=K,
-                        BLOCK_M=BLOCK_M,
-                        BLOCK_N=BLOCK_N,
-                        out_fp16=out_fp16,
-                        nt_vmcnt=nt_vmcnt,
-                        b_group_base=group_base,
-                        # NOTE: cache_modifier=16 (CPOL sc1) = write-through C store -> L2Y lands in
-                        # L2 so the role-1 push (different CU, same kernel) reads fresh, not stale L1.
-                        c_cache_modifier=16,
-                    )
-                    # drain L2Y stores before raising sb_l2. NOTE: c_cache_modifier=16 (sc1) writes
-                    # THROUGH L2 to HBM, leaving a stale L2 line -- the role-1 push must invalidate
-                    # L2 (l2_invalidate() before push_block) to re-read fresh, else it pushes stale.
-                    fx.rocdl.s_waitcnt(0)
-                    fx.gpu.barrier()  # all waves' stores landed before the signal
-                    _emit_if_then(
-                        thread_index == fx.Int32(0),
-                        lambda: atomic_add(sb_l2_base, block_m, fx.Int32(1), scope="agent"),
-                    )
-                else:
-                    # role 2b: empty GEMM tiles reduce on freed CUs (overlaps the push tail)
-                    empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
-                    total_empty_warps = (
-                        fx.Int32(gemm_grid_blocks) - real_tiles * fx.Int32(n_blocks)
-                    ) * fx.Int32(_NUM_WARPS)
+                    _do_gemm_tile(block_m, block_n)
+            else:
+                if block_index < combine_cu + reduce_cu:
+                    # ── role 2a: DEDICATED TOPK REDUCE (no-op when num_reduce_cu == 0) ──
                     topk_reduce(
                         thread_index,
-                        empty_ordinal,
-                        total_empty_warps,
+                        block_index - combine_cu,
+                        fx.Int32(dedicated_reduce_warps),
                         topk,
                         out_features,
                         num_experts,
@@ -557,6 +552,32 @@ def _compile(
                         gate_local_res,
                         d_topk_w_res,
                     )
+                else:
+                    if block_m < real_tiles:
+                        _do_gemm_tile(block_m, block_n)
+                    else:
+                        # role 2b: empty GEMM tiles reduce on freed CUs (overlaps the push tail)
+                        empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
+                        total_empty_warps = (
+                            fx.Int32(gemm_grid_blocks) - real_tiles * fx.Int32(n_blocks)
+                        ) * fx.Int32(_NUM_WARPS)
+                        topk_reduce(
+                            thread_index,
+                            empty_ordinal,
+                            total_empty_warps,
+                            topk,
+                            out_features,
+                            num_experts,
+                            rank,
+                            comb_local_res,
+                            output_res,
+                            topk_indices_res,
+                            num_tokens_res,
+                            barrier_base,
+                            topk_weights_res,
+                            gate_local_res,
+                            d_topk_w_res,
+                        )
 
     @flyc.jit
     def launch(

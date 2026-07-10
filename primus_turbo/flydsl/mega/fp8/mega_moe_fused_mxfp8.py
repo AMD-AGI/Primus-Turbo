@@ -44,6 +44,9 @@ from primus_turbo.flydsl.mega.fp8.dispatch_fp8_push_kernel import (
 from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
     dispatch_grouped_gemm_mxfp8,
 )
+from primus_turbo.flydsl.mega.fp8.grouped_gemm_combine_fp8_kernel import (
+    grouped_gemm_combine_fp8,
+)
 from primus_turbo.flydsl.mega.fp8.grouped_gemm_combine_mxfp8_kernel import (
     grouped_gemm_combine_mxfp8,
 )
@@ -72,6 +75,7 @@ def mega_moe_fused_mxfp8_forward(
     block_n: int = 256,
     num_combine_cu: int | None = None,
     comm: str = "fp8_fused",
+    combine: str = "mxfp8",
     return_aux: bool = False,
 ):
     """Fused mega MoE forward, mxfp8 compute. Returns y[T, H] bf16.
@@ -179,24 +183,48 @@ def mega_moe_fused_mxfp8_forward(
             a_fp8, a_scale, w1q, w1s, group_offs, out_dtype=torch.bfloat16
         )
     act = swiglu(l1)
-    aq, as_ = quantize_rowwise_mxfp8(act)
-    w2q, w2s = quantize_grouped_weight_mxfp8(w2)
 
-    # FUSED L2: one 3-role kernel does the grouped mxfp8 L2 GEMM -> cross-rank combine PUSH ->
-    # weighted top-k reduce (mirror of the L1 fused kernel: compute -> comm). Init the L2
-    # scoreboard (0) + reduce flags (-1, the "wait" state) cross-rank before the kernel signals
-    # them, then it returns the per-token output directly.
+    # FUSED L2: one 3-role kernel does the L2 GEMM -> cross-rank combine PUSH -> weighted top-k
+    # reduce (mirror of the L1 fused kernel: compute -> comm). Init the L2 scoreboard (0) +
+    # reduce flags (-1, the "wait" state) cross-rank before the kernel signals them.
     torch.cuda.synchronize()
     group.barrier()
     symm.sb_l2.zero_()
     symm.barrier_local.fill_(-1)
     torch.cuda.synchronize()
     group.barrier()
-    y = grouped_gemm_combine_mxfp8(
-        aq, as_, w2q, w2s, handle, group,
-        topk_indices=topk_idx64, topk_weights=topk_weights.to(torch.float32),
-        BM=block_m, BN=block_n, num_combine_cu=(num_combine_cu if num_combine_cu is not None else 64),
-    )
+    if combine == "bf16":
+        # bf16 fused L2 (production reference): grouped bf16 GEMM + bf16 combine + weighted reduce.
+        from primus_turbo.pytorch.core.backend import BackendType
+        from primus_turbo.pytorch.kernels.mega_moe.grouped_gemm_combine_impl import (
+            grouped_gemm_combine_impl,
+        )
+
+        y, _ = grouped_gemm_combine_impl(
+            act, w2, list(handle), BackendType.FLYDSL.value,
+            topk_indices=topk_idx64.contiguous().view(-1),
+            topk_weights=topk_weights.to(torch.float32).contiguous().view(-1),
+            num_combine_cu=(num_combine_cu if num_combine_cu is not None else 64),
+            num_reduce_cu=0, layout="nt", BM=block_m, BN=block_n,
+        )
+    elif combine == "fp8":
+        # bf16 GEMM + CShuffle mxfp8-quant epilogue + FP8 combine PUSH (half XGMI bytes) +
+        # fp8-dequant reduce (grouped_gemm_combine_fp8). No separate act/w2 quant: the GEMM
+        # epilogue quantizes the L2Y in-register (StoreCQuantMxfp8CShuffle32).
+        y = grouped_gemm_combine_fp8(
+            act, w2, list(handle), group,
+            topk_indices=topk_idx64, topk_weights=topk_weights.to(torch.float32),
+            BM=block_m, BN=block_n,
+            num_combine_cu=(num_combine_cu if num_combine_cu is not None else 48),
+        )
+    else:
+        aq, as_ = quantize_rowwise_mxfp8(act)
+        w2q, w2s = quantize_grouped_weight_mxfp8(w2)
+        y = grouped_gemm_combine_mxfp8(
+            aq, as_, w2q, w2s, handle, group,
+            topk_indices=topk_idx64, topk_weights=topk_weights.to(torch.float32),
+            BM=block_m, BN=block_n, num_combine_cu=(num_combine_cu if num_combine_cu is not None else 64),
+        )
     if return_aux:
         return y, {"handle": handle, "l1": l1, "dispatch_weights": _aux_dispatch_weights}
     return y
