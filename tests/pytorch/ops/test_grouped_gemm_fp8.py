@@ -389,7 +389,7 @@ def test_grouped_gemm_fp8_blockwise_deterministic(
     )
 
 
-# MX_BLOCKWISE deterministic — triton backend only; only runs on gfx950.
+# MX_BLOCKWISE deterministic — triton + flydsl backends; only runs on gfx950.
 # Limited to trans_b=True: the TT-layout path routes through a Python-level
 # transpose+pad layer whose downstream allocator non-determinism is out of
 # scope for the kernel determinism test.
@@ -400,8 +400,9 @@ def test_grouped_gemm_fp8_blockwise_deterministic(
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
 @pytest.mark.deterministic
-def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance):
+def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance, backend):
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
         pytest.skip(reason)
@@ -416,7 +417,7 @@ def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format
         granularity=ScalingGranularity.MX_BLOCKWISE,
         trans_b=trans_b,
         balance=balance,
-        backend=BackendType.TRITON,
+        backend=backend,
         block_size=32,
         repeats=10,
     )
@@ -533,8 +534,9 @@ def test_grouped_gemm_fp8_blockwise(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance):
-    """MXFP8 grouped GEMM fwd + dgrad + wgrad on the triton backend."""
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
+def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance, backend):
+    """MXFP8 grouped GEMM fwd + dgrad + wgrad."""
     N, K = NK
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
@@ -549,7 +551,7 @@ def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, bal
         granularity=ScalingGranularity.MX_BLOCKWISE,
         trans_b=trans_b,
         balance=balance,
-        backend=BackendType.TRITON,
+        backend=backend,
         auto_tune=False,
     )
 
@@ -771,7 +773,7 @@ def test_grouped_gemm_fp8_rowwise_quantized_tensor(
     ],
 )
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.FLYDSL])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_mx_blockwise_quantized_tensor(
     B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune
