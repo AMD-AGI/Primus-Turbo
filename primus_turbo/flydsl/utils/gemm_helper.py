@@ -115,11 +115,19 @@ def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_byte
     return fx.Tensor(fx.make_view(iter_bf, lay))
 
 
-def swizzle_128(row, col):
-    offset = row * 128 + col
-    swizzle = ((offset % (16 * 128)) >> 8) << 4
+def swizzle_128(row, col, width=128):
+    """XOR bank-swizzle over a `width`=2**k logical row (width=128 is byte-identical to
+    the original fixed-128 form). The swizzle must stay within col's bits [0,k); for k<7
+    we extract fewer bits (k-4) from the `row%16` window so the result is always < width."""
+    k = width.bit_length() - 1
+    period = 16 * width
+    offset = row * width + col
+    nbits = k - 4
+    mask = (1 << nbits) - 1
+    extracted = (offset % period) >> (k + 1)
+    swizzle = (extracted & mask) << 4
     swizzled_offset = offset ^ swizzle
-    return swizzled_offset // 128, swizzled_offset % 128
+    return swizzled_offset // width, swizzled_offset % width
 
 
 def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
@@ -235,6 +243,28 @@ class S2RLoader:
                 halves.append(v.bitcast(fx.Int32))
             frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
         return frag
+
+    def base_addr(self, lds_src, preshuffled=False):
+        """Per-lane LDS byte address pairs for the bare-asm whole-loop: mirrors `load()`'s
+        addressing but returns addresses so `ds_line` can emit 2x ds_read_b128 (no HW
+        transpose) for an already-M/N-major operand. Same [[p0,p1]]*n_tiles shape as
+        `S2RLoaderTr.base_addr` (interchangeable); p0/p1 are the two 16B halves of one
+        32-elem fragment, not two lane-group bases."""
+        base = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        out = []
+        for i in range_constexpr(self.n_tiles):
+            row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
+            addrs = []
+            for step in range_constexpr(2):
+                col = (self.lane_id // 16) * 16 + step * 64
+                if const_expr(preshuffled):
+                    offset = (row // 8) * 1024 + (row % 8) * 16 + (col // 16) * 128
+                else:
+                    row_swz, col_swz = swizzle_128(row, col)
+                    offset = row_swz * 128 + col_swz
+                addrs.append(base + fx.Int32(offset))
+            out.append(addrs)
+        return out
 
 
 def wait_barrier(count):
@@ -532,7 +562,19 @@ class StoreCPerTensorCShuffle:
     invalid runs clamp to an OOB element index (HW SRD drop), as the scalar path does."""
 
     def __init__(
-        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, c_lds, wave_id
+        self,
+        A_scale,
+        B_scale,
+        C,
+        c_rows,
+        c_cols,
+        c_idx_fn,
+        n_tiles_a,
+        n_tiles_b,
+        out_ty,
+        c_lds,
+        wave_id,
+        row_pad=0,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
@@ -542,13 +584,22 @@ class StoreCPerTensorCShuffle:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
-        self.Cc = n_tiles_b * 16
-        self.EPL = (16 * self.Cc) // 64  # out_ty elements per lane on re-read
-        assert self.EPL * 2 == 16, f"CShuffle expects a 128b store (EPL=8 bf16); got EPL={self.EPL}"
-        # The ds_write_b16 staging + 128b re-read aliases LDS banks, but the epilogue
-        # store stall is hidden behind the MMA pipeline / next-tile prologue, so anti-
-        # conflict row padding is perf-neutral here and is not used.
-        self.row_stride = self.Cc  # logical == physical (no anti-conflict padding)
+        self.Cc = n_tiles_b * 16  # columns in one 16-row shuffle tile
+        self.EPL = (16 * self.Cc) // 64  # out_ty elements each lane re-reads (16*Cc rows/cols / 64 lanes)
+        # One coalesced global store is 128 bits = 8 x 16b (buffer_store_dwordx4). If a
+        # lane re-reads more than that (EPL > 8 -- e.g. the 4-wave 2x2 geometry has
+        # n_tiles_b=4 -> Cc=64 -> EPL=16), emit EPL//8 back-to-back 128b stores; EPL==8
+        # (the 8-wave path) is a single store. EPL must be a multiple of 8 and fit in one row.
+        self.elems_per_store = 8  # 16b elements packed into one 128b vector store
+        assert self.EPL % self.elems_per_store == 0 and self.EPL <= self.Cc, (
+            f"CShuffle expects EPL a multiple of 8 within Cc={self.Cc}; got EPL={self.EPL}"
+        )
+        # The ds_write_b16 staging + 128b re-read aliases LDS banks. row_pad=0 (default)
+        # keeps the historical behavior. row_pad is an explicit opt-in: the caller must
+        # size its own C_lds_shuffle allocation as n_waves*16*(n_tiles_b*16 + row_pad)
+        # (not just n_tiles_b*16), or this overflows the buffer.
+        self.row_stride = self.Cc + row_pad
+        self.row_pad = row_pad
         self.wave_lds_elems = 16 * self.row_stride  # per-wave staging (one 16-row tile)
         self.c_lds = c_lds
         # C addressed via i64 per-band re-basing (handles OUT_M*OUT_N > 2^31 / >4GB);
@@ -598,14 +649,16 @@ class StoreCPerTensorCShuffle:
             nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
             rsrc = _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
             row_in = (self.lane_id * self.EPL) // self.Cc
-            col_in = (self.lane_id * self.EPL) % self.Cc
-            lane_e = wave_off + row_in * self.row_stride + col_in
-            rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
-            vec = fx.make_view(rptr, fx.make_layout(self.EPL, 1)).load()
-            gcol = base_col + col_in
-            valid = (gcol + fx.Int32(self.EPL)) <= self.c_cols
-            off = (row_in * self.c_cols + gcol) * out_b  # i32-small within band
-            _buffer_ops.buffer_store(vec, rsrc, off, mask=valid, offset_is_bytes=True)
+            col0 = (self.lane_id * self.EPL) % self.Cc
+            for sub in range_constexpr(self.EPL // self.elems_per_store):
+                col_in = col0 + sub * self.elems_per_store
+                lane_e = wave_off + row_in * self.row_stride + col_in
+                rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
+                vec = fx.make_view(rptr, fx.make_layout(self.elems_per_store, 1)).load()
+                gcol = base_col + col_in
+                valid = (gcol + fx.Int32(self.elems_per_store)) <= self.c_cols
+                off = (row_in * self.c_cols + gcol) * out_b  # i32-small within band
+                _buffer_ops.buffer_store(vec, rsrc, off, mask=valid, offset_is_bytes=True)
             S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
 
 
@@ -730,16 +783,24 @@ def _packed_ds_read_tr_offsets(base_ptr, byte_offsets, vmcnt_hint=None):
     return [_llvm.extractvalue(v2i32, asm_op.result, [k]) for k in range(N)]
 
 
-def compute_global_swizzle_nn(lane_id, wave_id, N_out, n_rounds):
-    """Per-lane global-load offsets for NN B [K_inner, N_out] row-major: each
-    round loads 64 K-rows x 128 N-bytes via swizzle_128(k_row, n_col) over the
-    flat [K, N] byte view with N_out element stride."""
+def compute_global_swizzle_nn(lane_id, wave_id, N_out, n_rounds, width=128, wswz=False):
+    """Per-lane global-load offsets for NN B [K_inner, N_out] row-major, via
+    swizzle_128(k_row, n_col, width) over the flat [K, N] byte view. `width` must equal
+    the destination buffer's LDS column span (e.g. LDS_BLOCK_N; defaults to 128,
+    byte-identical there) or reads overlap. chunks=width//16 lanes cooperate per K-row,
+    the remaining 64/chunks lanes per wave span distinct K-rows."""
     offsets = []
     n_waves = fx.block_dim.x // 64
+    chunks = width // 16
+    rows_per_wave = 64 // chunks
     for r in range_constexpr(n_rounds):
-        k_row = lane_id // 8 + wave_id * 8 + r * (n_waves * 8)
-        n_col = (lane_id % 8) * 16
-        rs, cs = swizzle_128(k_row, n_col)
+        k_row = lane_id // chunks + wave_id * rows_per_wave + r * (n_waves * rows_per_wave)
+        n_col = (lane_id % chunks) * 16
+        rs, cs = swizzle_128(k_row, n_col, width=width)
+        if wswz:
+            # Matching write for the read-side j_chunk^(W<<1) bank-spread swizzle:
+            # XOR (wave_id<<1) into the column chunk so it lands where the read looks.
+            cs = cs ^ (((wave_id << 1) & (chunks - 1)) * 16)
         offsets.append(rs * N_out + cs)
     return offsets
 
@@ -762,11 +823,14 @@ class S2RLoaderTr:
         vmcnt_hint=2,
         chunk_stride=1024,
         n_waves=8,
+        width=128,
+        wswz=False,
     ):
-        """wave_idx: this wave's index along the transposed coordinate (wave_n
-        for B, wave_m for A). tile_stride: per-wave coverage on that axis.
-        chunk_stride must match the G2S writer. inline_asm issues the reads as
-        opaque asm (caller drains via vmcnt_hint) and requires agpr_alloc>0."""
+        """wave_idx: this wave's index along the transposed coord (wave_n for B, wave_m for
+        A). tile_stride: per-wave coverage. chunk_stride must match the G2S writer.
+        inline_asm issues opaque-asm reads (caller drains via vmcnt_hint, needs
+        agpr_alloc>0). width: this buffer's LDS column span (defaults 128) -- MUST match the
+        paired compute_global_swizzle_nn `width` (see swz_K for why it scales with width)."""
         self.wave_idx = wave_idx
         self.n_tiles = n_tiles
         self.tile_stride = tile_stride
@@ -776,20 +840,33 @@ class S2RLoaderTr:
         self.chunk_stride = chunk_stride
         self.n_waves = n_waves
         self.round_stride = n_waves * chunk_stride
+        self.width = width
+        self.wswz = wswz  # wave bank-swizzle (j_chunk^(W<<1)); scoped to 2-pool@1024
 
     def _ptr_off(self, c, tile_i, I, L_in_sg):
-        KW = self.n_waves * 8
+        # rows_per_wave = 64/chunks must match compute_global_swizzle_nn's own
+        # rows_per_wave (the write side's local K-row count per wave per round).
+        chunks = self.width // 16
+        rows_per_wave = 64 // chunks
+        KW = self.n_waves * rows_per_wave
         K_log = I * 16 + S2RLoaderTr._K_BASE[c] + (L_in_sg // 2)
         r_step = K_log // KW
-        W = (K_log % KW) // 8
-        K_mod_8 = K_log % 8
-        swz_K = ((K_log % 16) // 2) * 16
+        W = (K_log % KW) // rows_per_wave
+        K_local_row = K_log % rows_per_wave
+        # swz_K reproduces swizzle_128's own (extracted & mask) term: extracted =
+        # (K_log%16)//2 is width-independent; only the mask narrows with width.
+        swz_K = (((K_log % 16) // 2) & (chunks - 1)) * 16
         coord_start = self.wave_idx * self.tile_stride + tile_i * 16
         j_chunk = (coord_start // 16) ^ (swz_K // 16)
+        if self.wswz:
+            # XOR (W<<1) into j_chunk: address bit shift W*32, matching the write
+            # side's compute_global_swizzle_nn(wswz=True) -- drops LDSBankConflict
+            # 14% -> 0% at _CS=1024 (2-pool).
+            j_chunk = j_chunk ^ ((W << 1) & (chunks - 1))
         return (
             W * self.chunk_stride
             + r_step * self.round_stride
-            + K_mod_8 * 128
+            + K_local_row * self.width
             + j_chunk * 16
             + (L_in_sg % 2) * 8
         )
@@ -851,6 +928,21 @@ class S2RLoaderTr:
                 self._wait_lgkmcnt(0)
             return [self._assemble(c) for c in all_calls]
         return [self._assemble(self._issue_one(lds_src, t, base_off)) for t in range_constexpr(self.n_tiles)]
+
+    def base_addr(self, lds_src):
+        """Per-lane LDS address pairs [[p0,p1]]*n_tiles for the whole-loop transpose reads:
+        tile i's 4 ds_read_b64_tr_b8 are p0[i]+0, p1[i]+0, p0[i]+RS, p1[i]+RS (RS =
+        8*chunk_stride). p0/p1 are not tile-strided (j_chunk carries an XOR), so each tile
+        needs its own pair."""
+        base = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        I = self.lane_id // 16
+        L_in_sg = self.lane_id % 16
+        out = []
+        for t in range_constexpr(self.n_tiles):
+            p0 = base + fx.Int32(self._ptr_off(0, t, I, L_in_sg))
+            p1 = base + fx.Int32(self._ptr_off(1, t, I, L_in_sg))
+            out.append([p0, p1])
+        return out
 
 
 def block_mn(pid, num_pid_m, n_blocks, GM, GN):

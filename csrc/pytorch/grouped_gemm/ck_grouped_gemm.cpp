@@ -88,7 +88,10 @@ uint32_t get_grouped_gemm_num_cu(c10::optional<int64_t> num_cu) {
 
 at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                            at::Tensor &group_offs, const bool transA, const bool transB,
-                           c10::optional<int64_t> num_cu) {
+                           c10::optional<int64_t>    num_cu,
+                           const bool                work_steal,
+                           c10::optional<at::Tensor> ws_counter,
+                           int64_t                   ws_local_per_xcd) {
     auto out_dtype = a.scalar_type();
 
     // Check
@@ -96,6 +99,40 @@ at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(b.scalar_type()));
     PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong);
+
+    // Validate the WS counter. The buffer is owned and zeroed at allocation
+    // time by the Python wrapper (per-device cache, one-shot torch.zeros);
+    // the kernel self-resets all slots before exit (last-out CTA), so no
+    // per-call zero is needed here.
+    //
+    // Counter buffer layout: [xcd0..xcd7, global, done] -- 10 int32 slots.
+    // ws_local_per_xcd selects the WS mode (see grouped_gemm_kernel_ws.hpp).
+    int32_t *ws_counter_ptr = nullptr;
+    if (work_steal) {
+        PRIMUS_TURBO_CHECK(ws_counter.has_value(),
+                           "ck_grouped_gemm: work_steal=True requires ws_counter");
+        at::Tensor &counter = ws_counter.value();
+        PRIMUS_TURBO_CHECK(counter.scalar_type() == at::kInt,
+                           "ws_counter must be int32");
+        PRIMUS_TURBO_CHECK(counter.is_cuda(), "ws_counter must be on CUDA");
+        PRIMUS_TURBO_CHECK(counter.device() == a.device(),
+                           "ws_counter must be on the same CUDA device as `a` "
+                           "(counter cuda:", counter.device().index(),
+                           ", a cuda:", a.device().index(), ")");
+        PRIMUS_TURBO_CHECK(counter.is_contiguous(),
+                           "ws_counter must be contiguous");
+        constexpr int64_t kCounterSlots = 8 + 2; // NUM_XCDS_WS + global + done
+        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots,
+                           "ws_counter must have at least ", kCounterSlots, " int32 slots");
+        ws_counter_ptr = static_cast<int32_t *>(counter.data_ptr());
+    }
+    // The CK WS kernel takes ws_local_per_xcd as int32. Reject values that
+    // would truncate silently on the cast below (int32 max ~2.1B; the heuristic
+    // returns ceil(total_tiles / 8) at most, and any WS shape that fits in
+    // int32 tile count is well under this limit -- this is a defensive check).
+    PRIMUS_TURBO_CHECK(
+        ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
+        "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
 
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
@@ -117,6 +154,9 @@ at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
         auto params = make_ck_groued_gemm_params<AType, BType, CType>(
             args_tensor.data_ptr(), a, b, c, group_lens, group_offs, transA, transB, bs, m, n, k,
             stream, get_grouped_gemm_num_cu(num_cu));
+        params.work_steal       = work_steal;
+        params.ws_counter_ptr   = ws_counter_ptr;
+        params.ws_local_per_xcd = static_cast<int32_t>(ws_local_per_xcd);
         primus_turbo::ck_grouped_gemm<AType, BType, CType>(params);
     } else if (a.dtype() == at::kBFloat16) {
         using AType = typename TorchToCKTileType<at::kBFloat16>::type;
@@ -125,6 +165,9 @@ at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
         auto params = make_ck_groued_gemm_params<AType, BType, CType>(
             args_tensor.data_ptr(), a, b, c, group_lens, group_offs, transA, transB, bs, m, n, k,
             stream, get_grouped_gemm_num_cu(num_cu));
+        params.work_steal       = work_steal;
+        params.ws_counter_ptr   = ws_counter_ptr;
+        params.ws_local_per_xcd = static_cast<int32_t>(ws_local_per_xcd);
         primus_turbo::ck_grouped_gemm<AType, BType, CType>(params);
     } else {
         PRIMUS_TURBO_CHECK(false, "GroupedGemm only support float16 and bfloat16");
@@ -207,7 +250,10 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
 
 at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
-                                      c10::optional<int64_t> num_cu) {
+                                      c10::optional<int64_t>    num_cu,
+                                      const bool                work_steal,
+                                      c10::optional<at::Tensor> ws_counter,
+                                      int64_t                   ws_local_per_xcd) {
     // TODO: output datatype
     auto out_dtype = a.scalar_type();
 
@@ -216,6 +262,32 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(b.scalar_type()));
     PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong);
     PRIMUS_TURBO_CHECK(group_offs.scalar_type() == at::kLong);
+
+    // Validate WS counter -- kernel self-resets, no per-call zero needed.
+    // Counter layout: [xcd0..7, global, done] = 10 int32 slots.
+    int32_t *ws_counter_ptr = nullptr;
+    if (work_steal) {
+        PRIMUS_TURBO_CHECK(ws_counter.has_value(),
+                           "ck_grouped_gemm_variable_k: work_steal=True requires ws_counter");
+        at::Tensor &counter = ws_counter.value();
+        PRIMUS_TURBO_CHECK(counter.scalar_type() == at::kInt, "ws_counter must be int32");
+        PRIMUS_TURBO_CHECK(counter.is_cuda(), "ws_counter must be on CUDA");
+        PRIMUS_TURBO_CHECK(counter.device() == a.device(),
+                           "ws_counter must be on the same CUDA device as `a` "
+                           "(counter cuda:", counter.device().index(),
+                           ", a cuda:", a.device().index(), ")");
+        PRIMUS_TURBO_CHECK(counter.is_contiguous(),
+                           "ws_counter must be contiguous");
+        constexpr int64_t kCounterSlots = 8 + 2;
+        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots,
+                           "ws_counter must have at least ", kCounterSlots, " int32 slots");
+        ws_counter_ptr = static_cast<int32_t *>(counter.data_ptr());
+    }
+    // See ck_grouped_gemm(): the kernel takes ws_local_per_xcd as int32,
+    // reject values that would truncate silently on the cast below.
+    PRIMUS_TURBO_CHECK(
+        ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
+        "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
 
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
@@ -237,6 +309,9 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
         auto params = make_ck_groued_gemm_params<AType, BType, CType>(
             args_tensor.data_ptr(), a, b, c, group_lens, group_offs, transA, transB, bs, m, n, k,
             stream, get_grouped_gemm_num_cu(num_cu));
+        params.work_steal       = work_steal;
+        params.ws_counter_ptr   = ws_counter_ptr;
+        params.ws_local_per_xcd = static_cast<int32_t>(ws_local_per_xcd);
         primus_turbo::ck_grouped_gemm_variable_k<AType, BType, CType>(params);
     } else if (a.dtype() == at::kBFloat16) {
         using AType = typename TorchToCKTileType<at::kBFloat16>::type;
@@ -245,6 +320,9 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
         auto params = make_ck_groued_gemm_params<AType, BType, CType>(
             args_tensor.data_ptr(), a, b, c, group_lens, group_offs, transA, transB, bs, m, n, k,
             stream, get_grouped_gemm_num_cu(num_cu));
+        params.work_steal       = work_steal;
+        params.ws_counter_ptr   = ws_counter_ptr;
+        params.ws_local_per_xcd = static_cast<int32_t>(ws_local_per_xcd);
         primus_turbo::ck_grouped_gemm_variable_k<AType, BType, CType>(params);
     } else {
         PRIMUS_TURBO_CHECK(false, "GroupedGemm only support float16 and bfloat16");

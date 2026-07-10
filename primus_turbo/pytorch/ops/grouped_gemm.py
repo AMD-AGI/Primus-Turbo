@@ -139,11 +139,11 @@ def grouped_gemm(
             * ``"static"`` (default): static-stride persistent kernel.
             * ``"work_steal"``: work-stealing persistent kernel with a kernel-
               aware heuristic that picks per-XCD / global / hierarchical tile
-              claims based on tensor metadata. Triton backend only; explicit
-              selection of a non-Triton backend together with ``"work_steal"``
-              is rejected at dispatch. Internal WS sub-modes are not exposed
-              at this layer; tune via ``grouped_gemm_triton_kernel`` directly
-              when needed. Requires ``num_cu=None`` (see ``num_cu`` above).
+              claims based on tensor metadata. Supported on the Triton and CK
+              backends; HIPBLASLT advertises only ``"static"``. Internal WS
+              sub-modes are not exposed at this layer; tune via the kernel-
+              level entry points when needed. Requires ``num_cu=None`` (see
+              ``num_cu`` above).
 
     Returns:
         torch.Tensor: Output of shape [sum(group_lens), N], same dtype/device as `a`.

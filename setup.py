@@ -1,4 +1,3 @@
-import importlib.metadata
 import os
 import platform
 import subprocess
@@ -13,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.build_ext import TurboBuildExt, _join_rocm_home
-from tools.build_utils import HIPExtension, find_rocshmem_library, get_gpu_arch
+from tools.build_utils import HIPExtension, find_rocshmem_library, get_gpu_arch, is_package_installed
 
 # -------- Framework Switches ---------
 # PRIMUS_TURBO_FRAMEWORK="PYTORCH;JAX"
@@ -72,20 +71,6 @@ def check_submodules():
                 sys.exit(1)
             return
     print("[Primus-Turbo] Submodules already initialized.")
-
-
-def is_package_installed(package_name):
-    """Check if a package is properly installed (not just a namespace ghost).
-
-    Uses importlib.metadata to verify the package has real distribution
-    metadata registered with pip, avoiding false positives from leftover
-    empty directories that Python treats as implicit namespace packages.
-    """
-    try:
-        importlib.metadata.distribution(package_name)
-        return True
-    except importlib.metadata.PackageNotFoundError:
-        return False
 
 
 def get_extras_require():
@@ -226,9 +211,11 @@ def check_hip_compiler_flag(flag):
 
 
 def get_common_flags():
+    from tools.build_utils import HIP_LIBRARY_PATH
+
     arch = platform.machine().lower()
     extra_link_args = [
-        "-Wl,-rpath,/opt/rocm/lib",
+        f"-Wl,-rpath,{HIP_LIBRARY_PATH}",
         f"-L/usr/lib/{arch}-linux-gnu",
         "-fgpu-rdc",
         "--hip-link",
@@ -300,6 +287,15 @@ def build_kernels_extension():
     extra_flags["extra_link_args"] += [
         "-shared",
         "-Wl,-soname,libprimus_turbo_kernels.so",
+        # [experiment A] Force a single device-LTO partition so the rocSHMEM
+        # device runtime (default context) and the ODC GDA device kernels stay
+        # in ONE device-LTO unit. The default multi-partition device link
+        # (--lto-partitions=8 + -amdgpu-internalize-symbols) splits the rocSHMEM
+        # device default context away from the ODC kernels -> device getmem reads
+        # zero -> dual-node grad_norm=0. Keeping them in one partition mirrors the
+        # single-TU pinfix .so that works.
+        "-Xoffload-linker",
+        "--lto-partitions=1",
     ]
 
     kernels_source_files = Path(PROJECT_ROOT / "csrc" / "kernels")
