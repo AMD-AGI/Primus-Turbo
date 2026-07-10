@@ -6,30 +6,15 @@
 """MXFP4 grouped GEMM (MX_BLOCKWISE, Triton backend, gfx950).
 
 Mirrors :class:`FP8GroupedGemmMXFunc` but for E2M1 FP4. The MXFP4 training
-recipe (https://arxiv.org/pdf/2509.25149) keeps the forward operands plain MX
-and applies a 16-point Random Hadamard Transform (RHT) to the backward operands
-(grad_out + the cached col-wise transposes). Because the Hadamard is orthogonal
-it cancels inside each GEMM **only when both contracted operands share it**, so
-the recipes are paired exactly like the dense ``gemm_fp4``:
+recipe (https://arxiv.org/pdf/2509.25149) applies a 16-point Random Hadamard
+Transform (RHT) only to the wgrad operands (the col-wise grad_out + the cached
+col-wise A transpose); fwd and dgrad stay plain MX. Because the Hadamard is
+orthogonal it cancels inside each GEMM **only when both contracted operands
+share it**, so the recipes are paired exactly like the dense ``gemm_fp4``:
 
     fwd   : C    = A_row(rht=F)         @ B_row(rht=F)^T          (contract K)
-    dgrad : dA   = gradO_row(rht=T)     @ B_col(rht=T)^T          (contract N)
+    dgrad : dA   = gradO_row(rht=F)     @ B_col(rht=F)^T          (contract N)
     wgrad : dB   = gradO_col(rht=T)     @ A_col(rht=T)^T          (contract M_g)
-
-Both grouped activations ``A`` (fwd) and ``grad_out`` (bwd) are quantized by the
-fused C++ ``grouped_quantize_mxfp4_dual`` kernel: one bf16 read emits both the
-tight-M row-wise operand (fwd/dgrad) and the 128-padded per-group col-wise
-operand (variable-K wgrad), with the per-group M zero-pad + GPU-computed offsets
-folded into the quant pass (no bf16 scatter, no extra read, no D2H sync ->
-CUDA-graph capturable). ``A`` uses rht=F row-wise; ``grad_out`` uses rht=T both
-directions (+ optional gradient SR).
-
-The weight ``B`` ([G, N, K]) is dual-quantized in a single batched
-``quantize_fp4_with_trans`` call (rht=F row-wise for fwd, rht=T col-wise for
-dgrad): the FP4 ``quantize_mxfp4_dual`` kernel walks each group along
-``blockIdx.z``, so there is no Python per-group loop and no full-weight
-transpose/``contiguous`` copy. This mirrors the MXFP8 weight path
-(``FP8GroupedGemmMXFunc`` -> ``quantize_fp8_with_trans`` on the 3D ``(G, N, K)``).
 """
 
 from typing import Union
@@ -79,7 +64,7 @@ def _quant_weight_dual(b: torch.Tensor):
         ScalingGranularity.MX_BLOCKWISE,
         block_size=MXFP4_BLOCK_SIZE,
         scaling_recipe=ScalingRecipe(use_2d_block=True, use_sr=False, use_rht=False),
-        scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True, use_sr=False, use_rht=True),
+        scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True, use_sr=False, use_rht=False),
     )
 
 
@@ -168,7 +153,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             MXFP4_BLOCK_SIZE,
             group_lens,
             group_offs,
-            rowwise_recipe=ScalingRecipe(use_2d_block=False, use_sr=sr, use_rht=True),
+            rowwise_recipe=ScalingRecipe(use_2d_block=False, use_sr=sr, use_rht=False),
             colwise_recipe=ScalingRecipe(use_2d_block=False, use_sr=sr, use_rht=True),
         )
 

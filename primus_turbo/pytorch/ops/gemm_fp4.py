@@ -22,6 +22,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     check_quantized_tensor,
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import gemm_fp4_impl
+from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
 
 __all__ = ["gemm_fp4"]
 
@@ -53,6 +54,10 @@ class FP4GemmMXFunction(torch.autograd.Function):
         supported_mxfp4_backend, reason = check_mxfp4_support()
         assert supported_mxfp4_backend, reason
 
+        dest_dtype = FP4GemmMXFunction.get_fp4_dtype(
+            config.format,
+        )
+
         preshuffle = config.use_preshuffle
 
         a_scaling_recipe = ScalingRecipe(
@@ -62,18 +67,34 @@ class FP4GemmMXFunction(torch.autograd.Function):
             shuffle_scale=preshuffle,
             shuffle_out=False,
         )
+        a_t_scaling_recipe = ScalingRecipe(
+            use_2d_block=False,
+            use_sr=False,
+            use_rht=True,
+            shuffle_scale=preshuffle,
+            shuffle_out=preshuffle,
+        )
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, scaling_recipe=a_scaling_recipe)
-            a_fp4 = a
+            a_row, a_row_scale = a.qdata, a.scale_inv
+            if a_t is None:
+                a_t = QuantizedTensor.quantize(
+                    a.dequantize(),
+                    a.real_dtype,
+                    config.granularity,
+                    axis=-2,
+                    block_size=config.block_size,
+                    scaling_recipe=a_t_scaling_recipe,
+                )
+            a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
-            a_dtype = FP4GemmMXFunction.get_fp4_dtype(config.format)
-            a_fp4 = QuantizedTensor.quantize(
+            a_row, a_row_scale, a_col, a_col_scale = quantize_fp4_with_trans(
                 a,
-                a_dtype,
+                dest_dtype,
                 config.granularity,
                 block_size=config.block_size,
                 scaling_recipe=a_scaling_recipe,
-                axis=1,
+                scaling_recipe_for_trans=a_t_scaling_recipe,
             )
 
         b_scaling_recipe = ScalingRecipe(
@@ -83,27 +104,43 @@ class FP4GemmMXFunction(torch.autograd.Function):
             shuffle_scale=preshuffle,
             shuffle_out=preshuffle,
         )
+        b_t_scaling_recipe = ScalingRecipe(
+            use_2d_block=True,
+            use_sr=False,
+            use_rht=False,
+            shuffle_scale=preshuffle,
+            shuffle_out=preshuffle,
+        )
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
-            b_fp4 = b
+            b_row, b_row_scale = b.qdata, b.scale_inv
+            if b_t is None:
+                b_t = QuantizedTensor.quantize(
+                    b.dequantize(),
+                    b.real_dtype,
+                    config.granularity,
+                    axis=-2,
+                    block_size=config.block_size,
+                    scaling_recipe=b_t_scaling_recipe,
+                )
+            b_col, b_col_scale = b_t.qdata, b_t.scale_inv
         else:
-            b_dtype = FP4GemmMXFunction.get_fp4_dtype(config.format)
-            b_fp4 = QuantizedTensor.quantize(
+            b_row, b_row_scale, b_col, b_col_scale = quantize_fp4_with_trans(
                 b,
-                b_dtype,
+                dest_dtype,
                 config.granularity,
                 block_size=config.block_size,
                 scaling_recipe=b_scaling_recipe,
-                axis=1,
+                scaling_recipe_for_trans=b_t_scaling_recipe,
             )
 
         # NT layout
         out = gemm_fp4_impl(
-            a_fp4.qdata,
-            a_fp4.scale_inv,
+            a_row,
+            a_row_scale,
             False,
-            b_fp4.qdata,
-            b_fp4.scale_inv,
+            b_row,
+            b_row_scale,
             True,
             out_dtype,
             False,
@@ -112,71 +149,18 @@ class FP4GemmMXFunction(torch.autograd.Function):
             preshuffled=preshuffle,
         )
 
-        # Backward needs a col-wise (axis=0) version of A/B with an RHT recipe.
-        # If the caller pre-quantized this and passed it via ``a_t`` / ``b_t``,
-        # reuse it directly; otherwise derive it.
-        #
-        # Caution: do NOT derive from ``a_fp4.dequantize()`` when
-        # ``shuffle_scale=True`` is in the recipe -- ``dequantize_fp4``
-        # treats ``scale_inv`` as canonical-layout and a shuffled scale
-        # gives garbage. When a raw high-precision tensor was passed in,
-        # re-quantize from it directly; this matches what
-        # ``_quantize_mxfp4_dual`` would do under one fused op.
-        if a_t is not None:
-            quantized_a_t = a_t
-        else:
-            a_t_scaling_recipe = ScalingRecipe(
-                use_2d_block=False,
-                use_sr=False,
-                use_rht=True,
-                shuffle_scale=preshuffle,
-                shuffle_out=preshuffle,
-            )
-            a_for_t = a if not isinstance(a, QuantizedTensor) else a_fp4.dequantize()
-            quantized_a_t = QuantizedTensor.quantize(
-                a_for_t,
-                a_fp4.real_dtype,
-                config.granularity,
-                block_size=config.block_size,
-                axis=0,
-                scaling_recipe=a_t_scaling_recipe,
-            )
-
-        if b_t is not None:
-            quantized_b_t = b_t
-        else:
-            b_t_scaling_recipe = ScalingRecipe(
-                use_2d_block=True,
-                use_sr=False,
-                use_rht=True,
-                shuffle_scale=preshuffle,
-                shuffle_out=preshuffle,
-            )
-            b_for_t = b if not isinstance(b, QuantizedTensor) else b_fp4.dequantize()
-            quantized_b_t = QuantizedTensor.quantize(
-                b_for_t,
-                b_fp4.real_dtype,
-                config.granularity,
-                block_size=config.block_size,
-                axis=0,
-                scaling_recipe=b_t_scaling_recipe,
-            )
-        ctx.save_for_backward(
-            quantized_a_t.qdata, quantized_a_t.scale_inv, quantized_b_t.qdata, quantized_b_t.scale_inv
-        )
+        ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
 
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
         ctx.config = config
-        ctx.a_fp4_dtype = a_fp4.real_dtype
-        ctx.b_fp4_dtype = b_fp4.real_dtype
 
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        a_fp4_t, a_t_scale_inv, b_fp4_t, b_t_scale_inv = ctx.saved_tensors
+        a_col, a_col_scale, b_col, b_col_scale = ctx.saved_tensors
         grad_out_dtype = FP4GemmMXFunction.get_fp4_dtype(
             ctx.config.format,
         )
@@ -186,36 +170,13 @@ class FP4GemmMXFunction(torch.autograd.Function):
         preshuffle = ctx.config.use_preshuffle
         default_backend = (BackendType.AITER if preshuffle else BackendType.HIPBLASLT).value
 
-        quantized_grad_out = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            axis=1,
-            block_size=ctx.config.block_size,
-            scaling_recipe=ScalingRecipe(
-                use_2d_block=False,
-                use_sr=ctx.config.use_gradient_sr,
-                use_rht=True,
-                shuffle_scale=preshuffle,
-                shuffle_out=False,
-            ),
+        grad_out_scaling_recipe = ScalingRecipe(
+            use_2d_block=False,
+            use_sr=ctx.config.use_gradient_sr,
+            use_rht=False,
+            shuffle_scale=preshuffle,
+            shuffle_out=False,
         )
-
-        # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
-        grad_a = gemm_fp4_impl(
-            quantized_grad_out.qdata,
-            quantized_grad_out.scale_inv,
-            False,
-            b_fp4_t,
-            b_t_scale_inv,
-            True,
-            ctx.out_dtype,
-            False,
-            granularity=ctx.config.granularity.value,
-            default_backend=default_backend,
-            preshuffled=preshuffle,
-        )
-
         grad_out_t_scaling_recipe = ScalingRecipe(
             use_2d_block=False,
             use_sr=ctx.config.use_gradient_sr,
@@ -223,22 +184,23 @@ class FP4GemmMXFunction(torch.autograd.Function):
             shuffle_scale=preshuffle,
             shuffle_out=False,
         )
-        quantized_grad_out_t = QuantizedTensor.quantize(
+
+        g_row, g_row_scale, g_col, g_col_scale = quantize_fp4_with_trans(
             grad_out,
             grad_out_dtype,
             ctx.config.granularity,
             block_size=ctx.config.block_size,
-            axis=0,
-            scaling_recipe=grad_out_t_scaling_recipe,
+            scaling_recipe=grad_out_scaling_recipe,
+            scaling_recipe_for_trans=grad_out_t_scaling_recipe,
         )
 
-        # NOTE: convert TN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
-        grad_b = gemm_fp4_impl(
-            quantized_grad_out_t.qdata,
-            quantized_grad_out_t.scale_inv,
+        # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
+        grad_a = gemm_fp4_impl(
+            g_row,
+            g_row_scale,
             False,
-            a_fp4_t,
-            a_t_scale_inv,
+            b_col,
+            b_col_scale,
             True,
             ctx.out_dtype,
             False,
@@ -247,9 +209,31 @@ class FP4GemmMXFunction(torch.autograd.Function):
             preshuffled=preshuffle,
         )
 
-        # Grads correspond to forward args:
-        #   (a, b, a_t, b_t, trans_a, trans_b, out_dtype, config)
-        return grad_a, grad_b, None, None, None, None, None, None
+        # NOTE: convert TN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
+        grad_b = gemm_fp4_impl(
+            g_col,
+            g_col_scale,
+            False,
+            a_col,
+            a_col_scale,
+            True,
+            ctx.out_dtype,
+            False,
+            granularity=ctx.config.granularity.value,
+            default_backend=default_backend,
+            preshuffled=preshuffle,
+        )
+
+        return (
+            grad_a,  # a
+            grad_b,  # b
+            None,  # a_t
+            None,  # b_t
+            None,  # trans_a
+            None,  # trans_b
+            None,  # out_dtype
+            None,  # config
+        )
 
 
 @torch._dynamo.disable(
