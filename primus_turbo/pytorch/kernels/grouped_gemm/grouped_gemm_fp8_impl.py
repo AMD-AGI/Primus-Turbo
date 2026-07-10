@@ -852,8 +852,10 @@ def grouped_gemm_fp8_impl(
     )
 
     out = GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
-    if group_offs_out is None:
-        out = grouped_gemm_output_tail_kernel(out, group_offs)
+    # Over-allocated output: zero the unwritten tail past the tight write bound
+    # (group_offs_out for MX; group_offs otherwise) so the caller's [:total_m]
+    # slice never exposes uninitialized rows.
+    out = grouped_gemm_output_tail_kernel(out, group_offs_out if group_offs_out is not None else group_offs)
     return out
 
 
