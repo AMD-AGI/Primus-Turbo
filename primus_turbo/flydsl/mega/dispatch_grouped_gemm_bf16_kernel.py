@@ -31,7 +31,6 @@ from primus_turbo.flydsl.mega.prims import cast, ld, read_clock, spin_timed_out
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
-    _suppress_stdout_stderr,
     autotune,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (
@@ -236,17 +235,14 @@ def _make_kernel(
                             spin_start = read_clock()
                         signal = ld(sb_base, blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
-                # TODO(author): see tn branch -- no l2_invalidate before reading peer-written
-                # pool; mirroring combine's invalidate here deadlocks autotune on gfx950.
+                # TODO(zhuang12): no l2_invalidate before reading peer pool; mirroring combine's invalidate deadlocks autotune on gfx950.
 
                 gbase = g_idx * fx.Int32(K) * c_n
                 # A base = dispatch_token_pool (int64 symm addr); C base = OUTPUT tensor.
                 out_base = fx.arith.ArithValue(
                     arith.index_cast(fx.T.i64(), extract_base_index(OUTPUT)), signed=True
                 )
-                # Fold each per-tile base in int64 (worst-case pool >4GB) so voffset stays
-                # int32, then address tile-local (block_m=0). A: precise bound;
-                # C: HW num_records bounds via 0x40000000 flat layout.
+                # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
                 a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
                 c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
                 A_tile = make_bf16_fp16_tile_tensor(sym_layout.dispatch_token_pool, a_off, BLOCK_M * K)
@@ -278,8 +274,7 @@ def _rewind_dispatch_flag(kwargs):
     p = int(kwargs["disp_parity"])
     base = int(kwargs["expected_dispatch"]) - int(symm.world)
     npb = int(symm.num_max_pool_tokens) // int(kwargs["BLOCK_M"])
-    # reset local bank, make it visible, THEN rendezvous so no next-rep push
-    # lands before every rank has rewound (else pushes get zeroed -> undercount).
+    # reset local bank + make visible, THEN rendezvous so no next-rep push lands before all ranks rewound (else undercount).
     symm.dispatch_flag[p * npb : (p + 1) * npb].fill_(base)
     torch.cuda.synchronize()
     torch.distributed.barrier(symm.group)
@@ -426,6 +421,8 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
                 num_max_pool_tokens=symm.num_max_pool_tokens,
             )
         )
+
+        handle = handle + (symm.pool_src_slot.clone(),)
     else:
         symm = get_symm_buffer_for_mega_moe()
         sym_layout = symm.get_sym_layout()
@@ -437,9 +434,10 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         expert_send_offset,
         dispatched_token_idx,
         tile_to_expert,
-        _expected_count,
         _num_tokens_per_expert,
         num_tokens_per_expert_prefix,
+        num_tile_blocks,
+        *_combine_recv_and_pool_src,
     ) = handle
 
     num_comm = expert_send_dst_rank.numel()
@@ -483,44 +481,43 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
         output = torch.empty((num_max_pool_tokens, N), dtype=x.dtype, device=x.device)
         weight_arg, output_arg = weight_flat, output
-        tile_arg, num_tile_arg, group_offs_arg = tile_to_expert, symm.meta_scalars[1:2], dummy_i32
+        tile_arg, num_tile_arg, group_offs_arg = tile_to_expert, num_tile_blocks, dummy_i32
         c_n, out_m_rt, out_n_rt = N, 0, 0
         out_features_ce, hidden_size_ce = N, hidden_size
         G, trans_c = 0, False  # nt/nn grid uses worst_case_tiles; C never transposed
 
     disp_parity, expected_dispatch = symm.next_dispatch()
 
-    with _suppress_stdout_stderr():
-        _compiled_dispatch_grouped_gemm(
-            x_i32,
-            expert_send_dst_rank,
-            expert_send_dst_row,
-            expert_send_count,
-            expert_send_offset,
-            dispatched_token_idx,
-            sym_layout,
-            weight_arg,
-            output_arg,
-            tile_arg,
-            num_tile_arg,
-            group_offs_arg,
-            c_n,
-            out_m_rt,
-            out_n_rt,
-            disp_parity=disp_parity,
-            expected_dispatch=int(expected_dispatch),
-            out_features=int(out_features_ce),
-            hidden_size=int(hidden_size_ce),
-            num_max_pool_tokens=int(num_max_pool_tokens),
-            BLOCK_M=int(BM),
-            BLOCK_N=int(BN),
-            num_comm=int(num_comm),
-            GROUP_M=int(GROUP_M),
-            layout_code=int(layout_code),
-            trans_c=bool(trans_c),
-            G=int(G),
-            out_fp16=bool(out_fp16),
-            num_ranks=int(num_ranks),
-            stream=torch.cuda.current_stream(),
-        )
+    _compiled_dispatch_grouped_gemm(
+        x_i32,
+        expert_send_dst_rank,
+        expert_send_dst_row,
+        expert_send_count,
+        expert_send_offset,
+        dispatched_token_idx,
+        sym_layout,
+        weight_arg,
+        output_arg,
+        tile_arg,
+        num_tile_arg,
+        group_offs_arg,
+        c_n,
+        out_m_rt,
+        out_n_rt,
+        disp_parity=disp_parity,
+        expected_dispatch=int(expected_dispatch),
+        out_features=int(out_features_ce),
+        hidden_size=int(hidden_size_ce),
+        num_max_pool_tokens=int(num_max_pool_tokens),
+        BLOCK_M=int(BM),
+        BLOCK_N=int(BN),
+        num_comm=int(num_comm),
+        GROUP_M=int(GROUP_M),
+        layout_code=int(layout_code),
+        trans_c=bool(trans_c),
+        G=int(G),
+        out_fp16=bool(out_fp16),
+        num_ranks=int(num_ranks),
+        stream=torch.cuda.current_stream(),
+    )
     return output, symm.dispatch_token_pool, symm.weight_recv_buf, handle

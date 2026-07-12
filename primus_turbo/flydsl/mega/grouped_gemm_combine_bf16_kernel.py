@@ -35,7 +35,6 @@ from primus_turbo.flydsl.mega.prims import (
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
-    _suppress_stdout_stderr,
     autotune,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (
@@ -91,6 +90,10 @@ def _make_grouped_gemm_combine(
         WEIGHTS: fx.Tensor,
         TILE_TO_GROUP: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
+        RECV_DST_RANK: fx.Tensor,
+        RECV_START_ROW: fx.Tensor,
+        RECV_COUNT: fx.Tensor,
+        POOL_SRC_SLOT: fx.Tensor,
         OUTPUT: fx.Tensor,
         TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor,
@@ -116,20 +119,11 @@ def _make_grouped_gemm_combine(
         comb_base = sym_layout.combine_token_buffer
         reduce_flag_base = sym_layout.reduce_flag
         comb_local_res = create_buffer_resource_from_addr(comb_base, num_records_bytes=comb_records)
-        # recv-segment table for task-based (sustained-peer) combine push
-        seg_bytes = num_experts * 4
-        recv_dst_rank_res = create_buffer_resource_from_addr(
-            sym_layout.combine_recv_dst_rank, num_records_bytes=seg_bytes
-        )
-        recv_start_row_res = create_buffer_resource_from_addr(
-            sym_layout.combine_recv_start_row, num_records_bytes=seg_bytes
-        )
-        recv_count_res = create_buffer_resource_from_addr(
-            sym_layout.combine_recv_count, num_records_bytes=seg_bytes
-        )
-        origin_slot_res = create_buffer_resource_from_addr(
-            sym_layout.pool_src_slot, num_records_bytes=num_max_pool_tokens * 4
-        )
+        # recv-segment table + origin slots ride the handle (per-forward), NOT shared symm -> else bwd reads stale.
+        recv_dst_rank_res = create_buffer_resource(RECV_DST_RANK, max_size=True)
+        recv_start_row_res = create_buffer_resource(RECV_START_ROW, max_size=True)
+        recv_count_res = create_buffer_resource(RECV_COUNT, max_size=True)
+        origin_slot_res = create_buffer_resource(POOL_SRC_SLOT, max_size=True)
 
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         num_tile_blocks_res = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
@@ -208,9 +202,7 @@ def _make_grouped_gemm_combine(
                 act_base = fx.arith.ArithValue(
                     fx.arith.index_cast(fx.T.i64(), extract_base_index(ACT)), signed=True
                 )
-                # Fold each per-tile base in int64 (worst-case pool >4GB) so voffset stays
-                # int32, then address tile-local (block_m=0). A: precise bound;
-                # C: HW num_records bounds via 0x40000000 flat layout.
+                # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
                 a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
                 c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
                 A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
@@ -230,7 +222,7 @@ def _make_grouped_gemm_combine(
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
                     b_group_base=group_base,
-                    c_cache_modifier=16,
+                    c_cache_modifier=19,
                 )
                 fx.rocdl.s_waitcnt(0)
                 fx.gpu.barrier()
@@ -285,10 +277,7 @@ def _make_grouped_gemm_combine(
 
 
 def _rewind_combine_flags(kwargs):
-    # tuning-only: rewind the two never-reset flags so each rerun matches the
-    # baked expected. combine_flag is local (GEMM writes, combine reads); reduce_flag
-    # is cross-rank (combine pushes to peers). fill -> sync -> barrier so no next-rep
-    # write lands before every rank has rewound (else counts get zeroed).
+    # tuning-only: rewind the two never-reset flags (combine_flag local, reduce_flag cross-rank); fill -> sync -> barrier before rerun.
     symm = get_symm_buffer_for_mega_moe()
     p = int(kwargs["combine_parity"])
     n_blocks = int(kwargs["out_features"]) // int(kwargs["BLOCK_N"])
@@ -330,6 +319,10 @@ def _compiled_grouped_gemm_combine(
     WEIGHTS,
     TILE_TO_GROUP,
     NUM_TILE_BLOCKS,
+    RECV_DST_RANK,
+    RECV_START_ROW,
+    RECV_COUNT,
+    POOL_SRC_SLOT,
     OUTPUT,
     TOPK_INDICES,
     NUM_TOKENS_PER_RANK,
@@ -387,6 +380,10 @@ def _compiled_grouped_gemm_combine(
         WEIGHTS,
         TILE_TO_GROUP,
         NUM_TILE_BLOCKS,
+        RECV_DST_RANK,
+        RECV_START_ROW,
+        RECV_COUNT,
+        POOL_SRC_SLOT,
         OUTPUT,
         TOPK_INDICES,
         NUM_TOKENS_PER_RANK,
@@ -418,6 +415,11 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     assert x.dtype == torch.bfloat16 and l2_weights.dtype == torch.bfloat16
     assert topk_indices is not None, "topk reduce needs topk_indices"
     tile_to_expert = handle[5]
+    num_tile_blocks = handle[8]
+    recv_dst_rank = handle[9]
+    recv_start_row = handle[10]
+    recv_count = handle[11]
+    pool_src_slot = handle[12]
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.get_sym_layout()
     if layout == "tn":
@@ -444,7 +446,7 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     topk = int(sym_layout.num_topk)
     num_experts = int(sym_layout.num_experts)
     assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"
-    num_tile_blocks = symm.meta_scalars[1:2]
+
     dummy = num_tile_blocks
 
     apply_weights = topk_weights is not None
@@ -470,36 +472,39 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     combine_parity, expected_combine, expected_reduce = symm.next_combine(n_blocks)
 
     # num_combine_cu / num_reduce_cu are tunable per shape+layout (nt/nn optima differ).
-    with _suppress_stdout_stderr():
-        _compiled_grouped_gemm_combine(
-            act_2d,
-            weight_flat,
-            tile_to_expert,
-            num_tile_blocks,
-            output_d,
-            topk_indices_d,
-            num_tokens_d,
-            topk_weights_d,
-            grad_gate_d,
-            d_topk_w_d,
-            sym_layout,
-            c_n,
-            combine_parity=combine_parity,
-            expected_combine=expected_combine,
-            expected_reduce=expected_reduce,
-            out_features=out_features,
-            hidden_size=hidden_size,
-            num_max_pool_tokens=num_max_pool_tokens,
-            BLOCK_M=BM,
-            BLOCK_N=BN,
-            num_combine_slots=int(num_combine_slots),
-            topk=int(topk),
-            num_experts=int(num_experts),
-            rank=int(rank),
-            layout_code=_LAYOUT_CODES[layout],
-            apply_weights=bool(apply_weights),
-            with_gate=bool(with_gate),
-            out_fp16=False,
-            stream=torch.cuda.current_stream(),
-        )
+    _compiled_grouped_gemm_combine(
+        act_2d,
+        weight_flat,
+        tile_to_expert,
+        num_tile_blocks,
+        recv_dst_rank,
+        recv_start_row,
+        recv_count,
+        pool_src_slot,
+        output_d,
+        topk_indices_d,
+        num_tokens_d,
+        topk_weights_d,
+        grad_gate_d,
+        d_topk_w_d,
+        sym_layout,
+        c_n,
+        combine_parity=combine_parity,
+        expected_combine=expected_combine,
+        expected_reduce=expected_reduce,
+        out_features=out_features,
+        hidden_size=hidden_size,
+        num_max_pool_tokens=num_max_pool_tokens,
+        BLOCK_M=BM,
+        BLOCK_N=BN,
+        num_combine_slots=int(num_combine_slots),
+        topk=int(topk),
+        num_experts=int(num_experts),
+        rank=int(rank),
+        layout_code=_LAYOUT_CODES[layout],
+        apply_weights=bool(apply_weights),
+        with_gate=bool(with_gate),
+        out_fp16=False,
+        stream=torch.cuda.current_stream(),
+    )
     return output, d_topk_w

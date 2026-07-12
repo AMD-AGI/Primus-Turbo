@@ -16,8 +16,7 @@ from primus_turbo.flydsl.mega.prims import (
 )
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, sym_map
 
-# grid_sync counter layout: the low bits accumulate per-block arrivals and
-# bit 25 is the phase flag the last block flips. Requires num_blocks < 2^25.
+# grid_sync counter: low bits count per-block arrivals, bit 25 is the phase flag. Requires num_blocks < 2^25.
 _PHASE_BIT = 25
 _PHASE_MASK = fx.Int32(1 << _PHASE_BIT)
 
@@ -41,11 +40,9 @@ def grid_sync(
             fx.Int32((1 << _PHASE_BIT) - (num_blocks - 1)),
             fx.Int32(1),
         )
-        old_value = atomic_add(
-            sym_layout.grid_sync_count, fx.Int32(0), add_value, scope="agent", order="release"
-        )
+        old_value = atomic_add(sym_layout.grid_sync_count, fx.Int32(0), add_value, scope="agent")
         spin_start = read_clock()
-        new_value = ld(sym_layout.grid_sync_count, fx.Int32(0), scope="agent", order="acquire")
+        new_value = ld(sym_layout.grid_sync_count, fx.Int32(0), scope="agent")
         # spin until the phase bit toggles relative to our arrival snapshot
         while ((new_value ^ old_value) & _PHASE_MASK) == fx.Int32(0):
             if spin_timed_out(spin_start):
@@ -58,7 +55,7 @@ def grid_sync(
                     fx.Int32(num_blocks),
                 )
                 spin_start = read_clock()
-            new_value = ld(sym_layout.grid_sync_count, fx.Int32(0), scope="agent", order="acquire")
+            new_value = ld(sym_layout.grid_sync_count, fx.Int32(0), scope="agent")
     fx.gpu.barrier()
     memory_fence(order="acquire", scope="agent")
 

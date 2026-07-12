@@ -25,11 +25,6 @@ from tabulate import tabulate
 _HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..")))
 
-# Megatron-LM lives under the sibling Primus repo, not on the default path
-_MEGATRON_LM = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "Primus", "third_party", "Megatron-LM"))
-if _MEGATRON_LM not in sys.path:
-    sys.path.insert(0, _MEGATRON_LM)
-
 from mega_utils import (  # noqa: E402
     BF16_BYTES,
     aggregate_stage_metrics,
@@ -48,39 +43,11 @@ from mega_utils import (  # noqa: E402
     topk_reduce_only,
     turbo_csv_row,
 )
-from megatron.core.fusions.fused_bias_swiglu import (  # noqa: E402
-    weighted_bias_swiglu_impl,
-)
 
 import primus_turbo.pytorch  # noqa: E402,F401  # load full pkg first to break the circular import
-import primus_turbo.pytorch as turbo  # noqa: E402
 from primus_turbo.flydsl.mega import (  # noqa: E402
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
-from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
-
-
-def make_turbo_reference(group, *, num_experts, num_topk, hidden, inter):
-    """Turbo (DeepEP) EP-MoE full forward = ground-truth y; dispatcher built once, W1/W2 passed per call."""
-    dispatcher = turbo.modules.DeepEPTokenDispatcher(
-        num_experts=num_experts,
-        router_topk=num_topk,
-        ep_group=group,
-        permute_fusion=True,
-        deepep_num_use_cu=80,
-    )
-
-    def turbo_reference(x, topk_idx, gate_logits, W1, W2):
-        permuted_hidden, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
-            x, gate_logits, indices=topk_idx
-        )
-        group_lens = tokens_per_expert.to(device=x.device, dtype=torch.int64)
-        fc1_out = _turbo_gg(permuted_hidden, W1, group_lens, trans_b=True)
-        act = weighted_bias_swiglu_impl(fc1_out, None, permuted_probs.unsqueeze(-1)).to(x.dtype)
-        fc2_out = _turbo_gg(act, W2, group_lens, trans_b=True)
-        return dispatcher.token_combine(fc2_out)
-
-    return turbo_reference
 
 
 @dataclass
@@ -97,7 +64,7 @@ class StageMetrics:
 
 @dataclass
 class StageSpec:
-    """Declarative spec for one benchmarked stage; fused_fn is reused for timing + accuracy probe."""
+    """Declarative spec for one benchmarked stage; fused_fn is reused for timing + accuracy check."""
 
     name: str
     flops: float
@@ -126,8 +93,6 @@ class RunContext:
     topk_idx_flat: Any  # int32 [T*K], drives the per-token reduce
     topk_w_flat: Any  # f32 [T*K], forward routing weights
     reduce_ready: Any  # standalone reduce ready flags (0 == ready)
-    gate_logits: Any  # [T, E] probs for the turbo reference
-    turbo_reference: Any
 
 
 class StageRunner:
@@ -156,14 +121,16 @@ class StageRunner:
             fused_ms=t_fused,
             flops=spec.flops,
         )
-        # accuracy: fused vs ref over a clean synced bracket
+        # accuracy: fused vs ref over the SAME symm state (both under a synced bracket).
+        # ref_fn is the decoupled combine path (same handle/buffers), so any never-reset
+        # scoreboard drift cancels -> the isolated fused_fn output is directly comparable.
         ref_out = self.synced_fn(spec.ref_fn)
         out = self.synced_fn(spec.fused_fn)[0]
         check = check_accuracy(self.group, spec.name, out, ref_out)
         return metrics, check
 
 
-def _make_context(group, args, turbo_reference):
+def _make_context(group, args):
     """Build input + symm buffers and precompute shared geometry + topk tables (weights built in generate_input)."""
     inp = generate_input(
         group,
@@ -178,7 +145,7 @@ def _make_context(group, args, turbo_reference):
     )
     symm = inp.symm
     rank = group.rank()
-    real_tiles = int(symm.meta_scalars[1].item())
+    real_tiles = int(inp.num_tile_blocks.item())
     M_eff = real_tiles * args.bm
     # combine push bytes per rank = remote rows (origin_rank != rank, valid) x H x bf16
     origin = symm.pool_src_rank
@@ -187,8 +154,6 @@ def _make_context(group, args, turbo_reference):
     topk_idx_flat = inp.topk_idx.to(torch.int32).contiguous().view(-1)
     topk_w_flat = inp.topk_weight.to(torch.float32).contiguous().view(-1)
     reduce_ready = torch.zeros(int(symm.num_combine_slots), dtype=torch.int32, device="cuda")
-    gate_logits = torch.zeros(args.num_tokens, args.num_experts, dtype=torch.float32, device="cuda")
-    gate_logits.scatter_(1, inp.topk_idx, inp.topk_weight)
     return RunContext(
         group=group,
         args=args,
@@ -201,8 +166,6 @@ def _make_context(group, args, turbo_reference):
         topk_idx_flat=topk_idx_flat,
         topk_w_flat=topk_w_flat,
         reduce_ready=reduce_ready,
-        gate_logits=gate_logits,
-        turbo_reference=turbo_reference,
     )
 
 
@@ -221,9 +184,9 @@ def _make_fused_call(ctx, lhs, rhs, *, layout="nt", topk_weights):
     )
 
 
-def _make_combine_call(group, bm, cu):
+def _make_combine_call(ctx, bm, cu):
     """Build the combine-only call (the comm baseline) at a given CU count."""
-    return lambda: combine_only(group, BLOCK_M=bm, num_combine_cu=cu)
+    return lambda: combine_only(ctx.group, handle=ctx.inp.handle, BLOCK_M=bm, num_combine_cu=cu)
 
 
 def _stage_fwd(runner, ctx):
@@ -231,6 +194,39 @@ def _stage_fwd(runner, ctx):
     inp, args, symm = ctx.inp, ctx.args, ctx.symm
     N, K = args.hidden, args.inter
     flops = 2.0 * ctx.M_eff * N * K
+    ref_y = torch.empty(ctx.num_tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
+
+    # reference: decoupled gemm_only(nt) + combine_only + weighted topk_reduce, over the
+    # SAME handle/buffers as fused_fn -> never-reset scoreboard drift cancels between them.
+    def _ref_fwd():
+        grouped_gemm_bf16_only(
+            inp.act,
+            inp.W2,
+            symm.l2_token_buffer,
+            inp.tile_to_expert,
+            inp.num_tile_blocks,
+            BLOCK_M=args.bm,
+            BLOCK_N=args.bn,
+            GROUP_M=8,
+        )
+        sync_ranks(ctx.group)
+        combine_only(ctx.group, handle=ctx.inp.handle, BLOCK_M=args.bm, num_combine_cu=args.num_combine_cu)
+        sync_ranks(ctx.group)
+        ctx.reduce_ready.zero_()  # 0 == ready (reduce_only does not spin)
+        topk_reduce_only(
+            ref_y,
+            symm.combine_token_buffer,
+            ctx.reduce_ready,
+            ctx.topk_idx_flat,
+            symm.num_tokens_per_rank,
+            int(symm.num_combine_slots),
+            topk=int(symm.num_topk),
+            num_experts=int(symm.num_experts),
+            rank=ctx.rank,
+            topk_weights=ctx.topk_w_flat,  # weighted (forward routing weights)
+        )
+        return ref_y
+
     # L2 has small K=I -> GROUP_M=8 reuses the per-expert weight across more M-tiles (best here)
     spec = StageSpec(
         name="fwd fused (nt)",
@@ -246,9 +242,9 @@ def _stage_fwd(runner, ctx):
             BLOCK_N=args.bn,
             GROUP_M=8,
         ),
-        comm_fn=_make_combine_call(ctx.group, args.bm, args.num_combine_cu),
+        comm_fn=_make_combine_call(ctx, args.bm, args.num_combine_cu),
         fused_fn=_make_fused_call(ctx, inp.act, inp.W2, topk_weights=ctx.topk_w_flat),
-        ref_fn=lambda: ctx.turbo_reference(inp.x, inp.topk_idx, ctx.gate_logits, inp.W1, inp.W2),
+        ref_fn=_ref_fwd,
     )
     return runner.run(spec)
 
@@ -275,7 +271,7 @@ def _stage_bwd(runner, ctx):
             GROUP_M=8,
         )
         sync_ranks(ctx.group)
-        combine_only(ctx.group, BLOCK_M=args.bm, num_combine_cu=args.bwd_combine_cu)
+        combine_only(ctx.group, handle=ctx.inp.handle, BLOCK_M=args.bm, num_combine_cu=args.bwd_combine_cu)
         sync_ranks(ctx.group)
         ctx.reduce_ready.zero_()  # 0 == ready (reduce_only does not spin)
         topk_reduce_only(
@@ -308,16 +304,16 @@ def _stage_bwd(runner, ctx):
             BLOCK_N=args.bn,
             GROUP_M=8,
         ),
-        comm_fn=_make_combine_call(ctx.group, args.bm, args.bwd_combine_cu),
+        comm_fn=_make_combine_call(ctx, args.bm, args.bwd_combine_cu),
         fused_fn=_make_fused_call(ctx, grad_l1, inp.W1, layout="nn", topk_weights=None),
         ref_fn=_ref_bwd,
     )
     return runner.run(spec)
 
 
-def profile_combine(group, args, turbo_reference):
+def profile_grouped_gemm_combine(group, args):
     """Forward = e2e step 4 (NT weighted); backward = e2e step 3 (NN unweighted). Both report the 3-role fused kernel."""
-    ctx = _make_context(group, args, turbo_reference)
+    ctx = _make_context(group, args)
 
     # synced bracket isolates accuracy probes from timing; scoreboard is never-reset parity
     def _synced(run_fn):
@@ -343,12 +339,7 @@ def profile_combine(group, args, turbo_reference):
     }
 
 
-# Models the fused grouped-GEMM + combine path cannot run yet (skipped in the sweep).
-# Per-model isolation (run_sweep) already contains any crash/deadlock; this list just
-# fast-skips known flydsl tiling gaps: moe_intermediate_size not a multiple of the GEMM
-# tile (BN=256) -> "All autotune configs failed" (DeepSeek-V2-Lite I=1408, MoE-1T
-# I=1920). DeepSeek-V2 also fails autotune here (caught at run time as [skip]).
-# TODO(mega): support a tail/remainder N tile so these odd intermediate sizes run.
+# Fast-skip flydsl tiling gaps: moe_intermediate_size not a multiple of GEMM tile (BN=256) -> autotune fails. TODO(mega): add tail N tile.
 UNSUPPORTED = {"DeepSeek-V2-Lite", "MoE-1T"}
 
 
@@ -431,15 +422,7 @@ def benchmark_combine(local_rank, world, args):
     name = args.case_name
 
     try:
-        # turbo (DeepEP) full-forward baseline = the accuracy ground truth (per-model geometry)
-        turbo_reference = make_turbo_reference(
-            group,
-            num_experts=args.num_experts,
-            num_topk=args.num_topk,
-            hidden=args.hidden,
-            inter=args.inter,
-        )
-        result = profile_combine(group, args, turbo_reference)
+        result = profile_grouped_gemm_combine(group, args)
         per_rank = [None] * world  # all_gather_object fills per_rank[i] from rank i
         dist.all_gather_object(per_rank, result, group=group)
         if rank == 0:
@@ -474,7 +457,7 @@ def _join_with_timeout(ctx, timeout_s):
 def run_sweep(args):
     """Drive the per-model sweep: one fresh 8-proc spawn per MoE model so a crash or
     deadlock is isolated. Each model appends its row to a single shared CSV."""
-    cases = gen_moe_test_cases()
+    cases = gen_moe_test_cases(args.models)
     # resolve the output path once so per-model appends land in the same file
     out_file = args.output or f"grouped_gemm_combine_{datetime.now():%Y%m%d}_{get_platform_info()[1]}.csv"
     args.output = out_file
@@ -531,5 +514,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", type=str, default=None)
     # per-model wall-clock guard; a model exceeding it is terminated and skipped (deadlock safety)
     parser.add_argument("--case-timeout", type=int, default=900)
+    # restrict the sweep to these MoE model names (default = all)
+    parser.add_argument("--models", nargs="+", default=None)
     args = parser.parse_args()
     run_sweep(args)

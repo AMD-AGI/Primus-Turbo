@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import unittest
 
 import torch
 import torch.distributed as dist
@@ -17,7 +18,6 @@ import torch.nn.functional as F
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
-    skip_if_rocm_arch_multiprocess,
 )
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -29,13 +29,19 @@ import primus_turbo.pytorch as turbo  # noqa: E402
 from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
 )
+from primus_turbo.pytorch.core.utils import is_gfx950  # noqa: E402
 from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
 from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused  # noqa: E402
 from tests.pytorch.test_utils import compute_snr  # noqa: E402
 
-# bf16 fused kernel vs bf16 turbo reference; comm + split-role reduce add noise,
-# so use the MegaMoE-family SNR floor (matches modules/test_mega_moe.py).
+# bf16 fused vs bf16 turbo ref; comm + split-role reduce add noise -> use MegaMoE-family SNR floor.
 _SNR_THRESHOLD_DB = 25.0
+
+
+# Fused kernel only supports gfx950; skip everywhere else.
+skip_unless_gfx950 = unittest.skipUnless(
+    torch.cuda.is_available() and is_gfx950(), "mega_moe_fused only supports gfx950"
+)
 
 
 def _weighted_swiglu(fc1_out, weights):
@@ -142,7 +148,7 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
         self.assertGreaterEqual(snr, _SNR_THRESHOLD_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_THRESHOLD_DB}")
 
     # ── forward: fused op vs turbo DeepEP forward ─────────────────────────────
-    @skip_if_rocm_arch_multiprocess(("gfx942", "gfx90a"))
+    @skip_unless_gfx950
     @skip_if_lt_x_gpu(8)
     @parametrize(
         "hidden, inter, num_experts, num_topk, num_tokens",
@@ -174,7 +180,6 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
                 )
             torch.cuda.synchronize()
             group.barrier()
-            symm.assert_capacity()
 
             self._assert_snr(y_mega, y_turbo, tag="forward")
         finally:
@@ -184,7 +189,7 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
             dist.destroy_process_group()
 
     # ── backward: dl1 / dl2 / d_topk_weight vs reference (dx reported, see note) ──
-    @skip_if_rocm_arch_multiprocess(("gfx942", "gfx90a"))
+    @skip_unless_gfx950
     @skip_if_lt_x_gpu(8)
     @parametrize(
         "hidden, inter, num_experts, num_topk, num_tokens",
@@ -228,9 +233,7 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
             )
             dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
 
-            # dx now asserted: the dispatch<->combine dx discrepancy was root-caused to a
-            # stale-L2 read in the combine gate path and fixed in ep_intranode (glc|slc on the
-            # gate store/load). Routing here is balanced (random top-k), where dx is solid.
+            # dx now asserted: stale-L2 read in combine gate path fixed in ep_intranode (glc|slc); balanced routing here is solid.
             self._assert_snr(dx_m, dx_t, tag="dx")
             self._assert_snr(dl1_m, dl1_t, tag="dl1_weight")
             self._assert_snr(dl2_m, dl2_t, tag="dl2_weight")

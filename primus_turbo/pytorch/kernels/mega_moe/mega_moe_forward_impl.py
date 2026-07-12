@@ -26,8 +26,11 @@ from primus_turbo.pytorch.core.backend import (
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
-# dispatch handle layout (see dispatch_prologue_flydsl_kernel.py return order).
-_HANDLE_LEN = 9
+# dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
+# 0-5 send/dispatch tables + tile_to_expert, 6 num_tokens_per_expert,
+# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
+_HANDLE_LEN = 13
+_H_NUM_TILE_BLOCKS = 8
 
 
 class MegaMoEForwardFlyDSLBackend(KernelBackend):
@@ -72,7 +75,8 @@ class MegaMoEForwardFlyDSLBackend(KernelBackend):
             layout=layout,
         )
 
-        act = swiglu_flydsl_kernel(l1_out)
+        # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
+        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
 
         # fused grouped L2 GEMM + combine PUSH + topk reduce
         y, _ = grouped_gemm_combine_bf16_flydsl_kernel(

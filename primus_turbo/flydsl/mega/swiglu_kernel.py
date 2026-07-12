@@ -26,7 +26,6 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 from primus_turbo.flydsl.mega.prims import ld, st
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
-    _suppress_stdout_stderr,
     autotune,
 )
 
@@ -34,18 +33,14 @@ ACTIVATION_CLAMP = 10.0
 
 _VEC = 8
 _WARP = 64
-
-
-def _prune_swiglu_configs(configs, sig_args):
-    # All column tilings are valid now (partial last tile is guarded); keep every config.
-    return configs
+_POOL_BLOCK_M = 256  # pool-block granularity (fixed policy; matches symm_buffer.BLOCK_M)
 
 
 def _clampv(x, lo, hi):
     return fx.arith.minimumf(fx.arith.maximumf(x, lo), hi)
 
 
-def _make_swiglu(I: int, with_scale: bool, with_bound: bool, BM: int, grid_x: int, block_threads: int):
+def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: int):
     two_I = 2 * I
     cols_per_block = _VEC * block_threads
     assert I % _VEC == 0, f"I={I} not divisible by vec width {_VEC}"
@@ -83,16 +78,14 @@ def _make_swiglu(I: int, with_scale: bool, with_bound: bool, BM: int, grid_x: in
                     act = fx.arith.mulf(act, _vector.broadcast(f32v, sc))
                 buffer_store(fx.arith.trunc_f(bf16v, act), act_rsrc, m * fx.Int32(I) + col)
 
-        if with_bound:
-            m_real = buffer_load(
-                create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32()
-            ) * fx.Int32(BM)
-            m = block_index_x
-            while m < m_real:
-                compute_row(m)
-                m = m + fx.Int32(grid_x)
-        else:
-            compute_row(block_index_x)
+        # grid-stride over real pool rows only (NUM_TILE_BLOCKS * BM); unused tail skipped.
+        m_real = buffer_load(
+            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32()
+        ) * fx.Int32(BM)
+        m = block_index_x
+        while m < m_real:
+            compute_row(m)
+            m = m + fx.Int32(grid_x)
 
     return swiglu_kernel
 
@@ -100,7 +93,6 @@ def _make_swiglu(I: int, with_scale: bool, with_bound: bool, BM: int, grid_x: in
 def _make_swiglu_bwd(
     I: int,
     with_scale: bool,
-    with_bound: bool,
     BM: int,
     grid_x: int,
     block_threads: int,
@@ -234,28 +226,16 @@ def _make_swiglu_bwd(
                     guard=partial_tail,
                 )
 
-        if with_bound:
-            m_real = buffer_load(
-                create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32()
-            ) * fx.Int32(BM)
-            m = block_index_x
-            while m < m_real:
-                compute_row(m)
-                m = m + fx.Int32(grid_x)
-        else:
-            compute_row(block_index_x)
+        # grid-stride over real pool rows only (NUM_TILE_BLOCKS * BM); skip the unused tail.
+        m_real = buffer_load(
+            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32()
+        ) * fx.Int32(BM)
+        m = block_index_x
+        while m < m_real:
+            compute_row(m)
+            m = m + fx.Int32(grid_x)
 
     return swiglu_bwd_kernel
-
-
-def _active_symm_bounds():
-    from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
-
-    try:
-        symm = get_symm_buffer_for_mega_moe()
-    except RuntimeError:
-        return 0, None
-    return symm.block_m, symm.meta_scalars[1:2]
 
 
 @autotune(
@@ -263,8 +243,7 @@ def _active_symm_bounds():
         Config(grid_x=grid_x, block_threads=block_threads)
         for grid_x, block_threads in itertools.product((1024, 2048, 4096), (256, 512))
     ],
-    key=["I", "with_scale", "with_bound", "BM"],
-    prune_configs_by=_prune_swiglu_configs,
+    key=["I", "with_scale", "BM"],
 )
 @flyc.jit
 def _compiled_swiglu(
@@ -274,18 +253,16 @@ def _compiled_swiglu(
     NUM_TILE_BLOCKS,
     I: fx.Constexpr[int],
     with_scale: fx.Constexpr[int],
-    with_bound: fx.Constexpr[int],
     BM: fx.Constexpr[int],
-    M: int,
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     cols_per_block = _VEC * block_threads
     n_col_tiles = (I + cols_per_block - 1) // cols_per_block
-    kernel = _make_swiglu(I, bool(with_scale), bool(with_bound), BM, grid_x, block_threads)
+    kernel = _make_swiglu(I, bool(with_scale), BM, grid_x, block_threads)
     kernel(ACC1, ACT, SCALE, NUM_TILE_BLOCKS).launch(
-        grid=(grid_x if with_bound else M, n_col_tiles, 1),
+        grid=(grid_x, n_col_tiles, 1),
         block=(block_threads, 1, 1),
         stream=stream,
     )
@@ -297,8 +274,7 @@ def _compiled_swiglu(
         for grid_x, block_threads in itertools.product((2048, 4096), (256, 512))
     ],
     rep=5,
-    key=["I", "with_scale", "with_bound", "BM", "with_gate", "with_act_w"],
-    prune_configs_by=_prune_swiglu_configs,
+    key=["I", "with_scale", "BM", "with_gate", "with_act_w"],
 )
 @flyc.jit
 def _compiled_swiglu_bwd(
@@ -311,11 +287,9 @@ def _compiled_swiglu_bwd(
     ACT_W,
     I: fx.Constexpr[int],
     with_scale: fx.Constexpr[int],
-    with_bound: fx.Constexpr[int],
     BM: fx.Constexpr[int],
     with_gate: fx.Constexpr[int],
     with_act_w: fx.Constexpr[int],
-    M: int,
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
     stream: fx.Stream,
@@ -325,7 +299,6 @@ def _compiled_swiglu_bwd(
     kernel = _make_swiglu_bwd(
         I,
         bool(with_scale),
-        bool(with_bound),
         BM,
         grid_x,
         block_threads,
@@ -336,7 +309,7 @@ def _compiled_swiglu_bwd(
     # One f32 LDS slot per warp for cross-warp gate reduction.
     smem = (block_threads // _WARP) * 4 if with_gate else 0
     kernel(DACT, ACC1, DACC1, SCALE, NUM_TILE_BLOCKS, GRAD_GATE, ACT_W).launch(
-        grid=(grid_x if with_bound else M, grid_y, 1),
+        grid=(grid_x, grid_y, 1),
         block=(block_threads, 1, 1),
         stream=stream,
         smem=smem,
@@ -346,6 +319,7 @@ def _compiled_swiglu_bwd(
 def swiglu_backward_flydsl_kernel(
     dact: torch.Tensor,
     x: torch.Tensor,
+    num_tile_blocks: torch.Tensor,
     scale: torch.Tensor | None = None,
     return_gate: bool = False,
     return_act_w: bool = False,
@@ -359,31 +333,26 @@ def swiglu_backward_flydsl_kernel(
     x = x.contiguous()
     dact = dact.contiguous()
     dx = torch.empty((M, two_I), dtype=torch.bfloat16, device=x.device)
-    BM, num_tile_blocks = _active_symm_bounds()
     with_scale = scale is not None
-    with_bound = num_tile_blocks is not None
     scale_d = scale if with_scale else x
-    ntb_d = num_tile_blocks if with_bound else x
+    ntb_d = num_tile_blocks
     grad_gate = torch.empty((M,), dtype=torch.float32, device=x.device) if return_gate else x
     act_w = torch.empty((M, I), dtype=torch.bfloat16, device=x.device) if return_act_w else x
-    with _suppress_stdout_stderr():
-        _compiled_swiglu_bwd(
-            DACT=dact,
-            ACC1=x,
-            DACC1=dx,
-            SCALE=scale_d,
-            NUM_TILE_BLOCKS=ntb_d,
-            GRAD_GATE=grad_gate,
-            ACT_W=act_w,
-            I=I,
-            with_scale=int(with_scale),
-            with_bound=int(with_bound),
-            BM=BM,
-            with_gate=int(return_gate),
-            with_act_w=int(return_act_w),
-            M=M,
-            stream=torch.cuda.current_stream(),
-        )
+    _compiled_swiglu_bwd(
+        DACT=dact,
+        ACC1=x,
+        DACC1=dx,
+        SCALE=scale_d,
+        NUM_TILE_BLOCKS=ntb_d,
+        GRAD_GATE=grad_gate,
+        ACT_W=act_w,
+        I=I,
+        with_scale=int(with_scale),
+        BM=_POOL_BLOCK_M,
+        with_gate=int(return_gate),
+        with_act_w=int(return_act_w),
+        stream=torch.cuda.current_stream(),
+    )
     if return_gate and return_act_w:
         return dx, grad_gate, act_w
     if return_gate:
@@ -395,6 +364,7 @@ def swiglu_backward_flydsl_kernel(
 
 def swiglu_flydsl_kernel(
     x: torch.Tensor,
+    num_tile_blocks: torch.Tensor,
     scale: torch.Tensor | None = None,
     stream=None,
 ) -> torch.Tensor:
@@ -404,22 +374,17 @@ def swiglu_flydsl_kernel(
     assert two_I % 2 == 0, f"x last dim must be even (gate||up), got {two_I}"
     I = two_I // 2
     act = torch.empty((M, I), dtype=torch.bfloat16, device=x.device)
-    BM, num_tile_blocks = _active_symm_bounds()
     with_scale = scale is not None
-    with_bound = num_tile_blocks is not None
     scale_d = scale if with_scale else x
-    ntb_d = num_tile_blocks if with_bound else x
-    with _suppress_stdout_stderr():
-        _compiled_swiglu(
-            ACC1=x,
-            ACT=act,
-            SCALE=scale_d,
-            NUM_TILE_BLOCKS=ntb_d,
-            I=I,
-            with_scale=int(with_scale),
-            with_bound=int(with_bound),
-            BM=BM,
-            M=M,
-            stream=stream,
-        )
+    ntb_d = num_tile_blocks
+    _compiled_swiglu(
+        ACC1=x,
+        ACT=act,
+        SCALE=scale_d,
+        NUM_TILE_BLOCKS=ntb_d,
+        I=I,
+        with_scale=int(with_scale),
+        BM=_POOL_BLOCK_M,
+        stream=stream,
+    )
     return act

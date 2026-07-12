@@ -329,10 +329,7 @@ def profile_dispatch_grouped_gemm(group, args):
     }
 
 
-# Models the fused dispatch+grouped-GEMM path cannot run yet (skipped in the sweep).
-# TODO(mega): moe_intermediate_size not a multiple of the GEMM tile (BN=256) ->
-# "All autotune configs failed" (DeepSeek-V2-Lite I=1408, MoE-1T I=1920). Support
-# a tail/remainder N tile so these odd intermediate sizes can run.
+# Skip: moe_intermediate_size not a multiple of GEMM tile (BN=256) -> autotune fails. TODO(mega): add tail N tile.
 UNSUPPORTED = {"DeepSeek-V2-Lite", "MoE-1T"}
 
 
@@ -428,7 +425,7 @@ def benchmark_dispatch_grouped_gemm(local_rank, world, args):
     try:
         rich_rows, csv_rows = [], []
         # sweep every MoE model (gemm_turbo-style); unsupported cases are skipped
-        for case in gen_moe_test_cases():
+        for case in gen_moe_test_cases(args.models):
             name = case["Case"]
             if name in UNSUPPORTED:
                 if rank == 0:
@@ -484,6 +481,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--output", "-o", type=str, default=None)
+    # restrict the sweep to these MoE model names (default = all)
+    parser.add_argument("--models", nargs="+", default=None)
     args = parser.parse_args()
     torch.multiprocessing.spawn(
         benchmark_dispatch_grouped_gemm, args=(args.num_processes, args), nprocs=args.num_processes

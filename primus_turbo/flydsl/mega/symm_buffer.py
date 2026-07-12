@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 import warnings
 from collections import namedtuple
 from dataclasses import dataclass
@@ -185,7 +191,6 @@ def make_sym_layout_meta(token_dtype: torch.dtype, layout_config: LayoutConfig):
         pool_src_slot = RegionSpec(torch.int32, (cfg.num_max_pool_tokens,))
         weight_recv_buf = RegionSpec(torch.float32, (cfg.num_max_pool_tokens,))
         combine_gate = RegionSpec(torch.float32, (cfg.num_max_tokens_per_rank, cfg.num_topk))
-        meta_scalars = RegionSpec(torch.int32, (8,))
         grid_sync_count = RegionSpec(torch.int32, (2,))
         l2_token_buffer = RegionSpec(token_dtype, (cfg.num_max_pool_tokens, cfg.hidden))
         # flags: double-buffered, flat 1-D (host slices two banks of X out of 2*X)
@@ -193,10 +198,6 @@ def make_sym_layout_meta(token_dtype: torch.dtype, layout_config: LayoutConfig):
         combine_flag = RegionSpec(torch.int64, (2 * cfg.num_max_pool_blocks,))
         combine_token_buffer = RegionSpec(token_dtype, (cfg.num_combine_slots, cfg.hidden))
         reduce_flag = RegionSpec(torch.int64, (2 * cfg.num_combine_slots,))
-        # combine recv-segment table: one entry per (local_expert, source_rank)
-        combine_recv_dst_rank = RegionSpec(torch.int32, (cfg.num_experts,))
-        combine_recv_start_row = RegionSpec(torch.int32, (cfg.num_experts,))
-        combine_recv_count = RegionSpec(torch.int32, (cfg.num_experts,))
 
     SymLayoutMeta.token_dtype = token_dtype
     SymLayoutMeta.cfg = cfg
@@ -370,14 +371,6 @@ class SymmBuffer:
             **region_ptrs,
         )
         return self._sym_layout
-
-    def assert_capacity(self):
-
-        total_rows = int(self.meta_scalars[0].item())
-        assert total_rows <= self.num_max_pool_tokens, (
-            f"rank {self.rank}: dispatched rows {total_rows} exceed num_max_pool_tokens "
-            f"{self.num_max_pool_tokens}; raise pool policy"
-        )
 
     def describe(self) -> str:
         """Dump this heap's resolved region layout (offsets / bytes) -- for debugging IPC memory."""

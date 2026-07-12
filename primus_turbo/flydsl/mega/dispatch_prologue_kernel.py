@@ -28,7 +28,6 @@ from primus_turbo.flydsl.mega.prims import atomic_add, ld, st
 from primus_turbo.flydsl.mega.symm_buffer import SymLayout, sym_map
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
-    _suppress_stdout_stderr,
     autotune,
 )
 
@@ -67,11 +66,14 @@ def _make_dispatch_prologue(
         EXPERT_SEND_COUNT: fx.Tensor,
         EXPERT_SEND_OFFSET: fx.Tensor,
         TILE_TO_EXPERT: fx.Tensor,
-        TILE_EXPECTED: fx.Tensor,
         DISPATCHED_TOKEN_IDX: fx.Tensor,
         TOPK_WEIGHT: fx.Tensor,
         NUM_TOKENS_PER_EXPERT: fx.Tensor,
         NUM_TOKENS_PER_EXPERT_PREFIX: fx.Tensor,
+        NUM_TILE_BLOCKS: fx.Tensor,
+        COMBINE_RECV_DST_RANK: fx.Tensor,
+        COMBINE_RECV_START_ROW: fx.Tensor,
+        COMBINE_RECV_COUNT: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _, _ = fx.block_idx
@@ -95,37 +97,29 @@ def _make_dispatch_prologue(
         expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
         expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
         tile_to_expert_resource = create_buffer_resource(TILE_TO_EXPERT, max_size=True)
-        tile_expected_resource = create_buffer_resource(TILE_EXPECTED, max_size=True)
         dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
         topk_weight_resource = create_buffer_resource(TOPK_WEIGHT, max_size=True)
         num_tokens_per_expert_resource = create_buffer_resource(NUM_TOKENS_PER_EXPERT, max_size=True)
         num_tokens_per_expert_prefix_resource = create_buffer_resource(
             NUM_TOKENS_PER_EXPERT_PREFIX, max_size=True
         )
-        meta_scalars_resource = create_buffer_resource_from_addr(sl.meta_scalars, num_records_bytes=8 * 4)
+
+        num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
 
         my_origin_rank_resource = create_buffer_resource_from_addr(
             sl.pool_src_rank, num_records_bytes=origin_buffer_bytes
         )
         # combine recv-segment table: one (local_expert, source_rank) entry each
-        seg_table_bytes = num_experts * 4
-        combine_recv_dst_rank_resource = create_buffer_resource_from_addr(
-            sl.combine_recv_dst_rank, num_records_bytes=seg_table_bytes
-        )
-        combine_recv_start_row_resource = create_buffer_resource_from_addr(
-            sl.combine_recv_start_row, num_records_bytes=seg_table_bytes
-        )
-        combine_recv_count_resource = create_buffer_resource_from_addr(
-            sl.combine_recv_count, num_records_bytes=seg_table_bytes
-        )
+        combine_recv_dst_rank_resource = create_buffer_resource(COMBINE_RECV_DST_RANK, max_size=True)
+        combine_recv_start_row_resource = create_buffer_resource(COMBINE_RECV_START_ROW, max_size=True)
+        combine_recv_count_resource = create_buffer_resource(COMBINE_RECV_COUNT, max_size=True)
         origin_init_index = block_index * fx.Int32(block_threads) + thread_index
         while origin_init_index < fx.Int32(num_max_pool_tokens):
             buffer_store(fx.Int32(-1), my_origin_rank_resource, origin_init_index)
             origin_init_index = origin_init_index + fx.Int32(grid_stride)
-        # Fused init of the two per-pool-block tables (same range).
+        # Init the per-pool-block expert table (sentinel = experts_per_rank for unused blocks).
         pool_block_init_index = block_index * fx.Int32(block_threads) + thread_index
         while pool_block_init_index < fx.Int32(num_pool_blocks):
-            buffer_store(fx.Int32(0), tile_expected_resource, pool_block_init_index)
             buffer_store(fx.Int32(experts_per_rank), tile_to_expert_resource, pool_block_init_index)
             pool_block_init_index = pool_block_init_index + fx.Int32(grid_stride)
 
@@ -242,7 +236,6 @@ def _make_dispatch_prologue(
                         buffer_store(source_offset, workspace_resource, fx.Int32(WS_SROFF + expert_id))
                         source_offset = source_offset + count_value
                         comm_task_counter = comm_task_counter + 1
-                buffer_store(fx.Int32(num_experts), meta_scalars_resource, fx.Int32(2))
             if thread_index < fx.Int32(experts_per_rank):
                 local_expert_index = thread_index
                 expert_pool_base = buffer_load(
@@ -289,23 +282,10 @@ def _make_dispatch_prologue(
                         expert_pool_base + within_expert_offset, combine_recv_start_row_resource, seg_index
                     )
                     buffer_store(count_value, combine_recv_count_resource, seg_index)
-                    if count_value > fx.Int32(0):
-                        first_block = (expert_pool_base + within_expert_offset) // fx.Int32(block_m)
-                        last_block = (
-                            expert_pool_base + within_expert_offset + count_value - fx.Int32(1)
-                        ) // fx.Int32(block_m)
-                        block_cursor = first_block
-                        while block_cursor <= last_block:
-                            expected_value = buffer_load(
-                                tile_expected_resource, block_cursor, vec_width=1, dtype=fx.T.i32()
-                            )
-                            buffer_store(expected_value + fx.Int32(1), tile_expected_resource, block_cursor)
-                            block_cursor = block_cursor + fx.Int32(1)
-                        within_expert_offset = within_expert_offset + count_value
+                    within_expert_offset = within_expert_offset + count_value
                 if local_expert_index == fx.Int32(experts_per_rank - 1):
                     total_rows = expert_pool_base + padded_count
-                    buffer_store(total_rows, meta_scalars_resource, fx.Int32(0))
-                    buffer_store(total_rows // fx.Int32(block_m), meta_scalars_resource, fx.Int32(1))
+                    buffer_store(total_rows // fx.Int32(block_m), num_tile_blocks_resource, fx.Int32(0))
                     buffer_store(
                         _ext_i64(total_rows),
                         num_tokens_per_expert_prefix_resource,
@@ -314,8 +294,7 @@ def _make_dispatch_prologue(
 
         grid_sync(sl, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/C:table-built")
 
-        # Reuse the per-block histogram Phase A left in LDS (identical pair range,
-        # untouched by grid_sync/xgmi_barrier/Phase C) -- skip clear + recount.
+        # Reuse Phase A's per-block histogram in LDS (untouched by barriers) -- skip clear + recount.
         reserve_index = thread_index
         while reserve_index < fx.Int32(num_experts):
             block_expert_count = ld(lds_base, reserve_index, scope="workgroup", space=3)
@@ -438,11 +417,14 @@ def _compiled_dispatch_prologue(
     expert_send_count,
     expert_send_offset,
     tile_to_expert,
-    tile_expected,
     dispatched_token_idx,
     topk_weight_flat,
     num_tokens_per_expert,
     num_tokens_per_expert_prefix,
+    num_tile_blocks,
+    combine_recv_dst_rank,
+    combine_recv_start_row,
+    combine_recv_count,
     num_tokens: fx.Constexpr[int],
     num_topk: fx.Constexpr[int],
     num_experts: fx.Constexpr[int],
@@ -476,11 +458,14 @@ def _compiled_dispatch_prologue(
         expert_send_count,
         expert_send_offset,
         tile_to_expert,
-        tile_expected,
         dispatched_token_idx,
         topk_weight_flat,
         num_tokens_per_expert,
         num_tokens_per_expert_prefix,
+        num_tile_blocks,
+        combine_recv_dst_rank,
+        combine_recv_start_row,
+        combine_recv_count,
     ).launch(
         grid=(num_cu, 1, 1),
         block=(num_threads, 1, 1),
@@ -515,42 +500,52 @@ def dispatch_prologue_flydsl_kernel(
     expert_send_count = torch.empty(num_experts, dtype=torch.int32, device=dev)
     expert_send_offset = torch.empty(num_experts, dtype=torch.int32, device=dev)
     tile_to_expert = torch.empty(num_max_blocks, dtype=torch.int32, device=dev)
-    tile_expected = torch.empty(num_max_blocks, dtype=torch.int32, device=dev)
     dispatched_token_idx = torch.empty(num_max_pool_tokens, dtype=torch.int32, device=dev)
     num_tokens_per_expert = torch.empty(experts_per_rank, dtype=torch.int64, device=dev)
     num_tokens_per_expert_prefix = torch.empty(experts_per_rank + 1, dtype=torch.int64, device=dev)
+    num_tile_blocks = torch.empty(1, dtype=torch.int32, device=dev)
+    combine_recv_dst_rank = torch.empty(num_experts, dtype=torch.int32, device=dev)
+    combine_recv_start_row = torch.empty(num_experts, dtype=torch.int32, device=dev)
+    combine_recv_count = torch.empty(num_experts, dtype=torch.int32, device=dev)
     if topk_weight is not None:
         topk_weight_flat = topk_weight.to(torch.float32).contiguous().view(-1)
     else:
         topk_weight_flat = torch.zeros(num_tokens * num_topk, dtype=torch.float32, device=dev)
 
     stream = torch.cuda.current_stream()
-    # Silence flydsl autotune progress prints (fd-level, catches JIT output too).
-    with _suppress_stdout_stderr():
-        _compiled_dispatch_prologue(
-            topk_idx_flat=topk_idx_flat,
-            workspace=workspace,
-            sym_layout=sym_layout,
-            expert_send_dst_rank=expert_send_dst_rank,
-            expert_send_dst_row=expert_send_dst_row,
-            expert_send_count=expert_send_count,
-            expert_send_offset=expert_send_offset,
-            tile_to_expert=tile_to_expert,
-            tile_expected=tile_expected,
-            dispatched_token_idx=dispatched_token_idx,
-            topk_weight_flat=topk_weight_flat,
-            num_tokens_per_expert=num_tokens_per_expert,
-            num_tokens_per_expert_prefix=num_tokens_per_expert_prefix,
-            num_tokens=num_tokens,
-            num_topk=num_topk,
-            num_experts=num_experts,
-            num_ranks=num_ranks,
-            rank=rank,
-            experts_per_rank=experts_per_rank,
-            block_m=block_m,
-            num_max_pool_tokens=num_max_pool_tokens,
-            stream=stream,
-        )
+    _compiled_dispatch_prologue(
+        topk_idx_flat=topk_idx_flat,
+        workspace=workspace,
+        sym_layout=sym_layout,
+        expert_send_dst_rank=expert_send_dst_rank,
+        expert_send_dst_row=expert_send_dst_row,
+        expert_send_count=expert_send_count,
+        expert_send_offset=expert_send_offset,
+        tile_to_expert=tile_to_expert,
+        dispatched_token_idx=dispatched_token_idx,
+        topk_weight_flat=topk_weight_flat,
+        num_tokens_per_expert=num_tokens_per_expert,
+        num_tokens_per_expert_prefix=num_tokens_per_expert_prefix,
+        num_tile_blocks=num_tile_blocks,
+        combine_recv_dst_rank=combine_recv_dst_rank,
+        combine_recv_start_row=combine_recv_start_row,
+        combine_recv_count=combine_recv_count,
+        num_tokens=num_tokens,
+        num_topk=num_topk,
+        num_experts=num_experts,
+        num_ranks=num_ranks,
+        rank=rank,
+        experts_per_rank=experts_per_rank,
+        block_m=block_m,
+        num_max_pool_tokens=num_max_pool_tokens,
+        stream=stream,
+    )
+    # Handle ABI (indices consumed by fwd combine + bwd dispatch/combine):
+    #   0 expert_send_dst_rank   1 expert_send_dst_row   2 expert_send_count
+    #   3 expert_send_offset     4 dispatched_token_idx  5 tile_to_expert
+    #   6 num_tokens_per_expert  7 num_tokens_per_expert_prefix  8 num_tile_blocks
+    #   9 combine_recv_dst_rank  10 combine_recv_start_row  11 combine_recv_count
+    # (12 pool_src_slot is appended by the dispatch launcher on the forward path.)
     return (
         expert_send_dst_rank,
         expert_send_dst_row,
@@ -558,7 +553,10 @@ def dispatch_prologue_flydsl_kernel(
         expert_send_offset,
         dispatched_token_idx,
         tile_to_expert,
-        tile_expected,
         num_tokens_per_expert,
         num_tokens_per_expert_prefix,
+        num_tile_blocks,
+        combine_recv_dst_rank,
+        combine_recv_start_row,
+        combine_recv_count,
     )

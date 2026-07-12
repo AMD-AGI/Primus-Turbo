@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 from typing import Optional
 
 import flydsl.expr as fx
@@ -133,7 +139,8 @@ def combine_bf16_tile(
             full_bytes,
             dst_off=slot * fx.Int32(row_words),
             src_off=row * fx.Int32(row_words),
-            store_cache_modifier=3,  # glc|slc: L1+L2 bypass for cross-rank combine push
+            load_cache_modifier=19,
+            store_cache_modifier=19,  # sc0+sc1: push data to peer MALL coherence point
         )
         if const_expr(tail_cols):
             oob_index = fx.Int32(n_slots) * fx.Int32(out_features)
@@ -145,20 +152,20 @@ def combine_bf16_tile(
             in_tail = (lane_id * fx.Int32(_PVEC)) < fx.Int32(tail_cols)
             safe_col = arith.select(in_tail, col, fx.Int32(out_features - _PVEC))
             tail_value = buffer_load(
-                l2_res, row_off + safe_col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=_L1_BYPASS
+                l2_res, row_off + safe_col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=19
             )
             dst = arith.select(in_tail, slot_base + col, oob_index)
-            buffer_store(tail_value, peer, dst, cache_modifier=3)  # glc|slc: L1+L2 bypass
+            buffer_store(tail_value, peer, dst, cache_modifier=19)  # sc0+sc1: peer MALL coherence
         if const_expr(with_gate):
-            gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
+            gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32(), cache_modifier=19)
             gate_addr = sym_map(sym_layout, sym_layout.combine_gate, dst_rank)
             gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
-            buffer_store(gate_value, gate_peer, slot, cache_modifier=3)  # glc|slc: match token push
+            buffer_store(gate_value, gate_peer, slot, cache_modifier=19)  # sc0+sc1: match token push
         if const_expr(signal):
             bank = fx.Int32(0) if bank_offset is None else bank_offset
             barrier_addr = sym_map(sym_layout, sym_layout.reduce_flag, dst_rank)
-            _wait_mem()
-            st(barrier_addr, bank + slot, epoch, scope="sys")
+            fx.rocdl.s_waitcnt(0)
+            st(barrier_addr, bank + slot, epoch, scope="agent")
 
 
 @ASTRewriter.transform
@@ -202,9 +209,6 @@ def topk_reduce_bf16_tile(
                     if topk_index < fx.Int64(num_experts):
                         if lane_id == fx.Int32(0):
                             spin_start = read_clock()
-                            # TODO(author): reduce_flag is written scope="sys" by combine_bf16_tile
-                            # but read scope="agent" here. Keeping agent (proven working); raising to
-                            # sys deadlocks autotune on gfx950 -- confirm the intended scope on hardware.
                             flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
                             while flag != epoch:
                                 fx.rocdl.s_sleep(fx.Int32(1))
@@ -213,7 +217,7 @@ def topk_reduce_bf16_tile(
                                     fx.printf(
                                         "[MEGA rank="
                                         + str(rank)
-                                        + " topk_reduce] combine reduce-flag STUCK: "
+                                        + " topk_reduce] combine reduce-flag stuck: "
                                         "GEMM has not written this expert's rows; token={} slot={} expert={} "
                                         "reduce_flag_index={} (seen_flag={} expected_epoch={})\n",
                                         token,
@@ -249,7 +253,7 @@ def topk_reduce_bf16_tile(
                         row_off,
                         vec_width=_PVEC,
                         dtype=fx.T.bf16(),
-                        cache_modifier=3,  # glc|slc: L1+L2 bypass (avoid stale L2 on slot reuse)
+                        # cache_modifier=3,  # glc|slc: L1+L2 bypass (avoid stale L2 on slot reuse)
                     )
                 )
             if const_expr(apply_weights):

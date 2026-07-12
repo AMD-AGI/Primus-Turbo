@@ -29,10 +29,13 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
-# dispatch handle layout (see dispatch_prologue_flydsl_kernel.py return order).
-_HANDLE_LEN = 9
-_H_NUM_TOKENS_PER_EXPERT = 7
-_H_NUM_TOKENS_PER_EXPERT_PREFIX = 8
+# dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
+# 0-5 send/dispatch tables + tile_to_expert, 6 num_tokens_per_expert,
+# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
+_HANDLE_LEN = 13
+_H_NUM_TILE_BLOCKS = 8
+_H_NUM_TOKENS_PER_EXPERT = 6
+_H_NUM_TOKENS_PER_EXPERT_PREFIX = 7
 
 
 class MegaMoEBackwardFlyDSLBackend(KernelBackend):
@@ -93,6 +96,8 @@ class MegaMoEBackwardFlyDSLBackend(KernelBackend):
             scale=dispatch_weights_in_buf,
             return_gate=True,
             return_act_w=True,
+            # bound by THIS handle's tile count (per-forward, not shared symm)
+            num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
         )
 
         # dW2 = dispatch_l2_grad^T @ act_weighted (variable-K wgrad)

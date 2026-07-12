@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""``MegaMoE``: nn.Module wrapper over the fully fused mega MoE op."""
+"""``MegaMoE``: nn.Module over the fully fused mega MoE op (internal aux loss)."""
 
 import contextlib
 import math
@@ -14,7 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from primus_turbo.pytorch.modules.moe.mega_moe_utils import apply_random_logits
+from primus_turbo.pytorch.modules.moe.mega_moe_utils import (
+    apply_random_logits,
+    switch_load_balancing_loss_func,
+)
 from primus_turbo.pytorch.ops.moe.fused_moe_router import (
     fused_group_topk_routing_with_aux_score,
 )
@@ -39,7 +42,7 @@ class MegaMoE(nn.Module):
         score_function: str = "sigmoid",
         routed_scaling_factor: float = 1.0,
         force_load_balancing: bool = False,
-        aux_loss_fn: Optional[Callable] = None,
+        aux_loss_coeff: float = 0.0,
         add_bias_linear: bool = False,
         enable_expert_bias: bool = False,
         shared_expert_intermediate_size: Optional[int] = None,
@@ -82,10 +85,8 @@ class MegaMoE(nn.Module):
         self.score_function: str = score_function
         self.routed_scaling_factor: float = routed_scaling_factor
         self.force_load_balancing: bool = force_load_balancing
-        # optional framework hook: attach a load-balancing aux loss to the routing
-        # weights (grad flows back to the gate logits); signature
-        # (topk_weights, aux_scores [T,E], routing_map [T,E], valid_mask [T]|None) -> topk_weights
-        self.aux_loss_fn: Optional[Callable] = aux_loss_fn
+        # internal load-balancing aux loss coeff; 0 disables (grad flows to gate logits)
+        self.aux_loss_coeff: float = aux_loss_coeff
         self.router_dtype: torch.dtype = router_dtype
         # optional framework CUDA RNG tracker for seed-consistent weight init
         self.get_rng_state_tracker: Optional[Callable] = get_rng_state_tracker
@@ -111,8 +112,7 @@ class MegaMoE(nn.Module):
                 if add_bias_linear
                 else None
             )
-            # aux-free balancing not supported: the fused router does not inject
-            # expert_bias into the selection score, so it would be a silent no-op
+            # aux-free balancing unsupported: fused router ignores expert_bias (silent no-op)
             if enable_expert_bias:
                 raise NotImplementedError(
                     "MegaMoE does not support enable_expert_bias (aux-loss-free balancing): "
@@ -122,9 +122,7 @@ class MegaMoE(nn.Module):
         else:
             self.gate_weight = None
             self.gate_bias = None
-        # No expert_bias attribute on purpose: Megatron duck-types expert_bias +
-        # local_tokens_per_expert together in _update_router_expert_bias; exposing
-        # only expert_bias (unimplemented) would trip that loop.
+        # no expert_bias attribute: Megatron duck-types it with local_tokens_per_expert
 
         # per-rank expert shard: w1 [g, 2I, H] (gate+up), w2 [g, H, I]
         self.w1 = nn.Parameter(
@@ -154,7 +152,7 @@ class MegaMoE(nn.Module):
         tracker = self.get_rng_state_tracker() if self.get_rng_state_tracker is not None else None
 
         def rng_fork(name):
-            # fork tracker region (name=None -> tracker default); no-op without a tracker
+            # fork tracker region (name=None -> default); no-op without a tracker
             if tracker is None:
                 return contextlib.nullcontext()
             return tracker.fork() if name is None else tracker.fork(name)
@@ -178,8 +176,7 @@ class MegaMoE(nn.Module):
                         (init1 or (lambda w: nn.init.kaiming_uniform_(w, a=math.sqrt(5))))(
                             self.shared_gate_weight
                         )
-            # expert-sharded w1/w2: distinct region so each EP rank gets different experts.
-            # init independently so output_layer_init_method is honored when init_method is None
+            # expert-sharded w1/w2: distinct region so each EP rank gets different experts
             with rng_fork(self.rng_tracker_name):
                 if init1 is not None:
                     init1(self.w1)
@@ -190,12 +187,44 @@ class MegaMoE(nn.Module):
                 else:
                     self.w2.normal_(mean=0.0, std=2.0 / math.sqrt(self.intermediate_size))
 
+    def _compute_aux_loss(
+        self,
+        aux_scores: torch.Tensor,
+        routing_map: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Internal load-balancing aux loss (grad path to gate logits)."""
+        if valid_mask is not None:
+            rmap = routing_map & valid_mask.unsqueeze(-1)
+            total_tokens = int(valid_mask.sum())
+        else:
+            rmap = routing_map
+            total_tokens = aux_scores.shape[0]
+        tokens_per_expert = rmap.sum(dim=0)
+        return switch_load_balancing_loss_func(
+            probs=aux_scores,
+            tokens_per_expert=tokens_per_expert,
+            total_num_tokens=total_tokens,
+            topk=self.top_k,
+            num_experts=self.num_experts,
+            moe_aux_loss_coeff=self.aux_loss_coeff,
+        )
+
+    def _aux_loss_enabled(self) -> bool:
+        """Aux loss active only when training with grad and not benchmarking."""
+        return (
+            self.aux_loss_coeff != 0.0
+            and self.training
+            and torch.is_grad_enabled()
+            and not self.force_load_balancing
+        )
+
     def route(
         self,
         hidden_states: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Route tokens -> (topk_idx [T,K] i32, topk_weights [T,K] f32)."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Route tokens -> (topk_idx [T,K] i32, topk_weights [T,K] f32, aux_loss|None)."""
         assert self.has_router, "MegaMoE built routing-free (top_k=None); no internal router"
         x = hidden_states.to(self.router_dtype)
         assert valid_mask is None or valid_mask.shape[0] == x.shape[0], "valid_mask/token count mismatch"
@@ -219,16 +248,11 @@ class MegaMoE(nn.Module):
         # zero out padded tokens so they contribute nothing through combine
         if valid_mask is not None:
             topk_weights = topk_weights * valid_mask.to(topk_weights.dtype).unsqueeze(-1)
-        # load-balancing aux loss: framework hook attaches it to the weights so its
-        # grad flows back to the gate logits (skip for random-logits benchmarking)
-        if (
-            self.aux_loss_fn is not None
-            and self.training
-            and torch.is_grad_enabled()
-            and not self.force_load_balancing
-        ):
-            topk_weights = self.aux_loss_fn(topk_weights, aux_scores, routing_map, valid_mask)
-        return topk_idx.to(torch.int32), topk_weights.to(torch.float32)
+        # internal aux loss: scalar whose grad flows back to the gate logits
+        aux_loss = None
+        if self._aux_loss_enabled():
+            aux_loss = self._compute_aux_loss(aux_scores, routing_map, valid_mask)
+        return topk_idx.to(torch.int32), topk_weights.to(torch.float32), aux_loss
 
     def expert_compute(
         self,
@@ -246,20 +270,22 @@ class MegaMoE(nn.Module):
         topk_weights: Optional[torch.Tensor] = None,
         *,
         padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Fused expert compute (+ optional shared expert); y keeps input leading shape."""
+        return_aux_loss: bool = False,
+    ):
+        """Fused expert compute (+ shared expert); return_aux_loss=True -> (y, aux_loss)."""
         in_shape = hidden_states.shape
         in_dtype = hidden_states.dtype
         flat = hidden_states.reshape(-1, self.hidden_size)
+        aux_loss = None
         if topk_idx is None or topk_weights is None:
-            # Megatron parity: padding_mask [seq, bsz] True = PADDING; invert to valid_mask [T]
+            # Megatron parity: padding_mask [seq, bsz] True = PADDING -> valid_mask [T]
             valid_mask = None
             if padding_mask is not None:
                 valid_mask = (~padding_mask.reshape(-1).bool()).to(flat.device)
             # route on original precision
-            topk_idx, topk_weights = self.route(flat, valid_mask)
+            topk_idx, topk_weights, aux_loss = self.route(flat, valid_mask)
         else:
-            # external topk path does not consume padding_mask; caller must mask upstream
+            # external topk path ignores padding_mask; caller must mask upstream
             assert padding_mask is None, (
                 "padding_mask is ignored when topk_idx/topk_weights are provided; "
                 "zero out padded tokens' weights upstream"
@@ -270,7 +296,10 @@ class MegaMoE(nn.Module):
         y = self.expert_compute(x, topk_idx, topk_weights)
         if self.shared_w1 is not None:
             y = y + self._shared_expert(x)
-        return y.reshape(in_shape).to(in_dtype)
+        y = y.reshape(in_shape).to(in_dtype)
+        if return_aux_loss:
+            return y, aux_loss
+        return y
 
     def _shared_expert(self, x: torch.Tensor) -> torch.Tensor:
         """Replicated SwiGLU shared expert run on every token (optional gate)."""
