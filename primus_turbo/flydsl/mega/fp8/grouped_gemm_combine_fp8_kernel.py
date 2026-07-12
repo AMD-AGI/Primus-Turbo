@@ -278,11 +278,13 @@ def _compile(
         B_lds_next_1: fx.Array[fx.BFloat16, _b_lds, 16]
         C_lds_shuffle: fx.Array[fx.BFloat16, _cshuf_n, 16]
 
-    # PT_FP8_COMBINE_GEMM=mxfp8: run the L2 GEMM in fp8 (gemm_mxfp8_nt_tile, ~2x compute) instead
-    # of bf16 -- the CU sweep showed the fused L2 is GEMM-role-bound (more combine CUs hurt), so a
-    # faster GEMM frees the critical path. Uses the 16x16 mxfp8 tile + StoreCQuantMxfp8CShuffle
-    # (16x16). Inputs become pre-quantized fp8 act/w2 + preshuffled scales (host).
-    _mxgemm = os.environ.get("PT_FP8_COMBINE_GEMM", "bf16") == "mxfp8"
+    # PT_FP8_COMBINE_GEMM (DEFAULT "mxfp8"): run the L2 fc2 GEMM in fp8 (gemm_mxfp8_nt_tile, ~2x
+    # compute) -- the shipped fc2+combine path: mxfp8 GEMM + fp8 combine PUSH. The CU sweep showed
+    # the fused L2 is GEMM-role-bound (more combine CUs hurt), so a faster GEMM frees the critical
+    # path. Uses the mxfp8 tile + CShuffle mxfp8-quant epilogue; inputs become pre-quantized fp8
+    # act/w2 + preshuffled scales. Set PT_FP8_COMBINE_GEMM=bf16 to force the (slower) bf16-GEMM path
+    # for comparison.
+    _mxgemm = os.environ.get("PT_FP8_COMBINE_GEMM", "mxfp8") == "mxfp8"
     # PT_COMBINE_NO_REDUCE (debug/isolation, default off): compile out the topk reduce role
     # (dedicated + empty-block) so the kernel measures ONLY the GEMM (produce local fp8 L2Y) +
     # combine PUSH (XGMI copy to peer). Isolates the fp8 byte-lever on the produce+transmit half
@@ -473,9 +475,25 @@ _L2Y_FP8_SCRATCH: dict = {}
 _L2_BSP_CACHE: dict = {}  # (w2 data_ptr, G, H, I) -> (fp8 w2 int8 flat, preshuffled b_sp) [static weights]
 
 
+def prepare_w2_fp8(l2_weights):
+    """Prepare the L2 fc2 weight for the fp8 combine: grouped mxfp8 quant (FlyDSL) + scale
+    preshuffle (ScaleBComb layout) + int8 flat -> ``(weight_flat int8 [G*H*I], b_sp int32)``,
+    exactly the two operands the mxfp8 combine GEMM consumes. Static per weight version, so a
+    stateful holder (``MegaMoEFP8``) computes this ONCE per ``optim.step`` and passes it as
+    ``w2_fp8`` -- the combine then does NO per-call weight quant OR preshuffle."""
+    from primus_turbo.flydsl.mega.fp8.quant import quantize_grouped_weight_mxfp8_flydsl
+    from primus_turbo.flydsl.mega.fp8.quant_flydsl import preshuffle_b_scale
+
+    G, H, I = l2_weights.shape
+    w2q, w2s = quantize_grouped_weight_mxfp8_flydsl(l2_weights)
+    b_sp = preshuffle_b_scale(w2s, G, H, I)
+    weight_flat = w2q.reshape(G * H, I).contiguous().view(torch.int8).reshape(-1)
+    return weight_flat, b_sp
+
+
 def grouped_gemm_combine_fp8(
     act, l2_weights, handle, group, *, topk_indices, topk_weights, BM=256, BN=256,
-    num_combine_cu=48, num_reduce_cu=0,
+    num_combine_cu=48, num_reduce_cu=0, w2_fp8=None,
 ):
     """Fused grouped BF16 GEMM (mxfp8 epilogue quant) + FP8 combine PUSH + FP8-dequant reduce.
 
@@ -511,26 +529,31 @@ def grouped_gemm_combine_fp8(
     topk_indices_d = topk_indices.contiguous().view(-1)
     topk_weights_d = topk_weights.contiguous().view(-1)
 
-    _mxgemm = os.environ.get("PT_FP8_COMBINE_GEMM", "bf16") == "mxfp8"
+    _mxgemm = os.environ.get("PT_FP8_COMBINE_GEMM", "mxfp8") == "mxfp8"
     if _mxgemm:
-        # fp8 L2 GEMM path: quantize act (rowwise mxfp8, preshuffled a_sp) + w2 (grouped, host
-        # preshuffled b_sp, cached). ACT/WEIGHTS become fp8 int8 views; A/B_SCALE = preshuffled i32.
-        from primus_turbo.flydsl.mega.fp8.quant import quantize_grouped_weight_mxfp8
-        from primus_turbo.flydsl.mega.fp8.quant_flydsl import (
-            preshuffle_b_scale,
-            quantize_rowwise_mxfp8_flydsl,
-        )
+        # fp8 L2 GEMM path: quantize act (rowwise mxfp8, preshuffled a_sp); w2 comes pre-prepared
+        # from the caller (prepare_w2_fp8) or the internal version-keyed cache. ACT/WEIGHTS become
+        # fp8 int8 views; A/B_SCALE = preshuffled i32.
+        from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
 
         aq, a_sp = quantize_rowwise_mxfp8_flydsl(act.contiguous(), preshuffle=True)
         act_flat = aq.view(torch.int8).reshape(-1)
-        _bk = (l2_weights.data_ptr(), G, H, I)
-        ent = _L2_BSP_CACHE.get(_bk)
-        if ent is None:
-            w2q, w2s = quantize_grouped_weight_mxfp8(l2_weights)  # [G,H,I] fp8 + [G,H,I/32] raw E8M0
-            b_sp = preshuffle_b_scale(w2s, G, H, I)
-            w2q_flat = w2q.reshape(G * H, I).contiguous().view(torch.int8).reshape(-1)
-            _L2_BSP_CACHE[_bk] = ent = (w2q_flat, b_sp)
-        weight_flat, b_sp = ent
+        if w2_fp8 is not None:
+            # caller (MegaMoEFP8) owns + version-maintains the FULL prepared w2 (quant + scale
+            # preshuffle + int8 flat) via prepare_w2_fp8 -> no per-call quant OR preshuffle here.
+            weight_flat, b_sp = w2_fp8
+        else:
+            # STATIC-weight cache. Key MUST include _version: in-place optim.step() updates keep the
+            # same data_ptr, so a data_ptr-only key would return STALE fp8 w2 (wrong weights) in real
+            # training. _version bumps on every in-place update -> invalidates. (id/data_ptr +
+            # _version is the Rule-11 W1 pattern; real-training gain is grad-accum-only.) Caches BOTH
+            # the quant and the preshuffle (prepare_w2_fp8) so neither is redone per call.
+            _bk = (l2_weights.data_ptr(), getattr(l2_weights, "_version", 0), G, H, I)
+            ent = _L2_BSP_CACHE.get(_bk)
+            if ent is None:
+                w2q_flat, b_sp = prepare_w2_fp8(l2_weights)
+                _L2_BSP_CACHE[_bk] = ent = (w2q_flat, b_sp)
+            weight_flat, b_sp = ent
         a_scale_arg, b_scale_arg, ng = a_sp, b_sp, int(G)
     else:
         act_flat = act.contiguous().view(-1)

@@ -5,4 +5,5 @@
 ###############################################################################
 
 from .mega_moe import *
+from .mega_moe_fp8 import *
 from .token_dispatcher import *

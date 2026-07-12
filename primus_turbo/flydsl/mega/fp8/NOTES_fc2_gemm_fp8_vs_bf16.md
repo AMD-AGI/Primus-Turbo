@@ -131,6 +131,49 @@ producer-consumer,不加 barrier 会触发已知 reduce-flag liveness stall;barr
 稀释。bench:`agent/workspace/mxfp8_nn_step1/rounds/round-4/_pushonly_bench.py`
 (`PT_COMBINE_NO_REDUCE` / `BENCH_NO_REDUCE`)。
 
+## ★★★★ 修正(round-5,实测):"削 host barrier floor 兑现 L2 收益" 的假设被**证伪**
+上面那句 "要削掉 host barrier floor 才能兑现 ~0.8 ms" 是**错的**。round-5 直接测了 barrier floor 的大小和
+削掉后的效果(`PT_MEGA_BARRIER_MODE` env-gate,EP8 T=8192 DSv3,chi2868):
+
+1. **host barrier floor 只有 ~0.27 ms,不是 ~0.8 ms。** 微基准(`_rendezvous_cost_bench.py`,纯 rendezvous,
+   不含 kernel):4× rdv+resets = 270.5 us,2× = 157.0 us,1× = 50.8 us,resets = 13.7 us。整个 floor
+   ~0.27 ms;可安全削 ~0.11–0.15 ms。
+2. **削 barrier 对 bf16 和 fp8 一样受益,不会让 fp8 反超。** `_ep8_combine_bench` 标准口径:
+   full(4×)→ fp8 8.412 / bf16 8.311;reduced(留 2 个 load-bearing B+D)→ fp8 8.261 / bf16 8.116。
+   fp8 仍 ~打平/略慢于 bf16(+0.15 ms),两模式同幅受益。SNR 不变(correct)。
+3. **fp8 L2 kernel 的 0.73 ms 收益是真的、在融合前向里也在**(in-context segment timing,drained:
+   fp8 L2 seg 2.263 ms vs bf16 L2 seg 2.991 ms)。它没兑现到整前向,是因为**back-to-back harness 的跨 rank
+   straggler / 流水线争用**(iter N+1 的 L1 dispatch comm 与 iter N 的 L2 fp8 reduce 重叠,抢 XGMI/CU),
+   **不是 host barrier**。削 barrier 解决不了这个。
+4. **一个 pre-existing 隐患**:纯 400 连发(iter 间无 barrier)时,bf16 在 full 和 reduced **都**会触发
+   L1 scoreboard liveness stall(`MEGA mxfp8 GEMM gate timeout`)—— 与 barrier 削减无关,是既有的
+   间歇性 bug;fp8 连发能跑但 SNR 从 22.39 掉到 18.6(跨 iter payload race)。
+
+**结论:PROMPT_optimize_L2_barrier_floor 的核心思路(削 host barrier 兑现 L2 收益)是死路。** floor 太小
+且 barrier 都 load-bearing(A/C 看似冗余,实则在跨 rank straggler 下也承担 scoreboard 排序,reduced 下无额外
+安全裕度但也无回归)。真正的稀释源是 fp8 combine reduce 的跨 rank straggler/争用。reduced-barrier 作为一个
+~0.15 ms 的通用微优化(bf16+fp8 都受益)保留为 opt-in(`PT_MEGA_BARRIER_MODE=reduced`,默认 full 不变)。
+详见 `agent/workspace/mxfp8_nn_step1/rounds/round-5/summary.md`。
+
+## ★★★★★ 决定性更正(round-5):fp8 全链前向其实 **净胜 bf16 ~0.6–0.7 ms/step**,"打平"是 harness 假象
+上面(a)(b)反复说的 "fp8 全链打平 bf16" 是 **`_ep8_combine_bench` 连发 harness 的测量假象**。该 harness 把 20 个
+前向流水线连发、**步间无同步**(且复用同一批张量,Rule 11 benchmark idiom)—— 这让 iter N+1 的 fp8 L1 dispatch
+comm 与 iter N 的 fp8 L2 reduce 在 XGMI 上重叠争用,**专门拖累 fp8**,才看着像打平/略慢。
+
+用**干净的单步前向延迟**测(`_step_latency_bench.py`:global barrier 统一起点、逐 rank cuda events、计时区内无尾
+barrier、50 trials,EP8 T=8192 DSv3,chi2868):
+
+| barrier | fp8(fp8 L1 + fp8 L2) | bf16(fp8 L1 + bf16 L2) | fp8 净胜 | fp8 SNR |
+|---|---|---|---|---|
+| full(已 ship) | 10.671 ms | 11.346 ms | **−0.675 ms** | 20.32 dB |
+| reduced | 10.542 ms | 11.160 ms | **−0.618 ms** | 20.25 dB |
+
+- straggler spread ~0.06–0.11 ms(可忽略),full/reduced 下都稳赢;drained segment timing 佐证(fp8 前向总计
+  7.365 vs bf16 8.224 = −0.86 ms)。
+- **翻案:L1 的 1.4× + L2 的 kernel 收益确实复合,fp8 整前向净胜 ~0.6–0.7 ms/step**,SNR 20.3 > 15 dB gate。
+  **应 ship `combine="fp8"`(+`PT_FP8_COMBINE_GEMM=mxfp8`)。** host barrier 从来不是稀释源(只有 ~0.27 ms),
+  连发 harness 才是。用户的判断("分别有提升合在一起就该有提升,否则有问题")是对的 —— "问题"出在测量口径,不在 kernel。
+
 ## 为什么 fp8 在 fc2 上稳赢(而反向 wgrad 不赢)
 
 - fc2 是**大 N(H=7168)、大 K(I=2048)的 compute-bound GEMM** → fp8 的 ~2× 算力直接兑现(1293 vs 706 TF)。

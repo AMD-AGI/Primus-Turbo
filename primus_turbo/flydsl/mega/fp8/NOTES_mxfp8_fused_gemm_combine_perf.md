@@ -6,27 +6,49 @@ fused kernel (`grouped_gemm_combine_bf16_kernel.py`). AMD Instinct MI355X, DeepS
 
 Benchmarks: `benchmark/ops/bench_grouped_gemm_combine_mxfp8.py`, `benchmark/ops/bench_grouped_gemm_comine.py`.
 
-## TL;DR — fp8 gives **no** L2 win. Ship **L1 fp8 fused + L2 bf16 fused**.
+## ★★★ SUPERSEDED (2026-07-10): fp8 L2 IS a real ~1.37× kernel win now — see NOTES_fc2_gemm_fp8_vs_bf16.md
+
+The "no L2 win / 0.76× / ship bf16" verdict below was measured **before** the CShuffle mxfp8-quant
+epilogue existed. That verdict is now **wrong**. The wall was the quant placement (butterfly amax),
+not the fp8 approach. Fixed by `StoreCQuantMxfp8CShuffle32` (contiguous-col amax + coalesced fp8
+store, `gemm_helper.py`) + running the L2 GEMM role in fp8 (`PT_FP8_COMBINE_GEMM=mxfp8`).
+
+Isolated L2-kernel measurement (EP8 T=8192 DSv3, chi2868, `PT_COMBINE_NO_REDUCE` isolation bench):
+
+| L2 段 | bf16 | fp8 (mxfp8 GEMM + fp8 PUSH) | speedup |
+|---|---|---|---|
+| GEMM + PUSH (no reduce) | 2.72 ms | 1.99 ms | **1.37×** |
+| FULL L2 (GEMM + PUSH + REDUCE) | 2.98 ms | 2.16 ms | **1.38×** |
+
+So the byte-lever DOES realize (~0.73–0.82 ms saved), the fp8-dequant reduce is near-free, and the
+old "quant is a 1–2 ms wall" only applied to the butterfly placement. **However** the whole-forward
+(barrier-inflated) still shows ~tie (fp8 8.32 vs bf16 8.35 ms) because the L2 kernel gain is diluted
+by the L1↔L2 **host barrier floor** (`torch.cuda.synchronize() + group.barrier()` around the
+scoreboard / sb_l2 / barrier_local resets in `mega_moe_fused_mxfp8_forward`). Realizing the ~0.8 ms
+at the step level is now a **barrier-floor removal** task, not a combine/quant task. Full data +
+trajectory (0.76× butterfly → 0.92× CShuffle → ~1.0× whole-forward → 1.37× isolated L2): see
+`NOTES_fc2_gemm_fp8_vs_bf16.md` (★★★ section). SNR: fp8 L2 ~2.5 dB below bf16 (still > 15 dB gate).
+
+---
+
+## TL;DR (HISTORICAL — pre-CShuffle, superseded above) — fp8 gives **no** L2 win.
 
 The L2 combine is a **bf16** reduce-scatter of the (residual) MoE output; it is genuinely
 **XGMI-bandwidth-bound at ~300 GB/s** (see the bandwidth correction below — the earlier "43 GB/s /
 117 MB" figure was wrong). fp8-ing the combine **payload** does halve the bytes and, *in isolation*,
-combine drops 2.70 → 1.44 ms (1.85×). **But it cannot be turned into a fused L2 win:** the mxfp8
-**quantization of the L2 GEMM output is expensive compute (~1–2 ms)** and, wherever it is placed in
-the fused kernel, it costs more than the combine bytes it saves. Three placements were implemented
-and measured (all bit-correct, cos ≈ 0.9996 vs bf16 fused), all **slower** than bf16 fused:
+combine drops 2.70 → 1.44 ms (1.85×). At the time this was thought to not turn into a fused L2 win:
+the mxfp8 **quantization of the L2 GEMM output** was expensive (~1–2 ms) in the **butterfly** amax
+placement. Three placements were implemented (all bit-correct, cos ≈ 0.9996 vs bf16 fused), all
+slower than bf16 fused — but this was **fixed later** by the CShuffle epilogue (see the SUPERSEDED
+block above):
 
 | L2 fused variant | correct? | vs bf16 fused |
 |---|---|---|
 | bf16 fused (reference) | — | 1.00× (2.7–2.9 ms) |
 | fp8, **quant-in-combine** (3-role, 4-lane amax in combine) | cos 0.9996 | **0.99×** |
 | fp8, **separate quant role** (4-role, GEMM→quant→combine→reduce) | cos 0.9996 | **0.76×** |
-| fp8, **quant in GEMM epilogue** (32-lane butterfly amax) | cos 0.9996 | **0.76×** |
-
-Recommendation: **keep L2 as `grouped_gemm_combine_bf16`**; use fp8 only at L1 (`comm="fp8_fused"`,
-validated 1.4× vs bf16 fused). The fp8-combine correctness + byte-lever are validated and the
-approaches above are exhausted; do not re-attempt fp8 L2 combine without a fundamentally cheaper
-GEMM-output quantization.
+| fp8, **quant in GEMM epilogue** (32-lane **butterfly** amax) | cos 0.9996 | **0.76×** |
+| fp8, **quant in GEMM epilogue (CShuffle, NEW)** + fp8 GEMM | cos 0.9996 | **1.37× (isolated L2)** |
 
 ## Combine bandwidth correction (the "43 GB/s wall" was wrong)
 

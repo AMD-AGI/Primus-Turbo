@@ -4,25 +4,16 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""EP8 forward benchmark: mega MoE mxfp8-compute forward (fp8_fused / fp8 / bf16 comm).
+"""EP8 forward benchmark: mega MoE all-fp8 forward.
 
-Times ``mega_moe_fused_mxfp8_forward`` (both FFN GEMMs in per-1x32 E8M0 block-scaled
-mxfp8) and reports per-rank worst-case latency + SNR vs an fp32 dense reference. Comm
-modes:
-  * ``fp8_fused`` — ONE kernel pushes fp8 tokens + E8M0 scales cross-rank AND computes
-    the L1 grouped mxfp8 GEMM (scoreboard-gated, comm hidden under the MFMA GEMM);
-  * ``fp8`` — decoupled: push fp8 tokens + E8M0 scales, then a standalone L1 GEMM;
-  * ``bf16`` — push bf16 tokens (2x the dispatch bytes) then quantize the pool.
-
-``--comm <mode>`` times a single mode; ``--compare`` times several modes back-to-back
-(default ``bf16,fp8_fused``) and prints a speedup table (the symm buffer reallocates on
-a mode switch, so each mode is timed with its own fresh workspace).
+Times ``mega_moe_fused_mxfp8`` (L1 = the fused mxfp8 dispatch+fc1 kernel
+``dispatch_grouped_gemm_mxfp8``: ONE kernel pushes fp8 tokens + E8M0 scales cross-rank AND
+computes the L1 grouped mxfp8 GEMM, scoreboard-gated with comm hidden under the MFMA GEMM;
+L2 = the fp8 combine) and reports per-rank worst-case latency + SNR vs an fp32 dense reference.
 
 Run inside the FlyDSL container (8 GPUs):
   PYTHONPATH=<...>/Primus-Turbo python benchmark/ops/bench_mega_moe_mxfp8.py \
-      --num-processes 8 --compare --iters 50
-  PYTHONPATH=<...>/Primus-Turbo python benchmark/ops/bench_mega_moe_mxfp8.py \
-      --num-processes 8 --comm fp8_fused --iters 50
+      --num-processes 8 --iters 50
 """
 
 import argparse
@@ -66,7 +57,7 @@ def _worker(rank, world, args):
     group = dist.new_group(list(range(world)))
     torch.manual_seed(123 + rank)
 
-    from primus_turbo.flydsl.mega.fp8.mega_moe_fused_mxfp8 import mega_moe_fused_mxfp8_forward
+    from primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 import mega_moe_fused_mxfp8
 
     H, I, E, K, T = args.hidden, args.inter, args.num_experts, args.topk, args.num_tokens
     epr = E // world
@@ -102,8 +93,8 @@ def _worker(rank, world, args):
         return statistics.median(ts)
 
     def bench_mode(comm):
-        def fwd():  # mxfp8 compute; dispatch comm precision = comm
-            return mega_moe_fused_mxfp8_forward(x, topk_idx, topk_w, w1, w2, group, comm=comm)
+        def fwd():  # all-fp8: fused mxfp8 dispatch+fc1 -> swiglu -> fp8 combine
+            return mega_moe_fused_mxfp8(group, x, topk_idx, topk_w, w1, w2)
 
         with torch.no_grad():
             snr = _compute_snr(ref, fwd())
@@ -136,12 +127,11 @@ def main():
     ap.add_argument("--topk", type=int, default=2)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--comm", choices=["fp8_fused", "fp8", "bf16"], default="fp8_fused",
-                    help="dispatch comm precision for a single-mode run")
-    ap.add_argument("--compare", nargs="?", const="bf16,fp8_fused", default=None,
-                    help="comma-separated comm modes to time (default bf16,fp8_fused); each mode "
-                         "runs in its own spawn (avoids the mid-process symm IPC realloc race); "
-                         "the first mode is the speedup baseline")
+    ap.add_argument("--comm", choices=["fp8_fused"], default="fp8_fused",
+                    help="only fp8_fused remains (single all-fp8 path); kept for CLI compat")
+    ap.add_argument("--compare", nargs="?", const="fp8_fused", default=None,
+                    help="comma-separated modes to time; only fp8_fused remains, so this is a "
+                         "single-row table (kept for CLI compat)")
     ap.add_argument("--result-file", default=None, help=argparse.SUPPRESS)  # internal: per-mode result sink
     args = ap.parse_args()
 

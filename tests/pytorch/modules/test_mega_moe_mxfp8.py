@@ -4,12 +4,12 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""EP8 correctness test for the mega MoE forward with mxfp8 compute (bf16 comm).
+"""EP8 correctness test for the all-fp8 mega MoE forward.
 
-Runs the milestone-1 forward path ``mega_moe_fused_mxfp8_forward`` (cross-rank
-dispatch + combine in bf16, both FFN GEMMs in per-1x32 E8M0 block-scaled mxfp8) on
-an EP8 world and gates SNR vs an fp32 dense MoE reference assembled from the
-all-gathered global expert weights. The mxfp8 gate (15 dB) is looser than the bf16
+Runs the fused all-fp8 forward ``mega_moe_fused_mxfp8`` (L1 = fused mxfp8 dispatch+fc1,
+L2 = fp8 combine; both FFN GEMMs in per-1x32 E8M0 block-scaled mxfp8) on an EP8 world and
+gates SNR vs an fp32 dense MoE reference assembled from the all-gathered global expert
+weights. The mxfp8 gate (15 dB) is looser than the bf16
 kernel's 20 dB because two chained fp8 GEMMs + SwiGLU add quantization noise
 (measured ~23 dB on this shape).
 
@@ -71,16 +71,13 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         return dist.new_group(list(range(self.world_size)))
 
     @skip_if_lt_x_gpu(_WORLD)
-    @parametrize("comm", ["fp8_fused", "fp8", "bf16"])
     @parametrize("top_k", [2, 4])
-    def test_forward_mxfp8(self, top_k, comm):
+    def test_forward_mxfp8(self, top_k):
         if not check_mxfp8_support():
             self.skipTest("MXFP8 requires gfx950")
         self._init_process()
         group = self._ep_group()
-        from primus_turbo.flydsl.mega.fp8.mega_moe_fused_mxfp8 import (
-            mega_moe_fused_mxfp8_forward,
-        )
+        from primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 import mega_moe_fused_mxfp8
 
         world, rank, dev = self.world_size, self.rank, self.device
         epr = _E // world
@@ -92,7 +89,7 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         topk_w = (topk_w / (topk_w.sum(-1, keepdim=True) + 1e-20)).to(torch.float32)
 
         with torch.no_grad():
-            y = mega_moe_fused_mxfp8_forward(x, topk_idx, topk_w, w1, w2, group, comm=comm)
+            y = mega_moe_fused_mxfp8(group, x, topk_idx, topk_w, w1, w2)
             # fp32 dense reference from the all-gathered global expert weights
             w1g = [torch.empty_like(w1) for _ in range(world)]
             w2g = [torch.empty_like(w2) for _ in range(world)]
@@ -108,7 +105,7 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         dist.all_reduce(snr, op=dist.ReduceOp.MIN)
         snr = float(snr.item())
         if rank == 0:
-            print(f"[mxfp8 forward comm={comm} top_k={top_k}] min SNR = {snr:.2f} dB")
+            print(f"[mxfp8 forward top_k={top_k}] min SNR = {snr:.2f} dB")
         self.assertGreaterEqual(snr, _SNR_THRESHOLD_DB, f"mxfp8 SNR {snr:.2f} dB < {_SNR_THRESHOLD_DB}")
         dist.destroy_process_group()
 
@@ -169,8 +166,16 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         self._init_process()
         group = self._ep_group()
         import primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 as mxmod
-        from primus_turbo.flydsl.mega.fp8.mega_moe_fused_mxfp8 import mega_moe_fused_mxfp8_forward
+        from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+        from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
+            dispatch_grouped_gemm_mxfp8,
+        )
+        from primus_turbo.flydsl.mega.fp8.quant import (
+            quantize_grouped_weight_mxfp8,
+            quantize_rowwise_mxfp8,
+        )
         from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
+        from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
         from primus_turbo.pytorch.core.backend import BackendType
         from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
             grouped_gemm_variable_k_impl,
@@ -180,7 +185,7 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         )
 
         rank, dev = self.rank, self.device
-        epr = _E // self.world_size
+        world, epr = self.world_size, _E // self.world_size
         x = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
         w1 = torch.randn(epr, 2 * _I, _H, device=dev, dtype=torch.bfloat16) * 0.05
         w2 = torch.randn(epr, _H, _I, device=dev, dtype=torch.bfloat16) * 0.05
@@ -189,16 +194,33 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         topk_w = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32)
 
         with torch.no_grad():
-            _, aux = mega_moe_fused_mxfp8_forward(
-                x, topk_idx.to(torch.int64), topk_w, w1, w2, group, comm="fp8_fused", return_aux=True,
+            # replicate the forward's L1 (fused mxfp8 dispatch+fc1) to get handle / l1 /
+            # dispatch_weights (the intermediates the backward's STEP1+STEP2 need)
+            symm = get_symm_buffer_for_mega_moe(
+                group, num_experts=epr * world, num_max_tokens_per_rank=_T, num_topk=top_k,
+                hidden=_H, intermediate_hidden=_I, block_m=256, block_n=256, use_mxfp8=True,
             )
-            handle = tuple(aux["handle"])
+            sym_layout = symm.make_sym_layout()
+            handle = tuple(
+                dispatch_prologue(
+                    topk_idx.to(torch.int64), topk_w, sym_layout=sym_layout, num_tokens=_T,
+                    num_topk=top_k, num_experts=epr * world, world_size=world, rank=symm.rank,
+                    experts_per_rank=epr, block_m=256, num_max_pool_tokens=symm.num_max_pool_tokens,
+                )
+            )
+            w1q, w1s = quantize_grouped_weight_mxfp8(w1)
+            xq, xs = quantize_rowwise_mxfp8(x)
+            symm.scoreboard.zero_()
+            torch.cuda.synchronize(); group.barrier()
+            l1 = dispatch_grouped_gemm_mxfp8(xq, xs, w1q, w1s, handle, sym_layout, symm, BM=256, BN=256)
+            dispatch_weights = symm.weight_recv_buf.clone()
+
             dy = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
             grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_impl(
                 dy, w2, group, BackendType.FLYDSL.value, handle=handle, layout="nn", num_dispatch_cu=16,
             )
             _, _, act_weighted = swiglu_backward(
-                grad_swiglu, aux["l1"], scale=aux["dispatch_weights"], return_gate=True, return_act_w=True,
+                grad_swiglu, l1, scale=dispatch_weights, return_gate=True, return_act_w=True,
             )
             group_lens, group_offs = handle[9], handle[10]
             dW2_bf = grouped_gemm_variable_k_impl(
