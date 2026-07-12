@@ -7,7 +7,9 @@ from typing import Optional, Union
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -699,7 +701,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         out = out[:total_m]
@@ -757,7 +759,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         grad_a = grad_a[: ctx.total_m]
@@ -776,7 +778,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
         return grad_a, grad_b, None, None, None, None, None, None, None, None
@@ -875,7 +877,6 @@ def grouped_gemm_fp8(
         # behaviour in ``FP8GroupedGemmBlockFunc.forward``.
         return FP8GroupedGemmBlockFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
-        # MXFP8: raw tensors; quant + grouped GEMM via the Triton MX backend.
         return FP8GroupedGemmMXFunc.apply(
             a_data,
             b_data,
