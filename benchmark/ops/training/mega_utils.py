@@ -465,53 +465,32 @@ def generate_routing(num_tokens, num_topk, num_experts, *, device="cuda", seed=0
 
 
 # --------------------------------------------------------------------------- #
-# Bench helper: warmup, L2 flush, CUDA-event timing; cross-rank variants barrier around scoreboard reset.
+# Bench helper
 # --------------------------------------------------------------------------- #
-_L2_FLUSH_BYTES = 256 * 1024 * 1024  # > gfx950 L2 -> zeroing it evicts the cache
-_L2_FLUSH_BUF = None
 
 
-def _l2_flush():
-    global _L2_FLUSH_BUF
-    if _L2_FLUSH_BUF is None:
-        _L2_FLUSH_BUF = torch.empty(_L2_FLUSH_BYTES // 4, dtype=torch.int32, device="cuda")
-    _L2_FLUSH_BUF.zero_()
+def bench(fn, *, warmup=20, iters=30):
+    """Mean ms/call (CUDA events), copied from deep_ep utils.bench."""
+    # Flush L2 cache with 256 MB data
+    torch.cuda.synchronize()
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
 
+    # Warmup
+    for _ in range(warmup):
+        fn()
 
-def bench(fn, *, warmup=20, iters=30, reset=None, group=None):
-    """Mean ms/call (CUDA events).
+    # Flush L2
+    cache.zero_()
 
-    Cross-rank discipline (group set): barrier BEFORE reset so every rank has
-    finished the previous fn (no in-flight peer signals), zero, then a second
-    barrier so all state is clean before any rank's fn pushes/signals a peer.
-    Skipping the pre-reset barrier races the scoreboard and can deadlock."""
+    # Testing
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-
-    def _iter(start_event=None, end_event=None):
-        if group is not None:
-            torch.cuda.synchronize()
-            group.barrier()  # all ranks done with previous fn
-        if reset is not None:
-            reset()
-        if group is not None:
-            torch.cuda.synchronize()
-            group.barrier()  # all state clean before any fn
-        if start_event is None:
-            fn()
-            return
-        start_event.record()
-        fn()
-        end_event.record()
-
-    for _ in range(warmup):
-        _iter()
-    _l2_flush()
     for i in range(iters):
-        _iter(start_events[i], end_events[i])
+        start_events[i].record()
+        fn()
+        end_events[i].record()
     torch.cuda.synchronize()
 
-    # drop the first timed iter: residual cold-start after the single L2 flush above
     times = np.array([s.elapsed_time(e) for s, e in zip(start_events, end_events)])[1:]
     return np.average(times)
 

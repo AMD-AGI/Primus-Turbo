@@ -11,6 +11,7 @@ This page shows usage of **Primus-Turbo**.
   - [1.4 Mega MoE](#14-mega-moe)
 - [2. Modules](#2-modules)
   - [2.1 Linear](#21-linear)
+  - [2.2 MegaMoE](#22-megamoe)
 - [3. Low-Precision](#3-low-precision)
   - [3.1 Quantization Config](#31-quantization-config)
   - [3.2 FP8 GEMM](#32-fp8-gemm)
@@ -236,6 +237,57 @@ output = model(input)
 print(model)
 print(output)
 print(output.shape)
+```
+
+### 2.2 MegaMoE
+
+`MegaMoE` is an `nn.Module` wrapper over [`mega_moe_fused`](#14-mega-moe). It owns this rank's
+expert shard (`w1` / `w2`), optionally runs an internal router (`top_k` set) or takes external
+`topk_idx` / `topk_weights` (routing-free, `top_k=None`), and can add a shared expert. It only
+supports `bfloat16`. See [README_Mega_MoE](./README_Mega_MoE.md) for the design.
+
+> **Hardware requirements:** `gfx950` or higher, intra-node expert parallelism (one rank per GPU).
+
+```python
+import torch
+import torch.distributed as dist
+
+from primus_turbo.pytorch.modules.moe import MegaMoE
+
+# --- distributed setup (one rank per GPU, intra-node EP) ---
+dist.init_process_group("nccl")
+rank, world = dist.get_rank(), dist.get_world_size()
+torch.cuda.set_device(rank)
+ep_group = dist.new_group(list(range(world)))
+
+H, I, E, K = 7168, 2048, 256, 8   # hidden, intermediate, experts, top-k
+
+# Internal router (top_k set); experts are sharded across the EP group.
+model = MegaMoE(
+    hidden_size=H,
+    intermediate_size=I,
+    num_experts=E,
+    ep_group=ep_group,
+    top_k=K,                       # omit / None -> routing-free (pass topk_idx/weights to forward)
+    score_function="sigmoid",      # or "softmax"
+    routed_scaling_factor=1.0,
+    device="cuda",
+    dtype=torch.bfloat16,
+)
+
+T = 4096
+x = torch.randn(T, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+# Internal routing: module computes topk_idx/topk_weights from its gate.
+y = model(x)                       # [T, H]
+y.sum().backward()
+
+# Optional: also return the internal load-balancing aux loss (training only).
+# y, aux_loss = model(x, return_aux_loss=True)
+
+# Routing-free variant: build with top_k=None and feed routing from upstream.
+# y = model(x, topk_idx=topk_idx, topk_weights=topk_weights)
+# run with torchrun --nproc_per_node=8 --nnodes=1 this_code.py
 ```
 
 ## 3. Low-Precision
