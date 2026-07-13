@@ -186,6 +186,19 @@ grouped_quantize_mxfp4_dual_meta(const at::Tensor input, const at::Tensor group_
                                  const bool rowwise_use_rht, const bool colwise_use_2d_block,
                                  const bool colwise_use_sr, const bool colwise_use_rht);
 
+std::vector<at::Tensor> grouped_quantize_mxfp4(const at::Tensor input, const at::Tensor group_lens,
+                                               const at::Tensor     group_offs,
+                                               const at::ScalarType dest_dtype, const int64_t axis,
+                                               const bool use_2d_block, const bool use_sr,
+                                               const bool use_rht);
+
+std::vector<at::Tensor> grouped_quantize_mxfp4_meta(const at::Tensor     input,
+                                                    const at::Tensor     group_lens,
+                                                    const at::Tensor     group_offs,
+                                                    const at::ScalarType dest_dtype,
+                                                    const int64_t axis, const bool use_2d_block,
+                                                    const bool use_sr, const bool use_rht);
+
 //==================================================================
 //  Shuffle
 //==================================================================
@@ -248,29 +261,23 @@ at::Tensor turbo_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
 
 at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                            at::Tensor &group_offs, const bool transA, const bool transB,
-                           c10::optional<int64_t>    num_cu,
-                           const bool                work_steal,
-                           c10::optional<at::Tensor> ws_counter,
-                           int64_t                   ws_local_per_xcd);
+                           c10::optional<int64_t> num_cu, const bool work_steal,
+                           c10::optional<at::Tensor> ws_counter, int64_t ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                 at::Tensor &group_offs, const bool transA, const bool transB,
-                                c10::optional<int64_t>    num_cu,
-                                const bool                work_steal,
-                                c10::optional<at::Tensor> ws_counter,
-                                int64_t                   ws_local_per_xcd);
+                                c10::optional<int64_t> num_cu, const bool work_steal,
+                                c10::optional<at::Tensor> ws_counter, int64_t ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
-                                      c10::optional<int64_t>    num_cu,
-                                      const bool                work_steal,
+                                      c10::optional<int64_t> num_cu, const bool work_steal,
                                       c10::optional<at::Tensor> ws_counter,
                                       int64_t                   ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                            at::Tensor &group_offs, const bool transA,
-                                           const bool                transB,
-                                           c10::optional<int64_t>    num_cu,
+                                           const bool transB, c10::optional<int64_t> num_cu,
                                            const bool                work_steal,
                                            c10::optional<at::Tensor> ws_counter,
                                            int64_t                   ws_local_per_xcd);
