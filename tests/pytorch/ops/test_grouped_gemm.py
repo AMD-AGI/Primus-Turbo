@@ -484,3 +484,63 @@ def test_ck_grouped_gemm_op_ws_num_cu_below_num_xcds(num_cu):
         a, b, group_lens, group_offs, False, True, num_cu, True, counter, local_per_xcd
     )
     torch.testing.assert_close(out_ref, out_ws, rtol=0.0, atol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Over-allocated output tail must be zeroed (mirrors the FP8/FP4 sibling tests).
+# ---------------------------------------------------------------------------
+def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
+    """Fill and free caching-allocator blocks of ``shape`` with ``sentinel`` so a
+    subsequent same-shape allocation reuses a dirty (non-zero) block instead of a
+    fresh, driver-zeroed page. Lets us detect output regions the kernel never wrote."""
+    blocks = [torch.full(shape, sentinel, dtype=dtype, device=device) for _ in range(n)]
+    for x in blocks:
+        x.add_(0.0)
+    del blocks
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("trans_b", [True, False])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+def test_grouped_gemm_padded_tail_zeroed(dtype, trans_b, backend):
+    """Over-allocated output tail [sum(group_lens):M_total] must be zeroed, not left as
+    caching-allocator garbage."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    torch.manual_seed(42)
+    device = "cuda:0"
+    G, K, N = 8, 2048, 2880
+    group_lens = torch.tensor([4096, 0, 3072, 0, 0, 5120, 0, 0], dtype=torch.int64, device=device)
+    S = int(group_lens.sum())
+    PAD = 224
+    M_total = S + PAD  # simulate over-allocated (fixed-capacity permute) activation rows
+    sentinel = 12288.0  # exactly representable in bf16 and fp16
+    print(f"\ndtype={dtype}, trans_b={trans_b}, backend={backend}, S={S}, M_total={M_total}")
+
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+
+    b_shape = (G, N, K) if trans_b else (G, K, N)
+    a = torch.randn((M_total, K), dtype=dtype, device=device)
+    b = torch.randn(b_shape, dtype=dtype, device=device)
+
+    # Warm up (JIT/autotune), then poison the pool so any unwritten padding rows
+    # surface the sentinel instead of a fresh zeroed page.
+    grouped_gemm(a, b, group_lens, trans_b=trans_b)
+    torch.cuda.synchronize()
+    _poison_alloc_pool((M_total, N), dtype, device, sentinel)
+
+    out = grouped_gemm(a, b, group_lens, trans_b=trans_b)
+    torch.cuda.synchronize()
+
+    pad_tail = out[S:M_total]
+    assert torch.isfinite(pad_tail).all(), f"{backend.name}: padding tail non-finite"
+    torch.testing.assert_close(
+        pad_tail,
+        torch.zeros_like(pad_tail),
+        rtol=0.0,
+        atol=0.0,
+        msg=f"{backend.name}: padding tail [{S}:{M_total}] must be zeroed",
+    )
+
+    GlobalBackendManager.reset()

@@ -34,6 +34,9 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_mxfp8_triton_kernel,
     grouped_gemm_mxfp8_variable_k_triton_kernel,
 )
+from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+    grouped_gemm_output_tail_kernel,
+)
 
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
@@ -848,7 +851,12 @@ def grouped_gemm_fp8_impl(
         group_offs_out=group_offs_out,
     )
 
-    return GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    # Over-allocated output: zero the unwritten tail past the tight write bound
+    # (group_offs_out for MX; group_offs otherwise) so the caller's [:total_m]
+    # slice never exposes uninitialized rows.
+    out = grouped_gemm_output_tail_kernel(out, group_offs_out if group_offs_out is not None else group_offs)
+    return out
 
 
 @_torch_custom_op_wrapper(
