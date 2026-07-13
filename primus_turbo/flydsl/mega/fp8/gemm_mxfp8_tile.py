@@ -27,6 +27,7 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
@@ -36,6 +37,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     ScaleS2R,
     StoreCPerTensor,
     _emit_if_then,
+    _lds_barrier,
     ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor_rebased,
@@ -45,6 +47,12 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 
 BLOCK_K = 128  # fp8 mxfp8 contraction tile (16x16x128 MMA spans K=128 = 4 E8M0 micro-blocks)
+
+# LDS row-stride padding (i32) for the staged A-scale (Plan A). K128 is a power of two, so a
+# [BLOCK_M, K128] row-major LDS layout makes the per-sub-tile stride-K128 read collide on 2
+# banks (8-way conflict). Padding the stride to an odd value coprime with 32 spreads the 16
+# lanes across 16 banks (conflict-free) at ~0 extra LDS.
+_SC_LDS_STRIDE_PAD = 1
 
 
 class ScaleS2RRaw:
@@ -80,6 +88,144 @@ class ScaleS2RRaw:
             bg = b | (b << fx.Int32(8)) | (b << fx.Int32(16)) | (b << fx.Int32(24))
             out.append(bg.ir_value())
         return out
+
+
+def _lds_scale_n_windows(K, kt):
+    """Number of KT-windows (kt=0 -> whole-K single window) and double-buffer count."""
+    K128 = K // 128
+    KT = kt if kt else K128
+    n_windows = (K128 + KT - 1) // KT
+    n_buf = 2 if n_windows > 1 else 1  # double-buffer only when streaming
+    return KT, n_windows, n_buf
+
+
+class StreamScaleLDS:
+    """Plan-A double-buffered streaming raw-E8M0 A-scale loader.
+
+    Keeps a KT-window of the tile's raw E8M0 A-scale (i32 [BLOCK_M, KT], padded) resident in
+    LDS and reads it broadcast-on-the-fly (byte-0 only; MMA opsel=0). To hide HBM latency it
+    **prefetches the next window's raw scale into registers during the current window's MFMA**
+    and **commits** it (ds_write) at the window boundary into the other of two LDS buffers --
+    the same overlap the fp8 data prefetch uses. KT == K//128 (n_windows==1) degenerates to
+    whole-K resident (single buffer, staged once in the prologue, no in-loop refill).
+
+    Keeping RAW bytes (broadcast-on-read) costs 1/4 the LDS of the ScaleS2R broadcast layout;
+    the KT-window footprint is K-independent so K=7168 fits (whole-K would be 56 KB)."""
+
+    def __init__(self, sc_lds, scale_res, row_base, n_rows, KT, K128, n_windows, n_buf, n_tiles, tid, BLK):
+        self.lds = sc_lds
+        self.scale_res = scale_res
+        self.row_base = row_base
+        self.n_rows = n_rows
+        self.KT = KT
+        self.K128 = K128
+        self.n_windows = n_windows
+        self.n_buf = n_buf
+        self.n_tiles = n_tiles
+        self.tid = tid
+        self.BLK = BLK
+        self.stride = KT + _SC_LDS_STRIDE_PAD  # padded row stride within a window (bank-conflict-free)
+        self.buf_stride = n_rows * self.stride  # i32 per double-buffer slot
+        self.lane = fx.thread_idx.x % 64
+        self.VEC = 4 if (KT % 8 == 0) else (2 if (KT % 4 == 0) else 1)
+        self.n_vec = (n_rows * KT) // self.VEC
+        assert self.n_vec % BLK == 0, f"scale window {n_rows*KT}/{self.VEC} not divisible by {BLK}"
+        self._pending = None  # regs prefetched for the next window (list of (lds_off, vals))
+
+    def _buf_off(self, w):
+        return ((w & 1) if self.n_buf == 2 else 0) * self.buf_stride
+
+    def _prefetch(self, w):
+        """Issue window w's HBM loads into registers (no ds_write yet). Returns [(lds_off, vals)]."""
+        VEC = self.VEC
+        regs = []
+        buf_off = self._buf_off(w)
+        for it in range_constexpr(self.n_vec // self.BLK):
+            vb = self.tid + fx.Int32(it * self.BLK)
+            base_idx = vb * fx.Int32(VEC)
+            row = base_idx // fx.Int32(self.KT)
+            lk = base_idx % fx.Int32(self.KT)
+            grow = self.row_base + row
+            vals = _buffer_ops.buffer_load(
+                self.scale_res, grow * fx.Int32(self.K128) + fx.Int32(w * self.KT) + lk,
+                vec_width=VEC, dtype=T.i32,
+            )
+            regs.append((fx.Int32(buf_off) + row * fx.Int32(self.stride) + lk, vals))
+        return regs
+
+    def _commit(self, regs, drain_vm):
+        for (lds_off, vals) in regs:
+            if self.VEC == 1:
+                fx.make_view(fx.add_offset(self.lds.ptr, fx.make_int_tuple(lds_off)), fx.make_layout(1, 1)).store(
+                    Vec.from_elements([fx.Int32(vals)], fx.Int32)
+                )
+            else:
+                vv = Vec(vals)
+                for j in range_constexpr(self.VEC):
+                    fx.make_view(
+                        fx.add_offset(self.lds.ptr, fx.make_int_tuple(lds_off + fx.Int32(j))), fx.make_layout(1, 1)
+                    ).store(Vec.from_elements([fx.Int32(vv[j])], fx.Int32))
+        # prologue commit fully drains (no fp8 in flight yet); in-loop commits wait only lgkmcnt
+        # (their own LDS writes) so they do NOT drain the fp8 prefetch vmcnt pipeline.
+        asm = "s_waitcnt vmcnt(0) lgkmcnt(0)\ns_barrier" if drain_vm else "s_waitcnt lgkmcnt(0)\ns_barrier"
+        _llvm.inline_asm(res=None, operands_=[], asm_string=asm, constraints="", has_side_effects=True)
+
+    def start(self):
+        """Prologue: commit window 0 (full drain) + prefetch window 1 into registers."""
+        self._commit(self._prefetch(0), drain_vm=True)
+        self._pending = self._prefetch(1) if self.n_windows > 1 else None
+
+    def advance(self, w):
+        """Window boundary entering window w (w>=1): commit the prefetched window w (its HBM
+        loads overlapped the previous window's MFMA), then prefetch window w+1."""
+        self._commit(self._pending, drain_vm=False)
+        self._pending = self._prefetch(w + 1) if (w + 1) < self.n_windows else None
+
+    def load(self, base, k):
+        lk = k % self.KT  # window-local K-iter (k compile-time in the range_constexpr loop)
+        buf_off = self._buf_off(k // self.KT)
+        r = self.lane % 16
+        sh = (self.lane // 16) * fx.Int32(8)  # byte select = micro-block (lane//16)
+        out = []
+        for i in range_constexpr(self.n_tiles):
+            row = base + fx.Int32(i * 16) + r
+            off = fx.Int32(buf_off) + row * fx.Int32(self.stride) + lk
+            val = Vec(
+                fx.make_view(fx.add_offset(self.lds.ptr, fx.make_int_tuple(off)), fx.make_layout(1, 1)).load()
+            )
+            # byte-0 only: MMA runs opsel=0 -> samples byte 0; `& 0xFF` zeroes the high bytes.
+            b = (fx.Int32(val[0]) >> sh) & fx.Int32(0xFF)
+            out.append(b.ir_value())
+        return out
+
+
+def make_mxfp8_shared_storage_lds_scale(BLOCK_M, BLOCK_N, K, kt=0):
+    """Like ``make_mxfp8_shared_storage`` but adds an ``A_sc_lds`` region holding ONE KT-window
+    of the tile's raw E8M0 A-scale (i32 [BLOCK_M, KT], padded) for the Plan-A ``a_scale_lds``
+    path. ``kt`` = window K-iters resident (0 -> whole K = K//128). Streaming (kt < K//128)
+    makes the footprint K-independent so K=7168 fits, and DOUBLE-BUFFERS (2 windows) to overlap
+    the next window's refill with MFMA: A_sc_lds = n_buf*BLOCK_M*(kt+pad)*4 bytes (2*9 KB @ kt=8)
+    vs whole-K 56 KB @ K=7168. fp8 ping-pong = 128 KB (BM=BN=256)."""
+    LDS_BLOCK_M = BLOCK_M // 2
+    LDS_BLOCK_N = BLOCK_N // 2
+    a_lds = LDS_BLOCK_M * BLOCK_K
+    b_lds = LDS_BLOCK_N * BLOCK_K
+    KT, _n_windows, n_buf = _lds_scale_n_windows(K, kt)
+    a_sc = n_buf * BLOCK_M * (KT + _SC_LDS_STRIDE_PAD)  # padded row stride; double-buffered if streaming
+
+    @fx.struct
+    class SharedStorage:
+        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        A_sc_lds: fx.Array[fx.Int32, a_sc, 16]
+
+    return SharedStorage
 
 
 def make_mxfp8_shared_storage(BLOCK_M, BLOCK_N):
@@ -125,6 +271,8 @@ def gemm_mxfp8_nt_tile(
     out_fp16=False,
     nt_vmcnt=3,
     preshuffled=False,
+    a_scale_lds=False,  # Plan A: stage raw A-scale into LDS in the prologue, read from LDS
+    a_scale_lds_kt=0,  # Plan A streaming: LDS-resident A-scale window in K-iters (0 = whole K)
     c_cache_modifier=0,  # 16 (sc1) = write-through C store for a fused combine reader
     store_c=None,  # inject a store epilogue (e.g. StoreCQuantMxfp8CShuffle for fp8-combine L2)
 ):
@@ -192,7 +340,27 @@ def gemm_mxfp8_nt_tile(
     a_s2r = S2RLoader(wave_m, N_TILES_A)
     b_s2r = S2RLoader(wave_n, N_TILES_B)
 
-    if preshuffled:
+    if a_scale_lds:
+        # Plan A: A-scale staged raw into LDS + read from LDS; B preshuffled (ScaleBComb) since
+        # weights are static. A_SCALE_RES = RAW A-scale buffer resource (int32 [c_m, K//128]);
+        # B_SCALE_RES = combined b_sp tensor. sa bases are tile-LOCAL.
+        #   whole-K resident: KT = K_ITERS (one window, staged once in the prologue).
+        #   streaming: KT < K_ITERS (K-independent LDS, double-buffered; the K-loop commits the
+        #   prefetched next window at each boundary so K=7168 fits). Requires KT | K_ITERS.
+        A_SC_KT, A_SC_NWIN, A_SC_NBUF = _lds_scale_n_windows(K, a_scale_lds_kt)
+        assert K_ITERS % A_SC_KT == 0, f"a_scale_lds_kt {A_SC_KT} must divide K_ITERS {K_ITERS}"
+        sa_s2r = StreamScaleLDS(
+            lds.A_sc_lds, A_SCALE_RES, m_row, BLOCK_M, A_SC_KT, K_ITERS, A_SC_NWIN, A_SC_NBUF,
+            N_TILES_A, fx.thread_idx.x, 512,
+        )
+        sa_s2r.start()  # window 0 resident + window 1 prefetched into regs before the K-loop
+        sb_s2r = ScaleBComb(B_SCALE_RES, G * c_n, K)
+
+        def load_sb(k):
+            allv = sb_s2r.load(sb_base0, k)
+            return allv[0:2], allv[2:4]
+
+    elif preshuffled:
         sa_s2r = ScaleS2R(A_SCALE_RES, c_m, K, N_TILES_A)  # A_SCALE_RES = broadcast a_sp tensor
         sb_s2r = ScaleBComb(B_SCALE_RES, G * c_n, K)        # B_SCALE_RES = combined b_sp tensor
 
@@ -214,8 +382,12 @@ def gemm_mxfp8_nt_tile(
 
     wave_m_offset = wave_m * (N_TILES_A * 16)
     wave_n_offset = wave_n * (N_TILES_B * 16)
-    sa_base0 = fx.Int32(m_row + wave_m_offset)
-    sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
+    if a_scale_lds:  # A-scale read from LDS -> tile-LOCAL row base (global base minus m_row)
+        sa_base0 = fx.Int32(wave_m_offset)
+        sa_base1 = fx.Int32(wave_m_offset + LDS_BLOCK_M)
+    else:
+        sa_base0 = fx.Int32(m_row + wave_m_offset)
+        sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
     sb_base0 = fx.Int32(group_idx * c_n + block_n * BLOCK_N + wave_n_offset)
     sb_base1 = sb_base0 + fx.Int32(LDS_BLOCK_N)
 
@@ -240,6 +412,8 @@ def gemm_mxfp8_nt_tile(
     sb0, sb1 = load_sb(0)
 
     for k in range_constexpr(K_ITERS - 2):
+        if a_scale_lds and A_SC_KT < K_ITERS and (k + 1) % A_SC_KT == 0:
+            sa_s2r.advance((k + 1) // A_SC_KT)  # commit prefetched next window (overlapped), prefetch w+1
         sa0n = sa_s2r.load(sa_base0, k + 1)
         b0f = b_s2r.load(b_cur0)
         a0f = a_s2r.load(a_cur0)
@@ -451,6 +625,65 @@ def dense_mxfp8_tile_gemm_ps(a_fp8, a_sp, b_fp8, b_sp, *, num_xcd=1):
     launch = _compile_dense_mxfp8_tile_ps_test(M, N, K, num_xcd=num_xcd, cbsz=cbsz, blgp=blgp)
     args = (A, a_sp, B, b_sp, C.view(-1), N, torch.cuda.current_stream())
     ck = (M, N, K, num_xcd, cbsz, blgp, "ps")
+    compiled = _DENSE_TILE_COMPILED.get(ck)
+    if compiled is None:
+        compiled = flyc.compile(launch, *args)
+        _DENSE_TILE_COMPILED[ck] = compiled
+    compiled(*args)
+    return C
+
+
+@functools.lru_cache(maxsize=16)
+def _compile_dense_mxfp8_tile_lds_test(M, N, K, BLOCK_M=256, BLOCK_N=256, num_xcd=1, cbsz=0, blgp=0, kt=0):
+    """Dense mxfp8 tile test with the Plan-A LDS A-scale path (``a_scale_lds=True``): A_SC =
+    RAW E8M0 int32 [M, K//128] staged into LDS in the GEMM prologue; B_SP = preshuffled
+    ScaleBComb b_sp (weights static). ``kt`` = streaming window K-iters (0 = whole-K resident).
+    Validates the StreamScaleLDS read + prologue stage (+ double-buffered refill when kt>0)."""
+    assert M % BLOCK_M == 0 and N % BLOCK_N == 0
+    K32 = K // 32
+    SharedStorage = make_mxfp8_shared_storage_lds_scale(BLOCK_M, BLOCK_N, K, kt=kt)
+    n_blocks = N // BLOCK_N
+    total = (M // BLOCK_M) * n_blocks
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def kern(A: fx.Tensor, A_SC: fx.Tensor, B: fx.Tensor, B_SP: fx.Tensor, C: fx.Tensor, c_n: fx.Int32):
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        pid = xcd_remap_pid(fx.block_idx.x, total, num_xcd)
+        block_m = pid // fx.Int32(n_blocks)
+        block_n = pid % fx.Int32(n_blocks)
+        a_sc_res = _buffer_ops.create_buffer_resource(A_SC, max_size=False, num_records_bytes=M * K32)
+        gemm_mxfp8_nt_tile(
+            A, a_sc_res, B, B_SP, C, fx.Int32(M), c_n, lds, block_m, block_n,
+            K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, G=1, group_idx=fx.Int32(0),
+            cbsz=cbsz, blgp=blgp, a_scale_lds=True, a_scale_lds_kt=kt,
+        )
+
+    @flyc.jit
+    def launch(A, A_SC, B, B_SP, C, c_n: int, stream: fx.Stream = fx.Stream(None)):
+        kern(A, A_SC, B, B_SP, C, c_n, value_attrs=make_value_attrs(2, 0, "512,512")).launch(
+            grid=(total, 1, 1), block=(512, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def dense_mxfp8_tile_gemm_lds(a_fp8, a_scale, b_fp8, b_sp, *, num_xcd=1, kt=0):
+    """Dense mxfp8 NT GEMM via ``gemm_mxfp8_nt_tile(a_scale_lds=True)`` (Plan A). ``a_scale``
+    = RAW E8M0 [M, K//32] (uint8); staged into LDS in the prologue. ``b_sp`` = B scale in the
+    ScaleBComb layout (from ``preshuffle_b_scale``). ``kt`` = streaming window K-iters (0 =
+    whole-K resident). Test-only (validates the LDS scale path)."""
+    M, K = a_fp8.shape
+    N, Kb = b_fp8.shape
+    assert K == Kb
+    cbsz = 1 if a_fp8.dtype == torch.float8_e5m2 else 0
+    blgp = 1 if b_fp8.dtype == torch.float8_e5m2 else 0
+    A = a_fp8.contiguous().view(torch.int8)
+    B = b_fp8.contiguous().view(torch.int8)
+    A_SC = a_scale.contiguous().view(torch.uint8).view(torch.int32).reshape(-1)
+    C = torch.empty((M, N), dtype=torch.bfloat16, device=a_fp8.device)
+    launch = _compile_dense_mxfp8_tile_lds_test(M, N, K, num_xcd=num_xcd, cbsz=cbsz, blgp=blgp, kt=kt)
+    args = (A, A_SC, B, b_sp, C.view(-1), N, torch.cuda.current_stream())
+    ck = (M, N, K, num_xcd, cbsz, blgp, "lds", kt)
     compiled = _DENSE_TILE_COMPILED.get(ck)
     if compiled is None:
         compiled = flyc.compile(launch, *args)
