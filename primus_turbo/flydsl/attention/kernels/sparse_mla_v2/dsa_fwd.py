@@ -13,7 +13,6 @@ from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import T as _FTY  # kernel arg `T` (token count) shadows this name
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
@@ -41,7 +40,8 @@ DT = D // 16            # 32 PV d-tiles
 
 def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0, pool_cr=0, pf_pv=4,
               single_buffer=False, xcd_remap=0, peel=False, hoist_sink=True,
-              fused_store=False, pv_early=False, pf_qk=3, dyn_pool=False, bh=BLOCK_H, pstore=False):
+              fused_store=False, pv_early=False, pf_qk=3, dyn_pool=False, bh=BLOCK_H, pstore=False,
+              fast_path=True):
     elem = fx.BFloat16
     # Per-build head-block: bh=128 (1 WG/token, 8 waves) collapses the two bh=64 WGs that
     # each redundantly gather+store the SAME shared MLA latent to LDS, halving KV store work.
@@ -66,6 +66,12 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
     # single_buffer: one KV LDS tile + an extra WAR barrier per tile (pro many-tile gather
     # only). pstore uses 4 parity buffers.
     NBUF = 4 if pstore else (1 if (single_buffer and not pvk32) else 2)
+    # fast_path (first-pair fixed-max): default-ON accelerated softmax for the rescale-bound cr4
+    # shapes (pro cr4 = plain path, flash cr4 = pstore path; both pvk32/non-banded). softmax is
+    # shift-invariant so using the first pair's row-max as a fixed bound is math-exact; the fixed
+    # alpha=1 lets the compiler fold the per-tile o*=alpha rescale -> nomax speed at higher
+    # precision. Banded (cr0/cr128) are gather/memory-bound (no rescale head, measured) so left out.
+    _fmax0 = bool(fast_path and pvk32 and not banded)
     allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_fwd_smem")
     kv_off = allocator._align(allocator.ptr, 16)
     mask_off = allocator._align(kv_off + NBUF * LDS_ELEMS * 2, 16)
@@ -124,6 +130,7 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
         c_neg_inf = fx.Float32(float("-inf"))
         c_big_neg = fx.Float32(-3.0e38)  # finite running-max init: avoids -inf-(-inf)=NaN
         c_zero = fx.Float32(0.0)
+        _mb = [c_zero]   # fixed-max per-row bound holder (set by the fast_path first-pair pre-step)
 
         # ---- Q register-resident (A operand): head=head_A ----
         q_row = token * Hn * fx.Index(DQK) + head_A * fx.Index(DQK)
@@ -232,11 +239,12 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
         PF_PV = pf_pv
 
         # ---- QK / softmax / PV compute closures ----
-        def _qk_s(buf_off):
+        def _qk_s(buf_off, kvp=None):
             # QK over full K=512 for the KV tile at LDS[buf_off]; returns the 4 per-lane
             # scores S[head=lo, kv=grp*4+i] (mask not yet added).
+            _kvp = lds_kv if kvp is None else kvp
             def _bv(ks):
-                return Vec.load(v8, lds_kv, [buf_off + lo * fx.Index(STRIDE) + _swz(fx.Index(ks * 32) + grp * fx.Index(8), lo)])
+                return Vec.load(v8, _kvp, [buf_off + lo * fx.Index(STRIDE) + _swz(fx.Index(ks * 32) + grp * fx.Index(8), lo)])
             bvq = [_bv(k) for k in range_constexpr(PF_QK)]
             if const_expr(qk2):
                 # 2-accumulator: split the 16-deep MFMA RAW chain into two 8-deep
@@ -301,7 +309,7 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
             lo_d4 = lo // fx.Index(4)
             lo_m4 = lo % fx.Index(4)
             pv_base = fx.Int64(
-                (fx.Index(buf_off) + (grp * fx.Index(4) + lo_d4) * fx.Index(D_LDS) + lo_m4 * fx.Index(4))
+                (fx.Index(buf_off) + (grp * fx.Index(4) + lo_d4) * fx.Index(STRIDE) + lo_m4 * fx.Index(4))
                 * fx.Index(2) + fx.Index(kv_off))
 
             trq = [_tr(pv_base, dt) for dt in range_constexpr(PF_PV)]
@@ -338,6 +346,19 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
             # same m_new (no alpha-fold), deferred kv-sum (per-grp partial).
             sa = [s_a[i] + fx.Float32(_raw(Vec(mask_a)[i])) for i in range_constexpr(4)]
             sb = [s_b[i] + fx.Float32(_raw(Vec(mask_b)[i])) for i in range_constexpr(4)]
+            if const_expr(_fmax0):
+                # fixed-max: P=exp2((S - m_bound)*c_sl), alpha=const 1.0 -> compiler FOLDS the
+                # o*=alpha rescale (that fold, not a skip, is why fixed-max hits nomax speed).
+                # _mb[0] = the first-pair max bound set by the fast_path pre-step.
+                one = fx.Float32(1.0); mb = _mb[0]
+                p_a = [fx.Float32(rocdl.exp2(fx.Float32.ir_type, _raw((sa[i] - mb) * c_sl))) for i in range_constexpr(4)]
+                p_b = [fx.Float32(rocdl.exp2(fx.Float32.ir_type, _raw((sb[i] - mb) * c_sl))) for i in range_constexpr(4)]
+                lsum = p_a[0]
+                for i in range_constexpr(1, 4):
+                    lsum = fx.Float32(arith.AddFOp(_raw(lsum), _raw(p_a[i])).result)
+                for i in range_constexpr(4):
+                    lsum = fx.Float32(arith.AddFOp(_raw(lsum), _raw(p_b[i])).result)
+                return mb, one, p_a, p_b, fx.Float32(l_run + lsum)   # m=mb so lse=mb+log(l) correct
             lmax = sa[0]
             for i in range_constexpr(1, 4):
                 lmax = fx.Float32(arith.MaxNumFOp(_raw(lmax), _raw(sa[i])).result)
@@ -356,10 +377,10 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
             l_new = fx.Float32(alpha * l_run + lsum)
             return m_new, alpha, p_a, p_b, l_new
 
-        def _v32_base(buf_a, buf_b):
+        def _v32_base(buf_a, buf_b, koff=kv_off):
             lo_d4 = lo // fx.Index(4); lo_m4 = lo % fx.Index(4)
             def _base(bo):
-                return fx.Int64((fx.Index(bo) + (grp * fx.Index(4) + lo_d4) * fx.Index(D_LDS) + lo_m4 * fx.Index(4)) * fx.Index(2) + fx.Index(kv_off))
+                return fx.Int64((fx.Index(bo) + (grp * fx.Index(4) + lo_d4) * fx.Index(STRIDE) + lo_m4 * fx.Index(4)) * fx.Index(2) + fx.Index(koff))
             return _base(buf_a), _base(buf_b)
 
         def _v32(base_a, base_b, dt):
@@ -372,6 +393,7 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
         def _pv_o_k32(base_a, base_b, trq, p_a, ab, p_b, aprod, o_acc):
             # PV K=32 over 2 tiles: o = o*aprod + [p_a*ab | p_b] @ [V_a | V_b].
             # trq = PF_PV prefetched V32 (read before softmax to overlap its VALU bridge).
+            # fast_path/fixed-max: aprod is const 1.0 -> the compiler folds o*=aprod (rescale-free).
             pB = _raw(Vec.from_elements(
                 [fx.BFloat16(_raw(p_a[i] * ab)) for i in range_constexpr(4)]
                 + [fx.BFloat16(_raw(p_b[i])) for i in range_constexpr(4)], elem))
@@ -380,10 +402,8 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
             for dt in range_constexpr(DT):
                 if dt + PF_PV < DT:
                     trq.append(_v32(base_a, base_b, dt + PF_PV))
-                o_r = Vec(o_acc[dt]) * Vec(aprod_v)
-                new_o[dt] = rocdl.mfma_f32_16x16x32_bf16(v4f, [trq[dt], pB, o_r])
+                new_o[dt] = rocdl.mfma_f32_16x16x32_bf16(v4f, [trq[dt], pB, Vec(o_acc[dt]) * Vec(aprod_v)])
             return new_o
-
 
         # ---- Epilogue closures (shared by the plain and peeled paths) ----
         def _epi_scalars(m_run, l_run):
@@ -464,6 +484,20 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
             kv1 = gather_load(idxB0)
             gather_store(kv0, idxA0, fx.Index(0), fx.Index(0))      # prologue: pair0 -> bufs 0,1
             gather_store(kv1, idxB0, LE, MK)
+            if const_expr(_fmax0):
+                # fast_path: first-pair fixed-max bound (see plain path). Pair0 is already in bufs
+                # {0,LE}; QK it once for the crossgrp-max -> _mb[0], then the loop's _softmax32 runs
+                # the fixed-max branch (alpha=1 folded -> rescale-free, nomax speed, high precision).
+                gpu.barrier()
+                sa_f0 = _qk_s(fx.Index(0)); sb_f0 = _qk_s(LE)
+                ma_f0 = Vec.load(v4f, lds_mask, [grp * fx.Index(4)])
+                mb_f0 = Vec.load(v4f, lds_mask, [MK + grp * fx.Index(4)])
+                lm_f0 = c_big_neg
+                for i in range_constexpr(4):
+                    lm_f0 = fx.Float32(arith.MaxNumFOp(_raw(lm_f0), _raw(sa_f0[i] + fx.Float32(_raw(Vec(ma_f0)[i])))).result)
+                for i in range_constexpr(4):
+                    lm_f0 = fx.Float32(arith.MaxNumFOp(_raw(lm_f0), _raw(sb_f0[i] + fx.Float32(_raw(Vec(mb_f0)[i])))).result)
+                _mb[0] = crossgrp_max(lm_f0)
             idx2 = load_topk(TWO * MK)
             idx3 = load_topk(fx.Index(3) * MK)
             xinit = [c_big_neg, c_zero] + [c_zero_v4 for _ in range_constexpr(DT)] + [idx2, idx3]
@@ -500,6 +534,25 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
             m_f, l_t, lp, scal = _epi_scalars(m_run, l_sum)
             _write_out(m_f, l_t, lp, scal, o_acc)
         if const_expr(pvk32 and not pstore):
+            if const_expr(_fmax0):
+                # CHEAP fixed-max: bound = crossgrp-max over the FIRST pair only (1 QK, no full
+                # pre-pass). softmax is shift-invariant so any bound is mathematically exact; the
+                # main pass then runs at nomax speed (alpha=1 folded) with far better precision
+                # than no-max (pair-0 max already caps the bulk of the score range).
+                gather_store(kv0, idxA0, fx.Index(0), fx.Index(0))
+                kv1_f0 = gather_load(idxB0)
+                gather_store(kv1_f0, idxB0, fx.Index(LDS_ELEMS), fx.Index(TILE_K))
+                gpu.barrier()
+                sa_f0 = _qk_s(fx.Index(0)); sb_f0 = _qk_s(fx.Index(LDS_ELEMS))
+                ma_f0 = Vec.load(v4f, lds_mask, [grp * fx.Index(4)])
+                mb_f0 = Vec.load(v4f, lds_mask, [fx.Index(TILE_K) + grp * fx.Index(4)])
+                lm_f0 = c_big_neg
+                for i in range_constexpr(4):
+                    lm_f0 = fx.Float32(arith.MaxNumFOp(_raw(lm_f0), _raw(sa_f0[i] + fx.Float32(_raw(Vec(ma_f0)[i])))).result)
+                for i in range_constexpr(4):
+                    lm_f0 = fx.Float32(arith.MaxNumFOp(_raw(lm_f0), _raw(sb_f0[i] + fx.Float32(_raw(Vec(mb_f0)[i])))).result)
+                _mb[0] = crossgrp_max(lm_f0)
+                gpu.barrier()
             # 2-tile-batch PV K=32 (non-banded)
             idx2 = load_topk(fx.Index(2) * fx.Index(TILE_K))
             idx3 = load_topk(fx.Index(3) * fx.Index(TILE_K))
@@ -630,13 +683,15 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
                 m_f, l_t, lp, scal = _epi_scalars(m_run, l_sum)
                 _write_out(m_f, l_t, lp, scal, o_acc)
 
+    _launch_kw = {}
+
     @flyc.jit
     def launch(Q, KV, TOPK, SINK, O, LSE, T, H, NKV, stream):
         allocator.finalized = False
         with ir.InsertionPoint(CompilationContext.get_current().gpu_module_body):
             allocator.finalize()
         gy = fx.Index(H) // fx.Index(BLOCK_H)
-        k_fn(Q, KV, TOPK, SINK, O, LSE, T, H, NKV).launch(
+        k_fn(Q, KV, TOPK, SINK, O, LSE, T, H, NKV, **_launch_kw).launch(
             grid=(fx.Index(T), gy, 1), block=(THREADS, 1, 1), stream=stream)
 
     def _compile(*a):
@@ -655,17 +710,19 @@ _FWD_CACHE: dict = {}
 
 def _get_fwd(topk_len, scale, has_sink, banded=False, qk2=False, pool_P=0, pool_cr=0, pf_pv=4,
              single_buffer=False, xcd_remap=0, peel=False, hoist_sink=True,
-             fused_store=False, pv_early=False, pf_qk=3, dyn_pool=False, bh=64, pstore=False):
+             fused_store=False, pv_early=False, pf_qk=3, dyn_pool=False, bh=64, pstore=False,
+             fast_path=True):
     key = (topk_len, float(scale), bool(has_sink), bool(banded), bool(qk2), int(pool_P), int(pool_cr),
            int(pf_pv), bool(single_buffer), int(xcd_remap), bool(peel), bool(hoist_sink),
-           bool(fused_store), bool(pv_early), int(pf_qk), bool(dyn_pool), int(bh), bool(pstore))
+           bool(fused_store), bool(pv_early), int(pf_qk), bool(dyn_pool), int(bh), bool(pstore),
+           bool(fast_path))
     fn = _FWD_CACHE.get(key)
     if fn is None:
         fn = build_fwd(topk_len, float(scale), has_sink=has_sink, banded=banded, qk2=qk2,
                        pool_P=pool_P, pool_cr=pool_cr, pf_pv=pf_pv, single_buffer=single_buffer,
                        xcd_remap=xcd_remap, peel=peel, hoist_sink=hoist_sink,
                        fused_store=fused_store, pv_early=pv_early, pf_qk=pf_qk, dyn_pool=dyn_pool, bh=bh,
-                       pstore=pstore)
+                       pstore=pstore, fast_path=fast_path)
         _FWD_CACHE[key] = fn
     return fn
 
