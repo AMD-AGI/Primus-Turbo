@@ -94,6 +94,32 @@ through publishes to the coherent point; gemm invalidate+refill sees it fresh). 
   SharedAllocator per kernel, so put the tile IN the same struct (not a 2nd allocate()).
 - Switches: PT_MXFP8_PS_COALESCE=1, PT_MXFP8_PS_RELEASE=1 (now default in dispatch_grouped_gemm_mxfp8_bwd).
 
+## STEP1-bwd CU split: re-tune AFTER a role gets cheaper — the optimum MOVES (ndcu=16 -> 24)
+The old "ndcu=16/pscu=16 best" was measured on the pre-write-through kernel. After Round 3 made the
+preshuffle role cheap, the optimum shifted to **ndcu=24, pscu=8** (-5.2% load_balanced, -2.0%
+round_robin, cos PASS both). Lessons:
+- ndcu MUST be a MULTIPLE OF 8 (= #XCDs on MI355X). ndcu=20 is a hard CLIFF (2.25 ms vs 1.72 at 24,
+  reproduced twice) — uneven comm-block distribution across XCDs. Only sweep ndcu in {16,24,32,...}.
+- ndcu=24 beat 16 and 32 (16->1.82, 24->1.72, 32->1.88): 24 lowers the comm floor without over-
+  starving the (now-cheaper) gemm; 32 starves it.
+- pscu is INSENSITIVE once preshuffle is cheap (pscu 4/8/12/16 at ndcu=24 all ~1.73); pick the small
+  end (pscu=8) — it frees CUs for the more gemm-exposed round_robin case (RR: 24/8=1.567 vs 24/12=1.605).
+- GENERAL LESSON: whenever a pipeline role's cost changes materially, RE-SWEEP the CU split — a prior
+  "optimal" split is stale. The benefit is comm-volume-dependent but 24/8 improved BOTH tested dists.
+
+## The STEP1 comm (push) floor is XGMI-WRITE-BANDWIDTH-bound (counter-confirmed) — no fence lever
+An earlier tip asserted STEP1 is comm-bandwidth-bound from wall-time alone; rocprofv3 EA/GMI counters
+now PROVE it. Single-rank, comm-only (diag8): `TCC_EA0_WRREQ_GMI_CREDIT_STALL` = 163.8M >> GRBM_GUI_
+ACTIVE = 31.3M (~12 XGMI-write-credit stall-cycles per 32B remote write); remote writes dominate
+(`TCC_EA0_WRREQ_WRITE_GMI_32B` 13.3M vs `..._WRITE_DRAM_32B` 1.9M = 88% remote). The comm's own
+`l2_writeback` is WHERE the XGMI transfer is paid, so it is NOT removable overhead — do NOT try the
+Round-3 write-through trick on the comm push (it's bandwidth-bound, not drain-bound; profiled, ruled
+out). The raw-scale push is only ~3% of GMI volume (diag8 vs diag16), so streaming/dropping it can't
+move the floor (matches the tok_unroll-neutral result). To profile the push: single-rank diag8/diag16 +
+`--pmc TCC_EA0_WRREQ_WRITE_GMI_32B TCC_EA0_WRREQ_GMI_CREDIT_STALL TCC_EA0_WRREQ_WRITE_DRAM_32B`. Below
+the ~1.72 ms comm floor needs LESS XGMI VOLUME (fp8->fp4 dy push = precision tradeoff; fewer remote
+tokens = routing; or faster links) — not a kernel fence change.
+
 ## rocprofv3 on a distributed spin-wait kernel: profile ONE rank, not all
 Profiling all 8 ranks with `--pmc` serializes every dispatch and DESYNCS the cross-rank scoreboard
 handshake -> preshuffle/gemm gate timeouts, GPUs spin at 100%, garbage counters. Instead run 8 ranks

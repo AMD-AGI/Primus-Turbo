@@ -120,6 +120,7 @@ def _compile(
     ps_read_cm=0,
     ps_coalesce=0,
     ps_release=0,
+    gemm_acq=0,
 ):
     NO_GEMM = diag in (1, 5)  # 5 = comm+preshuffle, NO fences (isolate preshuffle write vs fence)
     GEMM_ONLY = diag == 2
@@ -412,8 +413,11 @@ def _compile(
                                         spin_start = read_clock()
                                     signal = ld(sb_base, block_m, scope="sys")
                         fx.gpu.barrier()
-                        if not NO_FENCE:
-                            l2_invalidate()  # acquire: see peer-written pool_fp8 + role-written pool_scale_ps
+                        # gemm ACQUIRE of pool_fp8 (peer push) + pool_scale_ps (preshuffle write).
+                        # gemm_acq: 0 = l2_invalidate (default, correct). 1 = SKIP it (Round 4 timing
+                        # PROBE — INCORRECT/garbage output, sizes the invalidate's cost ceiling).
+                        if not NO_FENCE and gemm_acq == 0:
+                            l2_invalidate()
                         fx.gpu.barrier()
 
                     g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
@@ -511,8 +515,8 @@ def dispatch_grouped_gemm_mxfp8_bwd(
     sym_layout,
     symm,
     *,
-    num_dispatch_cu: int = 16,
-    num_preshuffle_cu: int = 16,
+    num_dispatch_cu: int = 24,  # Round 5: XCD-aligned (mult of 8); ndcu=24 best for this STEP1 shape
+    num_preshuffle_cu: int = 8,  # preshuffle is cheap post-R3 -> pscu insensitive (4-16 all ~equal)
     BM: int = 256,
     BN: int = 256,
     GROUP_M: int = 4,
@@ -571,6 +575,9 @@ def dispatch_grouped_gemm_mxfp8_bwd(
     # store; PT_MXFP8_PS_RELEASE=0 to keep the coalesced write but restore the whole-L2 l2_writeback.
     ps_coalesce = int(os.environ.get("PT_MXFP8_PS_COALESCE", "1"))
     ps_release = int(os.environ.get("PT_MXFP8_PS_RELEASE", "1"))
+    # Round 4 probe: PT_MXFP8_GEMM_ACQ=1 SKIPS the gemm-role l2_invalidate acquire (INCORRECT timing
+    # probe to size the invalidate cost before a real coherent glc-read implementation).
+    gemm_acq = int(os.environ.get("PT_MXFP8_GEMM_ACQ", "0"))
 
     XQ = xq.contiguous().view(torch.uint8).view(torch.int32).reshape(-1)
     XS = xs.contiguous().view(torch.uint8).view(torch.int32).reshape(-1)
@@ -614,6 +621,7 @@ def dispatch_grouped_gemm_mxfp8_bwd(
         ps_read_cm=ps_read_cm,
         ps_coalesce=ps_coalesce,
         ps_release=ps_release,
+        gemm_acq=gemm_acq,
     )
     args = (
         XQ,
@@ -636,7 +644,7 @@ def dispatch_grouped_gemm_mxfp8_bwd(
     )
     ck = (N, K, num_max_pool_tokens, BM, BN, int(num_dispatch_cu), int(num_preshuffle_cu),
           int(num_comm), int(num_ranks), int(G), cbsz, blgp, out_fp16, int(GROUP_M), diag, tok_unroll,
-          two_stage, lds_kt, ps_read_cm, ps_coalesce, ps_release)
+          two_stage, lds_kt, ps_read_cm, ps_coalesce, ps_release, gemm_acq)
     if torch.cuda.is_current_stream_capturing():
         raw(*args)
     else:

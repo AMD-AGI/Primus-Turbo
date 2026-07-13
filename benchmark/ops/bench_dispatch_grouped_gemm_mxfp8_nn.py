@@ -253,8 +253,8 @@ if __name__ == "__main__":
     ap.add_argument("--num-tokens", type=int, default=8192)
     ap.add_argument("--bm", type=int, default=256)
     ap.add_argument("--bn", type=int, default=256)
-    ap.add_argument("--num-dispatch-cu", type=int, default=16)
-    ap.add_argument("--num-preshuffle-cu", type=int, default=16)
+    ap.add_argument("--num-dispatch-cu", type=int, default=24)   # Round 5: ndcu=24 (XCD-aligned) best
+    ap.add_argument("--num-preshuffle-cu", type=int, default=8)   # preshuffle cheap post-R3; pscu insensitive
     ap.add_argument("--dy-e5m2", action="store_true", help="quantize dy as E5M2 (default E4M3)")
     ap.add_argument("--mode", choices=["load_balanced", "round_robin", "both"], default="load_balanced")
     ap.add_argument("--iters", type=int, default=30)
