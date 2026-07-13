@@ -108,11 +108,15 @@ def _mxfp8_variable_k_wgrad(a_bf16, b_bf16, group_lens, group_offs):
     (_, _, b_t, b_ts, _, _, _, _) = grouped_quantize_fp8_with_trans(
         b_bf16, _DW2_FP8_FORMAT, ScalingGranularity.MX_BLOCKWISE, lens64, offs64, block_size=_MXFP8_BLOCK
     )
+    # FLYDSL native mxfp8 variable-K wgrad: at the real DSv3 shape (~2048 tok/expert) the FlyDSL GEMM
+    # is 0.58x bf16 (-42%) vs Triton's 1.15x (slower). The full fp8 dW2 (2x colwise quant + GEMM) is
+    # still net-negative because the standalone transpose-quant (1.007 ms) dominates; the quant is the
+    # remaining lever (see agent/workspace/dw2_mxfp8_wgrad_gfx950_20260713/findings.md).
     return grouped_gemm_fp8_variable_k_impl(
         a_t, b_t, a_ts, b_ts, lens_pc, offs_pc,
         trans_a=False, trans_b=False, trans_c=False,
         out_dtype=torch.bfloat16, granularity=ScalingGranularity.MX_BLOCKWISE.value,
-        num_cu=None, default_backend=BackendType.TRITON.value,
+        num_cu=None, default_backend=BackendType.FLYDSL.value,
     )
 
 
