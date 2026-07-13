@@ -31,6 +31,7 @@ num_max_pool_tokens % BLOCK_M == 0, K % 128 == 0 and K >= 256 (mxfp8 MMA).
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -49,6 +50,7 @@ from primus_turbo.flydsl.mega.fp8.ep_fp8 import (
     preshuffle_a_scale_tile,
 )
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
+    BLOCK_K,
     gemm_mxfp8_nt_tile,
     make_mxfp8_shared_storage,
 )
@@ -62,11 +64,36 @@ from primus_turbo.flydsl.mega.prims import (
     st,
 )
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
-from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs
+from primus_turbo.flydsl.utils.gemm_helper import _emit_lds_repack, ceildiv, make_value_attrs
 
 _FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip per-call @flyc.jit dispatch)
 _BSP_CACHE: dict = {}  # (weight data_ptr, G, N, K) -> preshuffled weight scale b_sp (weights static)
 _PS_SENTINEL = 1 << 20  # scoreboard value the preshuffle role stamps when a pool-block is ready
+
+
+def _make_fwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, tile_ps):
+    """fp8 ping-pong (== make_mxfp8_shared_storage, gemm role) + a ps_tile int32 scratch for the
+    preshuffle role's coalesced LDS transpose. flydsl allows only ONE SharedAllocator per kernel, so
+    both regions share one struct; gemm & preshuffle are distinct blocks so never use both at once
+    (extra ~14 KB @ K=7168 -> still 1 block/CU). Mirrors the bwd fork's coalesce storage."""
+    LDS_BLOCK_M = BLOCK_M // 2
+    LDS_BLOCK_N = BLOCK_N // 2
+    a_lds = LDS_BLOCK_M * BLOCK_K
+    b_lds = LDS_BLOCK_N * BLOCK_K
+
+    @fx.struct
+    class SharedStorageCoalesce:
+        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        ps_tile: fx.Array[fx.Int32, tile_ps, 16]
+
+    return SharedStorageCoalesce
 
 
 @functools.lru_cache(maxsize=64)
@@ -88,6 +115,9 @@ def _compile(
     agpr_alloc=0,
     out_fp16=False,
     GROUP_M=4,
+    ps_read_cm=1,
+    ps_coalesce=1,
+    ps_release=1,
 ):
     K = hidden_size
     N = out_features
@@ -95,14 +125,30 @@ def _compile(
     assert N % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
     assert K % 128 == 0 and K >= 256, f"mxfp8 needs K % 128 == 0 and K >= 256, got K={K}"
     assert K % 1024 == 0, f"clean fp8 push needs hidden % 1024 == 0, got K={K}"
-    SharedStorage = make_mxfp8_shared_storage(BLOCK_M, BLOCK_N)
+    K128 = K // 128
+    # Preshuffle-role fence optimization (ported from the bwd fork R2/R3), DEFAULT ON:
+    #   ps_read_cm=1  : ACQUIRE via glc coherent read of the peer-pushed raw pool_scale (skip buffer_inv).
+    #   ps_coalesce=1 : write pool_scale_ps via the coalesced LDS transpose (_emit_lds_repack, b128).
+    #   ps_release=1  : sc1 WRITE-THROUGH release + DROP the whole-L2 l2_writeback (gemm l2_invalidate
+    #                   still acquires it). See the bwd fork for the profiler evidence (-16.8% there).
+    PS_COALESCE = bool(ps_coalesce)
+    PS_RELEASE = bool(ps_release)
+    KT_PS = K128 if (K128 % 8 == 0 and 64 * K128 <= 16384) else 8
+    assert (64 * KT_PS) % _BLOCK_THREADS == 0, f"PS tile {64 * KT_PS} not divisible by {_BLOCK_THREADS}"
+    assert BLOCK_M % 64 == 0, "coalesced preshuffle needs BLOCK_M % 64 == 0"
+    _n_ps_chunks = ceildiv(K128, KT_PS)
+    _n_ps_groups = BLOCK_M // 64
+    TILE_PS = 64 * KT_PS
+    SharedStorage = (
+        _make_fwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, TILE_PS)
+        if PS_COALESCE else make_mxfp8_shared_storage(BLOCK_M, BLOCK_N)
+    )
     n_blocks = N // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
     _comm_cu = num_dispatch_cu
     _gemm_base = _comm_cu + num_preshuffle_cu  # gemm tiles start after comm + preshuffle roles
     _grid_size = _gemm_base + worst_case_tiles * n_blocks
     pool_scale_bytes_raw = num_max_pool_tokens * (K // 32)  # raw E8M0 pool region bytes
-    K128 = K // 128
     _ps_rounds = (worst_case_tiles + num_preshuffle_cu - 1) // num_preshuffle_cu
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
@@ -201,15 +247,38 @@ def _compile(
                                 )
                                 spin_start = read_clock()
                             sig = ld(sb_ps, block_m_ps, scope="sys")
+                    # ACQUIRE the peer-pushed raw pool_scale. Default ps_read_cm=1: glc coherent read
+                    # (in the transpose loads below), skip buffer_inv (comm already l2_writeback'd the
+                    # push to the coherent point before the sys signal). ps_read_cm=0 -> buffer_inv.
+                    if ps_read_cm == 0:
+                        l2_invalidate()
                     fx.gpu.barrier()
-                    l2_invalidate()  # acquire: see the peer-written raw pool_scale
-                    fx.gpu.barrier()
-                    preshuffle_a_scale_tile(
-                        a_scale_raw_res, ps_res, block_m_ps * fx.Int32(BLOCK_M),
-                        BLOCK_M, K128, thread_index, _BLOCK_THREADS,
-                    )
+                    if PS_COALESCE:
+                        # coalesced LDS transpose raw pool_scale -> broadcast pool_scale_ps (b128 both
+                        # sides). st_cm=16 (sc1 write-through) publishes to the coherent point when
+                        # PS_RELEASE, so the whole-L2 l2_writeback below is dropped.
+                        _ps_stcm = 16 if PS_RELEASE else 0
+                        for _g in range(_n_ps_groups):
+                            grp = block_m_ps * fx.Int32(_n_ps_groups) + fx.Int32(_g)
+                            for _c in range(_n_ps_chunks):
+                                _emit_lds_repack(
+                                    True, grp, fx.Int32(_c * KT_PS), lds.ps_tile,
+                                    a_scale_raw_res, ps_res, num_max_pool_tokens,
+                                    K128, KT_PS, thread_index, _BLOCK_THREADS,
+                                    rd_cm=ps_read_cm, st_cm=_ps_stcm,
+                                )
+                                fx.gpu.barrier()  # ps_tile reused next (grp,chunk): finish LDS reads
+                    else:
+                        preshuffle_a_scale_tile(
+                            a_scale_raw_res, ps_res, block_m_ps * fx.Int32(BLOCK_M),
+                            BLOCK_M, K128, thread_index, _BLOCK_THREADS,
+                            read_cache_modifier=ps_read_cm,
+                        )
                     fx.rocdl.s_waitcnt(fx.Int32(0))
-                    l2_writeback()  # release: make pool_scale_ps visible to the gemm role
+                    # RELEASE: default = coalesced sc1 write-through (published above); else whole-L2
+                    # l2_writeback. The gemm role's l2_invalidate acquire is UNCHANGED.
+                    if not (PS_COALESCE and PS_RELEASE):
+                        l2_writeback()
                     fx.gpu.barrier()
                     if thread_index == fx.Int32(0):
                         st(sb_ps, block_m_ps, fx.Int32(_PS_SENTINEL), scope="sys")
@@ -372,6 +441,12 @@ def dispatch_grouped_gemm_mxfp8(
     blgp = 1 if w1q.dtype == torch.float8_e5m2 else 0
     out_fp16 = out_dtype == torch.float16
     c_n = N
+    # Preshuffle-role fence optimization (bwd-fork R2/R3), DEFAULT ON. glc coherent acquire + coalesced
+    # write-through release (drop whole-L2 l2_writeback). Set PT_MXFP8_PS_COALESCE=0 / PS_RELEASE=0 /
+    # PS_READ_CM=0 to restore the scattered write / whole-L2 writeback / buffer_inv acquire.
+    ps_read_cm = int(os.environ.get("PT_MXFP8_PS_READ_CM", "1"))
+    ps_coalesce = int(os.environ.get("PT_MXFP8_PS_COALESCE", "1"))
+    ps_release = int(os.environ.get("PT_MXFP8_PS_RELEASE", "1"))
 
     XQ = xq.contiguous().view(torch.uint8).view(torch.int32).reshape(-1)
     XS = xs.contiguous().view(torch.uint8).view(torch.int32).reshape(-1)
@@ -403,6 +478,9 @@ def dispatch_grouped_gemm_mxfp8(
         blgp=blgp,
         out_fp16=out_fp16,
         GROUP_M=int(GROUP_M),
+        ps_read_cm=ps_read_cm,
+        ps_coalesce=ps_coalesce,
+        ps_release=ps_release,
     )
     args = (
         XQ,
@@ -424,7 +502,8 @@ def dispatch_grouped_gemm_mxfp8(
         torch.cuda.current_stream(),
     )
     ck = (N, K, num_max_pool_tokens, BM, BN, int(num_dispatch_cu), int(num_preshuffle_cu),
-          int(num_comm), int(num_ranks), int(G), cbsz, blgp, out_fp16, int(GROUP_M))
+          int(num_comm), int(num_ranks), int(G), cbsz, blgp, out_fp16, int(GROUP_M),
+          ps_read_cm, ps_coalesce, ps_release)
     if torch.cuda.is_current_stream_capturing():
         raw(*args)
     else:

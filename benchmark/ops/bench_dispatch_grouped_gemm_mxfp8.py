@@ -182,26 +182,35 @@ def profile(group, args, mode, W1):
     )
     _v(rank, "fp8 fused done")
 
-    # ── accuracy: fp8 fused vs the decoupled mxfp8 GEMM over the fused-filled pool, and vs
-    #    the bf16 fused output (fp8-quant noise). Both on real (non-pad) rows.
-    bf16_out = _synced(
-        lambda: dispatch_grouped_gemm_bf16(
-            x, W1, group, handle=handle, layout="nt", BM=BM, BN=BN, num_dispatch_cu=ndcu
-        ),
-        reset_sb=True,
-    )[0]
+    # ── accuracy on a FRESH x the timing loop NEVER pushed (stale-read / coherence gate) ──
+    # PT_MXFP8_ACC_FRESH (default 1): push a DIFFERENT x here so the preshuffle/gemm acquire must
+    # observe the freshly-pushed scale; a missing/insufficient scale fence reads the stale
+    # (timing-loop xq) scale from the small L2-resident scale region -> cos collapses. Run the fp8
+    # fused path FIRST (L2 still warm with the timing xq), then the decoupled ref + bf16.
+    _acc_fresh = os.environ.get("PT_MXFP8_ACC_FRESH", "1") != "0"
+    if _acc_fresh:
+        x_acc = torch.randn((T, H), device="cuda", dtype=torch.float32).bfloat16()
+        xq_acc, xs_acc = quantize_rowwise_mxfp8(x_acc)
+    else:
+        x_acc, xq_acc, xs_acc = x, xq, xs
     fp8_out = _synced(
         lambda: dispatch_grouped_gemm_mxfp8(
-            xq, xs, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN,
+            xq_acc, xs_acc, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN,
             num_dispatch_cu=ndcu, num_preshuffle_cu=pscu,
         ),
         reset_sb=True,
     )
-    ref_fp8 = _synced(
+    ref_fp8 = _synced(  # decoupled mxfp8 GEMM over the pool fp8_out just pushed (same x_acc)
         lambda: grouped_gemm_mxfp8_flydsl_kernel(
             symm.pool_fp8, symm.pool_scale, w1q, w1s, group_offs, out_dtype=torch.bfloat16
         )
     )
+    bf16_out = _synced(
+        lambda: dispatch_grouped_gemm_bf16(
+            x_acc, W1, group, handle=handle, layout="nt", BM=BM, BN=BN, num_dispatch_cu=ndcu
+        ),
+        reset_sb=True,
+    )[0]
     cos_vs_ref, _, _ = gate3(fp8_out[:M_eff], ref_fp8[:M_eff])
     cos_vs_bf16, _, _ = gate3(fp8_out[:M_eff], bf16_out[:M_eff])
 
