@@ -46,6 +46,7 @@ from primus_turbo.flydsl.mega.fp8.ep_fp8 import (
     preshuffle_a_scale_tile,
 )
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
+    BLOCK_K,
     gemm_mxfp8_nt_tile,
     make_mxfp8_shared_storage,
     make_mxfp8_shared_storage_lds_scale,
@@ -60,11 +61,37 @@ from primus_turbo.flydsl.mega.prims import (
     st,
 )
 from primus_turbo.flydsl.mega.sym_layout import SymLayout
-from primus_turbo.flydsl.utils.gemm_helper import make_value_attrs
+from primus_turbo.flydsl.utils.gemm_helper import _emit_lds_repack, ceildiv, make_value_attrs
 
 _FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip per-call @flyc.jit dispatch)
 _BSP_CACHE: dict = {}  # (weight data_ptr, G, N, K) -> preshuffled weight scale b_sp (weights static)
 _PS_SENTINEL = 1 << 20  # scoreboard value the preshuffle role stamps when a pool-block is ready
+
+
+def _make_bwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, tile_ps):
+    """8-buffer fp8 ping-pong (identical to make_mxfp8_shared_storage, used by the gemm role) PLUS a
+    ``ps_tile`` int32 scratch (used by the preshuffle role's coalesced LDS transpose). flydsl allows
+    only ONE SharedAllocator per kernel, so both regions must come from a single struct; the gemm and
+    preshuffle roles are distinct blocks so they never use both at once (extra ~14 KB, occupancy-safe).
+    Mirrors the make_mxfp8_shared_storage_lds_scale pattern (fp8 ping-pong + an extra int32 array)."""
+    LDS_BLOCK_M = BLOCK_M // 2
+    LDS_BLOCK_N = BLOCK_N // 2
+    a_lds = LDS_BLOCK_M * BLOCK_K
+    b_lds = LDS_BLOCK_N * BLOCK_K
+
+    @fx.struct
+    class SharedStorageCoalesce:
+        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds, 16]
+        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds, 16]
+        ps_tile: fx.Array[fx.Int32, tile_ps, 16]
+
+    return SharedStorageCoalesce
 
 
 @functools.lru_cache(maxsize=64)
@@ -91,6 +118,8 @@ def _compile(
     two_stage=0,
     lds_kt=0,
     ps_read_cm=0,
+    ps_coalesce=0,
+    ps_release=0,
 ):
     NO_GEMM = diag in (1, 5)  # 5 = comm+preshuffle, NO fences (isolate preshuffle write vs fence)
     GEMM_ONLY = diag == 2
@@ -132,10 +161,32 @@ def _compile(
     assert K % 128 == 0 and K >= 256, f"mxfp8 needs K % 128 == 0 and K >= 256, got K={K}"
     assert K % 1024 == 0, f"clean fp8 push needs hidden % 1024 == 0, got K={K}"
     LDS_KT = lds_kt if lds_kt else 8  # streaming A-scale window (K-iters); double-buffered in LDS
-    SharedStorage = (
-        make_mxfp8_shared_storage_lds_scale(BLOCK_M, BLOCK_N, K, kt=LDS_KT)
-        if LDS_STREAM else make_mxfp8_shared_storage(BLOCK_M, BLOCK_N)
-    )
+    K128 = K // 128
+
+    # --- Round 3: coalesced preshuffle-role write via the shared LDS transpose -------------------
+    # PS_COALESCE: replace the SCATTERED broadcast store (preshuffle_a_scale_tile, stride-256) with an
+    #   LDS-tiled transpose (_emit_lds_repack, both DRAM sides coalesced b128). One group of 64 rows x
+    #   KT_PS k-iters is staged in LDS then written coalesced; the role does BLOCK_M/64 group-calls per
+    #   pool-block. Coalescing is the prerequisite for a fast write-through release (scattered write-
+    #   through regressed to 2.39 ms).
+    # PS_RELEASE: publish pool_scale_ps via a coalesced sc1 WRITE-THROUGH store (st_cm=16) + s_waitcnt
+    #   vmcnt(0), and DROP the whole-L2 l2_writeback (buffer_wbl2). The gemm role's l2_invalidate still
+    #   acquires it (write-through -> coherent point; invalidate+refill sees it fresh).
+    PS_COALESCE = bool(ps_coalesce)
+    PS_RELEASE = bool(ps_release)
+    KT_PS = K128 if (K128 % 8 == 0 and 64 * K128 <= 16384) else 8
+    assert (64 * KT_PS) % _BLOCK_THREADS == 0, f"PS tile {64 * KT_PS} not divisible by {_BLOCK_THREADS}"
+    assert BLOCK_M % 64 == 0, "coalesced preshuffle needs BLOCK_M % 64 == 0"
+    _n_ps_chunks = ceildiv(K128, KT_PS)
+    _n_ps_groups = BLOCK_M // 64
+    TILE_PS = 64 * KT_PS
+
+    if LDS_STREAM:
+        SharedStorage = make_mxfp8_shared_storage_lds_scale(BLOCK_M, BLOCK_N, K, kt=LDS_KT)
+    elif PS_COALESCE:
+        SharedStorage = _make_bwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, TILE_PS)
+    else:
+        SharedStorage = make_mxfp8_shared_storage(BLOCK_M, BLOCK_N)
     n_blocks = N // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
     _comm_cu = num_dispatch_cu
@@ -143,7 +194,6 @@ def _compile(
     _gemm_base = _comm_cu if SKIP_PS_ROLE else _comm_cu + num_preshuffle_cu
     _grid_size = _gemm_base + worst_case_tiles * n_blocks
     pool_scale_bytes_raw = num_max_pool_tokens * (K // 32)  # raw E8M0 pool region bytes
-    K128 = K // 128
     _ps_rounds = (worst_case_tiles + num_preshuffle_cu - 1) // num_preshuffle_cu if num_preshuffle_cu else 0
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
@@ -169,6 +219,11 @@ def _compile(
         block_index, _b, _c = fx.block_idx
         comm_block_count = fx.Int32(_comm_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        # Preshuffle-role LDS transpose scratch lives in the SAME shared struct (SharedStorageCoalesce
+        # has a ps_tile field alongside the fp8 ping-pong; single-SharedAllocator constraint). Only the
+        # preshuffle role touches lds.ps_tile; only the gemm role touches the fp8 buffers -> distinct
+        # blocks, never both at once. Referenced directly as lds.ps_tile in the preshuffle branch (a
+        # top-`if` alias would live in a different branch scope after the flydsl AST rewrite).
 
         xq_res = create_buffer_resource(XQ, max_size=True)
         xs_res = create_buffer_resource(XS, max_size=True)
@@ -251,14 +306,35 @@ def _compile(
                         if not NO_FENCE and ps_read_cm == 0:
                             l2_invalidate()
                         fx.gpu.barrier()
-                        preshuffle_a_scale_tile(
-                            a_scale_raw_res, ps_res, block_m_ps * fx.Int32(BLOCK_M),
-                            BLOCK_M, K128, thread_index, _BLOCK_THREADS,
-                            read_cache_modifier=ps_read_cm,
-                        )
+                        if PS_COALESCE:
+                            # Coalesced LDS transpose: raw pool_scale -> broadcast pool_scale_ps, both
+                            # DRAM sides coalesced (b128). rd_cm=ps_read_cm (glc coherent acquire);
+                            # st_cm=16 (sc1 write-through) publishes to the coherent point when
+                            # PS_RELEASE (then the whole-L2 l2_writeback is dropped below).
+                            _ps_stcm = 16 if PS_RELEASE else 0
+                            for _g in range(_n_ps_groups):
+                                grp = block_m_ps * fx.Int32(_n_ps_groups) + fx.Int32(_g)
+                                for _c in range(_n_ps_chunks):
+                                    _emit_lds_repack(
+                                        True, grp, fx.Int32(_c * KT_PS), lds.ps_tile,
+                                        a_scale_raw_res, ps_res, num_max_pool_tokens,
+                                        K128, KT_PS, thread_index, _BLOCK_THREADS,
+                                        rd_cm=ps_read_cm, st_cm=_ps_stcm,
+                                    )
+                                    fx.gpu.barrier()  # ps_tile reused next (grp,chunk): finish LDS reads
+                        else:
+                            preshuffle_a_scale_tile(
+                                a_scale_raw_res, ps_res, block_m_ps * fx.Int32(BLOCK_M),
+                                BLOCK_M, K128, thread_index, _BLOCK_THREADS,
+                                read_cache_modifier=ps_read_cm,
+                            )
                         fx.rocdl.s_waitcnt(fx.Int32(0))
-                        if not NO_FENCE:
-                            l2_writeback()  # release: make pool_scale_ps visible to the gemm role
+                        # RELEASE: publish pool_scale_ps to the gemm role. Default = device-scope
+                        # l2_writeback (buffer_wbl2, whole-L2 flush). When PS_COALESCE+PS_RELEASE the
+                        # coalesced sc1 write-through already published it (drained by s_waitcnt above),
+                        # so the expensive whole-L2 flush is skipped.
+                        if not NO_FENCE and not (PS_COALESCE and PS_RELEASE):
+                            l2_writeback()
                         fx.gpu.barrier()
                         if thread_index == fx.Int32(0):
                             st(sb_ps, block_m_ps, fx.Int32(_PS_SENTINEL), scope="sys")
@@ -479,7 +555,22 @@ def dispatch_grouped_gemm_mxfp8_bwd(
     #       back via the fast ScaleS2R. Drops the preshuffle role + both preshuffle-stage fences.
     two_stage = int(os.environ.get("PT_MXFP8_BWD_2STAGE", "0"))
     lds_kt = int(os.environ.get("PT_MXFP8_LDS_KT", "0"))  # LDS_STREAM (two_stage=4) A-scale window K-iters
-    ps_read_cm = int(os.environ.get("PT_MXFP8_PS_READ_CM", "0"))  # !=0: uncached raw-scale read, skip acquire inv
+    # Preshuffle-role ACQUIRE: default 1 = glc (L1-bypass, coherent) read of the peer-pushed raw
+    # pool_scale + SKIP the buffer_inv invalidate. The comm role's l2_writeback already publishes the
+    # pushed scale to the device-coherent point, so a glc read observes it fresh WITHOUT the invalidate
+    # (validated: cos PASS on a FRESH dy the timing loop never pushed, load_balanced AND round_robin;
+    # Round 2). Set PT_MXFP8_PS_READ_CM=0 to restore the buffer_inv acquire. NOTE: this replaces the
+    # fence with a *coherent* (glc) read; do NOT set 0-CPOL here (a plain cached read WOULD read stale).
+    ps_read_cm = int(os.environ.get("PT_MXFP8_PS_READ_CM", "1"))
+    # Round 3 (main lever) switches, DEFAULT 1 (accepted): the preshuffle role writes pool_scale_ps
+    # via the coalesced LDS transpose (_emit_lds_repack, both DRAM sides b128) with an sc1 WRITE-THROUGH
+    # store, and DROPS the whole-L2 l2_writeback (buffer_wbl2). The gemm's l2_invalidate still acquires
+    # it (write-through publishes to the coherent point). Measured: STEP1-bwd wall 2.17 -> 1.81 ms
+    # (-16.8% LB, cos PASS fresh-dy LB+RR); rocprofv3 confirmed the old writeback was drain/stall-bound
+    # (SQ_WAIT +11%), not write-bandwidth-bound. Set PT_MXFP8_PS_COALESCE=0 to restore the scattered
+    # store; PT_MXFP8_PS_RELEASE=0 to keep the coalesced write but restore the whole-L2 l2_writeback.
+    ps_coalesce = int(os.environ.get("PT_MXFP8_PS_COALESCE", "1"))
+    ps_release = int(os.environ.get("PT_MXFP8_PS_RELEASE", "1"))
 
     XQ = xq.contiguous().view(torch.uint8).view(torch.int32).reshape(-1)
     XS = xs.contiguous().view(torch.uint8).view(torch.int32).reshape(-1)
@@ -521,6 +612,8 @@ def dispatch_grouped_gemm_mxfp8_bwd(
         two_stage=two_stage,
         lds_kt=lds_kt,
         ps_read_cm=ps_read_cm,
+        ps_coalesce=ps_coalesce,
+        ps_release=ps_release,
     )
     args = (
         XQ,
@@ -543,7 +636,7 @@ def dispatch_grouped_gemm_mxfp8_bwd(
     )
     ck = (N, K, num_max_pool_tokens, BM, BN, int(num_dispatch_cu), int(num_preshuffle_cu),
           int(num_comm), int(num_ranks), int(G), cbsz, blgp, out_fp16, int(GROUP_M), diag, tok_unroll,
-          two_stage, lds_kt, ps_read_cm)
+          two_stage, lds_kt, ps_read_cm, ps_coalesce, ps_release)
     if torch.cuda.is_current_stream_capturing():
         raw(*args)
     else:

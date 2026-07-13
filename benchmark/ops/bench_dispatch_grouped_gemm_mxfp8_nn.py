@@ -52,6 +52,9 @@ from primus_turbo.flydsl.mega.dispatch_grouped_gemm_bf16_kernel import (  # noqa
 from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (  # noqa: E402
     dispatch_grouped_gemm_mxfp8,
 )
+from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_bwd_kernel import (  # noqa: E402
+    dispatch_grouped_gemm_mxfp8_bwd,
+)
 from primus_turbo.flydsl.mega.fp8.quant import (  # noqa: E402
     quantize_grouped_weight_mxfp8,
     quantize_rowwise_mxfp8,
@@ -83,6 +86,13 @@ def profile(group, args, mode, W2):
 
     dy_fmt = float8_e5m2 if args.dy_e5m2 else float8_e4m3
     w2_fmt = float8_e4m3
+
+    # STEP1-backward optimization target: the dedicated bwd fork (dispatch_grouped_gemm_mxfp8_bwd),
+    # which carries the preshuffle-fence tuning switches. PT_MXFP8_BWD_FORK=0 falls back to the
+    # forward NT-reuse kernel (dispatch_grouped_gemm_mxfp8) for A/B comparison. Both are drop-in
+    # (identical signature, both return the L1 out tensor) and both compute dgrad = dispatch(dy)@w2.
+    _use_fork = os.environ.get("PT_MXFP8_BWD_FORK", "1") != "0"
+    _fp8_fn = dispatch_grouped_gemm_mxfp8_bwd if _use_fork else dispatch_grouped_gemm_mxfp8
 
     torch.manual_seed(7 + rank)
     dy = torch.randn((T, H), device="cuda", dtype=torch.float32).bfloat16()
@@ -134,7 +144,7 @@ def profile(group, args, mode, W2):
 
     # ── fp8 fused NT-reuse (forward L1 NT kernel + transposed w2 => dgrad as a @ b^T) ──
     t_fp8_nt = bench(
-        lambda: dispatch_grouped_gemm_mxfp8(
+        lambda: _fp8_fn(
             dyq, dys, w2tq, w2ts, handle, sym_layout, symm, BM=BM, BN=BN,
             num_dispatch_cu=ndcu, num_preshuffle_cu=pscu,
         ),
@@ -142,19 +152,31 @@ def profile(group, args, mode, W2):
     )
 
     # ── accuracy: fp8 NT-reuse grad_swiglu vs bf16 fused grad_swiglu (real rows) ──
-    bf16_out = _synced(
-        lambda: dispatch_grouped_gemm_bf16(
-            dy, W2, group, handle=handle, layout="nn", BM=BM, BN=BN, num_dispatch_cu=ndcu
-        ),
-        reset_sb=True,
-    )[0]
+    # COHERENCE GATE (PT_MXFP8_ACC_FRESH, default 1): compare on a FRESH dy the timing loop NEVER
+    # pushed. The timing loop above pushed `dyq` 30x, warming L2 with its pool_scale; pushing a
+    # DIFFERENT dy here forces the preshuffle/gemm acquire to actually observe the freshly-pushed
+    # scale. A missing/insufficient scale fence reads the stale (timing-loop) scale from the small,
+    # L2-resident scale region -> cos collapses. Run the fp8 path FIRST, before the big bf16 push
+    # evicts the warm scale lines. Set PT_MXFP8_ACC_FRESH=0 for the old (reuse-dyq) weak gate.
+    _acc_fresh = os.environ.get("PT_MXFP8_ACC_FRESH", "1") != "0"
+    if _acc_fresh:
+        dy_acc = torch.randn((T, H), device="cuda", dtype=torch.float32).bfloat16()
+        dyq_acc, dys_acc = quantize_rowwise_mxfp8(dy_acc, dy_fmt)
+    else:
+        dy_acc, dyq_acc, dys_acc = dy, dyq, dys
     nt_out = _synced(
-        lambda: dispatch_grouped_gemm_mxfp8(
-            dyq, dys, w2tq, w2ts, handle, sym_layout, symm, BM=BM, BN=BN,
+        lambda: _fp8_fn(
+            dyq_acc, dys_acc, w2tq, w2ts, handle, sym_layout, symm, BM=BM, BN=BN,
             num_dispatch_cu=ndcu, num_preshuffle_cu=pscu,
         ),
         reset_sb=True,
     )
+    bf16_out = _synced(
+        lambda: dispatch_grouped_gemm_bf16(
+            dy_acc, W2, group, handle=handle, layout="nn", BM=BM, BN=BN, num_dispatch_cu=ndcu
+        ),
+        reset_sb=True,
+    )[0]
     cos_nt, rel_nt, _ = gate3(nt_out[:M_eff], bf16_out[:M_eff])
 
     symm.destroy()
@@ -203,11 +225,14 @@ def benchmark(local_rank, world, args):
                 torch.cuda.synchronize(); group.barrier(); continue
 
             tf = lambda ms: flops / (ms * 1e-3) / 1e12
+            _kern = "bwd-fork" if os.environ.get("PT_MXFP8_BWD_FORK", "1") != "0" else "fwd-NTreuse"
+            _acc = "fresh-dy" if os.environ.get("PT_MXFP8_ACC_FRESH", "1") != "0" else "reuse-dy"
+            _kern = f"{_kern} acc={_acc}"
             print(f"\n{'='*80}")
             print(f"[bwd STEP1  dispatch(dy)+fc2 dgrad  fp8 NT-reuse vs bf16 fused]  {gpu_name} EP{world} "
                   f"T={args.num_tokens} H={args.hidden} I={args.inter} E={args.num_experts} "
                   f"K={args.num_topk} mode={mode} ndcu={args.num_dispatch_cu} pscu={args.num_preshuffle_cu} "
-                  f"dy_fmt={'E5M2' if args.dy_e5m2 else 'E4M3'} (max over ranks)")
+                  f"dy_fmt={'E5M2' if args.dy_e5m2 else 'E4M3'} kern={_kern} (max over ranks)")
             print(f"{'='*80}")
             print(_line("bf16 fused", bf16_fused, tf(bf16_fused)))
             print(_line("fp8 NT-reuse", fp8_nt, tf(fp8_nt),

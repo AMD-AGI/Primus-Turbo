@@ -1243,9 +1243,15 @@ def _lds_barrier():
     )
 
 
-def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=1):
+def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=1,
+                     rd_cm=0, st_cm=0):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
+    # rd_cm/st_cm (default 0 = cached): raw-load / broadcast-store cache modifiers. A fused-kernel
+    # preshuffle role passes rd_cm=1 (glc coherent acquire) + st_cm=16 (sc1 write-through release) so
+    # the transpose doubles as the fence: the write-through publishes pool_scale_ps to the coherent
+    # point (no whole-L2 buffer_wbl2 needed; the gemm's l2_invalidate acquires it). Host-side callers
+    # (build_preshuffle_ab_kernel) keep the defaults (plain cached).
     NT = 4
     TILE = 64 * KT
     assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
@@ -1261,7 +1267,8 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
             off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
             grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
         dw = _buffer_ops.buffer_load(
-            rin, grow * K128 + gk + rd_base, vec_width=1, dtype=T.i32, mask=(gk < K128) & (grow < dim)
+            rin, grow * K128 + gk + rd_base, vec_width=1, dtype=T.i32, mask=(gk < K128) & (grow < dim),
+            cache_modifier=rd_cm,
         )
         fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
             Vec.from_elements([fx.Int32(dw)], fx.Int32)
@@ -1297,6 +1304,7 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
             rout,
             ((grp * K128p + gkp) * 64 + lane) * 4 + wr_base,
             mask=(k0 + kkp * PACK) < K128,
+            cache_modifier=st_cm,
         )
 
 

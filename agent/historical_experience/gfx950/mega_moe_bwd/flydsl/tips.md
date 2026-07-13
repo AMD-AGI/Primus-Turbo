@@ -73,6 +73,58 @@ the coherence argument (single-owner + gated read + one invalidate drops stale, 
 per-block before each sentinel). A coarsened fence that still invalidates once is safe; skipping
 invalidation entirely is not (fails in real training with fresh per-step data).
 
+## Preshuffle-role RELEASE: coalesced write-through beats the whole-L2 l2_writeback (-16.8%, BIG win)
+The preshuffle role's release fence (`l2_writeback` = `buffer_wbl2 sc1` whole-L2 flush + `s_waitcnt
+vmcnt(0)`) is the STEP1-bwd's main remaining cost. Replace it with: write pool_scale_ps via the shared
+LDS transpose `_emit_lds_repack(is_a=True)` (both DRAM sides coalesced b128) using an sc1 WRITE-THROUGH
+store (`st_cm=16`), DROP the l2_writeback, and keep the gemm role's `l2_invalidate` acquire (write-
+through publishes to the coherent point; gemm invalidate+refill sees it fresh). Measured STEP1-bwd wall
+2.17 -> 1.81 ms (-16.8% LB, ~-19% RR), cos PASS on a FRESH dy (LB+RR). Near the comm floor (1.72).
+- WHY (rocprofv3, single-rank technique): the old writeback was DRAIN/STALL-bound, not write-bw-bound.
+  Full-kernel diag0 baseline vs write-through: SQ_WAIT_ANY -27.9%, GRBM_GUI_ACTIVE -13.8%, TCC_HIT
+  -19.6%, TCC_WRREQ_STALL ~flat. `buffer_wbl2` is DEVICE-scope: it flushed the whole L2 and stalled the
+  CONCURRENT gemm waves + churned L2. Write-through streams the (coalesced) stores and drops the flush.
+- Coalescing is REQUIRED first (scattered write-through = 2.39 ms, tips below). Coalesce-only (cached +
+  keep writeback) already gave -6.3% (contiguous dirty lines -> cheaper flush + efficient b128 store).
+- PROFILING PITFALL: the diag1 ISOLATION (comm+preshuffle, gemm-exit) is the WRONG lens for a device-
+  scope fence — it shows write-through as WORSE (store latency not hidden, no concurrent gemm to benefit
+  from dropping the flush). Always profile the FULL kernel (diag0) for device-scope fence changes.
+- The LDS transpose tile (64*K128 i32 = 14 KB @ K=7168) fits in a bwd-local shared struct alongside the
+  128 KB fp8 ping-pong (-> 142 KB, still 1 block/CU: no occupancy loss). flydsl allows only ONE
+  SharedAllocator per kernel, so put the tile IN the same struct (not a 2nd allocate()).
+- Switches: PT_MXFP8_PS_COALESCE=1, PT_MXFP8_PS_RELEASE=1 (now default in dispatch_grouped_gemm_mxfp8_bwd).
+
+## rocprofv3 on a distributed spin-wait kernel: profile ONE rank, not all
+Profiling all 8 ranks with `--pmc` serializes every dispatch and DESYNCS the cross-rank scoreboard
+handshake -> preshuffle/gemm gate timeouts, GPUs spin at 100%, garbage counters. Instead run 8 ranks
+manually (prof_single_rank.py, same MASTER_PORT) and wrap ONLY rank 0 with rocprofv3; ranks 1-7 run
+unprofiled so rank 0's peers push fast -> rank 0's spin stays short -> 0 gate timeouts, clean counters.
+Also: detached runs that hang leave ORPHAN python children (ppid=1) holding GPU mem at 100% util that
+`pkill -f bench_...` misses -> `pkill -9 python` before every measurement. Kernel-trace DURATIONS are
+spin-inflated (bf16 shows 14 ms vs 2.37 ms bench) -> use bench CUDA-event wall for timing, PMC for why.
+
+## Preshuffle-role ACQUIRE: a glc (L1-bypass) read replaces buffer_inv (small win, coherent)
+The preshuffle role's acquire of the peer-pushed raw pool_scale can drop `l2_invalidate` (buffer_inv
+sc1) and instead read raw with cache_modifier=1 (glc, globally-coherent L1-bypass). This is coherent
+because the COMM role already `l2_writeback`s the pushed scale to the device-coherent point BEFORE the
+sys-scope scoreboard signal the preshuffle gates on — so a glc read observes it fresh. Validated on a
+FRESH dy the timing loop never pushed (cos PASS, load_balanced AND round_robin, repeated). Win is
+small (~-1% of the STEP1 wall) because this is only the CHEAP acquire fence. IMPORTANT distinction vs
+the "don't remove fences" tip: glc is NOT a naive cached-read fence removal — glc IS the coherence
+mechanism (the read goes to the coherent point). A plain cached (cm=0) read WOULD read stale. Do NOT
+use sc1 (16/17) on a LOAD (measured 23.8 ms — sc1-on-load is catastrophic). `PT_MXFP8_PS_READ_CM=1`
+is now the default in `dispatch_grouped_gemm_mxfp8_bwd`.
+
+## FRESH-dy coherence gate: the SCALE region IS L2-resident, so scale-fence bugs ARE catchable
+An earlier tip said even a fresh dy_acc "can't reliably force the stale condition" — that is true for
+pool_FP8 (~470 MB ≫ L2) but NOT for pool_SCALE (small, L2-resident). To catch a SCALE-fence bug:
+run the fp8 kernel on the timing dyq (warms L2 with its scale), then IMMEDIATELY (only cuda.sync +
+group.barrier between, no cache flush) run it on a DIFFERENT dy_acc and compare vs bf16(dy_acc); a
+missing/insufficient scale acquire reads the stale (dyq) scale -> cos collapses. Implemented as
+`PT_MXFP8_ACC_FRESH` (default 1) in `bench_dispatch_grouped_gemm_mxfp8_nn.py`, running the fp8 acc
+FIRST (before the big bf16 push evicts warm scale lines). Calibrated: the proper-fence baseline PASSES
+(cos 0.999), so it is not a false-positive gate. Use it to gate ALL scale-fence changes.
+
 ## Do NOT fold the mxfp8 A-scale preshuffle into the gemm workgroup (2-stage) — dead end
 Tried removing the separate preshuffle stage + its 2 L2 fences (~0.24 ms) by having each gemm WG
 preshuffle its own tile's A-scale into a write-through global scratch, then read it back via the
