@@ -11,7 +11,6 @@ from typing import Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
-from primus_turbo.flydsl.mega.symm_buffer import SymmBuffer
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.mega_moe import (
     mega_moe_backward_impl,
@@ -19,7 +18,6 @@ from primus_turbo.pytorch.kernels.mega_moe import (
 )
 
 __all__ = [
-    "SymmBuffer",
     "MegaMoEFusedFunction",
     "mega_moe_fused",
 ]

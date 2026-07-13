@@ -281,7 +281,7 @@ def _rewind_dispatch_flag(kwargs):
 
 
 @autotune(
-    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=4) for cu in (16, 64)],
+    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=4) for cu in (16, 32, 64)],
     key=[
         "out_features",
         "hidden_size",

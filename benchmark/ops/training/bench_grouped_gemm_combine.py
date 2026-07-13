@@ -21,9 +21,9 @@ import torch.distributed as dist
 from config import gen_moe_test_cases, get_platform_info
 from tabulate import tabulate
 
-# repo root (primus_turbo) on the path so the shared mega_utils + kernels import
+# repo root (primus_turbo) on the path (config + mega_utils are same-dir)
 _HERE = os.path.dirname(__file__)
-sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
 from mega_utils import (  # noqa: E402
     BF16_BYTES,
@@ -111,8 +111,8 @@ class StageRunner:
         t_dense, dense_gm = dense_gemm_peak_ms(
             *spec.dense_dims, args.bm, args.bn, args.iters, group_m_cands=self.group_m_cands
         )
-        t_comb = bench(spec.comm_fn, group=self.group, iters=args.iters)
-        t_fused = bench(spec.fused_fn, group=self.group, iters=args.iters)
+        t_comb = bench(spec.comm_fn, iters=args.iters)
+        t_fused = bench(spec.fused_fn, iters=args.iters)
         metrics = StageMetrics(
             gemm_ms=t_gemm,
             dense_ms=t_dense,
