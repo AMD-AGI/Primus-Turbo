@@ -707,7 +707,7 @@ class QuantizedTensor(torch.Tensor):
         new_shape = torch.Size(new_shape)
 
         if tensor._granularity == ScalingGranularity.TENSORWISE:
-            new_data = tensor._data.transpose(d0, d1).contiguous()
+            new_data = torch.ops.primus_turbo_cpp_extension.transpose_2d(tensor._data.contiguous(), d0, d1)
             return cls._make_like(tensor, data=new_data, scale_inv=tensor._scale_inv, shape=new_shape)
 
         # Rowwise / MX blockwise: dequantize -> transpose -> re-quantize colwise.
@@ -880,7 +880,7 @@ def create_quantized_weight(
         elif granularity == ScalingGranularity.ROWWISE:
             # NOTE: rowwise quantization not support transpose, so we need to quantize the transposed weight manually.
             quantized_weight_t = QuantizedTensor.quantize(
-                weight.transpose(-2, -1),
+                torch.ops.primus_turbo_cpp_extension.transpose_2d(weight.contiguous(), -2, -1),
                 dest_dtype=dest_dtype,
                 granularity=quant_config.granularity,
                 block_size=quant_config.block_size,
