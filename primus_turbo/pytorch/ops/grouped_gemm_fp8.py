@@ -623,8 +623,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 group_lens,
                 group_offs,
                 block_size=config.block_size,
-                scaling_recipe=ScalingRecipe(),
-                scaling_recipe_for_trans=ScalingRecipe(),
+                scaling_recipe=a_scaling_recipe,
+                scaling_recipe_for_trans=a_scaling_recipe,
             )
         else:
             quantized_a = a
@@ -781,7 +781,18 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             default_backend=BackendType.FLYDSL.value,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
-        return grad_a, grad_b, None, None, None, None, None, None, None, None
+        return (
+            grad_a,  # a
+            grad_b,  # b
+            None,  # a_t
+            None,  # b_t
+            None,  # group_lens
+            None,  # group_offs
+            None,  # trans_b
+            None,  # out_dtype
+            None,  # config
+            None,  # num_cu
+        )
 
 
 @torch._dynamo.disable(

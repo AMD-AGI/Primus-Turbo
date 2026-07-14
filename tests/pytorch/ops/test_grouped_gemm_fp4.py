@@ -8,12 +8,16 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP4_BLOCK_SIZE,
     Float4QuantConfig,
     Format,
     ScaleDtype,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp4_support,
+    float4_e2m1fn_x2,
 )
+from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.pytorch.ops.grouped_gemm_fp4 import grouped_gemm_fp4
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -131,6 +135,94 @@ def test_grouped_gemm_fp4_mx_blockwise(B, M, NK, dtype, balance):
     """MXFP4 grouped GEMM fwd + dgrad + wgrad on the Triton backend."""
     N, K = NK
     _run(B, M, N, K, dtype, balance)
+
+
+# ----------------------------------------------------------------------------
+# Pre-quantized QuantizedTensor inputs.
+# ----------------------------------------------------------------------------
+def _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype, balance):
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+    if _check_hit_int32_limit(B, M, N, K):
+        pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
+
+    device = "cuda:0"
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    print(f"\n[QT] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, balance={balance}")
+
+    a = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_(True)
+    b_ref = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+
+    # Match the row-wise recipes grouped_gemm_fp4 applies internally so the
+    # pre-quantized operands pass check_quantized_tensor.
+    a_scaling_recipe = ScalingRecipe()
+    b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+
+    qt_a = QuantizedTensor.quantize(
+        a,
+        float4_e2m1fn_x2,
+        ScalingGranularity.MX_BLOCKWISE,
+        scaling_recipe=a_scaling_recipe,
+        block_size=MXFP4_BLOCK_SIZE,
+        group_lens=group_lens,
+        axis=-1,
+    )
+    qt_b = QuantizedTensor.quantize(
+        b,
+        float4_e2m1fn_x2,
+        ScalingGranularity.MX_BLOCKWISE,
+        scaling_recipe=b_scaling_recipe,
+        block_size=MXFP4_BLOCK_SIZE,
+        axis=-1,
+    )
+
+    # Reference
+    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=True)
+    grad_out = torch.randn_like(out_ref)
+    out_ref.backward(grad_out)
+    torch.cuda.synchronize()
+
+    config = _make_config()
+    out = grouped_gemm_fp4(qt_a, qt_b, group_lens, trans_b=True, config=config)
+    out.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # Check Shape
+    assert out.shape == out_ref.shape
+    assert qt_a.grad is not None and qt_a.grad.shape == a.shape
+    assert qt_b.grad is not None and qt_b.grad.shape == b.shape
+
+    # Check Results
+    out_snr = compute_snr(out_ref, out)
+    a_grad_snr = compute_snr(a_ref.grad, qt_a.grad)
+    b_grad_snr = compute_snr(b_ref.grad, qt_b.grad)
+    print(f"[QT] Out-SNR={out_snr:.2f} dB  AGrad-SNR={a_grad_snr:.2f} dB  BGrad-SNR={b_grad_snr:.2f} dB")
+    assert out_snr > SNR_THRESHOLD, f"out_snr={out_snr:.2f} too low"
+    assert a_grad_snr > SNR_THRESHOLD, f"a_grad_snr={a_grad_snr:.2f} too low"
+    assert b_grad_snr > SNR_THRESHOLD, f"b_grad_snr={b_grad_snr:.2f} too low"
+
+
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("dtype", DTYPE_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp4_mx_blockwise_quantized_tensor(B, M, NK, dtype, balance):
+    """MXFP4 grouped GEMM with pre-quantized grouped/regular QuantizedTensor inputs."""
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    N, K = NK
+    _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype, balance)
 
 
 # ----------------------------------------------------------------------------
