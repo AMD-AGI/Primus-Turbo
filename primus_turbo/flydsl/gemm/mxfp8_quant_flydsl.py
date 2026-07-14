@@ -104,12 +104,15 @@ def _store_scale(buf, buf_bytes, dword, jbyte, e8_i32, pack, ok=None, cm=_CM, ba
 
 
 def in_elt(dtype):
-    """Map a torch high-precision input dtype -> flydsl element class. The quant math
-    is all f32; only the LDS tile + global load bit-width/interpretation depend on it,
-    so bf16 and fp16 are both supported (anything else is unsupported -> caller gates)."""
+    """Map a torch high-precision input dtype -> flydsl element class. The quant math is all f32;
+    only the LDS tile + global load bit-width depends on it, so only bf16/fp16 are supported."""
     import torch
 
-    return fx.Float16 if dtype == torch.float16 else fx.BFloat16
+    if dtype == torch.float16:
+        return fx.Float16
+    if dtype == torch.bfloat16:
+        return fx.BFloat16
+    raise ValueError(f"unsupported input dtype {dtype}; expected bfloat16 or float16")
 
 
 def raw_scale_int32(free, contract):
@@ -409,6 +412,10 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype):
     import torch
 
     assert x_3d.ndim == 3 and x_3d.is_contiguous()
+    assert x_3d.is_cuda and x_3d.dtype in (torch.bfloat16, torch.float16), (
+        "quant expects a CUDA bf16/fp16 tensor"
+    )
+    assert "float8" in str(out_dtype), f"out_dtype must be an fp8 dtype, got {out_dtype}"
     B, M, K = int(x_3d.shape[0]), int(x_3d.shape[1]), int(x_3d.shape[2])
     Mp, Kp = _ceil128(M), _ceil128(K)
     out_fp8 = "e5m2" if out_dtype == torch.float8_e5m2 else "e4m3"
@@ -879,7 +886,11 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     import torch
 
     assert x.ndim == 2 and x.is_contiguous()
-    assert x.dtype in (torch.bfloat16, torch.float16)
+    assert x.is_cuda and x.dtype in (torch.bfloat16, torch.float16), (
+        "grouped quant expects a CUDA bf16/fp16 tensor"
+    )
+    assert group_lens.is_cuda and group_offs.is_cuda, "group_lens/group_offs must be CUDA tensors"
+    assert "float8" in str(out_dtype), f"out_dtype must be an fp8 dtype, got {out_dtype}"
     total_M, N = int(x.shape[0]), int(x.shape[1])
     G = int(group_lens.shape[0])
     N_pad = _ceil128(N)
