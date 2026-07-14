@@ -67,6 +67,7 @@ from primus_turbo.pytorch.kernels.mega_moe.grouped_gemm_combine_impl import (
 from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (
     colwise_grouped_meta,
     colwise_quant_mxfp8_grouped_flydsl,
+    colwise_requant_mxfp8_grouped_fp8in_flydsl,
 )
 
 __all__ = ["MegaMoEFusedMxfp8Function", "mega_moe_fused_mxfp8"]
@@ -126,7 +127,7 @@ def _host_rendezvous(group, *, load_bearing):
     group.barrier()
 
 
-def _mxfp8_variable_k_wgrad(a_bf16, b_bf16, group_lens, group_offs):
+def _mxfp8_variable_k_wgrad(a_bf16, b_bf16, group_lens, group_offs, *, a_fp8=None):
     """dW = a^T @ b (variable-K over the pool/contraction axis) in MXFP8. Quantizes both
     operands colwise (transposed) with the dedicated FlyDSL colwise-transpose quant, then the
     FlyDSL mxfp8 variable-K grouped GEMM. Returns [G, a.shape[1], b.shape[1]] bf16.
@@ -134,10 +135,21 @@ def _mxfp8_variable_k_wgrad(a_bf16, b_bf16, group_lens, group_offs):
     The colwise quant emits ONLY the transposed operand the wgrad needs (a_t + raw E8M0),
     skipping the C++ dual's wasted rowwise half -> ~1.2x faster than the dual for the 2 operands
     (0.81 vs ~0.99 ms at the DSv3 shape), byte-exact (dW2 SNR 22.58 dB == dual). The metadata is
-    shared across both operands. NOTE: colwise_grouped_meta does one total_M_pad D2H; only runs
-    when _USE_FP8_DW2 is on (see the flag comment for the net-parity status)."""
+    shared across both operands. NOTE: colwise_grouped_meta does one total_M_pad D2H.
+
+    ``a_fp8`` (a-branch producer fusion): when the ``a`` operand is already the STEP1 rowwise-fp8
+    pool ``(pool_fp8 [P,H], pool_scale [P,H//32])``, requant it colwise DIRECTLY from fp8 (fused
+    dequant->requant, no bf16 ``dispatch_l2_grad`` round-trip) -- byte-identical to quantizing the
+    dequanted bf16, but skips materializing + re-reading the bf16 intermediate. ``a_bf16`` is
+    ignored when ``a_fp8`` is given."""
     meta = colwise_grouped_meta(group_lens, group_offs)
-    a_t, a_ts, lens_pc, offs_pc = colwise_quant_mxfp8_grouped_flydsl(a_bf16, _DW2_FP8_FORMAT, meta=meta)
+    if a_fp8 is not None:
+        pool_fp8, pool_scale = a_fp8
+        a_t, a_ts, lens_pc, offs_pc = colwise_requant_mxfp8_grouped_fp8in_flydsl(
+            pool_fp8, pool_scale, _DW2_FP8_FORMAT, meta=meta
+        )
+    else:
+        a_t, a_ts, lens_pc, offs_pc = colwise_quant_mxfp8_grouped_flydsl(a_bf16, _DW2_FP8_FORMAT, meta=meta)
     b_t, b_ts, _, _ = colwise_quant_mxfp8_grouped_flydsl(b_bf16, _DW2_FP8_FORMAT, meta=meta)
     return grouped_gemm_fp8_variable_k_impl(
         a_t, b_t,
@@ -179,9 +191,14 @@ def _dequant_pool_fp8_bf16(symm):
 
 def _mxfp8_step1_dispatch_dgrad(dy, w2, group, handle, block_m, block_n):
     """Backward STEP1 in fp8: fp8 dispatch(dy) + fp8 fc2 dgrad (the optimized bwd fork).  Returns
-    ``(grad_swiglu bf16, dispatch_l2_grad bf16)``.  The fork emits only ``grad_swiglu``;
-    ``dispatch_l2_grad`` is recovered by dequanting the fp8 pool.  Needs the mxfp8 symm live (the
-    forward's global buffer) and the same cross-rank scoreboard gate the forward L1 uses."""
+    ``(grad_swiglu bf16, pool_fp8_handle)`` where ``pool_fp8_handle = (pool_fp8 [P,H] E4M3,
+    pool_scale [P,H//32] E8M0)`` is the dispatched-``dy`` pool (the dW2 ``a`` operand,
+    ``dispatch_l2_grad``, in its native rowwise-fp8 form).  The fork emits only ``grad_swiglu``.
+
+    dW2 requants the pool COLWISE directly from fp8 (a-branch fusion, no bf16 round-trip); the
+    bf16 ``dispatch_l2_grad`` is recovered on demand via ``_dequant_pool_fp8_bf16`` only for the
+    bf16-dW2 isolation path.  Needs the mxfp8 symm live (the forward's global buffer) and the same
+    cross-rank scoreboard gate the forward L1 uses."""
     symm = get_symm_buffer_for_mega_moe()  # live buffer from the forward
     sym_layout = symm.make_sym_layout()
     dyq, dys = quantize_rowwise_mxfp8_flydsl(dy)
@@ -194,8 +211,9 @@ def _mxfp8_step1_dispatch_dgrad(dy, w2, group, handle, block_m, block_n):
     grad_swiglu = dispatch_grouped_gemm_mxfp8_bwd(
         dyq, dys, w2tq, w2ts, handle, sym_layout, symm, BM=block_m, BN=block_n,
     )
-    dispatch_l2_grad = _dequant_pool_fp8_bf16(symm)
-    return grad_swiglu, dispatch_l2_grad
+    P, H = symm.pool_fp8.shape
+    pool_fp8_handle = (symm.pool_fp8, symm.pool_scale.reshape(P, H // 32))
+    return grad_swiglu, pool_fp8_handle
 
 
 class MegaMoEFusedMxfp8Function(torch.autograd.Function):
@@ -301,9 +319,13 @@ class MegaMoEFusedMxfp8Function(torch.autograd.Function):
         triton_be = BackendType.TRITON.value
 
         # STEP 1: dispatch dy + L2 dgrad (grad_swiglu = dispatch_l2_grad @ w2, NN). fp8 fork (fp8
-        # comm + fc2 dgrad) when _USE_FP8_STEP1, else bf16. Both return (grad_swiglu, dispatch_l2_grad).
+        # comm + fc2 dgrad) when _USE_FP8_STEP1, else bf16. The dW2 `a` operand (dispatch_l2_grad)
+        # is either a bf16 tensor (bf16 STEP1) or the native rowwise-fp8 pool handle (fp8 STEP1,
+        # requant colwise directly -> a-branch fusion, no bf16 round-trip).
+        dispatch_l2_grad = None       # bf16 tensor (bf16 STEP1, or lazily dequanted for bf16 dW2)
+        dispatch_l2_grad_fp8 = None   # (pool_fp8, pool_scale) handle (fp8 STEP1)
         if _USE_FP8_STEP1:
-            grad_swiglu, dispatch_l2_grad = _mxfp8_step1_dispatch_dgrad(
+            grad_swiglu, dispatch_l2_grad_fp8 = _mxfp8_step1_dispatch_dgrad(
                 dy, w2, ctx.group, handle, ctx.block_m, ctx.block_n,
             )
         else:
@@ -319,8 +341,12 @@ class MegaMoEFusedMxfp8Function(torch.autograd.Function):
         # dW2: dispatch_l2_grad^T @ act_weighted (variable-K wgrad). MXFP8 (fp8 colwise) by
         # default; bf16 path kept for isolating the fp8-dW2 effect (_USE_FP8_DW2=False).
         if _USE_FP8_DW2:
-            dW2 = _mxfp8_variable_k_wgrad(dispatch_l2_grad, act_weighted, group_lens, group_offs)
+            dW2 = _mxfp8_variable_k_wgrad(
+                dispatch_l2_grad, act_weighted, group_lens, group_offs, a_fp8=dispatch_l2_grad_fp8
+            )
         else:
+            if dispatch_l2_grad is None:  # fp8 STEP1 but bf16 dW2 -> dequant the pool on demand
+                dispatch_l2_grad = _dequant_pool_fp8_bf16(get_symm_buffer_for_mega_moe())
             dW2 = grouped_gemm_variable_k_impl(
                 dispatch_l2_grad, act_weighted, group_lens, group_offs,
                 trans_a=True, trans_b=False, trans_c=False, num_cu=None, default_backend=triton_be,

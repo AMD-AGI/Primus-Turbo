@@ -42,7 +42,7 @@ import torch
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
 from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_resource
-from flydsl.expr.rocdl import cvt_pk_bf8_f32, cvt_pk_fp8_f32
+from flydsl.expr.rocdl import cvt_f32_fp8, cvt_pk_bf8_f32, cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
 _BLK = 32  # mxfp8 block (M rows per E8M0 scale)
@@ -286,6 +286,170 @@ def colwise_quant_mxfp8_grouped_flydsl(
         BT //= 2
     _compile_colwise_quant_grouped(F, is_e5m2, BT)(
         x, q, s, meta["blk2grp"], meta["lens"], meta["offs32"], meta["offs_pc"],
+        total_M_pad // 4, n_pblk, n_pblk,
+    )
+    return q, s, meta["lens_pc"], meta["offs_pc"]
+
+
+# ── fp8-in fused dequant->colwise-requant (a-branch producer fusion) ─────────────────────────
+# The dW2 `a` operand (`dispatch_l2_grad`) originates from the STEP1 bwd fp8 pool, which is
+# ROWWISE MXFP8 (E4M3 [P,H] + per-1x32-H E8M0 scale [P,H//32]) because that layout is what the
+# STEP1 dgrad MMA contracts. dW2, however, contracts over P and needs the operand quantized
+# COLWISE (along P). The current path dequants the pool to a bf16 `dispatch_l2_grad` (HBM
+# round-trip) then re-quantizes it colwise. This kernel FUSES both: it reads the rowwise-fp8 pool
+# directly, dequants in-register (cvt_f32_fp8 * 2^(e8m0-127)), and emits the colwise (transposed)
+# fp8 operand dW2 wants -- eliminating the bf16 intermediate. Numerically identical to
+# dequant->requant (the pool fp8 dequants exactly), just without the bf16 materialization.
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 256):
+    """Grouped fp8-in colwise MXFP8 transpose-requant.  Same grid/thread structure as
+    ``_compile_colwise_quant_grouped`` (one workgroup == one padded 32-M block x BT-wide F-tile,
+    one output column ``f`` per thread) but the input is ROWWISE-fp8 (E4M3 ``[total_M, F]`` +
+    raw E8M0 ``[total_M, F//32]``): each of the 32 M-values is decoded (``cvt_f32_fp8`` + the raw
+    E8M0 rowwise scale ``2^(e8m0-127)``) before the colwise (along-M) amax/requant.
+
+    The rowwise E8M0 scale is SHARED by 32 consecutive output columns (``scol = f//32``), so the
+    workgroup stages its whole (32-M x ``BT/32``-scol) scale slab in LDS ONCE (BT threads, one byte
+    each) and each thread reads its 32 scales from LDS -- removing the 32x redundant global scale
+    loads of the naive per-element path (the kernel is memory-latency bound, so cutting the extra
+    scale loads is the lever)."""
+    assert F % BT == 0, f"F={F} must be a multiple of BT={BT}"
+    assert F % _BLK == 0, f"F={F} must be a multiple of {_BLK} (rowwise scale columns)"
+    assert BT % _BLK == 0, f"BT={BT} must be a multiple of {_BLK} (LDS scale staging)"
+    blk_i32 = _BLK // 4
+    n_ftile = F // BT
+    F32 = F // _BLK  # rowwise E8M0 scale columns (per input row)
+    SCPT = BT // _BLK  # scale columns per F-tile (shared 32-wide); 32 rows * SCPT == BT
+    fp8_max = 57344.0 if is_e5m2_out else 448.0
+    cvt = cvt_pk_bf8_f32 if is_e5m2_out else cvt_pk_fp8_f32
+    mbits = 2 if is_e5m2_out else 3
+    round_add = 1 << (22 - mbits)
+    target_pow2 = 15 if is_e5m2_out else 8
+
+    @fx.struct
+    class Smem:
+        scale: fx.Array[fx.Int32, BT, 16]  # 32-M x SCPT E8M0 bytes (i32) for this F-tile
+
+    @flyc.kernel(known_block_size=[BT, 1, 1])
+    def kern(
+        XQ: fx.Tensor, XS: fx.Tensor, Q: fx.Tensor, S: fx.Tensor,
+        BLK2GRP: fx.Tensor, LENS: fx.Tensor, OFFS: fx.Tensor, OFFS_PC: fx.Tensor,
+        mpad_i32: fx.Int32, npblk: fx.Int32,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        pmb = bid // fx.Int32(n_ftile)                       # padded 32-M block index
+        ftile = bid % fx.Int32(n_ftile)
+        f = ftile * fx.Int32(BT) + tid                       # output column (input free-col)
+        scol_base = ftile * fx.Int32(SCPT)                   # first rowwise scale col of this F-tile
+
+        xqr = create_buffer_resource(XQ, max_size=True)       # fp8 (i8 view) [total_M, F]
+        xsr = create_buffer_resource(XS, max_size=True)       # raw E8M0 uint8 [total_M, F//32]
+        qr = create_buffer_resource(Q, max_size=True)         # fp8 [F, total_M_pad] i32 [F, mpad_i32]
+        sr = create_buffer_resource(S, max_size=True)         # raw uint8 [F, npblk]
+        b2g = create_buffer_resource(BLK2GRP, max_size=True)  # i32 [npblk] -> group id
+        lr = create_buffer_resource(LENS, max_size=True)      # i32 [G] unpadded lens
+        ofr = create_buffer_resource(OFFS, max_size=True)     # i32 [G+1] unpadded row offsets
+        opr = create_buffer_resource(OFFS_PC, max_size=True)  # i32 [G+1] padded block-row offsets
+        scale_lds = fx.SharedAllocator().allocate(Smem).peek().scale
+
+        lo = fx.arith.constant(-fp8_max, type=fx.T.f32())
+        hi = fx.arith.constant(fp8_max, type=fx.T.f32())
+        zero_i32 = fx.arith.constant(0, type=fx.T.i32())
+
+        g = buffer_load(b2g, pmb, vec_width=1, dtype=fx.T.i32())
+        offs_pc_g = buffer_load(opr, g, vec_width=1, dtype=fx.T.i32())
+        in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32())
+        len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32())
+        m_local0 = pmb * fx.Int32(_BLK) - fx.arith.ArithValue(offs_pc_g)
+
+        def row_of(i_local):
+            m_local = fx.arith.ArithValue(m_local0) + i_local
+            real = m_local < fx.arith.ArithValue(len_g)
+            m_eff = fx.arith.select(real, m_local, fx.Int32(0))
+            return real, fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_eff)
+
+        # ── cooperative scale stage: thread tid loads scale[row (tid//SCPT), col (tid%SCPT)] ──
+        li = tid // fx.Int32(SCPT)   # M-row within this 32-block
+        lj = tid % fx.Int32(SCPT)    # scol within this F-tile
+        _, srow = row_of(li)
+        se_ld = buffer_load(xsr, srow * fx.Int32(F32) + (scol_base + lj), vec_width=1, dtype=fx.T.i8())
+        se_ld_i32 = fx.arith.ArithValue(se_ld).extui(fx.T.i32())
+        fx.make_view(fx.add_offset(scale_lds.ptr, fx.make_int_tuple(tid)), fx.make_layout(1, 1)).store(
+            Vec.from_elements([fx.arith._to_raw(se_ld_i32)], fx.Int32)
+        )
+        fx.gpu.barrier()
+
+        scol_local = tid // fx.Int32(_BLK)  # this column's scol within the tile (0..SCPT-1)
+        vals = []
+        for i in range_constexpr(_BLK):
+            real, row = row_of(fx.Int32(i))
+            # decode fp8 (E4M3) byte -> f32
+            qb = buffer_load(xqr, row * fx.Int32(F) + f, vec_width=1, dtype=fx.T.i8())
+            qb_i32 = fx.arith.ArithValue(qb).extui(fx.T.i32())
+            fq = cvt_f32_fp8(fx.T.f32(), fx.arith._to_raw(qb_i32), 0)
+            # rowwise E8M0 scale from LDS: slab index i*SCPT + scol_local; 2^(e8m0-127) = (e8m0<<23)
+            slot = fx.Int32(i * SCPT) + scol_local
+            sv = Vec(fx.make_view(fx.add_offset(scale_lds.ptr, fx.make_int_tuple(slot)),
+                                  fx.make_layout(1, 1)).load())
+            sc = (fx.arith.ArithValue(fx.Int32(sv[0])) << fx.Int32(23)).bitcast(fx.T.f32())
+            dv = fx.arith.mulf(fx.arith.ArithValue(fq), sc)
+            fv = fx.arith.select(real, dv, fx.Float32(0.0))
+            vals.append(fx.arith._to_raw(fv))
+
+        words, biased = _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32)
+        base_i32 = f * fx.arith.ArithValue(mpad_i32) + pmb * fx.Int32(blk_i32)
+        buffer_store(Vec.from_elements(words[0:4], fx.Int32).ir_value(), qr, base_i32)
+        buffer_store(Vec.from_elements(words[4:8], fx.Int32).ir_value(), qr, base_i32 + fx.Int32(4))
+        buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8()), sr,
+                     f * fx.arith.ArithValue(npblk) + pmb)
+
+    @flyc.jit
+    def launch(XQ, XS, Q, S, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_pblk,
+               stream: fx.Stream = fx.Stream(None)):
+        kern(XQ, XS, Q, S, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk).launch(
+            grid=(n_pblk * n_ftile, 1, 1), block=(BT, 1, 1), stream=stream)
+
+    return launch
+
+
+def colwise_requant_mxfp8_grouped_fp8in_flydsl(
+    q_in: torch.Tensor, s_in: torch.Tensor, out_dtype: torch.dtype,
+    group_lens: torch.Tensor = None, group_offs: torch.Tensor = None,
+    meta: dict = None, BT: int = 256,
+):
+    """Grouped fp8-in colwise (along-M) MXFP8 transpose-requant, per-group M padded to 128.
+
+    Drop-in replacement for ``colwise_quant_mxfp8_grouped_flydsl`` when the operand is already the
+    STEP1 rowwise-fp8 pool (fusing the dequant->requant round-trip).
+
+    Args:
+        q_in: rowwise-fp8 (E4M3) ``[total_M, F]`` (the dispatched-dy pool).
+        s_in: raw E8M0 rowwise scale, uint8 ``[total_M, F//32]``.
+        out_dtype: colwise output fp8 encoding (``float8_e5m2`` default dW2 / ``float8_e4m3fn``).
+        group_lens/group_offs: int ``[G]`` / ``[G+1]`` (unpadded) -- used if ``meta`` is None.
+        meta: precomputed ``colwise_grouped_meta`` (share across both dW2 operands).
+
+    Returns ``(q, s, lens_pc, offs_pc)`` (identical layout to ``colwise_quant_mxfp8_grouped_flydsl``):
+        q: fp8 ``[F, total_M_pad]``   s: uint8 ``[F, total_M_pad//32]``.
+    """
+    assert q_in.dim() == 2 and s_in.dim() == 2, "q_in [total_M, F], s_in [total_M, F//32]"
+    _, F = q_in.shape
+    assert s_in.shape[1] == F // _BLK, f"s_in cols {s_in.shape[1]} != F//32 {F // _BLK}"
+    is_e5m2_out = out_dtype == torch.float8_e5m2
+    if meta is None:
+        meta = colwise_grouped_meta(group_lens, group_offs)
+    total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
+    q = torch.empty((F, total_M_pad), dtype=out_dtype, device=q_in.device)
+    s = torch.empty((F, n_pblk), dtype=torch.uint8, device=q_in.device)
+    while F % BT != 0:
+        BT //= 2
+    xq = q_in.view(torch.uint8)
+    xs = s_in.contiguous().view(torch.uint8)
+    _compile_colwise_requant_grouped_fp8in(F, is_e5m2_out, BT)(
+        xq, xs, q, s, meta["blk2grp"], meta["lens"], meta["offs32"], meta["offs_pc"],
         total_M_pad // 4, n_pblk, n_pblk,
     )
     return q, s, meta["lens_pc"], meta["offs_pc"]
