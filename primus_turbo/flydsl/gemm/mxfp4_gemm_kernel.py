@@ -387,6 +387,7 @@ class MfmaScaleFp4:
         sca_voff=None,
         ki=None,
         sc_buf_stride=0,
+        tail128=None,
         _cache={},  # noqa: B006 -- deliberate cross-call asm compile cache
     ):
         """WHOLE-LOOP bare-asm: the ENTIRE K-loop is ONE inline-asm hw-loop. 2 LDS
@@ -438,6 +439,7 @@ class MfmaScaleFp4:
             self.coop,
             _TACC,
             ki,
+            tail128 is not None,
         )
         if key not in _cache:
             o_acc = list(range(NT))
@@ -517,6 +519,14 @@ class MfmaScaleFp4:
             i += 1  # scale per-lane gmem voffset
             i_sca0 = [i + g for g in range(4)]
             i += 4  # scale soffset inits (A-g0, A-g1, BL, BR)
+            if tail128 is not None:
+                # 128-tail block operand + scale soffsets (block ki = the trailing 128 K)
+                i_soff_ta = i
+                i_soff_tbl = i + 1
+                i_soff_tbr = i + 2
+                i_sca_ta = i + 3
+                i_sca_tb = i + 4
+                i += 5
 
             def emit_ds(buf, off=0):
                 # operands only; scales are VGPR-direct (emit_sc_vgpr in the loop).
@@ -854,6 +864,71 @@ class MfmaScaleFp4:
                                                 f"${_bt}, ${_q}, ${_sat}, ${_sbt} {_osel} cbsz:4 blgp:4"
                                             )
 
+            if tail128 is not None:
+                # ── 128-tail: trailing 128-K block, ONE scaled MFMA per acc (n_sub=1).
+                # Zero-waste K%256==128 support: read the REAL last 128 K (no 256-pad).
+                # Fresh g2s of block ki into buf0 via dedicated soffsets (decoupled from
+                # the loop pipeline), barrier, ds_read the s=0 fragments, MFMA once.
+                L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
+                L.append(f"s_mov_b32 ${o_sa}, ${i_soff_ta}")
+                L.append(f"s_mov_b32 ${o_sbl}, ${i_soff_tbl}")
+                L.append(f"s_mov_b32 ${o_sbr}, ${i_soff_tbr}")
+                L.append(f"s_mov_b32 ${o_sca[0]}, ${i_sca_ta}")
+                L.append(f"s_mov_b32 ${o_sca[2]}, ${i_sca_tb}")
+                L += emit_g2s(0, o_sa, o_sbl, o_sbr)  # operand block ki -> buf0 LDS
+                L += emit_sc_vgpr(0)  # block ki scales -> pinned VGPR (s=0 used)
+                L.append("s_waitcnt vmcnt(0)")
+                L.append("s_barrier")
+                for _ii in range(nta):  # ds_read s=0 fragments only
+                    L.append(f"ds_read_b128 ${t_a + _ii * n_sub}, ${i_ab[0][0]} offset:{_ii * ts_a}")
+                for _ji in range(ntb):
+                    L.append(f"ds_read_b128 ${t_bl + _ji * n_sub}, ${i_blb[0][0]} offset:{_ji * ts_b}")
+                for _ji in range(ntb):
+                    L.append(f"ds_read_b128 ${t_br + _ji * n_sub}, ${i_brb[0][0]} offset:{_ji * ts_b}")
+                L.append("s_waitcnt lgkmcnt(0)")
+                _scb[0] = 0
+                _bm, _bn = 4, 8
+                _ncol = 2 * ntb
+                _nib = nta // _bm
+                _ncb = _ncol // _bn
+                for _D in range(_nib + _ncb - 1):
+                    for _iib in range(_nib):
+                        _cb = _D - _iib
+                        if 0 <= _cb < _ncb:
+                            for _di in range(_bm):
+                                for _dj in range(_bn):
+                                    _s = 0  # n_sub=1: only the first (real) 128-K sub-block
+                                    _ii = _iib * _bm + _di
+                                    _col = _cb * _bn + _dj
+                                    _sl = _col // ntb
+                                    _ji = _col % ntb
+                                    _tb = t_bl if _sl == 0 else t_br
+                                    _sbfn = sbl_t if _sl == 0 else sbr_t
+                                    _q = _sl * nq + _ii * ntb + _ji
+                                    _oa, _ob = _ii % 4, _ji
+                                    _at = t_a + _ii * n_sub + _s
+                                    _bt = _tb + _ji * n_sub + _s
+                                    _sat = sa_t(_s, _ii // 4)
+                                    _sbt = _sbfn(_s)
+                                    if _TACC:
+                                        _osel = (
+                                            f"op_sel:[{_ob & 1},{_oa & 1},0] "
+                                            f"op_sel_hi:[{(_ob >> 1) & 1},{(_oa >> 1) & 1},0]"
+                                        )
+                                        L.append(
+                                            f"v_mfma_scale_f32_16x16x128_f8f6f4 ${_q}, ${_bt}, "
+                                            f"${_at}, ${_q}, ${_sbt}, ${_sat} {_osel} cbsz:4 blgp:4"
+                                        )
+                                    else:
+                                        _osel = (
+                                            f"op_sel:[{_oa & 1},{_ob & 1},0] "
+                                            f"op_sel_hi:[{(_oa >> 1) & 1},{(_ob >> 1) & 1},0]"
+                                        )
+                                        L.append(
+                                            f"v_mfma_scale_f32_16x16x128_f8f6f4 ${_q}, ${_at}, "
+                                            f"${_bt}, ${_q}, ${_sat}, ${_sbt} {_osel} cbsz:4 blgp:4"
+                                        )
+
             # ── register pinning (PIN + PINSC): scales LOW (PINBASE), frags after ──
             # Bypasses the LLVM RA "Cannot decrease cascade number" crash and aligns
             # the scale literals to the PINBASE base that emit_sc_vgpr writes.
@@ -882,6 +957,7 @@ class MfmaScaleFp4:
                 + ["s", "s"]  # scale rsrc A, B
                 + ["v"]  # scale voffset
                 + ["s", "s", "s", "s"]  # scale soffset inits (A-g0, A-g1, BL, BR)
+                + (["s"] * 5 if tail128 is not None else [])  # 128-tail soffsets (A/BL/BR + scA/scB)
                 + [str(q) for q in o_acc]
             )  # tied accs
             st = (
@@ -929,6 +1005,9 @@ class MfmaScaleFp4:
         ins.append(_raw(sc_voff))  # scale voffset
         for g in range_constexpr(4):
             ins.append(_raw(sc_soff0[g]))  # scale soffset inits
+        if tail128 is not None:
+            for _t in tail128:  # (soff_a, soff_bl, soff_br, sc_a, sc_b) for block ki
+                ins.append(_raw(_t))
         for q in range_constexpr(nq):
             ins.append(_raw(cL[q]))
         for q in range_constexpr(nq):

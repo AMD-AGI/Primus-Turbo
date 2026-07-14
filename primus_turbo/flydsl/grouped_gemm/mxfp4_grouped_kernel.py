@@ -195,20 +195,22 @@ def _build_grouped_mxfp4_nt_kernel(
 ):
     """Grouped MXFP4 NT (out = a @ b^T), per-group A rows + per-expert B, whole-loop compute.
 
-    ``k_real`` (<= K, 128-multiple): the operands' TRUE contraction (row stride). K is the
-    256-rounded tile/scale extent. When k_real < K the last 256-block's second 128-sub is
-    the over-read tail: its operand reads past the real row (garbage) but its scale is the
-    zero-padded region (E8M0 0 ~= 0), so it contributes ~0 -- no operand K-pad copy needed."""
+    K = 256-rounded tile/scale extent (the tiny E8M0 scale is zero-padded to it so the
+    preshuffle packs whole 256-blocks). ``k_real`` (<= K, 128-multiple) = the operands' TRUE
+    contraction (row stride, no operand pad). When k_real%256==128 the loop runs
+    k_real//256 full 256-blocks + ONE 128-K tail MFMA (reads the real last 128 K, its scale
+    is the block's s=0 in the padded packing) -- zero operand copy, zero wasted compute."""
     BLOCK_M = BLOCK_N = BLOCK_K = _BLOCK
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     swizzle = True
-    assert K % BLOCK_K == 0
-    KI = K // BLOCK_K
+    _KR = K if k_real is None else k_real  # operand true contraction (128-multiple)
+    assert K % 256 == 0 and _KR % 128 == 0
+    KI = _KR // BLOCK_K  # FULL 256-blocks over the REAL K; trailing 128 -> 128-tail
+    _K128TAIL = (_KR // 128) % 2  # 1 => trailing 128-K block handled by the 128-tail
     NABUF, NBB, OCC = 2, 2, 1
     N_SUB = BLOCK_K // 128
     BPR = BLOCK_K // 2
     KSTEP = BPR
-    _KR = K if k_real is None else k_real  # operand true contraction
     K2 = _KR // 2  # operand row stride (bytes) = real K (no operand K-pad)
     N_TILES_A = BLOCK_M // 32
     LDS_BN_HALF = BLOCK_N // 2
@@ -408,6 +410,18 @@ def _build_grouped_mxfp4_nt_kernel(
         _soa = rocdl.readfirstlane(T.i32, _wia * I32(K128) * I32(512))
         _sob = rocdl.readfirstlane(T.i32, b_exp_bytes + _wib * I32(K128) * I32(512))
         sc_soff06 = [_soa, _sc1, _sob, _sc3]
+        _tail128 = None
+        if const_expr(_K128TAIL):
+            # trailing 128-K block (block KI): operand + s=0 scale soffsets. _scvt = the
+            # whole-loop's per-256-block scale advance (64*(2*N_SUB)*4).
+            _scvt = 64 * (2 * N_SUB) * 4
+            _tail128 = (
+                rocdl.readfirstlane(T.i32, a_off + I32(KI * KSTEP)),
+                rocdl.readfirstlane(T.i32, bl_off + I32(KI * KSTEP)),
+                rocdl.readfirstlane(T.i32, br_off + I32(KI * KSTEP)),
+                rocdl.readfirstlane(T.i32, _soa + I32(KI * _scvt)),
+                rocdl.readfirstlane(T.i32, _sob + I32(KI * _scvt)),
+            )
         accL, accR = mfma.call_mxfp4_wholeloop(
             a_base6,
             bl_base6,
@@ -440,6 +454,7 @@ def _build_grouped_mxfp4_nt_kernel(
             sc_soff06,
             ki=KI,
             sc_buf_stride=(_SCBUF * 4),
+            tail128=_tail128,
         )
         base_row = m_row + I32(wave_m_off)
         base_col_l = bn * I32(BLOCK_N) + I32(wave_n_off)
@@ -540,10 +555,10 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     N_out = N  # true free dim to return
 
     # Free dim N: NO host pad -- the kernel tiles the real N (ceildiv) and masks store
-    # cols >= N (StoreCPlain n_valid), so a non-256 N runs natively with no operand copy.
-    # Contraction K: the OPERANDS stay at their real (128-padded) K (no copy); only the tiny
-    # E8M0 SCALE is zero-padded to 256 so the over-read tail 128-sub multiplies by ~0. The
-    # whole-loop tiles K256; k_real is the operands' true row stride.
+    # cols >= N (StoreCPlain n_valid). Contraction K: OPERANDS stay real (k_real, no copy);
+    # only the tiny E8M0 SCALE is zero-padded to 256 so the preshuffle packs whole 256-blocks
+    # and the trailing-128 block's s=0 scale is present. The whole-loop runs k_real//256 full
+    # 256-blocks + a 128-tail (one MFMA/acc) for the trailing 128 -- zero operand copy/waste.
     k_real = K
     K256 = (K + 255) // 256 * 256
     au = a.contiguous().view(torch.uint8)  # [total_M, k_real/2] -- real K, not padded
