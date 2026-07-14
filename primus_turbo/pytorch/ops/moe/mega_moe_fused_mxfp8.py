@@ -39,9 +39,13 @@ from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_bwd_kernel import 
 from primus_turbo.flydsl.mega.fp8.grouped_gemm_combine_fp8_kernel import (
     grouped_gemm_combine_fp8,
 )
+from primus_turbo.flydsl.mega.fp8.grouped_gemm_combine_mxfp8_kernel import (
+    grouped_gemm_combine_mxfp8_bwd,
+)
 from primus_turbo.flydsl.mega.fp8.quant import (
     quantize_grouped_weight_mxfp8,
     quantize_grouped_weight_mxfp8_cached,
+    quantize_rowwise_mxfp8,
 )
 from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.swiglu_kernel import swiglu, swiglu_backward
@@ -57,9 +61,6 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 )
 from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (
     dispatch_grouped_gemm_impl,
-)
-from primus_turbo.pytorch.kernels.mega_moe.grouped_gemm_combine_impl import (
-    grouped_gemm_combine_impl,
 )
 from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (
     colwise_grouped_meta,
@@ -135,6 +136,21 @@ def _w2t_mxfp8_cached(w2):
         v = quantize_grouped_weight_mxfp8(w2.transpose(1, 2).contiguous())  # [G,I,H]
         _W2T_FP8_CACHE.clear()
         _W2T_FP8_CACHE[key] = v
+    return v
+
+
+_W1T_FP8_CACHE: dict = {}
+
+
+def _w1t_mxfp8_cached(w1):
+    """Grouped mxfp8 quant of ``w1^T`` (``[G,H,2I]``) for the fp8 STEP3 fc1-dgrad NT-reuse combine;
+    cached (w1 static -> transpose + quant once per weight version)."""
+    key = (w1.data_ptr(), int(w1._version))
+    v = _W1T_FP8_CACHE.get(key)
+    if v is None:
+        v = quantize_grouped_weight_mxfp8(w1.transpose(1, 2).contiguous())  # [G,H,2I]
+        _W1T_FP8_CACHE.clear()
+        _W1T_FP8_CACHE[key] = v
     return v
 
 
@@ -280,12 +296,16 @@ class MegaMoEFusedMxfp8Function(torch.autograd.Function):
         # requant-fused directly from the STEP1 rowwise-fp8 pool.
         dW2 = _mxfp8_variable_k_wgrad(dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs)
 
-        # STEP 3 (bf16): L1 dgrad + combine PUSH + dx reduce + grad_gate scatter
-        dx, grad_topk_weights_flat = grouped_gemm_combine_impl(
-            grad_l1, w1, list(handle), BackendType.FLYDSL.value,
-            topk_indices=topk_idx.contiguous().view(-1), topk_weights=None,
-            grad_gate=grad_gate, num_combine_cu=16, num_reduce_cu=0,
-            layout="nn", BM=ctx.block_m, BN=ctx.block_n,
+        # STEP 3 (MXFP8): fc1 dgrad + combine PUSH + dx reduce + grad_gate scatter. NT-reuse via
+        # w1^T (cached fp8) + rowwise-fp8 grad_l1; the combine/reduce stay bf16 (byte-bound).
+        w1tq, w1ts = _w1t_mxfp8_cached(w1)
+        # C++ rowwise quant: the combine preshuffle expects this raw-E8M0 layout (the FlyDSL rowwise
+        # quant's scale layout is incompatible here -> non-finite).
+        grad_l1_q, grad_l1_s = quantize_rowwise_mxfp8(grad_l1)
+        dx, grad_topk_weights_flat = grouped_gemm_combine_mxfp8_bwd(
+            grad_l1_q, grad_l1_s, w1tq, w1ts, list(handle), ctx.group,
+            topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
+            BM=ctx.block_m, BN=ctx.block_n, num_combine_cu=16,
         )
 
         # dW1 (bf16): pool(x)^T @ grad_l1 (variable-K TN wgrad; re-dispatch saved x)

@@ -90,6 +90,7 @@ def _compile(
     agpr_alloc=0,
     out_fp16=False,
     apply_weights=True,
+    with_gate=False,
 ):
     K = hidden_size
     K128 = K // 128
@@ -102,12 +103,13 @@ def _compile(
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
     gemm_grid_blocks = worst_case_tiles * n_blocks
     comb_records = combine_slots * out_features * 2  # bf16 peer combine-buffer bound (bytes)
+    gate_records = combine_slots * 4  # f32 gate slots per peer (backward d_topk_w scatter)
     delta_records = num_ranks * 8
     pool_records = num_max_pool_tokens * 4
     dedicated_reduce_warps = num_reduce_cu * _NUM_WARPS
     gemm_base = num_combine_cu + num_reduce_cu
     GN = G * out_features  # flattened B rows [G*H]
-    topk_reduce = _get_topk_reduce(True, apply_weights, False)
+    topk_reduce = _get_topk_reduce(True, apply_weights, with_gate)
     pre_kern, n_kt = build_preshuffle_ab_kernel(K128)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
@@ -122,6 +124,8 @@ def _compile(
         TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor,
         TOPK_WEIGHTS: fx.Tensor,
+        GRAD_GATE: fx.Tensor,  # f32 [num_max_pool_tokens] (backward gate scatter); dummy if not with_gate
+        D_TOPK_W: fx.Tensor,   # f32 [combine_slots] gate-grad fold out; dummy if not with_gate
         sym_layout: SymLayout,
         c_n: fx.Int32,
     ):
@@ -162,6 +166,17 @@ def _compile(
         num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
         real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+        # backward gate scatter (push to peer combine_gate) + local gate read + fresh d_topk_w fold
+        grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
+        gate_base = sym_layout.combine_gate_ptr if with_gate else None
+        main_delta_res = (
+            create_buffer_resource_from_addr(sym_layout.offsets_ptr, num_records_bytes=delta_records)
+            if with_gate else None
+        )
+        gate_local_res = (
+            create_buffer_resource_from_addr(gate_base, num_records_bytes=gate_records) if with_gate else None
+        )
+        d_topk_w_res = create_buffer_resource(D_TOPK_W, max_size=True) if with_gate else None
 
         push_block = combine_bf16_tile(
             thread_index=thread_index,
@@ -176,7 +191,11 @@ def _compile(
             signal_delta_res=signal_delta_res,
             barrier_base=barrier_base,
             enable_barrier=True,
-            with_gate=False,
+            grad_gate_res=grad_gate_res,
+            gate_base=gate_base,
+            main_delta_res=main_delta_res,
+            gate_records=gate_records,
+            with_gate=with_gate,
         )
 
         if block_index < combine_cu:
@@ -207,7 +226,8 @@ def _compile(
                 topk_reduce(
                     thread_index, block_index - combine_cu, fx.Int32(dedicated_reduce_warps),
                     topk, out_features, num_experts, rank, comb_local_res, output_res,
-                    topk_indices_res, num_tokens_res, barrier_base, topk_weights_res, None, None,
+                    topk_indices_res, num_tokens_res, barrier_base, topk_weights_res,
+                    gate_local_res, d_topk_w_res,
                 )
             else:
                 # ── role 3: GROUPED MXFP8 GEMM (one tile -> L2Y, signal scoreboard) ──
@@ -254,7 +274,8 @@ def _compile(
                     topk_reduce(
                         thread_index, empty_ordinal, total_empty_warps, topk, out_features,
                         num_experts, rank, comb_local_res, output_res, topk_indices_res,
-                        num_tokens_res, barrier_base, topk_weights_res, None, None,
+                        num_tokens_res, barrier_base, topk_weights_res,
+                        gate_local_res, d_topk_w_res,
                     )
 
     @flyc.jit
@@ -271,6 +292,8 @@ def _compile(
         TOPK_INDICES,
         NUM_TOKENS_PER_RANK,
         TOPK_WEIGHTS,
+        GRAD_GATE,
+        D_TOPK_W,
         sym_layout,
         c_n: int,
         a_blocks: int,
@@ -287,7 +310,7 @@ def _compile(
         grid_size = gemm_base + worst_case_tiles * n_blocks
         grouped_gemm_combine_mxfp8_kernel(
             ACT, A_SP, WEIGHTS, B_SP, TILE_TO_GROUP, NUM_TILE_BLOCKS, OUTPUT, TOPK_INDICES,
-            NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, sym_layout, c_n,
+            NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, GRAD_GATE, D_TOPK_W, sym_layout, c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -355,13 +378,14 @@ def grouped_gemm_combine_mxfp8(
         int(topk), int(num_experts), int(rank), int(num_ranks), int(G),
         cbsz=cbsz, blgp=blgp,
     )
+    _dummy = num_tile_blocks  # placeholder for the (off) backward gate buffers
     args = (
         a8, a_raw, a_sp, b8, b_raw, b_sp, tile_to_expert, num_tile_blocks, output.view(-1),
-        topk_indices_d, symm.num_tokens_per_rank, topk_weights_d, sym_layout, out_features,
+        topk_indices_d, symm.num_tokens_per_rank, topk_weights_d, _dummy, _dummy, sym_layout, out_features,
         a_blocks, a_ngrp, b_ngrp, torch.cuda.current_stream(),
     )
     ck = (out_features, I, M, BM, BN, int(num_combine_cu), int(num_reduce_cu), int(combine_slots),
-          int(topk), int(num_experts), int(rank), int(num_ranks), int(G), cbsz, blgp)
+          int(topk), int(num_experts), int(rank), int(num_ranks), int(G), cbsz, blgp, False)
     if torch.cuda.is_current_stream_capturing():
         launch(*args)
     else:
@@ -371,3 +395,84 @@ def grouped_gemm_combine_mxfp8(
             _MXFP8_COMBINE_COMPILED[ck] = compiled
         compiled(*args)
     return output
+
+
+def grouped_gemm_combine_mxfp8_bwd(
+    aq: torch.Tensor,
+    as_: torch.Tensor,
+    w1tq: torch.Tensor,
+    w1ts: torch.Tensor,
+    handle,
+    group,
+    *,
+    topk_indices: torch.Tensor,
+    grad_gate: torch.Tensor,
+    BM: int = 256,
+    BN: int = 256,
+    num_combine_cu: int = 16,
+    num_reduce_cu: int = 0,
+):
+    """Backward STEP3: fused MXFP8 fc1-dgrad GEMM + combine PUSH + UNWEIGHTED top-k reduce + gate
+    scatter. The conjugate of STEP1 dispatch (expert->token). NT-reuse of the down-proj combine:
+    ``dx_pool[P,H] = grad_l1[P,2I] @ w1^T[G,H,2I]^T`` (contract 2I). Reuses bf16 combine/reduce.
+
+    ``aq`` [M,2I] fp8 grad_l1 + ``as_`` [M,2I//32] raw E8M0 (M = num_max_pool_tokens);
+    ``w1tq`` [G,H,2I] fp8 (w1 TRANSPOSED) + ``w1ts`` [G,H,2I//32] raw E8M0; ``grad_gate``
+    [num_max_pool_tokens] f32. Returns ``(dx [num_tokens,H] bf16, d_topk_w [combine_slots] f32)``.
+    The routing weight is already folded into grad_l1 upstream -> unweighted reduce."""
+    tile_to_expert = handle[7]
+    symm = get_symm_buffer_for_mega_moe()
+    sym_layout = symm.make_sym_layout()
+
+    M, K = aq.shape  # K = 2I (fc1 gate||up contraction)
+    G, H, Kw = w1tq.shape
+    assert Kw == K, f"w1^T K={Kw} != grad_l1 K={K}"
+    assert M == int(sym_layout.num_max_pool_tokens), "aq rows must match pool capacity"
+    assert H == int(sym_layout.hidden), f"w1^T N={H} != SymLayout hidden {int(sym_layout.hidden)}"
+    assert aq.dtype in (torch.float8_e4m3fn, torch.float8_e5m2), "takes pre-quantized fp8 grad_l1"
+    K128 = K // 128
+    GN = G * H
+    out_features = H
+    cbsz = 1 if aq.dtype == torch.float8_e5m2 else 0
+    blgp = 1 if w1tq.dtype == torch.float8_e5m2 else 0
+
+    combine_slots = int(sym_layout.combine_slots)
+    num_ranks = int(sym_layout.num_ranks)
+    rank = int(sym_layout.rank_idx)
+    topk = int(sym_layout.num_topk)
+    num_experts = int(sym_layout.num_experts)
+    num_tile_blocks = symm.meta_scalars[1:2]
+
+    a8 = aq.contiguous().view(torch.int8)
+    b8 = w1tq.contiguous().reshape(GN, K).view(torch.int8)
+    a_raw = as_.contiguous().view(torch.int32).reshape(-1)
+    b_raw = w1ts.contiguous().reshape(GN, K // 32).view(torch.int32).reshape(-1)
+    a_sp, b_sp, a_blocks, a_ngrp, b_ngrp = _get_grouped_mx_workspace(M, GN, K128, aq.device)
+
+    num_tokens = int(symm.num_tokens)
+    output = torch.empty(num_tokens, out_features, dtype=torch.bfloat16, device=aq.device)
+    d_topk_w = torch.empty(combine_slots, dtype=torch.float32, device=aq.device)
+    topk_indices_d = topk_indices.contiguous().view(-1)
+    grad_gate_d = grad_gate.contiguous().view(-1)
+
+    launch = _compile(
+        out_features, K, M, BM, BN, int(num_combine_cu), int(num_reduce_cu), int(combine_slots),
+        int(topk), int(num_experts), int(rank), int(num_ranks), int(G),
+        cbsz=cbsz, blgp=blgp, apply_weights=False, with_gate=True,
+    )
+    args = (
+        a8, a_raw, a_sp, b8, b_raw, b_sp, tile_to_expert, num_tile_blocks, output.view(-1),
+        topk_indices_d, symm.num_tokens_per_rank, num_tile_blocks, grad_gate_d, d_topk_w,
+        sym_layout, out_features, a_blocks, a_ngrp, b_ngrp, torch.cuda.current_stream(),
+    )
+    ck = (out_features, K, M, BM, BN, int(num_combine_cu), int(num_reduce_cu), int(combine_slots),
+          int(topk), int(num_experts), int(rank), int(num_ranks), int(G), cbsz, blgp, True)
+    if torch.cuda.is_current_stream_capturing():
+        launch(*args)
+    else:
+        compiled = _MXFP8_COMBINE_COMPILED.get(ck)
+        if compiled is None:
+            compiled = flyc.compile(launch, *args)
+            _MXFP8_COMBINE_COMPILED[ck] = compiled
+        compiled(*args)
+    return output, d_topk_w
