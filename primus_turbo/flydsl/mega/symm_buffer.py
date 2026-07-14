@@ -4,315 +4,326 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import warnings
-from collections import namedtuple
-from dataclasses import dataclass
-from functools import lru_cache
-from math import prod
 
-import flydsl.expr as fx
+import ctypes
+from typing import Callable, List, Optional, Tuple
+
 import torch
-from flydsl.expr import Int32, Int64, struct
-from flydsl.expr.buffer_ops import buffer_load
-from flydsl.expr.typing import Constexpr
+from flydsl.expr.numeric import Int64
+from flydsl.expr.typing import AddressSpace, Pointer, PointerType, address_space_from_attr
 
-from primus_turbo.flydsl.mega.prims import addr_buffer_resource
-
-__all__ = [
-    "SymmBuffer",
-    "get_symm_buffer_for_mega_moe",
-    "SymLayout",
-    "sym_map",
-    "make_sym_layout_type",
-    "make_sym_layout_meta",
-    "LayoutConfig",
-]
-
-BLOCK_M = 256  # pool-block granularity (fixed policy)
-TOKEN_DTYPE = torch.bfloat16  # dispatched-token dtype for the pool / L2 / combine buffers
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+except Exception as exception:  # pragma: no cover
+    print(f"Failed to load mega symmetric memory, please check your PyTorch version: {exception}")
 
 
-def align_up(value: int, alignment: int) -> int:
+def align(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+NUM_MAX_RANKS = 72
+BLOCK_M = 256  # pool-block granularity + pool alignment
+
+# default dispatched-token dtype; override via ``token_dtype`` to target fp8, etc.
+TOKEN_DTYPE = torch.bfloat16
+TOKEN_ALIGNMENT = 128  # get_token_alignment_for_mega_moe
 
 
 def get_num_max_pool_tokens(
     num_ranks: int, num_max_tokens_per_rank: int, num_topk: int, num_experts_per_rank: int
 ) -> int:
-    """Worst-case pool capacity: all ranks send max tokens + per-expert BLOCK_M padding."""
+    """Worst-case shared expert pool capacity + per-expert BLOCK_M padding (256-aligned)."""
     num_max_recv_tokens = num_ranks * num_max_tokens_per_rank
     num_max_experts_per_token = min(num_topk, num_experts_per_rank)
-    return align_up(
-        num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (BLOCK_M - 1), BLOCK_M
+    return align(
+        num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (BLOCK_M - 1),
+        BLOCK_M,
     )
 
 
-# --- layout config: pure dimensions, decoupled from IPC allocation -------------
+class SymBuffer:
+    """Pure addressing handle (base + peer deltas + ``map``); one i64 table (base at [NUM_MAX_RANKS]) so it loop-carries through kernel control flow."""
 
+    def __init__(self, container: List[int], rank_idx: int, device: Optional[torch.device] = None) -> None:
+        self.rank_idx = rank_idx
+        self.num_ranks = len(container)
+        size = len(container)
+        self.base = container[rank_idx]
+        # _offsets[i] = peer_base - base (zero-padded to NUM_MAX_RANKS); private -- reach peers via map()
+        self._offsets = [container[i] - self.base if i < size else 0 for i in range(NUM_MAX_RANKS)]
+        self._device = device
+        self._offsets_tensor = None  # lazy device-side table for kernel launches
 
-@dataclass(frozen=True)
-class LayoutConfig:
-    """All dims the RegionSpecs and SymLayout need. Pure data -> sizing is testable without IPC."""
+    def _offsets_device_ptr(self) -> int:
+        # build the i64 table once (deltas + base packed at [NUM_MAX_RANKS]); keep it alive on self
+        if self._offsets_tensor is None:
+            self._offsets_tensor = torch.tensor(
+                self._offsets + [self.base],
+                dtype=torch.int64,
+                device=self._device if self._device is not None else "cuda",
+            )
+        return self._offsets_tensor.data_ptr()
 
-    num_ranks: int
-    num_experts: int
-    num_experts_per_rank: int
-    num_max_tokens_per_rank: int
-    num_topk: int
-    hidden: int
-    intermediate_hidden: int
-    num_max_pool_tokens: int
-    num_max_pool_blocks: int
-    num_combine_slots: int
+    # -------- JitArgument protocol (host side) --------
+    def __get_ir_types__(self) -> list:
+        i64 = Int64.ir_type
+        space = address_space_from_attr(AddressSpace.Global)
+        return [PointerType.get(i64, space, 8)]
 
+    def __cache_signature__(self) -> tuple:
+        # only rank count specializes it; dims ride each kernel's constexpr, not the handle
+        return (type(self), self.num_ranks)
+
+    def __c_abi_spec__(self) -> list:
+        def fill_offsets(a, s):
+            s.value = a._offsets_device_ptr()
+
+        return [(ctypes.c_void_p, fill_offsets)]
+
+    # -------- DslType protocol (device side) --------
     @classmethod
-    def build(
-        cls, num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
-    ) -> "LayoutConfig":
-        """Derive the full config (pool capacity, block count, combine slots) from raw MoE dims."""
-        assert num_experts % num_ranks == 0, f"num_experts {num_experts} not divisible by ranks {num_ranks}"
-        num_experts_per_rank = num_experts // num_ranks
-        num_max_pool_tokens = get_num_max_pool_tokens(
-            num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank
-        )
-        return cls(
-            num_ranks=num_ranks,
-            num_experts=num_experts,
-            num_experts_per_rank=num_experts_per_rank,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_topk=num_topk,
-            hidden=hidden,
-            intermediate_hidden=intermediate_hidden,
-            num_max_pool_tokens=num_max_pool_tokens,
-            num_max_pool_blocks=num_max_pool_tokens // BLOCK_M,
-            num_combine_slots=num_max_tokens_per_rank * num_topk,
-        )
+    def __construct_from_ir_values__(
+        cls, values: list, exemplar: Optional["SymBuffer"] = None
+    ) -> "SymBuffer":
+        obj = cls.__new__(cls)  # skip host __init__; rebuild from block args
+        obj._offsets = Pointer(values[0])  # i64* table (deltas + base at [NUM_MAX_RANKS])
+        obj.base = None  # device: read from the table via get_base_ptr()
+        obj.num_ranks = exemplar.num_ranks if exemplar is not None else None
+        obj.rank_idx = exemplar.rank_idx if exemplar is not None else None
+        obj._device = None
+        obj._offsets_tensor = None
+        return obj
+
+    def __extract_to_ir_values__(self) -> list:
+        return [self._offsets]
+
+    # -------- get_base_ptr / map (python int on host, device ops in a kernel) --------
+    def get_base_ptr(self):
+        if isinstance(self._offsets, list):  # host
+            return self.base
+        # device: base is packed at the end of the table
+        return self._offsets[NUM_MAX_RANKS]
+
+    def map(self, ptr, dst_rank_idx):
+        if self.num_ranks == 1:
+            return ptr
+        # host: python int add; device: Pointer load (i64) + ptr
+        return self._offsets[dst_rank_idx] + ptr
 
 
-# --- heap layout description ---------------------------------------------------
+class Workspace:
+    """Heap layout owner: 32B barrier header, then each kernel region; ``get_*_ptr`` walk the offsets."""
 
+    NUM_BARRIER_SIGNAL_BYTES = 32
+    NUM_MAX_GRID_SYNC_COUNTERS = 4
 
-class RegionSpec:
-    def __init__(self, dtype: torch.dtype, shape: tuple):
-        self.dtype = dtype
-        self.shape = tuple(shape)
-        self.numel = prod(self.shape)
-
-    def __set_name__(self, owner, name):
-        self.name = name
-
-
-# A RegionSpec resolved to its 256B-aligned byte offset within a concrete heap.
-PlacedRegion = namedtuple("PlacedRegion", ["name", "offset", "dtype", "shape", "nbytes"])
-
-
-@lru_cache(maxsize=None)
-def _region_views_type(names: tuple):
-    # Named view bundle: consumers may unpack by name; positional unpack still works.
-    return namedtuple("RegionViews", names)
-
-
-class _LayoutMeta(type):
-    """Gather the declared RegionSpec fields into ``_region_specs``, in declaration order."""
-
-    def __new__(mcs, name, bases, namespace):
-        cls = super().__new__(mcs, name, bases, namespace)
-        cls._region_specs = tuple(v for v in namespace.values() if isinstance(v, RegionSpec))
-        return cls
-
-
-class _SymLayoutMetaBase(metaclass=_LayoutMeta):
-    """Region-introspection API shared by every layout meta (declaration order == memory order)."""
-
-    @classmethod
-    def region_names(cls) -> tuple:
-        """Region field names, in declaration order."""
-        return tuple(spec.name for spec in cls._region_specs)
-
-    @classmethod
-    def placed_regions(cls):
-        """Regions resolved to 256B-aligned byte offsets (declaration order)."""
-        placed, cursor = [], 0
-        for spec in cls._region_specs:
-            cursor = align_up(cursor, BLOCK_M)
-            nbytes = spec.numel * spec.dtype.itemsize
-            placed.append(PlacedRegion(spec.name, cursor, spec.dtype, spec.shape, nbytes))
-            cursor += nbytes
-        return tuple(placed)
-
-    @classmethod
-    def num_nbytes(cls) -> int:
-        """Total 256B-aligned heap size, for allocation."""
-        last = cls.placed_regions()[-1]
-        return align_up(last.offset + last.nbytes, BLOCK_M)
-
-    @classmethod
-    def describe(cls) -> str:
-        """Human-readable dump of the resolved heap layout (region / offset / bytes) -- for debugging IPC memory."""
-        lines = [f"{cls.__name__} heap layout ({cls.num_nbytes()} bytes total):"]
-        for p in cls.placed_regions():
-            lines.append(f"  {p.name:<24} @ {p.offset:>10}  {p.nbytes:>12} B  {p.dtype} {tuple(p.shape)}")
-        return "\n".join(lines)
-
-    @classmethod
-    def split_buffer(cls, buffer: "torch.Tensor"):
-        """Split a flat int8 IPC heap into one non-owning typed tensor view per region."""
-        from primus_turbo.pytorch.core.symm_mem import _tensor_from_device_ptr
-
-        placed = cls.placed_regions()
-        total_bytes = cls.num_nbytes()
-        buffer_nbytes = buffer.numel() * buffer.element_size()
-        assert buffer_nbytes >= total_bytes, f"buffer too small: {buffer_nbytes} < {total_bytes} bytes"
-        base_addr, device_index = buffer.data_ptr(), buffer.device.index
-        views = [
-            _tensor_from_device_ptr(base_addr + p.offset, p.shape, p.dtype, device_index) for p in placed
-        ]
-        return _region_views_type(cls.region_names())(*views)
-
-
-@lru_cache(maxsize=None)
-def make_sym_layout_meta(token_dtype: torch.dtype, layout_config: LayoutConfig):
-    """Build the heap-layout meta for a token dtype + a concrete LayoutConfig.
-
-    Every region shape reads its dims from ``cfg`` directly (e.g. ``cfg.num_max_pool_tokens``) --
-    no magic strings, so a reader sees exactly which LayoutConfig dim sizes each region. The three
-    token buffers follow ``token_dtype``; every other region has a fixed dtype. Declaration
-    order == memory order.
-    """
-    cfg = layout_config
-
-    # regular class body: the metaclass collects RegionSpecs in declaration order (== memory order)
-    class SymLayoutMeta(_SymLayoutMetaBase):
-        # token buffers: dtype follows the template parameter
-        dispatch_token_pool = RegionSpec(token_dtype, (cfg.num_max_pool_tokens, cfg.hidden))
-        expert_count_buffer = RegionSpec(torch.int32, (cfg.num_ranks, cfg.num_experts))
-        signal = RegionSpec(torch.int32, (cfg.num_ranks,))
-        pool_src_rank = RegionSpec(torch.int32, (cfg.num_max_pool_tokens,))
-        pool_src_slot = RegionSpec(torch.int32, (cfg.num_max_pool_tokens,))
-        weight_recv_buf = RegionSpec(torch.float32, (cfg.num_max_pool_tokens,))
-        combine_gate = RegionSpec(torch.float32, (cfg.num_max_tokens_per_rank, cfg.num_topk))
-        grid_sync_count = RegionSpec(torch.int32, (2,))
-        l2_token_buffer = RegionSpec(token_dtype, (cfg.num_max_pool_tokens, cfg.hidden))
-        # flags: double-buffered, flat 1-D (host slices two banks of X out of 2*X)
-        dispatch_flag = RegionSpec(torch.int64, (2 * cfg.num_max_pool_blocks,))
-        combine_flag = RegionSpec(torch.int64, (2 * cfg.num_max_pool_blocks,))
-        combine_token_buffer = RegionSpec(token_dtype, (cfg.num_combine_slots, cfg.hidden))
-        reduce_flag = RegionSpec(torch.int64, (2 * cfg.num_combine_slots,))
-
-    SymLayoutMeta.token_dtype = token_dtype
-    SymLayoutMeta.cfg = cfg
-    return SymLayoutMeta
-
-
-# --- SymLayout: the flydsl kernel handle over an allocated heap -----------------
-
-
-@struct
-class SymLayout:
-    """Kernel handle over a heap: offsets table + rank + Constexpr shape dims (region ptrs added by make_sym_layout_type)."""
-
-    offsets_ptr: Int64
-    rank_idx: Int32
-    num_ranks: Constexpr[int]
-    num_experts: Constexpr[int]
-    num_experts_per_rank: Constexpr[int]
-    num_max_tokens_per_rank: Constexpr[int]
-    num_topk: Constexpr[int]
-    hidden: Constexpr[int]
-    intermediate_hidden: Constexpr[int]
-    num_max_pool_tokens: Constexpr[int]
-    num_max_pool_blocks: Constexpr[int]
-    num_combine_slots: Constexpr[int]
-
-
-def sym_map(sl: SymLayout, ptr: fx.Numeric, dst_rank: fx.Numeric) -> fx.Numeric:
-    """Remap a local pointer to peer ``dst_rank`` via the IPC delta table."""
-    resource = addr_buffer_resource(sl.offsets_ptr, num_records_bytes=int(sl.num_ranks) * 8)
-    return ptr + buffer_load(resource, dst_rank, vec_width=1, dtype=fx.T.i64())
-
-
-# ptr -> peer-rank ptr mapping, callable as sym_layout.map(ptr, dst_rank)
-SymLayout.map = lambda self, ptr, dst_rank: sym_map(self, ptr, dst_rank)
-
-
-@lru_cache(maxsize=None)
-def make_sym_layout_type(region_names: tuple):
-    """Extend base SymLayout with one Int64 base+offset pointer field per region."""
-    fields = [slice(fd.name, fd.type_spec) for fd in SymLayout.__dsl_field_defs__]
-    fields += [slice(name, Int64) for name in region_names]
-    layout_type = struct[tuple(fields)]
-    layout_type.__dsl_display_name__ = "SymLayout"
-    layout_type.map = SymLayout.map
-    return layout_type
-
-
-class SymmBuffer:
     def __init__(
         self,
-        group,
-        *,
+        base,
+        num_ranks: int,
+        num_experts: int,
+        num_max_tokens_per_rank: int,
+        num_topk: int,
+        hidden: int = 0,
+        token_dtype: torch.dtype = TOKEN_DTYPE,
+    ) -> None:
+        self.base = base
+        self.num_ranks = num_ranks
+        self.num_experts = num_experts
+        self.num_max_tokens_per_rank = num_max_tokens_per_rank
+        self.num_topk = num_topk
+        self.num_experts_per_rank = num_experts // num_ranks
+        self.num_max_pool_tokens = get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk, self.num_experts_per_rank
+        )
+        self.hidden = hidden
+        self.token_dtype = token_dtype
+        self.num_max_pool_blocks = self.num_max_pool_tokens // BLOCK_M
+        self.num_combine_slots = num_max_tokens_per_rank * num_topk
+
+    # each region base = previous + its size, 256B-aligned (gfx950 cross-XCD flag coherence)
+    def get_dispatch_token_pool_ptr(self):
+        return self.base + align(self.NUM_BARRIER_SIGNAL_BYTES, BLOCK_M)
+
+    def get_l2_token_buffer_ptr(self):
+        pool_bytes = align(self.num_max_pool_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
+        return self.get_dispatch_token_pool_ptr() + pool_bytes
+
+    def get_combine_token_buffer_ptr(self):
+        pool_bytes = align(self.num_max_pool_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
+        return self.get_l2_token_buffer_ptr() + pool_bytes
+
+    def get_dispatch_flag_ptr(self):
+        combine_pool_bytes = align(self.num_combine_slots * self.hidden * self.token_dtype.itemsize, BLOCK_M)
+        return self.get_combine_token_buffer_ptr() + combine_pool_bytes
+
+    def get_combine_flag_ptr(self):
+        return self.get_dispatch_flag_ptr() + align(2 * self.num_max_pool_blocks * 8, BLOCK_M)
+
+    def get_reduce_flag_ptr(self):
+        return self.get_combine_flag_ptr() + align(2 * self.num_max_pool_blocks * 8, BLOCK_M)
+
+    def get_expert_count_buffer_ptr(self):
+        return self.get_reduce_flag_ptr() + align(2 * self.num_combine_slots * 8, BLOCK_M)
+
+    def get_pool_src_rank_ptr(self):
+        return self.get_expert_count_buffer_ptr() + align(self.num_ranks * self.num_experts * 4, BLOCK_M)
+
+    def get_pool_src_slot_ptr(self):
+        return self.get_pool_src_rank_ptr() + align(self.num_max_pool_tokens * 4, BLOCK_M)
+
+    def get_weight_recv_buf_ptr(self):
+        return self.get_pool_src_slot_ptr() + align(self.num_max_pool_tokens * 4, BLOCK_M)
+
+    def get_combine_gate_ptr(self):
+        return self.get_weight_recv_buf_ptr() + align(self.num_max_pool_tokens * 4, BLOCK_M)
+
+    def get_end_ptr(self):
+        # past the last region; on a base-0 Workspace this offset is the total heap size
+        return self.get_combine_gate_ptr() + align(self.num_max_tokens_per_rank * self.num_topk * 4, BLOCK_M)
+
+    # Barrier: [0..15] 4 grid sync counters, [16..19] XGMI counter, [20..27] 2 signals
+
+    def get_grid_sync_count_ptr(self, index: int = 0):
+        assert index < self.NUM_MAX_GRID_SYNC_COUNTERS, "Grid sync index out of bounds"
+        return self.base + index * 4
+
+    def get_xgmi_barrier_counter_ptr(self):
+        return self.base + self.NUM_MAX_GRID_SYNC_COUNTERS * 4
+
+    def get_xgmi_barrier_signal_ptr(self, phase):
+        return self.base + (self.NUM_MAX_GRID_SYNC_COUNTERS + 1) * 4 + phase * 4
+
+
+def get_symm_buffer_size_for_mega_moe(
+    num_ranks: int,
+    num_experts: int,
+    num_max_tokens_per_rank: int,
+    num_topk: int,
+    hidden: int,
+    token_dtype: torch.dtype = TOKEN_DTYPE,
+) -> Tuple[int, Callable[["torch.Tensor"], Tuple[torch.Tensor, ...]]]:
+    """Return ``(num_bytes, slice_input_buffers)``: the one owner of heap sizing + host slicing (offsets from Workspace)."""
+
+    # end offset on a base-0 Workspace == total heap size
+    num_bytes = Workspace(
+        0,
+        num_ranks,
         num_experts,
         num_max_tokens_per_rank,
         num_topk,
         hidden,
-        intermediate_hidden,
-        token_dtype=TOKEN_DTYPE,
-    ):
+        token_dtype,
+    ).get_end_ptr()
+
+    def slice_input_buffers(buffer: "torch.Tensor") -> Tuple[torch.Tensor, ...]:
+        # lazy: top-level import would cycle (pytorch.core -> pytorch -> flydsl.mega)
+        from primus_turbo.pytorch.core.symm_mem import _tensor_from_device_ptr
+
+        workspace = Workspace(
+            buffer.data_ptr(),
+            num_ranks,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            token_dtype,
+        )
+        dev = buffer.device.index
+        npt = workspace.num_max_pool_tokens
+        return (
+            _tensor_from_device_ptr(
+                int(workspace.get_dispatch_token_pool_ptr()), (npt, hidden), token_dtype, dev
+            ),
+            _tensor_from_device_ptr(int(workspace.get_weight_recv_buf_ptr()), (npt,), torch.float32, dev),
+            _tensor_from_device_ptr(int(workspace.get_pool_src_slot_ptr()), (npt,), torch.int32, dev),
+            _tensor_from_device_ptr(
+                int(workspace.get_dispatch_flag_ptr()), (2 * workspace.num_max_pool_blocks,), torch.int64, dev
+            ),
+            _tensor_from_device_ptr(
+                int(workspace.get_combine_flag_ptr()), (2 * workspace.num_max_pool_blocks,), torch.int64, dev
+            ),
+            _tensor_from_device_ptr(
+                int(workspace.get_reduce_flag_ptr()), (2 * workspace.num_combine_slots,), torch.int64, dev
+            ),
+        )
+
+    return num_bytes, slice_input_buffers
+
+
+class SymmBuffer:
+    """Host owner of the IPC heap + parity bookkeeping; hands the kernel a lean ``SymBuffer``."""
+
+    def __init__(
+        self,
+        group: "torch.distributed.ProcessGroup",
+        *,
+        num_experts: int,
+        num_max_tokens_per_rank: int,
+        num_topk: int,
+        hidden: int,
+        intermediate_hidden: int,
+        token_dtype: torch.dtype = TOKEN_DTYPE,
+    ) -> None:
         self.group = group
         self.rank = group.rank()
         self.world = group.size()
-        self.token_dtype = token_dtype
-        # dtype is part of the identity: a different token dtype needs a different heap
+        self.num_experts = int(num_experts)
+        self.num_max_tokens_per_rank = int(num_max_tokens_per_rank)
+        self.num_topk = int(num_topk)
+        self.hidden = int(hidden)
+        self.intermediate_hidden = int(intermediate_hidden)
         self.key = (
             self.world,
-            int(num_experts),
-            int(num_max_tokens_per_rank),
-            int(num_topk),
-            int(hidden),
-            int(intermediate_hidden),
+            self.num_experts,
+            self.num_max_tokens_per_rank,
+            self.num_topk,
+            self.hidden,
+            self.intermediate_hidden,
             token_dtype,
         )
 
-        # lazy import to avoid a circular import at module load time
-        from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
-
-        # pure layout config: single source of truth for every region dim
-        self.cfg = LayoutConfig.build(
-            num_ranks=self.world,
-            num_experts=int(num_experts),
-            num_max_tokens_per_rank=int(num_max_tokens_per_rank),
-            num_topk=int(num_topk),
-            hidden=int(hidden),
-            intermediate_hidden=int(intermediate_hidden),
+        # single layout owner: allocation size + the host-slicing hook
+        self.num_bytes, slice_input_buffers = get_symm_buffer_size_for_mega_moe(
+            self.world,
+            self.num_experts,
+            self.num_max_tokens_per_rank,
+            self.num_topk,
+            self.hidden,
+            token_dtype,
         )
-        # dtype-templated heap layout built from cfg (token buffers follow token_dtype)
-        self.meta = make_sym_layout_meta(token_dtype, self.cfg)
-        # expose dims as attributes for back-compat consumers (symm.hidden, symm.num_max_pool_tokens, ...)
-        self.block_m = BLOCK_M
-        self.num_ranks = self.cfg.num_ranks
-        self.num_experts = self.cfg.num_experts
-        self.num_experts_per_rank = self.cfg.num_experts_per_rank
-        self.num_max_tokens_per_rank = self.cfg.num_max_tokens_per_rank
-        self.num_topk = self.cfg.num_topk
-        self.hidden = self.cfg.hidden
-        self.intermediate_hidden = self.cfg.intermediate_hidden
-        self.num_max_pool_tokens = self.cfg.num_max_pool_tokens
-        self.num_max_pool_blocks = self.cfg.num_max_pool_blocks
-        self.num_combine_slots = self.cfg.num_combine_slots
-        self.num_tokens = self.cfg.num_max_tokens_per_rank  # back-compat alias
+        # derived pool dims for parity bookkeeping / callers
+        workspace = Workspace(
+            0,
+            self.world,
+            self.num_experts,
+            self.num_max_tokens_per_rank,
+            self.num_topk,
+            self.hidden,
+            token_dtype,
+        )
+        self.num_max_pool_tokens = workspace.num_max_pool_tokens
+        self.num_combine_slots = workspace.num_combine_slots
+        self.num_tokens = self.num_max_tokens_per_rank  # back-compat alias
 
-        self.num_bytes = self.meta.num_nbytes()
-
-        # allocate the single IPC heap (SymmetricMemory already memsets it to 0 on alloc)
-        self.symm_mem = SymmetricMemory(group, alloc_size=self.num_bytes, signal_pad_size=0)
-        heap = self.symm_mem.get_buffer(self.rank, (self.num_bytes,), torch.int8)
+        # allocate the single symmetric-memory heap (torch official; empty() is uninit -> zero it)
+        self.buffer = symm_mem.empty(self.num_bytes, dtype=torch.int8, device="cuda")
+        self.symm_mem = symm_mem.rendezvous(self.buffer, group=group)
+        self.buffer.zero_()
+        heap = self.buffer
         self.group.barrier()
         torch.cuda.synchronize()
 
-        # split the heap into named region views and bind by name (no positional coupling)
-        views = self.meta.split_buffer(heap)
-        for name in self.meta.region_names():
-            setattr(self, name, getattr(views, name))
+        # host-side region views, sliced by the layout owner from this rank's heap
+        (
+            self.dispatch_token_pool,
+            self.weight_recv_buf,
+            self.pool_src_slot,
+            self.dispatch_flag,
+            self.combine_flag,
+            self.reduce_flag,
+        ) = slice_input_buffers(heap)
 
         self.num_tokens_per_rank = torch.full(
             (self.world,), self.num_tokens, dtype=torch.int32, device="cuda"
@@ -324,92 +335,54 @@ class SymmBuffer:
         self._combine_parity = 0
         self._combine_expected = [0, 0]
         self._reduce_expected = [0, 0]
+        self._sym_buffer = None  # cached so its peer-delta table stays alive with this heap
 
-        self._sym_layout = None
-
-    def next_dispatch(self):
-
+    def next_dispatch(self) -> Tuple[int, int]:
         self._disp_parity ^= 1
         p = self._disp_parity
         self._disp_expected[p] += int(self.world)
         return p, self._disp_expected[p]
 
-    def next_combine(self, n_blocks):
-
+    def next_combine(self, n_blocks: int) -> Tuple[int, int, int]:
         self._combine_parity ^= 1
         p = self._combine_parity
         self._combine_expected[p] += int(n_blocks)
         self._reduce_expected[p] += 1
         return p, self._combine_expected[p], self._reduce_expected[p]
 
-    def get_sym_layout(self):
+    def get_sym_buffer(self) -> SymBuffer:
+        """Build (once) the SymBuffer handle; cached so its peer-delta table outlives async launches."""
+        if self._sym_buffer is None:
+            sym = SymBuffer(self.symm_mem.buffer_ptrs, self.rank)
+            sym._offsets_device_ptr()  # materialize the delta table now, keep it alive on `sym`
+            self._sym_buffer = sym
+        return self._sym_buffer
 
-        if self._sym_layout is not None:
-            return self._sym_layout
-
-        # peer IPC deltas relative to this rank's own base pointer
-        main = self.symm_mem.buffer_ptrs
-        self._main_delta = torch.tensor([p - main[self.rank] for p in main], dtype=torch.int64, device="cuda")
-
-        # extend the base SymLayout with this heap's regions, then fill dims + region base pointers
-        base = main[self.rank]
-        region_ptrs = {p.name: Int64(base + int(p.offset)) for p in self.meta.placed_regions()}
-        layout_type = make_sym_layout_type(self.meta.region_names())
-        self._sym_layout = layout_type(
-            offsets_ptr=Int64(self._main_delta.data_ptr()),
-            rank_idx=Int32(self.rank),
-            num_ranks=self.num_ranks,
-            num_experts=self.num_experts,
-            num_experts_per_rank=self.num_experts_per_rank,
-            num_max_tokens_per_rank=self.num_max_tokens_per_rank,
-            num_topk=self.num_topk,
-            hidden=self.hidden,
-            intermediate_hidden=self.intermediate_hidden,
-            num_max_pool_tokens=self.num_max_pool_tokens,
-            num_max_pool_blocks=self.num_max_pool_blocks,
-            num_combine_slots=self.num_combine_slots,
-            **region_ptrs,
-        )
-        return self._sym_layout
-
-    def describe(self) -> str:
-        """Dump this heap's resolved region layout (offsets / bytes) -- for debugging IPC memory."""
-        return self.meta.describe()
-
-    def __repr__(self) -> str:
-        return (
-            f"SymmBuffer(rank={self.rank}/{self.world}, num_experts={self.num_experts}, "
-            f"num_max_tokens_per_rank={self.num_max_tokens_per_rank}, num_topk={self.num_topk}, "
-            f"hidden={self.hidden}, num_max_pool_tokens={self.num_max_pool_tokens}, "
-            f"num_bytes={self.num_bytes})"
-        )
-
-    def destroy(self):
+    def destroy(self) -> None:
         global _CURRENT_SYMM_BUFFER
         if _CURRENT_SYMM_BUFFER is self:
             _CURRENT_SYMM_BUFFER = None
-        try:
-            self.symm_mem.destroy()
-        except Exception as e:
-            warnings.warn(f"SymmBuffer.destroy: symm_mem teardown failed: {e}")
+        # torch symmetric memory frees on GC; drop refs (region views alias buffer -> clear too)
+        self._sym_buffer = None
+        self.symm_mem = None
+        self.buffer = None
 
 
 _CURRENT_SYMM_BUFFER = None
 
 
 def get_symm_buffer_for_mega_moe(
-    group=None,
+    group: Optional["torch.distributed.ProcessGroup"] = None,
     *,
-    num_experts=None,
-    num_max_tokens_per_rank=None,
-    num_topk=None,
-    hidden=None,
-    intermediate_hidden=None,
-    token_dtype=TOKEN_DTYPE,  # dispatched-token dtype: bf16 (default) or fp8
+    num_experts: Optional[int] = None,
+    num_max_tokens_per_rank: Optional[int] = None,
+    num_topk: Optional[int] = None,
+    hidden: Optional[int] = None,
+    intermediate_hidden: Optional[int] = None,
+    token_dtype: torch.dtype = TOKEN_DTYPE,
 ) -> SymmBuffer:
-
+    """Cached per-(group, dims, dtype) SymmBuffer; no-arg call returns the active one."""
     global _CURRENT_SYMM_BUFFER
-    # note: block sizes are a fixed policy (BLOCK_M/BLOCK_N == 256), not a per-call knob
     if group is None:
         if _CURRENT_SYMM_BUFFER is None:
             raise RuntimeError(
@@ -417,10 +390,11 @@ def get_symm_buffer_for_mega_moe(
             )
         return _CURRENT_SYMM_BUFFER
 
+    num_max_tokens_per_rank = align(int(num_max_tokens_per_rank), TOKEN_ALIGNMENT)
     key = (
         group.size(),
         int(num_experts),
-        int(num_max_tokens_per_rank),
+        num_max_tokens_per_rank,
         int(num_topk),
         int(hidden),
         int(intermediate_hidden),

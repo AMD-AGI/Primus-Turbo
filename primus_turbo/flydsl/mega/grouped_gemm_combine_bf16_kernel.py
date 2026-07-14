@@ -32,7 +32,12 @@ from primus_turbo.flydsl.mega.prims import (
     read_clock,
     spin_timed_out,
 )
-from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.symm_buffer import (
+    TOKEN_DTYPE,
+    SymBuffer,
+    Workspace,
+    get_symm_buffer_for_mega_moe,
+)
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
@@ -65,6 +70,8 @@ def _make_grouped_gemm_combine(
     topk,
     num_experts,
     rank,
+    num_ranks=0,
+    num_max_tokens_per_rank=0,
     nt_vmcnt=3,
     out_fp16=False,
     layout="nt",
@@ -100,7 +107,7 @@ def _make_grouped_gemm_combine(
         TOPK_WEIGHTS: fx.Tensor,
         GRAD_GATE: fx.Tensor,
         D_TOPK_W: fx.Tensor,
-        sym_layout: SymLayout,
+        sym_buffer: SymBuffer,
         c_n: fx.Int32,
         combine_parity: fx.Int32,
         expected_combine: fx.Int32,
@@ -114,10 +121,22 @@ def _make_grouped_gemm_combine(
         reduce_bank = combine_parity * fx.Int32(num_combine_slots)
         expected_combine_i64 = cast(expected_combine, fx.T.i64())
         expected_reduce_i64 = cast(expected_reduce, fx.T.i64())
+        # build the layout from explicit dims (bf16 path -> TOKEN_DTYPE); the token pools are
+        # out_features-wide (the model hidden), not the down-proj K (hidden_size)
+        workspace = Workspace(
+            sym_buffer.get_base_ptr(),
+            num_ranks,
+            num_experts,
+            num_max_tokens_per_rank,
+            topk,
+            out_features,
+            token_dtype=TOKEN_DTYPE,
+        )
 
-        combine_flag_base = sym_layout.combine_flag
-        comb_base = sym_layout.combine_token_buffer
-        reduce_flag_base = sym_layout.reduce_flag
+        combine_flag_base = workspace.get_combine_flag_ptr()
+        comb_base = workspace.get_combine_token_buffer_ptr()
+        reduce_flag_base = workspace.get_reduce_flag_ptr()
+        l2_token_buffer_base = workspace.get_l2_token_buffer_ptr()
         comb_local_res = create_buffer_resource_from_addr(comb_base, num_records_bytes=comb_records)
         # recv-segment table + origin slots ride the handle (per-forward), NOT shared symm -> else bwd reads stale.
         recv_dst_rank_res = create_buffer_resource(RECV_DST_RANK, max_size=True)
@@ -133,7 +152,7 @@ def _make_grouped_gemm_combine(
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
         real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
         grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
-        gate_base = sym_layout.combine_gate if with_gate else None
+        gate_base = workspace.get_combine_gate_ptr() if with_gate else None
         gate_local_res = (
             create_buffer_resource_from_addr(gate_base, num_records_bytes=gate_records) if with_gate else None
         )
@@ -176,7 +195,8 @@ def _make_grouped_gemm_combine(
                     fx.gpu.barrier()
                     l2_invalidate()
                     combine_bf16_tile(
-                        sym_layout,
+                        sym_buffer,
+                        workspace,
                         thread_index=thread_index,
                         task_index=task_index,
                         recv_dst_rank_res=recv_dst_rank_res,
@@ -206,7 +226,7 @@ def _make_grouped_gemm_combine(
                 a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
                 c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
                 A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
-                C_tile = make_bf16_fp16_tile_tensor(sym_layout.l2_token_buffer, c_off, 0x40000000)
+                C_tile = make_bf16_fp16_tile_tensor(l2_token_buffer_base, c_off, 0x40000000)
                 gemm_tile(
                     A_tile,
                     WEIGHTS,
@@ -329,7 +349,7 @@ def _compiled_grouped_gemm_combine(
     TOPK_WEIGHTS,
     GRAD_GATE,
     D_TOPK_W,
-    sym_layout,
+    sym_buffer,
     c_n,
     combine_parity,
     expected_combine,
@@ -343,6 +363,8 @@ def _compiled_grouped_gemm_combine(
     topk: fx.Constexpr[int],
     num_experts: fx.Constexpr[int],
     rank: fx.Constexpr[int],
+    num_ranks: fx.Constexpr[int],
+    num_max_tokens_per_rank: fx.Constexpr[int],
     layout_code: fx.Constexpr[int],
     apply_weights: fx.Constexpr[bool],
     with_gate: fx.Constexpr[bool],
@@ -366,6 +388,8 @@ def _compiled_grouped_gemm_combine(
         topk,
         num_experts,
         rank,
+        num_ranks,
+        num_max_tokens_per_rank,
         nt_vmcnt,
         out_fp16,
         _LAYOUTS[layout_code],
@@ -390,7 +414,7 @@ def _compiled_grouped_gemm_combine(
         TOPK_WEIGHTS,
         GRAD_GATE,
         D_TOPK_W,
-        sym_layout,
+        sym_buffer,
         c_n,
         combine_parity,
         expected_combine,
@@ -421,7 +445,7 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     recv_count = handle[11]
     pool_src_slot = handle[12]
     symm = get_symm_buffer_for_mega_moe()
-    sym_layout = symm.get_sym_layout()
+    sym_buffer = symm.get_sym_buffer()
     if layout == "tn":
         hidden_size, num_max_pool_tokens = x.shape
     else:
@@ -433,18 +457,16 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
     out_features = N
     c_n = out_features
-    assert out_features == int(sym_layout.hidden), (
-        f"out_features {out_features} != SymLayout hidden {int(sym_layout.hidden)}"
+    assert out_features == int(symm.hidden), (
+        f"out_features {out_features} != SymmBuffer hidden {int(symm.hidden)}"
     )
-    assert num_max_pool_tokens == int(sym_layout.num_max_pool_tokens), (
-        "x rows must match SymLayout pool capacity"
-    )
+    assert num_max_pool_tokens == int(symm.num_max_pool_tokens), "x rows must match SymmBuffer pool capacity"
 
     device = x.device
-    num_combine_slots = int(sym_layout.num_combine_slots)
-    rank = int(sym_layout.rank_idx)
-    topk = int(sym_layout.num_topk)
-    num_experts = int(sym_layout.num_experts)
+    num_combine_slots = int(symm.num_combine_slots)
+    rank = int(symm.rank)
+    topk = int(symm.num_topk)
+    num_experts = int(symm.num_experts)
     assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"
 
     dummy = num_tile_blocks
@@ -487,7 +509,7 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         topk_weights_d,
         grad_gate_d,
         d_topk_w_d,
-        sym_layout,
+        sym_buffer,
         c_n,
         combine_parity=combine_parity,
         expected_combine=expected_combine,
@@ -501,6 +523,8 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         topk=int(topk),
         num_experts=int(num_experts),
         rank=int(rank),
+        num_ranks=int(symm.world),
+        num_max_tokens_per_rank=int(symm.num_max_tokens_per_rank),
         layout_code=_LAYOUT_CODES[layout],
         apply_weights=bool(apply_weights),
         with_gate=bool(with_gate),

@@ -28,7 +28,12 @@ from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
 )
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
 from primus_turbo.flydsl.mega.prims import cast, ld, read_clock, spin_timed_out
-from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.symm_buffer import (
+    TOKEN_DTYPE,
+    SymBuffer,
+    Workspace,
+    get_symm_buffer_for_mega_moe,
+)
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
@@ -62,6 +67,9 @@ def _make_kernel(
     G=0,
     num_xcd=8,
     num_ranks=8,
+    num_experts=0,
+    num_max_tokens_per_rank=0,
+    num_topk=0,
 ):
     K = hidden_size
     is_tn = layout == "tn"
@@ -90,7 +98,7 @@ def _make_kernel(
         EXPERT_SEND_COUNT: fx.Tensor,
         EXPERT_SEND_OFFSET: fx.Tensor,
         DISPATCHED_TOKEN_IDX: fx.Tensor,
-        sym_layout: SymLayout,
+        sym_buffer: SymBuffer,
         WEIGHTS: fx.Tensor,
         OUTPUT: fx.Tensor,
         TILE_TO_GROUP: fx.Tensor,
@@ -108,6 +116,19 @@ def _make_kernel(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         bank_offset = disp_parity * fx.Int32(NPB)
         expected_dispatch_i64 = cast(expected_dispatch, fx.T.i64())
+        # build the layout from explicit dims (bf16 path -> TOKEN_DTYPE), then hoist region
+        # pointers before dynamic branches (rewriter can't carry SymBuffer/Workspace)
+        workspace = Workspace(
+            sym_buffer.get_base_ptr(),
+            num_ranks,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden_size,
+            token_dtype=TOKEN_DTYPE,
+        )
+        dispatch_flag_base = workspace.get_dispatch_flag_ptr()
+        dispatch_token_pool_base = workspace.get_dispatch_token_pool_ptr()
 
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
         expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
@@ -129,7 +150,8 @@ def _make_kernel(
             ) // comm_block_count
             for task_iteration in range(local_task_count):
                 dispatch_bf16_tile(
-                    sym_layout,
+                    sym_buffer,
+                    workspace,
                     thread_index=thread_index,
                     hidden_size=hidden_size,
                     input_res=input_resource,
@@ -157,11 +179,10 @@ def _make_kernel(
                     block_n = local % fx.Int32(N_BLOCKS_N)
                 m_start = cast(ld(go_base, group_idx, dtype=fx.T.i64()), fx.T.i32())
                 m_end = cast(ld(go_base, group_idx + fx.Int32(1), dtype=fx.T.i64()), fx.T.i32())
-                sb_base = sym_layout.dispatch_flag
                 ge_blk = bank_offset + group_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
-                    sig = ld(sb_base, ge_blk, scope="sys", dtype=fx.T.i64())
+                    sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
                     while sig != expected_dispatch_i64:
                         fx.rocdl.s_sleep(fx.Int32(2))
                         if spin_timed_out(spin_start):
@@ -172,13 +193,13 @@ def _make_kernel(
                                 expected_dispatch_i64,
                             )
                             spin_start = read_clock()
-                        sig = ld(sb_base, ge_blk, scope="sys", dtype=fx.T.i64())
+                        sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
                 pool_ptr_ty = PointerType.get(
                     elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
                 )
                 pool_tensor = fx.make_view(
-                    fx.inttoptr(pool_ptr_ty, sym_layout.dispatch_token_pool),
+                    fx.inttoptr(pool_ptr_ty, dispatch_token_pool_base),
                     fx.make_layout(num_max_pool_tokens * OUT_M, 1),
                 )
                 if const_expr(trans_c):
@@ -217,12 +238,11 @@ def _make_kernel(
                 group_size_m = arith.select(remaining_m < fx.Int32(GROUP_M), remaining_m, fx.Int32(GROUP_M))
                 block_m = first_pid_m + (pid_in_group % group_size_m)
                 block_n = pid_in_group // group_size_m
-                sb_base = sym_layout.dispatch_flag
                 g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 blk = bank_offset + g_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
-                    signal = ld(sb_base, blk, scope="sys", dtype=fx.T.i64())
+                    signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
                     while signal != expected_dispatch_i64:
                         fx.rocdl.s_sleep(fx.Int32(2))
                         if spin_timed_out(spin_start):
@@ -233,7 +253,7 @@ def _make_kernel(
                                 expected_dispatch_i64,
                             )
                             spin_start = read_clock()
-                        signal = ld(sb_base, blk, scope="sys", dtype=fx.T.i64())
+                        signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
                 # TODO(zhuang12): no l2_invalidate before reading peer pool; mirroring combine's invalidate deadlocks autotune on gfx950.
 
@@ -245,7 +265,7 @@ def _make_kernel(
                 # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
                 a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
                 c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
-                A_tile = make_bf16_fp16_tile_tensor(sym_layout.dispatch_token_pool, a_off, BLOCK_M * K)
+                A_tile = make_bf16_fp16_tile_tensor(dispatch_token_pool_base, a_off, BLOCK_M * K)
                 C_tile = make_bf16_fp16_tile_tensor(out_base, c_off, 0x40000000)
                 gemm_tile(
                     A_tile,
@@ -307,7 +327,7 @@ def _compiled_dispatch_grouped_gemm(
     EXPERT_SEND_COUNT,
     EXPERT_SEND_OFFSET,
     DISPATCHED_TOKEN_IDX,
-    sym_layout,
+    sym_buffer,
     WEIGHTS,
     OUTPUT,
     TILE_TO_GROUP,
@@ -332,6 +352,9 @@ def _compiled_dispatch_grouped_gemm(
     num_ranks: fx.Constexpr[int],
     num_dispatch_cu: fx.Constexpr[int],
     nt_vmcnt: fx.Constexpr[int],
+    num_experts: fx.Constexpr[int],
+    num_max_tokens_per_rank: fx.Constexpr[int],
+    num_topk: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     # layout_code: 0=nt, 1=nn, 2=tn; tn uses 2 XCDs, nt/nn use 8
@@ -353,6 +376,9 @@ def _compiled_dispatch_grouped_gemm(
         G=int(G),
         num_xcd=num_xcd,
         num_ranks=int(num_ranks),
+        num_experts=int(num_experts),
+        num_max_tokens_per_rank=int(num_max_tokens_per_rank),
+        num_topk=int(num_topk),
     )
     kernel(
         INPUT_TOKENS,
@@ -361,7 +387,7 @@ def _compiled_dispatch_grouped_gemm(
         EXPERT_SEND_COUNT,
         EXPERT_SEND_OFFSET,
         DISPATCHED_TOKEN_IDX,
-        sym_layout,
+        sym_buffer,
         WEIGHTS,
         OUTPUT,
         TILE_TO_GROUP,
@@ -405,12 +431,12 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
             hidden=hidden,
             intermediate_hidden=l1_weights.shape[1] // 2,
         )
-        sym_layout = symm.get_sym_layout()
+        sym_buffer = symm.get_sym_buffer()
         handle = tuple(
             dispatch_prologue_flydsl_kernel(
                 topk_idx,
                 topk_weights,
-                sym_layout=sym_layout,
+                sym_buffer=sym_buffer,
                 num_tokens=num_tokens,
                 num_topk=num_topk,
                 num_experts=symm.num_experts,
@@ -419,13 +445,15 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
                 experts_per_rank=experts_per_rank,
                 block_m=BM,
                 num_max_pool_tokens=symm.num_max_pool_tokens,
+                hidden=symm.hidden,
+                num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
             )
         )
 
         handle = handle + (symm.pool_src_slot.clone(),)
     else:
         symm = get_symm_buffer_for_mega_moe()
-        sym_layout = symm.get_sym_layout()
+        sym_buffer = symm.get_sym_buffer()
 
     (
         expert_send_dst_rank,
@@ -444,7 +472,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     num_ranks = symm.world
     assert x.dtype == torch.bfloat16 and l1_weights.dtype == torch.bfloat16
     hidden_size = x.size(1)
-    num_max_pool_tokens = int(sym_layout.num_max_pool_tokens)
+    num_max_pool_tokens = int(symm.num_max_pool_tokens)
     dummy_i32 = get_dummy_tensor()
     x_i32 = x.contiguous().view(torch.int32).view(-1)
 
@@ -495,7 +523,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
-        sym_layout,
+        sym_buffer,
         weight_arg,
         output_arg,
         tile_arg,
@@ -518,6 +546,9 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         G=int(G),
         out_fp16=bool(out_fp16),
         num_ranks=int(num_ranks),
+        num_experts=int(symm.num_experts),
+        num_max_tokens_per_rank=int(symm.num_max_tokens_per_rank),
+        num_topk=int(symm.num_topk),
         stream=torch.cuda.current_stream(),
     )
     return output, symm.dispatch_token_pool, symm.weight_recv_buf, handle

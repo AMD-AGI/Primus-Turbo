@@ -25,7 +25,7 @@ from primus_turbo.flydsl.mega.prims import (
     spin_timed_out,
     st,
 )
-from primus_turbo.flydsl.mega.symm_buffer import SymLayout, sym_map
+from primus_turbo.flydsl.mega.symm_buffer import SymBuffer, Workspace
 
 _WARP = 64
 _BLOCK_THREADS = 512
@@ -36,7 +36,8 @@ _L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invali
 
 @ASTRewriter.transform
 def dispatch_bf16_tile(
-    sym_layout: SymLayout,
+    sym: SymBuffer,
+    workspace: Workspace,
     thread_index: fx.Int32,
     hidden_size: int,
     input_res: fx.ArithValue,
@@ -61,7 +62,10 @@ def dispatch_bf16_tile(
     dest_row_start = buffer_load(expert_send_dst_row_res, task_index, vec_width=1, dtype=fx.T.i32())
     source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
     token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32())
-    pool_address = sym_map(sym_layout, sym_layout.dispatch_token_pool, dst_rank)
+    # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
+    pool_address = sym.map(workspace.get_dispatch_token_pool_ptr(), dst_rank)
+    dispatch_flag_address = sym.map(workspace.get_dispatch_flag_ptr(), dst_rank)
+    num_max_pool_blocks = int(workspace.num_max_pool_blocks)
 
     local_count = (token_count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
 
@@ -84,12 +88,7 @@ def dispatch_bf16_tile(
         fx.rocdl.s_waitcnt(0)
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):
-            dispatch_flag_address = sym_map(sym_layout, sym_layout.dispatch_flag, dst_rank)
-            bank = (
-                fx.Int32(0)
-                if disp_parity is None
-                else disp_parity * fx.Int32(int(sym_layout.num_max_pool_blocks))
-            )
+            bank = fx.Int32(0) if disp_parity is None else disp_parity * fx.Int32(num_max_pool_blocks)
             # DeepEP parity: each task bumps dst expert counter +1 (host-predictable)
             local_expert = task_index // fx.Int32(num_ranks)
             atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
@@ -97,7 +96,8 @@ def dispatch_bf16_tile(
 
 @ASTRewriter.transform
 def combine_bf16_tile(
-    sym_layout: SymLayout,
+    sym: SymBuffer,
+    workspace: Workspace,
     thread_index: fx.Int32,
     task_index: fx.ArithValue,
     recv_dst_rank_res: fx.ArithValue,
@@ -111,8 +111,8 @@ def combine_bf16_tile(
     with_gate: bool = False,
 ):
     # Task-based combine push: one warp sustains one peer's XGMI link (scattered dst_slot)
-    out_features = int(sym_layout.hidden)
-    n_slots = int(sym_layout.num_combine_slots)
+    out_features = int(workspace.hidden)
+    n_slots = int(workspace.num_combine_slots)
     comb_records = n_slots * out_features * 2
     gate_records = n_slots * 4
     cols_per_step = _WARP * _PVEC
@@ -122,12 +122,15 @@ def combine_bf16_tile(
     full_bytes = num_full_chunks * cols_per_step * 2
     warp_id = thread_index // fx.Int32(_WARP)
     lane_id = thread_index % fx.Int32(_WARP)
-    l2_ptr = sym_layout.l2_token_buffer
+    l2_ptr = workspace.get_l2_token_buffer_ptr()
 
     dst_rank = buffer_load(recv_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
     start_row = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
     count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
-    comb_addr = sym_map(sym_layout, sym_layout.combine_token_buffer, dst_rank)
+    # hoist workspace-derived values before the dynamic loop (rewriter can't carry Workspace)
+    comb_addr = sym.map(workspace.get_combine_token_buffer_ptr(), dst_rank)
+    gate_addr = sym.map(workspace.get_combine_gate_ptr(), dst_rank) if with_gate else None
+    barrier_addr = sym.map(workspace.get_reduce_flag_ptr(), dst_rank) if signal else None
 
     local_count = (count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
     for i in range(local_count):
@@ -158,12 +161,10 @@ def combine_bf16_tile(
             buffer_store(tail_value, peer, dst, cache_modifier=19)  # sc0+sc1: peer MALL coherence
         if const_expr(with_gate):
             gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32(), cache_modifier=19)
-            gate_addr = sym_map(sym_layout, sym_layout.combine_gate, dst_rank)
             gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
             buffer_store(gate_value, gate_peer, slot, cache_modifier=19)  # sc0+sc1: match token push
         if const_expr(signal):
             bank = fx.Int32(0) if bank_offset is None else bank_offset
-            barrier_addr = sym_map(sym_layout, sym_layout.reduce_flag, dst_rank)
             fx.rocdl.s_waitcnt(0)
             st(barrier_addr, bank + slot, epoch, scope="agent")
 

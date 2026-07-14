@@ -174,7 +174,30 @@ def _mega_moe_forward_meta(
     y = x.new_empty((num_tokens, N2), dtype=torch.bfloat16)
     l1_out = x.new_empty((0, two_I), dtype=torch.bfloat16)
     dispatch_weights_in_buf = x.new_empty((0,), dtype=torch.float32)
-    return y, l1_out, dispatch_weights_in_buf, []
+
+    # Handle must have real length under compile: save_for_backward(..., *handle) fixes
+    # its length at trace time, so an empty fake -> len-0 handle in backward. Only count
+    # and dtype matter here (opaque saved activations); real shapes come from eager. See
+    # dispatch_prologue_flydsl_kernel for the ABI (0-11) + dispatch launcher (12).
+    i32 = lambda: x.new_empty((0,), dtype=torch.int32)  # noqa: E731
+    i64 = lambda: x.new_empty((0,), dtype=torch.int64)  # noqa: E731
+    handle = [
+        i32(),
+        i32(),
+        i32(),
+        i32(),  # 0-3 expert_send_dst_rank/dst_row/count/offset
+        i32(),
+        i32(),  # 4 dispatched_token_idx  5 tile_to_expert
+        i64(),
+        i64(),  # 6 num_tokens_per_expert  7 ..._prefix
+        i32(),  # 8 num_tile_blocks
+        i32(),
+        i32(),
+        i32(),  # 9-11 combine_recv_dst_rank/start_row/count
+        i32(),  # 12 pool_src_slot
+    ]
+    assert len(handle) == _HANDLE_LEN
+    return y, l1_out, dispatch_weights_in_buf, handle
 
 
 def mega_moe_forward_impl(

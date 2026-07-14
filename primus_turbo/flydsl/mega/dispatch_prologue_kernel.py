@@ -25,7 +25,7 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.barrier import grid_sync, xgmi_barrier
 from primus_turbo.flydsl.mega.prims import atomic_add, ld, st
-from primus_turbo.flydsl.mega.symm_buffer import SymLayout, sym_map
+from primus_turbo.flydsl.mega.symm_buffer import TOKEN_DTYPE, SymBuffer, Workspace
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
@@ -41,6 +41,8 @@ def _make_dispatch_prologue(
     experts_per_rank,
     block_m,
     num_max_pool_tokens,
+    hidden,
+    num_max_tokens_per_rank,
     grid_blocks=64,
     block_threads=256,
 ):
@@ -49,8 +51,8 @@ def _make_dispatch_prologue(
     num_pool_blocks = num_max_pool_tokens // block_m
     c_buffer_bytes = num_ranks * num_experts * 4
     origin_buffer_bytes = num_max_pool_tokens * 4
-    WS_SEND, WS_WITHIN = 0, num_experts
-    WS_START, WS_SROFF, WS_POOLBASE = 2 * num_experts, 3 * num_experts, 4 * num_experts
+    SCRATCH_SEND, SCRATCH_WITHIN = 0, num_experts
+    SCRATCH_START, SCRATCH_SROFF, SCRATCH_POOLBASE = 2 * num_experts, 3 * num_experts, 4 * num_experts
 
     def _ext_i64(v):
         """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
@@ -59,8 +61,8 @@ def _make_dispatch_prologue(
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def dispatch_prologue_kernel(
         TOPK_INDICES: fx.Tensor,
-        WORKSPACE: fx.Tensor,
-        sl: SymLayout,
+        SCRATCH: fx.Tensor,
+        sym_buffer: SymBuffer,
         EXPERT_SEND_DST_RANK: fx.Tensor,
         EXPERT_SEND_DST_ROW: fx.Tensor,
         EXPERT_SEND_COUNT: fx.Tensor,
@@ -77,6 +79,21 @@ def _make_dispatch_prologue(
     ):
         thread_index = fx.thread_idx.x
         block_index, _, _ = fx.block_idx
+        # build the layout from explicit dims (bf16 path -> TOKEN_DTYPE), then hoist workspace-derived
+        # region bases before dynamic control flow (rewriter can't carry Workspace)
+        workspace = Workspace(
+            sym_buffer.get_base_ptr(),
+            num_ranks,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            token_dtype=TOKEN_DTYPE,
+        )
+        expert_count_base = workspace.get_expert_count_buffer_ptr()
+        pool_src_rank_base = workspace.get_pool_src_rank_ptr()
+        pool_src_slot_base = workspace.get_pool_src_slot_ptr()
+        weight_recv_base = workspace.get_weight_recv_buf_ptr()
 
         lds_base = _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
         topk_resource = create_buffer_resource(TOPK_INDICES, max_size=True)
@@ -90,8 +107,8 @@ def _make_dispatch_prologue(
             return value
 
         # All global tensors use max_size buffer descriptors.
-        workspace_resource = create_buffer_resource(WORKSPACE, max_size=True)
-        workspace_base = extract_base_index(WORKSPACE, address_space=1)
+        scratch_resource = create_buffer_resource(SCRATCH, max_size=True)
+        scratch_base = extract_base_index(SCRATCH, address_space=1)
         expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
         expert_send_dst_row_resource = create_buffer_resource(EXPERT_SEND_DST_ROW, max_size=True)
         expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
@@ -107,7 +124,7 @@ def _make_dispatch_prologue(
         num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
 
         my_origin_rank_resource = create_buffer_resource_from_addr(
-            sl.pool_src_rank, num_records_bytes=origin_buffer_bytes
+            pool_src_rank_base, num_records_bytes=origin_buffer_bytes
         )
         # combine recv-segment table: one (local_expert, source_rank) entry each
         combine_recv_dst_rank_resource = create_buffer_resource(COMBINE_RECV_DST_RANK, max_size=True)
@@ -139,22 +156,31 @@ def _make_dispatch_prologue(
         while lds_flush_index < fx.Int32(num_experts):
             block_count = ld(lds_base, lds_flush_index, scope="workgroup", space=3)
             if block_count > fx.Int32(0):
-                atomic_add(workspace_base, fx.Int32(WS_SEND) + lds_flush_index, block_count, "agent", 1)
+                atomic_add(scratch_base, fx.Int32(SCRATCH_SEND) + lds_flush_index, block_count, "agent", 1)
             lds_flush_index = lds_flush_index + fx.Int32(block_threads)
-        grid_sync(sl, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/A:histogram")
+        grid_sync(workspace, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/A:histogram")
 
-        xgmi_barrier(sl, rank, num_ranks, thread_index, block_index, True, "dispatch_prologue/B1:all-entered")
+        xgmi_barrier(
+            workspace,
+            sym_buffer,
+            rank,
+            num_ranks,
+            thread_index,
+            block_index,
+            True,
+            "dispatch_prologue/B1:all-entered",
+        )
         if block_index == fx.Int32(0):
             for peer_rank in range(num_ranks):
                 peer_c_resource = create_buffer_resource_from_addr(
-                    sym_map(sl, sl.expert_count_buffer, fx.Int32(peer_rank)),
+                    sym_buffer.map(expert_count_base, fx.Int32(peer_rank)),
                     num_records_bytes=c_buffer_bytes,
                 )
                 push_expert_index = thread_index
                 while push_expert_index < fx.Int32(num_experts):
                     send_count_value = buffer_load(
-                        workspace_resource,
-                        fx.Int32(WS_SEND) + push_expert_index,
+                        scratch_resource,
+                        fx.Int32(SCRATCH_SEND) + push_expert_index,
                         vec_width=1,
                         dtype=fx.T.i32(),
                     )
@@ -163,18 +189,24 @@ def _make_dispatch_prologue(
                     )
                     push_expert_index = push_expert_index + fx.Int32(block_threads)
         xgmi_barrier(
-            sl, rank, num_ranks, thread_index, block_index, False, "dispatch_prologue/B3:all-gather-landed"
+            workspace,
+            sym_buffer,
+            rank,
+            num_ranks,
+            thread_index,
+            block_index,
+            False,
+            "dispatch_prologue/B3:all-gather-landed",
         )
 
         if block_index == fx.Int32(0):
-            own_c_address = sl.expert_count_buffer
             if thread_index < fx.Int32(num_ranks):
                 running_pool_offset = fx.Int32(0)
                 for local_expert_index in range(experts_per_rank):
                     expert_total_count = fx.Int32(0)
                     for source_rank in range(num_ranks):
                         expert_total_count = expert_total_count + ld(
-                            own_c_address,
+                            expert_count_base,
                             fx.Int32(source_rank * num_experts + local_expert_index)
                             + thread_index * fx.Int32(experts_per_rank),
                             scope="sys",
@@ -184,8 +216,8 @@ def _make_dispatch_prologue(
                     ) * fx.Int32(block_m)
                     buffer_store(
                         running_pool_offset,
-                        workspace_resource,
-                        fx.Int32(WS_POOLBASE)
+                        scratch_resource,
+                        fx.Int32(SCRATCH_POOLBASE)
                         + thread_index * fx.Int32(experts_per_rank)
                         + fx.Int32(local_expert_index),
                     )
@@ -196,13 +228,15 @@ def _make_dispatch_prologue(
                 preceding_count = fx.Int32(0)
                 for source_rank in range(rank):
                     preceding_count = preceding_count + ld(
-                        own_c_address, fx.Int32(source_rank * num_experts) + expert_index, scope="sys"
+                        expert_count_base, fx.Int32(source_rank * num_experts) + expert_index, scope="sys"
                     )
                 pool_base_value = buffer_load(
-                    workspace_resource, fx.Int32(WS_POOLBASE) + expert_index, vec_width=1, dtype=fx.T.i32()
+                    scratch_resource, fx.Int32(SCRATCH_POOLBASE) + expert_index, vec_width=1, dtype=fx.T.i32()
                 )
                 buffer_store(
-                    pool_base_value + preceding_count, workspace_resource, fx.Int32(WS_START) + expert_index
+                    pool_base_value + preceding_count,
+                    scratch_resource,
+                    fx.Int32(SCRATCH_START) + expert_index,
                 )
                 expert_index = expert_index + fx.Int32(block_threads)
             fx.gpu.barrier()
@@ -211,9 +245,9 @@ def _make_dispatch_prologue(
                 destination_rank = comm_task_index % fx.Int32(num_ranks)
                 local_expert_index = comm_task_index // fx.Int32(num_ranks)
                 expert_id = destination_rank * fx.Int32(experts_per_rank) + local_expert_index
-                count_value = ld(own_c_address, fx.Int32(rank * num_experts) + expert_id, scope="sys")
+                count_value = ld(expert_count_base, fx.Int32(rank * num_experts) + expert_id, scope="sys")
                 start_value = buffer_load(
-                    workspace_resource, fx.Int32(WS_START) + expert_id, vec_width=1, dtype=fx.T.i32()
+                    scratch_resource, fx.Int32(SCRATCH_START) + expert_id, vec_width=1, dtype=fx.T.i32()
                 )
                 buffer_store(destination_rank, expert_send_dst_rank_resource, comm_task_index)
                 buffer_store(start_value, expert_send_dst_row_resource, comm_task_index)
@@ -233,14 +267,14 @@ def _make_dispatch_prologue(
                             dtype=fx.T.i32(),
                         )
                         buffer_store(source_offset, expert_send_offset_resource, fx.Int32(comm_task_counter))
-                        buffer_store(source_offset, workspace_resource, fx.Int32(WS_SROFF + expert_id))
+                        buffer_store(source_offset, scratch_resource, fx.Int32(SCRATCH_SROFF + expert_id))
                         source_offset = source_offset + count_value
                         comm_task_counter = comm_task_counter + 1
             if thread_index < fx.Int32(experts_per_rank):
                 local_expert_index = thread_index
                 expert_pool_base = buffer_load(
-                    workspace_resource,
-                    fx.Int32(WS_POOLBASE + rank * experts_per_rank) + local_expert_index,
+                    scratch_resource,
+                    fx.Int32(SCRATCH_POOLBASE + rank * experts_per_rank) + local_expert_index,
                     vec_width=1,
                     dtype=fx.T.i32(),
                 )
@@ -248,7 +282,7 @@ def _make_dispatch_prologue(
                 for source_rank in fx.range_constexpr(num_ranks):
                     source_counts.append(
                         ld(
-                            own_c_address,
+                            expert_count_base,
                             fx.Int32(source_rank * num_experts + rank * experts_per_rank)
                             + local_expert_index,
                             scope="sys",
@@ -292,7 +326,7 @@ def _make_dispatch_prologue(
                         fx.Int32(experts_per_rank),
                     )
 
-        grid_sync(sl, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/C:table-built")
+        grid_sync(workspace, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/C:table-built")
 
         # Reuse Phase A's per-block histogram in LDS (untouched by barriers) -- skip clear + recount.
         reserve_index = thread_index
@@ -300,8 +334,8 @@ def _make_dispatch_prologue(
             block_expert_count = ld(lds_base, reserve_index, scope="workgroup", space=3)
             if block_expert_count > fx.Int32(0):
                 reserved_base = atomic_add(
-                    workspace_base,
-                    fx.Int32(WS_WITHIN) + reserve_index,
+                    scratch_base,
+                    fx.Int32(SCRATCH_WITHIN) + reserve_index,
                     block_expert_count,
                     "agent",
                     1,
@@ -328,10 +362,10 @@ def _make_dispatch_prologue(
                     + local_position
                 )
                 expert_start = buffer_load(
-                    workspace_resource, fx.Int32(WS_START) + expert_id, vec_width=1, dtype=fx.T.i32()
+                    scratch_resource, fx.Int32(SCRATCH_START) + expert_id, vec_width=1, dtype=fx.T.i32()
                 )
                 expert_source_offset = buffer_load(
-                    workspace_resource, fx.Int32(WS_SROFF) + expert_id, vec_width=1, dtype=fx.T.i32()
+                    scratch_resource, fx.Int32(SCRATCH_SROFF) + expert_id, vec_width=1, dtype=fx.T.i32()
                 )
                 destination_row = expert_start + within_expert_position
                 buffer_store(
@@ -341,15 +375,15 @@ def _make_dispatch_prologue(
                 destination_rank = expert_id // fx.Int32(experts_per_rank)
                 # Symmetric buffers on the destination rank.
                 peer_origin_rank_resource = create_buffer_resource_from_addr(
-                    sym_map(sl, sl.pool_src_rank, destination_rank),
+                    sym_buffer.map(pool_src_rank_base, destination_rank),
                     num_records_bytes=origin_buffer_bytes,
                 )
                 peer_origin_slot_resource = create_buffer_resource_from_addr(
-                    sym_map(sl, sl.pool_src_slot, destination_rank),
+                    sym_buffer.map(pool_src_slot_base, destination_rank),
                     num_records_bytes=origin_buffer_bytes,
                 )
                 peer_weight_resource = create_buffer_resource_from_addr(
-                    sym_map(sl, sl.weight_recv_buf, destination_rank),
+                    sym_buffer.map(weight_recv_base, destination_rank),
                     num_records_bytes=origin_buffer_bytes,
                 )
                 buffer_store(fx.Int32(rank), peer_origin_rank_resource, destination_row)
@@ -361,16 +395,23 @@ def _make_dispatch_prologue(
                 buffer_store(routing_weight, peer_weight_resource, destination_row)
             pair_index = pair_index + fx.Int32(grid_stride)
 
-        grid_sync(sl, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/D:scatter-done")
+        grid_sync(workspace, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/D:scatter-done")
 
         reset_index = block_index * fx.Int32(block_threads) + thread_index
         while reset_index < fx.Int32(num_experts):
-            buffer_store(fx.Int32(0), workspace_resource, fx.Int32(WS_SEND) + reset_index)
-            buffer_store(fx.Int32(0), workspace_resource, fx.Int32(WS_WITHIN) + reset_index)
+            buffer_store(fx.Int32(0), scratch_resource, fx.Int32(SCRATCH_SEND) + reset_index)
+            buffer_store(fx.Int32(0), scratch_resource, fx.Int32(SCRATCH_WITHIN) + reset_index)
             reset_index = reset_index + fx.Int32(grid_stride)
 
         xgmi_barrier(
-            sl, rank, num_ranks, thread_index, block_index, False, "dispatch_prologue/E:origins-landed"
+            workspace,
+            sym_buffer,
+            rank,
+            num_ranks,
+            thread_index,
+            block_index,
+            False,
+            "dispatch_prologue/E:origins-landed",
         )
 
     # Return the raw KernelFunction; the @flyc.jit launcher below drives launch.
@@ -378,15 +419,15 @@ def _make_dispatch_prologue(
 
 
 @functools.lru_cache(maxsize=8)
-def _dispatch_prologue_workspace_cached(num_experts, device):
+def _dispatch_prologue_scratch_cached(num_experts, device):
     return torch.zeros(5 * num_experts, dtype=torch.int32, device=device)
 
 
-def get_dispatch_prologue_workspace(num_experts, device="cuda"):
+def get_dispatch_prologue_scratch(num_experts, device="cuda"):
     dev = torch.device(device)
     if dev.type == "cuda" and dev.index is None:
         dev = torch.device("cuda", torch.cuda.current_device())
-    return _dispatch_prologue_workspace_cached(int(num_experts), dev)
+    return _dispatch_prologue_scratch_cached(int(num_experts), dev)
 
 
 @autotune(
@@ -410,8 +451,8 @@ def get_dispatch_prologue_workspace(num_experts, device="cuda"):
 @flyc.jit
 def _compiled_dispatch_prologue(
     topk_idx_flat,
-    workspace,
-    sym_layout,
+    scratch,
+    sym_buffer,
     expert_send_dst_rank,
     expert_send_dst_row,
     expert_send_count,
@@ -433,6 +474,8 @@ def _compiled_dispatch_prologue(
     experts_per_rank: fx.Constexpr[int],
     block_m: fx.Constexpr[int],
     num_max_pool_tokens: fx.Constexpr[int],
+    hidden: fx.Constexpr[int],
+    num_max_tokens_per_rank: fx.Constexpr[int],
     num_cu: fx.Constexpr[int],
     num_threads: fx.Constexpr[int],
     stream: fx.Stream,
@@ -446,13 +489,15 @@ def _compiled_dispatch_prologue(
         experts_per_rank,
         block_m,
         num_max_pool_tokens,
+        hidden,
+        num_max_tokens_per_rank,
         grid_blocks=num_cu,
         block_threads=num_threads,
     )
     kernel(
         topk_idx_flat,
-        workspace,
-        sym_layout,
+        scratch,
+        sym_buffer,
         expert_send_dst_rank,
         expert_send_dst_row,
         expert_send_count,
@@ -478,7 +523,7 @@ def dispatch_prologue_flydsl_kernel(
     topk_idx,
     topk_weight,
     *,
-    sym_layout,
+    sym_buffer,
     num_tokens,
     num_topk,
     num_experts,
@@ -487,12 +532,14 @@ def dispatch_prologue_flydsl_kernel(
     experts_per_rank,
     block_m,
     num_max_pool_tokens,
+    hidden,
+    num_max_tokens_per_rank,
 ):
     if topk_idx.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"topk_idx must be int32 or int64, got {topk_idx.dtype}")
     topk_idx_flat = topk_idx.contiguous().view(-1)
     dev = topk_idx.device
-    workspace = get_dispatch_prologue_workspace(num_experts, device=dev)
+    scratch = get_dispatch_prologue_scratch(num_experts, device=dev)
 
     num_max_blocks = num_max_pool_tokens // block_m
     expert_send_dst_rank = torch.empty(num_experts, dtype=torch.int32, device=dev)
@@ -515,8 +562,8 @@ def dispatch_prologue_flydsl_kernel(
     stream = torch.cuda.current_stream()
     _compiled_dispatch_prologue(
         topk_idx_flat=topk_idx_flat,
-        workspace=workspace,
-        sym_layout=sym_layout,
+        scratch=scratch,
+        sym_buffer=sym_buffer,
         expert_send_dst_rank=expert_send_dst_rank,
         expert_send_dst_row=expert_send_dst_row,
         expert_send_count=expert_send_count,
@@ -538,6 +585,8 @@ def dispatch_prologue_flydsl_kernel(
         experts_per_rank=experts_per_rank,
         block_m=block_m,
         num_max_pool_tokens=num_max_pool_tokens,
+        hidden=hidden,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
         stream=stream,
     )
     # Handle ABI (indices consumed by fwd combine + bwd dispatch/combine):

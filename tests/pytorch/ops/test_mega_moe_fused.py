@@ -88,6 +88,85 @@ def baseline_reference(group, x, topk_idx, topk_weight, l1_weight, l2_weight, *,
     return dispatcher.token_combine(fc2_out)
 
 
+def _test_forward_backward_impl(
+    tc,
+    hidden,
+    inter,
+    num_experts,
+    num_topk,
+    num_tokens,
+    *,
+    enable_cudagraph=False,
+    enable_torch_compile=False,
+):
+    """Forward + backward SNR of ``mega_moe_fused`` vs turbo DeepEP, optionally under graph/compile."""
+    tc._init_process()
+    symm = None
+    try:
+        group = dist.group.WORLD
+        x, l1_weight, l2_weight, topk_idx, topk_weight = tc._inputs(
+            num_tokens, hidden, inter, num_experts, num_topk
+        )
+        symm = tc._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
+        grad_y = torch.randn((num_tokens, hidden), device=tc.device, dtype=torch.bfloat16)
+
+        # fused runner over grad-carrying inputs; topk_idx stays a constant closure
+        def _fused(x, topk_weight, l1_weight, l2_weight):
+            return mega_moe_fused(group, x, topk_idx, topk_weight, l1_weight, l2_weight)
+
+        runner = _fused
+        if enable_torch_compile:
+            runner = torch.compile(runner)
+
+        x_m = x.detach().requires_grad_(True)
+        l1_m = l1_weight.detach().requires_grad_(True)
+        l2_m = l2_weight.detach().requires_grad_(True)
+        tw_m = topk_weight.detach().requires_grad_(True)
+
+        # make_graphed_callables warms up then captures both forward and backward graphs
+        if enable_cudagraph:
+            runner = torch.cuda.make_graphed_callables(runner, (x_m, tw_m, l1_m, l2_m))
+
+        # run several iters: symm bumps the host-side expected flag each forward, but a captured
+        # graph freezes it -> replay #2+ overshoots the device counter and spins (see next_dispatch).
+        num_iters = 4
+        for _ in range(num_iters):
+            y_m = runner(x_m, tw_m, l1_m, l2_m)
+            dx_m, dl1_m, dl2_m, dtw_m = torch.autograd.grad(y_m, [x_m, l1_m, l2_m, tw_m], grad_y)
+
+        # turbo reference: topk_weight flows through scatter, so dtw is compared directly
+        x_t = x.detach().requires_grad_(True)
+        l1_t = l1_weight.detach().requires_grad_(True)
+        l2_t = l2_weight.detach().requires_grad_(True)
+        tw_t = topk_weight.detach().requires_grad_(True)
+        y_t = baseline_reference(
+            group,
+            x_t,
+            topk_idx,
+            tw_t,
+            l1_t,
+            l2_t,
+            num_experts=num_experts,
+            num_topk=num_topk,
+        )
+        dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
+
+        torch.cuda.synchronize()
+        group.barrier()
+
+        tc._assert_snr(y_m, y_t, tag="forward")
+        # dx asserted: stale-L2 read in combine gate path fixed in ep_intranode (glc|slc).
+        tc._assert_snr(dx_m, dx_t, tag="dx")
+        tc._assert_snr(dl1_m, dl1_t, tag="dl1_weight")
+        tc._assert_snr(dl2_m, dl2_t, tag="dl2_weight")
+        tc._assert_snr(dtw_m, dtw_t, tag="dtw")
+    finally:
+        # release symm buffer + PG even on assertion failure
+        if symm is not None:
+            symm.destroy()
+        dist.destroy_process_group()
+
+
 @instantiate_parametrized_tests
 class MegaMoEFusedTestBase(MultiProcessTestCase):
     """EP8 accuracy tests: fused ``mega_moe_fused`` vs the turbo DeepEP reference."""
@@ -147,7 +226,7 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
         snr = self._snr(actual, ref, tag=tag)
         self.assertGreaterEqual(snr, _SNR_THRESHOLD_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_THRESHOLD_DB}")
 
-    # ── forward: fused op vs turbo DeepEP forward ─────────────────────────────
+    # ── forward + backward vs turbo DeepEP; optional cudagraph / torch.compile ──
     @skip_unless_gfx950
     @skip_if_lt_x_gpu(8)
     @parametrize(
@@ -156,93 +235,34 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
             (7168, 2048, 256, 8, 8192),
         ],
     )
-    def test_forward(self, hidden, inter, num_experts, num_topk, num_tokens):
-        self._init_process()
-        symm = None
-        try:
-            group = dist.group.WORLD
-            x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
-                num_tokens, hidden, inter, num_experts, num_topk
-            )
-            symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
-
-            with torch.no_grad():
-                y_mega = mega_moe_fused(group, x, topk_idx, topk_weight, l1_weight, l2_weight)
-                y_turbo = baseline_reference(
-                    group,
-                    x,
-                    topk_idx,
-                    topk_weight,
-                    l1_weight,
-                    l2_weight,
-                    num_experts=num_experts,
-                    num_topk=num_topk,
-                )
-            torch.cuda.synchronize()
-            group.barrier()
-
-            self._assert_snr(y_mega, y_turbo, tag="forward")
-        finally:
-            # release symm buffer + PG even on assertion failure
-            if symm is not None:
-                symm.destroy()
-            dist.destroy_process_group()
-
-    # ── backward: dl1 / dl2 / d_topk_weight vs reference (dx reported, see note) ──
-    @skip_unless_gfx950
-    @skip_if_lt_x_gpu(8)
     @parametrize(
-        "hidden, inter, num_experts, num_topk, num_tokens",
+        "enable_cudagraph, enable_torch_compile",
         [
-            (7168, 2048, 256, 8, 8192),
+            (False, False),
+            (True, False),
+            (False, True),
         ],
     )
-    def test_backward(self, hidden, inter, num_experts, num_topk, num_tokens):
-        self._init_process()
-        symm = None
-        try:
-            group = dist.group.WORLD
-            x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
-                num_tokens, hidden, inter, num_experts, num_topk
-            )
-            symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
-            grad_y = torch.randn((num_tokens, hidden), device=self.device, dtype=torch.bfloat16)
-
-            # fused op grads
-            x_m = x.detach().requires_grad_(True)
-            l1_m = l1_weight.detach().requires_grad_(True)
-            l2_m = l2_weight.detach().requires_grad_(True)
-            tw_m = topk_weight.detach().requires_grad_(True)
-            y_m = mega_moe_fused(group, x_m, topk_idx, tw_m, l1_m, l2_m)
-            dx_m, dl1_m, dl2_m, dtw_m = torch.autograd.grad(y_m, [x_m, l1_m, l2_m, tw_m], grad_y)
-
-            # turbo reference grads: topk_weight flows through scatter, so dtw is compared directly
-            x_t = x.detach().requires_grad_(True)
-            l1_t = l1_weight.detach().requires_grad_(True)
-            l2_t = l2_weight.detach().requires_grad_(True)
-            tw_t = topk_weight.detach().requires_grad_(True)
-            y_t = baseline_reference(
-                group,
-                x_t,
-                topk_idx,
-                tw_t,
-                l1_t,
-                l2_t,
-                num_experts=num_experts,
-                num_topk=num_topk,
-            )
-            dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
-
-            # dx now asserted: stale-L2 read in combine gate path fixed in ep_intranode (glc|slc); balanced routing here is solid.
-            self._assert_snr(dx_m, dx_t, tag="dx")
-            self._assert_snr(dl1_m, dl1_t, tag="dl1_weight")
-            self._assert_snr(dl2_m, dl2_t, tag="dl2_weight")
-            self._assert_snr(dtw_m, dtw_t, tag="dtw")
-        finally:
-            # release symm buffer + PG even on assertion failure
-            if symm is not None:
-                symm.destroy()
-            dist.destroy_process_group()
+    def test_forward_backward(
+        self,
+        hidden,
+        inter,
+        num_experts,
+        num_topk,
+        num_tokens,
+        enable_cudagraph,
+        enable_torch_compile,
+    ):
+        _test_forward_backward_impl(
+            self,
+            hidden,
+            inter,
+            num_experts,
+            num_topk,
+            num_tokens,
+            enable_cudagraph=enable_cudagraph,
+            enable_torch_compile=enable_torch_compile,
+        )
 
 
 if __name__ == "__main__":
