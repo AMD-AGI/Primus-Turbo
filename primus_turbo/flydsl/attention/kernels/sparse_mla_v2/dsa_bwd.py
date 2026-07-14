@@ -2653,7 +2653,17 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     # (skips the CSR argsort/bincount/cumsum + InvPtr/InvData buffers entirely; the
     # inverse window map is closed-form). Bit-exact vs the CSR path.
     is_cr0 = (num_kv == total_tokens) and (topk == 128)
-    is_cr128 = (num_kv > total_tokens) and (topk <= 256)
+    # FIX (dsv4 cr=4 small-seq dkv misdispatch): the cr=128 closed-form pool gather assumes a
+    # deterministic causal pool. A bare `topk<=256` also catches cr=4 (random pool) at small seq
+    # (S<=512 -> topk<=256) -> wrong dkv/dpool. Guard with the deterministic-pool condition the
+    # forward uses so cr=4 (pool_cr=4) falls through to the CSR gather. Production S=4096 already CSR.
+    _npool_bwd = num_kv - total_tokens
+    is_cr128 = (
+        _npool_bwd > 0
+        and topk <= 256
+        and total_tokens % _npool_bwd == 0
+        and (total_tokens // _npool_bwd) >= 64
+    )
     if is_cr0:
         _gargs = (interm.reshape(-1, D), dkv, int(num_kv), int(total_tokens), stream)
         _gc = _GATHER_CACHE.get("cb")
