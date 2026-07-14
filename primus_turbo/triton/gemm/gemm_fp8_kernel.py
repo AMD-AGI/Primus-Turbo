@@ -144,6 +144,7 @@ def _fp8_persistent_gemm_kernel(
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    MULTI_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
 ):
@@ -190,7 +191,8 @@ def _fp8_persistent_gemm_kernel(
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
             loop_k -= 1
-        tl.assume(loop_k > 1)
+        if MULTI_K:  # host guarantees loop_k > 1 here; skip for small K to avoid a false assume (OOB/UB)
+            tl.assume(loop_k > 1)
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         for k in range(0, loop_k):
@@ -375,6 +377,8 @@ def gemm_fp8_tensorwise_triton_kernel(
         stride_cn,
     )
     even_k = K % block_k == 0
+    # mirrors the kernel's loop_k (cdiv minus the peeled tail tile); gates the assume below
+    multi_k = ((K + block_k - 1) // block_k - (0 if even_k else 1)) > 1
     _fp8_persistent_gemm_kernel[(num_sms,)](
         *args,
         stride_ak=s_ak,
@@ -387,6 +391,7 @@ def gemm_fp8_tensorwise_triton_kernel(
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
+        MULTI_K=multi_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
@@ -438,6 +443,7 @@ def _fp8_rowwise_persistent_gemm_kernel(
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    MULTI_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
 ):
@@ -486,7 +492,8 @@ def _fp8_rowwise_persistent_gemm_kernel(
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
             loop_k -= 1
-        tl.assume(loop_k > 1)
+        if MULTI_K:  # host guarantees loop_k > 1 here; skip for small K to avoid a false assume (OOB/UB)
+            tl.assume(loop_k > 1)
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         for k in range(0, loop_k):
@@ -680,6 +687,8 @@ def gemm_fp8_rowwise_triton_kernel(
         stride_cn,
     )
     even_k = K % block_k == 0
+    # mirrors the kernel's loop_k (cdiv minus the peeled tail tile); gates the assume below
+    multi_k = ((K + block_k - 1) // block_k - (0 if even_k else 1)) > 1
     _fp8_rowwise_persistent_gemm_kernel[(num_sms,)](
         *args,
         stride_ak=s_ak,
@@ -692,6 +701,7 @@ def gemm_fp8_rowwise_triton_kernel(
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
+        MULTI_K=multi_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
