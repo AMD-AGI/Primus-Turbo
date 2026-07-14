@@ -2384,9 +2384,10 @@ def _get_dq(topk_len, scale, num_heads=None):
     fn = _DQ_CACHE.get(key)
     if fn is None:
         # PV-K32: per-16 QK/softmax kept, PV batches 2 tiles into mfma_16x16x32 with direct-v8
-        # operands. Gated to large-topk (topk>=512, even tile count); small-topk pair-batch's
-        # per-pair WAR barrier overhead loses. Both dQ kernels pin dq_acc in AGPR via inline-asm.
-        if topk_len >= 512 and topk_len % 32 == 0:
+        # operands. Both dQ kernels pin dq_acc in AGPR via inline-asm. Threshold 384 (not 512):
+        # build_bwd_dq races at TOPK=384; the race-free pvk32 path handles any even tile count.
+        # Kept coupled with the wrapper's dq_folds_delta threshold.
+        if topk_len >= 384 and topk_len % 32 == 0:
             fn = build_bwd_dq_pvk32(topk_len, float(scale), num_heads=num_heads)
         else:
             fn = build_bwd_dq(topk_len, float(scale), num_heads=num_heads)
@@ -2530,10 +2531,11 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     do_lora = do[..., :D].contiguous()  # [T, H, 512]
     delta = torch.empty(total_tokens, num_heads, dtype=torch.float32, device=q.device)  # [T, H]
     use_fused = int(num_heads) <= 64 and int(topk) <= 256
-    # The fused kernel (flash small-topk) AND build_bwd_dq (pro cr0/cr128, topk<512) both fold the
-    # delta compute inline (dO already resident), dropping the standalone delta off the wall. Only
-    # the pvk32 dQ path (cr4, topk>=512) still needs the standalone kernel.
-    dq_folds_delta = (not use_fused) and (int(topk) < 512)
+    # The fused kernel (flash small-topk) AND build_bwd_dq (pro cr0/cr128, topk<384) both fold the
+    # delta compute inline (dO already resident), dropping the standalone delta off the wall. The
+    # pvk32 dQ path (cr4, topk>=384) needs the standalone kernel. Threshold 384 kept identical to
+    # `_get_dq` so the delta path stays consistent with the dQ routing.
+    dq_folds_delta = (not use_fused) and (int(topk) < 384)
     if not (use_fused or dq_folds_delta):
         # flydsl delta = rowsum(O*dO), fp32 (replaces the triton _bwd_delta_kernel).
         _dstream = torch.cuda.current_stream()
