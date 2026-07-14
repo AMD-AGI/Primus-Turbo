@@ -4,14 +4,10 @@
 # See LICENSE for license information.
 ###############################################################################
 
-# Dual-cast mxfp8 quant emitting raw E8M0 scales. Tile [bm x bk] (=16*nth threads): all threads
-# coalesced-load the input -> LDS, then the two halves run concurrently -- ROW half writes fp8 +
-# row E8M0 (Qr/ASp), COL half casts + stages the transpose in LDS for a coalesced write-back
-# (AtQd) + col E8M0 (AtSp). Bit-identical to the HIP quantize_mxfp8_dual:
-#   Qr [Mp,Kp] fp8 row cast / ASp row E8M0 [Mp,Kp//32]
-#   AtQd [Kp,Mp] fp8 col cast (transposed) / AtSp col E8M0 [Kp,Mp//32]
-# Scales are raw row-major (1 byte/block, dword-packed; cross-workgroup dwords use byte stores to
-# avoid RMW races). GEMM-side preshuffle is fused in the GEMM launch, not here.
+# Dual-cast mxfp8 quant emitting raw row-major E8M0 scales, bit-identical to the HIP
+# quantize_mxfp8_dual. One coalesced tile load -> LDS feeds two concurrent halves: ROW casts fp8 +
+# row E8M0, COL casts the transpose + stages it in LDS for a coalesced write-back + col E8M0.
+# GEMM-side scale preshuffle is fused in the GEMM launch, not here.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
@@ -39,12 +35,8 @@ def _cvt_pk_bf8_f32(res, src_a, src_b, old, word_sel, **kw):
 
 
 def fp8_params(out_fp8):
-    """Per-output-format quant constants, mirroring the C++ compute_tile_scale /
-    cvt_f32x4_to_fp8x4. Returns (val_to_add, ep_sub, sat_bound, cvt_intrinsic):
-      val_to_add = 1 << (23 - mbits - 1)  (round-to-even bump; e4m3 mbits=3, e5m2=2)
-      ep_sub     = 127 + target_max_pow2  (e4m3 8 -> 135, e5m2 15 -> 142)
-      sat_bound  = fp8 max finite (e4m3 448, e5m2 57344)
-      cvt        = packed f32->fp8 (e4m3) / f32->bf8 (e5m2) rocdl intrinsic."""
+    """Per-output-format quant constants (val_to_add round-even bump, ep_sub bias, fp8 sat bound,
+    packed f32->fp8 cvt), mirroring the C++ compute_tile_scale / cvt_f32x4_to_fp8x4."""
     if out_fp8 == "e5m2":
         return (1 << 20, 142, 57344.0, _cvt_pk_bf8_f32)
     return (1 << 19, 135, 448.0, rocdl.cvt_pk_fp8_f32)
@@ -401,13 +393,10 @@ _RAW_QDUAL_BATCHED_CACHE: dict = {}
 
 
 def quant_mxfp8_raw_batched(x_3d, out_dtype):
-    """Batched raw-E8M0 dual-cast mxfp8 quant for a uniform [B, M, K] input (grouped-gemm
-    weight path). Quantizes all B experts in ONE FlyDSL launch (no Python loop / stack) and
-    returns the SAME 4-tuple as ``quant_mxfp8_raw`` per expert, stacked to [B, ...]:
-      row_fp8 [B, M, Kp] fp8, row_scale [B, M, Kp//32] e8m0,
-      col_fp8 [B, K, Mp] fp8, col_scale [B, K, Mp//32] e8m0
-    (Kp=ceil(K/128)*128, Mp=ceil(M/128)*128). Per-expert bit-identical to the removed
-    per-expert loop (standard MX 1x32 blocks), matching the HIP dual-cast output contract."""
+    """Batched raw-E8M0 dual-cast mxfp8 quant for a uniform [B, M, K] input (grouped-gemm weight
+    path), all B experts in ONE launch. Returns quant_mxfp8_raw's 4-tuple stacked to [B, ...]:
+    row_fp8 [B, M, Kp] / row_scale [B, M, Kp//32] e8m0 / col_fp8 [B, K, Mp] / col_scale, with
+    Kp=ceil(K/128)*128, Mp=ceil(M/128)*128. Bit-identical to the HIP dual-cast per expert."""
     import flydsl.compiler as _flyc
     import torch
 
@@ -448,13 +437,10 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype):
 
 
 # ============================================================================
-# Grouped dual-cast quant (per-group M zero-pad, offs-driven) -- FlyDSL replacement for the HIP
-# ``grouped_quantize_mxfp8_dual``, bit-compatible (raw row/col-major E8M0, no preshuffle):
-#   rowwise_output [M_pad_row, N_pad] fp8 / rowwise_scale [M_pad_row, N_pad//32] e8m0
-#   colwise_output [N, M_pad_col] fp8 (transposed) / colwise_scale [N, M_pad_col//32] e8m0
-# Grid tiles the col-128 padded M extent (bm divides 128 => each tile lives in one group). Real
-# rows are remapped from the TIGHT input to the row-64 / col-128 output; pad rows are zero data /
-# E8M0=127 (HIP zero-amax safe path); consumers read only the padded-offs regions.
+# Grouped dual-cast quant (per-group M zero-pad, offs-driven) -- bit-compatible FlyDSL replacement
+# for the HIP grouped_quantize_mxfp8_dual. Grid tiles the col-128 padded M extent (bm divides 128
+# => each tile lives in one group); real rows are remapped from the tight input to the row-64 /
+# col-128 output, pad rows emit zero data / E8M0=127. Output layout: see grouped_quant_mxfp8_raw.
 
 
 def _load_i32_at(div, idx):
@@ -497,11 +483,9 @@ def compile_grouped_qdual(
     out_fp8="e4m3",
     pad_extra=4,
 ):
-    """Compile the grouped dual-cast mxfp8 quant. Tile [bm=64 x bk=128] (== the fast dense qdual
-    config; bm=64 divides the 128-aligned col-pad boundaries so each tile stays in one group).
-    Per-tile group metadata (RB/RO/RE/RIE [NBM]) is computed by a fused ``meta`` prologue (O(G)
-    search once per tile) so the main kernel does uniform scalar loads and the host does zero
-    per-call metadata ops. pad/meta/kern launch back-to-back in one jit stub. Shapes are baked."""
+    """Compile the grouped dual-cast mxfp8 quant. Tile [bm=64 x bk=128] (bm=64 divides the
+    128-aligned col-pad boundary so each tile stays in one group). Each WG computes its per-tile
+    group metadata (RB/RO/RE/RIE) inline via an O(G) offset scan (no prologue kernel). Shapes baked."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
@@ -530,97 +514,6 @@ def compile_grouped_qdual(
     # overflow, else per-feature-row divergent (waterfalls) for any size. See _col_store_res.
     COL_DATA_BAND = BKv * M_pad_col < (1 << 31)
     COL_SCALE_BAND = BKv * SCALEN_COL < (1 << 31)
-    META_BLK = 256
-    META_GRID = (NBM + META_BLK - 1) // META_BLK
-
-    @flyc.kernel(known_block_size=[1, 1, 1])
-    def pad(GO: fx.Tensor, LR: fx.Tensor, ORow: fx.Tensor, LC: fx.Tensor, OCol: fx.Tensor):
-        # Fused padded-layout prologue (1 thread, mirrors HIP compute_padded_layout_gpu): from the
-        # tight int64 offs fill lens/offs_row (64-aligned) + lens/offs_col (128-aligned), replacing
-        # ~7 tiny torch launches. int64 written as (low=val, high=0) i32 pairs (offsets < 2^31).
-        I32 = fx.Int32
-        z = I32(0)
-        go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
-        go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
-        lr_r = bo.create_buffer_resource(LR, max_size=False, num_records_bytes=I32(G * 8))
-        or_r = bo.create_buffer_resource(ORow, max_size=False, num_records_bytes=I32((G + 1) * 8))
-        lc_r = bo.create_buffer_resource(LC, max_size=False, num_records_bytes=I32(G * 8))
-        oc_r = bo.create_buffer_resource(OCol, max_size=False, num_records_bytes=I32((G + 1) * 8))
-        bo.buffer_store(z, or_r, I32(0))
-        bo.buffer_store(z, or_r, I32(1))
-        bo.buffer_store(z, oc_r, I32(0))
-        bo.buffer_store(z, oc_r, I32(1))
-        acc_row = z
-        acc_col = z
-        prev = _load_i32_at(go_div, 0)
-        for g in range_constexpr(G):
-            nxt = _load_i32_at(go_div, 2 * (g + 1))
-            ln = nxt - prev
-            lrow = ((ln + I32(63)) // I32(64)) * I32(64)
-            lcol = ((ln + I32(127)) // I32(128)) * I32(128)
-            bo.buffer_store(lrow, lr_r, I32(2 * g))
-            bo.buffer_store(z, lr_r, I32(2 * g + 1))
-            bo.buffer_store(lcol, lc_r, I32(2 * g))
-            bo.buffer_store(z, lc_r, I32(2 * g + 1))
-            acc_row = acc_row + lrow
-            acc_col = acc_col + lcol
-            bo.buffer_store(acc_row, or_r, I32(2 * (g + 1)))
-            bo.buffer_store(z, or_r, I32(2 * (g + 1) + 1))
-            bo.buffer_store(acc_col, oc_r, I32(2 * (g + 1)))
-            bo.buffer_store(z, oc_r, I32(2 * (g + 1) + 1))
-            prev = nxt
-
-    @flyc.kernel(known_block_size=[META_BLK, 1, 1])
-    def meta(
-        GO: fx.Tensor,
-        GR: fx.Tensor,
-        GC: fx.Tensor,
-        RB: fx.Tensor,
-        RO: fx.Tensor,
-        RE: fx.Tensor,
-        RIE: fx.Tensor,
-    ):
-        # Prologue: one thread per M-tile bt does the O(G) group search over the int32-view int64
-        # offs and writes (RB,RO,RE,RIE): RB=abs input row of local row 0, RO=row-64 output base,
-        # RE=real-row end in col-pad space (OOB tile -> base_m), RIE=abs input row end of the group
-        # (bounds the input band so past-group rows HW-drop). bt>=NBM OOB-drops on the store.
-        I32 = fx.Int32
-        bt = fx.block_idx.x * I32(META_BLK) + fx.thread_idx.x
-        base_m = bt * I32(BMv)
-        go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
-        go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
-        gr_t = rocdl.make_buffer_tensor(GR, max_size=False, num_records_bytes=(G + 1) * 8)
-        gr_div = fx.logical_divide(gr_t, fx.make_layout(1, 1))
-        gc_t = rocdl.make_buffer_tensor(GC, max_size=False, num_records_bytes=(G + 1) * 8)
-        gc_div = fx.logical_divide(gc_t, fx.make_layout(1, 1))
-        found = I32(0)
-        go_orig_g = I32(0)
-        go_orig_g1 = I32(0)
-        go_row_g = I32(0)
-        go_col_g = I32(0)
-        for g in range_constexpr(G):
-            c0 = _load_i32_at(gc_div, 2 * g)  # low word of int64 offs[g]
-            c1 = _load_i32_at(gc_div, 2 * g + 2)
-            inq = (base_m >= c0) & (base_m < c1)
-            go_col_g = arith.select(inq, c0, go_col_g)
-            go_orig_g = arith.select(inq, _load_i32_at(go_div, 2 * g), go_orig_g)
-            go_orig_g1 = arith.select(inq, _load_i32_at(go_div, 2 * g + 2), go_orig_g1)
-            go_row_g = arith.select(inq, _load_i32_at(gr_div, 2 * g), go_row_g)
-            found = arith.select(inq, I32(1), found)
-        isreal = found == I32(1)
-        mrel = base_m - go_col_g
-        rb = arith.select(isreal, go_orig_g + mrel, I32(0))
-        ro = arith.select(isreal, go_row_g + mrel, I32(0))
-        re = arith.select(isreal, go_col_g + (go_orig_g1 - go_orig_g), base_m)
-        rie = arith.select(isreal, go_orig_g1, I32(0))
-        rb_rsrc = bo.create_buffer_resource(RB, max_size=False, num_records_bytes=I32(NBM * 4))
-        ro_rsrc = bo.create_buffer_resource(RO, max_size=False, num_records_bytes=I32(NBM * 4))
-        re_rsrc = bo.create_buffer_resource(RE, max_size=False, num_records_bytes=I32(NBM * 4))
-        rie_rsrc = bo.create_buffer_resource(RIE, max_size=False, num_records_bytes=I32(NBM * 4))
-        bo.buffer_store(rb, rb_rsrc, bt)
-        bo.buffer_store(ro, ro_rsrc, bt)
-        bo.buffer_store(re, re_rsrc, bt)
-        bo.buffer_store(rie, rie_rsrc, bt)
 
     @flyc.kernel(known_block_size=[NTHv, 1, 1])
     def kern(
@@ -629,10 +522,11 @@ def compile_grouped_qdual(
         ASp: fx.Tensor,
         AtQd: fx.Tensor,
         AtSp: fx.Tensor,
-        RB: fx.Tensor,  # per M-tile input row rebase (go_orig_g + mrel), int32 [NBM]
-        RO: fx.Tensor,  # per M-tile row-64 output base   (go_row_g  + mrel), int32 [NBM]
-        RE: fx.Tensor,  # per M-tile real-row end in col-pad space (go_col_g + Mg), int32 [NBM]
-        RIE: fx.Tensor,  # per M-tile abs INPUT row end (go_orig_g1); bounds the input band [NBM]
+        GO: fx.Tensor,  # tight per-group offs (int32 view of int64 [G+1])
+        LR: fx.Tensor,  # OUT: 64-padded per-group lens (int64 [G])
+        GR: fx.Tensor,  # OUT: 64-padded per-group offs (int64 [G+1])
+        LC: fx.Tensor,  # OUT: 128-padded per-group lens (int64 [G])
+        GC: fx.Tensor,  # OUT: 128-padded per-group offs (int64 [G+1])
     ):
         I32 = fx.Int32
         BF = elt.ir_type
@@ -653,19 +547,64 @@ def compile_grouped_qdual(
         br, bkc = _decode_pid(pid, I32(NBK), I32(NBM), False)
         base_m = br * I32(BMv)
 
-        # ---- per-tile group metadata (host-precomputed, indexed by M-tile br) ----
-        rb_t = rocdl.make_buffer_tensor(RB, max_size=False, num_records_bytes=NBM * 4)
-        rb_div = fx.logical_divide(rb_t, fx.make_layout(1, 1))
-        ro_t = rocdl.make_buffer_tensor(RO, max_size=False, num_records_bytes=NBM * 4)
-        ro_div = fx.logical_divide(ro_t, fx.make_layout(1, 1))
-        re_t = rocdl.make_buffer_tensor(RE, max_size=False, num_records_bytes=NBM * 4)
-        re_div = fx.logical_divide(re_t, fx.make_layout(1, 1))
-        rie_t = rocdl.make_buffer_tensor(RIE, max_size=False, num_records_bytes=NBM * 4)
-        rie_div = fx.logical_divide(rie_t, fx.make_layout(1, 1))
-        in_rebase = _load_i32_at(rb_div, br)  # abs input row for this tile's local row 0
-        rowbase_out = _load_i32_at(ro_div, br)  # row-64 output base for local row 0
-        real_end = _load_i32_at(re_div, br)  # real-row end (col-pad space); grow>=end -> pad
-        in_end = _load_i32_at(rie_div, br)  # abs input row end of this group (go_orig_g1)
+        # ---- per-tile group metadata computed INLINE (no pad/meta prologue kernels):
+        # each WG does the O(G) 64/128-padded-offset scan from GO (loaded to registers
+        # first, no dependent load chain), yielding in_rebase / rowbase_out / real_end /
+        # in_end. The pid==0 WG also emits the padded lens/offs outputs (threads t<=G). ----
+        go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
+        go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
+        go_vals = [_load_i32_at(go_div, 2 * g) for g in range_constexpr(G + 1)]
+        found = z
+        go_orig_g = z
+        go_orig_g1 = z
+        go_row_g = z
+        go_col_g = z
+        acc_row = z
+        acc_col = z
+        cap_lr = z
+        cap_lc = z
+        cap_or = z
+        cap_oc = z
+        for g in range_constexpr(G):
+            prev = go_vals[g]
+            nxt = go_vals[g + 1]
+            ln = nxt - prev
+            lrow = ((ln + I32(63)) // I32(64)) * I32(64)
+            lcol = ((ln + I32(127)) // I32(128)) * I32(128)
+            inq = (base_m >= acc_col) & (base_m < acc_col + lcol)
+            go_col_g = arith.select(inq, acc_col, go_col_g)
+            go_orig_g = arith.select(inq, prev, go_orig_g)
+            go_orig_g1 = arith.select(inq, nxt, go_orig_g1)
+            go_row_g = arith.select(inq, acc_row, go_row_g)
+            found = arith.select(inq, I32(1), found)
+            atg = t == I32(g)
+            cap_lr = arith.select(atg, lrow, cap_lr)
+            cap_lc = arith.select(atg, lcol, cap_lc)
+            cap_or = arith.select(atg, acc_row, cap_or)  # offs before group g
+            cap_oc = arith.select(atg, acc_col, cap_oc)
+            acc_row = acc_row + lrow
+            acc_col = acc_col + lcol
+        cap_or = arith.select(t == I32(G), acc_row, cap_or)  # offs_row[G] = total padded
+        cap_oc = arith.select(t == I32(G), acc_col, cap_oc)
+        isreal = found == I32(1)
+        mrel = base_m - go_col_g
+        in_rebase = arith.select(isreal, go_orig_g + mrel, z)  # abs input row for local row 0
+        rowbase_out = arith.select(isreal, go_row_g + mrel, z)  # row-64 output base
+        real_end = arith.select(isreal, go_col_g + (go_orig_g1 - go_orig_g), base_m)  # real-row end
+        in_end = arith.select(isreal, go_orig_g1, z)  # abs input row end of this group
+        if pid == z:  # one WG writes the padded lens/offs outputs (num_records masks t>G)
+            lr_r = bo.create_buffer_resource(LR, max_size=False, num_records_bytes=I32(G * 8))
+            gr_r = bo.create_buffer_resource(GR, max_size=False, num_records_bytes=I32((G + 1) * 8))
+            lc_r = bo.create_buffer_resource(LC, max_size=False, num_records_bytes=I32(G * 8))
+            gc_r = bo.create_buffer_resource(GC, max_size=False, num_records_bytes=I32((G + 1) * 8))
+            bo.buffer_store(cap_lr, lr_r, 2 * t)
+            bo.buffer_store(z, lr_r, 2 * t + I32(1))
+            bo.buffer_store(cap_or, gr_r, 2 * t)
+            bo.buffer_store(z, gr_r, 2 * t + I32(1))
+            bo.buffer_store(cap_lc, lc_r, 2 * t)
+            bo.buffer_store(z, lc_r, 2 * t + I32(1))
+            bo.buffer_store(cap_oc, gc_r, 2 * t)
+            bo.buffer_store(z, gc_r, 2 * t + I32(1))
 
         # ---- load tile: remap TIGHT input row -> LDS, zero pad rows / OOB cols ----
         # Input band bounded to THIS group's real rows [in_rebase, in_end): rows past the group
@@ -833,22 +772,14 @@ def compile_grouped_qdual(
         GO: fx.Tensor,
         GR: fx.Tensor,
         GC: fx.Tensor,
-        RB: fx.Tensor,
-        RO: fx.Tensor,
-        RE: fx.Tensor,
-        RIE: fx.Tensor,
         LR: fx.Tensor,
         LC: fx.Tensor,
         stream: fx.Stream,
     ):
-        # 0) pad_layout fills GR/GC (=offs_row/col) + LR/LC (=lens_row/col) from tight GO;
-        # 1) meta prologue fills RB/RO/RE/RIE (reads GR/GC); 2) main quant reads them.
-        pad(GO, LR, GR, LC, GC).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-        meta(GO, GR, GC, RB, RO, RE, RIE).launch(
-            grid=(META_GRID, 1, 1), block=(META_BLK, 1, 1), stream=stream
-        )
+        # Single kernel: per-tile group metadata computed inline (no pad/meta prologue),
+        # the pid==0 WG emits the padded lens/offs outputs (LR/GR/LC/GC).
         grid = NBM * NBK
-        kern(X, Qr, ASp, AtQd, AtSp, RB, RO, RE, RIE).launch(
+        kern(X, Qr, ASp, AtQd, AtSp, GO, LR, GR, LC, GC).launch(
             grid=(grid, 1, 1), block=(NTHv, 1, 1), stream=stream
         )
 
@@ -870,18 +801,10 @@ def quant_mxfp8_raw(x, out_dtype):
 
 
 def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
-    """FlyDSL grouped dual-cast mxfp8 quant, drop-in for the HIP
-    ``grouped_quantize_mxfp8_dual`` (non-shuffle, per-row/col E8M0).  Returns the same
-    8-tuple contract:
-      (rowwise_output [M_pad_row, N_pad] fp8, rowwise_scale [M_pad_row, N_pad//32] e8m0,
-       colwise_output [N, M_pad_col]     fp8, colwise_scale [N, M_pad_col//32] e8m0,
-       group_lens_padded_rowwise [G], group_offs_padded_rowwise [G+1],
-       group_lens_padded_colwise [G], group_offs_padded_colwise [G+1]).
-
-    ``x`` [total_M, N] bf16/fp16 contiguous; ``group_lens`` [G] / ``group_offs`` [G+1] int64 GPU
-    (tight). M_pad_row / M_pad_col use the host upper bounds (cdiv(total_M + G*align, align)*align)
-    like the HIP op, so the grid over-covers and OOB tiles emit all-zero fp8 / E8M0=127. The padded
-    per-group lens/offs are filled on-device by the fused ``pad`` prologue (no D2H)."""
+    """FlyDSL grouped dual-cast mxfp8 quant, drop-in for the HIP grouped_quantize_mxfp8_dual
+    (non-shuffle, per-row/col E8M0). ``x`` [total_M, N] bf16/fp16; group_lens/group_offs [G]/[G+1]
+    int64 GPU (tight). Returns the HIP 8-tuple: (row fp8 [M_pad_row, N_pad], row e8m0, col fp8
+    [N, M_pad_col] transposed, col e8m0, lens/offs_padded_row [G]/[G+1], lens/offs_padded_col)."""
     import flydsl.compiler as _flyc
     import torch
 
@@ -898,8 +821,7 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     M_pad_col = ((total_M + G * 128) + 127) // 128 * 128
     out_fp8 = "e5m2" if out_dtype == torch.float8_e5m2 else "e4m3"
 
-    # Padded per-group lens/offs are filled ON-DEVICE by the fused ``pad`` prologue (replacing ~7
-    # tiny host torch launches). Allocate uninitialized; ``pad`` fills them before meta/kern read.
+    # Padded per-group lens/offs are filled ON-DEVICE by the quant kernel (no host torch launches).
     lens_row = torch.empty(G, dtype=torch.int64, device=x.device)
     lens_col = torch.empty(G, dtype=torch.int64, device=x.device)
     offs_row = torch.empty(G + 1, dtype=torch.int64, device=x.device)
@@ -911,17 +833,12 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     AtSp = torch.empty(raw_scale_int32(N, M_pad_col), dtype=torch.int32, device=x.device)
 
     # int32 views of the int64 [G+1] offs (low word carries the value; token offsets < 2^31). The
-    # fused ``meta`` prologue reads these + fills RB/RO/RE/RIE on-device (no host metadata ops).
+    # kernel reads GO + fills the padded lens/offs (gr/gc/lr/lc) on-device (no host metadata ops).
     go = group_offs.to(torch.int64).view(torch.int32)
     gr = offs_row.view(torch.int32)
     gc = offs_col.view(torch.int32)
     lr = lens_row.view(torch.int32)
     lc = lens_col.view(torch.int32)
-    NBM = M_pad_col // 64
-    RB = torch.empty(NBM, dtype=torch.int32, device=x.device)
-    RO = torch.empty(NBM, dtype=torch.int32, device=x.device)
-    RE = torch.empty(NBM, dtype=torch.int32, device=x.device)
-    RIE = torch.empty(NBM, dtype=torch.int32, device=x.device)
 
     key = (total_M, N, G, M_pad_row, M_pad_col, x.dtype, out_dtype)
     comp = _GROUPED_QDUAL_CACHE.get(key)
@@ -930,9 +847,9 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
         launch = compile_grouped_qdual(
             total_M, N, G, M_pad_row, M_pad_col, elt=in_elt(x.dtype), out_fp8=out_fp8
         )
-        comp = _flyc.compile(launch, x, Qr, ASp, AtQd, AtSp, go, gr, gc, RB, RO, RE, RIE, lr, lc, stream)
+        comp = _flyc.compile(launch, x, Qr, ASp, AtQd, AtSp, go, gr, gc, lr, lc, stream)
         _GROUPED_QDUAL_CACHE[key] = comp
-    comp(x, Qr, ASp, AtQd, AtSp, go, gr, gc, RB, RO, RE, RIE, lr, lc, stream)
+    comp(x, Qr, ASp, AtQd, AtSp, go, gr, gc, lr, lc, stream)
 
     e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
     rowwise_scale = ASp.view(torch.uint8)[: M_pad_row * (N_pad // 32)].view(M_pad_row, N_pad // 32).view(e8)
