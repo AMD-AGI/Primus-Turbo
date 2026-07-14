@@ -23,8 +23,8 @@ rank owns a slice of the experts and tokens are routed directly into a peer rank
 - **Activation recompute** — forward saves only the original `x`; backward recomputes the
   dispatched `x`.
 - **No-Sync / CUDA Graph friendly** — no host-side sync points.
-- **Two levels of Python API** — the low-level autograd op `mega_moe_fused`, and the high-level
-  `MegaMoE` nn.Module with a built-in router.
+- **Python API** — a single autograd op `mega_moe_fused` that takes external routing
+  (`topk_idx` / `topk_weights`).
 
 ## Core Design
 
