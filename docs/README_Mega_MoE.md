@@ -103,17 +103,17 @@ recomputed by `dispatch_grouped_gemm`.
 
 ### Reproduce
 
-Two component benchmarks compare the fused path against the Primus-Turbo (DeepEP) baseline over 8
-ranks. Run them from the repo root:
+A single benchmark script covers both fused operators, selected with `--mode`; each compares the
+fused path against the Primus-Turbo (DeepEP) baseline over 8 ranks. Run from the repo root:
 
 ```bash
 export PYTORCH_ROCM_ARCH=gfx950
 
 # fused BF16 dispatch + grouped GEMM
-python benchmark/ops/training/bench_dispatch_grouped_gemm.py --models DeepSeek-V3 --num-processes 8
+python benchmark/ops/training/bench_mega_moe.py --mode dispatch_grouped_gemm --models DeepSeek-V3 --num-processes 8
 
 # fused BF16 grouped GEMM + combine
-python benchmark/ops/training/bench_grouped_gemm_combine.py --models DeepSeek-V3 --num-processes 8
+python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --models DeepSeek-V3 --num-processes 8
 ```
 
 ## Implementation Map
