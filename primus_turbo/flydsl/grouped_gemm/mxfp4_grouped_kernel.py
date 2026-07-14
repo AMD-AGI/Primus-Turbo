@@ -188,8 +188,15 @@ def _build_grouped_mxfp4_b_preshuffle(K128: int, G: int, N: int):
     return kern
 
 
-def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wlv=10, elgk=9, out_fp16=False):
-    """Grouped MXFP4 NT (out = a @ b^T), per-group A rows + per-expert B, whole-loop compute."""
+def _build_grouped_mxfp4_nt_kernel(
+    K, G, N, group_m=4, num_xcds=8, group_n=0, wlv=10, elgk=9, out_fp16=False, k_real=None
+):
+    """Grouped MXFP4 NT (out = a @ b^T), per-group A rows + per-expert B, whole-loop compute.
+
+    ``k_real`` (<= K, 128-multiple): the operands' TRUE contraction (row stride). K is the
+    256-rounded tile/scale extent. When k_real < K the last 256-block's second 128-sub is
+    the over-read tail: its operand reads past the real row (garbage) but its scale is the
+    zero-padded region (E8M0 0 ~= 0), so it contributes ~0 -- no operand K-pad copy needed."""
     BLOCK_M = BLOCK_N = BLOCK_K = _BLOCK
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     swizzle = True
@@ -199,7 +206,8 @@ def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wl
     N_SUB = BLOCK_K // 128
     BPR = BLOCK_K // 2
     KSTEP = BPR
-    K2 = K // 2
+    _KR = K if k_real is None else k_real  # operand true contraction
+    K2 = _KR // 2  # operand row stride (bytes) = real K (no operand K-pad)
     N_TILES_A = BLOCK_M // 32
     LDS_BN_HALF = BLOCK_N // 2
     N_TILES_BH = LDS_BN_HALF // 32
@@ -256,8 +264,8 @@ def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wl
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk)
-        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR, swizzle=swizzle)
-        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_BH, BPR, swizzle=swizzle)
+        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, _KR, N_LDS_STEPS_A, BPR, swizzle=swizzle)
+        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, _KR, N_LDS_STEPS_BH, BPR, swizzle=swizzle)
         rsrc_a = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=c_m * K2)
         rsrc_b = buffer_ops.create_buffer_resource(B_T, max_size=False, num_records_bytes=I32(G) * c_n * K2)
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8, wave_id)
@@ -497,12 +505,12 @@ def _grouped_mxfp4_pick_cfg(cache, cands, shape_key, capturing, build_entry, run
     return best_cfg
 
 
-def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16):
+def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=None):
     K128 = K // 128
     a_pre_shuf = _build_grouped_mxfp4_a_preshuffle(K128, G)
     b_pre_shuf = _build_grouped_mxfp4_b_preshuffle(K128, G, N)
     gemm_k, attrs, NBK = _build_grouped_mxfp4_nt_kernel(
-        K, G, N, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16
+        K, G, N, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16, k_real=k_real
     )
     b_pre_grid = ceildiv(G * N * K128, _PRESHUF_NG * _PRESHUF_BLK)
 
@@ -560,17 +568,17 @@ def grouped_gemm_mxfp4_flydsl_kernel(
 
     # Free dim N: NO host pad -- the kernel tiles the real N (ceildiv) and masks store
     # cols >= N (StoreCPlain n_valid), so a non-256 N runs natively with no operand copy.
-    # Contraction K: the whole-loop tiles 256, so K (already 128-padded by the quant) is
-    # zero-padded to 256 (0*2^-127 = 0 contributes nothing) -- a small K-col zero-fill.
+    # Contraction K: the OPERANDS stay at their real (128-padded) K (no copy); only the tiny
+    # E8M0 SCALE is zero-padded to 256 so the over-read tail 128-sub multiplies by ~0. The
+    # whole-loop tiles K256; k_real is the operands' true row stride.
+    k_real = K
     K256 = (K + 255) // 256 * 256
-    au = a.contiguous().view(torch.uint8)  # [total_M, K/2]
+    au = a.contiguous().view(torch.uint8)  # [total_M, k_real/2] -- real K, not padded
     asu = a_scale.contiguous().view(torch.uint8)  # [total_M, K/32]
-    bu = b.contiguous().view(torch.uint8)  # [G, N, K/2]
+    bu = b.contiguous().view(torch.uint8)  # [G, N, k_real/2]
     bsu = b_scale.contiguous().view(torch.uint8)  # [G, N, K/32]
     if K256 != K:
-        au = F.pad(au, (0, (K256 - K) // 2))
-        asu = F.pad(asu, (0, (K256 - K) // 32))
-        bu = F.pad(bu, (0, (K256 - K) // 2))
+        asu = F.pad(asu, (0, (K256 - K) // 32))  # scale zero-pad (tiny); operands stay real K
         bsu = F.pad(bsu, (0, (K256 - K) // 32))
     K = K256
     K128 = K // 128
@@ -610,10 +618,10 @@ def grouped_gemm_mxfp4_flydsl_kernel(
 
     def _entry(cfg):
         gm, xcd, gn = cfg
-        lk = (K, G, N, gm, xcd, gn, wlv, elgk, out_fp16)
+        lk = (K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real)
         ent = _GMXFP4_LAUNCH_CACHE.get(lk)
         if ent is None:
-            ent = _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16)
+            ent = _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=k_real)
             _GMXFP4_LAUNCH_CACHE[lk] = ent
         atk = (total_M, N, K, G, gm, xcd, gn, out_fp16)
         e2 = _GMXFP4_AT_CACHE.get(atk)
