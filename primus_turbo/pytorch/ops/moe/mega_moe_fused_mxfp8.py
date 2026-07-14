@@ -12,13 +12,13 @@ mxfp8 NT GEMM) -> SwiGLU -> L2 = the fp8 combine (`grouped_gemm_combine_fp8`: fp
 mxfp8-quant epilogue + fp8 XGMI PUSH + fp8-dequant weighted reduce).
 Backward (conjugate via the Dispatch<->Combine duality, mirrors the bf16
 `MegaMoEFusedFunction.backward`):
-  * STEP1 (dispatch(dy) + fc2 dgrad, NN) and STEP3 (fc1 dgrad + combine) + dW1: bf16.
-  * dW2 (fc2 weight grad, variable-K over the pool): **MXFP8** -- quantize
-    ``dispatch_l2_grad`` + ``act_weighted`` colwise (along the pool contraction) and run
-    the mxfp8 variable-K wgrad (`grouped_gemm_fp8_variable_k_impl`, MX_BLOCKWISE), mirroring
-    the validated `MXFP8GroupedGEMMFunction.backward` grad_b. dW2 is a large GEMM
-    (H*I*pool), so fp8 there is the main backward win; the dgrad/combine stay bf16 per the
-    L2-combine analysis (Increment A). A later increment fp8-izes STEP1 dgrad too.
+  * STEP1 (dispatch(dy) + fc2 dgrad, NN): **MXFP8** fork -- emits ``grad_swiglu`` + the dispatched-dy
+    pool in native rowwise-fp8 (the dW2 ``a`` operand). STEP3 (fc1 dgrad + combine) + dW1: bf16.
+  * dW2 (fc2 weight grad, variable-K over the pool): **MXFP8** -- the ``a`` operand
+    (``dispatch_l2_grad``) is requant-fused colwise DIRECTLY from the STEP1 rowwise-fp8 pool (no
+    bf16 round-trip, LDS-transposed coalesced write); ``act_weighted`` is colwise-quantized; then
+    the mxfp8 variable-K wgrad (`grouped_gemm_fp8_variable_k_impl`, MX_BLOCKWISE, autotuned).
+    dW2 is the large GEMM (H*I*pool) -> the main backward win (~1.04x bf16 balanced).
 
 ``_DW2_FP8_FORMAT`` selects the dW2 wgrad fp8 encoding (default E5M2 for gradient range;
 E4M3 measured higher-SNR at DSv3 magnitudes -- gated by dW2 SNR + few-step training loss)."""
@@ -55,9 +55,6 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_impl,
 )
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
-    grouped_gemm_variable_k_impl,
-)
 from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (
     dispatch_grouped_gemm_impl,
 )
@@ -73,36 +70,6 @@ from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (
 __all__ = ["MegaMoEFusedMxfp8Function", "mega_moe_fused_mxfp8"]
 
 _DW2_FP8_FORMAT = float8_e5m2  # dW2 wgrad encoding (E5M2 = grad range; flip to float8_e4m3 to compare)
-# fp8 dW2 default OFF: at the REAL DSv3 EP8 shape (~2048 tok/expert, compute-bound) it is now
-# ~PARITY, not a clear win. Latest measured (dw2_bench, balanced, e5m2):
-#   bf16 dW2 1.685 ms | FlyDSL fp8 GEMM-only 0.984 (0.58x, big win) | colwise quant (both, mine) 0.81
-#   -> full fp8 dW2 ~1.66-1.80 ms = ~0.99-1.06x bf16 (dW2 SNR 22.58 dB == dual, correctness fine).
-# The FlyDSL GEMM saves ~0.70 ms vs bf16, but the 2x colwise quant costs ~0.68-0.81 ms and almost
-# exactly cancels it. The dedicated colwise quant (quant_colwise_trans_flydsl) already beats the C++
-# dual by ~1.2x; the quant is at the practical limit for a separate pass. A CLEAR win needs either
-# (a) fusing the colwise-fp8 quant into the producers (STEP1 bwd emits dispatch_l2_grad colwise-fp8,
-# swiglu_backward emits act_weighted colwise-fp8 -> quant free, dW2 -> 0.58x bf16), or (b) a
-# D2H-free + faster (<0.55 ms) quant. See agent/workspace/dw2_mxfp8_wgrad_gfx950_20260713/findings.md.
-# Enable only after re-measuring a real speedup (and eliminate the metadata D2H first).
-_USE_FP8_DW2 = False
-# fp8 STEP1 backward (dispatch(dy) + fc2 dgrad) via the optimized mxfp8 bwd fork. Env-gated so the
-# 8-GPU test can toggle it without a code edit. Default OFF pending the DOWNSTREAM fix (below).
-# STEP1 ITSELF IS VERIFIED CORRECT + FAST (bench_dispatch_grouped_gemm_mxfp8_nn.py on MI355X EP8,
-# real DSv3 shape):
-#   * perf: 1.39x (load_balanced) / 1.55x (round_robin) vs bf16 fused STEP1.
-#   * correctness: grad_swiglu cos 0.999 vs bf16 (fresh-dy coherence gate); and in the real
-#     forward->fork sequence grad_swiglu == pool@w2 at 30.9 dB + dispatch_l2_grad 31.2 dB vs a torch
-#     reference (test_step1_isolate_grad_swiglu). Requires the C++ quantize_grouped_weight_mxfp8 for
-#     w2^T (the flydsl cached weight quant corrupts the fork -> forced C++ in _w2t_mxfp8_cached), and
-#     the fork must run right after the forward L1 (running a bf16 dispatch first evicts its coherent
-#     scale from L2 -> stale reads; not an issue in the real backward which has no bf16 STEP1).
-# WHY STILL OFF: the module's DOWNSTREAM backward (swiglu_backward / STEP3 combine / dW1, all bf16)
-# is broken on this tree -> dx/dW1/grad_topk are ~0 cos vs the fp32 dense reference EVEN with the
-# DEFAULT bf16 STEP1 (test_backward_gradcheck_mxfp8; the bf16 MegaMoE gradcheck also faults). So the
-# blocker is the pre-existing WIP bf16 backward kernels, NOT STEP1. Enable once that is fixed +
-# test_backward_gradcheck_mxfp8 passes with PT_MEGA_FP8_STEP1_DEV=1. Also: the pool dequant partially
-# eats STEP1's win (fuse dW2's colwise quant into the dispatch epilogue later).
-_USE_FP8_STEP1 = os.environ.get("PT_MEGA_FP8_STEP1", "0") != "0"
 _MXFP8_BLOCK = 32
 _HANDLE_GROUP_LENS = 9
 _HANDLE_GROUP_OFFS = 10
@@ -127,29 +94,22 @@ def _host_rendezvous(group, *, load_bearing):
     group.barrier()
 
 
-def _mxfp8_variable_k_wgrad(a_bf16, b_bf16, group_lens, group_offs, *, a_fp8=None):
-    """dW = a^T @ b (variable-K over the pool/contraction axis) in MXFP8. Quantizes both
-    operands colwise (transposed) with the dedicated FlyDSL colwise-transpose quant, then the
-    FlyDSL mxfp8 variable-K grouped GEMM. Returns [G, a.shape[1], b.shape[1]] bf16.
+def _mxfp8_variable_k_wgrad(a_fp8, b_bf16, group_lens, group_offs):
+    """dW2 = a^T @ b (variable-K over the pool/contraction axis) in MXFP8. Returns
+    [G, H, b.shape[1]] bf16.
 
-    The colwise quant emits ONLY the transposed operand the wgrad needs (a_t + raw E8M0),
-    skipping the C++ dual's wasted rowwise half -> ~1.2x faster than the dual for the 2 operands
-    (0.81 vs ~0.99 ms at the DSv3 shape), byte-exact (dW2 SNR 22.58 dB == dual). The metadata is
-    shared across both operands. NOTE: colwise_grouped_meta does one total_M_pad D2H.
-
-    ``a_fp8`` (a-branch producer fusion): when the ``a`` operand is already the STEP1 rowwise-fp8
-    pool ``(pool_fp8 [P,H], pool_scale [P,H//32])``, requant it colwise DIRECTLY from fp8 (fused
-    dequant->requant, no bf16 ``dispatch_l2_grad`` round-trip) -- byte-identical to quantizing the
-    dequanted bf16, but skips materializing + re-reading the bf16 intermediate. ``a_bf16`` is
-    ignored when ``a_fp8`` is given."""
+    ``a_fp8`` (a-branch producer fusion) is the STEP1 rowwise-fp8 pool ``(pool_fp8 [P,H],
+    pool_scale [P,H//32])``: requant it colwise DIRECTLY from fp8 (fused dequant->requant, no bf16
+    ``dispatch_l2_grad`` round-trip, LDS-transposed coalesced write). ``b`` (act_weighted, bf16) is
+    colwise-quantized with the dedicated FlyDSL colwise-transpose quant. Both emit ONLY the
+    transposed operand the wgrad needs (a_t + raw E8M0); the metadata is shared. Then the FlyDSL
+    mxfp8 variable-K grouped GEMM (autotuned config). NOTE: colwise_grouped_meta does one
+    total_M_pad D2H."""
     meta = colwise_grouped_meta(group_lens, group_offs)
-    if a_fp8 is not None:
-        pool_fp8, pool_scale = a_fp8
-        a_t, a_ts, lens_pc, offs_pc = colwise_requant_mxfp8_grouped_fp8in_flydsl(
-            pool_fp8, pool_scale, _DW2_FP8_FORMAT, meta=meta
-        )
-    else:
-        a_t, a_ts, lens_pc, offs_pc = colwise_quant_mxfp8_grouped_flydsl(a_bf16, _DW2_FP8_FORMAT, meta=meta)
+    pool_fp8, pool_scale = a_fp8
+    a_t, a_ts, lens_pc, offs_pc = colwise_requant_mxfp8_grouped_fp8in_flydsl(
+        pool_fp8, pool_scale, _DW2_FP8_FORMAT, meta=meta
+    )
     b_t, b_ts, _, _ = colwise_quant_mxfp8_grouped_flydsl(b_bf16, _DW2_FP8_FORMAT, meta=meta)
     return grouped_gemm_fp8_variable_k_impl(
         a_t, b_t,
@@ -178,27 +138,14 @@ def _w2t_mxfp8_cached(w2):
     return v
 
 
-def _dequant_pool_fp8_bf16(symm):
-    """Dequant the fp8 dispatched-``dy`` pool (rowwise mxfp8 ``[P,H]`` E4M3 + raw E8M0 ``[P,H//32]``)
-    back to a bf16 ``dispatch_l2_grad`` for dW2.  Torch reference (correctness gate); a FlyDSL dequant
-    (or fusing dW2's colwise quant into the dispatch epilogue) is the perf follow-up."""
-    P, H = symm.pool_fp8.shape
-    pf = symm.pool_fp8.to(torch.float32).view(P, H // 32, 32)
-    ps = symm.pool_scale.reshape(P, H // 32).view(torch.uint8).to(torch.int32)
-    sc = torch.exp2((ps - 127).to(torch.float32)).view(P, H // 32, 1)
-    return (pf * sc).view(P, H).to(torch.bfloat16)
-
-
 def _mxfp8_step1_dispatch_dgrad(dy, w2, group, handle, block_m, block_n):
     """Backward STEP1 in fp8: fp8 dispatch(dy) + fp8 fc2 dgrad (the optimized bwd fork).  Returns
     ``(grad_swiglu bf16, pool_fp8_handle)`` where ``pool_fp8_handle = (pool_fp8 [P,H] E4M3,
     pool_scale [P,H//32] E8M0)`` is the dispatched-``dy`` pool (the dW2 ``a`` operand,
-    ``dispatch_l2_grad``, in its native rowwise-fp8 form).  The fork emits only ``grad_swiglu``.
-
-    dW2 requants the pool COLWISE directly from fp8 (a-branch fusion, no bf16 round-trip); the
-    bf16 ``dispatch_l2_grad`` is recovered on demand via ``_dequant_pool_fp8_bf16`` only for the
-    bf16-dW2 isolation path.  Needs the mxfp8 symm live (the forward's global buffer) and the same
-    cross-rank scoreboard gate the forward L1 uses."""
+    ``dispatch_l2_grad``, in its native rowwise-fp8 form).  The fork emits only ``grad_swiglu``;
+    dW2 requants the pool COLWISE directly from fp8 (a-branch fusion, no bf16 round-trip).  Needs
+    the mxfp8 symm live (the forward's global buffer) and the same cross-rank scoreboard gate the
+    forward L1 uses."""
     symm = get_symm_buffer_for_mega_moe()  # live buffer from the forward
     sym_layout = symm.make_sym_layout()
     dyq, dys = quantize_rowwise_mxfp8_flydsl(dy)
@@ -305,7 +252,7 @@ class MegaMoEFusedMxfp8Function(torch.autograd.Function):
     @staticmethod
     @torch.no_grad()
     def backward(ctx, grad_y: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], ...]:
-        """Conjugate of the mxfp8 forward. STEP1/STEP3/dW1 bf16; dW2 MXFP8."""
+        """Conjugate of the mxfp8 forward. STEP1 fp8 fork; STEP3/dW1 bf16; dW2 MXFP8 (a-branch fused)."""
         if grad_y is None:
             return (None,) * 8
         saved = ctx.saved_tensors
@@ -316,41 +263,22 @@ class MegaMoEFusedMxfp8Function(torch.autograd.Function):
         group_offs = handle[_HANDLE_GROUP_OFFS]
         num_tokens, num_topk = ctx.num_tokens, ctx.num_topk
         dy = grad_y.contiguous().to(torch.bfloat16)
-        triton_be = BackendType.TRITON.value
 
-        # STEP 1: dispatch dy + L2 dgrad (grad_swiglu = dispatch_l2_grad @ w2, NN). fp8 fork (fp8
-        # comm + fc2 dgrad) when _USE_FP8_STEP1, else bf16. The dW2 `a` operand (dispatch_l2_grad)
-        # is either a bf16 tensor (bf16 STEP1) or the native rowwise-fp8 pool handle (fp8 STEP1,
-        # requant colwise directly -> a-branch fusion, no bf16 round-trip).
-        dispatch_l2_grad = None       # bf16 tensor (bf16 STEP1, or lazily dequanted for bf16 dW2)
-        dispatch_l2_grad_fp8 = None   # (pool_fp8, pool_scale) handle (fp8 STEP1)
-        if _USE_FP8_STEP1:
-            grad_swiglu, dispatch_l2_grad_fp8 = _mxfp8_step1_dispatch_dgrad(
-                dy, w2, ctx.group, handle, ctx.block_m, ctx.block_n,
-            )
-        else:
-            grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_impl(
-                dy, w2, ctx.group, BackendType.FLYDSL.value, handle=handle, layout="nn", num_dispatch_cu=16,
-            )
+        # STEP 1 (fp8 fork): dispatch(dy) + fc2 dgrad. Returns grad_swiglu + the dispatched-dy pool
+        # in its native rowwise-fp8 form -- the dW2 `a` operand (dispatch_l2_grad), requant colwise
+        # directly from fp8 (a-branch fusion, no bf16 round-trip).
+        grad_swiglu, dispatch_l2_grad_fp8 = _mxfp8_step1_dispatch_dgrad(
+            dy, w2, ctx.group, handle, ctx.block_m, ctx.block_n,
+        )
 
         # STEP 2 (bf16): SwiGLU^T (re-inject routing weight) + gate grad
         grad_l1, grad_gate, act_weighted = swiglu_backward(
             grad_swiglu, l1_out, scale=dispatch_weights_in_buf, return_gate=True, return_act_w=True,
         )
 
-        # dW2: dispatch_l2_grad^T @ act_weighted (variable-K wgrad). MXFP8 (fp8 colwise) by
-        # default; bf16 path kept for isolating the fp8-dW2 effect (_USE_FP8_DW2=False).
-        if _USE_FP8_DW2:
-            dW2 = _mxfp8_variable_k_wgrad(
-                dispatch_l2_grad, act_weighted, group_lens, group_offs, a_fp8=dispatch_l2_grad_fp8
-            )
-        else:
-            if dispatch_l2_grad is None:  # fp8 STEP1 but bf16 dW2 -> dequant the pool on demand
-                dispatch_l2_grad = _dequant_pool_fp8_bf16(get_symm_buffer_for_mega_moe())
-            dW2 = grouped_gemm_variable_k_impl(
-                dispatch_l2_grad, act_weighted, group_lens, group_offs,
-                trans_a=True, trans_b=False, trans_c=False, num_cu=None, default_backend=triton_be,
-            )
+        # dW2 (MXFP8): dispatch_l2_grad^T @ act_weighted (variable-K wgrad); the `a` operand is
+        # requant-fused directly from the STEP1 rowwise-fp8 pool.
+        dW2 = _mxfp8_variable_k_wgrad(dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs)
 
         # STEP 3 (bf16): L1 dgrad + combine PUSH + dx reduce + grad_gate scatter
         dx, grad_topk_weights_flat = grouped_gemm_combine_impl(
