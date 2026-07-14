@@ -9,14 +9,13 @@
 from __future__ import annotations
 
 import math
-import os
 import unittest
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.testing._internal.common_distributed import (
-    MultiProcessTestCase,
+    MultiProcContinuousTest,
     skip_if_lt_x_gpu,
 )
 from torch.testing._internal.common_utils import (
@@ -89,26 +88,22 @@ def baseline_reference(group, x, topk_idx, topk_weight, l1_weight, l2_weight, *,
 
 
 def _test_forward_backward_impl(
-    tc,
-    hidden,
-    inter,
+    group,
+    symm,
+    x,
+    l1_weight,
+    l2_weight,
+    topk_idx,
+    topk_weight,
+    *,
     num_experts,
     num_topk,
-    num_tokens,
-    *,
     enable_cudagraph=False,
     enable_torch_compile=False,
 ):
-    """Forward + backward SNR of ``mega_moe_fused`` vs turbo DeepEP, optionally under graph/compile."""
-    tc._init_process()
-    symm = None
+    """tc-free fwd+bwd of mega_moe_fused vs turbo; returns (tag, actual, ref) triples, frees symm."""
     try:
-        group = dist.group.WORLD
-        x, l1_weight, l2_weight, topk_idx, topk_weight = tc._inputs(
-            num_tokens, hidden, inter, num_experts, num_topk
-        )
-        symm = tc._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
-        grad_y = torch.randn((num_tokens, hidden), device=tc.device, dtype=torch.bfloat16)
+        grad_y = torch.randn(x.shape, device=x.device, dtype=torch.bfloat16)
 
         # fused runner over grad-carrying inputs; topk_idx stays a constant closure
         def _fused(x, topk_weight, l1_weight, l2_weight):
@@ -127,8 +122,7 @@ def _test_forward_backward_impl(
         if enable_cudagraph:
             runner = torch.cuda.make_graphed_callables(runner, (x_m, tw_m, l1_m, l2_m))
 
-        # run several iters: symm bumps the host-side expected flag each forward, but a captured
-        # graph freezes it -> replay #2+ overshoots the device counter and spins (see next_dispatch).
+        # device-side epoch flag advances per replay, so replay #2+ stays correct
         num_iters = 4
         for _ in range(num_iters):
             y_m = runner(x_m, tw_m, l1_m, l2_m)
@@ -154,41 +148,36 @@ def _test_forward_backward_impl(
         torch.cuda.synchronize()
         group.barrier()
 
-        tc._assert_snr(y_m, y_t, tag="forward")
         # dx asserted: stale-L2 read in combine gate path fixed in ep_intranode (glc|slc).
-        tc._assert_snr(dx_m, dx_t, tag="dx")
-        tc._assert_snr(dl1_m, dl1_t, tag="dl1_weight")
-        tc._assert_snr(dl2_m, dl2_t, tag="dl2_weight")
-        tc._assert_snr(dtw_m, dtw_t, tag="dtw")
+        return [
+            ("forward", y_m, y_t),
+            ("dx", dx_m, dx_t),
+            ("dl1_weight", dl1_m, dl1_t),
+            ("dl2_weight", dl2_m, dl2_t),
+            ("dtw", dtw_m, dtw_t),
+        ]
     finally:
-        # release symm buffer + PG even on assertion failure
+        # release symm buffer even on failure; PG is class-scoped (kept for next test)
         if symm is not None:
             symm.destroy()
-        dist.destroy_process_group()
 
 
 @instantiate_parametrized_tests
-class MegaMoEFusedTestBase(MultiProcessTestCase):
-    """EP8 accuracy tests: fused ``mega_moe_fused`` vs the turbo DeepEP reference."""
+class MegaMoEFusedTestBase(MultiProcContinuousTest):
+    """EP8 accuracy tests vs turbo DeepEP; base spawns workers + inits PG once per class."""
 
-    def setUp(self) -> None:
-        super().setUp()
-        self._spawn_processes()
-
-    @property
-    def world_size(self) -> int:
-        return torch.cuda.device_count()
+    # PG backend picked by the base class at spawn time.
+    @classmethod
+    def backend_str(cls) -> str:
+        return "nccl"
 
     @property
     def device(self) -> torch.device:
         return torch.device("cuda", self.rank)
 
-    def _init_process(self):
-        os.environ["WORLD_SIZE"] = str(self.world_size)
-        os.environ["LOCAL_RANK"] = str(self.rank)
+    def _setup_device(self):
+        # PG already up (base class); just bind the CUDA device + seed for this test.
         torch.cuda.set_device(self.device)
-        store = dist.FileStore(self.file_name, self.world_size)
-        dist.init_process_group(backend="nccl", world_size=self.world_size, rank=self.rank, store=store)
         torch.manual_seed(42 + self.rank)
 
     def _inputs(self, num_tokens, hidden, inter, num_experts, num_topk):
@@ -253,16 +242,27 @@ class MegaMoEFusedTestBase(MultiProcessTestCase):
         enable_cudagraph,
         enable_torch_compile,
     ):
-        _test_forward_backward_impl(
-            self,
-            hidden,
-            inter,
-            num_experts,
-            num_topk,
-            num_tokens,
+        self._setup_device()
+        group = dist.group.WORLD
+        x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
+            num_tokens, hidden, inter, num_experts, num_topk
+        )
+        symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
+        results = _test_forward_backward_impl(
+            group,
+            symm,
+            x,
+            l1_weight,
+            l2_weight,
+            topk_idx,
+            topk_weight,
+            num_experts=num_experts,
+            num_topk=num_topk,
             enable_cudagraph=enable_cudagraph,
             enable_torch_compile=enable_torch_compile,
         )
+        for tag, actual, ref in results:
+            self._assert_snr(actual, ref, tag=tag)
 
 
 if __name__ == "__main__":
