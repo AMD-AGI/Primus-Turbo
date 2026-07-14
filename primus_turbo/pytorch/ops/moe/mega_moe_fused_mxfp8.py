@@ -33,10 +33,16 @@ from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
 from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
     dispatch_grouped_gemm_mxfp8,
 )
+from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_bwd_kernel import (
+    dispatch_grouped_gemm_mxfp8_bwd,
+)
 from primus_turbo.flydsl.mega.fp8.grouped_gemm_combine_fp8_kernel import (
     grouped_gemm_combine_fp8,
 )
-from primus_turbo.flydsl.mega.fp8.quant import quantize_grouped_weight_mxfp8_cached
+from primus_turbo.flydsl.mega.fp8.quant import (
+    quantize_grouped_weight_mxfp8,
+    quantize_grouped_weight_mxfp8_cached,
+)
 from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.swiglu_kernel import swiglu, swiglu_backward
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
@@ -78,6 +84,18 @@ _DW2_FP8_FORMAT = float8_e5m2  # dW2 wgrad encoding (E5M2 = grad range; flip to 
 # D2H-free + faster (<0.55 ms) quant. See agent/workspace/dw2_mxfp8_wgrad_gfx950_20260713/findings.md.
 # Enable only after re-measuring a real speedup (and eliminate the metadata D2H first).
 _USE_FP8_DW2 = False
+# fp8 STEP1 backward (dispatch(dy) + fc2 dgrad) via the optimized mxfp8 bwd fork. Env-gated so the
+# 8-GPU test can toggle it without a code edit. Default OFF -- WIP, currently INCORRECT:
+#   * plumbing works on 8 GPUs (no deadlock, grads finite); dispatch_l2_grad (dequant of the fp8 pool)
+#     is correct -> dW2 order-invariant SNR 31 dB; the fork GEMM is correct (grad_swiglu == pool@w2
+#     at 26.6 dB) ONCE w2 is quantized with the C++ quantize_grouped_weight_mxfp8 (the flydsl cached
+#     path corrupts it -> forced C++ above).
+#   * BUT the fork's grad_swiglu ROW ORDER differs from the forward's l1 order (which swiglu_backward
+#     expects) in the fwd->bwd sequence -> dx/dW1/grad_topk are wrong (test_step1_fp8_vs_bf16, gated
+#     off). The fork's own benchmark never hits this (fork-only, fresh symm). Fix the output ordering
+#     (or align swiglu_backward to the fork's pool order), then re-gate on the 8-GPU SNR test before
+#     enabling. Also: the pool dequant partially eats the fork's -16.8% comm win (fuse it later).
+_USE_FP8_STEP1 = os.environ.get("PT_MEGA_FP8_STEP1", "0") != "0"
 _MXFP8_BLOCK = 32
 _HANDLE_GROUP_LENS = 9
 _HANDLE_GROUP_OFFS = 10
@@ -123,6 +141,55 @@ def _mxfp8_variable_k_wgrad(a_bf16, b_bf16, group_lens, group_offs):
         out_dtype=torch.bfloat16, granularity=ScalingGranularity.MX_BLOCKWISE.value,
         num_cu=None, default_backend=BackendType.FLYDSL.value,
     )
+
+
+_W2T_FP8_CACHE: dict = {}
+
+
+def _w2t_mxfp8_cached(w2):
+    """Grouped mxfp8 quant of ``w2^T`` (``[G,I,H]``) for the fp8 STEP1 NT-reuse dgrad; cached (w2 is
+    a static weight, so the transpose + quant run once per weight version)."""
+    key = (w2.data_ptr(), int(w2._version))
+    v = _W2T_FP8_CACHE.get(key)
+    if v is None:
+        # bench-exact C++ grouped weight quant (matches the validated fork bench); the cached flydsl
+        # path is a separate follow-up once STEP1 is validated.
+        v = quantize_grouped_weight_mxfp8(w2.transpose(1, 2).contiguous())  # [G,I,H]
+        _W2T_FP8_CACHE.clear()
+        _W2T_FP8_CACHE[key] = v
+    return v
+
+
+def _dequant_pool_fp8_bf16(symm):
+    """Dequant the fp8 dispatched-``dy`` pool (rowwise mxfp8 ``[P,H]`` E4M3 + raw E8M0 ``[P,H//32]``)
+    back to a bf16 ``dispatch_l2_grad`` for dW2.  Torch reference (correctness gate); a FlyDSL dequant
+    (or fusing dW2's colwise quant into the dispatch epilogue) is the perf follow-up."""
+    P, H = symm.pool_fp8.shape
+    pf = symm.pool_fp8.to(torch.float32).view(P, H // 32, 32)
+    ps = symm.pool_scale.reshape(P, H // 32).view(torch.uint8).to(torch.int32)
+    sc = torch.exp2((ps - 127).to(torch.float32)).view(P, H // 32, 1)
+    return (pf * sc).view(P, H).to(torch.bfloat16)
+
+
+def _mxfp8_step1_dispatch_dgrad(dy, w2, group, handle, block_m, block_n):
+    """Backward STEP1 in fp8: fp8 dispatch(dy) + fp8 fc2 dgrad (the optimized bwd fork).  Returns
+    ``(grad_swiglu bf16, dispatch_l2_grad bf16)``.  The fork emits only ``grad_swiglu``;
+    ``dispatch_l2_grad`` is recovered by dequanting the fp8 pool.  Needs the mxfp8 symm live (the
+    forward's global buffer) and the same cross-rank scoreboard gate the forward L1 uses."""
+    symm = get_symm_buffer_for_mega_moe()  # live buffer from the forward
+    sym_layout = symm.make_sym_layout()
+    dyq, dys = quantize_rowwise_mxfp8_flydsl(dy)
+    dys = dys.view(torch.float8_e8m0fnu)
+    w2tq, w2ts = _w2t_mxfp8_cached(w2)
+    # publish scoreboard=0 cross-rank before the fp8 comm signals (mirror the forward L1 B-gate).
+    _host_rendezvous(group, load_bearing=False)
+    symm.scoreboard.zero_()
+    _host_rendezvous(group, load_bearing=True)
+    grad_swiglu = dispatch_grouped_gemm_mxfp8_bwd(
+        dyq, dys, w2tq, w2ts, handle, sym_layout, symm, BM=block_m, BN=block_n,
+    )
+    dispatch_l2_grad = _dequant_pool_fp8_bf16(symm)
+    return grad_swiglu, dispatch_l2_grad
 
 
 class MegaMoEFusedMxfp8Function(torch.autograd.Function):
@@ -227,10 +294,16 @@ class MegaMoEFusedMxfp8Function(torch.autograd.Function):
         dy = grad_y.contiguous().to(torch.bfloat16)
         triton_be = BackendType.TRITON.value
 
-        # STEP 1 (bf16): dispatch dy + L2 dgrad (grad_swiglu = dispatch_l2_grad @ w2, NN)
-        grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_impl(
-            dy, w2, ctx.group, BackendType.FLYDSL.value, handle=handle, layout="nn", num_dispatch_cu=16,
-        )
+        # STEP 1: dispatch dy + L2 dgrad (grad_swiglu = dispatch_l2_grad @ w2, NN). fp8 fork (fp8
+        # comm + fc2 dgrad) when _USE_FP8_STEP1, else bf16. Both return (grad_swiglu, dispatch_l2_grad).
+        if _USE_FP8_STEP1:
+            grad_swiglu, dispatch_l2_grad = _mxfp8_step1_dispatch_dgrad(
+                dy, w2, ctx.group, handle, ctx.block_m, ctx.block_n,
+            )
+        else:
+            grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_impl(
+                dy, w2, ctx.group, BackendType.FLYDSL.value, handle=handle, layout="nn", num_dispatch_cu=16,
+            )
 
         # STEP 2 (bf16): SwiGLU^T (re-inject routing weight) + gate grad
         grad_l1, grad_gate, act_weighted = swiglu_backward(

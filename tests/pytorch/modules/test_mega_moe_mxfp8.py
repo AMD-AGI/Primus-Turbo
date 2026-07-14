@@ -155,6 +155,140 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(_WORLD)
     @parametrize("top_k", [2])
+    def test_step1_fp8_vs_bf16(self, top_k):
+        """fp8 STEP1 (the dispatch(dy)+fc2-dgrad bwd fork) vs bf16 STEP1: run the full mxfp8
+        fwd+bwd BOTH ways on identical inputs (toggling ``_USE_FP8_STEP1`` in-process) and gate
+        every grad (dx / dW1 / dW2 / grad_topk) by SNR. Isolates the fp8-STEP1 effect: the forward
+        is identical, only the backward STEP1 dispatch(dy)+dgrad differs (fp8 comm+GEMM +
+        dequant of the fp8 pool for dispatch_l2_grad).
+
+        WIP: currently FAILS -- the fork's grad_swiglu output row order differs from the forward's
+        l1 order in the fwd->bwd sequence (dW2 order-invariant passes at 31 dB; dx/dW1 fail). Gated
+        off (set PT_MEGA_FP8_STEP1_DEV=1 to run) until the ordering bug is fixed."""
+        if os.environ.get("PT_MEGA_FP8_STEP1_DEV", "0") == "0":
+            self.skipTest("fp8 STEP1 is WIP (flag-gated off); set PT_MEGA_FP8_STEP1_DEV=1 to run")
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        import primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 as mxmod
+        from primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 import mega_moe_fused_mxfp8
+
+        rank, dev = self.rank, self.device
+        epr = _E // self.world_size
+        torch.manual_seed(123 + rank)
+        x0 = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+        w1_0 = torch.randn(epr, 2 * _I, _H, device=dev, dtype=torch.bfloat16) * 0.05
+        w2_0 = torch.randn(epr, _H, _I, device=dev, dtype=torch.bfloat16) * 0.05
+        gate = torch.randn(_T, _E, device=dev)
+        topk_w0, topk_idx = torch.sigmoid(gate).topk(top_k, dim=-1)
+        tw0 = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32)
+        g_seed = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+
+        def run(use_fp8_step1):
+            mxmod._USE_FP8_STEP1 = use_fp8_step1
+            x = x0.clone().requires_grad_(True)
+            w1 = w1_0.clone().requires_grad_(True)
+            w2 = w2_0.clone().requires_grad_(True)
+            tw = tw0.clone().requires_grad_(True)
+            y = mega_moe_fused_mxfp8(group, x, topk_idx, tw, w1, w2)
+            y.backward(g_seed)
+            return x.grad, w1.grad, w2.grad, tw.grad
+
+        try:
+            g_bf = run(False)
+            g_fp8 = run(True)
+        finally:
+            mxmod._USE_FP8_STEP1 = False  # restore default
+
+        worst = 1e9
+        for name, a, b in zip(["dx", "dW1", "dW2", "grad_topk"], g_bf, g_fp8):
+            s = torch.tensor([compute_snr(a, b)], device=dev)
+            dist.all_reduce(s, op=dist.ReduceOp.MIN)
+            s = float(s.item())
+            if rank == 0:
+                print(f"[step1 fp8 vs bf16 top_k={top_k}] {name} SNR = {s:.2f} dB")
+            worst = min(worst, s)
+        self.assertGreaterEqual(worst, 15.0, f"fp8 STEP1 worst grad SNR {worst:.2f} dB < 15.0")
+        dist.destroy_process_group()
+
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [2])
+    def test_step1_isolate_grad_swiglu(self, top_k):
+        """Isolate the fp8 STEP1 fork's grad_swiglu + dispatch_l2_grad vs bf16, in the REAL
+        fwd->bwd sequence (L1 forward runs first on the symm, then STEP1). Pinpoints whether the
+        fork's GEMM output is the error source."""
+        if os.environ.get("PT_MEGA_FP8_STEP1_DEV", "0") == "0":
+            self.skipTest("fp8 STEP1 is WIP (flag-gated off); set PT_MEGA_FP8_STEP1_DEV=1 to run")
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        import primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 as mxmod
+        from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+        from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
+            dispatch_grouped_gemm_mxfp8,
+        )
+        from primus_turbo.flydsl.mega.fp8.quant import quantize_grouped_weight_mxfp8, quantize_rowwise_mxfp8
+        from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+        from primus_turbo.pytorch.core.backend import BackendType
+        from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (
+            dispatch_grouped_gemm_impl,
+        )
+
+        rank, dev = self.rank, self.device
+        world, epr = self.world_size, _E // self.world_size
+        x = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+        w1 = torch.randn(epr, 2 * _I, _H, device=dev, dtype=torch.bfloat16) * 0.05
+        w2 = torch.randn(epr, _H, _I, device=dev, dtype=torch.bfloat16) * 0.05
+        gate = torch.randn(_T, _E, device=dev)
+        topk_w0, topk_idx = torch.sigmoid(gate).topk(top_k, dim=-1)
+        topk_w = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32)
+        with torch.no_grad():
+            symm = get_symm_buffer_for_mega_moe(
+                group, num_experts=epr * world, num_max_tokens_per_rank=_T, num_topk=top_k,
+                hidden=_H, intermediate_hidden=_I, block_m=256, block_n=256, use_mxfp8=True,
+            )
+            sym_layout = symm.make_sym_layout()
+            handle = tuple(
+                dispatch_prologue(
+                    topk_idx.to(torch.int64), topk_w, sym_layout=sym_layout, num_tokens=_T,
+                    num_topk=top_k, num_experts=epr * world, world_size=world, rank=symm.rank,
+                    experts_per_rank=epr, block_m=256, num_max_pool_tokens=symm.num_max_pool_tokens,
+                )
+            )
+            w1q, w1s = quantize_grouped_weight_mxfp8(w1)
+            xq, xs = quantize_rowwise_mxfp8(x)
+            symm.scoreboard.zero_(); torch.cuda.synchronize(); group.barrier()
+            dispatch_grouped_gemm_mxfp8(xq, xs, w1q, w1s, handle, sym_layout, symm, BM=256, BN=256)
+            dy = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+            gsw_bf, dl2_bf, _, _ = dispatch_grouped_gemm_impl(
+                dy, w2, group, BackendType.FLYDSL.value, handle=handle, layout="nn", num_dispatch_cu=16,
+            )
+            gsw_fp8, dl2_fp8 = mxmod._mxfp8_step1_dispatch_dgrad(dy, w2, group, handle, 256, 256)
+            offs = handle[10]
+            c_m = int(offs[-1].item())
+            # same-pool-order reference: grad_swiglu = dispatch(dy) @ w2 on the FORK's OWN pool
+            # (dl2_fp8), per group. Removes the cross-symm row-order confound of comparing vs the
+            # bf16 path (which uses its own bf16 symm) -> isolates the fork GEMM's correctness.
+            gsw_ref = torch.zeros_like(gsw_fp8)
+            for g in range(epr):
+                lo, hi = int(offs[g].item()), int(offs[g + 1].item())
+                if hi > lo:
+                    gsw_ref[lo:hi] = (dl2_fp8[lo:hi].float() @ w2[g].float()).to(torch.bfloat16)
+        for name, a, b in [
+            ("grad_swiglu vs bf16(x-symm)", gsw_bf, gsw_fp8),
+            ("dispatch_l2_grad vs bf16(x-symm)", dl2_bf, dl2_fp8),
+            ("grad_swiglu vs same-order ref", gsw_ref, gsw_fp8),
+        ]:
+            s = torch.tensor([compute_snr(a[:c_m], b[:c_m])], device=dev)
+            dist.all_reduce(s, op=dist.ReduceOp.MIN)
+            if rank == 0:
+                print(f"[step1 isolate top_k={top_k}] {name} SNR = {float(s.item()):.2f} dB  (c_m={c_m})")
+        dist.destroy_process_group()
+
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [2])
     def test_dw2_fp8_vs_bf16(self, top_k):
         """Validate fp8 dW2 on REAL mega-pool data (same-tensor comparison): replicate the
         backward's STEP1 (dispatch dy) + STEP2 (swiglu^T) once to get dispatch_l2_grad +
