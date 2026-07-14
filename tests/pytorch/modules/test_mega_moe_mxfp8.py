@@ -214,6 +214,79 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(_WORLD)
     @parametrize("top_k", [2])
+    def test_backward_gradcheck_mxfp8(self, top_k):
+        """mxfp8 backward VALUE gradcheck vs the fp32 dense-autograd reference (dx/dW1/dW2/d_topk).
+
+        DIAGNOSTIC (gated off): on THIS tree it FAILS for the DEFAULT (bf16-STEP1) backward too --
+        forward matches dense (~22 dB, in this same test) but every grad is ~0 cos with wrong
+        magnitudes (dx~0.2, dW1~0.01, dW2~0.33, d_topk~0). Root cause is the pre-existing WIP
+        breakage of the bf16 GEMM kernels the backward's STEP1/STEP3/dW1 use (the bf16 MegaMoE
+        test_backward_gradcheck also faults/hangs). So the whole backward is unvalidated on this
+        tree -- fp8 STEP1 can't be gated until the bf16 backward kernels are fixed. Set
+        PT_MEGA_FP8_STEP1_DEV=1 to run (and PT_MEGA_FP8_STEP1_DEV also flips STEP1 to fp8)."""
+        if os.environ.get("PT_MEGA_FP8_STEP1_DEV", "0") == "0":
+            self.skipTest("mxfp8 backward gradcheck: bf16 backward kernels broken on this tree (WIP)")
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        import primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 as mxmod
+        from primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 import mega_moe_fused_mxfp8
+
+        rank, dev = self.rank, self.device
+        world, epr = self.world_size, _E // self.world_size
+        mxmod._USE_FP8_STEP1 = os.environ.get("PT_MEGA_FP8_STEP1_DEV", "0") != "0"
+        torch.manual_seed(123 + rank)
+        x = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16, requires_grad=True)
+        w1 = (torch.randn(epr, 2 * _I, _H, device=dev, dtype=torch.bfloat16) * 0.05).requires_grad_(True)
+        w2 = (torch.randn(epr, _H, _I, device=dev, dtype=torch.bfloat16) * 0.05).requires_grad_(True)
+        gate = torch.randn(_T, _E, device=dev)
+        topk_w0, topk_idx = torch.sigmoid(gate).topk(top_k, dim=-1)
+        tw = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32).requires_grad_(True)
+        g = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+
+        y = mega_moe_fused_mxfp8(group, x, topk_idx, tw, w1, w2)
+        dx_m, dW1_m, dW2_m, dtw_m = torch.autograd.grad(y, [x, w1, w2, tw], grad_outputs=g, allow_unused=True)
+
+        # fp32 dense reference: gather global weights, keep only this rank's shard differentiable.
+        g1 = [torch.empty_like(w1) for _ in range(world)]
+        g2 = [torch.empty_like(w2) for _ in range(world)]
+        dist.all_gather(g1, w1.detach().contiguous(), group=group)
+        dist.all_gather(g2, w2.detach().contiguous(), group=group)
+        w1_local = w1.detach().clone().requires_grad_(True)
+        w2_local = w2.detach().clone().requires_grad_(True)
+        w1g = torch.cat([w1_local if i == rank else g1[i] for i in range(world)], dim=0)
+        w2g = torch.cat([w2_local if i == rank else g2[i] for i in range(world)], dim=0)
+        xr = x.detach().clone().requires_grad_(True)
+        twr = tw.detach().clone().requires_grad_(True)
+        ref = _dense_moe_reference(xr, topk_idx, twr, w1g, w2g)
+        dx_r, dW1_r, dW2_r, dtw_r = torch.autograd.grad(
+            ref, [xr, w1_local, w2_local, twr], grad_outputs=g.float(), allow_unused=True
+        )
+
+        def cos(a, b):
+            a, b = a.detach().float().reshape(-1), b.detach().float().reshape(-1)
+            c = torch.tensor([float(torch.nn.functional.cosine_similarity(a, b, dim=0))], device=dev)
+            dist.all_reduce(c, op=dist.ReduceOp.MIN)
+            return float(c.item())
+
+        def nrm(t):
+            return float(t.detach().float().norm())
+        cs = {"dx": cos(dx_m, dx_r), "dW1": cos(dW1_m, dW1_r), "dW2": cos(dW2_m, dW2_r), "d_topk": cos(dtw_m, dtw_r)}
+        step1 = "fp8" if mxmod._USE_FP8_STEP1 else "bf16"
+        mxmod._USE_FP8_STEP1 = False
+        fwd_snr = float(compute_snr(ref, y))
+        if rank == 0:
+            print(f"[mxfp8 gradcheck top_k={top_k} STEP1={step1}] FWD SNR(y vs dense)={fwd_snr:.2f} dB | cos vs dense: "
+                  + ", ".join(f"{k}={v:.4f}" for k, v in cs.items()))
+            for nm, m, r in [("dx", dx_m, dx_r), ("dW1", dW1_m, dW1_r), ("dW2", dW2_m, dW2_r), ("d_topk", dtw_m, dtw_r)]:
+                print(f"    [{nm}] ||module||={nrm(m):.3e} ||dense||={nrm(r):.3e} ratio={nrm(m)/(nrm(r)+1e-20):.3f}")
+        dist.destroy_process_group()  # before asserts so a failure doesn't NCCL-hang
+        for k, v in cs.items():
+            self.assertGreaterEqual(v, 0.90, f"[mxfp8 gradcheck STEP1={step1}] {k} cos {v:.4f} < 0.90")
+
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [2])
     def test_step1_isolate_grad_swiglu(self, top_k):
         """Isolate the fp8 STEP1 fork's grad_swiglu + dispatch_l2_grad vs bf16, in the REAL
         fwd->bwd sequence (L1 forward runs first on the symm, then STEP1). Pinpoints whether the
