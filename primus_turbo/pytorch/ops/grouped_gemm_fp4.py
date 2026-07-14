@@ -136,7 +136,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=num_cu,
-            default_backend=BackendType.FLYDSL.value,
+            default_backend=BackendType.TRITON.value,
             group_offs_out=group_offs,
         )
 
@@ -187,7 +187,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=num_cu,
-            default_backend=BackendType.FLYDSL.value,
+            default_backend=BackendType.TRITON.value,
             group_offs_out=group_offs,
         )
 
@@ -207,7 +207,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=num_cu,
-            default_backend=BackendType.FLYDSL.value,
+            default_backend=BackendType.TRITON.value,
         )
 
         # forward args: (a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)

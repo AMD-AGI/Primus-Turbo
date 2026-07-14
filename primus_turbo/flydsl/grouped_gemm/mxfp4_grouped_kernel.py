@@ -48,6 +48,7 @@ from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
     _load_go,
     _wgrad_block_mn,
 )
+from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import run_eager_or_capture
 
 # isort: on
 
@@ -467,6 +468,7 @@ def _build_a_pre_kernel(G: int):
 
 _GMXFP4_LAUNCH_CACHE: dict = {}
 _GMXFP4_WS_CACHE: dict = {}
+_GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, out_fp16) -> [raw_launch, compiled]
 
 
 def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16):
@@ -594,8 +596,14 @@ def grouped_gemm_mxfp4_flydsl_kernel(
         grid_upper,
         stream,
     )
-    comp = flyc.compile(launch, *args)
-    comp(*args)
+    # Cache the compiled launch per shape (dense-mxfp4 pattern): re-compiling every call
+    # inflates steady-state latency; capture runs the raw closure.
+    atk = (total_M, N, K, G, out_fp16)
+    e2 = _GMXFP4_AT_CACHE.get(atk)
+    if e2 is None:
+        e2 = [launch, None]
+        _GMXFP4_AT_CACHE[atk] = e2
+    run_eager_or_capture(e2, args, 1)
     return out[:, :N_out] if N_out != N else out
 
 
@@ -784,6 +792,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
 
 _GMXFP4_WGRAD_LAUNCH_CACHE: dict = {}
 _GMXFP4_WGRAD_WS_CACHE: dict = {}
+_GMXFP4_WGRAD_AT_CACHE: dict = {}  # (OUT_M_p, OUT_N_p, M_alloc, G, out_fp16) -> [raw, compiled]
 
 
 def _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, device):
@@ -928,6 +937,10 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
         _GMXFP4_WGRAD_LAUNCH_CACHE[lk] = ent
     launch, _TOTAL = ent
     args = (a8, b8, out_flat, a_raw, b_raw, a_sp, b_sp, go_pad, stream)
-    comp = flyc.compile(launch, *args)
-    comp(*args)
+    atk = (OUT_M_p, OUT_N_p, M_alloc, G, out_fp16)
+    e2 = _GMXFP4_WGRAD_AT_CACHE.get(atk)
+    if e2 is None:
+        e2 = [launch, None]
+        _GMXFP4_WGRAD_AT_CACHE[atk] = e2
+    run_eager_or_capture(e2, args, 1)
     return out[:, :OUT_M, :OUT_N] if (OUT_M_p != OUT_M or OUT_N_p != OUT_N) else out
