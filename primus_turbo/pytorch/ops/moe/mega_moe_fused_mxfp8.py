@@ -90,11 +90,14 @@ _USE_FP8_DW2 = False
 #     is correct -> dW2 order-invariant SNR 31 dB; the fork GEMM is correct (grad_swiglu == pool@w2
 #     at 26.6 dB) ONCE w2 is quantized with the C++ quantize_grouped_weight_mxfp8 (the flydsl cached
 #     path corrupts it -> forced C++ above).
-#   * BUT the fork's grad_swiglu ROW ORDER differs from the forward's l1 order (which swiglu_backward
-#     expects) in the fwd->bwd sequence -> dx/dW1/grad_topk are wrong (test_step1_fp8_vs_bf16, gated
-#     off). The fork's own benchmark never hits this (fork-only, fresh symm). Fix the output ordering
-#     (or align swiglu_backward to the fork's pool order), then re-gate on the 8-GPU SNR test before
-#     enabling. Also: the pool dequant partially eats the fork's -16.8% comm win (fuse it later).
+#   * BUT the mxfp8 dispatch+GEMM grad_swiglu ROW ORDER differs from the forward's l1 order (which
+#     swiglu_backward expects) in the fwd->bwd sequence -> dx/dW1/grad_topk are wrong
+#     (test_step1_fp8_vs_bf16, gated off). NOT fork-specific: the forward kernel
+#     (dispatch_grouped_gemm_mxfp8) as STEP1 fails identically -> it's an mxfp8-vs-bf16 output-order
+#     mismatch, entangled with the module's MISSING dx/dW1 accuracy reference (only dW2 is gradchecked;
+#     the fp8-vs-bf16 diff can't say which order is "right"). Next: establish a dx/dW1 accuracy
+#     reference, pin the pool/output ordering, then re-gate on 8-GPU SNR. Also: the pool dequant
+#     partially eats the fork's -16.8% comm win (fuse dW2's colwise quant into the dispatch later).
 _USE_FP8_STEP1 = os.environ.get("PT_MEGA_FP8_STEP1", "0") != "0"
 _MXFP8_BLOCK = 32
 _HANDLE_GROUP_LENS = 9
