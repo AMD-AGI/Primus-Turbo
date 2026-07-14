@@ -335,20 +335,24 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
             symm.scoreboard.zero_(); torch.cuda.synchronize(); group.barrier()
             dispatch_grouped_gemm_mxfp8(xq, xs, w1q, w1s, handle, sym_layout, symm, BM=256, BN=256)
             dy = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
-            gsw_bf, dl2_bf, _, _ = dispatch_grouped_gemm_impl(
-                dy, w2, group, BackendType.FLYDSL.value, handle=handle, layout="nn", num_dispatch_cu=16,
-            )
+            # fork FIRST (matches the real forward->fork order; running bf16 STEP1 first would warm/
+            # evict L2 and make the fork's coherent scale read stale). Snapshot its pool + ref NOW.
             gsw_fp8, dl2_fp8 = mxmod._mxfp8_step1_dispatch_dgrad(dy, w2, group, handle, 256, 256)
+            gsw_fp8 = gsw_fp8.clone()
+            dl2_fp8 = dl2_fp8.clone()
             offs = handle[10]
             c_m = int(offs[-1].item())
             # same-pool-order reference: grad_swiglu = dispatch(dy) @ w2 on the FORK's OWN pool
-            # (dl2_fp8), per group. Removes the cross-symm row-order confound of comparing vs the
-            # bf16 path (which uses its own bf16 symm) -> isolates the fork GEMM's correctness.
+            # (dl2_fp8), per group -> isolates the fork GEMM's correctness (no cross-symm confound).
             gsw_ref = torch.zeros_like(gsw_fp8)
             for g in range(epr):
                 lo, hi = int(offs[g].item()), int(offs[g + 1].item())
                 if hi > lo:
                     gsw_ref[lo:hi] = (dl2_fp8[lo:hi].float() @ w2[g].float()).to(torch.bfloat16)
+            # bf16 STEP1 LAST (its own symm; only for the cross-symm sanity comparison).
+            gsw_bf, dl2_bf, _, _ = dispatch_grouped_gemm_impl(
+                dy, w2, group, BackendType.FLYDSL.value, handle=handle, layout="nn", num_dispatch_cu=16,
+            )
         for name, a, b in [
             ("grad_swiglu vs bf16(x-symm)", gsw_bf, gsw_fp8),
             ("dispatch_l2_grad vs bf16(x-symm)", dl2_bf, dl2_fp8),

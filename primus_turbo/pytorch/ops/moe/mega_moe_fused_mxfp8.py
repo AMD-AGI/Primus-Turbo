@@ -85,19 +85,22 @@ _DW2_FP8_FORMAT = float8_e5m2  # dW2 wgrad encoding (E5M2 = grad range; flip to 
 # Enable only after re-measuring a real speedup (and eliminate the metadata D2H first).
 _USE_FP8_DW2 = False
 # fp8 STEP1 backward (dispatch(dy) + fc2 dgrad) via the optimized mxfp8 bwd fork. Env-gated so the
-# 8-GPU test can toggle it without a code edit. Default OFF -- WIP, currently INCORRECT:
-#   * plumbing works on 8 GPUs (no deadlock, grads finite); dispatch_l2_grad (dequant of the fp8 pool)
-#     is correct -> dW2 order-invariant SNR 31 dB; the fork GEMM is correct (grad_swiglu == pool@w2
-#     at 26.6 dB) ONCE w2 is quantized with the C++ quantize_grouped_weight_mxfp8 (the flydsl cached
-#     path corrupts it -> forced C++ above).
-#   * BUT the mxfp8 dispatch+GEMM grad_swiglu ROW ORDER differs from the forward's l1 order (which
-#     swiglu_backward expects) in the fwd->bwd sequence -> dx/dW1/grad_topk are wrong
-#     (test_step1_fp8_vs_bf16, gated off). NOT fork-specific: the forward kernel
-#     (dispatch_grouped_gemm_mxfp8) as STEP1 fails identically -> it's an mxfp8-vs-bf16 output-order
-#     mismatch, entangled with the module's MISSING dx/dW1 accuracy reference (only dW2 is gradchecked;
-#     the fp8-vs-bf16 diff can't say which order is "right"). Next: establish a dx/dW1 accuracy
-#     reference, pin the pool/output ordering, then re-gate on 8-GPU SNR. Also: the pool dequant
-#     partially eats the fork's -16.8% comm win (fuse dW2's colwise quant into the dispatch later).
+# 8-GPU test can toggle it without a code edit. Default OFF pending the DOWNSTREAM fix (below).
+# STEP1 ITSELF IS VERIFIED CORRECT + FAST (bench_dispatch_grouped_gemm_mxfp8_nn.py on MI355X EP8,
+# real DSv3 shape):
+#   * perf: 1.39x (load_balanced) / 1.55x (round_robin) vs bf16 fused STEP1.
+#   * correctness: grad_swiglu cos 0.999 vs bf16 (fresh-dy coherence gate); and in the real
+#     forward->fork sequence grad_swiglu == pool@w2 at 30.9 dB + dispatch_l2_grad 31.2 dB vs a torch
+#     reference (test_step1_isolate_grad_swiglu). Requires the C++ quantize_grouped_weight_mxfp8 for
+#     w2^T (the flydsl cached weight quant corrupts the fork -> forced C++ in _w2t_mxfp8_cached), and
+#     the fork must run right after the forward L1 (running a bf16 dispatch first evicts its coherent
+#     scale from L2 -> stale reads; not an issue in the real backward which has no bf16 STEP1).
+# WHY STILL OFF: the module's DOWNSTREAM backward (swiglu_backward / STEP3 combine / dW1, all bf16)
+# is broken on this tree -> dx/dW1/grad_topk are ~0 cos vs the fp32 dense reference EVEN with the
+# DEFAULT bf16 STEP1 (test_backward_gradcheck_mxfp8; the bf16 MegaMoE gradcheck also faults). So the
+# blocker is the pre-existing WIP bf16 backward kernels, NOT STEP1. Enable once that is fixed +
+# test_backward_gradcheck_mxfp8 passes with PT_MEGA_FP8_STEP1_DEV=1. Also: the pool dequant partially
+# eats STEP1's win (fuse dW2's colwise quant into the dispatch epilogue later).
 _USE_FP8_STEP1 = os.environ.get("PT_MEGA_FP8_STEP1", "0") != "0"
 _MXFP8_BLOCK = 32
 _HANDLE_GROUP_LENS = 9
