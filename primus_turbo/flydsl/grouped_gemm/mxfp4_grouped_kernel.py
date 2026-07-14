@@ -468,7 +468,54 @@ def _build_a_pre_kernel(G: int):
 
 _GMXFP4_LAUNCH_CACHE: dict = {}
 _GMXFP4_WS_CACHE: dict = {}
-_GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, out_fp16) -> [raw_launch, compiled]
+_GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, gm, xcd, gn, out_fp16) -> [raw_launch, compiled]
+_GMXFP4_CFG_CACHE: dict = {}  # (total_M, N, K, G, out_fp16) -> (gm, xcd, gn)
+# Grouped NT config candidates. xcd=1 (group-major XCD order) is the dominant L2-locality
+# lever (xcd=8 measured ~20% slower); gn=4 (N-band) helps the fat-N MoE shapes. The wgrad
+# uses the same set. All candidates are bit-identical (swizzle only), so the timed sweep
+# never regresses correctness -- it just chases L2 residency / tile balance.
+_GMXFP4_CANDS = [(1, 1, 0), (1, 1, 4), (2, 1, 0), (2, 1, 4), (4, 1, 0), (4, 1, 4), (4, 8, 0)]
+
+
+def _grouped_mxfp4_pick_cfg(cache, cands, shape_key, capturing, build_entry, run_args, default_cfg):
+    """Timed per-shape config autotune (dense-mxfp4 pattern): compile every candidate,
+    warm all against the same L2 state, time with CUDA events, cache the fastest. During
+    capture (cannot time) fall back to the cached winner or the static default."""
+    cached = cache.get(shape_key)
+    if cached is not None:
+        return cached
+    if capturing:
+        cache[shape_key] = default_cfg
+        return default_cfg
+    compiled = []
+    for cfg in cands:
+        try:
+            entry = build_entry(cfg)
+            if entry[1] is None:
+                entry[1] = flyc.compile(entry[0], *run_args)
+            compiled.append((cfg, entry[1]))
+        except Exception:  # noqa: BLE001 -- a bad config must not break the GEMM
+            continue
+    if not compiled:
+        cache[shape_key] = default_cfg
+        return default_cfg
+    for _ in range(3):
+        for _, c in compiled:
+            c(*run_args)
+    torch.cuda.synchronize()
+    best_cfg, best_t = default_cfg, float("inf")
+    for cfg, c in compiled:
+        ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        ev0.record()
+        for _ in range(8):
+            c(*run_args)
+        ev1.record()
+        torch.cuda.synchronize()
+        t = ev0.elapsed_time(ev1)
+        if t < best_t:
+            best_t, best_cfg = t, cfg
+    cache[shape_key] = best_cfg
+    return best_cfg
 
 
 def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16):
@@ -572,13 +619,7 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     a_pre_grid = ceildiv(slab_rows * K128, _PRESHUF_NG * _PRESHUF_BLK)
 
     stream = torch.cuda.current_stream()
-    gm, xcd, gn, wlv, elgk = 4, 8, 0, 10, 9
-    lk = (K, G, N, gm, xcd, gn, wlv, elgk, out_fp16)
-    ent = _GMXFP4_LAUNCH_CACHE.get(lk)
-    if ent is None:
-        ent = _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16)
-        _GMXFP4_LAUNCH_CACHE[lk] = ent
-    launch, _NBK = ent
+    wlv, elgk = 10, 9
     args = (
         a8,
         b8,
@@ -596,14 +637,26 @@ def grouped_gemm_mxfp4_flydsl_kernel(
         grid_upper,
         stream,
     )
-    # Cache the compiled launch per shape (dense-mxfp4 pattern): re-compiling every call
-    # inflates steady-state latency; capture runs the raw closure.
-    atk = (total_M, N, K, G, out_fp16)
-    e2 = _GMXFP4_AT_CACHE.get(atk)
-    if e2 is None:
-        e2 = [launch, None]
-        _GMXFP4_AT_CACHE[atk] = e2
-    run_eager_or_capture(e2, args, 1)
+
+    def _entry(cfg):
+        gm, xcd, gn = cfg
+        lk = (K, G, N, gm, xcd, gn, wlv, elgk, out_fp16)
+        ent = _GMXFP4_LAUNCH_CACHE.get(lk)
+        if ent is None:
+            ent = _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16)
+            _GMXFP4_LAUNCH_CACHE[lk] = ent
+        atk = (total_M, N, K, G, gm, xcd, gn, out_fp16)
+        e2 = _GMXFP4_AT_CACHE.get(atk)
+        if e2 is None:
+            e2 = [ent[0], None]
+            _GMXFP4_AT_CACHE[atk] = e2
+        return e2
+
+    capturing = torch.cuda.is_current_stream_capturing()
+    cfg = _grouped_mxfp4_pick_cfg(
+        _GMXFP4_CFG_CACHE, _GMXFP4_CANDS, (total_M, N, K, G, out_fp16), capturing, _entry, args, (2, 1, 4)
+    )
+    run_eager_or_capture(_entry(cfg), args, 1)
     return out[:, :N_out] if N_out != N else out
 
 
@@ -929,18 +982,28 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     out_flat = out.view(-1)
 
     stream = torch.cuda.current_stream()
-    gm, xcd, gn, wlv, elgk = 4, 8, 0, 10, 9
-    lk = (OUT_M_p, OUT_N_p, G, M_alloc, gm, xcd, gn, wlv, elgk, out_fp16)
-    ent = _GMXFP4_WGRAD_LAUNCH_CACHE.get(lk)
-    if ent is None:
-        ent = _compile_grouped_mxfp4_wgrad_fused(OUT_M_p, OUT_N_p, G, M_alloc, gm, xcd, gn, wlv, elgk, out_fp16)
-        _GMXFP4_WGRAD_LAUNCH_CACHE[lk] = ent
-    launch, _TOTAL = ent
+    wlv, elgk = 10, 9
     args = (a8, b8, out_flat, a_raw, b_raw, a_sp, b_sp, go_pad, stream)
-    atk = (OUT_M_p, OUT_N_p, M_alloc, G, out_fp16)
-    e2 = _GMXFP4_WGRAD_AT_CACHE.get(atk)
-    if e2 is None:
-        e2 = [launch, None]
-        _GMXFP4_WGRAD_AT_CACHE[atk] = e2
-    run_eager_or_capture(e2, args, 1)
+
+    def _entry(cfg):
+        gm, xcd, gn = cfg
+        lk = (OUT_M_p, OUT_N_p, G, M_alloc, gm, xcd, gn, wlv, elgk, out_fp16)
+        ent = _GMXFP4_WGRAD_LAUNCH_CACHE.get(lk)
+        if ent is None:
+            ent = _compile_grouped_mxfp4_wgrad_fused(
+                OUT_M_p, OUT_N_p, G, M_alloc, gm, xcd, gn, wlv, elgk, out_fp16
+            )
+            _GMXFP4_WGRAD_LAUNCH_CACHE[lk] = ent
+        atk = (OUT_M_p, OUT_N_p, M_alloc, G, gm, xcd, gn, out_fp16)
+        e2 = _GMXFP4_WGRAD_AT_CACHE.get(atk)
+        if e2 is None:
+            e2 = [ent[0], None]
+            _GMXFP4_WGRAD_AT_CACHE[atk] = e2
+        return e2
+
+    capturing = torch.cuda.is_current_stream_capturing()
+    cfg = _grouped_mxfp4_pick_cfg(
+        _GMXFP4_CFG_CACHE, _GMXFP4_CANDS, (OUT_M_p, OUT_N_p, M_alloc, G, out_fp16), capturing, _entry, args, (2, 1, 4)
+    )
+    run_eager_or_capture(_entry(cfg), args, 1)
     return out[:, :OUT_M, :OUT_N] if (OUT_M_p != OUT_M or OUT_N_p != OUT_N) else out
