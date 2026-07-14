@@ -58,18 +58,25 @@ from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (
 from primus_turbo.pytorch.kernels.mega_moe.grouped_gemm_combine_impl import (
     grouped_gemm_combine_impl,
 )
-from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp8_with_trans
+from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (
+    colwise_grouped_meta,
+    colwise_quant_mxfp8_grouped_flydsl,
+)
 
 __all__ = ["MegaMoEFusedMxfp8Function", "mega_moe_fused_mxfp8"]
 
 _DW2_FP8_FORMAT = float8_e5m2  # dW2 wgrad encoding (E5M2 = grad range; flip to float8_e4m3 to compare)
-# fp8 dW2 default OFF: MEASURED NET-NEGATIVE at DSv3 EP8 shapes. The mega variable-K wgrad is
-# small-K / output-write bound (tokens/expert ~256, contraction = pool), so the in-tree Triton
-# mxfp8 variable-K wgrad is NOT faster than bf16 (fp8 gemm ~= bf16, even slightly slower), and
-# the colwise quant of both operands adds ~0.1-0.3 ms -> net +0.08..0.21 ms SLOWER (probe), for
-# no benefit + fp8 accuracy loss. Correctness is fine (fp8 vs bf16 dW2 = 22.51 dB); it's a perf
-# loss, not a win. Kept behind the flag: a compute-bound regime (large tokens/expert) or a
-# faster native FlyDSL mxfp8 wgrad could flip this. Enable only after re-measuring a speedup.
+# fp8 dW2 default OFF: at the REAL DSv3 EP8 shape (~2048 tok/expert, compute-bound) it is now
+# ~PARITY, not a clear win. Latest measured (dw2_bench, balanced, e5m2):
+#   bf16 dW2 1.685 ms | FlyDSL fp8 GEMM-only 0.984 (0.58x, big win) | colwise quant (both, mine) 0.81
+#   -> full fp8 dW2 ~1.66-1.80 ms = ~0.99-1.06x bf16 (dW2 SNR 22.58 dB == dual, correctness fine).
+# The FlyDSL GEMM saves ~0.70 ms vs bf16, but the 2x colwise quant costs ~0.68-0.81 ms and almost
+# exactly cancels it. The dedicated colwise quant (quant_colwise_trans_flydsl) already beats the C++
+# dual by ~1.2x; the quant is at the practical limit for a separate pass. A CLEAR win needs either
+# (a) fusing the colwise-fp8 quant into the producers (STEP1 bwd emits dispatch_l2_grad colwise-fp8,
+# swiglu_backward emits act_weighted colwise-fp8 -> quant free, dW2 -> 0.58x bf16), or (b) a
+# D2H-free + faster (<0.55 ms) quant. See agent/workspace/dw2_mxfp8_wgrad_gfx950_20260713/findings.md.
+# Enable only after re-measuring a real speedup (and eliminate the metadata D2H first).
 _USE_FP8_DW2 = False
 _MXFP8_BLOCK = 32
 _HANDLE_GROUP_LENS = 9
@@ -97,23 +104,21 @@ def _host_rendezvous(group, *, load_bearing):
 
 def _mxfp8_variable_k_wgrad(a_bf16, b_bf16, group_lens, group_offs):
     """dW = a^T @ b (variable-K over the pool/contraction axis) in MXFP8. Quantizes both
-    operands colwise (transposed) via the grouped dual-quant, then the mxfp8 variable-K
-    grouped GEMM. Returns [G, a.shape[1], b.shape[1]] bf16. Mirrors MXFP8GroupedGEMMFunction
-    grad_b (colwise operands, trans_a=trans_b=False)."""
-    lens64 = group_lens.to(torch.int64)
-    offs64 = group_offs.to(torch.int64)
-    (_, _, a_t, a_ts, _, _, lens_pc, offs_pc) = grouped_quantize_fp8_with_trans(
-        a_bf16, _DW2_FP8_FORMAT, ScalingGranularity.MX_BLOCKWISE, lens64, offs64, block_size=_MXFP8_BLOCK
-    )
-    (_, _, b_t, b_ts, _, _, _, _) = grouped_quantize_fp8_with_trans(
-        b_bf16, _DW2_FP8_FORMAT, ScalingGranularity.MX_BLOCKWISE, lens64, offs64, block_size=_MXFP8_BLOCK
-    )
-    # FLYDSL native mxfp8 variable-K wgrad: at the real DSv3 shape (~2048 tok/expert) the FlyDSL GEMM
-    # is 0.58x bf16 (-42%) vs Triton's 1.15x (slower). The full fp8 dW2 (2x colwise quant + GEMM) is
-    # still net-negative because the standalone transpose-quant (1.007 ms) dominates; the quant is the
-    # remaining lever (see agent/workspace/dw2_mxfp8_wgrad_gfx950_20260713/findings.md).
+    operands colwise (transposed) with the dedicated FlyDSL colwise-transpose quant, then the
+    FlyDSL mxfp8 variable-K grouped GEMM. Returns [G, a.shape[1], b.shape[1]] bf16.
+
+    The colwise quant emits ONLY the transposed operand the wgrad needs (a_t + raw E8M0),
+    skipping the C++ dual's wasted rowwise half -> ~1.2x faster than the dual for the 2 operands
+    (0.81 vs ~0.99 ms at the DSv3 shape), byte-exact (dW2 SNR 22.58 dB == dual). The metadata is
+    shared across both operands. NOTE: colwise_grouped_meta does one total_M_pad D2H; only runs
+    when _USE_FP8_DW2 is on (see the flag comment for the net-parity status)."""
+    meta = colwise_grouped_meta(group_lens, group_offs)
+    a_t, a_ts, lens_pc, offs_pc = colwise_quant_mxfp8_grouped_flydsl(a_bf16, _DW2_FP8_FORMAT, meta=meta)
+    b_t, b_ts, _, _ = colwise_quant_mxfp8_grouped_flydsl(b_bf16, _DW2_FP8_FORMAT, meta=meta)
     return grouped_gemm_fp8_variable_k_impl(
-        a_t, b_t, a_ts, b_ts, lens_pc, offs_pc,
+        a_t, b_t,
+        a_ts.view(torch.float8_e8m0fnu), b_ts.view(torch.float8_e8m0fnu),
+        lens_pc.to(torch.int64), offs_pc.to(torch.int64),
         trans_a=False, trans_b=False, trans_c=False,
         out_dtype=torch.bfloat16, granularity=ScalingGranularity.MX_BLOCKWISE.value,
         num_cu=None, default_backend=BackendType.FLYDSL.value,
