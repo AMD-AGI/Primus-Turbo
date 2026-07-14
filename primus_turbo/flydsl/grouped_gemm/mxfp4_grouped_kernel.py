@@ -14,6 +14,8 @@ contiguous layout the whole-loop reads: A into per-group 256-aligned slabs (so t
 tile's scale soffset stays 128-region aligned), B per expert.
 """
 
+import gc
+
 import torch
 import torch.nn.functional as F
 
@@ -456,53 +458,24 @@ def _build_grouped_mxfp4_nt_kernel(
 _GMXFP4_LAUNCH_CACHE: dict = {}
 _GMXFP4_WS_CACHE: dict = {}
 _GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, gm, xcd, gn, out_fp16) -> [raw_launch, compiled]
-_GMXFP4_CFG_CACHE: dict = {}  # (total_M, N, K, G, out_fp16) -> (gm, xcd, gn)
-# Grouped NT config candidates. xcd=1 (group-major XCD order) is the dominant L2-locality
-# lever (xcd=8 measured ~20% slower); gn=4 (N-band) helps the fat-N MoE shapes. The wgrad
-# uses the same set. All candidates are bit-identical (swizzle only), so the timed sweep
-# never regresses correctness -- it just chases L2 residency / tile balance.
-_GMXFP4_CANDS = [(1, 1, 0), (1, 1, 4), (2, 1, 0), (2, 1, 4), (4, 1, 0), (4, 1, 4), (4, 8, 0)]
+# Fixed grouped NT config: xcd=1 (group-major XCD order) is the dominant L2-locality lever
+# (xcd=8 measured ~20% slower); gm=2/gn=4 (N-band) is within ~1.5% of the per-shape optimum
+# across aligned + fat-N + square shapes. A single fixed config keeps ONE compiled kernel
+# per shape (a timed 7-candidate sweep exploded compile time + code-object memory on the
+# full test sweep of ~480 shapes -> segfault), while retaining the xcd=1 win.
+_GMXFP4_DEFAULT_CFG = (2, 1, 4)  # (group_m, num_xcds, group_n)
+# JIT compile-cache bound: each distinct shape compiles one FlyDSL kernel (GPU code object).
+# Real MoE uses a handful of shapes; a broad test sweep (~480 shapes) accumulates enough
+# code objects to exhaust memory -> drop the caches (and gc the modules) past this cap. A
+# real workload stays well under it, so its kernels are never evicted.
+_GMXFP4_CACHE_CAP = 96
 
 
-def _grouped_mxfp4_pick_cfg(cache, cands, shape_key, capturing, build_entry, run_args, default_cfg):
-    """Timed per-shape config autotune (dense-mxfp4 pattern): compile every candidate,
-    warm all against the same L2 state, time with CUDA events, cache the fastest. During
-    capture (cannot time) fall back to the cached winner or the static default."""
-    cached = cache.get(shape_key)
-    if cached is not None:
-        return cached
-    if capturing:
-        cache[shape_key] = default_cfg
-        return default_cfg
-    compiled = []
-    for cfg in cands:
-        try:
-            entry = build_entry(cfg)
-            if entry[1] is None:
-                entry[1] = flyc.compile(entry[0], *run_args)
-            compiled.append((cfg, entry[1]))
-        except Exception:  # noqa: BLE001 -- a bad config must not break the GEMM
-            continue
-    if not compiled:
-        cache[shape_key] = default_cfg
-        return default_cfg
-    for _ in range(3):
-        for _, c in compiled:
-            c(*run_args)
-    torch.cuda.synchronize()
-    best_cfg, best_t = default_cfg, float("inf")
-    for cfg, c in compiled:
-        ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        ev0.record()
-        for _ in range(8):
-            c(*run_args)
-        ev1.record()
-        torch.cuda.synchronize()
-        t = ev0.elapsed_time(ev1)
-        if t < best_t:
-            best_t, best_cfg = t, cfg
-    cache[shape_key] = best_cfg
-    return best_cfg
+def _bound_caches(*caches):
+    if any(len(c) > _GMXFP4_CACHE_CAP for c in caches):
+        for c in caches:
+            c.clear()
+        gc.collect()
 
 
 def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=None):
@@ -630,11 +603,8 @@ def grouped_gemm_mxfp4_flydsl_kernel(
             _GMXFP4_AT_CACHE[atk] = e2
         return e2
 
-    capturing = torch.cuda.is_current_stream_capturing()
-    cfg = _grouped_mxfp4_pick_cfg(
-        _GMXFP4_CFG_CACHE, _GMXFP4_CANDS, (total_M, N, K, G, out_fp16), capturing, _entry, args, (2, 1, 4)
-    )
-    run_eager_or_capture(_entry(cfg), args, 1)
+    run_eager_or_capture(_entry(_GMXFP4_DEFAULT_CFG), args, 1)
+    _bound_caches(_GMXFP4_LAUNCH_CACHE, _GMXFP4_AT_CACHE, _GMXFP4_WS_CACHE)
     return out[:, :N_out] if N_out != N else out
 
 
@@ -919,9 +889,6 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
             _GMXFP4_WGRAD_AT_CACHE[atk] = e2
         return e2
 
-    capturing = torch.cuda.is_current_stream_capturing()
-    cfg = _grouped_mxfp4_pick_cfg(
-        _GMXFP4_CFG_CACHE, _GMXFP4_CANDS, (OUT_M, OUT_N, M_total, G, out_fp16), capturing, _entry, args, (2, 1, 4)
-    )
-    run_eager_or_capture(_entry(cfg), args, 1)
+    run_eager_or_capture(_entry(_GMXFP4_DEFAULT_CFG), args, 1)
+    _bound_caches(_GMXFP4_WGRAD_LAUNCH_CACHE, _GMXFP4_WGRAD_AT_CACHE, _GMXFP4_WGRAD_WS_CACHE)
     return out

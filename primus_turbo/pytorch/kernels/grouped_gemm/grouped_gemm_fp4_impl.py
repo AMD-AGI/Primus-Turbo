@@ -139,6 +139,9 @@ class GroupedGEMMFP4FlyDSLBackend(KernelBackend):
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
         supported &= out_dtype in (torch.float16, torch.bfloat16)
         supported &= trans_b and not trans_a
+        # Free dim N must be a 64-multiple (the packed-scale preshuffle groups 64 rows);
+        # non-64 N (tiny 32-mult test shapes) falls back to Triton. MoE dims are 64-mult.
+        supported &= b.shape[-2] % 64 == 0
         supported &= get_device_compute_capability() >= (9, 5)
         return supported
 
@@ -313,8 +316,14 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
-        supported &= out_dtype in (torch.float16, torch.bfloat16)
+        # bf16 only: the FlyDSL wgrad consumes the FlyDSL dual-quant's 512-aligned colwise
+        # layout. fp16 activations fall back to the HIP quant (128-aligned col), which this
+        # kernel can't consume -> route fp16 wgrad to Triton.
+        supported &= out_dtype == torch.bfloat16
         supported &= not trans_a and not trans_b
+        # OUT_M/OUT_N (=a.shape[0]/b.shape[0], swapped by trans_c) must be 64-multiples for
+        # the packed-scale preshuffle; non-64 (tiny test shapes) falls back to Triton.
+        supported &= a.shape[0] % 64 == 0 and b.shape[0] % 64 == 0
         supported &= get_device_compute_capability() >= (9, 5)
         return supported
 
