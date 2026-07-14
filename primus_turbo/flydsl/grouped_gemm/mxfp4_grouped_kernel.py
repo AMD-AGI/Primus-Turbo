@@ -94,7 +94,6 @@ def _build_grouped_mxfp4_a_preshuffle(K128: int, G: int):
         a_raw: fx.Tensor,
         a_out: fx.Tensor,
         go_out: fx.Tensor,  # tight offs (int32 view int64 [G+1])
-        a_pre: fx.Tensor,  # 64-grp slab base (int32 view int64 [G+1])
         total_M: fx.Int32,
         slab_rows: fx.Int32,
     ):
@@ -121,18 +120,23 @@ def _build_grouped_mxfp4_a_preshuffle(K128: int, G: int):
 
         go_t = rocdl.make_buffer_tensor(go_out, max_size=False, num_records_bytes=(G + 1) * 8)
         go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
-        ap_t = rocdl.make_buffer_tensor(a_pre, max_size=False, num_records_bytes=(G + 1) * 8)
-        ap_div = fx.logical_divide(ap_t, fx.make_layout(1, 1))
+        # a_pre (64-grp slab base) accumulated inline from the tight offs -> no separate
+        # 1-thread cumsum kernel / AP tensor (one fewer launch, matters on small shapes).
         rd0 = I32(0)
         rd_end = I32(0)
         ok = I32(0)
+        apre = I32(0)
+        m_prev = _load_go(go_div, 0)
         for g in range_constexpr(G):
-            p0 = _load_go(ap_div, g)
-            p1 = _load_go(ap_div, g + 1)
+            m_nxt = _load_go(go_div, g + 1)
+            p0 = apre
+            p1 = apre + ((m_nxt - m_prev + I32(255)) // I32(256)) * I32(4)  # 4 64-grps / 256-slab
             inq = (grp >= p0) & (grp < p1)
-            rd0 = arith.select(inq, _load_go(go_div, g) + (grp - p0) * I32(64), rd0)
-            rd_end = arith.select(inq, _load_go(go_div, g + 1), rd_end)
+            rd0 = arith.select(inq, m_prev + (grp - p0) * I32(64), rd0)
+            rd_end = arith.select(inq, m_nxt, rd_end)
             ok = arith.select(inq, I32(1), ok)
+            apre = p1
+            m_prev = m_nxt
         base_ok = (gid4 < total4) & (ok != I32(0))
         rows = [rd0 + I32(t * 16) + r for t in range_constexpr(4)]
         valid = [base_ok & (rows[t] < rd_end) for t in range_constexpr(4)]
@@ -228,7 +232,6 @@ def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wl
         A_scale: fx.Tensor,  # packed A slabs (int32)
         B_scale: fx.Tensor,  # packed B per-expert (int32)
         GO: fx.Tensor,  # tight offs (int32 view int64 [G+1])
-        AP: fx.Tensor,  # 64-grp A-slab base (int32 view int64 [G+1])
         c_m: fx.Int32,  # total_M
         c_n: fx.Int32,  # N
         slab_rows: fx.Int32,  # padded A-slab rows
@@ -317,8 +320,6 @@ def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wl
         # ---- O(G) tile scan: pid -> (group_idx, local tile, m_start, m_end, a_pre) ----
         go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
         go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
-        ap_t = rocdl.make_buffer_tensor(AP, max_size=False, num_records_bytes=(G + 1) * 8)
-        ap_div = fx.logical_divide(ap_t, fx.make_layout(1, 1))
         pid = xcd_remap_pid(fx.block_idx.x, grid_upper, num_xcds)
         total_tiles = I32(0)
         prev = _load_go(go_div, 0)
@@ -342,6 +343,7 @@ def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wl
         m_start = I32(0)
         m_end = I32(0)
         a_pre_g = I32(0)
+        apre = I32(0)  # inline 64-grp slab-base cumsum (no AP tensor / cumsum launch)
         p2 = _load_go(go_div, 0)
         for g in range_constexpr(G):
             nx = _load_go(go_div, g + 1)
@@ -352,7 +354,8 @@ def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wl
             tile_start = arith.select(inq, cum, tile_start)
             m_start = arith.select(inq, p2, m_start)
             m_end = arith.select(inq, nx, m_end)
-            a_pre_g = arith.select(inq, _load_go(ap_div, g), a_pre_g)
+            a_pre_g = arith.select(inq, apre, a_pre_g)
+            apre = apre + ceildiv(nx - p2, BLOCK_M) * I32(4)
             cum = nc
             p2 = nx
         local = pid - tile_start
@@ -441,31 +444,6 @@ def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wl
     return kern, attrs, NBK
 
 
-def _build_a_pre_kernel(G: int):
-    """1-thread prologue: a_pre[g] = cumulative 4*ceil(M_g/256) (64-row-grp units),
-    so each group's A-scale slab is 256-aligned. a_pre[0]=0."""
-
-    @flyc.kernel(known_block_size=[1, 1, 1])
-    def kern(GO: fx.Tensor, AP: fx.Tensor):
-        I32 = fx.Int32
-        z = I32(0)
-        go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
-        go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
-        ap_r = buffer_ops.create_buffer_resource(AP, max_size=False, num_records_bytes=I32((G + 1) * 8))
-        buffer_ops.buffer_store(z, ap_r, I32(0))
-        buffer_ops.buffer_store(z, ap_r, I32(1))
-        acc = z
-        prev = _load_go(go_div, 0)
-        for g in range_constexpr(G):
-            nxt = _load_go(go_div, g + 1)
-            acc = acc + ((nxt - prev + I32(255)) // I32(256)) * I32(4)  # 4 64-grps per 256-slab
-            buffer_ops.buffer_store(acc, ap_r, I32(2 * (g + 1)))
-            buffer_ops.buffer_store(z, ap_r, I32(2 * (g + 1) + 1))
-            prev = nxt
-
-    return kern
-
-
 _GMXFP4_LAUNCH_CACHE: dict = {}
 _GMXFP4_WS_CACHE: dict = {}
 _GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, gm, xcd, gn, out_fp16) -> [raw_launch, compiled]
@@ -520,7 +498,6 @@ def _grouped_mxfp4_pick_cfg(cache, cands, shape_key, capturing, build_entry, run
 
 def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16):
     K128 = K // 128
-    a_pre_k = _build_a_pre_kernel(G)
     a_pre_shuf = _build_grouped_mxfp4_a_preshuffle(K128, G)
     b_pre_shuf = _build_grouped_mxfp4_b_preshuffle(K128, G, N)
     gemm_k, attrs, NBK = _build_grouped_mxfp4_nt_kernel(
@@ -538,7 +515,6 @@ def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16):
         a_sp: fx.Tensor,
         b_sp: fx.Tensor,
         GO: fx.Tensor,
-        AP: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
         slab_rows: fx.Int32,
@@ -546,12 +522,11 @@ def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16):
         grid_upper: fx.Int32,
         stream: fx.Stream,
     ):
-        a_pre_k(GO, AP).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-        a_pre_shuf(a_raw, a_sp, GO, AP, c_m, slab_rows).launch(
+        a_pre_shuf(a_raw, a_sp, GO, c_m, slab_rows).launch(
             grid=(a_pre_grid, 1, 1), block=(_PRESHUF_BLK, 1, 1), stream=stream
         )
         b_pre_shuf(b_raw, b_sp).launch(grid=(b_pre_grid, 1, 1), block=(_PRESHUF_BLK, 1, 1), stream=stream)
-        gemm_k(a8, b8, C, a_sp, b_sp, GO, AP, c_m, c_n, slab_rows, grid_upper, value_attrs=attrs).launch(
+        gemm_k(a8, b8, C, a_sp, b_sp, GO, c_m, c_n, slab_rows, grid_upper, value_attrs=attrs).launch(
             grid=(grid_upper, 1, 1), block=(256, 1, 1), stream=stream
         )
 
@@ -611,7 +586,6 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     out_flat = out.view(-1)
 
     go = (group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)).view(torch.int32)
-    ap = torch.empty(G + 1, dtype=torch.int64, device=dev).view(torch.int32)
     a_sp, b_sp, slab_rows = _get_grouped_mxfp4_ws(total_M, N, K128, G, dev)
 
     n_blocks = (N + 255) // 256
@@ -629,7 +603,6 @@ def grouped_gemm_mxfp4_flydsl_kernel(
         a_sp,
         b_sp,
         go,
-        ap,
         total_M,
         N,
         slab_rows,
