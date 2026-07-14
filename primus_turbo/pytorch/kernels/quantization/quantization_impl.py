@@ -564,18 +564,42 @@ def grouped_quantize_mxfp4_impl(
         or colwise_recipe.shuffle_out
     ), "Grouped MXFP4 dual quant does not support shuffle layouts."
 
-    return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
-        x,
-        group_lens,
-        group_offs,
-        float4_e2m1fn_x2,
-        rowwise_recipe.use_2d_block,
-        rowwise_recipe.use_sr,
-        rowwise_recipe.use_rht,
-        colwise_recipe.use_2d_block,
-        colwise_recipe.use_sr,
-        colwise_recipe.use_rht,
+    def _hip():
+        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
+            x,
+            group_lens,
+            group_offs,
+            float4_e2m1fn_x2,
+            rowwise_recipe.use_2d_block,
+            rowwise_recipe.use_sr,
+            rowwise_recipe.use_rht,
+            colwise_recipe.use_2d_block,
+            colwise_recipe.use_sr,
+            colwise_recipe.use_rht,
+        )
+
+    # FlyDSL grouped dual quant (bit-exact, faster than the HIP dual) for the
+    # per-block / non-SR recipes it supports. fp16 (different 16-bit layout than the
+    # bf16 microblock cast) / 2d-block / SR fall through to HIP.
+    fly_ok = (
+        not rowwise_recipe.use_2d_block
+        and not rowwise_recipe.use_sr
+        and not colwise_recipe.use_2d_block
+        and not colwise_recipe.use_sr
+        and x.dtype == torch.bfloat16
     )
+    if fly_ok:
+        from primus_turbo.flydsl.quant.mxfp4_grouped_quant import grouped_quant_mxfp4_raw
+
+        return grouped_quant_mxfp4_raw(
+            x,
+            group_lens,
+            group_offs,
+            float4_e2m1fn_x2,
+            rowwise_recipe.use_rht,
+            colwise_recipe.use_rht,
+        )
+    return _hip()
 
 
 def dequantize_mxfp8_impl(
