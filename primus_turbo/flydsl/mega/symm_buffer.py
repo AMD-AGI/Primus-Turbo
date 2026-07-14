@@ -237,7 +237,17 @@ def get_symm_buffer_size_for_mega_moe(
                 int(workspace.get_dispatch_token_pool_ptr()), (npt, hidden), token_dtype, dev
             ),
             _tensor_from_device_ptr(int(workspace.get_weight_recv_buf_ptr()), (npt,), torch.float32, dev),
+            _tensor_from_device_ptr(
+                int(workspace.get_l2_token_buffer_ptr()), (npt, hidden), token_dtype, dev
+            ),
+            _tensor_from_device_ptr(
+                int(workspace.get_combine_token_buffer_ptr()),
+                (workspace.num_combine_slots, hidden),
+                token_dtype,
+                dev,
+            ),
             _tensor_from_device_ptr(int(workspace.get_pool_src_slot_ptr()), (npt,), torch.int32, dev),
+            _tensor_from_device_ptr(int(workspace.get_pool_src_rank_ptr()), (npt,), torch.int32, dev),
             _tensor_from_device_ptr(
                 int(workspace.get_dispatch_flag_ptr()), (2 * workspace.num_max_pool_blocks,), torch.int64, dev
             ),
@@ -319,7 +329,10 @@ class SymmBuffer:
         (
             self.dispatch_token_pool,
             self.weight_recv_buf,
+            self.l2_token_buffer,
+            self.combine_token_buffer,
             self.pool_src_slot,
+            self.pool_src_rank,
             self.dispatch_flag,
             self.combine_flag,
             self.reduce_flag,
@@ -329,26 +342,13 @@ class SymmBuffer:
             (self.world,), self.num_tokens, dtype=torch.int32, device="cuda"
         )
 
-        # dispatch / combine use double-buffered parity signals
-        self._disp_parity = 0
-        self._disp_expected = [0, 0]
-        self._combine_parity = 0
-        self._combine_expected = [0, 0]
-        self._reduce_expected = [0, 0]
+        # device epoch state (parity + per-bank expected); bumped by the device bump kernel
+        self._disp_parity = torch.zeros(1, dtype=torch.int64, device="cuda")  # index into the 2 banks
+        self._disp_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._combine_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
+        self._combine_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._reduce_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._sym_buffer = None  # cached so its peer-delta table stays alive with this heap
-
-    def next_dispatch(self) -> Tuple[int, int]:
-        self._disp_parity ^= 1
-        p = self._disp_parity
-        self._disp_expected[p] += int(self.world)
-        return p, self._disp_expected[p]
-
-    def next_combine(self, n_blocks: int) -> Tuple[int, int, int]:
-        self._combine_parity ^= 1
-        p = self._combine_parity
-        self._combine_expected[p] += int(n_blocks)
-        self._reduce_expected[p] += 1
-        return p, self._combine_expected[p], self._reduce_expected[p]
 
     def get_sym_buffer(self) -> SymBuffer:
         """Build (once) the SymBuffer handle; cached so its peer-delta table outlives async launches."""

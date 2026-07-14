@@ -13,6 +13,7 @@ import torch
 from flydsl.expr import arith, const_expr
 from flydsl.expr.buffer_ops import (
     buffer_load,
+    buffer_store,
     create_buffer_resource,
     extract_base_index,
 )
@@ -107,15 +108,13 @@ def _make_kernel(
         c_n: fx.Int32,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
-        disp_parity: fx.Int32,
-        expected_dispatch: fx.Int32,
+        DISP_PARITY: fx.Tensor,
+        DISP_EXPECTED: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         comm_block_count = fx.Int32(num_dispatch_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        bank_offset = disp_parity * fx.Int32(NPB)
-        expected_dispatch_i64 = cast(expected_dispatch, fx.T.i64())
         # build the layout from explicit dims (bf16 path -> TOKEN_DTYPE), then hoist region
         # pointers before dynamic branches (rewriter can't carry SymBuffer/Workspace)
         workspace = Workspace(
@@ -129,6 +128,14 @@ def _make_kernel(
         )
         dispatch_flag_base = workspace.get_dispatch_flag_ptr()
         dispatch_token_pool_base = workspace.get_dispatch_token_pool_ptr()
+        # read epoch (already bumped by the bump kernel): parity -> bank, expected -> spin target
+        disp_parity_res = create_buffer_resource(DISP_PARITY, max_size=True)
+        disp_expected_res = create_buffer_resource(DISP_EXPECTED, max_size=True)
+        disp_parity = cast(
+            buffer_load(disp_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
+        )
+        bank_offset = disp_parity * fx.Int32(NPB)
+        expected_dispatch_i64 = buffer_load(disp_expected_res, disp_parity, vec_width=1, dtype=fx.T.i64())
 
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
         expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
@@ -288,16 +295,22 @@ def _make_kernel(
     return dispatch_grouped_gemm_kernel, grid_size
 
 
-def _rewind_dispatch_flag(kwargs):
-    # tuning-only: rewind never-reset flag so each rerun matches baked expected
-    symm = get_symm_buffer_for_mega_moe()
-    p = int(kwargs["disp_parity"])
-    base = int(kwargs["expected_dispatch"]) - int(symm.world)
-    npb = int(symm.num_max_pool_tokens) // int(kwargs["BLOCK_M"])
-    # reset local bank + make visible, THEN rendezvous so no next-rep push lands before all ranks rewound (else undercount).
-    symm.dispatch_flag[p * npb : (p + 1) * npb].fill_(base)
-    torch.cuda.synchronize()
-    torch.distributed.barrier(symm.group)
+@functools.lru_cache(maxsize=4)
+def _make_epoch_bump(addend):
+    """Single-block kernel: flip parity, bump the new bank's expected by addend."""
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def epoch_bump_kernel(PARITY: fx.Tensor, EXPECTED: fx.Tensor):
+        if fx.thread_idx.x == fx.Int32(0):
+            parity_res = create_buffer_resource(PARITY, max_size=True)
+            expected_res = create_buffer_resource(EXPECTED, max_size=True)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            buffer_store(new_parity, parity_res, fx.Int32(0))
+            idx = cast(new_parity, fx.T.i32())
+            new_exp = buffer_load(expected_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(addend)
+            buffer_store(new_exp, expected_res, idx)
+
+    return epoch_bump_kernel
 
 
 @autotune(
@@ -315,9 +328,7 @@ def _rewind_dispatch_flag(kwargs):
         "G",
         "num_ranks",
     ],
-    warmup=0,
     rep=5,
-    post_hook=_rewind_dispatch_flag,
 )
 @flyc.jit
 def _compiled_dispatch_grouped_gemm(
@@ -336,8 +347,8 @@ def _compiled_dispatch_grouped_gemm(
     c_n: int,
     out_m_rt: int,
     out_n_rt: int,
-    disp_parity: int,
-    expected_dispatch: int,
+    DISP_PARITY,
+    DISP_EXPECTED,
     out_features: fx.Constexpr[int],
     hidden_size: fx.Constexpr[int],
     num_max_pool_tokens: fx.Constexpr[int],
@@ -360,6 +371,10 @@ def _compiled_dispatch_grouped_gemm(
     # layout_code: 0=nt, 1=nn, 2=tn; tn uses 2 XCDs, nt/nn use 8
     layout = ("nt", "nn", "tn")[int(layout_code)]
     num_xcd = 2 if layout == "tn" else 8
+    # bump epoch on device (expected += num_ranks) before the GEMM; same-stream makes it visible
+    _make_epoch_bump(int(num_ranks))(DISP_PARITY, DISP_EXPECTED).launch(
+        grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
+    )
     kernel, grid_size = _make_kernel(
         out_features,
         hidden_size,
@@ -396,8 +411,8 @@ def _compiled_dispatch_grouped_gemm(
         c_n,
         out_m_rt,
         out_n_rt,
-        disp_parity,
-        expected_dispatch,
+        DISP_PARITY,
+        DISP_EXPECTED,
         value_attrs=make_value_attrs(2, 0, "512,512"),
     ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -514,8 +529,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         out_features_ce, hidden_size_ce = N, hidden_size
         G, trans_c = 0, False  # nt/nn grid uses worst_case_tiles; C never transposed
 
-    disp_parity, expected_dispatch = symm.next_dispatch()
-
+    # epoch tensors are bumped by _make_epoch_bump inside _compiled; just pass them through
     _compiled_dispatch_grouped_gemm(
         x_i32,
         expert_send_dst_rank,
@@ -532,8 +546,8 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         c_n,
         out_m_rt,
         out_n_rt,
-        disp_parity=disp_parity,
-        expected_dispatch=int(expected_dispatch),
+        DISP_PARITY=symm._disp_parity,
+        DISP_EXPECTED=symm._disp_expected,
         out_features=int(out_features_ce),
         hidden_size=int(hidden_size_ce),
         num_max_pool_tokens=int(num_max_pool_tokens),
