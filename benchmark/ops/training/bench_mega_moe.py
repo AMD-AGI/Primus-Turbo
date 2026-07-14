@@ -30,10 +30,10 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
-from tabulate import tabulate
 
 # config + this module's helpers are same-dir (auto on the script-dir path)
 from config import gen_moe_test_cases, get_platform_info
+from tabulate import tabulate
 
 # repo root (primus_turbo) on the path
 _HERE = os.path.dirname(__file__)
@@ -49,6 +49,9 @@ from flydsl.expr.buffer_ops import (  # noqa: E402
 )
 from flydsl.expr.typing import AddressSpace, PointerType  # noqa: E402
 
+# import primus_turbo.pytorch first to dodge the mega kernels' circular import
+import primus_turbo.pytorch  # noqa: E402,F401
+
 # primus_turbo.flydsl.* imported before primus_turbo.pytorch (kept from the
 # original mega_utils order; the two fused kernels below need pytorch first).
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (  # noqa: E402
@@ -59,8 +62,10 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (  # noqa: E402
     _make_shared_storage,
     gemm_bf16_tile,
 )
-from primus_turbo.flydsl.mega import (  # noqa: E402
+from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
+    dispatch_grouped_gemm_bf16_flydsl_kernel,
     dispatch_prologue_flydsl_kernel,
+    grouped_gemm_combine_bf16_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
@@ -84,13 +89,6 @@ from primus_turbo.flydsl.utils.gemm_helper import (  # noqa: E402
     ceildiv,
     make_value_attrs,
     xcd_remap_pid,
-)
-
-# import primus_turbo.pytorch first to dodge the mega kernels' circular import
-import primus_turbo.pytorch  # noqa: E402,F401
-from primus_turbo.flydsl.mega import (  # noqa: E402
-    dispatch_grouped_gemm_bf16_flydsl_kernel,
-    grouped_gemm_combine_bf16_flydsl_kernel,
 )
 from primus_turbo.pytorch.ops import grouped_gemm as turbo_grouped_gemm  # noqa: E402
 
@@ -1682,9 +1680,7 @@ MODES = {
         stages=[
             _FWD_REPORT,
             StageReport("bwd", "bwd ", {"xgmi": True}, "backward dgrad (NN, = dispatch_grouped_0)"),
-            StageReport(
-                "wgrad", "wgrad ", {}, "backward wgrad dW1 (TN, = dispatch + variable-K wgrad)"
-            ),
+            StageReport("wgrad", "wgrad ", {}, "backward wgrad dW1 (TN, = dispatch + variable-K wgrad)"),
         ],
     ),
     "grouped_gemm_combine": ModeSpec(
