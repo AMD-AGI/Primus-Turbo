@@ -51,7 +51,15 @@ from primus_turbo.flydsl.mega.ep_intranode import (
     dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.symm_buffer import (
+    BLOCK_M as _POOL_BLOCK_M,
+)
+from primus_turbo.flydsl.mega.symm_buffer import (
+    TOKEN_DTYPE,
+    SymBuffer,
+    Workspace,
+    get_symm_buffer_for_mega_moe,
+)
 from primus_turbo.flydsl.utils.gemm_helper import (
     ceildiv,
     make_value_attrs,
@@ -239,7 +247,17 @@ def compile_grouped_gemm_bf16(
 # Dispatch-PUSH-only launcher (no GEMM/scoreboard): raw dispatch bandwidth over XGMI.
 # --------------------------------------------------------------------------- #
 @functools.lru_cache(maxsize=256)
-def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, num_comm, waves_per_eu=2):
+def _compile_dispatch_only(
+    hidden_size,
+    num_max_pool_tokens,
+    num_dispatch_cu,
+    num_comm,
+    num_ranks,
+    num_experts,
+    num_max_tokens_per_rank,
+    num_topk,
+    waves_per_eu=2,
+):
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_only_k(
         INPUT_TOKENS: fx.Tensor,
@@ -248,11 +266,21 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
         EXPERT_SEND_COUNT: fx.Tensor,
         EXPERT_SEND_OFFSET: fx.Tensor,
         DISPATCHED_TOKEN_IDX: fx.Tensor,
-        sym_layout: SymLayout,
+        sym_buffer: SymBuffer,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         comm_block_count = fx.Int32(num_dispatch_cu)
+        # build workspace (hoist heap-derived ptrs before dynamic control flow)
+        workspace = Workspace(
+            sym_buffer.get_base_ptr(),
+            num_ranks,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden_size,
+            token_dtype=TOKEN_DTYPE,
+        )
         input_res = create_buffer_resource(INPUT_TOKENS, max_size=True)
         expert_send_dst_rank_res = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
         expert_send_dst_row_res = create_buffer_resource(EXPERT_SEND_DST_ROW, max_size=True)
@@ -266,7 +294,8 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
             ) // comm_block_count
             for local_iter in range(local_count):
                 dispatch_bf16_tile(
-                    sym_layout,
+                    sym_buffer,
+                    workspace,
                     thread_index=thread_index,
                     hidden_size=hidden_size,
                     input_res=input_res,
@@ -287,7 +316,7 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
         EXPERT_SEND_COUNT,
         EXPERT_SEND_OFFSET,
         DISPATCHED_TOKEN_IDX,
-        sym_layout,
+        sym_buffer,
         stream: fx.Stream,
     ):
         dispatch_only_k(
@@ -297,7 +326,7 @@ def _compile_dispatch_only(hidden_size, num_max_pool_tokens, num_dispatch_cu, nu
             EXPERT_SEND_COUNT,
             EXPERT_SEND_OFFSET,
             DISPATCHED_TOKEN_IDX,
-            sym_layout,
+            sym_buffer,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_dispatch_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -440,7 +469,16 @@ def dispatch_only(
     hidden_size = x.size(1)
     pool_capacity = symm.num_max_pool_tokens
     x_i32 = x.contiguous().view(torch.int32).view(-1)
-    launch = _compile_dispatch_only(hidden_size, pool_capacity, int(num_dispatch_cu), int(num_comm))
+    launch = _compile_dispatch_only(
+        hidden_size,
+        pool_capacity,
+        int(num_dispatch_cu),
+        int(num_comm),
+        int(symm.world),
+        int(symm.num_experts),
+        int(symm.num_max_tokens_per_rank),
+        int(symm.num_topk),
+    )
     launch(
         x_i32,
         expert_send_dst_rank,
@@ -448,7 +486,7 @@ def dispatch_only(
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
-        symm.get_sym_layout(),
+        symm.get_sym_buffer(),
         stream=torch.cuda.current_stream(),
     )
 
@@ -578,15 +616,17 @@ def _build_symm_and_plan(group, *, T, H, I, E, K, BLOCK_M, BLOCK_N, base_seed):
     handle = dispatch_prologue_flydsl_kernel(
         topk_idx,
         topk_weight,
-        sym_layout=symm.get_sym_layout(),
+        sym_buffer=symm.get_sym_buffer(),
         num_tokens=T,
         num_topk=K,
         num_experts=E,
         num_ranks=symm.world,
         rank=symm.rank,
         experts_per_rank=E // symm.world,
-        block_m=symm.block_m,
+        block_m=_POOL_BLOCK_M,
         num_max_pool_tokens=symm.num_max_pool_tokens,
+        hidden=symm.hidden,
+        num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
     )
     # pool_src_slot is cross-rank (symm); ride it on the handle like the production path
     handle = tuple(handle) + (symm.pool_src_slot,)
@@ -921,7 +961,16 @@ def _compile_reduce_only(
 
 
 @functools.lru_cache(maxsize=256)
-def _compile_combine_only_task(out_features, num_experts, num_combine_cu, waves_per_eu=2, with_gate=False):
+def _compile_combine_only_task(
+    out_features,
+    num_experts,
+    num_combine_cu,
+    num_ranks,
+    num_max_tokens_per_rank,
+    num_topk,
+    waves_per_eu=2,
+    with_gate=False,
+):
     """Task-based combine push: grid strides over num_experts recv-segments; a warp
     sustains ONE peer per segment (mirror of dispatch) -> sustained XGMI link."""
 
@@ -932,11 +981,21 @@ def _compile_combine_only_task(out_features, num_experts, num_combine_cu, waves_
         RECV_START_ROW: fx.Tensor,
         RECV_COUNT: fx.Tensor,
         POOL_SRC_SLOT: fx.Tensor,
-        sym_layout: SymLayout,
+        sym_buffer: SymBuffer,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         combine_cu = fx.Int32(num_combine_cu)
+        # build workspace (hoist heap-derived ptrs before dynamic control flow)
+        workspace = Workspace(
+            sym_buffer.get_base_ptr(),
+            num_ranks,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            out_features,
+            token_dtype=TOKEN_DTYPE,
+        )
         # recv-segment table + origin slots ride the handle (per-forward local copies)
         recv_dst_rank_res = create_buffer_resource(RECV_DST_RANK, max_size=True)
         recv_start_row_res = create_buffer_resource(RECV_START_ROW, max_size=True)
@@ -947,7 +1006,8 @@ def _compile_combine_only_task(out_features, num_experts, num_combine_cu, waves_
         local_count = (fx.Int32(num_experts) - block_index + combine_cu - fx.Int32(1)) // combine_cu
         for local_iter in range(local_count):
             combine_bf16_tile(
-                sym_layout,
+                sym_buffer,
+                workspace,
                 thread_index=thread_index,
                 task_index=block_index + local_iter * combine_cu,
                 recv_dst_rank_res=recv_dst_rank_res,
@@ -965,7 +1025,7 @@ def _compile_combine_only_task(out_features, num_experts, num_combine_cu, waves_
         RECV_START_ROW,
         RECV_COUNT,
         POOL_SRC_SLOT,
-        sym_layout,
+        sym_buffer,
         stream: fx.Stream,
     ):
         combine_task_k(
@@ -974,7 +1034,7 @@ def _compile_combine_only_task(out_features, num_experts, num_combine_cu, waves_
             RECV_START_ROW,
             RECV_COUNT,
             POOL_SRC_SLOT,
-            sym_layout,
+            sym_buffer,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_combine_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -990,9 +1050,9 @@ def combine_only(
     grad_gate=None,
 ):
     symm = get_symm_buffer_for_mega_moe()
-    sym_layout = symm.get_sym_layout()
-    out_features = int(sym_layout.hidden)
-    num_max_pool_tokens = int(sym_layout.num_max_pool_tokens)
+    sym_buffer = symm.get_sym_buffer()  # pure addressing handle
+    out_features = int(symm.hidden)  # dims live on SymmBuffer, not the handle
+    num_max_pool_tokens = int(symm.num_max_pool_tokens)
     if num_combine_cu is None:
         num_combine_cu = num_max_pool_tokens // BLOCK_M
     # recv-segment table + origin slots ride the handle (per-forward, not shared symm)
@@ -1008,8 +1068,11 @@ def combine_only(
     # task-based push (sustained per-peer): strides over num_experts recv-segments
     launch = _compile_combine_only_task(
         out_features,
-        int(sym_layout.num_experts),
+        int(symm.num_experts),
         int(num_combine_cu),
+        int(symm.world),
+        int(symm.num_max_tokens_per_rank),
+        int(symm.num_topk),
         waves_per_eu=waves,
         with_gate=with_gate,
     )
@@ -1019,7 +1082,7 @@ def combine_only(
         recv_start_row,
         recv_count,
         pool_src_slot,
-        sym_layout,
+        sym_buffer,
         stream=torch.cuda.current_stream(),
     )
     return symm.l2_token_buffer
