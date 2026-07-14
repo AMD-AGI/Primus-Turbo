@@ -12,11 +12,6 @@ import torch
 from flydsl.expr.numeric import Int64
 from flydsl.expr.typing import AddressSpace, Pointer, PointerType, address_space_from_attr
 
-try:
-    import torch.distributed._symmetric_memory as symm_mem
-except Exception as exception:  # pragma: no cover
-    print(f"Failed to load mega symmetric memory, please check your PyTorch version: {exception}")
-
 
 def align(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
@@ -317,10 +312,11 @@ class SymmBuffer:
         self.num_combine_slots = workspace.num_combine_slots
         self.num_tokens = self.num_max_tokens_per_rank  # back-compat alias
 
-        # allocate the single symmetric-memory heap (torch official; empty() is uninit -> zero it)
-        self.buffer = symm_mem.empty(self.num_bytes, dtype=torch.int8, device="cuda")
-        self.symm_mem = symm_mem.rendezvous(self.buffer, group=group)
-        self.buffer.zero_()
+        # allocate the single symmetric-memory heap (custom HIP IPC; ctor zeroes it, skip signal pad)
+        from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
+
+        self.symm_mem = SymmetricMemory(group, self.num_bytes, signal_pad_size=0)
+        self.buffer = self.symm_mem.get_buffer(self.rank, (self.num_bytes,), torch.int8)
         heap = self.buffer
         self.group.barrier()
         torch.cuda.synchronize()
@@ -362,8 +358,10 @@ class SymmBuffer:
         global _CURRENT_SYMM_BUFFER
         if _CURRENT_SYMM_BUFFER is self:
             _CURRENT_SYMM_BUFFER = None
-        # torch symmetric memory frees on GC; drop refs (region views alias buffer -> clear too)
+        # region views are non-owning aliases of the raw heap ptr; free the heap, then drop refs
         self._sym_buffer = None
+        if self.symm_mem is not None:
+            self.symm_mem.destroy()
         self.symm_mem = None
         self.buffer = None
 
