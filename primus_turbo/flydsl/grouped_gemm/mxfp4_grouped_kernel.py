@@ -214,6 +214,7 @@ def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wl
     _SCBUF = 4 * 4 * (BLOCK_K // 128) * 64
     _SCW = 4 * N_SUB * 64
     NBK = ceildiv(N, BLOCK_N)  # n_blocks
+    _NV = N if (N % BLOCK_N != 0) else None  # non-256 N: mask store cols >= N (no host N-pad)
 
     _anns = {f"A_lds{i}": fx.Array[fx.Float8E4M3FN, a_lds_size, 16] for i in range_constexpr(NABUF)}
     for _b in range_constexpr(NBB):
@@ -436,8 +437,8 @@ def _build_grouped_mxfp4_nt_kernel(K, G, N, group_m=4, num_xcds=8, group_n=0, wl
         # store bounded to the group's tight end: StoreCPlain's SRD num_records =
         # m_end*c_n -> partial-tile rows >= m_end (next group) HW-drop.
         store_c = StoreCPlain(C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty)
-        store_c.store(accL, base_row, base_col_l)
-        store_c.store(accR, base_row, base_col_r)
+        store_c.store(accL, base_row, base_col_l, n_valid=_NV)
+        store_c.store(accR, base_row, base_col_r, n_valid=_NV)
 
     _pt = {"passthrough": [["amdgpu-agpr-alloc", "256"]]}
     attrs = {"rocdl.flat_work_group_size": "256,256", "rocdl.waves_per_eu": OCC, **_pt}
@@ -557,12 +558,11 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     dev = a.device
     N_out = N  # true free dim to return
 
-    # The whole-loop tiles K/N in 256 blocks; K (already 128-padded by the quant) or N
-    # may be an odd 128-multiple. Pad both to 256 with zero fp4 / E8M0 (0*2^-127 = 0
-    # contributes nothing), so every shape runs natively (no Triton fallback). The pad
-    # is a small zero-fill on the fp4 / e8m0 uint8 tensors.
+    # Free dim N: NO host pad -- the kernel tiles the real N (ceildiv) and masks store
+    # cols >= N (StoreCPlain n_valid), so a non-256 N runs natively with no operand copy.
+    # Contraction K: the whole-loop tiles 256, so K (already 128-padded by the quant) is
+    # zero-padded to 256 (0*2^-127 = 0 contributes nothing) -- a small K-col zero-fill.
     K256 = (K + 255) // 256 * 256
-    N256 = (N + 255) // 256 * 256
     au = a.contiguous().view(torch.uint8)  # [total_M, K/2]
     asu = a_scale.contiguous().view(torch.uint8)  # [total_M, K/32]
     bu = b.contiguous().view(torch.uint8)  # [G, N, K/2]
@@ -572,10 +572,7 @@ def grouped_gemm_mxfp4_flydsl_kernel(
         asu = F.pad(asu, (0, (K256 - K) // 32))
         bu = F.pad(bu, (0, (K256 - K) // 2))
         bsu = F.pad(bsu, (0, (K256 - K) // 32))
-    if N256 != N:
-        bu = F.pad(bu, (0, 0, 0, N256 - N))
-        bsu = F.pad(bsu, (0, 0, 0, N256 - N))
-    K, N = K256, N256
+    K = K256
     K128 = K // 128
 
     a_raw = asu.contiguous().view(torch.int32).reshape(-1)

@@ -56,6 +56,9 @@ def _raw(v):
     return v
 
 
+_OOB_STORE = 1 << 28  # store col-mask redirect target (>> any C extent, no i32 overflow)
+
+
 # ── Device-side scale + fragment loaders / geometry ──────────────────────────
 
 
@@ -220,7 +223,7 @@ class StoreCPlain:
         fx.memref_store_vec(Vec.filled(1, value, self.out_ty), self.reg_out_1)
         fx.copy(self.out_atom_1, self.reg_out_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
 
-    def store(self, c_frag, base_row, base_col):
+    def store(self, c_frag, base_row, base_col, n_valid=None):
         # MN-ALIGNED fast path: the host wrapper guarantees M % 256 == 0 and
         # N % 256 == 0, so every BLOCK_M x BLOCK_N output tile is fully in-bounds.
         # We therefore drop the per-store column-edge redirect entirely (no
@@ -228,6 +231,11 @@ class StoreCPlain:
         # epilogue's fixed per-WG cost -- a measurable win on small-K / tall-M
         # shapes where the epilogue is a larger fraction of runtime (the OOB SRD
         # num_records still bounds any pathological index as a safety net).
+        #
+        # ``n_valid`` (non-256 free dim): redirect columns >= n_valid to an OOB index
+        # so the SRD drops them -- lets the kernel run over the REAL N (no host N-pad /
+        # operand copy); the over-read partial tile computes garbage that is dropped.
+        _mask = n_valid is not None
         for ti in range_constexpr(self.n_tiles_a):
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
             for tj in range_constexpr(self.n_tiles_b):
@@ -235,7 +243,10 @@ class StoreCPlain:
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
                     val = vec_f32[i].to(self.out_ty)
-                    self._store_scalar(val, (row + i) * self.c_cols + col)
+                    cidx = (row + i) * self.c_cols + col
+                    if const_expr(_mask):
+                        cidx = arith.select(col < fx.Int32(n_valid), cidx, fx.Int32(_OOB_STORE))
+                    self._store_scalar(val, cidx)
 
     @staticmethod
     def _permlane16_swap(a_i32, b_i32):
