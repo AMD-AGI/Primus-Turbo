@@ -25,6 +25,7 @@ from flydsl.expr.typing import Vector as Vec
 from primus_turbo.flydsl.utils.gemm_helper import make_row_band_resource, make_row_band_resource_div
 
 _CM = 1  # glc: bypass L2 on output stores
+_OOB = 0x7FFFFFFF  # past-end buffer offset -> HW drops the access
 
 
 def _cvt_pk_bf8_f32(res, src_a, src_b, old, word_sel, **kw):
@@ -134,247 +135,24 @@ def _ceil128(d):
     return ((d + 127) // 128) * 128
 
 
-def compile_qdual(
-    M,
-    K,
-    elt=None,
-    out_fp8="e4m3",
-    Mp=None,
-    Kp=None,
-    cm_row=_CM,
-    cm_col=_CM,
-    pad_extra=4,
-    grid_swz=False,
-    bm=64,
-    bk=128,
-    nth=512,
-):
-    """Compile the dual-cast mxfp8 quant. Tile [bm x bk] with bm*bk==16*nth (each half maps to
-    nth//2 threads); the transposed COL fp8 is staged through LDS + written back coalesced. Tile
-    shape trades which output gets the full 128B write burst (bm=64,bk=128: ROW full/COL half;
-    bm=128,bk=64: COL full/ROW half). pad_extra breaks the COL-read LDS bank conflict; grid_swz
-    uses column-major pids (anti DRAM-channel camping). Output is bit-identical across configs."""
-    if elt is None:
-        elt = fx.BFloat16
-    va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
-    Mp = M if Mp is None else Mp
-    Kp = K if Kp is None else Kp
-    assert Kp % 128 == 0 and Mp % 128 == 0 and Mp >= M and Kp >= K
-    # tile = bm*bk elems = nth*16 (each half maps onto nth//2 threads, 32 elems/thread).
-    assert bm * bk == 16 * nth and bm % 32 == 0 and bk % 32 == 0
-    BMv, BKv, NTHv = bm, bk, nth
-    HALF = NTHv // 2
-    PAD_L = BKv + pad_extra
-    SCMASK = (K % 4) != 0
-    LMASK = (Kp != K) and not SCMASK
-    NBK = Kp // BKv  # exact (Kp % 128 == 0)
-    NBM = Mp // BMv
-    VPR = BKv // 4  # vec4 per row
-    NKB = BKv // 32  # K-blocks (of 32) per row
-    NMB = BMv // 32  # M-blocks (of 32) per K-col
-    DWPC = BMv // 4  # dwords per K-col staged in LDS
-    LDSC_DW = BKv * BMv // 4
-    CW_ITERS_V = LDSC_DW // 4 // NTHv  # vec4 col-write iters/thread
-    assert DWPC % 4 == 0  # vec4 col write keeps 4 dwords inside one K-col
-    SCALEN_ROW = Kp // 32
-    SCALEN_COL = Mp // 32
-    SP_A_BYTES = raw_scale_int32(Mp, Kp) * 4
-    SP_AT_BYTES = raw_scale_int32(Kp, Mp) * 4
-
-    @flyc.kernel(known_block_size=[NTHv, 1, 1])
-    def kern(X: fx.Tensor, Qr: fx.Tensor, ASp: fx.Tensor, AtQd: fx.Tensor, AtSp: fx.Tensor):
-        I32 = fx.Int32
-        BF = elt.ir_type
-        F32 = fx.Float32
-        z = I32(0)
-        IRI = fx.Int32.ir_type
-
-        @fx.struct
-        class Smem:
-            tile: fx.Array[elt, BMv * PAD_L, 16]
-            ldsc: fx.Array[fx.Int32, LDSC_DW, 16]
-
-        sm = fx.SharedAllocator().allocate(Smem).peek()
-        tile = sm.tile
-        ldsc = sm.ldsc
-        t = fx.thread_idx.x
-        pid = fx.block_idx.x
-        br, bk = _decode_pid(pid, I32(NBK), I32(NBM), grid_swz)
-        rx = make_row_band_resource(bo.extract_base_index(X), z, I32(M), I32(K), 2)
-        gbase = (br * I32(BMv)) * I32(K) + bk * I32(BKv)
-        # vec8 (16B) load path when K%8==0: each 8-col block is one side of the K-pad boundary, so
-        # a single masked base redirect is exact -- halves the load/LDS-fill instruction count.
-        USE_V8 = (not SCMASK) and (K % 8 == 0)
-        if USE_V8:
-            VPR8 = BKv // 8
-            ITERS8 = BMv * BKv // 8 // NTHv
-            for ls in range_constexpr(ITERS8):
-                lin = t + I32(ls * NTHv)
-                lr = lin // I32(VPR8)
-                cv = (lin - lr * I32(VPR8)) * I32(8)
-                pbase = lr * I32(PAD_L) + cv
-                ioff = gbase + lr * I32(K) + cv
-                if LMASK:
-                    ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(0x7FFFFFFF))
-                v = bo.buffer_load(rx, ioff, vec_width=8, dtype=BF)
-                p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
-                fx.make_view(p, fx.make_layout(8, 1)).store(Vec(v))
-        else:
-            ITERS = BMv * BKv // 4 // NTHv
-            for ls in range_constexpr(ITERS):
-                lin = t + I32(ls * NTHv)
-                lr = lin // I32(VPR)
-                cv = (lin - lr * I32(VPR)) * I32(4)
-                pbase = lr * I32(PAD_L) + cv
-                if SCMASK:
-                    for j in range_constexpr(4):
-                        gcj = bk * I32(BKv) + cv + I32(j)
-                        vj = bo.buffer_load(
-                            rx, gbase + lr * I32(K) + cv + I32(j), vec_width=1, dtype=BF, mask=(gcj < I32(K))
-                        )
-                        pj = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase + I32(j)))
-                        fx.make_view(pj, fx.make_layout(1, 1)).store(Vec.from_elements([vj], elt))
-                else:
-                    ioff = gbase + lr * I32(K) + cv
-                    if LMASK:
-                        ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(0x7FFFFFFF))
-                    v = bo.buffer_load(rx, ioff, vec_width=4, dtype=BF)
-                    p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
-                    fx.make_view(p, fx.make_layout(4, 1)).store(Vec(v))
-        _llvm.inline_asm(
-            res=None,
-            operands_=[],
-            asm_string="s_waitcnt vmcnt(0) lgkmcnt(0)",
-            constraints="",
-            has_side_effects=True,
-        )
-        rocdl.s_barrier()
-        half = t // I32(HALF)
-        lt = t - half * I32(HALF)
-        if half == z:
-            # ROW half: thread -> (row, kb) = (lt//NKB, lt%NKB); bm rows x NKB K-blocks of 32.
-            row = lt // I32(NKB)
-            kb = lt - row * I32(NKB)
-            loff = row * I32(PAD_L) + kb * I32(32)
-            chunks = []
-            for i in range_constexpr(8):
-                p = fx.add_offset(tile.ptr, fx.make_int_tuple(loff + I32(4 * i)))
-                chunks.append(Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32))
-            amax = F32(0.0)
-            for i in range_constexpr(8):
-                a = fm.absf(chunks[i]).reduce("max")
-                amax = (amax > a).select(amax, a)
-            grow = br * I32(BMv) + row
-            gcol0 = bk * I32(BKv) + kb * I32(32)
-            ep = _ep(amax, va, ep_sub)
-            inv = F32(1.0) / fm.exp2(ep.to(F32))
-            rqr = make_row_band_resource(bo.extract_base_index(Qr), z, I32(Mp), I32(Kp), 1)
-            words = []
-            for wi in range_constexpr(8):
-                qf = chunks[wi] * inv
-                word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
-                word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
-                words.append(word)
-            # Coalesce 8 scalar 4B stores -> 2 vec4 (16B) stores (32 contiguous cols).
-            row_byte0 = grow * I32(Kp) + gcol0
-            for v in range_constexpr(2):
-                v4 = Vec.from_elements(words[4 * v : 4 * v + 4], fx.Int32)
-                bo.buffer_store(
-                    v4.ir_value(), rqr, row_byte0 + I32(16 * v), cache_modifier=cm_row, offset_is_bytes=True
-                )
-            kcol = bk * I32(BKv // 32) + kb
-            dword, jbyte = _raw_scale_dword(grow, kcol, SCALEN_ROW)
-            _store_scale(ASp, SP_A_BYTES, dword, jbyte, ep + I32(127), 4, None, cm=cm_row)
-        else:
-            # COL half: thread -> (c, mblk) = (lt//NMB, lt%NMB); c = K-col, mblk = M-block of 32.
-            c = lt // I32(NMB)
-            mblk = lt - c * I32(NMB)
-            base = fx.add_offset(tile.ptr, fx.make_int_tuple(c + I32(mblk * 32) * I32(PAD_L)))
-            cv2 = Vec(fx.make_view(base, fx.make_layout(32, PAD_L)).load()).to(F32)
-            ca = fm.absf(cv2).reduce("max")
-            camax = (F32(0.0) > ca).select(F32(0.0), ca)
-            cep = _ep(camax, va, ep_sub)
-            cinv = F32(1.0) / fm.exp2(cep.to(F32))
-            cq = cv2 * cinv
-            cwords = []
-            for wi in range_constexpr(8):
-                word = I32(cvt(IRI, _sat(cq[4 * wi + 0], sat_bnd), _sat(cq[4 * wi + 1], sat_bnd), z, 0))
-                word = I32(cvt(IRI, _sat(cq[4 * wi + 2], sat_bnd), _sat(cq[4 * wi + 3], sat_bnd), word, 1))
-                cwords.append(word)
-            # stage the 8 contiguous col words as 2 vec4 LDS stores (c-major; bm M-bytes/K-col)
-            csbase = c * I32(DWPC) + mblk * I32(8)
-            for v in range_constexpr(2):
-                sp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(csbase + I32(4 * v)))
-                fx.make_view(sp, fx.make_layout(4, 1)).store(
-                    Vec.from_elements(cwords[4 * v : 4 * v + 4], fx.Int32)
-                )
-            gc = bk * I32(BKv) + c
-            mcol = br * I32(BMv // 32) + mblk
-            dword_bc, jbyte_bc = _raw_scale_dword(gc, mcol, SCALEN_COL)
-            _store_scale(AtSp, SP_AT_BYTES, dword_bc, jbyte_bc, cep + I32(127), 4, None, cm=cm_col)
-        _llvm.inline_asm(
-            res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)", constraints="", has_side_effects=True
-        )
-        rocdl.s_barrier()
-        # Coalesced transposed write: each thread emits ONE vec4 (16B) store of 4 contiguous
-        # M-dwords of a K-col (DWPC%4==0 keeps them inside one K-col); consecutive lanes walk M
-        # so the wave coalesces one bm-byte burst per K-col.
-        raqd = make_row_band_resource(bo.extract_base_index(AtQd), z, I32(Kp), I32(Mp), 1)
-        mbase = br * I32(BMv)
-        for it in range_constexpr(CW_ITERS_V):
-            lo = (t + I32(it * NTHv)) * I32(4)
-            cc = lo // I32(DWPC)
-            dwi0 = lo - cc * I32(DWPC)
-            rp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(lo))
-            v4 = Vec(fx.make_view(rp, fx.make_layout(4, 1)).load())
-            gc = bk * I32(BKv) + cc
-            bo.buffer_store(
-                v4.ir_value(),
-                raqd,
-                gc * I32(Mp) + mbase + dwi0 * I32(4),
-                cache_modifier=cm_col,
-                offset_is_bytes=True,
-            )
-
-    @flyc.jit
-    def launch(
-        X: fx.Tensor, Qr: fx.Tensor, ASp: fx.Tensor, AtQd: fx.Tensor, AtSp: fx.Tensor, stream: fx.Stream
-    ):
-        grid = NBM * NBK
-        kern(X, Qr, ASp, AtQd, AtSp).launch(grid=(grid, 1, 1), block=(NTHv, 1, 1), stream=stream)
-
-    return launch
-
-
-_RAW_QDUAL_CACHE: dict = {}
-
-
 def _qdual_tile_cfg(M, K, Mp, Kp):
-    """Per-shape tile config for compile_qdual (all bit-identical; measured on MI355X/gfx950 over
-    Llama shapes). Default bm=128,bk=128 (1024 thr): BOTH ROW and COL get full 128B write bursts,
-    beating the bm=64 half-line-COL default 1.07-1.17x (write-burst granularity is the limiter,
-    not occupancy). Large-K small-M (Kp>=8192, Mp<=4096) prefers bm=128,bk=64 + grid swizzle (anti
-    DRAM-channel camping). PT_QDUAL_CFG='bm,bk,nth' overrides for A/B."""
-    import os
-
-    _ov = os.environ.get("PT_QDUAL_CFG")
-    if _ov:
-        b, k, n = (int(x) for x in _ov.split(","))
-        return dict(bm=b, bk=k, nth=n, pad_extra=4)
+    """Per-shape tile config for the dual-cast quant kernel (all bit-identical). Default bm=128,bk=128 gives
+    BOTH ROW and COL a full 128B write burst (write-burst granularity is the limiter, not
+    occupancy). Large-K small-M (Kp>=8192, Mp<=4096) uses bm=128,bk=64 + grid swizzle to avoid
+    DRAM-channel camping."""
     if Kp >= 8192 and Mp <= 4096:
         return dict(bm=128, bk=64, pad_extra=4, grid_swz=True)
     return dict(bm=128, bk=128, nth=1024, pad_extra=4)
 
 
 # ============================================================================
-# Batched dense dual-cast quant: same [bm x bk] tile / dual-cast body as ``compile_qdual`` plus a
-# batch dim so all B experts of a uniform [B, M, K] weight are quantized in ONE launch (grid =
-# B*NBM*NBK), replacing the per-expert Python loop + stack. Uniform shapes -> no group search;
-# each workgroup rebases the input + 4 output bands by batch id + adds a per-batch scale byte base.
-# Per-expert bit-identical to ``compile_qdual``.
+# Dense dual-cast quant, batched over B experts (B=1 covers the plain 2D case). Grid = B*NBM*NBK
+# quantizes all experts of a uniform [B, M, K] input in ONE launch (no per-expert Python loop).
+# Each workgroup handles one (batch, M-tile, K-tile) and rebases the input + 4 output bands by
+# batch id + a per-batch scale byte base (all 0 for B=1).
 
 
-def compile_qdual_batched(
+def compile_qdual(
     B,
     M,
     K,
@@ -390,11 +168,11 @@ def compile_qdual_batched(
     bk=128,
     nth=512,
 ):
-    """Batched ``compile_qdual``: quantize B experts of [B, M, K] in one launch.
-    Buffers are stacked per-expert (row fp8 [B, Mp, Kp], col fp8 [B, Kp, Mp], raw
-    E8M0 row/col scales [B, ...]); each workgroup handles one (batch, M-tile, K-tile).
-    See ``compile_qdual`` for the tile / dual-cast math; the only additions are the
-    per-batch rebase of the input + 4 output bands and the per-batch scale byte base."""
+    """Dense dual-cast mxfp8 quant, batched over B experts (B=1 = plain 2D). Tile [bm x bk]
+    (bm*bk==16*nth); ROW half writes fp8+E8M0, COL half stages the transpose through LDS for a
+    coalesced write-back (see file-header contract). Real-dim per-expert buffers (row [B,M,Kp],
+    col [B,K,Mp]); each workgroup does one (batch, M-tile, K-tile), masking pad rows/cols. Tile
+    shape trades the full-128B-burst side; grid_swz = column-major pids (anti DRAM camping)."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
@@ -471,7 +249,7 @@ def compile_qdual_batched(
                 pbase = lr * I32(PAD_L) + cv
                 ioff = gbase + lr * I32(K) + cv
                 if LMASK:
-                    ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(0x7FFFFFFF))
+                    ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(_OOB))
                 v = bo.buffer_load(rx, ioff, vec_width=8, dtype=BF)
                 p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
                 fx.make_view(p, fx.make_layout(8, 1)).store(Vec(v))
@@ -493,7 +271,7 @@ def compile_qdual_batched(
                 else:
                     ioff = gbase + lr * I32(K) + cv
                     if LMASK:
-                        ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(0x7FFFFFFF))
+                        ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(_OOB))
                     v = bo.buffer_load(rx, ioff, vec_width=4, dtype=BF)
                     p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
                     fx.make_view(p, fx.make_layout(4, 1)).store(Vec(v))
@@ -647,7 +425,7 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype):
     key = (B, M, K, Mp, Kp, x_3d.dtype, out_dtype)
     comp = _RAW_QDUAL_BATCHED_CACHE.get(key)
     if comp is None:
-        launch = compile_qdual_batched(
+        launch = compile_qdual(
             B, M, K, elt=in_elt(x_3d.dtype), out_fp8=out_fp8, Mp=Mp, Kp=Kp, **_qdual_tile_cfg(M, K, Mp, Kp)
         )
         comp = _flyc.compile(launch, x_3d, Qr, ASp, AtQd, AtSp, stream)
@@ -725,13 +503,7 @@ def compile_grouped_qdual(
     assert M_pad_col % 128 == 0 and M_pad_row % 64 == 0
     # bm=64,bk=128 (512 thr): the robust grouped choice -- the bm=128 dense big-tile is neutral/
     # worse here (the 4 per-tile scalar metadata loads need occupancy to hide, bm=128 starves it).
-    import os
-
-    _ov = os.environ.get("PT_GQDUAL_CFG")  # "bm,bk,nth" A/B override
-    if _ov:
-        bm, bk, nth = (int(v) for v in _ov.split(","))
-    else:
-        bm, bk, nth = 64, 128, 512
+    bm, bk, nth = 64, 128, 512
     assert bm * bk == 16 * nth and 128 % bm == 0 and bm % 32 == 0 and bk % 32 == 0
     BMv, BKv, NTHv = bm, bk, nth
     HALF = NTHv // 2
@@ -905,7 +677,7 @@ def compile_grouped_qdual(
             fcol = bkc * I32(BKv) + cv
             ioff = lr * I32(N) + fcol
             if LMASK:
-                ioff = (fcol < I32(N)).select(ioff, I32(0x7FFFFFFF))
+                ioff = (fcol < I32(N)).select(ioff, I32(_OOB))
             v = bo.buffer_load(rx, ioff, vec_width=8, dtype=BF)
             p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
             fx.make_view(p, fx.make_layout(8, 1)).store(Vec(v))
@@ -951,7 +723,7 @@ def compile_grouped_qdual(
             # Coalesce 8 fp8 words (32 contiguous cols) into 2 vec4 (16B) stores.
             row_byte0 = row * I32(N_pad) + gcol0  # local row within the [rowbase_out, ...) band
             for v in range_constexpr(2):
-                off = row_ok.select(row_byte0 + I32(16 * v), I32(0x7FFFFFFF))
+                off = row_ok.select(row_byte0 + I32(16 * v), I32(_OOB))
                 v4 = Vec.from_elements(words[4 * v : 4 * v + 4], fx.Int32)
                 bo.buffer_store(v4.ir_value(), rqr, off, cache_modifier=_CM, offset_is_bytes=True)
             kcol = bkc * I32(BKv // 32) + kb
@@ -1082,44 +854,12 @@ _GROUPED_QDUAL_CACHE: dict = {}
 def quant_mxfp8_raw(x, out_dtype):
     """FlyDSL raw-E8M0 dual-cast mxfp8 quant for an ARBITRARY 2D [M,K] input (NO host padding),
     bit-for-bit matching the C++ quantize_mxfp8_dual layout: fp8 [M,Kp] row / [K,Mp] col
-    (Kp=ceil(K/128)*128, Mp=ceil(M/128)*128) + plain row-major E8M0 scales [free, contract//32]
-    viewed as float8_e8m0fnu. Returns (row_fp8, row_scale, col_fp8, col_scale)."""
-    import flydsl.compiler as _flyc
-    import torch
-
+    (Kp=ceil(K/128)*128, Mp=ceil(M/128)*128) + plain row-major E8M0 scales viewed as
+    float8_e8m0fnu. Returns (row_fp8, row_scale, col_fp8, col_scale). Delegates to the B-batched
+    path with B=1 (one shared quant kernel; the 2D result is the B=0 slice)."""
     assert x.ndim == 2, f"quant_mxfp8_raw expects 2D, got {x.ndim}D"
-
-    out_fp8 = "e5m2" if out_dtype == torch.float8_e5m2 else "e4m3"
-    M, K = x.shape
-    Mp, Kp = _ceil128(M), _ceil128(K)
-    key = (M, K, Mp, Kp, x.dtype, out_dtype)
-    comp = _RAW_QDUAL_CACHE.get(key)
-    Qr = torch.empty(Mp, Kp, dtype=out_dtype, device=x.device)
-    AtQd = torch.empty(Kp, Mp, dtype=out_dtype, device=x.device)
-    # No zero-init needed: every in-range scale byte is written exactly once by a native
-    # byte store, and the consumer reads only [:nbytes] (the dword-alignment pad is unread).
-    ASp = torch.empty(raw_scale_int32(Mp, Kp), dtype=torch.int32, device=x.device)
-    AtSp = torch.empty(raw_scale_int32(Kp, Mp), dtype=torch.int32, device=x.device)
-    stream = torch.cuda.current_stream()
-    if comp is None:
-        launch = compile_qdual(
-            M,
-            K,
-            elt=in_elt(x.dtype),
-            out_fp8=out_fp8,
-            Mp=Mp,
-            Kp=Kp,
-            **_qdual_tile_cfg(M, K, Mp, Kp),
-        )
-        comp = _flyc.compile(launch, x, Qr, ASp, AtQd, AtSp, stream)
-        _RAW_QDUAL_CACHE[key] = comp
-    comp(x, Qr, ASp, AtQd, AtSp, stream)
-    e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
-    row_fp8 = Qr[:M, :Kp].contiguous()
-    row_scale = ASp.view(torch.uint8)[: Mp * (Kp // 32)].view(Mp, Kp // 32)[:M].contiguous().view(e8)
-    col_fp8 = AtQd[:K, :Mp].contiguous()
-    col_scale = AtSp.view(torch.uint8)[: Kp * (Mp // 32)].view(Kp, Mp // 32)[:K].contiguous().view(e8)
-    return row_fp8, row_scale, col_fp8, col_scale
+    row_fp8, row_scale, col_fp8, col_scale = quant_mxfp8_raw_batched(x.unsqueeze(0), out_dtype)
+    return row_fp8[0], row_scale[0], col_fp8[0], col_scale[0]
 
 
 def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
