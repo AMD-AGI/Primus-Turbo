@@ -2386,7 +2386,11 @@ def _get_dq(topk_len, scale, num_heads=None):
         # PV-K32: per-16 QK/softmax kept, PV batches 2 tiles into mfma_16x16x32 with direct-v8
         # operands. Gated to large-topk (topk>=512, even tile count); small-topk pair-batch's
         # per-pair WAR barrier overhead loses. Both dQ kernels pin dq_acc in AGPR via inline-asm.
-        if topk_len >= 512 and topk_len % 32 == 0:
+        # FIX (dsv4 cr=4 bwd dQ race): gate lowered 512 -> 384. build_bwd_dq (topk<512,
+        # single-tile + delta-fold) has a nondeterministic cross-wave race corrupting dq
+        # d-tile 0 at TOPK=384 (cr=4 S=1024). build_bwd_dq_pvk32 (per-pair WAR barrier) is
+        # race-free and handles any even tile count; the 512 gate was perf-only.
+        if topk_len >= 384 and topk_len % 32 == 0:
             fn = build_bwd_dq_pvk32(topk_len, float(scale), num_heads=num_heads)
         else:
             fn = build_bwd_dq(topk_len, float(scale), num_heads=num_heads)
@@ -2533,7 +2537,9 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     # The fused kernel (flash small-topk) AND build_bwd_dq (pro cr0/cr128, topk<512) both fold the
     # delta compute inline (dO already resident), dropping the standalone delta off the wall. Only
     # the pvk32 dQ path (cr4, topk>=512) still needs the standalone kernel.
-    dq_folds_delta = (not use_fused) and (int(topk) < 512)
+    # FIX (dsv4 cr=4 bwd dQ race): threshold 512 -> 384, coupled with `_get_dq` so TOPK=384
+    # routes through the race-free pvk32 path (+ standalone delta / no-O args).
+    dq_folds_delta = (not use_fused) and (int(topk) < 384)
     if not (use_fused or dq_folds_delta):
         # flydsl delta = rowsum(O*dO), fp32 (replaces the triton _bwd_delta_kernel).
         _dstream = torch.cuda.current_stream()
@@ -2651,7 +2657,20 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     # (skips the CSR argsort/bincount/cumsum + InvPtr/InvData buffers entirely; the
     # inverse window map is closed-form). Bit-exact vs the CSR path.
     is_cr0 = (num_kv == total_tokens) and (topk == 128)
-    is_cr128 = (num_kv > total_tokens) and (topk <= 256)
+    # FIX (dsv4 cr=4 small-seq dkv): the cr=128 (HCA) closed-form pool gather assumes a
+    # DETERMINISTIC causal pool (pool_cr = T/npool = 128). The bare `topk <= 256` test also
+    # catches cr=4 (CSA, RANDOM pool) at small seq (S<=512 -> topk<=256), routing its random
+    # pool through the closed-form gather -> wrong dkv/dpool. Guard with the same
+    # deterministic-pool condition the forward uses (T % npool == 0 and T // npool >= 64) so
+    # cr=4 (pool_cr=4) always falls through to the CSR gather. Production S=4096 (topk>256)
+    # was already CSR; this only rescues the small-seq cr=4 shapes.
+    _npool_bwd = num_kv - total_tokens
+    is_cr128 = (
+        _npool_bwd > 0
+        and topk <= 256
+        and total_tokens % _npool_bwd == 0
+        and (total_tokens // _npool_bwd) >= 64
+    )
     if is_cr0:
         _gargs = (interm.reshape(-1, D), dkv, int(num_kv), int(total_tokens), stream)
         _gc = _GATHER_CACHE.get("cb")

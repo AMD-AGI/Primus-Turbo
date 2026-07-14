@@ -497,7 +497,11 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
                     lm_f0 = fx.Float32(arith.MaxNumFOp(_raw(lm_f0), _raw(sa_f0[i] + fx.Float32(_raw(Vec(ma_f0)[i])))).result)
                 for i in range_constexpr(4):
                     lm_f0 = fx.Float32(arith.MaxNumFOp(_raw(lm_f0), _raw(sb_f0[i] + fx.Float32(_raw(Vec(mb_f0)[i])))).result)
-                _mb[0] = crossgrp_max(lm_f0)
+                # FIX (dsv4 cr=4 fwd NaN): floor the first-pair fixed-max bound to finite. A
+                # fully-masked first key-pair (query t<96 -> SWA slots all -1 -> -inf) makes
+                # crossgrp_max=-inf -> exp2(score-(-inf))=+inf -> NaN. maxnumf(.,0) floors it;
+                # fp_max>0 unchanged, bf16 rel-precision magnitude-independent -> speed-neutral.
+                _mb[0] = fx.Float32(arith.MaxNumFOp(_raw(crossgrp_max(lm_f0)), _raw(c_zero)).result)
             idx2 = load_topk(TWO * MK)
             idx3 = load_topk(fx.Index(3) * MK)
             xinit = [c_big_neg, c_zero] + [c_zero_v4 for _ in range_constexpr(DT)] + [idx2, idx3]
@@ -551,7 +555,8 @@ def build_fwd(topk_len, scale, has_sink=True, banded=False, qk2=False, pool_P=0,
                     lm_f0 = fx.Float32(arith.MaxNumFOp(_raw(lm_f0), _raw(sa_f0[i] + fx.Float32(_raw(Vec(ma_f0)[i])))).result)
                 for i in range_constexpr(4):
                     lm_f0 = fx.Float32(arith.MaxNumFOp(_raw(lm_f0), _raw(sb_f0[i] + fx.Float32(_raw(Vec(mb_f0)[i])))).result)
-                _mb[0] = crossgrp_max(lm_f0)
+                # FIX (dsv4 cr=4 fwd NaN): floor the fixed-max bound to finite (see pstore path).
+                _mb[0] = fx.Float32(arith.MaxNumFOp(_raw(crossgrp_max(lm_f0)), _raw(c_zero)).result)
                 gpu.barrier()
             # 2-tile-batch PV K=32 (non-banded)
             idx2 = load_topk(fx.Index(2) * fx.Index(TILE_K))
