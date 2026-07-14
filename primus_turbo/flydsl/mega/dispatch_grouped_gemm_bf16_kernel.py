@@ -147,6 +147,8 @@ def _make_kernel(
             go_base = fx.arith.ArithValue(
                 arith.index_cast(fx.T.i64(), extract_base_index(GROUP_OFFS)), signed=True
             )
+            # tn reuses TILE_TO_GROUP to carry per-expert REAL token counts (K bound)
+            real_count_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         else:
             group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
             num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
@@ -185,7 +187,9 @@ def _make_kernel(
                     block_m = local // fx.Int32(N_BLOCKS_N)
                     block_n = local % fx.Int32(N_BLOCKS_N)
                 m_start = cast(ld(go_base, group_idx, dtype=fx.T.i64()), fx.T.i32())
-                m_end = cast(ld(go_base, group_idx + fx.Int32(1), dtype=fx.T.i64()), fx.T.i32())
+                # bound K to REAL rows: [m_start, m_start+real); padding tail never read
+                real_count = buffer_load(real_count_resource, group_idx, vec_width=1, dtype=fx.T.i32())
+                m_end = m_start + real_count
                 ge_blk = bank_offset + group_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
@@ -511,7 +515,13 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)
         output = torch.empty(out_shape, device=x.device, dtype=out_dtype)
         weight_arg, output_arg = rhs.contiguous(), output.view(-1)
-        tile_arg, num_tile_arg, group_offs_arg = dummy_i32, dummy_i32, num_tokens_per_expert_prefix
+        # Bound the wgrad K-contraction to each expert's REAL (unpadded) token count so the
+        # GEMM never reads stale block-padding rows (the dW1 floor). real[e] = sum over source
+        # ranks of the combine recv counts (seg = e*num_ranks + src). Passed via the TILE arg,
+        # which the tn path otherwise ignores. Bounds-clamped buffers zero the partial tail tile.
+        combine_recv_count = _combine_recv_and_pool_src[2]  # handle[11]
+        real_count = combine_recv_count.view(G, num_ranks).sum(dim=1).to(torch.int32).contiguous()
+        tile_arg, num_tile_arg, group_offs_arg = real_count, dummy_i32, num_tokens_per_expert_prefix
         c_n, out_m_rt, out_n_rt = 0, int(OUT_M), int(OUT_N)
         out_features_ce, hidden_size_ce = OUT_N, OUT_M
     else:
