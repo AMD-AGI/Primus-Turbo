@@ -149,7 +149,10 @@ def compile_grouped_mxfp4_qdual(total_M, N, G, M_pad_col, N_pad, row_rht, col_rh
         for g in range_constexpr(G):
             prev = go_vals[g]
             nxt = go_vals[g + 1]
-            lpad = ((nxt - prev + I32(127)) // I32(128)) * I32(128)
+            # 512-align each group's colwise (wgrad-contraction) span: the mxfp4 whole-loop
+            # wgrad runs an even count of 256-K blocks (unroll-2), so per-group M must be a
+            # 512-multiple -- emit it here (zero pad) so the wgrad needs no on-GPU repack.
+            lpad = ((nxt - prev + I32(511)) // I32(512)) * I32(512)
             acc_next = acc + lpad
             inq = (base_c >= acc) & (base_c < acc_next)
             oc_g = arith.select(inq, acc, oc_g)
@@ -308,7 +311,7 @@ def grouped_quant_mxfp4_raw(x, group_lens, group_offs, fp4_dtype, row_rht, col_r
     G = int(group_lens.shape[0])
     assert N % MB == 0, f"N must be a multiple of {MB}"
     N_pad = (N + 127) // 128 * 128
-    M_pad_col = (total_M + G * 128 + 127) // 128 * 128
+    M_pad_col = (total_M + G * 512 + 511) // 512 * 512  # 512-align per-group col (wgrad)
 
     dev = x.device
     row_out = torch.empty(total_M, N_pad // 2, dtype=torch.uint8, device=dev)

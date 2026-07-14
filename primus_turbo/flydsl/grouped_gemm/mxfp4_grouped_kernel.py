@@ -672,6 +672,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
     N_BLOCKS_M = ceildiv(OUT_M, BLOCK_M)
     N_BLOCKS_N = ceildiv(OUT_N, BLOCK_N)
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
+    _NV = OUT_N if (OUT_N % BLOCK_N != 0) else None  # non-256 OUT_N: mask store cols >= OUT_N
     TOTAL = G * TILES_PER_GROUP
 
     _anns = {f"A_lds{i}": fx.Array[fx.Float8E4M3FN, a_lds_size, 16] for i in range_constexpr(NABUF)}
@@ -813,8 +814,8 @@ def _build_grouped_mxfp4_wgrad_kernel(
         base_col_l = b_row + I32(wave_n_off)
         base_col_r = b_row + I32(LDS_BN_HALF) + I32(wave_n_off)
         store_c = StoreCPlain(C, (group_idx + I32(1)) * I32(OUT_M), OUT_N, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty)
-        store_c.store(accL, base_row, base_col_l)
-        store_c.store(accR, base_row, base_col_r)
+        store_c.store(accL, base_row, base_col_l, n_valid=_NV)
+        store_c.store(accR, base_row, base_col_r, n_valid=_NV)
 
     _pt = {"passthrough": [["amdgpu-agpr-alloc", "256"]]}
     attrs = {"rocdl.flat_work_group_size": "256,256", "rocdl.waves_per_eu": OCC, **_pt}
@@ -871,92 +872,31 @@ def _compile_grouped_mxfp4_wgrad_fused(OUT_M, OUT_N, G, M_total, gm, xcd, gn, wl
     return launch, TOTAL
 
 
-def _repad_col_512(op8, sc8, old_offs_blk, new_offs_blk, G, M_alloc, n_blk_src, src_idx):
-    """GPU gather (sync-free) repack of a 128-padded col operand to the 512-aligned
-    per-group layout the whole-loop wgrad needs. op8 [OUT, M128/2] fp4, sc8 [OUT, M128/32]
-    E8M0 (uint8). ``src_idx`` [M_alloc/128] is the shared dest-block -> source-block gather
-    map (trailing sentinel index n_blk_src == a zero block feeds the pad)."""
-    OUT = op8.shape[0]
-    dev = op8.device
-    # fp4: 64 uint8 / 128-block; scale: 4 uint8 / 128-block. Append a zero block, gather.
-    op_r = op8.reshape(OUT, n_blk_src, 64)
-    op_z = torch.zeros(OUT, 1, 64, dtype=op8.dtype, device=dev)
-    op_out = torch.cat([op_r, op_z], dim=1).index_select(1, src_idx).reshape(OUT, M_alloc // 2)
-    sc_r = sc8.reshape(OUT, n_blk_src, 4)
-    sc_z = torch.zeros(OUT, 1, 4, dtype=sc8.dtype, device=dev)
-    sc_out = torch.cat([sc_r, sc_z], dim=1).index_select(1, src_idx).reshape(OUT, M_alloc // 32)
-    return op_out.contiguous(), sc_out.contiguous()
-
-
-def _wgrad_col_gather_idx(old_offs_blk, new_offs_blk, G, M_alloc, n_blk_src, dev):
-    """Shared dest-128-block -> source-128-block gather index (sync-free). Dest blocks past
-    the real per-group data (or past new_offs[G]) map to the sentinel zero block."""
-    NB = M_alloc // 128
-    blk = torch.arange(NB, device=dev)
-    # clamp to [0, G-1]: dest blocks past new_offs[G] map to the sentinel zero block via
-    # ``valid`` below, but g must stay in range to index old_* without an OOB gather fault.
-    g = torch.clamp(torch.searchsorted(new_offs_blk, blk, right=True) - 1, min=0, max=G - 1)
-    within = blk - new_offs_blk[g]
-    old_len = old_offs_blk[1:] - old_offs_blk[:-1]
-    valid = (blk < new_offs_blk[G]) & (within < old_len[g])
-    return torch.where(valid, old_offs_blk[g] + within, torch.full_like(blk, n_blk_src))
-
-
 def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     lhs, lhs_scale, rhs, rhs_scale, group_offs, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=-1
 ):
-    """FlyDSL MXFP4 grouped variable-K wgrad (bare-asm whole-loop). lhs [OUT_M, M128/2] /
-    rhs [OUT_N, M128/2] fp4 in the 128-padded per-group col layout, group_offs [G+1] the
-    matching 128-padded per-group M offsets. Repacks the contraction to 512-aligned per
-    group (whole-loop unroll-2 needs an even 256-block count) on-GPU, then runs the NT
-    whole-loop with a runtime nval. Returns C [G, OUT_M, OUT_N]."""
+    """FlyDSL MXFP4 grouped variable-K wgrad (bare-asm whole-loop). lhs [OUT_M, M/2] /
+    rhs [OUT_N, M/2] fp4 in the FlyDSL-quant colwise layout (each group's M already
+    512-aligned), group_offs [G+1] the matching 512-padded per-group M offsets. Runs the
+    NT whole-loop with a runtime nval directly -- no on-GPU repack, no free-dim pad (the
+    non-256 OUT_M rows are SRD-dropped, OUT_N cols masked in the store). Returns
+    C [G, OUT_M, OUT_N]."""
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == OUT_M and rhs.shape[0] == OUT_N
-    M128 = lhs.shape[1] * 2  # 128-padded contraction (packed /2)
-    assert rhs.shape[1] * 2 == M128
+    M_total = lhs.shape[1] * 2  # colwise contraction width (512-padded per group by the quant)
+    assert rhs.shape[1] * 2 == M_total
     dev = lhs.device
     out_fp16 = out_dtype == torch.float16
 
-    go = (group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)).view(-1)
-    old_offs_blk = (go // 128).to(torch.int64)
-    old_len_blk = old_offs_blk[1:] - old_offs_blk[:-1]
-    new_len_blk = ((old_len_blk + 3) // 4) * 4  # 512 = 4 * 128-blocks
-    new_offs_blk = torch.zeros(G + 1, dtype=torch.int64, device=dev)
-    new_offs_blk[1:] = new_len_blk.cumsum(0)
-    # baked 512-padded width upper bound (host-known -> no D2H sync): each group grows
-    # by < 512 over its 128-pad, so M128 + G*512 rounded to 512 always covers new_offs[G].
-    M_alloc = ((M128 + G * 512 + 511) // 512) * 512
-    n_blk_src = M128 // 128
-    src_idx = _wgrad_col_gather_idx(old_offs_blk, new_offs_blk, G, M_alloc, n_blk_src, dev)
+    a8 = lhs.contiguous().view(torch.int8).reshape(-1)
+    b8 = rhs.contiguous().view(torch.int8).reshape(-1)
+    a_raw = lhs_scale.contiguous().view(torch.int32).reshape(-1)
+    b_raw = rhs_scale.contiguous().view(torch.int32).reshape(-1)
+    go_pad = (group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)).view(torch.int32)
 
-    la = lhs.contiguous().view(torch.uint8)
-    lsc = lhs_scale.contiguous().view(torch.uint8)
-    ra = rhs.contiguous().view(torch.uint8)
-    rsc = rhs_scale.contiguous().view(torch.uint8)
-    la, lsc = _repad_col_512(la, lsc, old_offs_blk, new_offs_blk, G, M_alloc, n_blk_src, src_idx)
-    ra, rsc = _repad_col_512(ra, rsc, old_offs_blk, new_offs_blk, G, M_alloc, n_blk_src, src_idx)
-
-    # StoreCPlain's MN-aligned fast path (no col mask) + the 256-tiled whole-loop need
-    # OUT_M/OUT_N as 256-multiples: pad the operand rows with zeros (contribute nothing),
-    # run over the padded free dims, then slice the real region out of C.
-    OUT_M_p = (OUT_M + 255) // 256 * 256
-    OUT_N_p = (OUT_N + 255) // 256 * 256
-    if OUT_M_p != OUT_M:
-        la = F.pad(la, (0, 0, 0, OUT_M_p - OUT_M))
-        lsc = F.pad(lsc, (0, 0, 0, OUT_M_p - OUT_M))
-    if OUT_N_p != OUT_N:
-        ra = F.pad(ra, (0, 0, 0, OUT_N_p - OUT_N))
-        rsc = F.pad(rsc, (0, 0, 0, OUT_N_p - OUT_N))
-
-    a8 = la.view(torch.int8).reshape(-1)
-    b8 = ra.view(torch.int8).reshape(-1)
-    a_raw = lsc.view(torch.int32).reshape(-1)
-    b_raw = rsc.view(torch.int32).reshape(-1)
-    go_pad = (new_offs_blk * 128).view(torch.int32)
-
-    K128m = M_alloc // 128
-    a_sp, b_sp = _get_grouped_mxfp4_wgrad_ws(OUT_M_p, OUT_N_p, K128m, dev)
-    out = torch.empty((G, OUT_M_p, OUT_N_p), dtype=out_dtype, device=dev)
+    K128m = M_total // 128
+    a_sp, b_sp = _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, dev)
+    out = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=dev)
     out_flat = out.view(-1)
 
     stream = torch.cuda.current_stream()
@@ -965,14 +905,14 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
 
     def _entry(cfg):
         gm, xcd, gn = cfg
-        lk = (OUT_M_p, OUT_N_p, G, M_alloc, gm, xcd, gn, wlv, elgk, out_fp16)
+        lk = (OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16)
         ent = _GMXFP4_WGRAD_LAUNCH_CACHE.get(lk)
         if ent is None:
             ent = _compile_grouped_mxfp4_wgrad_fused(
-                OUT_M_p, OUT_N_p, G, M_alloc, gm, xcd, gn, wlv, elgk, out_fp16
+                OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16
             )
             _GMXFP4_WGRAD_LAUNCH_CACHE[lk] = ent
-        atk = (OUT_M_p, OUT_N_p, M_alloc, G, gm, xcd, gn, out_fp16)
+        atk = (OUT_M, OUT_N, M_total, G, gm, xcd, gn, out_fp16)
         e2 = _GMXFP4_WGRAD_AT_CACHE.get(atk)
         if e2 is None:
             e2 = [ent[0], None]
@@ -981,7 +921,7 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
 
     capturing = torch.cuda.is_current_stream_capturing()
     cfg = _grouped_mxfp4_pick_cfg(
-        _GMXFP4_CFG_CACHE, _GMXFP4_CANDS, (OUT_M_p, OUT_N_p, M_alloc, G, out_fp16), capturing, _entry, args, (2, 1, 4)
+        _GMXFP4_CFG_CACHE, _GMXFP4_CANDS, (OUT_M, OUT_N, M_total, G, out_fp16), capturing, _entry, args, (2, 1, 4)
     )
     run_eager_or_capture(_entry(cfg), args, 1)
-    return out[:, :OUT_M, :OUT_N] if (OUT_M_p != OUT_M or OUT_N_p != OUT_N) else out
+    return out
