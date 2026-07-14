@@ -232,43 +232,60 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
     return launch
 
 
+def colwise_grouped_meta(group_lens: torch.Tensor, group_offs: torch.Tensor):
+    """Precompute the (device) grouping metadata for the grouped colwise quant.  Both dW2
+    operands share the same group structure, so compute this ONCE and pass to both calls
+    (avoids re-running cumsum/repeat_interleave + the total_M_pad D2H twice)."""
+    dev = group_lens.device
+    lens = group_lens.to(torch.int32)
+    lens_pc = ((lens + 127) // 128) * 128                                   # pad each group M to 128
+    offs_pc = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=dev), torch.cumsum(lens_pc, 0)]
+    ).to(torch.int32)
+    total_M_pad = int(offs_pc[-1].item())                                   # D2H (sizes output/grid)
+    n_pblk = total_M_pad // _BLK
+    # group id per 32-M block via searchsorted on the block offsets (fixed output size =>
+    # no hidden D2H, unlike repeat_interleave which syncs to size its dynamic output).
+    blk2grp = (
+        torch.searchsorted(
+            offs_pc // _BLK, torch.arange(n_pblk, dtype=torch.int32, device=dev), right=True
+        )
+        - 1
+    ).to(torch.int32)
+    return {
+        "lens": lens, "lens_pc": lens_pc, "offs_pc": offs_pc,
+        "offs32": group_offs.to(torch.int32), "blk2grp": blk2grp,
+        "total_M_pad": total_M_pad, "n_pblk": n_pblk,
+    }
+
+
 def colwise_quant_mxfp8_grouped_flydsl(
     x: torch.Tensor, out_dtype: torch.dtype,
-    group_lens: torch.Tensor, group_offs: torch.Tensor, BT: int = 256,
+    group_lens: torch.Tensor = None, group_offs: torch.Tensor = None,
+    meta: dict = None, BT: int = 256,
 ):
     """Grouped colwise (along-M) MXFP8 transpose-quant, per-group M padded to 128.
 
     Args:
         x: bf16 ``[total_M, F]`` (groups stacked along M).
-        group_lens: int ``[G]`` unpadded per-group row counts.
-        group_offs: int ``[G+1]`` unpadded prefix offsets (``group_offs[G] == total_M``).
+        group_lens/group_offs: int ``[G]`` / ``[G+1]`` (unpadded) -- used if ``meta`` is None.
+        meta: precomputed ``colwise_grouped_meta`` (share across both dW2 operands).
 
     Returns ``(q, s, lens_pc, offs_pc)`` (drop-in for the wgrad's colwise operand):
-        q: fp8 ``[F, total_M_pad]``   s: uint8 ``[F, total_M_pad//32]``
-        lens_pc: int ``[G]`` padded per-group lens   offs_pc: int ``[G+1]`` padded prefix offsets.
+        q: fp8 ``[F, total_M_pad]``   s: uint8 ``[F, total_M_pad//32]``.
     """
     assert x.dim() == 2 and x.dtype == torch.bfloat16, "x must be bf16 [total_M, F]"
-    total_M, F = x.shape
+    _, F = x.shape
     is_e5m2 = out_dtype == torch.float8_e5m2
-    dev = x.device
-    lens = group_lens.to(torch.int32)
-    lens_pc = ((lens + 127) // 128) * 128                                   # pad each group M to 128
-    offs_pc = torch.cat([torch.zeros(1, dtype=torch.int32, device=dev), torch.cumsum(lens_pc, 0)]).to(
-        torch.int32
-    )
-    total_M_pad = int(offs_pc[-1].item())                                   # D2H (sizes the output/grid)
-    n_pblk = total_M_pad // _BLK
-    # group id per padded 32-M block (empty groups contribute 0 blocks).
-    blk2grp = torch.repeat_interleave(
-        torch.arange(lens.numel(), dtype=torch.int32, device=dev), (lens_pc // _BLK)
-    ).to(torch.int32)
-    offs32 = group_offs.to(torch.int32)
-
-    q = torch.empty((F, total_M_pad), dtype=out_dtype, device=dev)
-    s = torch.empty((F, n_pblk), dtype=torch.uint8, device=dev)
+    if meta is None:
+        meta = colwise_grouped_meta(group_lens, group_offs)
+    total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
+    q = torch.empty((F, total_M_pad), dtype=out_dtype, device=x.device)
+    s = torch.empty((F, n_pblk), dtype=torch.uint8, device=x.device)
     while F % BT != 0:
         BT //= 2
     _compile_colwise_quant_grouped(F, is_e5m2, BT)(
-        x, q, s, blk2grp, lens, offs32, offs_pc, total_M_pad // 4, n_pblk, n_pblk
+        x, q, s, meta["blk2grp"], meta["lens"], meta["offs32"], meta["offs_pc"],
+        total_M_pad // 4, n_pblk, n_pblk,
     )
-    return q, s, lens_pc, offs_pc
+    return q, s, meta["lens_pc"], meta["offs_pc"]
