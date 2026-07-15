@@ -24,6 +24,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
@@ -101,6 +102,15 @@ def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int =
     _KRD = K128 if k128_rd is None else k128_rd
     n_sub, nd, KK = 2, 4, K128 // 2
     b_dwords_pe = N * K128 // _PRESHUF_NG
+    # LDS-staged coalesced B repack (WG = one (expert, wi); 128 source rows x K128 read COALESCED
+    # into LDS, the 4-row byte-g transpose done in LDS, then coalesced write) when N is 128-aligned.
+    # This fixes the per-thread scattered gather that capped the preshuffle at ~0.4 TB/s (VMEM util
+    # 1%, coalescing 50%). A stays per-thread scattered (minority); non-128 N keeps the old path.
+    _B_LDS = (N % 128 == 0)
+    _WI_PE = (N // 128) if _B_LDS else 0
+    _TILE = 128 * K128
+    if _B_LDS:
+        _PS = fx.struct(type("PSTileFp4", (), {"__annotations__": {"tile": fx.Array[fx.Int32, _TILE, 16]}}))
 
     @flyc.kernel(known_block_size=[_PRESHUF_BLK, 1, 1])
     def kern(
@@ -119,65 +129,150 @@ def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int =
         b_rin = buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=I32(G * N * _KRD) * 4)
         b_rout = buffer_ops.create_buffer_resource(b_out, max_size=False, num_records_bytes=I32(G * N * K128) * 4)
         bid = rocdl.readfirstlane(T.i32, fx.block_idx.x)
-        is_b = bid >= a_grid
-        local = arith.select(is_b, bid - a_grid, bid)
-        gid_all = local * I32(_PRESHUF_BLK) + fx.thread_idx.x
-        rin = arith.select(is_b, b_rin, a_rin)
-        rout = arith.select(is_b, b_rout, a_rout)
-
-        b_expert = gid_all // I32(b_dwords_pe)
-        a_total4 = slab_rows * I32(K128) // I32(_PRESHUF_NG)
-        gid4 = arith.select(is_b, gid_all - b_expert * I32(b_dwords_pe), gid_all)
-        total4 = arith.select(is_b, I32(b_dwords_pe), a_total4)
-        last = gid4 % I32(nd)
-        e1 = gid4 // I32(nd)
-        r = e1 % I32(16)
-        e2 = e1 // I32(16)
-        kk = e2 % I32(KK)
-        wi = e2 // I32(KK)
-        r_region = last // I32(n_sub)
-        s = last % I32(n_sub)
-        k128 = kk * I32(n_sub) + s
-        grp_a = _mxfp4_grp_from(wi, r_region, 0)
-        grp_b = _mxfp4_grp_from(wi, r_region, 1)
-        _blk = ((wi * I32(KK) + kk) * I32(64) + r) * I32(nd) + last
-        base = arith.select(is_b, b_expert * I32(N * K128) + _blk, _blk)
-
-        # A: inline a_pre scan (owning group -> tight source rows rd0..rd_end)
         go_t = rocdl.make_buffer_tensor(go_out, max_size=False, num_records_bytes=(G + 1) * 8)
         go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
-        rd0 = I32(0)
-        rd_end = I32(0)
-        ok_a = I32(0)
-        apre = I32(0)
-        m_prev = _load_go(go_div, 0)
-        for g in range_constexpr(G):
-            m_nxt = _load_go(go_div, g + 1)
-            p0 = apre
-            p1 = apre + ((m_nxt - m_prev + I32(255)) // I32(256)) * I32(4)
-            inq = (grp_a >= p0) & (grp_a < p1)
-            rd0 = arith.select(inq, m_prev + (grp_a - p0) * I32(64), rd0)
-            rd_end = arith.select(inq, m_nxt, rd_end)
-            ok_a = arith.select(inq, I32(1), ok_a)
-            apre = p1
-            m_prev = m_nxt
-        rd_base = b_expert * I32(N)  # B source row base
+        BLK = _PRESHUF_BLK
 
-        okc = arith.select(is_b, (gid4 < I32(b_dwords_pe)) & (b_expert < I32(G)), (gid4 < a_total4) & (ok_a != I32(0)))
-        okc = okc & (k128 < I32(_KRD)) & (gid4 < total4)
-        rsrc_rows = [
-            arith.select(is_b, rd_base + grp_b * I32(64) + I32(t * 16) + r, rd0 + I32(t * 16) + r)
-            for t in range_constexpr(4)
-        ]
-        valid = [
-            okc & arith.select(is_b, grp_b * I32(64) + I32(t * 16) + r < I32(N), rsrc_rows[t] < rd_end)
-            for t in range_constexpr(4)
-        ]
-        words = _pack4(rin, rsrc_rows, k128, valid, _KRD)
-        # store ALL in-range blocks: invalid/pad blocks got words=0 from the masked reads,
-        # so slab-pad / 256-pad regions are written 0 (matches the split a_pre_shuf).
-        for g in range_constexpr(_PRESHUF_NG):
-            buffer_ops.buffer_store(words[g], rout, base + I32(g * 64), mask=gid4 < total4)
+        if const_expr(_B_LDS):
+            tid = fx.thread_idx.x
+            # ===== A slab: per-thread scattered (minority; blocks [0, a_grid)) =====
+            if bid < a_grid:
+                gid4 = bid * I32(BLK) + tid
+                a_total4 = slab_rows * I32(K128) // I32(_PRESHUF_NG)
+                last = gid4 % I32(nd)
+                e1 = gid4 // I32(nd)
+                r = e1 % I32(16)
+                e2 = e1 // I32(16)
+                kk = e2 % I32(KK)
+                wi = e2 // I32(KK)
+                r_region = last // I32(n_sub)
+                s = last % I32(n_sub)
+                k128 = kk * I32(n_sub) + s
+                grp_a = _mxfp4_grp_from(wi, r_region, 0)
+                _blk = ((wi * I32(KK) + kk) * I32(64) + r) * I32(nd) + last
+                rd0 = I32(0)
+                rd_end = I32(0)
+                ok_a = I32(0)
+                apre = I32(0)
+                m_prev = _load_go(go_div, 0)
+                for g in range_constexpr(G):
+                    m_nxt = _load_go(go_div, g + 1)
+                    p0 = apre
+                    p1 = apre + ((m_nxt - m_prev + I32(255)) // I32(256)) * I32(4)
+                    inq = (grp_a >= p0) & (grp_a < p1)
+                    rd0 = arith.select(inq, m_prev + (grp_a - p0) * I32(64), rd0)
+                    rd_end = arith.select(inq, m_nxt, rd_end)
+                    ok_a = arith.select(inq, I32(1), ok_a)
+                    apre = p1
+                    m_prev = m_nxt
+                okc = (gid4 < a_total4) & (ok_a != I32(0)) & (k128 < I32(_KRD))
+                rows = [rd0 + I32(t * 16) + r for t in range_constexpr(4)]
+                valid = [okc & (rows[t] < rd_end) for t in range_constexpr(4)]
+                words = _pack4(a_rin, rows, k128, valid, _KRD)
+                for g in range_constexpr(_PRESHUF_NG):
+                    buffer_ops.buffer_store(words[g], a_rout, _blk + I32(g * 64), mask=gid4 < a_total4)
+            # ===== B: LDS-staged COALESCED repack (WG = one (expert, wi)) =====
+            if bid >= a_grid:
+                tile = fx.SharedAllocator().allocate(_PS).peek().tile
+                bb = bid - a_grid
+                expert = bb // I32(_WI_PE)
+                wi = bb % I32(_WI_PE)
+                grp0 = I32(4) * (wi // I32(2)) + (wi % I32(2))  # grp_b(wi, 0)
+                e_row = expert * I32(N)
+                # read 128 source rows (r_region 0,1 -> blocks grp0, grp0+2) x K128 -> LDS (coalesced)
+                for i in range_constexpr(_TILE // BLK):
+                    idx = tid + I32(i * BLK)
+                    rrow = idx // I32(K128)
+                    k128 = idx % I32(K128)
+                    rregion = rrow // I32(64)
+                    rr = rrow % I32(64)
+                    grp = grp0 + rregion * I32(2)
+                    srow = e_row + grp * I32(64) + rr
+                    dw = buffer_ops.buffer_load(
+                        b_rin, srow * I32(_KRD) + k128, vec_width=1, dtype=T.i32,
+                        mask=(k128 < I32(_KRD)) & (grp * I32(64) + rr < I32(N)),
+                    )
+                    fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
+                        Vec.from_elements([fx.Int32(dw)], fx.Int32)
+                    )
+                wait_barrier(0)
+                # write outputs for this wi (both r_region): coalesced over lane = r*nd + last
+                _NOUT = 16 * nd * _PRESHUF_NG * KK
+                for j in range_constexpr(_NOUT // BLK):
+                    ol = tid + I32(j * BLK)
+                    lane = ol % I32(64)
+                    rest = ol // I32(64)
+                    g = rest % I32(_PRESHUF_NG)
+                    kk = rest // I32(_PRESHUF_NG)
+                    r = lane // I32(nd)
+                    last = lane % I32(nd)
+                    rregion = last // I32(n_sub)
+                    s = last % I32(n_sub)
+                    k128 = kk * I32(n_sub) + s
+                    sh = g * I32(8)
+                    p = I32(0)
+                    for t in range_constexpr(4):
+                        so = rregion * I32(64 * K128) + (I32(t * 16) + r) * I32(K128) + k128
+                        v = Vec(
+                            fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(so)), fx.make_layout(1, 1)).load()
+                        )
+                        p = p | (((fx.Int32(v[0]) >> sh) & I32(0xFF)) << I32(t * 8))
+                    out_flat = expert * I32(N * K128) + ((wi * I32(KK) + kk) * I32(64) + r) * I32(nd) + last + g * I32(64)
+                    buffer_ops.buffer_store(p, b_rout, out_flat)
+        else:
+            is_b = bid >= a_grid
+            local = arith.select(is_b, bid - a_grid, bid)
+            gid_all = local * I32(_PRESHUF_BLK) + fx.thread_idx.x
+            rin = arith.select(is_b, b_rin, a_rin)
+            rout = arith.select(is_b, b_rout, a_rout)
+            b_expert = gid_all // I32(b_dwords_pe)
+            a_total4 = slab_rows * I32(K128) // I32(_PRESHUF_NG)
+            gid4 = arith.select(is_b, gid_all - b_expert * I32(b_dwords_pe), gid_all)
+            total4 = arith.select(is_b, I32(b_dwords_pe), a_total4)
+            last = gid4 % I32(nd)
+            e1 = gid4 // I32(nd)
+            r = e1 % I32(16)
+            e2 = e1 // I32(16)
+            kk = e2 % I32(KK)
+            wi = e2 // I32(KK)
+            r_region = last // I32(n_sub)
+            s = last % I32(n_sub)
+            k128 = kk * I32(n_sub) + s
+            grp_a = _mxfp4_grp_from(wi, r_region, 0)
+            grp_b = _mxfp4_grp_from(wi, r_region, 1)
+            _blk = ((wi * I32(KK) + kk) * I32(64) + r) * I32(nd) + last
+            base = arith.select(is_b, b_expert * I32(N * K128) + _blk, _blk)
+            rd0 = I32(0)
+            rd_end = I32(0)
+            ok_a = I32(0)
+            apre = I32(0)
+            m_prev = _load_go(go_div, 0)
+            for g in range_constexpr(G):
+                m_nxt = _load_go(go_div, g + 1)
+                p0 = apre
+                p1 = apre + ((m_nxt - m_prev + I32(255)) // I32(256)) * I32(4)
+                inq = (grp_a >= p0) & (grp_a < p1)
+                rd0 = arith.select(inq, m_prev + (grp_a - p0) * I32(64), rd0)
+                rd_end = arith.select(inq, m_nxt, rd_end)
+                ok_a = arith.select(inq, I32(1), ok_a)
+                apre = p1
+                m_prev = m_nxt
+            rd_base = b_expert * I32(N)
+            okc = arith.select(
+                is_b, (gid4 < I32(b_dwords_pe)) & (b_expert < I32(G)), (gid4 < a_total4) & (ok_a != I32(0))
+            )
+            okc = okc & (k128 < I32(_KRD)) & (gid4 < total4)
+            rsrc_rows = [
+                arith.select(is_b, rd_base + grp_b * I32(64) + I32(t * 16) + r, rd0 + I32(t * 16) + r)
+                for t in range_constexpr(4)
+            ]
+            valid = [
+                okc & arith.select(is_b, grp_b * I32(64) + I32(t * 16) + r < I32(N), rsrc_rows[t] < rd_end)
+                for t in range_constexpr(4)
+            ]
+            words = _pack4(rin, rsrc_rows, k128, valid, _KRD)
+            for g in range_constexpr(_PRESHUF_NG):
+                buffer_ops.buffer_store(words[g], rout, base + I32(g * 64), mask=gid4 < total4)
 
     return kern
 
@@ -528,7 +623,8 @@ def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k
     gemm_k, attrs, NBK = _build_grouped_mxfp4_nt_kernel(
         K, G, N, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16, k_real=k_real
     )
-    b_pre_grid = ceildiv(G * N * K128, _PRESHUF_NG * _PRESHUF_BLK)
+    # B grid: LDS-staged path uses one WG per (expert, wi=N/128); scattered path is dword-tiled.
+    b_pre_grid = G * (N // 128) if (N % 128 == 0) else ceildiv(G * N * K128, _PRESHUF_NG * _PRESHUF_BLK)
 
     @flyc.jit
     def launch(
