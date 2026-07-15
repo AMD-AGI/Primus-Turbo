@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MXFP8 Mega-MoE Performance Summary</title>
+<style>
+  :root{
+    --bg:#ffffff; --panel:#f6f8fa; --stroke:#d0d7de; --stroke2:#eaeef2;
+    --fg:#1f2328; --muted:#656d76; --dim:#8c959f;
+    --accent:#1a7f37; --accent2:#0969da; --warn:#9a6700; --danger:#cf222e;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;padding:32px}
+  .wrap{max-width:1040px;margin:0 auto}
+  h1{font-size:24px;font-weight:700;margin:0 0 4px}
+  h2{font-size:18px;font-weight:600;margin:32px 0 10px;padding-top:8px;border-top:1px solid var(--stroke2)}
+  h3{font-size:14px;font-weight:600;color:var(--muted);margin:16px 0 6px}
+  .sub{color:var(--muted);font-size:13px}
+  .pill{display:inline-block;font-size:12px;color:var(--muted);border:1px solid var(--stroke);border-radius:999px;padding:2px 10px;margin:2px 6px 2px 0}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}
+  .stat{background:var(--panel);border:1px solid var(--stroke);border-radius:8px;padding:14px 16px}
+  .stat .v{font-size:22px;font-weight:700;color:var(--accent)}
+  .stat .l{font-size:12px;color:var(--muted);margin-top:2px}
+  table{border-collapse:collapse;width:100%;margin:8px 0 4px;font-size:13px}
+  th,td{text-align:right;padding:7px 12px;border-bottom:1px solid var(--stroke2)}
+  th:first-child,td:first-child{text-align:left}
+  thead th{color:var(--muted);font-weight:600;border-bottom:1px solid var(--stroke)}
+  tbody tr:hover{background:#f0f3f6}
+  .win{color:var(--accent);font-weight:600}
+  .best{background:#dafbe1}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+  .note{color:var(--dim);font-size:12px;margin:6px 0}
+  .card{background:var(--panel);border:1px solid var(--stroke);border-radius:8px;padding:14px 16px;margin:10px 0}
+  .card.ok{border-left:3px solid var(--accent)}
+  .card.warn{border-left:3px solid var(--warn)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .ct{font-weight:600;margin-bottom:4px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eff1f3;padding:1px 5px;border-radius:4px;font-size:12px}
+  @media(max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>MXFP8 Mega-MoE — Performance Summary</h1>
+  <div class="sub">DeepSeek-V3 MoE · MI355X (gfx950) · EP8 · T=8192 H=7168 I=2048 E=256 top-8 · per-1×32 E8M0 mxfp8 vs bf16</div>
+  <div style="margin-top:8px">
+    <span class="pill">routing: load_balanced</span>
+    <span class="sub">balanced routing (~T·K/E tokens per expert); Bwd S1 also has round_robin; whole-forward uses a real random gate.</span>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="v">1.59×</div><div class="l">Fwd L1 dispatch+fc1 (preshuffle opt)</div></div>
+    <div class="stat"><div class="v">1.38×</div><div class="l">Fwd L2 fc2+combine</div></div>
+    <div class="stat"><div class="v">1.41–1.56×</div><div class="l">Bwd S1 fc2-dgrad + comm</div></div>
+    <div class="stat"><div class="v">1.56×</div><div class="l">Bwd S3 fc1-dgrad + combine</div></div>
+  </div>
+
+  <h2>Fused wall-clock (per-step training metric, lower is better · ms)</h2>
+  <table>
+    <thead><tr><th>Stage</th><th>Structure</th><th>bf16</th><th>fp8</th><th>Speedup</th><th>Accuracy</th><th>Machine</th></tr></thead>
+    <tbody>
+      <tr><td>Forward L1</td><td class="sub">dispatch + fc1 (comm→compute)</td><td>3.62</td><td>2.285</td><td class="win">1.59×</td><td>cos 0.9991</td><td class="mono">n04-25</td></tr>
+      <tr><td>Forward L2</td><td class="sub">fc2 + combine (compute→comm)</td><td>2.98</td><td>2.16</td><td class="win">1.38×</td><td>cos 1.000</td><td class="mono">chi2761</td></tr>
+      <tr><td>Backward S1</td><td class="sub">fc2 dgrad + comm (comm→compute)</td><td>2.415</td><td>1.715</td><td class="win">1.41×</td><td>cos 0.9992</td><td class="mono">n04-25</td></tr>
+      <tr><td>Backward S3 <span class="sub">(WIP)</span></td><td class="sub">fc1-dgrad + combine (compute→comm)</td><td>4.10</td><td>2.63</td><td class="win">1.56×</td><td>26 dB*</td><td class="mono">n05-33</td></tr>
+      <tr><td><b>Whole forward (L1+L2)</b></td><td class="sub">real random gate</td><td>6.79</td><td>5.47</td><td class="win">1.24×</td><td>18.3 / 31.6 dB</td><td class="mono">chi2761</td></tr>
+    </tbody>
+  </table>
+  <div class="note">Backward S3 (fc1-dgrad + combine): bf16 = canonical bench (best combine_cu); fp8 = <code>grouped_gemm_combine_fp8_bwd</code> @ ncu=32. *26 dB is the finite-part SNR — S3 fp8 is dev-gated (WIP) pending a cross-rank write-order fix (see below); production backward S3 still uses bf16.</div>
+  <div class="note">Fused wall-clock = single-kernel wall after comm∥compute overlap. Whole-forward 1.24× uses the old L1 (2.56 ms); after the L1 preshuffle optimization (2.285 ms) the whole forward is actually better.</div>
+
+  <h2>GEMM compute ceiling (kernel-only, comm stripped)</h2>
+  <table>
+    <thead><tr><th>GEMM</th><th>shape</th><th>bf16 TF</th><th>mxfp8 TF</th><th>× bf16</th><th>vs fp8-tw</th></tr></thead>
+    <tbody>
+      <tr><td>fc1 (fwd L1)</td><td class="sub">N=4096 K=7168</td><td>1138</td><td class="win">2400</td><td>2.11×</td><td>0.93×</td></tr>
+      <tr><td>fc2 (fwd L2)</td><td class="sub">N=7168 K=2048</td><td>975</td><td class="win">1946</td><td>2.00×</td><td>0.93×</td></tr>
+      <tr><td>fc2-dgrad (bwd)</td><td class="sub">N=2048 K=7168</td><td>1116</td><td class="win">2377</td><td>2.13×</td><td>0.93×</td></tr>
+    </tbody>
+  </table>
+  <div class="note">Single GPU (n04-25), uniform M_per=2048, Triton bf16 reference, SNR ~28 dB. mxfp8 grouped NT GEMM peaks at ~2.4k TFLOPS ≈ 2× bf16, ~0.93× of the per-tensor-fp8 ceiling — per-1×32 block scaling is essentially free. dgrad runs NT (static w2 transpose) reusing the same tile.</div>
+
+  <h2>Backward STEP3 (fc1-dgrad + combine, fp8-PUSH) — new this round</h2>
+  <div class="note">n05-33 · real DSv3 EP8 pool (M_pad=66048, out=H=7168, K=2I=4096) · same pool/routing · reduce overlaps on empty GEMM blocks. Mirrors the production forward <code>grouped_gemm_combine_fp8</code> (mxfp8 GEMM + fp8 PUSH).</div>
+
+  <h3>Isolation ladder (ms, full_call − grad_l1 quant)</h3>
+  <table>
+    <thead><tr><th>Isolation</th><th>ncu=16</th><th>ncu=32 (sweet spot)</th></tr></thead>
+    <tbody>
+      <tr><td>GEMM only</td><td>~1.85 <span class="sub">(all CUs)</span></td><td>—</td></tr>
+      <tr><td>push only (fp8)</td><td>2.976</td><td>1.813</td></tr>
+      <tr><td>push only (bf16 ref)</td><td>4.043</td><td>2.631</td></tr>
+      <tr><td>GEMM + push (reduce off)</td><td>3.884</td><td>2.525</td></tr>
+      <tr class="best"><td><b>full (GEMM+push+reduce)</b></td><td>3.966</td><td class="win">2.499</td></tr>
+    </tbody>
+  </table>
+
+  <h3>combine PUSH — ncu sweep (fp8 vs bf16, same pool/routing)</h3>
+  <table>
+    <thead><tr><th>ncu</th><th>fp8 push (ms)</th><th>bf16 push (ms)</th><th>fp8/bf16</th></tr></thead>
+    <tbody>
+      <tr><td>16</td><td>2.976</td><td>4.043</td><td>0.74×</td></tr>
+      <tr><td>32</td><td>1.813</td><td>2.631</td><td>0.69×</td></tr>
+      <tr><td>48</td><td>1.779</td><td>3.048</td><td class="win">0.58×</td></tr>
+      <tr class="best"><td>64</td><td class="win">1.245</td><td>1.938</td><td>0.64×</td></tr>
+    </tbody>
+  </table>
+  <div class="note">Byte ratio fp8/bf16 ≈ 0.52× (fp8 payload H×1 + E8M0 H/32 vs bf16 H×2). Higher ncu approaches the byte lever; ncu=16 is combine-CU-starved and not representative of the true push cost.</div>
+
+  <h3>full STEP3 — fp8 vs bf16 (fused = GEMM + push + reduce)</h3>
+  <table>
+    <thead><tr><th></th><th>fused (ms)</th><th>gemm-only (ms)</th><th>push-only (ms)</th><th>accuracy</th></tr></thead>
+    <tbody>
+      <tr><td>bf16 STEP3 (canonical bench)</td><td>4.10</td><td>3.41</td><td>2.89</td><td>cos 1.000</td></tr>
+      <tr class="best"><td><b>fp8-PUSH STEP3</b></td><td class="win">~2.63</td><td>1.85</td><td>1.81</td><td>26 dB</td></tr>
+      <tr><td>speedup (fp8 vs bf16)</td><td class="win">1.56×</td><td>1.84×</td><td>1.60×</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <div class="note">bf16 = <code>grouped_gemm_combine_impl</code>(nn), canonical bench (best combine_cu=16–18; reduce flags pre-set ready = perf-only). fp8 = <code>grouped_gemm_combine_fp8_bwd</code> @ ncu=32 (reduce actually waits → slightly pessimistic, so the real gap is ≥1.56×). Both bf16-STEP3 halves (GEMM K=2I=4096, push) are ~1.6–1.8× slower than fp8. bf16 STEP3 is GEMM-bound (gemm 3.41 &gt; push 2.89).</div>
+
+  <div class="grid2" style="margin-top:12px">
+    <div class="card ok">
+      <div class="ct">Performance conclusion</div>
+      full fp8 STEP3 ≈ <b>2.63 ms</b> vs bf16 <b>4.10 ms</b> → <b>~1.56× faster</b>, in line with the forward L2 / STEP1 wins. <b>reduce is basically free</b> (hidden on empty GEMM blocks). comm-bound: push dominates and scales with ncu (fp8 push down to 1.245 ms @ ncu=64).
+    </div>
+    <div class="card warn">
+      <div class="ct">Production blocker</div>
+      Cross-rank write-ordering race → intermittent non-finite (math is correct, finite part 26 dB); ncu≥48 full triggers a liveness stall (deadlock). Three device-scope fence pairings (l2_writeback/l2_invalidate) did not fix it → needs rocprofv3 single-rank localization. Currently dev-gated; production backward still uses bf16-PUSH.
+    </div>
+  </div>
+
+  <h2>Status &amp; provenance</h2>
+  <div class="grid2">
+    <div class="card ok">
+      <div class="ct">Landed / validated</div>
+      Forward L1+L2 all-mxfp8 (production default, SNR 18.3 dB &gt; 15 gate); backward STEP1 wins 1.41–1.56× (cos 0.999). Weight prep w1/w2/w2ᵀ/w1ᵀ is all module-owned, version-keyed, computed once per optim.step (reused across a grad-accum window).
+    </div>
+    <div class="card warn">
+      <div class="ct">Weight-prep cost (must cache)</div>
+      w1ᵀ prepare (grouped quant [32,7168,4096] + preshuffle) = <b>2.9 ms</b>, larger than the GEMM itself, but static → amortized once per optim.step. grad_l1 quant = 0.39 ms, token-dependent, unavoidable, counted per step.
+    </div>
+  </div>
+  <div class="note">Provenance: fused wall-clock spans machines (Fwd chi2761 / Bwd n04-25 / STEP3 n05-33, all MI355X EP8 same shape); GEMM ceiling is single-GPU. Bwd STEP1 fused ~1192–1239 TF (incl. comm) is below the comm-stripped ~2377 TF; the gap is the exposed XGMI dispatch.</div>
+
+</div>
+</body>
+</html>
