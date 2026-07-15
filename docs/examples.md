@@ -8,6 +8,7 @@ This page shows usage of **Primus-Turbo**.
   - [1.1 Gemm](#11-gemm)
   - [1.2 Attention](#12-attention)
   - [1.3 Grouped Gemm](#13-grouped-gemm)
+  - [1.4 Mega MoE](#14-mega-moe)
 - [2. Modules](#2-modules)
   - [2.1 Linear](#21-linear)
 - [3. Low-Precision](#3-low-precision)
@@ -139,6 +140,74 @@ c = turbo.ops.grouped_gemm(a, b, group_lens, trans_b=False)
 print(c)
 print(c.shape) # [128, 256]
 ```
+
+### 1.4 Mega MoE
+
+`mega_moe_fused` is an EP intra-node MoE op that fuses communication with the grouped GEMM
+(`dispatch_grouped_gemm` + `grouped_gemm_combine`). It is a single autograd op; the per-shape
+communication buffer is allocated once and cached internally. See
+[README_Mega_MoE](./README_Mega_MoE.md) for the design and performance.
+
+> **Hardware requirements:** `gfx950` or higher, intra-node expert parallelism (one rank per GPU).
+
+```python
+import torch
+import torch.distributed as dist
+
+from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused
+
+# --- distributed setup (one rank per GPU, intra-node EP) ---
+dist.init_process_group("nccl")
+rank, world = dist.get_rank(), dist.get_world_size()
+torch.cuda.set_device(rank)
+group = dist.new_group(list(range(world)))
+
+# --- MoE shape ---
+H = 7168          # hidden size (hidden % 512 == 0)
+I = 2048          # intermediate size
+E = 256           # total experts (must be divisible by world)
+K = 8             # top-k
+T = 4096          # max tokens per rank
+epr = E // world  # experts per rank
+
+# Allocate the comm buffer ONCE for this shape; it is cached and reused.
+get_symm_buffer_for_mega_moe(
+    group,
+    num_experts=E,
+    num_max_tokens_per_rank=T,
+    num_topk=K,
+    hidden=H,
+    intermediate_hidden=I,
+)
+
+# --- per-rank weights: this rank owns experts [rank*epr, (rank+1)*epr) ---
+# w1: [epr, 2*I, H], w2: [epr, H, I]  (NT layout)
+w1 = torch.randn(epr, 2 * I, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+w2 = torch.randn(epr, H, I,   device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+# --- inputs ---
+x = torch.randn(T, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+topk_idx = torch.randint(0, E, (T, K), device="cuda", dtype=torch.int64)   # global expert ids
+topk_w   = torch.rand(T, K, device="cuda", dtype=torch.float32)            # routing weights
+
+# --- fused forward + backward ---
+y = mega_moe_fused(group, x, topk_idx, topk_w, w1, w2)   # [T, H]
+y.sum().backward()                                        # grads for x, w1, w2, topk_w
+# run with torchrun --nproc_per_node=8 --nnodes=1 this_code.py
+```
+
+Input contract:
+
+| Argument | Shape / dtype | Notes |
+| --- | --- | --- |
+| `x` | `[T, H]` bf16, CUDA | `H % 512 == 0` (hidden*2 must be 1024B-aligned) |
+| `topk_idx` | `[T, K]` int (cast to int64) | global expert ids in `[0, num_experts)`|
+| `topk_weights` | `[T, K]` fp32 | routing weights, applied in the top-k reduce |
+| `w1` | `[E/world, 2*I, H]` bf16 | this rank's expert slice, NT layout |
+| `w2` | `[E/world, H, I]` bf16 | this rank's expert slice, NT layout |
+| `group` | `ProcessGroup` | intra-node EP group |
+
 
 ## 2. Modules
 

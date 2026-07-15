@@ -14,7 +14,8 @@ from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.typing import T
+from flydsl.expr.buffer_ops import buffer_store, create_buffer_resource
+from flydsl.expr.typing import AddressSpace, PointerType, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 
@@ -64,6 +65,42 @@ def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_byt
     )
     iter_f8 = fx.recast_iter(f8_buf_ptr_ty, iter_i8)
     return fx.Tensor(fx.make_view(iter_f8, lay))
+
+
+def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_bytes):
+    """make_fp8_buffer_tensor_rebased for a 2-byte (bf16/fp16) operand: SRD base
+    advanced by ``base_bytes`` (i64), bounded by ``num_records_bytes`` (HW OOB clamp
+    -> per-group K-tail reads 0). Folds the per-group token base into the descriptor
+    so the buffer voffset/soffset stay int32 even past 2^31 elems."""
+    base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg))
+    base_off = arith.index_cast(T.i64, arith.index_cast(T.index, base_bytes))
+    base = _readfirstlane_i32(base + base_off)
+    nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
+    nrec = fx.Int64(_readfirstlane_i32(arith.index_cast(T.i64, nr)))
+    flags = _buffer_ops._get_buffer_flags()
+    base_ptr = fx.inttoptr(fx.PointerType.get(elem_ty=T.i8, address_space=1, alignment=16), base)
+    i8_buf_ty = fx.PointerType.get(elem_ty=T.i8, address_space=TargetAddressSpace.BufferDesc, alignment=16)
+    buf_ptr = fx.make_ptr(
+        i8_buf_ty, [base_ptr, fx.Int16(0).ir_value(), nrec.ir_value(), fx.Int32(flags).ir_value()]
+    )
+    lay = fx.make_layout(0x40000000, 1)
+    iter_i8 = fx.get_iter(fx.make_view(buf_ptr, lay))
+    bf_buf_ptr_ty = fx.PointerType.get(
+        elem_ty=bf16_ir_t,
+        address_space=TargetAddressSpace.BufferDesc,
+        alignment=fx.PointerType(iter_i8.type).alignment,
+    )
+    iter_bf = fx.recast_iter(bf_buf_ptr_ty, iter_i8)
+    return fx.Tensor(fx.make_view(iter_bf, lay))
+
+
+def make_bf16_fp16_tile_tensor(base_i64, byte_offset, elems):
+    """Per-tile 2-byte (bf16/fp16) global view with base rebased by ``byte_offset`` in
+    int64 (keeps per-lane voffset int32 past a >4GB pool). Returns a plain global view;
+    the caller feeds it straight to gemm_tile, so the nt_tile API stays unchanged."""
+    ptr_ty = PointerType.get(elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16)
+    tile_ptr = fx.inttoptr(ptr_ty, base_i64 + byte_offset)
+    return fx.make_view(tile_ptr, fx.make_layout(elems, 1))
 
 
 def swizzle_128(row, col, width=128):
@@ -162,15 +199,17 @@ def pack_i32x4_i32x8(lo, hi):
     return lo.shuffle(hi, list(range(8)))
 
 
-class S2RLoader:
-    # Uses the intrinsic ds_read (no manual-lgkmcnt inline-asm path): the backend already
-    # packs the reads onto shared base pointers and schedules per-tile lgkmcnt finer than a
-    # single coarse drain.
+class _S2RLoaderBase:
+    """Shared ctor for LDS->register operand loaders: caches the per-lane id,
+    this wave's tile index, and the tile count."""
+
     def __init__(self, wave_idx, n_tiles):
         self.lane_id = fx.thread_idx.x % 64
         self.wave_idx = wave_idx
         self.n_tiles = n_tiles
 
+
+class S2RLoader(_S2RLoaderBase):
     def _vec_load_16xf8(self, lds_src, offset):
         off_tup = fx.make_int_tuple(offset)
         ptr_off = fx.add_offset(lds_src.ptr, off_tup)
@@ -238,6 +277,10 @@ class Mfma16x16x128:
 
     def idx(self, i, j):
         return i * self.n_tiles_b + j
+
+    def set_inplace_asm(self, cbsz, blgp):
+        # inplace MFMA: accum in AGPR; cbsz/blgp select srcA/srcB fmt
+        self._do_mma = lambda _a, _b, _c: asm_mma_do(_a, _b, _c, mode="2", cbsz=cbsz, blgp=blgp)
 
     def _do_mma(self, a, b, c):
         return fly_dialect.mma_atom_call_ssa([self.accum_type], self.atom, a, b, c)
@@ -425,7 +468,9 @@ class StoreCPerTensor:
     drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
     """
 
-    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty):
+    def __init__(
+        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, elem_fn=None
+    ):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
@@ -433,6 +478,8 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
+        # Optional f32->f32 epilogue node chain (bias/act), post-scale pre-cast.
+        self.elem_fn = elem_fn
         self.scaled = A_scale is not None
         self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
         if self.scaled:
@@ -458,7 +505,10 @@ class StoreCPerTensor:
                 col_valid = col < self.c_cols
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
-                    val = (vec_f32[i] * scale if self.scaled else vec_f32[i]).to(self.out_ty)
+                    val = vec_f32[i] * scale if self.scaled else vec_f32[i]
+                    if self.elem_fn is not None:
+                        val = self.elem_fn(val)  # bias/act epilogue node chain
+                    val = val.to(self.out_ty)
                     off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
                     _buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
 
@@ -1058,3 +1108,237 @@ def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256,
             )
 
     return kern, n_kt
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Reusable bf16 GEMM primitives for gemm_bf16_kernel.py (mfma 32x32x16 / 16x16x32,
+# tr_b16 loaders, swizzle, store). bf16 counterpart of the fp8 block above.
+# ───────────────────────────────────────────────────────────────────────
+BLOCK_K = 64  # K depth per LDS tile (exported to the bf16 kernels)
+
+
+def make_fp16_bf16_buffer_tensor(arg):
+    return fx.rocdl.make_buffer_tensor(arg, max_size=False)
+
+
+def compute_global_swizzle_bf16(lane_id, wave_id, K, n_rounds):
+    offsets = []
+    n_waves = fx.block_dim.x // 64
+    for r in range_constexpr(n_rounds):
+        row = lane_id // 8 + wave_id * 8 + r * (n_waves * 8)
+        col_byte = (lane_id % 8) * 16
+        _, c = swizzle_128(row, col_byte)
+        offsets.append(row * K + c // 2)
+    return offsets
+
+
+def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps):
+    offsets = []
+    n_waves = fx.block_dim.x // 64
+    kk = (lane_id % 32) // 2
+    g = lane_id // 32
+    n_in = g * 16 + (lane_id % 2) * 8
+    for step in range_constexpr(n_steps):
+        idx = wave_id + step * n_waves
+        n_tile = idx // 4
+        ks = idx % 4
+        offsets.append((ks * 16 + kk) * c_n + n_tile * 32 + n_in)
+    return offsets
+
+
+def _packed_ds_read_tr16(base_ptr, byte_offsets):
+    n = len(byte_offsets)
+    v2i32 = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
+    struct_t = _llvm.StructType.get_literal([v2i32] * n)
+    asm = "\n".join(f"ds_read_b64_tr_b16 ${k}, ${n} offset:{byte_offsets[k]}" for k in range(n))
+    constraints = ",".join(["=&v"] * n + ["v"] + ["~{memory}"])
+    op = _llvm.InlineAsmOp(
+        res=struct_t,
+        operands_=[_raw(base_ptr)],
+        asm_string=asm,
+        constraints=constraints,
+        has_side_effects=True,
+    )
+    return [Vec(_llvm.extractvalue(v2i32, op.result, [k])).bitcast(fx.BFloat16) for k in range(n)]
+
+
+def _read_tr16_sub(base_i32, sub16, row_off):
+    """One tr16 sub-block (512 elems/block): packed double-read, the pair 128 bytes
+    apart, at sub16*512 + row_off, then assembled."""
+    ptr = _lds_ptr_from_i32(base_i32 + (sub16 * 512 + row_off) * 2)
+    r0, r1 = _packed_ds_read_tr16(ptr, [0, 128])
+    return r0.shuffle(r1, list(range(8)))
+
+
+class _S2RLoaderBf16(_S2RLoaderBase):
+    """Shared skeleton for the bf16 operand loaders (cf. _MfmaBf16): n_tiles output
+    tiles, each a list of k-sub fragments. Subclasses supply the per-sub offset table
+    and _tile(), which holds the LDS address math -- transposed ds_read_tr_b16 or
+    swizzled buffer load (too different to share beyond this loop)."""
+
+    def load(self, lds_src):
+        return [self._tile(lds_src, i) for i in range_constexpr(self.n_tiles)]
+
+
+class S2RLoaderTrBf16(_S2RLoaderBf16):
+    """mfma_f32_32x32x16 operand via ds_read_tr_b16 transpose. Like S2RLoaderTr's
+    _K_BASE, _SUB lists the tr16 sub-block of each inst_k=16 mfma step (consecutive
+    here); its length is both the sub count and the per-tile block stride."""
+
+    _SUB = (0, 1, 2, 3)
+
+    def _tile(self, lds_src, i):
+        m, kblk = self.lane_id % 32, self.lane_id // 32
+        row_off = (m // 16) * 256 + kblk * 128 + (m % 16) * 4
+        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        sub0 = (self.wave_idx * self.n_tiles + i) * len(self._SUB)
+        return [
+            _read_tr16_sub(base_i32, sub0 + self._SUB[c], row_off) for c in range_constexpr(len(self._SUB))
+        ]
+
+
+class _MfmaBf16:
+    """Grouped bf16 mfma: accumulate n_tiles_a x n_tiles_b output tiles. The k-sub
+    count is taken from each operand's fragment list (len(a[i])), so the atom's
+    (m, n, inst_k) is the only shape this class needs -- no BLOCK_K coupling."""
+
+    def __init__(self, n_tiles_a, n_tiles_b, m, n, inst_k):
+        self.atom = fx.make_mma_atom(fx.rocdl.MFMA(m, n, inst_k, fx.BFloat16))
+        acc_len = m * n // 64  # f32 accum lanes per wave
+        self.accum_type = Vec.make_type(acc_len, fx.Float32)
+        self.zero_value = Vec.filled(acc_len, 0.0, fx.Float32)
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+
+    def idx(self, i, j):
+        return i * self.n_tiles_b + j
+
+    def call(self, a, b, c):
+        assert len(a) == self.n_tiles_a
+        assert len(b) == self.n_tiles_b
+        for i in range_constexpr(self.n_tiles_a):
+            for j in range_constexpr(self.n_tiles_b):
+                acc = c[self.idx(i, j)]
+                for ks in range_constexpr(len(a[i])):
+                    acc = fly_dialect.mma_atom_call_ssa([self.accum_type], self.atom, a[i][ks], b[j][ks], acc)
+                c[self.idx(i, j)] = acc
+        return c
+
+
+class Mfma32x32x16(_MfmaBf16):
+    def __init__(self, n_tiles_a, n_tiles_b):
+        super().__init__(n_tiles_a, n_tiles_b, 32, 32, 16)
+
+
+class Mfma16x16x32(_MfmaBf16):
+    def __init__(self, n_tiles_a, n_tiles_b):
+        super().__init__(n_tiles_a, n_tiles_b, 16, 16, 32)
+
+
+class S2RLoaderTr16x32Bf16(_S2RLoaderBf16):
+    """mfma_f32_16x16x32 operand via ds_read_tr_b16 transpose. Like S2RLoaderTr's
+    _K_BASE, _SUB lists the tr16 sub-block offset of each inst_k=32 mfma step (each
+    spans two tr16 blocks); _BLOCK is the tr16 blocks per n32-region. Both baked in."""
+
+    _SUB = (0, 2)
+    _BLOCK = 4
+
+    def _tile(self, lds_src, i):
+        octet, mm = self.lane_id // 16, self.lane_id % 16
+        s_in_pair, kb = octet // 2, octet % 2
+        row_off = kb * 128 + mm * 4
+        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        orig_tile = self.wave_idx * self.n_tiles + i
+        n32_block, g16 = orig_tile // 2, orig_tile % 2
+        row = g16 * 256 + row_off  # fold g16 block offset into row
+        return [
+            _read_tr16_sub(base_i32, n32_block * self._BLOCK + self._SUB[c] + s_in_pair, row)
+            for c in range_constexpr(len(self._SUB))
+        ]
+
+
+def _load8_bf16(lds_src, byte_off):
+    i8 = fx.recast_iter(fx.Uint8, lds_src.ptr)
+    p = fx.add_offset(i8, fx.make_int_tuple(byte_off))
+    v = fx.make_view(p, fx.make_layout(16, 1)).load()
+    return v.bitcast(fx.BFloat16)
+
+
+class S2RLoaderBf16(_S2RLoaderBf16):
+    """mfma_f32_32x32x16 operand (swizzled, non-transposed). Mirroring S2RLoaderTr,
+    _K_BASE lists the K-column (elems) of each inst_k=16 sub of a 32-row tile; its
+    length is the sub count -- no BLOCK_K needed."""
+
+    _K_BASE = (0, 16, 32, 48)
+
+    def _tile(self, lds_src, i):
+        m, kblk = self.lane_id % 32, self.lane_id // 32
+        row = self.wave_idx * (self.n_tiles * 32) + i * 32 + m
+        subs = []
+        for c in range_constexpr(len(self._K_BASE)):
+            col_byte = (self._K_BASE[c] + kblk * 8) * 2
+            _, cs = swizzle_128(row, col_byte)
+            subs.append(_load8_bf16(lds_src, row * 128 + cs))
+        return subs
+
+
+class StoreCBf16:
+    def __init__(self, C, c_rows, c_cols, out_ty, cache_modifier=0):
+        self.c_rows = c_rows
+        self.c_cols = c_cols
+        self.lane_id = fx.thread_idx.x % 64
+        self.out_ty = out_ty
+        self.cache_modifier = cache_modifier
+        c_nbytes = c_rows * c_cols * 2
+        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
+        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_ty)
+        self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), out_ty)
+        self.c_rsrc = (
+            create_buffer_resource(C, max_size=False, num_records_bytes=c_nbytes) if cache_modifier else None
+        )
+        self.oob = fx.Int32(c_rows * c_cols)  # out-of-bounds sink index
+
+    def _store_masked(self, value, c_index, valid):
+        """Store one element to c_index (masked to the OOB sink when invalid)."""
+        idx = arith.select(valid, c_index, self.oob)
+        val = value.to(self.out_ty)
+        if self.cache_modifier:
+            buffer_store(val, self.c_rsrc, fx.Int32(idx), cache_modifier=self.cache_modifier)
+        else:
+            fx.memref_store_vec(Vec.filled(1, val, self.out_ty), self.reg_out_1)
+            fx.copy(self.out_atom_1, self.reg_out_1, fx.slice(self.c_div, (None, fx.Int32(idx))))
+
+    def store(self, c_frag, base_row, base_col):
+        n = self.lane_id % 32
+        m_hi = (self.lane_id // 32) * 4
+        col = base_col + n
+        col_valid = col < self.c_cols
+        for ti in range_constexpr(len(c_frag)):
+            acc = Vec(c_frag[ti])
+            for r in range_constexpr(16):
+                row = base_row + ti * 32 + (r // 4) * 8 + m_hi + (r % 4)
+                self._store_masked(acc[r], row * self.c_cols + col, col_valid)
+
+    def store16(self, c_frag, base_row, base_col):
+        n = self.lane_id % 16
+        m_hi = (self.lane_id // 16) * 4
+        col = base_col + n
+        col_valid = col < self.c_cols
+        for ti in range_constexpr(len(c_frag)):
+            acc = Vec(c_frag[ti])
+            for r in range_constexpr(4):
+                row = base_row + ti * 16 + m_hi + r
+                self._store_masked(acc[r], row * self.c_cols + col, col_valid)
+
+    def store_trans16(self, c_frag, group_idx, base_m, base_n, out_m, out_n):
+        n = self.lane_id % 16
+        m_hi = (self.lane_id // 16) * 4
+        glob_n = base_n + n
+        n_valid = glob_n < out_n
+        row_base = (group_idx * out_n + glob_n) * out_m
+        for ti in range_constexpr(len(c_frag)):
+            acc = Vec(c_frag[ti])
+            for r in range_constexpr(4):
+                m = base_m + ti * 16 + m_hi + r
+                self._store_masked(acc[r], row_base + m, n_valid)

@@ -159,8 +159,20 @@ MoEModelConfigs = {
         "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
         "head_dim_v": 128,
         "seqlen": 4096,
-        "num_experts": 256,
         "num_topk": 8,
+    },
+    # https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/config.json
+    "DeepSeek-V4-Pro": {
+        "n_routed_experts": 384,
+        "moe_intermediate_size": 3072,
+        "hidden_size": 7168,
+        # MLA attention config
+        "num_attention_heads": 128,
+        "num_key_value_heads": 128,
+        "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
+        "head_dim_v": 128,
+        "seqlen": 4096,
+        "num_topk": 6,
     },
     # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2/file/view/master/config.json
     "DeepSeek-V2": {
@@ -173,7 +185,6 @@ MoEModelConfigs = {
         "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
         "head_dim_v": 128,
         "seqlen": 4096,
-        "num_experts": 160,
         "num_topk": 8,
     },
     # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2-Lite/file/view/master/config.json
@@ -187,7 +198,6 @@ MoEModelConfigs = {
         "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
         "head_dim_v": 128,
         "seqlen": 4096,
-        "num_experts": 64,
         "num_topk": 8,
     },
     # https://huggingface.co/xai-org/grok-2/blob/main/config.json
@@ -200,7 +210,6 @@ MoEModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
         "seqlen": 8192,
-        "num_experts": 8,
         "num_topk": 2,
     },
     # https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507/file/view/master/config.json
@@ -213,7 +222,6 @@ MoEModelConfigs = {
         "num_key_value_heads": 4,
         "head_dim": 64,
         "seqlen": 8192,
-        "num_experts": 128,
         "num_topk": 8,
     },
     # https://modelscope.cn/models/Qwen/Qwen3-235B-A22B-Instruct-2507
@@ -226,7 +234,6 @@ MoEModelConfigs = {
         "num_key_value_heads": 4,
         "head_dim": 64,
         "seqlen": 8192,
-        "num_experts": 128,
         "num_topk": 8,
     },
     # https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/blob/main/config.json
@@ -239,7 +246,6 @@ MoEModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
         "seqlen": 4096,
-        "num_experts": 8,
         "num_topk": 2,
     },
     # https://huggingface.co/mistralai/Mixtral-8x22B-Instruct-v0.1/blob/main/config.json
@@ -252,7 +258,6 @@ MoEModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
         "seqlen": 8192,
-        "num_experts": 8,
         "num_topk": 2,
     },
     # https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json
@@ -266,7 +271,6 @@ MoEModelConfigs = {
         "head_dim_qk": 192,  # qk_nope_head_dim(128) + qk_rope_head_dim(64)
         "head_dim_v": 128,
         "seqlen": 4096,
-        "num_experts": 384,
         "num_topk": 8,
     },
     # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_1T.yaml
@@ -280,7 +284,6 @@ MoEModelConfigs = {
         "num_key_value_heads": 8,  # num_query_groups
         "head_dim": 128,
         "seqlen": 4096,
-        "num_experts": 224,
         "num_topk": 8,
     },
     # https://github.com/AMD-AGI/Primus/blob/main/primus/configs/models/megatron/moe_2T.yaml
@@ -456,12 +459,34 @@ def gen_attention_test_cases():
     return test_cases
 
 
+def gen_moe_test_cases(names=None):
+    """Generate mega-MoE test cases (one per MoE model) for the fused EP benchmarks.
+
+    names: optional iterable of model names to restrict the sweep (None = all).
+    """
+    wanted = set(names) if names else None
+    test_cases = []
+    for name, config in MoEModelConfigs.items():
+        if wanted is not None and name not in wanted:
+            continue
+        test_cases.append(
+            {
+                "Case": name,
+                "hidden": config["hidden_size"],
+                "inter": config["moe_intermediate_size"],
+                "num_experts": config["n_routed_experts"],
+                "num_topk": config["num_topk"],
+            }
+        )
+    return test_cases
+
+
 def gen_deepep_test_cases():
     # From MoE models (for MLA and other attention variants)
     test_cases = []
     for name, config in MoEModelConfigs.items():
         test_cases.append(
-            (name, config["seqlen"], config["hidden_size"], config["num_experts"], config["num_topk"])
+            (name, config["seqlen"], config["hidden_size"], config["n_routed_experts"], config["num_topk"])
         )
 
     return test_cases
