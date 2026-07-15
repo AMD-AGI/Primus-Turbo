@@ -485,6 +485,8 @@ _MXFP4_SMALL_CFG = tuple(int(x) for x in _os.environ.get("MXFP4_SMALL_CFG", "1,8
 # gone (an earlier xcd=8 few-tile heuristic was tuned against that stale overhead and now
 # regresses the small-square shapes); keep the knob but default it off (grid<0 never fires).
 _MXFP4_SMALL_GRID = int(_os.environ.get("MXFP4_SMALL_GRID", "0"))  # grid_upper < this -> small cfg
+_MXFP4_WLV = int(_os.environ.get("MXFP4_WLV", "10"))  # whole-loop vmcnt-in-flight hint (sweepable)
+_MXFP4_ELGK = int(_os.environ.get("MXFP4_ELGK", "9"))  # whole-loop lgkmcnt-at-barrier hint
 # JIT compile-cache bound: each distinct shape compiles one FlyDSL kernel (GPU code object).
 # Real MoE uses a handful of shapes; a broad test sweep (~480 shapes) accumulates enough
 # code objects to exhaust memory -> drop the caches (and gc the modules) past this cap. A
@@ -587,7 +589,7 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     a_pre_grid = ceildiv(slab_rows * K128, _PRESHUF_NG * _PRESHUF_BLK)
 
     stream = torch.cuda.current_stream()
-    wlv, elgk = 10, 9
+    wlv, elgk = _MXFP4_WLV, _MXFP4_ELGK
     args = (
         a8,
         b8,
@@ -891,7 +893,7 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     out_flat = out.view(-1)
 
     stream = torch.cuda.current_stream()
-    wlv, elgk = 10, 9
+    wlv, elgk = _MXFP4_WLV, _MXFP4_ELGK
     args = (a8, b8, out_flat, a_raw, b_raw, a_sp, b_sp, go_pad, stream)
 
     def _entry(cfg):
