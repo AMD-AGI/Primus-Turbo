@@ -199,11 +199,12 @@ def _build_grouped_mxfp4_nt_kernel(
     assert K % 256 == 0 and _KR % 128 == 0
     KI = _KR // BLOCK_K  # FULL 256-blocks over the REAL K; trailing 128 -> 128-tail
     _K128 = (_KR // 128) % 2  # 1 => there is a trailing 128-K block
-    # 128-tail (zero-waste) vs scale-pad-zero for the trailing 128: the tail's fresh
-    # g2s + barrier is a serial bubble that only amortizes on long K -- on short K it
-    # costs more than 1 padded (zero-scale) MFMA. So use the tail only for KI >= the
-    # threshold; short non-256-K rounds up (KI_LOOP = KI+1) and lets the last block's s=1
-    # multiply by the zero-padded scale.
+    # 128-tail (zero-waste) vs scale-pad-zero for the trailing 128: MEASURED -- scale-pad-zero
+    # wins even against a bubble-free tail (operand g2s hidden behind the odd-256 tail MFMAs).
+    # Reason: scale-pad-zero folds the extra block into the do-while so it is FULLY PIPELINED
+    # (one wasted zero-scale MFMA), whereas any 128-tail is a separate post-loop phase whose
+    # barrier+ds_read breaks the pipeline by more than that one MFMA costs. Keep the env
+    # override (MXFP4_TAIL_MIN) for A/B only; default => scale-pad-zero everywhere.
     _USE_TAIL = bool(_K128) and KI >= _MXFP4_TAIL_MIN
     _K128TAIL = 1 if _USE_TAIL else 0
     KI_LOOP = KI if (_USE_TAIL or not _K128) else (KI + 1)
