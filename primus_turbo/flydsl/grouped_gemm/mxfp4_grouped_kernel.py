@@ -303,7 +303,7 @@ def _build_grouped_mxfp4_nt_kernel(
     _USE_TAIL = bool(_K128) and KI >= _MXFP4_TAIL_MIN
     _K128TAIL = 1 if _USE_TAIL else 0
     KI_LOOP = KI if (_USE_TAIL or not _K128) else (KI + 1)
-    NABUF, NBB, OCC = 2, 2, 1
+    NABUF, NBB, OCC = 2, 2, _MXFP4_OCC
     N_SUB = BLOCK_K // 128
     BPR = BLOCK_K // 2
     KSTEP = BPR
@@ -602,6 +602,9 @@ _MXFP4_SMALL_CFG = tuple(int(x) for x in _os.environ.get("MXFP4_SMALL_CFG", "1,8
 _MXFP4_SMALL_GRID = int(_os.environ.get("MXFP4_SMALL_GRID", "0"))  # grid_upper < this -> small cfg
 _MXFP4_WLV = int(_os.environ.get("MXFP4_WLV", "10"))  # whole-loop vmcnt-in-flight hint (sweepable)
 _MXFP4_ELGK = int(_os.environ.get("MXFP4_ELGK", "9"))  # whole-loop lgkmcnt-at-barrier hint
+_MXFP4_OCC = int(_os.environ.get("MXFP4_OCC", "2"))  # waves_per_eu=2: hides latency on the latency-
+# bound short-K/small-tile fwd (MFMA util was ~5%); measured a broad win (small shapes +3-8%, big
+# +2-3%/neutral). VGPR ~216 => 2 waves (432<512) fit without spilling. env-tunable for A/B.
 # JIT compile-cache bound: each distinct shape compiles one FlyDSL kernel (GPU code object).
 # Real MoE uses a handful of shapes; a broad test sweep (~480 shapes) accumulates enough
 # code objects to exhaust memory -> drop the caches (and gc the modules) past this cap. A
@@ -759,7 +762,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
     BLOCK_M = BLOCK_N = BLOCK_K = _BLOCK
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     swizzle = True
-    NABUF, NBB, OCC = 2, 2, 1
+    NABUF, NBB, OCC = 2, 2, 1  # wgrad keeps occ=1 (feed-bound; occ measured non-lever for wgrad)
     N_SUB = BLOCK_K // 128
     BPR = BLOCK_K // 2
     KSTEP = BPR
