@@ -57,6 +57,12 @@ from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import run_eager_or_c
 _BLOCK = 256  # BLOCK_M = BLOCK_N = BLOCK_K
 _PRESHUF_BLK = 256
 _PRESHUF_NG = 4  # g_byte fan-out per preshuffle thread
+# Trailing-128 handling: KI (full 256-block count) >= this uses the zero-waste 128-tail;
+# below it, round up + zero-scale pad (avoids the tail's serial g2s+barrier bubble, which
+# only amortizes on long K). Env-overridable for tuning.
+import os as _os  # noqa: E402
+
+_MXFP4_TAIL_MIN = int(_os.environ.get("MXFP4_TAIL_MIN", "1"))  # KI>=1 uses the zero-waste 128-tail
 
 
 def _pack4(rin, rows, k128, valid, K128):
@@ -206,7 +212,15 @@ def _build_grouped_mxfp4_nt_kernel(
     _KR = K if k_real is None else k_real  # operand true contraction (128-multiple)
     assert K % 256 == 0 and _KR % 128 == 0
     KI = _KR // BLOCK_K  # FULL 256-blocks over the REAL K; trailing 128 -> 128-tail
-    _K128TAIL = (_KR // 128) % 2  # 1 => trailing 128-K block handled by the 128-tail
+    _K128 = (_KR // 128) % 2  # 1 => there is a trailing 128-K block
+    # 128-tail (zero-waste) vs scale-pad-zero for the trailing 128: the tail's fresh
+    # g2s + barrier is a serial bubble that only amortizes on long K -- on short K it
+    # costs more than 1 padded (zero-scale) MFMA. So use the tail only for KI >= the
+    # threshold; short non-256-K rounds up (KI_LOOP = KI+1) and lets the last block's s=1
+    # multiply by the zero-padded scale.
+    _USE_TAIL = bool(_K128) and KI >= _MXFP4_TAIL_MIN
+    _K128TAIL = 1 if _USE_TAIL else 0
+    KI_LOOP = KI if (_USE_TAIL or not _K128) else (KI + 1)
     NABUF, NBB, OCC = 2, 2, 1
     N_SUB = BLOCK_K // 128
     BPR = BLOCK_K // 2
@@ -387,10 +401,10 @@ def _build_grouped_mxfp4_nt_kernel(
 
         # ---- fill operand buffers ----
         for _pp in range_constexpr(0, _PRELL):
-            if const_expr(KI > _pp):
+            if const_expr(KI_LOOP > _pp):
                 a_g2s.load(A_buf[_pp], a_off + _pp * KSTEP)
         for _pp in range_constexpr(0, _PRELL):
-            if const_expr(KI > _pp):
+            if const_expr(KI_LOOP > _pp):
                 bl_g2s.load(BL_buf[_pp], bl_off + _pp * KSTEP)
                 br_g2s.load(BR_buf[_pp], br_off + _pp * KSTEP)
         _llvm.inline_asm(
@@ -442,7 +456,7 @@ def _build_grouped_mxfp4_nt_kernel(
             N_SUB,
             N_LDS_STEPS_A,
             N_LDS_STEPS_BH,
-            fx.Int32((KI // 2) * 2),
+            fx.Int32((KI_LOOP // 2) * 2),
             soff6_a,
             soff6_bl,
             soff6_br,
@@ -452,7 +466,7 @@ def _build_grouped_mxfp4_nt_kernel(
             _scrsb_v,
             sc_voff6,
             sc_soff06,
-            ki=KI,
+            ki=KI_LOOP,
             sc_buf_stride=(_SCBUF * 4),
             tail128=_tail128,
         )
@@ -478,7 +492,9 @@ _GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, gm, xcd, gn, out_fp16) -> [raw
 # across aligned + fat-N + square shapes. A single fixed config keeps ONE compiled kernel
 # per shape (a timed 7-candidate sweep exploded compile time + code-object memory on the
 # full test sweep of ~480 shapes -> segfault), while retaining the xcd=1 win.
-_GMXFP4_DEFAULT_CFG = (2, 1, 4)  # (group_m, num_xcds, group_n)
+_GMXFP4_DEFAULT_CFG = tuple(int(x) for x in _os.environ.get("MXFP4_CFG", "2,1,4").split(","))  # (gm,xcd,gn)
+_MXFP4_SMALL_CFG = tuple(int(x) for x in _os.environ.get("MXFP4_SMALL_CFG", "1,8,0").split(","))  # few-tile
+_MXFP4_SMALL_GRID = int(_os.environ.get("MXFP4_SMALL_GRID", "256"))  # grid_upper < this -> small cfg
 # JIT compile-cache bound: each distinct shape compiles one FlyDSL kernel (GPU code object).
 # Real MoE uses a handful of shapes; a broad test sweep (~480 shapes) accumulates enough
 # code objects to exhaust memory -> drop the caches (and gc the modules) past this cap. A
@@ -618,7 +634,12 @@ def grouped_gemm_mxfp4_flydsl_kernel(
             _GMXFP4_AT_CACHE[atk] = e2
         return e2
 
-    run_eager_or_capture(_entry(_GMXFP4_DEFAULT_CFG), args, 1)
+    # Deterministic config by output-tile count (1 compile/shape, no timed autotune):
+    # few tiles under-fill the CUs -> xcd=8 spreads WGs across all 8 XCDs for occupancy
+    # (measured +20-30% on the small/short-K worst shapes); many tiles -> xcd=1 group-major
+    # for L2 locality (xcd=8 there regresses ~20%). The large-shape (2,1,4) default is kept.
+    cfg = _MXFP4_SMALL_CFG if grid_upper < _MXFP4_SMALL_GRID else _GMXFP4_DEFAULT_CFG
+    run_eager_or_capture(_entry(cfg), args, 1)
     _bound_caches(_GMXFP4_LAUNCH_CACHE, _GMXFP4_AT_CACHE, _GMXFP4_WS_CACHE)
     return out[:, :N_out] if N_out != N else out
 
