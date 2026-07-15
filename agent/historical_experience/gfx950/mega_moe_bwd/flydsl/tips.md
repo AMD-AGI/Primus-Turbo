@@ -178,3 +178,16 @@ dgrad quantizes along H, wgrad contracts over the pool/token axis (quantize alon
 they need different quantizations of dy (no free pool reuse). Use `grouped_quantize_fp8_with_trans`
 (dual-axis) + `grouped_gemm_fp8_variable_k_impl(MX_BLOCKWISE)` for dW2, mirroring
 `MXFP8GroupedGEMMFunction.backward` (validated). fp8 weight-grad prefers E5M2 + SNR gate.
+
+## dW2 colwise (re)quant: wider packed-i32 loads REGRESS it (occupancy) — do not retry
+The colwise transpose-(re)quant (`quant_colwise_trans_flydsl`, the dW2 `a`/`b` operands) is
+LATENCY-bound and its scalar `vec_width=1` i8 path already MAXES occupancy (VGPR≈36, ~16 waves/CU,
+LDS-limited). Widening the strided column read to VW=4 (each thread owns 4 columns, read as one
+packed i32, unpack via `cvt_f32_fp8(.., byte)`; MB coupled to VW*MB=4 so LDS is held constant) makes
+the requant **+80% slower** (0.337→0.607 ms, full dW2 +20%), byte-identical output. Root cause: the
+per-column block-amax needs all 32 vals/column LIVE, so VW=4 holds 4×32 f32 + 32 hoisted i32 loads
+→ VGPR ~3-4x → VGPR-occupancy-limited → the latency-bound kernel loses the resident waves that are
+its ONLY latency-hiding mechanism. LDS was held constant but VGPR is the binding constraint. Wider
+loads are the WRONG lever here; VW=2 has the same mechanism (less severe, still a regression risk).
+The (re)quant is at its practical single-pass limit — the dW2 wgrad wins are the fp8 GEMM (near
+roofline) and producer-fusion (emit colwise-fp8 from swiglu_backward), NOT the standalone quant.

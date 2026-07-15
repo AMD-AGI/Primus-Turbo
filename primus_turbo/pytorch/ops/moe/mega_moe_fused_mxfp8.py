@@ -13,12 +13,18 @@ mxfp8-quant epilogue + fp8 XGMI PUSH + fp8-dequant weighted reduce).
 Backward (conjugate via the Dispatch<->Combine duality, mirrors the bf16
 `MegaMoEFusedFunction.backward`):
   * STEP1 (dispatch(dy) + fc2 dgrad, NN): **MXFP8** fork -- emits ``grad_swiglu`` + the dispatched-dy
-    pool in native rowwise-fp8 (the dW2 ``a`` operand). STEP3 (fc1 dgrad + combine) + dW1: bf16.
+    pool in native rowwise-fp8 (the dW2 ``a`` operand). STEP3 (fc1 dgrad + combine): fp8 GEMM + bf16
+    combine/reduce.
   * dW2 (fc2 weight grad, variable-K over the pool): **MXFP8** -- the ``a`` operand
     (``dispatch_l2_grad``) is requant-fused colwise DIRECTLY from the STEP1 rowwise-fp8 pool (no
     bf16 round-trip, LDS-transposed coalesced write); ``act_weighted`` is colwise-quantized; then
     the mxfp8 variable-K wgrad (`grouped_gemm_fp8_variable_k_impl`, MX_BLOCKWISE, autotuned).
     dW2 is the large GEMM (H*I*pool) -> the main backward win (~1.04x bf16 balanced).
+  * dW1 (fc1 weight grad, variable-K over the pool): **MXFP8** and **LOCAL** -- ``grad_l1^T @ pool_x``
+    contracts over pool tokens already gathered on this rank, so (unlike the bf16 path that
+    re-dispatches ``saved_x``) it needs NO cross-rank transfer. It reuses the FORWARD-dispatched
+    fc1-input pool (stashed rowwise-fp8 on ctx as ``pool_x_fp8``): ``grad_l1`` is colwise-quantized,
+    the pool requant-fused colwise from fp8 (b-branch). Mirrors dW2.
 
 ``_DW2_FP8_FORMAT`` selects the dW2 wgrad fp8 encoding (default E5M2 for gradient range;
 E4M3 measured higher-SNR at DSv3 magnitudes -- gated by dW2 SNR + few-step training loss)."""
@@ -58,9 +64,6 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_impl,
-)
-from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import (
-    dispatch_grouped_gemm_impl,
 )
 from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (
     colwise_grouped_meta,
@@ -112,6 +115,33 @@ def _mxfp8_variable_k_wgrad(a_fp8, b_bf16, group_lens, group_offs):
         pool_fp8, pool_scale, _DW2_FP8_FORMAT, meta=meta
     )
     b_t, b_ts, _, _ = colwise_quant_mxfp8_grouped_flydsl(b_bf16, _DW2_FP8_FORMAT, meta=meta)
+    return grouped_gemm_fp8_variable_k_impl(
+        a_t, b_t,
+        a_ts.view(torch.float8_e8m0fnu), b_ts.view(torch.float8_e8m0fnu),
+        lens_pc.to(torch.int64), offs_pc.to(torch.int64),
+        trans_a=False, trans_b=False, trans_c=False,
+        out_dtype=torch.bfloat16, granularity=ScalingGranularity.MX_BLOCKWISE.value,
+        num_cu=None, default_backend=BackendType.FLYDSL.value,
+    )
+
+
+def _mxfp8_variable_k_wgrad_dw1(a_bf16, b_fp8, group_lens, group_offs):
+    """dW1 = a^T @ b (variable-K over the pool/contraction axis) in MXFP8. Returns [G, 2I, H]
+    bf16 -- for fc1: ``a`` = grad_l1 [P,2I] (bf16), ``b`` = pool_x [P,H] (the FORWARD-dispatched
+    fc1-input pool, kept in its native rowwise-fp8 form).
+
+    LOCAL (per-rank): dW1 contracts over the pool tokens, which are already gathered on this rank,
+    so -- unlike the bf16 fused path that re-dispatches ``saved_x`` -- there is NO cross-rank
+    transfer. ``a`` (grad_l1, bf16) is colwise-quantized; ``b`` (the fp8 pool) is requant colwise
+    DIRECTLY from fp8 (fused dequant->requant, no bf16 round-trip). Both emit ONLY the transposed
+    operand + raw E8M0 the wgrad needs; the metadata is shared. Mirrors
+    :func:`_mxfp8_variable_k_wgrad` (dW2) with the fp8 operand on ``b`` instead of ``a``."""
+    meta = colwise_grouped_meta(group_lens, group_offs)
+    a_t, a_ts, lens_pc, offs_pc = colwise_quant_mxfp8_grouped_flydsl(a_bf16, _DW2_FP8_FORMAT, meta=meta)
+    pool_fp8, pool_scale = b_fp8
+    b_t, b_ts, _, _ = colwise_requant_mxfp8_grouped_fp8in_flydsl(
+        pool_fp8, pool_scale, _DW2_FP8_FORMAT, meta=meta
+    )
     return grouped_gemm_fp8_variable_k_impl(
         a_t, b_t,
         a_ts.view(torch.float8_e8m0fnu), b_ts.view(torch.float8_e8m0fnu),
@@ -278,6 +308,14 @@ class MegaMoEFusedMxfp8Function(torch.autograd.Function):
         )
         # per-pool-row routing weight (prologue-scattered); clone before L2 reuses the buffer
         dispatch_weights = symm.weight_recv_buf.clone() if save_bwd else None
+        # dW1 (fc1 wgrad) reuses THIS dispatched fc1-input pool -- clone its native rowwise-fp8 form
+        # now, before L2 / backward STEP1 overwrite symm.pool_fp8. Lets the backward dW1 be a LOCAL
+        # variable-K wgrad (grad_l1^T @ pool_x), with NO cross-rank re-dispatch (mirrors dW2's reuse
+        # of the STEP1 pool). fp8 (1B) pool [P,H] + E8M0 scale [P,H//32].
+        pool_x_fp8 = None
+        if save_bwd:
+            _Px, _Hx = symm.pool_fp8.shape
+            pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(_Px, _Hx // 32).clone())
 
         act = swiglu(l1)
 
@@ -300,22 +338,26 @@ class MegaMoEFusedMxfp8Function(torch.autograd.Function):
             ctx.block_m = block_m
             ctx.block_n = block_n
             ctx.handle_len = len(handle)
-            # w2t_fp8 / w1t_fp8 (module-owned, version-keyed w2^T / w1^T dgrad prep): non-diff derived
-            # tensors -> stash on ctx (not save_for_backward) so STEP1/STEP3 dgrad skip transpose+quant.
+            # w2t_fp8 / w1t_fp8 (module-owned, version-keyed w2^T / w1^T dgrad prep) + pool_x_fp8 (this
+            # step's dispatched fc1-input pool for dW1): non-diff derived tensors -> stash on ctx (not
+            # save_for_backward). STEP1/STEP3 dgrad skip transpose+quant; dW1 skips the re-dispatch.
             ctx.w2t_fp8 = w2t_fp8
             ctx.w1t_fp8 = w1t_fp8
-            ctx.save_for_backward(*handle, x, l1, dispatch_weights, w1, w2, topk_idx)
+            ctx.pool_x_fp8 = pool_x_fp8
+            # NOTE: x is NOT saved -- dW1 reuses pool_x_fp8 instead of re-dispatching saved_x.
+            ctx.save_for_backward(*handle, l1, dispatch_weights, w1, w2, topk_idx)
         return y
 
     @staticmethod
     @torch.no_grad()
     def backward(ctx, grad_y: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], ...]:
-        """Conjugate of the mxfp8 forward. STEP1 fp8 fork; STEP3/dW1 bf16; dW2 MXFP8 (a-branch fused)."""
+        """Conjugate of the mxfp8 forward. STEP1 fp8 fork; dW2 + dW1 MXFP8 variable-K (a/b-branch
+        fused, LOCAL); STEP3 fc1-dgrad+combine (fp8 GEMM, bf16 combine/reduce)."""
         if grad_y is None:
             return (None,) * 12
         saved = ctx.saved_tensors
         handle = tuple(saved[: ctx.handle_len])
-        (saved_x, l1_out, dispatch_weights_in_buf, w1, w2, topk_idx) = saved[ctx.handle_len :]
+        (l1_out, dispatch_weights_in_buf, w1, w2, topk_idx) = saved[ctx.handle_len :]
 
         group_lens = handle[_HANDLE_GROUP_LENS]
         group_offs = handle[_HANDLE_GROUP_OFFS]
@@ -352,11 +394,9 @@ class MegaMoEFusedMxfp8Function(torch.autograd.Function):
             BM=ctx.block_m, BN=ctx.block_n, num_combine_cu=16,
         )
 
-        # dW1 (bf16): pool(x)^T @ grad_l1 (variable-K TN wgrad; re-dispatch saved x)
-        dW1, _, _, _ = dispatch_grouped_gemm_impl(
-            saved_x, grad_l1, ctx.group, BackendType.FLYDSL.value,
-            handle=handle, layout="tn", trans_c=True, num_dispatch_cu=16,
-        )
+        # dW1 (MXFP8): grad_l1^T @ pool_x (variable-K wgrad). LOCAL -- reuses the FORWARD-dispatched
+        # fc1-input pool (rowwise-fp8, stashed on ctx), so NO cross-rank re-dispatch (mirrors dW2).
+        dW1 = _mxfp8_variable_k_wgrad_dw1(grad_l1, ctx.pool_x_fp8, group_lens, group_offs)
 
         grad_topk_weights = grad_topk_weights_flat.view(num_tokens, num_topk)
         # grads for (x, topk_idx, topk_weights, w1, w2, group, block_m, block_n, w1_fp8, w2_fp8,

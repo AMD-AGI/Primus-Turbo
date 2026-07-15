@@ -523,6 +523,314 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(_WORLD)
     @parametrize("top_k", [2])
+    def test_dw1_fp8_vs_bf16(self, top_k):
+        """Validate fp8 dW1 on REAL mega-pool data (same-tensor comparison): replicate the forward
+        L1 (dispatch+fc1), grab the dispatched fc1-input pool (pool_x, the dW1 `b` operand, in native
+        rowwise-fp8) BEFORE STEP1 overwrites symm.pool_fp8 -- exactly what the forward stashes as
+        ctx.pool_x_fp8; run STEP1 + swiglu^T for grad_l1; then compute dW1 both ways (bf16
+        grouped_gemm_variable_k on the dequant'd pool vs the LOCAL mxfp8 variable-K wgrad) on those
+        SAME tensors and gate by SNR. Confirms dW1 is a correct LOCAL wgrad (grad_l1^T @ pool_x, NO
+        cross-rank re-dispatch)."""
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        import primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 as mxmod
+        from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+        from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
+            dispatch_grouped_gemm_mxfp8,
+        )
+        from primus_turbo.flydsl.mega.fp8.quant import (
+            quantize_grouped_weight_mxfp8,
+            quantize_rowwise_mxfp8,
+        )
+        from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
+        from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+        from primus_turbo.pytorch.core.backend import BackendType
+        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
+            grouped_gemm_variable_k_impl,
+        )
+
+        rank, dev = self.rank, self.device
+        world, epr = self.world_size, _E // self.world_size
+        x = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+        w1 = torch.randn(epr, 2 * _I, _H, device=dev, dtype=torch.bfloat16) * 0.05
+        w2 = torch.randn(epr, _H, _I, device=dev, dtype=torch.bfloat16) * 0.05
+        gate = torch.randn(_T, _E, device=dev)
+        topk_w0, topk_idx = torch.sigmoid(gate).topk(top_k, dim=-1)
+        topk_w = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32)
+
+        with torch.no_grad():
+            symm = get_symm_buffer_for_mega_moe(
+                group, num_experts=epr * world, num_max_tokens_per_rank=_T, num_topk=top_k,
+                hidden=_H, intermediate_hidden=_I, block_m=256, block_n=256, use_mxfp8=True,
+            )
+            sym_layout = symm.make_sym_layout()
+            handle = tuple(
+                dispatch_prologue(
+                    topk_idx.to(torch.int64), topk_w, sym_layout=sym_layout, num_tokens=_T,
+                    num_topk=top_k, num_experts=epr * world, world_size=world, rank=symm.rank,
+                    experts_per_rank=epr, block_m=256, num_max_pool_tokens=symm.num_max_pool_tokens,
+                )
+            )
+            w1q, w1s = quantize_grouped_weight_mxfp8(w1)
+            xq, xs = quantize_rowwise_mxfp8(x)
+            symm.scoreboard.zero_()
+            torch.cuda.synchronize(); group.barrier()
+            l1 = dispatch_grouped_gemm_mxfp8(xq, xs, w1q, w1s, handle, sym_layout, symm, BM=256, BN=256)
+            dispatch_weights = symm.weight_recv_buf.clone()
+            # grab the dispatched fc1-input pool NOW (STEP1 below overwrites symm.pool_fp8)
+            P, Hh = symm.pool_fp8.shape
+            pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(P, Hh // 32).clone())
+
+            dy = torch.randn(_T, _H, device=dev, dtype=torch.bfloat16)
+            grad_swiglu, _ = mxmod._mxfp8_step1_dispatch_dgrad(dy, w2, group, handle, 256, 256)
+            grad_l1, _, _ = swiglu_backward(
+                grad_swiglu, l1, scale=dispatch_weights, return_gate=True, return_act_w=True,
+            )
+            # dequant pool_x (E4M3 * 2^e8m0 lossless) -> bf16 for the bf16 reference
+            pf = pool_x_fp8[0].to(torch.float32).view(P, Hh // 32, 32)
+            ps = pool_x_fp8[1].reshape(P, Hh // 32).view(torch.uint8).to(torch.int32)
+            sc = torch.exp2((ps - 127).to(torch.float32)).view(P, Hh // 32, 1)
+            pool_x_bf = (pf * sc).view(P, Hh).to(torch.bfloat16)
+            group_lens, group_offs = handle[9], handle[10]
+            # dW1 = grad_l1^T @ pool_x -> [G, 2I, H]
+            dW1_bf = grouped_gemm_variable_k_impl(
+                grad_l1, pool_x_bf, group_lens, group_offs,
+                trans_a=True, trans_b=False, trans_c=False, num_cu=None,
+                default_backend=BackendType.TRITON.value,
+            )
+            dW1_fp8 = mxmod._mxfp8_variable_k_wgrad_dw1(grad_l1, pool_x_fp8, group_lens, group_offs)
+
+        self.assertEqual(dW1_fp8.shape, dW1_bf.shape)
+        self.assertEqual(tuple(dW1_fp8.shape), (epr, 2 * _I, _H))
+        self.assertTrue(torch.isfinite(dW1_fp8.float()).all().item(), "fp8 dW1 non-finite")
+        snr = torch.tensor([compute_snr(dW1_bf, dW1_fp8)], device=dev)
+        dist.all_reduce(snr, op=dist.ReduceOp.MIN)
+        snr = float(snr.item())
+        if rank == 0:
+            print(f"[mxfp8 dW1 top_k={top_k}] fp8 vs bf16 min SNR = {snr:.2f} dB (fmt={mxmod._DW2_FP8_FORMAT})")
+        self.assertGreaterEqual(snr, 15.0, f"fp8 dW1 SNR {snr:.2f} dB < 15.0")
+        dist.destroy_process_group()
+
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [8])
+    def test_dw1_bench(self, top_k):
+        """Bench dW1 at the real DSv3 EP8 shape: NEW local mxfp8 variable-K wgrad (grad_l1^T @ pool_x,
+        reuses the forward-dispatched fp8 pool, NO cross-rank comm) vs the OLD bf16 fused
+        re-dispatch+TN wgrad (dispatch_grouped_gemm_impl tn: cross-rank PUSH saved_x + bf16 wgrad).
+        Both timed as PURE KERNEL time (the host reset+barrier is outside the cuda-event window).
+        PT_DW1_BENCH=1."""
+        if os.environ.get("PT_DW1_BENCH", "0") == "0":
+            self.skipTest("bench (set PT_DW1_BENCH=1)")
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        import primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 as mxmod
+        from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+        from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import dispatch_grouped_gemm_mxfp8
+        from primus_turbo.flydsl.mega.fp8.quant import quantize_grouped_weight_mxfp8, quantize_rowwise_mxfp8
+        from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
+        from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+        from primus_turbo.pytorch.core.backend import BackendType
+        from primus_turbo.pytorch.kernels.mega_moe.dispatch_grouped_gemm_impl import dispatch_grouped_gemm_impl
+
+        rank, dev = self.rank, self.device
+        world, epr = self.world_size, _E // self.world_size
+        H, I, T = 7168, 2048, 8192  # real DSv3 EP8 shape
+        x = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
+        w1 = torch.randn(epr, 2 * I, H, device=dev, dtype=torch.bfloat16) * 0.05
+        w2 = torch.randn(epr, H, I, device=dev, dtype=torch.bfloat16) * 0.05
+        gate = torch.randn(T, _E, device=dev)
+        topk_w0, topk_idx = torch.sigmoid(gate).topk(top_k, dim=-1)
+        topk_w = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32)
+
+        with torch.no_grad():
+            symm = get_symm_buffer_for_mega_moe(
+                group, num_experts=epr * world, num_max_tokens_per_rank=T, num_topk=top_k,
+                hidden=H, intermediate_hidden=I, block_m=256, block_n=256, use_mxfp8=True,
+            )
+            sym_layout = symm.make_sym_layout()
+            handle = tuple(dispatch_prologue(
+                topk_idx.to(torch.int64), topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=top_k,
+                num_experts=epr * world, world_size=world, rank=symm.rank, experts_per_rank=epr,
+                block_m=256, num_max_pool_tokens=symm.num_max_pool_tokens,
+            ))
+            w1q, w1s = quantize_grouped_weight_mxfp8(w1)
+            xq, xs = quantize_rowwise_mxfp8(x)
+            symm.scoreboard.zero_(); torch.cuda.synchronize(); group.barrier()
+            l1 = dispatch_grouped_gemm_mxfp8(xq, xs, w1q, w1s, handle, sym_layout, symm, BM=256, BN=256)
+            dw = symm.weight_recv_buf.clone()
+            # grab the dispatched fc1-input pool BEFORE STEP1 overwrites symm.pool_fp8
+            P, Hh = symm.pool_fp8.shape
+            pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(P, Hh // 32).clone())
+            dy = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
+            gsw, _ = mxmod._mxfp8_step1_dispatch_dgrad(dy, w2, group, handle, 256, 256)
+            grad_l1, _, _ = swiglu_backward(gsw, l1, scale=dw, return_gate=True, return_act_w=True)
+            group_lens, group_offs = handle[9], handle[10]
+
+            def new_local():
+                mxmod._mxfp8_variable_k_wgrad_dw1(grad_l1, pool_x_fp8, group_lens, group_offs)
+
+            def old_redispatch():
+                dispatch_grouped_gemm_impl(
+                    x, grad_l1, group, BackendType.FLYDSL.value,
+                    handle=handle, layout="tn", trans_c=True, num_dispatch_cu=16,
+                )
+
+            def bench(fn, it=30, wu=10, reset=None):
+                torch.cuda.synchronize(); group.barrier()
+                if reset is None:  # local self-contained op: back-to-back, one event pair round the loop
+                    for _ in range(wu):
+                        fn()
+                    torch.cuda.synchronize(); group.barrier()
+                    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+                    s.record()
+                    for _ in range(it):
+                        fn()
+                    e.record(); torch.cuda.synchronize()
+                    return s.elapsed_time(e) / it
+                # cross-rank op: per-iter reset+barrier (outside the event window -> not timed)
+                for _ in range(wu):
+                    reset(); torch.cuda.synchronize(); group.barrier()
+                    fn(); torch.cuda.synchronize(); group.barrier()
+                total = 0.0
+                for _ in range(it):
+                    reset(); torch.cuda.synchronize(); group.barrier()
+                    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+                    s.record(); fn(); e.record(); torch.cuda.synchronize(); group.barrier()
+                    total += s.elapsed_time(e)
+                return total / it
+
+            t_new = bench(new_local, reset=None)
+            t_old = bench(old_redispatch, reset=lambda: symm.scoreboard.zero_())
+
+        m_pad = int(handle[10][-1].item())
+        gflop = 2 * m_pad * H * (2 * I) / 1e12
+        t = torch.tensor([t_new, t_old], device=dev)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        if rank == 0:
+            tn_, to_ = float(t[0]), float(t[1])
+            print(f"[dW1 bench topk={top_k} H={H} I={I} T={T} M(pool)={m_pad} FLOP={gflop:.2f}T]")
+            print(f"  NEW local mxfp8 (grad_l1 quant + pool requant + fp8 variable-K, NO comm) = "
+                  f"{tn_:.3f} ms  ({gflop / tn_ * 1e3:.1f} TFLOPS-eff)")
+            print(f"  OLD bf16 re-dispatch (cross-rank PUSH saved_x + bf16 TN wgrad)           = "
+                  f"{to_:.3f} ms")
+            print(f"  speedup (old/new) = {to_ / tn_:.2f}x")
+        dist.destroy_process_group()
+
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [8])
+    def test_dw2_bench(self, top_k):
+        """Bench dW2 (fc2 wgrad) at the real DSv3 EP8 shape with a BREAKDOWN: the full mxfp8
+        variable-K wgrad vs its pieces (colwise_grouped_meta / requant(pool) / quant(act) /
+        variable-K GEMM) vs the bf16 grouped_gemm_variable_k reference. Isolates where the fp8-vs-bf16
+        margin goes (the GEMM should be ~2x bf16; the quant/requant is the overhead). All LOCAL (no
+        comm). PT_DW2_BENCH=1."""
+        if os.environ.get("PT_DW2_BENCH", "0") == "0":
+            self.skipTest("bench (set PT_DW2_BENCH=1)")
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        import primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 as mxmod
+        from primus_turbo.flydsl.mega.dispatch_prologue_kernel import dispatch_prologue
+        from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import dispatch_grouped_gemm_mxfp8
+        from primus_turbo.flydsl.mega.fp8.quant import quantize_grouped_weight_mxfp8, quantize_rowwise_mxfp8
+        from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (
+            colwise_grouped_meta, colwise_quant_mxfp8_grouped_flydsl,
+            colwise_requant_mxfp8_grouped_fp8in_flydsl,
+        )
+        from primus_turbo.flydsl.mega.swiglu_kernel import swiglu_backward
+        from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+        from primus_turbo.pytorch.core.backend import BackendType
+        from primus_turbo.pytorch.core.low_precision import ScalingGranularity
+        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import grouped_gemm_fp8_variable_k_impl
+        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import grouped_gemm_variable_k_impl
+
+        rank, dev = self.rank, self.device
+        world, epr = self.world_size, _E // self.world_size
+        H, I, T = 7168, 2048, 8192  # real DSv3 EP8 shape
+        fmt = mxmod._DW2_FP8_FORMAT
+        x = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
+        w1 = torch.randn(epr, 2 * I, H, device=dev, dtype=torch.bfloat16) * 0.05
+        w2 = torch.randn(epr, H, I, device=dev, dtype=torch.bfloat16) * 0.05
+        gate = torch.randn(T, _E, device=dev)
+        topk_w0, topk_idx = torch.sigmoid(gate).topk(top_k, dim=-1)
+        topk_w = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32)
+
+        with torch.no_grad():
+            symm = get_symm_buffer_for_mega_moe(
+                group, num_experts=epr * world, num_max_tokens_per_rank=T, num_topk=top_k,
+                hidden=H, intermediate_hidden=I, block_m=256, block_n=256, use_mxfp8=True,
+            )
+            sym_layout = symm.make_sym_layout()
+            handle = tuple(dispatch_prologue(
+                topk_idx.to(torch.int64), topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=top_k,
+                num_experts=epr * world, world_size=world, rank=symm.rank, experts_per_rank=epr,
+                block_m=256, num_max_pool_tokens=symm.num_max_pool_tokens,
+            ))
+            w1q, w1s = quantize_grouped_weight_mxfp8(w1)
+            xq, xs = quantize_rowwise_mxfp8(x)
+            symm.scoreboard.zero_(); torch.cuda.synchronize(); group.barrier()
+            l1 = dispatch_grouped_gemm_mxfp8(xq, xs, w1q, w1s, handle, sym_layout, symm, BM=256, BN=256)
+            dw = symm.weight_recv_buf.clone()
+            dy = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
+            grad_swiglu, pool_handle = mxmod._mxfp8_step1_dispatch_dgrad(dy, w2, group, handle, 256, 256)
+            _, _, act_weighted = swiglu_backward(grad_swiglu, l1, scale=dw, return_gate=True, return_act_w=True)
+            group_lens, group_offs = handle[9], handle[10]
+            pool_fp8, pool_scale = pool_handle
+            # bf16 reference operands (dequant the pool once, outside the timed loop)
+            P, Hh = pool_fp8.shape
+            pf = pool_fp8.to(torch.float32).view(P, Hh // 32, 32)
+            ps = pool_scale.reshape(P, Hh // 32).view(torch.uint8).to(torch.int32)
+            disp_bf = (pf * torch.exp2((ps - 127).to(torch.float32)).view(P, Hh // 32, 1)).view(P, Hh).to(torch.bfloat16)
+            # pre-quantized operands for the isolated-GEMM timing
+            meta0 = colwise_grouped_meta(group_lens, group_offs)
+            a_t, a_ts, lens_pc, offs_pc = colwise_requant_mxfp8_grouped_fp8in_flydsl(pool_fp8, pool_scale, fmt, meta=meta0)
+            b_t, b_ts, _, _ = colwise_quant_mxfp8_grouped_flydsl(act_weighted, fmt, meta=meta0)
+
+            def bench(fn, it=30, wu=10):
+                torch.cuda.synchronize(); group.barrier()
+                for _ in range(wu):
+                    fn()
+                torch.cuda.synchronize(); group.barrier()
+                s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+                s.record()
+                for _ in range(it):
+                    fn()
+                e.record(); torch.cuda.synchronize()
+                return s.elapsed_time(e) / it
+
+            t_full = bench(lambda: mxmod._mxfp8_variable_k_wgrad(pool_handle, act_weighted, group_lens, group_offs))
+            t_meta = bench(lambda: colwise_grouped_meta(group_lens, group_offs))
+            t_req = bench(lambda: colwise_requant_mxfp8_grouped_fp8in_flydsl(pool_fp8, pool_scale, fmt, meta=meta0))
+            t_qnt = bench(lambda: colwise_quant_mxfp8_grouped_flydsl(act_weighted, fmt, meta=meta0))
+            t_gemm = bench(lambda: grouped_gemm_fp8_variable_k_impl(
+                a_t, b_t, a_ts.view(torch.float8_e8m0fnu), b_ts.view(torch.float8_e8m0fnu),
+                lens_pc.to(torch.int64), offs_pc.to(torch.int64), trans_a=False, trans_b=False,
+                trans_c=False, out_dtype=torch.bfloat16, granularity=ScalingGranularity.MX_BLOCKWISE.value,
+                num_cu=None, default_backend=BackendType.FLYDSL.value))
+            t_bf16 = bench(lambda: grouped_gemm_variable_k_impl(
+                disp_bf, act_weighted, group_lens, group_offs, trans_a=True, trans_b=False,
+                trans_c=False, num_cu=None, default_backend=BackendType.TRITON.value))
+
+        m_pad = int(handle[10][-1].item())
+        gflop = 2 * m_pad * H * I / 1e12
+        t = torch.tensor([t_full, t_meta, t_req, t_qnt, t_gemm, t_bf16], device=dev)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        if rank == 0:
+            tf, tm, tr, tq, tg, tb = [float(v) for v in t]
+            print(f"[dW2 bench topk={top_k} H={H} I={I} T={T} M(pool)={m_pad} FLOP={gflop:.2f}T fmt={fmt}]")
+            print(f"  full mxfp8 wgrad = {tf:.3f} ms   |   bf16 ref = {tb:.3f} ms   |   fp8/bf16 = {tf/tb:.2f}x "
+                  f"(full)  {tg/tb:.2f}x (GEMM-only)")
+            print(f"  breakdown: meta={tm:.3f}  requant(pool)={tr:.3f}  quant(act)={tq:.3f}  "
+                  f"GEMM={tg:.3f} ({gflop/tg*1e3:.0f} TFLOPS)  [sum={tm+tr+tq+tg:.3f}]")
+        dist.destroy_process_group()
+
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [2])
     def test_step3_fp8_vs_bf16(self, top_k):
         """Validate fp8 STEP3 (fc1-dgrad + combine) vs bf16 on REAL mega-pool data: forward L1 ->
         handle/l1/dispatch_weights, then STEP1(bf16 dispatch dy)+STEP2(swiglu^T) -> grad_l1/grad_gate,
