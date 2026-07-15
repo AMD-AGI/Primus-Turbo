@@ -1479,35 +1479,30 @@ def _balanced_group_offs(m_total, G, device):
     return offs.view(torch.int32)
 
 
-def _balanced_targs(args, m_total, G):
-    """args with the group_offs slot (index 5) replaced by a balanced m_total/G split,
-    for distribution-independent autotune timing."""
-    bal = _balanced_group_offs(m_total, G, args[2].device)
-    return args[:5] + (bal,) + args[6:]
-
-
-# Fixed 8-wave candidates shared by NT (fwd) and NN (dgrad): (BLOCK_M, num_xcd, group_m,
-# group_n). Chosen from measured per-shape winners across m_total/G in 1024..8192, 7
-# production shapes, 28 combos each op: these 3 are the winner in ~26/28 rows across both
-# ops (a 4th xcd1 candidate is added below only for the op/shape that needs it). Autotune
-# candidate count is capped at 4 per shape (NT: 4 of these; NN: 3 of these + 1 4-wave).
 _NP_8WAVE_CANDS = ((256, 8, 4, 0), (256, 8, 8, 0), (256, 8, 4, 4))
 # xcd1 (group-major, B[g] L2-resident) only pays off once B[g] is large; K>=4096 is the
 # observed crossover (deepseek-up K=7168 wins with this at large M, nothing smaller does).
 _NP_LARGE_K = 4096
+_NP_PM_CANON = (1024, 8192)
+_PM_CANON_OVERRIDE = None
 
 
-def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
-    """Per-shape autotune of the non-persistent NT/NN kernel, balanced-timed (1.5% hysteresis,
-    cached per static shape, <=4 candidates raced). NN small-M (G*ceil(pm/128)*ceil(N/256)
-    <=num_cus, underfilled): single BLOCK_M=128, no autotune."""
-    out_view = args[2]
-    # time on a balanced group_offs (args[6] = M_total) so a skewed first call cannot
-    # bias the config pick.
-    targs = _balanced_targs(args, args[6], G)
+def _np_regime(trans_b, N, K, G, M_total):
+    """Coarse M-derived regime bucket for the autotune key (a rule, not a per-M retune):
+    1 = underfilled NN dgrad grid (wants small-M bm128), 0 = steady NK-autotuned."""
+    if not trans_b:
+        pm = M_total // G
+        if G * ((pm + 127) // 128) * ((N + 255) // 256) <= _num_cus():
+            return 1  # small-M dgrad -> bm128
+    return 0  # steady -> NK autotune
+
+
+def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
+    """Race the NT/NN candidates on synthetic balanced tensors at the canonical tokens/group
+    and cache per static (op,N,K,G,dtype,regime), never per M_total. regime==1 -> fixed bm128."""
     # NN B[K,N] per-group traversal: k*BLOCK_K*N rides the 32-bit soffset, so when the
-    # per-group span K*N (args[7]=N) reaches 2^32 fp8 re-base B's SRD per load in i64.
-    i64_tr = (not trans_b) and (K * args[7] >= 2**32)
+    # per-group span K*N reaches 2^32 fp8 re-base B's SRD per load in i64 (M-independent).
+    i64_tr = (not trans_b) and (K * N >= 2**32)
 
     def mk(bm, xcd, gm, gn):
         if trans_b:  # NT: merged factory, non-persistent mode (intrinsic MMA, scalar store)
@@ -1548,12 +1543,26 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
             i64_traverse=i64_tr,
         )
 
-    pm = args[6] // G
-    bm128_tiles = G * ((pm + 127) // 128) * ((args[7] + 255) // 256)
-    if not trans_b and bm128_tiles <= _num_cus():
+    if not trans_b and regime == 1:
         # small-M dgrad: BLOCK_M=128 doubles M-tiles, beats every bm256 swizzle here
         # (boundary sweep +5..31%, never loses) -> single config, no autotune.
         return mk(128, 1, 0, 0)
+
+    a_live, b_i8, out_live = args[0], args[1], args[2]
+    mps = []
+    for pm in (_PM_CANON_OVERRIDE,) if _PM_CANON_OVERRIDE else _NP_PM_CANON:
+        M_c = G * pm
+        a_c = (torch.randn((M_c, a_live.shape[1]), device=a_live.device) * 0.1).to(a_live.dtype)
+        out_c = torch.empty((M_c, N), device=out_live.device, dtype=out_live.dtype)
+        offs_c = _balanced_group_offs(M_c, G, a_live.device)
+        mps.append(
+            [
+                (a_c.view(torch.int8), b_i8, out_c, args[3], args[4], offs_c, M_c, N, args[8]),
+                out_c,
+                None,
+                None,
+            ]
+        )
 
     # NT gets a 4th (xcd1) 8-wave candidate since it has no 4-wave to race; NN keeps 3
     # 8-wave candidates and spends its 4th slot on a single rule-picked 4-wave candidate
@@ -1561,27 +1570,34 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
     cands = list(_NP_8WAVE_CANDS)
     if trans_b and K >= _NP_LARGE_K:
         cands.append((256, 1, 4, 0))
+
+    def _score(launch):
+        """Geomean of the launch time at every canonical M, or None if it drifts/NaNs at
+        any M (numeric guard). Timing each candidate at both ends picks an M-robust config."""
+        prod = 1.0
+        for targs, out_view, ref, refnorm in mps:
+            launch(*targs)
+            torch.cuda.synchronize()
+            if ref is not None:
+                o = out_view.detach().float()
+                e = float(((o - ref) * (o - ref)).sum().item())
+                if (e / refnorm) >= (2e-2**2) or not torch.isfinite(o.view(-1)[:1024]).all().item():
+                    return None
+            prod *= _robust_time(launch, targs)
+        return prod ** (1.0 / len(mps))
+
     base = mk(*cands[0])
-    base(*targs)
-    torch.cuda.synchronize()
-    _r = out_view.detach().clone().float()
-    _rn = float((_r * _r).sum().item()) or 1.0
-
-    def _ok():
-        o = out_view.detach().float()
-        e = float(((o - _r) * (o - _r)).sum().item())
-        return (e / _rn) < (2e-2**2) and torch.isfinite(o.view(-1)[:1024]).all().item()
-
-    best, bt = base, _robust_time(base, targs)
+    for mp in mps:  # establish the per-M numeric reference from the base config
+        base(*mp[0])
+        torch.cuda.synchronize()
+        r = mp[1].detach().clone().float()
+        mp[2], mp[3] = r, (float((r * r).sum().item()) or 1.0)
+    best, bs = base, _score(base)
     for cand in cands[1:]:
         l = mk(*cand)
-        l(*targs)
-        torch.cuda.synchronize()
-        if not _ok():  # numeric guard: never adopt a config that drifts from the base
-            continue
-        t = _robust_time(l, targs)
-        if t < bt * 0.985:  # adopt only if >=1.5% faster (robust timing -> reliable)
-            best, bt = l, t
+        s = _score(l)  # numeric guard folded in: None -> skip
+        if s is not None and s < bs * 0.985:  # adopt only if >=1.5% better (geomean)
+            best, bs = l, s
 
     # Race one 4-wave (occ=1) candidate against the 8-wave winner, dgrad (NN) only (fwd
     # NT 4-wave never wins). Config is a fixed rule on K, not a sweep: large-K -> xcd1
@@ -1609,18 +1625,12 @@ def _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args):
                     f"4-wave joint candidate compile failed (trans_b={trans_b}, K={K}, G={G}, "
                     f"xcd={xcd4}, gm={gm4}, gn={gn4}): {_e4w!r}"
                 )
-                l4 = None
-        else:
-            l4(*targs)
-            torch.cuda.synchronize()
-            if not _ok():
-                l4 = None
+            l4 = None
         if l4 is not None:
-            t = _robust_time(l4, targs)
-            # Re-time `best` right next to it to cancel thermal drift between candidates.
-            tb_now = _robust_time(best, targs)
-            if t < tb_now * 0.985:
-                best, bt = l4, t
+            s = _score(l4)
+            bs_now = _score(best)  # re-score best right next to it to cancel thermal drift
+            if s is not None and s < bs_now * 0.985:
+                best, bs = l4, s
     return best
 
 
@@ -1665,7 +1675,10 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     # grid). M_total is in the key (an underfilled grid prefers a different config).
     capped = num_cu is not None and num_cu > 0
     nonpersist = not capped
-    at_key = (op, N, K, G, out_fp16, cbsz, blgp, M_total, nonpersist, num_cu if capped else 0)
+    # NK autotune key: M_total is NOT in the key; instead a coarse M-derived regime bucket
+    # (steady vs small-M dgrad) is, so one tune covers every M_total (see _np_regime).
+    regime = _np_regime(trans_b, N, K, G, M_total) if nonpersist else 0
+    at_key = (op, N, K, G, out_fp16, cbsz, blgp, regime, nonpersist, num_cu if capped else 0)
     # Full rank (not flattened): a flat reshape(-1) overflows the int32 shape pack
     # when M_total*K / G*N*K > 2^31; the kernel re-bases A/B via i64 base.
     a_i8 = a.view(torch.int8)
@@ -1687,7 +1700,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
             # num_cu<=0 (full device): per-shape autotune the NON-PERSISTENT nt8w/nn8w
             # L2-reuse swizzle (3 candidates, balanced-timed). The straight-line one-
             # tile/WG body avoids the persistent scf.for tile-loop scheduling penalty.
-            launch = _autotune_np_dispatch(trans_b, K, G, out_fp16, cbsz, blgp, args)
+            launch = _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime)
         else:
             # Single persistent prod config (xcd8/agpr/cshuffle/sched), NO autotune.
             # Reached only by capped (num_cu>0 -> reserve CUs for comm overlap, grid
@@ -1932,9 +1945,9 @@ def _compile_grouped_tn_wgrad_persistent(
                 b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=b_rebase
             )
 
-            # i32 offsets: the persistent wgrad is dispatched only for small per-group
-            # token counts (m_total//G <= 1536), so the per-group span mg*OUT never
-            # reaches 2^31 and the 32-bit offset cannot overflow (no i64 traverse needed).
+            # i32 offsets: the persistent wgrad is dispatched only in the short regime
+            # (M_total <= 4096), so the per-group span mg*OUT never reaches 2^31 and the
+            # 32-bit offset cannot overflow (no i64 traverse needed).
             A0_off = block_m * BLOCK_M  # relative to the m_start-folded i64 SRD base
             A1_off = A0_off + LDS_BLOCK_M
             B0_off = block_n * BLOCK_N
@@ -3032,23 +3045,35 @@ def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num
 
 
 # 4-wave (group_m, group_n, num_xcd) candidates raced alongside 8-wave. (8,4,4)/(4,4,8)
-# cover most shapes; long contraction (m_total/G>1536) adds a 3rd picked by larger output
-# dim ((0,0,2) when OUT_M>OUT_N, else (4,16,8)) -- a no-op extra try on square shapes.
-_WGRAD_4WAVE_CANDS_SHORT = ((8, 4, 4), (4, 4, 8))  # m_total/G<=1536
-_WGRAD_4WAVE_CANDS_LONG_BASE = ((8, 4, 4), (4, 4, 8))  # m_total/G>1536
+# cover most shapes; long contraction (M_total>4096) adds both specialists so autotune
+# picks the per-shape optimum (OUT_M>OUT_N vs OUT_N>=OUT_M winner varies).
+_WGRAD_4WAVE_CANDS_SHORT = ((8, 4, 4), (4, 4, 8))  # M_total<=4096 (persist regime)
+_WGRAD_4WAVE_CANDS_LONG_BASE = ((8, 4, 4), (4, 4, 8))  # M_total>4096
 
 
-def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_total, i64_traverse=False):
-    """Per-shape wgrad autotune, balanced-timed, <=4 candidates raced. Races a same-family
-    8-wave pool first (persistent for short contraction m_total/G<=1536, masked-chunked
-    otherwise -- the two kernels tuned for their respective regimes), then joins the
-    occ=1 4-wave whole-loop against the winner. cands[0] is the correctness reference +
-    fallback if a candidate produces NaN/Inf or drifts."""
-    out_view = args[2]
-    # time on a balanced group_offs (m_total split over G) so a skewed call can't bias it.
-    targs = _balanced_targs(args, m_total, G)
+def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, short, i64_traverse=False):
+    """Race the wgrad candidates on synthetic balanced tensors at the live tokens/group and
+    cache per static (OUT_M,OUT_N,G,dtype,short,i64), never per m_total. short -> persistent
+    8-wave pool; long -> masked ref + full 4-wave pool. cands[0] is the correctness ref."""
 
-    short = m_total // G <= 1536
+    lhs_live, rhs_live = args[0], args[1]
+    M_total = lhs_live.shape[0]
+    pms = (_PM_CANON_OVERRIDE,) if _PM_CANON_OVERRIDE else (max(1, M_total // G),)
+    mps = []
+    for pm in pms:
+        M_c = G * pm
+        lhs_c = (torch.randn((M_c, OUT_M), device=lhs_live.device) * 0.1).to(lhs_live.dtype)
+        rhs_c = (torch.randn((M_c, OUT_N), device=rhs_live.device) * 0.1).to(rhs_live.dtype)
+        offs_c = _balanced_group_offs(M_c, G, lhs_live.device)
+        mps.append(
+            [
+                (lhs_c.view(torch.int8), rhs_c.view(torch.int8), args[2], args[3], args[4], offs_c, args[6]),
+                args[2],
+                None,
+                None,
+            ]
+        )
+
     if short:
         cands = [
             _wgrad_compile_cfg(
@@ -3066,28 +3091,38 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_tota
         cands = [_wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 8, i64_traverse=i64_traverse)]
 
     prod = cands[0]  # correctness reference + fallback
-    prod(*targs)
-    torch.cuda.synchronize()
-    if not torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
-        return prod  # numeric guard: prod produced NaN/Inf -> don't time alts
-    _ref = out_view.detach().clone().float()
-    _rn = float((_ref * _ref).sum().item()) or 1.0
+    for mp in mps:  # establish the per-M numeric reference from prod
+        prod(*mp[0])
+        torch.cuda.synchronize()
+        o = mp[1]
+        if not torch.isfinite(o.view(-1)[:1024].float()).all().item():
+            return prod  # numeric guard: prod produced NaN/Inf -> don't time alts
+        r = o.detach().clone().float()
+        mp[2], mp[3] = r, (float((r * r).sum().item()) or 1.0)
 
-    def _ok():
-        o = out_view.detach().float()
-        e = float(((o - _ref) * (o - _ref)).sum().item())
-        return (e / _rn) < (2e-2**2) and torch.isfinite(o.view(-1)[:1024]).all().item()
+    def _score(launch):
+        """Geomean of the launch time at every canonical M, or None if it drifts/NaNs."""
+        prodt = 1.0
+        for targs, ov, ref, refnorm in mps:
+            launch(*targs)
+            torch.cuda.synchronize()
+            o = ov.detach().float()
+            e = float(((o - ref) * (o - ref)).sum().item())
+            if (e / refnorm) >= (2e-2**2) or not torch.isfinite(o.view(-1)[:1024]).all().item():
+                return None
+            prodt *= _robust_time(launch, targs)
+        return prodt ** (1.0 / len(mps))
 
-    best_l, best_t = prod, _robust_time(prod, targs)
-    for l in cands[1:]:  # same-family pool: 1.5% hysteresis
-        t = _robust_time(l, targs)
-        if t < best_t * 0.985:
-            best_l, best_t = l, t
+    best_l, best_s = prod, _score(prod)
+    for l in cands[1:]:  # same-family pool: 1.5% hysteresis (geomean)
+        s = _score(l)
+        if s is not None and s < best_s * 0.985:
+            best_l, best_s = l, s
 
     if short:
         wave4_cands = _WGRAD_4WAVE_CANDS_SHORT
     else:
-        wave4_cands = _WGRAD_4WAVE_CANDS_LONG_BASE + ((0, 0, 2) if OUT_M > OUT_N else (4, 16, 8),)
+        wave4_cands = _WGRAD_4WAVE_CANDS_LONG_BASE + ((0, 0, 2), (4, 16, 8))
     for gm, gn, xcd in wave4_cands:
         l = _compile_grouped_tn_wgrad_4wave(
             OUT_M=OUT_M,
@@ -3100,13 +3135,9 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, m_tota
             group_m=gm,
             group_n=gn,
         )
-        l(*targs)
-        torch.cuda.synchronize()
-        if not _ok():
-            continue
-        t = _robust_time(l, targs)
-        if t < best_t * 0.985:
-            best_l, best_t = l, t
+        s = _score(l)  # numeric guard folded in: None -> skip
+        if s is not None and s < best_s * 0.985:
+            best_l, best_s = l, s
     return best_l
 
 
@@ -3150,13 +3181,14 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     stream = torch.cuda.current_stream()
 
     M_total = lhs.shape[0]
-    at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, M_total)
+    short = M_total <= 4096
+    i64_tr = (M_total * OUT_M >= 2**32) or (M_total * OUT_N >= 2**32)
+    at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, short, i64_tr)
     # out as 2D [G*OUT_M, OUT_N] (the kernel's stacked-group view).
     wargs = (lhs_i8, rhs_i8, out.view(G * OUT_M, OUT_N), lsf, rsf, go32, stream)
     launch = _GROUPED_WGRAD_AT_CACHE.get(at_key)
     if launch is None:
-        i64_tr = (M_total * OUT_M >= 2**32) or (M_total * OUT_N >= 2**32)
-        launch = _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, M_total, i64_tr)
+        launch = _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, short, i64_tr)
         _GROUPED_WGRAD_AT_CACHE[at_key] = launch
     launch(*wargs)
     return out
