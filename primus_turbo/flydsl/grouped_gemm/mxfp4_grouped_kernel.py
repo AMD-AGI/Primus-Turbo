@@ -214,7 +214,10 @@ def _build_grouped_mxfp4_nt_kernel(
     KSTEP = BPR
     K2 = _KR // 2  # operand row stride (bytes) = real K (no operand K-pad)
     N_TILES_A = BLOCK_M // 32
-    LDS_BN_HALF = BLOCK_N // 2
+    # block_n=128 => n_halves=1: the 128-N tile IS the "BL" span (2 wave_n x 64 N), no BR.
+    # LDS_BN_HALF stays 128 (per-2-wave N span) in both cases; only tile width + BR differ.
+    _n_halves = 1 if BLOCK_N < 256 else 2
+    LDS_BN_HALF = BLOCK_N if _n_halves == 1 else BLOCK_N // 2
     N_TILES_BH = LDS_BN_HALF // 32
     LDS_ROW_STRIDE = BPR
     a_lds_size = BLOCK_M * LDS_ROW_STRIDE
@@ -393,7 +396,8 @@ def _build_grouped_mxfp4_nt_kernel(
         for _pp in range_constexpr(0, _PRELL):
             if const_expr(KI_LOOP > _pp):
                 bl_g2s.load(BL_buf[_pp], bl_off + _pp * KSTEP)
-                br_g2s.load(BR_buf[_pp], br_off + _pp * KSTEP)
+                if const_expr(_n_halves == 2):
+                    br_g2s.load(BR_buf[_pp], br_off + _pp * KSTEP)
         _llvm.inline_asm(
             res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)", constraints="", has_side_effects=True
         )
@@ -405,11 +409,25 @@ def _build_grouped_mxfp4_nt_kernel(
         soff6_bl = rocdl.readfirstlane(T.i32, bl_off + fx.Int32(_PRELL * KSTEP))
         soff6_br = rocdl.readfirstlane(T.i32, br_off + fx.Int32(_PRELL * KSTEP))
         _sc1 = _scsoff(sa_b, 64)
-        _sc3 = rocdl.readfirstlane(T.i32, b_exp_bytes + _scsoff(sbr_b, 0))
         _wia = sa_b // I32(128)
-        _wib = (sbl_b // I32(256)) * I32(2) + (sbl_b % I32(256)) // I32(64)
         _soa = rocdl.readfirstlane(T.i32, _wia * I32(K128) * I32(512))
-        _sob = rocdl.readfirstlane(T.i32, b_exp_bytes + _wib * I32(K128) * I32(512))
+        if const_expr(_n_halves == 1):
+            # block_n=128: tile bn's N-64-groups (2bn, 2bn+1) live in tile (bn//2)'s BL
+            # (even bn -> r_region=0) or BR (odd bn -> r_region=1) packed region. Select the
+            # region soffset by bn parity; BR slot unused so point it at a valid soffset.
+            bn256 = bn // I32(2)
+            is_odd = (bn % I32(2)) != I32(0)
+            sbl_e = bn256 * I32(256) + I32(wave_n_off)
+            sbr_o = bn256 * I32(256) + I32(128) + I32(wave_n_off)
+            _wib_e = (sbl_e // I32(256)) * I32(2) + (sbl_e % I32(256)) // I32(64)
+            sob_e = b_exp_bytes + _wib_e * I32(K128) * I32(512)
+            sc3_o = b_exp_bytes + _scsoff(sbr_o, 0)
+            _sob = rocdl.readfirstlane(T.i32, arith.select(is_odd, sc3_o, sob_e))
+            _sc3 = _sob
+        else:
+            _sc3 = rocdl.readfirstlane(T.i32, b_exp_bytes + _scsoff(sbr_b, 0))
+            _wib = (sbl_b // I32(256)) * I32(2) + (sbl_b % I32(256)) // I32(64)
+            _sob = rocdl.readfirstlane(T.i32, b_exp_bytes + _wib * I32(K128) * I32(512))
         sc_soff06 = [_soa, _sc1, _sob, _sc3]
         _tail128 = None
         if const_expr(_K128TAIL):
@@ -456,15 +474,17 @@ def _build_grouped_mxfp4_nt_kernel(
             ki=KI_LOOP,
             sc_buf_stride=(_SCBUF * 4),
             tail128=_tail128,
+            n_halves=_n_halves,
         )
         base_row = m_row + I32(wave_m_off)
         base_col_l = bn * I32(BLOCK_N) + I32(wave_n_off)
-        base_col_r = bn * I32(BLOCK_N) + I32(LDS_BN_HALF) + I32(wave_n_off)
         # store bounded to the group's tight end: StoreCPlain's SRD num_records =
         # m_end*c_n -> partial-tile rows >= m_end (next group) HW-drop.
         store_c = StoreCPlain(C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty)
         store_c.store(accL, base_row, base_col_l, n_valid=_NV)
-        store_c.store(accR, base_row, base_col_r, n_valid=_NV)
+        if const_expr(_n_halves == 2):
+            base_col_r = bn * I32(BLOCK_N) + I32(LDS_BN_HALF) + I32(wave_n_off)
+            store_c.store(accR, base_row, base_col_r, n_valid=_NV)
 
     _pt = {"passthrough": [["amdgpu-agpr-alloc", "256"]]}
     attrs = {"rocdl.flat_work_group_size": "256,256", "rocdl.waves_per_eu": OCC, **_pt}

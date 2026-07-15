@@ -388,6 +388,7 @@ class MfmaScaleFp4:
         ki=None,
         sc_buf_stride=0,
         tail128=None,
+        n_halves=2,  # 2 = BL+BR (256-N tile); 1 = BL only (128-N tile, 2x tiles for occupancy)
         _cache={},  # noqa: B006 -- deliberate cross-call asm compile cache
     ):
         """WHOLE-LOOP bare-asm: the ENTIRE K-loop is ONE inline-asm hw-loop. 2 LDS
@@ -440,6 +441,7 @@ class MfmaScaleFp4:
             _TACC,
             ki,
             tail128 is not None,
+            n_halves,
         )
         if key not in _cache:
             o_acc = list(range(NT))
@@ -541,11 +543,12 @@ class MfmaScaleFp4:
                         r.append(
                             f"ds_read_b128 ${t_bl + ji * n_sub + s + off}, ${i_blb[buf][s]} offset:{ji * ts_b}"
                         )
-                for ji in range(ntb):
-                    for s in range(n_sub):
-                        r.append(
-                            f"ds_read_b128 ${t_br + ji * n_sub + s + off}, ${i_brb[buf][s]} offset:{ji * ts_b}"
-                        )
+                if n_halves == 2:
+                    for ji in range(ntb):
+                        for s in range(n_sub):
+                            r.append(
+                                f"ds_read_b128 ${t_br + ji * n_sub + s + off}, ${i_brb[buf][s]} offset:{ji * ts_b}"
+                            )
                 return r
 
             def emit_g2s(buf, sa_op, sbl_op, sbr_op):
@@ -560,11 +563,12 @@ class MfmaScaleFp4:
                         f"s_add_u32 m0, ${i_g_blb[buf]}, {st * _NWc * 1024}\n"
                         f"buffer_load_dwordx4 ${i_glb[st]}, ${i_rsb}, ${sbl_op} offen lds"
                     )
-                for st in range(nsb):
-                    r.append(
-                        f"s_add_u32 m0, ${i_g_brb[buf]}, {st * _NWc * 1024}\n"
-                        f"buffer_load_dwordx4 ${i_glb[st]}, ${i_rsb}, ${sbr_op} offen lds"
-                    )
+                if n_halves == 2:
+                    for st in range(nsb):
+                        r.append(
+                            f"s_add_u32 m0, ${i_g_brb[buf]}, {st * _NWc * 1024}\n"
+                            f"buffer_load_dwordx4 ${i_glb[st]}, ${i_rsb}, ${sbr_op} offen lds"
+                        )
                 return r
 
             def ds_line(buf, tt):
@@ -596,7 +600,7 @@ class MfmaScaleFp4:
                 # 4x8: wider block separates each acc's two K-sub MFMA by more
                 # independent-acc MFMA -> avoids the accumulator RAW stall.
                 bm, bn = 4, 8
-                ncol = 2 * ntb
+                ncol = n_halves * ntb  # n_halves=1 -> only sl=0 (BL); MFMA/acc/scale auto-gated
                 nib = nta // bm
                 ncb = ncol // bn
                 cells = []
@@ -823,7 +827,7 @@ class MfmaScaleFp4:
                 L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
                 _scb[0] = 0
                 _bm, _bn = 4, 8  # match loop-body block (see emit_inplace)
-                _ncol = 2 * ntb
+                _ncol = n_halves * ntb
                 _nib = nta // _bm
                 _ncb = _ncol // _bn
                 for _D in range(_nib + _ncb - 1):
@@ -888,7 +892,7 @@ class MfmaScaleFp4:
                 L.append("s_waitcnt lgkmcnt(0)")
                 _scb[0] = 0
                 _bm, _bn = 4, 8
-                _ncol = 2 * ntb
+                _ncol = n_halves * ntb
                 _nib = nta // _bm
                 _ncb = _ncol // _bn
                 for _D in range(_nib + _ncb - 1):
