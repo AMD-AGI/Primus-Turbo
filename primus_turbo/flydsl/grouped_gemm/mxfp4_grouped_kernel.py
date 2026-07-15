@@ -61,7 +61,11 @@ _PRESHUF_NG = 4  # g_byte fan-out per preshuffle thread
 # only amortizes on long K). Env-overridable for tuning.
 import os as _os  # noqa: E402
 
-_MXFP4_TAIL_MIN = int(_os.environ.get("MXFP4_TAIL_MIN", "1"))  # KI>=1 uses the zero-waste 128-tail
+# Trailing-128: scale-pad-zero (round KI up, last block's s=1 * zero-padded scale) beats the
+# "zero-waste" 128-tail once the other overheads are gone -- the tail's fresh g2s + barrier
+# is a serial bubble larger than the one padded MFMA. So default the 128-tail OFF (high
+# threshold => scale-pad-zero); the tail stays available via the env knob.
+_MXFP4_TAIL_MIN = int(_os.environ.get("MXFP4_TAIL_MIN", "100000"))
 
 
 def _pack4(rin, rows, k128, valid, K128):
