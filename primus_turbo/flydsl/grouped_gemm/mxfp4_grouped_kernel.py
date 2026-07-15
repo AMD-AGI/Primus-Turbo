@@ -17,7 +17,6 @@ tile's scale soffset stays 128-region aligned), B per expert.
 import gc
 
 import torch
-import torch.nn.functional as F
 
 # isort: off
 import flydsl.compiler as flyc
@@ -87,14 +86,16 @@ def _pack4(rin, rows, k128, valid, K128):
     return out
 
 
-def _build_grouped_mxfp4_a_preshuffle(K128: int, G: int):
-    """Repack canonical A E8M0 [total_M, K128] -> per-group 256-aligned packed slabs.
+def _build_grouped_mxfp4_a_preshuffle(K128: int, G: int, k128_rd: int = None):
+    """Repack canonical A E8M0 [total_M, k128_rd] -> per-group 256-aligned packed slabs of
+    K128 (256-rounded) blocks. ``k128_rd`` (<= K128) is the REAL raw K128; K-blocks in
+    [k128_rd, K128) are the 256-pad and read 0 (mask) -> the packed scale is zero-padded
+    to 256 WITHOUT a host F.pad of the raw scale (which cost a torch copy per call).
 
     Grid: one thread per NG-folded output dword over the padded slab space. Each thread
-    decodes its slab row-group ``grp`` (dense mxfp4 map), finds the owning group via
-    ``a_pre`` (64-row-group cumulative), reads the 4 tight source rows go[g]+... (pad
-    rows past go[g+1] -> 0), and packs. ``a_pre[g]`` is 4*ceil(M_g/256) so each slab is
-    256-aligned."""
+    decodes its slab row-group ``grp``, finds the owning group via the inline a_pre scan,
+    reads the 4 tight source rows go[g]+... (pad rows past go[g+1] -> 0), and packs."""
+    _KRD = K128 if k128_rd is None else k128_rd
     n_sub, nd, KK = 2, 4, K128 // 2
 
     @flyc.kernel(known_block_size=[_PRESHUF_BLK, 1, 1])
@@ -107,7 +108,7 @@ def _build_grouped_mxfp4_a_preshuffle(K128: int, G: int):
     ):
         I32 = fx.Int32
         rin = buffer_ops.create_buffer_resource(
-            a_raw, max_size=False, num_records_bytes=total_M * I32(K128) * 4
+            a_raw, max_size=False, num_records_bytes=total_M * I32(_KRD) * 4
         )
         rout = buffer_ops.create_buffer_resource(
             a_out, max_size=False, num_records_bytes=slab_rows * I32(K128) * 4
@@ -145,19 +146,21 @@ def _build_grouped_mxfp4_a_preshuffle(K128: int, G: int):
             ok = arith.select(inq, I32(1), ok)
             apre = p1
             m_prev = m_nxt
-        base_ok = (gid4 < total4) & (ok != I32(0))
+        base_ok = (gid4 < total4) & (ok != I32(0)) & (k128 < I32(_KRD))  # k128>=_KRD -> 256-pad -> 0
         rows = [rd0 + I32(t * 16) + r for t in range_constexpr(4)]
         valid = [base_ok & (rows[t] < rd_end) for t in range_constexpr(4)]
-        words = _pack4(rin, rows, k128, valid, K128)
+        words = _pack4(rin, rows, k128, valid, _KRD)
         for g in range_constexpr(_PRESHUF_NG):
             buffer_ops.buffer_store(words[g], rout, base + I32(g * 64), mask=gid4 < total4)
 
     return kern
 
 
-def _build_grouped_mxfp4_b_preshuffle(K128: int, G: int, N: int):
-    """Repack canonical B E8M0 [G*N, K128] -> per-expert packed slabs (dense map per
-    expert, expert = block // blocks_per_expert)."""
+def _build_grouped_mxfp4_b_preshuffle(K128: int, G: int, N: int, k128_rd: int = None):
+    """Repack canonical B E8M0 [G*N, k128_rd] -> per-expert packed slabs of K128 (256-
+    rounded) blocks. ``k128_rd`` (<= K128) is the REAL raw K128; K-blocks in [k128_rd, K128)
+    read 0 (mask) -> zero-padded to 256 with no host F.pad of the raw scale."""
+    _KRD = K128 if k128_rd is None else k128_rd
     n_sub, nd, KK = 2, 4, K128 // 2
     dwords_pe = N * K128 // _PRESHUF_NG  # output threads per expert
 
@@ -165,7 +168,7 @@ def _build_grouped_mxfp4_b_preshuffle(K128: int, G: int, N: int):
     def kern(b_raw: fx.Tensor, b_out: fx.Tensor):
         I32 = fx.Int32
         rin = buffer_ops.create_buffer_resource(
-            b_raw, max_size=False, num_records_bytes=I32(G * N * K128) * 4
+            b_raw, max_size=False, num_records_bytes=I32(G * N * _KRD) * 4
         )
         rout = buffer_ops.create_buffer_resource(
             b_out, max_size=False, num_records_bytes=I32(G * N * K128) * 4
@@ -186,10 +189,10 @@ def _build_grouped_mxfp4_b_preshuffle(K128: int, G: int, N: int):
         base = expert * I32(N * K128) + ((wi * I32(KK) + kk) * I32(64) + r) * I32(nd) + last
         grp = _mxfp4_grp_from(wi, r_region, 1)
         rd_base = expert * I32(N)
-        ok = (gid4 < total4) & (expert < I32(G))
+        ok = (gid4 < total4) & (expert < I32(G)) & (k128 < I32(_KRD))  # k128>=_KRD -> 256-pad -> 0
         rows = [rd_base + grp * I32(64) + I32(t * 16) + r for t in range_constexpr(4)]
         valid = [ok & (grp * I32(64) + I32(t * 16) + r < I32(N)) for t in range_constexpr(4)]
-        words = _pack4(rin, rows, k128, valid, K128)
+        words = _pack4(rin, rows, k128, valid, _KRD)
         for g in range_constexpr(_PRESHUF_NG):
             buffer_ops.buffer_store(words[g], rout, base + I32(g * 64), mask=ok)
 
@@ -511,8 +514,9 @@ def _bound_caches(*caches):
 
 def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=None):
     K128 = K // 128
-    a_pre_shuf = _build_grouped_mxfp4_a_preshuffle(K128, G)
-    b_pre_shuf = _build_grouped_mxfp4_b_preshuffle(K128, G, N)
+    k128_rd = (K if k_real is None else k_real) // 128  # real raw K128 (scale not host-padded)
+    a_pre_shuf = _build_grouped_mxfp4_a_preshuffle(K128, G, k128_rd)
+    b_pre_shuf = _build_grouped_mxfp4_b_preshuffle(K128, G, N, k128_rd)
     gemm_k, attrs, NBK = _build_grouped_mxfp4_nt_kernel(
         K, G, N, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16, k_real=k_real
     )
@@ -570,20 +574,16 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     dev = a.device
     N_out = N  # true free dim to return
 
-    # Free dim N: NO host pad -- the kernel tiles the real N (ceildiv) and masks store
-    # cols >= N (StoreCPlain n_valid). Contraction K: OPERANDS stay real (k_real, no copy);
-    # only the tiny E8M0 SCALE is zero-padded to 256 so the preshuffle packs whole 256-blocks
-    # and the trailing-128 block's s=0 scale is present. The whole-loop runs k_real//256 full
-    # 256-blocks + a 128-tail (one MFMA/acc) for the trailing 128 -- zero operand copy/waste.
+    # ZERO host pad / ZERO torch copies. Free dim N: kernel tiles the real N + masks store
+    # cols >= N. Contraction K: operands stay real (k_real row stride); the whole-loop runs
+    # k_real//256 full 256-blocks + a 128-tail. The tiny E8M0 SCALE is zero-padded to 256
+    # entirely INSIDE the preshuffle (k128_rd real read + 256-block mask) -- no F.pad.
     k_real = K
     K256 = (K + 255) // 256 * 256
-    au = a.contiguous().view(torch.uint8)  # [total_M, k_real/2] -- real K, not padded
-    asu = a_scale.contiguous().view(torch.uint8)  # [total_M, K/32]
+    au = a.contiguous().view(torch.uint8)  # [total_M, k_real/2] -- real K
+    asu = a_scale.contiguous().view(torch.uint8)  # [total_M, k_real/32] -- real K
     bu = b.contiguous().view(torch.uint8)  # [G, N, k_real/2]
-    bsu = b_scale.contiguous().view(torch.uint8)  # [G, N, K/32]
-    if K256 != K:
-        asu = F.pad(asu, (0, (K256 - K) // 32))  # scale zero-pad (tiny); operands stay real K
-        bsu = F.pad(bsu, (0, (K256 - K) // 32))
+    bsu = b_scale.contiguous().view(torch.uint8)  # [G, N, k_real/32]
     K = K256
     K128 = K // 128
 
