@@ -199,6 +199,98 @@ def _build_grouped_mxfp4_b_preshuffle(K128: int, G: int, N: int, k128_rd: int = 
     return kern
 
 
+def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int = None):
+    """Merged A-slab + B-per-expert scale preshuffle in ONE launch (matches the fp8/dense
+    single-preshuffle structure -> one fewer in-stream kernel launch + gap per grouped GEMM,
+    a bigger relative win on the small/short-K shapes). Blocks [0, a_grid) do the A slab
+    (mode 0, inline a_pre scan over GO); [a_grid, ...) do the B per-expert (mode 1). The
+    two paths are computed then segment-selected (SGPR rsrc via arith.select, values via
+    select) -- no per-thread divergence. ``k128_rd`` real read + 256-block mask = zero pad,
+    no host F.pad."""
+    _KRD = K128 if k128_rd is None else k128_rd
+    n_sub, nd, KK = 2, 4, K128 // 2
+    b_dwords_pe = N * K128 // _PRESHUF_NG
+
+    @flyc.kernel(known_block_size=[_PRESHUF_BLK, 1, 1])
+    def kern(
+        a_raw: fx.Tensor,
+        a_out: fx.Tensor,
+        b_raw: fx.Tensor,
+        b_out: fx.Tensor,
+        go_out: fx.Tensor,
+        total_M: fx.Int32,
+        slab_rows: fx.Int32,
+        a_grid: fx.Int32,
+    ):
+        I32 = fx.Int32
+        a_rin = buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=total_M * I32(_KRD) * 4)
+        a_rout = buffer_ops.create_buffer_resource(a_out, max_size=False, num_records_bytes=slab_rows * I32(K128) * 4)
+        b_rin = buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=I32(G * N * _KRD) * 4)
+        b_rout = buffer_ops.create_buffer_resource(b_out, max_size=False, num_records_bytes=I32(G * N * K128) * 4)
+        bid = rocdl.readfirstlane(T.i32, fx.block_idx.x)
+        is_b = bid >= a_grid
+        local = arith.select(is_b, bid - a_grid, bid)
+        gid_all = local * I32(_PRESHUF_BLK) + fx.thread_idx.x
+        rin = arith.select(is_b, b_rin, a_rin)
+        rout = arith.select(is_b, b_rout, a_rout)
+
+        b_expert = gid_all // I32(b_dwords_pe)
+        a_total4 = slab_rows * I32(K128) // I32(_PRESHUF_NG)
+        gid4 = arith.select(is_b, gid_all - b_expert * I32(b_dwords_pe), gid_all)
+        total4 = arith.select(is_b, I32(b_dwords_pe), a_total4)
+        last = gid4 % I32(nd)
+        e1 = gid4 // I32(nd)
+        r = e1 % I32(16)
+        e2 = e1 // I32(16)
+        kk = e2 % I32(KK)
+        wi = e2 // I32(KK)
+        r_region = last // I32(n_sub)
+        s = last % I32(n_sub)
+        k128 = kk * I32(n_sub) + s
+        grp_a = _mxfp4_grp_from(wi, r_region, 0)
+        grp_b = _mxfp4_grp_from(wi, r_region, 1)
+        _blk = ((wi * I32(KK) + kk) * I32(64) + r) * I32(nd) + last
+        base = arith.select(is_b, b_expert * I32(N * K128) + _blk, _blk)
+
+        # A: inline a_pre scan (owning group -> tight source rows rd0..rd_end)
+        go_t = rocdl.make_buffer_tensor(go_out, max_size=False, num_records_bytes=(G + 1) * 8)
+        go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
+        rd0 = I32(0)
+        rd_end = I32(0)
+        ok_a = I32(0)
+        apre = I32(0)
+        m_prev = _load_go(go_div, 0)
+        for g in range_constexpr(G):
+            m_nxt = _load_go(go_div, g + 1)
+            p0 = apre
+            p1 = apre + ((m_nxt - m_prev + I32(255)) // I32(256)) * I32(4)
+            inq = (grp_a >= p0) & (grp_a < p1)
+            rd0 = arith.select(inq, m_prev + (grp_a - p0) * I32(64), rd0)
+            rd_end = arith.select(inq, m_nxt, rd_end)
+            ok_a = arith.select(inq, I32(1), ok_a)
+            apre = p1
+            m_prev = m_nxt
+        rd_base = b_expert * I32(N)  # B source row base
+
+        okc = arith.select(is_b, (gid4 < I32(b_dwords_pe)) & (b_expert < I32(G)), (gid4 < a_total4) & (ok_a != I32(0)))
+        okc = okc & (k128 < I32(_KRD)) & (gid4 < total4)
+        rsrc_rows = [
+            arith.select(is_b, rd_base + grp_b * I32(64) + I32(t * 16) + r, rd0 + I32(t * 16) + r)
+            for t in range_constexpr(4)
+        ]
+        valid = [
+            okc & arith.select(is_b, grp_b * I32(64) + I32(t * 16) + r < I32(N), rsrc_rows[t] < rd_end)
+            for t in range_constexpr(4)
+        ]
+        words = _pack4(rin, rsrc_rows, k128, valid, _KRD)
+        # store ALL in-range blocks: invalid/pad blocks got words=0 from the masked reads,
+        # so slab-pad / 256-pad regions are written 0 (matches the split a_pre_shuf).
+        for g in range_constexpr(_PRESHUF_NG):
+            buffer_ops.buffer_store(words[g], rout, base + I32(g * 64), mask=gid4 < total4)
+
+    return kern
+
+
 def _build_grouped_mxfp4_nt_kernel(
     K, G, N, group_m=4, num_xcds=8, group_n=0, wlv=10, elgk=9, out_fp16=False, k_real=None
 ):
@@ -515,8 +607,7 @@ def _bound_caches(*caches):
 def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=None):
     K128 = K // 128
     k128_rd = (K if k_real is None else k_real) // 128  # real raw K128 (scale not host-padded)
-    a_pre_shuf = _build_grouped_mxfp4_a_preshuffle(K128, G, k128_rd)
-    b_pre_shuf = _build_grouped_mxfp4_b_preshuffle(K128, G, N, k128_rd)
+    ab_pre_shuf = _build_grouped_mxfp4_ab_preshuffle(K128, G, N, k128_rd)  # merged A+B, 1 launch
     gemm_k, attrs, NBK = _build_grouped_mxfp4_nt_kernel(
         K, G, N, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16, k_real=k_real
     )
@@ -539,10 +630,9 @@ def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k
         grid_upper: fx.Int32,
         stream: fx.Stream,
     ):
-        a_pre_shuf(a_raw, a_sp, GO, c_m, slab_rows).launch(
-            grid=(a_pre_grid, 1, 1), block=(_PRESHUF_BLK, 1, 1), stream=stream
+        ab_pre_shuf(a_raw, a_sp, b_raw, b_sp, GO, c_m, slab_rows, a_pre_grid).launch(
+            grid=(a_pre_grid + b_pre_grid, 1, 1), block=(_PRESHUF_BLK, 1, 1), stream=stream
         )
-        b_pre_shuf(b_raw, b_sp).launch(grid=(b_pre_grid, 1, 1), block=(_PRESHUF_BLK, 1, 1), stream=stream)
         gemm_k(a8, b8, C, a_sp, b_sp, GO, c_m, c_n, slab_rows, grid_upper, value_attrs=attrs).launch(
             grid=(grid_upper, 1, 1), block=(256, 1, 1), stream=stream
         )
