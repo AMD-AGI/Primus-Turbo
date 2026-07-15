@@ -6,6 +6,7 @@
 
 """FlyDSL MXFP8 (per-1x32 E8M0 block-scaled) grouped GEMM for gfx950 (NT fwd/dgrad)."""
 
+import math
 import os
 
 import torch
@@ -672,12 +673,18 @@ def _build_grouped_mxfp8_nt_kernel(
 _GNT_FUSED_CACHE: dict = {}  # (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persist) -> launch
 _GNT_WS_CACHE: dict = {}  # (M_pad, N, K128, G, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp)
 _GNT_AT_CACHE: dict = {}  # (M_pad, N, K, G, cbsz, blgp, out_fp16, persist) -> [raw, compiled]
-_GNT_CFG_CACHE: dict = {}  # at_key -> (bm, gm, xcd, gn) chosen by autotune
+_GNT_CFG_CACHE: dict = {}  # cfg_key (NO M_pad) -> (bm, gm, xcd, gn) chosen by autotune
 
-# fwd/dgrad NT autotune: balanced-distribution timing so the cached config depends only
-# on the static shape. PT_MXGG_AUTOTUNE=0 -> fixed base cfg.
+# fwd/dgrad NT autotune. The launch is M-generic (M is a runtime arg), so the config race
+# keys on the static shape only (cfg_key, no M_pad) and is reused for every M.
+# PT_MXGG_AUTOTUNE=0 -> fixed base cfg.
 _GNT_AUTOTUNE = os.environ.get("PT_MXGG_AUTOTUNE", "1") != "0"
 _GNT_NT_DEFAULT_CFG = (256, 4, 4, 0)  # (BLOCK_M, GROUP_M, num_xcd, group_n); cand[0] = base ref
+
+# tokens/group points the race times on (geomean). The swizzle is not M-invariant: a single
+# midpoint mis-picks a cfg that wins there but loses at the range ends, so two spread steady
+# points reward range-robust cfgs (~2.1% worst-case regret vs 3.3%). PT_MXGG_CANON_M overrides.
+_GNT_PM_CANON = tuple(int(x) for x in os.environ.get("PT_MXGG_CANON_M", "2048,8192").split(","))
 
 
 def _gnt_nt_candidates(N):
@@ -705,72 +712,102 @@ def _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent):
     return launch
 
 
-def _balanced_mx_targs(args, M_pad, total_m, G):
-    """Replace the read/write offsets with a synthetic balanced 32-aligned split for
-    distribution-independent autotune timing."""
-    device = args[2].device
-    q = max((M_pad // G) // 32 * 32, 32)
-    pad = [q] * G
-    for i in range((M_pad - q * G) // 32):
-        pad[i % G] += 32
-    pad[G - 1] += M_pad - sum(pad)  # absorb any leftover so sum == M_pad exactly
-    r = total_m // G
-    real = [min(r + (1 if i < (total_m - r * G) else 0), pad[i]) for i in range(G)]
+def _canon_nt_targs(args, K, G, N, pm):
+    """Synthetic balanced args at `pm` tokens/group (dummy content, only shapes drive timing);
+    reuses the M-independent b-side from `args`. Returns (targs, out_c=numeric-guard ref)."""
+    dev = args[2].device
+    stream = args[15]
+    M_c = G * pm
+    K128 = K // 128
+    nsc = K // 32  # nsc % 4 == 0 (K % 128 == 0) so the int32 view is exact
 
-    def _offs_i32(sizes):
-        o = torch.zeros(G + 1, dtype=torch.int64, device=device)
-        o[1:] = torch.tensor(sizes, dtype=torch.int64, device=device).cumsum(0)
-        return o.view(torch.int32)
+    a8_c = torch.randint(0, 127, (M_c, K), device=dev, dtype=torch.int8)
+    out_c = torch.empty((M_c, N), device=dev, dtype=args[2].dtype)
+    a_scale_c = torch.randint(120, 128, (M_c, nsc), device=dev, dtype=torch.uint8)
+    a_raw_c = a_scale_c.view(torch.int32).reshape(-1)
+    a_sp_c, b_sp_c, a_blocks_c, a_ngrp_c = _get_grouped_mx_workspace(M_c, N, K128, G, dev, stream)
 
-    go_pad = _offs_i32(pad)
-    go_out = _offs_i32(real)
-    return args[:7] + (go_pad, go_out) + args[9:]
+    n_blocks = (N + _BLOCK_N - 1) // _BLOCK_N
+    grid_upper_c = ((M_c + 255) // 256 + G) * n_blocks
+    go_c = (torch.arange(0, G + 1, dtype=torch.int64, device=dev) * pm).view(torch.int32)
+
+    targs = (
+        a8_c,
+        args[1],  # b8 (weights, M-independent)
+        out_c,
+        a_raw_c,
+        args[4],  # b_raw (b scales, M-independent)
+        a_sp_c,
+        b_sp_c,
+        go_c,  # go_pad (balanced, fully packed)
+        go_c,  # go_out (== go_pad)
+        M_c,
+        a_ngrp_c * 64,
+        N,
+        a_blocks_c,
+        a_ngrp_c,
+        grid_upper_c,
+        stream,
+    )
+    return targs, out_c
 
 
-def _select_nt_cfg(at_key, K, G, N, cbsz, blgp, out_fp16, persistent, out_view, args, M_pad, total_m):
-    """First-call micro-bench for this static shape; cache the winning cfg."""
-    cached = _GNT_CFG_CACHE.get(at_key)
+def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
+    """First-call race on synthetic canonical tensors; cache the winning cfg per static shape
+    (cfg_key, no M_pad -> reused for every M)."""
+    cached = _GNT_CFG_CACHE.get(cfg_key)
     if cached is not None:
         return cached
     if not _GNT_AUTOTUNE:
-        _GNT_CFG_CACHE[at_key] = _GNT_NT_DEFAULT_CFG
+        _GNT_CFG_CACHE[cfg_key] = _GNT_NT_DEFAULT_CFG
         return _GNT_NT_DEFAULT_CFG
 
-    targs = _balanced_mx_targs(args, M_pad, total_m, G)
     cands = _gnt_nt_candidates(N)
+    # one (targs, out_view) per steady point; candidates scored by geomean over points
+    points = [_canon_nt_targs(args, K, G, N, pm) for pm in _GNT_PM_CANON]
+
+    def _geomean(ts):
+        return math.exp(sum(math.log(t) for t in ts) / len(ts))
 
     try:
         base = _get_nt_launch(K, G, N, *cands[0], cbsz, blgp, out_fp16, persistent)
-        base(*targs)
-        torch.cuda.synchronize()
-        ref = out_view.detach().clone().float()
-        ref_n = float((ref * ref).sum().item()) or 1.0
-        if not torch.isfinite(ref.reshape(-1)[:1024]).all().item():
-            raise RuntimeError("base cfg produced non-finite output")
-        best_cfg, best_t = cands[0], _robust_time(base, targs)
+        refs, base_ts = [], []
+        for targs, out_view in points:
+            base(*targs)
+            torch.cuda.synchronize()
+            r = out_view.detach().clone().float()
+            if not torch.isfinite(r.reshape(-1)[:1024]).all().item():
+                raise RuntimeError("base cfg produced non-finite output")
+            refs.append((r, float((r * r).sum().item()) or 1.0))
+            base_ts.append(_robust_time(base, targs))
+        best_cfg, best_score = cands[0], _geomean(base_ts)
     except Exception:
-        _GNT_CFG_CACHE[at_key] = _GNT_NT_DEFAULT_CFG
+        _GNT_CFG_CACHE[cfg_key] = _GNT_NT_DEFAULT_CFG
         return _GNT_NT_DEFAULT_CFG
-
-    def _matches_base():
-        o = out_view.detach().float()
-        err = float(((o - ref) * (o - ref)).sum().item())
-        return (err / ref_n) < (2e-2**2) and torch.isfinite(o.reshape(-1)[:1024]).all().item()
 
     for cfg in cands[1:]:
         try:
             launch = _get_nt_launch(K, G, N, *cfg, cbsz, blgp, out_fp16, persistent)
-            launch(*targs)
-            torch.cuda.synchronize()
-            if not _matches_base():  # never adopt a config that drifts from the base
+            ts, matched = [], True
+            for (targs, out_view), (ref, ref_n) in zip(points, refs):
+                launch(*targs)
+                torch.cuda.synchronize()
+                o = out_view.detach().float()
+                err = float(((o - ref) * (o - ref)).sum().item())
+                # never adopt a config that drifts from the base at any point
+                if not ((err / ref_n) < (2e-2**2) and torch.isfinite(o.reshape(-1)[:1024]).all().item()):
+                    matched = False
+                    break
+                ts.append(_robust_time(launch, targs))
+            if not matched:
                 continue
-            t = _robust_time(launch, targs)
+            score = _geomean(ts)
         except Exception:
             continue
-        if t < best_t * 0.985:  # adopt only if >=1.5% faster
-            best_cfg, best_t = cfg, t
+        if score < best_score * 0.985:  # adopt only if geomean >=1.5% faster than the base
+            best_cfg, best_score = cfg, score
 
-    _GNT_CFG_CACHE[at_key] = best_cfg
+    _GNT_CFG_CACHE[cfg_key] = best_cfg
     return best_cfg
 
 
@@ -915,16 +952,13 @@ def grouped_gemm_mxfp8_flydsl_kernel(
         grid_upper,
         stream,
     )
-    # BLOCK_M fixed at 256; the (gm, xcd, gn) L2-locality swizzle is autotuned per shape
-    # (numerically identical tile set, only the launch is timed).
+    # at_key bakes buffers/workspace per M_pad; cfg_key (no M_pad) picks the swizzle once/shape.
     at_key = (M_pad, N, K, G, cbsz, blgp, out_fp16, persistent)
+    cfg_key = (N, K, G, cbsz, blgp, out_fp16, persistent)
     entry = _GNT_AT_CACHE.get(at_key)
     if entry is None:
-        # total_m read (one D2H) only on the first-call autotune path; cached after.
-        total_m = int(_go_out[G]) if _go_out.numel() > G else M_pad
-        bm, gm, xcd, gn = _select_nt_cfg(
-            at_key, K, G, N, cbsz, blgp, out_fp16, persistent, out, args, M_pad, total_m
-        )
+        # race on canonical synthetic tensors -> needs only the static shape (args' b-side)
+        bm, gm, xcd, gn = _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args)
         launch = _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent)
         entry = [launch, None]
         _GNT_AT_CACHE[at_key] = entry
