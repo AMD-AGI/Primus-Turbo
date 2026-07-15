@@ -27,10 +27,10 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.core.utils import is_gfx942
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
-from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-    quant_fp8_blockwise_dual_impl,
+from primus_turbo.pytorch.ops.quantization import (
+    quantize_fp8,
+    quantize_fp8_with_trans,
 )
-from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans
 
 __all__ = ["gemm_fp8"]
 
@@ -379,133 +379,126 @@ class FP8GemmRowFunction(torch.autograd.Function):
         )
 
 
-# TODO(ruibin): Add support for quantized tensor
 class FP8GemmBlockFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        a: torch.Tensor,
-        b: torch.Tensor,
+        a: Union[torch.Tensor, QuantizedTensor],
+        b: Union[torch.Tensor, QuantizedTensor],
+        a_t: Optional[QuantizedTensor],
+        b_t: Optional[QuantizedTensor],  # not used
         trans_a: bool,
         trans_b: bool,
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
     ):
-        from primus_turbo.pytorch.ops.quantization import (
-            quant_fp8_blockwise_for_weight_impl,
-            quant_fp8_blockwise_impl,
-        )
-
-        assert isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor), "a and b must be torch.Tensor"
         assert trans_a == False, "trans_a has to be False"
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
-        a_dtype_bwd = _get_fp8_dtype(config.format, False)
 
-        # When forward and backward share the same FP8 dtype (i.e. non-HYBRID
-        # formats), fuse forward row-quant with column-quant of the same
-        # activation in a single dual kernel pass and save the column result
-        # into ctx so the backward can skip its own column-quant launch.
-        # This is a kernel fusion (single tensor `a` is read once instead of
-        # twice) and does NOT depend on tensor identity across iterations.
-        fuse_a_dual = a_dtype == a_dtype_bwd and a.is_contiguous()
+        if isinstance(a, QuantizedTensor):
+            check_quantized_tensor(a, config, axis=-1)
+            a_row, a_row_scale = a.qdata, a.scale_inv
+            if a_t is None:
+                a_t = QuantizedTensor.quantize(
+                    a.dequantize(),
+                    a_dtype,
+                    config.granularity,
+                    axis=-2,
+                    block_size=config.block_size,
+                )
 
-        if fuse_a_dual:
-            (
-                a_fp8_row,
-                a_scale_inv_row,
-                a_fp8_col,
-                a_scale_inv_col,
-            ) = quant_fp8_blockwise_dual_impl(a, a_dtype, config.block_size)
+            a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
-            a_fp8_row, a_scale_inv_row = quant_fp8_blockwise_impl(
-                a, a_dtype, axis=1, block_size=config.block_size
-            )
-            a_fp8_col = None
-            a_scale_inv_col = None
+            (
+                a_row,
+                a_row_scale,
+                a_col,
+                a_col_scale,
+            ) = quantize_fp8_with_trans(a, a_dtype, config.block_size)
 
-        b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
+        # --- B side: 2D-block weight, reused unchanged in fwd + bwd. ---
+        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        if isinstance(b, QuantizedTensor):
+            check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
+            b_row, b_row_scale = b.qdata, b.scale_inv
+        else:
+            b_row, b_row_scale = quantize_fp8(
+                b, b_dtype, block_size=config.block_size, scaling_recipe=b_scaling_recipe
+            )
+        b_col, b_col_scale = b_row, b_row_scale
 
         out = gemm_fp8_impl(
-            a_fp8_row,
-            a_scale_inv_row,
+            a_row,
+            a_row_scale,
             trans_a,
-            b_fp8,
-            b_scale_inv,
+            b_row,
+            b_row_scale,
             trans_b,
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.TRITON.value,
         )
-        if fuse_a_dual:
-            ctx.save_for_backward(b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col)
-            ctx.has_prequantized_a_col = True
-        else:
-            ctx.save_for_backward(a, b_fp8, b_scale_inv)
-            ctx.has_prequantized_a_col = False
+        ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
+
         ctx.trans_a = trans_a
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
         ctx.config = config
+
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        from primus_turbo.pytorch.ops.quantization import quant_fp8_blockwise_impl
+        a_col, a_col_scale, b_col, b_col_scale = ctx.saved_tensors
 
-        if not grad_out.is_contiguous():
-            grad_out = grad_out.contiguous()
-
-        if ctx.has_prequantized_a_col:
-            b_fp8, b_scale_inv, a_fp8_col, a_scale_inv_col = ctx.saved_tensors
-        else:
-            a, b_fp8, b_scale_inv = ctx.saved_tensors
-            a_dtype = _get_fp8_dtype(ctx.config.format, False)
-            a_fp8_col, a_scale_inv_col = quant_fp8_blockwise_impl(
-                a, a_dtype, axis=0, block_size=ctx.config.block_size
-            )
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
+        grad_out = grad_out.contiguous()
 
         # Quantize grad_out in both row-wise and column-wise directions:
         # - row-wise: for dgrad (grad_x)
         # - col-wise: for wgrad (grad_w)
         (
-            grad_out_fp8_row,
-            grad_out_scale_inv_row,
-            grad_out_fp8_col,
-            grad_out_scale_inv_col,
-        ) = quant_fp8_blockwise_dual_impl(grad_out, grad_out_dtype, ctx.config.block_size)
+            g_row,
+            g_row_scale,
+            g_col,
+            g_col_scale,
+        ) = quantize_fp8_with_trans(
+            grad_out, grad_out_dtype, ctx.config.granularity, block_size=ctx.config.block_size
+        )
 
-        a_grad = gemm_fp8_impl(
-            grad_out_fp8_row,
-            grad_out_scale_inv_row,
+        grad_a = gemm_fp8_impl(
+            g_row,
+            g_row_scale,
             False,
-            b_fp8,
-            b_scale_inv,
+            b_col,
+            b_col_scale,
             not ctx.trans_b,
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.TRITON.value,
         )
 
-        b_grad = gemm_fp8_impl(
-            a_fp8_col,
-            a_scale_inv_col,
+        grad_b = gemm_fp8_impl(
+            a_col,
+            a_col_scale,
             not ctx.trans_a,
-            grad_out_fp8_col,
-            grad_out_scale_inv_col,
+            g_col,
+            g_col_scale,
             False,
             ctx.out_dtype,
             ctx.trans_b,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.CK.value,
+            default_backend=BackendType.TRITON.value,
         )
 
         return (
-            a_grad,  # a
-            b_grad,  # b
+            grad_a,  # a
+            grad_b,  # b
+            None,  # a_t
+            None,  # b_t
             None,  # trans_a
             None,  # trans_b
             None,  # out_dtype
@@ -739,9 +732,9 @@ def gemm_fp8(
             a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config
         )
     elif config.granularity == ScalingGranularity.BLOCKWISE:
-        # BLOCKWISE does not yet support pre-quantized inputs; preserve the
-        # existing assertion behaviour in ``FP8GemmBlockFunction.forward``.
-        return FP8GemmBlockFunction.apply(a, b, trans_a, trans_b, out_dtype, config)
+        return FP8GemmBlockFunction.apply(
+            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config
+        )
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
         return FP8GemmMXFunction.apply(
             a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config
