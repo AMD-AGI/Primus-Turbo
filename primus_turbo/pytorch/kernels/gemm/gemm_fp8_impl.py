@@ -428,6 +428,7 @@ _GEMM_FP8_BACKENDS = {
 class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
     _backends = _GEMM_FP8_BACKENDS
     _cache = TuneCache(1024)
+    _tune_config_name = "gemm_fp8"  # auto-load configs/pytorch/<arch>/gemm_fp8.json
 
     @classmethod
     def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, **kwargs):

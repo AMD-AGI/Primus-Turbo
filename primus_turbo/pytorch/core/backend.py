@@ -3,6 +3,8 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+import importlib
+import json
 import os
 import warnings
 from abc import ABC, abstractmethod
@@ -297,12 +299,42 @@ class BackendEntry:
     autotune: bool = True
 
 
+# make_key tuples may hold ints/bools/str, torch.dtype and Enum members. Encode to a
+# JSON-safe form that round-trips to the *identical* hashable (a loaded key must match
+# what make_key produces at runtime). Both functions recurse into tuples/lists.
+def _encode_key(x: Any) -> Any:
+    if isinstance(x, torch.dtype):
+        return {"__dtype__": str(x).removeprefix("torch.")}
+    if isinstance(x, Enum):
+        return {"__enum__": f"{type(x).__module__}:{type(x).__qualname__}", "name": x.name}
+    if isinstance(x, (list, tuple)):
+        return [_encode_key(e) for e in x]
+    if isinstance(x, (bool, int, float, str)) or x is None:
+        return x
+    raise TypeError(f"Unsupported tune-cache key element: {type(x)!r}")
+
+
+def _decode_key(x: Any) -> Any:
+    if isinstance(x, dict):
+        if "__dtype__" in x:
+            return getattr(torch, x["__dtype__"])
+        if "__enum__" in x:
+            module, qualname = x["__enum__"].split(":")
+            return getattr(importlib.import_module(module), qualname)[x["name"]]
+        raise ValueError(f"Bad tune-cache key element: {x!r}")
+    if isinstance(x, list):
+        return tuple(_decode_key(e) for e in x)
+    return x
+
+
 class TuneCache:
     """LRU cache for storing tuned backend results."""
 
     def __init__(self, capacity: int = 1024):
         self._capacity = capacity
         self._cache: OrderedDict[Hashable, Type[KernelBackend]] = OrderedDict()
+        # per-key profiling result (e.g. {"time_ms": ...}); only for dump_cache, not runtime
+        self._perf: Dict[Hashable, dict] = {}
 
     def get(self, key: Hashable) -> Optional[Type[KernelBackend]]:
         if key in self._cache:
@@ -320,11 +352,23 @@ class TuneCache:
                 f"Consider disabling AutoTune or using fixed shapes.",
                 stacklevel=2,
             )
-            self._cache.popitem(last=False)
+            evicted_key, _ = self._cache.popitem(last=False)
+            self._perf.pop(evicted_key, None)
         self._cache[key] = value
+
+    def set_perf(self, key: Hashable, perf: dict) -> None:
+        self._perf[key] = perf
+
+    def get_perf(self, key: Hashable) -> Optional[dict]:
+        return self._perf.get(key)
 
     def clear(self) -> None:
         self._cache.clear()
+        self._perf.clear()
+
+    def items(self) -> List[tuple]:
+        """Return ``(key, backend_impl)`` pairs (for serialization)."""
+        return list(self._cache.items())
 
     def __len__(self) -> int:
         return len(self._cache)
@@ -355,6 +399,9 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
     _warmup_iters: int = 10
     _profile_iters: int = 20
     _subclasses: List[Type["AutoKernelDispatcher"]] = []
+    # Basename of this dispatcher's tune-config asset, e.g. "gemm_fp8" ->
+    # configs/pytorch/<arch>/gemm_fp8.json. None => no packaged asset to auto-load.
+    _tune_config_name: Optional[str] = None
 
     @staticmethod
     def _is_graph_capturing() -> bool:
@@ -381,6 +428,83 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         for subclass in cls._subclasses:
             if subclass._cache is not None:
                 subclass._cache.clear()
+            subclass._tune_config_loaded = False  # allow the packaged asset to re-load on next dispatch
+
+    @classmethod
+    def dump_cache(cls, path: str) -> int:
+        """Serialize this dispatcher's tuned cache to a JSON file.
+
+        Each entry is ``{"key": <encoded_key>, "backend": <name>, "perf": <dict|null>}``.
+        Only the *selected backend* is stored; per-backend internal config is out of
+        scope here (handled separately by warmup / pin). ``perf`` carries profiling
+        metadata (e.g. ``{"time_ms": ...}``) when available. Returns entries written.
+        """
+        if cls._cache is None:
+            return 0
+        impl_to_name = {entry.impl: bt.name for bt, entry in cls._backends.items()}
+        entries = []
+        for key, impl in cls._cache.items():
+            name = impl_to_name.get(impl)
+            if name is None:
+                continue  # impl not registered in _backends; skip
+            entries.append({"key": _encode_key(key), "backend": name, "perf": cls._cache.get_perf(key)})
+        with open(path, "w") as f:
+            json.dump({"dispatcher": cls.__name__, "entries": entries}, f, indent=2)
+        return len(entries)
+
+    @classmethod
+    def load_cache(cls, path: str) -> int:
+        """Load a JSON tune cache produced by ``dump_cache`` into this dispatcher.
+
+        Only ``key`` and ``backend`` are used at runtime (``perf`` is informational).
+        Unknown / unregistered backends are skipped (logged once). Returns entries loaded.
+        """
+        if cls._cache is None:
+            return 0
+        with open(path) as f:
+            data = json.load(f)
+        loaded = 0
+        for entry_json in data.get("entries", []):
+            encoded_key, name = entry_json["key"], entry_json["backend"]
+            entry = cls._backends.get(BackendType.__members__.get(name))
+            if entry is None:
+                logger.warning(f"Tune cache {path}: backend '{name}' unavailable, skipped.", once=True)
+                continue
+            cls._cache.put(_decode_key(encoded_key), entry.impl)
+            loaded += 1
+        return loaded
+
+    @classmethod
+    def _ensure_tune_config_loaded(cls) -> None:
+        """Lazily load this dispatcher's packaged tune-config asset (once).
+
+        Reads ``tuning/configs/pytorch/<arch>/<_tune_config_name>.json`` — no env var.
+        Skipped while auto-tune is on (offline tuning / pure runtime tune ignore
+        the asset, so the fresh profiling cache is never polluted).
+        """
+        if cls._tune_config_name is None or cls.__dict__.get("_tune_config_loaded"):
+            return
+        if GlobalBackendManager.auto_tune_enabled():
+            return  # retry once auto-tune is turned off
+        cls._tune_config_loaded = True  # latch first: attempt at most once, even on failure
+        try:
+            arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        except Exception:
+            return
+        path = os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "tuning",
+                "configs",
+                "pytorch",
+                arch,
+                f"{cls._tune_config_name}.json",
+            )
+        )
+        if os.path.isfile(path):
+            logger.info(f"{cls.__name__}: loaded {cls.load_cache(path)} tuned entries from {path}")
 
     @classmethod
     def make_key(cls, **kwargs) -> Hashable:
@@ -434,6 +558,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
 
         if best_backend is not None:
             cls._cache.put(key, best_backend)
+            cls._cache.set_perf(key, {"time_ms": best_time})
         return best_backend
 
     @classmethod
@@ -462,6 +587,13 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
             backend_cls = cls.tune(**kwargs)
             if backend_cls is not None:
                 return backend_cls.execute(**kwargs)
+
+        # 2.5 Reuse a loaded/tuned backend choice without profiling (empty/None cache -> skip).
+        cls._ensure_tune_config_loaded()  # lazy one-time load of the packaged tune-config asset
+        if cls._cache:
+            cached = cls._cache.get(cls.make_key(**kwargs))
+            if cached is not None and cached.can_handle(**kwargs):
+                return cached.execute(**kwargs)
 
         # 3. Default backend
         default_entry = cls._backends.get(default_backend_enum)

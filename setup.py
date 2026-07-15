@@ -446,7 +446,7 @@ if __name__ == "__main__":
         long_description=(PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",
         packages=find_packages(exclude=["tests", "tests.*"]),
-        package_data={"primus_turbo": ["lib/*.so"]},
+        package_data={"primus_turbo": ["lib/*.so", "tuning/configs/*/*/*.json"]},
         ext_modules=ext_modules,
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,

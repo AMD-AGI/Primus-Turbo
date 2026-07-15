@@ -15,3 +15,5 @@ agent/workspace/
 logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
+# Generated offline-tune assets (regenerate via primus_turbo.tuning.offline_tune_gemm).
+primus_turbo/tuning/configs/
