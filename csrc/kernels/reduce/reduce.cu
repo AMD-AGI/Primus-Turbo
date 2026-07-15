@@ -85,11 +85,11 @@ void reduce_col_impl(const InType *input, OutType *output, const int64_t &batch,
                      const int64_t &n, const int64_t workspace_sizes, void *workspace,
                      hipStream_t stream) {
     const int32_t BLOCK_SIZE = 256;
-    const int32_t NUM_WARP   = BLOCK_SIZE / THREADS_PER_WARP;
+    const int32_t NUM_WARP   = BLOCK_SIZE / warp_size();
     const int32_t UNROLL_M   = 8;
     const int32_t UNROLL_N   = sizeof(uint4) / sizeof(OutType);
 
-    const int64_t grid_x = DIVUP<int64_t>(n, THREADS_PER_WARP * UNROLL_N);
+    const int64_t grid_x = DIVUP<int64_t>(n, warp_size() * UNROLL_N);
     const int64_t grid_z = batch;
 
     // Single

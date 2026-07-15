@@ -34,9 +34,15 @@
 #endif
 
 //
-// Universal warp size constant (AMD = 64)
+// Universal warp size constant (AMD = 64 in gfx942/gfx950, 32 in gfx1250)
 //
 namespace primus_turbo {
-constexpr int THREADS_PER_WARP      = 64;
+// Device pass: rely on the per-arch predefined macros so fat-binary builds
+// (multiple --offload-arch) still get the correct value for each arch.
+#if defined(__gfx942__) || defined(__gfx950__)
+constexpr int THREADS_PER_WARP = 64;
+#else
+constexpr int THREADS_PER_WARP = 32;
+#endif
 constexpr int MAX_THREADS_PER_BLOCK = 1024; // TODO: ?
 } // namespace primus_turbo

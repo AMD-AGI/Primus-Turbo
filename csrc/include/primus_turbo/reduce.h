@@ -26,7 +26,7 @@ int64_t get_reduce_row_workspace_sizes(const int64_t &outer_len, const int64_t &
 template <typename ComputeType>
 int64_t get_reduce_col_workspace_sizes(const int64_t batch, const int64_t m, const int64_t n) {
     const int BLOCK    = 256;
-    const int NUM_WARP = BLOCK / THREADS_PER_WARP;
+    const int NUM_WARP = BLOCK / warp_size();
     const int UNROLL_M = 8;
 
     const int64_t cnt =

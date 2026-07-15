@@ -5,6 +5,7 @@
 ###############################################################################
 
 import importlib.metadata
+import importlib.util
 import os
 import re
 import shutil
@@ -31,6 +32,8 @@ except ImportError as exc:
         "It is vendored as a git submodule; initialize it with:\n"
         "  git submodule sync && git submodule update --init --recursive"
     ) from exc
+
+from primus_turbo.common.logger import logger
 
 try:
     import torch  # noqa: F401
@@ -135,25 +138,34 @@ def _find_library_home(
 
 def find_rocm_home() -> Optional[str]:
     """Find the ROCm install path."""
-    hipcc_path = shutil.which("hipcc")
-    if hipcc_path is not None:
-        rocm_home = os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
-        if os.path.basename(rocm_home) == "hip":
-            rocm_home = os.path.dirname(rocm_home)
-    else:
-        fallback_path = ROCM_FALLBACK_LIBRARY_HOME
-        if os.path.exists(fallback_path):
-            rocm_home = fallback_path
+
+    rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
+    if rocm_home is None:
+        # Support for TheRock rocm-sdk-core
+        spec = importlib.util.find_spec("_rocm_sdk_core")
+        if spec is not None and spec.origin is not None:
+            rocm_home = str(Path(spec.origin).parent.resolve())
+
+    if rocm_home is None:
+        hipcc_path = shutil.which("hipcc")
+        if hipcc_path is not None:
+            rocm_home = os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
+            if os.path.basename(rocm_home) == "hip":
+                rocm_home = os.path.dirname(rocm_home)
+        else:
+            fallback_path = ROCM_FALLBACK_LIBRARY_HOME
+            if os.path.exists(fallback_path):
+                rocm_home = fallback_path
+    if rocm_home and torch.version.hip is None:
+        logger.warning("No ROCm runtime is found, using ROCM_HOME='%s'", rocm_home)
     return rocm_home
 
 
-def find_hip_home() -> str:
-    return _find_library_home(
-        ["HIP_HOME", "HIP_PATH", "HIP_DIR"], ["hipcc"], fallback_path=ROCM_FALLBACK_LIBRARY_HOME
-    )
+def _join_rocm_home(*paths) -> str:
+    return os.path.join(find_rocm_home(), *paths)
 
 
-HIP_HOME: Path = find_hip_home()
+HIP_HOME: Path = _join_rocm_home("hip")
 HIP_LIBRARY_PATH = os.path.join(HIP_HOME, "lib")
 HIP_INCLUDE_PATH = os.path.join(HIP_HOME, "include")
 
@@ -335,3 +347,39 @@ def get_gpu_arch(gpu_id: int = 0) -> str:
         raise IndexError(f"gpu_id {gpu_id} out of range (found {len(matches)} GPUs).")
 
     return matches[gpu_id].lower()
+
+
+# Optional GEMM backends, selected via the PRIMUS_TURBO_BUILD_BACKEND env var.
+SUPPORT_BACKENDS = ("ck", "turbo")
+
+
+def enabled_backends():
+    """Set of GEMM backends to build, parsed from PRIMUS_TURBO_BUILD_BACKEND.
+
+    The variable is a comma/semicolon separated list of backend names, e.g.
+    "ck,turbo" enables both the CK and turbo backends.
+      * unset        -> all SUPPORT_BACKENDS are enabled by default
+      * empty string -> no backends are built
+    """
+    val = os.environ.get("PRIMUS_TURBO_BUILD_BACKEND")
+    if val is None:
+        return set(SUPPORT_BACKENDS)
+
+    selected = {b.strip().lower() for b in re.split(r"[,;]", val) if b.strip()}
+    unknown = selected - set(SUPPORT_BACKENDS)
+    if unknown:
+        warnings.warn(
+            f"Ignoring unknown PRIMUS_TURBO_BUILD_BACKEND entries: {sorted(unknown)}. "
+            f"Supported backends: {sorted(SUPPORT_BACKENDS)}."
+        )
+    return selected & set(SUPPORT_BACKENDS)
+
+
+def build_ck_backend():
+    """Whether to build the Composable-Kernel / MFMA backend (PRIMUS_TURBO_BUILD_BACKEND)."""
+    return "ck" in enabled_backends()
+
+
+def build_turbo_backend():
+    """Whether to build the turbo (MFMA) GEMM backend (PRIMUS_TURBO_BUILD_BACKEND)."""
+    return "turbo" in enabled_backends()

@@ -154,6 +154,10 @@ void dequantize_mxfp4_impl(const uint8_t *x, OType *y, const int64_t stride_x_ro
                            const int64_t stride_scale_col, const int scale_n_rows,
                            const int scale_n_cols, const int block_size, const bool use_rowwise,
                            hipStream_t stream) {
+    // TODO(ruibin): add kernel support for gfx1250
+    if (is_gfx1250()) {
+        PRIMUS_TURBO_ERROR("dequantize_mxfp4 is not implemented on gfx1250.");
+    }
     (void) stride_x_col; // packed input is contiguous along columns (stride == 1)
     if (n_rows == 0 || n_cols == 0)
         return;

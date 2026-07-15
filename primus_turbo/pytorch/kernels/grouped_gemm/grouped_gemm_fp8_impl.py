@@ -19,7 +19,7 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import build_ck, get_device_compute_capability
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -79,6 +79,8 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
+        # check the CK backend was compiled into this build
+        supported &= build_ck()
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8CKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8CKBackend.SUPPORTED_GRANULARITIES
@@ -141,6 +143,8 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
+        # check the CK backend was compiled into this build
+        supported &= build_ck()
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_GRANULARITIES

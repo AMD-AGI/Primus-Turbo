@@ -60,6 +60,10 @@ inline void LAUNCH_KERNEL_NON_COOPERATIVE(T &&config, Kern &&kernel, Args &&...a
 
 #endif // #ifndef LAUNCH_KERNEL
 
+#ifndef SET_SHARED_MEMORY_FOR_TMA
+#define SET_SHARED_MEMORY_FOR_TMA(kernel) void()
+#endif
+
 #define SWITCH_RANKS(case_macro)                                                                   \
     switch (num_ranks) {                                                                           \
     case 2:                                                                                        \

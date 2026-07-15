@@ -1676,6 +1676,10 @@ void grouped_quantize_mxfp8_dual_impl(
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
     int colwise_scale_M_pad, int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
     ScalingRecipe colwise_recipe, hipStream_t stream) {
+    // TODO(ruibin): add kernel support for gfx1250
+    if (is_gfx1250()) {
+        PRIMUS_TURBO_ERROR("grouped_quantize_mxfp8_dual is not implemented on gfx1250.");
+    }
     PRIMUS_TURBO_CHECK(rowwise_recipe.use_rht == false, "MXFP8 not support RHT");
     PRIMUS_TURBO_CHECK(colwise_recipe.use_rht == false, "MXFP8 not support RHT");
     PRIMUS_TURBO_CHECK(rowwise_recipe.use_sr == false, "MXFP8 not support SR");
@@ -1757,6 +1761,10 @@ void grouped_quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *sca
                                  QuantizeMode mode, int G, int total_M, int N, int N_pad,
                                  int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
                                  ScalingRecipe recipe, hipStream_t stream) {
+    // TODO(ruibin): add kernel support for gfx1250
+    if (is_gfx1250()) {
+        PRIMUS_TURBO_ERROR("grouped_quantize_mxfp8 is not implemented on gfx1250.");
+    }
     PRIMUS_TURBO_CHECK(recipe.use_rht == false, "MXFP8 not support RHT");
     PRIMUS_TURBO_CHECK(recipe.use_sr == false, "MXFP8 not support SR");
 
@@ -1818,6 +1826,10 @@ void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t
                               int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
                               ScalingRecipe rowwise_recipe, ScalingRecipe colwise_recipe,
                               hipStream_t stream) {
+    // TODO(ruibin): add kernel support for gfx1250
+    if (is_gfx1250()) {
+        PRIMUS_TURBO_ERROR("quantize_mxfp8_dual is not implemented on gfx1250.");
+    }
     // Batched (G > 1) input is handled by replicating the per-matrix grid along
     // blockIdx.z; each z-slice quantizes one (M, N) group offset by its stride.
     dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
@@ -1909,6 +1921,10 @@ void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale, Quan
                          int G, int M, int N, int M_pad, int N_pad, int scale_stride, int scale_N,
                          int scale_M_pad, int scale_N_pad, ScalingRecipe recipe,
                          hipStream_t stream) {
+    // TODO(ruibin): add kernel support for gfx1250
+    if (is_gfx1250()) {
+        PRIMUS_TURBO_ERROR("quantize_mxfp8 is not implemented on gfx1250.");
+    }
     // Batched (G > 1) input replicates the per-matrix grid along blockIdx.z;
     // each z-slice quantizes one (M, N) group offset by its per-group stride.
     dim3 grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);

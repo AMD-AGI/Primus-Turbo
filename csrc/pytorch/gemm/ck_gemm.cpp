@@ -9,6 +9,8 @@
 
 namespace primus_turbo::pytorch {
 
+#ifdef BUILD_CK_BACKEND
+
 template <typename AType, typename BType, typename CType, typename ACCType>
 inline CKGemmFP8Params<AType, BType, CType, ACCType>
 make_ck_gemm_fp8_params(const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
@@ -96,5 +98,16 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
 
     return c;
 }
+
+#else // !BUILD_CK_BACKEND : CK GEMM unsupported (CK backend disabled)
+
+at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
+                       const bool transA, const bool transB, at::ScalarType out_dtype,
+                       const std::string &granularity) {
+    PRIMUS_TURBO_ERROR("ck_gemm_fp8 is unavailable: CK backend not built. "
+                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+}
+
+#endif // BUILD_CK_BACKEND
 
 } // namespace primus_turbo::pytorch
