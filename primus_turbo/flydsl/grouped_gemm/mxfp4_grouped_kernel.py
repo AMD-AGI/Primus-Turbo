@@ -476,7 +476,10 @@ _GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, gm, xcd, gn, out_fp16) -> [raw
 # full test sweep of ~480 shapes -> segfault), while retaining the xcd=1 win.
 _GMXFP4_DEFAULT_CFG = tuple(int(x) for x in _os.environ.get("MXFP4_CFG", "2,1,4").split(","))  # (gm,xcd,gn)
 _MXFP4_SMALL_CFG = tuple(int(x) for x in _os.environ.get("MXFP4_SMALL_CFG", "1,8,0").split(","))  # few-tile
-_MXFP4_SMALL_GRID = int(_os.environ.get("MXFP4_SMALL_GRID", "256"))  # grid_upper < this -> small cfg
+# xcd=1 (2,1,4) wins across the board once the scale F.pad + split preshuffle overheads are
+# gone (an earlier xcd=8 few-tile heuristic was tuned against that stale overhead and now
+# regresses the small-square shapes); keep the knob but default it off (grid<0 never fires).
+_MXFP4_SMALL_GRID = int(_os.environ.get("MXFP4_SMALL_GRID", "0"))  # grid_upper < this -> small cfg
 # JIT compile-cache bound: each distinct shape compiles one FlyDSL kernel (GPU code object).
 # Real MoE uses a handful of shapes; a broad test sweep (~480 shapes) accumulates enough
 # code objects to exhaust memory -> drop the caches (and gc the modules) past this cap. A
