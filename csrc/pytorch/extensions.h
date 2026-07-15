@@ -60,6 +60,11 @@ std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          inpu
                                                   const int64_t             axis,
                                                   c10::optional<at::Tensor> scale_opt);
 
+// ********* Transpose *********
+at::Tensor transpose_2d(const at::Tensor input, const int64_t dim0, const int64_t dim1);
+
+at::Tensor transpose_2d_meta(const at::Tensor input, const int64_t dim0, const int64_t dim1);
+
 at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
                                      const at::ScalarType dest_dtype);
 
@@ -186,6 +191,19 @@ grouped_quantize_mxfp4_dual_meta(const at::Tensor input, const at::Tensor group_
                                  const bool rowwise_use_rht, const bool colwise_use_2d_block,
                                  const bool colwise_use_sr, const bool colwise_use_rht);
 
+std::vector<at::Tensor> grouped_quantize_mxfp4(const at::Tensor input, const at::Tensor group_lens,
+                                               const at::Tensor     group_offs,
+                                               const at::ScalarType dest_dtype, const int64_t axis,
+                                               const bool use_2d_block, const bool use_sr,
+                                               const bool use_rht);
+
+std::vector<at::Tensor> grouped_quantize_mxfp4_meta(const at::Tensor     input,
+                                                    const at::Tensor     group_lens,
+                                                    const at::Tensor     group_offs,
+                                                    const at::ScalarType dest_dtype,
+                                                    const int64_t axis, const bool use_2d_block,
+                                                    const bool use_sr, const bool use_rht);
+
 //==================================================================
 //  Shuffle
 //==================================================================
@@ -248,19 +266,26 @@ at::Tensor turbo_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
 
 at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                            at::Tensor &group_offs, const bool transA, const bool transB,
-                           c10::optional<int64_t> num_cu);
+                           c10::optional<int64_t> num_cu, const bool work_steal,
+                           c10::optional<at::Tensor> ws_counter, int64_t ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                 at::Tensor &group_offs, const bool transA, const bool transB,
-                                c10::optional<int64_t> num_cu);
+                                c10::optional<int64_t> num_cu, const bool work_steal,
+                                c10::optional<at::Tensor> ws_counter, int64_t ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
-                                      c10::optional<int64_t> num_cu);
+                                      c10::optional<int64_t> num_cu, const bool work_steal,
+                                      c10::optional<at::Tensor> ws_counter,
+                                      int64_t                   ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                            at::Tensor &group_offs, const bool transA,
-                                           const bool transB, c10::optional<int64_t> num_cu);
+                                           const bool transB, c10::optional<int64_t> num_cu,
+                                           const bool                work_steal,
+                                           c10::optional<at::Tensor> ws_counter,
+                                           int64_t                   ws_local_per_xcd);
 
 at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                at::Tensor &b_scales, at::Tensor &group_lens, at::Tensor &group_offs,
@@ -358,5 +383,14 @@ void unpermute_meta(at::Tensor permuted_tokens, at::Tensor output_tokens,
 int64_t create_stream_with_cu_masks(const int device_id, const std::vector<uint32_t> &cu_masks);
 
 void destroy_stream(const int device_id, const int64_t stream_ptr);
+
+//==================================================================
+//  ODC rocSHMEM distributed backends (single-node host + multi-node GDA)
+//==================================================================
+
+#ifndef DISABLE_ROCSHMEM
+void register_odc_rocshmem_host(pybind11::module_ &m);
+void register_odc_rocshmem_gda(pybind11::module_ &m);
+#endif
 
 } // namespace primus_turbo::pytorch

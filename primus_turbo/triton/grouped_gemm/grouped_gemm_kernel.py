@@ -1235,3 +1235,80 @@ def grouped_gemm_variable_k_triton_kernel(
         kpack=1,
     )
     return out
+
+
+@triton.jit
+def _grouped_gemm_output_tail_kernel(
+    C,
+    group_offs_ptr,
+    G,
+    M_total,
+    N,
+    stride_cm,
+    stride_cn,
+    NUM_SMS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    covered = tl.load(group_offs_ptr + G).to(tl.int64)
+    m_total = tl.cast(M_total, tl.int64)
+    num_pad = m_total - covered
+    if num_pad <= 0:
+        return
+
+    num_m_blocks = tl.cdiv(num_pad, BLOCK_SIZE_M)
+    num_n_blocks = tl.cdiv(N, BLOCK_SIZE_N)
+    total_tiles = num_m_blocks * num_n_blocks
+
+    zeros = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=C.dtype.element_ty)
+
+    pid = tl.program_id(0)
+    for tile in range(pid, total_tiles, NUM_SMS):
+        bm = tile // num_n_blocks
+        bn = tile % num_n_blocks
+        rows = covered + bm * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+        cols = bn * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        mask = (rows[:, None] < m_total) & (cols[None, :] < N)
+        C_ = C + rows[:, None] * stride_cm + cols[None, :] * stride_cn
+        tl.store(C_, zeros, mask)
+
+
+def grouped_gemm_output_tail_kernel(
+    out: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> torch.Tensor:
+    """Zero the uncovered padding tail of a grouped GEMM output, in place.
+
+    Clears rows ``[group_offs[-1], out.shape[0])`` -- the rows the persistent
+    forward/dgrad kernel never writes when the output is over-allocated to
+    padded token counts. CPU-sync-free (the covered boundary is read on device)
+    and a no-op when there is no padding.
+
+    Args:
+        out: [M_total, N] grouped GEMM output.
+        group_offs: [G+1] int64 prefix sum the kernel used to write ``out``.
+
+    Returns:
+        The same ``out`` tensor.
+    """
+    assert out.ndim == 2, f"expected 2D grouped GEMM output, got {tuple(out.shape)}"
+    M_total, N = out.shape
+    G = group_offs.shape[0] - 1
+    if G <= 0 or M_total == 0 or N == 0:
+        return out
+
+    num_sms = get_num_cus()
+    _grouped_gemm_output_tail_kernel[(num_sms,)](
+        out,
+        group_offs,
+        G,
+        M_total,
+        N,
+        out.stride(0),
+        out.stride(1),
+        NUM_SMS=num_sms,
+        BLOCK_SIZE_M=64,
+        BLOCK_SIZE_N=256,
+        num_warps=4,
+    )
+    return out

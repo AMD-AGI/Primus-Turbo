@@ -17,7 +17,6 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
-    float4_e2m1fn_x2,
 )
 from primus_turbo.triton.quantization.quant_blockwise import (
     quant_fp8_blockwise_dual_kernel,
@@ -574,59 +573,90 @@ def grouped_quantize_mxfp8_impl(
 
 def grouped_quantize_mxfp4_impl(
     x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: Optional[int],
     block_size: int,
     group_lens: torch.Tensor,
     group_offs: torch.Tensor,
-    rowwise_recipe: Optional[ScalingRecipe] = None,
-    colwise_recipe: Optional[ScalingRecipe] = None,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    with_trans: bool = False,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+) -> Union[
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]:
-    """Fused grouped dual (rowwise + colwise) MXFP4 quantization in one bf16 read.
+    """Grouped MXFP4 quantization fused with per-group M-axis zero-padding.
 
-    One pass over the grouped activation ``x`` [total_m, N] (groups along M via
-    ``group_lens`` / ``group_offs``) emits:
+    When ``with_trans`` is True, the fused dual (rowwise + colwise) quantizer runs
+    in one bf16 read and emits:
       * rowwise FP4 [total_m, N_pad/2] + E8M0 scale [total_m, N_pad/32] in the
         tight (un-padded) M layout -- the fwd/dgrad operand (row i == input row i);
       * colwise FP4 [N, M_pad_col/2] + E8M0 scale [N, M_pad_col/32] in the
         128-padded per-group M layout -- the variable-K wgrad operand.
-    The per-group 128-padding offsets are computed on-GPU (no D2H sync), so the
-    op is CUDA-graph capturable.
-
     Returns ``(rowwise_out, rowwise_scale, colwise_out, colwise_scale,
-    group_lens_padded_colwise, group_offs_padded_colwise)``.
+    group_lens_padded_rowwise, group_offs_padded_rowwise,
+    group_lens_padded_colwise, group_offs_padded_colwise)`` to mirror
+    :func:`grouped_quantize_mxfp8_impl`. Rowwise is tight-M, so its padded
+    layout equals the original ``group_lens`` / ``group_offs``.
+
+    When ``with_trans`` is False, only the single direction selected by ``axis``
+    (1 -> rowwise, 0 -> colwise) is produced, returning
+    ``(data, scale_inv, group_lens_padded, group_offs_padded)``.
     """
     mxfp4_support, reason = check_mxfp4_support()
     assert mxfp4_support, reason
 
     assert block_size == MXFP4_BLOCK_SIZE, f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
 
-    rowwise_recipe = ScalingRecipe() if rowwise_recipe is None else rowwise_recipe
-    colwise_recipe = ScalingRecipe() if colwise_recipe is None else colwise_recipe
-    assert not (
-        rowwise_recipe.shuffle_scale
-        or rowwise_recipe.shuffle_out
-        or colwise_recipe.shuffle_scale
-        or colwise_recipe.shuffle_out
-    ), "Grouped MXFP4 dual quant does not support shuffle layouts."
+    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
 
-    return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
-        x,
-        group_lens,
-        group_offs,
-        float4_e2m1fn_x2,
-        rowwise_recipe.use_2d_block,
-        rowwise_recipe.use_sr,
-        rowwise_recipe.use_rht,
-        colwise_recipe.use_2d_block,
-        colwise_recipe.use_sr,
-        colwise_recipe.use_rht,
-    )
+    if with_trans:
+        scaling_recipe_for_trans = (
+            ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+        )
+        assert not (
+            scaling_recipe.shuffle_scale
+            or scaling_recipe.shuffle_out
+            or scaling_recipe_for_trans.shuffle_scale
+            or scaling_recipe_for_trans.shuffle_out
+        ), "Grouped MXFP4 dual quant does not support shuffle layouts."
+
+        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
+            x,
+            group_lens,
+            group_offs,
+            out_dtype,
+            scaling_recipe.use_2d_block,
+            scaling_recipe.use_sr,
+            scaling_recipe.use_rht,
+            scaling_recipe_for_trans.use_2d_block,
+            scaling_recipe_for_trans.use_sr,
+            scaling_recipe_for_trans.use_rht,
+        )
+    else:
+        assert axis in (0, 1), "The axis must be 0 (colwise) or 1 (rowwise) when with_trans is False."
+        assert not (scaling_recipe.shuffle_scale or scaling_recipe.shuffle_out), (
+            "Grouped MXFP4 single quant does not support shuffle layouts."
+        )
+        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4(
+            x,
+            group_lens,
+            group_offs,
+            out_dtype,
+            axis,
+            scaling_recipe.use_2d_block,
+            scaling_recipe.use_sr,
+            scaling_recipe.use_rht,
+        )
 
 
 def dequantize_mxfp8_impl(
@@ -713,7 +743,12 @@ def quantize_mxfp4_impl(
         scaling_recipe_for_trans = scaling_recipe
 
     if not with_trans:
-        assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
+        if x.ndim == 2:
+            assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False and x is 2D."
+        elif x.ndim == 3:
+            assert axis in (1, 2), "The axis must be 1 or 2 when with_trans is False and x is 3D."
+        else:
+            raise ValueError(f"The input tensor must be 2D or 3D but got {x.ndim}D.")
     else:
         assert axis is None, "The axis must be None when with_trans is True."
 
@@ -757,22 +792,22 @@ def dequantize_mxfp4_impl(
     scale_inv: torch.Tensor,
 ) -> torch.Tensor:
     assert x.is_contiguous(), "The x tensor must be contiguous."
-    assert x.dim() == 2, "The x must be 2D tensor."
-    assert scale_inv.dim() == 2, "The scale_inv must be 2D tensor."
+    assert x.dim() in (2, 3), "The x must be a 2D or 3D tensor."
+    assert scale_inv.dim() == x.dim(), "The scale_inv rank must match x."
     assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
-    assert axis in (
-        0,
-        1,
-    ), "The axis must be 0 or 1."
     assert x.dtype == torch.float4_e2m1fn_x2, f"The x dtype must be torch.float4_e2m1fn_x2 but got {x.dtype}."
     SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
     assert out_dtype in SUPPORTED_OUT_DTYPES, (
         f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
     )
 
-    num_rows, row_length = x.size()
-    # NOTE: x is packed in last dimension
-    row_length = row_length * 2
+    if x.dim() == 2:
+        assert axis in (0, 1), "The axis must be 0 or 1 for 2D input."
+        # NOTE: x is packed in the last dimension (2 fp4 per byte).
+        row_length = x.size(1) * 2
+    else:
+        assert axis in (1, 2), "The axis must be 1 or 2 for 3D input."
+        row_length = x.size(2) * 2
     assert row_length % block_size == 0, (
         "The last dimension of the x tensor must be divisible by the block size."
     )

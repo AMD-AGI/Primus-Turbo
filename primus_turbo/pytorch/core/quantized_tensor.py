@@ -229,20 +229,30 @@ class QuantizedTensor(torch.Tensor):
             assert hp_tensor.ndim == 2, (
                 f"Grouped quantized tensor expects a 2D packed-M tensor, got {hp_tensor.ndim}D"
             )
-            assert dest_dtype in _SUPPORTED_QUANTIZED_DTYPES and dest_dtype != float4_e2m1fn_x2, (
-                "Unsupported quantized dtype (FP4 not supported for grouped activations)"
-            )
-            if granularity == ScalingGranularity.MX_BLOCKWISE:
-                assert dest_dtype in [
-                    float8_e4m3,
-                    float8_e5m2,
-                ], "Unsupported quantized dtype for grouped MX_BLOCKWISE"
-
-                supported, reason = check_mxfp8_support()
-                assert block_size == MXFP8_BLOCK_SIZE, (
-                    "block_size must be MXFP8_BLOCK_SIZE for grouped MX_BLOCKWISE"
+            assert dest_dtype in _SUPPORTED_QUANTIZED_DTYPES, "Unsupported quantized dtype"
+            # FP4 grouped activations are only supported under MX_BLOCKWISE.
+            if dest_dtype == float4_e2m1fn_x2:
+                assert granularity == ScalingGranularity.MX_BLOCKWISE, (
+                    "FP4 grouped activations only support MX_BLOCKWISE granularity"
                 )
-                assert supported, reason
+            if granularity == ScalingGranularity.MX_BLOCKWISE:
+                if dest_dtype == float4_e2m1fn_x2:
+                    supported, reason = check_mxfp4_support()
+                    assert block_size == MXFP4_BLOCK_SIZE, (
+                        "block_size must be MXFP4_BLOCK_SIZE for MX_BLOCKWISE FP4 quantization"
+                    )
+                    assert supported, reason
+                else:
+                    assert dest_dtype in [
+                        float8_e4m3,
+                        float8_e5m2,
+                    ], "Unsupported quantized dtype for MX_BLOCKWISE FP8 quantization"
+
+                    supported, reason = check_mxfp8_support()
+                    assert block_size == MXFP8_BLOCK_SIZE, (
+                        "block_size must be MXFP8_BLOCK_SIZE for MX_BLOCKWISE FP8 quantization"
+                    )
+                    assert supported, reason
                 assert scaling_recipe is not None, "scaling_recipe must be provided for grouped MX_BLOCKWISE"
         else:
             assert granularity in _SUPPORTED_QUANTIZED_GRANS, f"Unsupported granularity {granularity}"
@@ -370,10 +380,6 @@ class QuantizedTensor(torch.Tensor):
         else:
             assert dest_dtype == float4_e2m1fn_x2
             assert granularity == ScalingGranularity.MX_BLOCKWISE
-            # MXFP4 single-direction kernel only supports 2D input with axis in {0, 1};
-            assert data.ndim == 2, (
-                f"FP4 single-direction quantization requires a 2D tensor, got {data.ndim}D."
-            )
 
             data_, scale_inv = quantize_fp4(
                 data,
@@ -398,12 +404,28 @@ class QuantizedTensor(torch.Tensor):
         axis: Optional[int] = None,
         scaling_recipe: Optional[ScalingRecipe] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp8
+        from primus_turbo.pytorch.ops.quantization import (
+            grouped_quantize_fp4,
+            grouped_quantize_fp8,
+        )
 
         axis = _normalize_axis(axis, data.ndim)
 
         if dest_dtype in [float8_e4m3, float8_e5m2]:
             data_, scale_inv, group_lens_padded, group_offs_padded = grouped_quantize_fp8(
+                data,
+                dest_dtype,
+                granularity,
+                group_lens=group_lens,
+                group_offs=group_offs,
+                block_size=block_size,
+                axis=axis,
+                scaling_recipe=scaling_recipe,
+            )
+            return data_, scale_inv, group_lens_padded, group_offs_padded
+
+        if dest_dtype == float4_e2m1fn_x2:
+            data_, scale_inv, group_lens_padded, group_offs_padded = grouped_quantize_fp4(
                 data,
                 dest_dtype,
                 granularity,
@@ -474,10 +496,25 @@ class QuantizedTensor(torch.Tensor):
     @torch.no_grad()
     def _grouped_dequantize(self) -> torch.Tensor:
         from primus_turbo.pytorch.ops.quantization import (
+            grouped_dequantize_fp4,
             grouped_dequantize_fp8,
         )
 
         axis = _normalize_axis(self._quantized_axis, self._data.ndim)
+
+        if self._dest_dtype == float4_e2m1fn_x2:
+            assert self._granularity == ScalingGranularity.MX_BLOCKWISE, (
+                "Grouped dequantization is only supported for MX_BLOCKWISE FP4"
+            )
+            return grouped_dequantize_fp4(
+                self._data,
+                self._orig_dtype,
+                self._granularity,
+                block_size=self._block_size,
+                axis=axis,
+                scale_inv=self._scale_inv,
+                scaling_recipe=self._scaling_recipe,
+            )
 
         if self._dest_dtype in [float8_e4m3, float8_e5m2]:
             assert self._granularity == ScalingGranularity.MX_BLOCKWISE, (
@@ -707,7 +744,7 @@ class QuantizedTensor(torch.Tensor):
         new_shape = torch.Size(new_shape)
 
         if tensor._granularity == ScalingGranularity.TENSORWISE:
-            new_data = tensor._data.transpose(d0, d1).contiguous()
+            new_data = torch.ops.primus_turbo_cpp_extension.transpose_2d(tensor._data.contiguous(), d0, d1)
             return cls._make_like(tensor, data=new_data, scale_inv=tensor._scale_inv, shape=new_shape)
 
         # Rowwise / MX blockwise: dequantize -> transpose -> re-quantize colwise.
@@ -880,7 +917,7 @@ def create_quantized_weight(
         elif granularity == ScalingGranularity.ROWWISE:
             # NOTE: rowwise quantization not support transpose, so we need to quantize the transposed weight manually.
             quantized_weight_t = QuantizedTensor.quantize(
-                weight.transpose(-2, -1),
+                torch.ops.primus_turbo_cpp_extension.transpose_2d(weight.contiguous(), -2, -1),
                 dest_dtype=dest_dtype,
                 granularity=quant_config.granularity,
                 block_size=quant_config.block_size,

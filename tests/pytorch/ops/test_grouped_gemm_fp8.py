@@ -380,7 +380,7 @@ def test_grouped_gemm_fp8_blockwise_deterministic(
     )
 
 
-# MX_BLOCKWISE deterministic — triton backend only; only runs on gfx950.
+# MX_BLOCKWISE deterministic — triton + flydsl backends; only runs on gfx950.
 # Limited to trans_b=True: the TT-layout path routes through a Python-level
 # transpose+pad layer whose downstream allocator non-determinism is out of
 # scope for the kernel determinism test.
@@ -391,8 +391,9 @@ def test_grouped_gemm_fp8_blockwise_deterministic(
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
 @pytest.mark.deterministic
-def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance):
+def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance, backend):
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
         pytest.skip(reason)
@@ -407,7 +408,7 @@ def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format
         granularity=ScalingGranularity.MX_BLOCKWISE,
         trans_b=trans_b,
         balance=balance,
-        backend=BackendType.TRITON,
+        backend=backend,
         block_size=32,
         repeats=10,
     )
@@ -515,8 +516,9 @@ def test_grouped_gemm_fp8_blockwise(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance):
-    """MXFP8 grouped GEMM fwd + dgrad + wgrad on the triton backend."""
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
+def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance, backend):
+    """MXFP8 grouped GEMM fwd + dgrad + wgrad."""
     N, K = NK
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
@@ -531,7 +533,7 @@ def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, bal
         granularity=ScalingGranularity.MX_BLOCKWISE,
         trans_b=trans_b,
         balance=balance,
-        backend=BackendType.TRITON,
+        backend=backend,
         auto_tune=False,
     )
 
@@ -686,6 +688,16 @@ def test_grouped_gemm_fp8_tensorwise_quantized_tensor(
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
 
+    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can hang/flake when M <= 512.
+    # This has been observed under pytest; root cause not yet identified. MI355 works normally.
+    # Skip also when auto_tune=True because the tuner may select hipBLASLt.
+    if (
+        get_device_compute_capability() == (9, 4)
+        and M <= 512
+        and (backend is BackendType.HIPBLASLT or auto_tune is True)
+    ):
+        pytest.skip("gfx942: hipBLASLt path can hang/flake when M <= 512")
+
     N, K = NK
     _run_grouped_gemm_fp8_quantized_tensor_test(
         B=B,
@@ -743,12 +755,19 @@ def test_grouped_gemm_fp8_rowwise_quantized_tensor(
     ],
 )
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.FLYDSL])
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_mx_blockwise_quantized_tensor(
     B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune
 ):
     """MX_BLOCKWISE grouped_gemm with pre-quantized grouped/regular QuantizedTensor inputs."""
+    # FlyDSL MX grouped GEMM is gfx950-only; skip on other archs (e.g. gfx942, gfx1250).
+    if backend == BackendType.FLYDSL and get_device_compute_capability() != (9, 5):
+        pytest.skip("FlyDSL MX_BLOCKWISE grouped GEMM is gfx950-only")
+
+    mxfp8_supported, reason = check_mxfp8_support()
+    if not mxfp8_supported:
+        pytest.skip(reason)
 
     N, K = NK
     _run_grouped_gemm_fp8_quantized_tensor_test(
@@ -1035,3 +1054,65 @@ def test_grouped_gemm_fp8_blockwise_zero_group_lens():
     b_grad_snr = compute_snr(b_ref.grad, b.grad)
     print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
     assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+
+def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
+    """Fill and free caching-allocator blocks of ``shape`` with ``sentinel`` so a
+    subsequent same-shape allocation reuses a dirty (non-zero) block instead of a
+    fresh, driver-zeroed page. Lets us detect output regions the kernel never wrote."""
+    blocks = [torch.full(shape, sentinel, dtype=dtype, device=device) for _ in range(n)]
+    for x in blocks:
+        x.add_(0.0)
+    del blocks
+
+
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize(
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
+def test_grouped_gemm_fp8_padded_tail_zeroed(ori_dtype, trans_b, backend):
+    """Over-allocated output tail [sum(group_lens):M_total] must be zeroed, not left as
+    caching-allocator garbage."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
+
+    torch.manual_seed(42)
+    device = "cuda:0"
+    G, K, N = 8, 2048, 2880
+    group_lens = torch.tensor([4096, 0, 3072, 0, 0, 5120, 0, 0], dtype=torch.int64, device=device)
+    S = int(group_lens.sum())
+    PAD = 224
+    M_total = S + PAD  # simulate FP8-padded activation rows
+    sentinel = 12288.0  # exactly representable in bf16 and fp16
+    print(f"\nori_dtype={ori_dtype}, trans_b={trans_b}, backend={backend}, S={S}, M_total={M_total}")
+
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    config = Float8QuantConfig(format=Format.E4M3, granularity=ScalingGranularity.TENSORWISE)
+
+    b_shape = (G, N, K) if trans_b else (G, K, N)
+    a = torch.randn((M_total, K), dtype=ori_dtype, device=device)
+    b = torch.randn(b_shape, dtype=ori_dtype, device=device)
+
+    # Warm up (JIT/autotune), then poison the pool so any unwritten padding rows
+    # surface the sentinel instead of a fresh zeroed page.
+    grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+    torch.cuda.synchronize()
+    _poison_alloc_pool((M_total, N), ori_dtype, device, sentinel)
+
+    out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+    torch.cuda.synchronize()
+
+    pad_tail = out[S:M_total]
+    assert torch.isfinite(pad_tail).all(), f"{backend.name}: padding tail non-finite"
+    torch.testing.assert_close(
+        pad_tail,
+        torch.zeros_like(pad_tail),
+        rtol=0.0,
+        atol=0.0,
+        msg=f"{backend.name}: padding tail [{S}:{M_total}] must be zeroed",
+    )
+
+    GlobalBackendManager.reset()

@@ -8,12 +8,16 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP4_BLOCK_SIZE,
     Float4QuantConfig,
     Format,
     ScaleDtype,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp4_support,
+    float4_e2m1fn_x2,
 )
+from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.pytorch.ops.grouped_gemm_fp4 import grouped_gemm_fp4
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -131,6 +135,94 @@ def test_grouped_gemm_fp4_mx_blockwise(B, M, NK, dtype, balance):
     """MXFP4 grouped GEMM fwd + dgrad + wgrad on the Triton backend."""
     N, K = NK
     _run(B, M, N, K, dtype, balance)
+
+
+# ----------------------------------------------------------------------------
+# Pre-quantized QuantizedTensor inputs.
+# ----------------------------------------------------------------------------
+def _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype, balance):
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+    if _check_hit_int32_limit(B, M, N, K):
+        pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
+
+    device = "cuda:0"
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    print(f"\n[QT] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, balance={balance}")
+
+    a = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_(True)
+    b_ref = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+
+    # Match the row-wise recipes grouped_gemm_fp4 applies internally so the
+    # pre-quantized operands pass check_quantized_tensor.
+    a_scaling_recipe = ScalingRecipe()
+    b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+
+    qt_a = QuantizedTensor.quantize(
+        a,
+        float4_e2m1fn_x2,
+        ScalingGranularity.MX_BLOCKWISE,
+        scaling_recipe=a_scaling_recipe,
+        block_size=MXFP4_BLOCK_SIZE,
+        group_lens=group_lens,
+        axis=-1,
+    )
+    qt_b = QuantizedTensor.quantize(
+        b,
+        float4_e2m1fn_x2,
+        ScalingGranularity.MX_BLOCKWISE,
+        scaling_recipe=b_scaling_recipe,
+        block_size=MXFP4_BLOCK_SIZE,
+        axis=-1,
+    )
+
+    # Reference
+    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=True)
+    grad_out = torch.randn_like(out_ref)
+    out_ref.backward(grad_out)
+    torch.cuda.synchronize()
+
+    config = _make_config()
+    out = grouped_gemm_fp4(qt_a, qt_b, group_lens, trans_b=True, config=config)
+    out.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # Check Shape
+    assert out.shape == out_ref.shape
+    assert qt_a.grad is not None and qt_a.grad.shape == a.shape
+    assert qt_b.grad is not None and qt_b.grad.shape == b.shape
+
+    # Check Results
+    out_snr = compute_snr(out_ref, out)
+    a_grad_snr = compute_snr(a_ref.grad, qt_a.grad)
+    b_grad_snr = compute_snr(b_ref.grad, qt_b.grad)
+    print(f"[QT] Out-SNR={out_snr:.2f} dB  AGrad-SNR={a_grad_snr:.2f} dB  BGrad-SNR={b_grad_snr:.2f} dB")
+    assert out_snr > SNR_THRESHOLD, f"out_snr={out_snr:.2f} too low"
+    assert a_grad_snr > SNR_THRESHOLD, f"a_grad_snr={a_grad_snr:.2f} too low"
+    assert b_grad_snr > SNR_THRESHOLD, f"b_grad_snr={b_grad_snr:.2f} too low"
+
+
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("dtype", DTYPE_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp4_mx_blockwise_quantized_tensor(B, M, NK, dtype, balance):
+    """MXFP4 grouped GEMM with pre-quantized grouped/regular QuantizedTensor inputs."""
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    N, K = NK
+    _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype, balance)
 
 
 # ----------------------------------------------------------------------------
@@ -337,3 +429,58 @@ def test_grouped_gemm_fp4_mx_blockwise_deterministic(B, M, NK, dtype, balance):
     """fwd + dgrad + wgrad are bit-exact across 10 repeats (SR off)."""
     N, K = NK
     _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, repeats=10)
+
+
+# ----------------------------------------------------------------------------
+# Over-allocated output tail must be zeroed (mirrors the FP8 sibling test).
+# ----------------------------------------------------------------------------
+def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
+    """Fill and free caching-allocator blocks of ``shape`` with ``sentinel`` so a
+    subsequent same-shape allocation reuses a dirty (non-zero) block instead of a
+    fresh, driver-zeroed page. Lets us detect output regions the kernel never wrote."""
+    blocks = [torch.full(shape, sentinel, dtype=dtype, device=device) for _ in range(n)]
+    for x in blocks:
+        x.add_(0.0)
+    del blocks
+
+
+@pytest.mark.parametrize("dtype", DTYPE_VALUES)
+def test_grouped_gemm_fp4_padded_tail_zeroed(dtype):
+    """Over-allocated output tail [sum(group_lens):M_total] must be zeroed, not left as
+    caching-allocator garbage."""
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+
+    torch.manual_seed(42)
+    device = "cuda:0"
+    G, K, N = 8, 2048, 2880
+    group_lens = torch.tensor([4096, 0, 3072, 0, 0, 5120, 0, 0], dtype=torch.int64, device=device)
+    S = int(group_lens.sum())
+    PAD = 224
+    M_total = S + PAD  # simulate over-allocated (fixed-capacity permute) activation rows
+    sentinel = 12288.0  # exactly representable in bf16 and fp16
+    print(f"\ndtype={dtype}, S={S}, M_total={M_total}")
+
+    config = _make_config()
+    a = torch.randn((M_total, K), dtype=dtype, device=device)
+    b = torch.randn((G, N, K), dtype=dtype, device=device)
+
+    # Warm up (JIT/autotune), then poison the pool so any unwritten padding rows
+    # surface the sentinel instead of a fresh zeroed page.
+    grouped_gemm_fp4(a, b, group_lens, trans_b=True, config=config)
+    torch.cuda.synchronize()
+    _poison_alloc_pool((M_total, N), dtype, device, sentinel)
+
+    out = grouped_gemm_fp4(a, b, group_lens, trans_b=True, config=config)
+    torch.cuda.synchronize()
+
+    pad_tail = out[S:M_total]
+    assert torch.isfinite(pad_tail).all(), "padding tail non-finite"
+    torch.testing.assert_close(
+        pad_tail,
+        torch.zeros_like(pad_tail),
+        rtol=0.0,
+        atol=0.0,
+        msg=f"padding tail [{S}:{M_total}] must be zeroed",
+    )

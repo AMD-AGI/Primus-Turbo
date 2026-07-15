@@ -7,7 +7,9 @@ from typing import Optional, Union
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -621,8 +623,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 group_lens,
                 group_offs,
                 block_size=config.block_size,
-                scaling_recipe=ScalingRecipe(),
-                scaling_recipe_for_trans=ScalingRecipe(),
+                scaling_recipe=a_scaling_recipe,
+                scaling_recipe_for_trans=a_scaling_recipe,
             )
         else:
             quantized_a = a
@@ -699,7 +701,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         out = out[:total_m]
@@ -757,7 +759,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         grad_a = grad_a[: ctx.total_m]
@@ -776,10 +778,21 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
-        return grad_a, grad_b, None, None, None, None, None, None, None, None
+        return (
+            grad_a,  # a
+            grad_b,  # b
+            None,  # a_t
+            None,  # b_t
+            None,  # group_lens
+            None,  # group_offs
+            None,  # trans_b
+            None,  # out_dtype
+            None,  # config
+            None,  # num_cu
+        )
 
 
 @torch._dynamo.disable(

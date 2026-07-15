@@ -307,6 +307,22 @@ tasks:
     output: grouped_gemm_fp8_blockwise_triton_benchmark.csv
     shardable: true
 
+  # ── Mega MoE fused (multi-GPU) ───────────────────────────
+  # TODO(mega): flydsl kernels are gfx950-only for now; not supported on gfx942.
+  # - label: mega_dispatch_grouped_gemm
+  #   group: mega_moe
+  #   script: bench_mega_moe.py
+  #   args: [--mode, dispatch_grouped_gemm]
+  #   output: dispatch_grouped_gemm_benchmark.csv
+  #   gpus: 8
+
+  # - label: mega_grouped_gemm_combine
+  #   group: mega_moe
+  #   script: bench_mega_moe.py
+  #   args: [--mode, grouped_gemm_combine]
+  #   output: grouped_gemm_combine_benchmark.csv
+  #   gpus: 8
+
   # ── DeepEP (multi-GPU, placed last) ──────────────────────
   - label: deep_ep_intranode
     group: deepep

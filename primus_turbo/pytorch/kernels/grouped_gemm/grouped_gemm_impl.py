@@ -14,11 +14,33 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
+from primus_turbo.pytorch.core.utils import _get_device_compute_capability
+
+
+def _is_gfx950_device(device: torch.device) -> bool:
+    """Compute capability check bound to a specific tensor's device.
+
+    ``is_gfx950()`` inspects the *current* CUDA device via
+    ``torch.cuda.current_device()``, which is wrong when the tensor lives
+    on a different device than the ambient one (multi-GPU / mixed-arch
+    hosts). Route by the tensor's device instead.
+    """
+    if device.type != "cuda":
+        return False
+    return _get_device_compute_capability(device) == (9, 5)
+
+
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
 )
+from primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic import (
+    approximate_ck_standard_total_tiles,
+    compute_ck_variable_k_total_tiles,
+    resolve_ck_ws_local_per_xcd,
+)
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+    grouped_gemm_output_tail_kernel,
     grouped_gemm_triton_kernel,
     grouped_gemm_variable_k_triton_kernel,
 )
@@ -30,10 +52,38 @@ _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 #   "work_steal"  -- work-stealing persistent kernel with the kernel-aware
 #                    heuristic that picks the WS sub-mode (per-XCD /
 #                    global / hierarchical) from tensor metadata.
-#                    Triton backend only in this build.
+#                    Triton + CK backends.
 _SUPPORTED_SCHEDULES: tuple[str, ...] = ("static", "work_steal")
-_TRITON_SUPPORTED_SCHEDULES: tuple[str, ...] = ("static", "work_steal")
+_WS_SUPPORTED_SCHEDULES: tuple[str, ...] = ("static", "work_steal")
 _NON_WS_SUPPORTED_SCHEDULES: tuple[str, ...] = ("static",)
+
+# Per-device cache for the CK work-stealing counter buffer.
+#
+# Layout: [xcd0..xcd7, global, done] -- 10 int32 slots. The kernel self-resets
+# every slot to 0 before exit (last-out CTA pattern, see
+# grouped_gemm_kernel_ws.hpp), so the only zero we ever need is the one
+# ``torch.zeros`` does at first allocation. Caching one buffer per device makes
+# that allocation a one-shot cost per process.
+#
+# Caveat: the singleton is not stream-safe. Concurrent WS launches on different
+# streams of the same device would race on the same slots. Safe under the
+# typical single-stream autograd graph. The public ``grouped_gemm()`` op also
+# rejects ``schedule="work_steal"`` paired with ``num_cu != None``, so partial-
+# grid launches never reach the WS path from the high level.
+_CK_WS_COUNTER_NUM_SLOTS = 10
+_ck_ws_counters: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_ck_ws_counter(device: torch.device) -> torch.Tensor:
+    buf = _ck_ws_counters.get(device)
+    if buf is None:
+        buf = torch.zeros(_CK_WS_COUNTER_NUM_SLOTS, dtype=torch.int32, device=device)
+        _ck_ws_counters[device] = buf
+    return buf
+
+
+def _num_cus(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 class GroupedGEMMCKBackend(KernelBackend):
@@ -53,7 +103,15 @@ class GroupedGEMMCKBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= not trans_a
-        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+        supported &= schedule in _WS_SUPPORTED_SCHEDULES
+        # The CK WS kernel needs 4 extra bytes of LDS for the atomicAdd
+        # broadcast slot, which fits on gfx950 (MI355X) but overflows
+        # gfx942's 64 KB LDS budget. The device-side WS body is stubbed
+        # out on gfx942, so refuse to dispatch WS to CK on that arch.
+        # Check the *tensor's* device (multi-GPU safe), not the ambient
+        # ``current_device()``.
+        if schedule == "work_steal" and not _is_gfx950_device(a.device):
+            supported = False
         return supported
 
     @staticmethod
@@ -68,8 +126,39 @@ class GroupedGEMMCKBackend(KernelBackend):
         schedule: str = "static",
         **kwargs,
     ) -> torch.Tensor:
+        work_steal = schedule == "work_steal"
+        ws_counter: torch.Tensor | None = None
+        resolved_lpx = 0
+        if work_steal:
+            ws_counter = _get_ck_ws_counter(a.device)
+            # Sync-free: derive total_tiles from tensor metadata. Use the
+            # transpose-aware M dimension (``can_handle`` already rejects
+            # trans_a=True on this backend, but keep the shape logic honest
+            # so it stays correct if that constraint is ever relaxed).
+            total_m = a.size(1) if trans_a else a.size(0)
+            n = b.size(1) if trans_b else b.size(2)
+            total_tiles = approximate_ck_standard_total_tiles(
+                total_m,
+                group_lens.numel(),
+                n,
+            )
+            resolved_lpx = resolve_ck_ws_local_per_xcd(
+                "auto",
+                total_tiles,
+                num_cu or _num_cus(a.device),
+                kernel_kind="standard",
+            )
         return torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm(
-            a, b, group_lens, group_offs, trans_a, trans_b, num_cu
+            a,
+            b,
+            group_lens,
+            group_offs,
+            trans_a,
+            trans_b,
+            num_cu,
+            work_steal,
+            ws_counter,
+            resolved_lpx,
         )
 
 
@@ -91,7 +180,11 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
-        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+        supported &= schedule in _WS_SUPPORTED_SCHEDULES
+        # See GroupedGEMMCKBackend.can_handle: the CK WS kernel is
+        # gfx950-only due to LDS budget. Route by the tensor's device.
+        if schedule == "work_steal" and not _is_gfx950_device(a.device):
+            supported = False
         return supported
 
     @staticmethod
@@ -113,8 +206,37 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         else:
             lhs, rhs = a, b
             trans_lhs, trans_rhs = trans_a, trans_b
+        work_steal = schedule == "work_steal"
+        ws_counter: torch.Tensor | None = None
+        resolved_lpx = 0
+        if work_steal:
+            ws_counter = _get_ck_ws_counter(lhs.device)
+            # Variable-K total_tiles depends only on tensor shapes
+            # (lhs.size, rhs.size, group_lens.numel) -- exact and sync-free.
+            m_out = lhs.size(1) if trans_lhs else lhs.size(0)
+            n_out = rhs.size(0) if trans_rhs else rhs.size(1)
+            total_tiles = compute_ck_variable_k_total_tiles(
+                group_lens.numel(),
+                m_out,
+                n_out,
+            )
+            resolved_lpx = resolve_ck_ws_local_per_xcd(
+                "auto",
+                total_tiles,
+                num_cu or _num_cus(lhs.device),
+                kernel_kind="variable_k",
+            )
         return torch.ops.primus_turbo_cpp_extension.ck_grouped_gemm_variable_k(
-            lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs, num_cu
+            lhs,
+            rhs,
+            group_lens,
+            group_offs,
+            trans_lhs,
+            trans_rhs,
+            num_cu,
+            work_steal,
+            ws_counter,
+            resolved_lpx,
         )
 
 
@@ -222,7 +344,7 @@ class GroupedGEMMTritonBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= not trans_a
-        supported &= schedule in _TRITON_SUPPORTED_SCHEDULES
+        supported &= schedule in _WS_SUPPORTED_SCHEDULES
         return supported
 
     @staticmethod
@@ -275,7 +397,7 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
-        supported &= schedule in _TRITON_SUPPORTED_SCHEDULES
+        supported &= schedule in _WS_SUPPORTED_SCHEDULES
         return supported
 
     @staticmethod
@@ -374,7 +496,9 @@ def grouped_gemm_impl(
         schedule=schedule,
     )
 
-    return GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = grouped_gemm_output_tail_kernel(out, group_offs)
+    return out
 
 
 @_torch_custom_op_wrapper("primus_turbo::grouped_gemm_variable_k_impl", mutates_args=(), device_types="cuda")

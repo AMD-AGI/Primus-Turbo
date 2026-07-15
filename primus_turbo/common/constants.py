@@ -39,3 +39,21 @@ ENV_ATTN_V3_ATOMIC_FP32 = "PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"
 # When set to "1", EP dispatch/combine kernels run on the caller's current CUDA stream.
 # Default: "0"
 ENV_EP_FORCE_CURRENT_STREAM = "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"
+
+# ---------------------------------------------------------------------------
+# ODC (on-demand-comm) rocSHMEM GDA device-kernel knobs, consumed by
+# csrc/kernels/odc_rocshmem/odc_rocshmem_gda.cu for the multi-node
+# reduce-scatter / all-gather device kernels.
+# ---------------------------------------------------------------------------
+
+# Threads-per-block for the ODC GDA device kernels (clamped to [32, 1024]).
+# Default: 256
+ENV_ODC_GDA_BLOCK = "PRIMUS_TURBO_ODC_GDA_BLOCK"
+
+# Reduce-scatter peer-pipeline batch depth (1 = serial; clamped to [1, 64]).
+# Default: 1
+ENV_ODC_GDA_PIPE = "PRIMUS_TURBO_ODC_GDA_PIPE"
+
+# Number of rocSHMEM QPs/contexts for multi-QP NIC concurrency (clamped to
+# [1, 256]); a value >1 selects the multi-QP path. Default: 1
+ENV_ODC_GDA_NUM_QP = "PRIMUS_TURBO_ODC_GDA_NUM_QP"

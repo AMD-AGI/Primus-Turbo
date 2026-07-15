@@ -4,7 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import importlib
+import importlib.metadata
+import importlib.util
 import os
 import re
 import shutil
@@ -45,7 +46,41 @@ else:
     patch_torch_extension()
 
 
-TURBO_FALLBACK_LIBRARY_HOME = "/opt/rocm"
+def is_package_installed(package_name):
+    """Check if a package is properly installed (not just a namespace ghost).
+
+    Uses importlib.metadata to verify the package has real distribution
+    metadata registered with pip, avoiding false positives from leftover
+    empty directories that Python treats as implicit namespace packages.
+    """
+    try:
+        importlib.metadata.distribution(package_name)
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
+def is_rocm_sdk_devel_installed():
+    return is_package_installed("rocm_sdk_devel")
+
+
+def rocm_sdk_devel_library_home():
+    if is_package_installed("rocm_sdk_devel"):
+        from rocm_sdk._devel import get_devel_root
+
+        return get_devel_root()
+
+    else:
+        return None
+
+
+def _rocm_fallback_library_home():
+    rocm_library_home = rocm_sdk_devel_library_home()
+
+    return rocm_library_home if rocm_library_home is not None else "/opt/rocm"
+
+
+ROCM_FALLBACK_LIBRARY_HOME = _rocm_fallback_library_home()
 
 
 @dataclass
@@ -118,7 +153,7 @@ def find_rocm_home() -> Optional[str]:
             if os.path.basename(rocm_home) == "hip":
                 rocm_home = os.path.dirname(rocm_home)
         else:
-            fallback_path = TURBO_FALLBACK_LIBRARY_HOME
+            fallback_path = ROCM_FALLBACK_LIBRARY_HOME
             if os.path.exists(fallback_path):
                 rocm_home = fallback_path
     if rocm_home and torch.version.hip is None:
@@ -202,8 +237,14 @@ def find_mpi_home():
 
 
 def find_rocshmem_home():
+
+    def _rocshmem_fallback_library_home():
+        rocshmem_library_home = rocm_sdk_devel_library_home()
+
+        return rocshmem_library_home if rocshmem_library_home is not None else "/opt/rocm/rocshmem"
+
     return _find_library_home(
-        ["ROCSHMEM_HOME", "ROCSHMEM_PATH", "ROCSHMEM_DIR"], fallback_path="/opt/rocm/rocshmem"
+        ["ROCSHMEM_HOME", "ROCSHMEM_PATH", "ROCSHMEM_DIR"], fallback_path=_rocshmem_fallback_library_home()
     )
 
 

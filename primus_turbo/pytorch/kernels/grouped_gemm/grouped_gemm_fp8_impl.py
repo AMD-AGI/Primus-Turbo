@@ -34,6 +34,9 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_mxfp8_triton_kernel,
     grouped_gemm_mxfp8_variable_k_triton_kernel,
 )
+from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+    grouped_gemm_output_tail_kernel,
+)
 
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
@@ -427,13 +430,15 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
 
 
 class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
-    """FlyDSL fp8 grouped GEMM backend (gfx950, per-tensor / TENSORWISE only).
+    """FlyDSL fp8 grouped GEMM backend (gfx950).
 
-    M-grouped operator: forward (trans_b=True, NT) + dgrad (trans_b=False, NN).
-    Uses the FlyDSL mfma_f32_16x16x128_f8f6f4 kernel (gfx950-only).
+    M-grouped operator. Granularities:
+      - TENSORWISE: forward (trans_b=True, NT) + dgrad (trans_b=False, NN).
+      - MX_BLOCKWISE: NT only (trans_b=True), per-1x32 raw E8M0 scales.
+    Uses the FlyDSL mfma[_scale]_f32_16x16x128_f8f6f4 kernel (gfx950-only).
     """
 
-    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.MX_BLOCKWISE}
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -456,11 +461,17 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
-        # per-tensor scaling = single scalar each
-        supported &= a_scales.numel() == 1 and b_scales.numel() == 1
-        # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4.
+        # gfx950 (CDNA4) only: kernel uses mfma[_scale]_f32_16x16x128_f8f6f4.
         supported &= get_device_compute_capability() >= (9, 5)
-        # K-loop needs ceil(K/128) >= 2, i.e. contraction K >= 129.
+
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            # NT only; per-1x32 raw E8M0 scales; K % 128 == 0 and K >= 256.
+            supported &= trans_b
+            supported &= a.shape[1] % 128 == 0 and a.shape[1] >= 256
+            return supported
+
+        # TENSORWISE: per-tensor scalar scales; contraction K >= 129.
+        supported &= a_scales.numel() == 1 and b_scales.numel() == 1
         supported &= a.shape[1] >= 129
         return supported
 
@@ -482,6 +493,27 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
         from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
             grouped_gemm_fp8_tensorwise_flydsl_kernel,
         )
+
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import (
+                grouped_gemm_mxfp8_flydsl_kernel,
+            )
+
+            N = b.shape[-2]
+            K = b.shape[-1]
+            group_offs_out = kwargs.get("group_offs_out", None)
+            return grouped_gemm_mxfp8_flydsl_kernel(
+                a,
+                a_scales,
+                b,
+                b_scales,
+                group_offs,
+                N,
+                K,
+                group_offs_out,
+                out_dtype=out_dtype,
+                num_cu=num_cu,
+            )
 
         return grouped_gemm_fp8_tensorwise_flydsl_kernel(
             a, b, a_scales, b_scales, group_offs, trans_b=trans_b, out_dtype=out_dtype, num_cu=num_cu
@@ -645,14 +677,15 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
 
 
 class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
-    """FlyDSL fp8 variable-K grouped GEMM backend (gfx950, per-tensor only).
+    """FlyDSL fp8 variable-K grouped GEMM backend (gfx950).
 
     wgrad: C[g] = lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]], contraction
-    = m_g (variable per group) via a runtime scf.for K-loop. Uses the FlyDSL
-    mfma_f32_16x16x128_f8f6f4 TN kernel (gfx950-only).
+    = m_g (variable per group) via a runtime scf.for K-loop. Supports TENSORWISE
+    (trans_a=True, TN) and MX_BLOCKWISE (non-transposed operands, TN) via the
+    FlyDSL mfma[_scale]_f32_16x16x128_f8f6f4 TN kernel (gfx950-only).
     """
 
-    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE}
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.MX_BLOCKWISE}
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
 
     @staticmethod
@@ -675,12 +708,18 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
-        # variable-K contract: contraction along the shared (rows) dim.
-        supported &= trans_a and not trans_b
-        # per-tensor scaling = single scalar each
-        supported &= a_scales.numel() == 1 and b_scales.numel() == 1
-        # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4.
+        # gfx950 (CDNA4) only: kernel uses mfma[_scale]_f32_16x16x128_f8f6f4.
         supported &= get_device_compute_capability() >= (9, 5)
+
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            # MXFP8 wgrad: non-transposed operands (TN), contraction M_total % 128 == 0.
+            supported &= (not trans_a) and (not trans_b)
+            supported &= a.shape[1] % 128 == 0
+            return supported
+
+        # TENSORWISE: variable-K contraction along shared rows; per-tensor scalars.
+        supported &= trans_a and not trans_b
+        supported &= a_scales.numel() == 1 and b_scales.numel() == 1
         return supported
 
     @staticmethod
@@ -703,14 +742,34 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
             grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel,
         )
 
-        # trans_c swaps which operand is lhs (output transpose), mirroring the
-        # Triton variable-K backend: out[g] = lhs[g]^T @ rhs[g].
+        # trans_c swaps which operand is lhs (output transpose): out[g] = lhs[g]^T @ rhs[g].
         if trans_c:
             lhs, rhs = b, a
             lhs_scales, rhs_scales = b_scales, a_scales
         else:
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
+
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import (
+                grouped_gemm_mxfp8_variable_k_flydsl_kernel,
+            )
+
+            OUT_M = lhs.shape[0]
+            OUT_N = rhs.shape[0]
+            G = group_lens.shape[0]
+            return grouped_gemm_mxfp8_variable_k_flydsl_kernel(
+                lhs,
+                lhs_scales,
+                rhs,
+                rhs_scales,
+                group_offs,
+                OUT_M,
+                OUT_N,
+                G,
+                out_dtype=out_dtype,
+                num_cu=num_cu,
+            )
 
         return grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
             lhs, rhs, lhs_scales, rhs_scales, group_offs, out_dtype=out_dtype, num_cu=num_cu
@@ -792,7 +851,12 @@ def grouped_gemm_fp8_impl(
         group_offs_out=group_offs_out,
     )
 
-    return GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    # Over-allocated output: zero the unwritten tail past the tight write bound
+    # (group_offs_out for MX; group_offs otherwise) so the caller's [:total_m]
+    # slice never exposes uninitialized rows.
+    out = grouped_gemm_output_tail_kernel(out, group_offs_out if group_offs_out is not None else group_offs)
+    return out
 
 
 @_torch_custom_op_wrapper(

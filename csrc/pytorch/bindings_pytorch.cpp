@@ -37,6 +37,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("quantize_fp8_blockwise_for_weight(Tensor input, ScalarType dest_dtype, int block_size) "
           "-> Tensor[]");
 
+    // ********* Transpose *********
+    m.def("transpose_2d(Tensor input, int dim0, int dim1) -> Tensor");
+
     m.def("dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) -> "
           "Tensor");
     m.def("dequantize_fp8_rowwise(Tensor input, Tensor scale_inv, int axis, "
@@ -59,6 +62,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "ScalarType dest_dtype, "
           "bool rowwise_use_2d_block, bool rowwise_use_sr, bool rowwise_use_rht, "
           "bool colwise_use_2d_block, bool colwise_use_sr, bool colwise_use_rht) -> Tensor[]");
+    m.def("grouped_quantize_mxfp4(Tensor input, Tensor group_lens, Tensor group_offs, "
+          "ScalarType dest_dtype, int axis, "
+          "bool use_2d_block, bool use_sr, bool use_rht) -> Tensor[]");
 
     // ********* MXFP8 Quantization *********
     m.def("quantize_mxfp8_dual(Tensor input, ScalarType dest_dtype, "
@@ -104,9 +110,11 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
 
     // ********* Grouped Gemm *********
     m.def("ck_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, bool transA, "
-          "bool transB, int? num_cu=None) -> Tensor");
+          "bool transB, int? num_cu=None, bool work_steal=False, Tensor? ws_counter=None, "
+          "int ws_local_per_xcd=0) -> Tensor");
     m.def("ck_grouped_gemm_variable_k(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, "
-          "bool transA, bool transB, int? num_cu=None) -> Tensor");
+          "bool transA, bool transB, int? num_cu=None, bool work_steal=False, "
+          "Tensor? ws_counter=None, int ws_local_per_xcd=0) -> Tensor");
     m.def("ck_grouped_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, "
           "Tensor group_lens, Tensor group_offs, bool transA, bool transB, "
           "ScalarType out_dtype, str granularity, int? num_cu) -> Tensor");
@@ -130,6 +138,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("turbo_gemm_fp8", turbo_gemm_fp8);
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
+    m.impl("transpose_2d", transpose_2d);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
     m.impl("dequantize_fp8_rowwise", dequantize_fp8_rowwise);
@@ -141,6 +150,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("quantize_mxfp4", quantize_mxfp4);
     m.impl("dequantize_mxfp4", dequantize_mxfp4);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual);
+    m.impl("grouped_quantize_mxfp4", grouped_quantize_mxfp4);
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual);
@@ -178,6 +188,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
+    m.impl("transpose_2d", transpose_2d_meta);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise_meta);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
     m.impl("dequantize_fp8_rowwise", dequantize_fp8_rowwise_meta);
@@ -190,6 +201,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("quantize_mxfp4", quantize_mxfp4_meta);
     m.impl("dequantize_mxfp4", dequantize_mxfp4_meta);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual_meta);
+    m.impl("grouped_quantize_mxfp4", grouped_quantize_mxfp4_meta);
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual_meta);
@@ -267,6 +279,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     auto runtime_module = m.def_submodule("runtime", "Runtime utilities");
     runtime_module.def("create_stream_with_cu_masks", &create_stream_with_cu_masks);
     runtime_module.def("destroy_stream", &destroy_stream);
+
+    // ********* ODC rocSHMEM distributed backends *********
+#ifndef DISABLE_ROCSHMEM
+    register_odc_rocshmem_host(m);
+    register_odc_rocshmem_gda(m);
+#endif
 }
 
 /********************************************/
