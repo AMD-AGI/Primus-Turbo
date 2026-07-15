@@ -13,7 +13,11 @@ import torch
 from primus_turbo.flydsl.mega.fp8.grouped_gemm_combine_fp8_kernel import prepare_w2_fp8
 from primus_turbo.flydsl.mega.fp8.quant import quantize_grouped_weight_mxfp8_flydsl
 from primus_turbo.pytorch.modules.moe.mega_moe import MegaMoE
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 import mega_moe_fused_mxfp8
+from primus_turbo.pytorch.ops.moe.mega_moe_fused_mxfp8 import (
+    mega_moe_fused_mxfp8,
+    prepare_w1t_dgrad_fp8,
+    prepare_w2t_dgrad_fp8,
+)
 
 __all__ = ["MegaMoEFP8"]
 
@@ -60,12 +64,21 @@ class MegaMoEFP8(MegaMoE):
         """Fused mxfp8 dispatch -> L1 -> SwiGLU -> L2 -> fp8 combine -> reduce; y [T, hidden].
 
         Weight fp8 prep is maintained here (module-owned, version-keyed, FlyDSL): w1 grouped
-        quant for L1 dispatch, and w2 quant + scale preshuffle for the L2 combine -- both computed
-        once per optim.step and reused (grad-accum), so the op does NO per-call weight prep. Only
-        token-dependent work goes to the op."""
+        quant for L1 dispatch, w2 quant + scale preshuffle for the L2 combine (forward, along I),
+        and -- when grad is enabled (training) -- w2^T / w1^T grouped quant for the backward fc2
+        dgrad (STEP1, along H) / fc1 dgrad (STEP3, along 2I). All computed once per optim.step and
+        reused (grad-accum), so the op does NO per-call weight prep and the backward does NO
+        w1/w2 transpose/quant. Only token-dependent work goes to the op."""
         w1_fp8 = self._cached_weight(self.w1, "_w1_fp8", quantize_grouped_weight_mxfp8_flydsl)
         w2_fp8 = self._cached_weight(self.w2, "_w2_fp8", prepare_w2_fp8)
+        # backward-only: hoist the w2^T (STEP1) / w1^T (STEP3) dgrad prep here (version-keyed, shared
+        # across grad-accum); skipped under no_grad (inference) since only the backward consumes them.
+        if torch.is_grad_enabled():
+            w2t_fp8 = self._cached_weight(self.w2, "_w2t_fp8", prepare_w2t_dgrad_fp8)
+            w1t_fp8 = self._cached_weight(self.w1, "_w1t_fp8", prepare_w1t_dgrad_fp8)
+        else:
+            w2t_fp8 = w1t_fp8 = None
         return mega_moe_fused_mxfp8(
             self.ep_group, x, topk_idx, topk_weights, self.w1, self.w2,
-            w1_fp8=w1_fp8, w2_fp8=w2_fp8,
+            w1_fp8=w1_fp8, w2_fp8=w2_fp8, w2t_fp8=w2t_fp8, w1t_fp8=w1t_fp8,
         )

@@ -59,9 +59,12 @@ from mega_utils import (  # noqa: E402
     print_header,
     print_stage,
 )
-from megatron.core.fusions.fused_bias_swiglu import (  # noqa: E402
-    weighted_bias_swiglu_impl,
-)
+try:  # megatron only powers the forward accuracy ground-truth (turbo DeepEP ref); optional for perf
+    from megatron.core.fusions.fused_bias_swiglu import (  # noqa: E402
+        weighted_bias_swiglu_impl,
+    )
+except Exception:
+    weighted_bias_swiglu_impl = None
 
 import primus_turbo.pytorch as turbo  # noqa: E402
 from primus_turbo.flydsl.mega.grouped_gemm_combine_bf16_kernel import (  # noqa: E402

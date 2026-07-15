@@ -26,10 +26,12 @@ Tokens/act quantized outside. NT only. K(=I) % 128 == 0; N(=H) % BLOCK_N == 0; o
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.expr import const_expr
 from flydsl.expr.buffer_ops import (
     buffer_load,
     create_buffer_resource,
@@ -109,6 +111,9 @@ def _compile(
     dedicated_reduce_warps = num_reduce_cu * _NUM_WARPS
     gemm_base = num_combine_cu + num_reduce_cu
     GN = G * out_features  # flattened B rows [G*H]
+    # PT_COMBINE_GEMM_ONLY (debug/isolation): GEMM role only (skip combine PUSH + reduce) -> isolate
+    # the pure fp8 GEMM. Requires num_reduce_cu==0.
+    _gemm_only = os.environ.get("PT_COMBINE_GEMM_ONLY", "0") == "1"
     topk_reduce = _get_topk_reduce(True, apply_weights, with_gate)
     pre_kern, n_kt = build_preshuffle_ab_kernel(K128)
 
@@ -199,8 +204,11 @@ def _compile(
         )
 
         if block_index < combine_cu:
-            # ── role 1: COMBINE PUSH (grid-stride pool blocks) ──
-            local_count = (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
+            # ── role 1: COMBINE PUSH ── (0 iters under PT_COMBINE_GEMM_ONLY)
+            local_count = (
+                fx.Int32(0) if _gemm_only
+                else (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
+            )
             for tile_iter in range(local_count):
                 block_m = block_index + tile_iter * combine_cu
                 if thread_index == fx.Int32(0):
@@ -266,17 +274,18 @@ def _compile(
                     if thread_index == fx.Int32(0):
                         atomic_add(sb_l2_base, block_m, fx.Int32(1), scope="agent")
                 else:
-                    # role 2b: empty GEMM tiles reduce on freed CUs (overlaps the push tail)
-                    empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
-                    total_empty_warps = (
-                        fx.Int32(gemm_grid_blocks) - real_tiles * fx.Int32(n_blocks)
-                    ) * fx.Int32(_NUM_WARPS)
-                    topk_reduce(
-                        thread_index, empty_ordinal, total_empty_warps, topk, out_features,
-                        num_experts, rank, comb_local_res, output_res, topk_indices_res,
-                        num_tokens_res, barrier_base, topk_weights_res,
-                        gate_local_res, d_topk_w_res,
-                    )
+                    if const_expr(not _gemm_only):
+                        # role 2b: empty GEMM tiles reduce on freed CUs (overlaps the push tail)
+                        empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
+                        total_empty_warps = (
+                            fx.Int32(gemm_grid_blocks) - real_tiles * fx.Int32(n_blocks)
+                        ) * fx.Int32(_NUM_WARPS)
+                        topk_reduce(
+                            thread_index, empty_ordinal, total_empty_warps, topk, out_features,
+                            num_experts, rank, comb_local_res, output_res, topk_indices_res,
+                            num_tokens_res, barrier_base, topk_weights_res,
+                            gate_local_res, d_topk_w_res,
+                        )
 
     @flyc.jit
     def launch(

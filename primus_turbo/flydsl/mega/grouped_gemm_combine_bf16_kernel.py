@@ -357,6 +357,10 @@ def _compile(
     # (XGMI copy to peer). Isolates the produce+transmit half from the cross-rank reduce +
     # producer-consumer sync. Requires num_reduce_cu==0.
     _no_reduce = os.environ.get("PT_COMBINE_NO_REDUCE", "0") == "1"
+    # PT_COMBINE_GEMM_ONLY (debug/isolation): also skip the combine PUSH role -> GEMM role only
+    # (produce L2Y). Isolates the pure GEMM from combine + reduce. Requires num_reduce_cu==0.
+    _gemm_only = os.environ.get("PT_COMBINE_GEMM_ONLY", "0") == "1"
+    _no_reduce = _no_reduce or _gemm_only
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -450,8 +454,11 @@ def _compile(
 
         # comm roles fill the FRONT [0, gemm_base) -> overlap under the MFMA-bound GEMM at the back
         if block_index < combine_cu:
-            # ── role 1: COMBINE PUSH (grid-stride pool blocks) ──
-            local_count = (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
+            # ── role 1: COMBINE PUSH (grid-stride pool blocks) ── (0 iters under PT_COMBINE_GEMM_ONLY)
+            local_count = (
+                fx.Int32(0) if _gemm_only
+                else (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
+            )
             for tile_iter in range(local_count):
                 block_m = block_index + tile_iter * combine_cu
                 if thread_index == fx.Int32(0):
