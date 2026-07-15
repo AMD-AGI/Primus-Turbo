@@ -21,6 +21,8 @@ belong to exactly one group (the meta prologue does one O(G) search per tile);
 BK=128 == the N-pad align so each tile is one side of the N-pad boundary.
 """
 
+import gc
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
@@ -292,6 +294,7 @@ def compile_grouped_mxfp4_qdual(total_M, N, G, M_pad_col, N_pad, row_rht, col_rh
 
 
 _GQ_MXFP4_CACHE: dict = {}
+_GQ_MXFP4_CACHE_CAP = 64  # bound the per-(total_M) compiled-quant cache (broad-sweep OOM guard)
 
 
 def grouped_quant_mxfp4_raw(x, group_lens, group_offs, fp4_dtype, row_rht, col_rht, bm=64, bk=256):
@@ -336,6 +339,12 @@ def grouped_quant_mxfp4_raw(x, group_lens, group_offs, fp4_dtype, row_rht, col_r
             total_M, N, G, M_pad_col, N_pad, bool(row_rht), bool(col_rht), bm=bm, bk=bk
         )
         comp = _flyc.compile(launch, xi, roi, row_sc, coi, col_sc, go, lc, oc, stream)
+        # The cache key includes total_M (a per-step token count), so a broad shape sweep
+        # accumulates many compiled quant kernels -> bound it (the live ``comp`` is kept by
+        # the local ref, so dropping the dict frees the rest). Real workloads stay under it.
+        if len(_GQ_MXFP4_CACHE) >= _GQ_MXFP4_CACHE_CAP:
+            _GQ_MXFP4_CACHE.clear()
+            gc.collect()
         _GQ_MXFP4_CACHE[key] = comp
     comp(xi, roi, row_sc, coi, col_sc, go, lc, oc, stream)
 

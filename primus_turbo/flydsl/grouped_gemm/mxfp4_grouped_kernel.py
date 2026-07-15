@@ -483,7 +483,7 @@ _GMXFP4_DEFAULT_CFG = (2, 1, 4)  # (group_m, num_xcds, group_n)
 # Real MoE uses a handful of shapes; a broad test sweep (~480 shapes) accumulates enough
 # code objects to exhaust memory -> drop the caches (and gc the modules) past this cap. A
 # real workload stays well under it, so its kernels are never evicted.
-_GMXFP4_CACHE_CAP = 96
+_GMXFP4_CACHE_CAP = 32
 
 
 def _bound_caches(*caches):
