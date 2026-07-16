@@ -162,6 +162,8 @@ def compile_qdual(
     bm=64,
     bk=128,
     nth=512,
+    row_2d=False,
+    col_2d=False,
 ):
     """Dense dual-cast mxfp8 quant, batched over B experts (B=1 = plain 2D). Tile [bm x bk]
     (bm*bk==16*nth); ROW half writes fp8+E8M0, COL half stages the transpose through LDS for a
@@ -210,14 +212,23 @@ def compile_qdual(
         z = I32(0)
         IRI = fx.Int32.ir_type
 
-        @fx.struct
-        class Smem:
-            tile: fx.Array[elt, BMv * PAD_L, 16]
-            ldsc: fx.Array[fx.Int32, LDSC_DW, 16]
+        _use_2d = row_2d or col_2d
+        # amax_r/amax_c stage the Phase-0 1D amax for the 32x32 tile reduction (2d weight quant).
+        # Assigned unconditionally so the scf.if branch closures capture them; ~4KB LDS, no
+        # occupancy change (total < half the 160KB LDS). Unused on the 1D path.
+        _anns = {
+            "tile": fx.Array[elt, BMv * PAD_L, 16],
+            "ldsc": fx.Array[fx.Int32, LDSC_DW, 16],
+            "amax_r": fx.Array[fx.Float32, BMv * NKB, 16],
+            "amax_c": fx.Array[fx.Float32, BKv * NMB, 16],
+        }
+        Smem = fx.struct(type("QSmem", (), {"__annotations__": _anns}))
 
         sm = fx.SharedAllocator().allocate(Smem).peek()
         tile = sm.tile
         ldsc = sm.ldsc
+        amax_r = sm.amax_r
+        amax_c = sm.amax_c
         t = fx.thread_idx.x
         pid = fx.block_idx.x
         batch = pid // I32(NPB)
@@ -280,6 +291,41 @@ def compile_qdual(
         rocdl.s_barrier()
         half = t // I32(HALF)
         lt = t - half * I32(HALF)
+        if _use_2d:
+            # Phase 0: each thread stages its 1D per-32-block amax to LDS; after the barrier the
+            # main pass reduces the group of 32 (rows for row cast / K-cols for col cast) into the
+            # shared 32x32 tile scale -- avoids the 32x-redundant re-read of the whole tile.
+            if half == z:
+                _row = lt // I32(NKB)
+                _kb = lt - _row * I32(NKB)
+                _loff = _row * I32(PAD_L) + _kb * I32(32)
+                _am = F32(0.0)
+                for i in range_constexpr(8):
+                    p = fx.add_offset(tile.ptr, fx.make_int_tuple(_loff + I32(4 * i)))
+                    v = Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32)
+                    a = fm.absf(v).reduce("max")
+                    _am = (_am > a).select(_am, a)
+                if row_2d:
+                    ap = fx.add_offset(amax_r.ptr, fx.make_int_tuple(_row * I32(NKB) + _kb))
+                    fx.make_view(ap, fx.make_layout(1, 1)).store(Vec.from_elements([_am], F32))
+            else:
+                _c = lt // I32(NMB)
+                _mblk = lt - _c * I32(NMB)
+                _cbase = fx.add_offset(tile.ptr, fx.make_int_tuple(_c + I32(_mblk * 32) * I32(PAD_L)))
+                _cam = fm.absf(Vec(fx.make_view(_cbase, fx.make_layout(32, PAD_L)).load()).to(F32)).reduce(
+                    "max"
+                )
+                if col_2d:
+                    ap = fx.add_offset(amax_c.ptr, fx.make_int_tuple(_c * I32(NMB) + _mblk))
+                    fx.make_view(ap, fx.make_layout(1, 1)).store(Vec.from_elements([_cam], F32))
+            _llvm.inline_asm(
+                res=None,
+                operands_=[],
+                asm_string="s_waitcnt lgkmcnt(0)",
+                constraints="",
+                has_side_effects=True,
+            )
+            rocdl.s_barrier()
         if half == z:
             row = lt // I32(NKB)
             kb = lt - row * I32(NKB)
@@ -289,9 +335,18 @@ def compile_qdual(
                 p = fx.add_offset(tile.ptr, fx.make_int_tuple(loff + I32(4 * i)))
                 chunks.append(Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32))
             amax = F32(0.0)
-            for i in range_constexpr(8):
-                a = fm.absf(chunks[i]).reduce("max")
-                amax = (amax > a).select(amax, a)
+            if row_2d:
+                # 2D-block scale: reduce the 32 rows' Phase-0 1D amax into the 32x32 tile scale
+                # (all 32 rows in the group share one E8M0 scale).
+                gbase = (row // I32(32)) * I32(32)
+                for rr in range_constexpr(32):
+                    p = fx.add_offset(amax_r.ptr, fx.make_int_tuple((gbase + I32(rr)) * I32(NKB) + kb))
+                    v = Vec(fx.make_view(p, fx.make_layout(1, 1)).load())
+                    amax = (amax > F32(v[0])).select(amax, F32(v[0]))
+            else:
+                for i in range_constexpr(8):
+                    a = fm.absf(chunks[i]).reduce("max")
+                    amax = (amax > a).select(amax, a)
             grow = br * I32(BMv) + row
             gcol0 = bk * I32(BKv) + kb * I32(32)
             row_ok = grow < I32(M)
@@ -323,8 +378,18 @@ def compile_qdual(
             mblk = lt - c * I32(NMB)
             base = fx.add_offset(tile.ptr, fx.make_int_tuple(c + I32(mblk * 32) * I32(PAD_L)))
             cv2 = Vec(fx.make_view(base, fx.make_layout(32, PAD_L)).load()).to(F32)
-            ca = fm.absf(cv2).reduce("max")
-            camax = (F32(0.0) > ca).select(F32(0.0), ca)
+            camax = F32(0.0)
+            if col_2d:
+                # 2D-block scale: reduce the 32 K-cols' Phase-0 1D amax into the transposed
+                # 32x32 tile scale (all 32 K-cols in the group share one E8M0 scale).
+                gcbase = (c // I32(32)) * I32(32)
+                for cc in range_constexpr(32):
+                    p = fx.add_offset(amax_c.ptr, fx.make_int_tuple((gcbase + I32(cc)) * I32(NMB) + mblk))
+                    v = Vec(fx.make_view(p, fx.make_layout(1, 1)).load())
+                    camax = (camax > F32(v[0])).select(camax, F32(v[0]))
+            else:
+                ca = fm.absf(cv2).reduce("max")
+                camax = (camax > ca).select(camax, ca)
             cep = _ep(camax, va, ep_sub)
             cinv = F32(1.0) / fm.exp2(cep.to(F32))
             cq = cv2 * cinv
@@ -392,7 +457,7 @@ def compile_qdual(
 _RAW_QDUAL_BATCHED_CACHE: dict = {}
 
 
-def quant_mxfp8_raw_batched(x_3d, out_dtype):
+def quant_mxfp8_raw_batched(x_3d, out_dtype, row_2d=False, col_2d=False):
     """Batched raw-E8M0 dual-cast mxfp8 quant for a uniform [B, M, K] input (grouped-gemm weight
     path), all B experts in ONE launch. Returns quant_mxfp8_raw's 4-tuple stacked to [B, ...]:
     row_fp8 [B, M, Kp] / row_scale [B, M, Kp//32] e8m0 / col_fp8 [B, K, Mp] / col_scale, with
@@ -418,11 +483,20 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype):
     AtSp = torch.empty(B * K * (Mp // 32) // 4, dtype=torch.int32, device=x_3d.device)
     stream = torch.cuda.current_stream()
 
-    key = (B, M, K, Mp, Kp, x_3d.dtype, out_dtype)
+    key = (B, M, K, Mp, Kp, x_3d.dtype, out_dtype, row_2d, col_2d)
     comp = _RAW_QDUAL_BATCHED_CACHE.get(key)
     if comp is None:
         launch = compile_qdual(
-            B, M, K, elt=in_elt(x_3d.dtype), out_fp8=out_fp8, Mp=Mp, Kp=Kp, **_qdual_tile_cfg(M, K, Mp, Kp)
+            B,
+            M,
+            K,
+            elt=in_elt(x_3d.dtype),
+            out_fp8=out_fp8,
+            Mp=Mp,
+            Kp=Kp,
+            row_2d=row_2d,
+            col_2d=col_2d,
+            **_qdual_tile_cfg(M, K, Mp, Kp),
         )
         comp = _flyc.compile(launch, x_3d, Qr, ASp, AtQd, AtSp, stream)
         _RAW_QDUAL_BATCHED_CACHE[key] = comp
@@ -789,14 +863,16 @@ def compile_grouped_qdual(
 _GROUPED_QDUAL_CACHE: dict = {}
 
 
-def quant_mxfp8_raw(x, out_dtype):
+def quant_mxfp8_raw(x, out_dtype, row_2d=False, col_2d=False):
     """FlyDSL raw-E8M0 dual-cast mxfp8 quant for an ARBITRARY 2D [M,K] input (NO host padding),
     bit-for-bit matching the C++ quantize_mxfp8_dual layout: fp8 [M,Kp] row / [K,Mp] col
     (Kp=ceil(K/128)*128, Mp=ceil(M/128)*128) + plain row-major E8M0 scales viewed as
     float8_e8m0fnu. Returns (row_fp8, row_scale, col_fp8, col_scale). Delegates to the B-batched
     path with B=1 (one shared quant kernel; the 2D result is the B=0 slice)."""
     assert x.ndim == 2, f"quant_mxfp8_raw expects 2D, got {x.ndim}D"
-    row_fp8, row_scale, col_fp8, col_scale = quant_mxfp8_raw_batched(x.unsqueeze(0), out_dtype)
+    row_fp8, row_scale, col_fp8, col_scale = quant_mxfp8_raw_batched(
+        x.unsqueeze(0), out_dtype, row_2d=row_2d, col_2d=col_2d
+    )
     return row_fp8[0], row_scale[0], col_fp8[0], col_scale[0]
 
 

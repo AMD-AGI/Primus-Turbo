@@ -225,30 +225,41 @@ def grouped_quantize_fp8_with_trans(
 def quantize_fp8_with_trans_flydsl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
+    *,
+    block_size: Optional[int] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FlyDSL dual-cast (row-wise + transposed col-wise) MXFP8 quant -- the operand quant
-    for the MX GEMM (``FP8GemmMXFunction``). Emits raw row-major E8M0 ``[dim, K//32]``
-    scales; the GEMM preshuffles the raw scale itself, so nothing is shuffled here.
-    Returns (row_fp8, row_scale, col_fp8, col_scale).
-
-    A 3D ``[B, M, K]`` batched input (grouped-gemm weight path) is quantized for all B
-    experts in ONE launch via ``quant_mxfp8_raw_batched`` (no per-expert Python loop /
-    stack); the 2D path stays on ``quant_mxfp8_raw``."""
+    """FlyDSL dual-cast (row-wise + transposed col-wise) MXFP8 quant -- the operand quant for
+    the MX GEMM. Feature-parity with ``quantize_fp8_with_trans``: honors ``use_2d_block`` (per
+    32x32 tile scale, for weights) on the row (``scaling_recipe``) and col
+    (``scaling_recipe_for_trans``) casts. A 3D ``[B, M, K]`` input quantizes all B experts in
+    one launch. Returns (row_fp8, row_scale, col_fp8, col_scale)."""
+    assert granularity == ScalingGranularity.MX_BLOCKWISE, "FlyDSL quant supports MX_BLOCKWISE only"
+    assert block_size in (None, MXFP8_BLOCK_SIZE), f"MXFP8 block_size must be {MXFP8_BLOCK_SIZE}"
+    row_2d = bool(scaling_recipe is not None and scaling_recipe.use_2d_block)
+    col_2d = bool(scaling_recipe_for_trans is not None and scaling_recipe_for_trans.use_2d_block)
     if x.ndim == 3:
         from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import quant_mxfp8_raw_batched
 
-        return quant_mxfp8_raw_batched(x.contiguous(), out_dtype)
+        return quant_mxfp8_raw_batched(x.contiguous(), out_dtype, row_2d=row_2d, col_2d=col_2d)
 
     from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import quant_mxfp8_raw
 
-    return quant_mxfp8_raw(x.contiguous(), out_dtype)
+    return quant_mxfp8_raw(x.contiguous(), out_dtype, row_2d=row_2d, col_2d=col_2d)
 
 
 def grouped_quantize_fp8_with_trans_flydsl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
+    granularity: ScalingGranularity,
     group_lens: torch.Tensor,
     group_offs: torch.Tensor,
+    *,
+    block_size: Optional[int] = None,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -259,11 +270,19 @@ def grouped_quantize_fp8_with_trans_flydsl(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """FlyDSL grouped dual-cast MXFP8 quant -- the A / grad_out operand quant for the
-    MX grouped GEMM (``FP8GroupedGemmMXFunc``). Returns the 8-tuple (rowwise fp8/scale,
-    colwise fp8/scale, then row-64/col-128 padded lens/offs). The raw row-major E8M0
-    scale is bit-compatible with the HIP grouped dual-cast quant on the consumer-read
-    regions; the GEMM preshuffles the raw E8M0 scale itself."""
+    """FlyDSL grouped dual-cast MXFP8 quant -- the A / grad_out (activation) operand quant for
+    the MX grouped GEMM. Returns the 8-tuple (rowwise fp8/scale, colwise fp8/scale, then
+    row-64/col-128 padded lens/offs). The activation path is 1D per-32-block scale;
+    ``use_2d_block`` (weight-only) is not applicable here (grouped weights go through
+    ``quantize_fp8_with_trans_flydsl``). The GEMM preshuffles the raw E8M0 scale itself."""
+    assert granularity == ScalingGranularity.MX_BLOCKWISE, "FlyDSL quant supports MX_BLOCKWISE only"
+    assert block_size in (None, MXFP8_BLOCK_SIZE), f"MXFP8 block_size must be {MXFP8_BLOCK_SIZE}"
+    assert not (scaling_recipe is not None and scaling_recipe.use_2d_block), (
+        "grouped activation quant does not support use_2d_block"
+    )
+    assert not (scaling_recipe_for_trans is not None and scaling_recipe_for_trans.use_2d_block), (
+        "grouped activation quant does not support use_2d_block"
+    )
     from primus_turbo.flydsl.gemm.mxfp8_quant_flydsl import grouped_quant_mxfp8_raw
 
     return grouped_quant_mxfp8_raw(x.contiguous(), group_lens, group_offs, out_dtype)

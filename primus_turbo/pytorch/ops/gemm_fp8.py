@@ -547,7 +547,14 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 )
             a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
-            a_row, a_row_scale, a_col, a_col_scale = quantize_fp8_with_trans_flydsl(a, fp8_dtype)
+            a_row, a_row_scale, a_col, a_col_scale = quantize_fp8_with_trans_flydsl(
+                a,
+                fp8_dtype,
+                granularity,
+                block_size=block_size,
+                scaling_recipe=a_scaling_recipe,
+                scaling_recipe_for_trans=a_scaling_recipe,
+            )
 
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if isinstance(b, QuantizedTensor):
@@ -564,7 +571,14 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 )
             b_col, b_col_scale = b_t.qdata, b_t.scale_inv
         else:
-            b_row, b_row_scale, b_col, b_col_scale = quantize_fp8_with_trans_flydsl(b, fp8_dtype)
+            b_row, b_row_scale, b_col, b_col_scale = quantize_fp8_with_trans_flydsl(
+                b,
+                fp8_dtype,
+                granularity,
+                block_size=block_size,
+                scaling_recipe=b_scaling_recipe,
+                scaling_recipe_for_trans=b_scaling_recipe,
+            )
 
         # NT layout
         out = gemm_fp8_impl(
@@ -597,7 +611,14 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         # Dual-cast grad_out: one kernel emits both the row-wise (grad_a, NN->NT) and
         # col-wise (grad_b, TN->NT) directions -- no second single-direction pass.
-        g_row, g_row_scale, g_col, g_col_scale = quantize_fp8_with_trans_flydsl(grad_out, grad_out_dtype)
+        g_row, g_row_scale, g_col, g_col_scale = quantize_fp8_with_trans_flydsl(
+            grad_out,
+            grad_out_dtype,
+            ctx.config.granularity,
+            block_size=ctx.config.block_size,
+            scaling_recipe=ScalingRecipe(),
+            scaling_recipe_for_trans=ScalingRecipe(),
+        )
 
         grad_a = gemm_fp8_impl(
             g_row,
