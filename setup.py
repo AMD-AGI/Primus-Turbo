@@ -227,7 +227,7 @@ def get_offload_archs():
                 arch_list.append(arch)
 
     # TODO(ruibin): add JAX support for gfx1250
-    if BUILD_JAX and "gfx1250" not in arch_list:
+    if BUILD_JAX and "gfx1250" in arch_list:
         raise ValueError("The JAX backend is not supported on gfx1250.")
 
     # TODO(ruibin): add CK and turbo support for gfx1250
