@@ -1484,7 +1484,6 @@ _NP_8WAVE_CANDS = ((256, 8, 4, 0), (256, 8, 8, 0), (256, 8, 4, 4))
 # observed crossover (deepseek-up K=7168 wins with this at large M, nothing smaller does).
 _NP_LARGE_K = 4096
 _NP_PM_CANON = (1024, 8192)
-_PM_CANON_OVERRIDE = None
 
 
 def _np_regime(trans_b, N, K, G, M_total):
@@ -1550,7 +1549,7 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
 
     a_live, b_i8, out_live = args[0], args[1], args[2]
     mps = []
-    for pm in (_PM_CANON_OVERRIDE,) if _PM_CANON_OVERRIDE else _NP_PM_CANON:
+    for pm in _NP_PM_CANON:
         M_c = G * pm
         a_c = (torch.randn((M_c, a_live.shape[1]), device=a_live.device) * 0.1).to(a_live.dtype)
         out_c = torch.empty((M_c, N), device=out_live.device, dtype=out_live.dtype)
@@ -3058,7 +3057,7 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, short,
 
     lhs_live, rhs_live = args[0], args[1]
     M_total = lhs_live.shape[0]
-    pms = (_PM_CANON_OVERRIDE,) if _PM_CANON_OVERRIDE else (max(1, M_total // G),)
+    pms = (max(1, M_total // G),)
     mps = []
     for pm in pms:
         M_c = G * pm

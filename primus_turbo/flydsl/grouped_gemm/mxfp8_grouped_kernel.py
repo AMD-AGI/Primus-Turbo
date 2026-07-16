@@ -7,7 +7,6 @@
 """FlyDSL MXFP8 (per-1x32 E8M0 block-scaled) grouped GEMM for gfx950 (NT fwd/dgrad)."""
 
 import math
-import os
 
 import torch
 
@@ -677,14 +676,12 @@ _GNT_CFG_CACHE: dict = {}  # cfg_key (NO M_pad) -> (bm, gm, xcd, gn) chosen by a
 
 # fwd/dgrad NT autotune. The launch is M-generic (M is a runtime arg), so the config race
 # keys on the static shape only (cfg_key, no M_pad) and is reused for every M.
-# PT_MXGG_AUTOTUNE=0 -> fixed base cfg.
-_GNT_AUTOTUNE = os.environ.get("PT_MXGG_AUTOTUNE", "1") != "0"
 _GNT_NT_DEFAULT_CFG = (256, 4, 4, 0)  # (BLOCK_M, GROUP_M, num_xcd, group_n); cand[0] = base ref
 
 # tokens/group points the race times on (geomean). The swizzle is not M-invariant: a single
 # midpoint mis-picks a cfg that wins there but loses at the range ends, so two spread steady
-# points reward range-robust cfgs (~2.1% worst-case regret vs 3.3%). PT_MXGG_CANON_M overrides.
-_GNT_PM_CANON = tuple(int(x) for x in os.environ.get("PT_MXGG_CANON_M", "2048,8192").split(","))
+# points reward range-robust cfgs (~2.1% worst-case regret vs 3.3%).
+_GNT_PM_CANON = (2048, 8192)
 
 
 def _gnt_nt_candidates(N):
@@ -758,9 +755,6 @@ def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
     cached = _GNT_CFG_CACHE.get(cfg_key)
     if cached is not None:
         return cached
-    if not _GNT_AUTOTUNE:
-        _GNT_CFG_CACHE[cfg_key] = _GNT_NT_DEFAULT_CFG
-        return _GNT_NT_DEFAULT_CFG
 
     cands = _gnt_nt_candidates(N)
     # one (targs, out_view) per steady point; candidates scored by geomean over points
