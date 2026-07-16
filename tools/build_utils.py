@@ -156,7 +156,7 @@ def find_rocm_home() -> Optional[str]:
             fallback_path = ROCM_FALLBACK_LIBRARY_HOME
             if os.path.exists(fallback_path):
                 rocm_home = fallback_path
-    if rocm_home and torch.version.hip is None:
+    if rocm_home:
         logger.warning("No ROCm runtime is found, using ROCM_HOME='%s'", rocm_home)
     return rocm_home
 
