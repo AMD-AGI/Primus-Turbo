@@ -415,7 +415,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 a_row_scale,
                 a_col,
                 a_col_scale,
-            ) = quantize_fp8_with_trans(a, a_dtype, config.block_size)
+            ) = quantize_fp8_with_trans(a, a_dtype, config.granularity, block_size=config.block_size)
 
         # --- B side: 2D-block weight, reused unchanged in fwd + bwd. ---
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
@@ -424,7 +424,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             b_row, b_row_scale = b.qdata, b.scale_inv
         else:
             b_row, b_row_scale = quantize_fp8(
-                b, b_dtype, block_size=config.block_size, scaling_recipe=b_scaling_recipe
+                b, b_dtype, config.granularity, block_size=config.block_size, scaling_recipe=b_scaling_recipe
             )
         b_col, b_col_scale = b_row, b_row_scale
 
