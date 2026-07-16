@@ -30,11 +30,13 @@ _SUPPORTED_QUANTIZED_DTYPES = [float8_e4m3, float8_e5m2, float4_e2m1fn_x2]
 _SUPPORTED_QUANTIZED_GRANS = [
     ScalingGranularity.ROWWISE,
     ScalingGranularity.TENSORWISE,
+    ScalingGranularity.BLOCKWISE,
     ScalingGranularity.MX_BLOCKWISE,
 ]
 _SUPPORTED_GROUPED_QUANTIZED_GRANS = [
     ScalingGranularity.ROWWISE,
     ScalingGranularity.TENSORWISE,
+    ScalingGranularity.BLOCKWISE,
     ScalingGranularity.MX_BLOCKWISE,
 ]
 
@@ -62,6 +64,7 @@ def _get_padding_align_size(tensor: QuantizedTensor):
     if (
         tensor._granularity == ScalingGranularity.TENSORWISE
         or tensor._granularity == ScalingGranularity.ROWWISE
+        or tensor._granularity == ScalingGranularity.BLOCKWISE
     ):
         return 0
     else:
@@ -254,10 +257,22 @@ class QuantizedTensor(torch.Tensor):
                     )
                     assert supported, reason
                 assert scaling_recipe is not None, "scaling_recipe must be provided for grouped MX_BLOCKWISE"
+            elif granularity == ScalingGranularity.BLOCKWISE:
+                assert dest_dtype in [
+                    float8_e4m3,
+                    float8_e5m2,
+                ], "Unsupported quantized dtype for grouped BLOCKWISE quantization"
+                assert block_size is not None, "block_size must be provided for grouped BLOCKWISE"
         else:
             assert granularity in _SUPPORTED_QUANTIZED_GRANS, f"Unsupported granularity {granularity}"
 
-            if granularity == ScalingGranularity.MX_BLOCKWISE:
+            if granularity == ScalingGranularity.BLOCKWISE:
+                assert dest_dtype in [
+                    float8_e4m3,
+                    float8_e5m2,
+                ], "Unsupported quantized dtype for BLOCKWISE"
+                assert block_size is not None, "block_size must be provided for BLOCKWISE"
+            elif granularity == ScalingGranularity.MX_BLOCKWISE:
                 assert dest_dtype in [
                     float8_e4m3,
                     float8_e5m2,
@@ -517,9 +532,10 @@ class QuantizedTensor(torch.Tensor):
             )
 
         if self._dest_dtype in [float8_e4m3, float8_e5m2]:
-            assert self._granularity == ScalingGranularity.MX_BLOCKWISE, (
-                "Grouped dequantization is only supported for MX_BLOCKWISE FP8"
-            )
+            assert self._granularity in (
+                ScalingGranularity.MX_BLOCKWISE,
+                ScalingGranularity.BLOCKWISE,
+            ), "Grouped dequantization is only supported for MX_BLOCKWISE / BLOCKWISE FP8"
             assert self._group_lens is not None, "group_lens is missing"
             assert self._group_offs is not None, "group_offs is missing"
             assert self._orig_group_offs is not None, "orig_group_offs is missing"

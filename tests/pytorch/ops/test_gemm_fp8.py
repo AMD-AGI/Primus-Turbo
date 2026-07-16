@@ -415,8 +415,8 @@ def _run_gemm_fp8_quantized_tensor_test(
     )
 
     b_kwargs = dict()
-    if granularity == ScalingGranularity.MX_BLOCKWISE:
-        # MX uses fused dual-direction kernel; cache both directions at construction time.
+    if granularity in (ScalingGranularity.MX_BLOCKWISE, ScalingGranularity.BLOCKWISE):
+        # MX / BLOCKWISE weights use a 2D block scale.
         b_kwargs["scaling_recipe"] = ScalingRecipe(use_2d_block=True)
 
     qt_b = QuantizedTensor.quantize(
@@ -545,6 +545,29 @@ def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
         granularity=ScalingGranularity.MX_BLOCKWISE,
         backend=backend,
         block_size=32,
+    )
+
+
+@pytest.mark.parametrize("m", [256, 512, 1024])
+@pytest.mark.parametrize("n", [256, 512, 4096])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.TRITON])
+def test_gemm_fp8_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
+    """BLOCKWISE gemm with pre-quantized QuantizedTensor inputs."""
+
+    _run_gemm_fp8_quantized_tensor_test(
+        m=m,
+        n=n,
+        k=k,
+        layout=layout,
+        format=format,
+        dtype=dtype,
+        granularity=ScalingGranularity.BLOCKWISE,
+        backend=backend,
+        block_size=128,
     )
 
 

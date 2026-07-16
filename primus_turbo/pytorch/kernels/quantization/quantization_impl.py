@@ -19,6 +19,8 @@ from primus_turbo.pytorch.core.low_precision import (
     check_mxfp8_support,
 )
 from primus_turbo.triton.quantization.quant_blockwise import (
+    dequant_fp8_blockwise_for_weight_kernel,
+    dequant_fp8_blockwise_kernel,
     quant_fp8_blockwise_dual_kernel,
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
@@ -132,6 +134,96 @@ def quant_fp8_blockwise_impl_meta(
     scales_shape = (M, triton.cdiv(N, block_size)) if axis == 1 else (triton.cdiv(M, block_size), N)
     x_scales = torch.empty(scales_shape, dtype=torch.float32, device=x.device)
     return x_fp8, x_scales
+
+
+@torch.library.custom_op("primus_turbo::dequant_fp8_blockwise_impl", mutates_args=())
+def dequant_fp8_blockwise_impl(
+    x_fp8: torch.Tensor,
+    scale_inv: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Dequantize a 2D 1D-block (row/col) blockwise-quantized tensor."""
+    assert x_fp8.is_contiguous() and x_fp8.dim() == 2, "Input must be 2D and contiguous"
+    assert axis in (-2, -1, 0, 1), f"axis must be 0 or 1 (or -1, -2), got {axis}"
+    axis = axis % 2
+
+    M, N = x_fp8.shape
+    out = torch.empty((M, N), dtype=out_dtype, device=x_fp8.device)
+    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    dequant_fp8_blockwise_kernel[grid](
+        x_fp8,
+        scale_inv,
+        out,
+        M,
+        N,
+        block_size,
+        axis,
+    )
+    return out
+
+
+@dequant_fp8_blockwise_impl.register_fake
+def dequant_fp8_blockwise_impl_meta(
+    x_fp8: torch.Tensor,
+    scale_inv: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int = 128,
+) -> torch.Tensor:
+    assert x_fp8.dim() == 2, "Input must be 2D"
+    M, N = x_fp8.shape
+    return torch.empty((M, N), dtype=out_dtype, device=x_fp8.device)
+
+
+@torch.library.custom_op("primus_turbo::dequant_fp8_blockwise_for_weight_impl", mutates_args=())
+def dequant_fp8_blockwise_for_weight_impl(
+    w_fp8: torch.Tensor,
+    scale_inv: torch.Tensor,
+    out_dtype: torch.dtype,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Dequantize a 2D/3D 2D-block (``[..., cdiv(M,BS), cdiv(N,BS)]`` scale) weight.
+
+    Inverse of :func:`quant_fp8_blockwise_for_weight_impl`.
+    """
+    assert w_fp8.dim() in (2, 3)
+    if not w_fp8.is_contiguous():
+        w_fp8 = w_fp8.contiguous()
+
+    ori_dims = w_fp8.dim()
+    if ori_dims == 2:
+        B, M, N = 1, *w_fp8.shape
+        w_fp8 = w_fp8.unsqueeze(0)
+        scale_inv = scale_inv.unsqueeze(0)
+    else:
+        B, M, N = w_fp8.shape
+
+    out = torch.empty((B, M, N), dtype=out_dtype, device=w_fp8.device)
+    grid = (B, triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    dequant_fp8_blockwise_for_weight_kernel[grid](
+        w_fp8,
+        scale_inv,
+        out,
+        M,
+        N,
+        block_size,
+    )
+    if ori_dims == 2:
+        out = out.squeeze(0)
+    return out
+
+
+@dequant_fp8_blockwise_for_weight_impl.register_fake
+def dequant_fp8_blockwise_for_weight_impl_meta(
+    w_fp8: torch.Tensor,
+    scale_inv: torch.Tensor,
+    out_dtype: torch.dtype,
+    block_size: int = 128,
+) -> torch.Tensor:
+    assert w_fp8.dim() in (2, 3)
+    return torch.empty(w_fp8.shape, dtype=out_dtype, device=w_fp8.device)
 
 
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_dual_impl", mutates_args=())

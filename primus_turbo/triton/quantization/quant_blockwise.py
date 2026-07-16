@@ -156,6 +156,84 @@ def quant_fp8_blockwise_for_weight_kernel(
     tl.store(w_scales_ptr + scale_offs, w_scales_inv)
 
 
+# ---------------------------------------------------------------------------
+# Blockwise dequantize kernels (inverse of the quantize kernels above).
+# ---------------------------------------------------------------------------
+@triton.jit
+def dequant_fp8_blockwise_kernel(
+    x_fp8_ptr,
+    x_scales_ptr,
+    out_ptr,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+    AXIS: tl.constexpr,
+):
+    """Dequantize a 2D blockwise-quantized tensor along ``AXIS``.
+
+    * ``AXIS == 1`` (row): one scale value per (row, N-block), stored as
+      ``[M, cdiv(N, BLOCK_SIZE)]``.
+    * ``AXIS == 0`` (col): one scale value per (M-block, col), stored as
+      ``[cdiv(M, BLOCK_SIZE), N]``.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    offs_m = tl.cast(pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
+    offs_n = tl.cast(pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    x_ptrs = x_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
+    x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    if AXIS == 1:
+        # One scale per row for this N-block.
+        scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
+        scale_mask = offs_m < M
+        scale = tl.load(x_scales_ptr + scale_offs, mask=scale_mask, other=0.0)
+        out_tile = x_tile * scale[:, None]
+    else:
+        # One scale per col for this M-block.
+        scale_offs = pid_m * N + offs_n
+        scale_mask = offs_n < N
+        scale = tl.load(x_scales_ptr + scale_offs, mask=scale_mask, other=0.0)
+        out_tile = x_tile * scale[None, :]
+
+    out_ptrs = out_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, out_tile.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def dequant_fp8_blockwise_for_weight_kernel(
+    w_fp8_ptr,
+    w_scales_ptr,
+    out_ptr,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Dequantize a 2D-block (``[cdiv(M,BS), cdiv(N,BS)]`` scale) weight tile."""
+    bid = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    pid_n = tl.program_id(axis=2)
+
+    batch_offset_w = bid * M * N
+    batch_offset_scales = bid * tl.cdiv(M, BLOCK_SIZE) * tl.cdiv(N, BLOCK_SIZE)
+
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    w_ptrs = w_fp8_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
+    w_tile = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    scale_offs = batch_offset_scales + pid_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
+    scale = tl.load(w_scales_ptr + scale_offs)
+    out_tile = w_tile * scale
+
+    out_ptrs = out_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, out_tile.to(out_ptr.dtype.element_ty), mask=mask)
+
+
 @triton.jit
 def quant_fp8_blockwise_segment_m_row_col_kernel(
     x_ptr,

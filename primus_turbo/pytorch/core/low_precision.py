@@ -99,7 +99,7 @@ MXFP8_BLOCK_SIZE = 32
 # Padding align size for MXFP8
 MXFP8_PADDING_ALIGN_SIZE = 128
 # Block size for BLOCKWISE scaling
-BLOCKWISE_BLOCK_SIZE = 128
+DEFAULT_BLOCK_SIZE = 128
 
 
 class Format(Enum):

@@ -16,6 +16,8 @@ from primus_turbo.pytorch.core.low_precision import (
     float4_e2m1fn_x2,
 )
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    dequant_fp8_blockwise_for_weight_impl,
+    dequant_fp8_blockwise_impl,
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
     dequantize_mxfp4_impl,
@@ -23,6 +25,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     grouped_dequantize_mxfp8_impl,
     grouped_quantize_mxfp4_impl,
     grouped_quantize_mxfp8_impl,
+    quant_fp8_blockwise_dual_impl,
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,
@@ -132,6 +135,8 @@ def quantize_fp8_with_trans(
             scaling_recipe,
             scaling_recipe_for_trans,
         )
+    elif granularity == ScalingGranularity.BLOCKWISE:
+        return quant_fp8_blockwise_dual_impl(x, out_dtype, block_size=block_size)
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
@@ -246,6 +251,14 @@ def dequantize_fp8(
             raise ValueError("axis must be specified for rowwise FP8 de-quantization")
 
         return dequantize_fp8_rowwise_impl(x, out_dtype, axis, scale_inv)
+    elif granularity == ScalingGranularity.BLOCKWISE:
+        assert block_size is not None, "block_size must be specified for BLOCKWISE de-quantization"
+        # 2D-block (weight) scales along both dims; 1D-block (activation) scales
+        # along a single ``axis`` (row: -1/1, col: -2/0).
+        if scaling_recipe is not None and scaling_recipe.use_2d_block:
+            return dequant_fp8_blockwise_for_weight_impl(x, scale_inv, out_dtype, block_size)
+        assert axis is not None, "axis must be specified for 1D BLOCKWISE de-quantization"
+        return dequant_fp8_blockwise_impl(x, scale_inv, out_dtype, axis, block_size)
     elif granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MXFP8_BLOCK_SIZE, (
             f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"

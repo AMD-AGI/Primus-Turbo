@@ -10,6 +10,7 @@ import torch
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.low_precision import (
+    DEFAULT_BLOCK_SIZE,
     MXFP4_BLOCK_SIZE,
     MXFP8_BLOCK_SIZE,
     ScalingGranularity,
@@ -130,6 +131,118 @@ def test_quantize_fp8_rowwise(orig_dtype, dest_dtype, axis, B, M, N, torch_compi
     x_dq = dequantize_fp8(x_fp8, orig_dtype, granularity, axis=axis, scale_inv=x_scale_inv)
     x_dq_ref = dequantize_fp8_ref(x_fp8_ref, orig_dtype, granularity, axis=axis, scale_inv=x_scale_inv_ref)
     torch.testing.assert_close(x_dq, x_dq_ref, **get_tolerances(dest_dtype))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("M", [128, 256, 320])
+@pytest.mark.parametrize("N", [128, 256, 320])
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.BLOCKWISE])
+def test_quantize_fp8_blockwise(orig_dtype, dest_dtype, M, N, axis, granularity):
+    """1D-block (activation) blockwise FP8 quant/dequant round-trip."""
+    torch.manual_seed(42)
+
+    x = torch.randn((M, N), device="cuda", dtype=orig_dtype)
+
+    x_fp8, x_scale_inv = quantize_fp8(
+        x,
+        dest_dtype,
+        granularity=granularity,
+        axis=axis,
+        block_size=DEFAULT_BLOCK_SIZE,
+    )
+
+    out = dequantize_fp8(
+        x_fp8,
+        orig_dtype,
+        granularity=granularity,
+        block_size=DEFAULT_BLOCK_SIZE,
+        axis=axis,
+        scale_inv=x_scale_inv,
+    )
+
+    torch.testing.assert_close(x, out, **get_tolerances(dest_dtype))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("M", [128, 256, 320])
+@pytest.mark.parametrize("N", [128, 256, 320])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.BLOCKWISE])
+def test_quantize_fp8_blockwise_with_trans(orig_dtype, dest_dtype, M, N, granularity):
+    """Fused row + col blockwise FP8 quant, dequantized in both directions."""
+    torch.manual_seed(42)
+
+    x = torch.randn((M, N), device="cuda", dtype=orig_dtype)
+
+    x_fp8_row, x_scale_inv_row, x_fp8_col, x_scale_inv_col = quantize_fp8_with_trans(
+        x,
+        dest_dtype,
+        granularity=granularity,
+        block_size=DEFAULT_BLOCK_SIZE,
+    )
+
+    # Rowwise (axis == 1) dequantize.
+    out_row = dequantize_fp8(
+        x_fp8_row,
+        orig_dtype,
+        granularity=granularity,
+        block_size=DEFAULT_BLOCK_SIZE,
+        axis=1,
+        scale_inv=x_scale_inv_row,
+    )
+    torch.testing.assert_close(x, out_row, **get_tolerances(dest_dtype))
+
+    # Colwise (axis == 0) dequantize.
+    out_col = dequantize_fp8(
+        x_fp8_col,
+        orig_dtype,
+        granularity=granularity,
+        block_size=DEFAULT_BLOCK_SIZE,
+        axis=0,
+        scale_inv=x_scale_inv_col,
+    )
+    torch.testing.assert_close(x, out_col, **get_tolerances(dest_dtype))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("M", [128, 256, 320])
+@pytest.mark.parametrize("N", [128, 256, 320])
+@pytest.mark.parametrize("granularity", [ScalingGranularity.BLOCKWISE])
+def test_quantize_fp8_blockwise_for_weight(orig_dtype, dest_dtype, batched, B, M, N, granularity):
+    """2D-block (weight) blockwise FP8 quant/dequant round-trip for 2D/3D weights."""
+    torch.manual_seed(42)
+
+    if batched:
+        x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
+    else:
+        x = torch.randn((M, N), device="cuda", dtype=orig_dtype)
+
+    # use_2d_block ignores axis; scales along both dims.
+    scaling_recipe = ScalingRecipe(use_2d_block=True)
+
+    x_fp8, x_scale_inv = quantize_fp8(
+        x,
+        dest_dtype,
+        granularity=granularity,
+        block_size=DEFAULT_BLOCK_SIZE,
+        scaling_recipe=scaling_recipe,
+    )
+
+    out = dequantize_fp8(
+        x_fp8,
+        orig_dtype,
+        granularity=granularity,
+        block_size=DEFAULT_BLOCK_SIZE,
+        scale_inv=x_scale_inv,
+        scaling_recipe=scaling_recipe,
+    )
+
+    torch.testing.assert_close(x, out, **get_tolerances(dest_dtype))
 
 
 def padding_size(n: int, padding_align_size: int) -> int:
