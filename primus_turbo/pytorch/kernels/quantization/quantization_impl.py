@@ -9,6 +9,11 @@ from typing import Optional, Tuple, Union
 import torch
 import triton
 
+from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import (
+    grouped_quant_mxfp8_raw,
+    quant_mxfp8_raw,
+    quant_mxfp8_raw_batched,
+)
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     MXFP4_PADDING_ALIGN_SIZE,
@@ -610,6 +615,55 @@ def grouped_quantize_mxfp8_impl(
             scaling_recipe.shuffle_scale,
             scaling_recipe.shuffle_out,
         )
+
+
+def quantize_mxfp8_flydsl_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    block_size: int = MXFP8_BLOCK_SIZE,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FlyDSL dual-cast (row-wise + transposed col-wise) MXFP8 quant (gfx950), the MX GEMM operand
+    quant. Honors ``use_2d_block`` (per 32x32 tile scale, weights) on the row / col recipe; raw
+    E8M0 layout bit-matching the HIP quantize_mxfp8_dual. A 3D [B, M, K] input does all B experts
+    in one launch. Returns (row_fp8, row_scale, col_fp8, col_scale)."""
+    assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+    row_2d = bool(scaling_recipe is not None and scaling_recipe.use_2d_block)
+    col_2d = bool(scaling_recipe_for_trans is not None and scaling_recipe_for_trans.use_2d_block)
+    x = x.contiguous()
+    if x.ndim == 3:
+        return quant_mxfp8_raw_batched(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
+    return quant_mxfp8_raw(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
+
+
+def grouped_quantize_mxfp8_flydsl_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    block_size: int = MXFP8_BLOCK_SIZE,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """FlyDSL grouped dual-cast MXFP8 quant (gfx950), the A / grad_out (activation) operand quant
+    for the MX grouped GEMM. Returns the 8-tuple (rowwise fp8/scale, colwise fp8/scale, then
+    row-64 / col-128 padded lens/offs). Activation is 1D per-32-block; ``use_2d_block`` (weight-only)
+    is not applicable here (grouped weights go through ``quantize_mxfp8_flydsl_impl``)."""
+    assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
+    assert not (scaling_recipe is not None and scaling_recipe.use_2d_block) and not (
+        scaling_recipe_for_trans is not None and scaling_recipe_for_trans.use_2d_block
+    ), "grouped activation quant does not support use_2d_block"
+    return grouped_quant_mxfp8_raw(x.contiguous(), group_lens, group_offs, out_dtype)
 
 
 def grouped_quantize_mxfp4_impl(

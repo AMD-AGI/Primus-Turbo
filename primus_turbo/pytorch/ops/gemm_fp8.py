@@ -27,10 +27,10 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.core.utils import is_gfx942
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import gemm_fp8_impl
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import quantize_mxfp8_flydsl_impl
 from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_trans,
-    quantize_fp8_with_trans_flydsl,
 )
 
 __all__ = ["gemm_fp8"]
@@ -547,10 +547,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 )
             a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
-            a_row, a_row_scale, a_col, a_col_scale = quantize_fp8_with_trans_flydsl(
+            a_row, a_row_scale, a_col, a_col_scale = quantize_mxfp8_flydsl_impl(
                 a,
                 fp8_dtype,
-                granularity,
                 block_size=block_size,
                 scaling_recipe=a_scaling_recipe,
                 scaling_recipe_for_trans=a_scaling_recipe,
@@ -571,10 +570,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 )
             b_col, b_col_scale = b_t.qdata, b_t.scale_inv
         else:
-            b_row, b_row_scale, b_col, b_col_scale = quantize_fp8_with_trans_flydsl(
+            b_row, b_row_scale, b_col, b_col_scale = quantize_mxfp8_flydsl_impl(
                 b,
                 fp8_dtype,
-                granularity,
                 block_size=block_size,
                 scaling_recipe=b_scaling_recipe,
                 scaling_recipe_for_trans=b_scaling_recipe,
@@ -611,10 +609,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         # Dual-cast grad_out: one kernel emits both the row-wise (grad_a, NN->NT) and
         # col-wise (grad_b, TN->NT) directions -- no second single-direction pass.
-        g_row, g_row_scale, g_col, g_col_scale = quantize_fp8_with_trans_flydsl(
+        g_row, g_row_scale, g_col, g_col_scale = quantize_mxfp8_flydsl_impl(
             grad_out,
             grad_out_dtype,
-            ctx.config.granularity,
             block_size=ctx.config.block_size,
             scaling_recipe=ScalingRecipe(),
             scaling_recipe_for_trans=ScalingRecipe(),
