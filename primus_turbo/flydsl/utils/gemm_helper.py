@@ -103,6 +103,27 @@ def make_bf16_fp16_tile_tensor(base_i64, byte_offset, elems):
     return fx.make_view(tile_ptr, fx.make_layout(elems, 1))
 
 
+def make_bf16_rebased_rsrc(arg, base_elems, num_records_bytes):
+    """Return a raw !llvm.ptr<8> buffer SRD whose base = arg's base advanced by
+    ``base_elems`` bf16 elements (2 bytes), in 64-bit, bounded by ``num_records_bytes``.
+    For buffers > 4GB (e.g. pro-cr4 interm 4.8GB) where a flat entry*D_V element offset
+    overflows the 32-bit voffset. Mirrors BufferResourceDescriptor.from_memref's
+    MakeBufferRsrcOp construction but with a rebased base. Pass directly to
+    buffer_load/buffer_store as `rsrc` (with dtype=bf16)."""
+    base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg))
+    base = base + arith.index_cast(T.i64, base_elems) * fx.Int64(2)
+    nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
+    nrec = _raw(fx.Int64(arith.index_cast(T.i64, nr)))
+    flags = _buffer_ops._get_buffer_flags()
+    llvm_ptr_ty = ir.Type.parse('!llvm.ptr')
+    base_ptr = _llvm.IntToPtrOp(llvm_ptr_ty, _raw(base)).result
+    rsrc_ty = ir.Type.parse('!llvm.ptr<8>')
+    stride_val = _buffer_ops._create_i16_constant(0)
+    flags_val = _buffer_ops._create_i32_constant(flags)
+    rsrc = rocdl.MakeBufferRsrcOp(rsrc_ty, base_ptr, stride_val, nrec, flags_val).result
+    return rsrc
+
+
 def swizzle_128(row, col, width=128):
     """XOR bank-swizzle over a `width`=2**k logical row (width=128 is byte-identical to
     the original fixed-128 form). The swizzle must stay within col's bits [0,k); for k<7
