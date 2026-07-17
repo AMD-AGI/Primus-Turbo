@@ -49,14 +49,3 @@ def build_ck() -> bool:
         return BUILD_CK_BACKEND
     except ImportError:
         return False
-
-
-@functools.lru_cache
-def build_turbo() -> bool:
-    """Whether the turbo (MFMA) GEMM backend was compiled into this build."""
-    try:
-        from primus_turbo._build_info import BUILD_TURBO_BACKEND
-
-        return BUILD_TURBO_BACKEND
-    except ImportError:
-        return False

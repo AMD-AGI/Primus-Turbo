@@ -3,8 +3,11 @@
 // See LICENSE for license information.
 
 #include "primus_turbo/gemm.h"
-#include "turbo/turbo_gemm_mxfp8_kernel.h"
 #include <hip/hip_runtime.h>
+
+#ifdef BUILD_TURBO_BACKEND
+
+#include "turbo/turbo_gemm_mxfp8_kernel.h"
 
 namespace primus_turbo {
 
@@ -70,3 +73,44 @@ INSTANTIATE_TURBO_GEMM(dtype::float8_e5m2, dtype::float8_e4m3, dtype::bfloat16)
 #undef INSTANTIATE_TURBO_GEMM
 
 } // namespace primus_turbo
+
+#else // !BUILD_TURBO_BACKEND : turbo (MFMA) GEMM not compiled on gfx1250.
+
+#include "primus_turbo/macros.h"
+
+namespace primus_turbo {
+
+// Stub symbols so host bindings link uniformly. The real kernels are unavailable on
+// gfx1250; callers must gate on is_gfx1250() before invoking the impl.
+
+size_t turbo_gemm_mxfp8_workspace_size(int32_t, int32_t, int32_t) {
+    return 0;
+}
+
+template <typename AType, typename BType, typename CType>
+void turbo_gemm_mxfp8_impl(const AType *, const BType *, const dtype::float8_e8m0 *,
+                           const dtype::float8_e8m0 *, CType *, int32_t, int32_t, int32_t, void *,
+                           size_t, hipStream_t) {
+    PRIMUS_TURBO_ERROR("turbo_gemm_mxfp8 is unavailable: the turbo backend is not built "
+                       "on this architecture (gfx1250 is unsupported).");
+}
+
+#define INSTANTIATE_TURBO_GEMM(A, B, C)                                                            \
+    template void turbo_gemm_mxfp8_impl<A, B, C>(const A *, const B *, const dtype::float8_e8m0 *, \
+                                                 const dtype::float8_e8m0 *, C *, int32_t,         \
+                                                 int32_t, int32_t, void *, size_t, hipStream_t);
+
+INSTANTIATE_TURBO_GEMM(dtype::float8_e4m3, dtype::float8_e4m3, dtype::float16)
+INSTANTIATE_TURBO_GEMM(dtype::float8_e4m3, dtype::float8_e4m3, dtype::bfloat16)
+INSTANTIATE_TURBO_GEMM(dtype::float8_e5m2, dtype::float8_e5m2, dtype::float16)
+INSTANTIATE_TURBO_GEMM(dtype::float8_e5m2, dtype::float8_e5m2, dtype::bfloat16)
+INSTANTIATE_TURBO_GEMM(dtype::float8_e4m3, dtype::float8_e5m2, dtype::float16)
+INSTANTIATE_TURBO_GEMM(dtype::float8_e4m3, dtype::float8_e5m2, dtype::bfloat16)
+INSTANTIATE_TURBO_GEMM(dtype::float8_e5m2, dtype::float8_e4m3, dtype::float16)
+INSTANTIATE_TURBO_GEMM(dtype::float8_e5m2, dtype::float8_e4m3, dtype::bfloat16)
+
+#undef INSTANTIATE_TURBO_GEMM
+
+} // namespace primus_turbo
+
+#endif // BUILD_TURBO_BACKEND

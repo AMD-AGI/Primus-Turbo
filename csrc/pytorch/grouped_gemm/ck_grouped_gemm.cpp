@@ -387,8 +387,9 @@ at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                            at::Tensor &group_offs, const bool transA, const bool transB,
                            c10::optional<int64_t> num_cu, const bool work_steal,
                            c10::optional<at::Tensor> ws_counter, int64_t ws_local_per_xcd) {
-    PRIMUS_TURBO_ERROR("ck_grouped_gemm is unavailable: CK backend not built. "
-                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm is unavailable: CK backend not built (disabled via "
+                       "PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
 }
 
 at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
@@ -396,16 +397,18 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
                                       c10::optional<int64_t> num_cu, const bool work_steal,
                                       c10::optional<at::Tensor> ws_counter,
                                       int64_t                   ws_local_per_xcd) {
-    PRIMUS_TURBO_ERROR("ck_grouped_gemm_variable_k is unavailable: CK backend not built. "
-                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm_variable_k is unavailable: CK backend not built (disabled "
+                       "via PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
 }
 
 at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                at::Tensor &b_scales, at::Tensor &group_lens, at::Tensor &group_offs,
                                const bool transA, const bool transB, at::ScalarType out_dtype,
                                const std::string &granularity, c10::optional<int64_t> num_cu) {
-    PRIMUS_TURBO_ERROR("ck_grouped_gemm_fp8 is unavailable: CK backend not built. "
-                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm_fp8 is unavailable: CK backend not built (disabled via "
+                       "PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
 }
 
 at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
@@ -414,8 +417,9 @@ at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tens
                                           const bool transB, at::ScalarType out_dtype,
                                           const std::string     &granularity,
                                           c10::optional<int64_t> num_cu) {
-    PRIMUS_TURBO_ERROR("ck_grouped_gemm_fp8_variable_k is unavailable: CK backend not built. "
-                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm_fp8_variable_k is unavailable: CK backend not built "
+                       "(disabled via PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
 }
 
 #endif // BUILD_CK_BACKEND

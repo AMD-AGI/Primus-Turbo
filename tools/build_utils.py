@@ -349,37 +349,15 @@ def get_gpu_arch(gpu_id: int = 0) -> str:
     return matches[gpu_id].lower()
 
 
-# Optional GEMM backends, selected via the PRIMUS_TURBO_BUILD_BACKEND env var.
-SUPPORT_BACKENDS = ("ck", "turbo")
-
-
-def enabled_backends():
-    """Set of GEMM backends to build, parsed from PRIMUS_TURBO_BUILD_BACKEND.
-
-    The variable is a comma/semicolon separated list of backend names, e.g.
-    "ck,turbo" enables both the CK and turbo backends.
-      * unset        -> all SUPPORT_BACKENDS are enabled by default
-      * empty string -> no backends are built
-    """
-    val = os.environ.get("PRIMUS_TURBO_BUILD_BACKEND")
-    if val is None:
-        return set(SUPPORT_BACKENDS)
-
-    selected = {b.strip().lower() for b in re.split(r"[,;]", val) if b.strip()}
-    unknown = selected - set(SUPPORT_BACKENDS)
-    if unknown:
-        warnings.warn(
-            f"Ignoring unknown PRIMUS_TURBO_BUILD_BACKEND entries: {sorted(unknown)}. "
-            f"Supported backends: {sorted(SUPPORT_BACKENDS)}."
-        )
-    return selected & set(SUPPORT_BACKENDS)
-
-
 def build_ck_backend():
-    """Whether to build the Composable-Kernel / MFMA backend (PRIMUS_TURBO_BUILD_BACKEND)."""
-    return "ck" in enabled_backends()
+    """Whether to build the Composable-Kernel (ck_tile) GEMM backend.
 
-
-def build_turbo_backend():
-    """Whether to build the turbo (MFMA) GEMM backend (PRIMUS_TURBO_BUILD_BACKEND)."""
-    return "turbo" in enabled_backends()
+    Controlled by the PRIMUS_TURBO_BUILD_CK env var:
+      * unset                              -> enabled by default
+      * "0"/"false"/"off"/"" (empty)  -> disabled
+      * any other value                    -> enabled
+    """
+    val = os.environ.get("PRIMUS_TURBO_BUILD_CK")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "off", "")

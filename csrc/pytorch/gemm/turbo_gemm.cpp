@@ -2,6 +2,7 @@
 //
 // See LICENSE for license information.
 
+#include "primus_turbo/arch.h"
 #include "primus_turbo/gemm.h"
 
 #include "../extensions.h"
@@ -9,8 +10,6 @@
 #include "../utils.h"
 
 namespace primus_turbo::pytorch {
-
-#ifdef BUILD_TURBO_BACKEND
 
 // ── MX_BLOCKWISE launch ──
 
@@ -67,6 +66,10 @@ static at::Tensor launch_mxfp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
 at::Tensor turbo_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at::Tensor scaleB_inv,
                           const at::ScalarType out_dtype, bool transA, bool transB, bool transC,
                           const std::string &granularity) {
+    // Runtime guard: the turbo (MFMA) backend is not compiled on gfx1250.
+    PRIMUS_TURBO_CHECK(!primus_turbo::is_gfx1250(),
+                       "turbo_gemm_fp8 is unavailable: the turbo backend is not built "
+                       "on this architecture (gfx1250 is unsupported).");
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(A.scalar_type()), "A must be FP8.");
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(B.scalar_type()), "B must be FP8.");
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(out_dtype) || out_dtype == at::kFloat,
@@ -82,16 +85,5 @@ at::Tensor turbo_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at:
     PRIMUS_TURBO_ERROR("turbo_gemm_fp8: unsupported granularity '" + granularity + "'.");
     return at::Tensor();
 }
-
-#else // !BUILD_TURBO_BACKEND : turbo MXFP8 GEMM disabled
-
-at::Tensor turbo_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at::Tensor scaleB_inv,
-                          const at::ScalarType out_dtype, bool transA, bool transB, bool transC,
-                          const std::string &granularity) {
-    PRIMUS_TURBO_ERROR("turbo_gemm_fp8 is unavailable: turbo backend not built. "
-                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'turbo'.");
-}
-
-#endif // BUILD_TURBO_BACKEND
 
 } // namespace primus_turbo::pytorch

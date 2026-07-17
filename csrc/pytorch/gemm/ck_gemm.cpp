@@ -104,8 +104,9 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
 at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
                        const bool transA, const bool transB, at::ScalarType out_dtype,
                        const std::string &granularity) {
-    PRIMUS_TURBO_ERROR("ck_gemm_fp8 is unavailable: CK backend not built. "
-                       "Rebuild with PRIMUS_TURBO_BUILD_BACKEND including 'ck'.");
+    PRIMUS_TURBO_ERROR("ck_gemm_fp8 is unavailable: CK backend not built (disabled via "
+                       "PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
 }
 
 #endif // BUILD_CK_BACKEND
