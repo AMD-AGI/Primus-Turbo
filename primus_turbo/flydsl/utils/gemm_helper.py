@@ -115,9 +115,9 @@ def make_bf16_rebased_rsrc(arg, base_elems, num_records_bytes):
     nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
     nrec = _raw(fx.Int64(arith.index_cast(T.i64, nr)))
     flags = _buffer_ops._get_buffer_flags()
-    llvm_ptr_ty = ir.Type.parse('!llvm.ptr')
+    llvm_ptr_ty = ir.Type.parse("!llvm.ptr")
     base_ptr = _llvm.IntToPtrOp(llvm_ptr_ty, _raw(base)).result
-    rsrc_ty = ir.Type.parse('!llvm.ptr<8>')
+    rsrc_ty = ir.Type.parse("!llvm.ptr<8>")
     stride_val = _buffer_ops._create_i16_constant(0)
     flags_val = _buffer_ops._create_i32_constant(flags)
     rsrc = rocdl.MakeBufferRsrcOp(rsrc_ty, base_ptr, stride_val, nrec, flags_val).result
