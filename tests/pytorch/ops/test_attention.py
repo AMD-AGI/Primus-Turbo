@@ -9,6 +9,7 @@ import os
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
     attention_triton_backward_impl,
@@ -526,3 +527,112 @@ def test_attention_fake_kernel_strides(qkv_format):
         f"compiled={out_compiled.stride()}, eager={eager_strides}"
     )
     assert out_compiled.shape == out_eager.shape
+
+
+# ============================================================================
+# DeepSeek-V4 single-latent sparse-MLA attention (flydsl, gfx950/MI355X).
+# ============================================================================
+
+# Fixed dims: kv_lora_rank (single latent, K == V) + rope pad; SWA local window.
+SPARSE_MLA_ROPE_DIM = 64
+SPARSE_MLA_HEAD_DIM = 512
+SPARSE_MLA_SWA_WINDOW = 128
+# (variant -> num_heads, index-topk cap). cr spans pure-SWA / random-pool / deterministic-pool (HCA).
+SPARSE_MLA_VARIANTS = {"flash": (64, 512), "pro": (128, 1024)}
+
+
+def _sparse_mla_topk(variant, cr, seqlen):
+    if cr == 0:
+        return 0, 0, SPARSE_MLA_SWA_WINDOW
+    if cr == 4:
+        pool = max(seqlen // 4, 1)
+        topk_pool = min(SPARSE_MLA_VARIANTS[variant][1], pool)
+        return pool, topk_pool, SPARSE_MLA_SWA_WINDOW + topk_pool
+    pool = max(seqlen // cr, 1)
+    return pool, 0, SPARSE_MLA_SWA_WINDOW + pool
+
+
+def _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool, seed=0):
+    """DSV4 sparse-MLA inputs: single-latent kv, per-token top-k (SWA band + optional pool),
+    zero-padded rope cols, random sink / grad_out."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    dev, dt, d, w = "cuda", torch.bfloat16, SPARSE_MLA_HEAD_DIM, SPARSE_MLA_SWA_WINDOW
+    latent = torch.randn(seqlen, d, generator=gen, device=dev, dtype=dt)
+    q = torch.randn(seqlen, num_heads, d, generator=gen, device=dev, dtype=dt)
+    q = torch.cat([q, torch.zeros(seqlen, num_heads, SPARSE_MLA_ROPE_DIM, device=dev, dtype=dt)], -1)
+    sink = torch.randn(num_heads, generator=gen, device=dev, dtype=torch.float32) * 0.1
+    grad_out = torch.randn(seqlen, num_heads, d, generator=gen, device=dev, dtype=dt)
+
+    tok = torch.arange(seqlen, device=dev).view(seqlen, 1)
+    win = tok - w + 1 + torch.arange(w, device=dev).view(1, w)
+    win = torch.where(win >= 0, win, torch.full_like(win, -1))
+    if cr == 0:
+        kv = latent.unsqueeze(1)
+        topk = win
+    else:
+        p = torch.randn(pool, d, generator=gen, device=dev, dtype=dt)
+        kv = torch.cat([latent, p], 0).unsqueeze(1)
+        if cr == 4:
+            pool_topk = seqlen + torch.randint(0, pool, (seqlen, topk_pool), generator=gen, device=dev)
+        else:
+            ps = torch.arange(pool, device=dev).view(1, pool)
+            pool_topk = torch.where(
+                ((ps + 1) * cr - 1) <= tok, seqlen + ps, torch.full_like(ps.expand(seqlen, pool), -1)
+            )
+        topk = torch.cat([win, pool_topk], 1)
+    pad = ((topk.shape[1] + 63) // 64) * 64 - topk.shape[1]
+    if pad > 0:
+        topk = torch.cat([topk, torch.full((seqlen, pad), -1, device=dev, dtype=topk.dtype)], 1)
+    kv = torch.cat([kv, torch.zeros(kv.shape[0], 1, SPARSE_MLA_ROPE_DIM, device=dev, dtype=dt)], -1)
+    return q.contiguous(), kv.contiguous(), topk.to(torch.int32).contiguous(), sink, grad_out
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="sparse-MLA (flydsl) is gfx950-only"
+)
+@pytest.mark.parametrize("seqlen", [512, 1024, 2048])
+@pytest.mark.parametrize("variant", ["flash", "pro"])
+@pytest.mark.parametrize("cr", [0, 4, 128])
+def test_sparse_mla_v4(variant, cr, seqlen):
+    """flydsl sparse-MLA fwd/bwd correctness (SNR vs triton oracle) + determinism, over the
+    pure-SWA (cr=0), random-pool (cr=4) and deterministic-pool/HCA (cr=128) paths. seqlen=512
+    also exercises the cr=4 small-seq dkv-dispatch guard."""
+    import math
+
+    # Lazy import: keeps collection working on non-gfx950 (flydsl sparse-MLA is gfx950-only).
+    from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_v4_flydsl
+    from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_v4_flydsl
+    from primus_turbo.triton.attention.sparse_mla import (
+        sparse_mla_bwd_v4_triton,
+        sparse_mla_fwd_v4_triton,
+    )
+
+    d = SPARSE_MLA_HEAD_DIM
+    num_heads = SPARSE_MLA_VARIANTS[variant][0]
+    pool, topk_pool, _ = _sparse_mla_topk(variant, cr, seqlen)
+    scale = 1.0 / math.sqrt(d)
+    q, kv, topk_idx, sink, grad_out = _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool)
+
+    out, lse = sparse_mla_fwd_v4_flydsl(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
+    out_ref, lse_ref = sparse_mla_fwd_v4_triton(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
+    assert torch.isfinite(out).all(), "forward produced non-finite values"
+    fwd_snr = compute_snr(out_ref, out)
+    assert fwd_snr > 40.0, f"fwd SNR {fwd_snr:.1f} <= 40"
+
+    dq, dkv, dsink = sparse_mla_bwd_v4_flydsl(
+        q, kv, out, grad_out, topk_idx, lse, attn_sink=sink, kv_lora_rank=d, scale=scale
+    )
+    dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_v4_triton(
+        q, kv, out_ref, grad_out, topk_idx, lse_ref, attn_sink=sink, kv_lora_rank=d, scale=scale
+    )
+    assert torch.isfinite(dq).all() and torch.isfinite(dkv).all(), "backward produced non-finite values"
+    assert compute_snr(dq_ref, dq) > 40.0, "dq SNR <= 40"
+    assert compute_snr(dkv_ref, dkv) > 40.0, "dkv SNR <= 40"
+    if dsink is not None:
+        assert compute_snr(dsink_ref, dsink) > 40.0, "dsink SNR <= 40"
+
+    # Determinism: one WG owns each output tile (no float atomics), so a re-run is bit-exact.
+    dq2, dkv2, _ = sparse_mla_bwd_v4_flydsl(
+        q, kv, out, grad_out, topk_idx, lse, attn_sink=sink, kv_lora_rank=d, scale=scale
+    )
+    assert torch.equal(dq, dq2) and torch.equal(dkv, dkv2), "backward is not deterministic"

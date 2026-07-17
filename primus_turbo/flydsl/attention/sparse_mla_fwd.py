@@ -66,27 +66,27 @@ def build_fwd(
     CHUNKS = THREADS // TILE_K  # d-chunks storing one KV tile (256->16, 512->32)
     ECHUNK = D // CHUNKS  # elems per chunk (256->32, 512->16)
     V8PT = ECHUNK // 8  # v8 KV regs gathered/stored per thread (256->4, 512->2)
-    pvk32 = not banded  # 2-tile-batch PV K=32 (non-banded gather path)
+    pv2x = not banded  # 2-tile-batch PV K=32 (non-banded gather path)
     # No XOR swizzle for the shared MLA latent: one swizzle can't make both the QK
     # contiguous-v8 read and the PV transpose-tr16 read conflict-free (K==V shares one
     # LDS). D_LDS=528 padding is the layout -> _swz is identity.
     STRIDE = D_LDS  # kv-row LDS stride (elements)
-    # pstore: 4-buffer parity PRESTORE pipeline for the many-tile pvk32 gather path. Pair
+    # pstore: 4-buffer parity PRESTORE pipeline for the many-tile pv2x gather path. Pair
     # pr gathers+stores pair pr+1 into the OTHER parity buffers first, so those reg->LDS
     # ds_writes overlap this pair's PV MFMA drain; collapses 3->1 barriers/pair.
-    pstore = bool(pstore) and pvk32
+    pstore = bool(pstore) and pv2x
     NUM_TILES = (topk_len + TILE_K - 1) // TILE_K
     W = 128  # SWA window for the closed-form banded (cr0) path: kv in [token-127..token]
     LDS_ELEMS = TKP * STRIDE  # 16 kv rows x padded D per KV LDS tile
     # single_buffer: one KV LDS tile + an extra WAR barrier per tile (pro many-tile gather
     # only). pstore uses 4 parity buffers.
-    NBUF = 4 if pstore else (1 if (single_buffer and not pvk32) else 2)
+    NBUF = 4 if pstore else (1 if (single_buffer and not pv2x) else 2)
     # fast_path (first-pair fixed-max): default-ON accelerated softmax for the rescale-bound cr4
-    # shapes (pro cr4 = plain path, flash cr4 = pstore path; both pvk32/non-banded). softmax is
+    # shapes (pro cr4 = plain path, flash cr4 = pstore path; both pv2x/non-banded). softmax is
     # shift-invariant so using the first pair's row-max as a fixed bound is math-exact; the fixed
     # alpha=1 lets the compiler fold the per-tile o*=alpha rescale -> nomax speed at higher
     # precision. Banded (cr0/cr128) are gather/memory-bound (no rescale head) so left out.
-    _fmax0 = bool(fast_path and pvk32 and not banded)
+    _fmax0 = bool(fast_path and pv2x and not banded)
     allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_fwd_smem")
     kv_off = allocator._align(allocator.ptr, 16)
     mask_off = allocator._align(kv_off + NBUF * LDS_ELEMS * 2, 16)
@@ -597,7 +597,7 @@ def build_fwd(
             n_loop = (NUM_TILES - 1) if peel_last else NUM_TILES
             loop_ub = fx.Index(n_loop)
             t_last_dyn = fx.Index(NUM_TILES - 1)
-        if const_expr(pvk32 and pstore):
+        if const_expr(pv2x and pstore):
             # 2-tile-batch PV K=32 + 4-buffer parity PRESTORE pipeline: pair pr reads buffers
             # stored by the previous iteration's prestore, then prestores pair pr+1 into the
             # other buffers so those ds_writes overlap its PV drain (one barrier/pair, WAR).
@@ -669,7 +669,7 @@ def build_fwd(
             o_acc = [xres[2 + dt] for dt in range_constexpr(DT)]
             m_f, l_t, lp, scal = _epi_scalars(m_run, l_sum)
             _write_out(m_f, l_t, lp, scal, o_acc)
-        if const_expr(pvk32 and not pstore):
+        if const_expr(pv2x and not pstore):
             if const_expr(_fmax0):
                 # CHEAP fixed-max: bound = crossgrp-max over the FIRST pair only (1 QK, no full
                 # pre-pass). softmax is shift-invariant so any bound is mathematically exact; the
@@ -741,7 +741,7 @@ def build_fwd(
             o_acc = [xres[2 + dt] for dt in range_constexpr(DT)]
             m_f, l_t, lp, scal = _epi_scalars(m_run, l_sum)
             _write_out(m_f, l_t, lp, scal, o_acc)
-        if const_expr(not pvk32):
+        if const_expr(not pv2x):
             loop_results = init
             for t, iter_args in range(fx.Index(0), loop_ub, fx.Index(1), init=init):
                 m_run = iter_args[0]
