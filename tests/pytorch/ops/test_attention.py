@@ -593,18 +593,18 @@ def _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool, seed=0):
 @pytest.mark.parametrize("seqlen", [512, 1024, 2048])
 @pytest.mark.parametrize("variant", ["flash", "pro"])
 @pytest.mark.parametrize("cr", [0, 4, 128])
-def test_sparse_mla_v4(variant, cr, seqlen):
+def test_sparse_mla(variant, cr, seqlen):
     """flydsl sparse-MLA fwd/bwd correctness (SNR vs triton oracle) + determinism, over the
     pure-SWA (cr=0), random-pool (cr=4) and deterministic-pool/HCA (cr=128) paths. seqlen=512
     also exercises the cr=4 small-seq dkv-dispatch guard."""
     import math
 
     # Lazy import: keeps collection working on non-gfx950 (flydsl sparse-MLA is gfx950-only).
-    from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_v4_flydsl
-    from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_v4_flydsl
+    from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_flydsl
+    from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_flydsl
     from primus_turbo.triton.attention.sparse_mla import (
-        sparse_mla_bwd_v4_triton,
-        sparse_mla_fwd_v4_triton,
+        sparse_mla_bwd_triton,
+        sparse_mla_fwd_triton,
     )
 
     d = SPARSE_MLA_HEAD_DIM
@@ -613,16 +613,16 @@ def test_sparse_mla_v4(variant, cr, seqlen):
     scale = 1.0 / math.sqrt(d)
     q, kv, topk_idx, sink, grad_out = _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool)
 
-    out, lse = sparse_mla_fwd_v4_flydsl(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
-    out_ref, lse_ref = sparse_mla_fwd_v4_triton(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
+    out, lse = sparse_mla_fwd_flydsl(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
+    out_ref, lse_ref = sparse_mla_fwd_triton(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
     assert torch.isfinite(out).all(), "forward produced non-finite values"
     fwd_snr = compute_snr(out_ref, out)
     assert fwd_snr > 40.0, f"fwd SNR {fwd_snr:.1f} <= 40"
 
-    dq, dkv, dsink = sparse_mla_bwd_v4_flydsl(
+    dq, dkv, dsink = sparse_mla_bwd_flydsl(
         q, kv, out, grad_out, topk_idx, lse, attn_sink=sink, kv_lora_rank=d, scale=scale
     )
-    dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_v4_triton(
+    dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_triton(
         q, kv, out_ref, grad_out, topk_idx, lse_ref, attn_sink=sink, kv_lora_rank=d, scale=scale
     )
     assert torch.isfinite(dq).all() and torch.isfinite(dkv).all(), "backward produced non-finite values"
@@ -632,7 +632,7 @@ def test_sparse_mla_v4(variant, cr, seqlen):
         assert compute_snr(dsink_ref, dsink) > 40.0, "dsink SNR <= 40"
 
     # Determinism: one WG owns each output tile (no float atomics), so a re-run is bit-exact.
-    dq2, dkv2, _ = sparse_mla_bwd_v4_flydsl(
+    dq2, dkv2, _ = sparse_mla_bwd_flydsl(
         q, kv, out, grad_out, topk_idx, lse, attn_sink=sink, kv_lora_rank=d, scale=scale
     )
     assert torch.equal(dq, dq2) and torch.equal(dkv, dkv2), "backward is not deterministic"

@@ -9,8 +9,8 @@
 Fused single MQA latent (K = V = the first kv_lora_rank channels), per-token absolute top-k
 indices, optional per-head softmax sink; the QK / PV GEMMs lower to MFMA via tl.dot. The
 backward uses the non-atomic chunked-gather scheme (per rank-chunk dQ + dKV-intermediate
-kernels, then a CSR inverted-topk reduce into dkv). Public entry points sparse_mla_fwd_v4_triton
-/ sparse_mla_bwd_v4_triton are the reference oracle for the flydsl sparse-MLA path.
+kernels, then a CSR inverted-topk reduce into dkv). Public entry points sparse_mla_fwd_triton
+/ sparse_mla_bwd_triton are the reference oracle for the flydsl sparse-MLA path.
 """
 
 import torch
@@ -119,7 +119,7 @@ def _sparse_mla_fwd_tr_kernel(
     tl.store(LSE_ptr + tok.to(tl.int64) * num_heads + offs_h, lse, mask=mask_h)
 
 
-def sparse_mla_fwd_v4_triton(q, kv, topk_indices, attn_sink=None, kv_lora_rank=512, scale=None):
+def sparse_mla_fwd_triton(q, kv, topk_indices, attn_sink=None, kv_lora_rank=512, scale=None):
     """DeepSeek-V4 sparse-MLA forward (plain Triton / MFMA). API mirrors the gluon path.
 
     Args:
@@ -541,7 +541,7 @@ def _bwd_dkv_gather_acc(
         tl.store(dKV_acc_ptr + acc_base + D_V + offs_r, dkv_acc_rope)
 
 
-def sparse_mla_bwd_v4_triton(q, kv, o, do, topk_indices, lse, attn_sink=None, kv_lora_rank=512, scale=None):
+def sparse_mla_bwd_triton(q, kv, o, do, topk_indices, lse, attn_sink=None, kv_lora_rank=512, scale=None):
     """DeepSeek-V4 sparse-MLA backward (plain Triton / MFMA, non-atomic).
 
     Returns ``(dq, dkv, d_sink)`` with ``dkv`` shaped like ``kv`` and ``d_sink``

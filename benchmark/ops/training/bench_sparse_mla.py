@@ -17,11 +17,11 @@ from tabulate import tabulate
 # Import the package first so it fully initializes before the triton kernel modules pull in
 # triton_knobs_helper (avoids a partial-init circular import via primus_turbo.pytorch.core.utils).
 import primus_turbo.pytorch  # noqa: F401  (import-ordering side effect)
-from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_v4_flydsl
-from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_v4_flydsl
+from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_flydsl
+from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_flydsl
 from primus_turbo.triton.attention.sparse_mla import (
-    sparse_mla_bwd_v4_triton,
-    sparse_mla_fwd_v4_triton,
+    sparse_mla_bwd_triton,
+    sparse_mla_fwd_triton,
 )
 
 # DeepSeek-V4 single-latent sparse-MLA fixed dims (kv_lora_rank + rope pad).
@@ -92,20 +92,20 @@ def profile_sparse_mla(variant, cr, seqlen):
     scale = 1.0 / math.sqrt(HEAD_DIM)
     q, kv, topk_idx, sink, grad_out = build_sparse_mla_inputs(cr, num_heads, seqlen, pool, topk_pool)
 
-    fwd_func = lambda: sparse_mla_fwd_v4_flydsl(
+    fwd_func = lambda: sparse_mla_fwd_flydsl(
         q, kv, topk_idx, attn_sink=sink, kv_lora_rank=HEAD_DIM, scale=scale
     )
     out, lse = fwd_func()
-    out_ref, lse_ref = sparse_mla_fwd_v4_triton(
+    out_ref, lse_ref = sparse_mla_fwd_triton(
         q, kv, topk_idx, attn_sink=sink, kv_lora_rank=HEAD_DIM, scale=scale
     )
     fwd_snr = compute_snr(out_ref, out)
 
-    bwd_func = lambda: sparse_mla_bwd_v4_flydsl(
+    bwd_func = lambda: sparse_mla_bwd_flydsl(
         q, kv, out, grad_out, topk_idx, lse, attn_sink=sink, kv_lora_rank=HEAD_DIM, scale=scale
     )
     dq, dkv, dsink = bwd_func()
-    dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_v4_triton(
+    dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_triton(
         q, kv, out_ref, grad_out, topk_idx, lse_ref, attn_sink=sink, kv_lora_rank=HEAD_DIM, scale=scale
     )
     bwd_snr = min(compute_snr(dq_ref, dq), compute_snr(dkv_ref, dkv))

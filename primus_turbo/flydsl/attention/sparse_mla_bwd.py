@@ -2512,7 +2512,7 @@ def _get_interm(topk_len, num_heads):
     return fn
 
 
-def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv_lora_rank=512, scale=None):
+def sparse_mla_bwd_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv_lora_rank=512, scale=None):
     # flydsl heads-split dQ + flydsl dKV-interm/gather.
     assert q.is_contiguous() and o.is_contiguous() and do.is_contiguous()
     assert topk_indices.is_contiguous() and lse.is_contiguous()

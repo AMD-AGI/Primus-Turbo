@@ -928,7 +928,7 @@ def _get_fwd(
     return fn
 
 
-def sparse_mla_fwd_v4_flydsl(q, kv, topk_indices, attn_sink=None, kv_lora_rank=512, scale=None):
+def sparse_mla_fwd_flydsl(q, kv, topk_indices, attn_sink=None, kv_lora_rank=512, scale=None):
     assert q.is_contiguous() and topk_indices.is_contiguous()
     total_tokens, num_heads, d_qk = q.shape
     topk = topk_indices.shape[1]
