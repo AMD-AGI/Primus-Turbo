@@ -842,7 +842,7 @@ class S2RLoaderTr:
         if self.wswz:
             # XOR (W<<1) into j_chunk: address bit shift W*32, matching the write
             # side's compute_global_swizzle_nn(wswz=True) -- drops LDSBankConflict
-            # 14% -> 0% at _CS=1024 (2-pool).
+            # conflicts drop to 0 at _CS=1024 (2-pool).
             j_chunk = j_chunk ^ ((W << 1) & (chunks - 1))
         return (
             W * self.chunk_stride

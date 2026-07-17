@@ -161,10 +161,9 @@ def sparse_mla_fwd_v4_triton(q, kv, topk_indices, attn_sink=None, kv_lora_rank=5
     has_rope = False
 
     grid = lambda META: (total_tokens, triton.cdiv(num_heads, META["BLOCK_H"]))
-    # The AMD ping-pong / async-copy knobs primus_turbo enables globally are a
-    # pessimization for this fwd kernel (~16-29% slower on flash in bench_v4_attention).
-    # They are read at compile time and are not in Triton's cache key, so compiling under
-    # this scope pins the faster non-ping-pong schedule without touching any other kernel.
+    # The AMD ping-pong / async-copy knobs primus_turbo enables globally are a pessimization for
+    # this fwd kernel. They are read at compile time and are not in Triton's cache key, so compiling
+    # under this scope pins the faster non-ping-pong schedule without touching any other kernel.
     with scoped_amd_triton_knobs_disabled():
         _sparse_mla_fwd_tr_kernel[grid](
             Q_ptr=q,
@@ -210,11 +209,9 @@ def _build_inverted_topk_slice(topk_indices_slice, r_start, R_CHUNK, num_kv=None
     """
     T, RC = topk_indices_slice.shape
     n_kv = T if num_kv is None else int(num_kv)
-    # Keep the sort keys int32 (was .long()): the stable radix sort over T*R_CHUNK
-    # keys is ~2x faster on int32 than int64 and yields a BIT-IDENTICAL permutation
-    # (same key values, stable) -> inv_ptr/inv_data byte-for-byte identical, so the
-    # gather stays deterministic and the SNR reference is unchanged. Measured
-    # (scoring shape): pro 1.13->0.60ms, flash 0.75->0.42ms.
+    # Keep the sort keys int32 (was .long()): the stable radix sort is faster on int32 than
+    # int64 and yields a BIT-IDENTICAL permutation (same key values, stable) -> inv_ptr/inv_data
+    # byte-for-byte identical, so the gather stays deterministic and the SNR reference holds.
     flat_kv = topk_indices_slice.reshape(-1)  # [T*R_CHUNK] int32; -1 marks invalid
 
     inv_data = torch.argsort(flat_kv, stable=True).to(torch.int32)  # [T*R_CHUNK]
@@ -570,30 +567,20 @@ def sparse_mla_bwd_v4_triton(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     delta = torch.empty(total_tokens, num_heads, dtype=torch.float32, device=q.device)
 
     # ---- config (mirror the gluon bwd chunking) ----
-    # R_CHUNK (rank-chunk width): dQ is read-modify-written across chunks, so more
-    # chunks = more redundant dq reload passes + repeated launches/CSR builds. For
-    # high head counts (H>=128) the dq RMW volume is large, so a single chunk over
-    # the whole topk (bounded for memory) is a big win (-22% on pro cr4). For low
-    # head counts (H<=64) the smaller dq RMW is outweighed by the larger per-chunk
-    # buffers/occupancy, and 256 stays best — so keep the cap there.
+    # R_CHUNK (rank-chunk width): dQ is read-modify-written across chunks, so more chunks = more
+    # redundant dq reloads + repeated launches/CSR builds. H>=128 has large dq RMW volume, so one
+    # chunk over the whole topk (memory-bounded) wins; H<=64's smaller dq RMW is outweighed by the
+    # larger per-chunk buffers/occupancy, so 256 stays the cap.
     if num_heads >= 128:
         R_CHUNK = min(topk, 1536)
     else:
         R_CHUNK = min(256, topk)
     BH_DQ, TK_DQ = 64, 16
-    # dKV-intermediate tiling. The default (BH_DKV=32, TK_DKV=64) is best for high
-    # head counts (H>=128) and for chunk widths that are not 128-aligned. For low
-    # head counts (H<=64) with a 128-aligned chunk, a wider TILE_K=128 over a single
-    # head-group (BH_DKV=64, NUM_HG=1) reduces redundant Q/dO re-loads and issues
-    # fuller MMAs (measured ~6-7% faster on the full flash bwd: cr=0 1.21->1.14 ms,
-    # cr=4 5.44->5.09 ms in bench_v4_attention); it regresses for H>=128 (register
-    # pressure) and for non-128-aligned chunks (partial tiles), so it is guarded.
-    #
-    # The wide config's per-launch LDS overflows the 160 KB limit ONLY when the AMD
-    # ping-pong / async-copy knobs are on (primus_turbo enables them globally for GEMM),
-    # which double-buffer the LDS operand tiles and ~double this kernel's shared memory.
-    # The whole bwd compiles under scoped_amd_triton_knobs_disabled() below, so the wide
-    # config fits and is the default where it applies (~6-7% faster on the full flash bwd).
+    # dKV-intermediate tiling. Default (BH_DKV=32, TK_DKV=64) is best for H>=128 and non-128-aligned
+    # chunks. For H<=64 with a 128-aligned chunk, a wider TILE_K=128 over one head-group (BH_DKV=64,
+    # NUM_HG=1) cuts Q/dO re-loads and issues fuller MMAs; guarded off for H>=128 and non-128 chunks.
+    # Its LDS overflows 160 KB only with ping-pong on, but the bwd compiles under
+    # scoped_amd_triton_knobs_disabled() below, so it fits and is the default where it applies.
     use_wide_dkv = num_heads <= 64 and R_CHUNK % 128 == 0
     BH_DKV, TK_DKV = (64, 128) if use_wide_dkv else (32, 64)
     num_hg_dq = triton.cdiv(num_heads, BH_DQ)
@@ -626,8 +613,7 @@ def sparse_mla_bwd_v4_triton(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     ]
 
     # The AMD ping-pong / async-copy knobs primus_turbo enables globally are a
-    # pessimization for the whole triton_v2 backward (~5-7% slower on the full bwd for
-    # both flash and pro in bench_v4_attention) and overflow the 160 KB LDS limit for the
+    # pessimization for the whole triton_v2 backward, and it overflows the 160 KB LDS limit for
     # wide dKV tiling. Compile the entire bwd (dQ / dKV-intermediate / gather) with them
     # disabled; the knobs are read at compile time and are not in Triton's cache key, so
     # this pins the faster non-ping-pong schedule without touching any kernel elsewhere.

@@ -85,7 +85,7 @@ def build_fwd(
     # shapes (pro cr4 = plain path, flash cr4 = pstore path; both pvk32/non-banded). softmax is
     # shift-invariant so using the first pair's row-max as a fixed bound is math-exact; the fixed
     # alpha=1 lets the compiler fold the per-tile o*=alpha rescale -> nomax speed at higher
-    # precision. Banded (cr0/cr128) are gather/memory-bound (no rescale head, measured) so left out.
+    # precision. Banded (cr0/cr128) are gather/memory-bound (no rescale head) so left out.
     _fmax0 = bool(fast_path and pvk32 and not banded)
     allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_fwd_smem")
     kv_off = allocator._align(allocator.ptr, 16)

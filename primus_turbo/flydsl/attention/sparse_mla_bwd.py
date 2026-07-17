@@ -32,7 +32,16 @@ def _attach(launch):
     return launch
 
 
-def _c8(a, b):
+def _cached_run(cache, key, launch, args):
+    """Compile ``launch`` for ``args`` once (memoized on ``key`` in ``cache``) and run it."""
+    compiled = cache.get(key)
+    if compiled is None:
+        compiled = launch.compile(*args)
+        cache[key] = compiled
+    compiled(*args)
+
+
+def _concat_bf16_v8(a, b):
     """Concat two v4 int16 into a direct v8 bf16 (plain register concat, no shuffle
     crossbar; 16x16x32 MFMA operands must be direct-v8)."""
     va = Vec(a)
@@ -245,10 +254,10 @@ KS = D // 32  # 16 QK MFMA K-steps
 DT = D // 16  # 32 PV d-tiles
 
 
-def build_bwd_dq(topk_len, scale, pf=4, num_heads=None, pvpf=8):
-    # pf=4 (QK KV-read prefetch depth): this kernel runs 2-acc QK (_QK4=0 for its pro cr0/cr128
+def build_bwd_dq(topk_len, scale, qk_prefetch=4, num_heads=None, pv_prefetch=8):
+    # qk_prefetch=4 (QK KV-read prefetch depth): this kernel runs 2-acc QK (_QK4=0 for its pro cr0/cr128
     # shapes), whose 4 chains consume operands slower than the 8-acc path -> the prefetch optimum
-    # shifts shallower (pf=4 beats 6/3 isolated; pf6 was the 8-acc optimum). pvpf=8 unchanged.
+    # shifts shallower (qk_prefetch=4 beats 6/3 isolated; pf6 was the 8-acc optimum). pv_prefetch=8 unchanged.
     elem = fx.BFloat16
     # D_LDS: KV LDS row pad. 528 (264 dword %32=8) avoids the QK natural-v8 read's 2-way
     # bank conflict.
@@ -359,10 +368,9 @@ def build_bwd_dq(topk_len, scale, pf=4, num_heads=None, pvpf=8):
         # NaN P; clamping makes -inf-(-3e38)=-inf -> P=0 (matches triton's P mask).
         lse_h = fx.Float32(arith.MaxNumFOp(_raw(lse_h), _raw(fx.Float32(-3.0e38))).result)
         lse_l2 = fx.Float32(lse_h * c_log2e)  # loop-invariant: hoist lse*log2e out of tile loop
-        # FOLD delta = rowsum(O*dO) into dQ (was a separate BW-bound kernel fully on the wall,
-        # ~170us for pro). dO already resident in do_packs; stream O (1 vec8 at a time), fp32-
-        # accumulate the bf16 product, then sum the 4 d-groups (lanes lo,lo+16,lo+32,lo+48) via
-        # ds_bpermute. Overturns the stale "folding into occ-1 dQ costs more than it saves".
+        # FOLD delta = rowsum(O*dO) into dQ (was a separate BW-bound kernel). dO already resident
+        # in do_packs; stream O (1 vec8 at a time), fp32-accumulate the bf16 product, then sum the
+        # 4 d-groups (lanes lo,lo+16,lo+32,lo+48) via ds_bpermute.
         o_row = token * Hn * fx.Index(D) + head_A * fx.Index(D)
         _dpart = fx.Float32(0.0)
         for _ks in range_constexpr(KS):
@@ -453,9 +461,8 @@ def build_bwd_dq(topk_len, scale, pf=4, num_heads=None, pvpf=8):
             acc_dp0 = Vec.filled(4, 0.0, fx.Float32)
             acc_dp1 = Vec.filled(4, 0.0, fx.Float32)
             # QK4: 4 acc/operand (8 chains) vs 2. Gated to large-topk (topk>=512): this kernel
-            # only ever serves pro cr0 (R128) / cr128 (R160), few-tile shapes where the 8-acc's
-            # extra VGPR/chains don't amortize -> 2-acc is faster (isolated dQ -4%). (Large-R pro
-            # cr4 / flash cr4 use build_bwd_dq_pvk32, which keeps 8-acc.)
+            # only serves pro cr0/cr128 few-tile shapes where the 8-acc's extra VGPR/chains don't
+            # amortize -> 2-acc is faster. (Large-R pro cr4 / flash cr4 use pv2x, which keeps 8-acc.)
             _QK4 = 1 if topk_len >= 512 else 0
             acc_s2 = Vec.filled(4, 0.0, fx.Float32)
             acc_s3 = Vec.filled(4, 0.0, fx.Float32)
@@ -473,7 +480,7 @@ def build_bwd_dq(topk_len, scale, pf=4, num_heads=None, pvpf=8):
             def _do(ks):
                 return do_packs[ks]
 
-            PF = pf  # KV-read prefetch depth (build param, tuned for large-topk pro).
+            PF = qk_prefetch  # KV-read prefetch depth (build param, tuned for large-topk pro).
             bvq = [_bv(k) for k in range_constexpr(PF)]
             for ks in range_constexpr(KS):
                 if ks + PF < KS:
@@ -543,7 +550,11 @@ def build_bwd_dq(topk_len, scale, pf=4, num_heads=None, pvpf=8):
                 ptr = buffer_ops.create_llvm_ptr(_raw(pv_base + fx.Int64(dt * 32)), address_space=3)
                 return _raw(Vec(rocdl.ds_read_tr16_b64(v4, ptr).result).bitcast(fx.Int16))
 
-            _PVPF = pvpf if (pvpf and ((num_heads is not None and num_heads > 64) or topk_len >= 512)) else 0
+            _PVPF = (
+                pv_prefetch
+                if (pv_prefetch and ((num_heads is not None and num_heads > 64) or topk_len >= 512))
+                else 0
+            )
             bvv_pf = [_bvv(dt) for dt in range_constexpr(_PVPF)] if const_expr(_PVPF) else None
 
             # dS = P*(dP - delta)*scale; when masked P=0 -> dS=0 (no explicit dP mask).
@@ -660,15 +671,15 @@ def build_bwd_dq(topk_len, scale, pf=4, num_heads=None, pvpf=8):
     return _attach(launch)
 
 
-def build_bwd_dq_pvk32(topk_len, scale, num_heads=None, pf=6, pvpf=8, db=1):
+def build_bwd_dq_pv2x(topk_len, scale, num_heads=None, qk_prefetch=6, pv_prefetch=8, double_buf=1):
     elem = fx.BFloat16
     D_LDS = 528
     NUM_TILES = (topk_len + TILE_K - 1) // TILE_K
     LDS_ELEMS = TILE_K * D_LDS
-    # db: cross-pair double-buffer (KVBUF=4). pair p writes LDS set (p%2); next pair writes the
+    # double_buf: cross-pair double-buffer (KVBUF=4). pair p writes LDS set (p%2); next pair writes the
     # OTHER set, so the post-PV WAR barrier is unnecessary (1 barrier/pair vs 2) -> -sync-latency.
-    KVBUF = 4 if db else 2
-    allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_dq_pvk32_smem")
+    KVBUF = 4 if double_buf else 2
+    allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_dq_pv2x_smem")
     kv_off = allocator._align(allocator.ptr, 16)
     mask_off = allocator._align(kv_off + KVBUF * LDS_ELEMS * 2, 16)
     allocator.ptr = allocator._align(mask_off + KVBUF * TILE_K * 4, 16)
@@ -803,11 +814,11 @@ def build_bwd_dq_pvk32(topk_len, scale, num_heads=None, pf=6, pvpf=8, db=1):
                     v8, lds_kv, [buf_off + lo * fx.Index(D_LDS) + fx.Index(ks * 32) + grp * fx.Index(8)]
                 )
 
-            bvq = [_bv(k) for k in range_constexpr(pf)]
+            bvq = [_bv(k) for k in range_constexpr(qk_prefetch)]
             NR = 4 if _QK4 else 2
             for ks in range_constexpr(KS):
-                if ks + pf < KS:
-                    bvq.append(_bv(ks + pf))
+                if ks + qk_prefetch < KS:
+                    bvq.append(_bv(ks + qk_prefetch))
                 r = ks % NR
                 accs[r] = _qkmma(_raw(bvq[ks]), q_packs[ks], accs[r])
                 accd[r] = _qkmma(_raw(bvq[ks]), do_packs[ks], accd[r])
@@ -890,8 +901,8 @@ def build_bwd_dq_pvk32(topk_len, scale, num_heads=None, pf=6, pvpf=8, db=1):
             idxn = iter_args[DT + 10]
             ta = p * fx.Index(2)
             tb = ta + fx.Index(1)
-            if const_expr(db):
-                # db: pair p writes LDS set (p%2); next pair writes the OTHER set (no WAR barrier).
+            if const_expr(double_buf):
+                # double_buf: pair p writes LDS set (p%2); next pair writes the OTHER set (no WAR barrier).
                 pmod = p % fx.Index(2)
                 ao = pmod * fx.Index(2 * LDS_ELEMS)
                 bo = ao + fx.Index(LDS_ELEMS)
@@ -929,14 +940,14 @@ def build_bwd_dq_pvk32(topk_len, scale, num_heads=None, pf=6, pvpf=8, db=1):
                 + fx.Index(kv_off)
             )
             new_dq = [None] * DT
-            trq = [v32(base_a, base_b, dt) for dt in range_constexpr(pvpf)]
+            trq = [v32(base_a, base_b, dt) for dt in range_constexpr(pv_prefetch)]
             for dt in range_constexpr(DT):
-                if dt + pvpf < DT:
-                    trq.append(v32(base_a, base_b, dt + pvpf))
+                if dt + pv_prefetch < DT:
+                    trq.append(v32(base_a, base_b, dt + pv_prefetch))
                 new_dq[dt] = _mma_agpr(trq[dt], pB, dq_acc[dt])
-            if const_expr(not db):
+            if const_expr(not double_buf):
                 # WAR barrier (single-buffer only): next pair reuses buf0/buf1 -> its gather_store
-                # must wait for this pair's PV tr16 reads to drain (else cross-wave race). db avoids
+                # must wait for this pair's PV tr16 reads to drain (else cross-wave race). double_buf avoids
                 # this by writing the OTHER set next pair.
                 gpu.barrier()
             loop_results = yield (list(new_dq) + list(kva_n) + list(kvb_n) + [idxn, idxn2, idxn3])
@@ -1000,10 +1011,10 @@ D_TILES = D_V // 16  # 32
 DT_PER_WAVE = D_TILES // WAVES  # 8
 
 
-# build_interm_rtr: REGISTER-transpose Q/dO (no Q/dO LDS) -> BD=512 at occ-2. Each WAVE owns
+# build_interm_regtr: REGISTER-transpose Q/dO (no Q/dO LDS) -> BD=512 at occ-2. Each WAVE owns
 # DT_PER_WAVE=8 contiguous d-tiles and loops all rank-tiles, holding only its 128 d of Q/dO
 # compact. A[m=d,k=h] is built once via ds_bpermute 16x16 transpose; dS/P stay LDS-staged.
-def build_interm_rtr(topk_len, num_heads, BD=512):
+def build_interm_regtr(topk_len, num_heads, BD=512):
     elem = fx.BFloat16
     R_CHUNK = topk_len
     KS16 = num_heads // 16  # h-blocks of 16 (flash 4, pro 8)
@@ -1024,7 +1035,7 @@ def build_interm_rtr(topk_len, num_heads, BD=512):
     # occupancy -> hides the mfma/read latency. Short R (R128) prefers DBUF2.
     # GSZ128 (pro cr0) doubles DS_LDS -> DBUF=1 to keep occ-2 (2WG within LDS cap).
     DBUF = 1 if (topk_len >= 192 or GSZ >= 128) else 2
-    allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_interm_rtr_smem")
+    allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_interm_regtr_smem")
     ds_off = allocator._align(allocator.ptr, 16)
     p_off = allocator._align(ds_off + DBUF * DS_LDS * 2, 16)
     allocator.ptr = allocator._align(p_off + DBUF * DS_LDS * 2, 16)
@@ -1250,8 +1261,10 @@ def build_interm_rtr(topk_len, num_heads, BD=512):
                 else:
                     b_ds = [tr_ks(ds_off + bs_b, fx.Index(rt), ks) for ks in range_constexpr(KS16)]
                     b_p = [tr_ks(p_off + bs_b, fx.Index(rt), ks) for ks in range_constexpr(KS16)]
-                    bds8 = [_c8(b_ds[2 * k2], b_ds[2 * k2 + 1]) for k2 in range_constexpr(KS16 // 2)]
-                    bp8 = [_c8(b_p[2 * k2], b_p[2 * k2 + 1]) for k2 in range_constexpr(KS16 // 2)]
+                    bds8 = [
+                        _concat_bf16_v8(b_ds[2 * k2], b_ds[2 * k2 + 1]) for k2 in range_constexpr(KS16 // 2)
+                    ]
+                    bp8 = [_concat_bf16_v8(b_p[2 * k2], b_p[2 * k2 + 1]) for k2 in range_constexpr(KS16 // 2)]
                 for u in range_constexpr(DTW):
                     if const_expr(_PRIO):
                         rocdl.s_setprio(1)
@@ -1336,16 +1349,16 @@ def build_interm_rtr(topk_len, num_heads, BD=512):
     return _attach(launch)
 
 
-def build_interm_blk(topk_len, num_heads, BD, qpad=16, spad=8):
+def build_interm_blocked(topk_len, num_heads, BD, qpad=16, spad=8):
     elem = fx.BFloat16
     R_CHUNK = topk_len
     KS16 = num_heads // 16
     DBLK = D_V // BD  # number of d-blocks (grid.y)
     DT_BLK = BD // 16  # d-tiles per block
-    _BLKPRIO = 1  # s_setprio(1) around blk mfma
-    # BLKSTACK (stacked-K, blk twin of rtr BSTACK): accumulate Q@dS + dO@P into ONE acc chain
-    # -> removes the 4 fp32 combine adds/output (blk is issue-bound). Gated to topk<=128 or
-    # topk>=512 (excludes R160 local-band). Only flash uses blk (pro is rtr).
+    _BLKPRIO = 1  # s_setprio(1) around blocked mfma
+    # BLKSTACK (stacked-K, blocked twin of regtr BSTACK): accumulate Q@dS + dO@P into ONE acc chain
+    # -> removes the 4 fp32 combine adds/output (blocked is issue-bound). Gated to topk<=128 or
+    # topk>=512 (excludes R160 local-band). Only flash uses blocked (pro is regtr).
     _BLKSTACK = 1 if (topk_len <= 128 or topk_len >= 512) else 0
     RGROUPS = R_CHUNK // 64  # rank-groups (each = 4 rank-tiles = 4 waves)
     # tr16 bank-pad: pad the LDS row stride so consecutive tr16 rows land in distinct banks
@@ -1360,7 +1373,7 @@ def build_interm_blk(topk_len, num_heads, BD, qpad=16, spad=8):
     QIT = QDATA8 // THREADS  # stage iters (must divide)
     SIT = SDATA8 // THREADS
 
-    allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_interm_blk_smem")
+    allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_interm_blocked_smem")
     q_off = allocator._align(allocator.ptr, 16)
     do_off = allocator._align(q_off + Q_LDS * 2, 16)
     ds_off = allocator._align(do_off + Q_LDS * 2, 16)
@@ -1578,10 +1591,10 @@ def _store_dkv_bf16(dkv_rsrc, col_base, raw_lo, raw_hi):
     )
 
 
-def build_gather(nw=8):
+def build_gather(num_waves=8):
     elem = fx.BFloat16
-    THREADS = nw * LANES
-    RED_ELEMS = nw * D_V  # LDS: [NW][512] fp32 partials
+    THREADS = num_waves * LANES
+    RED_ELEMS = num_waves * D_V  # LDS: [NW][512] fp32 partials
 
     allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_gather_smem")
     red_off = allocator._align(allocator.ptr, 16)
@@ -1623,7 +1636,7 @@ def build_gather(nw=8):
         acc_hi = Vec.filled(4, 0.0, fx.Float32)
 
         loop_res = [acc_lo, acc_hi]
-        for e, iter_args in range(start + wave, end, fx.Index(nw), init=[acc_lo, acc_hi]):
+        for e, iter_args in range(start + wave, end, fx.Index(num_waves), init=[acc_lo, acc_hi]):
             entry = fx.Index(fx.Int32(buffer_ops.buffer_load(invdata_rsrc, e, vec_width=1, dtype=fx.Int32)))
             i_reb = make_bf16_rebased_rsrc(Interm, entry * fx.Index(D_V), fx.Index(D_V * 2))
             # single vec8 load (dwordx4) of this lane's 8 contiguous d-cols, split lo/hi ->
@@ -1640,11 +1653,11 @@ def build_gather(nw=8):
         Vec(loop_res[1]).store(lds_red, [wave * fx.Index(D_V) + col_lo + fx.Index(4)])
         gpu.barrier()
 
-        if nw > 1:
+        if num_waves > 1:
             if wave == fx.Index(0):
                 s_lo = Vec(loop_res[0])
                 s_hi = Vec(loop_res[1])
-                for w in range_constexpr(1, nw):
+                for w in range_constexpr(1, num_waves):
                     s_lo = s_lo + Vec.load(v4f_ty, lds_red, [fx.Index(w * D_V) + col_lo])
                     s_hi = s_hi + Vec.load(v4f_ty, lds_red, [fx.Index(w * D_V) + col_lo + fx.Index(4)])
                 _store_dkv_bf16(dkv_rsrc, kv * fx.Index(DQK) + col_lo, _raw(s_lo), _raw(s_hi))
@@ -1663,9 +1676,9 @@ def build_gather(nw=8):
     return _attach(launch)
 
 
-def build_partial_reduce(ns):
-    """Sum Partial[pidx, 0..ns-1, :D_V] -> dKV[KV_BASE+pidx, :D_V] (f32). One WG per
-    pool kv, 64 lanes x EPL cols. Companion pass-2 for build_gather_pool (ns-split)."""
+def build_partial_reduce(num_splits):
+    """Sum Partial[pidx, 0..num_splits-1, :D_V] -> dKV[KV_BASE+pidx, :D_V] (f32). One WG per
+    pool kv, 64 lanes x EPL cols. Companion pass-2 for build_gather_pool (num_splits-split)."""
 
     def _b():
         @flyc.kernel(known_block_size=[LANES, 1, 1])
@@ -1677,18 +1690,18 @@ def build_partial_reduce(ns):
             part_rsrc = buffer_ops.create_buffer_resource(
                 Partial,
                 max_size=False,
-                num_records_bytes=_raw(fx.Index(NPOOL) * fx.Index(ns) * fx.Index(D_V * 4)),
+                num_records_bytes=_raw(fx.Index(NPOOL) * fx.Index(num_splits) * fx.Index(D_V * 4)),
             )
             dkv_rsrc = buffer_ops.create_buffer_resource(
                 dKV, max_size=False, num_records_bytes=_raw(fx.Index(NKV) * fx.Index(DQK * 2))
             )  # bf16 dKV
-            base0 = (pidx * fx.Index(ns)) * fx.Index(D_V)
+            base0 = (pidx * fx.Index(num_splits)) * fx.Index(D_V)
             acc_lo = Vec(buffer_ops.buffer_load(part_rsrc, base0 + col_lo, vec_width=4, dtype=fx.Float32))
             acc_hi = Vec(
                 buffer_ops.buffer_load(part_rsrc, base0 + col_lo + fx.Index(4), vec_width=4, dtype=fx.Float32)
             )
-            for sx in range_constexpr(1, ns):
-                b = (pidx * fx.Index(ns) + fx.Index(sx)) * fx.Index(D_V)
+            for sx in range_constexpr(1, num_splits):
+                b = (pidx * fx.Index(num_splits) + fx.Index(sx)) * fx.Index(D_V)
                 acc_lo = acc_lo + Vec(
                     buffer_ops.buffer_load(part_rsrc, b + col_lo, vec_width=4, dtype=fx.Float32)
                 )
@@ -1708,15 +1721,15 @@ def build_partial_reduce(ns):
     return _b()
 
 
-def build_gather_banded(nw=8, rc=None):
+def build_gather_banded(num_waves=8, row_chunk=None):
     """Closed-form banded gather for the SWA local window (W=128); the inverse window map
     is closed-form so the whole CSR path is skipped. For kv=j, flat interm row =
-    (j+local)*RC + (W-1-local), count = min(W, T-j); ``rc`` = interm row stride (R_CHUNK)."""
+    (j+local)*RC + (W-1-local), count = min(W, T-j); ``row_chunk`` = interm row stride (R_CHUNK)."""
     elem = fx.BFloat16
     W = 128
-    RC = W if rc is None else rc  # interm row stride (ranks per token)
-    THREADS = nw * LANES
-    RED_ELEMS = nw * D_V
+    RC = W if row_chunk is None else row_chunk  # interm row stride (ranks per token)
+    THREADS = num_waves * LANES
+    RED_ELEMS = num_waves * D_V
 
     allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_gather_banded_smem")
     red_off = allocator._align(allocator.ptr, 16)
@@ -1750,7 +1763,7 @@ def build_gather_banded(nw=8, rc=None):
         acc_hi = Vec.filled(4, 0.0, fx.Float32)
 
         loop_res = [acc_lo, acc_hi]
-        for local, iter_args in range(wave, count, fx.Index(nw), init=[acc_lo, acc_hi]):
+        for local, iter_args in range(wave, count, fx.Index(num_waves), init=[acc_lo, acc_hi]):
             a_lo = Vec(iter_args[0])
             a_hi = Vec(iter_args[1])
             entry = (kv + local) * fx.Index(RC) + fx.Index(W - 1) - local
@@ -1766,11 +1779,11 @@ def build_gather_banded(nw=8, rc=None):
         Vec(loop_res[1]).store(lds_red, [wave * fx.Index(D_V) + col_lo + fx.Index(4)])
         gpu.barrier()
 
-        if nw > 1:
+        if num_waves > 1:
             if wave == fx.Index(0):
                 s_lo = Vec(loop_res[0])
                 s_hi = Vec(loop_res[1])
-                for w in range_constexpr(1, nw):
+                for w in range_constexpr(1, num_waves):
                     s_lo = s_lo + Vec.load(v4f_ty, lds_red, [fx.Index(w * D_V) + col_lo])
                     s_hi = s_hi + Vec.load(v4f_ty, lds_red, [fx.Index(w * D_V) + col_lo + fx.Index(4)])
                 _store_dkv_bf16(dkv_rsrc, kv * fx.Index(DQK) + col_lo, _raw(s_lo), _raw(s_hi))
@@ -1789,13 +1802,13 @@ def build_gather_banded(nw=8, rc=None):
     return _attach(launch)
 
 
-def build_gather_pool(nw=16, ns=32):
+def build_gather_pool(num_waves=16, num_splits=32):
     """Closed-form pool gather for cr=128 (deterministic causal HCA pool): token i attends
     pool block b (kv=T+b) iff i >= (b+1)*cr_pool - 1 and visibility is monotone in b, so
     column b == block b == kv gives a closed-form inverse. Same NS-split + LDS reduce."""
-    THREADS = nw * LANES
-    RED_ELEMS = nw * D_V
-    GW = ns * nw
+    THREADS = num_waves * LANES
+    RED_ELEMS = num_waves * D_V
+    GW = num_splits * num_waves
     elem = fx.BFloat16
 
     allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="mla_bwd_gather_pool_smem")
@@ -1821,7 +1834,7 @@ def build_gather_pool(nw=16, ns=32):
         tid = fx.Index(gpu.thread_idx.x)
         wave = tid // fx.Index(LANES)
         lane = tid % fx.Index(LANES)
-        gw = s * fx.Index(nw) + wave
+        gw = s * fx.Index(num_waves) + wave
 
         interm_rsrc = buffer_ops.create_buffer_resource(
             Interm, max_size=False, num_records_bytes=_raw(fx.Index(N_TR) * fx.Index(D_V * 2))
@@ -1829,7 +1842,7 @@ def build_gather_pool(nw=16, ns=32):
         part_rsrc = buffer_ops.create_buffer_resource(
             Partial,
             max_size=False,
-            num_records_bytes=_raw(fx.Index(NPOOL) * fx.Index(ns) * fx.Index(D_V * 4)),
+            num_records_bytes=_raw(fx.Index(NPOOL) * fx.Index(num_splits) * fx.Index(D_V * 4)),
         )
 
         # start_i(b) = (b+1)*cr_pool - 1 (first token that sees block b); count = T - start_i
@@ -1862,10 +1875,10 @@ def build_gather_pool(nw=16, ns=32):
         if wave == fx.Index(0):
             s_lo = Vec(loop_res[0])
             s_hi = Vec(loop_res[1])
-            for w in range_constexpr(1, nw):
+            for w in range_constexpr(1, num_waves):
                 s_lo = s_lo + Vec.load(v4f_ty, lds_red, [fx.Index(w * D_V) + col_lo])
                 s_hi = s_hi + Vec.load(v4f_ty, lds_red, [fx.Index(w * D_V) + col_lo + fx.Index(4)])
-            poff = (pidx * fx.Index(ns) + s) * fx.Index(D_V)
+            poff = (pidx * fx.Index(num_splits) + s) * fx.Index(D_V)
             buffer_ops.buffer_store(
                 _raw(s_lo), part_rsrc, (poff + col_lo) * fx.Index(4), offset_is_bytes=True
             )
@@ -1879,7 +1892,7 @@ def build_gather_pool(nw=16, ns=32):
         with ir.InsertionPoint(CompilationContext.get_current().gpu_module_body):
             allocator.finalize()
         k_fn(Interm, Partial, NKV, N_TR, T, NPOOL, CR_POOL, R_CHUNK, R_OFF).launch(
-            grid=(fx.Index(NPOOL), ns, 1), block=(THREADS, 1, 1), stream=stream
+            grid=(fx.Index(NPOOL), num_splits, 1), block=(THREADS, 1, 1), stream=stream
         )
 
     return _attach(launch)
@@ -2185,8 +2198,7 @@ def build_bwd_fused(topk_len, scale, num_heads=64):
                 )
 
                 # hand dS/P to LDS scratch [kt][head_A][kv=grp*4+i] for the interm head-contraction.
-                # (Packing the 4 contiguous ranks into one v4 dwordx2 store was measured -3.5%
-                # slower: the single-bf16 stores pipeline better and the v4 pack adds VALU.)
+                # (Single-bf16 stores pipeline better than a v4-packed store, which adds VALU.)
                 base_ds = fx.Index(kt * num_heads * TILE_K) + head_A * fx.Index(TILE_K) + grp * fx.Index(4)
                 for i in range_constexpr(4):
                     Vec.from_elements([fx.BFloat16(_raw(dsvals[i]))], elem).store(
@@ -2221,26 +2233,23 @@ def build_bwd_fused(topk_len, scale, num_heads=64):
             gpu.barrier()  # all KB tiles' dS/P visible before the interm phase
 
             # ============ interm phase: d-block outer, kv-tile inner (reuse staged Q/dO) ======
-            for db in range_constexpr(NDB):
+            for double_buf in range_constexpr(NDB):
                 # stage one 128-d block of Q/dO from registers to LDS (once per KB tiles).
                 for kl in range_constexpr(KSB):
-                    ks = db * KSB + kl
+                    ks = double_buf * KSB + kl
                     d_local = fx.Index(kl * 32) + grp * fx.Index(8)
                     Vec(q_packs[ks]).store(lds_qb, [head_A * fx.Index(BD_LDSB) + d_local])
                     Vec(do_packs[ks]).store(lds_dob, [head_A * fx.Index(BD_LDSB) + d_local])
                 gpu.barrier()  # Q/dO d-block visible
 
-                # Hoist the Q/dO transpose reads (A operands) OUT of the kt loop: aq/ao index
-                # only (d-tile, ks), NOT kt, so they are identical across all KB kv-tiles. The
-                # kt loop is fully unrolled and the compiler does not CSE these LDS reads, so
-                # without hoisting each aq/ao is re-read KB times (the dominant tr16 traffic on
-                # the LDS-read-bound interm phase). Read once per d-block, reuse across kt
-                # (isolated fused: flash cr128 -3%, cr0 flat; tr16 reads 752->576, VGPR 388->384).
-                # (Staging 2 d-blocks at once to also amortize the dS/P reads was measured flat/
-                # worse: the extra held aq/ao registers offset the fewer reads at occ-1.)
+                # Hoist the Q/dO transpose reads (A operands) OUT of the kt loop: aq/ao index only
+                # (d-tile, ks), not kt, so they are identical across all KB kv-tiles. The unrolled
+                # kt loop is not CSE'd by the compiler, so without hoisting each aq/ao is re-read KB
+                # times (the dominant tr16 traffic on the LDS-read-bound interm phase). Read once per
+                # d-block, reuse across kt. (Staging 2 d-blocks at once offsets the win at occ-1.)
                 aq_h = [
                     [
-                        _c8(
+                        _concat_bf16_v8(
                             tr_h(qb_off, fx.Index(BD_LDSB), wave + fx.Index(u * WAVES), 2 * k2),
                             tr_h(qb_off, fx.Index(BD_LDSB), wave + fx.Index(u * WAVES), 2 * k2 + 1),
                         )
@@ -2250,7 +2259,7 @@ def build_bwd_fused(topk_len, scale, num_heads=64):
                 ]
                 ao_h = [
                     [
-                        _c8(
+                        _concat_bf16_v8(
                             tr_h(dob_off, fx.Index(BD_LDSB), wave + fx.Index(u * WAVES), 2 * k2),
                             tr_h(dob_off, fx.Index(BD_LDSB), wave + fx.Index(u * WAVES), 2 * k2 + 1),
                         )
@@ -2264,23 +2273,23 @@ def build_bwd_fused(topk_len, scale, num_heads=64):
                     ds_off_kt = ds_off + kt * num_heads * TILE_K * 2
                     pp_off_kt = pp_off + kt * num_heads * TILE_K * 2
                     # The interm B operands (dS/P) index only (kt, ks), not the d-tile, so their
-                    # tr16 reads are hoisted once per (db, kt) and reused across the d-tile loop.
+                    # tr16 reads are hoisted once per (double_buf, kt) and reused across the d-tile loop.
                     bd_h = [
-                        _c8(
+                        _concat_bf16_v8(
                             tr_h(ds_off_kt, fx.Index(TILE_K), fx.Index(0), 2 * k2),
                             tr_h(ds_off_kt, fx.Index(TILE_K), fx.Index(0), 2 * k2 + 1),
                         )
                         for k2 in range_constexpr(KSH // 2)
                     ]
                     bp_h = [
-                        _c8(
+                        _concat_bf16_v8(
                             tr_h(pp_off_kt, fx.Index(TILE_K), fx.Index(0), 2 * k2),
                             tr_h(pp_off_kt, fx.Index(TILE_K), fx.Index(0), 2 * k2 + 1),
                         )
                         for k2 in range_constexpr(KSH // 2)
                     ]
                     for u in range_constexpr(DUW):
-                        dt = db * (DT // NDB) + wave + fx.Index(u * WAVES)  # global d-tile
+                        dt = double_buf * (DT // NDB) + wave + fx.Index(u * WAVES)  # global d-tile
                         if const_expr(interm_chains == 3):
                             # K=32 (halved MFMA count) + 2 independent iacc chains (Q@dS, dO@P)
                             # -> 2-way ILP hides the mfma RAW latency on this head-contract GEMM.
@@ -2398,11 +2407,11 @@ def _get_dq(topk_len, scale, num_heads=None):
     if fn is None:
         # PV-K32: per-16 QK/softmax kept, PV batches 2 tiles into mfma_16x16x32 with direct-v8
         # operands. Both dQ kernels pin dq_acc in AGPR via inline-asm. Threshold 384 (not 512):
-        # build_bwd_dq races at TOPK=384; the race-free pvk32 path handles any even tile count.
+        # build_bwd_dq races at TOPK=384; the race-free pv2x path handles any even tile count.
         # Kept coupled with the wrapper's dq_folds_delta threshold.
         if topk_len >= 384 and topk_len % 32 == 0:
-            # db+pf4: cross-pair double-buffer (1 barrier/pair) + QK prefetch depth 4 -> +3.8% pro cr4.
-            fn = build_bwd_dq_pvk32(topk_len, float(scale), num_heads=num_heads, pf=4, db=1)
+            # cross-pair double-buffer (1 barrier/pair) + QK prefetch depth 4.
+            fn = build_bwd_dq_pv2x(topk_len, float(scale), num_heads=num_heads, qk_prefetch=4, double_buf=1)
         else:
             fn = build_bwd_dq(topk_len, float(scale), num_heads=num_heads)
         _DQ_CACHE[key] = fn
@@ -2436,20 +2445,20 @@ _GATHER_CACHE: dict = {}
 def _get_gather():
     fn = _GATHER_CACHE.get("fn")
     if fn is None:
-        # nw=16: the HCA cr128 pool-entry-0 CSR list is ~4000 long and one WG per kv walked it
+        # num_waves=16: the HCA cr128 pool-entry-0 CSR list is ~4000 long and one WG per kv walked it
         # serially; 16 waves split the list. cr0/cr4 (balanced/BW-bound) neutral.
         fn = build_gather(16)
         _GATHER_CACHE["fn"] = fn
     return fn
 
 
-def _get_gather_banded(rc=None):
-    # rc = interm row stride (R_CHUNK). None -> W=128 (cr0). cr128 local band uses rc=192
+def _get_gather_banded(row_chunk=None):
+    # row_chunk = interm row stride (R_CHUNK). None -> W=128 (cr0). cr128 local band uses row_chunk=192
     # (the padded topk width) since the local ranks 0..127 live in a wider interm row.
-    key = ("banded", rc)
+    key = ("banded", row_chunk)
     fn = _GATHER_CACHE.get(key)
     if fn is None:
-        fn = build_gather_banded(8, rc=rc)
+        fn = build_gather_banded(8, row_chunk=row_chunk)
         _GATHER_CACHE[key] = fn
     return fn
 
@@ -2474,19 +2483,19 @@ _INTERM_CACHE: dict = {}
 
 
 def _get_interm(topk_len, num_heads):
-    # rtr (register-transpose Q/dO, no Q/dO LDS -> BD256) for pro (num_heads>64); flash (H<=64)
-    # uses blk (tuned wide BD already minimizes re-read; rtr's transpose overhead not amortized
+    # regtr (register-transpose Q/dO, no Q/dO LDS -> BD256) for pro (num_heads>64); flash (H<=64)
+    # uses blocked (tuned wide BD already minimizes re-read; regtr's transpose overhead not amortized
     # at H=64).
-    use_rtr = int(num_heads) > 64
-    mode = "rtr" if use_rtr else "blk"
+    use_regtr = int(num_heads) > 64
+    mode = "regtr" if use_regtr else "blocked"
     key = (topk_len, num_heads, mode)
     fn = _INTERM_CACHE.get(key)
     if fn is None:
-        if mode == "rtr":
+        if mode == "regtr":
             # interm stays baseline (functional rocdl.mfma): inline-asm in-place MFMA breaks det
             # on interm's per-output fresh accumulator (the AGPR win only holds for dQ's
             # loop-carried acc).
-            fn = build_interm_rtr(topk_len, num_heads, 256)
+            fn = build_interm_regtr(topk_len, num_heads, 256)
         else:
             # BD is R_CHUNK-dependent (interm is latency-bound). flash (H<=64): wider BD reduces
             # the d-block count -> less dS/P HBM re-read; pro (H=128): BD128 (BD256=176KB > cap).
@@ -2498,7 +2507,7 @@ def _get_interm(topk_len, num_heads):
                 # pro (H=128) BD128 beats BD64 at every R: the read-batching makes BD128's fewer
                 # d-blocks (less dS/P re-read) dominate BD64's 2WG occupancy. BD256 = 176KB > cap.
                 bd = 128
-            fn = build_interm_blk(topk_len, num_heads, bd)
+            fn = build_interm_blocked(topk_len, num_heads, bd)
         _INTERM_CACHE[key] = fn
     return fn
 
@@ -2537,7 +2546,7 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
 
     # delta = rowsum(O*dO): fp32 accumulation with a bf16 product (avoids materializing two
     # fp32 copies of O/dO); SNR-safe. The fused path (flash small-topk) folds this compute into
-    # the fused kernel (dO already resident there) so the ~89us standalone delta drops off the
+    # the fused kernel (dO already resident there) so the standalone delta drops off the
     # wall; the non-fused pro path keeps the standalone kernel (dQ is occ-1 VGPR-locked).
     assert o.shape[-1] == D and o.is_contiguous()
     # do_lora dedup: delta and the dQ kernel both need a contiguous [T,H,512] copy of the lora
@@ -2547,7 +2556,7 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     use_fused = int(num_heads) <= 64 and int(topk) <= 256
     # The fused kernel (flash small-topk) AND build_bwd_dq (pro cr0/cr128, topk<384) both fold the
     # delta compute inline (dO already resident), dropping the standalone delta off the wall. The
-    # pvk32 dQ path (cr4, topk>=384) needs the standalone kernel. Threshold 384 kept identical to
+    # pv2x dQ path (cr4, topk>=384) needs the standalone kernel. Threshold 384 kept identical to
     # `_get_dq` so the delta path stays consistent with the dQ routing.
     dq_folds_delta = (not use_fused) and (int(topk) < 384)
     if not (use_fused or dq_folds_delta):
@@ -2560,11 +2569,7 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
             int(total_tokens * num_heads),
             _dstream,
         )
-        _dc = _DELTA_CACHE.get("c")
-        if _dc is None:
-            _dc = _get_delta().compile(*_dargs)
-            _DELTA_CACHE["c"] = _dc
-        _dc(*_dargs)
+        _cached_run(_DELTA_CACHE, "c", _get_delta(), _dargs)
     # The dQ/fused kernels write ALL D_V=512 lora cols for every (token,head) AND
     # zero the 64 rope cols (512..575) in-kernel (matches triton's zeroed rope),
     # folding away the strided host dq[..., D:].zero_().
@@ -2578,7 +2583,7 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
         chunk_P = torch.empty(total_tokens, num_heads, topk, dtype=torch.bfloat16, device=q.device)
         # ---- flydsl dQ (also produces dS / P for the dKV-interm kernel) ----
         fn = _get_dq(topk, scale, num_heads)
-        # build_bwd_dq (topk<512) folds delta inline -> takes O as an extra input; pvk32 does not.
+        # build_bwd_dq (topk<512) folds delta inline -> takes O as an extra input; pv2x does not.
         if dq_folds_delta:
             args = (
                 q,
@@ -2612,15 +2617,10 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
                 int(num_kv),
                 stream,
             )
-        ckey = ("c", topk, float(scale))
-        compiled = _DQ_CACHE.get(ckey)
-        if compiled is None:
-            compiled = fn.compile(*args)
-            _DQ_CACHE[ckey] = compiled
-        compiled(*args)
+        _cached_run(_DQ_CACHE, ("c", topk, float(scale)), fn, args)
 
     # interm only ever writes/reads the D_V=512 lora cols (rope cols are dead) -> allocate it
-    # D_V-wide (not d_qk=576): cuts the dominant dKV-interm HBM write AND the gather read by 11%.
+    # D_V-wide (not d_qk=576): cuts the dominant dKV-interm HBM write AND the gather read.
     R_CHUNK = topk
     interm = torch.empty(total_tokens, R_CHUNK, D, dtype=torch.bfloat16, device=q.device)
     # dKV is written directly in bf16 by the gather kernels (reduction stays fp32 in-register,
@@ -2628,7 +2628,7 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     # unreferenced by a query.
     dkv = torch.zeros(num_kv, d_qk, dtype=kv.dtype, device=q.device)
 
-    # ---- flydsl dKV-interm: register-transpose (rtr) for pro, 2D-blocked (blk) for flash.
+    # ---- flydsl dKV-interm: register-transpose (regtr) for pro, 2D-blocked (blocked) for flash.
     if use_fused:
         # one kernel produced dq + interm already (dS/P via LDS, no chunk_dS/P HBM).
         ffn = _get_fused(int(topk), float(scale), int(num_heads))
@@ -2647,21 +2647,11 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
             int(num_kv),
             stream,
         )
-        fckey = ("fc", int(topk), float(scale), int(num_heads))
-        fc = _DQ_CACHE.get(fckey)
-        if fc is None:
-            fc = ffn.compile(*fargs)
-            _DQ_CACHE[fckey] = fc
-        fc(*fargs)
+        _cached_run(_DQ_CACHE, ("fc", int(topk), float(scale), int(num_heads)), ffn, fargs)
     else:
         ifn = _get_interm(int(topk), int(num_heads))
         iargs = (q, do_lora, chunk_dS, chunk_P, interm, int(total_tokens), stream)
-        ickey = ("c", int(topk), int(num_heads))
-        icompiled = _INTERM_CACHE.get(ickey)
-        if icompiled is None:
-            icompiled = ifn.compile(*iargs)
-            _INTERM_CACHE[ickey] = icompiled
-        icompiled(*iargs)
+        _cached_run(_INTERM_CACHE, ("c", int(topk), int(num_heads)), ifn, iargs)
 
     # cr=0 (pure SWA): num_kv==T and topk==W=128 -> use the closed-form banded gather
     # (skips the CSR argsort/bincount/cumsum + InvPtr/InvData buffers entirely; the
@@ -2680,22 +2670,14 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
     )
     if is_cr0:
         _gargs = (interm.reshape(-1, D), dkv, int(num_kv), int(total_tokens), stream)
-        _gc = _GATHER_CACHE.get("cb")
-        if _gc is None:
-            _gc = _get_gather_banded().compile(*_gargs)
-            _GATHER_CACHE["cb"] = _gc
-        _gc(*_gargs)
+        _cached_run(_GATHER_CACHE, "cb", _get_gather_banded(), _gargs)
     elif is_cr128:
         # cr=128 (HCA): both the local SWA band and the pool are deterministic, so both invert
-        # closed-form. (1) banded-local gather (rc=R_CHUNK) for kv 0..T-1. (2) closed-form pool
+        # closed-form. (1) banded-local gather (row_chunk=R_CHUNK) for kv 0..T-1. (2) closed-form pool
         # gather for kv>=T. Local and pool kv write disjoint dkv rows -> no conflict.
         _bargs = (interm.reshape(-1, D), dkv, int(num_kv), int(total_tokens), stream)
         _bkey = ("cb128", int(R_CHUNK))
-        _bc = _GATHER_CACHE.get(_bkey)
-        if _bc is None:
-            _bc = _get_gather_banded(rc=int(R_CHUNK)).compile(*_bargs)
-            _GATHER_CACHE[_bkey] = _bc
-        _bc(*_bargs)
+        _cached_run(_GATHER_CACHE, _bkey, _get_gather_banded(row_chunk=int(R_CHUNK)), _bargs)
 
         # The REAL pool occupies ranks 128..128+P-1 (P = npool); ranks 128+P..R_CHUNK are
         # -1 padding (topk padded to a multiple of 64).
@@ -2718,17 +2700,9 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
             128,
             stream,
         )
-        _pc = _GATHER_CACHE.get("cpool")
-        if _pc is None:
-            _pc = _get_gather_pool().compile(*_pargs)
-            _GATHER_CACHE["cpool"] = _pc
-        _pc(*_pargs)
+        _cached_run(_GATHER_CACHE, "cpool", _get_gather_pool(), _pargs)
         _rargs = (partial.reshape(-1, D), dkv, int(num_kv), int(total_tokens), int(npool), stream)
-        _rc = _GATHER_CACHE.get("cr")
-        if _rc is None:
-            _rc = _get_partial_reduce().compile(*_rargs)
-            _GATHER_CACHE["cr"] = _rc
-        _rc(*_rargs)
+        _cached_run(_GATHER_CACHE, "cr", _get_partial_reduce(), _rargs)
     else:
         # cr4: full CSR single-WG gather. CSR inverted-topk scatter of interm -> dkv[:, :D]
         # (bf16 cast in-kernel), rope cols untouched. The NS-split loses here: cr4's long pool
@@ -2743,11 +2717,7 @@ def sparse_mla_bwd_v4_flydsl(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
             int(total_tokens * R_CHUNK),
             stream,
         )
-        _gc = _GATHER_CACHE.get("c")
-        if _gc is None:
-            _gc = _get_gather().compile(*_gargs)
-            _GATHER_CACHE["c"] = _gc
-        _gc(*_gargs)
+        _cached_run(_GATHER_CACHE, "c", _get_gather(), _gargs)
 
     d_sink = None
     if has_sink:
