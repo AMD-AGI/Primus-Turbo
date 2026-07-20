@@ -242,6 +242,7 @@ def _make_dual_struct(need_scr):
 def _emit_dual_body(
     row_rht, col_rht, row_2d, col_2d, lds, tid, X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, bid,
     gx=0, gro=0, grsc=0, gco=0, gcsc=0, gmul=1, padded=False, ncblk=None, CP=None, RP=None,
+    col_locality=False,
 ):
     """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for
     block ``bid``. ``row_2d``/``col_2d`` select the C++ ``USE_2D_BLOCK`` amax
@@ -262,8 +263,19 @@ def _emit_dual_body(
         ncblk = C // _TC
     cpad = CP if padded else C  # row-out column extent (K_pad)
     rpad = RP if padded else R  # col-out column extent (N_pad)
-    rblk = bid // ncblk
-    cblk = bid % ncblk
+    # Block order picks which output's partial stores L2 gets to combine:
+    #  - col_locality (C>R, e.g. down-proj): row-tile-fastest, so the ~R/_TR blocks
+    #    that write the SAME col-out rows (fixed gcol=cblk*_TC) at different rblk
+    #    column-bands run back-to-back -> L2 merges their 32B transpose stores into
+    #    full lines (kills the ~2x write-amp that made large-C shapes write-bound).
+    #  - else (R>=C, e.g. gate/up, square): col-tile-fastest keeps row-out coalesced.
+    if col_locality:
+        nrblk = R // _TR
+        cblk = bid // nrblk
+        rblk = bid % nrblk
+    else:
+        rblk = bid // ncblk
+        cblk = bid % ncblk
     r0 = rblk * _TR
     c0w = cblk * _TCW  # i32-word base along C
 
@@ -422,9 +434,11 @@ def _emit_dual_body(
             buffer_ops.buffer_store(arith.trunci(T.i8, cbiased & 0xFF), cscrsrc, csoff)
 
 
-def _build_dual_kernel(row_rht, col_rht, row_2d=False, col_2d=False):
+def _build_dual_kernel(row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False):
     """Single-recipe fused LDS dual (one coalesced 32x256 tile load feeds both the
-    rowwise and colwise-transpose casts). Thin wrapper over ``_emit_dual_body``."""
+    rowwise and colwise-transpose casts). Thin wrapper over ``_emit_dual_body``.
+    ``col_locality`` (set for C>R shapes) flips the block order to combine the
+    transpose stores; see ``_emit_dual_body``."""
     _DualSS = _make_dual_struct(bool(row_2d or col_2d))
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
@@ -454,13 +468,14 @@ def _build_dual_kernel(row_rht, col_rht, row_2d=False, col_2d=False):
             R,
             C,
             fx.block_idx.x,
+            col_locality=col_locality,
         )
 
     return _dual_kernel
 
 
-def _build_dual_launch(row_rht, col_rht, row_2d=False, col_2d=False):
-    kern = _build_dual_kernel(row_rht, col_rht, row_2d, col_2d)
+def _build_dual_launch(row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False):
+    kern = _build_dual_kernel(row_rht, col_rht, row_2d, col_2d, col_locality)
 
     @flyc.jit
     def _dual_launch(
@@ -759,10 +774,11 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False):
     """Return (compiled_fn, grid_x) for the fused dual at
     (R, C, row_rht, col_rht, row_2d, col_2d).
     Requires R % 128 == 0 and C % 256 == 0 (no scale/output padding)."""
-    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d))
+    col_locality = int(C) > int(R)  # C>R (down-proj): combine transpose stores
+    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality)
     raw = _DUAL_LAUNCH.get(lk)
     if raw is None:
-        raw = _build_dual_launch(*lk)
+        raw = _build_dual_launch(bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality)
         _DUAL_LAUNCH[lk] = raw
     key = (int(R), int(C), bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d))
     ent = _DUAL_COMPILED.get(key)
@@ -786,7 +802,7 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False):
 # blocks -> fills the GPU even for small per-expert N, where the 2D dense kernel is
 # occupancy-starved and drops to ~2.5 TB/s). Reuses _emit_dual_body per-tile with
 # per-expert base offsets; SRDs cover the whole 3D (gmul=G). ----
-def _build_dual3_kernel(row_rht, col_rht, row_2d=False, col_2d=False, padded=False):
+def _build_dual3_kernel(row_rht, col_rht, row_2d=False, col_2d=False, padded=False, col_locality=False):
     _DualSS = _make_dual_struct(bool(row_2d or col_2d))
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
@@ -815,14 +831,14 @@ def _build_dual3_kernel(row_rht, col_rht, row_2d=False, col_2d=False, padded=Fal
             X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, lbid,
             gx=g * (R * (C >> 1)), gro=g * (R * (cpad >> 3)), grsc=g * (R * (cpad >> 5)),
             gco=g * (C * (rpad >> 3)), gcsc=g * (C * (rpad >> 5)), gmul=G,
-            padded=padded, ncblk=ncblk, CP=CP, RP=RP,
+            padded=padded, ncblk=ncblk, CP=CP, RP=RP, col_locality=col_locality,
         )
 
     return _dual3_kernel
 
 
-def _build_dual3_launch(row_rht, col_rht, row_2d=False, col_2d=False, padded=False):
-    kern = _build_dual3_kernel(row_rht, col_rht, row_2d, col_2d, padded)
+def _build_dual3_launch(row_rht, col_rht, row_2d=False, col_2d=False, padded=False, col_locality=False):
+    kern = _build_dual3_kernel(row_rht, col_rht, row_2d, col_2d, padded, col_locality)
 
     @flyc.jit
     def _dual3_launch(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, grid_x, stream):
@@ -861,10 +877,11 @@ def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False):
     Kp = ((K + 127) // 128) * 128
     Np = ((N + 127) // 128) * 128
     padded = (K % _TC != 0) or (N % 128 != 0)
-    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded)
+    col_locality = int(K) > int(N)  # K>N: combine transpose stores (col-out)
+    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded, col_locality)
     raw = _DUAL3_LAUNCH.get(lk)
     if raw is None:
-        raw = _build_dual3_launch(bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded)
+        raw = _build_dual3_launch(bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded, col_locality)
         _DUAL3_LAUNCH[lk] = raw
     key = (int(N), int(K), int(G), *lk)
     ent = _DUAL3_COMPILED.get(key)
