@@ -4,4 +4,5 @@
 # See LICENSE for license information.
 ###############################################################################
 
+from .mega_moe_fp8 import *
 from .token_dispatcher import *
