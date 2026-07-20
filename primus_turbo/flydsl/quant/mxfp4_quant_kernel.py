@@ -596,7 +596,7 @@ _DUAL2_COMPILED = {}
 
 
 def _grid_of(R, C):
-    return (R // 64) * (C // 256)
+    return (R // _TR) * (C // _TC)
 
 
 def get_dual2_cast(Ra, Ca, Rb, Cb, recipes):
@@ -774,7 +774,7 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False):
         rs = torch.zeros((R, C // 32), dtype=torch.uint8, device="cuda")
         co = torch.zeros((C, R // 8), dtype=torch.int32, device="cuda")
         cs = torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda")
-        grid_x = (R // 64) * (C // 256)
+        grid_x = (R // _TR) * (C // _TC)
         stream = torch.cuda.current_stream()
         fn = flyc.compile(raw, x, ro, rs, co, cs, R, C, grid_x, stream)
         ent = (fn, grid_x)
