@@ -64,13 +64,23 @@
   - 性能:T=8192 fused ≈ 2.22–2.52 ms @ ~1600–1840 TFLOPS(和源 repo 报的 fp8 fused ~2.56ms 一致);
     T=2048 fused ≈ 1.0 ms。token quant ≈ 0.04–0.06 ms(~L1 的 2.5%)。
 
-### ★ 上一步刚做、但【尚未在 GPU 验证】(接续第一件事就是验证它)
-把 **token quant 挪进了 `dispatch_grouped_gemm_mxfp8`**(`dispatch_grouped_gemm_mxfp8_kernel.py`
-函数顶部,约 line 431 的 `if xq.dtype == torch.bfloat16:` 分支):现在传 **bf16 x + `xs=None`** 时,
-op 内部做**一次全局** rowwise mxfp8 quant(`quantize_rowwise_mxfp8_flydsl`,单独 launch、同流天然
-ordered,无需显式 sync)再跑 clean-push 流水线;传预量化 fp8 `xq`+`xs` 则跳过(源签名兼容,re-sync 友好)。
-benchmark 已改成用 bf16 x 调用(`_l1_step` 里 `dispatch_grouped_gemm_mxfp8(x, None, ...)`)。
-两个文件都已本地 `py_compile` 过,但**最后那次 GPU 复跑被打断(切机器),还没确认 cos 仍 =1.0**。
+### ★★ fc2 (L2 fp8 combine) 的 NaN 竞争已修复 —— 根因是 signal pad 没用 uncached 内存
+移植 L2 后,完整 fp8 前向在部分 rank 随机出 NaN。根因**不是** kernel bug,而是**对称内存的 port gap**:
+源 repo 的 `SymmetricMemory` 用 **`hipMallocUncached`** 分配 signal pad(存跨 rank flags + fp8 combine
+buffer `comb`);MegaMoE 之前用普通(cached)`hipMalloc`(bf16 走单堆 `signal_pad_size=0`,从没用过
+signal pad,所以没暴露)。cached 下 peer PUSH 过来的 payload/E8M0 留在 stale L2 line → fp8 reduce 读到
+垃圾 E8M0 指数(=+inf)→ 非有限输出。**修复**:`primus_turbo/pytorch/core/symm_mem.py` 里 signal pad 改用
+`hipMallocUncached`(bf16 不受影响,它 `signal_pad_size=0`;wrapper 里 `hipMallocUncached` 本就存在)。
+验证(n03-33,2026-07-20):3 次跑(2×T=2048、1×T=8192)全 rank 无 NaN,fp8 vs bf16 **SNR 20.8–22.3 dB
+cos ~0.996 PASS**,fp8 前向 T=8192 = 5.22ms(**1.35× vs bf16 7.06ms**)。
+
+### token quant 已挪进 `dispatch_grouped_gemm_mxfp8`(已 GPU 验证)
+`dispatch_grouped_gemm_mxfp8_kernel.py` 函数顶部(约 line 431 `if xq.dtype == torch.bfloat16:` 分支):
+传 **bf16 x + `xs=None`** 时,op 内部做**一次全局** rowwise mxfp8 quant(`quantize_rowwise_mxfp8_flydsl`,
+单独 launch、同流天然 ordered,无需显式 sync)再跑 clean-push 流水线;传预量化 fp8 `xq`+`xs` 则跳过
+(源签名兼容,re-sync 友好)。benchmark 用 bf16 x 调用(`_l1_step` 里 `dispatch_grouped_gemm_mxfp8(x, None, ...)`)。
+**已在 n03-33 GPU 验证(2026-07-20)**:T=2048 L1 0.94ms、T=8192 L1 2.35ms(fused 2.29ms @ 1782 TFLOPS,
+token_quant 0.059ms ~2.5%),cos=1.00000 PASS。
 
 > 设计结论(已讨论定):token quant **不要** fuse 进 device kernel 的每个 push(会变成 per-push、
 > K× 重复量化,还把 bandwidth-bound 的 COMM 角色变 compute-bound,毁掉 comm/gemm overlap)。
@@ -81,12 +91,20 @@ benchmark 已改成用 bf16 x 调用(`_l1_step` 里 `dispatch_grouped_gemm_mxfp8
 
 ## 3. 接续步骤(按优先级)
 
-1. **[先做] 验证上一步的 quant-inside 改动**:跑 L1 bench(见 §4 命令),确认 T=2048 与 T=8192
-   仍 `cos=1.0 PASS`、性能没退化。过了就 accept。
-2. **移植 L2(fp8 combine)+ SwiGLU**:源文件
-   `Primus-Turbo/primus_turbo/flydsl/mega/fp8/grouped_gemm_combine_fp8_kernel.py`(前向 fp8 combine,
-   含 `prepare_w2_fp8`)+ 源 `swiglu_kernel.py` 的 `swiglu`。注意源前向 L2 结论:**combine 保持 bf16
-   输出(带宽 bound),fp8-combine 三种放法都赢不了**(见源 `NOTES_mxfp8_fused_gemm_combine_perf.md`);
+**✅ 前向已全部完成并验证**(L1 fp8 + SwiGLU + L2 fp8 combine)。L2 vendored 的文件:`gemm_bf16_kernel.py`、
+`grouped_gemm_combine_bf16_kernel.py`、`swiglu_kernel.py`、`grouped_gemm_combine_fp8_kernel.py`(都在
+`flydsl/mega/fp8/`,import 已重写)。op 前向在 `mega_moe_fused_fp8.py::MegaMoEFusedFP8Function.forward`
+(standalone,权重内部量化;`_host_rendezvous` 做 L1/L2 scoreboard/flag 复位);e2e bench
+`benchmark/ops/bench_mega_moe_fused_fp8.py`(fp8 vs bf16 SNR gate)。**下一步是反向。**
+
+1. **[下一步] 移植反向**:STEP1(dispatch(dy)+fc2 dgrad,NN,fp8,会赢)优先;dW2/dW1 mxfp8 variable-K;
+   STEP3(fc1 dgrad fp8 + combine/reduce)。源 `mega_moe_fused_mxfp8.py::backward` + 源核
+   `dispatch_grouped_gemm_mxfp8_bwd_kernel.py`、`grouped_gemm_combine_mxfp8_kernel.py`、
+   `quant_colwise_trans_flydsl.py`;依赖 `grouped_gemm_fp8_variable_k_impl`(MegaMoE 已有)。见源
+   `NOTES_mxfp8_backward_handoff.md`。forward 目前**没 save_for_backward**,接反向时要补 ctx 保存
+   (handle/l1/dispatch_weights/pool_x_fp8 等)。反向的 fp8 combine PUSH 同样吃 uncached signal pad(已修)。
+2. **(已完成)移植 L2(fp8 combine)+ SwiGLU**:combine 保持 bf16 输出(带宽 bound)
+   (见源 `NOTES_mxfp8_fused_gemm_combine_perf.md`);
    落地方案 = L1 fp8 fused + L2 用 `grouped_gemm_combine_fp8`(GEMM fp8、combine/reduce bf16)。
    vendor 进 `flydsl/mega/fp8/`,同样把 import 重写成 `mega.fp8.*`,补 `__init__` 导出。
    ⚠️ 命名漂移:源 op 用 `swiglu`/`swiglu_backward`;MegaMoE bf16 侧叫 `swiglu_flydsl_kernel` 等 ——
@@ -108,6 +126,11 @@ benchmark 已改成用 bf16 x 调用(`_l1_step` 里 `dispatch_grouped_gemm_mxfp8
 
 ## 4. 环境 & 命令(重要:构建/运行必须在 GPU 机器的容器里)
 
+- **★ 新容器先修 flydsl 版本**:stock `rocm/primus:v26.3` 容器自带 flydsl `0.1.1.dev409`(egg),
+  缺 `#412` mega 核需要的符号(`TargetAddressSpace` / `extract_base_index`)→ `import primus_turbo.flydsl.mega`
+  会挂在 **bf16** 文件上(不是 fp8 的问题)。修复:在容器里跑
+  `bash slab/notes/MegaMoeFlydsl/_repro/fix_flydsl.sh`(卸 dev409 egg → 装 `flydsl==0.2.4` → 清 `~/.flydsl`)。
+  `amd-aiter` 的依赖冲突警告无害。每台新起的容器都要先做这步。
 - **我的编辑 shell 和 GPU 机器不是同一台**。`/perf_apps` 是共享盘(改文件在哪都行),但
   flydsl/GPU 的 import、build、bench 必须在有 GPU 的机器的容器 `xiaoming-dev`(`rocm/primus:v26.3`)里跑。
 - 之前的 GPU 机是 `smci355-ccs-aus-n01-25`,容器 `xiaoming-dev`。**换机器后先确认容器/GPU 位置**:

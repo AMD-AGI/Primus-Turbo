@@ -115,9 +115,14 @@ class SymmetricMemory:
             buffer_ptr = self.lib.hipMalloc(alloc_size)
             self.lib.hipMemset(buffer_ptr, 0, alloc_size)
             self.buffer_ptrs = self._rendezvous(buffer_ptr)
-            # signal_pad allocated only when requested (mega-moe passes 0 and skips it).
+            # signal_pad allocated only when requested (bf16 mega passes 0 and skips it).
+            # Allocate UNCACHED: it holds cross-rank spin-wait flags/scoreboards AND (for the fp8
+            # mega combine two-heap layout) the combine buffer, which a peer PUSHes and the local
+            # reduce reads. Cached (plain hipMalloc) leaves the peer-written payload/E8M0 in a stale
+            # L2 line -> the fp8 reduce reads a garbage E8M0 exponent (=+inf) -> non-finite output.
+            # Uncached bypasses L2 so cross-rank reads see the freshly-landed data (matches source).
             if self.signal_pad_size > 0:
-                signal_pad_ptr = self.lib.hipMalloc(self.signal_pad_size)
+                signal_pad_ptr = self.lib.hipMallocUncached(self.signal_pad_size)
                 self.lib.hipMemset(signal_pad_ptr, 0, self.signal_pad_size)
                 self.signal_pad_ptrs = self._rendezvous(signal_pad_ptr)
         except Exception:
