@@ -18,6 +18,10 @@ from primus_turbo.pytorch.core.utils import is_gfx950
 # Triton ``knobs.amd`` attributes touched by the turbo GEMM kernels.
 _AMD_KNOB_ATTRS = ("use_async_copy", "scalarize_packed_fops", "use_block_pingpong")
 
+# ping-pong / async-copy knobs disabled by the sparse-MLA attention kernels.
+_AMD_PINGPONG_ATTRS = ("use_async_copy", "use_block_pingpong")
+_AMD_PINGPONG_ENVS = ("TRITON_HIP_USE_ASYNC_COPY", "TRITON_HIP_USE_BLOCK_PINGPONG")
+
 # Env-var fallback (older Triton without ``triton.knobs``).
 _AMD_KNOB_ENVS = (
     "TRITON_HIP_USE_ASYNC_COPY",
@@ -72,6 +76,46 @@ def scoped_amd_triton_knobs(gfx942_enable: Optional[bool] = None):
             for name in ("use_async_copy", "scalarize_packed_fops"):
                 if hasattr(amd, name):
                     setattr(amd, name, gfx942_enable)
+        yield
+    finally:
+        if saved_attrs:
+            amd = triton.knobs.amd
+            for name, val in saved_attrs.items():
+                setattr(amd, name, val)
+        for name, val in saved_env.items():
+            if val is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = val
+
+
+@contextlib.contextmanager
+def scoped_amd_triton_knobs_disabled():
+    """Snapshot the AMD ping-pong / async-copy knobs, disable them for the scope, restore on exit.
+
+    primus_turbo enables these globally for the GEMM kernels, but they pessimize the sparse-MLA
+    attention kernels (~16-29% slower fwd, ~5-7% slower bwd on gfx950) and the wide dKV tiling
+    overflows the 160 KB LDS limit with them on. They are read at compile time and are not part of
+    Triton's compile cache key, so compiling a kernel inside this scope pins the non-ping-pong
+    schedule for that kernel for the process while leaving every other (kernel compiled outside the
+    scope) exactly as primus_turbo configured it.
+    """
+    saved_attrs = {}
+    if _amd_knobs_available():
+        amd = triton.knobs.amd
+        for name in _AMD_PINGPONG_ATTRS:
+            if hasattr(amd, name):
+                saved_attrs[name] = getattr(amd, name)
+    saved_env = {name: os.environ.get(name) for name in _AMD_PINGPONG_ENVS}
+    try:
+        if _amd_knobs_available():
+            amd = triton.knobs.amd
+            for name in _AMD_PINGPONG_ATTRS:
+                if hasattr(amd, name):
+                    setattr(amd, name, False)
+        else:
+            for name in _AMD_PINGPONG_ENVS:
+                os.environ[name] = "0"
         yield
     finally:
         if saved_attrs:
