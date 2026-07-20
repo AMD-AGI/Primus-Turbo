@@ -1111,6 +1111,10 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
                               int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
                               int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
                               ScalingRecipe colwise_recipe, hipStream_t stream) {
+    // TODO(ruibin): add kernel support for gfx1250
+    if (is_gfx1250()) {
+        PRIMUS_TURBO_ERROR("quantize_mxfp4_dual is not implemented on gfx1250.");
+    }
     // Batched (G > 1) input is handled by replicating the per-matrix grid along
     // blockIdx.z; each z-slice quantizes one (M, N) group offset by its stride.
     dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
@@ -1224,6 +1228,10 @@ void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8
                          QuantizeMode mode, int G, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
                          ScalingRecipe recipe, hipStream_t stream) {
+    // TODO(ruibin): add kernel support for gfx1250
+    if (is_gfx1250()) {
+        PRIMUS_TURBO_ERROR("quantize_mxfp4 is not implemented on gfx1250.");
+    }
     // Batched (G > 1) input replicates the per-matrix grid along blockIdx.z;
     // each z-slice quantizes one (M, N) group offset by its per-group stride.
     dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
@@ -1679,6 +1687,10 @@ void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *
                                       int colwise_scale_stride, int rowwise_scale_N,
                                       int colwise_scale_N, ScalingRecipe rowwise_recipe,
                                       ScalingRecipe colwise_recipe, hipStream_t stream) {
+    // TODO(ruibin): add kernel support for gfx1250
+    if (is_gfx1250()) {
+        PRIMUS_TURBO_ERROR("grouped_quantize_mxfp4_dual is not implemented on gfx1250.");
+    }
     PRIMUS_TURBO_CHECK(rowwise_recipe.shuffle_out == false && rowwise_recipe.shuffle_scale == false,
                        "grouped MXFP4 dual does not support shuffle");
     PRIMUS_TURBO_CHECK(colwise_recipe.shuffle_out == false && colwise_recipe.shuffle_scale == false,
@@ -2019,6 +2031,10 @@ void grouped_quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *outpu
                                  const int64_t *group_offs_padded_colwise, QuantizeMode mode, int G,
                                  int total_M, int N, int M_pad_col, int N_pad, int scale_stride,
                                  int scale_N, ScalingRecipe recipe, hipStream_t stream) {
+    // TODO(ruibin): add kernel support for gfx1250
+    if (is_gfx1250()) {
+        PRIMUS_TURBO_ERROR("grouped_quantize_mxfp4 is not implemented on gfx1250.");
+    }
     PRIMUS_TURBO_CHECK(recipe.shuffle_out == false && recipe.shuffle_scale == false,
                        "grouped MXFP4 single does not support shuffle");
 

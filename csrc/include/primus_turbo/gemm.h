@@ -4,7 +4,15 @@
 
 #pragma once
 
+// Derive its guard macro from the arch macro so the
+// turbo sources are force-skipped when compiling for gfx1250.
+#if !defined(PRIMUS_TURBO_GFX1250)
+#define BUILD_TURBO_BACKEND
+#endif
+
+#ifdef BUILD_CK_BACKEND
 #include "ck_tile/ops/gemm_quant/pipeline/tile_gemm_quant_traits.hpp"
+#endif
 #include "primus_turbo/dtype.h"
 #include <cstdint>
 #include <hip/hip_runtime.h>
@@ -56,6 +64,7 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
 //==================================================================
 //  CK GEMM
 //==================================================================
+#ifdef BUILD_CK_BACKEND
 
 template <typename AType, typename BType, typename CType, typename ACCType = float>
 struct CKGemmFP8Params {
@@ -79,9 +88,13 @@ template <typename ADataType, typename BDataType, typename CDataType, typename A
           ck_tile::QuantType QuantMode>
 void ck_gemm_fp8_impl(const CKGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params);
 
+#endif // BUILD_CK_BACKEND
+
 //==================================================================
 //  Turbo GEMM
 //==================================================================
+// The turbo (MFMA) GEMM kernels are compiled for every architecture except gfx1250
+// (guarded by BUILD_TURBO_BACKEND inside the .cu).
 
 size_t turbo_gemm_mxfp8_workspace_size(int32_t m, int32_t n, int32_t k);
 

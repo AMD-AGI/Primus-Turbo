@@ -92,6 +92,18 @@ def get_device_compute_capability(device_id: int = 0) -> Tuple[int, int]:
     return _get_device_compute_capability(device_id)
 
 
+def is_gfx950() -> bool:
+    return get_device_compute_capability() == (9, 5)
+
+
+def is_gfx942() -> bool:
+    return get_device_compute_capability() == (9, 4)
+
+
+def is_gfx1250() -> bool:
+    return get_device_compute_capability() == (12, 5)
+
+
 def jnp_dtype_to_turbo_dtype(jnp_dtype):
     """Convert JAX NumPy dtype to Primus-Turbo DType."""
     jnp_dtype = dtypes.canonicalize_dtype(jnp_dtype)

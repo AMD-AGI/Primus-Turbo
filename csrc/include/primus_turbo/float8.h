@@ -25,17 +25,17 @@ inline Float8Format current_fp8_format() {
 #if PRIMUS_TURBO_DEVICE_COMPILE
     return Float8Format::FNUZ; // dummy
 #else
-    static Float8Format fmt = [] { return is_gfx950() ? Float8Format::OCP : Float8Format::FNUZ; }();
+    static Float8Format fmt = [] { return is_gfx942() ? Float8Format::FNUZ : Float8Format::OCP; }();
     return fmt;
 #endif
 }
 
 PRIMUS_TURBO_HOST_DEVICE bool is_fp8_fnuz() {
 #if PRIMUS_TURBO_DEVICE_COMPILE
-#if defined(__gfx950__)
-    return false; // gfx950 OCP
-#else
+#if defined(__gfx942__)
     return true;
+#else
+    return false; // gfx950 OCP
 #endif
 #else
     return current_fp8_format() == Float8Format::FNUZ;
@@ -45,10 +45,10 @@ PRIMUS_TURBO_HOST_DEVICE bool is_fp8_fnuz() {
 struct float8_e4m3_t {
 
 #if PRIMUS_TURBO_DEVICE_COMPILE
-#if defined(__gfx950__)
-    using storage_t = __hip_fp8_e4m3; // OCP on gfx950
+#if defined(__gfx942__)
+    using storage_t = __hip_fp8_e4m3_fnuz; // FNUZ on gfx942
 #else
-    using storage_t = __hip_fp8_e4m3_fnuz; // FNUZ on others
+    using storage_t = __hip_fp8_e4m3; // OCP on others
 #endif
     storage_t val;
 #else // host side – keep both encodings
@@ -180,10 +180,10 @@ static_assert(std::is_trivially_copyable_v<float8_e4m3_t>);
 struct float8_e5m2_t {
 
 #if PRIMUS_TURBO_DEVICE_COMPILE
-#if defined(__gfx950__)
-    using storage_t = __hip_fp8_e5m2; // OCP on gfx950
+#if defined(__gfx942__)
+    using storage_t = __hip_fp8_e5m2_fnuz; // FNUZ on gfx942
 #else
-    using storage_t = __hip_fp8_e5m2_fnuz; // FNUZ on others
+    using storage_t = __hip_fp8_e5m2; // OCP on others
 #endif
     storage_t val;
 #else // host side – keep both encodings
@@ -392,10 +392,10 @@ public:
 
     PRIMUS_TURBO_HOST_DEVICE static float8_e4m3_t max() {
 #if PRIMUS_TURBO_DEVICE_COMPILE
-#if defined(__gfx950__)
-        return float8_e4m3_t::from_bits(0x7E);
-#else
+#if defined(__gfx942__)
         return float8_e4m3_t::from_bits(0x7F);
+#else
+        return float8_e4m3_t::from_bits(0x7E);
 #endif
 #else
         return primus_turbo::is_fp8_fnuz() ? float8_e4m3_t::from_bits(0x7F)
@@ -414,10 +414,10 @@ public:
     // FNUZ: 0x80
     PRIMUS_TURBO_HOST_DEVICE static float8_e4m3_t quiet_NaN() {
 #if PRIMUS_TURBO_DEVICE_COMPILE
-#if defined(__gfx950__)
-        return float8_e4m3_t::from_bits(0x7F);
-#else
+#if defined(__gfx942__)
         return float8_e4m3_t::from_bits(0x80);
+#else
+        return float8_e4m3_t::from_bits(0x7F);
 #endif
 #else
         return primus_turbo::is_fp8_fnuz() ? float8_e4m3_t::from_bits(0x80)
@@ -430,10 +430,10 @@ template <> class numeric_limits<float8_e5m2_t> {
 public:
     static constexpr bool is_specialized = true;
 #if PRIMUS_TURBO_DEVICE_COMPILE
-#if defined(__gfx950__)
-    static constexpr bool has_infinity = true;
-#else
+#if defined(__gfx942__)
     static constexpr bool has_infinity = false;
+#else
+    static constexpr bool has_infinity = true;
 #endif
 #else
     // Host: cannot determine at compile time whether this is OCP or FNUZ.
@@ -448,10 +448,10 @@ public:
 
     PRIMUS_TURBO_HOST_DEVICE static float8_e5m2_t max() {
 #if PRIMUS_TURBO_DEVICE_COMPILE
-#if defined(__gfx950__)
-        return float8_e5m2_t::from_bits(0x7B);
-#else
+#if defined(__gfx942__)
         return float8_e5m2_t::from_bits(0x7F);
+#else
+        return float8_e5m2_t::from_bits(0x7B);
 #endif
 #else
         return primus_turbo::is_fp8_fnuz() ? float8_e5m2_t::from_bits(0x7F)
@@ -463,10 +463,10 @@ public:
 
     PRIMUS_TURBO_HOST_DEVICE static float8_e5m2_t infinity() {
 #if PRIMUS_TURBO_DEVICE_COMPILE
-#if defined(__gfx950__)
-        return float8_e5m2_t::from_bits(0x7C);
-#else
+#if defined(__gfx942__)
         return max();
+#else
+        return float8_e5m2_t::from_bits(0x7C);
 #endif
 #else
         return primus_turbo::is_fp8_fnuz() ? max() : float8_e5m2_t::from_bits(0x7C);
@@ -475,10 +475,10 @@ public:
 
     PRIMUS_TURBO_HOST_DEVICE static float8_e5m2_t quiet_NaN() {
 #if PRIMUS_TURBO_DEVICE_COMPILE
-#if defined(__gfx950__)
-        return float8_e5m2_t::from_bits(0x7D);
-#else
+#if defined(__gfx942__)
         return float8_e5m2_t::from_bits(0x80);
+#else
+        return float8_e5m2_t::from_bits(0x7D);
 #endif
 #else
         return primus_turbo::is_fp8_fnuz() ? float8_e5m2_t::from_bits(0x80)

@@ -175,7 +175,8 @@ void cached_notify_dispatch(const int *rank_prefix_matrix, int num_memset_int, v
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumRanks, int kNumThreads, bool kUseCheapFence, typename topk_idx_t>
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kUseCheapFence,
+          typename topk_idx_t>
 __global__ void __launch_bounds__(kNumThreads, 1)
     dispatch(int4 *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t *recv_topk_idx,
              float *recv_topk_weights, int *recv_channel_offset, int *send_head, const int4 *x,
@@ -245,7 +246,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales,
                       channel_rank_offset * num_recv_buffer_tokens * num_scales);
 
-    BARRIER_SYNC_INIT();
+    sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
@@ -361,7 +362,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
             // Move tail index
             // NOTES: here all warps should share the same new tail
-            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            sync_barrier(responsible_rank, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and lane_id == 0)
                 st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
                                                       cached_channel_tail_idx);
@@ -429,7 +430,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Synchronize queue tail
-            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            sync_barrier(responsible_rank, num_threads_per_rank);
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
 
             // Copy data
@@ -486,7 +487,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            sync_barrier(responsible_rank, num_threads_per_rank);
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and lane_id == 0)
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
 
@@ -517,7 +518,8 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t 
               int scale_token_stride, int scale_hidden_stride, void **buffer_ptrs, int rank,
               int num_ranks, hipStream_t stream, int num_sms, int num_max_send_tokens,
               int num_recv_buffer_tokens) {
-    constexpr int kNumThreads = 1024;
+    constexpr int kNumThreads         = 1024;
+    constexpr int kNumTMABytesPerWarp = 8192;
 
     // Make sure never OOB
     PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_scales) * scale_hidden_stride <
@@ -527,8 +529,11 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t 
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
-        auto dispatch_func = use_cheap_fence ? dispatch<ranks, kNumThreads, true, topk_idx_t>      \
-                                             : dispatch<ranks, kNumThreads, false, topk_idx_t>;    \
+        auto dispatch_func =                                                                       \
+            use_cheap_fence                                                                        \
+                ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, topk_idx_t>              \
+                : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, topk_idx_t>;            \
+        SET_SHARED_MEMORY_FOR_TMA(dispatch_func);                                                  \
         LAUNCH_KERNEL_NON_COOPERATIVE(                                                             \
             &cfg, dispatch_func, reinterpret_cast<int4 *>(recv_x), recv_x_scales, recv_src_idx,    \
             recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head,                      \
@@ -615,7 +620,8 @@ void cached_notify_combine(void **buffer_ptrs, int *send_head, int num_channels,
 #undef CACHED_NOTIFY_COMBINE
 }
 
-template <typename dtype_t, int kNumRanks, int kNumThreads, bool kUseCheapFence>
+template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp,
+          bool kUseCheapFence>
 __global__ void __launch_bounds__(kNumThreads, 1)
     combine(dtype_t *recv_x, float *recv_topk_weights, const dtype_t *x, const float *topk_weights,
             const dtype_t *bias_0, const dtype_t *bias_1, const int *src_idx,
@@ -637,7 +643,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto          bias_1_int4   = reinterpret_cast<const int4 *>(bias_1);
     auto          recv_int4     = reinterpret_cast<int4 *>(recv_x);
 
-    BARRIER_SYNC_INIT();
+    sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
@@ -740,7 +746,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-            BARRIER_SYNC(__threadfence_block(), send_rank_id, num_threads_per_rank);
+            sync_barrier(send_rank_id, num_threads_per_rank);
             if (lane_id == 0 and send_warp_id_in_rank == 0)
                 st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
                                                       current_channel_tail_idx);
@@ -936,14 +942,17 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
              int num_tokens, int num_recv_tokens, int hidden, int num_topk, void **buffer_ptrs,
              int rank, int num_ranks, hipStream_t stream, int num_sms, int num_max_send_tokens,
              int num_recv_buffer_tokens) {
-    constexpr int kNumThreads = 1024;
+    constexpr int kNumThreads         = 1024;
+    constexpr int kNumTMABytesPerWarp = 4096;
 
     static const bool use_cheap_fence = is_enable_cheap_fence();
 
 #define COMBINE_LAUNCH_CASE(dtype, ranks)                                                          \
     {                                                                                              \
-        auto combine_func = use_cheap_fence ? combine<dtype, ranks, kNumThreads, true>             \
-                                            : combine<dtype, ranks, kNumThreads, false>;           \
+        auto combine_func = use_cheap_fence                                                        \
+                                ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true>    \
+                                : combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false>;  \
+        SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                   \
         LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, combine_func, reinterpret_cast<dtype *>(recv_x),       \
                                       recv_topk_weights, reinterpret_cast<const dtype *>(x),       \
                                       topk_weights, reinterpret_cast<const dtype *>(bias_0),       \

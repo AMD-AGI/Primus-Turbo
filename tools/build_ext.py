@@ -9,12 +9,7 @@ from typing import Optional
 
 from setuptools.command.build_ext import build_ext
 
-from .build_utils import find_rocm_home
-
-
-def _join_rocm_home(*paths) -> str:
-    return os.path.join(find_rocm_home(), *paths)
-
+from .build_utils import _join_rocm_home
 
 SUBPROCESS_DECODE_ARGS = ()
 
@@ -419,18 +414,6 @@ def _write_ninja_file(
     cuda_dlink_post_cflags = sanitize_flags(cuda_dlink_post_cflags)
     ldflags = sanitize_flags(ldflags)
 
-    # print("***************************************************")
-    # print("cflags\n", cflags)
-    # print("post_cflags\n", post_cflags)
-    # print("cuda_cflags\n", cuda_cflags)
-    # print("cuda_post_cflags\n", cuda_post_cflags)
-    # print("cuda_dlink_post_cflags\n", cuda_dlink_post_cflags)
-    # print("ldflags\n", ldflags)
-    # print("sources\n", sources)
-    # print("objects\n", objects)
-    # print("library_target\n", library_target)
-    # print("***************************************************")
-
     # Sanity checks...
     if len(sources) != len(objects):
         raise AssertionError("sources and objects lists must be the same length")
@@ -581,6 +564,12 @@ class TurboBuildExt(BaseBuildExtension):
         if self.inplace:
             self.build_temp = str(self.PROJECT_ROOT / "build" / "temp")
             self.build_lib = str(self.PROJECT_ROOT / "build" / "lib")
+
+    def build_extensions(self) -> None:
+        # ninja is required to compile the extensions; fail loudly instead of
+        # silently falling back to the (miscompiling) distutils backend.
+        verify_ninja_availability()
+        super().build_extensions()
 
     def get_ext_filename(self, ext_name: str) -> str:
         filename = super().get_ext_filename(ext_name)

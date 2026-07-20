@@ -29,8 +29,23 @@ def is_gfx942() -> bool:
     return get_device_compute_capability() == (9, 4)
 
 
+def is_gfx1250() -> bool:
+    return get_device_compute_capability() == (12, 5)
+
+
 @functools.lru_cache
 def get_num_cus() -> int:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
 
     return props.multi_processor_count
+
+
+@functools.lru_cache
+def build_ck() -> bool:
+    """Whether the CK GEMM backend was compiled into this build."""
+    try:
+        from primus_turbo._build_info import BUILD_CK_BACKEND
+
+        return BUILD_CK_BACKEND
+    except ImportError:
+        return False

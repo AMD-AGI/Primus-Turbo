@@ -26,7 +26,11 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import (
+    build_ck,
+    get_device_compute_capability,
+    is_gfx1250,
+)
 from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_triton_kernel,
     gemm_fp8_rowwise_triton_kernel,
@@ -144,6 +148,8 @@ class GEMMFP8CKBackend(KernelBackend):
         granularity: ScalingGranularity,
     ) -> bool:
         supported = True
+        # check the CK backend was compiled into this build
+        supported &= build_ck()
         # check ScalingGranularity
         supported &= granularity in GEMMFP8CKBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -307,6 +313,8 @@ class GEMMFP8TurboBackend(KernelBackend):
         granularity: ScalingGranularity,
     ) -> bool:
         supported = True
+        # TODO(ruibin): add gfx1250 support for turbo backend.
+        supported &= not is_gfx1250()
         supported &= granularity in GEMMFP8TurboBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8TurboBackend.SUPPORTED_DTYPES
         supported &= not trans_a and trans_b and not trans_c

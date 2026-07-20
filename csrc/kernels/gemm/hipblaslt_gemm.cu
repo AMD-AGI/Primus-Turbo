@@ -58,8 +58,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
     if (use_low_precision) {
         if (scale_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0) {
             PRIMUS_TURBO_CHECK(
-                is_gfx950(),
-                "The HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 only support on gfx950.");
+                !is_gfx942(),
+                "The HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 not support on gfx942.");
         }
         PRIMUS_TURBO_CHECK(scaleA_inv != nullptr);
         PRIMUS_TURBO_CHECK(scaleB_inv != nullptr);

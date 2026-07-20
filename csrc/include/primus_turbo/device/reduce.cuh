@@ -7,6 +7,14 @@
 #include "primus_turbo/common.h"
 #include "primus_turbo/device/utils.cuh"
 
+// gfx12 (gfx1250 / gfx1251, CDNA5) removed the unified `s_waitcnt`; LDS waits use
+// the split `s_wait_dscnt` counter instead.
+#if defined(__gfx1250__)
+#define PRIMUS_TURBO_WAIT_DS_STR "s_wait_dscnt 0"
+#else
+#define PRIMUS_TURBO_WAIT_DS_STR "s_waitcnt lgkmcnt(0)"
+#endif
+
 #define FINAL_MASK 0xffffffffffffffffULL
 
 namespace primus_turbo {
@@ -187,8 +195,7 @@ template <template <class> class Func, typename T> PRIMUS_TURBO_DEVICE T BlockRe
 //   block memory-op scheduling around this VALU-bound reduction.
 PRIMUS_TURBO_DEVICE float ds_swizzle_xor1(float val) {
     float result;
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F\n\t"
-                 "s_waitcnt lgkmcnt(0)"
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F\n\t" PRIMUS_TURBO_WAIT_DS_STR
                  : "=v"(result)
                  : "v"(val));
     return result;
@@ -196,8 +203,7 @@ PRIMUS_TURBO_DEVICE float ds_swizzle_xor1(float val) {
 
 PRIMUS_TURBO_DEVICE float ds_swizzle_xor2(float val) {
     float result;
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F\n\t"
-                 "s_waitcnt lgkmcnt(0)"
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F\n\t" PRIMUS_TURBO_WAIT_DS_STR
                  : "=v"(result)
                  : "v"(val));
     return result;
@@ -205,8 +211,7 @@ PRIMUS_TURBO_DEVICE float ds_swizzle_xor2(float val) {
 
 PRIMUS_TURBO_DEVICE float ds_swizzle_xor8(float val) {
     float result;
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x201F\n\t"
-                 "s_waitcnt lgkmcnt(0)"
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x201F\n\t" PRIMUS_TURBO_WAIT_DS_STR
                  : "=v"(result)
                  : "v"(val));
     return result;
@@ -214,8 +219,7 @@ PRIMUS_TURBO_DEVICE float ds_swizzle_xor8(float val) {
 
 PRIMUS_TURBO_DEVICE float ds_swizzle_xor16(float val) {
     float result;
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x401F\n\t"
-                 "s_waitcnt lgkmcnt(0)"
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x401F\n\t" PRIMUS_TURBO_WAIT_DS_STR
                  : "=v"(result)
                  : "v"(val));
     return result;
@@ -247,24 +251,21 @@ PRIMUS_TURBO_DEVICE float warp_reduce_max_8_dpp(float val) {
     // clobber) is what makes the per-row reduction deterministic.
 
     // Step 1: Exchange with thread 4 positions away
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F\n\t"
-                 "s_waitcnt lgkmcnt(0)"
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F\n\t" PRIMUS_TURBO_WAIT_DS_STR
                  : "=v"(tmp)
                  : "v"(v));
     val = fmaxf(val, uint_as_float(tmp));
     v   = float_as_uint(val);
 
     // Step 2: Exchange with thread 2 positions away
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F\n\t"
-                 "s_waitcnt lgkmcnt(0)"
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F\n\t" PRIMUS_TURBO_WAIT_DS_STR
                  : "=v"(tmp)
                  : "v"(v));
     val = fmaxf(val, uint_as_float(tmp));
     v   = float_as_uint(val);
 
     // Step 3: Exchange with adjacent thread
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F\n\t"
-                 "s_waitcnt lgkmcnt(0)"
+    asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F\n\t" PRIMUS_TURBO_WAIT_DS_STR
                  : "=v"(tmp)
                  : "v"(v));
     val = fmaxf(val, uint_as_float(tmp));
@@ -272,11 +273,16 @@ PRIMUS_TURBO_DEVICE float warp_reduce_max_8_dpp(float val) {
     return val;
 }
 
+// Full-wavefront max reduction. ``ds_swizzle`` only exchanges within 32-lane
+// groups, so a 64-lane wavefront needs an extra cross-group (lane ^ 32) step
+// while a 32-lane wavefront (gfx1250) is already fully reduced after xor16.
 PRIMUS_TURBO_DEVICE float warp_reduce_max_64_dpp(float val) {
     val = warp_reduce_max_8_dpp(val);
     val = fmaxf(val, ds_swizzle_xor8(val));
     val = fmaxf(val, ds_swizzle_xor16(val));
-    val = fmaxf(val, __shfl_xor_sync(FINAL_MASK, val, 32, THREADS_PER_WARP));
+    if constexpr (THREADS_PER_WARP == 64) {
+        val = fmaxf(val, __shfl_xor_sync(FINAL_MASK, val, 32, THREADS_PER_WARP));
+    }
     return val;
 }
 

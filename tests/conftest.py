@@ -49,6 +49,23 @@ def pytest_configure(config):
 
 def pytest_collection_modifyitems(config, items):
     """Skip distributed tests in parallel mode, skip single-GPU tests in --dist-only mode."""
+    # TODO(ruibin): gfx1250 is not yet fully supported by the Primus-Turbo.
+    is_gfx1250 = False
+    try:
+        from primus_turbo.pytorch.core.utils import is_gfx1250 as is_gfx1250_pytorch
+
+        is_gfx1250 = is_gfx1250_pytorch()
+    except ImportError:
+        from primus_turbo.jax.core.utils import is_gfx1250 as is_gfx1250_jax
+
+        is_gfx1250 = is_gfx1250_jax()
+
+    if is_gfx1250:
+        skip_gfx1250 = pytest.mark.skip(reason="Not yet supported on gfx1250")
+        for item in items:
+            item.add_marker(skip_gfx1250)
+        return
+
     dist_only = config.getoption("--dist-only", False)
     deterministic_only = config.getoption("--deterministic-only", False)
 

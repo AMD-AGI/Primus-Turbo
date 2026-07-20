@@ -10,6 +10,8 @@
 
 namespace primus_turbo::pytorch {
 
+#ifdef BUILD_CK_BACKEND
+
 template <typename AType, typename BType, typename CType>
 inline CKGroupedGemmParams<AType, BType, CType>
 make_ck_groued_gemm_params(void *args_ptr, const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
@@ -60,25 +62,6 @@ inline CKGroupedGemmFP8Params<AType, BType, CType, ACCType> make_ck_groued_gemm_
     return params;
 }
 
-at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens) {
-    // Check input tensor type
-    PRIMUS_TURBO_CHECK(group_lens.scalar_type() == at::kLong,
-                       "group_lens must be of type Long (int64_t)");
-
-    // Create output tensor with one more element than input
-    at::Tensor group_offs = at::empty({group_lens.numel() + 1}, group_lens.options());
-
-    // Get current CUDA stream
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    // Call the CUDA implementation to compute group offsets
-    compute_group_offs<int64_t>(reinterpret_cast<const int64_t *>(group_lens.data_ptr()),
-                                reinterpret_cast<int64_t *>(group_offs.data_ptr()),
-                                group_lens.numel(), stream);
-
-    return group_offs;
-}
-
 uint32_t get_grouped_gemm_num_cu(c10::optional<int64_t> num_cu) {
     auto    stream     = at::cuda::getCurrentCUDAStream();
     int32_t cus        = get_multi_processor_count(stream.device_index());
@@ -88,10 +71,8 @@ uint32_t get_grouped_gemm_num_cu(c10::optional<int64_t> num_cu) {
 
 at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                            at::Tensor &group_offs, const bool transA, const bool transB,
-                           c10::optional<int64_t>    num_cu,
-                           const bool                work_steal,
-                           c10::optional<at::Tensor> ws_counter,
-                           int64_t                   ws_local_per_xcd) {
+                           c10::optional<int64_t> num_cu, const bool work_steal,
+                           c10::optional<at::Tensor> ws_counter, int64_t ws_local_per_xcd) {
     auto out_dtype = a.scalar_type();
 
     // Check
@@ -112,27 +93,24 @@ at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
         PRIMUS_TURBO_CHECK(ws_counter.has_value(),
                            "ck_grouped_gemm: work_steal=True requires ws_counter");
         at::Tensor &counter = ws_counter.value();
-        PRIMUS_TURBO_CHECK(counter.scalar_type() == at::kInt,
-                           "ws_counter must be int32");
+        PRIMUS_TURBO_CHECK(counter.scalar_type() == at::kInt, "ws_counter must be int32");
         PRIMUS_TURBO_CHECK(counter.is_cuda(), "ws_counter must be on CUDA");
         PRIMUS_TURBO_CHECK(counter.device() == a.device(),
                            "ws_counter must be on the same CUDA device as `a` "
-                           "(counter cuda:", counter.device().index(),
-                           ", a cuda:", a.device().index(), ")");
-        PRIMUS_TURBO_CHECK(counter.is_contiguous(),
-                           "ws_counter must be contiguous");
+                           "(counter cuda:",
+                           counter.device().index(), ", a cuda:", a.device().index(), ")");
+        PRIMUS_TURBO_CHECK(counter.is_contiguous(), "ws_counter must be contiguous");
         constexpr int64_t kCounterSlots = 8 + 2; // NUM_XCDS_WS + global + done
-        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots,
-                           "ws_counter must have at least ", kCounterSlots, " int32 slots");
+        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots, "ws_counter must have at least ",
+                           kCounterSlots, " int32 slots");
         ws_counter_ptr = static_cast<int32_t *>(counter.data_ptr());
     }
     // The CK WS kernel takes ws_local_per_xcd as int32. Reject values that
     // would truncate silently on the cast below (int32 max ~2.1B; the heuristic
     // returns ceil(total_tiles / 8) at most, and any WS shape that fits in
     // int32 tile count is well under this limit -- this is a defensive check).
-    PRIMUS_TURBO_CHECK(
-        ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
-        "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
+    PRIMUS_TURBO_CHECK(ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
+                       "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
 
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
@@ -250,8 +228,7 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
 
 at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
-                                      c10::optional<int64_t>    num_cu,
-                                      const bool                work_steal,
+                                      c10::optional<int64_t> num_cu, const bool work_steal,
                                       c10::optional<at::Tensor> ws_counter,
                                       int64_t                   ws_local_per_xcd) {
     // TODO: output datatype
@@ -274,20 +251,18 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
         PRIMUS_TURBO_CHECK(counter.is_cuda(), "ws_counter must be on CUDA");
         PRIMUS_TURBO_CHECK(counter.device() == a.device(),
                            "ws_counter must be on the same CUDA device as `a` "
-                           "(counter cuda:", counter.device().index(),
-                           ", a cuda:", a.device().index(), ")");
-        PRIMUS_TURBO_CHECK(counter.is_contiguous(),
-                           "ws_counter must be contiguous");
+                           "(counter cuda:",
+                           counter.device().index(), ", a cuda:", a.device().index(), ")");
+        PRIMUS_TURBO_CHECK(counter.is_contiguous(), "ws_counter must be contiguous");
         constexpr int64_t kCounterSlots = 8 + 2;
-        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots,
-                           "ws_counter must have at least ", kCounterSlots, " int32 slots");
+        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots, "ws_counter must have at least ",
+                           kCounterSlots, " int32 slots");
         ws_counter_ptr = static_cast<int32_t *>(counter.data_ptr());
     }
     // See ck_grouped_gemm(): the kernel takes ws_local_per_xcd as int32,
     // reject values that would truncate silently on the cast below.
-    PRIMUS_TURBO_CHECK(
-        ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
-        "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
+    PRIMUS_TURBO_CHECK(ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
+                       "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
 
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
@@ -405,5 +380,48 @@ at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tens
 
     return c;
 }
+
+#else // !BUILD_CK_BACKEND : CK grouped GEMM unsupported (CK backend disabled)
+
+at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+                           at::Tensor &group_offs, const bool transA, const bool transB,
+                           c10::optional<int64_t> num_cu, const bool work_steal,
+                           c10::optional<at::Tensor> ws_counter, int64_t ws_local_per_xcd) {
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm is unavailable: CK backend not built (disabled via "
+                       "PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
+}
+
+at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
+                                      at::Tensor &group_offs, const bool transA, const bool transB,
+                                      c10::optional<int64_t> num_cu, const bool work_steal,
+                                      c10::optional<at::Tensor> ws_counter,
+                                      int64_t                   ws_local_per_xcd) {
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm_variable_k is unavailable: CK backend not built (disabled "
+                       "via PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
+}
+
+at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                               at::Tensor &b_scales, at::Tensor &group_lens, at::Tensor &group_offs,
+                               const bool transA, const bool transB, at::ScalarType out_dtype,
+                               const std::string &granularity, c10::optional<int64_t> num_cu) {
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm_fp8 is unavailable: CK backend not built (disabled via "
+                       "PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
+}
+
+at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
+                                          at::Tensor &b_scales, at::Tensor &group_lens,
+                                          at::Tensor &group_offs, const bool transA,
+                                          const bool transB, at::ScalarType out_dtype,
+                                          const std::string     &granularity,
+                                          c10::optional<int64_t> num_cu) {
+    PRIMUS_TURBO_ERROR("ck_grouped_gemm_fp8_variable_k is unavailable: CK backend not built "
+                       "(disabled via PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
+}
+
+#endif // BUILD_CK_BACKEND
 
 } // namespace primus_turbo::pytorch

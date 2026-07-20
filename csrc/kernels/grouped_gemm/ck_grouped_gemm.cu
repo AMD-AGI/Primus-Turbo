@@ -19,15 +19,13 @@ std::int64_t get_ck_grouped_gemm_fp8_args_sizes(const int group_num) {
 }
 
 template <typename ADataType, typename BDataType, typename CDataType>
-__global__ void
-compute_grouped_gemm_args(ck_tile::GemmTransKernelArg<> *args_ptr, const ADataType *a_ptr,
-                          const BDataType *b_ptr, CDataType *c_ptr, const int64_t *group_lens_ptr,
-                          const int64_t *group_offs_ptr, const ck_tile::index_t group_num,
-                          const ck_tile::index_t n, const ck_tile::index_t k,
-                          const ck_tile::index_t strideA, const ck_tile::index_t strideB,
-                          const ck_tile::index_t strideC, const ck_tile::index_t k_batch,
-                          const ck_tile::index_t m_tile, const ck_tile::index_t n_tile,
-                          const bool work_steal) {
+__global__ void compute_grouped_gemm_args(
+    ck_tile::GemmTransKernelArg<> *args_ptr, const ADataType *a_ptr, const BDataType *b_ptr,
+    CDataType *c_ptr, const int64_t *group_lens_ptr, const int64_t *group_offs_ptr,
+    const ck_tile::index_t group_num, const ck_tile::index_t n, const ck_tile::index_t k,
+    const ck_tile::index_t strideA, const ck_tile::index_t strideB, const ck_tile::index_t strideC,
+    const ck_tile::index_t k_batch, const ck_tile::index_t m_tile, const ck_tile::index_t n_tile,
+    const bool work_steal) {
     const int64_t group_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (group_id >= group_num)
         return;
@@ -50,7 +48,7 @@ compute_grouped_gemm_args(ck_tile::GemmTransKernelArg<> *args_ptr, const ADataTy
     // read these fields, so skip the O(G^2) scan when work_steal is off --
     // this keeps args-setup latency at O(G) for the common static case.
     if (work_steal) {
-        const ck_tile::index_t num_n_tiles = (n + n_tile - 1) / n_tile;
+        const ck_tile::index_t num_n_tiles    = (n + n_tile - 1) / n_tile;
         ck_tile::index_t       my_block_start = 0;
         for (int64_t g = 0; g < group_id; ++g) {
             const ck_tile::index_t M_g       = static_cast<ck_tile::index_t>(group_lens_ptr[g]);
@@ -104,38 +102,6 @@ __global__ void compute_grouped_gemm_fp8_args(
     args_ptr[group_id].group_karg.stride_BQ = strideBQ;
     args_ptr[group_id].group_karg.stride_C  = strideC;
     args_ptr[group_id].group_karg.k_batch   = k_batch;
-}
-
-template <typename IndexType>
-__global__ void compute_group_offs_device(const IndexType       *group_lens_ptr,
-                                          IndexType             *group_offs_ptr,
-                                          const ck_tile::index_t group_num) {
-    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx == 0) {
-        group_offs_ptr[0] = 0;
-    }
-
-    if (idx < group_num) {
-        // Compute cumulative sum for group offsets
-        IndexType cumsum = 0;
-        for (ck_tile::index_t i = 0; i < idx; i++) {
-            cumsum += group_lens_ptr[i];
-        }
-        group_offs_ptr[idx + 1] = cumsum + group_lens_ptr[idx];
-    }
-}
-
-template <typename IndexType>
-void compute_group_offs(const IndexType *group_lens_ptr, IndexType *group_offs_ptr,
-                        const int64_t group_num, hipStream_t stream) {
-    const ck_tile::index_t total_elements    = group_num;
-    const int              threads_per_block = 256;
-    const int              blocks =
-        static_cast<int>((total_elements + threads_per_block - 1) / threads_per_block);
-
-    compute_group_offs_device<IndexType>
-        <<<blocks, threads_per_block, 0, stream>>>(group_lens_ptr, group_offs_ptr, group_num);
 }
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType>
@@ -260,10 +226,8 @@ __global__ void compute_grouped_gemm_variable_k_args(
     CDataType *c_ptr, const int64_t *group_lens_ptr, const int64_t *group_offs_ptr,
     const bool transA, const bool transB, const ck_tile::index_t group_num,
     const ck_tile::index_t m, const ck_tile::index_t n, const ck_tile::index_t strideA,
-    const ck_tile::index_t strideB, const ck_tile::index_t strideC,
-    const ck_tile::index_t k_batch,
-    const ck_tile::index_t m_tile, const ck_tile::index_t n_tile,
-    const bool work_steal) {
+    const ck_tile::index_t strideB, const ck_tile::index_t strideC, const ck_tile::index_t k_batch,
+    const ck_tile::index_t m_tile, const ck_tile::index_t n_tile, const bool work_steal) {
     const int64_t group_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (group_id >= group_num)
         return;
@@ -294,16 +258,16 @@ __global__ void compute_grouped_gemm_variable_k_args(
     // Same pattern as the forward kernel; the WS kernel's FindGroupId reads
     // these fields. Skip the O(G^2) scan when work_steal is off.
     if (work_steal) {
-        const ck_tile::index_t num_n_tiles = (n + n_tile - 1) / n_tile;
+        const ck_tile::index_t num_n_tiles    = (n + n_tile - 1) / n_tile;
         ck_tile::index_t       my_block_start = 0;
         for (int64_t g = 0; g < group_id; ++g) {
-            const ck_tile::index_t M_g = (group_lens_ptr[g] > 0) ? m : 0;
+            const ck_tile::index_t M_g       = (group_lens_ptr[g] > 0) ? m : 0;
             const ck_tile::index_t m_tiles_g = (M_g + m_tile - 1) / m_tile;
             my_block_start += m_tiles_g * num_n_tiles * k_batch;
         }
         const ck_tile::index_t my_m_tiles = (effective_m + m_tile - 1) / m_tile;
-        args_ptr[group_id].block_start = my_block_start;
-        args_ptr[group_id].block_end   = my_block_start + my_m_tiles * num_n_tiles * k_batch;
+        args_ptr[group_id].block_start    = my_block_start;
+        args_ptr[group_id].block_end      = my_block_start + my_m_tiles * num_n_tiles * k_batch;
     }
 }
 
@@ -694,8 +658,8 @@ template void ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::fp8_t, ck_
                                              float, ck_tile::QuantType::RowColQuant>(
     const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float>
         &params);
-#if 0 // CK grouped BLOCKWISE (ABQuantGrouped) dropped: Triton is the production blockwise
-      // path. Explicit instantiations kept (not deleted) to cut CK compile time.
+#if 0  // CK grouped BLOCKWISE (ABQuantGrouped) dropped: Triton is the production blockwise
+       // path. Explicit instantiations kept (not deleted) to cut CK compile time.
 // fp8 * fp8 -> fp16 (ABQuantGrouped/blockwise)
 template void ck_grouped_gemm_fp8_variable_k<ck_tile::fp8_t, ck_tile::fp8_t, ck_tile::half_t, float,
                                              ck_tile::QuantType::ABQuantGrouped>(
@@ -732,8 +696,5 @@ template void ck_grouped_gemm_fp8_variable_k<ck_tile::bf8_t, ck_tile::fp8_t, ck_
                                              float, ck_tile::QuantType::ABQuantGrouped>(
     const CKGroupedGemmFP8Params<ck_tile::bf8_t, ck_tile::fp8_t, ck_tile::bfloat16_t, float>
         &params);
-
 #endif // ABQuantGrouped grouped-gemm instantiations disabled
-template void compute_group_offs<int64_t>(const int64_t *group_lens_ptr, int64_t *group_offs_ptr,
-                                          const int64_t group_num, hipStream_t stream);
 } // namespace primus_turbo

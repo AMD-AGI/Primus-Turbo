@@ -86,7 +86,7 @@ template <typename T>
 void rmsnorm_bwd_impl(const T *input, const T *gamma, const T *output_grad, T *input_grad,
                       T *gamma_grad, const int64_t inner_len, const int64_t outer_len,
                       const float epsilon, hipStream_t stream) {
-    const dim3    block_dim(THREADS_PER_WARP, 1, 1);
+    const dim3    block_dim(warp_size(), 1, 1);
     const dim3    grid_dim(outer_len, 1, 1);
     constexpr int UNROLL = sizeof(uint4) / sizeof(T);
     if (inner_len % UNROLL == 0) {
