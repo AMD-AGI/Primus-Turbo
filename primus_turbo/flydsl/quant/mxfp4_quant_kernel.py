@@ -283,8 +283,9 @@ def _emit_dual_body(
         wc = tw % _TCW
         goff = (r0 + tr) * (C >> 1) + c0w + wc + gx
         if padded:
-            # mask cols past real C (and rows past real R) -> OOB load returns 0.
-            goff = arith.select(((c0w + wc) < (C >> 1)) & ((r0 + tr) < R), goff, fx.Int32(_OOB))
+            # mask cols past real C -> OOB load returns 0 (rows always valid: R%64==0,
+            # tile is 64 rows, rblk covers exactly R/64 tiles).
+            goff = arith.select((c0w + wc) < (C >> 1), goff, fx.Int32(_OOB))
         vec = buffer_ops.buffer_load(rsrc, goff, vec_width=4, dtype=T.i32)
         _lds_store_vec4(lds.buf.ptr, tw, vec)
     # DS writes must retire before any thread reads the tile (a bare s_barrier
@@ -331,7 +332,7 @@ def _emit_dual_body(
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
             sc = grow * (cpad >> 5) + gcmb + grsc
             if padded:
-                wok = (gcmb < (cpad >> 5)) & (grow < R)
+                wok = gcmb < (cpad >> 5)  # rows always valid (R%64==0)
                 ob = arith.select(wok, ob, fx.Int32(_OOB))
                 sc = arith.select(wok, sc, fx.Int32(_OOB))
             _store_words_vec4(orsrc, ob, rwords)
@@ -355,7 +356,7 @@ def _emit_dual_body(
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
             sc = grow * (cpad >> 5) + gcmb + grsc
             if padded:
-                wok = (gcmb < (cpad >> 5)) & (grow < R)
+                wok = gcmb < (cpad >> 5)  # rows always valid (R%64==0)
                 ob = arith.select(wok, ob, fx.Int32(_OOB))
                 sc = arith.select(wok, sc, fx.Int32(_OOB))
             _store_words_vec4(orsrc, ob, rwords)
