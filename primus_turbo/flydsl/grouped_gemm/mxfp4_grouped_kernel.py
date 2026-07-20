@@ -500,15 +500,20 @@ def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k
 
 
 def _get_grouped_mxfp4_ws(total_M, N, K128, G, device):
-    key = (total_M, N, K128, G, device)
+    # M-generic workspace: key on the static shape (no total_M) and grow the A-slab
+    # buffer only when a larger total_M arrives. The kernel is passed the live slab_rows
+    # (a_pre_grid derives from it), so a larger cached buffer is safe -- only the needed
+    # prefix is written/read. Keeping total_M out of the key stops per-total_M churn from
+    # tripping _bound_caches and evicting the compiled kernels (mirrors #419 for mxfp8).
+    slab_rows = (ceildiv(total_M, 256) + G) * 256  # padded A-slab upper bound for this call
+    key = (N, K128, G, device)
     e = _GMXFP4_WS_CACHE.get(key)
-    if e is None:
-        slab_rows = (ceildiv(total_M, 256) + G) * 256  # padded A-slab upper bound
+    if e is None or e[2] < slab_rows:
         a_sp = torch.empty(slab_rows * K128, dtype=torch.int32, device=device)
-        b_sp = torch.empty(G * N * K128, dtype=torch.int32, device=device)
+        b_sp = e[1] if e is not None else torch.empty(G * N * K128, dtype=torch.int32, device=device)
         e = (a_sp, b_sp, slab_rows)
         _GMXFP4_WS_CACHE[key] = e
-    return e
+    return e[0], e[1], slab_rows
 
 
 def grouped_gemm_mxfp4_flydsl_kernel(
@@ -576,7 +581,10 @@ def grouped_gemm_mxfp4_flydsl_kernel(
         if ent is None:
             ent = _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=k_real)
             _GMXFP4_LAUNCH_CACHE[lk] = ent
-        atk = (total_M, N, K, G, gm, xcd, gn, out_fp16, k_real)  # k_real: same K256 diff real K must not collide
+        # M-generic launch (total_M is a runtime arg, not compiled in) -> key on the static
+        # shape only, reuse the compiled object for every total_M. Dropping total_M here stops
+        # per-total_M entries from evicting the cache (mirrors #419's mxfp8 M-decoupling).
+        atk = (N, K, G, gm, xcd, gn, out_fp16, k_real)  # k_real: same K256 diff real K must not collide
         e2 = _GMXFP4_AT_CACHE.get(atk)
         if e2 is None:
             e2 = [ent[0], None]
