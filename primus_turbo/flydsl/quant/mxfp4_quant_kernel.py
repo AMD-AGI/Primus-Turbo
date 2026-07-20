@@ -23,6 +23,7 @@ from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+_OOB = 0x7FFFFFFF  # word offset past any SRD -> buffer_load returns 0 / buffer_store dropped
 BLK = 256
 MB = 32  # MXFP4 micro-block size (elements per e8m0 scale)
 
@@ -239,32 +240,51 @@ def _make_dual_struct(need_scr):
 
 
 def _emit_dual_body(
-    row_rht, col_rht, row_2d, col_2d, lds, tid, X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, bid
+    row_rht, col_rht, row_2d, col_2d, lds, tid, X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, bid,
+    gx=0, gro=0, grsc=0, gco=0, gcsc=0, gmul=1, padded=False, ncblk=None, CP=None, RP=None,
 ):
     """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for
     block ``bid``. ``row_2d``/``col_2d`` select the C++ ``USE_2D_BLOCK`` amax
     geometry via the LDS amax scratch. Shared by the single-recipe and merged
-    A+B kernels."""
-    ncblk = C // _TC
+    A+B kernels. For the batched-3D kernel, ``gx/gro/grsc/gco/gcsc`` are the
+    per-expert element/byte base offsets added to every access and ``gmul`` (=G)
+    widens the SRD bounds to cover the whole 3D tensor (R,C stay per-expert).
+
+    ``padded`` (non-256 K / non-128 N, bit-exact vs the HIP dual whose pad is
+    all-zero): X is the REAL [R,C], but ROW_OUT/ROW_SC use K_pad=CP (=ceil(C/128)*128)
+    columns and COL_OUT/COL_SC use N_pad=RP (=ceil(R/128)*128) columns; the caller
+    zero-inits the outputs so pad regions stay 0. Loads past real C are masked to 0
+    (tail micro-blocks quantize real data; all-zero pad micro-blocks -> scale/data 0,
+    matching HIP). Writes past K_pad (row) / real C rows (col) are redirected to _OOB
+    so the bounds-checked buffer_store drops them. ``ncblk`` = ceil(C/_TC) is passed in
+    (the padded grid tiles over the real C incl its tail)."""
+    if ncblk is None:
+        ncblk = C // _TC
+    cpad = CP if padded else C  # row-out column extent (K_pad)
+    rpad = RP if padded else R  # col-out column extent (N_pad)
     rblk = bid // ncblk
     cblk = bid % ncblk
     r0 = rblk * _TR
     c0w = cblk * _TCW  # i32-word base along C
 
-    # hoisted output SRDs (uniform per block)
+    # hoisted output SRDs (uniform per block; bounds cover all `gmul` experts;
+    # row-out strides on cpad(K_pad), col-out on rpad(N_pad))
     xw = R * (C >> 1)
-    rsrc = buffer_ops.create_buffer_resource(X, max_size=False, num_records_bytes=xw * 4)
-    orsrc = buffer_ops.create_buffer_resource(ROW_OUT, max_size=False, num_records_bytes=R * (C >> 3) * 4)
-    rscrsrc = buffer_ops.create_buffer_resource(ROW_SC, max_size=False, num_records_bytes=R * (C >> 5))
-    corsrc = buffer_ops.create_buffer_resource(COL_OUT, max_size=False, num_records_bytes=C * (R >> 3) * 4)
-    cscrsrc = buffer_ops.create_buffer_resource(COL_SC, max_size=False, num_records_bytes=C * (R >> 5))
+    rsrc = buffer_ops.create_buffer_resource(X, max_size=False, num_records_bytes=xw * 4 * gmul)
+    orsrc = buffer_ops.create_buffer_resource(ROW_OUT, max_size=False, num_records_bytes=R * (cpad >> 3) * 4 * gmul)
+    rscrsrc = buffer_ops.create_buffer_resource(ROW_SC, max_size=False, num_records_bytes=R * (cpad >> 5) * gmul)
+    corsrc = buffer_ops.create_buffer_resource(COL_OUT, max_size=False, num_records_bytes=C * (rpad >> 3) * 4 * gmul)
+    cscrsrc = buffer_ops.create_buffer_resource(COL_SC, max_size=False, num_records_bytes=C * (rpad >> 5) * gmul)
 
     # ---- coalesced tile load -> LDS ----
     for chunk in range_constexpr(_NLOAD):
         tw = chunk * (BLK * 4) + tid * 4
         tr = tw // _TCW
         wc = tw % _TCW
-        goff = (r0 + tr) * (C >> 1) + c0w + wc
+        goff = (r0 + tr) * (C >> 1) + c0w + wc + gx
+        if padded:
+            # mask cols past real C (and rows past real R) -> OOB load returns 0.
+            goff = arith.select(((c0w + wc) < (C >> 1)) & ((r0 + tr) < R), goff, fx.Int32(_OOB))
         vec = buffer_ops.buffer_load(rsrc, goff, vec_width=4, dtype=T.i32)
         _lds_store_vec4(lds.buf.ptr, tw, vec)
     # DS writes must retire before any thread reads the tile (a bare s_barrier
@@ -308,9 +328,14 @@ def _emit_dual_body(
             rwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits))
             grow = r0 + r_row
             gcmb = cblk * _RMBC + cmb
-            ob = grow * (C >> 3) + gcmb * 4
+            ob = grow * (cpad >> 3) + gcmb * 4 + gro
+            sc = grow * (cpad >> 5) + gcmb + grsc
+            if padded:
+                wok = (gcmb < (cpad >> 5)) & (grow < R)
+                ob = arith.select(wok, ob, fx.Int32(_OOB))
+                sc = arith.select(wok, sc, fx.Int32(_OOB))
             _store_words_vec4(orsrc, ob, rwords)
-            buffer_ops.buffer_store(arith.trunci(T.i8, rbiased & 0xFF), rscrsrc, grow * (C >> 5) + gcmb)
+            buffer_ops.buffer_store(arith.trunci(T.i8, rbiased & 0xFF), rscrsrc, sc)
     else:
         for k in range_constexpr(_RROWTASK):
             task = k * BLK + tid
@@ -327,9 +352,14 @@ def _emit_dual_body(
             rwords, rbiased = _finish_microblock(rbits, row_rht)
             grow = r0 + r_row
             gcmb = cblk * (_TC // 32) + cmb
-            ob = grow * (C >> 3) + gcmb * 4
+            ob = grow * (cpad >> 3) + gcmb * 4 + gro
+            sc = grow * (cpad >> 5) + gcmb + grsc
+            if padded:
+                wok = (gcmb < (cpad >> 5)) & (grow < R)
+                ob = arith.select(wok, ob, fx.Int32(_OOB))
+                sc = arith.select(wok, sc, fx.Int32(_OOB))
             _store_words_vec4(orsrc, ob, rwords)
-            buffer_ops.buffer_store(arith.trunci(T.i8, rbiased & 0xFF), rscrsrc, grow * (C >> 5) + gcmb)
+            buffer_ops.buffer_store(arith.trunci(T.i8, rbiased & 0xFF), rscrsrc, sc)
 
     # ---- COL phase: thread = column, 32-row microblocks (strided LDS reads) ----
     c_col = tid
@@ -362,9 +392,14 @@ def _emit_dual_body(
             cwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits))
             gcol = cblk * _TC + c_col
             gmmb = rblk * _RMB + mmb
-            cob = gcol * (R >> 3) + gmmb * 4
+            cob = gcol * (rpad >> 3) + gmmb * 4 + gco
+            csoff = gcol * (rpad >> 5) + gmmb + gcsc
+            if padded:
+                cok = gcol < C  # col-out has real-C rows; drop pad-K rows
+                cob = arith.select(cok, cob, fx.Int32(_OOB))
+                csoff = arith.select(cok, csoff, fx.Int32(_OOB))
             _store_words_vec4(corsrc, cob, cwords)
-            buffer_ops.buffer_store(arith.trunci(T.i8, cbiased & 0xFF), cscrsrc, gcol * (R >> 5) + gmmb)
+            buffer_ops.buffer_store(arith.trunci(T.i8, cbiased & 0xFF), cscrsrc, csoff)
     else:
         for mmb in range_constexpr(_RMB):
             row0 = mmb * 32
@@ -376,9 +411,14 @@ def _emit_dual_body(
             cwords, cbiased = _finish_microblock(cbits, col_rht)
             gcol = cblk * _TC + c_col
             gmmb = rblk * _RMB + mmb
-            cob = gcol * (R >> 3) + gmmb * 4
+            cob = gcol * (rpad >> 3) + gmmb * 4 + gco
+            csoff = gcol * (rpad >> 5) + gmmb + gcsc
+            if padded:
+                cok = gcol < C  # col-out has real-C rows; drop pad-K rows
+                cob = arith.select(cok, cob, fx.Int32(_OOB))
+                csoff = arith.select(cok, csoff, fx.Int32(_OOB))
             _store_words_vec4(corsrc, cob, cwords)
-            buffer_ops.buffer_store(arith.trunci(T.i8, cbiased & 0xFF), cscrsrc, gcol * (R >> 5) + gmmb)
+            buffer_ops.buffer_store(arith.trunci(T.i8, cbiased & 0xFF), cscrsrc, csoff)
 
 
 def _build_dual_kernel(row_rht, col_rht, row_2d=False, col_2d=False):
@@ -739,6 +779,133 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False):
         ent = (fn, grid_x)
         _DUAL_COMPILED[key] = ent
     return ent
+
+
+# ---- Batched-3D dual quant: [G,N,K] weight, all experts in ONE launch (G x the
+# blocks -> fills the GPU even for small per-expert N, where the 2D dense kernel is
+# occupancy-starved and drops to ~2.5 TB/s). Reuses _emit_dual_body per-tile with
+# per-expert base offsets; SRDs cover the whole 3D (gmul=G). ----
+def _build_dual3_kernel(row_rht, col_rht, row_2d=False, col_2d=False, padded=False):
+    _DualSS = _make_dual_struct(bool(row_2d or col_2d))
+
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def _dual3_kernel(
+        X: fx.Tensor,  # int32 view [G, R, C/2] (real)
+        ROW_OUT: fx.Tensor,  # int32 view [G, R, CP/8]
+        ROW_SC: fx.Tensor,  # uint8 [G, R, CP/32]
+        COL_OUT: fx.Tensor,  # int32 view [G, C, RP/8]
+        COL_SC: fx.Tensor,  # uint8 [G, C, RP/32]
+        R: fx.Int32,
+        C: fx.Int32,
+        G: fx.Int32,
+        CP: fx.Int32,  # K_pad (row-out cols); == C when aligned
+        RP: fx.Int32,  # N_pad (col-out cols); == R when aligned
+    ):
+        lds = fx.SharedAllocator().allocate(_DualSS).peek()
+        tid = fx.thread_idx.x
+        cpad = CP if padded else C
+        rpad = RP if padded else R
+        ncblk = ((C + _TC - 1) // _TC) if padded else (C // _TC)  # ceil over real C (incl tail)
+        tpg = (R // _TR) * ncblk  # tiles per expert
+        g = fx.block_idx.x // tpg
+        lbid = fx.block_idx.x - g * tpg
+        _emit_dual_body(
+            row_rht, col_rht, row_2d, col_2d, lds, tid,
+            X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, lbid,
+            gx=g * (R * (C >> 1)), gro=g * (R * (cpad >> 3)), grsc=g * (R * (cpad >> 5)),
+            gco=g * (C * (rpad >> 3)), gcsc=g * (C * (rpad >> 5)), gmul=G,
+            padded=padded, ncblk=ncblk, CP=CP, RP=RP,
+        )
+
+    return _dual3_kernel
+
+
+def _build_dual3_launch(row_rht, col_rht, row_2d=False, col_2d=False, padded=False):
+    kern = _build_dual3_kernel(row_rht, col_rht, row_2d, col_2d, padded)
+
+    @flyc.jit
+    def _dual3_launch(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, grid_x, stream):
+        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP).launch(
+            grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream
+        )
+
+    return _dual3_launch
+
+
+_DUAL3_LAUNCH = {}
+_DUAL3_COMPILED = {}
+
+
+def dual3_eligible(N, K, row_recipe, col_recipe):
+    """True if the batched-3D FlyDSL dual can replace the C++ dual for a [G,N,K]
+    weight (SR off, no preshuffle). Handles non-256 K / non-128 N via K_pad/N_pad
+    (bit-exact vs the HIP dual whose pad is all-zero). Needs N%64==0 (row/col tiling)
+    and K%64==0 (32-microblock + vec4-aligned tail load mask)."""
+    return (
+        not row_recipe.use_sr
+        and not col_recipe.use_sr
+        and not row_recipe.shuffle_scale
+        and not row_recipe.shuffle_out
+        and not col_recipe.shuffle_scale
+        and not col_recipe.shuffle_out
+        and (N % 64 == 0)
+        and (K % 64 == 0)
+    )
+
+
+def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False):
+    """(compiled_fn, grid_x, K_pad, N_pad, padded) for the batched-3D dual at
+    (N,K,G,recipes). K_pad=ceil(K/128)*128 (row-out), N_pad=ceil(N/128)*128 (col-out);
+    `padded` when K not a 256-tile multiple or N not 128-multiple."""
+    Kp = ((K + 127) // 128) * 128
+    Np = ((N + 127) // 128) * 128
+    padded = (K % _TC != 0) or (N % 128 != 0)
+    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded)
+    raw = _DUAL3_LAUNCH.get(lk)
+    if raw is None:
+        raw = _build_dual3_launch(bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded)
+        _DUAL3_LAUNCH[lk] = raw
+    key = (int(N), int(K), int(G), *lk)
+    ent = _DUAL3_COMPILED.get(key)
+    if ent is None:
+        import torch
+
+        x = torch.zeros((G, N, K // 2), dtype=torch.int32, device="cuda")
+        ro = torch.zeros((G, N, Kp // 8), dtype=torch.int32, device="cuda")
+        rs = torch.zeros((G, N, Kp // 32), dtype=torch.uint8, device="cuda")
+        co = torch.zeros((G, K, Np // 8), dtype=torch.int32, device="cuda")
+        cs = torch.zeros((G, K, Np // 32), dtype=torch.uint8, device="cuda")
+        ncblk = ((K + _TC - 1) // _TC) if padded else (K // _TC)
+        grid_x = (N // _TR) * ncblk * G
+        fn = flyc.compile(raw, x, ro, rs, co, cs, N, K, G, Kp, Np, grid_x, torch.cuda.current_stream())
+        ent = (fn, grid_x, Kp, Np, padded)
+        _DUAL3_COMPILED[key] = ent
+    return ent
+
+
+def flydsl_dual_quant_batched(x3d, fp4_dtype, row_rht, col_rht, row_2d=False, col_2d=False):
+    """Batched-3D fused rowwise + colwise-transpose mxfp4 dual cast for a [G,N,K]
+    weight in ONE launch. Returns C++-compatible per-expert
+    (row_data [G,N,K/2], row_scale [G,N,K/32], col_data [G,K,N/2], col_scale [G,K,N/32])."""
+    import torch
+
+    G, N, K = x3d.shape
+    dev = x3d.device
+    x_i32 = x3d.contiguous().view(torch.int32)  # [G, N, K/2]
+    fn, grid_x, Kp, Np, padded = get_dual3_cast(N, K, G, row_rht, col_rht, row_2d, col_2d)
+    # Outputs sized on K_pad/N_pad; zeros so pad regions match the HIP dual (all-0).
+    alloc = torch.zeros if padded else torch.empty
+    ro = alloc((G, N, Kp // 8), dtype=torch.int32, device=dev)
+    rs = alloc((G, N, Kp // 32), dtype=torch.uint8, device=dev)
+    co = alloc((G, K, Np // 8), dtype=torch.int32, device=dev)
+    cs = alloc((G, K, Np // 32), dtype=torch.uint8, device=dev)
+    fn(x_i32, ro, rs, co, cs, N, K, G, Kp, Np, grid_x, torch.cuda.current_stream())
+    return (
+        ro.view(torch.uint8).view(fp4_dtype),
+        rs.view(torch.float8_e8m0fnu),
+        co.view(torch.uint8).view(fp4_dtype),
+        cs.view(torch.float8_e8m0fnu),
+    )
 
 
 # raw @flyc.jit launchers (rht off / on), built once
