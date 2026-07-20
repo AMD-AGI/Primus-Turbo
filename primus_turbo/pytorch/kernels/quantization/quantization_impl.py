@@ -887,6 +887,25 @@ def quantize_mxfp4_impl(
     assert x.is_contiguous(), "The x tensor must be contiguous."
 
     if with_trans:
+        # FlyDSL batched-3D dual quant for the [G,N,K] weight: bit-exact vs the HIP dual
+        # but ~1.3-1.66x faster (all G experts in ONE launch -> G x the blocks, so it is
+        # not occupancy-starved the way the per-expert HIP dual is). fp16 / SR / shuffle /
+        # non-64-N / non-256-K fall through to the HIP dual below.
+        from primus_turbo.flydsl.quant.mxfp4_quant_kernel import dual3_eligible, flydsl_dual_quant_batched
+
+        if (
+            x.ndim == 3
+            and x.dtype == torch.bfloat16
+            and dual3_eligible(x.shape[1], x.shape[2], scaling_recipe, scaling_recipe_for_trans)
+        ):
+            return flydsl_dual_quant_batched(
+                x,
+                out_dtype,
+                scaling_recipe.use_rht,
+                scaling_recipe_for_trans.use_rht,
+                row_2d=scaling_recipe.use_2d_block,
+                col_2d=scaling_recipe_for_trans.use_2d_block,
+            )
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
             x,
             out_dtype,
