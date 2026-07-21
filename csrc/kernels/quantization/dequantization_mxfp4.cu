@@ -46,6 +46,16 @@ __device__ __forceinline__ void cvt_fp4x2_scaled(uint32_t fp4, float scale, OTyp
                      : "v"(fp4), "v"(scale));
         *reinterpret_cast<uint64_t *>(out) = r;
     }
+#elif defined(__gfx1250__)
+    // gfx1250 (CDNA5) only exposes the PK8 scale converter for de-quantization, and
+    // its E8M0 scale is selected cross-lane (lanes 16..31 read lanes 0..15). To keep
+    // each thread's scale independent we run the converter as a pure FP4->F32 unpack
+    // (scale byte = 0x7f == 2^0, opsel 0) and apply the per-thread ``scale`` in
+    // registers. Only the low 2 nibbles of ``fp4`` are meaningful here.
+    typedef float     float32x8_t __attribute__((ext_vector_type(8)));
+    const float32x8_t r = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(fp4, 0x7f7f7f7fu, 0);
+    out[0]              = static_cast<OType>(r[0] * scale);
+    out[1]              = static_cast<OType>(r[1] * scale);
 #else
     __builtin_trap();
 #endif
@@ -154,10 +164,6 @@ void dequantize_mxfp4_impl(const uint8_t *x, OType *y, const int64_t stride_x_ro
                            const int64_t stride_scale_col, const int scale_n_rows,
                            const int scale_n_cols, const int block_size, const bool use_rowwise,
                            hipStream_t stream) {
-    // TODO(ruibin): add kernel support for gfx1250
-    if (is_gfx1250()) {
-        PRIMUS_TURBO_ERROR("dequantize_mxfp4 is not implemented on gfx1250.");
-    }
     (void) stride_x_col; // packed input is contiguous along columns (stride == 1)
     if (n_rows == 0 || n_cols == 0)
         return;

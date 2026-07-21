@@ -258,10 +258,6 @@ void grouped_dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t strid
                                    const int scale_n_rows, const int scale_n_cols,
                                    const int64_t *group_offs, const int64_t *group_offs_padded,
                                    int G, int block_size, bool use_rowwise, hipStream_t stream) {
-    // TODO(ruibin): add kernel support for gfx1250
-    if (is_gfx1250()) {
-        PRIMUS_TURBO_ERROR("grouped_dequantize_mxfp8 is not implemented on gfx1250.");
-    }
     if (total_M == 0 || n_cols == 0)
         return;
 
@@ -289,10 +285,6 @@ void dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t stride_x_row,
                            const int64_t stride_scale_col, const int scale_n_rows,
                            const int scale_n_cols, const int block_size, const bool use_rowwise,
                            hipStream_t stream) {
-    // TODO(ruibin): add kernel support for gfx1250
-    if (is_gfx1250()) {
-        PRIMUS_TURBO_ERROR("dequantize_mxfp8 is not implemented on gfx1250.");
-    }
     (void) stride_x_col; // input is contiguous along columns (stride == 1)
     if (n_rows == 0 || n_cols == 0)
         return;

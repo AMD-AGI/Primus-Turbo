@@ -39,9 +39,9 @@ using namespace primus_turbo::detail;
 // ============================================================================
 
 // Hardware architecture parameters
-constexpr int WARP_SIZE         = 64;  // AMD wavefront size
-constexpr int THREADS_PER_BLOCK = 256; // 4 warps per block
-constexpr int WARPS_PER_BLOCK   = THREADS_PER_BLOCK / WARP_SIZE;
+constexpr int WARP_SIZE         = THREADS_PER_WARP;
+constexpr int WARPS_PER_BLOCK   = 4;
+constexpr int THREADS_PER_BLOCK = WARP_SIZE * WARPS_PER_BLOCK;
 
 // Tile dimensions for main kernel loop
 constexpr int BLOCK_M = 128; // rows per thread block
@@ -214,6 +214,15 @@ __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4(float v0, float v1, float
     // Combine into 16-bit result (4 FP4 values)
     result |= (tmp << 8);
     return result;
+#elif defined(__gfx1250__)
+    // gfx1250 (CDNA5) only exposes the PK8 scale converter (8 f32 -> 8 fp4 with a
+    // single per-lane float32 scale). Pad the upper 4 lanes with zeros and keep the
+    // low 16 bits (4 fp4). Element i maps to nibble i, and the scale divides the
+    // input -- identical semantics to the gfx950 pk_fp4 path.
+    typedef float     float32x8_t __attribute__((ext_vector_type(8)));
+    const float32x8_t v      = {v0, v1, v2, v3, 0.f, 0.f, 0.f, 0.f};
+    const uint32_t    packed = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, scale);
+    return static_cast<uint16_t>(packed & 0xFFFFu);
 #else
     __builtin_trap();
     return 0;
@@ -254,6 +263,13 @@ __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4_sr(float v0, float v1, fl
     // Combine into 16-bit result (4 FP4 values)
     result |= (tmp << 8);
     return result;
+#elif defined(__gfx1250__)
+    // gfx1250 stochastic-rounding PK8 converter: 8 f32 -> 8 fp4 with one rng seed
+    // and a per-lane float32 scale. Pad the upper half and keep the low 4 fp4.
+    typedef float     float32x8_t __attribute__((ext_vector_type(8)));
+    const float32x8_t v      = {v0, v1, v2, v3, 0.f, 0.f, 0.f, 0.f};
+    const uint32_t    packed = __builtin_amdgcn_cvt_scalef32_sr_pk8_fp4_f32(v, rng, scale);
+    return static_cast<uint16_t>(packed & 0xFFFFu);
 #else
     __builtin_trap();
     return 0;
@@ -696,11 +712,17 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
     // Layout: [N_chunk][column_within_chunk][m_chunk]
     __shared__ uint8_t s_colwise_scale[NUM_CHUNKS_N][MXFP4_BLOCK_SIZE][NUM_CHUNKS_M];
 
-    // Zero-initialize for boundary handling (OOB entries stay 0)
-    static_assert(sizeof(s_colwise_fp4) == THREADS_PER_BLOCK * sizeof(uint64_t),
-                  "s_colwise_fp4 size must match thread count for zero-init");
+    // Zero-initialize for boundary handling (OOB entries stay 0). The block width
+    // scales with the wavefront size, so a grid-stride loop covers the buffer for
+    // both 256-thread (gfx950) and 128-thread (gfx1250) blocks.
+    constexpr int COLWISE_FP4_U64 = sizeof(s_colwise_fp4) / sizeof(uint64_t);
+    static_assert(sizeof(s_colwise_fp4) % sizeof(uint64_t) == 0,
+                  "s_colwise_fp4 must be a whole number of uint64_t words");
     if (!shuffle_colwise) {
-        reinterpret_cast<uint64_t *>(s_colwise_fp4)[tid] = 0;
+#pragma unroll
+        for (int i = tid; i < COLWISE_FP4_U64; i += THREADS_PER_BLOCK) {
+            reinterpret_cast<uint64_t *>(s_colwise_fp4)[i] = 0;
+        }
     }
 
     // ========================================================================
@@ -1077,25 +1099,29 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void quantize_mxfp4_dual_kern
         if (!shuffle_colwise) {
             constexpr int ITEMS_PER_COL = NUM_CHUNKS_M * THREADS_PER_ROW;
             constexpr int SEGS_PER_COL  = ITEMS_PER_COL / 4; // uint64_t segments per column
-            static_assert(THREADS_PER_BLOCK == NUM_CHUNKS_N * MXFP4_BLOCK_SIZE * SEGS_PER_COL,
-                          "Thread count must exactly cover all colwise FP4 segments");
+            constexpr int TOTAL_SEGS    = NUM_CHUNKS_N * MXFP4_BLOCK_SIZE * SEGS_PER_COL;
+            static_assert(TOTAL_SEGS % THREADS_PER_BLOCK == 0,
+                          "Thread count must evenly cover all colwise FP4 segments");
 
-            const int n_chunk      = tid / (MXFP4_BLOCK_SIZE * SEGS_PER_COL);
-            const int local_tid    = tid % (MXFP4_BLOCK_SIZE * SEGS_PER_COL);
-            const int col_in_chunk = local_tid / SEGS_PER_COL;
-            const int seg          = local_tid % SEGS_PER_COL;
+#pragma unroll
+            for (int item = tid; item < TOTAL_SEGS; item += THREADS_PER_BLOCK) {
+                const int n_chunk      = item / (MXFP4_BLOCK_SIZE * SEGS_PER_COL);
+                const int local_tid    = item % (MXFP4_BLOCK_SIZE * SEGS_PER_COL);
+                const int col_in_chunk = local_tid / SEGS_PER_COL;
+                const int seg          = local_tid % SEGS_PER_COL;
 
-            const int global_col = base_n + n_chunk * MXFP4_BLOCK_SIZE + col_in_chunk;
+                const int global_col = base_n + n_chunk * MXFP4_BLOCK_SIZE + col_in_chunk;
 
-            if (global_col < N) {
-                const uint64_t data = *reinterpret_cast<const uint64_t *>(
-                    &s_colwise_fp4[n_chunk][col_in_chunk][seg * 4]);
-                const int row_start = base_m + seg * (4 * ELEMS_PER_THREAD);
-                if (row_start < M_pad) {
-                    // Make sure the colwise store bypass L2 cache
-                    __builtin_nontemporal_store(
-                        data, reinterpret_cast<uint64_t *>(colwise_fp4 + global_col * M_packed +
-                                                           base_m / 2 + seg * 8));
+                if (global_col < N) {
+                    const uint64_t data = *reinterpret_cast<const uint64_t *>(
+                        &s_colwise_fp4[n_chunk][col_in_chunk][seg * 4]);
+                    const int row_start = base_m + seg * (4 * ELEMS_PER_THREAD);
+                    if (row_start < M_pad) {
+                        // Make sure the colwise store bypass L2 cache
+                        __builtin_nontemporal_store(
+                            data, reinterpret_cast<uint64_t *>(colwise_fp4 + global_col * M_packed +
+                                                               base_m / 2 + seg * 8));
+                    }
                 }
             }
         }
@@ -1111,14 +1137,10 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
                               int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
                               int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
                               ScalingRecipe colwise_recipe, hipStream_t stream) {
-    // TODO(ruibin): add kernel support for gfx1250
-    if (is_gfx1250()) {
-        PRIMUS_TURBO_ERROR("quantize_mxfp4_dual is not implemented on gfx1250.");
-    }
     // Batched (G > 1) input is handled by replicating the per-matrix grid along
     // blockIdx.z; each z-slice quantizes one (M, N) group offset by its stride.
     dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
-    dim3           block(THREADS_PER_BLOCK);
+    dim3           block(warp_size() * WARPS_PER_BLOCK);
     const uint32_t sr_seed = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
 
     // Per-group strides into the contiguous (G, ...) output/scale buffers. FP4
@@ -1228,14 +1250,10 @@ void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8
                          QuantizeMode mode, int G, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
                          ScalingRecipe recipe, hipStream_t stream) {
-    // TODO(ruibin): add kernel support for gfx1250
-    if (is_gfx1250()) {
-        PRIMUS_TURBO_ERROR("quantize_mxfp4 is not implemented on gfx1250.");
-    }
     // Batched (G > 1) input replicates the per-matrix grid along blockIdx.z;
     // each z-slice quantizes one (M, N) group offset by its per-group stride.
     dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
-    dim3           block(THREADS_PER_BLOCK);
+    dim3           block(warp_size() * WARPS_PER_BLOCK);
     const uint32_t sr_seed = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
 
     // Per-group strides into the contiguous (G, ...) output/scale buffers. FP4
@@ -1375,9 +1393,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp4_d
         s_colwise_fp4[NUM_CHUNKS_N][MXFP4_BLOCK_SIZE][NUM_CHUNKS_M * THREADS_PER_ROW];
     __shared__ uint8_t s_colwise_scale[NUM_CHUNKS_N][MXFP4_BLOCK_SIZE][NUM_CHUNKS_M];
 
-    static_assert(sizeof(s_colwise_fp4) == THREADS_PER_BLOCK * sizeof(uint64_t),
-                  "s_colwise_fp4 size must match thread count for zero-init");
-    reinterpret_cast<uint64_t *>(s_colwise_fp4)[tid] = 0;
+    constexpr int COLWISE_FP4_U64 = sizeof(s_colwise_fp4) / sizeof(uint64_t);
+    static_assert(sizeof(s_colwise_fp4) % sizeof(uint64_t) == 0,
+                  "s_colwise_fp4 must be a whole number of uint64_t words");
+#pragma unroll
+    for (int i = tid; i < COLWISE_FP4_U64; i += THREADS_PER_BLOCK) {
+        reinterpret_cast<uint64_t *>(s_colwise_fp4)[i] = 0;
+    }
 
     for (int round = 0; round < TOTAL_CHUNKS; round += WARPS_PER_BLOCK) {
         const int chunk_idx = round + warp_id;
@@ -1655,24 +1677,28 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp4_d
 
         constexpr int ITEMS_PER_COL = NUM_CHUNKS_M * THREADS_PER_ROW;
         constexpr int SEGS_PER_COL  = ITEMS_PER_COL / 4; // uint64_t segments per column
-        static_assert(THREADS_PER_BLOCK == NUM_CHUNKS_N * MXFP4_BLOCK_SIZE * SEGS_PER_COL,
-                      "Thread count must exactly cover all colwise FP4 segments");
+        constexpr int TOTAL_SEGS    = NUM_CHUNKS_N * MXFP4_BLOCK_SIZE * SEGS_PER_COL;
+        static_assert(TOTAL_SEGS % THREADS_PER_BLOCK == 0,
+                      "Thread count must evenly cover all colwise FP4 segments");
 
-        const int n_chunk      = tid / (MXFP4_BLOCK_SIZE * SEGS_PER_COL);
-        const int local_tid    = tid % (MXFP4_BLOCK_SIZE * SEGS_PER_COL);
-        const int col_in_chunk = local_tid / SEGS_PER_COL;
-        const int seg          = local_tid % SEGS_PER_COL;
+#pragma unroll
+        for (int item = tid; item < TOTAL_SEGS; item += THREADS_PER_BLOCK) {
+            const int n_chunk      = item / (MXFP4_BLOCK_SIZE * SEGS_PER_COL);
+            const int local_tid    = item % (MXFP4_BLOCK_SIZE * SEGS_PER_COL);
+            const int col_in_chunk = local_tid / SEGS_PER_COL;
+            const int seg          = local_tid % SEGS_PER_COL;
 
-        const int global_col = base_n + n_chunk * MXFP4_BLOCK_SIZE + col_in_chunk;
-        if (global_col < N) {
-            const uint64_t data =
-                *reinterpret_cast<const uint64_t *>(&s_colwise_fp4[n_chunk][col_in_chunk][seg * 4]);
-            const int row_start = base_m + seg * (4 * ELEMS_PER_THREAD);
-            if (row_start < M_pad_col) {
-                __builtin_nontemporal_store(
-                    data, reinterpret_cast<uint64_t *>(colwise_fp4 +
-                                                       static_cast<int64_t>(global_col) * M_packed +
-                                                       base_m / 2 + seg * 8));
+            const int global_col = base_n + n_chunk * MXFP4_BLOCK_SIZE + col_in_chunk;
+            if (global_col < N) {
+                const uint64_t data = *reinterpret_cast<const uint64_t *>(
+                    &s_colwise_fp4[n_chunk][col_in_chunk][seg * 4]);
+                const int row_start = base_m + seg * (4 * ELEMS_PER_THREAD);
+                if (row_start < M_pad_col) {
+                    __builtin_nontemporal_store(
+                        data, reinterpret_cast<uint64_t *>(
+                                  colwise_fp4 + static_cast<int64_t>(global_col) * M_packed +
+                                  base_m / 2 + seg * 8));
+                }
             }
         }
     }
@@ -1687,17 +1713,13 @@ void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *
                                       int colwise_scale_stride, int rowwise_scale_N,
                                       int colwise_scale_N, ScalingRecipe rowwise_recipe,
                                       ScalingRecipe colwise_recipe, hipStream_t stream) {
-    // TODO(ruibin): add kernel support for gfx1250
-    if (is_gfx1250()) {
-        PRIMUS_TURBO_ERROR("grouped_quantize_mxfp4_dual is not implemented on gfx1250.");
-    }
     PRIMUS_TURBO_CHECK(rowwise_recipe.shuffle_out == false && rowwise_recipe.shuffle_scale == false,
                        "grouped MXFP4 dual does not support shuffle");
     PRIMUS_TURBO_CHECK(colwise_recipe.shuffle_out == false && colwise_recipe.shuffle_scale == false,
                        "grouped MXFP4 dual does not support shuffle");
 
     dim3           grid((M_pad_col + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
-    dim3           block(THREADS_PER_BLOCK);
+    dim3           block(warp_size() * WARPS_PER_BLOCK);
     const uint32_t sr_seed = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
 
 #define GROUPED_QUANTIZE_MXFP4_DUAL_ARGS                                                           \
@@ -2031,15 +2053,11 @@ void grouped_quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *outpu
                                  const int64_t *group_offs_padded_colwise, QuantizeMode mode, int G,
                                  int total_M, int N, int M_pad_col, int N_pad, int scale_stride,
                                  int scale_N, ScalingRecipe recipe, hipStream_t stream) {
-    // TODO(ruibin): add kernel support for gfx1250
-    if (is_gfx1250()) {
-        PRIMUS_TURBO_ERROR("grouped_quantize_mxfp4 is not implemented on gfx1250.");
-    }
     PRIMUS_TURBO_CHECK(recipe.shuffle_out == false && recipe.shuffle_scale == false,
                        "grouped MXFP4 single does not support shuffle");
 
     dim3           grid((M_pad_col + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
-    dim3           block(THREADS_PER_BLOCK);
+    dim3           block(warp_size() * WARPS_PER_BLOCK);
     const uint32_t sr_seed = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
 
 #define GROUPED_QUANTIZE_MXFP4_ARGS                                                                \
