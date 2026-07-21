@@ -265,6 +265,7 @@ def _emit_dual_body(
     CP=None,
     RP=None,
     col_locality=False,
+    batched=False,
 ):
     """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for block
     ``bid``. ``row_2d``/``col_2d`` pick the C++ ``USE_2D_BLOCK`` amax geometry; the
@@ -290,29 +291,47 @@ def _emit_dual_body(
     r0 = rblk * _TR
     c0w = cblk * _TCW  # i32-word base along C
 
-    # hoisted output SRDs (uniform per block; bounds cover all `gmul` experts;
-    # row-out strides on cpad(K_pad), col-out on rpad(N_pad))
-    xw = R * (C >> 1)
-    rsrc = buffer_ops.create_buffer_resource(X, max_size=False, num_records_bytes=xw * 4 * gmul)
-    orsrc = buffer_ops.create_buffer_resource(
-        ROW_OUT, max_size=False, num_records_bytes=R * (cpad >> 3) * 4 * gmul
-    )
-    rscrsrc = buffer_ops.create_buffer_resource(
-        ROW_SC, max_size=False, num_records_bytes=R * (cpad >> 5) * gmul
-    )
-    corsrc = buffer_ops.create_buffer_resource(
-        COL_OUT, max_size=False, num_records_bytes=C * (rpad >> 3) * 4 * gmul
-    )
-    cscrsrc = buffer_ops.create_buffer_resource(
-        COL_SC, max_size=False, num_records_bytes=C * (rpad >> 5) * gmul
-    )
+    # Output SRDs are re-based in int64 with per-tile / per-expert num_records. A whole-tensor
+    # SRD would need num_records = full bytes, which overflows the 32-bit num_records field
+    # once the operand exceeds 4GB (high rows/experts OOB -> garbage) and drives a per-row byte
+    # voffset past int32. 2D folds THIS tile's row (r0) / col (cblk*_TC) base -> num_records
+    # per-tile; batched-3D folds the per-EXPERT base (gx/... , experts small so r0/c0 stay in
+    # the offsets). ``_row0``/``_col0`` drop the folded base from the additive offsets below.
+    _fold = not batched
+    _row0 = fx.Int32(0) if _fold else r0
+    _col0 = fx.Int32(0) if _fold else cblk * _TC
+
+    def _srd(t, elem_off, elem_bytes, nrec_bytes):
+        base = arith.index_cast(T.i64, buffer_ops.extract_base_index(t))
+        boff = arith.index_cast(T.i64, arith.index_cast(T.index, elem_off) * arith.index(elem_bytes))
+        raw = arith._to_raw(base + boff)
+        r = rocdl.readfirstlane(res=raw.type, src=raw)  # pin the SRD base to an SGPR
+        base_v = r.result if hasattr(r, "result") else r
+        nr = arith.minui(arith.index_cast(T.index, nrec_bytes), arith.index(0x7FFFFFFF))
+        return buffer_ops.create_buffer_resource_from_addr(base_v, num_records_bytes=nr)
+
+    if batched:
+        rsrc = _srd(X, gx, 4, R * (C >> 1) * 4)
+        orsrc = _srd(ROW_OUT, gro, 4, R * (cpad >> 3) * 4)
+        rscrsrc = _srd(ROW_SC, grsc, 1, R * (cpad >> 5))
+        corsrc = _srd(COL_OUT, gco, 4, C * (rpad >> 3) * 4)
+        cscrsrc = _srd(COL_SC, gcsc, 1, C * (rpad >> 5))
+        gx = gro = grsc = gco = gcsc = 0  # expert bases folded into the SRDs above
+    else:
+        r0i = arith.index_cast(T.index, r0)
+        c0i = arith.index_cast(T.index, cblk * _TC)
+        rsrc = _srd(X, r0i * arith.index_cast(T.index, C >> 1), 4, _TR * (C >> 1) * 4)
+        orsrc = _srd(ROW_OUT, r0i * arith.index_cast(T.index, cpad >> 3), 4, _TR * (cpad >> 3) * 4)
+        rscrsrc = _srd(ROW_SC, r0i * arith.index_cast(T.index, cpad >> 5), 1, _TR * (cpad >> 5))
+        corsrc = _srd(COL_OUT, c0i * arith.index_cast(T.index, rpad >> 3), 4, _TC * (rpad >> 3) * 4)
+        cscrsrc = _srd(COL_SC, c0i * arith.index_cast(T.index, rpad >> 5), 1, _TC * (rpad >> 5))
 
     # ---- coalesced tile load -> LDS ----
     for chunk in range_constexpr(_NLOAD):
         tw = chunk * (BLK * 4) + tid * 4
         tr = tw // _TCW
         wc = tw % _TCW
-        goff = (r0 + tr) * (C >> 1) + c0w + wc + gx
+        goff = (_row0 + tr) * (C >> 1) + c0w + wc + gx
         if padded:
             # mask cols past real C -> OOB load returns 0 (rows always valid: R%64==0,
             # tile is 64 rows, rblk covers exactly R/64 tiles).
@@ -358,7 +377,7 @@ def _emit_dual_body(
                 tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, (row_base + i) * _RMBC + cmb))
             native_bits, rbiased = _compute_scale_native(tile_amax)
             rwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits))
-            grow = r0 + r_row
+            grow = _row0 + r_row
             gcmb = cblk * _RMBC + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
             sc = grow * (cpad >> 5) + gcmb + grsc
@@ -382,7 +401,7 @@ def _emit_dual_body(
                     rbits.append(word << 16)
                     rbits.append(word & 0xFFFF0000)
             rwords, rbiased = _finish_microblock(rbits, row_rht)
-            grow = r0 + r_row
+            grow = _row0 + r_row
             gcmb = cblk * (_TC // 32) + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
             sc = grow * (cpad >> 5) + gcmb + grsc
@@ -422,7 +441,7 @@ def _emit_dual_body(
                 tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, mmb * _TC + col_base + i))
             native_bits, cbiased = _compute_scale_native(tile_amax)
             cwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits))
-            gcol = cblk * _TC + c_col
+            gcol = _col0 + c_col
             gmmb = rblk * _RMB + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
             csoff = gcol * (rpad >> 5) + gmmb + gcsc
@@ -441,7 +460,7 @@ def _emit_dual_body(
                 fb = arith.select(half != 0, word & fx.Int32(-65536), word << 16)
                 cbits.append(fb)
             cwords, cbiased = _finish_microblock(cbits, col_rht)
-            gcol = cblk * _TC + c_col
+            gcol = _col0 + c_col
             gmmb = rblk * _RMB + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
             csoff = gcol * (rpad >> 5) + gmmb + gcsc
@@ -628,17 +647,21 @@ def _build_dual3_kernel(row_rht, col_rht, row_2d=False, col_2d=False, padded=Fal
             R,
             C,
             lbid,
-            gx=g * (R * (C >> 1)),
-            gro=g * (R * (cpad >> 3)),
-            grsc=g * (R * (cpad >> 5)),
-            gco=g * (C * (rpad >> 3)),
-            gcsc=g * (C * (rpad >> 5)),
+            # per-expert element bases in index (64-bit): g * per_expert_elems overflows
+            # int32 for large-G MoE (e.g. G=64: 63 * N*K/2 > 2^31); _emit_dual_body folds
+            # these into per-expert int64 SRD bases.
+            gx=arith.index_cast(T.index, g) * arith.index_cast(T.index, R * (C >> 1)),
+            gro=arith.index_cast(T.index, g) * arith.index_cast(T.index, R * (cpad >> 3)),
+            grsc=arith.index_cast(T.index, g) * arith.index_cast(T.index, R * (cpad >> 5)),
+            gco=arith.index_cast(T.index, g) * arith.index_cast(T.index, C * (rpad >> 3)),
+            gcsc=arith.index_cast(T.index, g) * arith.index_cast(T.index, C * (rpad >> 5)),
             gmul=G,
             padded=padded,
             ncblk=ncblk,
             CP=CP,
             RP=RP,
             col_locality=col_locality,
+            batched=True,
         )
 
     return _dual3_kernel

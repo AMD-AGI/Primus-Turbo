@@ -29,7 +29,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     _readfirstlane_i32,
     ceildiv,
-    make_fp8_buffer_tensor,
+    make_fp8_rebased_tensor_and_srd,
     wait_barrier,
     xcd_remap_pid,
 )
@@ -247,19 +247,10 @@ def _build_grouped_mxfp4_nt_kernel(
         wave_n = wave_id % 2
         I32 = fx.Int32
 
-        # ---- tile-independent setup ----
-        gA = make_fp8_buffer_tensor(A, F8)
-        gB = make_fp8_buffer_tensor(B_T, F8)
-        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
-        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+        # ---- tile-independent setup (operand SRDs/loaders built per-tile below, rebased) ----
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk)
         gl_off_a = fp4_g2s_offsets(lane_id, wave_id, _KR, N_LDS_STEPS_A, BPR, swizzle=swizzle)
         gl_off_b = fp4_g2s_offsets(lane_id, wave_id, _KR, N_LDS_STEPS_BH, BPR, swizzle=swizzle)
-        rsrc_a = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=c_m * K2)
-        rsrc_b = buffer_ops.create_buffer_resource(B_T, max_size=False, num_records_bytes=I32(G) * c_n * K2)
-        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8, wave_id)
-        bl_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8, wave_id)
-        br_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8, wave_id)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, LDS_ROW_STRIDE, swizzle=swizzle)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_BH, LDS_ROW_STRIDE, swizzle=swizzle)
         _qn = ((c_n + 63) // 64) * 64
@@ -360,10 +351,26 @@ def _build_grouped_mxfp4_nt_kernel(
         bm, bn = _grouped_block_mn(local, m_start, m_end, NBK, BLOCK_M, group_m, group_n)
 
         m_row = m_start + bm * I32(BLOCK_M)  # tight A/C row base
-        a_off = m_row * K2
-        b_base = group_idx * c_n * K2
-        bl_off = b_base + bn * I32(BLOCK_N) * K2
-        br_off = b_base + (bn * I32(BLOCK_N) + I32(LDS_BN_HALF)) * K2
+        # Fold the tile's A row base + per-expert/col B base into the operand SRDs in int64:
+        # large-G MoE (group_idx*c_n*K2) / large total_M (m_row*K2) exceed 2^31, which the
+        # whole-loop's int32 voffset/soffset cannot reach. Residual offsets stay intra-tile.
+        a_base_e = arith.index_cast(T.index, m_row) * arith.index(K2)
+        b_base_e = (
+            arith.index_cast(T.index, group_idx) * arith.index_cast(T.index, c_n)
+            + arith.index_cast(T.index, bn) * arith.index(BLOCK_N)
+        ) * arith.index(K2)
+        a_nrec = (arith.index_cast(T.index, c_m) - arith.index_cast(T.index, m_row)) * arith.index(K2)
+        b_nrec = arith.index(G) * arith.index_cast(T.index, c_n) * arith.index(K2) - b_base_e
+        gA, rsrc_a = make_fp8_rebased_tensor_and_srd(A, F8, a_base_e, a_nrec)
+        gB, rsrc_b = make_fp8_rebased_tensor_and_srd(B_T, F8, b_base_e, b_nrec)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8, wave_id)
+        bl_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8, wave_id)
+        br_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8, wave_id)
+        a_off = I32(0)  # A/B tile+expert bases folded into the SRDs above; only the LDS-half
+        bl_off = I32(0)  # column shift (br) survives as an int32-safe intra-tile residual.
+        br_off = I32(LDS_BN_HALF) * K2
         # A-scale slab row base (256-aligned): a_pre_g*64 + bm*256 + wave off
         sa_b = a_pre_g * I32(64) + bm * I32(BLOCK_M) + I32(wave_m_off)
         sbl_b = bn * I32(BLOCK_N) + I32(wave_n_off)
@@ -543,10 +550,15 @@ def grouped_gemm_mxfp4_flydsl_kernel(
 
     a_raw = asu.contiguous().view(torch.int32).reshape(-1)
     b_raw = bsu.contiguous().view(torch.int32).reshape(-1)
-    a8 = au.contiguous().view(torch.int8).reshape(-1)
-    b8 = bu.contiguous().view(torch.int8).reshape(-1)
+    # Keep the fp4 operands multi-dim (do NOT flatten to 1D): a large-G MoE B holds
+    # G*N*K/2 > 2^31 int8s, and flydsl packs a 1D tensor's single dim as int32 (host
+    # CABI overflow). Multi-dim keeps every dim/stride int32; the kernel addresses via
+    # the rebased base (make_fp8_rebased_tensor_and_srd), independent of the shape.
+    a8 = au.contiguous().view(torch.int8)
+    b8 = bu.contiguous().view(torch.int8)
+    # 2D C (NOT flattened): StoreCPlain re-bases per row band from C's base + c_n, so the
+    # shape only needs each dim int32; a 1D total_M*N view overflows the CABI for large M*N.
     out = torch.empty((total_M, N), dtype=out_dtype, device=dev)
-    out_flat = out.view(-1)
 
     go = (group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)).view(torch.int32)
     a_sp, b_sp, slab_rows = _get_grouped_mxfp4_ws(total_M, N, K128, G, dev)
@@ -560,7 +572,7 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     args = (
         a8,
         b8,
-        out_flat,
+        out,
         a_raw,
         b_raw,
         a_sp,
@@ -668,18 +680,10 @@ def _build_grouped_mxfp4_wgrad_kernel(
         wave_n = wave_id % 2
         I32 = fx.Int32
 
-        gA = make_fp8_buffer_tensor(A, F8)
-        gB = make_fp8_buffer_tensor(B_T, F8)
-        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
-        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+        # operand SRDs/loaders built per-tile below (rebased); tile-independent parts here.
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk)
         gl_off_a = fp4_g2s_offsets(lane_id, wave_id, M_total, N_LDS_STEPS_A, BPR, swizzle=swizzle)
         gl_off_b = fp4_g2s_offsets(lane_id, wave_id, M_total, N_LDS_STEPS_BH, BPR, swizzle=swizzle)
-        rsrc_a = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=I32(OUT_M) * I32(M2))
-        rsrc_b = buffer_ops.create_buffer_resource(B_T, max_size=False, num_records_bytes=I32(OUT_N) * I32(M2))
-        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8, wave_id)
-        bl_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8, wave_id)
-        br_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8, wave_id)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, LDS_ROW_STRIDE, swizzle=swizzle)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_BH, LDS_ROW_STRIDE, swizzle=swizzle)
         _qm = ((OUT_M + 63) // 64) * 64
@@ -736,9 +740,24 @@ def _build_grouped_mxfp4_wgrad_kernel(
 
         a_row = block_m * I32(BLOCK_M)
         b_row = block_n * I32(BLOCK_N)
-        a_off = a_row * I32(M2) + (m_start >> 1)
-        bl_off = b_row * I32(M2) + (m_start >> 1)
-        br_off = (b_row + I32(LDS_BN_HALF)) * I32(M2) + (m_start >> 1)
+        # Fold the tile's row base + per-group contraction start into the operand SRDs in
+        # int64: a_row*M2 (large OUT_M) and the m_start byte offset (large M_total) push the
+        # start past 2^31, unreachable by the whole-loop's int32 voffset/soffset.
+        _ms2 = arith.index_cast(T.index, m_start >> 1)
+        a_base_e = arith.index_cast(T.index, a_row) * arith.index(M2) + _ms2
+        b_base_e = arith.index_cast(T.index, b_row) * arith.index(M2) + _ms2
+        a_nrec = arith.index(OUT_M) * arith.index(M2) - a_base_e
+        b_nrec = arith.index(OUT_N) * arith.index(M2) - b_base_e
+        gA, rsrc_a = make_fp8_rebased_tensor_and_srd(A, F8, a_base_e, a_nrec)
+        gB, rsrc_b = make_fp8_rebased_tensor_and_srd(B_T, F8, b_base_e, b_nrec)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8, wave_id)
+        bl_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8, wave_id)
+        br_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8, wave_id)
+        a_off = I32(0)  # tile row base + contraction start folded into the SRDs above; only
+        bl_off = I32(0)  # br's LDS-half row shift survives as an int32-safe residual.
+        br_off = I32(LDS_BN_HALF) * I32(M2)
         sa_b = a_row + I32(wave_m_off)
         sbl_b = b_row + I32(wave_n_off)
         sbr_b = b_row + I32(LDS_BN_HALF) + I32(wave_n_off)
@@ -851,20 +870,24 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     dev = lhs.device
     out_fp16 = out_dtype == torch.float16
 
-    a8 = lhs.contiguous().view(torch.int8).reshape(-1)
-    b8 = rhs.contiguous().view(torch.int8).reshape(-1)
+    # Keep the fp4 operands 2D (do NOT flatten): a large total_M makes OUT_*/2 * M/2
+    # exceed 2^31 int8s, which flydsl packs as an int32 dim (host CABI overflow). The
+    # kernel addresses via the rebased base, independent of the operand shape.
+    a8 = lhs.contiguous().view(torch.int8)
+    b8 = rhs.contiguous().view(torch.int8)
     a_raw = lhs_scale.contiguous().view(torch.int32).reshape(-1)
     b_raw = rhs_scale.contiguous().view(torch.int32).reshape(-1)
     go_pad = (group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)).view(torch.int32)
 
     K128m = M_total // 128
     a_sp, b_sp = _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, dev)
+    # 3D C (NOT flattened): StoreCPlain re-bases per row band from C's base + OUT_N; a 1D
+    # G*OUT_M*OUT_N view overflows the CABI for large-G MoE grad_b (> 2^31 elems).
     out = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=dev)
-    out_flat = out.view(-1)
 
     stream = torch.cuda.current_stream()
     wlv, elgk = 10, 9
-    args = (a8, b8, out_flat, a_raw, b_raw, a_sp, b_sp, go_pad, stream)
+    args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go_pad, stream)
 
     def _entry(cfg):
         gm, xcd, gn = cfg
