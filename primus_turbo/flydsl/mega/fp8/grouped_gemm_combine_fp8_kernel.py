@@ -630,7 +630,14 @@ def _compile_bwd(
                 else:
                     if block_m < real_tiles:
                         _do_gemm_tile(block_m, block_n)
-                    else:
+                    elif const_expr(num_reduce_cu == 0):
+                        # TAIL reduce (only when there are NO dedicated reduce CUs). With dedicated
+                        # reduce (num_reduce_cu>0) the empty GEMM blocks stay IDLE: a tail reduce
+                        # block can become resident and spin for a flag whose producing GEMM tile is
+                        # still queued behind it -> co-scheduling deadlock (fp8 bwd: heavier mxfp8
+                        # GEMM K=2I + lower occupancy widen the window vs the fwd/bf16 tail reduce).
+                        # Dedicated reduce sits at LOW grid indices (resident from t=0, never blocks a
+                        # GEMM tile), so it covers all tokens deadlock-free.
                         empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
                         total_empty_warps = (
                             fx.Int32(gemm_grid_blocks) - real_tiles * fx.Int32(n_blocks)
@@ -752,28 +759,32 @@ def grouped_gemm_combine_fp8(
 
 
 def grouped_gemm_combine_fp8_bwd(
-    grad_l1, w1t, handle, group, *, topk_indices, grad_gate, BM=256, BN=256,
-    num_combine_cu=16, num_reduce_cu=0, w1t_fp8=None,
+    grad_l1, w1t_fp8, handle, group, *, topk_indices, grad_gate, BM=256, BN=256,
+    num_combine_cu=16, num_reduce_cu=0,
 ):
     """Backward STEP3, FP8-PUSH: mxfp8 fc1-dgrad (``grad_l1 @ w1t^T``) with a CShuffle mxfp8-quant
     epilogue -> LOCAL fp8 dx pool -> FP8 combine PUSH (+ gate scatter) -> UNWEIGHTED fp8-dequant
-    reduce (+ ``d_topk_w`` fold). The fp8-PUSH analog of ``grouped_gemm_combine_mxfp8_bwd`` (which
-    pushes bf16 dx), mirroring the production forward ``grouped_gemm_combine_fp8``.
+    reduce (+ ``d_topk_w`` fold). The fp8-PUSH analog / backward mirror of the production forward
+    ``grouped_gemm_combine_fp8``.
 
-    ``grad_l1`` [M, 2I] bf16 (M = num_max_pool_tokens; routing weight already folded upstream),
-    ``w1t`` [G, H, 2I] bf16 (w1 transposed, contraction 2I), ``grad_gate`` [M] f32. Returns
-    ``(dx [num_tokens, H] bf16, d_topk_w [combine_slots] f32)``. Caller inits ``symm.barrier_local``
-    =-1, ``symm.sb_l2``=0, ``symm.combine_gate``=0 (cross-rank barrier'd) before calling."""
+    PURE COMPUTE: the fc1^T weight comes in ALREADY prepared as ``w1t_fp8 = (weight_flat, b_sp)``
+    (build once with :func:`prepare_w2_fp8` on ``w1^T`` [G,H,2I], op-layer version-keyed) -- no weight
+    prep here. ``grad_l1`` [M, 2I] bf16 (M = num_max_pool_tokens; routing weight already folded
+    upstream) is the A operand, quantized rowwise-mxfp8 internally; ``grad_gate`` [M] f32. Shapes:
+    K=2I from ``grad_l1``, H / G from ``sym_layout``. Returns ``(dx [num_tokens, H] bf16, d_topk_w
+    [combine_slots] f32)``. Caller inits ``symm.barrier_local``=-1, ``symm.sb_l2``=0,
+    ``symm.combine_gate``=0 (cross-rank barrier'd) before calling."""
     from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
 
-    assert grad_l1.dtype == torch.bfloat16 and w1t.dtype == torch.bfloat16
+    assert grad_l1.dtype == torch.bfloat16
+    weight_flat, b_sp = w1t_fp8
     tile_to_expert = handle[7]
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.make_sym_layout()
     M, K = grad_l1.shape  # K = 2I (fc1 gate||up contraction)
-    G, H, Kw = w1t.shape
-    assert Kw == K, f"w1^T K={Kw} != grad_l1 K={K}"
-    assert H == int(sym_layout.hidden) and M == int(sym_layout.num_max_pool_tokens)
+    H = int(sym_layout.hidden)
+    G = int(sym_layout.num_experts_per_rank)
+    assert M == int(sym_layout.num_max_pool_tokens)
     out_features = H
     combine_slots = int(sym_layout.combine_slots)
     num_ranks = int(sym_layout.num_ranks)
@@ -799,9 +810,10 @@ def grouped_gemm_combine_fp8_bwd(
 
     # act = grad_l1 rowwise mxfp8 (preshuffled a_sp); w1t prepared (grouped mxfp8 quant + preshuffle
     # b_sp). Mirror the forward mxgemm host path; E4M3 (dx PUSH format = the CShuffle epilogue's E4M3).
+    # grad_l1 (A operand) rowwise mxfp8 quant (preshuffled a_sp) -- per-call token work; w1^T is
+    # already prepared (weight_flat + b_sp) at the op layer, so there is NO weight prep here.
     aq, a_sp = quantize_rowwise_mxfp8_flydsl(grad_l1.contiguous(), preshuffle=True)
     act_flat = aq.view(torch.int8).reshape(-1)
-    weight_flat, b_sp = w1t_fp8 if w1t_fp8 is not None else prepare_w2_fp8(w1t)  # prepare is shape-generic
 
     launch = _compile_bwd(
         out_features, K, M, BM, BN, int(num_combine_cu), int(num_reduce_cu),
