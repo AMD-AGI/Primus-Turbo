@@ -210,7 +210,7 @@ def _finish_microblock(vbits, use_rht):
     return words, biased
 
 
-# ---- fused-dual tile geometry (shared by the single and merged kernels) ----
+# ---- fused-dual tile geometry (shared by the 2D and batched-3D kernels) ----
 _TR = 64  # tile rows (R dim); 2 col-microblocks/tile, 32KB LDS (occ 2)
 _TC = 256  # tile cols (C dim)
 _TCW = _TC // 2  # 128 i32 words per tile row
@@ -240,35 +240,46 @@ def _make_dual_struct(need_scr):
 
 
 def _emit_dual_body(
-    row_rht, col_rht, row_2d, col_2d, lds, tid, X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, bid,
-    gx=0, gro=0, grsc=0, gco=0, gcsc=0, gmul=1, padded=False, ncblk=None, CP=None, RP=None,
+    row_rht,
+    col_rht,
+    row_2d,
+    col_2d,
+    lds,
+    tid,
+    X,
+    ROW_OUT,
+    ROW_SC,
+    COL_OUT,
+    COL_SC,
+    R,
+    C,
+    bid,
+    gx=0,
+    gro=0,
+    grsc=0,
+    gco=0,
+    gcsc=0,
+    gmul=1,
+    padded=False,
+    ncblk=None,
+    CP=None,
+    RP=None,
     col_locality=False,
 ):
-    """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for
-    block ``bid``. ``row_2d``/``col_2d`` select the C++ ``USE_2D_BLOCK`` amax
-    geometry via the LDS amax scratch. Shared by the single-recipe and merged
-    A+B kernels. For the batched-3D kernel, ``gx/gro/grsc/gco/gcsc`` are the
-    per-expert element/byte base offsets added to every access and ``gmul`` (=G)
-    widens the SRD bounds to cover the whole 3D tensor (R,C stay per-expert).
-
-    ``padded`` (non-256 K / non-128 N, bit-exact vs the HIP dual whose pad is
-    all-zero): X is the REAL [R,C], but ROW_OUT/ROW_SC use K_pad=CP (=ceil(C/128)*128)
-    columns and COL_OUT/COL_SC use N_pad=RP (=ceil(R/128)*128) columns; the caller
-    zero-inits the outputs so pad regions stay 0. Loads past real C are masked to 0
-    (tail micro-blocks quantize real data; all-zero pad micro-blocks -> scale/data 0,
-    matching HIP). Writes past K_pad (row) / real C rows (col) are redirected to _OOB
-    so the bounds-checked buffer_store drops them. ``ncblk`` = ceil(C/_TC) is passed in
-    (the padded grid tiles over the real C incl its tail)."""
+    """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for block
+    ``bid``. ``row_2d``/``col_2d`` pick the C++ ``USE_2D_BLOCK`` amax geometry; the
+    batched-3D kernel passes per-expert base offsets ``gx/gro/grsc/gco/gcsc`` and
+    ``gmul=G`` to widen the SRDs over the whole 3D tensor (R,C stay per-expert).
+    ``padded`` (non-256 K / non-128 N): X is the real [R,C] but outputs use K_pad=CP /
+    N_pad=RP cols (caller zero-inits so pad stays 0, matching HIP); loads past real C
+    mask to 0 and writes past K_pad / real-C rows go to _OOB so the store drops them."""
     if ncblk is None:
         ncblk = C // _TC
     cpad = CP if padded else C  # row-out column extent (K_pad)
     rpad = RP if padded else R  # col-out column extent (N_pad)
-    # Block order picks which output's partial stores L2 gets to combine:
-    #  - col_locality (C>R, e.g. down-proj): row-tile-fastest, so the ~R/_TR blocks
-    #    that write the SAME col-out rows (fixed gcol=cblk*_TC) at different rblk
-    #    column-bands run back-to-back -> L2 merges their 32B transpose stores into
-    #    full lines (kills the ~2x write-amp that made large-C shapes write-bound).
-    #  - else (R>=C, e.g. gate/up, square): col-tile-fastest keeps row-out coalesced.
+    # Block order = which output's partial stores L2 can combine. col_locality (C>R):
+    # row-tile-fastest so blocks writing the same col-out rows run back-to-back and L2
+    # merges the scattered transpose stores; else col-tile-fastest keeps row-out coalesced.
     if col_locality:
         nrblk = R // _TR
         cblk = bid // nrblk
@@ -283,10 +294,18 @@ def _emit_dual_body(
     # row-out strides on cpad(K_pad), col-out on rpad(N_pad))
     xw = R * (C >> 1)
     rsrc = buffer_ops.create_buffer_resource(X, max_size=False, num_records_bytes=xw * 4 * gmul)
-    orsrc = buffer_ops.create_buffer_resource(ROW_OUT, max_size=False, num_records_bytes=R * (cpad >> 3) * 4 * gmul)
-    rscrsrc = buffer_ops.create_buffer_resource(ROW_SC, max_size=False, num_records_bytes=R * (cpad >> 5) * gmul)
-    corsrc = buffer_ops.create_buffer_resource(COL_OUT, max_size=False, num_records_bytes=C * (rpad >> 3) * 4 * gmul)
-    cscrsrc = buffer_ops.create_buffer_resource(COL_SC, max_size=False, num_records_bytes=C * (rpad >> 5) * gmul)
+    orsrc = buffer_ops.create_buffer_resource(
+        ROW_OUT, max_size=False, num_records_bytes=R * (cpad >> 3) * 4 * gmul
+    )
+    rscrsrc = buffer_ops.create_buffer_resource(
+        ROW_SC, max_size=False, num_records_bytes=R * (cpad >> 5) * gmul
+    )
+    corsrc = buffer_ops.create_buffer_resource(
+        COL_OUT, max_size=False, num_records_bytes=C * (rpad >> 3) * 4 * gmul
+    )
+    cscrsrc = buffer_ops.create_buffer_resource(
+        COL_SC, max_size=False, num_records_bytes=C * (rpad >> 5) * gmul
+    )
 
     # ---- coalesced tile load -> LDS ----
     for chunk in range_constexpr(_NLOAD):
@@ -496,238 +515,6 @@ def _build_dual_launch(row_rht, col_rht, row_2d=False, col_2d=False, col_localit
     return _dual_launch
 
 
-def _build_dual2_kernel(a_row_rht, a_col_rht, a_row_2d, a_col_2d, b_row_rht, b_col_rht, b_row_2d, b_col_2d):
-    """Merged dual for two independent activations A[Ra,Ca] and B[Rb,Cb]: one
-    grid launch does both casts (workgroup-uniform ``bid < a_blocks`` routing,
-    so LDS barriers stay divergence-free). A and B may use different amax
-    geometries; the scratch buffer is always allocated for both."""
-    _DualSS = _make_dual_struct(True)
-
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
-    def _dual2_kernel(
-        X_A: fx.Tensor,
-        ROW_OUT_A: fx.Tensor,
-        ROW_SC_A: fx.Tensor,
-        COL_OUT_A: fx.Tensor,
-        COL_SC_A: fx.Tensor,
-        X_B: fx.Tensor,
-        ROW_OUT_B: fx.Tensor,
-        ROW_SC_B: fx.Tensor,
-        COL_OUT_B: fx.Tensor,
-        COL_SC_B: fx.Tensor,
-        RA: fx.Int32,
-        CA: fx.Int32,
-        RB: fx.Int32,
-        CB: fx.Int32,
-        A_BLOCKS: fx.Int32,
-    ):
-        lds = fx.SharedAllocator().allocate(_DualSS).peek()
-        tid = fx.thread_idx.x
-        bid = fx.block_idx.x
-        if bid < A_BLOCKS:
-            _emit_dual_body(
-                a_row_rht,
-                a_col_rht,
-                a_row_2d,
-                a_col_2d,
-                lds,
-                tid,
-                X_A,
-                ROW_OUT_A,
-                ROW_SC_A,
-                COL_OUT_A,
-                COL_SC_A,
-                RA,
-                CA,
-                bid,
-            )
-        if bid >= A_BLOCKS:
-            _emit_dual_body(
-                b_row_rht,
-                b_col_rht,
-                b_row_2d,
-                b_col_2d,
-                lds,
-                tid,
-                X_B,
-                ROW_OUT_B,
-                ROW_SC_B,
-                COL_OUT_B,
-                COL_SC_B,
-                RB,
-                CB,
-                bid - A_BLOCKS,
-            )
-
-    return _dual2_kernel
-
-
-def _build_dual2_launch(recipes):
-    kern = _build_dual2_kernel(*recipes)
-
-    @flyc.jit
-    def _dual2_launch(
-        X_A: fx.Tensor,
-        ROW_OUT_A: fx.Tensor,
-        ROW_SC_A: fx.Tensor,
-        COL_OUT_A: fx.Tensor,
-        COL_SC_A: fx.Tensor,
-        X_B: fx.Tensor,
-        ROW_OUT_B: fx.Tensor,
-        ROW_SC_B: fx.Tensor,
-        COL_OUT_B: fx.Tensor,
-        COL_SC_B: fx.Tensor,
-        RA: fx.Int32,
-        CA: fx.Int32,
-        RB: fx.Int32,
-        CB: fx.Int32,
-        A_BLOCKS: fx.Int32,
-        grid_x: fx.Int32,
-        stream: fx.Stream,
-    ):
-        kern(
-            X_A,
-            ROW_OUT_A,
-            ROW_SC_A,
-            COL_OUT_A,
-            COL_SC_A,
-            X_B,
-            ROW_OUT_B,
-            ROW_SC_B,
-            COL_OUT_B,
-            COL_SC_B,
-            RA,
-            CA,
-            RB,
-            CB,
-            A_BLOCKS,
-        ).launch(grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream)
-
-    return _dual2_launch
-
-
-_DUAL2_LAUNCH = {}
-_DUAL2_COMPILED = {}
-
-
-def _grid_of(R, C):
-    return (R // _TR) * (C // _TC)
-
-
-def get_dual2_cast(Ra, Ca, Rb, Cb, recipes):
-    """Return (compiled_fn, grid_x, a_blocks) for the merged A+B dual at these two
-    shapes/recipes. ``recipes`` = 8-tuple
-    (a_row_rht, a_col_rht, a_row_2d, a_col_2d, b_row_rht, b_col_rht, b_row_2d, b_col_2d)."""
-    lk = tuple(bool(x) for x in recipes)
-    raw = _DUAL2_LAUNCH.get(lk)
-    if raw is None:
-        raw = _build_dual2_launch(lk)
-        _DUAL2_LAUNCH[lk] = raw
-    a_blocks = _grid_of(Ra, Ca)
-    grid_x = a_blocks + _grid_of(Rb, Cb)
-    key = (int(Ra), int(Ca), int(Rb), int(Cb), lk)
-    ent = _DUAL2_COMPILED.get(key)
-    if ent is None:
-        import torch
-
-        def _z(shape, dt):
-            return torch.zeros(shape, dtype=dt, device="cuda")
-
-        xa = _z((Ra, Ca // 2), torch.int32)
-        roa = _z((Ra, Ca // 8), torch.int32)
-        rsa = _z((Ra, Ca // 32), torch.uint8)
-        coa = _z((Ca, Ra // 8), torch.int32)
-        csa = _z((Ca, Ra // 32), torch.uint8)
-        xb = _z((Rb, Cb // 2), torch.int32)
-        rob = _z((Rb, Cb // 8), torch.int32)
-        rsb = _z((Rb, Cb // 32), torch.uint8)
-        cob = _z((Cb, Rb // 8), torch.int32)
-        csb = _z((Cb, Rb // 32), torch.uint8)
-        stream = torch.cuda.current_stream()
-        fn = flyc.compile(
-            raw,
-            xa,
-            roa,
-            rsa,
-            coa,
-            csa,
-            xb,
-            rob,
-            rsb,
-            cob,
-            csb,
-            Ra,
-            Ca,
-            Rb,
-            Cb,
-            a_blocks,
-            grid_x,
-            stream,
-        )
-        ent = (fn, grid_x, a_blocks)
-        _DUAL2_COMPILED[key] = ent
-    return ent
-
-
-def dual2_eligible(Ra, Ca, Rb, Cb, a_row_rec, a_col_rec, b_row_rec, b_col_rec):
-    """True if the merged A+B dual can replace two separate FlyDSL duals: both
-    shapes individually eligible and both C dims 256-aligned."""
-    return dual_eligible(Ra, Ca, a_row_rec, a_col_rec) and dual_eligible(Rb, Cb, b_row_rec, b_col_rec)
-
-
-def flydsl_dual_quant2(x_a, x_b, fp4_dtype, a_recipes, b_recipes):
-    """One-launch merged dual for A and B. ``a_recipes``/``b_recipes`` =
-    (row_rht, col_rht, row_2d, col_2d). Returns (a_row, a_col, b_row, b_col) each
-    as (data, scale) in the same dtypes/layouts as ``flydsl_dual_quant``."""
-    import torch
-
-    Ra, Ca = x_a.shape
-    Rb, Cb = x_b.shape
-    dev = x_a.device
-
-    def _alloc(R, C):
-        return (
-            torch.empty((R, C // 8), dtype=torch.int32, device=dev),
-            torch.empty((R, C // 32), dtype=torch.uint8, device=dev),
-            torch.empty((C, R // 8), dtype=torch.int32, device=dev),
-            torch.empty((C, R // 32), dtype=torch.uint8, device=dev),
-        )
-
-    roa, rsa, coa, csa = _alloc(Ra, Ca)
-    rob, rsb, cob, csb = _alloc(Rb, Cb)
-    recipes = tuple(a_recipes) + tuple(b_recipes)
-    fn, grid_x, a_blocks = get_dual2_cast(Ra, Ca, Rb, Cb, recipes)
-    fn(
-        x_a.view(torch.int32),
-        roa,
-        rsa,
-        coa,
-        csa,
-        x_b.view(torch.int32),
-        rob,
-        rsb,
-        cob,
-        csb,
-        Ra,
-        Ca,
-        Rb,
-        Cb,
-        a_blocks,
-        grid_x,
-        torch.cuda.current_stream(),
-    )
-
-    def _pack(ro, rs, co, cs):
-        return (
-            ro.view(torch.uint8).view(fp4_dtype),
-            rs.view(torch.float8_e8m0fnu),
-            co.view(torch.uint8).view(fp4_dtype),
-            cs.view(torch.float8_e8m0fnu),
-        )
-
-    return _pack(roa, rsa, coa, csa), _pack(rob, rsb, cob, csb)
-
-
 _DUAL_LAUNCH = {}
 _DUAL_COMPILED = {}
 
@@ -827,11 +614,31 @@ def _build_dual3_kernel(row_rht, col_rht, row_2d=False, col_2d=False, padded=Fal
         g = fx.block_idx.x // tpg
         lbid = fx.block_idx.x - g * tpg
         _emit_dual_body(
-            row_rht, col_rht, row_2d, col_2d, lds, tid,
-            X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, lbid,
-            gx=g * (R * (C >> 1)), gro=g * (R * (cpad >> 3)), grsc=g * (R * (cpad >> 5)),
-            gco=g * (C * (rpad >> 3)), gcsc=g * (C * (rpad >> 5)), gmul=G,
-            padded=padded, ncblk=ncblk, CP=CP, RP=RP, col_locality=col_locality,
+            row_rht,
+            col_rht,
+            row_2d,
+            col_2d,
+            lds,
+            tid,
+            X,
+            ROW_OUT,
+            ROW_SC,
+            COL_OUT,
+            COL_SC,
+            R,
+            C,
+            lbid,
+            gx=g * (R * (C >> 1)),
+            gro=g * (R * (cpad >> 3)),
+            grsc=g * (R * (cpad >> 5)),
+            gco=g * (C * (rpad >> 3)),
+            gcsc=g * (C * (rpad >> 5)),
+            gmul=G,
+            padded=padded,
+            ncblk=ncblk,
+            CP=CP,
+            RP=RP,
+            col_locality=col_locality,
         )
 
     return _dual3_kernel
@@ -881,7 +688,9 @@ def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False):
     lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded, col_locality)
     raw = _DUAL3_LAUNCH.get(lk)
     if raw is None:
-        raw = _build_dual3_launch(bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded, col_locality)
+        raw = _build_dual3_launch(
+            bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded, col_locality
+        )
         _DUAL3_LAUNCH[lk] = raw
     key = (int(N), int(K), int(G), *lk)
     ent = _DUAL3_COMPILED.get(key)
