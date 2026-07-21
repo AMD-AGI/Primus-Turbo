@@ -36,7 +36,8 @@ import torch
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     ceildiv,
-    make_fp8_buffer_tensor,
+    make_fp8_rebased_tensor_and_srd,
+    make_row_band_resource,
     wait_barrier,
 )
 import flydsl.compiler as flyc
@@ -55,8 +56,6 @@ def _raw(v):
         return v.ir_value()
     return v
 
-
-_OOB_STORE = 1 << 28  # store col-mask redirect target (>> any C extent, no i32 overflow)
 
 
 # ── Device-side scale + fragment loaders / geometry ──────────────────────────
@@ -212,35 +211,27 @@ class StoreCPlain:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty if out_ty is not None else fx.BFloat16
-        c_nbytes = c_rows * c_cols * 2  # bf16/fp16 both 2 bytes/elem
-        self._C = C  # raw C handle for the wide (dwordx4) TACCW store's buffer resource
-        gC = rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
-        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
-        self.out_atom_1 = fx.make_copy_atom(rocdl.BufferCopy16b(), self.out_ty)
-        self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), self.out_ty)
-
-    def _store_scalar(self, value, c_index):
-        fx.memref_store_vec(Vec.filled(1, value, self.out_ty), self.reg_out_1)
-        fx.copy(self.out_atom_1, self.reg_out_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+        # int64 byte base: the store re-bases per row band (make_row_band_resource) so a
+        # C whose flat rows*cols exceeds 2^31 (large-G wgrad grad_b [G,N,K]) addresses
+        # correctly. Pass C as 2D so its shape packs within int32.
+        self.c_base = buffer_ops.extract_base_index(C)
 
     def store(self, c_frag, base_row, base_col, n_valid=None):
-        # MN-ALIGNED fast path: host guarantees M%256==0 and N%256==0, so every tile is
-        # fully in-bounds -> drop the per-store column-edge redirect (saves the epilogue's
-        # fixed per-WG cost). The OOB SRD num_records still bounds pathological indices.
-        # n_valid (non-256 free dim): redirect cols >= n_valid to an OOB index (SRD drops
-        # them) so the kernel runs over the REAL N with no host N-pad.
+        # Re-base at this tile's row band in int64; intra-band voffsets stay int32. Rows
+        # past c_rows OOB-drop via the band SRD's num_records. n_valid (non-256 free dim):
+        # mask cols >= n_valid so the kernel runs the REAL N with no host N-pad.
         _mask = n_valid is not None
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         for ti in range_constexpr(self.n_tiles_a):
-            row = base_row + ti * 16 + (self.lane_id // 16) * 4
+            row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
+                col_valid = (col < fx.Int32(n_valid)) if _mask else None
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
                     val = vec_f32[i].to(self.out_ty)
-                    cidx = (row + i) * self.c_cols + col
-                    if const_expr(_mask):
-                        cidx = arith.select(col < fx.Int32(n_valid), cidx, fx.Int32(_OOB_STORE))
-                    self._store_scalar(val, cidx)
+                    off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
+                    buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
 
     @staticmethod
     def _permlane16_swap(a_i32, b_i32):
@@ -279,16 +270,15 @@ class StoreCPlain:
         M%256==N%256==0 so all tiles are in-bounds (SRD num_records is the safety net)."""
         nta, ntb = self.n_tiles_a, self.n_tiles_b
         assert ntb % 2 == 0, "store_tacc_wide pairs N sub-blocks (ntb must be even)"
-        c_nbytes = self.c_rows * self.c_cols * 2
-        rsrc = buffer_ops.create_buffer_resource(self._C, max_size=False, num_records_bytes=c_nbytes)
+        # Re-base at this tile's row band in int64 (rows*cols may exceed 2^31); the per-lane
+        # byte offset below is then intra-band int32.
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         rg = self.lane_id // 16
         col_off = (rg % 2) * 16 + (rg // 2) * 8  # rg0->0 rg1->16 rg2->8 rg3->24
-        # Hoisted per-lane base byte offset: (base_row*c_cols + base_col + lane%16*c_cols + col_off)*2.
-        # Per-store delta (ti*16*c_cols + tj*16)*2 is a compile-time constant -> one v_add per store
-        # instead of recomputing r*c_cols (matches AITER's voffset+imm addressing).
-        lane_base = (
-            base_row * self.c_cols + base_col + (self.lane_id % 16) * self.c_cols + col_off
-        ) * fx.Int32(2)
+        # Hoisted per-lane base byte offset relative to base_row: (base_col + lane%16*c_cols
+        # + col_off)*2. Per-store delta (ti*16*c_cols + tj*16)*2 is a compile-time constant ->
+        # one v_add per store instead of recomputing r*c_cols (matches AITER's voffset+imm).
+        lane_base = (base_col + (self.lane_id % 16) * self.c_cols + col_off) * fx.Int32(2)
 
         def _off(ti, tj):
             return lane_base + fx.Int32((ti * 16 * self.c_cols + tj * 16) * 2)
@@ -1013,20 +1003,28 @@ def _build_mxfp4_gemm_kernel(
         # ── Tile-INDEPENDENT setup (hoisted out of the per-tile body; every value
         # below depends only on the fixed LDS buffers / wave id / whole-tensor
         # resources, NOT block_m/n) ──
-        gA = make_fp8_buffer_tensor(A, F8_IR_t)
-        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
-        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
-        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
-
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk, coop=coop, tacc=_l_tacc)
 
         gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR, swizzle=swizzle)
         gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_BH, BPR, swizzle=swizzle)
-        rsrc_a = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=c_m * K2)
-        rsrc_b = buffer_ops.create_buffer_resource(B_T, max_size=False, num_records_bytes=c_n * K2)
-        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-        bl_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8_IR_t, wave_id)
-        br_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8_IR_t, wave_id)
+        # Operand SRDs/loaders are rebased per-tile (_bind below): the tile's A row base
+        # (bm*BLOCK_M*K2) / B col base (bn*BLOCK_N*K2) exceed 2^31 for large M*K / N*K, which
+        # the whole-loop's int32 voffset/soffset cannot address. One tile per block, so the
+        # per-tile build runs once; _bind stashes the loaders/SRDs for _fill/_compute to read.
+        _ld: dict = {}
+
+        def _bind(bm, bn):
+            a_base_e = arith.index_cast(T.index, bm * fx.Int32(BLOCK_M)) * arith.index(K2)
+            b_base_e = arith.index_cast(T.index, bn * fx.Int32(BLOCK_N)) * arith.index(K2)
+            a_nrec = (arith.index_cast(T.index, c_m) - arith.index_cast(T.index, bm * fx.Int32(BLOCK_M))) * arith.index(K2)
+            b_nrec = (arith.index_cast(T.index, c_n) - arith.index_cast(T.index, bn * fx.Int32(BLOCK_N))) * arith.index(K2)
+            gA, _ld["rsrc_a"] = make_fp8_rebased_tensor_and_srd(A, F8_IR_t, a_base_e, a_nrec)
+            gB, _ld["rsrc_b"] = make_fp8_rebased_tensor_and_srd(B_T, F8_IR_t, b_base_e, b_nrec)
+            a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+            b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+            _ld["a_g2s"] = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            _ld["bl_g2s"] = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8_IR_t, wave_id)
+            _ld["br_g2s"] = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8_IR_t, wave_id)
 
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, LDS_ROW_STRIDE, swizzle=swizzle)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_BH, LDS_ROW_STRIDE, swizzle=swizzle)
@@ -1143,9 +1141,10 @@ def _build_mxfp4_gemm_kernel(
             bm, bn = grouped_xcd_pid(
                 _pid, c_m, c_n, BLOCK_M, BLOCK_N, group_m=group_m, num_xcds=num_xcds, group_n=group_n
             )
-            a_off = bm * BLOCK_M * K2
-            bl_off = bn * BLOCK_N * K2
-            br_off = (bn * BLOCK_N + LDS_BN_HALF) * K2
+            _bind(bm, bn)  # rebase the operand SRDs/loaders on this tile's A/B base (int64)
+            a_off = fx.Int32(0)  # tile A row / B col bases folded into the SRDs; only br's
+            bl_off = fx.Int32(0)  # LDS-half column shift survives as an int32-safe residual.
+            br_off = fx.Int32(LDS_BN_HALF * K2)
             sa_b = fx.Int32(bm * BLOCK_M + wave_m_off)
             sbl_b = fx.Int32(bn * BLOCK_N + wave_n_off)
             sbr_b = fx.Int32(bn * BLOCK_N + LDS_BN_HALF + wave_n_off)
@@ -1157,11 +1156,11 @@ def _build_mxfp4_gemm_kernel(
             _, _, a_off, bl_off, br_off, _, _, _ = o
             for _pp in range_constexpr(0, _PRELL):
                 if const_expr(KI > _pp):
-                    a_g2s.load(A_buf[_pp], a_off + _pp * KSTEP)
+                    _ld["a_g2s"].load(A_buf[_pp], a_off + _pp * KSTEP)
             for _pp in range_constexpr(0, _PRELL):
                 if const_expr(KI > _pp):
-                    bl_g2s.load(BL_buf[_pp], bl_off + _pp * KSTEP)
-                    br_g2s.load(BR_buf[_pp], br_off + _pp * KSTEP)
+                    _ld["bl_g2s"].load(BL_buf[_pp], bl_off + _pp * KSTEP)
+                    _ld["br_g2s"].load(BR_buf[_pp], br_off + _pp * KSTEP)
 
         def _drain():
             # scale stores skipped (VGPR-direct); drain lgkmcnt + barrier so operand
@@ -1221,8 +1220,8 @@ def _build_mxfp4_gemm_kernel(
                 brbase6,
                 gl_a6,
                 gl_b6,
-                rsrc_a,
-                rsrc_b,
+                _ld["rsrc_a"],
+                _ld["rsrc_b"],
                 fx.Int32(KSTEP),
                 scv6,
                 accL,
@@ -1754,17 +1753,17 @@ def gemm_mxfp4_flydsl_kernel(
     a_raw = a_scale.contiguous().view(torch.int32).reshape(-1)
     b_raw = b_scale.contiguous().view(torch.int32).reshape(-1)
     out = torch.empty((M, N), dtype=out_dtype, device=a.device)
-    # FLAT 1D int8 views: the prologue operand G2S uses the NON-rebased FlyDSL
-    # ``G2SLoader`` (flat byte offsets via ``fx.slice``), so the source tensor MUST be
-    # a 1D layout; a 2D [M, K//2] layout makes the k=0/1 prologue loads address wrong
-    # (the in-loop asm refill is SRD+byte-offset and shape-agnostic). C is flat too
-    # (StoreCPlain re-bases per row band from C's base index + the passed c_n).
-    a8 = a.contiguous().view(torch.int8).reshape(-1)
-    b8 = b.contiguous().view(torch.int8).reshape(-1)
-    out_flat = out.view(-1)
+    # Keep the fp4 operands 2D (do NOT flatten): M*K/2 / N*K/2 exceed 2^31 int8s for
+    # large M*K / N*K, which flydsl packs as an int32 dim (host CABI overflow). Both the
+    # prologue G2S and the in-loop asm refill address off the rebased flat base
+    # (make_fp8_rebased_tensor_and_srd), so the operand's own shape is irrelevant.
+    a8 = a.contiguous().view(torch.int8)
+    b8 = b.contiguous().view(torch.int8)
 
     # Fused stub args: (A, B_T, C, A_raw, B_raw, A_scale_ws, B_scale_ws, c_m, c_n, stream).
-    fused_args = (a8, b8, out_flat, a_raw, b_raw, a_sp, b_sp, M, N, stream)
+    # C stays 2D (StoreCPlain re-bases per row band from C's base + c_n); a 1D M*N view
+    # overflows the CABI for large M*N.
+    fused_args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, M, N, stream)
 
     def _exec_plain():
         # default one-WG-per-tile path (autotuned swizzle / pipe depth / scale-load / wide store).
