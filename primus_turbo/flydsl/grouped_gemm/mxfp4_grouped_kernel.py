@@ -104,10 +104,18 @@ def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int =
         a_grid: fx.Int32,
     ):
         I32 = fx.Int32
-        a_rin = buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=total_M * I32(_KRD) * 4)
-        a_rout = buffer_ops.create_buffer_resource(a_out, max_size=False, num_records_bytes=slab_rows * I32(K128) * 4)
-        b_rin = buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=I32(G * N * _KRD) * 4)
-        b_rout = buffer_ops.create_buffer_resource(b_out, max_size=False, num_records_bytes=I32(G * N * K128) * 4)
+        a_rin = buffer_ops.create_buffer_resource(
+            a_raw, max_size=False, num_records_bytes=total_M * I32(_KRD) * 4
+        )
+        a_rout = buffer_ops.create_buffer_resource(
+            a_out, max_size=False, num_records_bytes=slab_rows * I32(K128) * 4
+        )
+        b_rin = buffer_ops.create_buffer_resource(
+            b_raw, max_size=False, num_records_bytes=I32(G * N * _KRD) * 4
+        )
+        b_rout = buffer_ops.create_buffer_resource(
+            b_out, max_size=False, num_records_bytes=I32(G * N * K128) * 4
+        )
         bid = rocdl.readfirstlane(T.i32, fx.block_idx.x)
         is_b = bid >= a_grid
         local = arith.select(is_b, bid - a_grid, bid)
@@ -153,7 +161,9 @@ def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int =
             m_prev = m_nxt
         rd_base = b_expert * I32(N)  # B source row base
 
-        okc = arith.select(is_b, (gid4 < I32(b_dwords_pe)) & (b_expert < I32(G)), (gid4 < a_total4) & (ok_a != I32(0)))
+        okc = arith.select(
+            is_b, (gid4 < I32(b_dwords_pe)) & (b_expert < I32(G)), (gid4 < a_total4) & (ok_a != I32(0))
+        )
         okc = okc & (k128 < I32(_KRD)) & (gid4 < total4)
         rsrc_rows = [
             arith.select(is_b, rd_base + grp_b * I32(64) + I32(t * 16) + r, rd0 + I32(t * 16) + r)
@@ -693,9 +703,15 @@ def _build_grouped_mxfp4_wgrad_kernel(
         wave_m_off = wave_m * (N_TILES_A * 16)
         wave_n_off = wave_n * (N_TILES_BH * 16)
 
-        a_base6 = [[a_s2r.base_addr(A_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NABUF)]
-        bl_base6 = [[b_s2r.base_addr(BL_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBB)]
-        br_base6 = [[b_s2r.base_addr(BR_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBB)]
+        a_base6 = [
+            [a_s2r.base_addr(A_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NABUF)
+        ]
+        bl_base6 = [
+            [b_s2r.base_addr(BL_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBB)
+        ]
+        br_base6 = [
+            [b_s2r.base_addr(BR_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBB)
+        ]
 
         def _gbase(buf):
             v = fx.Int32(fx.ptrtoint(buf.ptr)) + fx.Int32(wave_id) * fx.Int32(1024)
@@ -708,13 +724,19 @@ def _build_grouped_mxfp4_wgrad_kernel(
         gl_b6 = [fx.Int32(gl_off_b[st]) for st in range_constexpr(N_LDS_STEPS_BH)]
         scv6 = fx.Int32(0x7F7F7F7F)
         sc_rb6 = [
-            fx.ptrtoint(fx.add_offset(SC_buf[b].ptr, fx.make_int_tuple(fx.Int32(wave_id) * fx.Int32(_SCW) + lane_id)))
+            fx.ptrtoint(
+                fx.add_offset(SC_buf[b].ptr, fx.make_int_tuple(fx.Int32(wave_id) * fx.Int32(_SCW) + lane_id))
+            )
             for b in range_constexpr(_NSCBUF)
         ]
         sc_gb6 = [
             rocdl.readfirstlane(
                 T.i32,
-                fx.Int32(fx.ptrtoint(fx.add_offset(SC_buf[b].ptr, fx.make_int_tuple(fx.Int32(wave_id) * fx.Int32(_SCW))))),
+                fx.Int32(
+                    fx.ptrtoint(
+                        fx.add_offset(SC_buf[b].ptr, fx.make_int_tuple(fx.Int32(wave_id) * fx.Int32(_SCW)))
+                    )
+                ),
             )
             for b in range_constexpr(_NSCBUF)
         ]
@@ -786,16 +808,44 @@ def _build_grouped_mxfp4_wgrad_kernel(
         _sob = rocdl.readfirstlane(T.i32, _wib * I32(K128m) * I32(512) + ksb)
         sc_soff06 = [_soa, _sc1, _sob, _sc3]
         accL, accR = mfma.call_mxfp4_wholeloop(
-            a_base6, bl_base6, br_base6, a_s2r.tile_stride, b_s2r.tile_stride,
-            abase6, blbase6, brbase6, gl_a6, gl_b6, rsrc_a, rsrc_b, fx.Int32(KSTEP), scv6,
-            accL, accR, N_SUB, N_LDS_STEPS_A, N_LDS_STEPS_BH, nval,
-            soff6_a, soff6_bl, soff6_br, sc_rb6, sc_gb6, _scrsa_v, _scrsb_v, sc_voff6, sc_soff06,
-            ki=None, sc_buf_stride=(_SCBUF * 4),
+            a_base6,
+            bl_base6,
+            br_base6,
+            a_s2r.tile_stride,
+            b_s2r.tile_stride,
+            abase6,
+            blbase6,
+            brbase6,
+            gl_a6,
+            gl_b6,
+            rsrc_a,
+            rsrc_b,
+            fx.Int32(KSTEP),
+            scv6,
+            accL,
+            accR,
+            N_SUB,
+            N_LDS_STEPS_A,
+            N_LDS_STEPS_BH,
+            nval,
+            soff6_a,
+            soff6_bl,
+            soff6_br,
+            sc_rb6,
+            sc_gb6,
+            _scrsa_v,
+            _scrsb_v,
+            sc_voff6,
+            sc_soff06,
+            ki=None,
+            sc_buf_stride=(_SCBUF * 4),
         )
         base_row = group_idx * I32(OUT_M) + a_row + I32(wave_m_off)
         base_col_l = b_row + I32(wave_n_off)
         base_col_r = b_row + I32(LDS_BN_HALF) + I32(wave_n_off)
-        store_c = StoreCPlain(C, (group_idx + I32(1)) * I32(OUT_M), OUT_N, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty)
+        store_c = StoreCPlain(
+            C, (group_idx + I32(1)) * I32(OUT_M), OUT_N, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty
+        )
         store_c.store(accL, base_row, base_col_l, n_valid=_NV)
         store_c.store(accR, base_row, base_col_r, n_valid=_NV)
 

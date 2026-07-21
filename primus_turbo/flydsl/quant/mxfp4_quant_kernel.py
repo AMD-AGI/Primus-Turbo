@@ -291,12 +291,11 @@ def _emit_dual_body(
     r0 = rblk * _TR
     c0w = cblk * _TCW  # i32-word base along C
 
-    # Output SRDs are re-based in int64 with per-tile / per-expert num_records. A whole-tensor
-    # SRD would need num_records = full bytes, which overflows the 32-bit num_records field
-    # once the operand exceeds 4GB (high rows/experts OOB -> garbage) and drives a per-row byte
-    # voffset past int32. 2D folds THIS tile's row (r0) / col (cblk*_TC) base -> num_records
-    # per-tile; batched-3D folds the per-EXPERT base (gx/... , experts small so r0/c0 stay in
-    # the offsets). ``_row0``/``_col0`` drop the folded base from the additive offsets below.
+    # Re-base each SRD in int64 with per-tile/per-expert num_records: a whole-tensor SRD's
+    # num_records (full bytes) overflows the 32-bit field past 4GB (high rows/experts OOB) and
+    # the per-row voffset overflows int32. 2D folds this tile's row (r0)/col (cblk*_TC) base;
+    # batched-3D folds the per-expert base (small experts keep r0/c0 in the offsets). _row0/
+    # _col0 drop the folded base from the additive offsets below.
     _fold = not batched
     _row0 = fx.Int32(0) if _fold else r0
     _col0 = fx.Int32(0) if _fold else cblk * _TC

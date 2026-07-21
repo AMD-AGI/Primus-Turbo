@@ -215,7 +215,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             scaling_recipe_for_trans=grad_out_t_scaling_recipe,
         )
 
-        # --- dgrad: grad_a = gradO_row(rht=T) @ B_col(rht=T)^T, contract N -> [total_m, K] ---
+        # --- dgrad: grad_a = gradO_row(rht=F) @ B_col(rht=F)^T, contract N -> [total_m, K] ---
         grad_a = grouped_gemm_fp4_impl(
             grad_out_fp4_row,
             b_col,
