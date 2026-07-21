@@ -509,7 +509,7 @@ template <int kNumThreads, typename dtype_t, typename prob_t>
 __global__ void unpermute_kernel_e1(const int4 *permuted_tokens, int4 *tokens,
                                     const prob_t *permuted_probs, prob_t *probs,
                                     const int *row_id_map, const int *num_dispatched_tokens_ptr,
-                                    int hidden_int4) {
+                                    int hidden_int4, int num_dispatched_max) {
     constexpr int num_warps  = kNumThreads / kWarpSize;
     constexpr int row_stride = 3;
 
@@ -518,14 +518,16 @@ __global__ void unpermute_kernel_e1(const int4 *permuted_tokens, int4 *tokens,
     const int warp_id               = thread_id / kWarpSize;
     const int num_dispatched_tokens = *num_dispatched_tokens_ptr;
 
-    for (int64_t block_start = blockIdx.x * num_warps; block_start < num_dispatched_tokens;
+    // Iterate the full buffer; worst-token padding rows [num_dispatched_tokens, max) get zeroed (AIMA-219).
+    for (int64_t block_start = blockIdx.x * num_warps; block_start < num_dispatched_max;
          block_start += static_cast<int64_t>(num_warps) * gridDim.x) {
         const int64_t token_id = block_start + warp_id;
-        if (token_id >= num_dispatched_tokens)
+        if (token_id >= num_dispatched_max)
             continue;
 
-        const int n_routed = row_id_map[token_id * row_stride + 2];
-        const int s        = (n_routed > 0) ? row_id_map[token_id * row_stride + 0] : 0;
+        const bool is_padding = token_id >= num_dispatched_tokens;
+        const int  n_routed   = is_padding ? 0 : row_id_map[token_id * row_stride + 2];
+        const int  s          = (n_routed > 0) ? row_id_map[token_id * row_stride + 0] : 0;
         int4     *dst      = tokens + token_id * hidden_int4;
         if (s > 0) {
             const int4 *src = permuted_tokens + (s - 1) * hidden_int4;
@@ -564,11 +566,10 @@ __launch_bounds__(kNumThreads, 4) __global__
     const int E          = num_local_experts;
     const int row_stride = 2 * E + 1;
 
-    if (token_id >= *num_dispatched_tokens_ptr)
-        return;
-
-    const int *row      = row_id_map + token_id * row_stride;
-    const int  n_routed = row[2 * E];
+    // Zero worst-token padding rows instead of returning, else torch.empty tail stays NaN (AIMA-219).
+    const bool is_padding = token_id >= *num_dispatched_tokens_ptr;
+    const int *row        = is_padding ? nullptr : (row_id_map + token_id * row_stride);
+    const int  n_routed   = is_padding ? 0 : row[2 * E];
 
     if (j < hidden_int4) {
         float acc[num_eles_per_pack];
@@ -683,7 +684,7 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
         unpermute_kernel_e1<kE1NumThreads, dtype_t, prob_t>
             <<<e1_grid, kE1NumThreads, /*shmem=*/0, stream>>>(
                 permuted_tokens_int4, tokens_int4, permuted_probs, probs, row_id_map,
-                num_dispatched_tokens_ptr, hidden_int4);
+                num_dispatched_tokens_ptr, hidden_int4, num_dispatched_max);
     } else {
 #define LAUNCH_UNPERMUTE_NC(num_hidden_per_block, NC, grid)                                        \
     unpermute_kernel<(num_hidden_per_block), (NC), dtype_t, prob_t>                                \
