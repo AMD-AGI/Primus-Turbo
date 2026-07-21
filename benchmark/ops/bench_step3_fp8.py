@@ -4,17 +4,20 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Isolated fc2 (L2) latency benchmark for the fp8 combine.
+"""Backward STEP3 (fc1 dgrad + combine) fp8 -- smoke correctness + latency.
 
-Builds the symm workspace + prologue, runs the fp8 L1 (dispatch+fc1) + SwiGLU to get a real
-``act`` in the pool, then times the fp8 L2 path on that ``act``:
-  grouped_gemm_combine_fp8  (fp8 GEMM + mxfp8 epilogue + fp8 PUSH + fp8-dequant reduce) -> y bf16.
-Reports latency + a finite/NaN check. (For the fp8-vs-bf16 accuracy/speed comparison at the
-whole-forward level, use bench_mega_moe_fused_fp8.py, which uses the bf16 mega_moe_fused as the
-reference -- this repo carries no bf16 combine kernel under flydsl/mega/fp8/.)
+Replicates the backward up to STEP3 on real mega-pool data: forward L1 -> (l1, dispatch_weights),
+STEP1 (dispatch(dy)+fc2 dgrad), STEP2 swiglu_backward -> grad_l1 + grad_gate. Then STEP3
+(``_mxfp8_step3_fc1_dgrad_combine``): fp8 fc1-dgrad + combine PUSH + unweighted reduce + gate
+scatter -> dx [T, H] + grad_topk_weights [T, K].
+
+SMOKE only: dx / grad_topk_weights finite + correctly shaped + runs cross-rank (no deadlock/NaN).
+Rigorous dx SNR is validated later by the full-backward e2e gradcheck vs a torch dense-MoE autograd
+reference -- an isolated bf16 dx reference would need a bf16 combine on the fp8 SymLayout stack (not
+present; the fp8 subpackage carries no bf16 combine kernel).
 
 Run inside the dev container (8 GPUs):
-  PYTHONPATH=<repo> python benchmark/ops/bench_grouped_gemm_combine_fp8_l2.py --num-processes 8 --num-tokens 8192
+  PYTHONPATH=<repo> python benchmark/ops/bench_step3_fp8.py --num-processes 8 --num-tokens 8192
 """
 
 import argparse
@@ -31,19 +34,17 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
-    grouped_gemm_combine_fp8,
-    prepare_w2_fp8,
     quantize_grouped_weight_mxfp8,
-    swiglu,
+    swiglu_backward,
+)
+from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import (
+    _mxfp8_step1_dispatch_dgrad,
+    _mxfp8_step3_fc1_dgrad_combine,
 )
 
 
 def _routing(T, K, E, *, device, seed):
     g = torch.Generator(device=device).manual_seed(seed)
-    if os.environ.get("PT_ROUTING", "load_balanced") == "round_robin":
-        idx = (torch.arange(T * K, device=device).view(T, K) % E).to(torch.int64)
-        w = torch.rand(T, K, generator=g, device=device).softmax(-1).to(torch.float32)
-        return idx, w
     scores = torch.rand(T, E, generator=g, device=device).abs() + 1
     w, idx = torch.topk(scores.softmax(-1), K, dim=-1)
     return idx.to(torch.int64), w.to(torch.float32)
@@ -56,29 +57,19 @@ def _global_weights(E, I, H, device):
     return W1, W2
 
 
-def _snr_db(ref, out):
-    ref, out = ref.float(), out.float()
-    return float(10.0 * torch.log10(ref.pow(2).sum() / ((ref - out).pow(2).sum() + 1e-12)))
-
-
-def _bench(fn, *, warmup, iters, group, reset):
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-
-    def _iter(s=None, e=None):
-        torch.cuda.synchronize(); group.barrier()
-        reset()
-        torch.cuda.synchronize(); group.barrier()
-        if s is None:
-            fn(); return
-        s.record(); fn(); e.record()
-
+def _bench(fn, *, warmup, iters, group):
+    # BACK-TO-BACK timing (host custom-op dispatch overlaps GPU); single-call event-bracket timing
+    # would count host dispatch/autotune-lookup as GPU-idle and inflate fast fp8 kernels.
+    torch.cuda.synchronize(); group.barrier()
     for _ in range(warmup):
-        _iter()
-    for i in range(iters):
-        _iter(starts[i], ends[i])
-    torch.cuda.synchronize()
-    return float(np.average([s.elapsed_time(e) for s, e in zip(starts, ends)][1:]))
+        fn()
+    torch.cuda.synchronize(); group.barrier()
+    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    s.record()
+    for _ in range(iters):
+        fn()
+    e.record(); torch.cuda.synchronize()
+    return float(s.elapsed_time(e) / iters)
 
 
 @torch.no_grad()
@@ -105,46 +96,35 @@ def profile(group, args):
         world_size=world, rank=symm.rank, experts_per_rank=epr, block_m=BM,
         num_max_pool_tokens=symm.num_max_pool_tokens,
     ))
-    w1q, w1s = quantize_grouped_weight_mxfp8(W1)
 
-    # L1 (fp8) + SwiGLU -> act (the real L2 input), once
+    w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
     symm.scoreboard.zero_()
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
-    act = swiglu(l1).contiguous()
+    dispatch_weights = symm.weight_recv_buf.clone()
 
-    tw_f32 = topk_w.to(torch.float32)
-    w2_fp8 = prepare_w2_fp8(W2)  # weight prep at the caller (op layer); combine is pure compute
+    dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
+    grad_swiglu, _ = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
+    grad_l1, grad_gate = swiglu_backward(grad_swiglu, l1, scale=dispatch_weights, return_gate=True)
 
-    def _reset_l2():
-        symm.sb_l2.zero_()
-        symm.barrier_local.fill_(-1)
-
-    def _fp8():
-        return grouped_gemm_combine_fp8(
-            act, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=tw_f32,
-            BM=BM, BN=BN, num_combine_cu=48,
+    def _step3():
+        return _mxfp8_step3_fc1_dgrad_combine(
+            grad_l1, W1, group, handle, BM, BN, grad_gate=grad_gate, topk_idx=topk_idx,
+            num_tokens=T, num_topk=K,
         )
 
-    # correctness smoke: fp8 L2 output must be finite (+ diagnostics on where it breaks)
-    act_finite = bool(torch.isfinite(act.float()).all())
-    m_pad = int(handle[10][-1].item())
-    torch.cuda.synchronize(); group.barrier(); _reset_l2(); torch.cuda.synchronize(); group.barrier()
-    y_fp8 = _fp8()
-    torch.cuda.synchronize(); group.barrier()
-    yf = y_fp8.float()
-    nan = bool((~torch.isfinite(yf)).any())
-    n_nan = int(torch.isnan(yf).sum().item())
-    n_inf = int(torch.isinf(yf).sum().item())
-    bad_tok = int((~torch.isfinite(yf)).any(dim=1).sum().item())
-    num_tokens = yf.shape[0]
+    dx, grad_topk_weights = _step3()
+    dx_ok = tuple(dx.shape) == (T, H) and bool(torch.isfinite(dx.float()).all())
+    dtw_ok = tuple(grad_topk_weights.shape) == (T, K) and bool(torch.isfinite(grad_topk_weights.float()).all())
+    dx_norm = float(dx.float().norm())
 
-    t_fp8 = _bench(_fp8, warmup=args.warmup, iters=args.iters, group=group, reset=_reset_l2)
+    t_step3 = _bench(_step3, warmup=args.warmup, iters=args.iters, group=group)
+    m_pad = int(handle[10][-1].item())
+    flops = 2.0 * m_pad * (2 * I) * H  # fc1 dgrad GEMM: [P,2I] @ [2I,H]
     symm.destroy()
-    return {"t_fp8": t_fp8, "nan": float(nan), "act_finite": float(act_finite),
-            "n_nan": float(n_nan), "n_inf": float(n_inf), "bad_tok": float(bad_tok),
-            "num_tokens": float(num_tokens), "m_pad": float(m_pad)}
+    return {"dx_ok": float(dx_ok), "dtw_ok": float(dtw_ok), "dx_norm": dx_norm,
+            "t_step3": t_step3, "flops": flops, "m_pad": m_pad}
 
 
 def _amax(group, v):
@@ -168,27 +148,27 @@ def worker(local_rank, world, args):
     rank = dist.get_rank()
     try:
         r = profile(group, args)
-        t_fp8 = _amax(group, r["t_fp8"])
-        nan = _amax(group, r["nan"])
-        act_finite = _amin(group, r["act_finite"])
-        n_nan, n_inf = _amax(group, r["n_nan"]), _amax(group, r["n_inf"])
-        bad_tok = _amax(group, r["bad_tok"])
+        dx_ok, dtw_ok = _amin(group, r["dx_ok"]), _amin(group, r["dtw_ok"])
+        dx_norm = _amax(group, r["dx_norm"])
+        t_step3 = _amax(group, r["t_step3"])
         if rank == 0:
-            routing = os.environ.get("PT_ROUTING", "load_balanced")
+            tf = r["flops"] / (t_step3 * 1e-3) / 1e12
+            ok = dx_ok >= 1.0 and dtw_ok >= 1.0
             print(f"\n{'='*72}")
-            print(f"[fc2 (L2 combine) fp8]  EP{world} T={args.num_tokens} H={args.hidden} "
-                  f"I={args.inter} E={args.num_experts} K={args.num_topk} routing={routing} m_pad={int(r['m_pad'])}")
+            print(f"[backward STEP3  fc1 dgrad+combine  fp8]  EP{world} T={args.num_tokens} "
+                  f"H={args.hidden} I={args.inter} E={args.num_experts} K={args.num_topk}")
             print(f"{'='*72}")
-            print(f"  fp8 L2 combine : {t_fp8:8.3f} ms   finite={not bool(nan)}")
-            print(f"  [diag] act_finite={bool(act_finite>=1.0)}  y: n_nan={int(n_nan)} n_inf={int(n_inf)} "
-                  f"bad_tokens={int(bad_tok)}/{int(r['num_tokens'])}")
+            print(f"  STEP3 fp8    : {t_step3:8.3f} ms | {tf:8.1f} TFLOPS  (M_pool={r['m_pad']})")
+            print(f"  [smoke] dx [T,H] finite={bool(dx_ok>=1.0)} (norm={dx_norm:.3e}) | "
+                  f"grad_topk [T,K] finite={bool(dtw_ok>=1.0)}  {'PASS' if ok else 'FAIL'} "
+                  f"(rigorous dx SNR -> e2e backward gradcheck)")
         torch.cuda.synchronize(); group.barrier()
     finally:
         dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="isolated fc2 (L2 combine) fp8 vs bf16")
+    ap = argparse.ArgumentParser(description="backward STEP3 (fc1 dgrad + combine) fp8 smoke")
     ap.add_argument("--num-processes", type=int, default=8)
     ap.add_argument("--hidden", type=int, default=7168)
     ap.add_argument("--inter", type=int, default=2048)

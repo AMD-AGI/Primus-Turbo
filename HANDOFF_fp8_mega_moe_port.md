@@ -97,12 +97,21 @@ token_quant 0.059ms ~2.5%),cos=1.00000 PASS。
 (standalone,权重内部量化;`_host_rendezvous` 做 L1/L2 scoreboard/flag 复位);e2e bench
 `benchmark/ops/bench_mega_moe_fused_fp8.py`(fp8 vs bf16 SNR gate)。**下一步是反向。**
 
-1. **[下一步] 移植反向**:STEP1(dispatch(dy)+fc2 dgrad,NN,fp8,会赢)优先;dW2/dW1 mxfp8 variable-K;
-   STEP3(fc1 dgrad fp8 + combine/reduce)。源 `mega_moe_fused_mxfp8.py::backward` + 源核
-   `dispatch_grouped_gemm_mxfp8_bwd_kernel.py`、`grouped_gemm_combine_mxfp8_kernel.py`、
-   `quant_colwise_trans_flydsl.py`;依赖 `grouped_gemm_fp8_variable_k_impl`(MegaMoE 已有)。见源
-   `NOTES_mxfp8_backward_handoff.md`。forward 目前**没 save_for_backward**,接反向时要补 ctx 保存
-   (handle/l1/dispatch_weights/pool_x_fp8 等)。反向的 fp8 combine PUSH 同样吃 uncached signal pad(已修)。
+**✅ 反向 STEP1 已完成并验证**(dispatch(dy)+fc2 dgrad,fp8)。**没有独立的 bwd kernel** —— STEP1 直接
+复用前向的 `dispatch_grouped_gemm_mxfp8`(泛型 dispatch PUSH + 分组 mxfp8 NT GEMM:A=dy bf16 内部量化+push、
+weight=w2^T `[G,I,H]` → grad_swiglu `[P,I]`),只是 CU 划分不同(STEP1 用 `ndcu=24/pscu=8`,前向 16/16;见
+`_STEP1_NUM_DISPATCH_CU`)。源 repo 的 `dispatch_grouped_gemm_mxfp8_bwd_kernel.py` 是前向 kernel 的 fork
+(只多一堆 net-negative 的实验旋钮 diag/two_stage/...,默认路径逐字等价)—— **已确认不需要,没 vendor**。
+op 层:`prepare_w2t_dgrad_fp8`(=`quantize_grouped_weight_mxfp8(w2.T)`)+ 版本缓存 `_w2t_fp8_cached` +
+`_mxfp8_step1_dispatch_dgrad`。验证 bench `benchmark/ops/bench_step1_dispatch_dgrad_fp8.py`:DSv3 T=8192
+STEP1 = **1.87ms @ 1093 TFLOPS,SNR 30.9 dB PASS**;vs bf16 dgrad(nn) 2.40ms(bench_mega_moe.py)= **1.27×**。
+
+1. **[下一步] 移植反向剩余段**:STEP2(SwiGLU^T,`swiglu_backward`,bf16)→ dW2/dW1 mxfp8 variable-K wgrad →
+   STEP3(fc1 dgrad fp8 + combine)。源 `mega_moe_fused_mxfp8.py::backward` + 源核
+   `grouped_gemm_combine_mxfp8_kernel.py`(或 `grouped_gemm_combine_fp8_bwd`)、`quant_colwise_trans_flydsl.py`;
+   依赖 `grouped_gemm_fp8_variable_k_impl`(MegaMoE 已有)。见源 `NOTES_mxfp8_backward_handoff.md`。
+   forward 目前**没 save_for_backward**,接完整反向时要补 ctx 保存(handle/l1/dispatch_weights/pool_x_fp8 等)。
+   反向的 fp8 combine PUSH 同样吃 uncached signal pad(已修)。
 2. **(已完成)移植 L2(fp8 combine)+ SwiGLU**:combine 保持 bf16 输出(带宽 bound)
    (见源 `NOTES_mxfp8_fused_gemm_combine_perf.md`);
    落地方案 = L1 fp8 fused + L2 用 `grouped_gemm_combine_fp8`(GEMM fp8、combine/reduce bf16)。

@@ -1262,6 +1262,74 @@ def _build_grouped_mxfp8_wgrad_kernel(
 _GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16) -> launch
 _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
 _GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16) -> [raw, compiled]
+_GWG_CFG_CACHE: dict = {}  # at_key -> (bm, bn, gm, xcd, gn) chosen by autotune
+
+# variable-K wgrad config autotune (mirrors the fwd/dgrad NT path). Shares PT_MXGG_AUTOTUNE.
+_GWG_WGRAD_DEFAULT_CFG = (256, 256, 4, 8, 0)  # (bm, bn, gm, xcd, gn); cand[0] = base ref (prior fixed cfg)
+
+
+def _gwg_wgrad_candidates():
+    """(bm,bn,gm,xcd,gn) autotune candidates; cand[0] = the prior fixed default (base ref).
+    bm=256 dominates (bm=128 measured ~1.3x slower); the win at the DSv3 dW2 shape is xcd 8->1."""
+    return [
+        (256, 256, 4, 8, 0),  # base ref (prior fixed default)
+        (256, 256, 4, 1, 0),  # xcd=1 -- wins the DSv3 dW2 shape (~5%)
+        (256, 256, 1, 1, 0),
+        (256, 256, 8, 4, 0),
+    ]
+
+
+def _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16):
+    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16)
+    launch = _GWG_FUSED_CACHE.get(fk)
+    if launch is None:
+        launch = _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16)
+        _GWG_FUSED_CACHE[fk] = launch
+    return launch
+
+
+def _select_wgrad_cfg(at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, out_view, args):
+    """First-call micro-bench for this static shape; cache the winning (bm,bn,gm,xcd,gn).
+    Guarded: falls back to the base cfg under CUDA-graph capture or if anything faults."""
+    cached = _GWG_CFG_CACHE.get(at_key)
+    if cached is not None:
+        return cached
+    if not _GNT_AUTOTUNE or torch.cuda.is_current_stream_capturing():
+        return _GWG_WGRAD_DEFAULT_CFG  # don't cache under capture -> autotune on a later eager call
+    cands = [c for c in _gwg_wgrad_candidates() if OUT_M % c[0] == 0 and OUT_N % c[1] == 0]
+    try:
+        base = _get_wgrad_launch(OUT_M, OUT_N, G, *cands[0], cbsz, blgp, out_fp16)
+        base(*args)
+        torch.cuda.synchronize()
+        ref = out_view.detach().clone().float()
+        ref_n = float((ref * ref).sum().item()) or 1.0
+        if not torch.isfinite(ref.reshape(-1)[:1024]).all().item():
+            raise RuntimeError("base cfg produced non-finite output")
+        best_cfg, best_t = cands[0], _robust_time(base, args)
+    except Exception:
+        _GWG_CFG_CACHE[at_key] = _GWG_WGRAD_DEFAULT_CFG
+        return _GWG_WGRAD_DEFAULT_CFG
+
+    def _matches_base():
+        o = out_view.detach().float()
+        err = float(((o - ref) * (o - ref)).sum().item())
+        return (err / ref_n) < (2e-2**2) and torch.isfinite(o.reshape(-1)[:1024]).all().item()
+
+    for cfg in cands[1:]:
+        try:
+            launch = _get_wgrad_launch(OUT_M, OUT_N, G, *cfg, cbsz, blgp, out_fp16)
+            launch(*args)
+            torch.cuda.synchronize()
+            if not _matches_base():  # never adopt a config that drifts from the base
+                continue
+            t = _robust_time(launch, args)
+        except Exception:
+            continue
+        if t < best_t * 0.985:  # adopt only if >=1.5% faster
+            best_cfg, best_t = cfg, t
+
+    _GWG_CFG_CACHE[at_key] = best_cfg
+    return best_cfg
 
 
 def _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16):
@@ -1369,20 +1437,13 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     a_blocks = a_ngrp * n_kt
     pre_grid = a_blocks + b_ngrp * n_kt
 
-    bm, bn, gm, xcd, gn = 256, 256, 4, 8, 0
-    # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
-    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16)
-    launch = _GWG_FUSED_CACHE.get(fk)
-    if launch is None:
-        launch = _compile_grouped_mxfp8_wgrad_fused(
-            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16
-        )
-        _GWG_FUSED_CACHE[fk] = launch
-
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
     at_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16)
     entry = _GWG_AT_CACHE.get(at_key)
     if entry is None:
+        # first call for this shape: autotune (bm,bn,gm,xcd,gn) (eager only; base cfg under capture).
+        bm, bn, gm, xcd, gn = _select_wgrad_cfg(at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, out, args)
+        launch = _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16)
         entry = [launch, None]
         _GWG_AT_CACHE[at_key] = entry
     run_eager_or_capture(entry, args, 1)

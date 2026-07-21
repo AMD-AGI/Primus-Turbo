@@ -406,21 +406,32 @@ def build_jax_extension():
 
 
 if __name__ == "__main__":
-    # Initialize submodules
-    check_submodules()
+    # Escape hatch: install the pure-Python package against already-present
+    # prebuilt .so artifacts, skipping submodule init and the (long / here
+    # impossible) CK-HIP source compile. Enabled via PRIMUS_TURBO_SKIP_EXT_BUILD=1.
+    SKIP_EXT = os.environ.get("PRIMUS_TURBO_SKIP_EXT_BUILD") == "1"
 
-    # set cxx
-    setup_cxx_env()
+    if SKIP_EXT:
+        # Build metadata still useful; no submodules / no compiler needed.
+        write_build_info()
+        torch_ext = None
+        ext_modules = []
+    else:
+        # Initialize submodules
+        check_submodules()
 
-    # Build metadata
-    write_build_info()
+        # set cxx
+        setup_cxx_env()
 
-    # Extensions
-    kernels_ext = build_kernels_extension()
+        # Build metadata
+        write_build_info()
 
-    torch_ext = build_torch_extension()
-    jax_ext = build_jax_extension()
-    ext_modules = [kernels_ext] + [e for e in (torch_ext, jax_ext) if e is not None]
+        # Extensions
+        kernels_ext = build_kernels_extension()
+
+        torch_ext = build_torch_extension()
+        jax_ext = build_jax_extension()
+        ext_modules = [kernels_ext] + [e for e in (torch_ext, jax_ext) if e is not None]
 
     # Entry points and Install Requires
     entry_points = {}

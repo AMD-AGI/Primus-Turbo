@@ -19,11 +19,18 @@ Currently wired: the L1 forward path (fused mxfp8 dispatch + fc1). L2 combine + 
 ported in later steps.
 """
 
-# --- L1 forward: fused mxfp8 dispatch PUSH + preshuffle + grouped mxfp8 NT GEMM ---
+# --- fused mxfp8 dispatch PUSH + preshuffle + grouped mxfp8 NT GEMM ---
+# (generic: forward L1 = dispatch(x)+fc1; backward STEP1 = dispatch(dy)+fc2 dgrad reuses it with a
+# different CU split -- no separate bwd kernel)
 from .dispatch_grouped_gemm_mxfp8_kernel import dispatch_grouped_gemm_mxfp8
 
 # --- L2 forward: fp8 GEMM + combine PUSH + weighted top-k reduce (bf16 out) ---
-from .grouped_gemm_combine_fp8_kernel import grouped_gemm_combine_fp8, prepare_w2_fp8
+# --- backward STEP3: fp8 fc1-dgrad + combine PUSH + unweighted reduce (+ gate scatter) ---
+from .grouped_gemm_combine_fp8_kernel import (
+    grouped_gemm_combine_fp8,
+    grouped_gemm_combine_fp8_bwd,
+    prepare_w2_fp8,
+)
 
 # --- SwiGLU (bf16, between L1 and L2) ---
 from .swiglu_kernel import swiglu, swiglu_backward
@@ -42,9 +49,17 @@ from .quant import (
 )
 from .quant_flydsl import preshuffle_b_scale, quantize_rowwise_mxfp8_flydsl
 
+# --- colwise-transpose mxfp8 quant (backward variable-K wgrad operands: dW2 / dW1) ---
+from .quant_colwise_trans_flydsl import (
+    colwise_grouped_meta,
+    colwise_quant_mxfp8_grouped_flydsl,
+    colwise_requant_mxfp8_grouped_fp8in_flydsl,
+)
+
 __all__ = [
     "dispatch_grouped_gemm_mxfp8",
     "grouped_gemm_combine_fp8",
+    "grouped_gemm_combine_fp8_bwd",
     "prepare_w2_fp8",
     "swiglu",
     "swiglu_backward",
@@ -57,4 +72,7 @@ __all__ = [
     "quantize_rowwise_mxfp8",
     "quantize_rowwise_mxfp8_flydsl",
     "preshuffle_b_scale",
+    "colwise_grouped_meta",
+    "colwise_quant_mxfp8_grouped_flydsl",
+    "colwise_requant_mxfp8_grouped_fp8in_flydsl",
 ]
