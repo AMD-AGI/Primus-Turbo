@@ -15,6 +15,7 @@ tile's scale soffset stays 128-region aligned), B per expert.
 """
 
 import gc
+import math
 
 import torch
 
@@ -28,6 +29,7 @@ from flydsl.expr.typing import T
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     _readfirstlane_i32,
+    _robust_time,
     ceildiv,
     make_fp8_rebased_tensor_and_srd,
     wait_barrier,
@@ -533,6 +535,82 @@ def _get_grouped_mxfp4_ws(total_M, N, K128, G, device):
     return e[0], e[1], slab_rows
 
 
+_GMXFP4_CFG_CACHE: dict = {}  # (N, K, G, out_fp16) -> raced (gm, xcd, gn); M-generic
+_GMXFP4_PM_CANON = (2048, 4096)  # tokens/group steady points for the race (geomean)
+
+
+def _gmxfp4_nt_candidates():
+    """<=3 L2-swizzle configs raced per NT shape; cand[0]=(2,1,4) is the group-major default
+    that wins most shapes, (2,8,0)/(4,8,0) win wide-N short-K shapes (measured per-shape)."""
+    return [_GMXFP4_DEFAULT_CFG, (2, 8, 0), (4, 8, 0)]
+
+
+def _canon_gmxfp4_targs(args, K, G, N, k_real, pm):
+    """Synthetic balanced NT args at `pm` tokens/group (shapes drive timing; scales=1.0 keep
+    the output finite), reusing the M-independent b-side from `args`. The launch is M-generic,
+    so one compile covers every total_M -- the race just times L2 residency per swizzle."""
+    dev = args[0].device
+    stream = args[13]
+    M_c = G * pm
+    K128 = K // 128
+    a8_c = torch.randint(-127, 127, (M_c, K // 2), device=dev, dtype=torch.int8)
+    out_c = torch.empty((M_c, N), device=dev, dtype=args[2].dtype)
+    a_raw_c = torch.full((M_c * (k_real // 32) // 4,), 0x7F7F7F7F, device=dev, dtype=torch.int32)
+    a_sp_c, b_sp_c, slab_rows_c = _get_grouped_mxfp4_ws(M_c, N, K128, G, dev)
+    n_blocks = (N + 255) // 256
+    grid_upper_c = (ceildiv(M_c, 256) + G) * n_blocks
+    a_pre_grid_c = ceildiv(slab_rows_c * K128, _PRESHUF_NG * _PRESHUF_BLK)
+    go_c = (torch.arange(0, G + 1, dtype=torch.int64, device=dev) * pm).view(torch.int32)
+    return (
+        a8_c,
+        args[1],  # b8 (weights, M-independent)
+        out_c,
+        a_raw_c,
+        args[4],  # b_raw (b scales, M-independent)
+        a_sp_c,
+        b_sp_c,
+        go_c,
+        M_c,
+        N,
+        slab_rows_c,
+        a_pre_grid_c,
+        grid_upper_c,
+        stream,
+    )
+
+
+def _select_gmxfp4_cfg(cfg_key, entry_of, K, G, N, k_real, args):
+    """First-call timed race over <=3 swizzle candidates on synthetic canon args (2 tokens/
+    group steady points, geomean); cached per static shape (no total_M). The swizzle is a pure
+    WG->tile bijection (bit-identical), so this only chases L2 residency, never correctness."""
+    cached = _GMXFP4_CFG_CACHE.get(cfg_key)
+    if cached is not None:
+        return cached
+    points = [_canon_gmxfp4_targs(args, K, G, N, k_real, pm) for pm in _GMXFP4_PM_CANON]
+
+    def _score(cfg):
+        c = flyc.compile(entry_of(cfg)[0], *points[0])  # M-generic -> one compile serves both points
+        for targs in points:
+            for _ in range(5):
+                c(*targs)
+        return math.exp(sum(math.log(_robust_time(c, t)) for t in points) / len(points))
+
+    try:
+        best_cfg, best_score = _GMXFP4_DEFAULT_CFG, _score(_GMXFP4_DEFAULT_CFG)
+    except Exception:  # a bad race falls back to the default, never breaks the GEMM
+        _GMXFP4_CFG_CACHE[cfg_key] = _GMXFP4_DEFAULT_CFG
+        return _GMXFP4_DEFAULT_CFG
+    for cfg in _gmxfp4_nt_candidates()[1:]:
+        try:
+            s = _score(cfg)
+        except Exception:  # a candidate that fails to compile/run is skipped
+            continue
+        if s < best_score * 0.985:  # adopt only if geomean >=1.5% faster than the default
+            best_cfg, best_score = cfg, s
+    _GMXFP4_CFG_CACHE[cfg_key] = best_cfg
+    return best_cfg
+
+
 def grouped_gemm_mxfp4_flydsl_kernel(
     a, a_scale, b, b_scale, group_offs, N, K, group_offs_out=None, out_dtype=torch.bfloat16, num_cu=-1
 ):
@@ -613,11 +691,13 @@ def grouped_gemm_mxfp4_flydsl_kernel(
             _GMXFP4_AT_CACHE[atk] = e2
         return e2
 
-    # Deterministic config by output-tile count (1 compile/shape, no timed autotune):
-    # few tiles under-fill the CUs -> xcd=8 spreads WGs across all 8 XCDs for occupancy
-    # (measured +20-30% on the small/short-K worst shapes); many tiles -> xcd=1 group-major
-    # for L2 locality (xcd=8 there regresses ~20%). The large-shape (2,1,4) default is kept.
-    cfg = _GMXFP4_DEFAULT_CFG
+    # Per-shape L2-swizzle: race <=3 candidates once per static shape (cached, M-generic);
+    # the (2,1,4) group-major default wins most shapes, a few wide-N short-K shapes take
+    # (2,8,0). Graph capture can't time, so it keeps the default.
+    if torch.cuda.is_current_stream_capturing():
+        cfg = _GMXFP4_DEFAULT_CFG
+    else:
+        cfg = _select_gmxfp4_cfg((N, K, G, out_fp16), _entry, K, G, N, k_real, args)
     run_eager_or_capture(_entry(cfg), args, 1)
     _bound_caches(_GMXFP4_LAUNCH_CACHE, _GMXFP4_AT_CACHE, _GMXFP4_WS_CACHE)
     return out[:, :N_out] if N_out != N else out

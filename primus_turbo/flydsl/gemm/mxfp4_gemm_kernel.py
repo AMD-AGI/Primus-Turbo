@@ -1304,29 +1304,6 @@ _MXFP4_LAUNCH_CACHE: dict = {}  # (K, gm, xcd, gn, wlv, elgk, coop, ksplit, tacc
 _MXFP4_AT_CACHE: dict = {}  # (M, N, K, gm, xcd, gn, wlv, elgk, taccw, coop) -> [raw, compiled_or_None]
 _MXFP4_CFG_CACHE: dict = {}  # (M, N, K) -> (gm, gn, xcd, wlv, elgk, taccw, coop)
 
-# Autotune candidates for the L2 (group_m / group_n / num_xcds) workgroup swizzle.
-# The swizzle is a pure WG->tile bijection (correctness-invariant), but it drives
-# L2 residency and the partial-wave tail, so the per-shape optimum is not captured
-# by a static heuristic. We pick the best by a quick timed sweep on the real
-# operands, cached per (M, N, K).
-_MXFP4_AUTOTUNE_CANDIDATES = [
-    (4, 0, 8),
-    (8, 0, 8),
-    (16, 0, 8),
-    (8, 0, 4),
-    (16, 0, 4),
-    (4, 4, 8),
-    (8, 6, 8),
-    (4, 8, 8),
-    # Wider N-bands (group_n 16/32) + no-M-group (group_m 1) cover wide-N / small-M
-    # shapes the group_n<=8 set leaves on the table. Swizzle is correctness-invariant
-    # and autotune takes the global min, so extra candidates never regress.
-    (4, 16, 8),
-    (4, 32, 8),
-    (8, 32, 8),
-    (1, 8, 8),
-]
-
 
 def _mxfp4_nt_config(M, N, K):
     """Per-shape (group_m, group_n, num_xcds) for the BN256 path (2D N-band L2
@@ -1348,9 +1325,23 @@ def _mxfp4_nt_config(M, N, K):
     return group_m, group_n, num_xcds
 
 
+def _mxfp4_swizzle_candidates(M, N, K):
+    """<=3 L2-swizzle configs for the timed autotune: the production heuristic pick plus up
+    to two group_n neighbors (group_n is the dominant L2-residency axis). Keeping the
+    heuristic pick in the set means autotune never regresses below it; the swizzle is a pure
+    WG->tile bijection (correctness-invariant), so trimming the sweep only trades coverage."""
+    gm, gn, xcd = _mxfp4_nt_config(M, N, K)
+    cands = [(gm, gn, xcd)]
+    for gn2 in (0, gn * 2 if gn else 4):
+        c = (gm, gn2, xcd)
+        if c not in cands:
+            cands.append(c)
+    return cands[:3]
+
+
 def _autotune_mxfp4_config(M, N, K, args):
     """Pick (group_m, group_n, num_xcds) for this (M, N, K) by a quick timed sweep
-    over ``_MXFP4_AUTOTUNE_CANDIDATES`` on the real operands; cached per shape.
+    over ``_mxfp4_swizzle_candidates`` (<=3) on the real operands; cached per shape.
 
     The swizzle only remaps which workgroup computes which output tile, so every
     candidate is bit-identical -- we are purely chasing L2 residency / tail balance.
@@ -1382,7 +1373,7 @@ def _autotune_mxfp4_config(M, N, K, args):
     _wl_opts = ((10, 9), (16, 15)) if _try_deepwl else ((10, 9),)
     compiled_cands = []
     for _wlv, _elgk in _wl_opts:
-        for gm, gn, xcd in _MXFP4_AUTOTUNE_CANDIDATES:
+        for gm, gn, xcd in _mxfp4_swizzle_candidates(M, N, K):
             try:
                 at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, False, False)
                 entry = _MXFP4_AT_CACHE.get(at_key)
@@ -1503,11 +1494,10 @@ def _ksplit_candidates(M, N, K):
     if tiles >= ncu // 2 or K < 2048:
         return [1]  # already enough WGs to fill the CUs (or K too small to split)
     kb = K // 256
-    cands = [1]
-    for s in (2, 3, 4, 6, 8, 12, 16):
-        if kb % s == 0 and s <= kb and tiles * s <= ncu * 2:
-            cands.append(s)
-    return cands
+    splits = [s for s in (2, 3, 4, 6, 8, 12, 16) if kb % s == 0 and s <= kb and tiles * s <= ncu * 2]
+    # <=3 configs: baseline + the two largest valid splits (max CU fill for few-tile large-K);
+    # ksplit=1 stays in the set + the sweep takes the global min, so trimming never regresses.
+    return [1, *splits[-2:]]
 
 
 def _compile_mxfp4_fused(K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, coop=False, out_fp16=False):
