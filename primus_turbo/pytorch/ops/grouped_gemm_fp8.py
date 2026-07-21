@@ -33,10 +33,12 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
 )
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-    grouped_quantize_mxfp8_flydsl_impl,
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_segment_m_row_col_impl,
-    quantize_mxfp8_flydsl_impl,
+)
+from primus_turbo.pytorch.ops.quantization import (
+    grouped_quantize_fp8_with_trans,
+    quantize_fp8_with_trans,
 )
 
 __all__ = [
@@ -71,11 +73,15 @@ def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
 
 
 class FP8GroupedGemmBlockFunc(torch.autograd.Function):
+    """BLOCKWISE grouped GEMM autograd"""
+
     @staticmethod
     def forward(
         ctx,
-        a: torch.Tensor,
-        b: torch.Tensor,
+        a: Union[torch.Tensor, QuantizedTensor],
+        b: Union[torch.Tensor, QuantizedTensor],
+        a_t: Optional[QuantizedTensor],  # not used
+        b_t: Optional[QuantizedTensor],  # not used
         group_lens: torch.Tensor,  # [B,] int64
         group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
@@ -85,6 +91,11 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
     ):
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size in [128], "Only block_size 128 is supported currently."
+        if isinstance(a, QuantizedTensor):
+            # TODO(ruibin): grouped BLOCKWISE emits fused pre-shuffled row / segment-padded col scales, from the quant kernel, it is not compatible with the QuantizedTensor."
+            raise NotImplementedError(
+                "FP8GroupedGemmBlockFunc does not support a pre-quantized activation `a`"
+            )
         assert a.ndim == 2, "Input tensor must be 2-dimensional."
         assert b.ndim == 3, "Weight tensor must be 3-dimensional."
         assert group_lens.size(0) == b.size(0), "group_lens size must match b size(0)."
@@ -93,23 +104,26 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
 
-        # One bf16 read of `a` → row-wise (fwd) + segment-padded col-wise (bwd wgrad).
-        # Row scales are pre-shuffled to the persistent GEMM's scale order. gemm_other_dim
-        # = fwd-GEMM N lets the quant pick the HIP fast path on small GEMMs.
+        # --- A side: fused row + segment-padded col grouped quant in one bf16 read.
         gemm_n = b.size(-2) if trans_b else b.size(-1)
-        a_fp8_row, a_fp8_col, a_scale_inv_row, a_scale_inv_col, _, _ = (
-            quant_fp8_blockwise_segment_m_row_col_impl(
-                a, a_dtype, config.block_size, group_lens, group_offs, gemm_other_dim=gemm_n
-            )
+        a_fp8_row, a_fp8_col, a_scale_row, a_scale_col, _, _ = quant_fp8_blockwise_segment_m_row_col_impl(
+            a, a_dtype, config.block_size, group_lens, group_offs, gemm_other_dim=gemm_n
         )
 
-        b_fp8, b_scale_inv = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
+        # --- B side: 2D-block weight, reused unchanged in fwd + bwd. If the caller
+        # pre-quantized it as a QuantizedTensor, reuse its buffers directly. ---
+        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        if isinstance(b, QuantizedTensor):
+            check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
+            b_fp8, b_scale = b.qdata, b.scale_inv
+        else:
+            b_fp8, b_scale = quant_fp8_blockwise_for_weight_impl(b, b_dtype, block_size=config.block_size)
 
         out = grouped_gemm_fp8_impl(
             a_fp8_row,
             b_fp8,
-            a_scale_inv_row,
-            b_scale_inv,
+            a_scale_row,
+            b_scale,
             group_lens,
             group_offs,
             trans_a=False,
@@ -122,9 +136,9 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
 
         ctx.save_for_backward(
             a_fp8_col,
-            a_scale_inv_col,
+            a_scale_col,
             b_fp8,
-            b_scale_inv,
+            b_scale,
             group_lens,
             group_offs,
         )
@@ -142,23 +156,22 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
 
         (
             a_fp8_col,
-            a_scale_inv_col,
+            a_scale_col,
             b_fp8,
-            b_scale_inv,
+            b_scale,
             group_lens,
             group_offs,
         ) = ctx.saved_tensors
         block_size = ctx.config.block_size
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
 
-        # One bf16 read of grad_out → row-wise (dgrad) + segment-padded col-wise (wgrad).
-        # gemm_other_dim = bwd-GEMM K lets the quant pick the HIP fast path on small GEMMs.
+        # --- grad_out: fused row + segment-padded col grouped quant in one bf16 read.
         gemm_k = b_fp8.size(-1) if ctx.trans_b else b_fp8.size(-2)
         (
             grad_out_fp8_row,
             grad_out_fp8_col,
-            grad_out_scale_inv_row,
-            grad_out_scale_inv_col,
+            grad_out_scale_row,
+            grad_out_scale_col,
             var_k_group_lens,
             var_k_group_offs,
         ) = quant_fp8_blockwise_segment_m_row_col_impl(
@@ -169,8 +182,8 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         grad_a = grouped_gemm_fp8_impl(
             grad_out_fp8_row,
             b_fp8,
-            grad_out_scale_inv_row,
-            b_scale_inv,
+            grad_out_scale_row,
+            b_scale,
             group_lens,
             group_offs,
             trans_a=False,
@@ -184,8 +197,8 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         grad_b = grouped_gemm_fp8_variable_k_impl(
             a_fp8_col,
             grad_out_fp8_col,
-            a_scale_inv_col,
-            grad_out_scale_inv_col,
+            a_scale_col,
+            grad_out_scale_col,
             var_k_group_lens,
             var_k_group_offs,
             trans_a=not ctx.trans_a,
@@ -200,6 +213,8 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         return (
             grad_a,  # a
             grad_b,  # b
+            None,  # a_t
+            None,  # b_t
             None,  # group_lens
             None,  # group_offs
             None,  # trans_b
@@ -604,7 +619,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
         a_scaling_recipe = ScalingRecipe()
         if not isinstance(a, QuantizedTensor):
-            # NOTE: If a is not a QuantizedTensor use grouped_quantize_mxfp8_flydsl_impl to avoid call dequantize.
+            # NOTE: If a is not a QuantizedTensor use grouped_quantize_fp8_with_trans to avoid call dequantize.
             (
                 a_fp8_row,
                 a_scale_row,
@@ -614,9 +629,10 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 group_offs_padded_rowwise,
                 _,
                 _,
-            ) = grouped_quantize_mxfp8_flydsl_impl(
+            ) = grouped_quantize_fp8_with_trans(
                 a,
                 a_dtype,
+                config.granularity,
                 group_lens,
                 group_offs,
                 block_size=config.block_size,
@@ -650,13 +666,15 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if not isinstance(b, QuantizedTensor):
-            # NOTE: If b is not a QuantizedTensor use quantize_mxfp8_flydsl_impl to avoid call dequantize.
-            b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = quantize_mxfp8_flydsl_impl(
+            # NOTE: If b is not a QuantizedTensor use quantize_fp8_with_trans to avoid call dequantize.
+
+            b_fp8_row, b_scale_row, b_fp8_col, b_scale_col = quantize_fp8_with_trans(
                 b,
                 b_dtype,
+                config.granularity,
                 block_size=config.block_size,
-                scaling_recipe=b_scaling_recipe,
-                scaling_recipe_for_trans=b_scaling_recipe,
+                scaling_recipe=ScalingRecipe(use_2d_block=True),
+                scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
             )
         else:
             quantized_b = b
@@ -730,9 +748,10 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             group_offs_padded_rowwise,
             group_lens_padded_colwise,
             group_offs_padded_colwise,
-        ) = grouped_quantize_mxfp8_flydsl_impl(
+        ) = grouped_quantize_fp8_with_trans(
             grad_out,
             grad_out_dtype,
+            ctx.config.granularity,
             group_lens,
             group_offs,
             block_size=ctx.config.block_size,
@@ -878,9 +897,21 @@ def grouped_gemm_fp8(
             num_cu,
         )
     elif config.granularity == ScalingGranularity.BLOCKWISE:
-        # BLOCKWISE only accepts raw tensors today; preserve existing assertion
-        # behaviour in ``FP8GroupedGemmBlockFunc.forward``.
-        return FP8GroupedGemmBlockFunc.apply(a, b, group_lens, group_offs, trans_b, out_dtype, config, num_cu)
+        # BLOCKWISE accepts a pre-quantized 2D-block weight (``b``); the activation
+        # ``a`` must stay a raw tensor (fused pre-shuffled quant). ``a_data_t`` /
+        # ``b_data_t`` are unused by ``FP8GroupedGemmBlockFunc``.
+        return FP8GroupedGemmBlockFunc.apply(
+            a_data,
+            b_data,
+            a_data_t,
+            b_data_t,
+            group_lens,
+            group_offs,
+            trans_b,
+            out_dtype,
+            config,
+            num_cu,
+        )
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
         return FP8GroupedGemmMXFunc.apply(
             a_data,

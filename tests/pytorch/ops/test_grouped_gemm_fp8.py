@@ -799,6 +799,102 @@ def test_grouped_gemm_fp8_mx_blockwise_quantized_tensor(
     )
 
 
+@pytest.mark.parametrize("B", B_VALUES)
+@pytest.mark.parametrize("M", M_VALUES)
+@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_grouped_gemm_fp8_blockwise_weight_quantized_tensor(
+    B, M, NK, ori_dtype, format, block_size, trans_b, balance, backend, auto_tune
+):
+    """BLOCKWISE grouped_gemm with a pre-quantized 2D-block weight (``b``); ``a`` raw.
+
+    NOTE: Grouped BLOCKWISE only supports the weight side as a QuantizedTensor: the
+    activation ``a`` must stay a raw tensor. So ``a`` is kept high-precision and
+    only ``b`` is externally quantized.
+    """
+    N, K = NK
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
+    if _check_hit_int32_limit(B, M, N, K):
+        pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
+
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(auto_tune)
+
+    device = "cuda:0"
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    print(
+        f"\n[QT-BLOCKWISE-weight] B={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, "
+        f"format={format}, block_size={block_size}, trans_b={trans_b}, balance={balance}, "
+        f"backend={backend}, auto_tune={auto_tune}"
+    )
+
+    b_shape = (B, N, K) if trans_b else (B, K, N)
+    a = torch.randn((B * M, K), dtype=ori_dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_(True)
+    b_ref = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+
+    # Externally quantize only the weight as a 2D-block QuantizedTensor.
+    fwd_dtype = _get_fp8_dtype(format, is_fwd=True)
+    b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+    qt_b = QuantizedTensor.quantize(
+        b,
+        fwd_dtype,
+        ScalingGranularity.BLOCKWISE,
+        axis=-1 if trans_b else -2,
+        block_size=block_size,
+        scaling_recipe=b_scaling_recipe,
+    )
+
+    # Reference
+    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b)
+    grad_out = torch.randn_like(out_ref)
+    out_ref.backward(grad_out)
+    torch.cuda.synchronize()
+
+    config = Float8QuantConfig(format=format, granularity=ScalingGranularity.BLOCKWISE, block_size=block_size)
+    out = grouped_gemm_fp8(a, qt_b, group_lens, trans_b=trans_b, config=config)
+    out.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # Check Shape
+    assert out.shape == out_ref.shape
+    assert a.grad is not None and a.grad.shape == a_ref.grad.shape
+    assert qt_b.grad is not None and qt_b.grad.shape == b.shape
+
+    # Check Results
+    snr_threshold = 25 if format == Format.E4M3 else 20
+
+    out_snr = compute_snr(out_ref, out)
+    a_grad_snr = compute_snr(a_ref.grad, a.grad)
+    b_grad_snr = compute_snr(b_ref.grad, qt_b.grad)
+    print(
+        f"[QT-BLOCKWISE-weight] Out-SNR={out_snr:.2f} dB, "
+        f"AGrad-SNR={a_grad_snr:.2f} dB, BGrad-SNR={b_grad_snr:.2f} dB"
+    )
+    assert out_snr > snr_threshold, f"out_snr={out_snr:.2f} too low"
+    assert a_grad_snr > snr_threshold, f"a_grad_snr={a_grad_snr:.2f} too low"
+    assert b_grad_snr > snr_threshold, f"b_grad_snr={b_grad_snr:.2f} too low"
+
+    # Reset config and caches
+    GlobalBackendManager.reset()
+
+
 def _test_grouped_gemm_fp8_hipgraph_test(
     B: int,
     M: int,
