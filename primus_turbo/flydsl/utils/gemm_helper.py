@@ -82,38 +82,16 @@ def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_byt
 
 
 def make_fp8_rebased_tensor_and_srd(arg_i8, fp8_ir_t, base_elems, num_records_bytes):
-    """Rebased fp8 BufferDesc tensor (feeds the G2S prologue loads) plus a matching raw
-    buffer resource (feeds ``MfmaScaleFp4.call_mxfp4_wholeloop``'s K-loop, which addresses
-    via a bare rsrc + int32 soffset), both sharing one int64-folded base. The mxfp4 GEMMs
-    reach the operand two ways; folding the per-tile/expert element base into both SRDs in
-    64-bit keeps every voffset/soffset int32, so large-G MoE / large total_M (base > 2^31
-    elems) address correctly where a flat pack + 32-bit voffset cannot."""
-    base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg_i8))
-    base = _readfirstlane_i32(base + arith.index_cast(T.i64, base_elems))
-    # Cap num_records at the SIGNED int32 max (mirrors the proven StoreCPerTensor path):
-    # the SRD's num_records is treated as int32, so a > 2^31 byte count (e.g. group-0's
-    # to-end bound in a > 4GB MoE B) would wrap negative -> every load OOB-drops -> zeros.
-    # After the int64 base fold every access is intra-tile (<< 2^31), so this always covers it.
-    nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0x7FFFFFFF))
-    nrec_pinned = _readfirstlane_i32(arith.index_cast(T.i64, nr))
-    flags = _buffer_ops._get_buffer_flags()
-    base_ptr = fx.inttoptr(fx.PointerType.get(elem_ty=T.i8, address_space=1, alignment=16), base)
-    i8_buf_ty = fx.PointerType.get(elem_ty=T.i8, address_space=TargetAddressSpace.BufferDesc, alignment=16)
-    buf_ptr = fx.make_ptr(
-        i8_buf_ty, [base_ptr, fx.Int16(0).ir_value(), fx.Int64(nrec_pinned).ir_value(), fx.Int32(flags).ir_value()]
+    """``make_fp8_buffer_tensor_rebased`` (the G2S prologue tensor) plus a matching raw SRD on
+    the same int64-folded base for ``call_mxfp4_wholeloop``'s K-loop (bare rsrc + int32
+    soffset). The mxfp4 GEMMs reach the operand both ways past 2^31 elems."""
+    tensor = make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_bytes)
+    base = _readfirstlane_i32(
+        arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg_i8)) + arith.index_cast(T.i64, base_elems)
     )
-    lay = fx.make_layout(0x40000000, 1)  # 1D flat; HW bounds via num_records
-    iter_i8 = fx.get_iter(fx.make_view(buf_ptr, lay))
-    f8_buf_ptr_ty = fx.PointerType.get(
-        elem_ty=fp8_ir_t,
-        address_space=TargetAddressSpace.BufferDesc,
-        alignment=fx.PointerType(iter_i8.type).alignment,
-    )
-    iter_f8 = fx.recast_iter(f8_buf_ptr_ty, iter_i8)
-    tensor = fx.Tensor(fx.make_view(iter_f8, lay))
-    srd = _buffer_ops.create_buffer_resource_from_addr(
-        base, num_records_bytes=arith.index_cast(T.index, nrec_pinned)
-    )
+    nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
+    nrec = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nr)))
+    srd = _buffer_ops.create_buffer_resource_from_addr(base, num_records_bytes=nrec)
     return tensor, srd
 
 

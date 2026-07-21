@@ -57,7 +57,6 @@ def _raw(v):
     return v
 
 
-
 # ── Device-side scale + fragment loaders / geometry ──────────────────────────
 
 
@@ -1016,8 +1015,12 @@ def _build_mxfp4_gemm_kernel(
         def _bind(bm, bn):
             a_base_e = arith.index_cast(T.index, bm * fx.Int32(BLOCK_M)) * arith.index(K2)
             b_base_e = arith.index_cast(T.index, bn * fx.Int32(BLOCK_N)) * arith.index(K2)
-            a_nrec = (arith.index_cast(T.index, c_m) - arith.index_cast(T.index, bm * fx.Int32(BLOCK_M))) * arith.index(K2)
-            b_nrec = (arith.index_cast(T.index, c_n) - arith.index_cast(T.index, bn * fx.Int32(BLOCK_N))) * arith.index(K2)
+            a_nrec = (
+                arith.index_cast(T.index, c_m) - arith.index_cast(T.index, bm * fx.Int32(BLOCK_M))
+            ) * arith.index(K2)
+            b_nrec = (
+                arith.index_cast(T.index, c_n) - arith.index_cast(T.index, bn * fx.Int32(BLOCK_N))
+            ) * arith.index(K2)
             gA, _ld["rsrc_a"] = make_fp8_rebased_tensor_and_srd(A, F8_IR_t, a_base_e, a_nrec)
             gB, _ld["rsrc_b"] = make_fp8_rebased_tensor_and_srd(B_T, F8_IR_t, b_base_e, b_nrec)
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
