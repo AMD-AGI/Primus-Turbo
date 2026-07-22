@@ -44,7 +44,7 @@ pool_x -> fp8 GEMM) vs shipped bf16 Triton ``grouped_gemm_variable_k_impl``. Sam
 breakdown + SNR gate as fc2_wgrad. (Not in ``both``.)
 
 Backward stage ``--stage fc1_dgrad_combine``: STEP3 = fc1 dgrad (grad_l1 @ w1^T) + combine + reduce
-+ grad_gate scatter -> dx [T,H]. fp8 ``grouped_gemm_combine_fp8_bwd`` (fp8-PUSH, fp8 stack) vs the
++ grad_gate scatter -> dx [T,H]. fp8 ``grouped_gemm_combine_mxfp8_flydsl_kernel_bwd`` (fp8-PUSH, fp8 stack) vs the
 shipped bf16 ``grouped_gemm_combine_bf16_flydsl_kernel(layout='nn')`` (separate bf16 stack -- the
 fp8/bf16 dispatch handles are not interchangeable), kernel-only timing -> LATENCY compare (dx SNR
 via e2e gradcheck). The fp8-PUSH combine can intermittently spin-deadlock at large T (~5-15%) and
@@ -80,6 +80,7 @@ import primus_turbo.pytorch  # noqa: E402,F401
 from primus_turbo.flydsl.mega import (  # noqa: E402  (shipped bf16 kernels -- do NOT modify)
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
+    swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
@@ -89,13 +90,11 @@ from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
-    grouped_gemm_combine_fp8,
-    grouped_gemm_combine_fp8_bwd,
+    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    grouped_gemm_combine_mxfp8_flydsl_kernel_bwd,
     prepare_w2_fp8,
     quantize_grouped_weight_mxfp8,
     quantize_rowwise_mxfp8_flydsl,
-    swiglu,
-    swiglu_backward,
 )
 from primus_turbo.pytorch.core.backend import BackendType  # noqa: E402
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity  # noqa: E402
@@ -297,27 +296,23 @@ def profile_l2(group, args, mode):
     symm.scoreboard.zero_()
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
-    act = swiglu(l1).contiguous()             # [M, I] bf16 SwiGLU output (contiguous: combine reads it flat)
+    act = swiglu_flydsl_kernel(l1, symm.meta_scalars[1:2]).contiguous()  # [M, I] bf16 (contiguous: combine reads flat)
     w2_fp8 = prepare_w2_fp8(W2)               # static weight prep (module-owned in production)
     real_tiles = int(symm.meta_scalars[1].item())
     M_eff = real_tiles * BM
     m_pad = int(handle[_H_GROUP_OFFS][-1].item())
 
-    def _reset_l2():  # combine flag reset (cross-rank); run OUTSIDE the timed window (kernel-only)
-        symm.sb_l2.zero_(); symm.barrier_local.fill_(-1)
-
-    def _fp8():  # fp8 L2 combine kernel only (GEMM + PUSH + reduce); matches the isolated L2 bench
-        return grouped_gemm_combine_fp8(
+    def _fp8():  # fp8 L2 combine kernel (GEMM + PUSH + reduce); self-resets the L2 flags internally
+        return grouped_gemm_combine_mxfp8_flydsl_kernel(
             act, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=topk_w_f32,
             BM=BM, BN=BN, num_combine_cu=48,
         )
 
-    torch.cuda.synchronize(); group.barrier(); _reset_l2(); torch.cuda.synchronize(); group.barrier()
     y = _fp8()
     torch.cuda.synchronize(); group.barrier()
     fin = bool(torch.isfinite(y.float()).all())
     y_norm = float(y.float().norm())
-    t_fp8 = _bench(_fp8, warmup=args.warmup, iters=args.iters, group=group, reset=_reset_l2)
+    t_fp8 = _bench(_fp8, warmup=args.warmup, iters=args.iters, group=group)
     flops = 2.0 * M_eff * H * I  # fc2 GEMM: [M,I] @ [I,H] -> [M,H]  (N=H, K=I)
     symm.destroy()
     torch.cuda.synchronize(); group.barrier()
@@ -487,8 +482,8 @@ def profile_fc2_wgrad(group, args, mode):
 
     # dispatch(dy)+fc2-dgrad -> grad_swiglu + dispatched-dy fp8 pool; swiglu_backward -> act_weighted
     grad_swiglu, pool_handle = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
-    _, _, act_weighted = swiglu_backward(
-        grad_swiglu, l1, scale=dispatch_weights, return_gate=True, return_act_w=True,
+    _, _, act_weighted = swiglu_backward_flydsl_kernel(
+        grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
     group_lens, group_offs = handle[_H_GROUP_LENS], handle[_H_GROUP_OFFS]
 
@@ -594,8 +589,8 @@ def profile_fc1_wgrad(group, args, mode):
     pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(Pp, Hp // 32).clone())
 
     grad_swiglu, _ = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
-    grad_l1, _, _ = swiglu_backward(
-        grad_swiglu, l1, scale=dispatch_weights, return_gate=True, return_act_w=True,
+    grad_l1, _, _ = swiglu_backward_flydsl_kernel(
+        grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
     group_lens, group_offs = handle[_H_GROUP_LENS], handle[_H_GROUP_OFFS]
 
@@ -664,7 +659,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     fp8 vs bf16 on SEPARATE symm stacks (the fp8 / bf16 dispatch handles are NOT interchangeable --
     bf16 combine reads recv_* at handle[9..12] where the fp8 handle holds group_lens/offs), so this
     is a LATENCY comparison (dx SNR is gated by the e2e backward gradcheck, not here):
-      * fp8  : fp8 stack -- real backward to grad_l1 + grad_gate, then ``grouped_gemm_combine_fp8_bwd``
+      * fp8  : fp8 stack -- real backward to grad_l1 + grad_gate, then ``grouped_gemm_combine_mxfp8_flydsl_kernel_bwd``
                (fp8 fc1-dgrad + fp8-PUSH combine; w1^T prepped once). Kernel-only (reset outside window).
       * bf16 : bf16 stack -- shipped ``dispatch...bf16`` for a handle + a realistic grad_l1 replica,
                then ``grouped_gemm_combine_bf16_flydsl_kernel(layout='nn')``, same pool/routing.
@@ -698,7 +693,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
     grad_swiglu, _ = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
-    grad_l1, grad_gate = swiglu_backward(grad_swiglu, l1, scale=dispatch_weights, return_gate=True)
+    grad_l1, grad_gate = swiglu_backward_flydsl_kernel(grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True)
 
     w1t_fp8 = prepare_w2_fp8(W1.transpose(1, 2).contiguous())  # w1^T fp8 prep (static weight, once)
     tidx64 = topk_idx.contiguous().view(-1)                    # fp8 combine-bwd takes int64
@@ -709,7 +704,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
         symm.sb_l2.zero_(); symm.barrier_local.fill_(-1); symm.combine_gate.zero_()
 
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only)
-        dx, _ = grouped_gemm_combine_fp8_bwd(
+        dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel_bwd(
             grad_l1, w1t_fp8, list(handle), group, topk_indices=tidx64, grad_gate=grad_gate,
             BM=BM, BN=BN, num_combine_cu=48,
         )

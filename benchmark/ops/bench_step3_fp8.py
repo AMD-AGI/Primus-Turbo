@@ -35,8 +35,8 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
     quantize_grouped_weight_mxfp8,
-    swiglu_backward,
 )
+from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
     _mxfp8_step1_dispatch_dgrad,
     _mxfp8_step3_fc1_dgrad_combine,
@@ -106,7 +106,7 @@ def profile(group, args):
 
     dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
     grad_swiglu, _ = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
-    grad_l1, grad_gate = swiglu_backward(grad_swiglu, l1, scale=dispatch_weights, return_gate=True)
+    grad_l1, grad_gate = swiglu_backward_flydsl_kernel(grad_swiglu, l1, get_symm_buffer_for_mega_moe().meta_scalars[1:2], scale=dispatch_weights, return_gate=True)
 
     def _step3():
         return _mxfp8_step3_fc1_dgrad_combine(

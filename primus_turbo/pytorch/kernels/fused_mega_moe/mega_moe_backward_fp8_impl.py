@@ -32,11 +32,11 @@ from primus_turbo.flydsl.mega.fp8 import (
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     dispatch_grouped_gemm_mxfp8,
     get_symm_buffer_for_mega_moe,
-    grouped_gemm_combine_fp8_bwd,
+    grouped_gemm_combine_mxfp8_flydsl_kernel_bwd,
     prepare_w2_fp8,
     quantize_grouped_weight_mxfp8,
-    swiglu_backward,
 )
+from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float8_e5m2
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
@@ -63,6 +63,7 @@ _STEP1_NUM_PRESHUFFLE_CU = 8
 # variable-K wgrads (dW1/dW2) take group_lens/offs; the combine takes tile_to_expert.
 _HANDLE_GROUP_LENS = 9
 _HANDLE_GROUP_OFFS = 10
+_HANDLE_NUM_TILE_BLOCKS = 11  # device real-tile count (SwiGLU epilogue row bound)
 
 _W2T_PREP_ATTR = "_mega_fp8_w2t_prep"
 _W1T_COMBINE_PREP_ATTR = "_mega_fp8_w1t_combine_prep"
@@ -194,7 +195,7 @@ def _mxfp8_step3_fc1_dgrad_combine(
     symm.barrier_local.fill_(-1)
     symm.combine_gate.zero_()
     _host_rendezvous(group)
-    dx, d_topk_w_flat = grouped_gemm_combine_fp8_bwd(
+    dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel_bwd(
         grad_l1, w1tf, list(handle), group,
         topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
         BM=block_m, BN=block_n, num_combine_cu=48,
@@ -261,8 +262,9 @@ def mega_moe_backward_fp8_impl(
 
     # STEP2 (bf16): SwiGLU^T -> grad_l1 [P,2I]; re-inject routing weight; grad_gate [P]; and
     # act_weighted [P,I] = fwd-act * weight (the dW2 `b` operand, folding host saved_act*weight).
-    grad_l1, grad_gate, act_weighted = swiglu_backward(
-        grad_swiglu, l1, scale=dispatch_weights, return_gate=True, return_act_w=True
+    grad_l1, grad_gate, act_weighted = swiglu_backward_flydsl_kernel(
+        grad_swiglu, l1, handle[_HANDLE_NUM_TILE_BLOCKS],
+        scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
 
     # dW2 (MXFP8 variable-K): dispatch_l2_grad^T @ act_weighted; `a` requant-fused directly from

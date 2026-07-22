@@ -550,23 +550,23 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     topk_weights: Optional[torch.Tensor] = None,
     BM: int = 256,
     BN: int = 256,
-    *,
-    save_bwd: bool = False,
-) -> Tuple[torch.Tensor, tuple, object, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+) -> Tuple[torch.Tensor, tuple, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Self-contained fp8 L1 = fused mxfp8 dispatch + fc1 (NT); fp8 sibling of
     ``dispatch_grouped_gemm_bf16_flydsl_kernel``.
 
     Takes the pre-quantized fc1 weight (``w1q`` [G,2I,H] fp8 + ``w1s`` raw E8M0; prepared
     version-keyed by the caller). When ``handle is None`` (forward), builds the symmetric workspace +
     dispatch-prologue handle from ``topk_idx`` / ``topk_weights``; otherwise reuses the live symm
-    buffer + the given handle. Publishes the cross-rank scoreboard reset (barrier-bracketed), runs the
-    fused dispatch-PUSH + grouped mxfp8 GEMM (token quant folded in via the bf16-x path), and -- when
-    ``save_bwd`` -- clones the backward inputs off the shared symm pool BEFORE any later stage (STEP1
-    dispatch(dy)) overwrites it.
+    buffer + the given handle. Publishes the cross-rank scoreboard reset (barrier-bracketed) and runs
+    the fused dispatch-PUSH + grouped mxfp8 GEMM (token quant folded in via the bf16-x path).
 
-    Returns ``(l1, handle, symm, dispatch_weights, pool_x_fp8)``; ``dispatch_weights`` / ``pool_x_fp8``
-    are ``None`` unless ``save_bwd``. The caller keeps ``handle`` (L2 + backward reuse it) and ``symm``
-    (L2 combine flag reset).
+    Returns ``(l1, handle, dispatch_weights, pool_x_fp8)`` where ``dispatch_weights`` is
+    ``symm.weight_recv_buf`` (per-pool-row routing weight) and ``pool_x_fp8`` is
+    ``(symm.pool_fp8 [P,H] fp8, symm.pool_scale [P,H//32] E8M0)`` -- both LIVE views into the shared
+    symm pool (no clone). The caller keeps ``handle`` (L2 + backward reuse it); ``handle[-1]`` is the
+    device ``num_tile_blocks`` (real-tile count), the SwiGLU-epilogue row bound (mirrors bf16's
+    ``handle[_H_NUM_TILE_BLOCKS]``). It can re-fetch the live symm buffer via
+    ``get_symm_buffer_for_mega_moe()`` (e.g. the L2 combine flag reset).
     """
     if handle is None:
         assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
@@ -586,7 +586,7 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
                 num_experts=G * world, world_size=world, rank=symm.rank, experts_per_rank=G,
                 block_m=BM, num_max_pool_tokens=symm.num_max_pool_tokens,
             )
-        )
+        ) + (symm.meta_scalars[1:2],)  # handle[-1] = num_tile_blocks (device real-tile count)
     else:
         symm = get_symm_buffer_for_mega_moe()  # live buffer from a prior forward
         sym_layout = symm.make_sym_layout()
@@ -603,9 +603,5 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     #  * pool_x_fp8: THIS dispatched fc1-input pool in native rowwise-fp8 -- lets dW1 be a LOCAL
     #    variable-K wgrad (grad_l1^T @ pool_x) with NO cross-rank re-dispatch (mirrors dW2's reuse
     #    of the STEP1 pool). fp8 (1B) [P,H] + E8M0 [P,H//32].
-    dispatch_weights = symm.weight_recv_buf.clone() if save_bwd else None
-    pool_x_fp8 = None
-    if save_bwd:
-        _Px, _Hx = symm.pool_fp8.shape
-        pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(_Px, _Hx // 32).clone())
-    return l1, handle, symm, dispatch_weights, pool_x_fp8
+    _Px, _Hx = symm.pool_fp8.shape
+    return l1, handle, symm.weight_recv_buf, (symm.pool_fp8, symm.pool_scale.reshape(_Px, _Hx // 32))
