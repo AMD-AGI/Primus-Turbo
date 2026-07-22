@@ -37,7 +37,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8,
     swiglu_backward,
 )
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import (
+from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
     _mxfp8_step1_dispatch_dgrad,
     _mxfp8_step3_fc1_dgrad_combine,
 )

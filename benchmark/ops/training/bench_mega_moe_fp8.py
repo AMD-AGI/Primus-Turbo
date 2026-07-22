@@ -106,13 +106,13 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (  # noq
     grouped_gemm_variable_k_impl,
 )
 from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused  # noqa: E402  (shipped bf16 op)
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import (  # noqa: E402  (fp8 op + bwd stages)
+from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (  # noqa: E402  (fp8 bwd stages)
     _DW_FP8_FORMAT,
     _mxfp8_step1_dispatch_dgrad,
     _mxfp8_variable_k_wgrad,
     _mxfp8_variable_k_wgrad_dw1,
-    mega_moe_fused_fp8,
 )
+from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8  # noqa: E402  (fp8 op)
 
 _MXFP8_BLOCK = 32
 _H_TILE_TO_EXPERT = 7
