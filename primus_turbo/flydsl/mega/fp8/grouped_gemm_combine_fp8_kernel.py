@@ -58,6 +58,7 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import _host_rendezvous
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K as _MXFP8_BLOCK_K,
     gemm_mxfp8_nt_tile,
@@ -476,7 +477,7 @@ def _compile_bwd(
     """Backward STEP3 = mxfp8 fc1-dgrad GEMM (CShuffle mxfp8-quant epilogue -> local fp8 dx pool) +
     FP8 combine PUSH (+ gate scatter) + UNWEIGHTED fp8-dequant reduce (+ d_topk_w fold). The fp8
     analog of the current bf16-PUSH ``grouped_gemm_combine_mxfp8_bwd``, mirroring the production
-    forward ``grouped_gemm_combine_fp8`` (always the mxfp8-GEMM path). ``ACT`` = grad_l1 fp8,
+    forward ``grouped_gemm_combine_mxfp8_flydsl_kernel`` (always the mxfp8-GEMM path). ``ACT`` = grad_l1 fp8,
     ``WEIGHTS`` = w1^T fp8; the reduce is unweighted (routing weight folded into grad_l1 upstream)."""
     K = hidden_size
     assert out_features % BLOCK_N == 0
@@ -683,7 +684,7 @@ def prepare_w2_fp8(l2_weights):
     return weight_flat, b_sp
 
 
-def grouped_gemm_combine_fp8(
+def grouped_gemm_combine_mxfp8_flydsl_kernel(
     act, w2_fp8, handle, group, *, topk_indices, topk_weights, BM=256, BN=256,
     num_combine_cu=48, num_reduce_cu=0,
 ):
@@ -693,15 +694,21 @@ def grouped_gemm_combine_fp8(
     [G*H*I], b_sp int32)`` -- build it once with :func:`prepare_w2_fp8` and maintain it version-keyed
     at the op layer; this function does NO weight quant/preshuffle and NO caching. ``act`` [M, I]
     bf16 (M = num_max_pool_tokens) is the activation A operand, quantized rowwise-mxfp8 internally
-    (per-call token work). GEMM epilogue quantizes C -> LOCAL fp8 L2Y; combine pure-copies fp8 ->
+    (per-call token work).     GEMM epilogue quantizes C -> LOCAL fp8 L2Y; combine pure-copies fp8 ->
     peer; reduce dequants -> ``y`` [num_tokens, H] bf16. Shapes: I from ``act``, H / G from
-    ``sym_layout`` (hidden / num_experts_per_rank). Caller inits ``symm.barrier_local``=-1,
-    ``symm.sb_l2``=0."""
+    ``sym_layout`` (hidden / num_experts_per_rank). Self-contained: resets the L2 scoreboard/flags
+    (``symm.sb_l2``=0, ``symm.barrier_local``=-1) cross-rank internally, so the caller does not."""
     assert act.dtype == torch.bfloat16
     weight_flat, b_sp = w2_fp8
     tile_to_expert = handle[7]
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.make_sym_layout()
+    # self-contained cross-rank L2 flag reset (barrier-bracketed so every peer sees sb_l2=0 /
+    # barrier_local=-1 before any rank signals) -- mirrors the bf16 combine being self-contained.
+    _host_rendezvous(group)
+    symm.sb_l2.zero_()
+    symm.barrier_local.fill_(-1)
+    _host_rendezvous(group)
     M, I = act.shape
     H = int(sym_layout.hidden)
     G = int(sym_layout.num_experts_per_rank)
@@ -758,14 +765,14 @@ def grouped_gemm_combine_fp8(
     return output
 
 
-def grouped_gemm_combine_fp8_bwd(
+def grouped_gemm_combine_mxfp8_flydsl_kernel_bwd(
     grad_l1, w1t_fp8, handle, group, *, topk_indices, grad_gate, BM=256, BN=256,
     num_combine_cu=16, num_reduce_cu=0,
 ):
     """Backward STEP3, FP8-PUSH: mxfp8 fc1-dgrad (``grad_l1 @ w1t^T``) with a CShuffle mxfp8-quant
     epilogue -> LOCAL fp8 dx pool -> FP8 combine PUSH (+ gate scatter) -> UNWEIGHTED fp8-dequant
     reduce (+ ``d_topk_w`` fold). The fp8-PUSH analog / backward mirror of the production forward
-    ``grouped_gemm_combine_fp8``.
+    ``grouped_gemm_combine_mxfp8_flydsl_kernel``.
 
     PURE COMPUTE: the fc1^T weight comes in ALREADY prepared as ``w1t_fp8 = (weight_flat, b_sp)``
     (build once with :func:`prepare_w2_fp8` on ``w1^T`` [G,H,2I], op-layer version-keyed) -- no weight

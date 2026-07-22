@@ -35,8 +35,8 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
     quantize_grouped_weight_mxfp8,
-    swiglu_backward,
 )
+from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
@@ -140,8 +140,9 @@ def profile(group, args):
     # STEP1 (dispatch(dy)+fc2 dgrad) -> grad_swiglu + dispatched-dy fp8 pool
     grad_swiglu, pool_handle = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
     # STEP2 (swiglu^T, re-inject routing weight) -> act_weighted (the dW2 b operand)
-    _, _, act_weighted = swiglu_backward(
-        grad_swiglu, l1, scale=dispatch_weights, return_gate=True, return_act_w=True,
+    _, _, act_weighted = swiglu_backward_flydsl_kernel(
+        grad_swiglu, l1, get_symm_buffer_for_mega_moe().meta_scalars[1:2],
+        scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
     group_lens, group_offs = handle[_H_GROUP_LENS], handle[_H_GROUP_OFFS]
 

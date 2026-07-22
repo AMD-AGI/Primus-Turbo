@@ -8,7 +8,7 @@
 
 Builds the symm workspace + prologue, runs the fp8 L1 (dispatch+fc1) + SwiGLU to get a real
 ``act`` in the pool, then times the fp8 L2 path on that ``act``:
-  grouped_gemm_combine_fp8  (fp8 GEMM + mxfp8 epilogue + fp8 PUSH + fp8-dequant reduce) -> y bf16.
+  grouped_gemm_combine_mxfp8_flydsl_kernel  (fp8 GEMM + mxfp8 epilogue + fp8 PUSH + fp8-dequant reduce) -> y bf16.
 Reports latency + a finite/NaN check. (For the fp8-vs-bf16 accuracy/speed comparison at the
 whole-forward level, use bench_mega_moe_fused_fp8.py, which uses the bf16 mega_moe_fused as the
 reference -- this repo carries no bf16 combine kernel under flydsl/mega/fp8/.)
@@ -31,11 +31,11 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
-    grouped_gemm_combine_fp8,
+    grouped_gemm_combine_mxfp8_flydsl_kernel,
     prepare_w2_fp8,
     quantize_grouped_weight_mxfp8,
-    swiglu,
 )
+from primus_turbo.flydsl.mega import swiglu_flydsl_kernel
 
 
 def _routing(T, K, E, *, device, seed):
@@ -112,17 +112,13 @@ def profile(group, args):
     symm.scoreboard.zero_()
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
-    act = swiglu(l1).contiguous()
+    act = swiglu_flydsl_kernel(l1, get_symm_buffer_for_mega_moe().meta_scalars[1:2]).contiguous()
 
     tw_f32 = topk_w.to(torch.float32)
     w2_fp8 = prepare_w2_fp8(W2)  # weight prep at the caller (op layer); combine is pure compute
 
-    def _reset_l2():
-        symm.sb_l2.zero_()
-        symm.barrier_local.fill_(-1)
-
     def _fp8():
-        return grouped_gemm_combine_fp8(
+        return grouped_gemm_combine_mxfp8_flydsl_kernel(
             act, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=tw_f32,
             BM=BM, BN=BN, num_combine_cu=48,
         )
@@ -130,7 +126,6 @@ def profile(group, args):
     # correctness smoke: fp8 L2 output must be finite (+ diagnostics on where it breaks)
     act_finite = bool(torch.isfinite(act.float()).all())
     m_pad = int(handle[10][-1].item())
-    torch.cuda.synchronize(); group.barrier(); _reset_l2(); torch.cuda.synchronize(); group.barrier()
     y_fp8 = _fp8()
     torch.cuda.synchronize(); group.barrier()
     yf = y_fp8.float()
@@ -140,7 +135,7 @@ def profile(group, args):
     bad_tok = int((~torch.isfinite(yf)).any(dim=1).sum().item())
     num_tokens = yf.shape[0]
 
-    t_fp8 = _bench(_fp8, warmup=args.warmup, iters=args.iters, group=group, reset=_reset_l2)
+    t_fp8 = _bench(_fp8, warmup=args.warmup, iters=args.iters, group=group)
     symm.destroy()
     return {"t_fp8": t_fp8, "nan": float(nan), "act_finite": float(act_finite),
             "n_nan": float(n_nan), "n_inf": float(n_inf), "bad_tok": float(bad_tok),

@@ -19,13 +19,13 @@ from typing import Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
+from primus_turbo.flydsl.mega import swiglu_flydsl_kernel
 from primus_turbo.flydsl.mega.fp8 import (
-    _host_rendezvous,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
-    grouped_gemm_combine_fp8,
+    get_symm_buffer_for_mega_moe,
+    grouped_gemm_combine_mxfp8_flydsl_kernel,
     prepare_w2_fp8,
     quantize_grouped_weight_mxfp8_cached,
-    swiglu,
 )
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
 ]
 
 _W2_PREP_ATTR = "_mega_fp8_w2_prep"
+_H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device real-tile count)
 
 
 def _w1_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -67,42 +68,35 @@ def mega_moe_forward_fp8_impl(
     group: ProcessGroup,
     block_m: int,
     block_n: int,
-    *,
-    save_bwd: bool,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]], tuple]:
     """Fused mxfp8 MoE forward: L1 (dispatch + fc1, NT) -> SwiGLU (bf16) -> L2 fp8 combine.
 
     ``topk_idx`` must already be int64 (the op layer converts). Returns
-    ``(y, l1, dispatch_weights, pool_x_fp8, handle)`` where -- when ``save_bwd`` -- ``dispatch_weights``
-    and ``pool_x_fp8`` are the CLONED backward inputs (see below), else ``None``:
-      * ``l1``               : fc1 output ``[P, 2I]`` (the SwiGLU / swiglu_backward operand).
-      * ``dispatch_weights`` : per-pool-row routing weight (prologue-scattered) -- swiglu_backward
-        re-injects it as the SwiGLU^T scale + gate grad.
-      * ``pool_x_fp8``       : THIS dispatched fc1-input pool in native rowwise-fp8 -- lets dW1 be a
-        LOCAL variable-K wgrad (grad_l1^T @ pool_x) with NO cross-rank re-dispatch (mirrors dW2's
-        reuse of the STEP1 pool). ``(pool_fp8 [P,H] fp8, pool_scale [P,H//32] E8M0)``.
-      * ``handle``           : the dispatch prologue handle tuple (backward reuses it).
-    """
+    ``(y, l1, dispatch_weights, pool_x_fp8, handle)``: ``l1`` = fc1 output [P, 2I];
+    ``dispatch_weights`` = per-pool-row routing weight; ``pool_x_fp8`` = fc1-input pool in rowwise-fp8
+    ``(pool_fp8 [P,H], pool_scale [P,H//32])`` for a LOCAL dW1 wgrad; ``handle`` = dispatch prologue
+    tuple. The backward operands are LIVE symm-pool views (not cloned)."""
     # w1 fp8 prep -> (w1q, w1s), version-keyed on w1._version -- symmetric with the w2 prep below.
     w1q, w1s = _w1_fp8_cached(w1)
 
     # ── L1: fused mxfp8 dispatch + fc1 (one self-contained unit) ──
-    l1, handle, symm, dispatch_weights, pool_x_fp8 = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
-        x, w1q, w1s, group, topk_idx=topk_idx, topk_weights=topk_weights,
-        BM=block_m, BN=block_n, save_bwd=save_bwd,
+    l1, handle, dispatch_weights, pool_x_fp8 = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
+        x, 
+        w1q, w1s, 
+        group, 
+        topk_idx=topk_idx, 
+        topk_weights=topk_weights,
+        BM=block_m, BN=block_n,
     )
 
-    act = swiglu(l1)
+    act = swiglu_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS])
 
     # w2 fp8 prep -> (w2q, w2s), version-keyed here at the op layer -- symmetric with w1 at L1.
     w2q, w2s = _w2_fp8_cached(w2)
 
     # ── L2: fp8 combine (fp8 GEMM + mxfp8 epilogue + fp8 PUSH + bf16-out dequant reduce) ──
-    _host_rendezvous(group)
-    symm.sb_l2.zero_()
-    symm.barrier_local.fill_(-1)
-    _host_rendezvous(group)
-    y = grouped_gemm_combine_fp8(
+    # grouped_gemm_combine_mxfp8_flydsl_kernel is self-contained: it resets the L2 scoreboard/flags cross-rank.
+    y = grouped_gemm_combine_mxfp8_flydsl_kernel(
         act, (w2q, w2s), list(handle), group,
         topk_indices=topk_idx, topk_weights=topk_weights.to(torch.float32),
         BM=block_m, BN=block_n, num_combine_cu=48,

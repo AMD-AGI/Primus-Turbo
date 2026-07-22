@@ -71,7 +71,7 @@ class MegaMoEFusedFP8Function(torch.autograd.Function):
             save_bwd = any(ctx.needs_input_grad)
 
             y, l1, dispatch_weights, pool_x_fp8, handle = mega_moe_forward_fp8_impl(
-                x, topk_idx, topk_weights, w1, w2, group, block_m, block_n, save_bwd=save_bwd,
+                x, topk_idx, topk_weights, w1, w2, group, block_m, block_n,
             )
 
             if save_bwd:

@@ -31,13 +31,10 @@ from .dispatch_grouped_gemm_mxfp8_kernel import (
 # --- L2 forward: fp8 GEMM + combine PUSH + weighted top-k reduce (bf16 out) ---
 # --- backward STEP3: fp8 fc1-dgrad + combine PUSH + unweighted reduce (+ gate scatter) ---
 from .grouped_gemm_combine_fp8_kernel import (
-    grouped_gemm_combine_fp8,
-    grouped_gemm_combine_fp8_bwd,
+    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    grouped_gemm_combine_mxfp8_flydsl_kernel_bwd,
     prepare_w2_fp8,
 )
-
-# --- SwiGLU (bf16, between L1 and L2) ---
-from .swiglu_kernel import swiglu, swiglu_backward
 
 # --- symmetric workspace (SymLayout + scoreboard + two-heap) ---
 from .dispatch_prologue import dispatch_prologue
@@ -63,11 +60,9 @@ from .quant_colwise_trans_flydsl import (
 __all__ = [
     "dispatch_grouped_gemm_mxfp8",
     "dispatch_grouped_gemm_mxfp8_flydsl_kernel",
-    "grouped_gemm_combine_fp8",
-    "grouped_gemm_combine_fp8_bwd",
+    "grouped_gemm_combine_mxfp8_flydsl_kernel",
+    "grouped_gemm_combine_mxfp8_flydsl_kernel_bwd",
     "prepare_w2_fp8",
-    "swiglu",
-    "swiglu_backward",
     "dispatch_prologue",
     "SymLayout",
     "get_symm_buffer_for_mega_moe",
