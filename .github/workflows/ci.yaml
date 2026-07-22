@@ -32,7 +32,7 @@ jobs:
     steps:
       - name: Print job info
         run: |
-          echo "🎉 Begin Primus-Turbo Python Lint."
+          echo "🎉 Begin Primus-Turbo Lint (pre-commit)."
           echo "🐧 Running on ${{ runner.os }}, branch: ${{ github.ref }}"
       - uses: actions/checkout@v4
       - run: git config --global --add safe.directory /github/workspace
@@ -40,16 +40,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
             python-version: ${{ matrix.python-version }}
-      - name: Display Python version
-        run: python -c "import sys; print(sys.version)"
-      - name: Install Ruff
-        run: pip install ruff==0.15.12
-      - name: Ruff lint check
-        if: always()
-        run: ruff check --output-format=github .
-      - name: Ruff format check
-        if: always()
-        run: ruff format --check --diff .
+      # Single source of truth: runs every hook in .pre-commit-config.yaml (ruff, clang-format, ...).
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: --all-files --show-diff-on-failure
 
   install-dependencies:
     # GPU runner job: for PRs, only run when a maintainer adds the 'ci:gpu'

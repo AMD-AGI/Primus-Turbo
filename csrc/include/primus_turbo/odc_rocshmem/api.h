@@ -88,10 +88,9 @@ int gda_reduce_scatter_acc(long long acc_fp32, long long input_sym, std::size_t 
                            std::size_t scratch_stride_bytes, int dtype_code, int nblocks);
 
 // Comm/compute-overlap variant: launch on a side stream and return without sync.
-int gda_reduce_scatter_acc_async(long long acc_fp32, long long input_sym,
-                                 std::size_t seg_off_bytes, std::size_t shard_elems, int n_pes,
-                                 long long scratch_sym, std::size_t scratch_stride_bytes,
-                                 int dtype_code, int nblocks);
+int gda_reduce_scatter_acc_async(long long acc_fp32, long long input_sym, std::size_t seg_off_bytes,
+                                 std::size_t shard_elems, int n_pes, long long scratch_sym,
+                                 std::size_t scratch_stride_bytes, int dtype_code, int nblocks);
 
 // Wait for all pending overlapped reduce-scatter kernels on the side stream.
 int gda_rs_overlap_sync();
