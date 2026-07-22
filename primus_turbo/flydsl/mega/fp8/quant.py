@@ -24,9 +24,6 @@ from primus_turbo.pytorch.ops.quantization import quantize_fp8
 
 MXFP8_BLOCK = 32
 
-# Attribute name under which a weight tensor stashes its cached fp8 quant (keyed by _version).
-_WQ_ATTR = "_mxfp8_grouped_q"
-
 
 def quantize_rowwise_mxfp8(x: torch.Tensor, fmt=float8_e4m3):
     """Rowwise MXFP8 quant of a 2D ``[M, K]`` tensor along K (block=32).
@@ -71,30 +68,3 @@ def quantize_grouped_weight_mxfp8_flydsl(w: torch.Tensor):
     G, N, K = w.shape
     q, s = quantize_rowwise_mxfp8_flydsl(w.reshape(G * N, K))  # q e4m3 [G*N,K], s uint8 [G*N,K//32]
     return q.view(G, N, K), s.view(torch.float8_e8m0fnu).view(G, N, K // MXFP8_BLOCK)
-
-
-def quantize_grouped_weight_mxfp8_cached(w: torch.Tensor, fmt=float8_e4m3):
-    """Quantize a STATIC weight, caching the fp8 result ON the weight tensor, keyed by
-    ``w._version``. Re-quantizes only when the weight changed in place (``optim.step()`` bumps
-    ``_version``); otherwise returns the stashed ``(w_fp8, w_scale)``. First call always quantizes.
-
-    Storing on the tensor (vs a global dict) makes it per-weight: auto-scales to many layers with
-    no size cap / LRU thrash, and the fp8 copy is freed when the weight is. Correctness-safe
-    (``_version`` guards against stale weights) and transfer-safe (keyed off the weight's own
-    version, never an activation id -- Rule 11). Reuse pays off across a gradient-accumulation
-    window (all micro-steps share one ``_version``) and, once the backward is mxfp8, across
-    fwd+bwd; with grad-accum=1 and a forward-only consume it just quantizes every step."""
-    v = getattr(w, "_version", 0)
-    ent = getattr(w, _WQ_ATTR, None)
-    if ent is not None and ent[0] == v and ent[1] is fmt:
-        return ent[2], ent[3]
-    # FlyDSL path (bit-identical, ~2.6x faster) for the E4M3 default; else the generic quant.
-    if fmt is float8_e4m3:
-        q, s = quantize_grouped_weight_mxfp8_flydsl(w)
-    else:
-        q, s = quantize_grouped_weight_mxfp8(w, fmt)
-    try:
-        setattr(w, _WQ_ATTR, (v, fmt, q, s))
-    except (AttributeError, RuntimeError):
-        pass  # can't stash on this tensor (rare) -> return freshly quantized, no caching
-    return q, s

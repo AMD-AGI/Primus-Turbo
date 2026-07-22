@@ -25,38 +25,52 @@ from primus_turbo.flydsl.mega.fp8 import (
     get_symm_buffer_for_mega_moe,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     prepare_w2_fp8,
-    quantize_grouped_weight_mxfp8_cached,
+    quantize_grouped_weight_mxfp8_flydsl,
 )
 
 __all__ = [
     "mega_moe_forward_fp8_impl",
 ]
 
+_W1_PREP_ATTR = "_mega_fp8_w1_prep"
 _W2_PREP_ATTR = "_mega_fp8_w2_prep"
 _H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device real-tile count)
 
 
+def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
+    """Cache ``prep(w)`` ON the weight tensor, keyed by ``w._version`` -- the single place the fp8
+    weight-prep caching lives (not scattered across the quant helpers). Recomputes only when the
+    weight changed in place (``optim.step()`` bumps ``_version``); otherwise returns the stash.
+
+    Storing on the tensor (vs a global dict) makes it per-weight: auto-scales to many layers with no
+    size cap / LRU thrash, freed with the weight. Correctness-safe (``_version`` guards stale
+    weights) and transfer-safe (keyed off the weight's own version, never an activation id -- Rule
+    11). Reuse pays off across a grad-accum window (all micro-steps share one ``_version``)."""
+    v = getattr(w, "_version", 0)
+    ent = getattr(w, attr, None)
+    if ent is not None and ent[0] == v:
+        return ent[1]
+    with torch.no_grad():
+        out = prep(w)
+    try:
+        setattr(w, attr, (v, out))
+    except (AttributeError, RuntimeError):
+        pass  # can't stash on this tensor (rare) -> return freshly computed, no caching
+    return out
+
+
 def _w1_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Version-keyed fc1 weight prep -> ``(w1q [G,2I,H] fp8, w1s [G,2I,H//32] raw E8M0)``. The L1
-    dispatch GEMM takes the raw quant and preshuffles the weight scale internally (cached), so this
-    is just the grouped mxfp8 quant. Re-quantized only when ``w1`` changes (``optim.step`` bumps
-    ``_version``); the cache is kept on the weight by ``quantize_grouped_weight_mxfp8_cached``."""
-    return quantize_grouped_weight_mxfp8_cached(w1)
+    dispatch GEMM takes the raw quant and preshuffles the weight scale internally, so this is just
+    the grouped mxfp8 (E4M3) quant."""
+    return _version_keyed_weight_prep(w1, _W1_PREP_ATTR, quantize_grouped_weight_mxfp8_flydsl)
 
 
 def _w2_fp8_cached(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Version-keyed fc2 weight prep -> ``(w2q, w2s)`` = ``prepare_w2_fp8(w2)`` = ``(weight_flat int8
-    [G*H*I], b_sp int32 preshuffled scale)``. Unlike w1, the L2 combine is pure-compute (no internal
-    quant/preshuffle), so quant + ScaleBComb preshuffle + int8-flat are baked here. Stashed ON the
-    weight tensor: re-prepped only when ``w2`` changes (``optim.step`` bumps ``_version``)."""
-    v = getattr(w2, "_version", 0)
-    ent = getattr(w2, _W2_PREP_ATTR, None)
-    if ent is None or ent[0] != v:
-        with torch.no_grad():
-            out = prepare_w2_fp8(w2)
-        ent = (v, out)
-        setattr(w2, _W2_PREP_ATTR, ent)
-    return ent[1]
+    """Version-keyed fc2 weight prep -> ``(weight_flat int8 [G*H*I], b_sp int32 preshuffled scale)``.
+    Unlike w1, the L2 combine is pure-compute (no internal quant/preshuffle), so quant + ScaleBComb
+    preshuffle + int8-flat are baked here by ``prepare_w2_fp8``."""
+    return _version_keyed_weight_prep(w2, _W2_PREP_ATTR, prepare_w2_fp8)
 
 
 def mega_moe_forward_fp8_impl(

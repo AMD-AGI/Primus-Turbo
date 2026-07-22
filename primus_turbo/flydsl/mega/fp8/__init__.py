@@ -44,7 +44,6 @@ from .symm_buffer import get_symm_buffer_for_mega_moe
 # --- quantization (weights: grouped mxfp8; activations: FlyDSL rowwise mxfp8) ---
 from .quant import (
     quantize_grouped_weight_mxfp8,
-    quantize_grouped_weight_mxfp8_cached,
     quantize_grouped_weight_mxfp8_flydsl,
     quantize_rowwise_mxfp8,
 )
@@ -67,7 +66,6 @@ __all__ = [
     "SymLayout",
     "get_symm_buffer_for_mega_moe",
     "quantize_grouped_weight_mxfp8",
-    "quantize_grouped_weight_mxfp8_cached",
     "quantize_grouped_weight_mxfp8_flydsl",
     "quantize_rowwise_mxfp8",
     "quantize_rowwise_mxfp8_flydsl",
