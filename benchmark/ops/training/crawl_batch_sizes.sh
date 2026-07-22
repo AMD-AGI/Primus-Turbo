@@ -38,6 +38,7 @@ declare -A FRAMEWORK_FIELD=([megatron]=micro_batch_size [torchtitan]=local_batch
 # a loop over GPU x dtype. Each framework keeps its own model -> basename map so
 # cross-framework naming differences are matched verbosely (e.g. Llama-4 is
 # "llama4_17B128E" on megatron but "llama4_17Bx128E" on torchtitan).
+# shellcheck disable=SC2034  # used indirectly via nameref in crawl_convention
 declare -A MEGATRON_BASENAME=(
   [Llama-3.1-405B]=llama3.1_405B
   [Llama-3.1-8B]=llama3.1_8B
@@ -57,6 +58,7 @@ declare -A MEGATRON_BASENAME=(
   [Llama-4-17Bx128E]=llama4_17B128E
 )
 
+# shellcheck disable=SC2034  # used indirectly via nameref in crawl_convention
 declare -A TORCHTITAN_BASENAME=(
   [Llama-3.1-405B]=llama3.1_405B
   [Llama-3.1-8B]=llama3.1_8B
