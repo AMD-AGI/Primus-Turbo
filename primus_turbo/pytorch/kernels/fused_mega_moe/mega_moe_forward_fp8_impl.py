@@ -20,9 +20,8 @@ import torch
 from torch.distributed import ProcessGroup
 
 from primus_turbo.flydsl.mega.fp8 import (
-    dispatch_grouped_gemm_mxfp8,
-    dispatch_prologue,
-    get_symm_buffer_for_mega_moe,
+    _host_rendezvous,
+    dispatch_grouped_gemm_mxfp8_flydsl_kernel,
     grouped_gemm_combine_fp8,
     prepare_w2_fp8,
     quantize_grouped_weight_mxfp8_cached,
@@ -34,14 +33,6 @@ __all__ = [
 ]
 
 _W2_PREP_ATTR = "_mega_fp8_w2_prep"
-
-
-def _host_rendezvous(group) -> None:
-    """Cross-rank publish barrier: drain this rank's GPU work, then all-rank barrier, so a
-    scoreboard/flag reset is visible on every peer before any rank signals it. (Full mode;
-    the source op gates these behind PT_MEGA_BARRIER_MODE -- kept always-on here for safety.)"""
-    torch.cuda.synchronize()
-    group.barrier()
 
 
 def _w2_fp8_cached(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -84,38 +75,15 @@ def mega_moe_forward_fp8_impl(
         reuse of the STEP1 pool). ``(pool_fp8 [P,H] fp8, pool_scale [P,H//32] E8M0)``.
       * ``handle``           : the dispatch prologue handle tuple (backward reuses it).
     """
-    G, world = w1.shape[0], group.size()
-    T, H = x.shape
-    I = w1.shape[1] // 2
-    K = topk_idx.shape[-1]
+    # w1 fp8 prep (grouped mxfp8 quant), version-keyed on w1._version -- symmetric with the w2 prep
+    # below; the L1 unit takes the prepared weight in (like the combine takes the prepared w2).
+    w1q, w1s = quantize_grouped_weight_mxfp8_cached(w1)
 
-    # ── L1: fused mxfp8 dispatch + fc1 (token quant folded inside via the bf16-x path) ──
-    symm = get_symm_buffer_for_mega_moe(
-        group, num_experts=G * world, num_max_tokens_per_rank=T, num_topk=K,
-        hidden=H, intermediate_hidden=I, block_m=block_m, block_n=block_n, use_mxfp8=True,
+    # ── L1: fused mxfp8 dispatch + fc1 (one self-contained unit) ──
+    l1, handle, symm, dispatch_weights, pool_x_fp8 = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
+        x, w1q, w1s, group, topk_idx=topk_idx, topk_weights=topk_weights,
+        BM=block_m, BN=block_n, save_bwd=save_bwd,
     )
-    sym_layout = symm.make_sym_layout()
-    handle = tuple(
-        dispatch_prologue(
-            topk_idx, topk_weights, sym_layout=sym_layout, num_tokens=T, num_topk=K,
-            num_experts=G * world, world_size=world, rank=symm.rank, experts_per_rank=G,
-            block_m=block_m, num_max_pool_tokens=symm.num_max_pool_tokens,
-        )
-    )
-    w1q, w1s = quantize_grouped_weight_mxfp8_cached(w1)  # version-keyed cache on w1._version
-    # publish scoreboard=0 cross-rank before the L1 comm signals (per-pool-block sentinel handoff)
-    _host_rendezvous(group)
-    symm.scoreboard.zero_()
-    _host_rendezvous(group)
-    l1 = dispatch_grouped_gemm_mxfp8(
-        x, None, w1q, w1s, handle, sym_layout, symm, BM=block_m, BN=block_n
-    )
-    # backward saves (clone BEFORE backward STEP1's dispatch(dy) overwrites the symm pool)
-    dispatch_weights = symm.weight_recv_buf.clone() if save_bwd else None
-    pool_x_fp8 = None
-    if save_bwd:
-        _Px, _Hx = symm.pool_fp8.shape
-        pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(_Px, _Hx // 32).clone())
 
     act = swiglu(l1)
 

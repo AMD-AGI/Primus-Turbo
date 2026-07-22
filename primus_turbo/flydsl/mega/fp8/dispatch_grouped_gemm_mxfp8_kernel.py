@@ -32,10 +32,12 @@ num_max_pool_tokens % BLOCK_M == 0, K % 128 == 0 and K >= 256 (mxfp8 MMA).
 
 import functools
 import os
+from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from torch.distributed import ProcessGroup
 from flydsl.expr import arith
 from flydsl.expr.buffer_ops import (
     buffer_load,
@@ -68,6 +70,8 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.gemm_helper import _emit_lds_repack, ceildiv, make_value_attrs
+from primus_turbo.flydsl.mega.fp8.dispatch_prologue import dispatch_prologue
+from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
 
 _FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip per-call @flyc.jit dispatch)
 _BSP_CACHE: dict = {}  # (weight data_ptr, G, N, K) -> preshuffled weight scale b_sp (weights static)
@@ -526,3 +530,82 @@ def dispatch_grouped_gemm_mxfp8(
             _FUSED_COMPILED[ck] = compiled
         compiled(*args)
     return output
+
+
+def _host_rendezvous(group) -> None:
+    """Cross-rank publish barrier: drain this rank's GPU work, then all-rank barrier, so a
+    scoreboard/flag reset is visible on every peer before any rank signals it. (Full mode;
+    the source op gates these behind PT_MEGA_BARRIER_MODE -- kept always-on here for safety.)"""
+    torch.cuda.synchronize()
+    group.barrier()
+
+
+def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
+    x: torch.Tensor,
+    w1q: torch.Tensor,
+    w1s: torch.Tensor,
+    group: ProcessGroup,
+    handle: Optional[tuple] = None,
+    topk_idx: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
+    BM: int = 256,
+    BN: int = 256,
+    *,
+    save_bwd: bool = False,
+) -> Tuple[torch.Tensor, tuple, object, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    """Self-contained fp8 L1 = fused mxfp8 dispatch + fc1 (NT); fp8 sibling of
+    ``dispatch_grouped_gemm_bf16_flydsl_kernel``.
+
+    Takes the pre-quantized fc1 weight (``w1q`` [G,2I,H] fp8 + ``w1s`` raw E8M0; prepared
+    version-keyed by the caller). When ``handle is None`` (forward), builds the symmetric workspace +
+    dispatch-prologue handle from ``topk_idx`` / ``topk_weights``; otherwise reuses the live symm
+    buffer + the given handle. Publishes the cross-rank scoreboard reset (barrier-bracketed), runs the
+    fused dispatch-PUSH + grouped mxfp8 GEMM (token quant folded in via the bf16-x path), and -- when
+    ``save_bwd`` -- clones the backward inputs off the shared symm pool BEFORE any later stage (STEP1
+    dispatch(dy)) overwrites it.
+
+    Returns ``(l1, handle, symm, dispatch_weights, pool_x_fp8)``; ``dispatch_weights`` / ``pool_x_fp8``
+    are ``None`` unless ``save_bwd``. The caller keeps ``handle`` (L2 + backward reuse it) and ``symm``
+    (L2 combine flag reset).
+    """
+    if handle is None:
+        assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
+        assert group is not None, "handle=None requires group to build the symm workspace"
+        G, world = w1q.shape[0], group.size()
+        T, H = x.shape
+        I = w1q.shape[1] // 2
+        K = topk_idx.shape[-1]
+        symm = get_symm_buffer_for_mega_moe(
+            group, num_experts=G * world, num_max_tokens_per_rank=T, num_topk=K,
+            hidden=H, intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
+        )
+        sym_layout = symm.make_sym_layout()
+        handle = tuple(
+            dispatch_prologue(
+                topk_idx, topk_weights, sym_layout=sym_layout, num_tokens=T, num_topk=K,
+                num_experts=G * world, world_size=world, rank=symm.rank, experts_per_rank=G,
+                block_m=BM, num_max_pool_tokens=symm.num_max_pool_tokens,
+            )
+        )
+    else:
+        symm = get_symm_buffer_for_mega_moe()  # live buffer from a prior forward
+        sym_layout = symm.make_sym_layout()
+    # publish scoreboard=0 cross-rank before the L1 comm signals (per-pool-block sentinel handoff)
+    _host_rendezvous(group)
+    symm.scoreboard.zero_()
+    _host_rendezvous(group)
+    l1 = dispatch_grouped_gemm_mxfp8(
+        x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN
+    )
+    # backward saves (clone BEFORE backward STEP1's dispatch(dy) overwrites the symm pool):
+    #  * dispatch_weights: the per-pool-row routing weight (prologue-scattered) -- swiglu_backward
+    #    re-injects it as the SwiGLU^T scale + gate grad.
+    #  * pool_x_fp8: THIS dispatched fc1-input pool in native rowwise-fp8 -- lets dW1 be a LOCAL
+    #    variable-K wgrad (grad_l1^T @ pool_x) with NO cross-rank re-dispatch (mirrors dW2's reuse
+    #    of the STEP1 pool). fp8 (1B) [P,H] + E8M0 [P,H//32].
+    dispatch_weights = symm.weight_recv_buf.clone() if save_bwd else None
+    pool_x_fp8 = None
+    if save_bwd:
+        _Px, _Hx = symm.pool_fp8.shape
+        pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(_Px, _Hx // 32).clone())
+    return l1, handle, symm, dispatch_weights, pool_x_fp8
