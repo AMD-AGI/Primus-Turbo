@@ -44,6 +44,14 @@ def _uniform_seqlen(cu_seqlens: "torch.Tensor"):
 
 @functools.lru_cache(maxsize=64)
 def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left):
+    # D=64 (the Meta hd64 campaign regime): the 4-wave stagger-off config
+    # (block_m=128, waves_per_eu=2, stagger off) is the tuned production path --
+    # STAGGER=0 lifts MFMA util 37->43% (+3-8% TF/s, e.g. 910->945 at S=16384) and
+    # clears the 1.68x-H100 line on every square shape. Other head dims (D=128) keep
+    # the build default (8-wave) to stay zero-regression outside the tuned regime.
+    cfg = {}
+    if D == 64:
+        cfg = dict(waves_per_eu=2, dualwave_swp_enable_stagger=False, block_m=128)
     return build_flash_attn_dualwave_swp_module(
         num_heads=Hq,
         head_dim=D,
@@ -54,6 +62,7 @@ def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left):
         cross_seqlen=cross_seqlen,
         emit_lse=emit_lse,
         window_left=window_left,
+        **cfg,
     )
 
 
