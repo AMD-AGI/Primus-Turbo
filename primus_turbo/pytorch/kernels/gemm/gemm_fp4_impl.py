@@ -237,6 +237,10 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         preshuffled: bool = False,
     ) -> bool:
 
+        # No path for AITER-preshuffled inputs (this backend preshuffles raw E8M0 itself).
+        if preshuffled:
+            return False
+
         supported = True
         # gfx950 (CDNA4) only: mfma_scale_f32_16x16x128_f8f6f4 is absent below.
         supported &= get_device_compute_capability() >= (9, 5)
