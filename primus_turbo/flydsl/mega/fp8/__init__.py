@@ -22,7 +22,11 @@ ported in later steps.
 # --- fused mxfp8 dispatch PUSH + preshuffle + grouped mxfp8 NT GEMM ---
 # (generic: forward L1 = dispatch(x)+fc1; backward STEP1 = dispatch(dy)+fc2 dgrad reuses it with a
 # different CU split -- no separate bwd kernel)
-from .dispatch_grouped_gemm_mxfp8_kernel import dispatch_grouped_gemm_mxfp8
+from .dispatch_grouped_gemm_mxfp8_kernel import (
+    _host_rendezvous,
+    dispatch_grouped_gemm_mxfp8,
+    dispatch_grouped_gemm_mxfp8_flydsl_kernel,
+)
 
 # --- L2 forward: fp8 GEMM + combine PUSH + weighted top-k reduce (bf16 out) ---
 # --- backward STEP3: fp8 fc1-dgrad + combine PUSH + unweighted reduce (+ gate scatter) ---
@@ -58,6 +62,7 @@ from .quant_colwise_trans_flydsl import (
 
 __all__ = [
     "dispatch_grouped_gemm_mxfp8",
+    "dispatch_grouped_gemm_mxfp8_flydsl_kernel",
     "grouped_gemm_combine_fp8",
     "grouped_gemm_combine_fp8_bwd",
     "prepare_w2_fp8",

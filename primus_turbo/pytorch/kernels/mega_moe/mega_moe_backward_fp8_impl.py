@@ -26,6 +26,7 @@ from typing import Tuple
 import torch
 
 from primus_turbo.flydsl.mega.fp8 import (
+    _host_rendezvous,
     colwise_grouped_meta,
     colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
@@ -41,7 +42,6 @@ from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float8_e
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_impl,
 )
-from primus_turbo.pytorch.kernels.mega_moe.mega_moe_forward_fp8_impl import _host_rendezvous
 
 __all__ = [
     "mega_moe_backward_fp8_impl",
