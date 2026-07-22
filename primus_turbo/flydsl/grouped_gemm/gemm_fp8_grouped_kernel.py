@@ -1096,8 +1096,8 @@ def _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t):
     a_base = arith.index_cast(T.index, m_start) * arith.index(OUT_M)
     b_base = arith.index_cast(T.index, m_start) * arith.index(OUT_N)
     mg = arith.index_cast(T.index, m_end) - arith.index_cast(T.index, m_start)
-    a_nrec = mg * arith.index(OUT_M)
-    b_nrec = mg * arith.index(OUT_N)
+    a_nrec = arith.maxsi(mg * arith.index(OUT_M), arith.index(0))
+    b_nrec = arith.maxsi(mg * arith.index(OUT_N), arith.index(0))
     gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
     gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, b_nrec)
     a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
@@ -2616,9 +2616,15 @@ def _wave4_do_tile_tn(
     bm_off = block_m * BLOCK_M
     bn_off = block_n * BLOCK_N
     a_base = arith.index_cast(T.index, m_start) * arith.index(OUT_M) + arith.index_cast(T.index, bm_off)
-    a_nrec = arith.index_cast(T.index, mg) * arith.index(OUT_M) - arith.index_cast(T.index, bm_off)
+    a_nrec = arith.maxsi(
+        arith.index_cast(T.index, mg) * arith.index(OUT_M) - arith.index_cast(T.index, bm_off),
+        arith.index(0),
+    )
     b_base = arith.index_cast(T.index, m_start) * arith.index(OUT_N) + arith.index_cast(T.index, bn_off)
-    b_nrec = arith.index_cast(T.index, mg) * arith.index(OUT_N) - arith.index_cast(T.index, bn_off)
+    b_nrec = arith.maxsi(
+        arith.index_cast(T.index, mg) * arith.index(OUT_N) - arith.index_cast(T.index, bn_off),
+        arith.index(0),
+    )
 
     gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
     gB = make_fp8_buffer_tensor_rebased(B, F8_IR_t, b_base, b_nrec)
