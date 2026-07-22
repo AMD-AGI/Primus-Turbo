@@ -107,17 +107,31 @@ def main():
         f"device={torch.cuda.get_device_name(0)} arch={torch.cuda.get_device_properties(0).gcnArchName}",
         flush=True,
     )
+    # Acceptance: convert the measured MI355 convTF to a MI350 equivalent (/1.2) and
+    # compare to the 1.4x-H100 customer bar (MI350). verdict = PASS if >= 1.4x, else
+    # the shortfall vs 1.4x. Matches the bwd square-causal acceptance table.
     print(f"\n===== Forward hd64 THD  B={B}  4-wave stagger-off  hw-exp  [node {NODE}] =====", flush=True)
-    print(f"{'S':>6} {'ms':>7} {'convTF':>7} {'1.68x line':>10} {'1.4x thr':>9} {'1.68x':>6}", flush=True)
+    print(
+        f"{'S':>6} {'H100_fwd':>9} {'1.4xtgt(MI350)':>15} {'MI355':>7} {'MI350(/1.2)':>12} {'xH100':>6} {'verdict':>8}",
+        flush=True,
+    )
     npass = 0
     for S in SQUARE_S:
         ms, tf = bench_one(S)
-        strict = H100_SQ[S] * 1.68
-        thr = H100_SQ[S] * 1.40
-        ok = tf >= strict
-        npass += ok
-        print(f"{S:6d} {ms:7.3f} {tf:7.0f} {strict:10.0f} {thr:9.0f} {'YES' if ok else 'no':>6}", flush=True)
-    print(f"  -> {npass}/4 clear the strict 1.68x line", flush=True)
+        h = H100_SQ[S]
+        tgt = h * 1.40
+        mi350 = tf / 1.2
+        xh = mi350 / h
+        if xh >= 1.4:
+            verdict = "PASS"
+            npass += 1
+        else:
+            verdict = f"{(xh / 1.4 - 1) * 100:+.1f}%"
+        print(
+            f"{S:6d} {h:9d} {tgt:15.0f} {tf:7.0f} {mi350:12.0f} {xh:6.2f} {verdict:>8}",
+            flush=True,
+        )
+    print(f"  -> {npass}/4 clear 1.4x H100 (MI350-equivalent)", flush=True)
 
 
 if __name__ == "__main__":
