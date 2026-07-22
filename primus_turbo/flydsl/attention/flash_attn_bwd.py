@@ -2022,7 +2022,7 @@ def build_flash_attn_bwd_dq_module(
     fast_fp_math=True,
     daz=True,
     enable_dma=True,
-    fast_exp2=True,
+    fast_exp2=False,  # default hw v_exp2 (~52 dB), aligned with the fwd acceptance path
     window_left=-1,
 ):
     """Build the dQ Q-outer backward launcher (16x16x32 mirror of dkdv).

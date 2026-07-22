@@ -3,8 +3,8 @@
 #
 # Square-causal acceptance for the integrated FlyDSL hd64 flash-attention BACKWARD
 # (primus_turbo.flydsl.attention.flash_attn_bwd), B=1, Sq=Skv=S, Hq=128 Hkv=16 D=64.
-# Prints both exp paths: hw (52.6 dB, fast_exp2=False) and fast (35 dB, production
-# default, fast_exp2=True), in the same acceptance format as the forward bench.
+# Prints both exp paths: hw (52.6 dB, default, fast_exp2=False; aligned with the
+# fwd acceptance path) and fast (35 dB, fast_exp2=True), same acceptance format.
 #
 # conv TF/s = 10*B*Hq*S*S*D*(1-(S-1)/(2S)) / full_bwd_ms(odo+dq+dkdv)  (5 bwd GEMMs).
 # MI350-equivalent = MI355 convTF / 1.2 ; xH100 = MI350 / H100_bwd ; PASS if >= 1.4x.
@@ -112,7 +112,7 @@ def bench_one(S, fast):
 
 
 def run_table(fast):
-    tag = "fast(35dB, production default)" if fast else "hw(52.6dB)"
+    tag = "fast(35dB)" if fast else "hw(52.6dB, default)"
     print(f"\n===== Backward hd64 THD  B={B}  square-causal  {tag}  [node {NODE}] =====", flush=True)
     print(
         f"{'S':>6} {'H100_bwd':>9} {'1.4xtgt(MI350)':>15} {'MI355':>7} {'MI350(/1.2)':>12} {'xH100':>6} {'verdict':>8}",
