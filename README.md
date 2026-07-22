@@ -3,7 +3,7 @@
 [![Primus-Turbo-CI](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/ci.yaml/badge.svg)](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/ci.yaml)
 [![Primus-Turbo-Benchmark](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/benchmark.yaml/badge.svg)](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/benchmark.yaml)
 
-[What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Primus Product Matrix](#-primus-product-matrix) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [License](#-license)
+[What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Primus Product Matrix](#-primus-product-matrix) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [Acknowledgements](#-acknowledgements) | [License](#-license)
 
 ## 🔍 What's Primus-Turbo?
 **Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives, optimizer modules, low-precision computation (FP8), and compute–communication overlap kernels.
@@ -26,7 +26,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 |     Module     | Role | Key Features |
 |----------------|------|--------------|
 | [**Primus-LM**](https://github.com/AMD-AGI/Primus)           | E2E training framework | - Supports multiple training backends (Megatron, TorchTitan, etc.)<br>- Provides high-performance, scalable distributed training<br>- Deeply integrates with Primus-Turbo and Primus-SaFE |
-| [**Primus-Turbo**](https://github.com/AMD-AGI/Primus-Turbo)  | High-performance operators & modules | - Supports core training operators and modules (FlashAttention, GEMM, GroupedGemm, DeepEP etc.)<br>- Integrates multiple high-performance backends (e.g., CK, hipBLASLt, AITER) <br>- High performance and easy to integrate |
+| [**Primus-Turbo**](https://github.com/AMD-AGI/Primus-Turbo)  | High-performance operators & modules | - Supports core training operators and modules (FlashAttention, GEMM, GroupedGemm, DeepEP etc.)<br>- Integrates multiple high-performance backends (e.g., CK, hipBLASLt, AITER, FlyDSL) <br>- High performance and easy to integrate |
 | [**Primus-SaFE**](https://github.com/AMD-AGI/Primus-SaFE)    | Stability & platform layer | - Cluster sanity check and benchmarking<br>- Kubernetes scheduling with topology awareness<br>- Fault tolerance<br>- Stability enhancements |
 
 
@@ -40,6 +40,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 - Python >= 3.10
 - PyTorch >= 2.6.0 (with ROCm support)
 - [AITER](https://github.com/ROCm/aiter) (required for some operators, e.g. FlashAttention / FP8): `pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@v0.1.14.post1"`
+- [FlyDSL](https://github.com/ROCm/FlyDSL) (required; provides the FlyDSL kernel backend for GEMM / GroupedGEMM / Attention / MoE)
 - rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
 
 #### Hardware
@@ -215,6 +216,13 @@ See [Benchmarks](./benchmark/README.md) for detailed performance results and com
 
 ## 📍 Roadmap
 [Roadmap: Primus-Turbo Roadmap H1 2026](https://github.com/AMD-AGI/Primus-Turbo/issues/211)
+
+## 🙏 Acknowledgements
+
+Primus-Turbo builds on excellent open-source work from the AMD/ROCm ecosystem. We especially thank:
+
+- [**FlyDSL**](https://github.com/ROCm/FlyDSL) — a Flexible Layout Python DSL and MLIR compiler stack for authoring high-performance AMD GPU kernels. Many of our kernels (GEMM, GroupedGEMM, Attention, MoE) are authored with FlyDSL, and we thank the FlyDSL team for their close collaboration and support.
+- [**AITER**](https://github.com/ROCm/aiter) — AI Tensor Engine for ROCm, providing high-performance operator backends (e.g. FlashAttention, FP8) that Primus-Turbo integrates.
 
 ## 📜 License
 
