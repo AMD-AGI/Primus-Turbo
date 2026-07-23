@@ -37,6 +37,14 @@ Primus-Turbo uses or references the following third-party projects:
    - License: Apache License 2.0
    - Repository: https://github.com/feifeibear/long-context-attention.git
 
+4. FlyDSL
+   - License: Apache License 2.0
+   - Repository: https://github.com/ROCm/FlyDSL.git
+
+5. AITER
+   - License: MIT License
+   - Repository: https://github.com/ROCm/aiter.git
+
 Please comply with the respective licenses of these third-party projects when using or distributing Primus.
 
 --------------------------------------------------------------------------------

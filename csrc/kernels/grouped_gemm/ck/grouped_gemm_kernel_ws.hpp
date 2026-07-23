@@ -49,26 +49,23 @@ constexpr index_t NUM_XCDS_WS = 8;
 
 template <typename TilePartitioner_, typename GemmPipeline_, typename EpiloguePipeline_>
 struct GroupedGemmKernelWS
-    : public GroupedGemmKernel<TilePartitioner_, GemmPipeline_, EpiloguePipeline_>
-{
+    : public GroupedGemmKernel<TilePartitioner_, GemmPipeline_, EpiloguePipeline_> {
     using Base = GroupedGemmKernel<TilePartitioner_, GemmPipeline_, EpiloguePipeline_>;
     using Self = GroupedGemmKernelWS<TilePartitioner_, GemmPipeline_, EpiloguePipeline_>;
 
-    using TilePartitioner         = typename Base::TilePartitioner;
-    using OffsetTile1DPartitioner = typename Base::OffsetTile1DPartitioner;
+    using TilePartitioner                        = typename Base::TilePartitioner;
+    using OffsetTile1DPartitioner                = typename Base::OffsetTile1DPartitioner;
     static constexpr index_t NumDTensor_         = Base::NumDTensor_;
     static constexpr index_t kBlockSize          = Base::kBlockSize;
     static constexpr bool    UsePersistentKernel = Base::UsePersistentKernel;
 
-    static_assert(UsePersistentKernel,
-                  "GroupedGemmKernelWS requires a persistent GemmPipeline.");
+    static_assert(UsePersistentKernel, "GroupedGemmKernelWS requires a persistent GemmPipeline.");
 
     // Override the host-side occupancy query to match the WS kernel's
     // 4-arg launch signature.
-    CK_TILE_HOST static auto MaxOccupancyGridSize(const stream_config& s) -> dim3
-    {
-        using ConstantPointer = const void CK_TILE_CONSTANT_ADDRESS_SPACE*;
-        const auto kernel = kentry<1, Self, ConstantPointer, index_t, int32_t*, index_t>;
+    CK_TILE_HOST static auto MaxOccupancyGridSize(const stream_config &s) -> dim3 {
+        using ConstantPointer = const void CK_TILE_CONSTANT_ADDRESS_SPACE *;
+        const auto kernel     = kentry<1, Self, ConstantPointer, index_t, int32_t *, index_t>;
         int        occupancy;
         HIP_CHECK_ERROR(
             hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel, kBlockSize, 0));
@@ -81,12 +78,9 @@ struct GroupedGemmKernelWS
     // the ragged tail. Speculative prefetch hides per-claim atomic latency
     // under Run; FindGroupId is O(log G) and reads precomputed
     // [block_start, block_end) populated by primus's args-setup kernel.
-    CK_TILE_DEVICE void operator()(
-        const void CK_TILE_CONSTANT_ADDRESS_SPACE* gemm_descs_const,
-        const index_t                              group_count,
-        int32_t*                                   tile_counter_ptr,
-        const index_t                              local_per_xcd) const
-    {
+    CK_TILE_DEVICE void operator()(const void CK_TILE_CONSTANT_ADDRESS_SPACE *gemm_descs_const,
+                                   const index_t group_count, int32_t *tile_counter_ptr,
+                                   const index_t local_per_xcd) const {
         // gfx942 has 64 KB LDS per CU and CK's 256x256x64 tile config already
         // uses the full 64 KB. Our WS kernel adds a 4-byte ``__shared__``
         // broadcast slot for the atomicAdd result (see s_block_id below),
@@ -99,12 +93,12 @@ struct GroupedGemmKernelWS
         // never actually launched -- it exists only to make the gfx942
         // device object link successfully.
 #if defined(__gfx942__)
-        (void)gemm_descs_const;
-        (void)group_count;
-        (void)tile_counter_ptr;
-        (void)local_per_xcd;
+        (void) gemm_descs_const;
+        (void) group_count;
+        (void) tile_counter_ptr;
+        (void) local_per_xcd;
 #else
-        const auto gemm_desc_ptr = reinterpret_cast<const GemmTransKernelArg<NumDTensor_>*>(
+        const auto gemm_desc_ptr = reinterpret_cast<const GemmTransKernelArg<NumDTensor_> *>(
             cast_pointer_to_generic_address_space(gemm_descs_const));
 
         // Total tiles across all groups. ``block_start``/``block_end`` are
@@ -124,10 +118,10 @@ struct GroupedGemmKernelWS
         // schedule="work_steal", so callers should never hit this branch
         // from the high-level op, but the kernel-level binding still exposes
         // num_cu -- belt-and-braces.
-        const index_t active_xcds = min(static_cast<index_t>(gridDim.x), NUM_XCDS_WS);
-        const index_t xcd_id        = blockIdx.x % active_xcds;
-        int32_t* const local_counter  = tile_counter_ptr + xcd_id;
-        int32_t* const global_counter = tile_counter_ptr + NUM_XCDS_WS;
+        const index_t  active_xcds    = min(static_cast<index_t>(gridDim.x), NUM_XCDS_WS);
+        const index_t  xcd_id         = blockIdx.x % active_xcds;
+        int32_t *const local_counter  = tile_counter_ptr + xcd_id;
+        int32_t *const global_counter = tile_counter_ptr + NUM_XCDS_WS;
         const index_t  phase1_total   = local_per_xcd * active_xcds;
 
         // Single claim slot -- no speculative prefetch. Originally this kernel
@@ -157,72 +151,57 @@ struct GroupedGemmKernelWS
         // The top-of-loop ``__syncthreads()`` plugs both. Loop-exit
         // conditions are block-uniform (derived from ``s_block_id``
         // alone), so this barrier cannot diverge.
-        while(true)
-        {
+        while (true) {
             __syncthreads();
-            if(threadIdx.x == 0)
-            {
+            if (threadIdx.x == 0) {
                 s_block_id = atomicAdd(local_counter, 1);
             }
             __syncthreads();
             const index_t local_idx = s_block_id;
-            if(local_idx >= local_per_xcd)
-            {
+            if (local_idx >= local_per_xcd) {
                 break;
             }
             const index_t block_id = xcd_id * local_per_xcd + local_idx;
             // Bound check: per-XCD-only mode (local_per_xcd = ceil(t/N))
             // can produce block_ids past total_tiles for the last XCD.
-            if(block_id >= total_tiles)
-            {
+            if (block_id >= total_tiles) {
                 continue;
             }
 
-            const index_t group_id =
-                this->FindGroupId(gemm_desc_ptr, block_id, group_count);
-            const auto& kargs        = gemm_desc_ptr[group_id];
-            const auto  grid_size_2d = TilePartitioner::GridSize(
-                kargs.group_karg.M, kargs.group_karg.N);
+            const index_t group_id = this->FindGroupId(gemm_desc_ptr, block_id, group_count);
+            const auto   &kargs    = gemm_desc_ptr[group_id];
+            const auto    grid_size_2d =
+                TilePartitioner::GridSize(kargs.group_karg.M, kargs.group_karg.N);
             const auto block_idx_2d = OffsetTile1DPartitioner::GetOffsetedTileIndex(
-                0,
-                kargs.group_karg.M,
-                kargs.group_karg.N,
+                0, kargs.group_karg.M, kargs.group_karg.N,
                 (block_id - kargs.block_start) % grid_size_2d);
-            this->Run(kargs.group_karg,
-                      block_idx_2d,
+            this->Run(kargs.group_karg, block_idx_2d,
                       (block_id - kargs.block_start) / grid_size_2d);
             block_sync_lds();
         }
 
         // -- Phase 2: global fallback ----------------------------------------
         // Same top-of-loop ``__syncthreads()`` rationale as Phase 1.
-        while(true)
-        {
+        while (true) {
             __syncthreads();
-            if(threadIdx.x == 0)
-            {
+            if (threadIdx.x == 0) {
                 s_block_id = atomicAdd(global_counter, 1);
             }
             __syncthreads();
             const index_t g_idx    = s_block_id;
             const index_t block_id = phase1_total + g_idx;
-            if(block_id >= total_tiles)
-            {
+            if (block_id >= total_tiles) {
                 break;
             }
 
-            const index_t group_id =
-                this->FindGroupId(gemm_desc_ptr, block_id, group_count);
-            const auto& kargs        = gemm_desc_ptr[group_id];
-            const auto  grid_size_2d = TilePartitioner::GridSize(
-                kargs.group_karg.M, kargs.group_karg.N);
+            const index_t group_id = this->FindGroupId(gemm_desc_ptr, block_id, group_count);
+            const auto   &kargs    = gemm_desc_ptr[group_id];
+            const auto    grid_size_2d =
+                TilePartitioner::GridSize(kargs.group_karg.M, kargs.group_karg.N);
             const auto block_idx_2d = OffsetTile1DPartitioner::GetOffsetedTileIndex(
-                0,
-                kargs.group_karg.M,
-                kargs.group_karg.N,
+                0, kargs.group_karg.M, kargs.group_karg.N,
                 (block_id - kargs.block_start) % grid_size_2d);
-            this->Run(kargs.group_karg,
-                      block_idx_2d,
+            this->Run(kargs.group_karg, block_idx_2d,
                       (block_id - kargs.block_start) / grid_size_2d);
             block_sync_lds();
         }
@@ -245,16 +224,13 @@ struct GroupedGemmKernelWS
         // serialized; the next launch sees all writes from the prior launch).
         // No explicit __threadfence() needed.
         __syncthreads();
-        if(threadIdx.x == 0)
-        {
-            int32_t* const done_counter = tile_counter_ptr + NUM_XCDS_WS + 1;
-            const int32_t prev = atomicAdd(done_counter, 1);
-            if(prev == static_cast<int32_t>(gridDim.x - 1))
-            {
+        if (threadIdx.x == 0) {
+            int32_t *const done_counter = tile_counter_ptr + NUM_XCDS_WS + 1;
+            const int32_t  prev         = atomicAdd(done_counter, 1);
+            if (prev == static_cast<int32_t>(gridDim.x - 1)) {
                 // I am the last CTA out. Zero every slot (work + done) so the
                 // next launch starts clean.
-                for(index_t i = 0; i < NUM_XCDS_WS + 2; ++i)
-                {
+                for (index_t i = 0; i < NUM_XCDS_WS + 2; ++i) {
                     tile_counter_ptr[i] = 0;
                 }
             }
