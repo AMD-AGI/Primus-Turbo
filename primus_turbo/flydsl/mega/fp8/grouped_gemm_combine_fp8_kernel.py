@@ -454,7 +454,7 @@ def _compile(
                 gemm_mxfp8_nt_tile(
                     ACT, A_SCALE, WEIGHTS, B_SCALE, ACT, c_m_const, c_n, lds, block_m, block_n,
                     K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, G=_num_groups, group_idx=group_index,
-                    out_fp16=False, nt_vmcnt=nt_vmcnt, preshuffled=True, store_c=store_c,
+                    out_fp16=False, nt_vmcnt=nt_vmcnt, store_c=store_c,
                 )
                 fx.rocdl.s_waitcnt(0)
                 fx.gpu.barrier()
@@ -664,7 +664,7 @@ def _compile_bwd(
                 gemm_mxfp8_nt_tile(
                     ACT, A_SCALE, WEIGHTS, B_SCALE, ACT, c_m_const, c_n, lds, block_m, block_n,
                     K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, G=num_groups, group_idx=group_index,
-                    out_fp16=False, nt_vmcnt=nt_vmcnt, preshuffled=True, store_c=store_c,
+                    out_fp16=False, nt_vmcnt=nt_vmcnt, store_c=store_c,
                 )
                 fx.rocdl.s_waitcnt(0)
                 fx.gpu.barrier()

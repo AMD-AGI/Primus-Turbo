@@ -10,8 +10,11 @@ Thin ``torch.autograd.Function`` that validates at the op boundary and delegates
 orchestration to ``mega_moe_forward_fp8_impl`` / ``mega_moe_backward_fp8_impl`` in
 ``pytorch/kernels/mega_moe``. Those impls are PLAIN functions, NOT the ``custom_op`` /
 ``AutoKernelDispatcher`` layer: the fp8 path carries state the custom_op schema can't hold --
-reuse of the forward's live symmetric buffer in backward, host ``synchronize()`` +
-``group.barrier()`` rendezvous, and derived non-tensor handles.
+reuse of the forward's live symmetric buffer in backward and derived non-tensor handles (the
+bf16 mega MoE op is a plain autograd.Function for the same reason). The comm gates self-reset via
+a device epoch (no host synchronize()+barrier() rendezvous), which removed the large-T reset-race
+deadlock -- but the cross-rank symm-memory PUSH + device spin-wait handshake still does not compose
+with CUDA-graph capture, so the op is NOT graph-captured.
 
 Forward = L1 fused mxfp8 dispatch+fc1 NT -> SwiGLU -> L2 fp8 combine. Backward = STEP1
 dispatch(dy)+fc2 dgrad -> STEP2 SwiGLU^T -> dW2 variable-K wgrad -> STEP3 fc1 dgrad + combine
