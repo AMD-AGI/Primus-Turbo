@@ -88,10 +88,8 @@ uint32_t get_grouped_gemm_num_cu(c10::optional<int64_t> num_cu) {
 
 at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                            at::Tensor &group_offs, const bool transA, const bool transB,
-                           c10::optional<int64_t>    num_cu,
-                           const bool                work_steal,
-                           c10::optional<at::Tensor> ws_counter,
-                           int64_t                   ws_local_per_xcd) {
+                           c10::optional<int64_t> num_cu, const bool work_steal,
+                           c10::optional<at::Tensor> ws_counter, int64_t ws_local_per_xcd) {
     auto out_dtype = a.scalar_type();
 
     // Check
@@ -112,27 +110,24 @@ at::Tensor ck_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
         PRIMUS_TURBO_CHECK(ws_counter.has_value(),
                            "ck_grouped_gemm: work_steal=True requires ws_counter");
         at::Tensor &counter = ws_counter.value();
-        PRIMUS_TURBO_CHECK(counter.scalar_type() == at::kInt,
-                           "ws_counter must be int32");
+        PRIMUS_TURBO_CHECK(counter.scalar_type() == at::kInt, "ws_counter must be int32");
         PRIMUS_TURBO_CHECK(counter.is_cuda(), "ws_counter must be on CUDA");
         PRIMUS_TURBO_CHECK(counter.device() == a.device(),
                            "ws_counter must be on the same CUDA device as `a` "
-                           "(counter cuda:", counter.device().index(),
-                           ", a cuda:", a.device().index(), ")");
-        PRIMUS_TURBO_CHECK(counter.is_contiguous(),
-                           "ws_counter must be contiguous");
+                           "(counter cuda:",
+                           counter.device().index(), ", a cuda:", a.device().index(), ")");
+        PRIMUS_TURBO_CHECK(counter.is_contiguous(), "ws_counter must be contiguous");
         constexpr int64_t kCounterSlots = 8 + 2; // NUM_XCDS_WS + global + done
-        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots,
-                           "ws_counter must have at least ", kCounterSlots, " int32 slots");
+        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots, "ws_counter must have at least ",
+                           kCounterSlots, " int32 slots");
         ws_counter_ptr = static_cast<int32_t *>(counter.data_ptr());
     }
     // The CK WS kernel takes ws_local_per_xcd as int32. Reject values that
     // would truncate silently on the cast below (int32 max ~2.1B; the heuristic
     // returns ceil(total_tiles / 8) at most, and any WS shape that fits in
     // int32 tile count is well under this limit -- this is a defensive check).
-    PRIMUS_TURBO_CHECK(
-        ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
-        "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
+    PRIMUS_TURBO_CHECK(ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
+                       "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
 
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
@@ -250,8 +245,7 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
 
 at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
-                                      c10::optional<int64_t>    num_cu,
-                                      const bool                work_steal,
+                                      c10::optional<int64_t> num_cu, const bool work_steal,
                                       c10::optional<at::Tensor> ws_counter,
                                       int64_t                   ws_local_per_xcd) {
     // TODO: output datatype
@@ -274,20 +268,18 @@ at::Tensor ck_grouped_gemm_variable_k(at::Tensor &a, at::Tensor &b, at::Tensor &
         PRIMUS_TURBO_CHECK(counter.is_cuda(), "ws_counter must be on CUDA");
         PRIMUS_TURBO_CHECK(counter.device() == a.device(),
                            "ws_counter must be on the same CUDA device as `a` "
-                           "(counter cuda:", counter.device().index(),
-                           ", a cuda:", a.device().index(), ")");
-        PRIMUS_TURBO_CHECK(counter.is_contiguous(),
-                           "ws_counter must be contiguous");
+                           "(counter cuda:",
+                           counter.device().index(), ", a cuda:", a.device().index(), ")");
+        PRIMUS_TURBO_CHECK(counter.is_contiguous(), "ws_counter must be contiguous");
         constexpr int64_t kCounterSlots = 8 + 2;
-        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots,
-                           "ws_counter must have at least ", kCounterSlots, " int32 slots");
+        PRIMUS_TURBO_CHECK(counter.numel() >= kCounterSlots, "ws_counter must have at least ",
+                           kCounterSlots, " int32 slots");
         ws_counter_ptr = static_cast<int32_t *>(counter.data_ptr());
     }
     // See ck_grouped_gemm(): the kernel takes ws_local_per_xcd as int32,
     // reject values that would truncate silently on the cast below.
-    PRIMUS_TURBO_CHECK(
-        ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
-        "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
+    PRIMUS_TURBO_CHECK(ws_local_per_xcd >= 0 && ws_local_per_xcd <= INT32_MAX,
+                       "ws_local_per_xcd must fit in int32 (got ", ws_local_per_xcd, ")");
 
     // Alloc args workspace
     const int64_t args_sizes = get_ck_grouped_gemm_args_sizes(group_lens.numel());
