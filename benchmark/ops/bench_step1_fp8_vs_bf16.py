@@ -8,7 +8,7 @@
 
 STEP1 is the *fused* cross-rank dispatch(dy) PUSH + grouped fc2-dgrad GEMM (grad_swiglu =
 dispatched_dy @ w2, NN, contract H -> [P, I]). Both legs run the SAME fused op:
-  * fp8 : ``_mxfp8_step1_dispatch_dgrad`` (fp8 PUSH, byte-halved comm + mxfp8 ~2x-compute GEMM),
+  * fp8 : ``_dispatch_l2_dgrad_mxfp8_flydsl_kernel`` (fp8 PUSH, byte-halved comm + mxfp8 ~2x-compute GEMM),
           on the fp8 mega stack (SymLayout + two-heap symm).
   * bf16: ``dispatch_grouped_gemm_bf16_flydsl_kernel(dy, w2, handle=h, layout="nn")`` -- exactly
           the L2-dgrad the bf16 ``mega_moe_fused`` backward uses (bf16 PUSH + bf16 GEMM), on the
@@ -37,7 +37,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     get_symm_buffer_for_mega_moe,
     quantize_grouped_weight_mxfp8,
 )
-from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import _mxfp8_step1_dispatch_dgrad
+from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import _dispatch_l2_dgrad_mxfp8_flydsl_kernel
 
 _H_GROUP_OFFS = 10
 
@@ -109,7 +109,7 @@ def profile(group, args):
     dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
 
     def _fp8():
-        return _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
+        return _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
 
     grad_swiglu_fp8, pool_handle = _fp8()
     grad_swiglu_fp8 = grad_swiglu_fp8.clone()

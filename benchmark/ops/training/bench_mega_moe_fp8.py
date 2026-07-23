@@ -26,7 +26,7 @@ Accuracy = SNR(fp8 y vs bf16 y), gate >=18 dB. NOTE round_robin trips the fp8 L2
 race (NaN/GPU fault); use ``--mode load_balanced`` for the clean full-forward number.
 
 Backward stage ``--stage dispatch_fc2_dgrad``: the fused cross-rank dispatch(dy) PUSH + grouped
-fc2-dgrad GEMM (grad_swiglu = dispatched_dy @ w2, NN). fp8 ``_mxfp8_step1_dispatch_dgrad`` (fp8 PUSH
+fc2-dgrad GEMM (grad_swiglu = dispatched_dy @ w2, NN). fp8 ``_dispatch_l2_dgrad_mxfp8_flydsl_kernel`` (fp8 PUSH
 halves comm bytes + mxfp8 ~2x GEMM, comm hidden under the GEMM) vs the bf16 backward's own L2-dgrad
 ``dispatch_grouped_gemm_bf16_flydsl_kernel(dy, w2, layout='nn')``. Fast fused kernels -> back-to-back
 timing; accuracy = grad_swiglu SNR vs a per-group bf16 ref. (Not part of ``both``.)
@@ -107,7 +107,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (  # noq
 from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused  # noqa: E402  (shipped bf16 op)
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (  # noqa: E402  (fp8 bwd stages)
     _DW_FP8_FORMAT,
-    _mxfp8_step1_dispatch_dgrad,
+    _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
     _mxfp8_variable_k_wgrad,
     _mxfp8_variable_k_wgrad_dw1,
 )
@@ -370,7 +370,7 @@ def profile_fwd(group, args, mode):
 def profile_dispatch_fc2_dgrad(group, args, mode):
     """Backward dispatch(dy) + fc2-dgrad = fused cross-rank dispatch(dy) PUSH + grouped fc2-dgrad
     GEMM (grad_swiglu = dispatched_dy @ w2, NN, contract H -> [P, I]). Both legs the SAME fused op:
-      * fp8  : ``_mxfp8_step1_dispatch_dgrad`` (fp8 PUSH byte-halved comm + mxfp8 ~2x GEMM), fp8 stack
+      * fp8  : ``_dispatch_l2_dgrad_mxfp8_flydsl_kernel`` (fp8 PUSH byte-halved comm + mxfp8 ~2x GEMM), fp8 stack
       * bf16 : ``dispatch_grouped_gemm_bf16_flydsl_kernel(dy, w2, layout='nn')`` -- exactly the
                L2-dgrad the bf16 ``mega_moe_fused`` backward uses, bf16 stack.
     Separate symm globals: run fp8 fully, ``destroy()``, then bf16 (no coexistence). Fast fused
@@ -402,7 +402,7 @@ def profile_dispatch_fc2_dgrad(group, args, mode):
     dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)  # fwd L1 (setup)
 
     def _fp8():
-        return _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
+        return _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
 
     grad_swiglu_fp8, pool_handle = _fp8()
     grad_swiglu_fp8 = grad_swiglu_fp8.clone()
@@ -481,7 +481,7 @@ def profile_fc2_wgrad(group, args, mode):
     dispatch_weights = symm.weight_recv_buf.clone()
 
     # dispatch(dy)+fc2-dgrad -> grad_swiglu + dispatched-dy fp8 pool; swiglu_backward -> act_weighted
-    grad_swiglu, pool_handle = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
+    grad_swiglu, pool_handle = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
     _, _, act_weighted = swiglu_backward_flydsl_kernel(
         grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
@@ -588,7 +588,7 @@ def profile_fc1_wgrad(group, args, mode):
     Pp, Hp = symm.pool_fp8.shape
     pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(Pp, Hp // 32).clone())
 
-    grad_swiglu, _ = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
+    grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
     grad_l1, _, _ = swiglu_backward_flydsl_kernel(
         grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
@@ -692,7 +692,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
-    grad_swiglu, _ = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
+    grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
     grad_l1, grad_gate = swiglu_backward_flydsl_kernel(grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True)
 
     w1t_fp8 = prepare_w2_fp8(W1.transpose(1, 2).contiguous())  # w1^T fp8 prep (static weight, once)

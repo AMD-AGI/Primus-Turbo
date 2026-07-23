@@ -7,7 +7,7 @@
 """Backward STEP1 (dispatch(dy) + fc2 dgrad) fp8 -- isolated correctness + latency.
 
 Sets up the forward symm + prologue (real fwd->bwd order: run the fp8 L1 first), then runs STEP1
-(``_mxfp8_step1_dispatch_dgrad``): fp8 dispatch(dy) PUSH + grouped mxfp8 fc2-dgrad NT GEMM ->
+(``_dispatch_l2_dgrad_mxfp8_flydsl_kernel``): fp8 dispatch(dy) PUSH + grouped mxfp8 fc2-dgrad NT GEMM ->
 ``grad_swiglu`` [P, I] + the dispatched-dy fp8 pool. Correctness: dequant STEP1's OWN dispatched-dy
 pool -> ``dl2`` [P,H] bf16, then per local expert ``grad_swiglu_ref = dl2 @ w2[g]`` -- isolates the
 fork GEMM (dispatch-push correctness is trusted / covered elsewhere). SNR gate on the real
@@ -33,7 +33,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     get_symm_buffer_for_mega_moe,
     quantize_grouped_weight_mxfp8,
 )
-from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import _mxfp8_step1_dispatch_dgrad
+from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import _dispatch_l2_dgrad_mxfp8_flydsl_kernel
 
 _H_GROUP_OFFS = 10
 
@@ -104,7 +104,7 @@ def profile(group, args):
     dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
 
     def _step1():
-        return _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
+        return _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
 
     # correctness: STEP1 once, then per-group bf16 ref over STEP1's own dispatched-dy pool
     grad_swiglu, pool_handle = _step1()
