@@ -106,7 +106,7 @@ def mega_moe_forward_fp8_impl(
 
     # ── L2: fp8 combine (fp8 GEMM + mxfp8 epilogue + fp8 PUSH + bf16-out dequant reduce) ──
     # grouped_gemm_combine_mxfp8_flydsl_kernel is self-contained: it resets the L2 scoreboard/flags cross-rank.
-    y = grouped_gemm_combine_mxfp8_flydsl_kernel(
+    y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
         act, (w2q, w2s), list(handle), group,
         topk_indices=topk_idx, topk_weights=topk_weights.to(torch.float32),
         BM=block_m, BN=block_n, num_combine_cu=48,
