@@ -398,7 +398,6 @@ def _compile(
                     blgp=blgp,
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
-                    preshuffled=True,
                 )
 
     @flyc.jit
