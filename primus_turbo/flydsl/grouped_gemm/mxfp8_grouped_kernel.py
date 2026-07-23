@@ -1276,6 +1276,12 @@ def _gwg_wgrad_candidates():
         (256, 256, 4, 1, 0),  # xcd=1 -- wins the DSv3 dW2 shape (~5%)
         (256, 256, 1, 1, 0),
         (256, 256, 8, 4, 0),
+        # R2 sweep (occupancy-bound at G=32): probe more L2 swizzles + a smaller-A-LDS tile.
+        (256, 256, 2, 1, 0),
+        (256, 256, 8, 1, 0),
+        (256, 256, 16, 1, 0),
+        (128, 256, 4, 1, 0),  # bm=128 -> ~96KB LDS (less A); test occupancy trade vs ~1.3x MFMA loss
+        (128, 256, 8, 1, 0),
     ]
 
 
