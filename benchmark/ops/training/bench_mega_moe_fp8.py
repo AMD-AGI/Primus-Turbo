@@ -92,10 +92,10 @@ from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     get_symm_buffer_for_mega_moe,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel_bwd,
-    prepare_w2_fp8,
     quantize_grouped_weight_mxfp8,
     quantize_rowwise_mxfp8_flydsl,
 )
+from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8  # noqa: E402
 from primus_turbo.pytorch.core.backend import BackendType  # noqa: E402
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity  # noqa: E402
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (  # noqa: E402
