@@ -28,11 +28,11 @@ from .dispatch_grouped_gemm_mxfp8_kernel import (
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
 )
 
-# --- L2 forward: fp8 GEMM + combine PUSH + weighted top-k reduce (bf16 out) ---
-# --- backward STEP3: fp8 fc1-dgrad + combine PUSH + unweighted reduce (+ gate scatter) ---
+# --- unified fp8 combine (ONE entry, role inferred from topk_weights/grad_gate; mirrors bf16) ---
+#   forward L2      : fp8 GEMM + combine PUSH + weighted top-k reduce (bf16 out)
+#   backward STEP3  : fp8 fc1-dgrad + combine PUSH + unweighted reduce (+ gate scatter)
 from .grouped_gemm_combine_fp8_kernel import (
     grouped_gemm_combine_mxfp8_flydsl_kernel,
-    grouped_gemm_combine_mxfp8_flydsl_kernel_bwd,
 )
 
 # --- symmetric workspace (SymLayout + scoreboard + two-heap) ---
@@ -59,7 +59,6 @@ __all__ = [
     "dispatch_grouped_gemm_mxfp8",
     "dispatch_grouped_gemm_mxfp8_flydsl_kernel",
     "grouped_gemm_combine_mxfp8_flydsl_kernel",
-    "grouped_gemm_combine_mxfp8_flydsl_kernel_bwd",
     "dispatch_prologue",
     "SymLayout",
     "get_symm_buffer_for_mega_moe",

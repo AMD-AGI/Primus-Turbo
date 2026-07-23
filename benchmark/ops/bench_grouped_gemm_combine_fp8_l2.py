@@ -118,10 +118,11 @@ def profile(group, args):
     w2_fp8 = prepare_w2_fp8(W2)  # weight prep at the caller (op layer); combine is pure compute
 
     def _fp8():
-        return grouped_gemm_combine_mxfp8_flydsl_kernel(
+        y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
             act, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=tw_f32,
             BM=BM, BN=BN, num_combine_cu=48,
         )
+        return y
 
     # correctness smoke: fp8 L2 output must be finite (+ diagnostics on where it breaks)
     act_finite = bool(torch.isfinite(act.float()).all())

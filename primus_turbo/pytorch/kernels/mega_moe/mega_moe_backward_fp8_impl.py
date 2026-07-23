@@ -30,7 +30,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
-    grouped_gemm_combine_mxfp8_flydsl_kernel_bwd,
+    grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8,
 )
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
@@ -180,7 +180,7 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
     version-keyed at the op layer (``_w1t_combine_fp8_cached``); the combine kernel is pure compute
     and self-resets its epoch flags on device (no host scoreboard/flag reset rendezvous)."""
     w1tf = w1t_fp8 if w1t_fp8 is not None else _w1t_combine_fp8_cached(w1)
-    dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel_bwd(
+    dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel(
         grad_l1, w1tf, list(handle), group,
         topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
         BM=block_m, BN=block_n, num_combine_cu=16,
