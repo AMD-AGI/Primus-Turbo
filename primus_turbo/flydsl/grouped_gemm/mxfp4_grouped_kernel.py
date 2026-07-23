@@ -91,8 +91,13 @@ def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int =
     select) -- no per-thread divergence. ``k128_rd`` real read + 256-block mask = zero pad,
     no host F.pad."""
     _KRD = K128 if k128_rd is None else k128_rd
+    # ScaleS2RPacked interleaves four 64-row groups at a time, so its physical
+    # row extent must be a 256-multiple even though the FP4 operand keeps the
+    # real N row stride. Without this padding, the last partial quartet leaves
+    # holes in one expert's workspace and spills stores into the next expert.
+    N_SCALE = ceildiv(N, 256) * 256
     n_sub, nd, KK = 2, 4, K128 // 2
-    b_dwords_pe = N * K128 // _PRESHUF_NG
+    b_dwords_pe = N_SCALE * K128 // _PRESHUF_NG
 
     @flyc.kernel(known_block_size=[_PRESHUF_BLK, 1, 1])
     def kern(
@@ -116,7 +121,7 @@ def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int =
             b_raw, max_size=False, num_records_bytes=I32(G * N * _KRD) * 4
         )
         b_rout = buffer_ops.create_buffer_resource(
-            b_out, max_size=False, num_records_bytes=I32(G * N * K128) * 4
+            b_out, max_size=False, num_records_bytes=I32(G * N_SCALE * K128) * 4
         )
         bid = rocdl.readfirstlane(T.i32, fx.block_idx.x)
         is_b = bid >= a_grid
@@ -141,7 +146,7 @@ def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int =
         grp_a = _mxfp4_grp_from(wi, r_region, 0)
         grp_b = _mxfp4_grp_from(wi, r_region, 1)
         _blk = ((wi * I32(KK) + kk) * I32(64) + r) * I32(nd) + last
-        base = arith.select(is_b, b_expert * I32(N * K128) + _blk, _blk)
+        base = arith.select(is_b, b_expert * I32(N_SCALE * K128) + _blk, _blk)
 
         # A: inline a_pre scan (owning group -> tight source rows rd0..rd_end)
         go_t = rocdl.make_buffer_tensor(go_out, max_size=False, num_records_bytes=(G + 1) * 8)
@@ -220,6 +225,7 @@ def _build_grouped_mxfp4_nt_kernel(
     N_LDS_STEPS_BH = LDS_BN_HALF // _ROWS_PER_STEP
     _PRELL, _NSCBUF = 2, 2
     K128 = K // 128
+    N_SCALE = ceildiv(N, 256) * 256
     _SCBUF = 4 * 4 * (BLOCK_K // 128) * 64
     _SCW = 4 * N_SUB * 64
     NBK = ceildiv(N, BLOCK_N)  # n_blocks
@@ -265,9 +271,8 @@ def _build_grouped_mxfp4_nt_kernel(
         gl_off_b = fp4_g2s_offsets(lane_id, wave_id, _KR, N_LDS_STEPS_BH, BPR, swizzle=swizzle)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, LDS_ROW_STRIDE, swizzle=swizzle)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_BH, LDS_ROW_STRIDE, swizzle=swizzle)
-        _qn = ((c_n + 63) // 64) * 64
         sa_s2r = ScaleS2RPacked(A_scale, slab_rows, K, 4)
-        sb_s2r = ScaleS2RPacked(B_scale, _qn * I32(G), K, 4)
+        sb_s2r = ScaleS2RPacked(B_scale, I32(N_SCALE * G), K, 4)
         wave_m_off = wave_m * (N_TILES_A * 16)
         wave_n_off = wave_n * (N_TILES_BH * 16)
 
@@ -387,7 +392,7 @@ def _build_grouped_mxfp4_nt_kernel(
         sa_b = a_pre_g * I32(64) + bm * I32(BLOCK_M) + I32(wave_m_off)
         sbl_b = bn * I32(BLOCK_N) + I32(wave_n_off)
         sbr_b = bn * I32(BLOCK_N) + I32(LDS_BN_HALF) + I32(wave_n_off)
-        b_exp_bytes = group_idx * c_n * I32(K128) * I32(4)  # per-expert B-scale base (bytes)
+        b_exp_bytes = group_idx * I32(N_SCALE * K128 * 4)  # padded per-expert B-scale base (bytes)
 
         # ---- fill operand buffers ----
         for _pp in range_constexpr(0, _PRELL):
@@ -484,12 +489,13 @@ def _bound_caches(*caches):
 
 def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=None):
     K128 = K // 128
+    N_SCALE = ceildiv(N, 256) * 256
     k128_rd = (K if k_real is None else k_real) // 128  # real raw K128 (scale not host-padded)
     ab_pre_shuf = _build_grouped_mxfp4_ab_preshuffle(K128, G, N, k128_rd)  # merged A+B, 1 launch
     gemm_k, attrs, NBK = _build_grouped_mxfp4_nt_kernel(
         K, G, N, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16, k_real=k_real
     )
-    b_pre_grid = ceildiv(G * N * K128, _PRESHUF_NG * _PRESHUF_BLK)
+    b_pre_grid = ceildiv(G * N_SCALE * K128, _PRESHUF_NG * _PRESHUF_BLK)
 
     @flyc.jit
     def launch(
@@ -525,11 +531,14 @@ def _get_grouped_mxfp4_ws(total_M, N, K128, G, device):
     # prefix is written/read. Keeping total_M out of the key stops per-total_M churn from
     # tripping _bound_caches and evicting the compiled kernels (mirrors #419 for mxfp8).
     slab_rows = (ceildiv(total_M, 256) + G) * 256  # padded A-slab upper bound for this call
+    n_scale = ceildiv(N, 256) * 256
     key = (N, K128, G, device)
     e = _GMXFP4_WS_CACHE.get(key)
     if e is None or e[2] < slab_rows:
         a_sp = torch.empty(slab_rows * K128, dtype=torch.int32, device=device)
-        b_sp = e[1] if e is not None else torch.empty(G * N * K128, dtype=torch.int32, device=device)
+        b_sp = (
+            e[1] if e is not None else torch.empty(G * n_scale * K128, dtype=torch.int32, device=device)
+        )
         e = (a_sp, b_sp, slab_rows)
         _GMXFP4_WS_CACHE[key] = e
     return e[0], e[1], slab_rows
