@@ -750,7 +750,7 @@ def grouped_quantize_mxfp4_impl(
             and x.dtype == torch.bfloat16
         )
         if fly_ok:
-            from primus_turbo.flydsl.quant.mxfp4_grouped_quant import grouped_quant_mxfp4_raw
+            from primus_turbo.flydsl.quantization.mxfp4_grouped_quant import grouped_quant_mxfp4_raw
 
             (
                 rowwise_out,
@@ -889,7 +889,7 @@ def quantize_mxfp4_impl(
     if with_trans:
         # FlyDSL dual quant (bit-exact vs the HIP dual): 3D [G,N,K] weight in one launch,
         # 2D [R,C] dense. SR / shuffle / fp16 / unaligned dims fall through to HIP below.
-        from primus_turbo.flydsl.quant.mxfp4_quant_kernel import (
+        from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
             dual3_eligible,
             dual_eligible,
             flydsl_dual_quant,

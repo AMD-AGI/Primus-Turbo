@@ -29,7 +29,7 @@ from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.quant.mxfp4_quant_kernel import (
+from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _compute_scale_native,
     _cvt_microblock_to_fp4,
     _microblock_amax,

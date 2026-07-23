@@ -31,7 +31,7 @@ def _assert_bitexact(hip_out, fly_out):
 @pytest.mark.skipif(not check_mxfp4_support(), reason="MXFP4 dual needs gfx950")
 @pytest.mark.parametrize("shape", [(4096, 4096), (4096, 11008), (11008, 4096)])
 def test_flydsl_dual_quant_2d_bitexact(shape):
-    from primus_turbo.flydsl.quant.mxfp4_quant_kernel import flydsl_dual_quant
+    from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import flydsl_dual_quant
 
     R, C = shape
     torch.manual_seed(0)
@@ -44,7 +44,7 @@ def test_flydsl_dual_quant_2d_bitexact(shape):
 @pytest.mark.skipif(not check_mxfp4_support(), reason="MXFP4 dual needs gfx950")
 @pytest.mark.parametrize("shape", [(8, 5760, 2880), (8, 4096, 7168), (8, 8192, 4096)])
 def test_flydsl_dual_quant_batched_bitexact(shape):
-    from primus_turbo.flydsl.quant.mxfp4_quant_kernel import flydsl_dual_quant_batched
+    from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import flydsl_dual_quant_batched
 
     G, N, K = shape
     torch.manual_seed(0)
