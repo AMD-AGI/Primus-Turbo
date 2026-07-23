@@ -11,8 +11,8 @@ dispatch(dy)+fc2 dgrad -> SwiGLU^T -> dW2 -> STEP3 fc1 dgrad+combine -> dW1) and
 gradient (dx, d_topk_w, dW1, dW2) against the bf16 ``mega_moe_fused`` reference on identical inputs,
 with an SNR gate. Reports rough fwd+bwd latency.
 
-NOTE: the fp8 STEP3 combine (fp8-PUSH) has a known intermittent cross-rank reduce-flag stall at
-large T; this smoke defaults to T=2048 (stable). Raise --num-tokens to stress it.
+NOTE: the STEP1 dispatch(dy) and STEP3 combine gates self-reset via a device epoch (no host
+rendezvous), which removed the old large-T reset-race stall -- validated stable through T=8192.
 
 Run inside the dev container (8 GPUs):
   PYTHONPATH=<repo> python benchmark/ops/bench_mega_moe_fused_fp8_bwd.py --num-processes 8 --num-tokens 2048

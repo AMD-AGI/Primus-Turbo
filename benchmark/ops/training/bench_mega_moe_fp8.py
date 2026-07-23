@@ -688,8 +688,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     ))
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
-    symm.scoreboard.zero_()
-    torch.cuda.synchronize(); group.barrier()
+    # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard/flag reset.
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
     grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
@@ -700,13 +699,13 @@ def profile_fc1_dgrad_combine(group, args, mode):
     m_pad = int(handle[_H_GROUP_OFFS][-1].item())
     flops = 2.0 * m_pad * (2 * I) * H  # fc1 dgrad GEMM: [P,2I] @ [2I,H] -> [P,H]
 
-    def _reset_fp8():  # cross-rank L2 combine reset; run OUTSIDE the timed window (kernel-only)
-        symm.sb_l2.zero_(); symm.barrier_local.fill_(-1); symm.combine_gate.zero_()
+    def _reset_fp8():  # epoch self-reset (device) -> no host flag reset needed
+        pass
 
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only)
         dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel_bwd(
             grad_l1, w1t_fp8, list(handle), group, topk_indices=tidx64, grad_gate=grad_gate,
-            BM=BM, BN=BN, num_combine_cu=48,
+            BM=BM, BN=BN, num_combine_cu=16,
         )
         return dx
 

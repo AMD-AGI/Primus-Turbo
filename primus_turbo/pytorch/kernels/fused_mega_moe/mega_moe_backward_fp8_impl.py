@@ -8,16 +8,16 @@
 
 fp8 sibling of the bf16 ``mega_moe_backward_impl`` (``mega_moe_backward_impl.py``). Like the fp8
 forward this is a PLAIN orchestration function (no custom_op / dispatcher): it reuses the forward's
-live symmetric buffer, does host ``synchronize()`` + ``group.barrier()`` rendezvous, and maintains
-the version-keyed w1^T / w2^T dgrad quant inside the L2/L1 dgrad helpers (no ctx-passed prequant).
+live symmetric buffer and maintains the version-keyed w1^T / w2^T dgrad quant inside the L2/L1 dgrad
+helpers (no ctx-passed prequant). The STEP1 dispatch(dy) and STEP3 combine gates now self-reset via
+a device epoch (no host synchronize()+barrier() rendezvous).
 
 Backward (conjugate via the Dispatch<->Combine duality; L2 = fc2, L1 = fc1, as in bf16):
   * L2 dgrad: dispatch(dy) + fc2 GEMM (NT via w2^T) MXFP8 -> grad_swiglu + rowwise-fp8 dispatched-dy pool.
   * SwiGLU^T (bf16), re-inject routing weight, gate grad, act_weighted (dW2 b-operand).
   * dW2   variable-K wgrad (MXFP8), a-operand requant-fused from the L2-dgrad fp8 pool.
-  * L1 dgrad: fc1 GEMM (fp8) + combine/reduce (fp8-PUSH). KNOWN: the fp8-PUSH combine has an
-    intermittent cross-rank reduce-flag liveness stall at large T (stable at T<=2048; robust fix
-    pending -- candidate: split into fused GEMM+push then a barrier'd standalone reduce).
+  * L1 dgrad: fc1 GEMM (fp8) + combine/reduce (fp8-PUSH). The epoch self-reset flags removed the
+    host reset-race that used to stall this combine at large T (now stable through T=8192).
   * dW1   variable-K wgrad (MXFP8), LOCAL -- reuses the FORWARD-dispatched fc1-input pool.
 """
 
@@ -26,12 +26,10 @@ from typing import Tuple
 import torch
 
 from primus_turbo.flydsl.mega.fp8 import (
-    _host_rendezvous,
     colwise_grouped_meta,
     colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
-    get_symm_buffer_for_mega_moe,
     grouped_gemm_combine_mxfp8_flydsl_kernel_bwd,
     quantize_grouped_weight_mxfp8,
 )
@@ -179,19 +177,13 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
     grad_gate scatter -> ``(dx [num_tokens, H] bf16, grad_topk_weights [num_tokens, num_topk] f32)``.
 
     Backward mirror of the forward L2 (compute -> comm, combine-bound). fc1^T is prepped
-    version-keyed at the op layer (``_w1t_combine_fp8_cached``); the combine kernel is pure compute.
-    Resets the L2 scoreboard / reduce flags / combine_gate cross-rank (barrier-bracketed) first."""
-    symm = get_symm_buffer_for_mega_moe()
+    version-keyed at the op layer (``_w1t_combine_fp8_cached``); the combine kernel is pure compute
+    and self-resets its epoch flags on device (no host scoreboard/flag reset rendezvous)."""
     w1tf = w1t_fp8 if w1t_fp8 is not None else _w1t_combine_fp8_cached(w1)
-    _host_rendezvous(group)
-    symm.sb_l2.zero_()
-    symm.barrier_local.fill_(-1)
-    symm.combine_gate.zero_()
-    _host_rendezvous(group)
     dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel_bwd(
         grad_l1, w1tf, list(handle), group,
         topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
-        BM=block_m, BN=block_n, num_combine_cu=48,
+        BM=block_m, BN=block_n, num_combine_cu=16,
     )
     grad_topk_weights = d_topk_w_flat[: num_tokens * num_topk].view(num_tokens, num_topk)
     return dx, grad_topk_weights
@@ -265,8 +257,7 @@ def mega_moe_backward_fp8_impl(
     dW2 = _mxfp8_variable_k_wgrad(dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs)
 
     # L1 dgrad (fp8-PUSH): fc1 dgrad + combine + unweighted reduce + grad_gate scatter -> dx +
-    # grad_topk_weights. (fp8-PUSH combine has a known intermittent cross-rank reduce-flag stall
-    # at large T -- robust fix pending; see the L1 dgrad combine notes.)
+    # grad_topk_weights. (epoch self-reset flags -> no host reset-race stall; stable through T=8192.)
     dx, grad_topk_weights = _l1_dgrad_combine_mxfp8_flydsl_kernel(
         grad_l1, w1, group, handle, block_m, block_n,
         grad_gate=grad_gate, topk_idx=topk_idx, num_tokens=num_tokens, num_topk=num_topk,
