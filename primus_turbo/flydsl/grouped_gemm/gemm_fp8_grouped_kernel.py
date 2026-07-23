@@ -28,6 +28,8 @@ Design (CPU-sync-free, reuses the dense kernel body verbatim):
 
 Built on the dense kernel's primitives; see gemm_fp8_kernel.py for the K-loop /
 K-tail / barrier rationale (identical here).
+
+Authored with FlyDSL (https://github.com/ROCm/FlyDSL).
 """
 
 import os

@@ -3,6 +3,11 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
+"""Primus-Turbo dense BF16 GEMM kernel (FlyDSL).
+
+Authored with FlyDSL (https://github.com/ROCm/FlyDSL)."""
+
 import functools
 
 import flydsl.compiler as flyc
