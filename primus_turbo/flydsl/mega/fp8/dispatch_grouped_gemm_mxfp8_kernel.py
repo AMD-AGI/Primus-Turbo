@@ -550,23 +550,28 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     topk_weights: Optional[torch.Tensor] = None,
     BM: int = 256,
     BN: int = 256,
+    num_dispatch_cu: int = 16,
+    num_preshuffle_cu: int = 16,
 ) -> Tuple[torch.Tensor, tuple, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Self-contained fp8 L1 = fused mxfp8 dispatch + fc1 (NT); fp8 sibling of
-    ``dispatch_grouped_gemm_bf16_flydsl_kernel``.
+    """Self-contained fp8 dispatch + grouped mxfp8 NT GEMM; fp8 sibling of
+    ``dispatch_grouped_gemm_bf16_flydsl_kernel``. Drives BOTH the forward L1 (dispatch x + fc1) and
+    the backward STEP1 (dispatch dy + fc2-dgrad) -- both are the SAME NT op, only the input/weight
+    and the comm/preshuffle CU split (``num_dispatch_cu`` / ``num_preshuffle_cu``) differ.
 
-    Takes the pre-quantized fc1 weight (``w1q`` [G,2I,H] fp8 + ``w1s`` raw E8M0; prepared
-    version-keyed by the caller). When ``handle is None`` (forward), builds the symmetric workspace +
-    dispatch-prologue handle from ``topk_idx`` / ``topk_weights``; otherwise reuses the live symm
-    buffer + the given handle. Publishes the cross-rank scoreboard reset (barrier-bracketed) and runs
-    the fused dispatch-PUSH + grouped mxfp8 GEMM (token quant folded in via the bf16-x path).
+    Takes the pre-quantized weight (``w1q`` [G,*,K] fp8 + ``w1s`` raw E8M0; prepared version-keyed by
+    the caller -- fc1 weight for forward, ``w2^T`` for the STEP1 dgrad). When ``handle is None``
+    (forward), builds the symmetric workspace + dispatch-prologue handle from ``topk_idx`` /
+    ``topk_weights``; otherwise reuses the live symm buffer + the given handle (backward). Publishes
+    the cross-rank scoreboard reset (barrier-bracketed) and runs the fused dispatch-PUSH + grouped
+    mxfp8 GEMM (token quant folded in via the bf16-x path).
 
-    Returns ``(l1, handle, dispatch_weights, pool_x_fp8)`` where ``dispatch_weights`` is
-    ``symm.weight_recv_buf`` (per-pool-row routing weight) and ``pool_x_fp8`` is
-    ``(symm.pool_fp8 [P,H] fp8, symm.pool_scale [P,H//32] E8M0)`` -- both LIVE views into the shared
-    symm pool (no clone). The caller keeps ``handle`` (L2 + backward reuse it); ``handle[-1]`` is the
-    device ``num_tile_blocks`` (real-tile count), the SwiGLU-epilogue row bound (mirrors bf16's
-    ``handle[_H_NUM_TILE_BLOCKS]``). It can re-fetch the live symm buffer via
-    ``get_symm_buffer_for_mega_moe()`` (e.g. the L2 combine flag reset).
+    Returns ``(l1, handle, dispatch_weights, pool_x_fp8)`` where ``l1`` is the GEMM output (fc1 out
+    for forward, grad_swiglu for STEP1), ``dispatch_weights`` is ``symm.weight_recv_buf`` (per-pool-row
+    routing weight; unused by STEP1), and ``pool_x_fp8`` is ``(symm.pool_fp8 [P,H] fp8, symm.pool_scale
+    [P,H//32] E8M0)`` -- both LIVE views into the shared symm pool (no clone). The caller keeps
+    ``handle`` (L2 + backward reuse it); ``handle[-1]`` is the device ``num_tile_blocks`` (real-tile
+    count), the SwiGLU-epilogue row bound (mirrors bf16's ``handle[_H_NUM_TILE_BLOCKS]``). It can
+    re-fetch the live symm buffer via ``get_symm_buffer_for_mega_moe()`` (e.g. the L2 combine flag reset).
     """
     if handle is None:
         assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
@@ -595,7 +600,8 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     symm.scoreboard.zero_()
     _host_rendezvous(group)
     l1 = dispatch_grouped_gemm_mxfp8(
-        x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN
+        x, None, w1q, w1s, handle, sym_layout, symm,
+        num_dispatch_cu=num_dispatch_cu, num_preshuffle_cu=num_preshuffle_cu, BM=BM, BN=BN,
     )
     # backward saves (clone BEFORE backward STEP1's dispatch(dy) overwrites the symm pool):
     #  * dispatch_weights: the per-pool-row routing weight (prologue-scattered) -- swiglu_backward

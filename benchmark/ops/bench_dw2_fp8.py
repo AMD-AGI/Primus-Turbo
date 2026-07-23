@@ -47,7 +47,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
 )
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
     _DW_FP8_FORMAT,
-    _mxfp8_step1_dispatch_dgrad,
+    _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
     _mxfp8_variable_k_wgrad,
 )
 
@@ -138,7 +138,7 @@ def profile(group, args):
 
     dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
     # STEP1 (dispatch(dy)+fc2 dgrad) -> grad_swiglu + dispatched-dy fp8 pool
-    grad_swiglu, pool_handle = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
+    grad_swiglu, pool_handle = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
     # STEP2 (swiglu^T, re-inject routing weight) -> act_weighted (the dW2 b operand)
     _, _, act_weighted = swiglu_backward_flydsl_kernel(
         grad_swiglu, l1, get_symm_buffer_for_mega_moe().meta_scalars[1:2],

@@ -8,7 +8,7 @@
 
 Replicates the backward up to STEP3 on real mega-pool data: forward L1 -> (l1, dispatch_weights),
 STEP1 (dispatch(dy)+fc2 dgrad), STEP2 swiglu_backward -> grad_l1 + grad_gate. Then STEP3
-(``_mxfp8_step3_fc1_dgrad_combine``): fp8 fc1-dgrad + combine PUSH + unweighted reduce + gate
+(``_l1_dgrad_combine_mxfp8_flydsl_kernel``): fp8 fc1-dgrad + combine PUSH + unweighted reduce + gate
 scatter -> dx [T, H] + grad_topk_weights [T, K].
 
 SMOKE only: dx / grad_topk_weights finite + correctly shaped + runs cross-rank (no deadlock/NaN).
@@ -38,8 +38,8 @@ from primus_turbo.flydsl.mega.fp8 import (
 )
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
-    _mxfp8_step1_dispatch_dgrad,
-    _mxfp8_step3_fc1_dgrad_combine,
+    _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
+    _l1_dgrad_combine_mxfp8_flydsl_kernel,
 )
 
 
@@ -105,11 +105,11 @@ def profile(group, args):
     dispatch_weights = symm.weight_recv_buf.clone()
 
     dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
-    grad_swiglu, _ = _mxfp8_step1_dispatch_dgrad(dy, W2, group, handle, BM, BN)
+    grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
     grad_l1, grad_gate = swiglu_backward_flydsl_kernel(grad_swiglu, l1, get_symm_buffer_for_mega_moe().meta_scalars[1:2], scale=dispatch_weights, return_gate=True)
 
     def _step3():
-        return _mxfp8_step3_fc1_dgrad_combine(
+        return _l1_dgrad_combine_mxfp8_flydsl_kernel(
             grad_l1, W1, group, handle, BM, BN, grad_gate=grad_gate, topk_idx=topk_idx,
             num_tokens=T, num_topk=K,
         )
