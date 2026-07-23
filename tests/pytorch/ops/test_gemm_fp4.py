@@ -400,6 +400,100 @@ def test_gemm_fp4_mx_blockwise_torch_compile_backward(m, n, k, dtype):
     GlobalBackendManager.reset()
 
 
+# ----------------------------------------------------------------------------
+# Determinism suite (run with --deterministic-only): bit-exact across repeats.
+# ----------------------------------------------------------------------------
+_DET_GEMM_FP4_MNK = [(256, 256, 256), (512, 512, 256), (1024, 1024, 512)]
+
+
+@pytest.mark.parametrize("mnk", _DET_GEMM_FP4_MNK)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "backend",
+    [BackendType.AITER, BackendType.HIPBLASLT, BackendType.FLYDSL],
+    ids=["AITER", "HIPBLASLT", "FLYDSL"],
+)
+@pytest.mark.deterministic
+def test_gemm_fp4_deterministic(mnk, dtype, backend):
+    """Dense MXFP4 GEMM fwd + bwd are bit-exact across 10 repeats (SR off), and
+    match a high-precision reference (SNR)."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+
+    m, n, k = mnk
+    if backend == BackendType.AITER and dtype != torch.bfloat16:
+        pytest.skip("AITER backend only supports bfloat16 dtype")
+    if backend == BackendType.FLYDSL and not (m % 256 == 0 and n % 256 == 0 and k % 256 == 0):
+        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 256")
+
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(False)
+
+    device = "cuda:0"
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    # NT layout (a: [m, k], b: [n, k]) -- the production FP4 GEMM usage.
+    trans_a, trans_b = False, True
+    config = Float4QuantConfig(
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        format=Format.E2M1_X2,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+    )
+    print(f"\n[deterministic] M={m}, N={n}, K={k}, dtype={dtype}, backend={backend}")
+
+    a0 = torch.randn((m, k), dtype=dtype, device=device)
+    b0 = torch.randn((n, k), dtype=dtype, device=device)
+    a0 = a0 / a0.abs().max()
+    b0 = b0 / b0.abs().max()
+
+    # Reference (high precision)
+    a_ref = a0.detach().clone().requires_grad_()
+    b_ref = b0.detach().clone().requires_grad_()
+    c_ref = a_ref @ b_ref.T
+    grad_c = torch.randn_like(c_ref)
+    c_ref.backward(grad_c)
+    torch.cuda.synchronize()
+
+    def _run_once():
+        # Clean memory each iter so the caching allocator can't alias a buffer
+        # still being written by a pending op from a prior case.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        a = a0.detach().clone().requires_grad_()
+        b = b0.detach().clone().requires_grad_()
+        c = gemm_fp4(a, b, trans_a, trans_b, dtype, config)
+        c.backward(grad_c)
+        return c.detach(), a.grad.detach(), b.grad.detach()
+
+    try:
+        repeats = 10
+        outs = []
+        for _ in range(repeats):
+            outs.append(_run_once())
+            torch.cuda.synchronize()
+
+        c0, da0, db0 = outs[0]
+        # Determinism (bitwise identical across runs)
+        for i in range(1, repeats):
+            ci, dai, dbi = outs[i]
+            torch.testing.assert_close(c0, ci, rtol=0, atol=0)
+            torch.testing.assert_close(da0, dai, rtol=0, atol=0)
+            torch.testing.assert_close(db0, dbi, rtol=0, atol=0)
+
+        # Correctness (close to reference)
+        snr_threshold = 10
+        assert compute_snr(c_ref.detach(), c0) > snr_threshold, "c_snr too low"
+        assert compute_snr(a_ref.grad.detach(), da0) > snr_threshold, "a_grad_snr too low"
+        assert compute_snr(b_ref.grad.detach(), db0) > snr_threshold, "b_grad_snr too low"
+    finally:
+        GlobalBackendManager.reset()
+
+
 # ---------------------------------------------------------------------------
 # AITER preshuffle fast-path coverage
 # ---------------------------------------------------------------------------
