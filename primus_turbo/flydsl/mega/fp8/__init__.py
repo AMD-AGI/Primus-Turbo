@@ -33,7 +33,6 @@ from .dispatch_grouped_gemm_mxfp8_kernel import (
 from .grouped_gemm_combine_fp8_kernel import (
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel_bwd,
-    prepare_w2_fp8,
 )
 
 # --- symmetric workspace (SymLayout + scoreboard + two-heap) ---
@@ -61,7 +60,6 @@ __all__ = [
     "dispatch_grouped_gemm_mxfp8_flydsl_kernel",
     "grouped_gemm_combine_mxfp8_flydsl_kernel",
     "grouped_gemm_combine_mxfp8_flydsl_kernel_bwd",
-    "prepare_w2_fp8",
     "dispatch_prologue",
     "SymLayout",
     "get_symm_buffer_for_mega_moe",

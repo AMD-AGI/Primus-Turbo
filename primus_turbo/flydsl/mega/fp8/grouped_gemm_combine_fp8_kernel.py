@@ -668,22 +668,6 @@ def _compile_bwd(
 _L2Y_FP8_SCRATCH: dict = {}
 
 
-def prepare_w2_fp8(l2_weights):
-    """Prepare the L2 fc2 weight for the fp8 combine: grouped mxfp8 quant (FlyDSL) + scale
-    preshuffle (ScaleBComb layout) + int8 flat -> ``(weight_flat int8 [G*H*I], b_sp int32)``,
-    exactly the two operands the mxfp8 combine GEMM consumes. Static per weight version, so a
-    stateful holder (``MegaMoEFP8``) computes this ONCE per ``optim.step`` and passes it as
-    ``w2_fp8`` -- the combine then does NO per-call weight quant OR preshuffle."""
-    from primus_turbo.flydsl.mega.fp8.quant import quantize_grouped_weight_mxfp8_flydsl
-    from primus_turbo.flydsl.mega.fp8.quant_flydsl import preshuffle_b_scale
-
-    G, H, I = l2_weights.shape
-    w2q, w2s = quantize_grouped_weight_mxfp8_flydsl(l2_weights)
-    b_sp = preshuffle_b_scale(w2s, G, H, I)
-    weight_flat = w2q.reshape(G * H, I).contiguous().view(torch.int8).reshape(-1)
-    return weight_flat, b_sp
-
-
 def grouped_gemm_combine_mxfp8_flydsl_kernel(
     act, w2_fp8, handle, group, *, topk_indices, topk_weights, BM=256, BN=256,
     num_combine_cu=48, num_reduce_cu=0,
@@ -691,8 +675,8 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     """Fused grouped mxfp8 GEMM (mxfp8-quant epilogue) + FP8 combine PUSH + FP8-dequant reduce.
 
     PURE COMPUTE kernel: the fc2 weight comes in ALREADY prepared as ``w2_fp8 = (weight_flat int8
-    [G*H*I], b_sp int32)`` -- build it once with :func:`prepare_w2_fp8` and maintain it version-keyed
-    at the op layer; this function does NO weight quant/preshuffle and NO caching. ``act`` [M, I]
+    [G*H*I], b_sp int32)`` -- build it once with the op-layer ``prepare_w2_fp8`` and maintain it
+    version-keyed at the op layer; this function does NO weight quant/preshuffle and NO caching. ``act`` [M, I]
     bf16 (M = num_max_pool_tokens) is the activation A operand, quantized rowwise-mxfp8 internally
     (per-call token work).     GEMM epilogue quantizes C -> LOCAL fp8 L2Y; combine pure-copies fp8 ->
     peer; reduce dequants -> ``y`` [num_tokens, H] bf16. Shapes: I from ``act``, H / G from
@@ -775,7 +759,7 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel_bwd(
     ``grouped_gemm_combine_mxfp8_flydsl_kernel``.
 
     PURE COMPUTE: the fc1^T weight comes in ALREADY prepared as ``w1t_fp8 = (weight_flat, b_sp)``
-    (build once with :func:`prepare_w2_fp8` on ``w1^T`` [G,H,2I], op-layer version-keyed) -- no weight
+    (build once with the op-layer ``prepare_w2_fp8`` on ``w1^T`` [G,H,2I], op-layer version-keyed) -- no weight
     prep here. ``grad_l1`` [M, 2I] bf16 (M = num_max_pool_tokens; routing weight already folded
     upstream) is the A operand, quantized rowwise-mxfp8 internally; ``grad_gate`` [M] f32. Shapes:
     K=2I from ``grad_l1``, H / G from ``sym_layout``. Returns ``(dx [num_tokens, H] bf16, d_topk_w

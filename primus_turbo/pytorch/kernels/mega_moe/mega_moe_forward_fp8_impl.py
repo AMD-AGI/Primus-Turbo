@@ -22,11 +22,9 @@ from torch.distributed import ProcessGroup
 from primus_turbo.flydsl.mega import swiglu_flydsl_kernel
 from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
-    get_symm_buffer_for_mega_moe,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
-    prepare_w2_fp8,
-    quantize_grouped_weight_mxfp8_flydsl,
 )
+from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w1_fp8, prepare_w2_fp8
 
 __all__ = [
     "mega_moe_forward_fp8_impl",
@@ -63,7 +61,7 @@ def _w1_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Version-keyed fc1 weight prep -> ``(w1q [G,2I,H] fp8, w1s [G,2I,H//32] raw E8M0)``. The L1
     dispatch GEMM takes the raw quant and preshuffles the weight scale internally, so this is just
     the grouped mxfp8 (E4M3) quant."""
-    return _version_keyed_weight_prep(w1, _W1_PREP_ATTR, quantize_grouped_weight_mxfp8_flydsl)
+    return _version_keyed_weight_prep(w1, _W1_PREP_ATTR, prepare_w1_fp8)
 
 
 def _w2_fp8_cached(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
