@@ -536,9 +536,7 @@ def _get_grouped_mxfp4_ws(total_M, N, K128, G, device):
     e = _GMXFP4_WS_CACHE.get(key)
     if e is None or e[2] < slab_rows:
         a_sp = torch.empty(slab_rows * K128, dtype=torch.int32, device=device)
-        b_sp = (
-            e[1] if e is not None else torch.empty(G * n_scale * K128, dtype=torch.int32, device=device)
-        )
+        b_sp = e[1] if e is not None else torch.empty(G * n_scale * K128, dtype=torch.int32, device=device)
         e = (a_sp, b_sp, slab_rows)
         _GMXFP4_WS_CACHE[key] = e
     return e[0], e[1], slab_rows
