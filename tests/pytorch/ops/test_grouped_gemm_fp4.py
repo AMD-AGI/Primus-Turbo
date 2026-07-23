@@ -7,6 +7,7 @@
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     Float4QuantConfig,
@@ -135,6 +136,58 @@ def test_grouped_gemm_fp4_mx_blockwise(B, M, NK, dtype, balance):
     """MXFP4 grouped GEMM fwd + dgrad + wgrad on the Triton backend."""
     N, K = NK
     _run(B, M, N, K, dtype, balance)
+
+
+# ----------------------------------------------------------------------------
+# FlyDSL packed-scale workspace regression.
+# ----------------------------------------------------------------------------
+def test_grouped_gemm_fp4_flydsl_non_256_free_dim_scale_workspace():
+    """FlyDSL dgrad must fully overwrite packed scales when free-N is not 256-aligned."""
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+
+    from primus_turbo.flydsl.grouped_gemm import mxfp4_grouped_kernel
+
+    device = "cuda:0"
+    groups, n, k = 2, 256, 320
+    group_lens = torch.tensor([0, 128], dtype=torch.int64, device=device)
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    a = torch.randn((128, k), dtype=torch.bfloat16, device=device, requires_grad=True)
+    b = torch.randn((groups, n, k), dtype=torch.bfloat16, device=device)
+    a_ref = a.detach().clone().requires_grad_(True)
+    b_ref = b.detach().clone()
+    grad_out = torch.randn((128, n), dtype=torch.bfloat16, device=device)
+
+    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=True)
+    out_ref.backward(grad_out)
+
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.FLYDSL)
+    GlobalBackendManager.set_auto_tune(False)
+    mxfp4_grouped_kernel._GMXFP4_WS_CACHE.clear()
+    try:
+        out = grouped_gemm_fp4(a, b, group_lens, trans_b=True, config=_make_config())
+
+        # The dgrad shape has free-N=320 and contraction K=256. Poison its cached
+        # packed-scale workspace after forward: a correct preshuffle overwrites the
+        # complete 512-row physical extent, including all 256-padding slots.
+        _, b_scale_workspace, _ = mxfp4_grouped_kernel._get_grouped_mxfp4_ws(
+            128, k, 2, groups, torch.device(device)
+        )
+        b_scale_workspace.fill_(-1)
+
+        out.backward(grad_out)
+        torch.cuda.synchronize()
+    finally:
+        GlobalBackendManager.set_grouped_gemm_backend(None)
+        GlobalBackendManager.set_auto_tune(None)
+
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(a.grad).all()
+    assert compute_snr(out_ref, out) > SNR_THRESHOLD
+    assert compute_snr(a_ref.grad, a.grad) > SNR_THRESHOLD
 
 
 # ----------------------------------------------------------------------------

@@ -116,7 +116,8 @@ class GroupedGEMMFP4FlyDSLBackend(KernelBackend):
 
     MX_BLOCKWISE, NT (trans_b=True). Reuses the dense mxfp4 whole-loop compute
     (mfma_scale_f32_16x16x128_f8f6f4) with the fp8-grouped addressing; the host
-    wrapper zero-pads K/N to 256 so every shape runs natively.
+    wrapper zero-pads K scales and the packed N-scale workspace to 256 while
+    retaining the real FP4 operand strides.
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.MX_BLOCKWISE}
@@ -142,8 +143,9 @@ class GroupedGEMMFP4FlyDSLBackend(KernelBackend):
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
         supported &= out_dtype in (torch.float16, torch.bfloat16)
         supported &= trans_b and not trans_a
-        # Free dim N must be a 64-multiple (the packed-scale preshuffle groups 64 rows);
-        # non-64 N (tiny 32-mult test shapes) falls back to Triton. MoE dims are 64-mult.
+        # Free dim N must be a 64-multiple (the packed-scale preshuffle groups 64 rows).
+        # Its physical scale workspace is padded to 256 by the FlyDSL wrapper.
+        # Non-64 N (tiny 32-mult test shapes) falls back to Triton.
         supported &= b.shape[-2] % 64 == 0
         supported &= get_device_compute_capability() >= (9, 5)
         return supported
