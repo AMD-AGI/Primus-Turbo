@@ -71,11 +71,11 @@ _MAIN_DTYPES = {
 }
 _SIGNAL_DTYPES = {
     "_ipc_barrier": torch.int32,
-    "scoreboard": torch.int32,
-    "sb_consume": torch.int32,
-    "sb_l2": torch.int32,
+    "dispatch_flag": torch.int64,  # 2 banks x num_pool_blocks (comm->preshuffle epoch gate)
+    "preshuffle_flag": torch.int64,  # 2 banks x num_pool_blocks (preshuffle->gemm epoch gate)
+    "combine_flag": torch.int64,  # 2 banks x num_pool_blocks (L2 GEMM->combine epoch gate)
     "comb": torch.bfloat16,
-    "barrier_local": torch.int32,
+    "reduce_flag": torch.int64,  # 2 banks x combine_slots (combine->reduce epoch gate)
 }
 
 
@@ -303,12 +303,28 @@ class SymmBuffer:
             dtype=torch.int64,
             device="cuda",
         )
-        # comb + barrier_local live in the uncached signal pad -> peer tables from signal_pad_ptrs
+        # comb + the epoch flags live in the uncached signal pad -> peer tables from signal_pad_ptrs
+        # (kept for parity/debug; the kernels reach peers via the sym_layout delta tables).
         self.comb_addrs = _peer_ptr_table(signal_ptrs, signal_spec["comb"][0])
-        self.barrier_addrs = _peer_ptr_table(signal_ptrs, signal_spec["barrier_local"][0])
-        self.scoreboard_ptrs = _peer_ptr_table(signal_ptrs, signal_spec["scoreboard"][0])
+        self.reduce_flag_addrs = _peer_ptr_table(signal_ptrs, signal_spec["reduce_flag"][0])
+        self.dispatch_flag_addrs = _peer_ptr_table(signal_ptrs, signal_spec["dispatch_flag"][0])
         # combine_gate (cached main) peer table -> backward gate-grad (d_topk_w) scatter
         self.gate_addrs = _peer_ptr_table(buffer_ptrs, slice_input_buffers["combine_gate"][0])
+
+        # ---- device epoch state (bf16-style self-reset) for the cross-rank spin flags ----
+        # parity (0/1) picks the flag bank; expected[parity] is the cumulative spin target.
+        # Bumped on-device by each op's epoch_bump kernel -> the flags need NO host reset
+        # (removes the per-call synchronize()+barrier() rendezvous) and carry no cross-call reset
+        # race. LOCAL tensors (each rank bumps/reads its own; lockstep keeps every rank's
+        # parity/expected identical, so cross-rank flag writes hit the right bank).
+        #   dispatch: dispatch_flag(+num_ranks) comm->preshuffle, preshuffle_flag(+1) preshuffle->gemm
+        self._disp_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
+        self._disp_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._ps_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        #   combine: combine_flag(+n_blocks) GEMM->combine, reduce_flag(+1) combine->reduce
+        self._combine_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
+        self._combine_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._reduce_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
 
         # the SymLayout struct + its delta tables are built lazily on first request
         self._sym_layout = None

@@ -124,13 +124,15 @@ def _main_regions(sl):
 def _signal_regions(sl):
     R, NPB = int(sl.num_ranks), int(sl.num_max_pool_blocks)
     CS, H = int(sl.combine_slots), int(sl.hidden)
+    # All epoch flags (bf16-style self-reset): 2 banks (parity) x length, i64. Never host-reset;
+    # each spins on a cumulative per-bank expected -> no consuming store, no cross-call reset race.
     return [
         ("_ipc_barrier", _I32, R),
-        ("scoreboard", _I32, NPB),
-        ("sb_consume", _I32, NPB),
-        ("sb_l2", _I32, NPB),
+        ("dispatch_flag", _I64, 2 * NPB),    # cross-rank comm->preshuffle gate (per-expert, atomic_add)
+        ("preshuffle_flag", _I64, 2 * NPB),  # local preshuffle->gemm gate (per-block, st=expected)
+        ("combine_flag", _I64, 2 * NPB),     # L2 GEMM->combine gate (per-block, atomic_add)
         ("comb", _BF16, CS * H),
-        ("barrier_local", _I32, CS),
+        ("reduce_flag", _I64, 2 * CS),       # L2 combine->reduce gate (per-slot, st=expected)
     ]
 
 
@@ -286,11 +288,11 @@ _REGION_ACCESSORS = (
     "act_fp8",
     "act_scale",
     "pool_scale_ps",
-    "scoreboard",
-    "sb_consume",
-    "sb_l2",
+    "dispatch_flag",
+    "preshuffle_flag",
+    "combine_flag",
     "comb",
-    "barrier_local",
+    "reduce_flag",
 )
 
 

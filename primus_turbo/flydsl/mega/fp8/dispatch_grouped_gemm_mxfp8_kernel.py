@@ -41,6 +41,7 @@ from torch.distributed import ProcessGroup
 from flydsl.expr import arith
 from flydsl.expr.buffer_ops import (
     buffer_load,
+    buffer_store,
     create_buffer_resource,
     create_buffer_resource_from_addr,
 )
@@ -60,6 +61,7 @@ from primus_turbo.flydsl.mega.fp8.quant_flydsl import (
     preshuffle_b_scale,
     quantize_rowwise_mxfp8_flydsl,
 )
+from primus_turbo.flydsl.mega.prims import cast
 from primus_turbo.flydsl.mega.fp8.prims import (
     l2_invalidate,
     l2_writeback,
@@ -101,6 +103,31 @@ def _make_fwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, tile_ps):
         ps_tile: fx.Array[fx.Int32, tile_ps, 16]
 
     return SharedStorageCoalesce
+
+
+@functools.lru_cache(maxsize=4)
+def _make_epoch_bump(add_dispatch, add_ps):
+    """Single-block device kernel: flip the dispatch flag parity, bump dispatch/preshuffle
+    expected[new_parity]. Launched on the dispatch stream just before the main kernel so the
+    comm->preshuffle (dispatch_flag) and preshuffle->gemm (preshuffle_flag) gates self-reset (no
+    host synchronize()+barrier(), no cross-call reset race). Mirrors the bf16 dispatch epoch bump,
+    plus a second (preshuffle) counter for the fp8-only preshuffle role."""
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def epoch_bump_kernel(PARITY: fx.Tensor, DISP_EXP: fx.Tensor, PS_EXP: fx.Tensor):
+        if fx.thread_idx.x == fx.Int32(0):
+            parity_res = create_buffer_resource(PARITY, max_size=True)
+            disp_res = create_buffer_resource(DISP_EXP, max_size=True)
+            ps_res = create_buffer_resource(PS_EXP, max_size=True)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            buffer_store(new_parity, parity_res, fx.Int32(0))
+            idx = cast(new_parity, fx.T.i32())
+            new_disp = buffer_load(disp_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_dispatch)
+            buffer_store(new_disp, disp_res, idx)
+            new_ps = buffer_load(ps_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_ps)
+            buffer_store(new_ps, ps_res, idx)
+
+    return epoch_bump_kernel
 
 
 @functools.lru_cache(maxsize=64)
@@ -173,14 +200,29 @@ def _compile(
         POOL_SCALE_PS: fx.Tensor,  # local pool E8M0 in ScaleS2R broadcast layout a_sp (int32)
         OUTPUT: fx.Tensor,  # bf16 [num_max_pool_tokens, N] flattened
         TILE_TO_GROUP: fx.Tensor,
-        EXPECTED: fx.Tensor,
+        EXPECTED: fx.Tensor,  # (unused after epoch migration; kept for handle-plumbing stability)
         NUM_TILE_BLOCKS: fx.Tensor,
+        DISP_PARITY: fx.Tensor,
+        DISP_EXPECTED: fx.Tensor,
+        PS_EXPECTED: fx.Tensor,
         c_n: fx.Int32,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         comm_block_count = fx.Int32(_comm_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        # ---- epoch: parity picks the flag bank; expected[parity] is the cumulative spin target ----
+        disp_parity_res = create_buffer_resource(DISP_PARITY, max_size=True)
+        disp_expected_res = create_buffer_resource(DISP_EXPECTED, max_size=True)
+        ps_expected_res = create_buffer_resource(PS_EXPECTED, max_size=True)
+        disp_parity = cast(
+            buffer_load(disp_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
+        )
+        bank_offset = disp_parity * fx.Int32(worst_case_tiles)
+        expected_dispatch = buffer_load(disp_expected_res, disp_parity, vec_width=1, dtype=fx.T.i64())
+        expected_ps = buffer_load(ps_expected_res, disp_parity, vec_width=1, dtype=fx.T.i64())
+        dispatch_flag_local = sym_layout.dispatch_flag_ptr
+        preshuffle_flag_local = sym_layout.preshuffle_flag_ptr
 
         xq_res = create_buffer_resource(XQ, max_size=True)
         xs_res = create_buffer_resource(XS, max_size=True)
@@ -211,11 +253,12 @@ def _compile(
                 sym_layout.offsets_ptr, num_records_bytes=num_ranks * 8
             ),
             signal=True,
-            scoreboard_base=sym_layout.scoreboard_ptr,
-            scoreboard_offsets_resource=create_buffer_resource_from_addr(
+            dispatch_flag_base=sym_layout.dispatch_flag_ptr,
+            dispatch_flag_offsets_resource=create_buffer_resource_from_addr(
                 sym_layout.signal_offsets_ptr, num_records_bytes=num_ranks * 8
             ),
-            block_m=BLOCK_M,
+            bank=bank_offset,
+            world_size=num_ranks,
         )
 
         if block_index < comm_block_count:
@@ -237,23 +280,24 @@ def _compile(
                 sym_layout.pool_scale_ptr, num_records_bytes=pool_scale_bytes_raw
             )
             ps_res = create_buffer_resource(POOL_SCALE_PS, max_size=True)
-            sb_ps = sym_layout.scoreboard_ptr
             for _r in range(_ps_rounds):
                 block_m_ps = ps_index + fx.Int32(_r * num_preshuffle_cu)
                 if block_m_ps < real_tiles:
-                    exp_ps = buffer_load(expected_resource, block_m_ps, vec_width=1, dtype=fx.T.i32())
+                    # epoch gate: wait this block's expert to receive all num_ranks arrivals
+                    # (dispatch_flag[bank + expert] == cumulative expected). expert = tile_to_group.
+                    expert_ps = buffer_load(group_resource, block_m_ps, vec_width=1, dtype=fx.T.i32())
                     if thread_index == fx.Int32(0):
                         spin_start = read_clock()
-                        sig = ld(sb_ps, block_m_ps, scope="sys")
-                        while sig < exp_ps:
+                        sig = ld(dispatch_flag_local, bank_offset + expert_ps, scope="sys", dtype=fx.T.i64())
+                        while sig != expected_dispatch:
                             fx.rocdl.s_sleep(fx.Int32(2))
                             if spin_timed_out(spin_start):
                                 fx.printf(
-                                    "MEGA mxfp8 preshuffle gate timeout: block={} sig={} exp={}\n",
-                                    block_m_ps, sig, exp_ps,
+                                    "MEGA mxfp8 preshuffle gate timeout: block={} expert={} sig={} exp={}\n",
+                                    block_m_ps, expert_ps, sig, expected_dispatch,
                                 )
                                 spin_start = read_clock()
-                            sig = ld(sb_ps, block_m_ps, scope="sys")
+                            sig = ld(dispatch_flag_local, bank_offset + expert_ps, scope="sys", dtype=fx.T.i64())
                     # ACQUIRE the peer-pushed raw pool_scale. Default ps_read_cm=1: glc coherent read
                     # (in the transpose loads below), skip buffer_inv (comm already l2_writeback'd the
                     # push to the coherent point before the sys signal). ps_read_cm=0 -> buffer_inv.
@@ -288,7 +332,8 @@ def _compile(
                         l2_writeback()
                     fx.gpu.barrier()
                     if thread_index == fx.Int32(0):
-                        st(sb_ps, block_m_ps, fx.Int32(_PS_SENTINEL), scope="sys")
+                        # epoch handoff to gemm: preshuffle_flag[bank + block] = cumulative expected_ps
+                        st(preshuffle_flag_local, bank_offset + block_m_ps, expected_ps, scope="sys")
         else:
             # GEMM role: one NT output tile (block_m, block_n) of the grouped L1 GEMM.
             tile_index = block_index - fx.Int32(_gemm_base)
@@ -306,19 +351,19 @@ def _compile(
                 block_m = first_pid_m + (pid_in_group % group_size_m)
                 block_n = pid_in_group // group_size_m
                 c_m_real = fx.Int32(num_max_pool_tokens)
-                sb_base = sym_layout.scoreboard_ptr
-                # wait for the preshuffle role's SENTINEL (block_m's A-scale is in pool_scale_ps).
+                # wait for the preshuffle role's epoch handoff (block_m's A-scale is in pool_scale_ps).
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
-                    signal = ld(sb_base, block_m, scope="sys")
-                    while signal < fx.Int32(_PS_SENTINEL):
+                    signal = ld(preshuffle_flag_local, bank_offset + block_m, scope="sys", dtype=fx.T.i64())
+                    while signal != expected_ps:
                         fx.rocdl.s_sleep(fx.Int32(2))
                         if spin_timed_out(spin_start):
                             fx.printf(
-                                "MEGA mxfp8 GEMM gate timeout: block={} signal={}\n", block_m, signal
+                                "MEGA mxfp8 GEMM gate timeout: block={} signal={} exp={}\n",
+                                block_m, signal, expected_ps,
                             )
                             spin_start = read_clock()
-                        signal = ld(sb_base, block_m, scope="sys")
+                        signal = ld(preshuffle_flag_local, bank_offset + block_m, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
                 l2_invalidate()  # acquire: see peer-written pool_fp8 + role-written pool_scale_ps
                 fx.gpu.barrier()
@@ -373,9 +418,17 @@ def _compile(
         TILE_TO_GROUP,
         EXPECTED,
         NUM_TILE_BLOCKS,
+        DISP_PARITY,
+        DISP_EXPECTED,
+        PS_EXPECTED,
         c_n: int,
         stream: fx.Stream = fx.Stream(None),
     ):
+        # bump epoch on device (dispatch += num_ranks, preshuffle += 1) before the kernel;
+        # same-stream ordering makes the bumped parity/expected visible to the kernel.
+        _make_epoch_bump(int(num_ranks), 1)(DISP_PARITY, DISP_EXPECTED, PS_EXPECTED).launch(
+            grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
+        )
         dispatch_grouped_gemm_mxfp8_kernel(
             XQ,
             XS,
@@ -392,6 +445,9 @@ def _compile(
             TILE_TO_GROUP,
             EXPECTED,
             NUM_TILE_BLOCKS,
+            DISP_PARITY,
+            DISP_EXPECTED,
+            PS_EXPECTED,
             c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(_grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -428,8 +484,9 @@ def dispatch_grouped_gemm_mxfp8(
     ScaleBComb). ``w1q`` [G, N, K] fp8 weights + ``w1s`` [G, N, K//32] raw E8M0.
     Returns L1 out [num_max_pool_tokens, N] bf16.
 
-    NOTE: the caller must zero ``symm.scoreboard`` (cross-rank, barrier-bracketed) before the
-    launch so the per-block sentinel handoff starts clean."""
+    Self-resetting: the comm->preshuffle (``dispatch_flag``) and preshuffle->gemm
+    (``preshuffle_flag``) gates are double-banked + device epoch-bumped, so no host scoreboard
+    reset / rendezvous is needed (the epoch tensors ride on ``symm``)."""
     # bf16 activation -> one global rowwise mxfp8 quant here (matches the per-forward cost living
     # inside this op); pre-quantized fp8 tokens skip it.
     if xq.dtype == torch.bfloat16:
@@ -515,6 +572,9 @@ def dispatch_grouped_gemm_mxfp8(
         tile_to_expert,
         expected_count,
         num_tile_blocks,
+        symm._disp_parity,
+        symm._disp_expected,
+        symm._ps_expected,
         c_n,
         torch.cuda.current_stream(),
     )
@@ -561,9 +621,9 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     Takes the pre-quantized weight (``w1q`` [G,*,K] fp8 + ``w1s`` raw E8M0; prepared version-keyed by
     the caller -- fc1 weight for forward, ``w2^T`` for the STEP1 dgrad). When ``handle is None``
     (forward), builds the symmetric workspace + dispatch-prologue handle from ``topk_idx`` /
-    ``topk_weights``; otherwise reuses the live symm buffer + the given handle (backward). Publishes
-    the cross-rank scoreboard reset (barrier-bracketed) and runs the fused dispatch-PUSH + grouped
-    mxfp8 GEMM (token quant folded in via the bf16-x path).
+    ``topk_weights``; otherwise reuses the live symm buffer + the given handle (backward). Runs the
+    fused dispatch-PUSH + grouped mxfp8 GEMM (token quant folded in via the bf16-x path); the comm
+    gates self-reset via the device epoch (no host scoreboard rendezvous).
 
     Returns ``(l1, handle, dispatch_weights, pool_x_fp8)`` where ``l1`` is the GEMM output (fc1 out
     for forward, grad_swiglu for STEP1), ``dispatch_weights`` is ``symm.weight_recv_buf`` (per-pool-row
@@ -595,10 +655,8 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     else:
         symm = get_symm_buffer_for_mega_moe()  # live buffer from a prior forward
         sym_layout = symm.make_sym_layout()
-    # publish scoreboard=0 cross-rank before the L1 comm signals (per-pool-block sentinel handoff)
-    _host_rendezvous(group)
-    symm.scoreboard.zero_()
-    _host_rendezvous(group)
+    # epoch self-reset: dispatch_flag/preshuffle_flag are double-banked + device epoch-bumped, so
+    # NO host rendezvous + scoreboard zero (that per-call synchronize()+barrier() is gone).
     l1 = dispatch_grouped_gemm_mxfp8(
         x, None, w1q, w1s, handle, sym_layout, symm,
         num_dispatch_cu=num_dispatch_cu, num_preshuffle_cu=num_preshuffle_cu, BM=BM, BN=BN,

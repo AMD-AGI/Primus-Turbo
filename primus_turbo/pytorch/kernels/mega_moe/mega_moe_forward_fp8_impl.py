@@ -4,17 +4,15 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Fused mega MoE MXFP8 forward orchestration (FlyDSL): L1 fused dispatch+fc1 (NT) + SwiGLU + L2 fp8 combine.
+"""Fused mega MoE MXFP8 forward (FlyDSL): L1 dispatch+fc1 (NT) -> SwiGLU -> L2 fp8 combine.
 
-fp8 sibling of the bf16 ``mega_moe_forward_impl`` (``mega_moe_forward_impl.py``). Unlike bf16 this is
-a PLAIN orchestration function, NOT a ``torch.library.custom_op`` / ``AutoKernelDispatcher`` backend:
-the fp8 path carries state the custom_op schema can't hold -- reuse of the forward's live symmetric
-buffer in backward, host ``synchronize()`` + ``group.barrier()`` rendezvous, and derived non-tensor
-handles. The bf16 ``w1`` / ``w2`` stay the differentiable inputs; their mxfp8 quant is maintained
-here by version-keyed caches keyed on ``w._version`` (no caller-supplied prequant tuples).
+A plain orchestration function (not a custom_op): the fp8 path carries state the schema can't hold
+(live symm buffer reused in backward, non-tensor handles). The comm gates now self-reset via a
+device epoch (no host synchronize()+barrier() rendezvous). ``w1`` / ``w2`` stay the differentiable
+inputs; their mxfp8 quant is version-keyed on ``w._version``.
 """
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from torch.distributed import ProcessGroup
@@ -58,14 +56,14 @@ def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
 
 
 def _w1_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Version-keyed fc1 weight prep -> ``(w1q [G,2I,H] fp8, w1s [G,2I,H//32] raw E8M0)``. The L1
+    """Version-keyed L1 (fc1) weight prep -> ``(w1q [G,2I,H] fp8, w1s [G,2I,H//32] raw E8M0)``. The L1
     dispatch GEMM takes the raw quant and preshuffles the weight scale internally, so this is just
     the grouped mxfp8 (E4M3) quant."""
     return _version_keyed_weight_prep(w1, _W1_PREP_ATTR, prepare_w1_fp8)
 
 
 def _w2_fp8_cached(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Version-keyed fc2 weight prep -> ``(weight_flat int8 [G*H*I], b_sp int32 preshuffled scale)``.
+    """Version-keyed L2 (fc2) weight prep -> ``(weight_flat int8 [G*H*I], b_sp int32 preshuffled scale)``.
     Unlike w1, the L2 combine is pure-compute (no internal quant/preshuffle), so quant + ScaleBComb
     preshuffle + int8-flat are baked here by ``prepare_w2_fp8``."""
     return _version_keyed_weight_prep(w2, _W2_PREP_ATTR, prepare_w2_fp8)
@@ -80,12 +78,12 @@ def mega_moe_forward_fp8_impl(
     group: ProcessGroup,
     block_m: int,
     block_n: int,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]], tuple]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], tuple]:
     """Fused mxfp8 MoE forward: L1 (dispatch + fc1, NT) -> SwiGLU (bf16) -> L2 fp8 combine.
 
     ``topk_idx`` must already be int64 (the op layer converts). Returns
-    ``(y, l1, dispatch_weights, pool_x_fp8, handle)``: ``l1`` = fc1 output [P, 2I];
-    ``dispatch_weights`` = per-pool-row routing weight; ``pool_x_fp8`` = fc1-input pool in rowwise-fp8
+    ``(y, l1, dispatch_weights, pool_x_fp8, handle)``: ``l1`` = L1 (fc1) output [P, 2I];
+    ``dispatch_weights`` = per-pool-row routing weight; ``pool_x_fp8`` = L1-input pool in rowwise-fp8
     ``(pool_fp8 [P,H], pool_scale [P,H//32])`` for a LOCAL dW1 wgrad; ``handle`` = dispatch prologue
     tuple. The backward operands are LIVE symm-pool views (not cloned)."""
     # w1 fp8 prep -> (w1q, w1s), version-keyed on w1._version -- symmetric with the w2 prep below.
