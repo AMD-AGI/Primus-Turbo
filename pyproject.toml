@@ -38,3 +38,27 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+parallel = true
+concurrency = ["multiprocessing", "thread"]
+source = ["primus_turbo"]
+omit = [
+    "primus_turbo/_version.py",
+    "primus_turbo/_build_info.py",
+    "*/tests/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+omit = [
+    "primus_turbo/triton/*",
+    "primus_turbo/flydsl/*",
+]
+
+[tool.coverage.paths]
+source = ["primus_turbo/", "*/primus_turbo/"]

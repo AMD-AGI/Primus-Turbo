@@ -173,6 +173,14 @@ jobs:
           pip3 install -r requirements.txt
           pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@${AITER_VERSION}"
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" pip3 install --no-build-isolation -e ".[pytorch]" -v
+      - name: Prepare coverage environment
+        run: |
+          # Enable coverage in test subprocesses (spawned by distributed tests)
+          # and clear stale data files left over from retried/previous runs.
+          echo "COVERAGE_PROCESS_START=$(pwd)/pyproject.toml" >> $GITHUB_ENV
+          SITE_PACKAGES=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          echo "import coverage; coverage.process_startup()" > "${SITE_PACKAGES}/coverage_subprocess.pth"
+          rm -f .coverage .coverage.*
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
@@ -182,7 +190,7 @@ jobs:
           command: >
             timeout -k 60s 130m
             bash -lc
-            "exec pytest -v tests/pytorch -n 8 --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO"
+            "exec pytest -v tests/pytorch -n 8 --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append"
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run deterministic tests (parallel)
@@ -194,7 +202,7 @@ jobs:
           command: >
             timeout -k 60s 55m
             bash -lc
-            "exec pytest -v tests/pytorch -n 8 --deterministic-only --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO"
+            "exec pytest -v tests/pytorch -n 8 --deterministic-only --timeout=600 --timeout-method=thread --max-worker-restart=8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append"
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run distributed tests
@@ -202,9 +210,21 @@ jobs:
         with:
           timeout_minutes: 60
           max_attempts: 2
-          command: pytest -v tests/pytorch --dist-only --timeout=600 --timeout-method=thread --log-cli-level=INFO
+          command: pytest -v tests/pytorch --dist-only --timeout=600 --timeout-method=thread --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      - name: Combine and stage coverage data
+        if: always()
+        run: |
+          coverage combine --append || true
+          cp .coverage coverage_data_pytorch || true
+      - name: Upload coverage data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-pytorch
+          path: coverage_data_pytorch
+          if-no-files-found: warn
 
   unittest-jax-gfx942:
     needs: code-lint
@@ -257,12 +277,20 @@ jobs:
           unset AITER_ASM_DIR
           pip3 install -r requirements.txt
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="JAX" pip3 install --no-build-isolation -e ".[jax]" -v
+      - name: Prepare coverage environment
+        run: |
+          # Enable coverage in test subprocesses (spawned by distributed tests)
+          # and clear stale data files left over from retried/previous runs.
+          echo "COVERAGE_PROCESS_START=$(pwd)/pyproject.toml" >> $GITHUB_ENV
+          SITE_PACKAGES=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          echo "import coverage; coverage.process_startup()" > "${SITE_PACKAGES}/coverage_subprocess.pth"
+          rm -f .coverage .coverage.*
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 60
           max_attempts: 2
-          command: pytest -v tests/jax -n 8 --log-cli-level=INFO
+          command: pytest -v tests/jax -n 8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       # Keep in-process multi-GPU tests and distributed/per-process tests in
@@ -275,7 +303,7 @@ jobs:
         with:
           timeout_minutes: 30
           max_attempts: 2
-          command: pytest -v tests/jax --dist-only --ignore=tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO
+          command: pytest -v tests/jax --dist-only --ignore=tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run distributed tests
@@ -283,6 +311,76 @@ jobs:
         with:
           timeout_minutes: 30
           max_attempts: 2
-          command: pytest -v tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO
+          command: pytest -v tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
         env:
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      - name: Combine and stage coverage data
+        if: always()
+        run: |
+          coverage combine --append || true
+          cp .coverage coverage_data_jax || true
+      - name: Upload coverage data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-jax
+          path: coverage_data_jax
+          if-no-files-found: warn
+
+  coverage-report:
+    needs: [unittest-pytorch-gfx942, unittest-jax-gfx942]
+    # Run whenever the GPU jobs were eligible to run, even if some failed, so we
+    # still merge whatever coverage data is available.
+    if: >-
+      always() &&
+      (github.event_name != 'pull_request' ||
+       contains(github.event.pull_request.labels.*.name, 'ci:gpu'))
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - run: echo "🎉 Begin Primus-Turbo Coverage Merge."
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install coverage
+        run: pip install "coverage[toml]"
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage-artifacts
+          merge-multiple: true
+      - name: Merge coverage data and generate reports
+        run: |
+          shopt -s nullglob
+          data_files=(coverage-artifacts/coverage_data_*)
+          if [ ${#data_files[@]} -eq 0 ]; then
+            echo "No coverage data found; skipping merge." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Combine the raw per-framework data files into one line-level dataset.
+          coverage combine "${data_files[@]}"
+          coverage report
+          coverage html -d visual-coverage
+          coverage json -o coverage.json
+          python tools/ci/coverage_summary.py coverage.json \
+            >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload combined coverage report
+        id: upload_combined
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-coverage
+          path: visual-coverage
+          if-no-files-found: warn
+      - name: Link coverage artifact in run summary
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "Full HTML report: download the **visual-coverage** artifact ([direct link](${{ steps.upload_combined.outputs.artifact-url }})), unzip and open \`visual-coverage/index.html\`."
+          } >> "$GITHUB_STEP_SUMMARY"

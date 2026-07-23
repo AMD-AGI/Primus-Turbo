@@ -7,6 +7,8 @@ expecttest
 pytest
 pytest-xdist
 pytest-timeout
+pytest-cov
+coverage[toml]
 setuptools==69.5.1
 setuptools_scm[toml]>=8
 wheel
