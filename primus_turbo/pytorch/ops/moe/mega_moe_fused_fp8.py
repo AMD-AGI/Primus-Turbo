@@ -75,6 +75,12 @@ class MegaMoEFusedFP8Function(torch.autograd.Function):
             )
 
             if save_bwd:
+                # dispatch_weights / pool_x_fp8 are LIVE views into the shared symm pool -> clone
+                # before a later stage (backward STEP1 dispatch(dy), or the next forward) overwrites
+                # it. l1 is a fresh dispatch-GEMM output (not a symm view), so it needs no clone.
+                dispatch_weights = dispatch_weights.clone()
+                pool_x_fp8 = (pool_x_fp8[0].clone(), pool_x_fp8[1].clone())
+
                 ctx.group = group
                 ctx.num_tokens = x.shape[0]
                 ctx.num_topk = num_topk
