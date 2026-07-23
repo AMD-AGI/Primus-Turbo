@@ -703,10 +703,18 @@ def profile_fc1_dgrad_combine(group, args, mode):
     fin = bool(torch.isfinite(dx_fp8.float()).all())
     dx_norm = float(dx_fp8.float().norm())
     t_fp8 = _bench(_fp8, warmup=args.warmup, iters=args.iters, group=group, reset=_reset_fp8)
+    if rank == 0:  # emit fp8 STEP3 NOW so it survives a bf16-ref-leg abort at large T (see below)
+        _tf = flops / (t_fp8 * 1e-3) / 1e12
+        print(f"  [STEP3 fp8] {t_fp8:.3f} ms | {_tf:.1f} TFLOPS  dx finite={fin} (norm={dx_norm:.3e}; "
+              f"M_pool={m_pad})", flush=True)
     symm.destroy()
     torch.cuda.synchronize(); group.barrier()
 
-    # ── bf16 leg: bf16 stack -- shipped dispatch for a handle + realistic grad_l1 replica, combine(nn) ──
+    # ── bf16 leg: bf16 stack -- shipped dispatch for a handle + realistic grad_l1 replica, combine(nt) ──
+    # KNOWN: this bf16 REFERENCE combine (K=2I=4096) OOBs (SIGABRT) at large T (T=8192), for both nt
+    # and nn layouts -- an untested large-K bf16-combine config. It is UNRELATED to the fp8 STEP3
+    # (validated fine at T=8192: standalone 3.19 ms + e2e dx SNR 21.9 dB). The fp8 result above is
+    # printed before this leg so it survives a bf16-leg abort; the bf16 ref is clean at T<=2048.
     l1_bf, _, _, hbf = dispatch_grouped_gemm_bf16_flydsl_kernel(
         x, W1, group, handle=None, topk_idx=topk_idx, topk_weights=topk_w, layout="nt", BM=BM, BN=BN,
     )
@@ -714,8 +722,8 @@ def profile_fc1_dgrad_combine(group, args, mode):
     w1t_bf = W1.transpose(1, 2).contiguous()                   # [G, H, 2I] (NT-reuse, matches fp8 w1^T)
     tidx32 = topk_idx.to(torch.int32).contiguous().view(-1)    # bf16 combine takes int32
 
-    def _bf16():  # shipped bf16 combine (nt = w1^T reuse, the L2-validated layout); gate scatter
-        dx, _ = grouped_gemm_combine_bf16_flydsl_kernel(       # omitted -> core GEMM+push+reduce compare
+    def _bf16():  # shipped bf16 combine (nt = w1^T reuse, matches fp8 STEP3's weight)
+        dx, _ = grouped_gemm_combine_bf16_flydsl_kernel(
             grad_l1_bf, w1t_bf, hbf, topk_indices=tidx32, layout="nt", BM=BM, BN=BN,
         )
         return dx
