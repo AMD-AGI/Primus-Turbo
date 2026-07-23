@@ -21,7 +21,7 @@ entire EP dispatch handle over caller-owned (symmetric) buffers:
 
 All symmetric sub-buffers (cross-rank ``c_buffer`` / ``signal`` / ``origin_rank`` /
 ``origin_slot`` / ``weight_recv_buf``, plus the device scalars / barrier / profile /
-``scoreboard`` / ``barrier_local`` regions) are named by a single ``SymLayout`` struct
+epoch-flag regions) are named by a single ``SymLayout`` struct
 (``sym_layout.py``) passed to the kernel by value -- the kernel computes every address
 from the struct's two heap bases + per-region byte offsets + per-peer delta tables.
 The dispatch handle is returned as a plain tuple handle (DeepEP-style) the
@@ -104,8 +104,6 @@ def _make_dispatch_prologue(
     total_pairs = num_tokens * num_topk
     grid_stride = grid_blocks * block_threads
     num_pool_blocks = num_max_pool_tokens // block_m  # pool-block capacity
-    # scoreboard + barrier_local reset in-kernel (folds out two host zeroing launches):
-    combine_slots = num_topk * num_tokens  # per-rank combine slots (= barrier_local len)
     c_buffer_bytes = world_size * num_experts * 4
     origin_buffer_bytes = num_max_pool_tokens * 4
     # WORKSPACE = one [5 * num_experts] i32 scratch tensor; named sub-regions by offset.
@@ -474,23 +472,9 @@ def _make_dispatch_prologue(
                 buffer_store(routing_weight, peer_weight_resource, destination_row)
             pair_index = pair_index + fx.Int32(grid_stride)
 
-        # ---- Reset the cross-rank signal buffers in-kernel (replaces two host zero launches).
-        # scoreboard -> 0 (dispatch handshake); barrier_local -> -1 (combine flags, raised
-        # >=0 by role 1). The grid_sync below + Phase E publish these locally + cross-rank.
-        scoreboard_resource = create_buffer_resource_from_addr(
-            sl.scoreboard_ptr, num_records_bytes=num_pool_blocks * 4
-        )
-        barrier_local_resource = create_buffer_resource_from_addr(
-            sl.barrier_local_ptr, num_records_bytes=combine_slots * 4
-        )
-        signal_block_index = block_index * fx.Int32(block_threads) + thread_index
-        while signal_block_index < fx.Int32(num_pool_blocks):
-            buffer_store(fx.Int32(0), scoreboard_resource, signal_block_index)
-            signal_block_index = signal_block_index + fx.Int32(grid_stride)
-        flag_slot_index = block_index * fx.Int32(block_threads) + thread_index
-        while flag_slot_index < fx.Int32(combine_slots):
-            buffer_store(fx.Int32(-1), barrier_local_resource, flag_slot_index)
-            flag_slot_index = flag_slot_index + fx.Int32(grid_stride)
+        # NOTE: the old in-kernel scoreboard=0 / barrier_local=-1 resets are GONE. Those flags are
+        # now the double-banked epoch flags (dispatch_flag / reduce_flag), self-reset by each op's
+        # device epoch bump -> the prologue must NOT touch them (a reset would corrupt the epoch).
 
         grid_sync(sl, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/D:scatter-done")
 

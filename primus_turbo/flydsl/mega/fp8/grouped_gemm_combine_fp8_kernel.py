@@ -47,6 +47,7 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 
 from primus_turbo.flydsl.mega.fp8.combine_config import _BLOCK_THREADS, _NUM_WARPS, _WARP
+from primus_turbo.flydsl.mega.prims import cast
 from primus_turbo.flydsl.mega.fp8.prims import (
     _wait_mem,
     atomic_add,
@@ -72,10 +73,37 @@ from primus_turbo.flydsl.mega.fp8.gemm_helper import (
 _WT = 16  # cache_modifier sc1 = write-through
 
 
+@functools.lru_cache(maxsize=4)
+def _make_epoch_bump(add_combine, add_reduce):
+    """Single-block device kernel: flip the flag parity, bump combine/reduce expected[new_parity].
+
+    Mirrors the bf16 combine's ``_make_epoch_bump``. Launched on the combine stream just before the
+    main kernel so the flags self-reset (no host synchronize()+barrier() rendezvous, no cross-call
+    reset race): the flag banks are never zeroed; each call spins on the cumulative per-bank
+    ``expected`` instead."""
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def epoch_bump_kernel(PARITY: fx.Tensor, COMBINE_EXP: fx.Tensor, REDUCE_EXP: fx.Tensor):
+        if fx.thread_idx.x == fx.Int32(0):
+            parity_res = create_buffer_resource(PARITY, max_size=True)
+            combine_res = create_buffer_resource(COMBINE_EXP, max_size=True)
+            reduce_res = create_buffer_resource(REDUCE_EXP, max_size=True)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            buffer_store(new_parity, parity_res, fx.Int32(0))
+            idx = cast(new_parity, fx.T.i32())
+            new_combine = buffer_load(combine_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_combine)
+            buffer_store(new_combine, combine_res, idx)
+            new_reduce = buffer_load(reduce_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_reduce)
+            buffer_store(new_reduce, reduce_res, idx)
+
+    return epoch_bump_kernel
+
+
 # ─────────── role COMBINE: read LOCAL fp8 L2Y -> push peer packed comb (pure copy) + flags ───────────
 def combine_copy_fp8_tile(
     *, thread_index, block_m_size, hidden, comb_records, H4, SC, payload_i32_total,
     l2y_fp8_res, l2y_scale_res, origin_rank_res, origin_slot_res, comb_base, signal_delta_res, barrier_base,
+    reduce_bank, expected_reduce,
     with_gate=False, grad_gate_res=None, gate_base=None, main_delta_res=None, gate_records=0,
 ):
     """FP8 combine PUSH: read local fp8 L2Y row -> push packed fp8 payload + E8M0 to the peer
@@ -122,9 +150,12 @@ def combine_copy_fp8_tile(
                     gate_addr = gate_base + buffer_load(main_delta_res, origin, vec_width=1, dtype=fx.T.i64())
                     gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
                     buffer_store(gate_value, gate_peer, slot)
+                # epoch flag: write the cumulative reduce target into the peer's reduce_flag bank
+                # (never reset; the reduce spins on == expected_reduce). reduce_bank uses OUR parity,
+                # which equals the peer's by lockstep, so it lands in the peer's current bank.
                 barrier_addr = barrier_base + delta
                 _wait_mem()
-                st(barrier_addr, slot, fx.Int32(1), scope="sys")
+                st(barrier_addr, reduce_bank + slot, expected_reduce, scope="sys")
 
             _emit_if_then(origin >= fx.Int32(0), _emit_row)
 
@@ -139,7 +170,8 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots):
     words_per_lane = H4 // _WARP
 
     def _reduce(thread_index, base_pid, total_warps, num_experts, rank, comb_base, comb_records,
-                output_res, topk_indices_res, num_tokens_res, barrier_base, topk_weights_res):
+                output_res, topk_indices_res, num_tokens_res, barrier_base, reduce_bank, expected_reduce,
+                topk_weights_res):
         _v2 = fx.T.VectorType.get([2], fx.T.f32())
         f32_v4 = fx.T.VectorType.get([4], fx.T.f32())
         bf16_v4 = fx.T.VectorType.get([4], fx.T.bf16())
@@ -158,14 +190,14 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots):
                     if topk_index < fx.Int64(num_experts):
                         if lane == fx.Int32(0):
                             spin_start = read_clock()
-                            flag = ld(barrier_base, slot, scope="agent")
-                            while flag < fx.Int32(0):
+                            flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
+                            while flag != expected_reduce:
                                 fx.rocdl.s_sleep(fx.Int32(1))
                                 if spin_timed_out(spin_start):
                                     fx.printf("MEGA fp8 ep reduce flag timeout: rank={} token={} slot={}\n",
                                               fx.Int32(rank), token, slot)
                                     spin_start = read_clock()
-                                flag = ld(barrier_base, slot, scope="agent")
+                                flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
             _wait_mem()
 
             for k in fx.range_constexpr(words_per_lane):
@@ -191,13 +223,7 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots):
                     acc = fx.arith.addf(acc, term)
                 buffer_store(fx.arith.trunc_f(bf16_v4, acc), output_res, token * fx.Int32(hidden) + w * fx.Int32(4))
 
-            for jj in fx.range_constexpr(topk):
-                slot = token * fx.Int32(topk) + fx.Int32(jj)
-                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
-                if topk_index >= fx.Int64(0):
-                    if topk_index < fx.Int64(num_experts):
-                        if lane == fx.Int32(0):
-                            st(barrier_base, slot, fx.Int32(-1), scope="agent")
+            # epoch flags self-reset (double-banked, cumulative expected) -> NO consuming store.
             token = token + total_warps
 
     return ASTRewriter.transform(_reduce)
@@ -215,7 +241,8 @@ def _make_topk_reduce_fp8_bwd(hidden, topk, combine_slots):
     words_per_lane = H4 // _WARP
 
     def _reduce(thread_index, base_pid, total_warps, num_experts, rank, comb_base, comb_records,
-                output_res, topk_indices_res, num_tokens_res, barrier_base, gate_local_res, d_topk_w_res):
+                output_res, topk_indices_res, num_tokens_res, barrier_base, reduce_bank, expected_reduce,
+                gate_local_res, d_topk_w_res):
         _v2 = fx.T.VectorType.get([2], fx.T.f32())
         f32_v4 = fx.T.VectorType.get([4], fx.T.f32())
         bf16_v4 = fx.T.VectorType.get([4], fx.T.bf16())
@@ -234,14 +261,14 @@ def _make_topk_reduce_fp8_bwd(hidden, topk, combine_slots):
                     if topk_index < fx.Int64(num_experts):
                         if lane == fx.Int32(0):
                             spin_start = read_clock()
-                            flag = ld(barrier_base, slot, scope="agent")
-                            while flag < fx.Int32(0):
+                            flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
+                            while flag != expected_reduce:
                                 fx.rocdl.s_sleep(fx.Int32(1))
                                 if spin_timed_out(spin_start):
                                     fx.printf("MEGA fp8 ep bwd reduce flag timeout: rank={} token={} slot={}\n",
                                               fx.Int32(rank), token, slot)
                                     spin_start = read_clock()
-                                flag = ld(barrier_base, slot, scope="agent")
+                                flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
             _wait_mem()
 
             for k in fx.range_constexpr(words_per_lane):
@@ -268,10 +295,7 @@ def _make_topk_reduce_fp8_bwd(hidden, topk, combine_slots):
             for jj in fx.range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(jj)
                 topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
-                if topk_index >= fx.Int64(0):
-                    if topk_index < fx.Int64(num_experts):
-                        if lane == fx.Int32(0):
-                            st(barrier_base, slot, fx.Int32(-1), scope="agent")
+                # epoch flags self-reset (double-banked) -> NO consuming store; only the d_topk_w fold.
                 if lane == fx.Int32(0):
                     # d_topk_w[slot] = combine_gate[slot] for valid routes else 0 (folds the host
                     # combine_gate * (topk_idx>=0) mask into a fresh buffer).
@@ -343,6 +367,7 @@ def _compile(
         ACT: fx.Tensor, WEIGHTS: fx.Tensor, L2Y_FP8: fx.Tensor, L2Y_SCALE: fx.Tensor,
         TILE_TO_GROUP: fx.Tensor, NUM_TILE_BLOCKS: fx.Tensor, OUTPUT: fx.Tensor, TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor, TOPK_WEIGHTS: fx.Tensor, A_SCALE: fx.Tensor, B_SCALE: fx.Tensor,
+        COMBINE_PARITY: fx.Tensor, COMBINE_EXPECTED: fx.Tensor, REDUCE_EXPECTED: fx.Tensor,
         sym_layout: SymLayout, c_n: fx.Int32,
     ):
         thread_index = fx.thread_idx.x
@@ -352,9 +377,20 @@ def _compile(
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
-        sb_l2_base = sym_layout.sb_l2_ptr
+        combine_flag_base = sym_layout.combine_flag_ptr
         comb_base = sym_layout.comb_ptr
-        barrier_base = sym_layout.barrier_local_ptr
+        reduce_flag_base = sym_layout.reduce_flag_ptr
+        # ---- epoch: parity picks the flag bank; expected[parity] is the cumulative spin target ----
+        combine_parity_res = create_buffer_resource(COMBINE_PARITY, max_size=True)
+        combine_expected_res = create_buffer_resource(COMBINE_EXPECTED, max_size=True)
+        reduce_expected_res = create_buffer_resource(REDUCE_EXPECTED, max_size=True)
+        parity = cast(
+            buffer_load(combine_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
+        )
+        combine_bank = parity * fx.Int32(worst_case_tiles)
+        reduce_bank = parity * fx.Int32(combine_slots)
+        expected_combine = buffer_load(combine_expected_res, parity, vec_width=1, dtype=fx.T.i64())
+        expected_reduce = buffer_load(reduce_expected_res, parity, vec_width=1, dtype=fx.T.i64())
         l2y_fp8_res = create_buffer_resource(L2Y_FP8, max_size=True)
         l2y_scale_res = create_buffer_resource(L2Y_SCALE, max_size=True)
         signal_delta_res = create_buffer_resource_from_addr(
@@ -376,21 +412,21 @@ def _compile(
                 thread_index=thread_index, block_m_size=BLOCK_M, hidden=out_features, comb_records=comb_records,
                 H4=H4, SC=SC, payload_i32_total=payload_i32_total, l2y_fp8_res=l2y_fp8_res,
                 l2y_scale_res=l2y_scale_res, origin_rank_res=origin_rank_res, origin_slot_res=origin_slot_res,
-                comb_base=comb_base, signal_delta_res=signal_delta_res, barrier_base=barrier_base,
+                comb_base=comb_base, signal_delta_res=signal_delta_res, barrier_base=reduce_flag_base,
+                reduce_bank=reduce_bank, expected_reduce=expected_reduce,
             )
             local_count = (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
             for tile_iter in range(local_count):
                 block_m = block_index + tile_iter * combine_cu
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
-                    sig = ld(sb_l2_base, block_m, scope="agent")
-                    while sig < fx.Int32(n_blocks):
+                    sig = ld(combine_flag_base, combine_bank + block_m, scope="agent", dtype=fx.T.i64())
+                    while sig != expected_combine:
                         fx.rocdl.s_sleep(fx.Int32(2))
                         if spin_timed_out(spin_start):
                             fx.printf("MEGA fp8 ep combine gate timeout: block={} sig={}\n", block_m, sig)
                             spin_start = read_clock()
-                        sig = ld(sb_l2_base, block_m, scope="agent")
-                    st(sb_l2_base, block_m, fx.Int32(0), scope="agent")
+                        sig = ld(combine_flag_base, combine_bank + block_m, scope="agent", dtype=fx.T.i64())
                 fx.gpu.barrier()
                 l2_invalidate()
                 push_block(block_m)
@@ -424,7 +460,7 @@ def _compile(
                 fx.gpu.barrier()
                 _emit_if_then(
                     thread_index == fx.Int32(0),
-                    lambda: atomic_add(sb_l2_base, block_m, fx.Int32(1), scope="agent"),
+                    lambda: atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1), scope="agent"),
                 )
 
             if const_expr(_no_reduce):
@@ -438,7 +474,7 @@ def _compile(
                     reduce_fp8(
                         thread_index, block_index - combine_cu, fx.Int32(dedicated_reduce_warps),
                         num_experts, rank, comb_base, comb_records, output_res, topk_indices_res,
-                        num_tokens_res, barrier_base, topk_weights_res,
+                        num_tokens_res, reduce_flag_base, reduce_bank, expected_reduce, topk_weights_res,
                     )
                 else:
                     if block_m < real_tiles:
@@ -450,19 +486,26 @@ def _compile(
                         ) * fx.Int32(_NUM_WARPS)
                         reduce_fp8(
                             thread_index, empty_ordinal, total_empty_warps, num_experts, rank, comb_base,
-                            comb_records, output_res, topk_indices_res, num_tokens_res, barrier_base, topk_weights_res,
+                            comb_records, output_res, topk_indices_res, num_tokens_res, reduce_flag_base,
+                            reduce_bank, expected_reduce, topk_weights_res,
                         )
 
     @flyc.jit
     def launch(
         ACT, WEIGHTS, L2Y_FP8, L2Y_SCALE, TILE_TO_GROUP, NUM_TILE_BLOCKS, OUTPUT, TOPK_INDICES,
-        NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, A_SCALE, B_SCALE, sym_layout, c_n: int,
+        NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, A_SCALE, B_SCALE,
+        COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED, sym_layout, c_n: int,
         stream: fx.Stream = fx.Stream(None),
     ):
         grid_size = gemm_base + worst_case_tiles * n_blocks
+        # bump epoch on device (combine += n_blocks, reduce += 1) before the kernel; same-stream visible
+        _make_epoch_bump(int(n_blocks), 1)(COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED).launch(
+            grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
+        )
         kern(
             ACT, WEIGHTS, L2Y_FP8, L2Y_SCALE, TILE_TO_GROUP, NUM_TILE_BLOCKS, OUTPUT, TOPK_INDICES,
-            NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, A_SCALE, B_SCALE, sym_layout, c_n,
+            NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, A_SCALE, B_SCALE,
+            COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED, sym_layout, c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -529,7 +572,9 @@ def _compile_bwd(
         ACT: fx.Tensor, WEIGHTS: fx.Tensor, L2Y_FP8: fx.Tensor, L2Y_SCALE: fx.Tensor,
         TILE_TO_GROUP: fx.Tensor, NUM_TILE_BLOCKS: fx.Tensor, OUTPUT: fx.Tensor, TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor, GRAD_GATE: fx.Tensor, D_TOPK_W: fx.Tensor,
-        A_SCALE: fx.Tensor, B_SCALE: fx.Tensor, sym_layout: SymLayout, c_n: fx.Int32,
+        A_SCALE: fx.Tensor, B_SCALE: fx.Tensor,
+        COMBINE_PARITY: fx.Tensor, COMBINE_EXPECTED: fx.Tensor, REDUCE_EXPECTED: fx.Tensor,
+        sym_layout: SymLayout, c_n: fx.Int32,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
@@ -537,10 +582,21 @@ def _compile_bwd(
         reduce_cu = fx.Int32(num_reduce_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
-        sb_l2_base = sym_layout.sb_l2_ptr
+        combine_flag_base = sym_layout.combine_flag_ptr
         comb_base = sym_layout.comb_ptr
-        barrier_base = sym_layout.barrier_local_ptr
+        reduce_flag_base = sym_layout.reduce_flag_ptr
         gate_base = sym_layout.combine_gate_ptr
+        # ---- epoch: parity picks the flag bank; expected[parity] is the cumulative spin target ----
+        combine_parity_res = create_buffer_resource(COMBINE_PARITY, max_size=True)
+        combine_expected_res = create_buffer_resource(COMBINE_EXPECTED, max_size=True)
+        reduce_expected_res = create_buffer_resource(REDUCE_EXPECTED, max_size=True)
+        parity = cast(
+            buffer_load(combine_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
+        )
+        combine_bank = parity * fx.Int32(worst_case_tiles)
+        reduce_bank = parity * fx.Int32(combine_slots)
+        expected_combine = buffer_load(combine_expected_res, parity, vec_width=1, dtype=fx.T.i64())
+        expected_reduce = buffer_load(reduce_expected_res, parity, vec_width=1, dtype=fx.T.i64())
         l2y_fp8_res = create_buffer_resource(L2Y_FP8, max_size=True)
         l2y_scale_res = create_buffer_resource(L2Y_SCALE, max_size=True)
         signal_delta_res = create_buffer_resource_from_addr(
@@ -567,7 +623,8 @@ def _compile_bwd(
                 thread_index=thread_index, block_m_size=BLOCK_M, hidden=out_features, comb_records=comb_records,
                 H4=H4, SC=SC, payload_i32_total=payload_i32_total, l2y_fp8_res=l2y_fp8_res,
                 l2y_scale_res=l2y_scale_res, origin_rank_res=origin_rank_res, origin_slot_res=origin_slot_res,
-                comb_base=comb_base, signal_delta_res=signal_delta_res, barrier_base=barrier_base,
+                comb_base=comb_base, signal_delta_res=signal_delta_res, barrier_base=reduce_flag_base,
+                reduce_bank=reduce_bank, expected_reduce=expected_reduce,
                 with_gate=True, grad_gate_res=grad_gate_res, gate_base=gate_base,
                 main_delta_res=main_delta_res, gate_records=gate_records,
             )
@@ -580,14 +637,13 @@ def _compile_bwd(
                 if not _push_only:  # PUSH_ONLY skips the GEMM-done gate + acquire (GEMM idle) -> pure push
                     if thread_index == fx.Int32(0):
                         spin_start = read_clock()
-                        sig = ld(sb_l2_base, block_m, scope="agent")
-                        while sig < fx.Int32(n_blocks):
+                        sig = ld(combine_flag_base, combine_bank + block_m, scope="agent", dtype=fx.T.i64())
+                        while sig != expected_combine:
                             fx.rocdl.s_sleep(fx.Int32(2))
                             if spin_timed_out(spin_start):
                                 fx.printf("MEGA fp8 ep bwd combine gate timeout: block={} sig={}\n", block_m, sig)
                                 spin_start = read_clock()
-                            sig = ld(sb_l2_base, block_m, scope="agent")
-                        st(sb_l2_base, block_m, fx.Int32(0), scope="agent")
+                            sig = ld(combine_flag_base, combine_bank + block_m, scope="agent", dtype=fx.T.i64())
                     fx.gpu.barrier()
                     l2_invalidate()
                 push_block(block_m)
@@ -614,7 +670,7 @@ def _compile_bwd(
                 fx.gpu.barrier()
                 _emit_if_then(
                     thread_index == fx.Int32(0),
-                    lambda: atomic_add(sb_l2_base, block_m, fx.Int32(1), scope="agent"),
+                    lambda: atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1), scope="agent"),
                 )
 
             if const_expr(_no_reduce):
@@ -626,7 +682,8 @@ def _compile_bwd(
                     reduce_fp8_bwd(
                         thread_index, block_index - combine_cu, fx.Int32(dedicated_reduce_warps),
                         num_experts, rank, comb_base, comb_records, output_res, topk_indices_res,
-                        num_tokens_res, barrier_base, gate_local_res, d_topk_w_res,
+                        num_tokens_res, reduce_flag_base, reduce_bank, expected_reduce,
+                        gate_local_res, d_topk_w_res,
                     )
                 else:
                     if block_m < real_tiles:
@@ -645,20 +702,26 @@ def _compile_bwd(
                         ) * fx.Int32(_NUM_WARPS)
                         reduce_fp8_bwd(
                             thread_index, empty_ordinal, total_empty_warps, num_experts, rank, comb_base,
-                            comb_records, output_res, topk_indices_res, num_tokens_res, barrier_base,
-                            gate_local_res, d_topk_w_res,
+                            comb_records, output_res, topk_indices_res, num_tokens_res, reduce_flag_base,
+                            reduce_bank, expected_reduce, gate_local_res, d_topk_w_res,
                         )
 
     @flyc.jit
     def launch(
         ACT, WEIGHTS, L2Y_FP8, L2Y_SCALE, TILE_TO_GROUP, NUM_TILE_BLOCKS, OUTPUT, TOPK_INDICES,
-        NUM_TOKENS_PER_RANK, GRAD_GATE, D_TOPK_W, A_SCALE, B_SCALE, sym_layout, c_n: int,
+        NUM_TOKENS_PER_RANK, GRAD_GATE, D_TOPK_W, A_SCALE, B_SCALE,
+        COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED, sym_layout, c_n: int,
         stream: fx.Stream = fx.Stream(None),
     ):
         grid_size = gemm_base + worst_case_tiles * n_blocks
+        # bump epoch on device (combine += n_blocks, reduce += 1) before the kernel; same-stream visible
+        _make_epoch_bump(int(n_blocks), 1)(COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED).launch(
+            grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
+        )
         kern(
             ACT, WEIGHTS, L2Y_FP8, L2Y_SCALE, TILE_TO_GROUP, NUM_TILE_BLOCKS, OUTPUT, TOPK_INDICES,
-            NUM_TOKENS_PER_RANK, GRAD_GATE, D_TOPK_W, A_SCALE, B_SCALE, sym_layout, c_n,
+            NUM_TOKENS_PER_RANK, GRAD_GATE, D_TOPK_W, A_SCALE, B_SCALE,
+            COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED, sym_layout, c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -680,19 +743,13 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     bf16 (M = num_max_pool_tokens) is the activation A operand, quantized rowwise-mxfp8 internally
     (per-call token work).     GEMM epilogue quantizes C -> LOCAL fp8 L2Y; combine pure-copies fp8 ->
     peer; reduce dequants -> ``y`` [num_tokens, H] bf16. Shapes: I from ``act``, H / G from
-    ``sym_layout`` (hidden / num_experts_per_rank). Self-contained: resets the L2 scoreboard/flags
-    (``symm.sb_l2``=0, ``symm.barrier_local``=-1) cross-rank internally, so the caller does not."""
+    ``sym_layout`` (hidden / num_experts_per_rank). Self-resetting: the combine_flag / reduce_flag
+    epoch gates are double-banked + device epoch-bumped, so NO host flag reset / rendezvous."""
     assert act.dtype == torch.bfloat16
     weight_flat, b_sp = w2_fp8
     tile_to_expert = handle[7]
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.make_sym_layout()
-    # self-contained cross-rank L2 flag reset (barrier-bracketed so every peer sees sb_l2=0 /
-    # barrier_local=-1 before any rank signals) -- mirrors the bf16 combine being self-contained.
-    _host_rendezvous(group)
-    symm.sb_l2.zero_()
-    symm.barrier_local.fill_(-1)
-    _host_rendezvous(group)
     M, I = act.shape
     H = int(sym_layout.hidden)
     G = int(sym_layout.num_experts_per_rank)
@@ -734,6 +791,7 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     args = (
         act_flat, weight_flat, l2y_fp8, l2y_scale, tile_to_expert, num_tile_blocks, output.view(-1),
         topk_indices_d, symm.num_tokens_per_rank, topk_weights_d, a_scale_arg, b_scale_arg,
+        symm._combine_parity, symm._combine_expected, symm._reduce_expected,
         sym_layout, out_features, torch.cuda.current_stream(),
     )
     ck = (out_features, I, M, BM, BN, int(num_combine_cu), int(num_reduce_cu),
@@ -763,8 +821,8 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel_bwd(
     prep here. ``grad_l1`` [M, 2I] bf16 (M = num_max_pool_tokens; routing weight already folded
     upstream) is the A operand, quantized rowwise-mxfp8 internally; ``grad_gate`` [M] f32. Shapes:
     K=2I from ``grad_l1``, H / G from ``sym_layout``. Returns ``(dx [num_tokens, H] bf16, d_topk_w
-    [combine_slots] f32)``. Caller inits ``symm.barrier_local``=-1, ``symm.sb_l2``=0,
-    ``symm.combine_gate``=0 (cross-rank barrier'd) before calling."""
+    [combine_slots] f32)``. Self-resetting: the combine_flag / reduce_flag epoch gates are
+    double-banked + device epoch-bumped, so NO host flag reset / rendezvous."""
     from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
 
     assert grad_l1.dtype == torch.bfloat16
@@ -813,6 +871,7 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel_bwd(
     args = (
         act_flat, weight_flat, l2y_fp8, l2y_scale, tile_to_expert, num_tile_blocks, output.view(-1),
         topk_indices_d, symm.num_tokens_per_rank, grad_gate_d, d_topk_w, a_sp, b_sp,
+        symm._combine_parity, symm._combine_expected, symm._reduce_expected,
         sym_layout, out_features, torch.cuda.current_stream(),
     )
     ck = (out_features, K, M, BM, BN, int(num_combine_cu), int(num_reduce_cu),

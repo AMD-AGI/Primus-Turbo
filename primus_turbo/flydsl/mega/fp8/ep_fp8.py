@@ -107,9 +107,10 @@ def dispatch_fp8_copy_tile(
     pool_scale_base,  # RAW: sym_layout.pool_scale_ptr ; BROADCAST: sym_layout.pool_scale_ps_ptr
     pool_offsets_resource,
     signal=False,
-    scoreboard_base=None,
-    scoreboard_offsets_resource=None,
-    block_m=0,
+    dispatch_flag_base=None,
+    dispatch_flag_offsets_resource=None,
+    bank=None,
+    world_size=0,
     push_scale=True,
     fence=True,
     tok_unroll=1,
@@ -252,13 +253,14 @@ def dispatch_fp8_copy_tile(
             fx.gpu.barrier()
 
             def _signal():
-                scoreboard_address = _peer_addr(scoreboard_base, scoreboard_offsets_resource, dst_rank)
-                first_block = (dest_row_start + tok_lo) // fx.Int32(block_m)
-                last_block = (dest_row_start + tok_hi - fx.Int32(1)) // fx.Int32(block_m)
-                _emit_for(
-                    last_block - first_block + fx.Int32(1),
-                    lambda bo: atomic_add(scoreboard_address, first_block + bo, fx.Int32(1), scope="sys"),
-                )
+                # epoch dispatch gate (bf16-style, per-expert uniform): one +1 to the peer's
+                # dispatch_flag[bank + local_expert]. task table is dense [local_expert][dst_rank]
+                # (prologue C3a), so local_expert = task_index // world_size and each dst expert
+                # receives exactly num_ranks +1s -> reaches the cumulative expected. Replaces the
+                # per-pool-block variable-count scoreboard (host-reset).
+                df_address = _peer_addr(dispatch_flag_base, dispatch_flag_offsets_resource, dst_rank)
+                local_expert = task_index // fx.Int32(world_size)
+                atomic_add(df_address, bank + local_expert, fx.Int64(1), scope="sys")
 
             _emit_if_then(thread_index == fx.Int32(0), _signal)
 
