@@ -15,8 +15,9 @@ Built stage by stage. Stage 1 (``--stage l1``): L1 = fused dispatch + fc1.
   * bf16 : shipped ``dispatch_grouped_gemm_bf16_flydsl_kernel(layout="nt")``
 Both timed as the FULL per-forward L1 (prologue + dispatch + fc1) so the comparison is apples-to-
 apples (the bf16 nt kernel cannot be safely reused back-to-back, so each call re-runs its prologue;
-the fp8 leg matches by rebuilding its handle + scoreboard reset each call -- exactly one training
-forward). fp8 correctness gated vs a torch dequant grouped-GEMM over the kernel's own pool.
+the fp8 leg matches by rebuilding its handle each call, and its comm gates self-reset on device via
+the epoch bump -- exactly one training forward). fp8 correctness gated vs a torch dequant
+grouped-GEMM over the kernel's own pool.
 
 Stage ``--stage fwd``: the FULL forward (L1 + SwiGLU + L2) via the actual ops -- fp8
 ``mega_moe_fused_fp8`` vs shipped bf16 ``mega_moe_fused`` on identical inputs. Each op is
@@ -149,8 +150,8 @@ def _dequant_mxfp8(q, s_raw, block=_MXFP8_BLOCK):
 
 
 def _bench(fn, *, warmup, iters, group, reset=None):
-    """Per-call CUDA-event latency. ``reset`` (e.g. combine sb_l2/flag reset) runs OUTSIDE the timed
-    window each iter -> KERNEL-ONLY time. sync+barrier before each call serializes ranks (safe
+    """Per-call CUDA-event latency. Optional ``reset`` runs OUTSIDE the timed window each iter (the
+    epoch-self-reset kernels need none). sync+barrier before each call serializes ranks (safe
     back-to-back even for the cross-rank fp8 kernels)."""
     ev_s = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ev_e = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
@@ -224,11 +225,8 @@ def profile_l1(group, args, mode):
             num_max_pool_tokens=symm.num_max_pool_tokens,
         ))
 
-    def _fp8():  # FULL per-forward L1: prologue + scoreboard reset (cross-rank) + fused dispatch+GEMM
+    def _fp8():  # FULL per-forward L1: prologue + fused dispatch+GEMM (epoch self-reset on device)
         h = _prologue()
-        torch.cuda.synchronize(); group.barrier()
-        symm.scoreboard.zero_()
-        torch.cuda.synchronize(); group.barrier()
         return dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, h, sym_layout, symm, BM=BM, BN=BN)
 
     def _bf16():  # FULL per-forward L1 (shipped bf16): handle=None re-runs the prologue each call
@@ -238,8 +236,6 @@ def profile_l1(group, args, mode):
 
     # ── correctness (fp8): one L1, then torch dequant grouped-GEMM over the dispatched pool ──
     handle = _prologue()
-    torch.cuda.synchronize(); group.barrier()
-    symm.scoreboard.zero_()
     torch.cuda.synchronize(); group.barrier()
     out = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     torch.cuda.synchronize(); group.barrier()
@@ -271,7 +267,7 @@ def profile_l2(group, args, mode):
 
     Both need the pool populated + a SwiGLU activation, so each leg runs its own L1 -> swiglu -> act
     first (setup, untimed), then times ONLY the L2 combine per-forward:
-      * fp8  : reset sb_l2/barrier_local (cross-rank, the op's real per-forward cost) + fp8 combine
+      * fp8  : the fp8 combine (self-resets its epoch flags on device -- no host reset cost)
       * bf16 : shipped combine reused back-to-back (self-managed cross-rank state; timing-valid)."""
     rank, world = group.rank(), group.size()
     H, I, E, K, T, BM, BN = args.hidden, args.inter, args.num_experts, args.num_topk, args.num_tokens, args.bm, args.bn
@@ -292,8 +288,6 @@ def profile_l2(group, args, mode):
         num_max_pool_tokens=symm.num_max_pool_tokens,
     ))
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
-    torch.cuda.synchronize(); group.barrier()
-    symm.scoreboard.zero_()
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     act = swiglu_flydsl_kernel(l1, symm.meta_scalars[1:2]).contiguous()  # [M, I] bf16 (contiguous: combine reads flat)
@@ -397,8 +391,6 @@ def profile_dispatch_fc2_dgrad(group, args, mode):
     ))
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
-    symm.scoreboard.zero_()
-    torch.cuda.synchronize(); group.barrier()
     dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)  # fwd L1 (setup)
 
     def _fp8():
@@ -474,8 +466,6 @@ def profile_fc2_wgrad(group, args, mode):
     ))
     # fwd L1 -> l1 + dispatch_weights (the swiglu_backward inputs)
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
-    torch.cuda.synchronize(); group.barrier()
-    symm.scoreboard.zero_()
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
@@ -580,8 +570,6 @@ def profile_fc1_wgrad(group, args, mode):
     ))
     # fwd L1 -> l1 + dispatch_weights; CLONE the fc1-input pool BEFORE STEP1 overwrites symm.pool_fp8
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
-    torch.cuda.synchronize(); group.barrier()
-    symm.scoreboard.zero_()
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
@@ -862,8 +850,8 @@ def worker(local_rank, world, args):
                     print(f"  bf16/fp8: {bf16_ms / fp8_ms:.3f}x  ({'fp8 faster' if fp8_ms < bf16_ms else 'fp8 SLOWER'})")
                     print(f"  [acc] fp8 dx finite={bool(fin >= 1.0)} (norm={r['dx_norm']:.3e})  "
                           f"(fp8/bf16 on separate symm stacks -> latency compare; rigorous dx SNR -> e2e gradcheck)")
-                    print(f"  note: fp8-PUSH combine may intermittently spin-deadlock at large T + round_robin trips it "
-                          f"(like fwd L2) -> use load_balanced, re-run w/ fresh MASTER_PORT if it hangs")
+                    print(f"  note: epoch self-reset removed the old large-T STEP3 deadlock; use load_balanced for "
+                          f"realistic routing (round_robin is a pathological all-to-few case)")
                 torch.cuda.synchronize(); group.barrier()
     finally:
         dist.destroy_process_group()
