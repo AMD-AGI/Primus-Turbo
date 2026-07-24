@@ -106,24 +106,26 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         else:
             quantized_a = a
             check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
+            a_row, a_row_scale = quantized_a.qdata, quantized_a.scale_inv
+            group_offs_padded_rowwise = quantized_a.group_offs
             if a_t is None:
-                quantized_a_t = QuantizedTensor.quantize(
+                # The colwise (wgrad) operand must carry grouped_quantize_fp4_with_trans'
+                # 512-aligned-per-group layout to match grad_out in the FlyDSL wgrad;
+                # QuantizedTensor.quantize(axis=-2) pads each group differently, so the
+                # contraction widths mismatch for unbalanced groups.
+                _, _, a_col, a_col_scale, _, _, _, _ = grouped_quantize_fp4_with_trans(
                     quantized_a.dequantize(),
-                    quantized_a.real_dtype,
+                    float4_e2m1fn_x2,
                     config.granularity,
-                    axis=-2,
-                    block_size=config.block_size,
-                    scaling_recipe=a_t_scaling_recipe,
-                    group_lens=group_lens,
+                    group_lens,
+                    group_offs,
+                    block_size=MXFP4_BLOCK_SIZE,
+                    scaling_recipe=a_scaling_recipe,
+                    scaling_recipe_for_trans=a_t_scaling_recipe,
                 )
             else:
                 assert isinstance(a_t, QuantizedTensor)
-                quantized_a_t = a_t
-
-            a_row, a_row_scale = quantized_a.qdata, quantized_a.scale_inv
-            a_col, a_col_scale = quantized_a_t.qdata, quantized_a_t.scale_inv
-
-            group_offs_padded_rowwise = quantized_a.group_offs
+                a_col, a_col_scale = a_t.qdata, a_t.scale_inv
 
         # --- B: 3D weight (G, N, K). row-wise (rht=F) is the fwd operand; col-wise
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
@@ -170,7 +172,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         out = out[:total_m]
@@ -215,7 +217,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             scaling_recipe_for_trans=grad_out_t_scaling_recipe,
         )
 
-        # --- dgrad: grad_a = gradO_row(rht=T) @ B_col(rht=T)^T, contract N -> [total_m, K] ---
+        # --- dgrad: grad_a = gradO_row(rht=F) @ B_col(rht=F)^T, contract N -> [total_m, K] ---
         grad_a = grouped_gemm_fp4_impl(
             grad_out_fp4_row,
             b_col,
@@ -228,7 +230,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         grad_a = grad_a[: ctx.total_m]
@@ -247,7 +249,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
         )
 
         return (

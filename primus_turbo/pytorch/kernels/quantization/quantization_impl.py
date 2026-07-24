@@ -725,18 +725,61 @@ def grouped_quantize_mxfp4_impl(
             or scaling_recipe_for_trans.shuffle_out
         ), "Grouped MXFP4 dual quant does not support shuffle layouts."
 
-        return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
-            x,
-            group_lens,
-            group_offs,
-            out_dtype,
-            scaling_recipe.use_2d_block,
-            scaling_recipe.use_sr,
-            scaling_recipe.use_rht,
-            scaling_recipe_for_trans.use_2d_block,
-            scaling_recipe_for_trans.use_sr,
-            scaling_recipe_for_trans.use_rht,
+        def _hip():
+            return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
+                x,
+                group_lens,
+                group_offs,
+                out_dtype,
+                scaling_recipe.use_2d_block,
+                scaling_recipe.use_sr,
+                scaling_recipe.use_rht,
+                scaling_recipe_for_trans.use_2d_block,
+                scaling_recipe_for_trans.use_sr,
+                scaling_recipe_for_trans.use_rht,
+            )
+
+        # FlyDSL grouped dual quant (bit-exact, faster than the HIP dual) for the
+        # per-block / non-SR recipes it supports. fp16 (different 16-bit layout than the
+        # bf16 microblock cast) / 2d-block / SR fall through to HIP.
+        fly_ok = (
+            not scaling_recipe.use_2d_block
+            and not scaling_recipe.use_sr
+            and not scaling_recipe_for_trans.use_2d_block
+            and not scaling_recipe_for_trans.use_sr
+            and x.dtype == torch.bfloat16
         )
+        if fly_ok:
+            from primus_turbo.flydsl.quantization.mxfp4_grouped_quant import grouped_quant_mxfp4_raw
+
+            (
+                rowwise_out,
+                rowwise_scale,
+                colwise_out,
+                colwise_scale,
+                group_lens_padded_colwise,
+                group_offs_padded_colwise,
+            ) = grouped_quant_mxfp4_raw(
+                x,
+                group_lens,
+                group_offs,
+                out_dtype,
+                scaling_recipe.use_rht,
+                scaling_recipe_for_trans.use_rht,
+            )
+            # Adapt the FlyDSL raw 6-tuple to main's 8-tuple dual contract: rowwise is
+            # tight-M, so its padded layout equals the original group_lens / group_offs.
+            return (
+                rowwise_out,
+                rowwise_scale,
+                colwise_out,
+                colwise_scale,
+                group_lens,
+                group_offs,
+                group_lens_padded_colwise,
+                group_offs_padded_colwise,
+            )
+        return _hip()
     else:
         assert axis in (0, 1), "The axis must be 0 (colwise) or 1 (rowwise) when with_trans is False."
         assert not (scaling_recipe.shuffle_scale or scaling_recipe.shuffle_out), (
@@ -844,6 +887,38 @@ def quantize_mxfp4_impl(
     assert x.is_contiguous(), "The x tensor must be contiguous."
 
     if with_trans:
+        # FlyDSL dual quant (bit-exact vs the HIP dual): 3D [G,N,K] weight in one launch,
+        # 2D [R,C] dense. SR / shuffle / fp16 / unaligned dims fall through to HIP below.
+        from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
+            dual3_eligible,
+            dual_eligible,
+            flydsl_dual_quant,
+            flydsl_dual_quant_batched,
+        )
+
+        if x.dtype == torch.bfloat16:
+            if x.ndim == 3 and dual3_eligible(
+                x.shape[1], x.shape[2], scaling_recipe, scaling_recipe_for_trans
+            ):
+                return flydsl_dual_quant_batched(
+                    x,
+                    out_dtype,
+                    scaling_recipe.use_rht,
+                    scaling_recipe_for_trans.use_rht,
+                    row_2d=scaling_recipe.use_2d_block,
+                    col_2d=scaling_recipe_for_trans.use_2d_block,
+                )
+            if x.ndim == 2 and dual_eligible(
+                x.shape[0], x.shape[1], scaling_recipe, scaling_recipe_for_trans
+            ):
+                return flydsl_dual_quant(
+                    x,
+                    out_dtype,
+                    scaling_recipe.use_rht,
+                    scaling_recipe_for_trans.use_rht,
+                    row_2d=scaling_recipe.use_2d_block,
+                    col_2d=scaling_recipe_for_trans.use_2d_block,
+                )
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
             x,
             out_dtype,

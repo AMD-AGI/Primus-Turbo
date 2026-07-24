@@ -28,6 +28,7 @@ from primus_turbo.pytorch.core.backend import (
     TuneCache,
 )
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float4_e2m1fn_x2
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -110,8 +111,83 @@ class GroupedGEMMFP4TritonBackend(KernelBackend):
         )
 
 
+class GroupedGEMMFP4FlyDSLBackend(KernelBackend):
+    """FlyDSL MXFP4 grouped GEMM backend (fwd / dgrad, gfx950).
+
+    MX_BLOCKWISE, NT (trans_b=True). Reuses the dense mxfp4 whole-loop compute
+    (mfma_scale_f32_16x16x128_f8f6f4) with the fp8-grouped addressing; the host
+    wrapper zero-pads K scales and the packed N-scale workspace to 256 while
+    retaining the real FP4 operand strides.
+    """
+
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.MX_BLOCKWISE}
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 3
+        supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
+        supported &= out_dtype in (torch.float16, torch.bfloat16)
+        supported &= granularity in GroupedGEMMFP4FlyDSLBackend.SUPPORTED_GRANULARITIES
+        supported &= not trans_a
+        supported &= get_device_compute_capability() >= (9, 5)
+
+        supported &= trans_b
+        supported &= b.shape[-2] % 64 == 0
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ):
+        from primus_turbo.flydsl.grouped_gemm.mxfp4_grouped_kernel import (
+            grouped_gemm_mxfp4_flydsl_kernel,
+        )
+
+        N = b.shape[-2]
+        K = b.shape[-1] * 2
+        group_offs_out = kwargs.get("group_offs_out", None)
+        return grouped_gemm_mxfp4_flydsl_kernel(
+            a,
+            a_scales,
+            b,
+            b_scales,
+            group_offs,
+            N,
+            K,
+            group_offs_out=group_offs_out,
+            out_dtype=out_dtype,
+            num_cu=num_cu if num_cu is not None else -1,
+        )
+
+
 class GroupedGEMMFP4KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
+        BackendType.FLYDSL: BackendEntry(GroupedGEMMFP4FlyDSLBackend),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP4TritonBackend),
     }
     _cache = TuneCache(1024)
@@ -214,8 +290,95 @@ class GroupedGEMMFP4VariableKTritonBackend(KernelBackend):
         )
 
 
+class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
+    """FlyDSL MXFP4 variable-K grouped GEMM backend (wgrad, gfx950).
+
+    MX_BLOCKWISE, non-transposed FP4-packed 2D operands ``(OUT_*, M_total/2)``,
+    contraction over the (128-padded) per-group M. Reuses the dense whole-loop
+    with a runtime nval; the host repacks the contraction to 512-aligned per group.
+    """
+
+    SUPPORTED_GRANULARITIES = {ScalingGranularity.MX_BLOCKWISE}
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 2
+        supported &= granularity in GroupedGEMMFP4VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
+        supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
+        # bf16 only: the FlyDSL wgrad consumes the FlyDSL dual-quant's 512-aligned colwise
+        # layout. fp16 activations fall back to the HIP quant (128-aligned col), which this
+        # kernel can't consume -> route fp16 wgrad to Triton.
+        supported &= out_dtype == torch.bfloat16
+        supported &= not trans_a and not trans_b
+        # OUT_M/OUT_N (=a.shape[0]/b.shape[0], swapped by trans_c) must be 64-multiples for
+        # the packed-scale preshuffle; non-64 (tiny test shapes) falls back to Triton.
+        supported &= a.shape[0] % 64 == 0 and b.shape[0] % 64 == 0
+        supported &= get_device_compute_capability() >= (9, 5)
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scales: torch.Tensor,
+        b_scales: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        num_cu: int | None,
+        **kwargs,
+    ):
+        from primus_turbo.flydsl.grouped_gemm.mxfp4_grouped_kernel import (
+            grouped_gemm_mxfp4_variable_k_flydsl_kernel,
+        )
+
+        # wgrad: C[g] (OUT_M, OUT_N) = lhs[:,g] @ rhs[:,g]^T, reduction over M.
+        # lhs/rhs swapped by trans_c (matches the FP8 variable-K backend).
+        if trans_c:
+            lhs, rhs = b, a
+            lhs_scales, rhs_scales = b_scales, a_scales
+        else:
+            lhs, rhs = a, b
+            lhs_scales, rhs_scales = a_scales, b_scales
+        OUT_M = lhs.shape[0]
+        OUT_N = rhs.shape[0]
+        G = group_lens.shape[0]
+        return grouped_gemm_mxfp4_variable_k_flydsl_kernel(
+            lhs,
+            lhs_scales,
+            rhs,
+            rhs_scales,
+            group_offs,
+            OUT_M,
+            OUT_N,
+            G,
+            out_dtype=out_dtype,
+            num_cu=num_cu if num_cu is not None else -1,
+        )
+
+
 class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
     _backends = {
+        BackendType.FLYDSL: BackendEntry(GroupedGEMMFP4VariableKFlyDSLBackend),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP4VariableKTritonBackend),
     }
     _cache = TuneCache(1024)
