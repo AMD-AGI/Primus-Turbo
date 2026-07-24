@@ -32,6 +32,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8,
+    rowcol_dual_quant_mxfp8_grouped_flydsl,
 )
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8
@@ -146,7 +147,7 @@ def _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2, group, handle, block_m, block
     return grad_swiglu, pool_fp8_handle
 
 
-def _mxfp8_variable_k_wgrad(a_fp8, b_bf16, group_lens, group_offs):
+def _mxfp8_variable_k_wgrad(a_fp8, b_bf16, group_lens, group_offs, meta=None):
     """dW2 = ``a^T @ b`` (variable-K over the dispatched pool tokens) in MXFP8 -> ``[G, H, b.dim1]`` bf16.
 
     L2 (fc2) weight grad: ``a`` = the L2-dgrad dispatched-dy pool ``(pool_fp8 [P,H], pool_scale [P,H//32])`` (the
@@ -155,7 +156,8 @@ def _mxfp8_variable_k_wgrad(a_fp8, b_bf16, group_lens, group_offs):
     (bf16, from ``swiglu_backward``) -- colwise-quantized. Both emit only the transposed operand
     the wgrad needs + raw E8M0; the grouped meta (one D2H of the padded per-group offsets) is shared.
     Then the FlyDSL mxfp8 variable-K grouped GEMM. dW2 is the large backward GEMM (H*I over the pool)."""
-    meta = colwise_grouped_meta(group_lens, group_offs)
+    if meta is None:
+        meta = colwise_grouped_meta(group_lens, group_offs)
     pool_fp8, pool_scale = a_fp8
     a_t, a_ts, lens_pc, offs_pc = colwise_requant_mxfp8_grouped_fp8in_flydsl(
         pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta
@@ -173,35 +175,41 @@ def _mxfp8_variable_k_wgrad(a_fp8, b_bf16, group_lens, group_offs):
 
 def _l1_dgrad_combine_mxfp8_flydsl_kernel(
     grad_l1, w1, group, handle, block_m, block_n, *, grad_gate, topk_idx, num_tokens, num_topk,
-    w1t_fp8=None,
+    w1t_fp8=None, grad_l1_rowwise_fp8=None,
 ):
     """Backward L1 dgrad: fp8 fc1-dgrad (``grad_l1 @ w1^T``) + combine PUSH + unweighted reduce +
     grad_gate scatter -> ``(dx [num_tokens, H] bf16, grad_topk_weights [num_tokens, num_topk] f32)``.
 
     Backward mirror of the forward L2 (compute -> comm, combine-bound). fc1^T is prepped
     version-keyed at the op layer (``_w1t_combine_fp8_cached``); the combine kernel is pure compute
-    and self-resets its epoch flags on device (no host scoreboard/flag reset rendezvous)."""
+    and self-resets its epoch flags on device (no host scoreboard/flag reset rendezvous).
+
+    ``grad_l1_rowwise_fp8`` = precomputed ``(aq e4m3, a_sp preshuffled)`` for ``grad_l1`` (from the
+    fused dual-quant); when given, the combine skips its internal rowwise quant (one grad_l1 read)."""
     w1tf = w1t_fp8 if w1t_fp8 is not None else _w1t_combine_fp8_cached(w1)
     dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel(
         grad_l1, w1tf, list(handle), group,
         topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
+        x_fp8_rowwise=grad_l1_rowwise_fp8,
         BM=block_m, BN=block_n, num_combine_cu=24,  # retuned 16->24 for epoch comm (T=8192, +5.2%)
     )
     grad_topk_weights = d_topk_w_flat[: num_tokens * num_topk].view(num_tokens, num_topk)
     return dx, grad_topk_weights
 
 
-def _mxfp8_variable_k_wgrad_dw1(a_bf16, b_fp8, group_lens, group_offs):
+def _mxfp8_variable_k_wgrad_dw1(a_colwise_fp8, b_fp8, meta):
     """dW1 = ``a^T @ b`` (variable-K over the pool tokens) in MXFP8, LOCAL -> ``[G, 2I, H]`` bf16.
 
-    L1 (fc1) weight grad: ``a`` = ``grad_l1`` [P, 2I] (bf16, from SwiGLU^T) -- colwise-quantized; ``b`` =
-    ``pool_x`` [P, H] = the FORWARD-dispatched fc1-input pool kept in native rowwise-fp8 (cloned in
-    the forward before the L2 dgrad overwrites the symm pool) -- requant COLWISE directly from fp8. LOCAL:
-    dW1 contracts over pool tokens already gathered on THIS rank, so (unlike the bf16 fused path that
-    re-dispatches ``saved_x`` cross-rank) it needs NO cross-rank transfer -- that is where dW1's fp8
-    win comes from. Mirrors :func:`_mxfp8_variable_k_wgrad` (dW2) with the fp8 operand on ``b``."""
-    meta = colwise_grouped_meta(group_lens, group_offs)
-    a_t, a_ts, lens_pc, offs_pc = colwise_quant_mxfp8_grouped_flydsl(a_bf16, _DW_FP8_FORMAT, meta=meta)
+    L1 (fc1) weight grad: ``a`` = ``grad_l1`` [P, 2I] colwise-quantized -- passed in PRE-QUANTIZED as
+    ``a_colwise_fp8 = (q_col [2I,Mpad] fp8, s_col E8M0)`` from the fused dual-quant (one grad_l1 read
+    shared with STEP3's rowwise operand); ``b`` = ``pool_x`` [P, H] = the FORWARD-dispatched fc1-input
+    pool kept in native rowwise-fp8 (cloned in the forward before the L2 dgrad overwrites the symm
+    pool) -- requant COLWISE directly from fp8. LOCAL: dW1 contracts over pool tokens already gathered
+    on THIS rank, so (unlike the bf16 fused path that re-dispatches ``saved_x`` cross-rank) it needs NO
+    cross-rank transfer -- that is where dW1's fp8 win comes from. ``meta`` (grouped padded offsets) is
+    shared with the fused quant + dW2 + the pool requant."""
+    a_t, a_ts = a_colwise_fp8
+    lens_pc, offs_pc = meta["lens_pc"], meta["offs_pc"]
     pool_fp8, pool_scale = b_fp8
     b_t, b_ts, _, _ = colwise_requant_mxfp8_grouped_fp8in_flydsl(
         pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta
@@ -242,6 +250,8 @@ def mega_moe_backward_fp8_impl(
     group_lens = handle[_HANDLE_GROUP_LENS]
     group_offs = handle[_HANDLE_GROUP_OFFS]
     dy = grad_y.contiguous().to(torch.bfloat16)
+    # grouped padded-offset meta shared across the fused grad_l1 dual-quant, dW1, dW2, pool requant.
+    meta = colwise_grouped_meta(group_lens, group_offs)
 
     # L2 dgrad (fp8 fork): dispatch(dy) + fc2 -> grad_swiglu + the dispatched-dy pool in native
     # rowwise-fp8 (the dW2 `a` operand `dispatch_l2_grad`, requant colwise directly from fp8).
@@ -254,19 +264,28 @@ def mega_moe_backward_fp8_impl(
         scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
 
+    # grad_l1 is quantized TWICE downstream: rowwise-preshuffled E4M3 (STEP3 fc1-dgrad A operand) +
+    # colwise-grouped (dW1 `a` operand). Fuse both into ONE read of grad_l1 (byte-exact to the two
+    # shipped kernels): q_row/a_sp feed the combine; q_col/s_col feed dW1. Saves ~0.09ms/backward.
+    gl1_q_row, gl1_a_sp, gl1_q_col, gl1_s_col = rowcol_dual_quant_mxfp8_grouped_flydsl(
+        grad_l1, _DW_FP8_FORMAT, meta=meta,
+    )
+
     # dW2 (MXFP8 variable-K): dispatch_l2_grad^T @ act_weighted; `a` requant-fused directly from
     # the L2-dgrad rowwise-fp8 pool. Run before anything else overwrites symm.pool_fp8.
-    dW2 = _mxfp8_variable_k_wgrad(dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs)
+    dW2 = _mxfp8_variable_k_wgrad(dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs, meta=meta)
 
     # L1 dgrad (fp8-PUSH): fc1 dgrad + combine + unweighted reduce + grad_gate scatter -> dx +
-    # grad_topk_weights. (epoch self-reset flags -> no host reset-race stall; stable through T=8192.)
+    # grad_topk_weights. Uses the pre-quantized rowwise grad_l1 (fused above; combine skips its
+    # internal quant). (epoch self-reset flags -> no host reset-race stall; stable through T=8192.)
     dx, grad_topk_weights = _l1_dgrad_combine_mxfp8_flydsl_kernel(
         grad_l1, w1, group, handle, block_m, block_n,
         grad_gate=grad_gate, topk_idx=topk_idx, num_tokens=num_tokens, num_topk=num_topk,
+        grad_l1_rowwise_fp8=(gl1_q_row, gl1_a_sp),
     )
 
-    # dW1 (MXFP8 variable-K, LOCAL): grad_l1^T @ pool_x -- reuses the FORWARD-dispatched
-    # fc1-input pool (rowwise-fp8, cloned on ctx), so NO cross-rank re-dispatch.
-    dW1 = _mxfp8_variable_k_wgrad_dw1(grad_l1, pool_x_fp8, group_lens, group_offs)
+    # dW1 (MXFP8 variable-K, LOCAL): grad_l1^T @ pool_x -- `a` = pre-quantized colwise grad_l1 (fused
+    # above); `b` = the FORWARD-dispatched fc1-input pool (rowwise-fp8, cloned on ctx), NO re-dispatch.
+    dW1 = _mxfp8_variable_k_wgrad_dw1((gl1_q_col, gl1_s_col), pool_x_fp8, meta)
 
     return dx, grad_topk_weights, dW1.to(w1.dtype), dW2.to(w2.dtype)

@@ -474,7 +474,7 @@ _L2Y_FP8_SCRATCH: dict = {}
 
 def grouped_gemm_combine_mxfp8_flydsl_kernel(
     x, weights_fp8, handle, group, *, topk_indices, topk_weights=None, grad_gate=None,
-    BM=256, BN=256, num_combine_cu=48, num_reduce_cu=0,
+    x_fp8_rowwise=None, BM=256, BN=256, num_combine_cu=48, num_reduce_cu=0,
 ):
     """Unified fp8 grouped mxfp8 GEMM (mxfp8-quant epilogue) + FP8 combine PUSH + FP8-dequant reduce.
     ONE entry for BOTH directions (mirrors bf16 ``grouped_gemm_combine_bf16_flydsl_kernel``); the role
@@ -491,7 +491,13 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     (M = num_max_pool_tokens) is the activation A operand, quantized rowwise-mxfp8 internally per call;
     H / G come from ``sym_layout``. Self-resetting: the combine_flag / reduce_flag epoch gates are
     double-banked + device epoch-bumped, so NO host flag reset / rendezvous. Always returns
-    ``(output, d_topk_w)`` (``d_topk_w`` is None in the forward role)."""
+    ``(output, d_topk_w)`` (``d_topk_w`` is None in the forward role).
+
+    ``x_fp8_rowwise`` (backward STEP3 only): pass a precomputed ``(aq [M,K] e4m3, a_sp preshuffled)``
+    == ``quantize_rowwise_mxfp8_flydsl(x, preshuffle=True)`` to SKIP the internal rowwise quant. Used
+    when the caller fused grad_l1's rowwise+colwise quant into one read (``rowcol_dual_quant``): the
+    A operand here is byte-identical to the internal quant, so the GEMM is unchanged. ``x`` is still
+    passed (bf16, for M/K/device); its values are unused when ``x_fp8_rowwise`` is given."""
     apply_weights = topk_weights is not None
     with_gate = grad_gate is not None
     assert x.dtype == torch.bfloat16
@@ -536,9 +542,14 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
 
     # activation (A operand) rowwise mxfp8 quant (preshuffled a_sp) -- per-call token work. The
     # weight is already prepared (weight_flat + b_sp) at the op layer, so there is NO weight quant here.
-    from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
+    # If the caller already produced the rowwise-fp8 A operand (fused grad_l1 dual-quant), reuse it
+    # (byte-identical) and skip the internal quant -- one read of grad_l1 for both STEP3 + dW1.
+    if x_fp8_rowwise is not None:
+        aq, a_sp = x_fp8_rowwise
+    else:
+        from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
 
-    aq, a_sp = quantize_rowwise_mxfp8_flydsl(x.contiguous(), preshuffle=True)
+        aq, a_sp = quantize_rowwise_mxfp8_flydsl(x.contiguous(), preshuffle=True)
     act_flat = aq.view(torch.int8).reshape(-1)
 
     launch = _compile(
