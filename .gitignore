@@ -16,4 +16,3 @@ logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
 .coverage*
-tests/pytorch/ops/test_mega_moe_dispatch_combine_grouped_gemm.py
