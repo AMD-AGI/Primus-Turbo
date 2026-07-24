@@ -7,7 +7,7 @@
 """Benchmark the MXFP8 mega MoE stages (fp8-only), EP, intra-node.
 
 The BF16 reference legs were SPLIT OUT into ``bench_mega_moe_bf16.py`` (run it separately and
-compare offline) so the fp8 and bf16 stacks can never poison each other -- e.g. the large-K STEP3
+compare offline) so the fp8 and bf16 stacks can never poison each other -- e.g. the large-K fc1_dgrad_combine
 bf16 combine OOB must not take down the fp8 stage bench. This file runs ONLY the fp8 legs; per-stage
 correctness gates that need a reference use a self-contained torch/e2e reference, not the bf16 kernel.
 
@@ -45,7 +45,7 @@ re-dispatch). fp8 ``_mxfp8_variable_k_wgrad_dw1`` (colwise-quant grad_l1 + colwi
 pool_x -> fp8 GEMM) vs shipped bf16 Triton ``grouped_gemm_variable_k_impl``. Same FULL/GEMM-only +
 breakdown + SNR gate as fc2_wgrad. (Not in ``both``.)
 
-Backward stage ``--stage fc1_dgrad_combine``: STEP3 = fc1 dgrad (grad_l1 @ w1^T) + combine + reduce
+Backward stage ``--stage fc1_dgrad_combine`` = fc1 dgrad (grad_l1 @ w1^T) + combine + reduce
 + grad_gate scatter -> dx [T,H]. fp8 ``grouped_gemm_combine_mxfp8_flydsl_kernel(grad_gate=...)`` (fp8-PUSH, fp8 stack) vs the
 shipped bf16 ``grouped_gemm_combine_bf16_flydsl_kernel(layout='nn')`` (separate bf16 stack -- the
 fp8/bf16 dispatch handles are not interchangeable), kernel-only timing -> LATENCY compare (dx SNR
@@ -292,7 +292,7 @@ def profile_l2(group, args, mode):
     M_eff = real_tiles * BM
     m_pad = int(handle[_H_GROUP_OFFS][-1].item())
 
-    cc, rc = _cu(args.combine_cu, 48), _cu(args.reduce_cu, 0)  # l2 combine default 48/0
+    cc, rc = _cu(args.combine_cu, 32), _cu(args.reduce_cu, 0)  # l2 combine default (prod, epoch-comm tuned)
 
     def _fp8():  # fp8 L2 combine kernel (GEMM + PUSH + reduce); self-resets the L2 flags internally
         y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
@@ -490,7 +490,7 @@ def profile_fc2_wgrad(group, args, mode):
 def profile_fc1_wgrad(group, args, mode):
     """Backward fc1 wgrad (dW1), MXFP8 variable-K wgrad, LOCAL. Replays backward up to dW1 on the
     real mega pool: fwd L1 -> (l1, dispatch_weights) + CLONE the forward-dispatched fc1-input pool
-    (pool_x, native rowwise-fp8) BEFORE STEP1 overwrites symm.pool_fp8; dispatch(dy)+fc2-dgrad ->
+    (pool_x, native rowwise-fp8) BEFORE the dispatch_fc2_dgrad stage overwrites symm.pool_fp8; dispatch(dy)+fc2-dgrad ->
     grad_swiglu; swiglu_backward -> grad_l1. Then dW1 = grad_l1^T @ pool_x (variable-K) BOTH ways:
       * fp8  : ``_mxfp8_variable_k_wgrad_dw1`` (colwise-quant grad_l1 + colwise-requant fp8 pool_x -> fp8 GEMM)
       * bf16 : ``grouped_gemm_variable_k_impl`` (Triton) on the dequant'd pool.
@@ -515,7 +515,7 @@ def profile_fc1_wgrad(group, args, mode):
         world_size=world, rank=symm.rank, experts_per_rank=epr, block_m=BM,
         num_max_pool_tokens=symm.num_max_pool_tokens,
     ))
-    # fwd L1 -> l1 + dispatch_weights; CLONE the fc1-input pool BEFORE STEP1 overwrites symm.pool_fp8
+    # fwd L1 -> l1 + dispatch_weights; CLONE the fc1-input pool BEFORE the dispatch_fc2_dgrad stage overwrites symm.pool_fp8
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
@@ -529,8 +529,12 @@ def profile_fc1_wgrad(group, args, mode):
     )
     group_lens, group_offs = handle[_H_GROUP_LENS], handle[_H_GROUP_OFFS]
 
-    def _fp8():  # colwise-quant grad_l1 + colwise-requant fp8 pool_x -> mxfp8 variable-K wgrad (LOCAL)
-        return _mxfp8_variable_k_wgrad_dw1(grad_l1, pool_x_fp8, group_lens, group_offs)
+    def _fp8():  # FULL dW1 (isolated): meta + colwise-quant grad_l1 + colwise-requant pool_x + GEMM.
+        # dW1 now takes the colwise grad_l1 operand PRE-quantized (shared with STEP3 via the fused
+        # dual-quant in the real backward); in isolation we still quantize it here so FULL is comparable.
+        meta_f = colwise_grouped_meta(group_lens, group_offs)
+        a_colwise = colwise_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=meta_f)[:2]
+        return _mxfp8_variable_k_wgrad_dw1(a_colwise, pool_x_fp8, meta_f)
 
     # BREAKDOWN: pre-quantize both operands ONCE -> isolate the fp8 variable-K GEMM from the per-call
     # colwise quant(grad_l1)/requant(pool_x). (dW1: `a`=grad_l1 quant, `b`=pool_x requant.)
@@ -574,7 +578,7 @@ def profile_fc1_wgrad(group, args, mode):
 
 
 def profile_fc1_dgrad_combine(group, args, mode):
-    """Backward STEP3 = fc1 dgrad (grad_l1 @ w1^T) + combine + reduce + grad_gate scatter -> dx [T,H].
+    """Backward fc1_dgrad_combine = fc1 dgrad (grad_l1 @ w1^T) + combine + reduce + grad_gate scatter -> dx [T,H].
     fp8 vs bf16 on SEPARATE symm stacks (the fp8 / bf16 dispatch handles are NOT interchangeable --
     bf16 combine reads recv_* at handle[9..12] where the fp8 handle holds group_lens/offs), so this
     is a LATENCY comparison (dx SNR is gated by the e2e backward gradcheck, not here):
@@ -594,7 +598,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     g = torch.Generator(device="cuda").manual_seed(4321 + rank)
     dy = torch.randn((T, H), generator=g, device="cuda", dtype=torch.bfloat16)
 
-    # ── fp8 leg: fp8 stack -- real backward to grad_l1/grad_gate, then fp8 STEP3 combine bwd ──
+    # ── fp8 leg: fp8 stack -- real backward to grad_l1/grad_gate, then fp8 fc1_dgrad_combine bwd ──
     symm = get_symm_buffer_for_mega_moe(
         group, num_experts=E, num_max_tokens_per_rank=T, num_topk=K, hidden=H,
         intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
@@ -621,7 +625,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     def _reset_fp8():  # epoch self-reset (device) -> no host flag reset needed
         pass
 
-    cc, rc = _cu(args.combine_cu, 16), _cu(args.reduce_cu, 0)  # step3 combine default 16/0
+    cc, rc = _cu(args.combine_cu, 24), _cu(args.reduce_cu, 0)  # step3 combine default (prod, epoch-comm tuned)
 
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only); grad_gate=... selects the bwd role
         dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
@@ -636,12 +640,12 @@ def profile_fc1_dgrad_combine(group, args, mode):
     fin = bool(torch.isfinite(dx_fp8.float()).all())
     dx_norm = float(dx_fp8.float().norm())
     t_fp8 = _bench(_fp8, warmup=args.warmup, iters=args.iters, group=group, reset=_reset_fp8)
-    if rank == 0:  # emit fp8 STEP3 NOW so it survives a bf16-ref-leg abort at large T (see below)
+    if rank == 0:  # emit fp8 result NOW so it survives a bf16-ref-leg abort at large T (see below)
         _tf = flops / (t_fp8 * 1e-3) / 1e12
-        print(f"  [STEP3 fp8] {t_fp8:.3f} ms | {_tf:.1f} TFLOPS  dx finite={fin} (norm={dx_norm:.3e}; "
+        print(f"  [fc1_dgrad_combine fp8] {t_fp8:.3f} ms | {_tf:.1f} TFLOPS  dx finite={fin} (norm={dx_norm:.3e}; "
               f"M_pool={m_pad})", flush=True)
     symm.destroy()
-    # bf16 STEP3 reference -> bench_mega_moe_bf16.py (split out; its large-K combine OOBs at large T).
+    # bf16 fc1_dgrad_combine reference -> bench_mega_moe_bf16.py (split out; its large-K combine OOBs at large T).
     return {"fin": float(fin), "dx_norm": dx_norm, "fp8_ms": t_fp8, "flops": flops, "m_pad": m_pad}
 
 
@@ -697,7 +701,7 @@ def worker(local_rank, world, args):
                           f"(fp8-vs-bf16 SNR -> bench_mega_moe_fused_fp8; bf16 ms -> bench_mega_moe_bf16.py)")
                 torch.cuda.synchronize(); group.barrier()
 
-            if args.stage == "dispatch_fc2_dgrad":
+            if args.stage in ("dispatch_fc2_dgrad", "bwd"):
                 r = profile_dispatch_fc2_dgrad(group, args, mode)
                 snr, nan = _amin(group, r["snr"]), _amax(group, r["nan"])
                 fp8_ms = _amax(group, r["fp8_ms"])
@@ -709,7 +713,7 @@ def worker(local_rank, world, args):
                           f"{'PASS' if snr >= 18.0 and nan < 1.0 else 'FAIL'} (gate SNR>=18dB; bf16 ms -> bench_mega_moe_bf16.py)")
                 torch.cuda.synchronize(); group.barrier()
 
-            if args.stage == "fc2_wgrad":
+            if args.stage in ("fc2_wgrad", "bwd"):
                 r = profile_fc2_wgrad(group, args, mode)
                 nan = _amax(group, r["nan"])
                 fp8_ms = _amax(group, r["fp8_ms"])
@@ -725,7 +729,7 @@ def worker(local_rank, world, args):
                           f"(fp8-vs-bf16 SNR -> e2e gradcheck; bf16 ref -> bench_mega_moe_bf16.py)")
                 torch.cuda.synchronize(); group.barrier()
 
-            if args.stage == "fc1_wgrad":
+            if args.stage in ("fc1_wgrad", "bwd"):
                 r = profile_fc1_wgrad(group, args, mode)
                 nan = _amax(group, r["nan"])
                 fp8_ms = _amax(group, r["fp8_ms"])
@@ -741,17 +745,17 @@ def worker(local_rank, world, args):
                           f"bf16 ref -> bench_mega_moe_bf16.py). fp8 dW1 is LOCAL (reuses fwd pool).")
                 torch.cuda.synchronize(); group.barrier()
 
-            if args.stage == "fc1_dgrad_combine":
+            if args.stage in ("fc1_dgrad_combine", "bwd"):
                 r = profile_fc1_dgrad_combine(group, args, mode)
                 fin = _amin(group, r["fin"])
                 fp8_ms = _amax(group, r["fp8_ms"])
                 if rank == 0:
                     tf = lambda ms: r["flops"] / (ms * 1e-3) / 1e12
-                    print(f"\n{'='*80}\n[mega MoE bwd fc1 dgrad+combine (STEP3)  fp8]  {hdr}\n{'='*80}")
+                    print(f"\n{'='*80}\n[mega MoE bwd fc1_dgrad_combine  fp8]  {hdr}\n{'='*80}")
                     print(f"  fp8  : {fp8_ms:8.3f} ms | {tf(fp8_ms):8.1f} TFLOPS  (fc1-dgrad GEMM + fp8-PUSH combine + reduce, kernel-only; M_pool={r['m_pad']})")
                     print(f"  [acc] fp8 dx finite={bool(fin >= 1.0)} (norm={r['dx_norm']:.3e})  "
                           f"(rigorous dx SNR -> e2e gradcheck; bf16 ref -> bench_mega_moe_bf16.py)")
-                    print(f"  note: epoch self-reset removed the old large-T STEP3 deadlock; use load_balanced "
+                    print(f"  note: epoch self-reset removed the old large-T fc1_dgrad_combine deadlock; use load_balanced "
                           f"(round_robin is a pathological all-to-few case)")
                 torch.cuda.synchronize(); group.barrier()
     finally:
@@ -763,10 +767,11 @@ def _build_parser():
         description="mega MoE MXFP8 per-stage bench (fp8-only; bf16 reference -> bench_mega_moe_bf16.py)")
     ap.add_argument("--stage",
                     choices=["l1", "l2", "fwd", "dispatch_fc2_dgrad", "fc2_wgrad", "fc1_wgrad",
-                             "fc1_dgrad_combine", "both"],
+                             "fc1_dgrad_combine", "both", "bwd"],
                     default="both",
-                    help="which stage to bench (dispatch_fc2_dgrad / fc2_wgrad / fc1_wgrad / "
-                         "fc1_dgrad_combine are backward; not in 'both')")
+                    help="which stage(s) to bench. 'both' = forward (l1+l2+fwd); "
+                         "'bwd' = all backward stages (dispatch_fc2_dgrad + fc2_wgrad + fc1_wgrad + "
+                         "fc1_dgrad_combine)")
     ap.add_argument("--mode", choices=["load_balanced", "round_robin", "both"], default="both",
                     help="routing distribution(s) to bench")
     ap.add_argument("--num-processes", type=int, default=8)

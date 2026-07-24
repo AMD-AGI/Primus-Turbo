@@ -63,8 +63,10 @@ def _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32):
     exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
     exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
     biased = fx.arith.ArithValue(exp) + fx.Int32(127)
-    scale = (biased << fx.Int32(23)).bitcast(fx.T.f32())  # 2^exp as f32
-    inv_scale = fx.Float32(1.0) / fx.arith.ArithValue(scale)
+    # scale = 2^(biased-127) is an exact power of two, so 1/scale = 2^(127-biased) = float bits
+    # ((254 - biased) << 23). Bit-identical to 1.0/scale (IEEE div by pow2 is exact) but replaces
+    # a VALU fdiv sequence with one sub+shift. Valid for every finite scale (exp<128).
+    inv_scale = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32())
     qs = []
     for fv in vals:
         q = fmath.clampf(fx.arith.ArithValue(fv) * inv_scale, lo, hi)
@@ -480,3 +482,205 @@ def colwise_requant_mxfp8_grouped_fp8in_flydsl(
         total_M_pad // 4, n_pblk, n_mwg,
     )
     return q, s, meta["lens_pc"], meta["offs_pc"]
+
+
+# ── FUSED rowwise + colwise dual-quant (one read of grad_l1 -> both operands) ─────────────────
+# grad_l1 [P, F] bf16 is needed BOTH rowwise-preshuffled (E4M3, STEP3 fc1-dgrad) and colwise-grouped
+# (E5M2, dW1 wgrad). Reading it twice (the two shipped kernels) costs an extra HBM read; this fuses
+# both from ONE read via a 32xBT bf16 tile staged in LDS -> colwise reads down columns, rowwise reads
+# across each 32-feature block. Byte-exact to `quantize_rowwise_mxfp8_flydsl(preshuffle=True)` (rowwise
+# half, always E4M3) + `colwise_quant_mxfp8_grouped_flydsl` (colwise half).
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
+    from primus_turbo.flydsl.mega.fp8.quant_flydsl import _e8m0_broadcast_i32, _preshuffle_a_idx
+    assert F % BT == 0 and BT % _BLK == 0
+    blk_i32 = _BLK // 4
+    n_ftile = F // BT
+    K128 = F // 128
+    TILE = _BLK * BT                       # LDS f32-as-i32 tile [32 rows][BT cols]
+    # colwise (out) params
+    c_max = 57344.0 if is_e5m2_col else 448.0
+    c_cvt = cvt_pk_bf8_f32 if is_e5m2_col else cvt_pk_fp8_f32
+    c_mbits = 2 if is_e5m2_col else 3
+    c_round = 1 << (22 - c_mbits)
+    c_target = 15 if is_e5m2_col else 8
+    # rowwise params: ALWAYS E4M3 (matches quantize_rowwise_mxfp8_flydsl)
+    r_round = 1 << 19
+    r_target = 8
+
+    NB = BT // _BLK                          # 32-feature blocks per tile row
+
+    @fx.struct
+    class Smem:
+        tile: fx.Array[fx.Int32, TILE, 16]   # bf16 value (f32 bitcast to i32) [row*BT + col]
+        rscale: fx.Array[fx.Int32, BT, 16]   # rowwise E8M0 biased byte per (row, fblk) = [row*NB + fblk]
+
+    @flyc.kernel(known_block_size=[BT, 1, 1])
+    def kern(
+        X: fx.Tensor, QC: fx.Tensor, SC: fx.Tensor, QR: fx.Tensor, ASP: fx.Tensor,
+        BLK2GRP: fx.Tensor, LENS: fx.Tensor, OFFS: fx.Tensor, OFFS_PC: fx.Tensor,
+        mpad_i32: fx.Int32, npblk: fx.Int32,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        pmb = bid // fx.Int32(n_ftile)
+        ftile = bid % fx.Int32(n_ftile)
+        f = ftile * fx.Int32(BT) + tid          # global feature / output column
+        fblk_local = tid // fx.Int32(_BLK)      # 32-feature block within the tile
+        jj = tid % fx.Int32(_BLK)               # feature within its 32-block
+
+        xr = create_buffer_resource(X, max_size=True)
+        qcr = create_buffer_resource(QC, max_size=True)
+        scr = create_buffer_resource(SC, max_size=True)
+        qrr = create_buffer_resource(QR, max_size=True)     # rowwise fp8 [P, F] int8 view
+        aspr = create_buffer_resource(ASP, max_size=True)   # rowwise preshuffled scale i32
+        b2g = create_buffer_resource(BLK2GRP, max_size=True)
+        lr = create_buffer_resource(LENS, max_size=True)
+        ofr = create_buffer_resource(OFFS, max_size=True)
+        opr = create_buffer_resource(OFFS_PC, max_size=True)
+        lds = fx.SharedAllocator().allocate(Smem).peek()
+        tile = lds.tile
+        rscale = lds.rscale
+
+        c_lo = fx.arith.constant(-c_max, type=fx.T.f32())
+        c_hi = fx.arith.constant(c_max, type=fx.T.f32())
+        r_lo = fx.arith.constant(-448.0, type=fx.T.f32())
+        r_hi = fx.arith.constant(448.0, type=fx.T.f32())
+        zero_i32 = fx.arith.constant(0, type=fx.T.i32())
+
+        g = buffer_load(b2g, pmb, vec_width=1, dtype=fx.T.i32())
+        offs_pc_g = buffer_load(opr, g, vec_width=1, dtype=fx.T.i32())
+        in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32())
+        len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32())
+        m_local0 = pmb * fx.Int32(_BLK) - fx.arith.ArithValue(offs_pc_g)
+
+        def _lds_store(idx, i32val):
+            fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
+                Vec.from_elements([fx.arith._to_raw(i32val)], fx.Int32))
+
+        def _lds_f32(idx):
+            sv = Vec(fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).load())
+            return fx.arith.ArithValue(fx.Int32(sv[0])).bitcast(fx.T.f32())
+
+        def _rs_store(idx, i32val):
+            fx.make_view(fx.add_offset(rscale.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
+                Vec.from_elements([fx.arith._to_raw(i32val)], fx.Int32))
+
+        def _rs_load(idx):
+            sv = Vec(fx.make_view(fx.add_offset(rscale.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).load())
+            return fx.Int32(sv[0])
+
+        # ── load the 32 M-values of this column (padding-masked) + stage to LDS ──
+        vals = []
+        for i in range_constexpr(_BLK):
+            m_local = fx.arith.ArithValue(m_local0) + fx.Int32(i)
+            real = m_local < fx.arith.ArithValue(len_g)
+            m_eff = fx.arith.select(real, m_local, fx.Int32(0))
+            row = fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_eff)
+            v = buffer_load(xr, row * fx.Int32(F) + f, vec_width=1, dtype=fx.T.bf16())
+            fv = fx.arith.select(real, fx.arith.extf(fx.T.f32(), v), fx.Float32(0.0))
+            vals.append(fx.arith._to_raw(fv))
+            _lds_store(fx.Int32(i * BT) + tid, fx.arith.ArithValue(fv).bitcast(fx.T.i32()))
+
+        # ── colwise (byte-exact to colwise_quant_mxfp8_grouped_flydsl) ──
+        words, biased = _e8m0_quant_pack(vals, c_round, c_target, c_lo, c_hi, c_cvt, zero_i32)
+        base_i32 = f * fx.arith.ArithValue(mpad_i32) + pmb * fx.Int32(blk_i32)
+        buffer_store(Vec.from_elements(words[0:4], fx.Int32).ir_value(), qcr, base_i32)
+        buffer_store(Vec.from_elements(words[4:8], fx.Int32).ir_value(), qcr, base_i32 + fx.Int32(4))
+        buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8()), scr,
+                     f * fx.arith.ArithValue(npblk) + pmb)
+
+        fx.gpu.barrier()
+
+        # ── rowwise (E4M3, preshuffled scale; byte-exact to quantize_rowwise_mxfp8_flydsl) ──
+        # Phase A: each thread computes ONE (row, fblk) block's E8M0 scale (no per-lane redundancy):
+        #   block index = tid = rowA*NB + fblkA; amax over its 32 features -> LDS rscale + a_sp.
+        rowA = tid // fx.Int32(NB)
+        fblkA = tid % fx.Int32(NB)
+        m_localA = fx.arith.ArithValue(m_local0) + fx.arith.ArithValue(rowA)
+        realA = m_localA < fx.arith.ArithValue(len_g)
+        amax = None
+        for k in range_constexpr(_BLK):
+            # swizzle the 32-feature read order by lane so a wavefront spreads across LDS banks
+            # (naive k hits bank k for all lanes -> N-way conflict). amax is commutative -> byte-exact.
+            koff = (fx.Int32(k) + tid) & fx.Int32(_BLK - 1)
+            rv = _lds_f32(rowA * fx.Int32(BT) + fblkA * fx.Int32(_BLK) + koff)
+            a = fmath.absf(rv)
+            amax = a if amax is None else fx.arith.maximumf(amax, a)
+        amax_bits = fx.arith.ArithValue(amax).bitcast(fx.T.i32())
+        t = amax_bits + fx.Int32(r_round)
+        exp = ((t >> fx.Int32(23)) & fx.Int32(0x1FF)) - fx.Int32(127 + r_target)
+        exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
+        exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
+        biasedA = fx.arith.ArithValue(exp) + fx.Int32(127)
+        _rs_store(tid, biasedA)
+        if realA:
+            global_rowA = fx.arith.ArithValue(in_off_g) + m_localA
+            global_fblkA = ftile * fx.Int32(NB) + fblkA
+            buffer_store(_e8m0_broadcast_i32(biasedA), aspr,
+                         _preshuffle_a_idx(global_rowA, global_fblkA, K128))
+        fx.gpu.barrier()
+
+        # Phase B: each thread quantizes its column's 32 values with the shared block scale.
+        for i in range_constexpr(_BLK):
+            m_local = fx.arith.ArithValue(m_local0) + fx.Int32(i)
+            real = m_local < fx.arith.ArithValue(len_g)
+            if real:
+                biased_r = _rs_load(fx.Int32(i * NB) + fblk_local)
+                # scale = 2^(biased_r-127) is an exact power of two, so 1/scale = 2^(127-biased_r)
+                # = float bits ((254 - biased_r) << 23). Bit-identical to 1.0/scale (IEEE div by
+                # pow2 is exact) but replaces a VALU fdiv sequence with one sub+shift. Valid for
+                # every finite scale (exp<128); exp==128 means amax~2^128 (bf16 overflow, degenerate).
+                inv_bits = (fx.Int32(254) - fx.arith.ArithValue(biased_r)) << fx.Int32(23)
+                inv = fx.arith.ArithValue(inv_bits).bitcast(fx.T.f32())
+                # this thread's own column value is already live in vals[i] (loaded at prologue);
+                # reuse the register instead of a 32nd ds_read/thread round-trip through LDS.
+                q = fmath.clampf(fx.arith.ArithValue(vals[i]) * fx.arith.ArithValue(inv), r_lo, r_hi)
+                wbyte = cvt_pk_fp8_f32(fx.T.i32(), fx.arith._to_raw(q), fx.arith._to_raw(q), zero_i32, False)
+                my_byte = fx.arith.ArithValue(wbyte) & fx.Int32(0xFF)
+                global_row = fx.arith.ArithValue(in_off_g) + m_local
+                buffer_store(fx.arith.ArithValue(my_byte).trunci(fx.T.i8()), qrr,
+                             global_row * fx.Int32(F) + f)
+
+    @flyc.jit
+    def launch(X, QC, SC, QR, ASP, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_pblk,
+               stream: fx.Stream = fx.Stream(None)):
+        kern(X, QC, SC, QR, ASP, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk).launch(
+            grid=(n_pblk * n_ftile, 1, 1), block=(BT, 1, 1), stream=stream)
+
+    return launch
+
+
+def rowcol_dual_quant_mxfp8_grouped_flydsl(
+    x: torch.Tensor, out_dtype_col: torch.dtype,
+    group_lens: torch.Tensor = None, group_offs: torch.Tensor = None,
+    meta: dict = None, BT: int = 256,
+):
+    """Fused rowwise(E4M3, preshuffled) + colwise(``out_dtype_col``, grouped) MXFP8 quant of ``x``
+    [P, F] bf16 in ONE read. Returns ``(q_row [P,F] e4m3, a_sp i32, q_col [F,Mpad] fp8, s_col uint8)``:
+      * ``(q_row, a_sp)`` == ``quantize_rowwise_mxfp8_flydsl(x, preshuffle=True)``
+      * ``(q_col, s_col)`` == ``colwise_quant_mxfp8_grouped_flydsl(x, out_dtype_col, meta)[:2]``
+    """
+    assert x.dim() == 2 and x.dtype == torch.bfloat16
+    M, F = x.shape
+    x = x.contiguous()
+    is_e5m2_col = out_dtype_col == torch.float8_e5m2
+    if meta is None:
+        meta = colwise_grouped_meta(group_lens, group_offs)
+    total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
+    K128 = F // 128
+    q_col = torch.empty((F, total_M_pad), dtype=out_dtype_col, device=x.device)
+    s_col = torch.empty((F, n_pblk), dtype=torch.uint8, device=x.device)
+    q_row = torch.empty((M, F), dtype=torch.float8_e4m3fn, device=x.device)
+    a_ngrp = (M + 63) // 64
+    a_sp = torch.zeros(a_ngrp * K128 * 256, dtype=torch.int32, device=x.device)
+    while F % BT != 0:
+        BT //= 2
+    _compile_rowcol_dual_grouped(F, is_e5m2_col, BT)(
+        x, q_col, s_col, q_row.view(torch.int8), a_sp,
+        meta["blk2grp"], meta["lens"], meta["offs32"], meta["offs_pc"],
+        total_M_pad // 4, n_pblk, n_pblk,
+    )
+    return q_row, a_sp, q_col, s_col

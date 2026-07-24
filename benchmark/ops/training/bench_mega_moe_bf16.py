@@ -6,17 +6,18 @@
 
 """BF16 mega MoE per-stage latency bench (EP, intra-node) -- the bf16 reference legs split out
 of ``bench_mega_moe_fp8.py`` into their OWN process so the fp8 and bf16 stacks can never poison
-each other (e.g. the large-K STEP3 bf16 combine OOB must not take down the fp8 stage bench).
+each other (e.g. the large-K fc1_dgrad_combine bf16 combine OOB must not take down the fp8 stage bench).
 
 Same CLI/stages as ``bench_mega_moe_fp8.py`` (compare the two runs' numbers offline):
 
   --stage l1                 L1 = dispatch + fc1 (NT)
   --stage l2                 L2 = fc2 + combine (NT weighted)
   --stage fwd                full forward (mega_moe_fused)
-  --stage dispatch_fc2_dgrad backward STEP1 = dispatch(dy) + fc2-dgrad (NN)
+  --stage dispatch_fc2_dgrad backward dispatch(dy) + fc2-dgrad (NN)
   --stage fc2_wgrad          backward dW2 (variable-K wgrad, Triton)
   --stage fc1_wgrad          backward dW1 (variable-K wgrad, Triton)
-  --stage fc1_dgrad_combine  backward STEP3 = fc1 dgrad + combine (NT)
+  --stage fc1_dgrad_combine  backward fc1 dgrad + combine (NT)
+  --stage bwd                all backward stages
 
 The wgrad stages time the bf16 Triton variable-K GEMM on SYNTHETIC bf16 operands (correct shapes
 + the real bf16 handle's group_lens/offs); GEMM latency is value-independent, so this is a faithful
@@ -273,9 +274,10 @@ _STAGES = {
     "dispatch_fc2_dgrad": (profile_dispatch_fc2_dgrad, "bwd dispatch(dy)+fc2-dgrad"),
     "fc2_wgrad": (profile_fc2_wgrad, "bwd fc2 wgrad (dW2, variable-K)"),
     "fc1_wgrad": (profile_fc1_wgrad, "bwd fc1 wgrad (dW1, variable-K)"),
-    "fc1_dgrad_combine": (profile_fc1_dgrad_combine, "bwd fc1 dgrad+combine (STEP3)"),
+    "fc1_dgrad_combine": (profile_fc1_dgrad_combine, "bwd fc1_dgrad_combine"),
 }
 _FWD_STAGES = ("l1", "l2", "fwd")
+_BWD_STAGES = ("dispatch_fc2_dgrad", "fc2_wgrad", "fc1_wgrad", "fc1_dgrad_combine")
 
 
 def worker(local_rank, world, args):
@@ -291,7 +293,9 @@ def worker(local_rank, world, args):
     rank = dist.get_rank()
     _platform, gpu = get_platform_info() if rank == 0 else (None, None)
     modes = ["load_balanced", "round_robin"] if args.mode == "both" else [args.mode]
-    stages = list(_FWD_STAGES) if args.stage == "both" else [args.stage]
+    stages = (list(_FWD_STAGES) if args.stage == "both"
+              else list(_BWD_STAGES) if args.stage == "bwd"
+              else [args.stage])
     try:
         for mode in modes:
             hdr = (f"{gpu}  EP{world} T={args.num_tokens} H={args.hidden} I={args.inter} "
@@ -318,8 +322,9 @@ def worker(local_rank, world, args):
 def _build_parser():
     ap = argparse.ArgumentParser(description="mega MoE BF16 per-stage latency bench (training)")
     ap.add_argument("--stage",
-                    choices=list(_STAGES) + ["both"], default="both",
-                    help="which stage to bench ('both' = l1+l2+fwd; the bwd stages run individually)")
+                    choices=list(_STAGES) + ["both", "bwd"], default="both",
+                    help="which stage(s): 'both' = l1+l2+fwd; 'bwd' = all backward stages "
+                         "(fc1_dgrad_combine bf16 OOBs at large T -- runs last)")
     ap.add_argument("--mode", choices=["load_balanced", "round_robin", "both"], default="both")
     ap.add_argument("--num-processes", type=int, default=8)
     ap.add_argument("--hidden", type=int, default=7168)   # DeepSeek-V3
