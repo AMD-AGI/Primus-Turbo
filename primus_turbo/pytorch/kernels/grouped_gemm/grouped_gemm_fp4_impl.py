@@ -139,15 +139,14 @@ class GroupedGEMMFP4FlyDSLBackend(KernelBackend):
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
-        supported &= granularity in GroupedGEMMFP4FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
         supported &= out_dtype in (torch.float16, torch.bfloat16)
-        supported &= trans_b and not trans_a
-        # Free dim N must be a 64-multiple (the packed-scale preshuffle groups 64 rows).
-        # Its physical scale workspace is padded to 256 by the FlyDSL wrapper.
-        # Non-64 N (tiny 32-mult test shapes) falls back to Triton.
-        supported &= b.shape[-2] % 64 == 0
+        supported &= granularity in GroupedGEMMFP4FlyDSLBackend.SUPPORTED_GRANULARITIES
+        supported &= not trans_a
         supported &= get_device_compute_capability() >= (9, 5)
+
+        supported &= trans_b
+        supported &= b.shape[-2] % 64 == 0
         return supported
 
     @staticmethod

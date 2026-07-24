@@ -297,7 +297,7 @@ _GQ_MXFP4_CACHE: dict = {}
 _GQ_MXFP4_CACHE_CAP = 64  # bound the per-(total_M) compiled-quant cache (broad-sweep OOM guard)
 
 
-def grouped_quant_mxfp4_raw(x, group_lens, group_offs, fp4_dtype, row_rht, col_rht, bm=64, bk=256):
+def grouped_quant_mxfp4_raw(x, group_lens, group_offs, out_dtype, row_rht, col_rht, bm=64, bk=256):
     """FlyDSL grouped mxfp4 dual quant, drop-in for the HIP grouped_quantize_mxfp4_dual
     (non-shuffle, non-SR, non-2d recipes). Returns the same 6-tuple:
       (rowwise_out [total_M, N_pad/2] fp4, rowwise_scale [total_M, N_pad/32] e8m0,
@@ -324,6 +324,8 @@ def grouped_quant_mxfp4_raw(x, group_lens, group_offs, fp4_dtype, row_rht, col_r
     lens_col = torch.empty(G, dtype=torch.int64, device=dev)
     offs_col = torch.empty(G + 1, dtype=torch.int64, device=dev)
 
+    # int32 views of the int64 [G+1] offs (low word carries the value; token offsets
+    # < 2^31). The kernel reads GO and fills the 128-padded col lens/offs (lc/oc) on-device.
     go = group_offs.to(torch.int64).view(torch.int32)
     lc = lens_col.view(torch.int32)
     oc = offs_col.view(torch.int32)
@@ -350,9 +352,9 @@ def grouped_quant_mxfp4_raw(x, group_lens, group_offs, fp4_dtype, row_rht, col_r
 
     e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
     return (
-        row_out.view(fp4_dtype),
+        row_out.view(out_dtype),
         row_sc.view(e8),
-        col_out.view(fp4_dtype),
+        col_out.view(out_dtype),
         col_sc.view(e8),
         lens_col,
         offs_col,

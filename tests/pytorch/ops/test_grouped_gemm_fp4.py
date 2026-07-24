@@ -350,6 +350,16 @@ _DET_NK_VALUES = [(2048, 1536), (4096, 7168), (2880, 2048), (256, 320)]
 _DET_POISON_SENTINELS = [0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x7C, 0x83, 0x7B, 0x84]
 
 
+def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
+    """Fill and free caching-allocator blocks of ``shape`` with ``sentinel`` so a
+    subsequent same-shape allocation reuses a dirty (non-zero) block instead of a
+    fresh, driver-zeroed page. Lets us detect output regions the kernel never wrote."""
+    blocks = [torch.full(shape, sentinel, dtype=dtype, device=device) for _ in range(n)]
+    for x in blocks:
+        x.add_(0.0)
+    del blocks
+
+
 def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend=None, repeats=10):
     seed = 42
     torch.manual_seed(seed)
@@ -468,6 +478,20 @@ def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend
     assert a_grad_snr > SNR_THRESHOLD, "a_grad_snr too low"
     assert b_grad_snr > SNR_THRESHOLD, "b_grad_snr too low"
 
+    # Over-allocated output tail [S:S+PAD] must be zeroed, not caching-allocator
+    # garbage: a fixed-capacity permute leaves padding rows the kernel never writes.
+    # Forward-only (the ref/backward paths use tight rows); poison the pool first.
+    S = int(group_lens.sum())
+    PAD = 224
+    a_pad = torch.randn((S + PAD, K), dtype=dtype, device=device)
+    torch.cuda.synchronize()
+    _poison_alloc_pool((S + PAD, N), dtype, device, 12288.0, n=8)
+    out_pad = grouped_gemm_fp4(a_pad, b0, group_lens, trans_b=True, config=config)
+    torch.cuda.synchronize()
+    tail = out_pad[S : S + PAD]
+    assert torch.isfinite(tail).all(), "over-allocated tail non-finite"
+    assert int(torch.count_nonzero(tail)) == 0, f"over-allocated tail [{S}:{S + PAD}] not zeroed"
+
 
 @pytest.mark.parametrize("B", _DET_B_VALUES)
 @pytest.mark.parametrize("M", _DET_M_VALUES)
@@ -495,58 +519,3 @@ def test_grouped_gemm_fp4_mx_blockwise_deterministic(B, M, NK, dtype, balance, b
         # wgrad dispatch raise instead of falling back to Triton.
         pytest.skip("FlyDSL grouped MXFP4 wgrad is bf16-only")
     _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend=backend, repeats=10)
-
-
-# ----------------------------------------------------------------------------
-# Over-allocated output tail must be zeroed (mirrors the FP8 sibling test).
-# ----------------------------------------------------------------------------
-def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
-    """Fill and free caching-allocator blocks of ``shape`` with ``sentinel`` so a
-    subsequent same-shape allocation reuses a dirty (non-zero) block instead of a
-    fresh, driver-zeroed page. Lets us detect output regions the kernel never wrote."""
-    blocks = [torch.full(shape, sentinel, dtype=dtype, device=device) for _ in range(n)]
-    for x in blocks:
-        x.add_(0.0)
-    del blocks
-
-
-@pytest.mark.parametrize("dtype", DTYPE_VALUES)
-def test_grouped_gemm_fp4_padded_tail_zeroed(dtype):
-    """Over-allocated output tail [sum(group_lens):M_total] must be zeroed, not left as
-    caching-allocator garbage."""
-    supported, reason = check_mxfp4_support()
-    if not supported:
-        pytest.skip(reason)
-
-    torch.manual_seed(42)
-    device = "cuda:0"
-    G, K, N = 8, 2048, 2880
-    group_lens = torch.tensor([4096, 0, 3072, 0, 0, 5120, 0, 0], dtype=torch.int64, device=device)
-    S = int(group_lens.sum())
-    PAD = 224
-    M_total = S + PAD  # simulate over-allocated (fixed-capacity permute) activation rows
-    sentinel = 12288.0  # exactly representable in bf16 and fp16
-    print(f"\ndtype={dtype}, S={S}, M_total={M_total}")
-
-    config = _make_config()
-    a = torch.randn((M_total, K), dtype=dtype, device=device)
-    b = torch.randn((G, N, K), dtype=dtype, device=device)
-
-    # Warm up (JIT/autotune), then poison the pool so any unwritten padding rows
-    # surface the sentinel instead of a fresh zeroed page.
-    grouped_gemm_fp4(a, b, group_lens, trans_b=True, config=config)
-    torch.cuda.synchronize()
-    _poison_alloc_pool((M_total, N), dtype, device, sentinel)
-
-    out = grouped_gemm_fp4(a, b, group_lens, trans_b=True, config=config)
-    torch.cuda.synchronize()
-
-    pad_tail = out[S:M_total]
-    assert torch.isfinite(pad_tail).all(), "padding tail non-finite"
-    torch.testing.assert_close(
-        pad_tail,
-        torch.zeros_like(pad_tail),
-        rtol=0.0,
-        atol=0.0,
-        msg=f"padding tail [{S}:{M_total}] must be zeroed",
-    )
