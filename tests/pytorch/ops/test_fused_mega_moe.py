@@ -41,7 +41,7 @@ from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe  # noqa: 
 from tests.pytorch.test_utils import compute_snr  # noqa: E402
 
 # bf16 fused vs bf16 turbo ref; comm + split-role reduce add noise -> use MegaMoE-family SNR floor.
-_SNR_THRESHOLD_DB = 25.0
+_SNR_THRESHOLD_DB = 40.0
 # Use cosine to catch directional gradient errors that SNR alone can miss.
 _COSINE_THRESHOLD = 0.99
 
