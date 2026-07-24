@@ -12,18 +12,18 @@ import torch
 from torch.distributed import ProcessGroup
 
 from primus_turbo.pytorch.core.backend import BackendType
-from primus_turbo.pytorch.kernels.mega_moe import (
-    mega_moe_backward_impl,
-    mega_moe_forward_impl,
+from primus_turbo.pytorch.kernels.fused_mega_moe import (
+    fused_mega_moe_backward_impl,
+    fused_mega_moe_forward_impl,
 )
 
 __all__ = [
-    "MegaMoEFusedFunction",
-    "mega_moe_fused",
+    "FusedMegaMoEFunction",
+    "fused_mega_moe",
 ]
 
 
-class MegaMoEFusedFunction(torch.autograd.Function):
+class FusedMegaMoEFunction(torch.autograd.Function):
     """Wraps the fused mega MoE forward so its output joins the autograd graph."""
 
     @staticmethod
@@ -36,7 +36,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
         w2: torch.Tensor,
         group: ProcessGroup,
     ) -> torch.Tensor:
-        with torch.profiler.record_function("mega_moe_forward"):
+        with torch.profiler.record_function("fused_mega_moe_forward"):
             # Validate at the op boundary so failures point here, not deep in FlyDSL.
             assert x.dim() == 2 and x.is_cuda and x.dtype == torch.bfloat16, (
                 f"x must be 2D bf16 CUDA, got {x.shape}/{x.dtype}"
@@ -60,7 +60,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             ctx.set_materialize_grads(False)
 
             # fused MoE forward: dispatch grouped L1 GEMM (NT) + SwiGLU + grouped L2 GEMM combine (NT)
-            y, l1_out, dispatch_weights_in_buf, handle = mega_moe_forward_impl(
+            y, l1_out, dispatch_weights_in_buf, handle = fused_mega_moe_forward_impl(
                 x,
                 w1,
                 w2,
@@ -94,7 +94,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
     @torch.no_grad()
     def backward(ctx, grad_y: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], ...]:
         """Conjugate of forward via Dispatch<->Combine duality; grads for x / w1 / w2 / topk_w."""
-        with torch.profiler.record_function("mega_moe_backward"):
+        with torch.profiler.record_function("fused_mega_moe_backward"):
             # grad_y is None when the output got no grad
             if grad_y is None:
                 return (None,) * 6
@@ -102,7 +102,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             handle = tuple(handle)
 
             # fused MoE backward: L2 dgrad (nn) + SwiGLU^T + dW2 + L1 dgrad combine (nn) + dW1 (tn)
-            dx, grad_topk_weights, dW1, dW2 = mega_moe_backward_impl(
+            dx, grad_topk_weights, dW1, dW2 = fused_mega_moe_backward_impl(
                 grad_y,
                 saved_x,
                 l1_out,
@@ -128,7 +128,7 @@ class MegaMoEFusedFunction(torch.autograd.Function):
             )
 
 
-def mega_moe_fused(
+def fused_mega_moe(
     group: ProcessGroup,
     x: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -137,4 +137,4 @@ def mega_moe_fused(
     w2: torch.Tensor,
 ) -> torch.Tensor:
     """One fully fused mega MoE forward; the symmetric buffer is fetched (and cached) internally."""
-    return MegaMoEFusedFunction.apply(x, topk_idx, topk_weights, w1, w2, group)
+    return FusedMegaMoEFunction.apply(x, topk_idx, topk_weights, w1, w2, group)

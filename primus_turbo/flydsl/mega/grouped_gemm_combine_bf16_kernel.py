@@ -28,7 +28,6 @@ from primus_turbo.flydsl.mega.ep_intranode import (
 from primus_turbo.flydsl.mega.prims import (
     atomic_add,
     cast,
-    l2_invalidate,
     ld,
     read_clock,
     spin_timed_out,
@@ -182,11 +181,15 @@ def _make_grouped_gemm_combine(
                         tile_cursor = t0
                         while tile_cursor <= t1:
                             spin_start = read_clock()
+                            fx.rocdl.s_waitcnt(0)
                             signal_count = ld(
-                                combine_flag_base, combine_bank + tile_cursor, scope="agent", dtype=fx.T.i64()
+                                combine_flag_base,
+                                combine_bank + tile_cursor,
+                                scope="sys",
+                                dtype=fx.T.i64(),
                             )
                             while signal_count != expected_combine_i64:
-                                fx.rocdl.s_sleep(fx.Int32(2))
+                                fx.rocdl.s_sleep(fx.Int32(1))
                                 if spin_timed_out(spin_start):
                                     fx.printf(
                                         "MEGA combine(task) gate timeout: tile={} signal={} thr={}\n",
@@ -195,15 +198,17 @@ def _make_grouped_gemm_combine(
                                         expected_combine_i64,
                                     )
                                     spin_start = read_clock()
+                                fx.rocdl.s_waitcnt(0)
                                 signal_count = ld(
                                     combine_flag_base,
                                     combine_bank + tile_cursor,
-                                    scope="agent",
+                                    order="relaxed",
+                                    scope="sys",
                                     dtype=fx.T.i64(),
                                 )
                             tile_cursor = tile_cursor + fx.Int32(1)
+                    fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()
-                    l2_invalidate()
                     combine_bf16_tile(
                         sym_buffer,
                         workspace,
@@ -219,7 +224,6 @@ def _make_grouped_gemm_combine(
                         bank_offset=reduce_bank,
                         with_gate=with_gate,
                     )
-            fx.rocdl.s_waitcnt(0)
         else:
             gemm_tile_index = block_index - fx.Int32(gemm_base)
             block_m = gemm_tile_index // fx.Int32(n_blocks)
@@ -252,12 +256,20 @@ def _make_grouped_gemm_combine(
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
                     b_group_base=group_base,
-                    c_cache_modifier=19,
+                    c_cache_modifier=18,  # sc1|nt: agent-visible non-temporal local stage.
                 )
                 fx.rocdl.s_waitcnt(0)
                 fx.gpu.barrier()
+                # Keep a separator: LLVM folds adjacent barriers, but two rendezvous are required.
+                fx.rocdl.s_waitcnt(0)
+                fx.gpu.barrier()
                 if thread_index == fx.Int32(0):
-                    atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1), scope="agent")
+                    atomic_add(
+                        combine_flag_base,
+                        combine_bank + block_m,
+                        fx.Int64(1),
+                        scope="sys",
+                    )
             else:
                 # Empty region: first num_reduce_cu blocks do topk reduce, rest early-exit.
                 empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
@@ -273,7 +285,7 @@ def _make_grouped_gemm_combine(
                                 combine_flag_base,
                                 combine_bank + empty_block_m,
                                 fx.Int64(n_blocks),
-                                scope="agent",
+                                scope="sys",
                             )
 
                     n_reduce_tiles = n_empty * fx.Int32(n_blocks)

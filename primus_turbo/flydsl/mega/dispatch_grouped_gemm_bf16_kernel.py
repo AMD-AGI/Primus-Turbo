@@ -5,7 +5,6 @@
 ###############################################################################
 
 import functools
-import os
 from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
@@ -45,10 +44,6 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_value_attrs,
     xcd_remap_pid,
 )
-
-# TN wgrad scoreboard fold-reset (default on). Off -> the scoreboard stays dirty after the
-# wgrad, hanging the NEXT reuse dispatch's gate (e.g. multi-layer back-to-back backward).
-_TN_SB_RESET = os.environ.get("MEGA_TN_SB_RESET", "1") == "1"
 
 
 @functools.lru_cache(maxsize=1)
@@ -198,9 +193,10 @@ def _make_kernel(
                 ge_blk = bank_offset + group_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
+                    fx.rocdl.s_waitcnt(0)
                     sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
                     while sig != expected_dispatch_i64:
-                        fx.rocdl.s_sleep(fx.Int32(2))
+                        fx.rocdl.s_sleep(fx.Int32(1))
                         if spin_timed_out(spin_start):
                             fx.printf(
                                 "MEGA tn variable-K gate timeout: expert={} sig={} exp={}\n",
@@ -209,6 +205,7 @@ def _make_kernel(
                                 expected_dispatch_i64,
                             )
                             spin_start = read_clock()
+                        fx.rocdl.s_waitcnt(0)
                         sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
                 pool_ptr_ty = PointerType.get(
@@ -241,19 +238,6 @@ def _make_kernel(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                 )
-                # Fold-reset the scoreboard (mirrors the NT/NN GEMM below): the TN gate only
-                # READS it, so without this the scoreboard stays at `expected` after the wgrad
-                # (never re-zeroed) and the NEXT reuse dispatch's gate spins forever -> hang.
-                # Each of the group's pool blocks is read by exactly TILES_PER_GROUP tiles; count
-                # the bumps and let the last one (prev == exp + TILES_PER_GROUP - 1) reset to 0.
-                if const_expr(_TN_SB_RESET):
-                    if thread_index == fx.Int32(0):
-                        for j in range(n_pb):
-                            pbj = pb0 + j
-                            exp_r = buffer_load(expected_resource, pbj, vec_width=1, dtype=fx.T.i32())
-                            prev = atomic_add(sb_base, pbj, fx.Int32(1), scope="sys")
-                            if prev == exp_r + fx.Int32(TILES_PER_GROUP - 1):
-                                st(sb_base, pbj, fx.Int32(0), scope="sys")
         else:
             tile_index = block_index - comm_block_count
             real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
@@ -271,9 +255,10 @@ def _make_kernel(
                 blk = bank_offset + g_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
+                    fx.rocdl.s_waitcnt(0)
                     signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
                     while signal != expected_dispatch_i64:
-                        fx.rocdl.s_sleep(fx.Int32(2))
+                        fx.rocdl.s_sleep(fx.Int32(1))
                         if spin_timed_out(spin_start):
                             fx.printf(
                                 "MEGA dispatch GEMM gate timeout: expert={} signal={} expected={}\n",
@@ -282,9 +267,9 @@ def _make_kernel(
                                 expected_dispatch_i64,
                             )
                             spin_start = read_clock()
+                        fx.rocdl.s_waitcnt(0)
                         signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
-                # TODO(zhuang12): no l2_invalidate before reading peer pool; mirroring combine's invalidate deadlocks autotune on gfx950.
 
                 gbase = g_idx * fx.Int32(K) * c_n
                 # A base = dispatch_token_pool (int64 symm addr); C base = OUTPUT tensor.
@@ -336,7 +321,7 @@ def _make_epoch_bump(addend):
 
 
 @autotune(
-    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=4) for cu in (16, 32, 64)],
+    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=3) for cu in (16, 32, 64)],
     key=[
         "out_features",
         "hidden_size",
@@ -499,7 +484,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         expert_send_offset,
         dispatched_token_idx,
         tile_to_expert,
-        _num_tokens_per_expert,
+        _,
         num_tokens_per_expert_prefix,
         num_tile_blocks,
         *_combine_recv_and_pool_src,
