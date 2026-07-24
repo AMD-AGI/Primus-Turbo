@@ -10,8 +10,20 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_impl im
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_impl import (
     fused_mega_moe_forward_impl,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_stage1_impl import (
+    fused_mega_moe_stage1_backward_impl,
+    fused_mega_moe_stage1_forward_impl,
+)
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_stage2_impl import (
+    fused_mega_moe_stage2_backward_impl,
+    fused_mega_moe_stage2_forward_impl,
+)
 
 __all__ = [
     "fused_mega_moe_backward_impl",
     "fused_mega_moe_forward_impl",
+    "fused_mega_moe_stage1_forward_impl",
+    "fused_mega_moe_stage1_backward_impl",
+    "fused_mega_moe_stage2_forward_impl",
+    "fused_mega_moe_stage2_backward_impl",
 ]
