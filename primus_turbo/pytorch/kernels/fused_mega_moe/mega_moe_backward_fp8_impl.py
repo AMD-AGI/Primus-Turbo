@@ -119,7 +119,8 @@ def _w1t_combine_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
     return ent[1]
 
 
-def _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2, group, handle, block_m, block_n, *, w2t_fp8=None):
+def _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2, group, handle, block_m, block_n, *, w2t_fp8=None,
+                                           num_dispatch_cu=None, num_preshuffle_cu=None):
     """Fused fp8 dispatch(dy) PUSH + L2 (fc2) dgrad (the winnable fp8 backward fork).
 
     Quantizes ``dy`` rowwise mxfp8, PUSHes it cross-rank into the pool (fp8, byte-halved), and
@@ -138,7 +139,8 @@ def _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2, group, handle, block_m, block
     # for the (later) variable-K wgrad; dispatch_weights is unused here.
     grad_swiglu, _, _, pool_fp8_handle = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
         dy, w2tq, w2ts, group, handle=handle,
-        num_dispatch_cu=_L2_DGRAD_NUM_DISPATCH_CU, num_preshuffle_cu=_L2_DGRAD_NUM_PRESHUFFLE_CU,
+        num_dispatch_cu=_L2_DGRAD_NUM_DISPATCH_CU if num_dispatch_cu is None else num_dispatch_cu,
+        num_preshuffle_cu=_L2_DGRAD_NUM_PRESHUFFLE_CU if num_preshuffle_cu is None else num_preshuffle_cu,
         BM=block_m, BN=block_n,
     )
     return grad_swiglu, pool_fp8_handle
@@ -183,7 +185,7 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
     dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel(
         grad_l1, w1tf, list(handle), group,
         topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
-        BM=block_m, BN=block_n, num_combine_cu=16,
+        BM=block_m, BN=block_n, num_combine_cu=24,  # retuned 16->24 for epoch comm (T=8192, +5.2%)
     )
     grad_topk_weights = d_topk_w_flat[: num_tokens * num_topk].view(num_tokens, num_topk)
     return dx, grad_topk_weights
