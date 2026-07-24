@@ -90,6 +90,8 @@ def mega_moe_forward_fp8_impl(
     w1q, w1s = _w1_fp8_cached(w1)
 
     # ── L1: fused mxfp8 dispatch + fc1 (one self-contained unit) ──
+    # NOTE: the isolated l1 bench favoured 24/8, but that was a back-to-back-prologue artifact; the
+    # per-forward op path (e2e) is insensitive to this split, so keep the 16/16 default.
     l1, handle, dispatch_weights, pool_x_fp8 = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
         x, 
         w1q, w1s, 
@@ -109,6 +111,6 @@ def mega_moe_forward_fp8_impl(
     y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
         act, (w2q, w2s), list(handle), group,
         topk_indices=topk_idx, topk_weights=topk_weights.to(torch.float32),
-        BM=block_m, BN=block_n, num_combine_cu=48,
+        BM=block_m, BN=block_n, num_combine_cu=32,  # retuned 48->32 for epoch comm (T=8192, +4.6%)
     )
     return y, l1, dispatch_weights, pool_x_fp8, handle

@@ -188,6 +188,11 @@ def _snr_db(ref, out):
     return float(10.0 * torch.log10(ref.pow(2).sum() / ((ref - out).pow(2).sum() + 1e-12)))
 
 
+def _cu(argval, default):
+    """CU-split override resolver: -1 (or None) -> stage default, else the swept value."""
+    return default if argval is None or argval < 0 else argval
+
+
 def _amax(group, v):
     t = torch.tensor([v], device="cuda"); dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group); return float(t)
 
@@ -219,14 +224,18 @@ def profile_l1(group, args, mode):
             num_max_pool_tokens=symm.num_max_pool_tokens,
         ))
 
+    dc, pc = _cu(args.dispatch_cu, 16), _cu(args.preshuffle_cu, 16)  # l1 dispatch default 16/16
+
     def _fp8():  # FULL per-forward L1: prologue + fused dispatch+GEMM (epoch self-reset on device)
         h = _prologue()
-        return dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, h, sym_layout, symm, BM=BM, BN=BN)
+        return dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, h, sym_layout, symm, BM=BM, BN=BN,
+                                           num_dispatch_cu=dc, num_preshuffle_cu=pc)
 
     # ── correctness (fp8): one L1, then torch dequant grouped-GEMM over the dispatched pool ──
     handle = _prologue()
     torch.cuda.synchronize(); group.barrier()
-    out = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    out = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN,
+                                      num_dispatch_cu=dc, num_preshuffle_cu=pc)
     torch.cuda.synchronize(); group.barrier()
     real_tiles = int(symm.meta_scalars[1].item())
     M_eff = real_tiles * BM
@@ -283,10 +292,12 @@ def profile_l2(group, args, mode):
     M_eff = real_tiles * BM
     m_pad = int(handle[_H_GROUP_OFFS][-1].item())
 
+    cc, rc = _cu(args.combine_cu, 48), _cu(args.reduce_cu, 0)  # l2 combine default 48/0
+
     def _fp8():  # fp8 L2 combine kernel (GEMM + PUSH + reduce); self-resets the L2 flags internally
         y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
             act, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=topk_w_f32,
-            BM=BM, BN=BN, num_combine_cu=48,
+            BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
         )
         return y
 
@@ -356,8 +367,12 @@ def profile_dispatch_fc2_dgrad(group, args, mode):
     torch.cuda.synchronize(); group.barrier()
     dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)  # fwd L1 (setup)
 
+    dc = args.dispatch_cu if args.dispatch_cu >= 0 else None    # default 24 inside helper
+    pc = args.preshuffle_cu if args.preshuffle_cu >= 0 else None  # default 8 inside helper
+
     def _fp8():
-        return _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
+        return _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN,
+                                                      num_dispatch_cu=dc, num_preshuffle_cu=pc)
 
     grad_swiglu_fp8, pool_handle = _fp8()
     grad_swiglu_fp8 = grad_swiglu_fp8.clone()
@@ -606,10 +621,12 @@ def profile_fc1_dgrad_combine(group, args, mode):
     def _reset_fp8():  # epoch self-reset (device) -> no host flag reset needed
         pass
 
+    cc, rc = _cu(args.combine_cu, 16), _cu(args.reduce_cu, 0)  # step3 combine default 16/0
+
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only); grad_gate=... selects the bwd role
         dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
             grad_l1, w1t_fp8, list(handle), group, topk_indices=tidx64, grad_gate=grad_gate,
-            BM=BM, BN=BN, num_combine_cu=16,
+            BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
         )
         return dx
 
@@ -762,6 +779,11 @@ def _build_parser():
     ap.add_argument("--bn", type=int, default=256)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--iters", type=int, default=15)
+    # CU-role split overrides for sweeping (comm mechanism changed -> re-tune). -1 = stage default.
+    ap.add_argument("--dispatch-cu", type=int, default=-1, help="num_dispatch_cu (l1 / dispatch_fc2_dgrad)")
+    ap.add_argument("--preshuffle-cu", type=int, default=-1, help="num_preshuffle_cu (l1 / dispatch_fc2_dgrad)")
+    ap.add_argument("--combine-cu", type=int, default=-1, help="num_combine_cu (l2 / fc1_dgrad_combine)")
+    ap.add_argument("--reduce-cu", type=int, default=-1, help="num_reduce_cu (l2 / fc1_dgrad_combine)")
     return ap
 
 
