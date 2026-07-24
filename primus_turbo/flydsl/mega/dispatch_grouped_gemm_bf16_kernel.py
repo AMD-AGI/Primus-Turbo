@@ -193,9 +193,10 @@ def _make_kernel(
                 ge_blk = bank_offset + group_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
+                    fx.rocdl.s_waitcnt(0)
                     sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
                     while sig != expected_dispatch_i64:
-                        fx.rocdl.s_sleep(fx.Int32(2))
+                        fx.rocdl.s_sleep(fx.Int32(1))
                         if spin_timed_out(spin_start):
                             fx.printf(
                                 "MEGA tn variable-K gate timeout: expert={} sig={} exp={}\n",
@@ -204,6 +205,7 @@ def _make_kernel(
                                 expected_dispatch_i64,
                             )
                             spin_start = read_clock()
+                        fx.rocdl.s_waitcnt(0)
                         sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
                 pool_ptr_ty = PointerType.get(
@@ -253,9 +255,10 @@ def _make_kernel(
                 blk = bank_offset + g_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
+                    fx.rocdl.s_waitcnt(0)
                     signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
                     while signal != expected_dispatch_i64:
-                        fx.rocdl.s_sleep(fx.Int32(2))
+                        fx.rocdl.s_sleep(fx.Int32(1))
                         if spin_timed_out(spin_start):
                             fx.printf(
                                 "MEGA dispatch GEMM gate timeout: expert={} signal={} expected={}\n",
@@ -264,9 +267,9 @@ def _make_kernel(
                                 expected_dispatch_i64,
                             )
                             spin_start = read_clock()
+                        fx.rocdl.s_waitcnt(0)
                         signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
-                # TODO(zhuang12): no l2_invalidate before reading peer pool; mirroring combine's invalidate deadlocks autotune on gfx950.
 
                 gbase = g_idx * fx.Int32(K) * c_n
                 # A base = dispatch_token_pool (int64 symm addr); C base = OUTPUT tensor.
@@ -318,7 +321,7 @@ def _make_epoch_bump(addend):
 
 
 @autotune(
-    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=4) for cu in (16, 32, 64)],
+    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=3) for cu in (16, 32, 64)],
     key=[
         "out_features",
         "hidden_size",
@@ -481,7 +484,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         expert_send_offset,
         dispatched_token_idx,
         tile_to_expert,
-        _num_tokens_per_expert,
+        _,
         num_tokens_per_expert_prefix,
         num_tile_blocks,
         *_combine_recv_and_pool_src,

@@ -23,7 +23,7 @@ rank owns a slice of the experts and tokens are routed directly into a peer rank
 - **Activation recompute** — forward saves only the original `x`; backward recomputes the
   dispatched `x`.
 - **No-Sync / CUDA Graph friendly** — no host-side sync points.
-- **Python API** — a single autograd op `mega_moe_fused` that takes external routing
+- **Python API** — a single autograd op `fused_mega_moe` that takes external routing
   (`topk_idx` / `topk_weights`).
 
 ## Core Design
@@ -120,8 +120,8 @@ python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --mo
 
 | Component | File |
 | --- | --- |
-| Autograd op | `primus_turbo/pytorch/ops/moe/mega_moe_fused.py` |
-| Forward / backward custom ops | `primus_turbo/pytorch/kernels/mega_moe/` |
+| Autograd op | `primus_turbo/pytorch/ops/moe/fused_mega_moe.py` |
+| Forward / backward custom ops | `primus_turbo/pytorch/kernels/fused_mega_moe/` |
 | Dispatch + grouped GEMM kernel | `primus_turbo/flydsl/mega/dispatch_grouped_gemm_bf16_kernel.py` |
 | Grouped GEMM + combine kernel | `primus_turbo/flydsl/mega/grouped_gemm_combine_bf16_kernel.py` |
 | Dispatch prologue (routing tables) | `primus_turbo/flydsl/mega/dispatch_prologue_kernel.py` |
