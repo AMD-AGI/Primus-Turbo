@@ -761,10 +761,9 @@ def _get_blockwise_autotune_configs(
     else:
         num_stage_values = [1, 2]
         block_n_values = [128]
-    for block_m, block_n, kp, gm, chunk, ns in itertools.product(
+    for block_m, block_n, gm, chunk, ns in itertools.product(
         [128, 256],
         block_n_values,
-        [1, 2],
         [4, 8],
         [32, 64],
         num_stage_values,
@@ -1013,6 +1012,11 @@ _blockwise_fp8_tn_kernel = triton.autotune(
     key=["M", "N", "K"],
 )(_blockwise_fp8_unified_kernel)
 
+# Fixed config for the no-autotune path; valid for all layouts (num_stages=2 is TN-safe).
+_DEFAULT_BLOCKWISE_CFG = dict(
+    BLOCK_M=128, BLOCK_N=128, BLOCK_K=128, GROUP_M=8, NUM_XCDS=8, CHUNK=64, num_warps=4, num_stages=2
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Unified Public API — Block-wise FP8 GEMM
@@ -1029,6 +1033,8 @@ def gemm_fp8_blockwise_triton_kernel(
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
+    auto_tune: bool = False,
+    backend_config: dict | None = None,
 ) -> torch.Tensor:
     """Unified block-wise FP8 GEMM Triton kernel.
 
@@ -1060,6 +1066,9 @@ def gemm_fp8_blockwise_triton_kernel(
         trans_b: Whether B is transposed.
         out_dtype: Output dtype (default bfloat16).
         trans_c: If True, return transposed output.
+        auto_tune: If True (and no backend_config), autotune-search the config (benches).
+        backend_config: Pinned config dict to use directly (highest priority); None ->
+            autotune when auto_tune else a fixed default config (no bench).
 
     Returns:
         C of shape (M, N) if trans_c=False, or (N, M) if trans_c=True.
@@ -1130,35 +1139,50 @@ def gemm_fp8_blockwise_triton_kernel(
     num_k = (K + 127) // 128
     NUM_SMS = ((M + 127) // 128) * ((N + 127) // 128)
 
+    # Config precedence (cfg=None means "let the autotune wrapper search"):
+    if backend_config is not None:
+        cfg = backend_config  # pinned: use it as-is (no bench)
+    elif auto_tune:
+        cfg = None  # tuning: autotune search (benches)
+    else:
+        cfg = _DEFAULT_BLOCKWISE_CFG  # default serving: fixed config, no bench
+
+    launch_args = (
+        A_view,
+        B_view,
+        out,
+        A_scales_arg,
+        B_scales_arg,
+        M,
+        N,
+        K,
+        A_view.stride(0),
+        A_view.stride(1),
+        B_view.stride(0),
+        B_view.stride(1),
+        stride_cm,
+        stride_cn,
+        stride_as_k,
+        stride_as_m,
+        stride_bs_0,
+        stride_bs_1,
+        NUM_SMS,
+        num_k,
+    )
+    flags = dict(
+        A_K_CONTIGUOUS=not trans_a,
+        B_K_CONTIGUOUS=trans_b,
+        SCALE_2D_B=SCALE_2D_B,
+        EVEN_K=EVEN_K,
+        TRANS_C_STORE=TRANS_C_STORE,
+    )
+
     # gfx950 enables its full knob set for the scope; gfx942 enables
     # use_async_copy/scalarize_packed_fops only for NT/NN (TN/wgrad regresses
     # ~5-8%). The scope restores every knob on exit.
     with scoped_amd_triton_knobs(gfx942_enable=not is_tn):
-        autotune_kernel[(NUM_SMS,)](
-            A_view,
-            B_view,
-            out,
-            A_scales_arg,
-            B_scales_arg,
-            M,
-            N,
-            K,
-            A_view.stride(0),
-            A_view.stride(1),
-            B_view.stride(0),
-            B_view.stride(1),
-            stride_cm,
-            stride_cn,
-            stride_as_k,
-            stride_as_m,
-            stride_bs_0,
-            stride_bs_1,
-            NUM_SMS,
-            num_k,
-            A_K_CONTIGUOUS=not trans_a,
-            B_K_CONTIGUOUS=trans_b,
-            SCALE_2D_B=SCALE_2D_B,
-            EVEN_K=EVEN_K,
-            TRANS_C_STORE=TRANS_C_STORE,
-        )
+        if cfg is None:
+            autotune_kernel[(NUM_SMS,)](*launch_args, **flags)
+        else:
+            _blockwise_fp8_unified_kernel[(NUM_SMS,)](*launch_args, **flags, **cfg)
     return out

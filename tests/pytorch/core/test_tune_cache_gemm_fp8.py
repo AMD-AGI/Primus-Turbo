@@ -23,7 +23,7 @@ def test_offline_cache_end_to_end_gemm_fp8(tmp_path, monkeypatch):
     device = "cuda:0"
     torch.manual_seed(0)
     m, n, k = 512, 1024, 2048
-    a = torch.randn(m, k, dtype=torch.bfloat16, device=device)   # NT: a[m,k], b[n,k]
+    a = torch.randn(m, k, dtype=torch.bfloat16, device=device)  # NT: a[m,k], b[n,k]
     b = torch.randn(n, k, dtype=torch.bfloat16, device=device)
     cfg = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE, format=Format.E4M3)
 

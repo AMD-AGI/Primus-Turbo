@@ -285,6 +285,8 @@ class GEMMFP8TritonBackend(KernelBackend):
                 trans_b=trans_b,
                 out_dtype=out_dtype,
                 trans_c=trans_c,
+                auto_tune=GlobalBackendManager.auto_tune_enabled(),
+                backend_config=backend_config,
             )
         else:
             raise ValueError(f"Unsupported granularity for FP8 Triton: {granularity}")

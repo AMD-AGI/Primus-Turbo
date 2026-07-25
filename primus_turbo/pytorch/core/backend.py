@@ -58,7 +58,9 @@ _PRECISION_TYPE_SET = set(_PRECISION_TYPE_MAPPING.values())
 _OTHER_PRECISION_HOLDER = "OTHER"
 
 # Packaged offline tune-config assets: primus_turbo/tuning/configs/<framework>/<arch>/<op>.json
-_TUNE_CONFIGS_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "tuning", "configs"))
+_TUNE_CONFIGS_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "tuning", "configs")
+)
 
 
 class BackendType(Enum):
