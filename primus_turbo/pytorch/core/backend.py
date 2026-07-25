@@ -57,6 +57,9 @@ _PRECISION_TYPE_MAPPING = {
 _PRECISION_TYPE_SET = set(_PRECISION_TYPE_MAPPING.values())
 _OTHER_PRECISION_HOLDER = "OTHER"
 
+# Packaged offline tune-config assets: primus_turbo/tuning/configs/<framework>/<arch>/<op>.json
+_TUNE_CONFIGS_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "tuning", "configs"))
+
 
 class BackendType(Enum):
     CK = auto()
@@ -76,8 +79,9 @@ class GlobalBackendManager:
     1. Code settings - set_gemm_backend(), etc.
     2. Environment variables - PRIMUS_TURBO_GEMM_BACKEND, etc.
     3. Auto-tune - PRIMUS_TURBO_AUTO_TUNE=1
-    4. Code defaults
-    5. Fallback: try all backends
+    4. Offline tune-config lookup - packaged configs/<arch>/<op>.json (auto-loaded)
+    5. Code defaults
+    6. Fallback: try all backends
     """
 
     _gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
@@ -280,8 +284,26 @@ class KernelBackend(ABC):
 
     @staticmethod
     @abstractmethod
-    def execute(**kwargs):
+    def execute(backend_config: Optional[dict] = None, **kwargs):
+        """Run the kernel.
+
+        Every backend receives ``backend_config`` (a flat dict, or None) and decides
+        whether to use it: backends with an internal autotune (Triton blockwise /
+        FlyDSL) apply the pinned config (None -> their fixed default, never bench);
+        all others ignore it.
+        """
         raise NotImplementedError("execute is not implemented")
+
+    @staticmethod
+    def tune_config(**kwargs) -> Optional[dict]:
+        """Return this backend's chosen internal config (a flat, JSON-able dict).
+
+        Default ``None`` = no internal autotune to pin. Backends with a per-shape
+        internal autotune (Triton blockwise / FlyDSL) override this to run that
+        search once and return the winning config; ``execute`` then accepts it back
+        via ``backend_config=`` to skip the runtime search (see dispatcher pin flow).
+        """
+        return None
 
 
 @dataclass(frozen=True)
@@ -327,58 +349,60 @@ def _decode_key(x: Any) -> Any:
     return x
 
 
+@dataclass
+class TuneEntry:
+    """One tuned result: the chosen backend, its optional internal config, and perf.
+
+    ``backend_config`` is the backend's own opaque flat dict (None = nothing to pin);
+    ``perf`` is profiling metadata (e.g. ``{"time_ms": ...}``), informational only.
+    """
+
+    backend: Type[KernelBackend]
+    backend_config: Optional[dict] = None
+    perf: Optional[dict] = None
+
+
 class TuneCache:
-    """LRU cache for storing tuned backend results."""
+    """LRU cache mapping a tune key to its :class:`TuneEntry`."""
 
     def __init__(self, capacity: int = 1024):
         self._capacity = capacity
-        self._cache: OrderedDict[Hashable, Type[KernelBackend]] = OrderedDict()
-        # per-key profiling result (e.g. {"time_ms": ...}); only for dump_cache, not runtime
-        self._perf: Dict[Hashable, dict] = {}
+        self._entries: OrderedDict[Hashable, TuneEntry] = OrderedDict()
 
-    def get(self, key: Hashable) -> Optional[Type[KernelBackend]]:
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
+    def get(self, key: Hashable) -> Optional[TuneEntry]:
+        if key in self._entries:
+            self._entries.move_to_end(key)
+            return self._entries[key]
         return None
 
-    def put(self, key: Hashable, value: Type[KernelBackend]) -> None:
-        if key in self._cache:
-            self._cache.move_to_end(key)
-        elif len(self._cache) >= self._capacity:
+    def put(self, key: Hashable, entry: TuneEntry) -> None:
+        if key in self._entries:
+            self._entries.move_to_end(key)
+        elif len(self._entries) >= self._capacity:
             warnings.warn(
                 f"TuneCache capacity ({self._capacity}) exceeded. "
                 f"Input shapes changing frequently - AutoTune may not be beneficial. "
                 f"Consider disabling AutoTune or using fixed shapes.",
                 stacklevel=2,
             )
-            evicted_key, _ = self._cache.popitem(last=False)
-            self._perf.pop(evicted_key, None)
-        self._cache[key] = value
-
-    def set_perf(self, key: Hashable, perf: dict) -> None:
-        self._perf[key] = perf
-
-    def get_perf(self, key: Hashable) -> Optional[dict]:
-        return self._perf.get(key)
+            self._entries.popitem(last=False)
+        self._entries[key] = entry
 
     def clear(self) -> None:
-        self._cache.clear()
-        self._perf.clear()
+        self._entries.clear()
 
     def items(self) -> List[tuple]:
-        """Return ``(key, backend_impl)`` pairs (for serialization)."""
-        return list(self._cache.items())
+        """Return ``(key, TuneEntry)`` pairs (for serialization)."""
+        return list(self._entries.items())
 
     def __len__(self) -> int:
-        return len(self._cache)
+        return len(self._entries)
 
     def __contains__(self, key: Hashable) -> bool:
-        return key in self._cache
+        return key in self._entries
 
 
 def _format_kwargs(kwargs: Dict[str, Any]) -> str:
-
     def _format_value(v):
         if isinstance(v, torch.Tensor):
             return f"Tensor(shape={v.shape}, dtype={v.dtype})"
@@ -402,6 +426,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
     # Basename of this dispatcher's tune-config asset, e.g. "gemm_fp8" ->
     # configs/pytorch/<arch>/gemm_fp8.json. None => no packaged asset to auto-load.
     _tune_config_name: Optional[str] = None
+    _tune_config_loaded: bool = False  # latch: packaged asset auto-loaded at most once
 
     @staticmethod
     def _is_graph_capturing() -> bool:
@@ -434,20 +459,27 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
     def dump_cache(cls, path: str) -> int:
         """Serialize this dispatcher's tuned cache to a JSON file.
 
-        Each entry is ``{"key": <encoded_key>, "backend": <name>, "perf": <dict|null>}``.
-        Only the *selected backend* is stored; per-backend internal config is out of
-        scope here (handled separately by warmup / pin). ``perf`` carries profiling
-        metadata (e.g. ``{"time_ms": ...}``) when available. Returns entries written.
+        Each entry is ``{"key", "backend", "backend_config", "perf"}``.
+        ``backend_config`` is the selected backend's internal config (``null`` when
+        the backend has none / not pinned); ``perf`` carries profiling metadata
+        (e.g. ``{"time_ms": ...}``). Returns entries written.
         """
         if cls._cache is None:
             return 0
         impl_to_name = {entry.impl: bt.name for bt, entry in cls._backends.items()}
         entries = []
-        for key, impl in cls._cache.items():
-            name = impl_to_name.get(impl)
+        for key, tuned in cls._cache.items():
+            name = impl_to_name.get(tuned.backend)
             if name is None:
-                continue  # impl not registered in _backends; skip
-            entries.append({"key": _encode_key(key), "backend": name, "perf": cls._cache.get_perf(key)})
+                continue  # backend not registered in _backends; skip
+            entries.append(
+                {
+                    "key": _encode_key(key),
+                    "backend": name,
+                    "backend_config": tuned.backend_config,
+                    "perf": tuned.perf,
+                }
+            )
         with open(path, "w") as f:
             json.dump({"dispatcher": cls.__name__, "entries": entries}, f, indent=2)
         return len(entries)
@@ -456,7 +488,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
     def load_cache(cls, path: str) -> int:
         """Load a JSON tune cache produced by ``dump_cache`` into this dispatcher.
 
-        Only ``key`` and ``backend`` are used at runtime (``perf`` is informational).
+        Loads ``key`` -> ``backend`` + ``backend_config`` (``perf`` is informational).
         Unknown / unregistered backends are skipped (logged once). Returns entries loaded.
         """
         if cls._cache is None:
@@ -470,7 +502,10 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
             if entry is None:
                 logger.warning(f"Tune cache {path}: backend '{name}' unavailable, skipped.", once=True)
                 continue
-            cls._cache.put(_decode_key(encoded_key), entry.impl)
+            cls._cache.put(
+                _decode_key(encoded_key),
+                TuneEntry(entry.impl, entry_json.get("backend_config"), entry_json.get("perf")),
+            )
             loaded += 1
         return loaded
 
@@ -482,7 +517,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         Skipped while auto-tune is on (offline tuning / pure runtime tune ignore
         the asset, so the fresh profiling cache is never polluted).
         """
-        if cls._tune_config_name is None or cls.__dict__.get("_tune_config_loaded"):
+        if cls._tune_config_name is None or cls._tune_config_loaded:
             return
         if GlobalBackendManager.auto_tune_enabled():
             return  # retry once auto-tune is turned off
@@ -491,18 +526,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
             arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         except Exception:
             return
-        path = os.path.normpath(
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "..",
-                "tuning",
-                "configs",
-                "pytorch",
-                arch,
-                f"{cls._tune_config_name}.json",
-            )
-        )
+        path = os.path.join(_TUNE_CONFIGS_ROOT, "pytorch", arch, f"{cls._tune_config_name}.json")
         if os.path.isfile(path):
             logger.info(f"{cls.__name__}: loaded {cls.load_cache(path)} tuned entries from {path}")
 
@@ -512,42 +536,51 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
 
     @classmethod
     @torch.no_grad()
-    def profile(cls, backend: Type[KernelBackend], **kwargs) -> float:
+    def profile(cls, backend: Type[KernelBackend], backend_config: Optional[dict] = None, **kwargs) -> float:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
         # warm-up
         for _ in range(cls._warmup_iters):
-            backend.execute(**kwargs)
+            backend.execute(**kwargs, backend_config=backend_config)
             torch.cuda.synchronize()
 
         torch.cuda.synchronize()
         start.record()
         for _ in range(cls._profile_iters):
-            backend.execute(**kwargs)
+            backend.execute(**kwargs, backend_config=backend_config)
         end.record()
         torch.cuda.synchronize()
 
         return start.elapsed_time(end) / cls._profile_iters
 
     @classmethod
-    def tune(cls, **kwargs) -> Optional[Type[KernelBackend]]:
-        """Profile all compatible backends and cache the fastest one."""
+    def tune_backend(cls, **kwargs) -> tuple[Optional[Type[KernelBackend]], Optional[dict]]:
+        """Profile all compatible backends and cache the fastest one.
+
+        Returns ``(backend, backend_config)``. ``backend_config`` is the winning
+        backend's internal config (``None`` for backends without an internal
+        autotune), captured so ``dump_cache`` can persist it for later pinning.
+        Distinct from ``KernelBackend.tune_config`` (which picks a backend's *internal*
+        config); this picks the *backend*.
+        """
         key = cls.make_key(**kwargs)
 
-        cached_backend = cls._cache.get(key)
-        if cached_backend is not None:
-            return cached_backend
+        cached = cls._cache.get(key)
+        if cached is not None:
+            return cached.backend, cached.backend_config
 
         best_backend = None
+        best_cfg = None
         best_time = float("inf")
         for entry in cls._backends.values():
             if not entry.autotune:
                 continue
             if entry.impl.can_handle(**kwargs):
+                cfg = entry.impl.tune_config(**kwargs)  # backend picks its internal config (or None)
                 torch.cuda.synchronize()
                 try:
-                    cur_time = cls.profile(entry.impl, **kwargs)
+                    cur_time = cls.profile(entry.impl, cfg, **kwargs)
                 except Exception:
                     cur_time = float("inf")
                 finally:
@@ -555,11 +588,11 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                 if cur_time < best_time:
                     best_time = cur_time
                     best_backend = entry.impl
+                    best_cfg = cfg
 
         if best_backend is not None:
-            cls._cache.put(key, best_backend)
-            cls._cache.set_perf(key, {"time_ms": best_time})
-        return best_backend
+            cls._cache.put(key, TuneEntry(best_backend, best_cfg, {"time_ms": best_time}))
+        return best_backend, best_cfg
 
     @classmethod
     def dispatch(
@@ -579,35 +612,39 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                     f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
                     f"Please check input constraints or choose a different backend."
                 )
-            return entry.impl.execute(**kwargs)
+            # auto-tune only this forced backend's internal config; else default cfg.
+            cfg = None
+            if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
+                cfg = entry.impl.tune_config(**kwargs)
+                cls._cache.put(cls.make_key(**kwargs), TuneEntry(entry.impl, cfg))
+            return entry.impl.execute(**kwargs, backend_config=cfg)
 
-        # 2. Auto tune
-        # NOTE: Skip autotune during cuda graph capture.
+        # 2. Auto tune (skipped during cuda graph capture)
         if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
-            backend_cls = cls.tune(**kwargs)
+            backend_cls, backend_cfg = cls.tune_backend(**kwargs)
             if backend_cls is not None:
-                return backend_cls.execute(**kwargs)
+                return backend_cls.execute(**kwargs, backend_config=backend_cfg)
 
-        # 2.5 Reuse a loaded/tuned backend choice without profiling (empty/None cache -> skip).
-        cls._ensure_tune_config_loaded()  # lazy one-time load of the packaged tune-config asset
+        # 3. Tuned cache lookup (no profiling); auto-loads the packaged asset once.
+        cls._ensure_tune_config_loaded()
         if cls._cache:
             cached = cls._cache.get(cls.make_key(**kwargs))
-            if cached is not None and cached.can_handle(**kwargs):
-                return cached.execute(**kwargs)
+            if cached is not None and cached.backend.can_handle(**kwargs):
+                return cached.backend.execute(**kwargs, backend_config=cached.backend_config)
 
-        # 3. Default backend
+        # 4. Default backend
         default_entry = cls._backends.get(default_backend_enum)
         if default_entry is not None and default_entry.impl.can_handle(**kwargs):
-            return default_entry.impl.execute(**kwargs)
+            return default_entry.impl.execute(**kwargs, backend_config=None)
 
-        # 4. Fallback: try all backends
+        # 5. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
                 logger.warning(
                     f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, fallback backend {fallback_backend_enum.name} is selected. The fallback backend may hurt performance!",
                     once=True,
                 )
-                return fallback_backend_entry.impl.execute(**kwargs)
+                return fallback_backend_entry.impl.execute(**kwargs, backend_config=None)
 
         raise ValueError(
             f"No compatible backend found for {cls.__name__} with inputs: {_format_kwargs(kwargs)}"

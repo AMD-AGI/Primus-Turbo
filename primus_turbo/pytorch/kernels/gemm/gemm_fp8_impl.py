@@ -120,6 +120,7 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8(
             a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
@@ -186,6 +187,7 @@ class GEMMFP8CKBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         if trans_c:
             lhs, rhs = b, a
@@ -249,6 +251,7 @@ class GEMMFP8TritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         if granularity == ScalingGranularity.TENSORWISE:
             return gemm_fp8_tensorwise_triton_kernel(
@@ -333,6 +336,7 @@ class GEMMFP8TurboBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         return torch.ops.primus_turbo_cpp_extension.turbo_gemm_fp8(
             a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
@@ -397,6 +401,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             out = gemm_mxfp8_flydsl_kernel(

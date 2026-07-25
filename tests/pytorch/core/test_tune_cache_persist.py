@@ -13,6 +13,7 @@ from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
     KernelBackend,
+    TuneEntry,
 )
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 
@@ -56,8 +57,8 @@ def test_tune_cache_roundtrip(tmp_path):
 
     k1 = d.make_key(16, 2048, 4096, torch.float8_e4m3fn, True, ScalingGranularity.ROWWISE)
     k2 = d.make_key(32, 2048, 4096, torch.bfloat16, False, ScalingGranularity.BLOCKWISE)
-    d._cache.put(k1, _DummyTriton)
-    d._cache.put(k2, _DummyCK)
+    d._cache.put(k1, TuneEntry(_DummyTriton))
+    d._cache.put(k2, TuneEntry(_DummyCK))
 
     path = tmp_path / "dummy.json"
     assert d.dump_cache(str(path)) == 2
@@ -66,7 +67,7 @@ def test_tune_cache_roundtrip(tmp_path):
     import json
 
     entries = json.loads(path.read_text())["entries"]
-    assert set(entries[0]) == {"key", "backend", "perf"}
+    assert set(entries[0]) == {"key", "backend", "backend_config", "perf"}
 
     # Fresh cache, then reload from disk.
     d._cache.clear()
@@ -74,8 +75,8 @@ def test_tune_cache_roundtrip(tmp_path):
     assert d.load_cache(str(path)) == 2
 
     # Keys must round-trip to the identical hashable -> lookup hits, maps to same impl.
-    assert d._cache.get(k1) is _DummyTriton
-    assert d._cache.get(k2) is _DummyCK
+    assert d._cache.get(k1).backend is _DummyTriton
+    assert d._cache.get(k2).backend is _DummyCK
 
 
 class _RetTriton(KernelBackend):
@@ -118,7 +119,7 @@ def test_dispatch_uses_loaded_cache():
         assert d.dispatch(BackendType.CK, m=16) == "ck"
 
         # Cache says TRITON for m=16 -> lookup wins over the CK default.
-        d._cache.put(d.make_key(m=16), _RetTriton)
+        d._cache.put(d.make_key(m=16), TuneEntry(_RetTriton))
         assert d.dispatch(BackendType.CK, m=16) == "triton"
 
         # Un-cached key -> default backend.

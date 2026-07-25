@@ -50,7 +50,7 @@ def test_offline_cache_end_to_end_gemm_fp8(tmp_path, monkeypatch):
 
         # 3. autotune off + loaded cache -> dispatch hits the cached backend (spy on its execute).
         GlobalBackendManager.set_auto_tune(False)
-        cached_impl = snapshot[0][1]
+        cached_impl = snapshot[0][1].backend
         hits = {"n": 0}
         orig_execute = cached_impl.execute
 

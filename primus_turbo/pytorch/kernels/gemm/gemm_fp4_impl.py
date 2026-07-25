@@ -115,6 +115,7 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        backend_config=None,
     ):
         # preshuffled is accepted only so the dispatcher's uniform
         # execute(**kwargs) call works; can_handle already rejected the
@@ -183,6 +184,7 @@ class GEMMFP4AITERBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        backend_config=None,
     ):
         if preshuffled:
             # Fast path: caller guarantees a_scale_inv, b_scale_inv, and b
