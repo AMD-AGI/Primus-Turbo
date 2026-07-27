@@ -625,7 +625,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     def _reset_fp8():  # epoch self-reset (device) -> no host flag reset needed
         pass
 
-    cc, rc = _cu(args.combine_cu, 24), _cu(args.reduce_cu, 0)  # step3 combine default (prod, epoch-comm tuned)
+    cc, rc = _cu(args.combine_cu, 28), _cu(args.reduce_cu, 0)  # step3 combine default (unified w/ fwd L2)
 
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only); grad_gate=... selects the bwd role
         dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(

@@ -16,9 +16,7 @@ Backward (conjugate via the Dispatch<->Combine duality; L2 = fc2, L1 = fc1, as i
   * L2 dgrad: dispatch(dy) + fc2 GEMM (NT via w2^T) MXFP8 -> grad_swiglu + rowwise-fp8 dispatched-dy pool.
   * SwiGLU^T (bf16), re-inject routing weight, gate grad, act_weighted (dW2 b-operand).
   * dW2   variable-K wgrad (MXFP8), a-operand requant-fused from the L2-dgrad fp8 pool.
-  * L1 dgrad: fc1 GEMM (fp8) + combine/reduce (fp8-PUSH). The epoch self-reset flags removed the
-    host reset-race that used to stall this combine at large T (now stable through T=8192).
-  * dW1   variable-K wgrad (MXFP8), LOCAL -- reuses the FORWARD-dispatched fc1-input pool.
+  * STEP3: fc1 dgrad + combine + reduce (fused) -> dx; then dW1 variable-K wgrad (serial).
 """
 
 from typing import Tuple
@@ -191,7 +189,7 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
         grad_l1, w1tf, list(handle), group,
         topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
         x_fp8_rowwise=grad_l1_rowwise_fp8,
-        BM=block_m, BN=block_n, num_combine_cu=24,  # retuned 16->24 for epoch comm (T=8192, +5.2%)
+        BM=block_m, BN=block_n, num_combine_cu=28,  # unified w/ fwd L2 (task-based push; T=8192)
     )
     grad_topk_weights = d_topk_w_flat[: num_tokens * num_topk].view(num_tokens, num_topk)
     return dx, grad_topk_weights
@@ -242,7 +240,7 @@ def mega_moe_backward_fp8_impl(
     """Fused mxfp8 MoE backward (conjugate of forward via the Dispatch<->Combine duality).
 
     L2 dgrad: dispatch(dy)+fc2 (fp8 fork) -> SwiGLU^T (re-inject routing weight + gate grad)
-    -> dW2 variable-K wgrad -> L1 dgrad: fc1 + combine (fp8-PUSH) -> dW1 variable-K wgrad (LOCAL).
+    -> dW2 variable-K wgrad -> STEP3 (fused fc1 dgrad+combine -> dx, then serial dW1 wgrad).
     The version-keyed w1^T / w2^T dgrad quant is maintained inside the L2/L1 dgrad helpers.
 
     Returns ``(dx, grad_topk_weights, dW1, dW2)`` with dW1/dW2 cast back to the weight dtypes.
@@ -275,17 +273,12 @@ def mega_moe_backward_fp8_impl(
     # the L2-dgrad rowwise-fp8 pool. Run before anything else overwrites symm.pool_fp8.
     dW2 = _mxfp8_variable_k_wgrad(dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs, meta=meta)
 
-    # L1 dgrad (fp8-PUSH): fc1 dgrad + combine + unweighted reduce + grad_gate scatter -> dx +
-    # grad_topk_weights. Uses the pre-quantized rowwise grad_l1 (fused above; combine skips its
-    # internal quant). (epoch self-reset flags -> no host reset-race stall; stable through T=8192.)
+    # STEP3: fused fc1 dgrad + combine + reduce -> dx; then dW1 variable-K wgrad (serial).
     dx, grad_topk_weights = _l1_dgrad_combine_mxfp8_flydsl_kernel(
         grad_l1, w1, group, handle, block_m, block_n,
         grad_gate=grad_gate, topk_idx=topk_idx, num_tokens=num_tokens, num_topk=num_topk,
         grad_l1_rowwise_fp8=(gl1_q_row, gl1_a_sp),
     )
-
-    # dW1 (MXFP8 variable-K, LOCAL): grad_l1^T @ pool_x -- `a` = pre-quantized colwise grad_l1 (fused
-    # above); `b` = the FORWARD-dispatched fc1-input pool (rowwise-fp8, cloned on ctx), NO re-dispatch.
     dW1 = _mxfp8_variable_k_wgrad_dw1((gl1_q_col, gl1_s_col), pool_x_fp8, meta)
 
     return dx, grad_topk_weights, dW1.to(w1.dtype), dW2.to(w2.dtype)
