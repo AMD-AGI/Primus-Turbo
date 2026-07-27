@@ -109,23 +109,19 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             a_row, a_row_scale = quantized_a.qdata, quantized_a.scale_inv
             group_offs_padded_rowwise = quantized_a.group_offs
             if a_t is None:
-                # The colwise (wgrad) operand must carry grouped_quantize_fp4_with_trans'
-                # 512-aligned-per-group layout to match grad_out in the FlyDSL wgrad;
-                # QuantizedTensor.quantize(axis=-2) pads each group differently, so the
-                # contraction widths mismatch for unbalanced groups.
-                _, _, a_col, a_col_scale, _, _, _, _ = grouped_quantize_fp4_with_trans(
+                quantized_a_t = QuantizedTensor.quantize(
                     quantized_a.dequantize(),
-                    float4_e2m1fn_x2,
+                    quantized_a.real_dtype,
                     config.granularity,
-                    group_lens,
-                    group_offs,
-                    block_size=MXFP4_BLOCK_SIZE,
-                    scaling_recipe=a_scaling_recipe,
-                    scaling_recipe_for_trans=a_t_scaling_recipe,
+                    axis=-2,
+                    block_size=config.block_size,
+                    scaling_recipe=a_t_scaling_recipe,
+                    group_lens=group_lens,
                 )
             else:
                 assert isinstance(a_t, QuantizedTensor)
-                a_col, a_col_scale = a_t.qdata, a_t.scale_inv
+                quantized_a_t = a_t
+            a_col, a_col_scale = quantized_a_t.qdata, quantized_a_t.scale_inv
 
         # --- B: 3D weight (G, N, K). row-wise (rht=F) is the fwd operand; col-wise
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
@@ -189,7 +185,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         a_col, a_col_scale, b_col, b_col_scale, group_lens, group_offs = ctx.saved_tensors
 
-        # --- grad_out: fused grouped dual-quant in one bf16 read
+        # --- grad_out: fused grouped dual-quant in one 16-bit read
         grad_out_scaling_recipe = ScalingRecipe(
             use_sr=ctx.config.use_gradient_sr,
         )

@@ -91,75 +91,6 @@ def _cvt_microblock_to_fp4(vf, scale_native_f32):
     return words
 
 
-def _build_row_kernel(use_rht):
-    """Factory: fresh @flyc.kernel with RHT baked in as a Python constant."""
-
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
-    def _row_cast_kernel(
-        X: fx.Tensor,  # int32 view of bf16 [R, C], shape [R, C/2]
-        OUT: fx.Tensor,  # int32 view of fp4 bytes [R, C/2], shape [R, C/8]
-        SCALE: fx.Tensor,  # uint8 [R, C/32]
-        R: fx.Int32,
-        C: fx.Int32,
-    ):
-        g = fx.block_idx.x * fx.Int32(BLK) + fx.thread_idx.x
-        mb_per_row = C >> 5  # C / 32
-        row = g // mb_per_row
-        mb = g % mb_per_row
-        # ---- load 16 i32 (32 bf16) from X (i32 view: offsets in i32 words) ----
-        x_words = R * (C >> 1)
-        rsrc = buffer_ops.create_buffer_resource(X, max_size=False, num_records_bytes=x_words * 4)
-        i32base = row * (C >> 1) + mb * 16
-        vbits = []  # 32 f32-bit i32 values
-        for c in range_constexpr(4):
-            wv = buffer_ops.buffer_load(rsrc, i32base + c * 4, vec_width=4, dtype=T.i32)
-            for j in range_constexpr(4):
-                w = wv[j]
-                vbits.append(w << 16)  # even bf16
-                vbits.append(w & 0xFFFF0000)  # odd bf16
-        vf = [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in vbits]
-        if use_rht:
-            vf = _rht16(vf[0:16]) + _rht16(vf[16:32])
-        # ---- amax over 32 (int-max on abs bits) ----
-        amax = fx.Int32(0)
-        for i in range_constexpr(32):
-            b = Vec.from_elements([vf[i]], fx.Float32).bitcast(fx.Int32)[0]
-            amax = _imax(amax, _abs_i32(b))
-        native_bits, biased = _compute_scale_native(amax)
-        scale_native = arith.bitcast(T.f32, native_bits)
-        words = _cvt_microblock_to_fp4(vf, scale_native)
-        # ---- store fp4: OUT i32 view [R, C/8]; offset = row*(C/8) + mb*4 + c ----
-        out_words = R * (C >> 3)
-        orsrc = buffer_ops.create_buffer_resource(OUT, max_size=False, num_records_bytes=out_words * 4)
-        outbase = row * (C >> 3) + mb * 4
-        for c in range_constexpr(4):
-            buffer_ops.buffer_store(words[c], orsrc, outbase + c)
-        # ---- store scale byte: SCALE [R, C/32] u8; offset = row*(C/32) + mb ----
-        sc_nbytes = R * mb_per_row
-        srsrc = buffer_ops.create_buffer_resource(SCALE, max_size=False, num_records_bytes=sc_nbytes)
-        buffer_ops.buffer_store(arith.trunci(T.i8, biased & 0xFF), srsrc, row * mb_per_row + mb)
-
-    return _row_cast_kernel
-
-
-def _build_row_launch(use_rht):
-    kern = _build_row_kernel(use_rht)
-
-    @flyc.jit
-    def _row_cast_launch(
-        X: fx.Tensor,
-        OUT: fx.Tensor,
-        SCALE: fx.Tensor,
-        R: fx.Int32,
-        C: fx.Int32,
-        grid_x: fx.Int32,
-        stream: fx.Stream,
-    ):
-        kern(X, OUT, SCALE, R, C).launch(grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream)
-
-    return _row_cast_launch
-
-
 def _store_words_vec4(rsrc, off, words):
     """One b128 (vec4) buffer_store of 4 contiguous i32 fp4-packed words, instead
     of 4 scalar b32 stores (4x fewer store instructions, same bytes/values)."""
@@ -755,27 +686,3 @@ def flydsl_dual_quant_batched(x3d, fp4_dtype, row_rht, col_rht, row_2d=False, co
         co.view(torch.uint8).view(fp4_dtype),
         cs.view(torch.float8_e8m0fnu),
     )
-
-
-# raw @flyc.jit launchers (rht off / on), built once
-_ROW_LAUNCH = {False: _build_row_launch(False), True: _build_row_launch(True)}
-_ROW_COMPILED = {}
-
-
-def get_row_cast(R, C, use_rht):
-    """Return (compiled_fn, grid_x) for the row cast at (R, C, use_rht)."""
-    key = (int(R), int(C), bool(use_rht))
-    ent = _ROW_COMPILED.get(key)
-    if ent is None:
-        import torch
-
-        x = torch.zeros((R, C // 2), dtype=torch.int32, device="cuda")
-        out = torch.zeros((R, C // 8), dtype=torch.int32, device="cuda")
-        sc = torch.zeros((R, C // 32), dtype=torch.uint8, device="cuda")
-        grid_x = (R * (C // 32) + BLK - 1) // BLK
-        stream = torch.cuda.current_stream()
-        raw = _ROW_LAUNCH[bool(use_rht)]
-        fn = flyc.compile(raw, x, out, sc, R, C, grid_x, stream)
-        ent = (fn, grid_x)
-        _ROW_COMPILED[key] = ent
-    return ent
