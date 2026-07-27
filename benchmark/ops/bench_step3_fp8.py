@@ -145,7 +145,7 @@ def profile(group, args):
     w1tf = _w1t_combine_fp8_cached(W1)
     rowwise = (gl1_q_row, gl1_a_sp)
     tki = topk_idx.contiguous().view(-1)
-    combine_cu = getattr(args, "combine_cu", 24)
+    combine_cu = getattr(args, "combine_cu", 28)
 
     def _step3():
         return grouped_gemm_combine_mxfp8_flydsl_kernel(
