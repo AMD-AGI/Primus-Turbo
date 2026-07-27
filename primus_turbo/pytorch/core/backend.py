@@ -293,6 +293,11 @@ class KernelBackend(ABC):
         whether to use it: backends with an internal autotune (Triton blockwise /
         FlyDSL) apply the pinned config (None -> their fixed default, never bench);
         all others ignore it.
+
+        A consuming backend must also *validate* the config before use: it is opaque
+        to the framework, so only the backend can tell that one pinned by an older
+        build no longer fits the kernel. A mismatch costs performance, not
+        correctness, so warn and fall back to the default rather than fail.
         """
         raise NotImplementedError("execute is not implemented")
 
@@ -614,11 +619,18 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                     f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
                     f"Please check input constraints or choose a different backend."
                 )
-            # auto-tune only this forced backend's internal config; else default cfg.
-            cfg = None
-            if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
+            # Backend is settled; only its internal config is open. A cached entry may
+            # name a *different* backend, whose config is not ours to consume.
+            key = cls.make_key(**kwargs)
+            cls._ensure_tune_config_loaded()
+            cached = cls._cache.get(key)
+            if cached is not None and cached.backend is entry.impl:
+                cfg = cached.backend_config
+            elif GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
                 cfg = entry.impl.tune_config(**kwargs)
-                cls._cache.put(cls.make_key(**kwargs), TuneEntry(entry.impl, cfg))
+                cls._cache.put(key, TuneEntry(entry.impl, cfg))
+            else:
+                cfg = None
             return entry.impl.execute(**kwargs, backend_config=cfg)
 
         # 2. Auto tune (skipped during cuda graph capture)

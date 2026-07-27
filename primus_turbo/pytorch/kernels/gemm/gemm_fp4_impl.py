@@ -300,6 +300,7 @@ _GEMM_FP4_BACKENDS = {
 class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
     _backends = _GEMM_FP4_BACKENDS
     _cache = TuneCache(1024)
+    _tune_config_name = "gemm_fp4"  # auto-load configs/pytorch/<arch>/gemm_fp4.json
 
     @classmethod
     def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, preshuffled=False, **kwargs):

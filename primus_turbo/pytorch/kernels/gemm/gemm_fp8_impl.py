@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -35,6 +35,7 @@ from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_triton_kernel,
     gemm_fp8_rowwise_triton_kernel,
     gemm_fp8_tensorwise_triton_kernel,
+    tune_gemm_fp8_blockwise_triton_kernel,
 )
 
 
@@ -241,6 +242,24 @@ class GEMMFP8TritonBackend(KernelBackend):
         return supported
 
     @staticmethod
+    def tune_config(
+        a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, granularity, **kwargs
+    ) -> Optional[dict]:
+        # Blockwise is the only granularity with a per-shape internal autotune.
+        if granularity != ScalingGranularity.BLOCKWISE:
+            return None
+        return tune_gemm_fp8_blockwise_triton_kernel(
+            a,
+            a_scale_inv,
+            b,
+            b_scale_inv,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            out_dtype=out_dtype,
+            trans_c=trans_c,
+        )
+
+    @staticmethod
     def execute(
         a: torch.Tensor,
         a_scale_inv: torch.Tensor,
@@ -276,6 +295,8 @@ class GEMMFP8TritonBackend(KernelBackend):
                 trans_c=trans_c,
             )
         elif granularity == ScalingGranularity.BLOCKWISE:
+            # No auto_tune here: searching is tune_config()'s job, and benching during
+            # serving would stall inference and break CUDA graph capture.
             return gemm_fp8_blockwise_triton_kernel(
                 a,
                 a_scale_inv,
@@ -285,7 +306,6 @@ class GEMMFP8TritonBackend(KernelBackend):
                 trans_b=trans_b,
                 out_dtype=out_dtype,
                 trans_c=trans_c,
-                auto_tune=GlobalBackendManager.auto_tune_enabled(),
                 backend_config=backend_config,
             )
         else:

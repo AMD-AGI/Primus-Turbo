@@ -90,6 +90,7 @@ _GEMM_BACKENDS = {
 class GEMMKernelDispatcher(AutoKernelDispatcher):
     _backends = _GEMM_BACKENDS
     _cache = TuneCache(1024)
+    _tune_config_name = "gemm"  # auto-load configs/pytorch/<arch>/gemm.json
 
     @classmethod
     def make_key(cls, a, b, trans_a, trans_b, out_dtype, trans_c, **kwargs):
