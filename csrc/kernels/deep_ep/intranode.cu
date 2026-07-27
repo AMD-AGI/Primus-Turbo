@@ -495,16 +495,36 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         }
     }
 
-    // Clean unused `recv_topk_idx` as -1
+    // Clean unused worst-token tail rows [num_recv_tokens, num_worst_tokens).
+    // recv_topk_idx -> -1; recv_x / recv_topk_weights / recv_x_scales -> 0.
+    // AIMA-219: recv_x was left as torch::empty tail here, and the sync-free
+    // grouped gemm reads the full worst-token shape -> NaN weight grad in the
+    // dispatch-combine backward. Zero the activation tail too, not just the idx.
     if (num_worst_tokens > 0) {
         auto       rank_prefix_matrix = static_cast<int *>(buffer_ptrs[rank]);
         const auto num_recv_tokens    = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + rank];
-        const auto clean_start        = num_recv_tokens * num_topk + sm_id * kNumThreads;
-        const auto clean_end          = num_worst_tokens * num_topk;
-        const auto clean_stride       = num_sms * kNumThreads;
-#pragma unroll 2
-        for (int i = clean_start + thread_id; i < clean_end; i += clean_stride)
+        const auto base               = sm_id * kNumThreads + thread_id;
+        const auto stride             = num_sms * kNumThreads;
+
+        for (int i = num_recv_tokens * num_topk + base; i < num_worst_tokens * num_topk; i += stride)
             recv_topk_idx[i] = -1;
+
+        if (recv_topk_weights != nullptr) {
+            for (int i = num_recv_tokens * num_topk + base; i < num_worst_tokens * num_topk;
+                 i += stride)
+                recv_topk_weights[i] = 0.0f;
+        }
+
+        const int4 zero4 = make_int4(0, 0, 0, 0);
+        for (int64_t i = static_cast<int64_t>(num_recv_tokens) * hidden_int4 + base;
+             i < static_cast<int64_t>(num_worst_tokens) * hidden_int4; i += stride)
+            recv_x[i] = zero4;
+
+        if (recv_x_scales != nullptr && num_scales > 0) {
+            for (int64_t i = static_cast<int64_t>(num_recv_tokens) * num_scales + base;
+                 i < static_cast<int64_t>(num_worst_tokens) * num_scales; i += stride)
+                recv_x_scales[i] = 0.0f;
+        }
     }
 }
 

@@ -104,9 +104,14 @@ class _MoEPermute(torch.autograd.Function):
         else:
             num_permuted_alloc = int(tokens_per_expert.sum().item())
 
-        permuted_tokens = torch.empty((num_permuted_alloc, hidden_size), dtype=tokens.dtype, device=device)
+        # AIMA-219: zeros (not empty) so worst-token padding rows (num_permuted_alloc
+        # > actual dispatched) are well-defined. The permute kernel only writes real
+        # + per-expert-pad slots; the unmasked bias-activation / grouped-gemm then
+        # read the full worst-case shape, so an uninitialized tail surfaces as NaN
+        # in the dispatch-combine backward grad.
+        permuted_tokens = torch.zeros((num_permuted_alloc, hidden_size), dtype=tokens.dtype, device=device)
         if use_fp8 and scaling_factor is not None:
-            permuted_scaling_factor = torch.empty(
+            permuted_scaling_factor = torch.zeros(
                 (num_permuted_alloc, scales_per_token),
                 dtype=scaling_factor.dtype,
                 device=device,
@@ -114,7 +119,7 @@ class _MoEPermute(torch.autograd.Function):
         else:
             permuted_scaling_factor = None
         permuted_probs = (
-            torch.empty((num_permuted_alloc,), dtype=probs.dtype, device=device)
+            torch.zeros((num_permuted_alloc,), dtype=probs.dtype, device=device)
             if probs is not None
             else None
         )
@@ -288,8 +293,8 @@ class _MoEUnpermute(torch.autograd.Function):
         row_id_map, num_dispatched_tokens_tensor = ctx.saved_tensors
         grad_unpermuted_tokens = grad_unpermuted_tokens.contiguous()
         device = grad_unpermuted_tokens.device
-        # No pre-fill: kernel zeros padded slots itself (see moe_permute.hip is_padding_token).
-        grad_permuted = torch.empty(
+        # AIMA-219: zeros so worst-token padding rows are defined (see forward note).
+        grad_permuted = torch.zeros(
             (ctx.num_permuted, ctx.hidden_size),
             dtype=grad_unpermuted_tokens.dtype,
             device=device,
@@ -297,7 +302,7 @@ class _MoEUnpermute(torch.autograd.Function):
 
         if ctx.with_probs and unpermuted_probs_grad is not None:
             unpermuted_probs_grad = unpermuted_probs_grad.contiguous()
-            grad_permuted_probs: Optional[torch.Tensor] = torch.empty(
+            grad_permuted_probs: Optional[torch.Tensor] = torch.zeros(
                 (ctx.num_permuted,), dtype=ctx.permuted_probs_dtype, device=device
             )
         else:

@@ -41,6 +41,11 @@ def swiglu_with_mask_fwd_kernel(
 
         extra_mask = tl.load(row_mask_ptr + row_idx, mask=row_mask)
         mask = (row_mask & col_mask) & (extra_mask != 0)
+        # AIMA-219: store ALL in-bounds rows, not just extra_mask rows. Padding
+        # rows compute to 0 (inputs load as 0), so writing them with the bounds
+        # mask zeros the torch.empty tail instead of leaving it uninitialized ->
+        # otherwise fc2's backward weight grad reads NaN over the worst-case shape.
+        store_mask = row_mask & col_mask
 
         up_ptr = x_ptr + row_idx * stride_x_token
         down_ptr = up_ptr + half_stride_x_token
@@ -54,7 +59,7 @@ def swiglu_with_mask_fwd_kernel(
         probs = tl.load(probs_ptr + row_idx * stride_probs_token)
         out = out * probs
 
-        tl.store(out_ptr + row_idx * stride_out_token + col_off, out.to(data_type), mask=mask)
+        tl.store(out_ptr + row_idx * stride_out_token + col_off, out.to(data_type), mask=store_mask)
 
 
 @triton.jit
@@ -95,6 +100,8 @@ def swiglu_with_mask_bwd_kernel(
 
         extra_mask = tl.load(row_mask_ptr + row_idx, mask=row_mask)
         mask = (row_mask & col_mask) & (extra_mask != 0)
+        # AIMA-219: zero the padding-row grad tail (see fwd kernel note).
+        store_mask = row_mask & col_mask
 
         up_ptr = x_ptr + row_idx * stride_x_token
         down_ptr = up_ptr + half_stride_x_token
@@ -126,12 +133,14 @@ def swiglu_with_mask_bwd_kernel(
         grad_up = grad_out_with_probs * (down * grad_silu)
 
         tl.store(
-            grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask
+            grad_x_ptr + row_idx * stride_grad_x_token + col_off,
+            grad_up.to(grad_x_data_type),
+            mask=store_mask,
         )
         tl.store(
             grad_x_ptr + row_idx * stride_grad_x_token + stride_grad_x_token // 2 + col_off,
             grad_down.to(grad_x_data_type),
-            mask=mask,
+            mask=store_mask,
         )
 
 

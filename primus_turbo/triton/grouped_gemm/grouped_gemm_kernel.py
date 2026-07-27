@@ -376,7 +376,12 @@ def grouped_gemm_triton_kernel(
     stride_ak = a.stride(1)  # =1 for contiguous a
 
     # Output
-    out = torch.empty((M_total, N), device=a.device, dtype=a.dtype)
+    # AIMA-219: the kernel only writes rows [0, group_offs[G]) (sum of group
+    # lengths). In sync-free worst-token mode M_total is the worst-case padded
+    # size > sum(group_lens), so the tail rows would stay uninitialized and the
+    # (unmasked) bias-activation then propagates that garbage into fc2's backward
+    # weight grad -> NaN. zeros keeps the tail well-defined with no host sync.
+    out = torch.zeros((M_total, N), device=a.device, dtype=a.dtype)
 
     # Kernel config (cached — origami + LDS check run only on first call per shape)
     num_sms = _get_num_cus()
@@ -614,7 +619,9 @@ def grouped_gemm_variable_k_triton_kernel(
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=lhs.dtype)
+    # AIMA-219: zero so any group skipped by the kernel (e.g. 0-token expert in
+    # worst-token mode) leaves a well-defined 0 weight grad, not uninitialized.
+    out = torch.zeros((G, OUT_M, OUT_N), device=lhs.device, dtype=lhs.dtype)
     num_sms = _get_num_cus()
     dummy_scale = torch.empty(1, device=lhs.device, dtype=torch.float32)
 

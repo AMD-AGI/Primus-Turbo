@@ -629,6 +629,26 @@ void permute_impl(const dtype_t *tokens, dtype_t *permuted_tokens, const scalar_
 
     const int effective_probs_stride = probs_stride > 0 ? probs_stride : num_local_experts;
 
+    // AIMA-219: permute is a scatter — it only writes output rows referenced by
+    // row_id_map. With a worst-token buffer (num_dispatched_max > sum of padded
+    // per-expert counts) the tail rows are never targeted and stay uninitialized
+    // (torch.empty), which the sync-free grouped-gemm then reads over the full
+    // worst-case shape -> NaN in the dispatch-combine backward grad. Unlike
+    // unpermute (a gather that can zero its own padding rows), a scatter cannot,
+    // so zero the whole output first; the scatter overwrites the valid rows.
+    PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(
+        permuted_tokens, 0,
+        static_cast<size_t>(num_dispatched_max) * hidden_size * sizeof(dtype_t), stream));
+    if (permuted_probs != nullptr) {
+        PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(
+            permuted_probs, 0, static_cast<size_t>(num_dispatched_max) * sizeof(prob_t), stream));
+    }
+    if (permuted_scaling_factor != nullptr) {
+        PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(
+            permuted_scaling_factor, 0,
+            static_cast<size_t>(num_dispatched_max) * scales_per_token * sizeof(scalar_t), stream));
+    }
+
 #define LAUNCH_PERMUTE_NC(num_hidden_per_block, NC, grid)                                          \
     permute_kernel<(num_hidden_per_block), (NC), prob_t, scalar_t>                                 \
         <<<grid, (num_hidden_per_block), /*shmem=*/0, stream>>>(                                   \
