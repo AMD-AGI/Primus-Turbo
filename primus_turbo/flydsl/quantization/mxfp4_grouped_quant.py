@@ -26,10 +26,13 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
+    _SR_COL_SALT,
     _compute_scale_native,
     _cvt_microblock_to_fp4,
     _microblock_amax,
     _microblock_vf,
+    _next_sr_seed,
+    _sr_hash,
 )
 from primus_turbo.flydsl.utils.gemm_helper import make_row_band_resource, xcd_remap_pid
 
@@ -74,7 +77,18 @@ def _half_to_f32bits(raw16, is_fp16):
 
 
 def compile_grouped_mxfp4_qdual(
-    total_M, N, G, M_pad_col, N_pad, row_rht, col_rht, bm=64, bk=256, is_fp16=False
+    total_M,
+    N,
+    G,
+    M_pad_col,
+    N_pad,
+    row_rht,
+    col_rht,
+    bm=64,
+    bk=256,
+    is_fp16=False,
+    row_sr=False,
+    col_sr=False,
 ):
     """Compile the fused grouped mxfp4 dual quant. Shapes/recipes are baked.
 
@@ -128,6 +142,7 @@ def compile_grouped_mxfp4_qdual(
         GO: fx.Tensor,  # tight per-group offs (int32 view of int64 [G+1])
         LC: fx.Tensor,  # OUT: 512-aligned per-group lens (int64 [G])
         OC: fx.Tensor,  # OUT: 512-aligned per-group offs (int64 [G+1])
+        SR_SEED: fx.Int32,  # per-launch stochastic-rounding seed (0 when SR off)
     ):
         # Fused dual tile (one BM x BK tile / WG, one microblock/thread). The per-tile
         # group metadata is computed INLINE (no meta prologue kernel): each WG does the
@@ -242,9 +257,11 @@ def compile_grouped_mxfp4_qdual(
                         rbits.append(_half_to_f32bits((v4[j] >> 16) & 0xFFFF, is_fp16))  # high 16b
                 vf = _microblock_vf(rbits, row_rht)
                 native_bits, rbiased = _compute_scale_native(_microblock_amax(vf))
-                rwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits))
                 grow = in_rebase + r_row
                 gcmb = bkc * I32(_CMB) + r_cmb
+                # grid-unique row-microblock seed = its rowwise-scale linear index
+                rseed = _sr_hash(SR_SEED ^ (grow * ROW_SC_N + gcmb)) if row_sr else None
+                rwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), rseed)
                 row_ok = (grow < in_end) & (gcmb * I32(4) < I32(ROW_OUT_W))  # mask N_pad overshoot
                 ob = r_row * I32(ROW_OUT_W) + gcmb * I32(4)  # band-local (in_rebase folded into SRD)
                 for c in range_constexpr(4):
@@ -267,12 +284,14 @@ def compile_grouped_mxfp4_qdual(
                     cbits.append(_half_to_f32bits(raw16, is_fp16))
                 cvf = _microblock_vf(cbits, col_rht)
                 cnative, cbiased = _compute_scale_native(_microblock_amax(cvf))
-                cwords = _cvt_microblock_to_fp4(cvf, arith.bitcast(T.f32, cnative))
+                gcol = bkc * I32(BK) + c_col
+                gmmb = bt * I32(_RMB) + mblk
+                # grid-unique col-microblock seed = its colwise-scale linear index (salted apart from row)
+                cseed = _sr_hash((SR_SEED ^ _SR_COL_SALT) ^ (gcol * COL_SC_N + gmmb)) if col_sr else None
+                cwords = _cvt_microblock_to_fp4(cvf, arith.bitcast(T.f32, cnative), cseed)
                 _lds_store_vec4(
                     lds.ldsc.ptr, c_col * I32(DWPC) + mblk * I32(4), Vec.from_elements(cwords, fx.Int32)
                 )
-                gcol = bkc * I32(BK) + c_col
-                gmmb = bt * I32(_RMB) + mblk
                 buffer_ops.buffer_store(
                     arith.trunci(T.i8, cbiased & 0xFF),
                     cscrsrc,
@@ -300,11 +319,12 @@ def compile_grouped_mxfp4_qdual(
         GO: fx.Tensor,
         LC: fx.Tensor,
         OC: fx.Tensor,
+        SR_SEED: fx.Int32,
         stream: fx.Stream,
     ):
         # Single kernel: per-tile group metadata computed inline (no meta prologue),
         # padded lens/offs emitted by the pid==0 WG.
-        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, GO, LC, OC).launch(
+        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, GO, LC, OC, SR_SEED).launch(
             grid=(NBM * NBK, 1, 1), block=(nth, 1, 1), stream=stream
         )
 
@@ -315,9 +335,11 @@ _GQ_MXFP4_CACHE: dict = {}
 _GQ_MXFP4_CACHE_CAP = 64  # bound the per-(total_M) compiled-quant cache (broad-sweep OOM guard)
 
 
-def grouped_quant_mxfp4_raw(x, group_lens, group_offs, out_dtype, row_rht, col_rht, bm=64, bk=256):
+def grouped_quant_mxfp4_raw(
+    x, group_lens, group_offs, out_dtype, row_rht, col_rht, bm=64, bk=256, row_sr=False, col_sr=False
+):
     """FlyDSL grouped mxfp4 dual quant, drop-in for the HIP grouped_quantize_mxfp4_dual
-    (non-shuffle, non-SR, non-2d recipes). Returns the same 6-tuple:
+    (non-shuffle, non-2d recipes; SR supported = unbiased, not bit-exact). Returns the 6-tuple:
       (rowwise_out [total_M, N_pad/2] fp4, rowwise_scale [total_M, N_pad/32] e8m0,
        colwise_out [N, M_pad_col/2] fp4, colwise_scale [N, M_pad_col/32] e8m0,
        group_lens_padded_col [G], group_offs_padded_col [G+1]).
@@ -348,7 +370,20 @@ def grouped_quant_mxfp4_raw(x, group_lens, group_offs, out_dtype, row_rht, col_r
     lc = lens_col.view(torch.int32)
     oc = offs_col.view(torch.int32)
 
-    key = (total_M, N, G, M_pad_col, N_pad, bool(row_rht), bool(col_rht), int(bm), int(bk), x.dtype)
+    key = (
+        total_M,
+        N,
+        G,
+        M_pad_col,
+        N_pad,
+        bool(row_rht),
+        bool(col_rht),
+        int(bm),
+        int(bk),
+        bool(row_sr),
+        bool(col_sr),
+        x.dtype,
+    )
     comp = _GQ_MXFP4_CACHE.get(key)
     stream = torch.cuda.current_stream()
     xi = x.view(torch.int32)
@@ -366,8 +401,10 @@ def grouped_quant_mxfp4_raw(x, group_lens, group_offs, out_dtype, row_rht, col_r
             bm=bm,
             bk=bk,
             is_fp16=(x.dtype == torch.float16),
+            row_sr=bool(row_sr),
+            col_sr=bool(col_sr),
         )
-        comp = _flyc.compile(launch, xi, roi, row_sc, coi, col_sc, go, lc, oc, stream)
+        comp = _flyc.compile(launch, xi, roi, row_sc, coi, col_sc, go, lc, oc, 0, stream)
         # The cache key includes total_M (a per-step token count), so a broad shape sweep
         # accumulates many compiled quant kernels -> bound it (the live ``comp`` is kept by
         # the local ref, so dropping the dict frees the rest). Real workloads stay under it.
@@ -375,7 +412,8 @@ def grouped_quant_mxfp4_raw(x, group_lens, group_offs, out_dtype, row_rht, col_r
             _GQ_MXFP4_CACHE.clear()
             gc.collect()
         _GQ_MXFP4_CACHE[key] = comp
-    comp(xi, roi, row_sc, coi, col_sc, go, lc, oc, stream)
+    sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
+    comp(xi, roi, row_sc, coi, col_sc, go, lc, oc, sr_seed, stream)
 
     e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
     return (

@@ -22,6 +22,7 @@ import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import _to_raw as _raw
 
 _OOB = 0x7FFFFFFF  # word offset past any SRD -> buffer_load returns 0 / buffer_store dropped
 BLK = 256
@@ -34,6 +35,36 @@ def _abs_i32(fbits):
 
 def _imax(a, b):
     return arith.select(a < b, b, a)
+
+
+# ---- Stochastic rounding (gradient SR) ----------------------------------------
+# SR can't be bit-exact vs the C++ dual (different thread<->element tiling), and it
+# is random by design; the goal is an unbiased, decorrelated rounding. Each launch
+# gets a distinct seed (host counter, mirroring the C++ atomic counter) and each
+# micro-block a grid-unique id (col salted apart from row).
+_SR_COL_SALT = 0x5BD1E995  # decorrelate the col-wise operand from the row-wise one
+_SR_COUNTER = [0]
+
+
+def _next_sr_seed():
+    """Per-launch u32 seed: distinct each launch, reproducible within a process for
+    a fixed call order (matches the C++ ``global_sr_counter`` semantics)."""
+    s = _SR_COUNTER[0] & 0xFFFFFFFF
+    _SR_COUNTER[0] = (_SR_COUNTER[0] + 1) & 0xFFFFFFFF
+    return s
+
+
+def _sr_hash(seed):
+    """Integer avalanche hash for SR seeds (same shape as the C++ ``sr_hash``).
+    Uses ``>>`` (the fx numeric shift accepts a python int; ``shrui`` does not);
+    arithmetic vs logical shift is irrelevant here - SR only needs the resulting
+    seeds well-distributed and decorrelated across micro-blocks/pairs."""
+    seed = (seed ^ 61) ^ (seed >> 16)
+    seed = seed * 9
+    seed = seed ^ (seed >> 4)
+    seed = seed * 0x27D4EB2D
+    seed = seed ^ (seed >> 15)
+    return seed
 
 
 def _compute_scale_native(amax_bits):
@@ -79,14 +110,33 @@ def _rht16(v):
     return r
 
 
-def _cvt_microblock_to_fp4(vf, scale_native_f32):
-    """32 f32 Values -> 4 i32 words (8 fp4 each). Pair-form cvt, dst_sel chaining."""
+def _cvt_microblock_to_fp4(vf, scale_native_f32, seed=None):
+    """32 f32 Values -> 4 i32 words (8 fp4 each). Pair-form cvt, dst_sel chaining.
+    ``seed`` (an i32 Value) switches to the stochastic-rounding converter; one
+    per-thread seed drives all pairs of the micro-block (mirrors the C++ path).
+    Same packing as the plain path (SR op is its exact analog)."""
     words = []
     for wi in range_constexpr(4):
         acc = fx.Int32(0)
         for pair in range_constexpr(4):
             i = wi * 8 + pair * 2
-            acc = rocdl.cvt_scalef32_pk_fp4_f32(T.i32, acc, vf[i], vf[i + 1], scale_native_f32, pair)
+            if seed is None:
+                acc = rocdl.cvt_scalef32_pk_fp4_f32(T.i32, acc, vf[i], vf[i + 1], scale_native_f32, pair)
+            else:
+                # SR op's dst_sel/oldVdst chaining misbehaves (bytes 1-2 corrupt);
+                # mirror the C++ path exactly: one rng for all pairs (per-thread seed),
+                # each pair -> byte 0 with old=0, then OR-shift into place.
+                src = _raw(
+                    Vec.from_elements([fx.Float32(_raw(vf[i])), fx.Float32(_raw(vf[i + 1]))], fx.Float32)
+                )
+                # The llvm.amdgcn.cvt.scalef32.sr.pk.fp4.f32 intrinsic consumes the SR
+                # seed one bit lower than the raw v_cvt asm the C++ path uses, which
+                # halves the round-up probability. Shift left by 1 to realign; drops
+                # only one LSB of a full-entropy hash so the distribution is unaffected.
+                b = rocdl.cvt_scalef32_sr_pk_fp4_f32(
+                    T.i32, _raw(fx.Int32(0)), src, _raw(seed << 1), scale_native_f32, 0
+                )
+                acc = acc | ((fx.Int32(b) & 0xFF) << (pair * 8))
         words.append(acc)
     return words
 
@@ -132,12 +182,14 @@ def _microblock_amax(vf):
     return amax
 
 
-def _finish_microblock(vbits, use_rht):
-    """32 f32-bit i32 values -> (4 fp4 i32 words, scale_e8m0 i8-ready i32)."""
+def _finish_microblock(vbits, use_rht, seed=None):
+    """32 f32-bit i32 values -> (4 fp4 i32 words, scale_e8m0 i8-ready i32).
+    ``seed`` (i32 Value) enables stochastic rounding in the final cvt (amax/scale
+    stay deterministic)."""
     vf = _microblock_vf(vbits, use_rht)
     amax = _microblock_amax(vf)
     native_bits, biased = _compute_scale_native(amax)
-    words = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits))
+    words = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), seed)
     return words, biased
 
 
@@ -197,6 +249,10 @@ def _emit_dual_body(
     RP=None,
     col_locality=False,
     batched=False,
+    row_sr=False,
+    col_sr=False,
+    sr_seed=None,
+    sr_gbid=None,
 ):
     """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for block
     ``bid``. ``row_2d``/``col_2d`` pick the C++ ``USE_2D_BLOCK`` amax geometry; the
@@ -272,6 +328,21 @@ def _emit_dual_body(
     # does NOT wait for LDS); fx.barrier() emits the waitcnt + barrier.
     fx.barrier()
 
+    # Per-micro-block SR seeds: grid-unique block id folds the tile + loop task so
+    # every micro-block in the launch draws an independent seed (col salted apart
+    # from row). Constexpr row_sr/col_sr -> the plain (seed=None) IR when SR is off.
+    _gbid = bid if sr_gbid is None else sr_gbid
+
+    def _row_seed(k):
+        if not row_sr:
+            return None
+        return _sr_hash(sr_seed ^ (_gbid * (BLK * _RROWTASK) + (k * BLK + tid)))
+
+    def _col_seed(mmb):
+        if not col_sr:
+            return None
+        return _sr_hash((sr_seed ^ _SR_COL_SALT) ^ (_gbid * (BLK * _RMB) + (mmb * BLK + tid)))
+
     # ---- ROW phase: 32-elem microblocks along C, contiguous LDS (vec4 reads) ----
     if row_2d:
         # 2D-block amax: the scale spans a whole 32x32 tile = the 32 rows that
@@ -306,7 +377,7 @@ def _emit_dual_body(
             for i in range_constexpr(32):
                 tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, (row_base + i) * _RMBC + cmb))
             native_bits, rbiased = _compute_scale_native(tile_amax)
-            rwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits))
+            rwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), _row_seed(k))
             grow = _row0 + r_row
             gcmb = cblk * _RMBC + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
@@ -330,7 +401,7 @@ def _emit_dual_body(
                     word = v4[j]
                     rbits.append(word << 16)
                     rbits.append(word & 0xFFFF0000)
-            rwords, rbiased = _finish_microblock(rbits, row_rht)
+            rwords, rbiased = _finish_microblock(rbits, row_rht, _row_seed(k))
             grow = _row0 + r_row
             gcmb = cblk * (_TC // 32) + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
@@ -370,7 +441,7 @@ def _emit_dual_body(
             for i in range_constexpr(32):
                 tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, mmb * _TC + col_base + i))
             native_bits, cbiased = _compute_scale_native(tile_amax)
-            cwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits))
+            cwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), _col_seed(mmb))
             gcol = _col0 + c_col
             gmmb = rblk * _RMB + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
@@ -389,7 +460,7 @@ def _emit_dual_body(
                 word = _lds_load1(lds.buf.ptr, (row0 + row) * _TCW + cw)
                 fb = arith.select(half != 0, word & fx.Int32(-65536), word << 16)
                 cbits.append(fb)
-            cwords, cbiased = _finish_microblock(cbits, col_rht)
+            cwords, cbiased = _finish_microblock(cbits, col_rht, _col_seed(mmb))
             gcol = _col0 + c_col
             gmmb = rblk * _RMB + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
@@ -402,11 +473,14 @@ def _emit_dual_body(
             buffer_ops.buffer_store(arith.trunci(T.i8, cbiased & 0xFF), cscrsrc, csoff)
 
 
-def _build_dual_kernel(row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False):
+def _build_dual_kernel(
+    row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False, row_sr=False, col_sr=False
+):
     """Single-recipe fused LDS dual (one coalesced 32x256 tile load feeds both the
     rowwise and colwise-transpose casts). Thin wrapper over ``_emit_dual_body``.
     ``col_locality`` (set for C>R shapes) flips the block order to combine the
-    transpose stores; see ``_emit_dual_body``."""
+    transpose stores; see ``_emit_dual_body``. ``row_sr``/``col_sr`` enable
+    stochastic rounding on that direction (uses the per-launch ``SR_SEED``)."""
     _DualSS = _make_dual_struct(bool(row_2d or col_2d))
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
@@ -418,6 +492,7 @@ def _build_dual_kernel(row_rht, col_rht, row_2d=False, col_2d=False, col_localit
         COL_SC: fx.Tensor,  # uint8 [C, R/32]
         R: fx.Int32,
         C: fx.Int32,
+        SR_SEED: fx.Int32,  # per-launch stochastic-rounding seed (0 when SR off)
     ):
         lds = fx.SharedAllocator().allocate(_DualSS).peek()
         tid = fx.thread_idx.x
@@ -437,13 +512,19 @@ def _build_dual_kernel(row_rht, col_rht, row_2d=False, col_2d=False, col_localit
             C,
             fx.block_idx.x,
             col_locality=col_locality,
+            row_sr=row_sr,
+            col_sr=col_sr,
+            sr_seed=SR_SEED,
+            sr_gbid=fx.block_idx.x,
         )
 
     return _dual_kernel
 
 
-def _build_dual_launch(row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False):
-    kern = _build_dual_kernel(row_rht, col_rht, row_2d, col_2d, col_locality)
+def _build_dual_launch(
+    row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False, row_sr=False, col_sr=False
+):
+    kern = _build_dual_kernel(row_rht, col_rht, row_2d, col_2d, col_locality, row_sr, col_sr)
 
     @flyc.jit
     def _dual_launch(
@@ -454,10 +535,11 @@ def _build_dual_launch(row_rht, col_rht, row_2d=False, col_2d=False, col_localit
         COL_SC: fx.Tensor,
         R: fx.Int32,
         C: fx.Int32,
+        SR_SEED: fx.Int32,
         grid_x: fx.Int32,
         stream: fx.Stream,
     ):
-        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C).launch(
+        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, SR_SEED).launch(
             grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream
         )
 
@@ -470,13 +552,12 @@ _DUAL_COMPILED = {}
 
 def dual_eligible(R, C, row_recipe, col_recipe):
     """True if the FlyDSL fused dual can wholesale-replace the C++ dual for these
-    recipes/dims (SR off, no preshuffle, dims aligned -> no padding). Both the
-    per-microblock (2d=F) and the 2d-block (2d=T weight) amax geometries are
-    supported and bit-exact vs C++; SR / shuffled recipes still fall back."""
+    recipes/dims (no preshuffle, dims aligned -> no padding). Both the per-microblock
+    (2d=F) and the 2d-block (2d=T weight) amax geometries are supported and bit-exact
+    vs C++ (non-SR); SR is supported (unbiased, not bit-exact). Shuffled recipes still
+    fall back."""
     return (
-        not row_recipe.use_sr
-        and not col_recipe.use_sr
-        and not row_recipe.shuffle_scale
+        not row_recipe.shuffle_scale
         and not row_recipe.shuffle_out
         and not col_recipe.shuffle_scale
         and not col_recipe.shuffle_out
@@ -485,9 +566,12 @@ def dual_eligible(R, C, row_recipe, col_recipe):
     )
 
 
-def flydsl_dual_quant(x_bf16, fp4_dtype, row_rht, col_rht, row_2d=False, col_2d=False):
+def flydsl_dual_quant(
+    x_bf16, fp4_dtype, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=False, col_sr=False
+):
     """Fused rowwise + colwise-transpose mxfp4 cast (one bf16 read). Returns
-    (row_data, row_scale, col_data, col_scale) in C++-compatible dtypes/shapes."""
+    (row_data, row_scale, col_data, col_scale) in C++-compatible dtypes/shapes.
+    ``row_sr``/``col_sr`` request stochastic rounding on that direction."""
     import torch
 
     R, C = x_bf16.shape
@@ -497,8 +581,9 @@ def flydsl_dual_quant(x_bf16, fp4_dtype, row_rht, col_rht, row_2d=False, col_2d=
     rs = torch.empty((R, C // 32), dtype=torch.uint8, device=dev)
     co = torch.empty((C, R // 8), dtype=torch.int32, device=dev)
     cs = torch.empty((C, R // 32), dtype=torch.uint8, device=dev)
-    fn, grid_x = get_dual_cast(R, C, row_rht, col_rht, row_2d, col_2d)
-    fn(x_i32, ro, rs, co, cs, R, C, grid_x, torch.cuda.current_stream())
+    fn, grid_x = get_dual_cast(R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr)
+    sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
+    fn(x_i32, ro, rs, co, cs, R, C, sr_seed, grid_x, torch.cuda.current_stream())
     row_data = ro.view(torch.uint8).view(fp4_dtype)  # [R, C/2] fp4
     col_data = co.view(torch.uint8).view(fp4_dtype)  # [C, R/2] fp4
     row_scale = rs.view(torch.float8_e8m0fnu)
@@ -506,17 +591,28 @@ def flydsl_dual_quant(x_bf16, fp4_dtype, row_rht, col_rht, row_2d=False, col_2d=
     return row_data, row_scale, col_data, col_scale
 
 
-def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False):
+def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=False, col_sr=False):
     """Return (compiled_fn, grid_x) for the fused dual at
-    (R, C, row_rht, col_rht, row_2d, col_2d).
+    (R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr).
     Requires R % 128 == 0 and C % 256 == 0 (no scale/output padding)."""
     col_locality = int(C) > int(R)  # C>R (down-proj): combine transpose stores
-    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality)
+    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality, bool(row_sr), bool(col_sr))
     raw = _DUAL_LAUNCH.get(lk)
     if raw is None:
-        raw = _build_dual_launch(bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality)
+        raw = _build_dual_launch(
+            bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality, bool(row_sr), bool(col_sr)
+        )
         _DUAL_LAUNCH[lk] = raw
-    key = (int(R), int(C), bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d))
+    key = (
+        int(R),
+        int(C),
+        bool(row_rht),
+        bool(col_rht),
+        bool(row_2d),
+        bool(col_2d),
+        bool(row_sr),
+        bool(col_sr),
+    )
     ent = _DUAL_COMPILED.get(key)
     if ent is None:
         import torch
@@ -528,7 +624,7 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False):
         cs = torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda")
         grid_x = (R // _TR) * (C // _TC)
         stream = torch.cuda.current_stream()
-        fn = flyc.compile(raw, x, ro, rs, co, cs, R, C, grid_x, stream)
+        fn = flyc.compile(raw, x, ro, rs, co, cs, R, C, 0, grid_x, stream)
         ent = (fn, grid_x)
         _DUAL_COMPILED[key] = ent
     return ent
@@ -538,7 +634,9 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False):
 # blocks -> fills the GPU even for small per-expert N, where the 2D dense kernel is
 # occupancy-starved and drops to ~2.5 TB/s). Reuses _emit_dual_body per-tile with
 # per-expert base offsets; SRDs cover the whole 3D (gmul=G). ----
-def _build_dual3_kernel(row_rht, col_rht, row_2d=False, col_2d=False, padded=False, col_locality=False):
+def _build_dual3_kernel(
+    row_rht, col_rht, row_2d=False, col_2d=False, padded=False, col_locality=False, row_sr=False, col_sr=False
+):
     _DualSS = _make_dual_struct(bool(row_2d or col_2d))
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
@@ -553,6 +651,7 @@ def _build_dual3_kernel(row_rht, col_rht, row_2d=False, col_2d=False, padded=Fal
         G: fx.Int32,
         CP: fx.Int32,  # K_pad (row-out cols); == C when aligned
         RP: fx.Int32,  # N_pad (col-out cols); == R when aligned
+        SR_SEED: fx.Int32,
     ):
         lds = fx.SharedAllocator().allocate(_DualSS).peek()
         tid = fx.thread_idx.x
@@ -592,17 +691,24 @@ def _build_dual3_kernel(row_rht, col_rht, row_2d=False, col_2d=False, padded=Fal
             RP=RP,
             col_locality=col_locality,
             batched=True,
+            # global bid so different experts (same lbid) get independent seeds
+            row_sr=row_sr,
+            col_sr=col_sr,
+            sr_seed=SR_SEED,
+            sr_gbid=fx.block_idx.x,
         )
 
     return _dual3_kernel
 
 
-def _build_dual3_launch(row_rht, col_rht, row_2d=False, col_2d=False, padded=False, col_locality=False):
-    kern = _build_dual3_kernel(row_rht, col_rht, row_2d, col_2d, padded, col_locality)
+def _build_dual3_launch(
+    row_rht, col_rht, row_2d=False, col_2d=False, padded=False, col_locality=False, row_sr=False, col_sr=False
+):
+    kern = _build_dual3_kernel(row_rht, col_rht, row_2d, col_2d, padded, col_locality, row_sr, col_sr)
 
     @flyc.jit
-    def _dual3_launch(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, grid_x, stream):
-        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP).launch(
+    def _dual3_launch(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, SR_SEED, grid_x, stream):
+        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, SR_SEED).launch(
             grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream
         )
 
@@ -615,13 +721,11 @@ _DUAL3_COMPILED = {}
 
 def dual3_eligible(N, K, row_recipe, col_recipe):
     """True if the batched-3D FlyDSL dual can replace the C++ dual for a [G,N,K]
-    weight (SR off, no preshuffle). Handles non-256 K / non-128 N via K_pad/N_pad
-    (bit-exact vs the HIP dual whose pad is all-zero). Needs N%64==0 (row/col tiling)
-    and K%64==0 (32-microblock + vec4-aligned tail load mask)."""
+    weight (no preshuffle). Handles non-256 K / non-128 N via K_pad/N_pad (bit-exact
+    vs the HIP dual whose pad is all-zero; SR is unbiased, not bit-exact). Needs
+    N%64==0 (row/col tiling) and K%64==0 (32-microblock + vec4-aligned tail load mask)."""
     return (
-        not row_recipe.use_sr
-        and not col_recipe.use_sr
-        and not row_recipe.shuffle_scale
+        not row_recipe.shuffle_scale
         and not row_recipe.shuffle_out
         and not col_recipe.shuffle_scale
         and not col_recipe.shuffle_out
@@ -630,7 +734,7 @@ def dual3_eligible(N, K, row_recipe, col_recipe):
     )
 
 
-def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False):
+def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=False, col_sr=False):
     """(compiled_fn, grid_x, K_pad, N_pad, padded) for the batched-3D dual at
     (N,K,G,recipes). K_pad=ceil(K/128)*128 (row-out), N_pad=ceil(N/128)*128 (col-out);
     `padded` when K not a 256-tile multiple or N not 128-multiple."""
@@ -638,11 +742,27 @@ def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False):
     Np = ((N + 127) // 128) * 128
     padded = (K % _TC != 0) or (N % 128 != 0)
     col_locality = int(K) > int(N)  # K>N: combine transpose stores (col-out)
-    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded, col_locality)
+    lk = (
+        bool(row_rht),
+        bool(col_rht),
+        bool(row_2d),
+        bool(col_2d),
+        padded,
+        col_locality,
+        bool(row_sr),
+        bool(col_sr),
+    )
     raw = _DUAL3_LAUNCH.get(lk)
     if raw is None:
         raw = _build_dual3_launch(
-            bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), padded, col_locality
+            bool(row_rht),
+            bool(col_rht),
+            bool(row_2d),
+            bool(col_2d),
+            padded,
+            col_locality,
+            bool(row_sr),
+            bool(col_sr),
         )
         _DUAL3_LAUNCH[lk] = raw
     key = (int(N), int(K), int(G), *lk)
@@ -657,29 +777,33 @@ def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False):
         cs = torch.zeros((G, K, Np // 32), dtype=torch.uint8, device="cuda")
         ncblk = ((K + _TC - 1) // _TC) if padded else (K // _TC)
         grid_x = (N // _TR) * ncblk * G
-        fn = flyc.compile(raw, x, ro, rs, co, cs, N, K, G, Kp, Np, grid_x, torch.cuda.current_stream())
+        fn = flyc.compile(raw, x, ro, rs, co, cs, N, K, G, Kp, Np, 0, grid_x, torch.cuda.current_stream())
         ent = (fn, grid_x, Kp, Np, padded)
         _DUAL3_COMPILED[key] = ent
     return ent
 
 
-def flydsl_dual_quant_batched(x3d, fp4_dtype, row_rht, col_rht, row_2d=False, col_2d=False):
+def flydsl_dual_quant_batched(
+    x3d, fp4_dtype, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=False, col_sr=False
+):
     """Batched-3D fused rowwise + colwise-transpose mxfp4 dual cast for a [G,N,K]
     weight in ONE launch. Returns C++-compatible per-expert
-    (row_data [G,N,K/2], row_scale [G,N,K/32], col_data [G,K,N/2], col_scale [G,K,N/32])."""
+    (row_data [G,N,K/2], row_scale [G,N,K/32], col_data [G,K,N/2], col_scale [G,K,N/32]).
+    ``row_sr``/``col_sr`` request stochastic rounding on that direction."""
     import torch
 
     G, N, K = x3d.shape
     dev = x3d.device
     x_i32 = x3d.contiguous().view(torch.int32)  # [G, N, K/2]
-    fn, grid_x, Kp, Np, padded = get_dual3_cast(N, K, G, row_rht, col_rht, row_2d, col_2d)
+    fn, grid_x, Kp, Np, padded = get_dual3_cast(N, K, G, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr)
     # Outputs sized on K_pad/N_pad; zeros so pad regions match the HIP dual (all-0).
     alloc = torch.zeros if padded else torch.empty
     ro = alloc((G, N, Kp // 8), dtype=torch.int32, device=dev)
     rs = alloc((G, N, Kp // 32), dtype=torch.uint8, device=dev)
     co = alloc((G, K, Np // 8), dtype=torch.int32, device=dev)
     cs = alloc((G, K, Np // 32), dtype=torch.uint8, device=dev)
-    fn(x_i32, ro, rs, co, cs, N, K, G, Kp, Np, grid_x, torch.cuda.current_stream())
+    sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
+    fn(x_i32, ro, rs, co, cs, N, K, G, Kp, Np, sr_seed, grid_x, torch.cuda.current_stream())
     return (
         ro.view(torch.uint8).view(fp4_dtype),
         rs.view(torch.float8_e8m0fnu),
