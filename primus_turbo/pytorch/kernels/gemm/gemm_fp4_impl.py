@@ -11,6 +11,7 @@ import torch
 _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.common.aiter_utils import get_aiter
+from primus_turbo.flydsl.gemm.mxfp4_gemm_kernel import gemm_mxfp4_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,
@@ -21,6 +22,7 @@ from primus_turbo.pytorch.core.backend import (
     TuneCache,
 )
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float4_e2m1fn_x2
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
 
 def ceil_div(a, b):
@@ -198,9 +200,98 @@ class GEMMFP4AITERBackend(KernelBackend):
         )
 
 
+class GEMMFP4FlyDSLBackend(KernelBackend):
+    """FlyDSL 4-wave MXFP4 dense GEMM backend (gfx950 / CDNA4 only).
+
+    NT only (trans_a=F, trans_b=T), E2M1 fp4 operands, bf16/fp16 out. Per-1x32 E8M0
+    block scales [M,K//32]/[N,K//32] are passed straight to ``gemm_mxfp4_flydsl_kernel``,
+    which repacks them into the lane-contiguous VGPR-direct layout via a separate
+    FlyDSL preshuffle kernel (quant stays generic, mirroring the mxfp8 GEMM). The
+    kernel is a whole-loop bare-asm path tuned for 256x256x256 tiles, so M/N/K must
+    all be multiples of 256.
+    """
+
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.MX_BLOCKWISE,
+    }
+
+    # (a_dtype, b_dtype, c_dtype)
+    SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES)
+
+    # (trans_a, trans_b, trans_c)
+    SUPPORTED_LAYOUTS = ((False, True, False),)
+
+    FLYDSL_FP4_MNK_MULTIPLE = 256
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+        preshuffled: bool = False,
+    ) -> bool:
+
+        # No path for AITER-preshuffled inputs (this backend preshuffles raw E8M0 itself).
+        if preshuffled:
+            return False
+
+        supported = True
+        # gfx950 (CDNA4) only: mfma_scale_f32_16x16x128_f8f6f4 is absent below.
+        supported &= get_device_compute_capability() >= (9, 5)
+        supported &= granularity in GEMMFP4FlyDSLBackend.SUPPORTED_GRANULARITIES
+        supported &= a.ndim == 2 and b.ndim == 2
+        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP4FlyDSLBackend.SUPPORTED_DTYPES
+        supported &= (trans_a, trans_b, trans_c) in GEMMFP4FlyDSLBackend.SUPPORTED_LAYOUTS
+        if not supported:
+            return False
+
+        m, n = a.size(0), b.size(0)
+        k = a.size(1) * 2  # FP4 K dim is packed (2 values / byte)
+        mul = GEMMFP4FlyDSLBackend.FLYDSL_FP4_MNK_MULTIPLE
+        supported &= (m % mul == 0) and (n % mul == 0) and (k % mul == 0)
+
+        # Raw E8M0 block scales, 1 byte/elem, [DIM, K//32] (the GEMM wrapper preshuffles
+        # them into its lane-contiguous layout).
+        def _scale_ok(s, dim):
+            return s.ndim == 2 and s.shape == (dim, k // 32) and s.element_size() == 1
+
+        supported &= _scale_ok(a_scale_inv, m)
+        supported &= _scale_ok(b_scale_inv, n)
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: ScalingGranularity,
+        preshuffled: bool = False,
+    ):
+        # preshuffled accepted only so the dispatcher's uniform execute(**kwargs)
+        # call works; can_handle already rejected the preshuffled=True case.
+        del preshuffled
+        # Raw E8M0 block scales ([DIM, K/32], 1 byte/elem) are passed straight through;
+        # the FlyDSL GEMM wrapper repacks them into its lane-contiguous layout via a
+        # separate preshuffle kernel on the same stream (quant stays generic). The
+        # whole-loop kernel consumes any K % 256 (KI//2 pairs + MFMA-only odd tail).
+        return gemm_mxfp4_flydsl_kernel(a, a_scale_inv, b, b_scale_inv, out_dtype=out_dtype, trans_c=trans_c)
+
+
 _GEMM_FP4_BACKENDS = {
     BackendType.AITER: BackendEntry(GEMMFP4AITERBackend, autotune=False),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP4HipBLASLtBackend),
+    BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend, autotune=False),
 }
 
 

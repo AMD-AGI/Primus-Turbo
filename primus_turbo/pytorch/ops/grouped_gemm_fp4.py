@@ -106,6 +106,8 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         else:
             quantized_a = a
             check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
+            a_row, a_row_scale = quantized_a.qdata, quantized_a.scale_inv
+            group_offs_padded_rowwise = quantized_a.group_offs
             if a_t is None:
                 quantized_a_t = QuantizedTensor.quantize(
                     quantized_a.dequantize(),
@@ -119,11 +121,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             else:
                 assert isinstance(a_t, QuantizedTensor)
                 quantized_a_t = a_t
-
-            a_row, a_row_scale = quantized_a.qdata, quantized_a.scale_inv
             a_col, a_col_scale = quantized_a_t.qdata, quantized_a_t.scale_inv
-
-            group_offs_padded_rowwise = quantized_a.group_offs
 
         # --- B: 3D weight (G, N, K). row-wise (rht=F) is the fwd operand; col-wise
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
@@ -170,7 +168,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         out = out[:total_m]
@@ -187,7 +185,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         a_col, a_col_scale, b_col, b_col_scale, group_lens, group_offs = ctx.saved_tensors
 
-        # --- grad_out: fused grouped dual-quant in one bf16 read
+        # --- grad_out: fused grouped dual-quant in one 16-bit read
         grad_out_scaling_recipe = ScalingRecipe(
             use_sr=ctx.config.use_gradient_sr,
         )
@@ -215,7 +213,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             scaling_recipe_for_trans=grad_out_t_scaling_recipe,
         )
 
-        # --- dgrad: grad_a = gradO_row(rht=T) @ B_col(rht=T)^T, contract N -> [total_m, K] ---
+        # --- dgrad: grad_a = gradO_row(rht=F) @ B_col(rht=F)^T, contract N -> [total_m, K] ---
         grad_a = grouped_gemm_fp4_impl(
             grad_out_fp4_row,
             b_col,
@@ -228,7 +226,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         grad_a = grad_a[: ctx.total_m]
@@ -247,7 +245,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
         )
 
         return (

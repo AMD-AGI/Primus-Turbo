@@ -67,6 +67,20 @@ def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_byt
     return fx.Tensor(fx.make_view(iter_f8, lay))
 
 
+def make_fp8_rebased_tensor_and_srd(arg_i8, fp8_ir_t, base_elems, num_records_bytes):
+    """``make_fp8_buffer_tensor_rebased`` (the G2S prologue tensor) plus a matching raw SRD on
+    the same int64-folded base for ``call_mxfp4_wholeloop``'s K-loop (bare rsrc + int32
+    soffset). The mxfp4 GEMMs reach the operand both ways past 2^31 elems."""
+    tensor = make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_bytes)
+    base = _readfirstlane_i32(
+        arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg_i8)) + arith.index_cast(T.i64, base_elems)
+    )
+    nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
+    nrec = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nr)))
+    srd = _buffer_ops.create_buffer_resource_from_addr(base, num_records_bytes=nrec)
+    return tensor, srd
+
+
 def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_bytes):
     """make_fp8_buffer_tensor_rebased for a 2-byte (bf16/fp16) operand: SRD base
     advanced by ``base_bytes`` (i64), bounded by ``num_records_bytes`` (HW OOB clamp

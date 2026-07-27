@@ -356,8 +356,9 @@ def grouped_quantize_fp4(
 
       * row-wise (``axis`` == last dim): tight-M layout (row i == input row i);
         the returned padded group_lens/offs equal the (tight) originals.
-      * col-wise (``axis`` == 0): 128-padded per-group M layout; the returned
-        padded group_lens/offs are the col-wise padded offsets from the kernel.
+      * col-wise (``axis`` == 0): the same per-group padded M layout the fused dual
+        quantizer emits (the variable-K wgrad operand); the returned padded
+        group_lens/offs are the col-wise padded offsets from the kernel.
 
     Returns ``(data, scale_inv, group_lens_padded, group_offs_padded)`` to mirror
     :func:`grouped_quantize_fp8`.
@@ -407,11 +408,11 @@ def grouped_quantize_fp4_with_trans(
     """FP4 Grouped Quantize with trans (fused rowwise + colwise).
 
     ``x`` is a 2D packed-M grouped activation ``[total_m, N]`` (groups along M via
-    ``group_lens`` / ``group_offs``). One bf16 read emits both operands:
+    ``group_lens`` / ``group_offs``). One 16-bit (bf16/fp16) read emits both operands:
 
       * row-wise FP4 [total_m, N_pad/2] + scale [total_m, N_pad/32] in the tight
         (un-padded) M layout (row i == input row i) -- the fwd/dgrad operand;
-      * col-wise FP4 [N, M_pad_col/2] + scale [N, M_pad_col/32] in the 128-padded
+      * col-wise FP4 [N, M_pad_col/2] + scale [N, M_pad_col/32] in the 512-aligned
         per-group M layout -- the variable-K wgrad operand.
 
     Returns ``(rowwise_out, rowwise_scale, colwise_out, colwise_scale,
