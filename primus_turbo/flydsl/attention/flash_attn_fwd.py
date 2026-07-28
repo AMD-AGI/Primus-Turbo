@@ -359,8 +359,8 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = gemm_helper.pv_step_k(0, v_p_0, v_v, v_o)
-                # Cross-seqlen can put a diagonal tile in v_s_1; self-attention skips this.
-                if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
+                # Cross-seqlen can put a diagonal tile in v_s_1; so can SWA's lower window edge.
+                if const_expr(traits.CAUSAL and (traits.CROSS_SEQLEN or traits.WINDOW_LEFT >= 0)):
                     v_s_1 = softmax_helper.causal_mask_prologue_if_needed(
                         v_s_1,
                         j_idx - 2,
