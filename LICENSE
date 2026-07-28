@@ -95,6 +95,30 @@ Primus-Turbo uses or references the following third-party projects:
        primus_turbo/pytorch/kernels/moe/moe_dispatch_combine_impl.py
          <- megatron/core/transformer/moe/fused_a2a.py
 
+10. tritonBLAS
+   - License: MIT License
+   - Repository: https://github.com/ROCm/tritonBLAS.git
+
+11. Triton (including its AMD performance kernels)
+   - License: MIT License
+   - Repository: https://github.com/ROCm/triton.git
+   - Note: our Triton attention kernel is adapted from
+     python/perf-kernels/flash-attention.py and carries the Triton copyright
+     notices:
+       primus_turbo/triton/attention/attention_kernel.py
+
+12. composable_kernel
+   - License: MIT License
+   - Repository: https://github.com/ROCm/composable_kernel.git
+   - Note: vendored as a submodule under 3rdparty/; the headers it provides are
+     redistributed in the source package together with its LICENSE file.
+
+13. hipify_torch
+   - License: MIT License
+   - Repository: https://github.com/ROCm/hipify_torch.git
+   - Note: vendored as a submodule under 3rdparty/; redistributed in the source
+     package together with its LICENSE.txt file.
+
 Please comply with the respective licenses of these third-party projects when
 using or distributing Primus. The Apache-2.0 text referenced above is in
 LICENSE-APACHE; the 3-clause BSD text is reproduced below.

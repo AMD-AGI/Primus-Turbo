@@ -223,6 +223,8 @@ Primus-Turbo builds on excellent open-source work from the wider community. We e
 
 - [**FlyDSL**](https://github.com/ROCm/FlyDSL) — a Flexible Layout Python DSL and MLIR compiler stack for authoring high-performance AMD GPU kernels. Many of our kernels (GEMM, GroupedGEMM, Attention, MoE) are built with FlyDSL; those files carry FlyDSL attribution and remain under Apache-2.0 — see `LICENSE` and `LICENSE-APACHE`. We thank the FlyDSL team for their close collaboration and support.
 - [**AITER**](https://github.com/ROCm/aiter) — AI Tensor Engine for ROCm, providing high-performance operator backends (e.g. FlashAttention, FP8) that Primus-Turbo integrates.
+- [**tritonBLAS**](https://github.com/ROCm/tritonBLAS) — high-quality Triton GEMM kernels for AMD GPUs. Our persistent BF16/FP16 and FP8 GEMM kernels are adapted from it.
+- [**Triton**](https://github.com/ROCm/triton) — our Triton attention kernel is adapted from the AMD performance kernels in `python/perf-kernels/flash-attention.py`, which implement the FlashAttention v2 algorithm by Tri Dao.
 - [**Triton-distributed**](https://github.com/ByteDance-Seed/Triton-distributed) — a distributed compiler for computation-communication overlapping. Our Mega MoE comm-compute fused kernels reference its overlapping-kernel design.
 - [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) — a clean and efficient FP8/BF16 GEMM library. Our Mega MoE barrier and symmetric-heap layout designs reference it.
 - [**NVIDIA TransformerEngine**](https://github.com/NVIDIA/TransformerEngine) — our Triton MoE permute/unpermute kernels are adapted from TransformerEngine. That file remains under Apache-2.0 and carries NVIDIA attribution — see `LICENSE` and `LICENSE-APACHE`.
