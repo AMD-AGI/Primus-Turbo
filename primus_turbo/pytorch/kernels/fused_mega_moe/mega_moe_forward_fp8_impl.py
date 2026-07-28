@@ -32,6 +32,13 @@ _W1_PREP_ATTR = "_mega_fp8_w1_prep"
 _W2_PREP_ATTR = "_mega_fp8_w2_prep"
 _H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device real-tile count)
 
+# EP8 T=8192 DSv3 retuned CU splits (epoch self-reset comm; see bench_mega_moe_fp8 sweeps):
+#   L1 dispatch+preshuffle: 16/16 best in e2e (isolated L1 favours 24/8 but that is a prologue artifact).
+#   L2 combine: 32 beats 48 (~5%); pin explicitly so prod skips autotune cold-start sweep.
+_L1_NUM_DISPATCH_CU = 16
+_L1_NUM_PRESHUFFLE_CU = 16
+_L2_NUM_COMBINE_CU = 32
+
 
 def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
     """Cache ``prep(w)`` ON the weight tensor, keyed by ``w._version`` -- the single place the fp8
@@ -98,6 +105,8 @@ def mega_moe_forward_fp8_impl(
         group, 
         topk_idx=topk_idx, 
         topk_weights=topk_weights,
+        num_dispatch_cu=_L1_NUM_DISPATCH_CU,
+        num_preshuffle_cu=_L1_NUM_PRESHUFFLE_CU,
         BM=block_m, BN=block_n,
     )
 
@@ -113,5 +122,6 @@ def mega_moe_forward_fp8_impl(
         topk_indices=topk_idx, topk_weights=topk_weights.to(torch.float32),
         x_fp8=(act_fp8, act_a_sp),
         BM=block_m, BN=block_n,
+        num_combine_cu=_L2_NUM_COMBINE_CU,
     )
     return y, l1, dispatch_weights, pool_x_fp8, handle

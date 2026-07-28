@@ -87,7 +87,7 @@ def resolve_num_combine_cu(
         return int(explicit)
     if os.environ.get("PT_FP8_COMBINE_AUTOTUNE", "1") == "0":
         # shipped defaults when autotune disabled
-        return 48 if apply_weights else 24
+        return 32 if apply_weights else 24
 
     if key in _MEM:
         return _MEM[key]

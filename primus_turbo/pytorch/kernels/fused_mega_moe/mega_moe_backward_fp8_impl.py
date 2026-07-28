@@ -29,7 +29,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
-    quantize_grouped_weight_mxfp8,
+    quantize_grouped_weight_mxfp8_flydsl,
     rowcol_dual_quant_mxfp8_grouped_flydsl,
 )
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
@@ -79,7 +79,7 @@ def prepare_w2t_dgrad_fp8(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
     ``(w2tq [G,I,H] fp8, w2ts [G,I,H//32] raw E8M0)``. STATIC weight prep (maintained version-keyed
     at the op layer); the transpose+quant never runs inside the kernel.
     """
-    return quantize_grouped_weight_mxfp8(w2.transpose(1, 2).contiguous())  # [G,I,H]
+    return quantize_grouped_weight_mxfp8_flydsl(w2.transpose(1, 2).contiguous())  # [G,I,H]
 
 
 def prepare_w1t_dgrad_fp8(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
