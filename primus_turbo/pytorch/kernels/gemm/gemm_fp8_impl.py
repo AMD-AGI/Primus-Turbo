@@ -366,8 +366,10 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         granularity: ScalingGranularity,
     ) -> bool:
         supported = True
-        # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
-        supported &= get_device_compute_capability() >= (9, 5)
+        # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942- and
+        # on gfx1250 (wave32/WMMA). gfx1250 reports (12, 5), so the ">=" comparison alone
+        # wrongly admits it; exclude it explicitly (mirrors the turbo backend gate above).
+        supported &= get_device_compute_capability() >= (9, 5) and not is_gfx1250()
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
