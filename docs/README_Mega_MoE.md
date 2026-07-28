@@ -127,3 +127,13 @@ python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --mo
 | Dispatch prologue (routing tables) | `primus_turbo/flydsl/mega/dispatch_prologue_kernel.py` |
 | SwiGLU fwd/bwd | `primus_turbo/flydsl/mega/swiglu_kernel.py` |
 | Cross-rank tiles (dispatch/combine/reduce) | `primus_turbo/flydsl/mega/ep_intranode.py` |
+
+## Acknowledgements
+
+- [**Triton-distributed**](https://github.com/ByteDance-Seed/Triton-distributed) (ByteDance-Seed,
+  MIT License) — Mega MoE's comm-compute overlapping design (symmetric-memory push, signal/wait
+  synchronization, fusing intra-node EP communication into the GEMM kernel) references
+  Triton-distributed's overlapping-kernel approach.
+- [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) (DeepSeek, MIT License) — Mega MoE's
+  cross-rank barrier and symmetric-buffer layout follow DeepGEMM's design; see the file headers of
+  `primus_turbo/flydsl/mega/barrier.py` and `primus_turbo/flydsl/mega/symm_buffer.py` for details.

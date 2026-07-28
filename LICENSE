@@ -45,6 +45,14 @@ Primus-Turbo uses or references the following third-party projects:
    - License: MIT License
    - Repository: https://github.com/ROCm/aiter.git
 
+6. Triton-distributed
+   - License: MIT License
+   - Repository: https://github.com/ByteDance-Seed/Triton-distributed.git
+
+7. DeepGEMM
+   - License: MIT License
+   - Repository: https://github.com/deepseek-ai/DeepGEMM.git
+
 Please comply with the respective licenses of these third-party projects when using or distributing Primus.
 
 --------------------------------------------------------------------------------

@@ -223,6 +223,8 @@ Primus-Turbo builds on excellent open-source work from the AMD/ROCm ecosystem. W
 
 - [**FlyDSL**](https://github.com/ROCm/FlyDSL) — a Flexible Layout Python DSL and MLIR compiler stack for authoring high-performance AMD GPU kernels. Many of our kernels (GEMM, GroupedGEMM, Attention, MoE) are authored with FlyDSL, and we thank the FlyDSL team for their close collaboration and support.
 - [**AITER**](https://github.com/ROCm/aiter) — AI Tensor Engine for ROCm, providing high-performance operator backends (e.g. FlashAttention, FP8) that Primus-Turbo integrates.
+- [**Triton-distributed**](https://github.com/ByteDance-Seed/Triton-distributed) — a distributed compiler for computation-communication overlapping. Our Mega MoE comm-compute fused kernels reference its overlapping-kernel design.
+- [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) — a clean and efficient FP8/BF16 GEMM library. Our Mega MoE barrier and symmetric-heap layout designs reference it.
 
 ## 📜 License
 

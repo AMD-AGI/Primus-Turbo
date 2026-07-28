@@ -1,3 +1,12 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# The reference flow this test drives is derived from DeepEP
+# (https://github.com/deepseek-ai/DeepEP); see tests/pytorch/ref/deep_ep_ref.py.
+#
+# See LICENSE for license information.
+###############################################################################
+
 import torch
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import (

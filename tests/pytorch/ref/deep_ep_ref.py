@@ -1,5 +1,11 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2025 DeepSeek. All rights reserved.
+#
+# Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
+#
+# The ``tune_and_verify_*`` reference flows and the numeric helpers below are
+# derived from DeepEP (https://github.com/deepseek-ai/DeepEP), tests/test_intranode.py,
+# tests/test_internode.py and tests/utils.py.
 #
 # See LICENSE for license information.
 ###############################################################################
