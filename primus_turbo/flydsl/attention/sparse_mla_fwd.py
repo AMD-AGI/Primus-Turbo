@@ -1,3 +1,11 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2025 FlyDSL Project Contributors
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL); see LICENSE-APACHE for the Apache-2.0 terms.
+#
+# See LICENSE for license information.
+###############################################################################
+
 """DeepSeek-V4 sparse-MLA attention forward (flydsl, gfx950/MI355X).
 Kernel implementation + host-side dispatch, single file.
 """

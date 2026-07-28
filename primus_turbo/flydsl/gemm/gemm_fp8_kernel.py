@@ -1,5 +1,7 @@
 ###############################################################################
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2025 FlyDSL Project Contributors
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL); see LICENSE-APACHE for the Apache-2.0 terms.
 #
 # See LICENSE for license information.
 ###############################################################################
@@ -7,9 +9,7 @@
 """Primus-Turbo dense FP8 GEMM kernel (FlyDSL): NT, NN and TN layouts.
 256x256 tile, BLOCK_K=128, 8-wave (wave_m=2 x wave_n=4), mfma_f32_16x16x128_f8f6f4,
 per-tensor scale, bf16/fp16 out, arbitrary K via native K-tail (TT unsupported).
-Primitives are imported from flydsl.utils.gemm_helper as module globals.
-
-Authored with FlyDSL (https://github.com/ROCm/FlyDSL)."""
+Primitives are imported from flydsl.utils.gemm_helper as module globals."""
 
 import functools
 
