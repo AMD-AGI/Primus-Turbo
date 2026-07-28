@@ -1,5 +1,10 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2025 DeepSeek. All rights reserved.
+#
+# Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Adapted from DeepGEMM (https://github.com/deepseek-ai/DeepGEMM, MIT License),
+# deep_gemm/include/deep_gemm/comm/barrier.cuh: grid_sync, nvlink_barrier.
 #
 # See LICENSE for license information.
 ###############################################################################
@@ -72,13 +77,7 @@ def xgmi_barrier(
     skip_fence: bool = False,
     tag: str = "xgmi_barrier",
 ):
-    """Cross-rank arrival barrier over XGMI (ported from DeepGEMM ``nvlink_barrier``).
-
-    Self-resetting ping-pong: a local counter's low 2 bits pick one of two signal buffers
-    (phase = bit 0) and the add direction (sign = bit 1). Each round adds +1 (even rounds,
-    wait for ``world_size``) or -1 (odd rounds, wait for 0) to every peer's signal, so the
-    two buffers alternate 0<->world_size with no host-side reset. Only block 0 participates.
-    """
+    """Cross-rank arrival barrier over XGMI."""
     # hoist all workspace-derived values before dynamic control flow (rewriter can't carry Workspace)
     counter_ptr = workspace.get_xgmi_barrier_counter_ptr()
     status = ld(counter_ptr, fx.Int32(0), scope="agent") & fx.Int32(3)

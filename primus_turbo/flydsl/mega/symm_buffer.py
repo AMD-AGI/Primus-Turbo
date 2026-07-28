@@ -1,9 +1,16 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2025 DeepSeek. All rights reserved.
+#
+# Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Adapted from DeepGEMM (https://github.com/deepseek-ai/DeepGEMM, MIT License),
+# deep_gemm/include/deep_gemm/layout/sym_buffer.cuh,
+# deep_gemm/include/deep_gemm/layout/mega_moe.cuh and
+# deep_gemm/mega/__init__.py: SymBuffer, Workspace and the host-side
+# symmetric-buffer allocation / slicing.
 #
 # See LICENSE for license information.
 ###############################################################################
-
 
 import ctypes
 from typing import Callable, List, Optional, Tuple

@@ -1,3 +1,13 @@
+###############################################################################
+# Copyright (c) 2025 DeepSeek. All rights reserved.
+#
+# Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Derived from DeepEP (https://github.com/deepseek-ai/DeepEP), tests/utils.py.
+#
+# See LICENSE for license information.
+###############################################################################
+
 import inspect
 import json
 import os

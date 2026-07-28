@@ -90,7 +90,7 @@ def dispatch_bf16_tile(
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):
             bank = fx.Int32(0) if disp_parity is None else disp_parity * fx.Int32(num_max_pool_blocks)
-            # DeepEP parity: each task bumps dst expert counter +1 (host-predictable)
+            # each task bumps dst expert counter +1, so the total is host-predictable
             local_expert = task_index // fx.Int32(num_ranks)
             atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
 
