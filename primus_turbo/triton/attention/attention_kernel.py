@@ -1,8 +1,14 @@
 ###############################################################################
+# SPDX-License-Identifier: MIT
+#
+# Copyright 2018-2020 Philippe Tillet
+# Copyright 2020-2022 OpenAI
+# Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
+#
 # This file includes a Triton implementation of the FlashAttention v2 algorithm,
 # originally developed by Tri Dao.
 #
-# References:
+# Algorithm reference:
 #   @inproceedings{dao2023flashattention2,
 #       title={Flash{A}ttention-2: Faster Attention with Better Parallelism and Work Partitioning},
 #       author={Dao, Tri},
@@ -11,11 +17,11 @@
 #   }
 #
 # Source code:
-#   https://github.com/Dao-AILab/flash-attention
+#   Adapted from the Triton project's AMD performance kernels,
+#   https://github.com/ROCm/triton, file python/perf-kernels/flash-attention.py.
 #
 # License:
-#   BSD 3-Clause License
-#   https://github.com/Dao-AILab/flash-attention/blob/main/LICENSE
+#   MIT License, the same license that covers Primus-Turbo (see LICENSE).
 #
 # Credits:
 #   OpenAI kernel team, AMD ML Frameworks Triton team

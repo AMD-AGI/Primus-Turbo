@@ -1,13 +1,16 @@
 ###############################################################################
+# SPDX-License-Identifier: Apache-2.0
+#
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
-# See LICENSE for license information.
-
-# Portions of this file are derived from feifeibear/long-context-attention,
-# licensed under the Apache License, Version 2.0.
+# Portions of this file are derived from feifeibear/long-context-attention
+# (https://github.com/feifeibear/long-context-attention),
+# licensed under the Apache License, Version 2.0 (see LICENSE-APACHE).
 # Original author: feifeibear (Jiarui Fang), Copyright 2024.
 # Modifications to the imported portions have been made by Li, Mou.
 #
+# Those portions remain under Apache-2.0, not the MIT license that covers the
+# rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 from typing import Optional, Tuple

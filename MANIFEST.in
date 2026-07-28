@@ -1,5 +1,6 @@
 include README.md
 include LICENSE
+include LICENSE-APACHE
 include setup.py
 include pyproject.toml
 include requirements.txt
@@ -10,6 +11,10 @@ recursive-include csrc *
 recursive-include primus_turbo *.py
 recursive-include 3rdparty/composable_kernel/include *
 recursive-include 3rdparty/hipify_torch/hipify_torch *
+
+# The vendored subtrees above are redistributed, so ship their licenses too.
+include 3rdparty/composable_kernel/LICENSE
+include 3rdparty/hipify_torch/LICENSE.txt
 
 # setuptools_scm pulls in every git-tracked file by default; drop dev-only
 # scaffolding (CI / editor / benchmarks / AI-agent docs) from the sdist.

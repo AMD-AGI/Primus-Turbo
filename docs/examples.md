@@ -148,7 +148,8 @@ print(c.shape) # [128, 256]
 communication buffer is allocated once and cached internally. See
 [README_Mega_MoE](./README_Mega_MoE.md) for the design and performance.
 
-> **Hardware requirements:** `gfx950` or higher, intra-node expert parallelism (one rank per GPU).
+> **Hardware requirements:** `gfx950` (not supported on `gfx1250`), intra-node expert parallelism
+> (one rank per GPU).
 
 ```python
 import torch

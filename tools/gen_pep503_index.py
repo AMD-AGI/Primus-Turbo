@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
 """Generate a PEP 503 "simple" repository index for GitHub Pages.
 
 Scans the repo's GitHub Releases, collects distribution files and emits a static

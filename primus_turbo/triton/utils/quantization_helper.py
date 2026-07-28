@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 import triton.language as tl
 
 FP32_MANTISSA_BITS = tl.constexpr(23)

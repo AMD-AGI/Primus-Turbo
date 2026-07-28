@@ -1,15 +1,21 @@
 ###############################################################################
+# SPDX-License-Identifier: Apache-2.0
+#
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2025 FlyDSL Project Contributors
-# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL); see LICENSE-APACHE for the Apache-2.0 terms.
 #
-# See LICENSE for license information.
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL),
+#   file kernels/gemm/fp8_gemm_8wave.py.
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """8-wave MXFP8 matmul (per-1x32 E8M0 block scaling) for AMD CDNA4 (gfx950).
 
-Derived from ``kernels/fp8_gemm_8wave.py`` (tensorwise FP8). The structural
-difference vs the tensorwise kernel:
+Structurally parallels the tensorwise FP8 path in ``gemm_fp8_kernel.py``; the
+difference vs that kernel:
 
   * tensorwise applies a single per-row (A) / per-col (B) FP32 scale in the
     epilogue, with the MFMA run un-scaled (identity scale operand).

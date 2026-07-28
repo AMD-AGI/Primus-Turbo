@@ -30,16 +30,37 @@ Primus-Turbo uses or references the following third-party projects:
    - Repository: https://github.com/deepseek-ai/DeepEP.git
 
 2. torchtitan
-   - License: BSD License
+   - License: BSD 3-Clause License
    - Repository: https://github.com/pytorch/torchtitan.git
+   - Note: the Meta-copyrighted files derived from this project live under
+     benchmark/, which is excluded from the distributed source package
+     (see MANIFEST.in), so they are not redistributed.
 
 3. long-context-attention
-   - License: Apache License 2.0
+   - License: Apache License 2.0 (full text in LICENSE-APACHE)
    - Repository: https://github.com/feifeibear/long-context-attention.git
+   - Note: the following file carries the original author's attribution and
+     remains licensed under Apache-2.0 rather than the MIT license above:
+       primus_turbo/pytorch/ops/attention/usp/attention_ring.py
 
 4. FlyDSL
-   - License: Apache License 2.0
+   - License: Apache License 2.0 (full text in LICENSE-APACHE)
    - Repository: https://github.com/ROCm/FlyDSL.git
+   - Note: the following files carry FlyDSL attribution and remain licensed under
+     Apache-2.0 rather than the MIT license above:
+       primus_turbo/flydsl/utils/gemm_helper.py
+       primus_turbo/flydsl/gemm/gemm_fp8_kernel.py
+       primus_turbo/flydsl/gemm/gemm_bf16_kernel.py
+       primus_turbo/flydsl/gemm/mxfp8_gemm_kernel.py
+       primus_turbo/flydsl/gemm/mxfp4_gemm_kernel.py
+       primus_turbo/flydsl/grouped_gemm/gemm_fp8_grouped_kernel.py
+       primus_turbo/flydsl/grouped_gemm/mxfp8_grouped_kernel.py
+       primus_turbo/flydsl/grouped_gemm/mxfp4_grouped_kernel.py
+       primus_turbo/flydsl/quantization/mxfp8_quant_flydsl.py
+       primus_turbo/flydsl/quantization/mxfp4_quant_kernel.py
+       primus_turbo/flydsl/quantization/mxfp4_grouped_quant.py
+       primus_turbo/flydsl/attention/sparse_mla_fwd.py
+       primus_turbo/flydsl/attention/sparse_mla_bwd.py
 
 5. AITER
    - License: MIT License
@@ -53,6 +74,84 @@ Primus-Turbo uses or references the following third-party projects:
    - License: MIT License
    - Repository: https://github.com/deepseek-ai/DeepGEMM.git
 
-Please comply with the respective licenses of these third-party projects when using or distributing Primus.
+8. NVIDIA TransformerEngine
+   - License: Apache License 2.0 (full text in LICENSE-APACHE)
+   - Repository: https://github.com/NVIDIA/TransformerEngine.git
+   - Note: the following file carries NVIDIA attribution and remains licensed
+     under Apache-2.0 rather than the MIT license above:
+       primus_turbo/triton/moe/permutation.py
+
+9. NVIDIA Megatron-LM
+   - License: 3-clause BSD (full text at the end of this file)
+   - Repository: https://github.com/NVIDIA/Megatron-LM.git
+   - Note: the following files carry NVIDIA attribution and remain licensed under
+     the 3-clause BSD license rather than the MIT license above:
+       primus_turbo/pytorch/ops/moe/permutation.py
+         <- megatron/core/transformer/moe/moe_utils.py
+       primus_turbo/pytorch/ops/moe/indices_converter.py
+         <- megatron/core/fusions/fused_indices_converter.py
+       primus_turbo/triton/moe/multihot_to_indices.py
+         <- megatron/core/fusions/fused_indices_converter.py
+       primus_turbo/pytorch/kernels/moe/moe_dispatch_combine_impl.py
+         <- megatron/core/transformer/moe/fused_a2a.py
+
+10. tritonBLAS
+   - License: MIT License
+   - Repository: https://github.com/ROCm/tritonBLAS.git
+
+11. Triton (including its AMD performance kernels)
+   - License: MIT License
+   - Repository: https://github.com/ROCm/triton.git
+   - Note: our Triton attention kernel is adapted from
+     python/perf-kernels/flash-attention.py and carries the Triton copyright
+     notices:
+       primus_turbo/triton/attention/attention_kernel.py
+
+12. composable_kernel
+   - License: MIT License
+   - Repository: https://github.com/ROCm/composable_kernel.git
+   - Note: vendored as a submodule under 3rdparty/; the headers it provides are
+     redistributed in the source package together with its LICENSE file.
+
+13. hipify_torch
+   - License: MIT License
+   - Repository: https://github.com/ROCm/hipify_torch.git
+   - Note: vendored as a submodule under 3rdparty/; redistributed in the source
+     package together with its LICENSE.txt file.
+
+Please comply with the respective licenses of these third-party projects when
+using or distributing Primus. The Apache-2.0 text referenced above is in
+LICENSE-APACHE; the 3-clause BSD text is reproduced below.
+
+--------------------------------------------------------------------------------
+NVIDIA Megatron-LM — 3-clause BSD License
+
+Applies to the Megatron-LM-derived files listed under item 9 above.
+
+Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+ * Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+ * Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+ * Neither the name of NVIDIA CORPORATION nor the names of its
+   contributors may be used to endorse or promote products derived
+   from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 --------------------------------------------------------------------------------
