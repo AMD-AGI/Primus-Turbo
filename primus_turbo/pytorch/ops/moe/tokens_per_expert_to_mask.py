@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 import torch
 
 from primus_turbo.pytorch.kernels.moe.tokens_per_expert_to_mask_impl import (

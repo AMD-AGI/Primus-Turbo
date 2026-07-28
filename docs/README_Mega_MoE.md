@@ -103,8 +103,11 @@ recomputed by `dispatch_grouped_gemm`.
 
 ### Reproduce
 
-A single benchmark script covers both fused operators, selected with `--mode`; each compares the
-fused path against the Primus-Turbo (DeepEP) baseline over 8 ranks. Run from the repo root:
+A single benchmark script covers both fused operators, selected with `--mode`. Each compares the
+fused path against the serial baseline — the same work measured as a separate GEMM-only leg and a
+separate communication-only leg — over 8 ranks, and reports both `speedup (vs serial)` and the
+roofline ratio $\max(T_{\text{comm}}, T_{\text{gemm}}) / T_{\text{measured}}$ used in the tables
+above. Run from the repo root:
 
 ```bash
 export PYTORCH_ROCM_ARCH=gfx950

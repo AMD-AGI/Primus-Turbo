@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 from .dispatch_grouped_gemm_bf16_kernel import dispatch_grouped_gemm_bf16_flydsl_kernel
 from .dispatch_prologue_kernel import dispatch_prologue_flydsl_kernel
 from .grouped_gemm_combine_bf16_kernel import grouped_gemm_combine_bf16_flydsl_kernel

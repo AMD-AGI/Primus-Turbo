@@ -1,3 +1,8 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
 """Quick correctness + benchmark template for representative shapes.
 
 This is the reference template referenced by SKILL.md. The kernel-optimize
