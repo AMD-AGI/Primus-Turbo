@@ -84,13 +84,7 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
 
 # Above this many partials the Triton finalize loses badly to a torch
 # reduction: it parallelizes over H only (ceil(H/BLOCK_H) programs) and walks
-# n_parts serially, so a tall, narrow buffer leaves the GPU idle. Measured on
-# MI355X (median over 50 runs, triton vs torch):
-#   (256, 2880)     21.1 us vs  22.7 us   triton wins slightly
-#   (4096, 2880)    61.6 us vs  34.6 us   1.8x slower
-#   (16384, 2880)  190.8 us vs  51.8 us   3.7x slower
-#   (65536, 128)   686.1 us vs  32.6 us    21x slower
-#   (262144, 128) 2684.0 us vs  51.0 us    53x slower
+# n_parts serially, so a tall, narrow buffer leaves the GPU idle.
 # The multi-row backward emits ceil(B / ROWS_PER_BLOCK) partials, which reaches
 # the tall regime for q_norm/k_norm (B in the millions, H=128).
 _FINALIZE_TRITON_MAX_PARTS = 512
