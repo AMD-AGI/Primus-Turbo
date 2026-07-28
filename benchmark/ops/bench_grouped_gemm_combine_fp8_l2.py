@@ -6,9 +6,9 @@
 
 """Isolated fc2 (L2) latency benchmark for the fp8 combine.
 
-Builds the symm workspace + prologue, runs the fp8 L1 (dispatch+fc1) + SwiGLU to get a real
-``act`` in the pool, then times the fp8 L2 path on that ``act``:
-  grouped_gemm_combine_mxfp8_flydsl_kernel  (fp8 GEMM + mxfp8 epilogue + fp8 PUSH + fp8-dequant reduce) -> y bf16.
+Builds the symm workspace + prologue, runs the fp8 L1 (dispatch+fc1) + fused SwiGLU+mxfp8 quant,
+then times the fp8 L2 path on the pre-quantized activation:
+  grouped_gemm_combine_mxfp8_flydsl_kernel(x_fp8=...)  (fp8 GEMM + combine + reduce) -> y bf16.
 Reports latency + a finite/NaN check. (For the fp8-vs-bf16 accuracy/speed comparison at the
 whole-forward level, use bench_mega_moe_fused_fp8.py, which uses the bf16 mega_moe_fused as the
 reference -- this repo carries no bf16 combine kernel under flydsl/mega/fp8/.)
@@ -33,8 +33,8 @@ from primus_turbo.flydsl.mega.fp8 import (
     get_symm_buffer_for_mega_moe,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8,
+    swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega import swiglu_flydsl_kernel
 from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8
 
 
@@ -107,25 +107,26 @@ def profile(group, args):
     ))
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
 
-    # L1 (fp8) + SwiGLU -> act (the real L2 input), once
+    # L1 (fp8) + fused SwiGLU+mxfp8 quant -> act_fp8 (the real L2 A operand), once
     torch.cuda.synchronize(); group.barrier()
     symm.scoreboard.zero_()
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
-    act = swiglu_flydsl_kernel(l1, get_symm_buffer_for_mega_moe().meta_scalars[1:2]).contiguous()
+    ntb = get_symm_buffer_for_mega_moe().meta_scalars[1:2]
+    act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, ntb)
 
     tw_f32 = topk_w.to(torch.float32)
     w2_fp8 = prepare_w2_fp8(W2)  # weight prep at the caller (op layer); combine is pure compute
 
     def _fp8():
         y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-            act, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=tw_f32,
-            BM=BM, BN=BN, num_combine_cu=48,
+            None, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=tw_f32,
+            x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=48,
         )
         return y
 
     # correctness smoke: fp8 L2 output must be finite (+ diagnostics on where it breaks)
-    act_finite = bool(torch.isfinite(act.float()).all())
+    act_finite = bool(torch.isfinite(act_fp8.float()).all())
     m_pad = int(handle[10][-1].item())
     y_fp8 = _fp8()
     torch.cuda.synchronize(); group.barrier()

@@ -101,6 +101,9 @@ from primus_turbo.pytorch.core.low_precision import ScalingGranularity  # noqa: 
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (  # noqa: E402
     grouped_gemm_fp8_variable_k_impl,
 )
+from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (  # noqa: E402
+    rowcol_dual_quant_mxfp8_grouped_flydsl,
+)
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (  # noqa: E402  (fp8 bwd stages)
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
@@ -618,6 +621,12 @@ def profile_fc1_dgrad_combine(group, args, mode):
     grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
     grad_l1, grad_gate = swiglu_backward_flydsl_kernel(grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True)
 
+    group_lens = handle[_H_GROUP_LENS]
+    group_offs = handle[_H_GROUP_OFFS]
+    meta = colwise_grouped_meta(group_lens, group_offs)
+    gl1_q_row, gl1_a_sp, _, _ = rowcol_dual_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=meta)
+    grad_l1_rowwise = (gl1_q_row, gl1_a_sp)
+
     w1t_fp8 = prepare_w2_fp8(W1.transpose(1, 2).contiguous())  # w1^T fp8 prep (static weight, once)
     tidx64 = topk_idx.contiguous().view(-1)                    # fp8 combine-bwd takes int64
     m_pad = int(handle[_H_GROUP_OFFS][-1].item())
@@ -631,7 +640,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only); grad_gate=... selects the bwd role
         dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
             grad_l1, w1t_fp8, list(handle), group, topk_indices=tidx64, grad_gate=grad_gate,
-            BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
+            x_fp8_rowwise=grad_l1_rowwise, BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
         )
         return dx
 

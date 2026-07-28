@@ -135,14 +135,6 @@ def worker(local_rank, world, args):
         )[0],
         warmup=args.warmup, iters=args.iters, group=group,
     )
-    r["L2_combine_oldpath"] = _bench(
-        lambda: grouped_gemm_combine_mxfp8_flydsl_kernel(
-            act_bf16, w2_fp8, list(handle), group,
-            topk_indices=topk_idx, topk_weights=topk_w,
-            BM=BM, BN=BN, num_combine_cu=CC,
-        )[0],
-        warmup=args.warmup, iters=args.iters, group=group,
-    )
     r["FULL_no_grad"] = _bench(
         lambda: mega_moe_fused_fp8(group, x_nograd, topk_idx, tw_nograd, W1, W2),
         warmup=args.warmup, iters=args.iters, group=group,
@@ -159,17 +151,15 @@ def worker(local_rank, world, args):
         print(f"{'=' * 72}")
         for k in (
             "L1_dispatch_fc1", "SwiGLU_bf16", "quant_rowwise", "SwiGLU+quant_fused",
-            "w2_prep_cached", "L2_combine_xfp8", "L2_combine_oldpath",
+            "w2_prep_cached", "L2_combine_xfp8",
             "FULL_no_grad", "FULL_autograd",
         ):
             print(f"  {k:<22} {r[k]:7.3f} ms")
 
         sum_iso = r["L1_dispatch_fc1"] + r["SwiGLU+quant_fused"] + r["L2_combine_xfp8"]
-        sum_old = r["L1_dispatch_fc1"] + r["SwiGLU_bf16"] + r["L2_combine_oldpath"]
         unfused_prep = r["SwiGLU_bf16"] + r["quant_rowwise"]
         print(f"\n  --- composition ---")
         print(f"  L1 + fused_swiglu + L2(x_fp8)     = {sum_iso:.3f} ms  (isolated sum)")
-        print(f"  L1 + swiglu_bf16 + L2(internal q) = {sum_old:.3f} ms  (old path sum)")
         print(f"  FULL no-grad (op)                 = {r['FULL_no_grad']:.3f} ms")
         print(f"  FULL autograd (bwd_only fwd col)  = {r['FULL_autograd']:.3f} ms")
         print(f"  autograd overhead                 = {r['FULL_autograd'] - r['FULL_no_grad']:+.3f} ms")

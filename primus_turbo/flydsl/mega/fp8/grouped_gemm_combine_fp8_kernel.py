@@ -65,14 +65,12 @@ from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     emit_gemm_mxfp8_nt_tile,
 )
 from primus_turbo.flydsl.mega.fp8.gemm_helper import (
-    StoreCPerTensor,
     StoreCQuantMxfp8CShuffle,
     _emit_if_then,
     make_value_attrs,
     xcd_remap_pid,
 )
 from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import _grouped_block_mn
-from primus_turbo.flydsl.utils.gemm_helper import make_bf16_fp16_tile_tensor
 
 # GEMM launch attrs (nt_vmcnt / waves_per_eu); included in flyc compile cache key below.
 _COMBINE_NT_VMCNT = 3
@@ -85,13 +83,8 @@ _COMBINE_NUM_XCD = int(os.environ.get("PT_COMBINE_NUM_XCD", "1"))
 _COMBINE_GROUP_M = int(os.environ.get("PT_COMBINE_GROUP_M", "0"))
 _COMBINE_GROUP_N = int(os.environ.get("PT_COMBINE_GROUP_N", "0"))
 _COMBINE_TILE_SWIZZLE = _COMBINE_NUM_XCD > 1 or _COMBINE_GROUP_M > 0 or _COMBINE_GROUP_N > 0
-# GEMM tile MFMA emit toggles (A/B: grouped-kernel barrier + B-scale slab layout).
-_COMBINE_FULL_BARRIER = os.environ.get("PT_COMBINE_FULL_BARRIER", "0") != "0"
-_COMBINE_B_N_SLABS = os.environ.get("PT_COMBINE_B_N_SLABS", "0") != "0"
 # Launch only real_tiles*n_blocks GEMM blocks (+ separate tail-reduce reservation), not worst_case.
 _COMBINE_REAL_TILES_GRID = os.environ.get("PT_COMBINE_REAL_TILES_GRID", "1") != "0"
-
-_WT = 16  # cache_modifier sc1 = write-through
 
 
 @functools.lru_cache(maxsize=4)
@@ -276,8 +269,6 @@ def _compile(
     out_features, hidden_size, num_max_pool_tokens, BLOCK_M, BLOCK_N, num_combine_cu, num_reduce_cu,
     combine_slots, topk, num_experts, rank, num_ranks, apply_weights, with_gate,
     num_groups=0, nt_vmcnt=_COMBINE_NT_VMCNT, waves_per_eu=_COMBINE_WAVES_PER_EU, agpr_alloc=0,
-    bf16_epilogue=False,
-    full_barrier=_COMBINE_FULL_BARRIER, b_n_slabs=_COMBINE_B_N_SLABS,
     real_tiles_grid=_COMBINE_REAL_TILES_GRID,
     persistent_gemm=_COMBINE_PERSISTENT_GEMM, num_persistent_cu=_COMBINE_GEMM_CU,
     num_xcd=_COMBINE_NUM_XCD, group_m=_COMBINE_GROUP_M, group_n=_COMBINE_GROUP_N,
@@ -298,18 +289,7 @@ def _compile(
     _mx_cshuf_n = _BLOCK_THREADS // 64 * 16 * (BLOCK_N // 128 * 16)
 
     @fx.struct
-    class _SharedStorageMxGemmOnly:
-        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, _mx_a_lds, 16]
-        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, _mx_a_lds, 16]
-        A_lds_next_0: fx.Array[fx.Float8E4M3FN, _mx_a_lds, 16]
-        A_lds_next_1: fx.Array[fx.Float8E4M3FN, _mx_a_lds, 16]
-        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, _mx_b_lds, 16]
-        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, _mx_b_lds, 16]
-        B_lds_next_0: fx.Array[fx.Float8E4M3FN, _mx_b_lds, 16]
-        B_lds_next_1: fx.Array[fx.Float8E4M3FN, _mx_b_lds, 16]
-
-    @fx.struct
-    class _SharedStorageMxGemmCShuffle:
+    class _SharedStorage:
         A_lds_cur_0: fx.Array[fx.Float8E4M3FN, _mx_a_lds, 16]
         A_lds_cur_1: fx.Array[fx.Float8E4M3FN, _mx_a_lds, 16]
         A_lds_next_0: fx.Array[fx.Float8E4M3FN, _mx_a_lds, 16]
@@ -320,8 +300,6 @@ def _compile(
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, _mx_b_lds, 16]
         C_lds_shuffle: fx.Array[fx.BFloat16, _mx_cshuf_n, 16]
 
-    _bf16_epilogue = bf16_epilogue
-    SharedStorage = _SharedStorageMxGemmOnly if _bf16_epilogue else _SharedStorageMxGemmCShuffle
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
     gemm_grid_blocks = worst_case_tiles * n_blocks
@@ -344,9 +322,6 @@ def _compile(
     # Measures the combine-PUSH wall (cross-rank byte cost) -> INCORRECT output, timing only.
     _push_only = os.environ.get("PT_COMBINE_PUSH_ONLY", "0") == "1"
     _no_reduce = _no_reduce or _gemm_only or _push_only
-    # PT_COMBINE_BF16_EPILOGUE=1: GEMM writes bf16 to symm l2_token_buffer (StoreCPerTensor) instead
-    # of StoreCQuantMxfp8CShuffle -> local fp8 L2Y. Isolation probe for the mxfp8 quant epilogue
-    # overhead; output is incorrect for PUSH/reduce (use with PT_COMBINE_GEMM_ONLY).
     reduce_fp8 = _make_topk_reduce_fp8(out_features, topk, combine_slots, apply_weights, with_gate)
     # Tail-reduce reservation when pool capacity exceeds real tiles (worst_case > real_tiles).
     max_tail_blocks = (worst_case_tiles - 1) * n_blocks
@@ -364,7 +339,7 @@ def _compile(
         block_index, _b, _c = fx.block_idx
         combine_cu = fx.Int32(num_combine_cu)
         reduce_cu = fx.Int32(num_reduce_cu)
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        lds = fx.SharedAllocator().allocate(_SharedStorage).peek()
 
         combine_flag_base = sym_layout.combine_flag_ptr
         comb_base = sym_layout.comb_ptr
@@ -457,25 +432,16 @@ def _compile(
                 n_tiles_a = BLOCK_M // 64
                 n_tiles_b = BLOCK_N // 128
                 c_idx_fn = lambda i, j: i * n_tiles_b + j
-                if const_expr(_bf16_epilogue):
-                    l2_base = sym_layout.l2_token_buffer_ptr
-                    c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
-                    c_tile = make_bf16_fp16_tile_tensor(l2_base, c_off, 0x40000000)
-                    store_c = StoreCPerTensor(
-                        None, None, c_tile, c_m_const, out_features, c_idx_fn, n_tiles_a, n_tiles_b,
-                        fx.BFloat16, cache_modifier=_WT,
-                    )
-                else:
-                    store_c = StoreCQuantMxfp8CShuffle(
-                        L2Y_FP8, L2Y_SCALE, c_m_const, out_features,
-                        c_idx_fn, n_tiles_a, n_tiles_b,
-                        fx.BFloat16, lds.C_lds_shuffle, thread_index // fx.Int32(64),
-                    )
+                store_c = StoreCQuantMxfp8CShuffle(
+                    L2Y_FP8, L2Y_SCALE, c_m_const, out_features,
+                    c_idx_fn, n_tiles_a, n_tiles_b,
+                    fx.BFloat16, lds.C_lds_shuffle, thread_index // fx.Int32(64),
+                )
                 emit_gemm_mxfp8_nt_tile(
                     ACT, A_SCALE, WEIGHTS, B_SCALE, lds, block_m, block_n,
                     K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, G=num_groups, group_idx=group_index,
                     c_m=c_m_const, c_n=c_n, nt_vmcnt=nt_vmcnt, scale_pack=4,
-                    store_c=store_c, full_barrier=full_barrier, b_n_slabs=b_n_slabs,
+                    store_c=store_c, full_barrier=False, b_n_slabs=False,
                 )
                 fx.rocdl.s_waitcnt(0)
                 rocdl.s_barrier()
@@ -629,46 +595,37 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     once with the op-layer ``prepare_w2_fp8``; fwd on ``w2`` [G,H,I], bwd on ``w1^T`` [G,H,2I]; op-layer
     version-keyed) -- NO weight quant/preshuffle and NO caching here.
 
-    Forward L2 activation input (one of):
-      * ``x_fp8=(act_fp8, a_sp)``: pre-quantized A operand from ``swiglu_mxfp8_flydsl_kernel`` (no
-        per-call rowwise quant; ``x`` is ignored).
-      * ``x`` [M, K] bf16: rowwise mxfp8 quant runs internally per call.
+    Forward L2 requires ``x_fp8=(act_fp8, a_sp)`` from ``swiglu_mxfp8_flydsl_kernel``; there is
+    no internal A quant on the forward path.
 
-    ``x_fp8_rowwise`` (backward STEP3 only): pass a precomputed ``(aq [M,K] e4m3, a_sp preshuffled)``
-    == ``quantize_rowwise_mxfp8_flydsl(x, preshuffle=True)`` to SKIP the internal rowwise quant. Used
-    when the caller fused grad_l1's rowwise+colwise quant into one read (``rowcol_dual_quant``): the
-    A operand here is byte-identical to the internal quant, so the GEMM is unchanged. ``x`` is still
-    passed (bf16, for M/K/device); its values are unused when ``x_fp8_rowwise`` is given.
+    Backward STEP3 requires ``x_fp8_rowwise=(q_row, a_sp)`` from ``rowcol_dual_quant_mxfp8_grouped_flydsl``
+    (fused rowwise quant of ``grad_l1``). ``x`` [M, K] bf16 is still passed for M/K/device metadata;
+    its values are unused when ``x_fp8_rowwise`` is given.
 
     Self-resetting: the combine_flag / reduce_flag epoch gates are double-banked + device epoch-bumped,
     so NO host flag reset / rendezvous. Always returns ``(output, d_topk_w)`` (``d_topk_w`` is None in
     the forward role)."""
     if "PT_FP8_NUM_REDUCE_CU" in os.environ:
         num_reduce_cu = int(os.environ["PT_FP8_NUM_REDUCE_CU"])
-    bf16_epilogue = os.environ.get("PT_COMBINE_BF16_EPILOGUE", "0") == "1"
-    full_barrier = os.environ.get("PT_COMBINE_FULL_BARRIER", "0") != "0"
-    b_n_slabs = os.environ.get("PT_COMBINE_B_N_SLABS", "0") != "0"
     apply_weights = topk_weights is not None
     with_gate = grad_gate is not None
     weight_flat, b_sp = weights_fp8
     tile_to_expert = handle[7]
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.make_sym_layout()
-    if x_fp8 is not None:
-        assert not with_gate, "x_fp8 pre-quant is forward-L2 only"
-        assert x_fp8_rowwise is None, "x_fp8 and x_fp8_rowwise are mutually exclusive"
-        aq, a_sp = x_fp8
-        M, K = aq.shape
-        dev = aq.device
-    elif x_fp8_rowwise is not None:
+    if x_fp8 is not None and x_fp8_rowwise is not None:
+        raise ValueError("x_fp8 and x_fp8_rowwise are mutually exclusive")
+    if with_gate:
+        assert x_fp8_rowwise is not None, "backward STEP3 requires pre-quantized grad_l1 via x_fp8_rowwise"
         assert x is not None
         aq, a_sp = x_fp8_rowwise
-        M, K = x.shape  # K = I (fwd fc2) or 2I (bwd fc1^T gate||up contraction)
+        M, K = x.shape  # K = 2I for fc1^T dgrad
         dev = x.device
     else:
-        assert x is not None and x.dtype == torch.bfloat16
-        M, K = x.shape  # K = I (fwd fc2) or 2I (bwd fc1^T gate||up contraction)
-        dev = x.device
+        assert x_fp8 is not None, "forward L2 requires pre-quantized activation via x_fp8"
+        aq, a_sp = x_fp8
+        M, K = aq.shape  # K = I for fc2
+        dev = aq.device
     H = int(sym_layout.hidden)
     G = int(sym_layout.num_experts_per_rank)
     assert M == int(sym_layout.num_max_pool_tokens)
@@ -702,14 +659,7 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     else:
         d_topk_w, grad_gate_arg = _dummy_f32, _dummy_f32
 
-    # activation (A operand) rowwise mxfp8 quant -- skipped when pre-quant is supplied.
-    if x_fp8 is not None or x_fp8_rowwise is not None:
-        act_flat = aq.view(torch.int8).reshape(-1)
-    else:
-        from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
-
-        aq, a_sp = quantize_rowwise_mxfp8_flydsl(x.contiguous(), preshuffle=True)
-        act_flat = aq.view(torch.int8).reshape(-1)
+    act_flat = aq.view(torch.int8).reshape(-1)
 
     real_tiles_host = int(num_tile_blocks.item())
     worst_case_tiles_host = M // BM
@@ -719,15 +669,13 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
 
     autotune_key = (
         out_features, K, M, BM, BN, apply_weights, with_gate, int(G), int(num_ranks),
-        bf16_epilogue, full_barrier, b_n_slabs,
     )
 
     def _run_with_cu(cu: int) -> None:
         launch = _compile(
             out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
             int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks),
-            apply_weights, with_gate, num_groups=int(G), bf16_epilogue=bf16_epilogue,
-            full_barrier=full_barrier, b_n_slabs=b_n_slabs,
+            apply_weights, with_gate, num_groups=int(G),
         )
         args = (
             act_flat, weight_flat, l2y_fp8, l2y_scale, tile_to_expert, num_tile_blocks, output.view(-1),
@@ -737,8 +685,8 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
         )
         ck = (out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
               int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks), int(G),
-              apply_weights, with_gate, _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU, bf16_epilogue,
-              full_barrier, b_n_slabs, _COMBINE_REAL_TILES_GRID,
+              apply_weights, with_gate, _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU,
+              _COMBINE_REAL_TILES_GRID,
               _COMBINE_PERSISTENT_GEMM, _COMBINE_GEMM_CU, _COMBINE_NUM_XCD, _COMBINE_GROUP_M, _COMBINE_GROUP_N,
               _COMBINE_TILE_SWIZZLE)
         if torch.cuda.is_current_stream_capturing():
