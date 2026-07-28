@@ -111,10 +111,6 @@ def _unwrap_order(order: Optional[str]) -> llvm.AtomicOrdering:
         ) from None
 
 
-def _wait_mem() -> None:
-    llvm.inline_asm(fx.T.i32(), [], "s_waitcnt lgkmcnt(0) vmcnt(0)", "=r,~{memory}", has_side_effects=True)
-
-
 def _as_value(v: Union[int, fx.ArithValue]) -> ir.Value:
     # Coerce python int / ArithValue / raw ir value to a raw ir value (bare int -> i32; pass typed for i64).
     if isinstance(v, int):
@@ -122,10 +118,6 @@ def _as_value(v: Union[int, fx.ArithValue]) -> ir.Value:
     elif hasattr(v, "ir_value"):
         v = v.ir_value()
     return _unwrap_value(v)
-
-
-def l2_invalidate() -> None:
-    llvm.inline_asm(fx.T.i32(), [], "buffer_inv sc1", "=r,~{memory}", has_side_effects=True)
 
 
 def memory_fence(order: Optional[str] = None, scope: Optional[str] = None) -> None:

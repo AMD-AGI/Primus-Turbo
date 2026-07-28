@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Accuracy tests for the fused ``mega_moe_fused`` op against the turbo DeepEP MoE."""
+"""Accuracy tests for the ``fused_mega_moe`` op against the turbo DeepEP MoE."""
 
 from __future__ import annotations
 
@@ -37,16 +37,21 @@ from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
 )
 from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
-from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused  # noqa: E402
+from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe  # noqa: E402
 from tests.pytorch.test_utils import compute_snr  # noqa: E402
 
 # bf16 fused vs bf16 turbo ref; comm + split-role reduce add noise -> use MegaMoE-family SNR floor.
-_SNR_THRESHOLD_DB = 25.0
+_SNR_THRESHOLD_DB = 40.0
+# Use cosine to catch directional gradient errors that SNR alone can miss.
+_COSINE_THRESHOLD = 0.99
+
+# Match the small tensor-level grad norm seen under real training loss scaling.
+_GRAD_OUT_NORM = 1e-3
 
 
 # Fused kernel only supports gfx950; skip everywhere else.
 skip_unless_gfx950 = unittest.skipUnless(
-    torch.cuda.is_available() and is_gfx950(), "mega_moe_fused only supports gfx950"
+    torch.cuda.is_available() and is_gfx950(), "fused_mega_moe only supports gfx950"
 )
 
 
@@ -108,13 +113,15 @@ def _test_forward_backward_impl(
     enable_cudagraph=False,
     enable_torch_compile=False,
 ):
-    """tc-free fwd+bwd of mega_moe_fused vs turbo; returns (tag, actual, ref) triples, frees symm."""
+    """tc-free fwd+bwd of fused_mega_moe vs turbo; returns (tag, actual, ref) triples, frees symm."""
     try:
-        grad_y = torch.randn(x.shape, device=x.device, dtype=torch.bfloat16)
+        # Normalize grad_out by tensor norm so gradient-independent floors remain visible.
+        _gy = torch.randn(x.shape, device=x.device, dtype=torch.float32)
+        grad_y = (_gy / (_gy.norm() + 1e-12) * _GRAD_OUT_NORM).bfloat16()
 
         # fused runner over grad-carrying inputs; topk_idx stays a constant closure
         def _fused(x, topk_weight, l1_weight, l2_weight):
-            return mega_moe_fused(group, x, topk_idx, topk_weight, l1_weight, l2_weight)
+            return fused_mega_moe(group, x, topk_idx, topk_weight, l1_weight, l2_weight)
 
         runner = _fused
         if enable_torch_compile:
@@ -170,7 +177,7 @@ def _test_forward_backward_impl(
 
 
 @instantiate_parametrized_tests
-class MegaMoEFusedTestBase(MultiProcContinuousTest):
+class FusedMegaMoETestBase(MultiProcContinuousTest):
     """EP8 accuracy tests vs turbo DeepEP; base spawns workers + inits PG once per class."""
 
     # PG backend picked by the base class at spawn time.
@@ -209,18 +216,23 @@ class MegaMoEFusedTestBase(MultiProcContinuousTest):
             intermediate_hidden=inter,
         )
 
-    def _snr(self, actual, ref, *, tag):
-        """SNR (dB) of actual vs reference; weakest rank governs the EP group."""
-        snr = torch.tensor([compute_snr(ref, actual)], device=self.device)  # ref is the signal
-        dist.all_reduce(snr, op=dist.ReduceOp.MIN)
-        snr = float(snr.item())
+    def _metrics(self, actual, ref, *, tag):
+        """SNR (dB, magnitude+direction) and cosine (direction only) vs ref; weakest rank governs."""
+        cos = torch.nn.functional.cosine_similarity(
+            actual.float().flatten(), ref.float().flatten(), dim=0, eps=1e-12
+        )
+        m = torch.tensor([compute_snr(ref, actual), float(cos)], device=self.device)  # both higher=better
+        dist.all_reduce(m, op=dist.ReduceOp.MIN)  # weakest rank governs the EP group
+        snr, cos = float(m[0]), float(m[1])
         if self.rank == 0:
-            print(f"[{tag}] min SNR = {snr:.2f} dB")
-        return snr
+            print(f"[{tag}] min SNR = {snr:.2f} dB, min cos = {cos:.5f}")
+        return snr, cos
 
     def _assert_snr(self, actual, ref, *, tag):
-        snr = self._snr(actual, ref, tag=tag)
+        # Require BOTH: SNR (catches floors + magnitude) AND cosine (catches direction errors).
+        snr, cos = self._metrics(actual, ref, tag=tag)
         self.assertGreaterEqual(snr, _SNR_THRESHOLD_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_THRESHOLD_DB}")
+        self.assertGreaterEqual(cos, _COSINE_THRESHOLD, f"[{tag}] cosine {cos:.5f} < {_COSINE_THRESHOLD}")
 
     # ── forward + backward vs turbo DeepEP; optional cudagraph / torch.compile ──
     @skip_unless_gfx950

@@ -571,7 +571,7 @@ def _compile_dense_nt(
     GROUP_M: int = 1,
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
-    nt_vmcnt: int = 4,  # swept: vmcnt=4 > 3 (~1% on L1 NT, gfx950)
+    nt_vmcnt: int = 3,  # gfx950 G2S LDS hazard: vmcnt>=4 races (nondeterministic); 3 is det
     num_xcd: int = 8,
     out_fp16: bool = False,
 ):
@@ -985,12 +985,14 @@ def _compile_grouped_variable_k_bf16(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
-        num_tokens_per_expert_prefix: fx.Tensor,
+        group_k_offsets: fx.Tensor,
+        masked_k: fx.Tensor,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
     ):
         _ = str(fx.thread_idx.x)
-        go_base = fx.Int64(_ptrtoint(_get_iter(num_tokens_per_expert_prefix)))
+        go_base = fx.Int64(_ptrtoint(_get_iter(group_k_offsets)))
+        gk_base = fx.Int64(_ptrtoint(_get_iter(masked_k)))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         pid = fx.block_idx.x
 
@@ -1005,7 +1007,8 @@ def _compile_grouped_variable_k_bf16(
                 block_m = local_tile // N_BLOCKS_N
                 block_n = local_tile % N_BLOCKS_N
             m_start = _load_i64_as_i32(go_base, group_idx)
-            m_end = _load_i64_as_i32(go_base, group_idx + 1)
+            # bound K to valid rows; padding tail never read
+            m_end = m_start + _load_i64_as_i32(gk_base, group_idx)
             gemm_bf16_variable_k_tile(
                 A,
                 B,
@@ -1031,14 +1034,22 @@ def _compile_grouped_variable_k_bf16(
 
     @flyc.jit
     def launch_grouped_variable_k(
-        A, B, C, num_tokens_per_expert_prefix, out_m_rt: fx.Int32, out_n_rt: fx.Int32, stream: fx.Stream
+        A,
+        B,
+        C,
+        group_k_offsets,
+        masked_k,
+        out_m_rt: fx.Int32,
+        out_n_rt: fx.Int32,
+        stream: fx.Stream,
     ):
         grid_x = fx.Int32(TOTAL)
         kernel_grouped_variable_k(
             A,
             B,
             C,
-            num_tokens_per_expert_prefix,
+            group_k_offsets,
+            masked_k,
             out_m_rt,
             out_n_rt,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
@@ -1051,29 +1062,33 @@ _COMPILED_GROUPED_GEMM_CACHE = {}
 
 
 def grouped_gemm_variable_k_bf16(
-    lhs: torch.Tensor,
-    rhs: torch.Tensor,
-    num_tokens_per_expert_prefix: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_k_offsets: torch.Tensor,
+    masked_k: torch.Tensor = None,
     out_dtype: torch.dtype = torch.bfloat16,
     BLOCK_M: int = 256,
     BLOCK_N: int = 256,
     num_xcd: int = 8,
     trans_c: bool = False,
 ) -> torch.Tensor:
-    assert lhs.dim() == 2 and rhs.dim() == 2 and lhs.shape[0] == rhs.shape[0]
-    assert lhs.dtype == torch.bfloat16 and rhs.dtype == torch.bfloat16
-    OUT_M = lhs.shape[1]
-    OUT_N = rhs.shape[1]
-    G = num_tokens_per_expert_prefix.numel() - 1
+    """Variable-K grouped wgrad: out[g]=a[g_rows].T@b[g_rows], K=[offsets[g],offsets[g]+masked_k[g])."""
+    assert a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
+    assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+    OUT_M = a.shape[1]
+    OUT_N = b.shape[1]
+    G = group_k_offsets.numel() - 1
     out_fp16 = out_dtype == torch.float16
     out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)
-    out = torch.empty(out_shape, device=lhs.device, dtype=out_dtype)
-    # prefix offsets must be int64
-    prefix_i64 = (
-        num_tokens_per_expert_prefix
-        if num_tokens_per_expert_prefix.dtype == torch.int64
-        else num_tokens_per_expert_prefix.to(torch.int64)
-    )
+    out = torch.empty(out_shape, device=a.device, dtype=out_dtype)
+    # index tables loaded as i64 in-kernel
+    offsets_i64 = group_k_offsets if group_k_offsets.dtype == torch.int64 else group_k_offsets.to(torch.int64)
+    # per-expert valid K length; default = padded span
+    if masked_k is None:
+        masked_k_i64 = (offsets_i64[1:] - offsets_i64[:-1]).contiguous()
+    else:
+        assert masked_k.numel() == G, f"masked_k len {masked_k.numel()} != G {G}"
+        masked_k_i64 = (masked_k if masked_k.dtype == torch.int64 else masked_k.to(torch.int64)).contiguous()
     launch = _compile_grouped_variable_k_bf16(
         OUT_M,
         OUT_N,
@@ -1084,11 +1099,16 @@ def grouped_gemm_variable_k_bf16(
         out_fp16=out_fp16,
         trans_c=trans_c,
     )
+    # Pass operands as an int32 view: the kernel only reads their base pointer (rebased
+    # by byte offsets in make_bf16_buffer_tensor_rebased), so dtype is irrelevant, while
+    # halving the element count keeps the flyc CABI 32-bit numel field from overflowing
+    # on production pools (>2^31 bf16 elems).
     args = (
-        lhs.contiguous().view(-1),
-        rhs.contiguous().view(-1),
+        a.contiguous().view(torch.int32).view(-1),
+        b.contiguous().view(torch.int32).view(-1),
         out.view(-1),
-        prefix_i64,
+        offsets_i64,
+        masked_k_i64,
         OUT_M,
         OUT_N,
         torch.cuda.current_stream(),

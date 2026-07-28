@@ -294,7 +294,7 @@ def _make_dispatch_prologue(
                 padded_count = ((expert_total_count + fx.Int32(block_m - 1)) // fx.Int32(block_m)) * fx.Int32(
                     block_m
                 )
-                buffer_store(_ext_i64(padded_count), num_tokens_per_expert_resource, local_expert_index)
+                buffer_store(_ext_i64(expert_total_count), num_tokens_per_expert_resource, local_expert_index)
                 buffer_store(
                     _ext_i64(expert_pool_base), num_tokens_per_expert_prefix_resource, local_expert_index
                 )
@@ -592,7 +592,7 @@ def dispatch_prologue_flydsl_kernel(
     # Handle ABI (indices consumed by fwd combine + bwd dispatch/combine):
     #   0 expert_send_dst_rank   1 expert_send_dst_row   2 expert_send_count
     #   3 expert_send_offset     4 dispatched_token_idx  5 tile_to_expert
-    #   6 num_tokens_per_expert  7 num_tokens_per_expert_prefix  8 num_tile_blocks
+    #   6 real_count_per_expert  7 num_tokens_per_expert_prefix  8 num_tile_blocks
     #   9 combine_recv_dst_rank  10 combine_recv_start_row  11 combine_recv_count
     # (12 pool_src_slot is appended by the dispatch launcher on the forward path.)
     return (

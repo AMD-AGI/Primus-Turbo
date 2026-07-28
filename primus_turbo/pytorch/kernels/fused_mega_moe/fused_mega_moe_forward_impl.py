@@ -27,13 +27,13 @@ from primus_turbo.pytorch.core.backend import (
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
 # dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
-# 0-5 send/dispatch tables + tile_to_expert, 6 num_tokens_per_expert,
+# 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
 # 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
 _HANDLE_LEN = 13
 _H_NUM_TILE_BLOCKS = 8
 
 
-class MegaMoEForwardFlyDSLBackend(KernelBackend):
+class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
     """FlyDSL fused MoE forward: dispatch grouped GEMM (nt) + SwiGLU + grouped GEMM combine (nt)."""
 
     @staticmethod
@@ -98,14 +98,14 @@ class MegaMoEForwardFlyDSLBackend(KernelBackend):
         )
 
 
-_MEGA_MOE_FORWARD_BACKENDS = {
+_FUSED_MEGA_MOE_FORWARD_BACKENDS = {
     # autotune is kernel-internal; skip framework-level backend profiling
-    BackendType.FLYDSL: BackendEntry(MegaMoEForwardFlyDSLBackend, autotune=False),
+    BackendType.FLYDSL: BackendEntry(FusedMegaMoEForwardFlyDSLBackend, autotune=False),
 }
 
 
-class MegaMoEForwardKernelDispatcher(AutoKernelDispatcher):
-    _backends = _MEGA_MOE_FORWARD_BACKENDS
+class FusedMegaMoEForwardKernelDispatcher(AutoKernelDispatcher):
+    _backends = _FUSED_MEGA_MOE_FORWARD_BACKENDS
     _cache = TuneCache(1024)
 
     @classmethod
@@ -127,11 +127,11 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 
 @_torch_custom_op_wrapper(
-    "primus_turbo::mega_moe_forward",
+    "primus_turbo::fused_mega_moe_forward",
     mutates_args=(),
     device_types="cuda",
 )
-def _mega_moe_forward(
+def _fused_mega_moe_forward(
     x: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -153,11 +153,11 @@ def _mega_moe_forward(
         topk_weights=topk_weights,
         layout=layout,
     )
-    return MegaMoEForwardKernelDispatcher.dispatch(default_backend_enum, None, **kwargs)
+    return FusedMegaMoEForwardKernelDispatcher.dispatch(default_backend_enum, None, **kwargs)
 
 
-@_mega_moe_forward.register_fake
-def _mega_moe_forward_meta(
+@_fused_mega_moe_forward.register_fake
+def _fused_mega_moe_forward_meta(
     x: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -189,7 +189,7 @@ def _mega_moe_forward_meta(
         i32(),
         i32(),  # 4 dispatched_token_idx  5 tile_to_expert
         i64(),
-        i64(),  # 6 num_tokens_per_expert  7 ..._prefix
+        i64(),  # 6 real_count_per_expert  7 padded-prefix
         i32(),  # 8 num_tile_blocks
         i32(),
         i32(),
@@ -200,7 +200,7 @@ def _mega_moe_forward_meta(
     return y, l1_out, dispatch_weights_in_buf, handle
 
 
-def mega_moe_forward_impl(
+def fused_mega_moe_forward_impl(
     x: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -219,7 +219,7 @@ def mega_moe_forward_impl(
         l1_out,
         dispatch_weights_in_buf,
         handle,
-    ) = _mega_moe_forward(
+    ) = _fused_mega_moe_forward(
         x,
         w1,
         w2,

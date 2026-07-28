@@ -143,7 +143,7 @@ print(c.shape) # [128, 256]
 
 ### 1.4 Mega MoE
 
-`mega_moe_fused` is an EP intra-node MoE op that fuses communication with the grouped GEMM
+`fused_mega_moe` is an EP intra-node MoE op that fuses communication with the grouped GEMM
 (`dispatch_grouped_gemm` + `grouped_gemm_combine`). It is a single autograd op; the per-shape
 communication buffer is allocated once and cached internally. See
 [README_Mega_MoE](./README_Mega_MoE.md) for the design and performance.
@@ -155,7 +155,7 @@ import torch
 import torch.distributed as dist
 
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
-from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused
+from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
 
 # --- distributed setup (one rank per GPU, intra-node EP) ---
 dist.init_process_group("nccl")
@@ -192,7 +192,7 @@ topk_idx = torch.randint(0, E, (T, K), device="cuda", dtype=torch.int64)   # glo
 topk_w   = torch.rand(T, K, device="cuda", dtype=torch.float32)            # routing weights
 
 # --- fused forward + backward ---
-y = mega_moe_fused(group, x, topk_idx, topk_w, w1, w2)   # [T, H]
+y = fused_mega_moe(group, x, topk_idx, topk_w, w1, w2)   # [T, H]
 y.sum().backward()                                        # grads for x, w1, w2, topk_w
 # run with torchrun --nproc_per_node=8 --nnodes=1 this_code.py
 ```

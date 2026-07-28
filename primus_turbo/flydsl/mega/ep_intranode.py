@@ -17,7 +17,6 @@ from flydsl.expr.buffer_ops import (
 )
 
 from primus_turbo.flydsl.mega.prims import (
-    _wait_mem,
     atomic_add,
     copy_warp,
     ld,
@@ -82,6 +81,8 @@ def dispatch_bf16_tile(
             hidden_bytes,
             dst_off=dest_row * fx.Int32(hidden_i32),
             src_off=source_row * fx.Int32(hidden_i32),
+            load_cache_modifier=19,
+            store_cache_modifier=19,
         )
 
     if const_expr(signal):
@@ -142,8 +143,8 @@ def combine_bf16_tile(
             full_bytes,
             dst_off=slot * fx.Int32(row_words),
             src_off=row * fx.Int32(row_words),
-            load_cache_modifier=19,
-            store_cache_modifier=19,  # sc0+sc1: push data to peer MALL coherence point
+            load_cache_modifier=18,  # sc1|nt: read the same-agent GEMM stage.
+            store_cache_modifier=19,  # sc0|sc1|nt: publish to a remote agent.
         )
         if const_expr(tail_cols):
             oob_index = fx.Int32(n_slots) * fx.Int32(out_features)
@@ -155,18 +156,20 @@ def combine_bf16_tile(
             in_tail = (lane_id * fx.Int32(_PVEC)) < fx.Int32(tail_cols)
             safe_col = arith.select(in_tail, col, fx.Int32(out_features - _PVEC))
             tail_value = buffer_load(
-                l2_res, row_off + safe_col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=19
+                l2_res, row_off + safe_col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=18
             )
             dst = arith.select(in_tail, slot_base + col, oob_index)
-            buffer_store(tail_value, peer, dst, cache_modifier=19)  # sc0+sc1: peer MALL coherence
+            buffer_store(tail_value, peer, dst, cache_modifier=19)
         if const_expr(with_gate):
-            gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32(), cache_modifier=19)
+            gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
             gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
-            buffer_store(gate_value, gate_peer, slot, cache_modifier=19)  # sc0+sc1: match token push
+            buffer_store(gate_value, gate_peer, slot, cache_modifier=19)
+
         if const_expr(signal):
             bank = fx.Int32(0) if bank_offset is None else bank_offset
+            # Wait for CM19 payload stores before publishing the relaxed completion flag.
             fx.rocdl.s_waitcnt(0)
-            st(barrier_addr, bank + slot, epoch, scope="agent")
+            st(barrier_addr, bank + slot, epoch, order="relaxed", scope="sys")
 
 
 @ASTRewriter.transform
@@ -210,7 +213,14 @@ def topk_reduce_bf16_tile(
                     if topk_index < fx.Int64(num_experts):
                         if lane_id == fx.Int32(0):
                             spin_start = read_clock()
-                            flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
+                            fx.rocdl.s_waitcnt(0)
+                            flag = ld(
+                                barrier_base,
+                                reduce_bank + slot,
+                                order="relaxed",
+                                scope="sys",
+                                dtype=fx.T.i64(),
+                            )
                             while flag != epoch:
                                 fx.rocdl.s_sleep(fx.Int32(1))
                                 if spin_timed_out(spin_start):
@@ -230,8 +240,15 @@ def topk_reduce_bf16_tile(
                                     )
                                     spin_start = read_clock()
                                 # re-read the flag each spin iteration (MUST stay inside the while)
-                                flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
-            _wait_mem()
+                                fx.rocdl.s_waitcnt(0)
+                                flag = ld(
+                                    barrier_base,
+                                    reduce_bank + slot,
+                                    order="relaxed",
+                                    scope="sys",
+                                    dtype=fx.T.i64(),
+                                )
+            fx.gpu.barrier()
 
         token_row_off = token * fx.Int32(topk) * fx.Int32(out_features)
         # Prefetch per-slot validity (scalar, once per token).
@@ -254,13 +271,17 @@ def topk_reduce_bf16_tile(
                         row_off,
                         vec_width=_PVEC,
                         dtype=fx.T.bf16(),
-                        # cache_modifier=3,  # glc|slc: L1+L2 bypass (avoid stale L2 on slot reuse)
+                        cache_modifier=19,  # sc0|sc1|nt: system-visible non-temporal read.
                     )
                 )
             if const_expr(apply_weights):
                 weights = [
                     buffer_load(
-                        topk_weights_res, token * fx.Int32(topk) + fx.Int32(j), vec_width=1, dtype=fx.T.f32()
+                        topk_weights_res,
+                        token * fx.Int32(topk) + fx.Int32(j),
+                        vec_width=1,
+                        dtype=fx.T.f32(),
+                        cache_modifier=19,
                     )
                     for j in range_constexpr(topk)
                 ]
@@ -279,8 +300,8 @@ def topk_reduce_bf16_tile(
                 topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
                 if lane_id == fx.Int32(0):
                     gate_v = buffer_load(
-                        gate_local_res, slot, vec_width=1, dtype=fx.T.f32(), cache_modifier=3
-                    )  # glc|slc: avoid stale L2 on slot reuse (match token read)
+                        gate_local_res, slot, vec_width=1, dtype=fx.T.f32(), cache_modifier=19
+                    )
                     zero_f = fx.Float32(0.0)
                     v1 = fx.arith.select(topk_index < fx.Int64(num_experts), gate_v, zero_f)
                     d_val = fx.arith.select(topk_index >= fx.Int64(0), v1, zero_f)

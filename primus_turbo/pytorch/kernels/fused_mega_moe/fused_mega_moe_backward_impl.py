@@ -11,6 +11,7 @@ from typing import List, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
+from primus_turbo.flydsl.gemm.gemm_bf16_kernel import grouped_gemm_variable_k_bf16
 from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
@@ -23,22 +24,19 @@ from primus_turbo.pytorch.core.backend import (
     KernelBackend,
     TuneCache,
 )
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
-    grouped_gemm_variable_k_impl,
-)
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
 # dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
-# 0-5 send/dispatch tables + tile_to_expert, 6 num_tokens_per_expert,
+# 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
 # 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
 _HANDLE_LEN = 13
 _H_NUM_TILE_BLOCKS = 8
-_H_NUM_TOKENS_PER_EXPERT = 6
+_H_REAL_COUNT_PER_EXPERT = 6
 _H_NUM_TOKENS_PER_EXPERT_PREFIX = 7
 
 
-class MegaMoEBackwardFlyDSLBackend(KernelBackend):
+class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
     """FlyDSL fused MoE backward: L2 dgrad (nn) + SwiGLU^T + dW2 + L1 dgrad combine (nn) + dW1 (tn)."""
 
     @staticmethod
@@ -72,7 +70,7 @@ class MegaMoEBackwardFlyDSLBackend(KernelBackend):
 
         # ABI guard: catch a kernel return-order change loudly.
         assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
-        num_tokens_per_expert = handle[_H_NUM_TOKENS_PER_EXPERT]
+        real_count_per_expert = handle[_H_REAL_COUNT_PER_EXPERT]
         num_tokens_per_expert_prefix = handle[_H_NUM_TOKENS_PER_EXPERT_PREFIX]
         in_handle = tuple(handle)
 
@@ -100,17 +98,12 @@ class MegaMoEBackwardFlyDSLBackend(KernelBackend):
             num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
         )
 
-        # dW2 = dispatch_l2_grad^T @ act_weighted (variable-K wgrad)
-        dW2 = grouped_gemm_variable_k_impl(
+        dW2 = grouped_gemm_variable_k_bf16(
             dispatch_l2_grad,
             act_weighted,
-            num_tokens_per_expert,
             num_tokens_per_expert_prefix,
-            trans_a=True,
-            trans_b=False,
+            masked_k=real_count_per_expert,
             trans_c=False,
-            num_cu=None,
-            default_backend=BackendType.TRITON.value,
         )
 
         # L1 dgrad (grad_l1 @ w1, nn) + combine PUSH + dx reduce + grad_gate scatter
@@ -139,14 +132,14 @@ class MegaMoEBackwardFlyDSLBackend(KernelBackend):
         return dx, grad_topk_weights, dW1.to(w1.dtype), dW2.to(w2.dtype)
 
 
-_MEGA_MOE_BACKWARD_BACKENDS = {
+_FUSED_MEGA_MOE_BACKWARD_BACKENDS = {
     # autotune is kernel-internal; skip framework-level backend profiling
-    BackendType.FLYDSL: BackendEntry(MegaMoEBackwardFlyDSLBackend, autotune=False),
+    BackendType.FLYDSL: BackendEntry(FusedMegaMoEBackwardFlyDSLBackend, autotune=False),
 }
 
 
-class MegaMoEBackwardKernelDispatcher(AutoKernelDispatcher):
-    _backends = _MEGA_MOE_BACKWARD_BACKENDS
+class FusedMegaMoEBackwardKernelDispatcher(AutoKernelDispatcher):
+    _backends = _FUSED_MEGA_MOE_BACKWARD_BACKENDS
     _cache = TuneCache(1024)
 
     @classmethod
@@ -164,11 +157,11 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 
 @_torch_custom_op_wrapper(
-    "primus_turbo::mega_moe_backward",
+    "primus_turbo::fused_mega_moe_backward",
     mutates_args=(),
     device_types="cuda",
 )
-def _mega_moe_backward(
+def _fused_mega_moe_backward(
     grad_y: torch.Tensor,
     saved_x: torch.Tensor,
     l1_out: torch.Tensor,
@@ -198,11 +191,11 @@ def _mega_moe_backward(
         num_tokens=num_tokens,
         num_topk=num_topk,
     )
-    return MegaMoEBackwardKernelDispatcher.dispatch(default_backend_enum, None, **kwargs)
+    return FusedMegaMoEBackwardKernelDispatcher.dispatch(default_backend_enum, None, **kwargs)
 
 
-@_mega_moe_backward.register_fake
-def _mega_moe_backward_meta(
+@_fused_mega_moe_backward.register_fake
+def _fused_mega_moe_backward_meta(
     grad_y: torch.Tensor,
     saved_x: torch.Tensor,
     l1_out: torch.Tensor,
@@ -225,7 +218,7 @@ def _mega_moe_backward_meta(
     return dx, grad_topk_weights, dW1, dW2
 
 
-def mega_moe_backward_impl(
+def fused_mega_moe_backward_impl(
     grad_y: torch.Tensor,
     saved_x: torch.Tensor,
     l1_out: torch.Tensor,
@@ -243,7 +236,7 @@ def mega_moe_backward_impl(
 
     Returns (dx, grad_topk_weights, dW1, dW2).
     """
-    return _mega_moe_backward(
+    return _fused_mega_moe_backward(
         grad_y,
         saved_x,
         l1_out,

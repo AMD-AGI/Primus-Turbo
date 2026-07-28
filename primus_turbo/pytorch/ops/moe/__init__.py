@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+from .fused_mega_moe import *
 from .fused_moe_router import *
 from .indices_converter import *
 from .moe_dispatch_combine import *
