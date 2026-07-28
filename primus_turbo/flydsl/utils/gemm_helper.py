@@ -578,6 +578,8 @@ class StoreCPerTensorCShuffle:
         c_lds,
         wave_id,
         row_pad=0,
+        pipe=False,
+        store_aux=0,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
@@ -604,6 +606,12 @@ class StoreCPerTensorCShuffle:
         self.row_stride = self.Cc + row_pad
         self.row_pad = row_pad
         self.wave_lds_elems = 16 * self.row_stride  # per-wave staging (one 16-row tile)
+        # pipe=True double-buffers the staging region (parity ti%2) so ti+1's ds_write
+        # overlaps ti's ds_read + store; needs 2x LDS (caller sizes C_lds_shuffle 2*_cshuf_n).
+        self.pipe = pipe
+        # Non-temporal aux immediate for the C store (keeps write-once C out of L2). 0 = default.
+        self.store_aux = store_aux
+        self.wave_stride = self.wave_lds_elems * (2 if pipe else 1)
         self.c_lds = c_lds
         # C addressed via i64 per-band re-basing (handles OUT_M*OUT_N > 2^31 / >4GB);
         # the final 128b store re-bases at each 16-row sub-tile band (see store()).
@@ -626,22 +634,24 @@ class StoreCPerTensorCShuffle:
     def store(self, c_frag, base_row, base_col):
         scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
         lds_base = fx.Int32(fx.ptrtoint(self.c_lds.ptr))
-        wave_off = self.wave_id * self.wave_lds_elems  # element offset of this wave's region
+        wave_base = self.wave_id * self.wave_stride  # base of this wave's region(s)
         out_b = 2  # bf16/fp16 = 2 bytes
         cols_i = _as_index(self.c_cols)
         rows_i = _as_index(self.c_rows)
-        for ti in range_constexpr(self.n_tiles_a):
-            # --- stage this 16-row sub-tile row-major into the per-wave LDS region ---
+
+        def _write_ti(ti, roff):
+            # stage this 16-row sub-tile row-major into the given per-wave LDS region
             for tj in range_constexpr(self.n_tiles_b):
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 lds_col = tj * 16 + self.lane_id % 16
                 for i in range_constexpr(4):
                     lds_row = (self.lane_id // 16) * 4 + i
-                    e = wave_off + lds_row * self.row_stride + lds_col
+                    e = roff + lds_row * self.row_stride + lds_col
                     val = (vec_f32[i] * scale).to(self.out_ty)
                     ptr = fx.inttoptr(self._store_ptr_t, lds_base + e * 2)
                     ptr.store(val)
-            S2RLoaderTr._wait_lgkmcnt(0)
+
+        def _read_store_ti(ti, roff):
             # Re-base output at this 16-row band (i64), re-read N-contiguous (one EPL-col
             # run/lane) + one 128b store at a small in-band i32 offset; band num_records OOB-drops.
             band_row = arith.index_cast(T.index, base_row + ti * 16)
@@ -655,14 +665,41 @@ class StoreCPerTensorCShuffle:
             col0 = (self.lane_id * self.EPL) % self.Cc
             for sub in range_constexpr(self.EPL // self.elems_per_store):
                 col_in = col0 + sub * self.elems_per_store
-                lane_e = wave_off + row_in * self.row_stride + col_in
+                lane_e = roff + row_in * self.row_stride + col_in
                 rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
                 vec = fx.make_view(rptr, fx.make_layout(self.elems_per_store, 1)).load()
                 gcol = base_col + col_in
                 valid = (gcol + fx.Int32(self.elems_per_store)) <= self.c_cols
                 off = (row_in * self.c_cols + gcol) * out_b  # i32-small within band
-                _buffer_ops.buffer_store(vec, rsrc, off, mask=valid, offset_is_bytes=True)
-            S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
+                _buffer_ops.buffer_store(
+                    vec, rsrc, off, mask=valid, cache_modifier=self.store_aux, offset_is_bytes=True
+                )
+
+        if const_expr(self.pipe and self.n_tiles_a > 1):
+            # Depth-2 softpipe over ti: prefetch ti+1's ds_write, store ti, drain in WPT
+            # steps (lgkmcnt oldest-first) so ti+1's prefetched writes stay in flight.
+            WPT = self.n_tiles_b * 4  # ds_write_b16 per ti (n_tiles_b tj * 4 rows)
+
+            def _roff(ti):
+                return wave_base + (ti % 2) * self.wave_lds_elems
+
+            _write_ti(0, _roff(0))
+            for ti in range_constexpr(self.n_tiles_a):
+                if const_expr(ti + 1 < self.n_tiles_a):
+                    _write_ti(ti + 1, _roff(ti + 1))
+                    S2RLoaderTr._wait_lgkmcnt(WPT)  # ti writes done; keep ti+1's WPT
+                    _read_store_ti(ti, _roff(ti))
+                    S2RLoaderTr._wait_lgkmcnt(WPT)  # ti read done; region free for ti+2
+                else:
+                    S2RLoaderTr._wait_lgkmcnt(0)  # last: drain final writes
+                    _read_store_ti(ti, _roff(ti))
+                    S2RLoaderTr._wait_lgkmcnt(0)
+        else:
+            for ti in range_constexpr(self.n_tiles_a):
+                _write_ti(ti, wave_base)
+                S2RLoaderTr._wait_lgkmcnt(0)
+                _read_store_ti(ti, wave_base)
+                S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
 
 
 def _a_tail_mask_vec(lane_id, r):
