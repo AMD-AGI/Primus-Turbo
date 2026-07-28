@@ -82,9 +82,19 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     return "grid", BLOCK_H, grid, 0, 0
 
 
+# Above this many partials the Triton finalize loses badly to a torch
+# reduction: it parallelizes over H only (ceil(H/BLOCK_H) programs) and walks
+# n_parts serially, so a tall, narrow buffer leaves the GPU idle.
+# The multi-row backward emits ceil(B / ROWS_PER_BLOCK) partials, which reaches
+# the tall regime for q_norm/k_norm (B in the millions, H=128).
+_FINALIZE_TRITON_MAX_PARTS = 512
+
+
 def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torch.Tensor:
     """Reduce (n_parts, H) fp32 partials to dgamma[H]."""
     n_parts, H = dg_partial.shape
+    if n_parts > _FINALIZE_TRITON_MAX_PARTS:
+        return dg_partial.sum(dim=0).to(gamma_dtype)
     dg = torch.empty(H, device=dg_partial.device, dtype=gamma_dtype)
     BLOCK_H = 64 if H >= 64 else _next_pow2(H)
     BLOCK_N = 64 if n_parts >= 64 else _next_pow2(max(n_parts, 1))
