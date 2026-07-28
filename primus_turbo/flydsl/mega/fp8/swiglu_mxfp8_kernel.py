@@ -34,6 +34,8 @@ _POOL_BLOCK_M = 256
 
 _ACT_BF16_SCRATCH: dict = {}
 _SCALE_RAW_SCRATCH: dict = {}
+_Q_SCRATCH: dict = {}
+_ASP_SCRATCH: dict = {}
 
 
 @functools.lru_cache(maxsize=16)
@@ -80,9 +82,9 @@ def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = 4096, scale_pack:
         )
         row = block_index_x
         while row < fx.Int32(c_m):
-            act_row = row * fx.Int32(I)
-            scale_row = row * fx.Int32(n_blk)
             if row < m_real:
+                act_row = row * fx.Int32(I)
+                scale_row = row * fx.Int32(n_blk)
                 row_base = row * fx.Int32(two_I)
                 col = tid * fx.Int32(_VEC)
                 while col < fx.Int32(I):
@@ -103,44 +105,44 @@ def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = 4096, scale_pack:
 
                 fx.rocdl.s_barrier()
 
-            b = tid
-            while b < fx.Int32(n_blk):
-                words, biased = _quant_block_words(act_rsrc, act_row + b * fx.Int32(_BLK))
-                buffer_store(
-                    fx.arith.ArithValue(biased).trunci(fx.T.i8()),
-                    scale_rsrc,
-                    scale_row + b,
-                )
-                base_i32 = row * fx.Int32(K_fp8_i32) + b * fx.Int32(blk_i32)
-                for wi in range_constexpr(blk_i32):
-                    buffer_store(words[wi], qr, base_i32 + fx.Int32(wi))
-                b = b + fx.Int32(BT)
+                b = tid
+                while b < fx.Int32(n_blk):
+                    words, biased = _quant_block_words(act_rsrc, act_row + b * fx.Int32(_BLK))
+                    buffer_store(
+                        fx.arith.ArithValue(biased).trunci(fx.T.i8()),
+                        scale_rsrc,
+                        scale_row + b,
+                    )
+                    base_i32 = row * fx.Int32(K_fp8_i32) + b * fx.Int32(blk_i32)
+                    for wi in range_constexpr(blk_i32):
+                        buffer_store(words[wi], qr, base_i32 + fx.Int32(wi))
+                    b = b + fx.Int32(BT)
 
-            fx.rocdl.s_barrier()
+                fx.rocdl.s_barrier()
 
-            grp = row // fx.Int32(64)
-            r_row = row % fx.Int32(16)
-            s_row = (row % fx.Int32(64)) // fx.Int32(16)
-            n_out = K128p * 4
-            n_rounds = ceildiv(n_out, BT)
-            for pi in range_constexpr(n_rounds):
-                idx = tid + pi * BT
-                if idx < fx.Int32(n_out):
-                    kkp = idx // fx.Int32(4)
-                    g = idx % fx.Int32(4)
-                    lane = g * fx.Int32(16) + r_row
-                    packed = fx.Int32(0)
-                    for bb in range_constexpr(scale_pack):
-                        ki = kkp * fx.Int32(scale_pack) + fx.Int32(bb)
-                        raw_b = ki * fx.Int32(4) + g
-                        scale_byte = fx.arith.ArithValue(
-                            buffer_load(scale_rsrc, scale_row + raw_b, vec_width=1, dtype=fx.T.i8())
-                        ).extui(fx.T.i32())
-                        packed = packed | ((scale_byte & fx.Int32(0xFF)) << (fx.Int32(bb) * fx.Int32(8)))
-                    out_idx = (
-                        (grp * fx.Int32(K128p) + kkp) * fx.Int32(64) + lane
-                    ) * fx.Int32(4) + s_row
-                    buffer_store(packed, sr, out_idx)
+                grp = row // fx.Int32(64)
+                r_row = row % fx.Int32(16)
+                s_row = (row % fx.Int32(64)) // fx.Int32(16)
+                n_out = K128p * 4
+                n_rounds = ceildiv(n_out, BT)
+                for pi in range_constexpr(n_rounds):
+                    idx = tid + pi * BT
+                    if idx < fx.Int32(n_out):
+                        kkp = idx // fx.Int32(4)
+                        g = idx % fx.Int32(4)
+                        lane = g * fx.Int32(16) + r_row
+                        packed = fx.Int32(0)
+                        for bb in range_constexpr(scale_pack):
+                            ki = kkp * fx.Int32(scale_pack) + fx.Int32(bb)
+                            raw_b = ki * fx.Int32(4) + g
+                            scale_byte = fx.arith.ArithValue(
+                                buffer_load(scale_rsrc, scale_row + raw_b, vec_width=1, dtype=fx.T.i8())
+                            ).extui(fx.T.i32())
+                            packed = packed | ((scale_byte & fx.Int32(0xFF)) << (fx.Int32(bb) * fx.Int32(8)))
+                        out_idx = (
+                            (grp * fx.Int32(K128p) + kkp) * fx.Int32(64) + lane
+                        ) * fx.Int32(4) + s_row
+                        buffer_store(packed, sr, out_idx)
 
             row = row + fx.Int32(grid_x)
 
@@ -184,10 +186,8 @@ def swiglu_mxfp8_flydsl_kernel(
     sk = (M, I, dev)
     act_bf16 = _ACT_BF16_SCRATCH.get(sk)
     if act_bf16 is None:
-        act_bf16 = torch.zeros((M, I), dtype=torch.bfloat16, device=dev)
+        act_bf16 = torch.empty((M, I), dtype=torch.bfloat16, device=dev)
         _ACT_BF16_SCRATCH[sk] = act_bf16
-    else:
-        act_bf16.zero_()
 
     sk2 = (M, n_blk, dev)
     scale_raw = _SCALE_RAW_SCRATCH.get(sk2)
@@ -195,11 +195,19 @@ def swiglu_mxfp8_flydsl_kernel(
         scale_raw = torch.empty((M, n_blk), dtype=torch.uint8, device=dev)
         _SCALE_RAW_SCRATCH[sk2] = scale_raw
 
-    q = torch.zeros((M, I), dtype=torch.float8_e4m3fn, device=dev)
+    sk3 = (M, I, dev)
+    q = _Q_SCRATCH.get(sk3)
+    if q is None:
+        q = torch.empty((M, I), dtype=torch.float8_e4m3fn, device=dev)
+        _Q_SCRATCH[sk3] = q
     q_i32 = q.view(torch.int32)
     K128p = ceildiv(I // 128, scale_pack)
     a_ngrp = ceildiv(M, 64)
-    a_sp = torch.zeros(a_ngrp * K128p * 256, dtype=torch.int32, device=dev)
+    asp_sk = (a_ngrp, K128p, dev)
+    a_sp = _ASP_SCRATCH.get(asp_sk)
+    if a_sp is None:
+        a_sp = torch.empty(a_ngrp * K128p * 256, dtype=torch.int32, device=dev)
+        _ASP_SCRATCH[asp_sk] = a_sp
 
     launch = _compile_swiglu_mxfp8(int(I), scale_pack=int(scale_pack))
     args = (x, act_bf16, q_i32, a_sp, scale_raw, num_tile_blocks, M, torch.cuda.current_stream())
