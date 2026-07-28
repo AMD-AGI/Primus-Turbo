@@ -2,6 +2,9 @@
 # Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
 #
+# Adapted from NVIDIA Megatron-LM (https://github.com/NVIDIA/Megatron-LM),
+#   file megatron/core/transformer/moe/fused_a2a.py.
+#
 # See LICENSE for license information.
 ###############################################################################
 

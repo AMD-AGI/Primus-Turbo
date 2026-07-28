@@ -219,12 +219,14 @@ See [Benchmarks](./benchmark/README.md) for detailed performance results and com
 
 ## 🙏 Acknowledgements
 
-Primus-Turbo builds on excellent open-source work from the AMD/ROCm ecosystem. We especially thank:
+Primus-Turbo builds on excellent open-source work from the wider community. We especially thank:
 
-- [**FlyDSL**](https://github.com/ROCm/FlyDSL) — a Flexible Layout Python DSL and MLIR compiler stack for authoring high-performance AMD GPU kernels. Many of our kernels (GEMM, GroupedGEMM, Attention, MoE) are authored with FlyDSL, and we thank the FlyDSL team for their close collaboration and support.
+- [**FlyDSL**](https://github.com/ROCm/FlyDSL) — a Flexible Layout Python DSL and MLIR compiler stack for authoring high-performance AMD GPU kernels. Many of our kernels (GEMM, GroupedGEMM, Attention, MoE) are built with FlyDSL; those files carry FlyDSL attribution and remain under Apache-2.0 — see `LICENSE` and `LICENSE-APACHE`. We thank the FlyDSL team for their close collaboration and support.
 - [**AITER**](https://github.com/ROCm/aiter) — AI Tensor Engine for ROCm, providing high-performance operator backends (e.g. FlashAttention, FP8) that Primus-Turbo integrates.
 - [**Triton-distributed**](https://github.com/ByteDance-Seed/Triton-distributed) — a distributed compiler for computation-communication overlapping. Our Mega MoE comm-compute fused kernels reference its overlapping-kernel design.
 - [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) — a clean and efficient FP8/BF16 GEMM library. Our Mega MoE barrier and symmetric-heap layout designs reference it.
+- [**NVIDIA TransformerEngine**](https://github.com/NVIDIA/TransformerEngine) — our Triton MoE permute/unpermute kernels are adapted from TransformerEngine. That file remains under Apache-2.0 and carries NVIDIA attribution — see `LICENSE` and `LICENSE-APACHE`.
+- [**NVIDIA Megatron-LM**](https://github.com/NVIDIA/Megatron-LM) — parts of our MoE token permutation and dispatch layer are adapted from Megatron-LM. Those files carry NVIDIA attribution and remain under the 3-clause BSD license — see `LICENSE`.
 
 ## 📜 License
 

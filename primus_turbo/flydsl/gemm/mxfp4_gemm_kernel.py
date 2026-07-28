@@ -1,16 +1,22 @@
 ###############################################################################
+# SPDX-License-Identifier: Apache-2.0
+#
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2025 FlyDSL Project Contributors
-# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL); see LICENSE-APACHE for the Apache-2.0 terms.
 #
-# See LICENSE for license information.
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL),
+#   file kernels/gemm/fp4_gemm_4wave.py.
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """4-wave MXFP4 dense GEMM (per-32-K E8M0 block scaling) for AMD CDNA4 (gfx950).
 
 NT only: A [M, K] fp4 (packed 2/byte), B [N, K] fp4, C = a @ b^T (bf16).
 
-Ported from the FlyDSL standalone 4-wave production kernel. The 4-wave (2x2 wave)
+The 4-wave (2x2 wave)
 topology gives 1 wave/SIMD so the full 256-AGPR file holds one wave's N-sliced
 accumulator (acc_left + acc_right) cleanly, freeing arch-VGPR for operand prefetch.
 

@@ -1,5 +1,6 @@
 include README.md
 include LICENSE
+include LICENSE-APACHE
 include setup.py
 include pyproject.toml
 include requirements.txt

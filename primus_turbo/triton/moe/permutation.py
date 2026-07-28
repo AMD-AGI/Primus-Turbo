@@ -1,8 +1,14 @@
 ###############################################################################
+# SPDX-License-Identifier: Apache-2.0
+#
 # Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
 #
-# See LICENSE for license information.
+# Adapted from NVIDIA TransformerEngine (https://github.com/NVIDIA/TransformerEngine).
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 from typing import Union
