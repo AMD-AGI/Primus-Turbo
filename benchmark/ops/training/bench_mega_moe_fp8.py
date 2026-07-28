@@ -81,7 +81,6 @@ from config import get_platform_info  # noqa: E402
 import primus_turbo.pytorch  # noqa: E402,F401
 from primus_turbo.flydsl.mega import (  # noqa: E402  (SwiGLU fwd/bwd; shared with the bf16 stack)
     swiglu_backward_flydsl_kernel,
-    swiglu_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     colwise_grouped_meta,
@@ -91,8 +90,10 @@ from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
-    quantize_grouped_weight_mxfp8,
+    quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
+    quantize_grouped_weight_mxfp8_flydsl,
     quantize_rowwise_mxfp8_flydsl,
+    swiglu_mxfp8_flydsl_kernel,
 )
 from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8  # noqa: E402
 from primus_turbo.pytorch.core.backend import BackendType  # noqa: E402
@@ -286,7 +287,7 @@ def profile_l2(group, args, mode):
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
-    act = swiglu_flydsl_kernel(l1, symm.meta_scalars[1:2]).contiguous()  # [M, I] bf16 (contiguous: combine reads flat)
+    act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, symm.meta_scalars[1:2])
     w2_fp8 = prepare_w2_fp8(W2)               # static weight prep (module-owned in production)
     real_tiles = int(symm.meta_scalars[1].item())
     M_eff = real_tiles * BM
@@ -294,10 +295,10 @@ def profile_l2(group, args, mode):
 
     cc, rc = _cu(args.combine_cu, 32), _cu(args.reduce_cu, 0)  # l2 combine default (prod, epoch-comm tuned)
 
-    def _fp8():  # fp8 L2 combine kernel (GEMM + PUSH + reduce); self-resets the L2 flags internally
+    def _fp8():  # fp8 L2 combine (pre-quant act from fused SwiGLU+mxfp8; no per-call A quant)
         y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-            act, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=topk_w_f32,
-            BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
+            None, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=topk_w_f32,
+            x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
         )
         return y
 

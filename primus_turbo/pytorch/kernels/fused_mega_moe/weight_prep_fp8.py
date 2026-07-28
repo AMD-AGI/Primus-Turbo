@@ -39,6 +39,6 @@ def prepare_w2_fp8(l2_weights: torch.Tensor):
     and, transposed, the backward STEP3 fc1^T combine weight."""
     G, N, K = l2_weights.shape
     w2q, w2s = quantize_grouped_weight_mxfp8_flydsl(l2_weights)
-    b_sp = preshuffle_b_scale(w2s, G, N, K)
+    b_sp = preshuffle_b_scale(w2s, G, N, K, pack=4)
     weight_flat = w2q.reshape(G * N, K).contiguous().view(torch.int8).reshape(-1)
     return weight_flat, b_sp

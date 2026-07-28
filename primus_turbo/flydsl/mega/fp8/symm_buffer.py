@@ -73,7 +73,7 @@ _SIGNAL_DTYPES = {
     "_ipc_barrier": torch.int32,
     "dispatch_flag": torch.int64,  # 2 banks x num_pool_blocks (comm->preshuffle epoch gate)
     "preshuffle_flag": torch.int64,  # 2 banks x num_pool_blocks (preshuffle->gemm epoch gate)
-    "combine_flag": torch.int64,  # 2 banks x num_pool_blocks (L2 GEMM->combine epoch gate)
+    "combine_flag": torch.int64,  # 2 banks x num_pool_blocks x (H//block_n) scatter release slots
     "comb": torch.bfloat16,
     "reduce_flag": torch.int64,  # 2 banks x combine_slots (combine->reduce epoch gate)
 }
@@ -89,6 +89,7 @@ def _build_layout_spec(
     activation="swiglu",
     *,
     block_m=256,
+    block_n=256,
     pool_mult=2,
     use_mxfp8=False,
 ):
@@ -115,6 +116,7 @@ def _build_layout_spec(
         num_max_pool_tokens,
         num_pool_blocks,
         combine_slots,
+        block_n=block_n,
         use_mxfp8=int(bool(use_mxfp8)),
     )
     main_off, sig_off, num_bytes, signal_bytes = _sym_region_layout(sl)
@@ -147,6 +149,7 @@ def get_symm_buffer_size_for_mega_moe(
     activation="swiglu",
     *,
     block_m=256,
+    block_n=256,
     pool_mult=2,
     use_mxfp8=False,
 ):
@@ -173,6 +176,7 @@ def get_symm_buffer_size_for_mega_moe(
         intermediate_hidden,
         activation,
         block_m=block_m,
+        block_n=block_n,
         pool_mult=pool_mult,
         use_mxfp8=use_mxfp8,
     )
@@ -216,6 +220,7 @@ class SymmBuffer:
             hidden,
             intermediate_hidden,
             block_m=block_m,
+            block_n=block_n,
             pool_mult=pool_mult,
             use_mxfp8=use_mxfp8,
         )
@@ -321,7 +326,7 @@ class SymmBuffer:
         self._disp_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
         self._disp_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._ps_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
-        #   combine: combine_flag(+n_blocks) GEMM->combine, reduce_flag(+1) combine->reduce
+        #   combine: combine_flag(+1) per-epoch expected; GEMM st per (block_m,block_n) slot
         self._combine_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
         self._combine_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._reduce_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
@@ -358,6 +363,7 @@ class SymmBuffer:
             self.num_max_pool_tokens,
             self.num_pool_blocks,
             self.combine_slots,
+            block_n=self.block_n,
             use_mxfp8=int(self.use_mxfp8),
             base=my_main,
             offsets_ptr=self._main_delta.data_ptr(),
@@ -428,6 +434,7 @@ def get_symm_buffer_for_mega_moe(
         hidden,
         intermediate_hidden,
         block_m=block_m,
+        block_n=block_n,
         pool_mult=pool_mult,
         use_mxfp8=use_mxfp8,
     )

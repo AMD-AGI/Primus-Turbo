@@ -398,6 +398,7 @@ def _compile(
                     blgp=blgp,
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
+                    scale_pack=1,  # L1 preshuffle role writes pack=1 ScaleS2R layout
                 )
 
     @flyc.jit
@@ -525,10 +526,10 @@ def dispatch_grouped_gemm_mxfp8(
     XS = xs.contiguous().view(torch.uint8).view(torch.int32).reshape(-1)
     WEIGHTS = w1q.contiguous().reshape(G * N, K).view(torch.int8).reshape(-1)
     # weights are static -> preshuffle the weight scale ONCE (ScaleBComb b_sp), cached.
-    _bk = (w1s.data_ptr(), G, N, K)
+    _bk = (w1s.data_ptr(), G, N, K, 1)  # L1 GEMM reads ScaleBComb with pack=1
     weight_scale_ps = _BSP_CACHE.get(_bk)
     if weight_scale_ps is None:
-        weight_scale_ps = preshuffle_b_scale(w1s, G, N, K)
+        weight_scale_ps = preshuffle_b_scale(w1s, G, N, K, pack=1)
         _BSP_CACHE[_bk] = weight_scale_ps
     pool_scale_ps = symm.pool_scale_ps  # local broadcast a_sp (preshuffle role writes it)
 

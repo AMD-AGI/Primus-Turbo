@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Fused mega MoE MXFP8 forward (FlyDSL): L1 dispatch+fc1 (NT) -> SwiGLU -> L2 fp8 combine.
+"""Fused mega MoE MXFP8 forward (FlyDSL): L1 dispatch+fc1 (NT) -> SwiGLU+mxfp8 quant -> L2 fp8 combine.
 
 A plain orchestration function (not a custom_op): the fp8 path carries state the schema can't hold
 (live symm buffer reused in backward, non-tensor handles). The comm gates now self-reset via a
@@ -17,10 +17,10 @@ from typing import Tuple
 import torch
 from torch.distributed import ProcessGroup
 
-from primus_turbo.flydsl.mega import swiglu_flydsl_kernel
 from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
+    swiglu_mxfp8_flydsl_kernel,
 )
 from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w1_fp8, prepare_w2_fp8
 
@@ -79,7 +79,7 @@ def mega_moe_forward_fp8_impl(
     block_m: int,
     block_n: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], tuple]:
-    """Fused mxfp8 MoE forward: L1 (dispatch + fc1, NT) -> SwiGLU (bf16) -> L2 fp8 combine.
+    """Fused mxfp8 MoE forward: L1 (dispatch + fc1, NT) -> SwiGLU+mxfp8 quant -> L2 fp8 combine.
 
     ``topk_idx`` must already be int64 (the op layer converts). Returns
     ``(y, l1, dispatch_weights, pool_x_fp8, handle)``: ``l1`` = L1 (fc1) output [P, 2I];
@@ -101,7 +101,7 @@ def mega_moe_forward_fp8_impl(
         BM=block_m, BN=block_n,
     )
 
-    act = swiglu_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS])
+    act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS])
 
     # w2 fp8 prep -> (w2q, w2s), version-keyed here at the op layer -- symmetric with w1 at L1.
     w2q, w2s = _w2_fp8_cached(w2)
@@ -109,8 +109,9 @@ def mega_moe_forward_fp8_impl(
     # ── L2: fp8 combine (fp8 GEMM + mxfp8 epilogue + fp8 PUSH + bf16-out dequant reduce) ──
     # grouped_gemm_combine_mxfp8_flydsl_kernel is self-contained: it resets the L2 scoreboard/flags cross-rank.
     y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-        act, (w2q, w2s), list(handle), group,
+        None, (w2q, w2s), list(handle), group,
         topk_indices=topk_idx, topk_weights=topk_weights.to(torch.float32),
-        BM=block_m, BN=block_n, num_combine_cu=32,  # retuned 48->32 for epoch comm (T=8192, +4.6%)
+        x_fp8=(act_fp8, act_a_sp),
+        BM=block_m, BN=block_n,
     )
     return y, l1, dispatch_weights, pool_x_fp8, handle

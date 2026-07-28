@@ -67,6 +67,7 @@ class SymLayout:
     num_max_pool_tokens: Constexpr[int]  # pool capacity (rows)
     num_max_pool_blocks: Constexpr[int]  # num_max_pool_tokens // block_m
     combine_slots: Constexpr[int]  # num_topk * num_max_tokens_per_rank
+    block_n: Constexpr[int]  # L2 GEMM N-tile width (combine_flag slots per block_m = hidden // block_n)
     # mxfp8 forward: append fp8 pool/act data + raw E8M0 block-scale regions (1 = on).
     # Appended AFTER every bf16 region so the bf16 (use_mxfp8=0) byte layout is unchanged.
     use_mxfp8: Constexpr[int]
@@ -124,13 +125,15 @@ def _main_regions(sl):
 def _signal_regions(sl):
     R, NPB = int(sl.num_ranks), int(sl.num_max_pool_blocks)
     CS, H = int(sl.combine_slots), int(sl.hidden)
+    BN = int(sl.block_n)
+    n_l2_n = H // BN
     # All epoch flags (bf16-style self-reset): 2 banks (parity) x length, i64. Never host-reset;
     # each spins on a cumulative per-bank expected -> no consuming store, no cross-call reset race.
     return [
         ("_ipc_barrier", _I32, R),
         ("dispatch_flag", _I64, 2 * NPB),    # cross-rank comm->preshuffle gate (per-expert, atomic_add)
         ("preshuffle_flag", _I64, 2 * NPB),  # local preshuffle->gemm gate (per-block, st=expected)
-        ("combine_flag", _I64, 2 * NPB),     # L2 GEMM->combine gate (per-block, atomic_add)
+        ("combine_flag", _I64, 2 * NPB * n_l2_n),  # L2 GEMM->combine: per (block_m, block_n) release st
         ("comb", _BF16, CS * H),
         ("reduce_flag", _I64, 2 * CS),       # L2 combine->reduce gate (per-slot, st=expected)
     ]
@@ -227,6 +230,7 @@ def build_sym_layout(
     num_max_pool_blocks,
     combine_slots,
     *,
+    block_n=256,
     use_mxfp8=0,
     base=0,
     offsets_ptr=0,
@@ -255,6 +259,7 @@ def build_sym_layout(
         num_max_pool_tokens=int(num_max_pool_tokens),
         num_max_pool_blocks=int(num_max_pool_blocks),
         combine_slots=int(combine_slots),
+        block_n=int(block_n),
         use_mxfp8=int(use_mxfp8),
     )
 

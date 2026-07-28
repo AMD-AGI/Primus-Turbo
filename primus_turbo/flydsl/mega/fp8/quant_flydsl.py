@@ -30,29 +30,26 @@ from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_reso
 from flydsl.expr.rocdl import cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.mega.fp8.gemm_helper import ceildiv
+
 _BLK = 32  # mxfp8 block (elements per E8M0 scale)
 _VEC = 8   # sub-vector width for the bf16 load / f32 compute
 
 
-def _quant_block_words(xr, base_elem):
-    """Quantize one 1x32 bf16 block at ``xr[base_elem : base_elem+32]`` to MXFP8.
+def _mxfp8_words_from_f32_subvecs(fvs):
+    """Quantize one 1x32 f32 block given as ``subs`` vectors of width ``_VEC`` to MXFP8.
 
-    Returns ``(words, biased)``: ``words`` = 8 i32 packing the 32 fp8 (E4M3) values
-    (4 fp8/word, via the HW ``cvt_pk_fp8_f32``); ``biased`` = the E8M0 scale byte in an
-    i32. Mirrors the production ``compute_tile_scale`` (round-even exp, target 2^8,
-    soft-clamp before cvt). Shared by the standalone quant kernel and the fused push."""
+    Returns ``(words, biased)`` (same layout as ``_quant_block_words``). Used by the standalone
+    quant kernel and the fused SwiGLU+mxfp8 epilogue."""
     f32v = fx.T.VectorType.get([_VEC], fx.T.f32())
     neg1 = fx.arith.constant_vector(-1.0, f32v)
     lim = fx.arith.constant_vector(448.0, f32v)
     neglim = fx.arith.constant_vector(-448.0, f32v)
     subs = _BLK // _VEC  # 4
 
-    fvs = []
     sub_amax = []
     for s in range_constexpr(subs):
-        vv = buffer_load(xr, base_elem + fx.Int32(s * _VEC), vec_width=_VEC, dtype=fx.T.bf16())
-        fv = fx.arith.extf(f32v, vv)
-        fvs.append(fv)
+        fv = fvs[s]
         av = fx.arith.maximumf(fv, fx.arith.mulf(fv, neg1))  # |fv|
         sub_amax.append(
             fx.arith.ArithValue(_vector.reduction(fx.T.f32(), _vector.CombiningKind.MAXIMUMF, av))
@@ -86,6 +83,23 @@ def _quant_block_words(xr, base_elem):
     return words, biased
 
 
+def _quant_block_words(xr, base_elem):
+    """Quantize one 1x32 bf16 block at ``xr[base_elem : base_elem+32]`` to MXFP8.
+
+    Returns ``(words, biased)``: ``words`` = 8 i32 packing the 32 fp8 (E4M3) values
+    (4 fp8/word, via the HW ``cvt_pk_fp8_f32``); ``biased`` = the E8M0 scale byte in an
+    i32. Mirrors the production ``compute_tile_scale`` (round-even exp, target 2^8,
+    soft-clamp before cvt). Shared by the standalone quant kernel and the fused push."""
+    f32v = fx.T.VectorType.get([_VEC], fx.T.f32())
+    subs = _BLK // _VEC  # 4
+
+    fvs = []
+    for s in range_constexpr(subs):
+        vv = buffer_load(xr, base_elem + fx.Int32(s * _VEC), vec_width=_VEC, dtype=fx.T.bf16())
+        fvs.append(fx.arith.extf(f32v, vv))
+    return _mxfp8_words_from_f32_subvecs(fvs)
+
+
 def _e8m0_broadcast_i32(biased):
     """Broadcast the E8M0 byte (i32) into all 4 bytes of an i32 (ScaleS2R operand)."""
     bb = fx.arith.ArithValue(biased) & fx.Int32(0xFF)
@@ -108,32 +122,30 @@ def _preshuffle_a_idx(dest_row, b, K128):
 @functools.lru_cache(maxsize=32)
 def _compile_quant(K: int, BT: int = 256, preshuffle: bool = False):
     assert K % _BLK == 0, f"K={K} must be a multiple of {_BLK}"
-    n_blk = K // _BLK          # E8M0 blocks (micro-blocks) per row
-    K128 = K // 128            # K-iters (= n_blk // 4)
-    K_fp8_i32 = K // 4         # fp8 row viewed as i32 words
-    blk_i32 = _BLK // 4        # fp8 i32 words per block (=8)
+    n_blk = K // _BLK
+    K128 = K // 128
+    K_fp8_i32 = K // 4
+    blk_i32 = _BLK // 4
 
     @flyc.kernel(known_block_size=[BT, 1, 1])
     def kern(X: fx.Tensor, Q: fx.Tensor, S: fx.Tensor, c_m: fx.Int32):
         tid = fx.thread_idx.x
-        row = fx.block_idx.x  # one workgroup per token row
+        row = fx.block_idx.x
 
-        xr = create_buffer_resource(X, max_size=True)  # bf16 [M, K]
-        qr = create_buffer_resource(Q, max_size=True)  # fp8 data viewed int32 [M, K//4]
-        sr = create_buffer_resource(S, max_size=True)  # raw uint8 [M,K//32] OR broadcast i32 a_sp
+        xr = create_buffer_resource(X, max_size=True)
+        qr = create_buffer_resource(Q, max_size=True)
+        sr = create_buffer_resource(S, max_size=True)
 
         b = tid
         while b < fx.Int32(n_blk):
             base = row * fx.Int32(K) + b * fx.Int32(_BLK)
             words, biased = _quant_block_words(xr, base)
 
-            # store E8M0 scale: raw [row, b] byte, OR broadcast into the ScaleS2R layout-1.
             if preshuffle:
                 buffer_store(_e8m0_broadcast_i32(biased), sr, _preshuffle_a_idx(row, b, K128))
             else:
                 buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8()), sr, row * fx.Int32(n_blk) + b)
 
-            # store the 8 packed fp8 i32 words to Q (int32 view) at this block's columns.
             base_i32 = row * fx.Int32(K_fp8_i32) + b * fx.Int32(blk_i32)
             for wi in range_constexpr(blk_i32):
                 buffer_store(words[wi], qr, base_i32 + fx.Int32(wi))
@@ -147,11 +159,114 @@ def _compile_quant(K: int, BT: int = 256, preshuffle: bool = False):
     return launch
 
 
+@functools.lru_cache(maxsize=32)
+def _compile_quant_preshuffle_pack4(K: int, BT: int = 256, scale_pack: int = 4):
+    """Quant bf16 row + fused pack-4 A-scale preshuffle (single kernel, LDS repack)."""
+    assert K % _BLK == 0, f"K={K} must be a multiple of {_BLK}"
+    n_blk = K // _BLK
+    K128 = K // 128
+    K128p = ceildiv(K128, scale_pack)
+    K_fp8_i32 = K // 4
+    blk_i32 = _BLK // 4
+
+    @fx.struct
+    class RowSmem:
+        raw: fx.Array[fx.Int8, n_blk, 16]
+
+    @flyc.kernel(known_block_size=[BT, 1, 1])
+    def kern(X: fx.Tensor, Q: fx.Tensor, S: fx.Tensor, c_m: fx.Int32):
+        tid = fx.thread_idx.x
+        row = fx.block_idx.x
+        smem = fx.SharedAllocator().allocate(RowSmem).peek().raw
+
+        xr = create_buffer_resource(X, max_size=True)
+        qr = create_buffer_resource(Q, max_size=True)
+        sr = create_buffer_resource(S, max_size=True)
+
+        b = tid
+        while b < fx.Int32(n_blk):
+            base = row * fx.Int32(K) + b * fx.Int32(_BLK)
+            words, biased = _quant_block_words(xr, base)
+            smem[b] = fx.arith.ArithValue(biased).trunci(fx.T.i8())
+
+            base_i32 = row * fx.Int32(K_fp8_i32) + b * fx.Int32(blk_i32)
+            for wi in range_constexpr(blk_i32):
+                buffer_store(words[wi], qr, base_i32 + fx.Int32(wi))
+
+            b = b + fx.Int32(BT)
+
+        fx.rocdl.s_barrier()
+        grp = row // fx.Int32(64)
+        r_row = row % fx.Int32(16)
+        s_row = (row % fx.Int32(64)) // fx.Int32(16)
+        n_out = K128p * 4
+        n_rounds = ceildiv(n_out, BT)
+        for pi in range_constexpr(n_rounds):
+            idx = tid + pi * BT
+            if idx < fx.Int32(n_out):
+                kkp = idx // fx.Int32(4)
+                g = idx % fx.Int32(4)
+                lane = g * fx.Int32(16) + r_row
+                packed = fx.Int32(0)
+                for bb in range_constexpr(scale_pack):
+                    ki = kkp * fx.Int32(scale_pack) + fx.Int32(bb)
+                    raw_b = ki * fx.Int32(4) + g
+                    scale_byte = fx.arith.ArithValue(smem[raw_b]).extui(fx.T.i32())
+                    packed = packed | ((scale_byte & fx.Int32(0xFF)) << (fx.Int32(bb) * fx.Int32(8)))
+                    out_idx = ((grp * fx.Int32(K128p) + kkp) * fx.Int32(64) + lane) * fx.Int32(4) + s_row
+                buffer_store(packed, sr, out_idx)
+
+    @flyc.jit
+    def launch(X: fx.Tensor, Q: fx.Tensor, S: fx.Tensor, M: int, stream: fx.Stream = fx.Stream(None)):
+        kern(X, Q, S, M).launch(grid=(M, 1, 1), block=(BT, 1, 1), stream=stream)
+
+    return launch
+
+
 _QUANT_COMPILED: dict = {}
 _BSCALE_PS_COMPILED: dict = {}
+_ASCALE_PS_COMPILED: dict = {}
+# Match grouped GEMM / gemm_mxfp8_nt_tile (_SCALE_PACK).
+_SCALE_PACK = 4
 
 
-def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int):
+def preshuffle_a_scale(a_scale: torch.Tensor, M: int, K: int, *, pack: int = _SCALE_PACK):
+    """Raw E8M0 ``[M, K//32]`` uint8 -> ScaleS2R broadcast ``a_sp`` (pack=4 layout)."""
+    from primus_turbo.flydsl.mega.fp8.gemm_helper import (
+        _PRESHUF_KT,
+        build_preshuffle_ab_kernel,
+        ceildiv,
+    )
+
+    K128 = K // 128
+    K128p = ceildiv(K128, pack)
+    a_ngrp = ceildiv(M, 64)
+    dev = a_scale.device
+    a_raw = a_scale.contiguous().view(torch.int32).reshape(M, K128)
+    a_sp = torch.zeros(a_ngrp * K128p * 256, dtype=torch.int32, device=dev)
+    b_raw = torch.zeros(64 * K128, dtype=torch.int32, device=dev)
+    b_sp = torch.zeros(1, dtype=torch.int32, device=dev)
+    a_blocks = a_ngrp * ceildiv(K128, _PRESHUF_KT)
+    pre_kern, _n_kt = build_preshuffle_ab_kernel(K128, pack=pack)
+
+    @flyc.jit
+    def _launch(a_raw, b_raw, a_sp, b_sp, a_blocks_i: fx.Int32, a_ngrp_i: fx.Int32,
+                stream: fx.Stream = fx.Stream(None)):
+        pre_kern(a_raw, b_raw, a_sp, b_sp, fx.Int32(M), fx.Int32(64), a_blocks_i, a_ngrp_i, fx.Int32(0)).launch(
+            grid=(a_blocks_i, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    args = (a_raw, b_raw, a_sp, b_sp, a_blocks, a_ngrp, torch.cuda.current_stream())
+    ck = (M, K128, pack)
+    compiled = _ASCALE_PS_COMPILED.get(ck)
+    if compiled is None:
+        compiled = flyc.compile(_launch, *args)
+        _ASCALE_PS_COMPILED[ck] = compiled
+    compiled(*args)
+    return a_sp
+
+
+def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int, *, pack: int = _SCALE_PACK):
     """Host preshuffle of a grouped weight E8M0 scale into the ScaleBComb layout-3 ``b_sp``.
 
     ``b_scale`` = raw E8M0 [G, N, K//32] (or [G*N, K//32]) uint8 -> ``b_sp`` int32
@@ -167,15 +282,16 @@ def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int):
 
     GN = G * N
     K128 = K // 128
+    K128p = ceildiv(K128, pack)
     dev = b_scale.device
     b_raw = b_scale.contiguous().reshape(GN, K // 32).view(torch.int32).reshape(-1)
     a_ngrp = 1
     a_blocks = a_ngrp * ceildiv(K128, _PRESHUF_KT)
     b_ngrp = ((GN + 255) // 256) * 4
     a_raw = torch.zeros(64 * K128, dtype=torch.int32, device=dev)  # dummy A (64 rows)
-    a_sp = torch.zeros(a_ngrp * K128 * 256, dtype=torch.int32, device=dev)
-    b_sp = torch.zeros(b_ngrp * K128 * 256, dtype=torch.int32, device=dev)
-    pre_kern, n_kt = build_preshuffle_ab_kernel(K128)
+    a_sp = torch.zeros(a_ngrp * K128p * 256, dtype=torch.int32, device=dev)
+    b_sp = torch.zeros(b_ngrp * K128p * 256, dtype=torch.int32, device=dev)
+    pre_kern, n_kt = build_preshuffle_ab_kernel(K128, pack=pack)
 
     @flyc.jit
     def _launch(a_raw, b_raw, a_sp, b_sp, a_blocks: fx.Int32, a_ngrp: fx.Int32, b_ngrp: fx.Int32,
@@ -185,7 +301,7 @@ def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int):
         )
 
     args = (a_raw, b_raw, a_sp, b_sp, a_blocks, a_ngrp, b_ngrp, torch.cuda.current_stream())
-    ck = (GN, K128)
+    ck = (GN, K128, pack)
     compiled = _BSCALE_PS_COMPILED.get(ck)
     if compiled is None:
         compiled = flyc.compile(_launch, *args)
@@ -194,27 +310,39 @@ def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int):
     return b_sp
 
 
-def quantize_rowwise_mxfp8_flydsl(x: torch.Tensor, preshuffle: bool = False):
+def quantize_rowwise_mxfp8_flydsl(x: torch.Tensor, preshuffle: bool = False, scale_pack: int = _SCALE_PACK):
     """Rowwise MXFP8 quant of ``x`` [M, K] bf16 in one FlyDSL kernel.
 
     ``preshuffle=False``: returns ``(q fp8 [M,K], s uint8 [M, K//32])`` raw E8M0 (matches
-    ``quantize_rowwise_mxfp8``). ``preshuffle=True``: the scale is written directly in the
-    ScaleS2R broadcast layout-1 ``a_sp`` (int32 [ceildiv(M,64)*K128*256]) so a GEMM can
-    read it with ``ScaleS2R`` (no separate preshuffle pass); returns ``(q, a_sp)``."""
+    ``quantize_rowwise_mxfp8``). ``preshuffle=True``: returns ``(q, a_sp)`` with A-scale in the
+    ScaleS2R broadcast layout; ``scale_pack=4`` (default) fuses pack-4 preshuffle into the quant
+    kernel (no separate host preshuffle pass)."""
     assert x.dim() == 2 and x.dtype == torch.bfloat16
     M, K = x.shape
     x = x.contiguous()
     q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
-    q_i32 = q.view(torch.int32)  # fp8 data as int32 words (4 fp8/word), for the packed store
-    K128 = K // 128
+    q_i32 = q.view(torch.int32)
     if preshuffle:
-        a_ngrp = (M + 63) // 64
-        s = torch.zeros(a_ngrp * K128 * 256, dtype=torch.int32, device=x.device)
-    else:
-        s = torch.empty((M, K // _BLK), dtype=torch.uint8, device=x.device)
-    launch = _compile_quant(int(K), preshuffle=bool(preshuffle))
+        K128 = K // 128
+        K128p = ceildiv(K128, scale_pack)
+        a_ngrp = ceildiv(M, 64)
+        a_sp = torch.zeros(a_ngrp * K128p * 256, dtype=torch.int32, device=x.device)
+        if scale_pack == 4:
+            launch = _compile_quant_preshuffle_pack4(int(K), scale_pack=int(scale_pack))
+        else:
+            launch = _compile_quant(int(K), preshuffle=True)
+        args = (x, q_i32, a_sp, M, torch.cuda.current_stream())
+        ck = (M, K, True, int(scale_pack))
+        compiled = _QUANT_COMPILED.get(ck)
+        if compiled is None:
+            compiled = flyc.compile(launch, *args)
+            _QUANT_COMPILED[ck] = compiled
+        compiled(*args)
+        return q, a_sp
+    s = torch.empty((M, K // _BLK), dtype=torch.uint8, device=x.device)
+    launch = _compile_quant(int(K), preshuffle=False)
     args = (x, q_i32, s, M, torch.cuda.current_stream())
-    ck = (M, K, preshuffle)
+    ck = (M, K, False)
     compiled = _QUANT_COMPILED.get(ck)
     if compiled is None:
         compiled = flyc.compile(launch, *args)
