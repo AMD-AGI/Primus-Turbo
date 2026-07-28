@@ -1,12 +1,12 @@
 ###############################################################################
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2025 FlyDSL Project Contributors
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL), licensed under Apache-2.0.
 #
 # See LICENSE for license information.
 ###############################################################################
 
-"""Primus-Turbo dense BF16 GEMM kernel (FlyDSL).
-
-Authored with FlyDSL (https://github.com/ROCm/FlyDSL)."""
+"""Primus-Turbo dense BF16 GEMM kernel (FlyDSL)."""
 
 import functools
 
