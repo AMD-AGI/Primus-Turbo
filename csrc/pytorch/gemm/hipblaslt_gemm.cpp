@@ -6,8 +6,22 @@
 
 #include "../extensions.h"
 #include "../type_traits.h"
+#include "kernels/gemm/hipblaslt/hipblaslt_algo_cache.h"
 
 namespace primus_turbo::pytorch {
+
+namespace {
+static thread_local at::Tensor tl_workspace;
+
+// Assumes single HIP stream per CPU thread. If a thread dispatches GEMMs on
+// multiple streams concurrently, the workspace could be concurrently overwritten.
+at::Tensor &get_workspace_tensor(int64_t size, const at::Device &device) {
+    if (!tl_workspace.defined() || tl_workspace.numel() < size || tl_workspace.device() != device) {
+        tl_workspace = at::empty({size}, at::TensorOptions().dtype(at::kByte).device(device));
+    }
+    return tl_workspace;
+}
+} // namespace
 
 at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
                           bool transB, bool transC) {
@@ -73,7 +87,7 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
     const hipDataType  C_type            = get_hipblaslt_dtype(C.scalar_type());
 
     const int64_t workspace_size = get_hipblaslt_workspace_size_in_byte();
-    at::Tensor workspace = at::empty({workspace_size}, torch::dtype(at::kByte).device(at::kCUDA));
+    auto         &workspace      = get_workspace_tensor(workspace_size, A.device());
 
     // clang-format off
     // NOTE: hipblaslt expects tensor in col-major but torch Tensor is in row-major.
@@ -199,7 +213,7 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     const hipDataType  C_type            = get_hipblaslt_dtype(C.scalar_type());
 
     const int64_t workspace_size = get_hipblaslt_workspace_size_in_byte();
-    at::Tensor workspace = at::empty({workspace_size}, torch::dtype(at::kByte).device(at::kCUDA));
+    auto         &workspace      = get_workspace_tensor(workspace_size, A.device());
 
     // clang-format off
     // NOTE: hipblaslt expects tensor in col-major but torch Tensor is in row-major.
@@ -322,7 +336,7 @@ at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     const hipDataType  C_type            = get_hipblaslt_dtype(C.scalar_type());
 
     const int64_t workspace_size = get_hipblaslt_workspace_size_in_byte();
-    at::Tensor workspace = at::empty({workspace_size}, torch::dtype(at::kByte).device(at::kCUDA));
+    auto         &workspace      = get_workspace_tensor(workspace_size, A.device());
 
     // clang-format off
     // NOTE: hipblaslt expects tensor in col-major but torch Tensor is in row-major.
@@ -345,6 +359,10 @@ at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
     // clang-format on
 
     return C;
+}
+
+void hipblaslt_algo_cache_clear() {
+    primus_turbo::HipblasltAlgoCache::instance().clear();
 }
 
 } // namespace primus_turbo::pytorch
