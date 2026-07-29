@@ -414,10 +414,13 @@ class ScaleBComb:
     One dwordx4 per lane returns [s0,s1,s2,s3]; (s0,s1)=b0 sub-tiles, (s2,s3)=b1.
     """
 
-    def __init__(self, sp_tensor, dim, K, n_slabs=1, pack=1):
+    def __init__(self, sp_tensor, dim, K, n_slabs=1, pack=1, k128p=None):
         self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
         self.PACK = pack
-        self.K128p = ceildiv(self.K128, self.PACK)  # packed K-groups (PACK scales / dword)
+        # packed K-groups (PACK scales / dword). k128p overrides the stride: the variable-K
+        # wgrad packs each group from its own contraction start, so its stride carries one
+        # spare dword per group (see the per-group packed base in the wgrad kernel).
+        self.K128p = ceildiv(self.K128, self.PACK) if k128p is None else k128p
         self.lane = fx.thread_idx.x % 64
         # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
         # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
@@ -428,11 +431,11 @@ class ScaleBComb:
         nbytes = self.slab_elems * n_slabs * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
-    def load(self, base, k, slab=0):
-        """base: sb_base0 (b0 region col base). Returns 4 i32 (b0:0,1  b1:2,3)."""
+    def load(self, base, k, kbase=0, slab=0):
+        """base: sb_base0 (b0 region col base). ``kbase``: packed-K base of the group's own
+        region (0 = one global packing). Returns 4 i32 (b0:0,1  b1:2,3)."""
         grp = (base // 256) * 4 + (base % 256) // 32
-        kk = k // self.PACK
-        idx = ((grp * self.K128p + kk) * 64 + self.lane) * 4 + slab * self.slab_elems
+        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * 4 + slab * self.slab_elems
         v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(4)]
 
@@ -457,10 +460,11 @@ class ScaleS2R:
     the mxfp8 GEMM launch.
     """
 
-    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1):
+    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1, k128p=None):
         self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
         self.PACK = pack
-        self.K128p = ceildiv(self.K128, self.PACK)  # packed K-groups (PACK scales / dword)
+        # packed K-groups (PACK scales / dword); k128p overrides the stride (see ScaleBComb).
+        self.K128p = ceildiv(self.K128, self.PACK) if k128p is None else k128p
         self.n_tiles = n_tiles
         self.group_span = 16 * n_tiles
         self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
@@ -470,12 +474,12 @@ class ScaleS2R:
         nbytes = ceildiv(dim, self.group_span) * self.K128p * 64 * n_tiles * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
-    def load(self, base, k):
+    def load(self, base, k, kbase=0):
         """base: runtime global row/col base for this (region, wave). Returns n_tiles i32
-        (packed dword for K-group k//PACK; caller selects byte k%PACK via MFMA op_sel)."""
+        (packed dword for K-group kbase + k//PACK; caller selects byte k%PACK via MFMA
+        op_sel). ``kbase``: packed-K base of the group's own region (0 = global packing)."""
         grp = base // self.group_span
-        kk = k // self.PACK
-        idx = ((grp * self.K128p + kk) * 64 + self.lane) * self.n_tiles
+        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * self.n_tiles
         v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
 
@@ -1102,12 +1106,20 @@ def _lds_barrier():
     )
 
 
-def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=1):
+def _emit_lds_repack(
+    is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=1, kbound=None,
+    k128p=None,
+):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
+    # kbound (default K128) bounds this chunk's k index and k128p (default
+    # ceildiv(K128,pack)) is the output k-stride: the variable-K wgrad passes a
+    # group-local k0 with the group's own bound and the shared packed stride, so every
+    # group packs from its own contraction start (rd_base/wr_base carry its raw/packed base).
     NT = 4
     TILE = 64 * KT
     assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
+    KBND = K128 if kbound is None else kbound
     for i in range_constexpr(TILE // BLK):
         idx = tid + i * BLK
         rr = idx // KT
@@ -1120,7 +1132,11 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
             off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
             grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
         dw = _buffer_ops.buffer_load(
-            rin, grow * K128 + gk + rd_base, vec_width=1, dtype=T.i32, mask=(gk < K128) & (grow < dim)
+            rin,
+            grow * K128 + gk + rd_base,
+            vec_width=1,
+            dtype=T.i32,
+            mask=(gk < KBND) & (grow < dim),
         )
         fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
             Vec.from_elements([fx.Int32(dw)], fx.Int32)
@@ -1129,7 +1145,7 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
     # Packed store: pack PACK consecutive K-iters into one output dword per lane (the
     # reader mirrors this via kk=k//PACK + MFMA op_sel). PACK=1 = unpacked.
     PACK = pack
-    K128p = ceildiv(K128, PACK)
+    K128p = ceildiv(K128, PACK) if k128p is None else k128p
     NGP = KT // PACK  # packed groups produced per KT-chunk
     NOUTp = NGP * 64
     for j in range_constexpr(NOUTp // BLK):
@@ -1155,7 +1171,7 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
             vec.ir_value(),
             rout,
             ((grp * K128p + gkp) * 64 + lane) * 4 + wr_base,
-            mask=(k0 + kkp * PACK) < K128,
+            mask=(k0 + kkp * PACK) < KBND,
         )
 
 

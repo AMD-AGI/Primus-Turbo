@@ -87,7 +87,7 @@ def _wgrad_mx_accum(mfma, a_frags, b_frags, acc_regs, sa, sb):
 
 def _wgrad_mx_body_4buf(
     k,
-    ks0,
+    kp0,
     BLOCK_K,
     A1off,
     B1off,
@@ -116,17 +116,23 @@ def _wgrad_mx_body_4buf(
     NA,
     NB,
     opsel=0,
+    quads=(2, 2),
 ):
     """One K-tile of the wgrad distance-2 4-buffer pipeline (scales loaded inline).
 
     ``opsel``: packed-dword byte immediate for this tile (caller computes it from the
-    constexpr tail index; k is runtime so k%pack can't be an op_sel immediate)."""
+    constexpr tail index; k is runtime so k%pack can't be an op_sel immediate).
+    ``kp0``: this group's packed-scale base (scale k is group-local, see the kernel).
+    ``quads``: live (M, N) output halves; 1 drops the padding half's MFMAs and its LDS
+    reads while leaving every g2s, barrier and vmcnt wait in place."""
+    qm, qn = quads
     k1 = k + 1
     k2 = k + 2
     mfma.opsel = opsel
-    sa0 = sa_s2r.load(sa_base0, ks0 + k)
-    sa1 = sa_s2r.load(sa_base1, ks0 + k)
-    sb_all = sb_s2r.load(sb_base0, ks0 + k)
+    sa0 = sa_s2r.load(sa_base0, k, kp0)
+    if qm == 2:
+        sa1 = sa_s2r.load(sa_base1, k, kp0)
+    sb_all = sb_s2r.load(sb_base0, k, kp0)
     sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
     b0 = b_s2r.load(b_cur0)
@@ -137,32 +143,37 @@ def _wgrad_mx_body_4buf(
     _wgrad_mx_accum(mfma, a0, b0, acc00, sa0, sb0)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
-    b1 = b_s2r.load(b_cur1)
+    if qn == 2:
+        b1 = b_s2r.load(b_cur1)
     b_g2s.load(b_cur0, 0 + k2 * BLOCK_K)
     rocdl.s_barrier()
-    rocdl.s_setprio(1)
-    _wgrad_mx_accum(mfma, a0, b1, acc01, sa0, sb1)
-    rocdl.s_setprio(0)
+    if qn == 2:
+        rocdl.s_setprio(1)
+        _wgrad_mx_accum(mfma, a0, b1, acc01, sa0, sb1)
+        rocdl.s_setprio(0)
     rocdl.s_barrier()
-    a1 = a_s2r.load(a_cur1)
+    if qm == 2:
+        a1 = a_s2r.load(a_cur1)
     a_g2s.load(a_cur0, 0 + k2 * BLOCK_K)
     rocdl.s_barrier()
-    rocdl.s_setprio(1)
-    _wgrad_mx_accum(mfma, a1, b0, acc10, sa1, sb0)
-    rocdl.s_setprio(0)
+    if qm == 2:
+        rocdl.s_setprio(1)
+        _wgrad_mx_accum(mfma, a1, b0, acc10, sa1, sb0)
+        rocdl.s_setprio(0)
     rocdl.s_barrier()
     b_g2s.load(b_cur1, B1off + k2 * BLOCK_K)
     wait_barrier(2 * NA + NB)
-    rocdl.s_setprio(1)
-    _wgrad_mx_accum(mfma, a1, b1, acc11, sa1, sb1)
-    rocdl.s_setprio(0)
+    if qm == 2 and qn == 2:
+        rocdl.s_setprio(1)
+        _wgrad_mx_accum(mfma, a1, b1, acc11, sa1, sb1)
+        rocdl.s_setprio(0)
     rocdl.s_barrier()
 
 
 def _wgrad_ssa_chunk(
     base_k,
     chunk,
-    ks0,
+    kp0,
     BLOCK_K,
     A1off,
     B1off,
@@ -192,29 +203,38 @@ def _wgrad_ssa_chunk(
     N_LDS_STEPS_A,
     N_LDS_STEPS_B,
     pack=1,
+    quads=(2, 2),
 ):
-    """One constexpr chunk of the wgrad K-loop with SSA-register accumulators."""
+    """One constexpr chunk of the wgrad K-loop with SSA-register accumulators.
+
+    ``quads``: live (M, N) output halves; see ``_wgrad_mx_body_4buf``."""
+    qm, qn = quads
     c00 = [Vec(fx.memref_load_vec(r)) for r in acc00]
-    c01 = [Vec(fx.memref_load_vec(r)) for r in acc01]
-    c10 = [Vec(fx.memref_load_vec(r)) for r in acc10]
-    c11 = [Vec(fx.memref_load_vec(r)) for r in acc11]
-    sa0 = sa_s2r.load(sa_base0, ks0 + base_k)
-    sa1 = sa_s2r.load(sa_base1, ks0 + base_k)
-    sb_all = sb_s2r.load(sb_base0, ks0 + base_k)
+    if qn == 2:
+        c01 = [Vec(fx.memref_load_vec(r)) for r in acc01]
+    if qm == 2:
+        c10 = [Vec(fx.memref_load_vec(r)) for r in acc10]
+    if qm == 2 and qn == 2:
+        c11 = [Vec(fx.memref_load_vec(r)) for r in acc11]
+    sa0 = sa_s2r.load(sa_base0, base_k, kp0)
+    if qm == 2:
+        sa1 = sa_s2r.load(sa_base1, base_k, kp0)
+    sb_all = sb_s2r.load(sb_base0, base_k, kp0)
     sb0, sb1 = sb_all[0:2], sb_all[2:4]
     for _j in range_constexpr(chunk):
         k = base_k + _j
         k1 = k + 1
         k2 = k + 2
-        # pack>1: k is runtime (base_k=_c*chunk) but base_k%pack==0 & ks0%pack==0
-        # -> byte within the packed dword is the constexpr _j%pack (op_sel immediate).
+        # pack>1: k is group-local and runtime (base_k=_c*chunk) but base_k%pack==0 and the
+        # group packs from its own start -> the byte within the packed dword is the constexpr
+        # _j%pack (op_sel immediate), whatever the group's contraction offset is.
         # The scale dword is shared by `pack` consecutive K-iters; load it only once
         # per pack-group and reuse (cuts scale-load vmem instructions PACK-fold). The
         # tail-group prefetch (_j+1==chunk) is dropped: the next chunk reloads it.
         mfma.opsel = scale_opsel(_j, pack)
         _reload = (_j + 1) % pack == 0 and (_j + 1) < chunk
         if _reload:
-            sa0n = sa_s2r.load(sa_base0, ks0 + k1)
+            sa0n = sa_s2r.load(sa_base0, k1, kp0)
         b0 = b_s2r.load(b_cur0)
         a0 = a_s2r.load(a_cur0)
         a_g2s.load(a_next1, A1off + k1 * BLOCK_K)
@@ -223,43 +243,53 @@ def _wgrad_ssa_chunk(
         c00 = mfma.call(a0, b0, c00, sa0, sb0)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
-        b1 = b_s2r.load(b_cur1)
+        if qn == 2:
+            b1 = b_s2r.load(b_cur1)
         b_g2s.load(b_cur0, 0 + k2 * BLOCK_K)
         if _reload:
-            sb_alln = sb_s2r.load(sb_base0, ks0 + k1)
+            sb_alln = sb_s2r.load(sb_base0, k1, kp0)
         rocdl.s_barrier()
-        rocdl.s_setprio(1)
-        c01 = mfma.call(a0, b1, c01, sa0, sb1)
-        rocdl.s_setprio(0)
+        if qn == 2:
+            rocdl.s_setprio(1)
+            c01 = mfma.call(a0, b1, c01, sa0, sb1)
+            rocdl.s_setprio(0)
         rocdl.s_barrier()
-        a1 = a_s2r.load(a_cur1)
+        if qm == 2:
+            a1 = a_s2r.load(a_cur1)
         a_g2s.load(a_cur0, 0 + k2 * BLOCK_K)
-        if _reload:
-            sa1n = sa_s2r.load(sa_base1, ks0 + k1)
+        if _reload and qm == 2:
+            sa1n = sa_s2r.load(sa_base1, k1, kp0)
         rocdl.s_barrier()
-        rocdl.s_setprio(1)
-        c10 = mfma.call(a1, b0, c10, sa1, sb0)
-        rocdl.s_setprio(0)
+        if qm == 2:
+            rocdl.s_setprio(1)
+            c10 = mfma.call(a1, b0, c10, sa1, sb0)
+            rocdl.s_setprio(0)
         rocdl.s_barrier()
         b_g2s.load(b_cur1, B1off + k2 * BLOCK_K)
         wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
-        rocdl.s_setprio(1)
-        c11 = mfma.call(a1, b1, c11, sa1, sb1)
-        rocdl.s_setprio(0)
+        if qm == 2 and qn == 2:
+            rocdl.s_setprio(1)
+            c11 = mfma.call(a1, b1, c11, sa1, sb1)
+            rocdl.s_setprio(0)
         rocdl.s_barrier()
         a_cur0, a_next0 = a_next0, a_cur0
         a_cur1, a_next1 = a_next1, a_cur1
         b_cur0, b_next0 = b_next0, b_cur0
         b_cur1, b_next1 = b_next1, b_cur1
         if _reload:
-            sa0, sa1 = sa0n, sa1n
+            sa0 = sa0n
+            if qm == 2:
+                sa1 = sa1n
             sb_all = sb_alln
             sb0, sb1 = sb_all[0:2], sb_all[2:4]
     for _i in range_constexpr(N_ACCUMS):
         fx.memref_store_vec(c00[_i], acc00[_i])
-        fx.memref_store_vec(c01[_i], acc01[_i])
-        fx.memref_store_vec(c10[_i], acc10[_i])
-        fx.memref_store_vec(c11[_i], acc11[_i])
+        if qn == 2:
+            fx.memref_store_vec(c01[_i], acc01[_i])
+        if qm == 2:
+            fx.memref_store_vec(c10[_i], acc10[_i])
+        if qm == 2 and qn == 2:
+            fx.memref_store_vec(c11[_i], acc11[_i])
     return a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1
 
 
@@ -408,6 +438,12 @@ def _build_grouped_mxfp8_nt_kernel(
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
     SA_TILES = N_TILES_A
+    # Boundary N-block skip: when the last N-block holds <= LDS_BLOCK_N valid columns its b1
+    # half is all padding, so that tile's acc01/acc11 quadrants (half its MFMAs) and the b1
+    # LDS reads are dead work -- the tile runs a b0-only body. Compile-time gated on the
+    # static N (the mirror of the runtime c_n); a 256-aligned N emits only the full body.
+    _HALF_N = (N % BLOCK_N != 0) and (N % BLOCK_N <= LDS_BLOCK_N)
+    _LAST_BN = ceildiv(N, BLOCK_N) - 1
     # CShuffle epilogue staging (store_cshuffle only): one 16-row sub-tile per wave.
     _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
     _cshuf_n = 8 * 16 * (N_TILES_B * 16)
@@ -513,15 +549,6 @@ def _build_grouped_mxfp8_nt_kernel(
                 local, m_start, m_end, n_blocks, BLOCK_M, group_m, group_n
             )
 
-            a_cur0 = lds.A_lds_cur_0
-            a_cur1 = lds.A_lds_cur_1
-            a_next0 = lds.A_lds_next_0
-            a_next1 = lds.A_lds_next_1
-            b_cur0 = lds.B_lds_cur_0
-            b_cur1 = lds.B_lds_cur_1
-            b_next0 = lds.B_lds_next_0
-            b_next1 = lds.B_lds_next_1
-
             lane_id = fx.thread_idx.x % 64
             wave_id = fx.thread_idx.x // 64
             wave_m = wave_id // 4
@@ -591,148 +618,182 @@ def _build_grouped_mxfp8_nt_kernel(
             sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
             sb_base0 = block_n * BLOCK_N + wave_n_offset
 
-            c00_frag = [mfma.zero_value] * N_ACCUMS
-            c01_frag = [mfma.zero_value] * N_ACCUMS
-            c10_frag = [mfma.zero_value] * N_ACCUMS
-            c11_frag = [mfma.zero_value] * N_ACCUMS
+            # nq = live N-quadrants: 2 = full tile, 1 = b0 only (b1 half is all padding).
+            # g2s traffic, barriers and vmcnt waits are identical in both bodies, so the
+            # existing wave_m==1 half-barrier pairing and the drain counts stay valid.
+            def _body(nq):
+                a_cur0 = lds.A_lds_cur_0
+                a_cur1 = lds.A_lds_cur_1
+                a_next0 = lds.A_lds_next_0
+                a_next1 = lds.A_lds_next_1
+                b_cur0 = lds.B_lds_cur_0
+                b_cur1 = lds.B_lds_cur_1
+                b_next0 = lds.B_lds_next_0
+                b_next1 = lds.B_lds_next_1
 
-            b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K)
-            a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
-            b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K)
-            a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
-            if const_expr(persistent):
-                rocdl.s_barrier()
-            else:
-                if wave_m == 1:
+                c00_frag = [mfma.zero_value] * N_ACCUMS
+                c10_frag = [mfma.zero_value] * N_ACCUMS
+                if const_expr(nq == 2):
+                    c01_frag = [mfma.zero_value] * N_ACCUMS
+                    c11_frag = [mfma.zero_value] * N_ACCUMS
+
+                b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K)
+                a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
+                b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K)
+                a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
+                if const_expr(persistent):
                     rocdl.s_barrier()
-            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
-            b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K)
-            a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-            b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
-            wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+                else:
+                    if wave_m == 1:
+                        rocdl.s_barrier()
+                wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+                b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K)
+                a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
+                b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
+                wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
-            sa0 = sa_s2r.load(sa_base0, 0)
-            sa1 = sa_s2r.load(sa_base1, 0)
-            sb_all = sb_s2r.load(sb_base0, 0, slab=group_idx)
-            sb0, sb1 = sb_all[0:2], sb_all[2:4]
+                sa0 = sa_s2r.load(sa_base0, 0)
+                sa1 = sa_s2r.load(sa_base1, 0)
+                sb_all = sb_s2r.load(sb_base0, 0, slab=group_idx)
+                sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
-            for k in range_constexpr(K_ITERS - 2):
-                mfma.opsel = scale_opsel(k, _GG_SCALE_PACK)  # select packed scale byte for K-iter k
-                # One packed dword feeds _GG_SCALE_PACK consecutive K-iters; reload it only
-                # at the pack boundary (op_sel picks the byte). Cuts scale-load vmem PACK-fold.
-                # The boundary always lands on k+1==K_ITERS-2's dword, so the epilogue below
-                # keeps reading the correct retained dword via op_sel.
-                _rl = (k + 1) % _GG_SCALE_PACK == 0
-                if const_expr(_rl):
-                    sa0n = sa_s2r.load(sa_base0, k + 1)
+                for k in range_constexpr(K_ITERS - 2):
+                    mfma.opsel = scale_opsel(k, _GG_SCALE_PACK)  # select packed scale byte for K-iter k
+                    # One packed dword feeds _GG_SCALE_PACK consecutive K-iters; reload it only
+                    # at the pack boundary (op_sel picks the byte). Cuts scale-load vmem PACK-fold.
+                    # The boundary always lands on k+1==K_ITERS-2's dword, so the epilogue below
+                    # keeps reading the correct retained dword via op_sel.
+                    _rl = (k + 1) % _GG_SCALE_PACK == 0
+                    if const_expr(_rl):
+                        sa0n = sa_s2r.load(sa_base0, k + 1)
+                    b0_frag = b_s2r.load(b_cur0)
+                    a0_frag = a_s2r.load(a_cur0)
+                    a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
+                    rocdl.s_barrier()
+                    rocdl.s_setprio(1)
+                    c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
+                    rocdl.s_setprio(0)
+                    rocdl.s_barrier()
+                    if const_expr(nq == 2):
+                        b1_frag = b_s2r.load(b_cur1)
+                    b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K)
+                    if const_expr(_rl):
+                        sb_alln = sb_s2r.load(sb_base0, k + 1, slab=group_idx)
+                    rocdl.s_barrier()
+                    if const_expr(nq == 2):
+                        rocdl.s_setprio(1)
+                        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
+                        rocdl.s_setprio(0)
+                    rocdl.s_barrier()
+                    a1_frag = a_s2r.load(a_cur1)
+                    a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
+                    if const_expr(_rl):
+                        sa1n = sa_s2r.load(sa_base1, k + 1)
+                    rocdl.s_barrier()
+                    rocdl.s_setprio(1)
+                    c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
+                    rocdl.s_setprio(0)
+                    rocdl.s_barrier()
+                    b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K)
+                    wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+                    if const_expr(nq == 2):
+                        rocdl.s_setprio(1)
+                        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
+                        rocdl.s_setprio(0)
+                    rocdl.s_barrier()
+                    a_cur0, a_next0 = a_next0, a_cur0
+                    a_cur1, a_next1 = a_next1, a_cur1
+                    b_cur0, b_next0 = b_next0, b_cur0
+                    b_cur1, b_next1 = b_next1, b_cur1
+                    if const_expr(_rl):
+                        sa0, sa1 = sa0n, sa1n
+                        sb_all = sb_alln
+                        sb0, sb1 = sb_all[0:2], sb_all[2:4]
+
+                # Step K_ITERS-2 (prefetch last iter's scales).
+                mfma.opsel = scale_opsel(K_ITERS - 2, _GG_SCALE_PACK)
+                sa0n = sa_s2r.load(sa_base0, K_ITERS - 1)
+                sa1n = sa_s2r.load(sa_base1, K_ITERS - 1)
+                sb_alln = sb_s2r.load(sb_base0, K_ITERS - 1, slab=group_idx)
                 b0_frag = b_s2r.load(b_cur0)
                 a0_frag = a_s2r.load(a_cur0)
-                a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
-                b1_frag = b_s2r.load(b_cur1)
-                b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K)
-                if const_expr(_rl):
-                    sb_alln = sb_s2r.load(sb_base0, k + 1, slab=group_idx)
+                if const_expr(nq == 2):
+                    b1_frag = b_s2r.load(b_cur1)
                 rocdl.s_barrier()
-                rocdl.s_setprio(1)
-                c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
-                rocdl.s_setprio(0)
+                if const_expr(nq == 2):
+                    rocdl.s_setprio(1)
+                    c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
+                    rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a1_frag = a_s2r.load(a_cur1)
-                a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
-                if const_expr(_rl):
-                    sa1n = sa_s2r.load(sa_base1, k + 1)
+                a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
-                b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K)
-                wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
-                rocdl.s_setprio(1)
-                c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
-                rocdl.s_setprio(0)
+                b0_frag = b_s2r.load(b_next0)
+                rocdl.s_barrier()
+                if const_expr(nq == 2):
+                    rocdl.s_setprio(1)
+                    c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
+                    rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a_cur0, a_next0 = a_next0, a_cur0
                 a_cur1, a_next1 = a_next1, a_cur1
                 b_cur0, b_next0 = b_next0, b_cur0
                 b_cur1, b_next1 = b_next1, b_cur1
-                if const_expr(_rl):
-                    sa0, sa1 = sa0n, sa1n
-                    sb_all = sb_alln
-                    sb0, sb1 = sb_all[0:2], sb_all[2:4]
+                sa0, sa1 = sa0n, sa1n
+                sb_all = sb_alln
+                sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
-            # Step K_ITERS-2 (prefetch last iter's scales).
-            mfma.opsel = scale_opsel(K_ITERS - 2, _GG_SCALE_PACK)
-            sa0n = sa_s2r.load(sa_base0, K_ITERS - 1)
-            sa1n = sa_s2r.load(sa_base1, K_ITERS - 1)
-            sb_alln = sb_s2r.load(sb_base0, K_ITERS - 1, slab=group_idx)
-            b0_frag = b_s2r.load(b_cur0)
-            a0_frag = a_s2r.load(a_cur0)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            b1_frag = b_s2r.load(b_cur1)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            a1_frag = a_s2r.load(a_cur1)
-            a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            b0_frag = b_s2r.load(b_next0)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            a_cur0, a_next0 = a_next0, a_cur0
-            a_cur1, a_next1 = a_next1, a_cur1
-            b_cur0, b_next0 = b_next0, b_cur0
-            b_cur1, b_next1 = b_next1, b_cur1
-            sa0, sa1 = sa0n, sa1n
-            sb_all = sb_alln
-            sb0, sb1 = sb_all[0:2], sb_all[2:4]
+                # Step K_ITERS-1.
+                mfma.opsel = scale_opsel(K_ITERS - 1, _GG_SCALE_PACK)
+                a0_frag = a_s2r.load(a_cur0)
+                wait_barrier(0)
+                rocdl.s_setprio(1)
+                c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
+                if const_expr(nq == 2):
+                    b1_frag = b_s2r.load(b_cur1)
+                rocdl.s_barrier()
+                if const_expr(nq == 2):
+                    rocdl.s_setprio(1)
+                    c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
+                    rocdl.s_setprio(0)
+                rocdl.s_barrier()
+                a1_frag = a_s2r.load(a_cur1)
+                rocdl.s_barrier()
+                rocdl.s_setprio(1)
+                c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
+                if const_expr(nq == 2):
+                    c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
 
-            # Step K_ITERS-1.
-            mfma.opsel = scale_opsel(K_ITERS - 1, _GG_SCALE_PACK)
-            a0_frag = a_s2r.load(a_cur0)
-            wait_barrier(0)
-            rocdl.s_setprio(1)
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            b1_frag = b_s2r.load(b_cur1)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            a1_frag = a_s2r.load(a_cur1)
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
-            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
+                base_row = m_row_c + wave_m_offset
+                base_col = block_n * BLOCK_N + wave_n_offset
+                store_c.store(c00_frag, base_row + 0, base_col + 0)
+                store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+                if const_expr(nq == 2):
+                    store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+                    store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
-            base_row = m_row_c + wave_m_offset
-            base_col = block_n * BLOCK_N + wave_n_offset
-            store_c.store(c00_frag, base_row + 0, base_col + 0)
-            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+            if const_expr(_HALF_N):
+                # Scalar (wave-uniform) predicate: every wave must take the same path,
+                # the bodies contain s_barrier.
+                if _readfirstlane_i32(block_n) == fx.Int32(_LAST_BN):
+                    _body(1)
+                else:
+                    _body(2)
+            else:
+                _body(2)
 
         if const_expr(persistent):
             for t in range(pid, total_tiles, nsms):
@@ -1099,12 +1160,17 @@ def grouped_gemm_mxfp8_flydsl_kernel(
 
 
 def _build_grouped_wgrad_preshuffle_kernel(
-    OUT_M: int, OUT_N: int, KT: int = _PRESHUF_KT, BLK: int = 256, pack: int = 1
+    OUT_M: int, OUT_N: int, G: int, KT: int = _PRESHUF_KT, BLK: int = 256, pack: int = 1
 ):
     """LHS (layout 1) + RHS (B-comb layout 3) E8M0 scale preshuffle for the wgrad.
 
     Returns ``(kern, a_ngrp, b_ngrp)``. ``pack`` packs PACK consecutive contraction
     (m_total) K-blocks per output dword (reader selects the byte via MFMA op_sel).
+    Each group is packed from its OWN contraction start, so pack>1 needs no alignment
+    of the group offsets: group g's packed region begins at ``go[g]//BLOCK_K//pack + g``
+    and the K-stride is ``k128//pack + G``. The single spare dword per group is what
+    keeps the regions disjoint (floor(a/p)+ceil(n/p) <= floor((a+n)/p)+1), and paying it
+    here keeps the timed main kernel at one extra integer add.
     """
     a_ngrp = ceildiv(OUT_M, 64)
     b_ngrp = ((OUT_N + 255) // 256) * 4
@@ -1119,13 +1185,15 @@ def _build_grouped_wgrad_preshuffle_kernel(
         b_raw: fx.Tensor,
         a_sp: fx.Tensor,
         b_sp: fx.Tensor,
+        group_offs: fx.Tensor,  # padded per-group M offsets (int32 view of int64 [G+1])
         k128: fx.Int32,  # contraction blocks = M_total // 128
-        n_kt: fx.Int32,  # ceildiv(k128, KT)
-        a_blocks: fx.Int32,  # a_ngrp * n_kt
+        n_ck: fx.Int32,  # per-row-group KT-chunk slots = k128//KT + G (upper bound)
+        a_blocks: fx.Int32,  # a_ngrp * n_ck
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
         tile = fx.SharedAllocator().allocate(Smem).peek().tile
+        k128p = k128 // pack + fx.Int32(G)  # packed K-stride (one spare dword per group)
         rin_a = _buffer_ops.create_buffer_resource(
             a_raw, max_size=False, num_records_bytes=fx.Int32(OUT_M) * k128 * 4
         )
@@ -1133,44 +1201,79 @@ def _build_grouped_wgrad_preshuffle_kernel(
             b_raw, max_size=False, num_records_bytes=fx.Int32(OUT_N) * k128 * 4
         )
         rout_a = _buffer_ops.create_buffer_resource(
-            a_sp, max_size=False, num_records_bytes=fx.Int32(a_ngrp) * k128 * 256 * 4
+            a_sp, max_size=False, num_records_bytes=fx.Int32(a_ngrp) * k128p * 256 * 4
         )
         rout_b = _buffer_ops.create_buffer_resource(
-            b_sp, max_size=False, num_records_bytes=fx.Int32(b_ngrp) * k128 * 256 * 4
+            b_sp, max_size=False, num_records_bytes=fx.Int32(b_ngrp) * k128p * 256 * 4
         )
-        # pack>1 requires every group's contraction 512-aligned so the runtime ks0 lands
-        # on a packed-dword boundary (op_sel immediate); the caller guarantees it.
-        if bid < a_blocks:
-            _emit_lds_repack(
-                True,
-                bid // n_kt,
-                (bid % n_kt) * KT,
-                tile,
-                rin_a,
-                rout_a,
-                fx.Int32(OUT_M),
-                k128,
-                KT,
-                tid,
-                BLK,
-                pack=pack,
-            )
-        if bid >= a_blocks:
-            bb = bid - a_blocks
-            _emit_lds_repack(
-                False,
-                bb // n_kt,
-                (bb % n_kt) * KT,
-                tile,
-                rin_b,
-                rout_b,
-                fx.Int32(OUT_N),
-                k128,
-                KT,
-                tid,
-                BLK,
-                pack=pack,
-            )
+        go = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
+        go_div = fx.logical_divide(go, fx.make_layout(1, 1))
+
+        # Chunk slot -> owning group: O(G) scan over the per-group KT-chunk counts (this
+        # pass is not on the timed path). Slots past the real count fall through unwritten.
+        bb = arith.select(bid < a_blocks, bid, bid - a_blocks)
+        row_grp = bb // n_ck
+        ck = bb % n_ck
+        acc = fx.Int32(0)
+        ks0 = fx.Int32(0)
+        k_iters = fx.Int32(0)
+        j0 = fx.Int32(0)
+        gidx = fx.Int32(0)
+        valid = fx.Int32(0)
+        prev = _load_go(go_div, 0) // 128
+        for g in range_constexpr(G):
+            nxt = _load_go(go_div, g + 1) // 128
+            ki = nxt - prev
+            nc = ceildiv(ki, KT)
+            inq = (ck >= acc) & (ck < acc + nc)
+            ks0 = arith.select(inq, prev, ks0)
+            k_iters = arith.select(inq, ki, k_iters)
+            j0 = arith.select(inq, (ck - acc) * KT, j0)
+            gidx = arith.select(inq, fx.Int32(g), gidx)
+            valid = arith.select(inq, fx.Int32(1), valid)
+            acc = acc + nc
+            prev = nxt
+        kp0 = ks0 // pack + gidx  # group's packed base; 256 i32 (64 lanes x 4) per dword
+
+        if valid > fx.Int32(0):
+            if bid < a_blocks:
+                _emit_lds_repack(
+                    True,
+                    row_grp,
+                    j0,
+                    tile,
+                    rin_a,
+                    rout_a,
+                    fx.Int32(OUT_M),
+                    k128,
+                    KT,
+                    tid,
+                    BLK,
+                    rd_base=ks0,
+                    wr_base=kp0 * 256,
+                    pack=pack,
+                    kbound=k_iters,
+                    k128p=k128p,
+                )
+            if bid >= a_blocks:
+                _emit_lds_repack(
+                    False,
+                    row_grp,
+                    j0,
+                    tile,
+                    rin_b,
+                    rout_b,
+                    fx.Int32(OUT_N),
+                    k128,
+                    KT,
+                    tid,
+                    BLK,
+                    rd_base=ks0,
+                    wr_base=kp0 * 256,
+                    pack=pack,
+                    kbound=k_iters,
+                    k128p=k128p,
+                )
 
     return kern, a_ngrp, b_ngrp
 
@@ -1194,9 +1297,9 @@ def _build_grouped_mxfp8_wgrad_kernel(
     """Grouped MXFP8 variable-K wgrad (runtime per-group contraction M_g).
 
     ``pack``: E8M0 scale packing (PACK scales/dword, op_sel byte select). pack>1 shrinks
-    the preshuffled scale buffer + its mainloop traffic PACK-fold, but requires every
-    group's contraction to be 512-aligned (m_start % 512 == 0) so the runtime per-group
-    ks0 offset lands on a packed-dword boundary (op_sel is an immediate)."""
+    the preshuffled scale buffer + its mainloop scale traffic PACK-fold. Each group is
+    packed from its own contraction start (base ``ks0//pack + g``), so the op_sel byte is
+    the group-local k%pack for any group offset -- no alignment of group_offs required."""
     BLOCK_K = 128
     assert BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0 and BLOCK_M >= 128 and BLOCK_N >= 256
     assert G >= 1
@@ -1218,6 +1321,11 @@ def _build_grouped_mxfp8_wgrad_kernel(
     N_BLOCKS_N = ceildiv(OUT_N, BLOCK_N)
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
+    # Boundary half-tile skip: a trailing block with <= half a tile of valid rows/cols has
+    # an all-padding second half, so that tile's MFMAs and LDS reads for it are dead work.
+    # Compile-time gated per side; a BLOCK-aligned OUT_M/OUT_N emits only the full body.
+    _HALF_M = (OUT_M % BLOCK_M != 0) and (OUT_M % BLOCK_M <= LDS_BLOCK_M)
+    _HALF_N = (OUT_N % BLOCK_N != 0) and (OUT_N % BLOCK_N <= LDS_BLOCK_N)
 
     @fx.struct
     class SharedStorage:
@@ -1261,7 +1369,12 @@ def _build_grouped_mxfp8_wgrad_kernel(
             m_start = _load_go(go_div, group_idx)
             m_end = _load_go(go_div, group_idx + 1)
             k_iters = (m_end - m_start) // BLOCK_K  # runtime; M_g padded to 128 -> exact
-            ks0 = m_start // BLOCK_K  # scale K128-block base for this group
+            # Scales are packed per group from the group's own contraction start, so the
+            # scale index is group-local and the base is (ks0//pack + g): the one spare
+            # dword per group keeps the regions disjoint for any group offset (no 512
+            # alignment assumed), at the cost of G spare dwords in the K-stride.
+            kp0 = m_start // (BLOCK_K * pack) + group_idx
+            k128p = m_total // (BLOCK_K * pack) + fx.Int32(G)
 
             lane_id = fx.thread_idx.x % 64
             wave_id = fx.thread_idx.x // 64
@@ -1303,8 +1416,8 @@ def _build_grouped_mxfp8_wgrad_kernel(
             a_s2r = S2RLoader(wave_m, N_TILES_A)
             b_s2r = S2RLoader(wave_n, N_TILES_B)
 
-            sa_s2r = ScaleS2R(A_scale, OUT_M, m_total, SA_TILES, pack=pack)
-            sb_s2r = ScaleBComb(B_scale, OUT_N, m_total, pack=pack)
+            sa_s2r = ScaleS2R(A_scale, OUT_M, m_total, SA_TILES, pack=pack, k128p=k128p)
+            sb_s2r = ScaleBComb(B_scale, OUT_N, m_total, pack=pack, k128p=k128p)
             store_c = StoreCPerTensor(
                 None, None, C, (group_idx + 1) * OUT_M, OUT_N, mfma.idx, N_TILES_A, N_TILES_B, _out_ty
             )
@@ -1344,51 +1457,23 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
             # MAIN: every FULL chunk runs the SSA-accumulator body (memref RMW only at the
             # chunk boundary); the dynamic loop carries just the 8 swapped buffer refs.
-            _nfull = k_iters // chunk
-            for _c in range(_nfull):
-                (a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1) = _wgrad_ssa_chunk(
-                    _c * chunk,
-                    chunk,
-                    ks0,
-                    BLOCK_K,
-                    A1off,
-                    B1off,
-                    a_g2s,
-                    b_g2s,
-                    a_s2r,
-                    b_s2r,
-                    sa_s2r,
-                    sb_s2r,
-                    mfma,
-                    a_cur0,
-                    a_cur1,
-                    b_cur0,
-                    b_cur1,
-                    a_next0,
-                    a_next1,
-                    b_next0,
-                    b_next1,
-                    acc00,
-                    acc01,
-                    acc10,
-                    acc11,
-                    sa_base0,
-                    sa_base1,
-                    sb_base0,
-                    N_ACCUMS,
-                    N_LDS_STEPS_A,
-                    N_LDS_STEPS_B,
-                    pack,
-                )
-
-            # TAIL: the k_iters%chunk remainder tiles, per-tile (k_abs<k_iters) guarded.
-            _tail0 = _nfull * chunk
-            for _j in range_constexpr(chunk):
-                k_abs = _tail0 + _j
-                if k_abs < k_iters:
-                    _wgrad_mx_body_4buf(
-                        k_abs,
-                        ks0,
+            # `quads` selects the live output halves for this tile's boundary position;
+            # g2s / barrier / vmcnt sequences are identical across the variants.
+            def _run(quads):
+                a_cur0 = lds.A_lds_cur_0
+                a_cur1 = lds.A_lds_cur_1
+                a_next0 = lds.A_lds_next_0
+                a_next1 = lds.A_lds_next_1
+                b_cur0 = lds.B_lds_cur_0
+                b_cur1 = lds.B_lds_cur_1
+                b_next0 = lds.B_lds_next_0
+                b_next1 = lds.B_lds_next_1
+                _nfull = k_iters // chunk
+                for _c in range(_nfull):
+                    (a_cur0, a_cur1, b_cur0, b_cur1, a_next0, a_next1, b_next0, b_next1) = _wgrad_ssa_chunk(
+                        _c * chunk,
+                        chunk,
+                        kp0,
                         BLOCK_K,
                         A1off,
                         B1off,
@@ -1414,15 +1499,86 @@ def _build_grouped_mxfp8_wgrad_kernel(
                         sa_base0,
                         sa_base1,
                         sb_base0,
+                        N_ACCUMS,
                         N_LDS_STEPS_A,
                         N_LDS_STEPS_B,
-                        scale_opsel(_j, pack),
+                        pack,
+                        quads,
                     )
-                a_cur0, a_next0 = a_next0, a_cur0
-                a_cur1, a_next1 = a_next1, a_cur1
-                b_cur0, b_next0 = b_next0, b_cur0
-                b_cur1, b_next1 = b_next1, b_cur1
 
+                # TAIL: the k_iters%chunk remainder tiles, per-tile (k_abs<k_iters) guarded.
+                _tail0 = _nfull * chunk
+                for _j in range_constexpr(chunk):
+                    k_abs = _tail0 + _j
+                    if k_abs < k_iters:
+                        _wgrad_mx_body_4buf(
+                            k_abs,
+                            kp0,
+                            BLOCK_K,
+                            A1off,
+                            B1off,
+                            a_g2s,
+                            b_g2s,
+                            a_s2r,
+                            b_s2r,
+                            sa_s2r,
+                            sb_s2r,
+                            mfma,
+                            a_cur0,
+                            a_cur1,
+                            b_cur0,
+                            b_cur1,
+                            a_next0,
+                            a_next1,
+                            b_next0,
+                            b_next1,
+                            acc00,
+                            acc01,
+                            acc10,
+                            acc11,
+                            sa_base0,
+                            sa_base1,
+                            sb_base0,
+                            N_LDS_STEPS_A,
+                            N_LDS_STEPS_B,
+                            scale_opsel(_j, pack),
+                            quads,
+                        )
+                    a_cur0, a_next0 = a_next0, a_cur0
+                    a_cur1, a_next1 = a_next1, a_cur1
+                    b_cur0, b_next0 = b_next0, b_cur0
+                    b_cur1, b_next1 = b_next1, b_cur1
+
+            # Scalar (wave-uniform) boundary predicates: the bodies contain s_barrier, so
+            # every wave of the WG must take the same path.
+            if const_expr(_HALF_M and _HALF_N):
+                if _readfirstlane_i32(block_m) == fx.Int32(N_BLOCKS_M - 1):
+                    if _readfirstlane_i32(block_n) == fx.Int32(N_BLOCKS_N - 1):
+                        _run((1, 1))
+                    else:
+                        _run((1, 2))
+                else:
+                    if _readfirstlane_i32(block_n) == fx.Int32(N_BLOCKS_N - 1):
+                        _run((2, 1))
+                    else:
+                        _run((2, 2))
+            elif const_expr(_HALF_M):
+                if _readfirstlane_i32(block_m) == fx.Int32(N_BLOCKS_M - 1):
+                    _run((1, 2))
+                else:
+                    _run((2, 2))
+            elif const_expr(_HALF_N):
+                if _readfirstlane_i32(block_n) == fx.Int32(N_BLOCKS_N - 1):
+                    _run((2, 1))
+                else:
+                    _run((2, 2))
+            else:
+                _run((2, 2))
+
+            # All four quadrants are stored unconditionally: a quadrant skipped above keeps
+            # its zero-init and lies entirely outside the row/col bounds, which StoreC
+            # clamps. Keeping the stores here also keeps them out of `_run`, whose scf.for
+            # body extraction only captures names the loop itself references.
             c00_frag = [Vec(fx.memref_load_vec(r)) for r in acc00]
             c01_frag = [Vec(fx.memref_load_vec(r)) for r in acc01]
             c10_frag = [Vec(fx.memref_load_vec(r)) for r in acc10]
@@ -1447,7 +1603,7 @@ _GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16) -> 
 def _compile_grouped_mxfp8_wgrad_fused(
     OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack=1, preshuffle=True
 ):
-    pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N, pack=pack)
+    pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N, G, pack=pack)
     gemm_kern, BM, BN, wpe, TOTAL = _build_grouped_mxfp8_wgrad_kernel(
         OUT_M=OUT_M,
         OUT_N=OUT_N,
@@ -1475,7 +1631,7 @@ def _compile_grouped_mxfp8_wgrad_fused(
         group_offs: fx.Tensor,
         m_total: fx.Int32,
         k128: fx.Int32,
-        n_kt: fx.Int32,
+        n_ck: fx.Int32,
         a_blocks: fx.Int32,
         pre_grid: fx.Int32,
         stream: fx.Stream,
@@ -1483,7 +1639,7 @@ def _compile_grouped_mxfp8_wgrad_fused(
         # preshuffle=False: skip the E8M0 scale preshuffle (assumes a_sp/b_sp already
         # populated by a prior call) so the GEMM main kernel can be timed in isolation.
         if const_expr(preshuffle):
-            pre_kern(a_raw, b_raw, a_sp, b_sp, k128, n_kt, a_blocks).launch(
+            pre_kern(a_raw, b_raw, a_sp, b_sp, group_offs, k128, n_ck, a_blocks).launch(
                 grid=(pre_grid, 1, 1), block=(_PRESHUF_BLK, 1, 1), stream=stream
             )
         gemm_kern(
@@ -1500,15 +1656,17 @@ def _compile_grouped_mxfp8_wgrad_fused(
     return launch_grouped_mxfp8_wgrad_fused
 
 
-def _get_grouped_wgrad_workspace(OUT_M, OUT_N, K128, device, stream):
-    key = (OUT_M, OUT_N, K128, device, stream)
+def _get_grouped_wgrad_workspace(OUT_M, OUT_N, K128, G, pack, device, stream):
+    key = (OUT_M, OUT_N, K128, G, pack, device, stream)
     e = _GWG_WS_CACHE.get(key)
     if e is None:
         a_ngrp = ceildiv(OUT_M, 64)
         b_ngrp = ((OUT_N + 255) // 256) * 4
-        # wgrad keeps the unpacked (pack=1) scale layout (runtime per-group ks0 offset).
-        a_sp = torch.empty(a_ngrp * K128 * 256, dtype=torch.int32, device=device)
-        b_sp = torch.empty(b_ngrp * K128 * 256, dtype=torch.int32, device=device)
+        # Packed K-stride: each group packs from its own contraction start, so the stride
+        # holds one spare dword per group (see _build_grouped_wgrad_preshuffle_kernel).
+        K128p = K128 // pack + G
+        a_sp = torch.empty(a_ngrp * K128p * 256, dtype=torch.int32, device=device)
+        b_sp = torch.empty(b_ngrp * K128p * 256, dtype=torch.int32, device=device)
         e = (a_sp, b_sp)
         _GWG_WS_CACHE[key] = e
     return e
@@ -1525,7 +1683,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     G: int,
     out_dtype: torch.dtype = torch.bfloat16,
     num_cu: "int | None" = -1,
-    pack: int = 1,
+    pack: int = 4,
     preshuffle: bool = True,
 ) -> "torch.Tensor":
     """FlyDSL MXFP8 grouped variable-K wgrad. Returns C [G, OUT_M, OUT_N].
@@ -1534,10 +1692,10 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     was populated by a prior preshuffle=True call on the same shape) so the GEMM main
     kernel can be timed alone; used by benches, not the training path.
 
-    pack>1 packs `pack` consecutive contraction-K-blocks' E8M0 scales into one
-    dword (op_sel immediate byte select). Requires every group's contraction M
-    to be (128*pack)-aligned so the runtime per-group ks0 lands on a packed-dword
-    boundary; the caller guarantees it (bench per-group M=4096 => ks0=g*32, 512-al).
+    pack>1 packs `pack` consecutive contraction-K-blocks' E8M0 scales into one dword
+    (op_sel immediate byte select), which folds the mainloop scale-load count and the
+    scale workspace by PACK. Each group is packed from its own contraction start, so any
+    128-aligned group_offs works (the preshuffle absorbs the per-group phase).
     """
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == OUT_M and rhs.shape[0] == OUT_N
@@ -1559,13 +1717,15 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     go = _go.view(torch.int32)
 
     stream = torch.cuda.current_stream()
-    a_sp, b_sp = _get_grouped_wgrad_workspace(OUT_M, OUT_N, K128, lhs.device, stream)
+    a_sp, b_sp = _get_grouped_wgrad_workspace(OUT_M, OUT_N, K128, G, pack, lhs.device, stream)
 
     a_ngrp = ceildiv(OUT_M, 64)
     b_ngrp = ((OUT_N + 255) // 256) * 4
-    n_kt = ceildiv(K128, _PRESHUF_KT)
-    a_blocks = a_ngrp * n_kt
-    pre_grid = a_blocks + b_ngrp * n_kt
+    # Per-group KT-chunk slots. sum_g ceildiv(k_g, KT) <= K128//KT + G, so this bound holds
+    # for every distribution (slots past the real count exit the preshuffle immediately).
+    n_ck = K128 // _PRESHUF_KT + G
+    a_blocks = a_ngrp * n_ck
+    pre_grid = a_blocks + b_ngrp * n_ck
 
     bm, bn, gm, xcd, gn = 256, 256, 4, 1, 0
     # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
@@ -1577,7 +1737,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
         )
         _GWG_FUSED_CACHE[fk] = launch
 
-    args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
+    args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_ck, a_blocks, pre_grid, stream)
     at_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16, pack, preshuffle)
     entry = _GWG_AT_CACHE.get(at_key)
     if entry is None:

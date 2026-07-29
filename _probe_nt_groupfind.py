@@ -62,7 +62,7 @@ CASES = {
 }
 
 
-def run(name, mg, A=1024, B=256):
+def run(name, mg, A=1024, B=256, num_cu=-1):
     o = offs(mg)
     m = int(o[-1].item())
     g = len(mg)
@@ -74,7 +74,7 @@ def run(name, mg, A=1024, B=256):
         [deq(a[int(o[i]) : int(o[i + 1])], a_s[int(o[i]) : int(o[i + 1])], 1) @ deq(w[i], w_s[i], 1).t()
          for i in range(g)]
     )
-    got = fly_mx(a, a_s, w, w_s, o, B, A, out_dtype=torch.bfloat16, num_cu=-1)
+    got = fly_mx(a, a_s, w, w_s, o, B, A, out_dtype=torch.bfloat16, num_cu=num_cu)
     out.append(("fwd", snr(ref, got)))
     # wgrad (variable-K TN): C[g, A, B] = L[A, m] @ R[B, m]^T per group. Contract: the
     # per-group contraction is padded to a multiple of BLOCK_K=128; skip the shapes that
@@ -96,14 +96,22 @@ def run(name, mg, A=1024, B=256):
     return ok
 
 
+# (N, num_cu) sweep. N=256 is BLOCK_N-aligned (full-quadrant body); N=384 is the gpt-oss
+# x.5*256 flavour whose last N-block is half padding, so it takes the reduced-quadrant body.
+# num_cu>0 selects the persistent grid, which walks the tile space in an scf.for.
+VARIANTS = [(256, -1), (384, -1), (384, 256)]
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     allok = True
-    for name, mg in CASES.items():
-        try:
-            allok &= run(name, mg)
-        except Exception as e:  # unsupported shape -> report, don't mask
-            print(f"{name:24s} EXC {type(e).__name__}: {e}")
-            allok = False
+    for N, ncu in VARIANTS:
+        print(f"--- N={N} num_cu={ncu}")
+        for name, mg in CASES.items():
+            try:
+                allok &= run(name, mg, B=N, num_cu=ncu)
+            except Exception as e:  # unsupported shape -> report, don't mask
+                print(f"{name:24s} EXC {type(e).__name__}: {e}")
+                allok = False
     print("ALL_OK" if allok else "SOME_FAILED")
     sys.exit(0 if allok else 1)
