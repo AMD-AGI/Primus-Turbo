@@ -646,7 +646,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
 
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only); grad_gate=... selects the bwd role
         dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-            grad_l1, w1t_fp8, list(handle), group, topk_indices=tidx64, grad_gate=grad_gate,
+            None, w1t_fp8, list(handle), group, topk_indices=tidx64, grad_gate=grad_gate,
             x_fp8_rowwise=grad_l1_rowwise, BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
         )
         return dx

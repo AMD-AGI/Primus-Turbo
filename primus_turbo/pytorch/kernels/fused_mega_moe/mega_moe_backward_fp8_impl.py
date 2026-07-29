@@ -26,6 +26,7 @@ import torch
 from primus_turbo.flydsl.mega.fp8 import (
     colwise_grouped_meta,
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
+    colwise_requant_mxfp8_grouped_fp8in_flydsl,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl,
@@ -119,22 +120,8 @@ def _w1t_combine_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
 
 def _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2, group, handle, block_m, block_n, *, w2t_fp8=None,
                                            num_dispatch_cu=None, num_preshuffle_cu=None):
-    """Fused fp8 dispatch(dy) PUSH + L2 (fc2) dgrad (the winnable fp8 backward fork).
-
-    Quantizes ``dy`` rowwise mxfp8, PUSHes it cross-rank into the pool (fp8, byte-halved), and
-    computes ``grad_swiglu = dispatched_dy @ w2`` as a grouped mxfp8 NT GEMM against ``w2^T``
-    (``w2t_fp8``; version-keyed here). Returns ``(grad_swiglu [P, I] bf16, pool_fp8_handle)`` where
-    ``pool_fp8_handle = (pool_fp8 [P,H] fp8, pool_scale [P,H//32] E8M0)`` is the dispatched-dy pool
-    in native rowwise-fp8 -- the dW2 ``a`` operand for the (later) variable-K wgrad.
-
-    Needs the live mxfp8 symm buffer (the forward's global buffer) and the same cross-rank
-    scoreboard gate the forward L1 uses; the caller need not have kept anything but the handle."""
+    """Fp8 dispatch(dy) PUSH + fc2 dgrad: ``grad_swiglu = dy @ w2`` and rowwise-fp8 pool for dW2 ``a``."""
     w2tq, w2ts = w2t_fp8 if w2t_fp8 is not None else _w2t_fp8_cached(w2)
-    # The L2 dgrad IS the forward L1 op: same NT dispatch-PUSH + grouped mxfp8 GEMM wrapper (handle-
-    # reuse path -> reuses the live symm buffer + does the scoreboard rendezvous internally). Here
-    # A = dy (bf16 -> quantized + PUSHed inside), weight = w2^T [G,I,H] -> grad_swiglu [P, I]; only
-    # the CU split differs. pool_x_fp8 (the left-populated dispatched-dy pool) is the dW2 `a` operand
-    # for the (later) variable-K wgrad; dispatch_weights is unused here.
     grad_swiglu, _, _, pool_fp8_handle = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
         dy, w2tq, w2ts, group, handle=handle,
         num_dispatch_cu=_L2_DGRAD_NUM_DISPATCH_CU if num_dispatch_cu is None else num_dispatch_cu,
@@ -172,21 +159,16 @@ def _mxfp8_variable_k_wgrad(a_fp8, b_bf16, group_lens, group_offs, meta=None):
 
 
 def _l1_dgrad_combine_mxfp8_flydsl_kernel(
-    grad_l1, w1, group, handle, block_m, block_n, *, grad_gate, topk_idx, num_tokens, num_topk,
-    w1t_fp8=None, grad_l1_rowwise_fp8=None,
+    w1, group, handle, block_m, block_n, *, grad_l1_rowwise_fp8, grad_gate, topk_idx, num_tokens, num_topk,
+    w1t_fp8=None,
 ):
     """Backward L1 dgrad: fp8 fc1-dgrad (``grad_l1 @ w1^T``) + combine PUSH + unweighted reduce +
     grad_gate scatter -> ``(dx [num_tokens, H] bf16, grad_topk_weights [num_tokens, num_topk] f32)``.
 
-    Backward mirror of the forward L2 (compute -> comm, combine-bound). fc1^T is prepped
-    version-keyed at the op layer (``_w1t_combine_fp8_cached``); the combine kernel is pure compute
-    and self-resets its epoch flags on device (no host scoreboard/flag reset rendezvous).
-
-    ``grad_l1_rowwise_fp8`` = precomputed ``(aq e4m3, a_sp preshuffled)`` for ``grad_l1`` (from the
-    fused dual-quant); when given, the combine skips its internal rowwise quant (one grad_l1 read)."""
+    ``grad_l1_rowwise_fp8`` = ``(q_row e4m3, a_sp preshuffled)`` from ``rowcol_dual_quant_mxfp8_grouped_flydsl``."""
     w1tf = w1t_fp8 if w1t_fp8 is not None else _w1t_combine_fp8_cached(w1)
     dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel(
-        grad_l1, w1tf, list(handle), group,
+        None, w1tf, list(handle), group,
         topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
         x_fp8_rowwise=grad_l1_rowwise_fp8,
         BM=block_m, BN=block_n, num_combine_cu=28,  # unified w/ fwd L2 (task-based push; T=8192)
@@ -275,9 +257,9 @@ def mega_moe_backward_fp8_impl(
 
     # STEP3: fused fc1 dgrad + combine + reduce -> dx; then dW1 variable-K wgrad (serial).
     dx, grad_topk_weights = _l1_dgrad_combine_mxfp8_flydsl_kernel(
-        grad_l1, w1, group, handle, block_m, block_n,
-        grad_gate=grad_gate, topk_idx=topk_idx, num_tokens=num_tokens, num_topk=num_topk,
+        w1, group, handle, block_m, block_n,
         grad_l1_rowwise_fp8=(gl1_q_row, gl1_a_sp),
+        grad_gate=grad_gate, topk_idx=topk_idx, num_tokens=num_tokens, num_topk=num_topk,
     )
     dW1 = _mxfp8_variable_k_wgrad_dw1((gl1_q_col, gl1_s_col), pool_x_fp8, meta)
 

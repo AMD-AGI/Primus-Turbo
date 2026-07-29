@@ -149,7 +149,7 @@ def profile(group, args):
 
     def _step3():
         return grouped_gemm_combine_mxfp8_flydsl_kernel(
-            grad_l1, w1tf, list(handle), group, topk_indices=tki, grad_gate=grad_gate,
+            None, w1tf, list(handle), group, topk_indices=tki, grad_gate=grad_gate,
             x_fp8_rowwise=rowwise, BM=BM, BN=BN, num_combine_cu=combine_cu,
         )
 

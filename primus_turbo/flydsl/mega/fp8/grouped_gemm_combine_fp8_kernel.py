@@ -599,8 +599,9 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     no internal A quant on the forward path.
 
     Backward STEP3 requires ``x_fp8_rowwise=(q_row, a_sp)`` from ``rowcol_dual_quant_mxfp8_grouped_flydsl``
-    (fused rowwise quant of ``grad_l1``). ``x`` [M, K] bf16 is still passed for M/K/device metadata;
-    its values are unused when ``x_fp8_rowwise`` is given.
+    (fused rowwise quant of ``grad_l1``). Pass ``x=None``; M/K/device come from ``q_row.shape``.
+
+    Forward L2 and backward STEP3 both pass ``x=None`` when ``x_fp8`` / ``x_fp8_rowwise`` is given.
 
     Self-resetting: the combine_flag / reduce_flag epoch gates are double-banked + device epoch-bumped,
     so NO host flag reset / rendezvous. Always returns ``(output, d_topk_w)`` (``d_topk_w`` is None in
@@ -617,10 +618,9 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
         raise ValueError("x_fp8 and x_fp8_rowwise are mutually exclusive")
     if with_gate:
         assert x_fp8_rowwise is not None, "backward STEP3 requires pre-quantized grad_l1 via x_fp8_rowwise"
-        assert x is not None
         aq, a_sp = x_fp8_rowwise
-        M, K = x.shape  # K = 2I for fc1^T dgrad
-        dev = x.device
+        M, K = aq.shape  # K = 2I for fc1^T dgrad
+        dev = aq.device
     else:
         assert x_fp8 is not None, "forward L2 requires pre-quantized activation via x_fp8"
         aq, a_sp = x_fp8
