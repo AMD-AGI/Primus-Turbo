@@ -39,10 +39,8 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8,
 )
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
-from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (
-    colwise_grouped_meta,
-    rowcol_dual_quant_mxfp8_grouped_flydsl,
-)
+from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import colwise_grouped_meta
+from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
@@ -139,13 +137,12 @@ def profile(group, args):
     group_lens = handle[_H_GROUP_LENS]
     group_offs = handle[_H_GROUP_OFFS]
     meta = colwise_grouped_meta(group_lens, group_offs)
-    gl1_q_row, gl1_a_sp, _, _ = rowcol_dual_quant_mxfp8_grouped_flydsl(
-        grad_l1, _DW_FP8_FORMAT, meta=meta,
-    )
+    gl1_q_row, gl1_a_sp = quantize_rowwise_mxfp8_flydsl(grad_l1, preshuffle=True)
     w1tf = _w1t_combine_fp8_cached(W1)
     rowwise = (gl1_q_row, gl1_a_sp)
     tki = topk_idx.contiguous().view(-1)
     combine_cu = getattr(args, "combine_cu", 28)
+    combine_slots = symm.combine_slots
 
     def _step3():
         return grouped_gemm_combine_mxfp8_flydsl_kernel(
@@ -155,7 +152,11 @@ def profile(group, args):
 
     dx, grad_topk_weights = _step3()
     dx_ok = tuple(dx.shape) == (T, H) and bool(torch.isfinite(dx.float()).all())
-    dtw_ok = tuple(grad_topk_weights.shape) == (T, K) and bool(torch.isfinite(grad_topk_weights.float()).all())
+    dtw_ok = (
+        grad_topk_weights is not None
+        and tuple(grad_topk_weights.shape) == (combine_slots,)
+        and bool(torch.isfinite(grad_topk_weights.float()).all())
+    )
     dx_norm = float(dx.float().norm())
 
     t_step3 = _bench(_step3, warmup=args.warmup, iters=args.iters, group=group)

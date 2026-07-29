@@ -631,7 +631,8 @@ def profile_fc1_dgrad_combine(group, args, mode):
     group_lens = handle[_H_GROUP_LENS]
     group_offs = handle[_H_GROUP_OFFS]
     meta = colwise_grouped_meta(group_lens, group_offs)
-    gl1_q_row, gl1_a_sp, _, _ = rowcol_dual_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=meta)
+    from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
+    gl1_q_row, gl1_a_sp = quantize_rowwise_mxfp8_flydsl(grad_l1, preshuffle=True)
     grad_l1_rowwise = (gl1_q_row, gl1_a_sp)
 
     w1t_fp8 = prepare_w2_fp8(W1.transpose(1, 2).contiguous())  # w1^T fp8 prep (static weight, once)

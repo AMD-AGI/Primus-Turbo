@@ -17,6 +17,9 @@ Backward (conjugate via the Dispatch<->Combine duality; L2 = fc2, L1 = fc1, as i
   * SwiGLU^T (bf16), re-inject routing weight, gate grad, act_weighted (dW2 b-operand).
   * dW2   variable-K wgrad (MXFP8), a-operand requant-fused from the L2-dgrad fp8 pool.
   * STEP3: fc1 dgrad + combine + reduce (fused) -> dx; then dW1 variable-K wgrad (serial).
+
+STEP3 and dW1 MUST stay on the default stream back-to-back (no dual-stream overlap).
+``PT_MEGA_BWD_DUAL_STREAM`` and similar hooks are intentionally unsupported.
 """
 
 from typing import Tuple
@@ -25,13 +28,14 @@ import torch
 
 from primus_turbo.flydsl.mega.fp8 import (
     colwise_grouped_meta,
+    colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl,
-    rowcol_dual_quant_mxfp8_grouped_flydsl,
 )
+from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8
 from primus_turbo.pytorch.core.backend import BackendType
@@ -244,10 +248,11 @@ def mega_moe_backward_fp8_impl(
         scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
 
-    # grad_l1 is quantized TWICE downstream: rowwise-preshuffled E4M3 (STEP3 fc1-dgrad A operand) +
-    # colwise-grouped (dW1 `a` operand). Fuse both into ONE read of grad_l1 (byte-exact to the two
-    # shipped kernels): q_row/a_sp feed the combine; q_col/s_col feed dW1. Saves ~0.09ms/backward.
-    gl1_q_row, gl1_a_sp, gl1_q_col, gl1_s_col = rowcol_dual_quant_mxfp8_grouped_flydsl(
+    # grad_l1 -> rowwise (STEP3) + colwise (dW1). Fused dual-quant saves one HBM read but its
+    # post-kernel preshuffle_a_scale costs ~2.6 ms at M=num_max_pool_tokens; split quant is faster
+    # (~0.6 ms total) and matches quantize_rowwise pack=4 a_sp byte-exact.
+    gl1_q_row, gl1_a_sp = quantize_rowwise_mxfp8_flydsl(grad_l1, preshuffle=True)
+    gl1_q_col, gl1_s_col, _, _ = colwise_quant_mxfp8_grouped_flydsl(
         grad_l1, _DW_FP8_FORMAT, meta=meta,
     )
 
@@ -255,7 +260,7 @@ def mega_moe_backward_fp8_impl(
     # the L2-dgrad rowwise-fp8 pool. Run before anything else overwrites symm.pool_fp8.
     dW2 = _mxfp8_variable_k_wgrad(dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs, meta=meta)
 
-    # STEP3: fused fc1 dgrad + combine + reduce -> dx; then dW1 variable-K wgrad (serial).
+    # STEP3 then dW1 — serial on the default stream (dual-stream overlap forbidden).
     dx, grad_topk_weights = _l1_dgrad_combine_mxfp8_flydsl_kernel(
         w1, group, handle, block_m, block_n,
         grad_l1_rowwise_fp8=(gl1_q_row, gl1_a_sp),

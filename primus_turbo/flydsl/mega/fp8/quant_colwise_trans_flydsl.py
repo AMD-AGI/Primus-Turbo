@@ -45,6 +45,11 @@ from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_reso
 from flydsl.expr.rocdl import cvt_f32_fp8, cvt_pk_bf8_f32, cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.mega.fp8.quant_flydsl import (
+    preshuffle_a_scale,
+    quantize_rowwise_mxfp8_flydsl,
+)
+
 _BLK = 32  # mxfp8 block (M rows per E8M0 scale)
 
 
@@ -560,17 +565,16 @@ def colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
 # grad_l1 [P, F] bf16 is needed BOTH rowwise-preshuffled (E4M3, STEP3 fc1-dgrad) and colwise-grouped
 # (E5M2, dW1 wgrad). Reading it twice (the two shipped kernels) costs an extra HBM read; this fuses
 # both from ONE read via a 32xBT bf16 tile staged in LDS -> colwise reads down columns, rowwise reads
-# across each 32-feature block. Byte-exact to `quantize_rowwise_mxfp8_flydsl(preshuffle=True)` (rowwise
-# half, always E4M3) + `colwise_quant_mxfp8_grouped_flydsl` (colwise half).
+# across each 32-feature block. Rowwise ``q`` matches ``quantize_rowwise_mxfp8_flydsl``;
+# raw E8M0 lands in ``s_raw`` then ``preshuffle_a_scale`` (pack=4) for GEMM ``a_sp``.
 
 
 @functools.lru_cache(maxsize=64)
 def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
-    from primus_turbo.flydsl.mega.fp8.quant_flydsl import _e8m0_broadcast_i32, _preshuffle_a_idx
     assert F % BT == 0 and BT % _BLK == 0
     blk_i32 = _BLK // 4
     n_ftile = F // BT
-    K128 = F // 128
+    n_blk = F // _BLK
     TILE = _BLK * BT                       # LDS f32-as-i32 tile [32 rows][BT cols]
     # colwise (out) params
     c_max = 57344.0 if is_e5m2_col else 448.0
@@ -591,7 +595,7 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
 
     @flyc.kernel(known_block_size=[BT, 1, 1])
     def kern(
-        X: fx.Tensor, QC: fx.Tensor, SC: fx.Tensor, QR: fx.Tensor, ASP: fx.Tensor,
+        X: fx.Tensor, QC: fx.Tensor, SC: fx.Tensor, QR: fx.Tensor, SRAW: fx.Tensor,
         BLK2GRP: fx.Tensor, LENS: fx.Tensor, OFFS: fx.Tensor, OFFS_PC: fx.Tensor,
         mpad_i32: fx.Int32, npblk: fx.Int32,
     ):
@@ -607,7 +611,7 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
         qcr = create_buffer_resource(QC, max_size=True)
         scr = create_buffer_resource(SC, max_size=True)
         qrr = create_buffer_resource(QR, max_size=True)     # rowwise fp8 [P, F] int8 view
-        aspr = create_buffer_resource(ASP, max_size=True)   # rowwise preshuffled scale i32
+        srr = create_buffer_resource(SRAW, max_size=True)   # raw E8M0 rowwise [P, F//32] uint8
         b2g = create_buffer_resource(BLK2GRP, max_size=True)
         lr = create_buffer_resource(LENS, max_size=True)
         ofr = create_buffer_resource(OFFS, max_size=True)
@@ -666,9 +670,8 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
 
         fx.gpu.barrier()
 
-        # ── rowwise (E4M3, preshuffled scale; byte-exact to quantize_rowwise_mxfp8_flydsl) ──
-        # Phase A: each thread computes ONE (row, fblk) block's E8M0 scale (no per-lane redundancy):
-        #   block index = tid = rowA*NB + fblkA; amax over its 32 features -> LDS rscale + a_sp.
+        # ── rowwise (E4M3 + raw E8M0; a_sp pack-4 preshuffle done on host after launch) ──
+        # Phase A: each thread computes ONE (row, fblk) block's E8M0 scale -> LDS rscale + s_raw.
         rowA = tid // fx.Int32(NB)
         fblkA = tid % fx.Int32(NB)
         m_localA = fx.arith.ArithValue(m_local0) + fx.arith.ArithValue(rowA)
@@ -691,8 +694,8 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
         if realA:
             global_rowA = fx.arith.ArithValue(in_off_g) + m_localA
             global_fblkA = ftile * fx.Int32(NB) + fblkA
-            buffer_store(_e8m0_broadcast_i32(biasedA), aspr,
-                         _preshuffle_a_idx(global_rowA, global_fblkA, K128))
+            buffer_store(fx.arith.ArithValue(biasedA).trunci(fx.T.i8()), srr,
+                         global_rowA * fx.Int32(n_blk) + global_fblkA)
         fx.gpu.barrier()
 
         # Phase B: each thread quantizes its column's 32 values with the shared block scale.
@@ -717,9 +720,9 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
                              global_row * fx.Int32(F) + f)
 
     @flyc.jit
-    def launch(X, QC, SC, QR, ASP, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_pblk,
+    def launch(X, QC, SC, QR, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_pblk,
                stream: fx.Stream = fx.Stream(None)):
-        kern(X, QC, SC, QR, ASP, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk).launch(
+        kern(X, QC, SC, QR, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk).launch(
             grid=(n_pblk * n_ftile, 1, 1), block=(BT, 1, 1), stream=stream)
 
     return launch
@@ -742,17 +745,24 @@ def rowcol_dual_quant_mxfp8_grouped_flydsl(
     if meta is None:
         meta = colwise_grouped_meta(group_lens, group_offs)
     total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
-    K128 = F // 128
+    n_blk = F // _BLK
     q_col = torch.empty((F, total_M_pad), dtype=out_dtype_col, device=x.device)
     s_col = torch.empty((F, n_pblk), dtype=torch.uint8, device=x.device)
     q_row = torch.empty((M, F), dtype=torch.float8_e4m3fn, device=x.device)
-    a_ngrp = (M + 63) // 64
-    a_sp = torch.zeros(a_ngrp * K128 * 256, dtype=torch.int32, device=x.device)
+    s_raw = torch.zeros((M, n_blk), dtype=torch.uint8, device=x.device)
     while F % BT != 0:
         BT //= 2
     _compile_rowcol_dual_grouped(F, is_e5m2_col, BT)(
-        x, q_col, s_col, q_row.view(torch.int8), a_sp,
+        x, q_col, s_col, q_row.view(torch.int8), s_raw,
         meta["blk2grp"], meta["lens"], meta["offs32"], meta["offs_pc"],
         total_M_pad // 4, n_pblk, n_pblk,
     )
+    # Symm pool slack (rows beyond block_m-padded group_offs[-1]): grouped kernel skips them;
+    # fill q_row + s_raw so STEP3's [M=num_max_pool_tokens] GEMM view matches standalone quant.
+    m_pool = int(meta["offs32"][-1].item())
+    if m_pool < M:
+        q_slack, s_slack = quantize_rowwise_mxfp8_flydsl(x[m_pool:].contiguous(), preshuffle=False)
+        q_row[m_pool:].copy_(q_slack)
+        s_raw[m_pool:].copy_(s_slack)
+    a_sp = preshuffle_a_scale(s_raw, M, F)
     return q_row, a_sp, q_col, s_col

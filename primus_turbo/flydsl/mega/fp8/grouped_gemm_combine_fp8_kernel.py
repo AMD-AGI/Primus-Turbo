@@ -85,6 +85,9 @@ _COMBINE_GROUP_N = int(os.environ.get("PT_COMBINE_GROUP_N", "0"))
 _COMBINE_TILE_SWIZZLE = _COMBINE_NUM_XCD > 1 or _COMBINE_GROUP_M > 0 or _COMBINE_GROUP_N > 0
 # Launch only real_tiles*n_blocks GEMM blocks (+ separate tail-reduce reservation), not worst_case.
 _COMBINE_REAL_TILES_GRID = os.environ.get("PT_COMBINE_REAL_TILES_GRID", "1") != "0"
+# backward STEP3: optional split GEMM+push from reduce (host barrier between). Off by default
+# after rowwise-quant fix; enable with PT_COMBINE_SPLIT_REDUCE=1 if co-scheduling races return.
+_SPLIT_BWD_REDUCE = os.environ.get("PT_COMBINE_SPLIT_REDUCE", "0") == "1"
 
 
 @functools.lru_cache(maxsize=4)
@@ -202,6 +205,11 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
 
         token = global_warp_id
         while token < num_tokens:
+            valid = []
+            for jj in fx.range_constexpr(topk):
+                slot = token * fx.Int32(topk) + fx.Int32(jj)
+                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+                valid.append((topk_index >= fx.Int64(0)) & (topk_index < fx.Int64(num_experts)))
             for jj in fx.range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(jj)
                 topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
@@ -219,6 +227,7 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                                 flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
             _wait_mem()
 
+            zero_vec = fx.arith.constant_vector(0.0, f32_v4)
             for k in fx.range_constexpr(words_per_lane):
                 w = lane + fx.Int32(k * _WARP)
                 sword_idx = w // fx.Int32(32)
@@ -241,6 +250,7 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                     hi = cvt_pk_f32_fp8(res=_v2, src=pw, word_sel=True)
                     deq = _vector.shuffle(lo, hi, [0, 1, 2, 3])
                     term = fx.arith.mulf(deq, _vector.broadcast(f32_v4, fx.arith._to_raw(coef)))
+                    term = fx.arith.select(valid[jj], term, zero_vec)
                     acc = fx.arith.addf(acc, term)
                 buffer_store(fx.arith.trunc_f(bf16_v4, acc), output_res, token * fx.Int32(hidden) + w * fx.Int32(4))
 
@@ -273,6 +283,7 @@ def _compile(
     persistent_gemm=_COMBINE_PERSISTENT_GEMM, num_persistent_cu=_COMBINE_GEMM_CU,
     num_xcd=_COMBINE_NUM_XCD, group_m=_COMBINE_GROUP_M, group_n=_COMBINE_GROUP_N,
     tile_swizzle=_COMBINE_TILE_SWIZZLE,
+    force_no_reduce=False,
 ):
     """Unified fp8 combine: mxfp8 GEMM (CShuffle mxfp8-quant epilogue -> local fp8 pool) + FP8 combine
     PUSH (+ optional gate scatter) + fp8-dequant top-k reduce. One kernel for BOTH:
@@ -312,7 +323,7 @@ def _compile(
     H4 = out_features // 4
     SC = out_features // 128
     payload_i32_total = combine_slots * H4
-    _no_reduce = os.environ.get("PT_COMBINE_NO_REDUCE", "0") == "1"
+    _env_no_reduce = os.environ.get("PT_COMBINE_NO_REDUCE", "0") == "1"
     # PT_COMBINE_GEMM_ONLY (isolation): combine PUSH does 0 tiles + reduce compiled out -> the kernel
     # runs ONLY the mxfp8 fc1-dgrad GEMM role (+ CShuffle fp8 epilogue). Measures the GEMM-role wall
     # (no cross-rank comm, no reduce) -> INCORRECT output, timing only.
@@ -321,7 +332,7 @@ def _compile(
     # reduce idle), so it just XGMI-copies whatever's in the local fp8 L2Y to the peer comb + flags.
     # Measures the combine-PUSH wall (cross-rank byte cost) -> INCORRECT output, timing only.
     _push_only = os.environ.get("PT_COMBINE_PUSH_ONLY", "0") == "1"
-    _no_reduce = _no_reduce or _gemm_only or _push_only
+    _no_reduce = force_no_reduce or _env_no_reduce or _gemm_only or _push_only
     reduce_fp8 = _make_topk_reduce_fp8(out_features, topk, combine_slots, apply_weights, with_gate)
     # Tail-reduce reservation when pool capacity exceeds real tiles (worst_case > real_tiles).
     max_tail_blocks = (worst_case_tiles - 1) * n_blocks
@@ -575,6 +586,64 @@ def _compile(
     return launch
 
 
+@functools.lru_cache(maxsize=32)
+def _compile_reduce_only(
+    out_features, combine_slots, topk, num_experts, rank, num_ranks,
+    apply_weights, with_gate, reduce_blocks,
+):
+    """Standalone fp8 topk reduce (+ optional gate fold) for split backward STEP3."""
+    reduce_fp8 = _make_topk_reduce_fp8(out_features, topk, combine_slots, apply_weights, with_gate)
+    comb_records = combine_slots * out_features * 2
+    gate_records = combine_slots * 4
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def reduce_kern(
+        OUTPUT: fx.Tensor, TOPK_INDICES: fx.Tensor, NUM_TOKENS_PER_RANK: fx.Tensor,
+        TOPK_WEIGHTS: fx.Tensor, GRAD_GATE: fx.Tensor, D_TOPK_W: fx.Tensor,
+        COMBINE_PARITY: fx.Tensor, REDUCE_EXPECTED: fx.Tensor, sym_layout: SymLayout,
+    ):
+        thread_index = fx.thread_idx.x
+        block_index, _b, _c = fx.block_idx
+        combine_parity_res = create_buffer_resource(COMBINE_PARITY, max_size=True)
+        reduce_expected_res = create_buffer_resource(REDUCE_EXPECTED, max_size=True)
+        parity = cast(
+            buffer_load(combine_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
+        )
+        reduce_bank = parity * fx.Int32(combine_slots)
+        expected_reduce = buffer_load(reduce_expected_res, parity, vec_width=1, dtype=fx.T.i64())
+        reduce_flag_base = sym_layout.reduce_flag_ptr
+        comb_base = sym_layout.comb_ptr
+        gate_base = sym_layout.combine_gate_ptr
+        gate_local_res = create_buffer_resource_from_addr(gate_base, num_records_bytes=gate_records)
+        output_res = create_buffer_resource(OUTPUT, max_size=True)
+        topk_indices_res = create_buffer_resource(TOPK_INDICES, max_size=True)
+        num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
+        topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
+        grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True)
+        d_topk_w_res = create_buffer_resource(D_TOPK_W, max_size=True)
+        reduce_fp8(
+            thread_index, block_index, fx.Int32(reduce_blocks),
+            num_experts, rank, comb_base, comb_records, output_res, topk_indices_res,
+            num_tokens_res, reduce_flag_base, reduce_bank, expected_reduce,
+            topk_weights_res, gate_local_res, d_topk_w_res,
+        )
+
+    @flyc.jit
+    def launch_reduce(
+        OUTPUT, TOPK_INDICES, NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, GRAD_GATE, D_TOPK_W,
+        COMBINE_PARITY, REDUCE_EXPECTED, sym_layout,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        reduce_kern(
+            OUTPUT, TOPK_INDICES, NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, GRAD_GATE, D_TOPK_W,
+            COMBINE_PARITY, REDUCE_EXPECTED, sym_layout,
+        ).launch(grid=(reduce_blocks, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
+
+    return launch_reduce
+
+
+_FP8_REDUCE_ONLY_COMPILED: dict = {}
+
 _L2Y_FP8_SCRATCH: dict = {}
 
 
@@ -672,31 +741,84 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     )
 
     def _run_with_cu(cu: int) -> None:
+        stream = torch.cuda.current_stream()
+        gemm_push_args = (
+            act_flat, weight_flat, l2y_fp8, l2y_scale, tile_to_expert, num_tile_blocks, output.view(-1),
+            topk_indices_d, symm.num_tokens_per_rank, topk_weights_arg, grad_gate_arg, d_topk_w, a_sp, b_sp,
+            symm._combine_parity, symm._combine_expected, symm._reduce_expected,
+            sym_layout, out_features, real_tiles_host, tail_blocks_host, stream,
+        )
+        use_split = with_gate and _SPLIT_BWD_REDUCE and not any(
+            os.environ.get(k, "0") == "1"
+            for k in ("PT_COMBINE_GEMM_ONLY", "PT_COMBINE_PUSH_ONLY", "PT_COMBINE_NO_REDUCE")
+        )
+
+        if use_split:
+            launch_gp = _compile(
+                out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
+                int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks),
+                apply_weights, with_gate, num_groups=int(G), force_no_reduce=True,
+            )
+            gp_ck = (
+                out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
+                int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks), int(G),
+                apply_weights, with_gate, True,
+                _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU, _COMBINE_REAL_TILES_GRID,
+                _COMBINE_PERSISTENT_GEMM, _COMBINE_GEMM_CU, _COMBINE_NUM_XCD, _COMBINE_GROUP_M,
+                _COMBINE_GROUP_N, _COMBINE_TILE_SWIZZLE,
+            )
+            if torch.cuda.is_current_stream_capturing():
+                launch_gp(*gemm_push_args)
+            else:
+                compiled_gp = _FP8_COMBINE_COMPILED.get(gp_ck)
+                if compiled_gp is None:
+                    compiled_gp = flyc.compile(launch_gp, *gemm_push_args)
+                    _FP8_COMBINE_COMPILED[gp_ck] = compiled_gp
+                compiled_gp(*gemm_push_args)
+
+            _host_rendezvous(group)
+
+            reduce_blocks = (num_tokens + _NUM_WARPS - 1) // _NUM_WARPS
+            launch_r = _compile_reduce_only(
+                out_features, int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks),
+                apply_weights, with_gate, reduce_blocks,
+            )
+            reduce_args = (
+                output.view(-1), topk_indices_d, symm.num_tokens_per_rank, topk_weights_arg,
+                grad_gate_arg, d_topk_w, symm._combine_parity, symm._reduce_expected, sym_layout, stream,
+            )
+            r_ck = (out_features, int(combine_slots), int(topk), int(num_experts), int(rank),
+                    int(num_ranks), apply_weights, with_gate, reduce_blocks)
+            if torch.cuda.is_current_stream_capturing():
+                launch_r(*reduce_args)
+            else:
+                compiled_r = _FP8_REDUCE_ONLY_COMPILED.get(r_ck)
+                if compiled_r is None:
+                    compiled_r = flyc.compile(launch_r, *reduce_args)
+                    _FP8_REDUCE_ONLY_COMPILED[r_ck] = compiled_r
+                compiled_r(*reduce_args)
+            return
+
         launch = _compile(
             out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
             int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks),
             apply_weights, with_gate, num_groups=int(G),
         )
-        args = (
-            act_flat, weight_flat, l2y_fp8, l2y_scale, tile_to_expert, num_tile_blocks, output.view(-1),
-            topk_indices_d, symm.num_tokens_per_rank, topk_weights_arg, grad_gate_arg, d_topk_w, a_sp, b_sp,
-            symm._combine_parity, symm._combine_expected, symm._reduce_expected,
-            sym_layout, out_features, real_tiles_host, tail_blocks_host, torch.cuda.current_stream(),
-        )
         ck = (out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
               int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks), int(G),
-              apply_weights, with_gate, _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU,
+              apply_weights, with_gate, False,
+              _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU,
               _COMBINE_REAL_TILES_GRID,
               _COMBINE_PERSISTENT_GEMM, _COMBINE_GEMM_CU, _COMBINE_NUM_XCD, _COMBINE_GROUP_M, _COMBINE_GROUP_N,
               _COMBINE_TILE_SWIZZLE)
         if torch.cuda.is_current_stream_capturing():
-            launch(*args)
+            launch(*gemm_push_args)
         else:
             compiled = _FP8_COMBINE_COMPILED.get(ck)
             if compiled is None:
-                compiled = flyc.compile(launch, *args)
+                compiled = flyc.compile(launch, *gemm_push_args)
                 _FP8_COMBINE_COMPILED[ck] = compiled
-            compiled(*args)
+            compiled(*gemm_push_args)
 
     cu = resolve_num_combine_cu(
         key=autotune_key,
