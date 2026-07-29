@@ -47,7 +47,10 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
     _grouped_block_mn,
+    _lds_load1_i32,
+    _lds_store1_i32,
     _load_go,
+    _tree_add_i32,
     _wgrad_block_mn,
 )
 
@@ -422,6 +425,8 @@ def _build_grouped_mxfp8_nt_kernel(
     }
     if store_cshuffle:  # only allocate the staging region when the CShuffle epilogue is used
         _ss_anns["C_lds_shuffle"] = fx.Array[_cshuf_ty, _cshuf_n, 16]
+    # tile-count prefix [0, G] followed by A-scale slab prefix [G+1, 2G+1] (see the scan).
+    _ss_anns["gfind_lds"] = fx.Array[fx.Int32, 2 * (G + 1), 16]
     SharedStorage = fx.struct(type("SharedStorage", (), {"__annotations__": _ss_anns}))
 
     @flyc.kernel(known_block_size=[512, 1, 1])
@@ -445,13 +450,26 @@ def _build_grouped_mxfp8_nt_kernel(
         go_out = fx.rocdl.make_buffer_tensor(group_offs_out, max_size=False, num_records_bytes=(G + 1) * 8)
         go_out_div = fx.logical_divide(go_out, fx.make_layout(1, 1))
 
-        # total_tiles on-device (O(G) scan over TIGHT sizes; no host read).
-        total_tiles = fx.Int32(0)
+        # One on-device O(G) scan (no host read): _tcs[g] = tiles owned by groups < g
+        # (TIGHT sizes), _sas[g] = 64-row A-scale slabs before group g (PADDED sizes).
+        # total_tiles = _tcs[G]. Only _tcs is pinned to SGPRs (the boundary compares need
+        # it); both prefixes are parked in LDS below so the per-tile lookup is one ds_read.
+        _tcs = [fx.Int32(0)]
+        _sas = [fx.Int32(0)]
+        _acc = fx.Int32(0)
+        _sacc = fx.Int32(0)
         prev = _load_go(go_out_div, 0)
+        sprev = _load_go(go_pad_div, 0)
         for g in range_constexpr(G):
             nxt = _load_go(go_out_div, g + 1)
-            total_tiles = total_tiles + ceildiv(nxt - prev, BLOCK_M) * n_blocks
+            snxt = _load_go(go_pad_div, g + 1)
+            _acc = _acc + ceildiv(nxt - prev, BLOCK_M) * n_blocks
+            _sacc = _sacc + ceildiv(snxt - sprev, 64)
+            _tcs.append(_readfirstlane_i32(_acc))
+            _sas.append(_sacc)
             prev = nxt
+            sprev = snxt
+        total_tiles = _tcs[G]
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         pid = fx.block_idx.x
@@ -467,30 +485,24 @@ def _build_grouped_mxfp8_nt_kernel(
                 has_side_effects=True,
             )
 
+        # Park both prefixes in LDS: keeping 2*(G+1) live scalars overflows the SGPR file
+        # and spills, and the per-tile lookup becomes one ds_read instead of a G-wide tree.
+        if fx.thread_idx.x == fx.Int32(0):
+            for g in range_constexpr(G + 1):
+                _lds_store1_i32(lds.gfind_lds.ptr, fx.Int32(g), _tcs[g])
+                _lds_store1_i32(lds.gfind_lds.ptr, fx.Int32(G + 1 + g), _sas[g])
+        rocdl.s_barrier()
+
         def _do_tile(t):
             tt = xcd_remap_pid(t, total_tiles, num_xcd)
-            # tt -> (group_idx, tile_start); the scan also accumulates the group's
-            # 64-row A-scale slab base sa_pre = go_pre[group_idx].
-            cum = fx.Int32(0)
-            group_idx = fx.Int32(0)
-            tile_start = fx.Int32(0)
-            sa_pre = fx.Int32(0)
-            sacc = fx.Int32(0)
-            p2 = _load_go(go_out_div, 0)
-            sp = _load_go(go_pad_div, 0)
-            for g in range_constexpr(G):
-                nx = _load_go(go_out_div, g + 1)
-                tg = ceildiv(nx - p2, BLOCK_M) * n_blocks
-                nc = cum + tg
-                inq = (tt >= cum) & (tt < nc)
-                group_idx = arith.select(inq, fx.Int32(g), group_idx)
-                tile_start = arith.select(inq, cum, tile_start)
-                sa_pre = arith.select(inq, sacc, sa_pre)
-                sn = _load_go(go_pad_div, g + 1)
-                sacc = sacc + ceildiv(sn - sp, 64)
-                cum = nc
-                p2 = nx
-                sp = sn
+            # tt -> owning group: the boundary flags are monotone, so their tree-reduced
+            # sum is the group index (log-G depth, no per-tile buffer_load / select chain).
+            # Its tile base and A-scale slab base are one LDS lookup each.
+            group_idx = _tree_add_i32(
+                [arith.select(tt >= _tcs[g + 1], fx.Int32(1), fx.Int32(0)) for g in range_constexpr(G)]
+            )
+            tile_start = _lds_load1_i32(lds.gfind_lds.ptr, group_idx)
+            sa_pre = _lds_load1_i32(lds.gfind_lds.ptr, group_idx + fx.Int32(G + 1))
 
             m_start = _load_go(go_out_div, group_idx)  # tight C base
             m_end = _load_go(go_out_div, group_idx + 1)  # tight C end (store bound)
@@ -1237,10 +1249,14 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
         def _do_tile(t):
             tt = xcd_remap_pid(t, TOTAL, num_xcd)
-            # interleave=True: band-cyclic group round-robin spreads each group's tiles
-            # across launch order so the HW scheduler balances skewed M_g (one WG/tile).
+            # interleave=False: group-major tile order, i.e. longest-processing-time-first
+            # for the usual histogram (low group ids hold the most tokens), instead of
+            # band-cyclic, which pushes a hot group's later M-bands to the tail of the
+            # launch sequence. num_xcd=1 then leaves consecutive tiles on the HW XCD
+            # round-robin so every XCD gets an even slice of each group; group_m still
+            # keeps the B-stripe L2 reuse inside the band.
             group_idx, block_m, block_n = _wgrad_block_mn(
-                tt, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, True
+                tt, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, False
             )
             m_start = _load_go(go_div, group_idx)
             m_end = _load_go(go_div, group_idx + 1)
@@ -1551,7 +1567,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     a_blocks = a_ngrp * n_kt
     pre_grid = a_blocks + b_ngrp * n_kt
 
-    bm, bn, gm, xcd, gn = 256, 256, 4, 8, 0
+    bm, bn, gm, xcd, gn = 256, 256, 4, 1, 0
     # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
     fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle)
     launch = _GWG_FUSED_CACHE.get(fk)
