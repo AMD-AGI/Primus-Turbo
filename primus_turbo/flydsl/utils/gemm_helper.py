@@ -1084,6 +1084,35 @@ def _robust_time(launch, args, warmup=250, reps=5, iters=50):
     return ts[len(ts) // 2]
 
 
+def _robust_ab_ratio(base, cand, args, warmup=20, reps=5, iters=50):
+    """Median cand/base time ratio, the two timed alternately inside one window.
+
+    Timing the candidates in separate windows lets clock drift pick the winner: whoever
+    runs first is measured on a cooler GPU, and that bias can exceed the adoption margin.
+    Alternating puts both on one clock/temperature trajectory so the ratio cancels it, and
+    the median over `reps` is the majority vote of independent trials. Assumes the caller
+    already ramped to the sustained-load clock."""
+    for _ in range(warmup):
+        base(*args)
+        cand(*args)
+    torch.cuda.synchronize()
+    rs = []
+    for _ in range(reps):
+        ts = []
+        for launch in (base, cand):
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            for _ in range(iters):
+                launch(*args)
+            e1.record()
+            torch.cuda.synchronize()
+            ts.append(e0.elapsed_time(e1))
+        rs.append(ts[1] / ts[0])
+    rs.sort()
+    return rs[len(rs) // 2]
+
+
 # E8M0 scale preshuffle (FlyDSL, LDS-tiled): raw E8M0 [DIM,K//32] -> preshuffled int32.
 # Tile by k: coalesced load of 64 rows x KT cols into LDS, coalesced dwordx4 store of the
 # [KT,64,4] block (wave-lane transpose via LDS, both DRAM sides coalesced). n_tiles=4.

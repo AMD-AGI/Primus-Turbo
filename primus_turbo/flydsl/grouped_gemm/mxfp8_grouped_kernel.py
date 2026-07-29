@@ -37,6 +37,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     scale_opsel,
     _emit_lds_repack,
     _readfirstlane_i32,
+    _robust_ab_ratio,
     _robust_time,
     ceildiv,
     compute_global_swizzle,
@@ -62,8 +63,9 @@ import flydsl.expr.buffer_ops as _buffer_ops
 _BLOCK_N = 256
 _PRESHUF_BLK = 256
 
-# E8M0 scale packing factor for the fwd/dgrad NT path (grouped-only opt-in; the
-# shared gemm_helper defaults to unpacked). wgrad stays unpacked (pack=1).
+# E8M0 scale packing factor for the fwd/dgrad NT path (grouped-only opt-in; the shared
+# gemm_helper defaults to unpacked). 4 is the hardware maximum: scale_opsel feeds the MFMA
+# op_sel field, which selects one of the 4 bytes of a dword.
 _GG_SCALE_PACK = 4
 
 
@@ -124,7 +126,10 @@ def _wgrad_mx_body_4buf(
     constexpr tail index; k is runtime so k%pack can't be an op_sel immediate).
     ``kp0``: this group's packed-scale base (scale k is group-local, see the kernel).
     ``quads``: live (M, N) output halves; 1 drops the padding half's MFMAs and its LDS
-    reads while leaving every g2s, barrier and vmcnt wait in place."""
+    reads while leaving every g2s, barrier and vmcnt wait in place. Dropping the padding
+    half's g2s as well (as the NT kernel does) measured net-negative here: A1 is this
+    pipeline's only distance-1 pool, so losing it also shortens the drain tail and the
+    saved DMAs are paid back as an earlier wait."""
     qm, qn = quads
     k1 = k + 1
     k2 = k + 2
@@ -506,6 +511,7 @@ def _build_grouped_mxfp8_nt_kernel(
             prev = nxt
             sprev = snxt
         total_tiles = _tcs[G]
+        m_total_pad = sprev  # go_pad[G] = the scan's last value
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         pid = fx.block_idx.x
@@ -543,7 +549,6 @@ def _build_grouped_mxfp8_nt_kernel(
             m_start = _load_go(go_out_div, group_idx)  # tight C base
             m_end = _load_go(go_out_div, group_idx + 1)  # tight C end (store bound)
             m_start_pad = _load_go(go_pad_div, group_idx)  # padded A DATA base (32-aligned)
-            m_total_pad = _load_go(go_pad_div, G)
             local = tt - tile_start
             local_block_m, block_n = _grouped_block_mn(
                 local, m_start, m_end, n_blocks, BLOCK_M, group_m, group_n
@@ -618,10 +623,20 @@ def _build_grouped_mxfp8_nt_kernel(
             sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
             sb_base0 = block_n * BLOCK_N + wave_n_offset
 
-            # nq = live N-quadrants: 2 = full tile, 1 = b0 only (b1 half is all padding).
-            # g2s traffic, barriers and vmcnt waits are identical in both bodies, so the
-            # existing wave_m==1 half-barrier pairing and the drain counts stay valid.
+            # nq = live N-quadrants: 2 = full tile, 1 = b0 only (b1 half is all padding, so
+            # its g2s is dropped too and B costs one step per K-iter instead of two).
+            # All four LDS pools run at prefetch distance 2 (K-iter k stages k+2), so a g2s
+            # has a whole K-iter to land instead of A1's old "inside its own iteration".
+            # Each drain leaves one K-iter of issues in flight, minus the first step group:
+            # vmcnt retires out of order, so a tail longer than that shows up as a
+            # repeat-to-repeat race even though issue order alone would allow it (pitfalls/04).
+            _NB_DRAIN = 2 * N_LDS_STEPS_A + N_LDS_STEPS_B
+            _NB_DRAIN_HALF = 2 * N_LDS_STEPS_A
+
             def _body(nq):
+                _full = nq == 2
+                _nd = _NB_DRAIN if _full else _NB_DRAIN_HALF
+
                 a_cur0 = lds.A_lds_cur_0
                 a_cur1 = lds.A_lds_cur_1
                 a_next0 = lds.A_lds_next_0
@@ -633,24 +648,27 @@ def _build_grouped_mxfp8_nt_kernel(
 
                 c00_frag = [mfma.zero_value] * N_ACCUMS
                 c10_frag = [mfma.zero_value] * N_ACCUMS
-                if const_expr(nq == 2):
+                if const_expr(_full):
                     c01_frag = [mfma.zero_value] * N_ACCUMS
                     c11_frag = [mfma.zero_value] * N_ACCUMS
 
                 b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K)
                 a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
-                b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K)
+                if const_expr(_full):
+                    b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K)
                 a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
                 if const_expr(persistent):
                     rocdl.s_barrier()
                 else:
                     if wave_m == 1:
                         rocdl.s_barrier()
-                wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+                wait_barrier(_nd)
                 b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K)
                 a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-                b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
-                wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+                if const_expr(_full):
+                    b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
+                a_g2s.load(a_next1, A1_gl_offset + 1 * BLOCK_K)
+                wait_barrier(_nd)
 
                 sa0 = sa_s2r.load(sa_base0, 0)
                 sa1 = sa_s2r.load(sa_base1, 0)
@@ -668,19 +686,18 @@ def _build_grouped_mxfp8_nt_kernel(
                         sa0n = sa_s2r.load(sa_base0, k + 1)
                     b0_frag = b_s2r.load(b_cur0)
                     a0_frag = a_s2r.load(a_cur0)
-                    a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
+                    if const_expr(_full):
+                        b1_frag = b_s2r.load(b_cur1)  # covered by c00; peak fragments unchanged
                     rocdl.s_barrier()
                     rocdl.s_setprio(1)
                     c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
                     rocdl.s_setprio(0)
                     rocdl.s_barrier()
-                    if const_expr(nq == 2):
-                        b1_frag = b_s2r.load(b_cur1)
                     b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K)
                     if const_expr(_rl):
                         sb_alln = sb_s2r.load(sb_base0, k + 1, slab=group_idx)
                     rocdl.s_barrier()
-                    if const_expr(nq == 2):
+                    if const_expr(_full):
                         rocdl.s_setprio(1)
                         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
                         rocdl.s_setprio(0)
@@ -694,9 +711,13 @@ def _build_grouped_mxfp8_nt_kernel(
                     c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
                     rocdl.s_setprio(0)
                     rocdl.s_barrier()
-                    b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K)
-                    wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
-                    if const_expr(nq == 2):
+                    # Both b1 and a1 LDS halves are read by now, so their k+2 stage issues
+                    # here; the drain below only has to retire the k-1 tail.
+                    if const_expr(_full):
+                        b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K)
+                    a_g2s.load(a_cur1, A1_gl_offset + (k + 2) * BLOCK_K)
+                    wait_barrier(_nd)
+                    if const_expr(_full):
                         rocdl.s_setprio(1)
                         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
                         rocdl.s_setprio(0)
@@ -710,7 +731,8 @@ def _build_grouped_mxfp8_nt_kernel(
                         sb_all = sb_alln
                         sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
-                # Step K_ITERS-2 (prefetch last iter's scales).
+                # Step K_ITERS-2 (prefetch last iter's scales). Distance 2 means every stage
+                # is already issued by now, so both tail steps only read.
                 mfma.opsel = scale_opsel(K_ITERS - 2, _GG_SCALE_PACK)
                 sa0n = sa_s2r.load(sa_base0, K_ITERS - 1)
                 sa1n = sa_s2r.load(sa_base1, K_ITERS - 1)
@@ -722,24 +744,21 @@ def _build_grouped_mxfp8_nt_kernel(
                 c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
-                if const_expr(nq == 2):
+                if const_expr(_full):
                     b1_frag = b_s2r.load(b_cur1)
                 rocdl.s_barrier()
-                if const_expr(nq == 2):
+                if const_expr(_full):
                     rocdl.s_setprio(1)
                     c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
                     rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a1_frag = a_s2r.load(a_cur1)
-                a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
-                b0_frag = b_s2r.load(b_next0)
-                rocdl.s_barrier()
-                if const_expr(nq == 2):
+                if const_expr(_full):
                     rocdl.s_setprio(1)
                     c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
                     rocdl.s_setprio(0)
@@ -752,18 +771,19 @@ def _build_grouped_mxfp8_nt_kernel(
                 sb_all = sb_alln
                 sb0, sb1 = sb_all[0:2], sb_all[2:4]
 
-                # Step K_ITERS-1.
+                # Step K_ITERS-1: last stage was issued one K-iter ago, so drain, then read.
                 mfma.opsel = scale_opsel(K_ITERS - 1, _GG_SCALE_PACK)
-                a0_frag = a_s2r.load(a_cur0)
                 wait_barrier(0)
+                b0_frag = b_s2r.load(b_cur0)
+                a0_frag = a_s2r.load(a_cur0)
                 rocdl.s_setprio(1)
                 c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
-                if const_expr(nq == 2):
+                if const_expr(_full):
                     b1_frag = b_s2r.load(b_cur1)
                 rocdl.s_barrier()
-                if const_expr(nq == 2):
+                if const_expr(_full):
                     rocdl.s_setprio(1)
                     c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
                     rocdl.s_setprio(0)
@@ -772,7 +792,7 @@ def _build_grouped_mxfp8_nt_kernel(
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
-                if const_expr(nq == 2):
+                if const_expr(_full):
                     c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
@@ -781,7 +801,7 @@ def _build_grouped_mxfp8_nt_kernel(
                 base_col = block_n * BLOCK_N + wave_n_offset
                 store_c.store(c00_frag, base_row + 0, base_col + 0)
                 store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-                if const_expr(nq == 2):
+                if const_expr(_full):
                     store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
                     store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
@@ -815,10 +835,15 @@ _GNT_CFG_CACHE: dict = {}  # cfg_key (NO M_pad) -> (bm, gm, xcd, gn) chosen by a
 # keys on the static shape only (cfg_key, no M_pad) and is reused for every M.
 _GNT_NT_DEFAULT_CFG = (256, 4, 4, 0)  # (BLOCK_M, GROUP_M, num_xcd, group_n); cand[0] = base ref
 
-# tokens/group points the race times on (geomean). The swizzle is not M-invariant: a single
-# midpoint mis-picks a cfg that wins there but loses at the range ends, so two spread steady
-# points reward range-robust cfgs (~2.1% worst-case regret vs 3.3%).
-_GNT_PM_CANON = (2048, 8192)
+# (tokens/group, skewed) points the race times on. The swizzle is invariant in neither M nor
+# the token distribution: a single midpoint mis-picks a cfg that wins there but loses at the
+# range ends, and a balanced-only race adopts cfgs that win on even groups yet cost several %
+# on the top-heavy routing real MoE produces. Two points spread both axes.
+_GNT_PM_CANON = ((2048, False), (8192, True))
+# Per-point hysteresis: a candidate must beat the base at EVERY point by this factor. A
+# geomean-only gate hides cfgs that trade one regime for another -- one cfg serves every
+# distribution, since the cfg cache keys on the static shape alone.
+_GNT_AT_MARGIN = 0.985
 
 
 def _gnt_nt_candidates(N):
@@ -853,7 +878,22 @@ def _get_nt_launch(
     cstore_aux=None,
     preshuffle=True,
 ):
-    fk = (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, store_cshuffle, cstore_aux, preshuffle)
+    fk = (
+        K,
+        G,
+        N,
+        bm,
+        gm,
+        xcd,
+        gn,
+        cbsz,
+        blgp,
+        out_fp16,
+        persistent,
+        store_cshuffle,
+        cstore_aux,
+        preshuffle,
+    )
     launch = _GNT_FUSED_CACHE.get(fk)
     if launch is None:
         launch = _compile_grouped_mxfp8_nt_fused(
@@ -876,9 +916,28 @@ def _get_nt_launch(
     return launch
 
 
-def _canon_nt_targs(args, K, G, N, pm):
-    """Synthetic balanced args at `pm` tokens/group (dummy content, only shapes drive timing);
-    reuses the M-independent b-side from `args`. Returns (targs, out_c=numeric-guard ref)."""
+def _canon_go(G, pm, skew, dev):
+    """[G+1] group offsets holding G*pm rows: evenly split, or (skew) a top-heavy power law
+    in BLOCK_M units -- the canonical shape of MoE routing, where a few experts take most of
+    the tokens and the tail groups fall back to row-major tiles."""
+    if not skew:
+        return torch.arange(0, G + 1, dtype=torch.int64, device=dev) * pm
+    nu = G * pm // 256
+    w = [(i + 1) ** -2.0 for i in range(G)]
+    tw = sum(w)
+    u = [max(1, round(nu * x / tw)) for x in w]
+    u[0] += nu - sum(u)
+    offs, acc = [0], 0
+    for x in u:
+        acc += x
+        offs.append(acc * 256)
+    return torch.tensor(offs, dtype=torch.int64, device=dev)
+
+
+def _canon_nt_targs(args, K, G, N, pm, skew):
+    """Synthetic args at `pm` tokens/group (dummy content, only shapes drive timing), groups
+    evenly split or top-heavy per `skew`; reuses the M-independent b-side from `args`.
+    Returns (targs, out_c=numeric-guard ref)."""
     dev = args[2].device
     stream = args[15]
     M_c = G * pm
@@ -893,7 +952,7 @@ def _canon_nt_targs(args, K, G, N, pm):
 
     n_blocks = (N + _BLOCK_N - 1) // _BLOCK_N
     grid_upper_c = ((M_c + 255) // 256 + G) * n_blocks
-    go_c = (torch.arange(0, G + 1, dtype=torch.int64, device=dev) * pm).view(torch.int32)
+    go_c = _canon_go(G, pm, skew, dev).view(torch.int32)
 
     targs = (
         a8_c,
@@ -903,7 +962,7 @@ def _canon_nt_targs(args, K, G, N, pm):
         args[4],  # b_raw (b scales, M-independent)
         a_sp_c,
         b_sp_c,
-        go_c,  # go_pad (balanced, fully packed)
+        go_c,  # go_pad (fully packed)
         go_c,  # go_out (== go_pad)
         M_c,
         a_ngrp_c * 64,
@@ -924,15 +983,15 @@ def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
         return cached
 
     cands = _gnt_nt_candidates(N)
-    # one (targs, out_view) per steady point; candidates scored by geomean over points
-    points = [_canon_nt_targs(args, K, G, N, pm) for pm in _GNT_PM_CANON]
+    # one (targs, out_view) per steady point; candidates scored by their geomean cand/base ratio
+    points = [_canon_nt_targs(args, K, G, N, pm, skew) for pm, skew in _GNT_PM_CANON]
 
     def _geomean(ts):
         return math.exp(sum(math.log(t) for t in ts) / len(ts))
 
     try:
         base = _get_nt_launch(K, G, N, *cands[0], cbsz, blgp, out_fp16, persistent)
-        refs, base_ts = [], []
+        refs = []
         for targs, out_view in points:
             base(*targs)
             torch.cuda.synchronize()
@@ -940,16 +999,16 @@ def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
             if not torch.isfinite(r.reshape(-1)[:1024]).all().item():
                 raise RuntimeError("base cfg produced non-finite output")
             refs.append((r, float((r * r).sum().item()) or 1.0))
-            base_ts.append(_robust_time(base, targs))
-        best_cfg, best_score = cands[0], _geomean(base_ts)
+        _robust_time(base, points[0][0])  # ramp to the sustained-load clock before racing
     except Exception:
         _GNT_CFG_CACHE[cfg_key] = _GNT_NT_DEFAULT_CFG
         return _GNT_NT_DEFAULT_CFG
 
+    best_cfg, best_ratio = cands[0], 1.0
     for cfg in cands[1:]:
         try:
             launch = _get_nt_launch(K, G, N, *cfg, cbsz, blgp, out_fp16, persistent)
-            ts, matched = [], True
+            rs, matched = [], True
             for (targs, out_view), (ref, ref_n) in zip(points, refs):
                 launch(*targs)
                 torch.cuda.synchronize()
@@ -959,14 +1018,16 @@ def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
                 if not ((err / ref_n) < (2e-2**2) and torch.isfinite(o.reshape(-1)[:1024]).all().item()):
                     matched = False
                     break
-                ts.append(_robust_time(launch, targs))
+                rs.append(_robust_ab_ratio(base, launch, targs))
             if not matched:
                 continue
-            score = _geomean(ts)
         except Exception:
             continue
-        if score < best_score * 0.985:  # adopt only if geomean >=1.5% faster than the base
-            best_cfg, best_score = cfg, score
+        # Adopt only a cfg that clears the hysteresis at EVERY point, then keep the fastest
+        # such cfg -- ties keep the earlier candidate, so the fixed list order decides.
+        score = _geomean(rs)
+        if max(rs) < _GNT_AT_MARGIN and score < best_ratio:
+            best_cfg, best_ratio = cfg, score
 
     _GNT_CFG_CACHE[cfg_key] = best_cfg
     return best_cfg
