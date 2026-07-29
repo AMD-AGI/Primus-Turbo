@@ -254,15 +254,23 @@ def colwise_grouped_meta(group_lens: torch.Tensor, group_offs: torch.Tensor):
     n_pblk = total_M_pad // _BLK
     # group id per 32-M block via searchsorted on the block offsets (fixed output size =>
     # no hidden D2H, unlike repeat_interleave which syncs to size its dynamic output).
+    offs32 = group_offs.to(torch.int32)
     blk2grp = (
         torch.searchsorted(
             offs_pc // _BLK, torch.arange(n_pblk, dtype=torch.int32, device=dev), right=True
         )
         - 1
     ).to(torch.int32)
+    grp = blk2grp
+    offs_pc_g = offs_pc[grp]
+    in_off_g = offs32[grp]
+    len_g = lens[grp]
+    m_local0 = torch.arange(n_pblk, dtype=torch.int32, device=dev) * _BLK - offs_pc_g
+    # Per-pmb WG metadata [offs_pc_g, in_off_g, len_g, m_local0] — avoids dependent VMEM chain + barrier.
+    pmb_meta = torch.stack([offs_pc_g, in_off_g, len_g, m_local0], dim=1).contiguous()
     return {
         "lens": lens, "lens_pc": lens_pc, "offs_pc": offs_pc,
-        "offs32": group_offs.to(torch.int32), "blk2grp": blk2grp,
+        "offs32": offs32, "blk2grp": blk2grp, "pmb_meta": pmb_meta,
         "total_M_pad": total_M_pad, "n_pblk": n_pblk,
     }
 
@@ -581,8 +589,7 @@ def _compile_rowcol_dual_pack_grouped(F: int, BT: int = 256):
 
     @flyc.kernel(known_block_size=[BT, 1, 1])
     def pack_kern(
-        ASP: fx.Tensor, SRAW: fx.Tensor,
-        BLK2GRP: fx.Tensor, LENS: fx.Tensor, OFFS: fx.Tensor, OFFS_PC: fx.Tensor,
+        ASP: fx.Tensor, SRAW: fx.Tensor, PMB_META: fx.Tensor,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -591,16 +598,11 @@ def _compile_rowcol_dual_pack_grouped(F: int, BT: int = 256):
 
         aspr = create_buffer_resource(ASP, max_size=True)
         srr = create_buffer_resource(SRAW, max_size=True)
-        b2g = create_buffer_resource(BLK2GRP, max_size=True)
-        lr = create_buffer_resource(LENS, max_size=True)
-        ofr = create_buffer_resource(OFFS, max_size=True)
-        opr = create_buffer_resource(OFFS_PC, max_size=True)
-
-        grp_i = buffer_load(b2g, pmb, vec_width=1, dtype=fx.T.i32())
-        offs_pc_g = buffer_load(opr, grp_i, vec_width=1, dtype=fx.T.i32())
-        in_off_g = buffer_load(ofr, grp_i, vec_width=1, dtype=fx.T.i32())
-        len_g = buffer_load(lr, grp_i, vec_width=1, dtype=fx.T.i32())
-        m_local0 = pmb * fx.Int32(_BLK) - fx.arith.ArithValue(offs_pc_g)
+        pmbr = create_buffer_resource(PMB_META, max_size=True)
+        mb = pmb * fx.Int32(4)
+        in_off_g = buffer_load(pmbr, mb + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
+        len_g = buffer_load(pmbr, mb + fx.Int32(2), vec_width=1, dtype=fx.T.i32())
+        m_local0 = fx.arith.ArithValue(buffer_load(pmbr, mb + fx.Int32(3), vec_width=1, dtype=fx.T.i32()))
 
         flat = tid + pi * BT
         if flat < fx.Int32(n_row_pack_slots):
@@ -621,9 +623,8 @@ def _compile_rowcol_dual_pack_grouped(F: int, BT: int = 256):
                 buffer_store(packed, aspr, _preshuffle_a_pack4_idx(global_row, kkp, g_out, K128p))
 
     @flyc.jit
-    def launch_pack(ASP, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, n_pblk,
-                    stream: fx.Stream = fx.Stream(None)):
-        pack_kern(ASP, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC).launch(
+    def launch_pack(ASP, SRAW, PMB_META, n_pblk, stream: fx.Stream = fx.Stream(None)):
+        pack_kern(ASP, SRAW, PMB_META).launch(
             grid=(n_pblk * n_pack_rounds, 1, 1), block=(BT, 1, 1), stream=stream)
 
     return launch_pack
@@ -653,13 +654,12 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
     class Smem:
         tile: fx.Array[fx.Int32, TILE, 16]   # bf16 value (f32 bitcast to i32) [row*BT + col]
         rscale: fx.Array[fx.Int32, BT, 16]   # rowwise E8M0 biased byte per (row, fblk) = [row*NB + fblk]
-        meta: fx.Array[fx.Int32, 4, 16]      # WG-uniform: grp_i, offs_pc_g, in_off_g, len_g
+        meta: fx.Array[fx.Int32, 3, 16]      # WG-uniform: in_off_g, len_g, m_local0 (from pmb_meta)
 
     @flyc.kernel(known_block_size=[BT, 1, 1])
     def kern(
         X: fx.Tensor, QC: fx.Tensor, SC: fx.Tensor, QR: fx.Tensor, SRAW: fx.Tensor,
-        BLK2GRP: fx.Tensor, LENS: fx.Tensor, OFFS: fx.Tensor, OFFS_PC: fx.Tensor,
-        mpad_i32: fx.Int32, npblk: fx.Int32,
+        PMB_META: fx.Tensor, mpad_i32: fx.Int32, npblk: fx.Int32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -673,10 +673,7 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
         scr = create_buffer_resource(SC, max_size=True)
         qrr = create_buffer_resource(QR, max_size=True)     # rowwise fp8 [P, F] int8 view
         srr = create_buffer_resource(SRAW, max_size=True)   # raw E8M0 staging [P, F//32] uint8
-        b2g = create_buffer_resource(BLK2GRP, max_size=True)
-        lr = create_buffer_resource(LENS, max_size=True)
-        ofr = create_buffer_resource(OFFS, max_size=True)
-        opr = create_buffer_resource(OFFS_PC, max_size=True)
+        pmbr = create_buffer_resource(PMB_META, max_size=True)
         lds = fx.SharedAllocator().allocate(Smem).peek()
         tile = lds.tile
         rscale = lds.rscale
@@ -696,18 +693,15 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
             sv = Vec(fx.make_view(fx.add_offset(meta_lds.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).load())
             return fx.Int32(sv[0])
 
+        mb = pmb * fx.Int32(4)
         if tid == fx.Int32(0):
-            grp_i0 = buffer_load(b2g, pmb, vec_width=1, dtype=fx.T.i32())
-            _meta_store(fx.Int32(0), grp_i0)
-            _meta_store(fx.Int32(1), buffer_load(opr, grp_i0, vec_width=1, dtype=fx.T.i32()))
-            _meta_store(fx.Int32(2), buffer_load(ofr, grp_i0, vec_width=1, dtype=fx.T.i32()))
-            _meta_store(fx.Int32(3), buffer_load(lr, grp_i0, vec_width=1, dtype=fx.T.i32()))
+            _meta_store(fx.Int32(0), buffer_load(pmbr, mb + fx.Int32(1), vec_width=1, dtype=fx.T.i32()))
+            _meta_store(fx.Int32(1), buffer_load(pmbr, mb + fx.Int32(2), vec_width=1, dtype=fx.T.i32()))
+            _meta_store(fx.Int32(2), buffer_load(pmbr, mb + fx.Int32(3), vec_width=1, dtype=fx.T.i32()))
         fx.gpu.barrier()
-        grp_i = _meta_load(fx.Int32(0))
-        offs_pc_g = _meta_load(fx.Int32(1))
-        in_off_g = _meta_load(fx.Int32(2))
-        len_g = _meta_load(fx.Int32(3))
-        m_local0 = pmb * fx.Int32(_BLK) - fx.arith.ArithValue(offs_pc_g)
+        in_off_g = _meta_load(fx.Int32(0))
+        len_g = _meta_load(fx.Int32(1))
+        m_local0 = fx.arith.ArithValue(_meta_load(fx.Int32(2)))
 
         def _lds_store(idx, i32val):
             fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
@@ -788,11 +782,11 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
                              global_row * fx.Int32(F) + f)
 
     @flyc.jit
-    def launch(X, QC, SC, QR, ASP, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_pblk,
+    def launch(X, QC, SC, QR, ASP, SRAW, PMB_META, mpad_i32, npblk, n_pblk,
                stream: fx.Stream = fx.Stream(None)):
-        kern(X, QC, SC, QR, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk).launch(
+        kern(X, QC, SC, QR, SRAW, PMB_META, mpad_i32, npblk).launch(
             grid=(n_pblk * n_ftile, 1, 1), block=(BT, 1, 1), stream=stream)
-        launch_pack(ASP, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, n_pblk, stream=stream)
+        launch_pack(ASP, SRAW, PMB_META, n_pblk, stream=stream)
 
     return launch
 
@@ -813,6 +807,15 @@ def rowcol_dual_quant_mxfp8_grouped_flydsl(
     is_e5m2_col = out_dtype_col == torch.float8_e5m2
     if meta is None:
         meta = colwise_grouped_meta(group_lens, group_offs)
+    elif "pmb_meta" not in meta:
+        dev = meta["lens"].device
+        n_pblk = meta["n_pblk"]
+        grp = meta["blk2grp"]
+        offs_pc_g = meta["offs_pc"][grp]
+        in_off_g = meta["offs32"][grp]
+        len_g = meta["lens"][grp]
+        m_local0 = torch.arange(n_pblk, dtype=torch.int32, device=dev) * _BLK - offs_pc_g
+        meta = {**meta, "pmb_meta": torch.stack([offs_pc_g, in_off_g, len_g, m_local0], dim=1).contiguous()}
     total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
     n_blk = F // _BLK
     K128p = ceildiv(F // 128, 4)
@@ -825,8 +828,7 @@ def rowcol_dual_quant_mxfp8_grouped_flydsl(
     while F % BT != 0:
         BT //= 2
     _compile_rowcol_dual_grouped(F, is_e5m2_col, BT)(
-        x, q_col, s_col, q_row.view(torch.int8), a_sp, s_raw,
-        meta["blk2grp"], meta["lens"], meta["offs32"], meta["offs_pc"],
+        x, q_col, s_col, q_row.view(torch.int8), a_sp, s_raw, meta["pmb_meta"],
         total_M_pad // 4, n_pblk, n_pblk,
     )
     return q_row, a_sp, q_col, s_col
