@@ -191,6 +191,7 @@ class GroupedGEMMFP4KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
         BackendType.TRITON: BackendEntry(GroupedGEMMFP4TritonBackend),
     }
     _cache = TuneCache(1024)
+    _tune_config_name = "grouped_gemm_fp4"  # auto-load configs/pytorch/<arch>/grouped_gemm_fp4.json
 
     @classmethod
     def make_key(
@@ -382,6 +383,7 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         BackendType.TRITON: BackendEntry(GroupedGEMMFP4VariableKTritonBackend),
     }
     _cache = TuneCache(1024)
+    _tune_config_name = "grouped_gemm_fp4_vk"  # auto-load configs/pytorch/<arch>/grouped_gemm_fp4_vk.json
 
     @classmethod
     def make_key(

@@ -532,6 +532,7 @@ class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
         BackendType.FLYDSL: BackendEntry(GroupedGEMMFP8FlyDSLBackend),
     }
     _cache = TuneCache(1024)
+    _tune_config_name = "grouped_gemm_fp8"  # auto-load configs/pytorch/<arch>/grouped_gemm_fp8.json
 
     @classmethod
     def make_key(
@@ -788,6 +789,7 @@ class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         BackendType.FLYDSL: BackendEntry(GroupedGEMMFP8VariableKFlyDSLBackend),
     }
     _cache = TuneCache(1024)
+    _tune_config_name = "grouped_gemm_fp8_vk"  # auto-load configs/pytorch/<arch>/grouped_gemm_fp8_vk.json
 
     @classmethod
     def make_key(

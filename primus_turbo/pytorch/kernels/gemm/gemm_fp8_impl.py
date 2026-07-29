@@ -295,8 +295,8 @@ class GEMMFP8TritonBackend(KernelBackend):
                 trans_c=trans_c,
             )
         elif granularity == ScalingGranularity.BLOCKWISE:
-            # No auto_tune here: searching is tune_config()'s job, and benching during
-            # serving would stall inference and break CUDA graph capture.
+            # No auto_tune here: searching is tune_config()'s job, and benching on the
+            # serving path would stall the first call and break CUDA graph capture.
             return gemm_fp8_blockwise_triton_kernel(
                 a,
                 a_scale_inv,
