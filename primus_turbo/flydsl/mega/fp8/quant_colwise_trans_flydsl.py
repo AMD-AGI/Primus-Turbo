@@ -45,9 +45,10 @@ from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_reso
 from flydsl.expr.rocdl import cvt_f32_fp8, cvt_pk_bf8_f32, cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.mega.fp8.gemm_helper import ceildiv
+
 from primus_turbo.flydsl.mega.fp8.quant_flydsl import (
-    preshuffle_a_scale,
-    quantize_rowwise_mxfp8_flydsl,
+    _preshuffle_a_pack4_idx,
 )
 
 _BLK = 32  # mxfp8 block (M rows per E8M0 scale)
@@ -566,7 +567,66 @@ def colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
 # (E5M2, dW1 wgrad). Reading it twice (the two shipped kernels) costs an extra HBM read; this fuses
 # both from ONE read via a 32xBT bf16 tile staged in LDS -> colwise reads down columns, rowwise reads
 # across each 32-feature block. Rowwise ``q`` matches ``quantize_rowwise_mxfp8_flydsl``;
-# raw E8M0 lands in ``s_raw`` then ``preshuffle_a_scale`` (pack=4) for GEMM ``a_sp``.
+# ``a_sp`` pack=4 fused in-kernel: one workgroup/pool M-block loops all F-tiles then packs (single launch).
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_rowcol_dual_pack_grouped(F: int, BT: int = 256):
+    """Pack=4 a_sp preshuffle for grouped rowcol dual-quant (reads s_raw written by quant kernel)."""
+    n_blk = F // _BLK
+    K128p = ceildiv(F // 128, 4)
+    n_out_pack = K128p * 4
+    n_row_pack_slots = _BLK * n_out_pack
+    n_pack_rounds = (n_row_pack_slots + BT - 1) // BT
+
+    @flyc.kernel(known_block_size=[BT, 1, 1])
+    def pack_kern(
+        ASP: fx.Tensor, SRAW: fx.Tensor,
+        BLK2GRP: fx.Tensor, LENS: fx.Tensor, OFFS: fx.Tensor, OFFS_PC: fx.Tensor,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        pmb = bid // fx.Int32(n_pack_rounds)
+        pi = bid % fx.Int32(n_pack_rounds)
+
+        aspr = create_buffer_resource(ASP, max_size=True)
+        srr = create_buffer_resource(SRAW, max_size=True)
+        b2g = create_buffer_resource(BLK2GRP, max_size=True)
+        lr = create_buffer_resource(LENS, max_size=True)
+        ofr = create_buffer_resource(OFFS, max_size=True)
+        opr = create_buffer_resource(OFFS_PC, max_size=True)
+
+        grp_i = buffer_load(b2g, pmb, vec_width=1, dtype=fx.T.i32())
+        offs_pc_g = buffer_load(opr, grp_i, vec_width=1, dtype=fx.T.i32())
+        in_off_g = buffer_load(ofr, grp_i, vec_width=1, dtype=fx.T.i32())
+        len_g = buffer_load(lr, grp_i, vec_width=1, dtype=fx.T.i32())
+        m_local0 = pmb * fx.Int32(_BLK) - fx.arith.ArithValue(offs_pc_g)
+
+        flat = tid + pi * BT
+        if flat < fx.Int32(n_row_pack_slots):
+            row_i = flat // fx.Int32(n_out_pack)
+            pidx = flat % fx.Int32(n_out_pack)
+            m_local = fx.arith.ArithValue(m_local0) + fx.arith.ArithValue(row_i)
+            if m_local < fx.arith.ArithValue(len_g):
+                global_row = fx.arith.ArithValue(in_off_g) + m_local
+                kkp = pidx // fx.Int32(4)
+                g_out = pidx % fx.Int32(4)
+                packed = fx.Int32(0)
+                for bb in range_constexpr(4):
+                    raw_b = (kkp * fx.Int32(4) + fx.Int32(bb)) * fx.Int32(4) + g_out
+                    scale_byte = buffer_load(
+                        srr, global_row * fx.Int32(n_blk) + raw_b, vec_width=1, dtype=fx.T.i8())
+                    b_i32 = fx.arith.extui(fx.T.i32(), scale_byte)
+                    packed = packed | ((b_i32 & fx.Int32(0xFF)) << (fx.Int32(bb) * fx.Int32(8)))
+                buffer_store(packed, aspr, _preshuffle_a_pack4_idx(global_row, kkp, g_out, K128p))
+
+    @flyc.jit
+    def launch_pack(ASP, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, n_pblk,
+                    stream: fx.Stream = fx.Stream(None)):
+        pack_kern(ASP, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC).launch(
+            grid=(n_pblk * n_pack_rounds, 1, 1), block=(BT, 1, 1), stream=stream)
+
+    return launch_pack
 
 
 @functools.lru_cache(maxsize=64)
@@ -587,11 +647,13 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
     r_target = 8
 
     NB = BT // _BLK                          # 32-feature blocks per tile row
+    launch_pack = _compile_rowcol_dual_pack_grouped(F, BT)
 
     @fx.struct
     class Smem:
         tile: fx.Array[fx.Int32, TILE, 16]   # bf16 value (f32 bitcast to i32) [row*BT + col]
         rscale: fx.Array[fx.Int32, BT, 16]   # rowwise E8M0 biased byte per (row, fblk) = [row*NB + fblk]
+        meta: fx.Array[fx.Int32, 4, 16]      # WG-uniform: grp_i, offs_pc_g, in_off_g, len_g
 
     @flyc.kernel(known_block_size=[BT, 1, 1])
     def kern(
@@ -602,16 +664,15 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         pmb = bid // fx.Int32(n_ftile)
-        ftile = bid % fx.Int32(n_ftile)
-        f = ftile * fx.Int32(BT) + tid          # global feature / output column
-        fblk_local = tid // fx.Int32(_BLK)      # 32-feature block within the tile
-        jj = tid % fx.Int32(_BLK)               # feature within its 32-block
+        ftile_i = bid % fx.Int32(n_ftile)
+        f = ftile_i * fx.Int32(BT) + tid
+        fblk_local = tid // fx.Int32(_BLK)
 
         xr = create_buffer_resource(X, max_size=True)
         qcr = create_buffer_resource(QC, max_size=True)
         scr = create_buffer_resource(SC, max_size=True)
         qrr = create_buffer_resource(QR, max_size=True)     # rowwise fp8 [P, F] int8 view
-        srr = create_buffer_resource(SRAW, max_size=True)   # raw E8M0 rowwise [P, F//32] uint8
+        srr = create_buffer_resource(SRAW, max_size=True)   # raw E8M0 staging [P, F//32] uint8
         b2g = create_buffer_resource(BLK2GRP, max_size=True)
         lr = create_buffer_resource(LENS, max_size=True)
         ofr = create_buffer_resource(OFFS, max_size=True)
@@ -619,6 +680,7 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
         lds = fx.SharedAllocator().allocate(Smem).peek()
         tile = lds.tile
         rscale = lds.rscale
+        meta_lds = lds.meta
 
         c_lo = fx.arith.constant(-c_max, type=fx.T.f32())
         c_hi = fx.arith.constant(c_max, type=fx.T.f32())
@@ -626,10 +688,25 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
         r_hi = fx.arith.constant(448.0, type=fx.T.f32())
         zero_i32 = fx.arith.constant(0, type=fx.T.i32())
 
-        g = buffer_load(b2g, pmb, vec_width=1, dtype=fx.T.i32())
-        offs_pc_g = buffer_load(opr, g, vec_width=1, dtype=fx.T.i32())
-        in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32())
-        len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32())
+        def _meta_store(idx, val):
+            fx.make_view(fx.add_offset(meta_lds.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
+                Vec.from_elements([fx.arith._to_raw(val)], fx.Int32))
+
+        def _meta_load(idx):
+            sv = Vec(fx.make_view(fx.add_offset(meta_lds.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).load())
+            return fx.Int32(sv[0])
+
+        if tid == fx.Int32(0):
+            grp_i0 = buffer_load(b2g, pmb, vec_width=1, dtype=fx.T.i32())
+            _meta_store(fx.Int32(0), grp_i0)
+            _meta_store(fx.Int32(1), buffer_load(opr, grp_i0, vec_width=1, dtype=fx.T.i32()))
+            _meta_store(fx.Int32(2), buffer_load(ofr, grp_i0, vec_width=1, dtype=fx.T.i32()))
+            _meta_store(fx.Int32(3), buffer_load(lr, grp_i0, vec_width=1, dtype=fx.T.i32()))
+        fx.gpu.barrier()
+        grp_i = _meta_load(fx.Int32(0))
+        offs_pc_g = _meta_load(fx.Int32(1))
+        in_off_g = _meta_load(fx.Int32(2))
+        len_g = _meta_load(fx.Int32(3))
         m_local0 = pmb * fx.Int32(_BLK) - fx.arith.ArithValue(offs_pc_g)
 
         def _lds_store(idx, i32val):
@@ -648,7 +725,7 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
             sv = Vec(fx.make_view(fx.add_offset(rscale.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).load())
             return fx.Int32(sv[0])
 
-        # ── load the 32 M-values of this column (padding-masked) + stage to LDS ──
+        # ── load 32 M-values of this column + stage to LDS ──
         vals = []
         for i in range_constexpr(_BLK):
             m_local = fx.arith.ArithValue(m_local0) + fx.Int32(i)
@@ -660,7 +737,7 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
             vals.append(fx.arith._to_raw(fv))
             _lds_store(fx.Int32(i * BT) + tid, fx.arith.ArithValue(fv).bitcast(fx.T.i32()))
 
-        # ── colwise (byte-exact to colwise_quant_mxfp8_grouped_flydsl) ──
+        # ── colwise ──
         words, biased = _e8m0_quant_pack(vals, c_round, c_target, c_lo, c_hi, c_cvt, zero_i32)
         base_i32 = f * fx.arith.ArithValue(mpad_i32) + pmb * fx.Int32(blk_i32)
         buffer_store(Vec.from_elements(words[0:4], fx.Int32).ir_value(), qcr, base_i32)
@@ -670,16 +747,13 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
 
         fx.gpu.barrier()
 
-        # ── rowwise (E4M3 + raw E8M0; a_sp pack-4 preshuffle done on host after launch) ──
-        # Phase A: each thread computes ONE (row, fblk) block's E8M0 scale -> LDS rscale + s_raw.
+        # ── rowwise Phase A: s_raw ──
         rowA = tid // fx.Int32(NB)
         fblkA = tid % fx.Int32(NB)
         m_localA = fx.arith.ArithValue(m_local0) + fx.arith.ArithValue(rowA)
         realA = m_localA < fx.arith.ArithValue(len_g)
         amax = None
         for k in range_constexpr(_BLK):
-            # swizzle the 32-feature read order by lane so a wavefront spreads across LDS banks
-            # (naive k hits bank k for all lanes -> N-way conflict). amax is commutative -> byte-exact.
             koff = (fx.Int32(k) + tid) & fx.Int32(_BLK - 1)
             rv = _lds_f32(rowA * fx.Int32(BT) + fblkA * fx.Int32(_BLK) + koff)
             a = fmath.absf(rv)
@@ -693,25 +767,19 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
         _rs_store(tid, biasedA)
         if realA:
             global_rowA = fx.arith.ArithValue(in_off_g) + m_localA
-            global_fblkA = ftile * fx.Int32(NB) + fblkA
+            global_fblkA = ftile_i * fx.Int32(NB) + fblkA
             buffer_store(fx.arith.ArithValue(biasedA).trunci(fx.T.i8()), srr,
                          global_rowA * fx.Int32(n_blk) + global_fblkA)
         fx.gpu.barrier()
 
-        # Phase B: each thread quantizes its column's 32 values with the shared block scale.
+        # ── rowwise Phase B: q_row ──
         for i in range_constexpr(_BLK):
             m_local = fx.arith.ArithValue(m_local0) + fx.Int32(i)
             real = m_local < fx.arith.ArithValue(len_g)
             if real:
                 biased_r = _rs_load(fx.Int32(i * NB) + fblk_local)
-                # scale = 2^(biased_r-127) is an exact power of two, so 1/scale = 2^(127-biased_r)
-                # = float bits ((254 - biased_r) << 23). Bit-identical to 1.0/scale (IEEE div by
-                # pow2 is exact) but replaces a VALU fdiv sequence with one sub+shift. Valid for
-                # every finite scale (exp<128); exp==128 means amax~2^128 (bf16 overflow, degenerate).
                 inv_bits = (fx.Int32(254) - fx.arith.ArithValue(biased_r)) << fx.Int32(23)
                 inv = fx.arith.ArithValue(inv_bits).bitcast(fx.T.f32())
-                # this thread's own column value is already live in vals[i] (loaded at prologue);
-                # reuse the register instead of a 32nd ds_read/thread round-trip through LDS.
                 q = fmath.clampf(fx.arith.ArithValue(vals[i]) * fx.arith.ArithValue(inv), r_lo, r_hi)
                 wbyte = cvt_pk_fp8_f32(fx.T.i32(), fx.arith._to_raw(q), fx.arith._to_raw(q), zero_i32, False)
                 my_byte = fx.arith.ArithValue(wbyte) & fx.Int32(0xFF)
@@ -720,10 +788,11 @@ def _compile_rowcol_dual_grouped(F: int, is_e5m2_col: bool, BT: int = 256):
                              global_row * fx.Int32(F) + f)
 
     @flyc.jit
-    def launch(X, QC, SC, QR, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_pblk,
+    def launch(X, QC, SC, QR, ASP, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_pblk,
                stream: fx.Stream = fx.Stream(None)):
         kern(X, QC, SC, QR, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk).launch(
             grid=(n_pblk * n_ftile, 1, 1), block=(BT, 1, 1), stream=stream)
+        launch_pack(ASP, SRAW, BLK2GRP, LENS, OFFS, OFFS_PC, n_pblk, stream=stream)
 
     return launch
 
@@ -746,23 +815,18 @@ def rowcol_dual_quant_mxfp8_grouped_flydsl(
         meta = colwise_grouped_meta(group_lens, group_offs)
     total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
     n_blk = F // _BLK
+    K128p = ceildiv(F // 128, 4)
     q_col = torch.empty((F, total_M_pad), dtype=out_dtype_col, device=x.device)
     s_col = torch.empty((F, n_pblk), dtype=torch.uint8, device=x.device)
     q_row = torch.empty((M, F), dtype=torch.float8_e4m3fn, device=x.device)
+    a_ngrp = (M + 63) // 64
+    a_sp = torch.zeros(a_ngrp * K128p * 256, dtype=torch.int32, device=x.device)
     s_raw = torch.zeros((M, n_blk), dtype=torch.uint8, device=x.device)
     while F % BT != 0:
         BT //= 2
     _compile_rowcol_dual_grouped(F, is_e5m2_col, BT)(
-        x, q_col, s_col, q_row.view(torch.int8), s_raw,
+        x, q_col, s_col, q_row.view(torch.int8), a_sp, s_raw,
         meta["blk2grp"], meta["lens"], meta["offs32"], meta["offs_pc"],
         total_M_pad // 4, n_pblk, n_pblk,
     )
-    # Symm pool slack (rows beyond block_m-padded group_offs[-1]): grouped kernel skips them;
-    # fill q_row + s_raw so STEP3's [M=num_max_pool_tokens] GEMM view matches standalone quant.
-    m_pool = int(meta["offs32"][-1].item())
-    if m_pool < M:
-        q_slack, s_slack = quantize_rowwise_mxfp8_flydsl(x[m_pool:].contiguous(), preshuffle=False)
-        q_row[m_pool:].copy_(q_slack)
-        s_raw[m_pool:].copy_(s_slack)
-    a_sp = preshuffle_a_scale(s_raw, M, F)
     return q_row, a_sp, q_col, s_col

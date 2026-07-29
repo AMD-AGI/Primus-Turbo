@@ -28,14 +28,13 @@ import torch
 
 from primus_turbo.flydsl.mega.fp8 import (
     colwise_grouped_meta,
-    colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl,
+    rowcol_dual_quant_mxfp8_grouped_flydsl,
 )
-from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8
 from primus_turbo.pytorch.core.backend import BackendType
@@ -248,11 +247,8 @@ def mega_moe_backward_fp8_impl(
         scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
 
-    # grad_l1 -> rowwise (STEP3) + colwise (dW1). Fused dual-quant saves one HBM read but its
-    # post-kernel preshuffle_a_scale costs ~2.6 ms at M=num_max_pool_tokens; split quant is faster
-    # (~0.6 ms total) and matches quantize_rowwise pack=4 a_sp byte-exact.
-    gl1_q_row, gl1_a_sp = quantize_rowwise_mxfp8_flydsl(grad_l1, preshuffle=True)
-    gl1_q_col, gl1_s_col, _, _ = colwise_quant_mxfp8_grouped_flydsl(
+    # grad_l1 -> rowwise (STEP3) + colwise (dW1) in ONE read; pack=4 a_sp fused in launch().
+    gl1_q_row, gl1_a_sp, gl1_q_col, gl1_s_col = rowcol_dual_quant_mxfp8_grouped_flydsl(
         grad_l1, _DW_FP8_FORMAT, meta=meta,
     )
 

@@ -119,6 +119,15 @@ def _preshuffle_a_idx(dest_row, b, K128):
     return ((grp * fx.Int32(K128) + gk) * fx.Int32(64) + lane) * fx.Int32(4) + s_row
 
 
+def _preshuffle_a_pack4_idx(dest_row, kkp, g, K128p):
+    """ScaleS2R pack=4 slot for row ``dest_row``, packed-K index ``kkp``, micro-group ``g``."""
+    grp = dest_row // fx.Int32(64)
+    s_row = (dest_row % fx.Int32(64)) // fx.Int32(16)
+    r_row = dest_row % fx.Int32(16)
+    lane = g * fx.Int32(16) + r_row
+    return ((grp * fx.Int32(K128p) + kkp) * fx.Int32(64) + lane) * fx.Int32(4) + s_row
+
+
 @functools.lru_cache(maxsize=32)
 def _compile_quant(K: int, BT: int = 256, preshuffle: bool = False):
     assert K % _BLK == 0, f"K={K} must be a multiple of {_BLK}"
