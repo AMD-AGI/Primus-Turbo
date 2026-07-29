@@ -86,6 +86,7 @@ from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     colwise_grouped_meta,
     colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
+    colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
@@ -446,8 +447,8 @@ def profile_fc2_wgrad(group, args, mode):
     group_lens, group_offs = handle[_H_GROUP_LENS], handle[_H_GROUP_OFFS]
     pool_fp8, pool_scale = pool_handle
 
-    def _fp8():  # requant fp8 pool colwise + colwise-quant act -> mxfp8 variable-K wgrad
-        return _mxfp8_variable_k_wgrad(pool_handle, act_weighted, group_lens, group_offs)
+    def _fp8():  # production path: shared meta + dual-launch requant/quant -> mxfp8 wgrad GEMM
+        return _mxfp8_variable_k_wgrad(pool_handle, act_weighted, group_lens, group_offs, meta=meta0)
 
     # BREAKDOWN: pre-quantize both operands ONCE (outside the timed loop) -> time the ISOLATED fp8
     # variable-K GEMM apart from the per-call requant(pool)/quant(act) the FULL fp8 wgrad pays.
@@ -466,6 +467,11 @@ def profile_fc2_wgrad(group, args, mode):
             default_backend=BackendType.FLYDSL.value,
         )
 
+    def _pair():  # dual-launch D: requant(pool)+quant(act), shared meta (matches _mxfp8_variable_k_wgrad)
+        return colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
+            pool_fp8, pool_scale, act_weighted, _DW_FP8_FORMAT, meta=meta0,
+        )
+
     def _req():  # requant the fp8 pool colwise (dW2 `a` operand producer)
         return colwise_requant_mxfp8_grouped_fp8in_flydsl(pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta0)
 
@@ -481,6 +487,7 @@ def profile_fc2_wgrad(group, args, mode):
 
     t_fp8 = _bench_b2b(_fp8, warmup=args.warmup, iters=args.iters, group=group)
     t_gemm = _bench_b2b(_gemm, warmup=args.warmup, iters=args.iters, group=group)
+    t_pair = _bench_b2b(_pair, warmup=args.warmup, iters=args.iters, group=group)
     t_req = _bench_b2b(_req, warmup=args.warmup, iters=args.iters, group=group)
     t_qnt = _bench_b2b(_qnt, warmup=args.warmup, iters=args.iters, group=group)
     t_meta = _bench_b2b(_meta, warmup=args.warmup, iters=args.iters, group=group)
@@ -488,7 +495,7 @@ def profile_fc2_wgrad(group, args, mode):
     flops = 2.0 * m_pad * H * I  # wgrad GEMM: [P,H]^T @ [P,I] -> [H,I] over the pool
     symm.destroy()
     return {"nan": float(nan), "fp8_ms": t_fp8, "gemm_ms": t_gemm,
-            "req_ms": t_req, "qnt_ms": t_qnt, "meta_ms": t_meta, "flops": flops, "m_pad": m_pad}
+            "req_ms": t_req, "qnt_ms": t_qnt, "pair_ms": t_pair, "meta_ms": t_meta, "flops": flops, "m_pad": m_pad}
 
 
 def profile_fc1_wgrad(group, args, mode):
@@ -728,13 +735,15 @@ def worker(local_rank, world, args):
                 nan = _amax(group, r["nan"])
                 fp8_ms = _amax(group, r["fp8_ms"])
                 gemm_ms, req_ms, qnt_ms = _amax(group, r["gemm_ms"]), _amax(group, r["req_ms"]), _amax(group, r["qnt_ms"])
-                meta_ms = _amax(group, r["meta_ms"])
+                pair_ms, meta_ms = _amax(group, r["pair_ms"]), _amax(group, r["meta_ms"])
                 if rank == 0:
                     tf = lambda ms: r["flops"] / (ms * 1e-3) / 1e12
                     print(f"\n{'='*80}\n[mega MoE bwd fc2 wgrad (dW2, variable-K)  fp8]  {hdr}\n{'='*80}")
-                    print(f"  fp8  FULL : {fp8_ms:8.3f} ms | {tf(fp8_ms):8.1f} TFLOPS  (meta+requant+quant+GEMM; M_pool={r['m_pad']})")
-                    print(f"  breakdown: meta={meta_ms:.3f}  requant(pool)={req_ms:.3f}  quant(act)={qnt_ms:.3f}  "
-                          f"GEMM={gemm_ms:.3f} ms ({tf(gemm_ms):.0f} TFLOPS)  [sum={meta_ms + req_ms + qnt_ms + gemm_ms:.3f}]")
+                    print(f"  fp8  FULL : {fp8_ms:8.3f} ms | {tf(fp8_ms):8.1f} TFLOPS  (dual quant+GEMM; meta once/step; M_pool={r['m_pad']})")
+                    print(f"  breakdown: meta(step)={meta_ms:.3f}  dual(requant+quant)={pair_ms:.3f}  "
+                          f"[sep: requant={req_ms:.3f} quant={qnt_ms:.3f}]  "
+                          f"GEMM={gemm_ms:.3f} ms ({tf(gemm_ms):.0f} TFLOPS)  "
+                          f"[sum={pair_ms + gemm_ms:.3f} excl meta]")
                     print(f"  [acc] dW2 fp8 finite={not bool(nan >= 1.0)}  "
                           f"(fp8-vs-bf16 SNR -> e2e gradcheck; bf16 ref -> bench_mega_moe_bf16.py)")
                 torch.cuda.synchronize(); group.barrier()

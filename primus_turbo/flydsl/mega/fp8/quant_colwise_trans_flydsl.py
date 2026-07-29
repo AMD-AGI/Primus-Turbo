@@ -484,6 +484,78 @@ def colwise_requant_mxfp8_grouped_fp8in_flydsl(
     return q, s, meta["lens_pc"], meta["offs_pc"]
 
 
+# ── dW2 dual-launch: fp8-in pool requant (a) + bf16 act colwise-quant (b) ────────────────────
+# Independent grids (requant ``n_mwg*(H/BT)`` heavy + quant ``n_pblk*(I/BT)`` light LDS=0), same
+# ``meta``, back-to-back on one stream.  Byte-exact to the two shipped kernels; avoids the
+# single-WG serial-tail fusion that held 36KB LDS through the act phase.
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_dw2_colwise_dual_launch(
+    F_a: int, F_b: int, is_e5m2_out: bool, BT_a: int, BT_b: int, MB: int,
+):
+    """Return a launch closure that dispatches requant then quant on the same stream."""
+    launch_a = _compile_colwise_requant_grouped_fp8in(F_a, is_e5m2_out, BT_a, MB)
+    launch_b = _compile_colwise_quant_grouped(F_b, is_e5m2_out, BT_b)
+
+    def launch(
+        XQ, XS, QA, SA, XB, QB, SB,
+        BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_mwg,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        launch_a(
+            XQ, XS, QA, SA, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_mwg, stream=stream,
+        )
+        launch_b(
+            XB, QB, SB, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, npblk, stream=stream,
+        )
+
+    return launch
+
+
+def colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
+    q_in: torch.Tensor, s_in: torch.Tensor, x_bf16: torch.Tensor, out_dtype: torch.dtype,
+    group_lens: torch.Tensor = None, group_offs: torch.Tensor = None,
+    meta: dict = None, BT: int = 256,
+):
+    """dW2 colwise operands: pool rowwise-fp8 requant (a) + bf16 act quant (b), dual-launch.
+
+    Uses two independent kernels (heavy requant grid + light quant grid) on one stream with
+    shared ``meta``.  Returns ``(a_t, a_ts, b_t, b_ts, lens_pc, offs_pc)`` -- byte-exact to
+    ``colwise_requant_mxfp8_grouped_fp8in_flydsl`` +
+    ``colwise_quant_mxfp8_grouped_flydsl``."""
+    assert q_in.dim() == 2 and s_in.dim() == 2 and x_bf16.dim() == 2
+    assert x_bf16.dtype == torch.bfloat16
+    M, F_a = q_in.shape
+    M_b, F_b = x_bf16.shape
+    assert M == M_b, f"pool rows {M} != act rows {M_b}"
+    assert s_in.shape[1] == F_a // _BLK
+    is_e5m2_out = out_dtype == torch.float8_e5m2
+    if meta is None:
+        meta = colwise_grouped_meta(group_lens, group_offs)
+    total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
+    q_a = torch.empty((F_a, total_M_pad), dtype=out_dtype, device=q_in.device)
+    s_a = torch.empty((F_a, n_pblk), dtype=torch.uint8, device=q_in.device)
+    q_b = torch.empty((F_b, total_M_pad), dtype=out_dtype, device=q_in.device)
+    s_b = torch.empty((F_b, n_pblk), dtype=torch.uint8, device=q_in.device)
+    BT_a = BT
+    while F_a % BT_a != 0:
+        BT_a //= 2
+    BT_b = BT
+    while F_b % BT_b != 0:
+        BT_b //= 2
+    MB = 4 if n_pblk % 4 == 0 else (2 if n_pblk % 2 == 0 else 1)
+    n_mwg = n_pblk // MB
+    x_bf16 = x_bf16.contiguous()
+    _compile_dw2_colwise_dual_launch(F_a, F_b, is_e5m2_out, BT_a, BT_b, MB)(
+        q_in.view(torch.uint8), s_in.contiguous().view(torch.uint8), q_a, s_a,
+        x_bf16, q_b, s_b,
+        meta["blk2grp"], meta["lens"], meta["offs32"], meta["offs_pc"],
+        total_M_pad // 4, n_pblk, n_mwg,
+    )
+    return q_a, s_a, q_b, s_b, meta["lens_pc"], meta["offs_pc"]
+
+
 # ── FUSED rowwise + colwise dual-quant (one read of grad_l1 -> both operands) ─────────────────
 # grad_l1 [P, F] bf16 is needed BOTH rowwise-preshuffled (E4M3, STEP3 fc1-dgrad) and colwise-grouped
 # (E5M2, dW1 wgrad). Reading it twice (the two shipped kernels) costs an extra HBM read; this fuses

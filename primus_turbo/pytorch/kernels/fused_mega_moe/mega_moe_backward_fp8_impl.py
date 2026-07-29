@@ -25,8 +25,7 @@ import torch
 
 from primus_turbo.flydsl.mega.fp8 import (
     colwise_grouped_meta,
-    colwise_quant_mxfp8_grouped_flydsl,
-    colwise_requant_mxfp8_grouped_fp8in_flydsl,
+    colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl,
@@ -151,16 +150,17 @@ def _mxfp8_variable_k_wgrad(a_fp8, b_bf16, group_lens, group_offs, meta=None):
     L2 (fc2) weight grad: ``a`` = the L2-dgrad dispatched-dy pool ``(pool_fp8 [P,H], pool_scale [P,H//32])`` (the
     ``dispatch_l2_grad`` operand, native rowwise-fp8) -- requant COLWISE DIRECTLY from fp8 (fused
     dequant->requant, no bf16 round-trip, LDS-transposed coalesced write); ``b`` = ``act_weighted``
-    (bf16, from ``swiglu_backward``) -- colwise-quantized. Both emit only the transposed operand
+    (bf16, from ``swiglu_backward``) -- colwise-quantized. Both are produced by
+    ``colwise_requant_fp8in_and_quant_bf16_grouped_flydsl`` (dual-launch: independent requant +
+    quant grids, shared ``meta``, one stream). Both emit only the transposed operand
     the wgrad needs + raw E8M0; the grouped meta (one D2H of the padded per-group offsets) is shared.
     Then the FlyDSL mxfp8 variable-K grouped GEMM. dW2 is the large backward GEMM (H*I over the pool)."""
     if meta is None:
         meta = colwise_grouped_meta(group_lens, group_offs)
     pool_fp8, pool_scale = a_fp8
-    a_t, a_ts, lens_pc, offs_pc = colwise_requant_mxfp8_grouped_fp8in_flydsl(
-        pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta
+    a_t, a_ts, b_t, b_ts, lens_pc, offs_pc = colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
+        pool_fp8, pool_scale, b_bf16, _DW_FP8_FORMAT, meta=meta,
     )
-    b_t, b_ts, _, _ = colwise_quant_mxfp8_grouped_flydsl(b_bf16, _DW_FP8_FORMAT, meta=meta)
     return grouped_gemm_fp8_variable_k_impl(
         a_t, b_t,
         a_ts.view(torch.float8_e8m0fnu), b_ts.view(torch.float8_e8m0fnu),

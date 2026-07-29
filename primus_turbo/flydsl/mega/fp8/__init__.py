@@ -54,6 +54,7 @@ from .quant_colwise_trans_flydsl import (
     colwise_grouped_meta,
     colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
+    colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     rowcol_dual_quant_mxfp8_grouped_flydsl,
 )
 
@@ -73,5 +74,6 @@ __all__ = [
     "colwise_grouped_meta",
     "colwise_quant_mxfp8_grouped_flydsl",
     "colwise_requant_mxfp8_grouped_fp8in_flydsl",
+    "colwise_requant_fp8in_and_quant_bf16_grouped_flydsl",
     "rowcol_dual_quant_mxfp8_grouped_flydsl",
 ]
