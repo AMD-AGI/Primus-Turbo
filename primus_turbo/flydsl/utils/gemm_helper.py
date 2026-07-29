@@ -580,7 +580,12 @@ class StoreCPerTensorCShuffle:
         row_pad=0,
         pipe=False,
         store_aux=0,
+        double_buffer=None,
     ):
+        # ``double_buffer`` is the tensorwise-NT caller's name for ``pipe`` (staging
+        # double-buffer); accept it as an alias so both call sites stay valid.
+        if double_buffer is not None:
+            pipe = double_buffer
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
@@ -616,12 +621,16 @@ class StoreCPerTensorCShuffle:
         # C addressed via i64 per-band re-basing (handles OUT_M*OUT_N > 2^31 / >4GB);
         # the final 128b store re-bases at each 16-row sub-tile band (see store()).
         self.c_base = _buffer_ops.extract_base_index(C)
-        gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)
-        gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)
-        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
-        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
-        self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        # A_scale/B_scale optional: None -> scale already folded into the accumulator by
+        # the scaled MMA (mxfp8), so the store is plain (mirrors StoreCPerTensor).
+        self.scaled = A_scale is not None
+        if self.scaled:
+            gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)
+            gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)
+            self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+            self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+            self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
         # addr-space 2 (LDS), mirroring G2SLoader.LdsPtr_t. Separate scalar-store
         # (align 2) and vector-read (align 16) pointer types.
         self._store_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 2)
@@ -632,7 +641,7 @@ class StoreCPerTensorCShuffle:
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def store(self, c_frag, base_row, base_col):
-        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
+        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div) if self.scaled else None
         lds_base = fx.Int32(fx.ptrtoint(self.c_lds.ptr))
         wave_base = self.wave_id * self.wave_stride  # base of this wave's region(s)
         out_b = 2  # bf16/fp16 = 2 bytes
@@ -647,7 +656,7 @@ class StoreCPerTensorCShuffle:
                 for i in range_constexpr(4):
                     lds_row = (self.lane_id // 16) * 4 + i
                     e = roff + lds_row * self.row_stride + lds_col
-                    val = (vec_f32[i] * scale).to(self.out_ty)
+                    val = (vec_f32[i] * scale if self.scaled else vec_f32[i]).to(self.out_ty)
                     ptr = fx.inttoptr(self._store_ptr_t, lds_base + e * 2)
                     ptr.store(val)
 
