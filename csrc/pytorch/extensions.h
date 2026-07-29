@@ -41,6 +41,18 @@ std::vector<at::Tensor> batch_quantize_fp8_tensorwise_meta(const at::Tensor     
                                                            const at::ScalarType      dest_dtype,
                                                            c10::optional<at::Tensor> scale_opt);
 
+std::vector<at::Tensor> grouped_quantize_fp8_tensorwise(const at::Tensor          input,
+                                                        const at::ScalarType      dest_dtype,
+                                                        const at::Tensor          group_lens,
+                                                        const at::Tensor          group_offs,
+                                                        c10::optional<at::Tensor> scale_opt);
+
+std::vector<at::Tensor> grouped_quantize_fp8_tensorwise_meta(const at::Tensor          input,
+                                                             const at::ScalarType      dest_dtype,
+                                                             const at::Tensor          group_lens,
+                                                             const at::Tensor          group_offs,
+                                                             c10::optional<at::Tensor> scale_opt);
+
 std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tensor     input,
                                                                  const at::ScalarType dest_dtype,
                                                                  const int64_t        block_size,
@@ -84,6 +96,15 @@ at::Tensor batch_dequantize_fp8_tensorwise(const at::Tensor input, const at::Ten
 
 at::Tensor batch_dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                                 const at::ScalarType dest_dtype);
+
+at::Tensor grouped_dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
+                                             const at::Tensor     group_offs,
+                                             const at::ScalarType dest_dtype);
+
+at::Tensor grouped_dequantize_fp8_tensorwise_meta(const at::Tensor     input,
+                                                  const at::Tensor     scale_inv,
+                                                  const at::Tensor     group_offs,
+                                                  const at::ScalarType dest_dtype);
 
 std::vector<at::Tensor> quantize_mxfp4_dual(
     const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,

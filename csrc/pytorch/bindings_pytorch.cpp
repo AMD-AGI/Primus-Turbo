@@ -32,6 +32,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "Tensor[]");
     m.def("batch_quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? "
           "scale_opt=None) -> Tensor[]");
+    m.def("grouped_quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor group_lens, "
+          "Tensor group_offs, Tensor? scale_opt=None) -> Tensor[]");
     m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis, Tensor? "
           "scale_opt=None) -> Tensor[]");
     m.def("quantize_fp8_blockwise_segment_m_row_col(Tensor input, ScalarType dest_dtype, "
@@ -42,6 +44,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "Tensor");
     m.def("batch_dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, ScalarType dest_dtype) "
           "-> Tensor");
+    m.def("grouped_dequantize_fp8_tensorwise(Tensor input, Tensor scale_inv, Tensor group_offs, "
+          "ScalarType dest_dtype) -> Tensor");
     m.def("dequantize_fp8_rowwise(Tensor input, Tensor scale_inv, int axis, "
           "ScalarType dest_dtype) -> Tensor");
 
@@ -142,9 +146,11 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise);
     m.impl("batch_quantize_fp8_tensorwise", batch_quantize_fp8_tensorwise);
+    m.impl("grouped_quantize_fp8_tensorwise", grouped_quantize_fp8_tensorwise);
     m.impl("transpose_2d", transpose_2d);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise);
     m.impl("batch_dequantize_fp8_tensorwise", batch_dequantize_fp8_tensorwise);
+    m.impl("grouped_dequantize_fp8_tensorwise", grouped_dequantize_fp8_tensorwise);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise);
     m.impl("dequantize_fp8_rowwise", dequantize_fp8_rowwise);
     m.impl("quantize_fp8_blockwise_segment_m_row_col", quantize_fp8_blockwise_segment_m_row_col);
@@ -194,9 +200,11 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* Quantization *********
     m.impl("quantize_fp8_tensorwise", quantize_fp8_tensorwise_meta);
     m.impl("batch_quantize_fp8_tensorwise", batch_quantize_fp8_tensorwise_meta);
+    m.impl("grouped_quantize_fp8_tensorwise", grouped_quantize_fp8_tensorwise_meta);
     m.impl("transpose_2d", transpose_2d_meta);
     m.impl("dequantize_fp8_tensorwise", dequantize_fp8_tensorwise_meta);
     m.impl("batch_dequantize_fp8_tensorwise", batch_dequantize_fp8_tensorwise_meta);
+    m.impl("grouped_dequantize_fp8_tensorwise", grouped_dequantize_fp8_tensorwise_meta);
     m.impl("quantize_fp8_rowwise", quantize_fp8_rowwise_meta);
     m.impl("dequantize_fp8_rowwise", dequantize_fp8_rowwise_meta);
     m.impl("quantize_fp8_blockwise_segment_m_row_col",

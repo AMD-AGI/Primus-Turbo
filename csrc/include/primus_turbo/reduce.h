@@ -34,10 +34,30 @@ int64_t get_reduce_col_workspace_sizes(const int64_t batch, const int64_t m, con
     return cnt * sizeof(ComputeType);
 }
 
+// Workspace of `reduce_grouped_row`: one partial per row, staging the two rounds.
+template <typename ComputeType>
+int64_t get_reduce_grouped_row_workspace_sizes(const int64_t total_m) {
+    return sizeof(ComputeType) * total_m;
+}
+
 template <typename InType, typename OutType, typename ComputeType>
 void reduce_row(PrimusTurboReduceOp reduce_op, const InType *input, OutType *output,
                 const int64_t &outer_len, const int64_t &inner_len, const int64_t workspace_sizes,
                 void *workspace, hipStream_t stream);
+
+// Segmented counterpart of `reduce_row`: the rows of a [total_m, inner_len] input
+// are split into `group_num` variable-length groups by the device-side
+// `group_offs` (length group_num + 1) and each group is reduced all the way down
+// to the scalar `output[group]`. The group bounds stay on device.
+//
+// Rows outside [group_offs[0], group_offs[group_num]) fold into the first / last
+// group rather than being dropped, matching how the grouped quantize kernels
+// clamp a row to a group. Empty groups yield the reduce identity.
+template <typename InType, typename OutType, typename ComputeType>
+void reduce_grouped_row(PrimusTurboReduceOp reduce_op, const InType *input, OutType *output,
+                        const int64_t *group_offs, const int64_t group_num, const int64_t total_m,
+                        const int64_t inner_len, const int64_t workspace_sizes, void *workspace,
+                        hipStream_t stream);
 
 template <typename InType, typename OutType, typename ComputeType>
 void reduce_col(PrimusTurboReduceOp reduce_op, const InType *input, OutType *output,

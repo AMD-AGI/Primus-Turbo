@@ -5,6 +5,7 @@
 #include "primus_turbo/device/reduce.cuh"
 #include "primus_turbo/reduce.h"
 #include "reduce_col.cuh"
+#include "reduce_grouped_row.cuh"
 #include "reduce_row.cuh"
 
 namespace primus_turbo {
@@ -73,6 +74,57 @@ void reduce_row(PrimusTurboReduceOp reduce_op, const InType *input, OutType *out
     case PrimusTurboReduceOp::REDUCE_ABS_MAX:
         reduce_row_impl<AbsMaxOp, InType, OutType, ComputeType>(input, output, outer_len, inner_len,
                                                                 workspace_sizes, workspace, stream);
+        return;
+    default:
+        PRIMUS_TURBO_CHECK(false, "Unsupported reduce op");
+        return;
+    }
+}
+
+template <template <class> class ReduceOp, typename InType, typename OutType, typename ComputeType>
+void reduce_grouped_row_impl(const InType *input, OutType *output, const int64_t *group_offs,
+                             const int64_t group_num, const int64_t total_m,
+                             const int64_t inner_len, const int64_t workspace_sizes,
+                             void *workspace, hipStream_t stream) {
+    constexpr int BLOCK_SIZE = 256;
+
+    PRIMUS_TURBO_CHECK(workspace != nullptr &&
+                           workspace_sizes >=
+                               get_reduce_grouped_row_workspace_sizes<ComputeType>(total_m),
+                       "workspace too small for the grouped row reduce");
+
+    // Round 1 hands one partial per row to round 2, which owns the group bounds.
+    auto         *row_partial    = reinterpret_cast<ComputeType *>(workspace);
+    const int64_t rows_per_block = BLOCK_SIZE / warp_size();
+
+    const dim3 grid_rows(DIVUP<int64_t>(total_m, rows_per_block), 1, 1);
+    reduce_grouped_row_per_row_kernel<ReduceOp, InType, ComputeType, BLOCK_SIZE>
+        <<<grid_rows, BLOCK_SIZE, 0, stream>>>(input, row_partial, total_m, inner_len);
+
+    const dim3 grid_groups(group_num, 1, 1);
+    reduce_grouped_row_per_group_kernel<ReduceOp, ComputeType, OutType, BLOCK_SIZE>
+        <<<grid_groups, BLOCK_SIZE, 0, stream>>>(row_partial, output, group_offs, group_num,
+                                                 total_m);
+}
+
+template <typename InType, typename OutType, typename ComputeType>
+void reduce_grouped_row(PrimusTurboReduceOp reduce_op, const InType *input, OutType *output,
+                        const int64_t *group_offs, const int64_t group_num, const int64_t total_m,
+                        const int64_t inner_len, const int64_t workspace_sizes, void *workspace,
+                        hipStream_t stream) {
+    if (group_num == 0 || total_m == 0 || inner_len == 0)
+        return;
+
+    switch (reduce_op) {
+    case PrimusTurboReduceOp::REDUCE_MAX:
+        reduce_grouped_row_impl<MaxOp, InType, OutType, ComputeType>(
+            input, output, group_offs, group_num, total_m, inner_len, workspace_sizes, workspace,
+            stream);
+        return;
+    case PrimusTurboReduceOp::REDUCE_ABS_MAX:
+        reduce_grouped_row_impl<AbsMaxOp, InType, OutType, ComputeType>(
+            input, output, group_offs, group_num, total_m, inner_len, workspace_sizes, workspace,
+            stream);
         return;
     default:
         PRIMUS_TURBO_CHECK(false, "Unsupported reduce op");
@@ -157,6 +209,19 @@ DECL_REDUCE_ROW_INSTANCE(dtype::bfloat16, dtype::float32, dtype::float32)
 DECL_REDUCE_ROW_INSTANCE(dtype::float32, dtype::float32, dtype::float32)
 
 #undef DECL_REDUCE_ROW_INSTANCE
+
+#define DECL_REDUCE_GROUPED_ROW_INSTANCE(InType, OutType, ComputeType)                             \
+    template void reduce_grouped_row<InType, OutType, ComputeType>(                                \
+        PrimusTurboReduceOp reduce_op, const InType *input, OutType *output,                       \
+        const int64_t *group_offs, const int64_t group_num, const int64_t total_m,                 \
+        const int64_t inner_len, const int64_t workspace_sizes, void *workspace,                   \
+        hipStream_t stream);
+
+DECL_REDUCE_GROUPED_ROW_INSTANCE(dtype::float16, dtype::float32, dtype::float32)
+DECL_REDUCE_GROUPED_ROW_INSTANCE(dtype::bfloat16, dtype::float32, dtype::float32)
+DECL_REDUCE_GROUPED_ROW_INSTANCE(dtype::float32, dtype::float32, dtype::float32)
+
+#undef DECL_REDUCE_GROUPED_ROW_INSTANCE
 
 #define DECL_REDUCE_COL_INSTANCE(InType, OutType, ComputeType)                                     \
     template void reduce_col<InType, OutType, ComputeType>(                                        \

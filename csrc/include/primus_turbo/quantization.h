@@ -5,6 +5,7 @@
 #pragma once
 
 #include "primus_turbo/common.h"
+#include "primus_turbo/reduce.h"
 #include <hip/hip_runtime.h>
 #include <optional>
 
@@ -25,6 +26,28 @@ template <typename FType, typename QType, typename ComputeType = float>
 void batch_quantize_tensorwise_impl(const FType *x, const float *scale, QType *y,
                                     const int64_t batch_num, const int64_t numel_per_batch,
                                     hipStream_t stream);
+
+// Workspace of `grouped_quantize_tensorwise_impl`: the per-group amax followed by
+// the workspace of the grouped reduce producing it. Only the PreComputeScale=false
+// path touches it; the static-scale path may be given {0, nullptr}.
+inline int64_t get_grouped_quantize_tensorwise_workspace_sizes(const int64_t group_num,
+                                                               const int64_t total_m) {
+    return static_cast<int64_t>(sizeof(float)) * group_num +
+           get_reduce_grouped_row_workspace_sizes<float>(total_m);
+}
+
+// Grouped tensorwise quantize: x is viewed as [total_m, n] and its rows are
+// split into ``group_num`` variable-length groups by the device-side
+// ``group_offs`` (length group_num + 1); rows of group ``g`` are scaled by
+// ``scale[g]``. With PreComputeScale=false the per-group amax -> scale /
+// scale_inv pass is fused in, so the group lengths never leave the GPU.
+template <typename FType, typename QType, typename ComputeType = float,
+          bool PreComputeScale = false>
+void grouped_quantize_tensorwise_impl(const FType *x, float *scale, float *scale_inv, QType *y,
+                                      const int64_t *group_offs, const int64_t group_num,
+                                      const int64_t total_m, const int64_t n,
+                                      const int64_t workspace_sizes, void *workspace,
+                                      hipStream_t stream);
 
 // Segment-padded group offsets (each segment rounded up to block_size), on-device.
 template <typename IndexType>
@@ -196,6 +219,14 @@ template <typename FType, typename QType, typename ComputeType = float>
 void batch_dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y,
                                       const int64_t batch_num, const int64_t numel_per_batch,
                                       hipStream_t stream);
+
+// Counterpart of ``grouped_quantize_tensorwise_impl``: x is viewed as
+// [total_m, n] and the rows of group ``g`` (per the device-side ``group_offs``)
+// are scaled by ``scale_inv[g]``.
+template <typename FType, typename QType, typename ComputeType = float>
+void grouped_dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y,
+                                        const int64_t *group_offs, const int64_t group_num,
+                                        const int64_t total_m, const int64_t n, hipStream_t stream);
 
 // Rowwise dequantize when the per-row dim is the innermost (last) dim.
 // scale_inv has shape [outer_len] (one scalar per row).

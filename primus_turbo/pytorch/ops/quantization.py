@@ -22,7 +22,9 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequantize_fp8_tensorwise_impl,
     dequantize_mxfp4_impl,
     dequantize_mxfp8_impl,
+    grouped_dequantize_fp8_tensorwise_impl,
     grouped_dequantize_mxfp8_impl,
+    grouped_quantize_fp8_tensorwise_impl,
     grouped_quantize_mxfp4_impl,
     grouped_quantize_mxfp8_impl,
     quant_fp8_blockwise_dual_impl,
@@ -158,9 +160,23 @@ def grouped_quantize_fp8(
     torch.Tensor,
 ]:
     """
-    FP8 Grouped Quantize with trans
+    FP8 Grouped Quantize
+
+    Returns ``(data, scale_inv, group_lens_padded, group_offs_padded)``.
+
+    NOTE:
+        For TENSORWISE quantization:
+            1. The x must be a 2D packed-M tensor; each group gets its own scalar
+               scale, so scale_inv is ``[G, 1]``.
+            2. The layout is tight-M (row i == input row i), so the returned padded
+               group_lens / group_offs are the (tight) originals.
     """
-    if granularity == ScalingGranularity.MX_BLOCKWISE:
+    if granularity == ScalingGranularity.TENSORWISE:
+        assert x.ndim == 2, "grouped tensorwise quantize expects a 2D packed-M tensor"
+
+        data, scale_inv = grouped_quantize_fp8_tensorwise_impl(x, out_dtype, group_lens, group_offs)
+        return data, scale_inv, group_lens, group_offs
+    elif granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MXFP8_BLOCK_SIZE, (
             f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
         )
@@ -284,8 +300,17 @@ def grouped_dequantize_fp8(
 ) -> torch.Tensor:
     """
     FP8 Grouped DeQuantize
+
+    NOTE:
+        For TENSORWISE de-quantization the layout is tight-M, so ``group_offs``
+        (the un-padded offsets) addresses the groups and ``group_offs_padded`` is
+        unused.
     """
-    if granularity == ScalingGranularity.MX_BLOCKWISE:
+    if granularity == ScalingGranularity.TENSORWISE:
+        assert x.ndim == 2, "grouped tensorwise de-quantize expects a 2D packed-M tensor"
+
+        return grouped_dequantize_fp8_tensorwise_impl(x, out_dtype, scale_inv, group_offs)
+    elif granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MXFP8_BLOCK_SIZE, (
             f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
         )

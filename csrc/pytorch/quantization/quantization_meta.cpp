@@ -27,6 +27,21 @@ std::vector<at::Tensor> batch_quantize_fp8_tensorwise_meta(const at::Tensor     
     return {input_fp8, scale_inv};
 }
 
+std::vector<at::Tensor> grouped_quantize_fp8_tensorwise_meta(const at::Tensor          input,
+                                                             const at::ScalarType      dest_dtype,
+                                                             const at::Tensor          group_lens,
+                                                             const at::Tensor          group_offs,
+                                                             c10::optional<at::Tensor> scale_opt) {
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "grouped tensorwise input must be 2D [total_M, N]");
+    PRIMUS_TURBO_CHECK(group_offs.size(0) == group_lens.size(0) + 1,
+                       "group_offs.size(0) must equal group_lens.size(0) + 1");
+    auto input_fp8 = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
+    // Mirror the CUDA impl: one scale per group, shaped ``[G, 1]``.
+    auto scale_inv =
+        at::empty({group_lens.size(0), 1}, input.options().dtype(at::kFloat).device(at::kMeta));
+    return {input_fp8, scale_inv};
+}
+
 std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          input,
                                                   const at::ScalarType      dest_dtype,
                                                   const int64_t             axis,
@@ -51,6 +66,17 @@ at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tens
 at::Tensor batch_dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                                 const at::ScalarType dest_dtype) {
     PRIMUS_TURBO_CHECK(input.dim() == 3, "batch tensorwise input must be 3D [B, M, N]");
+    at::Tensor output = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
+    return output;
+}
+
+at::Tensor grouped_dequantize_fp8_tensorwise_meta(const at::Tensor     input,
+                                                  const at::Tensor     scale_inv,
+                                                  const at::Tensor     group_offs,
+                                                  const at::ScalarType dest_dtype) {
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "grouped tensorwise input must be 2D [total_M, N]");
+    PRIMUS_TURBO_CHECK(group_offs.size(0) == scale_inv.numel() + 1,
+                       "group_offs.size(0) must equal the group count + 1");
     at::Tensor output = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
     return output;
 }

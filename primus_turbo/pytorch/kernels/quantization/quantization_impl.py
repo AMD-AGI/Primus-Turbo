@@ -57,6 +57,27 @@ def quantize_fp8_tensorwise_impl(
     return x_fp8, scale_inv
 
 
+def grouped_quantize_fp8_tensorwise_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Grouped quantize FP8 Tensor-Wise
+
+    A 2D [total_M, N] tensor whose rows are split into G variable-length groups by
+    group_lens / group_offs is quantized per group, so scale_inv is [G, 1].
+    """
+    assert x.dim() == 2, "The x tensor must be 2D [M, N]."
+
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.grouped_quantize_fp8_tensorwise(
+        x, out_dtype, group_lens, group_offs, None
+    )
+
+    return x_fp8, scale_inv
+
+
 def quantize_fp8_rowwise_impl(
     x: torch.Tensor, out_dtype: torch.dtype, axis: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -80,6 +101,26 @@ def dequantize_fp8_tensorwise_impl(x: torch.Tensor, out_dtype: torch.dtype, scal
     if x.dim() == 3:
         return torch.ops.primus_turbo_cpp_extension.batch_dequantize_fp8_tensorwise(x, scale_inv, out_dtype)
     return torch.ops.primus_turbo_cpp_extension.dequantize_fp8_tensorwise(x, scale_inv, out_dtype)
+
+
+def grouped_dequantize_fp8_tensorwise_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    scale_inv: torch.Tensor,
+    group_offs: torch.Tensor,
+):
+    """
+    Grouped DeQuantize FP8 Tensor-Wise
+
+    Counterpart of ``grouped_quantize_fp8_tensorwise_impl``: the rows of a 2D
+    [total_M, N] tensor are split into G groups by group_offs and group ``g`` is
+    scaled by scale_inv[g].
+    """
+    assert x.dim() == 2, "The x tensor must be 2D [total_M, N]."
+
+    return torch.ops.primus_turbo_cpp_extension.grouped_dequantize_fp8_tensorwise(
+        x, scale_inv, group_offs, out_dtype
+    )
 
 
 def dequantize_fp8_rowwise_impl(x: torch.Tensor, out_dtype: torch.dtype, axis: int, scale_inv: torch.Tensor):

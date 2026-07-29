@@ -147,6 +147,80 @@ std::vector<at::Tensor> batch_quantize_fp8_tensorwise(const at::Tensor          
     return {output, scale_inv};
 }
 
+// Grouped counterpart of ``quantize_fp8_tensorwise``: ``input`` is a 2D
+// ``[total_M, N]`` grouped-GEMM operand whose rows are partitioned into ``G``
+// variable-length groups by ``group_lens`` / ``group_offs``. Each group gets its
+// own scalar scale, so the scales carry a leading group dim ``[G, 1]``. The
+// group bounds stay on device, so no D2H sync is required.
+std::vector<at::Tensor> grouped_quantize_fp8_tensorwise(const at::Tensor          input,
+                                                        const at::ScalarType      dest_dtype,
+                                                        const at::Tensor          group_lens,
+                                                        const at::Tensor          group_offs,
+                                                        c10::optional<at::Tensor> scale_opt) {
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
+                       input.scalar_type() == at::kFloat);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "grouped tensorwise input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "grouped tensorwise input must be 2D [total_M, N]");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "grouped tensorwise input must be contiguous");
+    for (const auto &t : {group_lens, group_offs}) {
+        PRIMUS_TURBO_CHECK(t.is_cuda(), "group_lens / group_offs must be CUDA tensors");
+        PRIMUS_TURBO_CHECK(t.scalar_type() == at::kLong, "group_lens / group_offs must be int64");
+        PRIMUS_TURBO_CHECK(t.dim() == 1, "group_lens / group_offs must be 1D");
+        PRIMUS_TURBO_CHECK(t.is_contiguous(), "group_lens / group_offs must be contiguous");
+    }
+    PRIMUS_TURBO_CHECK(group_offs.size(0) == group_lens.size(0) + 1,
+                       "group_offs.size(0) must equal group_lens.size(0) + 1");
+    PRIMUS_TURBO_CHECK(group_lens.size(0) >= 1, "must have at least one group");
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int64_t              G       = group_lens.size(0);
+    const int64_t              total_M = input.size(0);
+    const int64_t              N       = input.size(1);
+    const std::vector<int64_t> scale_shape{G, 1};
+
+    at::Tensor scale     = torch::empty(scale_shape, input.options().dtype(at::kFloat));
+    at::Tensor scale_inv = torch::empty(scale_shape, input.options().dtype(at::kFloat));
+
+    const bool pre_computed_scale = scale_opt.has_value();
+    if (pre_computed_scale) {
+        scale = scale_opt.value();
+        PRIMUS_TURBO_CHECK(scale.numel() == G,
+                           "grouped tensorwise scale must hold one entry per group");
+        PRIMUS_TURBO_CHECK(scale.is_contiguous(), "grouped tensorwise scale must be contiguous");
+        scale_inv = (1.0f / scale).reshape(scale_shape);
+    }
+
+    // The per-group amax -> scale pass is fused into the quantize launch, so a
+    // dynamic scale only needs the reduction workspace and no D2H sync.
+    const int64_t ws_sizes =
+        pre_computed_scale ? 0 : get_grouped_quantize_tensorwise_workspace_sizes(G, total_M);
+    at::Tensor workspace = torch::empty({ws_sizes}, input.options().dtype(at::kByte));
+
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+            if (pre_computed_scale) {
+                grouped_quantize_tensorwise_impl<FType, QType, float, true>(
+                    reinterpret_cast<const FType *>(input.data_ptr()),
+                    reinterpret_cast<float *>(scale.data_ptr()),
+                    reinterpret_cast<float *>(scale_inv.data_ptr()),
+                    reinterpret_cast<QType *>(output.data_ptr()), group_offs.data_ptr<int64_t>(), G,
+                    total_M, N, ws_sizes, workspace.data_ptr(), stream);
+            } else {
+                grouped_quantize_tensorwise_impl<FType, QType, float, false>(
+                    reinterpret_cast<const FType *>(input.data_ptr()),
+                    reinterpret_cast<float *>(scale.data_ptr()),
+                    reinterpret_cast<float *>(scale_inv.data_ptr()),
+                    reinterpret_cast<QType *>(output.data_ptr()), group_offs.data_ptr<int64_t>(), G,
+                    total_M, N, ws_sizes, workspace.data_ptr(), stream);
+            }
+        });
+    });
+
+    return {output, scale_inv};
+}
+
 inline void compute_quantize_fp8_rowwise_bmn(const std::vector<int64_t> &shape, int64_t axis,
                                              int64_t &B, int64_t &M, int64_t &N) {
     const int64_t ndim = static_cast<int64_t>(shape.size());
@@ -311,6 +385,45 @@ at::Tensor batch_dequantize_fp8_tensorwise(const at::Tensor input, const at::Ten
                 reinterpret_cast<const QType *>(input.data_ptr()),
                 reinterpret_cast<const float *>(scale_inv.data_ptr()),
                 reinterpret_cast<FType *>(output.data_ptr()), batch_num, numel_per_batch, stream);
+        });
+    });
+
+    return output;
+}
+
+// Grouped counterpart of ``dequantize_fp8_tensorwise``: scale_inv carries one
+// entry per group of the 2D ``[total_M, N]`` input, whose rows are partitioned
+// by ``group_offs``. The group bounds stay on device.
+at::Tensor grouped_dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
+                                             const at::Tensor     group_offs,
+                                             const at::ScalarType dest_dtype) {
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kBFloat16 || dest_dtype == at::kHalf ||
+                       dest_dtype == at::kFloat);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(input.scalar_type()));
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "grouped tensorwise input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.dim() == 2, "grouped tensorwise input must be 2D [total_M, N]");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "grouped tensorwise input must be contiguous");
+    PRIMUS_TURBO_CHECK(scale_inv.scalar_type() == at::kFloat && scale_inv.is_contiguous(),
+                       "grouped tensorwise scale_inv must be contiguous float32");
+    PRIMUS_TURBO_CHECK(group_offs.is_cuda() && group_offs.scalar_type() == at::kLong &&
+                           group_offs.dim() == 1 && group_offs.is_contiguous(),
+                       "group_offs must be a contiguous 1D int64 CUDA tensor");
+    PRIMUS_TURBO_CHECK(group_offs.size(0) == scale_inv.numel() + 1,
+                       "group_offs.size(0) must equal the group count + 1");
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int64_t G       = scale_inv.numel();
+    const int64_t total_M = input.size(0);
+    const int64_t N       = input.size(1);
+
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(output.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(input.scalar_type(), QType, {
+            grouped_dequantize_tensorwise_impl<FType, QType>(
+                reinterpret_cast<const QType *>(input.data_ptr()),
+                reinterpret_cast<const float *>(scale_inv.data_ptr()),
+                reinterpret_cast<FType *>(output.data_ptr()), group_offs.data_ptr<int64_t>(), G,
+                total_M, N, stream);
         });
     });
 
