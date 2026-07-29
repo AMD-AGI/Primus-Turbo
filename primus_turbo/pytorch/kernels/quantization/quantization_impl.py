@@ -42,8 +42,18 @@ def quantize_fp8_tensorwise_impl(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize FP8 Tensor-Wise
+
+    A 2D [M, N] tensor shares a single scalar scale. A 3D [B, M, N] tensor
+    (grouped-linear / multi-expert operand) is quantized per leading batch and
+    gets a [B, 1] scale_inv.
     """
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
+    assert x.dim() in (2, 3), "The x tensor must be 2D [M, N] or 3D [B, M, N]."
+    if x.dim() == 3:
+        x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.batch_quantize_fp8_tensorwise(
+            x, out_dtype, None
+        )
+    else:
+        x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
     return x_fp8, scale_inv
 
 
@@ -62,7 +72,13 @@ def quantize_fp8_rowwise_impl(
 def dequantize_fp8_tensorwise_impl(x: torch.Tensor, out_dtype: torch.dtype, scale_inv: torch.Tensor):
     """
     DeQuantize FP8 Tensor-Wise
+
+    A 2D [M, N] tensor takes a scalar scale_inv. A 3D [B, M, N] tensor takes a
+    scale_inv holding one entry per leading batch.
     """
+    assert x.dim() in (2, 3), "The x tensor must be 2D [M, N] or 3D [B, M, N]."
+    if x.dim() == 3:
+        return torch.ops.primus_turbo_cpp_extension.batch_dequantize_fp8_tensorwise(x, scale_inv, out_dtype)
     return torch.ops.primus_turbo_cpp_extension.dequantize_fp8_tensorwise(x, scale_inv, out_dtype)
 
 

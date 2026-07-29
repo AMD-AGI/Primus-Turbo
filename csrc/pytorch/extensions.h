@@ -33,6 +33,14 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
                                                      const at::ScalarType      dest_dtype,
                                                      c10::optional<at::Tensor> scale_opt);
 
+std::vector<at::Tensor> batch_quantize_fp8_tensorwise(const at::Tensor          input,
+                                                      const at::ScalarType      dest_dtype,
+                                                      c10::optional<at::Tensor> scale_opt);
+
+std::vector<at::Tensor> batch_quantize_fp8_tensorwise_meta(const at::Tensor          input,
+                                                           const at::ScalarType      dest_dtype,
+                                                           c10::optional<at::Tensor> scale_opt);
+
 std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tensor     input,
                                                                  const at::ScalarType dest_dtype,
                                                                  const int64_t        block_size,
@@ -70,6 +78,12 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
 
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                           const at::ScalarType dest_dtype);
+
+at::Tensor batch_dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
+                                           const at::ScalarType dest_dtype);
+
+at::Tensor batch_dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                                const at::ScalarType dest_dtype);
 
 std::vector<at::Tensor> quantize_mxfp4_dual(
     const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,

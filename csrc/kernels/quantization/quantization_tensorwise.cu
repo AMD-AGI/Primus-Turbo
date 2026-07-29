@@ -136,6 +136,23 @@ void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y
 }
 
 // ---------------------------------------------------------------------------
+// Batched tensorwise quantize / dequantize
+// ---------------------------------------------------------------------------
+template <typename FType, typename QType, typename ComputeType>
+void batch_quantize_tensorwise_impl(const FType *x, const float *scale, QType *y,
+                                    const int64_t batch_num, const int64_t numel_per_batch,
+                                    hipStream_t stream) {
+    PRIMUS_TURBO_ERROR("batch_quantize_tensorwise_impl is not implemented yet");
+}
+
+template <typename FType, typename QType, typename ComputeType>
+void batch_dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y,
+                                      const int64_t batch_num, const int64_t numel_per_batch,
+                                      hipStream_t stream) {
+    PRIMUS_TURBO_ERROR("batch_dequantize_tensorwise_impl is not implemented yet");
+}
+
+// ---------------------------------------------------------------------------
 // Explicit instantiations
 // ---------------------------------------------------------------------------
 // `compute_scale_from_amax` is declared in primus_turbo/quantization.h and
@@ -149,7 +166,13 @@ template void compute_scale_from_amax<float>(const float *amax, float q_max, flo
     template void quantize_tensorwise_impl<FType, QType>(                                          \
         const FType *x, const float *scale, QType *y, const int64_t n, hipStream_t stream);        \
     template void dequantize_tensorwise_impl<FType, QType>(                                        \
-        const QType *x, const float *scale_inv, FType *y, const int64_t n, hipStream_t stream);
+        const QType *x, const float *scale_inv, FType *y, const int64_t n, hipStream_t stream);    \
+    template void batch_quantize_tensorwise_impl<FType, QType>(                                    \
+        const FType *x, const float *scale, QType *y, const int64_t batch_num,                     \
+        const int64_t numel_per_batch, hipStream_t stream);                                        \
+    template void batch_dequantize_tensorwise_impl<FType, QType>(                                  \
+        const QType *x, const float *scale_inv, FType *y, const int64_t batch_num,                 \
+        const int64_t numel_per_batch, hipStream_t stream);
 
 DECL_QUANT_AND_DEQUANT_TENSORWISE_INSTANCE(dtype::float16, dtype::float8_e4m3)
 DECL_QUANT_AND_DEQUANT_TENSORWISE_INSTANCE(dtype::float16, dtype::float8_e5m2)

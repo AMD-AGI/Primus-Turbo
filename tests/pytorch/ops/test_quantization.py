@@ -30,13 +30,27 @@ from tests.pytorch.test_utils import get_tolerances
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
-@pytest.mark.parametrize("numel", [6 * 1 * 7168 * 8192])
+@pytest.mark.parametrize(
+    "shape",
+    [(6 * 7168, 8192), (111, 113), (4, 128, 256), (3, 111, 113), (8, 1, 1)],
+)
 @pytest.mark.parametrize("torch_compile", [True, False])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
-def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, torch_compile, granularity):
+def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, shape, torch_compile, granularity):
     torch.manual_seed(42)
 
-    x = torch.rand(numel, device="cuda", dtype=orig_dtype)
+    # A 3D [B, M, N] input is quantized per leading batch and gets a [B, 1] scale;
+    # every other rank shares a single scalar scale for the whole tensor.
+    batched = len(shape) == 3
+
+    x = torch.rand(shape, device="cuda", dtype=orig_dtype)
+    if batched:
+        # Spread the per-batch magnitudes far apart so a single shared scale cannot
+        # pass. Powers of two leave the mantissas untouched, keeping the comparison
+        # against the reference free of extra rounding.
+        batch_exps = torch.arange(shape[0], device="cuda", dtype=torch.float32) * 2 - shape[0]
+        x = x * torch.pow(2.0, batch_exps).to(orig_dtype).view(-1, 1, 1)
+
     x_ref = x.detach().clone()
     x_fp8_ref, x_scale_ref, x_scale_inv_ref = quantize_fp8_ref(x_ref, dest_dtype, granularity)
 
@@ -51,10 +65,11 @@ def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, torch_compile, g
     else:
         x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=granularity)
 
+    assert x_scale_inv.shape == ((shape[0], 1) if batched else ())
     torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
     torch.testing.assert_close(
-        x_fp8_ref.to(torch.float32) * x_scale_inv_ref,
-        x_fp8.to(torch.float32) * x_scale_inv,
+        dequantize_fp8_ref(x_fp8_ref, torch.float32, granularity, scale_inv=x_scale_inv_ref),
+        dequantize_fp8_ref(x_fp8, torch.float32, granularity, scale_inv=x_scale_inv),
         **get_tolerances(dest_dtype),
     )
 

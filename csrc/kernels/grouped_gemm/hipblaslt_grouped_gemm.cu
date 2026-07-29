@@ -177,9 +177,11 @@ private:
             valid_group_num += params.group_lens_ptr[i] > 0 ? 1 : 0;
         }
 
-        const char *a_ptr = static_cast<const char *>(params.a_ptr);
-        const char *b_ptr = static_cast<const char *>(params.b_ptr);
-        char       *c_ptr = static_cast<char *>(params.c_ptr);
+        const char *a_ptr       = static_cast<const char *>(params.a_ptr);
+        const char *b_ptr       = static_cast<const char *>(params.b_ptr);
+        char       *c_ptr       = static_cast<char *>(params.c_ptr);
+        const char *a_scale_ptr = static_cast<const char *>(params.a_scale_ptr);
+        const char *b_scale_ptr = static_cast<const char *>(params.b_scale_ptr);
         gemm_ptrs_.resize(valid_group_num);
         ld_a_.resize(valid_group_num);
         ld_b_.resize(valid_group_num);
@@ -190,6 +192,14 @@ private:
         cols_b_.resize(valid_group_num);
         rows_c_.resize(valid_group_num);
         cols_c_.resize(valid_group_num);
+
+        // Size of one group's B slice, only meaningful for the 3D (non-transA)
+        // layout where B is indexed by group; with transA, B is grouped along
+        // its rows and an empty group takes no space at all.
+        const int64_t b_group_bytes =
+            params.transA ? 0
+                          : get_dim(params.b_shape, -2) * get_dim(params.b_shape, -1) *
+                                static_cast<int64_t>(hipblaslt_dtype_bytes(params.b_type));
 
         int write_idx = 0;
         for (size_t i = 0; i < params.group_num; ++i) {
@@ -205,17 +215,24 @@ private:
                 c_ptr += c_size_t;
             }
 
-            if (len == 0)
+            if (len == 0) {
+                // When A is not transposed B is [group_num, ...] and every group
+                // owns a whole slice, so an empty group still consumes one.
+                b_ptr += b_group_bytes;
                 continue;
+            }
 
             // pointers
             gemm_ptrs_[write_idx].a_ptr = a_ptr;
             gemm_ptrs_[write_idx].b_ptr = b_ptr;
             gemm_ptrs_[write_idx].c_ptr = c_ptr;
             if (params.use_low_precision) {
-                // TODO(xiaobochen): support variable scale mode
-                gemm_ptrs_[write_idx].a_scale_ptr = params.a_scale_ptr;
-                gemm_ptrs_[write_idx].b_scale_ptr = params.b_scale_ptr;
+                // A zero stride collapses back to a single scale shared by every group.
+                const int64_t group_idx = static_cast<int64_t>(i);
+                gemm_ptrs_[write_idx].a_scale_ptr =
+                    a_scale_ptr + group_idx * params.a_scale_group_stride_bytes;
+                gemm_ptrs_[write_idx].b_scale_ptr =
+                    b_scale_ptr + group_idx * params.b_scale_group_stride_bytes;
             }
 
             // leading dimension

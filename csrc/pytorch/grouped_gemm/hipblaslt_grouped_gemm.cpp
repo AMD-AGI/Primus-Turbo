@@ -61,6 +61,13 @@ inline HipblasltGroupedGemmParams make_hipblaslt_grouped_gemm_fp8_params(
     params.b_type      = get_hipblaslt_dtype(b.scalar_type());
     params.b_shape     = b.sizes().vec();
 
+    // A single scale stays shared by every group (stride 0); a group_num-element
+    // scale tensor gives each group its own scale.
+    params.a_scale_group_stride_bytes =
+        a_scales.numel() == 1 ? 0 : static_cast<int64_t>(a_scales.element_size());
+    params.b_scale_group_stride_bytes =
+        b_scales.numel() == 1 ? 0 : static_cast<int64_t>(b_scales.element_size());
+
     params.c_ptr   = reinterpret_cast<void *>(c.data_ptr());
     params.c_type  = get_hipblaslt_dtype(c.scalar_type());
     params.c_shape = c.sizes().vec();
@@ -130,6 +137,18 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
                        "out_dtype must be kBFloat16 or kHalf");
     PRIMUS_TURBO_CHECK(granularity == "TENSORWISE", "granularity must be 'TENSORWISE'");
 
+    // TENSORWISE takes either one scale shared by all groups, or one scale per
+    // group (e.g. per-expert activation scales).
+    const int64_t group_num = group_lens.numel();
+    PRIMUS_TURBO_CHECK(a_scales.scalar_type() == at::kFloat && b_scales.scalar_type() == at::kFloat,
+                       "a_scales and b_scales must be float32");
+    PRIMUS_TURBO_CHECK(a_scales.is_contiguous() && b_scales.is_contiguous(),
+                       "a_scales and b_scales must be contiguous");
+    PRIMUS_TURBO_CHECK(a_scales.numel() == 1 || a_scales.numel() == group_num,
+                       "a_scales must hold 1 or group_num elements");
+    PRIMUS_TURBO_CHECK(b_scales.numel() == 1 || b_scales.numel() == group_num,
+                       "b_scales must hold 1 or group_num elements");
+
     // Scale mode
     hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_END;
     if (granularity == "TENSORWISE") {
@@ -141,10 +160,9 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
     // Create output tensor
     at::Tensor c;
     if (transA) {
-        const int64_t bs = group_lens.numel();
-        const int64_t m  = a.size(1);
-        const int64_t n  = transB ? b.size(0) : b.size(1);
-        c                = at::empty({bs, m, n}, a.options().dtype(out_dtype));
+        const int64_t m = a.size(1);
+        const int64_t n = transB ? b.size(0) : b.size(1);
+        c               = at::empty({group_num, m, n}, a.options().dtype(out_dtype));
     } else {
         const int64_t m = a.size(0);
         const int64_t n = transB ? b.size(1) : b.size(2);

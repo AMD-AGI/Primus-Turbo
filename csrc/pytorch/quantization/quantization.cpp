@@ -87,6 +87,66 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
     return {output, scale_inv};
 }
 
+// Batched counterpart of ``quantize_fp8_tensorwise``: a 3D ``[B, M, N]`` input
+// (grouped-linear / multi-expert operand) is quantized one leading slice at a
+// time, so the scales carry a leading batch dim ``[B, 1]``.
+std::vector<at::Tensor> batch_quantize_fp8_tensorwise(const at::Tensor          input,
+                                                      const at::ScalarType      dest_dtype,
+                                                      c10::optional<at::Tensor> scale_opt) {
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
+                       input.scalar_type() == at::kFloat);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
+    PRIMUS_TURBO_CHECK(input.dim() == 3, "batch tensorwise input must be 3D [B, M, N]");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "batch tensorwise input must be contiguous");
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int64_t              batch_num       = input.size(0);
+    const int64_t              numel_per_batch = input.size(1) * input.size(2);
+    const std::vector<int64_t> scale_shape{batch_num, 1};
+
+    at::Tensor scale     = torch::empty(scale_shape, input.options().dtype(at::kFloat));
+    at::Tensor scale_inv = torch::empty(scale_shape, input.options().dtype(at::kFloat));
+
+    if (scale_opt.has_value()) {
+        scale = scale_opt.value();
+        PRIMUS_TURBO_CHECK(scale.numel() == batch_num,
+                           "batch tensorwise scale must hold one entry per batch");
+        PRIMUS_TURBO_CHECK(scale.is_contiguous(), "batch tensorwise scale must be contiguous");
+        scale_inv = (1.0f / scale).reshape(scale_shape);
+    } else {
+        // Reduce
+        auto          amax      = torch::empty(scale_shape, input.options().dtype(at::kFloat));
+        const int64_t ws_size   = get_reduce_row_workspace_sizes<float>(batch_num, numel_per_batch);
+        auto          workspace = torch::empty({ws_size}, input.options().dtype(at::kByte));
+        TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
+            reduce_row<InT, float, float>(PrimusTurboReduceOp::REDUCE_ABS_MAX,
+                                          reinterpret_cast<InT *>(input.data_ptr()),
+                                          amax.data_ptr<float>(), batch_num, numel_per_batch,
+                                          ws_size, workspace.data_ptr(), stream);
+        });
+
+        // Compute Scale
+        const float fp8_max = get_float8_max(dest_dtype);
+        compute_scale_from_amax<float>(reinterpret_cast<const float *>(amax.data_ptr()), fp8_max,
+                                       reinterpret_cast<float *>(scale.data_ptr()),
+                                       reinterpret_cast<float *>(scale_inv.data_ptr()),
+                                       amax.numel(), stream);
+    }
+
+    // Quantize
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+            batch_quantize_tensorwise_impl<FType, QType>(
+                reinterpret_cast<const FType *>(input.data_ptr()),
+                reinterpret_cast<const float *>(scale.data_ptr()),
+                reinterpret_cast<QType *>(output.data_ptr()), batch_num, numel_per_batch, stream);
+        });
+    });
+
+    return {output, scale_inv};
+}
+
 inline void compute_quantize_fp8_rowwise_bmn(const std::vector<int64_t> &shape, int64_t axis,
                                              int64_t &B, int64_t &M, int64_t &N) {
     const int64_t ndim = static_cast<int64_t>(shape.size());
@@ -221,6 +281,36 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
                 reinterpret_cast<const QType *>(input.data_ptr()),
                 reinterpret_cast<const float *>(scale_inv.data_ptr()),
                 reinterpret_cast<FType *>(output.data_ptr()), input.numel(), stream);
+        });
+    });
+
+    return output;
+}
+
+// Batched counterpart of ``dequantize_fp8_tensorwise``: scale_inv carries one
+// entry per leading-dim batch of the 3D ``[B, M, N]`` input.
+at::Tensor batch_dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor scale_inv,
+                                           const at::ScalarType dest_dtype) {
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kBFloat16 || dest_dtype == at::kHalf ||
+                       dest_dtype == at::kFloat);
+    PRIMUS_TURBO_CHECK(is_torch_fp8(input.scalar_type()));
+    PRIMUS_TURBO_CHECK(input.dim() == 3, "batch tensorwise input must be 3D [B, M, N]");
+    PRIMUS_TURBO_CHECK(input.size(0) == scale_inv.numel(),
+                       "batch tensorwise scale_inv must hold one entry per batch");
+    PRIMUS_TURBO_CHECK(input.is_contiguous() && scale_inv.is_contiguous(),
+                       "batch tensorwise input and scale_inv must be contiguous");
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int64_t batch_num       = input.size(0);
+    const int64_t numel_per_batch = input.size(1) * input.size(2);
+
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(output.scalar_type(), FType, {
+        TORCH_TYPE_SWITCH_FP8(input.scalar_type(), QType, {
+            batch_dequantize_tensorwise_impl<FType, QType>(
+                reinterpret_cast<const QType *>(input.data_ptr()),
+                reinterpret_cast<const float *>(scale_inv.data_ptr()),
+                reinterpret_cast<FType *>(output.data_ptr()), batch_num, numel_per_batch, stream);
         });
     });
 

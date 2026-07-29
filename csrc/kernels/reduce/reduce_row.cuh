@@ -30,7 +30,11 @@ __launch_bounds__(BLOCK_SIZE) __global__
     const int64_t block_start = static_cast<int64_t>(blockid_x) * BLOCK_SIZE * UNROLL;
     const InType *input_ptr   = input + blockid_y * inner_len + block_start;
 
-    const bool full_tile = block_start + BLOCK_SIZE * UNROLL <= inner_len;
+    // Row ``blockid_y`` starts at ``blockid_y * inner_len``, so the packed load is
+    // only safe for rows past the first when the row stride preserves the pack
+    // alignment; otherwise fall back to the scalar path.
+    const bool row_aligned = (blockid_y == 0) || (inner_len % UNROLL_N == 0);
+    const bool full_tile   = row_aligned && (block_start + BLOCK_SIZE * UNROLL <= inner_len);
     if (full_tile) {
 #pragma unroll
         for (int mi = 0; mi < UNROLL_M; ++mi) {

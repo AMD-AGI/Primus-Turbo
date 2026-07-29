@@ -22,6 +22,25 @@ from primus_turbo.pytorch.ops.quantization import dequantize_fp8, quantize_fp8
 __all__ = ["FP8AllToAll"]
 
 
+def _quantize_fp8_flat(x: torch.Tensor, out_dtype: torch.dtype, granularity: ScalingGranularity):
+    """Tensorwise quantize of a tensor of any rank.
+
+    The tensorwise kernels take a 2D input, while a whole-tensor scale does not
+    depend on how the elements are laid out across dims, so the tensor is
+    collapsed into a single row and the original shape is restored afterwards.
+    """
+    x_fp8, scale_inv = quantize_fp8(x.view(1, -1), out_dtype, granularity)
+    return x_fp8.view(x.shape), scale_inv
+
+
+def _dequantize_fp8_flat(
+    x: torch.Tensor, out_dtype: torch.dtype, granularity: ScalingGranularity, scale_inv: torch.Tensor
+):
+    """Counterpart of ``_quantize_fp8_flat``."""
+    out = dequantize_fp8(x.view(1, -1), out_dtype, granularity, scale_inv=scale_inv)
+    return out.view(x.shape)
+
+
 class FP8AllToAll(torch.autograd.Function):
     """
     Split input tensor and then scatter the split list to all processes in a group.
@@ -81,7 +100,7 @@ class FP8AllToAll(torch.autograd.Function):
         input_ = input_.contiguous()
         # quant
         if fwd_quant:
-            input_, scale_inv = quantize_fp8(input_, fwd_fp8_dtype, config.granularity)
+            input_, scale_inv = _quantize_fp8_flat(input_, fwd_fp8_dtype, config.granularity)
             dist.all_reduce(scale_inv, op=dist.ReduceOp.MIN, group=group)
             input_ = input_.view(torch.uint8)
 
@@ -114,7 +133,7 @@ class FP8AllToAll(torch.autograd.Function):
             if fwd_quant:
                 output = output.view(fwd_fp8_dtype)
 
-                output = dequantize_fp8(output, orig_dtype, config.granularity, scale_inv=scale_inv)
+                output = _dequantize_fp8_flat(output, orig_dtype, config.granularity, scale_inv)
 
         ctx.config = config
         ctx.group = group
@@ -147,7 +166,7 @@ class FP8AllToAll(torch.autograd.Function):
         grad_output = grad_output.contiguous()
         # quant
         if bwd_quant:
-            grad_output, scale_inv = quantize_fp8(grad_output, bwd_fp8_dtype, config.granularity)
+            grad_output, scale_inv = _quantize_fp8_flat(grad_output, bwd_fp8_dtype, config.granularity)
             dist.all_reduce(scale_inv, op=dist.ReduceOp.MIN, group=ctx.group)
 
             grad_output = grad_output.view(torch.uint8)
@@ -181,7 +200,7 @@ class FP8AllToAll(torch.autograd.Function):
             if bwd_quant:
                 dgrad = dgrad.view(bwd_fp8_dtype)
 
-                dgrad = dequantize_fp8(dgrad, orig_dtype, config.granularity, scale_inv=scale_inv)
+                dgrad = _dequantize_fp8_flat(dgrad, orig_dtype, config.granularity, scale_inv)
 
         return (
             None,

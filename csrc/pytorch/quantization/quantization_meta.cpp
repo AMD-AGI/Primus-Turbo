@@ -16,6 +16,17 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
     return {input_fp8, scale_inv};
 }
 
+std::vector<at::Tensor> batch_quantize_fp8_tensorwise_meta(const at::Tensor          input,
+                                                           const at::ScalarType      dest_dtype,
+                                                           c10::optional<at::Tensor> scale_opt) {
+    PRIMUS_TURBO_CHECK(input.dim() == 3, "batch tensorwise input must be 3D [B, M, N]");
+    auto input_fp8 = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
+    // Mirror the CUDA impl: one scale per leading batch, shaped ``[B, 1]``.
+    auto scale_inv =
+        at::empty({input.size(0), 1}, input.options().dtype(at::kFloat).device(at::kMeta));
+    return {input_fp8, scale_inv};
+}
+
 std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          input,
                                                   const at::ScalarType      dest_dtype,
                                                   const int64_t             axis,
@@ -33,6 +44,13 @@ std::vector<at::Tensor> quantize_fp8_rowwise_meta(const at::Tensor          inpu
 
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                           const at::ScalarType dest_dtype) {
+    at::Tensor output = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
+    return output;
+}
+
+at::Tensor batch_dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                                const at::ScalarType dest_dtype) {
+    PRIMUS_TURBO_CHECK(input.dim() == 3, "batch tensorwise input must be 3D [B, M, N]");
     at::Tensor output = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
     return output;
 }

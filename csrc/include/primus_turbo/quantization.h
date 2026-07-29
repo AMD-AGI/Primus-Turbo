@@ -19,6 +19,13 @@ template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
                               hipStream_t stream);
 
+// Batched tensorwise quantize: x is viewed as [batch_num, numel_per_batch] and
+// batch ``b`` is scaled by ``scale[b]``. All batches are covered by one launch.
+template <typename FType, typename QType, typename ComputeType = float>
+void batch_quantize_tensorwise_impl(const FType *x, const float *scale, QType *y,
+                                    const int64_t batch_num, const int64_t numel_per_batch,
+                                    hipStream_t stream);
+
 // Segment-padded group offsets (each segment rounded up to block_size), on-device.
 template <typename IndexType>
 void compute_padded_group_offs(const IndexType *group_lens_ptr, IndexType *padded_lens_ptr,
@@ -183,6 +190,12 @@ void compute_padded_layout_gpu(const int64_t *group_lens, int64_t *group_lens_pa
 template <typename FType, typename QType, typename ComputeType = float>
 void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y, const int64_t n,
                                 hipStream_t stream);
+
+// Counterpart of ``batch_quantize_tensorwise_impl``: scale_inv has one entry per batch.
+template <typename FType, typename QType, typename ComputeType = float>
+void batch_dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y,
+                                      const int64_t batch_num, const int64_t numel_per_batch,
+                                      hipStream_t stream);
 
 // Rowwise dequantize when the per-row dim is the innermost (last) dim.
 // scale_inv has shape [outer_len] (one scalar per row).
