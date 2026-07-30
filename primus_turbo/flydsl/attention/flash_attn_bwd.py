@@ -1765,10 +1765,11 @@ def _qsplit_for(Sq):
     return 3
 
 
-def _blockkv_for(Sq):
-    # Small Sq: BLOCK_KV=64 fills the grid (kills the tail effect); large Sq: 128
-    # amortises per-tile cost.
-    return 64 if Sq <= 2048 else 128
+def _blockkv_for(Skv):
+    # dkdv is KV-outer, so Skv (not Sq) sets its grid: a short Skv needs BLOCK_KV=64
+    # to fill the CU array, a long one wants 128 to amortise the per-tile cost. Keying
+    # this on Sq costs 19% on rectangular shapes such as Sq=2048, Skv=16384.
+    return 64 if Skv <= 2048 else 128
 
 
 def _dq_block_kv(Sq):
@@ -1815,7 +1816,7 @@ def flydsl_varlen_backward(dout, q, k, v, out, lse_bhsq, B, Sq, Skv, Hq, Hkv, D,
     window_left>=0 = sliding-window causal (valid q+off-W < kv <= q+off)."""
     q_split = _qsplit_for(Sq)
     dq_l, dkdv_l, odo_l = _get_bwd(
-        Hq, Hkv, D, scale, window_left, q_split, _blockkv_for(Sq), _dq_block_kv(Sq)
+        Hq, Hkv, D, scale, window_left, q_split, _blockkv_for(Skv), _dq_block_kv(Sq)
     )
     st = torch.cuda.current_stream()
     # identity delta = -rowsum(O.dO); both kernels center dP by it (exact). odo reads

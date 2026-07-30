@@ -99,6 +99,7 @@ def bench_one(S):
 
 def _auto_it(fn):
     """One timed call sets the iteration count so every block lands near 60 ms."""
+    fn()  # first call carries the JIT compile; do not time it
     torch.cuda.synchronize()
     t = time.time()
     fn()
