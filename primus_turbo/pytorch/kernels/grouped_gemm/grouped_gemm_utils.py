@@ -62,6 +62,8 @@ class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
         prof_kwargs = dict(kwargs)
         prof_kwargs["group_lens"] = lb_group_lens
         prof_kwargs["group_offs"] = lb_group_offs
+        if kwargs.get("group_offs_out", None) is not None:
+            prof_kwargs["group_offs_out"] = lb_group_offs
 
         best_backend = None
         best_time = float("inf")
