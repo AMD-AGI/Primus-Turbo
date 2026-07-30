@@ -98,8 +98,12 @@ def run(name, mg, A=1024, B=256, num_cu=-1):
 
 # (N, num_cu) sweep. N=256 is BLOCK_N-aligned (full-quadrant body); N=384 is the gpt-oss
 # x.5*256 flavour whose last N-block is half padding, so it takes the reduced-quadrant body.
+# Both have an N residue of 0 or exactly BLOCK_N/2, so the store drops its column mask
+# (_COL_SAFE); N=320 (residue 64, reduced body) and N=448 (residue 192, full body) are the
+# residues that keep the mask, and their last N-block overhangs N -- an over-wide store
+# lands in the next output row and shows up as an SNR break.
 # num_cu>0 selects the persistent grid, which walks the tile space in an scf.for.
-VARIANTS = [(256, -1), (384, -1), (384, 256)]
+VARIANTS = [(256, -1), (384, -1), (384, 256), (320, -1), (448, -1)]
 
 
 if __name__ == "__main__":

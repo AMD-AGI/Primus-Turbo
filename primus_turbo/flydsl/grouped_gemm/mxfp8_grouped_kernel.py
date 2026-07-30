@@ -40,7 +40,9 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     _robust_ab_ratio,
     _robust_time,
     ceildiv,
+    ceildiv_pow2,
     compute_global_swizzle,
+    floordiv_pow2,
     make_fp8_buffer_tensor_rebased,
     make_value_attrs,
     wait_barrier,
@@ -449,6 +451,12 @@ def _build_grouped_mxfp8_nt_kernel(
     # static N (the mirror of the runtime c_n); a 256-aligned N emits only the full body.
     _HALF_N = (N % BLOCK_N != 0) and (N % BLOCK_N <= LDS_BLOCK_N)
     _LAST_BN = ceildiv(N, BLOCK_N) - 1
+    # Column span actually stored: BLOCK_N for the full body, LDS_BLOCK_N for the b0-only
+    # one, and only the last N-block can overhang. Both spans stay inside N iff the residue
+    # is 0 or exactly LDS_BLOCK_N, in which case the epilogue's per-store OOB select is dead
+    # work. Unlike the wgrad kernel, the b0-only body drops its c01/c11 stores outright, so
+    # nothing here relies on the column clamp.
+    _COL_SAFE = N % BLOCK_N in (0, LDS_BLOCK_N)
     # CShuffle epilogue staging (store_cshuffle only): one 16-row sub-tile per wave.
     _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
     _cshuf_n = 8 * 16 * (N_TILES_B * 16)
@@ -484,7 +492,7 @@ def _build_grouped_mxfp8_nt_kernel(
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        n_blocks = ceildiv(c_n, BLOCK_N)
+        n_blocks = ceildiv_pow2(c_n, BLOCK_N)
 
         go_pad = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
         go_pad_div = fx.logical_divide(go_pad, fx.make_layout(1, 1))
@@ -495,6 +503,14 @@ def _build_grouped_mxfp8_nt_kernel(
         # (TIGHT sizes), _sas[g] = 64-row A-scale slabs before group g (PADDED sizes).
         # total_tiles = _tcs[G]. Only _tcs is pinned to SGPRs (the boundary compares need
         # it); both prefixes are parked in LDS below so the per-tile lookup is one ds_read.
+        # Both round-ups go through ceildiv_pow2: the scan runs once per workgroup ahead of
+        # the first MFMA with nothing to overlap it, and signed floordiv would put a
+        # divide/remainder/sign-select chain on each of its 2*G steps. Pinning the loaded
+        # offsets themselves to SGPRs (moving the whole chain to the scalar port) was
+        # measured slower -- it serialises the scan on one vmcnt wait per load. Running the
+        # scan on one thread and publishing it was measured neutral: it removes the 8x wave
+        # redundancy but forces the per-tile decode into a log-G chain of dependent
+        # ds_read, which costs back what the redundancy cost.
         _tcs = [fx.Int32(0)]
         _sas = [fx.Int32(0)]
         _acc = fx.Int32(0)
@@ -504,9 +520,9 @@ def _build_grouped_mxfp8_nt_kernel(
         for g in range_constexpr(G):
             nxt = _load_go(go_out_div, g + 1)
             snxt = _load_go(go_pad_div, g + 1)
-            _acc = _acc + ceildiv(nxt - prev, BLOCK_M) * n_blocks
-            _sacc = _sacc + ceildiv(snxt - sprev, 64)
-            _tcs.append(_readfirstlane_i32(_acc))
+            _acc = _acc + _readfirstlane_i32(ceildiv_pow2(nxt - prev, BLOCK_M)) * n_blocks
+            _sacc = _sacc + ceildiv_pow2(snxt - sprev, 64)
+            _tcs.append(_acc)
             _sas.append(_sacc)
             prev = nxt
             sprev = snxt
@@ -612,7 +628,18 @@ def _build_grouped_mxfp8_nt_kernel(
                     store_aux=_cstore_aux,
                 )
             else:
-                store_c = StoreCPerTensor(None, None, C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
+                store_c = StoreCPerTensor(
+                    None,
+                    None,
+                    C,
+                    m_end,
+                    c_n,
+                    mfma.idx,
+                    N_TILES_A,
+                    N_TILES_B,
+                    _out_ty,
+                    col_safe=_COL_SAFE,
+                )
 
             wave_m_offset = wave_m * (N_TILES_A * 16)
             wave_n_offset = wave_n * (N_TILES_B * 16)
@@ -696,12 +723,18 @@ def _build_grouped_mxfp8_nt_kernel(
                     b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K)
                     if const_expr(_rl):
                         sb_alln = sb_s2r.load(sb_base0, k + 1, slab=group_idx)
-                    rocdl.s_barrier()
+                    # The c01/c11 rendezvous pairs only align the waves around an MFMA
+                    # phase; in the b0-only body that phase is empty, so the pair degrades
+                    # to two back-to-back s_barrier bracketing nothing. Every wave of the
+                    # workgroup picks the same body (the predicate is wave-uniform), and
+                    # the LDS WAR guards are the barriers that follow c00 and c10, so
+                    # dropping these leaves the buffer protection intact.
                     if const_expr(_full):
+                        rocdl.s_barrier()
                         rocdl.s_setprio(1)
                         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
                         rocdl.s_setprio(0)
-                    rocdl.s_barrier()
+                        rocdl.s_barrier()
                     a1_frag = a_s2r.load(a_cur1)
                     a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
                     if const_expr(_rl):
@@ -721,7 +754,7 @@ def _build_grouped_mxfp8_nt_kernel(
                         rocdl.s_setprio(1)
                         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
                         rocdl.s_setprio(0)
-                    rocdl.s_barrier()
+                        rocdl.s_barrier()
                     a_cur0, a_next0 = a_next0, a_cur0
                     a_cur1, a_next1 = a_next1, a_cur1
                     b_cur0, b_next0 = b_next0, b_cur0
@@ -746,12 +779,11 @@ def _build_grouped_mxfp8_nt_kernel(
                 rocdl.s_barrier()
                 if const_expr(_full):
                     b1_frag = b_s2r.load(b_cur1)
-                rocdl.s_barrier()
-                if const_expr(_full):
+                    rocdl.s_barrier()
                     rocdl.s_setprio(1)
                     c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
                     rocdl.s_setprio(0)
-                rocdl.s_barrier()
+                    rocdl.s_barrier()
                 a1_frag = a_s2r.load(a_cur1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
@@ -762,7 +794,7 @@ def _build_grouped_mxfp8_nt_kernel(
                     rocdl.s_setprio(1)
                     c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
                     rocdl.s_setprio(0)
-                rocdl.s_barrier()
+                    rocdl.s_barrier()
                 a_cur0, a_next0 = a_next0, a_cur0
                 a_cur1, a_next1 = a_next1, a_cur1
                 b_cur0, b_next0 = b_next0, b_cur0
@@ -782,12 +814,11 @@ def _build_grouped_mxfp8_nt_kernel(
                 rocdl.s_barrier()
                 if const_expr(_full):
                     b1_frag = b_s2r.load(b_cur1)
-                rocdl.s_barrier()
-                if const_expr(_full):
+                    rocdl.s_barrier()
                     rocdl.s_setprio(1)
                     c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1)
                     rocdl.s_setprio(0)
-                rocdl.s_barrier()
+                    rocdl.s_barrier()
                 a1_frag = a_s2r.load(a_cur1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
@@ -1429,13 +1460,16 @@ def _build_grouped_mxfp8_wgrad_kernel(
             )
             m_start = _load_go(go_div, group_idx)
             m_end = _load_go(go_div, group_idx + 1)
-            k_iters = (m_end - m_start) // BLOCK_K  # runtime; M_g padded to 128 -> exact
+            # All three quotients are non-negative with power-of-two divisors, so they go
+            # through floordiv_pow2: signed floordiv would put a divide/remainder/sign-select
+            # chain on the per-workgroup prologue, which has no MFMA to hide behind.
+            k_iters = floordiv_pow2(m_end - m_start, BLOCK_K)  # M_g padded to 128 -> exact
             # Scales are packed per group from the group's own contraction start, so the
             # scale index is group-local and the base is (ks0//pack + g): the one spare
             # dword per group keeps the regions disjoint for any group offset (no 512
             # alignment assumed), at the cost of G spare dwords in the K-stride.
-            kp0 = m_start // (BLOCK_K * pack) + group_idx
-            k128p = m_total // (BLOCK_K * pack) + fx.Int32(G)
+            kp0 = floordiv_pow2(m_start, BLOCK_K * pack) + group_idx
+            k128p = floordiv_pow2(m_total, BLOCK_K * pack) + fx.Int32(G)
 
             lane_id = fx.thread_idx.x % 64
             wave_id = fx.thread_idx.x // 64

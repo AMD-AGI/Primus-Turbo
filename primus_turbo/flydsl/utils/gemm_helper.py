@@ -32,6 +32,24 @@ def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def ceildiv_pow2(a, b: int):
+    """``ceildiv(a, b)`` for a power-of-two ``b`` and a non-negative device value ``a``.
+
+    ``a // b`` on a signed DSL value lowers to ``arith.floordivsi``: a divide plus a
+    remainder plus the sign-mismatch compare/select correction, ~15 ISA instructions
+    even for a constant power of two. The shift is one. Use it on runtime values on a
+    hot path; plain ``ceildiv`` stays for host-side ints."""
+    assert b > 0 and (b & (b - 1)) == 0
+    return (a + (b - 1)) >> (b.bit_length() - 1)
+
+
+def floordiv_pow2(a, b: int):
+    """``a // b`` for a power-of-two ``b`` and a non-negative device value ``a``; see
+    ``ceildiv_pow2`` for why the signed floordiv lowering is worth avoiding."""
+    assert b > 0 and (b & (b - 1)) == 0
+    return a >> (b.bit_length() - 1)
+
+
 _PRESHUF_KT = 16  # scale-preshuffle k-tile (rows*KT dwords staged in LDS per workgroup)
 
 
@@ -513,13 +531,30 @@ class StoreCPerTensor:
     re-based per row band in 64-bit index (int64-safe, M*N > 4GB) via
     ``make_row_band_resource``; columns past c_cols clamp to an OOB index (HW SRD
     drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
+
+    ``col_safe``: caller-proven "every column this store touches is < c_cols", which
+    drops the per-store OOB select (one v_cndmask each, ~1/4 of the epilogue). Only
+    pass it when the tile's column span is bounded at compile time AND no dead
+    N-quadrant is being dropped by the column clamp.
     """
 
     def __init__(
-        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, elem_fn=None
+        self,
+        A_scale,
+        B_scale,
+        C,
+        c_rows,
+        c_cols,
+        c_idx_fn,
+        n_tiles_a,
+        n_tiles_b,
+        out_ty,
+        elem_fn=None,
+        col_safe=False,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
+        self.col_safe = col_safe
         self.lane_id = fx.thread_idx.x % 64
         self.c_idx_fn = c_idx_fn
         self.n_tiles_a = n_tiles_a
@@ -549,7 +584,7 @@ class StoreCPerTensor:
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
-                col_valid = col < self.c_cols
+                col_valid = None if self.col_safe else col < self.c_cols
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
                     val = vec_f32[i] * scale if self.scaled else vec_f32[i]
