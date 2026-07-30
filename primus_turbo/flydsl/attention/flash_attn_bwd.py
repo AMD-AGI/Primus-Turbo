@@ -1065,6 +1065,7 @@ def build_flash_attn_bwd_dq_module(
     fold_lse=None,  # None = fold on the hw-exp path only (see below)
     batch_size=None,  # compile-time B; required for SBHD seq-step stride bake
     sbhd=False,       # SBHD [S,B,H,D] native layout (seq-step = B*H*D)
+    fuse_delta=False,  # compute DELTA here from O (K16 slot) instead of a separate odo pass
 ):
     """Build the dQ Q-outer backward launcher (16x16x32 mirror of dkdv).
 
@@ -1154,7 +1155,7 @@ def build_flash_attn_bwd_dq_module(
         LSE: fx.Tensor,
         DELTA: fx.Tensor,
         DQ: fx.Tensor,
-        K16: fx.Tensor,
+        O: fx.Tensor,  # fuse_delta: O for the DELTA reduce; otherwise unused placeholder slot
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
     ):
@@ -1175,6 +1176,12 @@ def build_flash_attn_bwd_dq_module(
 
         def _fmul(a, b):
             return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
+
+        def _fadd(a, b):
+            return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
+
+        def _fsub(a, b):
+            return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
 
         def mfma_acc(a, b, c):
             return _mfma(rocdl.mfma_f32_16x16x32_bf16, a, b, c)
@@ -1318,6 +1325,10 @@ def build_flash_attn_bwd_dq_module(
         delta_in_rsrc = buffer_ops.create_buffer_resource(
             DELTA, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
         )
+        if const_expr(fuse_delta):
+            o_rsrc = buffer_ops.create_buffer_resource(
+                O, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
+            )
 
         # ---- DMA-to-LDS for the K/V tiles (buffer_load_dwordx4 ... lds). ----
         if const_expr(ENABLE_DMA):
@@ -1381,6 +1392,7 @@ def build_flash_attn_bwd_dq_module(
 
         q_b_packs = [[None] * K_STEPS_QK for _ in range_constexpr(QT)]
         do_b_packs = [[None] * K_STEPS_QK for _ in range_constexpr(QT)]
+        d_parts = [fx.Float32(0.0) for _ in range_constexpr(QT)]
         for qt in range_constexpr(QT):
             _qr = q_row_of(qt)
             for ks in range_constexpr(K_STEPS_QK):
@@ -1391,6 +1403,18 @@ def build_flash_attn_bwd_dq_module(
                 do_b_packs[qt][ks] = buffer_ops.buffer_load(
                     do_rsrc, global_idx_q(_qr, q_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
                 )
+                if const_expr(fuse_delta):
+                    # This lane's slice of row _qr: O.dO over the 8 D it holds. The O
+                    # pack dies here (only the f32 partial stays live), so the reduce
+                    # adds one in-flight dwordx4, not a second B-operand set.
+                    _o_v = Vec(
+                        buffer_ops.buffer_load(
+                            o_rsrc, global_idx_q(_qr, q_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
+                        )
+                    ).to(fx.Float32)
+                    _od = _o_v * Vec(do_b_packs[qt][ks]).to(fx.Float32)
+                    for i in range_constexpr(MFMA_LANE_K):
+                        d_parts[qt] = fx.Float32(_fadd(d_parts[qt], Vec(_od)[i]))
 
         # ---- FOLD: prescale the owned Q by sm*log2e once per work-group (amortized
         # over the whole causal kv-loop). Q feeds GEMM1a only -- dQ is accumulated from
@@ -1411,9 +1435,38 @@ def build_flash_attn_bwd_dq_module(
             lse_owned.append(
                 fx.Float32(buffer_ops.buffer_load(lse_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32))
             )
-            delta_owned.append(
-                fx.Float32(buffer_ops.buffer_load(delta_in_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32))
-            )
+            if const_expr(not fuse_delta):
+                delta_owned.append(
+                    fx.Float32(buffer_ops.buffer_load(delta_in_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32))
+                )
+        if const_expr(fuse_delta):
+            # DELTA[b,hq,q] = -rowsum_d(O.dO). A row's 64 D are split over the 4
+            # K-subgroup lanes that share lane16, so the row total is a 2-step xor
+            # butterfly over kg (masks 16,32) -- ds_bpermute is the LDS crossbar only,
+            # no allocation and no barrier, the same reduce the standalone odo kernel
+            # runs over its lane groups. Every (b,hq,q) row is OWNED by exactly one
+            # work-group, so one lane per row (kg==0) stores it for dkdv, which still
+            # reads DELTA; the rows this tile only traces are recomputed, not stored.
+            _lane_i32 = fx.Int32(lane)
+            for _m in [M_TILE, 2 * M_TILE]:
+                _idx = _raw((_lane_i32 ^ fx.Int32(_m)) * fx.Int32(4))
+                for qt in range_constexpr(QT):
+                    _part = _raw(Vec.from_elements([d_parts[qt]], fx.Float32).bitcast(fx.Int32)[0])
+                    _peer = rocdl.ds_bpermute(fx.Int32.ir_type, _idx, _part)
+                    _peer_f = fx.Float32(
+                        _raw(Vec.from_elements([fx.Int32(_peer)], fx.Int32).bitcast(fx.Float32)[0])
+                    )
+                    d_parts[qt] = fx.Float32(_fadd(d_parts[qt], _peer_f))
+            for qt in range_constexpr(QT):
+                delta_owned.append(fx.Float32(_fsub(fx.Float32(0.0), d_parts[qt])))
+                _q_row = q_row_of(qt)
+                buffer_ops.buffer_store(
+                    delta_owned[qt],
+                    delta_in_rsrc,
+                    (q_head_idx * seq_len_q_v + _q_row) * fx.Index(4),
+                    mask=ArithValue(_q_row < _q_store_end) & ArithValue(kg == fx.Index(0)),
+                    offset_is_bytes=True,
+                )
 
         # ---- Constants ----
         c_neg_inf = fx.Float32(float("-inf"))
@@ -1758,7 +1811,7 @@ def build_flash_attn_bwd_dq_module(
         LSE: fx.Tensor,
         DELTA: fx.Tensor,
         DQ: fx.Tensor,
-        K16: fx.Tensor,
+        O: fx.Tensor,
         batch_size: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
@@ -1791,7 +1844,7 @@ def build_flash_attn_bwd_dq_module(
             LSE,
             DELTA,
             DQ,
-            K16,
+            O,
             seq_len_q,
             seq_len_k,
             value_attrs={
@@ -1855,6 +1908,33 @@ def _dq_block_kv(Sq):
 
 
 _BWD_CACHE: dict = {}
+# Fold the odo (DELTA = -rowsum_d(O.dO)) pass into the dq kernel and drop its launch:
+# dq is Q-outer and already streams dO, so it reduces DELTA for the q rows it owns,
+# saving one kernel launch and the 268MB O HBM re-read.
+_FUSE_DELTA = True
+
+
+def _defer_delta(dq_launch):
+    """Adapt a fuse_delta dq launcher to the legacy odo -> dq -> dkdv call order.
+
+    The fused dq kernel produces DELTA itself, so the odo launcher has no kernel
+    left to launch: it only forwards its O tensor (holding a reference, which may be
+    the only one when the caller passes a freshly cast temporary) to the next dq
+    launch, where O occupies the argument slot the unused K16 used to occupy.
+    Callers that drive the sequence themselves pass O to dq directly instead.
+    """
+    pending = []
+
+    def _odo(O, DO, DELTA, batch_size, seq_len, stream):
+        pending.clear()
+        pending.append(O)
+
+    def _dq(Q, K, V, DO, LSE, DELTA, DQ, O, *rest):
+        if pending:
+            O = pending.pop()
+        return dq_launch(Q, K, V, DO, LSE, DELTA, DQ, O, *rest)
+
+    return _dq, _odo
 
 
 def _get_bwd(Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64, batch_size=None, sbhd=False):
@@ -1870,17 +1950,23 @@ def _get_bwd(Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64, 
             num_kv_heads=Hkv,
             window_left=window_left,
         )
-        launchers = (
-            build_flash_attn_bwd_dq_module(
-                block_kv=dq_block_kv, waves_per_eu=1, batch_size=batch_size, sbhd=sbhd, **common
-            ),
-            build_flash_attn_bwd_dkdv_module(
-                q_split=q_split, block_kv=block_kv, batch_size=batch_size, sbhd=sbhd, **common
-            ),
-            build_flash_attn_bwd_odo_module(
-                num_heads=Hq, head_dim=D, num_kv_heads=Hkv, sm_scale=scale, sbhd=sbhd
-            ),
+        dq_l = build_flash_attn_bwd_dq_module(
+            block_kv=dq_block_kv, waves_per_eu=1, batch_size=batch_size, sbhd=sbhd,
+            fuse_delta=_FUSE_DELTA, **common
         )
+        dkdv_l = build_flash_attn_bwd_dkdv_module(
+            q_split=q_split, block_kv=block_kv, batch_size=batch_size, sbhd=sbhd, **common
+        )
+        if _FUSE_DELTA:
+            # The fused dq kernel produces DELTA itself; the standalone odo kernel is
+            # never launched here. _defer_delta forwards O into dq's freed slot and
+            # keeps the legacy odo -> dq -> dkdv call order for callers.
+            dq_l, odo_l = _defer_delta(dq_l)
+        else:
+            odo_l = build_flash_attn_bwd_odo_module(
+                num_heads=Hq, head_dim=D, num_kv_heads=Hkv, sm_scale=scale, sbhd=sbhd
+            )
+        launchers = (dq_l, dkdv_l, odo_l)
         _BWD_CACHE[key] = launchers
     return launchers
 
@@ -1906,13 +1992,16 @@ def flydsl_varlen_backward(
         batch_size=B, sbhd=sbhd,
     )
     st = torch.cuda.current_stream()
-    # identity delta = -rowsum(O.dO); both kernels center dP by it (exact). odo reads
-    # bf16, so cast out/dout (no-op when they already are).
+    # identity delta = -rowsum(O.dO); both kernels center dP by it (exact). dq owns the
+    # reduce (it already holds dO in registers) and stores DELTA for dkdv when
+    # _FUSE_DELTA is on, so no odo launch is needed; O is cast to bf16 (no-op when out
+    # is already bf16) and passed into dq's freed slot via _defer_delta.
     delta = torch.empty(B, Hq, Sq, device=q.device, dtype=torch.float32)
-    odo_l(out.to(q.dtype).reshape(-1), dout.to(q.dtype).reshape(-1), delta.reshape(-1), B, Sq, st)
+    o16 = out.to(q.dtype).reshape(-1)
+    if not _FUSE_DELTA:
+        odo_l(o16, dout.to(q.dtype).reshape(-1), delta.reshape(-1), B, Sq, st)
     lse_s = _prescale_lse(lse_bhsq)
     dq = torch.empty_like(q)
-    k16 = torch.empty(1, device=q.device, dtype=q.dtype)  # unused kernel arg
     # SBHD workspace [q_split,Skv,B,Hkv,D]: summing the leading q_split axis yields
     # [Skv,B,Hkv,D] contiguous == native SBHD dk/dv (no permute). THD keeps
     # [B,q_split,Skv,Hkv,D] -> sum(dim=1) -> [B*Skv,Hkv,D].
@@ -1924,7 +2013,7 @@ def flydsl_varlen_backward(
         ws_dv = torch.empty(B, q_split, Skv, Hkv, D, device=q.device, dtype=v.dtype)
     qf, kf, vf, dof = q.reshape(-1), k.reshape(-1), v.reshape(-1), dout.reshape(-1)
     lsef, df = lse_s.reshape(-1), delta.reshape(-1)
-    dq_l(qf, kf, vf, dof, lsef, df, dq.reshape(-1), k16, B, Sq, Skv, st)
+    dq_l(qf, kf, vf, dof, lsef, df, dq.reshape(-1), o16, B, Sq, Skv, st)
     dkdv_l(qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1), B, Sq, Skv, st)
     if sbhd:
         dk = ws_dk.sum(dim=0)  # [Skv,B,Hkv,D] SBHD contiguous
