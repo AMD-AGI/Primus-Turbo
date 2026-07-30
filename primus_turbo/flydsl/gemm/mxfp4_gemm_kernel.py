@@ -14,7 +14,7 @@
 
 """4-wave MXFP4 dense GEMM (per-32-K E8M0 block scaling) for AMD CDNA4 (gfx950).
 
-NT only: A [M, K] fp4 (packed 2/byte), B [N, K] fp4, C = a @ b^T (bf16).
+NT only: A [M, K] fp4 (packed 2/byte), B [N, K] fp4, C = a @ b^T (bf16 or fp16).
 
 The 4-wave (2x2 wave)
 topology gives 1 wave/SIMD so the full 256-AGPR file holds one wave's N-sliced
@@ -197,7 +197,7 @@ class S2RLoaderFp4:
 
 
 class StoreCPlain:
-    """Plain FP32 accumulator -> BF16 store (no scaling; scales folded in MMA).
+    """Plain FP32 accumulator -> bf16/fp16 store (no scaling; scales folded in MMA).
 
     Uses ``fx.copy`` over a single divided output view + OOB-index redirect for the
     column-edge mask (``arith.select(col_valid, c_index, oob)``), which the backend
@@ -208,7 +208,7 @@ class StoreCPlain:
 
     ``out_ty`` is bf16 or fp16 (both 2 bytes). The narrow ``store`` path uses a generic
     f32->out_ty ``.to()`` cast so it serves either; the wide ``store_tacc_wide`` fast
-    path is bf16-only (``cvt_pk_bf16_f32``), so fp16 output forces the narrow path."""
+    path packs through ``_pack_pair``, which serves either too."""
 
     def __init__(self, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty=None):
         self.c_rows = c_rows
@@ -240,6 +240,12 @@ class StoreCPlain:
                     off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
                     buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
 
+    def _pack_pair(self, x0, x1):
+        if const_expr(self.out_ty is fx.Float16):
+            halves = Vec.from_elements([x0.to(fx.Float16), x1.to(fx.Float16)], fx.Float16)
+            return halves.bitcast(fx.Int32)[0]
+        return rocdl.cvt_pk_bf16_f32(x0, x1)
+
     @staticmethod
     def _permlane16_swap(a_i32, b_i32):
         """v_permlane16_swap_b32 a, b -- swap 16-lane row-groups between two regs
@@ -263,10 +269,10 @@ class StoreCPlain:
     def store_tacc_wide(self, c_frag, base_row, base_col):
         """TACC + AITER permlane16_swap WIDE store (autotune-selected TACCW variant). Combines TWO
         adjacent N sub-blocks (tj, tj+1) into a 16-row x 32-col region written with
-        ONE ``buffer_store_dwordx4`` (8 bf16 = 16B) per lane.
+        ONE ``buffer_store_dwordx4`` (8 out_ty = 16B) per lane.
 
-        With acc = Cᵀ a lane's 4 f32 are 4 CONSECUTIVE columns. Pack them to 2 bf16
-        dwords (cvt_pk), then 2x ``v_permlane16_swap`` reshuffle the 4 row-groups so
+        With acc = Cᵀ a lane's 4 f32 are 4 CONSECUTIVE columns. Pack them to 2 out_ty
+        dwords (``_pack_pair``), then 2x ``v_permlane16_swap`` reshuffle the 4 row-groups so
         each lane ends up holding 8 CONTIGUOUS columns (AITER's exact recipe):
             rg0 -> tj   cols 0..7    rg1 -> tj+1 cols 0..7
             rg2 -> tj   cols 8..15   rg3 -> tj+1 cols 8..15
@@ -293,21 +299,21 @@ class StoreCPlain:
         def _xpose(ti, tj):
             A = Vec(c_frag[self.c_idx_fn(ti, tj)])
             B = Vec(c_frag[self.c_idx_fn(ti, tj + 1)])
-            d_a0 = rocdl.cvt_pk_bf16_f32(A[0], A[1])
-            d_a1 = rocdl.cvt_pk_bf16_f32(A[2], A[3])
-            d_b0 = rocdl.cvt_pk_bf16_f32(B[0], B[1])
-            d_b1 = rocdl.cvt_pk_bf16_f32(B[2], B[3])
+            d_a0 = self._pack_pair(A[0], A[1])
+            d_a1 = self._pack_pair(A[2], A[3])
+            d_b0 = self._pack_pair(B[0], B[1])
+            d_b1 = self._pack_pair(B[2], B[3])
             v16, v18 = self._permlane16_swap(d_a0, d_b0)
             v17, v19 = self._permlane16_swap(d_a1, d_b1)
-            return Vec.from_elements([v16, v17, v18, v19], fx.Int32).bitcast(fx.BFloat16)
+            return Vec.from_elements([v16, v17, v18, v19], fx.Int32).bitcast(self.out_ty)
 
         # Software-pipeline cvt+permlane (phase1) away from the stores (phase2) so the
         # permlane16_swap->store RAW hazard (~80 exposed s_nop) is filled by independent
         # permlane work of later tiles instead of stalls.
         slots = [(ti, 2 * p) for ti in range_constexpr(nta) for p in range_constexpr(ntb // 2)]
         vecs = [_xpose(ti, tj) for (ti, tj) in slots]
-        for vec_bf, (ti, tj) in zip(vecs, slots):
-            buffer_ops.buffer_store(vec_bf, rsrc, _off(ti, tj), offset_is_bytes=True)
+        for vec_out, (ti, tj) in zip(vecs, slots):
+            buffer_ops.buffer_store(vec_out, rsrc, _off(ti, tj), offset_is_bytes=True)
 
 
 # ── Scaled MFMA whole-loop emitter ───────────────────────────────────────────
@@ -924,10 +930,6 @@ def _build_mxfp4_gemm_kernel(
     BLOCK_M = 256
     BLOCK_N = 256
     BLOCK_K = 256
-    # bf16/fp16 output: only the f32->out_ty cast in the store differs. fp16 uses the
-    # narrow scalar store (generic ``.to``); the wide TACCW store is bf16-only, so the
-    # caller forces taccw=False for fp16.
-    _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     # const_expr() resolves compile-time branches from LOCALS/params, not reliably from
     # module globals -> alias the per-shape epilogue selection to locals before traced use.
     _l_taccw = taccw  # autotune-selected per shape (never-regress epilogue variant axis)
@@ -1050,6 +1052,9 @@ def _build_mxfp4_gemm_kernel(
         # split-K writes partials to workspace C[ksplit*M, N] (row band split*M); the
         # StoreCPlain c_rows only bounds the SRD (not used in the index), so widen it.
         _c_store_rows = c_m if const_expr(ksplit == 1) else c_m * fx.Int32(ksplit)
+        # bf16/fp16 output: only the f32->out_ty cast in the store differs. Both the narrow
+        # scalar store (generic ``.to``) and the wide TACCW store serve either dtype.
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
         store_c = StoreCPlain(C, _c_store_rows, c_n, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty)
 
         wave_m_off = wave_m * (N_TILES_A * 16)  # 0 or 128
@@ -1309,8 +1314,9 @@ def _build_mxfp4_gemm_kernel(
 # ── Primus-Turbo host wrapper ────────────────────────────────────────────────
 
 _MXFP4_LAUNCH_CACHE: dict = {}  # (K, gm, xcd, gn, wlv, elgk, coop, ksplit, taccw, out_fp16) -> fused launch
-_MXFP4_AT_CACHE: dict = {}  # (M, N, K, gm, xcd, gn, wlv, elgk, taccw, coop) -> [raw, compiled_or_None]
-_MXFP4_CFG_CACHE: dict = {}  # (M, N, K) -> (gm, gn, xcd, wlv, elgk, taccw, coop)
+# (M, N, K, gm, xcd, gn, wlv, elgk, taccw, coop, out_fp16) -> [raw, compiled_or_None]
+_MXFP4_AT_CACHE: dict = {}
+_MXFP4_CFG_CACHE: dict = {}  # (M, N, K, out_fp16) -> (gm, gn, xcd, wlv, elgk, taccw, coop)
 
 
 def _mxfp4_nt_config(M, N, K):
@@ -1347,16 +1353,17 @@ def _mxfp4_swizzle_candidates(M, N, K):
     return cands[:3]
 
 
-def _autotune_mxfp4_config(M, N, K, args):
-    """Pick (group_m, group_n, num_xcds) for this (M, N, K) by a quick timed sweep
-    over ``_mxfp4_swizzle_candidates`` (<=3) on the real operands; cached per shape.
+def _autotune_mxfp4_config(M, N, K, args, out_fp16=False):
+    """Pick (group_m, group_n, num_xcds) for this (M, N, K, out dtype) by a quick timed
+    sweep over ``_mxfp4_swizzle_candidates`` (<=3) on the real operands; cached per shape
+    and store dtype.
 
     The swizzle only remaps which workgroup computes which output tile, so every
     candidate is bit-identical -- we are purely chasing L2 residency / tail balance.
     Skipped (falls back to the static heuristic) during CUDA-graph capture (cannot
     time inside capture). Compiled winners are stashed in _MXFP4_AT_CACHE so the
     subsequent real launch reuses them with no recompile."""
-    key = (M, N, K)
+    key = (M, N, K, out_fp16)
     cached = _MXFP4_CFG_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1383,10 +1390,10 @@ def _autotune_mxfp4_config(M, N, K, args):
     for _wlv, _elgk in _wl_opts:
         for gm, gn, xcd in _mxfp4_swizzle_candidates(M, N, K):
             try:
-                at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, False, False)
+                at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, False, False, out_fp16)
                 entry = _MXFP4_AT_CACHE.get(at_key)
                 if entry is None:
-                    raw = _get_mxfp4_fused_launch(K, gm, xcd, gn, _wlv, _elgk, coop=False)
+                    raw = _get_mxfp4_fused_launch(K, gm, xcd, gn, _wlv, _elgk, coop=False, out_fp16=out_fp16)
                     entry = [raw, flyc.compile(raw, *args)]
                     _MXFP4_AT_CACHE[at_key] = entry
                 compiled_cands.append(((gm, gn, xcd, _wlv, _elgk), entry[1]))
@@ -1438,13 +1445,15 @@ def _autotune_mxfp4_config(M, N, K, args):
     if _try_var:
         gm0, gn0, xcd0, w0, e0 = best[:5]
         try:
-            df_compiled = _MXFP4_AT_CACHE[(M, N, K, gm0, xcd0, gn0, w0, e0, False, False)][1]
+            df_compiled = _MXFP4_AT_CACHE[(M, N, K, gm0, xcd0, gn0, w0, e0, False, False, out_fp16)][1]
             variants = []  # (taccw, coop, compiled)
             for _cp, _tw in ((False, True), (True, False), (True, True)):
-                vkey = (M, N, K, gm0, xcd0, gn0, w0, e0, _tw, _cp)
+                vkey = (M, N, K, gm0, xcd0, gn0, w0, e0, _tw, _cp, out_fp16)
                 ventry = _MXFP4_AT_CACHE.get(vkey)
                 if ventry is None:
-                    vraw = _get_mxfp4_fused_launch(K, gm0, xcd0, gn0, w0, e0, taccw=_tw, coop=_cp)
+                    vraw = _get_mxfp4_fused_launch(
+                        K, gm0, xcd0, gn0, w0, e0, taccw=_tw, coop=_cp, out_fp16=out_fp16
+                    )
                     ventry = [vraw, flyc.compile(vraw, *args)]
                     _MXFP4_AT_CACHE[vkey] = ventry
                 variants.append((_tw, _cp, ventry[1]))
@@ -1489,7 +1498,7 @@ def _autotune_mxfp4_config(M, N, K, args):
     return best
 
 
-_MXFP4_KSPLIT_CACHE: dict = {}  # (M, N, K) -> chosen ksplit (timed, never regresses vs 1)
+_MXFP4_KSPLIT_CACHE: dict = {}  # (M, N, K, out_fp16) -> chosen ksplit (timed, never regresses vs 1)
 
 
 def _ksplit_candidates(M, N, K):
@@ -1768,9 +1777,7 @@ def gemm_mxfp4_flydsl_kernel(
 
     def _exec_plain():
         # default one-WG-per-tile path (autotuned swizzle / pipe depth / scale-load / wide store).
-        gm, gn, xcd, _wlv, _elgk, _taccw, _coop = _autotune_mxfp4_config(M, N, K, fused_args)
-        # fp16 has no wide (TACCW) store path -> force the narrow scalar store.
-        _tw = _taccw and not out_fp16
+        gm, gn, xcd, _wlv, _elgk, _tw, _coop = _autotune_mxfp4_config(M, N, K, fused_args, out_fp16)
         launch = _get_mxfp4_fused_launch(
             K, gm, xcd, gn, _wlv, _elgk, taccw=_tw, coop=_coop, out_fp16=out_fp16
         )
@@ -1791,8 +1798,8 @@ def gemm_mxfp4_flydsl_kernel(
 
     def _exec_split(ksplit):
         # split-K: grid x ksplit fills the CUs on few-tile large-K shapes. Each split writes
-        # its K/ksplit partial into a bf16 workspace[ksplit*M, N]; host sums the ksplit row
-        # bands (BW-bound bf16 reduce, faster than an atomic-fused reduce for these shapes).
+        # its K/ksplit partial into an out_dtype workspace[ksplit*M, N]; host sums the ksplit
+        # row bands (BW-bound reduce, faster than an atomic-fused reduce for these shapes).
         # The fused stub still preshuffles A/B into a_sp/b_sp before the split GEMM.
         gm, gn, xcd = _mxfp4_nt_config(M, N, K)
         ws = torch.empty((ksplit * M, N), dtype=out_dtype, device=a.device)
@@ -1818,13 +1825,13 @@ def gemm_mxfp4_flydsl_kernel(
     # The autotune times {plain, split+reduce} end-to-end on the real operands and takes the
     # global min, so split-K is used ONLY where it actually wins and never regresses a shape.
     # Skipped during graph capture (uses the cached pick).
-    ks = _MXFP4_KSPLIT_CACHE.get((M, N, K))
+    ks = _MXFP4_KSPLIT_CACHE.get((M, N, K, out_fp16))
     if ks is None:
         cands = _ksplit_candidates(M, N, K)
         if _capturing or len(cands) == 1:
             ks = 1  # cannot time inside capture / nothing to try
             if not _capturing:
-                _MXFP4_KSPLIT_CACHE[(M, N, K)] = ks
+                _MXFP4_KSPLIT_CACHE[(M, N, K, out_fp16)] = ks
         else:
 
             def _bench(fn):
@@ -1851,7 +1858,7 @@ def gemm_mxfp4_flydsl_kernel(
                 except Exception:  # noqa: BLE001 -- a bad variant must not break the GEMM
                     continue
             ks = min(times, key=times.get) if times else 1
-            _MXFP4_KSPLIT_CACHE[(M, N, K)] = ks
+            _MXFP4_KSPLIT_CACHE[(M, N, K, out_fp16)] = ks
 
     out2 = _exec_split(ks) if ks > 1 else _exec_plain()
     return out2.t().contiguous() if trans_c else out2
