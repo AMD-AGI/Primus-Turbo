@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm, vector
+from flydsl._mlir.dialects import fly, llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
@@ -98,18 +98,21 @@ def _read_exec_i64():
     return rocdl.ballot(T.i64, true_i1)
 
 
-def _ds_read_tr16_b64_imm(result_type, addr_i32, imm_offset=0):
-    """gfx950 ds_read_b64_tr_b16 with DUALWAVE_SWP immediate byte offset."""
-    imm = int(imm_offset)
-    raw_type = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
-    raw = llvm.inline_asm(
-        raw_type,
-        [as_mlir_value(addr_i32)],
-        f"ds_read_b64_tr_b16 $0, $1 offset:{imm}\n",
-        "=v,v,~{memory}",
-        has_side_effects=True,
+def _ds_read_tr16_b64(traits, result_type, base_ptr, imm_bytes, buf_id):
+    """gfx950 ds_read_b64_tr_b16 at a constant byte offset from a per-lane V base.
+
+    Emitted as the rocdl op, not inline asm: asm is opaque to SIInsertWaitcnts, so
+    every consumer would need a hand-written lgkmcnt plus a sched_barrier. The op
+    carries a real LDS memory effect, so the backend places the waits itself.
+    """
+    scope_name = _dualwave_lds_scope("v", buf_id)
+    ptr = buffer_ops.get_element_ptr(base_ptr, byte_offset=int(imm_bytes), elem_type=T.i8)
+    return rocdl.ds_read_tr16_b64_(
+        result_type,
+        as_mlir_value(ptr),
+        alias_scopes=_dualwave_lds_alias_scopes(scope_name),
+        noalias_scopes=_dualwave_lds_noalias_scopes(scope_name, traits.LDS_SCOPE_NAMES),
     )
-    return vector.BitCastOp(result_type, raw).result
 
 
 # Arithmetic and inline-asm primitives
@@ -306,7 +309,25 @@ def _anchor_v_o(traits, v_o):
     return [llvm.extractvalue(acc_irs[dc].type, ret, [dc]) for dc in range_constexpr(traits.D_CHUNKS)]
 
 
+def _rowsum_ones_a_operand(traits, lane, elem_dtype):
+    """A operand of the 16x16x32 row-sum MFMA.
+
+    Re-reading a packed P slice as 16x16x32 puts col = lane%16, k = 8*(lane//16)+i,
+    so the two q halves interleave along k. Rows 0/8 select the low half and 4/12
+    the high half, leaving each lane's own q sum in D element 0, no cross-lane move.
+    """
+    one_bits = 0x3F803F80 if const_expr(traits.DTYPE_STR == "bf16") else 0x3C003C00
+    is_tap_row = ArithValue(fx.Index(lane % 4) == fx.Index(0))
+    half_match = ArithValue(fx.Index((lane // 4) % 2) == fx.Index((lane // 16) % 2))
+    dword = is_tap_row.select(half_match.select(fx.Int32(one_bits), fx.Int32(0)), fx.Int32(0))
+    return Vec.from_elements([dword] * 4, fx.Int32).bitcast(elem_dtype).ir_value()
+
+
 def _anchor_v_p(traits, v_p, elem_dtype):
+    # A fixed reference max never rescales P, so there is no ordering left to pin and the
+    # tied-operand asm only costs register copies.
+    if const_expr(traits.DUALWAVE_SWP_FIXED_MAX):
+        return v_p
     p_lo, p_hi = v_p
     p_lo_all = _concat_vectors(p_lo[0], p_lo[1])
     p_hi_all = _concat_vectors(p_hi[0], p_hi[1])
@@ -385,10 +406,13 @@ def _scale_v_p(traits, v_p, scale_scalar, elem_dtype, fm_fast):
 
 def _bf16_trunc_pack_v8(traits, f32_vals, elem_dtype):
     if const_expr(traits.DTYPE_STR == "bf16"):
-        pairs = []
-        for j in range_constexpr(4):
-            pairs.append(rocdl.cvt_pk_bf16_f32(f32_vals[j * 2], f32_vals[j * 2 + 1]))
-        return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
+        # A vector fptrunc still selects v_cvt_pk_bf16_f32 pairwise, but as a scored op:
+        # the backend places the pack-to-MFMA wait states itself, so consumers need no
+        # hand fence (inline asm hides the VGPR def from GCNHazardRecognizer).
+        f32_vec = Vec.from_elements([as_mlir_value(v) for v in f32_vals], fx.Float32)
+        trunc_op = llvm.FPTruncOp(Vec.make_type(8, elem_dtype), as_mlir_value(f32_vec))
+        trunc_op.operation.attributes["fastmathFlags"] = ir.Attribute.parse("#llvm.fastmath<fast>")
+        return trunc_op.result
     # fp16: truncate each f32 -> f16 (RNE) and build the v8 pack directly.
     f16_vals = []
     for i in range_constexpr(8):
@@ -840,12 +864,6 @@ def _swizzled_v_imm_lo(traits, dc, k_substep):
     ) * traits.BF16_BYTES
 
 
-def _ds_read_tr_v4f16_imm(lds_base_elem_idx, imm_bytes, lds_kv_base_idx, v_lds_read_vec4_type):
-    byte_offset = lds_base_elem_idx * 2 + lds_kv_base_idx
-    addr_i32 = fx.Int32(byte_offset)
-    return _ds_read_tr16_b64_imm(v_lds_read_vec4_type, addr_i32, imm_bytes)
-
-
 def _seq_pad_col_base(traits, tile_idx, lane_div_32):
     """Base KV column for this lane's lo-half scores at `tile_idx`."""
     _lane_n_off = 8 if traits.KV_VECTORIZED else 4
@@ -944,7 +962,14 @@ def _init_dualwave_thread_mapping(ctx):
     Shared verbatim by DualwaveKernelContext and DualwaveFp8KernelContext."""
     traits = ctx.traits
     ctx.h_idx = fx.Index(gpu.block_idx.x)
-    ctx.q_block_idx = fx.Index(gpu.block_idx.y)
+    if const_expr(traits.CAUSAL and not traits.SPLITK):
+        # Dispatch order is the list-schedule order and causal work grows with q_block
+        # (a window flattens but never inverts that), so walk q_block descending
+        # (longest-processing-time-first). From seq_len, not grid_dim.y, to stay uniform.
+        _nq = (ctx.seq_len_v + fx.Index(traits.BLOCK_M - 1)) // fx.Index(traits.BLOCK_M)
+        ctx.q_block_idx = _nq - fx.Index(1) - fx.Index(gpu.block_idx.y)
+    else:
+        ctx.q_block_idx = fx.Index(gpu.block_idx.y)
     if const_expr(traits.SPLITK):
         ctx.bz_idx = fx.Index(gpu.block_idx.z)
         ctx.batch_idx = ctx.bz_idx // traits.NUM_KV_SPLITS
@@ -964,17 +989,29 @@ def _init_dualwave_thread_mapping(ctx):
         T.i32,
         arith.divsi(_tid_i32, as_mlir_value(fx.Int32(traits.WARP_SIZE))),
     )
-    # Dual-wave stagger splits the CTA into 2 wave-groups: waves [0, NUM_WAVES/2) vs
-    # [NUM_WAVES/2, NUM_WAVES). Divisor = NUM_WAVES//2 (=4 for the 8-wave CTA, 2 for 4-wave).
-    ctx.stagger_i32 = arith.divsi(_wave_id_uni_i32, as_mlir_value(fx.Int32(traits.NUM_WAVES // 2)))
     ctx.wave_id_uni = fx.Index(_wave_id_uni_i32)
 
-    ctx.wave_q_offset = ctx.wave_id * traits.ROWS_PER_WAVE
+    # Merged CTAs stack Q_HEADS_PER_WG sharers of one kv-head on top of the row groups:
+    # the low wave bits pick the row group, the high bits pick the sharer.
+    if const_expr(traits.Q_HEADS_PER_WG > 1):
+        ctx.wave_row_group = ctx.wave_id % traits.WAVE_ROW_GROUPS
+        ctx.wave_row_group_uni = ctx.wave_id_uni % traits.WAVE_ROW_GROUPS
+    else:
+        ctx.wave_row_group = ctx.wave_id
+        ctx.wave_row_group_uni = ctx.wave_id_uni
+    ctx.wave_q_offset = ctx.wave_row_group * traits.ROWS_PER_WAVE
     ctx.q_start = ctx.q_block_idx * traits.BLOCK_M
 
     ctx.h_kv_idx = ctx.h_idx % traits.NUM_HEADS_KV
     ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
-    ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
+    if const_expr(traits.Q_HEADS_PER_WG > 1):
+        ctx.q_head_idx = (
+            ctx.h_kv_idx * traits.GQA_GROUP_SIZE
+            + ctx.group_id * traits.Q_HEADS_PER_WG
+            + ctx.wave_id_uni // traits.WAVE_ROW_GROUPS
+        )
+    else:
+        ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
     ctx.kv_head_idx = ctx.h_kv_idx
 
 
@@ -982,7 +1019,7 @@ def _init_dualwave_q_row(ctx):
     """Set q_row / q_row_i32 / q_start_pos_i32 on a dualwave-style context."""
     traits = ctx.traits
     ctx.q_row_in_block = ctx.wave_q_offset + ctx.lane_mod_32
-    ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
+    ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_row_group_uni * traits.ROWS_PER_WAVE)
     ctx.q_row = ctx.q_start + ctx.q_row_in_block
     ctx.q_row_i32 = fx.Int32(ctx.q_row)
 
@@ -999,6 +1036,8 @@ class DualwaveSwpTraits:
     NUM_WAVES: int
     BLOCK_SIZE: int
     ROWS_PER_WAVE: int
+    WAVE_ROW_GROUPS: int
+    Q_HEADS_PER_WG: int
     HEAD_DIM: int
     K_STEP_QK: int
     K_STEPS_QK: int
@@ -1015,6 +1054,8 @@ class DualwaveSwpTraits:
     WAVES_PER_EU: int
     DAZ: bool
     DUALWAVE_SWP_LAZY_RESCALE: bool
+    DUALWAVE_SWP_FIXED_MAX: bool
+    DUALWAVE_SWP_MFMA_ROWSUM: bool
     DUALWAVE_SWP_SETPRIO: bool
     DUALWAVE_SWP_DEBUG_LAZY_COUNTS: bool
     DUALWAVE_SWP_ENABLE_STAGGER: bool
@@ -1076,11 +1117,15 @@ class DualwaveSwpTraits:
             self.NUM_HEADS_Q,
             self.NUM_HEADS_KV,
             self.HEAD_DIM,
+            self.BLOCK_M,
+            self.Q_HEADS_PER_WG,
             self.CAUSAL,
             self.DTYPE_STR,
             self.WAVES_PER_EU,
             self.DAZ,
             self.DUALWAVE_SWP_LAZY_RESCALE,
+            self.DUALWAVE_SWP_FIXED_MAX,
+            self.DUALWAVE_SWP_MFMA_ROWSUM,
             self.DUALWAVE_SWP_SETPRIO,
             self.DUALWAVE_SWP_DEBUG_LAZY_COUNTS,
             self.DUALWAVE_SWP_ENABLE_STAGGER,
@@ -1105,6 +1150,7 @@ def _make_dualwave_swp_traits(
     waves_per_eu=2,
     daz=True,
     dualwave_swp_lazy_rescale=True,
+    dualwave_swp_fixed_max=None,
     dualwave_swp_setprio=True,
     dualwave_swp_debug_lazy_counts=False,
     dualwave_swp_enable_stagger=True,
@@ -1117,6 +1163,7 @@ def _make_dualwave_swp_traits(
     emit_lse=False,
     window_left=-1,
     block_m=None,
+    gqa_merge=None,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     # Tile shape and wave geometry. Default = 8-wave CTA (BLOCK_M=256). A smaller
@@ -1126,11 +1173,10 @@ def _make_dualwave_swp_traits(
     warp_size = 64
     if block_m is None:
         block_m = 256
-    num_waves = block_m // rows_per_wave
+    wave_row_groups = block_m // rows_per_wave
     block_n = 64
     block_n_out = 64
     k_sub_n = 32
-    block_size = num_waves * warp_size
 
     # QK walks D in 16-wide MFMA K steps; PV consumes K_SUB_N in two 16-token steps.
     k_step_qk = 16
@@ -1153,6 +1199,21 @@ def _make_dualwave_swp_traits(
     smem_linear_wave = warp_size * 16 // bf16_bytes
     smem_n_per_wave = smem_linear_wave // d_128b_size
     smem_n_rpt = block_n // smem_n_per_wave
+    # GQA sharer merge: one CTA runs the same q-tile for Q_HEADS_PER_WG q-heads of one
+    # kv-head, so the wave count grows while the row tile stays. Both sharers then read a
+    # single shared K/V LDS tile, halving the per-CU K/V request rate per unit of work.
+    # Capped at SMEM_N_RPT waves, one LDS line each, so the DMA still splits evenly.
+    if gqa_merge is None:
+        gqa_merge = (
+            not dualwave_swp_enable_stagger
+            and not paged
+            and num_kv_splits == 1
+            and gqa_group_size % 2 == 0
+            and 2 * wave_row_groups <= smem_n_rpt
+        )
+    q_heads_per_wg = 2 if gqa_merge else 1
+    num_waves = wave_row_groups * q_heads_per_wg
+    block_size = num_waves * warp_size
     smem_d_rpt = head_dim // d_128b_size
     # K/V LDS tiles are wave-linear rows with padding to avoid bank-aligned repeats.
     smem_k_pad = 16 // bf16_bytes
@@ -1191,6 +1252,29 @@ def _make_dualwave_swp_traits(
     paged = bool(paged)
     varlen = bool(varlen)
     cross_seqlen = bool(cross_seqlen)
+    # Softmax is shift-invariant, so the main loop can run on a fixed zero reference max
+    # and let the epilogue tiles re-enter the online path from it. A window only changes
+    # which tiles are masked, not that invariance, so SWA takes the same path. Kept off
+    # for split-K, whose partial m/l are combined across chunks.
+    if dualwave_swp_fixed_max is None:
+        dualwave_swp_fixed_max = causal and not splitk
+    # With a fixed reference max nothing rebases l_row mid-loop, so the running row sum
+    # can live in an MFMA accumulator fed by a ones A operand instead of a VALU fold.
+    dualwave_swp_mfma_rowsum = bool(dualwave_swp_fixed_max)
+    # Splitting the K/V LDS reads across the memory/compute cluster boundary keeps this
+    # configuration's main loop inside the 4-waves-per-SIMD register budget (only the
+    # once-per-WG prologue and epilogue still spill), so ask the register allocator for
+    # that budget rather than the caller's floor. Stagger and paged spend the same
+    # scheduling slack the split needs, so they keep the caller's value.
+    if (
+        not dualwave_swp_enable_stagger
+        and not paged
+        and dualwave_swp_mfma_rowsum
+        and not splitk
+        and head_dim == 64
+        and block_m in (128, 256)
+    ):
+        waves_per_eu = max(waves_per_eu, 4)
 
     return DualwaveSwpTraits(
         BLOCK_M=block_m,
@@ -1200,6 +1284,8 @@ def _make_dualwave_swp_traits(
         WARP_SIZE=warp_size,
         NUM_WAVES=num_waves,
         BLOCK_SIZE=block_size,
+        WAVE_ROW_GROUPS=wave_row_groups,
+        Q_HEADS_PER_WG=q_heads_per_wg,
         ROWS_PER_WAVE=rows_per_wave,
         HEAD_DIM=head_dim,
         K_STEP_QK=k_step_qk,
@@ -1217,6 +1303,8 @@ def _make_dualwave_swp_traits(
         WAVES_PER_EU=waves_per_eu,
         DAZ=bool(daz),
         DUALWAVE_SWP_LAZY_RESCALE=bool(dualwave_swp_lazy_rescale),
+        DUALWAVE_SWP_FIXED_MAX=bool(dualwave_swp_fixed_max),
+        DUALWAVE_SWP_MFMA_ROWSUM=dualwave_swp_mfma_rowsum,
         DUALWAVE_SWP_SETPRIO=bool(dualwave_swp_setprio),
         DUALWAVE_SWP_DEBUG_LAZY_COUNTS=bool(dualwave_swp_debug_lazy_counts),
         DUALWAVE_SWP_ENABLE_STAGGER=bool(dualwave_swp_enable_stagger),
@@ -1323,6 +1411,12 @@ class DualwaveKernelContext:
         traits = self.traits
         self.NUM_DMA_K = traits.SMEM_D_RPT
         self.NUM_DMA_V = traits.SMEM_D_RPT
+        # vmcnt drains are counted in DMA instructions, but one K/V tile costs
+        # DMA_WAVE_REPS of them per wave, so keep the drains at a fixed number of tiles
+        # in flight however many waves share the tile.
+        _dma_reps = traits.SMEM_N_RPT // traits.NUM_WAVES
+        self.VM_DRAIN_KV = (self.NUM_DMA_K + self.NUM_DMA_V) * _dma_reps // 2
+        self.VM_DRAIN_V = self.NUM_DMA_V * _dma_reps // 2
 
         self.fm_fast = fx.arith.FastMathFlags.fast
         self.elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
@@ -1330,6 +1424,8 @@ class DualwaveKernelContext:
         self.v_lds_read_vec4_type = Vec.make_type(4, self.elem_dtype)
         self.kv_mfma_pack_type = Vec.make_type(8, self.elem_dtype)
         self.mfma_acc_vec_type = Vec.make_type(16, fx.Float32)
+        self.rowsum_acc_vec_type = Vec.make_type(4, fx.Float32)
+        self.c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
 
         self.c_neg_inf = fx.Float32(float("-inf"))
         self.c_neg_floor = fx.Float32(-3.0e38)
@@ -1464,7 +1560,6 @@ class DualwaveKernelContext:
             _buf_flags_i32=self.buf_flags_i32,
             _elem_ir=self.elem_ir,
         )
-
         if const_expr(traits.PAGED):
             self.k_div = None
             self.v_div = None
@@ -1536,6 +1631,9 @@ class DualwaveKernelContext:
         self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, self.elem_dtype))
+        if const_expr(self.traits.DUALWAVE_SWP_MFMA_ROWSUM):
+            self.rowsum_mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, self.elem_dtype))
+            self.rowsum_ones_a = _rowsum_ones_a_operand(self.traits, self.lane, self.elem_dtype)
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         self.lds_ptr_ty = fx.PointerType.get(self.elem_dtype.ir_type, 2, self.traits.DMA_BYTES)
 
@@ -1743,15 +1841,15 @@ class DualwaveQLoader(DualwaveKernelContext):
         super().__init__(ctx)
 
     def load_pack(self, q_row_in_block, ks):
+        elem_index = self.q_gmem_elem_offset + _q_pack_global_idx(
+            self.traits,
+            q_row_in_block,
+            ks,
+            lane_div_32=self.lane_div_32,
+            stride_q_n_v=self.stride_q_n_v,
+        )
         q_i32_pack = _buffer_load_128(
-            self.q_gmem_elem_offset
-            + _q_pack_global_idx(
-                self.traits,
-                q_row_in_block,
-                ks,
-                lane_div_32=self.lane_div_32,
-                stride_q_n_v=self.stride_q_n_v,
-            ),
+            elem_index,
             _load_atom_128=self.load_atom_128,
             q_div=self.q_div,
             q_load_i32x4_type=self.q_load_i32x4_type,
@@ -1807,11 +1905,15 @@ class DualwaveGemmHelper(DualwaveKernelContext):
     def __init__(self, ctx):
         super().__init__(ctx)
 
-    def qk(self, v_k, q_all_scaled_bf16):
+    def qk(self, v_k, q_all_scaled_bf16, v_s=None, ks_range=None):
         k_lo, k_hi = v_k
-        v_s_lo = self.c_zero_v16f32
-        v_s_hi = self.c_zero_v16f32
-        for ks in range_constexpr(self.traits.K_STEPS_QK):
+        ks_lo, ks_hi = (0, self.traits.K_STEPS_QK) if ks_range is None else ks_range
+        if v_s is None:
+            v_s_lo = self.c_zero_v16f32
+            v_s_hi = self.c_zero_v16f32
+        else:
+            v_s_lo, v_s_hi = v_s
+        for ks in range_constexpr(ks_lo, ks_hi):
             q_pack = _get_q_pack(self.traits, q_all_scaled_bf16, ks)
             v_s_lo = _mfma_acc(k_lo[ks], q_pack, v_s_lo, self.mma_atom, self.mfma_acc_vec_type)
             v_s_hi = _mfma_acc(k_hi[ks], q_pack, v_s_hi, self.mma_atom, self.mfma_acc_vec_type)
@@ -1856,6 +1958,42 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
     def reduce_sum(self, l_row, v_p):
         return _fadd(l_row, _score_pair_sum(v_p, self.c_zero_f, self.fm_fast), self.fm_fast)
 
+    def cast_p_and_sum(self, l_row, v_p):
+        """Pack P to bf16 and fold this tile into the running row sum.
+
+        The VALU path folds the f32 scores before packing; the MFMA path feeds the
+        packs themselves to a ones-matrix MFMA, so numerator and denominator see the
+        same bf16 values."""
+        if const_expr(self.traits.DUALWAVE_SWP_MFMA_ROWSUM):
+            v_p = self.cast_p(v_p)
+            return v_p, self.row_sum_packed(l_row, v_p)
+        return self.cast_p(v_p), self.reduce_sum(l_row, v_p)
+
+    def row_sum_packed(self, l_row, v_p):
+        """Accumulate the tile's row sums straight out of the packed bf16 P.
+
+        Each 16-kv pack is one 16x16x32 MFMA against the ones A operand, which also folds
+        the half-wave partner, so no permlane pair reduce is left. The fence stays only to
+        keep the packs from being hoisted; the scored fptrunc supplies the wait states."""
+        p_lo_packs, p_hi_packs = v_p
+        _sched_barrier(0)
+        for pks in range_constexpr(self.traits.PV_K_STEPS):
+            for pack in (p_lo_packs[pks], p_hi_packs[pks]):
+                l_row = _mfma_acc(
+                    self.rowsum_ones_a,
+                    pack,
+                    l_row,
+                    self.rowsum_mma_atom,
+                    self.rowsum_acc_vec_type,
+                )
+        return l_row
+
+    def finish_row_sum(self, l_row):
+        """Take the row sum out of the MFMA accumulator; D element 0 holds this lane's q."""
+        if const_expr(self.traits.DUALWAVE_SWP_MFMA_ROWSUM):
+            return Vec(l_row)[0]
+        return l_row
+
     def sub_m(self, v_s, row_max):
         return _sub_score_pair(v_s, row_max, self.fm_fast)
 
@@ -1886,6 +2024,51 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         )
         l_row = _fmul(l_row, corr, self.fm_fast)
         return v_o, m_new, l_row, v_p
+
+    def zero_row_max(self):
+        return self.c_zero_f
+
+    def scores_for_softmax(self, v_s):
+        """Layout the softmax path consumes: element lists when a row max still has to be
+        reduced out of them, the raw vector pair when the reference max is fixed."""
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return v_s
+        return self.v_s_vec_to_lists(v_s)
+
+    def shift_scores(self, v_s, row_max):
+        """Shift scores by the softmax reference max. A zero reference needs no shift,
+        so only the score layout is normalized for the exp2 slices."""
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            # Callers hand over either the vector pair or the per-element list pair.
+            return _score_lists_to_vecs(v_s) if isinstance(v_s[0], list) else v_s
+        return self.sub_m(v_s, row_max)
+
+    def tile_rescale_o(self, v_o, m_row, l_row, v_s, v_p, sched_group):
+        """Per-tile row-max update and O/P rescale, then the cluster's sched groups.
+
+        With a fixed reference max the correction is identically 1, so the row-max
+        reduction, the rescale and the m_row update all drop out."""
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return v_o, m_row, l_row, v_p
+        m_tile_max = self.reduce_max(v_s)
+        _sched_barrier_pairs(self.traits, 4, 6, sched_group)
+        if const_expr(self.traits.DUALWAVE_SWP_LAZY_RESCALE):
+            return self.lazy_rescale_o(v_o, m_row, l_row, m_tile_max, v_p)
+        return self.rescale_o(v_o, m_row, l_row, m_tile_max, v_p)
+
+    def tile_row_max(self, m_row, v_s):
+        """Fold an epilogue tile's max into the running reference and return the O/l
+        correction factor, or None when the reference is fixed and nothing rebases."""
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return m_row, None
+        return self.rescale_from_tile_max(m_row, self.reduce_max(v_s))
+
+    def scale_o_by(self, v_o, rescale):
+        if rescale is not None:
+            self.scale_o(v_o, rescale)
+
+    def scale_l_by(self, l_row, rescale):
+        return l_row if rescale is None else self.apply_l_rescale(l_row, rescale)
 
     def _lazy_rescale_o_rescale(self, _n, *_st, v_o, m_row, l_row, m_tile_max, v_p):
         corr = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_row, m_tile_max, self.fm_fast)))
@@ -2134,7 +2317,14 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
                     soffset,
                 )
         else:
-            self._async_load_kv_linear(ctx.k_dma_m0, buf_id, src_div, src_base, soffset, self.num_dma_k)
+            self._async_load_kv_linear(
+                ctx.k_dma_m0,
+                buf_id,
+                src_div,
+                src_base,
+                soffset,
+                self.num_dma_k,
+            )
 
     def load_k_tile(self, tile_idx, buf_id, page_id=None):
         self.load_k(self.tile_start(tile_idx), buf_id, page_id=page_id)
@@ -2167,7 +2357,14 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
                     soffset,
                 )
         else:
-            self._async_load_kv_linear(ctx.v_dma_m0, buf_id, src_div, src_base, soffset, self.num_dma_v)
+            self._async_load_kv_linear(
+                ctx.v_dma_m0,
+                buf_id,
+                src_div,
+                src_base,
+                soffset,
+                self.num_dma_v,
+            )
 
     def load_v_tile(self, tile_idx, buf_id, page_id=None):
         self.load_v(self.tile_start(tile_idx), buf_id, page_id=page_id)
@@ -2197,15 +2394,23 @@ class DualwaveKvLdsToVgprLoader(DualwaveKernelContext):
         )
         return lo, hi
 
-    def load_k(self, buf_id, urk_base=None):
+    def load_k(self, buf_id, urk_base=None, ks_range=None, k_regs=None):
+        """Read this buffer's K packs for k-steps [ks_range), filling `k_regs` if given.
+
+        Splitting the range lets the tail packs issue inside the QK cluster, so only
+        half of the K tile is resident at once."""
         if urk_base is None:
             urk_base = self.k_lds_read_base_per_lane
+        ks_lo, ks_hi = (0, self.traits.K_STEPS_QK) if ks_range is None else ks_range
         k_base = _k_buf_base(self.traits, buf_id)
-        k_lo = [None] * self.traits.K_STEPS_QK
-        k_hi = [None] * self.traits.K_STEPS_QK
+        if k_regs is None:
+            k_lo = [None] * self.traits.K_STEPS_QK
+            k_hi = [None] * self.traits.K_STEPS_QK
+        else:
+            k_lo, k_hi = k_regs
 
         if const_expr(self.traits.KV_VECTORIZED):
-            for ks in range_constexpr(self.traits.K_STEPS_QK):
+            for ks in range_constexpr(ks_lo, ks_hi):
                 k_lo[ks], k_hi[ks] = self._load_k_pair(
                     buf_id,
                     _vec_k_lds_idx_lo(
@@ -2218,17 +2423,20 @@ class DualwaveKvLdsToVgprLoader(DualwaveKernelContext):
                 )
             return (k_lo, k_hi)
 
-        for ks in range_constexpr(self.traits.K_STEPS_QK):
+        for ks in range_constexpr(ks_lo, ks_hi):
             k_lo[ks], k_hi[ks] = self._load_k_pair(
                 buf_id, k_base + urk_base + _swizzled_ks_offset(self.traits, ks)
             )
         return (k_lo, k_hi)
 
-    def load_v(self, buf_id, urv_base=None):
+    def load_v(self, buf_id, urv_base=None, substeps=None, packs=None):
+        """Read this buffer's V packs for k-substeps [substeps), filling `packs` if given."""
         if urv_base is None:
             urv_base = self.v_lds_read_base_per_lane
         v_base = _v_buf_base(self.traits, buf_id)
-        packs = [[None] * self.traits.D_CHUNKS for _ in range(4)]
+        ks_lo, ks_hi = (0, 4) if substeps is None else substeps
+        if packs is None:
+            packs = [[None] * self.traits.D_CHUNKS for _ in range(4)]
         if const_expr(self.traits.KV_VECTORIZED):
             v_base_ptr = buffer_ops.get_element_ptr(
                 self.lds_kv_base_ptr,
@@ -2245,8 +2453,8 @@ class DualwaveKvLdsToVgprLoader(DualwaveKernelContext):
                 ),
                 elem_type=T.i8,
             )
-            for dc in range_constexpr(self.traits.D_CHUNKS):
-                for k_substep in range_constexpr(4):
+            for k_substep in range_constexpr(ks_lo, ks_hi):
+                for dc in range_constexpr(self.traits.D_CHUNKS):
                     packs[k_substep][dc] = _read_v8f16_off(
                         self.traits,
                         v_base_ptr,
@@ -2255,21 +2463,20 @@ class DualwaveKvLdsToVgprLoader(DualwaveKernelContext):
                     )
             return packs
 
-        lds_base = v_base + urv_base
-        for dc in range_constexpr(self.traits.D_CHUNKS):
-            for k_substep in range_constexpr(4):
+        pair_off = self.traits.V_LDS_TO_REG_TRANSPOSE_PAIR_STRIDE * self.traits.BF16_BYTES
+        lane_ptr = buffer_ops.get_element_ptr(
+            self.lds_kv_base_ptr,
+            byte_offset=as_mlir_value(fx.Int32((v_base + urv_base) * self.traits.BF16_BYTES)),
+            elem_type=T.i8,
+        )
+        # k-substep major: the two reads of every P*V step land back to back, so the
+        # backend's own lgkmcnt for step k does not also wait on the later substeps.
+        for k_substep in range_constexpr(ks_lo, ks_hi):
+            for dc in range_constexpr(self.traits.D_CHUNKS):
                 imm_lo = _swizzled_v_imm_lo(self.traits, dc, k_substep)
-                a = _ds_read_tr_v4f16_imm(
-                    lds_base,
-                    imm_lo,
-                    lds_kv_base_idx=self.lds_kv_base_idx,
-                    v_lds_read_vec4_type=self.v_lds_read_vec4_type,
-                )
-                b = _ds_read_tr_v4f16_imm(
-                    lds_base,
-                    imm_lo + self.traits.V_LDS_TO_REG_TRANSPOSE_PAIR_STRIDE * self.traits.BF16_BYTES,
-                    lds_kv_base_idx=self.lds_kv_base_idx,
-                    v_lds_read_vec4_type=self.v_lds_read_vec4_type,
+                a = _ds_read_tr16_b64(self.traits, self.v_lds_read_vec4_type, lane_ptr, imm_lo, buf_id)
+                b = _ds_read_tr16_b64(
+                    self.traits, self.v_lds_read_vec4_type, lane_ptr, imm_lo + pair_off, buf_id
                 )
                 packs[k_substep][dc] = Vec(a).shuffle(Vec(b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
         return packs
@@ -2650,25 +2857,6 @@ def _sched_barrier_exp_pairs(traits, pairs, exp_cnt, group):
     for _ in range_constexpr(pairs):
         rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, 1, group)
         rocdl.sched_group_barrier(traits.SCHED_EXP_MASK, exp_cnt, group)
-
-
-def _stagger_extra_barrier_if_zero(stagger_i32):
-    """Emit `s_barrier;` only when stagger == 0."""
-    llvm.inline_asm(
-        ir.Type.parse("!llvm.void"),
-        [stagger_i32],
-        ("s_cmp_eq_u32 $0, 0\n\ts_cbranch_scc0 1f\n\ts_barrier\n\t1:"),
-        "s",
-        has_side_effects=True,
-    )
-
-
-@flyc.jit
-def _stagger_extra_barrier_if_one(stagger_i32):
-    """Emit `sched_barrier(0); s_barrier;` only when stagger == 1."""
-    if fx.Int32(stagger_i32) != fx.Int32(0):
-        rocdl.sched_barrier(0)
-        rocdl.s_barrier()
 
 
 def _debug_atomic_inc_lazy_count(byte_offset, debug_counts_rsrc):
