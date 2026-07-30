@@ -70,6 +70,9 @@ template <typename AType, typename BType, typename CType, typename ACCType>
 struct CKGroupedGemmFP8Params : public CKGroupedGemmParams<AType, BType, CType> {
     const ACCType *aq_ptr = nullptr;
     const ACCType *bq_ptr = nullptr;
+
+    int64_t a_scale_group_stride_bytes = 0;
+    int64_t b_scale_group_stride_bytes = 0;
 };
 #endif // BUILD_CK_BACKEND
 
@@ -84,9 +87,6 @@ struct HipblasltGroupedGemmParams {
     hipDataType          b_type;
     std::vector<int64_t> b_shape;
 
-    // Byte distance between the scales of two consecutive groups. 0 keeps every
-    // group on the same scalar (a single scale for the whole tensor); otherwise
-    // the scale pointer walks a `group_num`-element array, one scale per group.
     int64_t a_scale_group_stride_bytes = 0;
     int64_t b_scale_group_stride_bytes = 0;
 

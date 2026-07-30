@@ -381,6 +381,16 @@ def _make_group_lens(lens=DEFAULT_GROUP_LENS, device: str = DEVICE) -> torch.Ten
     return torch.tensor(lens, dtype=torch.int64, device=device)
 
 
+def _expected_grouped_scale_shape(
+    granularity: ScalingGranularity, G_: int, M_: int, N_: int, block_size, use_2d_block: bool
+):
+    """Return the expected scale_inv shape for a grouped [total_M, N] tensor at axis=-1."""
+    if granularity == ScalingGranularity.TENSORWISE:
+        # Unlike the non-grouped case, each group carries its own scalar scale.
+        return (G_, 1)
+    return _expected_scale_shape(granularity, M_, N_, block_size, use_2d_block)
+
+
 # Grouped tensors only support ROWWISE and TENSORWISE (see
 # QuantizedTensor.quantize assertions).
 _GROUPED_GRAN_CASES = [
@@ -424,8 +434,8 @@ class TestGroupedQuantizedTensorBasic:
 
     @pytest.mark.parametrize("granularity,block_size,dest_dtype", _GROUPED_GRAN_CASES)
     def test_scale_shape(self, granularity, block_size, dest_dtype):
-        """Packed-M quantization is group-agnostic, so scale shape matches
-        the equivalent non-grouped 2D wrapper."""
+        """TENSORWISE scales per group; ROWWISE is group-agnostic, so its scale
+        shape matches the equivalent non-grouped 2D wrapper."""
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEVICE)
         group_lens = _make_group_lens()
         qt = _make_quantized_tensor(
@@ -436,7 +446,9 @@ class TestGroupedQuantizedTensorBasic:
             group_lens=group_lens,
         )
 
-        expected = _expected_scale_shape(granularity, M, N, block_size, use_2d_block=False)
+        expected = _expected_grouped_scale_shape(
+            granularity, NUM_GROUPS, M, N, block_size, use_2d_block=False
+        )
         assert tuple(qt.scale_inv.shape) == expected, (
             f"{granularity.name}/{dest_dtype}: expected scale shape {expected}, got {tuple(qt.scale_inv.shape)}"
         )

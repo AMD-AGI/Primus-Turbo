@@ -771,7 +771,8 @@ def _process_variable_k_tile(
     LHS,
     RHS,
     C,
-    scale,  # per-CTA constant; ignored when IS_FP8=False
+    LHS_scale_ptr,  # fp32 scale, read only when IS_FP8: scalar, or [G] when LHS_SCALE_PER_GROUP
+    RHS_scale_ptr,  # fp32 scale, read only when IS_FP8: scalar, or [G] when RHS_SCALE_PER_GROUP
     group_offs_ptr,
     OUT_M,
     OUT_N,
@@ -793,6 +794,8 @@ def _process_variable_k_tile(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
+    LHS_SCALE_PER_GROUP: tl.constexpr = False,
+    RHS_SCALE_PER_GROUP: tl.constexpr = False,
 ):
     """Compute one variable-K output tile given its global tile id."""
     # -- Map to (group, local_tile) -- simple div/mod, O(1) --
@@ -870,7 +873,15 @@ def _process_variable_k_tile(
 
     # -- Apply scaling and store --
     if IS_FP8:
-        acc *= scale
+        if LHS_SCALE_PER_GROUP:
+            lhs_scale = tl.load(LHS_scale_ptr + group_idx)
+        else:
+            lhs_scale = tl.load(LHS_scale_ptr)
+        if RHS_SCALE_PER_GROUP:
+            rhs_scale = tl.load(RHS_scale_ptr + group_idx)
+        else:
+            rhs_scale = tl.load(RHS_scale_ptr)
+        acc *= lhs_scale * rhs_scale
     c = acc.to(C.type.element_ty)
     rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -911,6 +922,8 @@ def _grouped_variable_k_gemm_kernel(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    LHS_SCALE_PER_GROUP: tl.constexpr = False,
+    RHS_SCALE_PER_GROUP: tl.constexpr = False,
 ):
     """Persistent grouped variable-K GEMM kernel for backward (static stride)."""
     pid = tl.program_id(0)
@@ -929,17 +942,14 @@ def _grouped_variable_k_gemm_kernel(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    scale = tl.zeros((), dtype=tl.float32)
-    if IS_FP8:
-        scale = tl.load(LHS_scale_ptr) * tl.load(RHS_scale_ptr)
-
     for global_tile in range(pid, total_tiles, NUM_SMS):
         _process_variable_k_tile(
             global_tile,
             LHS,
             RHS,
             C,
-            scale,
+            LHS_scale_ptr,
+            RHS_scale_ptr,
             group_offs_ptr,
             OUT_M,
             OUT_N,
@@ -961,6 +971,8 @@ def _grouped_variable_k_gemm_kernel(
             CACHE_MODIFIER_A=CACHE_MODIFIER_A,
             CACHE_MODIFIER_B=CACHE_MODIFIER_B,
             ALLOW_TF32=ALLOW_TF32,
+            LHS_SCALE_PER_GROUP=LHS_SCALE_PER_GROUP,
+            RHS_SCALE_PER_GROUP=RHS_SCALE_PER_GROUP,
         )
 
 
@@ -1017,10 +1029,6 @@ def _grouped_variable_k_gemm_kernel_ws(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    scale = tl.zeros((), dtype=tl.float32)
-    if IS_FP8:
-        scale = tl.load(LHS_scale_ptr) * tl.load(RHS_scale_ptr)
-
     # See the forward WS kernel for the ACTIVE_XCDS rationale: when
     # NUM_SMS < NUM_XCDS, both the per-XCD slot count and the phase-1 ID
     # span must be capped at the active XCD count, or phase 2 skips past
@@ -1045,7 +1053,8 @@ def _grouped_variable_k_gemm_kernel_ws(
             LHS,
             RHS,
             C,
-            scale,
+            LHS_scale_ptr,
+            RHS_scale_ptr,
             group_offs_ptr,
             OUT_M,
             OUT_N,

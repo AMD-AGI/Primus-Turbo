@@ -60,6 +60,21 @@ _grouped_blockwise_warmed: set = set()
 _grouped_blockwise_vk_warmed: set = set()
 
 
+def _flatten_group_scale(scale: torch.Tensor, G: int, name: str) -> tuple[torch.Tensor, bool]:
+    """Normalise a tensorwise scale to what the kernels index.
+
+    A single-element scale is shared by every group and read as a scalar. A
+    per-group scale (G elements in any shape, e.g. [G] or the [G, 1] emitted by
+    the grouped tensorwise quantizer) is flattened so the kernel can index it
+    with group_idx; ``reshape`` copies only if the input is not already dense.
+    """
+    if scale.numel() == 1:
+        return scale, False
+
+    assert scale.numel() == G, f"{name} must hold 1 or G={G} elements, got shape {tuple(scale.shape)}"
+    return scale.reshape(-1), True
+
+
 def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
     """FP8 grouped GEMM config from MI300X bench (out_gg_fp8_persistent_full.yaml).
 
@@ -342,8 +357,8 @@ def _grouped_fp8_persistent_gemm_kernel(
     A,  # [M_total, K] FP8
     B,  # [G, ?, ?]  FP8 — (K,N) or (N,K) depending on trans_b
     C,  # [M_total, N] output (BF16/FP16)
-    A_scale_ptr,  # per-tensor scale for A (scalar, fp32)
-    B_scale_ptr,  # per-tensor scale for B (scalar, fp32)
+    A_scale_ptr,  # scale for A, fp32: scalar, or [G] when A_SCALE_PER_GROUP
+    B_scale_ptr,  # scale for B, fp32: scalar, or [G] when B_SCALE_PER_GROUP
     group_offs_ptr,  # [G+1] int64
     # Dimensions
     G,  # number of groups (runtime)
@@ -369,6 +384,8 @@ def _grouped_fp8_persistent_gemm_kernel(
     EVEN_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
+    A_SCALE_PER_GROUP: tl.constexpr = False,
+    B_SCALE_PER_GROUP: tl.constexpr = False,
 ):
     """Persistent grouped FP8 GEMM kernel (CPU-sync-free, per-tensor scaling)."""
     pid = tl.program_id(0)
@@ -390,10 +407,11 @@ def _grouped_fp8_persistent_gemm_kernel(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    # Load per-tensor scales once (scalar)
-    scale_a = tl.load(A_scale_ptr)
-    scale_b = tl.load(B_scale_ptr)
-    scale = scale_a * scale_b
+    # Scales shared by every group are tile-invariant, so load them once here;
+    # per-group scales depend on group_idx and are read inside the tile loop.
+    scale = tl.zeros((), dtype=tl.float32)
+    if not A_SCALE_PER_GROUP and not B_SCALE_PER_GROUP:
+        scale = tl.load(A_scale_ptr) * tl.load(B_scale_ptr)
 
     acc_dtype = tl.float32
 
@@ -476,8 +494,19 @@ def _grouped_fp8_persistent_gemm_kernel(
             b = tl.load(B_LAST, mask=rk_last[:, None] < K, other=0.0, cache_modifier=CACHE_MODIFIER_B)
             acc += tl.dot(a, b)
 
-        # ── Apply per-tensor scale and store ──
-        acc *= scale
+        # ── Apply scale and store ──
+        if A_SCALE_PER_GROUP or B_SCALE_PER_GROUP:
+            if A_SCALE_PER_GROUP:
+                scale_a = tl.load(A_scale_ptr + group_idx)
+            else:
+                scale_a = tl.load(A_scale_ptr)
+            if B_SCALE_PER_GROUP:
+                scale_b = tl.load(B_scale_ptr + group_idx)
+            else:
+                scale_b = tl.load(B_scale_ptr)
+            acc *= scale_a * scale_b
+        else:
+            acc *= scale
         c = acc.to(C.type.element_ty)
         rm_s = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M_g
         rn_s = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -507,8 +536,10 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     Args:
         a: [M_total, K] FP8 input (trans_a=False always).
         b: [G, K, N] or [G, N, K] (if trans_b) FP8 weights.
-        a_scale: Per-tensor dequantization scale for A, scalar fp32.
-        b_scale: Per-tensor dequantization scale for B, scalar fp32.
+        a_scale: Dequantization scale for A, fp32. Either a scalar shared by all
+            groups, or a per-group scale holding G elements (any shape, e.g.
+            [G] or [G, 1] as emitted by the grouped tensorwise quantizer).
+        b_scale: Dequantization scale for B, fp32. Same two forms as a_scale.
         group_offs: [G+1] int64 prefix sum of group lengths.
         trans_b: If True, b[g] is [N, K] (transposed).
         out_dtype: Output dtype (default bfloat16).
@@ -521,6 +552,9 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
 
     M_total, K_a = a.shape
     G = b.shape[0]
+
+    a_scale, a_scale_per_group = _flatten_group_scale(a_scale, G, "a_scale")
+    b_scale, b_scale_per_group = _flatten_group_scale(b_scale, G, "b_scale")
 
     if trans_b:
         N, K_b = b.shape[1], b.shape[2]
@@ -588,6 +622,8 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        A_SCALE_PER_GROUP=a_scale_per_group,
+        B_SCALE_PER_GROUP=b_scale_per_group,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
@@ -617,8 +653,10 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     Args:
         lhs: [M_total, OUT_M] FP8 (after trans_c swap, this is grad_out_fp8).
         rhs: [M_total, OUT_N] FP8 (after trans_c swap, this is a_fp8).
-        lhs_scale: Per-tensor scale for LHS, scalar fp32.
-        rhs_scale: Per-tensor scale for RHS, scalar fp32.
+        lhs_scale: Scale for LHS, fp32. Either a scalar shared by all groups, or
+            a per-group scale holding G elements (any shape, e.g. [G] or [G, 1]
+            as emitted by the grouped tensorwise quantizer).
+        rhs_scale: Scale for RHS, fp32. Same two forms as lhs_scale.
         group_offs: [G+1] int64 prefix sum.
         out_dtype: Output dtype (default bfloat16).
 
@@ -630,6 +668,9 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     OUT_M = lhs.shape[1]
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
+
+    lhs_scale, lhs_scale_per_group = _flatten_group_scale(lhs_scale, G, "lhs_scale")
+    rhs_scale, rhs_scale_per_group = _flatten_group_scale(rhs_scale, G, "rhs_scale")
 
     out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
     num_sms = get_num_cus()
@@ -666,6 +707,8 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         IS_FP8=True,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        LHS_SCALE_PER_GROUP=lhs_scale_per_group,
+        RHS_SCALE_PER_GROUP=rhs_scale_per_group,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,

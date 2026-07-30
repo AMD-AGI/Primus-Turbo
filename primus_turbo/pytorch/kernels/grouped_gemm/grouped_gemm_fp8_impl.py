@@ -85,6 +85,9 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8CKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8CKBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
+        # TENSORWISE: one scalar scale per operand, shared by every group or one per group.
+        if granularity == ScalingGranularity.TENSORWISE:
+            supported &= a_scales.numel() in (1, group_lens.size(0)) and b_scales.numel() in (1, b.size(0))
         return supported
 
     @staticmethod
@@ -149,6 +152,11 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_GRANULARITIES
         supported &= trans_a and not trans_b
+        # TENSORWISE: one scalar scale per operand, shared by every group or one per group.
+        # Both operands are packed along M here, so their group count comes from group_lens.
+        if granularity == ScalingGranularity.TENSORWISE:
+            G = group_lens.size(0)
+            supported &= a_scales.numel() in (1, G) and b_scales.numel() in (1, G)
         return supported
 
     @staticmethod
@@ -217,6 +225,11 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8HipblasltBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8HipblasltBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
+        # TENSORWISE: one scalar scale per operand, shared by every group or one per group.
+        # The binding derives its per-group scale stride from the numel, so any other
+        # element count would walk off the scale it was handed.
+        if granularity == ScalingGranularity.TENSORWISE:
+            supported &= a_scales.numel() in (1, group_lens.size(0)) and b_scales.numel() in (1, b.size(0))
         return supported
 
     @staticmethod
@@ -278,6 +291,11 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_GRANULARITIES
         supported &= trans_a and not trans_b
+        # TENSORWISE: one scalar scale per operand, shared by every group or one per group
+        # (the binding derives its per-group scale stride from the numel).
+        if granularity == ScalingGranularity.TENSORWISE:
+            G = group_lens.size(0)
+            supported &= a_scales.numel() in (1, G) and b_scales.numel() in (1, G)
         return supported
 
     @staticmethod
@@ -366,6 +384,10 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
             supported &= trans_b
+        # TENSORWISE: one scalar scale per operand, shared by every group or one per group;
+        # the kernel asserts on any other element count.
+        if granularity == ScalingGranularity.TENSORWISE:
+            supported &= a_scales.numel() in (1, group_lens.size(0)) and b_scales.numel() in (1, b.size(0))
         return supported
 
     @staticmethod
@@ -437,7 +459,8 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
     """FlyDSL fp8 grouped GEMM backend (gfx950).
 
     M-grouped operator. Granularities:
-      - TENSORWISE: forward (trans_b=True, NT) + dgrad (trans_b=False, NN).
+      - TENSORWISE: forward (trans_b=True, NT) + dgrad (trans_b=False, NN). One
+        scalar scale per operand, shared by every group (no per-group scales).
       - MX_BLOCKWISE: NT only (trans_b=True), per-1x32 raw E8M0 scales.
     Uses the FlyDSL mfma[_scale]_f32_16x16x128_f8f6f4 kernel (gfx950-only).
     """
@@ -474,7 +497,9 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
             supported &= a.shape[1] % 128 == 0 and a.shape[1] >= 256
             return supported
 
-        # TENSORWISE: per-tensor scalar scales; contraction K >= 129.
+        # TENSORWISE: the kernel folds ONE fp32 scalar per operand into its epilogue and
+        # has no per-group scale slot, so a per-group scale (a [G] / [G, 1] array) cannot be
+        # reduced to a scalar and has to fall back to Triton or CK. Contraction K >= 129.
         supported &= a_scales.numel() == 1 and b_scales.numel() == 1
         supported &= a.shape[1] >= 129
         return supported
@@ -608,6 +633,12 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
             supported &= not trans_a and not trans_b
+        # TENSORWISE: one scalar scale per operand, shared by every group or one per group;
+        # the kernel asserts on any other element count. Both operands are packed along M
+        # here, so their group count comes from group_lens.
+        if granularity == ScalingGranularity.TENSORWISE:
+            G = group_lens.size(0)
+            supported &= a_scales.numel() in (1, G) and b_scales.numel() in (1, G)
         return supported
 
     @staticmethod
@@ -685,8 +716,9 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
 
     wgrad: C[g] = lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]], contraction
     = m_g (variable per group) via a runtime scf.for K-loop. Supports TENSORWISE
-    (trans_a=True, TN) and MX_BLOCKWISE (non-transposed operands, TN) via the
-    FlyDSL mfma[_scale]_f32_16x16x128_f8f6f4 TN kernel (gfx950-only).
+    (trans_a=True, TN; one scalar scale per operand, shared by every group) and
+    MX_BLOCKWISE (non-transposed operands, TN) via the FlyDSL
+    mfma[_scale]_f32_16x16x128_f8f6f4 TN kernel (gfx950-only).
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.MX_BLOCKWISE}
@@ -721,7 +753,9 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
             supported &= a.shape[1] % 128 == 0
             return supported
 
-        # TENSORWISE: variable-K contraction along shared rows; per-tensor scalars.
+        # TENSORWISE: variable-K contraction along shared rows. The kernel folds ONE fp32
+        # scalar per operand into its epilogue and has no per-group scale slot, so a
+        # per-group scale (a [G] / [G, 1] array) has to fall back to Triton or CK.
         supported &= trans_a and not trans_b
         supported &= a_scales.numel() == 1 and b_scales.numel() == 1
         return supported

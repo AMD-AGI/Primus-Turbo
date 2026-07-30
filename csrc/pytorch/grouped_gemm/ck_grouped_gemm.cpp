@@ -62,6 +62,15 @@ inline CKGroupedGemmFP8Params<AType, BType, CType, ACCType> make_ck_groued_gemm_
     return params;
 }
 
+inline int64_t scale_group_stride_bytes(const std::string &granularity, const at::Tensor &scales,
+                                        const int64_t group_num, const char *name) {
+    if (granularity != "TENSORWISE" || scales.numel() == 1)
+        return 0;
+    PRIMUS_TURBO_CHECK(scales.numel() == group_num, "TENSORWISE ", name,
+                       " must hold 1 or group_num=", group_num, " elements, got ", scales.numel());
+    return static_cast<int64_t>(scales.element_size());
+}
+
 uint32_t get_grouped_gemm_num_cu(c10::optional<int64_t> num_cu) {
     auto    stream     = at::cuda::getCurrentCUDAStream();
     int32_t cus        = get_multi_processor_count(stream.device_index());
@@ -198,6 +207,11 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
     at::Tensor aq_tensor = a_scales.contiguous();
     at::Tensor bq_tensor = b_scales.contiguous();
 
+    const int64_t a_scale_group_stride_bytes =
+        scale_group_stride_bytes(granularity, aq_tensor, bs, "a_scales");
+    const int64_t b_scale_group_stride_bytes =
+        scale_group_stride_bytes(granularity, bq_tensor, bs, "b_scales");
+
     at::Tensor c      = at::empty({m, n}, at::dtype(out_dtype).device(at::kCUDA));
     auto       stream = at::cuda::getCurrentCUDAStream();
 
@@ -210,6 +224,8 @@ at::Tensor ck_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scale
                 auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                     args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                     transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
+                params.a_scale_group_stride_bytes = a_scale_group_stride_bytes;
+                params.b_scale_group_stride_bytes = b_scale_group_stride_bytes;
                 if (granularity == "TENSORWISE")
                     primus_turbo::ck_grouped_gemm_fp8<AType, BType, CType, float,
                                                       ck_tile::QuantType::TensorQuant>(params);
@@ -354,6 +370,11 @@ at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tens
     at::Tensor aq_tensor = a_scales.contiguous();
     at::Tensor bq_tensor = b_scales.contiguous();
 
+    const int64_t a_scale_group_stride_bytes =
+        scale_group_stride_bytes(granularity, aq_tensor, bs, "a_scales");
+    const int64_t b_scale_group_stride_bytes =
+        scale_group_stride_bytes(granularity, bq_tensor, bs, "b_scales");
+
     auto stream = at::cuda::getCurrentCUDAStream();
 
     TORCH_SCALAR_TYPE_TO_CK_TILE_TYPE_SWITCH_F16(
@@ -365,6 +386,8 @@ at::Tensor ck_grouped_gemm_fp8_variable_k(at::Tensor &a, at::Tensor &b, at::Tens
                 auto params = make_ck_groued_gemm_fp8_params<AType, BType, CType, float>(
                     args_tensor.data_ptr(), a, b, c, aq_tensor, bq_tensor, group_lens, group_offs,
                     transA, transB, bs, m, n, k, stream, get_grouped_gemm_num_cu(num_cu));
+                params.a_scale_group_stride_bytes = a_scale_group_stride_bytes;
+                params.b_scale_group_stride_bytes = b_scale_group_stride_bytes;
                 if (granularity == "TENSORWISE") primus_turbo::ck_grouped_gemm_fp8_variable_k<
                     AType, BType, CType, float, ck_tile::QuantType::TensorQuant>(params);
                 else if (granularity == "ROWWISE")

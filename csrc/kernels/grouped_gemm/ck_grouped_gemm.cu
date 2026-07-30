@@ -71,13 +71,17 @@ __global__ void compute_grouped_gemm_fp8_args(
     const ck_tile::index_t n, const ck_tile::index_t k, const ck_tile::index_t strideA,
     const ck_tile::index_t strideB, const ck_tile::index_t strideC, const ck_tile::index_t strideAQ,
     const ck_tile::index_t strideBQ, const ck_tile::index_t QK_A, const ck_tile::index_t QK_B,
-    const ck_tile::index_t k_batch) {
+    const ck_tile::index_t k_batch, const int64_t a_scale_group_stride_bytes,
+    const int64_t b_scale_group_stride_bytes) {
     const int64_t group_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (group_id >= group_num)
         return;
     if constexpr (QuantMode == ck_tile::QuantType::TensorQuant) {
-        args_ptr[group_id].group_karg.aq_ptr = aq_ptr;
-        args_ptr[group_id].group_karg.bq_ptr = bq_ptr;
+        // A zero stride collapses back to a single scale shared by every group.
+        args_ptr[group_id].group_karg.aq_ptr = reinterpret_cast<const AccDataType *>(
+            reinterpret_cast<const char *>(aq_ptr) + group_id * a_scale_group_stride_bytes);
+        args_ptr[group_id].group_karg.bq_ptr = reinterpret_cast<const AccDataType *>(
+            reinterpret_cast<const char *>(bq_ptr) + group_id * b_scale_group_stride_bytes);
     } else if constexpr (QuantMode == ck_tile::QuantType::RowColQuant) {
         args_ptr[group_id].group_karg.aq_ptr = aq_ptr + group_offs_ptr[group_id];
         args_ptr[group_id].group_karg.bq_ptr = bq_ptr + group_id * n;
@@ -196,7 +200,8 @@ void ck_grouped_gemm_fp8(
                 reinterpret_cast<ck_tile::QuantGemmTransKernelArg *>(params.args_ptr), params.a_ptr,
                 params.b_ptr, params.c_ptr, params.aq_ptr, params.bq_ptr, params.group_lens_ptr,
                 params.group_offs_ptr, params.group_num, params.n, params.k, strideA, strideB,
-                strideC, strideAQ, strideBQ, QK_A, QK_B, k_batch);
+                strideC, strideAQ, strideBQ, QK_A, QK_B, k_batch, params.a_scale_group_stride_bytes,
+                params.b_scale_group_stride_bytes);
     }
 
     const auto stream_cfg = ck_tile::stream_config{params.stream};
@@ -281,7 +286,8 @@ __global__ void compute_grouped_gemm_fp8_variable_k_args(
     const ck_tile::index_t n, const ck_tile::index_t strideA, const ck_tile::index_t strideB,
     const ck_tile::index_t strideC, const ck_tile::index_t strideAQ,
     const ck_tile::index_t strideBQ, const ck_tile::index_t QK_A, const ck_tile::index_t QK_B,
-    const ck_tile::index_t k_batch) {
+    const ck_tile::index_t k_batch, const int64_t a_scale_group_stride_bytes,
+    const int64_t b_scale_group_stride_bytes) {
     const int64_t group_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (group_id >= group_num)
         return;
@@ -294,8 +300,11 @@ __global__ void compute_grouped_gemm_fp8_variable_k_args(
     const int64_t strideAK = transA ? m : 1;
     const int64_t strideBK = transB ? 1 : n;
     if constexpr (QuantMode == ck_tile::QuantType::TensorQuant) {
-        args_ptr[group_id].group_karg.aq_ptr = aq_ptr;
-        args_ptr[group_id].group_karg.bq_ptr = bq_ptr;
+        // A zero stride collapses back to a single scale shared by every group.
+        args_ptr[group_id].group_karg.aq_ptr = reinterpret_cast<const AccDataType *>(
+            reinterpret_cast<const char *>(aq_ptr) + group_id * a_scale_group_stride_bytes);
+        args_ptr[group_id].group_karg.bq_ptr = reinterpret_cast<const AccDataType *>(
+            reinterpret_cast<const char *>(bq_ptr) + group_id * b_scale_group_stride_bytes);
     } else if constexpr (QuantMode == ck_tile::QuantType::RowColQuant) {
         // For variable_k with RowColQuant: a_scales is per-row, b_scales is per-column
         // A scale: offset by m (each group has m rows)
@@ -444,7 +453,8 @@ void ck_grouped_gemm_fp8_variable_k(
             reinterpret_cast<ck_tile::QuantGemmTransKernelArg *>(params.args_ptr), params.a_ptr,
             params.b_ptr, params.c_ptr, params.aq_ptr, params.bq_ptr, params.group_lens_ptr,
             params.group_offs_ptr, params.transA, params.transB, params.group_num, params.m,
-            params.n, strideA, strideB, strideC, strideAQ, strideBQ, QK_A, QK_B, k_batch);
+            params.n, strideA, strideB, strideC, strideAQ, strideBQ, QK_A, QK_B, k_batch,
+            params.a_scale_group_stride_bytes, params.b_scale_group_stride_bytes);
     }
 
     const auto stream_cfg = ck_tile::stream_config{params.stream};

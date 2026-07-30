@@ -223,7 +223,7 @@ class QuantizedTensor(torch.Tensor):
         assert hp_tensor.ndim in (2, 3), f"data must be a 2D or 3D tensor, got {hp_tensor.ndim}D"
         assert dest_dtype in _SUPPORTED_QUANTIZED_DTYPES, "Unsupported quantized dtype"
 
-        # NOTE: we treat grouped tensors as non-grouped tensors when granularity is TENSORWISE or ROWWISE.
+        # NOTE: we treat grouped tensors as non-grouped tensors when granularity is ROWWISE.
         is_grouped_tensor = group_lens is not None
         if is_grouped_tensor:
             assert granularity in _SUPPORTED_GROUPED_QUANTIZED_GRANS, (
@@ -307,11 +307,9 @@ class QuantizedTensor(torch.Tensor):
                 group_offs_from_lens,
             )
 
-            if granularity in [
-                ScalingGranularity.TENSORWISE,
-                ScalingGranularity.ROWWISE,
-            ]:
-                # NOTE: we treat grouped tensors as non-grouped tensors when granularity is TENSORWISE or ROWWISE.
+            if granularity == ScalingGranularity.ROWWISE:
+                # NOTE: we treat grouped tensors as non-grouped tensors when granularity is ROWWISE:
+                # a per-row scale does not depend on how the rows are grouped.
                 orig_group_lens = padded_group_lens = group_lens
                 orig_group_offs = padded_group_offs = group_offs_from_lens(group_lens)
 
@@ -533,9 +531,10 @@ class QuantizedTensor(torch.Tensor):
 
         if self._dest_dtype in [float8_e4m3, float8_e5m2]:
             assert self._granularity in (
+                ScalingGranularity.TENSORWISE,
                 ScalingGranularity.MX_BLOCKWISE,
                 ScalingGranularity.BLOCKWISE,
-            ), "Grouped dequantization is only supported for MX_BLOCKWISE / BLOCKWISE FP8"
+            ), "Grouped dequantization is only supported for TENSORWISE / MX_BLOCKWISE / BLOCKWISE FP8"
             assert self._group_lens is not None, "group_lens is missing"
             assert self._group_offs is not None, "group_offs is missing"
             assert self._orig_group_offs is not None, "orig_group_offs is missing"
@@ -594,8 +593,8 @@ class QuantizedTensor(torch.Tensor):
         """Dequantize back to the original high-precision dtype."""
 
         if self._is_grouped_tensor:
-            # NOTE: we treat grouped tensors as non-grouped tensors when granularity is TENSORWISE or ROWWISE.
-            if self._granularity in [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE]:
+            # NOTE: we treat grouped tensors as non-grouped tensors when granularity is ROWWISE.
+            if self._granularity == ScalingGranularity.ROWWISE:
                 out = self._dequantize()
             else:
                 out = self._grouped_dequantize()
