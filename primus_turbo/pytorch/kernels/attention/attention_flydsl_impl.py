@@ -44,11 +44,9 @@ def _uniform_seqlen(cu_seqlens: "torch.Tensor"):
 
 @functools.lru_cache(maxsize=64)
 def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=False):
-    # D=64 (the Meta hd64 campaign regime): the 4-wave stagger-off config
-    # (block_m=128, waves_per_eu=2, stagger off) is the tuned production path --
-    # STAGGER=0 lifts MFMA util 37->43% (+3-8% TF/s, e.g. 910->945 at S=16384) and
-    # clears the 1.68x-H100 line on every square shape. Other head dims (D=128) keep
-    # the build default (8-wave) to stay zero-regression outside the tuned regime.
+    # D=64 (the Meta hd64 campaign regime) uses the tuned 4-wave stagger-off config
+    # (block_m=128, waves_per_eu=2): stagger-off lifts MFMA utilization here. Other
+    # head dims keep the build default (8-wave) to stay zero-regression.
     cfg = {}
     if D == 64:
         cfg = dict(waves_per_eu=2, dualwave_swp_enable_stagger=False, block_m=128)
@@ -125,7 +123,6 @@ def flash_attn_varlen_flydsl_backward_impl(
     softmax_scale=None,
     causal=True,
     window_size=(-1, -1),
-    fast_exp2=False,
 ):
     """Deterministic 16x16x32 FlyDSL backward. ``lse`` is the natural-log softmax
     LSE in [B, Hq, Sq] fp32 (the backward prescales it internally). Returns
@@ -219,7 +216,6 @@ def flash_attn_sbhd_flydsl_backward_impl(
     softmax_scale=None,
     causal=True,
     window_size=(-1, -1),
-    fast_exp2=False,
 ):
     """Native SBHD deterministic 16x16x32 FlyDSL backward. q/dout/out:[Sq,B,Hq,D],
     k/v:[Skv,B,Hkv,D] bf16; ``lse`` is natural-log softmax LSE in [B,Hq,Sq] fp32.
