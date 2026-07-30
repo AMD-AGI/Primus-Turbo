@@ -859,6 +859,9 @@ _GNT_CFG_CACHE: dict = {}  # cfg_key (NO M_pad) -> (bm, gm, xcd, gn) chosen by a
 # fwd/dgrad NT autotune. The launch is M-generic (M is a runtime arg), so the config race
 # keys on the static shape only (cfg_key, no M_pad) and is reused for every M.
 _GNT_NT_DEFAULT_CFG = (256, 4, 4, 0)  # (BLOCK_M, GROUP_M, num_xcd, group_n); cand[0] = base ref
+# One XCD's private L2 slice; MI355X has 8 of them, so a band is only re-read out of L2
+# while its A footprint fits in one slice.
+_L2_SLICE_BYTES = 4 << 20
 
 # (tokens/group, skewed) points the race times on. The swizzle is invariant in neither M nor
 # the token distribution: a single midpoint mis-picks a cfg that wins there but loses at the
@@ -871,17 +874,25 @@ _GNT_PM_CANON = ((2048, False), (8192, True))
 _GNT_AT_MARGIN = 0.985
 
 
-def _gnt_nt_candidates(N):
+def _gnt_nt_candidates(N, K):
     """Flat (bm,gm,xcd,gn) autotune candidate list (4 max); cand[0] is the base reference.
 
     Trimmed 2026-07-09 from 5-7 to 4 via per-candidate AT_DBG timings across the MoE
     bench shapes (mi355x_vs_b200_grouped_gemm_fp8_tensorwise.md): the 2D N-band (gn>0)
     and (256,8,8,0) candidates never won on any fwd/dgrad shape, so only gm/xcd swizzles
     are kept.
+
+    GROUP_M widens the M band an A tile-row block is re-read over: B is streamed once
+    per band, so B traffic scales as 1/gm, while the band's A footprint (gm*bm*K bytes)
+    eventually outgrows an XCD's private L2 slice and the A re-reads stop hitting. Only
+    K is shape-dependent there, so the trade point moves with K and a single global band
+    width mis-serves long-K shapes. Measured tw/mx over gm 2/4/8/16 -- N=2944 K=5760:
+    1.010 / 1.036 / 1.047 / 1.031, against 1.089 / 1.122 / 1.086 at K=2944.
     """
+    gm0, gm1 = (8, 4) if 4 * 256 * K > _L2_SLICE_BYTES else (4, 8)
     return [
-        (256, 4, 4, 0),  # base ref (default); wins the large majority of shapes
-        (256, 8, 4, 0),  # gm=8 — wins dsv3-GateUP fwd (M=2048)
+        (256, gm0, 4, 0),  # base ref (default); the band width K asks for
+        (256, gm1, 4, 0),  # the other band width
         (256, 4, 8, 0),  # xcd=8 — wins qwen3-Down fwd (M=2048)
         (256, 1, 4, 0),  # gm=1 — wins several other MX MoE shapes (off-bench)
     ]
@@ -1007,7 +1018,7 @@ def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
     if cached is not None:
         return cached
 
-    cands = _gnt_nt_candidates(N)
+    cands = _gnt_nt_candidates(N, K)
     # one (targs, out_view) per steady point; candidates scored by their geomean cand/base ratio
     points = [_canon_nt_targs(args, K, G, N, pm, skew) for pm, skew in _GNT_PM_CANON]
 
