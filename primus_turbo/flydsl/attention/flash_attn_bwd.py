@@ -12,6 +12,7 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
@@ -41,6 +42,27 @@ def _extract_aligned_pointer(tensor, address_space=None) -> ir.Value:
 
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
     return llvm.LoadOp(result_type, _llvm_value(ptr)).result
+
+
+def _cached_launch(cache, jit_fn, hints, args, kwargs):
+    """Reuse the compiled artifact across calls that share a scalar signature."""
+    if kwargs:
+        if hints is None:
+            return jit_fn(*args, **kwargs)
+        with CompilationContext.compile_hints(hints):
+            return jit_fn(*args, **kwargs)
+    key = tuple(a for a in args[:-1] if not isinstance(a, torch.Tensor))
+    fn = cache.get(key)
+    if fn is None:
+        if len(cache) >= 64:
+            cache.clear()
+        if hints is None:
+            fn = flyc.compile(jit_fn, *args)
+        else:
+            with CompilationContext.compile_hints(hints):
+                fn = flyc.compile(jit_fn, *args)
+        cache[key] = fn
+    return fn(*args)
 
 
 def dtype_to_elem_type(dtype_str):
@@ -165,8 +187,10 @@ def build_flash_attn_bwd_odo_module(
             },
         ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
+    _compiled: dict = {}
+
     def _launch(*args, **kwargs):
-        return launch_flash_attn_bwd_odo(*args, **kwargs)
+        return _cached_launch(_compiled, launch_flash_attn_bwd_odo, None, args, kwargs)
 
     def _compile(*args):
         return flyc.compile(launch_flash_attn_bwd_odo, *args)
@@ -979,9 +1003,10 @@ def build_flash_attn_bwd_dkdv_module(
         "llvm_options": {"enable-post-misched": True, "lsr-drop-solution": True},
     }
 
+    _compiled: dict = {}
+
     def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_hints):
-            return launch_flash_attn_bwd_dkdv(*args, **kwargs)
+        return _cached_launch(_compiled, launch_flash_attn_bwd_dkdv, _hints, args, kwargs)
 
     def _compile(*args):
         with CompilationContext.compile_hints(_hints):
@@ -1737,9 +1762,10 @@ def build_flash_attn_bwd_dq_module(
         "llvm_options": {"enable-post-misched": True, "lsr-drop-solution": True},
     }
 
+    _compiled: dict = {}
+
     def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_hints):
-            return launch_flash_attn_bwd_dq(*args, **kwargs)
+        return _cached_launch(_compiled, launch_flash_attn_bwd_dq, _hints, args, kwargs)
 
     def _compile(*args):
         with CompilationContext.compile_hints(_hints):
@@ -1754,7 +1780,6 @@ def build_flash_attn_bwd_dq_module(
 # Deterministic drop-in for the CK hd64 FMHA varlen backward; the build_* module
 # factories above are called directly (same module).
 # ===========================================================================
-import torch
 
 
 def _qsplit_for(Sq):
