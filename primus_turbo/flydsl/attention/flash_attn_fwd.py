@@ -3,14 +3,9 @@
 
 """Dual-wave, software-pipelined flash-attention kernel for gfx950 (D=64/128, bf16/fp16).
 
-The gfx950 fast path of FlyDSL flash attention: same math as the generic
-``flash_attn_generic.py`` BLOCK_M=256 path, but with a hand-built software
-pipeline and two-wave-group time-multiplexing instead of the compiler schedule.
-Dispatched only when gpu_arch >= gfx950, head_dim in (64, 128), dtype in (bf16, fp16),
-and (at runtime) seq_len >= 384. seq_len need NOT be a multiple of 256/64: a
-partial last q-block and a partial/odd kv-tile count are handled the same way as
-the hand-written reference asm (num_records bound on Q/K/V/O, tile count rounded
-up to even, and a kv padding-mask on the non-causal path).
+Dispatched when gpu_arch >= gfx950, head_dim in (64, 128) and seq_len >= 384.
+seq_len need not be a multiple of 256/64: partial q-blocks and odd kv-tile counts
+are covered by num_records bounds, an even-rounded tile count and a kv pad mask.
 """
 
 import flydsl.compiler as flyc
@@ -69,12 +64,11 @@ def build_flash_attn_dualwave_swp_module(
     block_m=None,
     gqa_merge=None,
 ):
-    """Build an DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
+    """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
-    Supports dense self-attention, varlen packed QKV, and paged-KV cache modes.
-    Varlen uses cu_seqlens_q/kv with per-batch self-attention ranges.
-    Paged mode keeps Q/O dense and maps KV tiles through BlockTable pages.
-    Varlen, paged, and split-K are mutually constrained by the caller."""
+    Supports dense, varlen packed QKV, and paged-KV modes; varlen/paged/split-K combinations
+    are constrained by the caller, not validated here.
+    """
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -129,7 +123,6 @@ def build_flash_attn_dualwave_swp_module(
     traits.BLOCK_N_OUT // traits.BLOCK_N
     _dualwave_swp_cache_tag = traits.cache_tag
 
-    # Shared-memory layout: one 16B-aligned K/V region (K0/V0/K1/V1).
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
 
     if const_expr(traits.PAGED):
@@ -195,31 +188,22 @@ def build_flash_attn_dualwave_swp_module(
 
         active = ctx.active
         elem_dtype = ctx.elem_dtype
-        # Each memory cluster's LDS buffer is only overwritten two barriers later, so its
-        # drain can sink to the tail of the consuming compute cluster and let the ds_read
-        # latency hide behind that cluster's MFMAs. Stagger offsets the two wave groups by
-        # one barrier, which spends exactly that slack, so it keeps the drain in place.
+        # A tile's LDS buffer is not overwritten until two barriers later, so its drain can sink
+        # into the consuming compute cluster; stagger spends that same slack, hence the exclusion.
         sink_drains = not traits.DUALWAVE_SWP_ENABLE_STAGGER
-        # Only part of each K/V tile is resident in registers at a time: the rest is read
-        # from LDS inside the compute cluster that consumes it, which is what brings the
-        # whole kernel under the 4-waves-per-SIMD register budget. The V reads are scored
-        # by the backend, so it places their lgkmcnt itself and the tail reads land behind
-        # the preceding P*V MFMAs. Stagger and paged spend the same scheduling slack.
+        # Keeping only part of each K/V tile in registers (the rest read from LDS in the consuming
+        # compute cluster) is what fits the kernel under the 4-waves-per-SIMD register budget.
         split_kv_reads = sink_drains and not traits.PAGED
-        # Issuing a tile's overwrite DMA in the compute cluster instead of the memory
-        # cluster costs nothing (its drain deadline moves with it) and leaves the memory
-        # cluster holding LDS reads only, which is what makes fold_mem_barriers legal.
+        # Issuing the overwrite DMA in the compute cluster leaves the memory cluster holding LDS
+        # reads only, which is what makes fold_mem_barriers legal.
         late_dma = sink_drains and not traits.PAGED
         # QK k-steps whose K packs are read before the first MFMA group; the rest follow it.
         K_HEAD = traits.K_STEPS_QK // 2
         # P*V k-substeps of V read up front; substep k + V_HEAD is issued after step k.
         V_HEAD = 1
         split_k_reads = split_kv_reads and K_HEAD < traits.K_STEPS_QK
-        # A memory cluster only issues LDS reads whose drain sits in the compute cluster
-        # that consumes them, so its own rendezvous protects nothing: the write-after-read
-        # edge for every tile is already covered by the compute-cluster barrier that
-        # precedes its overwrite DMA. Merged CTAs pay double for a rendezvous (8 waves),
-        # so drop those four and keep the scheduling boundary only.
+        # The write-after-read edge is already covered by the compute-cluster barrier preceding each
+        # overwrite DMA, so the memory-cluster rendezvous protects nothing (and costs 8 waves merged).
         fold_mem_barriers = sink_drains and traits.Q_HEADS_PER_WG > 1
 
         def _mem_cluster_sync():
@@ -251,7 +235,6 @@ def build_flash_attn_dualwave_swp_module(
                 _sched_barrier(0)
                 _s_barrier()
 
-            # Prologue: load K tile split_t0 -> LDS buf0, wait, and sync the workgroup.
             if const_expr(traits.PAGED):
                 pro_pageid_0 = page_ids.async_load_split_page(0)
                 kv_gmem_to_lds.load_k_split(0, 0, page_id=pro_pageid_0)
@@ -261,7 +244,6 @@ def build_flash_attn_dualwave_swp_module(
             _sched_barrier(0)
             _s_barrier()
 
-            # Load this wave's Q rows and pre-scale by the 1/sqrt(D) softmax
             q_all_bf16 = q_loader.load_all()
             q_all_scaled_bf16 = q_loader.scale_all(q_all_bf16)
 
@@ -295,14 +277,12 @@ def build_flash_attn_dualwave_swp_module(
                 return v_o
 
             def _pv(v_p, v_v, v_o, buf_id):
-                """Full P*V for one KV tile."""
                 if const_expr(not split_kv_reads):
                     return gemm_helper.pv(v_p, v_v, v_o)
                 for step in range_constexpr(4):
                     v_o = _pv_step(step, v_p, v_v, v_o, buf_id)
                 return v_o
 
-            # Pipeline ahead: prefetch K tile1 (buf1) + V tile0 (buf0) as background
             if const_expr(traits.PAGED):
                 pro_pageid_1 = page_ids.async_load_split_page(1)
                 kv_gmem_to_lds.load_k_split(1, 1, page_id=pro_pageid_1)
@@ -319,7 +299,6 @@ def build_flash_attn_dualwave_swp_module(
             _sched_barrier(0)
             _dualwave_sync_barrier()
 
-            # Prologue scores + first softmax pass for KV tile 0
             if const_expr(traits.PAGED):
                 pro_pageid_2_lds = page_ids.load_page_id_lds(page_ids.split_tile(2))
             v_s_0 = _qk(v_k, 0)
@@ -333,9 +312,8 @@ def build_flash_attn_dualwave_swp_module(
                 # Non-causal tiny seq_len needs tile-0 padding masked before the full-tile no-op gate.
                 v_s_0 = softmax_helper.seq_pad_mask_if_needed(v_s_0, softmax_helper.split_tile(0))
             if const_expr(traits.DUALWAVE_SWP_FIXED_MAX):
-                # Softmax is shift-invariant, so a zero reference max holds for every tile
-                # and the final l_row normalization absorbs it. exp2 of a masked score is
-                # already 0, so fully-masked rows need no finite floor.
+                # Softmax is shift-invariant, so a zero reference max is valid; masked scores
+                # already exp2 to 0, so fully-masked rows need no finite floor.
                 m_row_pro = softmax_helper.zero_row_max()
             else:
                 m_row_pro = softmax_helper.reduce_max(v_s_0)
@@ -350,26 +328,21 @@ def build_flash_attn_dualwave_swp_module(
             )
             _dualwave_sync_barrier()
 
-            # Software-pipelined inner loop. Always split_tile-relative: split_t0 = 0 for
-            # dense/full-causal (byte-identical to absolute), = swa_lo for SWA (tile-skip),
-            # = split chunk start for split-K.
+            # Inner-loop tile indices are split_tile-relative: split_t0 = 0 dense/causal,
+            # swa_lo for SWA, chunk start for split-K.
             loop_lb = ctx.split_tile(3)
 
-            # Prefetch K tile 2 into buf0, keeping the K double-buffer one step ahead
             if const_expr(traits.PAGED):
                 _init_v_pid_lds = page_ids.load_page_id_lds(loop_lb - fx.Index(2))
                 kv_gmem_to_lds.load_k_split(2, 0, page_id=pro_pageid_2)
             else:
                 kv_gmem_to_lds.load_k_split(2, 0)
 
-            # ============================= Main loop =============================
-            # Loop-carried state (scf.for init args): m_row, l_row(=0), traits.D_CHUNKS zero
             init_args = [m_row_pro, l_row_init]
             for _ in range_constexpr(traits.D_CHUNKS):
                 init_args.append(v_o_zero)
             init_args.append(v_p_0[0])
             init_args.append(v_p_0[1])
-            # Carry the next Cluster-0 V page id, seeded with the first Cluster-0 tile.
             if const_expr(traits.PAGED):
                 init_args.append(page_ids.finish_page_id(_init_v_pid_lds))
             loop_results = init_args
@@ -471,7 +444,6 @@ def build_flash_attn_dualwave_swp_module(
                 c4_pageid = (
                     page_ids.finish_page_id(c4_pageid_lds) if const_expr(traits.PAGED) else fx.Index(0)
                 )
-                # sched_barrier(0) pins priority and real sync at the cluster boundary without emitting ISA.
                 if const_expr(sink_drains):
                     _s_waitcnt(traits.LGKMCNT_0_ONLY)
                     _waitcnt_vm_n(ctx.VM_DRAIN_KV)
@@ -549,7 +521,6 @@ def build_flash_attn_dualwave_swp_module(
                 _sched_barrier_exp_pairs(traits, 6, 3, 4)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(0)
-                # Prefetch the next iteration's Cluster-0 V page id before this barrier.
                 if const_expr(traits.PAGED):
                     next_pageid = page_ids.finish_page_id(next_pageid_lds)
                 if const_expr(sink_drains):
@@ -571,7 +542,6 @@ def build_flash_attn_dualwave_swp_module(
             if const_expr(traits.PAGED):
                 _ec0_v_pid = loop_results[v_pid_arg_idx]
 
-            # Tile indices for the last three tiles handled by the epilogue.
             max_m3 = split_t_end - 3
             max_m2 = split_t_end - 2
             max_m1 = split_t_end - 1
@@ -767,7 +737,6 @@ def build_flash_attn_dualwave_swp_module(
 
             _s_barrier()
 
-            # Store O as 128b writes by fusing each lane's half with its half-wave partner.
             if const_expr(not traits.SPLITK):
                 output_store.store_final_o(v_o, ctx.q_row)
                 if const_expr(traits.EMIT_LSE):
@@ -792,7 +761,6 @@ def build_flash_attn_dualwave_swp_module(
         if const_expr(traits.SPLITK):
             output_store.store_empty_split()
 
-    # Combine kernel computes weighted split-K O, with one wave row covering four cols per lane.
     COMBINE_BLOCK = 256
     COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
     COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
@@ -890,9 +858,8 @@ def build_flash_attn_dualwave_swp_module(
                 stream=stream,
             )
 
-    # K/V tiles are read from LDS in pieces spread across the compute clusters, so this
-    # kernel wants a pre-RA schedule that keeps those reads clustered, plus the post-RA
-    # pass that tidies up the waitcnts. Both are scoped to this module's compilation.
+    # K/V LDS reads are spread across compute clusters, so this module compiles with a
+    # memory-clause pre-RA schedule plus the post-RA waitcnt cleanup.
     _dualwave_swp_compile_hints = {
         "fast_fp_math": True,
         "unsafe_fp_math": True,
@@ -929,7 +896,6 @@ def build_flash_attn_dualwave_swp_module(
             stride_q_n = traits.DEFAULT_STRIDE_Q_N
         if head_dim_runtime is None:
             head_dim_runtime = traits.HEAD_DIM
-        # seq_len_kv defaults to seq_len (self-attention / equal Q,KV lengths).
         if seq_len_kv is None:
             seq_len_kv = seq_len
         if traits.SPLITK:
