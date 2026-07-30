@@ -870,6 +870,9 @@ def build_flash_attn_dualwave_swp_module(
         },
     }
 
+    _compiled: dict = {}
+    _COMPILED_MAX = 64
+
     def _launch(
         Q,
         K,
@@ -918,43 +921,32 @@ def build_flash_attn_dualwave_swp_module(
             block_table = O
         if block_table_stride is None:
             block_table_stride = 0
-        with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
-            if stream is None:
-                return launch_flash_attn_dualwave_swp(
-                    Q,
-                    K,
-                    V,
-                    O,
-                    debug_counts,
-                    cu_seqlens_q,
-                    cu_seqlens_kv,
-                    block_table,
-                    batch_size,
-                    seq_len,
-                    seq_len_kv,
-                    stride_q_n,
-                    stride_kv_n,
-                    head_dim_runtime,
-                    block_table_stride,
-                )
-            return launch_flash_attn_dualwave_swp(
-                Q,
-                K,
-                V,
-                O,
-                debug_counts,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                block_table,
-                batch_size,
-                seq_len,
-                seq_len_kv,
-                stride_q_n,
-                stride_kv_n,
-                head_dim_runtime,
-                block_table_stride,
-                stream=stream,
-            )
+        args = (
+            Q,
+            K,
+            V,
+            O,
+            debug_counts,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            block_table,
+            batch_size,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            head_dim_runtime,
+            block_table_stride,
+        )
+        key = args[8:] + (stream is None,)
+        fn = _compiled.get(key)
+        if fn is None:
+            if len(_compiled) >= _COMPILED_MAX:
+                _compiled.clear()
+            with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
+                fn = flyc.compile(launch_flash_attn_dualwave_swp, *args, stream)
+            _compiled[key] = fn
+        return fn(*args, stream)
 
     def _compile(
         Q,
