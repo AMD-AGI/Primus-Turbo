@@ -3,42 +3,9 @@
 
 """flash_attn backward kernel builders for FlyDSL (gfx950 / MI355X).
 
-Forked from flash_attn_fwd_kernel.py: reuses the verified forward machine
-(KV-head-major XCD remap, d64-general K XOR-swizzle, K@Q^T GEMM1 so S lands in
-PV-aligned registers, ds_read_tr16_b64 hardware transpose read, causal per-lane
-select, wave64 peer reduce) and only swaps the epilogue for the backward math.
-
-Three build modes (Q-outer, one work-group owns one q-tile -> single write, no
-float atomics -> deterministic):
-
-  mode="delta": delta[b,hq,s] = sum_j P_ij * dP_ij   (fp32 P, fp32 accumulate).
-      P recomputed from the saved LSE (softmax prob); dP = dO @ V^T reuses the
-      GEMM1 template with V as the "K" A-operand and dO as the "Q" B-operand.
-
-  mode="dq": dQ = sm_scale * sum_j dS_ij * k_j  with dS = P (.) (dP - delta).
-      P/dP recomputed exactly as in the delta kernel (bit-identical), so the
-      near-diagonal cancellation sum_j dS_ij = 0 stays exact against the
-      consistent delta buffer. dQ = dS @ K reuses the GEMM2 template with K read
-      transposed (ds_read_tr) as the "V" A-operand and dS as the "P" B-operand;
-      for head_dim=64 the K-swizzle equals the forward V-swizzle so that read
-      path is reused verbatim. Result [D,q] is stored transposed like O.
-
-  mode="fused_dq_delta": folds delta and dq into one kv-loop so S/P/dP are recomputed
-      once. dQ = sm/R*(A - (delta/R)*B) with, in one pass, A_i = sum_j C_ij k_j,
-      B_i = sum_j P_ij k_j, and a scalar reduce. Two variants:
-      * identity_center=True (production): C = P*(dP - delta_id) is CENTERED by a
-        precomputed identity delta_id = rowsum(O.dO) read from DELTA, so C is small
-        and the A/B GEMM2 uses plain bf16 operands; the scalar becomes the residual
-        rho = sum_j P*(dP-delta_id) and the epilogue's (rho/R)*B correction recovers
-        the exact consistent dq. No delta is written (delta_id already serves dkdv);
-        this eliminates the separate S/dP delta pass entirely.
-      * identity_center=False (legacy): C = P*dP is UNCENTERED, so A/B feed single
-        fp16 (tf32, 10-bit mantissa) operands to survive the near-diagonal
-        catastrophic cancellation (single-bf16's 8-bit fails); writes the recomputed
-        fp32 delta for the downstream dkdv kernel.
-
-Target: gfx950 only (32x32x16 bf16 MFMA, ds_read_tr16_b64, permlane32_swap +
-cvt_pk_bf16_f32 store). bf16, causal, GQA/MQA (num_kv_heads <= num_heads).
+Three deterministic kernels -- odo (identity delta), dkdv (KV-outer), dq
+(Q-outer). Each work-group owns one output tile and writes it once, so there
+are no float atomics. Built on the verified forward machine.
 """
 
 import math as host_math
@@ -50,7 +17,6 @@ from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
@@ -85,970 +51,6 @@ def dtype_to_elem_type(dtype_str):
     raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'bf16' or 'f16')")
 
 
-def build_flash_attn_bwd_module(
-    num_heads,
-    head_dim,
-    causal=True,
-    dtype_str="bf16",
-    sm_scale=None,
-    waves_per_eu=2,
-    block_m=128,
-    num_kv_heads=None,
-    unsafe_fp_math=True,
-    fast_fp_math=True,
-    daz=True,
-    mode="dq",
-    enable_dma=True,
-    identity_center=False,
-):
-    """Build one backward launcher. ``mode`` in {"delta", "dq", "fused_dq_delta"}.
-
-    ``identity_center`` (fused mode only): instead of computing delta in-kernel and
-    forming the uncentered A = sum_j (P*dP)*k (which needs fp16/tf32 operands to
-    survive the near-diagonal cancellation), read a precomputed identity delta
-    delta_id = rowsum_d(O*dO) from DELTA and center in-loop: C = P*(dP - delta_id).
-    Because dP-delta_id is already small, the A/B GEMM2 uses plain bf16 operands.
-    The residual rho = sum_j P*(dP-delta_id) then corrects the epilogue exactly:
-    dQ = sm/R * (A - (rho/R)*B), recovering the consistent dq WITHOUT the separate
-    delta pass (delta kernel eliminated; DELTA is filled cheaply on the host / by an
-    O.dO pass and reused by dkdv). No delta is written back."""
-    assert mode in ("delta", "dq", "fused_dq_delta"), mode
-    assert not identity_center or mode == "fused_dq_delta", "identity_center is fused-only"
-    assert causal, "backward kernel is causal-only for the GPT-OSS campaign"
-    gpu_arch = get_hip_arch()
-    assert gpu_arch.startswith("gfx950"), "backward kernel targets gfx950"
-    assert dtype_str == "bf16", "backward kernel targets bf16"
-
-    # DMA-to-LDS (buffer_load_dwordx4 ... lds) bypasses the VGPR staging of the K/V
-    # tile loads (gfx950+ only); relieves register pressure / removes the ds_write
-    # spill on this 168-VGPR delta/dq kernel.
-    ENABLE_DMA = enable_dma and not gpu_arch.startswith("gfx942")
-
-    if num_kv_heads is None:
-        num_kv_heads = num_heads
-    assert num_heads % num_kv_heads == 0
-
-    BLOCK_N = 64
-    K_SUB_N = 32
-    WARP_SIZE = 64
-    BLOCK_M = block_m
-    flat_work_group_size = 256 if BLOCK_M <= 128 else 512
-    NUM_WAVES = flat_work_group_size // WARP_SIZE
-    BLOCK_SIZE = flat_work_group_size
-    ROWS_PER_WAVE = BLOCK_M // NUM_WAVES
-
-    K_STEP_QK = 16
-    K_STEPS_QK = head_dim // K_STEP_QK
-    D_CHUNK = 32
-    D_CHUNKS = head_dim // D_CHUNK
-    PV_K_STEP = 16
-    PV_K_STEPS = K_SUB_N // PV_K_STEP
-
-    assert BLOCK_M % NUM_WAVES == 0
-    assert head_dim % 32 == 0 and head_dim >= 64
-    assert head_dim % 16 == 0
-
-    if sm_scale is None:
-        sm_scale = 1.0 / host_math.sqrt(head_dim)
-
-    NUM_HEADS_Q = num_heads
-    NUM_HEADS_KV = num_kv_heads
-    GQA_GROUP_SIZE = NUM_HEADS_Q // NUM_HEADS_KV
-    HEAD_DIM = head_dim
-    STRIDE_TOKEN_Q = NUM_HEADS_Q * HEAD_DIM
-    STRIDE_TOKEN_KV = NUM_HEADS_KV * HEAD_DIM
-
-    # K and V both go to LDS in the same K-swizzle layout (stride = head_dim);
-    # K is additionally read transposed (ds_read_tr) for the dQ GEMM.
-    K_STRIDE = HEAD_DIM
-    LDS_TILE = BLOCK_N * K_STRIDE
-    LDS_V_BASE = LDS_TILE
-    # Fused dual-tile: keep a 2nd K copy in fp16 (LDS_K16_BASE) alongside the bf16
-    # K/V tiles. GEMM1 (S=K@Q^T) reads the bf16 K tile; GEMM2's A/B fp16 MFMA reads
-    # this fp16 tile via a transpose-read directly, dropping the per-read bf16->fp16
-    # conversion from the VALU-issue-bound loop (host pre-casts the small K tensor).
-    # identity_center fuses with plain bf16 operands (centered A survives bf16), so
-    # it needs no separate fp16 K copy; only the legacy uncentered fused path does.
-    USE_K16 = mode == "fused_dq_delta" and not identity_center
-    LDS_K16_BASE = 2 * LDS_TILE
-    LDS_TOTAL = (3 if USE_K16 else 2) * LDS_TILE
-
-    VEC_WIDTH = 16
-    assert HEAD_DIM % VEC_WIDTH == 0
-    THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
-    assert BLOCK_SIZE % THREADS_PER_ROW_LOAD == 0
-    ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
-    if ROWS_PER_BATCH_LOAD >= BLOCK_N:
-        NUM_BATCHES_KV = 1
-        KV_NEEDS_GUARD = ROWS_PER_BATCH_LOAD > BLOCK_N
-    else:
-        assert BLOCK_N % ROWS_PER_BATCH_LOAD == 0
-        NUM_BATCHES_KV = BLOCK_N // ROWS_PER_BATCH_LOAD
-        KV_NEEDS_GUARD = False
-
-    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name=f"flash_attn_bwd_smem_{mode}")
-    lds_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_off + LDS_TOTAL * 2
-
-    IS_DQ = mode == "dq"
-    IS_DELTA = mode == "delta"
-    IS_FUSED = mode == "fused_dq_delta"
-
-    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-    def flash_attn_bwd_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        DO: fx.Tensor,
-        LSE: fx.Tensor,
-        DELTA: fx.Tensor,
-        DQ: fx.Tensor,
-        K16: fx.Tensor,
-        seq_len: fx.Int32,
-    ):
-        elem_dtype = dtype_to_elem_type(dtype_str)
-        elem_type = elem_dtype.ir_type
-        k_ptr = _extract_aligned_pointer(K)
-        v_ptr = _extract_aligned_pointer(V)
-
-        fm_fast = fx.arith.FastMathFlags.fast
-        v4f16_type = Vec.make_type(4, elem_dtype)
-        v8f16_type = Vec.make_type(8, elem_dtype)
-        v16f32_type = Vec.make_type(16, fx.Float32)
-        mfma_pack_type = v8f16_type
-        MFMA_LANE_K = 8
-
-        def _mfma(mfma_fn, a, b, c):
-            return mfma_fn(v16f32_type, [a, b, c])
-
-        def _fadd(a, b):
-            return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fsub(a, b):
-            return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fmul(a, b):
-            return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def mfma_acc(a, b, c):
-            return _mfma(rocdl.mfma_f32_32x32x16_bf16, a, b, c)
-
-        _f16 = fx.Float16
-
-        def mfma_f16(a, b, c):
-            # Single-fp16 MFMA (K=16, same throughput/accumulator layout as the bf16
-            # 32x32x16). Used by the fused dQ+delta A/B GEMM2 where fp16's 10-bit
-            # mantissa (= tf32) is enough for the near-diagonal dS cancellation.
-            return _mfma(rocdl.mfma_f32_32x32x16_f16, a, b, c)
-
-        seq_len_v = fx.Index(seq_len)
-
-        base_ptr = allocator.get_base()
-        lds = SmemPtr(base_ptr, lds_off, elem_type, shape=(LDS_TOTAL,)).get()
-
-        block_id = fx.Index(gpu.block_idx.x)
-        tid = fx.Index(gpu.thread_idx.x)
-        wave_id = tid // WARP_SIZE
-        lane = tid % WARP_SIZE
-        lane_mod_32 = lane % 32
-        lane_div_32 = lane // 32
-
-        # ds_read_tr16_b64 lane decomposition (4x4 transpose within 16-lane blocks).
-        tr_k_group = (lane % 16) // 4
-        tr_col_sub = lane % 4
-        tr_col_half = (lane % 32) // 16
-
-        def ds_read_tr_v4f16(lds_elem_idx):
-            byte_offset = lds_elem_idx * 2 + lds_off
-            byte_i64 = fx.Int64(byte_offset)
-            ptr = buffer_ops.create_llvm_ptr(byte_i64, address_space=3)
-            return rocdl.ds_read_tr16_b64(v4f16_type, ptr).result
-
-        # Same 16-bit transpose read, typed as real fp16, for the fused dual-tile
-        # fp16 K copy (bit-level reinterpret: the DMA wrote fp16 bit patterns there).
-        v4realf16_type = Vec.make_type(4, _f16)
-
-        def ds_read_tr_realf16(lds_elem_idx):
-            byte_offset = lds_elem_idx * 2 + lds_off
-            byte_i64 = fx.Int64(byte_offset)
-            ptr = buffer_ops.create_llvm_ptr(byte_i64, address_space=3)
-            return rocdl.ds_read_tr16_b64(v4realf16_type, ptr).result
-
-        wave_q_offset = wave_id * ROWS_PER_WAVE
-
-        # KV-head-major block_id decode (XCD/L2 locality; bijection -> det-neutral).
-        if const_expr(GQA_GROUP_SIZE == 1):
-            q_head_idx = block_id % NUM_HEADS_Q
-            batch_q_tile_id = block_id // NUM_HEADS_Q
-            kv_head_idx = q_head_idx
-        else:
-            kv_head_idx = block_id % NUM_HEADS_KV
-            _bid_rest = block_id // NUM_HEADS_KV
-            _q_in_group = _bid_rest % GQA_GROUP_SIZE
-            batch_q_tile_id = _bid_rest // GQA_GROUP_SIZE
-            q_head_idx = kv_head_idx * GQA_GROUP_SIZE + _q_in_group
-        num_q_tiles = (seq_len_v + BLOCK_M - 1) // BLOCK_M
-        _qt_disp = batch_q_tile_id % num_q_tiles
-        batch_idx = batch_q_tile_id // num_q_tiles
-        # Causal load-balance two-pointer interleave (mirrors the forward kernel):
-        # a q-tile's kv-loop length grows with q_tile_idx (tile 0 -> 1 kv-block,
-        # tile N-1 -> N), so natural dispatch runs only the heaviest tiles at the
-        # tail (low occupancy). Reorder dispatch to (0, N-1, 1, N-2, ...) so
-        # concurrent work-groups mix light+heavy loads. Bijection over q-tiles ->
-        # each output tile still computed by exactly one WG (corr/det-neutral);
-        # kv_head stays the fastest block_id axis so the XCD/L2 remap is untouched.
-        _qt_half = _qt_disp // fx.Index(2)
-        _qt_is_odd = ArithValue(_qt_disp % fx.Index(2) == fx.Index(1))
-        q_tile_idx = fx.Index(_qt_is_odd.select(num_q_tiles - fx.Index(1) - _qt_half, _qt_half))
-        q_start = q_tile_idx * BLOCK_M
-
-        # Fold the per-batch element offset into the raw KV pointers (0-based rows).
-        _kv_ptr_batch_off = batch_idx * seq_len_v * fx.Index(STRIDE_TOKEN_KV)
-        k_ptr = buffer_ops.get_element_ptr(k_ptr, _kv_ptr_batch_off, elem_type=elem_type)
-        v_ptr = buffer_ops.get_element_ptr(v_ptr, _kv_ptr_batch_off, elem_type=elem_type)
-
-        load_row_in_batch = tid // THREADS_PER_ROW_LOAD
-        load_lane_in_row = tid % THREADS_PER_ROW_LOAD
-        load_col_base = load_lane_in_row * VEC_WIDTH
-
-        def global_idx_q(token_idx, col):
-            return token_idx * STRIDE_TOKEN_Q + q_head_idx * HEAD_DIM + col
-
-        def global_idx_kv(token_idx, col):
-            return token_idx * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
-
-        def _kv_row_clamp(row_idx):
-            last = seq_len_v - fx.Index(1)
-            return fx.Index(ArithValue(row_idx < seq_len_v).select(row_idx, last))
-
-        def _load_global_vec(ptr, base_idx, vec_elems):
-            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=elem_type)
-            return _pointer_load(Vec.make_type(vec_elems, elem_dtype), gep)
-
-        def bf16_trunc_pack_v8(f32_vals):
-            # Hardware f32->bf16 pack (RNE, 1 VALU op/pair) instead of the manual
-            # &/>>/| truncation (3 VALU ops/pair); cuts the VALU-issue-bound path.
-            pairs = [
-                rocdl.cvt_pk_bf16_f32(_raw(f32_vals[j * 2]), _raw(f32_vals[j * 2 + 1]))
-                for j in range_constexpr(4)
-            ]
-            return (
-                Vec.from_elements([fx.Int32(_raw(p)) for p in pairs], fx.Int32).bitcast(elem_dtype).ir_value()
-            )
-
-        def _to_f16_v8(f32_vals):
-            # Single-fp16 pack of one 8-slot B-operand group (no bot half). fp16 keeps
-            # a 10-bit mantissa (= tf32), enough to preserve the near-diagonal dS
-            # cancellation that single-bf16 (8-bit) breaks, at half the double-bf16
-            # pack+MFMA cost.
-            return Vec.from_elements(
-                [fx.Float32(_raw(f32_vals[i])).to(_f16) for i in range_constexpr(8)], _f16
-            ).ir_value()
-
-        def _k_to_f16(kv8):
-            # Convert the transpose-read bf16 K sub-tile to fp16 for the fp16 MFMA.
-            # Must round-trip through f32 (a direct bf16->f16 arith.truncf is not
-            # lowered on this toolchain).
-            return Vec(kv8).to(fx.Float32).to(_f16).ir_value()
-
-        # ---- LDS bank-conflict swizzles (d64, gfx950 64 banks). A K/V row = 64 elems
-        # = 32 dwords, so same-parity rows share a 32-bank half; the 16 same-parity
-        # rows must be spread across the 8 aligned 16 B slots of that half to hit the
-        # b128 2-way floor. Two masks because the two tiles are read differently:
-        #   * K is BOTH normal-read (S=K@Q^T) AND transpose-read (dQ=K^T@dS). The
-        #     ds_read_tr16_b64 network only tolerates a 16-elem-granular mask, which on
-        #     d64 (4 blocks) cannot spread same-parity rows past 2 offsets -> stuck at
-        #     the legacy (row&3)<<4 (4-8 way). Keep legacy for K.
-        #   * V is normal-read ONLY (dP=V@dO^T), so it can use the finer 8-elem-granular
-        #     ((row//2)%8)*8 mask -> 8 distinct offsets -> 2-way. This halves the GEMM's
-        #     normal-read bank conflicts (measured ~60% of LDS-active cycles).
-        # Both round-trip (XOR self-inverse; period divides K_SUB_N=32 so lo/hi reads
-        # share the lane_mod_32 mask). D128 keeps the legacy mask for both.
-        def _k_bank_mask(row_idx):
-            return (row_idx & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
-
-        def _v_bank_mask(row_idx):
-            if const_expr(K_STRIDE == 64):
-                return ((row_idx >> fx.Index(1)) & fx.Index(7)) << fx.Index(3)
-            return (row_idx & fx.Index(K_STRIDE // 16 - 1)) << fx.Index(4)
-
-        def _k_swizzle(row_idx, col_idx):
-            return col_idx ^ _k_bank_mask(row_idx)
-
-        def _v_swizzle(row_idx, col_idx):
-            return col_idx ^ _v_bank_mask(row_idx)
-
-        def _coop_load(src_ptr, base, tile_start, swizzle=_k_swizzle):
-            """Cooperative row-major XOR-swizzled load of a BLOCK_N x head_dim tile."""
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = _kv_row_clamp(tile_start + load_row_in_batch + row_offset)
-                lds_row = load_row_in_batch + row_offset
-                if const_expr(KV_NEEDS_GUARD):
-                    if load_row_in_batch < fx.Index(BLOCK_N):
-                        g_idx = global_idx_kv(row_idx, load_col_base)
-                        swz_col = swizzle(lds_row, load_col_base)
-                        vec = _load_global_vec(src_ptr, g_idx, VEC_WIDTH)
-                        Vec(vec).store(lds, [base + lds_row * K_STRIDE + swz_col])
-                else:
-                    g_idx = global_idx_kv(row_idx, load_col_base)
-                    swz_col = swizzle(lds_row, load_col_base)
-                    vec = _load_global_vec(src_ptr, g_idx, VEC_WIDTH)
-                    Vec(vec).store(lds, [base + lds_row * K_STRIDE + swz_col])
-
-        # ---- Per-batch buffer descriptors (batch base folded into SRD base). ----
-        _q_nrec_bytes = _raw(seq_len_v * fx.Index(STRIDE_TOKEN_Q * 2))
-        _q_batch_byte_off = _raw(batch_idx * seq_len_v * fx.Index(STRIDE_TOKEN_Q * 2))
-        q_rsrc = buffer_ops.create_buffer_resource(
-            Q, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
-        )
-        do_rsrc = buffer_ops.create_buffer_resource(
-            DO, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
-        )
-        _lse_per_batch = seq_len_v * fx.Index(NUM_HEADS_Q)
-        _lse_nrec_bytes = _raw(_lse_per_batch * fx.Index(4))
-        _lse_batch_byte_off = _raw(batch_idx * _lse_per_batch * fx.Index(4))
-        lse_rsrc = buffer_ops.create_buffer_resource(
-            LSE, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
-        )
-        if const_expr(IS_DQ or (IS_FUSED and identity_center)):
-            delta_in_rsrc = buffer_ops.create_buffer_resource(
-                DELTA, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
-            )
-        if const_expr(IS_DQ or IS_FUSED):
-            dq_rsrc = buffer_ops.create_buffer_resource(
-                DQ, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
-            )
-        if const_expr((IS_DELTA or IS_FUSED) and not (IS_FUSED and identity_center)):
-            delta_out_rsrc = buffer_ops.create_buffer_resource(
-                DELTA, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
-            )
-
-        # ---- DMA-to-LDS for the K/V tiles (buffer_load_dwordx4 ... lds). ----
-        # K_STRIDE == head_dim, so the swizzled LDS layout matches the forward's K
-        # DMA path verbatim (LDS[row][c] = Global[row][c ^ ((row&3)<<4)]); serves
-        # both the normal read (_a_idx) and the transpose read (_read_k_tr for dQ).
-        if const_expr(ENABLE_DMA):
-            _kv_nrec_bytes = _raw(seq_len_v * fx.Index(STRIDE_TOKEN_KV * 2))
-            _kv_batch_byte_off = _raw(batch_idx * seq_len_v * fx.Index(STRIDE_TOKEN_KV * 2))
-            k_rsrc = buffer_ops.create_buffer_resource(
-                K, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_kv_batch_byte_off
-            )
-            v_rsrc = buffer_ops.create_buffer_resource(
-                V, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_kv_batch_byte_off
-            )
-            if const_expr(USE_K16):
-                # fp16 K copy (same [B,S,Hkv,D] layout, 2 bytes/elem -> identical
-                # byte math and swizzle as the bf16 K DMA).
-                k16_rsrc = buffer_ops.create_buffer_resource(
-                    K16, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_kv_batch_byte_off
-                )
-            lds_base_idx = buffer_ops.extract_base_index(lds, address_space=3)
-            DMA_BYTES = 16
-            DMA_BATCH_BYTES = BLOCK_SIZE * DMA_BYTES
-            KV_TILE_BYTES = BLOCK_N * K_STRIDE * 2
-            NUM_DMA_KV = KV_TILE_BYTES // DMA_BATCH_BYTES
-            LANES_PER_KV_ROW = HEAD_DIM * 2 // DMA_BYTES
-            ROWS_PER_DMA_BATCH = DMA_BATCH_BYTES // (HEAD_DIM * 2)
-            _dma_size = fx.Int32(DMA_BYTES)
-            _dma_soff = fx.Int32(0)
-            _dma_off = fx.Int32(0)
-            _dma_aux = fx.Int32(1)
-
-            def coop_dma_tile(src_rsrc, lds_byte_base, tile_start, bank_mask=_k_bank_mask):
-                """DMA a BLOCK_N x head_dim K/V tile into the swizzled LDS layout."""
-                for d in range_constexpr(NUM_DMA_KV):
-                    lds_addr = (
-                        lds_byte_base
-                        + wave_id * fx.Index(WARP_SIZE * DMA_BYTES)
-                        + fx.Index(d * DMA_BATCH_BYTES)
-                    )
-                    lds_lane0 = rocdl.readfirstlane(fx.Int64.ir_type, fx.Int64(lds_addr))
-                    lds_ptr = buffer_ops.create_llvm_ptr(lds_lane0, address_space=3)
-                    row_in_tile = tid // LANES_PER_KV_ROW + fx.Index(d * ROWS_PER_DMA_BATCH)
-                    swiz_col_f16 = (tid % LANES_PER_KV_ROW) * (DMA_BYTES // 2)
-                    xor_mask = bank_mask(row_in_tile)
-                    unsw_col_f16 = swiz_col_f16 ^ xor_mask
-                    col_byte = unsw_col_f16 * 2
-                    global_row = tile_start + row_in_tile
-                    global_byte = (
-                        global_row * fx.Index(STRIDE_TOKEN_KV * 2)
-                        + kv_head_idx * fx.Index(HEAD_DIM * 2)
-                        + col_byte
-                    )
-                    rocdl.raw_ptr_buffer_load_lds(
-                        src_rsrc, lds_ptr, _dma_size, fx.Int32(global_byte), _dma_soff, _dma_off, _dma_aux
-                    )
-
-        # ---- Preload Q and dO B-operand packs (register-resident). ----
-        q_row = q_start + wave_q_offset + lane_mod_32
-        q_row_i32 = fx.Int32(q_row)
-        q_b_packs = []
-        do_b_packs = []
-        for ks in range_constexpr(K_STEPS_QK):
-            q_col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
-            q_b_packs.append(
-                buffer_ops.buffer_load(
-                    q_rsrc, global_idx_q(q_row, q_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
-                )
-            )
-            do_b_packs.append(
-                buffer_ops.buffer_load(
-                    do_rsrc, global_idx_q(q_row, q_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
-                )
-            )
-
-        # ---- Load LSE (and delta for dq) for this lane's q_row. ----
-        _lse_elem = q_head_idx * seq_len_v + q_row
-        lse_val = fx.Float32(buffer_ops.buffer_load(lse_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32))
-        if const_expr(IS_DQ or (IS_FUSED and identity_center)):
-            # DELTA holds -delta_id (negated, matching the dkdv fold convention), so
-            # dP - delta_id == dP + delta_val in the loop below.
-            delta_val = fx.Float32(
-                buffer_ops.buffer_load(delta_in_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32)
-            )
-
-        # ---- Constants ----
-        c_neg_inf = fx.Float32(float("-inf"))
-        c_zero_f = fx.Float32(0.0)
-        c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
-        # LSE arrives host-prescaled as lse_s23 = (-log2e*lse)*2^23 + bias, i.e. the
-        # Schraudolph exp2 addend already scaled by 2^23, so _exp2_of folds its two
-        # fmas into one: scaled = s*(sm*log2e*2^23) + lse_s23 -> fptosi.
-        lse_s23_val = lse_val
-        c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
-        width_i32 = fx.Int32(WARP_SIZE)
-        shuf_32_i32 = fx.Int32(32)
-
-        # Crude Schraudolph 2^x (fast_exp2): P~ = bitcast(fptosi((s*sm*log2e + lse)*
-        # 2^23 + bias)). With lse host-prescaled to lse_s23 (see lse_s23_val above),
-        # _exp2_of collapses to a SINGLE fma: scaled = s*(sm*log2e*2^23) + lse_s23,
-        # trading the quarter-rate v_exp for 2 full-rate ops (fma+fptosi+bitcast).
-        # The epilogue renormalizes P = P~/rowsum(P~), restoring sum_j P=1 so the
-        # near-diagonal dS cancellation stays exact (dq decoupled from the exp approx).
-        _c_scaled_scale = fx.Float32(sm_scale * _LOG2E * float(1 << 23))
-        _c_scaled_floor = fx.Float32(-87.0 * float(1 << 23) + float(127 * (1 << 23) - 486411))
-        _exp2_compute_type = fx.Float32.ir_type
-
-        def _exp2_of(s_r, lse_t, apply_mask):
-            # Exact path (fast_exp2=False, unused) expects lse_t = plain -log2e*lse.
-            diff = fmath.fma(s_r, c_sm_scale_log2e, lse_t, fastmath=fm_fast)
-            return ArithValue(diff).exp2(fastmath=fm_fast)
-
-        def reduction_peer(v_f32):
-            return fx.Float32(v_f32).shuffle_xor(shuf_32_i32, width_i32)
-
-        # ---- KV loop upper bound (causal). ----
-        _q_end = q_start + BLOCK_M
-        kv_upper = fx.Index(ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v))
-
-        k_swz_mask = _k_bank_mask(lane_mod_32)
-        v_swz_mask = _v_bank_mask(lane_mod_32)
-
-        def _a_idx_lo(a_base, ks, swz_mask):
-            col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
-            return a_base + lane_mod_32 * K_STRIDE + (col ^ swz_mask)
-
-        def _a_idx_hi(a_base, ks, swz_mask):
-            col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
-            return a_base + fx.Index(K_SUB_N * K_STRIDE) + lane_mod_32 * K_STRIDE + (col ^ swz_mask)
-
-        def _gemm_kq(a_base, b_packs, swz_mask=k_swz_mask, init=None):
-            """GEMM1 template: acc[M=rows, N=q] = A[rows,D] @ B[q,D]^T over D. `init`
-            pre-loads BOTH MFMA accumulators (used to fold the per-q delta-center add
-            into the dP GEMM for free, mirroring dkdv's _neg_delta_acc)."""
-            acc_lo = c_zero_v16f32 if init is None else init
-            acc_hi = c_zero_v16f32 if init is None else init
-            for ks in range_constexpr(K_STEPS_QK):
-                a_lo = Vec.load(mfma_pack_type, lds, [_a_idx_lo(a_base, ks, swz_mask)])
-                a_hi = Vec.load(mfma_pack_type, lds, [_a_idx_hi(a_base, ks, swz_mask)])
-                acc_lo = mfma_acc(a_lo, b_packs[ks], acc_lo)
-                acc_hi = mfma_acc(a_hi, b_packs[ks], acc_hi)
-            return acc_lo, acc_hi
-
-        _steps = [(dc, pks) for dc in range(D_CHUNKS) for pks in range(PV_K_STEPS)]
-        TOTAL_PV = len(_steps)
-
-        def _read_k_tr(step_idx):
-            """Transpose-read K from LDS -> A-operand [M=D, ctr=kv] (like fwd V)."""
-            dc, pks = _steps[step_idx]
-            d_col = fx.Index(dc * D_CHUNK) + tr_col_half * 16 + tr_col_sub * 4
-            k_row = fx.Index(pks * PV_K_STEP) + lane_div_32 * 4 + tr_k_group
-            d_col_eff = _k_swizzle(k_row, d_col)
-            lds_lo = fx.Index(0) + k_row * K_STRIDE + d_col_eff
-            lds_hi = lds_lo + fx.Index(K_SUB_N * K_STRIDE)
-            vl_a = ds_read_tr_v4f16(lds_lo)
-            vl_b = ds_read_tr_v4f16(lds_lo + fx.Index(8 * K_STRIDE))
-            vl = Vec(vl_a).shuffle(Vec(vl_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-            vh_a = ds_read_tr_v4f16(lds_hi)
-            vh_b = ds_read_tr_v4f16(lds_hi + fx.Index(8 * K_STRIDE))
-            vh = Vec(vh_a).shuffle(Vec(vh_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-            return vl, vh
-
-        def _read_k16_tr(step_idx):
-            """Transpose-read the fp16 K copy (LDS_K16_BASE) -> A-operand [M=D, ctr=kv]
-            as real fp16, fed to mfma_f16 directly (no bf16->fp16 conversion)."""
-            dc, pks = _steps[step_idx]
-            d_col = fx.Index(dc * D_CHUNK) + tr_col_half * 16 + tr_col_sub * 4
-            k_row = fx.Index(pks * PV_K_STEP) + lane_div_32 * 4 + tr_k_group
-            d_col_eff = _k_swizzle(k_row, d_col)
-            lds_lo = fx.Index(LDS_K16_BASE) + k_row * K_STRIDE + d_col_eff
-            lds_hi = lds_lo + fx.Index(K_SUB_N * K_STRIDE)
-            vl_a = ds_read_tr_realf16(lds_lo)
-            vl_b = ds_read_tr_realf16(lds_lo + fx.Index(8 * K_STRIDE))
-            vl = Vec(vl_a).shuffle(Vec(vl_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-            vh_a = ds_read_tr_realf16(lds_hi)
-            vh_b = ds_read_tr_realf16(lds_hi + fx.Index(8 * K_STRIDE))
-            vh = Vec(vh_a).shuffle(Vec(vh_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-            return vl, vh
-
-        # ---- Loop-carried init ----
-        if const_expr(IS_DQ):
-            # dQ accumulators; +rowsum(P~) when fast_exp2 so the epilogue can
-            # renormalize dQ = sm/R * dQ~ (P~ is the unnormalized Schraudolph prob).
-            init_args = [c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
-        elif const_expr(IS_FUSED):
-            # [A_accs(D_CHUNKS), B_accs(D_CHUNKS), delta(, rowsum)] in one kv pass.
-            # fast_exp2 adds a rowsum(P~) accumulator so the epilogue can renormalize
-            # P = P~/rowsum(P~) (restores sum_j P=1 for the near-diagonal dS cancel).
-            init_args = [c_zero_v16f32 for _ in range_constexpr(2 * D_CHUNKS)] + [c_zero_f]
-        else:
-            # delta mode: delta_acc; +rowsum(P~) when fast_exp2 (renorm to true delta).
-            init_args = [c_zero_f]
-
-        def _kv_body(kv_start, inner_iter_args, apply_mask):
-            if const_expr(IS_DQ):
-                dq_accs = [inner_iter_args[i] for i in range_constexpr(D_CHUNKS)]
-            elif const_expr(IS_FUSED):
-                a_accs = [inner_iter_args[i] for i in range_constexpr(D_CHUNKS)]
-                b_accs = [inner_iter_args[D_CHUNKS + i] for i in range_constexpr(D_CHUNKS)]
-                delta_acc = inner_iter_args[2 * D_CHUNKS]
-            else:
-                # A single loop-carried value can arrive unwrapped (not a list).
-                delta_acc = (
-                    inner_iter_args[0] if isinstance(inner_iter_args, (list, tuple)) else inner_iter_args
-                )
-
-            # WAR guard: the single K/V LDS region is overwritten each iteration (no
-            # double buffer), so wait for the previous iteration's LDS reads. s_barrier
-            # alone only syncs wave *execution*, not outstanding lgkmcnt (ds_read) ops;
-            # drain them first so the next DMA can't overwrite LDS mid-read. (The legacy
-            # bank-conflict-serialized reads hid this WAR hazard; the finer V swizzle
-            # issues reads fast enough to expose it as run-to-run nondeterminism.)
-            rocdl.s_waitcnt(0)
-            gpu.barrier()
-            if const_expr(ENABLE_DMA):
-                coop_dma_tile(k_rsrc, lds_base_idx, kv_start)
-                coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(LDS_V_BASE * 2), kv_start, _v_bank_mask)
-                if const_expr(USE_K16):
-                    coop_dma_tile(k16_rsrc, lds_base_idx + fx.Index(LDS_K16_BASE * 2), kv_start)
-                rocdl.s_waitcnt(0)
-            else:
-                _coop_load(k_ptr, fx.Index(0), kv_start)
-                _coop_load(v_ptr, fx.Index(LDS_V_BASE), kv_start, _v_swizzle)
-            gpu.barrier()
-
-            # GEMM1: S[kv,q] = K @ Q^T
-            s_lo_acc, s_hi_acc = _gemm_kq(fx.Index(0), q_b_packs)
-            # dP[kv,q] = V @ dO^T (same template, V as "K", dO as "Q"). V is normal-read
-            # only, so it uses the finer 8-granular v_swz_mask (2-way vs K's stuck 8-way).
-            # identity_center: pre-load the accumulator with the per-q delta_val (uniform
-            # over this lane's 16 kv elements) so dp_acc = dO@V^T + delta_val comes out of
-            # the MFMA directly -> the per-element dS-centering add below is removed. Same
-            # deterministic re-association class as P3/H1 (fp add-order shift only).
-            if const_expr(IS_FUSED and identity_center):
-                _dp_init = Vec.from_elements([delta_val], fx.Float32).broadcast_to(16).ir_value()
-                dp_lo_acc, dp_hi_acc = _gemm_kq(fx.Index(LDS_V_BASE), do_b_packs, v_swz_mask, init=_dp_init)
-            else:
-                dp_lo_acc, dp_hi_acc = _gemm_kq(fx.Index(LDS_V_BASE), do_b_packs, v_swz_mask)
-
-            s_lo = [Vec(s_lo_acc)[r] for r in range_constexpr(16)]
-            s_hi = [Vec(s_hi_acc)[r] for r in range_constexpr(16)]
-
-            # Causal mask: only diagonal tiles (kv_start >= q_start = min q_row of
-            # the block) can have kv_col > q_row; below-diagonal tiles are provably
-            # unmasked, so the caller skips the compare+select there (apply_mask=False).
-            kv_start_i32 = fx.Int32(kv_start)
-            lane_off_i32 = fx.Int32(lane_div_32) * fx.Int32(4)
-
-            def _p_exp2(r):
-                # P[r] = exp2(sm*log2e*S[r] + lse) with the causal mask on diagonal
-                # tiles only. Returns (p_lo_r, p_hi_r) for the two 32-kv sub-blocks.
-                if const_expr(apply_mask):
-                    off = (r // 4) * 8 + (r % 4)
-                    kv_col = kv_start_i32 + lane_off_i32 + fx.Int32(off)
-                    s_lo_r = ArithValue(kv_col > q_row_i32).select(c_neg_inf, s_lo[r])
-                    s_hi_r = ArithValue(kv_col + fx.Int32(K_SUB_N) > q_row_i32).select(c_neg_inf, s_hi[r])
-                else:
-                    s_lo_r = s_lo[r]
-                    s_hi_r = s_hi[r]
-                return (_exp2_of(s_lo_r, lse_s23_val, apply_mask), _exp2_of(s_hi_r, lse_s23_val, apply_mask))
-
-            if const_expr(not IS_FUSED):
-                p_lo = []
-                p_hi = []
-                for r in range_constexpr(16):
-                    plo_r, phi_r = _p_exp2(r)
-                    p_lo.append(plo_r)
-                    p_hi.append(phi_r)
-                dp_lo = [Vec(dp_lo_acc)[r] for r in range_constexpr(16)]
-                dp_hi = [Vec(dp_hi_acc)[r] for r in range_constexpr(16)]
-                # rowsum(P~) for the fast_exp2 renorm (delta & dq share the recompute,
-                # so R is bit-identical between the two kernels -> exact cancellation).
-            # Build the loop-carried yield args conditionally, then yield ONCE at the
-            # tail (a single scf.yield per loop body, mirroring the forward).
-            if const_expr(IS_DELTA):
-                local = c_zero_f
-                for r in range_constexpr(16):
-                    local = _fadd(local, _fmul(p_lo[r], dp_lo[r]))
-                    local = _fadd(local, _fmul(p_hi[r], dp_hi[r]))
-                delta_acc = _fadd(delta_acc, local)
-                return [delta_acc]
-            elif const_expr(IS_FUSED and identity_center and not apply_mask):
-                # Vectorized bulk (below-diagonal) fused path. Same math as the scalar
-                # branch below, but each 8-slot group is carried as vector<8xf32> so the
-                # elementwise softmax/dS ops (exp2 fma, dP centering add, C=P*dP mul,
-                # rowsum/rho reductions) lower to packed v_pk_* instead of scalar
-                # v_add/v_mul/v_fma -> cuts VALU issues on this VALU-issue-bound kernel.
-                # The exp2 approx and C=P*dP are strictly elementwise, so plo/phi/clo/chi
-                # are bit-identical to the scalar path (A/B GEMM operands unchanged); only
-                # the scalar rho/R reductions are re-associated (still deterministic ->
-                # det gate holds; cos/l2 unaffected within margin). apply_mask handled by
-                # the scalar branch (diagonal tiles only; the maximumf floor clamp is a
-                # no-op off-diagonal). identity_center only (plain bf16 operands).
-                v8i32_ty = Vec.make_type(8, fx.Int32)
-                lse_v8 = Vec.from_elements([lse_s23_val], fx.Float32).broadcast_to(8).ir_value()
-                scale_v8 = Vec.filled(8, sm_scale * _LOG2E * float(1 << 23), fx.Float32).ir_value()
-
-                def _slice8(acc, base):
-                    v = Vec(acc)
-                    return v.shuffle(v, [base + j for j in range_constexpr(8)]).ir_value()
-
-                def _exp2_v8(s_v8):
-                    scaled = fmath.fma(_raw(s_v8), scale_v8, lse_v8, fastmath=fm_fast)
-                    i = arith.fptosi(v8i32_ty, _raw(scaled))
-                    return Vec(i).bitcast(fx.Float32).ir_value()
-
-                def _hred8(v8):
-                    v = Vec(v8)
-                    s4 = Vec(
-                        _fadd(v.shuffle(v, [0, 1, 2, 3]).ir_value(), v.shuffle(v, [4, 5, 6, 7]).ir_value())
-                    )
-                    s2 = Vec(_fadd(s4.shuffle(s4, [0, 1]).ir_value(), s4.shuffle(s4, [2, 3]).ir_value()))
-                    return _fadd(s2[0], s2[1])
-
-                # Accumulate the per-group C/P sums as vector<8xf32> across the PV_K
-                # steps and reduce ONCE at the tail, instead of an _hred8 per step:
-                # sum_pks hred8(g_pks) == hred8(sum_pks g_pks) (re-associated the same
-                # way P3's rho/R reduction already is -> deterministic, det gate holds;
-                # cos/l2 unaffected within margin). Trades PV_K_STEPS-1 extra v8 adds
-                # for PV_K_STEPS-1 fewer narrowing-shuffle reductions on this partly
-                # VALU-issue-bound kernel.
-                c_sum_v8 = None
-                for pks in range_constexpr(PV_K_STEPS):
-                    base = pks * 8
-                    plo_v = _exp2_v8(_slice8(s_lo_acc, base))
-                    phi_v = _exp2_v8(_slice8(s_hi_acc, base))
-                    # dp_lo/hi_acc already hold (dO@V^T + delta_val) via the GEMM acc init.
-                    clo_v = _fmul(plo_v, _slice8(dp_lo_acc, base))
-                    chi_v = _fmul(phi_v, _slice8(dp_hi_acc, base))
-                    c_g = _fadd(clo_v, chi_v)
-                    c_sum_v8 = c_g if c_sum_v8 is None else _fadd(c_sum_v8, c_g)
-                    plo_p = bf16_trunc_pack_v8([Vec(plo_v)[i] for i in range_constexpr(8)])
-                    phi_p = bf16_trunc_pack_v8([Vec(phi_v)[i] for i in range_constexpr(8)])
-                    clo_p = bf16_trunc_pack_v8([Vec(clo_v)[i] for i in range_constexpr(8)])
-                    chi_p = bf16_trunc_pack_v8([Vec(chi_v)[i] for i in range_constexpr(8)])
-                    for dc in range_constexpr(D_CHUNKS):
-                        k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
-                        a_accs[dc] = mfma_acc(k_lo, clo_p, a_accs[dc])
-                        a_accs[dc] = mfma_acc(k_hi, chi_p, a_accs[dc])
-                        b_accs[dc] = mfma_acc(k_lo, plo_p, b_accs[dc])
-                        b_accs[dc] = mfma_acc(k_hi, phi_p, b_accs[dc])
-                delta_acc = _fadd(delta_acc, _hred8(c_sum_v8))
-                _fused_yield = (
-                    [a_accs[i] for i in range_constexpr(D_CHUNKS)]
-                    + [b_accs[i] for i in range_constexpr(D_CHUNKS)]
-                    + [delta_acc]
-                )
-                return _fused_yield
-            elif const_expr(IS_FUSED):
-                # One pass accumulates delta=sum_j P*dP, A=sum_j (P*dP)*K, B=sum_j P*K
-                # (dQ = sm*(A - delta*B)). To keep VGPR pressure low (dual A/B
-                # accumulators already cost 2x dq's), process one 8-slot group at a
-                # time: exp2 -> C=P*dP -> fp16 pack -> GEMM2 immediately, so only the
-                # current group's packs stay live (not all 16 at once).
-                local = c_zero_f
-                # identity_center: C = P*(dP - delta_id) (dP + delta_val, delta_val =
-                # -delta_id) so A accumulates the centered dS and `local` becomes the
-                # residual rho = sum_j P*(dP-delta_id); operands are plain bf16.
-                # legacy: C = P*dP (uncentered), `local` is delta = sum_j P*dP; fp16.
-                _pack8 = bf16_trunc_pack_v8 if identity_center else _to_f16_v8
-                _mfma_ab = mfma_acc if identity_center else mfma_f16
-                for pks in range_constexpr(PV_K_STEPS):
-                    base = pks * 8
-                    plo_g = []
-                    phi_g = []
-                    clo_g = []
-                    chi_g = []
-                    for i in range_constexpr(8):
-                        r = base + i
-                        plo, phi = _p_exp2(r)
-                        # identity_center: delta_val is folded into the dP GEMM acc init
-                        # (see above), so dp_lo/hi_acc already hold dO@V^T + delta_val.
-                        dp_lo_r = Vec(dp_lo_acc)[r]
-                        dp_hi_r = Vec(dp_hi_acc)[r]
-                        clo = _fmul(plo, dp_lo_r)
-                        chi = _fmul(phi, dp_hi_r)
-                        local = _fadd(local, clo)
-                        local = _fadd(local, chi)
-                        plo_g.append(plo)
-                        phi_g.append(phi)
-                        clo_g.append(clo)
-                        chi_g.append(chi)
-                    plo_p = _pack8(plo_g)
-                    phi_p = _pack8(phi_g)
-                    clo_p = _pack8(clo_g)
-                    chi_p = _pack8(chi_g)
-                    # GEMM2: A[D,q] += K^T @ C ; B[D,q] += K^T @ P (K transpose-read
-                    # as "V"; C/P packs as "P"). identity_center reads the bf16 K tile
-                    # directly; the legacy fp16 path reads the dual-tile fp16 K copy.
-                    for dc in range_constexpr(D_CHUNKS):
-                        if const_expr(identity_center):
-                            k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
-                        elif const_expr(ENABLE_DMA):
-                            # Dual-tile: read the fp16 K copy directly (no conversion).
-                            k_lo, k_hi = _read_k16_tr(dc * PV_K_STEPS + pks)
-                        else:
-                            k_lo, k_hi = _read_k_tr(dc * PV_K_STEPS + pks)
-                            k_lo = _k_to_f16(k_lo)
-                            k_hi = _k_to_f16(k_hi)
-                        a_accs[dc] = _mfma_ab(k_lo, clo_p, a_accs[dc])
-                        a_accs[dc] = _mfma_ab(k_hi, chi_p, a_accs[dc])
-                        b_accs[dc] = _mfma_ab(k_lo, plo_p, b_accs[dc])
-                        b_accs[dc] = _mfma_ab(k_hi, phi_p, b_accs[dc])
-                delta_acc = _fadd(delta_acc, local)
-                _fused_yield = (
-                    [a_accs[i] for i in range_constexpr(D_CHUNKS)]
-                    + [b_accs[i] for i in range_constexpr(D_CHUNKS)]
-                    + [delta_acc]
-                )
-                return _fused_yield
-            else:
-                # dS = P~ .* (dP - delta_true). The delta buffer stores -delta_true
-                # (negated for dkdv's accumulator fold), so dP - delta_true = dP +
-                # delta_val. The subtraction is fp32 (near-diagonal cancellation done
-                # before the bf16 pack), so the dQ GEMM below is pure bf16 (CK-style:
-                # fp32 dS -> bf16 operand -> fp32 accumulate, no fp16 operand).
-                ds_lo = []
-                ds_hi = []
-                for r in range_constexpr(16):
-                    ds_lo.append(_fmul(p_lo[r], _fadd(dp_lo[r], delta_val)))
-                    ds_hi.append(_fmul(p_hi[r], _fadd(dp_hi[r], delta_val)))
-                ds_packs_lo = []
-                ds_packs_hi = []
-                for pks in range_constexpr(PV_K_STEPS):
-                    b = pks * 8
-                    ds_packs_lo.append(bf16_trunc_pack_v8(ds_lo[b : b + 8]))
-                    ds_packs_hi.append(bf16_trunc_pack_v8(ds_hi[b : b + 8]))
-
-                # GEMM2: dQ[D,q] += K^T @ dS  (K transpose-read as "V", dS as "P")
-                k_lo_cur, k_hi_cur = _read_k_tr(0)
-                for si in range_constexpr(TOTAL_PV):
-                    dc, pks = _steps[si]
-                    if const_expr(si + 1 < TOTAL_PV):
-                        k_lo_nxt, k_hi_nxt = _read_k_tr(si + 1)
-                    dq_accs[dc] = mfma_acc(k_lo_cur, ds_packs_lo[pks], dq_accs[dc])
-                    dq_accs[dc] = mfma_acc(k_hi_cur, ds_packs_hi[pks], dq_accs[dc])
-                    if const_expr(si + 1 < TOTAL_PV):
-                        k_lo_cur = k_lo_nxt
-                        k_hi_cur = k_hi_nxt
-                return [dq_accs[i] for i in range_constexpr(D_CHUNKS)]
-
-        # Split the causal kv-loop: [0, q_start) is fully below the diagonal (no
-        # mask), [q_start, kv_upper) straddles it (mask). This drops the per-tile
-        # compare+select from every below-diagonal tile (the large majority).
-        loop_results = init_args
-        for kv_start, inner_iter_args in range(0, q_start, BLOCK_N, init=init_args):
-            loop_results = yield _kv_body(kv_start, inner_iter_args, False)
-        # A single loop-carried value (delta mode) is yielded back unwrapped; the
-        # next loop's init= needs a list.
-        _tail_init = loop_results if isinstance(loop_results, (list, tuple)) else [loop_results]
-        for kv_start, inner_iter_args in range(q_start, kv_upper, BLOCK_N, init=_tail_init):
-            loop_results = yield _kv_body(kv_start, inner_iter_args, True)
-
-        # ---- Epilogue ----
-        if const_expr(IS_DELTA):
-            delta_final = loop_results[0] if isinstance(loop_results, (list, tuple)) else loop_results
-            delta_full = _fadd(delta_final, reduction_peer(delta_final))
-            # With fast_exp2 the recomputed P~ is the unnormalized Schraudolph prob
-            # (rowsum R != 1); renormalize to the true delta = (sum_j P~*dP)/R so the
-            # dq kernel's near-diagonal cancellation (which recomputes the same R) is
-            # exact. Store -delta so dkdv folds it straight into its dP accumulator.
-            if lane_div_32 == fx.Index(0):
-                buffer_ops.buffer_store(
-                    fx.Float32(_fsub(c_zero_f, delta_full)),
-                    delta_out_rsrc,
-                    _lse_elem * fx.Index(4),
-                    mask=ArithValue(q_row < seq_len_v),
-                    offset_is_bytes=True,
-                )
-        else:
-            if const_expr(IS_FUSED):
-                # delta = sum_j P*dP (peer-reduce over the kv split held by lane+-32);
-                # both lane halves then hold the full delta for their q=lane_mod_32.
-                a_finals = [loop_results[dc] for dc in range_constexpr(D_CHUNKS)]
-                b_finals = [loop_results[D_CHUNKS + dc] for dc in range_constexpr(D_CHUNKS)]
-                delta_final = loop_results[2 * D_CHUNKS]
-                delta_full = _fadd(delta_final, reduction_peer(delta_final))
-                # With fast_exp2, P~ is unnormalized (rowsum R = sum_j P~ != 1).
-                # Renormalize P = P~/R so sum_j P = 1 (exact near-diagonal cancel):
-                # true delta = (sum_j P~*dP)/R and dQ = sm/R*(A~ - (delta~/R)*B~).
-                # inv_r is per-q (== lane_mod_32), constant over the 16 D-registers.
-                dq_scale = fx.Float32(sm_scale)
-                if const_expr(not identity_center):
-                    if lane_div_32 == fx.Index(0):
-                        # Store -delta: dkdv folds it into its dP MFMA accumulator init
-                        # (dP - delta = dO@V^T + (-delta)), removing its per-element dS
-                        # subtract. dQ below still uses the positive delta_full.
-                        buffer_ops.buffer_store(
-                            fx.Float32(_fsub(c_zero_f, delta_full)),
-                            delta_out_rsrc,
-                            _lse_elem * fx.Index(4),
-                            mask=ArithValue(q_row < seq_len_v),
-                            offset_is_bytes=True,
-                        )
-                # identity_center: delta_full is now rho/R (peer-reduced sum_j
-                # P~*(dP-delta_id), renormalized), so A - delta_full*B == A - (rho/R)*B
-                # exactly recovers the consistent dq; DELTA already holds delta_id (for
-                # dkdv) and is not overwritten.
-                # dQ = dq_scale*(A - delta*B). The accumulators are [M=D, N=q] with
-                # N=q == lane_mod_32, so delta_full (per-q, per-lane) is constant across
-                # the 16 D-registers -> a single scalar multiply per register.
-                dq_finals = []
-                for dc in range_constexpr(D_CHUNKS):
-                    a_v = Vec(a_finals[dc])
-                    b_v = Vec(b_finals[dc])
-                    vals = [fx.Float32(_fsub(a_v[r], _fmul(delta_full, b_v[r]))) for r in range_constexpr(16)]
-                    dq_finals.append(Vec.from_elements(vals, fx.Float32).ir_value())
-                sm_vec = Vec.from_elements([dq_scale], fx.Float32).broadcast_to(16)
-            else:
-                # dq mode: dQ~ = sum_j dS~_j @ K accumulated in the loop. With
-                # fast_exp2 the dS used the unnormalized P~, so renormalize with
-                # inv_r = 1/rowsum(P~) (per-q, factors out of the GEMM -> a single
-                # epilogue scalar): dQ = sm * inv_r * dQ~.
-                dq_finals = [loop_results[dc] for dc in range_constexpr(D_CHUNKS)]
-                dq_scale = fx.Float32(sm_scale)
-                sm_vec = Vec.from_elements([dq_scale], fx.Float32).broadcast_to(16)
-            v_o = [Vec(dq_finals[dc]) * sm_vec for dc in range_constexpr(D_CHUNKS)]
-
-            pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-            is_hi_half = ArithValue(lane_div_32 != fx.Index(0))
-
-            def _o_pack_2dw(dc, store_group):
-                r_base = store_group * 4
-                lo = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base], Vec(v_o[dc])[r_base + 1])
-                hi = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base + 2], Vec(v_o[dc])[r_base + 3])
-                return lo, hi
-
-            def _swap_halves(dw):
-                swapped = rocdl.permlane32_swap(pair_i32_ty, _raw(dw), _raw(dw), False, False)
-                lo_res = llvm.extractvalue(T.i32, swapped, [0])
-                hi_res = llvm.extractvalue(T.i32, swapped, [1])
-                return is_hi_half.select(lo_res, hi_res)
-
-            for dc in range_constexpr(D_CHUNKS):
-                for g in range_constexpr(2):
-                    d0_a, d1_a = _o_pack_2dw(dc, 2 * g)
-                    d0_b, d1_b = _o_pack_2dw(dc, 2 * g + 1)
-                    y0_a, y1_a = _swap_halves(d0_a), _swap_halves(d1_a)
-                    y0_b, y1_b = _swap_halves(d0_b), _swap_halves(d1_b)
-                    w0 = is_hi_half.select(y0_b, _raw(d0_a))
-                    w1 = is_hi_half.select(y1_b, _raw(d1_a))
-                    w2 = is_hi_half.select(_raw(d0_b), y0_a)
-                    w3 = is_hi_half.select(_raw(d1_b), y1_a)
-                    o_pack = Vec.from_elements(
-                        [fx.Int32(w0), fx.Int32(w1), fx.Int32(w2), fx.Int32(w3)], fx.Int32
-                    )
-                    d_col = fx.Index(dc * D_CHUNK) + (fx.Index(2 * g) + lane_div_32) * fx.Index(8)
-                    o_global = global_idx_q(q_row, d_col)
-                    buffer_ops.buffer_store(o_pack, dq_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
-
-    @flyc.jit
-    def launch_flash_attn_bwd(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        DO: fx.Tensor,
-        LSE: fx.Tensor,
-        DELTA: fx.Tensor,
-        DQ: fx.Tensor,
-        K16: fx.Tensor,
-        batch_size: fx.Int32,
-        seq_len: fx.Int32,
-        stream: fx.Stream,
-    ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
-        bs_idx = fx.Index(batch_size)
-        sl_idx = fx.Index(seq_len)
-        num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
-        grid_x = bs_idx * num_q_tiles * NUM_HEADS_Q
-
-        passthrough_entries = (
-            [
-                ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
-                ["no-nans-fp-math", "true"],
-                ["unsafe-fp-math", "true"],
-            ]
-            if const_expr(daz)
-            else None
-        )
-        flash_attn_bwd_kernel(
-            Q,
-            K,
-            V,
-            DO,
-            LSE,
-            DELTA,
-            DQ,
-            K16,
-            seq_len,
-            value_attrs={
-                "rocdl.waves_per_eu": waves_per_eu,
-                "rocdl.flat_work_group_size": f"{int(flat_work_group_size)},{int(flat_work_group_size)}",
-                "passthrough": passthrough_entries,
-            },
-        ).launch(
-            grid=(grid_x, 1, 1),
-            block=(BLOCK_SIZE, 1, 1),
-            stream=stream,
-        )
-
-    _hints = {
-        "fast_fp_math": fast_fp_math,
-        "unsafe_fp_math": unsafe_fp_math,
-        # enable-post-misched=True: the split backward is VALU/exp2-issue-bound with
-        # the MFMA pipeline mostly idle, so the post-RA machine scheduler interleaves
-        # the gradient-GEMM MFMAs into the exp2/reduce VALU shadow. Reorder of
-        # independent ops only -> bit-identical output (corr/det unchanged).
-        "llvm_options": {"enable-post-misched": True, "lsr-drop-solution": True},
-    }
-
-    def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_hints):
-            return launch_flash_attn_bwd(*args, **kwargs)
-
-    def _compile(*args):
-        with CompilationContext.compile_hints(_hints):
-            return flyc.compile(launch_flash_attn_bwd, *args)
-
-    _launch.compile = _compile
-    return _launch
-
-
 def build_flash_attn_bwd_odo_module(
     num_heads,
     head_dim,
@@ -1061,18 +63,10 @@ def build_flash_attn_bwd_odo_module(
 ):
     """Identity-delta ("odo") kernel: DELTA[b,hq,s] = -sum_d O[b,s,hq,d]*dO[b,s,hq,d].
 
-    Memory-bound O.dO row-reduce that replaces the torch (out*dout).sum(-1): one
-    thread owns one (b,s,hq) row, reads its D-vector of O and dO (coalesced bf16
-    buffer loads), multiplies and sums in fp32, negates (the dkdv/dq fold convention
-    stores -delta_id) and scatter-stores the scalar to the transposed [B,Hq,S] delta.
-    delta_id is only a centering value (the fused dq kernel corrects rho/R*B exactly),
-    so the bf16*bf16 product with fp32 accumulate is enough precision.
-
-    waves_per_eu=4 (not 8): the row's O/dO loads are hoisted ahead of the reduction
-    (below) so all NVEC*2 dwordx4 loads are in flight before the first is consumed,
-    which needs ~80 VGPR. At the old wpe=8 (64-VGPR budget) that spilled (116 B
-    scratch) and the loads still drained one pair at a time (latency-exposed, ~35%
-    HBM BW); wpe=4 (128-VGPR budget) fits with 0 spill -> odo ~60us -> ~31us."""
+    One thread owns one (b,s,hq) row and stores the negated scalar (the dkdv/dq fold
+    convention) to the transposed [B,Hq,S] delta. waves_per_eu=4: the hoisted
+    whole-row O/dO loads do not fit the wpe=8 register budget.
+    """
     assert dtype_str == "bf16", "odo kernel targets bf16"
     gpu_arch = get_hip_arch()
     assert gpu_arch.startswith("gfx950"), "odo kernel targets gfx950"
@@ -1118,12 +112,9 @@ def build_flash_attn_bwd_odo_module(
         delta_rsrc = buffer_ops.create_buffer_resource(DELTA, max_size=True)
 
         base = row_c * fx.Index(HEAD_DIM)
-        # Hoist the whole row's O/dO loads ahead of the reduction so all NVEC*2
-        # dwordx4 loads are issued (and in flight) before the first is consumed.
-        # The original per-iter load->use pattern drained one pair at a time
-        # (one s_waitcnt per load), exposing the load latency (~35% of HBM BW on
-        # this memory-bound row-reduce). Same product/accumulate order -> the
-        # fp32 sum is bit-identical (det-safe) and it stays an exact O*dO.
+        # Hoist the whole row's O/dO loads ahead of the reduction so all NVEC*2 dwordx4
+        # loads are in flight before the first is consumed. Accumulate order is unchanged,
+        # so the fp32 sum stays bit-identical (det-safe).
         ovs = []
         dvs = []
         for c in range_constexpr(NVEC):
@@ -1203,40 +194,18 @@ def build_flash_attn_bwd_dkdv_module(
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
 
-    One work-group owns BLOCK_KV key/value rows of one kv-head and loops over the
-    GQA group's q-heads and (causal) q-blocks, accumulating dK/dV in registers ->
-    single write, no float atomics -> deterministic. Roles vs the forward are
-    swapped q<->kv:
-
-    Deterministic causal split-K over the q-loop (``q_split``): block_id carries a
-    split_idx (kv_head stays the fastest-varying axis so the forward XCD/L2
-    mapping is preserved). Each split owns a cyclic subset of the causal q-blocks
-    (q_start = kv_start + split_idx*BLOCK_Q, step = q_split*BLOCK_Q) and writes its
-    own slot of a [B, q_split, S, Hkv, D] workspace exactly once (no float
-    atomics); the host reduces slot-wise with a fixed-order fp32 sum. This lifts
-    the grid from B*Hkv*(S/BLOCK_KV) to that times q_split, which raises the grid
-    -wave count and hides latency at the cost of redundant work; callers tune
-    q_split per shape. q_split=1 degenerates to the single-owner path.
-      * K,V owned as MFMA B-operands (register-resident, like the forward's Q).
-      * Q,dO streamed to LDS (like the forward's K,V), read normally for the
-        S/dP GEMMs and transpose-read (ds_read_tr) for the dV/dK GEMMs.
-      * GEMM1a S[q,kv]=Q@K^T, GEMM1b dP[q,kv]=dO@V^T.
-      * GEMM2a dV^T[D,kv] += dO_tr @ P, GEMM2b dK^T[D,kv] += Q_tr @ dS, where the
-        P/dS accumulators feed directly as B-operands (K@Q^T PV-alignment), so no
-        explicit accumulator transpose is needed. For head_dim=64 the K-swizzle
-        equals the V-swizzle, so one &3-swizzled LDS tile serves both the normal
-        and the transpose read. Output [D,kv] is stored transposed to [kv,D].
+    One work-group owns BLOCK_KV rows of one kv-head and loops the GQA group's
+    q-heads and causal q-blocks, accumulating dK/dV in registers. q_split splits
+    the q-loop deterministically: cyclic subsets, reduced afterwards.
     """
     gpu_arch = get_hip_arch()
     assert gpu_arch.startswith("gfx950"), "bwd dkdv kernel targets gfx950"
     assert dtype_str == "bf16", "bwd dkdv kernel targets bf16"
     assert causal, "bwd dkdv kernel is causal-only for the GPT-OSS campaign"
 
-    # Prescale the owned K by sm*log2e and fold -log2e*lse into GEMM1a's MFMA C-init,
-    # so GEMM1a's accumulator already IS the base-2 softmax exponent and the per-slot
-    # diff FMA disappears. NOT combinable with Schraudolph, whose lse*2^23+bias addend
-    # (~1e9) loses the low mantissa bits it needs once it passes through the f32 MFMA
-    # accumulator, so it defaults to the hw-exp path only (same rule as dq).
+    # Prescale the owned K by sm*log2e and fold -log2e*lse into GEMM1a's MFMA C-init, so its
+    # accumulator already IS the base-2 softmax exponent. Not combinable with Schraudolph:
+    # its lse*2^23+bias addend loses the low mantissa bits through the f32 MFMA accumulator.
     if fold_lse is None:
         fold_lse = True
 
@@ -1260,12 +229,10 @@ def build_flash_attn_bwd_dkdv_module(
     BLOCK_SIZE = flat_work_group_size
     ROWS_PER_WAVE_KV = BLOCK_KV // NUM_WAVES
 
-    # ---- 16x16x32 bf16 MFMA tiling (M=N=16, K=32). Splits each old 32x32
-    # accumulator into 4 independent 16x16 chains -> 4x the MFMA-latency ILP at
-    # the SAME accumulator VGPR total (dep-wait is the dkdv bottleneck; MFMA is
-    # latency-bound, not throughput-bound). Lane layout: lane%16 = M/N index,
-    # lane//16 = K-subgroup (4 groups x 8 = K32) and, on the C output, the
-    # M-block ((lane//16)*4 + t, t in 0..3 -> 4 f32/lane).
+    # ---- 16x16x32 bf16 MFMA tiling (M=N=16, K=32): four independent 16x16 accumulator
+    # chains at the same accumulator VGPR total (dkdv is MFMA dep-wait bound). Lane layout:
+    # lane%16 = M/N index, lane//16 = K-subgroup (4 x 8 = K32) and, on the C output, the
+    # M-block ((lane//16)*4 + t, t in 0..3 -> 4 f32/lane). ----
     M_TILE = 16
     N_TILE = 16
     D_TILE = 16
@@ -1277,11 +244,9 @@ def build_flash_attn_bwd_dkdv_module(
     PV_K_STEP = 32  # K=32 per GEMM2 MFMA (contract over q)
     PV_K_STEPS = BLOCK_Q // PV_K_STEP  # 64/32 = 2
 
-    # GEMM1a's dense MFMA block is followed by the softmax's quarter-rate v_exp, so
-    # within a wave the matrix and TRANS pipes run back to back. sched_barrier(TRANS)
-    # pins MFMA/ds_read/VALU in place and frees only the exps to migrate, so they are
-    # the only thing left to fill GEMM1b's MFMA latency shadow (schedule-only, opcode
-    # multiset/output unchanged). See pitfalls/13 for the swept-mask/barrier-site data.
+    # sched_barrier(TRANS) pins MFMA/ds_read/VALU in place and frees only the softmax's
+    # quarter-rate v_exp to migrate, so the exps are what fills GEMM1b's MFMA latency shadow
+    # (schedule-only: opcode multiset and output unchanged).
     SCHED_TRANS = 0x400  # LLVM SchedGroupMask: TRANS (v_exp)
 
     assert BLOCK_KV % NUM_WAVES == 0
@@ -1349,12 +314,6 @@ def build_flash_attn_bwd_dkdv_module(
         def _mfma(mfma_fn, a, b, c):
             return mfma_fn(v4f32_type, [a, b, c])
 
-        def _fadd(a, b):
-            return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fsub(a, b):
-            return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
-
         def _fmul(a, b):
             return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
 
@@ -1381,11 +340,11 @@ def build_flash_attn_bwd_dkdv_module(
             ptr = buffer_ops.create_llvm_ptr(fx.Int64(byte_offset), address_space=3)
             return rocdl.ds_read_tr16_b64(v4f16_type, ptr).result
 
-        # ---- block_id decode. XCD-major (xcd = block_id % NUM_XCD) gives each XCD's
-        # private L2 slice one whole (batch, kv-head) chunk instead of two GQA groups'
-        # Q/dO; split_idx fastest inside the chunk keeps the co-resident work-groups
-        # q-aligned, where the reuse lives (see pitfalls/13 for the swept measurements).
-        # Bijective whenever B*NUM_HEADS_KV % NUM_XCD == 0; else keep kv-head-fastest. ----
+        # block_id decode. The dispatcher round-robins work-groups over the XCDs and each XCD
+        # owns a private L2 slice, so XCD-major decode gives each XCD a whole (batch, kv-head)
+        # chunk: its L2 streams one kv-head's K/V and the GQA work-groups reading byte-identical
+        # rows stay co-resident. Bijective when B*NUM_HEADS_KV % NUM_XCD == 0, which
+        # NUM_HEADS_KV % NUM_XCD == 0 guarantees; other head counts keep the plain decode.
         num_kv_tiles = (seq_len_k_v + BLOCK_KV - 1) // BLOCK_KV
         if const_expr(NUM_HEADS_KV % NUM_XCD == 0):
             _xcd = block_id % fx.Index(NUM_XCD)
@@ -1415,6 +374,9 @@ def build_flash_attn_bwd_dkdv_module(
         # In the 16x16 layout the owned kv row for a lane is nt*16 + lane16.
         kv_row_wave = kv_start + wave_id * ROWS_PER_WAVE_KV
 
+        def global_idx_kv(token_idx, col):
+            return token_idx * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
+
         def kv_row_of(nt):
             return kv_row_wave + fx.Index(nt * N_TILE) + lane16
 
@@ -1433,9 +395,6 @@ def build_flash_attn_bwd_dkdv_module(
         def global_idx_q(token_idx, col, q_head):
             return token_idx * STRIDE_TOKEN_Q + q_head * HEAD_DIM + col
 
-        def global_idx_kv(token_idx, col):
-            return token_idx * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
-
         def _q_row_clamp(row_idx):
             last = seq_len_q_v - fx.Index(1)
             return fx.Index(ArithValue(row_idx < seq_len_q_v).select(row_idx, last))
@@ -1445,8 +404,6 @@ def build_flash_attn_bwd_dkdv_module(
             return _pointer_load(Vec.make_type(vec_elems, elem_dtype), gep)
 
         def bf16_trunc_pack_v8(f32_vals):
-            # Hardware f32->bf16 pack (RNE, 1 VALU op/pair) instead of the manual
-            # &/>>/| truncation (3 VALU ops/pair); cuts the VALU-issue-bound path.
             pairs = [
                 rocdl.cvt_pk_bf16_f32(_raw(f32_vals[j * 2]), _raw(f32_vals[j * 2 + 1]))
                 for j in range_constexpr(4)
@@ -1552,11 +509,9 @@ def build_flash_attn_bwd_dkdv_module(
             def _dma_bases(tile_start):
                 """Head-independent part of the Q/dO DMA byte offset, one per batch.
 
-                Only the q_head term differs between the GQA heads sharing a q-block, so
-                the row/swizzle/column derivation is hoisted out of the head loop and each
-                head's DMA collapses to a single add. Q and dO address identically and
-                therefore share these bases. Measured on the dkdv kernel: vgpr_spill 4->0,
-                private_segment 20B->0 (scratch gone), ~+0.4% on the kernel.
+                Only the q_head term differs between GQA heads sharing a q-block, so hoisting
+                the row/swizzle/column derivation collapses each head's DMA to a single add
+                and takes the kernel's scratch spill to zero.
                 """
                 bases = []
                 for d in range_constexpr(NUM_DMA_Q):
@@ -1578,7 +533,11 @@ def build_flash_attn_bwd_dkdv_module(
             do_lds_ptrs = _dma_lds_ptrs(lds_base_idx + fx.Index(LDS_DO_BASE * 2))
 
             def coop_dma_tile(src_rsrc, lds_ptrs, bases, q_head):
-                """DMA a BLOCK_Q x head_dim Q/dO tile into the swizzled LDS layout."""
+                """DMA a BLOCK_Q x head_dim Q/dO tile into the swizzled LDS layout.
+
+                Address math is recomputed per tile on purpose: keeping the offsets live
+                across the k_tr peak pushes VGPRs past the occ-2 boundary.
+                """
                 _qoff = q_head * fx.Index(HEAD_DIM * 2)
                 for d in range_constexpr(NUM_DMA_Q):
                     rocdl.raw_ptr_buffer_load_lds(
@@ -1649,32 +608,17 @@ def build_flash_attn_bwd_dkdv_module(
                 )
             )
 
-        # Crude Schraudolph 2^x (fast_exp2): P = bitcast(fptosi((s*sm*log2e + lse)*
-        # 2^23 + bias)). The (lse*2^23 + bias) addend is pre-scaled on the host (see
-        # attention_flydsl_impl), so _p_of collapses to a SINGLE fma
-        # scaled = s*(sm*log2e*2^23) + lse_s23 -> fptosi: the diff fma and the
-        # Schraudolph *2^23+bias fma fold into one. lse_t is a plain loaded addend
-        # (not an in-kernel prescale), keeping it a clean fma(var,const,loaded)->fptosi.
-        _c_scaled_scale = fx.Float32(sm_scale * _LOG2E * float(1 << 23))
-        _c_scaled_floor = fx.Float32(-87.0 * float(1 << 23) + float(127 * (1 << 23) - 486411))
-        _compute_type = fx.Float32.ir_type
-
         def _p_of(s_r, lse_t, apply_mask):
             if const_expr(fold_lse):
                 assert apply_mask, "FOLD bulk uses the hazard-anchored path in _head_step"
-                # FOLD: masked (diagonal) tiles keep a ZERO C-init, so lse is added here
-                # via this fma; that fma (and the mask's v_cndmask) is itself a
-                # compiler-visible plain-VALU read of the accumulator, buying the hazard
-                # wait states with no separate anchor. Do NOT fold lse into the masked
-                # C-init and drop this fma: measured incorrect here (det=False; pitfalls/13).
+                # FOLD: masked (diagonal) tiles keep a ZERO C-init, so lse is added by this fma,
+                # which doubles as the compiler-visible plain-VALU accumulator read that buys the
+                # MFMA hazard wait states. Do NOT fold lse into the masked C-init and drop it.
                 s_r = fmath.fma(s_r, fx.Float32(1.0), lse_t, fastmath=fm_fast)
                 return _vexp(s_r)
             # Exact path (fast_exp2=False) expects lse_t = plain -log2e*lse, so
             # diff = log2e*(s*sm - lse) is the true base-2 softmax exponent.
             diff = fmath.fma(s_r, c_sm_scale_log2e, lse_t, fastmath=fm_fast)
-            # Bare NON-side-effecting v_exp_f32 (2^x): softmax diff<=0 so 2^diff in
-            # (0,1], no ldexp range-reduction; compiler overlaps it into the GEMM MFMA
-            # bubbles (dq's +25% lever, replaces ArithValue.exp2's v_exp+v_ldexp).
             return fx.Float32(
                 llvm.inline_asm(
                     ir.F32Type.get(), [_raw(diff)], "v_exp_f32 $0, $1", "=v,v", has_side_effects=False
@@ -1693,10 +637,9 @@ def build_flash_attn_bwd_dkdv_module(
         def _keepalive_v4(v4list):
             """Pin the -lse C-init registers live past GEMM1a.
 
-            Without a later use they die after GEMM1a's first MFMA reads them and, at the
-            256-VGPR ceiling, the RA reuses them for a later nt's MFMA output D while an
-            earlier nt's MFMA still reads them as C -- a WAR the hardware cannot guard.
-            Empty side-effecting asm: no instruction emitted, liveness constraint only.
+            Without a later use the RA may reuse them as a later nt's MFMA output D while
+            an earlier nt still reads them as C -- a WAR the hardware cannot guard. Empty
+            side-effecting asm: no instruction emitted, liveness constraint only.
             """
             for v4 in v4list:
                 llvm.inline_asm(
@@ -1730,7 +673,7 @@ def build_flash_attn_bwd_dkdv_module(
         def _read_tr(a_base, dt, pks):
             """Transpose-read Q/dO -> GEMM2 A-operand [m=D=dt*16+lane16][k=q=kg*8+s].
             Two ds_read_tr16 (4 q each): read0->s0..3 (q=pks*32+kg*4+j), read1->s4..7
-            (q=pks*32+16+kg*4+j). See .claude/memory/ds_read_tr16_b64_gfx950.md."""
+            (q=pks*32+16+kg*4+j)."""
             col = fx.Index(dt * D_TILE) + (lane % fx.Index(4)) * fx.Index(4)
             row0 = fx.Index(pks * PV_K_STEP) + kg * fx.Index(4) + (lane16 // fx.Index(4))
             row1 = row0 + fx.Index(N_TILE)
@@ -1750,12 +693,9 @@ def build_flash_attn_bwd_dkdv_module(
         _kv_end_c = ArithValue(_kv_end < seq_len_k_v).select(_kv_end, seq_len_k_v)
         _step = Q_SPLIT * BLOCK_Q
         _masked_upper = ArithValue(_kv_end_c >= causal_offset).select(_kv_end_c - causal_offset, fx.Index(0))
-        # Masked q-blocks this split visits = ceil((_masked_upper - _q_loop_start)/_step);
-        # unmask resumes at the next stride point. The masked band is BLOCK_KV wide, so it
-        # spans BLOCK_KV/BLOCK_Q q-blocks. A plain "+_step" assumes exactly ONE masked
-        # block per split, which holds for _step >= BLOCK_KV (q_split>=2) but under-counts
-        # for q_split=1 (_step=BLOCK_Q < band) -> the 2nd diagonal block was reprocessed
-        # unmasked (double-count + wrong mask) => dk/dv corruption. This ceil form is exact
+        # Masked q-blocks this split visits = ceil((_masked_upper - _q_loop_start)/_step): the
+        # masked band is BLOCK_KV wide, so for q_split=1 (_step=BLOCK_Q < band) it spans more
+        # than one q-block and a plain "+_step" would reprocess a diagonal block unmasked.
         # for every q_split and reduces to the old value when the band is one block wide.
         _masked_span = ArithValue(_masked_upper > _q_loop_start).select(
             _masked_upper - _q_loop_start, fx.Index(0)
@@ -1764,12 +704,9 @@ def build_flash_attn_bwd_dkdv_module(
             _step
         )
 
-        # GQA head axis is unrolled INSIDE each q_start body (rather than wrapping the
-        # whole q_start loop, as before) so that head h+1's GEMM1/exp2 is emitted right
-        # after head h's GEMM2 in the SAME straight-line block, with no real loop
-        # back-edge between them: the compiler can then schedule head h+1's exp2 VALU
-        # chain into head h's GEMM2 MFMA shadow (the GQA-head-axis operand-bubble
-        # softpipe). dv/dk legitimately accumulate across all GQA heads into the same
+        # The GQA head axis is unrolled INSIDE each q_start body so head h+1's GEMM1/exp2 is
+        # emitted in the same straight-line block as head h's GEMM2 and can be scheduled into
+        # its MFMA shadow; accumulating dv/dk across heads is a pure reassociation (det-neutral).
         # registers (K/V is shared by the group), so this is a pure reassociation of
         # the same sum -> det-neutral, and does not change live accumulator count.
         def _qbase(q_start, head_local, mt):
@@ -1778,11 +715,6 @@ def build_flash_attn_bwd_dkdv_module(
                 ArithValue(fx.Int32(q_start) + fx.Int32(kg) * fx.Int32(4) + fx.Int32(mt * M_TILE))
             )
 
-        # Load (-delta, lse) vec4/mt for one (q_start, GQA-head) from HBM into VGPR.
-        # Prefetched ONE GQA-head ahead (issued near the end of the prior head's GEMM2
-        # dt-loop below), so the HBM latency hides in the tail MFMA shadow while the
-        # +32 VGPR carry only overlaps the last GEMM2 iterations (minimising spill).
-        # Barrier-independent + head axis is a pure reassociation -> det-neutral.
         def _load_ld(q_start, head_local):
             _d = [
                 buffer_ops.buffer_load(
@@ -1834,18 +766,13 @@ def build_flash_attn_bwd_dkdv_module(
                 # Hand GEMM1b's MFMA latency to the exps alone (see SCHED_TRANS).
                 rocdl.sched_barrier(SCHED_TRANS)
 
-            # P[mt][nt] (each 4 f32 at q=mt*16+kg*4+t, kv=nt*16+lane16). Every VALU op
-            # removed here is worth ~0.30x its share of the body: this kernel is
-            # VALU-ISSUE-bound, not MFMA-bound (~25% MFMA-pipe, ~20% issue occupancy,
-            # the rest dependency latency), so the bulk path below spends exactly one
-            # non-trans instruction per head-step and none per slot.
+            # P[mt][nt]: each 4 f32 at q=mt*16+kg*4+t, kv=nt*16+lane16.
             P = [[None] * NT for _ in range_constexpr(MT)]
             if const_expr(fold_lse and not apply_mask):
-                # FOLD bulk: accumulator already IS the base-2 softmax exponent, so only
-                # the bare v_exp remains. One compiler-visible plain-VALU read of the
-                # GEMM1a accumulator per v4 is MANDATORY (not numerical protection) to
-                # force the MFMA->VALU wait; dropping it, or sharing one anchor across
-                # multiple v4s, corrupts P (measured det=False) -- see pitfalls/13.
+                # FOLD bulk: the accumulator already IS the base-2 softmax exponent, so only the
+                # bare v_exp remains. The per-v4 plain-VALU read of the GEMM1a accumulator is
+                # MANDATORY to force the MFMA->VALU wait -- dropping it, or sharing one anchor
+                # across multiple v4s, corrupts P.
                 for mt in range_constexpr(MT):
                     for nt in range_constexpr(NT):
                         s_v = Vec(s_tiles[mt][nt])
@@ -1888,10 +815,6 @@ def build_flash_attn_bwd_dkdv_module(
             for mt in range_constexpr(MT):
                 for nt in range_constexpr(NT):
                     dp_v = dp_tiles[mt][nt]
-                    # Scalar, not a packed v4 mul: packing these 256 v_mul_f32 into 128
-                    # v_pk_mul_f32 removes 94 issue slots, 5 VGPR and the 12 B of scratch
-                    # and is 1.4% SLOWER -- it pulls the mul up against the dP MFMAs and
-                    # the hazard s_nop cycles go 179 -> 270 (measured r16).
                     dS[mt][nt] = [_fmul(P[mt][nt][t], Vec(dp_v)[t]) for t in range_constexpr(4)]
 
             # B-operand packs for GEMM2: pack pks combines mt=2*pks (k=0..3) and
@@ -1904,16 +827,10 @@ def build_flash_attn_bwd_dkdv_module(
                     p_pack[pks][nt] = bf16_trunc_pack_v8(P[ma][nt] + P[mb][nt])
                     ds_pack[pks][nt] = bf16_trunc_pack_v8(dS[ma][nt] + dS[mb][nt])
 
-            # GEMM2a dV^T[dt][nt] += dO_tr[dt] @ P ; GEMM2b dK^T[dt][nt] += Q_tr @ dS.
-            # Depth-1 prefetch across dt: issue dt+1's dO transpose-reads before
-            # dt's dV MFMAs and dt+1's Q reads between the dV and dK MFMAs, so the
-            # ds_read_tr16 LDS latency hides in the MFMA shadow. pks is the outer
-            # MFMA loop (nt inner) so the two nt accumulators of each 16x16 chain
-            # interleave -> more independent MFMA ILP. Pure reorder -> det-neutral.
-            # (dt=0's do_tr/q_tr are read above, hoisted into the dS/pack shadow.)
-            # Prefetch head h+1's lse/-delta issued at the LAST GEMM2 dt iteration so
-            # the +32 VGPR carry only overlaps the final dt's MFMAs (spill-minimising)
-            # while its HBM latency still hides in those MFMAs + head h+1's DMA.
+            # GEMM2a dV^T += dO_tr @ P ; GEMM2b dK^T += Q_tr @ dS. Depth-1 dt prefetch of the
+            # transpose-reads plus pks-outer/nt-inner ordering hides the ds_read_tr16 latency in
+            # the MFMA shadow. Head h+1's lse/-delta prefetch is issued at the LAST dt so its
+            # +32 VGPR carry overlaps only the final dt's MFMAs.
             _nld = None
             rocdl.s_setprio(1)
             for dt in range_constexpr(DT):
@@ -1961,10 +878,6 @@ def build_flash_attn_bwd_dkdv_module(
             out += [dk_cur[dt][nt] for dt in range_constexpr(DT) for nt in range_constexpr(NT)]
             return out
 
-        # Prologue for the software-pipelined head loop: it expects its own tile
-        # already in flight and leaves the next one there. Both q-loops start at
-        # _q_loop_start (the masked one runs zero iterations exactly when
-        # _unmask_start == _q_loop_start), so one prologue covers both.
         _carry = dv_accs + dk_accs
         loop_results = _carry
         if const_expr(window_left >= 0):
@@ -2061,10 +974,8 @@ def build_flash_attn_bwd_dkdv_module(
     _hints = {
         "fast_fp_math": fast_fp_math,
         "unsafe_fp_math": unsafe_fp_math,
-        # enable-post-misched=True: the split backward is VALU/exp2-issue-bound with
-        # the MFMA pipeline mostly idle, so the post-RA machine scheduler interleaves
-        # the gradient-GEMM MFMAs into the exp2/reduce VALU shadow. Reorder of
-        # independent ops only -> bit-identical output (corr/det unchanged).
+        # Backward is VALU/exp2-issue-bound with the MFMA pipe mostly idle; post-RA
+        # misched hides the gradient-GEMM MFMAs in the exp2/reduce VALU shadow.
         "llvm_options": {"enable-post-misched": True, "lsr-drop-solution": True},
     }
 
@@ -2098,23 +1009,9 @@ def build_flash_attn_bwd_dq_module(
 ):
     """Build the dQ Q-outer backward launcher (16x16x32 mirror of dkdv).
 
-    One work-group owns BLOCK_M q rows of one q-head and loops the causal kv
-    blocks, accumulating dQ in registers -> single write, deterministic. Fused
-    identity-center path: DELTA holds -delta_id = -rowsum_d(O.dO); the kernel
-    centers dP by it in-loop (plain bf16 operands) and corrects the residual rho/R
-    in the epilogue -> exact consistent dQ in one pass (the K16 arg is unused).
-
-    Roles vs dkdv are swapped q<->kv:
-      * Q,dO owned as MFMA B-operands (register-resident, per wave's q rows).
-      * K,V streamed to LDS, read normally for the S/dP GEMMs and K transpose-read
-        (ds_read_tr) for the A/B GEMMs.
-      * GEMM1a S[kv,q]=K@Q^T, GEMM1b dP[kv,q]=V@dO^T (acc init folds -delta_id).
-        With ``fold_lse`` GEMM1a's acc init also folds -log2e*lse (the C-layout is
-        C[m=kv][n=q], so a lane's 4 slots share one q -> plain broadcast).
-      * GEMM2a A[D,q] += K_tr @ C (C=P*(dP-delta_id)), GEMM2b B[D,q] += K_tr @ P.
-      * rho=sum_kv C, R=sum_kv P~ reduced across the K-subgroups (lane^16/^32) in
-        the epilogue: dQ = sm/R * (A - (rho/R)*B), stored [q,D] (direct 16x16
-        C-layout: 4 contiguous D/lane -> no permlane32 transpose).
+    One work-group owns BLOCK_M q rows and loops the causal kv blocks. Q/dO are
+    register-resident B-operands, K/V stream through LDS, and C = P*(dP-delta_id)
+    is centered by odo's identity delta so GEMM2 runs on plain bf16.
     """
     gpu_arch = get_hip_arch()
     assert gpu_arch.startswith("gfx950"), "bwd dq kernel targets gfx950"
@@ -2122,10 +1019,8 @@ def build_flash_attn_bwd_dq_module(
     assert causal, "bwd dq kernel is causal-only for the GPT-OSS campaign"
 
     # Prescale the owned Q by sm*log2e and fold -log2e*lse into GEMM1a's MFMA C-init,
-    # so GEMM1a's accumulator already IS the base-2 softmax exponent and the per-slot
-    # diff FMA disappears. NOT combinable with Schraudolph, whose lse*2^23+bias addend
-    # (~1e9) loses the low mantissa bits it needs once it passes through the f32 MFMA
-    # accumulator, so it defaults to the hw-exp path only (same rule as dkdv).
+    # so the accumulator already IS the base-2 softmax exponent and the per-slot diff
+    # FMA disappears.
     if fold_lse is None:
         fold_lse = True
 
@@ -2151,16 +1046,14 @@ def build_flash_attn_bwd_dq_module(
     K_STEP_QK = 32  # K=32 per GEMM1 MFMA (contract over D)
     K_STEPS_QK = head_dim // K_STEP_QK  # d64 -> 2
     QT = ROWS_PER_WAVE_Q // N_TILE  # owned q 16-tiles per wave: 2
-    KVT = BLOCK_KV // M_TILE  # looped kv 16-tiles in the LDS block: 4
-    DT = head_dim // D_TILE  # D 16-tiles: 4
-    PV_K_STEP = 32  # K=32 per GEMM2 MFMA (contract over kv)
-    PV_K_STEPS = BLOCK_KV // PV_K_STEP  # 64/32 = 2
+    KVT = BLOCK_KV // M_TILE
+    DT = head_dim // D_TILE
+    PV_K_STEP = 32  # GEMM2 MFMA contracts over kv (vs K_STEP_QK over D)
+    PV_K_STEPS = BLOCK_KV // PV_K_STEP
 
-    # GEMM1a/GEMM1b's dense MFMA blocks are followed by the quarter-rate v_exp, so
-    # within a wave the matrix and TRANS pipes run back to back. sched_barrier(TRANS)
-    # pins MFMA/ds_read/VALU in place and frees only the exps to migrate, so they are
-    # the only thing left to fill the MFMA latency shadow (schedule-only, opcode
-    # multiset/output unchanged). See pitfalls/13 for the swept-mask/barrier-site data.
+    # sched_barrier(TRANS) pins MFMA/ds_read/VALU in place and frees only the
+    # quarter-rate v_exp to migrate, so the exps are what fills the MFMA latency
+    # shadow (schedule-only, opcode multiset unchanged).
     SCHED_TRANS = 0x400  # LLVM SchedGroupMask: TRANS (v_exp)
 
     assert BLOCK_M % NUM_WAVES == 0
@@ -2215,12 +1108,6 @@ def build_flash_attn_bwd_dq_module(
         def _mfma(mfma_fn, a, b, c):
             return mfma_fn(v4f32_type, [a, b, c])
 
-        def _fadd(a, b):
-            return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fsub(a, b):
-            return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
-
         def _fmul(a, b):
             return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
 
@@ -2228,24 +1115,11 @@ def build_flash_attn_bwd_dq_module(
             return _mfma(rocdl.mfma_f32_16x16x32_bf16, a, b, c)
 
         def _vexp(x):
-            # Hardware 2^x as the RAW v_exp_f32 intrinsic. Three properties matter here,
-            # and only this form has all three:
-            #  * it is ONE instruction -- math.exp2/ArithValue.exp2 lowers to v_exp +
-            #    v_ldexp + cmp/cndmask denormal range reduction even with fastmath=fast
-            #    (measured: bulk body 596 -> 953 issue slots), which the FOLD path does
-            #    not need because the softmax argument is <= 0 so 2^x is in (0,1];
-            #  * the compiler CAN see it, so it owns the MFMA->VALU wait states for the
-            #    GEMM1a accumulator this reads. A bare inline-asm v_exp does not get
-            #    them, which is why the fold path used to need a hand-rolled plain-VALU
-            #    "anchor" read per accumulator to buy the wait -- an anchor that is only
-            #    sound at per-v4 granularity (see the dkdv comment) and cost 3 v_min +
-            #    6 s_nop cycles per bulk body here;
-            #  * it is side-effect free, so it still sinks into the GEMM2 MFMA bubbles.
-            # dq's exps sit behind GEMM1b's 12 MFMAs, so the compiler's per-read waits
-            # are already satisfied and cost nothing: bulk body 596 -> 591 issue slots,
-            # s_nop 11 -> 5, -0.79% on the kernel, bit-identical. dkdv keeps the anchor
-            # form: there the exps follow GEMM1a directly (exp-before-dP), so the same
-            # change pads with s_nop instead (nop_cycles 205 -> 439, +1.06%).
+            # Hardware 2^x as the raw v_exp_f32 intrinsic: one instruction (math.exp2 adds ldexp
+            # range reduction the softmax argument <= 0 never needs), compiler-visible so it owns
+            # the MFMA->VALU wait states for the accumulator it reads, and side-effect free so it
+            # still sinks into the GEMM2 bubbles. dkdv keeps the anchor form -- there the exps
+            # follow GEMM1a directly and this pads with s_nop instead.
             return fx.Float32(
                 llvm.call_intrinsic(ir.F32Type.get(), "llvm.amdgcn.exp2.f32", [_raw(x)], [], [])
             )
@@ -2270,16 +1144,11 @@ def build_flash_attn_bwd_dq_module(
             ptr = buffer_ops.create_llvm_ptr(fx.Int64(byte_offset), address_space=3)
             return rocdl.ds_read_tr16_b64(v4f16_type, ptr).result
 
-        # ---- block_id decode. The dispatcher round-robins work-groups over the XCDs
-        # (xcd = block_id % NUM_XCD) and every XCD owns a private L2 slice, so the
-        # linearisation decides how much K/V one slice must hold. XCD-major decode:
-        # give each XCD a whole (batch, kv-head) chunk of the grid, so its L2 streams
-        # ONE kv-head's K/V (4 MB at S=16384) instead of the two it holds when kv_head
-        # is the fastest-varying axis, and keep the GQA_GROUP_SIZE work-groups that
-        # read byte-identical K/V rows adjacent inside the chunk -> they stay
-        # co-resident on that XCD and share every line fetched. Bijective as long as
-        # B*NUM_HEADS_KV % NUM_XCD == 0, which NUM_HEADS_KV % NUM_XCD == 0 guarantees
-        # for any batch; other head counts keep the plain kv-head-fastest decode. ----
+        # block_id decode. The dispatcher round-robins work-groups over the XCDs and each XCD
+        # owns a private L2 slice, so XCD-major decode gives each XCD a whole (batch, kv-head)
+        # chunk: its L2 streams one kv-head's K/V and the GQA work-groups reading byte-identical
+        # rows stay co-resident. Bijective when B*NUM_HEADS_KV % NUM_XCD == 0, which
+        # NUM_HEADS_KV % NUM_XCD == 0 guarantees; other head counts keep the plain decode.
         num_q_tiles = (seq_len_q_v + BLOCK_M - 1) // BLOCK_M
         if const_expr(NUM_HEADS_KV % NUM_XCD == 0):
             _xcd = block_id % fx.Index(NUM_XCD)
@@ -2305,25 +1174,15 @@ def build_flash_attn_bwd_dq_module(
             q_head_idx = kv_head_idx * GQA_GROUP_SIZE + _q_in_group
             _qt_disp = batch_q_tile_id % num_q_tiles
             batch_idx = batch_q_tile_id // num_q_tiles
-        # Longest q-tile first. Causal work per work-group grows with q_tile (its kv
-        # blocks = (q_tile+1)*BLOCK_M/BLOCK_KV) and the dispatcher hands block_ids out
-        # in order, so the dispatch order IS the list-schedule order: descending is
-        # longest-processing-time-first. It also keeps the co-resident work-groups at
-        # equal trip counts, so they sweep the kv axis in lock-step and the GQA group's
-        # byte-identical K/V tiles are shared by more work-groups at once.
+        # Descending q_tile = longest-processing-time-first: causal work grows with
+        # q_tile and block_ids are handed out in order, so dispatch order IS the
+        # list-schedule order.
         q_tile_idx = num_q_tiles - fx.Index(1) - _qt_disp
-        # Causal-aligned tile origin. num_q_tiles*BLOCK_M overshoots seq_len_q by `pad`,
-        # and anchoring the tiles at row 0 spends all of it on the LAST tile -- the one
-        # with the longest causal kv range, which those non-existent rows then walk in
-        # full. Shift every origin down by the largest BLOCK_KV multiple that fits in
-        # the pad: the overshoot moves to tile 0 (the shortest) and every tile's causal
-        # kv range loses one BLOCK_KV step. At Sq=16384 that is 7481 -> 7396 kv-block
-        # visits per head, i.e. -1.1% of every per-block cost (MFMA, v_exp, K/V DMA).
-        # The shift is a BLOCK_KV multiple and BLOCK_M % BLOCK_KV == 0, so q_start stays
-        # kv-block aligned and the masked/bulk loop split below is untouched. Tile 0
-        # clamps to row 0 and keeps BLOCK_M rows, so it recomputes the rows it shares
-        # with tile 1 (with a truncated kv range) but stores only the ones it owns --
-        # every output row still has exactly one writer, so det is unchanged.
+        # Causal-aligned tile origin: anchoring tiles at row 0 spends the whole pad on the LAST
+        # tile, the one with the longest causal kv range. Shift every origin down by the largest
+        # BLOCK_KV multiple that fits the pad so the overshoot lands on tile 0 and every tile
+        # loses one BLOCK_KV step. The shift is a BLOCK_KV multiple, so q_start stays kv-block
+        # aligned; tile 0 recomputes shared rows but stores only the ones it owns (det unchanged).
         _q_pad = num_q_tiles * fx.Index(BLOCK_M) - seq_len_q_v
         _q_shift = (_q_pad // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
         _q_raw = q_tile_idx * BLOCK_M
@@ -2406,12 +1265,10 @@ def build_flash_attn_bwd_dq_module(
             _dma_aux = fx.Int32(1)
 
             def coop_dma_tile(src_rsrc, lds_byte_base, tile_start):
-                """DMA a BLOCK_KV x head_dim K/V tile into the swizzled LDS layout.
+                """DMA a tile into the swizzled LDS layout.
 
-                The per-lane address math is deliberately recomputed per tile rather
-                than hoisted: this kernel sits exactly on the occ-2 VGPR boundary and
-                keeping the offsets live across the k_tr peak costs more (measured
-                vgpr 132 -> 144, occ-2 lost) than the few VALU ops it saves.
+                Address math is recomputed per tile on purpose: keeping the offsets live
+                across the k_tr peak pushes VGPRs past the occ-2 boundary.
                 """
                 for d in range_constexpr(NUM_DMA_KV):
                     lds_addr = (
@@ -2490,19 +1347,13 @@ def build_flash_attn_bwd_dq_module(
         c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
         c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
 
-        _c_scaled_scale = fx.Float32(sm_scale * _LOG2E * float(1 << 23))
-        _c_scaled_floor = fx.Float32(-87.0 * float(1 << 23) + float(127 * (1 << 23) - 486411))
-        _compute_type = fx.Float32.ir_type
         _scale_log2e_v4 = Vec.filled(4, sm_scale * _LOG2E, fx.Float32)  # exact (hw exp2) v4 scale
 
         def _p_of(s_r, lse_t, apply_mask):
             if const_expr(fold_lse):
                 # FOLD: s_r already = sm*log2e*S (prescaled Q). Masked (diagonal) tiles
-                # keep a ZERO C-init, so lse is added here; the bulk gets it from the
-                # C-init and only needs the clamp below. Folding lse into the masked
-                # C-init too is measure-closed: correct on dq (the mask's v_cndmask is a
-                # compiler-visible accumulator read) but +0.36% at Sq=2048, where the
-                # compiler pays back the 72 removed v_add with 49 more s_nop cycles.
+                # keep a ZERO C-init so lse is added here; the bulk gets it from the
+                # C-init and only needs the clamp below.
                 if const_expr(apply_mask):
                     s_r = fmath.fma(s_r, fx.Float32(1.0), lse_t, fastmath=fm_fast)
                 else:
@@ -2511,15 +1362,10 @@ def build_flash_attn_bwd_dq_module(
             diff = fmath.fma(s_r, c_sm_scale_log2e, lse_t, fastmath=fm_fast)
             return ArithValue(diff).exp2(fastmath=fm_fast)
 
-        # A-operand read (K/V from LDS): A[m=kv=lane16][k=D=kg*8+s]. kvt selects the
-        # 16-kv tile (row = kvt*16 + lane16), ks the D 32-step (D = ks*32 + kg*8).
-        # Address hoist (byte-identical layout): row = kvt*16 + lane16 with kvt*16
-        # a 16-multiple, so _pblk(kvt*16+lane16)*PBLK == kvt*(8*PBLK) + _pblk(lane16)*PBLK
-        # (proven over the full lane/kvt/ks domain). The lane-only part is loop-
-        # invariant and the (col^mask) part is kvt-invariant, so precompute both once
-        # instead of recomputing the shift/or swizzle bit-ops per ds_read. This drops
-        # the per-read _pblk + xor arithmetic to two adds without touching the LDS
-        # layout, its 0-conflict property, or determinism.
+        # A-operand read (K/V from LDS): A[m=kv=lane16][k=D=kg*8+s]. Address hoist: kvt*16 is a
+        # 16-multiple, so _pblk(kvt*16+lane16)*PBLK == kvt*(8*PBLK) + _pblk(lane16)*PBLK -- the
+        # lane-only part is loop-invariant and the (col^mask) part kvt-invariant, so both
+        # precompute once. Byte-identical layout, 0-conflict property and determinism kept.
         a_swz_mask = (lane16 & fx.Index(7)) << fx.Index(4)
 
         def _a_idx(a_base, kvt, ks):
@@ -2565,11 +1411,6 @@ def build_flash_attn_bwd_dq_module(
             a = _gemm1_load(a_base, kvts)
             return _gemm1_mfma(a, b_packs, inits_q, kvts)
 
-        # _read_tr address hoist (byte-identical layout, same trick as _a_idx):
-        # row0 = pks*32 + (kg*4 + lane16//4), pks*32 a 16-multiple, and (row0&7) is
-        # pks-invariant (32%8==0), so both _pblk(row0)*PBLK and the swizzle mask are
-        # lane-only. row1 = row0 + 16 -> _pblk(row1)*PBLK = _pblk(row0)*PBLK + 8*PBLK.
-        # Precompute the lane-only base + per-dt (col^mask) once; per read is then adds.
         def _read_tr(a_base, dt, pks):
             """Transpose-read K -> GEMM2 A-operand [m=D=dt*16+lane16][k=kv=kg*8+s]."""
             col = fx.Index(dt * D_TILE) + (lane % fx.Index(4)) * fx.Index(4)
@@ -2596,13 +1437,10 @@ def build_flash_attn_bwd_dq_module(
             lse_owned = [fx.Float32(Vec(lse_inits[qt])[0]) for qt in range_constexpr(QT)]
         q_slot_i32 = [fx.Int32(q_row_of(qt)) for qt in range_constexpr(QT)]
 
-        # ---- Loop-carried: A(DT*QT) dQ~ accumulators. dQ = sm * A,
-        # A = sum_kv K_tr @ (P~*(dP-delta_id)). The rho/R * B self-consistency
-        # correction is dropped (halves GEMM2 MFMA): delta_id from odo is the
-        # fp32-exact rowsum_d(O.dO), so C already carries the near-diagonal
-        # cancellation before the bf16 pack, holding the fast-mode SNR gate. The
-        # per-row rowsum(P~) renorm is also dropped: R==1 to bf16 precision (see
-        # the epilogue) so it was pure VALU overhead on a VALU-bound kernel.
+        # Loop-carried A(DT*QT) accumulators: dQ = sm * A, A = sum_kv K_tr @ (P~*(dP-delta_id)).
+        # The rho/R correction is dropped (halves GEMM2 MFMA): delta_id from odo is the
+        # fp32-exact rowsum_d(O.dO), so C already carries the near-diagonal cancellation before
+        # the bf16 pack. The rowsum(P~) renorm is dropped too -- R == 1 to bf16 precision.
         A_accs = [c_zero_v4f32 for _ in range_constexpr(DT * QT)]
 
         # Causal upper bound of the rows this work-group OWNS (not of the BLOCK_M rows
@@ -2621,20 +1459,13 @@ def build_flash_attn_bwd_dq_module(
 
             kv_start_i32 = fx.Int32(kv_start)
             # C[kvt][qt]: 4 f32 at kv=kvt*16+kg*4+t, q=qt*16+lane16. C = P~*(dP-delta_id)
-            # feeds GEMM2; R = rowsum(P~) is the fast_exp2 renorm. (P itself is no longer
-            # kept: the B-GEMM that consumed P was dropped, see the loop-carried comment.)
+            # feeds GEMM2.
             C = [[None] * QT for _ in range_constexpr(KVT)]
             c_pack = [[None] * QT for _ in range_constexpr(PV_K_STEPS)]
-            # Split GEMM1a/1b + exp2/C + pack per kv-half (pks = the 2 kvt of one GEMM2
-            # K=32 step): compute s/dP for only 2 kvt, consume (exp2/C/pack) and free them
-            # before the next half. This halves the live s/dP transient peak (the VGPR
-            # ceiling) WITHOUT touching the batched GEMM2 below, so it can reach occ-3
-            # (wpe=3) while keeping the depth-2 k_tr prefetch the per-kvt fusion lost.
-            # K cross-half prefetch: the NEXT kv-half's K ds_read is issued right
-            # after the current half's GEMM1 MFMAs (before the VALU-heavy exp2/C/
-            # pack section below), so its latency hides in that VALU shadow instead
-            # of sitting exposed right before the next half's GEMM1 MFMA issue
-            # (V stays loaded in-half by the unsplit _gemm1 -- only K is prefetched).
+            # Split GEMM1a/1b + exp2/C + pack per kv-half (pks = the 2 kvt of one GEMM2 K=32 step):
+            # only 2 kvt of s/dP are live at a time, halving the transient VGPR peak without touching
+            # the batched GEMM2 below. The next half's K ds_read is issued right after this half's
+            # GEMM1 MFMAs so its latency hides in the VALU-heavy exp2/C/pack shadow (V stays in-half).
             k_a_by_half = {0: _gemm1_load(fx.Index(0), [0, 1])}
             for pks in range_constexpr(PV_K_STEPS):
                 ka, kb = 2 * pks, 2 * pks + 1
@@ -2654,13 +1485,9 @@ def build_flash_attn_bwd_dq_module(
                 dp_tiles = _gemm1(fx.Index(LDS_V_BASE), do_b_packs, delta_inits, kvts=half)
                 rocdl.s_setprio(0)
 
-                # Narrow the prefetched-half's live range: load only ka's K here
-                # (before the qt loop), and issue kb's K load between qt=0 and
-                # qt=1 below (_next_kb_load), instead of the whole half in one
-                # block. Halves how long the second kvt's registers stay live
-                # before GEMM1 actually consumes them, trimming the extra
-                # scratch this prefetch adds while keeping the same total
-                # ds_read-vs-VALU-shadow overlap.
+                # Narrow the prefetched half's live range: load only ka's K here and issue kb's between
+                # qt=0 and qt=1 (_next_kb_load), so the second kvt's registers stay live for half as long
+                # before GEMM1 consumes them, at the same ds_read-vs-VALU overlap.
                 _next_kb_load = None
                 if const_expr(pks + 1 < PV_K_STEPS):
                     nka, nkb = 2 * (pks + 1), 2 * (pks + 1) + 1
@@ -2689,11 +1516,6 @@ def build_flash_attn_bwd_dq_module(
                             lse_v4 = Vec.from_elements([lse_owned[qt]], fx.Float32).broadcast_to(4)
                         for kvt in half:
                             if const_expr(fold_lse):
-                                # FOLD: the accumulator already IS the base-2 softmax
-                                # exponent (prescaled Q + -log2e*lse in GEMM1a's C-init),
-                                # so nothing is left per slot but the exp2 itself -- and
-                                # _vexp's intrinsic form lets the compiler carry the
-                                # MFMA->VALU wait states, so no hazard anchor is needed
                                 # either (see _vexp).
                                 _s_v = Vec(s_tiles[kvt][qt])
                                 p4 = Vec.from_elements(
@@ -2757,14 +1579,10 @@ def build_flash_attn_bwd_dq_module(
                 for qt in range_constexpr(QT):
                     c_pack[pks][qt] = bf16_trunc_pack_v8(C[ka][qt] + C[kb][qt])
 
-            # GEMM2 A^T[D,q] += K_tr @ C. The B-GEMM (K_tr @ P) is dropped -> half the
-            # GEMM2 MFMA. N3 ILP: process dt in pairs with the two dt interleaved at
-            # issue so a dependent MFMA (same dt,qt across pks) is separated by 3
-            # independent MFMAs (was 1), overlapping the 16x16x32 MFMA-operand latency.
-            # The next pair's k_tr is prefetched (pair-depth-2) during the current pair.
-            # The initial pair is read here (not hoisted above the compute) to keep the
-            # k_tr registers off the s/dP transient peak so wpe=3 fits occ-3 spill-free.
-            # s_setprio(2) raises MFMA issue priority over ds_read.
+            # GEMM2 A^T[D,q] += K_tr @ C. Process dt in interleaved pairs so a dependent MFMA is
+            # separated by 3 independent ones, covering the 16x16x32 operand latency. The next pair's
+            # k_tr is prefetched during the current one; the initial pair is read here, not hoisted,
+            # to keep k_tr off the s/dP transient peak. s_setprio(2) puts MFMA issue over ds_read.
             kts = [
                 [_read_tr(fx.Index(0), d, pks) for pks in range_constexpr(PV_K_STEPS)]
                 for d in range_constexpr(min(2, DT))
@@ -2783,15 +1601,11 @@ def build_flash_attn_bwd_dq_module(
                     for _ in range_constexpr(2 * PV_K_STEPS * QT):
                         rocdl.sched_mfma(1)
                         rocdl.sched_dsrd(1)
-                # LDS hand-over: the pair that prefetched the last k_tr holds this
-                # tile's final LDS reads, so from here the tile is dead and the next one
-                # is DMA'd into the SAME buffer while the remaining GEMM2 pair --
-                # register-only -- covers the transfer. Unlike an LDS double buffer
-                # (measured net-negative) the in-flight DMA writes never contend with
-                # LDS reads, and no second buffer is needed, so the LDS budget and
-                # occupancy are untouched. Issuing it here rather than before GEMM2 also
-                # keeps the DMA address registers off the all-DT k_tr peak, which is
-                # exactly on the occ-2 VGPR boundary at BLOCK_KV=96.
+                # LDS hand-over: this pair issues the tile's last k_tr read, so the next tile is DMA'd
+                # into the SAME buffer while the remaining register-only GEMM2 pair covers the transfer.
+                # Unlike an LDS double buffer (measured net-negative) the in-flight writes never contend
+                # with LDS reads and no second buffer is needed. Issuing it here also keeps the DMA
+                # address registers off the all-DT k_tr peak.
                 if const_expr(d0 == max(0, DT - 4)):
                     gpu.barrier()
                     if const_expr(ENABLE_DMA):
@@ -2840,13 +1654,9 @@ def build_flash_attn_bwd_dq_module(
 
         A_finals = [[loop_results[dt * QT + qt] for qt in range_constexpr(QT)] for dt in range_constexpr(DT)]
 
-        # ---- Epilogue: dQ = sm * A. Both exp modes use R==1: lse is the true
-        # log-sum-exp so rowsum(exp(S-lse))==1 over the row, and the Schraudolph fast
-        # P~ sums to 1 to bf16 precision (its per-element approx error cancels over
-        # the row-sum -> R deviates <0.01 dB SNR, verified across seeds/shapes), so
-        # the fast renorm was pure VALU overhead and is dropped (+4-5% on this VALU-
-        # bound kernel). The 16x16 C-layout gives 4 CONTIGUOUS D/lane at
-        # q=qt*16+lane16 -> direct store. ----
+        # Epilogue: dQ = sm * A. Both exp modes use R == 1 -- lse is the true log-sum-exp so
+        # rowsum(exp(S-lse)) == 1, and the Schraudolph fast P~ sums to 1 to bf16 precision -- so
+        # the renorm is dropped. The 16x16 C-layout gives 4 contiguous D per lane, direct store.
         for qt in range_constexpr(QT):
             dq_scale = fx.Float32(sm_scale)
             _q_row = q_row_of(qt)
@@ -2944,21 +1754,12 @@ def build_flash_attn_bwd_dq_module(
 # Deterministic drop-in for the CK hd64 FMHA varlen backward; the build_* module
 # factories above are called directly (same module).
 # ===========================================================================
-import math as _math
-import os as _os
-
 import torch
-
-_LOG2E = _math.log2(_math.e)
-_QSPLIT_ENV = _os.environ.get("DQ_QSPLIT")
-_DQ_BKV_ENV = _os.environ.get("DQ_BLOCK_KV")  # force dq's kv tile (shape sweeps)
 
 
 def _qsplit_for(Sq):
-    # q_split fans the dK/dV KV-owner WGs across the CU grid; the optimum rises
-    # with Sq before split-reduction overhead dominates. det-neutral. Swept on MI355X.
-    if _QSPLIT_ENV is not None:
-        return int(_QSPLIT_ENV)
+    # q_split fans the dK/dV KV-owner WGs across the CU grid; the optimum rises with
+    # Sq before split-reduction overhead dominates.
     if Sq <= 8192:
         return 4
     return 3
@@ -2966,22 +1767,15 @@ def _qsplit_for(Sq):
 
 def _blockkv_for(Sq):
     # Small Sq: BLOCK_KV=64 fills the grid (kills the tail effect); large Sq: 128
-    # amortises per-tile cost. Swept on MI355X.
+    # amortises per-tile cost.
     return 64 if Sq <= 2048 else 128
 
 
 def _dq_block_kv(Sq):
-    """dq's kv tile, swept in the FULL-bwd setting rather than standalone.
-
-    dq runs right after dkdv and loses ~6% to L2 contention there (L2 hit 91% alone
-    -> 85.3% in the loop), which moves the optimum: standalone the best is 64, but
-    end-to-end at Sq=16384 it is 96 (+1.0% on the full backward, and it flips
-    16384 from slower than 8192 to faster). Only multiples of 32 are valid --
-    80/112/128/160 silently produce the wrong dQ (SNR 8-14 dB), so keep to the
-    checked set {32, 64, 96, 192}.
+    """dq's kv tile, swept with dkdv running before it (L2 contention moves the
+    optimum). Only multiples of 32 are valid -- other sizes silently produce the
+    wrong dQ, so keep to the checked set {32, 64, 96, 192}.
     """
-    if _DQ_BKV_ENV is not None:
-        return int(_DQ_BKV_ENV)
     return 96 if Sq >= 16384 else 64
 
 
@@ -3015,13 +1809,6 @@ def _prescale_lse(lse_bhsq):
     return (lse_bhsq.float() * (-_LOG2E)).contiguous()
 
 
-def _uniform_len(cu):
-    d = cu[1:] - cu[:-1]
-    S = int(d[0].item())
-    assert bool((d == S).all().item()), "flydsl varlen bwd requires uniform seqlens"
-    return cu.numel() - 1, S
-
-
 def flydsl_varlen_backward(dout, q, k, v, out, lse_bhsq, B, Sq, Skv, Hq, Hkv, D, scale, window_left=-1):
     """Run the 16x16x32 flydsl bwd. THD-flat/contiguous tensors.
     q,dout,dq,out:[B*Sq,Hq,D]; k,v,dk,dv:[B*Skv,Hkv,D]; lse_bhsq:[B,Hq,Sq] f32.
@@ -3031,10 +1818,8 @@ def flydsl_varlen_backward(dout, q, k, v, out, lse_bhsq, B, Sq, Skv, Hq, Hkv, D,
         Hq, Hkv, D, scale, window_left, q_split, _blockkv_for(Sq), _dq_block_kv(Sq)
     )
     st = torch.cuda.current_stream()
-    # identity delta = -rowsum(O.dO); both kernels center dP by it (exact). Fused odo
-    # kernel replaces the torch (out*dout).sum(-1) elementwise+fp32-reduce (a pure
-    # Sq-scaling overhead). odo reads bf16, so cast (no-op when out/dout already bf16;
-    # the correctness gate passes fp32 out from the fp32 reference forward).
+    # identity delta = -rowsum(O.dO); both kernels center dP by it (exact). odo reads
+    # bf16, so cast out/dout (no-op when they already are).
     delta = torch.empty(B, Hq, Sq, device=q.device, dtype=torch.float32)
     odo_l(out.to(q.dtype).reshape(-1), dout.to(q.dtype).reshape(-1), delta.reshape(-1), B, Sq, st)
     lse_s = _prescale_lse(lse_bhsq)

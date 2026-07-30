@@ -1,14 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Shared module-level helpers for the gfx950 dual-wave, software-pipelined
-flash-attention kernels.
-
-These MLIR-dialect-facing free functions and the ``s_waitcnt`` bit-field
-constants were previously duplicated verbatim across ``flash_attn_gfx950``
-(bf16/f16) and ``flash_attn_fp8_gfx950`` (fp8); ``_LOG2E`` / ``_waitcnt_vm_n``
-are also shared with ``flash_attn_generic``. Moving them here changes nothing
-about the emitted IR/ISA -- it only removes the duplication.
+"""Shared MLIR-dialect helpers and ``s_waitcnt`` bit-field constants for the gfx950
+dual-wave, software-pipelined flash-attention kernels.
 """
 
 import math as host_math
@@ -29,10 +23,6 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 
 def dtype_to_elem_type(dtype_str: str):
-    """Map a dtype string to its FlyDSL numeric type.
-
-    Supported: 'f32', 'f16', 'bf16', 'fp8' (OCP e4m3fn, not the fnuz variant).
-    """
     if dtype_str == "f32":
         return fx.Float32
     if dtype_str == "f16":
@@ -100,10 +90,8 @@ def _read_exec_i64():
 
 def _ds_read_tr16_b64(traits, result_type, base_ptr, imm_bytes, buf_id):
     """gfx950 ds_read_b64_tr_b16 at a constant byte offset from a per-lane V base.
-
-    Emitted as the rocdl op, not inline asm: asm is opaque to SIInsertWaitcnts, so
-    every consumer would need a hand-written lgkmcnt plus a sched_barrier. The op
-    carries a real LDS memory effect, so the backend places the waits itself.
+    Emitted as the rocdl op, not inline asm: the op carries a real LDS memory effect so
+    SIInsertWaitcnts places lgkmcnt itself, whereas asm would need hand-written waits.
     """
     scope_name = _dualwave_lds_scope("v", buf_id)
     ptr = buffer_ops.get_element_ptr(base_ptr, byte_offset=int(imm_bytes), elem_type=T.i8)
@@ -180,9 +168,8 @@ def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
 
 
 def _attn_mask_lower_vec2_imm(rel_win_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32):
-    """SWA left-window pair mask asm: mask element to -inf when its column is BELOW
-    the sliding window, i.e. when rel_win_i32 > thr (mirror of the causal upper mask,
-    which masks when rel < thr). rel_win = (q_row + delta - kv_start - lane_off) - W."""
+    """SWA left-window pair mask asm; rel_win = (q_row + delta - kv_start - lane_off) - W,
+    masked when rel_win > thr (mirror of the causal upper mask, which masks when rel < thr)."""
     asm_str = (
         f"v_cmp_gt_i32_e64 $0, $6, {int(thr_x)}\n\t"
         f"v_cmp_gt_i32_e64 $1, $6, {int(thr_y)}\n\t"
@@ -310,11 +297,9 @@ def _anchor_v_o(traits, v_o):
 
 
 def _rowsum_ones_a_operand(traits, lane, elem_dtype):
-    """A operand of the 16x16x32 row-sum MFMA.
-
-    Re-reading a packed P slice as 16x16x32 puts col = lane%16, k = 8*(lane//16)+i,
-    so the two q halves interleave along k. Rows 0/8 select the low half and 4/12
-    the high half, leaving each lane's own q sum in D element 0, no cross-lane move.
+    """A operand of the 16x16x32 row-sum MFMA. Re-reading a packed P slice as 16x16x32 gives
+    col = lane%16, k = 8*(lane//16)+i, so rows 0/8 tap the low q half and 4/12 the high one,
+    leaving each lane's own q sum in D element 0 with no cross-lane move.
     """
     one_bits = 0x3F803F80 if const_expr(traits.DTYPE_STR == "bf16") else 0x3C003C00
     is_tap_row = ArithValue(fx.Index(lane % 4) == fx.Index(0))
@@ -349,17 +334,6 @@ def _anchor_v_p(traits, v_p, elem_dtype):
         anchored_lo.append(p_vec.shuffle(p_vec, [lo_base + i for i in range(8)]).ir_value())
         anchored_hi.append(p_vec.shuffle(p_vec, [hi_base + i for i in range(8)]).ir_value())
     return anchored_lo, anchored_hi
-
-
-def _v_pair_to_vec32(v):
-    return _concat_vectors(v[0], v[1]).ir_value()
-
-
-def _v_vec32_to_pair(v):
-    v_vec = Vec(v, (32,), fx.Float32)
-    v_lo = v_vec.shuffle(v_vec, [i for i in range(16)]).ir_value()
-    v_hi = v_vec.shuffle(v_vec, [16 + i for i in range(16)]).ir_value()
-    return v_lo, v_hi
 
 
 def _v_p_to_vec32(v_p):
@@ -413,7 +387,6 @@ def _bf16_trunc_pack_v8(traits, f32_vals, elem_dtype):
         trunc_op = llvm.FPTruncOp(Vec.make_type(8, elem_dtype), as_mlir_value(f32_vec))
         trunc_op.operation.attributes["fastmathFlags"] = ir.Attribute.parse("#llvm.fastmath<fast>")
         return trunc_op.result
-    # fp16: truncate each f32 -> f16 (RNE) and build the v8 pack directly.
     f16_vals = []
     for i in range_constexpr(8):
         f16_vals.append(fx.Float32(f32_vals[i]).to(elem_dtype))
@@ -673,19 +646,16 @@ def _load_k_pack_aligned(traits, lds_kv_base_ptr, elem_idx, buf_id, kv_mfma_pack
 
 
 def _ws_store_f32(f32_val, local_elem_index, rsrc):
-    """32-bit f32 store into a per-split-z workspace region via raw buffer descriptor."""
     f32_ir = as_mlir_value(fx.Float32(f32_val))
     buffer_ops.buffer_store(f32_ir, rsrc, as_mlir_value(fx.Int32(local_elem_index)))
 
 
 def _ws_store_quad_i32(dwords, local_elem_index, rsrc):
-    """128-bit i32x4 store (buffer_store_dwordx4) into a per-split-z workspace region."""
     vec_ir = Vec.from_elements([fx.Int32(v) for v in dwords], fx.Int32).ir_value()
     buffer_ops.buffer_store(vec_ir, rsrc, as_mlir_value(fx.Int32(local_elem_index)))
 
 
 def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
-    """128-bit global->register load (buffer_load_dwordx4) from Q."""
     return fly.copy_atom_call_ssa(
         [q_load_i32x4_type], _load_atom_128, fx.slice(q_div, (None, fx.Int32(elem_index)))
     )
@@ -700,7 +670,6 @@ def _buffer_load_lds_128(src_div, lds_byte_addr, src_elem, soffset_elems, _dma_a
 
 
 def _buffer_store_128(pack_i32_vec, elem_index, _o_store_reg_128, _store_atom_128, o_div):
-    """128-bit register->global store (buffer_store_dwordx4) into O."""
     fx.memref_store_vec(pack_i32_vec, _o_store_reg_128)
     fx.copy(_store_atom_128, _o_store_reg_128, fx.slice(o_div, (None, fx.Int32(elem_index))))
 
@@ -711,7 +680,6 @@ def _buffer_store_128(pack_i32_vec, elem_index, _o_store_reg_128, _store_atom_12
 def _k_buf_base(traits, buf_id):
     if const_expr(isinstance(buf_id, int)):
         return traits.DUALWAVE_SWP_K_BUF_BASE[buf_id]
-    # runtime buf_id (rare): K0=0, K1=DUALWAVE_SWP_KV_PER_BUFFER
     return buf_id * traits.DUALWAVE_SWP_KV_PER_BUFFER
 
 
@@ -748,7 +716,6 @@ def _vec_v_elem(n, d, kv_head_idx, TRAITS_BLOCK_N, TRAITS_KV_VEC_SIZE, TRAITS_HE
 
 
 def _vec_k_dma_oct_idx(traits, d, wave_id_uni, lane_in_warp):
-    """Flat octet index for this wave/lane's d-th DMA slot in vectorized K layout."""
     return wave_id_uni * (traits.WARP_SIZE * traits.SMEM_D_RPT) + d * traits.WARP_SIZE + lane_in_warp
 
 
@@ -784,12 +751,10 @@ def _paged_bt_byte_offset(tile_idx, split_t0):
 
 
 def _q_pack_col(traits, ks, lane_div_32):
-    """K-dimension column for Q pack at MFMA k-step `ks` for this lane."""
     return ks * traits.K_STEP_QK + lane_div_32 * traits.MFMA_LANE_K
 
 
 def _q_pack_global_idx(traits, q_row_in_block, ks, lane_div_32, stride_q_n_v):
-    """Flat global element index for Q pack (q_row, ks)."""
     return q_row_in_block * stride_q_n_v + _q_pack_col(traits, ks, lane_div_32=lane_div_32)
 
 
@@ -800,7 +765,6 @@ def _get_q_pack(traits, q_all_scaled_bf16, ks):
 
 
 def _vec_k_lds_idx_lo(traits, k_base, ks, lane_div_32, lane_mod_32):
-    """LDS element index for vectorized K pack lo at k-step `ks` for this lane."""
     return (
         k_base
         + (ks * 2 + lane_div_32) * (traits.BLOCK_N * traits.KV_VEC_SIZE)
@@ -957,9 +921,6 @@ def _store_splitk_ml_row(m_row, l_row, local_ml_idx, mrow_rsrc, lrow_rsrc):
 
 
 def _init_dualwave_thread_mapping(ctx):
-    """Set block/wave/lane/head indices on a dualwave-style context.
-
-    Shared verbatim by DualwaveKernelContext and DualwaveFp8KernelContext."""
     traits = ctx.traits
     ctx.h_idx = fx.Index(gpu.block_idx.x)
     if const_expr(traits.CAUSAL and not traits.SPLITK):
@@ -1166,9 +1127,6 @@ def _make_dualwave_swp_traits(
     gqa_merge=None,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
-    # Tile shape and wave geometry. Default = 8-wave CTA (BLOCK_M=256). A smaller
-    # BLOCK_M (e.g. 128 -> 4 waves) keeps rows_per_wave=32 (per-wave MFMA/softmax code
-    # unchanged) but shrinks the workgroup -> more WGs resident per CU (higher occupancy).
     rows_per_wave = 32
     warp_size = 64
     if block_m is None:
@@ -1178,7 +1136,6 @@ def _make_dualwave_swp_traits(
     block_n_out = 64
     k_sub_n = 32
 
-    # QK walks D in 16-wide MFMA K steps; PV consumes K_SUB_N in two 16-token steps.
     k_step_qk = 16
     k_steps_qk = head_dim // k_step_qk
     d_chunk = 32
@@ -1199,10 +1156,8 @@ def _make_dualwave_swp_traits(
     smem_linear_wave = warp_size * 16 // bf16_bytes
     smem_n_per_wave = smem_linear_wave // d_128b_size
     smem_n_rpt = block_n // smem_n_per_wave
-    # GQA sharer merge: one CTA runs the same q-tile for Q_HEADS_PER_WG q-heads of one
-    # kv-head, so the wave count grows while the row tile stays. Both sharers then read a
-    # single shared K/V LDS tile, halving the per-CU K/V request rate per unit of work.
-    # Capped at SMEM_N_RPT waves, one LDS line each, so the DMA still splits evenly.
+    # Two q-heads of one kv-head share a CTA and thus one K/V LDS tile. Capped at SMEM_N_RPT
+    # waves, one LDS line each, so the DMA still splits evenly.
     if gqa_merge is None:
         gqa_merge = (
             not dualwave_swp_enable_stagger
@@ -1252,20 +1207,16 @@ def _make_dualwave_swp_traits(
     paged = bool(paged)
     varlen = bool(varlen)
     cross_seqlen = bool(cross_seqlen)
-    # Softmax is shift-invariant, so the main loop can run on a fixed zero reference max
-    # and let the epilogue tiles re-enter the online path from it. A window only changes
-    # which tiles are masked, not that invariance, so SWA takes the same path. Kept off
-    # for split-K, whose partial m/l are combined across chunks.
+    # Softmax is shift-invariant, so the main loop can run on a fixed zero reference max and let
+    # the epilogue re-enter the online path; off for split-K, whose partial m/l cross chunks.
     if dualwave_swp_fixed_max is None:
         dualwave_swp_fixed_max = causal and not splitk
     # With a fixed reference max nothing rebases l_row mid-loop, so the running row sum
     # can live in an MFMA accumulator fed by a ones A operand instead of a VALU fold.
     dualwave_swp_mfma_rowsum = bool(dualwave_swp_fixed_max)
-    # Splitting the K/V LDS reads across the memory/compute cluster boundary keeps this
-    # configuration's main loop inside the 4-waves-per-SIMD register budget (only the
-    # once-per-WG prologue and epilogue still spill), so ask the register allocator for
-    # that budget rather than the caller's floor. Stagger and paged spend the same
-    # scheduling slack the split needs, so they keep the caller's value.
+    # Splitting the K/V LDS reads across the memory/compute cluster boundary keeps the main
+    # loop inside the 4-waves-per-SIMD register budget, so ask for that budget instead of the
+    # caller's floor. Stagger and paged spend the same scheduling slack, so they keep it.
     if (
         not dualwave_swp_enable_stagger
         and not paged
@@ -1594,10 +1545,8 @@ class DualwaveKernelContext:
         self.debug_counts_rsrc = (
             _make_raw_buffer_rsrc(self.DebugCounts) if traits.DUALWAVE_SWP_DEBUG_LAZY_COUNTS else None
         )
-        # EMIT_LSE reuses the DebugCounts tensor slot as the fp32 LSE output
-        # ([total_q, NUM_HEADS_Q] layout: elem = (q_tok_base+q_row)*NUM_HEADS_Q + q_head).
-        # Uses an addrspace(8) buffer resource (like the split-K workspace) so
-        # _ws_store_f32's buffer_store accepts it. 0xFFFFFFFF-byte bound = no clip.
+        # EMIT_LSE aliases the DebugCounts tensor slot as the fp32 LSE output
+        # ([total_q, NUM_HEADS_Q] layout).
         if const_expr(traits.EMIT_LSE):
             _lse_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(self.DebugCounts)))
             self.lse_rsrc = _make_ws_rsrc(_lse_base_i64, fx.Int64(0), fx.Int64(0xFFFFFFFF))
@@ -1641,7 +1590,6 @@ class DualwaveKernelContext:
         self.lane_in_warp = self.tid % self.traits.WARP_SIZE
         self.n_in_warp = self.lane_in_warp // self.traits.VEC_KV
         self.d_bucket = self.lane_in_warp % self.traits.VEC_KV
-        # # of LDS lines each wave must fill (=1 for the 8-wave CTA, 2 for 4-wave).
         self.dma_wave_reps = self.traits.SMEM_N_RPT // self.traits.NUM_WAVES
 
     def init_q_row(self):
@@ -1717,9 +1665,8 @@ class DualwaveKernelContext:
             )
             self.split_nonempty = self.split_t0 + fx.Index(4) <= self.max_num_tiles
         elif const_expr(traits.CAUSAL and traits.WINDOW_LEFT >= 0):
-            # SWA: skip KV tiles entirely below the left window. Lower tile bound =
-            # floor((q_start + delta - W)/BLOCK_N), aligned to even (buf0=even parity),
-            # and clamped so the pipeline keeps >= 4 active tiles [split_t0, split_t_end).
+            # SWA: start at the first KV tile that can intersect the left window; the base
+            # must stay even (buf0 parity) and leave >= 4 tiles for the pipeline.
             swa_lo_raw = fx.Int32(self.q_start) + self.delta_i32 - fx.Int32(traits.WINDOW_LEFT)
             swa_lo_raw = fx.Int32(ArithValue(swa_lo_raw > fx.Int32(0)).select(swa_lo_raw, fx.Int32(0)))
             swa_lo_tile = fx.Index(swa_lo_raw) // fx.Index(traits.BLOCK_N)
@@ -1959,11 +1906,8 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         return _fadd(l_row, _score_pair_sum(v_p, self.c_zero_f, self.fm_fast), self.fm_fast)
 
     def cast_p_and_sum(self, l_row, v_p):
-        """Pack P to bf16 and fold this tile into the running row sum.
-
-        The VALU path folds the f32 scores before packing; the MFMA path feeds the
-        packs themselves to a ones-matrix MFMA, so numerator and denominator see the
-        same bf16 values."""
+        """Pack P to bf16 and fold the tile into the row sum; the MFMA path feeds the packs
+        themselves to a ones-matrix MFMA so numerator and denominator see the same bf16 values."""
         if const_expr(self.traits.DUALWAVE_SWP_MFMA_ROWSUM):
             v_p = self.cast_p(v_p)
             return v_p, self.row_sum_packed(l_row, v_p)
@@ -2029,25 +1973,18 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         return self.c_zero_f
 
     def scores_for_softmax(self, v_s):
-        """Layout the softmax path consumes: element lists when a row max still has to be
-        reduced out of them, the raw vector pair when the reference max is fixed."""
         if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
             return v_s
         return self.v_s_vec_to_lists(v_s)
 
     def shift_scores(self, v_s, row_max):
-        """Shift scores by the softmax reference max. A zero reference needs no shift,
-        so only the score layout is normalized for the exp2 slices."""
         if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
-            # Callers hand over either the vector pair or the per-element list pair.
             return _score_lists_to_vecs(v_s) if isinstance(v_s[0], list) else v_s
         return self.sub_m(v_s, row_max)
 
     def tile_rescale_o(self, v_o, m_row, l_row, v_s, v_p, sched_group):
-        """Per-tile row-max update and O/P rescale, then the cluster's sched groups.
-
-        With a fixed reference max the correction is identically 1, so the row-max
-        reduction, the rescale and the m_row update all drop out."""
+        """With a fixed reference max the correction is identically 1, so the row-max reduction,
+        the rescale and the m_row update all drop out."""
         if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
             return v_o, m_row, l_row, v_p
         m_tile_max = self.reduce_max(v_s)
@@ -2057,8 +1994,7 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         return self.rescale_o(v_o, m_row, l_row, m_tile_max, v_p)
 
     def tile_row_max(self, m_row, v_s):
-        """Fold an epilogue tile's max into the running reference and return the O/l
-        correction factor, or None when the reference is fixed and nothing rebases."""
+        """Returns None as the O/l correction when the reference max is fixed and nothing rebases."""
         if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
             return m_row, None
         return self.rescale_from_tile_max(m_row, self.reduce_max(v_s))
@@ -2136,7 +2072,6 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         return _score_pair_to_lists(v_s)
 
     def _causal_mask_inplace(self, v_s, tile_idx, q_row_i32=None):
-        """Apply causal mask using DUALWAVE_SWP inline-asm attn_mask_vec2_imm."""
         if q_row_i32 is None:
             q_row_i32 = self.ctx_ref.q_row_i32
         traits = self.traits
@@ -2153,8 +2088,7 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         pair_thresholds = _causal_pair_thresholds(traits.KV_VECTORIZED)
         _apply_dualwave_causal_mask_pair(s_lo, rel_lo_i32, neg_inf_i32, pair_thresholds)
         _apply_dualwave_causal_mask_pair(s_hi, rel_hi_i32, neg_inf_i32, pair_thresholds)
-        # SWA left window: additionally mask columns BELOW the window (phys_kv <
-        # q_row + delta - W). Same pair thresholds, mirrored comparison, rel shifted by W.
+        # SWA left window: additionally mask columns below the window (phys_kv < q_row + delta - W).
         if const_expr(traits.WINDOW_LEFT >= 0):
             w_i32 = fx.Int32(traits.WINDOW_LEFT)
             rel_win_lo_i32 = fx.Int32(rel_lo_i32 - w_i32)
@@ -2183,9 +2117,7 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
             q_row_i32 = self.ctx_ref.q_row_i32
 
         traits = self.traits
-        # For SWA also mask tiles at the lower window edge. A tile [kv_start, kv_end)
-        # needs lower masking when kv_start < q_end + delta - W (highest query's window
-        # floor). Guard is conservative; _causal_mask_inplace is a no-op where unneeded.
+        # SWA lower-edge guard is deliberately conservative; _causal_mask_inplace is a no-op on tiles that need no masking.
         kv_start_pos_w = self.tile_start(tile_idx)
 
         @flyc.jit
@@ -2395,10 +2327,7 @@ class DualwaveKvLdsToVgprLoader(DualwaveKernelContext):
         return lo, hi
 
     def load_k(self, buf_id, urk_base=None, ks_range=None, k_regs=None):
-        """Read this buffer's K packs for k-steps [ks_range), filling `k_regs` if given.
-
-        Splitting the range lets the tail packs issue inside the QK cluster, so only
-        half of the K tile is resident at once."""
+        """Read this buffer's K packs for k-steps [ks_range). Splitting the range keeps only half the K tile resident in registers at once."""
         if urk_base is None:
             urk_base = self.k_lds_read_base_per_lane
         ks_lo, ks_hi = (0, self.traits.K_STEPS_QK) if ks_range is None else ks_range
@@ -2430,7 +2359,6 @@ class DualwaveKvLdsToVgprLoader(DualwaveKernelContext):
         return (k_lo, k_hi)
 
     def load_v(self, buf_id, urv_base=None, substeps=None, packs=None):
-        """Read this buffer's V packs for k-substeps [substeps), filling `packs` if given."""
         if urv_base is None:
             urv_base = self.v_lds_read_base_per_lane
         v_base = _v_buf_base(self.traits, buf_id)
@@ -2608,11 +2536,8 @@ class DualwaveStoreHelper(DualwaveKernelContext):
         self._store_final_o_row(v_o, q_row)
 
     def store_lse(self, m_row, l_row, q_row):
-        """Non-splitk LSE output. m_row is the running max of the *scaled* scores
-        (raw_qk * sm_scale * log2e), l_row = sum exp2(scaled - m_row). Hence
-        LSE_natural = ln2 * (m_row + log2(l_row)). One f32 per (row, head), written
-        by the row-owning lanes (lane_div_32 == 0) into DebugCounts-as-LSE:
-        elem = (q_tok_base + q_row) * NUM_HEADS_Q + q_head_idx  ([total_q, Hq] layout)."""
+        """Non-splitk LSE: m_row/l_row live in the log2 domain, hence LSE_natural =
+        ln2 * (m_row + log2(l_row)); written as f32 per (row, head) into the DebugCounts slot."""
         traits = self.traits
         lse_rsrc = self.lse_rsrc
         q_tok_base = self.q_tok_base
@@ -2836,15 +2761,11 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         )
 
 
-# Misc debug and public helpers
-
-
 def _scale_sched_pairs(pairs, head_dim):
     return max(1, (pairs + 1) // 2) if head_dim == 64 else pairs
 
 
 def _sched_barrier_pairs(traits, pairs, valu_cnt, group):
-    """Emit `pairs` × {1 MFMA + valu_cnt VALU} sched_group_barrier groups."""
     pairs = _scale_sched_pairs(pairs, traits.HEAD_DIM)
     for _ in range_constexpr(pairs):
         rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, 1, group)
@@ -2852,7 +2773,6 @@ def _sched_barrier_pairs(traits, pairs, valu_cnt, group):
 
 
 def _sched_barrier_exp_pairs(traits, pairs, exp_cnt, group):
-    """Emit `pairs` × {1 MFMA + exp_cnt EXP} sched_group_barrier groups."""
     pairs = _scale_sched_pairs(pairs, traits.HEAD_DIM)
     for _ in range_constexpr(pairs):
         rocdl.sched_group_barrier(traits.SCHED_MFMA_MASK, 1, group)

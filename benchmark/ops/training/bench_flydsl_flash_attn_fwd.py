@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Perf reproduction for the integrated FlyDSL hd64 flash-attention FORWARD
-# (primus_turbo.flydsl.attention.flash_attn_fwd), Meta square-causal grid.
-#
-# B=1 production config, 4-wave stagger-off (block_m=128, waves_per_eu=2,
-# stagger off), hw-exp2, square bottom-right causal, MI355X (gfx950).
-# convTF/s = 4*B*Hq*Sq*Skv*D*causal_frac / time. Acceptance:
-#   strict 1.68x line = H100_FA-v3 x 1.68  (=1.4x MI350 bar x 1.2 MI355>MI350)
-#   1.4x threshold    = H100_FA-v3 x 1.40
-#
-# Hot-steady protocol (B=1 small-workload): WARMS s continuous full-load warmup
-# (no sleep) + median of REPS. See meta flydsl_fwd/_bench_fwd.py.
+# Square-causal forward perf for primus_turbo.flydsl.attention.flash_attn_fwd,
+# hot-steady (continuous warmup, no sleep) against the H100 FA-v3 reference.
 #
 #   HIP_VISIBLE_DEVICES=0 python3 bench_flydsl_flash_attn_fwd.py
 import os
@@ -25,16 +16,15 @@ DEV = "cuda"
 DT = torch.bfloat16
 D = 64
 
-# square-causal focus shapes: Sq=Skv=S, Meta main head cfg (Hq=128, Hkv=16), B=1.
 HQ, HKV = 128, 16
 SQUARE_S = [2048, 4096, 8192, 16384]
 # H100 FA-v3 square-causal fwd reference (B=1, D=64, TF/s).
 H100_SQ = {2048: 298, 4096: 445, 8192: 486, 16384: 522}
-B = int(os.environ.get("B", "1"))
-WARMS = float(os.environ.get("WARMS", "3.0"))
-REPS = int(os.environ.get("REPS", "9"))
-IT = int(os.environ.get("IT", "20"))
-NODE = os.environ.get("NODE", os.uname().nodename)
+B = 1
+WARMS = 3.0
+REPS = 9
+IT = 20
+NODE = os.uname().nodename
 
 
 def _causal_frac(Sq, Skv):
@@ -69,7 +59,6 @@ def _time(fn):
 
 
 def bench_one(S):
-    # 4-wave stagger-off tuned config (production for B=1 hd64).
     mod = build_flash_attn_dualwave_swp_module(
         num_heads=HQ,
         head_dim=D,
@@ -107,9 +96,6 @@ def main():
         f"device={torch.cuda.get_device_name(0)} arch={torch.cuda.get_device_properties(0).gcnArchName}",
         flush=True,
     )
-    # Acceptance: convert the measured MI355 convTF to a MI350 equivalent (/1.2) and
-    # compare to the 1.4x-H100 customer bar (MI350). verdict = PASS if >= 1.4x, else
-    # the shortfall vs 1.4x. Matches the bwd square-causal acceptance table.
     print(f"\n===== Forward hd64 THD  B={B}  4-wave stagger-off  hw-exp  [node {NODE}] =====", flush=True)
     print(
         f"{'S':>6} {'H100_fwd':>9} {'1.4xtgt(MI350)':>15} {'MI355':>7} {'MI350(/1.2)':>12} {'xH100':>6} {'verdict':>8}",
