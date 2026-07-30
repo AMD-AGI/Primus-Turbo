@@ -1503,9 +1503,7 @@ class DualwaveKernelContext:
         if const_expr(traits.SBHD):
             # SBHD [S,B,H,D]: per-batch base is only H*D (seq-step B*H*D lives in stride_q_n).
             q_batch_byte_off = (
-                self.batch_idx
-                * fx.Index(traits.NUM_HEADS_Q * traits.HEAD_DIM)
-                * fx.Index(traits.BF16_BYTES)
+                self.batch_idx * fx.Index(traits.NUM_HEADS_Q * traits.HEAD_DIM) * fx.Index(traits.BF16_BYTES)
             )
         else:
             q_batch_byte_off = self.q_tok_base * self.stride_q_n_v * fx.Index(traits.BF16_BYTES)
