@@ -205,12 +205,26 @@ def build_flash_attn_dualwave_swp_module(
         # The write-after-read edge is already covered by the compute-cluster barrier preceding each
         # overwrite DMA, so the memory-cluster rendezvous protects nothing (and costs 8 waves merged).
         fold_mem_barriers = sink_drains and traits.Q_HEADS_PER_WG > 1
+        fold_pv_barriers = fold_mem_barriers and late_dma
+        vm_drain_sync = 0 if fold_pv_barriers else ctx.VM_DRAIN_KV
 
         def _mem_cluster_sync():
             if const_expr(fold_mem_barriers):
                 _sched_barrier(0)
             else:
                 _dualwave_sync_barrier()
+
+        def _qk_cluster_sync():
+            if const_expr(sink_drains):
+                _s_waitcnt(traits.LGKMCNT_0_ONLY)
+                _waitcnt_vm_n(vm_drain_sync)
+            _dualwave_sync_barrier()
+
+        def _pv_cluster_sync():
+            if const_expr(fold_pv_barriers):
+                _sched_barrier(0)
+            else:
+                _qk_cluster_sync()
 
         if const_expr(traits.DUALWAVE_SWP_MFMA_ROWSUM):
             l_row_init = ctx.c_zero_v4f32
@@ -376,7 +390,7 @@ def build_flash_attn_dualwave_swp_module(
                 _mem_cluster_sync()
 
                 # Cluster 1 finishes v_p_0 softmax, updates l_row, casts P, then computes MMA0.
-                if const_expr(late_dma):
+                if const_expr(late_dma and not fold_pv_barriers):
                     kv_gmem_to_lds.load_v_tile(j_idx - 2, 1)
                 if const_expr(traits.PAGED):
                     c2_pageid_lds = page_ids.load_page_id_lds(j_idx)
@@ -393,10 +407,7 @@ def build_flash_attn_dualwave_swp_module(
                 c2_pageid = (
                     page_ids.finish_page_id(c2_pageid_lds) if const_expr(traits.PAGED) else fx.Index(0)
                 )
-                if const_expr(sink_drains):
-                    _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                    _waitcnt_vm_n(ctx.VM_DRAIN_KV)
-                _dualwave_sync_barrier()
+                _qk_cluster_sync()
 
                 # Cluster 2 prefetches next K, reads this tile's V for P*V, then waits and syncs.
                 _s_nop(3)
@@ -415,6 +426,8 @@ def build_flash_attn_dualwave_swp_module(
                 # Cluster 3 computes P*V, row max, rescale, sub row, and first-half exp2.
                 if const_expr(late_dma):
                     kv_gmem_to_lds.load_k_tile(j_idx, 1)
+                if const_expr(fold_pv_barriers):
+                    kv_gmem_to_lds.load_v_tile(j_idx - 2, 1)
                 if const_expr(traits.PAGED):
                     c4_pageid_lds = page_ids.load_page_id_lds(j_idx - 1)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
@@ -444,10 +457,7 @@ def build_flash_attn_dualwave_swp_module(
                 c4_pageid = (
                     page_ids.finish_page_id(c4_pageid_lds) if const_expr(traits.PAGED) else fx.Index(0)
                 )
-                if const_expr(sink_drains):
-                    _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                    _waitcnt_vm_n(ctx.VM_DRAIN_KV)
-                _dualwave_sync_barrier()
+                _pv_cluster_sync()
 
                 # Cluster 4 mirrors C0: prefetch V, read K into v_k, wait, and sync.
                 _s_nop(3)
@@ -464,7 +474,7 @@ def build_flash_attn_dualwave_swp_module(
                 _mem_cluster_sync()
 
                 # Cluster 5 mirrors C1: finish v_p_1 softmax, update l_row, cast P, then MMA0.
-                if const_expr(late_dma):
+                if const_expr(late_dma and not fold_pv_barriers):
                     kv_gmem_to_lds.load_v_tile(j_idx - 1, 0)
                 if const_expr(traits.PAGED):
                     _c6_kpid_lds = page_ids.load_page_id_lds(j_idx + 1)
@@ -477,10 +487,7 @@ def build_flash_attn_dualwave_swp_module(
                 _sched_barrier_pairs(traits, 10, 5, 3)
                 # Hoist Cluster 6 K-DMA address prep to overlap Cluster 5 compute.
                 _c6_kpid = page_ids.finish_page_id(_c6_kpid_lds) if const_expr(traits.PAGED) else fx.Index(0)
-                if const_expr(sink_drains):
-                    _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                    _waitcnt_vm_n(ctx.VM_DRAIN_KV)
-                _dualwave_sync_barrier()
+                _qk_cluster_sync()
 
                 # Cluster 6 prefetches next K, reads V packs, optionally masks v_s_0, waits, and syncs.
                 _s_nop(3)
@@ -507,6 +514,8 @@ def build_flash_attn_dualwave_swp_module(
                 # Cluster 7 mirrors C3 and carries m_row, l_row, v_o, and packed v_p_0.
                 if const_expr(late_dma):
                     kv_gmem_to_lds.load_k_tile(j_idx + 1, 0)
+                if const_expr(fold_pv_barriers):
+                    kv_gmem_to_lds.load_v_tile(j_idx - 1, 0)
                 if const_expr(traits.PAGED):
                     next_pageid_lds = page_ids.load_page_id_lds(j_idx)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
@@ -523,10 +532,7 @@ def build_flash_attn_dualwave_swp_module(
                     _s_setprio(0)
                 if const_expr(traits.PAGED):
                     next_pageid = page_ids.finish_page_id(next_pageid_lds)
-                if const_expr(sink_drains):
-                    _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                    _waitcnt_vm_n(ctx.VM_DRAIN_KV)
-                _dualwave_sync_barrier()
+                _pv_cluster_sync()
 
                 yield_args = [m_row, l_row] + v_o + [v_p_0[0], v_p_0[1]]
                 if const_expr(traits.PAGED):
@@ -545,6 +551,9 @@ def build_flash_attn_dualwave_swp_module(
             max_m3 = split_t_end - 3
             max_m2 = split_t_end - 2
             max_m1 = split_t_end - 1
+
+            if const_expr(fold_pv_barriers):
+                _dualwave_sync_barrier()
 
             # Epilogue C0 prefetches V, reads K, and reuses the carried vectorized page id.
             _s_nop(3)
