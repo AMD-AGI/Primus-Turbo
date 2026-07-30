@@ -3,8 +3,16 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""CPU-only tests for TuneCache offline persistence (dump_cache / load_cache)."""
+"""The dispatcher's offline tune-cache contract, on a dummy dispatcher (CPU only).
 
+What the framework promises regardless of op: a dumped cache reloads into the same
+lookups, an asset from a foreign build is ignored rather than trusted, and a pinned
+config only reaches the backend it was tuned for. Per-op behaviour lives with that op.
+"""
+
+import json
+
+import pytest
 import torch
 
 from primus_turbo.pytorch.core.backend import (
@@ -18,132 +26,104 @@ from primus_turbo.pytorch.core.backend import (
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 
 
-class _DummyTriton(KernelBackend):
+class _TritonBackend(KernelBackend):
     @staticmethod
     def can_handle(**kwargs):
         return True
 
     @staticmethod
-    def execute(**kwargs):
-        return None
+    def execute(backend_config=None, **kwargs):
+        return ("triton", backend_config)
 
 
-class _DummyCK(KernelBackend):
+class _CKBackend(KernelBackend):
     @staticmethod
     def can_handle(**kwargs):
         return True
 
     @staticmethod
-    def execute(**kwargs):
-        return None
+    def execute(backend_config=None, **kwargs):
+        return ("ck", backend_config)
 
 
-class _DummyDispatcher(AutoKernelDispatcher):
-    # Defined in the class body so __init_subclass__ keeps it (does not reset to {}).
+class _Dispatcher(AutoKernelDispatcher):
+    # Assigned in the class body so __init_subclass__ keeps it instead of resetting to {}.
     _backends = {
-        BackendType.TRITON: BackendEntry(_DummyTriton),
-        BackendType.CK: BackendEntry(_DummyCK),
+        BackendType.TRITON: BackendEntry(_TritonBackend),
+        BackendType.CK: BackendEntry(_CKBackend),
     }
 
     @classmethod
-    def make_key(cls, m, n, k, dtype, trans, gran):
-        # Mix of int / torch.dtype / bool / Enum — exercises the key codec.
-        return (m, n, k, dtype, trans, gran)
+    def make_key(cls, m, dtype=torch.bfloat16, trans=False, gran=None):
+        # int / torch.dtype / bool / Enum / None: one of each type the codec must handle.
+        return (m, dtype, trans, gran)
 
 
-def test_tune_cache_roundtrip(tmp_path):
-    d = _DummyDispatcher
-    d._cache.clear()
+@pytest.fixture(autouse=True)
+def _isolated_cache():
+    """No profiling and no cache carried between tests (the cache is class state)."""
+    _Dispatcher._cache.clear()
+    GlobalBackendManager.set_auto_tune(False)
+    yield
+    GlobalBackendManager.set_auto_tune(None)
+    _Dispatcher._cache.clear()
 
-    k1 = d.make_key(16, 2048, 4096, torch.float8_e4m3fn, True, ScalingGranularity.ROWWISE)
-    k2 = d.make_key(32, 2048, 4096, torch.bfloat16, False, ScalingGranularity.BLOCKWISE)
-    d._cache.put(k1, TuneEntry(_DummyTriton))
-    d._cache.put(k2, TuneEntry(_DummyCK))
 
-    path = tmp_path / "dummy.json"
-    assert d.dump_cache(str(path)) == 2
+def test_dumped_cache_reloads_into_the_same_lookups(tmp_path):
+    tuned = _Dispatcher.make_key(16, torch.float8_e4m3fn, True, ScalingGranularity.ROWWISE)
+    plain = _Dispatcher.make_key(32, torch.bfloat16, False, None)
+    _Dispatcher._cache.put(tuned, TuneEntry(_TritonBackend, {"BLOCK_M": 64, "num_warps": 4}))
+    _Dispatcher._cache.put(plain, TuneEntry(_CKBackend))
 
-    # Each entry is a dict with key / backend / perf.
-    import json
-
+    path = tmp_path / "cache.json"
+    assert _Dispatcher.dump_cache(str(path)) == 2
     entries = json.loads(path.read_text())["entries"]
     assert set(entries[0]) == {"key", "backend", "backend_config", "perf"}
 
-    # Fresh cache, then reload from disk.
-    d._cache.clear()
-    assert len(d._cache) == 0
-    assert d.load_cache(str(path)) == 2
+    _Dispatcher._cache.clear()
+    assert _Dispatcher.load_cache(str(path)) == 2
 
-    # Keys must round-trip to the identical hashable -> lookup hits, maps to same impl.
-    assert d._cache.get(k1).backend is _DummyTriton
-    assert d._cache.get(k2).backend is _DummyCK
-
-
-class _RetTriton(KernelBackend):
-    @staticmethod
-    def can_handle(**kwargs):
-        return True
-
-    @staticmethod
-    def execute(**kwargs):
-        return "triton"
+    # Rehydrated keys must hash equal to the originals, or every lookup silently misses.
+    assert _Dispatcher._cache.get(tuned).backend is _TritonBackend
+    assert _Dispatcher._cache.get(tuned).backend_config == {"BLOCK_M": 64, "num_warps": 4}
+    assert _Dispatcher._cache.get(plain).backend is _CKBackend
+    assert _Dispatcher._cache.get(plain).backend_config is None
 
 
-class _RetCK(KernelBackend):
-    @staticmethod
-    def can_handle(**kwargs):
-        return True
+def test_entry_naming_an_unregistered_backend_is_skipped(tmp_path):
+    """An asset built against a different backend set must not resurrect that backend."""
+    path = tmp_path / "alien.json"
+    path.write_text(
+        json.dumps(
+            {
+                "dispatcher": _Dispatcher.__name__,
+                "entries": [
+                    {
+                        "key": [8, {"__dtype__": "bfloat16"}, False, None],
+                        "backend": BackendType.AITER.name,  # valid enum, not registered here
+                        "backend_config": None,
+                        "perf": None,
+                    }
+                ],
+            }
+        )
+    )
 
-    @staticmethod
-    def execute(**kwargs):
-        return "ck"
-
-
-class _DispatchDispatcher(AutoKernelDispatcher):
-    _backends = {
-        BackendType.TRITON: BackendEntry(_RetTriton),
-        BackendType.CK: BackendEntry(_RetCK),
-    }
-
-    @classmethod
-    def make_key(cls, m):
-        return (m,)
-
-
-def test_dispatch_uses_loaded_cache():
-    d = _DispatchDispatcher
-    d._cache.clear()
-    GlobalBackendManager.set_auto_tune(False)  # deterministic: never profile (CPU-only path)
-    try:
-        # Empty cache -> falls through to the default backend (behavior unchanged).
-        assert d.dispatch(BackendType.CK, m=16) == "ck"
-
-        # Cache says TRITON for m=16 -> lookup wins over the CK default.
-        d._cache.put(d.make_key(m=16), TuneEntry(_RetTriton))
-        assert d.dispatch(BackendType.CK, m=16) == "triton"
-
-        # Un-cached key -> default backend.
-        assert d.dispatch(BackendType.CK, m=32) == "ck"
-    finally:
-        GlobalBackendManager.set_auto_tune(None)
+    assert _Dispatcher.load_cache(str(path)) == 0
+    assert len(_Dispatcher._cache) == 0
 
 
-def test_load_unknown_backend_skipped(tmp_path):
-    import json
+def test_cache_outranks_the_default_backend():
+    assert _Dispatcher.dispatch(BackendType.CK, m=16)[0] == "ck"
 
-    d = _DummyDispatcher
-    d._cache.clear()
+    _Dispatcher._cache.put(_Dispatcher.make_key(m=16), TuneEntry(_TritonBackend))
+    assert _Dispatcher.dispatch(BackendType.CK, m=16)[0] == "triton"
+    assert _Dispatcher.dispatch(BackendType.CK, m=32)[0] == "ck"  # untuned key keeps the default
 
-    path = tmp_path / "with_unknown.json"
-    payload = {
-        "dispatcher": "_DummyDispatcher",
-        "entries": [
-            # AITER not registered here
-            {"key": [8, 512, 512, {"__dtype__": "bfloat16"}, False, None], "backend": "AITER", "perf": None},
-        ],
-    }
-    path.write_text(json.dumps(payload))
 
-    # AITER is a valid BackendType but not registered in _DummyDispatcher -> skipped.
-    assert d.load_cache(str(path)) == 0
-    assert len(d._cache) == 0
+def test_pinned_config_only_reaches_the_backend_it_was_tuned_for():
+    """backend_config is opaque, so handing one backend another's config would be garbage in."""
+    _Dispatcher._cache.put(_Dispatcher.make_key(m=16), TuneEntry(_TritonBackend, {"BLOCK_M": 64}))
+
+    assert _Dispatcher.dispatch(BackendType.CK, BackendType.CK, m=16) == ("ck", None)
+    assert _Dispatcher.dispatch(BackendType.CK, BackendType.TRITON, m=16) == ("triton", {"BLOCK_M": 64})
