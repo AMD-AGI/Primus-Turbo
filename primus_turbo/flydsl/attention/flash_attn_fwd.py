@@ -63,6 +63,7 @@ def build_flash_attn_dualwave_swp_module(
     window_left=-1,
     block_m=None,
     gqa_merge=None,
+    sbhd=False,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -119,6 +120,7 @@ def build_flash_attn_dualwave_swp_module(
         window_left=window_left,
         block_m=block_m,
         gqa_merge=gqa_merge,
+        sbhd=sbhd,
     )
     traits.BLOCK_N_OUT // traits.BLOCK_N
     _dualwave_swp_cache_tag = traits.cache_tag
