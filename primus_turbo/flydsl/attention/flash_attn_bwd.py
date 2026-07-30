@@ -26,6 +26,11 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 _LOG2E = host_math.log2(host_math.e)
 
+# dkdv MFMA-accumulator AGPR forcing (amdgpu-agpr-alloc). Only a win once the body
+# is VGPR-lean; on the current body it measured -8.5% (drift-immune A/B), so it is
+# disabled here and re-evaluated after the live-transient levers land. Layout-agnostic.
+_DKDV_AGPR = 0
+
 
 def _llvm_value(value):
     if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
@@ -224,6 +229,18 @@ def build_flash_attn_bwd_dkdv_module(
     fold_lse=None,  # None = fold on the hw-exp path only (see below)
     batch_size=None,  # compile-time B; required for SBHD seq-step stride bake
     sbhd=False,       # SBHD [S,B,H,D] native layout (seq-step = B*H*D)
+    agpr=_DKDV_AGPR,  # force N MFMA accumulators into AGPRs (0 disables); layout-agnostic
+    exp_intrin=True,   # FOLD bulk exp via exp2 intrinsic anchor (vs v_min+dead-op asm).
+                       # +0.71% drift-immune once the body is VGPR-lean (spill-free);
+                       # was -1.2% on the full-MT spilling body. Layout-agnostic.
+    g2d=1,             # GEMM2 transpose-read prefetch depth (ring across dt). 1 = depth-1
+                       # baseline (best here: g2d=2 measured -0.44% -- its 2x live ring
+                       # transpose-reads cost more than the hidden latency on this 241-VGPR
+                       # body). Kept as a knob; lds_ld only.
+    lds_ld=True,       # per-half GEMM1 + LDS-staged lse/-delta (the spill-killer): halves
+                       # the live S/dP/P/dS transient and drops the +MT*2 v4f32 register
+                       # carry; False keeps the full-MT register-prefetch body (A/B arm B).
+                       # Layout-agnostic -> benefits the THD meta path identically.
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
 
@@ -326,6 +343,21 @@ def build_flash_attn_bwd_dkdv_module(
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="flash_attn_bwd_smem_dkdv")
     lds_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_off + LDS_TOTAL * 2
+
+    # LDS staging region for (-delta, lse) of the whole GQA group's q-block. One
+    # cooperative vec fetch per array (LD_ARR/BLOCK_SIZE loads) replaces MT per-head
+    # buffer_loads carried in registers, and each use point re-reads straight from
+    # LDS -- removing the +MT*2 v4f32 (~32 VGPR) carry that pinned dkdv at spill.
+    # Layout-agnostic (delta/lse are [B,Hq,S] batch-major in both THD and SBHD).
+    if lds_ld:
+        LD_HEAD_ELEMS = BLOCK_Q
+        LD_ARR_ELEMS = GQA_GROUP_SIZE * LD_HEAD_ELEMS
+        LD_ELEMS = 2 * LD_ARR_ELEMS
+        LD_THREADS_PER_HEAD = BLOCK_SIZE // GQA_GROUP_SIZE
+        LD_VEC = LD_HEAD_ELEMS // LD_THREADS_PER_HEAD
+        assert BLOCK_SIZE % GQA_GROUP_SIZE == 0 and LD_HEAD_ELEMS % LD_THREADS_PER_HEAD == 0
+        ld_off = allocator._align(allocator.ptr, 16)
+        allocator.ptr = ld_off + LD_ELEMS * 4
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def flash_attn_bwd_dkdv_kernel(
@@ -664,6 +696,16 @@ def build_flash_attn_bwd_dkdv_module(
                 )
             )
 
+        def _vexp_intrin(x):
+            # Backend-visible 2^x: emits the same v_exp_f32 but, being a recognised VALU
+            # op rather than opaque inline asm, it IS a compiler-visible read of the MFMA
+            # accumulator -- so it carries the MFMA->VALU hazard itself and anchors the v4
+            # at no extra instruction (replaces the v_min anchor + _vexp_after dead-operand
+            # trick with zero added VALU on the exp-issue-bound critical path).
+            return fx.Float32(
+                llvm.call_intrinsic(ir.F32Type.get(), "llvm.amdgcn.exp2.f32", [_raw(x)], [], [])
+            )
+
         def _p_of(s_r, lse_t, apply_mask):
             if const_expr(fold_lse):
                 assert apply_mask, "FOLD bulk uses the hazard-anchored path in _head_step"
@@ -706,19 +748,22 @@ def build_flash_attn_bwd_dkdv_module(
                     has_side_effects=True,
                 )
 
-        def _gemm_qk(a_base, b_packs, inits=None):
+        def _gemm_qk(a_base, b_packs, inits=None, mts=None):
             """S[mt][nt] (v4f32) = A(Q/dO)[mt] @ B(owned K/V)[nt]^T over D. A is
             loaded once per (mt,ks) and reused across nt. inits[mt] optionally
-            pre-loads the accumulator (folds -delta into the dP GEMM for free)."""
-            a = [
-                [
+            pre-loads the accumulator (folds -delta into the dP GEMM for free).
+            mts restricts work to a subset of the MT q-tiles (per-half GEMM1); the
+            output is keyed by mt so [2,3] halves index correctly."""
+            _mts = list(range_constexpr(MT)) if mts is None else list(mts)
+            a = {
+                mt: [
                     Vec.load(mfma_pack_type, lds, [_a_idx(a_base, mt, ks)])
                     for ks in range_constexpr(K_STEPS_QK)
                 ]
-                for mt in range_constexpr(MT)
-            ]
-            out = [[None] * NT for _ in range_constexpr(MT)]
-            for mt in range_constexpr(MT):
+                for mt in _mts
+            }
+            out = {mt: [None] * NT for mt in _mts}
+            for mt in _mts:
                 for nt in range_constexpr(NT):
                     acc = c_zero_v4f32 if inits is None else inits[mt]
                     for ks in range_constexpr(K_STEPS_QK):
@@ -786,6 +831,179 @@ def build_flash_attn_bwd_dkdv_module(
             ]
             return _d, _l
 
+        if const_expr(lds_ld):
+            ld_lds = SmemPtr(base_ptr, ld_off, fx.Float32.ir_type, shape=(LD_ELEMS,)).get()
+            # Thread t owns LD_VEC consecutive q of one GQA head.
+            _ld_head = tid // fx.Index(LD_THREADS_PER_HEAD)
+            _ld_q = (tid % fx.Index(LD_THREADS_PER_HEAD)) * fx.Index(LD_VEC)
+
+            def _stage_ld_issue(q_start):
+                # Issued BEFORE the Q/dO DMA so both HBM streams are in flight together;
+                # the LDS commit lands after the DMA, so its vmcnt wait does not serialise
+                # them (gfx950 has no vmcnt subset wait, but the counter is in-order).
+                _g = (kv_head_idx * fx.Index(GQA_GROUP_SIZE) + _ld_head) * seq_len_q_v + q_start + _ld_q
+                return [
+                    buffer_ops.buffer_load(rsrc, _g, vec_width=LD_VEC, dtype=fx.Float32)
+                    for rsrc in (delta_rsrc, lse_rsrc)
+                ]
+
+            def _stage_ld_commit(vals):
+                _lds_i = _ld_head * fx.Index(LD_HEAD_ELEMS) + _ld_q
+                for arr in range_constexpr(2):
+                    Vec(vals[arr]).store(ld_lds, [fx.Index(arr * LD_ARR_ELEMS) + _lds_i])
+
+            def _ld_read(head_local, mt, arr):
+                # v4f32 at q = head's q-block + mt*M_TILE + kg*4 (+t), matching the GEMM1
+                # accumulator C layout; lane16 is absent -> a 16-way LDS broadcast.
+                # arr=0 -> -delta (GEMM1b init), arr=1 -> prescaled lse (GEMM1a init/masked add).
+                return Vec.load(
+                    v4f32_type,
+                    ld_lds,
+                    [fx.Index(arr * LD_ARR_ELEMS + head_local * LD_HEAD_ELEMS + mt * M_TILE) + kg * fx.Index(4)],
+                ).ir_value()
+
+            def _head_step_lds(q_start, apply_mask, head_local, dv_cur, dk_cur, bases=None):
+                sb_bulk = not apply_mask  # exps only exist on these paths
+                q_head = kv_head_idx * fx.Index(GQA_GROUP_SIZE) + fx.Index(head_local)
+                q_start_i32 = fx.Int32(q_start)
+                kg_off_i32 = fx.Int32(kg) * fx.Int32(4)
+                # Stage the whole GQA group's (-delta, lse) into LDS on head 0, riding
+                # head 0's existing barrier pair; heads 1..7 re-read straight from LDS.
+                _ldv = None
+                if const_expr(head_local == 0):
+                    _ldv = _stage_ld_issue(q_start)
+                gpu.barrier()  # WAR: guard prior head's LDS reads before this head's DMA
+                if const_expr(ENABLE_DMA):
+                    coop_dma_tile(q_rsrc, q_lds_ptrs, bases, q_head)
+                    coop_dma_tile(do_rsrc, do_lds_ptrs, bases, q_head)
+                    if const_expr(head_local == 0):
+                        _stage_ld_commit(_ldv)
+                    rocdl.s_waitcnt(0)
+                else:
+                    _coop_load(q_ptr, fx.Index(0), q_start, q_head)
+                    _coop_load(do_ptr, fx.Index(LDS_DO_BASE), q_start, q_head)
+                    if const_expr(head_local == 0):
+                        _stage_ld_commit(_ldv)
+                gpu.barrier()  # DMA + ld_lds commit visible before GEMM1 reads
+
+                # GEMM1a/exp2/GEMM1b/dS/pack per q-HALF (one pks = the two mt packing into
+                # one GEMM2 K=32 step): computing/consuming/packing 2 of the MT q-tiles at a
+                # time halves the live S/dP/P/dS transient that pinned dkdv at 256 VGPR with
+                # spills, so the kernel fits spill-free. lse/-delta are pulled from LDS at
+                # their use points (only the 2 v4f32 this half consumes are ever live).
+                # Pure re-ordering -> bit-identical, det-neutral.
+                p_pack = [[None] * NT for _ in range_constexpr(PV_K_STEPS)]
+                ds_pack = [[None] * NT for _ in range_constexpr(PV_K_STEPS)]
+                do_ring, q_ring = None, None
+                for pks in range_constexpr(PV_K_STEPS):
+                    ma, mb = 2 * pks, 2 * pks + 1
+                    half = [ma, mb]
+                    if const_expr(fold_lse and not apply_mask):
+                        # FOLD unmasked: prescaled -log2e*lse is GEMM1a's C-init, so the
+                        # accumulator already IS the base-2 softmax exponent.
+                        s_tiles = _gemm_qk(
+                            fx.Index(0), k_b_packs,
+                            inits={mt: _ld_read(head_local, mt, 1) for mt in half}, mts=half,
+                        )
+                    else:
+                        s_tiles = _gemm_qk(fx.Index(0), k_b_packs, mts=half)
+                    if const_expr(sb_bulk and not exp_intrin):
+                        rocdl.sched_barrier(SCHED_TRANS)
+
+                    P = [[None] * NT for _ in range_constexpr(MT)]
+                    if const_expr(fold_lse and not apply_mask):
+                        for mt in half:
+                            for nt in range_constexpr(NT):
+                                s_v = Vec(s_tiles[mt][nt])
+                                if const_expr(exp_intrin):
+                                    P[mt][nt] = [_vexp_intrin(fx.Float32(s_v[t])) for t in range_constexpr(4)]
+                                else:
+                                    _smin_anchor = fx.Float32(
+                                        arith.minimumf(_raw(fx.Float32(s_v[0])), _raw(c_zero_f))
+                                    )
+                                    P[mt][nt] = [_vexp(_smin_anchor)] + [
+                                        _vexp_after(fx.Float32(s_v[t]), _smin_anchor)
+                                        for t in range_constexpr(1, 4)
+                                    ]
+                    else:
+                        for mt in half:
+                            lse_v = _ld_read(head_local, mt, 1)
+                            for nt in range_constexpr(NT):
+                                s_v = s_tiles[mt][nt]
+                                p_vals = []
+                                for t in range_constexpr(4):
+                                    s_r = fx.Float32(Vec(s_v)[t])
+                                    if const_expr(apply_mask):
+                                        q_slot = q_start_i32 + kg_off_i32 + fx.Int32(mt * M_TILE + t)
+                                        _up = ArithValue(kv_row_i32_of(nt) > q_slot + causal_off_i32)
+                                        if const_expr(window_left >= 0):
+                                            _lo = ArithValue(
+                                                kv_row_i32_of(nt)
+                                                <= q_slot + causal_off_i32 - fx.Int32(window_left)
+                                            )
+                                            _mm = ArithValue(arith.ori(_raw(_up), _raw(_lo)))
+                                        else:
+                                            _mm = _up
+                                        s_r = _mm.select(c_neg_inf, s_r)
+                                    p_vals.append(_p_of(s_r, fx.Float32(Vec(lse_v)[t]), apply_mask))
+                                P[mt][nt] = p_vals
+
+                    dp_tiles = _gemm_qk(
+                        fx.Index(LDS_DO_BASE), v_b_packs,
+                        inits={mt: _ld_read(head_local, mt, 0) for mt in half}, mts=half,
+                    )
+
+                    # Hoist the first g2d dt's GEMM2 transpose-reads into the last half's
+                    # dS/pack shadow: the ds_read_tr16 LDS latency overlaps that VALU block
+                    # instead of exposing at GEMM2's first MFMA.
+                    if const_expr(pks == PV_K_STEPS - 1):
+                        do_ring = [
+                            [_read_tr(fx.Index(LDS_DO_BASE), _d, _p) for _p in range_constexpr(PV_K_STEPS)]
+                            for _d in range_constexpr(g2d)
+                        ]
+                        q_ring = [
+                            [_read_tr(fx.Index(0), _d, _p) for _p in range_constexpr(PV_K_STEPS)]
+                            for _d in range_constexpr(g2d)
+                        ]
+
+                    for nt in range_constexpr(NT):
+                        _ds = [
+                            [_fmul(P[mt][nt][t], Vec(dp_tiles[mt][nt])[t]) for t in range_constexpr(4)]
+                            for mt in half
+                        ]
+                        p_pack[pks][nt] = bf16_trunc_pack_v8(P[ma][nt] + P[mb][nt])
+                        ds_pack[pks][nt] = bf16_trunc_pack_v8(_ds[0] + _ds[1])
+
+                # GEMM2a dV^T += dO_tr @ P ; GEMM2b dK^T += Q_tr @ dS. Depth-g2d dt prefetch
+                # ring: issue dt+g2d's transpose-reads before dt's MFMAs so the ds_read_tr16
+                # LDS latency hides in the MFMA shadow. g2d=1 -> depth-1 baseline.
+                rocdl.s_setprio(1)
+                for dt in range_constexpr(DT):
+                    _slot = dt % g2d
+                    do_tr, q_tr = do_ring[_slot], q_ring[_slot]
+                    if const_expr(dt + g2d < DT):
+                        do_tr_n = [
+                            _read_tr(fx.Index(LDS_DO_BASE), dt + g2d, pks)
+                            for pks in range_constexpr(PV_K_STEPS)
+                        ]
+                    for pks in range_constexpr(PV_K_STEPS):
+                        for nt in range_constexpr(NT):
+                            dv_cur[dt][nt] = mfma_acc(do_tr[pks], p_pack[pks][nt], dv_cur[dt][nt])
+                    if const_expr(dt + g2d < DT):
+                        q_tr_n = [
+                            _read_tr(fx.Index(0), dt + g2d, pks) for pks in range_constexpr(PV_K_STEPS)
+                        ]
+                    for pks in range_constexpr(PV_K_STEPS):
+                        for nt in range_constexpr(NT):
+                            dk_cur[dt][nt] = mfma_acc(q_tr[pks], ds_pack[pks][nt], dk_cur[dt][nt])
+                    if const_expr(dt + g2d < DT):
+                        for _ in range_constexpr(2 * PV_K_STEPS * NT):
+                            rocdl.sched_mfma(1)
+                            rocdl.sched_dsrd(1)
+                        do_ring[_slot], q_ring[_slot] = do_tr_n, q_tr_n
+                rocdl.s_setprio(0)
+                return dv_cur, dk_cur
+
         def _head_step(q_start, apply_mask, head_local, dv_cur, dk_cur, cur_ld, bases=None):
             sb_bulk = not apply_mask  # exps only exist on these paths
             q_head = kv_head_idx * fx.Index(GQA_GROUP_SIZE) + fx.Index(head_local)
@@ -818,8 +1036,10 @@ def build_flash_attn_bwd_dkdv_module(
                 _keepalive_v4([lse_vecs[mt] for mt in range_constexpr(MT)])
             else:
                 s_tiles = _gemm_qk(fx.Index(0), k_b_packs)
-            if const_expr(sb_bulk):
+            if const_expr(sb_bulk and not exp_intrin):
                 # Hand GEMM1b's MFMA latency to the exps alone (see SCHED_TRANS).
+                # The exp2 intrinsic anchor carries the hazard itself, so with
+                # exp_intrin this explicit TRANS barrier is redundant (dropped).
                 rocdl.sched_barrier(SCHED_TRANS)
 
             # P[mt][nt]: each 4 f32 at q=mt*16+kg*4+t, kv=nt*16+lane16.
@@ -832,10 +1052,16 @@ def build_flash_attn_bwd_dkdv_module(
                 for mt in range_constexpr(MT):
                     for nt in range_constexpr(NT):
                         s_v = Vec(s_tiles[mt][nt])
-                        _smin_anchor = fx.Float32(arith.minimumf(_raw(fx.Float32(s_v[0])), _raw(c_zero_f)))
-                        P[mt][nt] = [_vexp(_smin_anchor)] + [
-                            _vexp_after(fx.Float32(s_v[t]), _smin_anchor) for t in range_constexpr(1, 4)
-                        ]
+                        if const_expr(exp_intrin):
+                            # exp2 intrinsic is a backend-visible accumulator read -> it
+                            # anchors the MFMA->VALU hazard for the whole v4 with no extra
+                            # v_min / dead-operand VALU (the exp-issue-bound critical path).
+                            P[mt][nt] = [_vexp_intrin(fx.Float32(s_v[t])) for t in range_constexpr(4)]
+                        else:
+                            _smin_anchor = fx.Float32(arith.minimumf(_raw(fx.Float32(s_v[0])), _raw(c_zero_f)))
+                            P[mt][nt] = [_vexp(_smin_anchor)] + [
+                                _vexp_after(fx.Float32(s_v[t]), _smin_anchor) for t in range_constexpr(1, 4)
+                            ]
             else:
                 for mt in range_constexpr(MT):
                     lse_v = lse_vecs[mt]
@@ -921,15 +1147,21 @@ def build_flash_attn_bwd_dkdv_module(
             dk_cur = [
                 [inner[DT * NT + dt * NT + nt] for nt in range_constexpr(NT)] for dt in range_constexpr(DT)
             ]
-            # Prologue: prefetch head 0's lse/-delta before the head loop; each
-            # _head_step then prefetches head h+1's during head h's GEMM2 shadow.
-            cur_ld = _load_ld(q_start, 0)
             # Head-invariant DMA offsets: computed once per q-block, reused by all heads.
             _bases = _dma_bases(q_start) if const_expr(ENABLE_DMA) else None
-            for head_local in range_constexpr(GQA_GROUP_SIZE):
-                dv_cur, dk_cur, cur_ld = _head_step(
-                    q_start, apply_mask, head_local, dv_cur, dk_cur, cur_ld, bases=_bases
-                )
+            if const_expr(lds_ld):
+                for head_local in range_constexpr(GQA_GROUP_SIZE):
+                    dv_cur, dk_cur = _head_step_lds(
+                        q_start, apply_mask, head_local, dv_cur, dk_cur, bases=_bases
+                    )
+            else:
+                # Prologue: prefetch head 0's lse/-delta before the head loop; each
+                # _head_step then prefetches head h+1's during head h's GEMM2 shadow.
+                cur_ld = _load_ld(q_start, 0)
+                for head_local in range_constexpr(GQA_GROUP_SIZE):
+                    dv_cur, dk_cur, cur_ld = _head_step(
+                        q_start, apply_mask, head_local, dv_cur, dk_cur, cur_ld, bases=_bases
+                    )
             out = [dv_cur[dt][nt] for dt in range_constexpr(DT) for nt in range_constexpr(NT)]
             out += [dk_cur[dt][nt] for dt in range_constexpr(DT) for nt in range_constexpr(NT)]
             return out
@@ -1003,8 +1235,13 @@ def build_flash_attn_bwd_dkdv_module(
                 ["unsafe-fp-math", "true"],
             ]
             if const_expr(daz)
-            else None
+            else []
         )
+        if const_expr(agpr != 0):
+            passthrough_entries = passthrough_entries + [
+                ["amdgpu-agpr-alloc", f"{int(agpr)},{int(agpr)}"],
+                ["amdgpu-mfma-vgpr-form", "false"],
+            ]
         flash_attn_bwd_dkdv_kernel(
             Q,
             K,
