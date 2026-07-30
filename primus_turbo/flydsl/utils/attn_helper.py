@@ -1029,6 +1029,9 @@ class DualwaveSwpTraits:
     CROSS_SEQLEN: bool
     KV_CACHE_LAYOUT: str
     KV_VECTORIZED: bool
+    # SBHD [S, B, H, D] native layout: seq-step stride is B*H*D (passed as the
+    # runtime stride_q_n/stride_kv_n) while the per-batch base is only H*D.
+    SBHD: bool
     DEFAULT_STRIDE_Q_N: int
     DEFAULT_STRIDE_KV_N: int
     DMA_BYTES: int
@@ -1099,6 +1102,7 @@ class DualwaveSwpTraits:
             self.CROSS_SEQLEN,
             self.KV_CACHE_LAYOUT,
             self.KV_VECTORIZED,
+            self.SBHD,
         )
 
 
@@ -1125,6 +1129,7 @@ def _make_dualwave_swp_traits(
     window_left=-1,
     block_m=None,
     gqa_merge=None,
+    sbhd=False,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
@@ -1268,6 +1273,7 @@ def _make_dualwave_swp_traits(
         CROSS_SEQLEN=cross_seqlen,
         KV_CACHE_LAYOUT=kv_cache_layout,
         KV_VECTORIZED=kv_vectorized,
+        SBHD=bool(sbhd),
         DEFAULT_STRIDE_Q_N=default_stride_q_n,
         DEFAULT_STRIDE_KV_N=default_stride_kv_n,
         DMA_BYTES=dma_bytes,
@@ -1494,7 +1500,15 @@ class DualwaveKernelContext:
         qo_per_batch_elems = self.seqlen_q_v * self.stride_q_n_v
         qo_nrec_bytes = qo_per_batch_elems * fx.Index(traits.BF16_BYTES)
         qo_layout = fx.make_layout(fx.Int32(qo_per_batch_elems), fx.Int32(1))
-        q_batch_byte_off = self.q_tok_base * self.stride_q_n_v * fx.Index(traits.BF16_BYTES)
+        if const_expr(traits.SBHD):
+            # SBHD [S,B,H,D]: per-batch base is only H*D (seq-step B*H*D lives in stride_q_n).
+            q_batch_byte_off = (
+                self.batch_idx
+                * fx.Index(traits.NUM_HEADS_Q * traits.HEAD_DIM)
+                * fx.Index(traits.BF16_BYTES)
+            )
+        else:
+            q_batch_byte_off = self.q_tok_base * self.stride_q_n_v * fx.Index(traits.BF16_BYTES)
         self.q_div = _make_rebased_view(
             fx.get_iter(q_tensor),
             q_batch_byte_off,
@@ -1522,7 +1536,15 @@ class DualwaveKernelContext:
             kv_per_batch_elems = self.seqlen_kv_v * self.stride_kv_n_v
             kv_nrec_bytes = kv_per_batch_elems * fx.Index(traits.BF16_BYTES)
             kv_layout = fx.make_layout(fx.Int32(kv_per_batch_elems), fx.Int32(1))
-            kv_batch_byte_off = self.kv_tok_base * self.stride_kv_n_v * fx.Index(traits.BF16_BYTES)
+            if const_expr(traits.SBHD):
+                # SBHD [S,B,H,D]: per-batch base is only Hkv*D (seq-step B*Hkv*D lives in stride_kv_n).
+                kv_batch_byte_off = (
+                    self.batch_idx
+                    * fx.Index(traits.NUM_HEADS_KV * traits.HEAD_DIM)
+                    * fx.Index(traits.BF16_BYTES)
+                )
+            else:
+                kv_batch_byte_off = self.kv_tok_base * self.stride_kv_n_v * fx.Index(traits.BF16_BYTES)
             self.k_div = _make_rebased_view(
                 fx.get_iter(k_tensor),
                 kv_batch_byte_off,
