@@ -100,22 +100,17 @@ def logical_k(k: int, a_dtype) -> int:
     return k * _VALUES_PER_ELEMENT.get(a_dtype, 1)
 
 
-def _annotate_perf(dispatcher, perf_counts: Callable[[tuple], tuple | None]) -> None:
+def _annotate_perf(dispatcher, perf_counts: Callable[[tuple], tuple]) -> None:
     """Add tflops / gbps to every tuned entry's ``perf``.
 
     The dispatcher only times the kernel; FLOP and byte counts depend on the op's operand
-    layout, so each asset supplies its own ``perf_counts``. A key is a fingerprint, not
-    always a faithful shape, so ``perf_counts`` may return None — then only ``time_ms``
-    is reported rather than a number derived from extents that do not mean what they say.
+    layout, so each asset supplies its own ``perf_counts``.
     """
     for key, entry in dispatcher._cache.items():
         time_ms = (entry.perf or {}).get("time_ms")
         if not time_ms:
             continue
-        counts = perf_counts(key)
-        if counts is None:
-            continue
-        flops, moved = counts
+        flops, moved = perf_counts(key)
         secs = time_ms * 1e-3
         entry.perf["tflops"] = round(flops / secs / 1e12, 2)
         entry.perf["gbps"] = round(moved / secs / 1e9, 1)

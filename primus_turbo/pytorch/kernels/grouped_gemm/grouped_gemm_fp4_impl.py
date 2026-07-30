@@ -403,11 +403,9 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         **kwargs,
     ):
         bs = group_lens.shape[0]
-        # MX wgrad hands in pre-transposed operands, so both contract on the last axis
-        # and the output extents are their leading dims (same rule as
-        # grouped_gemm_fp4_variable_k_impl_meta). Reading n off b.shape[-1] here would
-        # pick up the contraction extent instead, hiding the real N. MXFP4 is the only
-        # granularity, so this needs no branch.
+        # MXFP4 is the only granularity here, so no branch. MX wgrad contracts both
+        # operands on their last axis (mirrors the meta fn), so the output extents are
+        # their leading dims, not b.shape[-1].
         lhs, rhs = (b, a) if trans_c else (a, b)
         m, n = lhs.shape[0], rhs.shape[0]
         k = a.shape[0] if trans_a else a.shape[1]

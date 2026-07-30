@@ -811,10 +811,8 @@ class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         bs = group_lens.shape[0]
         k = a.shape[0] if trans_a else a.shape[1]
         if ScalingGranularity(granularity) == ScalingGranularity.MX_BLOCKWISE:
-            # MX wgrad hands in pre-transposed operands, so both contract on the last
-            # axis and the output extents are their leading dims (same rule as
-            # grouped_gemm_fp8_variable_k_impl_meta). Reading n off b.shape[-1] here
-            # would pick up the contraction extent instead, hiding the real N.
+            # MX wgrad contracts both operands on their last axis (mirrors the meta fn),
+            # so the output extents are their leading dims, not b.shape[-1].
             lhs, rhs = (b, a) if trans_c else (a, b)
             m, n = lhs.shape[0], rhs.shape[0]
         else:
