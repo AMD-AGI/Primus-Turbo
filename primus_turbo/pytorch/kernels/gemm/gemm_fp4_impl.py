@@ -279,6 +279,7 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        backend_config=None,
     ):
         # preshuffled accepted only so the dispatcher's uniform execute(**kwargs)
         # call works; can_handle already rejected the preshuffled=True case.
@@ -293,7 +294,7 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
 _GEMM_FP4_BACKENDS = {
     BackendType.AITER: BackendEntry(GEMMFP4AITERBackend, autotune=False),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP4HipBLASLtBackend),
-    BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend, autotune=False),
+    BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend),
 }
 
 
