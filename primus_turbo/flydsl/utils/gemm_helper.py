@@ -506,6 +506,11 @@ class ScaleS2R:
 #    remap, LDS-ptr/transpose loaders, swizzle), shared by dense and grouped.
 
 
+def _res_of(op):
+    """Unwrap an op builder's single result (some rocdl builders already return one)."""
+    return op.result if hasattr(op, "result") else op
+
+
 def _readfirstlane_i32(v):
     """Force a wave-uniform-in-value i32 into an SGPR via s_readfirstlane.
 
@@ -515,10 +520,98 @@ def _readfirstlane_i32(v):
     as divergent -> the SRD lands in VGPRs -> every buffer_store_short is
     wrapped in a readfirstlane/saveexec waterfall loop. Pinning the value to
     SGPR collapses the SRD to scalar regs and drops the per-store waterfall."""
+    return ArithValue(_res_of(rocdl.readfirstlane(res=_raw(v).type, src=_raw(v))))
+
+
+# Cross-lane i32 primitives. gfx9 DPP controls: ROW_SHR|n shifts right by n inside a
+# row of 16 lanes, ROW_BCAST15/31 feed a row's last lane into the following row(s).
+_DPP_ROW_SHR = 0x110
+_DPP_ROW_BCAST15 = 0x142
+_DPP_ROW_BCAST31 = 0x143
+
+
+def _dpp_add_i32(acc, ctrl, row_mask=0xF):
+    """acc + DPP(acc, ctrl); masked-off and shifted-in lanes contribute 0."""
+    raw = _raw(acc)
+    r = rocdl.update_dpp(raw.type, _raw(fx.Int32(0)), raw, ctrl, row_mask, 0xF, True)
+    return acc + ArithValue(_res_of(r))
+
+
+def _wave_prefix_add_i32(v):
+    """Wave64 inclusive add-scan of a per-lane i32 (lane l ends with the sum of 0..l).
+
+    Six DPP steps replace the serial carry; bound_ctrl zeroes the shifted-in lanes so
+    no bank_mask trimming is needed. Requires a full EXEC mask (kernel entry)."""
+    for _sh in (1, 2, 4, 8):
+        v = _dpp_add_i32(v, _DPP_ROW_SHR + _sh)
+    v = _dpp_add_i32(v, _DPP_ROW_BCAST15, row_mask=0xA)
+    return _dpp_add_i32(v, _DPP_ROW_BCAST31, row_mask=0xC)
+
+
+def _readlane_i32(v, lane):
+    """Broadcast one lane of a per-lane i32 into an SGPR; lane must be wave-uniform."""
     raw = _raw(v)
-    r = rocdl.readfirstlane(res=raw.type, src=raw)
-    rv = r.result if hasattr(r, "result") else r
-    return ArithValue(rv)
+    return ArithValue(_res_of(rocdl.readlane(res=raw.type, src=raw, lane=lane)))
+
+
+def _wave_count_le_i32(v, bound):
+    """Number of lanes whose per-lane i32 is <= the wave-uniform bound.
+
+    One ballot plus one s_bcnt1; on a monotone table this is the index of the first
+    lane above bound, i.e. an O(1) stand-in for a G-wide boundary compare chain."""
+    m = _res_of(rocdl.ballot(res=ir.IntegerType.get_signless(64), pred=_raw(v <= bound)))
+    n = _res_of(_llvm.intr_ctpop(m))
+    return ArithValue(arith.trunci(T.i32, n))
+
+
+def _lane_load_i32(rsrc, idx):
+    """One per-lane i32 gather from a buffer resource; out-of-range lanes read 0."""
+    return ArithValue(_buffer_ops.buffer_load(rsrc, idx, vec_width=1, dtype=T.i32))
+
+
+# A lane-resident table keeps a small int32 array in the lanes of every wave instead of
+# in SGPRs (which overflow past ~64 live entries) or in LDS (which needs a publish
+# barrier and a per-lookup ds_read): entry i lives in lane i%64 of chunk i//64, so a
+# lookup is one v_readlane and a prefix sum is one wave scan.
+def _lane_tbl_load(rsrc, lane, n_entries, stride=1, first=0):
+    """Gather entries [0, n_entries) of an i32 buffer view into lane-resident chunks.
+
+    Entry i is read from i32 element ``(i + first) * stride``; lanes past the buffer
+    bound read 0."""
+    n_chunk = ceildiv(n_entries, 64)
+    return [
+        _lane_load_i32(rsrc, (lane + 64 * c + first) * stride) for c in range_constexpr(n_chunk)
+    ]
+
+
+def _lane_tbl_scan(tbl):
+    """Inclusive add-scan across a lane-resident table (chunk totals carried forward)."""
+    out = []
+    base = fx.Int32(0)
+    for v in tbl:
+        s = _wave_prefix_add_i32(v) + base
+        out.append(s)
+        base = _readlane_i32(s, 63)
+    return out
+
+
+def _lane_tbl_get(tbl, idx):
+    """Entry ``idx`` (wave-uniform, or a Python int) of a lane-resident table."""
+    if isinstance(idx, int):
+        return _readlane_i32(tbl[idx // 64], idx % 64)
+    v = _readlane_i32(tbl[0], idx)
+    for c in range(1, len(tbl)):
+        hit = idx >= fx.Int32(64 * c)
+        v = arith.select(hit, _readlane_i32(tbl[c], idx - fx.Int32(64 * c)), v)
+    return v
+
+
+def _lane_tbl_count_le(tbl, bound):
+    """Number of table entries <= ``bound``."""
+    n = _wave_count_le_i32(tbl[0], bound)
+    for c in range(1, len(tbl)):
+        n = n + _wave_count_le_i32(tbl[c], bound)
+    return n
 
 
 class StoreCPerTensor:

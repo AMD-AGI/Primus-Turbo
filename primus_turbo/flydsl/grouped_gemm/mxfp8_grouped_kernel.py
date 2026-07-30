@@ -36,7 +36,12 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     _PRESHUF_KT,
     scale_opsel,
     _emit_lds_repack,
+    _lane_tbl_count_le,
+    _lane_tbl_get,
+    _lane_tbl_load,
+    _lane_tbl_scan,
     _readfirstlane_i32,
+    _readlane_i32,
     _robust_ab_ratio,
     _robust_time,
     ceildiv,
@@ -50,10 +55,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
     _grouped_block_mn,
-    _lds_load1_i32,
-    _lds_store1_i32,
     _load_go,
-    _tree_add_i32,
     _wgrad_block_mn,
 )
 
@@ -474,8 +476,6 @@ def _build_grouped_mxfp8_nt_kernel(
     }
     if store_cshuffle:  # only allocate the staging region when the CShuffle epilogue is used
         _ss_anns["C_lds_shuffle"] = fx.Array[_cshuf_ty, _cshuf_n, 16]
-    # tile-count prefix [0, G] followed by A-scale slab prefix [G+1, 2G+1] (see the scan).
-    _ss_anns["gfind_lds"] = fx.Array[fx.Int32, 2 * (G + 1), 16]
     SharedStorage = fx.struct(type("SharedStorage", (), {"__annotations__": _ss_anns}))
 
     @flyc.kernel(known_block_size=[512, 1, 1])
@@ -494,47 +494,50 @@ def _build_grouped_mxfp8_nt_kernel(
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
         n_blocks = ceildiv_pow2(c_n, BLOCK_N)
 
-        go_pad = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
-        go_pad_div = fx.logical_divide(go_pad, fx.make_layout(1, 1))
-        go_out = fx.rocdl.make_buffer_tensor(group_offs_out, max_size=False, num_records_bytes=(G + 1) * 8)
-        go_out_div = fx.logical_divide(go_out, fx.make_layout(1, 1))
-
-        # One on-device O(G) scan (no host read): _tcs[g] = tiles owned by groups < g
-        # (TIGHT sizes), _sas[g] = 64-row A-scale slabs before group g (PADDED sizes).
-        # total_tiles = _tcs[G]. Only _tcs is pinned to SGPRs (the boundary compares need
-        # it); both prefixes are parked in LDS below so the per-tile lookup is one ds_read.
-        # Both round-ups go through ceildiv_pow2: the scan runs once per workgroup ahead of
-        # the first MFMA with nothing to overlap it, and signed floordiv would put a
-        # divide/remainder/sign-select chain on each of its 2*G steps. Pinning the loaded
-        # offsets themselves to SGPRs (moving the whole chain to the scalar port) was
-        # measured slower -- it serialises the scan on one vmcnt wait per load. Running the
-        # scan on one thread and publishing it was measured neutral: it removes the 8x wave
-        # redundancy but forces the per-tile decode into a log-G chain of dependent
-        # ds_read, which costs back what the redundancy cost.
-        _tcs = [fx.Int32(0)]
-        _sas = [fx.Int32(0)]
-        _acc = fx.Int32(0)
-        _sacc = fx.Int32(0)
-        prev = _load_go(go_out_div, 0)
-        sprev = _load_go(go_pad_div, 0)
-        for g in range_constexpr(G):
-            nxt = _load_go(go_out_div, g + 1)
-            snxt = _load_go(go_pad_div, g + 1)
-            _acc = _acc + _readfirstlane_i32(ceildiv_pow2(nxt - prev, BLOCK_M)) * n_blocks
-            _sacc = _sacc + ceildiv_pow2(snxt - sprev, 64)
-            _tcs.append(_acc)
-            _sas.append(_sacc)
-            prev = nxt
-            sprev = snxt
-        total_tiles = _tcs[G]
-        m_total_pad = sprev  # go_pad[G] = the scan's last value
+        # One on-device lane-parallel group scan (no host read). Lane g owns group g, so
+        # both prefixes -- _tcs[g] = tiles owned by groups < g (TIGHT sizes) and _sas[g]
+        # = 64-row A-scale slabs before group g (PADDED sizes) -- come out of one wave
+        # inclusive scan each and stay resident in lanes. That removes the whole serial
+        # carry: no 2*(G+1) live scalars (they overflow the SGPR file), no LDS prefix
+        # table, no publish barrier, and the per-tile decode below is a ballot instead of
+        # a G-wide compare tree. Lanes past group G-1 read out of range (0) and add
+        # nothing, so their scan value is total_tiles and they never win that compare.
+        # Both round-ups go through ceildiv_pow2: signed floordiv would put a
+        # divide/remainder/sign-select chain on every lane.
+        lane_g = fx.thread_idx.x % 64
+        go_out_rs = _buffer_ops.create_buffer_resource(
+            group_offs_out, max_size=False, num_records_bytes=(G + 1) * 8
+        )
+        go_pad_rs = _buffer_ops.create_buffer_resource(
+            group_offs, max_size=False, num_records_bytes=(G + 1) * 8
+        )
+        # int32 view of the int64 [G+1] tables: entry g is at i32 element 2*g (token
+        # offsets are < 2^31, so the high word is 0).
+        _gout0 = _lane_tbl_load(go_out_rs, lane_g, G + 1, stride=2)
+        _gout1 = _lane_tbl_load(go_out_rs, lane_g, G + 1, stride=2, first=1)
+        _gpad0 = _lane_tbl_load(go_pad_rs, lane_g, G + 1, stride=2)
+        _gpad1 = _lane_tbl_load(go_pad_rs, lane_g, G + 1, stride=2, first=1)
+        _own = [lane_g + fx.Int32(64 * c) < fx.Int32(G) for c in range_constexpr(len(_gout0))]
+        _nt = [
+            arith.select(_own[c], ceildiv_pow2(_gout1[c] - _gout0[c], BLOCK_M) * n_blocks, fx.Int32(0))
+            for c in range_constexpr(len(_gout0))
+        ]
+        _ns = [
+            arith.select(_own[c], ceildiv_pow2(_gpad1[c] - _gpad0[c], 64), fx.Int32(0))
+            for c in range_constexpr(len(_gout0))
+        ]
+        _tcs_end = _lane_tbl_scan(_nt)  # entry g = tiles owned by groups <= g
+        _sas_end = _lane_tbl_scan(_ns)
+        _tcs = [_tcs_end[c] - _nt[c] for c in range_constexpr(len(_nt))]
+        _sas = [_sas_end[c] - _ns[c] for c in range_constexpr(len(_ns))]
+        total_tiles = _readlane_i32(_tcs_end[-1], 63)
+        m_total_pad = _lane_tbl_get(_gpad0, G)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         pid = fx.block_idx.x
         nsms = fx.grid_dim.x
 
         if const_expr(not persistent):
-            total_tiles = _readfirstlane_i32(total_tiles)
             _llvm.inline_asm(
                 None,
                 [pid.ir_value(), arith._to_raw(total_tiles)],
@@ -543,28 +546,19 @@ def _build_grouped_mxfp8_nt_kernel(
                 has_side_effects=True,
             )
 
-        # Park both prefixes in LDS: keeping 2*(G+1) live scalars overflows the SGPR file
-        # and spills, and the per-tile lookup becomes one ds_read instead of a G-wide tree.
-        if fx.thread_idx.x == fx.Int32(0):
-            for g in range_constexpr(G + 1):
-                _lds_store1_i32(lds.gfind_lds.ptr, fx.Int32(g), _tcs[g])
-                _lds_store1_i32(lds.gfind_lds.ptr, fx.Int32(G + 1 + g), _sas[g])
-        rocdl.s_barrier()
-
         def _do_tile(t):
             tt = xcd_remap_pid(t, total_tiles, num_xcd)
-            # tt -> owning group: the boundary flags are monotone, so their tree-reduced
-            # sum is the group index (log-G depth, no per-tile buffer_load / select chain).
-            # Its tile base and A-scale slab base are one LDS lookup each.
-            group_idx = _tree_add_i32(
-                [arith.select(tt >= _tcs[g + 1], fx.Int32(1), fx.Int32(0)) for g in range_constexpr(G)]
-            )
-            tile_start = _lds_load1_i32(lds.gfind_lds.ptr, group_idx)
-            sa_pre = _lds_load1_i32(lds.gfind_lds.ptr, group_idx + fx.Int32(G + 1))
+            # tt -> owning group: the lane-resident tile prefix is monotone, so the
+            # number of its entries at or below tt is the group index (one ballot + one
+            # s_bcnt1). Its tile base, A-scale slab base and row bounds are one
+            # v_readlane each -- no LDS lookup and no per-tile group-offset load.
+            group_idx = _lane_tbl_count_le(_tcs_end, tt)
+            tile_start = _lane_tbl_get(_tcs, group_idx)
+            sa_pre = _lane_tbl_get(_sas, group_idx)
 
-            m_start = _load_go(go_out_div, group_idx)  # tight C base
-            m_end = _load_go(go_out_div, group_idx + 1)  # tight C end (store bound)
-            m_start_pad = _load_go(go_pad_div, group_idx)  # padded A DATA base (32-aligned)
+            m_start = _lane_tbl_get(_gout0, group_idx)  # tight C base
+            m_end = _lane_tbl_get(_gout1, group_idx)  # tight C end (store bound)
+            m_start_pad = _lane_tbl_get(_gpad0, group_idx)  # padded A DATA base (32-aligned)
             local = tt - tile_start
             local_block_m, block_n = _grouped_block_mn(
                 local, m_start, m_end, n_blocks, BLOCK_M, group_m, group_n
