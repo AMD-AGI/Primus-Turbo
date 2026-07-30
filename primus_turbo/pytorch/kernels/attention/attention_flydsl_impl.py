@@ -157,7 +157,6 @@ def flash_attn_varlen_flydsl_backward_impl(
         Hkv,
         D,
         softmax_scale,
-        fast_exp2=fast_exp2,
         window_left=window_left,
     )
 
@@ -252,7 +251,6 @@ def flash_attn_sbhd_flydsl_backward_impl(
         Hkv,
         D,
         softmax_scale,
-        fast_exp2=fast_exp2,
         window_left=window_left,
         sbhd=True,
     )

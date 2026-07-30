@@ -82,6 +82,7 @@ def build_flash_attn_bwd_odo_module(
     sm_scale=None,
     waves_per_eu=4,
     block=256,
+    sbhd=False,  # SBHD [S,B,H,D] native O/dO layout (seq-step = B*H*D)
 ):
     """Identity-delta ("odo") kernel: DELTA[b,hq,s] = -sum_d O[b,s,hq,d]*dO[b,s,hq,d].
 
@@ -133,7 +134,17 @@ def build_flash_attn_bwd_odo_module(
         do_rsrc = buffer_ops.create_buffer_resource(DO, max_size=True)
         delta_rsrc = buffer_ops.create_buffer_resource(DELTA, max_size=True)
 
-        base = row_c * fx.Index(HEAD_DIM)
+        # Decompose the flat row = ((b*S + s)*Hq + hq) once, up front: THD packs
+        # O/dO as [B,S,Hq,D] (base = row*D) but SBHD is [S,B,Hq,D] so the element
+        # base must be ((s*B + b)*Hq + hq)*D. DELTA stays batch-major [B,Hq,S].
+        hq = row_c % fx.Index(NUM_HEADS_Q)
+        tmp = row_c // fx.Index(NUM_HEADS_Q)
+        s = tmp % sl
+        b = tmp // sl
+        if const_expr(sbhd):
+            base = ((s * fx.Index(batch_size) + b) * fx.Index(NUM_HEADS_Q) + hq) * fx.Index(HEAD_DIM)
+        else:
+            base = row_c * fx.Index(HEAD_DIM)
         # Hoist the whole row's O/dO loads ahead of the reduction so all NVEC*2 dwordx4
         # loads are in flight before the first is consumed. Accumulate order is unchanged,
         # so the fp32 sum stays bit-identical (det-safe).
@@ -149,11 +160,7 @@ def build_flash_attn_bwd_odo_module(
             for i in range_constexpr(VEC):
                 acc = _fadd(acc, Vec(prod)[i])
 
-        # row = ((b*S + s)*Hq + hq)  ->  delta[b,hq,s] at (b*Hq + hq)*S + s.
-        hq = row_c % fx.Index(NUM_HEADS_Q)
-        tmp = row_c // fx.Index(NUM_HEADS_Q)
-        s = tmp % sl
-        b = tmp // sl
+        # DELTA is transposed [B,Hq,S]: delta[b,hq,s] at (b*Hq + hq)*S + s.
         delta_off = (b * fx.Index(NUM_HEADS_Q) + hq) * sl + s
         neg_acc = arith.subf(_raw(c_zero_f), _raw(acc), fastmath=fm)
         buffer_ops.buffer_store(
@@ -215,6 +222,8 @@ def build_flash_attn_bwd_dkdv_module(
     enable_dma=True,
     window_left=-1,
     fold_lse=None,  # None = fold on the hw-exp path only (see below)
+    batch_size=None,  # compile-time B; required for SBHD seq-step stride bake
+    sbhd=False,       # SBHD [S,B,H,D] native layout (seq-step = B*H*D)
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
 
@@ -287,6 +296,14 @@ def build_flash_attn_bwd_dkdv_module(
     HEAD_DIM = head_dim
     STRIDE_TOKEN_Q = NUM_HEADS_Q * HEAD_DIM
     STRIDE_TOKEN_KV = NUM_HEADS_KV * HEAD_DIM
+    # SBHD [S,B,H,D]: per-token seq step is B*H*D (batch interleaved in the seq axis)
+    # while the per-batch base is only H*D. THD/BSHD keep RD==STRIDE (dense). The
+    # dk/dv workspace is reorganized to [q_split, Skv, B, Hkv, D] so the host's
+    # slot reduction (sum over the leading q_split axis) yields SBHD contiguously.
+    if sbhd:
+        assert batch_size is not None, "SBHD dkdv needs compile-time batch_size"
+    RD_STRIDE_Q = (batch_size * STRIDE_TOKEN_Q) if sbhd else STRIDE_TOKEN_Q
+    RD_STRIDE_KV = (batch_size * STRIDE_TOKEN_KV) if sbhd else STRIDE_TOKEN_KV
 
     Q_STRIDE = HEAD_DIM
     LDS_TILE = BLOCK_Q * Q_STRIDE
@@ -399,7 +416,7 @@ def build_flash_attn_bwd_dkdv_module(
         kv_row_wave = kv_start + wave_id * ROWS_PER_WAVE_KV
 
         def global_idx_kv(token_idx, col):
-            return token_idx * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
+            return token_idx * RD_STRIDE_KV + kv_head_idx * HEAD_DIM + col
 
         def kv_row_of(nt):
             return kv_row_wave + fx.Index(nt * N_TILE) + lane16
@@ -407,8 +424,12 @@ def build_flash_attn_bwd_dkdv_module(
         def kv_row_i32_of(nt):
             return fx.Int32(kv_row_of(nt))
 
-        # Fold per-batch element offset into raw Q/dO pointers (0-based rows).
-        _q_ptr_batch_off = batch_idx * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q)
+        # Per-batch base (elements). SBHD: batch inside the seq axis -> base is only
+        # H*D. THD: dense per-batch block -> base is seq*H*D.
+        if const_expr(sbhd):
+            _q_ptr_batch_off = batch_idx * fx.Index(STRIDE_TOKEN_Q)
+        else:
+            _q_ptr_batch_off = batch_idx * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q)
         q_ptr = buffer_ops.get_element_ptr(q_ptr, _q_ptr_batch_off, elem_type=elem_type)
         do_ptr = buffer_ops.get_element_ptr(do_ptr, _q_ptr_batch_off, elem_type=elem_type)
 
@@ -417,7 +438,7 @@ def build_flash_attn_bwd_dkdv_module(
         load_col_base = load_lane_in_row * VEC_WIDTH
 
         def global_idx_q(token_idx, col, q_head):
-            return token_idx * STRIDE_TOKEN_Q + q_head * HEAD_DIM + col
+            return token_idx * RD_STRIDE_Q + q_head * HEAD_DIM + col
 
         def _q_row_clamp(row_idx):
             last = seq_len_q_v - fx.Index(1)
@@ -464,10 +485,13 @@ def build_flash_attn_bwd_dkdv_module(
                     Vec(vec).store(lds, [base + lds_row * Q_STRIDE + swz_col])
 
         # ---- Per-batch descriptors (batch base folded into SRD base). ----
-        _q_nrec_bytes = _raw(seq_len_q_v * fx.Index(STRIDE_TOKEN_Q * 2))
-        _q_batch_byte_off = _raw(batch_idx * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q * 2))
-        _kv_nrec_bytes = _raw(seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
-        _kv_batch_byte_off = _raw(batch_idx * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
+        _q_nrec_bytes = _raw(seq_len_q_v * fx.Index(RD_STRIDE_Q * 2))
+        _q_batch_byte_off = _raw(_q_ptr_batch_off * fx.Index(2))
+        _kv_nrec_bytes = _raw(seq_len_k_v * fx.Index(RD_STRIDE_KV * 2))
+        if const_expr(sbhd):
+            _kv_batch_byte_off = _raw(batch_idx * fx.Index(STRIDE_TOKEN_KV * 2))
+        else:
+            _kv_batch_byte_off = _raw(batch_idx * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
         k_rsrc = buffer_ops.create_buffer_resource(
             K, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_kv_batch_byte_off
         )
@@ -476,8 +500,16 @@ def build_flash_attn_bwd_dkdv_module(
         )
         # DK/DV point at this split's slot of the [B, q_split, S, Hkv, D] workspace
         # (slot index = batch*q_split + split_idx); one WG writes it exactly once.
-        _ws_slot = batch_idx * fx.Index(Q_SPLIT) + split_idx
-        _dkv_ws_byte_off = _raw(_ws_slot * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
+        if const_expr(sbhd):
+            # [q_split, Skv, B, Hkv, D]: slot base = split*Skv*(B*Hkv*D) + batch*(Hkv*D).
+            # Token stride inside a slot is RD_STRIDE_KV (B*Hkv*D) == global_idx_kv step.
+            _dkv_ws_byte_off = _raw(
+                (split_idx * seq_len_k_v * fx.Index(RD_STRIDE_KV) + batch_idx * fx.Index(STRIDE_TOKEN_KV))
+                * fx.Index(2)
+            )
+        else:
+            _ws_slot = batch_idx * fx.Index(Q_SPLIT) + split_idx
+            _dkv_ws_byte_off = _raw(_ws_slot * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
         dk_rsrc = buffer_ops.create_buffer_resource(
             DK, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_dkv_ws_byte_off
         )
@@ -550,7 +582,7 @@ def build_flash_attn_bwd_dkdv_module(
                     unsw_col_f16 = position ^ xor_mask  # real col in [0,64), 1x HBM
                     col_byte = unsw_col_f16 * 2
                     global_row = tile_start + row_in_tile
-                    bases.append(global_row * fx.Index(STRIDE_TOKEN_Q * 2) + col_byte)
+                    bases.append(global_row * fx.Index(RD_STRIDE_Q * 2) + col_byte)
                 return bases
 
             q_lds_ptrs = _dma_lds_ptrs(lds_base_idx)
@@ -1031,6 +1063,8 @@ def build_flash_attn_bwd_dq_module(
     enable_dma=True,
     window_left=-1,
     fold_lse=None,  # None = fold on the hw-exp path only (see below)
+    batch_size=None,  # compile-time B; required for SBHD seq-step stride bake
+    sbhd=False,       # SBHD [S,B,H,D] native layout (seq-step = B*H*D)
 ):
     """Build the dQ Q-outer backward launcher (16x16x32 mirror of dkdv).
 
@@ -1095,6 +1129,12 @@ def build_flash_attn_bwd_dq_module(
     HEAD_DIM = head_dim
     STRIDE_TOKEN_Q = NUM_HEADS_Q * HEAD_DIM
     STRIDE_TOKEN_KV = NUM_HEADS_KV * HEAD_DIM
+    # SBHD [S,B,H,D]: per-token seq step is B*H*D (batch interleaved in the seq axis)
+    # while the per-batch base is only H*D. THD/BSHD keep RD==STRIDE (dense).
+    if sbhd:
+        assert batch_size is not None, "SBHD dq needs compile-time batch_size"
+    RD_STRIDE_Q = (batch_size * STRIDE_TOKEN_Q) if sbhd else STRIDE_TOKEN_Q
+    RD_STRIDE_KV = (batch_size * STRIDE_TOKEN_KV) if sbhd else STRIDE_TOKEN_KV
 
     K_STRIDE = HEAD_DIM
     LDS_TILE = BLOCK_KV * K_STRIDE
@@ -1217,16 +1257,25 @@ def build_flash_attn_bwd_dq_module(
         _q_owned_end = _q_raw + fx.Index(BLOCK_M) - _q_shift  # exclusive, always > q_start
         _q_store_end = fx.Index(ArithValue(_q_owned_end < seq_len_q_v).select(_q_owned_end, seq_len_q_v))
 
+        # Per-batch base (elements). SBHD: batch inside the seq axis -> base is only
+        # H*D. THD: dense per-batch block -> base is seq*H*D.
+        if const_expr(sbhd):
+            _q_batch_elems = batch_idx * fx.Index(STRIDE_TOKEN_Q)
+            _kv_batch_elems = batch_idx * fx.Index(STRIDE_TOKEN_KV)
+        else:
+            _q_batch_elems = batch_idx * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q)
+            _kv_batch_elems = batch_idx * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV)
+
         # Fold per-batch element offset into raw K/V pointers (0-based rows).
-        _kv_ptr_batch_off = batch_idx * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV)
+        _kv_ptr_batch_off = _kv_batch_elems
         k_ptr = buffer_ops.get_element_ptr(k_ptr, _kv_ptr_batch_off, elem_type=elem_type)
         v_ptr = buffer_ops.get_element_ptr(v_ptr, _kv_ptr_batch_off, elem_type=elem_type)
 
         def global_idx_q(token_idx, col):
-            return token_idx * STRIDE_TOKEN_Q + q_head_idx * HEAD_DIM + col
+            return token_idx * RD_STRIDE_Q + q_head_idx * HEAD_DIM + col
 
         def global_idx_kv(token_idx, col):
-            return token_idx * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
+            return token_idx * RD_STRIDE_KV + kv_head_idx * HEAD_DIM + col
 
         def bf16_trunc_pack_v8(f32_vals):
             pairs = [
@@ -1247,10 +1296,10 @@ def build_flash_attn_bwd_dq_module(
             return col_idx ^ mask
 
         # ---- Per-batch descriptors (batch base folded into SRD base). ----
-        _q_nrec_bytes = _raw(seq_len_q_v * fx.Index(STRIDE_TOKEN_Q * 2))
-        _q_batch_byte_off = _raw(batch_idx * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q * 2))
-        _kv_nrec_bytes = _raw(seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
-        _kv_batch_byte_off = _raw(batch_idx * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
+        _q_nrec_bytes = _raw(seq_len_q_v * fx.Index(RD_STRIDE_Q * 2))
+        _q_batch_byte_off = _raw(_q_batch_elems * fx.Index(2))
+        _kv_nrec_bytes = _raw(seq_len_k_v * fx.Index(RD_STRIDE_KV * 2))
+        _kv_batch_byte_off = _raw(_kv_batch_elems * fx.Index(2))
         q_rsrc = buffer_ops.create_buffer_resource(
             Q, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
         )
@@ -1315,7 +1364,7 @@ def build_flash_attn_bwd_dq_module(
                     col_byte = unsw_col_f16 * 2
                     global_row = tile_start + row_in_tile
                     global_byte = (
-                        global_row * fx.Index(STRIDE_TOKEN_KV * 2)
+                        global_row * fx.Index(RD_STRIDE_KV * 2)
                         + kv_head_idx * fx.Index(HEAD_DIM * 2)
                         + col_byte
                     )
@@ -1808,8 +1857,8 @@ def _dq_block_kv(Sq):
 _BWD_CACHE: dict = {}
 
 
-def _get_bwd(Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64):
-    key = (Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv)
+def _get_bwd(Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64, batch_size=None, sbhd=False):
+    key = (Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv, batch_size, sbhd)
     launchers = _BWD_CACHE.get(key)
     if launchers is None:
         common = dict(
@@ -1822,9 +1871,15 @@ def _get_bwd(Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64):
             window_left=window_left,
         )
         launchers = (
-            build_flash_attn_bwd_dq_module(block_kv=dq_block_kv, waves_per_eu=1, **common),
-            build_flash_attn_bwd_dkdv_module(q_split=q_split, block_kv=block_kv, **common),
-            build_flash_attn_bwd_odo_module(num_heads=Hq, head_dim=D, num_kv_heads=Hkv, sm_scale=scale),
+            build_flash_attn_bwd_dq_module(
+                block_kv=dq_block_kv, waves_per_eu=1, batch_size=batch_size, sbhd=sbhd, **common
+            ),
+            build_flash_attn_bwd_dkdv_module(
+                q_split=q_split, block_kv=block_kv, batch_size=batch_size, sbhd=sbhd, **common
+            ),
+            build_flash_attn_bwd_odo_module(
+                num_heads=Hq, head_dim=D, num_kv_heads=Hkv, sm_scale=scale, sbhd=sbhd
+            ),
         )
         _BWD_CACHE[key] = launchers
     return launchers
@@ -1835,13 +1890,20 @@ def _prescale_lse(lse_bhsq):
     return (lse_bhsq.float() * (-_LOG2E)).contiguous()
 
 
-def flydsl_varlen_backward(dout, q, k, v, out, lse_bhsq, B, Sq, Skv, Hq, Hkv, D, scale, window_left=-1):
-    """Run the 16x16x32 flydsl bwd. THD-flat/contiguous tensors.
-    q,dout,dq,out:[B*Sq,Hq,D]; k,v,dk,dv:[B*Skv,Hkv,D]; lse_bhsq:[B,Hq,Sq] f32.
+def flydsl_varlen_backward(
+    dout, q, k, v, out, lse_bhsq, B, Sq, Skv, Hq, Hkv, D, scale, window_left=-1, sbhd=False
+):
+    """Run the 16x16x32 flydsl bwd.
+    THD (sbhd=False): q,dout,dq,out:[B*Sq,Hq,D]; k,v,dk,dv:[B*Skv,Hkv,D].
+    SBHD (sbhd=True): q,dout,dq,out:[Sq,B,Hq,D]; k,v,dk,dv:[Skv,B,Hkv,D] (native,
+    no permute/copy anywhere -- the kernels address SBHD directly and the dk/dv
+    workspace is laid out [q_split,Skv,B,Hkv,D] so the slot reduction is contiguous).
+    lse_bhsq:[B,Hq,Sq] f32 (batch-major, layout-independent).
     window_left>=0 = sliding-window causal (valid q+off-W < kv <= q+off)."""
     q_split = _qsplit_for(Sq)
     dq_l, dkdv_l, odo_l = _get_bwd(
-        Hq, Hkv, D, scale, window_left, q_split, _blockkv_for(Skv), _dq_block_kv(Sq)
+        Hq, Hkv, D, scale, window_left, q_split, _blockkv_for(Skv), _dq_block_kv(Sq),
+        batch_size=B, sbhd=sbhd,
     )
     st = torch.cuda.current_stream()
     # identity delta = -rowsum(O.dO); both kernels center dP by it (exact). odo reads
@@ -1851,12 +1913,23 @@ def flydsl_varlen_backward(dout, q, k, v, out, lse_bhsq, B, Sq, Skv, Hq, Hkv, D,
     lse_s = _prescale_lse(lse_bhsq)
     dq = torch.empty_like(q)
     k16 = torch.empty(1, device=q.device, dtype=q.dtype)  # unused kernel arg
-    ws_dk = torch.empty(B, q_split, Skv, Hkv, D, device=q.device, dtype=k.dtype)
-    ws_dv = torch.empty(B, q_split, Skv, Hkv, D, device=q.device, dtype=v.dtype)
+    # SBHD workspace [q_split,Skv,B,Hkv,D]: summing the leading q_split axis yields
+    # [Skv,B,Hkv,D] contiguous == native SBHD dk/dv (no permute). THD keeps
+    # [B,q_split,Skv,Hkv,D] -> sum(dim=1) -> [B*Skv,Hkv,D].
+    if sbhd:
+        ws_dk = torch.empty(q_split, Skv, B, Hkv, D, device=q.device, dtype=k.dtype)
+        ws_dv = torch.empty(q_split, Skv, B, Hkv, D, device=q.device, dtype=v.dtype)
+    else:
+        ws_dk = torch.empty(B, q_split, Skv, Hkv, D, device=q.device, dtype=k.dtype)
+        ws_dv = torch.empty(B, q_split, Skv, Hkv, D, device=q.device, dtype=v.dtype)
     qf, kf, vf, dof = q.reshape(-1), k.reshape(-1), v.reshape(-1), dout.reshape(-1)
     lsef, df = lse_s.reshape(-1), delta.reshape(-1)
     dq_l(qf, kf, vf, dof, lsef, df, dq.reshape(-1), k16, B, Sq, Skv, st)
     dkdv_l(qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1), B, Sq, Skv, st)
-    dk = ws_dk.sum(dim=1).reshape(B * Skv, Hkv, D)
-    dv = ws_dv.sum(dim=1).reshape(B * Skv, Hkv, D)
+    if sbhd:
+        dk = ws_dk.sum(dim=0)  # [Skv,B,Hkv,D] SBHD contiguous
+        dv = ws_dv.sum(dim=0)
+    else:
+        dk = ws_dk.sum(dim=1).reshape(B * Skv, Hkv, D)
+        dv = ws_dv.sum(dim=1).reshape(B * Skv, Hkv, D)
     return dq, dk, dv
