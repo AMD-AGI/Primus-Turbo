@@ -90,7 +90,6 @@ def bench_one(S):
         waves_per_eu=2,
         dualwave_swp_setprio=True,
         dualwave_swp_enable_stagger=False,  # stagger OFF
-        dualwave_swp_lazy_rescale=True,
         block_m=128,  # 4-wave
     )
     st = torch.cuda.current_stream()
@@ -133,7 +132,6 @@ def bench_meta(Hq, Hkv, Sq, Skv, W):
         waves_per_eu=2,
         dualwave_swp_setprio=True,
         dualwave_swp_enable_stagger=False,
-        dualwave_swp_lazy_rescale=True,
         window_left=W,
         block_m=128,
     )
