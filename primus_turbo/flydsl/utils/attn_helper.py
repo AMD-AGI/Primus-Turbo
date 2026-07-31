@@ -342,6 +342,7 @@ class DualwaveSwpTraits:
             self.VARLEN,
             self.CROSS_SEQLEN,
             self.SBHD,
+            self.HAS_SINK,
         )
 
 
@@ -363,6 +364,7 @@ def _make_dualwave_swp_traits(
     block_m=None,
     gqa_merge=None,
     sbhd=False,
+    has_sink=False,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
@@ -449,6 +451,7 @@ def _make_dualwave_swp_traits(
         VARLEN=varlen,
         CROSS_SEQLEN=cross_seqlen,
         SBHD=bool(sbhd),
+        HAS_SINK=bool(has_sink),
         DEFAULT_STRIDE_Q_N=num_heads * head_dim,
         DEFAULT_STRIDE_KV_N=num_kv_heads * head_dim,
         DMA_BYTES=16,
@@ -508,8 +511,10 @@ class DualwaveKernelContext:
         stride_kv_n=None,
         head_dim_runtime=None,
         block_table_stride=None,
+        SINK=None,
     ):
         self.traits = traits
+        self.SINK = SINK
         self.Q = Q
         self.K = K
         self.V = V
@@ -699,6 +704,21 @@ class DualwaveKernelContext:
             )
         else:
             self.lse_rsrc = None
+
+        # Learned attention sink: one fp32 scalar per q-head, folded into the online-softmax
+        # denominator in the epilogue (virtual key with logit=sink_h, value=0). q_head_idx is
+        # wave-uniform, so this is a scalar load shared by all lanes of the wave.
+        if const_expr(traits.HAS_SINK):
+            _sink_rsrc = buffer_ops.create_buffer_resource(
+                self.SINK,
+                max_size=False,
+                num_records_bytes=as_mlir_value(fx.Index(traits.NUM_HEADS_Q) * fx.Index(4)),
+            )
+            self.sink_h = fx.Float32(
+                buffer_ops.buffer_load(_sink_rsrc, self.q_head_idx, vec_width=1, dtype=fx.Float32)
+            )
+        else:
+            self.sink_h = None
 
         self.load_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
@@ -981,6 +1001,27 @@ class DualwaveKernelContext:
     def safe_l_inv(self, l_row):
         l_inv = rocdl.rcp(T.f32, as_mlir_value(l_row))
         return ArithValue(fx.Float32(l_row) > self.c_zero_f).select(l_inv, self.c_zero_f)
+
+    def finalize_o_scale(self, m_row, l_row):
+        """Return (o_scale, m_out, l_out): the normalizing scale applied to the unnormalized O
+        and the (max, denom) pair to store as LSE. m_row/l_row are in the log2 domain
+        (l_row = sum_j 2^(s_j - m_row)).
+
+        With HAS_SINK, fold the learned per-head sink (a virtual key with logit=sink_h,
+        value=0) into the denominator, mirroring sparse_mla_fwd._epi_scalars:
+            mf = max(m_row, sink_log2);  af = 2^(m_row-mf);  st = 2^(sink_log2-mf)
+            l_out = l_row*af + st;  O *= af/l_out  (sink's value=0 -> no O contribution)
+        Without HAS_SINK, af==1 and mf==m_row, so this is byte-identical to the plain 1/l path."""
+        if const_expr(self.traits.HAS_SINK):
+            fm = self.fm_fast
+            sink_log2 = _fmul(self.sink_h, fx.Float32(_LOG2E), fm)
+            mf = fx.Float32(_fmax(m_row, sink_log2, fm))
+            af = fx.Float32(rocdl.exp2(T.f32, _fsub(m_row, mf, fm)))
+            st = fx.Float32(rocdl.exp2(T.f32, _fsub(sink_log2, mf, fm)))
+            l_out = fx.Float32(_fadd(_fmul(l_row, af, fm), st, fm))
+            o_scale = fx.Float32(_fmul(af, self.safe_l_inv(l_out), fm))
+            return o_scale, mf, l_out
+        return self.safe_l_inv(l_row), m_row, l_row
 
     def scale_o(self, v_o, scale_scalar):
         scale_vec = Vec.from_elements([scale_scalar], fx.Float32).broadcast_to(16)

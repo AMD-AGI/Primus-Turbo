@@ -235,6 +235,11 @@ def build_flash_attn_bwd_dkdv_module(
     # g2d: GEMM2 transpose-read prefetch depth (ring across dt). Depth-1 wins -- a deeper
     # ring's extra live transpose-reads outweigh the latency it hides on this body.
     g2d=1,
+    # sched_strategy: LLVM amdgpu-sched-strategy override (None = compiler default). At D128
+    # the GEMM2 ds_read_tr16 transpose-reads are latency-bound and scattered across compute
+    # clusters (LdsUtil/MfmaUtil both <60%); "max-memory-clause" clusters those LDS reads to
+    # hide their latency. D64 (MfmaUtil-bound) keeps None -> byte-identical.
+    sched_strategy=None,
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
 
@@ -482,10 +487,15 @@ def build_flash_attn_bwd_dkdv_module(
                 Vec.from_elements([fx.Int32(_raw(p)) for p in pairs], fx.Int32).bitcast(elem_dtype).ir_value()
             )
 
-        PBLK = 128  # 128-wide block holds 2 real rows (low r&4=0 -> [0,64), high -> [64,128))
+        # D64 packs 2 real rows into one 128-wide LDS block (low r&4=0 -> [0,64),
+        # high -> [64,128)); D128 is already 128-wide, so one row == one block.
+        PACK_2ROW = HEAD_DIM == 64  # host bool; gate tracer branches with const_expr()
+        PBLK = 128 if PACK_2ROW else HEAD_DIM
 
         def _pblk(row_idx):
-            return ((row_idx >> fx.Index(3)) << fx.Index(2)) | (row_idx & fx.Index(3))
+            if const_expr(PACK_2ROW):
+                return ((row_idx >> fx.Index(3)) << fx.Index(2)) | (row_idx & fx.Index(3))
+            return row_idx
 
         def _swizzle(row_idx, col_idx):
             mask = (row_idx & fx.Index(7)) << fx.Index(4)
@@ -565,9 +575,11 @@ def build_flash_attn_bwd_dkdv_module(
             lds_base_idx = buffer_ops.extract_base_index(lds, address_space=3)
             DMA_BYTES = 16
             DMA_BATCH_BYTES = BLOCK_SIZE * DMA_BYTES
-            Q_TILE_BYTES = (BLOCK_Q // 2) * 128 * 2
+            # D64: (BLOCK_Q/2) blocks, 2 rows each. D128: BLOCK_Q blocks, 1 row each.
+            # BLOCK_Q*HEAD_DIM*2 covers both (D64: 64*64*2 == 32*128*2).
+            Q_TILE_BYTES = BLOCK_Q * HEAD_DIM * 2
             NUM_DMA_Q = Q_TILE_BYTES // DMA_BATCH_BYTES
-            ROWS_PER_DMA_BATCH = DMA_BATCH_BYTES // (128 * 2)  # blocks per batch
+            ROWS_PER_DMA_BATCH = DMA_BATCH_BYTES // (128 * 2)  # 128-wide blocks per batch
             _dma_size = fx.Int32(DMA_BYTES)
             _dma_soff = fx.Int32(0)
             _dma_off = fx.Int32(0)
@@ -598,13 +610,18 @@ def build_flash_attn_bwd_dkdv_module(
                 for d in range_constexpr(NUM_DMA_Q):
                     block = tid // fx.Index(16) + fx.Index(d * ROWS_PER_DMA_BATCH)
                     lane_in_block = tid % fx.Index(16)
-                    half = lane_in_block // fx.Index(8)
                     position = lane_in_block * fx.Index(8)  # swiz col within 128-block
-                    row_in_tile = (
-                        fx.Index(8) * (block >> fx.Index(2)) + (block & fx.Index(3)) + half * fx.Index(4)
-                    )
+                    if const_expr(PACK_2ROW):
+                        # D64: block holds 2 rows; 8 lanes/half, real col in [0,64).
+                        half = lane_in_block // fx.Index(8)
+                        row_in_tile = (
+                            fx.Index(8) * (block >> fx.Index(2)) + (block & fx.Index(3)) + half * fx.Index(4)
+                        )
+                    else:
+                        # D128: block == row; 16 lanes span the full 128-wide row.
+                        row_in_tile = block
                     xor_mask = (row_in_tile & fx.Index(7)) << fx.Index(4)
-                    unsw_col_f16 = position ^ xor_mask  # real col in [0,64), 1x HBM
+                    unsw_col_f16 = position ^ xor_mask  # real col (1x HBM)
                     col_byte = unsw_col_f16 * 2
                     global_row = tile_start + row_in_tile
                     bases.append(global_row * fx.Index(RD_STRIDE_Q * 2) + col_byte)
@@ -742,9 +759,8 @@ def build_flash_attn_bwd_dkdv_module(
                 )
 
         def _gemm_qk(a_base, b_packs, inits=None, mts=None):
-            """S[mt][nt] (v4f32) = A(Q/dO)[mt] @ B(owned K/V)[nt]^T over D. A is
-            loaded once per (mt,ks) and reused across nt. inits[mt] optionally
-            pre-loads the accumulator (folds -delta into the dP GEMM for free).
+            """S[mt][nt] (v4f32) = A(Q/dO)[mt] @ B(owned K/V)[nt]^T over D. inits[mt]
+            optionally pre-loads the accumulator (folds -delta into the dP GEMM for free).
             mts restricts work to a subset of the MT q-tiles (per-half GEMM1); the
             output is keyed by mt so [2,3] halves index correctly."""
             _mts = list(range_constexpr(MT)) if mts is None else list(mts)
@@ -876,7 +892,11 @@ def build_flash_attn_bwd_dkdv_module(
                         mts=half,
                     )
                 else:
-                    s_tiles = _gemm_qk(fx.Index(0), k_b_packs, mts=half)
+                    s_tiles = _gemm_qk(
+                        fx.Index(0),
+                        k_b_packs,
+                        mts=half,
+                    )
                 if const_expr(sb_bulk and not exp_intrin):
                     rocdl.sched_barrier(SCHED_TRANS)
 
@@ -907,9 +927,11 @@ def build_flash_attn_bwd_dkdv_module(
                                     q_slot = q_start_i32 + kg_off_i32 + fx.Int32(mt * M_TILE + t)
                                     _up = ArithValue(kv_row_i32_of(nt) > q_slot + causal_off_i32)
                                     if const_expr(window_left >= 0):
+                                        # keep kv >= q+off-W (W+1 keys), matching the fwd
+                                        # SWA edge; strict '<' -> the boundary key q+off-W stays.
                                         _lo = ArithValue(
                                             kv_row_i32_of(nt)
-                                            <= q_slot + causal_off_i32 - fx.Int32(window_left)
+                                            < q_slot + causal_off_i32 - fx.Int32(window_left)
                                         )
                                         _mm = ArithValue(arith.ori(_raw(_up), _raw(_lo)))
                                     else:
@@ -927,7 +949,7 @@ def build_flash_attn_bwd_dkdv_module(
 
                 # Hoist the first g2d dt's GEMM2 transpose-reads into the last half's
                 # dS/pack shadow: the ds_read_tr16 LDS latency overlaps that VALU block
-                # instead of exposing at GEMM2's first MFMA.
+                # instead of exposing at GEMM2's first MFMA. dV reads dO_tr, dK reads Q_tr.
                 if const_expr(pks == PV_K_STEPS - 1):
                     do_ring = [
                         [_read_tr(fx.Index(LDS_DO_BASE), _d, _p) for _p in range_constexpr(PV_K_STEPS)]
@@ -949,10 +971,12 @@ def build_flash_attn_bwd_dkdv_module(
             # GEMM2a dV^T += dO_tr @ P ; GEMM2b dK^T += Q_tr @ dS. Depth-g2d dt prefetch
             # ring: issue dt+g2d's transpose-reads before dt's MFMAs so the ds_read_tr16
             # LDS latency hides in the MFMA shadow. g2d=1 -> depth-1 baseline.
+            _n_out = 2  # sched-hint scale: 1 op-stream per output (dV + dK)
             rocdl.s_setprio(1)
             for dt in range_constexpr(DT):
                 _slot = dt % g2d
-                do_tr, q_tr = do_ring[_slot], q_ring[_slot]
+                do_tr = do_ring[_slot]
+                q_tr = q_ring[_slot]
                 if const_expr(dt + g2d < DT):
                     do_tr_n = [
                         _read_tr(fx.Index(LDS_DO_BASE), dt + g2d, pks) for pks in range_constexpr(PV_K_STEPS)
@@ -966,17 +990,20 @@ def build_flash_attn_bwd_dkdv_module(
                     for nt in range_constexpr(NT):
                         dk_cur[dt][nt] = mfma_acc(q_tr[pks], ds_pack[pks][nt], dk_cur[dt][nt])
                 if const_expr(dt + g2d < DT):
-                    for _ in range_constexpr(2 * PV_K_STEPS * NT):
+                    for _ in range_constexpr(_n_out * PV_K_STEPS * NT):
                         rocdl.sched_mfma(1)
                         rocdl.sched_dsrd(1)
-                    do_ring[_slot], q_ring[_slot] = do_tr_n, q_tr_n
+                    do_ring[_slot] = do_tr_n
+                    q_ring[_slot] = q_tr_n
             rocdl.s_setprio(0)
             return dv_cur, dk_cur
 
         def _q_body(q_start, inner, apply_mask):
+            # inner (loop-carried) = [dv accs][dk accs].
+            _dk_base = DT * NT
             dv_cur = [[inner[dt * NT + nt] for nt in range_constexpr(NT)] for dt in range_constexpr(DT)]
             dk_cur = [
-                [inner[DT * NT + dt * NT + nt] for nt in range_constexpr(NT)] for dt in range_constexpr(DT)
+                [inner[_dk_base + dt * NT + nt] for nt in range_constexpr(NT)] for dt in range_constexpr(DT)
             ]
             # Head-invariant DMA offsets: computed once per q-block, reused by all heads.
             _bases = _dma_bases(q_start) if const_expr(ENABLE_DMA) else None
@@ -998,8 +1025,9 @@ def build_flash_attn_bwd_dkdv_module(
                 loop_results = yield _q_body(q_start, inner, True)
             for q_start, inner in range(_unmask_start, seq_len_q_v, _step, init=loop_results):
                 loop_results = yield _q_body(q_start, inner, False)
+        _dk_base = DT * NT
         dv_accs = [loop_results[i] for i in range_constexpr(DT * NT)]
-        dk_accs = [loop_results[DT * NT + i] for i in range_constexpr(DT * NT)]
+        dk_accs = [loop_results[_dk_base + i] for i in range_constexpr(DT * NT)]
 
         # ---- Store dV[kv,D], dK[kv,D]. The 16x16 C-layout gives each lane 4
         # CONTIGUOUS D values (D = dt*16 + kg*4 + t) at kv = nt*16 + lane16, so the
@@ -1091,6 +1119,8 @@ def build_flash_attn_bwd_dkdv_module(
         # misched hides the gradient-GEMM MFMAs in the exp2/reduce VALU shadow.
         "llvm_options": {"enable-post-misched": True, "lsr-drop-solution": True},
     }
+    if sched_strategy is not None:
+        _hints["llvm_options"]["amdgpu-sched-strategy"] = sched_strategy
 
     _compiled: dict = {}
 
@@ -1123,6 +1153,7 @@ def build_flash_attn_bwd_dq_module(
     batch_size=None,  # compile-time B; required for SBHD seq-step stride bake
     sbhd=False,  # SBHD [S,B,H,D] native layout (seq-step = B*H*D)
     fuse_delta=False,  # compute DELTA here from O (K16 slot) instead of a separate odo pass
+    block_m=192,  # q rows per work-group (owned); must be a multiple of 64
 ):
     """Build the dQ Q-outer backward launcher (16x16x32 mirror of dkdv).
 
@@ -1147,7 +1178,7 @@ def build_flash_attn_bwd_dq_module(
         num_kv_heads = num_heads
     assert num_heads % num_kv_heads == 0
 
-    BLOCK_M = 192  # q rows per work-group (owned)
+    BLOCK_M = block_m  # q rows per work-group (owned)
     WARP_SIZE = 64
     NUM_XCD = 8  # gfx950 XCDs; the dispatcher hands block_id to xcd = block_id % NUM_XCD
     BLOCK_KV = block_kv  # kv rows per loop iteration (LDS tile)
@@ -1350,10 +1381,15 @@ def build_flash_attn_bwd_dq_module(
                 Vec.from_elements([fx.Int32(_raw(p)) for p in pairs], fx.Int32).bitcast(elem_dtype).ir_value()
             )
 
-        PBLK = 128  # 128-wide block holds 2 real rows (low r&4=0 -> [0,64), high -> [64,128))
+        # D64 packs 2 real rows into one 128-wide LDS block (low r&4=0 -> [0,64),
+        # high -> [64,128)); D128 is already 128-wide, so one row == one block.
+        PACK_2ROW = HEAD_DIM == 64  # host bool; gate tracer branches with const_expr()
+        PBLK = 128 if PACK_2ROW else HEAD_DIM
 
         def _pblk(row_idx):
-            return ((row_idx >> fx.Index(3)) << fx.Index(2)) | (row_idx & fx.Index(3))
+            if const_expr(PACK_2ROW):
+                return ((row_idx >> fx.Index(3)) << fx.Index(2)) | (row_idx & fx.Index(3))
+            return row_idx
 
         def _swizzle(row_idx, col_idx):
             mask = (row_idx & fx.Index(7)) << fx.Index(4)
@@ -1398,9 +1434,10 @@ def build_flash_attn_bwd_dq_module(
             lds_base_idx = buffer_ops.extract_base_index(lds, address_space=3)
             DMA_BYTES = 16
             DMA_BATCH_BYTES = BLOCK_SIZE * DMA_BYTES
-            KV_TILE_BYTES = (BLOCK_KV // 2) * 128 * 2
+            # D64: (BLOCK_KV/2) blocks, 2 rows each. D128: BLOCK_KV blocks, 1 row each.
+            KV_TILE_BYTES = BLOCK_KV * HEAD_DIM * 2
             NUM_DMA_KV = KV_TILE_BYTES // DMA_BATCH_BYTES
-            ROWS_PER_DMA_BATCH = DMA_BATCH_BYTES // (128 * 2)  # blocks per batch
+            ROWS_PER_DMA_BATCH = DMA_BATCH_BYTES // (128 * 2)  # 128-wide blocks per batch
             _dma_size = fx.Int32(DMA_BYTES)
             _dma_soff = fx.Int32(0)
             _dma_off = fx.Int32(0)
@@ -1422,13 +1459,18 @@ def build_flash_attn_bwd_dq_module(
                     lds_ptr = buffer_ops.create_llvm_ptr(lds_lane0, address_space=3)
                     block = tid // fx.Index(16) + fx.Index(d * ROWS_PER_DMA_BATCH)
                     lane_in_block = tid % fx.Index(16)
-                    half = lane_in_block // fx.Index(8)
                     position = lane_in_block * fx.Index(8)  # swiz col within 128-block
-                    row_in_tile = (
-                        fx.Index(8) * (block >> fx.Index(2)) + (block & fx.Index(3)) + half * fx.Index(4)
-                    )
+                    if const_expr(PACK_2ROW):
+                        # D64: block holds 2 rows; 8 lanes/half, real col in [0,64).
+                        half = lane_in_block // fx.Index(8)
+                        row_in_tile = (
+                            fx.Index(8) * (block >> fx.Index(2)) + (block & fx.Index(3)) + half * fx.Index(4)
+                        )
+                    else:
+                        # D128: block == row; 16 lanes span the full 128-wide row.
+                        row_in_tile = block
                     xor_mask = (row_in_tile & fx.Index(7)) << fx.Index(4)
-                    unsw_col_f16 = position ^ xor_mask  # real col in [0,64), 1x HBM
+                    unsw_col_f16 = position ^ xor_mask  # real col (1x HBM)
                     col_byte = unsw_col_f16 * 2
                     global_row = tile_start + row_in_tile
                     global_byte = (
@@ -1719,11 +1761,13 @@ def build_flash_attn_bwd_dq_module(
                                     [_vexp(Vec(diff4)[t]) for t in range_constexpr(4)], fx.Float32
                                 )
                             if const_expr(window_left >= 0):
+                                # keep kv >= q+off-W (W+1 keys), matching the fwd SWA edge:
+                                # '>=' keeps the boundary key kv == _thr == q+off-W.
                                 _thr = q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left)
                                 _kvb = kv_start_i32 + fx.Int32(kvt * M_TILE + kg * 4)
                                 p4 = Vec.from_elements(
                                     [
-                                        ArithValue(_kvb + fx.Int32(t) > _thr).select(Vec(p4)[t], c_zero_f)
+                                        ArithValue(_kvb + fx.Int32(t) >= _thr).select(Vec(p4)[t], c_zero_f)
                                         for t in range_constexpr(4)
                                     ],
                                     fx.Float32,
@@ -1743,8 +1787,9 @@ def build_flash_attn_bwd_dq_module(
                                 kv_slot = kv_start_i32 + fx.Int32(kvt * M_TILE + kg * 4 + t)
                                 _up = ArithValue(kv_slot > q_slot_i32[qt] + causal_off_i32)
                                 if const_expr(window_left >= 0):
+                                    # keep kv >= q+off-W (W+1 keys), matching the fwd SWA edge.
                                     _lo = ArithValue(
-                                        kv_slot <= q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left)
+                                        kv_slot < q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left)
                                     )
                                     _mm = ArithValue(arith.ori(_raw(_up), _raw(_lo)))
                                 else:
@@ -1813,11 +1858,12 @@ def build_flash_attn_bwd_dq_module(
         _carry = A_accs
         loop_results = _carry
         if const_expr(window_left >= 0):
-            # fx.Index is unsigned: guard the subtract (W-1 may exceed q+off) to
-            # avoid underflow-to-huge. _wlo skips fully-out-of-window kv tiles.
+            # fx.Index is unsigned: guard the subtract (W may exceed q+off) to
+            # avoid underflow-to-huge. _wlo skips fully-out-of-window kv tiles; the
+            # first in-window kv is q+off-W (W+1-key window), so start from there.
             _wlo = fx.Index(
-                ArithValue(q_start + causal_offset >= fx.Index(window_left - 1)).select(
-                    q_start + causal_offset - fx.Index(window_left - 1), fx.Index(0)
+                ArithValue(q_start + causal_offset >= fx.Index(window_left)).select(
+                    q_start + causal_offset - fx.Index(window_left), fx.Index(0)
                 )
             )
             _wlo = (_wlo // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
@@ -1949,10 +1995,14 @@ def _qsplit_for(Sq):
     return 3
 
 
-def _blockkv_for(Skv):
+def _blockkv_for(Skv, head_dim=64):
     # dkdv is KV-outer, so Skv (not Sq) sets its grid: a short Skv needs BLOCK_KV=64
     # to fill the CU array, a long one wants 128 to amortise the per-tile cost. Keying
     # this on Sq costs 19% on rectangular shapes such as Sq=2048, Skv=16384.
+    # D128 tiles are 2x wide in LDS, so BLOCK_KV=128 would halve occupancy (32KB K/V
+    # tile) and fall off a throughput cliff at long Skv -- cap D128 at 64.
+    if head_dim >= 128:
+        return 64
     return 64 if Skv <= 2048 else 128
 
 
@@ -2007,16 +2057,26 @@ def _get_bwd(Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64, 
             num_kv_heads=Hkv,
             window_left=window_left,
         )
+        # dq is Q-outer: a WG owns block_m q rows and streams ALL kv, so a larger tile =
+        # fewer WGs = each kv block re-read fewer times (dq is kv-throughput-bound; occ is
+        # already 1 at D128's wide body). D128 wins at block_m=256; D64's leaner occ-bound
+        # body stays at 192 (byte-identical).
+        dq_block_m = 256 if D == 128 else 192
         dq_l = build_flash_attn_bwd_dq_module(
             block_kv=dq_block_kv,
             waves_per_eu=1,
             batch_size=batch_size,
             sbhd=sbhd,
             fuse_delta=_FUSE_DELTA,
+            block_m=dq_block_m,
             **common,
         )
+        # g2d (GEMM2 transpose-read prefetch depth): D128 has DT=8 (double D64's DT=4), so
+        # its GEMM2 dt-loop is twice as long -- a deeper ring hides more ds_read_tr16 latency
+        # there. Depth-3 wins for D128; D64's shorter DT=4 loop wins at depth-1 (byte-identical).
+        dkdv_g2d = 3 if D == 128 else 1
         dkdv_l = build_flash_attn_bwd_dkdv_module(
-            q_split=q_split, block_kv=block_kv, batch_size=batch_size, sbhd=sbhd, **common
+            q_split=q_split, block_kv=block_kv, batch_size=batch_size, sbhd=sbhd, g2d=dkdv_g2d, **common
         )
         if _FUSE_DELTA:
             # The fused dq kernel produces DELTA itself; the standalone odo kernel is
@@ -2037,8 +2097,127 @@ def _prescale_lse(lse_bhsq):
     return (lse_bhsq.float() * (-_LOG2E)).contiguous()
 
 
+# ============================================================================
+# kernel: dsink (attention-sink gradient)
+# ============================================================================
+
+_DSINK_THREADS = 256
+
+
+def build_flash_dsink_module(B, Sq, Hq):
+    """d_sink[h] = sum over all (b, s) of exp(sink_h - lse[b,h,s]) * delta[b,h,s].
+
+    LSE is the raw sink-inclusive natural-log softmax LSE and DELTA is the flash
+    identity delta = -sum_d O_s[b,s,h,d]*dO[b,s,h,d] (already negated by the dq kernel),
+    both fp32 [B,Hq,Sq] with the same flat layout (b*Hq+h)*Sq+s. Because delta carries
+    the negation, no final negate is applied (unlike sparse's build_dsink_reduce).
+
+    One WG per q-head (grid=(Hq,1,1)); the WG's 256 threads stride the head's B*Sq
+    scalars, accumulate in fp32, then thread 0 sums the LDS partials and writes d_sink[h].
+    Deterministic (fixed fp32 reduction order, no atomics)."""
+    THREADS = _DSINK_THREADS
+    NCHUNK = (Sq + THREADS - 1) // THREADS
+    allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="flash_attn_bwd_dsink_smem")
+    lds_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_off + THREADS * 4
+
+    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    def k_fn(SINK: fx.Tensor, LSE: fx.Tensor, DELTA: fx.Tensor, DSINK: fx.Tensor):
+        lds = SmemPtr(allocator.get_base(), lds_off, fx.Float32.ir_type, shape=(THREADS,)).get()
+        h = fx.Index(gpu.block_idx.x)
+        tid = fx.Index(gpu.thread_idx.x)
+        Hqn = fx.Index(Hq)
+        Sqn = fx.Index(Sq)
+        total_elems = fx.Index(B) * Hqn * Sqn
+
+        sink_rsrc = buffer_ops.create_buffer_resource(
+            SINK, max_size=False, num_records_bytes=_raw(Hqn * fx.Index(4))
+        )
+        lse_rsrc = buffer_ops.create_buffer_resource(
+            LSE, max_size=False, num_records_bytes=_raw(total_elems * fx.Index(4))
+        )
+        delta_rsrc = buffer_ops.create_buffer_resource(
+            DELTA, max_size=False, num_records_bytes=_raw(total_elems * fx.Index(4))
+        )
+        dsink_rsrc = buffer_ops.create_buffer_resource(
+            DSINK, max_size=False, num_records_bytes=_raw(Hqn * fx.Index(4))
+        )
+        c_log2e = fx.Float32(_LOG2E)
+        c_zero = fx.Float32(0.0)
+        sink_h = fx.Float32(buffer_ops.buffer_load(sink_rsrc, h, vec_width=1, dtype=fx.Float32))
+
+        acc = fx.Float32(0.0)
+        for b in range_constexpr(B):
+            head_base = (fx.Index(b) * Hqn + h) * Sqn  # first scalar of (b, h) row
+            for c in range_constexpr(NCHUNK):
+                s = fx.Index(c * THREADS) + tid
+                in_range = ArithValue(s < Sqn)
+                # clamp OOB tail to element 0 of the row (in-buffer, contribution masked)
+                g = head_base + fx.Index(in_range.select(s, fx.Index(0)))
+                lse_g = fx.Float32(buffer_ops.buffer_load(lse_rsrc, g, vec_width=1, dtype=fx.Float32))
+                delta_g = fx.Float32(buffer_ops.buffer_load(delta_rsrc, g, vec_width=1, dtype=fx.Float32))
+                e = fx.Float32(rocdl.exp2(fx.Float32.ir_type, _raw((sink_h - lse_g) * c_log2e)))
+                term = e * delta_g
+                acc = fx.Float32(
+                    arith.AddFOp(_raw(acc), _raw(fx.Float32(in_range.select(term, c_zero)))).result
+                )
+
+        Vec.from_elements([acc], fx.Float32).store(lds, [tid])
+        gpu.barrier()
+        # thread 0 sums the 256 partials serially (one WG per head; tiny, deterministic).
+        total = fx.Float32(0.0)
+        for j in range_constexpr(THREADS):
+            total = fx.Float32(
+                arith.AddFOp(
+                    _raw(total), _raw(Vec.load(Vec.make_type(1, fx.Float32), lds, [fx.Index(j)])[0])
+                ).result
+            )
+        buffer_ops.buffer_store(
+            total,
+            dsink_rsrc,
+            h * fx.Index(4),
+            mask=_raw(arith.CmpIOp(arith.CmpIPredicate.eq, _raw(tid), _raw(fx.Index(0))).result),
+            offset_is_bytes=True,
+        )
+
+    @flyc.jit
+    def launch(SINK, LSE, DELTA, DSINK, stream):
+        allocator.finalized = False
+        with ir.InsertionPoint(CompilationContext.get_current().gpu_module_body):
+            allocator.finalize()
+        k_fn(SINK, LSE, DELTA, DSINK).launch(grid=(fx.Index(Hq), 1, 1), block=(THREADS, 1, 1), stream=stream)
+
+    return launch
+
+
+_DSINK_CACHE: dict = {}
+
+
+def _flash_dsink(sink, lse_bhsq, delta, B, Hq, Sq, stream):
+    """Launch the dsink reduction. ``sink``:[Hq] f32, ``lse_bhsq``/``delta``:[B,Hq,Sq] f32
+    (raw sink-inclusive natural-log LSE and the already-negated identity delta). Returns
+    d_sink:[Hq] f32."""
+    d_sink = torch.empty(Hq, device=sink.device, dtype=torch.float32)
+    args = (
+        sink.reshape(-1),
+        lse_bhsq.reshape(-1).contiguous(),
+        delta.reshape(-1),
+        d_sink,
+        stream,
+    )
+    key = (B, Hq, Sq)
+    compiled = _DSINK_CACHE.get(key)
+    if compiled is None:
+        if len(_DSINK_CACHE) >= 64:
+            _DSINK_CACHE.clear()
+        compiled = flyc.compile(build_flash_dsink_module(B, Sq, Hq), *args)
+        _DSINK_CACHE[key] = compiled
+    compiled(*args)
+    return d_sink
+
+
 def flydsl_varlen_backward(
-    dout, q, k, v, out, lse_bhsq, B, Sq, Skv, Hq, Hkv, D, scale, window_left=-1, sbhd=False
+    dout, q, k, v, out, lse_bhsq, B, Sq, Skv, Hq, Hkv, D, scale, window_left=-1, sbhd=False, sink=None
 ):
     """Run the 16x16x32 flydsl bwd.
     THD (sbhd=False): q,dout,dq,out:[B*Sq,Hq,D]; k,v,dk,dv:[B*Skv,Hkv,D].
@@ -2046,7 +2225,12 @@ def flydsl_varlen_backward(
     no permute/copy anywhere -- the kernels address SBHD directly and the dk/dv
     workspace is laid out [q_split,Skv,B,Hkv,D] so the slot reduction is contiguous).
     lse_bhsq:[B,Hq,Sq] f32 (batch-major, layout-independent).
-    window_left>=0 = sliding-window causal (valid q+off-W < kv <= q+off)."""
+    window_left>=0 = sliding-window causal (valid q+off-W < kv <= q+off).
+    ``sink`` (optional [Hq] f32): learned per-q-head attention sink. dQ/dK/dV are
+    sink-agnostic (lse_bhsq is already sink-inclusive from the forward); when given, a
+    dedicated reduction kernel also returns dsink[h]=Sum_i exp(sink_h-lse_i)*delta_flash
+    (delta_flash is already -rowsum(O_s.dO), so no final negate), and the result is the
+    4-tuple (dq,dk,dv,dsink) instead of (dq,dk,dv)."""
     q_split = _qsplit_for(Sq)
     dq_l, dkdv_l, odo_l = _get_bwd(
         Hq,
@@ -2055,7 +2239,7 @@ def flydsl_varlen_backward(
         scale,
         window_left,
         q_split,
-        _blockkv_for(Skv),
+        _blockkv_for(Skv, D),
         _dq_block_kv(Sq),
         batch_size=B,
         sbhd=sbhd,
@@ -2090,4 +2274,10 @@ def flydsl_varlen_backward(
     else:
         dk = ws_dk.sum(dim=1).reshape(B * Skv, Hkv, D)
         dv = ws_dv.sum(dim=1).reshape(B * Skv, Hkv, D)
+    if sink is not None:
+        # dsink[h] = Sum_i exp(sink_h - lse_i) * delta_flash[b,h,i], with delta already
+        # -rowsum(O_s.dO) (negated) and lse_bhsq the raw sink-inclusive natural-log LSE.
+        # Both are [B,Hq,Sq] with the same flat layout (b*Hq+h)*Sq+s.
+        d_sink = _flash_dsink(sink, lse_bhsq, delta, B, Hq, Sq, st)
+        return dq, dk, dv, d_sink
     return dq, dk, dv
