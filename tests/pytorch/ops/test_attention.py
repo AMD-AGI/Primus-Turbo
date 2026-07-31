@@ -307,6 +307,128 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal):
     assert value_grad_snr > 40, f"value_grad_snr too low: {value_grad_snr}"
 
 
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="flydsl flash-attn is gfx950-only"
+)
+@pytest.mark.parametrize("seqlen", [1024, 2048])
+@pytest.mark.parametrize("heads", [(64, 8), (64, 4)])  # GQA group must be a power of two >= 8
+@pytest.mark.parametrize("head_dim", [64, 128])  # both FLYDSL head dims
+def test_attention_flydsl(seqlen, heads, head_dim):
+    """Force the FLYDSL dense backend through the public ``flash_attn_func`` and check
+    fwd+bwd (SBHD, causal, bf16, D in {64,128}) vs the pytorch reference. Independent of
+    the aiter package so the fast path is covered even where aiter is stale."""
+    from primus_turbo.pytorch.core.backend import (
+        BackendType,
+        GlobalBackendManager,
+        PrecisionType,
+    )
+
+    device, dtype = "cuda", torch.bfloat16
+    num_head_q, num_head_kv = heads
+    batch, d = 2, head_dim  # batch>=2 so sbhd vs bshd strides are unambiguous
+    sm_scale = d ** (-0.5)
+
+    # SBHD storage: allocate [s, b, h, d], permute to logical [b, s, h, d] with no copy.
+    q0 = torch.randn(seqlen, batch, num_head_q, d, device=device, dtype=dtype, requires_grad=True)
+    k0 = torch.randn(seqlen, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
+    v0 = torch.randn(seqlen, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
+    grad_out = torch.randn(seqlen, batch, num_head_q, d, device=device, dtype=dtype)
+    q_ref = q0.clone().detach().requires_grad_()
+    k_ref = k0.clone().detach().requires_grad_()
+    v_ref = v0.clone().detach().requires_grad_()
+
+    o_ref = attention_vanilla_forward_pytorch_ref_impl(q_ref, k_ref, v_ref, sm_scale, True, "sbhd")
+    o_ref.backward(grad_out)
+
+    GlobalBackendManager.set_attn_backend(BackendType.FLYDSL, PrecisionType.BF16_FP16_FP32)
+    try:
+        o = flash_attn_func(
+            q0.permute(1, 0, 2, 3),
+            k0.permute(1, 0, 2, 3),
+            v0.permute(1, 0, 2, 3),
+            softmax_scale=sm_scale,
+            causal=True,
+        )
+        o.permute(1, 0, 2, 3).backward(grad_out)
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
+
+    out_snr = compute_snr(o_ref, o.permute(1, 0, 2, 3))
+    dq_snr = compute_snr(q_ref.grad, q0.grad)
+    dk_snr = compute_snr(k_ref.grad, k0.grad)
+    dv_snr = compute_snr(v_ref.grad, v0.grad)
+    print(f"\nflydsl S={seqlen} H={heads}: out={out_snr:.1f} dq={dq_snr:.1f} dk={dk_snr:.1f} dv={dv_snr:.1f}")
+    assert out_snr > 40 and dq_snr > 40 and dk_snr > 40 and dv_snr > 40
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="flydsl flash-attn is gfx950-only"
+)
+@pytest.mark.parametrize("seqlen", [1024, 2048])
+@pytest.mark.parametrize("heads", [(64, 8), (128, 16)])  # gpt-oss / Meta GQA groups (power-of-two >= 8)
+@pytest.mark.parametrize("window_size_left", [-1, 128])  # full causal + sliding window
+@pytest.mark.parametrize("head_dim", [64, 128])  # both FLYDSL head dims
+def test_attention_flydsl_sink(seqlen, heads, window_size_left, head_dim):
+    """Force the FLYDSL dense backend through ``flash_attn_func`` WITH a learned per-q-head
+    attention sink (gpt-oss style) and check fwd O + bwd dq/dk/dv/dsink (SBHD, causal, bf16,
+    D in {64,128}) vs the pytorch sink reference. Covers the sink fold in the fwd softmax
+    denominator, the dedicated dsink reduction kernel, and the sliding-window lower edge in
+    the backward."""
+    from primus_turbo.pytorch.core.backend import (
+        BackendType,
+        GlobalBackendManager,
+        PrecisionType,
+    )
+
+    device, dtype = "cuda", torch.bfloat16
+    num_head_q, num_head_kv = heads
+    batch, d = 2, head_dim  # batch>=2 so sbhd vs bshd strides are unambiguous
+    sm_scale = d ** (-0.5)
+    window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
+
+    # SBHD storage: allocate [s, b, h, d], permute to logical [b, s, h, d] with no copy.
+    q0 = torch.randn(seqlen, batch, num_head_q, d, device=device, dtype=dtype, requires_grad=True)
+    k0 = torch.randn(seqlen, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
+    v0 = torch.randn(seqlen, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
+    sink = torch.randn(num_head_q, device=device, dtype=torch.float32, requires_grad=True)
+    grad_out = torch.randn(seqlen, batch, num_head_q, d, device=device, dtype=dtype)
+    q_ref = q0.clone().detach().requires_grad_()
+    k_ref = k0.clone().detach().requires_grad_()
+    v_ref = v0.clone().detach().requires_grad_()
+    sink_ref = sink.clone().detach().requires_grad_()
+
+    o_ref = attention_with_sink_ref_impl(
+        q_ref, k_ref, v_ref, sink_ref, sm_scale, True, window_size=window_size, qkv_format="sbhd"
+    )
+    o_ref.backward(grad_out)
+
+    GlobalBackendManager.set_attn_backend(BackendType.FLYDSL, PrecisionType.BF16_FP16_FP32)
+    try:
+        o = flash_attn_func(
+            q0.permute(1, 0, 2, 3),
+            k0.permute(1, 0, 2, 3),
+            v0.permute(1, 0, 2, 3),
+            softmax_scale=sm_scale,
+            causal=True,
+            window_size=window_size,
+            sink=sink,
+        )
+        o.permute(1, 0, 2, 3).backward(grad_out)
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
+
+    out_snr = compute_snr(o_ref, o.permute(1, 0, 2, 3))
+    dq_snr = compute_snr(q_ref.grad, q0.grad)
+    dk_snr = compute_snr(k_ref.grad, k0.grad)
+    dv_snr = compute_snr(v_ref.grad, v0.grad)
+    dsink_snr = compute_snr(sink_ref.grad, sink.grad)
+    print(
+        f"\nflydsl-sink S={seqlen} H={heads} WL={window_size_left}: out={out_snr:.1f} "
+        f"dq={dq_snr:.1f} dk={dk_snr:.1f} dv={dv_snr:.1f} dsink={dsink_snr:.1f}"
+    )
+    assert out_snr > 40 and dq_snr > 40 and dk_snr > 40 and dv_snr > 40 and dsink_snr > 40
+
+
 @pytest.mark.parametrize("batch", [4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
@@ -636,3 +758,63 @@ def test_sparse_mla(variant, cr, seqlen):
         q, kv, out, grad_out, topk_idx, lse, attn_sink=sink, kv_lora_rank=d, scale=scale
     )
     assert torch.equal(dq, dq2) and torch.equal(dkv, dkv2), "backward is not deterministic"
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="sparse-MLA (flydsl) is gfx950-only"
+)
+@pytest.mark.parametrize("seqlen", [1024, 2048])
+@pytest.mark.parametrize("variant", ["flash", "pro"])
+@pytest.mark.parametrize("cr", [0, 4, 128])
+def test_sparse_mla_op(variant, cr, seqlen):
+    """Public multi-backend training op ``sparse_mla_func``: autograd fwd+bwd (default
+    FLYDSL) vs triton oracle, plus the PRIMUS_TURBO_SPARSE_ATTN_BACKEND=TRITON override."""
+    import math
+
+    from primus_turbo.pytorch.core.backend import (
+        BackendType,
+        GlobalBackendManager,
+        PrecisionType,
+    )
+    from primus_turbo.pytorch.ops import sparse_mla_func
+    from primus_turbo.triton.attention.sparse_mla import (
+        sparse_mla_bwd_triton,
+        sparse_mla_fwd_triton,
+    )
+
+    d = SPARSE_MLA_HEAD_DIM
+    num_heads = SPARSE_MLA_VARIANTS[variant][0]
+    pool, topk_pool, _ = _sparse_mla_topk(variant, cr, seqlen)
+    scale = 1.0 / math.sqrt(d)
+    q, kv, topk_idx, sink, grad_out = _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool)
+
+    # Triton oracle (fwd + bwd), computed directly on the kernels.
+    out_ref, lse_ref = sparse_mla_fwd_triton(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
+    dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_triton(
+        q, kv, out_ref, grad_out, topk_idx, lse_ref, attn_sink=sink, kv_lora_rank=d, scale=scale
+    )
+
+    def _run_op():
+        qg = q.clone().requires_grad_(True)
+        kvg = kv.clone().requires_grad_(True)
+        sg = sink.clone().requires_grad_(True)
+        o = sparse_mla_func(qg, kvg, topk_idx, attn_sink=sg, kv_lora_rank=d, scale=scale)
+        o.backward(grad_out)
+        return o, qg.grad, kvg.grad, sg.grad
+
+    # Default backend (FLYDSL): autograd fwd + bwd through the public op.
+    try:
+        out, dq, dkv, dsink = _run_op()
+        assert torch.isfinite(out).all(), "op forward produced non-finite values"
+        assert compute_snr(out_ref, out) > 40.0, "op fwd SNR <= 40"
+        assert compute_snr(dq_ref, dq) > 40.0, "op dq SNR <= 40"
+        assert compute_snr(dkv_ref, dkv) > 40.0, "op dkv SNR <= 40"
+        assert compute_snr(dsink_ref, dsink) > 40.0, "op dsink SNR <= 40"
+
+        # Backend override: force TRITON through the public op; grads must match the oracle tightly.
+        GlobalBackendManager.set_sparse_attn_backend(BackendType.TRITON, PrecisionType.BF16_FP16_FP32)
+        out_t, dq_t, dkv_t, dsink_t = _run_op()
+        assert compute_snr(out_ref, out_t) > 60.0, "TRITON-override op fwd disagrees with oracle"
+        assert compute_snr(dq_ref, dq_t) > 60.0, "TRITON-override op dq disagrees with oracle"
+    finally:
+        GlobalBackendManager.set_sparse_attn_backend(None)

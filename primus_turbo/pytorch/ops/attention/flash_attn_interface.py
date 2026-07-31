@@ -8,6 +8,11 @@ from typing import Optional
 
 import torch
 
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
@@ -19,6 +24,15 @@ from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_varlen_backward_impl,
     attention_aiter_varlen_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+    flash_attn_sbhd_flydsl_backward_impl,
+    flash_attn_sbhd_flydsl_forward_impl,
+    flash_attn_varlen_flydsl_backward_impl,
+    flash_attn_varlen_flydsl_forward_impl,
+)
+from primus_turbo.pytorch.kernels.attention.attention_impl import (
+    resolve_flash_attn_backend,
+)
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
@@ -29,6 +43,9 @@ from primus_turbo.pytorch.ops.attention.attention_utils import (
     block_scaling_node,
     get_p_scale,
 )
+
+# Flash-attn selects its backend on the bf16/fp16/fp32 precision bucket.
+_ATTN_PRECISION = PrecisionType.BF16_FP16_FP32
 
 __all__ = ["flash_attn_func", "flash_attn_fp8_func", "flash_attn_varlen_func"]
 
@@ -220,6 +237,77 @@ class AiterFlashAttnFunc(torch.autograd.Function):
         )
 
 
+class FlydslFlashAttnFunc(torch.autograd.Function):
+    """Dense FlyDSL flash-attention (SBHD-native, gfx950, causal, bf16, D in {64,128}).
+
+    Inputs are logical ``[b, s, h, d]`` with sbhd storage; ``permute(1, 0, 2, 3)``
+    yields the ``[s, b, h, d]`` contiguous layout the kernel consumes with no copy.
+    fwd and bwd run on the same backend by construction (this Function is FlyDSL-only),
+    so no ctx.backend threading is needed.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, softmax_scale, causal, window_size, return_lse, is_grad_enabled, sink=None):
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+
+        q_s = q.permute(1, 0, 2, 3).contiguous()
+        k_s = k.permute(1, 0, 2, 3).contiguous()
+        v_s = v.permute(1, 0, 2, 3).contiguous()
+        out_s, lse = flash_attn_sbhd_flydsl_forward_impl(
+            q_s,
+            k_s,
+            v_s,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_lse=True,
+            sink=sink,
+        )
+        Sq, B, Hq, _ = q_s.shape
+        out = out_s.permute(1, 0, 2, 3)  # [b, s, h, d] view
+
+        if is_grad:
+            ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.B = B
+            ctx.Sq = Sq
+            ctx.Hq = Hq
+            ctx.sink = sink
+
+        if return_lse:
+            # kernel LSE is [B*Sq, Hq] (batch-major) -> [B, Hq, Sq]
+            return out, lse.view(B, Sq, Hq).permute(0, 2, 1)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
+        dout_s = dout.permute(1, 0, 2, 3).contiguous()
+        lse_bhsq = lse.view(ctx.B, ctx.Sq, ctx.Hq).permute(0, 2, 1).contiguous()  # [B, Hq, Sq]
+
+        grads = flash_attn_sbhd_flydsl_backward_impl(
+            dout_s,
+            q_s,
+            k_s,
+            v_s,
+            out_s,
+            lse_bhsq,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            window_size=ctx.window_size,
+            sink=ctx.sink,
+        )
+        # backward returns (dq,dk,dv) or (dq,dk,dv,dsink) when sink is present.
+        dq_s, dk_s, dv_s = grads[0], grads[1], grads[2]
+        dsink = grads[3] if len(grads) > 3 else None
+        dq = dq_s.permute(1, 0, 2, 3)
+        dk = dk_s.permute(1, 0, 2, 3)
+        dv = dv_s.permute(1, 0, 2, 3)
+        return dq, dk, dv, None, None, None, None, None, dsink
+
+
 class TritonFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -339,6 +427,27 @@ def flash_attn_func(
     sink: Optional[torch.Tensor] = None,
 ):
     qkv_format = _infer_qkv_format(q, k, v)
+
+    backend = resolve_flash_attn_backend(
+        varlen=False,
+        user_backend=GlobalBackendManager.get_attn_backend(_ATTN_PRECISION),
+        q=q,
+        k=k,
+        v=v,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink=sink,
+        qkv_format=qkv_format,
+    )
+    # FlyDSL emits no dropout softmax matrix; keep return_attn_probs on aiter.
+    if backend == BackendType.FLYDSL and not return_attn_probs:
+        return FlydslFlashAttnFunc.apply(
+            q, k, v, softmax_scale, causal, window_size, return_lse, torch.is_grad_enabled(), sink
+        )
 
     result = AiterFlashAttnFunc.apply(
         q,
@@ -582,6 +691,91 @@ class AiterFlashAttnVarlenFunc(torch.autograd.Function):
         )
 
 
+class FlydslFlashAttnVarlenFunc(torch.autograd.Function):
+    """Varlen (THD) FlyDSL flash-attention: gfx950, causal, bf16, D in {64,128},
+    uniform per-batch seqlens. FlyDSL-only, so fwd/bwd share the backend."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+        window_size,
+        return_lse,
+        is_grad_enabled,
+        sink=None,
+    ):
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+
+        out, lse = flash_attn_varlen_flydsl_forward_impl(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_lse=True,
+            sink=sink,
+        )
+        B = cu_seqlens_q.numel() - 1
+        Hq = q.shape[1]
+        Sq = q.shape[0] // B  # uniform seqlens (enforced by the flydsl eligibility gate)
+
+        if is_grad:
+            ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.B = B
+            ctx.Sq = Sq
+            ctx.Hq = Hq
+            ctx.sink = sink
+
+        if return_lse:
+            # kernel LSE is [B*Sq, Hq] (batch-major) -> [B, Hq, Sq]
+            return out, lse.view(B, Sq, Hq).permute(0, 2, 1)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        lse_bhsq = lse.view(ctx.B, ctx.Sq, ctx.Hq).permute(0, 2, 1).contiguous()  # [B, Hq, Sq]
+
+        grads = flash_attn_varlen_flydsl_backward_impl(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse_bhsq,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            ctx.max_seqlen_q,
+            ctx.max_seqlen_k,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            window_size=ctx.window_size,
+            sink=ctx.sink,
+        )
+        # backward returns (dq,dk,dv) or (dq,dk,dv,dsink) when sink is present.
+        dq, dk, dv = grads[0], grads[1], grads[2]
+        dsink = grads[3] if len(grads) > 3 else None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, dsink
+
+
 def flash_attn_varlen_func(
     q,
     k,
@@ -599,6 +793,7 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    sink: Optional[torch.Tensor] = None,
 ):
     """Variable-length flash attention (THD layout).
 
@@ -623,6 +818,41 @@ def flash_attn_varlen_func(
         return_lse: also return softmax_lse of shape (nheads, total_q).
         return_attn_probs: testing-only; return the dropout-encoded softmax output.
     """
+    backend = resolve_flash_attn_backend(
+        varlen=True,
+        user_backend=GlobalBackendManager.get_attn_backend(_ATTN_PRECISION),
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink=sink,
+    )
+    if backend == BackendType.FLYDSL and not return_attn_probs:
+        return FlydslFlashAttnVarlenFunc.apply(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            causal,
+            window_size,
+            return_lse,
+            torch.is_grad_enabled(),
+            sink,
+        )
+
     return AiterFlashAttnVarlenFunc.apply(
         q,
         k,

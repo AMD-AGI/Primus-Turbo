@@ -14,10 +14,12 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 import torch
 
 from primus_turbo.common.constants import (
+    ENV_ATTN_BACKEND,
     ENV_AUTO_TUNE,
     ENV_GEMM_BACKEND,
     ENV_GROUPED_GEMM_BACKEND,
     ENV_MOE_DISPATCH_COMBINE_BACKEND,
+    ENV_SPARSE_ATTN_BACKEND,
 )
 from primus_turbo.common.logger import logger
 from primus_turbo.triton.utils.origami import origami_clear_caches
@@ -92,6 +94,8 @@ class GlobalBackendManager:
     _gemm_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _grouped_gemm_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _moe_dispatch_combine_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
+    _attn_backend: Optional[Dict[PrecisionType, Optional[BackendType]]] = None
+    _sparse_attn_backend: Optional[Dict[PrecisionType, Optional[BackendType]]] = None
     _auto_tune: Optional[bool] = None
     _env_cache: Dict[str, Dict["PrecisionType", "BackendChoice"]] = {}
 
@@ -279,6 +283,57 @@ class GlobalBackendManager:
         return cls._backend_from_env(ENV_GROUPED_GEMM_BACKEND, precision)
 
     @classmethod
+    def set_attn_backend(
+        cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
+    ) -> None:
+        """Set the flash-attention backend in code."""
+        if backend is None:
+            cls._attn_backend = None
+            return
+
+        if cls._attn_backend is None:
+            cls._attn_backend = {}
+
+        if precision is None:
+            cls._attn_backend = {precision: backend for precision in _PRECISION_TYPE_SET}
+        else:
+            cls._attn_backend[precision] = backend
+
+    @classmethod
+    def get_attn_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
+        """Get the flash-attention backend configuration. Returns None if not set."""
+        if cls._attn_backend is not None:
+            return cls._attn_backend.get(precision)
+        # env parsing yields BackendChoice; attn dispatch consumes the bare enum.
+        choice = cls._backend_from_env(ENV_ATTN_BACKEND, precision)
+        return choice.backend if choice is not None else None
+
+    @classmethod
+    def set_sparse_attn_backend(
+        cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
+    ) -> None:
+        """Set the sparse-MLA (DeepSeek-V4) attention backend in code."""
+        if backend is None:
+            cls._sparse_attn_backend = None
+            return
+
+        if cls._sparse_attn_backend is None:
+            cls._sparse_attn_backend = {}
+
+        if precision is None:
+            cls._sparse_attn_backend = {precision: backend for precision in _PRECISION_TYPE_SET}
+        else:
+            cls._sparse_attn_backend[precision] = backend
+
+    @classmethod
+    def get_sparse_attn_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
+        """Get the sparse-MLA attention backend configuration. Returns None if not set."""
+        if cls._sparse_attn_backend is not None:
+            return cls._sparse_attn_backend.get(precision)
+        choice = cls._backend_from_env(ENV_SPARSE_ATTN_BACKEND, precision)
+        return choice.backend if choice is not None else None
+
+    @classmethod
     def get_moe_dispatch_combine_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
         """Get the MoE dispatch combine backend configuration. Returns None if not set.
 
@@ -325,6 +380,8 @@ class GlobalBackendManager:
         cls._gemm_backend = None
         cls._grouped_gemm_backend = None
         cls._moe_dispatch_combine_backend = None
+        cls._attn_backend = None
+        cls._sparse_attn_backend = None
         cls._auto_tune = None
         cls._env_cache = {}
         AutoKernelDispatcher.clear_all_caches()
@@ -544,6 +601,65 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                     once=True,
                 )
                 return fallback_backend_entry.impl.execute(**kwargs)
+
+        raise ValueError(
+            f"No compatible backend found for {cls.__name__} with inputs: {_format_kwargs(kwargs)}"
+        )
+
+    @classmethod
+    def _enum_for_impl(cls, impl: Type[KernelBackend]) -> Optional[BackendType]:
+        """Reverse-lookup the BackendType enum for a registered backend impl class."""
+        for backend_enum, entry in cls._backends.items():
+            if entry.impl is impl:
+                return backend_enum
+        return None
+
+    @classmethod
+    def resolve(
+        cls, default_backend_enum: BackendType, user_backend_enum: Optional[BackendType] = None, **kwargs
+    ) -> BackendType:
+        """Select (but do not execute) the backend enum for the given inputs.
+
+        Follows the same priority order as ``dispatch``: user > autotune >
+        default > fallback. Exposed so callers that run a kernel across multiple
+        passes (e.g. an autograd forward/backward pair) can pin the *same*
+        backend for every pass by resolving once and threading the enum through.
+        """
+        # 1. User specified backend (env or code) - highest priority
+        if user_backend_enum is not None:
+            if user_backend_enum not in cls._backends:
+                raise ValueError(
+                    f"User specified backend {user_backend_enum.name} is not registered for {cls.__name__}. "
+                    f"Available backends: {[b.name for b in cls._backends.keys()]}"
+                )
+            if not cls._backends[user_backend_enum].impl.can_handle(**kwargs):
+                raise ValueError(
+                    f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
+                    f"Please check input constraints or choose a different backend."
+                )
+            return user_backend_enum
+
+        # 2. Auto tune
+        # NOTE: Skip autotune during cuda graph capture.
+        if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
+            backend_cls = cls.tune(**kwargs)
+            tuned_enum = cls._enum_for_impl(backend_cls) if backend_cls is not None else None
+            if tuned_enum is not None:
+                return tuned_enum
+
+        # 3. Default backend
+        default_entry = cls._backends.get(default_backend_enum)
+        if default_entry is not None and default_entry.impl.can_handle(**kwargs):
+            return default_backend_enum
+
+        # 4. Fallback: try all backends
+        for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
+            if fallback_backend_entry.impl.can_handle(**kwargs):
+                logger.warning(
+                    f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, fallback backend {fallback_backend_enum.name} is selected. The fallback backend may hurt performance!",
+                    once=True,
+                )
+                return fallback_backend_enum
 
         raise ValueError(
             f"No compatible backend found for {cls.__name__} with inputs: {_format_kwargs(kwargs)}"

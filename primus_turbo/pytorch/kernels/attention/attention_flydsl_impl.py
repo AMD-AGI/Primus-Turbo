@@ -43,12 +43,12 @@ def _uniform_seqlen(cu_seqlens: "torch.Tensor"):
 
 
 @functools.lru_cache(maxsize=64)
-def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=False):
-    # D=64 (the Meta hd64 campaign regime) uses the tuned 4-wave stagger-off config
-    # (block_m=128, waves_per_eu=2): stagger-off lifts MFMA utilization here. Other
-    # head dims keep the build default (8-wave) to stay zero-regression.
+def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=False, has_sink=False):
+    # D in (64,128) use the tuned stagger-off config (block_m=128, waves_per_eu=2):
+    # stagger-off lifts MFMA utilization for both. The raw 8-wave build default halves
+    # occupancy; this is the same point D64 was tuned to. Other head dims keep the default.
     cfg = {}
-    if D == 64:
+    if D in (64, 128):
         cfg = dict(waves_per_eu=2, dualwave_swp_enable_stagger=False, block_m=128)
     return build_flash_attn_dualwave_swp_module(
         num_heads=Hq,
@@ -61,6 +61,7 @@ def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=Fa
         emit_lse=emit_lse,
         window_left=window_left,
         sbhd=sbhd,
+        has_sink=has_sink,
         **cfg,
     )
 
@@ -77,9 +78,12 @@ def flash_attn_varlen_flydsl_forward_impl(
     causal=True,
     window_size=(-1, -1),
     return_lse=False,
+    sink=None,
 ):
     """Native FlyDSL forward. q:[B*Sq,Hq,D], k/v:[B*Skv,Hkv,D] bf16 (THD packed).
-    Returns O:[B*Sq,Hq,D] (and LSE:[B*Sq,Hq] fp32 when ``return_lse``)."""
+    ``sink`` (optional [Hq] fp32) is a learned per-q-head attention sink folded into the
+    softmax denominator by the kernel. Returns O:[B*Sq,Hq,D] (and LSE:[B*Sq,Hq] fp32 when
+    ``return_lse`` -- LSE is sink-inclusive when ``sink`` is given)."""
     assert causal, "flydsl flash-attn forward is bottom-right causal only"
     assert q.dtype == torch.bfloat16, "flydsl flash-attn forward is bf16 only"
     B, Sq = _uniform_seqlen(cu_seqlens_q)
@@ -95,11 +99,14 @@ def flash_attn_varlen_flydsl_forward_impl(
     wl, wr = window_size
     assert wr in (0, -1), "only left-window (W,0) / full (-1,-1) supported"
     window_left = wl if wl >= 0 else -1
+    if sink is not None:
+        assert sink.dtype == torch.float32 and sink.numel() == Hq, "sink must be fp32 [Hq]"
+        sink = sink.contiguous()
 
-    mod = _fwd_module(Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left)
+    mod = _fwd_module(Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, has_sink=sink is not None)
     out = torch.empty_like(q)
     stream = torch.cuda.current_stream()
-    kw = dict(seq_len_kv=Skv, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_k, stream=stream)
+    kw = dict(seq_len_kv=Skv, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_k, sink=sink, stream=stream)
     lse = None
     if return_lse:
         # LSE flows through the DebugCounts slot; kernel layout is [total_q, Hq] fp32.
@@ -123,10 +130,13 @@ def flash_attn_varlen_flydsl_backward_impl(
     softmax_scale=None,
     causal=True,
     window_size=(-1, -1),
+    sink=None,
 ):
     """Deterministic 16x16x32 FlyDSL backward. ``lse`` is the natural-log softmax
     LSE in [B, Hq, Sq] fp32 (the backward prescales it internally). Returns
-    dQ:[B*Sq,Hq,D], dK/dV:[B*Skv,Hkv,D]."""
+    dQ:[B*Sq,Hq,D], dK/dV:[B*Skv,Hkv,D] (and dsink:[Hq] fp32 when ``sink`` is given).
+    ``sink`` (optional [Hq] fp32) is the learned per-q-head attention sink; dQ/dK/dV
+    are sink-agnostic (the saved LSE is already sink-inclusive), only dsink is added."""
     assert causal, "flydsl flash-attn backward is bottom-right causal only"
     B, Sq = _uniform_seqlen(cu_seqlens_q)
     Bk, Skv = _uniform_seqlen(cu_seqlens_k)
@@ -139,6 +149,9 @@ def flash_attn_varlen_flydsl_backward_impl(
     wl, wr = window_size
     assert wr in (0, -1), "only left-window (W,0) / full (-1,-1) supported"
     window_left = wl if wl >= 0 else -1
+    if sink is not None:
+        assert sink.dtype == torch.float32 and sink.numel() == Hq, "sink must be fp32 [Hq]"
+        sink = sink.contiguous()
 
     return flydsl_varlen_backward(
         dout.contiguous(),
@@ -155,6 +168,7 @@ def flash_attn_varlen_flydsl_backward_impl(
         D,
         softmax_scale,
         window_left=window_left,
+        sink=sink,
     )
 
 
@@ -166,11 +180,13 @@ def flash_attn_sbhd_flydsl_forward_impl(
     causal=True,
     window_size=(-1, -1),
     return_lse=False,
+    sink=None,
 ):
     """Native SBHD FlyDSL forward. q:[Sq,B,Hq,D], k/v:[Skv,B,Hkv,D] bf16 (the trace
     layout -- batch interleaved inside the seq axis). NO permute/copy: the kernel
     addresses SBHD directly via a compile-time SBHD trait + runtime seq-step stride
-    (B*H*D). Returns O:[Sq,B,Hq,D] (and LSE:[B*Sq,Hq] fp32 when ``return_lse``)."""
+    (B*H*D). ``sink`` (optional [Hq] fp32) is folded into the softmax denominator.
+    Returns O:[Sq,B,Hq,D] (and LSE:[B*Sq,Hq] fp32, sink-inclusive, when ``return_lse``)."""
     assert causal, "flydsl flash-attn forward is bottom-right causal only"
     assert q.dtype == torch.bfloat16, "flydsl flash-attn forward is bf16 only"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous(), "SBHD tensors must be contiguous"
@@ -185,8 +201,13 @@ def flash_attn_sbhd_flydsl_forward_impl(
     wl, wr = window_size
     assert wr in (0, -1), "only left-window (W,0) / full (-1,-1) supported"
     window_left = wl if wl >= 0 else -1
+    if sink is not None:
+        assert sink.dtype == torch.float32 and sink.numel() == Hq, "sink must be fp32 [Hq]"
+        sink = sink.contiguous()
 
-    mod = _fwd_module(Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, sbhd=True)
+    mod = _fwd_module(
+        Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, sbhd=True, has_sink=sink is not None
+    )
     out = torch.empty_like(q)
     stream = torch.cuda.current_stream()
     # SBHD seq-step strides live in the runtime stride args; the SBHD trait fixes the
@@ -195,6 +216,7 @@ def flash_attn_sbhd_flydsl_forward_impl(
         seq_len_kv=Skv,
         stride_q_n=B * Hq * D,
         stride_kv_n=B * Hkv * D,
+        sink=sink,
         stream=stream,
     )
     lse = None
@@ -216,11 +238,15 @@ def flash_attn_sbhd_flydsl_backward_impl(
     softmax_scale=None,
     causal=True,
     window_size=(-1, -1),
+    sink=None,
 ):
     """Native SBHD deterministic 16x16x32 FlyDSL backward. q/dout/out:[Sq,B,Hq,D],
     k/v:[Skv,B,Hkv,D] bf16; ``lse`` is natural-log softmax LSE in [B,Hq,Sq] fp32.
     NO permute/copy: SBHD is addressed natively and the dk/dv workspace is laid out
-    so the slot reduction is contiguous. Returns dQ:[Sq,B,Hq,D], dK/dV:[Skv,B,Hkv,D]."""
+    so the slot reduction is contiguous. Returns dQ:[Sq,B,Hq,D], dK/dV:[Skv,B,Hkv,D]
+    (and dsink:[Hq] fp32 when ``sink`` is given). ``sink`` (optional [Hq] fp32) is the
+    learned per-q-head attention sink; dQ/dK/dV are sink-agnostic (saved LSE is already
+    sink-inclusive), only dsink is added."""
     assert causal, "flydsl flash-attn backward is bottom-right causal only"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous(), "SBHD tensors must be contiguous"
     Sq, B, Hq, D = q.shape
@@ -232,6 +258,9 @@ def flash_attn_sbhd_flydsl_backward_impl(
     wl, wr = window_size
     assert wr in (0, -1), "only left-window (W,0) / full (-1,-1) supported"
     window_left = wl if wl >= 0 else -1
+    if sink is not None:
+        assert sink.dtype == torch.float32 and sink.numel() == Hq, "sink must be fp32 [Hq]"
+        sink = sink.contiguous()
 
     return flydsl_varlen_backward(
         dout.contiguous(),
@@ -249,4 +278,5 @@ def flash_attn_sbhd_flydsl_backward_impl(
         softmax_scale,
         window_left=window_left,
         sbhd=True,
+        sink=sink,
     )
