@@ -320,10 +320,9 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
-        # bf16 only: the FlyDSL wgrad consumes the FlyDSL dual-quant's 512-aligned colwise
-        # layout. fp16 activations fall back to the HIP quant (128-aligned col), which this
-        # kernel can't consume -> route fp16 wgrad to Triton.
-        supported &= out_dtype == torch.bfloat16
+        # bf16 and fp16: this kernel consumes the FlyDSL dual-quant's 512-aligned colwise
+        # layout, which the grouped quant now produces for both dtypes.
+        supported &= out_dtype in (torch.bfloat16, torch.float16)
         supported &= not trans_a and not trans_b
         # OUT_M/OUT_N (=a.shape[0]/b.shape[0], swapped by trans_c) must be 64-multiples for
         # the packed-scale preshuffle; non-64 (tiny test shapes) falls back to Triton.

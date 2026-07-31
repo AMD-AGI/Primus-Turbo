@@ -514,8 +514,4 @@ def test_grouped_gemm_fp4_mx_blockwise_deterministic(B, M, NK, dtype, balance, b
     N, K = NK
     if backend == BackendType.FLYDSL and N % 64 != 0:
         pytest.skip("FlyDSL grouped MXFP4 backend requires N % 64 == 0")
-    if backend == BackendType.FLYDSL and dtype != torch.bfloat16:
-        # FlyDSL variable-K wgrad is bf16-only; forcing FLYDSL for fp16 makes the
-        # wgrad dispatch raise instead of falling back to Triton.
-        pytest.skip("FlyDSL grouped MXFP4 wgrad is bf16-only")
     _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend=backend, repeats=10)
