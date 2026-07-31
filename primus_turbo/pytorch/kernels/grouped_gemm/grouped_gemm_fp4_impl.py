@@ -28,7 +28,7 @@ from primus_turbo.pytorch.core.backend import (
     TuneCache,
 )
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float4_e2m1fn_x2
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -70,6 +70,8 @@ class GroupedGEMMFP4TritonBackend(KernelBackend):
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= granularity in GroupedGEMMFP4TritonBackend.SUPPORTED_GRANULARITIES
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            supported &= not is_gfx942()
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
         supported &= out_dtype in (torch.float16, torch.bfloat16)
         # NT only: the kernel infers the contraction from the packed last dim.
@@ -138,12 +140,12 @@ class GroupedGEMMFP4FlyDSLBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
+        supported &= is_gfx950()
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
         supported &= out_dtype in (torch.float16, torch.bfloat16)
         supported &= granularity in GroupedGEMMFP4FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
-        supported &= get_device_compute_capability() >= (9, 5)
 
         supported &= trans_b
         supported &= b.shape[-2] % 64 == 0
@@ -242,6 +244,7 @@ class GroupedGEMMFP4VariableKTritonBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
+        supported &= not is_gfx942()
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKTritonBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
@@ -328,7 +331,7 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         # OUT_M/OUT_N (=a.shape[0]/b.shape[0], swapped by trans_c) must be 64-multiples for
         # the packed-scale preshuffle; non-64 (tiny test shapes) falls back to Triton.
         supported &= a.shape[0] % 64 == 0 and b.shape[0] % 64 == 0
-        supported &= get_device_compute_capability() >= (9, 5)
+        supported &= is_gfx950()
         return supported
 
     @staticmethod
