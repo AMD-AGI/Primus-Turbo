@@ -176,6 +176,7 @@ def _compile(
     ps_release=1,
     push_only=0,
     gemm_only=0,
+    gemm_inv=2,  # see the PT_MXFP8_GEMM_INV comment in dispatch_grouped_gemm_mxfp8
 ):
     K = hidden_size
     N = out_features
@@ -485,7 +486,15 @@ def _compile(
                                 spin_start = read_clock()
                             signal = ld(preshuffle_flag_local, bank_offset + block_m, scope="sys", dtype=fx.T.i64())
                     fx.gpu.barrier()
-                    l2_invalidate()  # acquire: see peer-written pool_fp8 + role-written pool_scale_ps
+                    if gemm_inv == 2:
+                        # `buffer_inv sc1` invalidates the issuing CU's vector L1 and the XCD's
+                        # L2, both of which the whole workgroup shares, so one lane covers all
+                        # 4 waves. Wait for it to land, then release the others via the barrier.
+                        if thread_index == fx.Int32(0):
+                            l2_invalidate()
+                            fx.rocdl.s_waitcnt(fx.Int32(0))
+                    elif gemm_inv:
+                        l2_invalidate()
                     fx.gpu.barrier()
 
                     g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
@@ -644,6 +653,17 @@ def dispatch_grouped_gemm_mxfp8(
     ps_release = int(os.environ.get("PT_MXFP8_PS_RELEASE", "1"))
     push_only = int(os.environ.get("PT_DISPATCH_PUSH_ONLY", "0") == "1")
     gemm_only = int(os.environ.get("PT_DISPATCH_GEMM_ONLY", "0") == "1")
+    # The GEMM role's per-tile whole-L2 `buffer_inv` acquire, which is what makes the peer-pushed
+    # pool rows / preshuffled A-scale visible -- ~4096 workgroups per launch.
+    #   0 = skip (TIMING ONLY, output is not coherent) -- sizes the cost of the acquire.
+    #   1 = every thread issues it (one per wave, 4 per workgroup).
+    #   2 = one lane issues it + s_waitcnt, the trailing barrier releases the other waves.
+    # 2 is the default: the 3 redundant per-wave invalidates were ~90% of the acquire's cost
+    # (L1 2.362 -> 2.169 ms, vs a 2.149 ms no-acquire bound). The cost is issue serialization on
+    # the L2 port, NOT the invalidate evicting the B weights this tile is about to stream -- that
+    # was the earlier theory, and attacking it by making the acquire rarer (fatter workgroups,
+    # fewer tiles each) lost more to pipeline serialization than it saved.
+    gemm_inv = int(os.environ.get("PT_MXFP8_GEMM_INV", "2"))
 
     dev = xq.device
     if fuse_setup and needs_x_quant:
@@ -747,6 +767,7 @@ def dispatch_grouped_gemm_mxfp8(
         ps_release=ps_release,
         push_only=push_only,
         gemm_only=gemm_only,
+        gemm_inv=gemm_inv,
     )
     args = (
         x_bf16,
@@ -776,7 +797,7 @@ def dispatch_grouped_gemm_mxfp8(
     )
     ck = (N, K, num_max_pool_tokens, BM, BN, int(num_dispatch_cu), int(num_preshuffle_cu),
           int(num_setup_cu), int(num_comm), int(num_ranks), int(G), num_tokens, cbsz, blgp, out_fp16, int(GROUP_M),
-          ps_read_cm, ps_coalesce, ps_release, push_only, gemm_only)
+          ps_read_cm, ps_coalesce, ps_release, push_only, gemm_only, gemm_inv)
     if torch.cuda.is_current_stream_capturing():
         raw(*args)
     else:
