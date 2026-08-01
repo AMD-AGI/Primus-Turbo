@@ -100,10 +100,10 @@ def mega_moe_forward_fp8_impl(
     # NOTE: the isolated l1 bench favoured 24/8, but that was a back-to-back-prologue artifact; the
     # per-forward op path (e2e) is insensitive to this split, so keep the 16/16 default.
     l1, handle, dispatch_weights, pool_x_fp8 = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
-        x, 
-        w1q, w1s, 
-        group, 
-        topk_idx=topk_idx, 
+        x,
+        w1q, w1s,
+        group,
+        topk_idx=topk_idx,
         topk_weights=topk_weights,
         num_dispatch_cu=_L1_NUM_DISPATCH_CU,
         num_preshuffle_cu=_L1_NUM_PRESHUFFLE_CU,
@@ -119,7 +119,8 @@ def mega_moe_forward_fp8_impl(
     # grouped_gemm_combine_mxfp8_flydsl_kernel is self-contained: it resets the L2 scoreboard/flags cross-rank.
     y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
         None, (w2q, w2s), list(handle), group,
-        topk_indices=topk_idx, topk_weights=topk_weights.to(torch.float32),
+        topk_indices=topk_idx,
+        topk_weights=topk_weights if topk_weights.dtype == torch.float32 else topk_weights.to(torch.float32),
         x_fp8=(act_fp8, act_a_sp),
         BM=block_m, BN=block_n,
         num_combine_cu=_L2_NUM_COMBINE_CU,

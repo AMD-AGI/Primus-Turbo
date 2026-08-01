@@ -29,6 +29,7 @@ from flydsl.expr.buffer_ops import (
 from primus_turbo.flydsl.mega.fp8.quant_flydsl import (
     _e8m0_broadcast_i32,
     _preshuffle_a_idx,
+    _quant_block_words,
 )
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, l2_writeback
 from primus_turbo.flydsl.mega.fp8.gemm_helper import _emit_if_then, ceildiv
@@ -96,8 +97,9 @@ def dispatch_fp8_copy_tile(
     thread_index,
     hidden_size,
     num_max_pool_tokens,
-    xq_resource,  # local pre-quantized fp8 tokens viewed int32 [T, hidden//4]
-    xs_resource,  # local raw E8M0 scales viewed int32 [T, hidden//128]
+    xq_resource=None,  # pre-quant fp8 tokens int32 [T, hidden//4]; omit when x_bf16_resource set
+    xs_resource=None,  # raw E8M0 scales int32 [T, hidden//128]
+    x_bf16_resource=None,  # bf16 [T, hidden]: in-push rowwise quant fused into this COMM role
     expert_send_dst_rank_resource,
     expert_send_dst_row_resource,
     expert_send_count_resource,

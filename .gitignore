@@ -12,6 +12,7 @@ test-reports/
 *_hip.cuh
 agent/tmp/
 agent/workspace/
+bench_logs_e2e/
 logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
