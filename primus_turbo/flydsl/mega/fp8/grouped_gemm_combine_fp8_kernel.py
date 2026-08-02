@@ -473,7 +473,7 @@ def _compile(
                     ACT, A_SCALE, WEIGHTS, B_SCALE, lds, block_m, block_n,
                     K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, G=num_groups, group_idx=group_index,
                     c_m=c_m_const, c_n=c_n, nt_vmcnt=nt_vmcnt, scale_pack=4,
-                    store_c=store_c, full_barrier=False, b_n_slabs=False,
+                    store_c=store_c,
                 )
                 fx.rocdl.s_waitcnt(0)
                 rocdl.s_barrier()
