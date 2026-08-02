@@ -4,18 +4,16 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Fused cross-rank dispatch PUSH (fp8) + grouped MXFP8 GEMM (NT), FlyDSL — 4-stage grid.
+"""Fused cross-rank dispatch PUSH (fp8) + grouped MXFP8 GEMM (NT), FlyDSL — 3-stage grid.
 
-One role-specialized kernel launched on every rank; each block picks its role from its index:
+Token quant and the weight B-scale preshuffle run host-side before the launch (the latter cached
+per weight version). One role-specialized kernel launched on every rank; each block picks its role
+from its index:
 
-  * SETUP (first ``num_setup_cu`` blocks): rowwise mxfp8 quant of the bf16 activations into
-    scratch ``xq``/``xs``, plus the weight B-scale preshuffle into ``weight_scale_ps`` when the
-    weight version is new. A device-scope gate releases the rest of the grid only once every
-    setup block has finished, so neither step needs its own host launch.
-  * COMM: each block pushes one comm task's PRE-QUANTIZED fp8 token rows and their RAW E8M0
-    block scales into the peer ``pool_fp8`` / ``pool_scale`` over XGMI, then signals the peer's
-    per-pool-block scoreboard. Quantizing once on the source keeps the push coalesced and
-    XGMI-bound (no in-push quant).
+  * COMM (first ``num_dispatch_cu`` blocks): each block pushes one comm task's PRE-QUANTIZED fp8
+    token rows and their RAW E8M0 block scales into the peer ``pool_fp8`` / ``pool_scale`` over
+    XGMI, then signals the peer's per-pool-block scoreboard. Quantizing once on the source keeps
+    the push coalesced and XGMI-bound (no in-push quant).
   * PRESHUFFLE (next ``num_preshuffle_cu`` blocks): waits for a pool-block's rows, transposes
     that block's A-scale raw -> ScaleS2R broadcast into the local ``pool_scale_ps`` ONCE
     (non-redundant), then stamps a SENTINEL on the scoreboard.
@@ -23,7 +21,7 @@ One role-specialized kernel launched on every rank; each block picks its role fr
     broadcast ``pool_scale_ps``, per-expert B = ``weight_fp8`` + preshuffled ``weight_scale``)
     via ``gemm_mxfp8_nt_tile``, spinning until its pool-block's SENTINEL is set.
 
-Comm, preshuffle and gemm overlap once setup completes. The sys-scope scoreboard plus each
+Comm, preshuffle and gemm all overlap inside the one grid. The sys-scope scoreboard plus each
 role's own cache fence carry all cross-rank / cross-XCD visibility, so no host sync is needed.
 
 NT only. Constraints: hidden % 1024 == 0 (fp8 warp push), N % BLOCK_N == 0,
@@ -38,7 +36,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from torch.distributed import ProcessGroup
-from flydsl.expr import arith, range_constexpr
+from flydsl.expr import arith
 from flydsl.expr.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -56,16 +54,12 @@ from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     gemm_mxfp8_nt_tile,
 )
 from primus_turbo.flydsl.mega.fp8.quant import (
-    _BLK as _QUANT_BLK,
-    _quant_block_words,
     preshuffle_b_scale,
     quantize_rowwise_mxfp8_flydsl,
 )
-from primus_turbo.flydsl.mega.fp8.barrier import grid_sync
 from primus_turbo.flydsl.mega.prims import cast
 from primus_turbo.flydsl.mega.fp8.prims import (
     l2_invalidate,
-    l2_writeback,
     ld,
     read_clock,
     spin_timed_out,
@@ -73,7 +67,6 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.gemm_helper import (
-    _PRESHUF_KT,
     _emit_lds_repack,
     ceildiv,
     make_value_attrs,
@@ -85,10 +78,6 @@ _FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip 
 _BSP_CACHE: dict = {}  # (weight data_ptr, G, N, K) -> preshuffled weight scale b_sp (weights static)
 _WEIGHTS_FLAT_CACHE: dict = {}  # (w1q data_ptr, G, N, K) -> int8 flat WEIGHTS view (weights static)
 _L1_OUTPUT_SCRATCH: dict = {}  # (P, N, dtype, device) -> bf16 L1 output buffer (fixed training shape)
-_XQ_SCRATCH: dict = {}  # (T, K, device) -> fp8 token scratch for fused setup quant
-_XS_SCRATCH: dict = {}  # (T, K, device) -> raw E8M0 scale scratch for fused setup quant
-_BSP_ALLOC: dict = {}  # (w1s data_ptr, G, N, K, pack) -> int32 b_sp buffer (filled by setup role)
-_SETUP_GATE: dict = {}  # device -> int32[2] [counter, done] for setup->pipeline release
 
 
 def _make_fwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, tile_ps):
@@ -150,11 +139,9 @@ def _compile(
     BLOCK_N,
     num_dispatch_cu,
     num_preshuffle_cu,
-    num_setup_cu,
     num_comm,
     num_ranks,
     G,
-    num_tokens,
     blgp=0,
     nt_vmcnt=3,
     waves_per_eu=2,
@@ -182,34 +169,16 @@ def _compile(
     SharedStorage = _make_fwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, TILE_PS)
     n_blocks = N // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
-    _setup_cu = num_setup_cu
     _comm_cu = num_dispatch_cu
-    _pipeline_base = _setup_cu
-    _gemm_base = _pipeline_base + _comm_cu + num_preshuffle_cu  # gemm tiles after setup+comm+ps
+    _gemm_base = _comm_cu + num_preshuffle_cu  # gemm tiles come after comm+ps
     _grid_size = _gemm_base + worst_case_tiles * n_blocks
     pool_scale_bytes_raw = num_max_pool_tokens * (K // 32)  # raw E8M0 pool region bytes
     _ps_rounds = (worst_case_tiles + num_preshuffle_cu - 1) // num_preshuffle_cu
-    _quant_n_blk = K // _QUANT_BLK
-    _quant_k_fp8_i32 = K // 4
-    _quant_blk_i32 = _QUANT_BLK // 4
-    GN = G * N
-    _b_ps_n_kt = ceildiv(K128, _PRESHUF_KT)
-    _b_ps_ngrp = ((GN + 255) // 256) * 4
-    _b_ps_blocks = _b_ps_ngrp * _b_ps_n_kt
-    _b_raw_bytes = GN * K128 * 4
-    _b_sp_bytes = _b_ps_ngrp * K128 * 256 * 4
-    _x_bf16_bytes = num_tokens * K * 2
-    _xq_bytes = num_tokens * K
-    _xs_bytes = num_tokens * (K // 32)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_mxfp8_kernel(
-        X_BF16: fx.Tensor,  # bf16 activations [T, K] (dummy when the host quantized instead)
-        W1S_RAW: fx.Tensor,  # raw weight E8M0 int32 view [G*N, K128]
-        XQ: fx.Tensor,  # fp8 tokens int32 view [T, K//4] flattened (setup writes, comm reads)
-        XS_U8: fx.Tensor,  # raw E8M0 scales uint8 [T, K//32] flat (setup quant writes)
-        XS: fx.Tensor,  # same storage int32 view [T, K//128] (comm reads)
-        SETUP_GATE: fx.Tensor,  # i32[4]: [counter, done, needs_x, needs_b]
+        XQ: fx.Tensor,  # fp8 tokens int32 view [T, K//4] flattened (comm reads)
+        XS: fx.Tensor,  # raw E8M0 scales int32 view [T, K//128] (comm reads)
         EXPERT_SEND_DST_RANK: fx.Tensor,
         EXPERT_SEND_DST_ROW: fx.Tensor,
         EXPERT_SEND_COUNT: fx.Tensor,
@@ -230,93 +199,9 @@ def _compile(
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
-        setup_base = fx.Int32(_setup_cu)
         comm_block_count = fx.Int32(_comm_cu)
-        pipeline_base = fx.Int32(_pipeline_base)
         gemm_base = fx.Int32(_gemm_base)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        setup_gate_res = create_buffer_resource(SETUP_GATE, max_size=True)
-
-        # ---- SETUP role ----
-        if block_index < setup_base:
-            setup_idx = block_index
-            needs_x = buffer_load(setup_gate_res, fx.Int32(2), vec_width=1, dtype=fx.T.i32())
-            needs_b = buffer_load(setup_gate_res, fx.Int32(3), vec_width=1, dtype=fx.T.i32())
-            if (needs_x == fx.Int32(0)) and (needs_b == fx.Int32(0)):
-                if block_index == fx.Int32(0) and thread_index == fx.Int32(0):
-                    buffer_store(fx.Int32(1), setup_gate_res, fx.Int32(1))
-                return
-            if needs_x != fx.Int32(0):
-                xr = create_buffer_resource(X_BF16, max_size=True)
-                qr = create_buffer_resource(XQ, max_size=True)
-                sr = create_buffer_resource(XS_U8, max_size=True)
-                row = setup_idx
-                while row < fx.Int32(num_tokens):
-                    b = thread_index
-                    while b < fx.Int32(_quant_n_blk):
-                        base = row * fx.Int32(K) + b * fx.Int32(_QUANT_BLK)
-                        words, biased = _quant_block_words(xr, base)
-                        buffer_store(
-                            fx.arith.ArithValue(biased).trunci(fx.T.i8()),
-                            sr,
-                            row * fx.Int32(_quant_n_blk) + b,
-                        )
-                        base_i32 = row * fx.Int32(_quant_k_fp8_i32) + b * fx.Int32(_quant_blk_i32)
-                        for wi in range_constexpr(_quant_blk_i32):
-                            buffer_store(words[wi], qr, base_i32 + fx.Int32(wi))
-                        b = b + fx.Int32(_BLOCK_THREADS)
-                    row = row + setup_base
-                fx.rocdl.s_waitcnt(fx.Int32(0))
-            fx.gpu.barrier()
-            if needs_b != fx.Int32(0):
-                b_raw_res = create_buffer_resource(
-                    W1S_RAW, max_size=False, num_records_bytes=_b_raw_bytes
-                )
-                b_sp_res = create_buffer_resource(
-                    WEIGHT_SCALE_PS, max_size=False, num_records_bytes=_b_sp_bytes
-                )
-                bb = setup_idx
-                while bb < fx.Int32(_b_ps_blocks):
-                    grp = bb // fx.Int32(_b_ps_n_kt)
-                    k0 = (bb % fx.Int32(_b_ps_n_kt)) * fx.Int32(_PRESHUF_KT)
-                    _emit_lds_repack(
-                        False,
-                        grp,
-                        k0,
-                        lds.ps_tile,
-                        b_raw_res,
-                        b_sp_res,
-                        fx.Int32(GN),
-                        K128,
-                        _PRESHUF_KT,
-                        thread_index,
-                        _BLOCK_THREADS,
-                        pack=1,
-                    )
-                    fx.gpu.barrier()
-                    bb = bb + setup_base
-            if _setup_cu > 1:
-                grid_sync(sym_layout, thread_index, block_index, _setup_cu, -1, "mxfp8/setup")
-            else:
-                fx.gpu.barrier()
-            l2_writeback()
-            fx.gpu.barrier()
-            if block_index == fx.Int32(0) and thread_index == fx.Int32(0):
-                buffer_store(fx.Int32(1), setup_gate_res, fx.Int32(1))
-            fx.gpu.barrier()
-            return
-
-        # Pipeline blocks wait until setup releases the comm|ps|gemm overlap region.
-        if thread_index == fx.Int32(0):
-            spin_start = read_clock()
-            done = buffer_load(setup_gate_res, fx.Int32(1), vec_width=1, dtype=fx.T.i32())
-            while done != fx.Int32(1):
-                fx.rocdl.s_sleep(fx.Int32(2))
-                if spin_timed_out(spin_start):
-                    fx.printf("MEGA mxfp8 setup gate timeout: block={}\n", block_index)
-                    spin_start = read_clock()
-                done = buffer_load(setup_gate_res, fx.Int32(1), vec_width=1, dtype=fx.T.i32())
-        fx.gpu.barrier()
 
         # ---- epoch: parity picks the flag bank; expected[parity] is the cumulative spin target ----
         disp_parity_res = create_buffer_resource(DISP_PARITY, max_size=True)
@@ -366,7 +251,7 @@ def _compile(
             world_size=num_ranks,
         )
 
-        pipeline_idx = block_index - pipeline_base
+        pipeline_idx = block_index
 
         if pipeline_idx < comm_block_count:
             if not _gemm_only:
@@ -501,12 +386,8 @@ def _compile(
 
     @flyc.jit
     def launch(
-        X_BF16,
-        W1S_RAW,
         XQ,
-        XS_U8,
         XS,
-        SETUP_GATE,
         EXPERT_SEND_DST_RANK,
         EXPERT_SEND_DST_ROW,
         EXPERT_SEND_COUNT,
@@ -531,12 +412,8 @@ def _compile(
             grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
         )
         dispatch_grouped_gemm_mxfp8_kernel(
-            X_BF16,
-            W1S_RAW,
             XQ,
-            XS_U8,
             XS,
-            SETUP_GATE,
             EXPERT_SEND_DST_RANK,
             EXPERT_SEND_DST_ROW,
             EXPERT_SEND_COUNT,
@@ -575,17 +452,14 @@ def dispatch_grouped_gemm_mxfp8(
     GROUP_M: int = 4,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Fused fp8 dispatch PUSH + grouped mxfp8 L1 GEMM (setup + comm/preshuffle/gemm pipeline).
+    """Fused fp8 dispatch PUSH + grouped mxfp8 L1 GEMM (comm/preshuffle/gemm pipeline).
 
-    Takes the bf16 activation ``x`` [T, K] and produces its mxfp8 rowwise quant internally: under
-    ``PT_DISPATCH_FUSE_SETUP=1`` the kernel's SETUP role quantizes all T rows into scratch before
-    the comm|preshuffle|gemm overlap begins (no separate host quant launch), otherwise a host-side
-    quant launch runs first. Weight B-scale preshuffle (ScaleBComb) also runs in SETUP when the
-    weight version is new; static weights are cached host-side after the first preshuffle.
+    Takes the bf16 activation ``x`` [T, K] and produces its mxfp8 rowwise quant internally via one
+    host-side launch, then runs the comm|preshuffle|gemm overlap. The weight B-scale preshuffle
+    (ScaleBComb) is host-side too and cached per weight version, since weights are static.
 
     The gates self-reset via the device epoch bump (see ``_make_epoch_bump``); its tensors ride
     on ``symm``."""
-    fuse_setup = int(os.environ.get("PT_DISPATCH_FUSE_SETUP", "0") == "1")
     assert x.dtype == torch.bfloat16, f"activation must be bf16, got {x.dtype}"
     (
         expert_send_dst_rank,
@@ -607,75 +481,31 @@ def dispatch_grouped_gemm_mxfp8(
     blgp = 1 if w1q.dtype == torch.float8_e5m2 else 0
     out_fp16 = out_dtype == torch.float16
     c_n = N
-    num_tokens = int(T)
     # Breakdown switches: compile only the push leg or only the gemm leg, so a bench can time
     # them separately. Either one on makes the output WRONG.
     push_only = int(os.environ.get("PT_DISPATCH_PUSH_ONLY", "0") == "1")
     gemm_only = int(os.environ.get("PT_DISPATCH_GEMM_ONLY", "0") == "1")
 
     dev = x.device
-    if fuse_setup:
-        # SETUP role quantizes x in-grid; hand it the bf16 rows plus persistent fp8/scale scratch.
-        x_bf16 = x if x.is_contiguous() else x.contiguous()
-        _xq_sk = (T, K, dev)
-        xq_c = _XQ_SCRATCH.get(_xq_sk)
-        if xq_c is None:
-            xq_c = torch.empty((T, K), dtype=torch.float8_e4m3fn, device=dev)
-            _XQ_SCRATCH[_xq_sk] = xq_c
-        xs_c = _XS_SCRATCH.get(_xq_sk)
-        if xs_c is None:
-            xs_c = torch.empty((T, K // 32), dtype=torch.uint8, device=dev)
-            _XS_SCRATCH[_xq_sk] = xs_c
-    else:
-        x_bf16 = torch.empty(1, dtype=torch.bfloat16, device=dev)  # unused by the grid
-        xq, xs = quantize_rowwise_mxfp8_flydsl(x)
-        xs = xs.view(torch.float8_e8m0fnu)
-        xq_c = xq if xq.is_contiguous() else xq.contiguous()
-        xs_c = xs if xs.is_contiguous() else xs.contiguous()
-        if xs_c.dtype != torch.uint8:
-            xs_c = xs_c.view(torch.uint8)
+    xq, xs = quantize_rowwise_mxfp8_flydsl(x)
+    xs = xs.view(torch.float8_e8m0fnu)
+    xq_c = xq if xq.is_contiguous() else xq.contiguous()
+    xs_c = xs if xs.is_contiguous() else xs.contiguous()
+    if xs_c.dtype != torch.uint8:
+        xs_c = xs_c.view(torch.uint8)
     XQ = xq_c.view(torch.int32)
-    XS_U8 = xs_c
     XS = xs_c.view(torch.int32)
-    W1S_RAW = w1s.contiguous().reshape(G * N, K // 32).view(torch.int32).reshape(-1)
     _wk = (w1q.data_ptr(), G, N, K)
     WEIGHTS = _WEIGHTS_FLAT_CACHE.get(_wk)
     if WEIGHTS is None:
         WEIGHTS = w1q.contiguous().reshape(G * N, K).view(torch.int8).reshape(-1)
         _WEIGHTS_FLAT_CACHE[_wk] = WEIGHTS
     _bk = (w1s.data_ptr(), G, N, K, 1)  # L1 GEMM reads ScaleBComb with pack=1
-    needs_b_ps = fuse_setup and (_bk not in _BSP_CACHE)
-    setup_env_cu = int(os.environ.get("PT_DISPATCH_SETUP_CU", "2"))
-    if fuse_setup:
-        # x quant alone fits in one CU; a fresh weight also needs the B-scale preshuffle.
-        num_setup_cu = setup_env_cu if needs_b_ps else 1
-    else:
-        num_setup_cu = 0
-    if needs_b_ps:
-        K128 = K // 128
-        b_ngrp = ((G * N + 255) // 256) * 4
-        weight_scale_ps = _BSP_ALLOC.get(_bk)
-        if weight_scale_ps is None:
-            weight_scale_ps = torch.zeros(b_ngrp * K128 * 256, dtype=torch.int32, device=dev)
-            _BSP_ALLOC[_bk] = weight_scale_ps
-    else:
-        weight_scale_ps = _BSP_CACHE.get(_bk)
-        if weight_scale_ps is None:
-            weight_scale_ps = preshuffle_b_scale(w1s, G, N, K, pack=1)
-            _BSP_CACHE[_bk] = weight_scale_ps
+    weight_scale_ps = _BSP_CACHE.get(_bk)
+    if weight_scale_ps is None:
+        weight_scale_ps = preshuffle_b_scale(w1s, G, N, K, pack=1)
+        _BSP_CACHE[_bk] = weight_scale_ps
     pool_scale_ps = symm.pool_scale_ps  # local broadcast a_sp (preshuffle role writes it)
-
-    setup_gate = _SETUP_GATE.get(dev)
-    if setup_gate is None:
-        setup_gate = torch.zeros(4, dtype=torch.int32, device=dev)
-        _SETUP_GATE[dev] = setup_gate
-    setup_gate.zero_()
-    setup_gate[2] = int(fuse_setup)
-    setup_gate[3] = int(needs_b_ps)
-    if num_setup_cu == 0 or not fuse_setup:
-        setup_gate[1] = 1
-    if num_setup_cu > 1:
-        symm.grid_sync_count.zero_()
 
     num_tile_blocks = symm.meta_scalars[1:2]
     _out_sk = (num_max_pool_tokens, N, out_dtype, dev)
@@ -693,11 +523,9 @@ def dispatch_grouped_gemm_mxfp8(
         BN,
         int(num_dispatch_cu),
         int(num_preshuffle_cu),
-        int(num_setup_cu),
         int(num_comm),
         int(num_ranks),
         int(G),
-        num_tokens,
         blgp=blgp,
         out_fp16=out_fp16,
         GROUP_M=int(GROUP_M),
@@ -705,12 +533,8 @@ def dispatch_grouped_gemm_mxfp8(
         gemm_only=gemm_only,
     )
     args = (
-        x_bf16,
-        W1S_RAW,
         XQ,
-        XS_U8,
         XS,
-        setup_gate,
         expert_send_dst_rank,
         expert_send_dst_row,
         expert_send_count,
@@ -731,7 +555,7 @@ def dispatch_grouped_gemm_mxfp8(
         torch.cuda.current_stream(),
     )
     ck = (N, K, num_max_pool_tokens, BM, BN, int(num_dispatch_cu), int(num_preshuffle_cu),
-          int(num_setup_cu), int(num_comm), int(num_ranks), int(G), num_tokens, blgp, out_fp16, int(GROUP_M),
+          int(num_comm), int(num_ranks), int(G), blgp, out_fp16, int(GROUP_M),
           push_only, gemm_only)
     if torch.cuda.is_current_stream_capturing():
         raw(*args)
@@ -741,8 +565,6 @@ def dispatch_grouped_gemm_mxfp8(
             compiled = flyc.compile(raw, *args)
             _FUSED_COMPILED[ck] = compiled
         compiled(*args)
-    if needs_b_ps:
-        _BSP_CACHE[_bk] = weight_scale_ps
     return output
 
 
