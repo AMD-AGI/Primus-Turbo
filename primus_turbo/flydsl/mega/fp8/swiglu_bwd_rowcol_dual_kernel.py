@@ -113,7 +113,6 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
     class Smem:
         tile: fx.Array[fx.Int32, TILE, 16]        # dgate|dup<<16 bf16 pair [row*BT + i]
         rscale: fx.Array[fx.Int32, 2 * BT, 16]    # rowwise E8M0 byte, gate half then up half
-        meta: fx.Array[fx.Int32, 3, 16]           # WG-uniform in_off_g, len_g, m_local0
 
     # Named, not `kern`: every FlyDSL kernel lowers to its Python function name, so a generic
     # name collides with a dozen others in a profile and cannot be selected by ATT regex.
@@ -144,7 +143,6 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
         lds = fx.SharedAllocator().allocate(Smem).peek()
         tile = lds.tile
         rscale = lds.rscale
-        meta_lds = lds.meta
 
         c_lo = fx.arith.constant(-c_max, type=fx.T.f32())
         c_hi = fx.arith.constant(c_max, type=fx.T.f32())
@@ -166,15 +164,15 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
         def _ld(arr, idx):
             return fx.Int32(Vec(_lds_ptr(arr, idx).load())[0])
 
+        # `pmb` is bid/n_itile, so these three addresses are workgroup-uniform and every lane
+        # can just read them.  The kernel this was derived from staged them through LDS behind
+        # a barrier; the sibling kernels in quant_colwise_trans_flydsl.py (`pack_kern`,
+        # `_compile_colwise_quant_grouped`) do not, and the barrier plus the
+        # v_readfirstlane_b32 the read-back lowers to were 8% of all stall.
         mb = pmb * fx.Int32(4)
-        if tid == fx.Int32(0):
-            _st(meta_lds, fx.Int32(0), buffer_load(pmbr, mb + fx.Int32(1), vec_width=1, dtype=fx.T.i32()))
-            _st(meta_lds, fx.Int32(1), buffer_load(pmbr, mb + fx.Int32(2), vec_width=1, dtype=fx.T.i32()))
-            _st(meta_lds, fx.Int32(2), buffer_load(pmbr, mb + fx.Int32(3), vec_width=1, dtype=fx.T.i32()))
-        fx.gpu.barrier()
-        in_off_g = _ld(meta_lds, fx.Int32(0))
-        len_g = _ld(meta_lds, fx.Int32(1))
-        m_local0 = fx.arith.ArithValue(_ld(meta_lds, fx.Int32(2)))
+        in_off_g = buffer_load(pmbr, mb + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
+        len_g = buffer_load(pmbr, mb + fx.Int32(2), vec_width=1, dtype=fx.T.i32())
+        m_local0 = fx.arith.ArithValue(buffer_load(pmbr, mb + fx.Int32(3), vec_width=1, dtype=fx.T.i32()))
 
         def _biased(amax, round_add, target):
             bits = fx.arith.ArithValue(amax).bitcast(fx.T.i32()) + fx.Int32(round_add)
