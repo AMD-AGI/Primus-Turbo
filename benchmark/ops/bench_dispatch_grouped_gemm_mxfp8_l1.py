@@ -38,8 +38,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
-    quantize_grouped_weight_mxfp8,
-    quantize_rowwise_mxfp8,
+    quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
     quantize_rowwise_mxfp8_flydsl,
 )
 
@@ -112,7 +111,7 @@ def profile(group, args):
         dispatch_prologue(
             topk_idx, topk_weight, sym_layout=sym_layout, num_tokens=T, num_topk=K,
             num_experts=E, world_size=world, rank=rank, experts_per_rank=epr,
-            block_m=BM, num_max_pool_tokens=symm.num_max_pool_tokens, no_cpu_sync=True,
+            block_m=BM, num_max_pool_tokens=symm.num_max_pool_tokens,
         )
     )
     tile_to_expert = handle[_H_TILE_TO_EXPERT]

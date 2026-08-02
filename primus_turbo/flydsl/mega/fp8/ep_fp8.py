@@ -29,20 +29,13 @@ from flydsl.expr.buffer_ops import (
 from primus_turbo.flydsl.mega.fp8.quant_flydsl import (
     _e8m0_broadcast_i32,
     _preshuffle_a_idx,
-    _quant_block_words,
 )
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, l2_writeback
-from primus_turbo.flydsl.mega.fp8.gemm_helper import _emit_if_then, ceildiv
+from primus_turbo.flydsl.mega.fp8.gemm_helper import _emit_if_then
 
 _WARP = 64
 _BLOCK_THREADS = 512
 _VEC_I32 = 4  # 4 x i32 = 16B / lane (b128 XGMI)
-
-
-def pool_scale_broadcast_i32(num_max_pool_tokens, hidden_size):
-    """Element count of the pool_scale region in the ScaleS2R broadcast layout-1
-    (int32): ceildiv(P, 64) * K128 * 256. This replaces the raw P*(hidden//32) bytes."""
-    return ceildiv(num_max_pool_tokens, 64) * (hidden_size // 128) * 256
 
 
 def preshuffle_a_scale_tile(

@@ -93,7 +93,7 @@ def worker(local_rank, world, args):
             dispatch_prologue(
                 topk_idx, topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=K,
                 num_experts=E, world_size=world, rank=rank, experts_per_rank=epr,
-                block_m=BM, num_max_pool_tokens=symm.num_max_pool_tokens, no_cpu_sync=True,
+                block_m=BM, num_max_pool_tokens=symm.num_max_pool_tokens,
             )
         )
 

@@ -120,10 +120,6 @@ def elem_ptr(base, idx, space, elem_bytes=4):
     return get_element_ptr(ptr, byte_offset=byte_off, elem_type=fx.T.i8())
 
 
-def addr_elem_ptr_i32(addr_i64, idx):
-    return elem_ptr(addr_i64, idx, "global")
-
-
 def atomic_add(base, offset, val, scope="agent", space="global", order="relaxed"):
     val = _as_value(val)
     elem_bytes = val.type.width // 8
@@ -138,25 +134,6 @@ def atomic_add(base, offset, val, scope="agent", space="global", order="relaxed"
         alignment=elem_bytes,
     )
     return fx.arith.ArithValue(res, signed=True)
-
-
-def atomic_cas(base, offset, cmp, val, scope="agent", space="global", order="relaxed"):
-    cmp = _as_value(cmp)
-    val = _as_value(val)
-    elem_bytes = val.type.width // 8
-    ptr = elem_ptr(base, offset, space, elem_bytes)
-    _fence_if_ordered(order)
-    pair = llvm.cmpxchg(
-        ptr,
-        cmp,
-        val,
-        llvm.AtomicOrdering.monotonic,
-        llvm.AtomicOrdering.monotonic,
-        syncscope=_unwrap_scope(scope),
-        alignment=elem_bytes,
-    )
-    old = llvm.extractvalue(val.type, pair, [0])
-    return fx.arith.ArithValue(old, signed=True)
 
 
 def ld(base, offset, *, scope="agent", space="global", order="relaxed", dtype=None):

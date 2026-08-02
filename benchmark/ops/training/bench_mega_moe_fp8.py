@@ -102,9 +102,6 @@ from primus_turbo.pytorch.core.low_precision import ScalingGranularity  # noqa: 
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (  # noqa: E402
     grouped_gemm_fp8_variable_k_impl,
 )
-from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (  # noqa: E402
-    rowcol_dual_quant_mxfp8_grouped_flydsl,
-)
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (  # noqa: E402  (fp8 bwd stages)
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,

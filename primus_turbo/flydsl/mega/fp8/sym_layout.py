@@ -40,13 +40,6 @@ def _align(x, a=_BASE_ALIGNMENT):
     return (x + a - 1) // a * a
 
 
-def get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank):
-    """Worst-case shared pool capacity (mega_moe.cuh ``get_num_max_pool_tokens``)."""
-    recv = num_ranks * num_max_tokens_per_rank
-    m = min(num_topk, num_experts_per_rank)
-    return _align(recv * m + num_experts_per_rank * (_MAX_BLOCK_M - 1), _LCM_BLOCK_M)
-
-
 # ---------------------------------------------------------------------------
 # The struct (passed to kernels by value) -- the single source of truth.
 # ---------------------------------------------------------------------------
@@ -159,23 +152,6 @@ def layout(sl):
     return main_off, sig_off, main_total, sig_total
 
 
-# host-facing layout views (used by tests / sizing)
-def num_bytes(sl):
-    """(main_bytes, signal_bytes) for one rank's two heaps."""
-    _, _, mb, sb = layout(sl)
-    return mb, sb
-
-
-def region_offset(sl, name):
-    """(byte offset, itemsize, heap) of a named region."""
-    main_off, sig_off, _, _ = layout(sl)
-    if name in main_off:
-        off, item, _ = main_off[name]
-        return off, item, "main"
-    off, item, _ = sig_off[name]
-    return off, item, "signal"
-
-
 # ---------------------------------------------------------------------------
 # Device helpers
 # ---------------------------------------------------------------------------
@@ -207,12 +183,6 @@ def _region_ptr(sl, name, index=0, dst_rank=None):
 def sym_map(sl, ptr, dst_rank):
     """Translate a local MAIN-heap ptr ``ptr`` (i64) into peer ``dst_rank``."""
     res = addr_buffer_resource(sl.offsets_ptr, num_records_bytes=int(sl.num_ranks) * 8)
-    return ptr + buffer_load(res, dst_rank, vec_width=1, dtype=fx.T.i64())
-
-
-def map_signal(sl, ptr, dst_rank):
-    """Translate a local SIGNAL-heap ptr ``ptr`` (i64) into peer ``dst_rank``."""
-    res = addr_buffer_resource(sl.signal_offsets_ptr, num_records_bytes=int(sl.num_ranks) * 8)
     return ptr + buffer_load(res, dst_rank, vec_width=1, dtype=fx.T.i64())
 
 
@@ -268,8 +238,9 @@ def build_sym_layout(
 # Convenience accessors: ``sym_layout.<region>_ptr`` -> this rank's i64 base ptr of that
 # region (a read-only property, so it is safe to read inside scf if/while regions -- a
 # struct method call would otherwise be treated as a state variable). Peer translation
-# uses ``sym_map(sym_layout, sym_layout.<region>_ptr, dst_rank)`` (``map_signal`` for the
-# signal heap). (_specialize_type subclasses SymLayout, so these properties are inherited
+# uses ``sym_map(sym_layout, sym_layout.<region>_ptr, dst_rank)`` for MAIN-heap regions;
+# SIGNAL-heap regions are translated in-kernel against a ``signal_offsets_ptr`` delta
+# resource. (_specialize_type subclasses SymLayout, so these properties are inherited
 # by the per-shape specialized instances.) Names must match _main_regions / _signal_regions.
 # ---------------------------------------------------------------------------
 _REGION_ACCESSORS = (

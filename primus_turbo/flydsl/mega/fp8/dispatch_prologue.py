@@ -60,7 +60,6 @@ _DEFAULT_GRID_BLOCKS = 64
 # Address-space / scope constants (atomic + fence prims come from prims.py)
 # --------------------------------------------------------------------------- #
 _SCOPE = "agent"  # device-wide scope (Triton scope="gpu" lowers to this)
-_I4 = 4  # int32 byte stride / atomic alignment
 _GLOBAL = 1  # LLVM global address space
 _LDS = 3  # LLVM LDS (workgroup) address space
 
@@ -82,10 +81,12 @@ def _ext_i64(v):
     return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
 
 
-# Prologue outputs are returned as a plain positional tuple:
-#   (handle, tile_to_expert, tile_expected, origin_rank, origin_slot,
-#    num_pool_blocks, max_num_token, num_tokens_per_expert, num_tokens_per_expert_prefix)
-# handle = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
+# The prologue returns one flat positional handle (DeepEP-style) the dispatch/combine kernels
+# unpack by index:
+#   0 expert_send_dst_rank   1 expert_send_dst_row  2 expert_send_count  3 expert_send_offset
+#   4 dispatched_token_idx   5 dispatched_topk_slot 6 src_token_weight
+#   7 tile_to_expert         8 tile_expected
+#   9 num_tokens_per_expert 10 num_tokens_per_expert_prefix
 # num_tokens_per_expert = REAL group_len (unpadded); _prefix = group_offs into the block_m-padded
 # pool (local experts). Consumers mask rows with `local_row < group_len`, so the len must be real
 # while the offset must be padded.
@@ -565,8 +566,7 @@ def _compile(
     )
 
 
-# Module-level fast-launch cache (function/stream-keyed CallState) used when the
-# caller does not supply its own launch_cache.
+# Module-level fast-launch cache (function/stream-keyed CallState).
 _DEFAULT_LAUNCH_CACHE: dict = {}
 
 
@@ -600,8 +600,6 @@ def dispatch_prologue(
     experts_per_rank,
     block_m,
     num_max_pool_tokens,
-    launch_cache=None,
-    no_cpu_sync=True,
     num_cu=_DEFAULT_GRID_BLOCKS,
 ):
     """One fused-prologue kernel launch.
@@ -615,8 +613,7 @@ def dispatch_prologue(
     expert_send_count / expert_send_offset / tile_to_expert / tile_expected /
     dispatched_token_idx / dispatched_topk_slot / src_token_weight) are allocated
     internally and returned -- callers never own them. ``origin_rank`` / ``origin_slot``
-    live in ``sym_layout`` (written cross-rank); the return keeps their tuple slots as
-    ``None`` for positional compatibility.
+    live in ``sym_layout`` and are written cross-rank, so they are not part of the return.
 
     The last two return values, ``num_tokens_per_expert`` (len ``experts_per_rank``) and
     ``num_tokens_per_expert_prefix`` (len ``experts_per_rank + 1``), are the kernel-side
@@ -651,11 +648,7 @@ def dispatch_prologue(
     else:  # no weights given -> internal zeros (topk_w is None branch)
         topk_weights_flat = torch.zeros(num_tokens * num_topk, dtype=torch.float32, device=dev)
 
-    # Default to the module-level launch cache so callers that don't pass one (e.g.
-    # the test / custom-op path) still hit the pre-packed CallState fast launch.
-    if launch_cache is None:
-        launch_cache = _DEFAULT_LAUNCH_CACHE
-
+    launch_cache = _DEFAULT_LAUNCH_CACHE
     stream = torch.cuda.current_stream()
     launch_function = _compile(
         num_tokens,
@@ -690,31 +683,25 @@ def dispatch_prologue(
     # Fast launch: call pre-packed CallState directly, fall back to normal call
     stream_id = stream.cuda_stream  # raw handle (fresh wrapper each call)
     call_state = None
-    if (
-        launch_cache is not None
-        and launch_cache.get("function") is launch_function
-        and launch_cache.get("stream") == stream_id
-    ):
+    if launch_cache.get("function") is launch_function and launch_cache.get("stream") == stream_id:
         call_state = launch_cache.get("call_state")
     if call_state is not None:
         call_state(kernel_arguments)
     else:
         launch_function(*kernel_arguments[:-1], stream=stream)
-        if launch_cache is not None:
-            launch_cache["function"], launch_cache["stream"], launch_cache["call_state"] = (
-                launch_function,
-                stream_id,
-                None,
-            )
-            try:
-                call_state_cache = launch_function._call_state_cache
-                if len(call_state_cache) == 1:
-                    launch_cache["call_state"] = next(iter(call_state_cache.values()))
-            except Exception:
-                pass
-    # DeepEP-style dispatch handle: a flat tuple the dispatch/combine kernels unpack.
-    # num_tasks (== num_experts) is derived from dst_rank.numel(); routing tensors last.
-    #   (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
+        launch_cache["function"], launch_cache["stream"], launch_cache["call_state"] = (
+            launch_function,
+            stream_id,
+            None,
+        )
+        try:
+            call_state_cache = launch_function._call_state_cache
+            if len(call_state_cache) == 1:
+                launch_cache["call_state"] = next(iter(call_state_cache.values()))
+        except Exception:
+            pass
+    # Flat handle, indexed as documented at the top of this module. num_tasks (== num_experts)
+    # is derived from dst_rank.numel().
     return (
         expert_send_dst_rank,
         expert_send_dst_row,

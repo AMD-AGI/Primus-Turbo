@@ -6,10 +6,10 @@
 
 """SwiGLU backward fused into the rowwise+colwise MXFP8 dual-quant.
 
-The unfused path materializes ``grad_l1 [P, 2I]`` bf16 in HBM and immediately reads it
-back in ``rowcol_dual_quant_mxfp8_grouped_flydsl`` -- a pure round trip (512 MiB write +
-512 MiB read at the DSv3 shape, ~40% of the pair's traffic).  ``grad_l1`` has no other
-consumer, so this kernel computes it in registers and feeds the quantizers directly.
+The unfused path materialized ``grad_l1 [P, 2I]`` bf16 in HBM and immediately read it
+back in a standalone dual-quant kernel -- a pure round trip (512 MiB write + 512 MiB read
+at the DSv3 shape, ~40% of the pair's traffic).  ``grad_l1`` has no other consumer, so this
+kernel computes it in registers and feeds the quantizers directly.
 
 Two constraints shape the decomposition:
 
@@ -394,8 +394,8 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
 ):
     """SwiGLU backward + rowwise/colwise MXFP8 dual-quant of ``grad_l1`` in one kernel.
 
-    Replaces ``swiglu_backward_flydsl_kernel(...) -> rowcol_dual_quant_mxfp8_grouped_flydsl(...)``
-    without ever materializing ``grad_l1 [P, 2I]`` bf16.  Returns
+    Replaces the old ``swiglu_backward -> standalone rowcol dual-quant`` kernel pair without
+    ever materializing ``grad_l1 [P, 2I]`` bf16.  Returns
     ``(q_row, a_sp, q_col, s_col, grad_gate, act_weighted)``, matching the two kernels'
     outputs except that rows outside every group carry 0 (not garbage) in ``grad_gate``.
     """

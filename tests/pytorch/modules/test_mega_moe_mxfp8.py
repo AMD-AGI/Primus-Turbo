@@ -130,7 +130,7 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
             dispatch_grouped_gemm_mxfp8,
             dispatch_prologue,
             get_symm_buffer_for_mega_moe,
-            quantize_grouped_weight_mxfp8,
+            quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
             quantize_rowwise_mxfp8_flydsl,
         )
 

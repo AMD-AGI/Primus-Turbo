@@ -35,7 +35,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
-    quantize_grouped_weight_mxfp8,
+    quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
 )
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.core.backend import BackendType

@@ -700,8 +700,9 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     Forward L2 requires ``x_fp8=(act_fp8, a_sp)`` from ``swiglu_mxfp8_flydsl_kernel``; there is
     no internal A quant on the forward path.
 
-    Backward STEP3 requires ``x_fp8_rowwise=(q_row, a_sp)`` from ``rowcol_dual_quant_mxfp8_grouped_flydsl``
-    (fused rowwise quant of ``grad_l1``). Pass ``x=None``; M/K/device come from ``q_row.shape``.
+    Backward STEP3 requires ``x_fp8_rowwise=(q_row, a_sp)`` from
+    ``swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl`` (fused rowwise quant of ``grad_l1``). Pass
+    ``x=None``; M/K/device come from ``q_row.shape``.
 
     Forward L2 and backward STEP3 both pass ``x=None`` when ``x_fp8`` / ``x_fp8_rowwise`` is given.
 

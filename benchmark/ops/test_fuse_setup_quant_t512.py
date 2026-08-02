@@ -35,7 +35,7 @@ sl = symm.make_sym_layout()
 handle = tuple(dispatch_prologue(
     topk_idx, topk_w, sym_layout=sl, num_tokens=T, num_topk=K, num_experts=E,
     world_size=1, rank=0, experts_per_rank=E, block_m=BM,
-    num_max_pool_tokens=symm.num_max_pool_tokens, no_cpu_sync=True,
+    num_max_pool_tokens=symm.num_max_pool_tokens,
 ))
 print("launch T=512", flush=True)
 dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sl, symm, num_dispatch_cu=4, num_preshuffle_cu=4, BM=BM, BN=BN)

@@ -60,7 +60,6 @@ def main():
             experts_per_rank=8,
             block_m=BM,
             num_max_pool_tokens=symm.num_max_pool_tokens,
-            no_cpu_sync=True,
         )
     )
 

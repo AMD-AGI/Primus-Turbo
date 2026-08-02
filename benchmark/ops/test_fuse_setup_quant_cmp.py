@@ -58,7 +58,7 @@ def main():
         dispatch_prologue(
             topk_idx, topk_w, sym_layout=sl, num_tokens=T, num_topk=K, num_experts=E,
             world_size=1, rank=0, experts_per_rank=E, block_m=BM,
-            num_max_pool_tokens=symm.num_max_pool_tokens, no_cpu_sync=True,
+            num_max_pool_tokens=symm.num_max_pool_tokens,
         )
     )
 

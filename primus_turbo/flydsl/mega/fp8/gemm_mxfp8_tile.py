@@ -20,14 +20,9 @@ scale, so the tile reads them coalesced.
 into fused mega kernels; ``gemm_mxfp8_nt_tile`` is the dispatch/combine wrapper.
 """
 
-import functools
-
-import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, range_constexpr, rocdl
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.typing import T
 
 from primus_turbo.flydsl.mega.fp8.gemm_helper import (
@@ -38,14 +33,10 @@ from primus_turbo.flydsl.mega.fp8.gemm_helper import (
     ScaleS2R,
     StoreCPerTensor,
     _emit_if_then,
-    _lds_barrier,
-    ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor_rebased,
-    make_value_attrs,
     scale_opsel,
     wait_barrier,
-    xcd_remap_pid,
 )
 
 BLOCK_K = 128  # fp8 mxfp8 contraction tile (16x16x128 MMA spans K=128 = 4 E8M0 micro-blocks)

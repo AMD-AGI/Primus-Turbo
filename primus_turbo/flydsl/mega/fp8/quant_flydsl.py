@@ -16,7 +16,8 @@ production HIP kernel (``csrc/kernels/quantization/quantization_mxfp8.hip``):
   exp = clamp(exp, -127, 128);  e8m0_byte = exp + 127;  scale = 2^exp
   q_i = round_to_fp8(x_i / scale)
 
-Standalone + validated vs ``quantize_rowwise_mxfp8`` before wiring into the push.
+Standalone + validated vs the generic ``quantize_fp8`` MX_BLOCKWISE path before wiring into
+the push.
 """
 
 import functools
@@ -239,42 +240,6 @@ _ASCALE_PS_COMPILED: dict = {}
 _SCALE_PACK = 4
 
 
-def preshuffle_a_scale(a_scale: torch.Tensor, M: int, K: int, *, pack: int = _SCALE_PACK):
-    """Raw E8M0 ``[M, K//32]`` uint8 -> ScaleS2R broadcast ``a_sp`` (pack=4 layout)."""
-    from primus_turbo.flydsl.mega.fp8.gemm_helper import (
-        _PRESHUF_KT,
-        build_preshuffle_ab_kernel,
-        ceildiv,
-    )
-
-    K128 = K // 128
-    K128p = ceildiv(K128, pack)
-    a_ngrp = ceildiv(M, 64)
-    dev = a_scale.device
-    a_raw = a_scale.contiguous().view(torch.int32).reshape(M, K128)
-    a_sp = torch.zeros(a_ngrp * K128p * 256, dtype=torch.int32, device=dev)
-    b_raw = torch.zeros(64 * K128, dtype=torch.int32, device=dev)
-    b_sp = torch.zeros(1, dtype=torch.int32, device=dev)
-    a_blocks = a_ngrp * ceildiv(K128, _PRESHUF_KT)
-    pre_kern, _n_kt = build_preshuffle_ab_kernel(K128, pack=pack)
-
-    @flyc.jit
-    def _launch(a_raw, b_raw, a_sp, b_sp, a_blocks_i: fx.Int32, a_ngrp_i: fx.Int32,
-                stream: fx.Stream = fx.Stream(None)):
-        pre_kern(a_raw, b_raw, a_sp, b_sp, fx.Int32(M), fx.Int32(64), a_blocks_i, a_ngrp_i, fx.Int32(0)).launch(
-            grid=(a_blocks_i, 1, 1), block=(256, 1, 1), stream=stream
-        )
-
-    args = (a_raw, b_raw, a_sp, b_sp, a_blocks, a_ngrp, torch.cuda.current_stream())
-    ck = (M, K128, pack)
-    compiled = _ASCALE_PS_COMPILED.get(ck)
-    if compiled is None:
-        compiled = flyc.compile(_launch, *args)
-        _ASCALE_PS_COMPILED[ck] = compiled
-    compiled(*args)
-    return a_sp
-
-
 def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int, *, pack: int = _SCALE_PACK):
     """Host preshuffle of a grouped weight E8M0 scale into the ScaleBComb layout-3 ``b_sp``.
 
@@ -322,8 +287,8 @@ def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int, *, pack: i
 def quantize_rowwise_mxfp8_flydsl(x: torch.Tensor, preshuffle: bool = False, scale_pack: int = _SCALE_PACK):
     """Rowwise MXFP8 quant of ``x`` [M, K] bf16 in one FlyDSL kernel.
 
-    ``preshuffle=False``: returns ``(q fp8 [M,K], s uint8 [M, K//32])`` raw E8M0 (matches
-    ``quantize_rowwise_mxfp8``). ``preshuffle=True``: returns ``(q, a_sp)`` with A-scale in the
+    ``preshuffle=False``: returns ``(q fp8 [M,K], s uint8 [M, K//32])`` raw E8M0.
+    ``preshuffle=True``: returns ``(q, a_sp)`` with A-scale in the
     ScaleS2R broadcast layout; ``scale_pack=4`` (default) fuses pack-4 preshuffle into the quant
     kernel (no separate host preshuffle pass)."""
     assert x.dim() == 2 and x.dtype == torch.bfloat16

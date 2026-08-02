@@ -97,7 +97,6 @@ _XQ_SCRATCH: dict = {}  # (T, K, device) -> fp8 token scratch for fused setup qu
 _XS_SCRATCH: dict = {}  # (T, K, device) -> raw E8M0 scale scratch for fused setup quant
 _BSP_ALLOC: dict = {}  # (w1s data_ptr, G, N, K, pack) -> int32 b_sp buffer (filled by setup role)
 _SETUP_GATE: dict = {}  # device -> int32[2] [counter, done] for setup->pipeline release
-_PS_SENTINEL = 1 << 20  # scoreboard value the preshuffle role stamps when a pool-block is ready
 
 
 def _make_fwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, tile_ps):
@@ -365,7 +364,6 @@ def _compile(
         esoff = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
         dti = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
-        expected_resource = create_buffer_resource(EXPECTED, max_size=True)
         num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
 
         # COMM role closure: clean-push pre-quantized fp8 + RAW scale to the peer pool, + signal.
