@@ -6,31 +6,25 @@
 
 """Fused cross-rank dispatch PUSH (fp8) + grouped MXFP8 GEMM (NT), FlyDSL — 4-stage grid.
 
-One role-specialized kernel launched on every rank:
+One role-specialized kernel launched on every rank; each block picks its role from its index:
 
-  * SETUP role (first ``num_setup_cu`` blocks): rowwise mxfp8 quant of bf16 activations
-    into scratch ``xq``/``xs`` and (when needed) weight B-scale preshuffle into
-    ``weight_scale_ps``. A device-scope gate releases the pipeline only after every setup
-    block finishes — no separate host quant / ``preshuffle_b_scale`` launches.
-  * Then comm -> preshuffle -> gemm software pipeline gated per pool-block by the sys-scope
-    scoreboard:
+  * SETUP (first ``num_setup_cu`` blocks): rowwise mxfp8 quant of the bf16 activations into
+    scratch ``xq``/``xs``, plus the weight B-scale preshuffle into ``weight_scale_ps`` when the
+    weight version is new. A device-scope gate releases the rest of the grid only once every
+    setup block has finished, so neither step needs its own host launch.
+  * COMM: each block pushes one comm task's PRE-QUANTIZED fp8 token rows and their RAW E8M0
+    block scales into the peer ``pool_fp8`` / ``pool_scale`` over XGMI, then signals the peer's
+    per-pool-block scoreboard. Quantizing once on the source keeps the push coalesced and
+    XGMI-bound (no in-push quant).
+  * PRESHUFFLE (next ``num_preshuffle_cu`` blocks): waits for a pool-block's rows, transposes
+    that block's A-scale raw -> ScaleS2R broadcast into the local ``pool_scale_ps`` ONCE
+    (non-redundant), then stamps a SENTINEL on the scoreboard.
+  * GEMM (remaining blocks): one NT output tile each of the grouped L1 GEMM (A = ``pool_fp8`` +
+    broadcast ``pool_scale_ps``, per-expert B = ``weight_fp8`` + preshuffled ``weight_scale``)
+    via ``gemm_mxfp8_nt_tile``, spinning until its pool-block's SENTINEL is set.
 
-  * COMM role: each block CLEAN-pushes a comm task's
-    PRE-QUANTIZED fp8 token rows + their RAW E8M0 block scales into the peer ``pool_fp8`` /
-    ``pool_scale`` regions over XGMI (coalesced, XGMI-saturating; no in-push quant), drains
-    with a device-scope L2 write-back, then signals the peer per-pool-block scoreboard.
-  * PRESHUFFLE role (next ``num_preshuffle_cu`` blocks): each block waits for a pool-block's
-    tokens (scoreboard >= expected), invalidates L2 to see the peer-written raw scale,
-    transposes that block's A-scale raw->broadcast into the local ``pool_scale_ps`` ONCE
-    (non-redundant), writes it back, then stamps a SENTINEL on the scoreboard.
-  * GEMM role (remaining blocks): each computes ONE NT output tile of the grouped L1 GEMM
-    (A = ``pool_fp8`` + ``pool_scale_ps`` broadcast E8M0, per-expert B = ``weight_fp8`` +
-    preshuffled ``weight_scale``) via ``gemm_mxfp8_nt_tile`` (ScaleS2R / ScaleBComb,
-    fast MMA), spinning until its pool-block's SENTINEL is set.
-
-Comm / preshuffle / gemm all overlap after setup completes; the scoreboard sys-scope
-acquire/release + device-scope L2 fences carry cross-rank/cross-XCD visibility (no host
-sync + standalone L2 invalidate). Tokens are quantized ONCE on the source before the push.
+Comm, preshuffle and gemm overlap once setup completes. The sys-scope scoreboard plus each
+role's own cache fence carry all cross-rank / cross-XCD visibility, so no host sync is needed.
 
 NT only. Constraints: hidden % 1024 == 0 (fp8 warp push), N % BLOCK_N == 0,
 num_max_pool_tokens % BLOCK_M == 0, K % 128 == 0 and K >= 256 (mxfp8 MMA).
@@ -200,7 +194,6 @@ def _compile(
     _quant_k_fp8_i32 = K // 4
     _quant_blk_i32 = _QUANT_BLK // 4
     GN = G * N
-    K128 = K // 128
     _b_ps_n_kt = ceildiv(K128, _PRESHUF_KT)
     _b_ps_ngrp = ((GN + 255) // 256) * 4
     _b_ps_blocks = _b_ps_ngrp * _b_ps_n_kt
@@ -245,7 +238,7 @@ def _compile(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         setup_gate_res = create_buffer_resource(SETUP_GATE, max_size=True)
 
-        # ---- SETUP role: x quant + weight B-scale preshuffle, then release pipeline ----
+        # ---- SETUP role ----
         if block_index < setup_base:
             setup_idx = block_index
             needs_x = buffer_load(setup_gate_res, fx.Int32(2), vec_width=1, dtype=fx.T.i32())
@@ -349,7 +342,6 @@ def _compile(
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
 
-        # COMM role closure: clean-push pre-quantized fp8 + RAW scale to the peer pool, + signal.
         dispatch_tile = dispatch_fp8_copy_tile(
             thread_index=thread_index,
             hidden_size=hidden_size,
@@ -379,7 +371,7 @@ def _compile(
 
         if pipeline_idx < comm_block_count:
             if not _gemm_only:
-                # COMM: this block owns comm tasks {comm_idx, comm_idx+comm_cu, ...}.
+                # ---- COMM role: this block owns tasks {comm_idx, comm_idx+comm_cu, ...} ----
                 comm_idx = pipeline_idx
                 local_task_count = (
                     fx.Int32(num_comm) - comm_idx + comm_block_count - fx.Int32(1)
@@ -388,7 +380,7 @@ def _compile(
                     dispatch_tile(comm_idx + task_iteration * comm_block_count, fx.Int32(0), 1)
         elif block_index < gemm_base:
             if not _push_only:
-                # PRESHUFFLE role: each block waits for comm, transposes A-scale, signals gemm.
+                # ---- PRESHUFFLE role ----
                 ps_index = pipeline_idx - comm_block_count
                 real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
                 a_scale_raw_res = create_buffer_resource_from_addr(
@@ -434,6 +426,7 @@ def _compile(
                             st(preshuffle_flag_local, bank_offset + block_m_ps, expected_ps, scope="sys")
         else:
             if not _push_only:
+                # ---- GEMM role ----
                 tile_index = block_index - gemm_base
                 real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
                 real_grid = real_tiles * fx.Int32(n_blocks)
@@ -535,8 +528,7 @@ def _compile(
         c_n: int,
         stream: fx.Stream = fx.Stream(None),
     ):
-        # bump epoch on device (dispatch += num_ranks, preshuffle += 1) before the kernel;
-        # same-stream ordering makes the bumped parity/expected visible to the kernel.
+        # Same-stream ordering is what makes the bumped parity/expected visible to the kernel.
         _make_epoch_bump(int(num_ranks), 1)(DISP_PARITY, DISP_EXPECTED, PS_EXPECTED).launch(
             grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
         )
@@ -594,9 +586,8 @@ def dispatch_grouped_gemm_mxfp8(
     setup quant. Weight B-scale preshuffle (ScaleBComb) also runs in SETUP when the weight version
     is new; static weights are cached host-side after the first preshuffle.
 
-    Self-resetting: the comm->preshuffle (``dispatch_flag``) and preshuffle->gemm
-    (``preshuffle_flag``) gates are double-banked + device epoch-bumped, so no host scoreboard
-    reset / rendezvous is needed (the epoch tensors ride on ``symm``)."""
+    The gates self-reset via the device epoch bump (see ``_make_epoch_bump``); its tensors ride
+    on ``symm``."""
     fuse_setup = int(os.environ.get("PT_DISPATCH_FUSE_SETUP", "0") == "1")
     needs_x_quant = xq.dtype == torch.bfloat16
     if needs_x_quant:
@@ -627,7 +618,8 @@ def dispatch_grouped_gemm_mxfp8(
     out_fp16 = out_dtype == torch.float16
     c_n = N
     num_tokens = int(T)
-    # Preshuffle-role fence opts (glc acquire + coalesced write-through release). Override via env.
+    # Breakdown switches: compile only the push leg or only the gemm leg, so a bench can time
+    # them separately. Either one on makes the output WRONG.
     push_only = int(os.environ.get("PT_DISPATCH_PUSH_ONLY", "0") == "1")
     gemm_only = int(os.environ.get("PT_DISPATCH_GEMM_ONLY", "0") == "1")
 
@@ -803,8 +795,7 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     the caller -- fc1 weight for forward, ``w2^T`` for the STEP1 dgrad). When ``handle is None``
     (forward), builds the symmetric workspace + dispatch-prologue handle from ``topk_idx`` /
     ``topk_weights``; otherwise reuses the live symm buffer + the given handle (backward). Runs the
-    fused dispatch-PUSH + grouped mxfp8 GEMM (token quant folded in via the bf16-x path); the comm
-    gates self-reset via the device epoch (no host scoreboard rendezvous).
+    fused dispatch-PUSH + grouped mxfp8 GEMM, with token quant folded in via the bf16-x path.
 
     Returns ``(l1, handle, dispatch_weights, pool_x_fp8)`` where ``l1`` is the GEMM output (fc1 out
     for forward, grad_swiglu for STEP1), ``dispatch_weights`` is ``symm.weight_recv_buf`` (per-pool-row
@@ -836,14 +827,9 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     else:
         symm = get_symm_buffer_for_mega_moe()  # live buffer from a prior forward
         sym_layout = symm.make_sym_layout()
-    # epoch self-reset: dispatch_flag/preshuffle_flag are double-banked + device epoch-bumped, so
-    # NO host rendezvous + scoreboard zero (that per-call synchronize()+barrier() is gone).
     l1 = dispatch_grouped_gemm_mxfp8(
         x, None, w1q, w1s, handle, sym_layout, symm,
         num_dispatch_cu=num_dispatch_cu, num_preshuffle_cu=num_preshuffle_cu, BM=BM, BN=BN,
     )
-    # Extra return views (LIVE symm pool, no clone):
-    #  * dispatch_weights: per-pool-row routing weight (prologue-scattered into weight_recv_buf).
-    #  * pool_x_fp8: dispatched fc1-input pool in rowwise fp8 — (pool_fp8 [P,H], pool_scale [P,H//32] E8M0).
     _Px, _Hx = symm.pool_fp8.shape
     return l1, handle, symm.weight_recv_buf, (symm.pool_fp8, symm.pool_scale.reshape(_Px, _Hx // 32))
