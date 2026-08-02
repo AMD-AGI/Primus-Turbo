@@ -250,7 +250,13 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
 
             gc = fx.arith.minimumf(fx.arith.maximumf(gate, vlo), vhi)
             uc = fx.arith.minimumf(fx.arith.maximumf(up, vlo), vhi)
-            sig = fx.arith.divf(vone, fx.arith.addf(vone, fmath.exp(fx.arith.mulf(gc, vneg1))))
+            # afn+arcp serves 1/denom with v_rcp_f32 instead of the ~10-VALU IEEE divide
+            # expansion (v_div_scale x2, v_rcp, 3 v_fma, v_div_fmas, v_div_fixup).  Same fix
+            # commit f213a599 made to the forward SwiGLU; this path never got it, and ATT put
+            # 18.9% of all stall on this line.  NOT `fast`: that also implies nnan/ninf and
+            # would let the compiler drop the ACTIVATION_CLAMP min/max for no extra speed.
+            denom = fx.arith.addf(vone, fmath.exp(fx.arith.mulf(gc, vneg1)))
+            sig = fx.arith.divf(vone, denom, fastmath="afn,arcp")
             s = fx.arith.mulf(gc, sig)
             dsilu = fx.arith.mulf(sig, fx.arith.addf(vone, fx.arith.mulf(gc, fx.arith.subf(vone, sig))))
             dgc = fx.arith.mulf(fx.arith.mulf(d, uc), dsilu)
