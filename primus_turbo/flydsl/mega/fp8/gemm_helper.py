@@ -118,7 +118,7 @@ class G2SLoader:
         self.n_waves = fx.block_dim.x // 64
         # Per-wave LDS chunk stride. A padded stride (e.g. 1056) un-aligns the
         # chunk base across LDS banks to cut transpose-read bank conflicts; the
-        # read side (S2RLoaderTr) must use the same value.
+        # read side must use the same value.
         self.chunk_stride = chunk_stride
         # i64-traversal mode. None -> the contraction K-offset rides the 32-bit
         # soffset (caps the operand span at < 2^32 fp8). A tuple
@@ -202,9 +202,8 @@ class S2RLoader:
     def base_addr(self, lds_src, preshuffled=False):
         """Per-lane LDS byte address pairs for the bare-asm whole-loop: mirrors `load()`'s
         addressing but returns addresses so `ds_line` can emit 2x ds_read_b128 (no HW
-        transpose) for an already-M/N-major operand. Same [[p0,p1]]*n_tiles shape as
-        `S2RLoaderTr.base_addr` (interchangeable); p0/p1 are the two 16B halves of one
-        32-elem fragment, not two lane-group bases."""
+        transpose) for an already-M/N-major operand. Returns [[p0,p1]]*n_tiles; p0/p1 are
+        the two 16B halves of one 32-elem fragment, not two lane-group bases."""
         base = fx.Int32(fx.ptrtoint(lds_src.ptr))
         out = []
         for i in range_constexpr(self.n_tiles):
@@ -227,6 +226,17 @@ def wait_barrier(count):
         res=None,
         operands_=[],
         asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
+        constraints="",
+        has_side_effects=True,
+    )
+
+
+def wait_lgkmcnt(n):
+    """Drain LDS/SMEM traffic to at most ``n`` outstanding ops."""
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string=f"s_waitcnt lgkmcnt({n})",
         constraints="",
         has_side_effects=True,
     )
@@ -529,7 +539,7 @@ class StoreCQuantMxfp8CShuffle:
                     e = wave_off + lds_row * self.row_stride + lds_col
                     ptr = fx.inttoptr(self._store_ptr_t, lds_base + e * 2)
                     ptr.store(vec_f32[i].to(self.out_ty))
-            S2RLoaderTr._wait_lgkmcnt(0)
+            wait_lgkmcnt(0)
             # re-read EPL=8 contiguous cols of one row per lane; 4 lanes cover one 1x32 block
             row_in = (self.lane_id * self.EPL) // self.Cc      # = lane//4
             col0 = (self.lane_id * self.EPL) % self.Cc         # = (lane%4)*8
@@ -618,189 +628,6 @@ def xcd_remap_pid(pid, total_pids, num_xcd):
     local = pid // num_xcd
     offset = xcd * per_xcd + arith.select(xcd < rem, xcd, rem)
     return offset + local
-
-
-def _inttoptr_lds(byte_addr):
-    """Integer byte address -> !llvm.ptr<3> (LDS). Parsed per call: the type is
-    bound to the current MLIRContext and cannot be cached across compiles."""
-    return _llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int64(byte_addr)))
-
-
-_gep = _buffer_ops.get_element_ptr
-
-
-def _lds_ptr_from_i32(addr_i32, byte_offset=0):
-    """Build an LDS pointer (ptr<3>) from an i32 byte address + optional static offset."""
-    ptr = _inttoptr_lds(ArithValue(addr_i32).extui(T.i64))
-    if byte_offset != 0:
-        ptr = _gep(ptr, static_byte_offset=byte_offset)
-    return ptr
-
-
-def _packed_ds_read_tr_offsets(base_ptr, byte_offsets, vmcnt_hint=None):
-    """Pack the ds_read_b64_tr_b8 reads onto ONE shared base-ptr VGPR, each at a
-    compile-time immediate byte offset (1 addr VGPR instead of N avoids an
-    address-register spill). Reads are async (complete on lgkmcnt); the caller
-    must drain lgkmcnt before the consuming mfma. Returns one v2i32 per offset."""
-    N = len(byte_offsets)
-    v2i32 = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
-    struct_t = _llvm.StructType.get_literal([v2i32] * N)
-    lines = []
-    if vmcnt_hint is not None and vmcnt_hint >= 0:
-        lines.append(f"s_waitcnt vmcnt({vmcnt_hint})")
-    for k in range(N):
-        # ${N} is the single shared input ptr (after N outputs $0..$N-1).
-        lines.append(f"ds_read_b64_tr_b8 ${k}, ${N} offset:{byte_offsets[k]}")
-    asm = "\n".join(lines)
-    constraints = ",".join(["=&v"] * N + ["v"] + ["~{memory}"])
-    asm_op = _llvm.InlineAsmOp(
-        res=struct_t,
-        operands_=[_raw(base_ptr)],
-        asm_string=asm,
-        constraints=constraints,
-        has_side_effects=True,
-    )
-    return [_llvm.extractvalue(v2i32, asm_op.result, [k]) for k in range(N)]
-
-
-class S2RLoaderTr:
-    """LDS -> mfma operand wave-coop transpose load via ds_read_b64_tr_b8.
-    Serves K-major fp8 operands (NN B, TN A and B — their mfma operand byte
-    layouts are identical); the operand is selected by the per-wave coordinate
-    stride tile_stride and the WG wave count n_waves. See _ptr_off for the map.
-    """
-
-    _K_BASE = (0, 8, 64, 72)
-
-    def __init__(
-        self,
-        wave_idx,
-        n_tiles,
-        tile_stride,
-        inline_asm=False,
-        vmcnt_hint=2,
-        chunk_stride=1024,
-        n_waves=8,
-        width=128,
-        wswz=False,
-    ):
-        """wave_idx: this wave's index along the transposed coord (wave_n for B, wave_m for
-        A). tile_stride: per-wave coverage. chunk_stride must match the G2S writer.
-        inline_asm issues opaque-asm reads (caller drains via vmcnt_hint, needs
-        agpr_alloc>0). width: this buffer's LDS column span (defaults 128) -- MUST match the
-        paired NN write-side swizzle `width` (see swz_K for why it scales with width)."""
-        self.wave_idx = wave_idx
-        self.n_tiles = n_tiles
-        self.tile_stride = tile_stride
-        self.lane_id = fx.thread_idx.x % 64
-        self.inline_asm = inline_asm
-        self.vmcnt_hint = vmcnt_hint
-        self.chunk_stride = chunk_stride
-        self.n_waves = n_waves
-        self.round_stride = n_waves * chunk_stride
-        self.width = width
-        self.wswz = wswz  # wave bank-swizzle (j_chunk^(W<<1)); scoped to 2-pool@1024
-
-    def _ptr_off(self, c, tile_i, I, L_in_sg):
-        # rows_per_wave = 64/chunks must match the NN write side's own
-        # rows_per_wave (the write side's local K-row count per wave per round).
-        chunks = self.width // 16
-        rows_per_wave = 64 // chunks
-        KW = self.n_waves * rows_per_wave
-        K_log = I * 16 + S2RLoaderTr._K_BASE[c] + (L_in_sg // 2)
-        r_step = K_log // KW
-        W = (K_log % KW) // rows_per_wave
-        K_local_row = K_log % rows_per_wave
-        # swz_K reproduces swizzle_128's own (extracted & mask) term: extracted =
-        # (K_log%16)//2 is width-independent; only the mask narrows with width.
-        swz_K = (((K_log % 16) // 2) & (chunks - 1)) * 16
-        coord_start = self.wave_idx * self.tile_stride + tile_i * 16
-        j_chunk = (coord_start // 16) ^ (swz_K // 16)
-        if self.wswz:
-            # XOR (W<<1) into j_chunk: address bit shift W*32, matching the write
-            # side's NN swizzle (wswz=True) -- drops LDSBankConflict
-            # 14% -> 0% at _CS=1024 (2-pool).
-            j_chunk = j_chunk ^ ((W << 1) & (chunks - 1))
-        return (
-            W * self.chunk_stride
-            + r_step * self.round_stride
-            + K_local_row * self.width
-            + j_chunk * 16
-            + (L_in_sg % 2) * 8
-        )
-
-    def _issue_one(self, lds_src, tile_i, base_off=None):
-        """Issue the 4 ds_read_b64_tr_b8 of one tile (no drain, no assemble).
-        Returns the 4 raw v2i32 Vec."""
-        tr_type = Vec.make_type(2, fx.Int32)
-        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
-        if base_off is not None:  # runtime LDS-stage byte offset (double-buffer parity)
-            base_i32 = base_i32 + base_off
-        I = self.lane_id // 16
-        L_in_sg = self.lane_id % 16
-        RS = self.round_stride  # c0->c2 / c1->c3 jump (one K-sub-round)
-        if self.inline_asm:
-            p0 = _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off(0, tile_i, I, L_in_sg)))
-            p1 = _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off(1, tile_i, I, L_in_sg)))
-            r02 = _packed_ds_read_tr_offsets(p0, [0, RS], vmcnt_hint=self.vmcnt_hint)
-            r13 = _packed_ds_read_tr_offsets(p1, [0, RS], vmcnt_hint=None)
-            # r02 = [c0, c2], r13 = [c1, c3] -> caller assembles as c0,c1,c2,c3
-            return [Vec(r02[0]), Vec(r13[0]), Vec(r02[1]), Vec(r13[1])]
-        return [
-            Vec(
-                rocdl.ds_read_tr8_b64(
-                    tr_type,
-                    _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off(c, tile_i, I, L_in_sg))),
-                ).result
-            )
-            for c in range_constexpr(4)
-        ]
-
-    @staticmethod
-    def _assemble(calls):
-        # Concat 4 x v2i32 -> v8i32 = mfma operand bytes 0..31 for this lane.
-        v4_lo = calls[0].shuffle(calls[1], [0, 1, 2, 3])
-        v4_hi = calls[2].shuffle(calls[3], [0, 1, 2, 3])
-        return v4_lo.shuffle(v4_hi, list(range(8)))
-
-    @staticmethod
-    def _wait_lgkmcnt(n):
-        _llvm.inline_asm(
-            res=None,
-            operands_=[],
-            asm_string=f"s_waitcnt lgkmcnt({n})",
-            constraints="",
-            has_side_effects=True,
-        )
-
-    def load(self, lds_src, preshuffled=False, drain=True, base_off=None):
-        """Return all n_tiles operand frags. Inline-asm path issues every tile's
-        async reads then one trailing lgkmcnt(0) before the consuming mfma;
-        drain=False skips it when a later drain covers these reads. The intrinsic
-        path lets the backend insert the wait. base_off = runtime LDS-stage byte
-        offset (double-buffer parity)."""
-        assert not preshuffled, "S2RLoaderTr does not support preshuffled"
-        if self.inline_asm:
-            all_calls = [self._issue_one(lds_src, t, base_off) for t in range_constexpr(self.n_tiles)]
-            if drain:
-                self._wait_lgkmcnt(0)
-            return [self._assemble(c) for c in all_calls]
-        return [self._assemble(self._issue_one(lds_src, t, base_off)) for t in range_constexpr(self.n_tiles)]
-
-    def base_addr(self, lds_src):
-        """Per-lane LDS address pairs [[p0,p1]]*n_tiles for the whole-loop transpose reads:
-        tile i's 4 ds_read_b64_tr_b8 are p0[i]+0, p1[i]+0, p0[i]+RS, p1[i]+RS (RS =
-        8*chunk_stride). p0/p1 are not tile-strided (j_chunk carries an XOR), so each tile
-        needs its own pair."""
-        base = fx.Int32(fx.ptrtoint(lds_src.ptr))
-        I = self.lane_id // 16
-        L_in_sg = self.lane_id % 16
-        out = []
-        for t in range_constexpr(self.n_tiles):
-            p0 = base + fx.Int32(self._ptr_off(0, t, I, L_in_sg))
-            p1 = base + fx.Int32(self._ptr_off(1, t, I, L_in_sg))
-            out.append([p0, p1])
-        return out
 
 
 def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
