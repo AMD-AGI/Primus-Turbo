@@ -6,10 +6,8 @@
 
 """Fused mega MoE MXFP8 forward (FlyDSL): L1 dispatch+fc1 (NT) -> SwiGLU+mxfp8 quant -> L2 fp8 combine.
 
-A plain orchestration function (not a custom_op): the fp8 path carries state the schema can't hold
-(live symm buffer reused in backward, non-tensor handles). The comm gates now self-reset via a
-device epoch (no host synchronize()+barrier() rendezvous). ``w1`` / ``w2`` stay the differentiable
-inputs; their mxfp8 quant is version-keyed on ``w._version``.
+A plain orchestration function, not a custom_op: the fp8 path carries state no schema can hold --
+a live symm buffer the backward reuses, plus non-tensor handles.
 """
 
 from typing import Tuple
@@ -35,23 +33,20 @@ _W1_PREP_ATTR = "_mega_fp8_w1_prep"
 _W2_PREP_ATTR = "_mega_fp8_w2_prep"
 _H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device real-tile count)
 
-# EP8 T=8192 DSv3 retuned CU splits (epoch self-reset comm; see bench_mega_moe_fp8 sweeps):
-#   L1 dispatch+preshuffle: 16/16 best in e2e (isolated L1 favours 24/8 but that is a prologue artifact).
-#   L2 combine: 32 beats 48 (~5%); pin explicitly so prod skips autotune cold-start sweep.
+# Retuned CU splits for EP8 T=8192 DSv3 (see bench_mega_moe_fp8 sweeps). The isolated L1 bench
+# favours 24/8, but that is a back-to-back-prologue artifact and e2e is insensitive, so keep 16/16.
+# L2 combine 32 beats 48 by ~5%. Pinned so prod skips the autotune cold-start sweep.
 _L1_NUM_DISPATCH_CU = 16
 _L1_NUM_PRESHUFFLE_CU = 16
 _L2_NUM_COMBINE_CU = 32
 
 
 def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
-    """Cache ``prep(w)`` ON the weight tensor, keyed by ``w._version`` -- the single place the fp8
-    weight-prep caching lives (not scattered across the quant helpers). Recomputes only when the
-    weight changed in place (``optim.step()`` bumps ``_version``); otherwise returns the stash.
+    """Cache ``prep(w)`` on the weight tensor, keyed by ``w._version``.
 
-    Storing on the tensor (vs a global dict) makes it per-weight: auto-scales to many layers with no
-    size cap / LRU thrash, freed with the weight. Correctness-safe (``_version`` guards stale
-    weights) and transfer-safe (keyed off the weight's own version, never an activation id -- Rule
-    11). Reuse pays off across a grad-accum window (all micro-steps share one ``_version``)."""
+    Stashing on the tensor rather than in a global dict keeps this per-weight: it scales to many
+    layers with no size cap, and frees with the weight. Keying on ``_version`` (bumped by
+    ``optim.step()``) is what makes reuse safe -- never key this off an activation id."""
     v = getattr(w, "_version", 0)
     ent = getattr(w, attr, None)
     if ent is not None and ent[0] == v:
@@ -66,16 +61,14 @@ def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
 
 
 def _w1_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Version-keyed L1 (fc1) weight prep -> ``(w1q [G,2I,H] fp8, w1s [G,2I,H//32] raw E8M0)``. The L1
-    dispatch GEMM takes the raw quant and preshuffles the weight scale internally, so this is just
-    the grouped mxfp8 (E4M3) quant."""
+    """-> ``(w1q [G,2I,H] fp8, w1s [G,2I,H//32] raw E8M0)``. The scale stays raw because the L1
+    dispatch GEMM preshuffles it internally."""
     return _version_keyed_weight_prep(w1, _W1_PREP_ATTR, prepare_w1_fp8)
 
 
 def _w2_fp8_cached(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Version-keyed L2 (fc2) weight prep -> ``(weight_flat int8 [G*H*I], b_sp int32 preshuffled scale)``.
-    Unlike w1, the L2 combine is pure-compute (no internal quant/preshuffle), so quant + ScaleBComb
-    preshuffle + int8-flat are baked here by ``prepare_w2_fp8``."""
+    """-> ``(weight_flat int8 [G*H*I], b_sp int32 preshuffled scale)``. Unlike w1, the L2 combine is
+    pure-compute, so quant + ScaleBComb preshuffle + int8-flat are all baked in here."""
     return _version_keyed_weight_prep(w2, _W2_PREP_ATTR, prepare_w2_fp8)
 
 
@@ -92,21 +85,17 @@ def mega_moe_forward_fp8_impl(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], dict, tuple]:
     """Fused mxfp8 MoE forward: L1 (dispatch + fc1, NT) -> SwiGLU+mxfp8 quant -> L2 fp8 combine.
 
-    ``topk_idx`` must already be int64 (the op layer converts). Returns
-    ``(y, l1, dispatch_weights, pool_x_colwise, colwise_meta, handle)``: ``l1`` = L1 (fc1) output
-    [P, 2I]; ``dispatch_weights`` = per-pool-row routing weight (a LIVE symm-pool view, clone before
-    a later stage overwrites it); ``handle`` = dispatch prologue tuple.
+    Returns ``(y, l1, dispatch_weights, pool_x_colwise, colwise_meta, handle)``, where ``l1`` is the
+    fc1 output [P, 2I] and ``handle`` the dispatch prologue tuple. ``topk_idx`` must already be
+    int64 (the op layer converts). ``dispatch_weights`` is a LIVE symm-pool view -- clone it before
+    a later stage overwrites it.
 
-    ``pool_x_colwise`` / ``colwise_meta`` are dW1's ``b`` operand, produced here (``save_bwd``, else
-    both are None) rather than in backward: the fc1-input pool is still live in the symm buffer at
-    this point, so requantizing it colwise consumes the view in place of the clone backward would
-    otherwise need, and keeps the requant off the backward critical path."""
-    # w1 fp8 prep -> (w1q, w1s), version-keyed on w1._version -- symmetric with the w2 prep below.
+    ``pool_x_colwise`` / ``colwise_meta`` are dW1's ``b`` operand (None unless ``save_bwd``), built
+    here because the fc1-input pool is still live in the symm buffer: requantizing it colwise now
+    consumes that view instead of the clone the backward would otherwise need."""
     w1q, w1s = _w1_fp8_cached(w1)
 
-    # ── L1: fused mxfp8 dispatch + fc1 (one self-contained unit) ──
-    # NOTE: the isolated l1 bench favoured 24/8, but that was a back-to-back-prologue artifact; the
-    # per-forward op path (e2e) is insensitive to this split, so keep the 16/16 default.
+    # ── L1: fused mxfp8 dispatch + fc1 ──
     l1, handle, dispatch_weights, pool_x_fp8 = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
         x,
         w1q, w1s,
@@ -120,11 +109,9 @@ def mega_moe_forward_fp8_impl(
 
     act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS])
 
-    # w2 fp8 prep -> (w2q, w2s), version-keyed here at the op layer -- symmetric with w1 at L1.
     w2q, w2s = _w2_fp8_cached(w2)
 
     # ── L2: fp8 combine (fp8 GEMM + mxfp8 epilogue + fp8 PUSH + bf16-out dequant reduce) ──
-    # grouped_gemm_combine_mxfp8_flydsl_kernel is self-contained: it resets the L2 scoreboard/flags cross-rank.
     y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
         None, (w2q, w2s), list(handle), group,
         topk_indices=topk_idx,
