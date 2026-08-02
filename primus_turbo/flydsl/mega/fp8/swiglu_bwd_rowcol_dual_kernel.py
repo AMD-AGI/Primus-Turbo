@@ -211,20 +211,40 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
         tc = (tid % fx.Int32(thr_per_row)) * fx.Int32(_VEC)
         i_base = itile * fx.Int32(BT)
 
-        for p in range_constexpr(n_pass):
+        gcol = i_base + tc
+
+        def _pass_rows(p):
             r = fx.Int32(p * rows_per_pass) + tr
             m_local = m_local0 + fx.arith.ArithValue(r)
             real = m_local < fx.arith.ArithValue(len_g)
             m_eff = fx.arith.select(real, m_local, fx.Int32(0))
-            row = fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_eff)
-            gcol = i_base + tc
-            gate = fx.arith.extf(f32v, buffer_load(
-                l1r, row * fx.Int32(F) + gcol, vec_width=_VEC, dtype=fx.T.bf16()))
-            up = fx.arith.extf(f32v, buffer_load(
-                l1r, row * fx.Int32(F) + fx.Int32(I) + gcol, vec_width=_VEC, dtype=fx.T.bf16()))
-            d_raw = fx.arith.extf(f32v, buffer_load(
-                dactr, row * fx.Int32(I) + gcol, vec_width=_VEC, dtype=fx.T.bf16()))
-            sc = buffer_load(scaler, row, vec_width=1, dtype=fx.T.f32())
+            return r, m_local, real, fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_eff)
+
+        def _issue(row):
+            """The four global reads of one pass, issued with nothing in between."""
+            return (
+                buffer_load(l1r, row * fx.Int32(F) + gcol, vec_width=_VEC, dtype=fx.T.bf16()),
+                buffer_load(l1r, row * fx.Int32(F) + fx.Int32(I) + gcol,
+                            vec_width=_VEC, dtype=fx.T.bf16()),
+                buffer_load(dactr, row * fx.Int32(I) + gcol, vec_width=_VEC, dtype=fx.T.bf16()),
+                buffer_load(scaler, row, vec_width=1, dtype=fx.T.f32()),
+            )
+
+        # Issue pass p+1's reads before consuming pass p's, so the s_waitcnt for pass p has
+        # the next pass's loads already in flight.  Without this the compiler cannot hoist
+        # them itself: the LDS store and the act_w / g_part buffer_stores sit in between and
+        # it will not prove they do not alias l1 / dact.
+        prefetch = _issue(_pass_rows(0)[3])
+
+        for p in range_constexpr(n_pass):
+            r, m_local, real, row = _pass_rows(p)
+            gate_b, up_b, d_b, sc = prefetch
+            if p + 1 < n_pass:
+                prefetch = _issue(_pass_rows(p + 1)[3])
+
+            gate = fx.arith.extf(f32v, gate_b)
+            up = fx.arith.extf(f32v, up_b)
+            d_raw = fx.arith.extf(f32v, d_b)
             scv = _vector.broadcast(f32v, sc)
             d = fx.arith.mulf(d_raw, scv)
 
