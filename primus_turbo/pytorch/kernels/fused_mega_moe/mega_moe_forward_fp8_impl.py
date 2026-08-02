@@ -22,6 +22,9 @@ from primus_turbo.flydsl.mega.fp8 import (
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     swiglu_mxfp8_flydsl_kernel,
 )
+from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
+    prepare_dw1_pool_operand_fp8,
+)
 from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w1_fp8, prepare_w2_fp8
 
 __all__ = [
@@ -85,14 +88,19 @@ def mega_moe_forward_fp8_impl(
     group: ProcessGroup,
     block_m: int,
     block_n: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], tuple]:
+    save_bwd: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], dict, tuple]:
     """Fused mxfp8 MoE forward: L1 (dispatch + fc1, NT) -> SwiGLU+mxfp8 quant -> L2 fp8 combine.
 
     ``topk_idx`` must already be int64 (the op layer converts). Returns
-    ``(y, l1, dispatch_weights, pool_x_fp8, handle)``: ``l1`` = L1 (fc1) output [P, 2I];
-    ``dispatch_weights`` = per-pool-row routing weight; ``pool_x_fp8`` = L1-input pool in rowwise-fp8
-    ``(pool_fp8 [P,H], pool_scale [P,H//32])`` for a LOCAL dW1 wgrad; ``handle`` = dispatch prologue
-    tuple. The backward operands are LIVE symm-pool views (not cloned)."""
+    ``(y, l1, dispatch_weights, pool_x_colwise, colwise_meta, handle)``: ``l1`` = L1 (fc1) output
+    [P, 2I]; ``dispatch_weights`` = per-pool-row routing weight (a LIVE symm-pool view, clone before
+    a later stage overwrites it); ``handle`` = dispatch prologue tuple.
+
+    ``pool_x_colwise`` / ``colwise_meta`` are dW1's ``b`` operand, produced here (``save_bwd``, else
+    both are None) rather than in backward: the fc1-input pool is still live in the symm buffer at
+    this point, so requantizing it colwise consumes the view in place of the clone backward would
+    otherwise need, and keeps the requant off the backward critical path."""
     # w1 fp8 prep -> (w1q, w1s), version-keyed on w1._version -- symmetric with the w2 prep below.
     w1q, w1s = _w1_fp8_cached(w1)
 
@@ -125,4 +133,8 @@ def mega_moe_forward_fp8_impl(
         BM=block_m, BN=block_n,
         num_combine_cu=_L2_NUM_COMBINE_CU,
     )
-    return y, l1, dispatch_weights, pool_x_fp8, handle
+
+    pool_x_colwise, colwise_meta = (
+        prepare_dw1_pool_operand_fp8(pool_x_fp8, handle) if save_bwd else (None, None)
+    )
+    return y, l1, dispatch_weights, pool_x_colwise, colwise_meta, handle

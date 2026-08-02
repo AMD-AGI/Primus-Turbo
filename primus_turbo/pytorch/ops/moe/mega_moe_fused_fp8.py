@@ -73,16 +73,16 @@ class MegaMoEFusedFP8Function(torch.autograd.Function):
             ctx.set_materialize_grads(False)
             save_bwd = any(ctx.needs_input_grad)
 
-            y, l1, dispatch_weights, pool_x_fp8, handle = mega_moe_forward_fp8_impl(
-                x, topk_idx, topk_weights, w1, w2, group, block_m, block_n,
+            y, l1, dispatch_weights, pool_x_colwise, colwise_meta, handle = mega_moe_forward_fp8_impl(
+                x, topk_idx, topk_weights, w1, w2, group, block_m, block_n, save_bwd=save_bwd,
             )
 
             if save_bwd:
-                # dispatch_weights / pool_x_fp8 are LIVE views into the shared symm pool -> clone
-                # before a later stage (backward STEP1 dispatch(dy), or the next forward) overwrites
-                # it. l1 is a fresh dispatch-GEMM output (not a symm view), so it needs no clone.
+                # dispatch_weights is a LIVE view into the shared symm pool -> clone before a later
+                # stage (backward STEP1 dispatch(dy), or the next forward) overwrites it. l1 is a
+                # fresh dispatch-GEMM output (not a symm view), so it needs no clone; the fc1-input
+                # pool was already consumed into pool_x_colwise inside the forward impl.
                 dispatch_weights = dispatch_weights.clone()
-                pool_x_fp8 = (pool_x_fp8[0].clone(), pool_x_fp8[1].clone())
 
                 ctx.group = group
                 ctx.num_tokens = x.shape[0]
@@ -90,10 +90,11 @@ class MegaMoEFusedFP8Function(torch.autograd.Function):
                 ctx.block_m = block_m
                 ctx.block_n = block_n
                 ctx.handle_len = len(handle)
-                # pool_x_fp8 (dW1's LOCAL fc1-input pool): a non-diff derived tensor pair -> stash on
-                # ctx (not save_for_backward, which is for graph-tracked tensors). w1/w2 stay the
-                # differentiable weights; backward re-derives their w1^T/w2^T dgrad quant version-keyed.
-                ctx.pool_x_fp8 = pool_x_fp8
+                # Non-diff derived tensors -> stash on ctx (save_for_backward is for graph-tracked
+                # tensors). w1/w2 stay the differentiable weights; backward re-derives their
+                # w1^T/w2^T dgrad quant version-keyed.
+                ctx.pool_x_colwise = pool_x_colwise
+                ctx.colwise_meta = colwise_meta
                 ctx.save_for_backward(*handle, l1, dispatch_weights, w1, w2, topk_idx)
             return y
 
@@ -112,7 +113,7 @@ class MegaMoEFusedFP8Function(torch.autograd.Function):
                 grad_y,
                 l1,
                 dispatch_weights,
-                ctx.pool_x_fp8,
+                ctx.pool_x_colwise,
                 w1,
                 w2,
                 topk_idx,
@@ -122,6 +123,7 @@ class MegaMoEFusedFP8Function(torch.autograd.Function):
                 ctx.num_topk,
                 ctx.block_m,
                 ctx.block_n,
+                ctx.colwise_meta,
             )
 
             # grads align with forward inputs (x, topk_idx, topk_weights, w1, w2, group, block_m, block_n)

@@ -45,6 +45,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 
 __all__ = [
     "mega_moe_backward_fp8_impl",
+    "prepare_dw1_pool_operand_fp8",
     "prepare_w1t_dgrad_fp8",
     "prepare_w2t_dgrad_fp8",
 ]
@@ -180,23 +181,51 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
     return dx, grad_topk_weights
 
 
-def _mxfp8_variable_k_wgrad_dw1(a_colwise_fp8, b_fp8, meta):
+def prepare_dw1_pool_operand_fp8(
+    pool_x_fp8: Tuple[torch.Tensor, torch.Tensor], handle: tuple,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], dict]:
+    """Turn the forward's fc1-input pool into dW1's ``b`` operand -> ``(pool_colwise, meta)``.
+
+    Called from ``mega_moe_forward_fp8_impl`` while ``pool_x_fp8`` is still a live rowwise-fp8 view
+    of the symm pool. Requantizing it colwise there consumes the view in place of the clone the
+    backward would otherwise need, and takes the requant off the backward critical path. ``meta``
+    is returned alongside so backward reuses it for the dual-quant / dW1 / dW2."""
+    meta = colwise_grouped_meta(handle[_HANDLE_GROUP_LENS], handle[_HANDLE_GROUP_OFFS])
+    pool_colwise = colwise_requant_mxfp8_grouped_fp8in_flydsl(
+        pool_x_fp8[0], pool_x_fp8[1], _DW_FP8_FORMAT, meta=meta,
+    )[:2]
+    return pool_colwise, meta
+
+
+def _mxfp8_variable_k_wgrad_dw1(
+    a_colwise_fp8,
+    pool_x_operand: Tuple[torch.Tensor, torch.Tensor],
+    meta,
+    *,
+    pool_x_is_colwise: bool = True,
+):
     """dW1 = ``a^T @ b`` (variable-K over the pool tokens) in MXFP8, LOCAL -> ``[G, 2I, H]`` bf16.
 
     L1 (fc1) weight grad: ``a`` = ``grad_l1`` [P, 2I] colwise-quantized -- passed in PRE-QUANTIZED as
     ``a_colwise_fp8 = (q_col [2I,Mpad] fp8, s_col E8M0)`` from the fused dual-quant (one grad_l1 read
-    shared with STEP3's rowwise operand); ``b`` = ``pool_x`` [P, H] = the FORWARD-dispatched fc1-input
-    pool kept in native rowwise-fp8 (cloned in the forward before the L2 dgrad overwrites the symm
-    pool) -- requant COLWISE directly from fp8. LOCAL: dW1 contracts over pool tokens already gathered
-    on THIS rank, so (unlike the bf16 fused path that re-dispatches ``saved_x`` cross-rank) it needs NO
-    cross-rank transfer -- that is where dW1's fp8 win comes from. ``meta`` (grouped padded offsets) is
-    shared with the fused quant + dW2 + the pool requant."""
+    shared with STEP3's rowwise operand); ``b`` = ``pool_x`` = the FORWARD-dispatched fc1-input pool,
+    colwise-fp8 ``(q [H,Mpad], s [H,n_pblk])`` already requantized in the forward (production path),
+    or native rowwise-fp8 ``(pool_fp8 [P,H], pool_scale [P,H//32])`` requantized here when
+    ``pool_x_is_colwise=False`` (isolated benches that time the requant as part of dW1).
+
+    LOCAL: dW1 contracts over pool tokens already gathered on THIS rank, so (unlike the bf16 fused
+    path that re-dispatches ``saved_x`` cross-rank) it needs NO cross-rank transfer -- that is where
+    dW1's fp8 win comes from. ``meta`` (grouped padded offsets) is shared with the fused quant +
+    dW2 + the pool requant."""
     a_t, a_ts = a_colwise_fp8
     lens_pc, offs_pc = meta["lens_pc"], meta["offs_pc"]
-    pool_fp8, pool_scale = b_fp8
-    b_t, b_ts, _, _ = colwise_requant_mxfp8_grouped_fp8in_flydsl(
-        pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta
-    )
+    if pool_x_is_colwise:
+        b_t, b_ts = pool_x_operand
+    else:
+        pool_fp8, pool_scale = pool_x_operand
+        b_t, b_ts, _, _ = colwise_requant_mxfp8_grouped_fp8in_flydsl(
+            pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta,
+        )
     return grouped_gemm_fp8_variable_k_impl(
         a_t, b_t,
         a_ts.view(torch.float8_e8m0fnu), b_ts.view(torch.float8_e8m0fnu),
@@ -211,7 +240,7 @@ def mega_moe_backward_fp8_impl(
     grad_y: torch.Tensor,
     l1: torch.Tensor,
     dispatch_weights: torch.Tensor,
-    pool_x_fp8: Tuple[torch.Tensor, torch.Tensor],
+    pool_x_colwise_fp8: Tuple[torch.Tensor, torch.Tensor],
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -221,6 +250,7 @@ def mega_moe_backward_fp8_impl(
     num_topk: int,
     block_m: int,
     block_n: int,
+    colwise_meta: dict,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mxfp8 MoE backward (conjugate of forward via the Dispatch<->Combine duality).
 
@@ -228,13 +258,15 @@ def mega_moe_backward_fp8_impl(
     -> dW2 variable-K wgrad -> STEP3 (fused fc1 dgrad+combine -> dx, then serial dW1 wgrad).
     The version-keyed w1^T / w2^T dgrad quant is maintained inside the L2/L1 dgrad helpers.
 
+    ``pool_x_colwise_fp8`` / ``colwise_meta`` come straight from ``mega_moe_forward_fp8_impl``,
+    which requants the fc1-input pool while it is still live in the symm buffer instead of cloning
+    it for a backward requant (see ``prepare_dw1_pool_operand_fp8``).
+
     Returns ``(dx, grad_topk_weights, dW1, dW2)`` with dW1/dW2 cast back to the weight dtypes.
     """
     group_lens = handle[_HANDLE_GROUP_LENS]
     group_offs = handle[_HANDLE_GROUP_OFFS]
     dy = grad_y.contiguous().to(torch.bfloat16)
-    # grouped padded-offset meta shared across the fused grad_l1 dual-quant, dW1, dW2, pool requant.
-    meta = colwise_grouped_meta(group_lens, group_offs)
 
     # L2 dgrad (fp8 fork): dispatch(dy) + fc2 -> grad_swiglu + the dispatched-dy pool in native
     # rowwise-fp8 (the dW2 `a` operand `dispatch_l2_grad`, requant colwise directly from fp8).
@@ -249,12 +281,14 @@ def mega_moe_backward_fp8_impl(
 
     # grad_l1 -> rowwise (STEP3) + colwise (dW1) in ONE read; pack=4 a_sp fused in launch().
     gl1_q_row, gl1_a_sp, gl1_q_col, gl1_s_col = rowcol_dual_quant_mxfp8_grouped_flydsl(
-        grad_l1, _DW_FP8_FORMAT, meta=meta,
+        grad_l1, _DW_FP8_FORMAT, meta=colwise_meta,
     )
 
     # dW2 (MXFP8 variable-K): dispatch_l2_grad^T @ act_weighted; `a` requant-fused directly from
     # the L2-dgrad rowwise-fp8 pool. Run before anything else overwrites symm.pool_fp8.
-    dW2 = _mxfp8_variable_k_wgrad(dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs, meta=meta)
+    dW2 = _mxfp8_variable_k_wgrad(
+        dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs, meta=colwise_meta,
+    )
 
     # STEP3 then dW1 — serial on the default stream (dual-stream overlap forbidden).
     dx, grad_topk_weights = _l1_dgrad_combine_mxfp8_flydsl_kernel(
@@ -262,6 +296,6 @@ def mega_moe_backward_fp8_impl(
         grad_l1_rowwise_fp8=(gl1_q_row, gl1_a_sp),
         grad_gate=grad_gate, topk_idx=topk_idx, num_tokens=num_tokens, num_topk=num_topk,
     )
-    dW1 = _mxfp8_variable_k_wgrad_dw1((gl1_q_col, gl1_s_col), pool_x_fp8, meta)
+    dW1 = _mxfp8_variable_k_wgrad_dw1((gl1_q_col, gl1_s_col), pool_x_colwise_fp8, colwise_meta)
 
     return dx, grad_topk_weights, dW1.to(w1.dtype), dW2.to(w2.dtype)
