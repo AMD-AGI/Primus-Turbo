@@ -94,17 +94,13 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         t = torch.tensor([v], device="cuda"); dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group); return float(t)
 
     @staticmethod
-    def _bench(fn, group, *, warmup, iters, reset=None):
-        """Per-call CUDA-event latency; ``reset`` (e.g. scoreboard.zero_) runs OUTSIDE the timed
-        window each iter (L1 needs a cross-rank scoreboard reset between launches, so it cannot be
-        timed strictly back-to-back). Event brackets only ``fn`` -> kernel time."""
+    def _bench(fn, group, *, warmup, iters):
+        """Per-call CUDA-event latency; each iter is preceded by a cross-rank sync so the ranks
+        enter the launch together. Event brackets only ``fn`` -> kernel time."""
         ev_s = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
         ev_e = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
 
         def _one(s=None, e=None):
-            torch.cuda.synchronize(); group.barrier()
-            if reset is not None:
-                reset()
             torch.cuda.synchronize(); group.barrier()
             if s is None:
                 fn(); return
@@ -172,8 +168,7 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
 
         # ── correctness: one L1 step, then torch dequant grouped-GEMM over the dispatched pool ──
         torch.cuda.synchronize(); group.barrier()
-        symm.scoreboard.zero_()
-        torch.cuda.synchronize(); group.barrier()
+        # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard reset.
         out = _l1()
         torch.cuda.synchronize(); group.barrier()
         real_tiles = int(num_tile_blocks[0].item())
@@ -190,9 +185,9 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         rel = float((o - ref).norm() / (ref.norm() + 1e-12))
         del A, Wd, ref, o, out  # free the large fp32 temporaries before timing (T=8192 -> ~GBs)
 
-        # ── fp8 latency: token quant (local) + fused L1 (scoreboard reset outside timed window) ──
+        # ── fp8 latency: token quant (local) + fused L1 ──
         t_quant = self._bench(_quant, group, warmup=5, iters=_ITERS)
-        t_l1 = self._bench(_l1, group, warmup=5, iters=_ITERS, reset=lambda: symm.scoreboard.zero_())
+        t_l1 = self._bench(_l1, group, warmup=5, iters=_ITERS)
         flops = 2.0 * M_eff * N * H
         m_pad = int(handle[10][-1].item())
         symm.destroy()  # free the fp8 symm before building the bf16 stack (no same-process coexistence)

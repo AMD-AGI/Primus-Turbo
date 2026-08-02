@@ -30,6 +30,8 @@ import torch.distributed as dist
 
 import primus_turbo.pytorch  # noqa: F401
 from primus_turbo.flydsl.mega.fp8 import (
+    colwise_grouped_meta,
+    colwise_quant_mxfp8_grouped_flydsl,
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
     get_symm_buffer_for_mega_moe,
@@ -41,6 +43,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
+    _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
     _mxfp8_variable_k_wgrad_dw1,
 )
@@ -111,8 +114,7 @@ def profile(group, args):
     # forward L1 -> l1 + dispatch_weights, then CLONE the fc1-input pool BEFORE STEP1 overwrites it
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
-    symm.scoreboard.zero_()
-    torch.cuda.synchronize(); group.barrier()
+    # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard reset.
     l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
     Pp, Hp = symm.pool_fp8.shape
@@ -132,8 +134,13 @@ def profile(group, args):
     sc = torch.exp2((ps - 127).to(torch.float32)).view(Pp, Hp // 32, 1)
     pool_x_bf = (pf * sc).view(Pp, Hp).to(torch.bfloat16)
 
+    # Production pre-quantizes both operands elsewhere (grad_l1 in STEP3's dual quant, the pool in
+    # the forward); this isolate times them as part of dW1, so it reads HIGH against the fused path.
+    dw1_meta = colwise_grouped_meta(group_lens, group_offs)
+
     def _fp8():  # colwise-quant grad_l1 + requant fp8 pool colwise -> mxfp8 variable-K wgrad (LOCAL)
-        return _mxfp8_variable_k_wgrad_dw1(grad_l1, pool_x_fp8, group_lens, group_offs)
+        a_col = colwise_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=dw1_meta)[:2]
+        return _mxfp8_variable_k_wgrad_dw1(a_col, pool_x_fp8, dw1_meta, pool_x_is_colwise=False)
 
     def _bf16():  # bf16 variable-K wgrad on the dequant'd pool
         return grouped_gemm_variable_k_impl(

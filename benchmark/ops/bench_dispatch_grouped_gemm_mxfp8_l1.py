@@ -72,14 +72,11 @@ def _dequant_mxfp8(q, s_raw, block=_MXFP8_BLOCK):
     return (qf * scale).view(*lead, K)
 
 
-def _bench(fn, *, warmup, iters, group, reset=None):
+def _bench(fn, *, warmup, iters, group):
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
 
     def _iter(s=None, e=None):
-        torch.cuda.synchronize(); group.barrier()
-        if reset is not None:
-            reset()
         torch.cuda.synchronize(); group.barrier()
         if s is None:
             fn(); return
@@ -143,8 +140,7 @@ def profile(group, args):
 
     # ── correctness: single L1 step, then torch dequant-GEMM over the kernel's dispatched pool ──
     torch.cuda.synchronize(); group.barrier()
-    symm.scoreboard.zero_()
-    torch.cuda.synchronize(); group.barrier()
+    # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard reset.
     out = _l1_step()
     torch.cuda.synchronize(); group.barrier()
 
@@ -163,13 +159,10 @@ def profile(group, args):
     # free the large fp32 reference temporaries before timing (at T=8192 these are ~8GB).
     del A, Wd, ref, o, out
 
-    # ── latency. One fused-containing loop only (t_l1 = token quant + fused): back-to-back fused
-    # launches at large T can race the cross-rank scoreboard reset (late XGMI writes landing after
-    # the zero-barrier), so we keep a single fused bench loop -- the real per-forward cost. The
-    # token quant is also timed alone (local, no scoreboard) to show its share; fused = L1 - quant.
+    # ── latency. One fused-containing loop only (t_l1 = token quant + fused), the real per-forward
+    # cost; the token quant is also timed alone (local) to show its share, so fused = L1 - quant.
     t_quant = _bench(_quant_tokens, warmup=args.warmup, iters=args.iters, group=group)
-    t_l1 = _bench(_l1_step, warmup=args.warmup, iters=args.iters,
-                  reset=lambda: symm.scoreboard.zero_(), group=group)
+    t_l1 = _bench(_l1_step, warmup=args.warmup, iters=args.iters, group=group)
 
     flops = 2.0 * M_eff * N * H
     symm.destroy()
