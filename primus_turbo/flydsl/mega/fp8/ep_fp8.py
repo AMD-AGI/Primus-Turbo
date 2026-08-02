@@ -11,9 +11,6 @@
   into the peer ``pool_fp8`` / ``pool_scale`` regions over XGMI, then (``signal``) drains
   with a device-scope L2 write-back and signals the peer per-pool-block scoreboard. No
   in-push quant (tokens are quantized once on the source) -> the push saturates XGMI.
-* ``preshuffle_a_scale_tile``: the PRESHUFFLE role's per-block transpose. Cooperatively
-  repacks ONE pool-block's raw E8M0 A-scale into the ScaleS2R broadcast layout so the gemm
-  role reads it with a single coalesced load (fast MMA), done once per block (non-redundant).
 
 Geometry: warp-per-token; hidden % 1024 == 0 (fp8 b128 push) and % 128 (MXFP8).
 """
@@ -26,53 +23,12 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
-from primus_turbo.flydsl.mega.fp8.quant import (
-    _e8m0_broadcast_i32,
-    _preshuffle_a_idx,
-)
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, l2_writeback
 from primus_turbo.flydsl.mega.fp8.gemm_helper import _emit_if_then
 
 _WARP = 64
 _BLOCK_THREADS = 512
 _VEC_I32 = 4  # 4 x i32 = 16B / lane (b128 XGMI)
-
-
-def preshuffle_a_scale_tile(
-    scale_raw_res, scale_ps_res, m_row_base, block_m_rows, K128, thread_index, num_threads,
-    cache_modifier=0, read_cache_modifier=0,
-):
-    """Cooperatively preshuffle ONE M-tile's raw E8M0 A-scale (``block_m_rows`` x K128 i32,
-    rows [m_row_base, m_row_base+block_m_rows)) from the raw pool_scale into the ScaleS2R
-    broadcast layout ``scale_ps`` (both LOCAL). Each (row, word) reads 1 raw i32 (=4
-    micro-blocks) and scatters 4 broadcast i32. Used by the clean-push fused kernel's gemm
-    role so the comm can push the RAW scale (coalesced XGMI) yet the MMA reads it preshuffled.
-
-    ``cache_modifier`` (default 0): pass 16 (sc1 write-through to HBM) when the SAME
-    workgroup both writes ``scale_ps`` and reads it back for its own GEMM (fused-preshuffle
-    2-stage): write-through keeps the scratch coherent even if a concurrent workgroup's
-    device-wide ``buffer_inv sc1`` drops the L2 line (data is already in HBM), so no
-    device-wide ``l2_writeback`` handoff is needed.
-
-    Requires ``block_m_rows * K128 % num_threads == 0`` (256*K128 % 512 == 0 for K128 even)."""
-    total = block_m_rows * K128
-    assert total % num_threads == 0, f"preshuffle tile {total} not divisible by {num_threads}"
-    for it in range(total // num_threads):
-        idx = thread_index + fx.Int32(it * num_threads)
-        r = idx // fx.Int32(K128)
-        k = idx % fx.Int32(K128)
-        row = m_row_base + r
-        word = buffer_load(
-            scale_raw_res, row * fx.Int32(K128) + k, vec_width=1, dtype=fx.T.i32(),
-            cache_modifier=read_cache_modifier,
-        )
-        for g in range(4):
-            b = k * fx.Int32(4) + fx.Int32(g)
-            byte = (fx.arith.ArithValue(word) >> fx.Int32(8 * g)) & fx.Int32(0xFF)
-            buffer_store(
-                _e8m0_broadcast_i32(byte), scale_ps_res, _preshuffle_a_idx(row, b, K128),
-                cache_modifier=cache_modifier,
-            )
 
 
 def _peer_addr(local_base, offsets_resource, dst_rank):

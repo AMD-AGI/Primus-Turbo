@@ -44,27 +44,6 @@ BLOCK_K = 128  # fp8 mxfp8 contraction tile (16x16x128 MMA spans K=128 = 4 E8M0 
 _SCALE_PACK = 4
 
 
-def make_mxfp8_shared_storage(BLOCK_M, BLOCK_N):
-    """8-buffer fp8 LDS ping-pong storage for the mxfp8 tile (A/B cur/next x0/1)."""
-    LDS_BLOCK_M = BLOCK_M // 2
-    LDS_BLOCK_N = BLOCK_N // 2
-    a_lds = LDS_BLOCK_M * BLOCK_K
-    b_lds = LDS_BLOCK_N * BLOCK_K
-
-    @fx.struct
-    class SharedStorage:
-        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds, 16]
-        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds, 16]
-        A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds, 16]
-        A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds, 16]
-        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds, 16]
-        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds, 16]
-        B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds, 16]
-        B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds, 16]
-
-    return SharedStorage
-
-
 def emit_gemm_mxfp8_nt_tile(
     A,
     A_SCALE_RES,
