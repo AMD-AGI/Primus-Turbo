@@ -34,7 +34,7 @@ halves comm bytes + mxfp8 ~2x GEMM, comm hidden under the GEMM) vs the bf16 back
 timing; accuracy = grad_swiglu SNR vs a per-group bf16 ref. (Not part of ``both``.)
 
 Backward stage ``--stage fc2_wgrad``: the fc2 weight grad dW2 (MXFP8 variable-K wgrad) --
-dW2 = dispatch_l2_grad^T @ act_weighted over the pool. fp8 ``_mxfp8_variable_k_wgrad`` (colwise
+dW2 = dispatch_l2_grad^T @ act_weighted over the pool. fp8 ``_mxfp8_variable_k_wgrad_dw2`` (colwise
 requant the fp8 pool + colwise-quant act -> fp8 GEMM) vs shipped bf16 Triton
 ``grouped_gemm_variable_k_impl``. Reports FULL vs GEMM-only + requant/quant/GEMM breakdown (the
 isolated fp8 GEMM is ~2x, per-call quant/requant dilute FULL to ~parity). SNR gate. (Not in ``both``.)
@@ -108,8 +108,8 @@ from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (  # noqa: E
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (  # noqa: E402  (fp8 bwd stages)
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
-    _mxfp8_variable_k_wgrad,
     _mxfp8_variable_k_wgrad_dw1,
+    _mxfp8_variable_k_wgrad_dw2,
 )
 from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8  # noqa: E402  (fp8 op)
 
@@ -410,7 +410,7 @@ def profile_fc2_wgrad(group, args, mode):
     mega pool: fwd L1 -> (l1, dispatch_weights); dispatch(dy)+fc2-dgrad -> grad_swiglu + the
     dispatched-dy fp8 pool; swiglu_backward -> act_weighted. Then dW2 = dispatch_l2_grad^T @
     act_weighted (variable-K over the pool) BOTH ways:
-      * fp8  : ``_mxfp8_variable_k_wgrad`` (colwise-requant the fp8 pool + colwise-quant act -> fp8 GEMM)
+      * fp8  : ``_mxfp8_variable_k_wgrad_dw2`` (colwise-requant the fp8 pool + colwise-quant act -> fp8 GEMM)
       * bf16 : ``grouped_gemm_variable_k_impl`` (Triton) on the dequant'd pool.
     Back-to-back timing; SNR gate. Also reports FULL vs GEMM-only + requant/quant/GEMM breakdown --
     the isolated fp8 GEMM is the ~2x win, while the per-call colwise requant/quant dilute it to
@@ -448,7 +448,7 @@ def profile_fc2_wgrad(group, args, mode):
     pool_fp8, pool_scale = pool_handle
 
     def _fp8():  # production path: shared meta + dual-launch requant/quant -> mxfp8 wgrad GEMM
-        return _mxfp8_variable_k_wgrad(pool_handle, act_weighted, group_lens, group_offs, meta=meta0)
+        return _mxfp8_variable_k_wgrad_dw2(pool_handle, act_weighted, group_lens, group_offs, meta=meta0)
 
     # BREAKDOWN: pre-quantize both operands ONCE (outside the timed loop) -> time the ISOLATED fp8
     # variable-K GEMM apart from the per-call requant(pool)/quant(act) the FULL fp8 wgrad pays.
@@ -467,7 +467,7 @@ def profile_fc2_wgrad(group, args, mode):
             default_backend=BackendType.FLYDSL.value,
         )
 
-    def _pair():  # dual-launch D: requant(pool)+quant(act), shared meta (matches _mxfp8_variable_k_wgrad)
+    def _pair():  # dual-launch D: requant(pool)+quant(act), shared meta (matches _mxfp8_variable_k_wgrad_dw2)
         return colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
             pool_fp8, pool_scale, act_weighted, _DW_FP8_FORMAT, meta=meta0,
         )

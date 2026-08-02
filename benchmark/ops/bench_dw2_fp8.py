@@ -9,7 +9,7 @@
 Replicates the backward up to dW2 on real mega-pool data: forward L1 -> (l1, dispatch_weights),
 STEP1 (dispatch(dy)+fc2 dgrad) -> grad_swiglu + the dispatched-dy fp8 pool, STEP2 swiglu_backward
 -> act_weighted. Then computes dW2 = dispatch_l2_grad^T @ act_weighted (variable-K over the pool)
-BOTH ways on the SAME tensors -- fp8 (``_mxfp8_variable_k_wgrad``, requant the fp8 pool colwise +
+BOTH ways on the SAME tensors -- fp8 (``_mxfp8_variable_k_wgrad_dw2``, requant the fp8 pool colwise +
 colwise-quant act) vs bf16 (``grouped_gemm_variable_k_impl`` on the dequant'd pool) -- and gates by
 SNR. dW2 is the large backward GEMM (H*I over the pool).
 
@@ -48,7 +48,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
-    _mxfp8_variable_k_wgrad,
+    _mxfp8_variable_k_wgrad_dw2,
 )
 
 _H_GROUP_LENS = 9
@@ -154,7 +154,7 @@ def profile(group, args):
     dl2 = (pf * sc).view(P, Hh).to(torch.bfloat16)
 
     def _fp8():  # requant fp8 pool colwise + colwise-quant act -> mxfp8 variable-K wgrad
-        return _mxfp8_variable_k_wgrad(pool_handle, act_weighted, group_lens, group_offs)
+        return _mxfp8_variable_k_wgrad_dw2(pool_handle, act_weighted, group_lens, group_offs)
 
     def _bf16():  # bf16 variable-K wgrad on the dequant'd pool
         return grouped_gemm_variable_k_impl(

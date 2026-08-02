@@ -135,7 +135,7 @@ def _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2, group, handle, block_m, block
     return grad_swiglu, pool_fp8_handle
 
 
-def _mxfp8_variable_k_wgrad(a_fp8, b_bf16, group_lens, group_offs, meta=None):
+def _mxfp8_variable_k_wgrad_dw2(a_fp8, b_bf16, group_lens, group_offs, meta=None):
     """dW2 = ``a^T @ b`` (variable-K over the dispatched pool tokens) in MXFP8 -> ``[G, H, b.dim1]`` bf16.
 
     L2 (fc2) weight grad: ``a`` = the L2-dgrad dispatched-dy pool ``(pool_fp8 [P,H], pool_scale [P,H//32])`` (the
@@ -285,7 +285,7 @@ def mega_moe_backward_fp8_impl(
 
     # dW2 (MXFP8 variable-K): dispatch_l2_grad^T @ act_weighted; `a` requant-fused directly from
     # the L2-dgrad rowwise-fp8 pool. Run before anything else overwrites symm.pool_fp8.
-    dW2 = _mxfp8_variable_k_wgrad(
+    dW2 = _mxfp8_variable_k_wgrad_dw2(
         dispatch_l2_grad_fp8, act_weighted, group_lens, group_offs, meta=colwise_meta,
     )
 
