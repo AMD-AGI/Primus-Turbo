@@ -39,8 +39,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
 )
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
-from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import colwise_grouped_meta
-from primus_turbo.flydsl.mega.fp8.quant_flydsl import quantize_rowwise_mxfp8_flydsl
+from primus_turbo.flydsl.mega.fp8.quant import colwise_grouped_meta, quantize_rowwise_mxfp8_flydsl
 from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,

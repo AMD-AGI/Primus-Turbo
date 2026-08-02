@@ -93,7 +93,6 @@ _SPLIT_BWD_REDUCE = os.environ.get("PT_COMBINE_SPLIT_REDUCE", "0") == "1"
 # the original dword path. Words are 4-aligned, so a group of 4 stays inside one E8M0 32-block:
 # one scale word + one shift serves all 4. Falls back to 1 when H4 is not a multiple of _WARP*VW.
 _REDUCE_VW = int(os.environ.get("PT_COMBINE_REDUCE_VW", "4"))
-_COMBINE_PROBE_PUSH_SKIP_MOD = int(os.environ.get("MEGA_MOE_PROBE_COMBINE_SKIP_MOD", "0"))
 
 
 @functools.lru_cache(maxsize=4)
@@ -128,7 +127,6 @@ def combine_copy_fp8_tile(
     l2y_fp8_res, l2y_scale_res, origin_rank_res, origin_slot_res, comb_base, signal_delta_res, barrier_base,
     reduce_bank, expected_reduce,
     with_gate=False, grad_gate_res=None, gate_base=None, main_delta_res=None, gate_records=0,
-    probe_skip_mod=0,
 ):
     """FP8 combine PUSH: read local fp8 L2Y row -> push packed fp8 payload + E8M0 to the peer
     ``comb[slot]``, raise the sys-scope flag. ``with_gate`` (backward STEP3) additionally scatters
@@ -136,52 +134,44 @@ def combine_copy_fp8_tile(
     heap ``main_delta``), mirroring the bf16 ``combine_bf16_tile`` gate path -- 1 f32, ~free vs the
     hidden-wide fp8 push."""
     rows_per_warp = block_m_size // _NUM_WARPS
-    # TIMING PROBE ONLY (leaves combine slots unwritten -> WRONG results): emit only (N-1)/N of
-    # each warp's row copies, sizing the XGMI traffic a pre-combine of the rows a token sends back
-    # to the same origin rank would remove. Dropping rows at trace time costs no runtime branch.
-    # Threaded in as a compile argument, since the jit disk cache keys on those, not the env.
-    rows_pushed = rows_per_warp * (probe_skip_mod - 1) // probe_skip_mod if probe_skip_mod > 1 else rows_per_warp
     lane = thread_index % fx.Int32(_WARP)
     warp_id = thread_index // fx.Int32(_WARP)
     chunk_base = warp_id * fx.Int32(rows_per_warp)
     cols_per_step = _WARP * 4  # 256 i32 payload words/step (b128 copy)
     num_full = H4 // cols_per_step
 
-    def _make_row_emitter(row, origin, emit_payload):
+    def _make_row_emitter(row, origin):
         # factory, not a closure over the loop var: `_emit_if_then` branch fns MUST take 0 args
         # (ReplaceIfWithDispatch injects result_names into any arg-accepting branch fn).
         def _emit_row():
             slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
             delta = buffer_load(signal_delta_res, origin, vec_width=1, dtype=fx.T.i64())
             peer = create_buffer_resource_from_addr(comb_base + delta, num_records_bytes=comb_records)
-            if emit_payload:
-                slot_base = slot * fx.Int32(H4)
-                row_base = row * fx.Int32(H4)
-                vals = []
-                for c in range(num_full):
-                    col = fx.Int32(c * cols_per_step) + lane * fx.Int32(4)
-                    vals.append(buffer_load(l2y_fp8_res, row_base + col, vec_width=4, dtype=fx.T.i32()))
-                for c in range(num_full):
-                    col = fx.Int32(c * cols_per_step) + lane * fx.Int32(4)
-                    buffer_store(vals[c], peer, slot_base + col)
+            slot_base = slot * fx.Int32(H4)
+            row_base = row * fx.Int32(H4)
+            vals = []
+            for c in range(num_full):
+                col = fx.Int32(c * cols_per_step) + lane * fx.Int32(4)
+                vals.append(buffer_load(l2y_fp8_res, row_base + col, vec_width=4, dtype=fx.T.i32()))
+            for c in range(num_full):
+                col = fx.Int32(c * cols_per_step) + lane * fx.Int32(4)
+                buffer_store(vals[c], peer, slot_base + col)
 
-                def _emit_scale():
-                    sv = buffer_load(l2y_scale_res, row * fx.Int32(SC) + lane, vec_width=1, dtype=fx.T.i32())
-                    buffer_store(sv, peer, fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + lane)
+            def _emit_scale():
+                sv = buffer_load(l2y_scale_res, row * fx.Int32(SC) + lane, vec_width=1, dtype=fx.T.i32())
+                buffer_store(sv, peer, fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + lane)
 
-                _emit_if_then(lane < fx.Int32(SC), _emit_scale)
-                if with_gate:
-                    # scatter the per-row gate gradient (d_topk_w) to origin[slot] in the MAIN-heap
-                    # combine_gate; same value/slot across lanes (idempotent, like the flag store).
-                    gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
-                    gate_addr = gate_base + buffer_load(main_delta_res, origin, vec_width=1, dtype=fx.T.i64())
-                    gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
-                    buffer_store(gate_value, gate_peer, slot)
+            _emit_if_then(lane < fx.Int32(SC), _emit_scale)
+            if with_gate:
+                # scatter the per-row gate gradient (d_topk_w) to origin[slot] in the MAIN-heap
+                # combine_gate; same value/slot across lanes (idempotent, like the flag store).
+                gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
+                gate_addr = gate_base + buffer_load(main_delta_res, origin, vec_width=1, dtype=fx.T.i64())
+                gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
+                buffer_store(gate_value, gate_peer, slot)
             # epoch flag: write the cumulative reduce target into the peer's reduce_flag bank
             # (never reset; the reduce spins on == expected_reduce). reduce_bank uses OUR parity,
             # which equals the peer's by lockstep, so it lands in the peer's current bank.
-            # ALWAYS written, even for a probe-skipped row: the reduce gate is per SLOT, so
-            # dropping the flag with the payload hangs the reduce instead of just corrupting it.
             barrier_addr = barrier_base + delta
             _wait_mem()
             st(barrier_addr, reduce_bank + slot, expected_reduce, scope="sys")
@@ -193,7 +183,7 @@ def combine_copy_fp8_tile(
         for j in range(rows_per_warp):
             row = base_row + fx.Int32(j)
             origin = buffer_load(origin_rank_res, row, vec_width=1, dtype=fx.T.i32())
-            _emit_if_then(origin >= fx.Int32(0), _make_row_emitter(row, origin, j < rows_pushed))
+            _emit_if_then(origin >= fx.Int32(0), _make_row_emitter(row, origin))
 
     return push_block
 
@@ -315,7 +305,6 @@ def _compile(
     num_xcd=_COMBINE_NUM_XCD, group_m=_COMBINE_GROUP_M, group_n=_COMBINE_GROUP_N,
     tile_swizzle=_COMBINE_TILE_SWIZZLE,
     force_no_reduce=False,
-    probe_push_skip_mod=0,  # TIMING PROBE, wrong results: drop 1/N pushed rows (dedup upper bound)
 ):
     """Unified fp8 combine: mxfp8 GEMM (CShuffle mxfp8-quant epilogue -> local fp8 pool) + FP8 combine
     PUSH (+ optional gate scatter) + fp8-dequant top-k reduce. One kernel for BOTH:
@@ -431,7 +420,6 @@ def _compile(
                 reduce_bank=reduce_bank, expected_reduce=expected_reduce,
                 with_gate=with_gate, grad_gate_res=grad_gate_res, gate_base=gate_base,
                 main_delta_res=main_delta_res, gate_records=gate_records,
-                probe_skip_mod=probe_push_skip_mod,
             )
             local_count = (
                 fx.Int32(0) if _gemm_only
@@ -768,12 +756,6 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     worst_case_tiles_host = M // BM
     tail_blocks_host = max(0, worst_case_tiles_host - real_tiles_host) * (out_features // BN)
 
-    from primus_turbo.flydsl.mega.fp8.fp8_combine_cu_autotune import resolve_num_combine_cu
-
-    autotune_key = (
-        out_features, K, M, BM, BN, apply_weights, with_gate, int(G), int(num_ranks),
-    )
-
     def _run_with_cu(cu: int) -> None:
         stream = torch.cuda.current_stream()
         gemm_push_args = (
@@ -792,7 +774,6 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
                 out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
                 int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks),
                 apply_weights, with_gate, num_groups=int(G), force_no_reduce=True,
-                probe_push_skip_mod=_COMBINE_PROBE_PUSH_SKIP_MOD,
             )
             gp_ck = (
                 out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
@@ -838,7 +819,6 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
             out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
             int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks),
             apply_weights, with_gate, num_groups=int(G),
-            probe_push_skip_mod=_COMBINE_PROBE_PUSH_SKIP_MOD,
         )
         ck = (out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
               int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks), int(G),
@@ -856,11 +836,6 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
                 _FP8_COMBINE_COMPILED[ck] = compiled
             compiled(*gemm_push_args)
 
-    cu = resolve_num_combine_cu(
-        key=autotune_key,
-        apply_weights=apply_weights,
-        explicit=num_combine_cu,
-        make_launch=lambda c: (lambda: _run_with_cu(c)),
-    )
-    _run_with_cu(cu)
+    # Shipped per-role CU split when the caller does not pin one (fwd L2 / bwd STEP3).
+    _run_with_cu(int(num_combine_cu) if num_combine_cu is not None else (32 if apply_weights else 24))
     return output, (d_topk_w if with_gate else None)

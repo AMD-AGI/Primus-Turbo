@@ -23,7 +23,7 @@ from flydsl.expr.buffer_ops import (
 )
 
 from primus_turbo.flydsl.mega.fp8.gemm_helper import ceildiv
-from primus_turbo.flydsl.mega.fp8.quant_flydsl import (
+from primus_turbo.flydsl.mega.fp8.quant import (
     _BLK,
     _SCALE_PACK,
     _VEC,

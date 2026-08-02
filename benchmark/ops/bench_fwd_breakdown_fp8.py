@@ -88,8 +88,6 @@ def worker(local_rank, world, args):
     W1L = W1.detach().clone().requires_grad_(True)
     W2L = W2.detach().clone().requires_grad_(True)
 
-    os.environ["PT_FP8_COMBINE_AUTOTUNE"] = "0"
-
     from primus_turbo.pytorch.kernels.mega_moe.mega_moe_forward_fp8_impl import (
         _w1_fp8_cached,
         _w2_fp8_cached,

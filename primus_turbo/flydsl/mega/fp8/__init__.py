@@ -37,16 +37,16 @@ from .dispatch_prologue import dispatch_prologue
 from .sym_layout import SymLayout
 from .symm_buffer import get_symm_buffer_for_mega_moe
 
-# --- quantization (weights: grouped mxfp8; activations: FlyDSL rowwise mxfp8) ---
-from .quant import quantize_grouped_weight_mxfp8_flydsl
-from .quant_flydsl import preshuffle_b_scale, quantize_rowwise_mxfp8_flydsl
-
-# --- colwise-transpose mxfp8 quant (backward variable-K wgrad operands: dW2 / dW1) ---
-from .quant_colwise_trans_flydsl import (
+# --- mxfp8 quantization: rowwise (weights / activations) + colwise-transpose (backward
+#     variable-K wgrad operands: dW2 / dW1) ---
+from .quant import (
     colwise_grouped_meta,
     colwise_quant_mxfp8_grouped_flydsl,
-    colwise_requant_mxfp8_grouped_fp8in_flydsl,
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
+    colwise_requant_mxfp8_grouped_fp8in_flydsl,
+    preshuffle_b_scale,
+    quantize_grouped_weight_mxfp8_flydsl,
+    quantize_rowwise_mxfp8_flydsl,
 )
 from primus_turbo.flydsl.mega.fp8.swiglu_bwd_rowcol_dual_kernel import (
     swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,

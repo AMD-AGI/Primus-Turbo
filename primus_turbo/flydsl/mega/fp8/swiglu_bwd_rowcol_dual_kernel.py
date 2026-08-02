@@ -42,7 +42,7 @@ from flydsl.expr.rocdl import cvt_pk_bf8_f32, cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.mega.fp8.gemm_helper import ceildiv
-from primus_turbo.flydsl.mega.fp8.quant_colwise_trans_flydsl import (
+from primus_turbo.flydsl.mega.fp8.quant import (
     _BLK,
     _compile_rowcol_dual_pack_grouped,
     colwise_grouped_meta,
@@ -166,7 +166,7 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
 
         # `pmb` is bid/n_itile, so these three addresses are workgroup-uniform and every lane
         # can just read them.  The kernel this was derived from staged them through LDS behind
-        # a barrier; the sibling kernels in quant_colwise_trans_flydsl.py (`pack_kern`,
+        # a barrier; the sibling kernels in quant.py (`pack_kern`,
         # `_compile_colwise_quant_grouped`) do not, and the barrier plus the
         # v_readfirstlane_b32 the read-back lowers to were 8% of all stall.
         mb = pmb * fx.Int32(4)

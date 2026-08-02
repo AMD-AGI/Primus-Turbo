@@ -76,7 +76,6 @@ def worker(local_rank, world, args):
     W1 = W1g[rank * epr : (rank + 1) * epr].contiguous()
     W2 = W2g[rank * epr : (rank + 1) * epr].contiguous()
 
-    os.environ["PT_FP8_COMBINE_AUTOTUNE"] = "0"
     w1q, w1s = _w1_fp8_cached(W1)
     w2_fp8 = prepare_w2_fp8(W2)
 
