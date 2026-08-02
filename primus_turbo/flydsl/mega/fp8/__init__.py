@@ -30,7 +30,10 @@ from .dispatch_grouped_gemm_mxfp8_kernel import (
 from .grouped_gemm_combine_fp8_kernel import (
     grouped_gemm_combine_mxfp8_flydsl_kernel,
 )
-from .swiglu_mxfp8_kernel import swiglu_mxfp8_flydsl_kernel
+from .swiglu_mxfp8_kernel import (
+    swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
+    swiglu_mxfp8_flydsl_kernel,
+)
 
 # --- symmetric workspace (SymLayout + scoreboard + two-heap) ---
 from .dispatch_prologue import dispatch_prologue
@@ -47,9 +50,6 @@ from .quant import (
     preshuffle_b_scale,
     quantize_grouped_weight_mxfp8_flydsl,
     quantize_rowwise_mxfp8_flydsl,
-)
-from primus_turbo.flydsl.mega.fp8.swiglu_bwd_rowcol_dual_kernel import (
-    swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
 )
 
 __all__ = [
