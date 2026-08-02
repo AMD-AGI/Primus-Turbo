@@ -57,6 +57,9 @@ from .quant_colwise_trans_flydsl import (
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     rowcol_dual_quant_mxfp8_grouped_flydsl,
 )
+from primus_turbo.flydsl.mega.fp8.swiglu_bwd_rowcol_dual_kernel import (
+    swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
+)
 
 __all__ = [
     "dispatch_grouped_gemm_mxfp8",
@@ -76,4 +79,5 @@ __all__ = [
     "colwise_requant_mxfp8_grouped_fp8in_flydsl",
     "colwise_requant_fp8in_and_quant_bf16_grouped_flydsl",
     "rowcol_dual_quant_mxfp8_grouped_flydsl",
+    "swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl",
 ]

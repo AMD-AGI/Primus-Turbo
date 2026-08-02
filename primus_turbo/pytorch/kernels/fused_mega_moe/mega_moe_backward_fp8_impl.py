@@ -33,9 +33,8 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl,
-    rowcol_dual_quant_mxfp8_grouped_flydsl,
+    swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
 )
-from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float8_e5m2
@@ -66,7 +65,6 @@ _L2_DGRAD_NUM_PRESHUFFLE_CU = 8
 # tile_to_expert.
 _HANDLE_GROUP_LENS = 9
 _HANDLE_GROUP_OFFS = 10
-_HANDLE_NUM_TILE_BLOCKS = 11  # device real-tile count (SwiGLU epilogue row bound)
 
 _W2T_PREP_ATTR = "_mega_fp8_w2t_prep"
 _W1T_COMBINE_PREP_ATTR = "_mega_fp8_w1t_combine_prep"
@@ -171,7 +169,8 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
     """Backward L1 dgrad: fp8 fc1-dgrad (``grad_l1 @ w1^T``) + combine PUSH + unweighted reduce +
     grad_gate scatter -> ``(dx [num_tokens, H] bf16, grad_topk_weights [num_tokens, num_topk] f32)``.
 
-    ``grad_l1_rowwise_fp8`` = ``(q_row e4m3, a_sp preshuffled)`` from ``rowcol_dual_quant_mxfp8_grouped_flydsl``."""
+    ``grad_l1_rowwise_fp8`` = ``(q_row e4m3, a_sp preshuffled)`` from
+    ``swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl``."""
     w1tf = w1t_fp8 if w1t_fp8 is not None else _w1t_combine_fp8_cached(w1)
     dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel(
         None, w1tf, list(handle), group,
@@ -274,16 +273,14 @@ def mega_moe_backward_fp8_impl(
     # rowwise-fp8 (the dW2 `a` operand `dispatch_l2_grad`, requant colwise directly from fp8).
     grad_swiglu, dispatch_l2_grad_fp8 = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2, group, handle, block_m, block_n)
 
-    # SwiGLU^T (bf16) -> grad_l1 [P,2I]; re-inject routing weight; grad_gate [P]; and
-    # act_weighted [P,I] = fwd-act * weight (the dW2 `b` operand, folding host saved_act*weight).
-    grad_l1, grad_gate, act_weighted = swiglu_backward_flydsl_kernel(
-        grad_swiglu, l1, handle[_HANDLE_NUM_TILE_BLOCKS],
-        scale=dispatch_weights, return_gate=True, return_act_w=True,
-    )
-
-    # grad_l1 -> rowwise (STEP3) + colwise (dW1) in ONE read; pack=4 a_sp fused in launch().
-    gl1_q_row, gl1_a_sp, gl1_q_col, gl1_s_col = rowcol_dual_quant_mxfp8_grouped_flydsl(
-        grad_l1, _DW_FP8_FORMAT, meta=colwise_meta,
+    # SwiGLU^T with the routing weight re-injected, fused with the rowwise (STEP3) and colwise
+    # (dW1) mxfp8 quant of grad_l1 -- which has no other consumer, so it never reaches HBM.
+    # Also emits grad_gate [P] and act_weighted [P,I] (the dW2 `b` operand, folding
+    # host saved_act*weight). pack=4 a_sp fused in launch().
+    (
+        gl1_q_row, gl1_a_sp, gl1_q_col, gl1_s_col, grad_gate, act_weighted,
+    ) = swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
+        grad_swiglu, l1, dispatch_weights, _DW_FP8_FORMAT, meta=colwise_meta,
     )
 
     # dW2 (MXFP8 variable-K): dispatch_l2_grad^T @ act_weighted; `a` requant-fused directly from
