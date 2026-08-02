@@ -108,7 +108,7 @@ def profile(group, args):
     # L1 (fp8) + fused SwiGLU+mxfp8 quant -> act_fp8 (the real L2 A operand), once
     torch.cuda.synchronize(); group.barrier()
     # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard reset.
-    l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     ntb = get_symm_buffer_for_mega_moe().meta_scalars[1:2]
     act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, ntb)
 

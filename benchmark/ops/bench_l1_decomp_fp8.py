@@ -2,11 +2,12 @@
 """L1 (dispatch+fc1) serial-prefix + fused-kernel decomposition (EP8, DSv3).
 
 Measures on one stream (no side-stream overlap):
-  prologue | x rowwise quant | fused [comm | preshuffle | GEMM] | full L1 (flydsl entry)
+  prologue | fused [x quant + comm | preshuffle | GEMM] | full L1 (flydsl entry)
 
 The fused kernel legs (comm / preshuffle / GEMM) overlap inside one grid; isolate with env:
   PT_DISPATCH_PUSH_ONLY=1  comm PUSH only (preshuffle+gemm idle)
-  PT_DISPATCH_GEMM_ONLY=1  preshuffle+GEMM only (comm idle; x must be pre-quant)
+  PT_DISPATCH_GEMM_ONLY=1  preshuffle+GEMM only (comm idle)
+Either isolation makes the output WRONG; they are timing probes only.
 
 Run (8 GPUs):
   PYTHONPATH=<repo> python benchmark/ops/bench_l1_decomp_fp8.py \\
@@ -98,8 +99,6 @@ def worker(local_rank, world, args):
         )
 
     handle = _prologue()
-    xq, xs = quantize_rowwise_mxfp8_flydsl(x)
-    xs = xs.view(torch.float8_e8m0fnu)
     torch.cuda.synchronize()
     group.barrier()
 
@@ -110,13 +109,13 @@ def worker(local_rank, world, args):
         warmup=args.warmup, iters=args.iters, group=group,
     )
 
-    def _fused_prequant():
+    def _fused():
         dispatch_grouped_gemm_mxfp8(
-            xq, xs, w1q, w1s, handle, sym_layout, symm,
+            x, w1q, w1s, handle, sym_layout, symm,
             num_dispatch_cu=DC, num_preshuffle_cu=PC, BM=BM, BN=BN,
         )
 
-    r["fused_kernel"] = _bench(_fused_prequant, warmup=args.warmup, iters=args.iters, group=group)
+    r["fused_kernel"] = _bench(_fused, warmup=args.warmup, iters=args.iters, group=group)
 
     def _full_l1():
         dispatch_grouped_gemm_mxfp8_flydsl_kernel(
@@ -129,7 +128,7 @@ def worker(local_rank, world, args):
     for leg, env_var in (("push_only", "PT_DISPATCH_PUSH_ONLY"), ("gemm_only", "PT_DISPATCH_GEMM_ONLY")):
         os.environ[env_var] = "1"
         try:
-            r[leg] = _bench(_fused_prequant, warmup=max(4, args.warmup // 2), iters=max(10, args.iters // 2), group=group)
+            r[leg] = _bench(_fused, warmup=max(4, args.warmup // 2), iters=max(10, args.iters // 2), group=group)
         except Exception as exc:
             r[leg] = float("nan")
             if rank == 0:
@@ -138,13 +137,13 @@ def worker(local_rank, world, args):
             os.environ.pop(env_var, None)
 
     if rank == 0:
-        serial_sum = r["prologue"] + r["x_quant"] + r["fused_kernel"]
+        serial_sum = r["prologue"] + r["fused_kernel"]
         print(f"\n{'=' * 72}")
         print(f"[L1 decomp fp8]  EP{world} T={T} H={H} I={I}  dispatch/ps CU={DC}/{PC}  (max rank ms)")
         print(f"{'=' * 72}")
         print(f"  {'prologue':<22} {r['prologue']:7.3f} ms")
-        print(f"  {'x rowwise quant':<22} {r['x_quant']:7.3f} ms")
-        print(f"  {'fused kernel':<22} {r['fused_kernel']:7.3f} ms  (comm|preshuffle|GEMM, pre-quant x)")
+        print(f"  {'fused kernel':<22} {r['fused_kernel']:7.3f} ms  (x quant + comm|preshuffle|GEMM)")
+        print(f"  {'  of which x quant':<22} {r['x_quant']:7.3f} ms  (rowwise mxfp8, host launch)")
         print(f"  {'serial sum (above)':<22} {serial_sum:7.3f} ms")
         print(f"  {'full L1 (flydsl entry)':<22} {r['full_l1_flydsl']:7.3f} ms  (prologue+quant+kernel / call)")
         print(f"  gap full - serial_sum   {r['full_l1_flydsl'] - serial_sum:+.3f} ms")

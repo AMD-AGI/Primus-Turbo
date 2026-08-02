@@ -115,7 +115,7 @@ def profile(group, args):
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
     # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard reset.
-    l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
     Pp, Hp = symm.pool_fp8.shape
     pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(Pp, Hp // 32).clone())

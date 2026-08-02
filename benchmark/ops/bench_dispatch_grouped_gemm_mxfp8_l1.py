@@ -120,8 +120,8 @@ def profile(group, args):
 
     # WEIGHTS are static (module-owned + version-keyed in production) -> quantize ONCE, out of the
     # timed L1 step. TOKENS are activation-dependent -> re-quantized EVERY forward; that token quant
-    # now lives INSIDE dispatch_grouped_gemm_mxfp8 (pass bf16 x + xs=None -> one global rowwise
-    # mxfp8 quant, then the clean-push pipeline). We still time the quant alone to show its share.
+    # now lives INSIDE dispatch_grouped_gemm_mxfp8 (bf16 x in -> one global rowwise mxfp8 quant,
+    # then the clean-push pipeline). We still time the quant alone to show its share.
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
 
     def _quant_tokens():  # for the breakdown only (the op does this internally on the bf16 path)
@@ -133,7 +133,7 @@ def profile(group, args):
 
     def _l1_step():  # the REAL per-forward cost: token quant (inside) + fused dispatch+GEMM
         return dispatch_grouped_gemm_mxfp8(
-            x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN,
+            x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN,
             num_dispatch_cu=ndcu, num_preshuffle_cu=pscu,
         )
 

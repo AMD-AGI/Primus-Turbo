@@ -75,10 +75,10 @@ signal pad,所以没暴露)。cached 下 peer PUSH 过来的 payload/E8M0 留在
 cos ~0.996 PASS**,fp8 前向 T=8192 = 5.22ms(**1.35× vs bf16 7.06ms**)。
 
 ### token quant 已挪进 `dispatch_grouped_gemm_mxfp8`(已 GPU 验证)
-`dispatch_grouped_gemm_mxfp8_kernel.py` 函数顶部(约 line 431 `if xq.dtype == torch.bfloat16:` 分支):
-传 **bf16 x + `xs=None`** 时,op 内部做**一次全局** rowwise mxfp8 quant(`quantize_rowwise_mxfp8_flydsl`,
-单独 launch、同流天然 ordered,无需显式 sync)再跑 clean-push 流水线;传预量化 fp8 `xq`+`xs` 则跳过
-(源签名兼容,re-sync 友好)。benchmark 用 bf16 x 调用(`_l1_step` 里 `dispatch_grouped_gemm_mxfp8(x, None, ...)`)。
+`dispatch_grouped_gemm_mxfp8` 只收 **bf16 x**,op 内部做**一次全局** rowwise mxfp8 quant
+(`quantize_rowwise_mxfp8_flydsl`,单独 launch、同流天然 ordered,无需显式 sync)再跑 clean-push 流水线;
+置 `PT_DISPATCH_FUSE_SETUP=1` 则改由 grid 内 SETUP 角色量化,省掉这次 host launch。
+benchmark 同样用 bf16 x 调用(`_l1_step` 里 `dispatch_grouped_gemm_mxfp8(x, w1q, ...)`)。
 **已在 n03-33 GPU 验证(2026-07-20)**:T=2048 L1 0.94ms、T=8192 L1 2.35ms(fused 2.29ms @ 1782 TFLOPS,
 token_quant 0.059ms ~2.5%),cos=1.00000 PASS。
 

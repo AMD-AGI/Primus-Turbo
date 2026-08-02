@@ -230,13 +230,13 @@ def profile_l1(group, args, mode):
 
     def _fp8():  # FULL per-forward L1: prologue + fused dispatch+GEMM (epoch self-reset on device)
         h = _prologue()
-        return dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, h, sym_layout, symm, BM=BM, BN=BN,
+        return dispatch_grouped_gemm_mxfp8(x, w1q, w1s, h, sym_layout, symm, BM=BM, BN=BN,
                                            num_dispatch_cu=dc, num_preshuffle_cu=pc)
 
     # ── correctness (fp8): one L1, then torch dequant grouped-GEMM over the dispatched pool ──
     handle = _prologue()
     torch.cuda.synchronize(); group.barrier()
-    out = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN,
+    out = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN,
                                       num_dispatch_cu=dc, num_preshuffle_cu=pc)
     torch.cuda.synchronize(); group.barrier()
     real_tiles = int(symm.meta_scalars[1].item())
@@ -287,7 +287,7 @@ def profile_l2(group, args, mode):
     ))
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
-    l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, symm.meta_scalars[1:2])
     w2_fp8 = prepare_w2_fp8(W2)               # static weight prep (module-owned in production)
     real_tiles = int(symm.meta_scalars[1].item())
@@ -367,7 +367,7 @@ def profile_dispatch_fc2_dgrad(group, args, mode):
     ))
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
-    dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)  # fwd L1 (setup)
+    dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)  # fwd L1 (setup)
 
     dc = args.dispatch_cu if args.dispatch_cu >= 0 else None    # default 24 inside helper
     pc = args.preshuffle_cu if args.preshuffle_cu >= 0 else None  # default 8 inside helper
@@ -433,7 +433,7 @@ def profile_fc2_wgrad(group, args, mode):
     # fwd L1 -> l1 + dispatch_weights (the swiglu_backward inputs)
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
-    l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
 
     # dispatch(dy)+fc2-dgrad -> grad_swiglu + dispatched-dy fp8 pool; swiglu_backward -> act_weighted
@@ -526,7 +526,7 @@ def profile_fc1_wgrad(group, args, mode):
     # fwd L1 -> l1 + dispatch_weights; CLONE the fc1-input pool BEFORE the dispatch_fc2_dgrad stage overwrites symm.pool_fp8
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
-    l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
     Pp, Hp = symm.pool_fp8.shape
     pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(Pp, Hp // 32).clone())
@@ -620,7 +620,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
     # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard/flag reset.
-    l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
     grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
     grad_l1, grad_gate = swiglu_backward_flydsl_kernel(grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True)

@@ -155,7 +155,6 @@ def _compile(
     num_ranks,
     G,
     num_tokens,
-    cbsz=0,
     blgp=0,
     nt_vmcnt=3,
     waves_per_eu=2,
@@ -205,7 +204,7 @@ def _compile(
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_mxfp8_kernel(
-        X_BF16: fx.Tensor,  # bf16 activations [T, K] (dummy when pre-quantized)
+        X_BF16: fx.Tensor,  # bf16 activations [T, K] (dummy when the host quantized instead)
         W1S_RAW: fx.Tensor,  # raw weight E8M0 int32 view [G*N, K128]
         XQ: fx.Tensor,  # fp8 tokens int32 view [T, K//4] flattened (setup writes, comm reads)
         XS_U8: fx.Tensor,  # raw E8M0 scales uint8 [T, K//32] flat (setup quant writes)
@@ -494,7 +493,6 @@ def _compile(
                         BLOCK_N=BLOCK_N,
                         G=G,
                         group_idx=g_idx,
-                        cbsz=cbsz,
                         blgp=blgp,
                         out_fp16=out_fp16,
                         nt_vmcnt=nt_vmcnt,
@@ -563,8 +561,7 @@ def _compile(
 
 
 def dispatch_grouped_gemm_mxfp8(
-    xq: torch.Tensor,
-    xs: torch.Tensor,
+    x: torch.Tensor,
     w1q: torch.Tensor,
     w1s: torch.Tensor,
     handle,
@@ -580,20 +577,16 @@ def dispatch_grouped_gemm_mxfp8(
 ) -> torch.Tensor:
     """Fused fp8 dispatch PUSH + grouped mxfp8 L1 GEMM (setup + comm/preshuffle/gemm pipeline).
 
-    Pass a bf16 activation as ``xq`` with ``xs=None``: the kernel's SETUP role quantizes all T
-    rows into scratch ``xq``/``xs`` before the comm|preshuffle|gemm overlap begins (no separate
-    host quant launch). Pass pre-quantized ``xq`` [T, K] fp8 + ``xs`` [T, K//32] raw E8M0 to skip
-    setup quant. Weight B-scale preshuffle (ScaleBComb) also runs in SETUP when the weight version
-    is new; static weights are cached host-side after the first preshuffle.
+    Takes the bf16 activation ``x`` [T, K] and produces its mxfp8 rowwise quant internally: under
+    ``PT_DISPATCH_FUSE_SETUP=1`` the kernel's SETUP role quantizes all T rows into scratch before
+    the comm|preshuffle|gemm overlap begins (no separate host quant launch), otherwise a host-side
+    quant launch runs first. Weight B-scale preshuffle (ScaleBComb) also runs in SETUP when the
+    weight version is new; static weights are cached host-side after the first preshuffle.
 
     The gates self-reset via the device epoch bump (see ``_make_epoch_bump``); its tensors ride
     on ``symm``."""
     fuse_setup = int(os.environ.get("PT_DISPATCH_FUSE_SETUP", "0") == "1")
-    needs_x_quant = xq.dtype == torch.bfloat16
-    if needs_x_quant:
-        assert xs is None, "bf16 activation path computes xs internally; pass xs=None"
-    else:
-        assert xs is not None, "pre-quantized fp8 path requires xs"
+    assert x.dtype == torch.bfloat16, f"activation must be bf16, got {x.dtype}"
     (
         expert_send_dst_rank,
         expert_send_dst_row,
@@ -606,14 +599,11 @@ def dispatch_grouped_gemm_mxfp8(
     expected_count = handle[8]
 
     G, N, K = w1q.shape
-    T, Kx = xq.shape
+    T, Kx = x.shape
     assert Kx == K, f"token K={Kx} != weight K={K}"
-    if not needs_x_quant:
-        assert xq.dtype in (torch.float8_e4m3fn, torch.float8_e5m2), "fused kernel takes pre-quantized fp8 tokens"
     num_comm = int(expert_send_dst_rank.numel())
     num_ranks = int(sym_layout.num_ranks)
     num_max_pool_tokens = int(sym_layout.num_max_pool_tokens)
-    cbsz = 1 if (not needs_x_quant and xq.dtype == torch.float8_e5m2) else 0
     blgp = 1 if w1q.dtype == torch.float8_e5m2 else 0
     out_fp16 = out_dtype == torch.float16
     c_n = N
@@ -623,9 +613,10 @@ def dispatch_grouped_gemm_mxfp8(
     push_only = int(os.environ.get("PT_DISPATCH_PUSH_ONLY", "0") == "1")
     gemm_only = int(os.environ.get("PT_DISPATCH_GEMM_ONLY", "0") == "1")
 
-    dev = xq.device
-    if fuse_setup and needs_x_quant:
-        x_bf16 = xq if xq.is_contiguous() else xq.contiguous()
+    dev = x.device
+    if fuse_setup:
+        # SETUP role quantizes x in-grid; hand it the bf16 rows plus persistent fp8/scale scratch.
+        x_bf16 = x if x.is_contiguous() else x.contiguous()
         _xq_sk = (T, K, dev)
         xq_c = _XQ_SCRATCH.get(_xq_sk)
         if xq_c is None:
@@ -635,17 +626,10 @@ def dispatch_grouped_gemm_mxfp8(
         if xs_c is None:
             xs_c = torch.empty((T, K // 32), dtype=torch.uint8, device=dev)
             _XS_SCRATCH[_xq_sk] = xs_c
-    elif needs_x_quant:
-        x_bf16 = torch.empty(1, dtype=torch.bfloat16, device=dev)
-        xq, xs = quantize_rowwise_mxfp8_flydsl(xq)
-        xs = xs.view(torch.float8_e8m0fnu)
-        xq_c = xq if xq.is_contiguous() else xq.contiguous()
-        xs_c = xs if xs.is_contiguous() else xs.contiguous()
-        if xs_c.dtype != torch.uint8:
-            xs_c = xs_c.view(torch.uint8)
-        needs_x_quant = False  # host already quantized
     else:
-        x_bf16 = torch.empty(1, dtype=torch.bfloat16, device=dev)
+        x_bf16 = torch.empty(1, dtype=torch.bfloat16, device=dev)  # unused by the grid
+        xq, xs = quantize_rowwise_mxfp8_flydsl(x)
+        xs = xs.view(torch.float8_e8m0fnu)
         xq_c = xq if xq.is_contiguous() else xq.contiguous()
         xs_c = xs if xs.is_contiguous() else xs.contiguous()
         if xs_c.dtype != torch.uint8:
@@ -662,11 +646,9 @@ def dispatch_grouped_gemm_mxfp8(
     _bk = (w1s.data_ptr(), G, N, K, 1)  # L1 GEMM reads ScaleBComb with pack=1
     needs_b_ps = fuse_setup and (_bk not in _BSP_CACHE)
     setup_env_cu = int(os.environ.get("PT_DISPATCH_SETUP_CU", "2"))
-    if fuse_setup and (needs_x_quant or needs_b_ps):
-        if needs_x_quant and not needs_b_ps:
-            num_setup_cu = 1
-        else:
-            num_setup_cu = setup_env_cu if needs_b_ps else min(setup_env_cu, 2)
+    if fuse_setup:
+        # x quant alone fits in one CU; a fresh weight also needs the B-scale preshuffle.
+        num_setup_cu = setup_env_cu if needs_b_ps else 1
     else:
         num_setup_cu = 0
     if needs_b_ps:
@@ -688,8 +670,8 @@ def dispatch_grouped_gemm_mxfp8(
         setup_gate = torch.zeros(4, dtype=torch.int32, device=dev)
         _SETUP_GATE[dev] = setup_gate
     setup_gate.zero_()
-    setup_gate[2] = int(fuse_setup and needs_x_quant)
-    setup_gate[3] = int(fuse_setup and needs_b_ps)
+    setup_gate[2] = int(fuse_setup)
+    setup_gate[3] = int(needs_b_ps)
     if num_setup_cu == 0 or not fuse_setup:
         setup_gate[1] = 1
     if num_setup_cu > 1:
@@ -716,7 +698,6 @@ def dispatch_grouped_gemm_mxfp8(
         int(num_ranks),
         int(G),
         num_tokens,
-        cbsz=cbsz,
         blgp=blgp,
         out_fp16=out_fp16,
         GROUP_M=int(GROUP_M),
@@ -750,7 +731,7 @@ def dispatch_grouped_gemm_mxfp8(
         torch.cuda.current_stream(),
     )
     ck = (N, K, num_max_pool_tokens, BM, BN, int(num_dispatch_cu), int(num_preshuffle_cu),
-          int(num_setup_cu), int(num_comm), int(num_ranks), int(G), num_tokens, cbsz, blgp, out_fp16, int(GROUP_M),
+          int(num_setup_cu), int(num_comm), int(num_ranks), int(G), num_tokens, blgp, out_fp16, int(GROUP_M),
           push_only, gemm_only)
     if torch.cuda.is_current_stream_capturing():
         raw(*args)
@@ -828,7 +809,7 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
         symm = get_symm_buffer_for_mega_moe()  # live buffer from a prior forward
         sym_layout = symm.make_sym_layout()
     l1 = dispatch_grouped_gemm_mxfp8(
-        x, None, w1q, w1s, handle, sym_layout, symm,
+        x, w1q, w1s, handle, sym_layout, symm,
         num_dispatch_cu=num_dispatch_cu, num_preshuffle_cu=num_preshuffle_cu, BM=BM, BN=BN,
     )
     _Px, _Hx = symm.pool_fp8.shape

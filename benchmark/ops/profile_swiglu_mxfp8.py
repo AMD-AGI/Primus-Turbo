@@ -73,7 +73,7 @@ def worker(local_rank, world, args):
         )
     )
     w1q, w1s = quantize_grouped_weight_mxfp8_flydsl(W1)
-    l1 = dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
     ntb = symm.meta_scalars[1:2]
     torch.cuda.synchronize()
     group.barrier()

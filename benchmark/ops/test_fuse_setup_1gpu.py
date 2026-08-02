@@ -65,7 +65,7 @@ def main():
 
     print(f"launch SETUP_CU={setup_cu}", flush=True)
     out = dispatch_grouped_gemm_mxfp8(
-        x, None, w1q, w1s, handle, sl, symm,
+        x, w1q, w1s, handle, sl, symm,
         num_dispatch_cu=16, num_preshuffle_cu=16, BM=BM, BN=BN,
     )
     torch.cuda.synchronize()

@@ -38,7 +38,7 @@ handle = tuple(dispatch_prologue(
     num_max_pool_tokens=symm.num_max_pool_tokens,
 ))
 print("launch T=512", flush=True)
-dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sl, symm, num_dispatch_cu=4, num_preshuffle_cu=4, BM=BM, BN=BN)
+dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sl, symm, num_dispatch_cu=4, num_preshuffle_cu=4, BM=BM, BN=BN)
 torch.cuda.synchronize()
 sk = (T, H, x.device)
 print("xq match", torch.equal(_XQ_SCRATCH[sk], xq_ref))

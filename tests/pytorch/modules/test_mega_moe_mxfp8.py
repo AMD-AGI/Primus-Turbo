@@ -160,7 +160,7 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         num_tile_blocks = symm.meta_scalars[1:2]
 
         def _l1():  # token quant (inside, bf16-x path) + fused dispatch + mxfp8 NT GEMM
-            return dispatch_grouped_gemm_mxfp8(x, None, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+            return dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
 
         def _quant():  # per-forward token quant alone (breakdown)
             xq, xs = quantize_rowwise_mxfp8_flydsl(x)
