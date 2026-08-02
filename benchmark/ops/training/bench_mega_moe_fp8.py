@@ -545,7 +545,7 @@ def profile_fc1_wgrad(group, args, mode):
         # dual-quant in the real backward); in isolation we still quantize it here so FULL is comparable.
         meta_f = colwise_grouped_meta(group_lens, group_offs)
         a_colwise = colwise_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=meta_f)[:2]
-        return _mxfp8_variable_k_wgrad_dw1(a_colwise, pool_x_fp8, meta_f)
+        return _mxfp8_variable_k_wgrad_dw1(a_colwise, pool_x_fp8, meta_f, pool_x_is_colwise=False)
 
     # BREAKDOWN: pre-quantize both operands ONCE -> isolate the fp8 variable-K GEMM from the per-call
     # colwise quant(grad_l1)/requant(pool_x). (dW1: `a`=grad_l1 quant, `b`=pool_x requant.)
