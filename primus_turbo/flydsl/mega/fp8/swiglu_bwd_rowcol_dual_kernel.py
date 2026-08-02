@@ -58,7 +58,7 @@ def _compile_gate_partial_reduce(n_part: int, BT: int = 256):
     """Fold the ``[n_part, P]`` per-i-tile gate partials into ``grad_gate [P]``."""
 
     @flyc.kernel(known_block_size=[BT, 1, 1])
-    def red_kern(GG: fx.Tensor, GP: fx.Tensor, P_i32: fx.Int32):
+    def gate_partial_reduce_kern(GG: fx.Tensor, GP: fx.Tensor, P_i32: fx.Int32):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         row = bid * fx.Int32(BT) + tid
@@ -75,7 +75,8 @@ def _compile_gate_partial_reduce(n_part: int, BT: int = 256):
 
     @flyc.jit
     def launch_reduce(GG, GP, P_i32, n_blocks, stream: fx.Stream = fx.Stream(None)):
-        red_kern(GG, GP, P_i32).launch(grid=(n_blocks, 1, 1), block=(BT, 1, 1), stream=stream)
+        gate_partial_reduce_kern(GG, GP, P_i32).launch(
+            grid=(n_blocks, 1, 1), block=(BT, 1, 1), stream=stream)
 
     return launch_reduce
 
@@ -114,8 +115,10 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
         rscale: fx.Array[fx.Int32, 2 * BT, 16]    # rowwise E8M0 byte, gate half then up half
         meta: fx.Array[fx.Int32, 3, 16]           # WG-uniform in_off_g, len_g, m_local0
 
+    # Named, not `kern`: every FlyDSL kernel lowers to its Python function name, so a generic
+    # name collides with a dozen others in a profile and cannot be selected by ATT regex.
     @flyc.kernel(known_block_size=[BT, 1, 1])
-    def kern(
+    def swiglu_bwd_dual_kern(
         L1: fx.Tensor, DACT: fx.Tensor, SCALE: fx.Tensor,
         QC: fx.Tensor, SC: fx.Tensor, QR: fx.Tensor, SRAW: fx.Tensor,
         ACTW: fx.Tensor, GPART: fx.Tensor,
@@ -352,8 +355,9 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
     @flyc.jit
     def launch(L1, DACT, SCALE, QC, SC, QR, ASP, SRAW, ACTW, GPART, PMB_META,
                mpad_i32, npblk, prows, n_pblk, stream: fx.Stream = fx.Stream(None)):
-        kern(L1, DACT, SCALE, QC, SC, QR, SRAW, ACTW, GPART, PMB_META, mpad_i32, npblk, prows).launch(
-            grid=(n_pblk * n_itile, 1, 1), block=(BT, 1, 1), stream=stream)
+        swiglu_bwd_dual_kern(
+            L1, DACT, SCALE, QC, SC, QR, SRAW, ACTW, GPART, PMB_META, mpad_i32, npblk, prows
+        ).launch(grid=(n_pblk * n_itile, 1, 1), block=(BT, 1, 1), stream=stream)
         launch_pack(ASP, SRAW, PMB_META, n_pblk, stream=stream)
 
     return launch, n_itile
