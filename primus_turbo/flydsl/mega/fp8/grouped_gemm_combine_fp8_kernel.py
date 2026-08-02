@@ -46,6 +46,7 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
+from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.mega.fp8.combine_config import _BLOCK_THREADS, _NUM_WARPS, _WARP
 from primus_turbo.flydsl.mega.prims import cast
@@ -88,6 +89,10 @@ _COMBINE_REAL_TILES_GRID = os.environ.get("PT_COMBINE_REAL_TILES_GRID", "1") != 
 # backward STEP3: optional split GEMM+push from reduce (host barrier between). Off by default
 # after rowwise-quant fix; enable with PT_COMBINE_SPLIT_REDUCE=1 if co-scheduling races return.
 _SPLIT_BWD_REDUCE = os.environ.get("PT_COMBINE_SPLIT_REDUCE", "0") == "1"
+# top-k reduce payload load width in i32 words per lane. 4 -> b128 (matches the PUSH path); 1 ->
+# the original dword path. Words are 4-aligned, so a group of 4 stays inside one E8M0 32-block:
+# one scale word + one shift serves all 4. Falls back to 1 when H4 is not a multiple of _WARP*VW.
+_REDUCE_VW = int(os.environ.get("PT_COMBINE_REDUCE_VW", "4"))
 
 
 @functools.lru_cache(maxsize=4)
@@ -189,7 +194,8 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
     H4 = hidden // 4
     payload_i32_total = combine_slots * H4
     SC = hidden // 128
-    words_per_lane = H4 // _WARP
+    VW = _REDUCE_VW if H4 % (_WARP * _REDUCE_VW) == 0 else 1
+    steps_per_lane = H4 // (_WARP * VW)
 
     def _reduce(thread_index, base_pid, total_warps, num_experts, rank, comb_base, comb_records,
                 output_res, topk_indices_res, num_tokens_res, barrier_base, reduce_bank, expected_reduce,
@@ -228,14 +234,18 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
             _wait_mem()
 
             zero_vec = fx.arith.constant_vector(0.0, f32_v4)
-            for k in fx.range_constexpr(words_per_lane):
-                w = lane + fx.Int32(k * _WARP)
+            for k in fx.range_constexpr(steps_per_lane):
+                # lane owns VW consecutive payload words -> b128 per lane, 1024 B per warp step.
+                w = lane * fx.Int32(VW) + fx.Int32(k * _WARP * VW)
                 sword_idx = w // fx.Int32(32)
                 shift = fx.Int32(8) * ((w // fx.Int32(8)) % fx.Int32(4))
-                acc = fx.arith.constant_vector(0.0, f32_v4)
+                acc = [fx.arith.constant_vector(0.0, f32_v4) for _ in range_constexpr(VW)]
                 for jj in fx.range_constexpr(topk):
                     slot = token * fx.Int32(topk) + fx.Int32(jj)
-                    pw = buffer_load(comb_res, slot * fx.Int32(H4) + w, vec_width=1, dtype=fx.T.i32())
+                    pv = buffer_load(
+                        comb_res, slot * fx.Int32(H4) + w, vec_width=VW, dtype=fx.T.i32(),
+                    )
+                    words = [Vec(pv)[v].ir_value() for v in range_constexpr(VW)] if VW > 1 else [pv]
                     sw = buffer_load(
                         comb_res, fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + sword_idx,
                         vec_width=1, dtype=fx.T.i32(),
@@ -246,13 +256,20 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                     if const_expr(apply_weights):   # WEIGHTED (fwd L2): coef = scale * topk_weight
                         wj = buffer_load(topk_weights_res, slot, vec_width=1, dtype=fx.T.f32())
                         coef = fx.arith.ArithValue(sf) * fx.arith.ArithValue(wj)
-                    lo = cvt_pk_f32_fp8(res=_v2, src=pw, word_sel=False)
-                    hi = cvt_pk_f32_fp8(res=_v2, src=pw, word_sel=True)
-                    deq = _vector.shuffle(lo, hi, [0, 1, 2, 3])
-                    term = fx.arith.mulf(deq, _vector.broadcast(f32_v4, fx.arith._to_raw(coef)))
-                    term = fx.arith.select(valid[jj], term, zero_vec)
-                    acc = fx.arith.addf(acc, term)
-                buffer_store(fx.arith.trunc_f(bf16_v4, acc), output_res, token * fx.Int32(hidden) + w * fx.Int32(4))
+                    coef_v = _vector.broadcast(f32_v4, fx.arith._to_raw(coef))
+                    for v in range_constexpr(VW):
+                        pw = words[v]
+                        lo = cvt_pk_f32_fp8(res=_v2, src=pw, word_sel=False)
+                        hi = cvt_pk_f32_fp8(res=_v2, src=pw, word_sel=True)
+                        deq = _vector.shuffle(lo, hi, [0, 1, 2, 3])
+                        term = fx.arith.mulf(deq, coef_v)
+                        term = fx.arith.select(valid[jj], term, zero_vec)
+                        acc[v] = fx.arith.addf(acc[v], term)
+                for v in range_constexpr(VW):
+                    buffer_store(
+                        fx.arith.trunc_f(bf16_v4, acc[v]), output_res,
+                        token * fx.Int32(hidden) + (w + fx.Int32(v)) * fx.Int32(4),
+                    )
 
             if const_expr(with_gate):
                 # d_topk_w[slot] = combine_gate[slot] for valid routes else 0 (backward gate grad).
