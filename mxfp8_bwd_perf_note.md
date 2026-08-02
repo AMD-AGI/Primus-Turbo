@@ -1,9 +1,11 @@
 # MXFP8 Backward — Performance & Correctness Status
 
-**Date:** 2026-08-01 (all numbers measured this session)
-**Device:** MI355X (`gfx950`, 256 CU, 8 XCD), node `smci355-ccs-aus-n04-33`, container `xiaoming-dev`
+**Date:** 2026-08-01; §1 and §2.1 re-measured 2026-08-02
+**Device:** MI355X (`gfx950`, 256 CU, 8 XCD) — node `smci355-ccs-aus-n04-33` / container `xiaoming-dev`
+(08-01), node `smci355-ccs-aus-n05-29` / container `xiaoming-perf` (08-02). The two are not
+interchangeable; see §1.1.
 **Model shape:** DeepSeek-V3 — H=7168, I=2048, E=256, K=8, EP8 intra-node, T=8192/rank
-**Code:** `feat/xiaompen/mega_moe_flydsl_mxfp8` @ `bbb5a85e` + uncommitted campaign work
+**Code:** `feat/xiaompen/mega_moe_flydsl_mxfp8` @ `b9103a5c` (was `bbb5a85e` + uncommitted work on 08-01)
 **Bench:** `benchmark/ops/bench_mega_moe_bwd_only.py`, CUDA events, `_amax` across ranks, warmup=8 / iters=25
 
 Companion to `mxfp8_fwd_breakdown_note.md` (forward). Campaign log:
@@ -16,20 +18,70 @@ Companion to `mxfp8_fwd_breakdown_note.md` (forward). Campaign log:
 Three legs share persistent leaf tensors, so the fp8 weight-quant cache hits across iters (mirrors
 training). `bwd-only` times `y.backward(grad_y)` with the forward outside the event window.
 
+Means of four runs, pooled over `803951e0` and `b9103a5c` (§1.2 shows the two are one population):
+
 | Routing | dtype | fwd+bwd | fwd-only | bwd-only |
 |---|---|---|---|---|
-| load_balanced | fp8 | **14.11** | 5.38 | **8.60** |
-| load_balanced | bf16 | 20.47 | 7.23 | 13.91 |
-| load_balanced | bf16/fp8 | 1.45× | 1.34× | **1.62×** |
-| round_robin | fp8 | **13.42** | 5.12 | **8.28** |
-| round_robin | bf16 | 19.77 | 7.01 | 13.43 |
-| round_robin | bf16/fp8 | 1.47× | 1.37× | **1.62×** |
+| load_balanced | fp8 | **13.62** | 5.31 | **8.42** |
+| load_balanced | bf16 | 20.20 | 7.12 | 13.74 |
+| load_balanced | bf16/fp8 | 1.48× | 1.34× | **1.63×** |
+| round_robin | fp8 | **13.07** | 5.06 | **8.12** |
+| round_robin | bf16 | 19.53 | 6.90 | 13.31 |
+| round_robin | bf16/fp8 | 1.49× | 1.37× | **1.64×** |
 
-The backward is where fp8 pays off most (1.62× vs 1.34× on the forward), and the ratio is identical
+The backward is where fp8 pays off most (1.63× vs 1.34× on the forward), and the ratio is unchanged
 under a heavily skewed routing, so the speedup does not depend on balanced experts.
 
-Cross-check `fwd-only + bwd-only` vs `fwd+bwd`: fp8 13.98 vs 14.11 (+1.0%), i.e. the three legs are
-self-consistent and nothing is hidden between them.
+Spread between repeats of one arm reached 1.35% (RR fp8 `bwd-only`, 8.158 vs 8.049) and 2.1% (LB
+bf16 `fwd-only`, 7.063 vs 7.211). **Treat anything under ~1.5% as noise**, and do not read a single
+run as a result.
+
+Cross-check `fwd-only + bwd-only` vs `fwd+bwd`: fp8 13.73 vs 13.62 (+0.8%), bf16 20.86 vs 20.20
+(+3.3%). The three legs are self-consistent; bf16 hides somewhat more between them.
+
+### 1.1 Against the 08-01 table — do not diff across nodes
+
+The previous session measured (`bbb5a85e` + uncommitted, node `n04-33`):
+
+| Routing | dtype | fwd+bwd | fwd-only | bwd-only |
+|---|---|---|---|---|
+| load_balanced | fp8 | 14.11 | 5.38 | 8.60 |
+| load_balanced | bf16 | 20.47 | 7.23 | 13.91 |
+| round_robin | fp8 | 13.42 | 5.12 | 8.28 |
+| round_robin | bf16 | 19.77 | 7.01 | 13.43 |
+
+Every cell is 0.9–3.5% faster now, which overstates the progress: **bf16 moved ~1.3% as well**, and
+no commit since has touched the bf16 path. That 1.3% is the node/session change, not code. Netting
+it out leaves, on load_balanced, about −2.2% `fwd+bwd` and −0.9% `bwd-only` — and **+0.2% on
+`fwd-only`, i.e. no measurable forward gain at all** once the drift is removed.
+
+So **A/B on one node within one session**; a cross-session diff on this bench carries a >1% floor
+that will swallow or invent a result of the size this campaign is chasing. Keeping the bf16 leg in
+every run is what makes the drift visible — it is the control, not redundant data.
+
+### 1.2 `803951e0` → `b9103a5c` — a no-op, confirmed as one
+
+`b9103a5c` renames the fused swiglu-bwd dual-quant kernels (`kern` → `swiglu_bwd_dual_kern`) so they
+can be picked out of a profile; it claims byte-exact parity. Two runs each side, same node, same
+session, means:
+
+| Routing | dtype | Δ fwd+bwd | Δ fwd-only | Δ bwd-only |
+|---|---|---|---|---|
+| load_balanced | fp8 | +0.37% | +0.38% | +0.23% |
+| load_balanced | bf16 | −0.36% | −0.39% | −0.10% |
+| round_robin | fp8 | −0.08% | +0.16% | −0.28% |
+| round_robin | bf16 | +0.06% | −0.13% | −0.45% |
+
+Everything is inside ±0.5%, well under the 1.5% noise floor, and **the signs disagree between the
+two routings** — fp8 up and bf16 down on load_balanced, the reverse on round_robin. A real effect
+cannot flip like that, so this is noise, as a pure rename should be. Recorded because a rename does
+change the FlyDSL cache key (kernels lower to their Python function name), which is worth confirming
+costs nothing rather than assuming it.
+
+Earlier the same day, `192ba6aa` (SwiGLU backward fused into the grad_l1 dual-quant) measured LB
+`bwd-only` 8.511 → 8.414, −1.1%, with bf16 flat to ±0.1% across the pair. That is the right shape
+for a real gain but only marginally above the floor, so read it as consistent with the −0.149 ms
+the commit itself reports rather than as an independent confirmation.
 
 ## 2. Backward internal structure
 
@@ -45,6 +97,38 @@ STEP3's PUSH leg moves ~484 MB/rank in ~1.97 ms ≈ 246 GB/s/rank ≈ 1.97 TB/s 
 ceiling. Rounds 3 and 5 established this independently, so **the remaining lever there is fewer
 bytes, not better scheduling or a different CU split**. The largest single traffic item is the local
 round trip where the GEMM epilogue writes 469 MB to L2Y and the PUSH reads the same 469 MB back.
+
+> **Unresolved (08-02).** STEP1 pushes the same ~484 MB/rank, yet its *entire fused stage* measures
+> 1.686 ms — less than the 1.97 ms this paragraph assigns to STEP3's PUSH alone. Both cannot hold.
+> The 1.97 ms was not re-derived this session, so treat "246 GB/s/rank = the XGMI ceiling" as
+> unverified, and do not build a roofline on it until someone re-measures STEP3's PUSH in isolation.
+
+### 2.1 STEP1 (dispatch(dy) + fc2 dgrad) — measured 08-02
+
+`benchmark/ops/bench_step1_fp8_vs_bf16.py`, EP8 T=8192, two runs agreeing to 0.001 ms:
+
+| | Time | TFLOPS | Share of its own backward |
+|---|---|---|---|
+| STEP1 fp8 | 1.686 ms | 1212 | 19.8% |
+| STEP1 bf16 | 2.408 ms | 849 | 17.5% |
+
+fp8 is 1.43× here against 1.63× for the backward as a whole, so **STEP1 is the weakest fp8 leg** and
+is what pulls the average down. Accuracy: `grad_swiglu` SNR 30.89 dB vs a per-group bf16 reference.
+
+Truncating the pushed rows (`MEGA_MOE_PROBE_PUSH_SKIP_MOD`; wrong results, timing only) gives the
+derivative *on the fused stage* rather than on an isolated PUSH: 100% of rows 1.686 ms, 75% 1.523,
+50% 1.400. Extrapolated to zero, the GEMM floor is ~1.12–1.15 ms — so **~0.54 ms, a third of the
+stage, is exposed PUSH and two thirds is GEMM**. Against the gfx950 peaks (MXFP8 5.0 PFLOPS, BF16
+2.5) the fp8 stage reaches 24% of its own dtype's peak while the bf16 stage reaches 34%, and even
+with the PUSH removed entirely fp8 only reaches 36%. The mxfp8 grouped GEMM failing to convert its
+2× nominal advantage — not the comm — is what caps the ratio at 1.43×.
+
+**This partially un-refutes dedup, for the backward only.** The same probe on the forward L1 bought
+0.077 ms for a third of the rows, inside that leg's noise (`mxfp8_fwd_breakdown_note.md` §4c); on
+STEP1 the same fractional cut is worth ~0.21 ms, ~2.7× more sensitive. The reason is shape: the
+dgrad GEMM is half the FLOPs of the forward L1 (N=I=2048 vs 2I=4096) against identical PUSH bytes,
+so here the PUSH has much less GEMM to hide behind. A forward-refuted optimization does not stay
+refuted in the backward.
 
 ## 3. Correctness — nondeterministic by default, and the fix is free
 
@@ -165,6 +249,28 @@ MASTER_PORT=$((20000+RANDOM%20000)) python3 $W/check_determinism.py \
 
 Both are 8-process spawns; kill the whole tree on interrupt or the ranks keep holding VRAM.
 
+The 08-02 numbers were taken from the other node, whose repo path and container differ:
+
+```bash
+ssh smci355-ccs-aus-n05-29 "docker exec xiaoming-perf bash -lc '
+cd /perf_apps/xiaoming/MegaMoE-dev
+export PYTHONPATH=/perf_apps/xiaoming/MegaMoE-dev MEGA_BENCH_TIMEOUT_S=1800
+export MASTER_PORT=\$((9000+RANDOM%500))
+
+# sec.1 regression (fp8 vs bf16, both routings) -- run it at least twice
+python benchmark/ops/bench_mega_moe_bwd_only.py \
+  --num-processes 8 --num-tokens 8192 --routing-mode both --only both --warmup 8 --iters 25
+
+# sec.2.1 STEP1 isolate; prefix MEGA_MOE_PROBE_PUSH_SKIP_MOD=2 or 4 for the PUSH derivative
+python benchmark/ops/bench_step1_fp8_vs_bf16.py --num-processes 8 --num-tokens 8192
+'"
+```
+
+`torch.multiprocessing.spawn` children carry the generic `spawn_main` cmdline and do not match a
+`pgrep` on the script name, so killing the parent leaves 8 GPU-holding orphans that silently block
+every later run. Reap by `spawn_main`; the wrappers under
+`agent/workspace/mxfp8_fwd_opt/run_probe_guarded.sh` already do.
+
 ## 5. Open items
 
 | P | Item | Notes |
@@ -172,6 +278,9 @@ Both are 8-process spawns; kill the whole tree on interrupt or the ranks keep ho
 | **P1** | root-cause the GEMM→push gate | costs reproducibility, not accuracy (round 7); the stall that proved it is removed, visibility family already ruled out |
 | **P2** | track `dW1`/`dW2` accumulation-order nondeterminism | independent source, one bf16 ULP |
 | **P3** | kill the L2Y local round trip in STEP3 | 469 MB written + 469 MB re-read; the only lever that attacks the XGMI/HBM floor |
+| **P5** | XGMI dedup on STEP1 | refuted on the forward, but §2.1 measures ~2.7× more push sensitivity here; ~0.21 ms of 1.686 |
+| **P6** | why the mxfp8 grouped GEMM stops at ~36% of peak | §2.1 — the cap on STEP1's fp8/bf16 ratio, and dW1 sits at a similar 39% |
+| **P7** | re-derive STEP3's isolated PUSH time | §2 says 1.97 ms at the XGMI ceiling; STEP1's whole stage is 1.686 ms for the same bytes |
 | **P4** | group-aware L2 swizzle for the combine GEMM | plain `GROUP_M` degrades monotonically (round 4) — groups span per-expert B slabs |
 | — | `num_combine_cu` re-sweep | exhausted (round 3): 28 optimal, PUSH is traffic-bound |
 | — | segment-driven PUSH | refuted (round 5): loses ILP from the compile-time trip count |
