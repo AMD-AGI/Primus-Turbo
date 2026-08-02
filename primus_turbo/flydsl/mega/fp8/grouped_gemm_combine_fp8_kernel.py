@@ -349,9 +349,6 @@ def _compile(
     # reduce idle), so it just XGMI-copies whatever's in the local fp8 L2Y to the peer comb + flags.
     # Measures the combine-PUSH wall (cross-rank byte cost) -> INCORRECT output, timing only.
     _push_only = os.environ.get("PT_COMBINE_PUSH_ONLY", "0") == "1"
-    # PT_COMBINE_GATE_DELAY=N (isolation): stall N*s_sleep(127) after the GEMM-done gate, before the
-    # push reads L2Y, to separate "the gate releases too early" from every other cause. 0 = off.
-    _gate_delay = int(os.environ.get("PT_COMBINE_GATE_DELAY", "0"))
     _no_reduce = force_no_reduce or _env_no_reduce or _gemm_only or _push_only
     reduce_fp8 = _make_topk_reduce_fp8(out_features, topk, combine_slots, apply_weights, with_gate)
     # Tail-reduce reservation when pool capacity exceeds real tiles (worst_case > real_tiles).
@@ -452,12 +449,6 @@ def _compile(
                                     spin_start = read_clock()
                     fx.gpu.barrier()
                     l2_invalidate()
-                    if _gate_delay:
-                        # Widens the window between the gate and the push reading L2Y. N>=4 makes y
-                        # and dx bitwise reproducible across runs; it does NOT move accuracy (fp8
-                        # measures a flat 21.9 dB on dx against an analytic reference either way).
-                        for _ in range_constexpr(_gate_delay):
-                            fx.rocdl.s_sleep(fx.Int32(127))
                 push_block(block_m)
             fx.rocdl.s_waitcnt(0)
         else:
