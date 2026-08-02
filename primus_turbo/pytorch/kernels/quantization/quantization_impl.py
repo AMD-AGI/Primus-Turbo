@@ -47,6 +47,24 @@ def quantize_fp8_tensorwise_impl(
     return x_fp8, scale_inv
 
 
+def quantize_fp8_tensorwise_pad_flydsl_impl(
+    x: torch.Tensor, out_dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """FlyDSL per-tensor fp8 cast fused with K-pad to Kp=ceil128(K) (gfx950), the tw grouped-GEMM
+    operand quant. Returns (x_fp8, scale_inv) matching quantize_fp8_tensorwise_impl, except the
+    fp8 inner dim is Kp (real data in [..., :K], pad columns zeroed). A 3D [B, N, K] weight does
+    all B experts in one launch."""
+    from primus_turbo.flydsl.quantization.fp8_tensorwise_quant_flydsl import (
+        quant_fp8_tensorwise_pad,
+        quant_fp8_tensorwise_pad_batched,
+    )
+
+    x = x.contiguous()
+    if x.ndim == 3:
+        return quant_fp8_tensorwise_pad_batched(x, out_dtype)
+    return quant_fp8_tensorwise_pad(x, out_dtype)
+
+
 def quantize_fp8_rowwise_impl(
     x: torch.Tensor, out_dtype: torch.dtype, axis: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
