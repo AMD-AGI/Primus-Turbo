@@ -26,6 +26,35 @@
   only valid when the workgroup enters with fresh LDS. Any persistent / multi-tile-per-workgroup
   scheme must switch it to a full barrier — and even then expect further ordering hazards.
 
+- **The compiler will not hoist a load across a `buffer_store` it cannot prove is non-aliasing.**
+  A producer loop that writes LDS and output buffers between passes gets *zero* cross-pass
+  prefetch, however obvious it looks: the tell in ATT is one `s_waitcnt vmcnt(N)` per pass, each at
+  ~100% stall rate, together dominating the profile. Issuing pass p+1's loads explicitly before
+  consuming pass p's halved VMEM-wait (27% -> 14% of stall) for ~12 VGPRs.
+
+- **`fx.arith.divf(a, b, fastmath="afn,arcp")`** replaces the ~10-VALU IEEE divide expansion
+  (`v_div_scale` x2, `v_rcp`, 3 `v_fma`, `v_div_fmas`, `v_div_fixup`) with `v_rcp_f32`. `arcp`
+  alone is a **no-op** — the backend keeps the IEEE expansion unless `afn` is set too. Do not use
+  `fast`: it also implies nnan/ninf, which lets the compiler delete an `ACTIVATION_CLAMP` min/max
+  for no extra speed. Worth -17% on the ALU-bound forward SwiGLU but only -1.6% on the
+  memory-bound backward one, where `v_exp_f32` still dominates the line.
+
+- **Workgroup-uniform metadata (indexed off `block_idx`) should be `buffer_load`ed by every lane**,
+  not staged into LDS by lane 0 behind a barrier. The LDS route costs a barrier plus the
+  `v_readfirstlane_b32` the read-back lowers to — 8% of stall. `pack_kern` and
+  `_compile_colwise_quant_grouped` already read directly; `_compile_rowcol_dual_grouped` does not,
+  so anything derived from it inherits the slow path.
+
+- **Zeroing via multiply by a 0/1 mask produces `-0.0` for negative inputs**, which encodes as fp8
+  `0x80` instead of `0x00`. Any output whose pad rows are written unconditionally will mismatch
+  while `amax`-derived scales still agree — a confusing signature. Use `arith.select`.
+
+- **LDS *per thread* is what caps occupancy, so shrinking `BT` does not raise it.** A 32-row MX
+  block staged as packed bf16 pairs is 128 B/thread, which pins the fused swiglu-bwd dual-quant at
+  4 of 8 waves/SIMD on the 160 KB LDS regardless of block size. Halving it needs either re-reading
+  `l1`/`dact` (+33% traffic: an F-tiled split makes the gate half read gate+up+d and the up half
+  gate+d) or register residency, which spills. Optimize for *tolerating* 4 waves/SIMD.
+
 ## Measurement
 
 - **`import pkg.sub.mod as m` can hand back a function, not the module.** When the package
@@ -48,6 +77,39 @@
 - **Skewed routing changes absolute latency far more than it changes speedups.** A 32x expert
   imbalance more than doubles FULL forward time at T=8192 (4.66 -> 10.16 ms) while kernel-internal
   gains hold at ~1.03x. Always include a skewed leg, but read relative gains, not absolute ms.
+
+- **The first run of an isolated stage probe reads several percent slow** (cold clocks). A 4x
+  repeat gave 0.609/0.609/0.610/0.610 where the first single shot read 0.630 — enough to invert an
+  accept/rollback decision. Never judge a round on one probe sample; this compounds with the
+  cross-session node drift noted above.
+
+- **`bench_mega_moe_bwd_only.py` has a ±0.03-0.06 ms (0.4-0.7%) band** at EP8/T=8192. A stage that
+  is ~7% of backward cannot produce a resolvable e2e signal from a <5% stage gain. Use the isolated
+  probe plus an ATT stall delta for attribution and read bwd-only as a no-regression check.
+
+- **A stall class's share overstates what removing it buys.** Deleting a barrier worth 6.6% of
+  stall bought 0.3% of wall clock: barrier stall is partly covered by the other workgroups resident
+  on the CU, and removing already-hidden stall pays nothing. Prefer hotspots whose stall rate is
+  ~100% (nothing is covering them) over ones with a big share but partial coverage.
+
+## Profiling (rocprofv3 / ATT)
+
+- **Every FlyDSL kernel lowers to its Python function name**, so a kernel called `kern` appears as
+  `kern_0` next to a dozen unrelated ones and cannot be selected by an ATT `kernel_include_regex`.
+  Name kernels uniquely up front. When reading `kernel_trace.csv`, group by `Kernel_Id`, never by
+  `Kernel_Name`.
+
+- **`rocprofv3 --stats` merges output across ranks** under `torch.multiprocessing.spawn`, making
+  per-kernel aggregates meaningless (and mixing warmup with steady state). Use `--kernel-trace` and
+  group per dispatch.
+
+- **The `rocprof-trace-decoder` .so is not in the ROCm 7.2.1 image.** Fetch the release installer
+  and copy it into `/opt/rocm/lib` before any ATT run; the installer fails unless its `--prefix`
+  directory already exists.
+
+- **Classifying ATT stalls needs `s_waitcnt`'s operands**, not just the opcode, to separate `vmcnt`
+  from `lgkmcnt`. Matching on the opcode alone silently buries every memory wait in a "SALU" bucket
+  and hides the real bottleneck.
 
 ## Anti-patterns (do not retry)
 
