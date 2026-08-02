@@ -151,6 +151,55 @@ GEMM-bound, so the CUs are worth more to the GEMM:
 Same for L2: `cc` = 32 (1.913) beats 48 (1.972) and 64 (2.006) in FULL even though PUSH-only
 prefers 64. **The shipped 16/16 and cc=32 splits are already optimal.** This closes out the old P4.
 
+### 4c. Dedup the redundant XGMI rows — refuted for BOTH stages
+
+A token routed to K experts that land on the same peer is pushed once **per expert**: only 66.1%
+of the 524288 (token, expert) pairs are distinct (token, expert-rank) pairs, so ~34% of both
+PUSHes is redundant. L1 could drop it with a local copy (identical bytes, `dedup_src_row` is
+already allocated in the symmetric layout); L2 would need a pre-combine weight-sum.
+
+Measured the ceiling before implementing either, via a compile-time knob that pushes only 2/3 of
+the rows (`MEGA_MOE_PROBE_PUSH_SKIP_MOD` / `MEGA_MOE_PROBE_COMBINE_SKIP_MOD`, §8). Results are
+wrong by construction; only the timing is read. One session, idle node, measured at `bbb5a85e`
+(the §4d re-measure at `3af98659` leaves the structure these numbers rest on unchanged):
+
+| | baseline | −1/3 of the pushed rows | Δ |
+|---|---:|---:|---|
+| L1 PUSH (isolated) | 1.768 | 1.309 | −0.459 |
+| L1 GEMM-only (push-independent → noise floor) | 1.740 | 1.686 | −0.054 |
+| **L1 fused** | **2.173** | **2.096** | **−0.077** |
+| L2 PUSH (isolated) | 1.729 | 1.164 | −0.565 |
+| L2 no-reduce | 1.745 | 1.681 | −0.064 |
+| **L2 full** | **1.900** | **1.858** | **−0.042** |
+| **FULL** | **4.501** | **4.460** | **−0.041** |
+
+Both isolated PUSHes shrink exactly as predicted (the L2 floor was computed at 1.136 ms, measured
+1.164). **Neither fused stage follows.** Removing 34% of *all* forward XGMI traffic is worth
+~0.06 ms of 4.5 ms — and the L1 figure is inside the noise floor of its own GEMM-only leg.
+
+**Why the "L2 binds on PUSH so cut its bytes" inference was wrong:** the PUSH-only leg runs with
+the GEMM idle, so its 32 CUs own the whole memory system; `max(GEMM, PUSH)` never described the
+fused stage. Decomposing L2 properly (§3c) puts 73% of it in the GEMM and only 19% in exposed
+PUSH, and that exposure is drain, not bandwidth — bytes are close to irrelevant on this path.
+**Do not retry dedup, on either stage, in any form that only removes bytes.**
+
+### 4d. L2 is not PUSH-bound — corrected decomposition
+
+Superseding the §3 reading. Idle node, `cc`=32, re-measured at `3af98659` (L2 full 1.874):
+
+| component | ms | share | from |
+|---|---:|---:|---|
+| GEMM | 1.391 | 74% | `PT_COMBINE_GEMM_ONLY` |
+| exposed PUSH | 0.355 | 19% | no-reduce 1.746 − GEMM |
+| reduce tail | 0.128 | 7% | full 1.874 − no-reduce 1.746 |
+
+`ea9880d7` (b128 top-k reduce) took the reduce tail from 0.155 to 0.128; GEMM and exposed PUSH
+were unmoved, and L1 is unchanged (fused 2.177, exposed push 0.433).
+
+The PUSH's 1.729 ms is **79% hidden**. What is left is pipeline drain: a row cannot ship until all
+`n_blocks` of its `block_m` are done (the same dependency §4a is about), so cutting bytes only
+shortens the last slice — 34% fewer bytes bought 0.064 of the 0.358.
+
 ---
 
 ## 5. ~~Confirmed defect: whole-L2 `buffer_inv` in every L1 GEMM workgroup~~ — **FIXED** (round 6)
@@ -255,7 +304,40 @@ sweep was **flat within ~3% noise**. See `rounds/round-{2,3,4}/summary.md`.
 
 Further gains here now require cheapening the quant math (fast reciprocal for the sigmoid, bit
 trick for `2^-exp`), which changes numerics and forfeits the bit-exact gate — an accuracy
-decision, not a perf one. Ceiling is ~0.06 ms, so it is low priority.
+decision, not a perf one.
+
+**That ceiling was measured, and the reciprocal half of it is now SHIPPED (round 7).** The single
+biggest ALU item was the *per-element* IEEE divide in the SiLU (`divf(g, denom)`), which AMDGPU
+expands to ~10 VALU (`v_div_scale` ×2, `v_rcp`, 3 `v_fma`, `v_div_fmas`, `v_div_fixup`) rather
+than the 2 of `v_rcp` + `v_mul`. Sweeping the fastmath flags on that one divide:
+
+| variant | SwiGLU ms | Δ | end-to-end SNR |
+|---|---:|---:|---:|
+| IEEE `divf` (old default) | 0.220 | — | 20.78 dB |
+| `arcp` | 0.218 | −0.002 | — |
+| **`afn,arcp` — SHIPPED** | **0.182** | **−0.038** | **20.57–20.66 dB** |
+| `fast` | 0.181 | −0.039 | 20.72 dB |
+| divide replaced by a multiply (bound) | 0.173 | −0.047 | wrong by construction |
+
+The divide was worth **0.047 ms of the 0.220 (21%)**; the shipped reciprocal captures 81% of it.
+Two things the sweep settles, both worth knowing before touching fastmath elsewhere:
+
+* **`arcp` alone is a no-op** — the backend keeps the full IEEE expansion unless `afn` is set too.
+  Testing only `arcp` would have wrongly cleared the divide as "not the bottleneck"; it took the
+  deliberately-wrong multiply variant to establish that it was.
+* **`fast` buys nothing over `afn,arcp`** and additionally implies `nnan`/`ninf`, which lets the
+  compiler assume the `ACTIVATION_CLAMP` min/max never sees a NaN — a robustness regression a
+  clean benchmark cannot show, for zero extra speed.
+
+Cost: ~1 ULP on the divide, so SwiGLU is **no longer bit-exact** against the round-1 snapshot;
+`test_swiglu.py --ref 1` will now fail its bit-exact leg by design. End-to-end SNR moves less than
+this gate's own session spread (a plain rebuild measured 19.97 and 20.78 on different days).
+
+**−0.038 ms on the stage (−17%); FULL ~4.50 → ~4.43 ms.** What is left here is the `1/scale` in
+`_mxfp8_words_from_f32_subvecs`: `scale` is an exact power of two, so replacing that divide with
+an exponent negation (`254 - biased`, shifted) is *bit-exact*, and would also remove the
+`0 * Inf = NaN` an all-zero 32-block currently produces. Amortised over 32 elements, so small —
+unmeasured.
 
 Note the *deeper* fusion — folding SwiGLU into the L1 GEMM epilogue the way L2 does with
 `StoreCQuantMxfp8CShuffle` — is **not** as attractive as it first looks: the backward saves the raw
@@ -269,24 +351,30 @@ each tile owns matched gate/up column pairs.
 
 | P | Target | Expected | Evidence | Risk |
 |---|--------|----------|----------|------|
-| **P2** | L2 GEMM role: close the +28% CU-normalised gap vs standalone (CShuffle mxfp8 quant epilogue, BN/BM not autotuned) | up to −0.28 ms on the GEMM leg | §3a | med — but L2 binds on PUSH, so this only pays once P3 lands |
-| **P3** | L2 PUSH: 247 GB/s at 25% of XGMI peak; per-row scatter limits outstanding requests | −0.2 ms would move the L2 bind point | §3b | high |
+| **P2** | L2 GEMM role: close the +28% CU-normalised gap vs standalone (CShuffle mxfp8 quant epilogue, BN/BM not autotuned) | up to −0.28 ms on the GEMM leg | §3a, §4d | med — **now unblocked and top-ranked**: the GEMM is 73% of L2, and the old "wait for P3" caveat died with P3 |
 | **P5** | L1 tail 0.48 ms (20% of L1): pipeline fill/drain of comm→preshuffle→GEMM | −0.1 to −0.2 ms | §2 | med |
 | **P6** | L1 `GROUP_M` 4 → 1/2 | −0.04 ms | §4a | **low** — one-line default |
 | **P7** | L2 COMBINE role: same per-wave `buffer_inv` redundancy as §5, untouched | small (~256 WGs/launch) but free | §5, round 6 | **low** — same one-line fix |
 | ~~P1~~ | L1 GEMM `buffer_inv`: issue from one lane, not all 4 waves | **DONE, −0.18 ms FULL**, bit-exact | §5, round 6 | shipped |
 | ~~P4~~ | SwiGLU: drop the global `act_bf16` round-trip | **DONE, −0.031 ms**, bit-exact | §6, round 2 | shipped |
+| ~~P8~~ | SwiGLU: serve the SiLU divide with `afn,arcp` (rcp+mul, not the IEEE expansion) | **DONE, −0.038 ms** (stage −17%) | §6, round 7 | shipped — **not** bit-exact (~1 ULP) |
 | ~~X~~ | L1: fewer/fatter GEMM workgroups to cut invalidates | **refuted, 0.85–0.91x** | §5, round 5 | do not retry |
 | ~~X~~ | L1: coherent `sc1` A loads instead of the invalidate | **blocked** — no cache modifier on `BufferCopyLDS128b` | §5, round 5 | needs a flydsl change |
 | ~~X~~ | SwiGLU: recover coalescing with a quad-butterfly amax | **refuted, 4.5% slower** | §6, round 3 | do not retry |
 | ~~X~~ | SwiGLU: `(BT, grid_x)` launch geometry | **refuted, flat within noise** | §6, round 4 | do not retry |
 | ~~X~~ | XCD / GROUP_M / GROUP_N tile swizzle on L1 or L2 | **refuted, up to +67%** | §4a | do not retry |
 | ~~X~~ | Re-tune dispatch/preshuffle/combine CU splits | **refuted, already optimal** | §4b | do not retry |
+| ~~P3~~ | L2 PUSH bytes (incl. the (token, expert-rank) dedup that would have cut 34%) | **refuted, −0.04 ms** | §4c | do not retry — L2 is not PUSH-bound (§4d) |
+| ~~X~~ | L1 (token, dst-rank) dedup via `dedup_src_row` | **refuted, −0.02 ms (inside noise)** | §4c | do not retry |
 | ~~X~~ | Fold x-quant into the grid | not worth it — x-quant is 0.038 ms | §1 | — |
 
 **Banked so far: 4.695 → 4.48–4.51 ms (−4.3%)** from P4 + P1, both bit-exact. The L1 stage is now
 within ~0.08 ms of its no-acquire bound, so the forward's remaining headroom has shifted almost
-entirely to L2 (P2/P3, 1.91 ms) and the L1 pipeline tail (P5).
+entirely to L2 (1.90 ms) and the L1 pipeline tail (P5).
+
+With P3 and both dedup variants refuted (§4c), **every remaining byte-reduction lever on the comm
+path is closed.** What is left in L2 is the GEMM itself (P2, 73% of the stage) and two drains —
+0.358 ms of PUSH and 0.155 ms of reduce (§4d) — neither of which responds to moving fewer bytes.
 
 ---
 
@@ -296,7 +384,8 @@ Campaign harness lives in `agent/workspace/mxfp8_fwd_opt/`:
 `run.sh` (container runner), `bench_fwd_fp8.py` (fp8-only legs, ~20 s/point vs ~156 s for the full
 compare), `bench_ref_gemm.py` (standalone GEMM roofline), `test_swiglu.py` (SwiGLU bit-exact +
 perf gate), `sweep_swiglu_geom.py`, `sweep_l1_inv.py` (L1 acquire gate), `sweep_locality.sh`,
-`sweep_cu.sh`, `sweep2.sh`, `probe_inv.sh`.
+`sweep_cu.sh`, `sweep2.sh`, `probe_inv.sh`, `probe_fwd_overlap.py` (per-stage overlap
+decomposition, §4d), `run_probe_guarded.sh` (timeout + worker reaping).
 Per-round kernel snapshots and write-ups are under `rounds/round-N/`.
 
 ```bash
@@ -335,7 +424,27 @@ $R/run.sh /tmp/l2p.log "PT_COMBINE_PUSH_ONLY=1 python $R/bench_fwd_fp8.py --num-
 
 # The buffer_inv probe (§5)
 $R/run.sh /tmp/inv.log "bash $R/probe_inv.sh"
+
+# Stage decomposition + the dedup ceiling probes (§4c, §4d). SKIP_MOD=N pushes (N-1)/N of the
+# rows, so 3 ~= the 66.1% a dedup would leave. Output is WRONG by construction; read only timing.
+G="bash $R/run_probe_guarded.sh $R/probe_fwd_overlap.py"
+$R/run.sh /tmp/base.log "$G --mode full"
+$R/run.sh /tmp/l1d.log  "MEGA_MOE_PROBE_PUSH_SKIP_MOD=3 $G --mode full"
+$R/run.sh /tmp/l2d.log  "MEGA_MOE_PROBE_COMBINE_SKIP_MOD=3 $G --mode full"
+$R/run.sh /tmp/l2nr.log "$G --mode noreduce"   # full - noreduce = reduce tail
 ```
+
+Two traps this campaign lost runs to, both worth knowing before adding a knob:
+
+* **The jit disk cache keys on the `_compile` arguments, not on the environment.** A knob read
+  from `os.environ` *inside* a traced closure silently reuses the previous binary — the first
+  L1 probe skipped 100% of the pushes and still reported the baseline 1.775 ms. Thread new knobs
+  through `_compile` as arguments (as `push_only` / `gemm_only` already are).
+* **`torch.multiprocessing.spawn` children carry a generic `spawn_main` cmdline**, so killing the
+  parent (or `pgrep`-ing the script name) leaves 8 orphans holding one GPU each and every later
+  run blocks. `run_probe_guarded.sh` wraps the probe with a hard timeout and reaps by
+  `spawn_main`; the node is shared, so check `ps -eo pid,ppid,args | grep spawn_main` and match
+  the parent against your own container before killing anything.
 
 **Measurement caveat.** `grouped_gemm_combine_fp8_kernel._compile()` reads
 `PT_COMBINE_GEMM_ONLY` / `PT_COMBINE_PUSH_ONLY` *inside* an `lru_cache`d body without them being

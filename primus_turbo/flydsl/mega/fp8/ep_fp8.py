@@ -116,6 +116,7 @@ def dispatch_fp8_copy_tile(
     push_scale=True,
     fence=True,
     tok_unroll=1,
+    probe_skip_mod=0,
 ):
     """CLEAN fp8 comm PUSH closure (no in-push quant): copy a comm task's PRE-QUANTIZED
     fp8 tokens (16B/lane b128, coalesced) into the peer ``pool_fp8``, plus their RAW E8M0
@@ -237,6 +238,14 @@ def dispatch_fp8_copy_tile(
 
     def dispatch_tile(task_index, sub, n_sub):
         dst_rank, dest_row_start, source_offset, token_count, peer_pool, peer_pscale = load_task(task_index)
+        # TIMING PROBE ONLY (leaves the pool partly unwritten -> WRONG results): push only
+        # (N-1)/N of each comm task's rows, sizing the XGMI traffic a (token, dst_rank) dedup
+        # would remove before committing to an implementation. Truncating the task's row range
+        # (rather than predicating per row) keeps the push loop free of divergent control flow:
+        # the copy is followed by a block-wide gpu.barrier(), which hangs if warps disagree.
+        # Threaded in as a compile argument, since the jit disk cache keys on those, not the env.
+        if probe_skip_mod > 1:
+            token_count = token_count * fx.Int32(probe_skip_mod - 1) // fx.Int32(probe_skip_mod)
         if n_sub == 1:
             tok_lo = fx.Int32(0)
             tok_hi = token_count

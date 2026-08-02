@@ -177,6 +177,7 @@ def _compile(
     push_only=0,
     gemm_only=0,
     gemm_inv=2,  # see the PT_MXFP8_GEMM_INV comment in dispatch_grouped_gemm_mxfp8
+    probe_push_skip_mod=0,  # TIMING PROBE, wrong results: drop 1/N pushed rows (dedup upper bound)
 ):
     K = hidden_size
     N = out_features
@@ -391,6 +392,7 @@ def _compile(
             ),
             bank=bank_offset,
             world_size=num_ranks,
+            probe_skip_mod=probe_push_skip_mod,
         )
 
         pipeline_idx = block_index - pipeline_base
@@ -664,6 +666,7 @@ def dispatch_grouped_gemm_mxfp8(
     # was the earlier theory, and attacking it by making the acquire rarer (fatter workgroups,
     # fewer tiles each) lost more to pipeline serialization than it saved.
     gemm_inv = int(os.environ.get("PT_MXFP8_GEMM_INV", "2"))
+    probe_push_skip_mod = int(os.environ.get("MEGA_MOE_PROBE_PUSH_SKIP_MOD", "0"))
 
     dev = xq.device
     if fuse_setup and needs_x_quant:
@@ -768,6 +771,7 @@ def dispatch_grouped_gemm_mxfp8(
         push_only=push_only,
         gemm_only=gemm_only,
         gemm_inv=gemm_inv,
+        probe_push_skip_mod=probe_push_skip_mod,
     )
     args = (
         x_bf16,
