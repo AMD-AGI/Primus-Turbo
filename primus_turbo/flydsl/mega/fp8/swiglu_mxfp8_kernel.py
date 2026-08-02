@@ -126,9 +126,14 @@ def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = 4096, scale_pack:
                                 fx.arith.maximumf(fx.arith.extf(f32v, up), lo), hi
                             )
                             denom = fx.arith.addf(one, fmath.exp(fx.arith.mulf(g, neg1)))
-                            act_v = fx.arith.trunc_f(
-                                bf16v, fx.arith.mulf(fx.arith.divf(g, denom), u)
-                            )
+                            # afn+arcp lets the backend serve g/denom with v_rcp_f32 + v_mul_f32
+                            # (~2 VALU) instead of the IEEE v_div_f32 expansion (~10): this divide
+                            # is per element and was 21% of the kernel (0.220 -> 0.182 ms). ~1 ULP,
+                            # which the bf16 round below mostly absorbs (SNR 20.78 -> 20.57 dB).
+                            # NOT `fast`: that also implies nnan/ninf and would let the compiler
+                            # drop the ACTIVATION_CLAMP min/max, for no extra speed.
+                            silu = fx.arith.divf(g, denom, fastmath="afn,arcp")
+                            act_v = fx.arith.trunc_f(bf16v, fx.arith.mulf(silu, u))
                             fvs.append(fx.arith.extf(f32v, act_v))
                         words, biased = _mxfp8_words_from_f32_subvecs(fvs)
                         smem[widx] = fx.arith.ArithValue(biased) & fx.Int32(0xFF)
