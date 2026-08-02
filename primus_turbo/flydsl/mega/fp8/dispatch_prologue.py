@@ -86,7 +86,9 @@ def _ext_i64(v):
 #   (handle, tile_to_expert, tile_expected, origin_rank, origin_slot,
 #    num_pool_blocks, max_num_token, num_tokens_per_expert, num_tokens_per_expert_prefix)
 # handle = (dst_rank, dst_offset, count, src_offset, src_tokens, topk_slot, weight)
-# num_tokens_per_expert / _prefix = block_m-padded group_len / group_offs (local experts)
+# num_tokens_per_expert = REAL group_len (unpadded); _prefix = group_offs into the block_m-padded
+# pool (local experts). Consumers mask rows with `local_row < group_len`, so the len must be real
+# while the offset must be padded.
 
 
 def _make_dispatch_prologue(
@@ -334,9 +336,11 @@ def _make_dispatch_prologue(
                 padded_count = ((expert_total_count + fx.Int32(block_m - 1)) // fx.Int32(block_m)) * fx.Int32(
                     block_m
                 )
-                # block_m-padded per-local-expert group_len + its exclusive prefix
-                # (== expert_pool_base); mirrors host group_lens / group_offs.
-                buffer_store(_ext_i64(padded_count), num_tokens_per_expert_resource, local_expert_index)
+                # REAL per-local-expert group_len (NOT block_m-padded) + its exclusive prefix into the
+                # padded pool (== expert_pool_base); mirrors host group_lens / group_offs. Publishing
+                # the padded count here makes the variable-K wgrads reduce over the tail padding rows,
+                # which the prologue's scatter never writes, so stale pool memory lands in dW1/dW2.
+                buffer_store(_ext_i64(expert_total_count), num_tokens_per_expert_resource, local_expert_index)
                 buffer_store(
                     _ext_i64(expert_pool_base), num_tokens_per_expert_prefix_resource, local_expert_index
                 )
@@ -615,9 +619,11 @@ def dispatch_prologue(
     ``None`` for positional compatibility.
 
     The last two return values, ``num_tokens_per_expert`` (len ``experts_per_rank``) and
-    ``num_tokens_per_expert_prefix`` (len ``experts_per_rank + 1``), are the block_m-padded
-    per-local-expert group lengths and their exclusive prefix sum -- the kernel-side
-    equivalent of the host ``group_lens`` / ``group_offs`` used by the variable-K wgrads."""
+    ``num_tokens_per_expert_prefix`` (len ``experts_per_rank + 1``), are the kernel-side
+    equivalent of the host ``group_lens`` / ``group_offs`` used by the variable-K wgrads:
+    the lengths are the REAL per-local-expert token counts, while the prefix indexes the
+    block_m-padded pool. Publishing padded lengths here would make those wgrads reduce over
+    each expert's tail padding rows, which the scatter never writes."""
     # Accept int32 or int64; the kernel reads each entry at its native dtype
     # (buffer_load infers element size from the tensor's element_type).
     if topk_idx.dtype not in (torch.int32, torch.int64):

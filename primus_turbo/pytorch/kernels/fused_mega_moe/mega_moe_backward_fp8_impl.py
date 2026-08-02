@@ -60,8 +60,10 @@ _L2_DGRAD_NUM_DISPATCH_CU = 24
 _L2_DGRAD_NUM_PRESHUFFLE_CU = 8
 
 # dispatch_prologue handle layout (see dispatch_prologue return): [7]=tile_to_expert,
-# [9]=num_tokens_per_expert (block_m-padded group_lens), [10]=its prefix (group_offs). The
-# variable-K wgrads (dW1/dW2) take group_lens/offs; the combine takes tile_to_expert.
+# [9]=num_tokens_per_expert (REAL unpadded group_lens), [10]=its prefix into the block_m-padded
+# pool (group_offs). The variable-K wgrads (dW1/dW2) take group_lens/offs and mask each group at
+# group_lens, so a padded length would fold the tail padding rows into dW; the combine takes
+# tile_to_expert.
 _HANDLE_GROUP_LENS = 9
 _HANDLE_GROUP_OFFS = 10
 _HANDLE_NUM_TILE_BLOCKS = 11  # device real-tile count (SwiGLU epilogue row bound)
