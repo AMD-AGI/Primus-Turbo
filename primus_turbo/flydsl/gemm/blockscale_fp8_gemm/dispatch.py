@@ -82,6 +82,16 @@ def flydsl_blockwise_4wave_wgrad_supported(M: int, N: int, K: int) -> bool:
 def select_blockscale_fp8_forward_kernel(M: int, N: int, K: int):
     """Select a measured gfx950 forward kernel and compile-time schedule."""
 
+    if N == 202048 and K == 5120:
+        return {
+            "family": "8wave_3stage",
+            "fold_group_size": 6,
+            "interleave_width": 1,
+            "wait_delay_thunks": 0,
+            "scale_a_k_major": True,
+            "group_m": 4,
+        }
+
     if N % 128 != 0:
         return {
             "family": "4wave",
@@ -97,6 +107,24 @@ def select_blockscale_fp8_forward_kernel(M: int, N: int, K: int):
             "block_m": 128,
             "fold_group_size": 6,
             "k_loop_unroll": 6,
+            "scale_a_k_major": True,
+        }
+
+    prefer_bm192 = (
+        (M >= 8192 and N <= 57344 and K in (4096, 5120, 8192, 18944, 28672, 53248))
+        or (K == 3584 and (N == 37888 or (M == 16384 and N == 152064) or M >= 163840))
+        or (
+            M == 4096
+            and ((K == 5120 and N in (5120, 7168, 32768)) or (K == 4096 and N in (22016, 28672, 32000)))
+        )
+        or (K == 14336 and M >= 16384)
+    )
+    if prefer_bm192:
+        return {
+            "family": "4wave",
+            "block_m": 192,
+            "fold_group_size": 4,
+            "k_loop_unroll": 2,
             "scale_a_k_major": True,
         }
 

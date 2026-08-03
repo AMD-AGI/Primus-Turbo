@@ -352,18 +352,19 @@ def test_gemm_fp8_blockwise_flydsl_routes_new_kernels():
         assert flydsl_blockwise_4wave_forward_supported(4096, 202048, 5120)
         assert flydsl_blockwise_4wave_forward_supported(32768, 128256, 4096)
         assert select_blockscale_fp8_forward_kernel(4096, 202048, 5120) == {
-            "family": "4wave",
-            "block_m": 128,
-            "fold_group_size": 4,
-            "k_loop_unroll": 6,
+            "family": "8wave_3stage",
+            "fold_group_size": 6,
+            "interleave_width": 1,
+            "wait_delay_thunks": 0,
             "scale_a_k_major": True,
+            "group_m": 4,
         }
         assert select_blockscale_fp8_forward_kernel(16384, 16384, 53248) == {
-            "family": "8wave_3stage",
-            "fold_group_size": 5,
-            "interleave_width": 2,
-            "wait_delay_thunks": 8,
-            "scale_a_k_major": False,
+            "family": "4wave",
+            "block_m": 192,
+            "fold_group_size": 4,
+            "k_loop_unroll": 2,
+            "scale_a_k_major": True,
         }
         assert select_blockscale_fp8_forward_kernel(8192, 8192, 29568) == {
             "family": "4wave",
@@ -373,21 +374,20 @@ def test_gemm_fp8_blockwise_flydsl_routes_new_kernels():
             "scale_a_k_major": True,
         }
         assert select_blockscale_fp8_forward_kernel(16384, 37888, 3584) == {
-            "family": "8wave_3stage",
+            "family": "4wave",
+            "block_m": 192,
             "fold_group_size": 4,
-            "interleave_width": 1,
-            "wait_delay_thunks": 0,
+            "k_loop_unroll": 2,
             "scale_a_k_major": True,
-            "group_m": 1,
         }
         assert select_blockscale_fp8_forward_kernel(65536, 28672, 4096) == {
-            "family": "8wave_3stage",
-            "fold_group_size": 8,
-            "interleave_width": 1,
-            "wait_delay_thunks": 0,
+            "family": "4wave",
+            "block_m": 192,
+            "fold_group_size": 4,
+            "k_loop_unroll": 2,
             "scale_a_k_major": True,
-            "group_m": 2,
         }
+        assert select_blockscale_fp8_forward_kernel(32768, 128256, 4096)["family"] == "8wave_3stage"
         assert select_blockscale_fp8_forward_kernel(49152, 12288, 4096)["family"] == "4wave"
         assert select_blockscale_fp8_forward_kernel(24576, 106496, 16384)["family"] == "8wave_3stage"
         assert select_blockscale_fp8_dgrad_kernel(16384, 106496, 16384)["family"] == "8wave_3stage"
