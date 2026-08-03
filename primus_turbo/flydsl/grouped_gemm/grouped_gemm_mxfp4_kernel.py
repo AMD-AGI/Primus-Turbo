@@ -1010,7 +1010,11 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == OUT_M and rhs.shape[0] == OUT_N
     M_total = lhs.shape[1] * 2  # colwise contraction width (512-padded per group by the quant)
-    assert rhs.shape[1] * 2 == M_total
+    assert rhs.shape[1] * 2 == M_total, (
+        f"MXFP4 wgrad contraction mismatch: lhs={tuple(lhs.shape)} "
+        f"rhs={tuple(rhs.shape)} lhs_scale={tuple(lhs_scale.shape)} "
+        f"rhs_scale={tuple(rhs_scale.shape)} group_offs={tuple(group_offs.shape)}"
+    )
     dev = lhs.device
     out_fp16 = out_dtype == torch.float16
 
