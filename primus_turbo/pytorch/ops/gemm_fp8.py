@@ -483,13 +483,28 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
             if flydsl_blockwise and trans_b and a_dtype == float8_e4m3:
-                a_row, a_row_scale, a_col, a_col_scale = quant_fp8_blockwise_dual_impl(
-                    a,
-                    a_dtype,
-                    config.block_size,
-                    col_transposed=True,
-                    row_scale_transposed=scale_a_k_major,
-                )
+                if (
+                    a.dtype == torch.bfloat16
+                    and a.shape[0] % config.block_size == 0
+                    and a.shape[1] % config.block_size == 0
+                    and a.numel() * a.element_size() <= 0xFFFFFFFF
+                ):
+                    from primus_turbo.flydsl.quantization.blockwise_fp8_quant_poc import (
+                        quantize_blockwise_fp8_dual,
+                    )
+
+                    a_row, a_row_scale, a_col, a_col_scale = quantize_blockwise_fp8_dual(
+                        a,
+                        row_scale_transposed=scale_a_k_major,
+                    )
+                else:
+                    a_row, a_row_scale, a_col, a_col_scale = quant_fp8_blockwise_dual_impl(
+                        a,
+                        a_dtype,
+                        config.block_size,
+                        col_transposed=True,
+                        row_scale_transposed=scale_a_k_major,
+                    )
                 a_col = a_col.transpose(0, 1)
             else:
                 (
@@ -514,13 +529,28 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
             b_row, b_row_scale = b.qdata, b.scale_inv
         else:
-            b_row, b_row_scale = quantize_fp8(
-                b,
-                b_dtype,
-                config.granularity,
-                block_size=config.block_size,
-                scaling_recipe=b_scaling_recipe,
-            )
+            if (
+                flydsl_blockwise
+                and b_dtype == float8_e4m3
+                and b.dtype == torch.bfloat16
+                and b.dim() == 2
+                and b.is_contiguous()
+                and b.shape[1] % 16 == 0
+                and b.numel() * b.element_size() <= 0xFFFFFFFF
+            ):
+                from primus_turbo.flydsl.quantization.blockwise_fp8_quant_poc import (
+                    quantize_blockwise_fp8_weight,
+                )
+
+                b_row, b_row_scale = quantize_blockwise_fp8_weight(b)
+            else:
+                b_row, b_row_scale = quantize_fp8(
+                    b,
+                    b_dtype,
+                    config.granularity,
+                    block_size=config.block_size,
+                    scaling_recipe=b_scaling_recipe,
+                )
 
         b_col, b_col_scale = b_row, b_row_scale
 
@@ -562,13 +592,30 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         # - col-wise: for wgrad (grad_w)
         wgrad_col_transposed = flydsl_blockwise and ctx.trans_b
         if wgrad_col_transposed:
-            g_row, g_row_scale, g_col, g_col_scale = quant_fp8_blockwise_dual_impl(
-                grad_out,
-                grad_out_dtype,
-                ctx.config.block_size,
-                col_transposed=True,
-                row_pad_to_block=pad_dgrad_contract,
-            )
+            if (
+                grad_out_dtype == float8_e4m3
+                and grad_out.dtype == torch.bfloat16
+                and not pad_dgrad_contract
+                and grad_out.shape[0] % ctx.config.block_size == 0
+                and grad_out.shape[1] % ctx.config.block_size == 0
+                and grad_out.numel() * grad_out.element_size() <= 0xFFFFFFFF
+            ):
+                from primus_turbo.flydsl.quantization.blockwise_fp8_quant_poc import (
+                    quantize_blockwise_fp8_dual,
+                )
+
+                g_row, g_row_scale, g_col, g_col_scale = quantize_blockwise_fp8_dual(
+                    grad_out,
+                    row_scale_transposed=False,
+                )
+            else:
+                g_row, g_row_scale, g_col, g_col_scale = quant_fp8_blockwise_dual_impl(
+                    grad_out,
+                    grad_out_dtype,
+                    ctx.config.block_size,
+                    col_transposed=True,
+                    row_pad_to_block=pad_dgrad_contract,
+                )
             # Present the transposed producer storage as the logical [M, N]
             # operand expected by dispatch; the FlyDSL launcher transposes it
             # back to its contiguous [N, M] storage without a copy.
