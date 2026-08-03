@@ -575,4 +575,31 @@ def compile_blockscale_fp8_gemm_8w_3stage(
     return launch_gemm
 
 
-__all__ = ["compile_blockscale_fp8_gemm_8w_3stage"]
+def compile_blockscale_fp8_gemm_nn_physical_8w(*, M: int, N: int, K: int, **kwargs):
+    """Compile physical NN ``A[M,K] @ B[K,N]`` with a tiled B transpose."""
+
+    from primus_turbo.flydsl.gemm.blockscale_fp8_gemm.utils import compile_fp8_transpose_32x32
+
+    transpose_b = compile_fp8_transpose_32x32(K, N)
+    gemm = compile_blockscale_fp8_gemm_8w_3stage(K=K, M=M, N=N, **kwargs)
+
+    @flyc.jit
+    def launch(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        B_workspace: fx.Tensor,
+        stream: fx.Stream,
+    ):
+        transpose_b(B, B_workspace, stream)
+        gemm(A, B_workspace, C, A_scale, B_scale, fx.Int32(M), fx.Int32(N), stream)
+
+    return launch
+
+
+__all__ = [
+    "compile_blockscale_fp8_gemm_8w_3stage",
+    "compile_blockscale_fp8_gemm_nn_physical_8w",
+]
