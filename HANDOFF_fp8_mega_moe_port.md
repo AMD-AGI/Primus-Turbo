@@ -21,7 +21,7 @@
 ## 1. 已定的关键设计决策(不要推翻,除非有新证据)
 
 1. **fp8 跳过 `pytorch/kernels/fused_mega_moe` 的 custom_op / AutoKernelDispatcher 层**。直接在
-   `pytorch/ops/moe/mega_moe_fused_fp8.py` 的 autograd Function 里 inline 编排(和源 repo 一致)。
+   `pytorch/ops/moe/fused_mega_moe_fp8.py` 的 autograd Function 里 inline 编排(和源 repo 一致)。
    原因:fp8 前向/反向带着 custom_op schema 装不下的状态(可选权重预量化 tuple、复用 forward 的
    live symm buffer、host `synchronize()+barrier()` rendezvous)。
 2. **权重量化状态由有状态模块 `MegaMoEFP8` 持有**(`pytorch/modules/moe/mega_moe_fp8.py`),按
@@ -42,8 +42,8 @@
 
 ### 顶层骨架(三个落点,bf16 全未动)
 - `primus_turbo/flydsl/mega/fp8/__init__.py` — 导出 L1 入口。
-- `primus_turbo/pytorch/ops/moe/mega_moe_fused_fp8.py` — `MegaMoEFusedFP8Function` +
-  `mega_moe_fused_fp8()` + `prepare_w1t_dgrad_fp8` / `prepare_w2t_dgrad_fp8`。
+- `primus_turbo/pytorch/ops/moe/fused_mega_moe_fp8.py` — `FusedMegaMoEFP8Function` +
+  `fused_mega_moe_fp8()` + `prepare_w1t_dgrad_fp8` / `prepare_w2t_dgrad_fp8`。
   **forward/backward 目前仍是 `NotImplementedError`(占位),等 L2/反向移植完再接线。**
 - `primus_turbo/pytorch/modules/moe/mega_moe_fp8.py` — 独立 `MegaMoEFP8`,已实现通用
   `_cached_weight`(版本键控);`expert_compute` 里权重预量化 + op 调用是注释模板,待放开。
@@ -59,7 +59,7 @@
 - Benchmark:`benchmark/ops/bench_dispatch_grouped_gemm_mxfp8_l1.py`(自包含,只用 vendored fp8 栈 +
   纯 torch dequant-GEMM 参考;**没用源 `mega_utils`**,因为它会拖进整套源 bf16 栈)。
 - 验证结果(8×MI355X,EP8,DSv3 H=7168 I=2048 E=256 K=8):
-  - import 冒烟全过(`import primus_turbo.flydsl.mega.fp8` / `mega_moe_fused_fp8` / `MegaMoEFP8`)。
+  - import 冒烟全过(`import primus_turbo.flydsl.mega.fp8` / `fused_mega_moe_fp8` / `MegaMoEFP8`)。
   - **正确性 cos=1.00000 rel=0.0017 PASS**(T=2048 与 T=8192)。
   - 性能:T=8192 fused ≈ 2.22–2.52 ms @ ~1600–1840 TFLOPS(和源 repo 报的 fp8 fused ~2.56ms 一致);
     T=2048 fused ≈ 1.0 ms。token quant ≈ 0.04–0.06 ms(~L1 的 2.5%)。
@@ -92,7 +92,7 @@ token_quant 0.059ms ~2.5%),cos=1.00000 PASS。
 
 **✅ 前向已全部完成并验证**(L1 fp8 + SwiGLU + L2 fp8 combine)。L2 vendored 的文件:`gemm_bf16_kernel.py`、
 `grouped_gemm_combine_bf16_kernel.py`、`swiglu_kernel.py`、`grouped_gemm_combine_fp8_kernel.py`(都在
-`flydsl/mega/fp8/`,import 已重写)。op 前向在 `mega_moe_fused_fp8.py::MegaMoEFusedFP8Function.forward`
+`flydsl/mega/fp8/`,import 已重写)。op 前向在 `fused_mega_moe_fp8.py::FusedMegaMoEFP8Function.forward`
 (standalone,权重内部量化;L1/L2 scoreboard/flag 用 device epoch 自复位,无 host rendezvous);e2e bench
 `benchmark/ops/bench_mega_moe_fused_fp8.py`(fp8 vs bf16 SNR gate)。**下一步是反向。**
 
@@ -117,7 +117,7 @@ STEP1 = **1.87ms @ 1093 TFLOPS,SNR 30.9 dB PASS**;vs bf16 dgrad(nn) 2.40ms(bench
    vendor 进 `flydsl/mega/fp8/`,同样把 import 重写成 `mega.fp8.*`,补 `__init__` 导出。
    ⚠️ 命名漂移:源 op 用 `swiglu`/`swiglu_backward`;MegaMoE bf16 侧叫 `swiglu_flydsl_kernel` 等 ——
    vendor 源的 swiglu 到 fp8 子包即可,别混用 bf16 侧的。
-3. **接线前向** `mega_moe_fused_fp8.py::MegaMoEFusedFP8Function.forward`:参照源
+3. **接线前向** `fused_mega_moe_fp8.py::FusedMegaMoEFP8Function.forward`:参照源
    `Primus-Turbo/primus_turbo/pytorch/ops/moe/mega_moe_fused_mxfp8.py` 的 forward(L1 → swiglu → L2)。
 4. **移植反向**:STEP1(dispatch(dy)+fc2 dgrad,NN,fp8,**会赢**)优先;dW2/dW1 mxfp8 variable-K
    wgrad;STEP3(fc1 dgrad fp8 + combine/reduce bf16)。源文件

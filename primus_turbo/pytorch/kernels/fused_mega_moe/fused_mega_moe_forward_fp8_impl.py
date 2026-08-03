@@ -20,13 +20,16 @@ from primus_turbo.flydsl.mega.fp8 import (
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl import (
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     prepare_dw1_pool_operand_fp8,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w1_fp8, prepare_w2_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
+    prepare_w1_fp8,
+    prepare_w2_fp8,
+)
 
 __all__ = [
-    "mega_moe_forward_fp8_impl",
+    "fused_mega_moe_forward_fp8_impl",
 ]
 
 _W1_PREP_ATTR = "_mega_fp8_w1_prep"
@@ -72,7 +75,7 @@ def _w2_fp8_cached(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return _version_keyed_weight_prep(w2, _W2_PREP_ATTR, prepare_w2_fp8)
 
 
-def mega_moe_forward_fp8_impl(
+def fused_mega_moe_forward_fp8_impl(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,

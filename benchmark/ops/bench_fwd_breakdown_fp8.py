@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-stage fp8 mega MoE forward breakdown (EP8, DSv3 shapes).
 
-Times each leg of ``mega_moe_forward_fp8_impl`` in isolation after shared L1 setup:
+Times each leg of ``fused_mega_moe_forward_fp8_impl`` in isolation after shared L1 setup:
   L1 dispatch+fc1 | SwiGLU bf16 | mxfp8 quant | SwiGLU+quant fused | w2 prep | L2 combine
 plus FULL op (no-grad + autograd leaves) for cross-check.
 
@@ -27,8 +27,8 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_rowwise_mxfp8_flydsl,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w2_fp8
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import prepare_w2_fp8
+from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8
 
 
 def _bench(fn, *, warmup, iters, group):
@@ -88,7 +88,7 @@ def worker(local_rank, world, args):
     W1L = W1.detach().clone().requires_grad_(True)
     W2L = W2.detach().clone().requires_grad_(True)
 
-    from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_forward_fp8_impl import (
+    from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_fp8_impl import (
         _w1_fp8_cached,
         _w2_fp8_cached,
     )
@@ -134,11 +134,11 @@ def worker(local_rank, world, args):
         warmup=args.warmup, iters=args.iters, group=group,
     )
     r["FULL_no_grad"] = _bench(
-        lambda: mega_moe_fused_fp8(group, x_nograd, topk_idx, tw_nograd, W1, W2),
+        lambda: fused_mega_moe_fp8(group, x_nograd, topk_idx, tw_nograd, W1, W2),
         warmup=args.warmup, iters=args.iters, group=group,
     )
     r["FULL_autograd"] = _bench(
-        lambda: mega_moe_fused_fp8(group, xL, topk_idx, twL, W1L, W2L),
+        lambda: fused_mega_moe_fp8(group, xL, topk_idx, twL, W1L, W2L),
         warmup=args.warmup, iters=args.iters, group=group,
     )
 

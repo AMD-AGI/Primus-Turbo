@@ -10,7 +10,7 @@ Builds the symm workspace + prologue, runs the fp8 L1 (dispatch+fc1) + fused Swi
 then times the fp8 L2 path on the pre-quantized activation:
   grouped_gemm_combine_mxfp8_flydsl_kernel(x_fp8=...)  (fp8 GEMM + combine + reduce) -> y bf16.
 Reports latency + a finite/NaN check. (For the fp8-vs-bf16 accuracy/speed comparison at the
-whole-forward level, use bench_mega_moe_fused_fp8.py, which uses the bf16 mega_moe_fused as the
+whole-forward level, use bench_mega_moe_fused_fp8.py, which uses the bf16 fused_mega_moe as the
 reference -- this repo carries no bf16 combine kernel under flydsl/mega/fp8/.)
 
 Run inside the dev container (8 GPUs):
@@ -35,7 +35,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w2_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import prepare_w2_fp8
 
 
 def _routing(T, K, E, *, device, seed):

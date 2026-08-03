@@ -20,7 +20,7 @@ import torch.distributed as dist
 
 import primus_turbo.pytorch  # noqa: F401
 from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
+from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8
 
 _ROW_LABEL_W = 14
 _COL_W = 11
@@ -126,7 +126,7 @@ def _amax(group, v):
 def _profile_routing(group, args, *, x, W1, W2, grad_y, topk_idx, topk_w):
     if args.only in ("both", "fp8"):
         fp8 = _profile_op(
-            mega_moe_fused_fp8, group, x, topk_idx, topk_w, W1, W2, grad_y,
+            fused_mega_moe_fp8, group, x, topk_idx, topk_w, W1, W2, grad_y,
             warmup=args.warmup, iters=args.iters,
         )
         fp8 = tuple(_amax(group, t) for t in fp8)

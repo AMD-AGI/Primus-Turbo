@@ -7,7 +7,7 @@
 """Trainable mega MoE with MXFP8 forward + partial-fp8 backward (autograd Function).
 
 Thin ``torch.autograd.Function`` that validates at the op boundary and delegates the actual
-orchestration to ``mega_moe_forward_fp8_impl`` / ``mega_moe_backward_fp8_impl`` in
+orchestration to ``fused_mega_moe_forward_fp8_impl`` / ``fused_mega_moe_backward_fp8_impl`` in
 ``pytorch/kernels/fused_mega_moe``. Those impls are PLAIN functions, NOT the ``custom_op`` /
 ``AutoKernelDispatcher`` layer: the fp8 path carries state the custom_op schema can't hold --
 reuse of the forward's live symmetric buffer in backward and derived non-tensor handles (the
@@ -31,21 +31,22 @@ import torch
 from torch.distributed import ProcessGroup
 
 from primus_turbo.pytorch.kernels.fused_mega_moe import (
-    mega_moe_backward_fp8_impl,
-    mega_moe_forward_fp8_impl,
+    fused_mega_moe_backward_fp8_impl,
+    fused_mega_moe_forward_fp8_impl,
 )
 
 # This op file exports only its own final API (the autograd Function + its wrapper). Everything else
 # (the per-stage ``_mxfp8_*`` helpers, ``_DW_FP8_FORMAT``, and the ``prepare_w1t/w2t_dgrad_fp8``
 # weight-prep) lives in the kernels layer -- callers import those from
-# ``primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl`` directly, not via this file.
+# ``primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl`` directly, not via
+# this file.
 __all__ = [
-    "MegaMoEFusedFP8Function",
-    "mega_moe_fused_fp8",
+    "FusedMegaMoEFP8Function",
+    "fused_mega_moe_fp8",
 ]
 
 
-class MegaMoEFusedFP8Function(torch.autograd.Function):
+class FusedMegaMoEFP8Function(torch.autograd.Function):
     """Fused mega MoE, MXFP8 forward + fp8-dW1/dW2 backward. Joins the autograd graph."""
 
     @staticmethod
@@ -73,7 +74,7 @@ class MegaMoEFusedFP8Function(torch.autograd.Function):
             ctx.set_materialize_grads(False)
             save_bwd = any(ctx.needs_input_grad)
 
-            y, l1, dispatch_weights, pool_x_colwise, colwise_meta, handle = mega_moe_forward_fp8_impl(
+            y, l1, dispatch_weights, pool_x_colwise, colwise_meta, handle = fused_mega_moe_forward_fp8_impl(
                 x, topk_idx, topk_weights, w1, w2, group, block_m, block_n, save_bwd=save_bwd,
             )
 
@@ -109,7 +110,7 @@ class MegaMoEFusedFP8Function(torch.autograd.Function):
             handle = tuple(saved[: ctx.handle_len])
             l1, dispatch_weights, w1, w2, topk_idx = saved[ctx.handle_len :]
 
-            dx, grad_topk_weights, dW1, dW2 = mega_moe_backward_fp8_impl(
+            dx, grad_topk_weights, dW1, dW2 = fused_mega_moe_backward_fp8_impl(
                 grad_y,
                 l1,
                 dispatch_weights,
@@ -130,7 +131,7 @@ class MegaMoEFusedFP8Function(torch.autograd.Function):
             return (dx, None, grad_topk_weights, dW1, dW2, None, None, None)
 
 
-def mega_moe_fused_fp8(
+def fused_mega_moe_fp8(
     group: ProcessGroup,
     x: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -146,6 +147,6 @@ def mega_moe_fused_fp8(
     Pass the ``w1`` / ``w2`` weights directly -- the op maintains their mxfp8 quant internally with a
     version-keyed cache (re-quantized only on ``optim.step``), so there are no weight-prequant args.
     """
-    return MegaMoEFusedFP8Function.apply(
+    return FusedMegaMoEFP8Function.apply(
         x, topk_idx, topk_weights, w1, w2, group, block_m, block_n,
     )

@@ -35,7 +35,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8_flydsl,
     swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w2_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import prepare_w2_fp8
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float8_e5m2
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
@@ -43,7 +43,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 )
 
 __all__ = [
-    "mega_moe_backward_fp8_impl",
+    "fused_mega_moe_backward_fp8_impl",
     "prepare_dw1_pool_operand_fp8",
     "prepare_w1t_dgrad_fp8",
     "prepare_w2t_dgrad_fp8",
@@ -187,7 +187,7 @@ def prepare_dw1_pool_operand_fp8(
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], dict]:
     """Turn the forward's fc1-input pool into dW1's ``b`` operand -> ``(pool_colwise, meta)``.
 
-    Called from ``mega_moe_forward_fp8_impl`` while ``pool_x_fp8`` is still a live rowwise-fp8 view
+    Called from ``fused_mega_moe_forward_fp8_impl`` while ``pool_x_fp8`` is still a live rowwise-fp8 view
     of the symm pool. Requantizing it colwise there consumes the view in place of the clone the
     backward would otherwise need, and takes the requant off the backward critical path. ``meta``
     is returned alongside so backward reuses it for the dual-quant / dW1 / dW2."""
@@ -237,7 +237,7 @@ def _mxfp8_variable_k_wgrad_dw1(
     )
 
 
-def mega_moe_backward_fp8_impl(
+def fused_mega_moe_backward_fp8_impl(
     grad_y: torch.Tensor,
     l1: torch.Tensor,
     dispatch_weights: torch.Tensor,
@@ -259,7 +259,7 @@ def mega_moe_backward_fp8_impl(
     -> dW2 variable-K wgrad -> STEP3 (fused fc1 dgrad+combine -> dx, then serial dW1 wgrad).
     The version-keyed w1^T / w2^T dgrad quant is maintained inside the L2/L1 dgrad helpers.
 
-    ``pool_x_colwise_fp8`` / ``colwise_meta`` come straight from ``mega_moe_forward_fp8_impl``,
+    ``pool_x_colwise_fp8`` / ``colwise_meta`` come straight from ``fused_mega_moe_forward_fp8_impl``,
     which requants the fc1-input pool while it is still live in the symm buffer instead of cloning
     it for a backward requant (see ``prepare_dw1_pool_operand_fp8``).
 

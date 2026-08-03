@@ -29,13 +29,13 @@ from primus_turbo.flydsl.mega.fp8 import (
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w2_fp8
-from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_forward_fp8_impl import (
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import prepare_w2_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_fp8_impl import (
     _w1_fp8_cached,
     _w2_fp8_cached,
 )
 from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
+from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8
 
 _H_BF16_NUM_TILE_BLOCKS = 8
 
@@ -158,7 +158,7 @@ def worker(local_rank, world, args):
     )
 
     fp8["FULL"] = _bench(
-        lambda: mega_moe_fused_fp8(group, x, topk_idx, topk_w, W1, W2),
+        lambda: fused_mega_moe_fp8(group, x, topk_idx, topk_w, W1, W2),
         warmup=args.warmup, iters=args.iters, group=group,
     )
     bf16["FULL"] = _bench(

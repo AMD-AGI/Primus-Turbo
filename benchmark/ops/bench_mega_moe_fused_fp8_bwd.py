@@ -36,7 +36,7 @@ import torch.nn.functional as F
 
 import primus_turbo.pytorch  # noqa: F401
 from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
+from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8
 
 _ACT_CLAMP = 10.0  # matches ACTIVATION_CLAMP in flydsl/mega/swiglu_kernel.py
 
@@ -67,7 +67,7 @@ def _leaf(t):
 def _run_once(fp8, group, x, topk_idx, topk_w, W1, W2, grad_y):
     """One fwd+bwd; returns (y, dx, d_topk_w, dW1, dW2) with fresh leaf inputs."""
     xL, twL, W1L, W2L = _leaf(x), _leaf(topk_w), _leaf(W1), _leaf(W2)
-    op = mega_moe_fused_fp8 if fp8 else fused_mega_moe
+    op = fused_mega_moe_fp8 if fp8 else fused_mega_moe
     y = op(group, xL, topk_idx, twL, W1L, W2L)
     y.backward(grad_y)
     return y.detach(), xL.grad, twL.grad, W1L.grad, W2L.grad
@@ -182,7 +182,7 @@ def profile(group, args):
     def _fwd_bwd_fp8():
         for t in (xf, twf, W1f, W2f):
             t.grad = None
-        mega_moe_fused_fp8(group, xf, topk_idx, twf, W1f, W2f).backward(grad_y)
+        fused_mega_moe_fp8(group, xf, topk_idx, twf, W1f, W2f).backward(grad_y)
 
     def _fwd_bwd_bf16():
         for t in (xb, twb, W1b, W2b):

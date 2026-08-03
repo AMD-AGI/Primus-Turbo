@@ -40,7 +40,7 @@ from primus_turbo.flydsl.mega.fp8 import (
 )
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.flydsl.mega.fp8.quant import colwise_grouped_meta, quantize_rowwise_mxfp8_flydsl
-from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl import (
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
     _w1t_combine_fp8_cached,

@@ -6,7 +6,7 @@
 
 """End-to-end forward validation for the fp8 mega MoE op.
 
-Compares the fp8 forward ``mega_moe_fused_fp8`` (L1 fused mxfp8 dispatch+fc1 -> SwiGLU -> L2 fp8
+Compares the fp8 forward ``fused_mega_moe_fp8`` (L1 fused mxfp8 dispatch+fc1 -> SwiGLU -> L2 fp8
 combine) against the bf16 ``fused_mega_moe`` on identical inputs, with an SNR/cos gate, and reports
 rough per-op latency. Forward-only (no_grad); the fp8 backward is not ported yet.
 
@@ -25,7 +25,7 @@ import torch.distributed as dist
 
 import primus_turbo.pytorch  # noqa: F401
 from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
+from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8
 
 
 def _routing(T, K, E, *, device, seed):
@@ -81,7 +81,7 @@ def profile(group, args):
     del W1g, W2g
 
     # fp8 first (optionally in isolation) so a NaN here can't be blamed on bf16-op interference
-    y_fp8 = mega_moe_fused_fp8(group, x, topk_idx, topk_w, W1, W2)
+    y_fp8 = fused_mega_moe_fp8(group, x, topk_idx, topk_w, W1, W2)
     print(f"[rank{rank}] fp8 norm={float(y_fp8.float().norm()):.4e} "
           f"nan={bool(torch.isnan(y_fp8).any())} inf={bool(torch.isinf(y_fp8).any())}", flush=True)
     if args.only == "fp8":
@@ -94,7 +94,7 @@ def profile(group, args):
 
     t_bf16 = _bench(lambda: fused_mega_moe(group, x, topk_idx, topk_w, W1, W2),
                     warmup=args.warmup, iters=args.iters, group=group)
-    t_fp8 = _bench(lambda: mega_moe_fused_fp8(group, x, topk_idx, topk_w, W1, W2),
+    t_fp8 = _bench(lambda: fused_mega_moe_fp8(group, x, topk_idx, topk_w, W1, W2),
                    warmup=args.warmup, iters=args.iters, group=group)
     return {"snr": snr, "cos": cos, "t_bf16": t_bf16, "t_fp8": t_fp8}
 

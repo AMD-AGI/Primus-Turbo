@@ -10,7 +10,7 @@ Minimal standalone module: it owns only the bf16 expert weights + the EP group a
 ``expert_compute``. Routing / shared-expert / token bookkeeping are the caller's (training
 framework's) responsibility.
 
-Weight fp8 quantization is NOT maintained here -- :func:`mega_moe_fused_fp8` does it internally
+Weight fp8 quantization is NOT maintained here -- :func:`fused_mega_moe_fp8` does it internally
 with a version-keyed cache (each static weight is re-quantized only when its ``_version`` changes,
 i.e. after ``optim.step``, and reused across a gradient-accumulation window). So this module just
 holds the bf16 ``Parameter`` s (the differentiable inputs) and forwards to the op.
@@ -19,7 +19,7 @@ holds the bf16 ``Parameter`` s (the differentiable inputs) and forwards to the o
 import torch
 from torch.distributed import ProcessGroup
 
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
+from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8
 
 __all__ = ["MegaMoEFP8"]
 
@@ -65,7 +65,7 @@ class MegaMoEFP8(torch.nn.Module):
         Only token-dependent work goes to the op; the invariant weight quant is maintained inside
         the op (version-keyed), so nothing is prepared here.
         """
-        return mega_moe_fused_fp8(
+        return fused_mega_moe_fp8(
             self.ep_group, x, topk_idx, topk_weights, self.w1, self.w2,
             block_m=self.block_m, block_n=self.block_n,
         )

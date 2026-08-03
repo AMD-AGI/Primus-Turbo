@@ -21,7 +21,7 @@ the epoch bump -- exactly one training forward). fp8 correctness gated vs a torc
 grouped-GEMM over the kernel's own pool.
 
 Stage ``--stage fwd``: the FULL forward (L1 + SwiGLU + L2) via the actual ops -- fp8
-``mega_moe_fused_fp8`` vs shipped bf16 ``mega_moe_fused`` on identical inputs. Each op is
+``fused_mega_moe_fp8`` vs shipped bf16 ``fused_mega_moe`` on identical inputs. Each op is
 self-contained (own prologue/dispatch/combine/reset per call) so this is the true per-forward
 wall-time; persistent W1/W2 make the fp8 op's version-keyed weight-quant cache HIT (as in training).
 Accuracy = SNR(fp8 y vs bf16 y), gate >=18 dB. NOTE round_robin trips the fp8 L2 combine cross-rank
@@ -96,19 +96,21 @@ from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     quantize_rowwise_mxfp8_flydsl,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w2_fp8  # noqa: E402
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (  # noqa: E402
+    prepare_w2_fp8,
+)
 from primus_turbo.pytorch.core.backend import BackendType  # noqa: E402
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity  # noqa: E402
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (  # noqa: E402
     grouped_gemm_fp8_variable_k_impl,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl import (  # noqa: E402  (fp8 bwd stages)
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (  # noqa: E402  (fp8 bwd stages)
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
     _mxfp8_variable_k_wgrad_dw1,
     _mxfp8_variable_k_wgrad_dw2,
 )
-from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8  # noqa: E402  (fp8 op)
+from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8  # noqa: E402  (fp8 op)
 
 _MXFP8_BLOCK = 32
 _H_TILE_TO_EXPERT = 7
@@ -316,7 +318,7 @@ def profile_l2(group, args, mode):
 
 def profile_fwd(group, args, mode):
     """Full forward: L1 (dispatch+fc1) + SwiGLU + L2 (fc2+combine), via the actual ops --
-    fp8 ``mega_moe_fused_fp8`` vs the shipped bf16 ``mega_moe_fused`` on identical inputs.
+    fp8 ``fused_mega_moe_fp8`` vs the shipped bf16 ``fused_mega_moe`` on identical inputs.
 
     Each op is self-contained (own prologue + dispatch + reset + combine per call), so this is the
     true per-forward wall-time. Persistent W1/W2 -> the fp8 op's version-keyed weight-quant cache
@@ -328,7 +330,7 @@ def profile_fwd(group, args, mode):
 
     with torch.no_grad():
         def _fp8():
-            return mega_moe_fused_fp8(group, x, topk_idx, topk_w, W1, W2)
+            return fused_mega_moe_fp8(group, x, topk_idx, topk_w, W1, W2)
 
         y_fp8 = _fp8()
         fin = bool(torch.isfinite(y_fp8.float()).all())
@@ -711,7 +713,7 @@ def worker(local_rank, world, args):
                 fp8_ms = _amax(group, r["fp8_ms"])
                 if rank == 0:
                     print(f"\n{'='*80}\n[mega MoE FULL forward (L1+SwiGLU+L2)  fp8]  {hdr}\n{'='*80}")
-                    print(f"  fp8  fwd : {fp8_ms:8.3f} ms  (mega_moe_fused_fp8, full per-forward)")
+                    print(f"  fp8  fwd : {fp8_ms:8.3f} ms  (fused_mega_moe_fp8, full per-forward)")
                     print(f"  [acc] fp8 y finite={bool(fin >= 1.0)}  "
                           f"(fp8-vs-bf16 SNR -> bench_mega_moe_fused_fp8; bf16 ms -> bench_mega_moe_bf16.py)")
                 torch.cuda.synchronize(); group.barrier()

@@ -33,7 +33,9 @@ from primus_turbo.flydsl.mega.fp8 import (
     get_symm_buffer_for_mega_moe,
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl import _dispatch_l2_dgrad_mxfp8_flydsl_kernel
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
+    _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
+)
 
 _H_GROUP_OFFS = 10
 
