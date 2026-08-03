@@ -85,9 +85,9 @@ def select_blockscale_fp8_forward_kernel(M: int, N: int, K: int):
         return {
             "family": "4wave",
             "block_m": 128,
-            "fold_group_size": 6,
-            "k_loop_unroll": 4,
-            "scale_a_k_major": False,
+            "fold_group_size": 4,
+            "k_loop_unroll": 6,
+            "scale_a_k_major": True,
         }
 
     if K == 29568:
