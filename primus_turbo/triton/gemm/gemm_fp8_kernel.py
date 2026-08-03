@@ -751,8 +751,8 @@ def gemm_fp8_rowwise_triton_kernel(
 # uncatchable by autotune) when ``num_stages=3`` is combined with that load
 # pattern. The contiguous-K NT/NN specialisations do not exercise that backend
 # path, so they keep the full ns=[1,2,3] space on gfx950. This matches the
-# historic TN-wgrad-only fragility noted in tips.md (R57: dual-strided loads
-# need different code-gen guards than the other two layouts).
+# TN-wgrad-only fragility: dual-strided loads need different code-gen guards
+# than the other two layouts.
 # ═══════════════════════════════════════════════════════════════════════════════
 def _get_blockwise_autotune_configs(
     allow_num_stages_3: bool = True,
@@ -844,7 +844,7 @@ def _get_blockwise_autotune_configs(
 #     TN     │ False          │ False          │ False      │ False    │ True
 #
 # Kept invariants (do not break without re-benchmarking):
-#   * `EVEN_K` fast path skips the K-tail mask on NT/NN (R26: removes two
+#   * `EVEN_K` fast path skips the K-tail mask on NT/NN (removes two
 #     `v_cmp_*` + one `v_cndmask_*` per K iteration). TN keeps the mask path
 #     because its `b_ptrs += BLOCK_K * stride_bk_val` arithmetic combined with
 #     `num_stages=3` triggered the historic Triton 3.7 LLVM-backend
@@ -1098,9 +1098,9 @@ def gemm_fp8_blockwise_triton_kernel(
     # how A/B scales are laid out, which autotune wrapper owns the search
     # space/cache, and the three constexpr flags (SCALE_2D_B/EVEN_K/TRANS_C_STORE).
     #
-    # TN safety notes (Round-6 P2-#7.6):
-    #   * TRANS_C_STORE=True lets the BF16 epilogue coalesce into dwordx4 under
-    #     the (N, M) output buffer; without it the wgrad path emits
+    # TN safety notes:
+    #   * `TRANS_C_STORE=True` lets the BF16 epilogue coalesce into dwordx4
+    #     under the `(N, M)` output buffer; without it the wgrad path emits
     #     64×buffer_store_short per tile.
     #   * EVEN_K=False keeps the mask-load path for the dual strided-K loads, the
     #     matched-pair safety net for the Triton 3.7 `Begin <= End` LLVM-backend

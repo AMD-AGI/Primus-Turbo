@@ -7,6 +7,7 @@
 import pytest
 import torch
 
+from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import shuffle_b
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     MXFP8_BLOCK_SIZE,
@@ -24,6 +25,11 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    quant_fp8_blockwise_dual_impl,
+    quant_fp8_blockwise_for_weight_dual_impl,
+    quant_fp8_blockwise_for_weight_impl,
+)
 from primus_turbo.pytorch.ops import gemm_fp8
 from tests.pytorch.test_utils import compute_snr
 
@@ -287,6 +293,158 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend,
         backend=backend,
         auto_tune=auto_tune,
         block_size=block_size,
+    )
+
+
+# FlyDSL blockwise covers the fwd/dgrad/wgrad autograd path (NT/NN/TN).
+# Each dimension is a contraction for one of those GEMMs and therefore uses
+# shapes compatible with the 128-element scale block.
+@pytest.mark.parametrize("m", [256, 512, 1024])
+@pytest.mark.parametrize("n", [256, 1024, 4096])
+@pytest.mark.parametrize("k", [256, 1024, 4096])
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("backend", [BackendType.FLYDSL])
+@pytest.mark.parametrize("auto_tune", [False])
+def test_gemm_fp8_blockwise_flydsl(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
+    _run_gemm_fp8_test(
+        m=m,
+        n=n,
+        k=k,
+        layout=layout,
+        format=format,
+        dtype=dtype,
+        granularity=ScalingGranularity.BLOCKWISE,
+        backend=backend,
+        auto_tune=auto_tune,
+        block_size=block_size,
+    )
+
+
+@pytest.mark.parametrize("m", [256, 512])
+@pytest.mark.parametrize("n", [512, 1024])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("layout", ["NT", "NN"])
+@pytest.mark.parametrize("format", [Format.E4M3])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", [BackendType.FLYDSL])
+@pytest.mark.deterministic
+def test_gemm_fp8_blockwise_flydsl_deterministic(m, n, k, layout, format, dtype, backend):
+    _run_gemm_fp8_deterministic_test(
+        m=m,
+        n=n,
+        k=k,
+        layout=layout,
+        format=format,
+        dtype=dtype,
+        granularity=ScalingGranularity.BLOCKWISE,
+        backend=backend,
+        block_size=128,
+    )
+
+
+@pytest.mark.parametrize("k", [256, 384])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm_fp8_blockwise_flydsl_dgrad_tail(k, dtype):
+    _run_gemm_fp8_test(
+        m=256,
+        n=320,
+        k=k,
+        layout="NT",
+        format=Format.E4M3,
+        dtype=dtype,
+        granularity=ScalingGranularity.BLOCKWISE,
+        backend=BackendType.FLYDSL,
+        auto_tune=False,
+        block_size=128,
+    )
+
+
+def test_flydsl_blockwise_quant_layouts_byte_exact():
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
+
+    x = torch.randn((384, 192), dtype=torch.bfloat16, device="cuda")
+    plain = quant_fp8_blockwise_dual_impl(x, float8_e4m3, 128)
+    transposed = quant_fp8_blockwise_dual_impl(
+        x,
+        float8_e4m3,
+        128,
+        col_transposed=True,
+    )
+    preshuffled = quant_fp8_blockwise_dual_impl(
+        x,
+        float8_e4m3,
+        128,
+        col_preshuffled=True,
+    )
+    row_padded = quant_fp8_blockwise_dual_impl(
+        x,
+        float8_e4m3,
+        128,
+        row_pad_to_block=True,
+    )
+
+    torch.testing.assert_close(transposed[0], plain[0], rtol=0, atol=0)
+    torch.testing.assert_close(transposed[1], plain[1], rtol=0, atol=0)
+    torch.testing.assert_close(transposed[2].T, plain[2], rtol=0, atol=0)
+    torch.testing.assert_close(transposed[3], plain[3], rtol=0, atol=0)
+
+    expected_col_preshuffled = shuffle_b(plain[2].T.contiguous())
+    torch.testing.assert_close(
+        preshuffled[2].reshape_as(expected_col_preshuffled),
+        expected_col_preshuffled,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(preshuffled[3], plain[3].T.contiguous(), rtol=0, atol=0)
+
+    assert row_padded[0].shape == (384, 256)
+    torch.testing.assert_close(row_padded[0][:, :192], plain[0], rtol=0, atol=0)
+    assert torch.count_nonzero(row_padded[0][:, 192:]).item() == 0
+    torch.testing.assert_close(row_padded[1], plain[1], rtol=0, atol=0)
+    torch.testing.assert_close(row_padded[2], plain[2], rtol=0, atol=0)
+    torch.testing.assert_close(row_padded[3], plain[3], rtol=0, atol=0)
+
+
+def test_flydsl_blockwise_weight_layouts_byte_exact():
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
+
+    weight = torch.randn((192, 256), dtype=torch.bfloat16, device="cuda")
+    plain_ref, scale_ref = quant_fp8_blockwise_for_weight_impl(
+        weight,
+        float8_e4m3,
+        block_size=128,
+    )
+    plain, forward_preshuffled, dgrad_preshuffled, scale = quant_fp8_blockwise_for_weight_dual_impl(
+        weight,
+        float8_e4m3,
+        block_size=128,
+        emit_dgrad_ps=True,
+        pad_dgrad_m=True,
+    )
+
+    torch.testing.assert_close(plain, plain_ref, rtol=0, atol=0)
+    torch.testing.assert_close(scale, scale_ref, rtol=0, atol=0)
+    torch.testing.assert_close(
+        forward_preshuffled,
+        shuffle_b(plain),
+        rtol=0,
+        atol=0,
+    )
+
+    plain_padded = plain.new_zeros((256, 256))
+    plain_padded[:192] = plain
+    expected_dgrad_preshuffled = shuffle_b(plain_padded.T.contiguous())
+    assert dgrad_preshuffled.shape == (256, 256)
+    torch.testing.assert_close(
+        dgrad_preshuffled.reshape_as(expected_dgrad_preshuffled),
+        expected_dgrad_preshuffled,
+        rtol=0,
+        atol=0,
     )
 
 

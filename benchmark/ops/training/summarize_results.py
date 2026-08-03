@@ -51,6 +51,7 @@ AMD_BENCHMARK_OPS = {
     "GEMM-FP8-Blockwise": {
         "Turbo(CK)": "gemm_fp8_blockwise_ck_benchmark.csv",
         "Turbo(Triton)": "gemm_fp8_blockwise_triton_benchmark.csv",
+        "Turbo(FlyDSL)": "gemm_fp8_blockwise_flydsl_benchmark.csv",
     },
     "GEMM-MXFP8": {
         "Turbo(Hipblaslt)": "gemm_mxfp8_hipblaslt_benchmark.csv",
