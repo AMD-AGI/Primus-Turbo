@@ -35,11 +35,19 @@ from primus_turbo.flydsl.attention.flash_attn_fwd import (
 
 def _uniform_seqlen(cu_seqlens: "torch.Tensor"):
     """(batch, S) from a cumulative-seqlens vector; asserts every segment is equal
-    (the FlyDSL varlen kernels are compiled for a uniform per-batch length)."""
+    (the rectangular rect16 backward fast path is compiled for a uniform per-batch
+    length). The ragged / block-causal path does NOT go through this -- it reads
+    per-segment boundaries from cu_seqlens inside the kernel."""
     seg = cu_seqlens[1:] - cu_seqlens[:-1]
     S = int(seg[0].item())
     assert bool((seg == S).all().item()), "flydsl flash-attn requires uniform seqlens"
     return cu_seqlens.numel() - 1, S
+
+
+def _is_uniform(cu_seqlens: "torch.Tensor"):
+    """True iff every segment has equal length (routes to the rect16 fast path)."""
+    seg = cu_seqlens[1:] - cu_seqlens[:-1]
+    return bool((seg == seg[0]).all().item())
 
 
 @functools.lru_cache(maxsize=64)
@@ -80,15 +88,23 @@ def flash_attn_varlen_flydsl_forward_impl(
     return_lse=False,
     sink=None,
 ):
-    """Native FlyDSL forward. q:[B*Sq,Hq,D], k/v:[B*Skv,Hkv,D] bf16 (THD packed).
+    """Native FlyDSL forward. q:[total_q,Hq,D], k/v:[total_kv,Hkv,D] bf16 (THD packed).
+    Segment boundaries come from ``cu_seqlens_q/k`` -- ragged (block-causal / document
+    masking) is supported natively: the kernel reads per-segment [tok_base,tok_end)
+    from cu_seqlens and applies a per-segment bottom-right causal (offset =
+    seglen_kv-seglen_q). Uniform seqlens are just the special case where every segment
+    is equal. Grid tiles by ``max_seqlen_q``; out-of-segment tiles early-exit.
     ``sink`` (optional [Hq] fp32) is a learned per-q-head attention sink folded into the
-    softmax denominator by the kernel. Returns O:[B*Sq,Hq,D] (and LSE:[B*Sq,Hq] fp32 when
-    ``return_lse`` -- LSE is sink-inclusive when ``sink`` is given)."""
+    softmax denominator by the kernel. Returns O:[total_q,Hq,D] (and LSE:[total_q,Hq]
+    fp32 when ``return_lse`` -- sink-inclusive when ``sink`` is given)."""
     assert causal, "flydsl flash-attn forward is bottom-right causal only"
     assert q.dtype == torch.bfloat16, "flydsl flash-attn forward is bf16 only"
-    B, Sq = _uniform_seqlen(cu_seqlens_q)
-    Bk, Skv = _uniform_seqlen(cu_seqlens_k)
+    B = cu_seqlens_q.numel() - 1
+    Bk = cu_seqlens_k.numel() - 1
     assert B == Bk, f"q/k batch mismatch ({B} vs {Bk})"
+    # Grid tiles by the max per-segment length; equal-length is max_seqlen == per-seg length.
+    Sq, Skv = int(max_seqlen_q), int(max_seqlen_k)
+    total_q = q.shape[0]
     Hq, D = q.shape[1], q.shape[2]
     Hkv = k.shape[1]
     assert D in (64, 128), f"flydsl flash-attn forward supports D in (64,128), got {D}"
@@ -110,7 +126,7 @@ def flash_attn_varlen_flydsl_forward_impl(
     lse = None
     if return_lse:
         # LSE flows through the DebugCounts slot; kernel layout is [total_q, Hq] fp32.
-        lse = torch.zeros((B * Sq, Hq), device=q.device, dtype=torch.float32)
+        lse = torch.zeros((total_q, Hq), device=q.device, dtype=torch.float32)
         kw["debug_counts"] = lse
     mod(q, k, v, out, B, Sq, **kw)
     return (out, lse) if return_lse else out
@@ -132,15 +148,13 @@ def flash_attn_varlen_flydsl_backward_impl(
     window_size=(-1, -1),
     sink=None,
 ):
-    """Deterministic 16x16x32 FlyDSL backward. ``lse`` is the natural-log softmax
-    LSE in [B, Hq, Sq] fp32 (the backward prescales it internally). Returns
-    dQ:[B*Sq,Hq,D], dK/dV:[B*Skv,Hkv,D] (and dsink:[Hq] fp32 when ``sink`` is given).
-    ``sink`` (optional [Hq] fp32) is the learned per-q-head attention sink; dQ/dK/dV
-    are sink-agnostic (the saved LSE is already sink-inclusive), only dsink is added."""
+    """Deterministic 16x16x32 FlyDSL backward. ``lse`` is packed [total_q,Hq] fp32 (as
+    emitted by the forward) for both paths; the uniform path transposes it to [B,Hq,Sq]
+    internally. Returns dQ:[total_q,Hq,D], dK/dV:[total_kv,Hkv,D] (and dsink:[Hq] fp32
+    when ``sink`` is given -- uniform path only). ``sink`` (optional [Hq] fp32) is the
+    learned per-q-head attention sink; dQ/dK/dV are sink-agnostic (the saved LSE is
+    already sink-inclusive), only dsink is added. Ragged/block-causal has no sink."""
     assert causal, "flydsl flash-attn backward is bottom-right causal only"
-    B, Sq = _uniform_seqlen(cu_seqlens_q)
-    Bk, Skv = _uniform_seqlen(cu_seqlens_k)
-    assert B == Bk, f"q/k batch mismatch ({B} vs {Bk})"
     Hq, D = q.shape[1], q.shape[2]
     Hkv = k.shape[1]
     assert D in (64, 128), f"flydsl flash-attn backward supports D in (64,128), got {D}"
@@ -153,6 +167,34 @@ def flash_attn_varlen_flydsl_backward_impl(
         assert sink.dtype == torch.float32 and sink.numel() == Hq, "sink must be fp32 [Hq]"
         sink = sink.contiguous()
 
+    if _is_uniform(cu_seqlens_q):
+        B, Sq = _uniform_seqlen(cu_seqlens_q)
+        Bk, Skv = _uniform_seqlen(cu_seqlens_k)
+        assert B == Bk, f"q/k batch mismatch ({B} vs {Bk})"
+        lse_bhsq = lse.reshape(B, Sq, Hq).permute(0, 2, 1).contiguous()  # rect16 wants head-major [B,Hq,Sq]
+        return flydsl_varlen_backward(
+            dout.contiguous(),
+            q,
+            k,
+            v,
+            out,
+            lse_bhsq,
+            B,
+            Sq,
+            Skv,
+            Hq,
+            Hkv,
+            D,
+            softmax_scale,
+            window_left=window_left,
+            sink=sink,
+        )
+
+    # Ragged / block-causal: per-segment [tok_base,tok_end) from cu_seqlens.
+    B = cu_seqlens_q.numel() - 1
+    Bk = cu_seqlens_k.numel() - 1
+    assert B == Bk, f"q/k batch mismatch ({B} vs {Bk})"
+    max_sq, max_skv = int(max_seqlen_q), int(max_seqlen_k)
     return flydsl_varlen_backward(
         dout.contiguous(),
         q,
@@ -161,14 +203,17 @@ def flash_attn_varlen_flydsl_backward_impl(
         out,
         lse,
         B,
-        Sq,
-        Skv,
+        max_sq,
+        max_skv,
         Hq,
         Hkv,
         D,
         softmax_scale,
         window_left=window_left,
-        sink=sink,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_k,
+        max_seqlen_q=max_sq,
+        max_seqlen_kv=max_skv,
     )
 
 
