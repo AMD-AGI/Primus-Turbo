@@ -328,7 +328,9 @@ def test_gemm_fp8_blockwise_flydsl_routes_new_kernels():
     from primus_turbo.flydsl.gemm.blockscale_fp8_gemm import (
         _compiled_cache,
         flydsl_blockwise_4wave_forward_supported,
+        select_blockscale_fp8_dgrad_kernel,
         select_blockscale_fp8_forward_kernel,
+        select_blockscale_fp8_wgrad_kernel,
     )
 
     GlobalBackendManager.set_gemm_backend(BackendType.FLYDSL)
@@ -388,6 +390,10 @@ def test_gemm_fp8_blockwise_flydsl_routes_new_kernels():
         }
         assert select_blockscale_fp8_forward_kernel(49152, 12288, 4096)["family"] == "4wave"
         assert select_blockscale_fp8_forward_kernel(24576, 106496, 16384)["family"] == "8wave_3stage"
+        assert select_blockscale_fp8_dgrad_kernel(16384, 106496, 16384)["family"] == "8wave_3stage"
+        assert select_blockscale_fp8_dgrad_kernel(4096, 202048, 5120)["family"] == "4wave"
+        assert select_blockscale_fp8_wgrad_kernel(16384, 8192, 29568)["fold_group_size"] == 6
+        assert select_blockscale_fp8_wgrad_kernel(163840, 37888, 3584)["fold_group_size"] == 4
     finally:
         GlobalBackendManager.reset()
 

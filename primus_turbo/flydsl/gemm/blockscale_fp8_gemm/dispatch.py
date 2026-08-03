@@ -6,7 +6,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Shape validation, measured forward selection, and cached host launchers."""
+"""Shape validation, measured kernel selection, and cached host launchers."""
 
 import flydsl.compiler as flyc
 import torch
@@ -22,6 +22,7 @@ from primus_turbo.flydsl.utils.gemm_helper import ceildiv
 
 _compiled_cache = {}
 _MAX_BUFFER_BYTES = 0xFFFFFFFF
+_DGRAD_8WAVE_MAX_CONTRACTION = 131072
 
 
 def _shape_supported(M: int, N: int, K: int) -> bool:
@@ -155,6 +156,34 @@ def select_blockscale_fp8_forward_kernel(M: int, N: int, K: int):
     }
 
 
+def select_blockscale_fp8_dgrad_kernel(M: int, N: int, K: int):
+    """Select dgrad for ``dY[M,N] @ W[N,K]`` using forward NT geometry."""
+
+    config = select_blockscale_fp8_forward_kernel(M, K, N)
+    if config["family"] == "8wave_3stage" and N <= _DGRAD_8WAVE_MAX_CONTRACTION:
+        config = dict(config)
+        config["scale_a_k_major"] = False
+        return config
+    return {
+        "family": "4wave",
+        "block_m": 192 if M % 192 == 0 else 128,
+        "fold_group_size": 4,
+        "k_loop_unroll": 2,
+        "scale_a_k_major": False,
+    }
+
+
+def select_blockscale_fp8_wgrad_kernel(M: int, N: int, K: int):
+    """Select wgrad for ``dY.T[N,M] @ A[M,K]``."""
+
+    block_m = 192 if N % 192 == 0 else 128
+    return {
+        "family": "4wave",
+        "block_m": block_m,
+        "fold_group_size": 6 if block_m == 128 and M <= 65536 else 4,
+    }
+
+
 def _out_dtype_name(out_dtype: torch.dtype) -> str:
     if out_dtype == torch.bfloat16:
         return "bf16"
@@ -176,27 +205,44 @@ def _run_cached(key, build, args):
         compiled(*args)
 
 
-def gemm_fp8_blockwise_4wave_dgrad(
+def _gemm_fp8_blockwise_dgrad(
     grad_out_fp8: torch.Tensor,
     weight_fp8: torch.Tensor,
     grad_out_scale_inv: torch.Tensor,
     weight_scale_inv: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    *,
+    use_selector: bool,
 ) -> torch.Tensor:
     """Physical NN dgrad: ``grad_out[M,N] @ weight[N,K]``."""
 
     M, N = grad_out_fp8.shape
     N_weight, K = weight_fp8.shape
     if N != N_weight or not flydsl_blockwise_4wave_dgrad_supported(M, N, K):
-        raise ValueError(
-            f"unsupported 4-wave dgrad shape: grad={grad_out_fp8.shape}, weight={weight_fp8.shape}"
-        )
+        raise ValueError(f"unsupported dgrad shape: grad={grad_out_fp8.shape}, weight={weight_fp8.shape}")
     if not grad_out_fp8.is_contiguous() or not weight_fp8.is_contiguous():
-        raise ValueError("4-wave dgrad inputs must be contiguous")
+        raise ValueError("dgrad inputs must be contiguous")
     if tuple(grad_out_scale_inv.shape) != (M, N // 128):
         raise ValueError(f"invalid dgrad A-scale shape {grad_out_scale_inv.shape}")
     if tuple(weight_scale_inv.shape) != (N // 128, K // 128):
         raise ValueError(f"invalid dgrad B-scale shape {weight_scale_inv.shape}")
+
+    config = (
+        select_blockscale_fp8_dgrad_kernel(M, N, K)
+        if use_selector
+        else {
+            "family": "4wave",
+            "block_m": 192 if M % 192 == 0 else 128,
+            "fold_group_size": 4,
+            "k_loop_unroll": 2,
+            "scale_a_k_major": False,
+        }
+    )
+    use_8wave = config["family"] == "8wave_3stage"
+    if use_8wave:
+        weight_scale_arg = weight_scale_inv.T.contiguous()
+    else:
+        weight_scale_arg = weight_scale_inv
 
     out = torch.empty((M, K), dtype=out_dtype, device=grad_out_fp8.device)
     weight_t = torch.empty((K, N), dtype=weight_fp8.dtype, device=weight_fp8.device)
@@ -206,23 +252,84 @@ def gemm_fp8_blockwise_4wave_dgrad(
         weight_fp8.view(torch.int8),
         out,
         grad_out_scale_inv,
-        weight_scale_inv,
+        weight_scale_arg,
         weight_t.view(torch.int8),
         stream,
     )
     out_dtype_name = _out_dtype_name(out_dtype)
-    key = ("dgrad", str(get_rocm_arch()), M, K, N, out_dtype_name)
-    _run_cached(
-        key,
-        lambda: compile_blockscale_fp8_gemm_nn_physical_4w(
+    key = (
+        "dgrad",
+        config["family"],
+        str(get_rocm_arch()),
+        M,
+        K,
+        N,
+        out_dtype_name,
+        tuple(sorted(config.items())),
+    )
+    if use_8wave:
+        from primus_turbo.flydsl.gemm.blockscale_fp8_gemm.eight_wave_blockwise_fp8_gemm_kernel import (
+            compile_blockscale_fp8_gemm_nn_physical_8w,
+        )
+
+        build = lambda: compile_blockscale_fp8_gemm_nn_physical_8w(
             M=M,
             N=K,
             K=N,
             out_dtype=out_dtype_name,
-        ),
-        args,
-    )
+            fold_group_size=config["fold_group_size"],
+            interleave_width=config["interleave_width"],
+            wait_delay_thunks=config["wait_delay_thunks"],
+            scale_a_k_major=False,
+            group_m=config.get("group_m", 4),
+        )
+    else:
+        build = lambda: compile_blockscale_fp8_gemm_nn_physical_4w(
+            M=M,
+            N=K,
+            K=N,
+            out_dtype=out_dtype_name,
+        )
+    _run_cached(key, build, args)
     return out
+
+
+def gemm_fp8_blockwise_4wave_dgrad(
+    grad_out_fp8: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    grad_out_scale_inv: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run physical NN dgrad with the 4-wave kernel."""
+
+    return _gemm_fp8_blockwise_dgrad(
+        grad_out_fp8,
+        weight_fp8,
+        grad_out_scale_inv,
+        weight_scale_inv,
+        out_dtype,
+        use_selector=False,
+    )
+
+
+def gemm_fp8_blockwise_dgrad(
+    grad_out_fp8: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    grad_out_scale_inv: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dispatch physical NN dgrad by its normalized GEMM shape."""
+
+    return _gemm_fp8_blockwise_dgrad(
+        grad_out_fp8,
+        weight_fp8,
+        grad_out_scale_inv,
+        weight_scale_inv,
+        out_dtype,
+        use_selector=True,
+    )
 
 
 def gemm_fp8_blockwise_forward(
@@ -343,7 +450,8 @@ def gemm_fp8_blockwise_4wave_wgrad(
         stream,
     )
     out_dtype_name = _out_dtype_name(out_dtype)
-    key = ("wgrad", str(get_rocm_arch()), N, K, M, out_dtype_name)
+    config = select_blockscale_fp8_wgrad_kernel(M, N, K)
+    key = ("wgrad", str(get_rocm_arch()), N, K, M, out_dtype_name, tuple(sorted(config.items())))
     _run_cached(
         key,
         lambda: compile_blockscale_fp8_gemm_tn_physical_4w(
@@ -351,6 +459,8 @@ def gemm_fp8_blockwise_4wave_wgrad(
             N=K,
             K=M,
             out_dtype=out_dtype_name,
+            BLOCK_M=config["block_m"],
+            fold_group_size=config["fold_group_size"],
         ),
         args,
     )
@@ -394,7 +504,8 @@ def gemm_fp8_blockwise_4wave_wgrad_normalized(
         stream,
     )
     out_dtype_name = _out_dtype_name(out_dtype)
-    key = ("wgrad_normalized", str(get_rocm_arch()), N, K, M, out_dtype_name)
+    config = select_blockscale_fp8_wgrad_kernel(M, N, K)
+    key = ("wgrad_normalized", str(get_rocm_arch()), N, K, M, out_dtype_name, tuple(sorted(config.items())))
     _run_cached(
         key,
         lambda: compile_blockscale_fp8_gemm_tn_4w(
@@ -402,16 +513,14 @@ def gemm_fp8_blockwise_4wave_wgrad_normalized(
             M=N,
             N=K,
             out_dtype=out_dtype_name,
-            BLOCK_M=192 if N % 192 == 0 else 128,
+            BLOCK_M=config["block_m"],
             scale_a_k_major=True,
             scale_b_k_major=True,
+            fold_group_size=config["fold_group_size"],
         ),
         args,
     )
     return out
-
-
-gemm_fp8_blockwise_dgrad = gemm_fp8_blockwise_4wave_dgrad
 
 
 def gemm_fp8_blockwise_wgrad(
@@ -450,5 +559,7 @@ __all__ = [
     "gemm_fp8_blockwise_dgrad",
     "gemm_fp8_blockwise_forward",
     "gemm_fp8_blockwise_wgrad",
+    "select_blockscale_fp8_dgrad_kernel",
     "select_blockscale_fp8_forward_kernel",
+    "select_blockscale_fp8_wgrad_kernel",
 ]
