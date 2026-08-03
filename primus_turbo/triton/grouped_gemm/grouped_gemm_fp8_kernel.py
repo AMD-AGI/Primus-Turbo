@@ -653,6 +653,8 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     rhs_scale: torch.Tensor,
     group_offs: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    out: torch.Tensor | None = None,
+    beta: float = 0.0,
 ) -> torch.Tensor:
     """Variable-K grouped FP8 GEMM (backward, per-tensor scaling) using Triton.
 
@@ -666,6 +668,8 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         rhs_scale: Per-tensor scale for RHS, scalar fp32.
         group_offs: [G+1] int64 prefix sum.
         out_dtype: Output dtype (default bfloat16).
+        out: Optional destination. Required when beta is 1.0.
+        beta: 0.0 overwrites out, 1.0 accumulates into it.
 
     Returns:
         [G, OUT_M, OUT_N] output.
@@ -673,10 +677,30 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0]
     OUT_M = lhs.shape[1]
-    OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
+    if beta not in (0.0, 1.0):
+        raise ValueError(f"beta must be 0.0 or 1.0, got {beta}")
+    if out is None:
+        if beta != 0.0:
+            raise ValueError("beta=1.0 requires an explicit out buffer")
+        OUT_N = rhs.shape[1]
+        out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
+    else:
+        if out.ndim != 3 or out.shape[:2] != (G, OUT_M):
+            raise ValueError(
+                f"out shape {tuple(out.shape)} must start with {(G, OUT_M)}"
+            )
+        # K-padded forward operands may make rhs wider than the real weight.
+        # Compute only the columns represented by main_grad; padded rhs columns
+        # are zeros and have no corresponding parameter gradient.
+        OUT_N = out.shape[2]
+        if OUT_N > rhs.shape[1]:
+            raise ValueError(
+                f"out width {OUT_N} cannot exceed rhs width {rhs.shape[1]}"
+            )
+        if out.device != lhs.device:
+            raise ValueError("out must be on the same device as lhs")
     num_sms = get_num_cus()
 
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
@@ -711,6 +735,7 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         IS_FP8=True,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        BETA_IS_ONE=beta == 1.0,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
