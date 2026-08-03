@@ -74,6 +74,10 @@ from primus_turbo.flydsl.mega.fp8.gemm_helper import (
 from primus_turbo.flydsl.mega.fp8.dispatch_prologue import dispatch_prologue
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
 
+_VALIDATE_TILES = os.environ.get("PT_MEGA_VALIDATE_TILES", "0") != "0"
+_H_TILE_TO_EXPERT = 7  # dispatch_prologue handle index; see its unpack table
+_H_NUM_TILE_BLOCKS = 11  # appended by this module: the per-call real-tile count
+
 _FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip per-call @flyc.jit dispatch)
 _BSP_CACHE: dict = {}  # (weight data_ptr, G, N, K) -> preshuffled weight scale b_sp (weights static)
 _WEIGHTS_FLAT_CACHE: dict = {}  # (w1q data_ptr, G, N, K) -> int8 flat WEIGHTS view (weights static)
@@ -507,7 +511,10 @@ def dispatch_grouped_gemm_mxfp8(
         _BSP_CACHE[_bk] = weight_scale_ps
     pool_scale_ps = symm.pool_scale_ps  # local broadcast a_sp (preshuffle role writes it)
 
-    num_tile_blocks = symm.meta_scalars[1:2]
+    # The real-tile count must come off the handle, not the shared symm scratch the prologue wrote
+    # it into: a call that reuses a handle (the backward) would otherwise pair its own tile table
+    # with whatever count the most recent prologue left there.
+    num_tile_blocks = handle[_H_NUM_TILE_BLOCKS]
     _out_sk = (num_max_pool_tokens, N, out_dtype, dev)
     output = _L1_OUTPUT_SCRATCH.get(_out_sk)
     if output is None:
@@ -565,6 +572,34 @@ def dispatch_grouped_gemm_mxfp8(
     return output
 
 
+
+
+def _validate_tiles(handle, experts_per_rank: int, *, fresh: bool) -> None:
+    """Debug probe: every tile the kernels will treat as real must carry a valid expert id.
+
+    ``tile_to_expert`` is a per-call tensor on the handle, while the real-tile count is
+    ``symm.meta_scalars[1:2]`` -- a view into the SHARED symm buffer that the next prologue
+    overwrites. A call that reuses a handle (the backward) therefore pairs its own tile table with
+    whichever count the most recent prologue left behind. If that count is the larger of the two,
+    the tiles in between still hold the prologue's out-of-range sentinel (``experts_per_rank``), and
+    the preshuffle role spins forever on a dispatch flag no COMM role will ever raise -- the
+    ``preshuffle gate timeout: expert=<experts_per_rank>`` hang.
+
+    Costs a D2H sync, so it is off unless ``PT_MEGA_VALIDATE_TILES=1``.
+    """
+    if not _VALIDATE_TILES:
+        return
+    tile_to_expert, num_tile_blocks = handle[_H_TILE_TO_EXPERT], handle[-1]
+    real_tiles = int(num_tile_blocks[0].item())
+    bad = (tile_to_expert[:real_tiles] >= experts_per_rank).nonzero().flatten()
+    assert bad.numel() == 0, (
+        f"MEGA fp8 dispatch ({'fresh prologue' if fresh else 'reused handle'}): "
+        f"{bad.numel()} of the {real_tiles} real tiles carry the out-of-range sentinel "
+        f"expert>={experts_per_rank}; first offenders {bad[:8].tolist()} "
+        f"(tile table holds {int((tile_to_expert < experts_per_rank).sum().item())} assigned tiles)"
+    )
+
+
 def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     x: torch.Tensor,
     w1q: torch.Tensor,
@@ -597,6 +632,7 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     count), the SwiGLU-epilogue row bound (mirrors bf16's ``handle[_H_NUM_TILE_BLOCKS]``). It can
     re-fetch the live symm buffer via ``get_symm_buffer_for_mega_moe()`` (e.g. the L2 combine flag reset).
     """
+    handle_was_none = handle is None
     if handle is None:
         assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
         assert group is not None, "handle=None requires group to build the symm workspace"
@@ -615,10 +651,14 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
                 num_experts=G * world, world_size=world, rank=symm.rank, experts_per_rank=G,
                 block_m=BM, num_max_pool_tokens=symm.num_max_pool_tokens,
             )
-        ) + (symm.meta_scalars[1:2],)  # handle[-1] = num_tile_blocks (device real-tile count)
+            # handle[-1] = num_tile_blocks (device real-tile count). Cloned out of the shared symm
+            # scratch so it belongs to THIS call: the next prologue overwrites meta_scalars, and
+            # the backward reuses this handle long after that. Stream-ordered D2D, no host sync.
+        ) + (symm.meta_scalars[1:2].clone(),)
     else:
         symm = get_symm_buffer_for_mega_moe()  # live buffer from a prior forward
         sym_layout = symm.make_sym_layout()
+    _validate_tiles(handle, w1q.shape[0], fresh=handle_was_none)
     l1 = dispatch_grouped_gemm_mxfp8(
         x, w1q, w1s, handle, sym_layout, symm,
         num_dispatch_cu=num_dispatch_cu, num_preshuffle_cu=num_preshuffle_cu, BM=BM, BN=BN,

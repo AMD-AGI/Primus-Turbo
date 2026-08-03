@@ -323,5 +323,84 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
             )
 
 
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [8])
+    def test_training_loop_fwd_bwd(self, top_k):
+        """Drive the op the way Megatron drives it, which nothing else here does.
+
+        Every other test and bench holds the routing fixed and/or runs forward only. A training
+        step differs in three ways that all touch state the op carries between calls:
+
+          * the router emits **different top-k every microbatch**, so the tile count, the pool
+            layout and which expert owns which tile all move call to call;
+          * forward and backward alternate continuously with **no cross-rank rendezvous** between
+            them -- `test_staged_vs_fused_parity` inserts `synchronize() + barrier()` between runs,
+            and real training has no such thing, so any epoch/flag scheme that quietly depends on
+            it will pass there and hang here;
+          * weights are **persistent** and only change on an optimizer step, which is what the
+            `w._version`-keyed mxfp8 weight-quant cache is built around, and grads accumulate over
+            the microbatches in between.
+
+        Asserts only that every step produces finite y / dx / dW: this is a liveness and
+        state-threading test, not a precision one. It prints per step so a hang says which one.
+        """
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
+            fused_mega_moe_fp8_stage1,
+            fused_mega_moe_fp8_stage2,
+        )
+
+        dev = self.device
+        epr = _E // self.world_size
+        H, I, E, T, K = _H, _I, _E, _T, top_k
+        num_iters = int(os.environ.get("PT_TRAIN_ITERS", "3"))
+        micro_per_iter = int(os.environ.get("PT_TRAIN_MICRO", "4"))
+
+        # persistent bf16 parameters, as MegaMoEWeightModule holds them
+        w1 = (torch.randn(epr, 2 * I, H, device=dev, dtype=torch.bfloat16) * (2.0 / math.sqrt(H))).requires_grad_(True)
+        w2 = (torch.randn(epr, H, I, device=dev, dtype=torch.bfloat16) * (2.0 / math.sqrt(I))).requires_grad_(True)
+        nonfinite = torch.zeros(4, dtype=torch.int64, device=dev)
+
+        for it in range(num_iters):
+            for mb in range(micro_per_iter):
+                step = it * micro_per_iter + mb
+                torch.manual_seed(9000 + self.rank + step * 131)
+                x = torch.randn(T, H, device=dev, dtype=torch.bfloat16, requires_grad=True)
+                gate = torch.randn(T, E, device=dev)
+                tw0, topk_idx = torch.sigmoid(gate).topk(K, dim=-1)
+                topk_w = (tw0 / (tw0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32).requires_grad_(True)
+                grad_y = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
+
+                # mirrors MegaMoEFP8Experts.forward: w1, stage1, w2, stage2
+                l1, dispatch_weights, handle, state = fused_mega_moe_fp8_stage1(
+                    x, topk_idx, topk_w, w1, group
+                )
+                y = fused_mega_moe_fp8_stage2(
+                    l1, dispatch_weights, handle, state, topk_idx, topk_w, w2, group
+                )
+                y.backward(grad_y)  # grads accumulate across the microbatches, as in GA
+
+                # Accumulate the check on device: reading it here would insert a host sync every
+                # step, which is itself the thing under test -- training never pauses like that.
+                for slot, t in enumerate((y, x.grad, w1.grad, w2.grad)):
+                    nonfinite[slot] += (~torch.isfinite(t.float())).sum()
+                if self.rank == 0:
+                    print(f"  [iter {it} micro {mb}] step {step} launched", flush=True)
+
+            # optimizer step: mutating the weights bumps w._version, retiring the quant cache
+            with torch.no_grad():
+                for w in (w1, w2):
+                    w -= 1e-4 * w.grad
+                    w.grad = None
+
+        counts = [int(v) for v in nonfinite]
+        dist.destroy_process_group()
+        for tag, count in zip(("y", "dx", "dW1", "dW2"), counts):
+            self.assertEqual(count, 0, f"rank {self.rank}: {count} non-finite {tag} values")
+
+
 if __name__ == "__main__":
     run_tests()
