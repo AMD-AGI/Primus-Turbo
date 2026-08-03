@@ -19,6 +19,30 @@ namespace primus_turbo {
 
 using namespace primus_turbo::dtype;
 
+namespace {
+
+constexpr size_t TENSORWISE_MAX_PACKED_BYTES = 32;
+constexpr size_t TENSORWISE_MAX_PACKED_SIZE  = 16;
+
+template <typename T, int N> constexpr int32_t valid_tensorwise_pack() {
+    return (N <= TENSORWISE_MAX_PACKED_SIZE) &&
+                   ((sizeof(T) * N) <= TENSORWISE_MAX_PACKED_BYTES)
+               ? N
+               : 1;
+}
+
+template <typename T> int32_t get_tensorwise_pack_size(const T *ptr) {
+    int32_t pack_size = static_cast<int32_t>(
+        std::min(TENSORWISE_MAX_PACKED_BYTES / sizeof(T), TENSORWISE_MAX_PACKED_SIZE));
+    const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+    while (pack_size > 1 && address % (pack_size * sizeof(T)) != 0) {
+        pack_size /= 2;
+    }
+    return pack_size;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Tensorwise functors (build on top of QuantOpBase from quant_utils.cuh)
 // ---------------------------------------------------------------------------
@@ -57,8 +81,19 @@ void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, cons
 
     const int32_t BLOCK_SIZE = 512;
 
-    int32_t pack_size = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
+    int32_t pack_size =
+        std::min(get_tensorwise_pack_size<FType>(x), get_tensorwise_pack_size<QType>(y));
     switch (pack_size) {
+    case 16: {
+        constexpr int32_t UNROLL =
+            valid_tensorwise_pack<FType, 16>() < valid_tensorwise_pack<QType, 16>()
+                ? valid_tensorwise_pack<FType, 16>()
+                : valid_tensorwise_pack<QType, 16>();
+        PackedEltwiseConfig pack_cfg(n, UNROLL, BLOCK_SIZE);
+        unary_kernel<BLOCK_SIZE, UNROLL, FType, QType, QuantTensorwiseScalePtrOp<ComputeType>>
+            <<<pack_cfg.nBlock, BLOCK_SIZE, 0, stream>>>(x, y, op, pack_cfg);
+        break;
+    }
     case 8: {
         const int32_t       UNROLL = valid_pack<FType, 8>();
         PackedEltwiseConfig pack_cfg(n, UNROLL, BLOCK_SIZE);
@@ -201,8 +236,19 @@ void dequantize_tensorwise_impl(const QType *x, const float *scale_inv, FType *y
     };
 
     const int32_t BLOCK_SIZE = 512;
-    int32_t       pack_size  = std::min(get_pack_size<QType>(x), get_pack_size<FType>(y));
+    int32_t pack_size =
+        std::min(get_tensorwise_pack_size<QType>(x), get_tensorwise_pack_size<FType>(y));
     switch (pack_size) {
+    case 16: {
+        constexpr int32_t UNROLL =
+            valid_tensorwise_pack<QType, 16>() < valid_tensorwise_pack<FType, 16>()
+                ? valid_tensorwise_pack<QType, 16>()
+                : valid_tensorwise_pack<FType, 16>();
+        PackedEltwiseConfig pack_cfg(n, UNROLL, BLOCK_SIZE);
+        unary_kernel<BLOCK_SIZE, UNROLL, QType, FType, DeQuantTensorwiseScaleInvPtrOp<ComputeType>>
+            <<<pack_cfg.nBlock, BLOCK_SIZE, 0, stream>>>(x, y, op, pack_cfg);
+        break;
+    }
     case 8: {
         const int32_t       UNROLL = valid_pack<FType, 8>();
         PackedEltwiseConfig pack_cfg(n, UNROLL, BLOCK_SIZE);

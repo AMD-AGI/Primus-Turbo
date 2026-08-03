@@ -793,6 +793,7 @@ def _process_variable_k_tile(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
+    BETA_IS_ONE: tl.constexpr = False,
 ):
     """Compute one variable-K output tile given its global tile id."""
     # -- Map to (group, local_tile) -- simple div/mod, O(1) --
@@ -871,13 +872,17 @@ def _process_variable_k_tile(
     # -- Apply scaling and store --
     if IS_FP8:
         acc *= scale
-    c = acc.to(C.type.element_ty)
     rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    # Do not wrap the N tail back to column zero. For widths such as 2880,
+    # modulo aliases the final partial tile with the first tile; beta=1 then
+    # turns that overlap into a racy read-modify-write.
+    rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
     C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
-    tl.store(C_, c, c_mask)
+    if BETA_IS_ONE:
+        acc += tl.load(C_, mask=c_mask, other=0.0).to(tl.float32)
+    tl.store(C_, acc.to(C.type.element_ty), c_mask)
 
 
 @triton.jit()
@@ -911,6 +916,7 @@ def _grouped_variable_k_gemm_kernel(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    BETA_IS_ONE: tl.constexpr = False,
 ):
     """Persistent grouped variable-K GEMM kernel for backward (static stride)."""
     pid = tl.program_id(0)
@@ -961,6 +967,7 @@ def _grouped_variable_k_gemm_kernel(
             CACHE_MODIFIER_A=CACHE_MODIFIER_A,
             CACHE_MODIFIER_B=CACHE_MODIFIER_B,
             ALLOW_TF32=ALLOW_TF32,
+            BETA_IS_ONE=BETA_IS_ONE,
         )
 
 
