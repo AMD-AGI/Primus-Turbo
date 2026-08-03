@@ -89,6 +89,17 @@ _COMBINE_REAL_TILES_GRID = os.environ.get("PT_COMBINE_REAL_TILES_GRID", "1") != 
 # the original dword path. Words are 4-aligned, so a group of 4 stays inside one E8M0 32-block:
 # one scale word + one shift serves all 4. Falls back to 1 when H4 is not a multiple of _WARP*VW.
 _REDUCE_VW = int(os.environ.get("PT_COMBINE_REDUCE_VW", "4"))
+# N x s_sleep(127) between the GEMM-done gate and the PUSH's first L2Y read.
+#
+# The gate removes ~89% of the exposure -- with it disabled every output token is corrupt, with it
+# ~10% still are -- but a residual window survives that no release/acquire closes. `buffer_wbl2`
+# sc1 and sc0|sc1 on the GEMM's release, sc0|sc1 on the C stores, sc1 on the PUSH's L2Y loads,
+# dropping the PUSH's `buffer_inv`, and coherent epoch parity/expected traffic each leave the rate
+# at ~10%; only wall-clock separation moves it. Against the L2Y-poison amplifier in
+# repro_fp8_combine_gate.py the rate is 850 / 105 / 0 / 0 output tokens per rank at N = 0 / 1 / 2 / 4,
+# so this is 2x the minimum that closes it, at a cost inside run-to-run spread (+0.17% e2e, vs
+# +0.78% at N=8). This is wall-clock mitigation, not a root-cause fix.
+_GATE_DELAY = int(os.environ.get("PT_COMBINE_GATE_DELAY", "4"))
 
 
 @functools.lru_cache(maxsize=4)
@@ -447,6 +458,8 @@ def _compile(
                                     )
                                     spin_start = read_clock()
                     fx.gpu.barrier()
+                    for _ in range(_GATE_DELAY):
+                        fx.rocdl.s_sleep(fx.Int32(127))
                     l2_invalidate()
                 push_block(block_m)
             fx.rocdl.s_waitcnt(0)
@@ -712,7 +725,7 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
               _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU,
               _COMBINE_REAL_TILES_GRID,
               _COMBINE_PERSISTENT_GEMM, _COMBINE_GEMM_CU, _COMBINE_NUM_XCD, _COMBINE_GROUP_M, _COMBINE_GROUP_N,
-              _COMBINE_TILE_SWIZZLE)
+              _COMBINE_TILE_SWIZZLE, _GATE_DELAY)
         compiled = _FP8_COMBINE_COMPILED.get(ck)
         if compiled is None:
             compiled = flyc.compile(launch, *gemm_push_args)

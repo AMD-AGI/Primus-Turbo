@@ -132,6 +132,37 @@ refuted in the backward.
 
 ## 3. Correctness — nondeterministic by default, and the fix is free
 
+> **Correction (2026-08-03).** The round-7 correction immediately below is itself wrong on the
+> point that matters, and the stall is now **on by default at N=4**. Round 7 scored fp8 against an
+> analytic reference under a *single fixed routing*, which is exactly the condition that hides this
+> defect: what the PUSH ships for a corrupted row is the bytes left in L2Y by the previous call, and
+> with the routing and inputs held constant those bytes equal the correct ones. Change the routing
+> between iterations, as a training step does, and the leftover row can be one that used to be group
+> padding, whose L2Y is fp8 NaN — so **NaN reaches the forward output**, 39-86 tokens per rank on the
+> first changed step. Prefilling L2Y with the fp8 NaN byte turns the defect into a direct count and
+> removes the routing dependence entirely: ~870 of 8192 output tokens per rank, every iteration,
+> under fixed routing too. `repro_fp8_combine_gate.py` reproduces all three modes. So this was never
+> a reproducibility knob; it was an accuracy defect that the measurement could not see.
+>
+> New evidence on the mechanism, all from the poison amplifier:
+> - the gate is doing most of its job — disabling it entirely corrupts **every** output token
+>   (8192/8192), so the ~870 residual is a narrow window, not an absent gate
+> - the residual is not visibility. `buffer_wbl2 sc1` and `sc0 sc1` on the GEMM's release, `sc0|sc1`
+>   on the C stores, `sc1` on the PUSH's L2Y loads, dropping the PUSH's `buffer_inv`, and coherent
+>   epoch parity/expected traffic all leave it at ~870, confirming round 6 with a far sharper metric
+> - the ISA is already what the memory model asks for: the C stores carry `sc1`, are drained with
+>   `s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)` and an `s_barrier` before the flag store, and the PUSH
+>   does `s_barrier` → `buffer_inv sc1` → loads
+> - moving the flag store to *before* the C stores does not raise the rate, i.e. the residual is not
+>   explained by how long the gate waits
+> - stall sweep: 850 / 105 / 0 / 0 per rank at N = 0 / 1 / 2 / 4
+>
+> Ruled out and not worth revisiting: stale `origin_rank` in the pool (the live-row count matches
+> `num_tokens_per_expert.sum()` exactly), the pushed data itself (no live L2Y row is NaN once the
+> kernel finishes, so the GEMM's coverage is complete), unpushed `comb` slots (none), and the E8M0
+> scale (never the 0xFF NaN encoding). A per-tile atomic counter in place of the `n_blocks`
+> independent flag stores is incompatible with the varying tile count and hangs.
+
 > **Correction (round 7).** Section 3 below conflated two independent things. Its *bitwise*
 > determinism data stands. Its accuracy claim does not: the swinging dx SNR was never the fp8
 > path's fault. Scored against an **analytic** reference instead of the bf16 op, fp8 measures
@@ -166,10 +197,10 @@ the reference rather than the fp8 path — see the correction above.
 
 ### 3.2 A post-gate stall closed it
 
-> **Removed.** `PT_COMBINE_GATE_DELAY` has been deleted from the kernel. Once round 7 showed it
-> buys bitwise reproducibility but not accuracy, an off-by-default knob that nobody should enable
-> was not worth carrying. The measurements below stand as the evidence that the gate releases the
-> push too early; reinstate the stall from git history if you pick up that root-cause work.
+> **Restored, and on by default at N=4.** `PT_COMBINE_GATE_DELAY` was deleted after round 7 judged
+> it a reproducibility knob; the 2026-08-03 correction above shows that judgement came from a
+> fixed-routing measurement that could not see the NaN. N=4 is 2x the minimum that zeroes the poison
+> amplifier and costs +0.17% e2e, inside run-to-run spread (N=8 is measurably slower at +0.78%).
 
 The knob stalled `N × s_sleep(127)` after the GEMM-done gate, before the push read L2Y.
 Determinism vs N (T=2048, runs=6, rows differing):
@@ -203,8 +234,9 @@ This also corrects an earlier reading. `N=32` costs +9.4% on LB fwd+bwd (15.39 v
 twice), which suggested correctness was expensive. It is not — 32 is 8× more stall than needed, and
 the entire 9.4% was waste.
 
-N=8 would have been the sane setting (4× margin at the same unmeasurable cost) had the stall been
-kept as a default.
+Re-measured 2026-08-03 with the stall shipped, LB `fwd+bwd`, two reps each: N=0 13.504, N=2 13.537,
+N=4 13.527, N=8 13.610. N=2 and N=4 sit inside the spread; N=8 is the slowest in both reps. **N=4 is
+the default.**
 
 ### 3.4 What the stall does *not* fix
 
@@ -275,7 +307,7 @@ every later run. Reap by `spawn_main`; the wrappers under
 
 | P | Item | Notes |
 |---|---|---|
-| **P1** | root-cause the GEMM→push gate | costs reproducibility, not accuracy (round 7); the stall that proved it is removed, visibility family already ruled out |
+| **P1** | root-cause the GEMM→push gate | costs accuracy after all — NaN in the forward output once routing changes; mitigated by the N=4 stall, now on by default. Visibility family fully ruled out twice; the gate itself removes ~89% of the exposure and the ISA already matches the memory model, so the residual is unexplained. Repro: `repro_fp8_combine_gate.py` |
 | **P2** | track `dW1`/`dW2` accumulation-order nondeterminism | independent source, one bf16 ULP |
 | **P3** | kill the L2Y local round trip in STEP3 | 469 MB written + 469 MB re-read; the only lever that attacks the XGMI/HBM floor |
 | **P5** | XGMI dedup on STEP1 | refuted on the forward, but §2.1 measures ~2.7× more push sensitivity here; ~0.21 ms of 1.686 |
