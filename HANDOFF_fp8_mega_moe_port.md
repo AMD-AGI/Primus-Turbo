@@ -93,7 +93,7 @@ token_quant 0.059ms ~2.5%),cos=1.00000 PASS。
 **✅ 前向已全部完成并验证**(L1 fp8 + SwiGLU + L2 fp8 combine)。L2 vendored 的文件:`gemm_bf16_kernel.py`、
 `grouped_gemm_combine_bf16_kernel.py`、`swiglu_kernel.py`、`grouped_gemm_combine_fp8_kernel.py`(都在
 `flydsl/mega/fp8/`,import 已重写)。op 前向在 `mega_moe_fused_fp8.py::MegaMoEFusedFP8Function.forward`
-(standalone,权重内部量化;`_host_rendezvous` 做 L1/L2 scoreboard/flag 复位);e2e bench
+(standalone,权重内部量化;L1/L2 scoreboard/flag 用 device epoch 自复位,无 host rendezvous);e2e bench
 `benchmark/ops/bench_mega_moe_fused_fp8.py`(fp8 vs bf16 SNR gate)。**下一步是反向。**
 
 **✅ 反向 STEP1 已完成并验证**(dispatch(dy)+fc2 dgrad,fp8)。**没有独立的 bwd kernel** —— STEP1 直接

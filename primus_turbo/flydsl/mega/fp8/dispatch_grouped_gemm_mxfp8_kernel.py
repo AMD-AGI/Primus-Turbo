@@ -557,14 +557,11 @@ def dispatch_grouped_gemm_mxfp8(
     ck = (N, K, num_max_pool_tokens, BM, BN, int(num_dispatch_cu), int(num_preshuffle_cu),
           int(num_comm), int(num_ranks), int(G), blgp, out_fp16, int(GROUP_M),
           push_only, gemm_only)
-    if torch.cuda.is_current_stream_capturing():
-        raw(*args)
-    else:
-        compiled = _FUSED_COMPILED.get(ck)
-        if compiled is None:
-            compiled = flyc.compile(raw, *args)
-            _FUSED_COMPILED[ck] = compiled
-        compiled(*args)
+    compiled = _FUSED_COMPILED.get(ck)
+    if compiled is None:
+        compiled = flyc.compile(raw, *args)
+        _FUSED_COMPILED[ck] = compiled
+    compiled(*args)
     return output
 
 
