@@ -440,13 +440,13 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                 grouped_gemm_fp8_tensorwise_flydsl_kernel,
             )
             from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-                quantize_fp8_tensorwise_pad_flydsl_impl,
+                quantize_fp8_tensorwise_pad_impl,
             )
 
             go = group_offs if group_offs is not None else group_offs_from_lens(group_lens)
             fp8_dtype = _get_fp8_dtype(config.format, True)
-            a_q, a_sc = quantize_fp8_tensorwise_pad_flydsl_impl(a, fp8_dtype)  # [M, Kp]
-            b_q, b_sc = quantize_fp8_tensorwise_pad_flydsl_impl(b, fp8_dtype)  # [G, N, Kp]
+            a_q, a_sc = quantize_fp8_tensorwise_pad_impl(a, fp8_dtype)  # [M, Kp]
+            b_q, b_sc = quantize_fp8_tensorwise_pad_impl(b, fp8_dtype)  # [G, N, Kp]
             out = grouped_gemm_fp8_tensorwise_flydsl_kernel(
                 a_q,
                 b_q,

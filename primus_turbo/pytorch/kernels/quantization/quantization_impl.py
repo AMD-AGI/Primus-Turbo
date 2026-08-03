@@ -43,26 +43,20 @@ def quantize_fp8_tensorwise_impl(
     """
     Quantize FP8 Tensor-Wise
     """
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
+    # padding_align_size=1 -> Kp == K, shape-preserving (byte-identical to the legacy quant).
+    x = x.contiguous()
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None, 1)
     return x_fp8, scale_inv
 
 
-def quantize_fp8_tensorwise_pad_flydsl_impl(
+def quantize_fp8_tensorwise_pad_impl(
     x: torch.Tensor, out_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """FlyDSL per-tensor fp8 cast fused with K-pad to Kp=ceil128(K) (gfx950), the tw grouped-GEMM
-    operand quant. Returns (x_fp8, scale_inv) matching quantize_fp8_tensorwise_impl, except the
-    fp8 inner dim is Kp (real data in [..., :K], pad columns zeroed). A 3D [B, N, K] weight does
-    all B experts in one launch."""
-    from primus_turbo.flydsl.quantization.fp8_tensorwise_quant_flydsl import (
-        quant_fp8_tensorwise_pad,
-        quant_fp8_tensorwise_pad_batched,
-    )
-
+    """Per-tensor fp8 cast + K-pad to Kp=ceil128(K) (padding=128, the merged op default).
+    Real data in [..., :K], pad columns zeroed. Any ndim >= 1 ([B, N, K] weight in one launch)."""
     x = x.contiguous()
-    if x.ndim == 3:
-        return quant_fp8_tensorwise_pad_batched(x, out_dtype)
-    return quant_fp8_tensorwise_pad(x, out_dtype)
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None, 128)
+    return x_fp8, scale_inv
 
 
 def quantize_fp8_rowwise_impl(
