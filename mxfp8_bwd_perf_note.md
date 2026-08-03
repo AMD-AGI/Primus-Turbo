@@ -83,6 +83,34 @@ Earlier the same day, `192ba6aa` (SwiGLU backward fused into the grad_l1 dual-qu
 for a real gain but only marginally above the floor, so read it as consistent with the −0.149 ms
 the commit itself reports rather than as an independent confirmation.
 
+### 1.3 08-03 regression — the release fix and the two-stage split are both free
+
+Two things landed on 08-03: the second rendezvous on the combine's GEMM-done release (§3, the fix
+for the forward NaN) and the fp8 two-stage gate-up / gate-down split, which the bench now times as
+its own `fp8_staged` leg. Both were checked in one sweep, node `n04-33`, T=8192, `--only all
+--routing-mode both`, the fixed and pre-fix builds run alternately, two reps each, **every arm on
+its own `FLYDSL_RUNTIME_CACHE_DIR`** (see the trap in §3). Means of the two reps; `Δ` is fixed vs
+pre-fix (`PT_COMBINE_DOUBLE_BARRIER=0`):
+
+| Routing | Leg | fwd+bwd | Δ | fwd-only | Δ | bwd-only | Δ |
+|---|---|---|---|---|---|---|---|
+| load_balanced | fp8 | 13.481 | +0.12% | 5.289 | +1.50% | 8.349 | +0.07% |
+| load_balanced | fp8_staged | 13.495 | +0.45% | 5.187 | +0.54% | 8.308 | +0.40% |
+| load_balanced | bf16 *(control)* | 21.056 | +0.05% | 7.359 | +0.65% | 14.353 | +0.32% |
+| round_robin | fp8 | 12.997 | +0.55% | 5.023 | +0.61% | 8.046 | −0.14% |
+| round_robin | fp8_staged | 12.863 | −0.56% | 4.940 | −0.68% | 7.953 | −0.14% |
+| round_robin | bf16 *(control)* | 20.180 | −0.20% | 7.071 | −0.04% | 13.698 | +0.16% |
+
+**Read the bf16 rows first.** The knob cannot touch the bf16 path, yet its Δ ranges −0.20% to
++0.65% — that is this node's floor for the run, measured rather than assumed. Every fp8 Δ sits
+inside that band except LB `fwd-only` at +1.50%, and that arm's own two reps differ by 1.35%
+(5.253 vs 5.324), so it is the same outlier. **No measurable regression from either change.**
+
+The split specifically: `fp8_staged / fp8` is 0.97×–1.01× across all six cells, i.e. splitting one
+fused op into two does not cost anything measurable, which is what makes the DDP overlap it enables
+worth taking. fp8 vs bf16 lands at 1.55–1.57× on `fwd+bwd` and 1.70–1.73× on `bwd-only`, a little
+better than the §1 table's 1.48×/1.63× — different session, so do not diff the two directly.
+
 ## 2. Backward internal structure
 
 From the campaign's round-1/2 budget (see `logs/optimize.md`); not re-measured this session:
@@ -279,9 +307,16 @@ cd /perf_apps/xiaoming/MegaMoE
 export PYTHONPATH=/perf_apps/xiaoming/MegaMoE MEGA_BENCH_TIMEOUT_S=1800
 W=agent/workspace/mega_moe_combine_reduce_flydsl_gfx950_20260801/rounds/round-6/artifacts
 
-# performance (fp8 vs bf16, both routings)
+# performance (fused fp8 / staged fp8 / bf16, both routings). Give each arm of an A/B its own
+# FLYDSL_RUNTIME_CACHE_DIR, or a stale binary can make it compare a config against itself.
+FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d) \
 MASTER_PORT=$((20000+RANDOM%20000)) python3 benchmark/ops/bench_mega_moe_bwd_only.py \
-  --num-processes 8 --num-tokens 8192 --routing-mode both --only both --warmup 8 --iters 25
+  --num-processes 8 --num-tokens 8192 --routing-mode both --only all --warmup 8 --iters 25
+
+# forward NaN from the combine gate: poison amplifier, real training shape, and the hiding condition
+MASTER_PORT=$((20000+RANDOM%20000)) python3 repro_fp8_combine_gate.py --poison
+MASTER_PORT=$((20000+RANDOM%20000)) python3 repro_fp8_combine_gate.py
+MASTER_PORT=$((20000+RANDOM%20000)) python3 repro_fp8_combine_gate.py --fixed-routing
 
 # accuracy, against the analytic reference (no bf16 in the verdict)
 MASTER_PORT=$((20000+RANDOM%20000)) python3 benchmark/ops/bench_mega_moe_fused_fp8_bwd.py \
