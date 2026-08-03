@@ -349,7 +349,13 @@ def test_gemm_fp8_blockwise_flydsl_routes_new_kernels():
         assert {"forward", "dgrad", "wgrad_normalized"} <= directions
         assert flydsl_blockwise_4wave_forward_supported(4096, 202048, 5120)
         assert flydsl_blockwise_4wave_forward_supported(32768, 128256, 4096)
-        assert select_blockscale_fp8_forward_kernel(4096, 202048, 5120)["family"] == "4wave"
+        assert select_blockscale_fp8_forward_kernel(4096, 202048, 5120) == {
+            "family": "4wave",
+            "block_m": 128,
+            "fold_group_size": 4,
+            "k_loop_unroll": 6,
+            "scale_a_k_major": True,
+        }
         assert select_blockscale_fp8_forward_kernel(16384, 16384, 53248) == {
             "family": "8wave_3stage",
             "fold_group_size": 5,
