@@ -89,17 +89,18 @@ _COMBINE_REAL_TILES_GRID = os.environ.get("PT_COMBINE_REAL_TILES_GRID", "1") != 
 # the original dword path. Words are 4-aligned, so a group of 4 stays inside one E8M0 32-block:
 # one scale word + one shift serves all 4. Falls back to 1 when H4 is not a multiple of _WARP*VW.
 _REDUCE_VW = int(os.environ.get("PT_COMBINE_REDUCE_VW", "4"))
-# N x s_sleep(127) between the GEMM-done gate and the PUSH's first L2Y read.
+# Second rendezvous on the GEMM-done release. One `s_waitcnt(0)` + `s_barrier` reads as a complete
+# release and is not: the PUSH then ships L2Y bytes this call's GEMM has not written, ~10% of output
+# tokens (against the L2Y-poison amplifier in repro_fp8_combine_gate.py, 870 of 8192 per rank; with
+# the gate removed altogether it is all 8192, so the gate is doing most but not all of its job).
+# The bf16 combine already carries this second pair with the same note. The `s_waitcnt` between the
+# two barriers is load-bearing -- LLVM folds adjacent `s_barrier`s.
 #
-# The gate removes ~89% of the exposure -- with it disabled every output token is corrupt, with it
-# ~10% still are -- but a residual window survives that no release/acquire closes. `buffer_wbl2`
-# sc1 and sc0|sc1 on the GEMM's release, sc0|sc1 on the C stores, sc1 on the PUSH's L2Y loads,
-# dropping the PUSH's `buffer_inv`, and coherent epoch parity/expected traffic each leave the rate
-# at ~10%; only wall-clock separation moves it. Against the L2Y-poison amplifier in
-# repro_fp8_combine_gate.py the rate is 850 / 105 / 0 / 0 output tokens per rank at N = 0 / 1 / 2 / 4,
-# so this is 2x the minimum that closes it, at a cost inside run-to-run spread (+0.17% e2e, vs
-# +0.78% at N=8). This is wall-clock mitigation, not a root-cause fix.
-_GATE_DELAY = int(os.environ.get("PT_COMBINE_GATE_DELAY", "4"))
+# Nothing in the memory-visibility family substitutes for it: `buffer_wbl2` sc1 and sc0|sc1 on the
+# release, sc0|sc1 on the C stores, sc1 on the PUSH's L2Y loads, dropping the PUSH's `buffer_inv`,
+# sys-scope flag traffic, an `s_waitcnt` before every flag read, and coherent epoch parity/expected
+# traffic each leave the rate at ~10%.
+_DOUBLE_BARRIER = os.environ.get("PT_COMBINE_DOUBLE_BARRIER", "1") != "0"
 
 
 @functools.lru_cache(maxsize=4)
@@ -458,8 +459,6 @@ def _compile(
                                     )
                                     spin_start = read_clock()
                     fx.gpu.barrier()
-                    for _ in range(_GATE_DELAY):
-                        fx.rocdl.s_sleep(fx.Int32(127))
                     l2_invalidate()
                 push_block(block_m)
             fx.rocdl.s_waitcnt(0)
@@ -485,6 +484,9 @@ def _compile(
                 )
                 fx.rocdl.s_waitcnt(0)
                 rocdl.s_barrier()
+                if const_expr(_DOUBLE_BARRIER):
+                    fx.rocdl.s_waitcnt(0)
+                    rocdl.s_barrier()
                 flag_off = combine_bank + block_m * n_blocks_i32 + block_n
                 _emit_if_then(
                     thread_index == fx.Int32(0),
@@ -725,7 +727,7 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
               _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU,
               _COMBINE_REAL_TILES_GRID,
               _COMBINE_PERSISTENT_GEMM, _COMBINE_GEMM_CU, _COMBINE_NUM_XCD, _COMBINE_GROUP_M, _COMBINE_GROUP_N,
-              _COMBINE_TILE_SWIZZLE, _GATE_DELAY)
+              _COMBINE_TILE_SWIZZLE, _DOUBLE_BARRIER)
         compiled = _FP8_COMBINE_COMPILED.get(ck)
         if compiled is None:
             compiled = flyc.compile(launch, *gemm_push_args)

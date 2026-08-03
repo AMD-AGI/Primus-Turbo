@@ -34,26 +34,25 @@ Measured on 8 x gfx950, T=8192 K=8, NaN output tokens per rank out of 8192:
 --poison also reproduces under --fixed-routing, which is the point: the defect does not depend on
 routing at all. Routing only decides whether the leftover bytes happen to equal the correct ones.
 
-What is already ruled out, so nobody repeats it:
+FIXED: the GEMM's release kept only one `s_waitcnt(0)` + `s_barrier` before storing the done flag.
+The bf16 combine has always carried a second rendezvous there, with a note that one is not enough
+and that the `s_waitcnt` between the two barriers matters because LLVM folds adjacent `s_barrier`s.
+Set PT_COMBINE_DOUBLE_BARRIER=0 to get the old behaviour back and watch every mode above light up.
+
+What was ruled out on the way, so nobody repeats it:
   - stale origin_rank in the pool: the live-row count matches num_tokens_per_expert.sum() exactly
   - the pushed data itself: L2Y live rows are never NaN once the kernel has finished, i.e. the GEMM
-    does cover every row it should -- the PUSH just reads them too early
-  - the reduce's comb reads: every slot is pushed (no unpushed slot), and the E8M0 scale is never
-    the 0xFF NaN encoding
-  - agent-scope release on the GEMM side (buffer_wbl2 sc1 before the flag store): no effect
-  - device-coherent (sc0|sc1) loads of comb in the reduce: no effect
-A stall of 8 x s_sleep(127) inserted between the gate and the PUSH's first L2Y load drives the
-poisoned count from ~870 to 0, which is what pins it to ordering rather than coverage. That patch,
-in grouped_gemm_combine_fp8_kernel.py right after the gate's fx.gpu.barrier():
+    covers every row it should -- the PUSH just read them too early
+  - the reduce's comb reads: every slot is pushed, and the E8M0 scale is never the 0xFF NaN encoding
+  - the whole memory-visibility family, which is why this took so long to find: `buffer_wbl2` sc1
+    and sc0|sc1 on the release, sc0|sc1 on the C stores, sc1 on the PUSH's L2Y loads, dropping the
+    PUSH's `buffer_inv`, sys-scope flag traffic, an `s_waitcnt` before every flag read, and coherent
+    epoch parity/expected traffic all leave the poisoned rate at ~870. The release was incomplete at
+    the workgroup level, not at the cache level.
 
-    fx.gpu.barrier()
-    for _ in range(8):                 # <-- add
-        fx.rocdl.s_sleep(fx.Int32(127))
-    l2_invalidate()
-    push_block(block_m)
-
-is a wall-clock mitigation, not a fix, and is not committed. Root-causing why the flag is visible
-to the PUSH before the C stores are is the open question.
+Measurement trap: flyc's on-disk runtime cache can serve a stale binary across runs that differ only
+by an env-driven kernel constant, so an A/B can silently compare a config against itself. Give every
+arm its own FLYDSL_RUNTIME_CACHE_DIR and repeat each arm at least twice.
 """
 
 import argparse

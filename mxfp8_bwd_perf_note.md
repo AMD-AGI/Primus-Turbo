@@ -132,8 +132,21 @@ refuted in the backward.
 
 ## 3. Correctness — nondeterministic by default, and the fix is free
 
+> **Root-caused and fixed (2026-08-03).** The GEMM's release kept **one** `s_waitcnt(0)` +
+> `s_barrier` before the done-flag store. That reads as a complete release and is not; the bf16
+> combine has carried a *second* rendezvous there all along, with a note that one is not enough and
+> that the `s_waitcnt` separating the two barriers is load-bearing because LLVM folds adjacent
+> `s_barrier`s. Porting that second pair to the fp8 combine takes the corruption to zero at no
+> measurable cost (LB `fwd+bwd` 13.499 vs 13.486 ms over two reps each). No stall, and
+> `PT_COMBINE_GATE_DELAY` is gone again. Sections 3.2 / 3.5 below and the P1 item are superseded.
+>
+> **Measurement trap that cost several wrong conclusions here:** flyc's on-disk runtime cache can
+> serve a stale binary across runs that differ only by an env-driven kernel constant, so an A/B can
+> silently compare a config against itself. One bisect round produced a clean "fix" that vanished on
+> repeat. Give every arm its own `FLYDSL_RUNTIME_CACHE_DIR` and repeat each arm at least twice.
+>
 > **Correction (2026-08-03).** The round-7 correction immediately below is itself wrong on the
-> point that matters, and the stall is now **on by default at N=4**. Round 7 scored fp8 against an
+> point that matters. Round 7 scored fp8 against an
 > analytic reference under a *single fixed routing*, which is exactly the condition that hides this
 > defect: what the PUSH ships for a corrupted row is the bytes left in L2Y by the previous call, and
 > with the routing and inputs held constant those bytes equal the correct ones. Change the routing
@@ -144,18 +157,16 @@ refuted in the backward.
 > under fixed routing too. `repro_fp8_combine_gate.py` reproduces all three modes. So this was never
 > a reproducibility knob; it was an accuracy defect that the measurement could not see.
 >
-> New evidence on the mechanism, all from the poison amplifier:
-> - the gate is doing most of its job — disabling it entirely corrupts **every** output token
->   (8192/8192), so the ~870 residual is a narrow window, not an absent gate
-> - the residual is not visibility. `buffer_wbl2 sc1` and `sc0 sc1` on the GEMM's release, `sc0|sc1`
->   on the C stores, `sc1` on the PUSH's L2Y loads, dropping the PUSH's `buffer_inv`, and coherent
->   epoch parity/expected traffic all leave it at ~870, confirming round 6 with a far sharper metric
-> - the ISA is already what the memory model asks for: the C stores carry `sc1`, are drained with
->   `s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)` and an `s_barrier` before the flag store, and the PUSH
->   does `s_barrier` → `buffer_inv sc1` → loads
-> - moving the flag store to *before* the C stores does not raise the rate, i.e. the residual is not
->   explained by how long the gate waits
-> - stall sweep: 850 / 105 / 0 / 0 per rank at N = 0 / 1 / 2 / 4
+> How the mechanism was narrowed, all against the poison amplifier:
+> - the gate was doing most of its job — disabling it entirely corrupts **every** output token
+>   (8192/8192), so the ~870 residual was a narrow window, not an absent gate
+> - the residual was not visibility. `buffer_wbl2 sc1` and `sc0 sc1` on the GEMM's release, `sc0|sc1`
+>   on the C stores, `sc1` on the PUSH's L2Y loads, dropping the PUSH's `buffer_inv`, sys-scope flag
+>   traffic, an `s_waitcnt` before every flag read, and coherent epoch parity/expected traffic all
+>   leave it at ~870 — confirming round 6 with a far sharper metric
+> - moving the flag store to *before* the C stores does not raise the rate either, i.e. the residual
+>   was not explained by how long the gate waits
+> - what did close it was the missing second rendezvous, found by diffing against the bf16 combine
 >
 > Ruled out and not worth revisiting: stale `origin_rank` in the pool (the live-row count matches
 > `num_tokens_per_expert.sum()` exactly), the pushed data itself (no live L2Y row is NaN once the
@@ -197,10 +208,9 @@ the reference rather than the fp8 path — see the correction above.
 
 ### 3.2 A post-gate stall closed it
 
-> **Restored, and on by default at N=4.** `PT_COMBINE_GATE_DELAY` was deleted after round 7 judged
-> it a reproducibility knob; the 2026-08-03 correction above shows that judgement came from a
-> fixed-routing measurement that could not see the NaN. N=4 is 2x the minimum that zeroes the poison
-> amplifier and costs +0.17% e2e, inside run-to-run spread (N=8 is measurably slower at +0.78%).
+> **Superseded.** `PT_COMBINE_GATE_DELAY` is gone for good: the second rendezvous on the GEMM
+> release closes the window properly, so there is nothing left for a stall to hide. The numbers
+> below stand only as evidence that the release was incomplete.
 
 The knob stalled `N × s_sleep(127)` after the GEMM-done gate, before the push read L2Y.
 Determinism vs N (T=2048, runs=6, rows differing):
@@ -234,9 +244,8 @@ This also corrects an earlier reading. `N=32` costs +9.4% on LB fwd+bwd (15.39 v
 twice), which suggested correctness was expensive. It is not — 32 is 8× more stall than needed, and
 the entire 9.4% was waste.
 
-Re-measured 2026-08-03 with the stall shipped, LB `fwd+bwd`, two reps each: N=0 13.504, N=2 13.537,
-N=4 13.527, N=8 13.610. N=2 and N=4 sit inside the spread; N=8 is the slowest in both reps. **N=4 is
-the default.**
+Moot as of 2026-08-03 — the stall is not shipped at all. The second rendezvous that replaces it
+measures 13.486 vs 13.499 ms LB `fwd+bwd` against a single-barrier build, two reps each.
 
 ### 3.4 What the stall does *not* fix
 
@@ -248,6 +257,11 @@ was masked by the combine's much larger corruption until the stall removed that.
 benign for training, but it should be tracked separately.
 
 ### 3.5 Status of the stall as a fix
+
+> **Superseded 2026-08-03.** The root cause was a missing second `s_waitcnt(0)` + `s_barrier` on
+> the GEMM release, which is why the visibility family below could never move the number: the
+> release was incomplete at the workgroup level, not at the cache level. Round 6's negative results
+> were correct and were looking in the wrong place.
 
 It is a **mitigation, not a root-cause fix** — it closes the race window by wall-clock separation
 rather than by a correct release/acquire pairing. Round 6 empirically eliminated the entire
@@ -307,7 +321,7 @@ every later run. Reap by `spawn_main`; the wrappers under
 
 | P | Item | Notes |
 |---|---|---|
-| **P1** | root-cause the GEMM→push gate | costs accuracy after all — NaN in the forward output once routing changes; mitigated by the N=4 stall, now on by default. Visibility family fully ruled out twice; the gate itself removes ~89% of the exposure and the ISA already matches the memory model, so the residual is unexplained. Repro: `repro_fp8_combine_gate.py` |
+| ~~P1~~ | ~~root-cause the GEMM→push gate~~ | **Done 2026-08-03.** The release was missing bf16's second `s_waitcnt(0)` + `s_barrier`; it cost accuracy (NaN in the forward output once routing changes), not just reproducibility. Fixed at no measurable cost, stall dropped. Repro: `repro_fp8_combine_gate.py` |
 | **P2** | track `dW1`/`dW2` accumulation-order nondeterminism | independent source, one bf16 ULP |
 | **P3** | kill the L2Y local round trip in STEP3 | 469 MB written + 469 MB re-read; the only lever that attacks the XGMI/HBM floor |
 | **P5** | XGMI dedup on STEP1 | refuted on the forward, but §2.1 measures ~2.7× more push sensitivity here; ~0.21 ms of 1.686 |
