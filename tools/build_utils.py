@@ -300,7 +300,12 @@ def find_rocshmem_library() -> Library:
     library_dirs = [rocshmem_library_dir, mpi_library_dir]
     extra_link_args = [
         f"-Wl,-rpath,{rocshmem_library_dir}",
-        "-l:librocshmem.a",
+        # Absolute path, not -l:librocshmem.a: torch's HIPExtension puts the ROCm
+        # pip SDK's lib dir ahead of ours in -L order, and that wheel ships its own
+        # newer librocshmem.a whose symbols live in namespace rocshmem::host. Since
+        # we compile against ROCSHMEM_HOME's headers, picking that one up leaves
+        # rocshmem::* undefined in the .so.
+        f"{rocshmem_library_dir}/librocshmem.a",
         "-fgpu-rdc",
         "--hip-link",
         "-lamdhip64",
