@@ -3,6 +3,9 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+import os
+from functools import reduce
+from operator import mul
 from typing import Optional, Union
 
 import torch
@@ -24,7 +27,6 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.core.utils import is_gfx942
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_impl,
     grouped_gemm_fp8_variable_k_impl,
@@ -45,6 +47,41 @@ __all__ = [
     "grouped_gemm_fp8",
 ]
 
+# Opt-in: wgrad writes straight into the parameter's main_grad (beta=0 for the
+# first write, beta=1 for later accumulation) instead of returning a tensor
+# that Megatron then adds in a separate kernel.
+_FUSED_WGRAD_ENV = "PRIMUS_TURBO_FUSED_WGRAD_ACCUM"
+_DUMMY_WGRAD_CACHE: dict = {}
+
+
+def _fused_wgrad_enabled() -> bool:
+    return os.environ.get(_FUSED_WGRAD_ENV, "0") == "1"
+
+
+def _resolve_main_grad_view(weight_param, target_shape):
+    """Return a contiguous ``main_grad`` view compatible with target_shape."""
+    if weight_param is None:
+        return None
+    main_grad = getattr(weight_param, "main_grad", None)
+    if main_grad is None or not main_grad.is_cuda or not main_grad.is_contiguous():
+        return None
+    if main_grad.numel() != reduce(mul, target_shape, 1):
+        return None
+    try:
+        return main_grad.view(target_shape)
+    except RuntimeError:
+        return None
+
+
+def _get_dummy_wgrad(shape, dtype, device):
+    """Reuse an uninitialized grad tensor whose data the DDP hook skips."""
+    key = (tuple(shape), dtype, device)
+    dummy = _DUMMY_WGRAD_CACHE.get(key)
+    if dummy is None:
+        dummy = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
+        _DUMMY_WGRAD_CACHE[key] = dummy
+    return dummy.detach()
+
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
     if format == Format.E4M3:
@@ -61,15 +98,6 @@ def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
     # Some upstream reductions can produce expanded zero-stride grad_out views.
     # Custom grouped GEMM kernels expect dense layouts.
     return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
-
-
-def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
-    if is_gfx942():
-        return False
-
-    # NOTE: the non-NT layout gemm is not optimized for mi350/mi450.
-    # Force to use NT layout GEMM in backward for now.
-    return trans_a == False and trans_b == True
 
 
 class FP8GroupedGemmBlockFunc(torch.autograd.Function):
@@ -413,7 +441,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
         a_t: Optional[QuantizedTensor],  # not used
-        b_t: Optional[QuantizedTensor],
+        b_t: Optional[QuantizedTensor],  # not used
         group_lens: torch.Tensor,  # [B,] int64
         group_offs: torch.Tensor,  # [B + 1,] int64
         trans_b: bool,
@@ -421,7 +449,13 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         config: Float8QuantConfig,
         num_cu: int | None,
     ):
-        use_nt_layout_gemm_in_bwd = _deter_use_nt_layout_gemm_in_bwd(False, trans_b)
+        # Kept for the fused wgrad path: b is a view of the expert-weight
+        # parameter that owns main_grad.
+        ctx.weight_param = None
+        ctx.weight_view_shape = None
+        if isinstance(b, torch.Tensor) and not isinstance(b, QuantizedTensor):
+            ctx.weight_param = b._base if b._base is not None else b
+            ctx.weight_view_shape = tuple(b.shape)
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
@@ -497,12 +531,6 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                 block_size=config.block_size,
             )
 
-        if use_nt_layout_gemm_in_bwd:
-            if b_t is not None and isinstance(b_t, QuantizedTensor):
-                quantized_b_t = b_t
-            else:
-                quantized_b_t = quantized_b.transpose(-1, -2).contiguous()
-
         out = grouped_gemm_fp8_impl(
             quantized_a.qdata,
             quantized_b.qdata,
@@ -519,27 +547,16 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             maybe_pre_sync=True,
         )
 
-        if use_nt_layout_gemm_in_bwd:
-            ctx.save_for_backward(
-                quantized_a.qdata,
-                quantized_b_t.qdata,
-                quantized_a.scale_inv,
-                quantized_b_t.scale_inv,
-                group_lens,
-                group_offs,
-            )
-        else:
-            ctx.save_for_backward(
-                quantized_a.qdata,
-                quantized_b.qdata,
-                quantized_a.scale_inv,
-                quantized_b.scale_inv,
-                group_lens,
-                group_offs,
-            )
+        ctx.save_for_backward(
+            quantized_a.qdata,
+            quantized_b.qdata,
+            quantized_a.scale_inv,
+            quantized_b.scale_inv,
+            group_lens,
+            group_offs,
+        )
         ctx.trans_a = False
         ctx.trans_b = trans_b
-        ctx.use_nt_layout_gemm_in_bwd = use_nt_layout_gemm_in_bwd
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
@@ -562,37 +579,65 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             group_lens=group_lens,
         )
 
-        if ctx.use_nt_layout_gemm_in_bwd:
-            # b_fp8 is the per-group (K, N) transpose cache; grad_a runs as NT.
-            grad_a = grouped_gemm_fp8_impl(
-                quantized_grad_out.qdata,
-                b_fp8,
-                quantized_grad_out.scale_inv,
-                b_scale_inv,
-                group_lens,
-                group_offs,
-                trans_a=False,
-                trans_b=True,
-                out_dtype=ctx.out_dtype,
-                granularity=ctx.config.granularity.value,
-                num_cu=ctx.num_cu,
-                default_backend=BackendType.TRITON.value,
-            )
-        else:
-            grad_a = grouped_gemm_fp8_impl(
-                quantized_grad_out.qdata,
-                b_fp8,
-                quantized_grad_out.scale_inv,
-                b_scale_inv,
-                group_lens,
-                group_offs,
-                trans_a=False,
-                trans_b=not ctx.trans_b,
-                out_dtype=ctx.out_dtype,
-                granularity=ctx.config.granularity.value,
-                num_cu=ctx.num_cu,
-                default_backend=BackendType.TRITON.value,
-            )
+        grad_a = grouped_gemm_fp8_impl(
+            quantized_grad_out.qdata,
+            b_fp8,
+            quantized_grad_out.scale_inv,
+            b_scale_inv,
+            group_lens,
+            group_offs,
+            trans_a=False,
+            trans_b=not ctx.trans_b,
+            out_dtype=ctx.out_dtype,
+            granularity=ctx.config.granularity.value,
+            num_cu=ctx.num_cu,
+            default_backend=BackendType.TRITON.value,
+        )
+
+        if _fused_wgrad_enabled():
+            weight_param = getattr(ctx, "weight_param", None)
+            weight_view_shape = getattr(ctx, "weight_view_shape", None)
+            if weight_param is not None and weight_view_shape is not None:
+                main_grad_view = _resolve_main_grad_view(weight_param, weight_view_shape)
+                if main_grad_view is not None:
+                    if ctx.trans_b:
+                        lhs_fp8, rhs_fp8 = quantized_grad_out.qdata, a_fp8
+                        lhs_scale, rhs_scale = quantized_grad_out.scale_inv, a_scale_inv
+                    else:
+                        lhs_fp8, rhs_fp8 = a_fp8, quantized_grad_out.qdata
+                        lhs_scale, rhs_scale = a_scale_inv, quantized_grad_out.scale_inv
+
+                    from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+                        grouped_gemm_fp8_tensorwise_variable_k_triton_kernel,
+                    )
+
+                    grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
+                        lhs_fp8,
+                        rhs_fp8,
+                        lhs_scale,
+                        rhs_scale,
+                        group_offs,
+                        out_dtype=ctx.out_dtype,
+                        out=main_grad_view,
+                        # The first microbatch can overwrite the zeroed
+                        # main_grad. Read it only when this parameter has
+                        # already accumulated a gradient in the current step.
+                        beta=(
+                            1.0
+                            if getattr(weight_param, "grad_added_to_main_grad", False)
+                            else 0.0
+                        ),
+                    )
+                    # Tells Megatron the gradient is already in main_grad.
+                    weight_param.grad_added_to_main_grad = True
+                    grad_b = _get_dummy_wgrad(
+                        weight_view_shape,
+                        dtype=ctx.out_dtype,
+                        device=main_grad_view.device,
+                    )
+                    if k_pad_real is not None:
+                        grad_a = grad_a[:, :k_pad_real].contiguous()
+                    return grad_a, grad_b, None, None, None, None, None, None, None, None
 
         grad_b = grouped_gemm_fp8_variable_k_impl(
             a_fp8,
