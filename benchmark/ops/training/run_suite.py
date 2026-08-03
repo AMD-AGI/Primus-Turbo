@@ -189,6 +189,8 @@ def launch_task(task, gpu_id, output_dir, script_dir, log_dir):
         env["HIP_VISIBLE_DEVICES"] = str(gpu_id)
     for k, v in task.get("env", {}).items():
         env[k] = str(v)
+    if gpu_id is not None and env.get("PRIMUS_TURBO_GEMM_BACKEND") == "FLYDSL":
+        env.setdefault("FLYDSL_RUNTIME_CACHE_DIR", f"/tmp/primus_flydsl_cache_gpu{gpu_id}")
 
     cmd = [sys.executable, os.path.join(script_dir, task["script"])]
     cmd += [str(a) for a in task.get("args", [])]
