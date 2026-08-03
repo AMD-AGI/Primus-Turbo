@@ -60,7 +60,6 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import _host_rendezvous
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K as _MXFP8_BLOCK_K,
     emit_gemm_mxfp8_nt_tile,
@@ -666,6 +665,14 @@ def _compile_reduce_only(
 _FP8_REDUCE_ONLY_COMPILED: dict = {}
 
 _L2Y_FP8_SCRATCH: dict = {}
+
+
+def _host_rendezvous(group) -> None:
+    """Cross-rank publish barrier: drain this rank's GPU work, then all-rank barrier, so a
+    scoreboard/flag reset is visible on every peer before any rank signals it. (Full mode;
+    the source op gates these behind PT_MEGA_BARRIER_MODE -- kept always-on here for safety.)"""
+    torch.cuda.synchronize()
+    group.barrier()
 
 
 def grouped_gemm_combine_mxfp8_flydsl_kernel(

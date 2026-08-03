@@ -568,14 +568,6 @@ def dispatch_grouped_gemm_mxfp8(
     return output
 
 
-def _host_rendezvous(group) -> None:
-    """Cross-rank publish barrier: drain this rank's GPU work, then all-rank barrier, so a
-    scoreboard/flag reset is visible on every peer before any rank signals it. (Full mode;
-    the source op gates these behind PT_MEGA_BARRIER_MODE -- kept always-on here for safety.)"""
-    torch.cuda.synchronize()
-    group.barrier()
-
-
 def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     x: torch.Tensor,
     w1q: torch.Tensor,
