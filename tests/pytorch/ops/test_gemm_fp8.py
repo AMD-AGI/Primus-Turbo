@@ -7,7 +7,6 @@
 import pytest
 import torch
 
-from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import shuffle_b
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     MXFP8_BLOCK_SIZE,
@@ -27,7 +26,6 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_dual_impl,
-    quant_fp8_blockwise_for_weight_dual_impl,
     quant_fp8_blockwise_for_weight_impl,
 )
 from primus_turbo.pytorch.ops import gemm_fp8
@@ -323,6 +321,156 @@ def test_gemm_fp8_blockwise_flydsl(m, n, k, layout, format, dtype, block_size, b
     )
 
 
+def test_gemm_fp8_blockwise_flydsl_routes_new_kernels():
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
+
+    from primus_turbo.flydsl.gemm.blockscale_fp8_gemm import (
+        _compiled_cache,
+        flydsl_blockwise_4wave_forward_supported,
+        select_blockscale_fp8_forward_kernel,
+    )
+
+    GlobalBackendManager.set_gemm_backend(BackendType.FLYDSL)
+    try:
+        _compiled_cache.clear()
+        m = n = k = 256
+        a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        config = Float8QuantConfig(
+            granularity=ScalingGranularity.BLOCKWISE,
+            format=Format.E4M3,
+            block_size=128,
+            scale_dtype=ScaleDtype.FP32,
+        )
+        gemm_fp8(a, b, False, True, torch.bfloat16, config).sum().backward()
+        torch.cuda.synchronize()
+        directions = {key[0] for key in _compiled_cache}
+        assert {"forward", "dgrad", "wgrad_normalized"} <= directions
+        assert flydsl_blockwise_4wave_forward_supported(4096, 202048, 5120)
+        assert flydsl_blockwise_4wave_forward_supported(32768, 128256, 4096)
+        assert select_blockscale_fp8_forward_kernel(4096, 202048, 5120)["family"] == "4wave"
+        assert select_blockscale_fp8_forward_kernel(16384, 16384, 53248) == {
+            "family": "8wave_3stage",
+            "fold_group_size": 5,
+            "interleave_width": 2,
+            "wait_delay_thunks": 8,
+            "scale_a_k_major": False,
+        }
+        assert select_blockscale_fp8_forward_kernel(8192, 8192, 29568) == {
+            "family": "4wave",
+            "block_m": 128,
+            "fold_group_size": 6,
+            "k_loop_unroll": 6,
+            "scale_a_k_major": True,
+        }
+        assert select_blockscale_fp8_forward_kernel(16384, 37888, 3584) == {
+            "family": "8wave_3stage",
+            "fold_group_size": 4,
+            "interleave_width": 1,
+            "wait_delay_thunks": 0,
+            "scale_a_k_major": True,
+            "group_m": 1,
+        }
+        assert select_blockscale_fp8_forward_kernel(65536, 28672, 4096) == {
+            "family": "8wave_3stage",
+            "fold_group_size": 8,
+            "interleave_width": 1,
+            "wait_delay_thunks": 0,
+            "scale_a_k_major": True,
+            "group_m": 2,
+        }
+        assert select_blockscale_fp8_forward_kernel(49152, 12288, 4096)["family"] == "4wave"
+        assert select_blockscale_fp8_forward_kernel(24576, 106496, 16384)["family"] == "8wave_3stage"
+    finally:
+        GlobalBackendManager.reset()
+
+
+def test_gemm_fp8_blockwise_flydsl_8wave_3stage_poc():
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
+
+    import flydsl.compiler as flyc
+
+    from primus_turbo.flydsl.gemm.blockscale_fp8_gemm import (
+        compile_blockscale_fp8_gemm_4w,
+        compile_blockscale_fp8_gemm_8w_3stage,
+    )
+
+    m, n, k = 256, 128, 640
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(97)
+    a = (torch.randn((m, k), device="cuda", generator=generator) * 0.25).to(torch.float8_e4m3fn)
+    b = (torch.randn((n, k), device="cuda", generator=generator) * 0.25).to(torch.float8_e4m3fn)
+    scale_a = torch.rand((m, k // 128), device="cuda", generator=generator)
+    scale_b = torch.rand((n // 128, k // 128), device="cuda", generator=generator)
+    c4 = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    c8 = torch.empty_like(c4)
+    stream = torch.cuda.current_stream()
+    base = (a.view(torch.int8).view(-1), b.view(torch.int8).view(-1))
+    args4 = base + (c4.view(-1), scale_a.view(-1), scale_b.view(-1), m, n, stream)
+    args8 = base + (c8.view(-1), scale_a.view(-1), scale_b.view(-1), m, n, stream)
+    fn4 = flyc.compile(
+        compile_blockscale_fp8_gemm_4w(K=k, M=m, N=n, scale_a_k_major=False),
+        *args4,
+    )
+    fn8 = flyc.compile(compile_blockscale_fp8_gemm_8w_3stage(K=k, M=m, N=n), *args8)
+    fn4(*args4)
+    fn8(*args8)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c8, c4, rtol=0, atol=0)
+
+
+def test_gemm_fp8_blockwise_flydsl_4wave_unroll6():
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
+
+    import flydsl.compiler as flyc
+
+    from primus_turbo.flydsl.gemm.blockscale_fp8_gemm import compile_blockscale_fp8_gemm_4w
+
+    m = n = 256
+    k = 1152
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(101)
+    a = (torch.randn((m, k), device="cuda", generator=generator) * 0.25).to(torch.float8_e4m3fn)
+    b = (torch.randn((n, k), device="cuda", generator=generator) * 0.25).to(torch.float8_e4m3fn)
+    scale_a = torch.rand((m, k // 128), device="cuda", generator=generator)
+    scale_b = torch.rand((n // 128, k // 128), device="cuda", generator=generator)
+    c2 = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    c6 = torch.empty_like(c2)
+    stream = torch.cuda.current_stream()
+    base = (a.view(torch.int8).view(-1), b.view(torch.int8).view(-1))
+    args2 = base + (c2.view(-1), scale_a.view(-1), scale_b.view(-1), m, n, stream)
+    args6 = base + (c6.view(-1), scale_a.view(-1), scale_b.view(-1), m, n, stream)
+    fn2 = flyc.compile(
+        compile_blockscale_fp8_gemm_4w(
+            K=k,
+            M=m,
+            N=n,
+            scale_a_k_major=False,
+            fold_group_size=6,
+            k_loop_unroll=2,
+        ),
+        *args2,
+    )
+    fn6 = flyc.compile(
+        compile_blockscale_fp8_gemm_4w(
+            K=k,
+            M=m,
+            N=n,
+            scale_a_k_major=False,
+            fold_group_size=6,
+            k_loop_unroll=6,
+        ),
+        *args6,
+    )
+    fn2(*args2)
+    fn6(*args6)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c6, c2, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("m", [256, 512])
 @pytest.mark.parametrize("n", [512, 1024])
 @pytest.mark.parametrize("k", [256, 1024])
@@ -368,17 +516,17 @@ def test_flydsl_blockwise_quant_layouts_byte_exact():
 
     x = torch.randn((384, 192), dtype=torch.bfloat16, device="cuda")
     plain = quant_fp8_blockwise_dual_impl(x, float8_e4m3, 128)
+    kmajor = quant_fp8_blockwise_dual_impl(
+        x,
+        float8_e4m3,
+        128,
+        row_scale_transposed=True,
+    )
     transposed = quant_fp8_blockwise_dual_impl(
         x,
         float8_e4m3,
         128,
         col_transposed=True,
-    )
-    preshuffled = quant_fp8_blockwise_dual_impl(
-        x,
-        float8_e4m3,
-        128,
-        col_preshuffled=True,
     )
     row_padded = quant_fp8_blockwise_dual_impl(
         x,
@@ -391,15 +539,10 @@ def test_flydsl_blockwise_quant_layouts_byte_exact():
     torch.testing.assert_close(transposed[1], plain[1], rtol=0, atol=0)
     torch.testing.assert_close(transposed[2].T, plain[2], rtol=0, atol=0)
     torch.testing.assert_close(transposed[3], plain[3], rtol=0, atol=0)
-
-    expected_col_preshuffled = shuffle_b(plain[2].T.contiguous())
-    torch.testing.assert_close(
-        preshuffled[2].reshape_as(expected_col_preshuffled),
-        expected_col_preshuffled,
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(preshuffled[3], plain[3].T.contiguous(), rtol=0, atol=0)
+    torch.testing.assert_close(kmajor[0], plain[0], rtol=0, atol=0)
+    torch.testing.assert_close(kmajor[1], plain[1].T.contiguous(), rtol=0, atol=0)
+    torch.testing.assert_close(kmajor[2], plain[2], rtol=0, atol=0)
+    torch.testing.assert_close(kmajor[3], plain[3], rtol=0, atol=0)
 
     assert row_padded[0].shape == (384, 256)
     torch.testing.assert_close(row_padded[0][:, :192], plain[0], rtol=0, atol=0)
@@ -409,43 +552,19 @@ def test_flydsl_blockwise_quant_layouts_byte_exact():
     torch.testing.assert_close(row_padded[3], plain[3], rtol=0, atol=0)
 
 
-def test_flydsl_blockwise_weight_layouts_byte_exact():
+def test_flydsl_blockwise_row_scale_compatibility():
     if get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
 
-    weight = torch.randn((192, 256), dtype=torch.bfloat16, device="cuda")
-    plain_ref, scale_ref = quant_fp8_blockwise_for_weight_impl(
-        weight,
-        float8_e4m3,
-        block_size=128,
-    )
-    plain, forward_preshuffled, dgrad_preshuffled, scale = quant_fp8_blockwise_for_weight_dual_impl(
-        weight,
-        float8_e4m3,
-        block_size=128,
-        emit_dgrad_ps=True,
-        pad_dgrad_m=True,
-    )
+    from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl
 
-    torch.testing.assert_close(plain, plain_ref, rtol=0, atol=0)
-    torch.testing.assert_close(scale, scale_ref, rtol=0, atol=0)
-    torch.testing.assert_close(
-        forward_preshuffled,
-        shuffle_b(plain),
-        rtol=0,
-        atol=0,
-    )
-
-    plain_padded = plain.new_zeros((256, 256))
-    plain_padded[:192] = plain
-    expected_dgrad_preshuffled = shuffle_b(plain_padded.T.contiguous())
-    assert dgrad_preshuffled.shape == (256, 256)
-    torch.testing.assert_close(
-        dgrad_preshuffled.reshape_as(expected_dgrad_preshuffled),
-        expected_dgrad_preshuffled,
-        rtol=0,
-        atol=0,
-    )
+    a = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda")
+    a_fp8, a_scale, _, _ = quant_fp8_blockwise_dual_impl(a, float8_e4m3, 128)
+    b_fp8, b_scale = quant_fp8_blockwise_for_weight_impl(b, float8_e4m3, 128)
+    out_row_scale = gemm_fp8_blockwise_flydsl(a_fp8, b_fp8, a_scale, b_scale)
+    out_kmajor_scale = gemm_fp8_blockwise_flydsl(a_fp8, b_fp8, a_scale.T.contiguous(), b_scale)
+    torch.testing.assert_close(out_row_scale, out_kmajor_scale, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("m", [176, 256, 512, 1024])

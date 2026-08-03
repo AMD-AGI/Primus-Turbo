@@ -241,7 +241,7 @@ def swizzle_128(row, col, width=128):
     return row, col ^ (lds_row_swizzle(row, width // 16) * 16)
 
 
-def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
+def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled=False):
     offsets = []
     n_waves = fx.block_dim.x // 64
     for round in range_constexpr(n_rounds):
@@ -338,6 +338,12 @@ class G2SLoader:
             dst = self._lds_dst_at(lds_dst, step, base_off)
             fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
 
+    def load_one(self, lds_dst, k_offset, step, base_off=None):
+        src_div, soff = self._src_div(k_offset)
+        src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
+        dst = self._lds_dst_at(lds_dst, step, base_off)
+        fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
+
 
 def pack_i32x4_i32x8(lo, hi):
     # Pack two i32x4 as one i32x8
@@ -378,6 +384,9 @@ class S2RLoader(_S2RLoaderBase):
                 halves.append(v.bitcast(fx.Int32))
             frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
         return frag
+
+    def load_one(self, lds_src, lds_offset):
+        return self._vec_load_16xf8(lds_src, lds_offset).bitcast(fx.Int32)
 
     def base_addr(self, lds_src, preshuffled=False):
         """Per-lane LDS byte address pairs for the bare-asm whole-loop: mirrors `load()`'s
@@ -2161,314 +2170,3 @@ class StoreCBf16:
             for r in range_constexpr(4):
                 m = base_m + ti * 16 + m_hi + r
                 self._store_masked(acc[r], row_base + m, n_valid)
-
-
-def _as_i32_index(v):
-    """Coerce a scalar coordinate/index to an i32 ``ir.Value`` (or leave a Python int).
-
-    flydsl>=0.2 canonicalizes int-tuple / coord scalars to i32; a raw ``index``
-    input gets widened to i64 internally, which then clashes with the i32 coords
-    that ``_index_to_coordinate`` emits (``extsi i64 -> i32`` cast). Coercing the input to i32
-    up front keeps the whole int-tuple pipeline at a single width.
-    """
-    if isinstance(v, int):
-        return v
-    raw = arith.unwrap(v)
-    if not isinstance(raw, ir.Value):
-        return v
-    ty = raw.type
-    if isinstance(ty, ir.IndexType):
-        return fx.Int32(arith.IndexCastOp(T.i32, raw).result)
-    if isinstance(ty, ir.IntegerType) and ty.width != 32:
-        if ty.width > 32:
-            return fx.Int32(arith.TruncIOp(T.i32, raw).result)
-        return fx.Int32(arith.ExtSIOp(T.i32, raw).result)
-    return fx.Int32(raw)
-
-
-def _index_to_coordinate(index, layout):
-    """``fx.idx2crd`` with the linear index normalized to i32."""
-    return fx.idx2crd(_as_i32_index(index), layout)
-
-
-def _normalize_coordinate(crd):
-    """Coerce coordinate leaves so flydsl>=0.2 ``make_int_tuple`` accepts them.
-
-    In flydsl>=0.2 ``fly.make_int_tuple`` only accepts i32 / i64 operands, and
-    its leaf expander widens a *raw* ``index``-typed ``ir.Value`` to ``Int64``
-    but NOT a ``Numeric`` wrapper (e.g. ``fx.Index``), which is ``index``-typed
-    and width 64 -> it passes the raw ``index`` value straight through and the op
-    verifier rejects it. Recursively rewrap any ``index``-typed leaf as ``Int64``
-    (Python ints and non-index numerics are left untouched).
-    """
-    if isinstance(crd, (list, tuple)):
-        return tuple(_normalize_coordinate(c) for c in crd)
-    # Static Python ints stay static (flydsl folds them as constants).
-    if isinstance(crd, int):
-        return crd
-    # Static DSL numeric wrappers (Python-int-backed) -> hand back the raw int so
-    # flydsl folds it as a constant. NOTE ``is_static`` is a *method* on the
-    # Numeric wrappers, not a property, so it must be called.
-    is_static = getattr(crd, "is_static", None)
-    if callable(is_static):
-        try:
-            if is_static():
-                v = getattr(crd, "value", crd)
-                if isinstance(v, int):
-                    return v
-        except Exception:
-            pass
-    # Dynamic leaf: unwrap to a raw ``ir.Value`` and normalize every dynamic
-    # coordinate to a single i32 width. flydsl>=0.2's ``make_int_tuple`` rejects
-    # ``index``-typed operands, and its expander widens a raw index value to i64
-    # while other leaves (``ArithValue``) may already be i32 -> mixing widths
-    # trips a coord*stride APInt / ``extsi`` verifier failure. Coercing all
-    # dynamic leaves to i32 keeps the width uniform.
-    raw = arith.unwrap(crd)
-    if not isinstance(raw, ir.Value):
-        return crd
-    ty = raw.type
-    if isinstance(ty, ir.IndexType):
-        return fx.Int32(arith.IndexCastOp(T.i32, raw).result)
-    if isinstance(ty, ir.IntegerType) and ty.width != 32:
-        if ty.width > 32:
-            return fx.Int32(arith.TruncIOp(T.i32, raw).result)
-        return fx.Int32(arith.ExtSIOp(T.i32, raw).result)
-    return fx.Int32(raw)
-
-
-def _coordinate_to_index(crd, layout):
-    """Return ``fx.crd2idx`` as a raw index-typed ``ir.Value``.
-
-    flydsl >= 0.2 has ``get_scalar`` return a DSL numeric wrapper (``Int32`` /
-    ``ArithValue``) or a static Python int rather than a raw ``ir.Value``.
-    Raw MLIR arith ops (``shrui`` etc.) consumed downstream require an
-    ``ir.Value``, so unwrap here (materializing Python ints as constants) and
-    normalize to index type.
-    """
-    crd = _normalize_coordinate(crd)
-    result = fx.crd2idx(crd, layout)
-    scalar = fx.get_scalar(result)
-    scalar = arith.unwrap(scalar)
-    if not isinstance(scalar.type, ir.IndexType):
-        scalar = arith.IndexCastOp(T.index, scalar).result
-    return scalar
-
-
-def _swizzle_k_16b(row, col, k_blocks16):
-    """XOR-with-row swizzle on the K dimension at 16B granularity.
-
-    Computes: col XOR ((row & (k_blocks16 - 1)) * 16)
-
-    k_blocks16 is always a power of 2 (tile_k_bytes / 16), so use
-    bitwise AND instead of remui to save ~10 VALU cycles on CDNA.
-    """
-    from flydsl.expr import arith as _swz_arith
-
-    mask = k_blocks16 - _swz_arith.index(1)
-    rem = _swz_arith.andi(row, mask)
-    return col ^ (rem * 16)
-
-
-def _load_buffer_vector(
-    buffer_ops,
-    vector,
-    rsrc,
-    idx,
-    *,
-    elem_type,
-    vec_elems,
-    elem_bytes,
-    offset_in_bytes,
-    cache_modifier=0,
-):
-    """Load vec_elems elements via buffer_load dwordx[1,2,4] + bitcast."""
-    from flydsl.expr import arith as _ld_arith
-
-    elem_size = int(elem_bytes)
-    load_bytes = int(vec_elems) * elem_size
-    vec_width = load_bytes // 4
-
-    if offset_in_bytes:
-        idx_i32 = _ld_arith.shrui(_ld_arith.unwrap(idx), _ld_arith.unwrap(_ld_arith.index(2)))
-    elif elem_bytes == 2:
-        idx_i32 = _ld_arith.shrui(_ld_arith.unwrap(idx), _ld_arith.unwrap(_ld_arith.index(1)))
-    else:
-        idx_i32 = idx
-
-    i32_val = buffer_ops.buffer_load(
-        rsrc,
-        idx_i32,
-        vec_width=vec_width,
-        dtype=T.i32,
-        cache_modifier=cache_modifier,
-    )
-    if vec_width == 1:
-        i32_vec = vector.from_elements(T.vec(1, T.i32), [i32_val])
-    else:
-        i32_vec = i32_val
-    return vector.bitcast(T.vec(int(vec_elems), elem_type), i32_vec)
-
-
-def _schedule_block2d_iteration(
-    rocdl,
-    range_constexpr,
-    const_expr,
-    *,
-    sche_iters: int,
-    mfma_group: int,
-    dswr_start: int,
-):
-    """Finer quarter-iteration ping/pong schedule for the block2d (fwd / dgrad) hot loop.
-
-    Emits the SAME per-iteration scheduling-hint counts as the coarse stream
-    (``sched_vmem(1)``, a total of ``2 * mfma_group`` ``sched_mfma`` hints,
-    ``sched_dsrd(1)``, optional ``sched_dswr(1)``), but splits the matrix work into
-    FOUR ``s_setprio``-bracketed ``sched_mfma`` sub-groups (``g_lo, g_hi, g_lo, g_hi``
-    with ``g_lo = mfma_group // 2`` and ``g_hi = mfma_group - g_lo``, so the four sum
-    to exactly ``2 * mfma_group``) instead of two coarse ``mfma_group`` sub-groups.
-    The next-tile VMEM (B / scale) load, the current-tile DS-read, and the optional
-    DS-write hint are interleaved BETWEEN those finer sub-groups, pushing the LDS-read
-    and fp32 block-scale bookkeeping VALU (block2d VALU is ~69% of insts vs ~12% MFMA)
-    deeper into the matrix-unit shadow and tightening MFMA issue cadence, which raises
-    MFMA busy fraction.
-
-    This is a pure scheduling / priority hint stream: it emits no data ops and no
-    waitcnt, so the GEMM result is bit-identical to the coarse schedule. When
-    ``mfma_group < 2`` (cannot be halved) the function falls back to the coarse
-    two-sub-group ping/pong so ``sched_mfma(0)`` is never emitted.
-    """
-    g_lo = mfma_group // 2
-    g_hi = mfma_group - g_lo
-    for sche_i in range_constexpr(sche_iters):
-        rocdl.sched_vmem(1)
-        if const_expr(mfma_group >= 2):
-            # quarter-iteration 1
-            rocdl.s_setprio(1)
-            rocdl.sched_mfma(g_lo)
-            rocdl.s_setprio(0)
-            # quarter-iteration 2
-            rocdl.s_setprio(1)
-            rocdl.sched_mfma(g_hi)
-            rocdl.s_setprio(0)
-            rocdl.sched_dsrd(1)
-            # quarter-iteration 3
-            rocdl.s_setprio(1)
-            rocdl.sched_mfma(g_lo)
-            rocdl.s_setprio(0)
-            if const_expr(sche_i >= dswr_start - 1):
-                rocdl.sched_dswr(1)
-            # quarter-iteration 4
-            rocdl.s_setprio(1)
-            rocdl.sched_mfma(g_hi)
-            rocdl.s_setprio(0)
-        else:
-            # mfma_group < 2: coarse two-sub-group ping/pong (no half split)
-            rocdl.s_setprio(1)
-            rocdl.sched_mfma(mfma_group)
-            rocdl.s_setprio(0)
-            rocdl.sched_dsrd(1)
-            rocdl.s_setprio(1)
-            rocdl.sched_mfma(mfma_group)
-            rocdl.s_setprio(0)
-            if const_expr(sche_i >= dswr_start - 1):
-                rocdl.sched_dswr(1)
-
-
-def _tile_chunk_coordinate(
-    arith,
-    *,
-    tx_i32_base: ir.Value,
-    i: int,
-    total_threads: int,
-    layout_tile_div4,
-    chunk_i32: int = 4,
-):
-    """Map (thread, chunk_id) -> (row_local, col_local_i32) for X/A loads."""
-    if chunk_i32 not in (1, 2, 4):
-        raise ValueError(f"chunk_i32 must be one of (1,2,4), got {chunk_i32!r}")
-    chunk_off_i32 = arith.constant(i * total_threads * chunk_i32, index=True)
-    tile_idx_i32 = tx_i32_base + chunk_off_i32
-    coord_local = _index_to_coordinate(tile_idx_i32, layout_tile_div4)
-    row_local = fx.get(coord_local, 0)
-    col_local_i32 = fx.get(coord_local, 1)
-    return row_local, col_local_i32
-
-
-def _load_global_fp8x16(
-    buffer_ops,
-    vector,
-    *,
-    elem_type,
-    idx_i32: ir.Value,
-    rsrc,
-    vec_elems: int = 16,
-    elem_bytes: int = 1,
-):
-    """Copy 16 bytes from global memory into regs via buffer-load dwordx4 lowering."""
-    if int(vec_elems) <= 0:
-        raise ValueError(f"vec_elems must be > 0, got {vec_elems!r}")
-    return _load_buffer_vector(
-        buffer_ops,
-        vector,
-        rsrc,
-        idx_i32,
-        elem_type=elem_type,
-        vec_elems=vec_elems,
-        elem_bytes=elem_bytes,
-        offset_in_bytes=False,
-    )
-
-
-def _store_lds_fp8x16(
-    arith,
-    vector,
-    *,
-    lds_memref,
-    vec16_ty,
-    layout_lds,
-    row_local: ir.Value,
-    col_local_i32: ir.Value,
-    tx_c4: ir.Value,
-    k_blocks16: ir.Value,
-    lds_base: ir.Value,
-    vec_part_i32x4: ir.Value,
-    elem_bytes: int = 1,
-):
-    """Store one 16B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
-    if elem_bytes not in (1, 2):
-        raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
-    col_local_bytes = col_local_i32 * tx_c4
-    col_swz_bytes = _swizzle_k_16b(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
-    coord_store = (row_local, col_swz)
-    idx0 = _coordinate_to_index(coord_store, layout_lds) + lds_base
-    v16 = vector.bitcast(vec16_ty, vec_part_i32x4)
-    vector.store(v16, lds_memref, [idx0])
-
-
-def _store_lds_fp8x8(
-    arith,
-    vector,
-    *,
-    lds_memref,
-    vec8_ty,
-    layout_lds,
-    row_local: ir.Value,
-    col_local_i32: ir.Value,
-    tx_c4: ir.Value,
-    k_blocks16: ir.Value,
-    lds_base: ir.Value,
-    vec_part_i32x2: ir.Value,
-    elem_bytes: int = 1,
-):
-    """Store one 8B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
-    if elem_bytes not in (1, 2):
-        raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
-    col_local_bytes = col_local_i32 * tx_c4
-    col_swz_bytes = _swizzle_k_16b(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
-    coord_store = (row_local, col_swz)
-    idx0 = _coordinate_to_index(coord_store, layout_lds) + lds_base
-    v8 = vector.bitcast(vec8_ty, vec_part_i32x2)
-    vector.store(v8, lds_memref, [idx0])

@@ -28,7 +28,6 @@ from primus_turbo.triton.quantization.quant_blockwise import (
     dequant_fp8_blockwise_for_weight_kernel,
     dequant_fp8_blockwise_kernel,
     quant_fp8_blockwise_dual_kernel,
-    quant_fp8_blockwise_for_weight_dual_kernel,
     quant_fp8_blockwise_for_weight_kernel,
     quant_fp8_blockwise_kernel,
     quant_fp8_blockwise_segment_m_row_col_kernel,
@@ -239,19 +238,15 @@ def _blockwise_dual_output_shapes(
     N,
     block_size: int,
     col_transposed: bool,
-    col_preshuffled: bool,
     row_pad_to_block: bool,
+    row_scale_transposed: bool,
 ):
     row_n = ceil_div(N, block_size) * block_size if row_pad_to_block else N
     row_shape = (M, row_n)
-    row_scale_shape = (M, ceil_div(N, block_size))
-    col_scale_shape = (N, ceil_div(M, block_size)) if col_preshuffled else (ceil_div(M, block_size), N)
-    if col_preshuffled:
-        col_shape = (M, N)
-    elif col_transposed:
-        col_shape = (N, M)
-    else:
-        col_shape = (M, N)
+    row_blocks = ceil_div(N, block_size)
+    row_scale_shape = (row_blocks, M) if row_scale_transposed else (M, row_blocks)
+    col_scale_shape = (ceil_div(M, block_size), N)
+    col_shape = (N, M) if col_transposed else (M, N)
     return row_shape, row_scale_shape, col_shape, col_scale_shape
 
 
@@ -261,8 +256,8 @@ def quant_fp8_blockwise_dual_impl(
     dtype: torch.dtype,
     block_size: int = 128,
     col_transposed: bool = False,
-    col_preshuffled: bool = False,
     row_pad_to_block: bool = False,
+    row_scale_transposed: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor in both blockwise row and column modes in one pass.
 
@@ -273,16 +268,14 @@ def quant_fp8_blockwise_dual_impl(
     separate elementwise transpose-copy. The col-scale shape ``[M//128, N]`` is
     unchanged. The row output and row scale are unaffected.
 
-    When ``col_preshuffled`` is True the column-quantized FP8 output is stored
-    directly in the FlyDSL (16, 16) MFMA preshuffled+transposed operand layout
-    and the col-scale is stored transposed ``[N, M//128]``, so the wgrad
-    launcher's standalone preshuffle copy + scale transpose collapse to zero-cost
-    views. The two flags are mutually exclusive.
-
     When ``row_pad_to_block`` is True, the row-quantized output's trailing
     dimension is extended to a block boundary. The existing final block scale
     covers the zero-filled suffix, so dgrad can consume a contraction length
     divisible by ``block_size`` without another tensor copy.
+
+    When ``row_scale_transposed`` is True, row scales are written directly as
+    ``[ceil(N / block_size), M]``. The scale values are unchanged; this layout
+    gives the FlyDSL forward GEMM contiguous row-scale vectors for each K block.
 
     NOTE: This op is registered as ``torch.library.custom_op`` (opaque to
     inductor) instead of ``triton_op`` + ``wrap_triton``. On the AMD MI300
@@ -298,12 +291,8 @@ def quant_fp8_blockwise_dual_impl(
     used by ``quant_fp8_blockwise_impl`` and
     ``quant_fp8_blockwise_for_weight_impl``.
     """
-    if col_transposed and col_preshuffled:
-        raise ValueError("col_transposed and col_preshuffled are mutually exclusive")
     if x.dim() != 2 or not x.is_contiguous():
         raise ValueError("input must be a contiguous 2D tensor")
-    if col_preshuffled and (block_size != 128 or x.shape[1] % 16 != 0 or x.shape[0] % 32 != 0):
-        raise ValueError("col_preshuffled requires block_size=128, N divisible by 16, and M divisible by 32")
 
     M, N = x.shape
     row_shape, row_scales_shape, col_fp8_shape, col_scales_shape = _blockwise_dual_output_shapes(
@@ -311,8 +300,8 @@ def quant_fp8_blockwise_dual_impl(
         N,
         block_size,
         col_transposed,
-        col_preshuffled,
         row_pad_to_block,
+        row_scale_transposed,
     )
 
     x_fp8_row = torch.empty(row_shape, dtype=dtype, device=x.device)
@@ -333,7 +322,7 @@ def quant_fp8_blockwise_dual_impl(
         block_size,
         torch.finfo(dtype).max,
         COL_TRANSPOSED=col_transposed,
-        COL_PRESHUFFLED=col_preshuffled,
+        ROW_SCALE_TRANSPOSED=row_scale_transposed,
     )
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 
@@ -344,21 +333,19 @@ def quant_fp8_blockwise_dual_impl_meta(
     dtype: torch.dtype,
     block_size: int = 128,
     col_transposed: bool = False,
-    col_preshuffled: bool = False,
     row_pad_to_block: bool = False,
+    row_scale_transposed: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError("input must be 2D")
-    if col_transposed and col_preshuffled:
-        raise ValueError("col_transposed and col_preshuffled are mutually exclusive")
     M, N = x.shape
     row_shape, row_scales_shape, col_fp8_shape, col_scales_shape = _blockwise_dual_output_shapes(
         M,
         N,
         block_size,
         col_transposed,
-        col_preshuffled,
         row_pad_to_block,
+        row_scale_transposed,
     )
     x_fp8_row = torch.empty(row_shape, dtype=dtype, device=x.device)
     x_scales_row = torch.empty(row_scales_shape, dtype=torch.float32, device=x.device)
@@ -449,128 +436,6 @@ def quant_fp8_blockwise_for_weight_impl_meta(
         w_fp8 = w_fp8.squeeze(0)
         w_scales = w_scales.squeeze(0)
     return w_fp8, w_scales
-
-
-def _weight_dual_output_shapes(
-    M,
-    N,
-    block_size: int,
-    emit_dgrad_ps: bool,
-    pad_dgrad_m: bool,
-):
-    dgrad_m = ceil_div(M, block_size) * block_size if pad_dgrad_m else M
-    dgrad_shape = (dgrad_m, N) if emit_dgrad_ps else (1,)
-    scale_shape = (ceil_div(M, block_size), ceil_div(N, block_size))
-    return (M, N), (M, N), dgrad_shape, scale_shape
-
-
-@torch.library.custom_op("primus_turbo::quant_fp8_blockwise_for_weight_dual_impl", mutates_args=())
-def quant_fp8_blockwise_for_weight_dual_impl(
-    w: torch.Tensor,
-    dtype: torch.dtype,
-    block_size: int = 128,
-    emit_dgrad_ps: bool = False,
-    pad_dgrad_m: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """2D blockwise weight quant emitting plain + fwd-preshuffled (+ optional dgrad
-    transposed-preshuffle) FP8 in one pass.
-
-    Returns ``(w_fp8, w_fp8_ps, w_fp8_dgrad_ps, w_scales)`` where:
-      - ``w_fp8``          : plain block2d FP8 [M, N]   (for ctx)
-      - ``w_fp8_ps``       : forward (16, 16) MFMA pre-shuffled FP8 [M, N],
-                             byte-identical to ``shuffle_b(w_fp8)`` (consumed
-                             directly by the FlyDSL forward GEMM)
-      - ``w_fp8_dgrad_ps`` : dgrad (NN) transposed-preshuffle FP8
-                             [ceil(M / block) * block, N] buffer when
-                             ``pad_dgrad_m`` is enabled
-                             holding the bytes of ``_shuffle_b_transposed(w_fp8)``
-                             (== ``shuffle_b(w_fp8.transpose(0, 1))``), consumed by
-                             the FlyDSL dgrad GEMM, folding away its standalone
-                             per-backward ``_preshuffle_b_transposed_kernel``. Only
-                             materialized when ``emit_dgrad_ps`` is True; otherwise a
-                             1-element placeholder.
-      - ``w_scales``       : per-block scale [M // block, N // block] fp32 (layout
-                             unchanged vs the plain weight quant)
-
-    Triton-only (the HIP C++ fast path has no pre-shuffled store), 2D weights only.
-    """
-    if w.dim() != 2:
-        raise ValueError("input must be 2D")
-    if not w.is_contiguous():
-        w = w.contiguous()
-    if block_size != 128 or w.shape[0] % 16 != 0 or w.shape[1] % 32 != 0:
-        raise ValueError(
-            "weight preshuffle requires block_size=128, M divisible by 16, and N divisible by 32"
-        )
-    if pad_dgrad_m and not emit_dgrad_ps:
-        raise ValueError("pad_dgrad_m requires emit_dgrad_ps=True")
-
-    M, N = w.shape
-    plain_shape, fwd_shape, dgrad_shape, scale_shape = _weight_dual_output_shapes(
-        M,
-        N,
-        block_size,
-        emit_dgrad_ps,
-        pad_dgrad_m,
-    )
-    w_fp8 = torch.empty(plain_shape, dtype=dtype, device=w.device)
-    w_fp8_ps = torch.empty(fwd_shape, dtype=dtype, device=w.device)
-    w_fp8_dgrad_ps = torch.empty(dgrad_shape, dtype=dtype, device=w.device)
-    w_scales = torch.empty(
-        scale_shape,
-        dtype=torch.float32,
-        device=w.device,
-    )
-    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    quant_fp8_blockwise_for_weight_dual_kernel[grid](
-        w,
-        w_fp8,
-        w_fp8_ps,
-        w_fp8_dgrad_ps,
-        w_scales,
-        M,
-        N,
-        dgrad_shape[0],
-        block_size,
-        torch.finfo(dtype).max,
-        EMIT_DGRAD_PS=emit_dgrad_ps,
-        # num_warps=8 gives enough resident warps to issue the three FP8 stores
-        # (plain + fwd-PS + dgrad-PS) concurrently rather than serialize them on
-        # the forward weight-quant critical path.
-        num_warps=8,
-    )
-    return w_fp8, w_fp8_ps, w_fp8_dgrad_ps, w_scales
-
-
-@quant_fp8_blockwise_for_weight_dual_impl.register_fake
-def quant_fp8_blockwise_for_weight_dual_impl_meta(
-    w: torch.Tensor,
-    dtype: torch.dtype,
-    block_size: int = 128,
-    emit_dgrad_ps: bool = False,
-    pad_dgrad_m: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if w.dim() != 2:
-        raise ValueError("input must be 2D")
-    if pad_dgrad_m and not emit_dgrad_ps:
-        raise ValueError("pad_dgrad_m requires emit_dgrad_ps=True")
-    M, N = w.shape
-    plain_shape, fwd_shape, dgrad_shape, scale_shape = _weight_dual_output_shapes(
-        M,
-        N,
-        block_size,
-        emit_dgrad_ps,
-        pad_dgrad_m,
-    )
-    w_fp8 = torch.empty(plain_shape, dtype=dtype, device=w.device)
-    w_fp8_ps = torch.empty(fwd_shape, dtype=dtype, device=w.device)
-    w_fp8_dgrad_ps = torch.empty(dgrad_shape, dtype=dtype, device=w.device)
-    w_scales = torch.empty(
-        scale_shape,
-        dtype=torch.float32,
-        device=w.device,
-    )
-    return w_fp8, w_fp8_ps, w_fp8_dgrad_ps, w_scales
 
 
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_segment_m_row_col_impl", mutates_args=())
