@@ -128,6 +128,13 @@ def compile_blockwise_fp8_weight_quant(M: int, N: int):
                     scale_rsrc,
                     block_m * I32(N_BLOCKS) + block_n,
                 )
+        _llvm.inline_asm(
+            res=None,
+            operands_=[],
+            asm_string="s_waitcnt lgkmcnt(0)",
+            constraints="",
+            has_side_effects=True,
+        )
         rocdl.s_barrier()
         qscale = fx.memref_load(quant_scale, 0)
 
@@ -141,6 +148,7 @@ def compile_blockwise_fp8_weight_quant(M: int, N: int):
             tile_ptr = fx.add_offset(tile.ptr, fx.make_int_tuple(local_linear))
             values = Vec(fx.make_view(tile_ptr, fx.make_layout(VEC, 1)).load()).to(F32)
             values = values * qscale
+            packed_words = []
             for word_index in range_constexpr(VEC // 4):
                 base = word_index * 4
                 packed = I32(
@@ -161,13 +169,14 @@ def compile_blockwise_fp8_weight_quant(M: int, N: int):
                         1,
                     )
                 )
-                bo.buffer_store(
-                    packed,
-                    q_rsrc,
-                    global_row * I32(N) + global_col + I32(base),
-                    mask=valid,
-                    offset_is_bytes=True,
-                )
+                packed_words.append(packed)
+            bo.buffer_store(
+                Vec.from_elements(packed_words, fx.Int32).ir_value(),
+                q_rsrc,
+                global_row * I32(N) + global_col,
+                mask=valid,
+                offset_is_bytes=True,
+            )
 
     @flyc.jit
     def launch(x: fx.Tensor, q: fx.Tensor, scale: fx.Tensor, stream: fx.Stream):
