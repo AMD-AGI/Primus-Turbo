@@ -235,6 +235,7 @@ def build_flash_attn_bwd_dkdv_module(
     # g2d: GEMM2 transpose-read prefetch depth (ring across dt). Depth-1 wins -- a deeper
     # ring's extra live transpose-reads outweigh the latency it hides on this body.
     g2d=1,
+    varlen=False,  # ragged / block-causal: per-segment [tok_base,tok_end) from cu_seqlens
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
 
@@ -362,8 +363,11 @@ def build_flash_attn_bwd_dkdv_module(
         DELTA: fx.Tensor,
         DK: fx.Tensor,
         DV: fx.Tensor,
+        CuSeqQ: fx.Tensor,  # varlen: cu_seqlens_q [num_seg+1] i32; else unused placeholder slot
+        CuSeqKv: fx.Tensor,  # varlen: cu_seqlens_kv [num_seg+1] i32; else unused placeholder slot
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
+        total_kv: fx.Int32,  # varlen: sum of kv seglens (packed dk/dv workspace split stride); else unused
     ):
         elem_dtype = dtype_to_elem_type(dtype_str)
         elem_type = elem_dtype.ir_type
@@ -388,8 +392,6 @@ def build_flash_attn_bwd_dkdv_module(
 
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_k_v = fx.Index(seq_len_k)
-        # Bottom-right causal: offset = seq_k - seq_q >= 0 (Sq <= Skv).
-        causal_offset = seq_len_k_v - seq_len_q_v
         causal_off_i32 = fx.Int32(seq_len_k) - fx.Int32(seq_len_q)
         base_ptr = allocator.get_base()
         lds = SmemPtr(base_ptr, lds_off, elem_type, shape=(LDS_TOTAL,)).get()
@@ -435,6 +437,28 @@ def build_flash_attn_bwd_dkdv_module(
                 split_idx = fx.Index(0)
             kv_tile_idx = _rest % num_kv_tiles
             batch_idx = _rest // num_kv_tiles
+        # SHADOW seq_len_q_v/k_v to the per-segment length so downstream base/SRD/loop-bounds follow the segment (byte-identical when uniform; grid tiles were fixed from max above).
+        if const_expr(varlen):
+            _seg = batch_idx
+            _cuq_rsrc = buffer_ops.create_buffer_resource(CuSeqQ, max_size=True)
+            _cukv_rsrc = buffer_ops.create_buffer_resource(CuSeqKv, max_size=True)
+            _qb_i = fx.Int32(buffer_ops.buffer_load(_cuq_rsrc, _seg, vec_width=1, dtype=fx.Int32))
+            _qe_i = fx.Int32(
+                buffer_ops.buffer_load(_cuq_rsrc, _seg + fx.Index(1), vec_width=1, dtype=fx.Int32)
+            )
+            _kb_i = fx.Int32(buffer_ops.buffer_load(_cukv_rsrc, _seg, vec_width=1, dtype=fx.Int32))
+            _ke_i = fx.Int32(
+                buffer_ops.buffer_load(_cukv_rsrc, _seg + fx.Index(1), vec_width=1, dtype=fx.Int32)
+            )
+            q_tok_base = fx.Index(_qb_i)
+            kv_tok_base = fx.Index(_kb_i)
+            seq_len_q_v = fx.Index(_qe_i) - q_tok_base
+            seq_len_k_v = fx.Index(_ke_i) - kv_tok_base
+            causal_off_i32 = (_ke_i - _kb_i) - (_qe_i - _qb_i)
+        else:
+            q_tok_base = batch_idx * seq_len_q_v
+            kv_tok_base = batch_idx * seq_len_k_v
+        causal_offset = seq_len_k_v - seq_len_q_v
         kv_start = kv_tile_idx * BLOCK_KV
         # This wave owns ROWS_PER_WAVE_KV kv rows, split into NT 16-wide N-tiles.
         # In the 16x16 layout the owned kv row for a lane is nt*16 + lane16.
@@ -454,7 +478,7 @@ def build_flash_attn_bwd_dkdv_module(
         if const_expr(sbhd):
             _q_ptr_batch_off = batch_idx * fx.Index(STRIDE_TOKEN_Q)
         else:
-            _q_ptr_batch_off = batch_idx * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q)
+            _q_ptr_batch_off = q_tok_base * fx.Index(STRIDE_TOKEN_Q)
         q_ptr = buffer_ops.get_element_ptr(q_ptr, _q_ptr_batch_off, elem_type=elem_type)
         do_ptr = buffer_ops.get_element_ptr(do_ptr, _q_ptr_batch_off, elem_type=elem_type)
 
@@ -516,7 +540,7 @@ def build_flash_attn_bwd_dkdv_module(
         if const_expr(sbhd):
             _kv_batch_byte_off = _raw(batch_idx * fx.Index(STRIDE_TOKEN_KV * 2))
         else:
-            _kv_batch_byte_off = _raw(batch_idx * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
+            _kv_batch_byte_off = _raw(kv_tok_base * fx.Index(STRIDE_TOKEN_KV * 2))
         k_rsrc = buffer_ops.create_buffer_resource(
             K, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_kv_batch_byte_off
         )
@@ -532,6 +556,11 @@ def build_flash_attn_bwd_dkdv_module(
                 (split_idx * seq_len_k_v * fx.Index(RD_STRIDE_KV) + batch_idx * fx.Index(STRIDE_TOKEN_KV))
                 * fx.Index(2)
             )
+        elif const_expr(varlen):
+            # Packed [q_split,total_kv,Hkv,D]: slot base = (split*total_kv + kv_tok_base); host sum(dim=0) -> packed dk/dv.
+            _dkv_ws_byte_off = _raw(
+                (split_idx * fx.Index(total_kv) + kv_tok_base) * fx.Index(STRIDE_TOKEN_KV * 2)
+            )
         else:
             _ws_slot = batch_idx * fx.Index(Q_SPLIT) + split_idx
             _dkv_ws_byte_off = _raw(_ws_slot * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV * 2))
@@ -543,7 +572,10 @@ def build_flash_attn_bwd_dkdv_module(
         )
         _lse_per_batch = seq_len_q_v * fx.Index(NUM_HEADS_Q)
         _lse_nrec_bytes = _raw(_lse_per_batch * fx.Index(4))
-        _lse_batch_byte_off = _raw(batch_idx * _lse_per_batch * fx.Index(4))
+        if const_expr(varlen):
+            _lse_batch_byte_off = _raw(q_tok_base * fx.Index(NUM_HEADS_Q) * fx.Index(4))
+        else:
+            _lse_batch_byte_off = _raw(batch_idx * _lse_per_batch * fx.Index(4))
         lse_rsrc = buffer_ops.create_buffer_resource(
             LSE, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
         )
@@ -810,6 +842,27 @@ def build_flash_attn_bwd_dkdv_module(
             # Issued BEFORE the Q/dO DMA so both HBM streams are in flight together;
             # the LDS commit lands after the DMA, so its vmcnt wait does not serialise
             # them (gfx950 has no vmcnt subset wait, but the counter is in-order).
+            if const_expr(varlen):
+                # Packed [total_q,Hq]: consecutive q for a fixed head are stride-NUM_HEADS_Q apart, so gather scalars (uniform head-major loads a single vec below).
+                _qh = kv_head_idx * fx.Index(GQA_GROUP_SIZE) + _ld_head
+                _q0 = q_start + _ld_q
+                return [
+                    Vec.from_elements(
+                        [
+                            fx.Float32(
+                                buffer_ops.buffer_load(
+                                    rsrc,
+                                    (_q0 + fx.Index(j)) * fx.Index(NUM_HEADS_Q) + _qh,
+                                    vec_width=1,
+                                    dtype=fx.Float32,
+                                )
+                            )
+                            for j in range_constexpr(LD_VEC)
+                        ],
+                        fx.Float32,
+                    ).ir_value()
+                    for rsrc in (delta_rsrc, lse_rsrc)
+                ]
             _g = (kv_head_idx * fx.Index(GQA_GROUP_SIZE) + _ld_head) * seq_len_q_v + q_start + _ld_q
             return [
                 buffer_ops.buffer_load(rsrc, _g, vec_width=LD_VEC, dtype=fx.Float32)
@@ -906,10 +959,10 @@ def build_flash_attn_bwd_dkdv_module(
                                 if const_expr(apply_mask):
                                     q_slot = q_start_i32 + kg_off_i32 + fx.Int32(mt * M_TILE + t)
                                     _up = ArithValue(kv_row_i32_of(nt) > q_slot + causal_off_i32)
-                                    if const_expr(window_left >= 0):
+                                    if const_expr(window_left >= 0):  # W+1 keys: mask kv <= q+off-(W+1)
                                         _lo = ArithValue(
                                             kv_row_i32_of(nt)
-                                            <= q_slot + causal_off_i32 - fx.Int32(window_left)
+                                            <= q_slot + causal_off_i32 - fx.Int32(window_left + 1)
                                         )
                                         _mm = ArithValue(arith.ori(_raw(_up), _raw(_lo)))
                                     else:
@@ -1032,9 +1085,12 @@ def build_flash_attn_bwd_dkdv_module(
         DELTA: fx.Tensor,
         DK: fx.Tensor,
         DV: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        CuSeqKv: fx.Tensor,
         batch_size: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
+        total_kv: fx.Int32,
         stream: fx.Stream,
     ):
         allocator.finalized = False
@@ -1071,8 +1127,11 @@ def build_flash_attn_bwd_dkdv_module(
             DELTA,
             DK,
             DV,
+            CuSeqQ,
+            CuSeqKv,
             seq_len_q,
             seq_len_k,
+            total_kv,
             value_attrs={
                 "rocdl.waves_per_eu": _wpe_dkdv,
                 "rocdl.flat_work_group_size": f"{int(flat_work_group_size)},{int(flat_work_group_size)}",
@@ -1123,6 +1182,7 @@ def build_flash_attn_bwd_dq_module(
     batch_size=None,  # compile-time B; required for SBHD seq-step stride bake
     sbhd=False,  # SBHD [S,B,H,D] native layout (seq-step = B*H*D)
     fuse_delta=False,  # compute DELTA here from O (K16 slot) instead of a separate odo pass
+    varlen=False,  # ragged / block-causal: per-segment [tok_base,tok_end) from cu_seqlens
 ):
     """Build the dQ Q-outer backward launcher (16x16x32 mirror of dkdv).
 
@@ -1213,6 +1273,8 @@ def build_flash_attn_bwd_dq_module(
         DELTA: fx.Tensor,
         DQ: fx.Tensor,
         O: fx.Tensor,  # fuse_delta: O for the DELTA reduce; otherwise unused placeholder slot
+        CuSeqQ: fx.Tensor,  # varlen: cu_seqlens_q [num_seg+1] i32; else unused placeholder slot
+        CuSeqKv: fx.Tensor,  # varlen: cu_seqlens_kv [num_seg+1] i32; else unused placeholder slot
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
     ):
@@ -1255,9 +1317,6 @@ def build_flash_attn_bwd_dq_module(
 
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_k_v = fx.Index(seq_len_k)
-        # Bottom-right causal: offset = seq_k - seq_q >= 0 (Sq <= Skv).
-        causal_offset = seq_len_k_v - seq_len_q_v
-        causal_off_i32 = fx.Int32(seq_len_k) - fx.Int32(seq_len_q)
         base_ptr = allocator.get_base()
         lds = SmemPtr(base_ptr, lds_off, elem_type, shape=(LDS_TOTAL,)).get()
 
@@ -1303,23 +1362,57 @@ def build_flash_attn_bwd_dq_module(
             q_head_idx = kv_head_idx * GQA_GROUP_SIZE + _q_in_group
             _qt_disp = batch_q_tile_id % num_q_tiles
             batch_idx = batch_q_tile_id // num_q_tiles
+        # SHADOW seq_len_q_v/k_v to the per-segment length so downstream base/SRD/clamp follow the segment (byte-identical when uniform; grid tiles were fixed from max above).
+        if const_expr(varlen):
+            _seg = batch_idx
+            _cuq_rsrc = buffer_ops.create_buffer_resource(CuSeqQ, max_size=True)
+            _cukv_rsrc = buffer_ops.create_buffer_resource(CuSeqKv, max_size=True)
+            _qb_i = fx.Int32(buffer_ops.buffer_load(_cuq_rsrc, _seg, vec_width=1, dtype=fx.Int32))
+            _qe_i = fx.Int32(
+                buffer_ops.buffer_load(_cuq_rsrc, _seg + fx.Index(1), vec_width=1, dtype=fx.Int32)
+            )
+            _kb_i = fx.Int32(buffer_ops.buffer_load(_cukv_rsrc, _seg, vec_width=1, dtype=fx.Int32))
+            _ke_i = fx.Int32(
+                buffer_ops.buffer_load(_cukv_rsrc, _seg + fx.Index(1), vec_width=1, dtype=fx.Int32)
+            )
+            q_tok_base = fx.Index(_qb_i)
+            kv_tok_base = fx.Index(_kb_i)
+            seq_len_q_v = fx.Index(_qe_i) - q_tok_base
+            seq_len_k_v = fx.Index(_ke_i) - kv_tok_base
+            causal_off_i32 = (_ke_i - _kb_i) - (_qe_i - _qb_i)
+        else:
+            q_tok_base = batch_idx * seq_len_q_v
+            kv_tok_base = batch_idx * seq_len_k_v
+            causal_off_i32 = fx.Int32(seq_len_k) - fx.Int32(seq_len_q)
+        causal_offset = seq_len_k_v - seq_len_q_v
         # Descending q_tile = longest-processing-time-first: causal work grows with
         # q_tile and block_ids are handed out in order, so dispatch order IS the
         # list-schedule order.
-        q_tile_idx = num_q_tiles - fx.Index(1) - _qt_disp
-        # Causal-aligned tile origin: anchoring tiles at row 0 spends the whole pad on the LAST
-        # tile, the one with the longest causal kv range. Shift every origin down by the largest
-        # BLOCK_KV multiple that fits the pad so the overshoot lands on tile 0 and every tile
-        # loses one BLOCK_KV step. The shift is a BLOCK_KV multiple, so q_start stays kv-block
-        # aligned; tile 0 recomputes shared rows but stores only the ones it owns (det unchanged).
-        _q_pad = num_q_tiles * fx.Index(BLOCK_M) - seq_len_q_v
-        _q_shift = (_q_pad // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
-        _q_raw = q_tile_idx * BLOCK_M
-        q_start = fx.Index(
-            ArithValue(_q_raw >= _q_shift).select(_q_raw - _q_shift, fx.Index(0))
-        )  # fx.Index is unsigned: the discarded branch would underflow, so select it away
-        _q_owned_end = _q_raw + fx.Index(BLOCK_M) - _q_shift  # exclusive, always > q_start
-        _q_store_end = fx.Index(ArithValue(_q_owned_end < seq_len_q_v).select(_q_owned_end, seq_len_q_v))
+        if const_expr(varlen):
+            # Per-segment tile count; no causal-aligned shift (uniform-only opt). Out-of-segment tiles clamp to 0 and store nothing via the store-end mask.
+            _nqt_seg = (seq_len_q_v + fx.Index(BLOCK_M - 1)) // fx.Index(BLOCK_M)
+            _qt_in_seg = ArithValue(_qt_disp < _nqt_seg)
+            _qt_c = fx.Index(_qt_in_seg.select(_qt_disp, _nqt_seg - fx.Index(1)))
+            q_tile_idx = _nqt_seg - fx.Index(1) - _qt_c
+            q_start = q_tile_idx * BLOCK_M
+            _q_owned_end = q_start + fx.Index(BLOCK_M)
+            _q_store_end = fx.Index(
+                _qt_in_seg.select(
+                    ArithValue(_q_owned_end < seq_len_q_v).select(_q_owned_end, seq_len_q_v),
+                    fx.Index(0),
+                )
+            )
+        else:
+            q_tile_idx = num_q_tiles - fx.Index(1) - _qt_disp
+            # Causal-aligned origin: shift every tile down by the largest BLOCK_KV pad multiple so the overshoot lands on tile 0 (stays kv-block aligned; det unchanged).
+            _q_pad = num_q_tiles * fx.Index(BLOCK_M) - seq_len_q_v
+            _q_shift = (_q_pad // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
+            _q_raw = q_tile_idx * BLOCK_M
+            q_start = fx.Index(
+                ArithValue(_q_raw >= _q_shift).select(_q_raw - _q_shift, fx.Index(0))
+            )  # fx.Index is unsigned: the discarded branch would underflow, so select it away
+            _q_owned_end = _q_raw + fx.Index(BLOCK_M) - _q_shift  # exclusive, always > q_start
+            _q_store_end = fx.Index(ArithValue(_q_owned_end < seq_len_q_v).select(_q_owned_end, seq_len_q_v))
 
         # Per-batch base (elements). SBHD: batch inside the seq axis -> base is only
         # H*D. THD: dense per-batch block -> base is seq*H*D.
@@ -1327,8 +1420,8 @@ def build_flash_attn_bwd_dq_module(
             _q_batch_elems = batch_idx * fx.Index(STRIDE_TOKEN_Q)
             _kv_batch_elems = batch_idx * fx.Index(STRIDE_TOKEN_KV)
         else:
-            _q_batch_elems = batch_idx * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q)
-            _kv_batch_elems = batch_idx * seq_len_k_v * fx.Index(STRIDE_TOKEN_KV)
+            _q_batch_elems = q_tok_base * fx.Index(STRIDE_TOKEN_Q)
+            _kv_batch_elems = kv_tok_base * fx.Index(STRIDE_TOKEN_KV)
 
         # Fold per-batch element offset into raw K/V pointers (0-based rows).
         _kv_ptr_batch_off = _kv_batch_elems
@@ -1340,6 +1433,12 @@ def build_flash_attn_bwd_dq_module(
 
         def global_idx_kv(token_idx, col):
             return token_idx * RD_STRIDE_KV + kv_head_idx * HEAD_DIM + col
+
+        def _ld_delta_elem(q_row):
+            # VARLEN: packed [total_q,Hq] token-major. Uniform/SBHD: [B,Hq,Sq] head-major.
+            if const_expr(varlen):
+                return q_row * fx.Index(NUM_HEADS_Q) + q_head_idx
+            return q_head_idx * seq_len_q_v + q_row
 
         def bf16_trunc_pack_v8(f32_vals):
             pairs = [
@@ -1375,7 +1474,10 @@ def build_flash_attn_bwd_dq_module(
         )
         _lse_per_batch = seq_len_q_v * fx.Index(NUM_HEADS_Q)
         _lse_nrec_bytes = _raw(_lse_per_batch * fx.Index(4))
-        _lse_batch_byte_off = _raw(batch_idx * _lse_per_batch * fx.Index(4))
+        if const_expr(varlen):
+            _lse_batch_byte_off = _raw(q_tok_base * fx.Index(NUM_HEADS_Q) * fx.Index(4))
+        else:
+            _lse_batch_byte_off = _raw(batch_idx * _lse_per_batch * fx.Index(4))
         lse_rsrc = buffer_ops.create_buffer_resource(
             LSE, max_size=False, num_records_bytes=_lse_nrec_bytes, base_byte_offset=_lse_batch_byte_off
         )
@@ -1488,7 +1590,7 @@ def build_flash_attn_bwd_dq_module(
         lse_owned = []
         delta_owned = []
         for qt in range_constexpr(QT):
-            _lse_elem = q_head_idx * seq_len_q_v + q_row_of(qt)
+            _lse_elem = _ld_delta_elem(q_row_of(qt))
             lse_owned.append(
                 fx.Float32(buffer_ops.buffer_load(lse_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32))
             )
@@ -1520,7 +1622,7 @@ def build_flash_attn_bwd_dq_module(
                 buffer_ops.buffer_store(
                     delta_owned[qt],
                     delta_in_rsrc,
-                    (q_head_idx * seq_len_q_v + _q_row) * fx.Index(4),
+                    _ld_delta_elem(_q_row) * fx.Index(4),
                     mask=ArithValue(_q_row < _q_store_end) & ArithValue(kg == fx.Index(0)),
                     offset_is_bytes=True,
                 )
@@ -1719,7 +1821,7 @@ def build_flash_attn_bwd_dq_module(
                                     [_vexp(Vec(diff4)[t]) for t in range_constexpr(4)], fx.Float32
                                 )
                             if const_expr(window_left >= 0):
-                                _thr = q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left)
+                                _thr = q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left + 1)
                                 _kvb = kv_start_i32 + fx.Int32(kvt * M_TILE + kg * 4)
                                 p4 = Vec.from_elements(
                                     [
@@ -1744,7 +1846,7 @@ def build_flash_attn_bwd_dq_module(
                                 _up = ArithValue(kv_slot > q_slot_i32[qt] + causal_off_i32)
                                 if const_expr(window_left >= 0):
                                     _lo = ArithValue(
-                                        kv_slot <= q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left)
+                                        kv_slot <= q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left + 1)
                                     )
                                     _mm = ArithValue(arith.ori(_raw(_up), _raw(_lo)))
                                 else:
@@ -1816,8 +1918,8 @@ def build_flash_attn_bwd_dq_module(
             # fx.Index is unsigned: guard the subtract (W-1 may exceed q+off) to
             # avoid underflow-to-huge. _wlo skips fully-out-of-window kv tiles.
             _wlo = fx.Index(
-                ArithValue(q_start + causal_offset >= fx.Index(window_left - 1)).select(
-                    q_start + causal_offset - fx.Index(window_left - 1), fx.Index(0)
+                ArithValue(q_start + causal_offset >= fx.Index(window_left)).select(
+                    q_start + causal_offset - fx.Index(window_left), fx.Index(0)
                 )
             )
             _wlo = (_wlo // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
@@ -1869,6 +1971,8 @@ def build_flash_attn_bwd_dq_module(
         DELTA: fx.Tensor,
         DQ: fx.Tensor,
         O: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        CuSeqKv: fx.Tensor,
         batch_size: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
@@ -1902,6 +2006,8 @@ def build_flash_attn_bwd_dq_module(
             DELTA,
             DQ,
             O,
+            CuSeqQ,
+            CuSeqKv,
             seq_len_q,
             seq_len_k,
             value_attrs={
@@ -1994,8 +2100,10 @@ def _defer_delta(dq_launch):
     return _dq, _odo
 
 
-def _get_bwd(Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64, batch_size=None, sbhd=False):
-    key = (Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv, batch_size, sbhd)
+def _get_bwd(
+    Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64, batch_size=None, sbhd=False, varlen=False
+):
+    key = (Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv, batch_size, sbhd, varlen)
     launchers = _BWD_CACHE.get(key)
     if launchers is None:
         common = dict(
@@ -2013,10 +2121,11 @@ def _get_bwd(Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64, 
             batch_size=batch_size,
             sbhd=sbhd,
             fuse_delta=_FUSE_DELTA,
+            varlen=varlen,
             **common,
         )
         dkdv_l = build_flash_attn_bwd_dkdv_module(
-            q_split=q_split, block_kv=block_kv, batch_size=batch_size, sbhd=sbhd, **common
+            q_split=q_split, block_kv=block_kv, batch_size=batch_size, sbhd=sbhd, varlen=varlen, **common
         )
         if _FUSE_DELTA:
             # The fused dq kernel produces DELTA itself; the standalone odo kernel is
@@ -2038,7 +2147,25 @@ def _prescale_lse(lse_bhsq):
 
 
 def flydsl_varlen_backward(
-    dout, q, k, v, out, lse_bhsq, B, Sq, Skv, Hq, Hkv, D, scale, window_left=-1, sbhd=False
+    dout,
+    q,
+    k,
+    v,
+    out,
+    lse_bhsq,
+    B,
+    Sq,
+    Skv,
+    Hq,
+    Hkv,
+    D,
+    scale,
+    window_left=-1,
+    sbhd=False,
+    cu_seqlens_q=None,
+    cu_seqlens_kv=None,
+    max_seqlen_q=None,
+    max_seqlen_kv=None,
 ):
     """Run the 16x16x32 flydsl bwd.
     THD (sbhd=False): q,dout,dq,out:[B*Sq,Hq,D]; k,v,dk,dv:[B*Skv,Hkv,D].
@@ -2046,7 +2173,47 @@ def flydsl_varlen_backward(
     no permute/copy anywhere -- the kernels address SBHD directly and the dk/dv
     workspace is laid out [q_split,Skv,B,Hkv,D] so the slot reduction is contiguous).
     lse_bhsq:[B,Hq,Sq] f32 (batch-major, layout-independent).
-    window_left>=0 = sliding-window causal (valid q+off-W < kv <= q+off)."""
+    window_left>=0 = sliding-window causal (valid q+off-W < kv <= q+off).
+
+    Ragged / block-causal (cu_seqlens_q given, THD only): q/k/v/dq/dk/dv and lse_bhsq
+    all packed; each segment [cu[i],cu[i+1]) is an independent document (per-segment
+    bottom-right causal + cross-segment masking). Grid tiles by max_seqlen_q/kv."""
+    varlen = cu_seqlens_q is not None
+    st = torch.cuda.current_stream()
+    lse_s = _prescale_lse(lse_bhsq)
+    qf, kf, vf, dof = q.reshape(-1), k.reshape(-1), v.reshape(-1), dout.reshape(-1)
+    o16 = out.to(q.dtype).reshape(-1)
+
+    if varlen:
+        assert not sbhd, "ragged / block-causal backward is THD only"
+        assert _FUSE_DELTA, "ragged bwd fuses DELTA into dq (no odo launch)"
+        num_seg = cu_seqlens_q.numel() - 1
+        total_q, total_kv = q.shape[0], k.shape[0]
+        max_sq = int(max_seqlen_q) if max_seqlen_q is not None else Sq
+        max_skv = int(max_seqlen_kv) if max_seqlen_kv is not None else Skv
+        q_split = _qsplit_for(max_sq)
+        dq_l, dkdv_l, _ = _get_bwd(
+            Hq, Hkv, D, scale, window_left, q_split,
+            _blockkv_for(max_skv), _dq_block_kv(max_sq),
+            batch_size=num_seg, sbhd=False, varlen=True,
+        )
+        delta = torch.empty(total_q, Hq, device=q.device, dtype=torch.float32)
+        dq = torch.empty_like(q)
+        ws_dk = torch.zeros(q_split, total_kv, Hkv, D, device=q.device, dtype=k.dtype)
+        ws_dv = torch.zeros(q_split, total_kv, Hkv, D, device=q.device, dtype=v.dtype)
+        lsef, df = lse_s.reshape(-1), delta.reshape(-1)
+        dq_l(
+            qf, kf, vf, dof, lsef, df, dq.reshape(-1), o16,
+            cu_seqlens_q, cu_seqlens_kv, num_seg, max_sq, max_skv, st,
+        )
+        dkdv_l(
+            qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1),
+            cu_seqlens_q, cu_seqlens_kv, num_seg, max_sq, max_skv, total_kv, st,
+        )
+        dk = ws_dk.sum(dim=0)
+        dv = ws_dv.sum(dim=0)
+        return dq, dk, dv
+
     q_split = _qsplit_for(Sq)
     dq_l, dkdv_l, odo_l = _get_bwd(
         Hq,
@@ -2060,16 +2227,13 @@ def flydsl_varlen_backward(
         batch_size=B,
         sbhd=sbhd,
     )
-    st = torch.cuda.current_stream()
     # identity delta = -rowsum(O.dO); both kernels center dP by it (exact). dq owns the
     # reduce (it already holds dO in registers) and stores DELTA for dkdv when
     # _FUSE_DELTA is on, so no odo launch is needed; O is cast to bf16 (no-op when out
     # is already bf16) and passed into dq's freed slot via _defer_delta.
     delta = torch.empty(B, Hq, Sq, device=q.device, dtype=torch.float32)
-    o16 = out.to(q.dtype).reshape(-1)
     if not _FUSE_DELTA:
         odo_l(o16, dout.to(q.dtype).reshape(-1), delta.reshape(-1), B, Sq, st)
-    lse_s = _prescale_lse(lse_bhsq)
     dq = torch.empty_like(q)
     # SBHD workspace [q_split,Skv,B,Hkv,D]: summing the leading q_split axis yields
     # [Skv,B,Hkv,D] contiguous == native SBHD dk/dv (no permute). THD keeps
@@ -2080,10 +2244,13 @@ def flydsl_varlen_backward(
     else:
         ws_dk = torch.empty(B, q_split, Skv, Hkv, D, device=q.device, dtype=k.dtype)
         ws_dv = torch.empty(B, q_split, Skv, Hkv, D, device=q.device, dtype=v.dtype)
-    qf, kf, vf, dof = q.reshape(-1), k.reshape(-1), v.reshape(-1), dout.reshape(-1)
     lsef, df = lse_s.reshape(-1), delta.reshape(-1)
-    dq_l(qf, kf, vf, dof, lsef, df, dq.reshape(-1), o16, B, Sq, Skv, st)
-    dkdv_l(qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1), B, Sq, Skv, st)
+    cu_ph = torch.zeros(1, device=q.device, dtype=torch.int32)  # placeholder: cu args read only under const_expr(varlen)
+    dq_l(qf, kf, vf, dof, lsef, df, dq.reshape(-1), o16, cu_ph, cu_ph, B, Sq, Skv, st)
+    dkdv_l(
+        qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1),
+        cu_ph, cu_ph, B, Sq, Skv, 0, st,
+    )
     if sbhd:
         dk = ws_dk.sum(dim=0)  # [Skv,B,Hkv,D] SBHD contiguous
         dv = ws_dv.sum(dim=0)
