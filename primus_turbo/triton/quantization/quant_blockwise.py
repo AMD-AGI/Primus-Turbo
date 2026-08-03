@@ -75,7 +75,7 @@ def quant_fp8_blockwise_dual_kernel(
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     COL_TRANSPOSED: tl.constexpr = False,
-    COL_PRESHUFFLED: tl.constexpr = False,
+    ROW_SCALE_TRANSPOSED: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -116,34 +116,7 @@ def quant_fp8_blockwise_dual_kernel(
     # launcher collapses to a zero-cost view. The default [M, N] col path keeps
     # the output transpose. The col-scale layout ([M//128, N], stored below) is
     # unchanged.
-    if COL_PRESHUFFLED:
-        # Write the column-quantized tile DIRECTLY in the FlyDSL (16, 16) MFMA
-        # preshuffled+transposed operand layout, byte-identical to
-        # shuffle_b(x_col[M, N].transpose(0, 1).contiguous()) consumed by the
-        # wgrad GEMM. This folds the launcher's standalone preshuffle copy (a
-        # full M*N fp8 HBM round-trip + a dedicated kernel launch per backward
-        # step) into this store. The index math mirrors
-        # preshuffle_fp8._preshuffle_b_transposed_kernel exactly with (p=n, q=m)
-        # (here the operand is the transpose, so P=N, Q=M; BN=16, BK=32,
-        # K_inner=16 for the (16, 16) fp8 layout). Output is contiguous in runs
-        # of K_inner along m (last dim), so the store coalesces. The col results
-        # are already in [n, m] orientation (x_fp8_col_tile_t), so they store
-        # straight out at the permuted offset.
-        BN_PS: tl.constexpr = 16
-        BK_PS: tl.constexpr = 32
-        KIN_PS: tl.constexpr = 16
-        i0 = offs_n // BN_PS
-        i1 = offs_n % BN_PS
-        i2 = offs_m // BK_PS
-        i3 = (offs_m % BK_PS) // KIN_PS
-        i4 = offs_m % KIN_PS
-        ps_off = i4[None, :] + KIN_PS * (
-            i1[:, None]
-            + BN_PS * (i3[None, :] + (BK_PS // KIN_PS) * (i2[None, :] + (M // BK_PS) * i0[:, None]))
-        )
-        col_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
-        tl.store(x_fp8_col_ptr + ps_off, x_fp8_col_tile_t.to(x_fp8_col_ptr.dtype.element_ty), mask=col_mask)
-    elif COL_TRANSPOSED:
+    if COL_TRANSPOSED:
         x_fp8_col_ptrs = x_fp8_col_ptr + offs_n[:, None] * M + offs_m[None, :]
         col_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
         tl.store(x_fp8_col_ptrs, x_fp8_col_tile_t.to(x_fp8_col_ptr.dtype.element_ty), mask=col_mask)
@@ -152,7 +125,10 @@ def quant_fp8_blockwise_dual_kernel(
         x_fp8_col_ptrs = x_fp8_col_ptr + offs_m[:, None] * N + offs_n[None, :]
         tl.store(x_fp8_col_ptrs, x_fp8_col_tile.to(x_fp8_col_ptr.dtype.element_ty), mask=mask)
 
-    row_scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
+    if ROW_SCALE_TRANSPOSED:
+        row_scale_offs = pid_n * M + offs_m
+    else:
+        row_scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
     row_scale_mask = offs_m < M
     x_scales_row_tile_inv = tl.reshape(1.0 / x_scales_row_tile, BLOCK_SIZE)
     tl.store(
@@ -161,17 +137,8 @@ def quant_fp8_blockwise_dual_kernel(
         mask=row_scale_mask,
     )
 
-    if COL_PRESHUFFLED:
-        # Matching transposed scale layout [N, M // BLOCK_SIZE] (byte-identical to
-        # the wgrad launcher's a_col_scale_inv.transpose(0, 1).contiguous()), so
-        # the launcher's scale transpose is also dropped. Element (n, pid_m) at
-        # flat n * num_m_blocks + pid_m.
-        num_m_blocks = tl.cdiv(M, BLOCK_SIZE)
-        col_scale_offs = offs_n * num_m_blocks + pid_m
-        col_scale_mask = offs_n < N
-    else:
-        col_scale_offs = pid_m * N + offs_n
-        col_scale_mask = offs_n < N
+    col_scale_offs = pid_m * N + offs_n
+    col_scale_mask = offs_n < N
     # x_scales_col_tile_t is [n, 1]; flattening it yields the per-column scales in
     # the same n-order as flattening the previously-transposed [1, n] tile, so the
     # output scale layout is unchanged while the transpose is dropped.
@@ -303,126 +270,6 @@ def dequant_fp8_blockwise_for_weight_kernel(
 
     out_ptrs = out_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
     tl.store(out_ptrs, out_tile.to(out_ptr.dtype.element_ty), mask=mask)
-
-
-# w_ptr           [M, N]            (2D weight; M=rows / out-features, N=cols / in-features)
-# w_fp8_ptr       [M, N] FP8        plain block2d (for ctx / dgrad)
-# w_fp8_ps_ptr    [M, N] FP8        forward (16, 16) MFMA pre-shuffled (byte-identical to shuffle_b)
-# w_fp8_dgrad_ps_ptr [DGRAD_M, N] FP8  dgrad (NN) transposed-preshuffle, with
-#                                      DGRAD_M optionally padded to BLOCK_SIZE
-# w_scales_ptr    [M // BLOCK_SIZE, N // BLOCK_SIZE] FP32
-@triton.jit
-def quant_fp8_blockwise_for_weight_dual_kernel(
-    w_ptr,
-    w_fp8_ptr,
-    w_fp8_ps_ptr,
-    w_fp8_dgrad_ps_ptr,
-    w_scales_ptr,
-    M,
-    N,
-    DGRAD_M: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    EMIT_DGRAD_PS: tl.constexpr = False,
-):
-    """2D blockwise weight quant that emits the plain block2d FP8 weight, its forward
-    (16, 16) MFMA pre-shuffled copy, and (when ``EMIT_DGRAD_PS``) the dgrad
-    transposed-preshuffle copy, all from a single read of ``w``. ``DGRAD_M`` may
-    extend M to a block boundary; masked input rows produce exact FP8 zeros.
-
-    The forward pre-shuffled store is byte-identical to ``shuffle_b(w_fp8)`` (the
-    launcher's standalone ``permute().contiguous()`` copy of the [M, N] weight), so
-    the FlyDSL forward GEMM can consume it directly and skip its standalone
-    pre-shuffle HBM round-trip + kernel launch. The plain copy is kept for ``ctx``
-    and the dgrad transposed copy (when emitted) serves the dgrad GEMM.
-    """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    offs_m = tl.cast(pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
-    offs_n = tl.cast(pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-
-    # Load [BLOCK_SIZE, BLOCK_SIZE]
-    w_ptrs = w_ptr + offs_m[:, None] * N + offs_n[None, :]
-    w_tile = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
-
-    w_tile_abs = tl.abs(w_tile)
-    w_tile_max = tl.max(w_tile_abs)  # [1]
-    w_tile_max = tl.maximum(w_tile_max, 1e-4)
-    w_scales = FP8_MAX / w_tile_max
-    w_fp8_tile = w_tile * w_scales
-    w_fp8_tile = tl.clamp(w_fp8_tile, min=-FP8_MAX, max=FP8_MAX)
-    w_fp8_cast = w_fp8_tile.to(w_fp8_ptr.dtype.element_ty)
-
-    BN_PS: tl.constexpr = 16
-    BK_PS: tl.constexpr = 32
-    KIN_PS: tl.constexpr = 16
-
-    # Dgrad (NN) transposed-preshuffle store in the SAME read of w. Byte-identical
-    # to _shuffle_b_transposed(w_fp8) == shuffle_b(w_fp8.transpose(0, 1)), the
-    # operand the FlyDSL dgrad GEMM consumes (logical [K, N] from w [M=N_w, N=K_w]).
-    # T = w_fp8.T has shape [P=N (=K_w cols), Q=M (=N_w rows)]; shuffle_b reads
-    # T[row, col] = w_fp8[col, row] with row over P (=offs_n) and col over Q
-    # (=offs_m), so i0/i1 index offs_n (rows of T) and i2/i3/i4 index offs_m (cols
-    # of T), with Q = M. The stored tile is tl.trans(w_fp8_cast) -> [offs_n, offs_m].
-    # Folding this here eliminates the standalone per-backward-step
-    # _preshuffle_b_transposed_kernel; the dgrad GEMM's operand load is unchanged.
-    #
-    # This high-latency scattered store is issued FIRST (before the cheaper coalesced
-    # plain / fwd-PS / scale stores) so its latency overlaps the subsequent stores
-    # instead of tailing them on the forward weight-quant critical path.
-    if EMIT_DGRAD_PS:
-        # The transposed tile is reshaped so its KIN_PS=16 (16-byte) run is the
-        # explicit, fastest-varying, stride-1 trailing axis of the store, which lets
-        # Triton vectorize it into dwordx4 (16-byte) transactions rather than
-        # per-element 1-byte scatter stores. The byte destinations are unchanged
-        # (m = om_outer*KIN_PS + i4d below reproduces the i2d/i3d/i4d decomposition
-        # exactly); only the store width differs.
-        KOUT_PS: tl.constexpr = BLOCK_SIZE // KIN_PS  # offs_m chunks of KIN_PS per tile
-        i0d = offs_n // BN_PS
-        i1d = offs_n % BN_PS
-        om_outer = tl.cast(pid_m * KOUT_PS + tl.arange(0, KOUT_PS), tl.int64)  # global offs_m // KIN_PS
-        i4d = tl.cast(tl.arange(0, KIN_PS), tl.int64)  # offs_m % KIN_PS, the contiguous run
-        i2d = om_outer // (BK_PS // KIN_PS)
-        i3d = om_outer % (BK_PS // KIN_PS)
-        dps_off = i4d[None, None, :] + KIN_PS * (
-            i1d[:, None, None]
-            + BN_PS
-            * (
-                i3d[None, :, None]
-                + (BK_PS // KIN_PS) * (i2d[None, :, None] + (DGRAD_M // BK_PS) * i0d[:, None, None])
-            )
-        )
-        offs_m_3d = om_outer[None, :, None] * KIN_PS + i4d[None, None, :]
-        dps_mask = (offs_n[:, None, None] < N) & (offs_m_3d < DGRAD_M)
-        w_fp8_dgrad_t = tl.reshape(tl.trans(w_fp8_cast), (BLOCK_SIZE, KOUT_PS, KIN_PS))
-        tl.store(w_fp8_dgrad_ps_ptr + dps_off, w_fp8_dgrad_t, mask=dps_mask)
-
-    # Plain block2d store (consumed by ctx / dgrad).
-    w_fp8_ptrs = w_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
-    tl.store(w_fp8_ptrs, w_fp8_cast, mask=mask)
-
-    # Pre-shuffled store in the FlyDSL forward (16, 16) MFMA layout, byte-identical
-    # to shuffle_b(w_fp8) [N_shuf=M (rows), K_shuf=N (cols); BN=16, BK=32,
-    # K_inner=16 for 1-byte fp8]. shuffle_b reads element (row, col) at the 5D view
-    # index (i0, i1, i2, i3, i4) with row = i0*BN + i1, col = i2*BK + i3*K_inner + i4
-    # and writes it at permute(0, 2, 3, 1, 4); the flat offset below reproduces that
-    # exactly. Output is contiguous in runs of K_inner along the cols, so the store
-    # coalesces.
-    i0 = offs_m // BN_PS
-    i1 = offs_m % BN_PS
-    i2 = offs_n // BK_PS
-    i3 = (offs_n % BK_PS) // KIN_PS
-    i4 = offs_n % KIN_PS
-    ps_off = i4[None, :] + KIN_PS * (
-        i1[:, None] + BN_PS * (i3[None, :] + (BK_PS // KIN_PS) * (i2[None, :] + (N // BK_PS) * i0[:, None]))
-    )
-    tl.store(w_fp8_ps_ptr + ps_off, w_fp8_cast, mask=mask)
-
-    # Store scale (layout unchanged vs the plain weight quant).
-    scale_offs = pid_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
-    w_scales_inv = 1.0 / w_scales
-    tl.store(w_scales_ptr + scale_offs, w_scales_inv)
 
 
 @triton.jit
