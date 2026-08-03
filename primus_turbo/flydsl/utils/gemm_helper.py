@@ -603,9 +603,9 @@ class StoreCPerTensorCShuffle:
         # n_tiles_b=4 -> Cc=64 -> EPL=16), emit EPL//8 back-to-back 128b stores; EPL==8
         # (the 8-wave path) is a single store. EPL must be a multiple of 8 and fit in one row.
         self.elems_per_store = 8  # 16b elements packed into one 128b vector store
-        assert (
-            self.EPL % self.elems_per_store == 0 and self.EPL <= self.Cc
-        ), f"CShuffle expects EPL a multiple of 8 within Cc={self.Cc}; got EPL={self.EPL}"
+        assert self.EPL % self.elems_per_store == 0 and self.EPL <= self.Cc, (
+            f"CShuffle expects EPL a multiple of 8 within Cc={self.Cc}; got EPL={self.EPL}"
+        )
         # The ds_write_b16 staging + 128b re-read aliases LDS banks. row_pad=0 (default)
         # keeps the historical behavior. row_pad is an explicit opt-in: the caller must
         # size its own C_lds_shuffle allocation as n_waves*16*(n_tiles_b*16 + row_pad)
