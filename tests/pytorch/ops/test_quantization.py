@@ -64,6 +64,33 @@ def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, torch_compile, g
     torch.testing.assert_close(x_dq, x_dq_ref, **get_tolerances(dest_dtype))
 
 
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize("numel", [15, 16, 17, 2880, 2881])
+def test_quantize_fp8_tensorwise_pack16_matches_unaligned_fallback(orig_dtype, dest_dtype, numel):
+    """The aligned pack16 path must be byte-exact with the legacy fallback."""
+    torch.manual_seed(42)
+    x = torch.rand(numel, device="cuda", dtype=orig_dtype)
+    storage = torch.empty(numel + 1, device="cuda", dtype=orig_dtype)
+    x_unaligned = storage[1:]
+    x_unaligned.copy_(x)
+
+    assert x.data_ptr() % 32 == 0
+    assert x_unaligned.is_contiguous()
+    assert x_unaligned.data_ptr() % 32 != 0
+
+    x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=ScalingGranularity.TENSORWISE)
+    x_fp8_fallback, x_scale_inv_fallback = quantize_fp8(
+        x_unaligned,
+        dest_dtype,
+        granularity=ScalingGranularity.TENSORWISE,
+    )
+
+    assert x_fp8.data_ptr() % 16 == 0
+    assert torch.equal(x_fp8.view(torch.uint8), x_fp8_fallback.view(torch.uint8))
+    torch.testing.assert_close(x_scale_inv, x_scale_inv_fallback, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
