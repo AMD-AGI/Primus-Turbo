@@ -8,7 +8,7 @@
 
 Thin ``torch.autograd.Function`` that validates at the op boundary and delegates the actual
 orchestration to ``mega_moe_forward_fp8_impl`` / ``mega_moe_backward_fp8_impl`` in
-``pytorch/kernels/mega_moe``. Those impls are PLAIN functions, NOT the ``custom_op`` /
+``pytorch/kernels/fused_mega_moe``. Those impls are PLAIN functions, NOT the ``custom_op`` /
 ``AutoKernelDispatcher`` layer: the fp8 path carries state the custom_op schema can't hold --
 reuse of the forward's live symmetric buffer in backward and derived non-tensor handles (the
 bf16 mega MoE op is a plain autograd.Function for the same reason). The comm gates self-reset via
@@ -30,7 +30,7 @@ from typing import Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
-from primus_turbo.pytorch.kernels.mega_moe import (
+from primus_turbo.pytorch.kernels.fused_mega_moe import (
     mega_moe_backward_fp8_impl,
     mega_moe_forward_fp8_impl,
 )
@@ -38,7 +38,7 @@ from primus_turbo.pytorch.kernels.mega_moe import (
 # This op file exports only its own final API (the autograd Function + its wrapper). Everything else
 # (the per-stage ``_mxfp8_*`` helpers, ``_DW_FP8_FORMAT``, and the ``prepare_w1t/w2t_dgrad_fp8``
 # weight-prep) lives in the kernels layer -- callers import those from
-# ``primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl`` directly, not via this file.
+# ``primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl`` directly, not via this file.
 __all__ = [
     "MegaMoEFusedFP8Function",
     "mega_moe_fused_fp8",

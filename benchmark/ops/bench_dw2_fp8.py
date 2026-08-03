@@ -45,7 +45,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_variable_k_impl,
 )
-from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl import (
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
     _mxfp8_variable_k_wgrad_dw2,

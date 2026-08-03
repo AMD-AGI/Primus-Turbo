@@ -20,10 +20,10 @@ from primus_turbo.flydsl.mega.fp8 import (
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl import (
     prepare_dw1_pool_operand_fp8,
 )
-from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w1_fp8, prepare_w2_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w1_fp8, prepare_w2_fp8
 
 __all__ = [
     "mega_moe_forward_fp8_impl",

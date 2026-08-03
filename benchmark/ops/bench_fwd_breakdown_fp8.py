@@ -27,7 +27,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_rowwise_mxfp8_flydsl,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w2_fp8
 from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
 
 
@@ -88,7 +88,7 @@ def worker(local_rank, world, args):
     W1L = W1.detach().clone().requires_grad_(True)
     W2L = W2.detach().clone().requires_grad_(True)
 
-    from primus_turbo.pytorch.kernels.mega_moe.mega_moe_forward_fp8_impl import (
+    from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_forward_fp8_impl import (
         _w1_fp8_cached,
         _w2_fp8_cached,
     )

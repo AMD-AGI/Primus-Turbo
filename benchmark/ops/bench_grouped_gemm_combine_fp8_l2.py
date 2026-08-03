@@ -35,7 +35,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w2_fp8
 
 
 def _routing(T, K, E, *, device, seed):

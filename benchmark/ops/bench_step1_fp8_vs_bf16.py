@@ -11,7 +11,7 @@ dispatched_dy @ w2, NN, contract H -> [P, I]). Both legs run the SAME fused op:
   * fp8 : ``_dispatch_l2_dgrad_mxfp8_flydsl_kernel`` (fp8 PUSH, byte-halved comm + mxfp8 ~2x-compute GEMM),
           on the fp8 mega stack (SymLayout + two-heap symm).
   * bf16: ``dispatch_grouped_gemm_bf16_flydsl_kernel(dy, w2, handle=h, layout="nn")`` -- exactly
-          the L2-dgrad the bf16 ``mega_moe_fused`` backward uses (bf16 PUSH + bf16 GEMM), on the
+          the L2-dgrad the bf16 ``fused_mega_moe`` backward uses (bf16 PUSH + bf16 GEMM), on the
           bf16 mega stack.
 The two stacks are separate symm globals; we run fp8 fully, ``destroy()`` it, then run bf16 (no
 same-process coexistence). fp8 correctness is spot-checked vs a per-group torch ref (SNR).
@@ -37,7 +37,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     get_symm_buffer_for_mega_moe,
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
 )
-from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import _dispatch_l2_dgrad_mxfp8_flydsl_kernel
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl import _dispatch_l2_dgrad_mxfp8_flydsl_kernel
 
 _H_GROUP_OFFS = 10
 

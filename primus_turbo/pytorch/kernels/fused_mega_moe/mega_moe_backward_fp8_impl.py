@@ -35,7 +35,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8_flydsl,
     swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
 )
-from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w2_fp8
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float8_e5m2
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (

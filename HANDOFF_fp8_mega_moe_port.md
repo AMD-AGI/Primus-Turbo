@@ -20,7 +20,7 @@
 
 ## 1. 已定的关键设计决策(不要推翻,除非有新证据)
 
-1. **fp8 跳过 `pytorch/kernels/mega_moe` 的 custom_op / AutoKernelDispatcher 层**。直接在
+1. **fp8 跳过 `pytorch/kernels/fused_mega_moe` 的 custom_op / AutoKernelDispatcher 层**。直接在
    `pytorch/ops/moe/mega_moe_fused_fp8.py` 的 autograd Function 里 inline 编排(和源 repo 一致)。
    原因:fp8 前向/反向带着 custom_op schema 装不下的状态(可选权重预量化 tuple、复用 forward 的
    live symm buffer、host `synchronize()+barrier()` rendezvous)。

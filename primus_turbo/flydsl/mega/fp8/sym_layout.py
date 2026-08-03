@@ -12,7 +12,7 @@ the mega-MoE pipeline touches across TWO symmetric heaps:
   * the cached MAIN heap (``base`` / ``offsets_ptr``): pool, c_buffer, the cross-rank
     origin tables, weights, device scalars, GEMM intermediates;
   * the uncached SIGNAL heap (``signal_base`` / ``signal_offsets_ptr``): spin-wait
-    flags + the combine buffer (must bypass the cache, see mega_moe_fused).
+    flags + the combine buffer (must bypass the cache, see fused_mega_moe).
 
 Region byte offsets are recomputed from the struct's Constexpr dims and MUST match
 the host ``SymmBuffer`` allocation (same region order + 256B alignment). Each
@@ -68,7 +68,7 @@ class SymLayout:
 
 # ---------------------------------------------------------------------------
 # Memory layout: two heaps, each a 256B-aligned region packer. The region order
-# MUST mirror ``mega_moe_fused`` (``main`` list and ``_signal_regions``).
+# MUST mirror ``fused_mega_moe`` (``main`` list and ``_signal_regions``).
 # ---------------------------------------------------------------------------
 def _main_regions(sl):
     R, E = int(sl.num_ranks), int(sl.num_experts)

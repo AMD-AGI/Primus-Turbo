@@ -11,7 +11,7 @@ dispatch(dy)+fc2 dgrad -> SwiGLU^T -> dW2 -> STEP3 fc1 dgrad+combine -> dW1) and
 forward output and every gradient (dx, d_topk_w, dW1, dW2) against an ANALYTIC reference, with an
 SNR gate. Reports rough fwd+bwd latency against the bf16 op.
 
-The reference is analytic, NOT the bf16 ``mega_moe_fused`` op, because the bf16 backward combine
+The reference is analytic, NOT the bf16 ``fused_mega_moe`` op, because the bf16 backward combine
 loses a race that inflates a handful of dx rows by 4-9x on a run-to-run varying set of ranks. That
 made the old bf16-referenced dx gate report 3-19 dB at random while the fp8 path itself measures a
 flat 21.9 dB against truth. bf16 is still used for the LATENCY comparison, which the race does not
@@ -35,7 +35,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 import primus_turbo.pytorch  # noqa: F401
-from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused
+from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
 from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
 
 _ACT_CLAMP = 10.0  # matches ACTIVATION_CLAMP in flydsl/mega/swiglu_kernel.py
@@ -67,7 +67,7 @@ def _leaf(t):
 def _run_once(fp8, group, x, topk_idx, topk_w, W1, W2, grad_y):
     """One fwd+bwd; returns (y, dx, d_topk_w, dW1, dW2) with fresh leaf inputs."""
     xL, twL, W1L, W2L = _leaf(x), _leaf(topk_w), _leaf(W1), _leaf(W2)
-    op = mega_moe_fused_fp8 if fp8 else mega_moe_fused
+    op = mega_moe_fused_fp8 if fp8 else fused_mega_moe
     y = op(group, xL, topk_idx, twL, W1L, W2L)
     y.backward(grad_y)
     return y.detach(), xL.grad, twL.grad, W1L.grad, W2L.grad
@@ -187,7 +187,7 @@ def profile(group, args):
     def _fwd_bwd_bf16():
         for t in (xb, twb, W1b, W2b):
             t.grad = None
-        mega_moe_fused(group, xb, topk_idx, twb, W1b, W2b).backward(grad_y)
+        fused_mega_moe(group, xb, topk_idx, twb, W1b, W2b).backward(grad_y)
 
     # time each fully (its own warmup absorbs the use_mxfp8<->bf16 symm realloc on first call)
     t_fp8 = _bench(_fwd_bwd_fp8, warmup=args.warmup, iters=args.iters, group=group)

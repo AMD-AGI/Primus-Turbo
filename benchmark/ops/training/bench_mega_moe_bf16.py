@@ -12,7 +12,7 @@ Same CLI/stages as ``bench_mega_moe_fp8.py`` (compare the two runs' numbers offl
 
   --stage l1                 L1 = dispatch + fc1 (NT)
   --stage l2                 L2 = fc2 + combine (NT weighted)
-  --stage fwd                full forward (mega_moe_fused)
+  --stage fwd                full forward (fused_mega_moe)
   --stage dispatch_fc2_dgrad backward dispatch(dy) + fc2-dgrad (NN)
   --stage fc2_wgrad          backward dW2 (variable-K wgrad, Triton)
   --stage fc1_wgrad          backward dW1 (variable-K wgrad, Triton)
@@ -52,7 +52,7 @@ from primus_turbo.pytorch.core.backend import BackendType  # noqa: E402
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (  # noqa: E402
     grouped_gemm_variable_k_impl,
 )
-from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused  # noqa: E402
+from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe  # noqa: E402
 
 # bf16 dispatch-handle layout (see mega_moe_backward_impl): 5=tile_to_expert, 6=num_tokens_per_expert
 # (group_lens), 7=its prefix (group_offs), 8=num_tile_blocks.
@@ -177,7 +177,7 @@ def profile_fwd(group, args, mode):
     x, W1, W2, topk_idx, topk_w = generate_inputs(rank, world, T=T, H=H, I=I, E=E, K=K, mode=mode)
     with torch.no_grad():
         def _bf16():
-            return mega_moe_fused(group, x, topk_idx, topk_w, W1, W2)
+            return fused_mega_moe(group, x, topk_idx, topk_w, W1, W2)
         y = _bf16()
         fin = bool(torch.isfinite(y.float()).all())
         t_bf16 = _bench(_bf16, warmup=args.warmup, iters=args.iters, group=group)

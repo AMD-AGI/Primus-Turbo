@@ -13,7 +13,7 @@ intermediates (cached MAIN heap) AND the spin-wait flags + combine buffer
 single :class:`SymLayout` struct that recomputes the exact same offsets, so host
 views and device addresses agree. Inspired by ``deep_gemm/mega``.
 
-Moved out of ``primus_turbo.pytorch.ops.moe.mega_moe_fused`` (which re-exports
+Moved out of ``primus_turbo.pytorch.ops.moe.fused_mega_moe`` (which re-exports
 these names for backward compatibility) so the FlyDSL kernels can build the
 symmetric workspace without importing the torch-op layer.
 """
@@ -24,7 +24,7 @@ from primus_turbo.flydsl.mega.fp8.sym_layout import build_sym_layout
 from primus_turbo.flydsl.mega.fp8.sym_layout import layout as _sym_region_layout
 
 # NOTE: SymmetricMemory is imported lazily inside SymmBuffer.__init__ to avoid a
-# circular import (importing the pytorch package pulls in mega_moe_fused, which
+# circular import (importing the pytorch package pulls in fused_mega_moe, which
 # imports back from this module).
 
 __all__ = [

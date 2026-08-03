@@ -7,7 +7,7 @@
 """End-to-end forward validation for the fp8 mega MoE op.
 
 Compares the fp8 forward ``mega_moe_fused_fp8`` (L1 fused mxfp8 dispatch+fc1 -> SwiGLU -> L2 fp8
-combine) against the bf16 ``mega_moe_fused`` on identical inputs, with an SNR/cos gate, and reports
+combine) against the bf16 ``fused_mega_moe`` on identical inputs, with an SNR/cos gate, and reports
 rough per-op latency. Forward-only (no_grad); the fp8 backward is not ported yet.
 
 Run inside the dev container (8 GPUs):
@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 
 import primus_turbo.pytorch  # noqa: F401
-from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused
+from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
 from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
 
 
@@ -86,13 +86,13 @@ def profile(group, args):
           f"nan={bool(torch.isnan(y_fp8).any())} inf={bool(torch.isinf(y_fp8).any())}", flush=True)
     if args.only == "fp8":
         return {"snr": 0.0, "cos": 0.0, "t_bf16": 1.0, "t_fp8": 1.0}
-    y_bf16 = mega_moe_fused(group, x, topk_idx, topk_w, W1, W2)
+    y_bf16 = fused_mega_moe(group, x, topk_idx, topk_w, W1, W2)
     print(f"[rank{rank}] bf16 norm={float(y_bf16.float().norm()):.4e} "
           f"nan={bool(torch.isnan(y_bf16).any())}", flush=True)
     snr = _snr_db(y_bf16, y_fp8)
     cos = _cos(y_bf16, y_fp8)
 
-    t_bf16 = _bench(lambda: mega_moe_fused(group, x, topk_idx, topk_w, W1, W2),
+    t_bf16 = _bench(lambda: fused_mega_moe(group, x, topk_idx, topk_w, W1, W2),
                     warmup=args.warmup, iters=args.iters, group=group)
     t_fp8 = _bench(lambda: mega_moe_fused_fp8(group, x, topk_idx, topk_w, W1, W2),
                    warmup=args.warmup, iters=args.iters, group=group)

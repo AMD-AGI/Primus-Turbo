@@ -31,7 +31,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     get_symm_buffer_for_mega_moe,
     quantize_rowwise_mxfp8_flydsl,
 )
-from primus_turbo.pytorch.kernels.mega_moe.mega_moe_forward_fp8_impl import _w1_fp8_cached
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_forward_fp8_impl import _w1_fp8_cached
 
 
 def _bench(fn, *, warmup, iters, group):

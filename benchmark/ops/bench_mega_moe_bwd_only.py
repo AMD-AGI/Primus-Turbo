@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 
 import primus_turbo.pytorch  # noqa: F401
-from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused
+from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
 from primus_turbo.pytorch.ops.moe.mega_moe_fused_fp8 import mega_moe_fused_fp8
 
 _ROW_LABEL_W = 14
@@ -135,7 +135,7 @@ def _profile_routing(group, args, *, x, W1, W2, grad_y, topk_idx, topk_w):
 
     if args.only in ("both", "bf16"):
         bf16 = _profile_op(
-            mega_moe_fused, group, x, topk_idx, topk_w, W1, W2, grad_y,
+            fused_mega_moe, group, x, topk_idx, topk_w, W1, W2, grad_y,
             warmup=args.warmup, iters=args.iters,
         )
         bf16 = tuple(_amax(group, t) for t in bf16)

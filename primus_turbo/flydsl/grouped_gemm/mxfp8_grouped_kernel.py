@@ -1335,7 +1335,7 @@ def _select_wgrad_cfg(at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, out_view, a
     cached = _GWG_CFG_CACHE.get(at_key)
     if cached is not None:
         return cached
-    if not _GNT_AUTOTUNE or torch.cuda.is_current_stream_capturing():
+    if torch.cuda.is_current_stream_capturing():
         return _GWG_WGRAD_DEFAULT_CFG  # don't cache under capture -> autotune on a later eager call
     cands = [c for c in _gwg_wgrad_candidates() if OUT_M % c[0] == 0 and OUT_N % c[1] == 0]
     try:

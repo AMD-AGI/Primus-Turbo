@@ -96,13 +96,13 @@ from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     quantize_rowwise_mxfp8_flydsl,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.mega_moe.weight_prep_fp8 import prepare_w2_fp8  # noqa: E402
+from primus_turbo.pytorch.kernels.fused_mega_moe.weight_prep_fp8 import prepare_w2_fp8  # noqa: E402
 from primus_turbo.pytorch.core.backend import BackendType  # noqa: E402
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity  # noqa: E402
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (  # noqa: E402
     grouped_gemm_fp8_variable_k_impl,
 )
-from primus_turbo.pytorch.kernels.mega_moe.mega_moe_backward_fp8_impl import (  # noqa: E402  (fp8 bwd stages)
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_backward_fp8_impl import (  # noqa: E402  (fp8 bwd stages)
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
     _mxfp8_variable_k_wgrad_dw1,
@@ -342,7 +342,7 @@ def profile_dispatch_fc2_dgrad(group, args, mode):
     GEMM (grad_swiglu = dispatched_dy @ w2, NN, contract H -> [P, I]). Both legs the SAME fused op:
       * fp8  : ``_dispatch_l2_dgrad_mxfp8_flydsl_kernel`` (fp8 PUSH byte-halved comm + mxfp8 ~2x GEMM), fp8 stack
       * bf16 : ``dispatch_grouped_gemm_bf16_flydsl_kernel(dy, w2, layout='nn')`` -- exactly the
-               L2-dgrad the bf16 ``mega_moe_fused`` backward uses, bf16 stack.
+               L2-dgrad the bf16 ``fused_mega_moe`` backward uses, bf16 stack.
     Separate symm globals: run fp8 fully, ``destroy()``, then bf16 (no coexistence). Fast fused
     kernels -> back-to-back timing. Accuracy: grad_swiglu vs per-group bf16 ref over this stage's own
     dispatched-dy pool (SNR)."""
