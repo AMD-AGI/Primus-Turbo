@@ -63,12 +63,11 @@ void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, cons
     // their existing dispatch widths.
     constexpr int32_t PACK16 = 16;
     if constexpr (sizeof(FType) * PACK16 == 32 && sizeof(QType) * PACK16 == 16) {
-        const bool aligned = reinterpret_cast<uintptr_t>(x) % 32 == 0 &&
-                             reinterpret_cast<uintptr_t>(y) % 16 == 0;
+        const bool aligned =
+            reinterpret_cast<uintptr_t>(x) % 32 == 0 && reinterpret_cast<uintptr_t>(y) % 16 == 0;
         if (aligned) {
             PackedEltwiseConfig pack_cfg(n, PACK16, BLOCK_SIZE);
-            unary_kernel<BLOCK_SIZE, PACK16, FType, QType,
-                         QuantTensorwiseScalePtrOp<ComputeType>>
+            unary_kernel<BLOCK_SIZE, PACK16, FType, QType, QuantTensorwiseScalePtrOp<ComputeType>>
                 <<<pack_cfg.nBlock, BLOCK_SIZE, 0, stream>>>(x, y, op, pack_cfg);
             return;
         }
