@@ -36,8 +36,10 @@ from primus_turbo.flydsl.gemm.blockscale_fp8_gemm.utils import (
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     S2RLoader,
+    S2RLoaderTr,
     ceildiv,
     compute_global_swizzle,
+    compute_global_swizzle_nn,
     pack_i32x4_i32x8,
     wait_barrier,
 )
@@ -61,6 +63,7 @@ def compile_blockscale_fp8_gemm_8w_3stage(
     priority_includes_fold: bool = False,
     pipeline_wait_count: int = 6,
     wait_delay_thunks: int = 2,
+    physical_b_nn: bool = False,
 ):
     """Return a fixed-shape gfx950 block-scale GEMM launcher.
 
@@ -115,6 +118,8 @@ def compile_blockscale_fp8_gemm_8w_3stage(
     large_a = M * K > 0xFFFFFFFF
     large_b = N * K > 0xFFFFFFFF
     large_output = M * N * 2 > 0xFFFFFFFF
+    if physical_b_nn and large_b:
+        raise ValueError("physical_b_nn does not yet support B tensors larger than 4 GiB")
 
     a_lds_size = block_m * block_k
     b_lds_size = block_n * block_k
@@ -178,7 +183,11 @@ def compile_blockscale_fp8_gemm_8w_3stage(
             a_global_offset = (tile_m * block_m) * K
             gA_base = make_fp8_buffer_tensor(A, f8_ir_type)
             gA = fx.make_view(fx.get_iter(gA_base), fx.make_layout(m_extent * K, 1))
-        if const_expr(large_b):
+        if const_expr(physical_b_nn):
+            b_global_offset = tile_n * block_n
+            gB_base = make_fp8_buffer_tensor(B, f8_ir_type)
+            gB = fx.make_view(fx.get_iter(gB_base), fx.make_layout(n_extent * K, 1))
+        elif const_expr(large_b):
             b_global_offset = fx.Int32(0)
             b_total_bytes = fx.Index(N) * K
             b_base_off_bytes = fx.Index(tile_n) * block_n * K
@@ -208,16 +217,38 @@ def compile_blockscale_fp8_gemm_8w_3stage(
             K,
             n_lds_rounds_a,
         )
-        gl_off_b = compute_global_swizzle(
-            lane_id,
-            wave_id,
-            K,
-            n_lds_rounds_b,
-        )
+        if const_expr(physical_b_nn):
+            gl_off_b = compute_global_swizzle_nn(
+                lane_id,
+                wave_id,
+                N,
+                n_lds_rounds_b,
+                width=block_n,
+                wswz=True,
+            )
+        else:
+            gl_off_b = compute_global_swizzle(
+                lane_id,
+                wave_id,
+                K,
+                n_lds_rounds_b,
+            )
         a_g2s = G2SLoader(ga_div, gl_off_a, n_lds_rounds_a, f8_ir_type, wave_id)
         b_g2s = G2SLoader(gb_div, gl_off_b, n_lds_rounds_b, f8_ir_type, wave_id)
         a_s2r = S2RLoader(wave_m, n_tiles_a)
-        b_s2r = S2RLoader(wave_n, n_tiles_b)
+        if const_expr(physical_b_nn):
+            b_s2r = S2RLoaderTr(
+                wave_n,
+                n_tiles_b,
+                n_tiles_b * 16,
+                inline_asm=True,
+                vmcnt_hint=-1,
+                n_waves=8,
+                width=block_n,
+                wswz=True,
+            )
+        else:
+            b_s2r = S2RLoader(wave_n, n_tiles_b)
         mfma = _BlockScaleMfma(
             n_tiles_a,
             n_tiles_b,
@@ -357,13 +388,22 @@ def compile_blockscale_fp8_gemm_8w_3stage(
             g2s_thunks += _g2s_thunks(
                 b_g2s,
                 future_b,
-                fx.Int32(b_global_offset) + future_k,
+                fx.Int32(b_global_offset) + future_k * fx.Int32(N if physical_b_nn else 1),
                 n_lds_rounds_b,
             )
             next_a_halves = [[None, None] for _ in range(n_tiles_a)]
-            next_b_halves = [[None, None] for _ in range(n_tiles_b)]
             s2r_thunks = _s2r_thunks(a_s2r, next_a, next_a_halves, n_tiles_a)
-            s2r_thunks += _s2r_thunks(b_s2r, next_b, next_b_halves, n_tiles_b)
+            if const_expr(physical_b_nn):
+                next_b_calls = [None for _ in range(n_tiles_b)]
+                for tile in range_constexpr(n_tiles_b):
+
+                    def load(tile=tile):
+                        next_b_calls[tile] = b_s2r._issue_one(next_b, tile)
+
+                    s2r_thunks.append(load)
+            else:
+                next_b_halves = [[None, None] for _ in range(n_tiles_b)]
+                s2r_thunks += _s2r_thunks(b_s2r, next_b, next_b_halves, n_tiles_b)
 
             if const_expr(prefetch_before_wait):
                 # Six new G2S requests join the six requests from the previous
@@ -413,7 +453,11 @@ def compile_blockscale_fp8_gemm_8w_3stage(
                 interleave=interleave,
             )
             next_a_frag = [pack_i32x4_i32x8(halves[0], halves[1]) for halves in next_a_halves]
-            next_b_frag = [pack_i32x4_i32x8(halves[0], halves[1]) for halves in next_b_halves]
+            if const_expr(physical_b_nn):
+                S2RLoaderTr._wait_lgkmcnt(0)
+                next_b_frag = [S2RLoaderTr._assemble(calls) for calls in next_b_calls]
+            else:
+                next_b_frag = [pack_i32x4_i32x8(halves[0], halves[1]) for halves in next_b_halves]
             return next_a_frag, next_b_frag, c_frag
 
         def _finish_two_tiles(
@@ -448,7 +492,7 @@ def compile_blockscale_fp8_gemm_8w_3stage(
         b_g2s.load(b0, b_global_offset)
         if const_expr(k_iters > 1):
             a_g2s.load(a1, a_global_offset + block_k)
-            b_g2s.load(b1, b_global_offset + block_k)
+            b_g2s.load(b1, b_global_offset + block_k * (N if physical_b_nn else 1))
         wait_barrier(0)
         a_frag = a_s2r.load(a0)
         b_frag = b_s2r.load(b0)
@@ -575,6 +619,19 @@ def compile_blockscale_fp8_gemm_8w_3stage(
     return launch_gemm
 
 
+def compile_blockscale_fp8_gemm_nn_fused_8w(*, M: int, N: int, K: int, **kwargs):
+    """Compile physical NN ``A[M,K] @ B[K,N]`` with B transposed while loading LDS."""
+
+    return compile_blockscale_fp8_gemm_8w_3stage(
+        K=K,
+        M=M,
+        N=N,
+        scale_a_k_major=False,
+        physical_b_nn=True,
+        **kwargs,
+    )
+
+
 def compile_blockscale_fp8_gemm_nn_physical_8w(*, M: int, N: int, K: int, **kwargs):
     """Compile physical NN ``A[M,K] @ B[K,N]`` with a tiled B transpose."""
 
@@ -601,5 +658,6 @@ def compile_blockscale_fp8_gemm_nn_physical_8w(*, M: int, N: int, K: int, **kwar
 
 __all__ = [
     "compile_blockscale_fp8_gemm_8w_3stage",
+    "compile_blockscale_fp8_gemm_nn_fused_8w",
     "compile_blockscale_fp8_gemm_nn_physical_8w",
 ]

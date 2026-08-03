@@ -239,23 +239,36 @@ def _gemm_fp8_blockwise_dgrad(
         }
     )
     use_8wave = config["family"] == "8wave_3stage"
+    fuse_8wave_transpose = use_8wave and N * K <= _MAX_BUFFER_BYTES
     if use_8wave:
         weight_scale_arg = weight_scale_inv.T.contiguous()
     else:
         weight_scale_arg = weight_scale_inv
 
     out = torch.empty((M, K), dtype=out_dtype, device=grad_out_fp8.device)
-    weight_t = torch.empty((K, N), dtype=weight_fp8.dtype, device=weight_fp8.device)
     stream = torch.cuda.current_stream(grad_out_fp8.device)
-    args = (
-        grad_out_fp8.view(torch.int8),
-        weight_fp8.view(torch.int8),
-        out,
-        grad_out_scale_inv,
-        weight_scale_arg,
-        weight_t.view(torch.int8),
-        stream,
-    )
+    if fuse_8wave_transpose:
+        args = (
+            grad_out_fp8.view(torch.int8),
+            weight_fp8.view(torch.int8),
+            out,
+            grad_out_scale_inv,
+            weight_scale_arg,
+            M,
+            K,
+            stream,
+        )
+    else:
+        weight_t = torch.empty((K, N), dtype=weight_fp8.dtype, device=weight_fp8.device)
+        args = (
+            grad_out_fp8.view(torch.int8),
+            weight_fp8.view(torch.int8),
+            out,
+            grad_out_scale_inv,
+            weight_scale_arg,
+            weight_t.view(torch.int8),
+            stream,
+        )
     out_dtype_name = _out_dtype_name(out_dtype)
     key = (
         "dgrad",
@@ -265,14 +278,21 @@ def _gemm_fp8_blockwise_dgrad(
         K,
         N,
         out_dtype_name,
+        fuse_8wave_transpose,
         tuple(sorted(config.items())),
     )
     if use_8wave:
         from primus_turbo.flydsl.gemm.blockscale_fp8_gemm.eight_wave_blockwise_fp8_gemm_kernel import (
+            compile_blockscale_fp8_gemm_nn_fused_8w,
             compile_blockscale_fp8_gemm_nn_physical_8w,
         )
 
-        build = lambda: compile_blockscale_fp8_gemm_nn_physical_8w(
+        compile_8wave = (
+            compile_blockscale_fp8_gemm_nn_fused_8w
+            if fuse_8wave_transpose
+            else compile_blockscale_fp8_gemm_nn_physical_8w
+        )
+        build = lambda: compile_8wave(
             M=M,
             N=K,
             K=N,
@@ -280,7 +300,6 @@ def _gemm_fp8_blockwise_dgrad(
             fold_group_size=config["fold_group_size"],
             interleave_width=config["interleave_width"],
             wait_delay_thunks=config["wait_delay_thunks"],
-            scale_a_k_major=False,
             group_m=config.get("group_m", 4),
         )
     else:

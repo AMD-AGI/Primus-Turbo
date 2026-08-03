@@ -433,6 +433,62 @@ def test_gemm_fp8_blockwise_flydsl_8wave_3stage_poc():
     torch.testing.assert_close(c8, c4, rtol=0, atol=0)
 
 
+def test_gemm_fp8_blockwise_flydsl_8wave_fused_nn():
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
+
+    import flydsl.compiler as flyc
+
+    from primus_turbo.flydsl.gemm.blockscale_fp8_gemm import (
+        compile_blockscale_fp8_gemm_nn_fused_8w,
+        compile_blockscale_fp8_gemm_nn_physical_8w,
+    )
+
+    m, n, k = 256, 128, 640
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(103)
+    a = (torch.randn((m, k), device="cuda", generator=generator) * 0.25).to(torch.float8_e4m3fn)
+    b = (torch.randn((k, n), device="cuda", generator=generator) * 0.25).to(torch.float8_e4m3fn)
+    scale_a = torch.rand((m, k // 128), device="cuda", generator=generator)
+    scale_b = torch.rand((n // 128, k // 128), device="cuda", generator=generator)
+    c_workspace = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    c_fused = torch.empty_like(c_workspace)
+    b_workspace = torch.empty((n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    stream = torch.cuda.current_stream()
+    args_workspace = (
+        a.view(torch.int8).view(-1),
+        b.view(torch.int8).view(-1),
+        c_workspace.view(-1),
+        scale_a.view(-1),
+        scale_b.view(-1),
+        b_workspace.view(torch.int8).view(-1),
+        stream,
+    )
+    args_fused = (
+        a.view(torch.int8).view(-1),
+        b.view(torch.int8).view(-1),
+        c_fused.view(-1),
+        scale_a.view(-1),
+        scale_b.view(-1),
+        m,
+        n,
+        stream,
+    )
+    config = {"fold_group_size": 4, "interleave_width": 1, "wait_delay_thunks": 0}
+    fn_workspace = flyc.compile(
+        compile_blockscale_fp8_gemm_nn_physical_8w(M=m, N=n, K=k, **config),
+        *args_workspace,
+    )
+    fn_fused = flyc.compile(
+        compile_blockscale_fp8_gemm_nn_fused_8w(M=m, N=n, K=k, **config),
+        *args_fused,
+    )
+    fn_workspace(*args_workspace)
+    fn_fused(*args_fused)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c_fused, c_workspace, rtol=0, atol=0)
+
+
 def test_gemm_fp8_blockwise_flydsl_4wave_unroll6():
     if get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL fp8 GEMM is gfx950-only")

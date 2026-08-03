@@ -25,6 +25,7 @@ from .dispatch import (
 )
 from .eight_wave_blockwise_fp8_gemm_kernel import (
     compile_blockscale_fp8_gemm_8w_3stage,
+    compile_blockscale_fp8_gemm_nn_fused_8w,
     compile_blockscale_fp8_gemm_nn_physical_8w,
 )
 from .four_wave_blockwise_fp8_gemm_kernel import (
@@ -40,6 +41,7 @@ __all__ = [
     "compile_blockscale_fp8_gemm_4w",
     "compile_blockscale_fp8_gemm_8w_3stage",
     "compile_blockscale_fp8_gemm_nn_4w",
+    "compile_blockscale_fp8_gemm_nn_fused_8w",
     "compile_blockscale_fp8_gemm_nn_physical_4w",
     "compile_blockscale_fp8_gemm_nn_physical_8w",
     "compile_blockscale_fp8_gemm_tn_4w",
