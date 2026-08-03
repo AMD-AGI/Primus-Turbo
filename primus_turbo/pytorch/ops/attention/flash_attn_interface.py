@@ -752,7 +752,6 @@ class FlydslFlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
-        lse_bhsq = lse.view(ctx.B, ctx.Sq, ctx.Hq).permute(0, 2, 1).contiguous()  # [B, Hq, Sq]
 
         grads = flash_attn_varlen_flydsl_backward_impl(
             dout,
@@ -760,7 +759,7 @@ class FlydslFlashAttnVarlenFunc(torch.autograd.Function):
             k,
             v,
             out,
-            lse_bhsq,
+            lse,  # packed [total_q, Hq]; the impl transposes internally for the uniform path
             cu_seqlens_q,
             cu_seqlens_k,
             ctx.max_seqlen_q,
