@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Full mega MoE e2e timing: fwd+bwd, fwd-only, and bwd-only (fp8 vs bf16).
+"""Full mega MoE e2e timing: fwd+bwd, fwd-only, and bwd-only, across op variants.
 
-All three legs use the same persistent leaf tensors so fp8 weight-quant caches hit
-across iters (mirrors training). Cross-check: fwd+bwd ~= fwd-only + bwd-only.
+Variants: ``fp8`` (single fused op), ``fp8_staged`` (the two-stage gate-up / gate-down split),
+``bf16``. All legs use the same persistent leaf tensors so fp8 weight-quant caches hit across iters
+(mirrors training). Cross-check: fwd+bwd ~= fwd-only + bwd-only.
 
 Run (8 GPUs):
   PYTHONPATH=<repo> python benchmark/ops/bench_mega_moe_bwd_only.py \\
     --num-processes 8 --num-tokens 8192 --routing-mode both --warmup 8 --iters 25
+  # staged-vs-fused fp8 split regression check:
+  PYTHONPATH=<repo> python benchmark/ops/bench_mega_moe_bwd_only.py --only fp8_split
 """
 
 import argparse
@@ -20,10 +23,38 @@ import torch.distributed as dist
 
 import primus_turbo.pytorch  # noqa: F401
 from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
-from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8
+from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
+    fused_mega_moe_fp8,
+    fused_mega_moe_fp8_stage1,
+    fused_mega_moe_fp8_stage2,
+)
 
 _ROW_LABEL_W = 14
 _COL_W = 11
+
+
+def _fused_mega_moe_fp8_staged(group, x, topk_idx, topk_weights, W1, W2):
+    """The two-stage fp8 split behind the single-op signature the bench drives."""
+    l1, dispatch_weights, handle, state = fused_mega_moe_fp8_stage1(x, topk_idx, topk_weights, W1, group)
+    return fused_mega_moe_fp8_stage2(
+        l1, dispatch_weights, handle, state, topk_idx, topk_weights, W2, group
+    )
+
+
+_OPS = {
+    "fp8": fused_mega_moe_fp8,
+    "fp8_staged": _fused_mega_moe_fp8_staged,
+    "bf16": fused_mega_moe,
+}
+# --only -> which legs to time, in print order. The first leg is the ratio denominator.
+_LEG_SETS = {
+    "both": ["fp8", "bf16"],
+    "all": ["fp8", "fp8_staged", "bf16"],
+    "fp8_split": ["fp8", "fp8_staged"],
+    "fp8": ["fp8"],
+    "fp8_staged": ["fp8_staged"],
+    "bf16": ["bf16"],
+}
 
 
 def _routing(T, K, E, *, device, seed, mode):
@@ -124,51 +155,35 @@ def _amax(group, v):
 
 
 def _profile_routing(group, args, *, x, W1, W2, grad_y, topk_idx, topk_w):
-    if args.only in ("both", "fp8"):
-        fp8 = _profile_op(
-            fused_mega_moe_fp8, group, x, topk_idx, topk_w, W1, W2, grad_y,
+    """-> ``{leg: (t_fwd_bwd, t_fwd, t_bwd)}`` for every leg ``--only`` selected."""
+    out = {}
+    for leg in _LEG_SETS[args.only]:
+        t = _profile_op(
+            _OPS[leg], group, x, topk_idx, topk_w, W1, W2, grad_y,
             warmup=args.warmup, iters=args.iters,
         )
-        fp8 = tuple(_amax(group, t) for t in fp8)
-    else:
-        fp8 = (0.0, 0.0, 0.0)
-
-    if args.only in ("both", "bf16"):
-        bf16 = _profile_op(
-            fused_mega_moe, group, x, topk_idx, topk_w, W1, W2, grad_y,
-            warmup=args.warmup, iters=args.iters,
-        )
-        bf16 = tuple(_amax(group, t) for t in bf16)
-    else:
-        bf16 = (0.0, 0.0, 0.0)
-    return fp8, bf16
+        out[leg] = tuple(_amax(group, v) for v in t)
+    return out
 
 
-def _print_routing_table(routing_mode, fp8, bf16, *, only):
+def _print_routing_table(routing_mode, timings):
     w = _ROW_LABEL_W
     c = _COL_W
     sep = "-" * (w + 3 * c)
     print(f"\n{routing_mode:<{w}}{'fwd+bwd':>{c}}{'fwd-only':>{c}}{'bwd-only':>{c}}")
     print(sep)
-    if only in ("both", "fp8"):
-        print(f"{'fp8':<{w}}{fp8[0]:>{c}.3f}{fp8[1]:>{c}.3f}{fp8[2]:>{c}.3f}")
-    if only in ("both", "bf16"):
-        print(f"{'bf16':<{w}}{bf16[0]:>{c}.3f}{bf16[1]:>{c}.3f}{bf16[2]:>{c}.3f}")
-    if only == "both":
-        ratio = tuple(b / f if f > 0 else 0.0 for f, b in zip(fp8, bf16))
+    for leg, t in timings.items():
+        print(f"{leg:<{w}}{t[0]:>{c}.3f}{t[1]:>{c}.3f}{t[2]:>{c}.3f}")
+    legs = list(timings)
+    base = timings[legs[0]]
+    for leg in legs[1:]:
+        ratio = tuple(o / b if b > 0 else 0.0 for b, o in zip(base, timings[leg]))
+        label = f"{leg}/{legs[0]}"
+        print(f"{label:<{w}}" + "".join(f"{r:>{c - 1}.2f}x" for r in ratio))
+    for leg, t in timings.items():
         print(
-            f"{'bf16/fp8':<{w}}"
-            f"{ratio[0]:>{c}.2f}x"
-            f"{ratio[1]:>{c}.2f}x"
-            f"{ratio[2]:>{c}.2f}x"
-        )
-        print(
-            f"\n  cross-check fp8 : fwd+bwd={fp8[0]:.3f} ms  "
-            f"fwd+bwd_est={fp8[1] + fp8[2]:.3f} ms  (fwd-only + bwd-only)"
-        )
-        print(
-            f"  cross-check bf16: fwd+bwd={bf16[0]:.3f} ms  "
-            f"fwd+bwd_est={bf16[1] + bf16[2]:.3f} ms  (fwd-only + bwd-only)"
+            f"\n  cross-check {leg:<10}: fwd+bwd={t[0]:.3f} ms  "
+            f"fwd+bwd_est={t[1] + t[2]:.3f} ms  (fwd-only + bwd-only)"
         )
 
 
@@ -212,11 +227,11 @@ def worker(local_rank, world, args):
 
         for routing_mode in routing_modes:
             topk_idx, topk_w = _routing(T, K, E, device="cuda", seed=100 + rank, mode=routing_mode)
-            fp8, bf16 = _profile_routing(
+            timings = _profile_routing(
                 group, args, x=x, W1=W1, W2=W2, grad_y=grad_y, topk_idx=topk_idx, topk_w=topk_w,
             )
             if rank == 0:
-                _print_routing_table(routing_mode, fp8, bf16, only=args.only)
+                _print_routing_table(routing_mode, timings)
             torch.cuda.synchronize()
             group.barrier()
     finally:
@@ -225,7 +240,7 @@ def worker(local_rank, world, args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="mega MoE e2e fwd+bwd / fwd-only / bwd-only timing (fp8 vs bf16)"
+        description="mega MoE e2e fwd+bwd / fwd-only / bwd-only timing (fp8 / fp8_staged / bf16)"
     )
     ap.add_argument("--num-processes", type=int, default=8)
     ap.add_argument("--hidden", type=int, default=7168)
@@ -235,7 +250,7 @@ def main():
     ap.add_argument("--num-tokens", type=int, default=8192)
     ap.add_argument("--warmup", type=int, default=8)
     ap.add_argument("--iters", type=int, default=25)
-    ap.add_argument("--only", choices=["both", "fp8", "bf16"], default="both")
+    ap.add_argument("--only", choices=list(_LEG_SETS), default="both")
     ap.add_argument(
         "--routing-mode",
         choices=["load_balanced", "round_robin", "both"],

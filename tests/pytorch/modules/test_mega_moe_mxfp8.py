@@ -16,11 +16,15 @@ Stages:
   * Stage 1 (this file): ``test_l1_dispatch_fc1_bench`` -- L1 = fused mxfp8 dispatch + fc1.
   # * next: L2 combine / STEP1 / dW2 / dW1 / STEP3 (added incrementally).
 
+Also holds ``test_staged_vs_fused_parity``: the two-stage (gate-up / gate-down) fp8 op pair must
+reproduce the single fused fp8 op, since it is the same kernels in the same order cut at ``l1``.
+
 Run inside the dev container (8 GPUs):
   PYTHONPATH=<repo> python tests/pytorch/modules/test_mega_moe_mxfp8.py
   # or: PYTHONPATH=<repo> pytest tests/pytorch/modules/test_mega_moe_mxfp8.py -k l1 -q -s
 """
 
+import math
 import os
 
 import numpy as np
@@ -225,6 +229,98 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         dist.destroy_process_group()
         self.assertGreaterEqual(cos_m, 0.99, f"L1 cos {cos_m:.5f} < 0.99")
         self.assertLessEqual(rel_m, 0.05, f"L1 rel {rel_m:.4f} > 0.05")
+
+    # ──────────────── two-stage split parity: staged fp8 == fused fp8 ────────────────
+    @skip_if_lt_x_gpu(_WORLD)
+    @parametrize("top_k", [8])
+    def test_staged_vs_fused_parity(self, top_k):
+        """``fused_mega_moe_fp8_stage1/stage2`` vs the single fused ``fused_mega_moe_fp8``.
+
+        The split only moves the autograd boundary to ``l1`` (pre-SwiGLU) -- same kernels, same
+        order -- so the two must be numerically interchangeable.
+
+        The gate is calibrated against the op's OWN run-to-run spread rather than a fixed
+        tolerance, because neither mega MoE path is bit-reproducible: the combine sums each token's
+        top-k contributions cross-rank in arrival order, so bf16 rounding lands differently every
+        call (the bf16 op shows the same effect; at ``top_k=1``, with one contribution per token and
+        no backward, the fp8 forward IS bit-exact). Measuring that floor from two fused runs and
+        requiring staged-vs-fused to stay inside 2x it keeps the test sensitive to a real split bug
+        -- any mis-threaded state blows past the floor by orders of magnitude -- without chasing
+        reduce order. ``dW1`` / ``dW2`` / ``d(topk_weights)`` barely move run to run, so ``_ABS_TOL``
+        is what actually gates them."""
+        if not check_mxfp8_support():
+            self.skipTest("MXFP8 requires gfx950")
+        self._init_process()
+        group = self._ep_group()
+        from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
+            fused_mega_moe_fp8,
+            fused_mega_moe_fp8_stage1,
+            fused_mega_moe_fp8_stage2,
+        )
+
+        dev = self.device
+        epr = _E // self.world_size
+        H, I, E, T, K = _H, _I, _E, _T, top_k
+
+        # source RNG sequence: x -> w1 -> w2 -> gate (seed 123+rank set in _init_process)
+        x0 = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
+        w1_0 = torch.randn(epr, 2 * I, H, device=dev, dtype=torch.bfloat16) * (2.0 / math.sqrt(H))
+        w2_0 = torch.randn(epr, H, I, device=dev, dtype=torch.bfloat16) * (2.0 / math.sqrt(I))
+        gate = torch.randn(T, E, device=dev)
+        topk_w0, topk_idx = torch.sigmoid(gate).topk(K, dim=-1)
+        topk_w_0 = (topk_w0 / (topk_w0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32)
+        grad_y = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
+
+        def _leaves():
+            """Fresh leaves per run so the version-keyed weight-quant caches stay independent."""
+            return tuple(t.detach().clone().requires_grad_(True) for t in (x0, topk_w_0, w1_0, w2_0))
+
+        def _run(staged):
+            xL, twL, w1L, w2L = _leaves()
+            if staged:
+                l1, dispatch_weights, handle, state = fused_mega_moe_fp8_stage1(
+                    xL, topk_idx, twL, w1L, group
+                )
+                y = fused_mega_moe_fp8_stage2(
+                    l1, dispatch_weights, handle, state, topk_idx, twL, w2L, group
+                )
+            else:
+                y = fused_mega_moe_fp8(group, xL, topk_idx, twL, w1L, w2L)
+            y.backward(grad_y)
+            # Both paths drive the same process-global symm buffer, so one run must finish its
+            # backward before the next forward overwrites the pool.
+            torch.cuda.synchronize(); group.barrier()
+            return (y.detach(), xL.grad, twL.grad, w1L.grad, w2L.grad)
+
+        def _rel(ref, act):
+            r, a = ref.float().flatten(), act.float().flatten()
+            return self._amax(group, float((a - r).norm() / (r.norm() + 1e-12)))
+
+        _run(staged=False)  # discard: the first call of the process is a cold-start outlier
+        fused_a, fused_b, staged = _run(False), _run(False), _run(True)
+
+        tags = ("y", "dx", "dtopk_weights", "dW1", "dW2")
+        abs_tol, floor_slack = 1e-3, 2.0
+        stats = []
+        for tag, ref, other, act in zip(tags, fused_a, fused_b, staged):
+            floor = _rel(ref, other)
+            stats.append((tag, floor, _rel(ref, act), max(floor_slack * floor, abs_tol)))
+
+        if self.rank == 0:
+            print(f"\n{'='*72}")
+            print(f"[staged vs fused fp8 parity]  EP{self.world_size} T={T} H={H} I={I} E={E} K={K}")
+            print(f"{'='*72}")
+            for tag, floor, cross, limit in stats:
+                verdict = "PASS" if cross <= limit else "FAIL"
+                print(f"  {tag:<14}: staged_vs_fused={cross:.6f}  fused_self={floor:.6f}  "
+                      f"limit={limit:.6f}  {verdict}")
+        dist.destroy_process_group()
+        for tag, floor, cross, limit in stats:
+            self.assertLessEqual(
+                cross, limit,
+                f"[{tag}] staged-vs-fused rel {cross:.6f} > {limit:.6f} "
+                f"(fused self-noise {floor:.6f})",
+            )
 
 
 if __name__ == "__main__":

@@ -16,9 +16,17 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_fp8_impl
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_impl import (
     fused_mega_moe_forward_impl,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_stage1_fp8_impl import (
+    fused_mega_moe_stage1_backward_fp8_impl,
+    fused_mega_moe_stage1_forward_fp8_impl,
+)
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_stage1_impl import (
     fused_mega_moe_stage1_backward_impl,
     fused_mega_moe_stage1_forward_impl,
+)
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_stage2_fp8_impl import (
+    fused_mega_moe_stage2_backward_fp8_impl,
+    fused_mega_moe_stage2_forward_fp8_impl,
 )
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_stage2_impl import (
     fused_mega_moe_stage2_backward_impl,
@@ -34,4 +42,8 @@ __all__ = [
     "fused_mega_moe_stage2_backward_impl",
     "fused_mega_moe_backward_fp8_impl",
     "fused_mega_moe_forward_fp8_impl",
+    "fused_mega_moe_stage1_forward_fp8_impl",
+    "fused_mega_moe_stage1_backward_fp8_impl",
+    "fused_mega_moe_stage2_forward_fp8_impl",
+    "fused_mega_moe_stage2_backward_fp8_impl",
 ]
