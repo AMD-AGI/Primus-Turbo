@@ -562,9 +562,7 @@ def _lane_tbl_load(rsrc, lane, n_entries, stride=1, first=0):
     Entry i is read from i32 element ``(i + first) * stride``; lanes past the buffer
     bound read 0."""
     n_chunk = ceildiv(n_entries, 64)
-    return [
-        _lane_load_i32(rsrc, (lane + 64 * c + first) * stride) for c in range_constexpr(n_chunk)
-    ]
+    return [_lane_load_i32(rsrc, (lane + 64 * c + first) * stride) for c in range_constexpr(n_chunk)]
 
 
 def _lane_tbl_scan(tbl):
@@ -1137,9 +1135,7 @@ class S2RLoaderTr:
         for this call (-1 = none, when a caller-side rendezvous already covers it)."""
         assert not preshuffled, "S2RLoaderTr does not support preshuffled"
         if self.inline_asm:
-            all_calls = [
-                self._issue_one(lds_src, t, base_off, vmcnt) for t in range_constexpr(self.n_tiles)
-            ]
+            all_calls = [self._issue_one(lds_src, t, base_off, vmcnt) for t in range_constexpr(self.n_tiles)]
             if drain:
                 self._wait_lgkmcnt(0)
             return [self._assemble(c) for c in all_calls]
@@ -1270,7 +1266,21 @@ def _lds_barrier():
 
 
 def _emit_lds_repack(
-    is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=1, kbound=None,
+    is_a,
+    grp,
+    k0,
+    tile,
+    rin,
+    rout,
+    dim,
+    K128,
+    KT,
+    tid,
+    BLK,
+    rd_base=0,
+    wr_base=0,
+    pack=1,
+    kbound=None,
     k128p=None,
 ):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base

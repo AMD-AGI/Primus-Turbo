@@ -24,17 +24,22 @@ from contextlib import nullcontext as _nullctx
 # PT_GG_SCHED picks the eager NT/NN LLVM pre-RA schedule: mmc (default) / pm / bundled.
 _GG_SCHED_HINTS = {
     "pm": {"llvm_options": {"enable-post-misched": True}},
-    "mmc": {"llvm_options": {"amdgpu-sched-strategy": "max-memory-clause",
-                             "enable-post-misched": True, "lsr-drop-solution": True}},
+    "mmc": {
+        "llvm_options": {
+            "amdgpu-sched-strategy": "max-memory-clause",
+            "enable-post-misched": True,
+            "lsr-drop-solution": True,
+        }
+    },
     "": None,
 }
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.typing import T
@@ -233,9 +238,7 @@ def _compile_grouped_nn(
 
         # On-device lane-parallel group scan: lane g holds tile prefix _tcs[g] via one wave scan (replaces the O(G) carry + per-tile compare tree).
         lane_g = fx.thread_idx.x % 64
-        go_rs = _buffer_ops.create_buffer_resource(
-            group_offs, max_size=False, num_records_bytes=(G + 1) * 8
-        )
+        go_rs = _buffer_ops.create_buffer_resource(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
         # int32 view of the int64 [G+1] table: entry g at i32 element 2*g (offsets < 2^31).
         _g0 = _lane_tbl_load(go_rs, lane_g, G + 1, stride=2)
         _g1 = _lane_tbl_load(go_rs, lane_g, G + 1, stride=2, first=1)
@@ -278,15 +281,6 @@ def _compile_grouped_nn(
             local_block_m, block_n = _grouped_block_mn(
                 local, m_start, m_end, n_blocks, BLOCK_M, group_m, group_n
             )
-
-            a_cur0 = lds.A_lds_cur_0
-            a_cur1 = lds.A_lds_cur_1
-            a_next0 = lds.A_lds_next_0
-            a_next1 = lds.A_lds_next_1
-            b_cur0 = lds.B_lds_cur_0
-            b_cur1 = lds.B_lds_cur_1
-            b_next0 = lds.B_lds_next_0
-            b_next1 = lds.B_lds_next_1
 
             lane_id = fx.thread_idx.x % 64
             wave_id = fx.thread_idx.x // 64
@@ -352,15 +346,18 @@ def _compile_grouped_nn(
                 )
             else:
                 store_c = StoreCPerTensor(
-                    A_scale, B_scale, C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty,
+                    A_scale,
+                    B_scale,
+                    C,
+                    m_end,
+                    c_n,
+                    mfma.idx,
+                    N_TILES_A,
+                    N_TILES_B,
+                    _out_ty,
                     store_aux=cstore_aux,
                     col_safe=_col_safe,
                 )
-
-            c00_frag = [mfma.zero_value] * N_ACCUMS
-            c01_frag = [mfma.zero_value] * N_ACCUMS
-            c10_frag = [mfma.zero_value] * N_ACCUMS
-            c11_frag = [mfma.zero_value] * N_ACCUMS
 
             # Before-mfma scheduling barrier; after-mfma barriers stay real (gfx950 mfma-src/ds-read VGPR-overlap race).
             def _ibar():
@@ -379,8 +376,8 @@ def _compile_grouped_nn(
 
             # Runtime half-N skip: on the boundary block the b1 column half is all-OOB; the nq==1 body drops only its mfma+stores, leaving g2s/barriers unchanged (race-free).
             def _do_body(nq):
-                _full = nq == 2       # nq==2 full; nq in {0,1} half (skip c01/c11 mfma+store)
-                _ld_b1 = nq != 0      # nq==0 half-noload: drop the all-OOB b1 g2s too
+                _full = nq == 2  # nq==2 full; nq in {0,1} half (skip c01/c11 mfma+store)
+                _ld_b1 = nq != 0  # nq==0 half-noload: drop the all-OOB b1 g2s too
                 # Half body (nq==1): b1 transpose reads are dead; its g2s is re-aimed at b0 so loads become L2 hits instead of wasted HBM past c_n.
                 _b1_off = B1_gl_offset if _full else B0_gl_offset
                 # Half-body drain: lowering allowed in-flight only over-drains; gfx950 retires vmcnt out of order so drop one issue group for slack.
@@ -686,9 +683,7 @@ def _compile_grouped_nt(
 
         # On-device lane-parallel group scan (mirrors kernel_grouped_nn): tile prefix _tcs resident in lanes; _g0/_g1 = group start/end.
         lane_g = fx.thread_idx.x % 64
-        go_rs = _buffer_ops.create_buffer_resource(
-            group_offs, max_size=False, num_records_bytes=(G + 1) * 8
-        )
+        go_rs = _buffer_ops.create_buffer_resource(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
         # int32 view of the int64 [G+1] table: entry g at i32 element 2*g (offsets < 2^31).
         _g0 = _lane_tbl_load(go_rs, lane_g, G + 1, stride=2)
         _g1 = _lane_tbl_load(go_rs, lane_g, G + 1, stride=2, first=1)
@@ -801,7 +796,15 @@ def _compile_grouped_nt(
                 )
             else:
                 store_c = StoreCPerTensor(
-                    A_scale, B_scale, C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty,
+                    A_scale,
+                    B_scale,
+                    C,
+                    m_end,
+                    c_n,
+                    mfma.idx,
+                    N_TILES_A,
+                    N_TILES_B,
+                    _out_ty,
                     col_safe=_col_safe,
                 )
 
@@ -2384,8 +2387,24 @@ def _wholeloop_asm_3buf(
     # The buffer delta rides the ds_read 16-bit immediate, so one address set feeds all of a pool buffers.
     assert max(o for pol in buf_off for o in pol) + rs < 65536, "buffer delta overflows ds offset"
     key = (
-        "3buf", nta, ntb, nsa, nsb, nbuf_p, buf_off, mods, rs, _cs_t, nw, _vmcnt_mode, _has_tail,
-        a_plain, a_halves, b_halves, nval_can_be_zero, _WL_ELGK,
+        "3buf",
+        nta,
+        ntb,
+        nsa,
+        nsb,
+        nbuf_p,
+        buf_off,
+        mods,
+        rs,
+        _cs_t,
+        nw,
+        _vmcnt_mode,
+        _has_tail,
+        a_plain,
+        a_halves,
+        b_halves,
+        nval_can_be_zero,
+        _WL_ELGK,
     )
     if key not in _WL_ASM_CACHE_3BUF:
         o_acc = list(range(NT))
@@ -3216,7 +3235,14 @@ def _compile_grouped_tn_wgrad_4wave(
             if const_expr(_HALF_M or _HALF_N):
                 _tt = xcd_remap_pid(t, TOTAL, num_xcd)
                 _, _blk_m, _blk_n = _wgrad_block_mn(
-                    _tt, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, False,
+                    _tt,
+                    G,
+                    TILES_PER_GROUP,
+                    N_BLOCKS_M,
+                    N_BLOCKS_N,
+                    group_m,
+                    group_n,
+                    False,
                     _TILE_ROT,
                 )
                 if const_expr(_HALF_M and _HALF_N):
