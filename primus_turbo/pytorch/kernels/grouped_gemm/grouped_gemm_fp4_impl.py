@@ -164,7 +164,7 @@ class GroupedGEMMFP4FlyDSLBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
-        from primus_turbo.flydsl.grouped_gemm.mxfp4_grouped_kernel import (
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel import (
             grouped_gemm_mxfp4_flydsl_kernel,
         )
 
@@ -346,7 +346,7 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
-        from primus_turbo.flydsl.grouped_gemm.mxfp4_grouped_kernel import (
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel import (
             grouped_gemm_mxfp4_variable_k_flydsl_kernel,
         )
 

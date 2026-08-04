@@ -3,7 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""Unit tests for primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic.
+"""Unit tests for primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_ck_ws_heuristic.
 
 Pure Python -- no GPU required. Pins the policy boundaries so future
 re-tuning is intentional rather than accidental.
@@ -11,7 +11,7 @@ re-tuning is intentional rather than accidental.
 
 import pytest
 
-from primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic import (
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_ck_ws_heuristic import (
     CK_NUM_XCDS,
     CK_TILE_M,
     CK_TILE_N,

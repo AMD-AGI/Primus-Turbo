@@ -42,7 +42,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     wait_barrier,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.gemm.mxfp4_gemm_kernel import (
+from primus_turbo.flydsl.gemm.gemm_mxfp4_kernel import (
     _MXFP4_PRESHUF_BLK,
     _MXFP4_PRESHUF_NG,
     MfmaScaleFp4,
@@ -53,12 +53,12 @@ from primus_turbo.flydsl.gemm.mxfp4_gemm_kernel import (
     _mxfp4_grp_from,
     fp4_g2s_offsets,
 )
-from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _grouped_block_mn,
     _load_go,
     _wgrad_block_mn,
 )
-from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import run_eager_or_capture
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import run_eager_or_capture
 
 # isort: on
 
