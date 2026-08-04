@@ -508,7 +508,7 @@ if __name__ == "__main__":
     offload_arch_list, _ = get_offload_archs()
     if "--offload-arch=gfx1250" not in offload_arch_list:
         install_requires.append("triton>=3.7.0")
-        install_requires.append("flydsl>=0.2.0")
+        install_requires.append("flydsl==0.2.0")
     else:
         print("[Primus-Turbo Setup] Building for gfx1250; skipping triton dependency.")
 
