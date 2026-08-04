@@ -207,13 +207,24 @@ def _compile_grouped_bf16(
                 cum = nc
                 p = nx
 
-            m_start = _load_go(go_div, group_idx)
-            m_end = _load_go(go_div, group_idx + 1)
-            m_total = _load_go(go_div, G)
+            # Every value below is wave-uniform, but it is reached through a vector
+            # buffer load of group_offs, so the compiler's divergence analysis marks
+            # it divergent. Left unpinned it lands the A/B/C buffer descriptors in
+            # VGPRs and the backend wraps *every* buffer_load/buffer_store in a
+            # readfirstlane/saveexec waterfall loop (~13 extra instructions each,
+            # and a basic-block split that blocks G2S/MFMA interleaving). Pinning the
+            # scan outputs to SGPRs collapses the SRDs back to scalar regs.
+            group_idx = _readfirstlane_i32(group_idx)
+            tile_start = _readfirstlane_i32(tile_start)
+            m_start = _readfirstlane_i32(_load_go(go_div, group_idx))
+            m_end = _readfirstlane_i32(_load_go(go_div, group_idx + 1))
+            m_total = _readfirstlane_i32(_load_go(go_div, G))
             local_block_m, block_n = _grouped_block_mn(
                 tt - tile_start, m_start, m_end, n_blocks, BLOCK_M, group_m
             )
-            m_row = m_start + local_block_m * BLOCK_M
+            local_block_m = _readfirstlane_i32(local_block_m)
+            block_n = _readfirstlane_i32(block_n)
+            m_row = _readfirstlane_i32(m_start + local_block_m * BLOCK_M)
 
             # Rows this tile may touch, clamped to the tile height: keeps every
             # num_records product inside int32 even for a multi-GB pool.
@@ -369,7 +380,6 @@ def gemm_bf16_variable_k_tile(
     BLOCK_N,
     out_fp16=False,
     c_cache_modifier=0,
-    trans_c=False,
 ):
     CHUNK = 4
     WGRAD_WAVES = 8  # fixed 8 waves per block
@@ -421,10 +431,7 @@ def gemm_bf16_variable_k_tile(
     a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, bf16_ir, wave_id)
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, bf16_ir, wave_id)
     out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    if const_expr(trans_c):
-        store_c = StoreCBf16(C, G * OUT_N, OUT_M, out_ty, cache_modifier=c_cache_modifier)
-    else:
-        store_c = StoreCBf16(C, G * OUT_M, OUT_N, out_ty, cache_modifier=c_cache_modifier)
+    store_c = StoreCBf16(C, G * OUT_M, OUT_N, out_ty, cache_modifier=c_cache_modifier)
 
     acc00 = [fx.make_rmem_tensor(fx.make_layout(ACC_VEC_N, 1), fx.Float32) for _ in range(N_ACCUMS_EFF)]
     acc01 = [fx.make_rmem_tensor(fx.make_layout(ACC_VEC_N, 1), fx.Float32) for _ in range(N_ACCUMS_EFF)]
@@ -517,12 +524,9 @@ def gemm_bf16_variable_k_tile(
         for i in range_constexpr(NTA16):
             for j in range_constexpr(NTB16):
                 blk = [cfrag[i * NTB16 + j]]
-                if const_expr(trans_c):
-                    store_c.store_trans16(blk, group_idx, q_m + i * 16, q_n + j * 16, OUT_M, OUT_N)
-                else:
-                    store_c.store16(blk, group_idx, q_m + i * 16, q_n + j * 16, OUT_M, OUT_N)
+                store_c.store16(blk, group_idx, q_m + i * 16, q_n + j * 16, OUT_M, OUT_N)
 
-    # Both stores take in-group coordinates and mask the m/n overhang, so a
+    # The store takes in-group coordinates and masks the m/n overhang, so a
     # partial tile on either output axis is safe.
     local_m = block_m * BLOCK_M + wave_m * (NTA16 * 16)
     local_n = block_n * BLOCK_N + wave_n * (NTB16 * 16)
@@ -543,7 +547,6 @@ def _compile_grouped_variable_k_bf16(
     waves_per_eu=2,
     agpr_alloc=0,
     out_fp16=False,
-    trans_c=False,
 ):
     # Partial tiles on either output axis are masked at the store, so neither dim
     # has to tile exactly. The 128-bit global loads do need an 8-element (16B) row
@@ -575,12 +578,8 @@ def _compile_grouped_variable_k_bf16(
             tile = xcd_remap_pid(tile_idx, TOTAL, num_xcd)
             group_idx = tile // TILES_PER_GROUP
             local_tile = tile % TILES_PER_GROUP
-            if const_expr(trans_c):
-                block_n = local_tile // N_BLOCKS_M
-                block_m = local_tile % N_BLOCKS_M
-            else:
-                block_m = local_tile // N_BLOCKS_N
-                block_n = local_tile % N_BLOCKS_N
+            block_m = local_tile // N_BLOCKS_N
+            block_n = local_tile % N_BLOCKS_N
             m_start = _load_i64_as_i32(go_base, group_idx)
             # bound K to valid rows; padding tail never read
             m_end = m_start + _load_i64_as_i32(gk_base, group_idx)
@@ -602,7 +601,6 @@ def _compile_grouped_variable_k_bf16(
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 out_fp16=out_fp16,
-                trans_c=trans_c,
             )
 
         _do_tile(pid)
@@ -656,12 +654,18 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     """
     assert a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
     assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+    # (a^T @ b)^T == b^T @ a, so a transposed output is just the operands swapped --
+    # which keeps the epilogue on the coalesced store. Transposing in the store
+    # instead scatters it into 2-byte writes 16 rows apart and costs up to 2.2x on
+    # wgrad shapes, where the output is ~14x larger per flop than in the forward.
+    # Mirrors the fp8 variable-K entry.
+    if trans_c:
+        a, b = b, a
     OUT_M = a.shape[1]
     OUT_N = b.shape[1]
     G = group_k_offsets.numel() - 1
     out_fp16 = out_dtype == torch.float16
-    out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)
-    out = torch.empty(out_shape, device=a.device, dtype=out_dtype)
+    out = torch.empty((G, OUT_M, OUT_N), device=a.device, dtype=out_dtype)
     # index tables loaded as i64 in-kernel
     offsets_i64 = group_k_offsets if group_k_offsets.dtype == torch.int64 else group_k_offsets.to(torch.int64)
     # per-expert valid K length; default = padded span
@@ -678,7 +682,6 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         BLOCK_N=BLOCK_N,
         num_xcd=num_xcd,
         out_fp16=out_fp16,
-        trans_c=trans_c,
     )
     # Pass operands as an int32 view: the kernel only reads their base pointer (rebased
     # by byte offsets in make_bf16_buffer_tensor_rebased), so dtype is irrelevant, while
@@ -694,7 +697,7 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         OUT_N,
         torch.cuda.current_stream(),
     )
-    key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, out_fp16, trans_c)
+    key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, out_fp16)
     compiled = _COMPILED_GROUPED_GEMM_CACHE.get(key)
     if compiled is None:
         compiled = flyc.compile(launch, *args)

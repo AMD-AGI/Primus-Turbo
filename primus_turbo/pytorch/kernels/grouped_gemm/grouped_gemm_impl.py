@@ -533,8 +533,8 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
             grouped_gemm_bf16_variable_k_flydsl_kernel,
         )
 
-        # trans_c is handled inside the kernel's store (it transposes the output
-        # tile), so a/b stay in their natural order here.
+        # The kernel entry turns trans_c into an operand swap, so a/b stay in
+        # their natural order here.
         return grouped_gemm_bf16_variable_k_flydsl_kernel(
             a,
             b,
