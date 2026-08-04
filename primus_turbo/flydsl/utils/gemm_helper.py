@@ -155,19 +155,19 @@ def make_bf16_rebased_rsrc(arg, base_elems, num_records_bytes):
     return rsrc
 
 
+def lds_row_swizzle(row, chunks):
+    """XOR key, in 16B chunks, for a `chunks`-wide LDS row: one ds_read_b64_tr_b8 gathers a
+    single 16B column over the rows {16*a + b : a<4, b<8}, and the key spreads that column
+    over the gfx950 LDS banks. Shared by the g2s write side (swizzle_128) and the transpose
+    read side (S2RLoaderTr._ptr_off) so the two cannot drift apart."""
+    return ((row % 16) // 2) & (chunks - 1)
+
+
 def swizzle_128(row, col, width=128):
-    """XOR bank-swizzle over a `width`=2**k logical row (width=128 is byte-identical to
-    the original fixed-128 form). The swizzle must stay within col's bits [0,k); for k<7
-    we extract fewer bits (k-4) from the `row%16` window so the result is always < width."""
-    k = width.bit_length() - 1
-    period = 16 * width
-    offset = row * width + col
-    nbits = k - 4
-    mask = (1 << nbits) - 1
-    extracted = (offset % period) >> (k + 1)
-    swizzle = (extracted & mask) << 4
-    swizzled_offset = offset ^ swizzle
-    return swizzled_offset // width, swizzled_offset % width
+    """XOR bank-swizzle over a `width`=2**k logical row (width=128 is byte-identical to the
+    original fixed-128 form). The key only permutes the width//16 chunks inside one row, so
+    the row index passes through unchanged."""
+    return row, col ^ (lds_row_swizzle(row, width // 16) * 16)
 
 
 def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
@@ -609,6 +609,10 @@ class StoreCPerTensor:
     ``col_safe``: caller-proven "every column this store touches is < c_cols", which
     drops the per-store OOB select. Only pass it when the tile's column span is bounded
     at compile time AND no dead N-quadrant is being dropped by the column clamp.
+
+    ``c_base``: byte base index overriding the one extracted from ``C``, so a caller can
+    steer a tile's store to a second buffer of the same row pitch (the split-K wgrad
+    slices write a scratch band instead of C). Wave-uniform; it lands in the band SRD.
     """
 
     def __init__(
@@ -626,6 +630,7 @@ class StoreCPerTensor:
         col_safe=False,
         store_aux=0,
         trans=False,
+        c_base=None,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
@@ -641,7 +646,8 @@ class StoreCPerTensor:
         # Optional f32->f32 epilogue node chain (bias/act), post-scale pre-cast.
         self.elem_fn = elem_fn
         self.scaled = A_scale is not None
-        self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
+        # index = byte base address
+        self.c_base = _buffer_ops.extract_base_index(C) if c_base is None else c_base
         if self.scaled:
             gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
             gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
@@ -1063,9 +1069,8 @@ class S2RLoaderTr:
         r_step = K_log // KW
         W = (K_log % KW) // rows_per_wave
         K_local_row = K_log % rows_per_wave
-        # swz_K reproduces swizzle_128's own (extracted & mask) term: extracted =
-        # (K_log%16)//2 is width-independent; only the mask narrows with width.
-        swz_K = (((K_log % 16) // 2) & (chunks - 1)) * 16
+        # swz_K reproduces swizzle_128's own key over this buffer's chunk count.
+        swz_K = lds_row_swizzle(K_log, chunks) * 16
         coord_start = self.wave_idx * self.tile_stride + tile_i * 16
         j_chunk = (coord_start // 16) ^ (swz_K // 16)
         if self.wswz:

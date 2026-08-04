@@ -65,6 +65,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     compute_global_swizzle,
     compute_global_swizzle_nn,
     make_fp8_buffer_tensor_rebased,
+    make_row_band_resource,
     make_value_attrs,
     mask_a_tail,
     wait_barrier,
@@ -1283,14 +1284,96 @@ def _grouped_block_mn(local, m_start, m_end, n_blocks, block_m_size, group_m, gr
     return lm_r, bn_r
 
 
+_WGRAD_XCD_HW = 8  # gfx950 dispatcher: workgroup bid runs on XCD bid % _WGRAD_XCD_HW
+_WGRAD_XCD_RCP_SHIFT = 16  # fixed-point reciprocal of the compile-time swizzle divisors
+
+
+def _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, nxcd=_WGRAD_XCD_HW):
+    """(h, w) for the XCD-affine wgrad swizzle, or None when the grid is too small for it.
+
+    Each XCD has its own L2 slice and the dispatcher pins workgroup bid to XCD bid % nxcd, so the
+    tiles one XCD runs out of a group are exactly one residue class of the within-group index, and
+    the operand bytes that slice must hold are (#distinct block_m + #distinct block_n) x 32 KB per
+    K-step. A class scattered over the whole grid touches ~2x what a compact one does. Reordering
+    the grid so each class is a contiguous run of an (h rows x w cols) block order brings that down
+    to sz/w + w: h*w == sz makes a run exactly one block, otherwise h=1 (row-major inside the
+    column band) keeps a run's spill into the next block on a single extra row. Unlike an
+    xcd_remap_pid block partition this does not touch the dispatch order, so every XCD keeps the
+    hardware's own even tile split -- the reason methodology/05 finds only R=1 balances wgrad."""
+    sz = tiles_per_group // nxcd
+    if sz < 2 or n_blocks_m < 2 or n_blocks_n < 2:
+        return None
+    best = None
+    for w in (d for d in range(1, n_blocks_n + 1) if n_blocks_n % d == 0):
+        exact = [d for d in range(1, n_blocks_m + 1) if n_blocks_m % d == 0 and d * w == sz]
+        h = exact[0] if exact else 1
+        rows = h if exact else -(-sz // w)
+        key = (rows + w, -w)
+        if best is None or key < best[0]:
+            best = (key, h, w)
+    return best[1], best[2]
+
+
+def _wgrad_band_is_xcd_aff(n_blocks_m, n_blocks_n, group_m, group_n, nxcd=_WGRAD_XCD_HW):
+    """True when the (group_m, group_n) band already hands every XCD the minimal operand footprint,
+    against which the explicit de-interleave measures flat. A band whose super-block is exactly nxcd
+    cells and tiles the block grid gives each residue class of bid one fixed cell per super-block,
+    i.e. an (n_blocks_m/group_m) x (n_blocks_n/group_n) sub-lattice -- strided, but with the same
+    distinct-block_m + distinct-block_n count as the compact rectangle _wgrad_xcd_aff_geom builds.
+    down's 12x12 grid under (4,2) lands there (3 + 6 = 9 slabs either way, and measured flat);
+    gate_up's 23x12 cannot, N_BLOCKS_M being prime, and its (4,4) costs 17.0 against the map's
+    12.75."""
+    return group_m * group_n == nxcd and n_blocks_m % group_m == 0 and n_blocks_n % group_n == 0
+
+
+def _wgrad_xcd_div(x, d, xmax):
+    """``x // d`` for a compile-time d, as one multiply plus one shift by a fixed-point reciprocal
+    verified exact over [0, xmax]. Same trick as _wgrad_split_div, same reason: a real divide in
+    the per-tile prologue is a latency-exposed serial chain at occ=1."""
+    m = -(-(1 << _WGRAD_XCD_RCP_SHIFT) // d)
+    assert all((v * m) >> _WGRAD_XCD_RCP_SHIFT == v // d for v in range(xmax + 1)), (d, xmax)
+    return fx.Int32(fx.Int32(x * fx.Int32(m)) >> _WGRAD_XCD_RCP_SHIFT)
+
+
+def _wgrad_xcd_block_mn(local, N_BLOCKS_M, N_BLOCKS_N, h, w, TILES_PER_GROUP, nxcd=_WGRAD_XCD_HW):
+    """within-group tile index -> (block_m, block_n) under the XCD-affine swizzle; the geometry
+    (h, w) comes from _wgrad_xcd_aff_geom. De-interleaves the index by nxcd so one XCD's class
+    becomes a contiguous run, then walks (h x w) blocks down a width-w column band. Every divisor
+    is compile-time and goes through a multiply/shift, which the band map's runtime `pig // gsm`
+    cannot -- and this sits in the latency-exposed per-tile prologue at occ=1."""
+    per, rem = divmod(TILES_PER_GROUP, nxcd)
+    cbs, bsz = N_BLOCKS_M * w, h * w
+    c = local & fx.Int32(nxcd - 1)
+    lin = c * fx.Int32(per) + (local >> (nxcd.bit_length() - 1))
+    if const_expr(rem):
+        lin = lin + arith.select(c < fx.Int32(rem), c, fx.Int32(rem))
+    cb = _wgrad_xcd_div(lin, cbs, TILES_PER_GROUP)
+    p = lin - cb * fx.Int32(cbs)
+    blk = _wgrad_xcd_div(p, bsz, cbs - 1)
+    q = p - blk * fx.Int32(bsz)
+    if const_expr(h == 1):
+        return blk, cb * fx.Int32(w) + q
+    col = _wgrad_xcd_div(q, h, bsz - 1)
+    return blk * fx.Int32(h) + (q - col * fx.Int32(h)), cb * fx.Int32(w) + col
+
+
 def _wgrad_block_mn(
-    idx, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, interleave, tile_rot=0
+    idx,
+    G,
+    TILES_PER_GROUP,
+    N_BLOCKS_M,
+    N_BLOCKS_N,
+    group_m,
+    group_n,
+    interleave,
+    tile_rot=0,
+    xcd_aff=None,
 ):
     """idx -> (group_idx, block_m, block_n) for the wgrad output grid. interleave=True
     (masked one-tile/WG): band-cyclic group interleave (one group_m M-band per group ->
     skew load-balance, group_m B-stripe L2 reuse kept; one-M-row fallback when group_m
-    doesn't tile N_BLOCKS_M). interleave=False (persist strided): group_n band / group_m
-    cluster / row-major."""
+    doesn't tile N_BLOCKS_M). interleave=False (persist strided): XCD-affine (xcd_aff) /
+    group_n band / group_m cluster / row-major."""
     if const_expr(interleave and group_m > 0 and N_BLOCKS_M > group_m and N_BLOCKS_M % group_m == 0):
         BAND = const_expr(group_m * N_BLOCKS_N)
         bg = idx // BAND
@@ -1301,6 +1384,11 @@ def _wgrad_block_mn(
         return cl % G, cl // G, idx % N_BLOCKS_N
     group_idx = idx // TILES_PER_GROUP
     local = idx % TILES_PER_GROUP
+    if const_expr(xcd_aff is not None):
+        block_m, block_n = _wgrad_xcd_block_mn(
+            local, N_BLOCKS_M, N_BLOCKS_N, xcd_aff[0], xcd_aff[1], TILES_PER_GROUP
+        )
+        return group_idx, block_m, block_n
     if const_expr(tile_rot):
         # gcd(TILES_PER_GROUP, num_xcd) pins boundary tiles to fixed XCD residues; the per-group tile_rot rotation spreads them (a per-group bijection).
         local = (local + group_idx * fx.Int32(tile_rot)) % fx.Int32(TILES_PER_GROUP)
@@ -2467,16 +2555,27 @@ def _wholeloop_asm_3buf(
 
         def emit_g2s(write_buf_per_pool):
             r = []
-            for p in range(n_pools):
+            if a_plain:
+                # dgrad (NN) path keeps the original per-half (p-outer) A issue order: the A-pool
+                # step-interleave below is a wgrad-only L2-line win and must not perturb the shared
+                # NN dgrad trace (this helper is shared by _wave4_do_tile_tn and _wave4_do_tile_nn).
+                order = [(p, st) for p in range(a_halves) for st in range(nsa)]
+            else:
+                # wgrad (TN): A pools step-interleaved -- the two halves of one K-row are adjacent in
+                # the issue stream, so a row stride that is not a multiple of the 128B line lets the
+                # second half hit the line the first half already pulled in.
+                order = [(p, st) for st in range(nsa) for p in range(a_halves)]
+            # B pools stay last -- the partial drain below counts on exactly their loads being the
+            # outstanding ones.
+            order += [(p, st) for p in range(a_halves, n_pools) for st in range(nsb)]
+            for p, st in order:
                 rsrc = i_rsa if p < a_halves else i_rsb
                 gl = i_gla if p < a_halves else i_glb
-                nst = nsa if p < a_halves else nsb
                 buf = write_buf_per_pool[p]
-                for st in range(nst):
-                    r.append(
-                        f"s_add_u32 m0, ${i_gbase[p][buf]}, {st * nw * _cs_t[p]}\n"
-                        f"buffer_load_dwordx4 ${gl[st]}, ${rsrc}, ${o_wsoff[p]} offen lds"
-                    )
+                r.append(
+                    f"s_add_u32 m0, ${i_gbase[p][buf]}, {st * nw * _cs_t[p]}\n"
+                    f"buffer_load_dwordx4 ${gl[st]}, ${rsrc}, ${o_wsoff[p]} offen lds"
+                )
             return r
 
         def _mfma_line(qi, ii, ji):
@@ -2706,16 +2805,18 @@ def _wholeloop_tile_3buf(
     b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
     b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
     b_extra1 = lds.B_lds_extra_1  # pool3's 3rd buffer
-    if a_plain:
-        A0_gl_offset = 0
-        A1_gl_offset = fx.Int32(lds_block_m) * a_row_stride
-    else:
-        A0_gl_offset, A1_gl_offset = 0, lds_block_m
-    B0_gl_offset, B1_gl_offset = 0, lds_block_n
     cm_i = arith.index_cast(T.index, c_m)
     cn_i = arith.index_cast(T.index, c_n)
     A_K_STEP = arith.index(block_k) * cm_i
     B_K_STEP = arith.index(block_k) * cn_i
+    if a_plain:
+        A0_gl_offset = 0
+        A1_gl_offset = fx.Int32(lds_block_m) * a_row_stride
+        A1_soff0 = A1_gl_offset
+    else:
+        A0_gl_offset, A1_gl_offset = 0, lds_block_m
+        A1_soff0 = fx.Int32(lds_block_m)
+    B0_gl_offset, B1_gl_offset = 0, lds_block_n
 
     # Prologue: pools 0-2 prime 2 K-blocks, pool3 primes 3; a_halves/b_halves=1 skip a fully-masked half loads and pool.
     a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)
@@ -2777,7 +2878,7 @@ def _wholeloop_tile_3buf(
     # soff0[p] = gmem offset for the first in-loop write, targeting K-block nbuf[p] (matches W(0)=nbuf[p] in the asm schedule).
     soff0_a = [rocdl.readfirstlane(T.i32, fx.Int32(A0_gl_offset) + fx.Int32(2) * kstep_a)]
     if a_halves == 2:
-        soff0_a.append(rocdl.readfirstlane(T.i32, fx.Int32(A1_gl_offset) + fx.Int32(2) * kstep_a))
+        soff0_a.append(rocdl.readfirstlane(T.i32, A1_soff0 + fx.Int32(2) * kstep_a))
     soff0_b = [
         rocdl.readfirstlane(
             T.i32, fx.Int32(B0_gl_offset) + fx.Int32(3 if b0_extra_buf is not None else 2) * kstep_b
@@ -2879,14 +2980,20 @@ def _wave4_do_tile_tn(
     _cm,
     _cn,
     tile_rot=0,
+    xcd_aff=None,
     a_halves=2,
     b_halves=2,
     swap_n=False,
     col_safe=False,
+    slice_id=None,
+    split_s=None,
+    split_code=None,
+    split_pow2=True,
+    WS=None,
 ):
     tt = xcd_remap_pid(t, TOTAL, num_xcd)
     group_idx, block_m, block_n = _wgrad_block_mn(
-        tt, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, False, tile_rot
+        tt, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, False, tile_rot, xcd_aff
     )
     group_idx = _readfirstlane_i32(group_idx)
     block_m = _readfirstlane_i32(block_m)
@@ -2895,6 +3002,42 @@ def _wave4_do_tile_tn(
     m_end = _readfirstlane_i32(_load_go(go_div, group_idx + 1))
     mg = _readfirstlane_i32(m_end - m_start)
     k_iters = ceildiv(mg, BLOCK_K)
+    row_shift = None
+    store_base = None
+    assert slice_id is None or not swap_n, "split-K window is incompatible with the swap_n body"
+    if slice_id is not None:
+        # Contraction (token) split: slice s owns K-blocks [kb0, kb1) of this tile. Slice 0 keeps
+        # writing C, slices 1.. write band s-1 of the WS scratch (same row pitch as C) and a
+        # reduce pass sums them back; slice_id < 0 marks a tile outside the window (whole K
+        # range, writes C). Only the trip count and the operand row origin move, so the asm
+        # body is untouched.
+        _s = fx.Int32(_readfirstlane_i32(slice_id))
+        _whole = _s < fx.Int32(0)
+        _sc = fx.Int32(arith.select(_whole, fx.Int32(0), _s))
+        _ki = fx.Int32(k_iters)
+        _nxt = _sc + fx.Int32(1)
+        kb0 = fx.Int32(
+            arith.select(_whole, fx.Int32(0), _wgrad_split_div(_ki * _sc, split_code, split_pow2))
+        )
+        kb1 = fx.Int32(
+            arith.select(
+                _whole,
+                _ki,
+                arith.select(
+                    _nxt < split_s, _wgrad_split_div(_ki * _nxt, split_code, split_pow2), _ki
+                ),
+            )
+        )
+        m_off = kb0 * fx.Int32(BLOCK_K)
+        m_start = _readfirstlane_i32(m_start + m_off)
+        mg = _readfirstlane_i32(mg - m_off)
+        k_iters = fx.Int32(_readfirstlane_i32(kb1 - kb0))
+        _part = _s > fx.Int32(0)
+        _band = (_s - fx.Int32(1) - fx.Int32(group_idx)) * fx.Int32(OUT_M)
+        row_shift = _readfirstlane_i32(arith.select(_part, _band, fx.Int32(0)))
+        store_base = arith.select(
+            _part, _buffer_ops.extract_base_index(WS), _buffer_ops.extract_base_index(C)
+        )
     # main loop takes the largest multiple of 6; the remainder (0..5) is the in-asm fused tail.
     n6 = (k_iters // 6) * 6
     nval_main = _readfirstlane_i32(n6)
@@ -2927,6 +3070,8 @@ def _wave4_do_tile_tn(
         c_m_body, c_n_body = _cm, _cn
         base_row = group_idx * OUT_M + bm_off + wave_m * (N_TILES_A * 16)
         base_col = bn_off + wave_n * (N_TILES_B * 16)
+    if row_shift is not None:
+        base_row = base_row + row_shift
 
     gA = make_fp8_buffer_tensor_rebased(a_op, F8_IR_t, a_base, a_nrec)
     gB = make_fp8_buffer_tensor_rebased(b_op, F8_IR_t, b_base, b_nrec)
@@ -2963,11 +3108,14 @@ def _wave4_do_tile_tn(
         wswz=_wswz,
     )
 
+    _c_rows = (group_idx + 1) * OUT_M
+    if row_shift is not None:
+        _c_rows = _c_rows + row_shift  # row band end follows base_row into the scratch band
     store_c = StoreCPerTensor(
         A_scale,
         B_scale,
         C,
-        (group_idx + 1) * OUT_M,
+        _c_rows,
         _cn,
         mfma.idx,
         N_TILES_A,
@@ -2975,6 +3123,7 @@ def _wave4_do_tile_tn(
         _out_ty,
         trans=swap_n,
         col_safe=col_safe and not swap_n,
+        c_base=store_base,
     )
     _common = dict(
         a_g2s=a_g2s,
@@ -3084,6 +3233,203 @@ def _wave4_geometry(*, block_m, block_n, block_k, cs, csa, out_fp16):
     )
 
 
+# ---------------------------------------------------------------------------------------
+# Runtime-adaptive single-window split-K for the variable-K wgrad dispatch.
+#
+# A wgrad output tile costs n_g = ceil(M_g / BLOCK_K) K-blocks, so the dispatch makespan
+# quantizes two ways: (A) TOTAL % NCU != 0 leaves the last round with only ``rem`` busy CUs, and
+# (B) a hot group whose n_hot * ceil(TPG/NCU) exceeds the per-CU ideal pins the wall on its own
+# tile chain. Both are fixed by slicing the contraction (token) dim of ONE window of tiles: slice
+# 0 keeps writing C, slices 1.. write the S_MAX-1 spare C row bands the entry appends below C, and
+# a reduce kernel folds just the window back. The window is picked on-device from group_offs (the
+# autotune cache key has no distribution axis, so it cannot be baked) and the grid is a
+# compile-time upper bound truncated by a runtime live count (dead workgroups measure free).
+_WGRAD_SPLIT_S = (2, 4)  # rule B: gcd(S, 8) != 1 only, S=3/6 decorrelate the slice id from pid%8
+# Rule A may also use an odd factor, unlike rule B: its n*S slices all run in the ONE exposed
+# partial round, so they stay co-resident whatever the slice id does modulo the 8 XCDs. Widest
+# factor that still fits the round, so the round covers as many CUs as it can (rem=80 -> S=3 fills
+# 240 of 256 vs S=2's 160); the policy narrows it back to 2 unless the load is near-uniform.
+_WGRAD_SPLIT_S_A = (2, 3, 4)
+_WGRAD_SPLIT_UNIF = (13, 10)  # rule A opens on a near-uniform load only: n_hot*10 < n_min*13
+_WGRAD_SPLIT_CROWD = (3, 4)  # rule B1 opens once the hot chain crowds 3/4 of the per-CU ideal
+_WGRAD_RED_WPT = 4  # reduce workgroups per window tile
+_WGRAD_RED_VEC = 8  # out_ty elements (128b) each reduce lane moves per pass
+_WGRAD_SPLIT_RCP_SHIFT = 16  # fixed-point reciprocal of the slice factor, see _wgrad_split_rcp_cfg
+_WGRAD_SPLIT_RCP_MAX = 1 << (_WGRAD_SPLIT_RCP_SHIFT - 1)  # exactness bound on the dividend
+_WGRAD_SPLIT_RCP_EXACT = (1, 2, 3, 4, 6, 8)  # 5 and 7 lose exactness below the bound
+
+
+def _wgrad_split_geom(tiles_per_group, total, ncu):
+    """Compile-time split-K window geometry, shared by the factory and the host entry.
+    Returns (S_MAX, S_A, S_B, N_MAX, EXT) where S_MAX-1 = spare C row bands, S_A/S_B = the widest
+    factor rule A / rule B may pick (the policy may narrow either at runtime), N_MAX = largest
+    window in tiles and EXT = largest grid extension n*(S-1). S_MAX == 1 disables the path
+    (under-subscribed grid or non-pow2 NCU)."""
+    if total <= ncu or ncu <= 0 or (ncu & (ncu - 1)) != 0:
+        return 1, 1, 1, 0, 0
+    rem = total % ncu
+    s_a, n_a = 1, 0
+    if 0 < rem <= tiles_per_group:  # the window must stay inside one group (one workspace band)
+        for s in _WGRAD_SPLIT_S_A:
+            if s * rem <= ncu:
+                s_a, n_a = s, rem
+    if tiles_per_group <= ncu:
+        s_b, n_b = max(_WGRAD_SPLIT_S), tiles_per_group  # B1: split the whole hot group
+    else:
+        s_b, n_b = 2, tiles_per_group - ncu  # B2: halve only the hot group's overflow tiles
+    s_max = max(s_a, s_b)
+    if s_max <= 1:
+        return 1, 1, 1, 0, 0
+    return s_max, s_a, s_b, max(n_a, n_b), max(n_a * (s_a - 1), n_b * (s_b - 1))
+
+
+def _wgrad_split_rcp_cfg(tiles_per_group, S_A, S_B, ncu):
+    """``(pow2, {s: code})`` over every slice factor the runtime policy can return: rule A's S_A,
+    every rule-B factor its device-side fit loop may select (B1 tries all of _WGRAD_SPLIT_S up to
+    S_B, B2 only halves) and 1 for the guardrail fallbacks. Missing a reachable factor hands the
+    kernel the wrong divide, which stays *correct* (the per-group SRD clamp zeroes an out-of-range
+    slice) while burning a full dispatch unit per window tile -- it cost down/moderate 24%.
+    The code is what the kernel carries to divide by s: log2(s) when every factor is a power of
+    two, else the fixed-point reciprocal ``ceil(2**SHIFT / s)``, exact for every dividend below
+    _WGRAD_SPLIT_RCP_MAX. Keeping the all-pow2 case on the shift form matters: the slice bounds sit
+    in the per-tile prologue, a latency-exposed serial chain at occ=1, and carrying a select over
+    per-candidate constant divides there cost 0.8% even on configs that never pick 3."""
+    b = [s for s in _WGRAD_SPLIT_S if s <= S_B] if tiles_per_group <= ncu else [S_B]
+    cands = tuple(sorted({1, S_A, min(2, S_A), *b}))  # min(2, S_A) = rule A's non-uniform factor
+    pow2 = all(c & (c - 1) == 0 for c in cands)
+    assert pow2 or all(c in _WGRAD_SPLIT_RCP_EXACT for c in cands), f"no exact reciprocal {cands}"
+    return pow2, {
+        c: (c.bit_length() - 1 if pow2 else -(-(1 << _WGRAD_SPLIT_RCP_SHIFT) // c)) for c in cands
+    }
+
+
+def _wgrad_split_div(x, code, pow2):
+    """``x // s`` for the runtime slice factor s, from the code _wgrad_split_rcp_cfg picked for it:
+    one shift, or one multiply plus one shift. Wave-uniform scalars."""
+    if pow2:
+        return fx.Int32(x >> code)
+    return fx.Int32(fx.Int32(x * code) >> _WGRAD_SPLIT_RCP_SHIFT)
+
+
+def _wgrad_split_policy(go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, ncu, S_A, S_B):
+    """Device-side wave-uniform single-window split-K policy. Returns (lo, n, s, code): dispatch
+    ids [lo, lo + n*s) form the window and each of its n tiles is split into s contraction slices;
+    s == 1 (n == 0) means "do not split". ``code`` is what _wgrad_split_div needs for s, resolved
+    here (once per workgroup) rather than per tile. Pure SALU on the G group offsets, so every
+    workgroup recomputes it instead of paying a planner launch."""
+    pow2, rcp = _wgrad_split_rcp_cfg(TILES_PER_GROUP, S_A, S_B, ncu)
+    l2ncu = ncu.bit_length() - 1
+    rem = TOTAL % ncu
+    rounds_hot = ceildiv(TILES_PER_GROUP, ncu)
+    p = _readfirstlane_i32(_load_go(go_div, 0))
+    sum_n = fx.Int32(0)
+    n_hot = fx.Int32(0)
+    n_min = fx.Int32(0x7FFFFFFF)
+    n_last = fx.Int32(0)
+    hot = fx.Int32(0)
+    for g in range_constexpr(G):
+        q = _readfirstlane_i32(_load_go(go_div, g + 1))
+        ng = fx.Int32(_readfirstlane_i32(ceildiv_pow2(q - p, BLOCK_K)))
+        p = q
+        sum_n = sum_n + ng
+        up = ng > n_hot
+        hot = fx.Int32(arith.select(up, fx.Int32(g), hot))
+        n_hot = fx.Int32(arith.select(up, ng, n_hot))
+        n_min = fx.Int32(arith.select(ng < n_min, ng, n_min))
+        n_last = ng
+    ideal = (fx.Int32(TILES_PER_GROUP) * sum_n) >> l2ncu  # per-CU K-blocks under perfect packing
+    # B: the hot group's own tile chain sets the wall -> slice that group. B1 splits the whole
+    # group, so it already pays off while the chain merely CROWDS the ideal: a CU holding a
+    # 0.9*ideal tile cannot be topped up again without overshooting, and the cheapest backfill
+    # tile is the exposure. B2 only halves the overflow tiles, a worse deal than rule A unless
+    # the chain is genuinely over the ideal, so that class keeps the strict test.
+    b_chain = n_hot * fx.Int32(rounds_hot)
+    b_crowd = _WGRAD_SPLIT_CROWD if TILES_PER_GROUP <= ncu else (1, 1)
+    b_fires = (b_chain * fx.Int32(b_crowd[1])) > (ideal * fx.Int32(b_crowd[0]))
+    # A near-uniform test: with every n_g alike nothing backfills the last partial round, so its
+    # rem tiles are exposed. Under skew the tail tiles are the cheapest group, so the exposure is
+    # small -- only worth cutting once the group count already overflows the CUs (B2's class).
+    a_on = (n_hot * fx.Int32(_WGRAD_SPLIT_UNIF[1])) < (n_min * fx.Int32(_WGRAD_SPLIT_UNIF[0]))
+    if const_expr(TILES_PER_GROUP <= ncu):
+        # B1: smallest S whose sliced round count still fits the ideal.
+        b_s = fx.Int32(1)
+        for s in reversed(_WGRAD_SPLIT_S):
+            if s <= S_B:
+                fit = (fx.Int32(ceildiv(TILES_PER_GROUP * s, ncu)) * (n_hot >> (s.bit_length() - 1))) <= ideal
+                b_s = fx.Int32(arith.select(fit, fx.Int32(s), b_s))
+        b_n = fx.Int32(TILES_PER_GROUP)
+        take_a = arith.select(b_fires, fx.Int32(0), arith.select(a_on, fx.Int32(1), fx.Int32(0)))
+    else:
+        # B2: TPG > NCU, so only the ceil(TPG/NCU) overflow tiles of the hot group need halving.
+        b_s = fx.Int32(2)
+        b_n = fx.Int32(TILES_PER_GROUP - ncu)
+        take_a = arith.select(b_fires, fx.Int32(0), fx.Int32(1))
+    take_a = fx.Int32(take_a) > fx.Int32(0)
+    lo = fx.Int32(arith.select(take_a, fx.Int32(TOTAL - rem), hot * fx.Int32(TILES_PER_GROUP)))
+    n = fx.Int32(arith.select(take_a, fx.Int32(rem), b_n))
+    # Rule A's own factor: the widest cut that still fits the round only pays off while the tail
+    # tiles cost what the hot ones do, i.e. the exposed partial round is a full-cost round. Under
+    # skew the tail is the cheapest group (gate_up/moderate: 112 vs 516 K-blocks), the exposure is
+    # already short and the extra slices plus their reduce cost more than they recover -- measured
+    # +2.5% on gate_up/balanced against -0.7% on gate_up/moderate for the same S_A=3.
+    s_a = fx.Int32(arith.select(a_on, fx.Int32(S_A), fx.Int32(min(2, S_A))))
+    s = fx.Int32(arith.select(take_a, s_a, b_s))
+    # Guardrail: each slice must keep >= 6 K-blocks (the whole-loop fused-tail floor).
+    keep = fx.Int32(arith.select(take_a, n_last, n_hot)) >= (fx.Int32(6) * s)
+    s = fx.Int32(arith.select(keep, s, fx.Int32(1)))
+    if not pow2:
+        # Guardrail: the reciprocal form of the slice bounds needs k_iters inside its exact range.
+        # The dividend is k_iters*(s-1) (kb1 = div(_ki*_nxt), _nxt up to s-1), not k_iters alone, so
+        # bound by the widest reachable factor or a non-pow2 slice silently drops part of the K dim.
+        fits = n_hot * fx.Int32(max(rcp) - 1) < fx.Int32(_WGRAD_SPLIT_RCP_MAX)
+        s = fx.Int32(arith.select(fits, s, fx.Int32(1)))
+    # Neither rule claimed the load (mid skew, hot chain already inside the ideal): leave it whole.
+    # Slicing it anyway is what a mid-skew load measures worst at -- the window's reduce pass
+    # (11.4 us on down/moderate) costs more than the makespan it recovers.
+    fire = fx.Int32(arith.select(b_fires, fx.Int32(1), arith.select(take_a, fx.Int32(1), fx.Int32(0))))
+    s = fx.Int32(arith.select(fire > fx.Int32(0), s, fx.Int32(1)))
+    on = s > fx.Int32(1)
+    n = fx.Int32(arith.select(on, n, fx.Int32(0)))
+    lo = fx.Int32(arith.select(on, lo, fx.Int32(TOTAL)))
+    code = fx.Int32(rcp[1])
+    for c, v in rcp.items():
+        if c != 1:
+            code = fx.Int32(arith.select(s == fx.Int32(c), fx.Int32(v), code))
+    return (
+        _readfirstlane_i32(lo),
+        _readfirstlane_i32(n),
+        _readfirstlane_i32(s),
+        _readfirstlane_i32(code),
+    )
+
+
+_WGRAD_SPLIT_WS_CACHE = {}
+_WGRAD_SPLIT_WS_SHAPE = {}
+
+
+def _wgrad_split_ws(OUT_M, OUT_N, G, device, dtype, BLOCK_M=256, BLOCK_N=256):
+    """Scratch for the split-K slice partials: S_MAX-1 bands of OUT_M rows at C's row pitch, so
+    a slice store only swaps the band SRD's base. Persistent per (shape, device) rather than
+    appended to C: that would grow every wgrad output 1.75x (down) and hand the caller a view
+    into a larger storage, and a fixed buffer is what CUDA-graph capture needs. The band count is
+    memoized too, so a steady-state call is two dict lookups: deriving it put a device-property
+    query on the dispatch path, which the caller times together with the kernel."""
+    gk = (device.index, OUT_M, OUT_N, G, BLOCK_M, BLOCK_N)
+    shape = _WGRAD_SPLIT_WS_SHAPE.get(gk)
+    if shape is None:
+        ncu = torch.cuda.get_device_properties(device).multi_processor_count
+        tpg = ceildiv(OUT_M, BLOCK_M) * ceildiv(OUT_N, BLOCK_N)
+        bands = _wgrad_split_geom(tpg, G * tpg, ncu)[0] - 1
+        shape = (max(bands, 1) * OUT_M, OUT_N)
+        _WGRAD_SPLIT_WS_SHAPE[gk] = shape
+    key = (device.index, dtype) + shape
+    ws = _WGRAD_SPLIT_WS_CACHE.get(key)
+    if ws is None:
+        ws = torch.empty(shape, device=device, dtype=dtype)
+        _WGRAD_SPLIT_WS_CACHE[key] = ws
+    return ws
+
+
 def _compile_grouped_tn_wgrad_4wave(
     *,
     OUT_M: int,
@@ -3097,6 +3443,7 @@ def _compile_grouped_tn_wgrad_4wave(
     out_fp16: bool = False,
     group_m: int = 0,
     group_n: int = 0,
+    xcd_aff: bool = False,
     vmcnt_hint: int = 2,
     cap_cu: int = -1,
     half_bnd: bool = True,
@@ -3131,10 +3478,42 @@ def _compile_grouped_tn_wgrad_4wave(
     N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
-    _TILE_ROT = _WG_TILE_ROT if TILES_PER_GROUP > _WG_TILE_ROT else 0
+    # (group_m, group_n) are the XCD-affine (h, w) under xcd_aff; the rotation is subsumed by it.
+    _XCD_AFF = (group_m, group_n) if xcd_aff else None
+    if _XCD_AFF is not None:
+        assert num_xcd <= 1, "xcd_aff assumes the hardware bid % 8 XCD split, not a pid remap"
+        assert (
+            _wgrad_xcd_aff_geom(N_BLOCKS_M, N_BLOCKS_N, TILES_PER_GROUP) is not None
+            and N_BLOCKS_M % group_m == 0
+            and N_BLOCKS_N % group_n == 0
+            and group_m * group_n <= TILES_PER_GROUP // _WGRAD_XCD_HW
+        ), f"bad xcd_aff geometry ({group_m},{group_n}) for {N_BLOCKS_M}x{N_BLOCKS_N}"
+    _TILE_ROT = (
+        0 if _XCD_AFF is not None else (_WG_TILE_ROT if TILES_PER_GROUP > _WG_TILE_ROT else 0)
+    )
     # Every stored column is < OUT_N at compile time, so the epilogue per-element OOB select is dead. Needs half_bnd and OUT_N % LDS_BLOCK_N == 0.
     _HALF_N_TILE = half_bnd and (OUT_N % BLOCK_N != 0) and (OUT_N % BLOCK_N <= LDS_BLOCK_N)
     _COL_SAFE = (OUT_N % BLOCK_N == 0) or (_HALF_N_TILE and OUT_N % LDS_BLOCK_N == 0)
+    # Split-K window geometry. num_xcd>1 remaps the dispatch id, which can carry a window across
+    # a group boundary (two groups would then share one workspace band), so keep it to xcd=1.
+    _NCU = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    _S_MAX, _S_A, _S_B, _N_MAX, _SP_EXT = (
+        _wgrad_split_geom(TILES_PER_GROUP, TOTAL, _NCU) if num_xcd <= 1 else (1, 1, 1, 0, 0)
+    )
+    _SPLIT = _S_MAX > 1
+    _SP_POW2 = _wgrad_split_rcp_cfg(TILES_PER_GROUP, _S_A, _S_B, _NCU)[0]
+    _GRID_EXT = TOTAL + _SP_EXT
+    # Reduce: one workgroup covers BLOCK_M//_WGRAD_RED_WPT rows x BLOCK_N cols of a window tile.
+    _RED_ROWS = BLOCK_M // _WGRAD_RED_WPT
+    _RED_LPR = BLOCK_N // _WGRAD_RED_VEC  # lanes spanning one tile row
+    _RED_RPP = 256 // _RED_LPR  # rows one 256-thread pass covers
+    _RED_L2WPT = _WGRAD_RED_WPT.bit_length() - 1
+    _RED_GRID = max(1, _N_MAX * _WGRAD_RED_WPT)
+    assert not _SPLIT or (
+        _WGRAD_RED_WPT & (_WGRAD_RED_WPT - 1) == 0
+        and _RED_ROWS % _RED_RPP == 0
+        and OUT_N % _WGRAD_RED_VEC == 0
+    ), "split-K reduce needs a pow2 WPT, row-aligned passes and a vector-aligned OUT_N"
 
     # Scalar store shrinks C_lds_shuffle to a stub so the 2nd deferred-write B buffer fits.
     SharedStorage = _make_wave4_smem(
@@ -3152,6 +3531,7 @@ def _compile_grouped_tn_wgrad_4wave(
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         group_offs: fx.Tensor,
+        WS: fx.Tensor,
     ):
         _ = str(fx.thread_idx.x)
         F8_IR_t = fx.Float8E4M3FN.ir_type
@@ -3177,7 +3557,15 @@ def _compile_grouped_tn_wgrad_4wave(
         _cm = fx.Int32(OUT_M)
         _cn = fx.Int32(OUT_N)
 
-        def _do_tile_3buf(t, tile_a_halves, tile_b_halves, tile_swap_n=False):
+        def _do_tile_3buf(
+            t,
+            tile_a_halves,
+            tile_b_halves,
+            tile_swap_n=False,
+            slice_id=None,
+            split_s=None,
+            split_code=None,
+        ):
             _wave4_do_tile_tn(
                 t,
                 TOTAL=TOTAL,
@@ -3222,16 +3610,55 @@ def _compile_grouped_tn_wgrad_4wave(
                 _cm=_cm,
                 _cn=_cn,
                 tile_rot=_TILE_ROT,
+                xcd_aff=_XCD_AFF,
                 a_halves=tile_a_halves,
                 b_halves=tile_b_halves,
                 swap_n=tile_swap_n,
                 col_safe=_COL_SAFE,
+                slice_id=slice_id,
+                split_s=split_s,
+                split_code=split_code,
+                split_pow2=_SP_POW2,
+                WS=WS,
             )
 
         # Persistent: fixed grid of <=ncus WGs strides the tile space. Boundary M-/N-block with <=128 valid rows/cols runs the a0-/b0-only whole-loop (predicates wave-uniform, bodies have s_barrier).
         _HALF_M = half_bnd and (OUT_M % BLOCK_M != 0) and (OUT_M % BLOCK_M <= 128)
         _HALF_N = half_bnd and (OUT_N % BLOCK_N != 0) and (OUT_N % BLOCK_N <= 128)
-        for t in range(pid, TOTAL, nsms):
+        if const_expr(_SPLIT):
+            _sp_lo, _sp_n, _sp_s, _sp_code = _wgrad_split_policy(
+                go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, _NCU, _S_A, _S_B
+            )
+            _sp_nsl = _readfirstlane_i32(_sp_n * _sp_s)  # dispatch ids the window expands to
+            _sp_live = _readfirstlane_i32(fx.Int32(TOTAL) + (_sp_nsl - _sp_n))
+        else:
+            _sp_live = fx.Int32(TOTAL)
+        for d in range(pid, _sp_live, nsms):
+            if const_expr(_SPLIT):
+                # Window ids [lo, lo+n*S) carry (tile, slice); ids above it shift back by n*(S-1).
+                _rel = d - _sp_lo
+                _pre = _rel < fx.Int32(0)
+                _in = _rel < _sp_nsl
+                _q = _wgrad_split_div(_rel, _sp_code, _SP_POW2)
+                t = _readfirstlane_i32(
+                    arith.select(
+                        _pre,
+                        d,
+                        arith.select(_in, _sp_lo + _q, d - (_sp_nsl - _sp_n)),
+                    )
+                )
+                # slice_id < 0 = whole tile: window-outside tiles must NOT take the sliced K range.
+                _sid = _readfirstlane_i32(
+                    arith.select(
+                        _pre,
+                        fx.Int32(-1),
+                        arith.select(_in, _rel - _q * _sp_s, fx.Int32(-1)),
+                    )
+                )
+                _sl = dict(slice_id=_sid, split_s=_sp_s, split_code=_sp_code)
+            else:
+                t = d
+                _sl = {}
             if const_expr(_HALF_M or _HALF_N):
                 _tt = xcd_remap_pid(t, TOTAL, num_xcd)
                 _, _blk_m, _blk_n = _wgrad_block_mn(
@@ -3244,30 +3671,114 @@ def _compile_grouped_tn_wgrad_4wave(
                     group_n,
                     False,
                     _TILE_ROT,
+                    _XCD_AFF,
                 )
                 if const_expr(_HALF_M and _HALF_N):
                     if _readfirstlane_i32(_blk_m) == fx.Int32(N_BLOCKS_M - 1):
                         if _readfirstlane_i32(_blk_n) == fx.Int32(N_BLOCKS_N - 1):
-                            _do_tile_3buf(t, 1, 1)
+                            _do_tile_3buf(t, 1, 1, **_sl)
                         else:
-                            _do_tile_3buf(t, 1, 2)
+                            _do_tile_3buf(t, 1, 2, **_sl)
                     else:
                         if _readfirstlane_i32(_blk_n) == fx.Int32(N_BLOCKS_N - 1):
-                            _do_tile_3buf(t, 2, 1)
+                            _do_tile_3buf(t, 2, 1, **_sl)
                         else:
-                            _do_tile_3buf(t, 2, 2)
+                            _do_tile_3buf(t, 2, 2, **_sl)
                 elif const_expr(_HALF_M):
                     if _readfirstlane_i32(_blk_m) == fx.Int32(N_BLOCKS_M - 1):
-                        _do_tile_3buf(t, 1, 2)
+                        _do_tile_3buf(t, 1, 2, **_sl)
                     else:
-                        _do_tile_3buf(t, 2, 2)
+                        _do_tile_3buf(t, 2, 2, **_sl)
                 else:
                     if _readfirstlane_i32(_blk_n) == fx.Int32(N_BLOCKS_N - 1):
-                        _do_tile_3buf(t, 2, 1)
+                        _do_tile_3buf(t, 2, 1, **_sl)
                     else:
-                        _do_tile_3buf(t, 2, 2)
+                        _do_tile_3buf(t, 2, 2, **_sl)
             else:
-                _do_tile_3buf(t, 2, 2)
+                _do_tile_3buf(t, 2, 2, **_sl)
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def kernel_grouped_tn_wgrad_reduce(C: fx.Tensor, group_offs: fx.Tensor, WS: fx.Tensor):
+        """Fold the split-K scratch bands back into C. The window policy is recomputed here
+        (identical scalars), so this only touches the n window tiles -- the untouched part of a
+        band is never read and needs no zeroing pass. Slots are summed in a fixed 0..S-2 order
+        in fp32, keeping the store bit-reproducible."""
+        _ = str(fx.thread_idx.x)
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        _ir_ty = _out_ty.ir_type
+        f32v = fx.T.VectorType.get([_WGRAD_RED_VEC], fx.T.f32())
+        outv = fx.T.VectorType.get([_WGRAD_RED_VEC], _ir_ty)
+        go = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
+        go_div = fx.logical_divide(go, fx.make_layout(1, 1))
+        _lo, _n, _s_run, _ = _wgrad_split_policy(
+            go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, _NCU, _S_A, _S_B
+        )
+        c_base = _buffer_ops.extract_base_index(C)
+        ws_base = _buffer_ops.extract_base_index(WS)
+        tid = fx.thread_idx.x
+        col_l = (tid % fx.Int32(_RED_LPR)) * fx.Int32(_WGRAD_RED_VEC)
+        row_l = tid // fx.Int32(_RED_LPR)
+        live = _readfirstlane_i32(_n * fx.Int32(_WGRAD_RED_WPT))
+        for w in range(fx.block_idx.x, live, fx.grid_dim.x):
+            slot = _readfirstlane_i32(w >> _RED_L2WPT)
+            sub = _readfirstlane_i32(w & fx.Int32(_WGRAD_RED_WPT - 1))
+            _tt = xcd_remap_pid(_lo + slot, TOTAL, num_xcd)
+            _gi, _bm, _bn = _wgrad_block_mn(
+                _tt,
+                G,
+                TILES_PER_GROUP,
+                N_BLOCKS_M,
+                N_BLOCKS_N,
+                group_m,
+                group_n,
+                False,
+                _TILE_ROT,
+                _XCD_AFF,
+            )
+            gi = _readfirstlane_i32(_gi)
+            bm_off = _readfirstlane_i32(_bm * fx.Int32(BLOCK_M))
+            bn_off = _readfirstlane_i32(_bn * fx.Int32(BLOCK_N))
+            col = bn_off + col_l
+            col_ok = col < fx.Int32(OUT_N)
+            # Rows past OUT_M fall outside the band SRD (dropped); columns would wrap, hence col_ok.
+            rs_c = make_row_band_resource(c_base, gi * OUT_M + bm_off, (gi + 1) * OUT_M, OUT_N, 2)
+            rs_w = [
+                make_row_band_resource(ws_base, bm_off + fx.Int32((s - 1) * OUT_M), s * OUT_M, OUT_N, 2)
+                for s in range_constexpr(1, _S_MAX)
+            ]
+            off0 = (sub * fx.Int32(_RED_ROWS) + row_l) * fx.Int32(OUT_N) + col
+            for p in range_constexpr(_RED_ROWS // _RED_RPP):
+                off = off0 + fx.Int32(p * _RED_RPP * OUT_N)
+                acc = arith.extf(
+                    f32v,
+                    _buffer_ops.buffer_load(rs_c, off, vec_width=_WGRAD_RED_VEC, dtype=_ir_ty, mask=col_ok),
+                )
+                for s in range_constexpr(1, _S_MAX):
+                    # slots >= S were never written: address them out of bounds (HW returns 0).
+                    off_s = arith.select(fx.Int32(s) < _s_run, off, fx.Int32(0x3FFFFFFF))
+                    acc = arith.addf(
+                        acc,
+                        arith.extf(
+                            f32v,
+                            _buffer_ops.buffer_load(
+                                rs_w[s - 1],
+                                off_s,
+                                vec_width=_WGRAD_RED_VEC,
+                                dtype=_ir_ty,
+                                mask=col_ok,
+                            ),
+                        ),
+                    )
+                _buffer_ops.buffer_store(arith.trunc_f(outv, acc), rs_c, off, mask=col_ok)
+
+    # One tile per WG (grid=TOTAL): finest HW-scheduler backfill of the long-K skew tail; a freed CU grabs the next tile so the wall drops to total_work/#CU. PT_WL_GRIDMUL caps the grid.
+    # Both the grid and the launch attrs depend only on factory-scope constants, so resolve them
+    # once here: re-deriving them per call put a device query, an environ read and an arith.select
+    # over two literals on the launch path, and the caller times the dispatch with cuda events.
+    _CAP_CU = _NCU if cap_cu <= 0 else min(int(cap_cu), _NCU)
+    _GRID_MUL = int(os.environ.get("PT_WL_GRIDMUL", "0"))
+    _GRID_X = _GRID_EXT if _GRID_MUL <= 0 else min(_GRID_EXT, _CAP_CU * _GRID_MUL)
+    _ATTRS = make_value_attrs(1, 0, "256,256")
 
     @flyc.jit
     def launch_grouped_tn_wgrad_4wave(
@@ -3277,15 +3788,9 @@ def _compile_grouped_tn_wgrad_4wave(
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         group_offs: fx.Tensor,
+        WS: fx.Tensor,
         stream: fx.Stream,
     ):
-        ncus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-        cap = ncus if cap_cu <= 0 else min(int(cap_cu), ncus)
-        # One tile per WG (grid=TOTAL): finest HW-scheduler backfill of the long-K skew tail; a freed CU grabs the next tile so the wall drops to total_work/#CU. PT_WL_GRIDMUL caps the grid.
-        _mul = int(os.environ.get("PT_WL_GRIDMUL", "0"))
-        cap = TOTAL if _mul <= 0 else cap * _mul
-        grid_x = arith.select(fx.Int32(TOTAL) < cap, fx.Int32(TOTAL), fx.Int32(cap))
-        attrs = make_value_attrs(1, 0, "256,256")
         kernel_grouped_tn_wgrad_4wave(
             A,
             B,
@@ -3293,8 +3798,15 @@ def _compile_grouped_tn_wgrad_4wave(
             A_scale,
             B_scale,
             group_offs,
-            value_attrs=attrs,
-        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+            WS,
+            value_attrs=_ATTRS,
+        ).launch(grid=(_GRID_X, 1, 1), block=(256, 1, 1), stream=stream)
+        if const_expr(_SPLIT):
+            # Same stream: the reduce sees every slice partial. Grid is the compile-time window
+            # bound; a policy that picks S=1 leaves live=0 and every workgroup exits at once.
+            kernel_grouped_tn_wgrad_reduce(C, group_offs, WS).launch(
+                grid=(_RED_GRID, 1, 1), block=(256, 1, 1), stream=stream
+            )
 
     return launch_grouped_tn_wgrad_4wave
 
@@ -3379,8 +3891,29 @@ def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num
 # Per-group tile rotation: odd and coprime with the 16-tile CU-residue class, so it spreads the boundary tiles.
 _WG_TILE_ROT = 5
 
-# 4-wave (group_m, group_n, num_xcd) candidates; xcd=1 keeps group-major LPT order (a skewed load needs it, unknowable at dispatch). gm4/gn2 is the worst-case reference.
-_WGRAD_4WAVE_CANDS = ((4, 2, 1), (4, 4, 1), (8, 4, 1))
+# 4-wave (group_m, group_n, num_xcd, xcd_aff) candidates; xcd=1 keeps group-major LPT order (a
+# skewed load needs it, unknowable at dispatch).
+_WGRAD_4WAVE_CANDS = ((4, 2, 1, 0), (4, 4, 1, 0), (8, 4, 1, 0))
+
+
+def _wgrad_4wave_cands(OUT_M, OUT_N, ncu, block=256):
+    """Order the candidates so cands[0] -- the incumbent, which the race below only displaces on a
+    >1.5% win -- is the one the tile geometry argues for, and lead with the XCD-affine swizzle on
+    the grids whose band cannot already be one. A gn4 band covers 16 tiles with 8 operand blocks
+    (2.0 tiles/block) vs gn2's 8 tiles with 6 (1.33), but that only buys anything once a group holds
+    more tiles than the device runs at once and its operand slab stops being wholly L2 resident:
+    measured -1.9% on gate_up (276 tiles/group > 256 CU) and flat on down (144)."""
+    n_blocks_m = (OUT_M + block - 1) // block
+    n_blocks_n = (OUT_N + block - 1) // block
+    tiles_per_group = n_blocks_m * n_blocks_n
+    head = (4, 4) if tiles_per_group > ncu else (4, 2)
+    band = tuple(sorted(_WGRAD_4WAVE_CANDS, key=lambda c: c[:2] != head))
+    aff = (
+        None
+        if _wgrad_band_is_xcd_aff(n_blocks_m, n_blocks_n, *head)
+        else _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group)
+    )
+    return band if aff is None else ((aff[0], aff[1], 1, 1),) + band[:3]
 
 
 def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_traverse=False):
@@ -3405,16 +3938,26 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
     ):
         mps.append(
             [
-                (lhs_c.view(torch.int8), rhs_c.view(torch.int8), args[2], args[3], args[4], offs_c, args[6]),
+                (
+                    lhs_c.view(torch.int8),
+                    rhs_c.view(torch.int8),
+                    args[2],
+                    args[3],
+                    args[4],
+                    offs_c,
+                    args[6],
+                    args[7],
+                ),
                 args[2],
                 None,
                 None,
             ]
         )
 
-    wave4_cands = _WGRAD_4WAVE_CANDS
+    _ncu = torch.cuda.get_device_properties(lhs_live.device).multi_processor_count
+    wave4_cands = _wgrad_4wave_cands(OUT_M, OUT_N, _ncu)
 
-    def _compile_4wave(gm, gn, xcd):
+    def _compile_4wave(gm, gn, xcd, aff):
         return _compile_grouped_tn_wgrad_4wave(
             OUT_M=OUT_M,
             OUT_N=OUT_N,
@@ -3425,6 +3968,7 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
             num_xcd=xcd,
             group_m=gm,
             group_n=gn,
+            xcd_aff=bool(aff),
         )
 
     # Correctness reference: the first 4-wave candidate; masked kernel only as a compile/NaN fallback for i64 huge shapes.
@@ -3432,8 +3976,8 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
     prod_tag = None
     if not i64_traverse:
         try:
-            gm0, gn0, xcd0 = wave4_cands[0]
-            cand = _compile_4wave(gm0, gn0, xcd0)
+            gm0, gn0, xcd0, aff0 = wave4_cands[0]
+            cand = _compile_4wave(gm0, gn0, xcd0, aff0)
             ok = True
             for mp in mps:
                 cand(*mp[0])
@@ -3442,11 +3986,13 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
                     ok = False
                     break
             if ok:
-                prod, prod_tag = cand, f"4wave.gm{gm0}.gn{gn0}.x{xcd0}"
+                prod, prod_tag = cand, f"4wave.gm{gm0}.gn{gn0}.x{xcd0}.a{aff0}"
         except Exception:
             prod = None
     if prod is None:  # i64 huge shape or 4-wave failed to compile/produced NaN -> masked ref
-        prod = _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 1, i64_traverse=i64_traverse)
+        _masked = _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 1, i64_traverse=i64_traverse)
+        def prod(*a):  # masked fallback takes no split-K scratch (drop WS at index 6, keep stream)
+            return _masked(*a[:6], a[-1])
         prod_tag = "masked-fallback"
         for mp in mps:
             prod(*mp[0])
@@ -3476,9 +4022,9 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
 
     best_l, best_s = prod, _score(prod)
     race = wave4_cands if prod_tag == "masked-fallback" else wave4_cands[1:]
-    for gm, gn, xcd in race:
+    for gm, gn, xcd, aff in race:
         try:
-            l = _compile_4wave(gm, gn, xcd)
+            l = _compile_4wave(gm, gn, xcd, aff)
         except Exception:
             continue
         s = _score(l)  # numeric guard folded in: None -> skip
@@ -3507,7 +4053,10 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
+    out2d = torch.empty((G * OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
+    out = out2d.view(G, OUT_M, OUT_N)
+    # Split-K slice partials land in a persistent scratch; the reduce kernel folds them into C.
+    ws = _wgrad_split_ws(OUT_M, OUT_N, G, lhs.device, out_dtype)
     # kernel reads group_offs as int64 low-words via a free int32-view (no .to(int32) cast).
     _go64 = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
     go32 = _go64.view(torch.int32)
@@ -3525,13 +4074,27 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     M_total = lhs.shape[0]
     i64_tr = (M_total * OUT_M >= 2**32) or (M_total * OUT_N >= 2**32)
     at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, i64_tr)
-    # out as 2D [G*OUT_M, OUT_N] (the kernel stacked-group view).
-    wargs = (lhs_i8, rhs_i8, out.view(G * OUT_M, OUT_N), lsf, rsf, go32, stream)
-    launch = _GROUPED_WGRAD_AT_CACHE.get(at_key)
-    if launch is None:
-        launch = _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, i64_tr)
-        _GROUPED_WGRAD_AT_CACHE[at_key] = launch
-    launch(*wargs)
+    # out as 2D [G*OUT_M, OUT_N] (the kernel's stacked-group view).
+    wargs = (lhs_i8, rhs_i8, out2d, lsf, rsf, go32, ws, stream)
+    entry = _GROUPED_WGRAD_AT_CACHE.get(at_key)
+    if entry is None:
+        entry = [_autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, i64_tr), None]
+        _GROUPED_WGRAD_AT_CACHE[at_key] = entry
+    raw, compiled = entry
+    # Mode-split, same as the forward entry: CUDA-graph capture takes the raw @flyc.jit closure,
+    # eager takes a flyc.compile-d object. The raw closure re-binds the signature, re-resolves
+    # every argument and re-snapshots 23 captured globals per dispatch, which costs more host
+    # time (~57us) than the wgrad kernel spends filling the CUs with its first tile.
+    if torch.cuda.is_current_stream_capturing():
+        raw(*wargs)
+    else:
+        if compiled is None:
+            try:
+                compiled = flyc.compile(raw, *wargs)
+            except Exception:  # masked fallback is a plain closure, not a @flyc.jit function
+                compiled = raw
+            entry[1] = compiled
+        compiled(*wargs)
     return out
 
 
