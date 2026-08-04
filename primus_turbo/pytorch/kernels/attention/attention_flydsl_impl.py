@@ -33,21 +33,24 @@ from primus_turbo.flydsl.attention.flash_attn_fwd import (
 )
 
 
-def _uniform_seqlen(cu_seqlens: "torch.Tensor"):
-    """(batch, S) from a cumulative-seqlens vector; asserts every segment is equal
-    (the rectangular rect16 backward fast path is compiled for a uniform per-batch
-    length). The ragged / block-causal path does NOT go through this -- it reads
-    per-segment boundaries from cu_seqlens inside the kernel."""
-    seg = cu_seqlens[1:] - cu_seqlens[:-1]
-    S = int(seg[0].item())
-    assert bool((seg == S).all().item()), "flydsl flash-attn requires uniform seqlens"
-    return cu_seqlens.numel() - 1, S
+def _uniform_shape(cu_seqlens: "torch.Tensor", max_seqlen, total):
+    """(batch, S) iff every segment is exactly ``max_seqlen``, else None.
 
+    Routes to the rectangular rect16 fast path, which is compiled for a uniform
+    per-batch length; the ragged / block-causal path reads per-segment boundaries
+    from cu_seqlens inside the kernel instead.
 
-def _is_uniform(cu_seqlens: "torch.Tensor"):
-    """True iff every segment has equal length (routes to the rect16 fast path)."""
-    seg = cu_seqlens[1:] - cu_seqlens[:-1]
-    return bool((seg == seg[0]).all().item())
+    The test is host-only on purpose. Every segment is <= max_seqlen (the caller's
+    contract, which the grid already relies on) and they sum to ``total``, so
+    total == batch*max_seqlen forces all of them to equal max_seqlen. Deriving it
+    from cu_seqlens instead costs a .item() -- a full device sync plus a handful of
+    tiny reduce kernels -- on EVERY backward call, which at the gpt-oss prefill
+    shape measured ~1.1% of the backward wall and blocks the host from running the
+    launch sequence ahead of the GPU.
+    """
+    B = cu_seqlens.numel() - 1
+    S = int(max_seqlen)
+    return (B, S) if B * S == int(total) else None
 
 
 @functools.lru_cache(maxsize=64)
@@ -167,11 +170,15 @@ def flash_attn_varlen_flydsl_backward_impl(
         assert sink.dtype == torch.float32 and sink.numel() == Hq, "sink must be fp32 [Hq]"
         sink = sink.contiguous()
 
-    if _is_uniform(cu_seqlens_q):
-        B, Sq = _uniform_seqlen(cu_seqlens_q)
-        Bk, Skv = _uniform_seqlen(cu_seqlens_k)
+    uq = _uniform_shape(cu_seqlens_q, max_seqlen_q, q.shape[0])
+    uk = _uniform_shape(cu_seqlens_k, max_seqlen_k, k.shape[0])
+    if uq is not None and uk is not None:
+        B, Sq = uq
+        Bk, Skv = uk
         assert B == Bk, f"q/k batch mismatch ({B} vs {Bk})"
-        lse_bhsq = lse.reshape(B, Sq, Hq).permute(0, 2, 1).contiguous()  # rect16 wants head-major [B,Hq,Sq]
+        # rect16 wants head-major [B,Hq,Sq]; left non-contiguous so the -log2e prescale
+        # inside the backward materialises it in ONE pass instead of copy-then-scale.
+        lse_bhsq = lse.reshape(B, Sq, Hq).permute(0, 2, 1)
         return flydsl_varlen_backward(
             dout.contiguous(),
             q,
