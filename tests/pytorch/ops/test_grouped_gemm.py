@@ -17,60 +17,31 @@ from tests.pytorch.ref.gemm_ref import (
 from tests.pytorch.test_utils import compute_snr, get_tolerances
 
 
-@pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32])
-@pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048])
-@pytest.mark.parametrize(
-    "N_K", [(2048, 1536), (2048, 1408), (2816, 2048), (3072, 5120), (5120, 1536), (4096, 7168), (7168, 2048)]
-)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("balance", [True, False])
-@pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("reduce_num_cu", [0, 16, 32])
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
-@pytest.mark.parametrize("auto_tune", [False, True])
-def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, backend, auto_tune):
-    seed = 42
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def _skip_if_flydsl_unsupported(backend, dtype, K):
+    """Skip the shapes/dtypes the FlyDSL bf16 grouped GEMM backend refuses.
 
-    if backend is not None and auto_tune:
-        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+    An explicitly pinned backend raises instead of falling back, so these have
+    to be filtered out here rather than left to the dispatcher.
+    """
+    if backend is not BackendType.FLYDSL:
+        return
+    if get_device_compute_capability() != (9, 5):
+        pytest.skip("FlyDSL grouped GEMM is gfx950-only")
+    if dtype != torch.bfloat16:
+        pytest.skip("FlyDSL grouped GEMM only supports bfloat16")
+    # Partial tiles are masked on every axis now, so all that is left is a
+    # 16B-aligned row stride plus the three k slabs the K-loop pipelines over.
+    if K % 8 != 0 or K <= 128:
+        pytest.skip(f"FlyDSL needs K % 8 == 0 and K > 128, got K={K}")
 
-    if auto_tune and reduce_num_cu > 0:
-        pytest.skip(
-            "skip auto_tune when reduce_num_cu > 0 because hipBLASLt does not support reduce_num_cu > 0 "
-            "and the tuner may select hipBLASLt"
-        )
 
-    if backend is BackendType.HIPBLASLT and reduce_num_cu > 0:
-        pytest.skip("HIPBLASLT does not support reduce_num_cu > 0")
+def _check_grouped_gemm(B, M, N, K, dtype, balance, trans_b, num_cu):
+    """Run fwd+bwd against the reference and assert closeness and SNR.
 
-    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can exhibit
-    # intermittent/flake failures when M <= 512. This has not been reproduced on MI355.
-    # We skip for now to keep CI stable while we investigate the root cause.
-    # (Also skip when auto_tune=True because the tuner may select hipBLASLt.)
-    if (
-        M <= 512
-        and (backend is BackendType.HIPBLASLT or auto_tune is True)
-        and get_device_compute_capability() == (9, 4)
-    ):
-        pytest.skip(
-            "Intermittent flake on gfx942 with hipBLASLt when M <= 512; "
-            "skipping pending root-cause investigation (not reproduced on MI355)."
-        )
-
-    # Set backend and auto_tune config
-    GlobalBackendManager.set_grouped_gemm_backend(backend)
-    GlobalBackendManager.set_auto_tune(auto_tune)
-
+    The caller owns seeding and the backend/auto_tune configuration.
+    """
     device = "cuda"
-    props = torch.cuda.get_device_properties(device)
-    num_cu = props.multi_processor_count - reduce_num_cu
-
-    N, K = N_K
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    print(B, M, N, K, dtype, balance, trans_b, num_cu, backend, auto_tune)
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
 
@@ -109,7 +80,117 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
     torch.testing.assert_close(a_ref.grad, a.grad, **get_tolerances(dtype))
     torch.testing.assert_close(b_ref.grad, b.grad, **get_tolerances(dtype))
 
+
+@pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32])
+@pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048])
+@pytest.mark.parametrize(
+    "N_K", [(2048, 1536), (2048, 1408), (2816, 2048), (3072, 5120), (5120, 1536), (4096, 7168), (7168, 2048)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.parametrize("trans_b", [True, False])
+@pytest.mark.parametrize(
+    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, backend, auto_tune):
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    N, K = N_K
+
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
+    # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can exhibit
+    # intermittent/flake failures when M <= 512. This has not been reproduced on MI355.
+    # We skip for now to keep CI stable while we investigate the root cause.
+    # (Also skip when auto_tune=True because the tuner may select hipBLASLt.)
+    if (
+        M <= 512
+        and (backend is BackendType.HIPBLASLT or auto_tune is True)
+        and get_device_compute_capability() == (9, 4)
+    ):
+        pytest.skip(
+            "Intermittent flake on gfx942 with hipBLASLt when M <= 512; "
+            "skipping pending root-cause investigation (not reproduced on MI355)."
+        )
+
+    _skip_if_flydsl_unsupported(backend, dtype, K)
+
+    # Set backend and auto_tune config
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(auto_tune)
+
+    device = "cuda"
+    props = torch.cuda.get_device_properties(device)
+    num_cu = props.multi_processor_count
+
+    print(B, M, N, K, dtype, balance, trans_b, num_cu, backend, auto_tune)
+    _check_grouped_gemm(B, M, N, K, dtype, balance, trans_b, num_cu)
+
     # Reset config and caches
+    GlobalBackendManager.reset()
+
+
+# The FlyDSL tile walks K in slabs of 64; a K that is not a multiple of 64 leaves a
+# partial trailing slab that the loaders have to mask to zero. Every K in the matrix
+# above is a multiple of 64, so the tail path needs its own cases.
+@pytest.mark.parametrize("B", [1, 3, 8])
+@pytest.mark.parametrize("M", [128, 1024])
+@pytest.mark.parametrize("N_K", [(2048, 136), (2048, 1368), (3072, 1576), (2048, 4088)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.parametrize("trans_b", [True, False])
+def test_grouped_gemm_k_tail(B, M, N_K, dtype, balance, trans_b):
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    N, K = N_K
+    assert K % 64 != 0, f"this test is about the masked K tail, got an aligned K={K}"
+    _skip_if_flydsl_unsupported(BackendType.FLYDSL, dtype, K)
+
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.FLYDSL)
+    num_cu = torch.cuda.get_device_properties("cuda").multi_processor_count
+    try:
+        _check_grouped_gemm(B, M, N, K, dtype, balance, trans_b, num_cu)
+    finally:
+        GlobalBackendManager.reset()
+
+
+# Only CK and Triton honour a reduced CU budget: hipBLASLt has no num_cu knob and
+# FlyDSL launches a full-device grid, so both would silently ignore it.
+@pytest.mark.parametrize("B", [1, 2, 8, 32])
+@pytest.mark.parametrize("M", [128, 2048])
+@pytest.mark.parametrize("N_K", [(2048, 1536), (4096, 7168)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.parametrize("trans_b", [True, False])
+@pytest.mark.parametrize("reduce_num_cu", [16, 32])
+@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.TRITON])
+def test_grouped_gemm_func_with_reduce_num_cu(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, backend):
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    N, K = N_K
+
+    # Pin the backend so the tuner cannot route around the num_cu constraint.
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(False)
+
+    device = "cuda"
+    props = torch.cuda.get_device_properties(device)
+    num_cu = props.multi_processor_count - reduce_num_cu
+
+    print(B, M, N, K, dtype, balance, trans_b, num_cu, backend)
+    _check_grouped_gemm(B, M, N, K, dtype, balance, trans_b, num_cu)
+
     GlobalBackendManager.reset()
 
 
@@ -119,7 +200,9 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+@pytest.mark.parametrize(
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
 @pytest.mark.deterministic
 def test_grouped_gemm_deterministic(B, M, N_K, dtype, balance, trans_b, backend):
     seed = 42
@@ -133,6 +216,8 @@ def test_grouped_gemm_deterministic(B, M, N_K, dtype, balance, trans_b, backend)
     # Keep CI stable: reuse known gfx942 hipBLASLt flake skip for M <= 512.
     if M <= 512 and backend is BackendType.HIPBLASLT and get_device_compute_capability() == (9, 4):
         pytest.skip("Intermittent flake on gfx942 with hipBLASLt when M <= 512; skip temporarily")
+
+    _skip_if_flydsl_unsupported(backend, dtype, N_K[1])
 
     # Keep deterministic test focused: fixed backend / no autotune / no CU reduction.
     GlobalBackendManager.set_grouped_gemm_backend(backend)

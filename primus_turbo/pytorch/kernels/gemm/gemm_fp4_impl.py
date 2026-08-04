@@ -11,7 +11,7 @@ import torch
 _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.common.aiter_utils import get_aiter
-from primus_turbo.flydsl.gemm.mxfp4_gemm_kernel import gemm_mxfp4_flydsl_kernel
+from primus_turbo.flydsl.gemm.gemm_mxfp4_kernel import gemm_mxfp4_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendEntry,

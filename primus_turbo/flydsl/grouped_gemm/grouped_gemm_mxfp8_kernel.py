@@ -44,7 +44,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     wait_barrier,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _grouped_block_mn,
     _load_go,
     _wgrad_block_mn,

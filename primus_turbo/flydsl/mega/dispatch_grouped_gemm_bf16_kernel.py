@@ -22,6 +22,8 @@ from flydsl.expr.typing import AddressSpace, PointerType
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
+)
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
     gemm_bf16_variable_k_tile,
 )
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (

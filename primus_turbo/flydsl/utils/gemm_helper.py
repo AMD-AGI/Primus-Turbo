@@ -184,7 +184,18 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
 
 
 class G2SLoader:
-    def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, chunk_stride=1024, rebase=None):
+    def __init__(
+        self,
+        gl_src,
+        gl_offsets,
+        n_load_steps,
+        lds_dtype,
+        wave_id,
+        chunk_stride=1024,
+        rebase=None,
+        k_pos=None,
+        oob_elems=None,
+    ):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
@@ -202,6 +213,12 @@ class G2SLoader:
         # SRD per load: k_offset folds into the i64 descriptor base and soffset
         # stays 0, lifting the cap at the cost of one re-base per load.
         self.rebase = rebase
+        # Per-load k position inside the BLOCK_K slab and the operand's element
+        # count. Together they let `load` mask a partial trailing k slab: chunks
+        # at or past the k limit are aimed at `oob_elems`, one element past the
+        # SRD bound, so the HW zero-fills LDS instead of pulling in the next row.
+        self.k_pos = k_pos
+        self.oob_elems = oob_elems
 
     def _src_div(self, k_offset):
         """(divided source tensor, soffset) for one load. int32 path returns the
@@ -229,12 +246,22 @@ class G2SLoader:
         lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
         return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
-    def load(self, lds_dst, k_offset, base_off=None):
+    def load(self, lds_dst, k_offset, base_off=None, k_limit=None):
+        """``k_limit`` bounds the valid k positions of this slab (tail slab only).
+
+        The masked chunks still issue their load, so the vmcnt accounting of the
+        surrounding pipeline is unchanged.
+        """
         src_div, soff = self._src_div(k_offset)
         for step in range_constexpr(self.n_load_steps):
-            src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
+            off = self.gl_offsets[step]
+            step_soff = soff
+            if const_expr(k_limit is not None):
+                off = arith.select(self.k_pos[step] < k_limit, off + soff, fx.Int32(self.oob_elems))
+                step_soff = 0
+            src = fx.slice(src_div, (None, fx.Int32(off)))
             dst = self._lds_dst_at(lds_dst, step, base_off)
-            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
+            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(step_soff))
 
 
 def pack_i32x4_i32x8(lo, hi):
@@ -1181,18 +1208,27 @@ def make_fp16_bf16_buffer_tensor(arg):
 
 
 def compute_global_swizzle_bf16(lane_id, wave_id, K, n_rounds):
+    """Per-load element offsets, plus each load's k position inside the BLOCK_K slab.
+
+    The k positions let a caller mask the tail slab when K is not a multiple of
+    BLOCK_K (see ``G2SLoader.load``); they are ignored otherwise.
+    """
     offsets = []
+    k_pos = []
     n_waves = fx.block_dim.x // 64
     for r in range_constexpr(n_rounds):
         row = lane_id // 8 + wave_id * 8 + r * (n_waves * 8)
         col_byte = (lane_id % 8) * 16
         _, c = swizzle_128(row, col_byte)
         offsets.append(row * K + c // 2)
-    return offsets
+        k_pos.append(c // 2)
+    return offsets, k_pos
 
 
 def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps):
+    """``compute_global_swizzle_bf16`` for a k-major operand (k is the row index)."""
     offsets = []
+    k_pos = []
     n_waves = fx.block_dim.x // 64
     kk = (lane_id % 32) // 2
     g = lane_id // 32
@@ -1202,7 +1238,8 @@ def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps):
         n_tile = idx // 4
         ks = idx % 4
         offsets.append((ks * 16 + kk) * c_n + n_tile * 32 + n_in)
-    return offsets
+        k_pos.append(ks * 16 + kk)
+    return offsets, k_pos
 
 
 def _packed_ds_read_tr16(base_ptr, byte_offsets):
@@ -1379,18 +1416,25 @@ class StoreCBf16:
                 row = base_row + ti * 32 + (r // 4) * 8 + m_hi + (r % 4)
                 self._store_masked(acc[r], row * self.c_cols + col, col_valid)
 
-    def store16(self, c_frag, base_row, base_col):
+    def store16(self, c_frag, group_idx, base_m, base_n, out_m, out_n):
+        """Store one 16x16 fragment into group ``group_idx`` of a [G, out_m, out_n] C.
+
+        Both axes are masked: an overhanging m would otherwise land in the next
+        group's slab, and an overhanging n in the next row.
+        """
         n = self.lane_id % 16
         m_hi = (self.lane_id // 16) * 4
-        col = base_col + n
-        col_valid = col < self.c_cols
+        glob_n = base_n + n
+        n_valid = glob_n < out_n
+        row_base = group_idx * out_m
         for ti in range_constexpr(len(c_frag)):
             acc = Vec(c_frag[ti])
             for r in range_constexpr(4):
-                row = base_row + ti * 16 + m_hi + r
-                self._store_masked(acc[r], row * self.c_cols + col, col_valid)
+                m = base_m + ti * 16 + m_hi + r
+                self._store_masked(acc[r], (row_base + m) * out_n + glob_n, n_valid & (m < out_m))
 
     def store_trans16(self, c_frag, group_idx, base_m, base_n, out_m, out_n):
+        """``store16`` transposed: C is [G, out_n, out_m], the fragment is not."""
         n = self.lane_id % 16
         m_hi = (self.lane_id // 16) * 4
         glob_n = base_n + n
@@ -1400,4 +1444,4 @@ class StoreCBf16:
             acc = Vec(c_frag[ti])
             for r in range_constexpr(4):
                 m = base_m + ti * 16 + m_hi + r
-                self._store_masked(acc[r], row_base + m, n_valid)
+                self._store_masked(acc[r], row_base + m, n_valid & (m < out_m))

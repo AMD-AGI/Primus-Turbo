@@ -370,10 +370,72 @@ class GroupedGEMMTritonBackend(KernelBackend):
         )
 
 
+class GroupedGEMMFlyDSLBackend(KernelBackend):
+    """FlyDSL BF16 grouped GEMM backend (NT forward / NN dgrad, gfx950).
+
+    Reuses the tuned dense bf16 tile body with per-tile int64 rebasing of A/B/C;
+    the tile grid is resolved on-device from ``group_offs`` (no CPU sync).
+    """
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 3
+        # bf16 only: the LDS swizzle and ds_read_tr operand path are bf16-typed.
+        supported &= a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+        supported &= not trans_a
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+        supported &= _is_gfx950_device(a.device)
+        if not supported:
+            return False
+        K = a.shape[1]
+        N = b.shape[1] if trans_b else b.shape[2]
+        # A partial trailing BLOCK_K=64 slab is masked at the load, so K only needs
+        # a 16B-aligned row stride; the K-loop still pipelines over >= 3 slabs.
+        supported &= K % 8 == 0 and K > 128
+        # One expert slab is addressed with an int32 in-buffer offset.
+        supported &= N * K < 2**31
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> torch.Tensor:
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+            grouped_gemm_bf16_flydsl_kernel,
+        )
+
+        return grouped_gemm_bf16_flydsl_kernel(
+            a,
+            b,
+            group_offs,
+            trans_b=trans_b,
+        )
+
+
 _GROUPED_GEMM_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMTritonBackend),
+    BackendType.FLYDSL: BackendEntry(GroupedGEMMFlyDSLBackend),
 }
 
 
@@ -427,10 +489,66 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
         )
 
 
+class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
+    """FlyDSL BF16 variable-K grouped GEMM backend (TN wgrad, gfx950)."""
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> bool:
+        supported = True
+        supported &= a.dim() == 2 and b.dim() == 2
+        supported &= a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+        supported &= trans_a and not trans_b
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+        supported &= _is_gfx950_device(a.device)
+        # Partial tiles on both output dims are masked at the store, so the only
+        # shape requirement is a 16B-aligned row stride for the 128-bit loads.
+        supported &= a.shape[1] % 8 == 0 and b.shape[1] % 8 == 0
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> torch.Tensor:
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+            grouped_gemm_bf16_variable_k_flydsl_kernel,
+        )
+
+        # trans_c is handled inside the kernel's store (it transposes the output
+        # tile), so a/b stay in their natural order here.
+        return grouped_gemm_bf16_variable_k_flydsl_kernel(
+            a,
+            b,
+            group_offs,
+            out_dtype=a.dtype,
+            trans_c=trans_c,
+        )
+
+
 _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMVariableKCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMVariableKHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMVariableKTritonBackend),
+    BackendType.FLYDSL: BackendEntry(GroupedGEMMVariableKFlyDSLBackend),
 }
 
 
