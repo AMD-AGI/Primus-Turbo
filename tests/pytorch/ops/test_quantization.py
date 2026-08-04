@@ -288,7 +288,7 @@ def test_quantize_fp8_blockwise_flydsl(row_scale_transposed):
     if not str(get_rocm_arch()).startswith("gfx95"):
         pytest.skip("FlyDSL blockwise FP8 quantization is gfx950-only")
 
-    from primus_turbo.flydsl.quantization.blockwise_fp8_quant_poc import (
+    from primus_turbo.flydsl.quantization.blockwise_fp8_quant import (
         quantize_blockwise_fp8_dual,
         quantize_blockwise_fp8_weight,
     )

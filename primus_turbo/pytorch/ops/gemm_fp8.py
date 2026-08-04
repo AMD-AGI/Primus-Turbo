@@ -489,7 +489,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                     and a.shape[1] % config.block_size == 0
                     and a.numel() * a.element_size() <= 0xFFFFFFFF
                 ):
-                    from primus_turbo.flydsl.quantization.blockwise_fp8_quant_poc import (
+                    from primus_turbo.flydsl.quantization.blockwise_fp8_quant import (
                         quantize_blockwise_fp8_dual,
                     )
 
@@ -538,7 +538,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 and b.shape[1] % 16 == 0
                 and b.numel() * b.element_size() <= 0xFFFFFFFF
             ):
-                from primus_turbo.flydsl.quantization.blockwise_fp8_quant_poc import (
+                from primus_turbo.flydsl.quantization.blockwise_fp8_quant import (
                     quantize_blockwise_fp8_weight,
                 )
 
@@ -600,7 +600,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 and grad_out.shape[1] % ctx.config.block_size == 0
                 and grad_out.numel() * grad_out.element_size() <= 0xFFFFFFFF
             ):
-                from primus_turbo.flydsl.quantization.blockwise_fp8_quant_poc import (
+                from primus_turbo.flydsl.quantization.blockwise_fp8_quant import (
                     quantize_blockwise_fp8_dual,
                 )
 
