@@ -3311,12 +3311,15 @@ def _wgrad_split_div(x, code, pow2):
     return fx.Int32(fx.Int32(x * code) >> _WGRAD_SPLIT_RCP_SHIFT)
 
 
-def _wgrad_split_policy(go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, ncu, S_A, S_B):
+def _wgrad_split_policy(go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, ncu, S_A, S_B, slice_floor=6):
     """Device-side wave-uniform single-window split-K policy. Returns (lo, n, s, code): dispatch
     ids [lo, lo + n*s) form the window and each of its n tiles is split into s contraction slices;
     s == 1 (n == 0) means "do not split". ``code`` is what _wgrad_split_div needs for s, resolved
     here (once per workgroup) rather than per tile. Pure SALU on the G group offsets, so every
-    workgroup recomputes it instead of paying a planner launch."""
+    workgroup recomputes it instead of paying a planner launch.
+
+    ``slice_floor``: minimum K-blocks a slice must keep. 6 is the whole-loop fused-tail floor;
+    a caller whose slice bounds are floored to a packed-scale boundary needs 2*pack."""
     pow2, rcp = _wgrad_split_rcp_cfg(TILES_PER_GROUP, S_A, S_B, ncu)
     l2ncu = ncu.bit_length() - 1
     rem = TOTAL % ncu
@@ -3374,8 +3377,8 @@ def _wgrad_split_policy(go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, ncu, S_A, S_
     # +2.5% on gate_up/balanced against -0.7% on gate_up/moderate for the same S_A=3.
     s_a = fx.Int32(arith.select(a_on, fx.Int32(S_A), fx.Int32(min(2, S_A))))
     s = fx.Int32(arith.select(take_a, s_a, b_s))
-    # Guardrail: each slice must keep >= 6 K-blocks (the whole-loop fused-tail floor).
-    keep = fx.Int32(arith.select(take_a, n_last, n_hot)) >= (fx.Int32(6) * s)
+    # Guardrail: each slice must keep >= slice_floor K-blocks.
+    keep = fx.Int32(arith.select(take_a, n_last, n_hot)) >= (fx.Int32(slice_floor) * s)
     s = fx.Int32(arith.select(keep, s, fx.Int32(1)))
     if not pow2:
         # Guardrail: the reciprocal form of the slice bounds needs k_iters inside its exact range.

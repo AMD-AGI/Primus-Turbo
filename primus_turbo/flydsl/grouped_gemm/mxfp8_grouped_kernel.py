@@ -49,14 +49,22 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     compute_global_swizzle,
     floordiv_pow2,
     make_fp8_buffer_tensor_rebased,
+    make_row_band_resource,
     make_value_attrs,
     wait_barrier,
     xcd_remap_pid,
 )
 from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
+    _WGRAD_RED_VEC,
+    _WGRAD_RED_WPT,
     _grouped_block_mn,
     _load_go,
     _wgrad_block_mn,
+    _wgrad_split_div,
+    _wgrad_split_geom,
+    _wgrad_split_policy,
+    _wgrad_split_rcp_cfg,
+    _wgrad_split_ws,
 )
 
 import flydsl.expr.buffer_ops as _buffer_ops
@@ -211,12 +219,17 @@ def _wgrad_ssa_chunk(
     N_ACCUMS,
     N_LDS_STEPS_A,
     N_LDS_STEPS_B,
+    sc_pf,
     pack=1,
     quads=(2, 2),
 ):
     """One constexpr chunk of the wgrad K-loop with SSA-register accumulators.
 
-    ``quads``: live (M, N) output halves; see ``_wgrad_mx_body_4buf``."""
+    ``quads``: live (M, N) output halves; see ``_wgrad_mx_body_4buf``. ``sc_pf``: rmem
+    carriers (A half 0, B combined) that hand this chunk's first packed scale dword across
+    the chunk boundary -- the dynamic-loop equivalent of the accumulators -- so it is not the
+    one latency-exposed VMEM load left at chunk top. A half 1 stays an ordinary chunk-top
+    load (feeds phase C, 4 barriers later; carrying it too would cost 4 spill dwords)."""
     qm, qn = quads
     c00 = [Vec(fx.memref_load_vec(r)) for r in acc00]
     if qn == 2:
@@ -225,10 +238,10 @@ def _wgrad_ssa_chunk(
         c10 = [Vec(fx.memref_load_vec(r)) for r in acc10]
     if qm == 2 and qn == 2:
         c11 = [Vec(fx.memref_load_vec(r)) for r in acc11]
-    sa0 = sa_s2r.load(sa_base0, base_k, kp0)
+    sa0 = sa_s2r.split(Vec(fx.memref_load_vec(sc_pf[0])))
     if qm == 2:
         sa1 = sa_s2r.load(sa_base1, base_k, kp0)
-    sb_all = sb_s2r.load(sb_base0, base_k, kp0)
+    sb_all = sb_s2r.split(Vec(fx.memref_load_vec(sc_pf[1])))
     sb0, sb1 = sb_all[0:2], sb_all[2:4]
     for _j in range_constexpr(chunk):
         k = base_k + _j
@@ -239,11 +252,17 @@ def _wgrad_ssa_chunk(
         # _j%pack (op_sel immediate), whatever the group's contraction offset is.
         # The scale dword is shared by `pack` consecutive K-iters; load it only once
         # per pack-group and reuse (cuts scale-load vmem instructions PACK-fold). The
-        # tail-group prefetch (_j+1==chunk) is dropped: the next chunk reloads it.
+        # last pack-group prefetches ACROSS the chunk boundary into the rmem carriers, so
+        # the next chunk starts with its first dword already in flight.
         mfma.opsel = scale_opsel(_j, pack)
-        _reload = (_j + 1) % pack == 0 and (_j + 1) < chunk
+        _reload = (_j + 1) % pack == 0
+        _cross = (_j + 1) == chunk
         if _reload:
-            sa0n = sa_s2r.load(sa_base0, k1, kp0)
+            _va0 = sa_s2r.load_vec(sa_base0, k1, kp0)
+            if _cross:
+                fx.memref_store_vec(_va0, sc_pf[0])
+            else:
+                sa0n = sa_s2r.split(_va0)
         b0 = b_s2r.load(b_cur0)
         a0 = a_s2r.load(a_cur0)
         a_g2s.load(a_next1, A1off + k1 * BLOCK_K)
@@ -256,7 +275,11 @@ def _wgrad_ssa_chunk(
             b1 = b_s2r.load(b_cur1)
         b_g2s.load(b_cur0, 0 + k2 * BLOCK_K)
         if _reload:
-            sb_alln = sb_s2r.load(sb_base0, k1, kp0)
+            _vb = sb_s2r.load_vec(sb_base0, k1, kp0)
+            if _cross:
+                fx.memref_store_vec(_vb, sc_pf[1])
+            else:
+                sb_alln = sb_s2r.split(_vb)
         rocdl.s_barrier()
         if qn == 2:
             rocdl.s_setprio(1)
@@ -266,7 +289,7 @@ def _wgrad_ssa_chunk(
         if qm == 2:
             a1 = a_s2r.load(a_cur1)
         a_g2s.load(a_cur0, 0 + k2 * BLOCK_K)
-        if _reload and qm == 2:
+        if _reload and not _cross and qm == 2:
             sa1n = sa_s2r.load(sa_base1, k1, kp0)
         rocdl.s_barrier()
         if qm == 2:
@@ -285,7 +308,7 @@ def _wgrad_ssa_chunk(
         a_cur1, a_next1 = a_next1, a_cur1
         b_cur0, b_next0 = b_next0, b_cur0
         b_cur1, b_next1 = b_next1, b_cur1
-        if _reload:
+        if _reload and not _cross:
             sa0 = sa0n
             if qm == 2:
                 sa1 = sa1n
@@ -452,7 +475,8 @@ def _build_grouped_mxfp8_nt_kernel(
     # LDS reads are dead work -- the tile runs a b0-only body. Compile-time gated on the
     # static N (the mirror of the runtime c_n); a 256-aligned N emits only the full body.
     _HALF_N = (N % BLOCK_N != 0) and (N % BLOCK_N <= LDS_BLOCK_N)
-    _LAST_BN = ceildiv(N, BLOCK_N) - 1
+    _N_BLOCKS = ceildiv(N, BLOCK_N)
+    _LAST_BN = _N_BLOCKS - 1
     # Column span actually stored: BLOCK_N for the full body, LDS_BLOCK_N for the b0-only
     # one, and only the last N-block can overhang. Both spans stay inside N iff the residue
     # is 0 or exactly LDS_BLOCK_N, in which case the epilogue's per-store OOB select is dead
@@ -492,7 +516,10 @@ def _build_grouped_mxfp8_nt_kernel(
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        n_blocks = ceildiv_pow2(c_n, BLOCK_N)
+        # c_n mirrors the static N at every entry, so the tile decode can divide by the
+        # compile-time block count. gfx9 has no scalar integer divide, so a runtime divisor
+        # would expand every quotient below into v_rcp_iflag_f32 + readfirstlane.
+        n_blocks = _N_BLOCKS
 
         # One on-device lane-parallel group scan (no host read). Lane g owns group g, so
         # both prefixes -- _tcs[g] = tiles owned by groups < g (TIGHT sizes) and _sas[g]
@@ -824,11 +851,12 @@ def _build_grouped_mxfp8_nt_kernel(
 
                 base_row = m_row_c + wave_m_offset
                 base_col = block_n * BLOCK_N + wave_n_offset
-                store_c.store(c00_frag, base_row + 0, base_col + 0)
-                store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-                if const_expr(_full):
-                    store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-                    store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+                # Both N-quadrants of a row band go through one store call so the two
+                # quadrants and the two fragments of a row share one byte address.
+                _q0 = ((LDS_BLOCK_N, c01_frag),) if const_expr(_full) else ()
+                _q1 = ((LDS_BLOCK_N, c11_frag),) if const_expr(_full) else ()
+                store_c.store(c00_frag, base_row + 0, base_col + 0, _q0)
+                store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0, _q1)
 
             if const_expr(_HALF_N):
                 # Scalar (wave-uniform) predicate: every wave must take the same path,
@@ -857,11 +885,18 @@ _GNT_AT_CACHE: dict = {}  # (M_pad, N, K, G, cbsz, blgp, out_fp16, persist) -> [
 _GNT_CFG_CACHE: dict = {}  # cfg_key (NO M_pad) -> (bm, gm, xcd, gn) chosen by autotune
 
 # fwd/dgrad NT autotune. The launch is M-generic (M is a runtime arg), so the config race
-# keys on the static shape only (cfg_key, no M_pad) and is reused for every M.
+# keys on the static shape plus the band-width regime (cfg_key, no M_pad) and is reused for
+# every M inside that regime.
 _GNT_NT_DEFAULT_CFG = (256, 4, 4, 0)  # (BLOCK_M, GROUP_M, num_xcd, group_n); cand[0] = base ref
 # One XCD's private L2 slice; MI355X has 8 of them, so a band is only re-read out of L2
 # while its A footprint fits in one slice.
 _L2_SLICE_BYTES = 4 << 20
+# Tokens/group from which the wide M band wins whatever K is. The band width trades B
+# traffic (B is streamed once per band, so it scales as 1/gm) against A residency (a band's
+# A footprint is gm*BLOCK_M*K bytes). With a handful of M blocks per group a group spans one
+# or two bands, the B term is already paid off and the residency term picks the width; at
+# training-scale tokens/group a group spans tens of bands and the B term takes over.
+_GNT_WIDE_BAND_PM = 16384
 
 # (tokens/group, skewed) points the race times on. The swizzle is invariant in neither M nor
 # the token distribution: a single midpoint mis-picks a cfg that wins there but loses at the
@@ -874,7 +909,7 @@ _GNT_PM_CANON = ((2048, False), (8192, True))
 _GNT_AT_MARGIN = 0.985
 
 
-def _gnt_nt_candidates(N, K):
+def _gnt_nt_candidates(N, K, pm):
     """Flat (bm,gm,xcd,gn) autotune candidate list (4 max); cand[0] is the base reference.
 
     Trimmed 2026-07-09 from 5-7 to 4 via per-candidate AT_DBG timings across the MoE
@@ -884,14 +919,19 @@ def _gnt_nt_candidates(N, K):
 
     GROUP_M widens the M band an A tile-row block is re-read over: B is streamed once
     per band, so B traffic scales as 1/gm, while the band's A footprint (gm*bm*K bytes)
-    eventually outgrows an XCD's private L2 slice and the A re-reads stop hitting. Only
-    K is shape-dependent there, so the trade point moves with K and a single global band
-    width mis-serves long-K shapes. Measured tw/mx over gm 2/4/8/16 -- N=2944 K=5760:
-    1.010 / 1.036 / 1.047 / 1.031, against 1.089 / 1.122 / 1.086 at K=2944.
+    eventually outgrows an XCD's private L2 slice and the A re-reads stop hitting. The
+    trade point therefore moves with BOTH K and the tokens/group `pm` a band is cut out
+    of, and a single global band width mis-serves long-K and training-scale shapes alike.
+    Measured tw/mx over gm 2/4/8/16 at MoE bench scale (2048-8192 tokens/group) --
+    N=2944 K=5760: 1.010 / 1.036 / 1.047 / 1.031, against 1.089 / 1.122 / 1.086 at
+    K=2944, i.e. long K asks for the wide band and short K for the narrow one. At the
+    gpt-oss e2e scale (G=4, 32768 tokens/group) the short-K shapes flip to the wide band
+    as well: gm=8 over gm=4 is +1.9% on N=5760 K=2944 and +4.3% on N=2944 K=2944, +1.3%
+    over the whole fwd/dgrad/wgrad set.
     """
-    gm0, gm1 = (8, 4) if 4 * 256 * K > _L2_SLICE_BYTES else (4, 8)
+    gm0, gm1 = (8, 4) if (4 * 256 * K > _L2_SLICE_BYTES or pm >= _GNT_WIDE_BAND_PM) else (4, 8)
     return [
-        (256, gm0, 4, 0),  # base ref (default); the band width K asks for
+        (256, gm0, 4, 0),  # base ref (default); the band width K and pm ask for
         (256, gm1, 4, 0),  # the other band width
         (256, 4, 8, 0),  # xcd=8 — wins qwen3-Down fwd (M=2048)
         (256, 1, 4, 0),  # gm=1 — wins several other MX MoE shapes (off-bench)
@@ -1011,14 +1051,22 @@ def _canon_nt_targs(args, K, G, N, pm, skew):
     return targs, out_c
 
 
-def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
+def _select_nt_cfg(cfg_key, K, G, N, pm, cbsz, blgp, out_fp16, persistent, args):
     """First-call race on synthetic canonical tensors; cache the winning cfg per static shape
-    (cfg_key, no M_pad -> reused for every M)."""
+    (cfg_key, no M_pad -> reused for every M of the same band-width regime)."""
     cached = _GNT_CFG_CACHE.get(cfg_key)
     if cached is not None:
         return cached
 
-    cands = _gnt_nt_candidates(N, K)
+    cands = _gnt_nt_candidates(N, K, pm)
+    if pm >= _GNT_WIDE_BAND_PM:
+        # Scoring this regime would mean synthesising operands at the caller's own
+        # tokens/group -- a multi-GB transient on the first call -- because the canonical
+        # points are an order of magnitude smaller and rank the band widths the other way
+        # round. Nothing else in the table wins here either: xcd=8 gains 1.5% on even
+        # groups and gives 1-2% back on the top-heavy routing that dominates the geomean.
+        _GNT_CFG_CACHE[cfg_key] = cands[0]
+        return cands[0]
     # one (targs, out_view) per steady point; candidates scored by their geomean cand/base ratio
     points = [_canon_nt_targs(args, K, G, N, pm, skew) for pm, skew in _GNT_PM_CANON]
 
@@ -1235,13 +1283,15 @@ def grouped_gemm_mxfp8_flydsl_kernel(
         grid_upper,
         stream,
     )
-    # at_key bakes buffers/workspace per M_pad; cfg_key (no M_pad) picks the swizzle once/shape.
+    # at_key bakes buffers/workspace per M_pad; cfg_key (no M_pad, only the band-width regime
+    # the mean tokens/group falls in) picks the swizzle once per shape.
+    pm = M_pad // G
     at_key = (M_pad, N, K, G, cbsz, blgp, out_fp16, persistent, preshuffle)
-    cfg_key = (N, K, G, cbsz, blgp, out_fp16, persistent)
+    cfg_key = (N, K, G, cbsz, blgp, out_fp16, persistent, pm >= _GNT_WIDE_BAND_PM)
     entry = _GNT_AT_CACHE.get(at_key)
     if entry is None:
         # race on canonical synthetic tensors -> needs only the static shape (args' b-side)
-        bm, gm, xcd, gn = _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args)
+        bm, gm, xcd, gn = _select_nt_cfg(cfg_key, K, G, N, pm, cbsz, blgp, out_fp16, persistent, args)
         launch = _get_nt_launch(
             K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, preshuffle=preshuffle
         )
@@ -1424,6 +1474,36 @@ def _build_grouped_mxfp8_wgrad_kernel(
     _HALF_M = (OUT_M % BLOCK_M != 0) and (OUT_M % BLOCK_M <= LDS_BLOCK_M)
     _HALF_N = (OUT_N % BLOCK_N != 0) and (OUT_N % BLOCK_N <= LDS_BLOCK_N)
 
+    # Single-window adaptive split-K (ported from the tensorwise wgrad). One WG owns one
+    # output tile's whole contraction, so the wall is set either by the last partial round
+    # (rule A) or by a hot group's own tile chain (rule B); both are fixed by slicing ONE
+    # window of tiles' contraction dim -- slice 0 writes C, slices 1.. write scratch bands a
+    # reduce kernel folds back. The window is picked on-device from group_offs; the grid is a
+    # compile-time bound truncated by a runtime live count (dead workgroups exit before any memory op).
+    _NCU = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    _S_MAX, _S_A, _S_B, _N_MAX, _SP_EXT = (
+        _wgrad_split_geom(TILES_PER_GROUP, TOTAL, _NCU) if num_xcd <= 1 else (1, 1, 1, 0, 0)
+    )
+    _SPLIT = _S_MAX > 1
+    _SP_POW2 = _wgrad_split_rcp_cfg(TILES_PER_GROUP, _S_A, _S_B, _NCU)[0]
+    # Scales are packed PACK per dword from each group's own contraction start, so a slice may
+    # only begin on a packed-dword boundary (the op_sel byte is the constexpr k%pack). Both
+    # slice bounds are floored to `pack`, which costs a slice at most pack-1 K-blocks; the
+    # policy guardrail rises to 2*pack so the shortest slice still keeps >= pack blocks.
+    _SP_FLOOR = max(6, 2 * pack)
+    _GRID_X = TOTAL + _SP_EXT
+    # Reduce: one workgroup folds BLOCK_M//_WGRAD_RED_WPT rows x BLOCK_N cols of a window tile.
+    _RED_ROWS = BLOCK_M // _WGRAD_RED_WPT
+    _RED_LPR = BLOCK_N // _WGRAD_RED_VEC  # lanes spanning one tile row
+    _RED_RPP = 256 // _RED_LPR  # rows one 256-thread pass covers
+    _RED_L2WPT = _WGRAD_RED_WPT.bit_length() - 1
+    _RED_GRID = max(1, _N_MAX * _WGRAD_RED_WPT)
+    assert not _SPLIT or (
+        _WGRAD_RED_WPT & (_WGRAD_RED_WPT - 1) == 0
+        and _RED_ROWS % _RED_RPP == 0
+        and OUT_N % _WGRAD_RED_VEC == 0
+    ), "split-K reduce needs a pow2 WPT, row-aligned passes and a vector-aligned OUT_N"
+
     @fx.struct
     class SharedStorage:
         A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
@@ -1443,6 +1523,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
         A_scale: fx.Tensor,  # preshuffled LHS scale (layout 1)
         B_scale: fx.Tensor,  # preshuffled RHS scale (B-comb layout 3)
         group_offs: fx.Tensor,  # padded per-group M offsets (int32 view of int64 [G+1])
+        WS: fx.Tensor,  # split-K slice scratch, (S_MAX-1) row bands at C's pitch
         m_total: fx.Int32,  # total padded contraction length (LHS/RHS leading dim)
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
@@ -1452,7 +1533,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         pid = fx.block_idx.x
 
-        def _do_tile(t):
+        def _do_tile(t, slice_id=None, split_s=None, split_code=None):
             tt = xcd_remap_pid(t, TOTAL, num_xcd)
             # interleave=False: group-major tile order, i.e. longest-processing-time-first
             # for the usual histogram (low group ids hold the most tokens), instead of
@@ -1469,6 +1550,36 @@ def _build_grouped_mxfp8_wgrad_kernel(
             # through floordiv_pow2: signed floordiv would put a divide/remainder/sign-select
             # chain on the per-workgroup prologue, which has no MFMA to hide behind.
             k_iters = floordiv_pow2(m_end - m_start, BLOCK_K)  # M_g padded to 128 -> exact
+            row_shift = None
+            store_base = None
+            if slice_id is not None:
+                # Contraction (token) split: slice s owns K-blocks [kb0, kb1) of this tile.
+                # Both bounds are floored to a multiple of `pack` so the slice starts on a
+                # packed-scale dword and the op_sel byte stays the constexpr k%pack; the
+                # per-group packed base below then picks the shift up automatically, since
+                # kb0*BLOCK_K is a whole number of packed dwords. slice_id < 0 marks a tile
+                # outside the window: whole K range, writes C. Only the trip count, the
+                # operand row origin and the store band move, so the loop body is untouched.
+                _s = fx.Int32(_readfirstlane_i32(slice_id))
+                _whole = _s < fx.Int32(0)
+                _sc = fx.Int32(arith.select(_whole, fx.Int32(0), _s))
+                _ki = fx.Int32(k_iters)
+                _nxt = _sc + fx.Int32(1)
+                _b0 = _wgrad_split_div(_ki * _sc, split_code, _SP_POW2)
+                _b1 = _wgrad_split_div(_ki * _nxt, split_code, _SP_POW2)
+                if const_expr(pack > 1):
+                    _b0 = fx.Int32(_b0 & fx.Int32(-pack))
+                    _b1 = fx.Int32(_b1 & fx.Int32(-pack))
+                kb0 = fx.Int32(arith.select(_whole, fx.Int32(0), _b0))
+                kb1 = fx.Int32(arith.select(_whole, _ki, arith.select(_nxt < split_s, _b1, _ki)))
+                m_start = _readfirstlane_i32(m_start + kb0 * fx.Int32(BLOCK_K))
+                k_iters = _readfirstlane_i32(kb1 - kb0)
+                _part = _s > fx.Int32(0)
+                _band = (_s - fx.Int32(1) - group_idx) * fx.Int32(OUT_M)
+                row_shift = _readfirstlane_i32(arith.select(_part, _band, fx.Int32(0)))
+                store_base = arith.select(
+                    _part, _buffer_ops.extract_base_index(WS), _buffer_ops.extract_base_index(C)
+                )
             # Scales are packed per group from the group's own contraction start, so the
             # scale index is group-local and the base is (ks0//pack + g): the one spare
             # dword per group keeps the regions disjoint for any group offset (no 512
@@ -1518,8 +1629,22 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
             sa_s2r = ScaleS2R(A_scale, OUT_M, m_total, SA_TILES, pack=pack, k128p=k128p)
             sb_s2r = ScaleBComb(B_scale, OUT_N, m_total, pack=pack, k128p=k128p)
+            # A partial slice stores into scratch band s-1 instead of C: same row pitch, so
+            # only the SRD base and the band end move with row_shift.
+            _c_rows = (group_idx + 1) * OUT_M
+            if row_shift is not None:
+                _c_rows = _c_rows + row_shift
             store_c = StoreCPerTensor(
-                None, None, C, (group_idx + 1) * OUT_M, OUT_N, mfma.idx, N_TILES_A, N_TILES_B, _out_ty
+                None,
+                None,
+                C,
+                _c_rows,
+                OUT_N,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
+                _out_ty,
+                c_base=store_base,
             )
 
             wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -1544,6 +1669,8 @@ def _build_grouped_mxfp8_wgrad_kernel(
             wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
             base_row = group_idx * OUT_M + a_row + wave_m_offset
+            if row_shift is not None:
+                base_row = base_row + row_shift
             base_col = b_row + wave_n_offset
 
             # rmem accumulators carry across the dynamic chunk loop via memory; zero-init once.
@@ -1554,6 +1681,17 @@ def _build_grouped_mxfp8_wgrad_kernel(
             for q in (acc00, acc01, acc10, acc11):
                 for r in q:
                     fx.memref_store_vec(mfma.zero_value, r)
+            # Scale-prefetch carriers: (A half 0, B combined). Same mechanism as the
+            # accumulators -- the chunk body hands the next chunk's first packed dword across
+            # the dynamic loop through memory, which promotes to a register phi.
+            sc_pf = (
+                fx.make_rmem_tensor(fx.make_layout(SA_TILES, 1), fx.Int32),
+                fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32),
+            )
+            # Chunk 0's dword. Issued after the distance-2 prelude's vmcnt fences so it does
+            # not shift their outstanding-load counts.
+            fx.memref_store_vec(sa_s2r.load_vec(sa_base0, fx.Int32(0), kp0), sc_pf[0])
+            fx.memref_store_vec(sb_s2r.load_vec(sb_base0, fx.Int32(0), kp0), sc_pf[1])
 
             # MAIN: every FULL chunk runs the SSA-accumulator body (memref RMW only at the
             # chunk boundary); the dynamic loop carries just the 8 swapped buffer refs.
@@ -1602,6 +1740,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
                         N_ACCUMS,
                         N_LDS_STEPS_A,
                         N_LDS_STEPS_B,
+                        sc_pf,
                         pack,
                         quads,
                     )
@@ -1683,14 +1822,98 @@ def _build_grouped_mxfp8_wgrad_kernel(
             c01_frag = [Vec(fx.memref_load_vec(r)) for r in acc01]
             c10_frag = [Vec(fx.memref_load_vec(r)) for r in acc10]
             c11_frag = [Vec(fx.memref_load_vec(r)) for r in acc11]
-            store_c.store(c00_frag, base_row + 0, base_col + 0)
-            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+            store_c.store(c00_frag, base_row + 0, base_col + 0, ((LDS_BLOCK_N, c01_frag),))
+            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0, ((LDS_BLOCK_N, c11_frag),))
 
-        _do_tile(pid)
+        if const_expr(_SPLIT):
+            _lo, _n, _s, _code = _wgrad_split_policy(
+                go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, _NCU, _S_A, _S_B, _SP_FLOOR
+            )
+            _nsl = _readfirstlane_i32(_n * _s)  # dispatch ids the window expands to
+            _live = _readfirstlane_i32(fx.Int32(TOTAL) + (_nsl - _n))
+            # Window ids [lo, lo+n*S) carry (tile, slice); ids above it shift back by n*(S-1).
+            _rel = pid - _lo
+            _pre = _rel < fx.Int32(0)
+            _in = _rel < _nsl
+            _q = _wgrad_split_div(_rel, _code, _SP_POW2)
+            _t = _readfirstlane_i32(arith.select(_pre, pid, arith.select(_in, _lo + _q, pid - (_nsl - _n))))
+            _sid = _readfirstlane_i32(
+                arith.select(_pre, fx.Int32(-1), arith.select(_in, _rel - _q * _s, fx.Int32(-1)))
+            )
+            # The grid is the worst-case window expansion; the ids the policy left unused exit
+            # here, before any LDS or global traffic.
+            if pid < _live:
+                _do_tile(_t, slice_id=_sid, split_s=_s, split_code=_code)
+        else:
+            _do_tile(pid)
 
-    return kernel_grouped_mxfp8_wgrad, BLOCK_M, BLOCK_N, waves_per_eu, TOTAL
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def kernel_grouped_mxfp8_wgrad_reduce(C: fx.Tensor, group_offs: fx.Tensor, WS: fx.Tensor):
+        """Fold the split-K scratch bands back into C. The window policy is recomputed here
+        (identical wave-uniform scalars), so this only touches the n window tiles -- the rest
+        of a band is never read and needs no zeroing pass. Slots are summed in a fixed 0..S-2
+        order in fp32, keeping the store bit-reproducible."""
+        _ = str(fx.thread_idx.x)
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        _ir_ty = _out_ty.ir_type
+        f32v = fx.T.VectorType.get([_WGRAD_RED_VEC], fx.T.f32())
+        outv = fx.T.VectorType.get([_WGRAD_RED_VEC], _ir_ty)
+        go = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
+        go_div = fx.logical_divide(go, fx.make_layout(1, 1))
+        _lo, _n, _s_run, _ = _wgrad_split_policy(
+            go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, _NCU, _S_A, _S_B, _SP_FLOOR
+        )
+        c_base = _buffer_ops.extract_base_index(C)
+        ws_base = _buffer_ops.extract_base_index(WS)
+        tid = fx.thread_idx.x
+        col_l = (tid % fx.Int32(_RED_LPR)) * fx.Int32(_WGRAD_RED_VEC)
+        row_l = tid // fx.Int32(_RED_LPR)
+        live = _readfirstlane_i32(_n * fx.Int32(_WGRAD_RED_WPT))
+        for w in range(fx.block_idx.x, live, fx.grid_dim.x):
+            slot = _readfirstlane_i32(w >> _RED_L2WPT)
+            sub = _readfirstlane_i32(w & fx.Int32(_WGRAD_RED_WPT - 1))
+            _tt = xcd_remap_pid(_lo + slot, TOTAL, num_xcd)
+            _gi, _bm, _bn = _wgrad_block_mn(
+                _tt, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, False
+            )
+            gi = _readfirstlane_i32(_gi)
+            bm_off = _readfirstlane_i32(_bm * fx.Int32(BLOCK_M))
+            bn_off = _readfirstlane_i32(_bn * fx.Int32(BLOCK_N))
+            col = bn_off + col_l
+            col_ok = col < fx.Int32(OUT_N)
+            # Rows past OUT_M fall outside the band SRD (dropped); columns would wrap, hence col_ok.
+            rs_c = make_row_band_resource(c_base, gi * OUT_M + bm_off, (gi + 1) * OUT_M, OUT_N, 2)
+            rs_w = [
+                make_row_band_resource(ws_base, bm_off + fx.Int32((s - 1) * OUT_M), s * OUT_M, OUT_N, 2)
+                for s in range_constexpr(1, _S_MAX)
+            ]
+            off0 = (sub * fx.Int32(_RED_ROWS) + row_l) * fx.Int32(OUT_N) + col
+            for p in range_constexpr(_RED_ROWS // _RED_RPP):
+                off = off0 + fx.Int32(p * _RED_RPP * OUT_N)
+                acc = arith.extf(
+                    f32v,
+                    _buffer_ops.buffer_load(rs_c, off, vec_width=_WGRAD_RED_VEC, dtype=_ir_ty, mask=col_ok),
+                )
+                for s in range_constexpr(1, _S_MAX):
+                    # slots >= S were never written: address them out of bounds (HW returns 0).
+                    off_s = arith.select(fx.Int32(s) < _s_run, off, fx.Int32(0x3FFFFFFF))
+                    acc = arith.addf(
+                        acc,
+                        arith.extf(
+                            f32v,
+                            _buffer_ops.buffer_load(
+                                rs_w[s - 1],
+                                off_s,
+                                vec_width=_WGRAD_RED_VEC,
+                                dtype=_ir_ty,
+                                mask=col_ok,
+                            ),
+                        ),
+                    )
+                _buffer_ops.buffer_store(arith.trunc_f(outv, acc), rs_c, off, mask=col_ok)
+
+    _red = kernel_grouped_mxfp8_wgrad_reduce if _SPLIT else None
+    return kernel_grouped_mxfp8_wgrad, _red, waves_per_eu, _GRID_X, _RED_GRID
 
 
 # ── wgrad host wrapper ───────────────────────────────────────────────────────
@@ -1704,7 +1927,7 @@ def _compile_grouped_mxfp8_wgrad_fused(
     OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack=1, preshuffle=True
 ):
     pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N, G, pack=pack)
-    gemm_kern, BM, BN, wpe, TOTAL = _build_grouped_mxfp8_wgrad_kernel(
+    gemm_kern, red_kern, wpe, grid_x, red_grid = _build_grouped_mxfp8_wgrad_kernel(
         OUT_M=OUT_M,
         OUT_N=OUT_N,
         G=G,
@@ -1729,6 +1952,7 @@ def _compile_grouped_mxfp8_wgrad_fused(
         a_sp: fx.Tensor,
         b_sp: fx.Tensor,
         group_offs: fx.Tensor,
+        WS: fx.Tensor,
         m_total: fx.Int32,
         k128: fx.Int32,
         n_ck: fx.Int32,
@@ -1749,9 +1973,14 @@ def _compile_grouped_mxfp8_wgrad_fused(
             a_sp,
             b_sp,
             group_offs,
+            WS,
             m_total,
             value_attrs=make_value_attrs(wpe, 0, "512,512"),
-        ).launch(grid=(TOTAL, 1, 1), block=(512, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+        if const_expr(red_kern is not None):
+            # Same stream: the reduce sees every slice partial. The grid is the compile-time
+            # window bound; a policy that picks S=1 leaves live=0 and every WG exits at once.
+            red_kern(C, group_offs, WS).launch(grid=(red_grid, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_grouped_mxfp8_wgrad_fused
 
@@ -1828,7 +2057,11 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     pre_grid = a_blocks + b_ngrp * n_ck
 
     bm, bn, gm, xcd, gn = 256, 256, 4, 1, 0
+    # Split-K slice scratch (S_MAX-1 row bands at C's pitch), persistent per shape+device.
+    ws = _wgrad_split_ws(OUT_M, OUT_N, G, lhs.device, out_dtype, BLOCK_M=bm, BLOCK_N=bn)
     # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
+    # The split-K window geometry is a pure function of (OUT_M, OUT_N, G, bm, bn) plus the
+    # device CU count, all of which the key already pins.
     fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle)
     launch = _GWG_FUSED_CACHE.get(fk)
     if launch is None:
@@ -1837,7 +2070,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
         )
         _GWG_FUSED_CACHE[fk] = launch
 
-    args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_ck, a_blocks, pre_grid, stream)
+    args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, ws, M_total, K128, n_ck, a_blocks, pre_grid, stream)
     at_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16, pack, preshuffle)
     entry = _GWG_AT_CACHE.get(at_key)
     if entry is None:

@@ -449,12 +449,20 @@ class ScaleBComb:
         nbytes = self.slab_elems * n_slabs * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
+    def load_vec(self, base, k, kbase=0, slab=0):
+        """``load`` before the split into scalars, for callers that stash the whole dwordx4
+        (e.g. a loop-carried scale prefetch through an rmem carrier)."""
+        grp = (base // 256) * 4 + (base % 256) // 32
+        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * 4 + slab * self.slab_elems
+        return Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
+
     def load(self, base, k, kbase=0, slab=0):
         """base: sb_base0 (b0 region col base). ``kbase``: packed-K base of the group's own
         region (0 = one global packing). Returns 4 i32 (b0:0,1  b1:2,3)."""
-        grp = (base // 256) * 4 + (base % 256) // 32
-        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * 4 + slab * self.slab_elems
-        v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
+        return self.split(self.load_vec(base, k, kbase, slab))
+
+    @staticmethod
+    def split(v):
         return [v[i].ir_value() for i in range_constexpr(4)]
 
 
@@ -492,13 +500,20 @@ class ScaleS2R:
         nbytes = ceildiv(dim, self.group_span) * self.K128p * 64 * n_tiles * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
+    def load_vec(self, base, k, kbase=0):
+        """``load`` before the split into scalars, for callers that stash the whole vector
+        (e.g. a loop-carried scale prefetch through an rmem carrier)."""
+        grp = base // self.group_span
+        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * self.n_tiles
+        return Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
+
     def load(self, base, k, kbase=0):
         """base: runtime global row/col base for this (region, wave). Returns n_tiles i32
         (packed dword for K-group kbase + k//PACK; caller selects byte k%PACK via MFMA
         op_sel). ``kbase``: packed-K base of the group's own region (0 = global packing)."""
-        grp = base // self.group_span
-        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * self.n_tiles
-        v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
+        return self.split(self.load_vec(base, k, kbase))
+
+    def split(self, v):
         return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
 
 
@@ -692,30 +707,49 @@ class StoreCPerTensor:
             self._scale_v = (blk, self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div))
         return self._scale_v[1]
 
-    def store(self, c_frag, base_row, base_col):
+    def store(self, c_frag, base_row, base_col, col_frags=()):
+        """Store one row band. ``col_frags`` is an optional ``(col_delta, frag)`` sequence
+        stored at ``base_col + col_delta`` in the same band -- a 256-wide tile's N-quadrants,
+        which differ only by a compile-time column step. One row's stores share a single byte
+        address: the fragment/quadrant column steps ride the buffer instruction's 12-bit
+        immediate offset instead of a v_add_lshl_u32 each (masked stores keep the per-store
+        add, since the OOB clamp rewrites the offset; col_delta must stay well under 4096)."""
         scale = self._scale()
         if self.trans:
+            assert not col_frags
             return self._store_trans(c_frag, base_row, base_col, scale)
         # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        quads = [(0, c_frag)] + [(int(d), f) for d, f in col_frags]
+        col0 = base_col + self.lane_id % 16
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
-            for tj in range_constexpr(self.n_tiles_b):
-                col = base_col + tj * 16 + self.lane_id % 16
-                col_valid = None if self.col_safe else col < self.c_cols
-                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
-                # Whole-fragment scale: the wave-uniform per-tensor scale packs to v_pk_mul_f32, bit-identical to the per-element form.
-                if self.scaled:
-                    vec_f32 = vec_f32 * scale
-                for i in range_constexpr(4):
-                    val = vec_f32[i]
-                    if self.elem_fn is not None:
-                        val = self.elem_fn(val)  # bias/act epilogue node chain
-                    val = val.to(self.out_ty)
-                    off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
-                    _buffer_ops.buffer_store(
-                        val, rsrc, off, mask=col_valid, cache_modifier=self.store_aux, offset_is_bytes=True
-                    )
+            # Whole-fragment scale: the wave-uniform per-tensor scale packs to v_pk_mul_f32, bit-identical to the per-element form.
+            vecs = [
+                [
+                    (Vec(f[self.c_idx_fn(ti, tj)]) * scale) if self.scaled else Vec(f[self.c_idx_fn(ti, tj)])
+                    for tj in range_constexpr(self.n_tiles_b)
+                ]
+                for _, f in quads
+            ]
+            for i in range_constexpr(4):
+                row_off = ((row_local + i) * self.c_cols + col0) * 2  # i32-small within band
+                for q in range_constexpr(len(quads)):
+                    for tj in range_constexpr(self.n_tiles_b):
+                        dcol = quads[q][0] + tj * 16
+                        col_valid = None if self.col_safe else (col0 + dcol) < self.c_cols
+                        val = vecs[q][tj][i]
+                        if self.elem_fn is not None:
+                            val = self.elem_fn(val)  # bias/act epilogue node chain
+                        val = val.to(self.out_ty)
+                        _buffer_ops.buffer_store(
+                            val,
+                            rsrc,
+                            row_off if dcol == 0 else row_off + dcol * 2,
+                            mask=col_valid,
+                            cache_modifier=self.store_aux,
+                            offset_is_bytes=True,
+                        )
 
     def _store_trans(self, c_frag, base_row, base_col, scale):
         """Transposed twin of store() for the A/B-swapped wgrad boundary body. c_frag holds
