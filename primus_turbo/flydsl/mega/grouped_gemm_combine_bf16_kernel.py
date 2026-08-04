@@ -185,7 +185,6 @@ def _make_grouped_gemm_combine(
                             signal_count = ld(
                                 combine_flag_base,
                                 combine_bank + tile_cursor,
-                                scope="sys",
                                 dtype=fx.T.i64(),
                             )
                             while signal_count != expected_combine_i64:
@@ -202,8 +201,6 @@ def _make_grouped_gemm_combine(
                                 signal_count = ld(
                                     combine_flag_base,
                                     combine_bank + tile_cursor,
-                                    order="relaxed",
-                                    scope="sys",
                                     dtype=fx.T.i64(),
                                 )
                             tile_cursor = tile_cursor + fx.Int32(1)
@@ -268,7 +265,6 @@ def _make_grouped_gemm_combine(
                         combine_flag_base,
                         combine_bank + block_m,
                         fx.Int64(1),
-                        scope="sys",
                     )
             else:
                 # Empty region: first num_reduce_cu blocks do topk reduce, rest early-exit.
@@ -285,7 +281,6 @@ def _make_grouped_gemm_combine(
                                 combine_flag_base,
                                 combine_bank + empty_block_m,
                                 fx.Int64(n_blocks),
-                                scope="sys",
                             )
 
                     n_reduce_tiles = n_empty * fx.Int32(n_blocks)
