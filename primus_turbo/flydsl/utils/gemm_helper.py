@@ -921,6 +921,28 @@ def xcd_remap_pid(pid, total_pids, num_xcd):
     return offset + local
 
 
+def xcd_band_remap_pid(pid, total_pids, num_xcd, band):
+    """Band-cyclic variant of ``xcd_remap_pid``: an XCD owns every ``num_xcd``-th run of
+    ``band`` consecutive tiles instead of one contiguous ``total_pids/num_xcd`` slice.
+
+    A run still lands whole on one XCD, so the intra-run L2 reuse the contiguous remap
+    buys is kept, but every XCD now samples the full tile range. That matters when the
+    per-tile cost is not uniform (grouped GEMM: a group with a single M-block gets no
+    B reuse): the HW partition (XCD = block id % num_xcd) is static, so an XCD that
+    draws the expensive stretch cannot shed it and sets the makespan. Bijection over
+    [0, total_pids); the tail past the last whole round of ``num_xcd`` runs is identity.
+    """
+    if num_xcd <= 1 or band <= 0:
+        return pid
+    assert num_xcd & (num_xcd - 1) == 0
+    span = num_xcd * band
+    local = floordiv_pow2(pid, num_xcd)
+    xcd = pid - local * num_xcd
+    rnd = local // band
+    mapped = (rnd * num_xcd + xcd) * band + (local - rnd * band)
+    return arith.select(pid < (total_pids // span) * span, mapped, pid)
+
+
 def _inttoptr_lds(byte_addr):
     """Integer byte address -> !llvm.ptr<3> (LDS). Parsed per call: the type is
     bound to the current MLIRContext and cannot be cached across compiles."""

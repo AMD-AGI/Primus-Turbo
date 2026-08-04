@@ -22,7 +22,6 @@ tile's scale soffset stays 128-region aligned), B per expert.
 """
 
 import gc
-import math
 
 import torch
 
@@ -32,25 +31,33 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
+    _lane_tbl_count_le,
+    _lane_tbl_get,
+    _lane_tbl_load,
+    _lane_tbl_scan,
     _readfirstlane_i32,
-    _robust_time,
+    _readlane_i32,
     ceildiv,
+    ceildiv_pow2,
     make_fp8_rebased_tensor_and_srd,
     wait_barrier,
+    xcd_band_remap_pid,
     xcd_remap_pid,
 )
 from primus_turbo.flydsl.gemm.mxfp4_gemm_kernel import (
     _MXFP4_PRESHUF_BLK,
-    _MXFP4_PRESHUF_NG,
+    _MXFP4_PRESHUF_FO,
     MfmaScaleFp4,
     S2RLoaderFp4,
     ScaleS2RPacked,
     StoreCPlain,
     _build_mxfp4_preshuffle_kernel_ab,
     _mxfp4_grp_from,
+    _mxfp4_pack_cell,
     fp4_g2s_offsets,
 )
 from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
@@ -64,29 +71,9 @@ from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import run_eager_or_c
 
 _BLOCK = 256  # BLOCK_M = BLOCK_N = BLOCK_K
 _PRESHUF_BLK = 256
-_PRESHUF_NG = 4  # g_byte fan-out per preshuffle thread
-
-
-def _pack4(rin, rows, k128, valid, K128):
-    """Pack the 4 source E8M0 rows (byte t <- rows[t]) into NG dwords; returns list[NG]."""
-    I32 = fx.Int32
-    dws = []
-    for t in range_constexpr(4):
-        dws.append(
-            fx.Int32(
-                buffer_ops.buffer_load(
-                    rin, rows[t] * I32(K128) + k128, vec_width=1, dtype=T.i32, mask=valid[t]
-                )
-            )
-        )
-    out = []
-    for g in range_constexpr(_PRESHUF_NG):
-        sh = I32(g * 8)
-        p = I32(0)
-        for t in range_constexpr(4):
-            p = p | (((dws[t] >> sh) & I32(0xFF)) << I32(t * 8))
-        out.append(p)
-    return out
+_PRESHUF_NG = 4  # g bytes packed by one preshuffle thread
+_PRESHUF_ND = 4  # (r_region, K sub-block) cells packed by one preshuffle thread
+_PRESHUF_FO = _PRESHUF_NG * _PRESHUF_ND  # output dwords per thread
 
 
 def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int = None):
@@ -103,8 +90,12 @@ def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int =
     # real N row stride. Without this padding, the last partial quartet leaves
     # holes in one expert's workspace and spills stores into the next expert.
     N_SCALE = ceildiv(N, 256) * 256
-    n_sub, nd, KK = 2, 4, K128 // 2
-    b_dwords_pe = N_SCALE * K128 // _PRESHUF_NG
+    n_sub, nd, KK = 2, _PRESHUF_ND, K128 // 2
+    n_rr = nd // n_sub
+    b_dwords_pe = N_SCALE * K128 // _PRESHUF_FO
+    # One thread per (wi, kk, r) cell and 16 r per cell => a wave spans 64/16 cells, so wi --
+    # wave-uniform when a thread emitted a single dword -- now takes up to _NWI values.
+    _NWI = 1 + ceildiv(64 // 16 - 1, KK)
 
     @flyc.kernel(known_block_size=[_PRESHUF_BLK, 1, 1])
     def kern(
@@ -133,79 +124,107 @@ def _build_grouped_mxfp4_ab_preshuffle(K128: int, G: int, N: int, k128_rd: int =
         bid = rocdl.readfirstlane(T.i32, fx.block_idx.x)
         is_b = bid >= a_grid
         local = arith.select(is_b, bid - a_grid, bid)
+        lane_id = fx.thread_idx.x % 64
         gid_all = local * I32(_PRESHUF_BLK) + fx.thread_idx.x
         rin = arith.select(is_b, b_rin, a_rin)
         rout = arith.select(is_b, b_rout, a_rout)
 
+        # One thread owns a whole (wi, kk, r) cell -- both r_region halves and both K
+        # sub-blocks on top of the 4 g bytes: gather becomes dwordx2, scatter dwordx4, and
+        # the index/group-scan math amortises over 16 output dwords instead of 4. A workgroup
+        # now spans one full 128B source line instead of 32B of it (fewer redundant re-fetches
+        # by workgroups on other XCDs' L2 slices).
         b_expert = gid_all // I32(b_dwords_pe)
-        a_total4 = slab_rows * I32(K128) // I32(_PRESHUF_NG)
-        gid4 = arith.select(is_b, gid_all - b_expert * I32(b_dwords_pe), gid_all)
-        total4 = arith.select(is_b, I32(b_dwords_pe), a_total4)
-        last = gid4 % I32(nd)
-        e1 = gid4 // I32(nd)
-        r = e1 % I32(16)
-        e2 = e1 // I32(16)
+        a_total = slab_rows * I32(K128) // I32(_PRESHUF_FO)
+        gid = arith.select(is_b, gid_all - b_expert * I32(b_dwords_pe), gid_all)
+        total = arith.select(is_b, I32(b_dwords_pe), a_total)
+        r = gid % I32(16)
+        e2 = gid // I32(16)
         kk = e2 % I32(KK)
         wi = e2 // I32(KK)
-        r_region = last // I32(n_sub)
-        s = last % I32(n_sub)
-        k128 = kk * I32(n_sub) + s
-        grp_a = _mxfp4_grp_from(wi, r_region, 0)
-        grp_b = _mxfp4_grp_from(wi, r_region, 1)
-        _blk = ((wi * I32(KK) + kk) * I32(64) + r) * I32(nd) + last
+        k128 = kk * I32(n_sub)  # the thread's n_sub K sub-blocks are adjacent source dwords
+        _blk = ((wi * I32(KK) + kk) * I32(64) + r) * I32(nd)
         base = arith.select(is_b, b_expert * I32(N_SCALE * K128) + _blk, _blk)
 
-        # A: inline a_pre scan (owning group -> tight source rows rd0..rd_end)
-        go_t = rocdl.make_buffer_tensor(go_out, max_size=False, num_records_bytes=(G + 1) * 8)
-        go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
-        rd0 = I32(0)
-        rd_end = I32(0)
-        ok_a = I32(0)
-        apre = I32(0)
-        m_prev = _load_go(go_div, 0)
-        for g in range_constexpr(G):
-            m_nxt = _load_go(go_div, g + 1)
-            p0 = apre
-            p1 = apre + ((m_nxt - m_prev + I32(255)) // I32(256)) * I32(4)
-            inq = (grp_a >= p0) & (grp_a < p1)
-            rd0 = arith.select(inq, m_prev + (grp_a - p0) * I32(64), rd0)
-            rd_end = arith.select(inq, m_nxt, rd_end)
-            ok_a = arith.select(inq, I32(1), ok_a)
-            apre = p1
-            m_prev = m_nxt
-        rd_base = b_expert * I32(N)  # B source row base
+        # A: lane-resident group scan (owning group -> tight source rows rd0..rd_end). Lane g
+        # owns group g, so ONE wave inclusive scan of the per-group 64-row-block count plus a
+        # few O(1) lookups cover the wave (wi spans at most _NWI values inside a wave). Replaces
+        # the G-wide serial compare chain that made this preshuffle VALU-issue bound.
+        go_rs = buffer_ops.create_buffer_resource(go_out, max_size=False, num_records_bytes=(G + 1) * 8)
+        _go0 = _lane_tbl_load(go_rs, lane_id, G + 1, stride=2)
+        _go1 = _lane_tbl_load(go_rs, lane_id, G + 1, stride=2, first=1)
+        _own = [lane_id + I32(64 * c) < I32(G) for c in range_constexpr(len(_go0))]
+        _nb = [
+            arith.select(_own[c], ceildiv_pow2(_go1[c] - _go0[c], 256) * I32(4), I32(0))
+            for c in range_constexpr(len(_go0))
+        ]
+        _nbs_end = _lane_tbl_scan(_nb)  # entry g = 64-row groups owned by groups <= g
+        _nbs = [_nbs_end[c] - _nb[c] for c in range_constexpr(len(_nb))]
+        _ngrp = _readlane_i32(_nbs_end[-1], 63)
 
-        okc = arith.select(
-            is_b, (gid4 < I32(b_dwords_pe)) & (b_expert < I32(G)), (gid4 < a_total4) & (ok_a != I32(0))
+        def _a_rows(q):
+            gq = _lane_tbl_count_le(_nbs_end, q)
+            r0 = _lane_tbl_get(_go0, gq) + (q - _lane_tbl_get(_nbs, gq)) * I32(64)
+            return r0, _lane_tbl_get(_go1, gq)
+
+        _wi_u = _readfirstlane_i32(wi)
+        _rows_q = [_a_rows(I32(2) * _wi_u + I32(q)) for q in range_constexpr(2 * _NWI)]
+        _dwi = wi - _wi_u
+        rd_base = b_expert * I32(N)  # B source row base
+        in_grid = arith.select(is_b, (gid < I32(b_dwords_pe)) & (b_expert < I32(G)), gid < a_total) & (
+            gid < total
         )
-        okc = okc & (k128 < I32(_KRD)) & (gid4 < total4)
-        rsrc_rows = [
-            arith.select(is_b, rd_base + grp_b * I32(64) + I32(t * 16) + r, rd0 + I32(t * 16) + r)
-            for t in range_constexpr(4)
-        ]
-        valid = [
-            okc & arith.select(is_b, grp_b * I32(64) + I32(t * 16) + r < I32(N), rsrc_rows[t] < rd_end)
-            for t in range_constexpr(4)
-        ]
-        words = _pack4(rin, rsrc_rows, k128, valid, _KRD)
+
+        dws = []
+        for r_region in range_constexpr(n_rr):
+            rd0, rd_end = _rows_q[r_region]
+            for q in range_constexpr(1, _NWI):
+                _hit = _dwi == I32(q)
+                rd0 = arith.select(_hit, _rows_q[2 * q + r_region][0], rd0)
+                rd_end = arith.select(_hit, _rows_q[2 * q + r_region][1], rd_end)
+            grp_a = _mxfp4_grp_from(wi, r_region, 0)
+            grp_b = _mxfp4_grp_from(wi, r_region, 1)
+            # slab-pad groups past the last expert: nothing to read
+            okc = arith.select(is_b, in_grid, in_grid & (grp_a < _ngrp))
+            for t in range_constexpr(nd):
+                b_row = grp_b * I32(64) + I32(t * 16) + r
+                row = arith.select(is_b, rd_base + b_row, rd0 + I32(t * 16) + r)
+                valid = okc & arith.select(is_b, b_row < I32(N), row < rd_end)
+                v = Vec(
+                    buffer_ops.buffer_load(
+                        rin, row * I32(_KRD) + k128, vec_width=n_sub, dtype=T.i32, mask=valid
+                    )
+                )
+                if const_expr(_KRD % n_sub != 0):
+                    # odd real K128: the pair's tail sub-block is the next row's first dword
+                    v = Vec.from_elements(
+                        [v[0]]
+                        + [
+                            arith.select(k128 + I32(j) < I32(_KRD), v[j], I32(0))
+                            for j in range_constexpr(1, n_sub)
+                        ]
+                    )
+                dws.append(v)
+        words = _mxfp4_pack_cell(dws, n_sub, nd, _PRESHUF_NG)
         # store ALL in-range blocks: invalid/pad blocks got words=0 from the masked reads,
         # so slab-pad / 256-pad regions are written 0 (matches the split a_pre_shuf).
         for g in range_constexpr(_PRESHUF_NG):
-            buffer_ops.buffer_store(words[g], rout, base + I32(g * 64), mask=gid4 < total4)
+            buffer_ops.buffer_store(Vec.from_elements(words[g]), rout, base + I32(g * 64), mask=gid < total)
 
     return kern
 
 
 def _build_grouped_mxfp4_nt_kernel(
-    K, G, N, group_m=4, num_xcds=8, group_n=0, wlv=10, elgk=9, out_fp16=False, k_real=None
+    K, G, N, group_m=4, num_xcds=8, group_n=0, wlv=10, elgk=9, out_fp16=False, k_real=None, xcd_span=16
 ):
     """Grouped MXFP4 NT (out = a @ b^T), per-group A rows + per-expert B, whole-loop compute.
 
     K = 256-rounded tile/scale extent (the tiny E8M0 scale is zero-padded to it so the
     preshuffle packs whole 256-blocks). ``k_real`` (<= K, 128-multiple) = the operands' TRUE
     contraction (row stride, no operand pad). When k_real%256==128 the loop runs
-    k_real//256 full 256-blocks + ONE 128-K tail MFMA (reads the real last 128 K, its scale
-    is the block's s=0 in the padded packing) -- zero operand copy, zero wasted compute."""
+    k_real//256 full 256-blocks + a trailing block whose s=1 sub-step is past the real K
+    (its scale is the zero pad, so only s=0 contributes) -- zero operand copy, and that
+    dead sub-step and everything feeding it are dropped rather than executed."""
     BLOCK_M = BLOCK_N = BLOCK_K = _BLOCK
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     swizzle = True
@@ -213,8 +232,10 @@ def _build_grouped_mxfp4_nt_kernel(
     assert K % 256 == 0 and _KR % 128 == 0
     KI = _KR // BLOCK_K  # FULL 256-blocks over the REAL K
     _K128 = (_KR // 128) % 2  # 1 => trailing 128-K block, handled by scale-pad-zero below
-    # Trailing 128-K: round KI up and let the last 256-block's s=1 multiply the zero-padded
-    # scale (= 0). Fully pipelined into the do-while; one wasted MFMA, no post-loop tail phase.
+    # Trailing 128-K: round KI up so the last 256-block is fully pipelined into the do-while,
+    # and tell the whole-loop that this block's s=1 sub-step is past the contraction (it would
+    # only multiply the zero-padded scale) so it drops that sub-step and the prefetch stream
+    # that exists solely to feed a phase after it.
     KI_LOOP = KI + 1 if _K128 else KI
     NABUF, NBB, OCC = 2, 2, 2  # fwd waves_per_eu=2: hide the latency-bound short-K/small-tile GEMM
     N_SUB = BLOCK_K // 128
@@ -237,6 +258,11 @@ def _build_grouped_mxfp4_nt_kernel(
     _SCW = 4 * N_SUB * 64
     NBK = ceildiv(N, BLOCK_N)  # n_blocks
     _NV = N if (N % BLOCK_N != 0) else None  # non-256 N: mask store cols >= N (no host N-pad)
+    # Boundary N-block skip: when the last n-block holds <= LDS_BN_HALF valid columns its BR
+    # half is all free-dim padding, so that half's MFMAs and its B g2s are dead work (accR
+    # keeps its zeros and the store is column-masked). The whole-loop then runs a second,
+    # BR-less body selected by a wave-uniform SGPR flag.
+    _HALF_N = (N % BLOCK_N != 0) and (N % BLOCK_N <= LDS_BN_HALF)
 
     _anns = {f"A_lds{i}": fx.Array[fx.Float8E4M3FN, a_lds_size, 16] for i in range_constexpr(NABUF)}
     for _b in range_constexpr(NBB):
@@ -258,7 +284,6 @@ def _build_grouped_mxfp4_nt_kernel(
         c_m: fx.Int32,  # total_M
         c_n: fx.Int32,  # N
         slab_rows: fx.Int32,  # padded A-slab rows
-        grid_upper: fx.Int32,
     ):
         F8 = fx.Float8E4M3FN.ir_type
         lds = fx.SharedAllocator().allocate(SS).peek()
@@ -330,47 +355,49 @@ def _build_grouped_mxfp4_nt_kernel(
                 T.i32, (grp * fx.Int32(K128) + fx.Int32(_PRELL * N_SUB)) * fx.Int32(256)
             )
 
-        # ---- O(G) tile scan: pid -> (group_idx, local tile, m_start, m_end, a_pre) ----
-        go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
-        go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
-        pid = xcd_remap_pid(fx.block_idx.x, grid_upper, num_xcds)
-        total_tiles = I32(0)
-        prev = _load_go(go_div, 0)
-        for g in range_constexpr(G):
-            nxt = _load_go(go_div, g + 1)
-            total_tiles = total_tiles + ceildiv(nxt - prev, BLOCK_M) * I32(NBK)
-            prev = nxt
+        # ---- lane-resident group scan: pid -> (group_idx, local tile, m_start, m_end, a_pre) ----
+        # Lane g owns group g, so the tile prefix and the A-scale slab prefix both come out
+        # of ONE wave inclusive scan of the per-group 256-row block count. That replaces the
+        # serial G-wide compare tree (which needs 2*(G+1) live scalars and one group-offset
+        # load per group) with two lane-table loads, one scan and per-tile readlanes.
+        go_rs = buffer_ops.create_buffer_resource(GO, max_size=False, num_records_bytes=(G + 1) * 8)
+        _go0 = _lane_tbl_load(go_rs, lane_id, G + 1, stride=2)
+        _go1 = _lane_tbl_load(go_rs, lane_id, G + 1, stride=2, first=1)
+        _own = [lane_id + I32(64 * c) < I32(G) for c in range_constexpr(len(_go0))]
+        _nb = [
+            arith.select(_own[c], ceildiv_pow2(_go1[c] - _go0[c], BLOCK_M), I32(0))
+            for c in range_constexpr(len(_go0))
+        ]
+        _nbs_end = _lane_tbl_scan(_nb)
+        _tcs_end = [v * I32(NBK) for v in _nbs_end]  # entry g = tiles owned by groups <= g
+        _tcs = [_tcs_end[c] - _nb[c] * I32(NBK) for c in range_constexpr(len(_nb))]
+        _sas = [(_nbs_end[c] - _nb[c]) * I32(4) for c in range_constexpr(len(_nb))]
+        total_tiles = _readlane_i32(_tcs_end[-1], 63)
+        bid = fx.block_idx.x
         # non-persistent grid: WGs past total_tiles hardware-exit (scf.if cannot
-        # carry the Python-object loader state, so guard via s_endpgm).
-        _tt = _readfirstlane_i32(total_tiles)
+        # carry the Python-object loader state, so guard via s_endpgm). The grid is an
+        # upper bound (worst-case per-group round-up), so the exit MUST test the raw
+        # block id: the XCD remap is then a bijection over the LIVE tiles only, which
+        # spreads the over-launched WGs round-robin over the XCDs instead of stacking
+        # the whole dead tail onto the last one (it owns the top of the remapped range).
         _llvm.inline_asm(
             None,
-            [pid.ir_value(), arith._to_raw(_tt)],
+            [bid.ir_value(), arith._to_raw(total_tiles)],
             "s_cmp_lt_u32 $0, $1\n\ts_cbranch_scc1 1f\n\ts_endpgm\n\t1:",
             "s,s,~{scc},~{memory}",
             has_side_effects=True,
         )
-        cum = I32(0)
-        group_idx = I32(0)
-        tile_start = I32(0)
-        m_start = I32(0)
-        m_end = I32(0)
-        a_pre_g = I32(0)
-        apre = I32(0)  # inline 64-grp slab-base cumsum (no AP tensor / cumsum launch)
-        p2 = _load_go(go_div, 0)
-        for g in range_constexpr(G):
-            nx = _load_go(go_div, g + 1)
-            tg = ceildiv(nx - p2, BLOCK_M) * I32(NBK)
-            nc = cum + tg
-            inq = (pid >= cum) & (pid < nc)
-            group_idx = arith.select(inq, I32(g), group_idx)
-            tile_start = arith.select(inq, cum, tile_start)
-            m_start = arith.select(inq, p2, m_start)
-            m_end = arith.select(inq, nx, m_end)
-            a_pre_g = arith.select(inq, apre, a_pre_g)
-            apre = apre + ceildiv(nx - p2, BLOCK_M) * I32(4)
-            cum = nc
-            p2 = nx
+        # Band-cyclic (not contiguous) XCD partition: an XCD owns every 8th run of xcd_span
+        # M-blocks, keeping the intra-run L2 reuse of a contiguous remap while still drawing
+        # tiles from the whole token range. Needed because per-tile cost is NOT uniform under
+        # skewed routing -- a contiguous partition would strand a small-expert's cheap tail
+        # tiles on one static XCD (bid % 8), which then sets the makespan.
+        pid = xcd_band_remap_pid(bid, total_tiles, num_xcds, xcd_span * NBK)
+        group_idx = _lane_tbl_count_le(_tcs_end, pid)
+        tile_start = _lane_tbl_get(_tcs, group_idx)
+        a_pre_g = _lane_tbl_get(_sas, group_idx)
+        m_start = _lane_tbl_get(_go0, group_idx)
+        m_end = _lane_tbl_get(_go1, group_idx)
         local = pid - tile_start
         bm, bn = _grouped_block_mn(local, m_start, m_end, NBK, BLOCK_M, group_m, group_n)
 
@@ -426,6 +453,9 @@ def _build_grouped_mxfp4_nt_kernel(
         _wib = (sbl_b // I32(256)) * I32(2) + (sbl_b % I32(256)) // I32(64)
         _sob = rocdl.readfirstlane(T.i32, b_exp_bytes + _wib * I32(K128) * I32(512))
         sc_soff06 = [_soa, _sc1, _sob, _sc3]
+        _half_n = None
+        if const_expr(_HALF_N):
+            _half_n = _readfirstlane_i32(arith.select(bn == I32(NBK - 1), I32(1), I32(0)))
         accL, accR = mfma.call_mxfp4_wholeloop(
             a_base6,
             bl_base6,
@@ -458,6 +488,8 @@ def _build_grouped_mxfp4_nt_kernel(
             sc_soff06,
             ki=KI_LOOP,
             sc_buf_stride=(_SCBUF * 4),
+            half_n=_half_n,
+            half_k=bool(_K128),
         )
         base_row = m_row + I32(wave_m_off)
         base_col_l = bn * I32(BLOCK_N) + I32(wave_n_off)
@@ -476,10 +508,12 @@ def _build_grouped_mxfp4_nt_kernel(
 _GMXFP4_LAUNCH_CACHE: dict = {}
 _GMXFP4_WS_CACHE: dict = {}
 _GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, gm, xcd, gn, out_fp16) -> [raw_launch, compiled]
-# Fixed grouped NT config (gm, xcd, gn): xcd=1 (group-major XCD order) is the dominant L2
-# locality lever; gm=2/gn=4 is within noise of the per-shape optimum. One fixed config keeps
-# one compiled kernel per shape.
-_GMXFP4_DEFAULT_CFG = (2, 1, 4)
+# Fixed tile-blocking config per path: NT is (group_m, num_xcds, group_n, xcd_span), wgrad is
+# the first three. NT's tiles-per-group is skew-sensitive so it needs the band-cyclic XCD
+# partition; wgrad's skew lives in its per-group contraction length instead, so it stays on
+# plain hardware round-robin (xcd=1) and takes L2 reuse from the group-major gn=4 band.
+_GMXFP4_NT_CFG = (2, 8, 0, 16)
+_GMXFP4_WGRAD_CFG = (2, 1, 4)
 # JIT compile-cache bound: each distinct shape compiles one FlyDSL kernel (GPU code object).
 # Real MoE uses a handful of shapes; a broad test sweep (~480 shapes) accumulates enough
 # code objects to exhaust memory -> drop the caches (and gc the modules) past this cap. A
@@ -494,15 +528,25 @@ def _bound_caches(*caches):
         gc.collect()
 
 
-def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=None):
+def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=None, span=16):
     K128 = K // 128
     N_SCALE = ceildiv(N, 256) * 256
     k128_rd = (K if k_real is None else k_real) // 128  # real raw K128 (scale not host-padded)
     ab_pre_shuf = _build_grouped_mxfp4_ab_preshuffle(K128, G, N, k128_rd)  # merged A+B, 1 launch
     gemm_k, attrs, NBK = _build_grouped_mxfp4_nt_kernel(
-        K, G, N, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16, k_real=k_real
+        K,
+        G,
+        N,
+        group_m=gm,
+        num_xcds=xcd,
+        group_n=gn,
+        wlv=wlv,
+        elgk=elgk,
+        out_fp16=out_fp16,
+        k_real=k_real,
+        xcd_span=span,
     )
-    b_pre_grid = ceildiv(G * N_SCALE * K128, _PRESHUF_NG * _PRESHUF_BLK)
+    b_pre_grid = ceildiv(G * N_SCALE * K128, _PRESHUF_FO * _PRESHUF_BLK)
 
     @flyc.jit
     def launch(
@@ -524,7 +568,7 @@ def _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k
         ab_pre_shuf(a_raw, a_sp, b_raw, b_sp, GO, c_m, slab_rows, a_pre_grid).launch(
             grid=(a_pre_grid + b_pre_grid, 1, 1), block=(_PRESHUF_BLK, 1, 1), stream=stream
         )
-        gemm_k(a8, b8, C, a_sp, b_sp, GO, c_m, c_n, slab_rows, grid_upper, value_attrs=attrs).launch(
+        gemm_k(a8, b8, C, a_sp, b_sp, GO, c_m, c_n, slab_rows, value_attrs=attrs).launch(
             grid=(grid_upper, 1, 1), block=(256, 1, 1), stream=stream
         )
 
@@ -547,82 +591,6 @@ def _get_grouped_mxfp4_ws(total_M, N, K128, G, device):
         e = (a_sp, b_sp, slab_rows)
         _GMXFP4_WS_CACHE[key] = e
     return e[0], e[1], slab_rows
-
-
-_GMXFP4_CFG_CACHE: dict = {}  # (N, K, G, out_fp16) -> raced (gm, xcd, gn); M-generic
-_GMXFP4_PM_CANON = (2048, 4096)  # tokens/group steady points for the race (geomean)
-
-
-def _gmxfp4_nt_candidates():
-    """<=3 L2-swizzle configs raced per NT shape; cand[0]=(2,1,4) is the group-major default
-    that wins most shapes, (2,8,0)/(4,8,0) win wide-N short-K shapes (measured per-shape)."""
-    return [_GMXFP4_DEFAULT_CFG, (2, 8, 0), (4, 8, 0)]
-
-
-def _canon_gmxfp4_targs(args, K, G, N, k_real, pm):
-    """Synthetic balanced NT args at `pm` tokens/group (shapes drive timing; scales=1.0 keep
-    the output finite), reusing the M-independent b-side from `args`. The launch is M-generic,
-    so one compile covers every total_M -- the race just times L2 residency per swizzle."""
-    dev = args[0].device
-    stream = args[13]
-    M_c = G * pm
-    K128 = K // 128
-    a8_c = torch.randint(-127, 127, (M_c, K // 2), device=dev, dtype=torch.int8)
-    out_c = torch.empty((M_c, N), device=dev, dtype=args[2].dtype)
-    a_raw_c = torch.full((M_c * (k_real // 32) // 4,), 0x7F7F7F7F, device=dev, dtype=torch.int32)
-    a_sp_c, b_sp_c, slab_rows_c = _get_grouped_mxfp4_ws(M_c, N, K128, G, dev)
-    n_blocks = (N + 255) // 256
-    grid_upper_c = (ceildiv(M_c, 256) + G) * n_blocks
-    a_pre_grid_c = ceildiv(slab_rows_c * K128, _PRESHUF_NG * _PRESHUF_BLK)
-    go_c = (torch.arange(0, G + 1, dtype=torch.int64, device=dev) * pm).view(torch.int32)
-    return (
-        a8_c,
-        args[1],  # b8 (weights, M-independent)
-        out_c,
-        a_raw_c,
-        args[4],  # b_raw (b scales, M-independent)
-        a_sp_c,
-        b_sp_c,
-        go_c,
-        M_c,
-        N,
-        slab_rows_c,
-        a_pre_grid_c,
-        grid_upper_c,
-        stream,
-    )
-
-
-def _select_gmxfp4_cfg(cfg_key, entry_of, K, G, N, k_real, args):
-    """First-call timed race over <=3 swizzle candidates on synthetic canon args (2 tokens/
-    group steady points, geomean); cached per static shape (no total_M). The swizzle is a pure
-    WG->tile bijection (bit-identical), so this only chases L2 residency, never correctness."""
-    cached = _GMXFP4_CFG_CACHE.get(cfg_key)
-    if cached is not None:
-        return cached
-    points = [_canon_gmxfp4_targs(args, K, G, N, k_real, pm) for pm in _GMXFP4_PM_CANON]
-
-    def _score(cfg):
-        c = flyc.compile(entry_of(cfg)[0], *points[0])  # M-generic -> one compile serves both points
-        for targs in points:
-            for _ in range(5):
-                c(*targs)
-        return math.exp(sum(math.log(_robust_time(c, t)) for t in points) / len(points))
-
-    try:
-        best_cfg, best_score = _GMXFP4_DEFAULT_CFG, _score(_GMXFP4_DEFAULT_CFG)
-    except Exception:  # a bad race falls back to the default, never breaks the GEMM
-        _GMXFP4_CFG_CACHE[cfg_key] = _GMXFP4_DEFAULT_CFG
-        return _GMXFP4_DEFAULT_CFG
-    for cfg in _gmxfp4_nt_candidates()[1:]:
-        try:
-            s = _score(cfg)
-        except Exception:  # a candidate that fails to compile/run is skipped
-            continue
-        if s < best_score * 0.985:  # adopt only if geomean >=1.5% faster than the default
-            best_cfg, best_score = cfg, s
-    _GMXFP4_CFG_CACHE[cfg_key] = best_cfg
-    return best_cfg
 
 
 def grouped_gemm_mxfp4_flydsl_kernel(
@@ -667,7 +635,7 @@ def grouped_gemm_mxfp4_flydsl_kernel(
 
     n_blocks = (N + 255) // 256
     grid_upper = (ceildiv(total_M, 256) + G) * n_blocks
-    a_pre_grid = ceildiv(slab_rows * K128, _PRESHUF_NG * _PRESHUF_BLK)
+    a_pre_grid = ceildiv(slab_rows * K128, _PRESHUF_FO * _PRESHUF_BLK)
 
     stream = torch.cuda.current_stream()
     wlv, elgk = 10, 9
@@ -689,30 +657,25 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     )
 
     def _entry(cfg):
-        gm, xcd, gn = cfg
-        lk = (K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real)
+        gm, xcd, gn, span = cfg
+        lk = (K, G, N, gm, xcd, gn, span, wlv, elgk, out_fp16, k_real)
         ent = _GMXFP4_LAUNCH_CACHE.get(lk)
         if ent is None:
-            ent = _compile_grouped_mxfp4_nt_fused(K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=k_real)
+            ent = _compile_grouped_mxfp4_nt_fused(
+                K, G, N, gm, xcd, gn, wlv, elgk, out_fp16, k_real=k_real, span=span
+            )
             _GMXFP4_LAUNCH_CACHE[lk] = ent
         # M-generic launch (total_M is a runtime arg, not compiled in) -> key on the static
         # shape only, reuse the compiled object for every total_M. Dropping total_M here stops
         # per-total_M entries from evicting the cache (mirrors #419's mxfp8 M-decoupling).
-        atk = (N, K, G, gm, xcd, gn, out_fp16, k_real)  # k_real: same K256 diff real K must not collide
+        atk = (N, K, G, gm, xcd, gn, span, out_fp16, k_real)  # same K256 diff real K must not collide
         e2 = _GMXFP4_AT_CACHE.get(atk)
         if e2 is None:
             e2 = [ent[0], None]
             _GMXFP4_AT_CACHE[atk] = e2
         return e2
 
-    # Per-shape L2-swizzle: race <=3 candidates once per static shape (cached, M-generic);
-    # the (2,1,4) group-major default wins most shapes, a few wide-N short-K shapes take
-    # (2,8,0). Graph capture can't time, so it keeps the default.
-    if torch.cuda.is_current_stream_capturing():
-        cfg = _GMXFP4_DEFAULT_CFG
-    else:
-        cfg = _select_gmxfp4_cfg((N, K, G, out_fp16), _entry, K, G, N, k_real, args)
-    run_eager_or_capture(_entry(cfg), args, 1)
+    run_eager_or_capture(_entry(_GMXFP4_NT_CFG), args, 1)
     _bound_caches(_GMXFP4_LAUNCH_CACHE, _GMXFP4_AT_CACHE, _GMXFP4_WS_CACHE)
     return out[:, :N_out] if N_out != N else out
 
@@ -752,6 +715,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
     N_BLOCKS_N = ceildiv(OUT_N, BLOCK_N)
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     _NV = OUT_N if (OUT_N % BLOCK_N != 0) else None  # non-256 OUT_N: mask store cols >= OUT_N
+    _HALF_N = (OUT_N % BLOCK_N != 0) and (OUT_N % BLOCK_N <= LDS_BN_HALF)  # see the NT kernel
     TOTAL = G * TILES_PER_GROUP
 
     _anns = {f"A_lds{i}": fx.Array[fx.Float8E4M3FN, a_lds_size, 16] for i in range_constexpr(NABUF)}
@@ -901,6 +865,9 @@ def _build_grouped_mxfp4_wgrad_kernel(
         _soa = rocdl.readfirstlane(T.i32, _wia * I32(K128m) * I32(512) + ksb)
         _sob = rocdl.readfirstlane(T.i32, _wib * I32(K128m) * I32(512) + ksb)
         sc_soff06 = [_soa, _sc1, _sob, _sc3]
+        _half_n = None
+        if const_expr(_HALF_N):
+            _half_n = _readfirstlane_i32(arith.select(block_n == I32(N_BLOCKS_N - 1), I32(1), I32(0)))
         accL, accR = mfma.call_mxfp4_wholeloop(
             a_base6,
             bl_base6,
@@ -933,6 +900,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
             sc_soff06,
             ki=None,
             sc_buf_stride=(_SCBUF * 4),
+            half_n=_half_n,
         )
         base_row = group_idx * I32(OUT_M) + a_row + I32(wave_m_off)
         base_col_l = b_row + I32(wave_n_off)
@@ -972,7 +940,7 @@ def _compile_grouped_mxfp4_wgrad_fused(OUT_M, OUT_N, G, M_total, gm, xcd, gn, wl
     gemm_k, attrs, TOTAL = _build_grouped_mxfp4_wgrad_kernel(
         OUT_M, OUT_N, G, M_total, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16
     )
-    _PGRID = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_BLK
+    _PGRID = _MXFP4_PRESHUF_FO * _MXFP4_PRESHUF_BLK
 
     @flyc.jit
     def launch(
@@ -1049,6 +1017,6 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
             _GMXFP4_WGRAD_AT_CACHE[atk] = e2
         return e2
 
-    run_eager_or_capture(_entry(_GMXFP4_DEFAULT_CFG), args, 1)
+    run_eager_or_capture(_entry(_GMXFP4_WGRAD_CFG), args, 1)
     _bound_caches(_GMXFP4_WGRAD_LAUNCH_CACHE, _GMXFP4_WGRAD_AT_CACHE, _GMXFP4_WGRAD_WS_CACHE)
     return out

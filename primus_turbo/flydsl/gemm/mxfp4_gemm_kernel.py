@@ -226,19 +226,48 @@ class StoreCPlain:
     def store(self, c_frag, base_row, base_col, n_valid=None):
         # Re-base at this tile's row band in int64; intra-band voffsets stay int32. Rows
         # past c_rows OOB-drop via the band SRD's num_records. n_valid (non-256 free dim):
-        # mask cols >= n_valid so the kernel runs the REAL N with no host N-pad.
-        _mask = n_valid is not None
-        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        # cols >= n_valid must not be written, so the kernel runs the REAL N with no host
+        # N-pad. One call covers ONE contiguous 16*n_tiles_b column span per wave, so when
+        # n_valid is a multiple of that span the span is uniformly in or out of range and
+        # the whole call can be dropped by zeroing the band's num_records -- keeping the
+        # mask off the exposed per-store VALU chain.
+        c_rows = self.c_rows
+        if n_valid is not None and n_valid % (16 * self.n_tiles_b) == 0:
+            c_rows = arith.select(base_col < fx.Int32(n_valid), c_rows, base_row)
+            n_valid = None
+        rsrc = make_row_band_resource(self.c_base, base_row, c_rows, self.c_cols, 2)
+        if n_valid is None:
+            self._store_rowaddr(c_frag, base_col, rsrc)
+            return
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
-                col_valid = (col < fx.Int32(n_valid)) if _mask else None
+                col_valid = col < fx.Int32(n_valid)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
                     val = vec_f32[i].to(self.out_ty)
                     off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
                     buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
+
+    def _store_rowaddr(self, c_frag, base_col, rsrc):
+        """Unmasked store: ONE address per (row, lane) shared by the row's N sub-blocks.
+
+        The sub-blocks of a row are 16 columns = 32 bytes apart, which fits the store's
+        offset immediate, so the per-store address VALU (and, with no column mask, the
+        per-store OOB-redirect select) both disappear -- the epilogue's exposed VALU
+        chain is what costs it, not the store bandwidth. Rows past c_rows still
+        OOB-drop through the band SRD's num_records."""
+        row_b = self.c_cols * fx.Int32(2)  # C row stride in bytes
+        base = (base_col + self.lane_id % 16) * fx.Int32(2) + (self.lane_id // 16) * (row_b * fx.Int32(4))
+        for ti in range_constexpr(self.n_tiles_a):
+            for i in range_constexpr(4):
+                off = base + row_b * fx.Int32(ti * 16 + i)
+                for tj in range_constexpr(self.n_tiles_b):
+                    val = Vec(c_frag[self.c_idx_fn(ti, tj)])[i].to(self.out_ty)
+                    buffer_ops.buffer_store(
+                        val, rsrc, off if tj == 0 else off + tj * 32, offset_is_bytes=True
+                    )
 
     @staticmethod
     def _permlane16_swap(a_i32, b_i32):
@@ -375,12 +404,28 @@ class MfmaScaleFp4:
         sc_soff0,
         ki=None,
         sc_buf_stride=0,
+        half_n=None,
+        half_k=False,
         _cache={},  # noqa: B006 -- deliberate cross-call asm compile cache
     ):
         """WHOLE-LOOP bare-asm: the entire K-loop is one inline-asm hw-loop, unroll-2 with
         buf0/buf1 ping-pong. Each phase: ds_read operands + 128 MFMA (L+R, n_sub, packed
         scale) + G2S buffer_load_lds refill (next-K in-place) + s_barrier. Scales are
-        VGPR-direct (default) or COOP LDS-staged. Returns (accL, accR)."""
+        VGPR-direct (default) or COOP LDS-staged. Returns (accL, accR).
+
+        ``half_n``: optional wave-uniform SGPR flag selecting a second K-loop for the
+        boundary N-block whose R half is all free-dim padding -- it drops that half's
+        MFMAs and its B g2s (the R accumulators keep their tied-in zeros and the store
+        falls outside the row/col clamp). ds_read and the drain/barrier sequence are
+        unchanged, so the phase counts hold for either path.
+
+        ``half_k``: the true contraction ends 128 K into the LAST 256-K phase, so that
+        phase's second K sub-step only ever multiplies the zero-padded scale. Its MFMAs are
+        dropped. For an even ``ki`` that phase is the hw-loop's last phase B, so the final
+        unroll-2 iteration is peeled out of the loop; the peeled pair also drops everything
+        that only feeds a phase past the end of K (its g2s refills, the second operand
+        refill stream and the second scale prefetch), which is why the peeled phase A ends
+        on a full drain instead of the loop's partial one."""
         assert self.packed
         nta, ntb = self.n_tiles_a, self.n_tiles_b
         nq = nta * ntb
@@ -418,6 +463,8 @@ class MfmaScaleFp4:
             self.coop,
             _TACC,
             ki,
+            half_n is not None,
+            half_k,
         )
         if key not in _cache:
             o_acc = list(range(NT))
@@ -497,6 +544,8 @@ class MfmaScaleFp4:
             i += 1  # scale per-lane gmem voffset
             i_sca0 = [i + g for g in range(4)]
             i += 4  # scale soffset inits (A-g0, A-g1, BL, BR)
+            i_hn = i
+            i += 1 if half_n is not None else 0  # half-N variant selector
 
             def emit_ds(buf, off=0):
                 # operands only; scales are VGPR-direct (emit_sc_vgpr in the loop).
@@ -518,7 +567,7 @@ class MfmaScaleFp4:
                         )
                 return r
 
-            def emit_g2s(buf, sa_op, sbl_op, sbr_op):
+            def emit_g2s(buf, sa_op, sbl_op, sbr_op, half=False):
                 r = []
                 for st in range(nsa):
                     r.append(
@@ -530,7 +579,7 @@ class MfmaScaleFp4:
                         f"s_add_u32 m0, ${i_g_blb[buf]}, {st * _NWc * 1024}\n"
                         f"buffer_load_dwordx4 ${i_glb[st]}, ${i_rsb}, ${sbl_op} offen lds"
                     )
-                for st in range(nsb):
+                for st in range(0 if half else nsb):  # half: R is padding, nothing reads it
                     r.append(
                         f"s_add_u32 m0, ${i_g_brb[buf]}, {st * _NWc * 1024}\n"
                         f"buffer_load_dwordx4 ${i_glb[st]}, ${i_rsb}, ${sbr_op} offen lds"
@@ -557,12 +606,14 @@ class MfmaScaleFp4:
                     return f"ds_read_b128 ${tt}, ${i_brb[buf][s]} offset:{ji * ts_b}"
                 return ""
 
-            def emit_inplace(nxt_buf, g2sl):
+            def emit_inplace(nxt_buf, g2sl, half=False, drop_s=False, refill=True):
                 # NEXT-K in-place refill, blocked-diagonal (4 A-rows x 8 N-cols) with the
                 # K-sub (s) innermost so each acc's n_sub MFMA are consecutive. Both operands
                 # free progressively (ds_read of nxt_buf overlaps the MFMA tail); scales are
                 # VGPR-direct so their refill is a no-op. GAVOID: g2s only at no-ds-refill
                 # slots; the 4x8 block spacing avoids the accumulator RAW stall.
+                # drop_s: last K sub-step is past the contraction. refill: a phase after
+                # this one consumes the ds_read stream.
                 bm, bn = 4, 8
                 ncol = 2 * ntb
                 nib = nta // bm
@@ -574,9 +625,11 @@ class MfmaScaleFp4:
                         if 0 <= cb < ncb:
                             for di in range(bm):
                                 for dj in range(bn):
-                                    for s in range(n_sub):
+                                    for s in range(n_sub - 1 if drop_s else n_sub):
                                         ii = iib * bm + di
                                         col = cb * bn + dj
+                                        if half and col // ntb:
+                                            continue  # R half: padding columns
                                         cells.append((ii, col // ntb, col % ntb, s))
                 mlist = []
                 for ii, sl, ji, s in cells:
@@ -618,34 +671,40 @@ class MfmaScaleFp4:
                                 _rfslot.add(mi)
                                 _rf.add(rt)
                     _free = [mi for mi in range(len(mlist)) if mi not in _rfslot]
-                    _fgap = max(len(_free) // max(len(g2sl), 1), 1)
+                    _n = len(g2sl)
+                    _fgap = max(len(_free) // max(_n, 1), 1)
                     for _k, _fi in enumerate(_free):
-                        if (_k % _fgap == 0) and len(_gset) < len(g2sl):
+                        if (_k % _fgap == 0) and len(_gset) < _n:
                             _gset[_fi] = len(_gset)
                 out = []
                 gi = 0
                 refilled = set()
                 for mi, (ml, at, bt, sat, sbt) in enumerate(mlist):
                     out.append(ml)
-                    for rt in (at, bt, sat, sbt):
-                        if rt in mid and last[rt] == mi and rt not in refilled:
-                            out.append(ds_line(nxt_buf, rt))
-                            refilled.add(rt)
+                    if refill:
+                        for rt in (at, bt, sat, sbt):
+                            if rt in mid and last[rt] == mi and rt not in refilled:
+                                out.append(ds_line(nxt_buf, rt))
+                                refilled.add(rt)
                     if g2sl and mi in _gset and gi < len(g2sl):
                         out.append(g2sl[gi])
                         gi += 1
                 while gi < len(g2sl):
                     out.append(g2sl[gi])
                     gi += 1
-                # end drain: refill the still-pending operand temps (used till end).
-                for tt in range(t_a, NT + set_sz):
-                    if tt not in refilled:
-                        out.append(ds_line(nxt_buf, tt))
+                if refill:
+                    # end drain: refill the still-pending operand temps (used till end).
+                    for tt in range(t_a, NT + set_sz):
+                        if tt not in refilled:
+                            out.append(ds_line(nxt_buf, tt))
                 return out
 
             # ── phase boundary drains ─────────────────────────────────────────
-            _ipend = f"s_waitcnt vmcnt({_WLV}) lgkmcnt({_ELGK})\ns_barrier"
-            _ipenda = f"s_waitcnt vmcnt({_WLV}) lgkmcnt({_ELGK})\ns_barrier"
+            # The half-N body issues nsb fewer g2s per phase, so its vmcnt has to shrink
+            # by the same amount to leave the SAME live loads in flight at the barrier.
+            def _ipend_of(half):
+                v = max(_WLV - nsb, 0) if half else _WLV
+                return f"s_waitcnt vmcnt({v}) lgkmcnt({_ELGK})\ns_barrier"
 
             # ── VGPR-direct scale prefetch (lane-contiguous buffer_load to VGPR) ──
             # emit_sc_vgpr(tb) loads this kk's 2*n_sub*2 scale dwords DIRECT to the
@@ -698,8 +757,14 @@ class MfmaScaleFp4:
             _ipend_coop = "s_waitcnt vmcnt(0) lgkmcnt(0)\ns_barrier"
 
             # ── prologue (before the hw-loop label) ───────────────────────────
+            # half_k with an even trip count peels the final unroll-2 iteration out of the
+            # hw-loop: the counter starts one iteration in, so the loop stops two phases
+            # early and the peeled copy runs them without the now-dead prefetch.
+            # (VGPR-direct only: the peel reissues the scale prefetch itself, and the COOP
+            # path stages scales through LDS behind its own barrier.)
+            _KPEEL = half_k and not _COOP and (ki is not None) and (ki >= 4) and not (ki & 1)
             L = [
-                f"s_mov_b32 ${o_cnt}, 0",
+                f"s_mov_b32 ${o_cnt}, {2 if _KPEEL else 0}",
                 f"s_mov_b32 ${o_sa}, ${i_sa0}",
                 f"s_mov_b32 ${o_sbl}, ${i_sbl0}",
                 f"s_mov_b32 ${o_sbr}, ${i_sbr0}",
@@ -737,60 +802,90 @@ class MfmaScaleFp4:
             _has_tail = (ki is not None) and bool(ki & 1)
 
             if _has_loop:
-                L.append("1:")
-
                 # ── unroll-2 body (phase A even-k, phase B odd-k) ─────────────────
                 # SCV_ILV: the scale buffer_load is interleaved INTO the mfma stream
                 # (prepended to g2sl) so it overlaps the MFMA and stops competing with g2s
                 # for the boundary VMEM slot; _scv_adv (o_sca advance) is emitted AFTER
                 # emit_inplace so the interleaved loads read the un-advanced offset.
-                _g2sA = emit_g2s(0, o_sa, o_sbl, o_sbr)
-                _g2sB = emit_g2s(1, o_ta, o_tbl, o_tbr)
-                # phase A: consume set0; g2s P+2 -> LDS0, ds_read P+1 (LDS1) -> set1.
-                _scb[0] = 0
-                if _COOP:
-                    _scA = emit_sc_coop_g2s(0) + emit_sc_coop_ds(nsct, 1)
-                else:
-                    _scA = emit_sc_vgpr(nsct)
-                L += emit_inplace(1, _scA + _g2sA)
-                L += _scv_adv()
-                L.append(_ipenda)
-                L.append(f"s_add_u32 ${o_ta}, ${o_sa}, ${i_kstep}")
-                L.append(f"s_add_u32 ${o_tbl}, ${o_sbl}, ${i_kstep}")
-                L.append(f"s_add_u32 ${o_tbr}, ${o_sbr}, ${i_kstep}")
-                # phase B: consume set1; g2s P+2 -> LDS1, ds_read P+1 (LDS0) -> set0.
-                _scb[0] = nsct
-                if _COOP:
-                    _scB = emit_sc_coop_g2s(1) + emit_sc_coop_ds(0, 0)
-                else:
-                    _scB = emit_sc_vgpr(0)
-                L += emit_inplace(0, _scB + _g2sB)
-                L += _scv_adv()
-                L.append(_ipend)
-                for _so in (o_sa, o_sbl, o_sbr):
-                    L.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
-                    L.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
-                L.append(f"s_add_u32 ${o_cnt}, ${o_cnt}, 2")
-                L.append(f"s_cmp_lt_u32 ${o_cnt}, ${i_nval}")
-                L.append("s_cbranch_scc1 1b")
+                def emit_loop(lbl, half):
+                    B = [f"{lbl}:"]
+                    # phase A: consume set0; g2s P+2 -> LDS0, ds_read P+1 (LDS1) -> set1.
+                    _scb[0] = 0
+                    if _COOP:
+                        _scA = emit_sc_coop_g2s(0) + emit_sc_coop_ds(nsct, 1)
+                    else:
+                        _scA = emit_sc_vgpr(nsct)
+                    B += emit_inplace(1, _scA + emit_g2s(0, o_sa, o_sbl, o_sbr, half), half)
+                    B += _scv_adv()
+                    B.append(_ipend_of(half))
+                    B.append(f"s_add_u32 ${o_ta}, ${o_sa}, ${i_kstep}")
+                    B.append(f"s_add_u32 ${o_tbl}, ${o_sbl}, ${i_kstep}")
+                    B.append(f"s_add_u32 ${o_tbr}, ${o_sbr}, ${i_kstep}")
+                    # phase B: consume set1; g2s P+2 -> LDS1, ds_read P+1 (LDS0) -> set0.
+                    _scb[0] = nsct
+                    if _COOP:
+                        _scB = emit_sc_coop_g2s(1) + emit_sc_coop_ds(0, 0)
+                    else:
+                        _scB = emit_sc_vgpr(0)
+                    B += emit_inplace(0, _scB + emit_g2s(1, o_ta, o_tbl, o_tbr, half), half)
+                    B += _scv_adv()
+                    B.append(_ipend_of(half))
+                    for _so in (o_sa, o_sbl, o_sbr):
+                        B.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
+                        B.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
+                    B.append(f"s_add_u32 ${o_cnt}, ${o_cnt}, 2")
+                    B.append(f"s_cmp_lt_u32 ${o_cnt}, ${i_nval}")
+                    B.append(f"s_cbranch_scc1 {lbl}b")
+                    return B
+
+                def emit_peel(half):
+                    # Peeled last iteration: keeps phase A's operand refill + scale prefetch,
+                    # drops the g2s (would fill the pool for a phase past K's end). vmcnt goes
+                    # to 0 at both edges since there's no g2s burst left to grade a partial
+                    # count against; lgkm stays graded (refills still consumed in issue order).
+                    B = [f"s_waitcnt vmcnt(0) lgkmcnt({_ELGK})", "s_barrier"]
+                    _scb[0] = 0
+                    B += emit_inplace(1, emit_sc_vgpr(nsct), half)
+                    B.append(f"s_waitcnt vmcnt(0) lgkmcnt({_ELGK})")
+                    _scb[0] = nsct
+                    B += emit_inplace(0, [], half, drop_s=True, refill=False)
+                    return B
+
+                # Boundary N-block variant: same drain/barrier sequence, R-half dropped.
+                if half_n is not None:
+                    L.append(f"s_cmp_lg_u32 ${i_hn}, 0")
+                    L.append("s_cbranch_scc1 3f")
+                L += emit_loop("1", False)
+                if _KPEEL:
+                    L += emit_peel(False)
+                if half_n is not None:
+                    L.append("s_branch 4f")
+                    L.append("3:")
+                    L += emit_loop("2", True)
+                    if _KPEEL:
+                        L += emit_peel(True)
+                    L.append("4:")
 
             if _has_tail:
                 # odd-KI trailing phase-A (MFMA-only): the last even-k operands are already
                 # in the ds_read temps (last phase-B refill, or prologue emit_ds when KI==1)
                 # and set0 scales are loaded. No g2s/ds/scale reload -- drain, run the MFMAs.
+                # Under half_k this IS the trailing half phase, so its second K sub-step
+                # reads past the contraction and is dropped.
                 L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
                 _scb[0] = 0
                 _bm, _bn = 4, 8  # match loop-body block (see emit_inplace)
                 _ncol = 2 * ntb
                 _nib = nta // _bm
                 _ncb = _ncol // _bn
+                _nst = n_sub - 1 if half_k else n_sub
                 for _D in range(_nib + _ncb - 1):
                     for _iib in range(_nib):
                         _cb = _D - _iib
                         if 0 <= _cb < _ncb:
                             for _di in range(_bm):
                                 for _dj in range(_bn):
-                                    for _s in range(n_sub):
+                                    for _s in range(_nst):
                                         _ii = _iib * _bm + _di
                                         _col = _cb * _bn + _dj
                                         _sl = _col // ntb
@@ -849,6 +944,7 @@ class MfmaScaleFp4:
                 + ["s", "s"]  # scale rsrc A, B
                 + ["v"]  # scale voffset
                 + ["s", "s", "s", "s"]  # scale soffset inits (A-g0, A-g1, BL, BR)
+                + (["s"] if half_n is not None else [])  # half-N variant selector
                 + [str(q) for q in o_acc]
             )  # tied accs
             st = (
@@ -896,6 +992,8 @@ class MfmaScaleFp4:
         ins.append(_raw(sc_voff))  # scale voffset
         for g in range_constexpr(4):
             ins.append(_raw(sc_soff0[g]))  # scale soffset inits
+        if half_n is not None:
+            ins.append(_raw(half_n))
         for q in range_constexpr(nq):
             ins.append(_raw(cL[q]))
         for q in range_constexpr(nq):
@@ -1529,7 +1627,7 @@ def _compile_mxfp4_fused(K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, 
         taccw=taccw,
         out_fp16=out_fp16,
     )
-    _PGRID = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_BLK  # threads-per-block * fan-out
+    _PGRID = _MXFP4_PRESHUF_FO * _MXFP4_PRESHUF_BLK  # threads-per-block * fan-out
 
     @flyc.jit
     def launch_mxfp4_fused(
@@ -1546,8 +1644,8 @@ def _compile_mxfp4_fused(K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, 
     ):
         # 1) A + B scale preshuffle in ONE launch (raw E8M0 -> packed int32 in the
         # A_scale/B_scale ws). Blocks [0, grid_a) do A, [grid_a, grid_a+grid_b) do B; the
-        # kernel segment-selects operand/dim/grp per block. grid = ceildiv(dim*K128, NG*BLK)
-        # per operand (dim*K128 divisible by NG). Merging drops one in-stream kernel launch
+        # kernel segment-selects operand/dim/grp per block. grid = ceildiv(dim*K128, FO*BLK)
+        # per operand (dim*K128 divisible by FO). Merging drops one in-stream kernel launch
         # + inter-kernel gap per GEMM (6->3 preshuffle launches per training step).
         grid_a = ceildiv(c_m * fx.Int32(K128), _PGRID)
         grid_b = ceildiv(c_n * fx.Int32(K128), _PGRID)
@@ -1591,8 +1689,29 @@ def _get_mxfp4_fused_launch(
 # gives the 4 source rows grp*64 + t*16 + r. Forward map of the deleted C++ preshuffle index.
 
 _MXFP4_PRESHUF_BLK = 256
-_MXFP4_PRESHUF_NG = 4  # g_byte fan-out folded into one preshuffle thread (grid is 1/NG the dwords)
+_MXFP4_PRESHUF_NG = 4  # g bytes packed by one thread
+_MXFP4_PRESHUF_ND = 4  # (r_region, K sub-block) cells packed by one thread
+_MXFP4_PRESHUF_FO = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_ND  # output dwords per thread
 _MXFP4_SCALE_WS: dict = {}  # (M, N, K, device) -> (a_sp, b_sp) packed int32 workspace
+
+
+def _mxfp4_pack_cell(dws, n_sub, nd, ng):
+    """Byte-transpose one (wi, kk, r) preshuffle cell: output dword (g, last) takes byte g of
+    source row t as its byte t. ``dws`` is indexed [r_region * nd + t] and each entry holds
+    the n_sub adjacent K sub-blocks of that row. Returns ng lists of nd dwords, each list
+    contiguous in the packed layout so it stores as one vector."""
+    I32 = fx.Int32
+    out = []
+    for g in range_constexpr(ng):
+        sh = I32(g * 8)
+        grp = []
+        for last in range_constexpr(nd):
+            p = I32(0)
+            for t in range_constexpr(nd):
+                p = p | (((dws[(last // n_sub) * nd + t][last % n_sub] >> sh) & I32(0xFF)) << I32(t * 8))
+            grp.append(p)
+        out.append(grp)
+    return out
 
 
 def _mxfp4_grp_from(wi, r_region, mode):
@@ -1610,9 +1729,16 @@ def _build_mxfp4_preshuffle_kernel_ab():
     # on small-M/N). Blocks [0, grid_a) do A (mode 0); [grid_a, ...) do B (mode 1); the A/B
     # group map, buffer resources and dim are segment-selected from the WG-uniform block index
     # (readfirstlane -> SGPR arith.select). Per-thread packing math = the single-operand map.
+    # One thread owns a whole (wi, kk, r) cell -- both r_region halves and both K sub-blocks on
+    # top of the 4 g bytes -- so the gather is dwordx2, the scatter dwordx4, and a workgroup
+    # spans 32 source columns = one full 128B line of every row it touches. At one thread per
+    # output dword a workgroup covered only 32B of each line and the other three quarters were
+    # re-fetched by workgroups on three other XCDs, i.e. three redundant HBM reads per line.
     n_sub = 2
-    nd = 4
+    nd = _MXFP4_PRESHUF_ND
+    n_rr = nd // n_sub
     NG = _MXFP4_PRESHUF_NG
+    FO = _MXFP4_PRESHUF_FO
 
     @flyc.kernel(known_block_size=[_MXFP4_PRESHUF_BLK, 1, 1])
     def kern(
@@ -1640,40 +1766,34 @@ def _build_mxfp4_preshuffle_kernel_ab():
         rin = arith.select(is_b, b_rin, a_rin)
         rout = arith.select(is_b, b_rout, a_rout)
 
-        gid4 = local_bid * _MXFP4_PRESHUF_BLK + fx.thread_idx.x
+        gid = local_bid * _MXFP4_PRESHUF_BLK + fx.thread_idx.x
         total = dim * K128  # output int32 dwords for the active operand
-        total4 = total // NG  # threads (one per g_byte group)
+        ok = gid < total // FO
 
-        last = gid4 % nd
-        e1 = gid4 // nd
-        r = e1 % 16
-        e2 = e1 // 16
+        r = gid % 16
+        e2 = gid // 16
         kk = e2 % KK
         wi = e2 // KK
+        k128 = kk * n_sub  # the thread's two K sub-blocks are adjacent source dwords
+        base = ((wi * KK + kk) * 64 + r) * nd
 
-        r_region = last // n_sub
-        s = last % n_sub
-        k128 = kk * n_sub + s
-        # both group maps computed, segment-selected (mode branch is a trace-time Python if
-        # inside _mxfp4_grp_from, so both variants are emitted then chosen at runtime).
-        grp = arith.select(is_b, _mxfp4_grp_from(wi, r_region, 1), _mxfp4_grp_from(wi, r_region, 0))
-        base = ((wi * KK + kk) * 64 + r) * nd + last
-
-        dws = [fx.Int32(0)] * nd
-        for t in range_constexpr(nd):
-            row = grp * 64 + t * 16 + r
-            dws[t] = fx.Int32(
-                buffer_ops.buffer_load(
-                    rin, row * K128 + k128, vec_width=1, dtype=T.i32, mask=(gid4 < total4) & (row < dim)
-                )
-            )
-        for g in range_constexpr(NG):
-            sh = fx.Int32(g * 8)
-            packed = fx.Int32(0)
+        dws = []
+        for r_region in range_constexpr(n_rr):
+            # both group maps computed, segment-selected (mode branch is a trace-time Python if
+            # inside _mxfp4_grp_from, so both variants are emitted then chosen at runtime).
+            grp = arith.select(is_b, _mxfp4_grp_from(wi, r_region, 1), _mxfp4_grp_from(wi, r_region, 0))
             for t in range_constexpr(nd):
-                b = (dws[t] >> sh) & fx.Int32(0xFF)
-                packed = packed | (b << fx.Int32(t * 8))
-            buffer_ops.buffer_store(packed, rout, base + g * 64, mask=gid4 < total4)
+                row = grp * 64 + t * 16 + r
+                dws.append(
+                    Vec(
+                        buffer_ops.buffer_load(
+                            rin, row * K128 + k128, vec_width=n_sub, dtype=T.i32, mask=ok & (row < dim)
+                        )
+                    )
+                )
+        words = _mxfp4_pack_cell(dws, n_sub, nd, NG)
+        for g in range_constexpr(NG):
+            buffer_ops.buffer_store(Vec.from_elements(words[g]), rout, base + g * 64, mask=ok)
 
     return kern
 
