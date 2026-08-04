@@ -504,11 +504,11 @@ if __name__ == "__main__":
         "scipy",
     ]
 
-    # TODO(ruibin): Triton 3.7.0 and flydsl 0.2.0 does not support gfx1250, so we skip their installation when building for gfx1250.
+    # TODO(ruibin): Triton 3.7.0 and flydsl 0.2.4 does not support gfx1250, so we skip their installation when building for gfx1250.
     offload_arch_list, _ = get_offload_archs()
     if "--offload-arch=gfx1250" not in offload_arch_list:
         install_requires.append("triton>=3.7.0")
-        install_requires.append("flydsl==0.2.0")
+        install_requires.append("flydsl==0.2.4")
     else:
         print("[Primus-Turbo Setup] Building for gfx1250; skipping triton dependency.")
 
