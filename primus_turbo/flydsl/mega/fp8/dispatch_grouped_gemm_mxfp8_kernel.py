@@ -35,7 +35,6 @@ from typing import Optional, Tuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from torch.distributed import ProcessGroup
 from flydsl.expr import arith
 from flydsl.expr.buffer_ops import (
     buffer_load,
@@ -44,20 +43,22 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 from flydsl.expr.typing import AddressSpace, PointerType
+from torch.distributed import ProcessGroup
 
+from primus_turbo.flydsl.mega.fp8.dispatch_prologue import dispatch_prologue
 from primus_turbo.flydsl.mega.fp8.ep_fp8 import (
     _BLOCK_THREADS,
     dispatch_fp8_copy_tile,
+)
+from primus_turbo.flydsl.mega.fp8.gemm_helper import (
+    _emit_lds_repack,
+    ceildiv,
+    make_value_attrs,
 )
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K,
     gemm_mxfp8_nt_tile,
 )
-from primus_turbo.flydsl.mega.fp8.quant import (
-    preshuffle_b_scale,
-    quantize_rowwise_mxfp8_flydsl,
-)
-from primus_turbo.flydsl.mega.prims import cast
 from primus_turbo.flydsl.mega.fp8.prims import (
     l2_invalidate,
     ld,
@@ -65,18 +66,19 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     spin_timed_out,
     st,
 )
-from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
-from primus_turbo.flydsl.mega.fp8.gemm_helper import (
-    _emit_lds_repack,
-    ceildiv,
-    make_value_attrs,
+from primus_turbo.flydsl.mega.fp8.quant import (
+    preshuffle_b_scale,
+    quantize_rowwise_mxfp8_flydsl,
 )
-from primus_turbo.flydsl.mega.fp8.dispatch_prologue import dispatch_prologue
+from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.prims import cast
 
 _VALIDATE_TILES = os.environ.get("PT_MEGA_VALIDATE_TILES", "0") != "0"
 _H_TILE_TO_EXPERT = 7  # dispatch_prologue handle index; see its unpack table
 _H_NUM_TILE_BLOCKS = 11  # appended by this module: the per-call real-tile count
+_H_ORIGIN_RANK = 12  # appended by this module: per-call pool row -> owning rank
+_H_ORIGIN_SLOT = 13  # appended by this module: per-call pool row -> owning topk slot
 
 _FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip per-call @flyc.jit dispatch)
 _BSP_CACHE: dict = {}  # (weight data_ptr, G, N, K) -> preshuffled weight scale b_sp (weights static)
@@ -651,10 +653,17 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
                 num_experts=G * world, world_size=world, rank=symm.rank, experts_per_rank=G,
                 block_m=BM, num_max_pool_tokens=symm.num_max_pool_tokens,
             )
-            # handle[-1] = num_tile_blocks (device real-tile count). Cloned out of the shared symm
-            # scratch so it belongs to THIS call: the next prologue overwrites meta_scalars, and
-            # the backward reuses this handle long after that. Stream-ordered D2D, no host sync.
-        ) + (symm.meta_scalars[1:2].clone(),)
+            # Snapshots of the shared symm scratch, so they belong to THIS call: the next prologue
+            # overwrites meta_scalars AND resets the whole origin_rank / origin_slot region, while
+            # the backward reuses this handle long after that. num_tile_blocks is the real-tile
+            # count; origin_rank / origin_slot map each pool row back to the rank and topk slot that
+            # sent it, which is what STEP3's push needs to return the row to its owner. All three
+            # are stream-ordered D2D copies, no host sync. (bf16 does the same with pool_src_slot.)
+        ) + (
+            symm.meta_scalars[1:2].clone(),
+            symm.origin_rank.clone(),
+            symm.origin_slot.clone(),
+        )
     else:
         symm = get_symm_buffer_for_mega_moe()  # live buffer from a prior forward
         sym_layout = symm.make_sym_layout()

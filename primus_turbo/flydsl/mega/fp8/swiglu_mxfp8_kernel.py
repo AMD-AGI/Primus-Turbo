@@ -623,7 +623,7 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
     l1, dact = l1.contiguous(), dact.contiguous()
     is_e5m2_col = out_dtype_col == torch.float8_e5m2
     if meta is None:
-        meta = colwise_grouped_meta(group_lens, group_offs)
+        meta = colwise_grouped_meta(group_lens, group_offs, pool_rows=P)
     assert "pmb_meta" in meta, "meta must carry pmb_meta (built by colwise_grouped_meta)"
     total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
     n_blk = F // _BLK

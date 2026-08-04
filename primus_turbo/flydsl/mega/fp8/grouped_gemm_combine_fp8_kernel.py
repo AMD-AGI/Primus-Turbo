@@ -35,10 +35,10 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl
 import torch
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -48,8 +48,25 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import _grouped_block_mn
 from primus_turbo.flydsl.mega.fp8.combine_config import _BLOCK_THREADS, _NUM_WARPS, _WARP
-from primus_turbo.flydsl.mega.prims import cast
+from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
+    _H_NUM_TILE_BLOCKS,
+    _H_ORIGIN_RANK,
+    _H_ORIGIN_SLOT,
+)
+from primus_turbo.flydsl.mega.fp8.gemm_helper import (
+    StoreCQuantMxfp8CShuffle,
+    _emit_if_then,
+    make_value_attrs,
+    xcd_remap_pid,
+)
+from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
+    BLOCK_K as _MXFP8_BLOCK_K,
+)
+from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
+    emit_gemm_mxfp8_nt_tile,
+)
 from primus_turbo.flydsl.mega.fp8.prims import (
     _wait_mem,
     l2_invalidate,
@@ -60,17 +77,7 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
-    BLOCK_K as _MXFP8_BLOCK_K,
-    emit_gemm_mxfp8_nt_tile,
-)
-from primus_turbo.flydsl.mega.fp8.gemm_helper import (
-    StoreCQuantMxfp8CShuffle,
-    _emit_if_then,
-    make_value_attrs,
-    xcd_remap_pid,
-)
-from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import _grouped_block_mn
+from primus_turbo.flydsl.mega.prims import cast
 
 # GEMM launch attrs (nt_vmcnt / waves_per_eu); included in flyc compile cache key below.
 _COMBINE_NT_VMCNT = 3
@@ -345,7 +352,6 @@ def _compile(
     comb_records = combine_slots * out_features * 2
     gate_records = combine_slots * 4  # f32 gate slots per peer (backward d_topk_w scatter)
     delta_records = num_ranks * 8
-    pool_records = num_max_pool_tokens * 4
     dedicated_reduce_warps = num_reduce_cu * _NUM_WARPS
     gemm_base = num_combine_cu + num_reduce_cu
     H4 = out_features // 4
@@ -371,6 +377,7 @@ def _compile(
         TILE_TO_GROUP: fx.Tensor, NUM_TILE_BLOCKS: fx.Tensor, OUTPUT: fx.Tensor, TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor, TOPK_WEIGHTS: fx.Tensor, GRAD_GATE: fx.Tensor, D_TOPK_W: fx.Tensor,
         A_SCALE: fx.Tensor, B_SCALE: fx.Tensor,
+        ORIGIN_RANK: fx.Tensor, ORIGIN_SLOT: fx.Tensor,
         COMBINE_PARITY: fx.Tensor, COMBINE_EXPECTED: fx.Tensor, REDUCE_EXPECTED: fx.Tensor,
         sym_layout: SymLayout, c_n: fx.Int32,
     ):
@@ -404,8 +411,14 @@ def _compile(
         main_delta_res = create_buffer_resource_from_addr(
             sym_layout.offsets_ptr, num_records_bytes=delta_records
         )
-        origin_rank_res = create_buffer_resource_from_addr(sym_layout.origin_rank_ptr, num_records_bytes=pool_records)
-        origin_slot_res = create_buffer_resource_from_addr(sym_layout.origin_slot_ptr, num_records_bytes=pool_records)
+        # The pool-row -> (owning rank, topk slot) map has to come from this call's own snapshot, not
+        # from the live symm region: every dispatch prologue resets that whole region to -1 and
+        # refills only the rows it dispatches, so by the time a layer's backward runs, the region
+        # describes the LAST layer's routing. Pushing this layer's rows through that map sends them
+        # to the wrong slots and skips the right ones, which is what left peers' reduce spinning.
+        # bf16 avoids this the same way, via its handle[12] pool_src_slot snapshot.
+        origin_rank_res = create_buffer_resource(ORIGIN_RANK, max_size=True)
+        origin_slot_res = create_buffer_resource(ORIGIN_SLOT, max_size=True)
         gate_local_res = create_buffer_resource_from_addr(gate_base, num_records_bytes=gate_records)
 
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
@@ -589,6 +602,7 @@ def _compile(
     def launch(
         ACT, WEIGHTS, L2Y_FP8, L2Y_SCALE, TILE_TO_GROUP, NUM_TILE_BLOCKS, OUTPUT, TOPK_INDICES,
         NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, GRAD_GATE, D_TOPK_W, A_SCALE, B_SCALE,
+        ORIGIN_RANK, ORIGIN_SLOT,
         COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED, sym_layout, c_n: int,
         real_tiles_host: int,
         tail_blocks_host: int,
@@ -610,6 +624,7 @@ def _compile(
         kern(
             ACT, WEIGHTS, L2Y_FP8, L2Y_SCALE, TILE_TO_GROUP, NUM_TILE_BLOCKS, OUTPUT, TOPK_INDICES,
             NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, GRAD_GATE, D_TOPK_W, A_SCALE, B_SCALE,
+            ORIGIN_RANK, ORIGIN_SLOT,
             COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED, sym_layout, c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -678,7 +693,15 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     rank = int(sym_layout.rank_idx)
     topk = int(sym_layout.num_topk)
     num_experts = int(sym_layout.num_experts)
-    num_tile_blocks = symm.meta_scalars[1:2]
+    # Everything below that varies per call comes off the handle, never out of the live symm state.
+    # A layer's backward runs long after later layers' prologues have rewritten the shared scratch,
+    # so reading it there picks up another layer's dispatch: the tile count came back too large and
+    # exposed tiles this call never filled (they still hold the prologue's out-of-range expert
+    # sentinel, which indexed WEIGHTS one expert stride past its end), and the pool-row -> slot map
+    # came back describing another layer's routing. The three have to move together -- fixing only
+    # the count leaves the push sending rows to the wrong slots, which hangs peers' reduce.
+    num_tile_blocks = handle[_H_NUM_TILE_BLOCKS]
+    origin_rank, origin_slot = handle[_H_ORIGIN_RANK], handle[_H_ORIGIN_SLOT]
     num_tokens = int(symm.num_tokens)
 
     sk = (M, H, dev)
@@ -688,6 +711,7 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
         l2y_scale = torch.empty(M * (H // 32), dtype=torch.uint8, device=dev)
         _L2Y_FP8_SCRATCH[sk] = scratch = (l2y_fp8, l2y_scale)
     l2y_fp8, l2y_scale = scratch
+
 
     output = torch.empty(num_tokens, out_features, dtype=torch.bfloat16, device=dev)
     topk_indices_d = topk_indices.contiguous().view(-1)
@@ -704,15 +728,25 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
 
     act_flat = aq.view(torch.int8).reshape(-1)
 
-    real_tiles_host = int(num_tile_blocks.item())
+    # These two only ever size the grid. In the shipped reduce configuration the GEMM blocks and the
+    # tail-reduce blocks always add up to worst_case_tiles * n_blocks, so the grid does not depend on
+    # the real-tile count at all -- and reading that count here would cost a D2H sync per launch,
+    # which in a training step drains the whole queue and kills CPU/GPU overlap (the bf16 combine
+    # takes no host read whatever). Feed the pair that yields the same grid without the sync, and
+    # only pay for the count where the grid really is proportional to it.
     worst_case_tiles_host = M // BM
-    tail_blocks_host = max(0, worst_case_tiles_host - real_tiles_host) * (out_features // BN)
+    if num_reduce_cu == 0:
+        real_tiles_host, tail_blocks_host = worst_case_tiles_host, 0
+    else:
+        real_tiles_host = int(num_tile_blocks.item())
+        tail_blocks_host = max(0, worst_case_tiles_host - real_tiles_host) * (out_features // BN)
 
     def _run_with_cu(cu: int) -> None:
         stream = torch.cuda.current_stream()
         gemm_push_args = (
             act_flat, weight_flat, l2y_fp8, l2y_scale, tile_to_expert, num_tile_blocks, output.view(-1),
             topk_indices_d, symm.num_tokens_per_rank, topk_weights_arg, grad_gate_arg, d_topk_w, a_sp, b_sp,
+            origin_rank, origin_slot,
             symm._combine_parity, symm._combine_expected, symm._reduce_expected,
             sym_layout, out_features, real_tiles_host, tail_blocks_host, stream,
         )

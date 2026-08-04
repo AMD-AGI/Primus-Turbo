@@ -35,9 +35,9 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8_flydsl,
     swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import prepare_w2_fp8
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float8_e5m2
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import prepare_w2_fp8
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_impl,
 )
@@ -146,9 +146,9 @@ def _mxfp8_variable_k_wgrad_dw2(a_fp8, b_bf16, group_lens, group_offs, meta=None
     quant grids, shared ``meta``, one stream). Both emit only the transposed operand
     the wgrad needs + raw E8M0; the grouped meta (one D2H of the padded per-group offsets) is shared.
     Then the FlyDSL mxfp8 variable-K grouped GEMM. dW2 is the large backward GEMM (H*I over the pool)."""
-    if meta is None:
-        meta = colwise_grouped_meta(group_lens, group_offs)
     pool_fp8, pool_scale = a_fp8
+    if meta is None:
+        meta = colwise_grouped_meta(group_lens, group_offs, pool_rows=pool_fp8.shape[0])
     a_t, a_ts, b_t, b_ts, lens_pc, offs_pc = colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
         pool_fp8, pool_scale, b_bf16, _DW_FP8_FORMAT, meta=meta,
     )
@@ -191,7 +191,9 @@ def prepare_dw1_pool_operand_fp8(
     of the symm pool. Requantizing it colwise there consumes the view in place of the clone the
     backward would otherwise need, and takes the requant off the backward critical path. ``meta``
     is returned alongside so backward reuses it for the dual-quant / dW1 / dW2."""
-    meta = colwise_grouped_meta(handle[_HANDLE_GROUP_LENS], handle[_HANDLE_GROUP_OFFS])
+    meta = colwise_grouped_meta(
+        handle[_HANDLE_GROUP_LENS], handle[_HANDLE_GROUP_OFFS], pool_rows=pool_x_fp8[0].shape[0]
+    )
     pool_colwise = colwise_requant_mxfp8_grouped_fp8in_flydsl(
         pool_x_fp8[0], pool_x_fp8[1], _DW_FP8_FORMAT, meta=meta,
     )[:2]

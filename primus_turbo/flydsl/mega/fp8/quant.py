@@ -40,6 +40,7 @@ slower.  A fp8-in variant fuses the dequant->requant round-trip for the STEP1 po
 """
 
 import functools
+from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -96,8 +97,14 @@ def _mxfp8_words_from_f32_subvecs(fvs):
     exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
     exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
     biased = fx.arith.ArithValue(exp) + fx.Int32(127)
-    scale = (biased << fx.Int32(23)).bitcast(fx.T.f32())  # 2^exp as f32
-    inv_scale = fx.Float32(1.0) / fx.arith.ArithValue(scale)
+    # Build 1/scale from the exponent bits, as _e8m0_quant_pack does, rather than dividing by
+    # `bits(biased << 23)`. The two agree bit-for-bit on every scale a finite input can produce,
+    # but they differ on the one an all-zero block produces: there amax is 0, exp clamps to -127
+    # and biased is 0, so the float form is 1.0/0.0 = inf and every element quantizes to 0*inf =
+    # NaN. A token the loss masks out has an exactly-zero gradient row, so training hits this
+    # where fixed random benchmark data never does. 2^(127-biased) is also what the stored E8M0
+    # byte actually means, which the divide-by-zero form was not.
+    inv_scale = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32())
     inv_v = _vector.broadcast(f32v, arith._to_raw(inv_scale))
 
     words = []
@@ -475,27 +482,45 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
     return launch
 
 
-def colwise_grouped_meta(group_lens: torch.Tensor, group_offs: torch.Tensor):
+def colwise_grouped_meta(
+    group_lens: torch.Tensor, group_offs: torch.Tensor, pool_rows: Optional[int] = None
+):
     """Precompute the (device) grouping metadata for the grouped colwise quant.  Both dW2
     operands share the same group structure, so compute this ONCE and pass to both calls
-    (avoids re-running cumsum/repeat_interleave + the total_M_pad D2H twice)."""
+    (avoids re-running cumsum/repeat_interleave twice).
+
+    ``pool_rows`` is the M extent of the pool the groups live in. Given it, the padded total is
+    bounded without reading the device: each group is padded to 128 here while the pool already
+    pads each group to BLOCK_M=256, and 128 divides 256, so the 128-padded total can never exceed
+    the pool. Taking the bound instead of the exact value removes a D2H per call -- which does not
+    just cost the copy but blocks until every kernel already queued has retired, so in a training
+    step it serialises the whole pipeline (it measured ~1 s per call, 72% of the op's host time;
+    the bf16 path takes no host read at all). Rows past the real groups are masked by ``len_g`` in
+    the kernels and never read downstream, which bound per-group offsets from ``offs_pc``.
+    """
     dev = group_lens.device
     lens = group_lens.to(torch.int32)
     lens_pc = ((lens + 127) // 128) * 128                                   # pad each group M to 128
     offs_pc = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=dev), torch.cumsum(lens_pc, 0)]
     ).to(torch.int32)
-    total_M_pad = int(offs_pc[-1].item())                                   # D2H (sizes output/grid)
+    if pool_rows is None:
+        total_M_pad = int(offs_pc[-1].item())                               # D2H (sizes output/grid)
+    else:
+        assert int(pool_rows) % _BLK == 0, f"pool_rows {pool_rows} must be a multiple of {_BLK}"
+        total_M_pad = int(pool_rows)
     n_pblk = total_M_pad // _BLK
     # group id per 32-M block via searchsorted on the block offsets (fixed output size =>
-    # no hidden D2H, unlike repeat_interleave which syncs to size its dynamic output).
+    # no hidden D2H, unlike repeat_interleave which syncs to size its dynamic output). Blocks past
+    # the last real group land on index G, which none of the per-group tables below can hold, so
+    # clamp them onto the last group; their rows fail the len_g mask anyway.
     offs32 = group_offs.to(torch.int32)
     blk2grp = (
         torch.searchsorted(
             offs_pc // _BLK, torch.arange(n_pblk, dtype=torch.int32, device=dev), right=True
         )
         - 1
-    ).to(torch.int32)
+    ).clamp_(0, lens.numel() - 1).to(torch.int32)
     grp = blk2grp
     offs_pc_g = offs_pc[grp]
     in_off_g = offs32[grp]
@@ -526,10 +551,10 @@ def colwise_quant_mxfp8_grouped_flydsl(
         q: fp8 ``[F, total_M_pad]``   s: uint8 ``[F, total_M_pad//32]``.
     """
     assert x.dim() == 2 and x.dtype == torch.bfloat16, "x must be bf16 [total_M, F]"
-    _, F = x.shape
+    M, F = x.shape
     is_e5m2 = out_dtype == torch.float8_e5m2
     if meta is None:
-        meta = colwise_grouped_meta(group_lens, group_offs)
+        meta = colwise_grouped_meta(group_lens, group_offs, pool_rows=M)
     total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
     q = torch.empty((F, total_M_pad), dtype=out_dtype, device=x.device)
     s = torch.empty((F, n_pblk), dtype=torch.uint8, device=x.device)
@@ -710,11 +735,11 @@ def colwise_requant_mxfp8_grouped_fp8in_flydsl(
         q: fp8 ``[F, total_M_pad]``   s: uint8 ``[F, total_M_pad//32]``.
     """
     assert q_in.dim() == 2 and s_in.dim() == 2, "q_in [total_M, F], s_in [total_M, F//32]"
-    _, F = q_in.shape
+    M, F = q_in.shape
     assert s_in.shape[1] == F // _BLK, f"s_in cols {s_in.shape[1]} != F//32 {F // _BLK}"
     is_e5m2_out = out_dtype == torch.float8_e5m2
     if meta is None:
-        meta = colwise_grouped_meta(group_lens, group_offs)
+        meta = colwise_grouped_meta(group_lens, group_offs, pool_rows=M)
     total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
     q = torch.empty((F, total_M_pad), dtype=out_dtype, device=q_in.device)
     s = torch.empty((F, n_pblk), dtype=torch.uint8, device=q_in.device)
@@ -781,7 +806,7 @@ def colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
     assert s_in.shape[1] == F_a // _BLK
     is_e5m2_out = out_dtype == torch.float8_e5m2
     if meta is None:
-        meta = colwise_grouped_meta(group_lens, group_offs)
+        meta = colwise_grouped_meta(group_lens, group_offs, pool_rows=M)
     total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
     q_a = torch.empty((F_a, total_M_pad), dtype=out_dtype, device=q_in.device)
     s_a = torch.empty((F_a, n_pblk), dtype=torch.uint8, device=q_in.device)

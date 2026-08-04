@@ -1,9 +1,9 @@
 # MXFP8 Backward — Performance & Correctness Status
 
-**Date:** 2026-08-01; §1 and §2.1 re-measured 2026-08-02
+**Date:** 2026-08-01; §1 and §2.1 re-measured 2026-08-02; §1.3 08-03; §1.4 08-04
 **Device:** MI355X (`gfx950`, 256 CU, 8 XCD) — node `smci355-ccs-aus-n04-33` / container `xiaoming-dev`
-(08-01), node `smci355-ccs-aus-n05-29` / container `xiaoming-perf` (08-02). The two are not
-interchangeable; see §1.1.
+(08-01, 08-03), node `smci355-ccs-aus-n05-29` / container `xiaoming-perf` (08-02),
+node `smci355-ccs-aus-n01-25` (08-04). These are not interchangeable; see §1.1 and §1.4.
 **Model shape:** DeepSeek-V3 — H=7168, I=2048, E=256, K=8, EP8 intra-node, T=8192/rank
 **Code:** `feat/xiaompen/mega_moe_flydsl_mxfp8` @ `b9103a5c` (was `bbb5a85e` + uncommitted work on 08-01)
 **Bench:** `benchmark/ops/bench_mega_moe_bwd_only.py`, CUDA events, `_amax` across ranks, warmup=8 / iters=25
@@ -110,6 +110,46 @@ The split specifically: `fp8_staged / fp8` is 0.97×–1.01× across all six cel
 fused op into two does not cost anything measurable, which is what makes the DDP overlap it enables
 worth taking. fp8 vs bf16 lands at 1.55–1.57× on `fwd+bwd` and 1.70–1.73× on `bwd-only`, a little
 better than the §1 table's 1.48×/1.63× — different session, so do not diff the two directly.
+
+### 1.4 08-04 — a 15× "regression" that was the container image
+
+A sweep on nodes `n03-33` and `n01-25` returned 191–200 ms `fwd+bwd` against the 13.5 ms of §1.3, a
+15× miss. It was not code. Rebuilding the container back to torch 2.10 + flydsl 0.2.4 and rebuilding
+turbo from the same worktree restored it, with nothing in the tree changed:
+
+| Routing | Leg | fwd+bwd | fwd-only | bwd-only |
+|---|---|---|---|---|
+| load_balanced | fp8 | 13.210 | 5.179 | 8.400 |
+| load_balanced | fp8_staged | 13.187 | 5.093 | 8.157 |
+| load_balanced | bf16 *(control)* | 19.938 | 6.960 | 13.344 |
+| round_robin | fp8 | 12.735 | 4.933 | 7.878 |
+| round_robin | fp8_staged | 12.634 | 4.846 | 7.813 |
+| round_robin | bf16 *(control)* | 18.995 | 6.605 | 12.730 |
+
+Means of two reps, node `n01-25`, same invocation as §1.3.
+
+The slow image was a torch 2.12 + ROCm 7.14 build. Its signature is in the bench's own stderr:
+**7592 `register fat binary failed` lines per run, against 0 on the working image**, same bench, same
+worktree. FlyDSL emits a code object per kernel and that HIP runtime refuses to register them, so
+every kernel falls off the precompiled path. Two things that looked like plausible causes were ruled
+out first and are worth not re-testing: it is not the python-overlay staging (an editable build from
+source reproduced the 191 ms), and it is not the hardware (bf16 GEMM held 1366 TFLOPS and P2P 56.8
+GB/s on the slow node). **Count that string before believing any number from a new image** — the
+failure is silent apart from those lines, and it costs 15×, not the few percent this note is
+otherwise about.
+
+Do not diff this table against §1.3. **The bf16 control moved −5.3% (LB) and −5.9% (RR)** while fp8
+moved −2.0%, so `n01-25` is simply a faster node for this bench, and by more than the ~1.3% drift
+§1.1 saw between nodes. The `bf16/fp8` ratio reads 1.49–1.51× on `fwd+bwd` and 1.59–1.62× on
+`bwd-only`, below §1.3's 1.55–1.57× / 1.70–1.73×; that gap is the control moving, not fp8 losing
+ground, and it is exactly the cross-node artifact §1.1 warns about.
+
+Environment rebuild, in order (both scripts are in `.ab/`): `install_flydsl024.sh` replaces the
+`rocm/primus:v26.3` image's flydsl 0.1.1 egg — too old, no `TargetAddressSpace` — with 0.2.4 lifted
+out of `tasimage/primus:v26.3_turbo_perf`, which carries the same python and torch so nothing needs
+recompiling; then `install_turbo_editable.sh` drops the image's prebuilt turbo and builds this
+worktree editable. Clear any `build/` and `.so` from a different torch first; they are not
+ABI-compatible and the stale ones link.
 
 ## 2. Backward internal structure
 

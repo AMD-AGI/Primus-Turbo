@@ -37,7 +37,7 @@ __all__ = [
 ]
 
 # fp8 dispatch handle: dispatch_prologue's 11 tables + num_tile_blocks appended by the L1 kernel.
-_HANDLE_LEN = 12
+_HANDLE_LEN = 14
 
 
 def fused_mega_moe_stage1_forward_fp8_impl(

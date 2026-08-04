@@ -134,8 +134,10 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
             dispatch_grouped_gemm_mxfp8,
             dispatch_prologue,
             get_symm_buffer_for_mega_moe,
-            quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
             quantize_rowwise_mxfp8_flydsl,
+        )
+        from primus_turbo.flydsl.mega.fp8 import (
+            quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
         )
 
         rank, dev = self.rank, self.device
@@ -373,6 +375,12 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
                 tw0, topk_idx = torch.sigmoid(gate).topk(K, dim=-1)
                 topk_w = (tw0 / (tw0.sum(-1, keepdim=True) + 1e-20)).to(torch.float32).requires_grad_(True)
                 grad_y = torch.randn(T, H, device=dev, dtype=torch.bfloat16)
+                # Tokens the loss masks out arrive with an exactly-zero gradient row -- the last
+                # position of each sequence always, padding and EOD besides. Random data never
+                # produces one, and a zero row is the input that makes a block-scaled quantizer
+                # divide by a zero amax, so leaving it out hides a whole class of NaN.
+                grad_y[T - 2 :] = 0.0
+                grad_y[[551 % T, 2344 % T, 4185 % T]] = 0.0
 
                 # mirrors MegaMoEFP8Experts.forward: w1, stage1, w2, stage2
                 l1, dispatch_weights, handle, state = fused_mega_moe_fp8_stage1(

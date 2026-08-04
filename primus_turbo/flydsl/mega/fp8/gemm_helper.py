@@ -567,8 +567,10 @@ class StoreCQuantMxfp8CShuffle:
             exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
             exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
             biased = fx.arith.ArithValue(exp) + fx.Int32(127)
-            scale = (biased << fx.Int32(23)).bitcast(fx.T.f32())
-            inv = fx.Float32(1.0) / fx.arith.ArithValue(scale)
+            # 1/scale from the exponent bits, not 1.0/bits(biased << 23) -- see the same reciprocal
+            # in quant.py. An all-zero 32-column block gives biased 0, where the float form divides
+            # by zero and quantizes every element to 0*inf = NaN.
+            inv = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32())
             neglim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(-448.0)))
             poslim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(448.0)))
             # cvt 8 vals -> 2 packed i32 (4 fp8/word), coalesced 64b store
