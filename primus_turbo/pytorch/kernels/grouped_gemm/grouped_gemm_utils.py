@@ -68,7 +68,7 @@ class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
         best_backend = None
         best_time = float("inf")
         for entry in cls._backends.values():
-            if not entry.autotune:
+            if not entry.is_executable or not entry.autotune:
                 continue
             if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()
@@ -132,7 +132,7 @@ class BaseGroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
         best_backend = None
         best_time = float("inf")
         for entry in cls._backends.values():
-            if not entry.autotune:
+            if not entry.is_executable or not entry.autotune:
                 continue
             if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()

@@ -30,10 +30,12 @@ except ImportError:
 
 
 __all__ = [
+    "AutoTuneEntry",
     "BackendEntry",
     "BackendType",
     "GlobalBackendManager",
     "KernelBackend",
+    "PrecisionType",
     "TuneCache",
     "AutoKernelDispatcher",
 ]
@@ -64,6 +66,9 @@ class BackendType(Enum):
     DEEP_EP = auto()
     TURBO = auto()
     FLYDSL = auto()
+    # Not a kernel provider: asks the dispatcher to profile and pick one of the
+    # real backends. Only valid for ops that register an ``AutoTuneEntry``.
+    AUTOTUNE = auto()
 
 
 class GlobalBackendManager:
@@ -73,7 +78,8 @@ class GlobalBackendManager:
     Priority (high to low):
     1. Code settings - set_gemm_backend(), etc.
     2. Environment variables - PRIMUS_TURBO_GEMM_BACKEND, etc.
-    3. Auto-tune - PRIMUS_TURBO_AUTO_TUNE=1
+    3. Auto-tune - PRIMUS_TURBO_AUTO_TUNE=1 for every op, or BackendType.AUTOTUNE
+       via 1./2. to auto-tune a single op/precision.
     4. Code defaults
     5. Fallback: try all backends
     """
@@ -244,6 +250,13 @@ class GlobalBackendManager:
                     once=True,
                 )
 
+            # Dispatch/combine picks an EP backend that owns persistent communication
+            # buffers, so there is nothing to profile and swap per call.
+            assert backend != BackendType.AUTOTUNE, (
+                f"{ENV_MOE_DISPATCH_COMBINE_BACKEND}=AUTOTUNE is not supported: "
+                "MoE dispatch/combine has no auto-tune path."
+            )
+
             if backend == BackendType.DEEP_EP:
                 assert HAVE_DEEP_EP, (
                     "DeepEP is required for this module. Install from https://github.com/uccl-project/uccl or https://github.com/ROCm/DeepEP"
@@ -254,7 +267,12 @@ class GlobalBackendManager:
 
     @classmethod
     def auto_tune_enabled(cls) -> bool:
-        """Check if auto-tune is enabled."""
+        """Check whether the global auto-tune switch is on.
+
+        This is the process-wide switch only; an op may still be auto-tuned
+        through a per-op ``BackendType.AUTOTUNE`` request while this returns
+        False.
+        """
         if cls._auto_tune is not None:
             return cls._auto_tune
         return os.environ.get(ENV_AUTO_TUNE, "0") == "1"
@@ -264,6 +282,7 @@ class GlobalBackendManager:
         """Reset all backend settings and clear all dispatcher caches."""
         cls._gemm_backend = None
         cls._grouped_gemm_backend = None
+        cls._moe_dispatch_combine_backend = None
         cls._auto_tune = None
         cls._env_cache = {}
         AutoKernelDispatcher.clear_all_caches()
@@ -287,14 +306,41 @@ class BackendEntry:
     """Metadata wrapper for a registered kernel backend.
 
     Attributes:
-        impl: The kernel backend class.
+        impl: The kernel backend class, or None for a marker entry that carries
+              no kernel (see ``AutoTuneEntry``). Guard every use with
+              ``is_executable``.
         autotune: Whether this backend participates in auto-tuning.
                   Backends with autotune=False can still be selected via
                   explicit user configuration or as a fallback.
     """
 
-    impl: Type[KernelBackend]
+    impl: Optional[Type[KernelBackend]]
     autotune: bool = True
+
+    @property
+    def is_executable(self) -> bool:
+        """False for marker entries such as ``AutoTuneEntry`` that carry no kernel."""
+        return self.impl is not None
+
+
+@dataclass(frozen=True)
+class AutoTuneEntry(BackendEntry):
+    """Marker entry that opts an op into ``BackendType.AUTOTUNE``.
+
+    Register it as ``BackendType.AUTOTUNE: AutoTuneEntry()`` to let users request
+    auto-tuning for that op alone (``PRIMUS_TURBO_<OP>_BACKEND=autotune`` or
+    ``set_*_backend(BackendType.AUTOTUNE)``) instead of flipping the global
+    ``PRIMUS_TURBO_AUTO_TUNE`` switch. It holds no kernel, so it is never
+    profiled and never executed; the dispatcher skips it everywhere and reads it
+    purely as "this op accepts AUTOTUNE".
+    """
+
+    impl: Optional[Type[KernelBackend]] = None
+    autotune: bool = False
+
+    def __post_init__(self) -> None:
+        assert self.impl is None, "AutoTuneEntry is a marker and must not carry a kernel backend."
+        assert not self.autotune, "AutoTuneEntry must not participate in auto-tuning itself."
 
 
 class TuneCache:
@@ -418,7 +464,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         best_backend = None
         best_time = float("inf")
         for entry in cls._backends.values():
-            if not entry.autotune:
+            if not entry.is_executable or not entry.autotune:
                 continue
             if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()
@@ -441,8 +487,15 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         cls, default_backend_enum: BackendType, user_backend_enum: Optional[BackendType] = None, **kwargs
     ) -> Any:
         # 1. User specified backend (env or code) - highest priority
-
-        if user_backend_enum is not None:
+        # AUTOTUNE is not a kernel provider: it only says "this op accepts
+        # auto-tuning", so it falls through to step 2 instead of executing.
+        if user_backend_enum == BackendType.AUTOTUNE:
+            if user_backend_enum not in cls._backends:
+                raise ValueError(
+                    f"{cls.__name__} does not support AUTOTUNE: no AutoTuneEntry is registered for it. "
+                    f"Available backends: {[b.name for b in cls._backends.keys()]}"
+                )
+        elif user_backend_enum is not None:
             if user_backend_enum not in cls._backends:
                 raise ValueError(
                     f"User specified backend {user_backend_enum.name} is not registered for {cls.__name__}. "
@@ -458,19 +511,25 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
 
         # 2. Auto tune
         # NOTE: Skip autotune during cuda graph capture.
-        if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
+        if (
+            user_backend_enum == BackendType.AUTOTUNE or GlobalBackendManager.auto_tune_enabled()
+        ) and not cls._is_graph_capturing():
             backend_cls = cls.tune(**kwargs)
             if backend_cls is not None:
                 return backend_cls.execute(**kwargs)
 
         # 3. Default backend
         default_entry = cls._backends.get(default_backend_enum)
-        if default_entry is not None and default_entry.impl.can_handle(**kwargs):
+        if (
+            default_entry is not None
+            and default_entry.is_executable
+            and default_entry.impl.can_handle(**kwargs)
+        ):
             return default_entry.impl.execute(**kwargs)
 
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
-            if fallback_backend_entry.impl.can_handle(**kwargs):
+            if fallback_backend_entry.is_executable and fallback_backend_entry.impl.can_handle(**kwargs):
                 logger.warning(
                     f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, fallback backend {fallback_backend_enum.name} is selected. The fallback backend may hurt performance!",
                     once=True,

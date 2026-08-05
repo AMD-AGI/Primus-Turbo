@@ -14,6 +14,7 @@ from primus_turbo.common.aiter_utils import get_aiter
 from primus_turbo.flydsl.gemm.mxfp4_gemm_kernel import gemm_mxfp4_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
+    AutoTuneEntry,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -292,6 +293,7 @@ _GEMM_FP4_BACKENDS = {
     BackendType.AITER: BackendEntry(GEMMFP4AITERBackend, autotune=False),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP4HipBLASLtBackend),
     BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend, autotune=False),
+    BackendType.AUTOTUNE: AutoTuneEntry(),
 }
 
 

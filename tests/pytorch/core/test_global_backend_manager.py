@@ -79,6 +79,32 @@ class TestGlobalBackendManagerEnvVar:
         assert GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.FP8) is None
         assert GlobalBackendManager.auto_tune_enabled() is False
 
+    def test_autotune_backend_single_format(self, monkeypatch):
+        """PRIMUS_TURBO_GEMM_BACKEND=autotune -> AutoTune GEMM at every precision."""
+        monkeypatch.setenv("PRIMUS_TURBO_GEMM_BACKEND", "autotune")
+        for precision in PrecisionType:
+            assert GlobalBackendManager.get_gemm_backend(precision) == BackendType.AUTOTUNE
+        # Per-op AutoTune must not flip the global switch.
+        assert GlobalBackendManager.auto_tune_enabled() is False
+
+    def test_autotune_backend_per_precision_format(self, monkeypatch):
+        """AutoTune composes with named backends: only FP8 is tuned."""
+        monkeypatch.setenv("PRIMUS_TURBO_GEMM_BACKEND", "fp8:autotune,other:hipblaslt")
+        assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.AUTOTUNE
+        assert GlobalBackendManager.get_gemm_backend(PrecisionType.FP4) == BackendType.HIPBLASLT
+        assert GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_FP16_FP32) == BackendType.HIPBLASLT
+
+    def test_autotune_grouped_gemm_backend(self, monkeypatch):
+        monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_BACKEND", "fp4:autotune,other:ck")
+        assert GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4) == BackendType.AUTOTUNE
+        assert GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8) == BackendType.CK
+
+    def test_autotune_moe_dispatch_combine_rejected(self, monkeypatch):
+        """MoE dispatch/combine picks an EP backend and has no AutoTune path."""
+        monkeypatch.setenv("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND", "autotune")
+        with pytest.raises(AssertionError, match="AUTOTUNE is not supported"):
+            GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_FP16_FP32)
+
 
 class TestGlobalBackendManagerFunction:
     @staticmethod

@@ -14,6 +14,7 @@ from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_
 from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
+    AutoTuneEntry,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -430,6 +431,7 @@ _GEMM_FP8_BACKENDS = {
     BackendType.CK: BackendEntry(GEMMFP8CKBackend),
     BackendType.TRITON: BackendEntry(GEMMFP8TritonBackend),
     BackendType.FLYDSL: BackendEntry(GEMMFP8FlyDSLBackend),
+    BackendType.AUTOTUNE: AutoTuneEntry(),
 }
 
 

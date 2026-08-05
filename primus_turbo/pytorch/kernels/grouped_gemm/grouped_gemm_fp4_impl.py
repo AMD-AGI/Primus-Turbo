@@ -20,6 +20,7 @@ caller slices ``[:total_m]``; ``group_offs_out`` packs each group tight.
 import torch
 
 from primus_turbo.pytorch.core.backend import (
+    AutoTuneEntry,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -189,6 +190,7 @@ class GroupedGEMMFP4KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
         BackendType.FLYDSL: BackendEntry(GroupedGEMMFP4FlyDSLBackend),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP4TritonBackend),
+        BackendType.AUTOTUNE: AutoTuneEntry(),
     }
     _cache = TuneCache(1024)
 
@@ -379,6 +381,7 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
     _backends = {
         BackendType.FLYDSL: BackendEntry(GroupedGEMMFP4VariableKFlyDSLBackend),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP4VariableKTritonBackend),
+        BackendType.AUTOTUNE: AutoTuneEntry(),
     }
     _cache = TuneCache(1024)
 

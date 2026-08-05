@@ -7,6 +7,7 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import (
+    AutoTuneEntry,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -374,6 +375,7 @@ _GROUPED_GEMM_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMTritonBackend),
+    BackendType.AUTOTUNE: AutoTuneEntry(),
 }
 
 
@@ -431,6 +433,7 @@ _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMVariableKCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMVariableKHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMVariableKTritonBackend),
+    BackendType.AUTOTUNE: AutoTuneEntry(),
 }
 
 
