@@ -41,6 +41,33 @@ def ceildiv_pow2(a, b: int):
     return (a + (b - 1)) >> (b.bit_length() - 1)
 
 
+def _u32(v):
+    return _raw(fx.Int32(v) if isinstance(v, int) else v)
+
+
+def udiv(a, b):
+    """``a // b`` for device values proven non-negative (tile ids, group tile counts).
+
+    Python ``//`` on a device Int32 is arith.floordivsi: a magic multiply *plus* a
+    remainder and a sign fixup (``s_cmp_lg`` + ``s_cselect_b64`` + ``s_and_b64`` +
+    ``s_subb_u32``), ~12 SALU where the unsigned form is 1-3. On the grouped tile-decode
+    chain -- which is what gates a tile's first g2s -- those ops are fully exposed."""
+    return ArithValue(arith.divui(_u32(a), _u32(b)))
+
+
+def umod(a, b):
+    """``a % b`` for device values proven non-negative; see ``udiv``."""
+    return ArithValue(arith.remui(_u32(a), _u32(b)))
+
+
+def uindex(v):
+    """``arith.index_cast(T.index, v)`` for a device value proven non-negative (row/tile/group
+    offsets). The signed cast sign-extends, so every SRD base and extent derived from it carries
+    an ``s_ashr_i32`` plus a 64-bit multiply-and-carry chain; the unsigned cast zero-extends and
+    the high half folds to zero."""
+    return ArithValue(arith.index_castui(T.index, _raw(v)))
+
+
 _PRESHUF_KT = 16  # scale-preshuffle k-tile (rows*KT dwords staged in LDS per workgroup)
 
 
@@ -192,6 +219,41 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
     return offsets
 
 
+def compute_global_swizzle_shear(lane_id, wave_id, K, n_rounds, m_row, ksm, up):
+    """compute_global_swizzle(preshuffled=False) with every row's 128B fetch snapped to the
+    cache line that encloses it, for a row pitch whose ``K % 128 == ksm != 0``.
+
+    Row r of the tile starts ``sh = ((m_row + r) * ksm) % 128`` bytes into a line, so its raw
+    128B K-block straddles two lines and costs two L1->L2 requests instead of one. Rounding
+    the fetch window to the line boundary makes it one request; the window then no longer
+    holds the K-block a phase wants, and ``S2RLoaderShear`` puts the two halves back together
+    out of two consecutive windows. ``up=False`` rounds the window down (partner = slot k+1),
+    ``up=True`` rounds it up (partner = slot k-1). ksm must be a multiple of 16 so a 16B read
+    never straddles the window edge.
+
+    Offsets are relative to an A SRD rebased by ``-((m_row * ksm) % 128)``; that keeps every
+    offset non-negative and leaves the unsheared halves addressable with a plain ``+ mbias``.
+    """
+    assert ksm % 16 == 0 and 0 < ksm < 128
+    mbias = (m_row * fx.Int32(ksm)) % fx.Int32(128)
+    offsets = []
+    n_waves = fx.block_dim.x // 64
+    for round in range_constexpr(n_rounds):
+        row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
+        col = (lane_id % 8) * 16
+        r, c = swizzle_128(row, col)
+        sh = ((m_row + row) * fx.Int32(ksm)) % fx.Int32(128)
+        disp = ((fx.Int32(128) - sh) % fx.Int32(128)) if const_expr(up) else (fx.Int32(0) - sh)
+        offsets.append(r * K + c + mbias + disp)
+    return offsets
+
+
+def shear_mbias(m_row, ksm):
+    """Byte bias that ``compute_global_swizzle_shear`` assumes was taken off the A SRD base.
+    Unsheared halves of the same operand add it back to their own offsets."""
+    return (m_row * fx.Int32(ksm)) % fx.Int32(128)
+
+
 class G2SLoader:
     def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, chunk_stride=1024, rebase=None):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
@@ -307,6 +369,50 @@ class S2RLoader(_S2RLoaderBase):
                 addrs.append(base + fx.Int32(offset))
             out.append(addrs)
         return out
+
+
+class S2RLoaderShear(S2RLoader):
+    """S2RLoader twin for an operand fetched with ``compute_global_swizzle_shear``.
+
+    The g2s wrote each row's line-aligned window, displaced from the row's own K-blocks by
+    ``sh = ((m_row + row) * ksm) % 128``. Byte ``col`` of K-block k therefore sits at
+    ``(col + sh) % 128`` of window k, except for the bytes that fell past the window edge --
+    those live in the partner window (k-1 when the g2s rounded up, k+1 when it rounded down).
+    Both LDS pools are already resident, so this costs no extra traffic; pick ``up`` so the
+    partner is the slot the pipeline has already drained.
+
+    ``ksm == 64`` makes the whole splice free: ``sh`` is then 0 or 64, so ``(col + sh) % 128``
+    is ``col ^ sh`` and folds into the XOR bank-swizzle key, and the two 16B steps of a
+    fragment split statically -- step 0 (col < 64) is always the partner window's half and
+    step 1 always the current window's. What is left over the plain ``S2RLoader`` is one
+    ``v_cndmask`` per call to pick the base.
+    """
+
+    def __init__(self, wave_idx, n_tiles, m_row, ksm, up):
+        super().__init__(wave_idx, n_tiles)
+        assert ksm == 64 and up, "only the round-up 64B shear is implemented"
+        self.m_row = m_row
+
+    def load(self, lds_cur, lds_partner):
+        delta = fx.Int32(fx.ptrtoint(lds_partner.ptr)) - fx.Int32(fx.ptrtoint(lds_cur.ptr))
+        # n_tiles*16 and i*16 are even, so a fragment row's parity is the lane's parity.
+        odd = ((self.m_row + self.lane_id) & fx.Int32(1)) == fx.Int32(1)
+        sh = arith.select(odd, fx.Int32(64), fx.Int32(0))
+        pdelta = arith.select(odd, delta, fx.Int32(0))
+        frag = []
+        for i in range_constexpr(self.n_tiles):
+            halves = []
+            row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
+            key = (lds_row_swizzle(row, 8) * 16) ^ sh
+            for step in range_constexpr(2):
+                col = (self.lane_id // 16) * 16 + step * 64
+                offset = row * 128 + (col ^ key)
+                if const_expr(step == 0):
+                    offset = offset + pdelta
+                v = self._vec_load_16xf8(lds_cur, offset)
+                halves.append(v.bitcast(fx.Int32))
+            frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
+        return frag
 
 
 def wait_barrier(count):
@@ -553,6 +659,56 @@ def _wave_count_le_i32(v, bound):
 def _lane_load_i32(rsrc, idx):
     """One per-lane i32 gather from a buffer resource; out-of-range lanes read 0."""
     return ArithValue(_buffer_ops.buffer_load(rsrc, idx, vec_width=1, dtype=T.i32))
+
+
+def _sload_i32(rsrc, idx):
+    """One wave-uniform i32 read on the scalar path: ``s_buffer_load`` straight into an SGPR.
+
+    ``idx`` is a compile-time i32-element index into the resource. The value never enters the
+    VGPR file, so a consumer chain waits on lgkmcnt instead of parking a ``vmcnt(0)`` drain on
+    the vector path, and the read is served by the scalar cache rather than the vL1D that the
+    g2s stream evicts every tile. (Emitted as the raw intrinsic: `buffer_load(is_scalar=)` is
+    not in every flydsl build.)"""
+    i32_t = ir.IntegerType.get_signless(32)
+    rsrc_v4 = _llvm.bitcast(
+        ir.VectorType.get([4], i32_t), _llvm.ptrtoint(ir.IntegerType.get_signless(128), _raw(rsrc))
+    )
+    args = [rsrc_v4, _raw(fx.Int32(idx * 4)), _raw(fx.Int32(0))]  # rsrc, byte offset, cache policy
+    return ArithValue(_llvm.call_intrinsic(i32_t, "llvm.amdgcn.s.buffer.load.i32", args, [], []))
+
+
+# SGPR-resident int32 table (entry i in its own SGPR): small-table twin of the lane-resident
+# table above. Lookup is a select chain and the prefix sum is unrolled SALU, both O(n_entries),
+# so it only pays while the table is short -- but it keeps the whole group scan off the vector
+# path: no per-lane gather, no DPP wave scan, no v_readlane -> SALU hazard.
+def _sgpr_tbl_load(rsrc, n_entries, stride=1, first=0):
+    """Read entries [0, n_entries) of an i32 buffer view into SGPRs; entry i is i32 element
+    ``(i + first) * stride``. All loads are in flight under one lgkmcnt."""
+    return [_sload_i32(rsrc, (i + first) * stride) for i in range_constexpr(n_entries)]
+
+
+def _sgpr_tbl_scan(tbl):
+    """Inclusive add-scan of an SGPR-resident table (entry i = sum of entries 0..i)."""
+    out = []
+    acc = tbl[0]
+    out.append(acc)
+    for v in tbl[1:]:
+        acc = acc + v
+        out.append(acc)
+    return out
+
+
+def _sgpr_tbl_pick(bounds, key, tables):
+    """Decode ``key`` against the monotone boundary table ``bounds`` (``bounds[g]`` = first key
+    owned by group g+1) and return one entry per table in ``tables``, all from the owning
+    group. One compare per boundary drives every table's ``s_cselect`` directly -- cheaper than
+    materialising the group index first (count_le + a select chain per table), which pays an
+    extra i1 -> VALU -> readfirstlane round trip just to get the index."""
+    outs = [t[0] for t in tables]
+    for g in range_constexpr(1, len(tables[0])):
+        take = key >= bounds[g - 1]
+        outs = [ArithValue(arith.select(take, t[g], o)) for t, o in zip(tables, outs)]
+    return outs
 
 
 # Lane-resident int32 table (entry i in lane i%64 of chunk i//64): avoids SGPR overflow past ~64 entries and LDS publish-barrier/ds_read; lookup = one v_readlane, prefix sum = one wave scan.
@@ -953,6 +1109,23 @@ def xcd_remap_pid(pid, total_pids, num_xcd):
     xcd = pid % num_xcd
     local = pid // num_xcd
     offset = xcd * per_xcd + arith.select(xcd < rem, xcd, rem)
+    return offset + local
+
+
+def xcd_remap_pid_u(pid, total_pids, num_xcd):
+    """``xcd_remap_pid`` on ids proven non-negative: same bijection, unsigned divides.
+
+    Signed ``pid % num_xcd`` / ``pid // num_xcd`` cost a floor-div fixup each -- 19 SALU for
+    num_xcd=4 where the unsigned power-of-two forms are one mask and one shift. Kept as a
+    separate entry point so the signed callers (dense, wgrad, mxfp4/mxfp8 grouped) keep
+    byte-identical ISA."""
+    if num_xcd <= 1:
+        return pid
+    per_xcd = udiv(total_pids, num_xcd)  # floor
+    rem = total_pids - per_xcd * num_xcd
+    xcd = umod(pid, num_xcd)
+    local = udiv(pid, num_xcd)
+    offset = xcd * per_xcd + ArithValue(arith.minui(_u32(xcd), _u32(rem)))
     return offset + local
 
 
