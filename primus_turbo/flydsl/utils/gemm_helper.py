@@ -179,7 +179,16 @@ def swizzle_128(row, col, width=128):
     return row, col ^ (lds_row_swizzle(row, width // 16) * 16)
 
 
-def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
+def pair_major_row(row):
+    """Pair-major renumbering inside each 32-row wave slice: 32q + 16t + j -> 32q + 2j + t.
+    An n-operand's two mfma fragments (t) sit 16 LDS rows apart, so a lane holds output
+    columns 16 apart; feeding LDS row 32q+16t+j from global row 32q+2j+t instead makes the
+    pair ADJACENT and lets the epilogue store both in one dword. Bijective inside the
+    slice, so the LDS layout, its swizzle key and the operand's row bound are unchanged."""
+    return (row // 32) * 32 + (row % 16) * 2 + (row % 32) // 16
+
+
+def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled, row_pair=False):
     offsets = []
     n_waves = fx.block_dim.x // 64
     for round in range_constexpr(n_rounds):
@@ -197,12 +206,23 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
             row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
             col = (lane_id % 8) * 16
             r, c = swizzle_128(row, col)
+            if const_expr(row_pair):
+                r = pair_major_row(r)
             offsets.append(r * K + c)
     return offsets
 
 
 class G2SLoader:
-    def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, chunk_stride=1024, rebase=None):
+    def __init__(
+        self,
+        gl_src,
+        gl_offsets,
+        n_load_steps,
+        lds_dtype,
+        wave_id,
+        chunk_stride=1024,
+        rebase=None,
+    ):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
@@ -243,8 +263,7 @@ class G2SLoader:
         base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
         if base_off is not None:  # runtime LDS-stage byte offset (double-buffer parity)
             base_i32 = base_i32 + base_off
-        sum_i32 = base_i32 + fx.Int32(step_off)
-        lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
+        lds_ptr = fx.inttoptr(self.LdsPtr_t, base_i32 + fx.Int32(step_off))
         return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
     def load(self, lds_dst, k_offset, base_off=None):
@@ -664,10 +683,19 @@ class StoreCPerTensor:
         store_aux=0,
         trans=False,
         c_base=None,
+        pack_cols=0,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.col_safe = col_safe
+        # pack_cols (0=off, 2): the caller has permuted its B feed so a lane's two
+        # n-fragments are ADJACENT output columns (2*(lane%16)+t) instead of 16 apart, so one
+        # buffer_store carries both and the f32->out_ty converts pack into v_cvt_pk_bf16_f32.
+        # A row's coalesced run grows 32B -> 64B. Needs n_tiles_b==2 and col_safe (the pair
+        # is written as one unit, so it cannot be OOB-clamped per column).
+        self.pack_cols = int(pack_cols)
+        assert self.pack_cols in (0, 2)
+        assert not pack_cols or (n_tiles_b == 2 and col_safe), "pack_cols needs n_tiles_b==2 + col_safe"
         # trans: transposed scalar store for the A/B-swapped wgrad swap_n boundary body (frag row=N, col=M, written C[m,n]); square OUT_M==OUT_N tiles only.
         self.trans = trans
         self.store_aux = store_aux
@@ -721,7 +749,13 @@ class StoreCPerTensor:
         # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         quads = [(0, c_frag)] + [(int(d), f) for d, f in col_frags]
-        col0 = base_col + self.lane_id % 16
+        col0 = base_col + (self.lane_id % 16) * (self.pack_cols or 1)
+        # One packed store per quadrant: the quadrants stay apart (their column delta rides
+        # the buffer immediate) and the pair inside one is the n-fragment order tj.
+        if const_expr(self.pack_cols):
+            _groups = [[(q, tj) for tj in range_constexpr(self.n_tiles_b)] for q in range_constexpr(len(quads))]
+        else:
+            _groups = []
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             # Whole-fragment scale: the wave-uniform per-tensor scale packs to v_pk_mul_f32, bit-identical to the per-element form.
@@ -734,6 +768,24 @@ class StoreCPerTensor:
             ]
             for i in range_constexpr(4):
                 row_off = ((row_local + i) * self.c_cols + col0) * 2  # i32-small within band
+                if const_expr(self.pack_cols):
+                    for g in range_constexpr(len(_groups)):
+                        vals = []
+                        for e in range_constexpr(len(_groups[g])):
+                            q, tj = _groups[g][e]
+                            v = vecs[q][tj][i]
+                            if self.elem_fn is not None:
+                                v = self.elem_fn(v)
+                            vals.append(v.to(self.out_ty))
+                        dcol = quads[_groups[g][0][0]][0]
+                        _buffer_ops.buffer_store(
+                            Vec.from_elements(vals, self.out_ty),
+                            rsrc,
+                            row_off if dcol == 0 else row_off + dcol * 2,
+                            cache_modifier=self.store_aux,
+                            offset_is_bytes=True,
+                        )
+                    continue
                 for q in range_constexpr(len(quads)):
                     for tj in range_constexpr(self.n_tiles_b):
                         dcol = quads[q][0] + tj * 16
@@ -1370,6 +1422,7 @@ def _emit_lds_repack(
     pack=1,
     kbound=None,
     k128p=None,
+    b_pair=False,
 ):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
@@ -1390,8 +1443,13 @@ def _emit_lds_repack(
             grow = grp * 64 + rr  # A: rows grp*64 + (s*16+r)
         else:
             s = rr // 16  # B-comb: row = nblk*256 + wn*32 + OFF[s] + rinner
-            off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
-            grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
+            if b_pair:
+                # b_pair: the reader's n-operand is fed pair-major (see pair_major_row), so
+                # fragment s of lane rinner takes the scale of row 128*(s//2) + 2*rinner + s%2.
+                off = (grp % 4) * 32 + (s // 2) * fx.Int32(128) + (rr % 16) * 2 + (s % 2)
+            else:
+                off = (grp % 4) * 32 + (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128) + (rr % 16)
+            grow = (grp // 4) * 256 + off
         dw = _buffer_ops.buffer_load(
             rin,
             grow * K128 + gk + rd_base,
