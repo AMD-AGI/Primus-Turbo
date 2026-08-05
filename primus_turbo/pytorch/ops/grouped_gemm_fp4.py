@@ -186,12 +186,13 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         a_col, a_col_scale, b_col, b_col_scale, group_lens, group_offs = ctx.saved_tensors
 
         # --- grad_out: fused grouped dual-quant in one 16-bit read
-        # FlyDSL variable-K wgrad consumes the same 512-aligned colwise
-        # layout produced for the saved activation. The HIP stochastic-rounding
-        # quantizer uses a different alignment, so enabling gradient SR here
-        # makes the two contraction operands incompatible.
-        grad_out_scaling_recipe = ScalingRecipe(use_sr=False)
-        grad_out_t_scaling_recipe = ScalingRecipe(use_sr=False, use_rht=True)
+        # FlyDSL SR support keeps both operands on the same 512-aligned layout,
+        # so stochastic rounding can follow the caller's quantization recipe.
+        grad_out_scaling_recipe = ScalingRecipe(use_sr=ctx.config.use_gradient_sr)
+        grad_out_t_scaling_recipe = ScalingRecipe(
+            use_sr=ctx.config.use_gradient_sr,
+            use_rht=True,
+        )
         (
             grad_out_fp4_row,
             grad_out_scale_row,
