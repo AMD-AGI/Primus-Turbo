@@ -12,6 +12,8 @@ import torch
 
 from primus_turbo.pytorch.core.backend import (
     BackendType,
+    GlobalBackendManager,
+    PrecisionType,
 )
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
@@ -459,9 +461,12 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
-        # K-pad fast path: a non-128-aligned K makes the fp8 row stride split each vector load across a 128B line, so cast-and-pad both operands to Kp=ceil128(K) (pad cols contribute 0*0=0, GEMM unchanged). Raw NT inputs only.
+        # FlyDSL-only K-pad fast path: respect an explicitly selected Triton
+        # backend instead of silently routing its forward pass through FlyDSL.
         _kpad = (
-            trans_b
+            GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+            == BackendType.FLYDSL
+            and trans_b
             and not isinstance(a, QuantizedTensor)
             and not isinstance(b, QuantizedTensor)
             and a.dim() == 2
