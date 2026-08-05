@@ -494,12 +494,12 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
-        from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
             grouped_gemm_fp8_tensorwise_flydsl_kernel,
         )
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import (
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import (
                 grouped_gemm_mxfp8_flydsl_kernel,
             )
 
@@ -742,7 +742,7 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
-        from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
             grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel,
         )
 
@@ -755,7 +755,7 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
             lhs_scales, rhs_scales = a_scales, b_scales
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import (
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import (
                 grouped_gemm_mxfp8_variable_k_flydsl_kernel,
             )
 

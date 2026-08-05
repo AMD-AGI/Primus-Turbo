@@ -454,12 +454,12 @@ def test_ck_grouped_gemm_op_ws_num_cu_below_num_xcds(num_cu):
     (The public API rejects num_cu != None + schedule="work_steal", but the
     cpp op ``ck_grouped_gemm`` still accepts the combination -- belt-and-
     braces.)"""
-    from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
-        _get_ck_ws_counter,
-    )
-    from primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic import (
+    from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_ck_ws_heuristic import (
         approximate_ck_standard_total_tiles,
         resolve_ck_ws_local_per_xcd,
+    )
+    from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
+        _get_ck_ws_counter,
     )
 
     device = "cuda"
