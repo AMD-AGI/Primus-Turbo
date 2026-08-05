@@ -482,6 +482,32 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
     return launch
 
 
+_WEIGHT_GENERATION = [0]
+
+
+def advance_weight_generation() -> None:
+    """Invalidate every cached fp8 weight derivative. Call once per optimizer step.
+
+    A weight update has to invalidate THREE caches, and none of them can detect it on its own: the
+    quantized weight (was keyed on ``w._version``, which Megatron's precision-aware optimizer never
+    bumps) and the flattened / preshuffled copies the GEMM actually contracts (keyed on
+    ``w1q.data_ptr()``, which does not move when the quantization is rewritten in place -- and did
+    not move even when it was reallocated, because the allocator hands back the block it just
+    freed). All three missing the update is why the fp8 experts trained on their step-0 weights.
+
+    Megatron already publishes the right signal: the pipeline schedule calls
+    ``model.set_is_first_microbatch()`` on the first microbatch of each step, which is exactly when
+    the weight has changed and no microbatch of this step has consumed it yet. Driving one counter
+    from there beats three caches each guessing.
+    """
+    _WEIGHT_GENERATION[0] += 1
+
+
+def weight_generation() -> int:
+    """The current weight generation; include it in any cache key derived from a weight."""
+    return _WEIGHT_GENERATION[0]
+
+
 def colwise_grouped_meta(
     group_lens: torch.Tensor, group_offs: torch.Tensor, pool_rows: Optional[int] = None
 ):

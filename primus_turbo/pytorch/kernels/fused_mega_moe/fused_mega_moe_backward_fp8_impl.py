@@ -51,7 +51,7 @@ __all__ = [
 
 # dW2/dW1 wgrad fp8 encoding: E5M2 (gradient dynamic range). E4M3 measured slightly higher SNR at
 # DSv3 magnitudes -- flip to float8_e4m3 to compare (gate by dW SNR + few-step training loss).
-_DW_FP8_FORMAT = float8_e5m2
+_DW_FP8_FORMAT = torch.float8_e4m3fn  # ablation: was float8_e5m2
 
 # The L2 dgrad reuses the FORWARD dispatch+GEMM kernel with this CU split (the dgrad shape N=I
 # prefers more comm CUs / fewer preshuffle CUs than the forward's N=2I default of 16/16).

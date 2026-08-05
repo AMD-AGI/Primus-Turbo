@@ -69,6 +69,7 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 from primus_turbo.flydsl.mega.fp8.quant import (
     preshuffle_b_scale,
     quantize_rowwise_mxfp8_flydsl,
+    weight_generation,
 )
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
@@ -82,8 +83,8 @@ _H_ORIGIN_SLOT = 13  # appended by this module: per-call pool row -> owning topk
 
 _FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip per-call @flyc.jit dispatch)
 _BSP_CACHE: dict = {}  # (weight data_ptr, G, N, K) -> preshuffled weight scale b_sp (weights static)
-_WEIGHTS_FLAT_CACHE: dict = {}  # (w1q data_ptr, G, N, K) -> int8 flat WEIGHTS view (weights static)
-_L1_OUTPUT_SCRATCH: dict = {}  # (P, N, dtype, device) -> bf16 L1 output buffer (fixed training shape)
+_WEIGHTS_FLAT_CACHE: dict = {}  # (w1q data_ptr, G, N, K) -> int8 flat WEIGHTS, per weight generation
+_WEIGHT_CACHE_GEN = [-1]  # generation the two caches above currently hold
 
 
 def _make_fwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, tile_ps):
@@ -501,6 +502,15 @@ def dispatch_grouped_gemm_mxfp8(
         xs_c = xs_c.view(torch.uint8)
     XQ = xq_c.view(torch.int32)
     XS = xs_c.view(torch.int32)
+    # The generation has to be in these keys. data_ptr alone cannot see a weight update: the
+    # quantization is rewritten in place, and even when it was reallocated the allocator handed back
+    # the block it had just freed, so the pointer was stable across steps and these two caches served
+    # the step-0 flatten / preshuffle for the whole run -- the fp8 experts never saw a new weight.
+    _gen = weight_generation()
+    if _WEIGHT_CACHE_GEN[0] != _gen:
+        _WEIGHTS_FLAT_CACHE.clear()
+        _BSP_CACHE.clear()
+        _WEIGHT_CACHE_GEN[0] = _gen
     _wk = (w1q.data_ptr(), G, N, K)
     WEIGHTS = _WEIGHTS_FLAT_CACHE.get(_wk)
     if WEIGHTS is None:
@@ -517,11 +527,13 @@ def dispatch_grouped_gemm_mxfp8(
     # it into: a call that reuses a handle (the backward) would otherwise pair its own tile table
     # with whatever count the most recent prologue left there.
     num_tile_blocks = handle[_H_NUM_TILE_BLOCKS]
-    _out_sk = (num_max_pool_tokens, N, out_dtype, dev)
-    output = _L1_OUTPUT_SCRATCH.get(_out_sk)
-    if output is None:
-        output = torch.empty((num_max_pool_tokens, N), dtype=out_dtype, device=dev)
-        _L1_OUTPUT_SCRATCH[_out_sk] = output
+    # Fresh per call, like the bf16 dispatch. A shared scratch keyed on the shape looks free -- the
+    # training shape never changes -- but l1 is the SwiGLU backward's input, so it has to survive
+    # until this layer's backward. Sharing it means the next layer's forward overwrites it first, and
+    # every layer but the last computes its expert gradients from another layer's fc1 output. That is
+    # invisible with one MoE layer and grows with depth: 20 steps at 2 layers drifted 1.52 in loss
+    # against bf16, where one layer drifts 0.07.
+    output = torch.empty((num_max_pool_tokens, N), dtype=out_dtype, device=dev)
     output_flat = output.view(-1)
 
     raw = _compile(

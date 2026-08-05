@@ -12,6 +12,8 @@ a live symm buffer the backward reuses, plus non-tensor handles.
 
 from typing import Tuple
 
+import functools
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -23,6 +25,7 @@ from primus_turbo.flydsl.mega.fp8 import (
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     prepare_dw1_pool_operand_fp8,
 )
+from primus_turbo.flydsl.mega.fp8 import weight_generation
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
     prepare_w1_fp8,
     prepare_w2_fp8,
@@ -44,23 +47,51 @@ _L1_NUM_PRESHUFFLE_CU = 16
 _L2_NUM_COMBINE_CU = 32
 
 
-def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
-    """Cache ``prep(w)`` on the weight tensor, keyed by ``w._version``.
+_PREP_BUFFERS: dict = {}
+_PREP_FRESH: dict = {}
+_PREP_STATE = {"warned": False}
 
-    Stashing on the tensor rather than in a global dict keeps this per-weight: it scales to many
-    layers with no size cap, and frees with the weight. Keying on ``_version`` (bumped by
-    ``optim.step()``) is what makes reuse safe -- never key this off an activation id."""
-    v = getattr(w, "_version", 0)
-    ent = getattr(w, attr, None)
-    if ent is not None and ent[0] == v:
-        return ent[1]
+
+def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
+    """Quantize ``w`` once per optimizer step, into buffers that live for the whole run.
+
+    The quantized weight has a fixed shape, so it gets one allocation per weight and is rewritten in
+    place -- the same footprint the original never-refreshing cache had. Handing back a NEW tensor
+    each step is what made this leak: the old one is released only if nothing else references it, and
+    a live autograd graph does, so the copies piled up a step at a time (+41 GB by iteration 17, then
+    HIP OOM). ``prep`` still allocates a temporary, freed as soon as it is copied in, so the peak is
+    one persistent set plus one transient rather than one set per step.
+
+    Rewriting in place is safe only because every microbatch backward of step N finishes before the
+    first forward of step N+1, which is when the refresh happens, so no saved tensor from a live
+    graph can still point at these bytes. ``_version`` stays in the key so an in-place write that
+    does bump it still invalidates."""
+    key = (attr, w.data_ptr(), tuple(w.shape))
+    gen = (weight_generation(), getattr(w, "_version", 0))
+    buf = _PREP_BUFFERS.get(key)
+    if buf is not None and _PREP_FRESH.get(key) == gen:
+        return buf
+    if buf is not None and weight_generation() == 0 and w.grad is not None and not _PREP_STATE["warned"]:
+        # Reuse is only safe while something advances the generation. A whole backward has run and
+        # the generation never moved, so this is about to serve step-0 weights for the rest of the
+        # run -- invisible in the loss at first, then a model that stops learning.
+        _PREP_STATE["warned"] = True
+        print(
+            "[mega fp8] WARNING: the fp8 weight caches were never invalidated, so the experts are "
+            "about to keep training on their step-0 weights. Whoever owns the expert module must "
+            "call advance_weight_generation() once per optimizer step.",
+            flush=True,
+        )
     with torch.no_grad():
         out = prep(w)
-    try:
-        setattr(w, attr, (v, out))
-    except (AttributeError, RuntimeError):
-        pass  # can't stash on this tensor (rare) -> return freshly computed, no caching
-    return out
+    if buf is None:
+        _PREP_BUFFERS[key] = buf = out
+    else:
+        for dst, src in zip(buf, out):
+            dst.copy_(src)
+        del out  # release the temporary before returning, so steady-state stays one set
+    _PREP_FRESH[key] = gen
+    return buf
 
 
 def _w1_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

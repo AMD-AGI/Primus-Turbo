@@ -161,7 +161,14 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
             topk_idx, topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=K, num_experts=E,
             world_size=world, rank=rank, experts_per_rank=epr, block_m=BM,
             num_max_pool_tokens=symm.num_max_pool_tokens,
-        ))
+        )) + (
+            # The launcher appends these three per-call snapshots and the kernels index them by
+            # position, so a hand-built handle has to carry them too (see
+            # dispatch_grouped_gemm_mxfp8_flydsl_kernel).
+            symm.meta_scalars[1:2].clone(),
+            symm.origin_rank.clone(),
+            symm.origin_slot.clone(),
+        )
         w1q, w1s = quantize_grouped_weight_mxfp8(W1)  # static weight quant (out of the timed step)
         num_tile_blocks = symm.meta_scalars[1:2]
 
