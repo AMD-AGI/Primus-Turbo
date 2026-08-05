@@ -245,6 +245,49 @@ def test_quantize_fp8_blockwise_for_weight(orig_dtype, dest_dtype, batched, B, M
     torch.testing.assert_close(x, out, **get_tolerances(dest_dtype))
 
 
+@pytest.mark.parametrize("row_scale_transposed", [False, True])
+def test_quantize_fp8_blockwise_flydsl(row_scale_transposed):
+    from flydsl.runtime.device import get_rocm_arch
+
+    if not str(get_rocm_arch()).startswith("gfx95"):
+        pytest.skip("FlyDSL blockwise FP8 quantization is gfx950-only")
+
+    from primus_turbo.flydsl.quantization.blockwise_fp8_quant import (
+        quantize_blockwise_fp8_dual,
+        quantize_blockwise_fp8_weight,
+    )
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        quant_fp8_blockwise_dual_impl,
+        quant_fp8_blockwise_for_weight_impl,
+    )
+
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(137)
+
+    x = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16, generator=generator)
+    row_ref, row_scale_ref, col_ref, col_scale_ref = quant_fp8_blockwise_dual_impl(
+        x,
+        turbo.float8_e4m3,
+        128,
+        col_transposed=True,
+        row_scale_transposed=row_scale_transposed,
+    )
+    row, row_scale, col, col_scale = quantize_blockwise_fp8_dual(
+        x,
+        row_scale_transposed=row_scale_transposed,
+    )
+    torch.testing.assert_close(row, row_ref, rtol=0, atol=0)
+    torch.testing.assert_close(row_scale, row_scale_ref, rtol=0, atol=0)
+    torch.testing.assert_close(col, col_ref, rtol=0, atol=0)
+    torch.testing.assert_close(col_scale, col_scale_ref, rtol=0, atol=0)
+
+    weight = torch.randn((192, 256), device="cuda", dtype=torch.bfloat16, generator=generator)
+    weight_ref, weight_scale_ref = quant_fp8_blockwise_for_weight_impl(weight, turbo.float8_e4m3, 128)
+    weight_fp8, weight_scale = quantize_blockwise_fp8_weight(weight)
+    torch.testing.assert_close(weight_fp8, weight_ref, rtol=0, atol=0)
+    torch.testing.assert_close(weight_scale, weight_scale_ref, rtol=0, atol=0)
+
+
 def padding_size(n: int, padding_align_size: int) -> int:
     return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
 

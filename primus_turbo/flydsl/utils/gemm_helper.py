@@ -161,7 +161,7 @@ def swizzle_128(row, col, width=128):
     return swizzled_offset // width, swizzled_offset % width
 
 
-def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
+def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled=False):
     offsets = []
     n_waves = fx.block_dim.x // 64
     for round in range_constexpr(n_rounds):
@@ -236,6 +236,12 @@ class G2SLoader:
             dst = self._lds_dst_at(lds_dst, step, base_off)
             fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
 
+    def load_one(self, lds_dst, k_offset, step, base_off=None):
+        src_div, soff = self._src_div(k_offset)
+        src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
+        dst = self._lds_dst_at(lds_dst, step, base_off)
+        fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
+
 
 def pack_i32x4_i32x8(lo, hi):
     # Pack two i32x4 as one i32x8
@@ -276,6 +282,9 @@ class S2RLoader(_S2RLoaderBase):
                 halves.append(v.bitcast(fx.Int32))
             frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
         return frag
+
+    def load_one(self, lds_src, lds_offset):
+        return self._vec_load_16xf8(lds_src, lds_offset).bitcast(fx.Int32)
 
     def base_addr(self, lds_src, preshuffled=False):
         """Per-lane LDS byte address pairs for the bare-asm whole-loop: mirrors `load()`'s

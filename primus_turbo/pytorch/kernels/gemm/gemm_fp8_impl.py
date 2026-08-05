@@ -345,13 +345,25 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
     TENSORWISE: scalar a_scale/b_scale, bf16/fp16 out, arbitrary M/N/K, layouts
     NT/NN/TN (TT unsupported). trans_c via post-hoc transpose.
 
+    BLOCKWISE: FP32 inverse scales with block size 128, E4M3 operands and
+    bf16/fp16 output. NT/NN/TN use direction-specific wrappers around one
+    parameterized blockscale kernel.
+
     MX_BLOCKWISE: NT only, per-operand E4M3/E5M2 (incl. hybrid), bf16/fp16 out,
     per-1x32 raw E8M0 2D scales [M,K//32]/[N,K//32]. The kernel repacks the scales
     to its preshuffled layout, so execute() does no host-side padding.
     """
 
-    SUPPORTED_GRANULARITIES = {ScalingGranularity.TENSORWISE, ScalingGranularity.MX_BLOCKWISE}
+    SUPPORTED_GRANULARITIES = {
+        ScalingGranularity.TENSORWISE,
+        ScalingGranularity.BLOCKWISE,
+        ScalingGranularity.MX_BLOCKWISE,
+    }
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
+    SUPPORTED_DTYPES_BLOCKWISE = {
+        (float8_e4m3, float8_e4m3, torch.float16),
+        (float8_e4m3, float8_e4m3, torch.bfloat16),
+    }
 
     @staticmethod
     def can_handle(
@@ -365,26 +377,57 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ) -> bool:
-        supported = True
         # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
-        supported &= get_device_compute_capability() >= (9, 5)
-        supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
-        supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
+        if get_device_compute_capability() < (9, 5):
+            return False
+        if granularity not in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES:
+            return False
+        if out_dtype not in (torch.bfloat16, torch.float16):
+            return False
+
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+
+        if granularity == ScalingGranularity.BLOCKWISE:
+            if (a.dtype, b.dtype, out_dtype) not in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES_BLOCKWISE:
+                return False
+
+            if not trans_a and not trans_c:
+                from primus_turbo.flydsl.gemm import flydsl_blockwise_gemm_supported
+
+                return flydsl_blockwise_gemm_supported(
+                    m,
+                    n,
+                    k,
+                    allow_partial_n=trans_b,
+                )
+
+            if trans_a and not trans_b:
+                from primus_turbo.flydsl.gemm import flydsl_blockwise_wgrad_supported
+
+                return flydsl_blockwise_wgrad_supported(m, n, k)
+
+            return False
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # NT only; per-operand E4M3/E5M2; raw E8M0 2D scales [M,K//32]/[N,K//32].
-            supported &= (not trans_a) and trans_b
-            supported &= k % 128 == 0 and k >= 256
-            supported &= a_scale_inv.shape == (m, k // 32) and b_scale_inv.shape == (n, k // 32)
-            supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
-            return supported
+            if (a.dtype, b.dtype, out_dtype) not in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES:
+                return False
+            if trans_a or not trans_b:
+                return False
+            if k % 128 != 0 or k < 256:
+                return False
+            if a_scale_inv.shape != (m, k // 32) or b_scale_inv.shape != (n, k // 32):
+                return False
+            return a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
 
         # TENSORWISE: NT/NN/TN native (TT unsupported), scalar per-tensor scales.
-        supported &= not (trans_a and trans_b)
-        supported &= k > 128  # software pipeline needs >= 2 K tiles: ceil(K/128) >= 2
-        supported &= a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
-        return supported
+        if trans_a and trans_b:
+            return False
+        if (a.dtype, b.dtype, out_dtype) not in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES:
+            return False
+        if k < 129:  # software pipeline needs >= 2 K tiles: ceil(K/128) >= 2
+            return False
+        return a_scale_inv.numel() == 1 and b_scale_inv.numel() == 1
 
     @staticmethod
     def execute(
@@ -398,6 +441,22 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
+        if granularity == ScalingGranularity.BLOCKWISE:
+            if trans_a and not trans_b:
+                from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl_wgrad
+
+                out = gemm_fp8_blockwise_flydsl_wgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+                return out if trans_c else out.t().contiguous()
+
+            if trans_b:
+                from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl
+
+                return gemm_fp8_blockwise_flydsl(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+
+            from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl_dgrad
+
+            return gemm_fp8_blockwise_flydsl_dgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             out = gemm_mxfp8_flydsl_kernel(
                 a, a_scale_inv.view(torch.uint8), b, b_scale_inv.view(torch.uint8), out_dtype=out_dtype
