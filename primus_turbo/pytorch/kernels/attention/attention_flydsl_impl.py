@@ -153,7 +153,9 @@ def flash_attn_varlen_flydsl_backward_impl(
     assert wr in (0, -1), "only left-window (W,0) / full (-1,-1) supported"
     window_left = wl if wl >= 0 else -1
 
-    if _is_uniform(cu_seqlens_q):
+    # Both sides must be uniform: the rect16 fast path takes one (Sq, Skv) pair, so a
+    # uniform q paired with a ragged kv (uneven CP documents) has to go the ragged route.
+    if _is_uniform(cu_seqlens_q) and _is_uniform(cu_seqlens_k):
         B, Sq = _uniform_seqlen(cu_seqlens_q)
         Bk, Skv = _uniform_seqlen(cu_seqlens_k)
         assert B == Bk, f"q/k batch mismatch ({B} vs {Bk})"

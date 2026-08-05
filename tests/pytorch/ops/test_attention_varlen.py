@@ -115,26 +115,31 @@ FLYDSL_SEGS = [
 FLYDSL_WINDOWS = [(-1, -1), (1024, 0), (256, 0)]
 
 
-def _flydsl_block_diag_ref(q, k, v, do, cu, scale, win):
+def _flydsl_block_diag_ref(q, k, v, do, cu, scale, win, cu_k=None):
     """fp32 block-diagonal reference (per-segment bottom-right causal + optional left
-    window) for o and dq/dk/dv, matching the flydsl ragged document-masking contract."""
+    window) for o and dq/dk/dv, matching the flydsl ragged document-masking contract.
+    ``cu_k`` defaults to ``cu`` (square segments); pass it for seglen_q < seglen_kv."""
+    if cu_k is None:
+        cu_k = cu
     total_q, Hq, D = q.shape
     Hkv = k.shape[1]
     G = Hq // Hkv
     dev = q.device
     o = torch.empty(total_q, Hq, D, device=dev, dtype=torch.float32)
     dq = torch.empty_like(o)
-    dk = torch.empty(total_q, Hkv, D, device=dev, dtype=torch.float32)
+    dk = torch.empty(k.shape[0], Hkv, D, device=dev, dtype=torch.float32)
     dv = torch.empty_like(dk)
     for i in range(cu.numel() - 1):
         b, e = int(cu[i].item()), int(cu[i + 1].item())
-        S = e - b
+        kb, ke_ = int(cu_k[i].item()), int(cu_k[i + 1].item())
+        S, Sk = e - b, ke_ - kb
         qe = q[b:e].permute(1, 0, 2).float().detach().requires_grad_(True)
-        ke = k[b:e].permute(1, 0, 2).float().detach().requires_grad_(True)
-        ve = v[b:e].permute(1, 0, 2).float().detach().requires_grad_(True)
+        ke = k[kb:ke_].permute(1, 0, 2).float().detach().requires_grad_(True)
+        ve = v[kb:ke_].permute(1, 0, 2).float().detach().requires_grad_(True)
         sc = torch.matmul(qe, ke.repeat_interleave(G, 0).transpose(-1, -2)) * scale
-        qi = torch.arange(S, device=dev).view(1, S, 1)
-        kj = torch.arange(S, device=dev).view(1, 1, S)
+        # Bottom-right causal: query row i attends kv columns up to i + (Sk - S).
+        qi = torch.arange(S, device=dev).view(1, S, 1) + (Sk - S)
+        kj = torch.arange(Sk, device=dev).view(1, 1, Sk)
         mask = kj > qi
         if win >= 0:
             mask = mask | (kj < qi - win)
@@ -143,8 +148,8 @@ def _flydsl_block_diag_ref(q, k, v, do, cu, scale, win):
         os_.backward(do[b:e].permute(1, 0, 2).float())
         o[b:e] = os_.permute(1, 0, 2).detach()
         dq[b:e] = qe.grad.permute(1, 0, 2)
-        dk[b:e] = ke.grad.permute(1, 0, 2)
-        dv[b:e] = ve.grad.permute(1, 0, 2)
+        dk[kb:ke_] = ke.grad.permute(1, 0, 2)
+        dv[kb:ke_] = ve.grad.permute(1, 0, 2)
     return o, dq, dk, dv
 
 
@@ -197,6 +202,70 @@ def test_flydsl_flash_attn_varlen_blockcausal(segs, window):
         do, q, k, v, out, lse, cu, cu, maxs, maxs, softmax_scale=scale, causal=True, window_size=window
     )
     assert torch.equal(dq, dq2) and torch.equal(dk, dk2) and torch.equal(dv, dv2), "bwd not deterministic"
+
+
+# seqlen_q < seqlen_kv (context parallelism / KV cache): the bottom-right offset
+# Skv-Sq is then arbitrary, not a multiple of the bwd kv tile. Offsets 64/128 are the
+# aligned controls; the rest used to return a wrong dQ (the dq kernel split its causal
+# kv-loop at the unaligned q_start+offset, so the diagonal tile ran unmasked, its tail
+# was double-counted by the masked loop, and the LDS tile hand-over desynced).
+FLYDSL_RECT = [
+    ([96], [104]), ([96], [136]), ([96], [192]), ([96], [452]),  # +8, +40, +96, +356
+    ([96], [160]), ([128], [256]),  # +64, +128: BLOCK_KV-aligned controls
+    ([1000], [1033]), ([17], [528]),  # long/short q with an unaligned offset
+    ([96, 200, 33], [480, 456, 129]),  # ragged documents, per-segment q < kv
+    ([128, 128, 128], [128, 320, 192]),  # uniform q, ragged kv
+]
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="flydsl flash-attn is gfx950-only"
+)
+@pytest.mark.parametrize("seqlens", FLYDSL_RECT)
+@pytest.mark.parametrize("window", FLYDSL_WINDOWS)
+def test_flydsl_flash_attn_rect_causal(seqlens, window):
+    """flydsl hd64 THD fwd+bwd with seqlen_q < seqlen_kv (context-parallel shapes):
+    SNR vs the fp32 block-diagonal bottom-right-causal reference, over aligned and
+    unaligned Skv-Sq offsets x {full-causal, causal-SWA}."""
+    from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+        flash_attn_varlen_flydsl_backward_impl,
+        flash_attn_varlen_flydsl_forward_impl,
+    )
+
+    dev = "cuda"
+    torch.manual_seed(0)
+    D, Hq, Hkv = 64, 8, 1
+    scale = 1.0 / math.sqrt(D)
+    sq_list, skv_list = seqlens
+    cu_q, max_sq, total_q = _build_cu_seqlens(sq_list, dev)
+    cu_k, max_skv, total_kv = _build_cu_seqlens(skv_list, dev)
+    q = (torch.randn(total_q, Hq, D, device=dev, dtype=torch.bfloat16) * 0.5).contiguous()
+    k = (torch.randn(total_kv, Hkv, D, device=dev, dtype=torch.bfloat16) * 0.5).contiguous()
+    v = (torch.randn(total_kv, Hkv, D, device=dev, dtype=torch.bfloat16) * 0.5).contiguous()
+    do = (torch.randn(total_q, Hq, D, device=dev, dtype=torch.bfloat16) * 0.5).contiguous()
+
+    out, lse = flash_attn_varlen_flydsl_forward_impl(
+        q, k, v, cu_q, cu_k, max_sq, max_skv,
+        softmax_scale=scale, causal=True, window_size=window, return_lse=True,
+    )
+    dq, dk, dv = flash_attn_varlen_flydsl_backward_impl(
+        do, q, k, v, out, lse, cu_q, cu_k, max_sq, max_skv,
+        softmax_scale=scale, causal=True, window_size=window,
+    )
+
+    o_ref, dq_ref, dk_ref, dv_ref = _flydsl_block_diag_ref(q, k, v, do, cu_q, scale, window[0], cu_k=cu_k)
+    o_snr = compute_snr(o_ref, out.float())
+    dq_snr = compute_snr(dq_ref, dq.float())
+    dk_snr = compute_snr(dk_ref, dk.float())
+    dv_snr = compute_snr(dv_ref, dv.float())
+    print(
+        f"\nq={sq_list} kv={skv_list} win={window} o={o_snr:.1f} dq={dq_snr:.1f} "
+        f"dk={dk_snr:.1f} dv={dv_snr:.1f}"
+    )
+    assert o_snr > 40, f"o SNR too low: {o_snr:.1f}"
+    assert dq_snr > 40, f"dq SNR too low: {dq_snr:.1f}"
+    assert dk_snr > 40, f"dk SNR too low: {dk_snr:.1f}"
+    assert dv_snr > 40, f"dv SNR too low: {dv_snr:.1f}"
 
 
 def test_flash_attn_varlen_no_grad():

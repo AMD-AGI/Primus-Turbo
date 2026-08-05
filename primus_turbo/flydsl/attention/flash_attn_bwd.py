@@ -1910,8 +1910,8 @@ def build_flash_attn_bwd_dq_module(
             out = [A_cur[dt][qt] for dt in range_constexpr(DT) for qt in range_constexpr(QT)]
             return out
 
-        # Split the causal kv-loop: [0, q_start) below the diagonal (no mask),
-        # [q_start, kv_upper) straddles it (mask).
+        # Split the causal kv-loop: [_wlo, _split) below the diagonal (no mask),
+        # [_split, kv_upper) straddles it (mask).
         _carry = A_accs
         loop_results = _carry
         if const_expr(window_left >= 0):
@@ -1925,6 +1925,7 @@ def build_flash_attn_bwd_dq_module(
             _wlo = (_wlo // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
         else:
             _wlo = fx.Index(0)
+        _split = ((q_start + causal_offset) // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
         # Prologue for the software-pipelined body: it expects its own tile already in
         # LDS and leaves the next one there. _wlo is the first kv tile of whichever of
         # the two loops below runs first (they are contiguous).
@@ -1933,9 +1934,9 @@ def build_flash_attn_bwd_dq_module(
             coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(LDS_V_BASE * 2), _wlo)
             rocdl.s_waitcnt(0)
         gpu.barrier()
-        for kv_start, inner in range(_wlo, q_start + causal_offset, BLOCK_KV, init=_carry):
+        for kv_start, inner in range(_wlo, _split, BLOCK_KV, init=_carry):
             loop_results = yield _kv_body(kv_start, inner, False)
-        for kv_start, inner in range(q_start + causal_offset, kv_upper, BLOCK_KV, init=loop_results):
+        for kv_start, inner in range(_split, kv_upper, BLOCK_KV, init=loop_results):
             loop_results = yield _kv_body(kv_start, inner, True)
 
         A_finals = [[loop_results[dt * QT + qt] for qt in range_constexpr(QT)] for dt in range_constexpr(DT)]
