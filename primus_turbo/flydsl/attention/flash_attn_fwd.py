@@ -776,7 +776,7 @@ def build_flash_attn_dualwave_swp_module(
         # SINK now sits at index 8; the scalar shape/mode args (JIT cache key) start at 9.
         # has_sink is baked into the module (separate build), so the SINK tensor stays out
         # of the key.
-        key = args[9:] + (stream is None,)
+        key = tuple(type(a) for a in args[9:]) + (stream is None,)
         fn = _compiled.get(key)
         if fn is None:
             if len(_compiled) >= _COMPILED_MAX:
