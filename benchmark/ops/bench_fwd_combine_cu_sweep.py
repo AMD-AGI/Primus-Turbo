@@ -22,7 +22,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     swiglu_mxfp8_flydsl_kernel,
 )
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import prepare_w2_fp8
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_fp8_impl import _w1_fp8_cached
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import _w1_fp8_cached
 from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8
 
 

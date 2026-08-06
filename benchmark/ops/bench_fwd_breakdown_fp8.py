@@ -88,7 +88,7 @@ def worker(local_rank, world, args):
     W1L = W1.detach().clone().requires_grad_(True)
     W2L = W2.detach().clone().requires_grad_(True)
 
-    from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_fp8_impl import (
+    from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
         _w1_fp8_cached,
         _w2_fp8_cached,
     )

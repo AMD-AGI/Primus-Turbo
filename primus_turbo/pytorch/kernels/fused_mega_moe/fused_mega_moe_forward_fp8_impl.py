@@ -12,8 +12,6 @@ a live symm buffer the backward reuses, plus non-tensor handles.
 
 from typing import Tuple
 
-import functools
-
 import torch
 from torch.distributed import ProcessGroup
 
@@ -25,81 +23,20 @@ from primus_turbo.flydsl.mega.fp8 import (
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     prepare_dw1_pool_operand_fp8,
 )
-from primus_turbo.flydsl.mega.fp8 import weight_generation
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
-    prepare_w1_fp8,
-    prepare_w2_fp8,
+    _w1_fp8_cached,
+    _w2_fp8_cached,
 )
 
 __all__ = [
     "fused_mega_moe_forward_fp8_impl",
 ]
 
-_W1_PREP_ATTR = "_mega_fp8_w1_prep"
-_W2_PREP_ATTR = "_mega_fp8_w2_prep"
 _H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device real-tile count)
 
 # The L1 comm/preshuffle split comes from the kernel's per-shape table, so nothing is pinned here.
 # L2 combine 32 beats 48 by ~5% on EP8 T=8192 DSv3; the combine kernel has no such table yet.
 _L2_NUM_COMBINE_CU = 32
-
-
-_PREP_BUFFERS: dict = {}
-_PREP_FRESH: dict = {}
-_PREP_STATE = {"warned": False}
-
-
-def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
-    """Quantize ``w`` once per optimizer step, into buffers that live for the whole run.
-
-    The quantized weight has a fixed shape, so it gets one allocation per weight and is rewritten in
-    place -- the same footprint the original never-refreshing cache had. Handing back a NEW tensor
-    each step is what made this leak: the old one is released only if nothing else references it, and
-    a live autograd graph does, so the copies piled up a step at a time (+41 GB by iteration 17, then
-    HIP OOM). ``prep`` still allocates a temporary, freed as soon as it is copied in, so the peak is
-    one persistent set plus one transient rather than one set per step.
-
-    Rewriting in place is safe only because every microbatch backward of step N finishes before the
-    first forward of step N+1, which is when the refresh happens, so no saved tensor from a live
-    graph can still point at these bytes. ``_version`` stays in the key so an in-place write that
-    does bump it still invalidates."""
-    key = (attr, w.data_ptr(), tuple(w.shape))
-    gen = (weight_generation(), getattr(w, "_version", 0))
-    buf = _PREP_BUFFERS.get(key)
-    if buf is not None and _PREP_FRESH.get(key) == gen:
-        return buf
-    if buf is not None and weight_generation() == 0 and w.grad is not None and not _PREP_STATE["warned"]:
-        # Reuse is only safe while something advances the generation. A whole backward has run and
-        # the generation never moved, so this is about to serve step-0 weights for the rest of the
-        # run -- invisible in the loss at first, then a model that stops learning.
-        _PREP_STATE["warned"] = True
-        print(
-            "[mega fp8] WARNING: the fp8 weight caches were never invalidated, so the experts are "
-            "about to keep training on their step-0 weights. Whoever owns the expert module must "
-            "call advance_weight_generation() once per optimizer step.",
-            flush=True,
-        )
-    with torch.no_grad():
-        out = prep(w)
-    if buf is None:
-        _PREP_BUFFERS[key] = buf = out
-    else:
-        for dst, src in zip(buf, out):
-            dst.copy_(src)
-        del out  # release the temporary before returning, so steady-state stays one set
-    _PREP_FRESH[key] = gen
-    return buf
-
-
-def _w1_fp8_cached(w1: torch.Tensor) -> tuple:
-    """-> the dispatch GEMM's 4-tuple ``(w1q, w1s, flat, b_sp)``; see ``prepare_dispatch_weight_fp8``."""
-    return _version_keyed_weight_prep(w1, _W1_PREP_ATTR, prepare_w1_fp8)
-
-
-def _w2_fp8_cached(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """-> ``(weight_flat int8 [G*H*I], b_sp int32 preshuffled scale)``. Unlike w1, the L2 combine is
-    pure-compute, so quant + ScaleBComb preshuffle + int8-flat are all baked in here."""
-    return _version_keyed_weight_prep(w2, _W2_PREP_ATTR, prepare_w2_fp8)
 
 
 def fused_mega_moe_forward_fp8_impl(

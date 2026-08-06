@@ -44,7 +44,6 @@ from .symm_buffer import get_symm_buffer_for_mega_moe
 # --- mxfp8 quantization: rowwise (weights / activations) + colwise-transpose (backward
 #     variable-K wgrad operands: dW2 / dW1) ---
 from .quant import (
-    advance_weight_generation,
     colwise_grouped_meta,
     colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
@@ -52,7 +51,6 @@ from .quant import (
     preshuffle_b_scale,
     quantize_grouped_weight_mxfp8_flydsl,
     quantize_rowwise_mxfp8_flydsl,
-    weight_generation,
 )
 
 __all__ = [
@@ -66,8 +64,6 @@ __all__ = [
     "get_symm_buffer_for_mega_moe",
     "quantize_grouped_weight_mxfp8_flydsl",
     "quantize_rowwise_mxfp8_flydsl",
-    "weight_generation",
-    "advance_weight_generation",
     "preshuffle_b_scale",
     "colwise_grouped_meta",
     "colwise_quant_mxfp8_grouped_flydsl",

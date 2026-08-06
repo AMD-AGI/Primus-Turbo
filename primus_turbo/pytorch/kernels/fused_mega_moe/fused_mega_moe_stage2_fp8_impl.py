@@ -30,6 +30,8 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_imp
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_fp8_impl import (
     _H_NUM_TILE_BLOCKS,
     _L2_NUM_COMBINE_CU,
+)
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
     _w2_fp8_cached,
 )
 
