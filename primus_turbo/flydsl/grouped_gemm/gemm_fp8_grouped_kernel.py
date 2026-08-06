@@ -93,6 +93,14 @@ _SGPR_GO_MAX_G = 8
 # Band-cyclic group interleave (skew load-balance, keeps B-stripe L2 reuse); always on.
 _WG_INTERLEAVE = True
 
+# Epilogue store schedules for the grouped NT/NN bodies (`nt_esplit`/`nn_esplit`, see
+# _store_split): the tile's four accumulator quadrants (0=c00, 1=c01, 2=c10, 3=c11) split into
+# barrier-separated store batches. 0 reproduces the single 128-store burst; 4 is the deployed one.
+_NN_E_SCHED = {
+    0: ((), (0, 2, 1, 3)),
+    4: ((), (0,), (2,), (1,), (3,)),
+}
+
 
 def _load_i32(div, idx):
     """Read one int32 scalar from an i32 buffer view at i32-element idx (per-lane,
@@ -147,6 +155,36 @@ def _build_mfma(N_TILES_A, N_TILES_B, cbsz, blgp, asm_mode=None):
     return mfma
 
 
+def _nn_b_tr_issue(b_s2r, lds_src, vmcnt=None):
+    """Issue every B tile's transpose reads of one LDS stage and leave them in flight.
+    Same reads S2RLoaderTr.load issues, minus its trailing drain, so the caller can put
+    the drain where the operand is actually consumed (_nn_b_tr_mfma) or let a later
+    compiler-scored wait cover it."""
+    return [b_s2r._issue_one(lds_src, t, None, vmcnt) for t in range_constexpr(b_s2r.n_tiles)]
+
+
+def _nn_b_tr_mfma(mfma, raw, a_frag, c):
+    """Consume the reads _nn_b_tr_issue left in flight one B tile at a time: wait for that
+    tile's reads only, then run its whole mfma column, so the next tile's LDS latency sits
+    behind those mfma instead of in front of them. Needed because the reads are inline asm:
+    SIInsertWaitcnts does not score them, so S2RLoaderTr.load can only drain the stage as a
+    whole with zero mfma in between. Use this form when the a fragment is already resident
+    (no scored LDS read of its own follows the issue to carry an incremental wait).
+    Emitting the b tile in the outer loop keeps exactly one mfma per accumulator, so the
+    result is byte-identical to mfma.call(a_frag, b_s2r.load(...), c). Returns the
+    accumulators plus the assembled b fragments, for a later mfma group that reuses them."""
+    n_rd = len(raw[0])  # ds_read per B tile
+    b_frag = []
+    for j in range_constexpr(mfma.n_tiles_b):
+        # lgkm retires in issue order, so the tail still outstanding is the later tiles'.
+        S2RLoaderTr._wait_lgkmcnt(n_rd * (mfma.n_tiles_b - 1 - j))
+        rocdl.sched_barrier(0)  # nothing may cross a hand-written wait the backend cannot see
+        b_frag.append(S2RLoaderTr._assemble(raw[j]))
+        for i in range_constexpr(mfma.n_tiles_a):
+            c[mfma.idx(i, j)] = mfma._do_mma(a_frag[i], b_frag[j], c[mfma.idx(i, j)])
+    return c, b_frag
+
+
 def _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N):
     """Store the four output quadrants (shared by all 6 kernels; base_row/base_col are
     computed per-kernel by the caller)."""
@@ -154,6 +192,21 @@ def _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_
     store_c.store(c01, base_row + 0, base_col + LDS_BLOCK_N)
     store_c.store(c10, base_row + LDS_BLOCK_M, base_col + 0)
     store_c.store(c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+
+
+def _store_split(store_c, quad, base_row, base_col, esplit, full):
+    """Emit a body's four accumulator quadrants as the barrier-separated store batches of
+    `_NN_E_SCHED[esplit]` instead of one burst, replacing the body's own trailing barrier (which
+    batch 1 re-emits). ``quad`` is (frag, d_row, d_col) per quadrant in (c00, c01, c10, c11)
+    order; the odd ones are the b1 half a half-N body drops, and a batch left empty by that keeps
+    no barrier of its own. esplit=0 reproduces the single burst the callers used to emit."""
+    sched = [tuple(q for q in b if full or q % 2 == 0) for b in _NN_E_SCHED[esplit]]
+    for bi in range_constexpr(len(sched)):
+        if const_expr(bi == 1 or (bi > 1 and len(sched[bi]) > 0)):
+            rocdl.s_barrier()
+        for qi in range_constexpr(len(sched[bi])):
+            frag, d_row, d_col = quad[sched[bi][qi]]
+            store_c.store(frag, base_row + d_row, base_col + d_col)
 
 
 # PERSISTENT grouped NN dgrad: a fixed grid of num_sms WGs strides the tile space via scf.for.
@@ -195,6 +248,8 @@ def _compile_grouped_nn(
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
     nn_b0_dist2: bool = False,  # distance-2 prefetch for the always-load B0 half: 3 LDS buffers (cur/next/next2) so g2s writes the oldest consumed slot (no WAR stall) and a 3-iter window hides transpose-load latency. A/b1 stay distance-1 (+16KB LDS, still 1 WG/CU)
     nn_kshear: bool = True,  # K % 128 == 64: fetch A's line-aligned window per row instead of its raw K-block, so no row's 128B load splits a cache line (measured +25.7% TCP_TCC_READ_REQ on dY[M,2880]). Off = legacy split loads
+    nn_elgk: bool = True,  # graded drain of the B transpose reads: the b0 stage rides the a0 fragment's compiler-scored wait, the b1 stage drains one tile at a time inside its mfma column. Off = one lgkmcnt(0) per stage with no mfma to cover it
+    nn_esplit: int = 4,  # epilogue store schedule, see _NN_E_SCHED: how the tile's four accumulator quadrants are split into barrier-separated store batches. 0 = one 128-store burst after the trailing barrier
 ):
     """Persistent (CPU-sync-free) grouped NN dgrad. Same math as the dense NN kernel but a
     fixed grid of ``num_sms`` WGs strides the tile space via scf.for, amortising the per-WG
@@ -241,6 +296,12 @@ def _compile_grouped_nn(
     # two are mutually exclusive; store_cshuffle is a measured loss here anyway.
     _kshear = nn_kshear and K % BLOCK_K == 64 and not store_cshuffle
     _cshuf_lds = store_cshuffle or not _kshear
+    # Graded B drain only applies to the inline-asm transpose reads: the intrinsic path is
+    # scored, so the backend already interleaves incremental waits with the mfma there.
+    _elgk = nn_elgk and agpr_inplace and acc_mode == "agpr"
+    # The split reorders the quadrants of the scalar epilogue; the LDS-staged CShuffle one
+    # shares a single staging buffer across them and has to keep the emitted order.
+    _esplit = 0 if store_cshuffle else nn_esplit
 
     _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
     _cshuf_n = 8 * 16 * (N_TILES_B * 16)
@@ -548,7 +609,12 @@ def _compile_grouped_nn(
                 wait_barrier(_w2)
 
                 for k in range_constexpr(K_ITERS - 2):
-                    b0_frag = b_s2r.load(b_cur0, vmcnt=nn_loop_tr_vmcnt)
+                    # b0's reads stay in flight: the a0 fragment below is read after them and
+                    # lgkm retires in order, so the incremental wait the backend emits for a0 --
+                    # which it must, a0 feeds the very first mfma -- already covers the whole
+                    # asm prefix. Draining here instead only serialises b0's latency ahead of
+                    # a0's issue (the steady state's one fully exposed LDS wait).
+                    b0_frag = b_s2r.load(b_cur0, vmcnt=nn_loop_tr_vmcnt, drain=not _elgk)
                     a0_frag = _ld_a(a_cur0, a_prev0)
                     a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
                     _ibar()
@@ -557,12 +623,21 @@ def _compile_grouped_nn(
                     rocdl.s_setprio(0)
                     _dbar()
                     if const_expr(_full):
-                        b1_frag = b_s2r.load(b_cur1, vmcnt=nn_loop_tr_vmcnt)
+                        # a0 is resident here, so nothing scored follows to carry b1's wait:
+                        # issue now (keeping the g2s and the barrier as latency cover) and
+                        # drain per tile inside the mfma column below.
+                        if const_expr(_elgk):
+                            b1_raw = _nn_b_tr_issue(b_s2r, b_cur1, nn_loop_tr_vmcnt)
+                        else:
+                            b1_frag = b_s2r.load(b_cur1, vmcnt=nn_loop_tr_vmcnt)
                     b_g2s.load(b_cur0, B0_gl_offset + arith.index((k + 2) * BLOCK_K) * cn_i)
                     _ibar()
                     rocdl.s_setprio(1)
                     if const_expr(_full):
-                        c01 = mfma.call(a0_frag, b1_frag, c01)
+                        if const_expr(_elgk):
+                            c01, b1_frag = _nn_b_tr_mfma(mfma, b1_raw, a0_frag, c01)
+                        else:
+                            c01 = mfma.call(a0_frag, b1_frag, c01)
                     rocdl.s_setprio(0)
                     _dbar()
                     a1_frag = _ld_a(a_cur1, a_prev1)
@@ -599,7 +674,7 @@ def _compile_grouped_nn(
                     b_cur1, b_next1 = b_next1, b_cur1
 
                 k = K_ITERS - 2
-                b0_frag = b_s2r.load(b_cur0)
+                b0_frag = b_s2r.load(b_cur0, drain=not _elgk)
                 a0_frag = _ld_a(a_cur0, a_prev0)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
@@ -607,11 +682,17 @@ def _compile_grouped_nn(
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 if const_expr(_full):
-                    b1_frag = b_s2r.load(b_cur1)
+                    if const_expr(_elgk):
+                        b1_raw = _nn_b_tr_issue(b_s2r, b_cur1)
+                    else:
+                        b1_frag = b_s2r.load(b_cur1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 if const_expr(_full):
-                    c01 = mfma.call(a0_frag, b1_frag, c01)
+                    if const_expr(_elgk):
+                        c01, b1_frag = _nn_b_tr_mfma(mfma, b1_raw, a0_frag, c01)
+                    else:
+                        c01 = mfma.call(a0_frag, b1_frag, c01)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a1_frag = _ld_a(a_cur1, a_prev1)
@@ -620,7 +701,10 @@ def _compile_grouped_nn(
                 c10 = mfma.call(a1_frag, b0_frag, c10)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
-                b0_frag = b_s2r.load(b_next0)
+                # This stage feeds the last phase's c00, past the c11 mfma below and the slot
+                # rotate, so its reads ride the next a0 fragment's wait with a whole mfma group
+                # of cover.
+                b0_frag = b_s2r.load(b_next0, drain=not _elgk)
                 a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
@@ -641,11 +725,17 @@ def _compile_grouped_nn(
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 if const_expr(_full):
-                    b1_frag = b_s2r.load(b_cur1)
+                    if const_expr(_elgk):
+                        b1_raw = _nn_b_tr_issue(b_s2r, b_cur1)
+                    else:
+                        b1_frag = b_s2r.load(b_cur1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 if const_expr(_full):
-                    c01 = mfma.call(a0_frag, b1_frag, c01)
+                    if const_expr(_elgk):
+                        c01, b1_frag = _nn_b_tr_mfma(mfma, b1_raw, a0_frag, c01)
+                    else:
+                        c01 = mfma.call(a0_frag, b1_frag, c01)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a1_frag = _ld_a(a_cur1, a_prev1)
@@ -656,13 +746,27 @@ def _compile_grouped_nn(
                 if const_expr(_full):
                     c11 = mfma.call(a1_frag, b1_frag, c11)
                 rocdl.s_setprio(0)
-                rocdl.s_barrier()
-
-                store_c.store(c00, base_row + 0, base_col + 0)
-                store_c.store(c10, base_row + LDS_BLOCK_M, base_col + 0)
-                if const_expr(_full):
-                    store_c.store(c01, base_row + 0, base_col + LDS_BLOCK_N)
-                    store_c.store(c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+                # Epilogue store schedule. All four quadrants' 128 stores used to go out as one
+                # burst, with every wave free to be in a different quadrant, so the tile's writes
+                # were spread over four row/column bands at once. Batching them behind a barrier
+                # each keeps all 8 waves inside the same band, whose columns they then tile
+                # contiguously. The separator has to be the barrier: an `s_waitcnt vmcnt` throttle
+                # in its place, which drains the write queue but does not align the waves, is a
+                # regression. The quadrants write disjoint addresses, so the output is
+                # byte-identical whatever the order.
+                _store_split(
+                    store_c,
+                    (
+                        (c00, 0, 0),
+                        (c01, 0, LDS_BLOCK_N),
+                        (c10, LDS_BLOCK_M, 0),
+                        (c11, LDS_BLOCK_M, LDS_BLOCK_N),
+                    ),
+                    base_row,
+                    base_col,
+                    _esplit,
+                    _full,
+                )
 
             # Wave-uniform runtime half-N predicate (block_n is uniform per tile).
             _nb_last = n_blocks - fx.Int32(1)
@@ -747,6 +851,7 @@ def _compile_grouped_nt(
     persistent: bool = True,  # True = scf.for tile loop (fixed grid, cap_cu reserves CUs); False = one tile/WG + s_endpgm over-launch guard (full-device default)
     cap_cu: int = -1,  # >0: cap grid to this many WGs (= reserve device CUs for comm-compute overlap). <=0: use the full device CU count.
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
+    nt_esplit: int = 4,  # epilogue store schedule (see _NN_E_SCHED), the twin of the NN dgrad's nn_esplit. 0 = one 128-store burst
 ):
     """Grouped NT forward (out = a @ b^T). persistent=True: a fixed grid of WGs strides the
     tile space via scf.for (cap_cu reserves CUs for comm overlap); persistent=False: one tile
@@ -791,6 +896,9 @@ def _compile_grouped_nt(
     _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
     _cshuf_n = 8 * 16 * (N_TILES_B * 16)
     _cs_pipe = persistent and store_cshuffle and bool(cs_pipe)
+    # The split reorders the quadrants of the scalar epilogue; the LDS-staged CShuffle one
+    # shares a single staging buffer across them and has to keep the emitted order.
+    _esplit = 0 if store_cshuffle else nt_esplit
     _cshuf_alloc = (2 * _cshuf_n) if _cs_pipe else _cshuf_n
     _cstore_aux = 0 if cstore_aux is None else int(cstore_aux)
 
@@ -1162,13 +1270,21 @@ def _compile_grouped_nt(
                     if const_expr(_full):
                         c11 = _mm.call(a1_frag, b1_frag, c11)
                     rocdl.s_setprio(0)
-                    rocdl.s_barrier()
-
-                    _st.store(c00, _base_row + 0, _bcol + 0)
-                    _st.store(c10, _base_row + LDS_BLOCK_M, _bcol + 0)
-                    if const_expr(_full):
-                        _st.store(c01, _base_row + 0, _bcol + LDS_BLOCK_N)
-                        _st.store(c11, _base_row + LDS_BLOCK_M, _bcol + LDS_BLOCK_N)
+                    # Batched epilogue store, same lever (and same measured mechanism) as the NN
+                    # dgrad body's; this one owns all six forward cells of the tw suite.
+                    _store_split(
+                        _st,
+                        (
+                            (c00, 0, 0),
+                            (c01 if _full else None, 0, LDS_BLOCK_N),
+                            (c10, LDS_BLOCK_M, 0),
+                            (c11 if _full else None, LDS_BLOCK_M, LDS_BLOCK_N),
+                        ),
+                        _base_row,
+                        _bcol,
+                        _esplit,
+                        _full,
+                    )
 
                 # Wave-uniform runtime half-N predicate: last N-block whose valid width fits the b0 LDS half (b1 all padding).
                 _nb_last = n_blocks - fx.Int32(1)
