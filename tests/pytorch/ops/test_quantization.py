@@ -28,15 +28,41 @@ from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_
 from tests.pytorch.test_utils import get_tolerances
 
 
-@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
-@pytest.mark.parametrize("numel", [6 * 1 * 7168 * 8192])
-@pytest.mark.parametrize("torch_compile", [True, False])
+@pytest.mark.parametrize(
+    "orig_dtype,numel,torch_compile,check_unaligned_fallback",
+    [
+        (orig_dtype, 6 * 1 * 7168 * 8192, torch_compile, False)
+        for orig_dtype in [torch.bfloat16, torch.float16, torch.float32]
+        for torch_compile in [True, False]
+    ]
+    + [
+        (orig_dtype, numel, False, True)
+        for orig_dtype in [torch.bfloat16, torch.float16]
+        for numel in [15, 16, 17, 2880, 2881]
+    ],
+)
 @pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE])
-def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, torch_compile, granularity):
+def test_quantize_fp8_tensorwise(
+    orig_dtype,
+    dest_dtype,
+    numel,
+    torch_compile,
+    check_unaligned_fallback,
+    granularity,
+):
     torch.manual_seed(42)
 
     x = torch.rand(numel, device="cuda", dtype=orig_dtype)
+    if check_unaligned_fallback:
+        storage = torch.empty(numel + 1, device="cuda", dtype=orig_dtype)
+        x_unaligned = storage[1:]
+        x_unaligned.copy_(x)
+
+        assert x.data_ptr() % 32 == 0
+        assert x_unaligned.is_contiguous()
+        assert x_unaligned.data_ptr() % 32 != 0
+
     x_ref = x.detach().clone()
     x_fp8_ref, x_scale_ref, x_scale_inv_ref = quantize_fp8_ref(x_ref, dest_dtype, granularity)
 
@@ -62,6 +88,17 @@ def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, torch_compile, g
     x_dq = dequantize_fp8(x_fp8, orig_dtype, granularity, scale_inv=x_scale_inv)
     x_dq_ref = dequantize_fp8_ref(x_fp8_ref, orig_dtype, granularity, scale_inv=x_scale_inv_ref)
     torch.testing.assert_close(x_dq, x_dq_ref, **get_tolerances(dest_dtype))
+
+    if check_unaligned_fallback:
+        x_fp8_fallback, x_scale_inv_fallback = quantize_fp8(
+            x_unaligned,
+            dest_dtype,
+            granularity=granularity,
+        )
+
+        assert x_fp8.data_ptr() % 16 == 0
+        assert torch.equal(x_fp8.view(torch.uint8), x_fp8_fallback.view(torch.uint8))
+        torch.testing.assert_close(x_scale_inv, x_scale_inv_fallback, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
