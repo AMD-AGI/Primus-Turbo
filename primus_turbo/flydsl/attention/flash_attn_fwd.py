@@ -759,7 +759,7 @@ def build_flash_attn_dualwave_swp_module(
             block_table,
             block_table_stride,
         )
-        key = args[8:] + (stream is None,)
+        key = tuple(type(a) for a in args[8:]) + (stream is None,)
         fn = _compiled.get(key)
         if fn is None:
             if len(_compiled) >= _COMPILED_MAX:
