@@ -2701,9 +2701,10 @@ def _prescale_lse(lse_bhsq):
 # ============================================================================
 
 _DSINK_THREADS = 256
+_DSINK_UNROLL = 16  # chunks per loop trip = loads in flight (see the reduction loop below)
 
 
-def build_flash_dsink_module(B, Sq, Hq):
+def build_flash_dsink_module(Hq):
     """d_sink[h] = sum over all (b, s) of exp(sink_h - lse[b,h,s]) * delta[b,h,s].
 
     LSE is the raw sink-inclusive natural-log softmax LSE and DELTA is the flash
@@ -2713,21 +2714,31 @@ def build_flash_dsink_module(B, Sq, Hq):
 
     One WG per q-head (grid=(Hq,1,1)); the WG's 256 threads stride the head's B*Sq
     scalars, accumulate in fp32, then thread 0 sums the LDS partials and writes d_sink[h].
-    Deterministic (fixed fp32 reduction order, no atomics)."""
+    Deterministic (fixed fp32 reduction order, no atomics).
+
+    B and Sq are runtime arguments: only Hq (the grid and the row stride) is baked, so an
+    e2e run whose micro-batch shape drifts reuses one kernel."""
     THREADS = _DSINK_THREADS
-    NCHUNK = (Sq + THREADS - 1) // THREADS
     allocator = SmemAllocator(None, arch=get_hip_arch(), global_sym_name="flash_attn_bwd_dsink_smem")
     lds_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_off + THREADS * 4
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
-    def k_fn(SINK: fx.Tensor, LSE: fx.Tensor, DELTA: fx.Tensor, DSINK: fx.Tensor):
+    def k_fn(
+        SINK: fx.Tensor,
+        LSE: fx.Tensor,
+        DELTA: fx.Tensor,
+        DSINK: fx.Tensor,
+        batch_size: fx.Int32,
+        seq_len_q: fx.Int32,
+    ):
         lds = SmemPtr(allocator.get_base(), lds_off, fx.Float32.ir_type, shape=(THREADS,)).get()
         h = fx.Index(gpu.block_idx.x)
         tid = fx.Index(gpu.thread_idx.x)
         Hqn = fx.Index(Hq)
-        Sqn = fx.Index(Sq)
-        total_elems = fx.Index(B) * Hqn * Sqn
+        Sqn = fx.Index(seq_len_q)
+        Bn = fx.Index(batch_size)
+        total_elems = Bn * Hqn * Sqn
 
         sink_rsrc = buffer_ops.create_buffer_resource(
             SINK, max_size=False, num_records_bytes=_raw(Hqn * fx.Index(4))
@@ -2745,21 +2756,41 @@ def build_flash_dsink_module(B, Sq, Hq):
         c_zero = fx.Float32(0.0)
         sink_h = fx.Float32(buffer_ops.buffer_load(sink_rsrc, h, vec_width=1, dtype=fx.Float32))
 
-        acc = fx.Float32(0.0)
-        for b in range_constexpr(B):
-            head_base = (fx.Index(b) * Hqn + h) * Sqn  # first scalar of (b, h) row
-            for c in range_constexpr(NCHUNK):
-                s = fx.Index(c * THREADS) + tid
-                in_range = ArithValue(s < Sqn)
-                # clamp OOB tail to element 0 of the row (in-buffer, contribution masked)
-                g = head_base + fx.Index(in_range.select(s, fx.Index(0)))
-                lse_g = fx.Float32(buffer_ops.buffer_load(lse_rsrc, g, vec_width=1, dtype=fx.Float32))
-                delta_g = fx.Float32(buffer_ops.buffer_load(delta_rsrc, g, vec_width=1, dtype=fx.Float32))
-                e = fx.Float32(rocdl.exp2(fx.Float32.ir_type, _raw((sink_h - lse_g) * c_log2e)))
-                term = e * delta_g
-                acc = fx.Float32(
-                    arith.AddFOp(_raw(acc), _raw(fx.Float32(in_range.select(term, c_zero)))).result
-                )
+        # Thread tid walks s = tid, tid+THREADS, ... of row (b, h), b ascending, adding in
+        # that order -- the same elements in the same order the fully unrolled version
+        # summed, so the fp32 result is unchanged. UNROLL chunks per trip keep that many
+        # loads in flight: at one load per trip the kernel goes memory-latency bound and
+        # runs 2.3x slower than the unrolled build (Sq=8192, B=4, Hq=64).
+        def _c1(x):  # a single-arg loop yields the bare carried value, not a 1-list
+            return x[0] if isinstance(x, (list, tuple)) else x
+
+        acc0 = _raw(fx.Float32(0.0))
+        outer = acc0
+        for b, it_b in range(fx.Index(0), Bn, fx.Index(1), init=[acc0]):
+            head_base = (b * Hqn + h) * Sqn  # first scalar of (b, h) row
+            inner = _c1(it_b)
+            for base, it_s in range(tid, Sqn, fx.Index(THREADS * _DSINK_UNROLL), init=[_c1(it_b)]):
+                loaded = []
+                for u in range_constexpr(_DSINK_UNROLL):
+                    s = base + fx.Index(u * THREADS)
+                    in_range = ArithValue(s < Sqn)
+                    # clamp OOB tail to element 0 of the row (in-buffer, contribution masked)
+                    g = head_base + fx.Index(in_range.select(s, fx.Index(0)))
+                    loaded.append(
+                        (
+                            in_range,
+                            fx.Float32(buffer_ops.buffer_load(lse_rsrc, g, vec_width=1, dtype=fx.Float32)),
+                            fx.Float32(buffer_ops.buffer_load(delta_rsrc, g, vec_width=1, dtype=fx.Float32)),
+                        )
+                    )
+                a = _c1(it_s)
+                for in_range, lse_g, delta_g in loaded:
+                    e = fx.Float32(rocdl.exp2(fx.Float32.ir_type, _raw((sink_h - lse_g) * c_log2e)))
+                    term = e * delta_g
+                    a = arith.AddFOp(a, _raw(fx.Float32(in_range.select(term, c_zero)))).result
+                inner = yield [a]
+            outer = yield [_c1(inner)]
+        acc = fx.Float32(_c1(outer))
 
         Vec.from_elements([acc], fx.Float32).store(lds, [tid])
         gpu.barrier()
@@ -2780,11 +2811,13 @@ def build_flash_dsink_module(B, Sq, Hq):
         )
 
     @flyc.jit
-    def launch(SINK, LSE, DELTA, DSINK, stream):
+    def launch(SINK, LSE, DELTA, DSINK, batch_size: fx.Int32, seq_len_q: fx.Int32, stream):
         allocator.finalized = False
         with ir.InsertionPoint(CompilationContext.get_current().gpu_module_body):
             allocator.finalize()
-        k_fn(SINK, LSE, DELTA, DSINK).launch(grid=(fx.Index(Hq), 1, 1), block=(THREADS, 1, 1), stream=stream)
+        k_fn(SINK, LSE, DELTA, DSINK, batch_size, seq_len_q).launch(
+            grid=(fx.Index(Hq), 1, 1), block=(THREADS, 1, 1), stream=stream
+        )
 
     return launch
 
@@ -2802,14 +2835,14 @@ def _flash_dsink(sink, lse_bhsq, delta, B, Hq, Sq, stream):
         lse_bhsq.reshape(-1).contiguous(),
         delta.reshape(-1),
         d_sink,
+        B,
+        Sq,
         stream,
     )
-    key = (B, Hq, Sq)
+    key = (Hq,)
     compiled = _DSINK_CACHE.get(key)
     if compiled is None:
-        if len(_DSINK_CACHE) >= 64:
-            _DSINK_CACHE.clear()
-        compiled = flyc.compile(build_flash_dsink_module(B, Sq, Hq), *args)
+        compiled = flyc.compile(build_flash_dsink_module(Hq), *args)
         _DSINK_CACHE[key] = compiled
     compiled(*args)
     return d_sink
