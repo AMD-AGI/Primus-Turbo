@@ -89,6 +89,7 @@ from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
+    extend_handle,
     get_symm_buffer_for_mega_moe,
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
@@ -111,6 +112,9 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_imp
     _mxfp8_variable_k_wgrad_dw2,
 )
 from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8  # noqa: E402  (fp8 op)
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
+    prepare_dispatch_weight_fp8,
+)
 
 _MXFP8_BLOCK = 32
 _H_TILE_TO_EXPERT = 7
@@ -219,26 +223,27 @@ def profile_l1(group, args, mode):
         intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
     )
     sym_layout = symm.make_sym_layout()
-    w1q, w1s = quantize_grouped_weight_mxfp8(W1)  # static weight quant (module-owned in production)
+    w1_fp8 = prepare_dispatch_weight_fp8(W1)
+    w1q, w1s = w1_fp8[:2]  # static weight quant (module-owned in production)
 
     def _prologue():
-        return tuple(dispatch_prologue(
+        return extend_handle(dispatch_prologue(
             topk_idx, topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=K, num_experts=E,
             world_size=world, rank=rank, experts_per_rank=epr, block_m=BM,
             num_max_pool_tokens=symm.num_max_pool_tokens,
-        ))
+        ), symm)
 
-    dc, pc = _cu(args.dispatch_cu, 16), _cu(args.preshuffle_cu, 16)  # l1 dispatch default 16/16
+    dc, pc = _cu(args.dispatch_cu, None), _cu(args.preshuffle_cu, None)  # None -> kernel's split table
 
     def _fp8():  # FULL per-forward L1: prologue + fused dispatch+GEMM (epoch self-reset on device)
         h = _prologue()
-        return dispatch_grouped_gemm_mxfp8(x, w1q, w1s, h, sym_layout, symm, BM=BM, BN=BN,
+        return dispatch_grouped_gemm_mxfp8(x, w1_fp8, h, sym_layout, symm, BM=BM, BN=BN,
                                            num_dispatch_cu=dc, num_preshuffle_cu=pc)
 
     # ── correctness (fp8): one L1, then torch dequant grouped-GEMM over the dispatched pool ──
     handle = _prologue()
     torch.cuda.synchronize(); group.barrier()
-    out = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN,
+    out = dispatch_grouped_gemm_mxfp8(x, w1_fp8, handle, sym_layout, symm, BM=BM, BN=BN,
                                       num_dispatch_cu=dc, num_preshuffle_cu=pc)
     torch.cuda.synchronize(); group.barrier()
     real_tiles = int(symm.meta_scalars[1].item())
@@ -282,14 +287,15 @@ def profile_l2(group, args, mode):
         intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
     )
     sym_layout = symm.make_sym_layout()
-    handle = tuple(dispatch_prologue(
+    handle = extend_handle(dispatch_prologue(
         topk_idx, topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=K, num_experts=E,
         world_size=world, rank=rank, experts_per_rank=epr, block_m=BM,
         num_max_pool_tokens=symm.num_max_pool_tokens,
-    ))
-    w1q, w1s = quantize_grouped_weight_mxfp8(W1)
+    ), symm)
+    w1_fp8 = prepare_dispatch_weight_fp8(W1)
+    w1q, w1s = w1_fp8[:2]
     torch.cuda.synchronize(); group.barrier()
-    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1_fp8, handle, sym_layout, symm, BM=BM, BN=BN)
     act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, symm.meta_scalars[1:2])
     w2_fp8 = prepare_w2_fp8(W2)               # static weight prep (module-owned in production)
     real_tiles = int(symm.meta_scalars[1].item())
@@ -362,20 +368,21 @@ def profile_dispatch_fc2_dgrad(group, args, mode):
         intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
     )
     sym_layout = symm.make_sym_layout()
-    handle = tuple(dispatch_prologue(
+    handle = extend_handle(dispatch_prologue(
         topk_idx, topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=K, num_experts=E,
         world_size=world, rank=symm.rank, experts_per_rank=epr, block_m=BM,
         num_max_pool_tokens=symm.num_max_pool_tokens,
-    ))
-    w1q, w1s = quantize_grouped_weight_mxfp8(W1)
+    ), symm)
+    w1_fp8 = prepare_dispatch_weight_fp8(W1)
+    w1q, w1s = w1_fp8[:2]
     torch.cuda.synchronize(); group.barrier()
-    dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)  # fwd L1 (setup)
+    dispatch_grouped_gemm_mxfp8(x, w1_fp8, handle, sym_layout, symm, BM=BM, BN=BN)  # fwd L1 (setup)
 
     dc = args.dispatch_cu if args.dispatch_cu >= 0 else None    # default 24 inside helper
     pc = args.preshuffle_cu if args.preshuffle_cu >= 0 else None  # default 8 inside helper
 
     def _fp8():
-        return _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN,
+        return _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle,
                                                       num_dispatch_cu=dc, num_preshuffle_cu=pc)
 
     grad_swiglu_fp8, pool_handle = _fp8()
@@ -427,19 +434,20 @@ def profile_fc2_wgrad(group, args, mode):
         intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
     )
     sym_layout = symm.make_sym_layout()
-    handle = tuple(dispatch_prologue(
+    handle = extend_handle(dispatch_prologue(
         topk_idx, topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=K, num_experts=E,
         world_size=world, rank=symm.rank, experts_per_rank=epr, block_m=BM,
         num_max_pool_tokens=symm.num_max_pool_tokens,
-    ))
+    ), symm)
     # fwd L1 -> l1 + dispatch_weights (the swiglu_backward inputs)
-    w1q, w1s = quantize_grouped_weight_mxfp8(W1)
+    w1_fp8 = prepare_dispatch_weight_fp8(W1)
+    w1q, w1s = w1_fp8[:2]
     torch.cuda.synchronize(); group.barrier()
-    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1_fp8, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
 
     # dispatch(dy)+fc2-dgrad -> grad_swiglu + dispatched-dy fp8 pool; swiglu_backward -> act_weighted
-    grad_swiglu, pool_handle = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
+    grad_swiglu, pool_handle = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle)
     _, _, act_weighted = swiglu_backward_flydsl_kernel(
         grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
@@ -520,20 +528,21 @@ def profile_fc1_wgrad(group, args, mode):
         intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
     )
     sym_layout = symm.make_sym_layout()
-    handle = tuple(dispatch_prologue(
+    handle = extend_handle(dispatch_prologue(
         topk_idx, topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=K, num_experts=E,
         world_size=world, rank=symm.rank, experts_per_rank=epr, block_m=BM,
         num_max_pool_tokens=symm.num_max_pool_tokens,
-    ))
+    ), symm)
     # fwd L1 -> l1 + dispatch_weights; CLONE the fc1-input pool BEFORE the dispatch_fc2_dgrad stage overwrites symm.pool_fp8
-    w1q, w1s = quantize_grouped_weight_mxfp8(W1)
+    w1_fp8 = prepare_dispatch_weight_fp8(W1)
+    w1q, w1s = w1_fp8[:2]
     torch.cuda.synchronize(); group.barrier()
-    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1_fp8, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
     Pp, Hp = symm.pool_fp8.shape
     pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(Pp, Hp // 32).clone())
 
-    grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
+    grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle)
     grad_l1, _, _ = swiglu_backward_flydsl_kernel(
         grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True, return_act_w=True,
     )
@@ -614,17 +623,18 @@ def profile_fc1_dgrad_combine(group, args, mode):
         intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
     )
     sym_layout = symm.make_sym_layout()
-    handle = tuple(dispatch_prologue(
+    handle = extend_handle(dispatch_prologue(
         topk_idx, topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=K, num_experts=E,
         world_size=world, rank=symm.rank, experts_per_rank=epr, block_m=BM,
         num_max_pool_tokens=symm.num_max_pool_tokens,
-    ))
-    w1q, w1s = quantize_grouped_weight_mxfp8(W1)
+    ), symm)
+    w1_fp8 = prepare_dispatch_weight_fp8(W1)
+    w1q, w1s = w1_fp8[:2]
     torch.cuda.synchronize(); group.barrier()
     # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard/flag reset.
-    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1_fp8, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
-    grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
+    grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle)
     grad_l1, grad_gate = swiglu_backward_flydsl_kernel(grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True)
 
     group_lens = handle[_H_GROUP_LENS]
@@ -642,7 +652,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     def _reset_fp8():  # epoch self-reset (device) -> no host flag reset needed
         pass
 
-    cc, rc = _cu(args.combine_cu, 28), _cu(args.reduce_cu, 0)  # step3 combine default (unified w/ fwd L2)
+    cc, rc = _cu(args.combine_cu, 28), _cu(args.reduce_cu, 0)  # L1-dgrad combine default (unified w/ fwd L2)
 
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only); grad_gate=... selects the bwd role
         dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(

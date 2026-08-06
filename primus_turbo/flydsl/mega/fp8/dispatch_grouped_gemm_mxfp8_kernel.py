@@ -29,7 +29,9 @@ num_max_pool_tokens % BLOCK_M == 0, K % 128 == 0 and K >= 256 (mxfp8 MMA).
 """
 
 import functools
+import json
 import os
+import pathlib as _pathlib
 from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
@@ -66,11 +68,7 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     spin_timed_out,
     st,
 )
-from primus_turbo.flydsl.mega.fp8.quant import (
-    preshuffle_b_scale,
-    quantize_rowwise_mxfp8_flydsl,
-    weight_generation,
-)
+from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.prims import cast
@@ -82,9 +80,89 @@ _H_ORIGIN_RANK = 12  # appended by this module: per-call pool row -> owning rank
 _H_ORIGIN_SLOT = 13  # appended by this module: per-call pool row -> owning topk slot
 
 _FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip per-call @flyc.jit dispatch)
-_BSP_CACHE: dict = {}  # (weight data_ptr, G, N, K) -> preshuffled weight scale b_sp (weights static)
-_WEIGHTS_FLAT_CACHE: dict = {}  # (w1q data_ptr, G, N, K) -> int8 flat WEIGHTS, per weight generation
-_WEIGHT_CACHE_GEN = [-1]  # generation the two caches above currently hold
+
+# COMM / PRESHUFFLE / GEMM share one persistent grid, so the split between the first two is a tuning
+# knob, and the best pair moves with the GEMM's N: the forward's N=2I wants a balanced split, while
+# the L2-dgrad's N=I has half the FLOPs against the same push bytes and wants more comm.
+#
+# This is a LOOKUP, not a search. Timing the candidates on their first call was tried and is not
+# reproducible: on that call the ranks are still compiling and stepping through candidates, and in
+# that environment the two forward candidates measure within 0.8% of each other while their real
+# steady-state gap is ~5%, so the winner comes down to noise. Six runs of the same searching build
+# gave fwd-only 5.09 / 5.09 / 5.12 / 5.12 / 5.35 / 5.37 ms -- bimodal, half of them paying the 5%,
+# against 5.03-5.08 ms every time for a pinned (16, 16).
+#
+# So the table is produced offline, in steady state, by benchmark/ops/tune_cu_split_fp8.py, which
+# pins each candidate through PT_MEGA_CU_SPLIT and runs the normal bench. No tuning code lives here.
+_CU_SPLIT_CANDIDATES = ((16, 16), (24, 8))  # the scanner's search space; never timed at runtime
+# Measured steady-state winners on EP8 T=8192 DSv3 (gfx950): N=2I forward, N=I L2 dgrad.
+_CU_SPLIT_DEFAULTS = {4096: (16, 16), 2048: (24, 8)}
+_CU_SPLIT_TABLE: Optional[dict] = None  # lazily loaded from disk
+# PT_MEGA_CU_SPLIT="d,p" pins the split for every shape (the scanner uses this).
+_CU_SPLIT_ENV = os.environ.get("PT_MEGA_CU_SPLIT", "")
+_CU_SPLIT_DEBUG = os.environ.get("PT_MEGA_CU_SPLIT_DEBUG", "0") != "0"
+_CU_SPLIT_LOGGED: set = set()
+# Written by the scanner; keys are "N,K,pool,BM,BN,ranks,G" strings -> [dispatch_cu, preshuffle_cu].
+_CU_SPLIT_TABLE_PATH = os.environ.get(
+    "PT_MEGA_CU_SPLIT_TABLE",
+    str(_pathlib.Path(__file__).with_name("cu_split_table.json")),
+)
+
+
+def extend_handle(prologue_handle, symm) -> tuple:
+    """Append this module's three per-call handle slots (indices 11-13) to a ``dispatch_prologue``
+    handle. Every caller of ``dispatch_grouped_gemm_mxfp8`` must do this first; the plain prologue
+    handle stops at index 10.
+
+    All three are snapshots of shared symm scratch, so they belong to THIS call: the next prologue
+    overwrites meta_scalars AND resets the whole origin_rank / origin_slot region, while the backward
+    reuses this handle long after that. num_tile_blocks is the real-tile count; origin_rank /
+    origin_slot map each pool row back to the rank and topk slot that sent it, which is what the
+    L1-dgrad push needs to return the row to its owner. Stream-ordered D2D copies, no host sync.
+    (bf16 does the same with pool_src_slot.)
+    """
+    return tuple(prologue_handle) + (
+        symm.meta_scalars[1:2].clone(),
+        symm.origin_rank.clone(),
+        symm.origin_slot.clone(),
+    )
+
+
+def cu_split_key(N, K, num_max_pool_tokens, BM, BN, num_ranks, G) -> str:
+    """The shape key both this module and the offline scanner use for the split table."""
+    return f"{N},{K},{num_max_pool_tokens},{BM},{BN},{num_ranks},{G}"
+
+
+def _cu_split_table() -> dict:
+    global _CU_SPLIT_TABLE
+    if _CU_SPLIT_TABLE is None:
+        try:
+            _CU_SPLIT_TABLE = json.loads(_pathlib.Path(_CU_SPLIT_TABLE_PATH).read_text())
+        except Exception:  # absent or unreadable -> built-in defaults only
+            _CU_SPLIT_TABLE = {}
+    return _CU_SPLIT_TABLE
+
+
+def _resolve_cu_split(key: str, N: int):
+    """``(split, source)`` from env pin > offline table > per-N default. Never times anything."""
+    if _CU_SPLIT_ENV:
+        d, p = (int(v) for v in _CU_SPLIT_ENV.split(","))
+        return (d, p), "env"
+    if key in _cu_split_table():
+        return tuple(_cu_split_table()[key]), "table"
+    if N in _CU_SPLIT_DEFAULTS:
+        return _CU_SPLIT_DEFAULTS[N], "default"
+    # Unmeasured shape: borrow the nearest measured N, since the split tracks how much GEMM work
+    # rides on the same push bytes. Scan it to replace this guess with a measurement.
+    return _CU_SPLIT_DEFAULTS[min(_CU_SPLIT_DEFAULTS, key=lambda n: abs(n - N))], "guess"
+
+
+def _log_cu_split(key: str, split, src: str):
+    """Once per shape, not once per launch. The scanner reads the shape key off these lines, so this
+    also fires for a caller-pinned split -- that is the case it is scanning."""
+    if _CU_SPLIT_DEBUG and key not in _CU_SPLIT_LOGGED:
+        _CU_SPLIT_LOGGED.add(key)
+        print(f"[mega fp8] cu split {tuple(split)} from {src} for {key}", flush=True)
 
 
 def _make_fwd_shared_storage_coalesce(BLOCK_M, BLOCK_N, tile_ps):
@@ -446,14 +524,13 @@ def _compile(
 
 def dispatch_grouped_gemm_mxfp8(
     x: torch.Tensor,
-    w1q: torch.Tensor,
-    w1s: torch.Tensor,
+    w1_fp8: tuple,
     handle,
     sym_layout,
     symm,
     *,
-    num_dispatch_cu: int = 16,
-    num_preshuffle_cu: int = 16,
+    num_dispatch_cu: Optional[int] = None,
+    num_preshuffle_cu: Optional[int] = None,
     BM: int = 256,
     BN: int = 256,
     GROUP_M: int = 4,
@@ -465,9 +542,15 @@ def dispatch_grouped_gemm_mxfp8(
     host-side launch, then runs the comm|preshuffle|gemm overlap. The weight B-scale preshuffle
     (ScaleBComb) is host-side too and cached per weight version, since weights are static.
 
+    Leave ``num_dispatch_cu`` / ``num_preshuffle_cu`` at None to take the COMM/PRESHUFFLE split from
+    the offline table (see ``_resolve_cu_split``); pass a pair to pin it.
+
     The gates self-reset via the device epoch bump (see ``_make_epoch_bump``); its tensors ride
     on ``symm``."""
     assert x.dtype == torch.bfloat16, f"activation must be bf16, got {x.dtype}"
+    # All four come from prepare_dispatch_weight_fp8 at the op layer: this kernel derives no weight
+    # state and caches none, so it cannot go stale behind an optimizer step.
+    w1q, w1s, WEIGHTS, weight_scale_ps = w1_fp8
     (
         expert_send_dst_rank,
         expert_send_dst_row,
@@ -502,25 +585,6 @@ def dispatch_grouped_gemm_mxfp8(
         xs_c = xs_c.view(torch.uint8)
     XQ = xq_c.view(torch.int32)
     XS = xs_c.view(torch.int32)
-    # The generation has to be in these keys. data_ptr alone cannot see a weight update: the
-    # quantization is rewritten in place, and even when it was reallocated the allocator handed back
-    # the block it had just freed, so the pointer was stable across steps and these two caches served
-    # the step-0 flatten / preshuffle for the whole run -- the fp8 experts never saw a new weight.
-    _gen = weight_generation()
-    if _WEIGHT_CACHE_GEN[0] != _gen:
-        _WEIGHTS_FLAT_CACHE.clear()
-        _BSP_CACHE.clear()
-        _WEIGHT_CACHE_GEN[0] = _gen
-    _wk = (w1q.data_ptr(), G, N, K)
-    WEIGHTS = _WEIGHTS_FLAT_CACHE.get(_wk)
-    if WEIGHTS is None:
-        WEIGHTS = w1q.contiguous().reshape(G * N, K).view(torch.int8).reshape(-1)
-        _WEIGHTS_FLAT_CACHE[_wk] = WEIGHTS
-    _bk = (w1s.data_ptr(), G, N, K, 1)  # L1 GEMM reads ScaleBComb with pack=1
-    weight_scale_ps = _BSP_CACHE.get(_bk)
-    if weight_scale_ps is None:
-        weight_scale_ps = preshuffle_b_scale(w1s, G, N, K, pack=1)
-        _BSP_CACHE[_bk] = weight_scale_ps
     pool_scale_ps = symm.pool_scale_ps  # local broadcast a_sp (preshuffle role writes it)
 
     # The real-tile count must come off the handle, not the shared symm scratch the prologue wrote
@@ -536,23 +600,25 @@ def dispatch_grouped_gemm_mxfp8(
     output = torch.empty((num_max_pool_tokens, N), dtype=out_dtype, device=dev)
     output_flat = output.view(-1)
 
-    raw = _compile(
-        N,
-        K,
-        num_max_pool_tokens,
-        BM,
-        BN,
-        int(num_dispatch_cu),
-        int(num_preshuffle_cu),
-        int(num_comm),
-        int(num_ranks),
-        int(G),
-        blgp=blgp,
-        out_fp16=out_fp16,
-        GROUP_M=int(GROUP_M),
-        push_only=push_only,
-        gemm_only=gemm_only,
-    )
+    # _compile is lru_cached, so re-asking per candidate split costs one compile each, then nothing.
+    def _make_raw(dc, pc):
+        return _compile(
+            N,
+            K,
+            num_max_pool_tokens,
+            BM,
+            BN,
+            int(dc),
+            int(pc),
+            int(num_comm),
+            int(num_ranks),
+            int(G),
+            blgp=blgp,
+            out_fp16=out_fp16,
+            GROUP_M=int(GROUP_M),
+            push_only=push_only,
+            gemm_only=gemm_only,
+        )
     args = (
         XQ,
         XS,
@@ -575,14 +641,23 @@ def dispatch_grouped_gemm_mxfp8(
         c_n,
         torch.cuda.current_stream(),
     )
-    ck = (N, K, num_max_pool_tokens, BM, BN, int(num_dispatch_cu), int(num_preshuffle_cu),
-          int(num_comm), int(num_ranks), int(G), blgp, out_fp16, int(GROUP_M),
-          push_only, gemm_only)
-    compiled = _FUSED_COMPILED.get(ck)
-    if compiled is None:
-        compiled = flyc.compile(raw, *args)
-        _FUSED_COMPILED[ck] = compiled
-    compiled(*args)
+    def _run(dc, pc):
+        ck = (N, K, num_max_pool_tokens, BM, BN, int(dc), int(pc),
+              int(num_comm), int(num_ranks), int(G), blgp, out_fp16, int(GROUP_M),
+              push_only, gemm_only)
+        compiled = _FUSED_COMPILED.get(ck)
+        if compiled is None:
+            compiled = flyc.compile(_make_raw(dc, pc), *args)
+            _FUSED_COMPILED[ck] = compiled
+        compiled(*args)
+
+    cu_key = cu_split_key(N, K, num_max_pool_tokens, BM, BN, num_ranks, G)
+    if num_dispatch_cu is None or num_preshuffle_cu is None:
+        (num_dispatch_cu, num_preshuffle_cu), cu_src = _resolve_cu_split(cu_key, N)
+    else:
+        cu_src = "caller"
+    _log_cu_split(cu_key, (num_dispatch_cu, num_preshuffle_cu), cu_src)
+    _run(num_dispatch_cu, num_preshuffle_cu)
     return output
 
 
@@ -616,24 +691,23 @@ def _validate_tiles(handle, experts_per_rank: int, *, fresh: bool) -> None:
 
 def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     x: torch.Tensor,
-    w1q: torch.Tensor,
-    w1s: torch.Tensor,
+    w1_fp8: tuple,
     group: ProcessGroup,
     handle: Optional[tuple] = None,
     topk_idx: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     BM: int = 256,
     BN: int = 256,
-    num_dispatch_cu: int = 16,
-    num_preshuffle_cu: int = 16,
+    num_dispatch_cu: Optional[int] = None,
+    num_preshuffle_cu: Optional[int] = None,
 ) -> Tuple[torch.Tensor, tuple, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Self-contained fp8 dispatch + grouped mxfp8 NT GEMM; fp8 sibling of
     ``dispatch_grouped_gemm_bf16_flydsl_kernel``. Drives BOTH the forward L1 (dispatch x + fc1) and
     the backward L2 dgrad (dispatch dy + fc2-dgrad) -- both are the SAME NT op, only the input/weight
-    and the comm/preshuffle CU split (``num_dispatch_cu`` / ``num_preshuffle_cu``) differ.
+    differ; the comm/preshuffle CU split is searched per shape unless pinned.
 
-    Takes the pre-quantized weight (``w1q`` [G,*,K] fp8 + ``w1s`` raw E8M0; prepared version-keyed by
-    the caller -- fc1 weight for forward, ``w2^T`` for the L2 dgrad). When ``handle is None``
+    ``w1_fp8`` is the 4-tuple from ``prepare_dispatch_weight_fp8``, held version-keyed by the caller
+    -- the fc1 weight for the forward, ``w2^T`` for the L2 dgrad. When ``handle is None``
     (forward), builds the symmetric workspace + dispatch-prologue handle from ``topk_idx`` /
     ``topk_weights``; otherwise reuses the live symm buffer + the given handle (backward). Runs the
     fused dispatch-PUSH + grouped mxfp8 GEMM, with token quant folded in via the bf16-x path.
@@ -646,6 +720,7 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     count), the SwiGLU-epilogue row bound (mirrors bf16's ``handle[_H_NUM_TILE_BLOCKS]``). It can
     re-fetch the live symm buffer via ``get_symm_buffer_for_mega_moe()`` (e.g. the L2 combine flag reset).
     """
+    w1q = w1_fp8[0]
     handle_was_none = handle is None
     if handle is None:
         assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
@@ -659,29 +734,20 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
             hidden=H, intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
         )
         sym_layout = symm.make_sym_layout()
-        handle = tuple(
+        handle = extend_handle(
             dispatch_prologue(
                 topk_idx, topk_weights, sym_layout=sym_layout, num_tokens=T, num_topk=K,
                 num_experts=G * world, world_size=world, rank=symm.rank, experts_per_rank=G,
                 block_m=BM, num_max_pool_tokens=symm.num_max_pool_tokens,
-            )
-            # Snapshots of the shared symm scratch, so they belong to THIS call: the next prologue
-            # overwrites meta_scalars AND resets the whole origin_rank / origin_slot region, while
-            # the backward reuses this handle long after that. num_tile_blocks is the real-tile
-            # count; origin_rank / origin_slot map each pool row back to the rank and topk slot that
-            # sent it, which is what the L1-dgrad push needs to return the row to its owner. All three
-            # are stream-ordered D2D copies, no host sync. (bf16 does the same with pool_src_slot.)
-        ) + (
-            symm.meta_scalars[1:2].clone(),
-            symm.origin_rank.clone(),
-            symm.origin_slot.clone(),
+            ),
+            symm,
         )
     else:
         symm = get_symm_buffer_for_mega_moe()  # live buffer from a prior forward
         sym_layout = symm.make_sym_layout()
     _validate_tiles(handle, w1q.shape[0], fresh=handle_was_none)
     l1 = dispatch_grouped_gemm_mxfp8(
-        x, w1q, w1s, handle, sym_layout, symm,
+        x, w1_fp8, handle, sym_layout, symm,
         num_dispatch_cu=num_dispatch_cu, num_preshuffle_cu=num_preshuffle_cu, BM=BM, BN=BN,
     )
     _Px, _Hx = symm.pool_fp8.shape

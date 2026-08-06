@@ -17,6 +17,9 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8_flydsl,
     swiglu_mxfp8_flydsl_kernel,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
+    prepare_dispatch_weight_fp8,
+)
 
 
 def _bench(fn, group, warmup, iters):
@@ -72,8 +75,9 @@ def worker(local_rank, world, args):
             num_max_pool_tokens=symm.num_max_pool_tokens,
         )
     )
-    w1q, w1s = quantize_grouped_weight_mxfp8_flydsl(W1)
-    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    w1_fp8 = prepare_dispatch_weight_fp8(W1)
+    w1q, w1s = w1_fp8[:2]
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1_fp8, handle, sym_layout, symm, BM=BM, BN=BN)
     ntb = symm.meta_scalars[1:2]
     torch.cuda.synchronize()
     group.barrier()

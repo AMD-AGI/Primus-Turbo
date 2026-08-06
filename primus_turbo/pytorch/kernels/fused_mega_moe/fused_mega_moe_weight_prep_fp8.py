@@ -19,15 +19,30 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8_flydsl,
 )
 
-__all__ = ["prepare_w1_fp8", "prepare_w2_fp8"]
+__all__ = ["prepare_dispatch_weight_fp8", "prepare_w1_fp8", "prepare_w2_fp8"]
+
+
+def prepare_dispatch_weight_fp8(w: torch.Tensor):
+    """Prepare a grouped weight ``[G, N, K]`` for the fp8 dispatch GEMM -> ``(wq, ws, flat, b_sp)``.
+
+    Grouped mxfp8 quant + int8 flat + scale preshuffle (ScaleBComb, ``pack=1``): every weight
+    derivative the dispatch GEMM contracts, so the kernel does no per-call weight work and needs no
+    cache of its own. ``flat`` is a view of ``wq``, kept alongside it because the kernel still reads
+    ``wq`` for shape and dtype. Static per weight version, so a version-keyed holder computes this
+    once per ``optim.step``.
+    """
+    G, N, K = w.shape
+    wq, ws = quantize_grouped_weight_mxfp8_flydsl(w)
+    flat = wq.contiguous().reshape(G * N, K).view(torch.int8).reshape(-1)
+    return wq, ws, flat, preshuffle_b_scale(ws, G, N, K, pack=1)
 
 
 def prepare_w1_fp8(w1: torch.Tensor):
-    """Prepare the L1 fc1 weight ``[G, 2I, H]`` for the fp8 dispatch GEMM: grouped mxfp8 quant
-    (FlyDSL, E4M3) -> ``(w1q [G,2I,H] fp8, w1s [G,2I,H//32] raw E8M0)``. Unlike w2, the L1 dispatch
-    GEMM preshuffles the weight scale internally, so this is just the raw grouped quant (no
-    preshuffle / flatten). Parallels :func:`prepare_w2_fp8` so both weights prep through one layer."""
-    return quantize_grouped_weight_mxfp8_flydsl(w1)
+    """The L1 fc1 weight ``[G, 2I, H]`` prepped for the dispatch GEMM.
+
+    Thin alias of :func:`prepare_dispatch_weight_fp8`; parallels :func:`prepare_w2_fp8` so both
+    weights prep through one layer."""
+    return prepare_dispatch_weight_fp8(w1)
 
 
 def prepare_w2_fp8(l2_weights: torch.Tensor):

@@ -41,6 +41,9 @@ from primus_turbo.flydsl.mega.fp8 import (
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
     quantize_rowwise_mxfp8_flydsl,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
+    prepare_dispatch_weight_fp8,
+)
 
 _H_TILE_TO_EXPERT = 7
 _H_EXPECTED = 8
@@ -122,7 +125,8 @@ def profile(group, args):
     # timed L1 step. TOKENS are activation-dependent -> re-quantized EVERY forward; that token quant
     # now lives INSIDE dispatch_grouped_gemm_mxfp8 (bf16 x in -> one global rowwise mxfp8 quant,
     # then the clean-push pipeline). We still time the quant alone to show its share.
-    w1q, w1s = quantize_grouped_weight_mxfp8(W1)
+    w1_fp8 = prepare_dispatch_weight_fp8(W1)
+    w1q, w1s = w1_fp8[:2]
 
     def _quant_tokens():  # for the breakdown only (the op does this internally on the bf16 path)
         xq, xs = quantize_rowwise_mxfp8_flydsl(x)
@@ -133,7 +137,7 @@ def profile(group, args):
 
     def _l1_step():  # the REAL per-forward cost: token quant (inside) + fused dispatch+GEMM
         return dispatch_grouped_gemm_mxfp8(
-            x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN,
+            x, w1_fp8, handle, sym_layout, symm, BM=BM, BN=BN,
             num_dispatch_cu=ndcu, num_preshuffle_cu=pscu,
         )
 

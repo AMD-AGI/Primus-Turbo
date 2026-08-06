@@ -28,7 +28,10 @@ from primus_turbo.flydsl.mega.fp8 import (
 )
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float8_e5m2
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import prepare_w2_fp8
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
+    prepare_dispatch_weight_fp8,
+    prepare_w2_fp8,
+)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_impl,
 )
@@ -42,11 +45,6 @@ __all__ = [
 # dW1/dW2 wgrad fp8 encoding. E4M3 measured a slightly higher dW SNR than E5M2 at DSv3 magnitudes.
 _DW_FP8_FORMAT = torch.float8_e4m3fn
 
-# The L2 dgrad reuses the forward dispatch+GEMM kernel, but its N=I shape prefers more comm CUs and
-# fewer preshuffle CUs than the forward's N=2I default of 16/16.
-_L2_DGRAD_NUM_DISPATCH_CU = 24
-_L2_DGRAD_NUM_PRESHUFFLE_CU = 8
-
 # dispatch_prologue handle layout: [9]=num_tokens_per_expert, [10]=its prefix into the padded pool.
 # These MUST be the REAL unpadded lengths -- the variable-K wgrads mask each group at group_lens, so
 # a padded length would fold the tail padding rows into dW.
@@ -57,13 +55,13 @@ _W2T_PREP_ATTR = "_mega_fp8_w2t_prep"
 _W1T_COMBINE_PREP_ATTR = "_mega_fp8_w1t_combine_prep"
 
 
-def prepare_w2t_dgrad_fp8(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Grouped mxfp8 quant of ``w2^T`` -> ``(w2tq [G,I,H] fp8, w2ts [G,I,H//32] raw E8M0)``.
+def prepare_w2t_dgrad_fp8(w2: torch.Tensor) -> tuple:
+    """``w2^T`` [G,I,H] prepped for the L2 dgrad's dispatch GEMM -> ``(wq, ws, flat, b_sp)``.
 
     The L2 dgrad runs NT via the transposed weight, so w2 must be quantized along H (its
-    contraction axis). Static weight prep; the transpose+quant never runs inside the kernel.
+    contraction axis). Static weight prep; the transpose never runs inside the kernel.
     """
-    return quantize_grouped_weight_mxfp8_flydsl(w2.transpose(1, 2).contiguous())  # [G,I,H]
+    return prepare_dispatch_weight_fp8(w2.transpose(1, 2).contiguous())  # [G,I,H]
 
 
 def _w2t_fp8_cached(w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -93,11 +91,12 @@ def _w1t_combine_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
 def _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2, group, handle, *, w2t_fp8=None,
                                            num_dispatch_cu=None, num_preshuffle_cu=None):
     """Fp8 dispatch(dy) PUSH + fc2 dgrad: ``grad_swiglu = dy @ w2`` and rowwise-fp8 pool for dW2 ``a``."""
-    w2tq, w2ts = w2t_fp8 if w2t_fp8 is not None else _w2t_fp8_cached(w2)
+    w2t = w2t_fp8 if w2t_fp8 is not None else _w2t_fp8_cached(w2)
+    # None lets the kernel look this shape's split up; the dgrad's N=I wants a different one than the
+    # forward's N=2I, which is what a per-shape table gets right without pinned constants here.
     grad_swiglu, _, _, pool_fp8_handle = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
-        dy, w2tq, w2ts, group, handle=handle,
-        num_dispatch_cu=_L2_DGRAD_NUM_DISPATCH_CU if num_dispatch_cu is None else num_dispatch_cu,
-        num_preshuffle_cu=_L2_DGRAD_NUM_PRESHUFFLE_CU if num_preshuffle_cu is None else num_preshuffle_cu,
+        dy, w2t, group, handle=handle,
+        num_dispatch_cu=num_dispatch_cu, num_preshuffle_cu=num_preshuffle_cu,
     )
     return grad_swiglu, pool_fp8_handle
 

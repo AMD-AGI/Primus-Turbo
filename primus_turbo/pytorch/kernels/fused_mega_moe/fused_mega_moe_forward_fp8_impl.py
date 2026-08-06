@@ -39,11 +39,8 @@ _W1_PREP_ATTR = "_mega_fp8_w1_prep"
 _W2_PREP_ATTR = "_mega_fp8_w2_prep"
 _H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device real-tile count)
 
-# Retuned CU splits for EP8 T=8192 DSv3 (see bench_mega_moe_fp8 sweeps). The isolated L1 bench
-# favours 24/8, but that is a back-to-back-prologue artifact and e2e is insensitive, so keep 16/16.
-# L2 combine 32 beats 48 by ~5%. Pinned so prod skips the autotune cold-start sweep.
-_L1_NUM_DISPATCH_CU = 16
-_L1_NUM_PRESHUFFLE_CU = 16
+# The L1 comm/preshuffle split comes from the kernel's per-shape table, so nothing is pinned here.
+# L2 combine 32 beats 48 by ~5% on EP8 T=8192 DSv3; the combine kernel has no such table yet.
 _L2_NUM_COMBINE_CU = 32
 
 
@@ -94,9 +91,8 @@ def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
     return buf
 
 
-def _w1_fp8_cached(w1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """-> ``(w1q [G,2I,H] fp8, w1s [G,2I,H//32] raw E8M0)``. The scale stays raw because the L1
-    dispatch GEMM preshuffles it internally."""
+def _w1_fp8_cached(w1: torch.Tensor) -> tuple:
+    """-> the dispatch GEMM's 4-tuple ``(w1q, w1s, flat, b_sp)``; see ``prepare_dispatch_weight_fp8``."""
     return _version_keyed_weight_prep(w1, _W1_PREP_ATTR, prepare_w1_fp8)
 
 
@@ -125,17 +121,13 @@ def fused_mega_moe_forward_fp8_impl(
     ``pool_x_colwise`` / ``colwise_meta`` are dW1's ``b`` operand (None unless ``save_bwd``), built
     here because the fc1-input pool is still live in the symm buffer: requantizing it colwise now
     consumes that view instead of the clone the backward would otherwise need."""
-    w1q, w1s = _w1_fp8_cached(w1)
-
     # ── L1: fused mxfp8 dispatch + fc1 ──
     l1, handle, dispatch_weights, pool_x_fp8 = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
         x,
-        w1q, w1s,
+        _w1_fp8_cached(w1),
         group,
         topk_idx=topk_idx,
         topk_weights=topk_weights,
-        num_dispatch_cu=_L1_NUM_DISPATCH_CU,
-        num_preshuffle_cu=_L1_NUM_PRESHUFFLE_CU,
     )
 
     act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS])

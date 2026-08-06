@@ -22,6 +22,7 @@ low_precision) and the external ``flydsl`` package.
 from .dispatch_grouped_gemm_mxfp8_kernel import (
     dispatch_grouped_gemm_mxfp8,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
+    extend_handle,
 )
 
 # --- unified fp8 combine (ONE entry, role inferred from topk_weights/grad_gate; mirrors bf16) ---
@@ -57,6 +58,7 @@ from .quant import (
 __all__ = [
     "dispatch_grouped_gemm_mxfp8",
     "dispatch_grouped_gemm_mxfp8_flydsl_kernel",
+    "extend_handle",
     "grouped_gemm_combine_mxfp8_flydsl_kernel",
     "swiglu_mxfp8_flydsl_kernel",
     "dispatch_prologue",

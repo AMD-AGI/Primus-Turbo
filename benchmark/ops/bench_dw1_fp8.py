@@ -34,6 +34,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     colwise_quant_mxfp8_grouped_flydsl,
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
+    extend_handle,
     get_symm_buffer_for_mega_moe,
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
 )
@@ -46,6 +47,9 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_imp
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
     _mxfp8_variable_k_wgrad_dw1,
+)
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
+    prepare_dispatch_weight_fp8,
 )
 
 _H_GROUP_LENS = 9
@@ -105,23 +109,24 @@ def profile(group, args):
         intermediate_hidden=I, block_m=BM, block_n=BN, use_mxfp8=True,
     )
     sym_layout = symm.make_sym_layout()
-    handle = tuple(dispatch_prologue(
+    handle = extend_handle(dispatch_prologue(
         topk_idx, topk_w, sym_layout=sym_layout, num_tokens=T, num_topk=K, num_experts=E,
         world_size=world, rank=symm.rank, experts_per_rank=epr, block_m=BM,
         num_max_pool_tokens=symm.num_max_pool_tokens,
-    ))
+    ), symm)
 
     # forward L1 -> l1 + dispatch_weights, then CLONE the fc1-input pool BEFORE the L2 dgrad overwrites it
-    w1q, w1s = quantize_grouped_weight_mxfp8(W1)
+    w1_fp8 = prepare_dispatch_weight_fp8(W1)
+    w1q, w1s = w1_fp8[:2]
     torch.cuda.synchronize(); group.barrier()
     # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard reset.
-    l1 = dispatch_grouped_gemm_mxfp8(x, w1q, w1s, handle, sym_layout, symm, BM=BM, BN=BN)
+    l1 = dispatch_grouped_gemm_mxfp8(x, w1_fp8, handle, sym_layout, symm, BM=BM, BN=BN)
     dispatch_weights = symm.weight_recv_buf.clone()
     Pp, Hp = symm.pool_fp8.shape
     pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(Pp, Hp // 32).clone())
 
     dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
-    grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
+    grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle)
     grad_l1, _, _ = swiglu_backward_flydsl_kernel(
         grad_swiglu, l1, get_symm_buffer_for_mega_moe().meta_scalars[1:2],
         scale=dispatch_weights, return_gate=True, return_act_w=True,

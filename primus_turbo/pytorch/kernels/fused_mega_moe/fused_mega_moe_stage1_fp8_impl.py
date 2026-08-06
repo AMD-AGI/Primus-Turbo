@@ -21,8 +21,6 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_imp
     prepare_dw1_pool_operand_fp8,
 )
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_fp8_impl import (
-    _L1_NUM_DISPATCH_CU,
-    _L1_NUM_PRESHUFFLE_CU,
     _w1_fp8_cached,
 )
 
@@ -52,16 +50,12 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     """
     # int64 end-to-end (combine reads topk i64)
     topk_idx = topk_idx.to(torch.int64)
-    w1q, w1s = _w1_fp8_cached(w1)
-
     l1, handle, dispatch_weights, pool_x_fp8 = dispatch_grouped_gemm_mxfp8_flydsl_kernel(
         x,
-        w1q, w1s,
+        _w1_fp8_cached(w1),
         group,
         topk_idx=topk_idx,
         topk_weights=topk_weights,
-        num_dispatch_cu=_L1_NUM_DISPATCH_CU,
-        num_preshuffle_cu=_L1_NUM_PRESHUFFLE_CU,
     )
     assert len(handle) == _HANDLE_LEN, f"fp8 dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
 

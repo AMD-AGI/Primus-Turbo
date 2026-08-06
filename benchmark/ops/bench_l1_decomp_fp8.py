@@ -81,7 +81,7 @@ def worker(local_rank, world, args):
     topk_w, topk_idx = topk_w.float(), topk_idx.long()
     W1g = torch.randn((E, 2 * I, H), device="cuda", dtype=torch.bfloat16) * (2.0 / math.sqrt(H))
     W1 = W1g[rank * epr : (rank + 1) * epr].contiguous()
-    w1q, w1s = _w1_fp8_cached(W1)
+    w1_fp8 = _w1_fp8_cached(W1)
 
     symm = get_symm_buffer_for_mega_moe(
         group, num_experts=E, num_max_tokens_per_rank=T, num_topk=K, hidden=H,
@@ -111,7 +111,7 @@ def worker(local_rank, world, args):
 
     def _fused():
         dispatch_grouped_gemm_mxfp8(
-            x, w1q, w1s, handle, sym_layout, symm,
+            x, w1_fp8, handle, sym_layout, symm,
             num_dispatch_cu=DC, num_preshuffle_cu=PC, BM=BM, BN=BN,
         )
 
@@ -119,7 +119,7 @@ def worker(local_rank, world, args):
 
     def _full_l1():
         dispatch_grouped_gemm_mxfp8_flydsl_kernel(
-            x, w1q, w1s, group, topk_idx=topk_idx, topk_weights=topk_w,
+            x, w1_fp8, group, topk_idx=topk_idx, topk_weights=topk_w,
             num_dispatch_cu=DC, num_preshuffle_cu=PC, BM=BM, BN=BN,
         )
 

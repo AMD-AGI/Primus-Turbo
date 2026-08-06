@@ -90,13 +90,13 @@ def worker(local_rank, world, args):
     W1 = W1g[rank * epr : (rank + 1) * epr].contiguous()
     W2 = W2g[rank * epr : (rank + 1) * epr].contiguous()
 
-    w1q, w1s = _w1_fp8_cached(W1)
+    w1_fp8 = _w1_fp8_cached(W1)
     w2_fp8 = prepare_w2_fp8(W2)
 
     # ── fp8 path setup ──
     def _fp8_l1():
         return dispatch_grouped_gemm_mxfp8_flydsl_kernel(
-            x, w1q, w1s, group, topk_idx=topk_idx, topk_weights=topk_w,
+            x, w1_fp8, group, topk_idx=topk_idx, topk_weights=topk_w,
             num_dispatch_cu=DC, num_preshuffle_cu=PC, BM=BM, BN=BN,
         )
 

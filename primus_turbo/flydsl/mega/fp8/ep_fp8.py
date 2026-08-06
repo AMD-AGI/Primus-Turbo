@@ -23,11 +23,10 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
+from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, _WARP
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, l2_writeback
 from primus_turbo.flydsl.mega.fp8.gemm_helper import _emit_if_then
 
-_WARP = 64
-_BLOCK_THREADS = 512
 _VEC_I32 = 4  # 4 x i32 = 16B / lane (b128 XGMI)
 
 
