@@ -51,6 +51,7 @@ def test_quantize_fp8_tensorwise(orig_dtype, dest_dtype, numel, torch_compile, g
     else:
         x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=granularity)
 
+    assert x_fp8.shape == x.shape
     torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
     torch.testing.assert_close(
         x_fp8_ref.to(torch.float32) * x_scale_inv_ref,

@@ -80,19 +80,32 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                        amax.numel(), stream);
     }
 
-    // Output: last dim K -> Kp (Kp == K when padding_align_size divides K).
-    std::vector<int64_t> out_shape(input.sizes().begin(), input.sizes().end());
-    out_shape.back()  = Kp;
-    at::Tensor output = torch::empty(out_shape, torch::dtype(dest_dtype).device(input.device()));
-
-    TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
-        TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
-            quantize_tensorwise_pad_impl<FType, QType>(
-                reinterpret_cast<const FType *>(input.data_ptr()),
-                reinterpret_cast<const float *>(scale.data_ptr()),
-                reinterpret_cast<QType *>(output.data_ptr()), rows, K, Kp, stream);
+    at::Tensor output;
+    if (padding_align_size == 1) {
+        output = torch::empty_like(input, input.options().dtype(dest_dtype));
+        TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+            TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+                quantize_tensorwise_impl<FType, QType>(
+                    reinterpret_cast<const FType *>(input.data_ptr()),
+                    reinterpret_cast<const float *>(scale.data_ptr()),
+                    reinterpret_cast<QType *>(output.data_ptr()), input.numel(), stream);
+            });
         });
-    });
+    } else {
+        // Output: last dim K -> Kp.
+        std::vector<int64_t> out_shape(input.sizes().begin(), input.sizes().end());
+        out_shape.back() = Kp;
+        output = torch::empty(out_shape, torch::dtype(dest_dtype).device(input.device()));
+
+        TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
+            TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
+                quantize_tensorwise_pad_impl<FType, QType>(
+                    reinterpret_cast<const FType *>(input.data_ptr()),
+                    reinterpret_cast<const float *>(scale.data_ptr()),
+                    reinterpret_cast<QType *>(output.data_ptr()), rows, K, Kp, stream);
+            });
+        });
+    }
 
     return {output, scale_inv};
 }
