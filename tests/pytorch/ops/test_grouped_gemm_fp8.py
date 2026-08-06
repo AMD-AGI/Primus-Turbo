@@ -1226,3 +1226,121 @@ def test_grouped_gemm_fp8_padded_tail_zeroed(ori_dtype, trans_b, backend):
     )
 
     GlobalBackendManager.reset()
+
+
+def _run_grouped_gemm_fp8_fused_grad_accum_test(B, M, N, K, ori_dtype, granularity, trans_b):
+    """``fuse_grad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
+
+    The fused path hands the weight's ``main_grad`` to the wgrad GEMM as a beta=1
+    accumulate target instead of returning a gradient for autograd to add on top, so
+    the check is that the buffer moved by exactly the wgrad the ordinary path produces.
+    """
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if granularity == ScalingGranularity.MX_BLOCKWISE:
+        supported, reason = check_mxfp8_support()
+        if not supported:
+            pytest.skip(reason)
+
+    device = "cuda:0"
+    print(
+        f"\nB={B}, M={M}, N={N}, K={K}, ori_dtype={ori_dtype}, granularity={granularity}, trans_b={trans_b}"
+    )
+
+    # Only the Triton variable-K backend implements the beta=1 accumulate epilogue.
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+    GlobalBackendManager.set_auto_tune(False)
+
+    if granularity == ScalingGranularity.BLOCKWISE:
+        config = Float8QuantConfig(format=Format.E4M3, granularity=granularity, block_size=128)
+    elif granularity == ScalingGranularity.MX_BLOCKWISE:
+        config = Float8QuantConfig(
+            format=Format.E4M3,
+            granularity=granularity,
+            block_size=MXFP8_BLOCK_SIZE,
+            scale_dtype=ScaleDtype.E8M0,
+        )
+    else:
+        config = Float8QuantConfig(format=Format.E4M3, granularity=granularity)
+
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    b_shape = (B, N, K) if trans_b else (B, K, N)
+
+    a = torch.randn((B * M, K), dtype=ori_dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=ori_dtype, device=device, requires_grad=True)
+    grad_out = torch.randn((B * M, N), dtype=ori_dtype, device=device)
+    a_fused = a.detach().clone().requires_grad_(True)
+    b_fused = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+
+    # Baseline: ordinary autograd, b.grad holds the weight gradient.
+    out = grouped_gemm_fp8(a, b, group_lens, trans_b=trans_b, config=config)
+    out.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # Fused: the wgrad is accumulated into a pre-seeded main_grad buffer.
+    previous = torch.randn(b_fused.shape, dtype=torch.float32, device=device)
+    b_fused.main_grad = previous.clone()
+    b_fused.grad_added_to_main_grad = False
+
+    out_fused = grouped_gemm_fp8(
+        a_fused,
+        b_fused,
+        group_lens,
+        trans_b=trans_b,
+        config=config,
+        fuse_grad_accum_pattern="megatron",
+    )
+    out_fused.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # The forward is untouched, and the weight is flagged and left without a .grad so
+    # the training framework's own accumulation step stands down.
+    torch.testing.assert_close(out_fused, out)
+    assert b_fused.grad_added_to_main_grad is True, "weight must be flagged during forward"
+    assert b_fused.grad is None, "the fused path must not also produce b.grad"
+
+    snr_threshold = 25
+
+    a_grad_snr = compute_snr(a.grad, a_fused.grad)
+    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
+    assert a_grad_snr > snr_threshold, "a_grad_snr too low"
+
+    # The baseline rounds the wgrad to ori_dtype before autograd stores it while the
+    # fused path carries the fp32 accumulator all the way into the fp32 main_grad, so
+    # the two differ by that rounding -- compare by SNR rather than exactly.
+    accumulated = b_fused.main_grad - previous
+    b_grad_snr = compute_snr(b.grad.float(), accumulated)
+    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
+    assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+    GlobalBackendManager.reset()
+
+
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize(
+    "granularity, trans_b",
+    [
+        (ScalingGranularity.TENSORWISE, True),
+        (ScalingGranularity.TENSORWISE, False),
+        (ScalingGranularity.ROWWISE, True),
+        (ScalingGranularity.ROWWISE, False),
+        (ScalingGranularity.BLOCKWISE, True),
+        (ScalingGranularity.BLOCKWISE, False),
+        # MXFP8 grouped GEMM is NT-only.
+        (ScalingGranularity.MX_BLOCKWISE, True),
+    ],
+)
+def test_grouped_gemm_fp8_fused_grad_accum(ori_dtype, granularity, trans_b):
+    _run_grouped_gemm_fp8_fused_grad_accum_test(
+        B=4,
+        M=256,
+        N=512,
+        K=256,
+        ori_dtype=ori_dtype,
+        granularity=granularity,
+        trans_b=trans_b,
+    )

@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+
 import torch
 
 from primus_turbo.pytorch.core.backend import (
@@ -624,6 +625,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ):
         if trans_c:
@@ -632,6 +635,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         else:
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
+
+        beta = 1.0 if inplace_add_to_out else 0.0
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # wgrad: C[g](OUT_M,OUT_N) = lhs[:,g](OUT_M,M_g) @ rhs[:,g](OUT_N,M_g)^T
@@ -651,6 +656,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 G,
                 out_dtype=out_dtype,
                 num_cu=num_cu,
+                out=out,
+                beta=beta,
             )
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
@@ -660,6 +667,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 rhs_scales,
                 group_offs,
                 out_dtype=out_dtype,
+                out=out,
+                beta=beta,
             )
         elif granularity == ScalingGranularity.ROWWISE:
             return grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
@@ -669,6 +678,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 rhs_scales,
                 group_offs,
                 out_dtype=out_dtype,
+                out=out,
+                beta=beta,
             )
         return grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
             lhs,
@@ -677,6 +688,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
             rhs_scales,
             group_offs,
             out_dtype=out_dtype,
+            out=out,
+            beta=beta,
         )
 
 
@@ -903,6 +916,120 @@ def grouped_gemm_fp8_variable_k_impl(
     )
 
     return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+
+
+def _assert_triton_backend_will_run(
+    default_backend_enum: BackendType,
+    user_backend_enum: BackendType | None,
+    kwargs: dict,
+) -> None:
+    """Fail unless the dispatcher is guaranteed to land on the Triton backend.
+
+    Mirrors ``AutoKernelDispatcher.dispatch``: an explicit backend wins, then
+    auto-tune, then the default backend, then a scan of whatever else can handle the
+    inputs. Accumulating into ``out`` is Triton-only, and every other backend would
+    swallow ``out`` through ``**kwargs`` and silently produce no gradient, so all
+    three ways of reaching a different backend are rejected here instead.
+    """
+    resolved = user_backend_enum if user_backend_enum is not None else default_backend_enum
+    assert resolved == BackendType.TRITON, (
+        f"Fused gradient accumulation requires the TRITON grouped GEMM backend, "
+        f"but {resolved.name} is selected. Pin it with "
+        f"GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON) or "
+        f"PRIMUS_TURBO_GROUPED_GEMM_BACKEND=triton."
+    )
+    assert not GlobalBackendManager.auto_tune_enabled(), (
+        "Fused gradient accumulation is incompatible with auto-tune: the tuner may "
+        "pick a backend that cannot accumulate into `out`."
+    )
+    assert GroupedGEMMFP8VariableKTritonBackend.can_handle(**kwargs), (
+        "The TRITON grouped GEMM backend cannot handle these inputs, so the dispatcher "
+        "would fall back to a backend that cannot accumulate into `out`."
+    )
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::grouped_gemm_fp8_variable_k_accum_impl", mutates_args={"out"}, device_types="cuda"
+)
+def grouped_gemm_fp8_variable_k_accum_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+) -> None:
+    """Variable-K grouped FP8 GEMM that accumulates into ``out`` instead of returning.
+
+    Computes ``out += A^T @ B`` per group, folding the accumulation into the GEMM
+    epilogue (beta=1) so the caller does not have to run a separate elementwise add
+    over the whole weight-gradient buffer.
+
+    Split out from :func:`grouped_gemm_fp8_variable_k_impl` rather than added as a
+    flag on it because a ``torch.library`` custom op may not return a tensor that
+    aliases one of its inputs; this one mutates ``out`` and returns nothing.
+
+    Only the Triton backend implements the beta=1 epilogue. Every other backend takes
+    ``**kwargs`` and would quietly ignore ``out``, leaving the caller with a buffer
+    that was never written, so the backend is resolved and checked up front.
+    """
+    default_backend_enum = BackendType(default_backend)
+    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    granularity_enum = ScalingGranularity(granularity)
+
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scales=a_scales,
+        b_scales=b_scales,
+        group_lens=group_lens,
+        group_offs=group_offs,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        out_dtype=out_dtype,
+        granularity=granularity_enum,
+        num_cu=num_cu,
+        maybe_pre_sync=maybe_pre_sync,
+        inplace_add_to_out=True,
+        out=out,
+    )
+
+    _assert_triton_backend_will_run(default_backend_enum, user_backend_enum, kwargs)
+    GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+
+
+@grouped_gemm_fp8_variable_k_accum_impl.register_fake
+def grouped_gemm_fp8_variable_k_accum_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+) -> None:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
+    assert out.dim() == 3, f"out must be 3D, got {out.shape}"
+    return None
 
 
 @grouped_gemm_fp8_impl.register_fake
