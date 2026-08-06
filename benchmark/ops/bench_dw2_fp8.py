@@ -7,7 +7,7 @@
 """Backward dW2 (fc2 weight grad) MXFP8 variable-K wgrad -- isolated correctness + latency.
 
 Replicates the backward up to dW2 on real mega-pool data: forward L1 -> (l1, dispatch_weights),
-STEP1 (dispatch(dy)+fc2 dgrad) -> grad_swiglu + the dispatched-dy fp8 pool, STEP2 swiglu_backward
+the L2 dgrad (dispatch(dy)+fc2) -> grad_swiglu + the dispatched-dy fp8 pool, SwiGLU^T
 -> act_weighted. Then computes dW2 = dispatch_l2_grad^T @ act_weighted (variable-K over the pool)
 BOTH ways on the SAME tensors -- fp8 (``_mxfp8_variable_k_wgrad_dw2``, requant the fp8 pool colwise +
 colwise-quant act) vs bf16 (``grouped_gemm_variable_k_impl`` on the dequant'd pool) -- and gates by
@@ -128,7 +128,7 @@ def profile(group, args):
         num_max_pool_tokens=symm.num_max_pool_tokens,
     ))
 
-    # forward L1 -> l1 + dispatch_weights (the STEP2 inputs)
+    # forward L1 -> l1 + dispatch_weights (the SwiGLU^T inputs)
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
     # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard reset.
@@ -136,9 +136,9 @@ def profile(group, args):
     dispatch_weights = symm.weight_recv_buf.clone()
 
     dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
-    # STEP1 (dispatch(dy)+fc2 dgrad) -> grad_swiglu + dispatched-dy fp8 pool
+    # the L2 dgrad (dispatch(dy)+fc2) -> grad_swiglu + dispatched-dy fp8 pool
     grad_swiglu, pool_handle = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle, BM, BN)
-    # STEP2 (swiglu^T, re-inject routing weight) -> act_weighted (the dW2 b operand)
+    # SwiGLU^T (re-inject routing weight) -> act_weighted (the dW2 b operand)
     _, _, act_weighted = swiglu_backward_flydsl_kernel(
         grad_swiglu, l1, get_symm_buffer_for_mega_moe().meta_scalars[1:2],
         scale=dispatch_weights, return_gate=True, return_act_w=True,

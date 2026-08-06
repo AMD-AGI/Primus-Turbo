@@ -6,13 +6,8 @@
 
 """Two-stage mega MoE stage1 (gate-up) MXFP8 FlyDSL kernel composition.
 
-fp8 sibling of ``fused_mega_moe_stage1_impl``: the same kernels in the same order as the fused
-``fused_mega_moe_forward_fp8_impl`` / ``fused_mega_moe_backward_fp8_impl``, cut at ``l1`` (pre-SwiGLU)
-so w1 and w2 can sit in separate modules and become independent DDP gradient boundaries. No new
-kernel is introduced here -- every call below is a helper the fused path already uses.
-
-Stage1 owns: forward dispatch + fc1 (NT mxfp8) and the fc1-input pool requant for dW1; backward
-STEP3 (fc1 dgrad + combine -> dx) and the dW1 variable-K wgrad.
+Stage1 owns the forward dispatch + fc1 and the fc1-input pool requant for dW1; on the backward, the
+L1 dgrad and the dW1 wgrad. Every call below is a helper the fused path already uses.
 """
 
 from typing import Optional, Tuple
@@ -46,18 +41,14 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     group,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
-    block_m: int,
-    block_n: int,
     save_bwd: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, tuple, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[dict]]:
-    """Fused mxfp8 dispatch + fc1 (NT).
+    """dispatch + grouped fc1 GEMM (nt, mxfp8).
 
-    Returns ``(l1, dispatch_weights, handle, pool_x_colwise, colwise_meta)``. ``l1`` is the fc1
-    output [P, 2I] that stage2 SwiGLUs; ``dispatch_weights`` is cloned out of the live symm pool
-    because stage2's backward needs it as the SwiGLU^T scale long after later stages overwrite the
-    buffer. ``pool_x_colwise`` / ``colwise_meta`` (None unless ``save_bwd``) are dW1's ``b`` operand,
-    requantized here while the fc1-input pool is still live in symm -- the fused path does the same,
-    only after the L2 combine instead of right after dispatch.
+    Returns ``(l1, dispatch_weights, handle, pool_x_colwise, colwise_meta)``. ``dispatch_weights`` is
+    cloned because stage2's backward needs it as the SwiGLU^T scale long after later stages overwrite
+    the symm buffer. ``pool_x_colwise`` / ``colwise_meta`` (None unless ``save_bwd``) are dW1's ``b``
+    operand, requantized here while the fc1-input pool is still live in symm.
     """
     # int64 end-to-end (combine reads topk i64)
     topk_idx = topk_idx.to(torch.int64)
@@ -71,7 +62,6 @@ def fused_mega_moe_stage1_forward_fp8_impl(
         topk_weights=topk_weights,
         num_dispatch_cu=_L1_NUM_DISPATCH_CU,
         num_preshuffle_cu=_L1_NUM_PRESHUFFLE_CU,
-        BM=block_m, BN=block_n,
     )
     assert len(handle) == _HANDLE_LEN, f"fp8 dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
 
@@ -93,19 +83,15 @@ def fused_mega_moe_stage1_backward_fp8_impl(
     topk_idx: torch.Tensor,
     num_tokens: int,
     num_topk: int,
-    block_m: int,
-    block_n: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """STEP3 (fc1 dgrad + combine + reduce -> dx, grad_gate scatter) then the dW1 variable-K wgrad.
+    """L1 dgrad combine + dW1 (variable-K wgrad).
 
-    Both grad_l1 operands come pre-quantized from stage2's fused SwiGLU^T dual-quant -- the fp8 path
-    never materializes a bf16 grad_l1, which is why they arrive through the state side-channel
-    rather than the ``l1`` gradient slot. STEP3 and dW1 stay serial on the default stream.
-
-    Returns ``(dx, grad_topk_weights, dW1)`` with dW1 in the wgrad's bf16 accumulate dtype.
+    Returns ``(dx, grad_topk_weights, dW1)``. Both grad_l1 operands arrive pre-quantized from
+    stage2's fused SwiGLU^T dual-quant, which is why they come through the state side channel and
+    not the ``l1`` gradient slot. The two calls stay serial on the default stream.
     """
     dx, grad_topk_weights = _l1_dgrad_combine_mxfp8_flydsl_kernel(
-        w1, group, handle, block_m, block_n,
+        w1, group, handle,
         grad_l1_rowwise_fp8=grad_l1_rowwise_fp8,
         grad_gate=grad_gate,
         topk_idx=topk_idx,

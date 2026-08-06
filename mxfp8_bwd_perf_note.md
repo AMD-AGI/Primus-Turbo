@@ -157,30 +157,30 @@ From the campaign's round-1/2 budget (see `logs/optimize.md`); not re-measured t
 
 | Leg | Time (ms) | Share | Note |
 |---|---|---|---|
-| STEP3 combine (fc1-dgrad GEMM + PUSH + reduce) | ~2.69 | ~31% | PUSH is at the XGMI limit |
+| the L1 dgrad combine (fc1-dgrad GEMM + PUSH + reduce) | ~2.69 | ~31% | PUSH is at the XGMI limit |
 | dW1 GEMM (variable-K, LOCAL) | ~2.08 | ~24% | ~39% of peak |
 | L2 dgrad + dW2 + quant | remainder | — | includes ~0.43 ms fused dual-quant |
 
-STEP3's PUSH leg moves ~484 MB/rank in ~1.97 ms ≈ 246 GB/s/rank ≈ 1.97 TB/s aggregate = the XGMI
+The L1 dgrad's PUSH leg moves ~484 MB/rank in ~1.97 ms ≈ 246 GB/s/rank ≈ 1.97 TB/s aggregate = the XGMI
 ceiling. Rounds 3 and 5 established this independently, so **the remaining lever there is fewer
 bytes, not better scheduling or a different CU split**. The largest single traffic item is the local
 round trip where the GEMM epilogue writes 469 MB to L2Y and the PUSH reads the same 469 MB back.
 
-> **Unresolved (08-02).** STEP1 pushes the same ~484 MB/rank, yet its *entire fused stage* measures
-> 1.686 ms — less than the 1.97 ms this paragraph assigns to STEP3's PUSH alone. Both cannot hold.
+> **Unresolved (08-02).** the L2 dgrad pushes the same ~484 MB/rank, yet its *entire fused stage* measures
+> 1.686 ms — less than the 1.97 ms this paragraph assigns to the L1 dgrad's PUSH alone. Both cannot hold.
 > The 1.97 ms was not re-derived this session, so treat "246 GB/s/rank = the XGMI ceiling" as
-> unverified, and do not build a roofline on it until someone re-measures STEP3's PUSH in isolation.
+> unverified, and do not build a roofline on it until someone re-measures the L1 dgrad's PUSH in isolation.
 
-### 2.1 STEP1 (dispatch(dy) + fc2 dgrad) — measured 08-02
+### 2.1 the L2 dgrad (dispatch(dy) + fc2 dgrad) — measured 08-02
 
-`benchmark/ops/bench_step1_fp8_vs_bf16.py`, EP8 T=8192, two runs agreeing to 0.001 ms:
+`benchmark/ops/bench_l2_dgrad_fp8_vs_bf16.py`, EP8 T=8192, two runs agreeing to 0.001 ms:
 
 | | Time | TFLOPS | Share of its own backward |
 |---|---|---|---|
-| STEP1 fp8 | 1.686 ms | 1212 | 19.8% |
-| STEP1 bf16 | 2.408 ms | 849 | 17.5% |
+| L2 dgrad fp8 | 1.686 ms | 1212 | 19.8% |
+| L2 dgrad bf16 | 2.408 ms | 849 | 17.5% |
 
-fp8 is 1.43× here against 1.63× for the backward as a whole, so **STEP1 is the weakest fp8 leg** and
+fp8 is 1.43× here against 1.63× for the backward as a whole, so **the L2 dgrad is the weakest fp8 leg** and
 is what pulls the average down. Accuracy: `grad_swiglu` SNR 30.89 dB vs a per-group bf16 reference.
 
 Truncating the pushed rows (`MEGA_MOE_PROBE_PUSH_SKIP_MOD`; wrong results, timing only) gives the
@@ -193,7 +193,7 @@ with the PUSH removed entirely fp8 only reaches 36%. The mxfp8 grouped GEMM fail
 
 **This partially un-refutes dedup, for the backward only.** The same probe on the forward L1 bought
 0.077 ms for a third of the rows, inside that leg's noise (`mxfp8_fwd_breakdown_note.md` §4c); on
-STEP1 the same fractional cut is worth ~0.21 ms, ~2.7× more sensitive. The reason is shape: the
+the L2 dgrad the same fractional cut is worth ~0.21 ms, ~2.7× more sensitive. The reason is shape: the
 dgrad GEMM is half the FLOPs of the forward L1 (N=I=2048 vs 2I=4096) against identical PUSH bytes,
 so here the PUSH has much less GEMM to hide behind. A forward-refuted optimization does not stay
 refuted in the backward.
@@ -261,7 +261,7 @@ With identical seeded inputs, 6 runs compared bitwise against run 0
 | Output | rows differing | max\|Δ\| |
 |---|---|---|
 | `y` (forward L2 combine) | 23.2% (T=2048), 13.1% (T=8192) | 4.1e-01 |
-| `dx` (backward STEP3 combine) | 18.5% (T=2048), 11.3% (T=8192) | 3.4e+01 |
+| `dx` (backward the L1 dgrad combine) | 18.5% (T=2048), 11.3% (T=8192) | 3.4e+01 |
 | `d_topk_w` | deterministic | 0 |
 | `dW1` / `dW2` | 100% | 3.1e-02 / 1.6e-02 |
 
@@ -382,8 +382,8 @@ export MASTER_PORT=\$((9000+RANDOM%500))
 python benchmark/ops/bench_mega_moe_bwd_only.py \
   --num-processes 8 --num-tokens 8192 --routing-mode both --only both --warmup 8 --iters 25
 
-# sec.2.1 STEP1 isolate; prefix MEGA_MOE_PROBE_PUSH_SKIP_MOD=2 or 4 for the PUSH derivative
-python benchmark/ops/bench_step1_fp8_vs_bf16.py --num-processes 8 --num-tokens 8192
+# sec.2.1 the L2 dgrad isolate; prefix MEGA_MOE_PROBE_PUSH_SKIP_MOD=2 or 4 for the PUSH derivative
+python benchmark/ops/bench_l2_dgrad_fp8_vs_bf16.py --num-processes 8 --num-tokens 8192
 '"
 ```
 
@@ -398,10 +398,10 @@ every later run. Reap by `spawn_main`; the wrappers under
 |---|---|---|
 | ~~P1~~ | ~~root-cause the GEMM→push gate~~ | **Done 2026-08-03.** The release was missing bf16's second `s_waitcnt(0)` + `s_barrier`; it cost accuracy (NaN in the forward output once routing changes), not just reproducibility. Fixed at no measurable cost, stall dropped. Repro: `repro_fp8_combine_gate.py` |
 | **P2** | track `dW1`/`dW2` accumulation-order nondeterminism | independent source, one bf16 ULP |
-| **P3** | kill the L2Y local round trip in STEP3 | 469 MB written + 469 MB re-read; the only lever that attacks the XGMI/HBM floor |
-| **P5** | XGMI dedup on STEP1 | refuted on the forward, but §2.1 measures ~2.7× more push sensitivity here; ~0.21 ms of 1.686 |
-| **P6** | why the mxfp8 grouped GEMM stops at ~36% of peak | §2.1 — the cap on STEP1's fp8/bf16 ratio, and dW1 sits at a similar 39% |
-| **P7** | re-derive STEP3's isolated PUSH time | §2 says 1.97 ms at the XGMI ceiling; STEP1's whole stage is 1.686 ms for the same bytes |
+| **P3** | kill the L2Y local round trip in the L1 dgrad | 469 MB written + 469 MB re-read; the only lever that attacks the XGMI/HBM floor |
+| **P5** | XGMI dedup on the L2 dgrad | refuted on the forward, but §2.1 measures ~2.7× more push sensitivity here; ~0.21 ms of 1.686 |
+| **P6** | why the mxfp8 grouped GEMM stops at ~36% of peak | §2.1 — the cap on the L2 dgrad's fp8/bf16 ratio, and dW1 sits at a similar 39% |
+| **P7** | re-derive the L1 dgrad's isolated PUSH time | §2 says 1.97 ms at the XGMI ceiling; the L2 dgrad's whole stage is 1.686 ms for the same bytes |
 | **P4** | group-aware L2 swizzle for the combine GEMM | plain `GROUP_M` degrades monotonically (round 4) — groups span per-expert B slabs |
 | — | `num_combine_cu` re-sweep | exhausted (round 3): 28 optimal, PUSH is traffic-bound |
 | — | segment-driven PUSH | refuted (round 5): loses ILP from the compile-time trip count |

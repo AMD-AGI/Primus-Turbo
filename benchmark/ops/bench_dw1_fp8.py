@@ -7,8 +7,8 @@
 """Backward dW1 (fc1 weight grad) MXFP8 variable-K wgrad -- isolated correctness + latency.
 
 Replicates the backward up to dW1 on real mega-pool data: forward L1 -> (l1, dispatch_weights) and
-CLONE the forward-dispatched fc1-input pool (pool_x, native rowwise-fp8) BEFORE STEP1 overwrites it;
-STEP1 (dispatch(dy)+fc2 dgrad); STEP2 swiglu_backward -> grad_l1. Then dW1 = grad_l1^T @ pool_x
+CLONE the forward-dispatched fc1-input pool (pool_x, native rowwise-fp8) BEFORE the L2 dgrad overwrites it;
+the L2 dgrad (dispatch(dy)+fc2); SwiGLU^T -> grad_l1. Then dW1 = grad_l1^T @ pool_x
 (variable-K over the pool) BOTH ways on the SAME tensors -- fp8 (``_mxfp8_variable_k_wgrad_dw1``,
 colwise-quant grad_l1 + requant the fp8 pool colwise) vs bf16 (``grouped_gemm_variable_k_impl`` on
 the dequant'd pool) -- and gates by SNR. dW1's fp8 path is LOCAL (reuses the forward pool, no
@@ -111,7 +111,7 @@ def profile(group, args):
         num_max_pool_tokens=symm.num_max_pool_tokens,
     ))
 
-    # forward L1 -> l1 + dispatch_weights, then CLONE the fc1-input pool BEFORE STEP1 overwrites it
+    # forward L1 -> l1 + dispatch_weights, then CLONE the fc1-input pool BEFORE the L2 dgrad overwrites it
     w1q, w1s = quantize_grouped_weight_mxfp8(W1)
     torch.cuda.synchronize(); group.barrier()
     # dispatch/combine gates self-reset on device (epoch) -> no host scoreboard reset.
@@ -134,7 +134,7 @@ def profile(group, args):
     sc = torch.exp2((ps - 127).to(torch.float32)).view(Pp, Hp // 32, 1)
     pool_x_bf = (pf * sc).view(Pp, Hp).to(torch.bfloat16)
 
-    # Production pre-quantizes both operands elsewhere (grad_l1 in STEP3's dual quant, the pool in
+    # Production pre-quantizes both operands elsewhere (grad_l1 in the L1 dgrad's dual quant, the pool in
     # the forward); this isolate times them as part of dW1, so it reads HIGH against the fused path.
     dw1_meta = colwise_grouped_meta(group_lens, group_offs)
 

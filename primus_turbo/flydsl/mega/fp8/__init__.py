@@ -17,7 +17,7 @@ low_precision) and the external ``flydsl`` package.
 """
 
 # --- fused mxfp8 dispatch PUSH + preshuffle + grouped mxfp8 NT GEMM ---
-# (generic: forward L1 = dispatch(x)+fc1; backward STEP1 = dispatch(dy)+fc2 dgrad reuses it with a
+# (generic: forward L1 = dispatch(x)+fc1; the backward L2 dgrad = dispatch(dy)+fc2 reuses it with a
 # different CU split -- no separate bwd kernel)
 from .dispatch_grouped_gemm_mxfp8_kernel import (
     dispatch_grouped_gemm_mxfp8,
@@ -26,7 +26,7 @@ from .dispatch_grouped_gemm_mxfp8_kernel import (
 
 # --- unified fp8 combine (ONE entry, role inferred from topk_weights/grad_gate; mirrors bf16) ---
 #   forward L2      : fp8 GEMM + combine PUSH + weighted top-k reduce (bf16 out)
-#   backward STEP3  : fp8 fc1-dgrad + combine PUSH + unweighted reduce (+ gate scatter)
+#   backward L1 dgrad : fp8 fc1-dgrad + combine PUSH + unweighted reduce (+ gate scatter)
 from .grouped_gemm_combine_fp8_kernel import (
     grouped_gemm_combine_mxfp8_flydsl_kernel,
 )

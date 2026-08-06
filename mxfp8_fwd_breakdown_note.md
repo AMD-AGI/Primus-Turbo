@@ -459,5 +459,5 @@ kernel and yields `L2_gemm ≈ L2_push ≈ L2_full`. Always isolate the L2 legs 
 | Allowed | Not allowed |
 |---------|-------------|
 | Single CUDA stream | Extra streams for prep / quant overlap |
-| Comm ∥ GEMM inside one fused kernel grid (L1, L2) | Side-stream STEP3-style overlap |
+| Comm ∥ GEMM inside one fused kernel grid (L1, L2) | Side-stream L1-dgrad-style overlap |
 | CU split tuning, tile mapping, cache-op placement | Multi-stream w1/w2/x-quant overlap |

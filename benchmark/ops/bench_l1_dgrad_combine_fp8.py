@@ -4,18 +4,18 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Backward STEP3 (fc1 dgrad + combine) fp8 -- smoke correctness + latency + breakdown.
+"""Backward L1 dgrad (fc1 dgrad + combine) fp8 -- smoke correctness + latency + breakdown.
 
-Replicates the backward up to STEP3 on real mega-pool data: forward L1 -> (l1, dispatch_weights),
-STEP1 (dispatch(dy)+fc2 dgrad), STEP2 swiglu_backward -> grad_l1 + grad_gate. Then STEP3
+Replicates the backward up to the L1 dgrad on real mega-pool data: forward L1 -> (l1, dispatch_weights),
+the L2 dgrad (dispatch(dy)+fc2), SwiGLU^T -> grad_l1 + grad_gate. Then the L1 dgrad
 (``grouped_gemm_combine_mxfp8_flydsl_kernel`` with ``grad_gate``): fp8 fc1-dgrad + combine PUSH +
 unweighted reduce + gate scatter -> dx [T, H] + grad_topk_weights [T, K].
 
 Same kernel / overlap pattern as forward L2 (fc2+combine), but K=2I and ``with_gate=True``.
 
 Run inside the dev container (8 GPUs):
-  PYTHONPATH=<repo> python benchmark/ops/bench_step3_fp8.py --num-processes 8 --num-tokens 8192
-  PYTHONPATH=<repo> python benchmark/ops/bench_step3_fp8.py --num-processes 8 --breakdown
+  PYTHONPATH=<repo> python benchmark/ops/bench_l1_dgrad_combine_fp8.py --num-processes 8 --num-tokens 8192
+  PYTHONPATH=<repo> python benchmark/ops/bench_l1_dgrad_combine_fp8.py --num-processes 8 --breakdown
 """
 
 import argparse
@@ -205,7 +205,7 @@ def worker(local_rank, world, args):
             }.get(mode, mode)
             if mode == "full" and not getattr(args, "_breakdown_child", False):
                 print(f"\n{'='*72}")
-                print(f"[backward STEP3  fc1 dgrad+combine  fp8]  EP{world} T={args.num_tokens} "
+                print(f"[backward L1 dgrad  fc1 dgrad+combine  fp8]  EP{world} T={args.num_tokens} "
                       f"cc={args.combine_cu} H={args.hidden} I={args.inter} E={args.num_experts} K={args.num_topk}")
                 print(f"{'='*72}")
             print(f"  {label:42s} : {t_step3:8.3f} ms | {tf:8.1f} TFLOPS  (M_pool={int(r['m_pad'])})")
@@ -219,7 +219,7 @@ def worker(local_rank, world, args):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="backward STEP3 (fc1 dgrad + combine) fp8 smoke + breakdown")
+    ap = argparse.ArgumentParser(description="backward L1 dgrad (fc1 dgrad + combine) fp8 smoke + breakdown")
     ap.add_argument("--num-processes", type=int, default=8)
     ap.add_argument("--hidden", type=int, default=7168)
     ap.add_argument("--inter", type=int, default=2048)
@@ -238,7 +238,7 @@ if __name__ == "__main__":
 
     if args.breakdown:
         if args.num_processes == 1:
-            print("[STEP3 dgrad+combine breakdown] need EP>1"); sys.exit(1)
+            print("[L1 dgrad combine breakdown] need EP>1"); sys.exit(1)
         base_env = os.environ.copy()
         base_env["PYTHONPATH"] = base_env.get("PYTHONPATH", os.getcwd())
         specs = [
@@ -255,7 +255,7 @@ if __name__ == "__main__":
             "--warmup", str(args.warmup),
             "--iters", str(args.iters),
         ]
-        print(f"[STEP3 fc1 dgrad+combine breakdown] EP{args.num_processes} T={args.num_tokens} cc={args.combine_cu}")
+        print(f"[L1 dgrad fc1+combine breakdown] EP{args.num_processes} T={args.num_tokens} cc={args.combine_cu}")
         times = {}
         for mode, extra in specs:
             env = base_env.copy()
@@ -279,13 +279,13 @@ if __name__ == "__main__":
             reduce_est = max(f - nr, 0.0)
             overlap_eff = serial / max(nr, 1e-6)
             roofline = max(g, p) / max(nr, 1e-6)
-            print(f"\n--- overlap analysis (bwd STEP3, K=2I) ---")
+            print(f"\n--- overlap analysis (bwd L1 dgrad, K=2I) ---")
             print(f"  GEMM leg (isolated)          : {g:.3f} ms")
             print(f"  PUSH leg (isolated)          : {p:.3f} ms")
             print(f"  serial sum GEMM+PUSH         : {serial:.3f} ms")
             print(f"  GEMM||PUSH (NO_REDUCE)       : {nr:.3f} ms")
             print(f"  reduce+gate est (full-nr)    : {reduce_est:.3f} ms")
-            print(f"  full STEP3 combine           : {f:.3f} ms")
+            print(f"  full L1 dgrad combine           : {f:.3f} ms")
             print(f"  overlap saved                : {serial - nr:.3f} ms  ({100*(serial-nr)/serial:.0f}% of serial)")
             print(f"  overlap vs serial ratio      : {overlap_eff:.2f}x  (ideal {serial/max(g,p):.2f}x if perfect)")
             print(f"  overlap vs max(GEMM,PUSH)    : {roofline:.2f}x  (1.0 = perfect hide shorter leg)")

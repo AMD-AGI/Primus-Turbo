@@ -540,7 +540,7 @@ def profile_fc1_wgrad(group, args, mode):
     group_lens, group_offs = handle[_H_GROUP_LENS], handle[_H_GROUP_OFFS]
 
     def _fp8():  # FULL dW1 (isolated): meta + colwise-quant grad_l1 + colwise-requant pool_x + GEMM.
-        # dW1 now takes the colwise grad_l1 operand PRE-quantized (shared with STEP3 via the fused
+        # dW1 now takes the colwise grad_l1 operand PRE-quantized (shared with the L1 dgrad via the fused
         # dual-quant in the real backward); in isolation we still quantize it here so FULL is comparable.
         meta_f = colwise_grouped_meta(group_lens, group_offs)
         a_colwise = colwise_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=meta_f)[:2]

@@ -320,7 +320,7 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
     c_mbits = 2 if is_e5m2_col else 3
     c_round = 1 << (22 - c_mbits)
     c_target = 15 if is_e5m2_col else 8
-    # rowwise (STEP3 operand) params: ALWAYS E4M3
+    # rowwise (L1-dgrad operand) params: ALWAYS E4M3
     r_round = 1 << 19
     r_target = 8
 

@@ -629,18 +629,18 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
 ) -> Tuple[torch.Tensor, tuple, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Self-contained fp8 dispatch + grouped mxfp8 NT GEMM; fp8 sibling of
     ``dispatch_grouped_gemm_bf16_flydsl_kernel``. Drives BOTH the forward L1 (dispatch x + fc1) and
-    the backward STEP1 (dispatch dy + fc2-dgrad) -- both are the SAME NT op, only the input/weight
+    the backward L2 dgrad (dispatch dy + fc2-dgrad) -- both are the SAME NT op, only the input/weight
     and the comm/preshuffle CU split (``num_dispatch_cu`` / ``num_preshuffle_cu``) differ.
 
     Takes the pre-quantized weight (``w1q`` [G,*,K] fp8 + ``w1s`` raw E8M0; prepared version-keyed by
-    the caller -- fc1 weight for forward, ``w2^T`` for the STEP1 dgrad). When ``handle is None``
+    the caller -- fc1 weight for forward, ``w2^T`` for the L2 dgrad). When ``handle is None``
     (forward), builds the symmetric workspace + dispatch-prologue handle from ``topk_idx`` /
     ``topk_weights``; otherwise reuses the live symm buffer + the given handle (backward). Runs the
     fused dispatch-PUSH + grouped mxfp8 GEMM, with token quant folded in via the bf16-x path.
 
     Returns ``(l1, handle, dispatch_weights, pool_x_fp8)`` where ``l1`` is the GEMM output (fc1 out
-    for forward, grad_swiglu for STEP1), ``dispatch_weights`` is ``symm.weight_recv_buf`` (per-pool-row
-    routing weight; unused by STEP1), and ``pool_x_fp8`` is ``(symm.pool_fp8 [P,H] fp8, symm.pool_scale
+    for forward, grad_swiglu for the L2 dgrad), ``dispatch_weights`` is ``symm.weight_recv_buf``
+    (per-pool-row routing weight; unused by the L2 dgrad), and ``pool_x_fp8`` is ``(symm.pool_fp8 [P,H] fp8, symm.pool_scale
     [P,H//32] E8M0)`` -- both LIVE views into the shared symm pool (no clone). The caller keeps
     ``handle`` (L2 + backward reuse it); ``handle[-1]`` is the device ``num_tile_blocks`` (real-tile
     count), the SwiGLU-epilogue row bound (mirrors bf16's ``handle[_H_NUM_TILE_BLOCKS]``). It can
@@ -669,7 +669,7 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
             # overwrites meta_scalars AND resets the whole origin_rank / origin_slot region, while
             # the backward reuses this handle long after that. num_tile_blocks is the real-tile
             # count; origin_rank / origin_slot map each pool row back to the rank and topk slot that
-            # sent it, which is what STEP3's push needs to return the row to its owner. All three
+            # sent it, which is what the L1-dgrad push needs to return the row to its owner. All three
             # are stream-ordered D2D copies, no host sync. (bf16 does the same with pool_src_slot.)
         ) + (
             symm.meta_scalars[1:2].clone(),

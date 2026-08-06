@@ -144,7 +144,7 @@ def combine_copy_fp8_tile(
     with_gate=False, grad_gate_res=None, gate_base=None, main_delta_res=None, gate_records=0,
 ):
     """FP8 combine PUSH: read local fp8 L2Y row -> push packed fp8 payload + E8M0 to the peer
-    ``comb[slot]``, raise the sys-scope flag. ``with_gate`` (backward STEP3) additionally scatters
+    ``comb[slot]``, raise the sys-scope flag. ``with_gate`` (backward L1 dgrad) additionally scatters
     the per-row gate gradient ``grad_gate[row]`` to the origin peer's ``combine_gate[slot]`` (MAIN
     heap ``main_delta``), mirroring the bf16 ``combine_bf16_tile`` gate path -- 1 f32, ~free vs the
     hidden-wide fp8 push."""
@@ -206,7 +206,7 @@ def combine_copy_fp8_tile(
 # ─────────── role REDUCE: fp8-dequant topk sum (weighted|unweighted) + optional gate fold ───────────
 def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate):
     """FP8-dequant weighted top-k sum -> output. ``apply_weights`` (forward L2) multiplies each expert
-    term by the routing weight; else (backward STEP3) the weight was already folded into the input
+    term by the routing weight; else (backward L1 dgrad) the weight was already folded into the input
     upstream. ``with_gate`` (backward) additionally folds the gate gradient
     ``d_topk_w[slot] = combine_gate[slot]`` (route-masked). Mirrors the unified bf16
     ``topk_reduce_bf16_tile(apply_weights, with_gate)`` -- one reduce for both fwd and bwd."""
@@ -323,7 +323,7 @@ def _compile(
     """Unified fp8 combine: mxfp8 GEMM (CShuffle mxfp8-quant epilogue -> local fp8 pool) + FP8 combine
     PUSH (+ optional gate scatter) + fp8-dequant top-k reduce. One kernel for BOTH:
       * forward L2   (apply_weights=True,  with_gate=False): ``act @ w2``, K=I, WEIGHTED reduce -> y.
-      * backward STEP3 (apply_weights=False, with_gate=True): ``grad_l1 @ w1^T``, K=2I, UNWEIGHTED
+      * backward L1 dgrad (apply_weights=False, with_gate=True): ``grad_l1 @ w1^T``, K=2I, UNWEIGHTED
         reduce (routing weight folded upstream) + gate scatter / d_topk_w fold -> dx.
     Mirrors the unified bf16 ``grouped_gemm_combine`` (apply_weights/with_gate constexpr flags)."""
     K = hidden_size
@@ -644,7 +644,7 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     is inferred from the optional args:
       * forward L2  (pass ``topk_weights``, no ``grad_gate``): ``x @ w2``, K=I, WEIGHTED reduce
         -> ``y`` [num_tokens, H] bf16 (returned ``d_topk_w`` is None).
-      * backward STEP3 (pass ``grad_gate``, no ``topk_weights``): ``grad_l1 @ w1^T``, K=2I, UNWEIGHTED
+      * backward L1 dgrad (pass ``grad_gate``, no ``topk_weights``): ``grad_l1 @ w1^T``, K=2I, UNWEIGHTED
         reduce (routing weight folded upstream) + gate scatter -> ``dx`` [num_tokens, H] bf16 and
         ``d_topk_w`` [combine_slots] f32.
 
@@ -655,11 +655,11 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     Forward L2 requires ``x_fp8=(act_fp8, a_sp)`` from ``swiglu_mxfp8_flydsl_kernel``; there is
     no internal A quant on the forward path.
 
-    Backward STEP3 requires ``x_fp8_rowwise=(q_row, a_sp)`` from
+    The backward L1 dgrad requires ``x_fp8_rowwise=(q_row, a_sp)`` from
     ``swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl`` (fused rowwise quant of ``grad_l1``). Pass
     ``x=None``; M/K/device come from ``q_row.shape``.
 
-    Forward L2 and backward STEP3 both pass ``x=None`` when ``x_fp8`` / ``x_fp8_rowwise`` is given.
+    Forward L2 and the backward L1 dgrad both pass ``x=None`` when ``x_fp8`` / ``x_fp8_rowwise`` is given.
 
     Self-resetting: the combine_flag / reduce_flag epoch gates are double-banked + device epoch-bumped,
     so NO host flag reset / rendezvous. Always returns ``(output, d_topk_w)`` (``d_topk_w`` is None in
@@ -675,7 +675,7 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     if x_fp8 is not None and x_fp8_rowwise is not None:
         raise ValueError("x_fp8 and x_fp8_rowwise are mutually exclusive")
     if with_gate:
-        assert x_fp8_rowwise is not None, "backward STEP3 requires pre-quantized grad_l1 via x_fp8_rowwise"
+        assert x_fp8_rowwise is not None, "the backward L1 dgrad requires pre-quantized grad_l1 via x_fp8_rowwise"
         aq, a_sp = x_fp8_rowwise
         M, K = aq.shape  # K = 2I for fc1^T dgrad
         dev = aq.device
@@ -768,6 +768,6 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
             _FP8_COMBINE_COMPILED[ck] = compiled
         compiled(*gemm_push_args)
 
-    # Shipped per-role CU split when the caller does not pin one (fwd L2 / bwd STEP3).
+    # Shipped per-role CU split when the caller does not pin one (fwd L2 / bwd L1 dgrad).
     _run_with_cu(int(num_combine_cu) if num_combine_cu is not None else (32 if apply_weights else 24))
     return output, (d_topk_w if with_gate else None)

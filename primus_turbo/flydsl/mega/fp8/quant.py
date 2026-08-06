@@ -36,7 +36,7 @@ M-values; consecutive threads own consecutive columns so the reads stay coalesce
 workgroup handles one (32-M block, ``BT``-wide F-tile): the kernel is memory-*latency* bound
 (VALU and VMEM issue are <1% of runtime), so the large grid is what hides the strided-load
 latency -- an earlier single-workgroup-per-column version left ~2 waves/SIMD and ran 1.4x
-slower.  A fp8-in variant fuses the dequant->requant round-trip for the STEP1 pool operand.
+slower.  A fp8-in variant fuses the dequant->requant round-trip for the L2-dgrad pool operand.
 """
 
 import functools
@@ -594,9 +594,9 @@ def colwise_quant_mxfp8_grouped_flydsl(
 
 
 # ── fp8-in fused dequant->colwise-requant (a-branch producer fusion) ─────────────────────────
-# The dW2 `a` operand (`dispatch_l2_grad`) originates from the STEP1 bwd fp8 pool, which is
+# The dW2 `a` operand (`dispatch_l2_grad`) originates from the backward L2-dgrad fp8 pool, which is
 # ROWWISE MXFP8 (E4M3 [P,H] + per-1x32-H E8M0 scale [P,H//32]) because that layout is what the
-# STEP1 dgrad MMA contracts. dW2, however, contracts over P and needs the operand quantized
+# L2 dgrad MMA contracts. dW2, however, contracts over P and needs the operand quantized
 # COLWISE (along P). The current path dequants the pool to a bf16 `dispatch_l2_grad` (HBM
 # round-trip) then re-quantizes it colwise. This kernel FUSES both: it reads the rowwise-fp8 pool
 # directly, dequants in-register (cvt_f32_fp8 * 2^(e8m0-127)), and emits the colwise (transposed)
@@ -748,7 +748,7 @@ def colwise_requant_mxfp8_grouped_fp8in_flydsl(
     """Grouped fp8-in colwise (along-M) MXFP8 transpose-requant, per-group M padded to 128.
 
     Drop-in replacement for ``colwise_quant_mxfp8_grouped_flydsl`` when the operand is already the
-    STEP1 rowwise-fp8 pool (fusing the dequant->requant round-trip).
+    L2-dgrad rowwise-fp8 pool (fusing the dequant->requant round-trip).
 
     Args:
         q_in: rowwise-fp8 (E4M3) ``[total_M, F]`` (the dispatched-dy pool).
@@ -857,7 +857,7 @@ def colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
 
 
 # ── FUSED rowwise + colwise dual-quant (one read of grad_l1 -> both operands) ─────────────────
-# grad_l1 [P, F] bf16 is needed BOTH rowwise-preshuffled (E4M3, STEP3 fc1-dgrad) and colwise-grouped
+# grad_l1 [P, F] bf16 is needed BOTH rowwise-preshuffled (E4M3, the L1 fc1-dgrad) and colwise-grouped
 # (E5M2, dW1 wgrad). Reading it twice (the two shipped kernels) costs an extra HBM read; this fuses
 # both from ONE read via a 32xBT bf16 tile staged in LDS -> colwise reads down columns, rowwise reads
 # across each 32-feature block. Rowwise ``q`` matches ``quantize_rowwise_mxfp8_flydsl``;

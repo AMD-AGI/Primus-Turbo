@@ -14,7 +14,7 @@ routing + DSv3 EP8 shape), so any gap points at a real code/stack difference, no
 
 Stages:
   * Stage 1 (this file): ``test_l1_dispatch_fc1_bench`` -- L1 = fused mxfp8 dispatch + fc1.
-  # * next: L2 combine / STEP1 / dW2 / dW1 / STEP3 (added incrementally).
+  # * next: L2 combine / L2 dgrad / dW2 / dW1 / L1 dgrad (added incrementally).
 
 Also holds ``test_staged_vs_fused_parity``: the two-stage (gate-up / gate-down) fp8 op pair must
 reproduce the single fused fp8 op, since it is the same kernels in the same order cut at ``l1``.

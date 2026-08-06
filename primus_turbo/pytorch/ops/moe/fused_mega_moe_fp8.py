@@ -4,29 +4,17 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Trainable mega MoE with MXFP8 forward + partial-fp8 backward (autograd Function).
+"""Mega MoE autograd ops with an MXFP8 forward and a partial-fp8 backward.
 
-Thin ``torch.autograd.Function`` that validates at the op boundary and delegates the actual
-orchestration to ``fused_mega_moe_forward_fp8_impl`` / ``fused_mega_moe_backward_fp8_impl`` in
-``pytorch/kernels/fused_mega_moe``. Those impls are PLAIN functions, NOT the ``custom_op`` /
-``AutoKernelDispatcher`` layer: the fp8 path carries state the custom_op schema can't hold --
-reuse of the forward's live symmetric buffer in backward and derived non-tensor handles (the
-bf16 mega MoE op is a plain autograd.Function for the same reason). The comm gates self-reset via
-a device epoch (no host synchronize()+barrier() rendezvous), which removed the large-T reset-race
-deadlock -- but the cross-rank symm-memory PUSH + device spin-wait handshake still does not compose
-with CUDA-graph capture, so the op is NOT graph-captured.
+The fp8 counterpart of ``fused_mega_moe``, with the same two entry points:
 
-Forward = L1 fused mxfp8 dispatch+fc1 NT -> SwiGLU -> L2 fp8 combine. Backward = STEP1
-dispatch(dy)+fc2 dgrad -> STEP2 SwiGLU^T -> dW2 variable-K wgrad -> STEP3 fc1 dgrad + combine
-(fp8-PUSH) -> dW1 variable-K wgrad (LOCAL).
+  * ``fused_mega_moe_fp8`` -- one fully fused op (dispatch+fc1+SwiGLU+fc2+combine).
+  * ``fused_mega_moe_fp8_stage1`` / ``fused_mega_moe_fp8_stage2`` -- the same math split into two
+    autograd edges at ``l1`` (pre-SwiGLU), so w1 and w2 can be separate DDP gradient boundaries.
+    Stage state rides a ``_Fp8StageState`` side channel rather than the ops' args/returns.
 
-The differentiable ``w1`` / ``w2`` weights stay the high-precision inputs; their mxfp8 (and
-w1^T/w2^T dgrad) quant is maintained INSIDE the impls by version-keyed caches keyed on ``w._version``
-(no caller prequant args).
-
-``fused_mega_moe_fp8_stage1`` / ``fused_mega_moe_fp8_stage2`` run the same math split into two
-autograd edges (boundary at ``l1``, pre-SwiGLU) so w1 and w2 can live in separate modules and
-become independent DDP gradient boundaries -- the fp8 counterpart of ``fused_mega_moe_stage1/2``.
+Pass ``w1`` / ``w2`` as the high-precision weights; their mxfp8 quant is maintained inside the
+impls, keyed on ``w._version``. The op is NOT CUDA-graph capturable.
 """
 
 from typing import Optional, Tuple
@@ -70,8 +58,6 @@ class FusedMegaMoEFP8Function(torch.autograd.Function):
         w1: torch.Tensor,
         w2: torch.Tensor,
         group: ProcessGroup,
-        block_m: int,
-        block_n: int,
     ) -> torch.Tensor:
         with torch.profiler.record_function("mega_moe_fp8_forward"):
             # Validate at the op boundary so failures point here, not deep in FlyDSL. w1 / w2 are the
@@ -87,12 +73,12 @@ class FusedMegaMoEFP8Function(torch.autograd.Function):
             save_bwd = any(ctx.needs_input_grad)
 
             y, l1, dispatch_weights, pool_x_colwise, colwise_meta, handle = fused_mega_moe_forward_fp8_impl(
-                x, topk_idx, topk_weights, w1, w2, group, block_m, block_n, save_bwd=save_bwd,
+                x, topk_idx, topk_weights, w1, w2, group, save_bwd=save_bwd,
             )
 
             if save_bwd:
                 # dispatch_weights is a LIVE view into the shared symm pool -> clone before a later
-                # stage (backward STEP1 dispatch(dy), or the next forward) overwrites it. l1 is a
+                # stage (the backward L2 dgrad's dispatch(dy), or the next forward) overwrites it. l1 is a
                 # fresh dispatch-GEMM output (not a symm view), so it needs no clone; the fc1-input
                 # pool was already consumed into pool_x_colwise inside the forward impl.
                 dispatch_weights = dispatch_weights.clone()
@@ -100,8 +86,6 @@ class FusedMegaMoEFP8Function(torch.autograd.Function):
                 ctx.group = group
                 ctx.num_tokens = x.shape[0]
                 ctx.num_topk = num_topk
-                ctx.block_m = block_m
-                ctx.block_n = block_n
                 ctx.handle_len = len(handle)
                 # Non-diff derived tensors -> stash on ctx (save_for_backward is for graph-tracked
                 # tensors). w1/w2 stay the differentiable weights; backward re-derives their
@@ -117,7 +101,7 @@ class FusedMegaMoEFP8Function(torch.autograd.Function):
         with torch.profiler.record_function("mega_moe_fp8_backward"):
             # grad_y is None when the output got no grad
             if grad_y is None:
-                return (None,) * 8
+                return (None,) * 6
             saved = ctx.saved_tensors
             handle = tuple(saved[: ctx.handle_len])
             l1, dispatch_weights, w1, w2, topk_idx = saved[ctx.handle_len :]
@@ -134,13 +118,11 @@ class FusedMegaMoEFP8Function(torch.autograd.Function):
                 ctx.group,
                 ctx.num_tokens,
                 ctx.num_topk,
-                ctx.block_m,
-                ctx.block_n,
                 ctx.colwise_meta,
             )
 
-            # grads align with forward inputs (x, topk_idx, topk_weights, w1, w2, group, block_m, block_n)
-            return (dx, None, grad_topk_weights, dW1, dW2, None, None, None)
+            # grads align with forward inputs (x, topk_idx, topk_weights, w1, w2, group)
+            return (dx, None, grad_topk_weights, dW1, dW2, None)
 
 
 def fused_mega_moe_fp8(
@@ -150,25 +132,20 @@ def fused_mega_moe_fp8(
     topk_weights: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    *,
-    block_m: int = 256,
-    block_n: int = 256,
 ) -> torch.Tensor:
     """One fully fused mega MoE forward (MXFP8) that joins autograd; backward fp8-izes dW1/dW2.
 
     Pass the ``w1`` / ``w2`` weights directly -- the op maintains their mxfp8 quant internally with a
     version-keyed cache (re-quantized only on ``optim.step``), so there are no weight-prequant args.
     """
-    return FusedMegaMoEFP8Function.apply(
-        x, topk_idx, topk_weights, w1, w2, group, block_m, block_n,
-    )
+    return FusedMegaMoEFP8Function.apply(x, topk_idx, topk_weights, w1, w2, group)
 
 
 class _Fp8StageState:
     """Side channel carrying non-differentiable fp8 operands between stage1 and stage2.
 
     The bf16 split threads everything through op args/returns, but the fp8 backward cannot: its
-    fused SwiGLU^T emits grad_l1 ONLY as the two quantized operands STEP3 and dW1 consume
+    fused SwiGLU^T emits grad_l1 ONLY as the two quantized operands the L1 dgrad and dW1 consume
     ``((q_row, a_sp), (q_col, s_col))``, uint8/int32 tensors of a different shape than ``l1``, which
     no gradient slot accepts. So stage2.backward parks them here, returns ``None`` on the ``l1``
     slot, and stage1.backward picks them up -- safe because autograd's topological order runs
@@ -201,8 +178,6 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
         topk_weights: torch.Tensor,
         w1: torch.Tensor,
         group: ProcessGroup,
-        block_m: int,
-        block_n: int,
         state: _Fp8StageState,
     ):
         with torch.profiler.record_function("mega_moe_fp8_stage1_forward"):
@@ -221,7 +196,7 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
             (
                 l1, dispatch_weights, handle, pool_x_colwise, colwise_meta,
             ) = fused_mega_moe_stage1_forward_fp8_impl(
-                x, w1, group, topk_idx, topk_weights, block_m, block_n, save_bwd=save_bwd,
+                x, w1, group, topk_idx, topk_weights, save_bwd=save_bwd,
             )
             state.pool_x_colwise = pool_x_colwise
             state.colwise_meta = colwise_meta
@@ -235,8 +210,6 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
                 ctx.topk_idx = topk_idx
                 ctx.num_tokens = x.shape[0]
                 ctx.num_topk = topk_idx.shape[-1]
-                ctx.block_m = block_m
-                ctx.block_n = block_n
                 ctx.save_for_backward(w1)
             # handle tensors are non-differentiable index/table tensors
             ctx.mark_non_differentiable(*handle)
@@ -252,7 +225,7 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
         with torch.profiler.record_function("mega_moe_fp8_stage1_backward"):
             state = ctx.state
             if state.grad_l1_rowwise_fp8 is None:  # stage2.backward never ran -> nothing to do
-                return (None,) * 8
+                return (None,) * 6
             (w1,) = ctx.saved_tensors
 
             dx, grad_topk_weights, dW1 = fused_mega_moe_stage1_backward_fp8_impl(
@@ -267,13 +240,11 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
                 ctx.topk_idx,
                 ctx.num_tokens,
                 ctx.num_topk,
-                ctx.block_m,
-                ctx.block_n,
             )
             state.grad_l1_rowwise_fp8 = state.grad_l1_colwise_fp8 = None
 
-            # grads for (x, topk_idx, topk_weights, w1, group, block_m, block_n, state)
-            return dx, None, grad_topk_weights, dW1.to(w1.dtype), None, None, None, None
+            # grads for (x, topk_idx, topk_weights, w1, group, state)
+            return dx, None, grad_topk_weights, dW1.to(w1.dtype), None, None
 
 
 class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
@@ -288,8 +259,6 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
         topk_weights: torch.Tensor,
         w2: torch.Tensor,
         group: ProcessGroup,
-        block_m: int,
-        block_n: int,
         state: _Fp8StageState,
         *handle,
     ) -> torch.Tensor:
@@ -300,7 +269,7 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
             handle = tuple(handle)
 
             y = fused_mega_moe_stage2_forward_fp8_impl(
-                l1, w2, handle, group, topk_idx, topk_weights, block_m, block_n,
+                l1, w2, handle, group, topk_idx, topk_weights,
             )
 
             ctx.set_materialize_grads(False)
@@ -308,8 +277,6 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 ctx.group = group
                 ctx.state = state
                 ctx.handle = handle
-                ctx.block_m = block_m
-                ctx.block_n = block_n
                 # dispatch_weights is unused in forward; saved only as the SwiGLU^T scale in backward
                 ctx.save_for_backward(l1, dispatch_weights, w2)
             return y
@@ -321,7 +288,7 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
         stage1 through ``ctx.state``, so the ``l1`` slot returns None."""
         with torch.profiler.record_function("mega_moe_fp8_stage2_backward"):
             handle = ctx.handle
-            n_in = 9 + len(handle)
+            n_in = 7 + len(handle)
             if grad_y is None:
                 return (None,) * n_in
             l1, dispatch_weights, w2 = ctx.saved_tensors
@@ -330,22 +297,18 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
             (
                 grad_l1_rowwise_fp8, grad_l1_colwise_fp8, grad_gate, dW2,
             ) = fused_mega_moe_stage2_backward_fp8_impl(
-                grad_y, l1, dispatch_weights, w2, handle, ctx.group,
-                state.colwise_meta, ctx.block_m, ctx.block_n,
+                grad_y, l1, dispatch_weights, w2, handle, ctx.group, state.colwise_meta,
             )
             state.grad_l1_rowwise_fp8 = grad_l1_rowwise_fp8
             state.grad_l1_colwise_fp8 = grad_l1_colwise_fp8
 
-            # grads for (l1, dispatch_weights, topk_idx, topk_weights, w2, group, block_m, block_n,
-            # state, *handle)
+            # grads for (l1, dispatch_weights, topk_idx, topk_weights, w2, group, state, *handle)
             return (
                 None,
                 grad_gate,
                 None,
                 None,
                 dW2.to(w2.dtype),
-                None,
-                None,
                 None,
                 None,
                 *((None,) * len(handle)),
@@ -358,9 +321,6 @@ def fused_mega_moe_fp8_stage1(
     topk_weights: torch.Tensor,
     w1: torch.Tensor,
     group: ProcessGroup,
-    *,
-    block_m: int = 256,
-    block_n: int = 256,
 ):
     """Stage1 gate-up (MXFP8). Returns ``(l1, dispatch_weights, handle, state)`` to feed stage2.
 
@@ -370,7 +330,7 @@ def fused_mega_moe_fp8_stage1(
     """
     state = _Fp8StageState()
     l1, dispatch_weights, *handle = FusedMegaMoEFP8Stage1Function.apply(
-        x, topk_idx, topk_weights, w1, group, block_m, block_n, state,
+        x, topk_idx, topk_weights, w1, group, state,
     )
     return l1, dispatch_weights, tuple(handle), state
 
@@ -384,11 +344,8 @@ def fused_mega_moe_fp8_stage2(
     topk_weights: torch.Tensor,
     w2: torch.Tensor,
     group: ProcessGroup,
-    *,
-    block_m: int = 256,
-    block_n: int = 256,
 ) -> torch.Tensor:
     """Stage2 gate-down (MXFP8). Consumes stage1's forward state; returns y."""
     return FusedMegaMoEFP8Stage2Function.apply(
-        l1, dispatch_weights, topk_idx, topk_weights, w2, group, block_m, block_n, state, *handle,
+        l1, dispatch_weights, topk_idx, topk_weights, w2, group, state, *handle,
     )

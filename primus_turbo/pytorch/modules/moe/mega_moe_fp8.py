@@ -31,7 +31,6 @@ class MegaMoEFP8(torch.nn.Module):
         w1: bf16 grouped fc1 weight ``[G, 2I, H]`` (up/gate). Held as a ``Parameter``.
         w2: bf16 grouped fc2 weight ``[G, H, I]`` (down). Held as a ``Parameter``.
         ep_group: the expert-parallel process group.
-        block_m / block_n: FlyDSL tiling for the fused kernels.
 
     Shape requirements of the mxfp8 op (asserted inside the op): ``hidden % 1024 == 0`` (fp8 push)
     / ``% 256`` (weight N), ``intermediate % 1024 == 0`` (SwiGLU). Otherwise use the bf16 path.
@@ -42,17 +41,12 @@ class MegaMoEFP8(torch.nn.Module):
         w1: torch.Tensor,
         w2: torch.Tensor,
         ep_group: ProcessGroup,
-        *,
-        block_m: int = 256,
-        block_n: int = 256,
     ) -> None:
         super().__init__()
         assert w1.dtype == torch.bfloat16 and w2.dtype == torch.bfloat16, "w1/w2 must be bf16"
         self.w1 = torch.nn.Parameter(w1)
         self.w2 = torch.nn.Parameter(w2)
         self.ep_group = ep_group
-        self.block_m = block_m
-        self.block_n = block_n
 
     def expert_compute(
         self,
@@ -65,10 +59,7 @@ class MegaMoEFP8(torch.nn.Module):
         Only token-dependent work goes to the op; the invariant weight quant is maintained inside
         the op (version-keyed), so nothing is prepared here.
         """
-        return fused_mega_moe_fp8(
-            self.ep_group, x, topk_idx, topk_weights, self.w1, self.w2,
-            block_m=self.block_m, block_n=self.block_n,
-        )
+        return fused_mega_moe_fp8(self.ep_group, x, topk_idx, topk_weights, self.w1, self.w2)
 
     def forward(
         self,

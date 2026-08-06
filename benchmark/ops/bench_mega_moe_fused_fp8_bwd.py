@@ -6,8 +6,8 @@
 
 """End-to-end forward+BACKWARD validation for the fp8 mega MoE op.
 
-Runs the full fp8 autograd path (forward L1 dispatch+fc1 -> SwiGLU -> L2 combine; backward STEP1
-dispatch(dy)+fc2 dgrad -> SwiGLU^T -> dW2 -> STEP3 fc1 dgrad+combine -> dW1) and grad-checks the
+Runs the full fp8 autograd path (forward L1 dispatch+fc1 -> SwiGLU -> L2 combine; backward the L2 dgrad
+dispatch(dy)+fc2 dgrad -> SwiGLU^T -> dW2 -> the L1 dgrad fc1 dgrad+combine -> dW1) and grad-checks the
 forward output and every gradient (dx, d_topk_w, dW1, dW2) against an ANALYTIC reference, with an
 SNR gate. Reports rough fwd+bwd latency against the bf16 op.
 
@@ -17,7 +17,7 @@ made the old bf16-referenced dx gate report 3-19 dB at random while the fp8 path
 flat 21.9 dB against truth. bf16 is still used for the LATENCY comparison, which the race does not
 affect. Expect roughly 19-23 dB: that is the mxfp8 E5M2 gradient encoding floor, not slack.
 
-NOTE: the STEP1 dispatch(dy) and STEP3 combine gates self-reset via a device epoch (no host
+NOTE: the the L2 dgrad dispatch(dy) and the L1 dgrad combine gates self-reset via a device epoch (no host
 rendezvous), which removed the old large-T reset-race stall -- validated stable through T=8192.
 
 Run inside the dev container (8 GPUs):

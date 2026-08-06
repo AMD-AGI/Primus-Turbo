@@ -113,8 +113,6 @@ def fused_mega_moe_forward_fp8_impl(
     w1: torch.Tensor,
     w2: torch.Tensor,
     group: ProcessGroup,
-    block_m: int,
-    block_n: int,
     save_bwd: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], dict, tuple]:
     """Fused mxfp8 MoE forward: L1 (dispatch + fc1, NT) -> SwiGLU+mxfp8 quant -> L2 fp8 combine.
@@ -138,7 +136,6 @@ def fused_mega_moe_forward_fp8_impl(
         topk_weights=topk_weights,
         num_dispatch_cu=_L1_NUM_DISPATCH_CU,
         num_preshuffle_cu=_L1_NUM_PRESHUFFLE_CU,
-        BM=block_m, BN=block_n,
     )
 
     act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS])
@@ -151,7 +148,6 @@ def fused_mega_moe_forward_fp8_impl(
         topk_indices=topk_idx,
         topk_weights=topk_weights if topk_weights.dtype == torch.float32 else topk_weights.to(torch.float32),
         x_fp8=(act_fp8, act_a_sp),
-        BM=block_m, BN=block_n,
         num_combine_cu=_L2_NUM_COMBINE_CU,
     )
 

@@ -8,7 +8,7 @@
 
 The FlyDSL layer provides the basic primitives (grouped mxfp8 quant + scale preshuffle); this
 module composes them into the two operands the combine GEMM consumes. Shared by the forward
-(fc2 weight), the backward STEP3 (fc1^T combine weight), and the standalone benches, so the
+(fc2 weight), the backward L1 dgrad (fc1^T combine weight), and the standalone benches, so the
 "prepare a combine weight" concept lives once at the op layer rather than inside the kernel file.
 """
 
@@ -36,7 +36,7 @@ def prepare_w2_fp8(l2_weights: torch.Tensor):
     b_sp int32)``, exactly the two operands the mxfp8 combine GEMM consumes. Static per weight
     version, so a stateful holder computes this ONCE per ``optim.step`` and passes it as ``w2_fp8``
     -- the combine then does NO per-call weight quant OR preshuffle. Used for the forward fc2 weight
-    and, transposed, the backward STEP3 fc1^T combine weight."""
+    and, transposed, the backward L1 dgrad fc1^T combine weight."""
     G, N, K = l2_weights.shape
     w2q, w2s = quantize_grouped_weight_mxfp8_flydsl(l2_weights)
     b_sp = preshuffle_b_scale(w2s, G, N, K, pack=4)
