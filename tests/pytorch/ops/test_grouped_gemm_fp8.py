@@ -23,6 +23,7 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import grouped_gemm_fp8
+from primus_turbo.pytorch.ops.grouped_gemm_fp8 import _fused_wgrad_enabled
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
@@ -30,6 +31,26 @@ from tests.pytorch.ref.gemm_ref import (
 from tests.pytorch.test_utils import compute_snr
 
 torch.manual_seed(42)
+
+
+@pytest.mark.parametrize(
+    "enabled,backend,expected",
+    [
+        ("0", BackendType.TRITON, False),
+        ("1", BackendType.TRITON, True),
+        ("1", BackendType.FLYDSL, False),
+    ],
+)
+def test_fused_wgrad_backend_gate(monkeypatch, enabled, backend, expected):
+    monkeypatch.setenv("PRIMUS_TURBO_FUSED_WGRAD_ACCUM", enabled)
+    monkeypatch.setattr(
+        GlobalBackendManager,
+        "get_grouped_gemm_backend",
+        lambda precision: backend,
+    )
+
+    assert _fused_wgrad_enabled() is expected
+
 
 # Common test parameters
 B_VALUES = [1, 2, 3, 8, 16, 32]
