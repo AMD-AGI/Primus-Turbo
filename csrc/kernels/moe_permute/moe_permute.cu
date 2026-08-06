@@ -168,7 +168,11 @@ __launch_bounds__(kNumThreads, 1) __global__
             const int local = s_tile[thread_id * E + e];
             int       excl_block, scan_total;
             BlockScan(shared_temp.scan).ExclusiveSum(local, excl_block, scan_total);
-            const int prev            = s_acc[e];
+            const int prev = s_acc[e];
+            // Every thread must finish reading the pre-tile base before thread 0
+            // advances it; otherwise late wavefronts pick up this tile's own
+            // aggregate and their slot indices come out kNumItemsPerTile too high.
+            __syncthreads();
             s_tile[thread_id * E + e] = (local == 1) ? (excl_block + prev + 1) : 0;
             if (thread_id == 0)
                 s_acc[e] += scan_total;

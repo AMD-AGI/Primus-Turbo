@@ -30,14 +30,14 @@ def _is_gfx950_device(device: torch.device) -> bool:
     return _get_device_compute_capability(device) == (9, 5)
 
 
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
-    BaseGroupedGEMMKernelDispatcher,
-    BaseGroupedGEMMVariableKKernelDispatcher,
-)
-from primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic import (
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_ck_ws_heuristic import (
     approximate_ck_standard_total_tiles,
     compute_ck_variable_k_total_tiles,
     resolve_ck_ws_local_per_xcd,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+    BaseGroupedGEMMKernelDispatcher,
+    BaseGroupedGEMMVariableKKernelDispatcher,
 )
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     grouped_gemm_output_tail_kernel,

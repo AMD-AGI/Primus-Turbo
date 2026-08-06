@@ -42,7 +42,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     wait_barrier,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.gemm.mxfp4_gemm_kernel import (
+from primus_turbo.flydsl.gemm.gemm_mxfp4_kernel import (
     _MXFP4_PRESHUF_BLK,
     _MXFP4_PRESHUF_NG,
     MfmaScaleFp4,
@@ -53,12 +53,12 @@ from primus_turbo.flydsl.gemm.mxfp4_gemm_kernel import (
     _mxfp4_grp_from,
     fp4_g2s_offsets,
 )
-from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _grouped_block_mn,
     _load_go,
     _wgrad_block_mn,
 )
-from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import run_eager_or_capture
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import run_eager_or_capture
 
 # isort: on
 
@@ -207,7 +207,6 @@ def _build_grouped_mxfp4_nt_kernel(
     k_real//256 full 256-blocks + ONE 128-K tail MFMA (reads the real last 128 K, its scale
     is the block's s=0 in the padded packing) -- zero operand copy, zero wasted compute."""
     BLOCK_M = BLOCK_N = BLOCK_K = _BLOCK
-    _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     swizzle = True
     _KR = K if k_real is None else k_real  # operand true contraction (128-multiple)
     assert K % 256 == 0 and _KR % 128 == 0
@@ -463,6 +462,7 @@ def _build_grouped_mxfp4_nt_kernel(
         base_col_l = bn * I32(BLOCK_N) + I32(wave_n_off)
         # store bounded to the group's tight end: StoreCPlain's SRD num_records =
         # m_end*c_n -> partial-tile rows >= m_end (next group) HW-drop.
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
         store_c = StoreCPlain(C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty)
         store_c.store(accL, base_row, base_col_l, n_valid=_NV)
         base_col_r = bn * I32(BLOCK_N) + I32(LDS_BN_HALF) + I32(wave_n_off)
@@ -727,7 +727,6 @@ def _build_grouped_mxfp4_wgrad_kernel(
     OUT_M, OUT_N, G, M_total, group_m=4, num_xcds=8, group_n=0, wlv=10, elgk=9, out_fp16=False
 ):
     BLOCK_M = BLOCK_N = BLOCK_K = _BLOCK
-    _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     swizzle = True
     NABUF, NBB, OCC = 2, 2, 1  # wgrad keeps occ=1 (feed-bound; occ measured non-lever for wgrad)
     N_SUB = BLOCK_K // 128
@@ -937,6 +936,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
         base_row = group_idx * I32(OUT_M) + a_row + I32(wave_m_off)
         base_col_l = b_row + I32(wave_n_off)
         base_col_r = b_row + I32(LDS_BN_HALF) + I32(wave_n_off)
+        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
         store_c = StoreCPlain(
             C, (group_idx + I32(1)) * I32(OUT_M), OUT_N, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty
         )

@@ -57,6 +57,22 @@ void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, cons
 
     const int32_t BLOCK_SIZE = 512;
 
+    // Tensorwise BF16/FP16 -> FP8 can process 16 elements per thread with a
+    // 32-byte input load and a 16-byte output store. Keep this selection local
+    // so the shared memory-pack limits, dequantize, and other recipes stay on
+    // their existing dispatch widths.
+    constexpr int32_t PACK16 = 16;
+    if constexpr (sizeof(FType) * PACK16 == 32 && sizeof(QType) * PACK16 == 16) {
+        const bool aligned =
+            reinterpret_cast<uintptr_t>(x) % 32 == 0 && reinterpret_cast<uintptr_t>(y) % 16 == 0;
+        if (aligned) {
+            PackedEltwiseConfig pack_cfg(n, PACK16, BLOCK_SIZE);
+            unary_kernel<BLOCK_SIZE, PACK16, FType, QType, QuantTensorwiseScalePtrOp<ComputeType>>
+                <<<pack_cfg.nBlock, BLOCK_SIZE, 0, stream>>>(x, y, op, pack_cfg);
+            return;
+        }
+    }
+
     int32_t pack_size = std::min(get_pack_size<FType>(x), get_pack_size<QType>(y));
     switch (pack_size) {
     case 8: {

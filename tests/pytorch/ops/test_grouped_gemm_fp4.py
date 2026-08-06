@@ -371,7 +371,7 @@ def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend
     if _check_hit_int32_limit(B, M, N, K):
         pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
 
-    from primus_turbo.flydsl.grouped_gemm import mxfp4_grouped_kernel
+    from primus_turbo.flydsl.grouped_gemm import grouped_gemm_mxfp4_kernel
 
     device = "cuda:0"
     group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
@@ -413,13 +413,13 @@ def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend
         # and it may be absent from the cache when its dims differ from the forward.
         total_tokens = int(group_lens.sum().item())
         try:
-            _, b_scale_ws, _ = mxfp4_grouped_kernel._get_grouped_mxfp4_ws(
+            _, b_scale_ws, _ = grouped_gemm_mxfp4_kernel._get_grouped_mxfp4_ws(
                 total_tokens, K, (N + 127) // 128, B, torch.device(device)
             )
             b_scale_ws.fill_(s)
         except Exception:
             pass
-        for e in mxfp4_grouped_kernel._GMXFP4_WS_CACHE.values():
+        for e in grouped_gemm_mxfp4_kernel._GMXFP4_WS_CACHE.values():
             e[1].fill_(s)
 
     def _run_once(sentinel_byte):
@@ -439,7 +439,7 @@ def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend
     if backend is not None:
         GlobalBackendManager.set_grouped_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(False)
-    mxfp4_grouped_kernel._GMXFP4_WS_CACHE.clear()
+    grouped_gemm_mxfp4_kernel._GMXFP4_WS_CACHE.clear()
     try:
         # Warmup: compile + populate the workspace cache so the poison loop has real
         # buffers to overwrite before the first measured repeat.
@@ -514,8 +514,4 @@ def test_grouped_gemm_fp4_mx_blockwise_deterministic(B, M, NK, dtype, balance, b
     N, K = NK
     if backend == BackendType.FLYDSL and N % 64 != 0:
         pytest.skip("FlyDSL grouped MXFP4 backend requires N % 64 == 0")
-    if backend == BackendType.FLYDSL and dtype != torch.bfloat16:
-        # FlyDSL variable-K wgrad is bf16-only; forcing FLYDSL for fp16 makes the
-        # wgrad dispatch raise instead of falling back to Triton.
-        pytest.skip("FlyDSL grouped MXFP4 wgrad is bf16-only")
     _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend=backend, repeats=10)

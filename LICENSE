@@ -51,11 +51,11 @@ Primus-Turbo uses or references the following third-party projects:
        primus_turbo/flydsl/utils/gemm_helper.py
        primus_turbo/flydsl/gemm/gemm_fp8_kernel.py
        primus_turbo/flydsl/gemm/gemm_bf16_kernel.py
-       primus_turbo/flydsl/gemm/mxfp8_gemm_kernel.py
-       primus_turbo/flydsl/gemm/mxfp4_gemm_kernel.py
-       primus_turbo/flydsl/grouped_gemm/gemm_fp8_grouped_kernel.py
-       primus_turbo/flydsl/grouped_gemm/mxfp8_grouped_kernel.py
-       primus_turbo/flydsl/grouped_gemm/mxfp4_grouped_kernel.py
+       primus_turbo/flydsl/gemm/gemm_mxfp8_kernel.py
+       primus_turbo/flydsl/gemm/gemm_mxfp4_kernel.py
+       primus_turbo/flydsl/grouped_gemm/grouped_gemm_fp8_kernel.py
+       primus_turbo/flydsl/grouped_gemm/grouped_gemm_mxfp8_kernel.py
+       primus_turbo/flydsl/grouped_gemm/grouped_gemm_mxfp4_kernel.py
        primus_turbo/flydsl/quantization/mxfp8_quant_flydsl.py
        primus_turbo/flydsl/quantization/mxfp4_quant_kernel.py
        primus_turbo/flydsl/quantization/mxfp4_grouped_quant.py
