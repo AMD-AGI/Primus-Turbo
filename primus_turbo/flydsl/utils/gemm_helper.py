@@ -32,6 +32,42 @@ def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def ceildiv_pow2(a, b: int):
+    """``ceildiv(a, b)`` for a power-of-two ``b`` and a non-negative device value ``a``.
+    Signed ``a // b`` lowers to arith.floordivsi (divide + remainder + sign correction,
+    ~15 ISA ops even for a constant power of two); the shift is one. Use on runtime
+    hot-path values; plain ``ceildiv`` stays for host-side ints."""
+    assert b > 0 and (b & (b - 1)) == 0
+    return (a + (b - 1)) >> (b.bit_length() - 1)
+
+
+def _u32(v):
+    return _raw(fx.Int32(v) if isinstance(v, int) else v)
+
+
+def udiv(a, b):
+    """``a // b`` for device values proven non-negative (tile ids, group tile counts).
+
+    Python ``//`` on a device Int32 is arith.floordivsi: a magic multiply *plus* a
+    remainder and a sign fixup (``s_cmp_lg`` + ``s_cselect_b64`` + ``s_and_b64`` +
+    ``s_subb_u32``), ~12 SALU where the unsigned form is 1-3. On the grouped tile-decode
+    chain -- which is what gates a tile's first g2s -- those ops are fully exposed."""
+    return ArithValue(arith.divui(_u32(a), _u32(b)))
+
+
+def umod(a, b):
+    """``a % b`` for device values proven non-negative; see ``udiv``."""
+    return ArithValue(arith.remui(_u32(a), _u32(b)))
+
+
+def uindex(v):
+    """``arith.index_cast(T.index, v)`` for a device value proven non-negative (row/tile/group
+    offsets). The signed cast sign-extends, so every SRD base and extent derived from it carries
+    an ``s_ashr_i32`` plus a 64-bit multiply-and-carry chain; the unsigned cast zero-extends and
+    the high half folds to zero."""
+    return ArithValue(arith.index_castui(T.index, _raw(v)))
+
+
 _PRESHUF_KT = 16  # scale-preshuffle k-tile (rows*KT dwords staged in LDS per workgroup)
 
 
@@ -146,19 +182,19 @@ def make_bf16_rebased_rsrc(arg, base_elems, num_records_bytes):
     return rsrc
 
 
+def lds_row_swizzle(row, chunks):
+    """XOR key, in 16B chunks, for a `chunks`-wide LDS row: one ds_read_b64_tr_b8 gathers a
+    single 16B column over the rows {16*a + b : a<4, b<8}, and the key spreads that column
+    over the gfx950 LDS banks. Shared by the g2s write side (swizzle_128) and the transpose
+    read side (S2RLoaderTr._ptr_off) so the two cannot drift apart."""
+    return ((row % 16) // 2) & (chunks - 1)
+
+
 def swizzle_128(row, col, width=128):
-    """XOR bank-swizzle over a `width`=2**k logical row (width=128 is byte-identical to
-    the original fixed-128 form). The swizzle must stay within col's bits [0,k); for k<7
-    we extract fewer bits (k-4) from the `row%16` window so the result is always < width."""
-    k = width.bit_length() - 1
-    period = 16 * width
-    offset = row * width + col
-    nbits = k - 4
-    mask = (1 << nbits) - 1
-    extracted = (offset % period) >> (k + 1)
-    swizzle = (extracted & mask) << 4
-    swizzled_offset = offset ^ swizzle
-    return swizzled_offset // width, swizzled_offset % width
+    """XOR bank-swizzle over a `width`=2**k logical row (width=128 is byte-identical to the
+    original fixed-128 form). The key only permutes the width//16 chunks inside one row, so
+    the row index passes through unchanged."""
+    return row, col ^ (lds_row_swizzle(row, width // 16) * 16)
 
 
 def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
@@ -181,6 +217,41 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
             r, c = swizzle_128(row, col)
             offsets.append(r * K + c)
     return offsets
+
+
+def compute_global_swizzle_shear(lane_id, wave_id, K, n_rounds, m_row, ksm, up):
+    """compute_global_swizzle(preshuffled=False) with every row's 128B fetch snapped to the
+    cache line that encloses it, for a row pitch whose ``K % 128 == ksm != 0``.
+
+    Row r of the tile starts ``sh = ((m_row + r) * ksm) % 128`` bytes into a line, so its raw
+    128B K-block straddles two lines and costs two L1->L2 requests instead of one. Rounding
+    the fetch window to the line boundary makes it one request; the window then no longer
+    holds the K-block a phase wants, and ``S2RLoaderShear`` puts the two halves back together
+    out of two consecutive windows. ``up=False`` rounds the window down (partner = slot k+1),
+    ``up=True`` rounds it up (partner = slot k-1). ksm must be a multiple of 16 so a 16B read
+    never straddles the window edge.
+
+    Offsets are relative to an A SRD rebased by ``-((m_row * ksm) % 128)``; that keeps every
+    offset non-negative and leaves the unsheared halves addressable with a plain ``+ mbias``.
+    """
+    assert ksm % 16 == 0 and 0 < ksm < 128
+    mbias = (m_row * fx.Int32(ksm)) % fx.Int32(128)
+    offsets = []
+    n_waves = fx.block_dim.x // 64
+    for round in range_constexpr(n_rounds):
+        row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
+        col = (lane_id % 8) * 16
+        r, c = swizzle_128(row, col)
+        sh = ((m_row + row) * fx.Int32(ksm)) % fx.Int32(128)
+        disp = ((fx.Int32(128) - sh) % fx.Int32(128)) if const_expr(up) else (fx.Int32(0) - sh)
+        offsets.append(r * K + c + mbias + disp)
+    return offsets
+
+
+def shear_mbias(m_row, ksm):
+    """Byte bias that ``compute_global_swizzle_shear`` assumes was taken off the A SRD base.
+    Unsheared halves of the same operand add it back to their own offsets."""
+    return (m_row * fx.Int32(ksm)) % fx.Int32(128)
 
 
 class G2SLoader:
@@ -300,6 +371,50 @@ class S2RLoader(_S2RLoaderBase):
         return out
 
 
+class S2RLoaderShear(S2RLoader):
+    """S2RLoader twin for an operand fetched with ``compute_global_swizzle_shear``.
+
+    The g2s wrote each row's line-aligned window, displaced from the row's own K-blocks by
+    ``sh = ((m_row + row) * ksm) % 128``. Byte ``col`` of K-block k therefore sits at
+    ``(col + sh) % 128`` of window k, except for the bytes that fell past the window edge --
+    those live in the partner window (k-1 when the g2s rounded up, k+1 when it rounded down).
+    Both LDS pools are already resident, so this costs no extra traffic; pick ``up`` so the
+    partner is the slot the pipeline has already drained.
+
+    ``ksm == 64`` makes the whole splice free: ``sh`` is then 0 or 64, so ``(col + sh) % 128``
+    is ``col ^ sh`` and folds into the XOR bank-swizzle key, and the two 16B steps of a
+    fragment split statically -- step 0 (col < 64) is always the partner window's half and
+    step 1 always the current window's. What is left over the plain ``S2RLoader`` is one
+    ``v_cndmask`` per call to pick the base.
+    """
+
+    def __init__(self, wave_idx, n_tiles, m_row, ksm, up):
+        super().__init__(wave_idx, n_tiles)
+        assert ksm == 64 and up, "only the round-up 64B shear is implemented"
+        self.m_row = m_row
+
+    def load(self, lds_cur, lds_partner):
+        delta = fx.Int32(fx.ptrtoint(lds_partner.ptr)) - fx.Int32(fx.ptrtoint(lds_cur.ptr))
+        # n_tiles*16 and i*16 are even, so a fragment row's parity is the lane's parity.
+        odd = ((self.m_row + self.lane_id) & fx.Int32(1)) == fx.Int32(1)
+        sh = arith.select(odd, fx.Int32(64), fx.Int32(0))
+        pdelta = arith.select(odd, delta, fx.Int32(0))
+        frag = []
+        for i in range_constexpr(self.n_tiles):
+            halves = []
+            row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
+            key = (lds_row_swizzle(row, 8) * 16) ^ sh
+            for step in range_constexpr(2):
+                col = (self.lane_id // 16) * 16 + step * 64
+                offset = row * 128 + (col ^ key)
+                if const_expr(step == 0):
+                    offset = offset + pdelta
+                v = self._vec_load_16xf8(lds_cur, offset)
+                halves.append(v.bitcast(fx.Int32))
+            frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
+        return frag
+
+
 def wait_barrier(count):
     _llvm.inline_asm(
         res=None,
@@ -414,10 +529,10 @@ class ScaleBComb:
     One dwordx4 per lane returns [s0,s1,s2,s3]; (s0,s1)=b0 sub-tiles, (s2,s3)=b1.
     """
 
-    def __init__(self, sp_tensor, dim, K, n_slabs=1, pack=1):
+    def __init__(self, sp_tensor, dim, K, n_slabs=1, pack=1, k128p=None):
         self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
         self.PACK = pack
-        self.K128p = ceildiv(self.K128, self.PACK)  # packed K-groups (PACK scales / dword)
+        self.K128p = ceildiv(self.K128, self.PACK) if k128p is None else k128p
         self.lane = fx.thread_idx.x % 64
         # grp = (col//256)*4 + wn is block-strided, so the buffer holds cdiv(dim,256)*4
         # groups (matches the C++ preshuffle B sizing). A partial last 256-block reads
@@ -428,11 +543,11 @@ class ScaleBComb:
         nbytes = self.slab_elems * n_slabs * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
-    def load(self, base, k, slab=0):
-        """base: sb_base0 (b0 region col base). Returns 4 i32 (b0:0,1  b1:2,3)."""
+    def load(self, base, k, kbase=0, slab=0):
+        """base: sb_base0 (b0 region col base). ``kbase``: packed-K base of the group's own
+        region (0 = one global packing). Returns 4 i32 (b0:0,1  b1:2,3)."""
         grp = (base // 256) * 4 + (base % 256) // 32
-        kk = k // self.PACK
-        idx = ((grp * self.K128p + kk) * 64 + self.lane) * 4 + slab * self.slab_elems
+        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * 4 + slab * self.slab_elems
         v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(4)]
 
@@ -457,10 +572,10 @@ class ScaleS2R:
     the mxfp8 GEMM launch.
     """
 
-    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1):
+    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1, k128p=None):
         self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
         self.PACK = pack
-        self.K128p = ceildiv(self.K128, self.PACK)  # packed K-groups (PACK scales / dword)
+        self.K128p = ceildiv(self.K128, self.PACK) if k128p is None else k128p
         self.n_tiles = n_tiles
         self.group_span = 16 * n_tiles
         self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
@@ -470,18 +585,23 @@ class ScaleS2R:
         nbytes = ceildiv(dim, self.group_span) * self.K128p * 64 * n_tiles * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
-    def load(self, base, k):
+    def load(self, base, k, kbase=0):
         """base: runtime global row/col base for this (region, wave). Returns n_tiles i32
-        (packed dword for K-group k//PACK; caller selects byte k%PACK via MFMA op_sel)."""
+        (packed dword for K-group kbase + k//PACK; caller selects byte k%PACK via MFMA
+        op_sel). ``kbase``: packed-K base of the group's own region (0 = global packing)."""
         grp = base // self.group_span
-        kk = k // self.PACK
-        idx = ((grp * self.K128p + kk) * 64 + self.lane) * self.n_tiles
+        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * self.n_tiles
         v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
 
 
 # ── Reusable fp8 GEMM primitives (store, K-tail mask, value-attrs, AGPR MFMA, XCD
 #    remap, LDS-ptr/transpose loaders, swizzle), shared by dense and grouped.
+
+
+def _res_of(op):
+    """Unwrap an op builder's single result (some rocdl builders already return one)."""
+    return op.result if hasattr(op, "result") else op
 
 
 def _readfirstlane_i32(v):
@@ -493,10 +613,142 @@ def _readfirstlane_i32(v):
     as divergent -> the SRD lands in VGPRs -> every buffer_store_short is
     wrapped in a readfirstlane/saveexec waterfall loop. Pinning the value to
     SGPR collapses the SRD to scalar regs and drops the per-store waterfall."""
+    return ArithValue(_res_of(rocdl.readfirstlane(res=_raw(v).type, src=_raw(v))))
+
+
+# gfx9 DPP controls: ROW_SHR|n shifts right by n within a 16-lane row; ROW_BCAST15/31 feed a row's last lane into following rows.
+_DPP_ROW_SHR = 0x110
+_DPP_ROW_BCAST15 = 0x142
+_DPP_ROW_BCAST31 = 0x143
+
+
+def _dpp_add_i32(acc, ctrl, row_mask=0xF):
+    """acc + DPP(acc, ctrl); masked-off and shifted-in lanes contribute 0."""
+    raw = _raw(acc)
+    r = rocdl.update_dpp(raw.type, _raw(fx.Int32(0)), raw, ctrl, row_mask, 0xF, True)
+    return acc + ArithValue(_res_of(r))
+
+
+def _wave_prefix_add_i32(v):
+    """Wave64 inclusive add-scan of a per-lane i32 (lane l ends with the sum of 0..l).
+
+    Six DPP steps replace the serial carry; bound_ctrl zeroes the shifted-in lanes so
+    no bank_mask trimming is needed. Requires a full EXEC mask (kernel entry)."""
+    for _sh in (1, 2, 4, 8):
+        v = _dpp_add_i32(v, _DPP_ROW_SHR + _sh)
+    v = _dpp_add_i32(v, _DPP_ROW_BCAST15, row_mask=0xA)
+    return _dpp_add_i32(v, _DPP_ROW_BCAST31, row_mask=0xC)
+
+
+def _readlane_i32(v, lane):
+    """Broadcast one lane of a per-lane i32 into an SGPR; lane must be wave-uniform."""
     raw = _raw(v)
-    r = rocdl.readfirstlane(res=raw.type, src=raw)
-    rv = r.result if hasattr(r, "result") else r
-    return ArithValue(rv)
+    return ArithValue(_res_of(rocdl.readlane(res=raw.type, src=raw, lane=lane)))
+
+
+def _wave_count_le_i32(v, bound):
+    """Number of lanes whose per-lane i32 is <= the wave-uniform bound.
+
+    One ballot plus one s_bcnt1; on a monotone table this is the index of the first
+    lane above bound, i.e. an O(1) stand-in for a G-wide boundary compare chain."""
+    m = _res_of(rocdl.ballot(res=ir.IntegerType.get_signless(64), pred=_raw(v <= bound)))
+    n = _res_of(_llvm.intr_ctpop(m))
+    return ArithValue(arith.trunci(T.i32, n))
+
+
+def _lane_load_i32(rsrc, idx):
+    """One per-lane i32 gather from a buffer resource; out-of-range lanes read 0."""
+    return ArithValue(_buffer_ops.buffer_load(rsrc, idx, vec_width=1, dtype=T.i32))
+
+
+def _sload_i32(rsrc, idx):
+    """One wave-uniform i32 read on the scalar path: ``s_buffer_load`` straight into an SGPR.
+
+    ``idx`` is a compile-time i32-element index into the resource. The value never enters the
+    VGPR file, so a consumer chain waits on lgkmcnt instead of parking a ``vmcnt(0)`` drain on
+    the vector path, and the read is served by the scalar cache rather than the vL1D that the
+    g2s stream evicts every tile. (Emitted as the raw intrinsic: `buffer_load(is_scalar=)` is
+    not in every flydsl build.)"""
+    i32_t = ir.IntegerType.get_signless(32)
+    rsrc_v4 = _llvm.bitcast(
+        ir.VectorType.get([4], i32_t), _llvm.ptrtoint(ir.IntegerType.get_signless(128), _raw(rsrc))
+    )
+    args = [rsrc_v4, _raw(fx.Int32(idx * 4)), _raw(fx.Int32(0))]  # rsrc, byte offset, cache policy
+    return ArithValue(_llvm.call_intrinsic(i32_t, "llvm.amdgcn.s.buffer.load.i32", args, [], []))
+
+
+# SGPR-resident int32 table (entry i in its own SGPR): small-table twin of the lane-resident
+# table above. Lookup is a select chain and the prefix sum is unrolled SALU, both O(n_entries),
+# so it only pays while the table is short -- but it keeps the whole group scan off the vector
+# path: no per-lane gather, no DPP wave scan, no v_readlane -> SALU hazard.
+def _sgpr_tbl_load(rsrc, n_entries, stride=1, first=0):
+    """Read entries [0, n_entries) of an i32 buffer view into SGPRs; entry i is i32 element
+    ``(i + first) * stride``. All loads are in flight under one lgkmcnt."""
+    return [_sload_i32(rsrc, (i + first) * stride) for i in range_constexpr(n_entries)]
+
+
+def _sgpr_tbl_scan(tbl):
+    """Inclusive add-scan of an SGPR-resident table (entry i = sum of entries 0..i)."""
+    out = []
+    acc = tbl[0]
+    out.append(acc)
+    for v in tbl[1:]:
+        acc = acc + v
+        out.append(acc)
+    return out
+
+
+def _sgpr_tbl_pick(bounds, key, tables):
+    """Decode ``key`` against the monotone boundary table ``bounds`` (``bounds[g]`` = first key
+    owned by group g+1) and return one entry per table in ``tables``, all from the owning
+    group. One compare per boundary drives every table's ``s_cselect`` directly -- cheaper than
+    materialising the group index first (count_le + a select chain per table), which pays an
+    extra i1 -> VALU -> readfirstlane round trip just to get the index."""
+    outs = [t[0] for t in tables]
+    for g in range_constexpr(1, len(tables[0])):
+        take = key >= bounds[g - 1]
+        outs = [ArithValue(arith.select(take, t[g], o)) for t, o in zip(tables, outs)]
+    return outs
+
+
+# Lane-resident int32 table (entry i in lane i%64 of chunk i//64): avoids SGPR overflow past ~64 entries and LDS publish-barrier/ds_read; lookup = one v_readlane, prefix sum = one wave scan.
+def _lane_tbl_load(rsrc, lane, n_entries, stride=1, first=0):
+    """Gather entries [0, n_entries) of an i32 buffer view into lane-resident chunks.
+
+    Entry i is read from i32 element ``(i + first) * stride``; lanes past the buffer
+    bound read 0."""
+    n_chunk = ceildiv(n_entries, 64)
+    return [_lane_load_i32(rsrc, (lane + 64 * c + first) * stride) for c in range_constexpr(n_chunk)]
+
+
+def _lane_tbl_scan(tbl):
+    """Inclusive add-scan across a lane-resident table (chunk totals carried forward)."""
+    out = []
+    base = fx.Int32(0)
+    for v in tbl:
+        s = _wave_prefix_add_i32(v) + base
+        out.append(s)
+        base = _readlane_i32(s, 63)
+    return out
+
+
+def _lane_tbl_get(tbl, idx):
+    """Entry ``idx`` (wave-uniform, or a Python int) of a lane-resident table."""
+    if isinstance(idx, int):
+        return _readlane_i32(tbl[idx // 64], idx % 64)
+    v = _readlane_i32(tbl[0], idx)
+    for c in range(1, len(tbl)):
+        hit = idx >= fx.Int32(64 * c)
+        v = arith.select(hit, _readlane_i32(tbl[c], idx - fx.Int32(64 * c)), v)
+    return v
+
+
+def _lane_tbl_count_le(tbl, bound):
+    """Number of table entries <= ``bound``."""
+    n = _wave_count_le_i32(tbl[0], bound)
+    for c in range(1, len(tbl)):
+        n = n + _wave_count_le_i32(tbl[c], bound)
+    return n
 
 
 class StoreCPerTensor:
@@ -509,13 +761,39 @@ class StoreCPerTensor:
     re-based per row band in 64-bit index (int64-safe, M*N > 4GB) via
     ``make_row_band_resource``; columns past c_cols clamp to an OOB index (HW SRD
     drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
+
+    ``col_safe``: caller-proven "every column this store touches is < c_cols", which
+    drops the per-store OOB select. Only pass it when the tile's column span is bounded
+    at compile time AND no dead N-quadrant is being dropped by the column clamp.
+
+    ``c_base``: byte base index overriding the one extracted from ``C``, so a caller can
+    steer a tile's store to a second buffer of the same row pitch (the split-K wgrad
+    slices write a scratch band instead of C). Wave-uniform; it lands in the band SRD.
     """
 
     def __init__(
-        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, elem_fn=None
+        self,
+        A_scale,
+        B_scale,
+        C,
+        c_rows,
+        c_cols,
+        c_idx_fn,
+        n_tiles_a,
+        n_tiles_b,
+        out_ty,
+        elem_fn=None,
+        col_safe=False,
+        store_aux=0,
+        trans=False,
+        c_base=None,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
+        self.col_safe = col_safe
+        # trans: transposed scalar store for the A/B-swapped wgrad swap_n boundary body (frag row=N, col=M, written C[m,n]); square OUT_M==OUT_N tiles only.
+        self.trans = trans
+        self.store_aux = store_aux
         self.lane_id = fx.thread_idx.x % 64
         self.c_idx_fn = c_idx_fn
         self.n_tiles_a = n_tiles_a
@@ -524,7 +802,8 @@ class StoreCPerTensor:
         # Optional f32->f32 epilogue node chain (bias/act), post-scale pre-cast.
         self.elem_fn = elem_fn
         self.scaled = A_scale is not None
-        self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
+        # index = byte base address
+        self.c_base = _buffer_ops.extract_base_index(C) if c_base is None else c_base
         if self.scaled:
             gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
             gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
@@ -532,28 +811,74 @@ class StoreCPerTensor:
             self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
             self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
             self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        self._scale_v = None
 
     def _load_scalar(self, div):
         fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
+    def _scale(self):
+        """a_scale*b_scale, loaded once per emitting block. The quadrant stores share one
+        instance, so without this each of them re-issues both scalar buffer_loads and waits
+        on them before its first multiply -- an exposed round trip per quadrant. Cached per
+        MLIR block: sibling regions (a kernel's boundary-body branches) each get their own
+        load, since a value defined in one does not dominate a use in another."""
+        if not self.scaled:
+            return None
+        blk = ir.InsertionPoint.current.block
+        if self._scale_v is None or self._scale_v[0] != blk:
+            self._scale_v = (blk, self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div))
+        return self._scale_v[1]
+
     def store(self, c_frag, base_row, base_col):
-        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div) if self.scaled else None
+        scale = self._scale()
+        if self.trans:
+            return self._store_trans(c_frag, base_row, base_col, scale)
         # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
-                col_valid = col < self.c_cols
+                col_valid = None if self.col_safe else col < self.c_cols
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                # Whole-fragment scale: the wave-uniform per-tensor scale packs to v_pk_mul_f32, bit-identical to the per-element form.
+                if self.scaled:
+                    vec_f32 = vec_f32 * scale
                 for i in range_constexpr(4):
-                    val = vec_f32[i] * scale if self.scaled else vec_f32[i]
+                    val = vec_f32[i]
                     if self.elem_fn is not None:
                         val = self.elem_fn(val)  # bias/act epilogue node chain
                     val = val.to(self.out_ty)
                     off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
-                    _buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
+                    _buffer_ops.buffer_store(
+                        val, rsrc, off, mask=col_valid, cache_modifier=self.store_aux, offset_is_bytes=True
+                    )
+
+    def _store_trans(self, c_frag, base_row, base_col, scale):
+        """Transposed twin of store() for the A/B-swapped wgrad boundary body. c_frag holds
+        acc[n,m]; frag "row" (ti) -> N index, frag "col" (tj) -> M index. base_row = N origin,
+        base_col = M origin. Band is pinned to the M rows (base_col); columns are N. Same scalar
+        buffer_store path with the same value math -- only the global address is transposed."""
+        rsrc = make_row_band_resource(self.c_base, base_col, self.c_rows, self.c_cols, 2)
+        for ti in range_constexpr(self.n_tiles_a):
+            n_local = ti * 16 + (self.lane_id // 16) * 4  # a-side -> N (col within band)
+            for tj in range_constexpr(self.n_tiles_b):
+                m_in_band = tj * 16 + self.lane_id % 16  # b-side -> M (row within band)
+                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                if self.scaled:
+                    vec_f32 = vec_f32 * scale
+                for i in range_constexpr(4):
+                    n = base_row + n_local + i
+                    n_valid = None if self.col_safe else n < self.c_cols
+                    val = vec_f32[i]
+                    if self.elem_fn is not None:
+                        val = self.elem_fn(val)
+                    val = val.to(self.out_ty)
+                    off = (m_in_band * self.c_cols + n) * 2
+                    _buffer_ops.buffer_store(
+                        val, rsrc, off, mask=n_valid, cache_modifier=self.store_aux, offset_is_bytes=True
+                    )
 
 
 class StoreCPerTensorCShuffle:
@@ -578,7 +903,13 @@ class StoreCPerTensorCShuffle:
         c_lds,
         wave_id,
         row_pad=0,
+        pipe=False,
+        store_aux=0,
+        double_buffer=None,
     ):
+        # ``double_buffer`` is the tensorwise-NT caller's alias for ``pipe`` (staging double-buffer).
+        if double_buffer is not None:
+            pipe = double_buffer
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
@@ -604,16 +935,25 @@ class StoreCPerTensorCShuffle:
         self.row_stride = self.Cc + row_pad
         self.row_pad = row_pad
         self.wave_lds_elems = 16 * self.row_stride  # per-wave staging (one 16-row tile)
+        # pipe=True double-buffers the staging region (parity ti%2) so ti+1's ds_write
+        # overlaps ti's ds_read + store; needs 2x LDS (caller sizes C_lds_shuffle 2*_cshuf_n).
+        self.pipe = pipe
+        # Non-temporal aux immediate for the C store (keeps write-once C out of L2). 0 = default.
+        self.store_aux = store_aux
+        self.wave_stride = self.wave_lds_elems * (2 if pipe else 1)
         self.c_lds = c_lds
         # C addressed via i64 per-band re-basing (handles OUT_M*OUT_N > 2^31 / >4GB);
         # the final 128b store re-bases at each 16-row sub-tile band (see store()).
         self.c_base = _buffer_ops.extract_base_index(C)
-        gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)
-        gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)
-        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
-        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
-        self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        # A_scale/B_scale None -> scale already folded into the accumulator by the scaled MMA (mxfp8), so the store is plain.
+        self.scaled = A_scale is not None
+        if self.scaled:
+            gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)
+            gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)
+            self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+            self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+            self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
         # addr-space 2 (LDS), mirroring G2SLoader.LdsPtr_t. Separate scalar-store
         # (align 2) and vector-read (align 16) pointer types.
         self._store_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 2)
@@ -624,24 +964,26 @@ class StoreCPerTensorCShuffle:
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def store(self, c_frag, base_row, base_col):
-        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
+        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div) if self.scaled else None
         lds_base = fx.Int32(fx.ptrtoint(self.c_lds.ptr))
-        wave_off = self.wave_id * self.wave_lds_elems  # element offset of this wave's region
+        wave_base = self.wave_id * self.wave_stride  # base of this wave's region(s)
         out_b = 2  # bf16/fp16 = 2 bytes
         cols_i = _as_index(self.c_cols)
         rows_i = _as_index(self.c_rows)
-        for ti in range_constexpr(self.n_tiles_a):
-            # --- stage this 16-row sub-tile row-major into the per-wave LDS region ---
+
+        def _write_ti(ti, roff):
+            # stage this 16-row sub-tile row-major into the given per-wave LDS region
             for tj in range_constexpr(self.n_tiles_b):
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 lds_col = tj * 16 + self.lane_id % 16
                 for i in range_constexpr(4):
                     lds_row = (self.lane_id // 16) * 4 + i
-                    e = wave_off + lds_row * self.row_stride + lds_col
-                    val = (vec_f32[i] * scale).to(self.out_ty)
+                    e = roff + lds_row * self.row_stride + lds_col
+                    val = (vec_f32[i] * scale if self.scaled else vec_f32[i]).to(self.out_ty)
                     ptr = fx.inttoptr(self._store_ptr_t, lds_base + e * 2)
                     ptr.store(val)
-            S2RLoaderTr._wait_lgkmcnt(0)
+
+        def _read_store_ti(ti, roff):
             # Re-base output at this 16-row band (i64), re-read N-contiguous (one EPL-col
             # run/lane) + one 128b store at a small in-band i32 offset; band num_records OOB-drops.
             band_row = arith.index_cast(T.index, base_row + ti * 16)
@@ -655,14 +997,41 @@ class StoreCPerTensorCShuffle:
             col0 = (self.lane_id * self.EPL) % self.Cc
             for sub in range_constexpr(self.EPL // self.elems_per_store):
                 col_in = col0 + sub * self.elems_per_store
-                lane_e = wave_off + row_in * self.row_stride + col_in
+                lane_e = roff + row_in * self.row_stride + col_in
                 rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
                 vec = fx.make_view(rptr, fx.make_layout(self.elems_per_store, 1)).load()
                 gcol = base_col + col_in
                 valid = (gcol + fx.Int32(self.elems_per_store)) <= self.c_cols
                 off = (row_in * self.c_cols + gcol) * out_b  # i32-small within band
-                _buffer_ops.buffer_store(vec, rsrc, off, mask=valid, offset_is_bytes=True)
-            S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
+                _buffer_ops.buffer_store(
+                    vec, rsrc, off, mask=valid, cache_modifier=self.store_aux, offset_is_bytes=True
+                )
+
+        if const_expr(self.pipe and self.n_tiles_a > 1):
+            # Depth-2 softpipe over ti: prefetch ti+1's ds_write, store ti, drain in WPT
+            # steps (lgkmcnt oldest-first) so ti+1's prefetched writes stay in flight.
+            WPT = self.n_tiles_b * 4  # ds_write_b16 per ti (n_tiles_b tj * 4 rows)
+
+            def _roff(ti):
+                return wave_base + (ti % 2) * self.wave_lds_elems
+
+            _write_ti(0, _roff(0))
+            for ti in range_constexpr(self.n_tiles_a):
+                if const_expr(ti + 1 < self.n_tiles_a):
+                    _write_ti(ti + 1, _roff(ti + 1))
+                    S2RLoaderTr._wait_lgkmcnt(WPT)  # ti writes done; keep ti+1's WPT
+                    _read_store_ti(ti, _roff(ti))
+                    S2RLoaderTr._wait_lgkmcnt(WPT)  # ti read done; region free for ti+2
+                else:
+                    S2RLoaderTr._wait_lgkmcnt(0)  # last: drain final writes
+                    _read_store_ti(ti, _roff(ti))
+                    S2RLoaderTr._wait_lgkmcnt(0)
+        else:
+            for ti in range_constexpr(self.n_tiles_a):
+                _write_ti(ti, wave_base)
+                S2RLoaderTr._wait_lgkmcnt(0)
+                _read_store_ti(ti, wave_base)
+                S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
 
 
 def _a_tail_mask_vec(lane_id, r):
@@ -740,6 +1109,23 @@ def xcd_remap_pid(pid, total_pids, num_xcd):
     xcd = pid % num_xcd
     local = pid // num_xcd
     offset = xcd * per_xcd + arith.select(xcd < rem, xcd, rem)
+    return offset + local
+
+
+def xcd_remap_pid_u(pid, total_pids, num_xcd):
+    """``xcd_remap_pid`` on ids proven non-negative: same bijection, unsigned divides.
+
+    Signed ``pid % num_xcd`` / ``pid // num_xcd`` cost a floor-div fixup each -- 19 SALU for
+    num_xcd=4 where the unsigned power-of-two forms are one mask and one shift. Kept as a
+    separate entry point so the signed callers (dense, wgrad, mxfp4/mxfp8 grouped) keep
+    byte-identical ISA."""
+    if num_xcd <= 1:
+        return pid
+    per_xcd = udiv(total_pids, num_xcd)  # floor
+    rem = total_pids - per_xcd * num_xcd
+    xcd = umod(pid, num_xcd)
+    local = udiv(pid, num_xcd)
+    offset = xcd * per_xcd + ArithValue(arith.minui(_u32(xcd), _u32(rem)))
     return offset + local
 
 
@@ -856,9 +1242,8 @@ class S2RLoaderTr:
         r_step = K_log // KW
         W = (K_log % KW) // rows_per_wave
         K_local_row = K_log % rows_per_wave
-        # swz_K reproduces swizzle_128's own (extracted & mask) term: extracted =
-        # (K_log%16)//2 is width-independent; only the mask narrows with width.
-        swz_K = (((K_log % 16) // 2) & (chunks - 1)) * 16
+        # swz_K reproduces swizzle_128's own key over this buffer's chunk count.
+        swz_K = lds_row_swizzle(K_log, chunks) * 16
         coord_start = self.wave_idx * self.tile_stride + tile_i * 16
         j_chunk = (coord_start // 16) ^ (swz_K // 16)
         if self.wswz:
@@ -874,9 +1259,9 @@ class S2RLoaderTr:
             + (L_in_sg % 2) * 8
         )
 
-    def _issue_one(self, lds_src, tile_i, base_off=None):
+    def _issue_one(self, lds_src, tile_i, base_off=None, vmcnt=None):
         """Issue the 4 ds_read_b64_tr_b8 of one tile (no drain, no assemble).
-        Returns the 4 raw v2i32 Vec."""
+        Returns the 4 raw v2i32 Vec. vmcnt overrides the instance g2s drain hint."""
         tr_type = Vec.make_type(2, fx.Int32)
         base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
         if base_off is not None:  # runtime LDS-stage byte offset (double-buffer parity)
@@ -887,7 +1272,8 @@ class S2RLoaderTr:
         if self.inline_asm:
             p0 = _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off(0, tile_i, I, L_in_sg)))
             p1 = _lds_ptr_from_i32(base_i32 + fx.Int32(self._ptr_off(1, tile_i, I, L_in_sg)))
-            r02 = _packed_ds_read_tr_offsets(p0, [0, RS], vmcnt_hint=self.vmcnt_hint)
+            _vm = self.vmcnt_hint if vmcnt is None else vmcnt
+            r02 = _packed_ds_read_tr_offsets(p0, [0, RS], vmcnt_hint=_vm)
             r13 = _packed_ds_read_tr_offsets(p1, [0, RS], vmcnt_hint=None)
             # r02 = [c0, c2], r13 = [c1, c3] -> caller assembles as c0,c1,c2,c3
             return [Vec(r02[0]), Vec(r13[0]), Vec(r02[1]), Vec(r13[1])]
@@ -918,15 +1304,16 @@ class S2RLoaderTr:
             has_side_effects=True,
         )
 
-    def load(self, lds_src, preshuffled=False, drain=True, base_off=None):
+    def load(self, lds_src, preshuffled=False, drain=True, base_off=None, vmcnt=None):
         """Return all n_tiles operand frags. Inline-asm path issues every tile's
         async reads then one trailing lgkmcnt(0) before the consuming mfma;
         drain=False skips it when a later drain covers these reads. The intrinsic
         path lets the backend insert the wait. base_off = runtime LDS-stage byte
-        offset (double-buffer parity)."""
+        offset (double-buffer parity). vmcnt overrides the instance g2s drain hint
+        for this call (-1 = none, when a caller-side rendezvous already covers it)."""
         assert not preshuffled, "S2RLoaderTr does not support preshuffled"
         if self.inline_asm:
-            all_calls = [self._issue_one(lds_src, t, base_off) for t in range_constexpr(self.n_tiles)]
+            all_calls = [self._issue_one(lds_src, t, base_off, vmcnt) for t in range_constexpr(self.n_tiles)]
             if drain:
                 self._wait_lgkmcnt(0)
             return [self._assemble(c) for c in all_calls]
@@ -1056,12 +1443,31 @@ def _lds_barrier():
     )
 
 
-def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=1):
+def _emit_lds_repack(
+    is_a,
+    grp,
+    k0,
+    tile,
+    rin,
+    rout,
+    dim,
+    K128,
+    KT,
+    tid,
+    BLK,
+    rd_base=0,
+    wr_base=0,
+    pack=1,
+    kbound=None,
+    k128p=None,
+):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
+    # kbound (default K128) bounds this chunk's k index; k128p (default ceildiv(K128,pack)) is the output k-stride, so the variable-K wgrad packs each group from its own k0.
     NT = 4
     TILE = 64 * KT
     assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
+    KBND = K128 if kbound is None else kbound
     for i in range_constexpr(TILE // BLK):
         idx = tid + i * BLK
         rr = idx // KT
@@ -1074,7 +1480,11 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
             off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
             grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
         dw = _buffer_ops.buffer_load(
-            rin, grow * K128 + gk + rd_base, vec_width=1, dtype=T.i32, mask=(gk < K128) & (grow < dim)
+            rin,
+            grow * K128 + gk + rd_base,
+            vec_width=1,
+            dtype=T.i32,
+            mask=(gk < KBND) & (grow < dim),
         )
         fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
             Vec.from_elements([fx.Int32(dw)], fx.Int32)
@@ -1083,7 +1493,7 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
     # Packed store: pack PACK consecutive K-iters into one output dword per lane (the
     # reader mirrors this via kk=k//PACK + MFMA op_sel). PACK=1 = unpacked.
     PACK = pack
-    K128p = ceildiv(K128, PACK)
+    K128p = ceildiv(K128, PACK) if k128p is None else k128p
     NGP = KT // PACK  # packed groups produced per KT-chunk
     NOUTp = NGP * 64
     for j in range_constexpr(NOUTp // BLK):
@@ -1109,7 +1519,7 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
             vec.ir_value(),
             rout,
             ((grp * K128p + gkp) * 64 + lane) * 4 + wr_base,
-            mask=(k0 + kkp * PACK) < K128,
+            mask=(k0 + kkp * PACK) < KBND,
         )
 
 
