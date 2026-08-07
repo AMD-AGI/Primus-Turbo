@@ -1631,40 +1631,39 @@ _WGRAD_XCD_RCP_SHIFT = 16  # fixed-point reciprocal of the compile-time swizzle 
 
 
 def _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, nxcd=_WGRAD_XCD_HW):
-    """(h, w) for the XCD-affine wgrad swizzle, or None when the grid is too small for it.
+    """(h, w) for the XCD-affine wgrad swizzle, or None when the grid is too small. nxcd is the
+    number of XCDs sharing a group (_wgrad_xcd_span's k), not always the hardware count.
 
-    Each XCD has its own L2 slice and the dispatcher pins workgroup bid to XCD bid % nxcd, so the
-    tiles one XCD runs out of a group are exactly one residue class of the within-group index, and
-    the operand bytes that slice must hold are (#distinct block_m + #distinct block_n) x 32 KB per
-    K-step. A class scattered over the whole grid touches ~2x what a compact one does. Reordering
-    the grid so each class is a contiguous run of an (h rows x w cols) block order brings that down
-    to sz/w + w: h*w == sz makes a run exactly one block, otherwise h=1 (row-major inside the
-    column band) keeps a run's spill into the next block on a single extra row. Unlike an
-    xcd_remap_pid block partition this does not touch the dispatch order, so every XCD keeps the
-    hardware's own even tile split -- the reason methodology/05 finds only R=1 balances wgrad."""
+    bid is pinned to XCD bid % nxcd, so one XCD runs one residue class of the within-group index; a
+    class scattered over the grid holds far more operand slab than a compact run. Reorder each class
+    into a contiguous width-w column band so its footprint is the rows x cols the run spans. Unlike
+    an xcd_remap_pid partition this leaves the dispatch order alone, so every XCD keeps the
+    hardware's even tile split (methodology/05: only R=1 balances wgrad). h>1 walks h rows in
+    lockstep so h A-slabs stay hot and each B-slab is reused h times; h=2 helps a square run, deeper
+    h hurts, and a one-column band keeps h=1."""
     sz = tiles_per_group // nxcd
     if sz < 2 or n_blocks_m < 2 or n_blocks_n < 2:
         return None
     best = None
     for w in (d for d in range(1, n_blocks_n + 1) if n_blocks_n % d == 0):
-        exact = [d for d in range(1, n_blocks_m + 1) if n_blocks_m % d == 0 and d * w == sz]
-        h = exact[0] if exact else 1
-        rows = h if exact else -(-sz // w)
-        key = (rows + w, -w)
+        rows = min(n_blocks_m, -(-sz // w))
+        cols = w * -(-sz // (n_blocks_m * w))
+        key = (rows + cols, w)  # ties go to the narrowest band
         if best is None or key < best[0]:
-            best = (key, h, w)
-    return best[1], best[2]
+            best = (key, w, rows)
+    _, w, rows = best
+    return (2 if w > 1 and rows % 2 == 0 and n_blocks_m % 2 == 0 else 1), w
 
 
 def _wgrad_band_is_xcd_aff(n_blocks_m, n_blocks_n, group_m, group_n, nxcd=_WGRAD_XCD_HW):
-    """True when the (group_m, group_n) band already hands every XCD the minimal operand footprint,
-    against which the explicit de-interleave measures flat. A band whose super-block is exactly nxcd
-    cells and tiles the block grid gives each residue class of bid one fixed cell per super-block,
-    i.e. an (n_blocks_m/group_m) x (n_blocks_n/group_n) sub-lattice -- strided, but with the same
-    distinct-block_m + distinct-block_n count as the compact rectangle _wgrad_xcd_aff_geom builds.
-    down's 12x12 grid under (4,2) lands there (3 + 6 = 9 slabs either way, and measured flat);
-    gate_up's 23x12 cannot, N_BLOCKS_M being prime, and its (4,4) costs 17.0 against the map's
-    12.75."""
+    """True when the (group_m, group_n) band already hands every XCD the minimal operand footprint.
+    A band whose super-block is exactly nxcd cells and tiles the block grid gives each residue class
+    of bid one fixed cell per super-block, i.e. an (n_blocks_m/group_m) x (n_blocks_n/group_n)
+    sub-lattice -- strided, but with the same distinct-block count as the compact rectangle
+    _wgrad_xcd_aff_geom builds (needs N_BLOCKS_N non-prime to factor). Equal slab counts only make
+    the two orders equivalent while the launch is a few dispatch rounds deep; over a full-model
+    launch the strided class drifts out of its L2 slice and the compact run wins, so
+    _wgrad_4wave_cands only trusts this gate when the launch is shallow."""
     return group_m * group_n == nxcd and n_blocks_m % group_m == 0 and n_blocks_n % group_n == 0
 
 
@@ -1677,26 +1676,73 @@ def _wgrad_xcd_div(x, d, xmax):
     return fx.Int32(fx.Int32(x * fx.Int32(m)) >> _WGRAD_XCD_RCP_SHIFT)
 
 
-def _wgrad_xcd_block_mn(local, N_BLOCKS_M, N_BLOCKS_N, h, w, TILES_PER_GROUP, nxcd=_WGRAD_XCD_HW):
-    """within-group tile index -> (block_m, block_n) under the XCD-affine swizzle; the geometry
-    (h, w) comes from _wgrad_xcd_aff_geom. De-interleaves the index by nxcd so one XCD's class
-    becomes a contiguous run, then walks (h x w) blocks down a width-w column band. Every divisor
-    is compile-time and goes through a multiply/shift, which the band map's runtime `pig // gsm`
-    cannot -- and this sits in the latency-exposed per-tile prologue at occ=1."""
-    per, rem = divmod(TILES_PER_GROUP, nxcd)
+def _wgrad_xcd_span(tiles_per_group, G, ncu, nxcd=_WGRAD_XCD_HW):
+    """(gp, k) for the XCD-affine swizzle: how many groups one super-block of the dispatch id
+    spans, and how many XCDs then share a group.
+
+    A dispatch id class stays in its L2 slice only while its co-resident tiles come from one run. An
+    XCD holds ncu/nxcd tiles at occ=1; a group hands it only tiles_per_group/nxcd, so once a group
+    is smaller than that the XCD runs the tail of group g with the head of group g+1 and must hold
+    both groups' operand slabs. Letting a super-block cover gp = ceil(ncu / tiles_per_group) groups
+    and splitting the classes so k = nxcd/gp XCDs share each makes a class ncu/nxcd tiles of ONE
+    group again. The cost is a gp-times-bigger run per XCD (priced by _wgrad_xcd_aff_geom at the
+    wider sz), which still nets fewer resident slabs.
+
+    gp must divide nxcd (classes split evenly) and G (super-blocks tile the launch), and
+    gp*tiles_per_group must be a multiple of nxcd (every class the same tile count). The smallest
+    gp that covers the co-residency wins: a wider super-block only inflates the run footprint."""
+    if tiles_per_group <= 0 or ncu <= 0 or ncu <= tiles_per_group:
+        return 1, nxcd
+    want = -(-ncu // tiles_per_group)  # groups an XCD would otherwise co-run
+    for gp in (g for g in (2, 4, 8) if want <= g <= nxcd):
+        if nxcd % gp == 0 and G % gp == 0 and (gp * tiles_per_group) % nxcd == 0:
+            return gp, nxcd // gp
+    return 1, nxcd
+
+
+def _wgrad_xcd_rot_ok(TILES_PER_GROUP, gp=1, nxcd=_WGRAD_XCD_HW):
+    """True when the per-super-block class rotation of _wgrad_xcd_tile is a bijection. It permutes
+    the residue classes, so every class must own the same number of tiles, i.e. nxcd | gp*TPG."""
+    return (gp * TILES_PER_GROUP) % nxcd == 0
+
+
+def _wgrad_xcd_tile(idx, N_BLOCKS_M, N_BLOCKS_N, h, w, gp, TILES_PER_GROUP, rot=False, nxcd=_WGRAD_XCD_HW):
+    """dispatch id -> (group_idx, block_m, block_n) under the XCD-affine swizzle; the geometry
+    (h, w) comes from _wgrad_xcd_aff_geom and gp from _wgrad_xcd_span. De-interleaves the id by
+    nxcd so one XCD's class becomes a contiguous run inside its super-block of gp groups, then
+    walks (h x w) blocks down a width-w column band. Every divisor is compile-time and goes
+    through a multiply/shift, which the band map's runtime `pig // gsm` cannot -- and this sits in
+    the latency-exposed per-tile prologue at occ=1.
+
+    rot advances the class an XCD owns by one per super-block, the same fix _wgrad_block_mn's
+    tile_rot applies to the band maps and for the same reason: the runs are compact but not
+    equal-cost, so a fixed class per XCD is a fixed load imbalance. The boundary M-/N-blocks run the
+    cheaper half-tile whole-loop and sit in whole runs, so a fixed assignment leaves one XCD
+    carrying the heavy runs and setting the wall. Rotating hands every XCD every run in turn without
+    touching either the compactness of a run or the dispatch order."""
+    k = nxcd // gp
+    SB = gp * TILES_PER_GROUP
+    per, rem = divmod(SB, nxcd)
     cbs, bsz = N_BLOCKS_M * w, h * w
-    c = local & fx.Int32(nxcd - 1)
-    lin = c * fx.Int32(per) + (local >> (nxcd.bit_length() - 1))
+    sb = idx // SB
+    r = idx - sb * fx.Int32(SB)
+    c = r & fx.Int32(nxcd - 1)
+    if const_expr(rot):
+        assert _wgrad_xcd_rot_ok(TILES_PER_GROUP, gp, nxcd)
+        c = (c + sb) & fx.Int32(nxcd - 1)
+    # low log2(k) bits of the class pick the run inside a group, the high bits pick the group.
+    lin = (c & fx.Int32(k - 1)) * fx.Int32(per) + (r >> (nxcd.bit_length() - 1))
     if const_expr(rem):
         lin = lin + arith.select(c < fx.Int32(rem), c, fx.Int32(rem))
-    cb = _wgrad_xcd_div(lin, cbs, TILES_PER_GROUP)
+    group_idx = sb * fx.Int32(gp) + (c >> (k.bit_length() - 1))
+    cb = _wgrad_xcd_div(lin, cbs, per * k + rem)
     p = lin - cb * fx.Int32(cbs)
     blk = _wgrad_xcd_div(p, bsz, cbs - 1)
     q = p - blk * fx.Int32(bsz)
     if const_expr(h == 1):
-        return blk, cb * fx.Int32(w) + q
+        return group_idx, blk, cb * fx.Int32(w) + q
     col = _wgrad_xcd_div(q, h, bsz - 1)
-    return blk * fx.Int32(h) + (q - col * fx.Int32(h)), cb * fx.Int32(w) + col
+    return group_idx, blk * fx.Int32(h) + (q - col * fx.Int32(h)), cb * fx.Int32(w) + col
 
 
 def _wgrad_block_mn(
@@ -1710,6 +1756,7 @@ def _wgrad_block_mn(
     interleave,
     tile_rot=0,
     xcd_aff=None,
+    xcd_rot=False,
 ):
     """idx -> (group_idx, block_m, block_n) for the wgrad output grid. interleave=True
     (masked one-tile/WG): band-cyclic group interleave (one group_m M-band per group ->
@@ -1724,13 +1771,10 @@ def _wgrad_block_mn(
     if const_expr(interleave):
         cl = idx // N_BLOCKS_N
         return cl % G, cl // G, idx % N_BLOCKS_N
+    if const_expr(xcd_aff is not None):
+        return _wgrad_xcd_tile(idx, N_BLOCKS_M, N_BLOCKS_N, *xcd_aff, TILES_PER_GROUP, xcd_rot)
     group_idx = idx // TILES_PER_GROUP
     local = idx % TILES_PER_GROUP
-    if const_expr(xcd_aff is not None):
-        block_m, block_n = _wgrad_xcd_block_mn(
-            local, N_BLOCKS_M, N_BLOCKS_N, xcd_aff[0], xcd_aff[1], TILES_PER_GROUP
-        )
-        return group_idx, block_m, block_n
     if const_expr(tile_rot):
         # gcd(TILES_PER_GROUP, num_xcd) pins boundary tiles to fixed XCD residues; the per-group tile_rot rotation spreads them (a per-group bijection).
         local = (local + group_idx * fx.Int32(tile_rot)) % fx.Int32(TILES_PER_GROUP)
@@ -2915,8 +2959,11 @@ def _wholeloop_asm_3buf(
 
         def _diag_cells():
             # MFMA emission order: srcA pool is the outer loop so srcA stays on one fragment per bn-run (this MFMA is srcA-movement sensitive); bm x bn diagonal blocking spreads the ds_read refills.
-            bm, bn = 2, 4
+            bm = 2
             ncol = b_halves * ntb
+            # A body narrowed to a short last N-block (see _wgrad_bnd_ntb) can hold fewer columns
+            # than the default block, so take the widest block that still tiles what it has.
+            bn = gcd(4, ncol)
             nib, ncb = nta // bm, ncol // bn
             cells = []
             for D in range(nib + ncb - 1):
@@ -3309,6 +3356,7 @@ def _wave4_do_tile_tn(
     _cn,
     tile_rot=0,
     xcd_aff=None,
+    xcd_rot=False,
     a_halves=2,
     b_halves=2,
     swap_n=False,
@@ -3321,7 +3369,17 @@ def _wave4_do_tile_tn(
 ):
     tt = xcd_remap_pid(t, TOTAL, num_xcd)
     group_idx, block_m, block_n = _wgrad_block_mn(
-        tt, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, False, tile_rot, xcd_aff
+        tt,
+        G,
+        TILES_PER_GROUP,
+        N_BLOCKS_M,
+        N_BLOCKS_N,
+        group_m,
+        group_n,
+        False,
+        tile_rot,
+        xcd_aff,
+        xcd_rot,
     )
     group_idx = _readfirstlane_i32(group_idx)
     block_m = _readfirstlane_i32(block_m)
@@ -3752,6 +3810,22 @@ def _wgrad_split_ws(OUT_M, OUT_N, G, device, dtype, BLOCK_M=256, BLOCK_N=256):
     return ws
 
 
+def _wgrad_bnd_ntb(n_rem, wave_n, n_tiles_b):
+    """MFMA N-tiles per wave for the b0-only body of a last N-block holding n_rem valid columns,
+    the wgrad twin of the NT kernel's ``_bnd_ntb``.
+
+    The b0-only body skips the b1 half, but its remaining half is a fixed wave_n x n_tiles_b x 16
+    columns wide, so a remainder narrower than that half computes columns it will never store.
+    Dropping the tiles the remainder does not reach costs nothing else: the LDS slab, its g2s and
+    the transposed read pattern are unchanged (unlike the NT twin, whose g2s step count tracks the
+    tile count), only fewer 16-column tiles are read and multiplied. n_rem=0 (N-block-aligned OUT_N,
+    or the N bit of half_bnd off) keeps the full half. Sized up: a remainder not a multiple of
+    wave_n*16 keeps the epilogue column clamp."""
+    if n_rem <= 0:
+        return n_tiles_b
+    return min(n_tiles_b, -(-n_rem // (wave_n * 16)))
+
+
 def _compile_grouped_tn_wgrad_4wave(
     *,
     OUT_M: int,
@@ -3766,9 +3840,10 @@ def _compile_grouped_tn_wgrad_4wave(
     group_m: int = 0,
     group_n: int = 0,
     xcd_aff: bool = False,
+    xcd_rot: bool = True,
     vmcnt_hint: int = 2,
     cap_cu: int = -1,
-    half_bnd: bool = True,
+    half_bnd: int = 3,
 ):
     """4-wave (occ=1) grouped TN wgrad dW[g]=A[g]^T@B[g], variable-K per group. 256x256
     whole-loop bare-asm body: runtime nval (floored to x6) + in-asm fused tail; partial
@@ -3787,7 +3862,6 @@ def _compile_grouped_tn_wgrad_4wave(
     N_WAVES = _geo.N_WAVES
     N_TILES_A = _geo.N_TILES_A
     N_TILES_B = _geo.N_TILES_B
-    N_ACCUMS = _geo.N_ACCUMS
     LDS_BLOCK_M = _geo.LDS_BLOCK_M
     LDS_BLOCK_N = _geo.LDS_BLOCK_N
     N_LDS_STEPS_A = _geo.N_LDS_STEPS_A
@@ -3800,25 +3874,56 @@ def _compile_grouped_tn_wgrad_4wave(
     N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
-    # (group_m, group_n) are the XCD-affine (h, w) under xcd_aff; the rotation is subsumed by it.
-    _XCD_AFF = (group_m, group_n) if xcd_aff else None
+    _NCU = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    # (group_m, group_n) are the XCD-affine (h, w) under xcd_aff; it carries its own class rotation
+    # (_XCD_ROT) instead of the band maps' tile_rot, which would break the run's compactness.
+    _XCD_GP, _XCD_K = _wgrad_xcd_span(TILES_PER_GROUP, G, _NCU) if xcd_aff else (1, _WGRAD_XCD_HW)
+    _XCD_AFF = (group_m, group_n, _XCD_GP) if xcd_aff else None
+    _XCD_ROT = _XCD_AFF is not None and xcd_rot and _wgrad_xcd_rot_ok(TILES_PER_GROUP, _XCD_GP)
     if _XCD_AFF is not None:
         assert num_xcd <= 1, "xcd_aff assumes the hardware bid % 8 XCD split, not a pid remap"
         assert (
-            _wgrad_xcd_aff_geom(N_BLOCKS_M, N_BLOCKS_N, TILES_PER_GROUP) is not None
+            _wgrad_xcd_aff_geom(N_BLOCKS_M, N_BLOCKS_N, TILES_PER_GROUP, _XCD_K) is not None
             and N_BLOCKS_M % group_m == 0
             and N_BLOCKS_N % group_n == 0
-            and group_m * group_n <= TILES_PER_GROUP // _WGRAD_XCD_HW
+            and group_m * group_n <= TILES_PER_GROUP // _XCD_K
         ), f"bad xcd_aff geometry ({group_m},{group_n}) for {N_BLOCKS_M}x{N_BLOCKS_N}"
     _TILE_ROT = 0 if _XCD_AFF is not None else (_WG_TILE_ROT if TILES_PER_GROUP > _WG_TILE_ROT else 0)
-    # Every stored column is < OUT_N at compile time, so the epilogue per-element OOB select is dead. Needs half_bnd and OUT_N % LDS_BLOCK_N == 0.
-    _HALF_N_TILE = half_bnd and (OUT_N % BLOCK_N != 0) and (OUT_N % BLOCK_N <= LDS_BLOCK_N)
-    _COL_SAFE = (OUT_N % BLOCK_N == 0) or (_HALF_N_TILE and OUT_N % LDS_BLOCK_N == 0)
-    # Split-K window geometry. num_xcd>1 remaps the dispatch id, which can carry a window across
-    # a group boundary (two groups would then share one workspace band), so keep it to xcd=1.
-    _NCU = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    # The boundary bodies below drop the masked MFMA of a short last M-/N-block, but a cheap tile
+    # frees its CU early and the refilling WG walks the contraction out of phase with the co-resident
+    # WGs it shares an L2 slab with; at occ=1 nothing ever resyncs them, so the launch splits into
+    # phase cohorts that stop reusing each other's slabs. Shallow (an EP-sharded slice, a few dispatch
+    # rounds) the steady state does not set the wall and both bodies pay for themselves; over a
+    # full-model launch they do not. The M row is a whole run of the XCD-affine swizzle, so making it
+    # cheap desyncs entire runs and it loses deep, whereas the short N block is one tile inside a run,
+    # only shortens each row's tail, and also turns _COL_SAFE on -- so the M side stays behind the
+    # launch-depth gate and the N side behind the cost gate below. Peeling either into its own
+    # dispatch segment recovers nothing: a one-block-thick strip has no second block to share an
+    # operand slab with, so it reads its whole B (M row) or A (N column) from DRAM instead of reusing
+    # it inside the 2D run. half_bnd is the (1 = M, 2 = N) enable mask.
+    _HALF_M = bool(half_bnd & 1) and TOTAL < _WGRAD_AFF_ROUNDS * _NCU and 0 < OUT_M % BLOCK_M <= BLOCK_M // 2
+    _WAVE_N = BLOCK_N // LDS_BLOCK_N
+    _N_REM = OUT_N % BLOCK_N if 0 < OUT_N % BLOCK_N <= LDS_BLOCK_N else 0
+    # The short N body drops _BND_COLS columns off one N-block in N_BLOCKS_N, buying that fraction
+    # of the launch's MFMA, while the phase cost above is ~1/_WGRAD_BND_PHASE_INV of the wall
+    # whatever the shape. Deep, enable it only when the MFMA saved beats that cost; shallow, the cost
+    # is not on the wall (see _HALF_M).
+    _BND_COLS = BLOCK_N - _wgrad_bnd_ntb(_N_REM, _WAVE_N, N_TILES_B) * _WAVE_N * 16
+    _HALF_N = (
+        bool(half_bnd & 2)
+        and _N_REM > 0
+        and (TOTAL < _WGRAD_AFF_ROUNDS * _NCU or _BND_COLS * _WGRAD_BND_PHASE_INV > N_BLOCKS_N * BLOCK_N)
+    )
+    _BND_NTB = _wgrad_bnd_ntb(_N_REM if _HALF_N else 0, _WAVE_N, N_TILES_B)
+    # Every stored column is < OUT_N at compile time, so the epilogue per-element OOB select is
+    # dead: the b0-only body ends exactly on OUT_N and no full body reaches the last N-block.
+    _COL_SAFE = (OUT_N % BLOCK_N == 0) or (_HALF_N and _BND_NTB * _WAVE_N * 16 == OUT_N % BLOCK_N)
+    # Split-K window geometry. num_xcd>1 remaps the dispatch id, which can carry a window across a
+    # group boundary (two groups would then share one workspace band), so keep it to xcd=1. An
+    # _XCD_GP>1 super-block interleaves its gp groups every _XCD_K ids, so any window worth splitting
+    # straddles them -- same collision, same exclusion.
     _S_MAX, _S_A, _S_B, _N_MAX, _SP_EXT = (
-        _wgrad_split_geom(TILES_PER_GROUP, TOTAL, _NCU) if num_xcd <= 1 else (1, 1, 1, 0, 0)
+        _wgrad_split_geom(TILES_PER_GROUP, TOTAL, _NCU) if num_xcd <= 1 and _XCD_GP <= 1 else (1, 1, 1, 0, 0)
     )
     _SPLIT = _S_MAX > 1
     _SP_POW2 = _wgrad_split_rcp_cfg(TILES_PER_GROUP, _S_A, _S_B, _NCU)[0]
@@ -3886,6 +3991,8 @@ def _compile_grouped_tn_wgrad_4wave(
             split_s=None,
             split_code=None,
         ):
+            # A b0-only body only has to reach the last N-block's valid columns.
+            _ntb = _BND_NTB if tile_b_halves == 1 else N_TILES_B
             _wave4_do_tile_tn(
                 t,
                 TOTAL=TOTAL,
@@ -3904,8 +4011,8 @@ def _compile_grouped_tn_wgrad_4wave(
                 OUT_N=OUT_N,
                 F8_IR_t=F8_IR_t,
                 N_TILES_A=N_TILES_A,
-                N_TILES_B=N_TILES_B,
-                N_ACCUMS=N_ACCUMS,
+                N_TILES_B=_ntb,
+                N_ACCUMS=N_TILES_A * _ntb,
                 N_LDS_STEPS_A=N_LDS_STEPS_A,
                 N_LDS_STEPS_B=N_LDS_STEPS_B,
                 _CS=_CS,
@@ -3931,6 +4038,7 @@ def _compile_grouped_tn_wgrad_4wave(
                 _cn=_cn,
                 tile_rot=_TILE_ROT,
                 xcd_aff=_XCD_AFF,
+                xcd_rot=_XCD_ROT,
                 a_halves=tile_a_halves,
                 b_halves=tile_b_halves,
                 swap_n=tile_swap_n,
@@ -3943,8 +4051,6 @@ def _compile_grouped_tn_wgrad_4wave(
             )
 
         # Persistent: fixed grid of <=ncus WGs strides the tile space. Boundary M-/N-block with <=128 valid rows/cols runs the a0-/b0-only whole-loop (predicates wave-uniform, bodies have s_barrier).
-        _HALF_M = half_bnd and (OUT_M % BLOCK_M != 0) and (OUT_M % BLOCK_M <= 128)
-        _HALF_N = half_bnd and (OUT_N % BLOCK_N != 0) and (OUT_N % BLOCK_N <= 128)
         if const_expr(_SPLIT):
             _sp_lo, _sp_n, _sp_s, _sp_code = _wgrad_split_policy(
                 go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, _NCU, _S_A, _S_B
@@ -3992,6 +4098,7 @@ def _compile_grouped_tn_wgrad_4wave(
                     False,
                     _TILE_ROT,
                     _XCD_AFF,
+                    _XCD_ROT,
                 )
                 if const_expr(_HALF_M and _HALF_N):
                     if _readfirstlane_i32(_blk_m) == fx.Int32(N_BLOCKS_M - 1):
@@ -4052,6 +4159,7 @@ def _compile_grouped_tn_wgrad_4wave(
                 False,
                 _TILE_ROT,
                 _XCD_AFF,
+                _XCD_ROT,
             )
             gi = _readfirstlane_i32(_gi)
             bm_off = _readfirstlane_i32(_bm * fx.Int32(BLOCK_M))
@@ -4212,26 +4320,46 @@ _WG_TILE_ROT = 5
 # 4-wave (group_m, group_n, num_xcd, xcd_aff) candidates; xcd=1 keeps group-major LPT order (a
 # skewed load needs it, unknowable at dispatch).
 _WGRAD_4WAVE_CANDS = ((4, 2, 1, 0), (4, 4, 1, 0), (8, 4, 1, 0))
+# Dispatch rounds (G*tiles_per_group / ncu) from which the steady state, rather than the per-tile
+# work, sets the wall: the XCD-affine run leads the candidate list from here, and from here the
+# short last-M-block body stops paying for itself (see _HALF_M).
+_WGRAD_AFF_ROUNDS = 8
+# Reciprocal of the wall a boundary body costs once the launch is that deep, as a fraction of the
+# launch: a cheap tile frees its CU early and the WG that refills it runs out of L2 phase with its
+# neighbours (see _HALF_N). Empirically ~5% and shape-independent within the probe's noise.
+_WGRAD_BND_PHASE_INV = 20
 
 
-def _wgrad_4wave_cands(OUT_M, OUT_N, ncu, block=256):
+def _wgrad_4wave_cands(OUT_M, OUT_N, G, ncu, block=256):
     """Order the candidates so cands[0] -- the incumbent, which the race below only displaces on a
-    >1.5% win -- is the one the tile geometry argues for, and lead with the XCD-affine swizzle on
-    the grids whose band cannot already be one. A gn4 band covers 16 tiles with 8 operand blocks
-    (2.0 tiles/block) vs gn2's 8 tiles with 6 (1.33), but that only buys anything once a group holds
-    more tiles than the device runs at once and its operand slab stops being wholly L2 resident:
-    measured -1.9% on gate_up (276 tiles/group > 256 CU) and flat on down (144)."""
+    >1.5% win -- is the one the tile geometry argues for. A gn4 band packs more tiles per operand
+    block than gn2, but that only buys anything once a group holds more tiles than the device runs
+    at once and its operand slab stops being wholly L2 resident.
+
+    The XCD-affine run leads once the launch is deep enough for the steady state it optimises to set
+    the wall; it needs N_BLOCKS_N non-prime for _wgrad_xcd_span to give it a square run rather than
+    a thin strip. An EP-sharded slice is only a few rounds and measures flat, so there the affine
+    arm stays behind the band incumbent and only wins the race on a real margin."""
     n_blocks_m = (OUT_M + block - 1) // block
     n_blocks_n = (OUT_N + block - 1) // block
     tiles_per_group = n_blocks_m * n_blocks_n
     head = (4, 4) if tiles_per_group > ncu else (4, 2)
     band = tuple(sorted(_WGRAD_4WAVE_CANDS, key=lambda c: c[:2] != head))
+    deep = G * tiles_per_group >= _WGRAD_AFF_ROUNDS * ncu
     aff = (
         None
-        if _wgrad_band_is_xcd_aff(n_blocks_m, n_blocks_n, *head)
-        else _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group)
+        if not deep and _wgrad_band_is_xcd_aff(n_blocks_m, n_blocks_n, *head)
+        else _wgrad_xcd_aff_geom(
+            n_blocks_m,
+            n_blocks_n,
+            tiles_per_group,
+            _wgrad_xcd_span(tiles_per_group, G, ncu)[1],
+        )
     )
-    return band if aff is None else ((aff[0], aff[1], 1, 1),) + band[:3]
+    if aff is None:
+        return band
+    aff_c = (aff[0], aff[1], 1, 1)
+    return (aff_c,) + band[:3] if deep else band + (aff_c,)
 
 
 def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_traverse=False):
@@ -4273,7 +4401,7 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
         )
 
     _ncu = torch.cuda.get_device_properties(lhs_live.device).multi_processor_count
-    wave4_cands = _wgrad_4wave_cands(OUT_M, OUT_N, _ncu)
+    wave4_cands = _wgrad_4wave_cands(OUT_M, OUT_N, G, _ncu)
 
     def _compile_4wave(gm, gn, xcd, aff):
         return _compile_grouped_tn_wgrad_4wave(
