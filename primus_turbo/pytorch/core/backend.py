@@ -30,7 +30,7 @@ except ImportError:
 
 
 __all__ = [
-    "AutoTuneEntry",
+    "BackendChoice",
     "BackendEntry",
     "BackendType",
     "GlobalBackendManager",
@@ -56,6 +56,8 @@ _PRECISION_TYPE_MAPPING = {
 }
 _PRECISION_TYPE_SET = set(_PRECISION_TYPE_MAPPING.values())
 _OTHER_PRECISION_HOLDER = "OTHER"
+# Accepted wherever a backend name is, to auto-tune that op/precision alone.
+_AUTO_TUNE_HOLDER = "AUTOTUNE"
 
 
 class BackendType(Enum):
@@ -66,9 +68,12 @@ class BackendType(Enum):
     DEEP_EP = auto()
     TURBO = auto()
     FLYDSL = auto()
-    # Not a kernel provider: asks the dispatcher to profile and pick one of the
-    # real backends. Only valid for ops that register an ``AutoTuneEntry``.
-    AUTOTUNE = auto()
+
+
+@dataclass
+class BackendChoice:
+    backend: Optional[BackendType] = None
+    auto_tune: bool = False
 
 
 class GlobalBackendManager:
@@ -78,20 +83,32 @@ class GlobalBackendManager:
     Priority (high to low):
     1. Code settings - set_gemm_backend(), etc.
     2. Environment variables - PRIMUS_TURBO_GEMM_BACKEND, etc.
-    3. Auto-tune - PRIMUS_TURBO_AUTO_TUNE=1 for every op, or BackendType.AUTOTUNE
-       via 1./2. to auto-tune a single op/precision.
+    3. Auto-tune - PRIMUS_TURBO_AUTO_TUNE=1 for every op, or
+       set_*_backend(auto_tune=True) to auto-tune a single op/precision.
     4. Code defaults
     5. Fallback: try all backends
     """
 
-    _gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
-    _grouped_gemm_backend: Dict[PrecisionType, Optional[BackendType]] = None
-    _moe_dispatch_combine_backend: Dict[PrecisionType, Optional[BackendType]] = None
+    _gemm_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
+    _grouped_gemm_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
+    _moe_dispatch_combine_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _auto_tune: Optional[bool] = None
-    _env_cache: Dict[str, Dict["PrecisionType", "BackendType"]] = {}
+    _env_cache: Dict[str, Dict["PrecisionType", "BackendChoice"]] = {}
+
+    @staticmethod
+    def _parse_backend_choice(name: str) -> BackendChoice:
+        """Turn one backend name from an env var into a ``BackendChoice``.
+
+        Raises ``KeyError`` for names that are neither ``AUTOTUNE`` nor a
+        ``BackendType`` member; callers decide whether that is fatal.
+        """
+        name = name.strip().upper()
+        if name == _AUTO_TUNE_HOLDER:
+            return BackendChoice(auto_tune=True)
+        return BackendChoice(backend=BackendType[name])
 
     @classmethod
-    def _extract_backend_from_env(cls, env_value: str) -> Dict[PrecisionType, BackendType]:
+    def _extract_backend_from_env(cls, env_value: str) -> Dict[PrecisionType, BackendChoice]:
         """
         Extract the backend from the environment variable.
         Support formats. Example:
@@ -99,7 +116,8 @@ class GlobalBackendManager:
         2. ENV_KEY=<precision1>:<backend1>,<precision2>:<backend2>,... -> Each precision uses a different backend
         3. ENV_KEY=<precision1>:<backend1>,other:<backend2>,... -> precision1 use backend1, other precisions use backend2
 
-        Precision types are defined in the _PRECISION_TYPE_MAPPING.
+        Precision types are defined in the _PRECISION_TYPE_MAPPING. Any backend
+        slot also accepts "autotune" to auto-tune that precision alone.
         """
         if env_value in cls._env_cache:
             return cls._env_cache[env_value]
@@ -117,10 +135,12 @@ class GlobalBackendManager:
                 precision, backend = pair.split(":")
                 precision, backend = precision.strip().upper(), backend.strip().upper()
                 if precision == _OTHER_PRECISION_HOLDER:
-                    other_precision_backend = BackendType[backend]
+                    other_precision_backend = cls._parse_backend_choice(backend)
                     continue
                 assert precision in _PRECISION_TYPE_MAPPING, f"Precision {precision} not supported."
-                precision_backend_dict[_PRECISION_TYPE_MAPPING[precision]] = BackendType[backend]
+                precision_backend_dict[_PRECISION_TYPE_MAPPING[precision]] = cls._parse_backend_choice(
+                    backend
+                )
 
             # Set rest precisions to the other precision backend
             for precision in _PRECISION_TYPE_MAPPING.values():
@@ -128,8 +148,9 @@ class GlobalBackendManager:
                     precision_backend_dict[precision] = other_precision_backend
         else:
             # Parse format 1: ENV_KEY=backend -> All precison use the same backend
+            choice = cls._parse_backend_choice(env_value)
             for value in _PRECISION_TYPE_MAPPING.values():
-                precision_backend_dict[value] = BackendType[env_value.upper()]
+                precision_backend_dict[value] = choice
 
         cls._env_cache[env_value] = precision_backend_dict
         return precision_backend_dict
@@ -145,43 +166,97 @@ class GlobalBackendManager:
         """
         cls._env_cache.clear()
 
+    @staticmethod
+    def _updated_backend_table(
+        table: Optional[Dict[PrecisionType, BackendChoice]],
+        backend: Optional[BackendType],
+        precision: Optional[PrecisionType],
+        auto_tune: bool,
+    ) -> Dict[PrecisionType, BackendChoice]:
+        """Build the per-precision table produced by one ``set_*_backend`` call.
+
+        ``precision=None`` applies the choice to every precision; otherwise only
+        that precision is updated and the rest of ``table`` is kept.
+        """
+        if auto_tune:
+            assert backend is None, "Backend must be None when auto-tune is enabled"
+
+        choice = BackendChoice(backend=backend, auto_tune=auto_tune)
+        if precision is None:
+            return {p: choice for p in _PRECISION_TYPE_SET}
+
+        table = table if table is not None else {}
+        table[precision] = choice
+        return table
+
+    @classmethod
+    def _backend_from_env(
+        cls, env_key: str, precision: PrecisionType, allow_unknown_backend: bool = False
+    ) -> Optional[BackendChoice]:
+        """Read one precision's backend out of ``env_key``. None if unset or unusable.
+
+        With ``allow_unknown_backend``, a name that is not a ``BackendType`` yields
+        None instead of raising, for ops whose backends are not all modelled by the
+        enum (MoE dispatch/combine accepts custom EP names such as ``UCCL_EP``).
+        """
+        env_value = os.environ.get(env_key, None)
+        # Treat an empty / whitespace-only env var as missing (else
+        # _extract_backend_from_env raises KeyError on BackendType['']).
+        if env_value is None or not env_value.strip():
+            return None
+
+        try:
+            choice = cls._extract_backend_from_env(env_value).get(precision, None)
+        except KeyError:
+            if allow_unknown_backend:
+                return None
+            raise
+
+        if choice is None:
+            logger.warning(
+                f"Precision {precision.name} not found in the environment variable {env_key}. "
+                f"Using default backend.",
+                once=True,
+            )
+            return None
+
+        return choice
+
     @classmethod
     def set_gemm_backend(
-        cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
+        cls,
+        backend: Optional[BackendType] = None,
+        precision: Optional[PrecisionType] = None,
+        auto_tune: bool = False,
     ) -> None:
         """Set the GEMM backend in code."""
-        if backend is None:
-            cls._gemm_backend = None
-            return
-
-        if cls._gemm_backend is None:
-            cls._gemm_backend = {}
-
-        # backend is not None
-        if precision is None:
-            # preicision is None -> set all precisions to the same backend
-            cls._gemm_backend = {precision: backend for precision in _PRECISION_TYPE_SET}
-        else:
-            cls._gemm_backend[precision] = backend
+        cls._gemm_backend = cls._updated_backend_table(cls._gemm_backend, backend, precision, auto_tune)
 
     @classmethod
     def set_grouped_gemm_backend(
-        cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
+        cls,
+        backend: Optional[BackendType] = None,
+        precision: Optional[PrecisionType] = None,
+        auto_tune: bool = False,
     ) -> None:
         """Set the Grouped GEMM backend in code."""
-        if backend is None:
-            cls._grouped_gemm_backend = None
-            return
+        cls._grouped_gemm_backend = cls._updated_backend_table(
+            cls._grouped_gemm_backend, backend, precision, auto_tune
+        )
 
-        if cls._grouped_gemm_backend is None:
-            cls._grouped_gemm_backend = {}
+    @classmethod
+    def set_moe_dispatch_combine_backend(
+        cls,
+        backend: Optional[BackendType] = None,
+        precision: Optional[PrecisionType] = None,
+        auto_tune: bool = False,
+    ) -> None:
+        """Set the MoE dispatch/combine backend in code."""
+        assert auto_tune is False, "Auto-tune is not supported for MOE dispatch combine backend"
 
-        # backend is not None
-        if precision is None:
-            # preicision is None -> set all precisions to the same backend
-            cls._grouped_gemm_backend = {precision: backend for precision in _PRECISION_TYPE_SET}
-        else:
-            cls._grouped_gemm_backend[precision] = backend
+        cls._moe_dispatch_combine_backend = cls._updated_backend_table(
+            cls._moe_dispatch_combine_backend, backend, precision, auto_tune
+        )
 
     @classmethod
     def set_auto_tune(cls, enabled: Optional[bool]) -> None:
@@ -189,45 +264,22 @@ class GlobalBackendManager:
         cls._auto_tune = enabled
 
     @classmethod
-    def get_gemm_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
+    def get_gemm_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
         """Get the GEMM backend configuration. Returns None if not set."""
         if cls._gemm_backend is not None:
-            return cls._gemm_backend[precision]
-        env_value = os.environ.get(ENV_GEMM_BACKEND, None)
-        # Treat an empty / whitespace-only env var as missing (else
-        # _extract_backend_from_env raises KeyError on BackendType['']).
-        if env_value is not None and env_value.strip():
-            backend = cls._extract_backend_from_env(env_value).get(precision, None)
-            if backend is None:
-                logger.warning(
-                    f"Precision {precision.name} not found in the environment variable {ENV_GEMM_BACKEND}. "
-                    f"Using default backend.",
-                    once=True,
-                )
-            return backend
-
-        return None
+            # .get(): setting one precision leaves the others unconfigured.
+            return cls._gemm_backend.get(precision)
+        return cls._backend_from_env(ENV_GEMM_BACKEND, precision)
 
     @classmethod
-    def get_grouped_gemm_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
+    def get_grouped_gemm_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
         """Get the Grouped GEMM backend configuration. Returns None if not set."""
         if cls._grouped_gemm_backend is not None:
-            return cls._grouped_gemm_backend[precision]
-        env_value = os.environ.get(ENV_GROUPED_GEMM_BACKEND, None)
-        if env_value is not None and env_value.strip():
-            backend = cls._extract_backend_from_env(env_value).get(precision, None)
-            if backend is None:
-                logger.warning(
-                    f"Precision {precision.name} not found in the environment variable "
-                    f"{ENV_GROUPED_GEMM_BACKEND}. Using default backend.",
-                    once=True,
-                )
-            return backend
-
-        return None
+            return cls._grouped_gemm_backend.get(precision)
+        return cls._backend_from_env(ENV_GROUPED_GEMM_BACKEND, precision)
 
     @classmethod
-    def get_moe_dispatch_combine_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
+    def get_moe_dispatch_combine_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
         """Get the MoE dispatch combine backend configuration. Returns None if not set.
 
         If the environment variable contains a value that is not a valid ``BackendType``
@@ -235,43 +287,33 @@ class GlobalBackendManager:
         the EP-specific backend registry in ``moe_dispatch_combine_impl`` can handle it.
         """
         if cls._moe_dispatch_combine_backend is not None:
-            return cls._moe_dispatch_combine_backend[precision]
-        env_value = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND, None)
-        if env_value is not None and env_value.strip():
-            try:
-                backend = cls._extract_backend_from_env(env_value).get(precision, None)
-            except KeyError:
-                return None
+            return cls._moe_dispatch_combine_backend.get(precision)
 
-            if backend is None:
-                logger.warning(
-                    f"Precision {precision.name} not found in the environment variable "
-                    f"{ENV_MOE_DISPATCH_COMBINE_BACKEND}. Using default backend.",
-                    once=True,
-                )
+        choice = cls._backend_from_env(
+            ENV_MOE_DISPATCH_COMBINE_BACKEND, precision, allow_unknown_backend=True
+        )
+        if choice is None:
+            return None
 
-            # Dispatch/combine picks an EP backend that owns persistent communication
-            # buffers, so there is nothing to profile and swap per call.
-            assert backend != BackendType.AUTOTUNE, (
-                f"{ENV_MOE_DISPATCH_COMBINE_BACKEND}=AUTOTUNE is not supported: "
-                "MoE dispatch/combine has no auto-tune path."
+        # Dispatch/combine picks an EP backend that owns persistent communication
+        # buffers, so there is nothing to profile and swap per call.
+        assert not choice.auto_tune, (
+            f"{ENV_MOE_DISPATCH_COMBINE_BACKEND}=AUTOTUNE is not supported: "
+            "MoE dispatch/combine has no auto-tune path."
+        )
+
+        if choice.backend == BackendType.DEEP_EP:
+            assert HAVE_DEEP_EP, (
+                "DeepEP is required for this module. Install from https://github.com/uccl-project/uccl or https://github.com/ROCm/DeepEP"
             )
-
-            if backend == BackendType.DEEP_EP:
-                assert HAVE_DEEP_EP, (
-                    "DeepEP is required for this module. Install from https://github.com/uccl-project/uccl or https://github.com/ROCm/DeepEP"
-                )
-            return backend
-
-        return None
+        return choice
 
     @classmethod
     def auto_tune_enabled(cls) -> bool:
         """Check whether the global auto-tune switch is on.
 
         This is the process-wide switch only; an op may still be auto-tuned
-        through a per-op ``BackendType.AUTOTUNE`` request while this returns
-        False.
+        through a per-op request while this returns False.
         """
         if cls._auto_tune is not None:
             return cls._auto_tune
@@ -306,41 +348,14 @@ class BackendEntry:
     """Metadata wrapper for a registered kernel backend.
 
     Attributes:
-        impl: The kernel backend class, or None for a marker entry that carries
-              no kernel (see ``AutoTuneEntry``). Guard every use with
-              ``is_executable``.
+        impl: The kernel backend class.
         autotune: Whether this backend participates in auto-tuning.
                   Backends with autotune=False can still be selected via
                   explicit user configuration or as a fallback.
     """
 
-    impl: Optional[Type[KernelBackend]]
+    impl: Type[KernelBackend]
     autotune: bool = True
-
-    @property
-    def is_executable(self) -> bool:
-        """False for marker entries such as ``AutoTuneEntry`` that carry no kernel."""
-        return self.impl is not None
-
-
-@dataclass(frozen=True)
-class AutoTuneEntry(BackendEntry):
-    """Marker entry that opts an op into ``BackendType.AUTOTUNE``.
-
-    Register it as ``BackendType.AUTOTUNE: AutoTuneEntry()`` to let users request
-    auto-tuning for that op alone (``PRIMUS_TURBO_<OP>_BACKEND=autotune`` or
-    ``set_*_backend(BackendType.AUTOTUNE)``) instead of flipping the global
-    ``PRIMUS_TURBO_AUTO_TUNE`` switch. It holds no kernel, so it is never
-    profiled and never executed; the dispatcher skips it everywhere and reads it
-    purely as "this op accepts AUTOTUNE".
-    """
-
-    impl: Optional[Type[KernelBackend]] = None
-    autotune: bool = False
-
-    def __post_init__(self) -> None:
-        assert self.impl is None, "AutoTuneEntry is a marker and must not carry a kernel backend."
-        assert not self.autotune, "AutoTuneEntry must not participate in auto-tuning itself."
 
 
 class TuneCache:
@@ -464,7 +479,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         best_backend = None
         best_time = float("inf")
         for entry in cls._backends.values():
-            if not entry.is_executable or not entry.autotune:
+            if not entry.autotune:
                 continue
             if entry.impl.can_handle(**kwargs):
                 torch.cuda.synchronize()
@@ -484,18 +499,14 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
 
     @classmethod
     def dispatch(
-        cls, default_backend_enum: BackendType, user_backend_enum: Optional[BackendType] = None, **kwargs
+        cls,
+        default_backend_choice: BackendChoice,
+        user_backend_choice: Optional[BackendChoice] = None,
+        **kwargs,
     ) -> Any:
         # 1. User specified backend (env or code) - highest priority
-        # AUTOTUNE is not a kernel provider: it only says "this op accepts
-        # auto-tuning", so it falls through to step 2 instead of executing.
-        if user_backend_enum == BackendType.AUTOTUNE:
-            if user_backend_enum not in cls._backends:
-                raise ValueError(
-                    f"{cls.__name__} does not support AUTOTUNE: no AutoTuneEntry is registered for it. "
-                    f"Available backends: {[b.name for b in cls._backends.keys()]}"
-                )
-        elif user_backend_enum is not None:
+        if user_backend_choice is not None and user_backend_choice.backend is not None:
+            user_backend_enum = user_backend_choice.backend
             if user_backend_enum not in cls._backends:
                 raise ValueError(
                     f"User specified backend {user_backend_enum.name} is not registered for {cls.__name__}. "
@@ -512,24 +523,22 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         # 2. Auto tune
         # NOTE: Skip autotune during cuda graph capture.
         if (
-            user_backend_enum == BackendType.AUTOTUNE or GlobalBackendManager.auto_tune_enabled()
+            (user_backend_choice is not None and user_backend_choice.auto_tune)
+            or default_backend_choice.auto_tune
+            or GlobalBackendManager.auto_tune_enabled()
         ) and not cls._is_graph_capturing():
             backend_cls = cls.tune(**kwargs)
             if backend_cls is not None:
                 return backend_cls.execute(**kwargs)
 
         # 3. Default backend
-        default_entry = cls._backends.get(default_backend_enum)
-        if (
-            default_entry is not None
-            and default_entry.is_executable
-            and default_entry.impl.can_handle(**kwargs)
-        ):
+        default_entry = cls._backends.get(default_backend_choice.backend)
+        if default_entry is not None and default_entry.impl.can_handle(**kwargs):
             return default_entry.impl.execute(**kwargs)
 
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
-            if fallback_backend_entry.is_executable and fallback_backend_entry.impl.can_handle(**kwargs):
+            if fallback_backend_entry.impl.can_handle(**kwargs):
                 logger.warning(
                     f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, fallback backend {fallback_backend_enum.name} is selected. The fallback backend may hurt performance!",
                     once=True,

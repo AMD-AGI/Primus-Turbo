@@ -7,7 +7,7 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import (
-    AutoTuneEntry,
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -375,7 +375,6 @@ _GROUPED_GEMM_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMTritonBackend),
-    BackendType.AUTOTUNE: AutoTuneEntry(),
 }
 
 
@@ -433,7 +432,6 @@ _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMVariableKCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMVariableKHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMVariableKTritonBackend),
-    BackendType.AUTOTUNE: AutoTuneEntry(),
 }
 
 
@@ -484,8 +482,8 @@ def grouped_gemm_impl(
     maybe_pre_sync: bool = False,
     schedule: str = "static",
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
 
     kwargs = dict(
         a=a,
@@ -499,7 +497,7 @@ def grouped_gemm_impl(
         schedule=schedule,
     )
 
-    out = GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
     out = grouped_gemm_output_tail_kernel(out, group_offs)
     return out
 
@@ -518,8 +516,8 @@ def grouped_gemm_variable_k_impl(
     maybe_pre_sync: bool = False,
     schedule: str = "static",
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
     kwargs = dict(
         a=a,
         b=b,
@@ -532,7 +530,9 @@ def grouped_gemm_variable_k_impl(
         maybe_pre_sync=maybe_pre_sync,
         schedule=schedule,
     )
-    return GroupedGEMMVariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GroupedGEMMVariableKKernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, **kwargs
+    )
 
 
 @grouped_gemm_impl.register_fake

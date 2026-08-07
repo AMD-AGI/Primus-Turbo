@@ -20,7 +20,7 @@ caller slices ``[:total_m]``; ``group_offs_out`` packs each group tight.
 import torch
 
 from primus_turbo.pytorch.core.backend import (
-    AutoTuneEntry,
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -190,7 +190,6 @@ class GroupedGEMMFP4KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = {
         BackendType.FLYDSL: BackendEntry(GroupedGEMMFP4FlyDSLBackend),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP4TritonBackend),
-        BackendType.AUTOTUNE: AutoTuneEntry(),
     }
     _cache = TuneCache(1024)
 
@@ -381,7 +380,6 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
     _backends = {
         BackendType.FLYDSL: BackendEntry(GroupedGEMMFP4VariableKFlyDSLBackend),
         BackendType.TRITON: BackendEntry(GroupedGEMMFP4VariableKTritonBackend),
-        BackendType.AUTOTUNE: AutoTuneEntry(),
     }
     _cache = TuneCache(1024)
 
@@ -432,8 +430,8 @@ def grouped_gemm_fp4_impl(
     group_offs_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Forward / dgrad (NT): C[g] = A[g] @ B[g]^T, contraction over (packed) K."""
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -452,7 +450,7 @@ def grouped_gemm_fp4_impl(
         group_offs_out=group_offs_out,
     )
 
-    out = GroupedGEMMFP4KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMFP4KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
     # Over-allocated output: zero the unwritten tail past the tight write bound
     # (group_offs_out for MX; group_offs otherwise) so the caller's [:total_m]
     # slice never exposes uninitialized rows.
@@ -480,8 +478,8 @@ def grouped_gemm_fp4_variable_k_impl(
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
     """Backward wgrad: C[g] (OUT_M, OUT_N) = lhs[:,g] @ rhs[:,g]^T, reduction over M."""
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -500,7 +498,9 @@ def grouped_gemm_fp4_variable_k_impl(
         maybe_pre_sync=maybe_pre_sync,
     )
 
-    return GroupedGEMMFP4VariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GroupedGEMMFP4VariableKKernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, **kwargs
+    )
 
 
 @grouped_gemm_fp4_impl.register_fake

@@ -19,6 +19,7 @@ from primus_turbo.flydsl.mega import (
 )
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
+    BackendChoice,
     BackendEntry,
     BackendType,
     KernelBackend,
@@ -176,7 +177,7 @@ def _fused_mega_moe_backward(
     default_backend: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     group = _resolve_process_group(group_name)
-    default_backend_enum = BackendType(default_backend)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
 
     kwargs = dict(
         grad_y=grad_y,
@@ -191,7 +192,7 @@ def _fused_mega_moe_backward(
         num_tokens=num_tokens,
         num_topk=num_topk,
     )
-    return FusedMegaMoEBackwardKernelDispatcher.dispatch(default_backend_enum, None, **kwargs)
+    return FusedMegaMoEBackwardKernelDispatcher.dispatch(default_backend_choice, None, **kwargs)
 
 
 @_fused_mega_moe_backward.register_fake

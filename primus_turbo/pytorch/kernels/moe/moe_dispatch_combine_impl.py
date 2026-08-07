@@ -487,8 +487,9 @@ def _resolve_backend_name() -> str:
       2. ``PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND`` env var (supports names beyond ``BackendType``)
       3. Default: ``TURBO``
     """
-    user_backend = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_FP16_FP32)
-    if user_backend is not None:
+    user_backend_choice = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_FP16_FP32)
+    if user_backend_choice is not None and user_backend_choice.backend is not None:
+        user_backend = user_backend_choice.backend
         return _BACKEND_TYPE_TO_NAME.get(user_backend, user_backend.name)
 
     env_val = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND)

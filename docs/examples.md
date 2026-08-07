@@ -661,18 +661,17 @@ GlobalBackendManager.reset()
 
 `set_auto_tune(True)` turns AutoTune on for every operator. To auto-tune a single
 operator (or a single precision of it) while leaving everything else alone, pass
-`BackendType.AUTOTUNE` where you would normally name a backend:
+`auto_tune=True` instead of naming a backend:
 
 ```python
-from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager, PrecisionType
+from primus_turbo.pytorch.core.backend import GlobalBackendManager, PrecisionType
 
 # AutoTune FP8 GEMM only; other precisions keep their defaults.
-GlobalBackendManager.set_gemm_backend(BackendType.AUTOTUNE, PrecisionType.FP8)
+GlobalBackendManager.set_gemm_backend(auto_tune=True, precision=PrecisionType.FP8)
 ```
 
-NOTE: `BackendType.AUTOTUNE` is only accepted by operators that register an
-`AutoTuneEntry` (currently GEMM and Grouped GEMM). MoE dispatch/combine does not
-support it.
+NOTE: a backend and `auto_tune=True` are mutually exclusive. MoE dispatch/combine
+does not support AutoTune at all.
 
 ### 5.3 Environment Variables
 
