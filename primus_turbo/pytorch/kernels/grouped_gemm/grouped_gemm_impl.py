@@ -437,6 +437,7 @@ _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
 class GroupedGEMMKernelDispatcher(BaseGroupedGEMMKernelDispatcher):
     _backends = _GROUPED_GEMM_BACKENDS
     _cache = TuneCache(1024)
+    _tune_config_name = "grouped_gemm"  # auto-load configs/pytorch/<arch>/grouped_gemm.json
 
     @classmethod
     def make_key(cls, a, b, group_lens, group_offs, trans_a, trans_b, num_cu, **kwargs):
@@ -451,6 +452,7 @@ class GroupedGEMMKernelDispatcher(BaseGroupedGEMMKernelDispatcher):
 class GroupedGEMMVariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
     _backends = _GROUPED_GEMM_VARIABLE_K_BACKENDS
     _cache = TuneCache(1024)
+    _tune_config_name = "grouped_gemm_vk"  # auto-load configs/pytorch/<arch>/grouped_gemm_vk.json
 
     @classmethod
     def make_key(

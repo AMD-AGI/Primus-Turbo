@@ -6,7 +6,7 @@
 
 import torch
 
-from primus_turbo.pytorch.core.backend import AutoKernelDispatcher
+from primus_turbo.pytorch.core.backend import AutoKernelDispatcher, TuneEntry
 
 
 def _lb_group_lens(group_lens: torch.Tensor, total: int) -> torch.Tensor:
@@ -46,13 +46,13 @@ class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
 
     @classmethod
     @torch.no_grad()
-    def tune(cls, **kwargs):
+    def tune_backend(cls, **kwargs):
         """Tune with load-balanced group_lens (profiling only)."""
         key = cls.make_key(**kwargs)
 
-        cached_backend = cls._cache.get(key) if cls._cache is not None else None
-        if cached_backend is not None:
-            return cached_backend
+        cached = cls._cache.get(key) if cls._cache is not None else None
+        if cached is not None:
+            return cached.backend, cached.backend_config
 
         a: torch.Tensor = kwargs["a"]
         group_lens: torch.Tensor = kwargs["group_lens"]
@@ -66,14 +66,16 @@ class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
             prof_kwargs["group_offs_out"] = lb_group_offs
 
         best_backend = None
+        best_cfg = None
         best_time = float("inf")
         for entry in cls._backends.values():
             if not entry.autotune:
                 continue
             if entry.impl.can_handle(**kwargs):
+                cfg = entry.impl.tune_config(**kwargs)
                 torch.cuda.synchronize()
                 try:
-                    cur_time = cls.profile(entry.impl, **prof_kwargs)
+                    cur_time = cls.profile(entry.impl, cfg, **prof_kwargs)
                 except Exception:
                     cur_time = float("inf")
                 finally:
@@ -81,10 +83,11 @@ class BaseGroupedGEMMKernelDispatcher(AutoKernelDispatcher):
                 if cur_time < best_time:
                     best_time = cur_time
                     best_backend = entry.impl
+                    best_cfg = cfg
 
         if best_backend is not None and cls._cache is not None:
-            cls._cache.put(key, best_backend)
-        return best_backend
+            cls._cache.put(key, TuneEntry(best_backend, best_cfg, {"time_ms": best_time}))
+        return best_backend, best_cfg
 
 
 class BaseGroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
@@ -99,13 +102,13 @@ class BaseGroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
 
     @classmethod
     @torch.no_grad()
-    def tune(cls, **kwargs):
+    def tune_backend(cls, **kwargs):
         """Tune with load-balanced variable-K group_lens (profiling only)."""
         key = cls.make_key(**kwargs)
 
-        cached_backend = cls._cache.get(key) if cls._cache is not None else None
-        if cached_backend is not None:
-            return cached_backend
+        cached = cls._cache.get(key) if cls._cache is not None else None
+        if cached is not None:
+            return cached.backend, cached.backend_config
 
         a: torch.Tensor = kwargs["a"]
         b: torch.Tensor = kwargs["b"]
@@ -130,14 +133,16 @@ class BaseGroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
         prof_kwargs["group_offs"] = lb_group_offs
 
         best_backend = None
+        best_cfg = None
         best_time = float("inf")
         for entry in cls._backends.values():
             if not entry.autotune:
                 continue
             if entry.impl.can_handle(**kwargs):
+                cfg = entry.impl.tune_config(**kwargs)
                 torch.cuda.synchronize()
                 try:
-                    cur_time = cls.profile(entry.impl, **prof_kwargs)
+                    cur_time = cls.profile(entry.impl, cfg, **prof_kwargs)
                 except Exception:
                     cur_time = float("inf")
                 finally:
@@ -145,7 +150,8 @@ class BaseGroupedGEMMVariableKKernelDispatcher(AutoKernelDispatcher):
                 if cur_time < best_time:
                     best_time = cur_time
                     best_backend = entry.impl
+                    best_cfg = cfg
 
         if best_backend is not None and cls._cache is not None:
-            cls._cache.put(key, best_backend)
-        return best_backend
+            cls._cache.put(key, TuneEntry(best_backend, best_cfg, {"time_ms": best_time}))
+        return best_backend, best_cfg

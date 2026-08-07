@@ -532,6 +532,7 @@ class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
         BackendType.FLYDSL: BackendEntry(GroupedGEMMFP8FlyDSLBackend),
     }
     _cache = TuneCache(1024)
+    _tune_config_name = "grouped_gemm_fp8"  # auto-load configs/pytorch/<arch>/grouped_gemm_fp8.json
 
     @classmethod
     def make_key(
@@ -788,6 +789,7 @@ class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         BackendType.FLYDSL: BackendEntry(GroupedGEMMFP8VariableKFlyDSLBackend),
     }
     _cache = TuneCache(1024)
+    _tune_config_name = "grouped_gemm_fp8_vk"  # auto-load configs/pytorch/<arch>/grouped_gemm_fp8_vk.json
 
     @classmethod
     def make_key(
@@ -807,11 +809,17 @@ class GroupedGEMMFP8VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         **kwargs,
     ):
         bs = group_lens.shape[0]
-        m = a.shape[1] if trans_a else a.shape[0]
-        n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[0] if trans_a else a.shape[1]
-        if trans_c:
-            m, n = n, m
+        if ScalingGranularity(granularity) == ScalingGranularity.MX_BLOCKWISE:
+            # MX wgrad contracts both operands on their last axis (mirrors the meta fn),
+            # so the output extents are their leading dims, not b.shape[-1].
+            lhs, rhs = (b, a) if trans_c else (a, b)
+            m, n = lhs.shape[0], rhs.shape[0]
+        else:
+            m = a.shape[1] if trans_a else a.shape[0]
+            n = b.shape[-2] if trans_b else b.shape[-1]
+            if trans_c:
+                m, n = n, m
         return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
 
 

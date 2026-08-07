@@ -115,6 +115,7 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        backend_config=None,
     ):
         # preshuffled is accepted only so the dispatcher's uniform
         # execute(**kwargs) call works; can_handle already rejected the
@@ -183,6 +184,7 @@ class GEMMFP4AITERBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        backend_config=None,
     ):
         if preshuffled:
             # Fast path: caller guarantees a_scale_inv, b_scale_inv, and b
@@ -277,6 +279,7 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        backend_config=None,
     ):
         # preshuffled accepted only so the dispatcher's uniform execute(**kwargs)
         # call works; can_handle already rejected the preshuffled=True case.
@@ -291,13 +294,14 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
 _GEMM_FP4_BACKENDS = {
     BackendType.AITER: BackendEntry(GEMMFP4AITERBackend, autotune=False),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP4HipBLASLtBackend),
-    BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend, autotune=False),
+    BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend),
 }
 
 
 class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
     _backends = _GEMM_FP4_BACKENDS
     _cache = TuneCache(1024)
+    _tune_config_name = "gemm_fp4"  # auto-load configs/pytorch/<arch>/gemm_fp4.json
 
     @classmethod
     def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, preshuffled=False, **kwargs):

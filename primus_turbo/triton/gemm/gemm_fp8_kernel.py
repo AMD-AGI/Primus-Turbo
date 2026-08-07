@@ -43,6 +43,7 @@ import torch
 import triton
 import triton.language as tl
 
+from primus_turbo.common.logger import logger
 from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.triton.gemm.gemm_kernel import NUM_XCDS, _chiplet_transform_chunked
 from primus_turbo.triton.utils.origami import (
@@ -144,6 +145,7 @@ def _fp8_persistent_gemm_kernel(
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    MULTI_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
 ):
@@ -190,7 +192,8 @@ def _fp8_persistent_gemm_kernel(
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
             loop_k -= 1
-        tl.assume(loop_k > 1)
+        if MULTI_K:  # host guarantees loop_k > 1 here; skip for small K to avoid a false assume (OOB/UB)
+            tl.assume(loop_k > 1)
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         for k in range(0, loop_k):
@@ -375,6 +378,8 @@ def gemm_fp8_tensorwise_triton_kernel(
         stride_cn,
     )
     even_k = K % block_k == 0
+    # mirrors the kernel's loop_k (cdiv minus the peeled tail tile); gates the assume below
+    multi_k = ((K + block_k - 1) // block_k - (0 if even_k else 1)) > 1
     _fp8_persistent_gemm_kernel[(num_sms,)](
         *args,
         stride_ak=s_ak,
@@ -387,6 +392,7 @@ def gemm_fp8_tensorwise_triton_kernel(
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
+        MULTI_K=multi_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
@@ -438,6 +444,7 @@ def _fp8_rowwise_persistent_gemm_kernel(
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    MULTI_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
 ):
@@ -486,7 +493,8 @@ def _fp8_rowwise_persistent_gemm_kernel(
         loop_k = tl.cdiv(K, BLOCK_SIZE_K)
         if not EVEN_K:
             loop_k -= 1
-        tl.assume(loop_k > 1)
+        if MULTI_K:  # host guarantees loop_k > 1 here; skip for small K to avoid a false assume (OOB/UB)
+            tl.assume(loop_k > 1)
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         for k in range(0, loop_k):
@@ -680,6 +688,8 @@ def gemm_fp8_rowwise_triton_kernel(
         stride_cn,
     )
     even_k = K % block_k == 0
+    # mirrors the kernel's loop_k (cdiv minus the peeled tail tile); gates the assume below
+    multi_k = ((K + block_k - 1) // block_k - (0 if even_k else 1)) > 1
     _fp8_rowwise_persistent_gemm_kernel[(num_sms,)](
         *args,
         stride_ak=s_ak,
@@ -692,6 +702,7 @@ def gemm_fp8_rowwise_triton_kernel(
         NUM_XCDS=NUM_XCDS,
         CHUNK_SIZE=chunk_size,
         EVEN_K=even_k,
+        MULTI_K=multi_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
         num_warps=8,
@@ -751,10 +762,9 @@ def _get_blockwise_autotune_configs(
     else:
         num_stage_values = [1, 2]
         block_n_values = [128]
-    for block_m, block_n, kp, gm, chunk, ns in itertools.product(
+    for block_m, block_n, gm, chunk, ns in itertools.product(
         [128, 256],
         block_n_values,
-        [1, 2],
         [4, 8],
         [32, 64],
         num_stage_values,
@@ -1003,11 +1013,177 @@ _blockwise_fp8_tn_kernel = triton.autotune(
     key=["M", "N", "K"],
 )(_blockwise_fp8_unified_kernel)
 
+# Fixed config for the no-autotune path; valid for all layouts (num_stages=2 is TN-safe).
+# Its keys are also the schema a pinned config must match, hence the explicit num_ctas=1.
+_DEFAULT_BLOCKWISE_CFG = dict(
+    BLOCK_M=128,
+    BLOCK_N=128,
+    BLOCK_K=128,
+    GROUP_M=8,
+    NUM_XCDS=8,
+    CHUNK=64,
+    num_warps=4,
+    num_ctas=1,
+    num_stages=2,
+)
+
+
+def _blockwise_cfg_or_default(cfg: dict | None) -> dict:
+    """Pinned config, or the fixed default when it no longer fits this kernel.
+
+    Configs pinned by an older build outlive changes to the kernel's knobs; a mismatch
+    costs performance, not correctness, so degrade instead of failing the launch.
+    """
+    if cfg is None:
+        return _DEFAULT_BLOCKWISE_CFG
+    if cfg.keys() == _DEFAULT_BLOCKWISE_CFG.keys():
+        return cfg
+    logger.warning(
+        "Blockwise FP8: pinned config does not fit this kernel (mismatched keys: "
+        f"{sorted(cfg.keys() ^ _DEFAULT_BLOCKWISE_CFG.keys())}); using the default. Re-run "
+        "`python -m primus_turbo.tuning.offline_tune_gemm` to refresh the asset.",
+        once=True,
+    )
+    return _DEFAULT_BLOCKWISE_CFG
+
+
+def _blockwise_autotuner(trans_a: bool, trans_b: bool):
+    """The layout-specialised autotune wrapper for this (trans_a, trans_b)."""
+    if not trans_a and trans_b:
+        return _blockwise_fp8_nt_kernel
+    if not trans_a and not trans_b:
+        return _blockwise_fp8_nn_kernel
+    return _blockwise_fp8_tn_kernel
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Unified Public API — Block-wise FP8 GEMM
 # Interface consistent with CK blockwise backend.
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _gemm_fp8_blockwise_launch(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    cfg: dict | None,
+) -> tuple[torch.Tensor, dict]:
+    """Shared launch path behind the two public entry points below.
+
+    Runs the kernel with ``cfg``; ``cfg=None`` autotune-searches instead (benches).
+    Returns ``(out, cfg_used)`` — on the search branch the winner is read straight
+    off the autotuner, so it always belongs to this call's shape.
+    """
+    if (trans_a, trans_b) not in {(False, True), (False, False), (True, False)}:
+        raise ValueError(f"Unsupported layout for blockwise FP8 Triton: trans_a={trans_a}, trans_b={trans_b}")
+
+    is_tn = trans_a and not trans_b
+
+    # ── Operand views: always [M, K] @ [K, N] inside the kernel.
+    A_view = a.T if trans_a else a
+    B_view = b.T if trans_b else b
+    M, K = A_view.shape
+    _, N = B_view.shape
+
+    # ── Layout-specialised settings. The only true per-layout differences are:
+    # how A/B scales are laid out, which autotune wrapper owns the search
+    # space/cache, and the three constexpr flags (SCALE_2D_B/EVEN_K/TRANS_C_STORE).
+    #
+    # TN safety notes (Round-6 P2-#7.6):
+    #   * TRANS_C_STORE=True lets the BF16 epilogue coalesce into dwordx4 under
+    #     the (N, M) output buffer; without it the wgrad path emits
+    #     64×buffer_store_short per tile.
+    #   * EVEN_K=False keeps the mask-load path for the dual strided-K loads, the
+    #     matched-pair safety net for the Triton 3.7 `Begin <= End` LLVM-backend
+    #     assertion (the TN autotune wrapper already drops num_stages=3).
+    if not trans_a and trans_b:
+        # NT
+        A_scales_arg = a_scale_inv.T.contiguous()  # [K//128, M]
+        B_scales_arg = b_scale_inv  # [N//128, K//128]
+        SCALE_2D_B, EVEN_K, TRANS_C_STORE = True, (K % 128) == 0, False
+    elif not trans_a and not trans_b:
+        # NN — kernel expects [N_output_blocks, K_inner_blocks] for B_scales,
+        # while quantization stores it as [N//128, K//128] over the original
+        # weight; the .T.contiguous() rebuilds the indexing the kernel reads.
+        A_scales_arg = a_scale_inv.T.contiguous()
+        B_scales_arg = b_scale_inv.T.contiguous()
+        SCALE_2D_B, EVEN_K, TRANS_C_STORE = True, (K % 128) == 0, False
+    else:
+        # TN
+        A_scales_arg = a_scale_inv
+        B_scales_arg = b_scale_inv
+        SCALE_2D_B, EVEN_K, TRANS_C_STORE = False, False, True
+    autotune_kernel = _blockwise_autotuner(trans_a, trans_b)
+
+    # Scale strides:
+    #   * SCALE_2D_B=True  (NT/NN): A_scales/B_scales are stored as [outer, inner],
+    #     so stride(0)/stride(1) directly map to (outer, inner) the kernel needs.
+    #   * SCALE_2D_B=False (TN):    B_scales is [K//128, N] but the kernel addresses
+    #     it as `pn * stride_bs_0 + ki * stride_bs_1` (N-step then K-step), hence
+    #     the (1, 0) swap.
+    stride_as_k, stride_as_m = A_scales_arg.stride(0), A_scales_arg.stride(1)
+    if SCALE_2D_B:
+        stride_bs_0, stride_bs_1 = B_scales_arg.stride(0), B_scales_arg.stride(1)
+    else:
+        stride_bs_0, stride_bs_1 = B_scales_arg.stride(1), B_scales_arg.stride(0)
+
+    # ── Output buffer (handle trans_c by swapping strides on a (N, M) buffer).
+    if trans_c:
+        out = torch.empty((N, M), device=a.device, dtype=out_dtype)
+        stride_cm, stride_cn = out.stride(1), out.stride(0)
+    else:
+        out = torch.empty((M, N), device=a.device, dtype=out_dtype)
+        stride_cm, stride_cn = out.stride(0), out.stride(1)
+
+    num_k = (K + 127) // 128
+    NUM_SMS = ((M + 127) // 128) * ((N + 127) // 128)
+
+    launch_args = (
+        A_view,
+        B_view,
+        out,
+        A_scales_arg,
+        B_scales_arg,
+        M,
+        N,
+        K,
+        A_view.stride(0),
+        A_view.stride(1),
+        B_view.stride(0),
+        B_view.stride(1),
+        stride_cm,
+        stride_cn,
+        stride_as_k,
+        stride_as_m,
+        stride_bs_0,
+        stride_bs_1,
+        NUM_SMS,
+        num_k,
+    )
+    flags = dict(
+        A_K_CONTIGUOUS=not trans_a,
+        B_K_CONTIGUOUS=trans_b,
+        SCALE_2D_B=SCALE_2D_B,
+        EVEN_K=EVEN_K,
+        TRANS_C_STORE=TRANS_C_STORE,
+    )
+
+    # gfx950 enables its full knob set for the scope; gfx942 enables
+    # use_async_copy/scalarize_packed_fops only for NT/NN (TN/wgrad regresses
+    # ~5-8%). The scope restores every knob on exit.
+    with scoped_amd_triton_knobs(gfx942_enable=not is_tn):
+        if cfg is None:
+            autotune_kernel[(NUM_SMS,)](*launch_args, **flags)
+            # best_config is rewritten on every run, so here it is this launch's winner.
+            cfg = dict(autotune_kernel.best_config.all_kwargs())
+        else:
+            _blockwise_fp8_unified_kernel[(NUM_SMS,)](*launch_args, **flags, **cfg)
+    return out, cfg
 
 
 def gemm_fp8_blockwise_triton_kernel(
@@ -1019,6 +1195,7 @@ def gemm_fp8_blockwise_triton_kernel(
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
+    backend_config: dict | None = None,
 ) -> torch.Tensor:
     """Unified block-wise FP8 GEMM Triton kernel.
 
@@ -1050,105 +1227,53 @@ def gemm_fp8_blockwise_triton_kernel(
         trans_b: Whether B is transposed.
         out_dtype: Output dtype (default bfloat16).
         trans_c: If True, return transposed output.
+        backend_config: Config pinned by the dispatcher (offline asset or in-process
+            tune) to run as-is; None, or one that no longer fits the kernel, falls back
+            to the fixed default. Never benches — searching is
+            :func:`tune_gemm_fp8_blockwise_triton_kernel`'s job — so it is capture-safe.
 
     Returns:
         C of shape (M, N) if trans_c=False, or (N, M) if trans_c=True.
     """
-    if (trans_a, trans_b) not in {(False, True), (False, False), (True, False)}:
-        raise ValueError(f"Unsupported layout for blockwise FP8 Triton: trans_a={trans_a}, trans_b={trans_b}")
-
-    is_tn = trans_a and not trans_b
-
-    # ── Operand views: always [M, K] @ [K, N] inside the kernel.
-    A_view = a.T if trans_a else a
-    B_view = b.T if trans_b else b
-    M, K = A_view.shape
-    _, N = B_view.shape
-
-    # ── Layout-specialised settings. The only true per-layout differences are:
-    # how A/B scales are laid out, which autotune wrapper owns the search
-    # space/cache, and the three constexpr flags (SCALE_2D_B/EVEN_K/TRANS_C_STORE).
-    #
-    # TN safety notes (Round-6 P2-#7.6):
-    #   * TRANS_C_STORE=True lets the BF16 epilogue coalesce into dwordx4 under
-    #     the (N, M) output buffer; without it the wgrad path emits
-    #     64×buffer_store_short per tile.
-    #   * EVEN_K=False keeps the mask-load path for the dual strided-K loads, the
-    #     matched-pair safety net for the Triton 3.7 `Begin <= End` LLVM-backend
-    #     assertion (the TN autotune wrapper already drops num_stages=3).
-    if not trans_a and trans_b:
-        # NT
-        A_scales_arg = a_scale_inv.T.contiguous()  # [K//128, M]
-        B_scales_arg = b_scale_inv  # [N//128, K//128]
-        autotune_kernel = _blockwise_fp8_nt_kernel
-        SCALE_2D_B, EVEN_K, TRANS_C_STORE = True, (K % 128) == 0, False
-    elif not trans_a and not trans_b:
-        # NN — kernel expects [N_output_blocks, K_inner_blocks] for B_scales,
-        # while quantization stores it as [N//128, K//128] over the original
-        # weight; the .T.contiguous() rebuilds the indexing the kernel reads.
-        A_scales_arg = a_scale_inv.T.contiguous()
-        B_scales_arg = b_scale_inv.T.contiguous()
-        autotune_kernel = _blockwise_fp8_nn_kernel
-        SCALE_2D_B, EVEN_K, TRANS_C_STORE = True, (K % 128) == 0, False
-    else:
-        # TN
-        A_scales_arg = a_scale_inv
-        B_scales_arg = b_scale_inv
-        autotune_kernel = _blockwise_fp8_tn_kernel
-        SCALE_2D_B, EVEN_K, TRANS_C_STORE = False, False, True
-
-    # Scale strides:
-    #   * SCALE_2D_B=True  (NT/NN): A_scales/B_scales are stored as [outer, inner],
-    #     so stride(0)/stride(1) directly map to (outer, inner) the kernel needs.
-    #   * SCALE_2D_B=False (TN):    B_scales is [K//128, N] but the kernel addresses
-    #     it as `pn * stride_bs_0 + ki * stride_bs_1` (N-step then K-step), hence
-    #     the (1, 0) swap.
-    stride_as_k, stride_as_m = A_scales_arg.stride(0), A_scales_arg.stride(1)
-    if SCALE_2D_B:
-        stride_bs_0, stride_bs_1 = B_scales_arg.stride(0), B_scales_arg.stride(1)
-    else:
-        stride_bs_0, stride_bs_1 = B_scales_arg.stride(1), B_scales_arg.stride(0)
-
-    # ── Output buffer (handle trans_c by swapping strides on a (N, M) buffer).
-    if trans_c:
-        out = torch.empty((N, M), device=a.device, dtype=out_dtype)
-        stride_cm, stride_cn = out.stride(1), out.stride(0)
-    else:
-        out = torch.empty((M, N), device=a.device, dtype=out_dtype)
-        stride_cm, stride_cn = out.stride(0), out.stride(1)
-
-    num_k = (K + 127) // 128
-    NUM_SMS = ((M + 127) // 128) * ((N + 127) // 128)
-
-    # gfx950 enables its full knob set for the scope; gfx942 enables
-    # use_async_copy/scalarize_packed_fops only for NT/NN (TN/wgrad regresses
-    # ~5-8%). The scope restores every knob on exit.
-    with scoped_amd_triton_knobs(gfx942_enable=not is_tn):
-        autotune_kernel[(NUM_SMS,)](
-            A_view,
-            B_view,
-            out,
-            A_scales_arg,
-            B_scales_arg,
-            M,
-            N,
-            K,
-            A_view.stride(0),
-            A_view.stride(1),
-            B_view.stride(0),
-            B_view.stride(1),
-            stride_cm,
-            stride_cn,
-            stride_as_k,
-            stride_as_m,
-            stride_bs_0,
-            stride_bs_1,
-            NUM_SMS,
-            num_k,
-            A_K_CONTIGUOUS=not trans_a,
-            B_K_CONTIGUOUS=trans_b,
-            SCALE_2D_B=SCALE_2D_B,
-            EVEN_K=EVEN_K,
-            TRANS_C_STORE=TRANS_C_STORE,
-        )
+    out, _ = _gemm_fp8_blockwise_launch(
+        a,
+        a_scale_inv,
+        b,
+        b_scale_inv,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        out_dtype=out_dtype,
+        trans_c=trans_c,
+        cfg=_blockwise_cfg_or_default(backend_config),
+    )
     return out
+
+
+def tune_gemm_fp8_blockwise_triton_kernel(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_a: bool = False,
+    trans_b: bool = True,
+    out_dtype: torch.dtype = torch.bfloat16,
+    trans_c: bool = False,
+) -> dict:
+    """Autotune the block-wise FP8 kernel for *this* shape and return the winning config.
+
+    Benches the candidates for the given operands and returns the winner as a flat
+    dict, ready to pin offline and feed back through ``backend_config=``. Takes the
+    operands, not just the layout flags, because the winner is per-shape.
+    """
+    _, cfg = _gemm_fp8_blockwise_launch(
+        a,
+        a_scale_inv,
+        b,
+        b_scale_inv,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        out_dtype=out_dtype,
+        trans_c=trans_c,
+        cfg=None,
+    )
+    return cfg

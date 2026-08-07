@@ -24,7 +24,13 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import GEMMFP8KernelDispatcher
 from primus_turbo.pytorch.ops import gemm_fp8
+from primus_turbo.triton.gemm.gemm_fp8_kernel import (
+    _DEFAULT_BLOCKWISE_CFG,
+    _blockwise_cfg_or_default,
+    tune_gemm_fp8_blockwise_triton_kernel,
+)
 from tests.pytorch.test_utils import compute_snr
 
 torch.manual_seed(42)
@@ -241,7 +247,7 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune)
     )
 
 
-@pytest.mark.parametrize("m", [255, 256, 507, 512])
+@pytest.mark.parametrize("m", [64, 255, 256, 507, 512])
 @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
 @pytest.mark.parametrize("layout", ["NN", "NT"])
@@ -659,3 +665,92 @@ def test_gemm_fp8_blockwise_triton_deterministic(m, n, k, layout, format, dtype,
         backend=backend,
         block_size=128,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_offline_tuned_cache_drives_dispatch(tmp_path, monkeypatch):
+    """The offline flow on the real op: tune, dump, reload, then dispatch without profiling.
+
+    The tune-cache codec itself is covered in tests/pytorch/core; what matters here is
+    that this op's own key survives the trip, so the reloaded entry is actually found.
+    """
+    device = "cuda:0"
+    torch.manual_seed(0)
+    m, n, k = 512, 1024, 2048
+    a = torch.randn(m, k, dtype=torch.bfloat16, device=device)  # NT: a[m,k], b[n,k]
+    b = torch.randn(n, k, dtype=torch.bfloat16, device=device)
+    config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE, format=Format.E4M3)
+
+    disp = GEMMFP8KernelDispatcher
+    monkeypatch.delenv("PRIMUS_TURBO_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(disp, "_tune_config_name", None)  # ignore the packaged asset
+    GlobalBackendManager.reset()
+    disp._cache.clear()
+    try:
+        GlobalBackendManager.set_auto_tune(True)
+        out_tuned = gemm_fp8(a, b, False, True, torch.bfloat16, config)
+        torch.cuda.synchronize()
+        assert len(disp._cache) == 1, "one forward gemm should tune exactly one key"
+        tuned_backend = disp._cache.items()[0][1].backend
+
+        path = tmp_path / "gemm_fp8.json"
+        dumped = disp.dump_cache(str(path))
+        disp._cache.clear()
+        assert disp.load_cache(str(path)) == dumped, "the trip lost entries"
+
+        # Auto-tune off: the only way to reach the tuned backend is a cache hit.
+        GlobalBackendManager.set_auto_tune(False)
+        calls = []
+        tuned_execute = tuned_backend.execute
+
+        def _spy(**kwargs):
+            calls.append(1)
+            return tuned_execute(**kwargs)
+
+        monkeypatch.setattr(tuned_backend, "execute", staticmethod(_spy))
+        out_cached = gemm_fp8(a, b, False, True, torch.bfloat16, config)
+        torch.cuda.synchronize()
+
+        assert calls, "dispatch did not reach the tuned backend"
+        torch.testing.assert_close(out_cached, out_tuned, rtol=1e-2, atol=1e-2)
+    finally:
+        GlobalBackendManager.reset()
+        disp._cache.clear()
+        # Clearing dropped whatever the packaged asset had loaded; let it load again.
+        disp._tune_config_loaded = False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_freshly_tuned_blockwise_config_matches_the_kernel_schema():
+    """A tuned config must still fit the kernel, or pinning silently degrades to the default.
+
+    The two are compared by key set, so a Triton release that adds or drops a launch
+    meta-param would make every tuned config look stale and disable pinning everywhere.
+    """
+    device = "cuda:0"
+    M = N = K = 256  # blockwise needs N, K divisible by 128
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    fp8 = torch.float8_e4m3fnuz if "gfx942" in arch else torch.float8_e4m3fn
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device=device).to(fp8)  # NT: a[M,K], b[N,K]
+    b = torch.randn(N, K, device=device).to(fp8)
+    a_scale = torch.rand(M, K // 128, device=device, dtype=torch.float32) + 0.5
+    b_scale = torch.rand(N // 128, K // 128, device=device, dtype=torch.float32) + 0.5
+
+    tuned = tune_gemm_fp8_blockwise_triton_kernel(a, a_scale, b, b_scale, trans_a=False, trans_b=True)
+
+    assert tuned.keys() == _DEFAULT_BLOCKWISE_CFG.keys(), (
+        f"tuned config {sorted(tuned)} does not match the schema {sorted(_DEFAULT_BLOCKWISE_CFG)}; "
+        f"pinning would silently degrade to the default config"
+    )
+    assert _blockwise_cfg_or_default(tuned) is tuned
+
+
+def test_blockwise_config_falls_back_when_it_does_not_fit():
+    """Anything that is not a fitting config must degrade to the default, never raise."""
+    good = dict(_DEFAULT_BLOCKWISE_CFG)
+    assert _blockwise_cfg_or_default(good) is good
+    assert _blockwise_cfg_or_default(None) is _DEFAULT_BLOCKWISE_CFG
+    assert _blockwise_cfg_or_default({**good, "OBSOLETE_KNOB": 1}) is _DEFAULT_BLOCKWISE_CFG
+    stale = {key: value for key, value in good.items() if key != "CHUNK"}
+    assert _blockwise_cfg_or_default(stale) is _DEFAULT_BLOCKWISE_CFG

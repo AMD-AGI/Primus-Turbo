@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -35,6 +35,7 @@ from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_triton_kernel,
     gemm_fp8_rowwise_triton_kernel,
     gemm_fp8_tensorwise_triton_kernel,
+    tune_gemm_fp8_blockwise_triton_kernel,
 )
 
 
@@ -120,6 +121,7 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8(
             a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
@@ -186,6 +188,7 @@ class GEMMFP8CKBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         if trans_c:
             lhs, rhs = b, a
@@ -239,6 +242,24 @@ class GEMMFP8TritonBackend(KernelBackend):
         return supported
 
     @staticmethod
+    def tune_config(
+        a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, granularity, **kwargs
+    ) -> Optional[dict]:
+        # Blockwise is the only granularity with a per-shape internal autotune.
+        if granularity != ScalingGranularity.BLOCKWISE:
+            return None
+        return tune_gemm_fp8_blockwise_triton_kernel(
+            a,
+            a_scale_inv,
+            b,
+            b_scale_inv,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            out_dtype=out_dtype,
+            trans_c=trans_c,
+        )
+
+    @staticmethod
     def execute(
         a: torch.Tensor,
         a_scale_inv: torch.Tensor,
@@ -249,6 +270,7 @@ class GEMMFP8TritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         if granularity == ScalingGranularity.TENSORWISE:
             return gemm_fp8_tensorwise_triton_kernel(
@@ -273,6 +295,8 @@ class GEMMFP8TritonBackend(KernelBackend):
                 trans_c=trans_c,
             )
         elif granularity == ScalingGranularity.BLOCKWISE:
+            # No auto_tune here: searching is tune_config()'s job, and benching on the
+            # serving path would stall the first call and break CUDA graph capture.
             return gemm_fp8_blockwise_triton_kernel(
                 a,
                 a_scale_inv,
@@ -282,6 +306,7 @@ class GEMMFP8TritonBackend(KernelBackend):
                 trans_b=trans_b,
                 out_dtype=out_dtype,
                 trans_c=trans_c,
+                backend_config=backend_config,
             )
         else:
             raise ValueError(f"Unsupported granularity for FP8 Triton: {granularity}")
@@ -333,6 +358,7 @@ class GEMMFP8TurboBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         return torch.ops.primus_turbo_cpp_extension.turbo_gemm_fp8(
             a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
@@ -397,6 +423,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        backend_config=None,
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             out = gemm_mxfp8_flydsl_kernel(
@@ -436,6 +463,7 @@ _GEMM_FP8_BACKENDS = {
 class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
     _backends = _GEMM_FP8_BACKENDS
     _cache = TuneCache(1024)
+    _tune_config_name = "gemm_fp8"  # auto-load configs/pytorch/<arch>/gemm_fp8.json
 
     @classmethod
     def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, **kwargs):
