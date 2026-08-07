@@ -18,10 +18,8 @@ from primus_turbo.flydsl.mega.fp8 import dispatch_grouped_gemm_mxfp8_flydsl_kern
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     _l1_dgrad_combine_mxfp8_flydsl_kernel,
     _mxfp8_variable_k_wgrad_dw1,
-    prepare_dw1_pool_operand_fp8,
-)
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
     _w1_fp8_cached,
+    prepare_dw1_pool_operand_fp8,
 )
 
 __all__ = [

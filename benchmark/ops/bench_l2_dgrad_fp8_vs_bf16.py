@@ -41,7 +41,7 @@ from primus_turbo.flydsl.mega.fp8 import (
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     prepare_dispatch_weight_fp8,
 )
 

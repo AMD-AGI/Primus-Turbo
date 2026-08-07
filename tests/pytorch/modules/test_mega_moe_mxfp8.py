@@ -41,7 +41,7 @@ from torch.testing._internal.common_utils import (
 )
 
 from primus_turbo.pytorch.core.low_precision import check_mxfp8_support
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     prepare_dispatch_weight_fp8,
 )
 

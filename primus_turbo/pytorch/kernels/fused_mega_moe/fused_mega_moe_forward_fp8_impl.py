@@ -21,11 +21,9 @@ from primus_turbo.flydsl.mega.fp8 import (
     swiglu_mxfp8_flydsl_kernel,
 )
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
-    prepare_dw1_pool_operand_fp8,
-)
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
     _w1_fp8_cached,
     _w2_fp8_cached,
+    prepare_dw1_pool_operand_fp8,
 )
 
 __all__ = [

@@ -97,7 +97,7 @@ from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     quantize_rowwise_mxfp8_flydsl,
     swiglu_mxfp8_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (  # noqa: E402
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (  # noqa: E402
     prepare_w2_fp8,
 )
 from primus_turbo.pytorch.core.backend import BackendType  # noqa: E402
@@ -112,7 +112,7 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_imp
     _mxfp8_variable_k_wgrad_dw2,
 )
 from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import fused_mega_moe_fp8  # noqa: E402  (fp8 op)
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
+from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     prepare_dispatch_weight_fp8,
 )
 

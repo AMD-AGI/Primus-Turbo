@@ -26,13 +26,11 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_imp
     _HANDLE_GROUP_OFFS,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
     _mxfp8_variable_k_wgrad_dw2,
+    _w2_fp8_cached,
 )
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_forward_fp8_impl import (
     _H_NUM_TILE_BLOCKS,
     _L2_NUM_COMBINE_CU,
-)
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_weight_prep_fp8 import (
-    _w2_fp8_cached,
 )
 
 __all__ = [
