@@ -23,7 +23,7 @@ import gc
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
+from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -36,6 +36,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _next_sr_seed,
     _sr_hash,
 )
+from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import make_row_band_resource, xcd_remap_pid
 
 MB = 32  # MXFP4 microblock (elems per E8M0)

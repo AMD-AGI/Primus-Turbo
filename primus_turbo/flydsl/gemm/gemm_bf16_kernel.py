@@ -21,19 +21,20 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as _std_arith
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.extras import types as T
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr.buffer_ops import (
-    _create_i64_constant,
-    _unwrap_value,
-    create_llvm_ptr,
-    get_element_ptr,
-)
 from flydsl.expr.primitive import get_iter as _get_iter
 from flydsl.expr.primitive import ptrtoint as _ptrtoint
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 
+from primus_turbo.flydsl.utils.buffer_ops import (
+    _create_i64_constant,
+    _unwrap_value,
+    create_llvm_ptr,
+    get_element_ptr,
+)
 from primus_turbo.flydsl.utils.gemm_helper import (
     BLOCK_K,
     G2SLoader,
@@ -58,7 +59,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 
 def _i64(v):
     # widen an i32 runtime value to i64 (avoids overflow in worst-case base offsets)
-    return ArithValue(arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
+    return ArithValue(arith.extsi(T.i64(), _unwrap_value(v)), signed=True)
 
 
 def _load_i64_as_i32(base, offset):
@@ -66,13 +67,13 @@ def _load_i64_as_i32(base, offset):
     ptr = create_llvm_ptr(_unwrap_value(base), 1)  # global address space
     idx = _unwrap_value(offset)
     if isinstance(idx.type, ir.IndexType):
-        idx = _unwrap_value(_std_arith.IndexCastOp(fx.T.i64(), idx).result)
+        idx = _unwrap_value(_std_arith.IndexCastOp(T.i64(), idx).result)
     elif isinstance(idx.type, ir.IntegerType) and idx.type.width < 64:
-        idx = _unwrap_value(_std_arith.ExtSIOp(fx.T.i64(), idx).result)
+        idx = _unwrap_value(_std_arith.ExtSIOp(T.i64(), idx).result)
     byte_off = _unwrap_value(_std_arith.MulIOp(idx, _create_i64_constant(8)).result)
-    elem = get_element_ptr(ptr, byte_offset=byte_off, elem_type=fx.T.i8())
-    val = _llvm.LoadOp(fx.T.i64(), elem, ordering=_llvm.AtomicOrdering.monotonic, alignment=8)
-    trunc = _std_arith.TruncIOp(fx.T.i32(), val.result)
+    elem = get_element_ptr(ptr, byte_offset=byte_off, elem_type=T.i8())
+    val = _llvm.LoadOp(T.i64(), elem, ordering=_llvm.AtomicOrdering.monotonic, alignment=8)
+    trunc = _std_arith.TruncIOp(T.i32(), val.result)
     return ArithValue(trunc.result, signed=True)
 
 

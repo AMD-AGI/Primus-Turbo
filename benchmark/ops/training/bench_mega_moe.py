@@ -40,13 +40,9 @@ _HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
 import flydsl.compiler as flyc  # noqa: E402
-import flydsl.expr as fx  # noqa: E402
+import flydsl.expr as fx
+from flydsl._mlir.extras import types as T  # noqa: E402
 from flydsl.expr import arith  # noqa: E402
-from flydsl.expr.buffer_ops import (  # noqa: E402
-    buffer_load,
-    create_buffer_resource,
-    extract_base_index,
-)
 from flydsl.expr.typing import AddressSpace, PointerType  # noqa: E402
 
 # import primus_turbo.pytorch first to dodge the mega kernels' circular import
@@ -84,6 +80,11 @@ from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
     SymBuffer,
     Workspace,
     get_symm_buffer_for_mega_moe,
+)
+from primus_turbo.flydsl.utils.buffer_ops import (  # noqa: E402
+    buffer_load,
+    create_buffer_resource,
+    extract_base_index,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (  # noqa: E402
     ceildiv,
@@ -150,7 +151,7 @@ def compile_grouped_gemm_bf16(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         group_res = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         num_tile_blocks_res = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
-        real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+        real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=T.i32())
         # XCD-swizzle over the REAL tile range only (front-loaded); swizzling the full padded pool scatters real tiles -> ~2x slower.
         real_grid = real_tiles * n_blocks
 
@@ -165,7 +166,7 @@ def compile_grouped_gemm_bf16(
             group_size_m = arith.select(remaining_m < GROUP_M, remaining_m, fx.Int32(GROUP_M))
             block_m = first_pid_m + (pid_in_group % group_size_m)
             block_n = pid_in_group // group_size_m
-            g_idx = buffer_load(group_res, block_m, vec_width=1, dtype=fx.T.i32())
+            g_idx = buffer_load(group_res, block_m, vec_width=1, dtype=T.i32())
             gbase = g_idx * fx.Int32(K) * c_n
             # Worst-case pool (cap*K > 2^31): rebase A/C per tile in int64, int32 in-resource offset. Mirrors fused nt/nn.
             if layout in ("nt", "nn"):
@@ -174,8 +175,8 @@ def compile_grouped_gemm_bf16(
                 )
                 a_byte_off = _i64(block_m) * fx.Int64(BLOCK_M * K * 2)
                 c_byte_off = _i64(block_m * fx.Int32(BLOCK_M)) * _i64(c_n) * fx.Int64(2)
-                a_base = fx.arith.ArithValue(arith.index_cast(fx.T.i64(), extract_base_index(A)), signed=True)
-                c_base = fx.arith.ArithValue(arith.index_cast(fx.T.i64(), extract_base_index(C)), signed=True)
+                a_base = fx.arith.ArithValue(arith.index_cast(T.i64(), extract_base_index(A)), signed=True)
+                c_base = fx.arith.ArithValue(arith.index_cast(T.i64(), extract_base_index(C)), signed=True)
                 A_tile = fx.make_view(
                     fx.inttoptr(pool_ptr_ty, a_base + a_byte_off), fx.make_layout(BLOCK_M * K, 1)
                 )

@@ -46,10 +46,10 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     Mfma16x16x128,

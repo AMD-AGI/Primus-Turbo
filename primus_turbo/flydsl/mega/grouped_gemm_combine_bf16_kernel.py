@@ -9,13 +9,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-    create_buffer_resource_from_addr,
-    extract_base_index,
-)
+from flydsl._mlir.extras import types as T
 
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     _make_shared_storage,
@@ -41,6 +35,13 @@ from primus_turbo.flydsl.mega.symm_buffer import (
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
+)
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    create_buffer_resource_from_addr,
+    extract_base_index,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (
     make_bf16_fp16_tile_tensor,
@@ -133,14 +134,12 @@ def _make_grouped_gemm_combine(
         combine_expected_res = create_buffer_resource(COMBINE_EXPECTED, max_size=True)
         reduce_expected_res = create_buffer_resource(REDUCE_EXPECTED, max_size=True)
         combine_parity = cast(
-            buffer_load(combine_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
+            buffer_load(combine_parity_res, fx.Int32(0), vec_width=1, dtype=T.i64()), T.i32()
         )
         combine_bank = combine_parity * fx.Int32(worst_case_tiles)
         reduce_bank = combine_parity * fx.Int32(num_combine_slots)
-        expected_combine_i64 = buffer_load(
-            combine_expected_res, combine_parity, vec_width=1, dtype=fx.T.i64()
-        )
-        expected_reduce_i64 = buffer_load(reduce_expected_res, combine_parity, vec_width=1, dtype=fx.T.i64())
+        expected_combine_i64 = buffer_load(combine_expected_res, combine_parity, vec_width=1, dtype=T.i64())
+        expected_reduce_i64 = buffer_load(reduce_expected_res, combine_parity, vec_width=1, dtype=T.i64())
 
         combine_flag_base = workspace.get_combine_flag_ptr()
         comb_base = workspace.get_combine_token_buffer_ptr()
@@ -159,7 +158,7 @@ def _make_grouped_gemm_combine(
         topk_indices_res = create_buffer_resource(TOPK_INDICES, max_size=True)
         num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
-        real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+        real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=T.i32())
         grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
         gate_base = workspace.get_combine_gate_ptr() if with_gate else None
         gate_local_res = (
@@ -172,8 +171,8 @@ def _make_grouped_gemm_combine(
             seg_local = (fx.Int32(num_experts) - block_index + combine_cu - fx.Int32(1)) // combine_cu
             for seg_iter in range(seg_local):
                 task_index = block_index + seg_iter * combine_cu
-                seg_start = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
-                seg_count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+                seg_start = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=T.i32())
+                seg_count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=T.i32())
                 if seg_count > fx.Int32(0):
                     t0 = seg_start // fx.Int32(BLOCK_M)
                     t1 = (seg_start + seg_count - fx.Int32(1)) // fx.Int32(BLOCK_M)
@@ -186,7 +185,7 @@ def _make_grouped_gemm_combine(
                                 combine_flag_base,
                                 combine_bank + tile_cursor,
                                 scope="sys",
-                                dtype=fx.T.i64(),
+                                dtype=T.i64(),
                             )
                             while signal_count != expected_combine_i64:
                                 fx.rocdl.s_sleep(fx.Int32(1))
@@ -204,7 +203,7 @@ def _make_grouped_gemm_combine(
                                     combine_bank + tile_cursor,
                                     order="relaxed",
                                     scope="sys",
-                                    dtype=fx.T.i64(),
+                                    dtype=T.i64(),
                                 )
                             tile_cursor = tile_cursor + fx.Int32(1)
                     fx.rocdl.s_waitcnt(0)
@@ -230,15 +229,15 @@ def _make_grouped_gemm_combine(
             block_n = gemm_tile_index % fx.Int32(n_blocks)
             if block_m < real_tiles:
                 # GEMM role: one real tile (block_m, block_n) per block (unchanged).
-                group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=T.i32())
                 group_base = group_index * fx.Int32(K) * c_n
                 # A base = ACT tensor; C base = l2_token_buffer (int64 symm addr).
                 act_base = fx.arith.ArithValue(
-                    fx.arith.index_cast(fx.T.i64(), extract_base_index(ACT)), signed=True
+                    fx.arith.index_cast(T.i64(), extract_base_index(ACT)), signed=True
                 )
                 # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
-                a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
-                c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
+                a_off = cast(block_m, T.i64()) * fx.Int64(BLOCK_M * K * 2)
+                c_off = cast(block_m, T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, T.i64())
                 A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
                 C_tile = make_bf16_fp16_tile_tensor(l2_token_buffer_base, c_off, 0x40000000)
                 gemm_tile(
@@ -328,12 +327,12 @@ def _make_epoch_bump(add_combine, add_reduce):
             parity_res = create_buffer_resource(PARITY, max_size=True)
             combine_res = create_buffer_resource(COMBINE_EXP, max_size=True)
             reduce_res = create_buffer_resource(REDUCE_EXP, max_size=True)
-            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=T.i64()) ^ fx.Int64(1)
             buffer_store(new_parity, parity_res, fx.Int32(0))
-            idx = cast(new_parity, fx.T.i32())
-            new_combine = buffer_load(combine_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_combine)
+            idx = cast(new_parity, T.i32())
+            new_combine = buffer_load(combine_res, idx, vec_width=1, dtype=T.i64()) + fx.Int64(add_combine)
             buffer_store(new_combine, combine_res, idx)
-            new_reduce = buffer_load(reduce_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_reduce)
+            new_reduce = buffer_load(reduce_res, idx, vec_width=1, dtype=T.i64()) + fx.Int64(add_reduce)
             buffer_store(new_reduce, reduce_res, idx)
 
     return epoch_bump_kernel

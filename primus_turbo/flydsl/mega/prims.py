@@ -10,8 +10,11 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm
+from flydsl._mlir.extras import types as T
 from flydsl.expr import range_constexpr
-from flydsl.expr.buffer_ops import (
+from flydsl.expr.utils.arith import ArithValue
+
+from primus_turbo.flydsl.utils.buffer_ops import (
     _create_i32_constant,
     _create_i64_constant,
     _unwrap_value,
@@ -30,20 +33,18 @@ _I32_BYTES = 4  # word stride: i32-word offset -> byte address
 SPIN_TIMEOUT_CYCLES = 3_000_000_000
 
 
-def read_clock() -> fx.ArithValue:
+def read_clock() -> ArithValue:
     # Realtime counter for spin-wait watchdogs; unsigned so deltas compare right.
-    op = llvm.inline_asm(
-        fx.T.i64(), [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True
-    )
-    return fx.arith.ArithValue(op, signed=False)
+    op = llvm.inline_asm(T.i64(), [], "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", has_side_effects=True)
+    return ArithValue(op, signed=False)
 
 
-def spin_timed_out(spin_start: fx.ArithValue, timeout: int = SPIN_TIMEOUT_CYCLES) -> fx.ArithValue:
+def spin_timed_out(spin_start: ArithValue, timeout: int = SPIN_TIMEOUT_CYCLES) -> ArithValue:
     # Pure predicate (raw cmpi) for the watchdog `if`; the loop must stay inline for the AST rewriter (spin_start is loop-carried).
     return (read_clock() - spin_start) > fx.Int64(timeout)
 
 
-def cast(val: Union[int, fx.ArithValue], dtype) -> fx.ArithValue:
+def cast(val: Union[int, ArithValue], dtype) -> ArithValue:
     # Cast a scalar to dtype, picking the right widen/narrow/convert op.
     if hasattr(dtype, "ir_type"):
         dtype = dtype.ir_type
@@ -51,7 +52,7 @@ def cast(val: Union[int, fx.ArithValue], dtype) -> fx.ArithValue:
     src = _as_value(val)  # bare python int -> i32 constant
     src_ty = src.type
     if src_ty == dtype:
-        return fx.arith.ArithValue(src, signed=signed)
+        return ArithValue(src, signed=signed)
 
     src_int, dst_int = isinstance(src_ty, ir.IntegerType), isinstance(dtype, ir.IntegerType)
     src_idx, dst_idx = isinstance(src_ty, ir.IndexType), isinstance(dtype, ir.IndexType)
@@ -72,7 +73,7 @@ def cast(val: Union[int, fx.ArithValue], dtype) -> fx.ArithValue:
         op = (std_arith.FPToSIOp if signed else std_arith.FPToUIOp)(dtype, src)
     else:
         raise ValueError(f"cannot cast {src_ty} to {dtype}")
-    return fx.arith.ArithValue(op.result, signed=signed)
+    return ArithValue(op.result, signed=signed)
 
 
 _ADDR_SPACES = {"global": 1, "gmem": 1, "lds": 3, "shared": 3, "smem": 3}
@@ -111,7 +112,7 @@ def _unwrap_order(order: Optional[str]) -> llvm.AtomicOrdering:
         ) from None
 
 
-def _as_value(v: Union[int, fx.ArithValue]) -> ir.Value:
+def _as_value(v: Union[int, ArithValue]) -> ir.Value:
     # Coerce python int / ArithValue / raw ir value to a raw ir value (bare int -> i32; pass typed for i64).
     if isinstance(v, int):
         v = _create_i32_constant(v)
@@ -125,38 +126,38 @@ def memory_fence(order: Optional[str] = None, scope: Optional[str] = None) -> No
     llvm.fence(order_enum, syncscope=_unwrap_scope("agent" if scope is None else scope))
 
 
-def addr_buffer_resource(addr_i64: fx.ArithValue, num_records_bytes: int) -> fx.ArithValue:
+def addr_buffer_resource(addr_i64: ArithValue, num_records_bytes: int) -> ArithValue:
     return create_buffer_resource_from_addr(addr_i64, num_records_bytes=num_records_bytes)
 
 
 def elem_ptr(
-    base: Union[int, fx.ArithValue],
-    idx: Union[int, fx.ArithValue],
+    base: Union[int, ArithValue],
+    idx: Union[int, ArithValue],
     space: Union[int, str],
     elem_bytes: int = 4,
 ) -> ir.Value:
     ptr = create_llvm_ptr(_unwrap_value(base), _unwrap_space(space))
     idx_val = _unwrap_value(idx)
     if isinstance(idx_val.type, ir.IndexType):
-        idx_val = _unwrap_value(std_arith.IndexCastOp(fx.T.i64(), idx_val).result)
+        idx_val = _unwrap_value(std_arith.IndexCastOp(T.i64(), idx_val).result)
     elif isinstance(idx_val.type, ir.IntegerType) and idx_val.type.width < 64:
-        idx_val = _unwrap_value(std_arith.ExtSIOp(fx.T.i64(), idx_val).result)
+        idx_val = _unwrap_value(std_arith.ExtSIOp(T.i64(), idx_val).result)
     byte_off = _unwrap_value(std_arith.MulIOp(idx_val, _create_i64_constant(elem_bytes)).result)
-    return get_element_ptr(ptr, byte_offset=byte_off, elem_type=fx.T.i8())
+    return get_element_ptr(ptr, byte_offset=byte_off, elem_type=T.i8())
 
 
-def addr_elem_ptr_i32(addr_i64: Union[int, fx.ArithValue], idx: Union[int, fx.ArithValue]) -> ir.Value:
+def addr_elem_ptr_i32(addr_i64: Union[int, ArithValue], idx: Union[int, ArithValue]) -> ir.Value:
     return elem_ptr(addr_i64, idx, "global")
 
 
 def atomic_add(
-    base: Union[int, fx.ArithValue],
-    offset: Union[int, fx.ArithValue],
-    val: Union[int, fx.ArithValue],
+    base: Union[int, ArithValue],
+    offset: Union[int, ArithValue],
+    val: Union[int, ArithValue],
     scope: str = "agent",
     space: Union[int, str] = "global",
     order: str = "relaxed",
-) -> fx.ArithValue:
+) -> ArithValue:
     val = _as_value(val)
     elem_bytes = val.type.width // 8
     ptr = elem_ptr(base, offset, space, elem_bytes)
@@ -168,20 +169,20 @@ def atomic_add(
         syncscope=_unwrap_scope(scope),
         alignment=elem_bytes,
     )
-    return fx.arith.ArithValue(res, signed=True)
+    return ArithValue(res, signed=True)
 
 
 def ld(
-    base: Union[int, fx.ArithValue],
-    offset: Union[int, fx.ArithValue],
+    base: Union[int, ArithValue],
+    offset: Union[int, ArithValue],
     *,
     scope: str = "agent",
     space: Union[int, str] = "global",
     order: str = "relaxed",
     dtype: Optional[object] = None,
-) -> fx.ArithValue:
+) -> ArithValue:
     if dtype is None:
-        dtype = fx.T.i32()
+        dtype = T.i32()
     elif hasattr(dtype, "ir_type"):
         dtype = dtype.ir_type
     elem_bytes = dtype.width // 8
@@ -193,13 +194,13 @@ def ld(
         syncscope=_unwrap_scope(scope),
         alignment=elem_bytes,
     )
-    return fx.arith.ArithValue(op.result, signed=True)
+    return ArithValue(op.result, signed=True)
 
 
 def st(
-    base: Union[int, fx.ArithValue],
-    offset: Union[int, fx.ArithValue],
-    val: Union[int, fx.ArithValue],
+    base: Union[int, ArithValue],
+    offset: Union[int, ArithValue],
+    val: Union[int, ArithValue],
     *,
     scope: str = "agent",
     space: Union[int, str] = "global",
@@ -214,27 +215,27 @@ def st(
 
 
 def copy_warp(
-    dst: Union[int, fx.ArithValue],
-    src: Union[int, fx.ArithValue],
+    dst: Union[int, ArithValue],
+    src: Union[int, ArithValue],
     nbytes: int,
-    dst_off: Union[int, fx.ArithValue] = 0,
-    src_off: Union[int, fx.ArithValue] = 0,
+    dst_off: Union[int, ArithValue] = 0,
+    src_off: Union[int, ArithValue] = 0,
     load_cache_modifier: int = 0,
     store_cache_modifier: int = 0,
 ) -> None:
-    def _addr_i64(addr: Union[int, fx.ArithValue]) -> fx.ArithValue:
+    def _addr_i64(addr: Union[int, ArithValue]) -> ArithValue:
         if isinstance(addr, int):
             return fx.Int64(addr)
         v = _unwrap_value(addr)
         if isinstance(v.type, ir.IndexType):
-            v = std_arith.IndexCastOp(fx.T.i64(), v).result
+            v = std_arith.IndexCastOp(T.i64(), v).result
         elif isinstance(v.type, ir.IntegerType) and v.type.width < 64:
-            v = std_arith.ExtSIOp(fx.T.i64(), v).result
-        return fx.arith.ArithValue(v, signed=True)
+            v = std_arith.ExtSIOp(T.i64(), v).result
+        return ArithValue(v, signed=True)
 
     def _copy_operand(
-        operand: Union[int, fx.ArithValue], word_off: Union[int, fx.ArithValue], nbytes: int
-    ) -> Tuple[fx.ArithValue, fx.ArithValue]:
+        operand: Union[int, ArithValue], word_off: Union[int, ArithValue], nbytes: int
+    ) -> Tuple[ArithValue, ArithValue]:
         if "ptr" in str(_unwrap_value(operand).type):
             return operand, fx.Int32(word_off) if isinstance(word_off, int) else word_off
         base = _addr_i64(operand) + _addr_i64(word_off) * fx.Int64(_I32_BYTES)
@@ -248,7 +249,7 @@ def copy_warp(
     offs = [fx.Int32(c * cols) + lane_off for c in range_constexpr(nbytes // 4 // cols)]
     vals = [
         buffer_load(
-            src, src_off + o, vec_width=_COPY_VEC_I32, dtype=fx.T.i32(), cache_modifier=load_cache_modifier
+            src, src_off + o, vec_width=_COPY_VEC_I32, dtype=T.i32(), cache_modifier=load_cache_modifier
         )
         for o in offs
     ]

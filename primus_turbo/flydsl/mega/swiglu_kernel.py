@@ -14,12 +14,7 @@ import flydsl.expr as fx
 import flydsl.expr.math as fmath
 import torch
 from flydsl._mlir.dialects import vector as _vector
-from flydsl.expr.buffer_ops import (
-    _unwrap_value,
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-)
+from flydsl._mlir.extras import types as T
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
@@ -27,6 +22,12 @@ from primus_turbo.flydsl.mega.prims import ld, st
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
+)
+from primus_turbo.flydsl.utils.buffer_ops import (
+    _unwrap_value,
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
 )
 
 ACTIVATION_CLAMP = 10.0
@@ -49,8 +50,8 @@ def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: 
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def swiglu_kernel(ACC1: fx.Tensor, ACT: fx.Tensor, SCALE: fx.Tensor, NUM_TILE_BLOCKS: fx.Tensor):
-        f32v = fx.T.VectorType.get([_VEC], fx.T.f32())
-        bf16v = fx.T.VectorType.get([_VEC], fx.T.bf16())
+        f32v = T.VectorType.get([_VEC], T.f32())
+        bf16v = T.VectorType.get([_VEC], T.bf16())
         thread_index = fx.thread_idx.x
         block_index_x, block_index_y, _ = fx.block_idx
         col = block_index_y * fx.Int32(cols_per_block) + thread_index * fx.Int32(_VEC)
@@ -67,20 +68,20 @@ def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: 
             # i32 offset: assumes M*two_I < 2^31 elements (holds for all EP pool sizes).
             row_base = m * fx.Int32(two_I)
             if not partial_tail or col < fx.Int32(I):
-                gate = buffer_load(acc_rsrc, row_base + col, vec_width=_VEC, dtype=fx.T.bf16())
-                up = buffer_load(acc_rsrc, row_base + fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16())
+                gate = buffer_load(acc_rsrc, row_base + col, vec_width=_VEC, dtype=T.bf16())
+                up = buffer_load(acc_rsrc, row_base + fx.Int32(I) + col, vec_width=_VEC, dtype=T.bf16())
                 g = _clampv(fx.arith.extf(f32v, gate), lo, hi)
                 u = _clampv(fx.arith.extf(f32v, up), lo, hi)
                 denom = fx.arith.addf(one, fmath.exp(fx.arith.mulf(g, neg1)))
                 act = fx.arith.mulf(fx.arith.divf(g, denom), u)
                 if with_scale:
-                    sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
+                    sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=T.f32())
                     act = fx.arith.mulf(act, _vector.broadcast(f32v, sc))
                 buffer_store(fx.arith.trunc_f(bf16v, act), act_rsrc, m * fx.Int32(I) + col)
 
         # grid-stride over real pool rows only (NUM_TILE_BLOCKS * BM); unused tail skipped.
         m_real = buffer_load(
-            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32()
+            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=T.i32()
         ) * fx.Int32(BM)
         m = block_index_x
         while m < m_real:
@@ -120,8 +121,8 @@ def _make_swiglu_bwd(
         GRAD_GATE: fx.Tensor,
         ACT_W: fx.Tensor,
     ):
-        f32v = fx.T.VectorType.get([_VEC], fx.T.f32())
-        bf16v = fx.T.VectorType.get([_VEC], fx.T.bf16())
+        f32v = T.VectorType.get([_VEC], T.f32())
+        bf16v = T.VectorType.get([_VEC], T.bf16())
         thread_index = fx.thread_idx.x
         block_index_x, block_index_y, _ = fx.block_idx
         # LDS scratch for cross-warp gate reduction (one f32 slot per warp).
@@ -141,18 +142,16 @@ def _make_swiglu_bwd(
 
         def compute_tile(m, col, gate_parts=None, guard=False):
             row_base = m * fx.Int32(two_I)
-            gate = fx.arith.extf(
-                f32v, buffer_load(acc_rsrc, row_base + col, vec_width=_VEC, dtype=fx.T.bf16())
-            )
+            gate = fx.arith.extf(f32v, buffer_load(acc_rsrc, row_base + col, vec_width=_VEC, dtype=T.bf16()))
             up = fx.arith.extf(
-                f32v, buffer_load(acc_rsrc, row_base + fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16())
+                f32v, buffer_load(acc_rsrc, row_base + fx.Int32(I) + col, vec_width=_VEC, dtype=T.bf16())
             )
             d = fx.arith.extf(
-                f32v, buffer_load(dact_rsrc, m * fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16())
+                f32v, buffer_load(dact_rsrc, m * fx.Int32(I) + col, vec_width=_VEC, dtype=T.bf16())
             )
             d_raw = d
             if with_scale:
-                sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
+                sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=T.f32())
                 d = fx.arith.mulf(d, _vector.broadcast(f32v, sc))
 
             gc = _clampv(gate, lo, hi)
@@ -174,7 +173,7 @@ def _make_swiglu_bwd(
                 buffer_store(dgate, dacc_rsrc, row_base + col)
                 buffer_store(dup, dacc_rsrc, row_base + fx.Int32(I) + col)
                 if with_act_w:
-                    sc_w = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
+                    sc_w = buffer_load(scale_rsrc, m, vec_width=1, dtype=T.f32())
                     act_w_v = fx.arith.mulf(fx.arith.mulf(s, uc), _vector.broadcast(f32v, sc_w))
                     buffer_store(fx.arith.trunc_f(bf16v, act_w_v), act_w_rsrc, m * fx.Int32(I) + col)
 
@@ -184,7 +183,7 @@ def _make_swiglu_bwd(
                     # OOB lanes read garbage; zero them so the row sum stays clean.
                     contrib = fx.arith.select(in_bounds, contrib, zero)
                 gate_parts.append(
-                    fx.arith.ArithValue(_vector.reduction(fx.T.f32(), _vector.CombiningKind.ADD, contrib))
+                    fx.arith.ArithValue(_vector.reduction(T.f32(), _vector.CombiningKind.ADD, contrib))
                 )
 
         def compute_row(m):
@@ -208,12 +207,12 @@ def _make_swiglu_bwd(
                 fx.gpu.barrier()
                 if thread_index == fx.Int32(0):
                     total = fx.arith.ArithValue(
-                        ld(lds_base, fx.Int32(0), scope="workgroup", space=3, dtype=fx.T.f32())
+                        ld(lds_base, fx.Int32(0), scope="workgroup", space=3, dtype=T.f32())
                     )
                     for w in range(1, n_warps):
                         total = total.addf(
                             fx.arith.ArithValue(
-                                ld(lds_base, fx.Int32(w), scope="workgroup", space=3, dtype=fx.T.f32())
+                                ld(lds_base, fx.Int32(w), scope="workgroup", space=3, dtype=T.f32())
                             )
                         )
                     buffer_store(total, grad_gate_rsrc, m)
@@ -228,7 +227,7 @@ def _make_swiglu_bwd(
 
         # grid-stride over real pool rows only (NUM_TILE_BLOCKS * BM); skip the unused tail.
         m_real = buffer_load(
-            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32()
+            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=T.i32()
         ) * fx.Int32(BM)
         m = block_index_x
         while m < m_real:

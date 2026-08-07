@@ -50,7 +50,7 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _wgrad_block_mn,
 )
 
-import flydsl.expr.buffer_ops as _buffer_ops
+import primus_turbo.flydsl.utils.buffer_ops as _buffer_ops
 
 # isort: on
 

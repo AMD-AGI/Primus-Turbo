@@ -12,14 +12,7 @@ import itertools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr.buffer_ops import (
-    _unwrap_value,
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-    create_buffer_resource_from_addr,
-    extract_base_index,
-)
+from flydsl._mlir.extras import types as T
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
@@ -29,6 +22,14 @@ from primus_turbo.flydsl.mega.symm_buffer import TOKEN_DTYPE, SymBuffer, Workspa
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
+)
+from primus_turbo.flydsl.utils.buffer_ops import (
+    _unwrap_value,
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    create_buffer_resource_from_addr,
+    extract_base_index,
 )
 
 
@@ -56,7 +57,7 @@ def _make_dispatch_prologue(
 
     def _ext_i64(v):
         """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
-        return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
+        return fx.arith.ArithValue(fx.arith.extsi(T.i64(), _unwrap_value(v)), signed=True)
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def dispatch_prologue_kernel(
@@ -103,7 +104,7 @@ def _make_dispatch_prologue(
         def load_expert_id(elem_index):
             value = buffer_load(topk_resource, elem_index, vec_width=1, dtype=idx_load_dtype)
             if idx_is_i64:
-                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32(), _unwrap_value(value)), signed=True)
+                value = fx.arith.ArithValue(fx.arith.trunci(T.i32(), _unwrap_value(value)), signed=True)
             return value
 
         # All global tensors use max_size buffer descriptors.
@@ -182,7 +183,7 @@ def _make_dispatch_prologue(
                         scratch_resource,
                         fx.Int32(SCRATCH_SEND) + push_expert_index,
                         vec_width=1,
-                        dtype=fx.T.i32(),
+                        dtype=T.i32(),
                     )
                     buffer_store(
                         send_count_value, peer_c_resource, fx.Int32(rank * num_experts) + push_expert_index
@@ -231,7 +232,7 @@ def _make_dispatch_prologue(
                         expert_count_base, fx.Int32(source_rank * num_experts) + expert_index, scope="sys"
                     )
                 pool_base_value = buffer_load(
-                    scratch_resource, fx.Int32(SCRATCH_POOLBASE) + expert_index, vec_width=1, dtype=fx.T.i32()
+                    scratch_resource, fx.Int32(SCRATCH_POOLBASE) + expert_index, vec_width=1, dtype=T.i32()
                 )
                 buffer_store(
                     pool_base_value + preceding_count,
@@ -247,7 +248,7 @@ def _make_dispatch_prologue(
                 expert_id = destination_rank * fx.Int32(experts_per_rank) + local_expert_index
                 count_value = ld(expert_count_base, fx.Int32(rank * num_experts) + expert_id, scope="sys")
                 start_value = buffer_load(
-                    scratch_resource, fx.Int32(SCRATCH_START) + expert_id, vec_width=1, dtype=fx.T.i32()
+                    scratch_resource, fx.Int32(SCRATCH_START) + expert_id, vec_width=1, dtype=T.i32()
                 )
                 buffer_store(destination_rank, expert_send_dst_rank_resource, comm_task_index)
                 buffer_store(start_value, expert_send_dst_row_resource, comm_task_index)
@@ -264,7 +265,7 @@ def _make_dispatch_prologue(
                             expert_send_count_resource,
                             fx.Int32(comm_task_counter),
                             vec_width=1,
-                            dtype=fx.T.i32(),
+                            dtype=T.i32(),
                         )
                         buffer_store(source_offset, expert_send_offset_resource, fx.Int32(comm_task_counter))
                         buffer_store(source_offset, scratch_resource, fx.Int32(SCRATCH_SROFF + expert_id))
@@ -276,7 +277,7 @@ def _make_dispatch_prologue(
                     scratch_resource,
                     fx.Int32(SCRATCH_POOLBASE + rank * experts_per_rank) + local_expert_index,
                     vec_width=1,
-                    dtype=fx.T.i32(),
+                    dtype=T.i32(),
                 )
                 source_counts = []
                 for source_rank in fx.range_constexpr(num_ranks):
@@ -362,16 +363,16 @@ def _make_dispatch_prologue(
                     + local_position
                 )
                 expert_start = buffer_load(
-                    scratch_resource, fx.Int32(SCRATCH_START) + expert_id, vec_width=1, dtype=fx.T.i32()
+                    scratch_resource, fx.Int32(SCRATCH_START) + expert_id, vec_width=1, dtype=T.i32()
                 )
                 expert_source_offset = buffer_load(
-                    scratch_resource, fx.Int32(SCRATCH_SROFF) + expert_id, vec_width=1, dtype=fx.T.i32()
+                    scratch_resource, fx.Int32(SCRATCH_SROFF) + expert_id, vec_width=1, dtype=T.i32()
                 )
                 destination_row = expert_start + within_expert_position
                 buffer_store(
                     token_index, dispatched_token_idx_resource, expert_source_offset + within_expert_position
                 )
-                routing_weight = buffer_load(topk_weight_resource, pair_index, vec_width=1, dtype=fx.T.f32())
+                routing_weight = buffer_load(topk_weight_resource, pair_index, vec_width=1, dtype=T.f32())
                 destination_rank = expert_id // fx.Int32(experts_per_rank)
                 # Symmetric buffers on the destination rank.
                 peer_origin_rank_resource = create_buffer_resource_from_addr(

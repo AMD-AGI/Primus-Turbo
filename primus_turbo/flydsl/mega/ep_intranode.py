@@ -8,13 +8,10 @@ from typing import Optional
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import vector as _vector
+from flydsl._mlir.extras import types as T
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
-from flydsl.expr.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource_from_addr,
-)
+from flydsl.expr.utils.arith import ArithValue
 
 from primus_turbo.flydsl.mega.prims import (
     atomic_add,
@@ -25,6 +22,11 @@ from primus_turbo.flydsl.mega.prims import (
     st,
 )
 from primus_turbo.flydsl.mega.symm_buffer import SymBuffer, Workspace
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
+)
 
 _WARP = 64
 _BLOCK_THREADS = 512
@@ -39,13 +41,13 @@ def dispatch_bf16_tile(
     workspace: Workspace,
     thread_index: fx.Int32,
     hidden_size: int,
-    input_res: fx.ArithValue,
-    expert_send_dst_rank_res: fx.ArithValue,
-    expert_send_dst_row_res: fx.ArithValue,
-    expert_send_count_res: fx.ArithValue,
-    expert_send_offset_res: fx.ArithValue,
-    dispatched_token_idx_res: fx.ArithValue,
-    task_index: fx.ArithValue,
+    input_res: ArithValue,
+    expert_send_dst_rank_res: ArithValue,
+    expert_send_dst_row_res: ArithValue,
+    expert_send_count_res: ArithValue,
+    expert_send_offset_res: ArithValue,
+    dispatched_token_idx_res: ArithValue,
+    task_index: ArithValue,
     signal: bool = False,
     block_m: int = 0,
     disp_parity: Optional[fx.Int32] = None,
@@ -57,10 +59,10 @@ def dispatch_bf16_tile(
 
     warp_id = thread_index // fx.Int32(_WARP)
 
-    dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
-    dest_row_start = buffer_load(expert_send_dst_row_res, task_index, vec_width=1, dtype=fx.T.i32())
-    source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
-    token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+    dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=T.i32())
+    dest_row_start = buffer_load(expert_send_dst_row_res, task_index, vec_width=1, dtype=T.i32())
+    source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=T.i32())
+    token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=T.i32())
     # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
     pool_address = sym.map(workspace.get_dispatch_token_pool_ptr(), dst_rank)
     dispatch_flag_address = sym.map(workspace.get_dispatch_flag_ptr(), dst_rank)
@@ -71,7 +73,7 @@ def dispatch_bf16_tile(
     for i in range(local_count):
         row_index = warp_id + i * fx.Int32(_NUM_WARPS)
         source_row = buffer_load(
-            dispatched_token_idx_res, source_offset + row_index, vec_width=1, dtype=fx.T.i32()
+            dispatched_token_idx_res, source_offset + row_index, vec_width=1, dtype=T.i32()
         )
         dest_row = dest_row_start + row_index
         # dst = peer pool (base addr), src = local input (resource); offsets in i32 words
@@ -100,12 +102,12 @@ def combine_bf16_tile(
     sym: SymBuffer,
     workspace: Workspace,
     thread_index: fx.Int32,
-    task_index: fx.ArithValue,
-    recv_dst_rank_res: fx.ArithValue,
-    recv_start_row_res: fx.ArithValue,
-    recv_count_res: fx.ArithValue,
-    origin_slot_res: fx.ArithValue,
-    grad_gate_res: Optional[fx.ArithValue] = None,
+    task_index: ArithValue,
+    recv_dst_rank_res: ArithValue,
+    recv_start_row_res: ArithValue,
+    recv_count_res: ArithValue,
+    origin_slot_res: ArithValue,
+    grad_gate_res: Optional[ArithValue] = None,
     signal: bool = False,
     epoch: Optional[fx.Int64] = None,
     bank_offset: Optional[fx.Int32] = None,
@@ -125,9 +127,9 @@ def combine_bf16_tile(
     lane_id = thread_index % fx.Int32(_WARP)
     l2_ptr = workspace.get_l2_token_buffer_ptr()
 
-    dst_rank = buffer_load(recv_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
-    start_row = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
-    count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+    dst_rank = buffer_load(recv_dst_rank_res, task_index, vec_width=1, dtype=T.i32())
+    start_row = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=T.i32())
+    count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=T.i32())
     # hoist workspace-derived values before the dynamic loop (rewriter can't carry Workspace)
     comb_addr = sym.map(workspace.get_combine_token_buffer_ptr(), dst_rank)
     gate_addr = sym.map(workspace.get_combine_gate_ptr(), dst_rank) if with_gate else None
@@ -136,7 +138,7 @@ def combine_bf16_tile(
     local_count = (count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
     for i in range(local_count):
         row = start_row + warp_id + i * fx.Int32(_NUM_WARPS)
-        slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
+        slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=T.i32())
         copy_warp(
             comb_addr,
             l2_ptr,
@@ -156,12 +158,12 @@ def combine_bf16_tile(
             in_tail = (lane_id * fx.Int32(_PVEC)) < fx.Int32(tail_cols)
             safe_col = arith.select(in_tail, col, fx.Int32(out_features - _PVEC))
             tail_value = buffer_load(
-                l2_res, row_off + safe_col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=18
+                l2_res, row_off + safe_col, vec_width=_PVEC, dtype=T.bf16(), cache_modifier=18
             )
             dst = arith.select(in_tail, slot_base + col, oob_index)
             buffer_store(tail_value, peer, dst, cache_modifier=19)
         if const_expr(with_gate):
-            gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
+            gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=T.f32())
             gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
             buffer_store(gate_value, gate_peer, slot, cache_modifier=19)
 
@@ -184,31 +186,31 @@ def topk_reduce_bf16_tile(
     out_features: int,
     num_experts: int,
     rank: int,
-    comb_local_res: fx.ArithValue,
-    output_res: fx.ArithValue,
-    topk_indices_res: fx.ArithValue,
-    num_tokens_res: fx.ArithValue,
-    barrier_base: fx.ArithValue,
+    comb_local_res: ArithValue,
+    output_res: ArithValue,
+    topk_indices_res: ArithValue,
+    num_tokens_res: ArithValue,
+    barrier_base: ArithValue,
     reduce_bank: fx.Int32,
-    topk_weights_res: fx.ArithValue,
-    gate_local_res: Optional[fx.ArithValue],
-    d_topk_w_res: Optional[fx.ArithValue],
+    topk_weights_res: ArithValue,
+    gate_local_res: Optional[ArithValue],
+    d_topk_w_res: Optional[ArithValue],
     epoch: fx.Int64,
 ):
-    f32_vec = fx.T.VectorType.get([_PVEC], fx.T.f32())
-    bf16_vec = fx.T.VectorType.get([_PVEC], fx.T.bf16())
+    f32_vec = T.VectorType.get([_PVEC], T.f32())
+    bf16_vec = T.VectorType.get([_PVEC], T.bf16())
     num_vec_chunks = out_features // _PVEC
     lane_id = thread_index % fx.Int32(_WARP)
     warp_id = thread_index // fx.Int32(_WARP)
     global_warp_id = base_pid * fx.Int32(_NUM_WARPS) + warp_id
-    num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=fx.T.i32())
+    num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=T.i32())
     token = global_warp_id
     while token < num_tokens:
         if const_expr(signal):
             # Wait each slot's flag == epoch. Loop MUST stay inline (rewriter needs the control flow).
             for j in range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(j)
-                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=T.i64())
                 if topk_index >= fx.Int64(0):
                     if topk_index < fx.Int64(num_experts):
                         if lane_id == fx.Int32(0):
@@ -219,7 +221,7 @@ def topk_reduce_bf16_tile(
                                 reduce_bank + slot,
                                 order="relaxed",
                                 scope="sys",
-                                dtype=fx.T.i64(),
+                                dtype=T.i64(),
                             )
                             while flag != epoch:
                                 fx.rocdl.s_sleep(fx.Int32(1))
@@ -246,7 +248,7 @@ def topk_reduce_bf16_tile(
                                     reduce_bank + slot,
                                     order="relaxed",
                                     scope="sys",
-                                    dtype=fx.T.i64(),
+                                    dtype=T.i64(),
                                 )
             fx.gpu.barrier()
 
@@ -255,7 +257,7 @@ def topk_reduce_bf16_tile(
         valid = []
         for j in range_constexpr(topk):
             idx = buffer_load(
-                topk_indices_res, token * fx.Int32(topk) + fx.Int32(j), vec_width=1, dtype=fx.T.i64()
+                topk_indices_res, token * fx.Int32(topk) + fx.Int32(j), vec_width=1, dtype=T.i64()
             )
             valid.append((idx >= fx.Int64(0)) & (idx < fx.Int64(num_experts)))
         zero_vec = fx.arith.constant_vector(0.0, f32_vec)
@@ -270,7 +272,7 @@ def topk_reduce_bf16_tile(
                         comb_local_res,
                         row_off,
                         vec_width=_PVEC,
-                        dtype=fx.T.bf16(),
+                        dtype=T.bf16(),
                         cache_modifier=19,  # sc0|sc1|nt: system-visible non-temporal read.
                     )
                 )
@@ -280,7 +282,7 @@ def topk_reduce_bf16_tile(
                         topk_weights_res,
                         token * fx.Int32(topk) + fx.Int32(j),
                         vec_width=1,
-                        dtype=fx.T.f32(),
+                        dtype=T.f32(),
                         cache_modifier=19,
                     )
                     for j in range_constexpr(topk)
@@ -297,11 +299,9 @@ def topk_reduce_bf16_tile(
         if const_expr(signal and with_gate):
             for j in range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(j)
-                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=T.i64())
                 if lane_id == fx.Int32(0):
-                    gate_v = buffer_load(
-                        gate_local_res, slot, vec_width=1, dtype=fx.T.f32(), cache_modifier=19
-                    )
+                    gate_v = buffer_load(gate_local_res, slot, vec_width=1, dtype=T.f32(), cache_modifier=19)
                     zero_f = fx.Float32(0.0)
                     v1 = fx.arith.select(topk_index < fx.Int64(num_experts), gate_v, zero_f)
                     d_val = fx.arith.select(topk_index >= fx.Int64(0), v1, zero_f)

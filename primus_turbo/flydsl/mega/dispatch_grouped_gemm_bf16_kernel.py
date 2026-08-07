@@ -10,13 +10,8 @@ from typing import Optional, Tuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir.extras import types as T
 from flydsl.expr import arith, const_expr
-from flydsl.expr.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-    extract_base_index,
-)
 from flydsl.expr.typing import AddressSpace, PointerType
 
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
@@ -38,6 +33,12 @@ from primus_turbo.flydsl.mega.symm_buffer import (
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
+)
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    extract_base_index,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (
     make_bf16_fp16_tile_tensor,
@@ -131,11 +132,9 @@ def _make_kernel(
         # read epoch (already bumped by the bump kernel): parity -> bank, expected -> spin target
         disp_parity_res = create_buffer_resource(DISP_PARITY, max_size=True)
         disp_expected_res = create_buffer_resource(DISP_EXPECTED, max_size=True)
-        disp_parity = cast(
-            buffer_load(disp_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
-        )
+        disp_parity = cast(buffer_load(disp_parity_res, fx.Int32(0), vec_width=1, dtype=T.i64()), T.i32())
         bank_offset = disp_parity * fx.Int32(NPB)
-        expected_dispatch_i64 = buffer_load(disp_expected_res, disp_parity, vec_width=1, dtype=fx.T.i64())
+        expected_dispatch_i64 = buffer_load(disp_expected_res, disp_parity, vec_width=1, dtype=T.i64())
 
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
         expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
@@ -145,7 +144,7 @@ def _make_kernel(
         dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
         if const_expr(is_tn):
             go_base = fx.arith.ArithValue(
-                arith.index_cast(fx.T.i64(), extract_base_index(GROUP_OFFS)), signed=True
+                arith.index_cast(T.i64(), extract_base_index(GROUP_OFFS)), signed=True
             )
             # tn reuses TILE_TO_GROUP to carry per-expert REAL token counts (K bound)
             real_count_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
@@ -186,15 +185,15 @@ def _make_kernel(
                 else:
                     block_m = local // fx.Int32(N_BLOCKS_N)
                     block_n = local % fx.Int32(N_BLOCKS_N)
-                m_start = cast(ld(go_base, group_idx, dtype=fx.T.i64()), fx.T.i32())
+                m_start = cast(ld(go_base, group_idx, dtype=T.i64()), T.i32())
                 # bound K to REAL rows: [m_start, m_start+real); padding tail never read
-                real_count = buffer_load(real_count_resource, group_idx, vec_width=1, dtype=fx.T.i32())
+                real_count = buffer_load(real_count_resource, group_idx, vec_width=1, dtype=T.i32())
                 m_end = m_start + real_count
                 ge_blk = bank_offset + group_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
                     fx.rocdl.s_waitcnt(0)
-                    sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
+                    sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=T.i64())
                     while sig != expected_dispatch_i64:
                         fx.rocdl.s_sleep(fx.Int32(1))
                         if spin_timed_out(spin_start):
@@ -206,7 +205,7 @@ def _make_kernel(
                             )
                             spin_start = read_clock()
                         fx.rocdl.s_waitcnt(0)
-                        sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
+                        sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=T.i64())
                 fx.gpu.barrier()
                 pool_ptr_ty = PointerType.get(
                     elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
@@ -240,7 +239,7 @@ def _make_kernel(
                 )
         else:
             tile_index = block_index - comm_block_count
-            real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+            real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=T.i32())
             real_grid = real_tiles * fx.Int32(n_blocks)
             if tile_index < real_grid:
                 num_pid_in_group = fx.Int32(GROUP_M * n_blocks)
@@ -251,12 +250,12 @@ def _make_kernel(
                 group_size_m = arith.select(remaining_m < fx.Int32(GROUP_M), remaining_m, fx.Int32(GROUP_M))
                 block_m = first_pid_m + (pid_in_group % group_size_m)
                 block_n = pid_in_group // group_size_m
-                g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=T.i32())
                 blk = bank_offset + g_idx
                 if thread_index == fx.Int32(0):
                     spin_start = read_clock()
                     fx.rocdl.s_waitcnt(0)
-                    signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
+                    signal = ld(dispatch_flag_base, blk, scope="sys", dtype=T.i64())
                     while signal != expected_dispatch_i64:
                         fx.rocdl.s_sleep(fx.Int32(1))
                         if spin_timed_out(spin_start):
@@ -268,17 +267,17 @@ def _make_kernel(
                             )
                             spin_start = read_clock()
                         fx.rocdl.s_waitcnt(0)
-                        signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
+                        signal = ld(dispatch_flag_base, blk, scope="sys", dtype=T.i64())
                 fx.gpu.barrier()
 
                 gbase = g_idx * fx.Int32(K) * c_n
                 # A base = dispatch_token_pool (int64 symm addr); C base = OUTPUT tensor.
                 out_base = fx.arith.ArithValue(
-                    arith.index_cast(fx.T.i64(), extract_base_index(OUTPUT)), signed=True
+                    arith.index_cast(T.i64(), extract_base_index(OUTPUT)), signed=True
                 )
                 # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
-                a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
-                c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
+                a_off = cast(block_m, T.i64()) * fx.Int64(BLOCK_M * K * 2)
+                c_off = cast(block_m, T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, T.i64())
                 A_tile = make_bf16_fp16_tile_tensor(dispatch_token_pool_base, a_off, BLOCK_M * K)
                 C_tile = make_bf16_fp16_tile_tensor(out_base, c_off, 0x40000000)
                 gemm_tile(
@@ -311,10 +310,10 @@ def _make_epoch_bump(addend):
         if fx.thread_idx.x == fx.Int32(0):
             parity_res = create_buffer_resource(PARITY, max_size=True)
             expected_res = create_buffer_resource(EXPECTED, max_size=True)
-            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=T.i64()) ^ fx.Int64(1)
             buffer_store(new_parity, parity_res, fx.Int32(0))
-            idx = cast(new_parity, fx.T.i32())
-            new_exp = buffer_load(expected_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(addend)
+            idx = cast(new_parity, T.i32())
+            new_exp = buffer_load(expected_res, idx, vec_width=1, dtype=T.i64()) + fx.Int64(addend)
             buffer_store(new_exp, expected_res, idx)
 
     return epoch_bump_kernel

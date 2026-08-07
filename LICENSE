@@ -48,6 +48,7 @@ Primus-Turbo uses or references the following third-party projects:
    - Repository: https://github.com/ROCm/FlyDSL.git
    - Note: the following files carry FlyDSL attribution and remain licensed under
      Apache-2.0 rather than the MIT license above:
+       primus_turbo/flydsl/utils/buffer_ops.py
        primus_turbo/flydsl/utils/gemm_helper.py
        primus_turbo/flydsl/gemm/gemm_fp8_kernel.py
        primus_turbo/flydsl/gemm/gemm_bf16_kernel.py
