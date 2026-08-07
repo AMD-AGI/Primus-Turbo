@@ -12,12 +12,9 @@ from primus_turbo.pytorch.core.backend import (
 )
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
-    Format,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp8_support,
-    float8_e4m3,
-    float8_e5m2,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -40,57 +37,16 @@ from primus_turbo.pytorch.ops.quantization import (
     grouped_quantize_fp8_with_trans,
     quantize_fp8_with_trans,
 )
+from primus_turbo.pytorch.ops.utils import (
+    _ensure_contiguous_grad_out,
+    _get_dummy_wgrad,
+    _get_fp8_dtype,
+    _setup_fused_grad_accum,
+)
 
 __all__ = [
     "grouped_gemm_fp8",
 ]
-
-
-def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
-    if format == Format.E4M3:
-        return float8_e4m3
-    elif format == Format.E5M2:
-        return float8_e5m2
-    elif format == Format.HYBRID:
-        return float8_e4m3 if is_fwd_stage else float8_e5m2
-    else:
-        raise ValueError(f"Unsupported FP8 format: {format}")
-
-
-def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
-    # Some upstream reductions can produce expanded zero-stride grad_out views.
-    # Custom grouped GEMM kernels expect dense layouts.
-    return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
-
-
-def _setup_fused_grad_accum(b, fuse_grad_accum_pattern: Optional[str]):
-    """Resolve the weight's gradient-accumulation buffer for the fused wgrad path.
-
-    Returns ``(enabled, main_grad)``. When enabled, the wgrad GEMM writes straight
-    into ``main_grad`` and the Function must return no gradient for ``b``.
-
-    Call this at the top of ``forward``: the flag has to be set while the weight
-    object is still in hand, because the backward pass only sees the saved tensors.
-    """
-    if fuse_grad_accum_pattern is None:
-        return False, None
-
-    assert fuse_grad_accum_pattern in ["megatron"], (
-        "Only megatron support gradient accumulation fusion currently"
-    )
-
-    assert hasattr(b, "grad_added_to_main_grad"), (
-        "b.grad_added_to_main_grad must be set up before the backward pass."
-    )
-    assert hasattr(b, "main_grad"), "b.main_grad must be set up before the backward pass."
-    assert isinstance(b.main_grad, torch.Tensor) and (b.main_grad.shape == b.shape), (
-        "b.main_grad must be a tensor with the same shape as b"
-    )
-
-    # Set in forward, not backward: autograd hands backward the saved tensors, not
-    # the parameter object that carries this attribute.
-    b.grad_added_to_main_grad = True
-    return True, b.main_grad
 
 
 def _grouped_gemm_fp8_variable_k_impl_wrapper(
@@ -131,8 +87,10 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     if not inplace_add_to_out:
         return grouped_gemm_fp8_variable_k_impl(*inputs, **options)
 
+    assert out is not None, "out should not be None when inplace_add_to_out is True"
     grouped_gemm_fp8_variable_k_accum_impl(*inputs, out=out, **options)
-    return None
+
+    return _get_dummy_wgrad(out.shape, out.dtype)
 
 
 class FP8GroupedGemmBlockFunc(torch.autograd.Function):
@@ -151,9 +109,9 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         num_cu: int | None,
-        fuse_grad_accum_pattern: Union[None, str] = None,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_grad_accmu, main_grad = _setup_fused_grad_accum(b, fuse_grad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size in [128], "Only block_size 128 is supported currently."
@@ -213,7 +171,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
-        ctx.fuse_grad_accmu = fuse_grad_accmu
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
         ctx.main_grad = main_grad
 
         return out
@@ -276,7 +234,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.TRITON.value,
-            inplace_add_to_out=ctx.fuse_grad_accmu,
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
         )
 
@@ -291,7 +249,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # num_cu
-            None,  # fuse_grad_accum_pattern
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -309,9 +267,9 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         num_cu: int | None,
-        fuse_grad_accum_pattern: Union[None, str] = None,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_grad_accmu, main_grad = _setup_fused_grad_accum(b, fuse_grad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         assert config.granularity == ScalingGranularity.ROWWISE
 
@@ -406,7 +364,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
-        ctx.fuse_grad_accmu = fuse_grad_accmu
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
         ctx.main_grad = main_grad
         return out
 
@@ -466,7 +424,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.TRITON.value,
-            inplace_add_to_out=ctx.fuse_grad_accmu,
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
         )
 
@@ -481,7 +439,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # num_cu
-            None,  # fuse_grad_accum_pattern
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -499,9 +457,9 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         num_cu: int | None,
-        fuse_grad_accum_pattern: Union[None, str] = None,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_grad_accmu, main_grad = _setup_fused_grad_accum(b, fuse_grad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
@@ -564,7 +522,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
-        ctx.fuse_grad_accmu = fuse_grad_accmu
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
         # Kept off save_for_backward on purpose: the wgrad GEMM writes into this
         # buffer in place, which would bump the version counter that saved tensors
         # are checked against.
@@ -616,7 +574,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.TRITON.value,
-            inplace_add_to_out=ctx.fuse_grad_accmu,
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
         )
 
@@ -631,7 +589,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # num_cu
-            None,  # fuse_grad_accum_pattern
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -661,9 +619,9 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         num_cu: int | None,
-        fuse_grad_accum_pattern: Union[None, str] = None,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_grad_accmu, main_grad = _setup_fused_grad_accum(b, fuse_grad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         supported_mxfp8_backend, reason = check_mxfp8_support()
         assert supported_mxfp8_backend, reason
@@ -788,7 +746,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
         ctx.total_m = total_m
-        ctx.fuse_grad_accmu = fuse_grad_accmu
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
         ctx.main_grad = main_grad
         return out
 
@@ -837,8 +795,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         grad_a = grad_a[: ctx.total_m]
 
         # wgrad: grad_b[g] = grad_out_col[g] @ a_col[g]^T  (variable-K over colwise-128 M_g)
-        # The fused path needs the beta=1 epilogue, which only Triton has; FlyDSL stays
-        # the default for the ordinary path where it is faster.
+        # The fused path needs the beta=1 epilogue, which FlyDSL lacks; it stays the
+        # default for the ordinary path where it is faster.
         grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             grad_out_t_fp8,
             a_fp8_col,
@@ -852,8 +810,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=(BackendType.TRITON.value if ctx.fuse_grad_accmu else BackendType.FLYDSL.value),
-            inplace_add_to_out=ctx.fuse_grad_accmu,
+            default_backend=(BackendType.TRITON.value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value),
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
@@ -868,7 +826,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # num_cu
-            None,  # fuse_grad_accum_pattern
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -891,7 +849,7 @@ def grouped_gemm_fp8(
     out_dtype: Union[torch.dtype, None] = None,
     config: Union[Float8QuantConfig, None] = None,
     num_cu: int | None = None,
-    fuse_grad_accum_pattern: Union[None, str] = None,
+    fuse_bgrad_accum_pattern: Union[None, str] = None,
 ) -> torch.Tensor:
     """Grouped GEMM with FP8 quantization.
 
@@ -947,7 +905,7 @@ def grouped_gemm_fp8(
             out_dtype,
             config,
             num_cu,
-            fuse_grad_accum_pattern,
+            fuse_bgrad_accum_pattern,
         )
     elif config.granularity == ScalingGranularity.ROWWISE:
         return FP8GroupedGemmRowFunc.apply(
@@ -961,7 +919,7 @@ def grouped_gemm_fp8(
             out_dtype,
             config,
             num_cu,
-            fuse_grad_accum_pattern,
+            fuse_bgrad_accum_pattern,
         )
     elif config.granularity == ScalingGranularity.BLOCKWISE:
         # BLOCKWISE accepts a pre-quantized 2D-block weight (``b``); the activation
@@ -978,7 +936,7 @@ def grouped_gemm_fp8(
             out_dtype,
             config,
             num_cu,
-            fuse_grad_accum_pattern,
+            fuse_bgrad_accum_pattern,
         )
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
         return FP8GroupedGemmMXFunc.apply(
@@ -992,7 +950,7 @@ def grouped_gemm_fp8(
             out_dtype,
             config,
             num_cu,
-            fuse_grad_accum_pattern,
+            fuse_bgrad_accum_pattern,
         )
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

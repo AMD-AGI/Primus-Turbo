@@ -831,7 +831,8 @@ def _process_variable_k_tile(
 
     # -- K-loop over M_g (variable per group, always masked) --
     loop_k = tl.cdiv(M_g, BLOCK_SIZE_K)
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc_dtype = tl.float32
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
     for k in range(loop_k):
         k_start = k * BLOCK_SIZE_K
@@ -888,7 +889,7 @@ def _process_variable_k_tile(
         # which is nearly free in the bandwidth-bound regime since the tile is
         # written anyway, and it removes the standalone accumulation kernel the
         # caller would otherwise have to launch over the whole output.
-        acc += tl.load(C_, mask=c_mask, other=0.0).to(tl.float32)
+        acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
     c = acc.to(C.type.element_ty)
     tl.store(C_, c, c_mask)
 

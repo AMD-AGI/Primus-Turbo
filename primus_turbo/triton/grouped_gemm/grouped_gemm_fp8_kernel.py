@@ -1136,7 +1136,7 @@ def _grouped_fp8_rowwise_variable_k_gemm_kernel(
         # Cast group_idx to int64 to prevent overflow in C group offset
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
         if BETA_IS_ONE:
-            acc += tl.load(C_, mask=c_mask, other=0.0).to(tl.float32)
+            acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
         c = acc.to(C.type.element_ty)
         tl.store(C_, c, c_mask)
 
@@ -1740,7 +1740,7 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
         c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
         if BETA_IS_ONE:
-            acc += tl.load(C_, mask=c_mask, other=0.0).to(tl.float32)
+            acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
         c = acc.to(C.type.element_ty)
         tl.store(C_, c, c_mask)
 
@@ -2388,7 +2388,8 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
         LS_BASE = LHS_scale + (sk0 + rks[:, None]) * stride_lsk + rm[None, :] * stride_lsm
         RS_BASE = RHS_scale + (sk0 + rks[:, None]) * stride_rsk + rn[None, :] * stride_rsm
 
-        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        acc_dtype = tl.float32
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         loop_k = M_g // BLOCK_SIZE_K  # padded → no mask
         for _ in range(loop_k):
             l = tl.load(tl.multiple_of(L_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)  # (BM, BK)
@@ -2406,7 +2407,7 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
         cmask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
         if BETA_IS_ONE:
-            acc += tl.load(C_, mask=cmask, other=0.0).to(tl.float32)
+            acc += tl.load(C_, mask=cmask, other=0.0).to(acc_dtype)
         c = acc.to(C.type.element_ty)
         tl.store(C_, c, cmask)
 

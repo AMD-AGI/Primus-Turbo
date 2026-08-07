@@ -4,19 +4,69 @@
 # See LICENSE for license information.
 ###############################################################################
 
+from typing import Optional, Union
+
 import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
-from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_impl
+from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_accum_impl, gemm_impl
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_impl,
+    grouped_gemm_variable_k_accum_impl,
     grouped_gemm_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
 )
+from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, _setup_fused_grad_accum
 
 __all__ = ["grouped_gemm"]
+
+
+def _bgrad_grouped_gemm_impl_wrapper(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    num_cu: int | None,
+    default_backend: int,
+    schedule: str = "static",
+    inplace_add_to_out: bool = False,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked to.
+
+    Returns the weight gradient for autograd, or a dummy buffer when the wgrad went
+    straight into ``out``: forward already flagged the weight, so the training
+    framework's own accumulation step stands down. Megatron still expects a tensor
+    rather than None there, so its backward hooks stay on the main thread; the
+    contents are never read. It is handed back in the weight's own dtype, since a
+    mismatch would make autograd allocate and cast a full-size copy.
+    """
+    inputs = (a, b, group_lens, group_offs)
+    options = dict(
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        num_cu=num_cu,
+        schedule=schedule,
+    )
+
+    if not inplace_add_to_out:
+        return grouped_gemm_variable_k_impl(*inputs, default_backend=default_backend, **options)
+
+    assert out is not None, "out should not be None when inplace_add_to_out is True"
+    # Name a backend that carries the beta=1 epilogue as the default, rather than
+    # letting the dispatcher fall back to it and log a spurious "may hurt performance"
+    # warning. Backends without the epilogue still report it as unsupported, which
+    # keeps an explicitly pinned backend or auto-tune from silently landing somewhere
+    # that ignores `out`.
+    grouped_gemm_variable_k_accum_impl(*inputs, default_backend=BackendType.TRITON.value, out=out, **options)
+
+    return _get_dummy_wgrad(out.shape, b.dtype)
 
 
 class GroupedGemmFunc(torch.autograd.Function):
@@ -30,7 +80,9 @@ class GroupedGemmFunc(torch.autograd.Function):
         trans_b: bool,
         num_cu: int | None,
         schedule: str = "static",
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
         if len(group_lens) == 1:
             assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
             b_2d = b.squeeze(0)
@@ -55,6 +107,8 @@ class GroupedGemmFunc(torch.autograd.Function):
         ctx.trans_b = trans_b
         ctx.num_cu = num_cu
         ctx.schedule = schedule
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        ctx.main_grad = main_grad
         return out
 
     @staticmethod
@@ -75,15 +129,30 @@ class GroupedGemmFunc(torch.autograd.Function):
                 ctx.trans_a,
                 default_backend=BackendType.HIPBLASLT.value,
             )
-            grad_b = gemm_impl(
-                a,
-                True,
-                grad_out,
-                False,
-                b.dtype,
-                ctx.trans_b,
-                default_backend=BackendType.HIPBLASLT.value,
-            ).view(b.size())
+            if ctx.fuse_bgrad_accum:
+                # main_grad matches b's [1, ...] shape; the dense GEMM writes 2D, and
+                # squeeze(0) is a view so the accumulation lands in the real buffer.
+                gemm_accum_impl(
+                    a,
+                    True,
+                    grad_out,
+                    False,
+                    b.dtype,
+                    ctx.trans_b,
+                    out=ctx.main_grad.squeeze(0),
+                    default_backend=BackendType.TRITON.value,
+                )
+                grad_b = _get_dummy_wgrad(b.shape, b.dtype)
+            else:
+                grad_b = gemm_impl(
+                    a,
+                    True,
+                    grad_out,
+                    False,
+                    b.dtype,
+                    ctx.trans_b,
+                    default_backend=BackendType.HIPBLASLT.value,
+                ).view(b.size())
         else:
             grad_a = grouped_gemm_impl(
                 grad_out,
@@ -96,7 +165,7 @@ class GroupedGemmFunc(torch.autograd.Function):
                 default_backend=BackendType.TRITON.value,
                 schedule=ctx.schedule,
             )
-            grad_b = grouped_gemm_variable_k_impl(
+            grad_b = _bgrad_grouped_gemm_impl_wrapper(
                 a,
                 grad_out,
                 group_lens,
@@ -107,8 +176,10 @@ class GroupedGemmFunc(torch.autograd.Function):
                 num_cu=ctx.num_cu,
                 default_backend=BackendType.TRITON.value,
                 schedule=ctx.schedule,
+                inplace_add_to_out=ctx.fuse_bgrad_accum,
+                out=ctx.main_grad,
             )
-        return grad_a, grad_b, None, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None, None
 
 
 def grouped_gemm(
@@ -119,6 +190,7 @@ def grouped_gemm(
     trans_b: bool = False,
     num_cu: int | None = None,
     schedule: str = "static",
+    fuse_bgrad_accum_pattern: Union[None, str] = None,
 ) -> torch.Tensor:
     """
     Grouped GEMM.
@@ -144,6 +216,12 @@ def grouped_gemm(
               sub-modes are not exposed at this layer; tune via the kernel-
               level entry points when needed. Requires ``num_cu=None`` (see
               ``num_cu`` above).
+        fuse_bgrad_accum_pattern (str | None): Enables fusing the weight-gradient
+            accumulation into the wgrad GEMM epilogue, so backward writes
+            ``b.main_grad`` directly instead of returning a gradient the framework
+            then adds. ``"megatron"`` is the only supported pattern; ``b`` must
+            carry ``main_grad`` / ``grad_added_to_main_grad``. Defaults to None
+            (no fusion).
 
     Returns:
         torch.Tensor: Output of shape [sum(group_lens), N], same dtype/device as `a`.
@@ -176,4 +254,5 @@ def grouped_gemm(
         trans_b,
         num_cu,
         schedule,
+        fuse_bgrad_accum_pattern,
     )

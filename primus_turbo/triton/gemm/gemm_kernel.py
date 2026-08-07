@@ -141,7 +141,14 @@ def _bf16_persistent_gemm_kernel(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    BETA_IS_ONE: tl.constexpr = False,
 ):
+    """Persistent BF16/FP16 GEMM.
+
+    With ``BETA_IS_ONE=True`` each tile is accumulated into whatever ``C`` already
+    holds (``C += op(A) @ op(B)``) instead of overwriting it, which is the
+    ``D = beta*D + alpha*A*B`` pattern with beta=1.
+    """
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
@@ -229,7 +236,6 @@ def _bf16_persistent_gemm_kernel(
             b = tl.load(B_BASE, mask=b_mask_k, other=0.0, cache_modifier=CACHE_MODIFIER_B)
             acc += tl.dot(a, b, allow_tf32=ALLOW_TF32)
 
-        c = acc.to(C.type.element_ty)
         c_mask = (rm_raw[:, None] < M) & (rn_raw[None, :] < N)
         rm_s = rm_raw % M
         rn_s = rn_raw % N
@@ -238,6 +244,14 @@ def _bf16_persistent_gemm_kernel(
         if EVEN_N:
             rn_s = tl.max_contiguous(tl.multiple_of(rn_s, BLOCK_SIZE_N), BLOCK_SIZE_N)
         C_ = C + rm_s[:, None].to(tl.int64) * stride_cm + rn_s[None, :].to(tl.int64) * stride_cn
+        if BETA_IS_ONE:
+            # Read the previous value of this tile and fold it into the FP32
+            # accumulator before the cast. Costs one extra HBM read per output tile,
+            # which is nearly free in the bandwidth-bound regime since the tile is
+            # written anyway, and it removes the standalone accumulation kernel the
+            # caller would otherwise launch over the whole output.
+            acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
+        c = acc.to(C.type.element_ty)
         tl.store(C_, c, c_mask)
 
 
@@ -254,13 +268,15 @@ def gemm_triton_kernel(
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
+    beta: float = 0.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """General-purpose BF16/FP16 GEMM using optimized persistent kernel.
 
     Uses offline heuristic for block sizes / NUM_SMS, then origami analytical
     model to override GROUP_SIZE_M and cache modifiers.
 
-    Computes: C = op(A) @ op(B), where op(X) = X^T if trans else X.
+    Computes: C = beta * C + op(A) @ op(B), where op(X) = X^T if trans else X.
     If trans_c=True, returns C^T (contiguous, shape N×M).
 
     Args:
@@ -268,8 +284,18 @@ def gemm_triton_kernel(
         b: Input matrix (BF16 or FP16).
         trans_a: Whether A is transposed.
         trans_b: Whether B is transposed.
-        out_dtype: Output dtype (default bfloat16).
+        out_dtype: Output dtype (default bfloat16). Ignored when ``out`` is given,
+            since the kernel then writes in whatever dtype ``out`` has.
         trans_c: If True, return transposed output C^T (shape N×M).
+        beta: Either ``0.0`` (overwrite, the default) or ``1.0`` (accumulate:
+            ``out += op(A) @ op(B)``); no other value is supported. ``beta=1.0``
+            requires ``out`` and folds the accumulation into the GEMM epilogue,
+            removing the separate elementwise add the caller would otherwise run
+            over the whole output.
+        out: Optional pre-allocated output buffer, shape (N, M) if ``trans_c``
+            else (M, N). When given, the kernel writes (or accumulates, see
+            ``beta``) into it instead of allocating. Strides are read off the
+            tensor, so non-contiguous views are fine.
 
     Returns:
         C of shape (M, N) if trans_c=False, or (N, M) if trans_c=True.
@@ -300,12 +326,19 @@ def gemm_triton_kernel(
         B_view = B_view.contiguous()
 
     # Handle trans_c by writing to a (N, M) buffer with swapped strides
+    out_shape = (N, M) if trans_c else (M, N)
+    assert beta in (0.0, 1.0), f"Only beta=0 (overwrite) or beta=1 (accumulate) supported, got {beta}"
+    if out is None:
+        assert beta == 0.0, "beta=1.0 requires an explicit `out` buffer to accumulate into"
+        out = torch.empty(out_shape, device=a.device, dtype=out_dtype)
+    else:
+        assert tuple(out.shape) == out_shape, f"out shape {tuple(out.shape)} must equal {out_shape}"
+        assert out.device == a.device, "out must be on same device as a"
+
     if trans_c:
-        out = torch.empty((N, M), device=a.device, dtype=out_dtype)
         stride_cm = out.stride(1)  # = 1
         stride_cn = out.stride(0)  # = M
     else:
-        out = torch.empty((M, N), device=a.device, dtype=out_dtype)
         stride_cm = out.stride(0)  # = N
         stride_cn = out.stride(1)  # = 1
 
@@ -436,6 +469,7 @@ def gemm_triton_kernel(
         B_LOAD_ALIGNED=b_load_aligned,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        BETA_IS_ONE=(beta == 1.0),
         num_warps=8,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,

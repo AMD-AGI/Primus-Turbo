@@ -1229,7 +1229,7 @@ def test_grouped_gemm_fp8_padded_tail_zeroed(ori_dtype, trans_b, backend):
 
 
 def _run_grouped_gemm_fp8_fused_grad_accum_test(B, M, N, K, ori_dtype, granularity, trans_b):
-    """``fuse_grad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
+    """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
 
     The fused path hands the weight's ``main_grad`` to the wgrad GEMM as a beta=1
     accumulate target instead of returning a gradient for autograd to add on top, so
@@ -1292,7 +1292,7 @@ def _run_grouped_gemm_fp8_fused_grad_accum_test(B, M, N, K, ori_dtype, granulari
         group_lens,
         trans_b=trans_b,
         config=config,
-        fuse_grad_accum_pattern="megatron",
+        fuse_bgrad_accum_pattern="megatron",
     )
     out_fused.backward(grad_out)
     torch.cuda.synchronize()

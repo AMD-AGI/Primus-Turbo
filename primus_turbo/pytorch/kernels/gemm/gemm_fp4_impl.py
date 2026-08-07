@@ -76,6 +76,8 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        inplace_add_to_out: bool = False,
+        **kwargs,
     ) -> bool:
         # HipBLASLt vendor wrapper has no preshuffle plumbing (see
         # csrc/kernels/gemm/hipblaslt_gemm.cu) and would silently produce
@@ -84,6 +86,8 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
             return False
 
         supported = True
+        # TODO: this backend has no beta=1 accumulate epilogue yet.
+        supported &= not inplace_add_to_out
         # check ScalingGranularity
         supported &= granularity in GEMMFP4HipBLASLtBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -153,9 +157,13 @@ class GEMMFP4AITERBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        inplace_add_to_out: bool = False,
+        **kwargs,
     ) -> bool:
         del preshuffled  # AITER handles both layouts
         supported = True
+        # TODO: this backend has no beta=1 accumulate epilogue yet.
+        supported &= not inplace_add_to_out
         # check ScalingGranularity
         supported &= granularity in GEMMFP4AITERBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -235,6 +243,8 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        inplace_add_to_out: bool = False,
+        **kwargs,
     ) -> bool:
 
         # No path for AITER-preshuffled inputs (this backend preshuffles raw E8M0 itself).
@@ -242,6 +252,8 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
             return False
 
         supported = True
+        # TODO: this backend has no beta=1 accumulate epilogue yet.
+        supported &= not inplace_add_to_out
         # gfx950 (CDNA4) only: mfma_scale_f32_16x16x128_f8f6f4 is absent below.
         supported &= get_device_compute_capability() >= (9, 5)
         supported &= granularity in GEMMFP4FlyDSLBackend.SUPPORTED_GRANULARITIES
@@ -357,3 +369,86 @@ def gemm_fp4_impl_meta(
     if trans_c:
         m, n = n, m
     return torch.empty(m, n, dtype=out_dtype, device=a.device)
+
+
+@_torch_custom_op_wrapper("primus_turbo::gemm_fp4_accum_impl", mutates_args={"out"}, device_types="cuda")
+def gemm_fp4_accum_impl(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    granularity: int,
+    out: torch.Tensor,
+    default_backend: int,
+    preshuffled: bool = False,
+) -> None:
+    """Dense FP4 GEMM that accumulates into ``out`` instead of returning.
+
+    Computes ``out += op(A) @ op(B)``, folding the accumulation into the GEMM
+    epilogue (beta=1) so the caller does not have to run a separate elementwise add
+    over the whole weight-gradient buffer.
+
+    Split out from :func:`gemm_fp4_impl` rather than added as a flag on it because a
+    ``torch.library`` custom op may not return a tensor that aliases one of its
+    inputs; this one mutates ``out`` and returns nothing.
+
+    A backend without the beta=1 epilogue reports ``inplace_add_to_out`` as
+    unsupported in ``can_handle``, so the dispatcher routes to one that has it rather
+    than landing somewhere that would quietly ignore ``out``. None of the FP4 backends
+    carries that epilogue yet, so the dispatch below raises until one does; the
+    plumbing is otherwise complete.
+    """
+    default_backend_enum = BackendType(default_backend)
+    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.FP4)
+    granularity_enum = ScalingGranularity(granularity)
+
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scale_inv=a_scale_inv,
+        b_scale_inv=b_scale_inv,
+        out_dtype=out_dtype,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        granularity=granularity_enum,
+        preshuffled=preshuffled,
+        inplace_add_to_out=True,
+        out=out,
+    )
+
+    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
+    # the caller's buffer would accumulate the wgrad once per warmup and timing
+    # iteration. Prime the cache on a scratch buffer first: the tune key ignores `out`,
+    # so the dispatch below hits that cache and runs exactly once on the real buffer.
+    # Zeroed, not empty -- beta=1 reads the buffer back and NaNs would skew the timings.
+    if GlobalBackendManager.auto_tune_enabled() and not GEMMFP4KernelDispatcher._is_graph_capturing():
+        GEMMFP4KernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+
+    GEMMFP4KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+
+
+@gemm_fp4_accum_impl.register_fake
+def gemm_fp4_accum_impl_meta(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    granularity: int,
+    out: torch.Tensor,
+    default_backend: int,
+    preshuffled: bool = False,
+) -> None:
+    m, n, _ = get_gemm_logical_shape(a, b, trans_a, trans_b)
+    if trans_c:
+        m, n = n, m
+    assert tuple(out.shape) == (m, n), f"out shape {tuple(out.shape)} must equal {(m, n)}"
+    return None
