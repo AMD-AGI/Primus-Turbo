@@ -75,14 +75,19 @@ class GroupedGemmFunc(torch.autograd.Function):
                 ctx.trans_a,
                 default_backend=BackendType.HIPBLASLT.value,
             )
-            grad_b = gemm_impl(
+            # wgrad reduces over M, so it must stop at group_offs: under
+            # sync-free MoE `a` is worst-case allocated and its tail rows are
+            # uninitialized. A dense GEMM here folds that garbage into grad_b.
+            grad_b = grouped_gemm_variable_k_impl(
                 a,
-                True,
                 grad_out,
-                False,
-                b.dtype,
-                ctx.trans_b,
-                default_backend=BackendType.HIPBLASLT.value,
+                group_lens,
+                group_offs,
+                trans_a=not ctx.trans_a,
+                trans_b=False,
+                trans_c=ctx.trans_b,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.TRITON.value,
             ).view(b.size())
         else:
             grad_a = grouped_gemm_impl(
