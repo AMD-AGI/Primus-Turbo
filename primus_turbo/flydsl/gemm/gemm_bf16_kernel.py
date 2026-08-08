@@ -1066,6 +1066,10 @@ def _compile_grouped_variable_k_bf16(
 _COMPILED_GROUPED_GEMM_CACHE = {}
 
 
+def _ptr_only_view(t: torch.Tensor) -> torch.Tensor:
+    return t.contiguous().view(torch.int32)
+
+
 def grouped_gemm_variable_k_bf16(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1104,13 +1108,9 @@ def grouped_gemm_variable_k_bf16(
         out_fp16=out_fp16,
         trans_c=trans_c,
     )
-    # Pass operands as an int32 view: the kernel only reads their base pointer (rebased
-    # by byte offsets in make_bf16_buffer_tensor_rebased), so dtype is irrelevant, while
-    # halving the element count keeps the flyc CABI 32-bit numel field from overflowing
-    # on production pools (>2^31 bf16 elems).
     args = (
-        a.contiguous().view(torch.int32).view(-1),
-        b.contiguous().view(torch.int32).view(-1),
+        _ptr_only_view(a),
+        _ptr_only_view(b),
         out.view(-1),
         offsets_i64,
         masked_k_i64,

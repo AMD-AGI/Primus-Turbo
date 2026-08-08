@@ -465,7 +465,7 @@ def dispatch_only(
     assert x.dtype == torch.bfloat16
     hidden_size = x.size(1)
     pool_capacity = symm.num_max_pool_tokens
-    x_i32 = x.contiguous().view(torch.int32).view(-1)
+    x_i32 = x.contiguous().view(torch.int32)
     launch = _compile_dispatch_only(
         hidden_size,
         pool_capacity,

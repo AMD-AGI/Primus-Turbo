@@ -496,7 +496,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     hidden_size = x.size(1)
     num_max_pool_tokens = int(symm.num_max_pool_tokens)
     dummy_i32 = get_dummy_tensor()
-    x_i32 = x.contiguous().view(torch.int32).view(-1)
+    x_i32 = x.contiguous().view(torch.int32)
 
     assert layout in ("nt", "nn", "tn"), f"unsupported layout {layout}"
     out_fp16 = out_dtype == torch.float16
