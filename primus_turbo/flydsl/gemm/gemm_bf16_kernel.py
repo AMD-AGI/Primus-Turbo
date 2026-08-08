@@ -646,7 +646,9 @@ def _get_compiled_dense(launch, args):
         elif isinstance(a, int):
             key_parts.append(a)
         else:
-            key_parts.append(type(a).__name__)
+            # static-memref JitArgs bake shape into the IR, so shape must be in the key
+            shape = getattr(a, "shape", None)
+            key_parts.append((type(a).__name__, tuple(shape) if shape is not None else None))
     key = tuple(key_parts)
     cached = _COMPILED_DENSE_CACHE.get(key)
     if cached is None:
@@ -1111,7 +1113,7 @@ def grouped_gemm_variable_k_bf16(
     args = (
         _ptr_only_view(a),
         _ptr_only_view(b),
-        out.view(-1),
+        flyc.from_torch_tensor(out),
         offsets_i64,
         masked_k_i64,
         OUT_M,
