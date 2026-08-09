@@ -60,9 +60,7 @@ class TokenDispatcher:
         routing_map: Optional[torch.Tensor] = None,
         indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_states, probs = self._pre_dispatch(
-            hidden_states, probs, routing_map, indices
-        )
+        hidden_states, probs = self._pre_dispatch(hidden_states, probs, routing_map, indices)
         dispatched_tokens, dispatched_probs = self._exec_dispatch(hidden_states, probs)
         dispatched_input, tokens_per_expert, permuted_probs = self._post_dispatch(
             dispatched_tokens, dispatched_probs
@@ -110,8 +108,9 @@ class TokenDispatcher:
 class DeepEPTokenDispatcher(TokenDispatcher):
     """Dispatch tokens to experts (autograd combines gradients on backward).
 
-    ``tokens_per_expert`` comes from ``moe_permute`` so the count reflects
-    ``pad_multiple`` padding.
+    ``tokens_per_expert`` always reflects ``pad_multiple`` padding. On the host
+    path it is derived from DeepEP's already-synced counts instead of
+    ``moe_permute``'s, which avoids a second device sync.
 
     Fully nosync / CUDA-graph capturable requires all three:
     ``deepep_num_worst_tokens > 0``, ``permute_max_token_num > 0``,
@@ -124,7 +123,9 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         permute_fusion: deprecated; ``moe_permute`` is always fused.
         pad_multiple: pad per-expert permuted count to this multiple
             (set to grouped-GEMM ``BLOCK_M``).
-        permute_max_token_num: caller-provided cap; ``> 0`` removes the sum-item host sync.
+        permute_max_token_num: caller-provided cap; ``> 0`` removes the sum-item
+            host sync. Only consulted when DeepEP returns no host counts
+            (``deepep_num_worst_tokens > 0``).
         deepep_use_comm_stream: when False, pin EP kernels to the current stream.
         deepep_num_worst_tokens: ``> 0`` enables worst-case allocation mode.
         deepep_use_cuda_num_tokens_per_expert: keep ``tokens_per_expert`` on device.
@@ -187,10 +188,11 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         self.deepep_async_finish = deepep_async_finish
         self.deepep_allocate_on_comm_stream = deepep_allocate_on_comm_stream
-        self.deepep_use_cuda_num_tokens_per_expert = (
-            deepep_use_cuda_num_tokens_per_expert
-        )
+        self.deepep_use_cuda_num_tokens_per_expert = deepep_use_cuda_num_tokens_per_expert
         self.deepep_num_worst_tokens = deepep_num_worst_tokens
+
+        # (tensor, value, device) row bound reused across steps; see _row_bound.
+        self._row_bound_cache = None
 
         set_buffer_global_config(
             num_use_cu=deepep_num_use_cu,
@@ -241,9 +243,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                     )
                     * self.num_local_experts
                 )
-                token_indices = (base.unsqueeze(-1) + tp_offsets).reshape(
-                    num_tokens, -1
-                )
+                token_indices = (base.unsqueeze(-1) + tp_offsets).reshape(num_tokens, -1)
             token_probs = probs.gather(1, token_indices)
         elif routing_map is not None:
             warnings.warn(
@@ -259,9 +259,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 .reshape(num_tokens, self.tp_expanded_num_experts)
             ).contiguous()
             # Stable descending sort puts True first; mask short rows with -1.
-            _, sorted_expert_ids = routing_map.to(torch.int8).sort(
-                dim=-1, descending=True, stable=True
-            )
+            _, sorted_expert_ids = routing_map.to(torch.int8).sort(dim=-1, descending=True, stable=True)
             token_indices = sorted_expert_ids[:, : self.router_topk]
             valid = routing_map.gather(1, token_indices).to(torch.bool)
             token_probs = probs.gather(1, token_indices).masked_fill(~valid, 0.0)
@@ -283,12 +281,12 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 warnings.warn("DeepEP only supports float32 probs!")
             token_probs = token_probs.float()
 
-        # Discard DeepEP's tokens_per_expert; moe_permute's count includes pad_multiple.
+        # DeepEP already synced to build these host counts; reuse them in _post_dispatch.
         (
             hidden_states,
             dispatched_indices,
             dispatched_probs,
-            self.deep_ep_tokens_per_expert,
+            tokens_per_expert,
             handle,
         ) = turbo.ops.moe_dispatch(
             hidden_states,
@@ -302,100 +300,80 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         )
 
         self.handle = handle
+        self.tokens_per_expert = tokens_per_expert
         self.dispatched_indices = dispatched_indices
 
         return hidden_states, dispatched_probs
 
     def _post_dispatch(self, hidden_states, dispatched_probs):
-        self.use_legacy_triton_permute = self.pad_multiple == 0
-        reuse_deep_ep_cpu_tpe = (
-            not self.deepep_use_cuda_num_tokens_per_expert
-            and self.use_legacy_triton_permute
-            and self.deep_ep_tokens_per_expert.numel() > 0
-        )
-        if (
-            self.use_legacy_triton_permute
-            and self.deep_ep_tokens_per_expert.numel() > 0
-        ):
-            num_permuted_tokens = int(self.deep_ep_tokens_per_expert.sum().item())
+        # Empty when num_worst_tokens > 0; DeepEP skips the host count then.
+        if self.tokens_per_expert.numel() > 0:
+            if self.pad_multiple > 0:
+                # moe_permute rounds each expert's count up to pad_multiple.
+                self.tokens_per_expert = (
+                    (self.tokens_per_expert + self.pad_multiple - 1) // self.pad_multiple
+                ) * self.pad_multiple
+            num_permuted_tokens = int(self.tokens_per_expert.sum().item())
         elif self.permute_max_token_num > 0:
             num_permuted_tokens = self.permute_max_token_num
         else:
+            # Will cause a cpu sync at permute phase.
             num_permuted_tokens = -1
 
         self.hidden_shape_before_permute = hidden_states.shape
-        assert (
-            dispatched_probs.dtype == torch.float32
-        ), "DeepEP only supports float32 probs"
+        assert dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
 
-        if self.use_legacy_triton_permute:
-            self.dispatched_routing_map, dispatched_probs = (
-                turbo.ops.indices_to_multihot(
-                    self.dispatched_indices,
-                    dispatched_probs,
-                    self.num_local_experts,
-                    fused=True,
-                )
-            )
-            (
-                hidden_states,
-                permuted_probs,
-                self.reversed_mapping_for_combine,
-                tokens_per_expert,
-            ) = turbo.ops.token_permute(
-                hidden_states,
-                num_out_tokens=num_permuted_tokens,
-                routing_map=self.dispatched_routing_map,
-                probs=dispatched_probs,
-                fused=True,
-                return_tokens_per_expert=(
-                    self.deepep_use_cuda_num_tokens_per_expert
-                    or num_permuted_tokens == -1
-                ),
-            )
-        else:
-            (
-                hidden_states,
-                self.row_id_map,
-                tokens_per_expert,
-                _,
-                self.num_dispatched_token_tensor,
-                _,
-                permuted_probs,
-            ) = turbo.ops.moe_permute(
-                hidden_states,
-                self.dispatched_indices,
-                num_local_experts=self.num_local_experts,
-                num_topk=self.router_topk,
-                pad_multiple=self.pad_multiple,
-                num_permuted_tokens=num_permuted_tokens,
-                probs=dispatched_probs,
-                probs_layout="topk",
-            )
+        (
+            hidden_states,
+            self.row_id_map,
+            tokens_per_expert,
+            _,
+            _,
+            permuted_probs,
+        ) = turbo.ops.moe_permute(
+            hidden_states,
+            topk_indices=self.dispatched_indices,
+            num_local_experts=self.num_local_experts,
+            num_topk=self.router_topk,
+            pad_multiple=self.pad_multiple,
+            num_permuted_tokens=num_permuted_tokens,
+            probs=dispatched_probs,
+            probs_layout="topk",  # dispatched_probs is [num_dispatched, router_topk]
+        )
 
         if not self.deepep_use_cuda_num_tokens_per_expert:
-            if reuse_deep_ep_cpu_tpe:
-                tokens_per_expert = self.deep_ep_tokens_per_expert
+            if self.tokens_per_expert.numel() > 0:
+                tokens_per_expert = self.tokens_per_expert
             else:
                 tokens_per_expert = tokens_per_expert.cpu()
 
-        self.deep_ep_tokens_per_expert = None
+        self.tokens_per_expert = None
         return hidden_states, tokens_per_expert, permuted_probs
 
-    def _pre_combine(self, hidden_states):
-        if self.use_legacy_triton_permute:
-            return turbo.ops.token_unpermute(
-                hidden_states,
-                self.reversed_mapping_for_combine,
-                restore_shape=self.hidden_shape_before_permute,
-                routing_map=self.dispatched_routing_map,
-                fused=True,
-            )
+    def _row_bound(self, num_dispatched, device):
+        """Device-side row bound, cached because DeepEP's recv height is stable.
 
+        moe_unpermute saves it for its own backward, so one cached tensor covers
+        both directions and no allocation happens on the steady-state path.
+        """
+        cached = self._row_bound_cache
+        # Compare the requested device, not the tensor's: "cuda" != "cuda:0".
+        if cached is None or cached[1] != num_dispatched or cached[2] != device:
+            cached = (
+                torch.full((1,), num_dispatched, dtype=torch.int32, device=device),
+                num_dispatched,
+                device,
+            )
+            self._row_bound_cache = cached
+        return cached[0]
+
+    def _pre_combine(self, hidden_states):
+        # Row bound is DeepEP's recv height (== restore_shape[0]), not moe_permute's.
+        num_dispatched = int(self.hidden_shape_before_permute[0])
         hidden_states, _ = turbo.ops.moe_unpermute(
             hidden_states,
             self.row_id_map,
-            self.num_dispatched_token_tensor,
+            self._row_bound(num_dispatched, hidden_states.device),
             restore_shape=self.hidden_shape_before_permute,
             num_local_experts=self.num_local_experts,
             pad_multiple=self.pad_multiple,
@@ -415,7 +393,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.row_id_map = None
         self.dispatched_indices = None
         self.token_indices = None
-        self.num_dispatched_token_tensor = None
         return hidden_states
 
     def _post_combine(self, hidden_states):
