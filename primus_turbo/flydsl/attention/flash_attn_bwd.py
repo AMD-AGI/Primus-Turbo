@@ -45,7 +45,6 @@ _DKDV_AGPR = 0
 # band-ascending fp32 order (deterministic, no atomics), exactly like dk/dv's q_split.
 _FUSE_DQ = True
 
-
 def _llvm_value(value):
     if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
         return value.ir_value()
@@ -82,6 +81,26 @@ def _cached_launch(cache, jit_fn, hints, args, kwargs):
                 fn = flyc.compile(jit_fn, *args)
         cache[key] = fn
     return fn(*args)
+
+
+def _if_wave(cond, vals, then_fn, else_fn):
+    """scf.if threading ``vals`` through both arms, for a wave-uniform ``cond``.
+
+    Built directly rather than with a traced ``if``: the tracer only carries plain
+    named variables across a dynamic branch, and these are lists of accumulators.
+    """
+    from flydsl._mlir.dialects import scf
+
+    _v = [_raw(v) for v in vals]
+    op = scf.IfOp(_raw(cond), [x.type for x in _v], has_else=True)
+    with ir.InsertionPoint(op.regions[0].blocks[0]):
+        scf.YieldOp([_raw(x) for x in then_fn()])
+    if not op.regions[1].blocks:
+        op.regions[1].blocks.append()
+    with ir.InsertionPoint(op.regions[1].blocks[0]):
+        else_fn()
+        scf.YieldOp(_v)
+    return list(op.results)
 
 
 def dtype_to_elem_type(dtype_str):
@@ -677,6 +696,10 @@ def build_flash_attn_bwd_dkdv_module(
     # occupancy stays at 2 waves per SIMD either way. It is not a lever here.
     waves_per_eu=2,
     block_kv=128,
+    # block_q: q rows staged per q-loop trip (None = _BWD_BLOCK_Q). Under a left window a
+    # band's q extent is exactly BLOCK_KV + W rows, so a block_q that divides it walks the
+    # SAME (kv,q) area in fewer staging trips -- 96 covers 64+128 in two instead of three.
+    block_q=None,
     num_kv_heads=None,
     unsafe_fp_math=True,
     fast_fp_math=True,
@@ -750,6 +773,9 @@ def build_flash_attn_bwd_dkdv_module(
     q_pref=False,
     # g3_defer: run GEMM3 one head-step late off a second dS slot. See G3_DEFER.
     g3_defer=True,
+    # g2_half: flush GEMM2 per q-half instead of once per q-loop trip (None = fused only).
+    # It shortens the pack live ranges, which is what lets BLOCK_Q grow past 64. See G2_HALF.
+    g2_half=None,
     # qsp_lo/n_qsp: dispatch only the q_split sub-range [qsp_lo, qsp_lo+n_qsp) instead of
     # all q_split subsets. A split owns the q blocks with (q/BLOCK_Q) % q_split == split
     # in EVERY band, so a sub-range launch completes those q rows' dQ partials outright
@@ -794,7 +820,7 @@ def build_flash_attn_bwd_dkdv_module(
         num_kv_heads = num_heads
     assert num_heads % num_kv_heads == 0
 
-    BLOCK_Q = _BWD_BLOCK_Q
+    BLOCK_Q = _BWD_BLOCK_Q if block_q is None else int(block_q)
     WARP_SIZE = 64
     NUM_XCD = 8  # gfx950 XCDs; the dispatcher hands block_id to xcd = block_id % NUM_XCD
     BLOCK_KV = block_kv
@@ -892,20 +918,41 @@ def build_flash_attn_bwd_dkdv_module(
     # intrinsic path: forcing it on (alone or duplicated after GEMM1b) loses there, since
     # the default placement of this body's MFMA runs is already a local optimum.
     SCHED_TRANS = 0x400  # LLVM SchedGroupMask: TRANS (v_exp)
-    # EXP_IGLP: hand the head-step region to LLVM's MFMAExpInterleave IGLP strategy.
-    # At one wave/SIMD there is no sibling wave to hide exp2 latency under, so the
-    # MFMA/exp interleave must come from the scheduler, not by hand -- every hand-forced
-    # attempt (sched_group_barrier, splitting dP, deferring GEMM2/GEMM3) either extends a
-    # live range across an MFMA run or gets undone by LLVM re-hoisting. Emitted once per
-    # q-half (not once per head-step): that call count is the register sweet spot that
-    # keeps the co-resident dQ reduce wave alive (see _dq_partial_ws). Gated to
-    # NUM_WAVES == 4; at eight waves the sibling wave already covers the same latency.
-    EXP_IGLP = FUSE_DQ and bool(exp_iglp) and NUM_WAVES == 4
+    # EXP_IGLP: at one wave/SIMD there's no sibling wave to hide exp2 latency under, so
+    # hand the head-step region to LLVM's MFMAExpInterleave IGLP strategy instead of
+    # hand-placed barriers. Gated to NUM_WAVES == 4 (see _dq_partial_ws for the call count).
+    EXP_IGLP = bool(exp_iglp) and FUSE_DQ and NUM_WAVES == 4
     IGLP_EXP_INTERLEAVE = 2  # LLVM IGLPStrategyID::MFMAExpInterleaveID
-    # G2_HALF: run GEMM2 once per q-half instead of once per head-step (fused body only;
-    # the split bodies keep the single call so their ISA stays byte-identical). See the
-    # emission point in _head_step_lds for what it buys and what it does not.
-    G2_HALF = FUSE_DQ
+    # G2_HALF: run GEMM2 once per q-half instead of once per head-step. Fused-only -- the
+    # split bodies keep the single call so their ISA stays byte-identical; see the
+    # emission point in _head_step_lds for what it buys.
+    G2_HALF = FUSE_DQ if g2_half is None else bool(g2_half)
+    # Q_PAIR: a windowed band's two waves attend q ranges staggered by one half-tile, so
+    # walking contiguous tiles wastes a half-tile per wave. Stage the band's FIRST and LAST
+    # q-half together (each wave takes its own half); trip count becomes compile-time NB.
+    Q_PAIR = (
+        window_left >= 0
+        and not fuse_dq
+        and ENABLE_DMA
+        and not q_dbuf
+        and not bool(q_pref)
+        and not bool(pf_ring)
+        and Q_SPLIT == 1
+        and NUM_WAVES == 2
+        and PV_K_STEPS == 2
+        and BLOCK_Q // 2 == PV_K_STEP
+        # wave 1's first attended q row is the second half-tile's first row ...
+        and ROWS_PER_WAVE_KV == BLOCK_Q // 2
+        # ... and wave 0's last one is the last row before the extent's final half-tile.
+        and (BLOCK_KV + window_left) % BLOCK_Q == 0
+        and (BLOCK_KV + window_left) // BLOCK_Q >= 2
+        and ROWS_PER_WAVE_KV + window_left <= BLOCK_KV + window_left - BLOCK_Q // 2
+    )
+    Q_PAIR_NB = ((BLOCK_KV + window_left) // BLOCK_Q) if Q_PAIR else 0
+    # Q_BOUND: the windowed q-loop grid is BLOCK_KV-aligned, not BLOCK_Q-aligned, so when
+    # BLOCK_Q doesn't divide BLOCK_KV (or Q_PAIR fixes the trip count at NB) the band
+    # nearest the sequence end walks past real rows and needs an explicit mask term.
+    Q_BOUND = window_left >= 0 and (BLOCK_KV % BLOCK_Q != 0 or Q_PAIR)
     # s_waitcnt SIMM16 selecting lgkmcnt(0) alone: vmcnt/expcnt stay at their maxima, so the
     # wait retires the LDS traffic without also retiring in-flight global stores.
     WAIT_LGKM = 0xC07F
@@ -992,8 +1039,9 @@ def build_flash_attn_bwd_dkdv_module(
     QDO_TAIL = QDO_RING  # the merged publish the second slots exist for
     LDS_SLOTS = 2 if (q_dbuf or QDO_RING) else ((2 * DMA_GRP) if PF_RING else DMA_GRP)
     assert GQA_GROUP_SIZE % LDS_SLOTS == 0
-    # Share one SGPR LDS base pointer across every DMA destination (D128 only; D64 keeps
-    # the per-destination pointer table so its ISA stays byte-identical).
+    # Whole-window residency (the shape dq uses) does NOT port here: keeping a head's
+    # Q/dO extent resident needs LDS this body doesn't have room for without dropping a
+    # work-group per CU, so the occupancy loss outweighs the fence/code-size savings.
     DMA_SHARED_PTR = HEAD_DIM == 128
 
     VEC_WIDTH = 16
@@ -1020,6 +1068,14 @@ def build_flash_attn_bwd_dkdv_module(
     LD_THREADS_PER_HEAD = BLOCK_SIZE // GQA_GROUP_SIZE
     LD_VEC = LD_HEAD_ELEMS // LD_THREADS_PER_HEAD
     assert BLOCK_SIZE % GQA_GROUP_SIZE == 0 and LD_HEAD_ELEMS % LD_THREADS_PER_HEAD == 0
+    # buffer_load takes power-of-two vectors up to dwordx4, so a per-thread run that is not
+    # one (block_q=96 leaves 6 floats) is issued as its greedy power-of-two pieces.
+    LD_CHUNKS = []
+    _ld_rem = LD_VEC
+    while _ld_rem:
+        _ld_c = min(4, 1 << (_ld_rem.bit_length() - 1))
+        LD_CHUNKS.append((LD_VEC - _ld_rem, _ld_c))
+        _ld_rem -= _ld_c
 
     # The Q/dO slot ring, and under FUSE_DQ the K, V and dS tiles, share one element-indexed
     # view so every reader (_a_idx / _read_tr / _kv_lds_idx / _g3s_idx) addresses them the
@@ -1190,6 +1246,7 @@ def build_flash_attn_bwd_dkdv_module(
             q_tok_base = batch_idx * seq_len_q_v
             kv_tok_base = batch_idx * seq_len_k_v
         causal_offset = seq_len_k_v - seq_len_q_v
+        seq_len_q_i32 = fx.Int32(seq_len_q_v)
         kv_start = kv_tile_idx * BLOCK_KV
         # This wave owns ROWS_PER_WAVE_KV kv rows, split into NT 16-wide N-tiles.
         # In the 16x16 layout the owned kv row for a lane is nt*16 + lane16.
@@ -1290,6 +1347,9 @@ def build_flash_attn_bwd_dkdv_module(
         # _pblk(t*N_TILE + lane16) == t*ROW_BLK + _pblk(lane16) -- which is what lets a
         # pinned base reach its whole tile family by a compile-time offset.
         ROW_BLK = (N_TILE // 2) if PACK_2ROW else N_TILE
+        # LDS element delta of one half-tile of q rows (Q_PAIR): whole 8-row groups, so the
+        # packed image steps by ROW_BLK blocks per N_TILE rows.
+        Q_PAIR_HALF = (BLOCK_Q // 2 // N_TILE) * ROW_BLK * PBLK
 
         def _swizzle(row_idx, col_idx):
             mask = (row_idx & fx.Index(7)) << fx.Index(4)
@@ -1437,12 +1497,21 @@ def build_flash_attn_bwd_dkdv_module(
                     address_space=3,
                 )
 
-            def _dma_bases(tile_start):
+            if const_expr(Q_PAIR):
+                # A copy batch covers 16 consecutive tile rows, so the batches split evenly
+                # into the tile's two half-tiles -- which is what lets Q_PAIR source the
+                # second half from a different q offset at no extra address cost.
+                assert NUM_DMA_Q % 2 == 0 and ROWS_PER_DMA_BATCH * 16 == BLOCK_SIZE
+
+            def _dma_bases(tile_start, poff=None):
                 """Head-independent part of the Q/dO DMA byte offset, one per batch.
 
                 Only the q_head term differs between GQA heads sharing a q-block, so hoisting
                 the row/swizzle/column derivation collapses each head's DMA to a single add
                 and takes the kernel's scratch spill to zero.
+
+                poff (Q_PAIR) sources the tile's second half-tile poff rows further on
+                instead of BLOCK_Q/2, pairing two non-adjacent halves in one tile.
                 """
                 bases = []
                 for d in range_constexpr(NUM_DMA_Q):
@@ -1461,8 +1530,10 @@ def build_flash_attn_bwd_dkdv_module(
                     xor_mask = (row_in_tile & fx.Index(7)) << fx.Index(4)
                     unsw_col_f16 = position ^ xor_mask  # real col (1x HBM)
                     col_byte = unsw_col_f16 * 2
-                    global_row = tile_start + row_in_tile
-                    bases.append(global_row * fx.Index(RD_STRIDE_Q * 2) + col_byte)
+                    _src_row = tile_start + row_in_tile
+                    if const_expr(poff is not None and d >= NUM_DMA_Q // 2):
+                        _src_row = _src_row + poff - fx.Index(BLOCK_Q // 2)
+                    bases.append(_src_row * fx.Index(RD_STRIDE_Q * 2) + col_byte)
                 return bases
 
             if const_expr(not DMA_SHARED_PTR):
@@ -1861,25 +1932,6 @@ def build_flash_attn_bwd_dkdv_module(
                 + (lane16 & fx.Index(3))
             )
 
-        def _if_wave(cond, vals, then_fn, else_fn):
-            """scf.if threading ``vals`` through both arms, for a wave-uniform ``cond``.
-
-            Built directly rather than with a traced ``if``: the tracer only carries plain
-            named variables across a dynamic branch, and these are lists of accumulators.
-            """
-            from flydsl._mlir.dialects import scf
-
-            _v = [_raw(v) for v in vals]
-            op = scf.IfOp(_raw(cond), [x.type for x in _v], has_else=True)
-            with ir.InsertionPoint(op.regions[0].blocks[0]):
-                scf.YieldOp([_raw(x) for x in then_fn()])
-            if not op.regions[1].blocks:
-                op.regions[1].blocks.append()
-            with ir.InsertionPoint(op.regions[1].blocks[0]):
-                else_fn()
-                scf.YieldOp(_v)
-            return list(op.results)
-
         def _ds_write_vec(lds_elem_idx, const_elem_off, val):
             """LDS store reached through a pinned base + compile-time element offset."""
             ptr = buffer_ops.create_llvm_ptr(fx.Int64(lds_elem_idx * 2 + lds_off), address_space=3)
@@ -2069,10 +2121,20 @@ def build_flash_attn_bwd_dkdv_module(
         _ld_head = tid // fx.Index(LD_THREADS_PER_HEAD)
         _ld_q = (tid % fx.Index(LD_THREADS_PER_HEAD)) * fx.Index(LD_VEC)
 
-        def _stage_ld_issue(q_start):
+        if const_expr(Q_PAIR):
+            # Q_PAIR needs the (-delta, lse) staging to follow the tile's row pairing, so a
+            # thread's LD_VEC run must sit wholly inside one half-tile.
+            assert (BLOCK_Q // 2) % LD_VEC == 0
+
+        def _stage_ld_issue(q_start, poff=None):
             # Issued BEFORE the Q/dO DMA so both HBM streams are in flight together;
             # the LDS commit lands after the DMA, so its vmcnt wait does not serialise
             # them (gfx950 has no vmcnt subset wait, but the counter is in-order).
+            if const_expr(poff is not None):
+                # Second half-tile: same source shift as the Q/dO DMA (see _dma_bases).
+                q_start = q_start + ArithValue(_ld_q >= fx.Index(BLOCK_Q // 2)).select(
+                    poff - fx.Index(BLOCK_Q // 2), fx.Index(0)
+                )
             if const_expr(varlen):
                 # Packed [total_q,Hq]: consecutive q for a fixed head are stride-NUM_HEADS_Q apart, so gather scalars (uniform head-major loads a single vec below).
                 _qh = kv_head_idx * fx.Index(GQA_GROUP_SIZE) + _ld_head
@@ -2088,16 +2150,18 @@ def build_flash_attn_bwd_dkdv_module(
                                     dtype=fx.Float32,
                                 )
                             )
-                            for j in range_constexpr(LD_VEC)
+                            for j in range_constexpr(_o, _o + _c)
                         ],
                         fx.Float32,
                     ).ir_value()
                     for rsrc in (delta_rsrc, lse_rsrc)
+                    for _o, _c in LD_CHUNKS
                 ]
             _g = (kv_head_idx * fx.Index(GQA_GROUP_SIZE) + _ld_head) * seq_len_q_v + q_start + _ld_q
             _v = [
-                buffer_ops.buffer_load(rsrc, _g, vec_width=LD_VEC, dtype=fx.Float32)
+                buffer_ops.buffer_load(rsrc, _g + fx.Index(_o), vec_width=_c, dtype=fx.Float32)
                 for rsrc in (delta_rsrc, lse_rsrc)
+                for _o, _c in LD_CHUNKS
             ]
             if const_expr(LD_VEC == 1):
                 # An 8-wave group leaves one element per thread; vec_width=1 lowers to a
@@ -2108,20 +2172,23 @@ def build_flash_attn_bwd_dkdv_module(
         def _stage_ld_commit(vals):
             _lds_i = _ld_head * fx.Index(LD_HEAD_ELEMS) + _ld_q
             for arr in range_constexpr(2):
-                Vec(vals[arr]).store(ld_lds, [fx.Index(arr * LD_ARR_ELEMS) + _lds_i])
+                for i, (_o, _c) in enumerate(LD_CHUNKS):
+                    Vec(vals[arr * len(LD_CHUNKS) + i]).store(
+                        ld_lds, [fx.Index(arr * LD_ARR_ELEMS + _o) + _lds_i]
+                    )
 
-        def _ld_read(head_local, mt, arr):
+        def _ld_read(head_local, mt, arr, qoff=None):
             # v4f32 at q = head's q-block + mt*M_TILE + kg*4 (+t), matching the GEMM1
             # accumulator C layout; lane16 is absent -> a 16-way LDS broadcast.
             # arr=0 -> -delta (GEMM1b init), arr=1 -> prescaled lse (GEMM1a init/masked add).
-            return Vec.load(
-                v4f32_type,
-                ld_lds,
-                [
-                    fx.Index(arr * LD_ARR_ELEMS + head_local * LD_HEAD_ELEMS + mt * M_TILE)
-                    + kg * fx.Index(4)
-                ],
-            ).ir_value()
+            # qoff (Q_PAIR half-step) selects the tile half this wave is running.
+            _i = (
+                fx.Index(arr * LD_ARR_ELEMS + head_local * LD_HEAD_ELEMS + mt * M_TILE)
+                + kg * fx.Index(4)
+            )
+            if const_expr(qoff is not None):
+                _i = _i + qoff
+            return Vec.load(v4f32_type, ld_lds, [_i]).ir_value()
 
         def _dma_head(head_local, bases):
             """Issue (no wait) the Q/dO DMA for head_local into its LDS slot."""
@@ -2201,6 +2268,8 @@ def build_flash_attn_bwd_dkdv_module(
             mid_pf=None,
             qdo=None,
             ldv=None,
+            poff=None,
+            half=False,
         ):
             sb_bulk = not apply_mask  # exps only exist on these paths
             # The next head's Q/dO fetch: the earlier it is issued the more of this step
@@ -2225,7 +2294,26 @@ def build_flash_attn_bwd_dkdv_module(
             q_start_i32 = fx.Int32(q_start)
             kg_off_i32 = fx.Int32(kg) * fx.Int32(4)
             q_lds = fx.Index((head_local % LDS_SLOTS) * LDS_TOTAL)
+            # Q_PAIR: the paired trip's second half-tile holds rows q_start + poff instead
+            # of the contiguous q_start + BLOCK_Q/2, and each wave runs only its own half,
+            # so the LDS base, (-delta, lse) rows and mask q index all shift accordingly.
+            _pk_list = [0] if const_expr(half) else list(range_constexpr(PV_K_STEPS))
+            _hq = None
+            if const_expr(half):
+                _hq = wave_id * fx.Index(BLOCK_Q // 2)
+                q_lds = q_lds + wave_id * fx.Index(Q_PAIR_HALF)
             do_lds = q_lds + fx.Index(LDS_DO_BASE)
+
+            def _ld_rd(mt, arr):
+                return _ld_read(head_local, mt, arr, _hq)
+
+            def _q_slot_i32(mt):
+                if const_expr(half):
+                    return q_start_i32 + fx.Int32(wave_id * poff) + fx.Int32(mt * M_TILE)
+                _o = fx.Int32(mt * M_TILE)
+                if const_expr(poff is not None and mt >= MT // 2):
+                    _o = _o + fx.Int32(poff) - fx.Int32(BLOCK_Q // 2)
+                return q_start_i32 + _o
             if const_expr(q_dbuf):
                 # This head's tile landed during the previous step; the barrier publishes it
                 # and simultaneously fences the slot that the prefetch below overwrites.
@@ -2268,7 +2356,7 @@ def build_flash_attn_bwd_dkdv_module(
                 # heads 1..7 re-read straight from LDS.
                 _ldv = None
                 if const_expr(head_local == 0):
-                    _ldv = _stage_ld_issue(q_start)
+                    _ldv = _stage_ld_issue(q_start, poff)
                 _shadow = G3_SHADOW and head_local > 0
                 if const_expr(_shadow):
                     # The barrier below now publishes the dS tile GEMM3 is about to read,
@@ -2366,7 +2454,7 @@ def build_flash_attn_bwd_dkdv_module(
                         for _sh in mid_pf:
                             _dma_head(_sh, bases)
                         rocdl.s_setprio(1)
-                    if const_expr(dt == 1 and pk_list[-1] == PV_K_STEPS - 1):
+                    if const_expr(dt == 1 and pk_list[-1] == _pk_list[-1]):
                         _qdo_pf(3)
                     _slot = dt % g2d
                     do_tr = do_ring[_slot]
@@ -2426,7 +2514,7 @@ def build_flash_attn_bwd_dkdv_module(
                 return _gemm_qk(
                     do_lds,
                     v_b_packs,
-                    inits={mt: _ld_read(head_local, mt, 0) for mt in half},
+                    inits={mt: _ld_rd(mt, 0) for mt in half},
                     mts=half,
                     pin=_do_apin,
                 )
@@ -2458,7 +2546,7 @@ def build_flash_attn_bwd_dkdv_module(
                     _st = _gemm_qk(
                         q_lds,
                         k_b_packs,
-                        inits={mt: _ld_read(head_local, mt, 1) for mt in half},
+                        inits={mt: _ld_rd(mt, 1) for mt in half},
                         mts=half,
                         pin=_q_apin,
                     )
@@ -2503,14 +2591,14 @@ def build_flash_attn_bwd_dkdv_module(
                                 ]
                 else:
                     for mt in half:
-                        lse_v = _ld_read(head_local, mt, 1)
+                        lse_v = _ld_rd(mt, 1)
                         for nt in range_constexpr(NT):
                             s_v = s_tiles[mt][nt]
                             p_vals = []
                             for t in range_constexpr(4):
                                 s_r = fx.Float32(Vec(s_v)[t])
                                 if const_expr(apply_mask):
-                                    q_slot = q_start_i32 + kg_off_i32 + fx.Int32(mt * M_TILE + t)
+                                    q_slot = _q_slot_i32(mt) + kg_off_i32 + fx.Int32(t)
                                     _up = ArithValue(kv_row_i32_of(nt) > q_slot + causal_off_i32)
                                     if const_expr(window_left >= 0):
                                         # keep kv >= q+off-W (W+1 keys), matching the fwd
@@ -2520,6 +2608,16 @@ def build_flash_attn_bwd_dkdv_module(
                                             < q_slot + causal_off_i32 - fx.Int32(window_left)
                                         )
                                         _mm = ArithValue(arith.ori(_raw(_up), _raw(_lo)))
+                                        if const_expr(Q_BOUND):
+                                            # A BLOCK_Q not dividing BLOCK_KV lets the band's
+                                            # last trip run past the sequence end into the
+                                            # next batch's (real, in-range) rows.
+                                            _mm = ArithValue(
+                                                arith.ori(
+                                                    _raw(_mm),
+                                                    _raw(ArithValue(q_slot >= seq_len_q_i32)),
+                                                )
+                                            )
                                     else:
                                         _mm = _up
                                     s_r = _mm.select(c_neg_inf, s_r)
@@ -2532,9 +2630,9 @@ def build_flash_attn_bwd_dkdv_module(
                 # Hoist the first g2d dt's GEMM2 transpose-reads into the LAST half's
                 # dS/pack shadow: the ds_read_tr16 LDS latency overlaps that VALU block
                 # instead of exposing at GEMM2's first MFMA. dV reads dO_tr, dK reads Q_tr.
-                _pk_seg = [pks] if const_expr(G2_HALF) else list(range_constexpr(PV_K_STEPS))
+                _pk_seg = [pks] if const_expr(G2_HALF) else list(_pk_list)
                 _rings = None
-                if const_expr(G2_HALF or pks == PV_K_STEPS - 1):
+                if const_expr(G2_HALF or pks == _pk_list[-1]):
                     _rings = (
                         [
                             [_read_tr(do_lds, _d, _p, _do_trb) for _p in _pk_seg]
@@ -2575,7 +2673,7 @@ def build_flash_attn_bwd_dkdv_module(
             # the register relief that pays here, not interleaving for its own sake.
             def _pks_chain(pf=True, g3_split=False):
                 _rings = None
-                for pks in range_constexpr(PV_K_STEPS):
+                for pks in _pk_list:
                     half = [2 * pks, 2 * pks + 1]
                     # Half pks-1's dQ pass, emitted one q-half after its dS was published:
                     # its 16 MFMAs are the only independent matrix work available to the
@@ -2591,7 +2689,7 @@ def build_flash_attn_bwd_dkdv_module(
                         rocdl.s_waitcnt(WAIT_LGKM)
                         gpu.barrier()  # RAW: this half's dS columns feed every wave
                     if const_expr(G2_HALF):
-                        _last = const_expr(pks == PV_K_STEPS - 1)
+                        _last = const_expr(pks == _pk_list[-1])
                         if const_expr(_last and pf):
                             _qdo_pf(2)
                         _gemm2(
@@ -2605,7 +2703,7 @@ def build_flash_attn_bwd_dkdv_module(
                     if const_expr(pf):
                         _qdo_pf(2)
                     _gemm2(
-                        list(range_constexpr(PV_K_STEPS)),
+                        list(_pk_list),
                         _rings[0],
                         _rings[1],
                         const_expr(PF_RING and mid_pf is not None),
@@ -2673,7 +2771,7 @@ def build_flash_attn_bwd_dkdv_module(
                 rocdl.s_waitcnt(0)  # prefetch landed; the next step's barrier publishes it
             return dv_cur, dk_cur, (_qdo_next if const_expr(Q_PREF) else [qdo, None])
 
-        def _q_body(q_start, inner, apply_mask):
+        def _q_body(q_start, inner, apply_mask, poff=None, half=False):
             # inner (loop-carried) = [dv accs][dk accs] (+ [Q/dO][-delta, lse] under PF_QB).
             _dk_base = DT * NT
             dv_cur = [[inner[dt * NT + nt] for nt in range_constexpr(NT)] for dt in range_constexpr(DT)]
@@ -2681,7 +2779,7 @@ def build_flash_attn_bwd_dkdv_module(
                 [inner[_dk_base + dt * NT + nt] for nt in range_constexpr(NT)] for dt in range_constexpr(DT)
             ]
             # Head-invariant DMA offsets: computed once per q-block, reused by all heads.
-            _bases = _dma_bases(q_start) if const_expr(ENABLE_DMA and not Q_PREF) else None
+            _bases = _dma_bases(q_start, poff) if const_expr(ENABLE_DMA and not Q_PREF) else None
             _ldv = None
             if const_expr(PF_QB):
                 _pfb = 2 * DT * NT
@@ -2728,6 +2826,8 @@ def build_flash_attn_bwd_dkdv_module(
                     mid_pf=_mid,
                     qdo=_qdo,
                     ldv=_ldv,
+                    poff=poff,
+                    half=half,
                 )
                 _qdo = _pf[0]
                 if const_expr(_pf[1] is not None):
@@ -2762,11 +2862,34 @@ def build_flash_attn_bwd_dkdv_module(
             _carry = _carry + _qdo_issue(_q_loop_start, 0) + _stage_ld_issue(_q_loop_start)
         loop_results = _carry
 
-        if const_expr(window_left >= 0):
+        if const_expr(Q_PAIR):
+            # NB trips: one paired trip carries the band's two extreme q-halves (each wave
+            # its own half), plus NB-1 interior tiles; the paired trip's position rotates
+            # with the band index for L2 reuse (see _qrot), spelled as two interior loops.
+            _poff = fx.Index((2 * Q_PAIR_NB - 1) * (BLOCK_Q // 2))
+            _in0 = _q_loop_start + fx.Index(BLOCK_Q // 2)
+            _ihi = _in0 + fx.Index((Q_PAIR_NB - 1) * _step)
+            _ilo = _ihi - (_q_loop_start // fx.Index(_step)) % fx.Index(Q_PAIR_NB) * fx.Index(_step)
+            for q_start, inner in range(_ilo, _ihi, _step, init=_carry):
+                loop_results = yield _q_body(q_start, inner, True)
+            loop_results = _q_body(_q_loop_start, loop_results, True, poff=_poff, half=True)
+            for q_start, inner in range(_in0, _ilo, _step, init=loop_results):
+                loop_results = yield _q_body(q_start, inner, True)
+        elif const_expr(window_left >= 0):
             _qhi = _kv_end_c - causal_offset + fx.Index(window_left)
             _qhi = fx.Index(ArithValue(_qhi < seq_len_q_v).select(_qhi, seq_len_q_v))
+            # Phase-align the visit order across bands: every band's q range is NB blocks
+            # wide and the same q-block is read by NB different bands, so rotating each
+            # band's start by its own index makes trip i of every band land on the same
+            # q-block (mod NB), turning cross-band reuse into an L2 hit (permutation only;
+            # dk/dv accumulation order per band is unchanged, so determinism holds).
+            _qnb = (_qhi - _q_loop_start + fx.Index(_step - 1)) // fx.Index(_step)
+            _qnb = fx.Index(ArithValue(_qnb > fx.Index(0)).select(_qnb, fx.Index(1)))
+            _qrot = (_q_loop_start // fx.Index(_step)) % _qnb
             for q_start, inner in range(_q_loop_start, _qhi, _step, init=_carry):
-                loop_results = yield _q_body(q_start, inner, True)
+                _trip = (q_start - _q_loop_start) // fx.Index(_step)
+                _qs = _q_loop_start + ((_trip + _qnb - _qrot) % _qnb) * fx.Index(_step)
+                loop_results = yield _q_body(_qs, inner, True)
         else:
             for q_start, inner in range(_q_loop_start, _masked_upper, _step, init=_carry):
                 loop_results = yield _q_body(q_start, inner, True)
@@ -2921,6 +3044,10 @@ def build_flash_attn_bwd_dq_module(
     # ds_read_tr16 latency behind more MFMA, at one live transpose-read per extra tile.
     g2d=2,
     varlen=False,  # ragged / block-causal: per-segment [tok_base,tok_end) from cu_seqlens
+    # GQA sharers per work-group: the CTA's waves split into (row groups) x (q heads of
+    # one kv head). Width is unchanged, so occupancy and LDS are too.
+    q_heads_per_wg=1,
+    q_group=1,
 ):
     """Build the dQ Q-outer backward launcher (16x16x32 mirror of dkdv).
 
@@ -2952,7 +3079,18 @@ def build_flash_attn_bwd_dq_module(
     flat_work_group_size = 256
     NUM_WAVES = flat_work_group_size // WARP_SIZE
     BLOCK_SIZE = flat_work_group_size
-    ROWS_PER_WAVE_Q = BLOCK_M // NUM_WAVES  # 32
+    # GQA sharers spread ACROSS the waves of an unchanged-width CTA (low wave bits pick
+    # the row group, high bits pick the q head), so sharers of a kv head share one staging
+    # pass/rendezvous instead of each walking the full windowed kv extent. Unlike the
+    # judged-negative GQA merge in pitfalls/13 (which widened the CTA to 8 waves), waves,
+    # registers, LDS and work-group count here are unchanged -- only wave ownership moves.
+    Q_HEADS_PER_WG = q_heads_per_wg
+    WAVE_ROW_GROUPS = NUM_WAVES // Q_HEADS_PER_WG
+    ROWS_PER_WAVE_Q = BLOCK_M // WAVE_ROW_GROUPS  # 32
+    # A wave's own window is ROWS_PER_WAVE_Q + W rows inside the group's BLOCK_M + W, so
+    # the overhang tiles are all-masked for it and get a wave-uniform skip. Sharing the
+    # tile across heads instead of rows removes the overhang entirely.
+    WAVE_OVERHANG = ROWS_PER_WAVE_Q < BLOCK_M
 
     # ---- 16x16x32 bf16 MFMA tiling (M=N=16, K=32); q<->kv mirror of dkdv. ----
     M_TILE = 16
@@ -2973,7 +3111,8 @@ def build_flash_attn_bwd_dq_module(
     G2A = g2d
     assert G2A >= 2 and G2A % 2 == 0
 
-    assert BLOCK_M % NUM_WAVES == 0
+    assert NUM_WAVES % Q_HEADS_PER_WG == 0
+    assert BLOCK_M % WAVE_ROW_GROUPS == 0
     assert ROWS_PER_WAVE_Q % N_TILE == 0
     assert BLOCK_KV % M_TILE == 0
     assert head_dim % 32 == 0 and head_dim >= 64
@@ -2984,6 +3123,10 @@ def build_flash_attn_bwd_dq_module(
     NUM_HEADS_Q = num_heads
     NUM_HEADS_KV = num_kv_heads
     GQA_GROUP_SIZE = NUM_HEADS_Q // NUM_HEADS_KV
+    assert GQA_GROUP_SIZE % Q_HEADS_PER_WG == 0
+    GQA_SLOTS = GQA_GROUP_SIZE // Q_HEADS_PER_WG  # sharer groups per kv head
+    Q_GROUP = q_group  # q_tile run length made the fastest dispatch axis (1 = sharer first)
+
     HEAD_DIM = head_dim
     STRIDE_TOKEN_Q = NUM_HEADS_Q * HEAD_DIM
     STRIDE_TOKEN_KV = NUM_HEADS_KV * HEAD_DIM
@@ -2997,11 +3140,48 @@ def build_flash_attn_bwd_dq_module(
     K_STRIDE = HEAD_DIM
     LDS_TILE = BLOCK_KV * K_STRIDE
     LDS_V_BASE = LDS_TILE
-    LDS_TOTAL = 2 * LDS_TILE
+    LDS_SLOT = 2 * LDS_TILE  # K tile followed by V tile, in elements
 
-    # D128 stages the next K/V tile through VGPRs instead of buffer_load_lds (see the
-    # loop body); D64 keeps the DMA path.
+    # Stage the next K/V tile through VGPRs instead of buffer_load_lds: D128's wider tile
+    # needs it. Full-causal D64's kv prefix is long enough that the DMA path's lower
+    # register pressure wins there instead; windowed D64's short kv loop gets its own
+    # register-free mechanism below (WIN_RESIDENT), not this one.
     KV_REG_PF = ENABLE_DMA and HEAD_DIM == 128
+    # Depth of that register pipeline (tiles ahead the global loads are issued): depth 1
+    # wins -- a second live tile's registers cost more than the extra latency-hiding shadow
+    # buys on a walk this short, and this held up when re-checked at five trips.
+    KV_PF_D = 1
+    # DMA_SEED: issue the FIRST tile's buffer_load_lds before the Q/dO/O burst so its HBM
+    # latency lands under theirs (every Q/dO/O load is issued ahead of the delta reduce's
+    # forced drain point) instead of adding a second serial round trip after them.
+    DMA_SEED = ENABLE_DMA and window_left >= 0
+    # Whole-window residency: with BLOCK_M == BLOCK_KV and a window that's a multiple of
+    # it, the kv extent a work-group touches is exactly window_left/BLOCK_KV + 1 tiles at
+    # compile-time offsets, so giving each its own LDS slot turns the walk into
+    # straight-line code with no rendezvous, hand-over or loop-carried phi between tiles.
+    WIN_RESIDENT = (
+        ENABLE_DMA
+        and not KV_REG_PF
+        and window_left >= 0
+        and BLOCK_M == BLOCK_KV
+        and window_left % BLOCK_KV == 0
+        and WAVE_ROW_GROUPS == 1
+        and not varlen
+    )
+    WIN_TILES = (window_left // BLOCK_KV + 1) if WIN_RESIDENT else 1
+    # s_setprio (raises this wave's issue priority over SIMD siblings) is a net loss on the
+    # resident windowed walk -- a straight-line region with no rendezvous, so winning
+    # arbitration just starves the sibling work-groups covering this wave's memory latency.
+    DQ_SETPRIO = not WIN_RESIDENT
+    LDS_TOTAL = WIN_TILES * LDS_SLOT
+    # ds_read takes a 16-bit unsigned immediate offset, so the top of one work-group's
+    # LDS must stay below 65536 bytes or every A-fragment family needs a live address
+    # register (see the note on the tile read helpers).
+    assert LDS_TOTAL * 2 <= 65536
+    # An A/B flag has to be resolved HERE, in the builder's scope: the JIT cache key is
+    # the launcher's source text plus the scalar values its closure captures, so a flag
+    # read from a module global inside the traced kernel leaves the key unchanged and the
+    # stale binary is served back -- an arm that silently does not switch.
 
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="flash_attn_bwd_smem_dq16")
     lds_off = allocator._align(allocator.ptr, 16)
@@ -3034,6 +3214,10 @@ def build_flash_attn_bwd_dq_module(
         mfma_pack_type = v8f16_type
         MFMA_LANE_K = 8  # 8 bf16/lane; 4 lane-groups (lane//16) -> K=32
 
+        def _setprio(v):
+            if const_expr(DQ_SETPRIO):
+                rocdl.s_setprio(v)
+
         def _mfma(mfma_fn, a, b, c):
             return mfma_fn(v4f32_type, [a, b, c])
 
@@ -3048,6 +3232,17 @@ def build_flash_attn_bwd_dq_module(
 
         def mfma_acc(a, b, c):
             return _mfma(rocdl.mfma_f32_16x16x32_bf16, a, b, c)
+
+        def _dot2_bf16(a_i32, b_i32, acc_f32):
+            """gfx950 v_dot2_f32_bf16: acc + a.lo*b.lo + a.hi*b.hi, products in f32.
+            No ROCDL op exists for the dot family, so it goes through inline asm."""
+            return llvm.inline_asm(
+                ir.F32Type.get(),
+                [_raw(a_i32), _raw(b_i32), _raw(acc_f32)],
+                "v_dot2_f32_bf16 $0, $1, $2, $3",
+                "=v,v,v,v",
+                has_side_effects=False,
+            )
 
         def _vexp(x):
             # Hardware 2^x as the raw v_exp_f32 intrinsic: one instruction (math.exp2 adds ldexp
@@ -3082,17 +3277,51 @@ def build_flash_attn_bwd_dq_module(
         # rows stay co-resident. Bijective when B*NUM_HEADS_KV % NUM_XCD == 0, which
         # NUM_HEADS_KV % NUM_XCD == 0 guarantees; other head counts keep the plain decode.
         num_q_tiles = (seq_len_q_v + BLOCK_M - 1) // BLOCK_M
+
+        def _q_head_of(_kvh, _grp):
+            """q head this WAVE owns: the group's sharer base plus its own sharer slot."""
+            if const_expr(Q_HEADS_PER_WG == 1):
+                return _kvh * GQA_GROUP_SIZE + _grp
+            # Wave-uniform so the head offset stays scalar: it feeds the Q/dO/O/LSE/dQ
+            # addressing for the whole kernel, and a divergent copy would sit in a VGPR
+            # across the entire kv walk.
+            _sharer = fx.Index(
+                rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(wave_id // fx.Index(WAVE_ROW_GROUPS)))
+            )
+            return _kvh * GQA_GROUP_SIZE + _grp * fx.Index(Q_HEADS_PER_WG) + _sharer
+
         if const_expr(NUM_HEADS_KV % NUM_XCD == 0):
             _xcd = block_id % fx.Index(NUM_XCD)
             _slot = block_id // fx.Index(NUM_XCD)
-            _q_in_group = _slot % GQA_GROUP_SIZE
-            _u = _slot // GQA_GROUP_SIZE
-            _qt_disp = _u % num_q_tiles
-            _bkv = (_u // num_q_tiles) * fx.Index(NUM_XCD) + _xcd
+            # Sharer-innermost: the GQA sharer groups of one (batch, q_tile, kv-head) read
+            # a byte-identical kv window, so they are the tightest reuse pair to keep
+            # co-resident. Making q_tile the fastest axis instead -- consecutive q tiles
+            # share BLOCK_M + W - BLOCK_M of their windows, a sliding rather than exact
+            # reuse -- measures +0.45% median / -0.63% min, i.e. level.
+            if const_expr(Q_GROUP > 1):
+                # Group swizzle on the q_tile axis: a run of Q_GROUP consecutive q tiles
+                # is the fastest axis, the GQA sharer groups the next one. Bijective for
+                # any num_q_tiles because the tail run shrinks to what is left.
+                _per_kv = num_q_tiles * fx.Index(GQA_SLOTS)
+                _lin = _slot % _per_kv
+                _run = _lin // fx.Index(Q_GROUP * GQA_SLOTS)
+                _qbase = _run * fx.Index(Q_GROUP)
+                _rem = num_q_tiles - _qbase
+                _gcur = fx.Index(ArithValue(_rem < fx.Index(Q_GROUP)).select(_rem, fx.Index(Q_GROUP)))
+                _r = _lin - _run * fx.Index(Q_GROUP * GQA_SLOTS)
+                _q_in_group = _r // _gcur
+                _qt_disp = _qbase + _r % _gcur
+                _bkv = (_slot // _per_kv) * fx.Index(NUM_XCD) + _xcd
+            else:
+                _q_in_group = _slot % GQA_SLOTS
+                _u = _slot // GQA_SLOTS
+                _qt_disp = _u % num_q_tiles
+                _bkv = (_u // num_q_tiles) * fx.Index(NUM_XCD) + _xcd
             kv_head_idx = _bkv % NUM_HEADS_KV
             batch_idx = _bkv // NUM_HEADS_KV
-            q_head_idx = kv_head_idx * GQA_GROUP_SIZE + _q_in_group
+            q_head_idx = _q_head_of(kv_head_idx, _q_in_group)
         elif const_expr(GQA_GROUP_SIZE == 1):
+            assert Q_HEADS_PER_WG == 1
             q_head_idx = block_id % NUM_HEADS_Q
             batch_q_tile_id = block_id // NUM_HEADS_Q
             kv_head_idx = q_head_idx
@@ -3101,9 +3330,9 @@ def build_flash_attn_bwd_dq_module(
         else:
             kv_head_idx = block_id % NUM_HEADS_KV
             _bid_rest = block_id // NUM_HEADS_KV
-            _q_in_group = _bid_rest % GQA_GROUP_SIZE
-            batch_q_tile_id = _bid_rest // GQA_GROUP_SIZE
-            q_head_idx = kv_head_idx * GQA_GROUP_SIZE + _q_in_group
+            _q_in_group = _bid_rest % GQA_SLOTS
+            batch_q_tile_id = _bid_rest // GQA_SLOTS
+            q_head_idx = _q_head_of(kv_head_idx, _q_in_group)
             _qt_disp = batch_q_tile_id % num_q_tiles
             batch_idx = batch_q_tile_id // num_q_tiles
         # SHADOW seq_len_q_v/k_v to the per-segment length so downstream base/SRD/clamp follow the segment (byte-identical when uniform; grid tiles were fixed from max above).
@@ -3185,13 +3414,18 @@ def build_flash_attn_bwd_dq_module(
             return q_head_idx * seq_len_q_v + q_row
 
         def bf16_trunc_pack_v8(f32_vals):
+            # A None entry marks a value that is exactly zero at compile time (a patch
+            # _patch_bounds proved all-masked): cvt_pk_bf16_f32 is inline asm and would
+            # not fold, so emit the zero word directly.
             pairs = [
-                rocdl.cvt_pk_bf16_f32(_raw(f32_vals[j * 2]), _raw(f32_vals[j * 2 + 1]))
+                fx.Int32(0)
+                if f32_vals[j * 2] is None
+                else fx.Int32(
+                    _raw(rocdl.cvt_pk_bf16_f32(_raw(f32_vals[j * 2]), _raw(f32_vals[j * 2 + 1])))
+                )
                 for j in range_constexpr(4)
             ]
-            return (
-                Vec.from_elements([fx.Int32(_raw(p)) for p in pairs], fx.Int32).bitcast(elem_dtype).ir_value()
-            )
+            return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
 
         # D64 packs 2 real rows into one 128-wide LDS block (low r&4=0 -> [0,64),
         # high -> [64,128)); D128 is already 128-wide, so one row == one block.
@@ -3262,7 +3496,10 @@ def build_flash_attn_bwd_dq_module(
                 """Element index of this thread's 16 B slice of copy batch d.
 
                 Address math is recomputed per tile on purpose: keeping the offsets live
-                across the k_tr peak pushes VGPRs past the occ-2 boundary.
+                across the k_tr peak pushes VGPRs past the occ-2 boundary. Hoisting the
+                tile-invariant row/col part out of the loop is bitwise-neutral and even
+                lands at vgpr 152, but measures +0.42% then -0.08% across two sessions,
+                so the recompute is not what this loop pays for.
                 """
                 block = tid // fx.Index(16) + fx.Index(d * ROWS_PER_DMA_BATCH)
                 lane_in_block = tid % fx.Index(16)
@@ -3348,38 +3585,125 @@ def build_flash_attn_bwd_dq_module(
                         [fx.Index(_base + d * (DMA_BATCH_BYTES // 2)) + tid * fx.Index(DMA_BYTES // 2)],
                     )
 
+        # fx.Index is unsigned: guard the subtract (W may exceed q+off) to avoid
+        # underflow-to-huge. _wlo skips fully-out-of-window kv tiles; the first in-window
+        # kv is q+off-W (W+1-key window), so start from there.
+        if const_expr(window_left >= 0):
+            _wlo = fx.Index(
+                ArithValue(q_start + causal_offset >= fx.Index(window_left)).select(
+                    q_start + causal_offset - fx.Index(window_left), fx.Index(0)
+                )
+            )
+            _wlo = (_wlo // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
+        else:
+            _wlo = fx.Index(0)
+        # The first kv tiles' loads are issued before the Q/dO/O loads so their HBM latency
+        # overlaps instead of adding a second serial round trip; only the issue moves up,
+        # the wait/publish barrier stay at the loop head, and buffer_load_lds is VGPR-free.
+        # Tile j of the resident window as a signed row index: tiles clipped by the
+        # sequence start are staged from row 0 and neutralised via a -inf softmax seed
+        # (same zero contribution as a skipped tile, without a branch through the carry).
+        _qoff_i32 = fx.Int32(q_start) + causal_off_i32
+
+        def _win_tile_i32(j):
+            return _qoff_i32 + fx.Int32(j * BLOCK_KV - window_left)
+
+        def _win_dma_burst():
+            for _j in range_constexpr(WIN_TILES):
+                _tj = _win_tile_i32(_j)
+                _tj = fx.Index(ArithValue(_tj > fx.Int32(0)).select(_tj, fx.Int32(0)))
+                _sb = _j * LDS_SLOT * 2
+                coop_dma_tile(k_rsrc, lds_base_idx + fx.Index(_sb), _tj)
+                coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(_sb + LDS_V_BASE * 2), _tj)
+
+        _pf_carry = []
+        # The burst goes ahead of the Q/dO/O loads. vmcnt retires in issue order, so the
+        # O.dO reduce then drains the transfers too; issuing the burst after the O loads
+        # instead, so the reduce only waits for its own operands, measures -0.91% median.
+        if const_expr(WIN_RESIDENT):
+            _win_dma_burst()
+        elif const_expr(DMA_SEED and not WIN_RESIDENT):
+            coop_dma_tile(k_rsrc, lds_base_idx, _wlo)
+            coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(LDS_V_BASE * 2), _wlo)
+        if const_expr(KV_PF_D == 2):
+            _pf_carry = coop_load_tile_regs(_wlo + fx.Index(BLOCK_KV))
         # ---- Owned Q,dO B-operand packs: B[k=D][n=q], n=lane16, k=kg*8+s. Per wave
         # QT q 16-tiles x K_STEPS_QK D-steps; q_b_packs[qt][ks] is a v8 bf16. ----
-        q_row_wave = q_start + wave_id * ROWS_PER_WAVE_Q
+        if const_expr(WAVE_ROW_GROUPS == NUM_WAVES):
+            q_row_wave = q_start + wave_id * ROWS_PER_WAVE_Q
+        elif const_expr(WAVE_ROW_GROUPS == 1):
+            q_row_wave = q_start  # every wave owns the whole tile, only its head differs
+        else:
+            q_row_wave = q_start + (wave_id % fx.Index(WAVE_ROW_GROUPS)) * ROWS_PER_WAVE_Q
 
         def q_row_of(qt):
             return q_row_wave + fx.Index(qt * N_TILE) + lane16
 
         q_b_packs = [[None] * K_STEPS_QK for _ in range_constexpr(QT)]
         do_b_packs = [[None] * K_STEPS_QK for _ in range_constexpr(QT)]
+        o_packs = [[None] * K_STEPS_QK for _ in range_constexpr(QT)]
         d_parts = [fx.Float32(0.0) for _ in range_constexpr(QT)]
+
+        def _q_col_of(ks):
+            return fx.Index(ks * K_STEP_QK) + kg * MFMA_LANE_K
+
         for qt in range_constexpr(QT):
             _qr = q_row_of(qt)
             for ks in range_constexpr(K_STEPS_QK):
-                q_col = fx.Index(ks * K_STEP_QK) + kg * MFMA_LANE_K
+                q_col = _q_col_of(ks)
                 q_b_packs[qt][ks] = buffer_ops.buffer_load(
                     q_rsrc, global_idx_q(_qr, q_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
                 )
                 do_b_packs[qt][ks] = buffer_ops.buffer_load(
                     do_rsrc, global_idx_q(_qr, q_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
                 )
-                if const_expr(fuse_delta):
-                    # This lane's slice of row _qr: O.dO over the 8 D it holds. The O
-                    # pack dies here (only the f32 partial stays live), so the reduce
-                    # adds one in-flight dwordx4, not a second B-operand set.
-                    _o_v = Vec(
-                        buffer_ops.buffer_load(
-                            o_rsrc, global_idx_q(_qr, q_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
+        if const_expr(fuse_delta):
+            # Every O load is issued before the first is consumed (interleaving the O.dO
+            # reduce with the loads instead blocks the scheduler from hoisting them, adding
+            # a serial round trip); holding all O packs costs VGPRs but not waves/SIMD.
+            def _od_acc(qt, ks):
+                # v_dot2_f32_bf16 consumes packed bf16 operands and accumulates in f32,
+                # collapsing this lane's O.dO widen/multiply/add chain into 4 instructions.
+                # Still exact hardware fp32 products in a fixed order, so DELTA stays
+                # run-to-run deterministic.
+                _o = Vec(o_packs[qt][ks]).bitcast(fx.Int32)
+                _d = Vec(do_b_packs[qt][ks]).bitcast(fx.Int32)
+                for i in range_constexpr(MFMA_LANE_K // 2):
+                    d_parts[qt] = fx.Float32(_dot2_bf16(_o[i], _d[i], d_parts[qt]))
+
+            for qt in range_constexpr(QT):
+                for ks in range_constexpr(K_STEPS_QK):
+                    o_packs[qt][ks] = buffer_ops.buffer_load(
+                        o_rsrc,
+                        global_idx_q(q_row_of(qt), _q_col_of(ks)),
+                        vec_width=MFMA_LANE_K,
+                        dtype=elem_dtype,
+                    )
+        # ---- Owned LSE/-delta_id per q (one scalar per qt, q = qt*16 + lane16). ----
+        lse_owned = []
+        delta_owned = []
+
+        def _issue_lse():
+            for qt in range_constexpr(QT):
+                _lse_elem = _ld_delta_elem(q_row_of(qt))
+                lse_owned.append(
+                    fx.Float32(
+                        buffer_ops.buffer_load(lse_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32)
+                    )
+                )
+                if const_expr(not fuse_delta):
+                    delta_owned.append(
+                        fx.Float32(
+                            buffer_ops.buffer_load(
+                                delta_in_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32
+                            )
                         )
-                    ).to(fx.Float32)
-                    _od = _o_v * Vec(do_b_packs[qt][ks]).to(fx.Float32)
-                    for i in range_constexpr(MFMA_LANE_K):
-                        d_parts[qt] = fx.Float32(_fadd(d_parts[qt], Vec(_od)[i]))
+                    )
+
+        if const_expr(fuse_delta):
+            for qt in range_constexpr(QT):
+                for ks in range_constexpr(K_STEPS_QK):
+                    _od_acc(qt, ks)
 
         # ---- FOLD: prescale the owned Q by sm*log2e once per work-group (amortized
         # over the whole causal kv-loop). Q feeds GEMM1a only -- dQ is accumulated from
@@ -3392,20 +3716,11 @@ def build_flash_attn_bwd_dq_module(
                         (Vec(q_b_packs[qt][ks]).to(fx.Float32) * _qscale_v8).to(elem_dtype).ir_value()
                     )
 
-        # ---- Owned LSE/-delta_id per q (one scalar per qt, q = qt*16 + lane16). ----
-        lse_owned = []
-        delta_owned = []
-        for qt in range_constexpr(QT):
-            _lse_elem = _ld_delta_elem(q_row_of(qt))
-            lse_owned.append(
-                fx.Float32(buffer_ops.buffer_load(lse_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32))
-            )
-            if const_expr(not fuse_delta):
-                delta_owned.append(
-                    fx.Float32(
-                        buffer_ops.buffer_load(delta_in_rsrc, _lse_elem, vec_width=1, dtype=fx.Float32)
-                    )
-                )
+        # Issuing these with the Q/dO/O burst still in flight -- ahead of the O.dO reduce
+        # that drains vmcnt -- so the work-group pays one HBM round trip instead of two
+        # measures +-0 (median +0.04%, min -0.62%): the reduce is already covered, and
+        # the two extra live scalars per qt sit across the whole kv walk.
+        _issue_lse()
         if const_expr(fuse_delta):
             # DELTA[b,hq,q] = -rowsum_d(O.dO). A row's 64 D split over the 4 K-subgroup
             # lanes sharing lane16, so the row total is a 2-step xor butterfly over kg
@@ -3477,10 +3792,11 @@ def build_flash_attn_bwd_dq_module(
                 for kvt in kvts
             }
 
-        def _gemm1_mfma(a, b_packs, inits_q=None, kvts=None):
+        def _gemm1_mfma(a, b_packs, inits_q=None, kvts=None, dead=()):
             """S[kvt][qt] (v4f32) = a[kvt] @ B(owned Q/dO)[qt]^T over D, given
             already-loaded A tiles `a` (see _gemm1_load). inits_q[qt] optionally
-            pre-loads the accumulator (folds -delta_id into the dP GEMM for free)."""
+            pre-loads the accumulator (folds -delta_id into the dP GEMM for free).
+            `dead` drops the (kvt, qt) patches the caller proved all-masked."""
             if kvts is None:
                 kvts = list(a.keys())
             out = [[None] * QT for _ in range_constexpr(KVT)]
@@ -3490,13 +3806,15 @@ def build_flash_attn_bwd_dq_module(
             # live accumulator set buys nothing.
             for kvt in kvts:
                 for qt in range_constexpr(QT):
+                    if const_expr((kvt, qt) in dead):
+                        continue
                     acc = c_zero_v4f32 if inits_q is None else inits_q[qt]
                     for ks in range_constexpr(K_STEPS_QK):
                         acc = mfma_acc(a[kvt][ks], b_packs[qt][ks], acc)
                     out[kvt][qt] = acc
             return out
 
-        def _gemm1(a_base, b_packs, inits_q=None, kvts=None):
+        def _gemm1(a_base, b_packs, inits_q=None, kvts=None, dead=()):
             """S[kvt][qt] (v4f32) = A(K/V)[kvt] @ B(owned Q/dO)[qt]^T over D. A is
             loaded once per (kvt,ks) and reused across qt. inits_q[qt] optionally
             pre-loads the accumulator (folds -delta_id into the dP GEMM for free).
@@ -3505,7 +3823,7 @@ def build_flash_attn_bwd_dq_module(
             if kvts is None:
                 kvts = list(range_constexpr(KVT))
             a = _gemm1_load(a_base, kvts)
-            return _gemm1_mfma(a, b_packs, inits_q, kvts)
+            return _gemm1_mfma(a, b_packs, inits_q, kvts, dead)
 
         def _read_tr(a_base, dt, pks):
             """Transpose-read K -> GEMM2 A-operand [m=D=dt*16+lane16][k=kv=kg*8+s]."""
@@ -3519,15 +3837,16 @@ def build_flash_attn_bwd_dq_module(
         # Per-q delta init (broadcast over the 4 kv output rows) and q-slot i32. The
         # GEMM1a C-layout is C[m=kv][n=q], so a lane's 4 accumulator slots share one q
         # and -log2e*lse is a broadcast exactly like -delta_id (FOLD path).
-        delta_inits = [
-            Vec.from_elements([delta_owned[qt]], fx.Float32).broadcast_to(4).ir_value()
-            for qt in range_constexpr(QT)
-        ]
+        def _seed4(x):
+            """MFMA accumulator seed: one per-q scalar broadcast over the 4 kv slots."""
+            return Vec.from_elements([x], fx.Float32).broadcast_to(4).ir_value()
+
+        # Rebuilding these two seeds at each tile instead of carrying them frees enough
+        # registers to reach four work-groups per CU spill-free; forcing the same
+        # occupancy tier via waves_per_eu without freeing registers first spills badly.
+        delta_inits = [_seed4(delta_owned[qt]) for qt in range_constexpr(QT)]
         if const_expr(fold_lse):
-            lse_inits = [
-                Vec.from_elements([lse_owned[qt]], fx.Float32).broadcast_to(4).ir_value()
-                for qt in range_constexpr(QT)
-            ]
+            lse_inits = [_seed4(lse_owned[qt]) for qt in range_constexpr(QT)]
             # Reuse slot 0 of the broadcast for the masked path instead of keeping the
             # scalar alive too (same register, no extra live value).
             lse_owned = [fx.Float32(Vec(lse_inits[qt])[0]) for qt in range_constexpr(QT)]
@@ -3562,218 +3881,423 @@ def build_flash_attn_bwd_dq_module(
                 coop_dma_tile(k_rsrc, lds_base_idx, _kv_next)
                 coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(LDS_V_BASE * 2), _kv_next)
 
-        def _kv_body(kv_start, inner, apply_mask):
-            # The LDS tile for kv_start is already resident (prologue for the first
-            # iteration, the previous body for the rest): this body consumes it and
-            # leaves the tile for kv_start+BLOCK_KV behind (see the hand-over below).
-            A_cur = [[inner[dt * QT + qt] for qt in range_constexpr(QT)] for dt in range_constexpr(DT)]
+        def _kv_body(
+            kv_start,
+            inner,
+            apply_mask,
+            win_mask=True,
+            skip=None,
+            causal_sel=False,
+            dead=(),
+            in_range=(),
+            slot=0,
+            s_inits=None,
+        ):
+            # `slot` picks this tile's LDS pair when the whole window is resident; the
+            # offsets stay compile-time so ds_read keeps its immediate form. `s_inits`
+            # overrides the GEMM1a accumulator seed for the clipped tiles described above.
+            _lds_k = fx.Index(slot * LDS_SLOT)
+            _lds_v = fx.Index(slot * LDS_SLOT + LDS_V_BASE)
+            # `dead` / `in_range` are the compile-time (kvt, qt) patch sets from
+            # _patch_bounds: `dead` patches are always outside the window/causal edge (P
+            # is exactly zero, so GEMM1/exp/mask/select all drop); `in_range` ones are
+            # always inside (keep arithmetic, drop the select). Both are bitwise-neutral.
+            # `skip` is a wave-uniform predicate for "this wave sees at least one kv row of
+            # this tile"; excluded waves have P == 0 over the whole tile, so branching
+            # around them is bitwise-neutral. The hand-over stays outside the branch
+            # since it's work-group collective.
             sb_bulk = not apply_mask  # exps only exist on these paths
-            _pf = coop_load_tile_regs(kv_start + fx.Index(BLOCK_KV)) if const_expr(KV_REG_PF) else None
-
+            # Tiles KV_PF_D ahead are issued here; at depth 2 the tile due for LDS at the
+            # end of this body was issued by the previous one and arrives as a carry.
+            # A forced-L1-hit re-staging probe capped the whole "cut K/V requests" family
+            # (head-outer restructure, wider chunks, deeper prefetch) at a small gain, so
+            # that's not where this kernel's time goes.
+            _pf = (
+                coop_load_tile_regs(kv_start + fx.Index(KV_PF_D * BLOCK_KV))
+                if const_expr(KV_REG_PF)
+                else None
+            )
+            _pf_due = _pf
+            if const_expr(KV_PF_D == 2):
+                _pf_due = inner[DT * QT :]
+                inner = inner[: DT * QT]
             kv_start_i32 = fx.Int32(kv_start)
-            # C[kvt][qt]: 4 f32 at kv=kvt*16+kg*4+t, q=qt*16+lane16. C = P~*(dP-delta_id)
-            # feeds GEMM2.
-            C = [[None] * QT for _ in range_constexpr(KVT)]
-            c_pack = [[None] * QT for _ in range_constexpr(PV_K_STEPS)]
-            # Split GEMM1a/1b + exp2/C + pack per kv-half (pks = the 2 kvt of one GEMM2 K=32 step):
-            # only 2 kvt of s/dP are live at a time, halving the transient VGPR peak without touching
-            # the batched GEMM2 below. The next half's K ds_read is issued right after this half's
-            # GEMM1 MFMAs so its latency hides in the VALU-heavy exp2/C/pack shadow (V stays in-half).
-            k_a_by_half = {0: _gemm1_load(fx.Index(0), [0, 1])}
-            for pks in range_constexpr(PV_K_STEPS):
-                ka, kb = 2 * pks, 2 * pks + 1
-                half = [ka, kb]
-                # GEMM1a S[kv,q]=K@Q^T ; GEMM1b dP[kv,q]=V@dO^T (acc init=-delta_id) for
-                # this kv-half. s_setprio(1) raises MFMA priority over ds_read/VALU;
-                # dropped to 0 for the exp2/pack/reduce VALU section so it is not starved.
-                rocdl.s_setprio(1)
-                rocdl.iglp_opt(0)
-                if const_expr(fold_lse and not apply_mask):
-                    _s_inits = lse_inits
-                else:
-                    _s_inits = None
-                s_tiles = _gemm1_mfma(k_a_by_half[pks], q_b_packs, inits_q=_s_inits, kvts=half)
-                if const_expr(sb_bulk):
-                    rocdl.sched_barrier(SCHED_TRANS)
-                dp_tiles = _gemm1(fx.Index(LDS_V_BASE), do_b_packs, delta_inits, kvts=half)
-                rocdl.s_setprio(0)
 
-                # Narrow the prefetched half's live range: load only ka's K here and issue kb's between
-                # qt=0 and qt=1 (_next_kb_load), so the second kvt's registers stay live for half as long
-                # before GEMM1 consumes them, at the same ds_read-vs-VALU overlap.
-                _next_kb_load = None
-                if const_expr(pks + 1 < PV_K_STEPS):
-                    nka, nkb = 2 * (pks + 1), 2 * (pks + 1) + 1
-                    # s_setprio(1) around the prefetch ds_read issue only (not the
-                    # VALU it's interleaved with): the load itself should win issue
-                    # priority over the surrounding exp2/pack VALU so it drains
-                    # sooner, without raising priority on the VALU work itself.
-                    rocdl.s_setprio(1)
-                    k_a_by_half[pks + 1] = _gemm1_load(fx.Index(0), [nka])
-                    rocdl.s_setprio(0)
-
-                    def _next_kb_load():  # noqa: B023
-                        rocdl.s_setprio(1)
-                        k_a_by_half[pks + 1].update(_gemm1_load(fx.Index(0), [nkb]))  # noqa: B023
-                        rocdl.s_setprio(0)
-
-                if const_expr(not apply_mask):
-                    # Vectorized bulk (below-diagonal): exp2/C/reduce as packed v4 ops
-                    # (v_pk_*), mirroring the 32x32 kernel's v8 path. exp2 and C=P*dP are
-                    # strictly elementwise so C is bit-identical to the scalar branch;
-                    # R re-associated in a fixed order -> deterministic (det gate holds).
-                    for qt in range_constexpr(QT):
-                        if const_expr(qt == 1 and _next_kb_load is not None):
-                            _next_kb_load()
-                        if const_expr(not fold_lse):
-                            lse_v4 = Vec.from_elements([lse_owned[qt]], fx.Float32).broadcast_to(4)
-                        for kvt in half:
-                            if const_expr(fold_lse):
-                                # either (see _vexp).
-                                _s_v = Vec(s_tiles[kvt][qt])
-                                p4 = Vec.from_elements(
-                                    [_vexp(fx.Float32(_s_v[t])) for t in range_constexpr(4)],
-                                    fx.Float32,
-                                )
-                            else:
-                                # exact: 2^diff on the log2 exponent (lse arrives as
-                                # plain -log2e*lse), elementwise over the v4.
-                                diff4 = fmath.fma(
-                                    _raw(s_tiles[kvt][qt]),
-                                    _raw(_scale_log2e_v4),
-                                    _raw(lse_v4),
-                                    fastmath=fm_fast,
-                                )
-                                p4 = Vec.from_elements(
-                                    [_vexp(Vec(diff4)[t]) for t in range_constexpr(4)], fx.Float32
-                                )
-                            if const_expr(window_left >= 0):
-                                # keep kv >= q+off-W (W+1 keys), matching the fwd SWA edge:
-                                # '>=' keeps the boundary key kv == _thr == q+off-W.
-                                _thr = q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left)
-                                _kvb = kv_start_i32 + fx.Int32(kvt * M_TILE + kg * 4)
-                                p4 = Vec.from_elements(
-                                    [
-                                        ArithValue(_kvb + fx.Int32(t) >= _thr).select(Vec(p4)[t], c_zero_f)
-                                        for t in range_constexpr(4)
-                                    ],
-                                    fx.Float32,
-                                )
-                            c4 = p4 * Vec(dp_tiles[kvt][qt])
-                            C[kvt][qt] = [c4[t] for t in range_constexpr(4)]
-                else:
-                    for qt in range_constexpr(QT):
-                        if const_expr(qt == 1 and _next_kb_load is not None):
-                            _next_kb_load()
-                        lse_q = lse_owned[qt]
-                        for kvt in half:
-                            dp_v = dp_tiles[kvt][qt]
-                            s_v = s_tiles[kvt][qt]
-                            c_vals = []
-                            for t in range_constexpr(4):
-                                kv_slot = kv_start_i32 + fx.Int32(kvt * M_TILE + kg * 4 + t)
-                                _up = ArithValue(kv_slot > q_slot_i32[qt] + causal_off_i32)
-                                if const_expr(window_left >= 0):
-                                    # keep kv >= q+off-W (W+1 keys), matching the fwd SWA edge.
-                                    _lo = ArithValue(
-                                        kv_slot < q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left)
-                                    )
-                                    _mm = ArithValue(arith.ori(_raw(_up), _raw(_lo)))
-                                else:
-                                    _mm = _up
-                                s_r = _mm.select(c_neg_inf, fx.Float32(Vec(s_v)[t]))
-                                p = _p_of(s_r, lse_q, True)
-                                c = _fmul(p, Vec(dp_v)[t])
-                                c_vals.append(c)
-                            C[kvt][qt] = c_vals
-
-                # Pack this half's C now (contract over kv): combine kvt=ka (k=0..3) and
-                # kvt=kb (k=4..7) -> 8 kv values/lane matching _read_tr's kv ordering.
-                # Packing here frees C[ka],C[kb] (and s/dP) before the next half's GEMM1.
-                if const_expr(sb_bulk):
-                    rocdl.sched_barrier(SCHED_TRANS)
-                for qt in range_constexpr(QT):
-                    c_pack[pks][qt] = bf16_trunc_pack_v8(C[ka][qt] + C[kb][qt])
-
-            # GEMM2 A^T[D,q] += K_tr @ C. Process dt in interleaved pairs so a dependent MFMA is
-            # separated by 3 independent ones, covering the 16x16x32 operand latency. The next pair's
-            # k_tr is prefetched during the current one; the initial pair is read here, not hoisted,
-            # to keep k_tr off the s/dP transient peak. s_setprio(2) puts MFMA issue over ds_read.
-            kts = [
-                [_read_tr(fx.Index(0), d, pks) for pks in range_constexpr(PV_K_STEPS)]
-                for d in range_constexpr(min(G2A, DT))
-            ]
-            rocdl.s_setprio(2)
-            for d0 in range_constexpr(0, DT, 2):
-                if const_expr(d0 + G2A < DT):
-                    for _dn in range_constexpr(d0 + G2A, d0 + G2A + 2):
-                        kts.append(
-                            [_read_tr(fx.Index(0), _dn, pks) for pks in range_constexpr(PV_K_STEPS)]
-                        )
+            def _core(carry, emit_dma):
+                A_cur = [
+                    [carry[dt * QT + qt] for qt in range_constexpr(QT)]
+                    for dt in range_constexpr(DT)
+                ]
+                # C[kvt][qt]: 4 f32 at kv=kvt*16+kg*4+t, q=qt*16+lane16. C = P~*(dP-delta_id)
+                # feeds GEMM2.
+                C = [[None] * QT for _ in range_constexpr(KVT)]
+                c_pack = [[None] * QT for _ in range_constexpr(PV_K_STEPS)]
+                # Split GEMM1a/1b + exp2/C + pack per kv-half (pks = the 2 kvt of one GEMM2 K=32 step):
+                # only 2 kvt of s/dP are live at a time, halving the transient VGPR peak without touching
+                # the batched GEMM2 below. The next half's K ds_read is issued right after this half's
+                # GEMM1 MFMAs so its latency hides in the VALU-heavy exp2/C/pack shadow (V stays in-half).
+                k_a_by_half = {0: _gemm1_load(_lds_k, [0, 1])}
                 for pks in range_constexpr(PV_K_STEPS):
-                    for dd in range_constexpr(d0, min(d0 + 2, DT)):
+                    ka, kb = 2 * pks, 2 * pks + 1
+                    half = [ka, kb]
+                    # GEMM1a S[kv,q]=K@Q^T ; GEMM1b dP[kv,q]=V@dO^T (acc init=-delta_id) for
+                    # this kv-half. s_setprio(1) raises MFMA priority over ds_read/VALU;
+                    # dropped to 0 for the exp2/pack/reduce VALU section so it is not starved.
+                    _setprio(1)
+                    rocdl.iglp_opt(0)
+                    if const_expr(fold_lse and not apply_mask):
+                        _s_inits = lse_inits if s_inits is None else s_inits
+                    else:
+                        _s_inits = None
+                    s_tiles = _gemm1_mfma(
+                        k_a_by_half[pks], q_b_packs, inits_q=_s_inits, kvts=half, dead=dead
+                    )
+                    if const_expr(sb_bulk):
+                        rocdl.sched_barrier(SCHED_TRANS)
+                    dp_tiles = _gemm1(
+                        _lds_v, do_b_packs, delta_inits, kvts=half, dead=dead
+                    )
+                    _setprio(0)
+
+                    # Narrow the prefetched half's live range: load only ka's K here and issue kb's between
+                    # qt=0 and qt=1 (_next_kb_load), so the second kvt's registers stay live for half as long
+                    # before GEMM1 consumes them, at the same ds_read-vs-VALU overlap.
+                    _next_kb_load = None
+                    if const_expr(pks + 1 < PV_K_STEPS):
+                        nka, nkb = 2 * (pks + 1), 2 * (pks + 1) + 1
+                        # s_setprio(1) around the prefetch ds_read issue only (not the
+                        # VALU it's interleaved with): the load itself should win issue
+                        # priority over the surrounding exp2/pack VALU so it drains
+                        # sooner, without raising priority on the VALU work itself.
+                        _setprio(1)
+                        k_a_by_half[pks + 1] = _gemm1_load(_lds_k, [nka])
+                        _setprio(0)
+
+                        def _next_kb_load():  # noqa: B023
+                            _setprio(1)
+                            k_a_by_half[pks + 1].update(_gemm1_load(_lds_k, [nkb]))  # noqa: B023
+                            _setprio(0)
+
+                    if const_expr(not apply_mask):
+                        # Vectorized bulk (below-diagonal): exp2/C/reduce as packed v4 ops
+                        # (v_pk_*), mirroring the 32x32 kernel's v8 path. exp2 and C=P*dP are
+                        # strictly elementwise so C is bit-identical to the scalar branch;
+                        # R re-associated in a fixed order -> deterministic (det gate holds).
                         for qt in range_constexpr(QT):
-                            A_cur[dd][qt] = mfma_acc(kts[dd][pks], c_pack[pks][qt], A_cur[dd][qt])
-                # Interleave the next-pair prefetch ds_read_tr16 1:1 with the pair MFMAs.
-                if const_expr(d0 + G2A < DT):
-                    for _ in range_constexpr(2 * PV_K_STEPS * QT):
-                        rocdl.sched_mfma(1)
-                        rocdl.sched_dsrd(1)
-                # LDS hand-over (DMA path): this pair issues the tile's last k_tr read, so the
-                # next tile is DMA'd into the SAME buffer while the remaining register-only
-                # GEMM2 pair covers the transfer. Unlike an LDS double buffer (measured
-                # net-negative) the in-flight writes never contend with LDS reads and no second
-                # buffer is needed. Issuing it here also keeps the DMA address registers off the
-                # all-DT k_tr peak.
-                if const_expr(d0 == max(0, DT - 4) and not KV_REG_PF):
+                            # QT == 1 (BLOCK_M == 64) has no qt=1 to hang the load on, so it
+                            # issues at qt=0; the k_a_by_half entry is not optional.
+                            if const_expr(qt == min(1, QT - 1) and _next_kb_load is not None):
+                                _next_kb_load()
+                            if const_expr(not fold_lse):
+                                lse_v4 = Vec.from_elements([lse_owned[qt]], fx.Float32).broadcast_to(4)
+                            for kvt in half:
+                                if const_expr((kvt, qt) in dead):
+                                    C[kvt][qt] = [None] * 4
+                                    continue
+                                if const_expr(fold_lse):
+                                    # either (see _vexp).
+                                    _s_v = Vec(s_tiles[kvt][qt])
+                                    p4 = Vec.from_elements(
+                                        [_vexp(fx.Float32(_s_v[t])) for t in range_constexpr(4)],
+                                        fx.Float32,
+                                    )
+                                else:
+                                    # exact: 2^diff on the log2 exponent (lse arrives as
+                                    # plain -log2e*lse), elementwise over the v4.
+                                    diff4 = fmath.fma(
+                                        _raw(s_tiles[kvt][qt]),
+                                        _raw(_scale_log2e_v4),
+                                        _raw(lse_v4),
+                                        fastmath=fm_fast,
+                                    )
+                                    p4 = Vec.from_elements(
+                                        [_vexp(Vec(diff4)[t]) for t in range_constexpr(4)], fx.Float32
+                                    )
+                                _sel_win = const_expr(
+                                    window_left >= 0 and win_mask and (kvt, qt) not in in_range
+                                )
+                                _sel_causal = const_expr(causal_sel and (kvt, qt) not in in_range)
+                                if const_expr(_sel_win or _sel_causal):
+                                    # keep kv >= q+off-W (W+1 keys, matching the fwd SWA
+                                    # edge); causal_sel adds kv <= q+off so diagonal tiles
+                                    # can run this vectorised body (zero P after exp2, same
+                                    # result as feeding -inf) instead of the scalar one.
+                                    _kvb = kv_start_i32 + fx.Int32(kvt * M_TILE + kg * 4)
+                                    _qc = q_slot_i32[qt] + causal_off_i32
+                                    _thr = _qc - fx.Int32(window_left)
+                                    _keep = []
+                                    for t in range_constexpr(4):
+                                        _kvt4 = _kvb + fx.Int32(t)
+                                        _k = None
+                                        if const_expr(_sel_win):
+                                            _k = ArithValue(_kvt4 >= _thr)
+                                        if const_expr(_sel_causal):
+                                            _c = ArithValue(_kvt4 <= _qc)
+                                            _k = _c if _k is None else ArithValue(
+                                                arith.andi(_raw(_k), _raw(_c))
+                                            )
+                                        _keep.append(_k.select(Vec(p4)[t], c_zero_f))
+                                    p4 = Vec.from_elements(_keep, fx.Float32)
+                                c4 = p4 * Vec(dp_tiles[kvt][qt])
+                                C[kvt][qt] = [c4[t] for t in range_constexpr(4)]
+                    else:
+                        for qt in range_constexpr(QT):
+                            if const_expr(qt == min(1, QT - 1) and _next_kb_load is not None):
+                                _next_kb_load()
+                            lse_q = lse_owned[qt]
+                            for kvt in half:
+                                if const_expr((kvt, qt) in dead):
+                                    C[kvt][qt] = [None] * 4
+                                    continue
+                                dp_v = dp_tiles[kvt][qt]
+                                s_v = s_tiles[kvt][qt]
+                                c_vals = []
+                                for t in range_constexpr(4):
+                                    kv_slot = kv_start_i32 + fx.Int32(kvt * M_TILE + kg * 4 + t)
+                                    _up = ArithValue(kv_slot > q_slot_i32[qt] + causal_off_i32)
+                                    if const_expr(window_left >= 0 and win_mask):
+                                        # keep kv >= q+off-W (W+1 keys), matching the fwd SWA edge.
+                                        _lo = ArithValue(
+                                            kv_slot < q_slot_i32[qt] + causal_off_i32 - fx.Int32(window_left)
+                                        )
+                                        _mm = ArithValue(arith.ori(_raw(_up), _raw(_lo)))
+                                    else:
+                                        _mm = _up
+                                    s_r = _mm.select(c_neg_inf, fx.Float32(Vec(s_v)[t]))
+                                    p = _p_of(s_r, lse_q, True)
+                                    c = _fmul(p, Vec(dp_v)[t])
+                                    c_vals.append(c)
+                                C[kvt][qt] = c_vals
+
+                    # Pack this half's C now (contract over kv): combine kvt=ka (k=0..3) and
+                    # kvt=kb (k=4..7) -> 8 kv values/lane matching _read_tr's kv ordering.
+                    # Packing here frees C[ka],C[kb] (and s/dP) before the next half's GEMM1.
+                    if const_expr(sb_bulk):
+                        rocdl.sched_barrier(SCHED_TRANS)
+                    for qt in range_constexpr(QT):
+                        c_pack[pks][qt] = bf16_trunc_pack_v8(C[ka][qt] + C[kb][qt])
+
+                # GEMM2 A^T[D,q] += K_tr @ C, processed in interleaved dt pairs so a dependent
+                # MFMA is separated by 3 independent ones (covers the 16x16x32 operand
+                # latency); next pair's k_tr is prefetched during the current one.
+                kts = [
+                    [_read_tr(_lds_k, d, pks) for pks in range_constexpr(PV_K_STEPS)]
+                    for d in range_constexpr(min(G2A, DT))
+                ]
+                _setprio(2)
+                for d0 in range_constexpr(0, DT, 2):
+                    if const_expr(d0 + G2A < DT):
+                        for _dn in range_constexpr(d0 + G2A, d0 + G2A + 2):
+                            kts.append(
+                                [_read_tr(_lds_k, _dn, pks) for pks in range_constexpr(PV_K_STEPS)]
+                            )
+                    for pks in range_constexpr(PV_K_STEPS):
+                        for dd in range_constexpr(d0, min(d0 + 2, DT)):
+                            for qt in range_constexpr(QT):
+                                A_cur[dd][qt] = mfma_acc(kts[dd][pks], c_pack[pks][qt], A_cur[dd][qt])
+                    # Interleave the next-pair prefetch ds_read_tr16 1:1 with the pair MFMAs.
+                    if const_expr(d0 + G2A < DT):
+                        for _ in range_constexpr(2 * PV_K_STEPS * QT):
+                            rocdl.sched_mfma(1)
+                            rocdl.sched_dsrd(1)
+                    # LDS hand-over (DMA path): this pair issues the tile's last k_tr read, so
+                    # the next tile DMAs into the SAME buffer while the remaining register-only
+                    # GEMM2 pair covers the transfer -- no double buffer needed since in-flight
+                    # writes never contend with LDS reads once the last read has issued.
+                    if const_expr(
+                        emit_dma and d0 == max(0, DT - 4) and not KV_REG_PF and not WIN_RESIDENT
+                    ):
+                        gpu.barrier()
+                        _issue_dma(kv_start)  # noqa: B023
+                _setprio(0)
+                return [
+                    A_cur[dt][qt] for dt in range_constexpr(DT) for qt in range_constexpr(QT)
+                ]
+
+            if const_expr(skip is None):
+                out = _core(inner, True)
+            else:
+                out = _if_wave(
+                    skip,
+                    [inner[i] for i in range_constexpr(DT * QT)],
+                    lambda: _core(inner, False),
+                    lambda: None,
+                )
+                # The skipped waves never read this tile, so the WAR fence and the next
+                # tile's DMA -- work-group collective -- move behind the whole branch
+                # instead of riding GEMM2's last pair.
+                if const_expr(not KV_REG_PF and not WIN_RESIDENT):
                     gpu.barrier()
-                    _issue_dma(kv_start)  # noqa: B023
-            rocdl.s_setprio(0)
+                    _issue_dma(kv_start)
             if const_expr(KV_REG_PF):
                 # This pair of barriers is the whole per-tile rendezvous and prices at only
                 # 0.67% of the kernel (WAR 0.62%, publish 0.10%), so an LDS double buffer --
                 # which would remove the WAR half at 2x LDS plus a x2 loop unroll to keep the
                 # slot bases compile-time constants -- is not worth its register cost.
                 gpu.barrier()  # WAR: fence this tile's LDS reads before the rewrite
-                coop_store_tile_lds(_pf)
+                coop_store_tile_lds(_pf_due)
+            elif const_expr(WIN_RESIDENT):
+                # Nothing was written to LDS during the body, so there is no WAR hazard
+                # and no publish to fence: the tiles are all live from the single
+                # prologue barrier to the end of the kernel.
+                pass
             elif const_expr(ENABLE_DMA):
                 rocdl.s_waitcnt(0)
-            gpu.barrier()
+            if const_expr(not WIN_RESIDENT):
+                gpu.barrier()
 
-            out = [A_cur[dt][qt] for dt in range_constexpr(DT) for qt in range_constexpr(QT)]
-            return out
+            return out + _pf if const_expr(KV_PF_D == 2) else out
+
+        # ---- 16-row (kv, q) patch bounds -----------------------------------------------
+        # A BLOCK_KV x BLOCK_M tile is walked as KVT x QT patches of M_TILE x N_TILE rows,
+        # so band edges resolve per patch instead of per tile: a patch entirely outside the
+        # attended band (-window_left <= kv-(q+off) <= 0) has P == 0, so its GEMM1/exp2/mask
+        # select/C pack all drop; one entirely inside just drops the select. Both are exact.
+        _TRIM_ROWS = const_expr(
+            window_left >= 0 and BLOCK_M <= BLOCK_KV and WAVE_ROW_GROUPS == 1
+        )
+
+        def _patch_bounds(kv_off):
+            """(dead, in_range) patch sets for a tile at q_start + causal_offset + kv_off."""
+            dead, inr = set(), set()
+            if const_expr(_TRIM_ROWS):
+                for kvt in range_constexpr(KVT):
+                    klo, khi = kv_off + kvt * M_TILE, kv_off + kvt * M_TILE + M_TILE - 1
+                    for qt in range_constexpr(QT):
+                        qlo, qhi = qt * N_TILE, qt * N_TILE + N_TILE - 1
+                        if const_expr(klo > qhi or khi < qlo - window_left):
+                            dead.add((kvt, qt))
+                        elif const_expr(khi <= qlo and klo >= qhi - window_left):
+                            inr.add((kvt, qt))
+            return dead, inr
+
+        # The window-edge loop below runs at most one trip, at kv_off == -window_left: the
+        # tile grid is anchored on q_start + causal_offset (a BLOCK_KV multiple), so when
+        # q+off < W the whole edge range collapses onto _wlo and the loop doesn't run.
+        _EDGE_ANCHORED = const_expr(
+            _TRIM_ROWS and BLOCK_M == BLOCK_KV and window_left % BLOCK_KV == 0
+        )
+        _edge_dead, _edge_inr = (
+            _patch_bounds(-window_left) if const_expr(_EDGE_ANCHORED) else (set(), set())
+        )
+        _diag_dead, _diag_inr = _patch_bounds(0)
 
         # Split the causal kv-loop: [0, q_start) below the diagonal (no mask),
         # [q_start, kv_upper) straddles it (mask).
-        _carry = A_accs
+        _carry = A_accs + _pf_carry
         loop_results = _carry
         if const_expr(window_left >= 0):
-            # fx.Index is unsigned: guard the subtract (W may exceed q+off) to
-            # avoid underflow-to-huge. _wlo skips fully-out-of-window kv tiles; the
-            # first in-window kv is q+off-W (W+1-key window), so start from there.
-            _wlo = fx.Index(
-                ArithValue(q_start + causal_offset >= fx.Index(window_left)).select(
-                    q_start + causal_offset - fx.Index(window_left), fx.Index(0)
+            # First kv tile the window predicate is a tautology on: every walked q row
+            # (up to q_start+BLOCK_M-1) sees every kv >= _wsafe, so [_wsafe, diagonal)
+            # runs a window-mask-free body. Ceil onto the tile grid _wlo already sits
+            # on and clamp into [_wlo, diagonal] so the two loops stay contiguous.
+            _whi = q_start + causal_offset + fx.Index(BLOCK_M - 1)
+            _wsafe = fx.Index(
+                ArithValue(_whi >= fx.Index(window_left)).select(
+                    _whi - fx.Index(window_left), fx.Index(0)
                 )
             )
-            _wlo = (_wlo // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
-        else:
-            _wlo = fx.Index(0)
+            _wsafe = ((_wsafe + fx.Index(BLOCK_KV - 1)) // fx.Index(BLOCK_KV)) * fx.Index(BLOCK_KV)
+            _wsafe = fx.Index(ArithValue(_wsafe > _wlo).select(_wsafe, _wlo))
+            _wsafe = fx.Index(
+                ArithValue(_wsafe < q_start + causal_offset).select(
+                    _wsafe, q_start + causal_offset
+                )
+            )
         # Prologue for the software-pipelined body: it expects its own tile already in
         # LDS and leaves the next one there. _wlo is the first kv tile of whichever of
         # the two loops below runs first (they are contiguous).
         if const_expr(ENABLE_DMA):
-            coop_dma_tile(k_rsrc, lds_base_idx, _wlo)
-            coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(LDS_V_BASE * 2), _wlo)
+            if const_expr(not DMA_SEED):
+                coop_dma_tile(k_rsrc, lds_base_idx, _wlo)
+                coop_dma_tile(v_rsrc, lds_base_idx + fx.Index(LDS_V_BASE * 2), _wlo)
             rocdl.s_waitcnt(0)
         gpu.barrier()
-        for kv_start, inner in range(_wlo, q_start + causal_offset, BLOCK_KV, init=_carry):
-            loop_results = yield _kv_body(kv_start, inner, False)
-        for kv_start, inner in range(q_start + causal_offset, kv_upper, BLOCK_KV, init=loop_results):
-            loop_results = yield _kv_body(kv_start, inner, True)
+        # Collapsing the three kv bodies below (window edge / no edge / causal edge) into
+        # one that applies both edges everywhere is bitwise-neutral but regresses: every
+        # tile then pays both a window compare and a causal select where it used to pay one.
+        if const_expr(WIN_RESIDENT):
+            # Straight-line walk over the resident window: tile j sits at a compile-time
+            # offset from q_start + causal_offset, so its patch classification is
+            # compile-time too (j == 0 is the window edge, the last is the diagonal,
+            # everything between needs neither compare nor select).
+            for _j in range_constexpr(WIN_TILES):
+                _kvj = _win_tile_i32(_j)
+                if const_expr(_j == 0):
+                    _flags = dict(
+                        win_mask=True, dead=_edge_dead, in_range=_edge_inr
+                    )
+                elif const_expr(_j == WIN_TILES - 1):
+                    _flags = dict(
+                        win_mask=window_left < BLOCK_M - 1,
+                        causal_sel=True,
+                        dead=_diag_dead,
+                        in_range=_diag_inr,
+                    )
+                else:
+                    _flags = dict(win_mask=False)
+                # Only the tiles the sequence start can clip need the -inf seed; the
+                # diagonal tile is always in range. One scalar select per owned q 16-tile.
+                _si = None
+                if const_expr(_j < WIN_TILES - 1):
+                    _keep = ArithValue(_kvj >= fx.Int32(0))
+                    _si = [
+                        Vec.from_elements(
+                            [fx.Float32(_keep.select(lse_owned[qt], c_neg_inf))], fx.Float32
+                        )
+                        .broadcast_to(4)
+                        .ir_value()
+                        for qt in range_constexpr(QT)
+                    ]
+                loop_results = _kv_body(
+                    _kvj, loop_results, False, slot=_j, s_inits=_si, **_flags
+                )
+        elif const_expr(window_left >= 0):
+            # A wave owns only ROWS_PER_WAVE_Q of the group's BLOCK_M rows, so the group's
+            # kv extent overhangs each wave's own window at both ends; those tiles are
+            # all-masked (P == 0) for that wave and skipped behind a wave-uniform branch.
+            # Only the two edge loops need the test -- the bulk is in-window by construction.
+            _qw_i32 = fx.Int32(q_row_wave) + causal_off_i32
+            for kv_start, inner in range(_wlo, _wsafe, BLOCK_KV, init=_carry):
+                _live = None
+                if const_expr(WAVE_OVERHANG):
+                    _live = ArithValue(
+                        fx.Int32(kv_start) + fx.Int32(BLOCK_KV - 1 + window_left) >= _qw_i32
+                    )
+                loop_results = yield _kv_body(
+                    kv_start, inner, False, True, _live, False, _edge_dead, _edge_inr
+                )
+            for kv_start, inner in range(_wsafe, q_start + causal_offset, BLOCK_KV, init=loop_results):
+                loop_results = yield _kv_body(kv_start, inner, False, False)
+        else:
+            for kv_start, inner in range(_wlo, q_start + causal_offset, BLOCK_KV, init=_carry):
+                loop_results = yield _kv_body(kv_start, inner, False)
+        # The diagonal block only needs the window test when the window is narrower than
+        # the rows this group walks; at W >= BLOCK_M-1 no kv >= q_start can fall below
+        # any walked row's q+off-W.
+        _diag_win = const_expr(window_left < BLOCK_M - 1)
+        # Under a window the diagonal runs the vectorised body with the causal edge as a
+        # select instead of the scalar masked body: the window already forces a per-element
+        # test here, so folding the causal edge into it costs one more compare and buys the
+        # whole diagonal the bulk path's packing.
+        _cs = const_expr(window_left >= 0)
+        if const_expr(not WIN_RESIDENT):
+            # The resident walk above already ran this tile as its last slot.
+            for kv_start, inner in range(
+                q_start + causal_offset, kv_upper, BLOCK_KV, init=loop_results
+            ):
+                _live = None
+                if const_expr(_cs and WAVE_OVERHANG):
+                    # Above-diagonal counterpart of the loop above: a tile starting past
+                    # this wave's last owned q row is causally dead for it.
+                    _live = ArithValue(
+                        fx.Int32(kv_start) <= _qw_i32 + fx.Int32(ROWS_PER_WAVE_Q - 1)
+                    )
+                loop_results = yield _kv_body(
+                    kv_start, inner, not _cs, _diag_win, _live, _cs, _diag_dead, _diag_inr
+                )
 
         A_finals = [[loop_results[dt * QT + qt] for qt in range_constexpr(QT)] for dt in range_constexpr(DT)]
-
         # Epilogue: dQ = sm * A. Both exp modes use R == 1 -- lse is the true log-sum-exp so
         # rowsum(exp(S-lse)) == 1, and the Schraudolph fast P~ sums to 1 to bf16 precision -- so
         # the renorm is dropped. The 16x16 C-layout gives 4 contiguous D per lane, direct store.
@@ -3820,7 +4344,7 @@ def build_flash_attn_bwd_dq_module(
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len_q)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
-        grid_x = bs_idx * num_q_tiles * NUM_HEADS_Q
+        grid_x = bs_idx * num_q_tiles * (NUM_HEADS_Q // Q_HEADS_PER_WG)
 
         passthrough_entries = (
             [
@@ -3881,18 +4405,23 @@ def build_flash_attn_bwd_dq_module(
 # ===========================================================================
 
 
-def _qsplit_for(Sq):
+def _qsplit_for(Sq, window_left=-1):
     # q_split fans the dK/dV KV-owner WGs across the CU grid; the optimum rises with
     # Sq before split-reduction overhead dominates. Re-swept once the fused path started
     # dispatching one batch at a time (fewer work-groups per dispatch, so list-scheduling
     # slack matters more): 4 still wins; wider only adds dk/dv slots for the slot reduce
     # to fold.
+    if window_left >= 0:
+        # Sliding window: a band's whole q range is only BLOCK_KV+W rows, so splitting it
+        # hands the SAME work to q_split times as many work-groups and multiplies the
+        # dk/dv workspace. One slot avoids both the redundant prologues and the slot reduce.
+        return 1
     if Sq <= 8192:
         return 4
     return 3
 
 
-def _blockkv_for(Skv, head_dim=64):
+def _blockkv_for(Skv, head_dim=64, window_left=-1):
     # dkdv is KV-outer, so Skv (not Sq) sets its grid: a short Skv needs BLOCK_KV=64
     # to fill the CU array, a long one wants a wider tile to amortise per-tile cost;
     # keying this on Sq instead costs badly on rectangular shapes. D128's wider tile
@@ -3902,6 +4431,12 @@ def _blockkv_for(Skv, head_dim=64):
     # and determinism at Skv >= 8192 directly whenever these thresholds move.
     if head_dim >= 128:
         return 192 if Skv >= 8192 else 64
+    if window_left >= 0:
+        # Narrowing the band raises the attended fraction BLOCK_KV/(BLOCK_KV+W) and kills
+        # more fully-outside-window tiles, but alone it costs more in Q/dO re-read than it
+        # saves in MFMA. It only pays together with Q_PAIR, which recovers that MFMA
+        # saving at BLOCK_KV=64 without the extra staging (see Q_PAIR).
+        return 64
     return 64 if Skv <= 2048 else 128
 
 
@@ -3921,11 +4456,17 @@ def _fuse_blockkv_for(Skv):
     return 64 if Skv <= 1024 else 128
 
 
-def _dq_block_kv(Sq):
+def _dq_block_kv(Sq, window_left=-1):
     """dq's kv tile, swept with dkdv running before it (L2 contention moves the
     optimum). Only multiples of 32 are valid -- other sizes silently produce the
     wrong dQ, so keep to the checked set {32, 64, 96, 192}.
     """
+    if window_left >= 0:
+        # The window bound already trims the kv loop to ceil((BLOCK_M+W)/BLOCK_KV) tiles,
+        # so a narrow tile costs no extra area here (BLOCK_M and W are both multiples of
+        # 32) and buys scheduling/register slack. 96 and 192 compute the wrong dQ under a
+        # window (SNR ~6 dB) -- keep to {32, 64}.
+        return 32
     return 96 if Sq >= 16384 else 64
 
 
@@ -4051,6 +4592,11 @@ def _reduce_dkdv_slots(ws_dk, ws_dv, n_slots, n_groups, stream):
     built for (THD [B,q_split,Skv,Hkv,D] -> [B*Skv,Hkv,D], SBHD [q_split,...] with
     n_groups=1). Falls back to torch when the element count does not tile.
     """
+    if n_slots == 1:
+        # Nothing to fold: the single slot IS the result (one writer per element, so this
+        # is bitwise what the reduce would have produced). Skips a full-workspace
+        # DRAM round trip that the reduce cannot hit in L2.
+        return ws_dk.reshape(-1), ws_dv.reshape(-1)
     n_elems = ws_dk.numel() // (n_slots * n_groups)
     if n_elems % _SLOTRED_TILE:
         axis = 1 if n_groups > 1 else 0
@@ -4257,18 +4803,34 @@ def _get_bwd(
         # twice as wide, so it needs a halved tile to keep two waves per SIMD spill-free.
         # g2d (D128's GEMM2 transpose-read prefetch depth) goes deeper here to cover the
         # extra ds_read_tr16 latency within the occ-2 budget's spare registers.
-        dq_block_m = 128 if D == 128 else 192
+        # Under a left window the walked kv extent per WG is block_m + W, not the whole
+        # causal prefix, so a wide tile no longer amortises anything; g2d goes as deep as
+        # D128's under a window since the shortened kv loop is too short to hide the latency.
+        _swa = window_left >= 0
+        # Splitting the four waves by q rows leaves most staged tiles dead for most waves
+        # under a window (each wave's own window is a fraction of the group's kv extent).
+        # Splitting by GQA q head instead (one sharer head per wave) makes every wave want
+        # every staged tile, at unchanged rows/accumulators/LDS/occupancy/work-group count;
+        # needs four sharers to spend the waves on, so D128 and odd GQA ratios fall back
+        # to the row split.
+        _dq_hpw = 4 if (_swa and D != 128 and (Hq // Hkv) % 4 == 0) else 1
+        # Dispatch a run of 8 q tiles before advancing the GQA sharer group, so work-groups
+        # that overlap most of their window rows stay co-resident.
+        _dq_qgrp = 8 if _swa else 1
+        dq_block_m = 32 * (4 // _dq_hpw) if (_swa and D != 128) else (128 if D == 128 else 192)
         dq_l = (
             None
             if fuse_dq
             else build_flash_attn_bwd_dq_module(
                 block_kv=32 if D == 128 else dq_block_kv,
                 waves_per_eu=2 if D == 128 else 1,
-                g2d=4 if D == 128 else 2,
+                g2d=4 if (D == 128 or _swa) else 2,
                 batch_size=batch_size,
                 sbhd=sbhd,
                 fuse_delta=_FUSE_DELTA,
                 block_m=dq_block_m,
+                q_heads_per_wg=_dq_hpw,
+                q_group=_dq_qgrp,
                 varlen=varlen,
                 **common,
             )
@@ -4286,7 +4848,10 @@ def _get_bwd(
             dkdv_dma_grp = 2
             dkdv_pf_ring = block_kv >= 128
         else:
-            dkdv_wpe, dkdv_g2d, dkdv_dma_grp = 1 if _fuse_wide else 2, 1, 1
+            # A windowed band's q loop is three blocks long, so a second wave per SIMD has
+            # nothing left to interleave with: asking for one buys the body the whole
+            # register budget instead (the two-wave group below is already the occupancy).
+            dkdv_wpe, dkdv_g2d, dkdv_dma_grp = 1 if (_fuse_wide or _swa) else 2, 1, 1
             dkdv_pf_ring = False
         # The fused body keeps V's B-operand in registers; spending the LDS that frees on
         # a second Q/dO slot (q_dbuf, or dma_grp=2) loses both ways, and fence-trading
@@ -4307,7 +4872,17 @@ def _get_bwd(
             q_pref=fuse_dq,
             g3_defer=False,
             g3_kreg=_fuse_wide,
-            flat_wg=256,
+            # A windowed band is only BLOCK_KV + W q rows wide, so the default four-wave
+            # split gives each wave a single kv tile and a repeated Q/dO fragment read;
+            # halving to two waves shares that fragment read across two tiles per wave.
+            flat_wg=256 if not _swa else 128,
+            # Every knob below was independently re-swept on the Q_PAIR body since its
+            # register pressure differs from the 64-row band; verdicts held except
+            # g2_half (now a loss) and block_q (now fails the ISA occupancy gate).
+            block_q=None,
+            g2_half=None,
+            g1_ks_outer=None,
+            agpr=_DKDV_AGPR,
             **common,
         )
         dkdv_l = build_flash_attn_bwd_dkdv_module(**dkdv_kw)
@@ -4546,10 +5121,10 @@ def flydsl_varlen_backward(
         total_q, total_kv = q.shape[0], k.shape[0]
         max_sq = int(max_seqlen_q) if max_seqlen_q is not None else Sq
         max_skv = int(max_seqlen_kv) if max_seqlen_kv is not None else Skv
-        q_split = _qsplit_for(max_sq)
+        q_split = _qsplit_for(max_sq, window_left)
         dq_l, dkdv_l, _ = _get_bwd(
             Hq, Hkv, D, scale, window_left, q_split,
-            _blockkv_for(max_skv, D), _dq_block_kv(max_sq),
+            _blockkv_for(max_skv, D, window_left), _dq_block_kv(max_sq, window_left),
             batch_size=num_seg, sbhd=False, varlen=True,
         )
         delta = torch.empty(total_q, Hq, device=q.device, dtype=torch.float32)
@@ -4569,8 +5144,8 @@ def flydsl_varlen_backward(
         dv = ws_dv.sum(dim=0)
         return dq, dk, dv
 
-    q_split = _qsplit_for(Sq)
-    block_kv = _blockkv_for(Skv, D)
+    q_split = _qsplit_for(Sq, window_left)
+    block_kv = _blockkv_for(Skv, D, window_left)
     # Fused KV-outer path: dkdv also emits dQ, so S/dP/softmax are computed once instead
     # of twice (5 GEMMs, not 7). It needs a per-band dQ workspace whose q axis is the kv
     # band axis, hence square + block-aligned shapes; SWA and D128 keep the split pair.
@@ -4588,7 +5163,7 @@ def flydsl_varlen_backward(
         window_left,
         q_split,
         block_kv,
-        _dq_block_kv(Sq),
+        _dq_block_kv(Sq, window_left),
         batch_size=B,
         sbhd=sbhd,
         fuse_dq=fuse_dq,
