@@ -26,7 +26,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-
 DTYPES = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
@@ -35,19 +34,21 @@ DTYPES = {
 moe_permute: Any = None
 moe_unpermute: Any = None
 triton_permutation: Any = None
+TURBO_BACKEND: Any = None
 
 
 def load_backend_symbols() -> None:
     """Import Primus-Turbo only after argparse has handled ``--help``."""
 
-    global moe_permute, moe_unpermute, triton_permutation
+    global moe_permute, moe_unpermute, triton_permutation, TURBO_BACKEND
 
     try:
+        from primus_turbo.pytorch.core.backend import BackendType
         from primus_turbo.pytorch.ops.moe.moe_permute import (
-            moe_permute as hip_moe_permute,
+            moe_permute as turbo_moe_permute,
         )
         from primus_turbo.pytorch.ops.moe.moe_permute import (
-            moe_unpermute as hip_moe_unpermute,
+            moe_unpermute as turbo_moe_unpermute,
         )
         from primus_turbo.triton.moe import permutation as triton_backend
     except ImportError as error:
@@ -55,9 +56,10 @@ def load_backend_symbols() -> None:
             "Primus-Turbo with both Triton and HIP moe_permute backends must be installed"
         ) from error
 
-    moe_permute = hip_moe_permute
-    moe_unpermute = hip_moe_unpermute
+    moe_permute = turbo_moe_permute
+    moe_unpermute = turbo_moe_unpermute
     triton_permutation = triton_backend
+    TURBO_BACKEND = BackendType.TURBO
 
 
 @dataclass
@@ -491,12 +493,13 @@ def make_benchmarks(
         def hip_e2e():
             return moe_permute(
                 tokens,
-                routing_map,
+                routing_map=routing_map,
                 num_local_experts=routing_map.shape[1],
                 num_topk=0,
                 num_permuted_tokens=num_out_tokens,
                 probs=probs,
                 probs_layout="routing_map",
+                backend=TURBO_BACKEND,
             )
 
         def hip_roundtrip():
@@ -504,10 +507,10 @@ def make_benchmarks(
             return moe_unpermute(
                 output[0],
                 output[1],
-                output[4],
                 restore_shape=tokens.shape,
                 num_local_experts=routing_map.shape[1],
-                permuted_probs=output[6],
+                permuted_probs=output[5],
+                backend=TURBO_BACKEND,
             )
 
         benchmarks["hip"] = {
