@@ -23,6 +23,7 @@ from primus_turbo.pytorch.core.low_precision import (
     check_mxfp4_support,
     check_mxfp8_support,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.triton.quantization.quant_blockwise import (
     dequant_fp8_blockwise_for_weight_kernel,
     dequant_fp8_blockwise_kernel,
@@ -525,6 +526,25 @@ def quantize_mxfp8_impl(
         assert axis is None, "The axis must be None when with_trans is True."
 
     if with_trans:
+        # FlyDSL dual-cast quant (raw E8M0 bit-matching the HIP dual, and faster): a 3D
+        # [B, M, K] input does all B experts in one launch, and ``use_2d_block`` (per 32x32
+        # tile scale, weights) is honored on both directions. Shuffled layouts fall through
+        # to HIP, as does gfx1250: the kernel is CDNA4-only but check_mxfp8_support accepts (12, 5).
+        fly_ok = (
+            not is_gfx1250()
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and not scaling_recipe.shuffle_scale
+            and not scaling_recipe.shuffle_out
+            and not scaling_recipe_for_trans.shuffle_scale
+            and not scaling_recipe_for_trans.shuffle_out
+        )
+        if fly_ok:
+            x = x.contiguous()
+            row_2d = scaling_recipe.use_2d_block
+            col_2d = scaling_recipe_for_trans.use_2d_block
+            if x.ndim == 3:
+                return quant_mxfp8_raw_batched(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
+            return quant_mxfp8_raw(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual(
             x,
             out_dtype,
@@ -590,6 +610,22 @@ def grouped_quantize_mxfp8_impl(
             ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
         )
 
+        # FlyDSL grouped dual quant, a drop-in for the HIP grouped dual on the recipes it
+        # supports. This is the A / grad_out (activation) operand quant, which is 1D
+        # per-32-block, so ``use_2d_block`` (weight-only) falls back to HIP along with the
+        # shuffled layouts and gfx1250 (CDNA4-only kernel, still cleared by check_mxfp8_support).
+        fly_ok = (
+            not is_gfx1250()
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and not scaling_recipe.use_2d_block
+            and not scaling_recipe_for_trans.use_2d_block
+            and not scaling_recipe.shuffle_scale
+            and not scaling_recipe.shuffle_out
+            and not scaling_recipe_for_trans.shuffle_scale
+            and not scaling_recipe_for_trans.shuffle_out
+        )
+        if fly_ok:
+            return grouped_quant_mxfp8_raw(x.contiguous(), group_lens, group_offs, out_dtype)
         return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8_dual(
             x,
             group_lens,
@@ -615,55 +651,6 @@ def grouped_quantize_mxfp8_impl(
             scaling_recipe.shuffle_scale,
             scaling_recipe.shuffle_out,
         )
-
-
-def quantize_mxfp8_flydsl_impl(
-    x: torch.Tensor,
-    out_dtype: torch.dtype,
-    block_size: int = MXFP8_BLOCK_SIZE,
-    scaling_recipe: Optional[ScalingRecipe] = None,
-    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FlyDSL dual-cast (row-wise + transposed col-wise) MXFP8 quant (gfx950), the MX GEMM operand
-    quant. Honors ``use_2d_block`` (per 32x32 tile scale, weights) on the row / col recipe; raw
-    E8M0 layout bit-matching the HIP quantize_mxfp8_dual. A 3D [B, M, K] input does all B experts
-    in one launch. Returns (row_fp8, row_scale, col_fp8, col_scale)."""
-    assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
-    row_2d = bool(scaling_recipe is not None and scaling_recipe.use_2d_block)
-    col_2d = bool(scaling_recipe_for_trans is not None and scaling_recipe_for_trans.use_2d_block)
-    x = x.contiguous()
-    if x.ndim == 3:
-        return quant_mxfp8_raw_batched(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
-    return quant_mxfp8_raw(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
-
-
-def grouped_quantize_mxfp8_flydsl_impl(
-    x: torch.Tensor,
-    out_dtype: torch.dtype,
-    group_lens: torch.Tensor,
-    group_offs: torch.Tensor,
-    block_size: int = MXFP8_BLOCK_SIZE,
-    scaling_recipe: Optional[ScalingRecipe] = None,
-    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """FlyDSL grouped dual-cast MXFP8 quant (gfx950), the A / grad_out (activation) operand quant
-    for the MX grouped GEMM. Returns the 8-tuple (rowwise fp8/scale, colwise fp8/scale, then
-    row-64 / col-128 padded lens/offs). Activation is 1D per-32-block; ``use_2d_block`` (weight-only)
-    is not applicable here (grouped weights go through ``quantize_mxfp8_flydsl_impl``)."""
-    assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
-    assert not (scaling_recipe is not None and scaling_recipe.use_2d_block) and not (
-        scaling_recipe_for_trans is not None and scaling_recipe_for_trans.use_2d_block
-    ), "grouped activation quant does not support use_2d_block"
-    return grouped_quant_mxfp8_raw(x.contiguous(), group_lens, group_offs, out_dtype)
 
 
 def grouped_quantize_mxfp4_impl(
@@ -743,7 +730,8 @@ def grouped_quantize_mxfp4_impl(
         # the per-block recipes it supports. bf16 upcasts via the top-16-bits shift, fp16
         # via a real fpext; SR is supported (unbiased, not bit-exact); 2d-block -> HIP.
         fly_ok = (
-            not scaling_recipe.use_2d_block
+            not is_gfx1250()
+            and not scaling_recipe.use_2d_block
             and not scaling_recipe_for_trans.use_2d_block
             and x.dtype in (torch.bfloat16, torch.float16)
         )
@@ -789,7 +777,12 @@ def grouped_quantize_mxfp4_impl(
         # layout is identical to grouped_quantize_fp4_with_trans' colwise -- the wgrad
         # consumes both under one group_offs_padded_colwise, and the HIP single op pads
         # to a different alignment. Same fly_ok gate as the dual path (bf16 + fp16).
-        fly_ok = axis == 0 and not scaling_recipe.use_2d_block and x.dtype in (torch.bfloat16, torch.float16)
+        fly_ok = (
+            not is_gfx1250()
+            and axis == 0
+            and not scaling_recipe.use_2d_block
+            and x.dtype in (torch.bfloat16, torch.float16)
+        )
         if fly_ok:
             from primus_turbo.flydsl.quantization.mxfp4_grouped_quant import grouped_quant_mxfp4_raw
 
@@ -907,17 +900,17 @@ def quantize_mxfp4_impl(
     assert x.is_contiguous(), "The x tensor must be contiguous."
 
     if with_trans:
-        # FlyDSL dual quant (bit-exact vs the HIP dual for RTN): 3D [G,N,K] weight in one
-        # launch, 2D [R,C] dense. SR is supported (unbiased, not bit-exact); shuffle / fp16
-        # / unaligned dims fall through to HIP below.
-        from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
-            dual3_eligible,
-            dual_eligible,
-            flydsl_dual_quant,
-            flydsl_dual_quant_batched,
-        )
+        # FlyDSL dual quant (bit-exact vs the HIP dual): 3D [G,N,K] weight in one launch,
+        # 2D [R,C] dense. SR / shuffle / fp16 / unaligned dims fall through to HIP below,
+        # as does gfx1250: the kernel is CDNA4-only but check_mxfp4_support accepts (12, 5).
+        if x.dtype == torch.bfloat16 and not is_gfx1250():
+            from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
+                dual3_eligible,
+                dual_eligible,
+                flydsl_dual_quant,
+                flydsl_dual_quant_batched,
+            )
 
-        if x.dtype == torch.bfloat16:
             if x.ndim == 3 and dual3_eligible(
                 x.shape[1], x.shape[2], scaling_recipe, scaling_recipe_for_trans
             ):

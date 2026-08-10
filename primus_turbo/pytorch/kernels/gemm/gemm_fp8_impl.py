@@ -28,7 +28,8 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.core.utils import (
     build_ck,
-    get_device_compute_capability,
+    is_gfx942,
+    is_gfx950,
     is_gfx1250,
 )
 from primus_turbo.triton.gemm.gemm_fp8_kernel import (
@@ -96,6 +97,8 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         granularity: ScalingGranularity,
     ) -> bool:
         supported = True
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            supported &= not is_gfx942()
         # check ScalingGranularity
         supported &= granularity in GEMMFP8HipBLASLtBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -150,6 +153,7 @@ class GEMMFP8CKBackend(KernelBackend):
         supported = True
         # check the CK backend was compiled into this build
         supported &= build_ck()
+        supported &= not is_gfx1250()
         # check ScalingGranularity
         supported &= granularity in GEMMFP8CKBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -313,8 +317,7 @@ class GEMMFP8TurboBackend(KernelBackend):
         granularity: ScalingGranularity,
     ) -> bool:
         supported = True
-        # TODO(ruibin): add gfx1250 support for turbo backend.
-        supported &= not is_gfx1250()
+        supported &= is_gfx950()
         supported &= granularity in GEMMFP8TurboBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8TurboBackend.SUPPORTED_DTYPES
         supported &= not trans_a and trans_b and not trans_c
@@ -367,7 +370,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
     ) -> bool:
         supported = True
         # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
-        supported &= get_device_compute_capability() >= (9, 5)
+        supported &= is_gfx950()
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
