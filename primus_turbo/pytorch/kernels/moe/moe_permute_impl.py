@@ -54,11 +54,10 @@ class MoEPermuteBackend(Protocol):
     ) -> Tuple[
         torch.Tensor,  # row_id_map
         torch.Tensor,  # tokens_per_expert
-        torch.Tensor,  # overflow_flag (TURBO only; TRITON always reports 0)
+        torch.Tensor,  # overflow_flag (TURBO: device; TRITON: host zero, never drops)
         Optional[torch.Tensor],  # num_dispatched_tokens (TURBO only; None on TRITON)
         int,  # num_permuted (rows to allocate)
-        Optional[torch.Tensor],  # probs in the backend's layout
-        int,  # probs stride in the backend's layout
+        Optional[torch.Tensor],  # multihot probs, set only when the backend converted them
         Optional[torch.Tensor],  # top-k position map for backward
     ]: ...
 
@@ -109,13 +108,7 @@ def _assert_mask_map_layout(row_id_map: torch.Tensor, num_local_experts: int) ->
 
 
 class TritonMaskMapBackend:
-    """Triton path: convert top-k inputs to an unpadded, 0-based mask-map layout.
-
-    No capacity support: ``num_permuted_tokens`` is an upper bound the caller
-    must honour, and ``overflow_flag`` is always 0. Use TURBO to drop rows.
-    The mask-map kernels take no dispatched-token bound, so this backend never
-    produces or consumes ``num_dispatched_tokens``.
-    """
+    """Triton path: unpadded 0-based mask-map layout, no capacity / FP8 support."""
 
     @staticmethod
     def preprocess(
@@ -131,53 +124,46 @@ class TritonMaskMapBackend:
     ):
         assert pad_multiple == 0, "TRITON moe_permute does not support pad_multiple; use TURBO"
         indices_position_map = None
+        multihot_probs = None
         if routing_map is None:
             assert topk_indices is not None, "TRITON moe_permute requires routing_map or topk_indices"
             convert_topk_probs = probs is not None and probs_topk_stride > 0
-            routing_map, multihot_probs, indices_position_map = (
-                fused_moe_indices_converter_forward_impl(
-                    topk_indices,
-                    probs if convert_topk_probs else None,
-                    num_local_experts,
-                )
+            routing_map, multihot_probs, indices_position_map = fused_moe_indices_converter_forward_impl(
+                topk_indices,
+                probs if convert_topk_probs else None,
+                num_local_experts,
             )
-            if convert_topk_probs:
-                probs = multihot_probs
-            probs_topk_stride = 0
         else:
-            assert (
-                probs_topk_stride == 0
-            ), "TRITON moe_permute only accepts topk-aligned probs with topk_indices-only input"
+            assert probs_topk_stride == 0, (
+                "TRITON moe_permute only accepts topk-aligned probs with topk_indices-only input"
+            )
         device = routing_map.device
         num_experts = int(routing_map.shape[1])
-        assert (
-            num_experts == num_local_experts
-        ), f"routing_map has {num_experts} experts, expected {num_local_experts}"
-        assert (
-            int(routing_map.shape[0]) == num_tokens
-        ), f"routing_map has {int(routing_map.shape[0])} rows, expected {num_tokens}"
+        assert num_experts == num_local_experts, (
+            f"routing_map has {num_experts} experts, expected {num_local_experts}"
+        )
+        assert int(routing_map.shape[0]) == num_tokens, (
+            f"routing_map has {int(routing_map.shape[0])} rows, expected {num_tokens}"
+        )
         # Kernels launch a grid of num_tokens blocks; nothing to do at zero.
         if num_tokens == 0:
-            int_opts = dict(dtype=torch.int32, device=device)
             return (
-                torch.zeros((0, 2 * num_experts + 1), **int_opts),
+                torch.zeros((0, 2 * num_experts + 1), dtype=torch.int32, device=device),
                 torch.zeros((num_experts,), dtype=torch.int64, device=device),
-                torch.zeros((1,), **int_opts),
+                torch.zeros((1,), dtype=torch.int32),
                 None,
                 0,
-                probs,
-                probs_topk_stride,
+                multihot_probs,
                 indices_position_map,
             )
 
         row_id_map, tokens_per_expert = triton_permutation.make_row_id_map(
             routing_map, num_tokens, num_experts, True
         )
-        # No capacity kernel on this path, so nothing is ever dropped.
-        overflow_flag = torch.zeros((1,), dtype=torch.int32, device=device)
+        # No capacity kernel here, so nothing is dropped; keep it on host, no sync.
+        overflow_flag = torch.zeros((1,), dtype=torch.int32)
 
-        # num_permuted_tokens must be an upper bound: the permute kernel stores
-        # at row_id_map's dst row without clamping, so a smaller value is OOB.
+        # Must be an upper bound: the kernel stores at dst row without clamping.
         if num_permuted_tokens > 0:
             num_permuted = int(num_permuted_tokens)
         else:
@@ -188,8 +174,7 @@ class TritonMaskMapBackend:
             overflow_flag,
             None,
             num_permuted,
-            probs,
-            probs_topk_stride,
+            multihot_probs,
             indices_position_map,
         )
 
@@ -252,22 +237,20 @@ class TritonMaskMapBackend:
                 else None
             )
         else:
-            unpermuted_tokens, unpermuted_probs = (
-                triton_permutation.unpermute_with_mask_map(
-                    permuted_tokens,
-                    row_id_map,
-                    None,  # merging_probs
-                    permuted_probs,
-                    num_dispatched,
-                    num_local_experts,
-                    hidden_size,
-                )
+            unpermuted_tokens, unpermuted_probs = triton_permutation.unpermute_with_mask_map(
+                permuted_tokens,
+                row_id_map,
+                None,  # merging_probs
+                permuted_probs,
+                num_dispatched,
+                num_local_experts,
+                hidden_size,
             )
 
         if unpermuted_probs is not None and probs_topk_stride > 0:
-            assert (
-                indices_position_map is not None
-            ), "TRITON topk-aligned probs require the forward position map"
+            assert indices_position_map is not None, (
+                "TRITON topk-aligned probs require the forward position map"
+            )
             # moe_permute backward must match the original top-k probs shape.
             unpermuted_probs = fused_moe_indices_converter_backward_impl(
                 unpermuted_probs,
@@ -275,22 +258,6 @@ class TritonMaskMapBackend:
                 probs_topk_stride,
             )
         return unpermuted_tokens, unpermuted_probs
-
-
-def _dispatched_bound(
-    num_dispatched_tokens: Optional[torch.Tensor],
-    fallback: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Device-side row bound for the HIP kernels, defaulting to the buffer height.
-
-    The kernels read this as an early-exit limit, so ``fallback`` (the number of
-    rows actually allocated) is always safe -- it just stops skipping the
-    unrouted tail that DeepEP's worst-case padding leaves behind.
-    """
-    if num_dispatched_tokens is not None:
-        return num_dispatched_tokens
-    return torch.full((1,), fallback, dtype=torch.int32, device=device)
 
 
 class TurboBackend:
@@ -312,18 +279,16 @@ class TurboBackend:
         expert_map = topk_indices if topk_indices is not None else routing_map
         assert expert_map is not None, "TurboBackend requires routing_map or topk_indices"
         device = expert_map.device
-        int_opts = dict(dtype=torch.int32, device=device)
 
         # Preprocessing kernel asserts num_tokens > 0.
         if num_tokens == 0:
             return (
-                torch.zeros((pad_multiple, 2 * num_local_experts + 1), **int_opts),
+                torch.zeros((pad_multiple, 2 * num_local_experts + 1), dtype=torch.int32, device=device),
                 torch.zeros((num_local_experts,), dtype=torch.int64, device=device),
-                torch.zeros((1,), **int_opts),
-                torch.zeros((1,), **int_opts),
+                torch.zeros((1,), dtype=torch.int32, device=device),
+                torch.zeros((1,), dtype=torch.int32, device=device),
                 0,
-                probs,
-                probs_topk_stride,
+                None,
                 None,
             )
 
@@ -348,8 +313,7 @@ class TurboBackend:
             overflow_flag,
             num_dispatched_tokens,
             num_permuted,
-            probs,
-            probs_topk_stride,
+            None,
             None,
         )
 
@@ -385,6 +349,9 @@ class TurboBackend:
         )
 
         if run_kernel:
+            # Kernel early-exit row limit; the allocated row count is always safe.
+            if num_dispatched_tokens is None:
+                num_dispatched_tokens = torch.full((1,), tokens.shape[0], dtype=torch.int32, device=device)
             torch.ops.primus_turbo_cpp_extension.permute(
                 tokens,
                 permuted_tokens,
@@ -393,7 +360,7 @@ class TurboBackend:
                 probs,
                 permuted_probs,
                 row_id_map,
-                _dispatched_bound(num_dispatched_tokens, int(tokens.shape[0]), device),
+                num_dispatched_tokens,
                 pad_multiple,
                 num_local_experts,
                 hidden_size,
@@ -438,13 +405,16 @@ class TurboBackend:
             if permuted_probs is not None
             else None
         )
+        # Kernel early-exit row limit; the allocated row count is always safe.
+        if num_dispatched_tokens is None:
+            num_dispatched_tokens = torch.full((1,), num_dispatched, dtype=torch.int32, device=device)
         torch.ops.primus_turbo_cpp_extension.unpermute(
             permuted_tokens,
             unpermuted_tokens,
             permuted_probs,
             unpermuted_probs,
             row_id_map,
-            _dispatched_bound(num_dispatched_tokens, num_dispatched, device),
+            num_dispatched_tokens,
             num_local_experts,
             hidden_size,
             permuted_probs is not None,
@@ -464,6 +434,228 @@ def get_moe_permute_backend_cls(backend: BackendType) -> Type[MoEPermuteBackend]
     if cls is None:
         raise ValueError(f"Unknown moe_permute backend {backend}")
     return cls
+
+
+_torch_custom_op_wrapper = torch.library.custom_op
+
+# Schemas are spelled out: infer_schema cannot express optional tensor returns.
+# ``backend`` crosses the boundary as ``BackendType.value``; shape-derived sizes are SymInt.
+_PREPROCESS_SCHEMA = (
+    "(Tensor? routing_map, Tensor? topk_indices, SymInt num_tokens, int num_local_experts, "
+    "int num_topk, int pad_multiple, int num_permuted_tokens, Tensor? probs, "
+    "int probs_topk_stride, int backend) "
+    "-> (Tensor, Tensor, Tensor, Tensor?, SymInt, Tensor?, Tensor?)"
+)
+_PERMUTE_SCHEMA = (
+    "(Tensor tokens, Tensor row_id_map, Tensor? num_dispatched_tokens, SymInt num_permuted, "
+    "int num_local_experts, SymInt hidden_size, int pad_multiple, Tensor? scaling_factor, "
+    "Tensor? probs, int scales_per_token, bool use_fp8, int probs_topk_stride, int backend) "
+    "-> (Tensor, Tensor?, Tensor?)"
+)
+_UNPERMUTE_SCHEMA = (
+    "(Tensor permuted_tokens, Tensor row_id_map, Tensor? num_dispatched_tokens, "
+    "SymInt num_dispatched, int num_local_experts, SymInt hidden_size, Tensor? permuted_probs, "
+    "int probs_topk_stride, Tensor? indices_position_map, int backend) -> (Tensor, Tensor?)"
+)
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::moe_permute_preprocess",
+    mutates_args=(),
+    device_types="cuda",
+    schema=_PREPROCESS_SCHEMA,
+)
+def _moe_permute_preprocess(
+    routing_map,
+    topk_indices,
+    num_tokens,
+    num_local_experts,
+    num_topk,
+    pad_multiple,
+    num_permuted_tokens,
+    probs,
+    probs_topk_stride,
+    backend,
+):
+    return get_moe_permute_backend_cls(BackendType(backend)).preprocess(
+        routing_map,
+        topk_indices,
+        num_tokens,
+        num_local_experts,
+        num_topk,
+        pad_multiple,
+        num_permuted_tokens,
+        probs,
+        probs_topk_stride,
+    )
+
+
+@_moe_permute_preprocess.register_fake
+def _moe_permute_preprocess_meta(
+    routing_map,
+    topk_indices,
+    num_tokens,
+    num_local_experts,
+    num_topk,
+    pad_multiple,
+    num_permuted_tokens,
+    probs,
+    probs_topk_stride,
+    backend,
+):
+    expert_map = routing_map if routing_map is not None else topk_indices
+    device = expert_map.device
+    is_triton = BackendType(backend) is BackendType.TRITON
+
+    # TRITON forbids pad_multiple, so the padded height covers both backends.
+    row_id_map = torch.empty(
+        (num_tokens + pad_multiple, 2 * num_local_experts + 1), dtype=torch.int32, device=device
+    )
+    tokens_per_expert = torch.empty((num_local_experts,), dtype=torch.int64, device=device)
+    if is_triton:
+        # TRITON never drops: host flag, and no dispatched-token bound.
+        overflow_flag = torch.empty((1,), dtype=torch.int32)
+        num_dispatched_tokens = None
+    else:
+        overflow_flag = torch.empty((1,), dtype=torch.int32, device=device)
+        num_dispatched_tokens = torch.empty((1,), dtype=torch.int32, device=device)
+
+    # Only the caller-provided capacity is known at trace time.
+    if num_permuted_tokens > 0:
+        num_permuted = num_permuted_tokens
+    else:
+        num_permuted = torch.library.get_ctx().new_dynamic_size()
+
+    multihot_probs, indices_position_map = None, None
+    if is_triton and routing_map is None:
+        indices_position_map = torch.empty((num_tokens, num_local_experts), dtype=torch.int32, device=device)
+        if probs is not None and probs_topk_stride > 0:
+            multihot_probs = probs.new_empty((num_tokens, num_local_experts))
+    return (
+        row_id_map,
+        tokens_per_expert,
+        overflow_flag,
+        num_dispatched_tokens,
+        num_permuted,
+        multihot_probs,
+        indices_position_map,
+    )
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::moe_permute",
+    mutates_args=(),
+    device_types="cuda",
+    schema=_PERMUTE_SCHEMA,
+)
+def _moe_permute(
+    tokens,
+    row_id_map,
+    num_dispatched_tokens,
+    num_permuted,
+    num_local_experts,
+    hidden_size,
+    pad_multiple,
+    scaling_factor,
+    probs,
+    scales_per_token,
+    use_fp8,
+    probs_topk_stride,
+    backend,
+):
+    return get_moe_permute_backend_cls(BackendType(backend)).permute(
+        tokens,
+        row_id_map,
+        num_dispatched_tokens,
+        num_permuted,
+        num_local_experts,
+        hidden_size,
+        pad_multiple,
+        scaling_factor,
+        probs,
+        scales_per_token,
+        use_fp8,
+        probs_topk_stride,
+    )
+
+
+@_moe_permute.register_fake
+def _moe_permute_meta(
+    tokens,
+    row_id_map,
+    num_dispatched_tokens,
+    num_permuted,
+    num_local_experts,
+    hidden_size,
+    pad_multiple,
+    scaling_factor,
+    probs,
+    scales_per_token,
+    use_fp8,
+    probs_topk_stride,
+    backend,
+):
+    permuted_tokens = tokens.new_empty((num_permuted, hidden_size))
+    permuted_scaling_factor = (
+        scaling_factor.new_empty((num_permuted, scales_per_token))
+        if use_fp8 and scaling_factor is not None
+        else None
+    )
+    permuted_probs = probs.new_empty((num_permuted,)) if probs is not None else None
+    return permuted_tokens, permuted_scaling_factor, permuted_probs
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::moe_unpermute",
+    mutates_args=(),
+    device_types="cuda",
+    schema=_UNPERMUTE_SCHEMA,
+)
+def _moe_unpermute(
+    permuted_tokens,
+    row_id_map,
+    num_dispatched_tokens,
+    num_dispatched,
+    num_local_experts,
+    hidden_size,
+    permuted_probs,
+    probs_topk_stride,
+    indices_position_map,
+    backend,
+):
+    return get_moe_permute_backend_cls(BackendType(backend)).unpermute(
+        permuted_tokens,
+        row_id_map,
+        num_dispatched_tokens,
+        num_dispatched,
+        num_local_experts,
+        hidden_size,
+        permuted_probs,
+        probs_topk_stride,
+        indices_position_map,
+    )
+
+
+@_moe_unpermute.register_fake
+def _moe_unpermute_meta(
+    permuted_tokens,
+    row_id_map,
+    num_dispatched_tokens,
+    num_dispatched,
+    num_local_experts,
+    hidden_size,
+    permuted_probs,
+    probs_topk_stride,
+    indices_position_map,
+    backend,
+):
+    unpermuted_tokens = permuted_tokens.new_empty((num_dispatched, hidden_size))
+    # Top-k-aligned probs are narrowed back by the converter; multihot keeps one column per expert.
+    probs_row_width = probs_topk_stride if probs_topk_stride > 0 else num_local_experts
+    unpermuted_probs = (
+        permuted_probs.new_empty((num_dispatched, probs_row_width)) if permuted_probs is not None else None
+    )
+    return unpermuted_tokens, unpermuted_probs
 
 
 def moe_permute_process_impl(
@@ -487,7 +679,15 @@ def moe_permute_process_impl(
     int,
     Optional[torch.Tensor],
 ]:
-    return get_moe_permute_backend_cls(backend).preprocess(
+    (
+        row_id_map,
+        tokens_per_expert,
+        overflow_flag,
+        num_dispatched_tokens,
+        num_permuted,
+        multihot_probs,
+        indices_position_map,
+    ) = _moe_permute_preprocess(
         routing_map,
         topk_indices,
         num_tokens,
@@ -497,6 +697,20 @@ def moe_permute_process_impl(
         num_permuted_tokens,
         probs,
         probs_topk_stride,
+        backend.value,
+    )
+    # Resolved here, not in the op: a custom op may not return one of its own inputs.
+    if multihot_probs is not None:
+        probs, probs_topk_stride = multihot_probs, 0
+    return (
+        row_id_map,
+        tokens_per_expert,
+        overflow_flag,
+        num_dispatched_tokens,
+        num_permuted,
+        probs,
+        probs_topk_stride,
+        indices_position_map,
     )
 
 
@@ -515,7 +729,7 @@ def moe_permute_impl(
     use_fp8: bool,
     probs_topk_stride: int,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    return get_moe_permute_backend_cls(backend).permute(
+    return _moe_permute(
         tokens,
         row_id_map,
         num_dispatched_tokens,
@@ -528,6 +742,7 @@ def moe_permute_impl(
         scales_per_token,
         use_fp8,
         probs_topk_stride,
+        backend.value,
     )
 
 
@@ -543,7 +758,7 @@ def moe_unpermute_impl(
     probs_topk_stride: int,
     indices_position_map: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    return get_moe_permute_backend_cls(backend).unpermute(
+    return _moe_unpermute(
         permuted_tokens,
         row_id_map,
         num_dispatched_tokens,
@@ -553,4 +768,5 @@ def moe_unpermute_impl(
         permuted_probs,
         probs_topk_stride,
         indices_position_map,
+        backend.value,
     )

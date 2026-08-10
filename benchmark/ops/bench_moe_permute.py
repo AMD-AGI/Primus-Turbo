@@ -5,15 +5,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Compare the historical Triton and HIP MoE permutation backends.
+"""Compare the Triton and HIP MoE permutation backends (CUDA-event and wall time).
 
-The Triton path is the implementation that predates commit f9a37d90
-(``primus_turbo.triton.moe.permutation``).  The HIP path was introduced by
-f9a37d90 and is exposed through ``moe_permute`` / ``moe_unpermute``.
-
-The benchmark reports both CUDA-event time and host wall time.  API-level
-measurements include output allocation; ``*_kernel`` measurements exclude
-preprocessing but retain the output allocation performed by each backend.
+``*_kernel`` measurements exclude preprocessing but keep the output allocation.
 """
 
 import argparse

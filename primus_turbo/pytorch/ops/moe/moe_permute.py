@@ -27,13 +27,7 @@ def _default_backend(
     use_fp8: bool = False,
     scaling_factor: Optional[torch.Tensor] = None,
 ) -> BackendType:
-    """Pick the backend when the caller did not name one.
-
-    Padding and FP8 need the HIP kernels; Triton handles everything else
-    (including top-k inputs, which it converts to a mask-map internally).
-    permute and unpermute must land on the same answer here: the two
-    ``row_id_map`` layouts (0-based vs signed one-based) are not interchangeable.
-    """
+    """Padding / FP8 need TURBO; Triton handles the rest. Must agree across permute+unpermute."""
     if pad_multiple != 0 or use_fp8 or scaling_factor is not None:
         return BackendType.TURBO
     return BackendType.TRITON
@@ -66,8 +60,9 @@ class _MoEPermute(torch.autograd.Function):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
-        # Unused grads must reach backward as None, not materialized zeros.
-        ctx.set_materialize_grads(False)
+        # Unused grads reach backward as None, not zeros; dynamo cannot trace this ctx call.
+        if not torch.compiler.is_compiling():
+            ctx.set_materialize_grads(False)
 
         hidden_size = int(tokens.shape[-1])
         num_dispatched = int(tokens.shape[0])
@@ -211,13 +206,14 @@ class _MoEUnpermute(torch.autograd.Function):
         pad_multiple: int,
         backend: BackendType,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # Unused grads must reach backward as None, not materialized zeros.
-        ctx.set_materialize_grads(False)
+        # Unused grads reach backward as None, not zeros; dynamo cannot trace this ctx call.
+        if not torch.compiler.is_compiling():
+            ctx.set_materialize_grads(False)
 
         # A 3-D shape would silently unpermute the wrong extent.
-        assert (
-            len(restore_shape) == 2
-        ), f"moe_unpermute: restore_shape must be 2-D, got {tuple(restore_shape)}"
+        assert len(restore_shape) == 2, (
+            f"moe_unpermute: restore_shape must be 2-D, got {tuple(restore_shape)}"
+        )
         num_dispatched, hidden_size = int(restore_shape[0]), int(restore_shape[1])
         assert int(permuted_tokens.shape[-1]) == hidden_size, (
             f"moe_unpermute: permuted_tokens hidden {int(permuted_tokens.shape[-1])} "
@@ -325,10 +321,9 @@ def moe_permute(
 ]:
     """Fused preprocessing + permute; returns (permuted_tokens, row_id_map, tokens_per_expert, overflow_flag, permuted_scaling_factor, permuted_probs).
 
-    ``num_permuted_tokens`` is a capacity: TURBO drops the rows past it and
-    reports that in ``overflow_flag``. TRITON has no capacity kernel, so it
-    treats the value as an upper bound the caller must honour -- a smaller one
-    writes out of bounds -- and always reports ``overflow_flag == 0``.
+    ``num_permuted_tokens`` is a capacity on TURBO (extra rows dropped, flagged in
+    ``overflow_flag``) but only an upper bound on TRITON -- too small writes OOB.
+    TRITON never drops, so its ``overflow_flag`` is a host-side zero tensor.
     """
     if routing_map is None and topk_indices is None:
         raise ValueError("moe_permute: one of routing_map / topk_indices must be provided")
@@ -376,10 +371,8 @@ def moe_unpermute(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Unpermute back into ``restore_shape`` using the matching permute backend.
 
-    ``num_dispatched_tokens_tensor`` is an optional device-side row bound that
-    lets TURBO skip an unrouted tail (DeepEP's worst-case padding). It is the
-    caller's to supply -- DeepEP already knows the count -- and defaults to
-    ``restore_shape[0]``, which is always safe. TRITON ignores it.
+    ``num_dispatched_tokens_tensor`` is an optional device-side row bound letting
+    TURBO skip the unrouted tail; defaults to ``restore_shape[0]``. TRITON ignores it.
     """
     if backend is None:
         backend = _default_backend(pad_multiple)

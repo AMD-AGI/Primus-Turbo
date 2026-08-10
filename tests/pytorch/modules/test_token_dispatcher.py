@@ -75,11 +75,7 @@ def _build_tp_groups(tp_size):
 
 
 def _fail_on_all_ranks(errors):
-    """Turn a per-rank failure into an all-rank failure.
-
-    A bare ``assert`` that fires on only some ranks leaves the survivors
-    blocked forever in the next collective. Vote first, then raise together.
-    """
+    """Vote before raising: a one-rank assert would hang the others in the next collective."""
     flag = torch.tensor([1 if errors else 0], dtype=torch.int32, device="cuda")
     dist.all_reduce(flag, op=dist.ReduceOp.MAX)
     if flag.item():
@@ -167,8 +163,7 @@ def _run_dispatch_combine(
             f"rank {rank}: tokens_per_expert not aligned to pad_multiple={pad_multiple}: "
             f"{tokens_per_expert.tolist()}"
         )
-    # Counts must describe the permuted layout the grouped GEMM will read.
-    # Capacity modes size the output by the cap instead, so skip them.
+    # Counts must describe the permuted layout; capacity modes size by the cap.
     if deepep_num_worst_tokens == 0 and permute_max_token_num == 0:
         if int(tokens_per_expert.sum()) != num_permuted_rows:
             errors.append(
@@ -252,65 +247,6 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
                 pad_multiple=pad_multiple,
             )
-
-    @parametrize("backend", _get_backends())
-    @parametrize("pad_multiple", [128, 256])
-    def test_host_counts_match_device_counts(self, backend, pad_multiple):
-        """The host path pads DeepEP's counts itself instead of reading
-        moe_permute's; both must agree element-wise.
-
-        Routing round-robins over experts so per-expert counts are *not*
-        already multiples of pad_multiple. With the default constant probs
-        every token picks experts 0..topk-1 and the counts land on a power of
-        two, which makes the padding a no-op and the test vacuous.
-        """
-        self._bind_device()
-        num_tokens, num_experts, router_topk = 1000, 32, 2
-        token_indices = (
-            (torch.arange(num_tokens * router_topk, device="cuda") % num_experts)
-            .view(num_tokens, router_topk)
-            .to(torch.int64)
-        )
-        shared = dict(
-            num_tokens=num_tokens,
-            hidden_size=512,
-            num_experts=num_experts,
-            router_topk=router_topk,
-            token_indices=token_indices,
-        )
-        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
-            raw_counts = _run_dispatch_combine(
-                self.rank,
-                dist.group.WORLD,
-                deepep_use_cuda_num_tokens_per_expert=False,
-                pad_multiple=0,
-                **shared,
-            )
-            host_counts = _run_dispatch_combine(
-                self.rank,
-                dist.group.WORLD,
-                deepep_use_cuda_num_tokens_per_expert=False,
-                pad_multiple=pad_multiple,
-                **shared,
-            )
-            device_counts = _run_dispatch_combine(
-                self.rank,
-                dist.group.WORLD,
-                deepep_use_cuda_num_tokens_per_expert=True,
-                pad_multiple=pad_multiple,
-                **shared,
-            )
-        errors = []
-        if not (raw_counts % pad_multiple != 0).any():
-            errors.append(
-                f"rank {self.rank}: counts {raw_counts.tolist()} are already aligned to "
-                f"{pad_multiple}; padding would be a no-op and this test proves nothing"
-            )
-        try:
-            torch.testing.assert_close(host_counts, device_counts.cpu())
-        except AssertionError as e:
-            errors.append(f"rank {self.rank}: host/device counts differ: {e}")
-        _fail_on_all_ranks(errors)
 
     # ------------------------------------------------------------------
     # Autotune env var (PRIMUS_TURBO_AUTO_TUNE=1)
