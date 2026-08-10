@@ -26,7 +26,7 @@ from flydsl.expr import Int32, Int64, struct
 from flydsl.expr.buffer_ops import buffer_load
 from flydsl.expr.typing import Constexpr
 
-from primus_turbo.flydsl.mega.fp8.prims import addr_buffer_resource
+from primus_turbo.flydsl.mega.prims import addr_buffer_resource
 
 # ---- constants (from layout/mega_moe.cuh) ----
 _MAX_BLOCK_M = 192

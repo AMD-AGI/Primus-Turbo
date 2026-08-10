@@ -67,13 +67,11 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     _wait_mem,
     l2_invalidate,
     ld,
-    read_clock,
-    spin_timed_out,
     st,
 )
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.mega.prims import cast
+from primus_turbo.flydsl.mega.prims import cast, read_clock, spin_timed_out
 from primus_turbo.flydsl.utils.gemm_helper import emit_if_then, make_value_attrs, xcd_remap_pid
 
 # GEMM launch attrs (nt_vmcnt / waves_per_eu); included in flyc compile cache key below.

@@ -59,14 +59,12 @@ from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
 from primus_turbo.flydsl.mega.fp8.prims import (
     l2_invalidate,
     ld,
-    read_clock,
-    spin_timed_out,
     st,
 )
 from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.mega.prims import cast
+from primus_turbo.flydsl.mega.prims import cast, read_clock, spin_timed_out
 from primus_turbo.flydsl.utils.gemm_helper import (
     ceildiv,
     emit_lds_repack,

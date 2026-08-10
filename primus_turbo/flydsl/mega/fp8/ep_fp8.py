@@ -45,9 +45,8 @@ def dispatch_fp8_copy_tile(
     thread_index,
     hidden_size,
     num_max_pool_tokens,
-    xq_resource=None,  # pre-quant fp8 tokens int32 [T, hidden//4]; omit when x_bf16_resource set
+    xq_resource=None,  # pre-quant fp8 tokens int32 [T, hidden//4]
     xs_resource=None,  # raw E8M0 scales int32 [T, hidden//128]
-    x_bf16_resource=None,  # bf16 [T, hidden]: in-push rowwise quant fused into this COMM role
     expert_send_dst_rank_resource,
     expert_send_dst_row_resource,
     expert_send_count_resource,
@@ -61,9 +60,6 @@ def dispatch_fp8_copy_tile(
     dispatch_flag_offsets_resource=None,
     bank=None,
     world_size=0,
-    push_scale=True,
-    fence=True,
-    tok_unroll=1,
 ):
     """CLEAN fp8 comm PUSH closure (no in-push quant): copy a comm task's PRE-QUANTIZED
     fp8 tokens (16B/lane b128, coalesced) into the peer ``pool_fp8``, plus their RAW E8M0
@@ -116,72 +112,16 @@ def dispatch_fp8_copy_tile(
             for c in fx.range_constexpr(chunk_count):
                 col = fx.Int32(c * cols_per_warp_i32) + lane_id * fx.Int32(_VEC_I32)
                 buffer_store(vals[c], peer_pool, dest_row * fx.Int32(hidden_i32) + col)
-            if push_scale:
-                def _one_scale():
-                    sv = buffer_load(
-                        xs_resource, source_row * fx.Int32(scale_i32) + lane_id, vec_width=1, dtype=fx.T.i32()
-                    )
-                    buffer_store(sv, peer_pscale, dest_row * fx.Int32(scale_i32) + lane_id)
+            def _one_scale():
+                sv = buffer_load(
+                    xs_resource, source_row * fx.Int32(scale_i32) + lane_id, vec_width=1, dtype=fx.T.i32()
+                )
+                buffer_store(sv, peer_pscale, dest_row * fx.Int32(scale_i32) + lane_id)
 
-                emit_if_then(lane_id < fx.Int32(scale_i32), _one_scale)
+            emit_if_then(lane_id < fx.Int32(scale_i32), _one_scale)
 
         _emit_for(local_count, _row)
 
-    def copy_slice_unrolled(dest_row_start, source_offset, peer_pool, peer_pscale, tok_lo, tok_hi):
-        # tok_unroll>1: each warp processes `tok_unroll` token rows per loop iteration -> the
-        # b128 loads of all U rows are issued before any store, deepening in-flight XGMI traffic
-        # (memory-level parallelism) to better hide push latency. Same warp-strided row set as
-        # copy_slice; loads use a clamped in-range index (buffer-safe redundant read for the tail)
-        # and the store is guarded, so it is numerically identical to copy_slice.
-        U = tok_unroll
-        local_count = (tok_hi - tok_lo - warp_id + fx.Int32(n_warps - 1)) // fx.Int32(n_warps)
-        n_iter = (local_count + fx.Int32(U - 1)) // fx.Int32(U)
-
-        def _batch(j):
-            recs = []
-            for u in range(U):
-                i = j * fx.Int32(U) + fx.Int32(u)
-                valid = i < local_count
-                i_c = fx.arith.select(valid, i, fx.Int32(0))
-                row_index = tok_lo + warp_id + i_c * fx.Int32(n_warps)
-                source_row = buffer_load(
-                    dispatched_token_idx_resource, source_offset + row_index, vec_width=1, dtype=fx.T.i32()
-                )
-                dest_row = dest_row_start + row_index
-                vals = []
-                for c in fx.range_constexpr(chunk_count):
-                    col = fx.Int32(c * cols_per_warp_i32) + lane_id * fx.Int32(_VEC_I32)
-                    vals.append(
-                        buffer_load(
-                            xq_resource, source_row * fx.Int32(hidden_i32) + col, vec_width=_VEC_I32, dtype=fx.T.i32()
-                        )
-                    )
-                sval = None
-                if push_scale:
-                    sval = buffer_load(
-                        xs_resource, source_row * fx.Int32(scale_i32) + lane_id, vec_width=1, dtype=fx.T.i32()
-                    )
-                recs.append((valid, dest_row, vals, sval))
-            # zero-arg closures + immediate emit_if_then call => closure capture is safe (matches
-            # the copy_slice/_one_scale idiom). Branch fns MUST take 0 args: ReplaceIfWithDispatch
-            # injects result_names into any arg-accepting branch fn.
-            def _emit_store(valid, dest_row, vals, sval):
-                def _store():
-                    for c in fx.range_constexpr(chunk_count):
-                        col = fx.Int32(c * cols_per_warp_i32) + lane_id * fx.Int32(_VEC_I32)
-                        buffer_store(vals[c], peer_pool, dest_row * fx.Int32(hidden_i32) + col)
-                    if push_scale:
-                        def _one_scale():
-                            buffer_store(sval, peer_pscale, dest_row * fx.Int32(scale_i32) + lane_id)
-
-                        emit_if_then(lane_id < fx.Int32(scale_i32), _one_scale)
-
-                emit_if_then(valid, _store)
-
-            for valid, dest_row, vals, sval in recs:
-                _emit_store(valid, dest_row, vals, sval)
-
-        _emit_for(n_iter, _batch)
 
     def dispatch_tile(task_index, sub, n_sub):
         dst_rank, dest_row_start, source_offset, token_count, peer_pool, peer_pscale = load_task(task_index)
@@ -192,14 +132,12 @@ def dispatch_fp8_copy_tile(
             slice_tokens = (token_count + fx.Int32(n_sub - 1)) // fx.Int32(n_sub)
             tok_lo = sub * slice_tokens
             tok_hi = fx.arith.select(tok_lo + slice_tokens < token_count, tok_lo + slice_tokens, token_count)
-        if tok_unroll == 1:
-            copy_slice(dest_row_start, source_offset, peer_pool, peer_pscale, tok_lo, tok_hi)
-        else:
-            copy_slice_unrolled(dest_row_start, source_offset, peer_pool, peer_pscale, tok_lo, tok_hi)
+        copy_slice(dest_row_start, source_offset, peer_pool, peer_pscale, tok_lo, tok_hi)
         if signal:
             fx.rocdl.s_waitcnt(0)
-            if fence:
-                l2_writeback()
+            # Device-scope release before the flag: without it the peer can observe the signal
+            # ahead of the rows it announces.
+            l2_writeback()
             fx.gpu.barrier()
 
             def _signal():
