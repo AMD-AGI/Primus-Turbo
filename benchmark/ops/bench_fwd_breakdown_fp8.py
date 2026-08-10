@@ -116,10 +116,6 @@ def worker(local_rank, world, args):
     r = {}
     r["L1_dispatch_fc1"] = _bench(_l1, warmup=args.warmup, iters=args.iters, group=group)
     r["SwiGLU_bf16"] = _bench(lambda: swiglu_flydsl_kernel(l1, ntb), warmup=args.warmup, iters=args.iters, group=group)
-    r["quant_rowwise"] = _bench(
-        lambda: quantize_rowwise_mxfp8_flydsl(act_bf16, preshuffle=True),
-        warmup=args.warmup, iters=args.iters, group=group,
-    )
     r["SwiGLU+quant_fused"] = _bench(
         lambda: swiglu_mxfp8_flydsl_kernel(l1, ntb),
         warmup=args.warmup, iters=args.iters, group=group,
@@ -148,22 +144,20 @@ def worker(local_rank, world, args):
         print(f"[fp8 fwd breakdown]  EP{world} T={T} H={H} I={I}  L1={DC}/{PC} L2 cc={CC}  (max rank ms)")
         print(f"{'=' * 72}")
         for k in (
-            "L1_dispatch_fc1", "SwiGLU_bf16", "quant_rowwise", "SwiGLU+quant_fused",
+            "L1_dispatch_fc1", "SwiGLU_bf16", "SwiGLU+quant_fused",
             "w2_prep_cached", "L2_combine_xfp8",
             "FULL_no_grad", "FULL_autograd",
         ):
             print(f"  {k:<22} {r[k]:7.3f} ms")
 
         sum_iso = r["L1_dispatch_fc1"] + r["SwiGLU+quant_fused"] + r["L2_combine_xfp8"]
-        unfused_prep = r["SwiGLU_bf16"] + r["quant_rowwise"]
         print(f"\n  --- composition ---")
         print(f"  L1 + fused_swiglu + L2(x_fp8)     = {sum_iso:.3f} ms  (isolated sum)")
         print(f"  FULL no-grad (op)                 = {r['FULL_no_grad']:.3f} ms")
         print(f"  FULL autograd (bwd_only fwd col)  = {r['FULL_autograd']:.3f} ms")
         print(f"  autograd overhead                 = {r['FULL_autograd'] - r['FULL_no_grad']:+.3f} ms")
-        print(f"  swiglu_bf16 + quant (unfused)     = {unfused_prep:.3f} ms")
-        print(f"  swiglu_mxfp8 fused                = {r['SwiGLU+quant_fused']:.3f} ms  "
-              f"(delta {r['SwiGLU+quant_fused'] - unfused_prep:+.3f} vs unfused)")
+        print(f"  swiglu_bf16 (no quant)            = {r['SwiGLU_bf16']:.3f} ms")
+        print(f"  swiglu_mxfp8 fused                = {r['SwiGLU+quant_fused']:.3f} ms")
         print(f"  swiglu as %% of FULL no-grad      = {100.0 * r['SwiGLU+quant_fused'] / r['FULL_no_grad']:.1f}%")
         print(f"  L1 as %% of FULL no-grad          = {100.0 * r['L1_dispatch_fc1'] / r['FULL_no_grad']:.1f}%")
         print(f"  L2 as %% of FULL no-grad          = {100.0 * r['L2_combine_xfp8'] / r['FULL_no_grad']:.1f}%")

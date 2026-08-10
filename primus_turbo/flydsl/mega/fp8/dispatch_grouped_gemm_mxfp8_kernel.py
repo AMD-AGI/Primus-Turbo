@@ -328,7 +328,7 @@ def _compile(
                     fx.Int32(num_comm) - comm_idx + comm_block_count - fx.Int32(1)
                 ) // comm_block_count
                 for task_iteration in range(local_task_count):
-                    dispatch_tile(comm_idx + task_iteration * comm_block_count, fx.Int32(0), 1)
+                    dispatch_tile(comm_idx + task_iteration * comm_block_count)
         elif block_index < gemm_base:
             if not _push_only:
                 # ---- PRESHUFFLE role ----

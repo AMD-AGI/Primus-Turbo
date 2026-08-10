@@ -171,26 +171,7 @@ def _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32):
     return words, biased
 
 
-def _e8m0_broadcast_i32(biased):
-    """Broadcast the E8M0 byte (i32) into all 4 bytes of an i32 (ScaleS2R operand)."""
-    bb = fx.arith.ArithValue(biased) & fx.Int32(0xFF)
-    return bb | (bb << fx.Int32(8)) | (bb << fx.Int32(16)) | (bb << fx.Int32(24))
-
-
-# ── A-scale (ScaleS2R) preshuffle slot indices ────────────────────────────────────────────
-
-
-def _preshuffle_a_idx(dest_row, b, K128):
-    """ScaleS2R layout-1 slot for row ``dest_row``, micro-block ``b``:
-    ``((grp*K128 + gk)*64 + (g*16+r))*4 + s``, grp=row//64, s=(row%64)//16, r=row%16,
-    gk=b//4, g=b%4. Returns the i32 element index into the broadcast a_sp buffer."""
-    grp = dest_row // fx.Int32(64)
-    s_row = (dest_row % fx.Int32(64)) // fx.Int32(16)
-    r_row = dest_row % fx.Int32(16)
-    gk = b // fx.Int32(4)
-    g = b % fx.Int32(4)
-    lane = g * fx.Int32(16) + r_row
-    return ((grp * fx.Int32(K128) + gk) * fx.Int32(64) + lane) * fx.Int32(4) + s_row
+# ── A-scale (ScaleS2R) preshuffle slot index ──────────────────────────────────────────────
 
 
 def _preshuffle_a_pack4_idx(dest_row, kkp, g, K128p):
@@ -206,10 +187,9 @@ def _preshuffle_a_pack4_idx(dest_row, kkp, g, K128p):
 
 
 @functools.lru_cache(maxsize=32)
-def _compile_quant(K: int, BT: int = 256, preshuffle: bool = False):
+def _compile_quant(K: int, BT: int = 256):
     assert K % _BLK == 0, f"K={K} must be a multiple of {_BLK}"
     n_blk = K // _BLK
-    K128 = K // 128
     K_fp8_i32 = K // 4
     blk_i32 = _BLK // 4
 
@@ -227,80 +207,13 @@ def _compile_quant(K: int, BT: int = 256, preshuffle: bool = False):
             base = row * fx.Int32(K) + b * fx.Int32(_BLK)
             words, biased = _quant_block_words(xr, base)
 
-            if preshuffle:
-                buffer_store(_e8m0_broadcast_i32(biased), sr, _preshuffle_a_idx(row, b, K128))
-            else:
-                buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8()), sr, row * fx.Int32(n_blk) + b)
+            buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8()), sr, row * fx.Int32(n_blk) + b)
 
             base_i32 = row * fx.Int32(K_fp8_i32) + b * fx.Int32(blk_i32)
             for wi in range_constexpr(blk_i32):
                 buffer_store(words[wi], qr, base_i32 + fx.Int32(wi))
 
             b = b + fx.Int32(BT)
-
-    @flyc.jit
-    def launch(X: fx.Tensor, Q: fx.Tensor, S: fx.Tensor, M: int, stream: fx.Stream = fx.Stream(None)):
-        kern(X, Q, S, M).launch(grid=(M, 1, 1), block=(BT, 1, 1), stream=stream)
-
-    return launch
-
-
-@functools.lru_cache(maxsize=32)
-def _compile_quant_preshuffle_pack4(K: int, BT: int = 256, scale_pack: int = 4):
-    """Quant bf16 row + fused pack-4 A-scale preshuffle (single kernel, LDS repack)."""
-    assert K % _BLK == 0, f"K={K} must be a multiple of {_BLK}"
-    n_blk = K // _BLK
-    K128 = K // 128
-    K128p = ceildiv(K128, scale_pack)
-    K_fp8_i32 = K // 4
-    blk_i32 = _BLK // 4
-
-    @fx.struct
-    class RowSmem:
-        raw: fx.Array[fx.Int8, n_blk, 16]
-
-    @flyc.kernel(known_block_size=[BT, 1, 1])
-    def kern(X: fx.Tensor, Q: fx.Tensor, S: fx.Tensor, c_m: fx.Int32):
-        tid = fx.thread_idx.x
-        row = fx.block_idx.x
-        smem = fx.SharedAllocator().allocate(RowSmem).peek().raw
-
-        xr = create_buffer_resource(X, max_size=True)
-        qr = create_buffer_resource(Q, max_size=True)
-        sr = create_buffer_resource(S, max_size=True)
-
-        b = tid
-        while b < fx.Int32(n_blk):
-            base = row * fx.Int32(K) + b * fx.Int32(_BLK)
-            words, biased = _quant_block_words(xr, base)
-            smem[b] = fx.arith.ArithValue(biased).trunci(fx.T.i8())
-
-            base_i32 = row * fx.Int32(K_fp8_i32) + b * fx.Int32(blk_i32)
-            for wi in range_constexpr(blk_i32):
-                buffer_store(words[wi], qr, base_i32 + fx.Int32(wi))
-
-            b = b + fx.Int32(BT)
-
-        fx.rocdl.s_barrier()
-        grp = row // fx.Int32(64)
-        r_row = row % fx.Int32(16)
-        s_row = (row % fx.Int32(64)) // fx.Int32(16)
-        n_out = K128p * 4
-        n_rounds = ceildiv(n_out, BT)
-        for pi in range_constexpr(n_rounds):
-            idx = tid + pi * BT
-            if idx < fx.Int32(n_out):
-                kkp = idx // fx.Int32(4)
-                g = idx % fx.Int32(4)
-                lane = g * fx.Int32(16) + r_row
-                packed = fx.Int32(0)
-                for bb in range_constexpr(scale_pack):
-                    ki = kkp * fx.Int32(scale_pack) + fx.Int32(bb)
-                    raw_b = ki * fx.Int32(4) + g
-                    scale_byte = fx.arith.ArithValue(smem[raw_b]).extui(fx.T.i32())
-                    packed = packed | ((scale_byte & fx.Int32(0xFF)) << (fx.Int32(bb) * fx.Int32(8)))
-                    out_idx = ((grp * fx.Int32(K128p) + kkp) * fx.Int32(64) + lane) * fx.Int32(4) + s_row
-                buffer_store(packed, sr, out_idx)
 
     @flyc.jit
     def launch(X: fx.Tensor, Q: fx.Tensor, S: fx.Tensor, M: int, stream: fx.Stream = fx.Stream(None)):
@@ -350,39 +263,21 @@ def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int, *, pack: i
     return b_sp
 
 
-def quantize_rowwise_mxfp8_flydsl(x: torch.Tensor, preshuffle: bool = False, scale_pack: int = _SCALE_PACK):
-    """Rowwise MXFP8 quant of ``x`` [M, K] bf16 in one FlyDSL kernel.
+def quantize_rowwise_mxfp8_flydsl(x: torch.Tensor):
+    """Rowwise MXFP8 quant of ``x`` [M, K] bf16 -> ``(q fp8 [M,K], s uint8 [M, K//32])`` raw E8M0.
 
-    ``preshuffle=False``: returns ``(q fp8 [M,K], s uint8 [M, K//32])`` raw E8M0.
-    ``preshuffle=True``: returns ``(q, a_sp)`` with A-scale in the
-    ScaleS2R broadcast layout; ``scale_pack=4`` (default) fuses pack-4 preshuffle into the quant
-    kernel (no separate host preshuffle pass)."""
+    Callers that need the A-scale already in the ScaleS2R broadcast layout get it from the kernel
+    that produces the activation (``swiglu_mxfp8_flydsl_kernel`` forward,
+    ``swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl`` backward), which fuses the preshuffle in."""
     assert x.dim() == 2 and x.dtype == torch.bfloat16
     M, K = x.shape
     x = x.contiguous()
     q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     q_i32 = q.view(torch.int32)
-    if preshuffle:
-        K128 = K // 128
-        K128p = ceildiv(K128, scale_pack)
-        a_ngrp = ceildiv(M, 64)
-        a_sp = torch.zeros(a_ngrp * K128p * 256, dtype=torch.int32, device=x.device)
-        if scale_pack == 4:
-            launch = _compile_quant_preshuffle_pack4(int(K), scale_pack=int(scale_pack))
-        else:
-            launch = _compile_quant(int(K), preshuffle=True)
-        args = (x, q_i32, a_sp, M, torch.cuda.current_stream())
-        ck = (M, K, True, int(scale_pack))
-        compiled = _QUANT_COMPILED.get(ck)
-        if compiled is None:
-            compiled = flyc.compile(launch, *args)
-            _QUANT_COMPILED[ck] = compiled
-        compiled(*args)
-        return q, a_sp
     s = torch.empty((M, K // _BLK), dtype=torch.uint8, device=x.device)
-    launch = _compile_quant(int(K), preshuffle=False)
+    launch = _compile_quant(int(K))
     args = (x, q_i32, s, M, torch.cuda.current_stream())
-    ck = (M, K, False)
+    ck = (M, K)
     compiled = _QUANT_COMPILED.get(ck)
     if compiled is None:
         compiled = flyc.compile(launch, *args)

@@ -74,7 +74,7 @@ _ASP_SCRATCH: dict = {}
 # FORWARD: SwiGLU -> rowwise mxfp8
 # =============================================================================
 @functools.lru_cache(maxsize=16)
-def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = 4096, scale_pack: int = _SCALE_PACK):
+def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = 4096):
     """SwiGLU + mxfp8 quant, activation kept in REGISTERS.
 
     One thread owns one whole 1x32 mxfp8 block of one row, so the SwiGLU result feeds
@@ -90,7 +90,7 @@ def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = 4096, scale_pack:
     two_I = 2 * I
     n_blk = I // _BLK
     K128 = I // 128
-    K128p = ceildiv(K128, scale_pack)
+    K128p = ceildiv(K128, _SCALE_PACK)
     K_fp8_i32 = I // 4
     blk_i32 = _BLK // 4
     subs = _BLK // _VEC
@@ -195,8 +195,8 @@ def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = 4096, scale_pack:
                         lane = g * fx.Int32(16) + r_row
                         smem_row = r_local * fx.Int32(n_blk)
                         packed = fx.Int32(0)
-                        for bb in range_constexpr(scale_pack):
-                            ki = kkp * fx.Int32(scale_pack) + fx.Int32(bb)
+                        for bb in range_constexpr(_SCALE_PACK):
+                            ki = kkp * fx.Int32(_SCALE_PACK) + fx.Int32(bb)
                             raw_b = ki * fx.Int32(4) + g
                             scale_byte = fx.arith.ArithValue(smem[smem_row + raw_b])
                             packed = packed | ((scale_byte & fx.Int32(0xFF)) << (fx.Int32(bb) * fx.Int32(8)))
@@ -231,8 +231,6 @@ _SWIGLU_MXFP8_COMPILED: dict = {}
 def swiglu_mxfp8_flydsl_kernel(
     x: torch.Tensor,
     num_tile_blocks: torch.Tensor,
-    *,
-    scale_pack: int = _SCALE_PACK,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """SwiGLU on ``x`` [M, 2I] gate||up -> mxfp8 ``(q [M,I] fp8, a_sp int32 preshuffled)``."""
     x = x.contiguous()
@@ -248,7 +246,7 @@ def swiglu_mxfp8_flydsl_kernel(
         q = torch.empty((M, I), dtype=torch.float8_e4m3fn, device=dev)
         _Q_SCRATCH[sk3] = q
     q_i32 = q.view(torch.int32)
-    K128p = ceildiv(I // 128, scale_pack)
+    K128p = ceildiv(I // 128, _SCALE_PACK)
     a_ngrp = ceildiv(M, 64)
     asp_sk = (a_ngrp, K128p, dev)
     a_sp = _ASP_SCRATCH.get(asp_sk)
@@ -256,9 +254,9 @@ def swiglu_mxfp8_flydsl_kernel(
         a_sp = torch.empty(a_ngrp * K128p * 256, dtype=torch.int32, device=dev)
         _ASP_SCRATCH[asp_sk] = a_sp
 
-    launch = _compile_swiglu_mxfp8(int(I), scale_pack=int(scale_pack))
+    launch = _compile_swiglu_mxfp8(int(I))
     args = (x, q_i32, a_sp, num_tile_blocks, M, torch.cuda.current_stream())
-    ck = (M, I, int(scale_pack))
+    ck = (M, I)
     compiled = _SWIGLU_MXFP8_COMPILED.get(ck)
     if compiled is None:
         compiled = flyc.compile(launch, *args)
@@ -365,8 +363,6 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, BT: int = 256):
         c_hi = fx.arith.constant(c_max, type=fx.T.f32())
         r_lo = fx.arith.constant(-448.0, type=fx.T.f32())
         r_hi = fx.arith.constant(448.0, type=fx.T.f32())
-        one = fx.arith.constant(1.0, type=fx.T.f32())
-        zero_f = fx.arith.constant(0.0, type=fx.T.f32())
         zero_i32 = fx.arith.constant(0, type=fx.T.i32())
 
         def _lds_ptr_n(arr, idx, n):

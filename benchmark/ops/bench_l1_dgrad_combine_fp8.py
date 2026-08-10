@@ -39,8 +39,8 @@ from primus_turbo.flydsl.mega.fp8 import (
     grouped_gemm_combine_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
 )
-from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
-from primus_turbo.flydsl.mega.fp8.quant import colwise_grouped_meta, quantize_rowwise_mxfp8_flydsl
+from primus_turbo.flydsl.mega.fp8 import swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl
+from primus_turbo.flydsl.mega.fp8.quant import colwise_grouped_meta
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
     _DW_FP8_FORMAT,
     _dispatch_l2_dgrad_mxfp8_flydsl_kernel,
@@ -134,14 +134,14 @@ def profile(group, args):
 
     dy = torch.randn((T, H), device="cuda", dtype=torch.bfloat16)
     grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle)
-    grad_l1, grad_gate = swiglu_backward_flydsl_kernel(
-        grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True,
-    )
-
     group_lens = handle[_H_GROUP_LENS]
     group_offs = handle[_H_GROUP_OFFS]
     meta = colwise_grouped_meta(group_lens, group_offs)
-    gl1_q_row, gl1_a_sp = quantize_rowwise_mxfp8_flydsl(grad_l1, preshuffle=True)
+    # Same fused dual-quant the production backward uses: the rowwise operand comes out already
+    # preshuffled, so there is no separate rowwise-quant pass to stand in for it here.
+    gl1_q_row, gl1_a_sp, _, _, grad_gate, _ = swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
+        grad_swiglu, l1, dispatch_weights, _DW_FP8_FORMAT, meta=meta,
+    )
     w1tf = _w1t_combine_fp8_cached(W1)
     rowwise = (gl1_q_row, gl1_a_sp)
     tki = topk_idx.contiguous().view(-1)

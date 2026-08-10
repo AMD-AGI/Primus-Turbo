@@ -4,15 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""fp8 EP comm closures for the FUSED mxfp8 dispatch+GEMM kernel (3-stage pipeline).
+"""The COMM role of the fused mxfp8 dispatch+GEMM kernel: ``dispatch_fp8_copy_tile``.
 
-* ``dispatch_fp8_copy_tile``: the COMM role. One block CLEAN-pushes a comm task's
-  PRE-QUANTIZED fp8 token rows (16B/lane b128, coalesced) + their RAW E8M0 block scales
-  into the peer ``pool_fp8`` / ``pool_scale`` regions over XGMI, then drains with a
-  device-scope L2 write-back and signals the peer per-pool-block scoreboard. No
-  in-push quant (tokens are quantized once on the source) -> the push saturates XGMI.
-
-Geometry: warp-per-token; hidden % 1024 == 0 (fp8 b128 push) and % 128 (MXFP8).
+Warp-per-token geometry; hidden % 1024 == 0 (fp8 b128 push) and % 128 (MXFP8).
 """
 
 import flydsl.expr as fx
@@ -60,13 +54,12 @@ def dispatch_fp8_copy_tile(
     bank,
     world_size,
 ):
-    """CLEAN fp8 comm PUSH closure (no in-push quant): copy a comm task's PRE-QUANTIZED
-    fp8 tokens (16B/lane b128, coalesced) into the peer ``pool_fp8``, plus their RAW E8M0
-    scales (coalesced) into the peer ``pool_scale``, then drain with a device-scope
-    L2 write-back and signal the peer per-pool-block scoreboard. Mirrors
-    ``dispatch_fp8_push`` (saturates XGMI) but with the fused kernel's multi-task-per-block
-    distribution so the preshuffle/gemm roles can overlap. The preshuffle role transposes
-    the raw scale to the ScaleS2R broadcast layout on the dest."""
+    """Push one comm task's PRE-QUANTIZED fp8 rows (16B/lane b128) and RAW E8M0 scales into the
+    peer's ``pool_fp8`` / ``pool_scale``, then release and signal its scoreboard.
+
+    Tokens are quantized once on the source rather than in-push, which keeps both stores coalesced
+    and the push XGMI-bound. Blocks take multiple tasks each so the preshuffle/gemm roles overlap;
+    the raw scale is transposed to ScaleS2R on the destination by the preshuffle role."""
     assert hidden_size % 1024 == 0, f"fp8 token push needs hidden % 1024 == 0, got {hidden_size}"
     n_warps = _BLOCK_THREADS // _WARP
     hidden_i32 = hidden_size // 4  # fp8 row: hidden bytes -> i32 words
@@ -91,11 +84,12 @@ def dispatch_fp8_copy_tile(
         peer_pscale = create_buffer_resource_from_addr(pscale_addr, num_records_bytes=pool_scale_bytes)
         return destination_rank, dest_row_start, source_offset, token_count, peer_pool, peer_pscale
 
-    def copy_slice(dest_row_start, source_offset, peer_pool, peer_pscale, tok_lo, tok_hi):
-        local_count = (tok_hi - tok_lo - warp_id + fx.Int32(n_warps - 1)) // fx.Int32(n_warps)
+    def copy_rows(dest_row_start, source_offset, peer_pool, peer_pscale, token_count):
+        # warp-strided over the task's rows: warp w takes rows w, w+n_warps, ...
+        local_count = (token_count - warp_id + fx.Int32(n_warps - 1)) // fx.Int32(n_warps)
 
         def _row(i):
-            row_index = tok_lo + warp_id + i * fx.Int32(n_warps)
+            row_index = warp_id + i * fx.Int32(n_warps)
             source_row = buffer_load(
                 dispatched_token_idx_resource, source_offset + row_index, vec_width=1, dtype=fx.T.i32()
             )
@@ -122,16 +116,10 @@ def dispatch_fp8_copy_tile(
         _emit_for(local_count, _row)
 
 
-    def dispatch_tile(task_index, sub, n_sub):
+    def dispatch_tile(task_index):
+        # A block owns whole tasks -- the caller rotates it over them -- so no task is split.
         dst_rank, dest_row_start, source_offset, token_count, peer_pool, peer_pscale = load_task(task_index)
-        if n_sub == 1:
-            tok_lo = fx.Int32(0)
-            tok_hi = token_count
-        else:
-            slice_tokens = (token_count + fx.Int32(n_sub - 1)) // fx.Int32(n_sub)
-            tok_lo = sub * slice_tokens
-            tok_hi = fx.arith.select(tok_lo + slice_tokens < token_count, tok_lo + slice_tokens, token_count)
-        copy_slice(dest_row_start, source_offset, peer_pool, peer_pscale, tok_lo, tok_hi)
+        copy_rows(dest_row_start, source_offset, peer_pool, peer_pscale, token_count)
         fx.rocdl.s_waitcnt(0)
         # Device-scope release before the flag: without it the peer can observe the signal ahead of
         # the rows it announces.
@@ -139,11 +127,9 @@ def dispatch_fp8_copy_tile(
         fx.gpu.barrier()
 
         def _signal():
-            # epoch dispatch gate (bf16-style, per-expert uniform): one +1 to the peer's
-            # dispatch_flag[bank + local_expert]. task table is dense [local_expert][dst_rank]
-            # (prologue C3a), so local_expert = task_index // world_size and each dst expert
-            # receives exactly num_ranks +1s -> reaches the cumulative expected. Replaces the
-            # per-pool-block variable-count scoreboard (host-reset).
+            # One +1 to the peer's dispatch_flag[bank + local_expert]. The task table is dense
+            # [local_expert][dst_rank], so each dst expert receives exactly num_ranks of them and
+            # reaches the cumulative expected -- no host-reset scoreboard needed.
             df_address = _peer_addr(dispatch_flag_base, dispatch_flag_offsets_resource, dst_rank)
             local_expert = task_index // fx.Int32(world_size)
             atomic_add(df_address, bank + local_expert, fx.Int64(1), scope="sys")
