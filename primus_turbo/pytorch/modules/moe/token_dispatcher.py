@@ -108,9 +108,8 @@ class TokenDispatcher:
 class DeepEPTokenDispatcher(TokenDispatcher):
     """Dispatch tokens to experts (autograd combines gradients on backward).
 
-    ``tokens_per_expert`` always reflects ``pad_multiple`` padding. On the host
-    path it is derived from DeepEP's already-synced counts instead of
-    ``moe_permute``'s, which avoids a second device sync.
+    ``tokens_per_expert`` always reflects ``pad_multiple`` padding; the host path
+    pads DeepEP's already-synced counts to avoid a second device sync.
 
     Fully nosync / CUDA-graph capturable requires all three:
     ``deepep_num_worst_tokens > 0``, ``permute_max_token_num > 0``,
@@ -123,9 +122,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         permute_fusion: deprecated; ``moe_permute`` is always fused.
         pad_multiple: pad per-expert permuted count to this multiple
             (set to grouped-GEMM ``BLOCK_M``).
-        permute_max_token_num: caller-provided cap; ``> 0`` removes the sum-item
-            host sync. Only consulted when DeepEP returns no host counts
-            (``deepep_num_worst_tokens > 0``).
+        permute_max_token_num: caller-provided cap removing the sum-item host sync;
+            only consulted when DeepEP returns no host counts.
         deepep_use_comm_stream: when False, pin EP kernels to the current stream.
         deepep_num_worst_tokens: ``> 0`` enables worst-case allocation mode.
         deepep_use_cuda_num_tokens_per_expert: keep ``tokens_per_expert`` on device.
@@ -191,8 +189,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.deepep_use_cuda_num_tokens_per_expert = deepep_use_cuda_num_tokens_per_expert
         self.deepep_num_worst_tokens = deepep_num_worst_tokens
 
-        # (tensor, value, device) row bound reused across steps; see _row_bound.
-        self._row_bound_cache = None
 
         set_buffer_global_config(
             num_use_cu=deepep_num_use_cu,
@@ -350,30 +346,10 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.tokens_per_expert = None
         return hidden_states, tokens_per_expert, permuted_probs
 
-    def _row_bound(self, num_dispatched, device):
-        """Device-side row bound, cached because DeepEP's recv height is stable.
-
-        moe_unpermute saves it for its own backward, so one cached tensor covers
-        both directions and no allocation happens on the steady-state path.
-        """
-        cached = self._row_bound_cache
-        # Compare the requested device, not the tensor's: "cuda" != "cuda:0".
-        if cached is None or cached[1] != num_dispatched or cached[2] != device:
-            cached = (
-                torch.full((1,), num_dispatched, dtype=torch.int32, device=device),
-                num_dispatched,
-                device,
-            )
-            self._row_bound_cache = cached
-        return cached[0]
-
     def _pre_combine(self, hidden_states):
-        # Row bound is DeepEP's recv height (== restore_shape[0]), not moe_permute's.
-        num_dispatched = int(self.hidden_shape_before_permute[0])
         hidden_states, _ = turbo.ops.moe_unpermute(
             hidden_states,
             self.row_id_map,
-            self._row_bound(num_dispatched, hidden_states.device),
             restore_shape=self.hidden_shape_before_permute,
             num_local_experts=self.num_local_experts,
             pad_multiple=self.pad_multiple,

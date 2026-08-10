@@ -32,53 +32,36 @@ def routing_kwargs(routing_map: torch.Tensor, expert_map: torch.Tensor, kind: st
     return {"topk_indices": expert_map}
 
 
-def generate_routing_map(
-    num_tokens: int, num_experts: int, num_topk: int, *, seed: int
-) -> torch.Tensor:
+def generate_routing_map(num_tokens: int, num_experts: int, num_topk: int, *, seed: int) -> torch.Tensor:
     """Bool routing_map ``[num_tokens, num_experts]`` with exactly ``num_topk`` ones per row."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    perm = torch.argsort(
-        torch.rand(num_tokens, num_experts, generator=g, device="cuda"), dim=1
-    )
+    perm = torch.argsort(torch.rand(num_tokens, num_experts, generator=g, device="cuda"), dim=1)
     routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool, device="cuda")
     routing_map.scatter_(1, perm[:, :num_topk], True)
     return routing_map
 
 
-def routing_map_to_expert_map(
-    routing_map: torch.Tensor, num_topk: int, kind: str
-) -> torch.Tensor:
+def routing_map_to_expert_map(routing_map: torch.Tensor, num_topk: int, kind: str) -> torch.Tensor:
     """Return ``routing_map`` itself for the bool path, or ``topk_idx[num_tokens, num_topk]`` otherwise."""
     if kind == "routing_map":
         return routing_map
     dtype = {"topk_idx_int32": torch.int32, "topk_idx_int64": torch.int64}[kind]
     num_tokens, num_experts = routing_map.shape
-    expert_ids = (
-        torch.arange(num_experts, device="cuda")
-        .unsqueeze(0)
-        .expand(num_tokens, -1)
-        .contiguous()
-    )
+    expert_ids = torch.arange(num_experts, device="cuda").unsqueeze(0).expand(num_tokens, -1).contiguous()
     return expert_ids[routing_map].view(num_tokens, num_topk).to(dtype)
 
 
 def expected_permuted_layout(routing_map: torch.Tensor, pad_multiple: int):
-    """Build the (token_id, expert_idx) source map for each row of the
-    expert-major permuted output, including padded rows (marked with -1).
+    """Per-row (token_id, expert_idx) source map of the expert-major output.
 
-    The kernel writes ``[expert 0 real | expert 0 pad zeros | expert 1 real |
-    expert 1 pad zeros | ...]``: padding is inserted **per-expert**, NOT
-    appended once at the end, so the first ``real_total`` rows are not a
-    contiguous slice of the real entries when ``pad_multiple > 0``.
+    Padding is per-expert (``[e0 real | e0 pad | e1 real | ...]``, -1 rows), so the
+    real entries are not a contiguous prefix when ``pad_multiple > 0``.
     """
     device = routing_map.device
     num_tokens, num_experts = routing_map.shape
     real_per_expert = routing_map.sum(dim=0).tolist()
     if pad_multiple > 0:
-        padded_per_expert = [
-            ((r + pad_multiple - 1) // pad_multiple) * pad_multiple
-            for r in real_per_expert
-        ]
+        padded_per_expert = [((r + pad_multiple - 1) // pad_multiple) * pad_multiple for r in real_per_expert]
     else:
         padded_per_expert = list(real_per_expert)
     total = sum(padded_per_expert)
@@ -97,22 +80,16 @@ def expected_permuted_layout(routing_map: torch.Tensor, pad_multiple: int):
     return src_token, src_expert, total
 
 
-# -----------------------------------------------------------------------------
-# Forward + backward correctness (pad_multiple = 0)
-# -----------------------------------------------------------------------------
+# --- Forward + backward correctness (pad_multiple = 0) ---
 
 
 @pytest.mark.parametrize("num_topk", [1, 2, 4, 8])
-@pytest.mark.parametrize(
-    "expert_map_kind", ["routing_map", "topk_idx_int32", "topk_idx_int64"]
-)
+@pytest.mark.parametrize("expert_map_kind", ["routing_map", "topk_idx_int32", "topk_idx_int64"])
 @pytest.mark.parametrize("num_tokens", [4096])
 @pytest.mark.parametrize("num_experts", [16])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_moe_permutation(
-    num_topk, expert_map_kind, num_tokens, num_experts, hidden_size, backend
-):
+def test_moe_permutation(num_topk, expert_map_kind, num_tokens, num_experts, hidden_size, backend):
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=1234)
     expert_map = routing_map_to_expert_map(routing_map, num_topk, expert_map_kind)
 
@@ -126,22 +103,18 @@ def test_moe_permutation(
     ref_perm.backward(grad_perm, retain_graph=True)
 
     ref_unp_in = ref_perm.detach().clone().requires_grad_(True)
-    ref_unp_out = pytorch_unpermute_mask_map(
-        ref_unp_in, sorted_idx, tokens_ref.shape, probs=None
-    )
+    ref_unp_out = pytorch_unpermute_mask_map(ref_unp_in, sorted_idx, tokens_ref.shape, probs=None)
     grad_unp = torch.randn_like(ref_unp_out)
     ref_unp_out.backward(grad_unp, retain_graph=True)
 
     # --- turbo: permute (forward + backward) -----------------------------
-    permuted_tokens, row_id_map, tokens_per_expert, overflow_flag, _, _ = (
-        moe_permute(
-            tokens_turbo,
-            num_local_experts=num_experts,
-            num_topk=0 if expert_map_kind == "routing_map" else num_topk,
-            probs_layout="routing_map",
-            backend=backend,
-            **routing_kwargs(routing_map, expert_map, expert_map_kind),
-        )
+    permuted_tokens, row_id_map, tokens_per_expert, overflow_flag, _, _ = moe_permute(
+        tokens_turbo,
+        num_local_experts=num_experts,
+        num_topk=0 if expert_map_kind == "routing_map" else num_topk,
+        probs_layout="routing_map",
+        backend=backend,
+        **routing_kwargs(routing_map, expert_map, expert_map_kind),
     )
     assert int(overflow_flag.item()) == 0
     torch.testing.assert_close(
@@ -162,10 +135,8 @@ def test_moe_permutation(
     turbo_unp_out.backward(grad_unp, retain_graph=True)
 
     tol = get_tolerances(permuted_tokens.dtype)
-    # PyTorch native reference accumulates backward gradients in bf16, which is less accurate than the turbo implementation.
-    bwd_tol = dict(
-        atol=max(tol["atol"], 0.01 * num_topk), rtol=max(tol["rtol"], 0.01 * num_topk)
-    )
+    # Reference accumulates bwd grads in bf16, less accurate than turbo.
+    bwd_tol = dict(atol=max(tol["atol"], 0.01 * num_topk), rtol=max(tol["rtol"], 0.01 * num_topk))
 
     # --- compare ---------------------------------------------------------
     torch.testing.assert_close(permuted_tokens, ref_perm, **tol)
@@ -174,17 +145,13 @@ def test_moe_permutation(
     torch.testing.assert_close(turbo_unp_in.grad, ref_unp_in.grad, **bwd_tol)
 
 
-# -----------------------------------------------------------------------------
-# pad_multiple: tokens_per_expert is rounded up to the requested alignment
-# -----------------------------------------------------------------------------
+# --- pad_multiple: tokens_per_expert is rounded up to the requested alignment ---
 
 
 @pytest.mark.parametrize("num_topk", [1, 2, 4])
 @pytest.mark.parametrize("pad_multiple", [8, 16, 64])
 def test_moe_permute_pad_multiple(num_topk, pad_multiple):
-    """``pad_multiple > 0`` ⇒ ``tokens_per_expert`` rounds each expert's
-    real count up to a multiple of ``pad_multiple``. Verified against the
-    ``pad_multiple = 0`` baseline."""
+    """``pad_multiple > 0`` rounds each expert's count up, vs the pad-free baseline."""
     num_tokens, num_experts, hidden_size = 1024, 8, 64
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=1234)
     tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
@@ -209,9 +176,7 @@ def test_moe_permute_pad_multiple(num_topk, pad_multiple):
     assert (padded_per_expert % pad_multiple == 0).all()
 
 
-# -----------------------------------------------------------------------------
-# overflow_flag
-# -----------------------------------------------------------------------------
+# --- overflow_flag ---
 
 
 @pytest.mark.parametrize(
@@ -237,9 +202,7 @@ def test_overflow_flag(pad_multiple, cap_kind, expected):
     real_per_expert = routing_map.sum(dim=0)
     real = int(real_per_expert.sum().item())
     padded = int(
-        (((real_per_expert + pad_multiple - 1) // pad_multiple) * pad_multiple)
-        .sum()
-        .item()
+        (((real_per_expert + pad_multiple - 1) // pad_multiple) * pad_multiple).sum().item()
         if pad_multiple > 0
         else real
     )
@@ -270,10 +233,7 @@ def test_overflow_flag(pad_multiple, cap_kind, expected):
     assert int(overflow_flag.item()) == expected
 
 
-# -----------------------------------------------------------------------------
-# Fast path: num_tokens = 0 must short-circuit forward AND backward without
-# touching the preprocessing kernel (which hard-asserts max_num_dispatched > 0).
-# -----------------------------------------------------------------------------
+# --- Fast path: num_tokens = 0 short-circuits fwd+bwd without the preprocessing kernel ---
 
 
 @pytest.mark.parametrize("with_probs", [False, True])
@@ -285,13 +245,9 @@ def test_moe_permute_empty_input(with_probs, pad_multiple, backend):
         pytest.skip("TRITON has no padding support")
     num_experts, hidden_size = 8, 64
     routing_map = torch.zeros((0, num_experts), dtype=torch.bool, device="cuda")
-    tokens = torch.randn(
-        (0, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True
-    )
+    tokens = torch.randn((0, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     probs = (
-        torch.zeros(
-            (0, num_experts), dtype=torch.float32, device="cuda", requires_grad=True
-        )
+        torch.zeros((0, num_experts), dtype=torch.float32, device="cuda", requires_grad=True)
         if with_probs
         else None
     )
@@ -342,9 +298,7 @@ def test_moe_permute_empty_input(with_probs, pad_multiple, backend):
         assert probs.grad.shape == (0, num_experts)
 
     # moe_unpermute fast path: zero permuted rows back to zero dispatched rows.
-    permuted = torch.zeros(
-        (0, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True
-    )
+    permuted = torch.zeros((0, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     unpermuted, _ = moe_unpermute(
         permuted,
         row_id_map,
@@ -357,11 +311,7 @@ def test_moe_permute_empty_input(with_probs, pad_multiple, backend):
     assert permuted.grad is not None and permuted.grad.shape == (0, hidden_size)
 
 
-# -----------------------------------------------------------------------------
-# Probs path: forward writes [permuted, ] probs from [T, E] multihot, and the
-# backward routes ``permuted_probs.grad`` back to ``probs`` as well as
-# ``permuted_tokens.grad`` back to ``tokens``.
-# -----------------------------------------------------------------------------
+# --- Probs path: [T, E] multihot probs forward and their backward ---
 
 
 @pytest.mark.parametrize("num_topk", [1, 2, 4])
@@ -379,11 +329,8 @@ def test_moe_permute_with_probs_fwd_bwd(num_topk, pad_multiple, backend):
         device="cuda",
         requires_grad=True,
     )
-    # Use random multihot probs so the gather is observable; non-routed slots
-    # stay zero — that's the contract that ``[T, E]`` probs encode.
-    probs_dense = torch.rand(
-        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
-    )
+    # Random multihot probs; non-routed slots stay zero by contract.
+    probs_dense = torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda")
     probs_dense = probs_dense * routing_map.float()
     probs = probs_dense.detach().clone().requires_grad_(True)
 
@@ -401,9 +348,7 @@ def test_moe_permute_with_probs_fwd_bwd(num_topk, pad_multiple, backend):
     assert permuted_probs.dtype == torch.float32
     assert permuted_probs.shape[0] == permuted_tokens.shape[0]
 
-    # Reference: gather probs[T, E] into expert-major order with per-expert
-    # padding zeros, mirroring how the kernel writes ``permuted_probs`` from
-    # ``[token_id, expert_idx]``.
+    # Reference: gather probs[T, E] into expert-major order with padding zeros.
     src_token, src_expert, total = expected_permuted_layout(routing_map, pad_multiple)
     assert permuted_probs.shape[0] == total
     real_mask = src_token >= 0
@@ -411,17 +356,13 @@ def test_moe_permute_with_probs_fwd_bwd(num_topk, pad_multiple, backend):
     expected_pp[real_mask] = probs[src_token[real_mask], src_expert[real_mask]]
     torch.testing.assert_close(permuted_probs.float(), expected_pp, atol=0.0, rtol=0.0)
 
-    # Backward: random gradient on permuted_probs must flow back to probs at
-    # the matching ``[token_id, expert_idx]`` slots only; padded rows do not
-    # contribute (their src_token == -1).
+    # Backward: grad lands on matching [token_id, expert_idx] slots only.
     grad_perm = torch.randn_like(permuted_tokens)
     grad_pp = torch.randn_like(permuted_probs)
     torch.autograd.backward([permuted_tokens, permuted_probs], [grad_perm, grad_pp])
 
     expected_probs_grad = torch.zeros_like(probs)
-    expected_probs_grad[src_token[real_mask], src_expert[real_mask]] = grad_pp[
-        real_mask
-    ]
+    expected_probs_grad[src_token[real_mask], src_expert[real_mask]] = grad_pp[real_mask]
 
     torch.testing.assert_close(probs.grad, expected_probs_grad, atol=1e-5, rtol=1e-5)
     assert tokens.grad is not None
@@ -433,12 +374,9 @@ def test_moe_permute_triton_matches_hip_mask_map(num_topk):
     """The two backends must agree on the routing_map + multihot probs path."""
     num_tokens, num_experts, hidden_size = 256, 8, 128
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=9)
-    base_tokens = torch.randn(
-        (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
-    )
+    base_tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
     base_probs = (
-        torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda")
-        * routing_map.float()
+        torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda") * routing_map.float()
     )
 
     outputs = {}
@@ -464,19 +402,12 @@ def test_moe_permute_triton_matches_hip_mask_map(num_topk):
     grad_tokens = torch.randn_like(hip_output[0])
     grad_probs = torch.randn_like(hip_output[5])
     torch.autograd.backward([hip_output[0], hip_output[5]], [grad_tokens, grad_probs])
-    torch.autograd.backward(
-        [triton_output[0], triton_output[5]], [grad_tokens, grad_probs]
-    )
-    torch.testing.assert_close(
-        triton_tokens.grad, hip_tokens.grad, **get_tolerances(torch.bfloat16)
-    )
+    torch.autograd.backward([triton_output[0], triton_output[5]], [grad_tokens, grad_probs])
+    torch.testing.assert_close(triton_tokens.grad, hip_tokens.grad, **get_tolerances(torch.bfloat16))
     torch.testing.assert_close(triton_probs.grad, hip_probs.grad, atol=1e-5, rtol=1e-5)
 
 
-# -----------------------------------------------------------------------------
-# Backend selection: an explicit backend is used as given, so Triton must reject
-# what it cannot do instead of silently producing a different layout.
-# -----------------------------------------------------------------------------
+# --- Backend selection: an explicit backend must reject what it cannot do ---
 
 
 def test_moe_permute_triton_rejects_padding():
@@ -497,12 +428,8 @@ def test_moe_permute_triton_rejects_padding():
 def test_moe_permute_triton_converts_topk_inputs():
     num_tokens, num_experts, num_topk, hidden_size = 128, 8, 2, 64
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=13)
-    topk_indices = routing_map_to_expert_map(
-        routing_map, num_topk, "topk_idx_int32"
-    )
-    tokens = torch.randn(
-        (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
-    )
+    topk_indices = routing_map_to_expert_map(routing_map, num_topk, "topk_idx_int32")
+    tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
     probs = torch.rand(
         (num_tokens, num_topk),
         dtype=torch.float32,
@@ -520,16 +447,12 @@ def test_moe_permute_triton_converts_topk_inputs():
         backend=BackendType.TRITON,
     )
 
-    src_token, src_expert, _ = expected_permuted_layout(
-        routing_map, pad_multiple=0
+    src_token, src_expert, _ = expected_permuted_layout(routing_map, pad_multiple=0)
+    dense_probs = torch.zeros((num_tokens, num_experts), dtype=probs.dtype, device=probs.device).scatter(
+        1, topk_indices.long(), probs.detach()
     )
-    dense_probs = torch.zeros(
-        (num_tokens, num_experts), dtype=probs.dtype, device=probs.device
-    ).scatter(1, topk_indices.long(), probs.detach())
     torch.testing.assert_close(permuted_tokens, tokens[src_token], atol=0, rtol=0)
-    torch.testing.assert_close(
-        permuted_probs, dense_probs[src_token, src_expert], atol=0, rtol=0
-    )
+    torch.testing.assert_close(permuted_probs, dense_probs[src_token, src_expert], atol=0, rtol=0)
 
     permuted_probs.sum().backward()
     torch.testing.assert_close(probs.grad, torch.ones_like(probs), atol=0, rtol=0)
@@ -559,9 +482,7 @@ def test_moe_permute_capacity_truncation(backend):
         pytest.skip("TRITON has no capacity kernel; the value is an upper bound")
     num_tokens, num_experts, num_topk, hidden_size = 128, 4, 2, 64
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=23)
-    tokens = torch.randn(
-        (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True
-    )
+    tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     capacity = num_tokens  # half of num_tokens * num_topk
 
     (
@@ -581,14 +502,11 @@ def test_moe_permute_capacity_truncation(backend):
     assert permuted_tokens.shape == (capacity, hidden_size)
     # Both backends must flag the dropped rows.
     assert int(overflow_flag.item()) == 1
-    # Dropped rows must also leave the per-expert counts, or the grouped GEMM
-    # downstream would read past the permuted buffer.
+    # Dropped rows must leave the counts too, or the grouped GEMM overreads.
     assert int(tokens_per_expert.sum().item()) <= capacity
     # Survivors are the leading `capacity` rows of the expert-major layout.
     src_token, _, _ = expected_permuted_layout(routing_map, pad_multiple=0)
-    torch.testing.assert_close(
-        permuted_tokens, tokens.detach()[src_token[:capacity]], atol=0, rtol=0
-    )
+    torch.testing.assert_close(permuted_tokens, tokens.detach()[src_token[:capacity]], atol=0, rtol=0)
     torch.cuda.synchronize()
 
     out = moe_unpermute(
@@ -605,18 +523,11 @@ def test_moe_permute_capacity_truncation(backend):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_moe_unpermute_backward_probs_output_unused(backend):
-    """Backprop through the token output only; the probs output stays unused.
-
-    Autograd then hands backward a None probs grad, which must not zero out the
-    activation gradient.
-    """
+    """A None probs grad (probs output unused) must not zero the activation grad."""
     num_tokens, num_experts, num_topk, hidden_size = 64, 8, 2, 64
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=31)
     tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
-    probs = (
-        torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda")
-        * routing_map.float()
-    )
+    probs = torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda") * routing_map.float()
 
     permuted_tokens, row_id_map, _, _, _, permuted_probs = moe_permute(
         tokens,
@@ -641,25 +552,19 @@ def test_moe_unpermute_backward_probs_output_unused(backend):
     unpermuted_tokens.backward(grad_unp)
 
     src_token, _, _ = expected_permuted_layout(routing_map, pad_multiple=0)
-    torch.testing.assert_close(
-        permuted_in.grad, grad_unp[src_token].to(permuted_in.dtype), atol=0, rtol=0
-    )
+    torch.testing.assert_close(permuted_in.grad, grad_unp[src_token].to(permuted_in.dtype), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_moe_permute_zero_prob_row_is_not_zeroed(backend):
     """A routed slot whose prob happens to be 0.0 is still a real token."""
     if backend is BackendType.TRITON:
-        # The Triton kernel reads prob == 0.0 as a padded slot and zeroes it,
-        # which DeepEP's capacity_factor path relies on.
+        # Triton reads prob == 0.0 as padding; DeepEP's capacity path needs this.
         pytest.skip("TRITON treats a zero prob as padding")
     num_tokens, num_experts, num_topk, hidden_size = 64, 8, 2, 64
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=32)
     tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
-    probs = (
-        torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda")
-        * routing_map.float()
-    )
+    probs = torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda") * routing_map.float()
     zero_token = 0
     zero_expert = int(routing_map[zero_token].nonzero()[0].item())
     probs[zero_token, zero_expert] = 0.0
@@ -675,17 +580,14 @@ def test_moe_permute_zero_prob_row_is_not_zeroed(backend):
 
     src_token, src_expert, _ = expected_permuted_layout(routing_map, pad_multiple=0)
     row = int(((src_token == zero_token) & (src_expert == zero_expert)).nonzero()[0])
-    torch.testing.assert_close(
-        permuted_tokens[row], tokens[zero_token], atol=0, rtol=0
-    )
+    torch.testing.assert_close(permuted_tokens[row], tokens[zero_token], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_moe_permute_unrouted_tokens_roundtrip_to_zero(backend):
-    """A token with no route occupies no permuted row and comes back as zeros.
+    """An unrouted token occupies no permuted row and comes back as zeros.
 
-    ``moe_unpermute`` is called without an explicit dispatched-token bound, so
-    this also covers the default (``restore_shape[0]``) bound.
+    Also covers the default ``restore_shape[0]`` dispatched-token bound.
     """
     num_tokens, num_experts, num_topk, hidden_size = 64, 8, 2, 64
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=33)
@@ -710,17 +612,12 @@ def test_moe_permute_unrouted_tokens_roundtrip_to_zero(backend):
         backend=backend,
     )
     assert unpermuted.shape == (num_tokens, hidden_size)
-    torch.testing.assert_close(
-        unpermuted[unrouted], torch.zeros_like(unpermuted[unrouted]), atol=0, rtol=0
-    )
+    torch.testing.assert_close(unpermuted[unrouted], torch.zeros_like(unpermuted[unrouted]), atol=0, rtol=0)
     routed = [t for t in range(num_tokens) if t not in unrouted]
     assert (unpermuted[routed] != 0).any(dim=1).all()
 
 
-# -----------------------------------------------------------------------------
-# Unpermute probs backward: a forward gradient on ``unpermuted_probs`` must
-# flow back to ``permuted_probs.grad`` via the permute kernel.
-# -----------------------------------------------------------------------------
+# --- Unpermute probs backward: unpermuted_probs grad flows to permuted_probs.grad ---
 
 
 def test_moe_unpermute_with_probs_fwd_bwd():
@@ -728,10 +625,7 @@ def test_moe_unpermute_with_probs_fwd_bwd():
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=11)
 
     tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
-    probs = (
-        torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda")
-        * routing_map.float()
-    )
+    probs = torch.rand((num_tokens, num_experts), dtype=torch.float32, device="cuda") * routing_map.float()
     # Pick once: permute and unpermute must agree on the row_id_map layout.
     resolved = default_backend()
     permuted_tokens, row_id_map, _, _, _, permuted_probs = moe_permute(
@@ -759,36 +653,20 @@ def test_moe_unpermute_with_probs_fwd_bwd():
 
     grad_unp = torch.randn_like(unpermuted_tokens)
     grad_unp_probs = torch.randn_like(unpermuted_probs)
-    torch.autograd.backward(
-        [unpermuted_tokens, unpermuted_probs], [grad_unp, grad_unp_probs]
-    )
+    torch.autograd.backward([unpermuted_tokens, unpermuted_probs], [grad_unp, grad_unp_probs])
 
-    assert (
-        permuted_in.grad is not None and permuted_in.grad.shape == permuted_tokens.shape
-    )
-    assert (
-        permuted_probs.grad is not None
-        and permuted_probs.grad.shape == permuted_probs.shape
-    )
+    assert permuted_in.grad is not None and permuted_in.grad.shape == permuted_tokens.shape
+    assert permuted_probs.grad is not None and permuted_probs.grad.shape == permuted_probs.shape
 
-    # Forward-then-backward roundtrip: the gradient on permuted_probs at row r
-    # comes from grad_unp_probs[token_id, expert_idx] for the (token, expert)
-    # pair encoded at row r of the expert-major layout (or 0 for padded rows).
+    # permuted_probs grad at row r comes from the (token, expert) pair at row r.
     src_token, src_expert, total = expected_permuted_layout(routing_map, pad_multiple=0)
     real_mask = src_token >= 0
     expected_pp_grad = torch.zeros_like(permuted_probs)
-    expected_pp_grad[real_mask] = grad_unp_probs[
-        src_token[real_mask], src_expert[real_mask]
-    ]
-    torch.testing.assert_close(
-        permuted_probs.grad, expected_pp_grad, atol=1e-5, rtol=1e-5
-    )
+    expected_pp_grad[real_mask] = grad_unp_probs[src_token[real_mask], src_expert[real_mask]]
+    torch.testing.assert_close(permuted_probs.grad, expected_pp_grad, atol=1e-5, rtol=1e-5)
 
 
-# -----------------------------------------------------------------------------
-# fp16 dtype: forward + backward, exercising the unpermute fp16 dispatch added
-# in the C++ launcher.
-# -----------------------------------------------------------------------------
+# --- fp16 dtype: forward + backward through the unpermute fp16 dispatch ---
 
 
 @pytest.mark.parametrize("num_topk", [1, 4])
@@ -805,9 +683,7 @@ def test_moe_permute_fp16_fwd_bwd(num_topk):
     ref_perm.backward(grad_perm, retain_graph=True)
 
     ref_unp_in = ref_perm.detach().clone().requires_grad_(True)
-    ref_unp_out = pytorch_unpermute_mask_map(
-        ref_unp_in, sorted_idx, tokens_ref.shape, probs=None
-    )
+    ref_unp_out = pytorch_unpermute_mask_map(ref_unp_in, sorted_idx, tokens_ref.shape, probs=None)
     grad_unp = torch.randn_like(ref_unp_out)
     ref_unp_out.backward(grad_unp, retain_graph=True)
 
@@ -834,9 +710,7 @@ def test_moe_permute_fp16_fwd_bwd(num_topk):
     turbo_unp_out.backward(grad_unp, retain_graph=True)
 
     tol = get_tolerances(torch.float16)
-    bwd_tol = dict(
-        atol=max(tol["atol"], 0.01 * num_topk), rtol=max(tol["rtol"], 0.01 * num_topk)
-    )
+    bwd_tol = dict(atol=max(tol["atol"], 0.01 * num_topk), rtol=max(tol["rtol"], 0.01 * num_topk))
 
     torch.testing.assert_close(permuted_tokens, ref_perm, **tol)
     torch.testing.assert_close(tokens_turbo.grad, tokens_ref.grad, **bwd_tol)
@@ -844,14 +718,7 @@ def test_moe_permute_fp16_fwd_bwd(num_topk):
     torch.testing.assert_close(turbo_unp_in.grad, ref_unp_in.grad, **bwd_tol)
 
 
-# -----------------------------------------------------------------------------
-# pad_multiple > 0: end-to-end (forward + backward) correctness check.
-#   * permute forward must still match the reference for the real rows.
-#   * unpermute output shape must equal [num_dispatched, hidden] (i.e. the
-#     padding rows are stripped via the new ``pad_multiple`` parameter).
-#   * backward gradients on tokens / permuted_tokens must match the
-#     pad_multiple = 0 baseline (padding rows do not contribute).
-# -----------------------------------------------------------------------------
+# --- pad_multiple > 0: end-to-end forward + backward against the pad-free baseline ---
 
 
 @pytest.mark.parametrize("num_topk", [1, 2, 4])
@@ -889,9 +756,7 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple, backend):
     grad_unp_ref = torch.randn_like(unp_out_ref)
     unp_out_ref.backward(grad_unp_ref, retain_graph=True)
 
-    # Padded run: forward output interleaves padding zeros per expert
-    # (``[expert0 real | expert0 pad | expert1 real | expert1 pad | ...]``),
-    # so the real entries do NOT form a contiguous prefix in general.
+    # Padding is interleaved per expert, so real rows are not a contiguous prefix.
     tokens_pad = base.detach().clone().requires_grad_(True)
     perm_pad, row_id_map_pad, tokens_per_expert_pad, _, _, _ = moe_permute(
         tokens_pad,
@@ -901,20 +766,15 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple, backend):
         probs_layout="routing_map",
         backend=backend,
     )
-    src_token_pad, _src_expert_pad, total_pad = expected_permuted_layout(
-        routing_map, pad_multiple
-    )
+    src_token_pad, _src_expert_pad, total_pad = expected_permuted_layout(routing_map, pad_multiple)
     real_mask_pad = src_token_pad >= 0
     real_total = perm_ref.shape[0]
     assert perm_pad.shape[0] == total_pad
     assert int(real_mask_pad.sum().item()) == real_total
     assert int(tokens_per_expert_pad.sum().item()) == perm_pad.shape[0]
 
-    # Real rows of the padded output must equal the reference (same expert-
-    # major order) and padded rows must be zeros.
-    torch.testing.assert_close(
-        perm_pad[real_mask_pad], perm_ref, **get_tolerances(torch.bfloat16)
-    )
+    # Real rows must match the reference; padded rows must be zeros.
+    torch.testing.assert_close(perm_pad[real_mask_pad], perm_ref, **get_tolerances(torch.bfloat16))
     if perm_pad.shape[0] > real_total:
         assert torch.all(perm_pad[~real_mask_pad] == 0)
 
@@ -926,8 +786,7 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple, backend):
     tol = get_tolerances(torch.bfloat16)
     torch.testing.assert_close(tokens_pad.grad, tokens_ref.grad, **tol)
 
-    # Unpermute strips padding via ``restore_shape``; output collapses to
-    # [num_tokens, hidden].
+    # Unpermute strips padding via ``restore_shape``.
     unp_in_pad = perm_pad.detach().clone().requires_grad_(True)
     unp_out_pad, _ = moe_unpermute(
         unp_in_pad,
@@ -941,10 +800,55 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple, backend):
     assert unp_out_pad.shape == (num_tokens, hidden_size)
     torch.testing.assert_close(unp_out_pad, unp_out_ref, **tol)
 
-    # Backward through unpermute: gradient on real rows matches the
-    # pad_multiple = 0 baseline, padded rows must remain zero.
+    # Unpermute backward: real rows match the baseline, padded rows stay zero.
     unp_out_pad.backward(grad_unp_ref, retain_graph=True)
     assert unp_in_pad.grad is not None
     torch.testing.assert_close(unp_in_pad.grad[real_mask_pad], unp_in_ref.grad, **tol)
     if unp_in_pad.grad.shape[0] > real_total:
         assert torch.all(unp_in_pad.grad[~real_mask_pad] == 0)
+
+
+# --- torch.compile: the custom ops trace as one graph and match eager ---
+
+
+@pytest.mark.parametrize("preallocated", [False, True])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_moe_permute_torch_compile(preallocated, backend):
+    num_tokens, num_experts, num_topk, hidden_size = 512, 8, 2, 128
+    # Exact count, not a looser bound: the tail rows would stay uninitialised.
+    num_permuted_tokens = num_tokens * num_topk if preallocated else -1
+    routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=77)
+    base = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+
+    def roundtrip(tokens):
+        permuted, row_id_map, tokens_per_expert, _, _, _ = moe_permute(
+            tokens,
+            routing_map=routing_map,
+            num_local_experts=num_experts,
+            num_permuted_tokens=num_permuted_tokens,
+            probs_layout="routing_map",
+            backend=backend,
+        )
+        unpermuted, _ = moe_unpermute(
+            permuted,
+            row_id_map,
+            restore_shape=tokens.shape,
+            num_local_experts=num_experts,
+            backend=backend,
+        )
+        return permuted, tokens_per_expert, unpermuted
+
+    # Inference skips the autograd.Function ctx, so the roundtrip must be a single graph.
+    with torch.no_grad():
+        eager_out = roundtrip(base)
+        compiled_out = torch.compile(roundtrip, fullgraph=True)(base)
+    for compiled, eager in zip(compiled_out, eager_out):
+        torch.testing.assert_close(compiled, eager, atol=0, rtol=0)
+
+    # Training: forward and backward must stay bit-identical to eager.
+    tokens_eager = base.detach().clone().requires_grad_(True)
+    tokens_compiled = base.detach().clone().requires_grad_(True)
+    grad_out = torch.randn_like(base)
+    roundtrip(tokens_eager)[2].backward(grad_out)
+    torch.compile(roundtrip)(tokens_compiled)[2].backward(grad_out)
+    torch.testing.assert_close(tokens_compiled.grad, tokens_eager.grad, atol=0, rtol=0)
