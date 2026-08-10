@@ -1349,12 +1349,18 @@ class StoreCBf16:
         self.out_ty = out_ty
         self.cache_modifier = cache_modifier
         c_nbytes = c_rows * c_cols * 2
-        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        # Rebuild a rank-1 view: store indices are linear, so C's host rank must not leak in.
+        c_ptr_ty = PointerType.get(elem_ty=out_ty.ir_type, address_space=AddressSpace.Global, alignment=16)
+        c_base = ArithValue(arith.index_cast(T.i64, _buffer_ops.extract_base_index(C)), signed=True)
+        c_lin = fx.Tensor(fx.make_view(fx.inttoptr(c_ptr_ty, c_base), fx.make_layout(c_rows * c_cols, 1)))
+        gC = fx.rocdl.make_buffer_tensor(c_lin, max_size=False, num_records_bytes=c_nbytes)
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
         self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_ty)
         self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), out_ty)
         self.c_rsrc = (
-            create_buffer_resource(C, max_size=False, num_records_bytes=c_nbytes) if cache_modifier else None
+            create_buffer_resource(c_lin, max_size=False, num_records_bytes=c_nbytes)
+            if cache_modifier
+            else None
         )
         self.oob = fx.Int32(c_rows * c_cols)  # out-of-bounds sink index
 

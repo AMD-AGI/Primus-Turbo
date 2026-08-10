@@ -646,7 +646,9 @@ def _get_compiled_dense(launch, args):
         elif isinstance(a, int):
             key_parts.append(a)
         else:
-            key_parts.append(type(a).__name__)
+            # static-memref JitArgs bake shape into the IR, so shape must be in the key
+            shape = getattr(a, "shape", None)
+            key_parts.append((type(a).__name__, tuple(shape) if shape is not None else None))
     key = tuple(key_parts)
     cached = _COMPILED_DENSE_CACHE.get(key)
     if cached is None:
@@ -1066,6 +1068,10 @@ def _compile_grouped_variable_k_bf16(
 _COMPILED_GROUPED_GEMM_CACHE = {}
 
 
+def _ptr_only_view(t: torch.Tensor) -> torch.Tensor:
+    return t.contiguous().view(torch.int32)
+
+
 def grouped_gemm_variable_k_bf16(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1104,14 +1110,10 @@ def grouped_gemm_variable_k_bf16(
         out_fp16=out_fp16,
         trans_c=trans_c,
     )
-    # Pass operands as an int32 view: the kernel only reads their base pointer (rebased
-    # by byte offsets in make_bf16_buffer_tensor_rebased), so dtype is irrelevant, while
-    # halving the element count keeps the flyc CABI 32-bit numel field from overflowing
-    # on production pools (>2^31 bf16 elems).
     args = (
-        a.contiguous().view(torch.int32).view(-1),
-        b.contiguous().view(torch.int32).view(-1),
-        out.view(-1),
+        _ptr_only_view(a),
+        _ptr_only_view(b),
+        flyc.from_torch_tensor(out),
         offsets_i64,
         masked_k_i64,
         OUT_M,

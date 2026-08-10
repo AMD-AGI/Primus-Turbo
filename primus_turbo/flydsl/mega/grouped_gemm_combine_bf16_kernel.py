@@ -228,19 +228,23 @@ def _make_grouped_gemm_combine(
             if block_m < real_tiles:
                 # GEMM role: one real tile (block_m, block_n) per block (unchanged).
                 group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
-                group_base = group_index * fx.Int32(K) * c_n
-                # A base = ACT tensor; C base = l2_token_buffer (int64 symm addr).
+                # A/B base = ACT/WEIGHTS tensors; C base = l2_token_buffer (int64 symm addr).
                 act_base = fx.arith.ArithValue(
                     fx.arith.index_cast(fx.T.i64(), extract_base_index(ACT)), signed=True
                 )
-                # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
+                w_base = fx.arith.ArithValue(
+                    fx.arith.index_cast(fx.T.i64(), extract_base_index(WEIGHTS)), signed=True
+                )
+                # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A/B: precise bound; C: HW num_records via 0x40000000.
                 a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
+                b_off = cast(group_index, fx.T.i64()) * fx.Int64(K * out_features * 2)
                 c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
                 A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
+                B_tile = make_bf16_fp16_tile_tensor(w_base, b_off, K * out_features)
                 C_tile = make_bf16_fp16_tile_tensor(l2_token_buffer_base, c_off, 0x40000000)
                 gemm_tile(
                     A_tile,
-                    WEIGHTS,
+                    B_tile,
                     C_tile,
                     fx.Int32(BLOCK_M),
                     c_n,
@@ -252,7 +256,6 @@ def _make_grouped_gemm_combine(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
-                    b_group_base=group_base,
                     c_cache_modifier=18,  # sc1|nt: agent-visible non-temporal local stage.
                 )
                 fx.rocdl.s_waitcnt(0)
@@ -502,16 +505,16 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     # Pass 2D: kernel advances ACT base per-tile in int64 (flat MxK overflows int32 ABI).
     act_2d = x.contiguous()
     if layout == "nt":
-        weight_flat = l2_weights.reshape(G * N, K).contiguous().view(-1)
+        weight_flat = l2_weights.reshape(G * N, K).contiguous()
     else:
-        weight_flat = l2_weights.reshape(G * K, N).contiguous().view(-1)
+        weight_flat = l2_weights.reshape(G * K, N).contiguous()
     num_tokens = int(symm.num_tokens)
     output = torch.empty(num_tokens, out_features, dtype=torch.bfloat16, device=device)
-    output_d = output.view(-1)
-    topk_indices_d = topk_indices.contiguous().view(-1)
+    output_d = output
+    topk_indices_d = topk_indices.contiguous()
     num_tokens_d = symm.num_tokens_per_rank
-    topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else dummy
-    grad_gate_d = grad_gate.contiguous().view(-1) if with_gate else dummy
+    topk_weights_d = topk_weights.contiguous() if apply_weights else dummy
+    grad_gate_d = grad_gate.contiguous() if with_gate else dummy
     d_topk_w = torch.empty(num_combine_slots, dtype=torch.float32, device=device) if with_gate else None
     d_topk_w_d = d_topk_w if with_gate else dummy
 
@@ -519,7 +522,7 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     # num_combine_cu / num_reduce_cu are tunable per shape+layout (nt/nn optima differ).
     _compiled_grouped_gemm_combine(
         act_2d,
-        weight_flat,
+        flyc.from_torch_tensor(weight_flat),
         tile_to_expert,
         num_tile_blocks,
         recv_dst_rank,
