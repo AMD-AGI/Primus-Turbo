@@ -8,7 +8,9 @@
 
 import torch
 
-from primus_turbo.flydsl.gemm.gemm_bf16_kernel import grouped_gemm_variable_k_bf16
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_flydsl_kernel,
+)
 from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
@@ -81,7 +83,7 @@ def fused_mega_moe_stage2_backward_impl(
     )
 
     # dW2 = dispatched(dy)^ @ act_weighted (variable-K)
-    dW2 = grouped_gemm_variable_k_bf16(
+    dW2 = grouped_gemm_bf16_variable_k_flydsl_kernel(
         dispatch_l2_grad,
         act_weighted,
         num_tokens_per_expert_prefix,

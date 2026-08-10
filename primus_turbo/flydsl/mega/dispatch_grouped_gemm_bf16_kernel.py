@@ -22,7 +22,9 @@ from flydsl.expr.typing import AddressSpace, PointerType
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
-    gemm_bf16_variable_k_tile,
+)
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_tile,
 )
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
     dispatch_prologue_flydsl_kernel,
@@ -219,7 +221,7 @@ def _make_kernel(
                     gemm_a, gemm_b, rt_m, rt_n = WEIGHTS, pool_tensor, out_n_rt, out_m_rt
                 else:
                     gemm_a, gemm_b, rt_m, rt_n = pool_tensor, WEIGHTS, out_m_rt, out_n_rt
-                gemm_bf16_variable_k_tile(
+                grouped_gemm_bf16_variable_k_tile(
                     gemm_a,
                     gemm_b,
                     OUTPUT,

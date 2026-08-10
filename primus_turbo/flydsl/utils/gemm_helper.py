@@ -45,6 +45,11 @@ def _as_index(v):
     return arith.index(v) if isinstance(v, int) else arith.index_cast(T.index, v)
 
 
+def _i64(v):
+    # widen an i32 runtime value to i64 (avoids overflow in worst-case base offsets)
+    return ArithValue(arith.extsi(T.i64, _buffer_ops._unwrap_value(v)), signed=True)
+
+
 def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_bytes):
     """Build an fp8 BufferDesc tensor with the SRD base advanced by ``base_elems`` (fp8/int8
     = 1 byte/elem), in 64-bit. Folds a per-tile huge element offset into the
@@ -1170,8 +1175,9 @@ def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256,
 
 
 # ───────────────────────────────────────────────────────────────────────
-# Reusable bf16 GEMM primitives for gemm_bf16_kernel.py (mfma 32x32x16 / 16x16x32,
-# tr_b16 loaders, swizzle, store). bf16 counterpart of the fp8 block above.
+# Reusable bf16 GEMM primitives for the {gemm,grouped_gemm}_bf16_kernel.py pair
+# (mfma 32x32x16 / 16x16x32, tr_b16 loaders, swizzle, store).
+# bf16 counterpart of the fp8 block above.
 # ───────────────────────────────────────────────────────────────────────
 BLOCK_K = 64  # K depth per LDS tile (exported to the bf16 kernels)
 

@@ -56,11 +56,12 @@ import primus_turbo.pytorch  # noqa: E402,F401
 # original mega_utils order; the two fused kernels below need pytorch first).
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (  # noqa: E402
     _compile_dense_nt,
-    _compile_grouped_variable_k_bf16,
     _get_compiled_dense,
-    _i64,
     _make_shared_storage,
     gemm_bf16_tile,
+)
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (  # noqa: E402
+    _compile_grouped_variable_k_bf16,
 )
 from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_grouped_gemm_bf16_flydsl_kernel,
@@ -86,6 +87,7 @@ from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (  # noqa: E402
+    _i64,
     ceildiv,
     make_value_attrs,
     xcd_remap_pid,
