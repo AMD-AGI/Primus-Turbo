@@ -14,6 +14,7 @@ from primus_turbo.common.aiter_utils import get_aiter
 from primus_turbo.flydsl.gemm.gemm_mxfp4_kernel import gemm_mxfp4_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -319,8 +320,8 @@ def gemm_fp4_impl(
     default_backend: int,
     preshuffled: bool = False,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.FP4)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP4)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -336,7 +337,7 @@ def gemm_fp4_impl(
         preshuffled=preshuffled,
     )
 
-    return GEMMFP4KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GEMMFP4KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
 
 
 @gemm_fp4_impl.register_fake

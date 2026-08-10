@@ -14,6 +14,7 @@ from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_
 from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel import gemm_mxfp8_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -456,8 +457,8 @@ def gemm_fp8_impl(
     granularity: int,
     default_backend: int,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -472,7 +473,7 @@ def gemm_fp8_impl(
         granularity=granularity_enum,
     )
 
-    return GEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GEMMFP8KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
 
 
 @gemm_fp8_impl.register_fake
