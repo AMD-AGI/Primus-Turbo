@@ -65,6 +65,9 @@ from primus_turbo.flydsl.utils.gemm_helper import ceildiv
 ACTIVATION_CLAMP = 10.0
 _POOL_BLOCK_M = 256
 _WARP = 64
+# Persistent grid: block count for the forward SwiGLU+quant kernel, which strides over the pool
+# rows rather than mapping one block per row. 4096 blocks is 16 per CU on a 256-CU device.
+_SWIGLU_GRID_X = 4096
 
 _Q_SCRATCH: dict = {}
 _ASP_SCRATCH: dict = {}
@@ -74,7 +77,7 @@ _ASP_SCRATCH: dict = {}
 # FORWARD: SwiGLU -> rowwise mxfp8
 # =============================================================================
 @functools.lru_cache(maxsize=16)
-def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = 4096):
+def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = _SWIGLU_GRID_X):
     """SwiGLU + mxfp8 quant, activation kept in REGISTERS.
 
     One thread owns one whole 1x32 mxfp8 block of one row, so the SwiGLU result feeds
@@ -216,7 +219,7 @@ def _compile_swiglu_mxfp8(I: int, BT: int = 256, grid_x: int = 4096):
         NUM_TILE_BLOCKS: fx.Tensor,
         M: int,
         stream: fx.Stream = fx.Stream(None),
-        grid_x: fx.Constexpr[int] = 4096,
+        grid_x: fx.Constexpr[int] = _SWIGLU_GRID_X,
     ):
         kern(ACC1, Q, A_SP, NUM_TILE_BLOCKS, M, grid_x).launch(
             grid=(grid_x, 1, 1), block=(BT, 1, 1), stream=stream

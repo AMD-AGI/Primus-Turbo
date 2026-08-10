@@ -10,7 +10,6 @@ Warp-per-token geometry; hidden % 1024 == 0 (fp8 b128 push) and % 128 (MXFP8).
 """
 
 import flydsl.expr as fx
-from flydsl.compiler.ast_rewriter import InsertEmptyYieldForSCFFor
 from flydsl.expr.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -19,19 +18,13 @@ from flydsl.expr.buffer_ops import (
 
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, _WARP
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, l2_writeback
-from primus_turbo.flydsl.utils.gemm_helper import emit_if_then
+from primus_turbo.flydsl.utils.gemm_helper import emit_for, emit_if_then
 
 _VEC_I32 = 4  # 4 x i32 = 16B / lane (b128 XGMI)
 
 
 def _peer_addr(local_base, offsets_resource, dst_rank):
     return local_base + buffer_load(offsets_resource, dst_rank, vec_width=1, dtype=fx.T.i64())
-
-
-def _emit_for(stop, body):
-    InsertEmptyYieldForSCFFor.scf_for_dispatch(
-        fx.Int32(0), stop, fx.Int32(1), lambda iv, _names: body(fx.arith.ArithValue(iv, signed=True))
-    )
 
 
 def dispatch_fp8_copy_tile(
@@ -113,7 +106,7 @@ def dispatch_fp8_copy_tile(
 
             emit_if_then(lane_id < fx.Int32(scale_i32), _one_scale)
 
-        _emit_for(local_count, _row)
+        emit_for(local_count, _row)
 
 
     def dispatch_tile(task_index):

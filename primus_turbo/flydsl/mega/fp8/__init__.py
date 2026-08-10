@@ -10,7 +10,7 @@ Self-contained port of the Primus-Turbo mega MXFP8 stack. MegaMoE's bf16 path ru
 different symmetric-memory design (``SymBuffer`` + ``Workspace`` + flag/parity epochs), while the
 fp8 kernels were written against the ``SymLayout`` + scoreboard + two-heap design. To avoid
 touching the bf16 stack, that whole foundation is VENDORED here under this package
-(``prims`` / ``sym_layout`` / ``barrier`` / ``symm_buffer`` / ``dispatch_prologue`` /
+(``prims`` / ``barrier`` / ``symm_buffer`` / ``dispatch_prologue`` /
 ``gemm_helper``), and all fp8 modules import from ``primus_turbo.flydsl.mega.fp8.*`` only. It
 shares nothing with the bf16 files except ``primus_turbo.pytorch.core`` (SymmetricMemory,
 low_precision) and the external ``flydsl`` package.
@@ -38,8 +38,7 @@ from .swiglu_mxfp8_kernel import (
 
 # --- symmetric workspace (SymLayout + scoreboard + two-heap) ---
 from .dispatch_prologue import dispatch_prologue
-from .sym_layout import SymLayout
-from .symm_buffer import get_symm_buffer_for_mega_moe
+from .symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 
 # --- mxfp8 quantization: rowwise (weights / activations) + colwise-transpose (backward
 #     variable-K wgrad operands: dW2 / dW1) ---

@@ -56,8 +56,7 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     st,
 )
 from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
-from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
-from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.prims import cast, read_clock, spin_timed_out
 from primus_turbo.flydsl.utils.gemm_helper import (
     ceildiv,
@@ -211,7 +210,6 @@ def _compile(
     num_ranks,
     G,
     blgp=0,
-    nt_vmcnt=3,
     waves_per_eu=2,
     agpr_alloc=0,
     out_fp16=False,
@@ -324,9 +322,7 @@ def _compile(
             if not _gemm_only:
                 # ---- COMM role: this block owns tasks {comm_idx, comm_idx+comm_cu, ...} ----
                 comm_idx = pipeline_idx
-                local_task_count = (
-                    fx.Int32(num_comm) - comm_idx + comm_block_count - fx.Int32(1)
-                ) // comm_block_count
+                local_task_count = ceildiv(fx.Int32(num_comm) - comm_idx, comm_block_count)
                 for task_iteration in range(local_task_count):
                     dispatch_tile(comm_idx + task_iteration * comm_block_count)
         elif block_index < gemm_base:
@@ -440,8 +436,6 @@ def _compile(
                         group_idx=g_idx,
                         blgp=blgp,
                         out_fp16=out_fp16,
-                        nt_vmcnt=nt_vmcnt,
-                        scale_pack=1,
                     )
 
     @flyc.jit

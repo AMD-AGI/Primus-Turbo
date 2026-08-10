@@ -19,7 +19,10 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
+from flydsl.compiler.ast_rewriter import (
+    InsertEmptyYieldForSCFFor,
+    ReplaceIfWithDispatch,
+)
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.arith import _to_raw as _raw
@@ -1063,6 +1066,13 @@ def emit_if_then(cond, then_fn):
     ``then_fn`` must take no arguments, and closing over a loop variable in it is unsafe unless the
     call is immediate -- build a zero-arg emitter per iteration instead."""
     ReplaceIfWithDispatch.scf_if_dispatch(cond, then_fn)
+
+
+def emit_for(stop, body):
+    """Emit a dynamic ``for i in range(stop): body(i)`` with ``i`` as a signed Int32."""
+    InsertEmptyYieldForSCFFor.scf_for_dispatch(
+        fx.Int32(0), stop, fx.Int32(1), lambda iv, _names: body(fx.arith.ArithValue(iv, signed=True))
+    )
 
 
 def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=1):

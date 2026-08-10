@@ -69,8 +69,7 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     ld,
     st,
 )
-from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
-from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.prims import cast, read_clock, spin_timed_out
 from primus_turbo.flydsl.utils.gemm_helper import emit_if_then, make_value_attrs, xcd_remap_pid
 

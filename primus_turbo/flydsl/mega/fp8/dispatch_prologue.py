@@ -47,7 +47,7 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.fp8.barrier import grid_sync, xgmi_barrier
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, ld, st
-from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout, sym_map
+from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, sym_map
 
 _BLOCK_THREADS = int(_os.environ.get("PROLOGUE_BT", "256"))  # threads per block
 # grid_blocks (== num_cu) is a caller arg (default 64). Fewer blocks => cheaper

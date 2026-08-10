@@ -23,7 +23,6 @@ into fused mega kernels; ``gemm_mxfp8_nt_tile`` is the dispatch/combine wrapper.
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -31,11 +30,11 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     ScaleBComb,
     ScaleS2R,
+    StoreCPerTensor,
     _asm_mma_scale_do,
     compute_global_swizzle,
     emit_if_then,
     make_fp8_buffer_tensor_rebased,
-    make_row_band_resource,
     pack_i32x4_i32x8,
     scale_opsel,
     swizzle_128,
@@ -145,93 +144,6 @@ class MfmaScale16x16x128:
         return c
 
 
-class StoreCPerTensor:
-    """Scalar output store: out = (acc [* a_scale * b_scale]).to(out_ty).
-
-    Shared by the per-tensor GEMM and the mxfp8 GEMM. ``A_scale``/``B_scale`` are
-    optional: when given, both are read once from length-1 buffers and applied
-    uniformly (per-tensor); when ``None`` the scale is already folded into the
-    accumulator by the scaled MMA (mxfp8), so the store is plain. The output is
-    re-based per row band in 64-bit index (int64-safe, M*N > 4GB) via
-    ``make_row_band_resource``; columns past c_cols clamp to an OOB index (HW SRD
-    drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
-    """
-
-    def __init__(
-        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, elem_fn=None,
-        cache_modifier=0,
-    ):
-        self.c_rows = c_rows
-        self.c_cols = c_cols
-        self.lane_id = fx.thread_idx.x % 64
-        self.c_idx_fn = c_idx_fn
-        self.n_tiles_a = n_tiles_a
-        self.n_tiles_b = n_tiles_b
-        self.out_ty = out_ty
-        # CPOL on the C store: 0 = default; 16 (sc1) = write-through to HBM (a fused combine
-        # reader on another CU/XCD reads fresh after an l2_invalidate). Free per-store vs a
-        # device-wide l2_writeback.
-        self.cache_modifier = cache_modifier
-        # Optional f32->f32 epilogue node chain (bias/act), applied post-scale
-        # pre-cast. None -> plain scaled store (identical IR).
-        self.elem_fn = elem_fn
-        self.scaled = A_scale is not None
-        self.c_base = _buffer_ops.extract_base_index(C)  # index = byte base address
-        # write-through path (cache_modifier set): a full-C buffer resource + absolute element
-        # index (the row-band + byte-offset path can't carry a cache modifier). Mirrors
-        # StoreCBf16; OOB columns store to an out-of-range element the HW SRD drops.
-        self.c_full_rsrc = (
-            _buffer_ops.create_buffer_resource(C, max_size=False, num_records_bytes=c_rows * c_cols * 2)
-            if cache_modifier
-            else None
-        )
-        if self.scaled:
-            gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
-            gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
-            self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
-            self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
-            self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-            self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
-
-    def _load_scalar(self, div):
-        fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
-        return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
-
-    def store(self, c_frag, base_row, base_col):
-        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div) if self.scaled else None
-        if self.cache_modifier:
-            oob = self.c_rows * self.c_cols  # absolute element sink for OOB cols (HW SRD drop)
-            for ti in range_constexpr(self.n_tiles_a):
-                row_local = ti * 16 + (self.lane_id // 16) * 4
-                for tj in range_constexpr(self.n_tiles_b):
-                    col = base_col + tj * 16 + self.lane_id % 16
-                    col_valid = col < self.c_cols
-                    vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
-                    for i in range_constexpr(4):
-                        v = vec_f32[i] * scale if self.scaled else vec_f32[i]
-                        if self.elem_fn is not None:
-                            v = self.elem_fn(v)
-                        c_index = (base_row + row_local + i) * self.c_cols + col
-                        _buffer_ops.buffer_store(
-                            v.to(self.out_ty), self.c_full_rsrc, arith.select(col_valid, c_index, oob),
-                            cache_modifier=self.cache_modifier,
-                        )
-            return
-        # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
-        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
-        for ti in range_constexpr(self.n_tiles_a):
-            row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
-            for tj in range_constexpr(self.n_tiles_b):
-                col = base_col + tj * 16 + self.lane_id % 16
-                col_valid = col < self.c_cols
-                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
-                for i in range_constexpr(4):
-                    v = vec_f32[i] * scale if self.scaled else vec_f32[i]
-                    if self.elem_fn is not None:
-                        v = self.elem_fn(v)  # bias/act epilogue node chain
-                    val = v.to(self.out_ty)
-                    off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
-                    _buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
 
 
 def emit_gemm_mxfp8_nt_tile(
@@ -381,6 +293,9 @@ def emit_gemm_mxfp8_nt_tile(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
         if nt_vmcnt >= 0:
+            # Hand-placed drain for the gfx950 G2S/LDS hazard: at vmcnt >= 4 the next tile's global
+            # loads can overtake the LDS writes this MMA still reads, nondeterministically. 3 is the
+            # deepest value that stays deterministic, so this is a correctness bound, not a knob.
             _llvm.inline_asm(res=None, operands_=[], asm_string=f"s_waitcnt vmcnt({nt_vmcnt})",
                              constraints="", has_side_effects=True)
         a_cur0, a_next0 = a_next0, a_cur0
@@ -475,9 +390,12 @@ def gemm_mxfp8_nt_tile(
     blgp=0,
     out_fp16=False,
     nt_vmcnt=3,
-    scale_pack=_SCALE_PACK,
 ):
-    """One NT mxfp8 output tile wrapper (dispatch L1), storing C straight to global."""
+    """One NT mxfp8 output tile wrapper (dispatch L1), storing C straight to global.
+
+    ``pack=1``: this path's A-scale is the ScaleS2R broadcast the dispatch kernel's PRESHUFFLE role
+    writes on the device, unlike the combine path, whose A-scale comes pack-4 out of the fused
+    SwiGLU quant -- so the packing belongs here, not in the caller."""
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
@@ -488,6 +406,6 @@ def gemm_mxfp8_nt_tile(
     emit_gemm_mxfp8_nt_tile(
         A, A_SCALE_RES, B_T, B_SCALE_RES, lds, block_m, block_n,
         K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, G=G, group_idx=group_idx,
-        c_m=c_m, c_n=c_n, cbsz=cbsz, blgp=blgp, nt_vmcnt=nt_vmcnt, scale_pack=scale_pack,
+        c_m=c_m, c_n=c_n, cbsz=cbsz, blgp=blgp, nt_vmcnt=nt_vmcnt, scale_pack=1,
         store_c=store_c,
     )
