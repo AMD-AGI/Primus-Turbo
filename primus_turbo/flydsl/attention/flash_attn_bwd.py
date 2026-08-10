@@ -44,6 +44,18 @@ _DKDV_AGPR = 0
 # split-K workspace that build_flash_attn_bwd_dqred_module folds in a fixed
 # band-ascending fp32 order (deterministic, no atomics), exactly like dk/dv's q_split.
 _FUSE_DQ = True
+# Fuse dQ for SLIDING-WINDOW too (window_left>=0). The fused SWA path is CORRECT (the
+# windowed G3 q-loop + the reduce's g_lo lower edge are byte-exact; see _fuse_swa_probe),
+# but it is NOT the default: a finite window pins q_split=1, takes the windowed q-loop and
+# cannot use Q_PAIR, so the KV-outer body does its 5th (dQ) GEMM over a BLOCK_KV=256 band
+# of which only ~W keys are in-window -- pure waste that the split path avoids by computing
+# dQ in a dedicated Q-outer kernel (bk=64 + Q_PAIR). Measured on gfx950 (B3 Sq8192 Skv8192
+# Hq64/8, same-process A/B): fused is 6.6-8.8x SLOWER than the split pair across every
+# window 128..7936 -- no crossover -- and the reduce is hidden behind the body, so folding
+# it in gives nothing (band-load pipelining measured 0 gain). Full-causal keeps fusing (it
+# wins there: dQ needs every band anyway, so split-K is free). Flip this True only to
+# exercise the validated fused-SWA fallback; production SWA rides the faster split pair.
+_FUSE_DQ_SWA = False
 
 def _llvm_value(value):
     if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
@@ -403,6 +415,7 @@ def build_flash_attn_bwd_dqred_module(
     n_qsp=None,  # None: every q block (no q-split sub-range)
     block_q=_BWD_BLOCK_Q,
     causal_offset=0,  # Skv-Sq for a bottom-right-causal rectangular shape; 0 for square.
+    window_left=-1,  # >=0: SWA -- also clamp the band loop's LOW edge (see g_lo). <0: full.
 ):
     """Fold the fused kernel's dQ split-K partials: DQ[b,q] = sm * Sum_b' WSQ[b',b,q].
 
@@ -527,13 +540,35 @@ def build_flash_attn_bwd_dqred_module(
         # Topmost band this q group sees: with bottom-right causal masking a q row sees
         # keys kv <= q + causal_offset, so on a rectangular shape (Skv>Sq) it reaches
         # causal_offset//block_kv bands higher than its own. causal_offset==0 for square.
-        g = ((row0 % fx.Index(SQ)) + fx.Index(causal_offset)) // fx.Index(block_kv)
+        _qloc = row0 % fx.Index(SQ)
+        g = (_qloc + fx.Index(causal_offset)) // fx.Index(block_kv)
+        # SWA also bounds the LOW band: the fused body's windowed q-loop only wrote this q's
+        # dQ slot in bands whose kv range overlaps [q+off-W, q+off], so a band below
+        # g_lo = floor(max(0, q_blk+off-W) / block_kv) never wrote it -- summing it would read
+        # a stale slot. The fused body writes at q-BLOCK granularity (a band takes/leaves a
+        # whole BLOCK_Q run of q together), so the low edge must be computed from the block's
+        # first row q_blk, not the work-group's row0: when W is not a block_kv multiple (e.g.
+        # W=2047), a per-row floor would vary inside one block and skip a band that did write.
+        # (g's per-row and per-block value coincide -- off%block_kv==0 and a BLOCK_Q block sits
+        # in one block_kv bin -- so it needs no such alignment.) Full-causal (window_left<0)
+        # keeps g_lo=0, so range(0, g+1) is unchanged and the ISA stays byte-identical.
+        if const_expr(window_left >= 0):
+            _dlt = causal_offset - window_left  # constexpr int, may be negative
+            _qblk = _qloc - (_qloc % fx.Index(BQ))
+            if const_expr(_dlt >= 0):
+                _lonum = _qblk + fx.Index(_dlt)
+            else:
+                _dsub = fx.Index(-_dlt)
+                _lonum = fx.Index(ArithValue(_qblk > _dsub).select(_qblk - _dsub, fx.Index(0)))
+            g_lo = _lonum // fx.Index(block_kv)
+        else:
+            g_lo = fx.Index(0)
         base = row0 * fx.Index(HD) + chunk * fx.Index(CHUNK_ELEMS) + tid * fx.Index(VEC)
         offs = [base + fx.Index(c * BLOCK * VEC) for c in range_constexpr(UC)]
         c_zero_vec = Vec.filled(VEC, 0.0, fx.Float32).ir_value()
 
         acc = [c_zero_vec for _ in range_constexpr(UC)]
-        for band, inner in range(fx.Index(0), g + fx.Index(1), fx.Index(1), init=acc):
+        for band, inner in range(g_lo, g + fx.Index(1), fx.Index(1), init=acc):
             # One descriptor per band: the whole workspace overflows a 32-bit
             # num_records, a single band slab does not, and the band base is 64-bit.
             band_rsrc = buffer_ops.create_buffer_resource(
@@ -899,7 +934,9 @@ def build_flash_attn_bwd_dkdv_module(
     G3_SPL_AT = 1  # q-half whose GEMM1 the early pass is emitted after
     G3D_E = 3  # kstep prefetch depth of the early split pass
     if FUSE_DQ:
-        assert head_dim == 64 and window_left < 0 and not sbhd and not varlen
+        # window_left>=0 (SWA) rides the fused path too: the G3 q-loop takes the windowed
+        # upper bound (_qhi) and the reduce clamps the band range with a lower edge (g_lo).
+        assert head_dim == 64 and not sbhd and not varlen
         assert fold_lse, "fused dQ reads the prescaled K tile; see _reduce_dq_partials"
         assert DT * MT == G3_WAVES * G3_DT * G3_QT, "GEMM3 tiles must partition over carriers"
         # A wave's D-tiles must pair up (and start even) for the permuted partial layout
@@ -2886,6 +2923,45 @@ def build_flash_attn_bwd_dkdv_module(
             loop_results = _q_body(_q_loop_start, loop_results, True, poff=_poff, half=True)
             for q_start, inner in range(_in0, _ilo, _step, init=loop_results):
                 loop_results = yield _q_body(q_start, inner, True)
+        elif const_expr(FUSE_DQ and window_left >= 0):
+            # Fused SWA: three regions per band, mirroring the full-causal masked/unmask split
+            # but bounded by BOTH window edges -- upper-causal-masked | interior UNMASKED |
+            # lower-window-masked. A q-block is masked only where the band straddles a window
+            # boundary; the interior runs the fast apply_mask=False path. (Running every block
+            # apply_mask=True -- the scalar per-element exp path -- was the 15x fused-SWA
+            # regression: 85% of time sat in the dkdv body's masked path while full-causal ran
+            # its bulk unmasked.) Coverage is byte-identical to a single [_q_loop_start,_qhi)
+            # masked walk -- only interior blocks flip to unmasked -- so the reduce's g_lo/g
+            # coupling (which q wrote which band) is unchanged. Walked strictly IN ORDER: the
+            # L2 phase-rotation (2936) needs self-issued prefetch, but fused carries PF_QB
+            # across blocks (2870), so rotating would feed a block another's tiles (rotation=B).
+            # _qhi = min(seq_len_q, _kv_end + W - off): last q whose window still reaches this
+            # band's top key. A rectangular LOW band has _kv_end + W < off (window too far
+            # below), so NO q attends it; clamp the unsigned underflow to 0 (empty loop).
+            _qtop = _kv_end_c + fx.Index(window_left)
+            _qhi = ArithValue(_qtop >= causal_offset).select(_qtop - causal_offset, fx.Index(0))
+            _qhi = fx.Index(ArithValue(_qhi < seq_len_q_v).select(_qhi, seq_len_q_v))
+            # Lower window edge: q needs the lower mask once the band's first key drops out of
+            # its window -- kv_start < q + off - W  <=>  q > kv_start + W - off (= _lo_edge). A
+            # q-block [qs,qs+step) is lower-safe iff qs+step-1 <= _lo_edge; num_safe counts the
+            # lower-safe blocks from _q_loop_start (floor((_lo_span+1)/_step) folds the +step-1
+            # rounding), and _lo_masked_start is the block where masking resumes. Same unsigned
+            # underflow guard as _qhi: if _lo_edge < _q_loop_start no block is lower-safe.
+            _lo_top = kv_start + fx.Index(window_left)
+            _lo_edge = fx.Index(ArithValue(_lo_top >= causal_offset).select(_lo_top - causal_offset, fx.Index(0)))
+            _num_safe = fx.Index(ArithValue(_lo_edge >= _q_loop_start).select(
+                (_lo_edge - _q_loop_start + fx.Index(1)) // fx.Index(_step), fx.Index(0)))
+            _lo_masked_start = _q_loop_start + _num_safe * fx.Index(_step)
+            # interior end = _lo_masked_start clamped into [_unmask_start, _qhi]: interior may
+            # be empty (narrow W: the two masked edges meet) or full (wide W past seq end).
+            _int_end = fx.Index(ArithValue(_lo_masked_start < _qhi).select(_lo_masked_start, _qhi))
+            _int_end = fx.Index(ArithValue(_int_end > _unmask_start).select(_int_end, _unmask_start))
+            for q_start, inner in range(_q_loop_start, _masked_upper, _step, init=_carry):
+                loop_results = yield _q_body(q_start, inner, True)
+            for q_start, inner in range(_unmask_start, _int_end, _step, init=loop_results):
+                loop_results = yield _q_body(q_start, inner, False)
+            for q_start, inner in range(_int_end, _qhi, _step, init=loop_results):
+                loop_results = yield _q_body(q_start, inner, True)
         elif const_expr(window_left >= 0):
             _qhi = _kv_end_c - causal_offset + fx.Index(window_left)
             _qhi = fx.Index(ArithValue(_qhi < seq_len_q_v).select(_qhi, seq_len_q_v))
@@ -4639,7 +4715,7 @@ def _reduce_dkdv_slots(ws_dk, ws_dv, n_slots, n_groups, stream):
 
 def _reduce_dq_partials(
     ws, dq, block_kv, num_heads, head_dim, scale, stream, bat_lo=0, n_bat=None, qsp=(1, 0, None),
-    causal_offset=0,
+    causal_offset=0, window_left=-1,
 ):
     """dQ[q] = scale * Sum_{b : b*BLOCK_KV <= q} ws[b][q], in ascending band order.
 
@@ -4663,7 +4739,7 @@ def _reduce_dq_partials(
     # co-resident wave's register footprint (re-sweep per shape when perf-tuning).
     rpw_hd = 2 * num_heads * head_dim
     uc = 2 if rpw_hd % 4096 == 0 else next(u for u in (1, 3) if rpw_hd % (2048 * u) == 0)
-    key = (num_heads, head_dim, B, Sq, block_kv, scale, bat_lo, n_bat, qsp, causal_offset)
+    key = (num_heads, head_dim, B, Sq, block_kv, scale, bat_lo, n_bat, qsp, causal_offset, window_left)
     launcher = _DQRED_CACHE.get(key)
     if launcher is None:
         if len(_DQRED_CACHE) >= 32:
@@ -4684,6 +4760,7 @@ def _reduce_dq_partials(
             qsp_lo=qsp[1],
             n_qsp=qsp[2],
             causal_offset=causal_offset,
+            window_left=window_left,
         )
         _DQRED_CACHE[key] = launcher
     # Pass ONE band slice: the descriptor is rebased per band with a 64-bit offset, and
@@ -4728,7 +4805,7 @@ def _pipe_chunks(B, q_split, block_kv):
     )
 
 
-def _fused_pipelined(dkdv_l, odo_l, bufs, ws_dq, dq, B, Sq, Skv, block_kv, Hq, D, q_split, stream):
+def _fused_pipelined(dkdv_l, odo_l, bufs, ws_dq, dq, B, Sq, Skv, block_kv, Hq, D, q_split, stream, window_left=-1):
     """Run the fused kernel in chunks and hide each chunk's dQ reduce under the next one.
 
     The reduce is pure DRAM at the roofline while the fused kernel only uses 2.4 of the
@@ -4806,7 +4883,7 @@ def _fused_pipelined(dkdv_l, odo_l, bufs, ws_dq, dq, B, Sq, Skv, block_kv, Hq, D
         side.wait_event(evs[i])
         _reduce_dq_partials(
             ws_dq, dq, block_kv, Hq, D, 1.0 / _LOG2E, side, bat_lo=b, n_bat=1,
-            qsp=(q_split, lo, n), causal_offset=Skv - Sq,
+            qsp=(q_split, lo, n), causal_offset=Skv - Sq, window_left=window_left,
         )
     ev_join.record(side)
     return ev_join
@@ -5186,8 +5263,8 @@ def flydsl_varlen_backward(
     block_kv = _blockkv_for(Skv, D, window_left)
     # Fused KV-outer path: dkdv also emits dQ, so S/dP/softmax are computed once instead
     # of twice (5 GEMMs, not 7). It needs a per-band dQ workspace (Skv//block_kv bands x
-    # Sq rows), so block-aligned full-causal shapes -- square or rectangular; SWA and D128
-    # keep the split pair.
+    # Sq rows), so block-aligned causal shapes -- square or rectangular, full-causal or
+    # SWA; only D128 keeps the split pair.
     fuse_kv = _fuse_blockkv_for(Skv)
     # The fused dQ reduce tiles rows_per_wg*Hq*D (=2*Hq*D) by a block256*vec8*uc chunk;
     # _reduce_dq_partials picks uc=2 (4096 chunk) when it tiles and drops to uc=1 (2048)
@@ -5203,8 +5280,16 @@ def flydsl_varlen_backward(
     # Skv//block_kv bands and the fused body's G3 dQ emission is causal_offset-aware, so the
     # only rectangular-specific piece is the reduce's band count (see _reduce_dq_partials's
     # causal_offset). Needs Skv block-aligned too so the band axis tiles exactly.
+    # SWA (window_left>=0) CAN ride the fused path (the G3 q-loop takes the windowed upper
+    # bound _qhi so a band only writes dQ slots for in-window q, and the reduce clamps its
+    # band range with a lower edge g_lo so it never sums a never-written slot; both halves
+    # wrapped const_expr(window_left>=0), so full-causal ISA stays byte-identical). It is
+    # correct but ~7-9x SLOWER than the split pair for every finite window (see _FUSE_DQ_SWA
+    # for the measured sweep + root cause), so a finite window takes the split path by
+    # default; full-causal (window_left<0) always fuses. Set _FUSE_DQ_SWA to force-fuse SWA.
     fuse_dq = (
-        _FUSE_DQ and not sbhd and window_left < 0 and D == 64
+        _FUSE_DQ and not sbhd and D == 64
+        and (window_left < 0 or _FUSE_DQ_SWA)
         and Sq * Skv >= 1024 * 1024
         and Sq % fuse_kv == 0 and Skv % fuse_kv == 0 and (2 * Hq * D) % 2048 == 0
     )
@@ -5259,7 +5344,8 @@ def flydsl_varlen_backward(
                 ws_dk.reshape(B, -1), ws_dv.reshape(B, -1), cu_ph,
             )
             join_ev = _fused_pipelined(
-                dkdv_l, odo_l, bufs, ws_dq, dq, B, Sq, Skv, block_kv, Hq, D, q_split, st
+                dkdv_l, odo_l, bufs, ws_dq, dq, B, Sq, Skv, block_kv, Hq, D, q_split, st,
+                window_left=window_left,
             )
         else:
             # Pass ONE (band, batch) slice: the kernel rebases the SRD to its own slice with
@@ -5268,7 +5354,10 @@ def flydsl_varlen_backward(
                 qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1),
                 cu_ph, cu_ph, ws_dq[0, 0].reshape(-1), B, Sq, Skv, 0, st,
             )
-            _reduce_dq_partials(ws_dq, dq, block_kv, Hq, D, 1.0 / _LOG2E, st, causal_offset=Skv - Sq)
+            _reduce_dq_partials(
+                ws_dq, dq, block_kv, Hq, D, 1.0 / _LOG2E, st,
+                causal_offset=Skv - Sq, window_left=window_left,
+            )
     else:
         dq_l(qf, kf, vf, dof, lsef, df, dq.reshape(-1), o16, cu_ph, cu_ph, B, Sq, Skv, st)
         dkdv_l(
