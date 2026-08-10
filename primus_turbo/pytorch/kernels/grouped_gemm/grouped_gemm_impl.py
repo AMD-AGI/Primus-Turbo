@@ -15,14 +15,14 @@ from primus_turbo.pytorch.core.backend import (
     TuneCache,
 )
 from primus_turbo.pytorch.core.utils import build_ck, is_gfx950, is_gfx1250
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
-    BaseGroupedGEMMKernelDispatcher,
-    BaseGroupedGEMMVariableKKernelDispatcher,
-)
-from primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic import (
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_ck_ws_heuristic import (
     approximate_ck_standard_total_tiles,
     compute_ck_variable_k_total_tiles,
     resolve_ck_ws_local_per_xcd,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+    BaseGroupedGEMMKernelDispatcher,
+    BaseGroupedGEMMVariableKKernelDispatcher,
 )
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     grouped_gemm_output_tail_kernel,
