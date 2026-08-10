@@ -245,7 +245,7 @@ def _make_dispatch_prologue(
                 destination_rank = comm_task_index % fx.Int32(num_ranks)
                 local_expert_index = comm_task_index // fx.Int32(num_ranks)
                 expert_id = destination_rank * fx.Int32(experts_per_rank) + local_expert_index
-                count_value = ld(expert_count_base, fx.Int32(rank * num_experts) + expert_id, scope="sys")
+                count_value = ld(expert_count_base, fx.Int32(rank * num_experts) + expert_id)
                 start_value = buffer_load(
                     scratch_resource, fx.Int32(SCRATCH_START) + expert_id, vec_width=1, dtype=fx.T.i32()
                 )
