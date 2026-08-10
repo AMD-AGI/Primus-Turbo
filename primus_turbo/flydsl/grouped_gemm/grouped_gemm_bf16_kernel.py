@@ -274,7 +274,7 @@ def grouped_gemm_bf16_variable_k_tile(
 
 
 @functools.lru_cache(maxsize=64)
-def _compile_grouped_variable_k_bf16(
+def _compile_grouped_bf16_wgrad(
     OUT_M,
     OUT_N,
     G,
@@ -286,7 +286,7 @@ def _compile_grouped_variable_k_bf16(
     out_fp16=False,
     trans_c=False,
 ):
-assert OUT_M % BLOCK_M == 0, "OUT_M (unclamped store dim) must be divisible by BLOCK_M"
+    assert OUT_M % BLOCK_M == 0, "OUT_M (unclamped store dim) must be divisible by BLOCK_M"
     N_BLOCKS_M = OUT_M // BLOCK_M
     N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
@@ -406,7 +406,7 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     else:
         assert masked_k.numel() == G, f"masked_k len {masked_k.numel()} != G {G}"
         masked_k_i64 = (masked_k if masked_k.dtype == torch.int64 else masked_k.to(torch.int64)).contiguous()
-    launch = _compile_grouped_variable_k_bf16(
+    launch = _compile_grouped_bf16_wgrad(
         OUT_M,
         OUT_N,
         G,
@@ -426,6 +426,10 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         OUT_N,
         torch.cuda.current_stream(),
     )
-key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, num_xcd, out_fp16, trans_c)
+    key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, num_xcd, out_fp16, trans_c)
+    compiled = _COMPILED_GROUPED_GEMM_CACHE.get(key)
+    if compiled is None:
+        compiled = flyc.compile(launch, *args)
+        _COMPILED_GROUPED_GEMM_CACHE[key] = compiled
     compiled(*args)
     return out

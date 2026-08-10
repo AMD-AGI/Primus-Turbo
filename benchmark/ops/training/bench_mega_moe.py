@@ -61,7 +61,7 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (  # noqa: E402
     gemm_bf16_tile,
 )
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (  # noqa: E402
-    _compile_grouped_variable_k_bf16,
+    _compile_grouped_bf16_wgrad,
 )
 from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_grouped_gemm_bf16_flydsl_kernel,
@@ -365,7 +365,7 @@ def grouped_gemm_variable_k_only(
         lhs_e, rhs_e, OUT_M_e, OUT_N_e = rhs_pool, lhs_pool, OUT_N, OUT_M
     else:
         lhs_e, rhs_e, OUT_M_e, OUT_N_e = lhs_pool, rhs_pool, OUT_M, OUT_N
-    launch = _compile_grouped_variable_k_bf16(
+    launch = _compile_grouped_bf16_wgrad(
         OUT_M_e,
         OUT_N_e,
         G,
