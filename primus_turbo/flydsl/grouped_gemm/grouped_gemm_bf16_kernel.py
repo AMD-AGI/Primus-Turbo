@@ -286,7 +286,7 @@ def _compile_grouped_variable_k_bf16(
     out_fp16=False,
     trans_c=False,
 ):
-    assert OUT_M % BLOCK_M == 0, "OUT_M (unclamped store dim) must divide BLOCK_M"
+assert OUT_M % BLOCK_M == 0, "OUT_M (unclamped store dim) must be divisible by BLOCK_M"
     N_BLOCKS_M = OUT_M // BLOCK_M
     N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
@@ -426,10 +426,6 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         OUT_N,
         torch.cuda.current_stream(),
     )
-    key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, out_fp16, trans_c)
-    compiled = _COMPILED_GROUPED_GEMM_CACHE.get(key)
-    if compiled is None:
-        compiled = flyc.compile(launch, *args)
-        _COMPILED_GROUPED_GEMM_CACHE[key] = compiled
+key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, num_xcd, out_fp16, trans_c)
     compiled(*args)
     return out
