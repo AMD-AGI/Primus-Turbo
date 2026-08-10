@@ -8,8 +8,8 @@
 
 * ``dispatch_fp8_copy_tile``: the COMM role. One block CLEAN-pushes a comm task's
   PRE-QUANTIZED fp8 token rows (16B/lane b128, coalesced) + their RAW E8M0 block scales
-  into the peer ``pool_fp8`` / ``pool_scale`` regions over XGMI, then (``signal``) drains
-  with a device-scope L2 write-back and signals the peer per-pool-block scoreboard. No
+  into the peer ``pool_fp8`` / ``pool_scale`` regions over XGMI, then drains with a
+  device-scope L2 write-back and signals the peer per-pool-block scoreboard. No
   in-push quant (tokens are quantized once on the source) -> the push saturates XGMI.
 
 Geometry: warp-per-token; hidden % 1024 == 0 (fp8 b128 push) and % 128 (MXFP8).
@@ -45,8 +45,8 @@ def dispatch_fp8_copy_tile(
     thread_index,
     hidden_size,
     num_max_pool_tokens,
-    xq_resource=None,  # pre-quant fp8 tokens int32 [T, hidden//4]
-    xs_resource=None,  # raw E8M0 scales int32 [T, hidden//128]
+    xq_resource,  # pre-quant fp8 tokens int32 [T, hidden//4]
+    xs_resource,  # raw E8M0 scales int32 [T, hidden//128]
     expert_send_dst_rank_resource,
     expert_send_dst_row_resource,
     expert_send_count_resource,
@@ -55,16 +55,15 @@ def dispatch_fp8_copy_tile(
     pool_fp8_base,  # sym_layout.pool_fp8_ptr
     pool_scale_base,  # RAW: sym_layout.pool_scale_ptr ; BROADCAST: sym_layout.pool_scale_ps_ptr
     pool_offsets_resource,
-    signal=False,
-    dispatch_flag_base=None,
-    dispatch_flag_offsets_resource=None,
-    bank=None,
-    world_size=0,
+    dispatch_flag_base,
+    dispatch_flag_offsets_resource,
+    bank,
+    world_size,
 ):
     """CLEAN fp8 comm PUSH closure (no in-push quant): copy a comm task's PRE-QUANTIZED
     fp8 tokens (16B/lane b128, coalesced) into the peer ``pool_fp8``, plus their RAW E8M0
-    scales (coalesced) into the peer ``pool_scale``, then (``signal``) drain with a
-    device-scope L2 write-back and signal the peer per-pool-block scoreboard. Mirrors
+    scales (coalesced) into the peer ``pool_scale``, then drain with a device-scope
+    L2 write-back and signal the peer per-pool-block scoreboard. Mirrors
     ``dispatch_fp8_push`` (saturates XGMI) but with the fused kernel's multi-task-per-block
     distribution so the preshuffle/gemm roles can overlap. The preshuffle role transposes
     the raw scale to the ScaleS2R broadcast layout on the dest."""
@@ -133,23 +132,22 @@ def dispatch_fp8_copy_tile(
             tok_lo = sub * slice_tokens
             tok_hi = fx.arith.select(tok_lo + slice_tokens < token_count, tok_lo + slice_tokens, token_count)
         copy_slice(dest_row_start, source_offset, peer_pool, peer_pscale, tok_lo, tok_hi)
-        if signal:
-            fx.rocdl.s_waitcnt(0)
-            # Device-scope release before the flag: without it the peer can observe the signal
-            # ahead of the rows it announces.
-            l2_writeback()
-            fx.gpu.barrier()
+        fx.rocdl.s_waitcnt(0)
+        # Device-scope release before the flag: without it the peer can observe the signal ahead of
+        # the rows it announces.
+        l2_writeback()
+        fx.gpu.barrier()
 
-            def _signal():
-                # epoch dispatch gate (bf16-style, per-expert uniform): one +1 to the peer's
-                # dispatch_flag[bank + local_expert]. task table is dense [local_expert][dst_rank]
-                # (prologue C3a), so local_expert = task_index // world_size and each dst expert
-                # receives exactly num_ranks +1s -> reaches the cumulative expected. Replaces the
-                # per-pool-block variable-count scoreboard (host-reset).
-                df_address = _peer_addr(dispatch_flag_base, dispatch_flag_offsets_resource, dst_rank)
-                local_expert = task_index // fx.Int32(world_size)
-                atomic_add(df_address, bank + local_expert, fx.Int64(1), scope="sys")
+        def _signal():
+            # epoch dispatch gate (bf16-style, per-expert uniform): one +1 to the peer's
+            # dispatch_flag[bank + local_expert]. task table is dense [local_expert][dst_rank]
+            # (prologue C3a), so local_expert = task_index // world_size and each dst expert
+            # receives exactly num_ranks +1s -> reaches the cumulative expected. Replaces the
+            # per-pool-block variable-count scoreboard (host-reset).
+            df_address = _peer_addr(dispatch_flag_base, dispatch_flag_offsets_resource, dst_rank)
+            local_expert = task_index // fx.Int32(world_size)
+            atomic_add(df_address, bank + local_expert, fx.Int64(1), scope="sys")
 
-            emit_if_then(thread_index == fx.Int32(0), _signal)
+        emit_if_then(thread_index == fx.Int32(0), _signal)
 
     return dispatch_tile

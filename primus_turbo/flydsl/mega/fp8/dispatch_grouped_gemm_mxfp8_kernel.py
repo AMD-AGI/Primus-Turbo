@@ -325,7 +325,6 @@ def _compile(
             pool_offsets_resource=create_buffer_resource_from_addr(
                 sym_layout.offsets_ptr, num_records_bytes=num_ranks * 8
             ),
-            signal=True,
             dispatch_flag_base=sym_layout.dispatch_flag_ptr,
             dispatch_flag_offsets_resource=create_buffer_resource_from_addr(
                 sym_layout.signal_offsets_ptr, num_records_bytes=num_ranks * 8
