@@ -402,6 +402,7 @@ def build_flash_attn_bwd_dqred_module(
     qsp_lo=0,
     n_qsp=None,  # None: every q block (no q-split sub-range)
     block_q=_BWD_BLOCK_Q,
+    causal_offset=0,  # Skv-Sq for a bottom-right-causal rectangular shape; 0 for square.
 ):
     """Fold the fused kernel's dQ split-K partials: DQ[b,q] = sm * Sum_b' WSQ[b',b,q].
 
@@ -523,7 +524,10 @@ def build_flash_attn_bwd_dqred_module(
             )
         else:
             row0 = fx.Index(ROW0) + bid * fx.Index(RPW)  # b*SQ + q of this group's first row
-        g = (row0 % fx.Index(SQ)) // fx.Index(block_kv)  # topmost band this group sees
+        # Topmost band this q group sees: with bottom-right causal masking a q row sees
+        # keys kv <= q + causal_offset, so on a rectangular shape (Skv>Sq) it reaches
+        # causal_offset//block_kv bands higher than its own. causal_offset==0 for square.
+        g = ((row0 % fx.Index(SQ)) + fx.Index(causal_offset)) // fx.Index(block_kv)
         base = row0 * fx.Index(HD) + chunk * fx.Index(CHUNK_ELEMS) + tid * fx.Index(VEC)
         offs = [base + fx.Index(c * BLOCK * VEC) for c in range_constexpr(UC)]
         c_zero_vec = Vec.filled(VEC, 0.0, fx.Float32).ir_value()
@@ -745,6 +749,8 @@ def build_flash_attn_bwd_dkdv_module(
     # On for D128 and for the fused body; forcing it off there is 881.6 / 877.6 (-1.1%).
     g1_ks_outer=None,  # None = on for D128
     varlen=False,  # ragged / block-causal: per-segment [tok_base,tok_end) from cu_seqlens
+    square=True,  # caller guarantees Sq==Skv (causal_offset==0); gates the Q_PAIR windowed
+    # optimization, which is only correct for square shapes (see Q_PAIR).
     # fuse_dq: also emit dQ (the fifth GEMM) into a split-K workspace, replacing the
     # separate Q-outer dq kernel. See _FUSE_DQ and _gemm3 below.
     fuse_dq=False,
@@ -932,6 +938,11 @@ def build_flash_attn_bwd_dkdv_module(
     # q-half together (each wave takes its own half); trip count becomes compile-time NB.
     Q_PAIR = (
         window_left >= 0
+        # Q_PAIR's compile-time NB trip count and half-tile pairing assume the band's q
+        # extent starts at kv_start (causal_offset==0); on a rectangular shape (Sq!=Skv)
+        # its dk/dv come out wrong (SNR~15) while the plain windowed q-loop below stays
+        # correct. Only take Q_PAIR when the caller guarantees a square shape.
+        and square
         and not fuse_dq
         and ENABLE_DMA
         and not q_dbuf
@@ -3167,6 +3178,11 @@ def build_flash_attn_bwd_dq_module(
         and window_left % BLOCK_KV == 0
         and WAVE_ROW_GROUPS == 1
         and not varlen
+        # Each resident tile gets its own LDS slot; a wide window (e.g. W=2048 with
+        # BLOCK_KV=32 -> 65 tiles) would blow past the 65536-byte ds_read offset ceiling
+        # asserted below. When it will not fit, fall back to the single-slot looped walk
+        # (WIN_TILES=1), the same path W=2047 already takes.
+        and (window_left // BLOCK_KV + 1) * LDS_SLOT * 2 <= 65536
     )
     WIN_TILES = (window_left // BLOCK_KV + 1) if WIN_RESIDENT else 1
     # s_setprio (raises this wave's issue priority over SIMD siblings) is a net loss on the
@@ -4453,7 +4469,12 @@ def _fuse_blockkv_for(Skv):
     # four-wave body's whole register file, so the band stays 256.
     if Skv >= 4096:
         return 256
-    return 64 if Skv <= 1024 else 128
+    # Skv==1024 takes 128 (8 bands), not 64 (16 bands): on the small square the reduce's
+    # (Skv/BLOCK_KV)/2*|dQ| DRAM traffic is what makes the fused path lose, and halving the
+    # band count there recovers it (64/1024/1024 B=4 with pipe off: bkv=64 0.217ms ->
+    # bkv=128 0.168ms; bkv=256 0.190ms as its wider tile thins the grid). Skv<1024 is not
+    # bench-covered and keeps 64.
+    return 64 if Skv < 1024 else 128
 
 
 def _dq_block_kv(Sq, window_left=-1):
@@ -4617,7 +4638,8 @@ def _reduce_dkdv_slots(ws_dk, ws_dv, n_slots, n_groups, stream):
 
 
 def _reduce_dq_partials(
-    ws, dq, block_kv, num_heads, head_dim, scale, stream, bat_lo=0, n_bat=None, qsp=(1, 0, None)
+    ws, dq, block_kv, num_heads, head_dim, scale, stream, bat_lo=0, n_bat=None, qsp=(1, 0, None),
+    causal_offset=0,
 ):
     """dQ[q] = scale * Sum_{b : b*BLOCK_KV <= q} ws[b][q], in ascending band order.
 
@@ -4634,7 +4656,14 @@ def _reduce_dq_partials(
     of the kernel's partial-store traffic.
     """
     _, B, Sq, _ = ws.shape
-    key = (num_heads, head_dim, B, Sq, block_kv, scale, bat_lo, n_bat, qsp)
+    # rows_per_wg(=2)*Hq*D must tile the reduce's block256*vec8*uc chunk. uc=2 (=4096
+    # chunk) is the tuned Hq=128 footprint; keep it when it tiles, else fall to the
+    # smallest tiling uc (Hq=48 -> 6144, uc=1 -> 2048 chunk). Any tiling uc yields
+    # bitwise-identical dQ (see build_flash_attn_bwd_dqred_module); it only trades the
+    # co-resident wave's register footprint (re-sweep per shape when perf-tuning).
+    rpw_hd = 2 * num_heads * head_dim
+    uc = 2 if rpw_hd % 4096 == 0 else next(u for u in (1, 3) if rpw_hd % (2048 * u) == 0)
+    key = (num_heads, head_dim, B, Sq, block_kv, scale, bat_lo, n_bat, qsp, causal_offset)
     launcher = _DQRED_CACHE.get(key)
     if launcher is None:
         if len(_DQRED_CACHE) >= 32:
@@ -4648,12 +4677,13 @@ def _reduce_dq_partials(
             sm_scale=scale,
             block=256,
             rows_per_wg=2,
-            uc=2,
+            uc=uc,
             bat_lo=bat_lo,
             n_bat=n_bat,
             q_split=qsp[0],
             qsp_lo=qsp[1],
             n_qsp=qsp[2],
+            causal_offset=causal_offset,
         )
         _DQRED_CACHE[key] = launcher
     # Pass ONE band slice: the descriptor is rebased per band with a 64-bit offset, and
@@ -4776,7 +4806,7 @@ def _fused_pipelined(dkdv_l, odo_l, bufs, ws_dq, dq, B, Sq, Skv, block_kv, Hq, D
         side.wait_event(evs[i])
         _reduce_dq_partials(
             ws_dq, dq, block_kv, Hq, D, 1.0 / _LOG2E, side, bat_lo=b, n_bat=1,
-            qsp=(q_split, lo, n),
+            qsp=(q_split, lo, n), causal_offset=Skv - Sq,
         )
     ev_join.record(side)
     return ev_join
@@ -4784,9 +4814,9 @@ def _fused_pipelined(dkdv_l, odo_l, bufs, ws_dq, dq, B, Sq, Skv, block_kv, Hq, D
 
 def _get_bwd(
     Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv=64, batch_size=None, sbhd=False,
-    varlen=False, fuse_dq=False,
+    varlen=False, fuse_dq=False, square=True,
 ):
-    key = (Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv, batch_size, sbhd, varlen, fuse_dq)
+    key = (Hq, Hkv, D, scale, window_left, q_split, block_kv, dq_block_kv, batch_size, sbhd, varlen, fuse_dq, square)
     launchers = _BWD_CACHE.get(key)
     if launchers is None:
         common = dict(
@@ -4868,6 +4898,7 @@ def _get_bwd(
             dma_grp=dkdv_dma_grp,
             pf_ring=dkdv_pf_ring,
             varlen=varlen,
+            square=square,
             fuse_dq=fuse_dq,
             q_pref=fuse_dq,
             g3_defer=False,
@@ -5125,7 +5156,7 @@ def flydsl_varlen_backward(
         dq_l, dkdv_l, _ = _get_bwd(
             Hq, Hkv, D, scale, window_left, q_split,
             _blockkv_for(max_skv, D, window_left), _dq_block_kv(max_sq, window_left),
-            batch_size=num_seg, sbhd=False, varlen=True,
+            batch_size=num_seg, sbhd=False, varlen=True, square=False,
         )
         delta = torch.empty(total_q, Hq, device=q.device, dtype=torch.float32)
         dq = torch.empty_like(q)
@@ -5144,14 +5175,38 @@ def flydsl_varlen_backward(
         dv = ws_dv.sum(dim=0)
         return dq, dk, dv
 
+    # A left window at least as wide as the sequence keeps every causal key: the smallest
+    # in-range key index a query can mask off is Skv-1-W, so W >= Skv-1 makes the lower
+    # bound vacuous and the shape is mathematically full causal. Normalize to -1 so it
+    # takes the (faster) full-causal path instead of the windowed q-loop, which pins
+    # q_split=1 and cannot fuse. Bit-identical result (no key is ever outside the window).
+    if window_left >= 0 and window_left >= Skv - 1:
+        window_left = -1
     q_split = _qsplit_for(Sq, window_left)
     block_kv = _blockkv_for(Skv, D, window_left)
     # Fused KV-outer path: dkdv also emits dQ, so S/dP/softmax are computed once instead
-    # of twice (5 GEMMs, not 7). It needs a per-band dQ workspace whose q axis is the kv
-    # band axis, hence square + block-aligned shapes; SWA and D128 keep the split pair.
+    # of twice (5 GEMMs, not 7). It needs a per-band dQ workspace (Skv//block_kv bands x
+    # Sq rows), so block-aligned full-causal shapes -- square or rectangular; SWA and D128
+    # keep the split pair.
     fuse_kv = _fuse_blockkv_for(Skv)
+    # The fused dQ reduce tiles rows_per_wg*Hq*D (=2*Hq*D) by a block256*vec8*uc chunk;
+    # _reduce_dq_partials picks uc=2 (4096 chunk) when it tiles and drops to uc=1 (2048)
+    # otherwise (Hq=48 -> 6144), so any Hq with 2*Hq*D % 2048 == 0 fuses. D==64 here, so
+    # this is Hq % 16 == 0.
+    # The fused path fuses down to the smallest bench square (64/1024/1024 B=4, area 1M):
+    # once the pipeline is off and the band is 128 it ties/beats the split pair there
+    # (fused 0.168ms vs split 0.170ms; see the `pipe`/`_fuse_blockkv_for` small-shape
+    # cases). Gate on causal area Sq*Skv >= 1024^2 -- squares >=1024 and rectangulars like
+    # 1024/16384 whose huge Skv amortizes the reduce. Below 1M there is no bench coverage,
+    # so keep the floor rather than fuse un-measured tiny shapes.
+    # Rectangular (Skv>Sq) bottom-right causal also fuses: the dQ workspace already carries
+    # Skv//block_kv bands and the fused body's G3 dQ emission is causal_offset-aware, so the
+    # only rectangular-specific piece is the reduce's band count (see _reduce_dq_partials's
+    # causal_offset). Needs Skv block-aligned too so the band axis tiles exactly.
     fuse_dq = (
-        _FUSE_DQ and not sbhd and window_left < 0 and D == 64 and Sq == Skv and Sq % fuse_kv == 0
+        _FUSE_DQ and not sbhd and window_left < 0 and D == 64
+        and Sq * Skv >= 1024 * 1024
+        and Sq % fuse_kv == 0 and Skv % fuse_kv == 0 and (2 * Hq * D) % 2048 == 0
     )
     if fuse_dq:
         block_kv = fuse_kv
@@ -5167,13 +5222,20 @@ def flydsl_varlen_backward(
         batch_size=B,
         sbhd=sbhd,
         fuse_dq=fuse_dq,
+        square=(Sq == Skv),
     )
     # identity delta = -rowsum(O.dO); both kernels center dP by it (exact). dq owns the
     # reduce (it already holds dO in registers) and stores DELTA for dkdv when
     # _FUSE_DELTA is on, so no odo launch is needed; O is cast to bf16 (no-op when out
     # is already bf16) and passed into dq's freed slot via _defer_delta.
     delta = torch.empty(B, Hq, Sq, device=q.device, dtype=torch.float32)
-    pipe = fuse_dq and _DQ_PIPE and B > 1 and not sbhd
+    # The pipeline runs the backward one batch at a time to overlap each batch's dQ reduce
+    # with the next batch's compute; it only pays when per-batch compute dwarfs the extra
+    # per-batch dispatch. On the small square (64/1024/1024 B=4) the 4 micro-dispatches cost
+    # far more than they overlap (pipe on 0.274ms vs pipe off 0.168ms), so gate it on causal
+    # area: only Sq*Skv >= 2048^2 keeps the pipeline. Every fused bench shape but 1024^2 is
+    # well above this, so this flips only the small square to the single whole-batch dispatch.
+    pipe = fuse_dq and _DQ_PIPE and B > 1 and not sbhd and Sq * Skv >= 2048 * 2048
     if (fuse_dq or not _FUSE_DELTA) and not pipe:
         odo_l(o16, dout.to(q.dtype).reshape(-1), delta.reshape(-1), B, Sq, st)
     dq = torch.empty_like(q)
@@ -5206,7 +5268,7 @@ def flydsl_varlen_backward(
                 qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1),
                 cu_ph, cu_ph, ws_dq[0, 0].reshape(-1), B, Sq, Skv, 0, st,
             )
-            _reduce_dq_partials(ws_dq, dq, block_kv, Hq, D, 1.0 / _LOG2E, st)
+            _reduce_dq_partials(ws_dq, dq, block_kv, Hq, D, 1.0 / _LOG2E, st, causal_offset=Skv - Sq)
     else:
         dq_l(qf, kf, vf, dof, lsef, df, dq.reshape(-1), o16, cu_ph, cu_ph, B, Sq, Skv, st)
         dkdv_l(
