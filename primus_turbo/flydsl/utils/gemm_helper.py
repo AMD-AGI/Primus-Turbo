@@ -19,6 +19,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
+from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.arith import _to_raw as _raw
@@ -1056,6 +1057,14 @@ def _lds_barrier():
     )
 
 
+def emit_if_then(cond, then_fn):
+    """Emit a dynamic ``if cond: then_fn()`` (the body-only AST rewrite's primitive).
+
+    ``then_fn`` must take no arguments, and closing over a loop variable in it is unsafe unless the
+    call is immediate -- build a zero-arg emitter per iteration instead."""
+    ReplaceIfWithDispatch.scf_if_dispatch(cond, then_fn)
+
+
 def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=1):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
@@ -1110,6 +1119,74 @@ def _emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd
             rout,
             ((grp * K128p + gkp) * 64 + lane) * 4 + wr_base,
             mask=(k0 + kkp * PACK) < K128,
+        )
+
+
+# Same transpose as _emit_lds_repack above, plus cache modifiers on the raw load and the
+# broadcast store. A fused kernel whose preshuffle role publishes to peers needs the transpose
+# to double as the fence; the host-side preshuffle callers do not, and stay on the plain one.
+def emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, rd_base=0, wr_base=0, pack=1,
+                     rd_cm=0, st_cm=0):
+    # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
+    # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
+    # rd_cm/st_cm (default 0 = cached): raw-load / broadcast-store cache modifiers. A fused-kernel
+    # preshuffle role passes rd_cm=1 (glc coherent acquire) + st_cm=16 (sc1 write-through release) so
+    # the transpose doubles as the fence: the write-through publishes pool_scale_ps to the coherent
+    # point (no whole-L2 buffer_wbl2 needed; the gemm's l2_invalidate acquires it). Host-side callers
+    # (build_preshuffle_ab_kernel) keep the defaults (plain cached).
+    NT = 4
+    TILE = 64 * KT
+    assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
+    for i in range_constexpr(TILE // BLK):
+        idx = tid + i * BLK
+        rr = idx // KT
+        kk = idx % KT
+        gk = k0 + kk
+        if is_a:
+            grow = grp * 64 + rr  # A: rows grp*64 + (s*16+r)
+        else:
+            s = rr // 16  # B-comb: row = nblk*256 + wn*32 + OFF[s] + rinner
+            off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
+            grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
+        dw = _buffer_ops.buffer_load(
+            rin, grow * K128 + gk + rd_base, vec_width=1, dtype=T.i32, mask=(gk < K128) & (grow < dim),
+            cache_modifier=rd_cm,
+        )
+        fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
+            Vec.from_elements([fx.Int32(dw)], fx.Int32)
+        )
+    _lds_barrier()
+    # Packed store: pack PACK consecutive K-iters into one output dword per lane (the
+    # reader mirrors this via kk=k//PACK + MFMA op_sel). PACK=1 = unpacked.
+    PACK = pack
+    K128p = ceildiv(K128, PACK)
+    NGP = KT // PACK  # packed groups produced per KT-chunk
+    NOUTp = NGP * 64
+    for j in range_constexpr(NOUTp // BLK):
+        ol = tid + j * BLK
+        kkp = ol // 64
+        lane = ol % 64
+        r = lane % 16
+        sh = (lane // 16) * fx.Int32(8)
+        gkp = (k0 // PACK) + kkp
+        elems = []
+        for s in range_constexpr(NT):
+            packed = fx.Int32(0)
+            for bb in range_constexpr(PACK):
+                so = (s * 16 + r) * KT + (kkp * PACK + bb)
+                val = Vec(
+                    fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(so)), fx.make_layout(1, 1)).load()
+                )
+                b = (fx.Int32(val[0]) >> sh) & fx.Int32(0xFF)
+                packed = packed | (b << fx.Int32(bb * 8))
+            elems.append(packed)
+        vec = Vec.from_elements(elems, fx.Int32)
+        _buffer_ops.buffer_store(
+            vec.ir_value(),
+            rout,
+            ((grp * K128p + gkp) * 64 + lane) * 4 + wr_base,
+            mask=(k0 + kkp * PACK) < K128,
+            cache_modifier=st_cm,
         )
 
 

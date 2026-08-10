@@ -25,7 +25,7 @@ from flydsl.expr.buffer_ops import (
 
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, _WARP
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, l2_writeback
-from primus_turbo.flydsl.mega.fp8.gemm_helper import _emit_if_then
+from primus_turbo.flydsl.utils.gemm_helper import emit_if_then
 
 _VEC_I32 = 4  # 4 x i32 = 16B / lane (b128 XGMI)
 
@@ -123,7 +123,7 @@ def dispatch_fp8_copy_tile(
                     )
                     buffer_store(sv, peer_pscale, dest_row * fx.Int32(scale_i32) + lane_id)
 
-                _emit_if_then(lane_id < fx.Int32(scale_i32), _one_scale)
+                emit_if_then(lane_id < fx.Int32(scale_i32), _one_scale)
 
         _emit_for(local_count, _row)
 
@@ -162,7 +162,7 @@ def dispatch_fp8_copy_tile(
                         xs_resource, source_row * fx.Int32(scale_i32) + lane_id, vec_width=1, dtype=fx.T.i32()
                     )
                 recs.append((valid, dest_row, vals, sval))
-            # zero-arg closures + immediate _emit_if_then call => closure capture is safe (matches
+            # zero-arg closures + immediate emit_if_then call => closure capture is safe (matches
             # the copy_slice/_one_scale idiom). Branch fns MUST take 0 args: ReplaceIfWithDispatch
             # injects result_names into any arg-accepting branch fn.
             def _emit_store(valid, dest_row, vals, sval):
@@ -174,9 +174,9 @@ def dispatch_fp8_copy_tile(
                         def _one_scale():
                             buffer_store(sval, peer_pscale, dest_row * fx.Int32(scale_i32) + lane_id)
 
-                        _emit_if_then(lane_id < fx.Int32(scale_i32), _one_scale)
+                        emit_if_then(lane_id < fx.Int32(scale_i32), _one_scale)
 
-                _emit_if_then(valid, _store)
+                emit_if_then(valid, _store)
 
             for valid, dest_row, vals, sval in recs:
                 _emit_store(valid, dest_row, vals, sval)
@@ -212,6 +212,6 @@ def dispatch_fp8_copy_tile(
                 local_expert = task_index // fx.Int32(world_size)
                 atomic_add(df_address, bank + local_expert, fx.Int64(1), scope="sys")
 
-            _emit_if_then(thread_index == fx.Int32(0), _signal)
+            emit_if_then(thread_index == fx.Int32(0), _signal)
 
     return dispatch_tile

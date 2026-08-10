@@ -52,11 +52,6 @@ from primus_turbo.flydsl.mega.fp8.ep_fp8 import (
     _BLOCK_THREADS,
     dispatch_fp8_copy_tile,
 )
-from primus_turbo.flydsl.mega.fp8.gemm_helper import (
-    _emit_lds_repack,
-    ceildiv,
-    make_value_attrs,
-)
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K,
     gemm_mxfp8_nt_tile,
@@ -72,6 +67,11 @@ from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.prims import cast
+from primus_turbo.flydsl.utils.gemm_helper import (
+    ceildiv,
+    emit_lds_repack,
+    make_value_attrs,
+)
 
 _VALIDATE_TILES = os.environ.get("PT_MEGA_VALIDATE_TILES", "0") != "0"
 _H_TILE_TO_EXPERT = 7  # dispatch_prologue handle index; see its unpack table
@@ -382,7 +382,7 @@ def _compile(
                         for _g in range(_n_ps_groups):
                             grp = block_m_ps * fx.Int32(_n_ps_groups) + fx.Int32(_g)
                             for _c in range(_n_ps_chunks):
-                                _emit_lds_repack(
+                                emit_lds_repack(
                                     True, grp, fx.Int32(_c * KT_PS), lds.ps_tile,
                                     a_scale_raw_res, ps_res, num_max_pool_tokens,
                                     K128, KT_PS, thread_index, _BLOCK_THREADS,

@@ -52,7 +52,7 @@ from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_reso
 from flydsl.expr.rocdl import cvt_f32_fp8, cvt_pk_bf8_f32, cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.mega.fp8.gemm_helper import (
+from primus_turbo.flydsl.utils.gemm_helper import (
     _PRESHUF_KT,
     build_preshuffle_ab_kernel,
     ceildiv,

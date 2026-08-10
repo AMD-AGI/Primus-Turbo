@@ -36,8 +36,10 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.buffer_ops import (
     buffer_load,
@@ -54,12 +56,6 @@ from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
     _H_NUM_TILE_BLOCKS,
     _H_ORIGIN_RANK,
     _H_ORIGIN_SLOT,
-)
-from primus_turbo.flydsl.mega.fp8.gemm_helper import (
-    StoreCQuantMxfp8CShuffle,
-    _emit_if_then,
-    make_value_attrs,
-    xcd_remap_pid,
 )
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K as _MXFP8_BLOCK_K,
@@ -78,6 +74,7 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 from primus_turbo.flydsl.mega.fp8.sym_layout import SymLayout
 from primus_turbo.flydsl.mega.fp8.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.prims import cast
+from primus_turbo.flydsl.utils.gemm_helper import emit_if_then, make_value_attrs, xcd_remap_pid
 
 # GEMM launch attrs (nt_vmcnt / waves_per_eu); included in flyc compile cache key below.
 _COMBINE_NT_VMCNT = 3
@@ -108,6 +105,126 @@ _REDUCE_VW = int(os.environ.get("PT_COMBINE_REDUCE_VW", "4"))
 # sys-scope flag traffic, an `s_waitcnt` before every flag read, and coherent epoch parity/expected
 # traffic each leave the rate at ~10%.
 _DOUBLE_BARRIER = os.environ.get("PT_COMBINE_DOUBLE_BARRIER", "1") != "0"
+
+
+def wait_lgkmcnt(n):
+    """Drain LDS/SMEM traffic to at most ``n`` outstanding ops."""
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string=f"s_waitcnt lgkmcnt({n})",
+        constraints="",
+        has_side_effects=True,
+    )
+
+class StoreCQuantMxfp8CShuffle:
+    """CShuffle epilogue that QUANTIZES the f32 accumulators to per-1x32 E8M0 mxfp8 on the
+    LDS re-read. Stages each 16-row sub-tile row-major into per-wave LDS (like the
+    non-quantizing ``StoreCPerTensorCShuffle`` in ``flydsl/utils/gemm_helper.py``), then
+    re-reads ``EPL`` CONTIGUOUS columns per lane -> the
+    1x32-along-N block amax is a cheap 4-lane reduction (2 shuffles) instead of the direct
+    MFMA layout's 32-lane butterfly (5 shuffles), and the fp8 payload is a COALESCED store
+    instead of scattered bytes. Reuses ``StoreCQuantFp8``'s E8M0/cvt math.
+
+    Requires Cc = n_tiles_b*16 == 32 (one 1x32 block == one shuffle-tile row; N_TILES_B=2,
+    the mega L2 tile). Writes ``C_fp8`` [c_rows, c_cols] fp8 + ``C_scale`` [c_rows, c_cols//32]
+    E8M0 byte. This measures the efficient in-GEMM mxfp8 quant placement for fp8-combine."""
+
+    def __init__(self, C_fp8, C_scale, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, c_lds, wave_id):
+        self.c_rows = c_rows
+        self.c_cols = c_cols
+        self.lane_id = fx.thread_idx.x % 64
+        self.wave_id = wave_id
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        self.out_ty = out_ty
+        self.Cc = n_tiles_b * 16
+        assert self.Cc == 32, f"StoreCQuantMxfp8CShuffle requires Cc==32 (N_TILES_B=2), got {self.Cc}"
+        self.EPL = (16 * self.Cc) // 64  # = 8 contiguous cols/lane
+        self.row_stride = self.Cc
+        self.wave_lds_elems = 16 * self.row_stride
+        self.c_lds = c_lds
+        self.fp8 = _buffer_ops.create_buffer_resource(C_fp8, max_size=True)
+        self.scale = _buffer_ops.create_buffer_resource(C_scale, max_size=True)
+        # bf16 staging pointer (align 2 store, align 16 read).
+        self._store_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 2)
+        self._read_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 16)
+
+    def store(self, c_frag, base_row, base_col):
+        lds_base = fx.Int32(fx.ptrtoint(self.c_lds.ptr))
+        wave_off = self.wave_id * self.wave_lds_elems
+        for ti in range_constexpr(self.n_tiles_a):
+            # stage this 16-row sub-tile row-major into per-wave LDS (bf16)
+            for tj in range_constexpr(self.n_tiles_b):
+                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                lds_col = tj * 16 + self.lane_id % 16
+                for i in range_constexpr(4):
+                    lds_row = (self.lane_id // 16) * 4 + i
+                    e = wave_off + lds_row * self.row_stride + lds_col
+                    ptr = fx.inttoptr(self._store_ptr_t, lds_base + e * 2)
+                    ptr.store(vec_f32[i].to(self.out_ty))
+            wait_lgkmcnt(0)
+            # re-read EPL=8 contiguous cols of one row per lane; 4 lanes cover one 1x32 block
+            row_in = (self.lane_id * self.EPL) // self.Cc      # = lane//4
+            col0 = (self.lane_id * self.EPL) % self.Cc         # = (lane%4)*8
+            lane_e = wave_off + row_in * self.row_stride + col0
+            rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
+            vec = Vec(fx.make_view(rptr, fx.make_layout(self.EPL, 1)).load())  # 8 bf16
+            f = [fx.arith.ArithValue(vec[j].to(fx.Float32)) for j in range_constexpr(self.EPL)]
+            # within-lane |max| over the 8 owned values
+            av = fx.arith.ArithValue(
+                (fx.arith.ArithValue(f[0]).bitcast(fx.T.i32()) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32())
+            )
+            for j in range_constexpr(1, self.EPL):
+                aj = fx.arith.ArithValue(
+                    (f[j].bitcast(fx.T.i32()) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32())
+                )
+                av = fx.arith.ArithValue(fx.arith.maximumf(av, aj))
+            # 4-lane amax (the 4 consecutive lanes owning this row's 32-col block)
+            for sh in (1, 2):
+                peer = fx.arith.ArithValue(av.shuffle_xor(sh, 64))
+                av = fx.arith.ArithValue(fx.arith.maximumf(av, peer))
+            # E8M0 scale (mirror StoreCQuantFp8), target 2^8
+            amax_bits = av.bitcast(fx.T.i32())
+            t = amax_bits + fx.Int32(1 << 19)
+            exp = ((t >> fx.Int32(23)) & fx.Int32(0x1FF)) - fx.Int32(127 + 8)
+            exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
+            exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
+            biased = fx.arith.ArithValue(exp) + fx.Int32(127)
+            # 1/scale from the exponent bits, not 1.0/bits(biased << 23) -- see the same reciprocal
+            # in quant.py. An all-zero 32-column block gives biased 0, where the float form divides
+            # by zero and quantizes every element to 0*inf = NaN.
+            inv = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32())
+            neglim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(-448.0)))
+            poslim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(448.0)))
+            # cvt 8 vals -> 2 packed i32 (4 fp8/word), coalesced 64b store
+            words = []
+            for jw in range_constexpr(self.EPL // 4):
+                q = [
+                    fx.arith.ArithValue(
+                        fx.arith.minimumf(fx.arith.maximumf(f[jw * 4 + k] * inv, neglim), poslim)
+                    )
+                    for k in range_constexpr(4)
+                ]
+                w = rocdl.cvt_pk_fp8_f32(fx.T.i32(), q[0], q[1], fx.Int32(0), False)
+                w = rocdl.cvt_pk_fp8_f32(fx.T.i32(), q[2], q[3], w, True)
+                words.append(w)
+            base_row_i = base_row + ti * 16 + row_in
+            gcol = base_col + col0
+            fp8_idx = (base_row_i * fx.Int32(self.c_cols) + gcol) // fx.Int32(4)  # i32-word index
+            _buffer_ops.buffer_store(
+                Vec.from_elements(words, fx.Int32).ir_value(), self.fp8, fp8_idx, cache_modifier=16
+            )
+            # one E8M0 byte per 1x32 block: the lane owning col0==0 writes it
+            def _emit_scale():
+                sb = fx.arith.ArithValue(biased).trunci(fx.T.i8())
+                _buffer_ops.buffer_store(
+                    sb, self.scale, base_row_i * fx.Int32(self.c_cols // 32) + gcol // fx.Int32(32),
+                    cache_modifier=16,
+                )
+
+            emit_if_then(col0 == fx.Int32(0), _emit_scale)
 
 
 @functools.lru_cache(maxsize=4)
@@ -156,7 +273,7 @@ def combine_copy_fp8_tile(
     num_full = H4 // cols_per_step
 
     def _make_row_emitter(row, origin):
-        # factory, not a closure over the loop var: `_emit_if_then` branch fns MUST take 0 args
+        # factory, not a closure over the loop var: `emit_if_then` branch fns MUST take 0 args
         # (ReplaceIfWithDispatch injects result_names into any arg-accepting branch fn).
         def _emit_row():
             slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
@@ -176,7 +293,7 @@ def combine_copy_fp8_tile(
                 sv = buffer_load(l2y_scale_res, row * fx.Int32(SC) + lane, vec_width=1, dtype=fx.T.i32())
                 buffer_store(sv, peer, fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + lane)
 
-            _emit_if_then(lane < fx.Int32(SC), _emit_scale)
+            emit_if_then(lane < fx.Int32(SC), _emit_scale)
             if with_gate:
                 # scatter the per-row gate gradient (d_topk_w) to origin[slot] in the MAIN-heap
                 # combine_gate; same value/slot across lanes (idempotent, like the flag store).
@@ -198,7 +315,7 @@ def combine_copy_fp8_tile(
         for j in range(rows_per_warp):
             row = base_row + fx.Int32(j)
             origin = buffer_load(origin_rank_res, row, vec_width=1, dtype=fx.T.i32())
-            _emit_if_then(origin >= fx.Int32(0), _make_row_emitter(row, origin))
+            emit_if_then(origin >= fx.Int32(0), _make_row_emitter(row, origin))
 
     return push_block
 
@@ -501,7 +618,7 @@ def _compile(
                     fx.rocdl.s_waitcnt(0)
                     rocdl.s_barrier()
                 flag_off = combine_bank + block_m * n_blocks_i32 + block_n
-                _emit_if_then(
+                emit_if_then(
                     thread_index == fx.Int32(0),
                     lambda: st(combine_flag_base, flag_off, expected_combine, scope="agent"),
                 )

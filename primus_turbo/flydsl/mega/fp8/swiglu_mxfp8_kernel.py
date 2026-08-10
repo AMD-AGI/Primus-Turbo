@@ -52,7 +52,6 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.rocdl import cvt_pk_bf8_f32, cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.mega.fp8.gemm_helper import ceildiv
 from primus_turbo.flydsl.mega.fp8.quant import (
     _BLK,
     _SCALE_PACK,
@@ -61,6 +60,7 @@ from primus_turbo.flydsl.mega.fp8.quant import (
     _mxfp8_words_from_f32_subvecs,
     colwise_grouped_meta,
 )
+from primus_turbo.flydsl.utils.gemm_helper import ceildiv
 
 ACTIVATION_CLAMP = 10.0
 _POOL_BLOCK_M = 256
