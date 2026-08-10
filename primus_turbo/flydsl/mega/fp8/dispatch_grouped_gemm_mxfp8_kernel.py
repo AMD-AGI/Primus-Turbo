@@ -6,23 +6,17 @@
 
 """Fused cross-rank dispatch PUSH (fp8) + grouped MXFP8 GEMM (NT), FlyDSL — 3-stage grid.
 
-Token quant and the weight B-scale preshuffle run host-side before the launch (the latter cached
-per weight version). One role-specialized kernel launched on every rank; each block picks its role
-from its index:
+One kernel per rank; a block picks its role from its index, and all three overlap in the one grid:
 
-  * COMM (first ``num_dispatch_cu`` blocks): each block pushes one comm task's PRE-QUANTIZED fp8
-    token rows and their RAW E8M0 block scales into the peer ``pool_fp8`` / ``pool_scale`` over
-    XGMI, then signals the peer's per-pool-block scoreboard. Quantizing once on the source keeps
-    the push coalesced and XGMI-bound (no in-push quant).
-  * PRESHUFFLE (next ``num_preshuffle_cu`` blocks): waits for a pool-block's rows, transposes
-    that block's A-scale raw -> ScaleS2R broadcast into the local ``pool_scale_ps`` ONCE
-    (non-redundant), then stamps a SENTINEL on the scoreboard.
-  * GEMM (remaining blocks): one NT output tile each of the grouped L1 GEMM (A = ``pool_fp8`` +
-    broadcast ``pool_scale_ps``, per-expert B = ``weight_fp8`` + preshuffled ``weight_scale``)
-    via ``gemm_mxfp8_nt_tile``, spinning until its pool-block's SENTINEL is set.
+  * COMM (first ``num_dispatch_cu`` blocks): pushes one comm task's PRE-QUANTIZED fp8 rows and RAW
+    E8M0 scales into the peer's ``pool_fp8`` / ``pool_scale`` over XGMI, then signals its
+    scoreboard. Quantizing once on the source keeps the push coalesced and XGMI-bound.
+  * PRESHUFFLE (next ``num_preshuffle_cu``): waits for a pool-block, transposes its A-scale raw ->
+    ScaleS2R broadcast into ``pool_scale_ps`` once, stamps a SENTINEL.
+  * GEMM (the rest): one NT output tile each via ``gemm_mxfp8_nt_tile``, spinning on that SENTINEL.
 
-Comm, preshuffle and gemm all overlap inside the one grid. The sys-scope scoreboard plus each
-role's own cache fence carry all cross-rank / cross-XCD visibility, so no host sync is needed.
+Token quant and the weight B-scale preshuffle are host-side, before the launch. The sys-scope
+scoreboard plus each role's own cache fence carry all visibility, so no host sync is needed.
 
 NT only. Constraints: hidden % 1024 == 0 (fp8 warp push), N % BLOCK_N == 0,
 num_max_pool_tokens % BLOCK_M == 0, K % 128 == 0 and K >= 256 (mxfp8 MMA).
@@ -71,27 +65,18 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_value_attrs,
 )
 
-_VALIDATE_TILES = os.environ.get("PT_MEGA_VALIDATE_TILES", "0") != "0"
-_H_TILE_TO_EXPERT = 7  # dispatch_prologue handle index; see its unpack table
 _H_NUM_TILE_BLOCKS = 11  # appended by this module: the per-call real-tile count
 _H_ORIGIN_RANK = 12  # appended by this module: per-call pool row -> owning rank
 _H_ORIGIN_SLOT = 13  # appended by this module: per-call pool row -> owning topk slot
 
 _FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip per-call @flyc.jit dispatch)
 
-# COMM / PRESHUFFLE / GEMM share one persistent grid, so the split between the first two is a tuning
-# knob, and the best pair moves with the GEMM's N: the forward's N=2I wants a balanced split, while
-# the L2-dgrad's N=I has half the FLOPs against the same push bytes and wants more comm.
-#
-# This is a LOOKUP, not a search. Timing the candidates on their first call was tried and is not
-# reproducible: on that call the ranks are still compiling and stepping through candidates, and in
-# that environment the two forward candidates measure within 0.8% of each other while their real
-# steady-state gap is ~5%, so the winner comes down to noise. Six runs of the same searching build
-# gave fwd-only 5.09 / 5.09 / 5.12 / 5.12 / 5.35 / 5.37 ms -- bimodal, half of them paying the 5%,
-# against 5.03-5.08 ms every time for a pinned (16, 16).
-#
-# So the table is produced offline, in steady state, by benchmark/ops/tune_cu_split_fp8.py, which
-# pins each candidate through PT_MEGA_CU_SPLIT and runs the normal bench. No tuning code lives here.
+# The COMM/PRESHUFFLE split of the shared grid is a tuning knob, and the best pair moves with the
+# GEMM's N: the L2-dgrad's N=I has half the forward's FLOPs against the same push bytes, so it wants
+# more comm. A LOOKUP, not a search -- timing candidates on the first call is not reproducible (the
+# ranks are still compiling, and the two forward candidates measure within 0.8% there against a ~5%
+# steady-state gap), which made fwd-only bimodal at 5.09-5.37 ms. benchmark/ops/tune_cu_split_fp8.py
+# builds the table offline; no tuning code lives here.
 _CU_SPLIT_CANDIDATES = ((16, 16), (24, 8))  # the scanner's search space; never timed at runtime
 # Measured steady-state winners on EP8 T=8192 DSv3 (gfx950): N=2I forward, N=I L2 dgrad.
 _CU_SPLIT_DEFAULTS = {4096: (16, 16), 2048: (24, 8)}
@@ -370,12 +355,10 @@ def _compile(
                                     spin_start = read_clock()
                                 sig = ld(dispatch_flag_local, bank_offset + expert_ps, scope="sys", dtype=fx.T.i64())
                         fx.gpu.barrier()
-                        # The coalesced LDS transpose doubles as this role's fence (ported from the
-                        # bwd fork R2/R3, -16.8% there): rd_cm=1 acquires the peer-pushed raw
-                        # pool_scale with a glc coherent read instead of a whole-L2 buffer_inv, and
-                        # st_cm=16 releases pool_scale_ps by writing through to the coherent point,
-                        # so no device-wide l2_writeback handoff is needed -- the GEMM role's own
-                        # l2_invalidate is what acquires it.
+                        # The transpose doubles as this role's fence (-16.8% when ported from the
+                        # bwd fork): rd_cm=1 acquires the peer-pushed pool_scale with a coherent
+                        # read instead of a whole-L2 buffer_inv, st_cm=16 releases pool_scale_ps by
+                        # writing through, so no device-wide l2_writeback handoff is needed.
                         for _g in range(_n_ps_groups):
                             grp = block_m_ps * fx.Int32(_n_ps_groups) + fx.Int32(_g)
                             for _c in range(_n_ps_chunks):
@@ -421,16 +404,11 @@ def _compile(
                                 spin_start = read_clock()
                             signal = ld(preshuffle_flag_local, bank_offset + block_m, scope="sys", dtype=fx.T.i64())
                     fx.gpu.barrier()
-                    # ACQUIRE for the peer-pushed pool rows / preshuffled A-scale (~4096 workgroups
-                    # per launch): `buffer_inv sc1` invalidates the issuing CU's vector L1 and the
-                    # XCD's L2, both of which the whole workgroup shares, so one lane covers every
-                    # wave. Wait for it to land, then release the others via the barrier. Issuing it
-                    # per wave instead spends ~90% of the acquire's cost on the redundant copies
-                    # (2.362 -> 2.169 ms here, against a 2.149 ms incoherent bound): the price is
-                    # issue serialization on the L2 port, NOT the invalidate evicting the B weights
-                    # this tile is about to stream -- that theory was tested by making the acquire
-                    # rarer (fatter workgroups, fewer tiles each) and lost more to pipeline
-                    # serialization than it saved.
+                    # ACQUIRE for the peer-pushed pool rows / preshuffled A-scale. `buffer_inv sc1`
+                    # invalidates the CU's vector L1 and the XCD's L2, both shared by the whole
+                    # workgroup, so ONE lane covers every wave; the barrier then releases the rest.
+                    # Per-wave instead costs 2.362 vs 2.169 ms (2.149 incoherent bound) -- the price
+                    # is issue serialization on the L2 port, not eviction of the B weights.
                     if thread_index == fx.Int32(0):
                         l2_invalidate()
                         fx.rocdl.s_waitcnt(fx.Int32(0))
@@ -535,15 +513,10 @@ def dispatch_grouped_gemm_mxfp8(
 ) -> torch.Tensor:
     """Fused fp8 dispatch PUSH + grouped mxfp8 L1 GEMM (comm/preshuffle/gemm pipeline).
 
-    Takes the bf16 activation ``x`` [T, K] and produces its mxfp8 rowwise quant internally via one
-    host-side launch, then runs the comm|preshuffle|gemm overlap. The weight B-scale preshuffle
-    (ScaleBComb) is host-side too and cached per weight version, since weights are static.
-
-    Leave ``num_dispatch_cu`` / ``num_preshuffle_cu`` at None to take the COMM/PRESHUFFLE split from
-    the offline table (see ``_resolve_cu_split``); pass a pair to pin it.
-
-    The gates self-reset via the device epoch bump (see ``_make_epoch_bump``); its tensors ride
-    on ``symm``."""
+    Rowwise-quantizes the bf16 ``x`` [T, K] in one host-side launch, then runs the
+    comm|preshuffle|gemm overlap. Leave ``num_dispatch_cu`` / ``num_preshuffle_cu`` at None to take
+    the split from the offline table (``_resolve_cu_split``); pass a pair to pin it. The gates
+    self-reset via the device epoch bump (``_make_epoch_bump``), whose tensors ride on ``symm``."""
     assert x.dtype == torch.bfloat16, f"activation must be bf16, got {x.dtype}"
     # All four come from prepare_dispatch_weight_fp8 at the op layer: this kernel derives no weight
     # state and caches none, so it cannot go stale behind an optimizer step.
@@ -588,12 +561,9 @@ def dispatch_grouped_gemm_mxfp8(
     # it into: a call that reuses a handle (the backward) would otherwise pair its own tile table
     # with whatever count the most recent prologue left there.
     num_tile_blocks = handle[_H_NUM_TILE_BLOCKS]
-    # Fresh per call, like the bf16 dispatch. A shared scratch keyed on the shape looks free -- the
-    # training shape never changes -- but l1 is the SwiGLU backward's input, so it has to survive
-    # until this layer's backward. Sharing it means the next layer's forward overwrites it first, and
-    # every layer but the last computes its expert gradients from another layer's fc1 output. That is
-    # invisible with one MoE layer and grows with depth: 20 steps at 2 layers drifted 1.52 in loss
-    # against bf16, where one layer drifts 0.07.
+    # Fresh per call, not shared scratch: l1 is the SwiGLU backward's input, so it must survive to
+    # this layer's backward, and sharing lets the next layer's forward overwrite it first. Invisible
+    # with one MoE layer -- 2 layers over 20 steps drifted 1.52 in loss against bf16 vs 0.07 for one.
     output = torch.empty((num_max_pool_tokens, N), dtype=out_dtype, device=dev)
     output_flat = output.view(-1)
 
@@ -660,32 +630,6 @@ def dispatch_grouped_gemm_mxfp8(
 
 
 
-def _validate_tiles(handle, experts_per_rank: int, *, fresh: bool) -> None:
-    """Debug probe: every tile the kernels will treat as real must carry a valid expert id.
-
-    ``tile_to_expert`` is a per-call tensor on the handle, while the real-tile count is
-    ``symm.meta_scalars[1:2]`` -- a view into the SHARED symm buffer that the next prologue
-    overwrites. A call that reuses a handle (the backward) therefore pairs its own tile table with
-    whichever count the most recent prologue left behind. If that count is the larger of the two,
-    the tiles in between still hold the prologue's out-of-range sentinel (``experts_per_rank``), and
-    the preshuffle role spins forever on a dispatch flag no COMM role will ever raise -- the
-    ``preshuffle gate timeout: expert=<experts_per_rank>`` hang.
-
-    Costs a D2H sync, so it is off unless ``PT_MEGA_VALIDATE_TILES=1``.
-    """
-    if not _VALIDATE_TILES:
-        return
-    tile_to_expert, num_tile_blocks = handle[_H_TILE_TO_EXPERT], handle[-1]
-    real_tiles = int(num_tile_blocks[0].item())
-    bad = (tile_to_expert[:real_tiles] >= experts_per_rank).nonzero().flatten()
-    assert bad.numel() == 0, (
-        f"MEGA fp8 dispatch ({'fresh prologue' if fresh else 'reused handle'}): "
-        f"{bad.numel()} of the {real_tiles} real tiles carry the out-of-range sentinel "
-        f"expert>={experts_per_rank}; first offenders {bad[:8].tolist()} "
-        f"(tile table holds {int((tile_to_expert < experts_per_rank).sum().item())} assigned tiles)"
-    )
-
-
 def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     x: torch.Tensor,
     w1_fp8: tuple,
@@ -699,26 +643,19 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     num_preshuffle_cu: Optional[int] = None,
 ) -> Tuple[torch.Tensor, tuple, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Self-contained fp8 dispatch + grouped mxfp8 NT GEMM; fp8 sibling of
-    ``dispatch_grouped_gemm_bf16_flydsl_kernel``. Drives BOTH the forward L1 (dispatch x + fc1) and
-    the backward L2 dgrad (dispatch dy + fc2-dgrad) -- both are the SAME NT op, only the input/weight
-    differ; the comm/preshuffle CU split is searched per shape unless pinned.
+    ``dispatch_grouped_gemm_bf16_flydsl_kernel``.
 
-    ``w1_fp8`` is the 4-tuple from ``prepare_dispatch_weight_fp8``, held version-keyed by the caller
-    -- the fc1 weight for the forward, ``w2^T`` for the L2 dgrad. When ``handle is None``
-    (forward), builds the symmetric workspace + dispatch-prologue handle from ``topk_idx`` /
-    ``topk_weights``; otherwise reuses the live symm buffer + the given handle (backward). Runs the
-    fused dispatch-PUSH + grouped mxfp8 GEMM, with token quant folded in via the bf16-x path.
+    Drives BOTH the forward L1 (dispatch x + fc1) and the backward L2 dgrad (dispatch dy +
+    fc2-dgrad): the same NT op, only the input and weight differ. ``w1_fp8`` is the 4-tuple from
+    ``prepare_dispatch_weight_fp8`` -- the fc1 weight for the forward, ``w2^T`` for the dgrad.
+    ``handle is None`` marks the forward and builds the symm workspace + prologue handle from
+    ``topk_idx``; the backward passes that handle back and must, so its dy retraces x's routing.
 
-    Returns ``(l1, handle, dispatch_weights, pool_x_fp8)`` where ``l1`` is the GEMM output (fc1 out
-    for forward, grad_swiglu for the L2 dgrad), ``dispatch_weights`` is ``symm.weight_recv_buf``
-    (per-pool-row routing weight; unused by the L2 dgrad), and ``pool_x_fp8`` is ``(symm.pool_fp8 [P,H] fp8, symm.pool_scale
-    [P,H//32] E8M0)`` -- both LIVE views into the shared symm pool (no clone). The caller keeps
-    ``handle`` (L2 + backward reuse it); ``handle[-1]`` is the device ``num_tile_blocks`` (real-tile
-    count), the SwiGLU-epilogue row bound (mirrors bf16's ``handle[_H_NUM_TILE_BLOCKS]``). It can
-    re-fetch the live symm buffer via ``get_symm_buffer_for_mega_moe()`` (e.g. the L2 combine flag reset).
-    """
+    Returns ``(l1, handle, dispatch_weights, pool_x_fp8)``. ``dispatch_weights`` and ``pool_x_fp8``
+    are LIVE views into the shared symm pool -- clone them before a later stage overwrites them.
+    ``handle[_H_NUM_TILE_BLOCKS]`` is the device real-tile count, which bounds the SwiGLU
+    epilogue's rows."""
     w1q = w1_fp8[0]
-    handle_was_none = handle is None
     if handle is None:
         assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
         assert group is not None, "handle=None requires group to build the symm workspace"
@@ -742,7 +679,6 @@ def dispatch_grouped_gemm_mxfp8_flydsl_kernel(
     else:
         symm = get_symm_buffer_for_mega_moe()  # live buffer from a prior forward
         sym_layout = symm.make_sym_layout()
-    _validate_tiles(handle, w1q.shape[0], fresh=handle_was_none)
     l1 = dispatch_grouped_gemm_mxfp8(
         x, w1_fp8, handle, sym_layout, symm,
         num_dispatch_cu=num_dispatch_cu, num_preshuffle_cu=num_preshuffle_cu, BM=BM, BN=BN,
