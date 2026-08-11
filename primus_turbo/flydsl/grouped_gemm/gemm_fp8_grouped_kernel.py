@@ -308,7 +308,7 @@ def _compile_grouped_nn(
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
             _nnwz = os.environ.get("PT_NN_WSWZ", "1") == "1"  # wave-swizzle dgrad B, default on
-            gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
+            gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
             gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS, wswz=_nnwz)
 
             # AGPR in-place accum (mode 2) when agpr_inplace -> off the VGPR file (spill-free).
@@ -704,8 +704,8 @@ def _compile_grouped_nt(
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-            gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-            gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
+            gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
+            gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
 
             # AGPR in-place accum (mode 2) when agpr_inplace -> off the VGPR file (spill-free).
             mfma = _build_mfma(
@@ -3431,7 +3431,7 @@ def _compile_grouped_nn_4wave(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 2
         wave_n = wave_id % 2
-        gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
+        gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
         gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS, wswz=False)
 
         def _do_tile(t):

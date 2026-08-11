@@ -23,7 +23,7 @@ from flydsl.compiler.ast_rewriter import (
     InsertEmptyYieldForSCFFor,
     ReplaceIfWithDispatch,
 )
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.buffer_ops import buffer_store, create_buffer_resource
@@ -165,25 +165,15 @@ def swizzle_128(row, col, width=128):
     return swizzled_offset // width, swizzled_offset % width
 
 
-def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
+def compute_global_swizzle(lane_id, wave_id, K, n_rounds):
+    """Per-lane global-load offsets for a K-major operand, swizzled to match the LDS layout."""
     offsets = []
     n_waves = fx.block_dim.x // 64
     for round in range_constexpr(n_rounds):
-        if const_expr(preshuffled):
-            row = lane_id % 8 + wave_id * 8 + round * (n_waves * 8)
-            col = (lane_id // 8) * 16
-            offsets.append(
-                (row // 16) * (K * 16)
-                + (row % 16) * 16
-                + (col // 64) * 1024
-                + ((col % 64) // 16) * 256
-                + (col % 16)
-            )
-        else:
-            row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
-            col = (lane_id % 8) * 16
-            r, c = swizzle_128(row, col)
-            offsets.append(r * K + c)
+        row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
+        col = (lane_id % 8) * 16
+        r, c = swizzle_128(row, col)
+        offsets.append(r * K + c)
     return offsets
 
 
@@ -264,24 +254,21 @@ class S2RLoader(_S2RLoaderBase):
         view = fx.make_view(i8_iter, fx.make_layout(16, 1))
         return view.load()
 
-    def load(self, lds_src, preshuffled=False):
+    def load(self, lds_src):
         frag = []
         for i in range_constexpr(self.n_tiles):
             halves = []
             row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
             for step in range_constexpr(2):
                 col = (self.lane_id // 16) * 16 + step * 64
-                if const_expr(preshuffled):
-                    offset = (row // 8) * 1024 + (row % 8) * 16 + (col // 16) * 128
-                else:
-                    row_swz, col_swz = swizzle_128(row, col)
-                    offset = row_swz * 128 + col_swz
+                row_swz, col_swz = swizzle_128(row, col)
+                offset = row_swz * 128 + col_swz
                 v = self._vec_load_16xf8(lds_src, offset)
                 halves.append(v.bitcast(fx.Int32))
             frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
         return frag
 
-    def base_addr(self, lds_src, preshuffled=False):
+    def base_addr(self, lds_src):
         """Per-lane LDS byte address pairs for the bare-asm whole-loop: mirrors `load()`'s
         addressing but returns addresses so `ds_line` can emit 2x ds_read_b128 (no HW
         transpose) for an already-M/N-major operand. Same [[p0,p1]]*n_tiles shape as
@@ -294,11 +281,8 @@ class S2RLoader(_S2RLoaderBase):
             addrs = []
             for step in range_constexpr(2):
                 col = (self.lane_id // 16) * 16 + step * 64
-                if const_expr(preshuffled):
-                    offset = (row // 8) * 1024 + (row % 8) * 16 + (col // 16) * 128
-                else:
-                    row_swz, col_swz = swizzle_128(row, col)
-                    offset = row_swz * 128 + col_swz
+                row_swz, col_swz = swizzle_128(row, col)
+                offset = row_swz * 128 + col_swz
                 addrs.append(base + fx.Int32(offset))
             out.append(addrs)
         return out

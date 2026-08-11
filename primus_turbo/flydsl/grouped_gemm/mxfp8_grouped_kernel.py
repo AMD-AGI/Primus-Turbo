@@ -508,8 +508,8 @@ def _build_grouped_mxfp8_nt_kernel(
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-            gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-            gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
+            gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
+            gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
 
             mfma = MfmaScale16x16x128(N_TILES_A, N_TILES_B, cbsz=cbsz, blgp=blgp)
 
@@ -1148,8 +1148,8 @@ def _build_grouped_mxfp8_wgrad_kernel(
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-            gl_off_a = compute_global_swizzle(lane_id, wave_id, m_total, N_LDS_ROUNDS, preshuffled=False)
-            gl_off_b = compute_global_swizzle(lane_id, wave_id, m_total, N_LDS_ROUNDS, preshuffled=False)
+            gl_off_a = compute_global_swizzle(lane_id, wave_id, m_total, N_LDS_ROUNDS)
+            gl_off_b = compute_global_swizzle(lane_id, wave_id, m_total, N_LDS_ROUNDS)
 
             A1off = LDS_BLOCK_M * m_total  # region1 = OUT_M rows [LDS_BLOCK_M, BLOCK_M)
             B1off = LDS_BLOCK_N * m_total

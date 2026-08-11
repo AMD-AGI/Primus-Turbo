@@ -172,8 +172,8 @@ def _compile_dense_nt(
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-        gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-        gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
+        gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
+        gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
 
         mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
         if cbsz or blgp:
@@ -496,7 +496,7 @@ def _compile_dense_nn(
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-        gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
+        gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
         gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS)
 
         mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
