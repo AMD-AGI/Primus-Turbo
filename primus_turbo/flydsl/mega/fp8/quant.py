@@ -53,6 +53,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     _PRESHUF_KT,
     build_preshuffle_ab_kernel,
     ceildiv,
+    run_compiled,
 )
 
 MXFP8_BLOCK = 32  # mxfp8 block (elements per E8M0 scale)
@@ -244,11 +245,7 @@ def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int, *, pack: i
 
     args = (a_raw, b_raw, a_sp, b_sp, a_blocks, a_ngrp, b_ngrp, torch.cuda.current_stream())
     ck = (GN, K128, pack)
-    compiled = _BSCALE_PS_COMPILED.get(ck)
-    if compiled is None:
-        compiled = flyc.compile(_launch, *args)
-        _BSCALE_PS_COMPILED[ck] = compiled
-    compiled(*args)
+    run_compiled(_BSCALE_PS_COMPILED, ck, _launch, *args)
     return b_sp
 
 
@@ -267,11 +264,7 @@ def quantize_rowwise_mxfp8_flydsl(x: torch.Tensor):
     launch = _compile_quant(int(K))
     args = (x, q_i32, s, M, torch.cuda.current_stream())
     ck = (M, K)
-    compiled = _QUANT_COMPILED.get(ck)
-    if compiled is None:
-        compiled = flyc.compile(launch, *args)
-        _QUANT_COMPILED[ck] = compiled
-    compiled(*args)
+    run_compiled(_QUANT_COMPILED, ck, launch, *args)
     return q, s
 
 

@@ -1002,6 +1002,28 @@ def make_row_band_resource_div(c_base, base_row, c_rows, c_cols, elem_bytes):
     return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec)
 
 
+def run_compiled(cache: dict, key, launch, *args):
+    """``flyc.compile`` the launch once per ``key``, then call the compiled object.
+
+    Calling a ``@flyc.jit`` launch directly re-pays its dispatch on every launch: signature bind over
+    the launch's arguments, cache-key build from the bound values, and a globals-drift check. That is
+    host time on the critical path, and it is not small -- for the fp8 combine's ~24-argument launch
+    it measures 180 us per call against 37 us through the compiled object, and a training step makes
+    that call twice per MoE layer. ``flyc.compile`` resolves all of it once; the object it returns
+    only forwards to the call state.
+
+    The key belongs to the caller because it cannot be derived here. It has to cover everything the
+    compiled artifact depends on, which is the launch's own identity (usually an ``lru_cache``d
+    builder, but not always -- some callers build the closure per call) PLUS any argument value the
+    compile bakes in, such as an ``M`` that is not part of the builder's key.
+    """
+    compiled = cache.get(key)
+    if compiled is None:
+        compiled = flyc.compile(launch, *args)
+        cache[key] = compiled
+    compiled(*args)
+
+
 def _robust_time(launch, args, warmup=250, reps=5, iters=50):
     """Median-of-`reps` timing of launch(*args) after `warmup` iters.
     The long warmup reaches boost clock; short-K kernels mis-pick configs otherwise."""

@@ -31,7 +31,6 @@ LOCAL fp8 L2Y buffers (``L2Y_FP8`` uint8 [pool*H], ``L2Y_SCALE`` uint8 [pool*H/3
 """
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -70,7 +69,7 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.prims import cast, read_clock, spin_timed_out
-from primus_turbo.flydsl.utils.gemm_helper import emit_if_then, make_value_attrs
+from primus_turbo.flydsl.utils.gemm_helper import emit_if_then, make_value_attrs, run_compiled
 
 # GEMM launch attrs (nt_vmcnt / waves_per_eu); included in flyc compile cache key below.
 _COMBINE_NT_VMCNT = 3
@@ -85,6 +84,10 @@ _COMBINE_WAVES_PER_EU = 2
 # worst-case grid only added blocks that exit on arrival. Bring any of them back per-shape if a
 # measurement asks.
 _REDUCE_VW = 4  # top-k reduce payload load width in i32 words per lane (4 -> b128)
+# Cap on the empty blocks running the reduce. Matches the bf16 combine's default; the empty
+# region is far smaller than this in practice, so the cap does not bind and every empty block
+# joins in.
+_COMBINE_REDUCE_CAP = 256
 
 
 def wait_lgkmcnt(n):
@@ -417,13 +420,38 @@ def _compile(
     out_features, hidden_size, num_max_pool_tokens, BLOCK_M, BLOCK_N, num_combine_cu, num_reduce_cu,
     combine_slots, topk, num_experts, rank, num_ranks, apply_weights, with_gate,
     num_groups=0, nt_vmcnt=_COMBINE_NT_VMCNT, waves_per_eu=_COMBINE_WAVES_PER_EU, agpr_alloc=0,
+    num_gemm_cu=None,
 ):
     """Unified fp8 combine: mxfp8 GEMM (CShuffle mxfp8-quant epilogue -> local fp8 pool) + FP8 combine
     PUSH (+ optional gate scatter) + fp8-dequant top-k reduce. One kernel for BOTH:
       * forward L2   (apply_weights=True,  with_gate=False): ``act @ w2``, K=I, WEIGHTED reduce -> y.
       * backward L1 dgrad (apply_weights=False, with_gate=True): ``grad_l1 @ w1^T``, K=2I, UNWEIGHTED
         reduce (routing weight folded upstream) + gate scatter / d_topk_w fold -> dx.
-    Mirrors the unified bf16 ``grouped_gemm_combine`` (apply_weights/with_gate constexpr flags)."""
+    Mirrors the unified bf16 ``grouped_gemm_combine`` (apply_weights/with_gate constexpr flags).
+
+    The three roles are sized by their own argument, and 0 means the role is absent -- which is how
+    the isolation builds the benches time are expressed, instead of a flag per combination:
+
+      ``num_combine_cu``  blocks running the cross-rank PUSH.
+      ``num_reduce_cu``   cap on how many of the grid's EMPTY blocks run the reduce, the rest exiting
+                          on arrival; they stride over the empty tiles, so the cap only binds when
+                          the pool is nearly full. 0 removes the role. Same meaning as the bf16
+                          combine's argument of that name -- there is no separate reduce region in
+                          the grid, here or there.
+      ``num_gemm_cu``     None runs one workgroup per real tile, which is the only production shape:
+                          the block count follows the routing, so it is derived, not tuned. 0 removes
+                          the role. A positive count would mean a persistent grid, deleted as slower.
+
+    Because the reduce rides the empty blocks rather than a reserved region, the grid is
+    ``num_combine_cu + worst_case_tiles * n_blocks`` whatever the routing does -- so no launch ever
+    reads the real tile count back from the device, which would drain the queue and kill CPU/GPU
+    overlap. (The bf16 combine sizes its grid by the same expression.)
+
+    Dropping a role changes the others by implication rather than by a second switch: with no GEMM
+    role nothing ever sets the GEMM-done flag, so the PUSH must not wait on it, and the gate is
+    compiled out. Combinations that measure something: (combine, 0, None) skips the reduce,
+    (0, 0, None) is the GEMM alone, (combine, 0, 0) is the PUSH alone. All but the first give
+    INCORRECT output -- they exist to attribute time, not to compute."""
     K = hidden_size
     assert out_features % BLOCK_N == 0
     assert num_max_pool_tokens % BLOCK_M == 0
@@ -449,21 +477,17 @@ def _compile(
     comb_records = combine_slots * out_features * 2
     gate_records = combine_slots * 4  # f32 gate slots per peer (backward d_topk_w scatter)
     delta_records = num_ranks * 8
-    dedicated_reduce_warps = num_reduce_cu * _NUM_WARPS
-    gemm_base = num_combine_cu + num_reduce_cu
+    assert num_gemm_cu in (None, 0), (
+        f"num_gemm_cu={num_gemm_cu}: the GEMM role is one workgroup per real tile, so its block count "
+        "is derived (None) or the role is absent (0). A positive count would be the persistent grid, "
+        "removed as slower than one-WG-per-tile."
+    )
+    assert num_reduce_cu >= 0, f"num_reduce_cu={num_reduce_cu}: a cap on the empty blocks, or 0 for off"
+    _no_gemm = num_gemm_cu == 0
+    gemm_base = num_combine_cu
     H4 = out_features // 4
     SC = out_features // 128
     payload_i32_total = combine_slots * H4
-    _env_no_reduce = os.environ.get("PT_COMBINE_NO_REDUCE", "0") == "1"
-    # PT_COMBINE_GEMM_ONLY (isolation): combine PUSH does 0 tiles + reduce compiled out -> the kernel
-    # runs ONLY the mxfp8 fc1-dgrad GEMM role (+ CShuffle fp8 epilogue). Measures the GEMM-role wall
-    # (no cross-rank comm, no reduce) -> INCORRECT output, timing only.
-    _gemm_only = os.environ.get("PT_COMBINE_GEMM_ONLY", "0") == "1"
-    # PT_COMBINE_PUSH_ONLY (isolation): combine PUSH runs but SKIPS the GEMM-done sb_l2 gate (GEMM +
-    # reduce idle), so it just XGMI-copies whatever's in the local fp8 L2Y to the peer comb + flags.
-    # Measures the combine-PUSH wall (cross-rank byte cost) -> INCORRECT output, timing only.
-    _push_only = os.environ.get("PT_COMBINE_PUSH_ONLY", "0") == "1"
-    _no_reduce = _env_no_reduce or _gemm_only or _push_only
     reduce_fp8 = _make_topk_reduce_fp8(out_features, topk, combine_slots, apply_weights, with_gate)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
@@ -479,7 +503,6 @@ def _compile(
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         combine_cu = fx.Int32(num_combine_cu)
-        reduce_cu = fx.Int32(num_reduce_cu)
         lds = fx.SharedAllocator().allocate(_SharedStorage).peek()
 
         combine_flag_base = sym_layout.combine_flag_ptr
@@ -536,13 +559,12 @@ def _compile(
                 with_gate=with_gate, grad_gate_res=grad_gate_res, gate_base=gate_base,
                 main_delta_res=main_delta_res, gate_records=gate_records,
             )
-            local_count = (
-                fx.Int32(0) if _gemm_only
-                else (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
-            )
+            local_count = (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
             for tile_iter in range(local_count):
                 block_m = block_index + tile_iter * combine_cu
-                if not _push_only:  # PUSH_ONLY skips the GEMM-done gate + acquire (GEMM idle) -> pure push
+                # No GEMM role means no one ever sets the GEMM-done flag, so waiting on it would hang:
+                # the PUSH then ships whatever the local L2Y already holds (incorrect, timing only).
+                if not _no_gemm:
                     if thread_index == fx.Int32(0):
                         spin_start = read_clock()
                         flag_base = combine_bank + block_m * n_blocks_i32
@@ -618,34 +640,33 @@ def _compile(
                     lambda: st(combine_flag_base, flag_off, expected_combine, scope="agent"),
                 )
 
-            if const_expr(not _no_reduce) and block_index < combine_cu + reduce_cu:
-                reduce_fp8(
-                    thread_index, block_index - combine_cu, fx.Int32(dedicated_reduce_warps),
-                    num_experts, rank, comb_base, comb_records, output_res, topk_indices_res,
-                    num_tokens_res, reduce_flag_base, reduce_bank, expected_reduce,
-                    topk_weights_res, gate_local_res, d_topk_w_res,
-                )
-            else:
-                # GEMM role. The grid carries one block per REAL tile, so every block here has a tile;
-                # blocks past them exist only when the tail-reduce reservation is in play.
-                role_idx = block_index - fx.Int32(gemm_base)
-                real_gemm_blocks = real_tiles * fx.Int32(n_blocks)
-                if role_idx < real_gemm_blocks:
-                    block_m = role_idx // fx.Int32(n_blocks)
-                    block_n = role_idx % fx.Int32(n_blocks)
-                    if not _push_only:
-                        _do_gemm_tile(block_m, block_n)
-                elif const_expr(not _no_reduce) and const_expr(num_reduce_cu == 0):
-                    tail_idx = role_idx - real_gemm_blocks
+            # The grid is sized to the pool's worst case, so a block owns a real tile (GEMM) or
+            # falls in the empty region past them (reduce, capped at num_reduce_cu blocks that
+            # stride over the leftovers). No reserved reduce region: same shape as bf16.
+            role_idx = block_index - fx.Int32(gemm_base)
+            real_gemm_blocks = real_tiles * fx.Int32(n_blocks)
+            if role_idx < real_gemm_blocks:
+                block_m = role_idx // fx.Int32(n_blocks)
+                block_n = role_idx % fx.Int32(n_blocks)
+                if not _no_gemm:
+                    _do_gemm_tile(block_m, block_n)
+            elif const_expr(num_reduce_cu > 0):
+                empty_ordinal = role_idx - real_gemm_blocks
+                if empty_ordinal < fx.Int32(num_reduce_cu):
                     n_empty_tiles = fx.Int32(worst_case_tiles) - real_tiles
-                    max_tail = n_empty_tiles * fx.Int32(n_blocks)
-                    if tail_idx < max_tail:
-                        reduce_fp8(
-                            thread_index, tail_idx, max_tail * fx.Int32(_NUM_WARPS),
-                            num_experts, rank, comb_base, comb_records, output_res, topk_indices_res,
-                            num_tokens_res, reduce_flag_base, reduce_bank, expected_reduce,
-                            topk_weights_res, gate_local_res, d_topk_w_res,
-                        )
+                    n_reduce_tiles = n_empty_tiles * fx.Int32(n_blocks)
+                    # stride = the blocks that actually showed up, so the cap only binds when the
+                    # empty region is larger than it
+                    active = fx.arith.select(
+                        n_reduce_tiles < fx.Int32(num_reduce_cu),
+                        n_reduce_tiles, fx.Int32(num_reduce_cu),
+                    )
+                    reduce_fp8(
+                        thread_index, empty_ordinal, active * fx.Int32(_NUM_WARPS),
+                        num_experts, rank, comb_base, comb_records, output_res, topk_indices_res,
+                        num_tokens_res, reduce_flag_base, reduce_bank, expected_reduce,
+                        topk_weights_res, gate_local_res, d_topk_w_res,
+                    )
 
     @flyc.jit
     def launch(
@@ -653,14 +674,12 @@ def _compile(
         NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, GRAD_GATE, D_TOPK_W, A_SCALE, B_SCALE,
         ORIGIN_RANK, ORIGIN_SLOT,
         COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED, sym_layout, c_n: int,
-        real_tiles_host: int,
-        tail_blocks_host: int,
         stream: fx.Stream = fx.Stream(None),
     ):
-        if const_expr(not _no_reduce and num_reduce_cu == 0):
-            grid_size = gemm_base + real_tiles_host * n_blocks + tail_blocks_host
-        else:
-            grid_size = gemm_base + real_tiles_host * n_blocks
+        # Independent of the routing: the GEMM blocks and the empty blocks the reduce rides always
+        # add up to worst_case_tiles * n_blocks, so no launch reads the real tile count back from
+        # the device. Same expression as the bf16 combine's grid.
+        grid_size = gemm_base + worst_case_tiles * n_blocks
         # bump epoch on device (combine += n_blocks, reduce += 1) before the kernel; same-stream visible
         _make_epoch_bump(1, 1)(COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED).launch(
             grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
@@ -681,7 +700,8 @@ _L2Y_FP8_SCRATCH: dict = {}
 
 def grouped_gemm_combine_mxfp8_flydsl_kernel(
     x, weights_fp8, handle, group, *, topk_indices, topk_weights=None, grad_gate=None,
-    x_fp8=None, x_fp8_rowwise=None, BM=256, BN=256, num_combine_cu=None, num_reduce_cu=0,
+    x_fp8=None, x_fp8_rowwise=None, BM=256, BN=256,
+    num_combine_cu=None, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
 ):
     """Unified fp8 grouped mxfp8 GEMM (mxfp8-quant epilogue) + FP8 combine PUSH + FP8-dequant reduce.
     ONE entry for BOTH directions (mirrors bf16 ``grouped_gemm_combine_bf16_flydsl_kernel``); the role
@@ -707,9 +727,11 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
 
     Self-resetting: the combine_flag / reduce_flag epoch gates are double-banked + device epoch-bumped,
     so NO host flag reset / rendezvous. Always returns ``(output, d_topk_w)`` (``d_topk_w`` is None in
-    the forward role)."""
-    if "PT_FP8_NUM_REDUCE_CU" in os.environ:
-        num_reduce_cu = int(os.environ["PT_FP8_NUM_REDUCE_CU"])
+    the forward role).
+
+    ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 removes one, which
+    is how the benches isolate a stage. ``num_reduce_cu`` caps how many of the grid's empty blocks run
+    the reduce, the bf16 combine's meaning for the same name; see ``_compile`."""
     apply_weights = topk_weights is not None
     with_gate = grad_gate is not None
     weight_flat, b_sp = weights_fp8
@@ -772,19 +794,6 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
 
     act_flat = aq.view(torch.int8).reshape(-1)
 
-    # These two only ever size the grid. In the shipped reduce configuration the GEMM blocks and the
-    # tail-reduce blocks always add up to worst_case_tiles * n_blocks, so the grid does not depend on
-    # the real-tile count at all -- and reading that count here would cost a D2H sync per launch,
-    # which in a training step drains the whole queue and kills CPU/GPU overlap (the bf16 combine
-    # takes no host read whatever). Feed the pair that yields the same grid without the sync, and
-    # only pay for the count where the grid really is proportional to it.
-    worst_case_tiles_host = M // BM
-    if num_reduce_cu == 0:
-        real_tiles_host, tail_blocks_host = worst_case_tiles_host, 0
-    else:
-        real_tiles_host = int(num_tile_blocks.item())
-        tail_blocks_host = max(0, worst_case_tiles_host - real_tiles_host) * (out_features // BN)
-
     def _run_with_cu(cu: int) -> None:
         stream = torch.cuda.current_stream()
         gemm_push_args = (
@@ -792,22 +801,18 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
             topk_indices_d, symm.num_tokens_per_rank, topk_weights_arg, grad_gate_arg, d_topk_w, a_sp, b_sp,
             origin_rank, origin_slot,
             symm._combine_parity, symm._combine_expected, symm._reduce_expected,
-            sym_layout, out_features, real_tiles_host, tail_blocks_host, stream,
+            sym_layout, out_features, stream,
         )
         launch = _compile(
             out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
             int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks),
-            apply_weights, with_gate, num_groups=int(G),
+            apply_weights, with_gate, num_groups=int(G), num_gemm_cu=num_gemm_cu,
         )
-        ck = (out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
+        ck = (out_features, K, M, BM, BN, int(cu), int(num_reduce_cu), num_gemm_cu,
               int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks), int(G),
               apply_weights, with_gate,
               _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU)
-        compiled = _FP8_COMBINE_COMPILED.get(ck)
-        if compiled is None:
-            compiled = flyc.compile(launch, *gemm_push_args)
-            _FP8_COMBINE_COMPILED[ck] = compiled
-        compiled(*gemm_push_args)
+        run_compiled(_FP8_COMBINE_COMPILED, ck, launch, *gemm_push_args)
 
     # Shipped per-role CU split when the caller does not pin one (fwd L2 / bwd L1 dgrad).
     _run_with_cu(int(num_combine_cu) if num_combine_cu is not None else (32 if apply_weights else 24))

@@ -147,11 +147,26 @@ def profile(group, args):
     tki = topk_idx.contiguous().view(-1)
     combine_cu = getattr(args, "combine_cu", 28)
     combine_slots = symm.combine_slots
+    # Isolation = drop roles from the grid, so each mode says which stage it is timing. Everything
+    # but "full" produces INCORRECT output on purpose. "push" has to drop the GEMM rather than just
+    # idle it: with no GEMM the kernel also stops waiting on the GEMM-done flag, which is what makes
+    # the PUSH measurable on its own.
+    _ROLES = {                     # mode -> (num_reduce_cu, num_gemm_cu); None = kernel default
+        "full": (None, None),
+        "gemm": (0, None),
+        "push": (0, 0),
+        "no_reduce": (0, None),
+    }
+    _mode = getattr(args, "mode", "full")
+    reduce_cu, gemm_cu = _ROLES[_mode]
+    push_cu = 0 if _mode == "gemm" else combine_cu
+    _roles = {} if reduce_cu is None else {"num_reduce_cu": reduce_cu}
 
     def _step3():
         return grouped_gemm_combine_mxfp8_flydsl_kernel(
             None, w1tf, list(handle), group, topk_indices=tki, grad_gate=grad_gate,
-            x_fp8_rowwise=rowwise, BM=BM, BN=BN, num_combine_cu=combine_cu,
+            x_fp8_rowwise=rowwise, BM=BM, BN=BN,
+            num_combine_cu=push_cu, num_gemm_cu=gemm_cu, **_roles,
         )
 
     dx, grad_topk_weights = _step3()
@@ -246,12 +261,7 @@ if __name__ == "__main__":
             print("[L1 dgrad combine breakdown] need EP>1"); sys.exit(1)
         base_env = os.environ.copy()
         base_env["PYTHONPATH"] = base_env.get("PYTHONPATH", os.getcwd())
-        specs = [
-            ("full", {}),
-            ("gemm", {"PT_COMBINE_GEMM_ONLY": "1"}),
-            ("push", {"PT_COMBINE_PUSH_ONLY": "1"}),
-            ("no_reduce", {"PT_COMBINE_NO_REDUCE": "1"}),
-        ]
+        specs = [("full", {}), ("gemm", {}), ("push", {}), ("no_reduce", {})]
         cmd_base = [
             sys.executable, __file__,
             "--num-processes", str(args.num_processes),
@@ -299,10 +309,4 @@ if __name__ == "__main__":
     if args.num_processes == 1:
         worker(0, 1, args)
     else:
-        if args.mode == "gemm":
-            os.environ["PT_COMBINE_GEMM_ONLY"] = "1"
-        elif args.mode == "push":
-            os.environ["PT_COMBINE_PUSH_ONLY"] = "1"
-        elif args.mode == "no_reduce":
-            os.environ["PT_COMBINE_NO_REDUCE"] = "1"
         torch.multiprocessing.spawn(worker, args=(args.num_processes, args), nprocs=args.num_processes)

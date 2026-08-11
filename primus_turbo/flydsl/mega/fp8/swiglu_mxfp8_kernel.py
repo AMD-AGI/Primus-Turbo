@@ -60,7 +60,7 @@ from primus_turbo.flydsl.mega.fp8.quant import (
     compile_rowcol_dual_pack_grouped,
     mxfp8_words_from_f32_subvecs,
 )
-from primus_turbo.flydsl.utils.gemm_helper import ceildiv
+from primus_turbo.flydsl.utils.gemm_helper import ceildiv, run_compiled
 
 ACTIVATION_CLAMP = 10.0
 _POOL_BLOCK_M = 256
@@ -260,11 +260,7 @@ def swiglu_mxfp8_flydsl_kernel(
     launch = _compile_swiglu_mxfp8(int(I))
     args = (x, q_i32, a_sp, num_tile_blocks, M, torch.cuda.current_stream())
     ck = (M, I)
-    compiled = _SWIGLU_MXFP8_COMPILED.get(ck)
-    if compiled is None:
-        compiled = flyc.compile(launch, *args)
-        _SWIGLU_MXFP8_COMPILED[ck] = compiled
-    compiled(*args)
+    run_compiled(_SWIGLU_MXFP8_COMPILED, ck, launch, *args)
     return q, a_sp
 
 

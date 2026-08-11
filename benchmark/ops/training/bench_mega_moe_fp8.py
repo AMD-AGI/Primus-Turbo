@@ -300,7 +300,7 @@ def profile_l2(group, args, mode):
     M_eff = real_tiles * BM
     m_pad = int(handle[_H_GROUP_OFFS][-1].item())
 
-    cc, rc = _cu(args.combine_cu, 32), _cu(args.reduce_cu, 0)  # l2 combine default (prod, epoch-comm tuned)
+    cc, rc = _cu(args.combine_cu, 32), _cu(args.reduce_cu, 256)  # l2 combine default (prod, epoch-comm tuned)
 
     def _fp8():  # fp8 L2 combine (pre-quant act from fused SwiGLU+mxfp8; no per-call A quant)
         y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
@@ -640,7 +640,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     def _reset_fp8():  # epoch self-reset (device) -> no host flag reset needed
         pass
 
-    cc, rc = _cu(args.combine_cu, 28), _cu(args.reduce_cu, 0)  # L1-dgrad combine default (unified w/ fwd L2)
+    cc, rc = _cu(args.combine_cu, 28), _cu(args.reduce_cu, 256)  # L1-dgrad combine default (unified w/ fwd L2)
 
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only); grad_gate=... selects the bwd role
         dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
@@ -805,7 +805,9 @@ def _build_parser():
     ap.add_argument("--dispatch-cu", type=int, default=-1, help="num_dispatch_cu (l1 / dispatch_fc2_dgrad)")
     ap.add_argument("--preshuffle-cu", type=int, default=-1, help="num_preshuffle_cu (l1 / dispatch_fc2_dgrad)")
     ap.add_argument("--combine-cu", type=int, default=-1, help="num_combine_cu (l2 / fc1_dgrad_combine)")
-    ap.add_argument("--reduce-cu", type=int, default=-1, help="num_reduce_cu (l2 / fc1_dgrad_combine)")
+    ap.add_argument("--reduce-cu", type=int, default=-1,
+                help="num_reduce_cu (l2 / fc1_dgrad_combine): cap on the empty blocks running the "
+                     "reduce, 0 off; omit for the stage default")
     return ap
 
 

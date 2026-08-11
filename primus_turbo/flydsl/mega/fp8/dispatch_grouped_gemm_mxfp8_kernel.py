@@ -63,13 +63,14 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     emit_if_then,
     emit_lds_repack,
     make_value_attrs,
+    run_compiled,
 )
 
 _H_NUM_TILE_BLOCKS = 11  # appended by this module: the per-call real-tile count
 _H_ORIGIN_RANK = 12  # appended by this module: per-call pool row -> owning rank
 _H_ORIGIN_SLOT = 13  # appended by this module: per-call pool row -> owning topk slot
 
-_FUSED_COMPILED: dict = {}  # (shape key) -> flyc.compile'd launch (eager; skip per-call @flyc.jit dispatch)
+_FUSED_COMPILED: dict = {}  # (shape key) -> compiled launch; see run_compiled
 
 # The COMM/PRESHUFFLE split of the shared grid is a tuning knob, and the best pair moves with the
 # GEMM's N: the L2-dgrad's N=I has half the forward's FLOPs against the same push bytes, so it wants
@@ -724,11 +725,7 @@ def dispatch_grouped_gemm_mxfp8(
         ck = (N, K, num_max_pool_tokens, BM, BN, int(dc), int(pc),
               int(num_comm), int(num_ranks), int(G), blgp, out_fp16, int(GROUP_M),
               push_only, gemm_only)
-        compiled = _FUSED_COMPILED.get(ck)
-        if compiled is None:
-            compiled = flyc.compile(_make_raw(dc, pc), *args)
-            _FUSED_COMPILED[ck] = compiled
-        compiled(*args)
+        run_compiled(_FUSED_COMPILED, ck, _make_raw(dc, pc), *args)
 
     cu_key = cu_split_key(N, K, num_max_pool_tokens, BM, BN, num_ranks, G)
     if num_dispatch_cu is None or num_preshuffle_cu is None:
