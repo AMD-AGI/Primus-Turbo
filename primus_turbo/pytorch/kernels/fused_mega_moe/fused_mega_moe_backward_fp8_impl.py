@@ -27,7 +27,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
-    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    combine_l1_dgrad_mxfp8_flydsl_kernel,
     preshuffle_b_scale,
     quantize_grouped_weight_mxfp8_flydsl,
     swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
@@ -251,8 +251,8 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
     """L1 dgrad (``grad_l1 @ w1^T``) + combine PUSH + reduce + grad_gate scatter
     -> ``(dx [num_tokens, H] bf16, grad_topk_weights [num_tokens, num_topk] f32)``."""
     w1tf = w1t_fp8 if w1t_fp8 is not None else _w1t_combine_fp8_cached(w1)
-    dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel(
-        w1tf, list(handle), group,
+    dx, d_topk_w_flat = combine_l1_dgrad_mxfp8_flydsl_kernel(
+        w1tf, list(handle),
         topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
         x_fp8_rowwise=grad_l1_rowwise_fp8,
         num_combine_cu=28,  # unified w/ fwd L2 (task-based push; T=8192)

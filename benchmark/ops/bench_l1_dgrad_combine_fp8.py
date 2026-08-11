@@ -8,7 +8,7 @@
 
 Replicates the backward up to the L1 dgrad on real mega-pool data: forward L1 -> (l1, dispatch_weights),
 the L2 dgrad (dispatch(dy)+fc2), SwiGLU^T -> grad_l1 + grad_gate. Then the L1 dgrad
-(``grouped_gemm_combine_mxfp8_flydsl_kernel`` with ``grad_gate``): fp8 fc1-dgrad + combine PUSH +
+(``combine_l1_dgrad_mxfp8_flydsl_kernel``): fp8 fc1-dgrad + combine PUSH +
 unweighted reduce + gate scatter -> dx [T, H] + grad_topk_weights [T, K].
 
 Same kernel / overlap pattern as forward L2 (fc2+combine), but K=2I and ``with_gate=True``.
@@ -36,7 +36,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_prologue,
     extend_handle,
     get_symm_buffer_for_mega_moe,
-    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    combine_l1_dgrad_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
 )
 from primus_turbo.flydsl.mega.fp8 import swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl
@@ -163,8 +163,8 @@ def profile(group, args):
     _roles = {} if reduce_cu is None else {"num_reduce_cu": reduce_cu}
 
     def _step3():
-        return grouped_gemm_combine_mxfp8_flydsl_kernel(
-            w1tf, list(handle), group, topk_indices=tki, grad_gate=grad_gate,
+        return combine_l1_dgrad_mxfp8_flydsl_kernel(
+            w1tf, list(handle), topk_indices=tki, grad_gate=grad_gate,
             x_fp8_rowwise=rowwise, BM=BM, BN=BN,
             num_combine_cu=push_cu, num_gemm_cu=gemm_cu, **_roles,
         )

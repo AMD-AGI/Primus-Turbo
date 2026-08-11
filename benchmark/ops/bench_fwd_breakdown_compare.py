@@ -26,7 +26,7 @@ from primus_turbo.flydsl.mega import (
 )
 from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
-    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    combine_l2_fwd_mxfp8_flydsl_kernel,
     swiglu_mxfp8_flydsl_kernel,
 )
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import prepare_w2_fp8
@@ -142,8 +142,8 @@ def worker(local_rank, world, args):
     )
 
     fp8["L2"] = _bench(
-        lambda: grouped_gemm_combine_mxfp8_flydsl_kernel(
-            w2_fp8, list(handle_fp8), group,
+        lambda: combine_l2_fwd_mxfp8_flydsl_kernel(
+            w2_fp8, list(handle_fp8),
             topk_indices=topk_idx, topk_weights=topk_w,
             x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=CC,
         )[0],

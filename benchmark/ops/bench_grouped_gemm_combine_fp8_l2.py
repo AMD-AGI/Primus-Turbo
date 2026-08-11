@@ -8,7 +8,7 @@
 
 Builds the symm workspace + prologue, runs the fp8 L1 (dispatch+fc1) + fused SwiGLU+mxfp8 quant,
 then times the fp8 L2 path on the pre-quantized activation:
-  grouped_gemm_combine_mxfp8_flydsl_kernel(x_fp8=...)  (fp8 GEMM + combine + reduce) -> y bf16.
+  combine_l2_fwd_mxfp8_flydsl_kernel(x_fp8=...)  (fp8 GEMM + combine + reduce) -> y bf16.
 Reports latency + a finite/NaN check. (For the fp8-vs-bf16 accuracy/speed comparison at the
 whole-forward level, use bench_mega_moe_fused_fp8.py, which uses the bf16 fused_mega_moe as the
 reference -- this repo carries no bf16 combine kernel under flydsl/mega/fp8/.)
@@ -32,7 +32,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     dispatch_prologue,
     extend_handle,
     get_symm_buffer_for_mega_moe,
-    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    combine_l2_fwd_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
     swiglu_mxfp8_flydsl_kernel,
 )
@@ -121,8 +121,8 @@ def profile(group, args):
     w2_fp8 = prepare_w2_fp8(W2)  # weight prep at the caller (op layer); combine is pure compute
 
     def _fp8():
-        y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-            w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=tw_f32,
+        y = combine_l2_fwd_mxfp8_flydsl_kernel(
+            w2_fp8, list(handle), topk_indices=topk_idx, topk_weights=tw_f32,
             x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=48,
         )
         return y

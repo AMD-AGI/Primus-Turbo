@@ -18,7 +18,7 @@ import torch.distributed as dist
 import primus_turbo.pytorch  # noqa: F401
 from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
-    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    combine_l2_fwd_mxfp8_flydsl_kernel,
     swiglu_mxfp8_flydsl_kernel,
 )
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import prepare_w2_fp8
@@ -95,8 +95,8 @@ def worker(local_rank, world, args):
     rows = []
     for cc in candidates:
         l2_ms = _bench(
-            lambda cc=cc: grouped_gemm_combine_mxfp8_flydsl_kernel(
-                w2_fp8, list(handle), group,
+            lambda cc=cc: combine_l2_fwd_mxfp8_flydsl_kernel(
+                w2_fp8, list(handle),
                 topk_indices=topk_idx, topk_weights=topk_w,
                 x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=cc,
             )[0],

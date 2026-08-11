@@ -698,54 +698,35 @@ def _compile(
 _L2Y_FP8_SCRATCH: dict = {}
 
 
-def grouped_gemm_combine_mxfp8_flydsl_kernel(
-    weights_fp8, handle, group, *, topk_indices, topk_weights=None, grad_gate=None,
-    x_fp8=None, x_fp8_rowwise=None, BM=256, BN=256,
+def _combine_mxfp8(
+    weights_fp8, handle, act_fp8, *, topk_indices, apply_weights, with_gate, default_combine_cu,
+    topk_weights=None, grad_gate=None, BM=256, BN=256,
     num_combine_cu=None, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
 ):
-    """Unified fp8 grouped mxfp8 GEMM (mxfp8-quant epilogue) + FP8 combine PUSH + FP8-dequant reduce.
-    ONE entry for BOTH directions (mirrors bf16 ``grouped_gemm_combine_bf16_flydsl_kernel``); the role
-    is inferred from the optional args:
-      * forward L2  (pass ``topk_weights``, no ``grad_gate``): ``act @ w2``, K=I, WEIGHTED reduce
-        -> ``y`` [num_tokens, H] bf16 (returned ``d_topk_w`` is None).
-      * backward L1 dgrad (pass ``grad_gate``, no ``topk_weights``): ``grad_l1 @ w1^T``, K=2I, UNWEIGHTED
-        reduce (routing weight folded upstream) + gate scatter -> ``dx`` [num_tokens, H] bf16 and
-        ``d_topk_w`` [combine_slots] f32.
+    """Shared body of the two combine entries -- everything that does not depend on the direction.
+
+    The direction reaches here already resolved: ``act_fp8`` is the (quantized, scale) pair whichever
+    entry supplied it, and ``apply_weights`` / ``with_gate`` are the constexpr flags that pick the
+    reduce's shape inside ``_compile``. Returns ``(output, d_topk_w)``; ``d_topk_w`` is None unless
+    ``with_gate``.
 
     PURE COMPUTE: the weight comes in ALREADY prepared as ``weights_fp8 = (weight_flat, b_sp)`` (build
     once with the op-layer ``prepare_w2_fp8``; fwd on ``w2`` [G,H,I], bwd on ``w1^T`` [G,H,2I]; op-layer
     version-keyed) -- NO weight quant/preshuffle and NO caching here.
 
-    The activation arrives pre-quantized too, so there is no A quant on either path: forward L2 takes
-    ``x_fp8=(act_fp8, a_sp)`` from ``swiglu_mxfp8_flydsl_kernel``, and the backward L1 dgrad takes
-    ``x_fp8_rowwise=(q_row, a_sp)`` from ``swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl``. M/K/device come
-    from whichever was given.
-
     Self-resetting: the combine_flag / reduce_flag epoch gates are double-banked + device epoch-bumped,
-    so NO host flag reset / rendezvous. Always returns ``(output, d_topk_w)`` (``d_topk_w`` is None in
-    the forward role).
+    so NO host flag reset / rendezvous.
 
     ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 removes one, which
     is how the benches isolate a stage. ``num_reduce_cu`` caps how many of the grid's empty blocks run
-    the reduce, the bf16 combine's meaning for the same name; see ``_compile`."""
-    apply_weights = topk_weights is not None
-    with_gate = grad_gate is not None
+    the reduce, the bf16 combine's meaning for the same name; see ``_compile``."""
     weight_flat, b_sp = weights_fp8
     tile_to_expert = handle[7]
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.make_sym_layout()
-    if x_fp8 is not None and x_fp8_rowwise is not None:
-        raise ValueError("x_fp8 and x_fp8_rowwise are mutually exclusive")
-    if with_gate:
-        assert x_fp8_rowwise is not None, "the backward L1 dgrad requires pre-quantized grad_l1 via x_fp8_rowwise"
-        aq, a_sp = x_fp8_rowwise
-        M, K = aq.shape  # K = 2I for fc1^T dgrad
-        dev = aq.device
-    else:
-        assert x_fp8 is not None, "forward L2 requires pre-quantized activation via x_fp8"
-        aq, a_sp = x_fp8
-        M, K = aq.shape  # K = I for fc2
-        dev = aq.device
+    aq, a_sp = act_fp8
+    M, K = aq.shape  # K = I for the fc2 forward, 2I for the fc1^T dgrad
+    dev = aq.device
     H = int(sym_layout.hidden)
     G = int(sym_layout.num_experts_per_rank)
     assert M == int(sym_layout.num_max_pool_tokens)
@@ -810,6 +791,40 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
               _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU)
         run_compiled(_FP8_COMBINE_COMPILED, ck, launch, *gemm_push_args)
 
-    # Shipped per-role CU split when the caller does not pin one (fwd L2 / bwd L1 dgrad).
-    _run_with_cu(int(num_combine_cu) if num_combine_cu is not None else (32 if apply_weights else 24))
+    _run_with_cu(int(num_combine_cu) if num_combine_cu is not None else default_combine_cu)
     return output, (d_topk_w if with_gate else None)
+
+
+def combine_l2_fwd_mxfp8_flydsl_kernel(
+    weights_fp8, handle, *, topk_indices, topk_weights, x_fp8, BM=256, BN=256,
+    num_combine_cu=None, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
+):
+    """Forward L2: ``act @ w2`` (K=I) + fp8 combine PUSH + WEIGHTED top-k reduce -> ``y`` [T, H] bf16.
+
+    ``x_fp8 = (act_fp8, a_sp)`` comes pre-quantized from ``swiglu_mxfp8_flydsl_kernel``; there is no A
+    quant here. The routing weight is applied by the reduce, which is what ``topk_weights`` is for."""
+    y, _ = _combine_mxfp8(
+        weights_fp8, handle, x_fp8, topk_indices=topk_indices, topk_weights=topk_weights,
+        apply_weights=True, with_gate=False, default_combine_cu=32,
+        BM=BM, BN=BN, num_combine_cu=num_combine_cu, num_reduce_cu=num_reduce_cu,
+        num_gemm_cu=num_gemm_cu,
+    )
+    return y
+
+
+def combine_l1_dgrad_mxfp8_flydsl_kernel(
+    weights_fp8, handle, *, topk_indices, grad_gate, x_fp8_rowwise, BM=256, BN=256,
+    num_combine_cu=None, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
+):
+    """Backward L1 dgrad: ``grad_l1 @ w1^T`` (K=2I) + fp8 combine PUSH + gate scatter + UNWEIGHTED
+    top-k reduce -> ``(dx [T, H] bf16, d_topk_w [combine_slots] f32)``.
+
+    ``x_fp8_rowwise = (q_row, a_sp)`` comes pre-quantized from
+    ``swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl``. The reduce is unweighted because the routing weight
+    was already folded upstream; ``grad_gate`` is scattered into ``d_topk_w`` alongside it."""
+    return _combine_mxfp8(
+        weights_fp8, handle, x_fp8_rowwise, topk_indices=topk_indices, grad_gate=grad_gate,
+        apply_weights=False, with_gate=True, default_combine_cu=24,
+        BM=BM, BN=BN, num_combine_cu=num_combine_cu, num_reduce_cu=num_reduce_cu,
+        num_gemm_cu=num_gemm_cu,
+    )

@@ -29,7 +29,8 @@ from .dispatch_grouped_gemm_mxfp8_kernel import (
 #   forward L2      : fp8 GEMM + combine PUSH + weighted top-k reduce (bf16 out)
 #   backward L1 dgrad : fp8 fc1-dgrad + combine PUSH + unweighted reduce (+ gate scatter)
 from .grouped_gemm_combine_fp8_kernel import (
-    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    combine_l1_dgrad_mxfp8_flydsl_kernel,
+    combine_l2_fwd_mxfp8_flydsl_kernel,
 )
 from .swiglu_mxfp8_kernel import (
     swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
@@ -55,7 +56,8 @@ __all__ = [
     "dispatch_grouped_gemm_mxfp8",
     "dispatch_grouped_gemm_mxfp8_flydsl_kernel",
     "extend_handle",
-    "grouped_gemm_combine_mxfp8_flydsl_kernel",
+    "combine_l1_dgrad_mxfp8_flydsl_kernel",
+    "combine_l2_fwd_mxfp8_flydsl_kernel",
     "swiglu_mxfp8_flydsl_kernel",
     "dispatch_prologue",
     "SymLayout",

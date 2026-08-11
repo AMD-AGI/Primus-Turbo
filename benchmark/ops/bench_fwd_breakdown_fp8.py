@@ -23,7 +23,7 @@ import primus_turbo.pytorch  # noqa: F401
 from primus_turbo.flydsl.mega import swiglu_flydsl_kernel
 from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
-    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    combine_l2_fwd_mxfp8_flydsl_kernel,
     quantize_rowwise_mxfp8_flydsl,
     swiglu_mxfp8_flydsl_kernel,
 )
@@ -122,8 +122,8 @@ def worker(local_rank, world, args):
     )
     r["w2_prep_cached"] = _bench(lambda: _w2_fp8_cached(W2L), warmup=args.warmup, iters=args.iters, group=group)
     r["L2_combine_xfp8"] = _bench(
-        lambda: grouped_gemm_combine_mxfp8_flydsl_kernel(
-            w2_fp8, list(handle), group,
+        lambda: combine_l2_fwd_mxfp8_flydsl_kernel(
+            w2_fp8, list(handle),
             topk_indices=topk_idx, topk_weights=topk_w,
             x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=CC,
         )[0],

@@ -17,7 +17,7 @@ from torch.distributed import ProcessGroup
 
 from primus_turbo.flydsl.mega.fp8 import (
     dispatch_grouped_gemm_mxfp8_flydsl_kernel,
-    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    combine_l2_fwd_mxfp8_flydsl_kernel,
     swiglu_mxfp8_flydsl_kernel,
 )
 from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_fp8_impl import (
@@ -70,8 +70,8 @@ def fused_mega_moe_forward_fp8_impl(
     w2q, w2s = _w2_fp8_cached(w2)
 
     # ── L2: fp8 combine (fp8 GEMM + mxfp8 epilogue + fp8 PUSH + bf16-out dequant reduce) ──
-    y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-        (w2q, w2s), list(handle), group,
+    y = combine_l2_fwd_mxfp8_flydsl_kernel(
+        (w2q, w2s), list(handle),
         topk_indices=topk_idx,
         topk_weights=topk_weights if topk_weights.dtype == torch.float32 else topk_weights.to(torch.float32),
         x_fp8=(act_fp8, act_a_sp),

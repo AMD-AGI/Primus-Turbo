@@ -46,7 +46,7 @@ pool_x -> fp8 GEMM) vs shipped bf16 Triton ``grouped_gemm_variable_k_impl``. Sam
 breakdown + SNR gate as fc2_wgrad. (Not in ``both``.)
 
 Backward stage ``--stage fc1_dgrad_combine`` = fc1 dgrad (grad_l1 @ w1^T) + combine + reduce
-+ grad_gate scatter -> dx [T,H]. fp8 ``grouped_gemm_combine_mxfp8_flydsl_kernel(grad_gate=...)`` (fp8-PUSH, fp8 stack) vs the
++ grad_gate scatter -> dx [T,H]. fp8 ``combine_l1_dgrad_mxfp8_flydsl_kernel(grad_gate=...)`` (fp8-PUSH, fp8 stack) vs the
 shipped bf16 ``grouped_gemm_combine_bf16_flydsl_kernel(layout='nn')`` (separate bf16 stack -- the
 fp8/bf16 dispatch handles are not interchangeable), kernel-only timing -> LATENCY compare (dx SNR
 via e2e gradcheck). The fp8-PUSH combine can intermittently spin-deadlock at large T (~5-15%) and
@@ -90,7 +90,8 @@ from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     dispatch_prologue,
     extend_handle,
     get_symm_buffer_for_mega_moe,
-    grouped_gemm_combine_mxfp8_flydsl_kernel,
+    combine_l1_dgrad_mxfp8_flydsl_kernel,
+    combine_l2_fwd_mxfp8_flydsl_kernel,
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
     swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
     swiglu_mxfp8_flydsl_kernel,
@@ -303,8 +304,8 @@ def profile_l2(group, args, mode):
     cc, rc = _cu(args.combine_cu, 32), _cu(args.reduce_cu, 256)  # l2 combine default (prod, epoch-comm tuned)
 
     def _fp8():  # fp8 L2 combine (pre-quant act from fused SwiGLU+mxfp8; no per-call A quant)
-        y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-            w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=topk_w_f32,
+        y = combine_l2_fwd_mxfp8_flydsl_kernel(
+            w2_fp8, list(handle), topk_indices=topk_idx, topk_weights=topk_w_f32,
             x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
         )
         return y
@@ -588,7 +589,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
     fp8 vs bf16 on SEPARATE symm stacks (the fp8 / bf16 dispatch handles are NOT interchangeable --
     bf16 combine reads recv_* at handle[9..12] where the fp8 handle holds group_lens/offs), so this
     is a LATENCY comparison (dx SNR is gated by the e2e backward gradcheck, not here):
-      * fp8  : fp8 stack -- real backward to grad_l1 + grad_gate, then ``grouped_gemm_combine_mxfp8_flydsl_kernel(grad_gate=...)``
+      * fp8  : fp8 stack -- real backward to grad_l1 + grad_gate, then ``combine_l1_dgrad_mxfp8_flydsl_kernel(grad_gate=...)``
                (fp8 fc1-dgrad + fp8-PUSH combine; w1^T prepped once). Kernel-only (reset outside window).
       * bf16 : bf16 stack -- shipped ``dispatch...bf16`` for a handle + a realistic grad_l1 replica,
                then ``grouped_gemm_combine_bf16_flydsl_kernel(layout='nn')``, same pool/routing.
@@ -643,8 +644,8 @@ def profile_fc1_dgrad_combine(group, args, mode):
     cc, rc = _cu(args.combine_cu, 28), _cu(args.reduce_cu, 256)  # L1-dgrad combine default (unified w/ fwd L2)
 
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only); grad_gate=... selects the bwd role
-        dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-            w1t_fp8, list(handle), group, topk_indices=tidx64, grad_gate=grad_gate,
+        dx, _ = combine_l1_dgrad_mxfp8_flydsl_kernel(
+            w1t_fp8, list(handle), topk_indices=tidx64, grad_gate=grad_gate,
             x_fp8_rowwise=grad_l1_rowwise, BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
         )
         return dx
