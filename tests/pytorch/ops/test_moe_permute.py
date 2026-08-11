@@ -83,13 +83,15 @@ def expected_permuted_layout(routing_map: torch.Tensor, pad_multiple: int):
 # --- Forward + backward correctness (pad_multiple = 0) ---
 
 
-@pytest.mark.parametrize("num_topk", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_topk", [1, 2, 4, 5, 8])
 @pytest.mark.parametrize("expert_map_kind", ["routing_map", "topk_idx_int32", "topk_idx_int64"])
 @pytest.mark.parametrize("num_tokens", [4096])
-@pytest.mark.parametrize("num_experts", [16])
+@pytest.mark.parametrize("num_experts", [7, 16])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_moe_permutation(num_topk, expert_map_kind, num_tokens, num_experts, hidden_size, backend):
+    if num_topk > num_experts:
+        pytest.skip("num_topk must not exceed num_experts")
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=1234)
     expert_map = routing_map_to_expert_map(routing_map, num_topk, expert_map_kind)
 
@@ -425,8 +427,9 @@ def test_moe_permute_triton_rejects_padding():
         )
 
 
-def test_moe_permute_triton_converts_topk_inputs():
-    num_tokens, num_experts, num_topk, hidden_size = 128, 8, 2, 64
+@pytest.mark.parametrize("num_experts, num_topk", [(8, 2), (7, 5)])
+def test_moe_permute_triton_converts_topk_inputs(num_experts, num_topk):
+    num_tokens, hidden_size = 128, 64
     routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=13)
     topk_indices = routing_map_to_expert_map(routing_map, num_topk, "topk_idx_int32")
     tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
@@ -454,8 +457,11 @@ def test_moe_permute_triton_converts_topk_inputs():
     torch.testing.assert_close(permuted_tokens, tokens[src_token], atol=0, rtol=0)
     torch.testing.assert_close(permuted_probs, dense_probs[src_token, src_expert], atol=0, rtol=0)
 
-    permuted_probs.sum().backward()
-    torch.testing.assert_close(probs.grad, torch.ones_like(probs), atol=0, rtol=0)
+    grad_pp = torch.randn_like(permuted_probs)
+    permuted_probs.backward(grad_pp)
+    dense_grad = torch.zeros((num_tokens, num_experts), dtype=probs.dtype, device=probs.device)
+    dense_grad[src_token, src_expert] = grad_pp
+    torch.testing.assert_close(probs.grad, dense_grad.gather(1, topk_indices.long()), atol=0, rtol=0)
 
 
 def test_moe_permute_default_backend_falls_back_for_padding():

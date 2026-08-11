@@ -164,7 +164,7 @@ class TritonMaskMapBackend:
         overflow_flag = torch.zeros((1,), dtype=torch.int32)
 
         # Must be an upper bound: the kernel stores at dst row without clamping.
-        if num_permuted_tokens > 0:
+        if num_permuted_tokens >= 0:
             num_permuted = int(num_permuted_tokens)
         else:
             num_permuted = int(tokens_per_expert.sum().item())
@@ -303,7 +303,7 @@ class TurboBackend:
             )
         )
 
-        if num_permuted_tokens > 0:
+        if num_permuted_tokens >= 0:
             num_permuted = int(num_permuted_tokens)
         else:
             num_permuted = int(tokens_per_expert.sum().item())
@@ -520,8 +520,10 @@ def _moe_permute_preprocess_meta(
         overflow_flag = torch.empty((1,), dtype=torch.int32, device=device)
         num_dispatched_tokens = torch.empty((1,), dtype=torch.int32, device=device)
 
+    if num_tokens == 0:
+        num_permuted = 0
     # Only the caller-provided capacity is known at trace time.
-    if num_permuted_tokens > 0:
+    elif num_permuted_tokens >= 0:
         num_permuted = num_permuted_tokens
     else:
         num_permuted = torch.library.get_ctx().new_dynamic_size()
