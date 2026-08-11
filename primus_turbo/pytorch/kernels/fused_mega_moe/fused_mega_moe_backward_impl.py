@@ -11,7 +11,9 @@ from typing import List, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from primus_turbo.flydsl.gemm.gemm_bf16_kernel import grouped_gemm_variable_k_bf16
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_flydsl_kernel,
+)
 from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
@@ -99,7 +101,7 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
             num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
         )
 
-        dW2 = grouped_gemm_variable_k_bf16(
+        dW2 = grouped_gemm_bf16_variable_k_flydsl_kernel(
             dispatch_l2_grad,
             act_weighted,
             num_tokens_per_expert_prefix,
