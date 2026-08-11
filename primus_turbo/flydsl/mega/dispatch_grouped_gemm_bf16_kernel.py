@@ -22,7 +22,9 @@ from flydsl.expr.typing import AddressSpace, PointerType
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
-    gemm_bf16_variable_k_tile,
+)
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_tile,
 )
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
     dispatch_prologue_flydsl_kernel,
@@ -219,7 +221,7 @@ def _make_kernel(
                     gemm_a, gemm_b, rt_m, rt_n = WEIGHTS, pool_tensor, out_n_rt, out_m_rt
                 else:
                     gemm_a, gemm_b, rt_m, rt_n = pool_tensor, WEIGHTS, out_m_rt, out_n_rt
-                gemm_bf16_variable_k_tile(
+                grouped_gemm_bf16_variable_k_tile(
                     gemm_a,
                     gemm_b,
                     OUTPUT,
@@ -271,19 +273,23 @@ def _make_kernel(
                         signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
 
-                gbase = g_idx * fx.Int32(K) * c_n
-                # A base = dispatch_token_pool (int64 symm addr); C base = OUTPUT tensor.
+                # A base = dispatch_token_pool (int64 symm addr); B/C base = WEIGHTS/OUTPUT tensors.
                 out_base = fx.arith.ArithValue(
                     arith.index_cast(fx.T.i64(), extract_base_index(OUTPUT)), signed=True
                 )
-                # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
+                w_base = fx.arith.ArithValue(
+                    arith.index_cast(fx.T.i64(), extract_base_index(WEIGHTS)), signed=True
+                )
+                # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A/B: precise bound; C: HW num_records via 0x40000000.
                 a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
+                b_off = cast(g_idx, fx.T.i64()) * fx.Int64(K * out_features * 2)
                 c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
                 A_tile = make_bf16_fp16_tile_tensor(dispatch_token_pool_base, a_off, BLOCK_M * K)
+                B_tile = make_bf16_fp16_tile_tensor(w_base, b_off, K * out_features)
                 C_tile = make_bf16_fp16_tile_tensor(out_base, c_off, 0x40000000)
                 gemm_tile(
                     A_tile,
-                    WEIGHTS,
+                    B_tile,
                     C_tile,
                     fx.Int32(BLOCK_M),
                     c_n,
@@ -295,7 +301,6 @@ def _make_kernel(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
-                    b_group_base=gbase,
                 )
 
     grid_size = num_dispatch_cu + (TOTAL if is_tn else worst_case_tiles * n_blocks)
@@ -496,7 +501,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     hidden_size = x.size(1)
     num_max_pool_tokens = int(symm.num_max_pool_tokens)
     dummy_i32 = get_dummy_tensor()
-    x_i32 = x.contiguous().view(torch.int32).view(-1)
+    x_i32 = x.contiguous().view(torch.int32)
 
     assert layout in ("nt", "nn", "tn"), f"unsupported layout {layout}"
     out_fp16 = out_dtype == torch.float16
@@ -517,7 +522,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         G = num_tokens_per_expert_prefix.numel() - 1
         out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)
         output = torch.empty(out_shape, device=x.device, dtype=out_dtype)
-        weight_arg, output_arg = rhs.contiguous(), output.view(-1)
+        weight_arg, output_arg = rhs.contiguous(), flyc.from_torch_tensor(output)
         # Bound the wgrad K-contraction to each expert's REAL (unpadded) token count so the
         # GEMM never reads stale block-padding rows (the dW1 floor). real[e] = sum over source
         # ranks of the combine recv counts (seg = e*num_ranks + src). Passed via the TILE arg,
@@ -530,13 +535,13 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     else:
         if layout == "nt":
             G, N, K = l1_weights.shape
-            weight_flat = l1_weights.reshape(G * N, K).contiguous().view(-1)
+            weight_flat = l1_weights.reshape(G * N, K).contiguous()
         else:
             G, K, N = l1_weights.shape
-            weight_flat = l1_weights.reshape(G * K, N).contiguous().view(-1)
+            weight_flat = l1_weights.reshape(G * K, N).contiguous()
         assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
         output = torch.empty((num_max_pool_tokens, N), dtype=x.dtype, device=x.device)
-        weight_arg, output_arg = weight_flat, output
+        weight_arg, output_arg = flyc.from_torch_tensor(weight_flat), output
         tile_arg, num_tile_arg, group_offs_arg = tile_to_expert, num_tile_blocks, dummy_i32
         c_n, out_m_rt, out_n_rt = N, 0, 0
         out_features_ce, hidden_size_ce = N, hidden_size

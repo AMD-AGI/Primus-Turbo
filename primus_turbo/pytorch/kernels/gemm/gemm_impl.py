@@ -10,6 +10,7 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -109,8 +110,8 @@ def gemm_impl(
     trans_c: bool,
     default_backend: int,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.BF16_FP16_FP32)
 
     kwargs = dict(
         a=a,
@@ -121,7 +122,7 @@ def gemm_impl(
         trans_c=trans_c,
     )
 
-    return GEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GEMMKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
 
 
 @gemm_impl.register_fake

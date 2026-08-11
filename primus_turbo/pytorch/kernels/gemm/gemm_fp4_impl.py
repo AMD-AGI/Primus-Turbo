@@ -14,6 +14,7 @@ from primus_turbo.common.aiter_utils import get_aiter
 from primus_turbo.flydsl.gemm.gemm_mxfp4_kernel import gemm_mxfp4_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -22,7 +23,7 @@ from primus_turbo.pytorch.core.backend import (
     TuneCache,
 )
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float4_e2m1fn_x2
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950
 
 
 def ceil_div(a, b):
@@ -84,6 +85,7 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
             return False
 
         supported = True
+        supported &= not is_gfx942()
         # check ScalingGranularity
         supported &= granularity in GEMMFP4HipBLASLtBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -156,6 +158,8 @@ class GEMMFP4AITERBackend(KernelBackend):
     ) -> bool:
         del preshuffled  # AITER handles both layouts
         supported = True
+        # TODO(ruibin): add gfx1250 support for aiter backend.
+        supported &= is_gfx950()
         # check ScalingGranularity
         supported &= granularity in GEMMFP4AITERBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -243,7 +247,7 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
 
         supported = True
         # gfx950 (CDNA4) only: mfma_scale_f32_16x16x128_f8f6f4 is absent below.
-        supported &= get_device_compute_capability() >= (9, 5)
+        supported &= is_gfx950()
         supported &= granularity in GEMMFP4FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= a.ndim == 2 and b.ndim == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP4FlyDSLBackend.SUPPORTED_DTYPES
@@ -319,8 +323,8 @@ def gemm_fp4_impl(
     default_backend: int,
     preshuffled: bool = False,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.FP4)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP4)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -336,7 +340,7 @@ def gemm_fp4_impl(
         preshuffled=preshuffled,
     )
 
-    return GEMMFP4KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GEMMFP4KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
 
 
 @gemm_fp4_impl.register_fake

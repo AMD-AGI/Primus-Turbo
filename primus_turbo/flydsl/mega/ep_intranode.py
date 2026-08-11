@@ -81,7 +81,7 @@ def dispatch_bf16_tile(
             hidden_bytes,
             dst_off=dest_row * fx.Int32(hidden_i32),
             src_off=source_row * fx.Int32(hidden_i32),
-            load_cache_modifier=19,
+            load_cache_modifier=18,  # sc1|nt: read data produced by the same agent.
             store_cache_modifier=19,
         )
 
@@ -169,7 +169,7 @@ def combine_bf16_tile(
             bank = fx.Int32(0) if bank_offset is None else bank_offset
             # Wait for CM19 payload stores before publishing the relaxed completion flag.
             fx.rocdl.s_waitcnt(0)
-            st(barrier_addr, bank + slot, epoch, order="relaxed", scope="sys")
+            st(barrier_addr, bank + slot, epoch, scope="sys")
 
 
 @ASTRewriter.transform
@@ -217,7 +217,6 @@ def topk_reduce_bf16_tile(
                             flag = ld(
                                 barrier_base,
                                 reduce_bank + slot,
-                                order="relaxed",
                                 scope="sys",
                                 dtype=fx.T.i64(),
                             )
@@ -244,7 +243,6 @@ def topk_reduce_bf16_tile(
                                 flag = ld(
                                     barrier_base,
                                     reduce_bank + slot,
-                                    order="relaxed",
                                     scope="sys",
                                     dtype=fx.T.i64(),
                                 )
@@ -281,7 +279,7 @@ def topk_reduce_bf16_tile(
                         token * fx.Int32(topk) + fx.Int32(j),
                         vec_width=1,
                         dtype=fx.T.f32(),
-                        cache_modifier=19,
+                        cache_modifier=18,
                     )
                     for j in range_constexpr(topk)
                 ]

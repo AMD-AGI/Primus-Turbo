@@ -7,6 +7,7 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import (
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -19,7 +20,12 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.core.utils import build_ck, get_device_compute_capability
+from primus_turbo.pytorch.core.utils import (
+    build_ck,
+    is_gfx942,
+    is_gfx950,
+    is_gfx1250,
+)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -81,6 +87,7 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
         supported = True
         # check the CK backend was compiled into this build
         supported &= build_ck()
+        supported &= not is_gfx1250()
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8CKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8CKBackend.SUPPORTED_GRANULARITIES
@@ -145,6 +152,7 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         supported = True
         # check the CK backend was compiled into this build
         supported &= build_ck()
+        supported &= not is_gfx1250()
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_GRANULARITIES
@@ -362,6 +370,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         else:
             # MXFP8: both operands must be fp8 (e4m3/e5m2) — the kernel infers the
             # format from a.dtype — and the layout is NT only (trans_b=True).
+            supported &= not is_gfx942()
             supported &= a.dtype in (float8_e4m3, float8_e5m2)
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
@@ -466,7 +475,7 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
         supported &= granularity in GroupedGEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
         # gfx950 (CDNA4) only: kernel uses mfma[_scale]_f32_16x16x128_f8f6f4.
-        supported &= get_device_compute_capability() >= (9, 5)
+        supported &= is_gfx950()
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # NT only; per-1x32 raw E8M0 scales; K % 128 == 0 and K >= 256.
@@ -604,6 +613,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         else:
             # MXFP8 variable-K wgrad: both operands fp8 (e4m3/e5m2), and the kernel
             # expects the non-transposed (OUT_M, M_total) / (OUT_N, M_total) layout.
+            supported &= not is_gfx942()
             supported &= a.dtype in (float8_e4m3, float8_e5m2)
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
@@ -713,7 +723,7 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
         # gfx950 (CDNA4) only: kernel uses mfma[_scale]_f32_16x16x128_f8f6f4.
-        supported &= get_device_compute_capability() >= (9, 5)
+        supported &= is_gfx950()
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # MXFP8 wgrad: non-transposed operands (TN), contraction M_total % 128 == 0.
@@ -835,8 +845,8 @@ def grouped_gemm_fp8_impl(
     maybe_pre_sync: bool = False,
     group_offs_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -855,7 +865,7 @@ def grouped_gemm_fp8_impl(
         group_offs_out=group_offs_out,
     )
 
-    out = GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
     # Over-allocated output: zero the unwritten tail past the tight write bound
     # (group_offs_out for MX; group_offs otherwise) so the caller's [:total_m]
     # slice never exposes uninitialized rows.
@@ -882,8 +892,8 @@ def grouped_gemm_fp8_variable_k_impl(
     default_backend: int,
     maybe_pre_sync: bool = False,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -902,7 +912,9 @@ def grouped_gemm_fp8_variable_k_impl(
         maybe_pre_sync=maybe_pre_sync,
     )
 
-    return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, **kwargs
+    )
 
 
 @grouped_gemm_fp8_impl.register_fake
