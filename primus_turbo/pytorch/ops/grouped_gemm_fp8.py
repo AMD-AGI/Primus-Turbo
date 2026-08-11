@@ -62,7 +62,8 @@ def _fused_wgrad_enabled() -> bool:
     # The current fused accumulation entry writes through a Triton-only
     # out/beta kernel. Keep FlyDSL on its native variable-K wgrad dispatcher
     # until that kernel supports writing directly into main_grad.
-    return GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8) != BackendType.FLYDSL
+    backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    return backend_choice is None or backend_choice.backend != BackendType.FLYDSL
 
 
 def _resolve_main_grad_view(weight_param, target_shape):
