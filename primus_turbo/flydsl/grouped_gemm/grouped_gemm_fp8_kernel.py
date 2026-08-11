@@ -2203,6 +2203,9 @@ _NP_8WAVE_CANDS = ((256, 8, 4, 0), (256, 8, 8, 0))
 # The online race cannot find it: it scores on synthetic *balanced* tensors, where this arm
 # ties xcd8_gm4, but the real skewed deployed distributions separate them.
 _NP_STATIC_CAND = (256, 4, 8, 0)
+_NP_DRAM_WIDE_CAND = (256, 4, 4, 0)
+_NP_DRAM_NARROW_CAND = (256, 8, 4, 0)
+_NP_B_LLC = 256 << 20
 # xcd1 (group-major, B[g] L2-resident) only pays off for large B[g]; K>=4096 is the observed crossover.
 _NP_LARGE_K = 4096
 _NP_PM_CANON = (1024, 8192)
@@ -2297,6 +2300,9 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
         cands = list(_NP_8WAVE_CANDS)
         if N <= K and K >= _NP_LARGE_K:
             cands.append((256, 1, 4, 0))
+        elif G * N * K > _NP_B_LLC:
+            lead = _NP_DRAM_WIDE_CAND if N > K else _NP_DRAM_NARROW_CAND
+            cands = [lead] + [c for c in cands if c != lead] + [_NP_STATIC_CAND]
         else:
             cands.insert(0, _NP_STATIC_CAND)
     else:
@@ -3506,6 +3512,7 @@ def _wave4_do_tile_tn(
         trans=swap_n,
         col_safe=col_safe and not swap_n,
         c_base=store_base,
+        row_addr=True,
     )
     _common = dict(
         a_g2s=a_g2s,
@@ -3843,7 +3850,8 @@ def _compile_grouped_tn_wgrad_4wave(
     xcd_rot: bool = True,
     vmcnt_hint: int = 2,
     cap_cu: int = -1,
-    half_bnd: int = 3,
+    half_bnd: int = -1,
+    split_k: bool = True,
 ):
     """4-wave (occ=1) grouped TN wgrad dW[g]=A[g]^T@B[g], variable-K per group. 256x256
     whole-loop bare-asm body: runtime nval (floored to x6) + in-asm fused tail; partial
@@ -3901,7 +3909,9 @@ def _compile_grouped_tn_wgrad_4wave(
     # dispatch segment recovers nothing: a one-block-thick strip has no second block to share an
     # operand slab with, so it reads its whole B (M row) or A (N column) from DRAM instead of reusing
     # it inside the 2D run. half_bnd is the (1 = M, 2 = N) enable mask.
-    _HALF_M = bool(half_bnd & 1) and TOTAL < _WGRAD_AFF_ROUNDS * _NCU and 0 < OUT_M % BLOCK_M <= BLOCK_M // 2
+    _BND_GATED = half_bnd < 0 and TOTAL >= _WGRAD_AFF_ROUNDS * _NCU
+    _BND_MASK = 3 if half_bnd < 0 else half_bnd
+    _HALF_M = bool(_BND_MASK & 1) and not _BND_GATED and 0 < OUT_M % BLOCK_M <= BLOCK_M // 2
     _WAVE_N = BLOCK_N // LDS_BLOCK_N
     _N_REM = OUT_N % BLOCK_N if 0 < OUT_N % BLOCK_N <= LDS_BLOCK_N else 0
     # The short N body drops _BND_COLS columns off one N-block in N_BLOCKS_N, buying that fraction
@@ -3910,9 +3920,9 @@ def _compile_grouped_tn_wgrad_4wave(
     # is not on the wall (see _HALF_M).
     _BND_COLS = BLOCK_N - _wgrad_bnd_ntb(_N_REM, _WAVE_N, N_TILES_B) * _WAVE_N * 16
     _HALF_N = (
-        bool(half_bnd & 2)
+        bool(_BND_MASK & 2)
         and _N_REM > 0
-        and (TOTAL < _WGRAD_AFF_ROUNDS * _NCU or _BND_COLS * _WGRAD_BND_PHASE_INV > N_BLOCKS_N * BLOCK_N)
+        and (not _BND_GATED or _BND_COLS * _WGRAD_BND_PHASE_INV > N_BLOCKS_N * BLOCK_N)
     )
     _BND_NTB = _wgrad_bnd_ntb(_N_REM if _HALF_N else 0, _WAVE_N, N_TILES_B)
     # Every stored column is < OUT_N at compile time, so the epilogue per-element OOB select is
@@ -3923,7 +3933,9 @@ def _compile_grouped_tn_wgrad_4wave(
     # _XCD_GP>1 super-block interleaves its gp groups every _XCD_K ids, so any window worth splitting
     # straddles them -- same collision, same exclusion.
     _S_MAX, _S_A, _S_B, _N_MAX, _SP_EXT = (
-        _wgrad_split_geom(TILES_PER_GROUP, TOTAL, _NCU) if num_xcd <= 1 and _XCD_GP <= 1 else (1, 1, 1, 0, 0)
+        _wgrad_split_geom(TILES_PER_GROUP, TOTAL, _NCU)
+        if split_k and num_xcd <= 1 and _XCD_GP <= 1
+        else (1, 1, 1, 0, 0)
     )
     _SPLIT = _S_MAX > 1
     _SP_POW2 = _wgrad_split_rcp_cfg(TILES_PER_GROUP, _S_A, _S_B, _NCU)[0]
@@ -4050,7 +4062,6 @@ def _compile_grouped_tn_wgrad_4wave(
                 WS=WS,
             )
 
-        # Persistent: fixed grid of <=ncus WGs strides the tile space. Boundary M-/N-block with <=128 valid rows/cols runs the a0-/b0-only whole-loop (predicates wave-uniform, bodies have s_barrier).
         if const_expr(_SPLIT):
             _sp_lo, _sp_n, _sp_s, _sp_code = _wgrad_split_policy(
                 go_div, G, TILES_PER_GROUP, TOTAL, BLOCK_K, _NCU, _S_A, _S_B
@@ -4197,13 +4208,7 @@ def _compile_grouped_tn_wgrad_4wave(
                     )
                 _buffer_ops.buffer_store(arith.trunc_f(outv, acc), rs_c, off, mask=col_ok)
 
-    # One tile per WG (grid=TOTAL): finest HW-scheduler backfill of the long-K skew tail; a freed CU grabs the next tile so the wall drops to total_work/#CU. PT_WL_GRIDMUL caps the grid.
-    # Both the grid and the launch attrs depend only on factory-scope constants, so resolve them
-    # once here: re-deriving them per call put a device query, an environ read and an arith.select
-    # over two literals on the launch path, and the caller times the dispatch with cuda events.
-    _CAP_CU = _NCU if cap_cu <= 0 else min(int(cap_cu), _NCU)
-    _GRID_MUL = int(os.environ.get("PT_WL_GRIDMUL", "0"))
-    _GRID_X = _GRID_EXT if _GRID_MUL <= 0 else min(_GRID_EXT, _CAP_CU * _GRID_MUL)
+    _GRID_X = _GRID_EXT if cap_cu <= 0 else min(_GRID_EXT, int(cap_cu), _NCU)
     _ATTRS = make_value_attrs(1, 0, "256,256")
 
     @flyc.jit
@@ -4346,20 +4351,26 @@ def _wgrad_4wave_cands(OUT_M, OUT_N, G, ncu, block=256):
     head = (4, 4) if tiles_per_group > ncu else (4, 2)
     band = tuple(sorted(_WGRAD_4WAVE_CANDS, key=lambda c: c[:2] != head))
     deep = G * tiles_per_group >= _WGRAD_AFF_ROUNDS * ncu
+    xcd_k = _wgrad_xcd_span(tiles_per_group, G, ncu)[1]
     aff = (
         None
         if not deep and _wgrad_band_is_xcd_aff(n_blocks_m, n_blocks_n, *head)
-        else _wgrad_xcd_aff_geom(
-            n_blocks_m,
-            n_blocks_n,
-            tiles_per_group,
-            _wgrad_xcd_span(tiles_per_group, G, ncu)[1],
-        )
+        else _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, xcd_k)
     )
     if aff is None:
-        return band
-    aff_c = (aff[0], aff[1], 1, 1)
-    return (aff_c,) + band[:3] if deep else band + (aff_c,)
+        geom = band
+    else:
+        aff_c = (aff[0], aff[1], 1, 1)
+        geom = (aff_c,) + band[:3] if deep and aff != (1, 1) else band + (aff_c,)
+    cands = tuple(c + (-1, True) for c in geom)
+    if not deep:
+        return cands
+    cands += tuple(c[:4] + (3, False) for c in cands[:2])
+    if aff is not None and aff != (1, 1):
+        h = 2 * aff[0]
+        if n_blocks_m % h == 0 and h * aff[1] <= tiles_per_group // xcd_k:
+            cands = ((h, aff[1], 1, 1, 3, True),) + cands
+    return cands
 
 
 def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_traverse=False):
@@ -4403,7 +4414,7 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
     _ncu = torch.cuda.get_device_properties(lhs_live.device).multi_processor_count
     wave4_cands = _wgrad_4wave_cands(OUT_M, OUT_N, G, _ncu)
 
-    def _compile_4wave(gm, gn, xcd, aff):
+    def _compile_4wave(gm, gn, xcd, aff, half, split):
         return _compile_grouped_tn_wgrad_4wave(
             OUT_M=OUT_M,
             OUT_N=OUT_N,
@@ -4415,6 +4426,8 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
             group_m=gm,
             group_n=gn,
             xcd_aff=bool(aff),
+            half_bnd=half,
+            split_k=split,
         )
 
     # Correctness reference: the first 4-wave candidate; masked kernel only as a compile/NaN fallback for i64 huge shapes.
@@ -4422,8 +4435,8 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
     prod_tag = None
     if not i64_traverse:
         try:
-            gm0, gn0, xcd0, aff0 = wave4_cands[0]
-            cand = _compile_4wave(gm0, gn0, xcd0, aff0)
+            gm0, gn0, xcd0, aff0, hb0, sp0 = wave4_cands[0]
+            cand = _compile_4wave(gm0, gn0, xcd0, aff0, hb0, sp0)
             ok = True
             for mp in mps:
                 cand(*mp[0])
@@ -4469,14 +4482,16 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
         return worst
 
     best_l, best_s = prod, _score(prod)
+    # Freeze the hysteresis bar off the initial best so candidate order cannot pick the winner.
+    bar = best_s * 0.985
     race = wave4_cands if prod_tag == "masked-fallback" else wave4_cands[1:]
-    for gm, gn, xcd, aff in race:
+    for gm, gn, xcd, aff, half, split in race:
         try:
-            l = _compile_4wave(gm, gn, xcd, aff)
+            l = _compile_4wave(gm, gn, xcd, aff, half, split)
         except Exception:
             continue
         s = _score(l)  # numeric guard folded in: None -> skip
-        if s is not None and s < best_s * 0.985:
+        if s is not None and s < min(best_s, bar):
             best_l, best_s = l, s
     return best_l
 

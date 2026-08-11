@@ -424,7 +424,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             and a.shape[-1] >= 129
         )
         if _kpad:
-            from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
                 grouped_gemm_fp8_tensorwise_flydsl_kernel,
             )
             from primus_turbo.pytorch.kernels.quantization.quantization_impl import (

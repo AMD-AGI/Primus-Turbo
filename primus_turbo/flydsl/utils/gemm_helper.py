@@ -769,6 +769,10 @@ class StoreCPerTensor:
     ``c_base``: byte base index overriding the one extracted from ``C``, so a caller can
     steer a tile's store to a second buffer of the same row pitch (the split-K wgrad
     slices write a scratch band instead of C). Wave-uniform; it lands in the band SRD.
+
+    ``row_addr``: hoist the store address to one register per output row, leave the column
+    step to the buffer offset field, and convert a fragment before storing any of it -- see
+    store().
     """
 
     def __init__(
@@ -787,10 +791,12 @@ class StoreCPerTensor:
         store_aux=0,
         trans=False,
         c_base=None,
+        row_addr=False,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.col_safe = col_safe
+        self.row_addr = row_addr
         # trans: transposed scalar store for the A/B-swapped wgrad swap_n boundary body (frag row=N, col=M, written C[m,n]); square OUT_M==OUT_N tiles only.
         self.trans = trans
         self.store_aux = store_aux
@@ -838,6 +844,14 @@ class StoreCPerTensor:
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
+            row_byte = (
+                [
+                    (row_local + i) * self.c_cols * 2 + (base_col + self.lane_id % 16) * 2
+                    for i in range_constexpr(4)
+                ]
+                if self.row_addr
+                else None
+            )
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
                 col_valid = None if self.col_safe else col < self.c_cols
@@ -845,14 +859,27 @@ class StoreCPerTensor:
                 # Whole-fragment scale: the wave-uniform per-tensor scale packs to v_pk_mul_f32, bit-identical to the per-element form.
                 if self.scaled:
                     vec_f32 = vec_f32 * scale
+                burst = []
                 for i in range_constexpr(4):
                     val = vec_f32[i]
                     if self.elem_fn is not None:
                         val = self.elem_fn(val)  # bias/act epilogue node chain
                     val = val.to(self.out_ty)
+                    if self.row_addr:
+                        burst.append(val)
+                        continue
                     off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
                     _buffer_ops.buffer_store(
                         val, rsrc, off, mask=col_valid, cache_modifier=self.store_aux, offset_is_bytes=True
+                    )
+                for i, val in enumerate(burst):
+                    _buffer_ops.buffer_store(
+                        val,
+                        rsrc,
+                        row_byte[i] + tj * 32,
+                        mask=col_valid,
+                        cache_modifier=self.store_aux,
+                        offset_is_bytes=True,
                     )
 
     def _store_trans(self, c_frag, base_row, base_col, scale):
