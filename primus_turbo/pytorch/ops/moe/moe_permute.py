@@ -120,10 +120,9 @@ class _MoEPermute(torch.autograd.Function):
         ctx.use_fp8 = use_fp8
         ctx.has_probs = probs is not None
         ctx.probs_topk_stride = input_probs_topk_stride
-        ctx.indices_position_map = indices_position_map
         ctx.tokens_dtype = tokens.dtype
         # Kept only for backward; the dispatched-token bound is not public API.
-        ctx.save_for_backward(row_id_map, num_dispatched_tokens)
+        ctx.save_for_backward(row_id_map, num_dispatched_tokens, indices_position_map)
         return (
             permuted_tokens,
             row_id_map,
@@ -143,7 +142,7 @@ class _MoEPermute(torch.autograd.Function):
         permuted_scaling_factor_grad: Optional[torch.Tensor],
         permuted_probs_grad: Optional[torch.Tensor],
     ):
-        row_id_map, num_dispatched_tokens = ctx.saved_tensors
+        row_id_map, num_dispatched_tokens, indices_position_map = ctx.saved_tensors
         # None when only the probs output was used; the kernel needs a buffer.
         if grad_permuted_tokens is None:
             grad_permuted_tokens = torch.zeros(
@@ -170,7 +169,7 @@ class _MoEPermute(torch.autograd.Function):
             ctx.hidden_size,
             permuted_probs_grad,
             ctx.probs_topk_stride,
-            ctx.indices_position_map,
+            indices_position_map,
         )
 
         return (
@@ -209,6 +208,8 @@ class _MoEUnpermute(torch.autograd.Function):
         # Unused grads reach backward as None, not zeros; dynamo cannot trace this ctx call.
         if not torch.compiler.is_compiling():
             ctx.set_materialize_grads(False)
+
+        probs_topk_stride = int(probs_topk_stride) if permuted_probs is not None else 0
 
         # A 3-D shape would silently unpermute the wrong extent.
         assert len(restore_shape) == 2, (
@@ -334,6 +335,11 @@ def moe_permute(
             raise ValueError("moe_permute: probs_layout='topk' requires num_topk > 0")
         if topk_indices is None:
             raise ValueError("moe_permute: probs_layout='topk' requires topk_indices")
+        if num_topk != int(topk_indices.shape[1]):
+            raise ValueError(
+                f"moe_permute: num_topk={num_topk} disagrees with "
+                f"topk_indices width {int(topk_indices.shape[1])}"
+            )
 
     probs_topk_stride = num_topk if (probs is not None and probs_layout == "topk") else 0
 
@@ -368,6 +374,7 @@ def moe_unpermute(
     permuted_probs: Optional[torch.Tensor] = None,
     probs_topk_stride: int = 0,
     pad_multiple: int = 0,
+    use_fp8: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Unpermute back into ``restore_shape`` using the matching permute backend.
 
@@ -375,7 +382,7 @@ def moe_unpermute(
     TURBO skip the unrouted tail; defaults to ``restore_shape[0]``. TRITON ignores it.
     """
     if backend is None:
-        backend = _default_backend(pad_multiple)
+        backend = _default_backend(pad_multiple, use_fp8)
     if backend is BackendType.TRITON and permuted_probs is not None and probs_topk_stride > 0:
         # Silently switching to TURBO here would read a foreign row_id_map layout.
         raise ValueError(

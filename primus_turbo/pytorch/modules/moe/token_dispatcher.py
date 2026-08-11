@@ -154,6 +154,11 @@ class DeepEPTokenDispatcher(TokenDispatcher):
     ):
         super().__init__(num_experts, router_topk, ep_group, tp_group, tp_ep_group)
 
+        if deepep_num_worst_tokens > 0 and not deepep_use_cuda_num_tokens_per_expert:
+            raise ValueError(
+                "Please set deepep_use_cuda_num_tokens_per_expert=True when use deepep_num_worst_tokens"
+            )
+
         if permute_fusion is not None:
             warnings.warn(
                 "`permute_fusion` is deprecated and ignored: moe_permute is always "
@@ -189,7 +194,6 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.deepep_use_cuda_num_tokens_per_expert = deepep_use_cuda_num_tokens_per_expert
         self.deepep_num_worst_tokens = deepep_num_worst_tokens
 
-
         set_buffer_global_config(
             num_use_cu=deepep_num_use_cu,
             autotune_config=deepep_autotune_config,
@@ -215,8 +219,11 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 f"got {tuple(routing_map.shape)}"
             )
         if token_indices is not None:
-            assert token_indices.dim() == 2 and token_indices.shape[0] == num_tokens, (
-                f"token_indices must be 2D with shape[0]={num_tokens}, got {tuple(token_indices.shape)}"
+            expected_topk = self.router_topk // self.tp_size
+            assert token_indices.shape == (num_tokens, expected_topk), (
+                f"token_indices must have shape [num_tokens={num_tokens}, "
+                f"router_topk={expected_topk}] in the pre-TP-expansion expert space, "
+                f"got {tuple(token_indices.shape)}"
             )
 
         probs = (
@@ -312,6 +319,8 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             num_permuted_tokens = int(self.tokens_per_expert.sum().item())
         elif self.permute_max_token_num > 0:
             num_permuted_tokens = self.permute_max_token_num
+            if self.pad_multiple > 0:
+                num_permuted_tokens += self.num_local_experts * (self.pad_multiple - 1)
         else:
             # Will cause a cpu sync at permute phase.
             num_permuted_tokens = -1
