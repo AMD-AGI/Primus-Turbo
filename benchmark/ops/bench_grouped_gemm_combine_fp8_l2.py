@@ -122,7 +122,7 @@ def profile(group, args):
 
     def _fp8():
         y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-            None, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=tw_f32,
+            w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=tw_f32,
             x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=48,
         )
         return y

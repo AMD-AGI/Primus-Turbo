@@ -123,7 +123,7 @@ def worker(local_rank, world, args):
     r["w2_prep_cached"] = _bench(lambda: _w2_fp8_cached(W2L), warmup=args.warmup, iters=args.iters, group=group)
     r["L2_combine_xfp8"] = _bench(
         lambda: grouped_gemm_combine_mxfp8_flydsl_kernel(
-            None, w2_fp8, list(handle), group,
+            w2_fp8, list(handle), group,
             topk_indices=topk_idx, topk_weights=topk_w,
             x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=CC,
         )[0],

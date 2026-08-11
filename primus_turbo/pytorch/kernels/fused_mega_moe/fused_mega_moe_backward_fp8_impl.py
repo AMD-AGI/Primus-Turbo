@@ -252,7 +252,7 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
     -> ``(dx [num_tokens, H] bf16, grad_topk_weights [num_tokens, num_topk] f32)``."""
     w1tf = w1t_fp8 if w1t_fp8 is not None else _w1t_combine_fp8_cached(w1)
     dx, d_topk_w_flat = grouped_gemm_combine_mxfp8_flydsl_kernel(
-        None, w1tf, list(handle), group,
+        w1tf, list(handle), group,
         topk_indices=topk_idx.contiguous().view(-1), grad_gate=grad_gate,
         x_fp8_rowwise=grad_l1_rowwise_fp8,
         num_combine_cu=28,  # unified w/ fwd L2 (task-based push; T=8192)

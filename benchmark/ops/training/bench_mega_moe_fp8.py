@@ -304,7 +304,7 @@ def profile_l2(group, args, mode):
 
     def _fp8():  # fp8 L2 combine (pre-quant act from fused SwiGLU+mxfp8; no per-call A quant)
         y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-            None, w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=topk_w_f32,
+            w2_fp8, list(handle), group, topk_indices=topk_idx, topk_weights=topk_w_f32,
             x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
         )
         return y
@@ -644,7 +644,7 @@ def profile_fc1_dgrad_combine(group, args, mode):
 
     def _fp8():  # fp8 fc1-dgrad + fp8-PUSH combine (kernel only); grad_gate=... selects the bwd role
         dx, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-            None, w1t_fp8, list(handle), group, topk_indices=tidx64, grad_gate=grad_gate,
+            w1t_fp8, list(handle), group, topk_indices=tidx64, grad_gate=grad_gate,
             x_fp8_rowwise=grad_l1_rowwise, BM=BM, BN=BN, num_combine_cu=cc, num_reduce_cu=rc,
         )
         return dx

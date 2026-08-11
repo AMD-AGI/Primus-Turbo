@@ -699,14 +699,14 @@ _L2Y_FP8_SCRATCH: dict = {}
 
 
 def grouped_gemm_combine_mxfp8_flydsl_kernel(
-    x, weights_fp8, handle, group, *, topk_indices, topk_weights=None, grad_gate=None,
+    weights_fp8, handle, group, *, topk_indices, topk_weights=None, grad_gate=None,
     x_fp8=None, x_fp8_rowwise=None, BM=256, BN=256,
     num_combine_cu=None, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
 ):
     """Unified fp8 grouped mxfp8 GEMM (mxfp8-quant epilogue) + FP8 combine PUSH + FP8-dequant reduce.
     ONE entry for BOTH directions (mirrors bf16 ``grouped_gemm_combine_bf16_flydsl_kernel``); the role
     is inferred from the optional args:
-      * forward L2  (pass ``topk_weights``, no ``grad_gate``): ``x @ w2``, K=I, WEIGHTED reduce
+      * forward L2  (pass ``topk_weights``, no ``grad_gate``): ``act @ w2``, K=I, WEIGHTED reduce
         -> ``y`` [num_tokens, H] bf16 (returned ``d_topk_w`` is None).
       * backward L1 dgrad (pass ``grad_gate``, no ``topk_weights``): ``grad_l1 @ w1^T``, K=2I, UNWEIGHTED
         reduce (routing weight folded upstream) + gate scatter -> ``dx`` [num_tokens, H] bf16 and
@@ -716,14 +716,10 @@ def grouped_gemm_combine_mxfp8_flydsl_kernel(
     once with the op-layer ``prepare_w2_fp8``; fwd on ``w2`` [G,H,I], bwd on ``w1^T`` [G,H,2I]; op-layer
     version-keyed) -- NO weight quant/preshuffle and NO caching here.
 
-    Forward L2 requires ``x_fp8=(act_fp8, a_sp)`` from ``swiglu_mxfp8_flydsl_kernel``; there is
-    no internal A quant on the forward path.
-
-    The backward L1 dgrad requires ``x_fp8_rowwise=(q_row, a_sp)`` from
-    ``swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl`` (fused rowwise quant of ``grad_l1``). Pass
-    ``x=None``; M/K/device come from ``q_row.shape``.
-
-    Forward L2 and the backward L1 dgrad both pass ``x=None`` when ``x_fp8`` / ``x_fp8_rowwise`` is given.
+    The activation arrives pre-quantized too, so there is no A quant on either path: forward L2 takes
+    ``x_fp8=(act_fp8, a_sp)`` from ``swiglu_mxfp8_flydsl_kernel``, and the backward L1 dgrad takes
+    ``x_fp8_rowwise=(q_row, a_sp)`` from ``swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl``. M/K/device come
+    from whichever was given.
 
     Self-resetting: the combine_flag / reduce_flag epoch gates are double-banked + device epoch-bumped,
     so NO host flag reset / rendezvous. Always returns ``(output, d_topk_w)`` (``d_topk_w`` is None in

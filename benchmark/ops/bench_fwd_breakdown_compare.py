@@ -143,7 +143,7 @@ def worker(local_rank, world, args):
 
     fp8["L2"] = _bench(
         lambda: grouped_gemm_combine_mxfp8_flydsl_kernel(
-            None, w2_fp8, list(handle_fp8), group,
+            w2_fp8, list(handle_fp8), group,
             topk_indices=topk_idx, topk_weights=topk_w,
             x_fp8=(act_fp8, act_a_sp), BM=BM, BN=BN, num_combine_cu=CC,
         )[0],

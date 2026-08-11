@@ -57,7 +57,7 @@ def fused_mega_moe_stage2_forward_fp8_impl(
 
     # fused grouped fc2 GEMM + mxfp8 epilogue + fp8 combine PUSH + bf16 topk reduce
     y, _ = grouped_gemm_combine_mxfp8_flydsl_kernel(
-        None, (w2q, w2s), list(handle), group,
+        (w2q, w2s), list(handle), group,
         topk_indices=topk_idx,
         topk_weights=topk_weights if topk_weights.dtype == torch.float32 else topk_weights.to(torch.float32),
         x_fp8=(act_fp8, act_a_sp),
