@@ -34,9 +34,8 @@ def ceildiv(a: int, b: int) -> int:
 
 def ceildiv_pow2(a, b: int):
     """``ceildiv(a, b)`` for a power-of-two ``b`` and a non-negative device value ``a``.
-    Signed ``a // b`` lowers to arith.floordivsi (divide + remainder + sign correction,
-    ~15 ISA ops even for a constant power of two); the shift is one. Use on runtime
-    hot-path values; plain ``ceildiv`` stays for host-side ints."""
+    Signed ``a // b`` lowers to arith.floordivsi (divide + remainder + sign fixup); the shift
+    is one. Use on runtime hot-path values; plain ``ceildiv`` stays for host-side ints."""
     assert b > 0 and (b & (b - 1)) == 0
     return (a + (b - 1)) >> (b.bit_length() - 1)
 
@@ -47,11 +46,8 @@ def _u32(v):
 
 def udiv(a, b):
     """``a // b`` for device values proven non-negative (tile ids, group tile counts).
-
-    Python ``//`` on a device Int32 is arith.floordivsi: a magic multiply *plus* a
-    remainder and a sign fixup (``s_cmp_lg`` + ``s_cselect_b64`` + ``s_and_b64`` +
-    ``s_subb_u32``), ~12 SALU where the unsigned form is 1-3. On the grouped tile-decode
-    chain -- which is what gates a tile's first g2s -- those ops are fully exposed."""
+    Python ``//`` on a device Int32 is arith.floordivsi (magic multiply plus a remainder and
+    sign fixup); the unsigned form is far cheaper on the exposed grouped tile-decode chain."""
     return ArithValue(arith.divui(_u32(a), _u32(b)))
 
 
@@ -62,9 +58,8 @@ def umod(a, b):
 
 def uindex(v):
     """``arith.index_cast(T.index, v)`` for a device value proven non-negative (row/tile/group
-    offsets). The signed cast sign-extends, so every SRD base and extent derived from it carries
-    an ``s_ashr_i32`` plus a 64-bit multiply-and-carry chain; the unsigned cast zero-extends and
-    the high half folds to zero."""
+    offsets). The signed cast sign-extends into every derived SRD base/extent; the unsigned cast
+    zero-extends so the high half folds to zero."""
     return ArithValue(arith.index_castui(T.index, _raw(v)))
 
 
@@ -188,10 +183,9 @@ def make_bf16_rebased_rsrc(arg, base_elems, num_records_bytes):
 
 
 def lds_row_swizzle(row, chunks):
-    """XOR key, in 16B chunks, for a `chunks`-wide LDS row: one ds_read_b64_tr_b8 gathers a
-    single 16B column over the rows {16*a + b : a<4, b<8}, and the key spreads that column
-    over the gfx950 LDS banks. Shared by the g2s write side (swizzle_128) and the transpose
-    read side (S2RLoaderTr._ptr_off) so the two cannot drift apart."""
+    """XOR key, in 16B chunks, for a `chunks`-wide LDS row: it spreads the 16B column one
+    ds_read_b64_tr_b8 gathers across the gfx950 LDS banks. Shared by the g2s write side
+    (swizzle_128) and the transpose read side (S2RLoaderTr._ptr_off) so the two cannot drift."""
     return ((row % 16) // 2) & (chunks - 1)
 
 
@@ -225,20 +219,9 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
 
 
 def compute_global_swizzle_shear(lane_id, wave_id, K, n_rounds, m_row, ksm, up):
-    """compute_global_swizzle(preshuffled=False) with every row's 128B fetch snapped to the
-    cache line that encloses it, for a row pitch whose ``K % 128 == ksm != 0``.
-
-    Row r of the tile starts ``sh = ((m_row + r) * ksm) % 128`` bytes into a line, so its raw
-    128B K-block straddles two lines and costs two L1->L2 requests instead of one. Rounding
-    the fetch window to the line boundary makes it one request; the window then no longer
-    holds the K-block a phase wants, and ``S2RLoaderShear`` puts the two halves back together
-    out of two consecutive windows. ``up=False`` rounds the window down (partner = slot k+1),
-    ``up=True`` rounds it up (partner = slot k-1). ksm must be a multiple of 16 so a 16B read
-    never straddles the window edge.
-
-    Offsets are relative to an A SRD rebased by ``-((m_row * ksm) % 128)``; that keeps every
-    offset non-negative and leaves the unsheared halves addressable with a plain ``+ mbias``.
-    """
+    """compute_global_swizzle(preshuffled=False) with every row's 128B fetch snapped to its
+    enclosing cache line, for a row pitch whose ``K % 128 == ksm != 0`` (raw K-block straddles
+    two lines). ``S2RLoaderShear`` reassembles each K-block from two consecutive windows."""
     assert ksm % 16 == 0 and 0 < ksm < 128
     mbias = (m_row * fx.Int32(ksm)) % fx.Int32(128)
     offsets = []
@@ -272,11 +255,9 @@ class G2SLoader:
         # chunk base across LDS banks to cut transpose-read bank conflicts; the
         # read side (S2RLoaderTr) must use the same value.
         self.chunk_stride = chunk_stride
-        # i64-traversal mode. None -> the contraction K-offset rides the 32-bit
-        # soffset (caps the operand span at < 2^32 fp8). A tuple
-        # (arg_i8, fp8_ir_t, base_elems, num_records_bytes) instead re-bases the
-        # SRD per load: k_offset folds into the i64 descriptor base and soffset
-        # stays 0, lifting the cap at the cost of one re-base per load.
+        # i64-traversal mode. None -> the K-offset rides the 32-bit soffset (caps the operand
+        # span at < 2^32 fp8). A (arg_i8, fp8_ir_t, base_elems, num_records_bytes) tuple re-bases
+        # the SRD per load instead (k_offset folds into the i64 base), lifting the cap.
         self.rebase = rebase
 
     def _src_div(self, k_offset):
@@ -377,21 +358,9 @@ class S2RLoader(_S2RLoaderBase):
 
 
 class S2RLoaderShear(S2RLoader):
-    """S2RLoader twin for an operand fetched with ``compute_global_swizzle_shear``.
-
-    The g2s wrote each row's line-aligned window, displaced from the row's own K-blocks by
-    ``sh = ((m_row + row) * ksm) % 128``. Byte ``col`` of K-block k therefore sits at
-    ``(col + sh) % 128`` of window k, except for the bytes that fell past the window edge --
-    those live in the partner window (k-1 when the g2s rounded up, k+1 when it rounded down).
-    Both LDS pools are already resident, so this costs no extra traffic; pick ``up`` so the
-    partner is the slot the pipeline has already drained.
-
-    ``ksm == 64`` makes the whole splice free: ``sh`` is then 0 or 64, so ``(col + sh) % 128``
-    is ``col ^ sh`` and folds into the XOR bank-swizzle key, and the two 16B steps of a
-    fragment split statically -- step 0 (col < 64) is always the partner window's half and
-    step 1 always the current window's. What is left over the plain ``S2RLoader`` is one
-    ``v_cndmask`` per call to pick the base.
-    """
+    """S2RLoader twin for an operand fetched with ``compute_global_swizzle_shear``: each
+    K-block's bytes are split across window k and its partner (k-1 or k+1 per ``up``), both
+    already resident. ``ksm == 64`` folds the splice into the XOR bank-swizzle key for free."""
 
     def __init__(self, wave_idx, n_tiles, m_row, ksm, up):
         super().__init__(wave_idx, n_tiles)
@@ -558,24 +527,9 @@ class ScaleBComb:
 
 
 class ScaleS2R:
-    """Per-lane E8M0 scale loader for v_mfma_scale_f32_16x16x128 (preshuffled).
-
-    The 16x16x128 MFMA distributes K=128 so lane ``(g, r)`` with
-    ``g = lane//16`` (0..3) and ``r = lane%16`` holds the A/B data for matrix
-    row/col ``r`` and the 32-K micro-block ``g``. With opsel==0 the hardware
-    samples byte 0 of each lane's scale operand, so lane ``(g, r)`` just needs
-    ``scale[r, 4k+g]`` in a register.
-
-    To make that a single fully-coalesced dword load with no per-lane ALU, the
-    host pre-shuffles the raw E8M0 [DIM, K//32] into
-
-        SP[rt, k, lane] = broadcast_u8_to_u32( scale[rt*16 + lane%16, 4k + lane//16] )
-
-    laid out int32 [DIM//16, K//128, 64]. For row-tile ``rt`` and K-iter ``k``
-    the 64 lanes of a wave read 64 contiguous dwords. The A-operand preshuffle
-    (layout 1) is produced by ``build_preshuffle_ab_kernel`` (A region), fused into
-    the mxfp8 GEMM launch.
-    """
+    """Per-lane E8M0 scale loader for v_mfma_scale_f32_16x16x128 (preshuffled). The host
+    pre-shuffles the raw E8M0 [DIM, K//32] so each wave's 64 lanes read 64 contiguous dwords
+    with no per-lane ALU; the A-operand preshuffle comes from ``build_preshuffle_ab_kernel``."""
 
     def __init__(self, sp_tensor, dim, K, n_tiles, pack=1, k128p=None):
         self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
@@ -635,10 +589,9 @@ def _dpp_add_i32(acc, ctrl, row_mask=0xF):
 
 
 def _wave_prefix_add_i32(v):
-    """Wave64 inclusive add-scan of a per-lane i32 (lane l ends with the sum of 0..l).
-
-    Six DPP steps replace the serial carry; bound_ctrl zeroes the shifted-in lanes so
-    no bank_mask trimming is needed. Requires a full EXEC mask (kernel entry)."""
+    """Wave64 inclusive add-scan of a per-lane i32 (lane l ends with the sum of 0..l). Six DPP
+    steps replace the serial carry (bound_ctrl zeroes shifted-in lanes). Requires a full EXEC
+    mask (kernel entry)."""
     for _sh in (1, 2, 4, 8):
         v = _dpp_add_i32(v, _DPP_ROW_SHR + _sh)
     v = _dpp_add_i32(v, _DPP_ROW_BCAST15, row_mask=0xA)
@@ -652,10 +605,9 @@ def _readlane_i32(v, lane):
 
 
 def _wave_count_le_i32(v, bound):
-    """Number of lanes whose per-lane i32 is <= the wave-uniform bound.
-
-    One ballot plus one s_bcnt1; on a monotone table this is the index of the first
-    lane above bound, i.e. an O(1) stand-in for a G-wide boundary compare chain."""
+    """Number of lanes whose per-lane i32 is <= the wave-uniform bound. One ballot plus one
+    s_bcnt1; on a monotone table this is the first lane above bound, an O(1) stand-in for a
+    G-wide boundary compare chain."""
     m = _res_of(rocdl.ballot(res=ir.IntegerType.get_signless(64), pred=_raw(v <= bound)))
     n = _res_of(_llvm.intr_ctpop(m))
     return ArithValue(arith.trunci(T.i32, n))
@@ -667,13 +619,9 @@ def _lane_load_i32(rsrc, idx):
 
 
 def _sload_i32(rsrc, idx):
-    """One wave-uniform i32 read on the scalar path: ``s_buffer_load`` straight into an SGPR.
-
-    ``idx`` is a compile-time i32-element index into the resource. The value never enters the
-    VGPR file, so a consumer chain waits on lgkmcnt instead of parking a ``vmcnt(0)`` drain on
-    the vector path, and the read is served by the scalar cache rather than the vL1D that the
-    g2s stream evicts every tile. (Emitted as the raw intrinsic: `buffer_load(is_scalar=)` is
-    not in every flydsl build.)"""
+    """One wave-uniform i32 read on the scalar path (``s_buffer_load`` into an SGPR). The value
+    never enters the VGPR file, so a consumer waits on lgkmcnt and the read hits the scalar
+    cache, not the g2s-evicted vL1D. (Raw intrinsic: buffer_load(is_scalar=) is not universal.)"""
     i32_t = ir.IntegerType.get_signless(32)
     rsrc_v4 = _llvm.bitcast(
         ir.VectorType.get([4], i32_t), _llvm.ptrtoint(ir.IntegerType.get_signless(128), _raw(rsrc))
@@ -683,9 +631,8 @@ def _sload_i32(rsrc, idx):
 
 
 # SGPR-resident int32 table (entry i in its own SGPR): small-table twin of the lane-resident
-# table above. Lookup is a select chain and the prefix sum is unrolled SALU, both O(n_entries),
-# so it only pays while the table is short -- but it keeps the whole group scan off the vector
-# path: no per-lane gather, no DPP wave scan, no v_readlane -> SALU hazard.
+# table. Lookup/prefix-sum are O(n_entries) SALU, so it pays only while the table is short --
+# but keeps the whole group scan off the vector path (no gather, no DPP scan, no readlane).
 def _sgpr_tbl_load(rsrc, n_entries, stride=1, first=0):
     """Read entries [0, n_entries) of an i32 buffer view into SGPRs; entry i is i32 element
     ``(i + first) * stride``. All loads are in flight under one lgkmcnt."""
@@ -704,11 +651,9 @@ def _sgpr_tbl_scan(tbl):
 
 
 def _sgpr_tbl_pick(bounds, key, tables):
-    """Decode ``key`` against the monotone boundary table ``bounds`` (``bounds[g]`` = first key
-    owned by group g+1) and return one entry per table in ``tables``, all from the owning
-    group. One compare per boundary drives every table's ``s_cselect`` directly -- cheaper than
-    materialising the group index first (count_le + a select chain per table), which pays an
-    extra i1 -> VALU -> readfirstlane round trip just to get the index."""
+    """Decode ``key`` against the monotone boundary table ``bounds`` and return one entry per
+    table in ``tables``, all from the owning group. One compare per boundary drives every
+    ``s_cselect`` directly -- cheaper than materialising the group index first."""
     outs = [t[0] for t in tables]
     for g in range_constexpr(1, len(tables[0])):
         take = key >= bounds[g - 1]
@@ -718,10 +663,8 @@ def _sgpr_tbl_pick(bounds, key, tables):
 
 # Lane-resident int32 table (entry i in lane i%64 of chunk i//64): avoids SGPR overflow past ~64 entries and LDS publish-barrier/ds_read; lookup = one v_readlane, prefix sum = one wave scan.
 def _lane_tbl_load(rsrc, lane, n_entries, stride=1, first=0):
-    """Gather entries [0, n_entries) of an i32 buffer view into lane-resident chunks.
-
-    Entry i is read from i32 element ``(i + first) * stride``; lanes past the buffer
-    bound read 0."""
+    """Gather entries [0, n_entries) of an i32 buffer view into lane-resident chunks. Entry i
+    is read from i32 element ``(i + first) * stride``; lanes past the buffer bound read 0."""
     n_chunk = ceildiv(n_entries, 64)
     return [_lane_load_i32(rsrc, (lane + 64 * c + first) * stride) for c in range_constexpr(n_chunk)]
 
@@ -757,28 +700,9 @@ def _lane_tbl_count_le(tbl, bound):
 
 
 class StoreCPerTensor:
-    """Scalar output store: out = (acc [* a_scale * b_scale]).to(out_ty).
-
-    Shared by the per-tensor GEMM and the mxfp8 GEMM. ``A_scale``/``B_scale`` are
-    optional: when given, both are read once from length-1 buffers and applied
-    uniformly (per-tensor); when ``None`` the scale is already folded into the
-    accumulator by the scaled MMA (mxfp8), so the store is plain. The output is
-    re-based per row band in 64-bit index (int64-safe, M*N > 4GB) via
-    ``make_row_band_resource``; columns past c_cols clamp to an OOB index (HW SRD
-    drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
-
-    ``col_safe``: caller-proven "every column this store touches is < c_cols", which
-    drops the per-store OOB select. Only pass it when the tile's column span is bounded
-    at compile time AND no dead N-quadrant is being dropped by the column clamp.
-
-    ``c_base``: byte base index overriding the one extracted from ``C``, so a caller can
-    steer a tile's store to a second buffer of the same row pitch (the split-K wgrad
-    slices write a scratch band instead of C). Wave-uniform; it lands in the band SRD.
-
-    ``row_addr``: hoist the store address to one register per output row, leave the column
-    step to the buffer offset field, and convert a fragment before storing any of it -- see
-    store().
-    """
+    """Scalar output store: out = (acc [* a_scale * b_scale]).to(out_ty). Shared by the
+    per-tensor and mxfp8 GEMMs; scales optional (folded by the scaled MMA when None). Output
+    re-based per row band in 64-bit index; see col_safe/c_base/row_addr on __init__ below."""
 
     def __init__(
         self,
@@ -829,11 +753,9 @@ class StoreCPerTensor:
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def _scale(self):
-        """a_scale*b_scale, loaded once per emitting block. The quadrant stores share one
-        instance, so without this each of them re-issues both scalar buffer_loads and waits
-        on them before its first multiply -- an exposed round trip per quadrant. Cached per
-        MLIR block: sibling regions (a kernel's boundary-body branches) each get their own
-        load, since a value defined in one does not dominate a use in another."""
+        """a_scale*b_scale, loaded once per emitting block so the quadrant stores share one
+        instance instead of re-issuing both scalar loads. Cached per MLIR block: sibling regions
+        each get their own load, since a value in one does not dominate a use in another."""
         if not self.scaled:
             return None
         blk = ir.InsertionPoint.current.block
@@ -888,10 +810,9 @@ class StoreCPerTensor:
                     )
 
     def _store_trans(self, c_frag, base_row, base_col, scale):
-        """Transposed twin of store() for the A/B-swapped wgrad boundary body. c_frag holds
-        acc[n,m]; frag "row" (ti) -> N index, frag "col" (tj) -> M index. base_row = N origin,
-        base_col = M origin. Band is pinned to the M rows (base_col); columns are N. Same scalar
-        buffer_store path with the same value math -- only the global address is transposed."""
+        """Transposed twin of store() for the A/B-swapped wgrad boundary body: c_frag holds
+        acc[n,m], base_row = N origin, base_col = M origin (band pinned to M rows). Same scalar
+        buffer_store path and value math -- only the global address is transposed."""
         rsrc = make_row_band_resource(self.c_base, base_col, self.c_rows, self.c_cols, 2)
         for ti in range_constexpr(self.n_tiles_a):
             n_local = ti * 16 + (self.lane_id // 16) * 4  # a-side -> N (col within band)
@@ -915,11 +836,8 @@ class StoreCPerTensor:
 
 class StoreCPerTensorCShuffle:
     """CShuffle output store: same value->global-address mapping as StoreCPerTensor
-    (byte-identical) but stages each 16-row sub-tile through per-wave LDS row-major,
-    re-reads it N-contiguous, and emits one vectorized 128b global store per lane
-    (vs 128 column-strided scalar buffer_store_short). Assumes BLOCK_N=256 (EPL=8
-    out_ty/lane=128b) and c_cols % Cc == 0, base_col % Cc == 0 (true for FFN N dims);
-    invalid runs clamp to an OOB element index (HW SRD drop), as the scalar path does."""
+    (byte-identical) but stages each 16-row sub-tile through per-wave LDS, re-reads it
+    N-contiguous, and emits one vectorized 128b global store per lane. Assumes BLOCK_N=256."""
 
     def __init__(
         self,
@@ -952,18 +870,16 @@ class StoreCPerTensorCShuffle:
         self.out_ty = out_ty
         self.Cc = n_tiles_b * 16  # columns in one 16-row shuffle tile
         self.EPL = (16 * self.Cc) // 64  # out_ty elements each lane re-reads (16*Cc rows/cols / 64 lanes)
-        # One coalesced global store is 128 bits = 8 x 16b (buffer_store_dwordx4). If a
-        # lane re-reads more than that (EPL > 8 -- e.g. the 4-wave 2x2 geometry has
-        # n_tiles_b=4 -> Cc=64 -> EPL=16), emit EPL//8 back-to-back 128b stores; EPL==8
-        # (the 8-wave path) is a single store. EPL must be a multiple of 8 and fit in one row.
+        # One coalesced global store is 128 bits = 8 x 16b (buffer_store_dwordx4). A lane
+        # re-reading more than that (EPL > 8) emits EPL//8 back-to-back 128b stores; EPL==8 is a
+        # single store. EPL must be a multiple of 8 and fit in one row.
         self.elems_per_store = 8  # 16b elements packed into one 128b vector store
         assert self.EPL % self.elems_per_store == 0 and self.EPL <= self.Cc, (
             f"CShuffle expects EPL a multiple of 8 within Cc={self.Cc}; got EPL={self.EPL}"
         )
-        # The ds_write_b16 staging + 128b re-read aliases LDS banks. row_pad=0 (default)
-        # keeps the historical behavior. row_pad is an explicit opt-in: the caller must
-        # size its own C_lds_shuffle allocation as n_waves*16*(n_tiles_b*16 + row_pad)
-        # (not just n_tiles_b*16), or this overflows the buffer.
+        # The ds_write_b16 staging + 128b re-read aliases LDS banks; row_pad is an opt-in fix.
+        # The caller must then size C_lds_shuffle as n_waves*16*(n_tiles_b*16 + row_pad), not
+        # just n_tiles_b*16, or this overflows the buffer.
         self.row_stride = self.Cc + row_pad
         self.row_pad = row_pad
         self.wave_lds_elems = 16 * self.row_stride  # per-wave staging (one 16-row tile)
@@ -1112,10 +1028,9 @@ def make_value_attrs(waves_per_eu, agpr_alloc, fwg):
 
 
 def asm_mma_do(a, b, c, mode="2", cbsz=0, blgp=0):
-    """fp8 16x16x128 MFMA via inline asm, to pin the dst register class.
-    mode "2" (=a,v,v,0): accumulator in AGPR (srcA/srcB in VGPR) — separate register
-    files keep dst from aliasing srcA and free the VGPR file. mode "3" (=v,v,v,0): VGPR
-    in-place (D=C, avoids the accvgpr shuffle). mode "1" (=&v,v,v,0): VGPR early-clobber."""
+    """fp8 16x16x128 MFMA via inline asm, to pin the dst register class. mode "2" (=a,v,v,0):
+    accumulator in AGPR, freeing the VGPR file; mode "3" (=v,v,v,0): VGPR in-place (D=C, no
+    accvgpr shuffle); mode "1" (=&v,v,v,0): VGPR early-clobber."""
     v4f32 = ir.VectorType.get([4], ir.F32Type.get())
     cons = {"2": "=a,v,v,0", "3": "=v,v,v,0"}.get(str(mode), "=&v,v,v,0")
     # cbsz/blgp select srcA/srcB fp8 format (0=E4M3, 1=E5M2).
@@ -1145,12 +1060,9 @@ def xcd_remap_pid(pid, total_pids, num_xcd):
 
 
 def xcd_remap_pid_u(pid, total_pids, num_xcd):
-    """``xcd_remap_pid`` on ids proven non-negative: same bijection, unsigned divides.
-
-    Signed ``pid % num_xcd`` / ``pid // num_xcd`` cost a floor-div fixup each -- 19 SALU for
-    num_xcd=4 where the unsigned power-of-two forms are one mask and one shift. Kept as a
-    separate entry point so the signed callers (dense, wgrad, mxfp4/mxfp8 grouped) keep
-    byte-identical ISA."""
+    """``xcd_remap_pid`` on ids proven non-negative: same bijection, unsigned divides (a mask
+    and a shift for pow2 num_xcd, vs a floor-div fixup each on the signed path). A separate
+    entry point so the signed callers keep byte-identical ISA."""
     if num_xcd <= 1:
         return pid
     per_xcd = udiv(total_pids, num_xcd)  # floor
@@ -1227,11 +1139,9 @@ def compute_global_swizzle_nn(lane_id, wave_id, N_out, n_rounds, width=128, wswz
 
 
 class S2RLoaderTr:
-    """LDS -> mfma operand wave-coop transpose load via ds_read_b64_tr_b8.
-    Serves K-major fp8 operands (NN B, TN A and B — their mfma operand byte
-    layouts are identical); the operand is selected by the per-wave coordinate
-    stride tile_stride and the WG wave count n_waves. See _ptr_off for the map.
-    """
+    """LDS -> mfma operand wave-coop transpose load via ds_read_b64_tr_b8. Serves K-major fp8
+    operands (NN B, TN A and B, whose mfma operand byte layouts are identical); the operand is
+    selected by tile_stride and the WG wave count n_waves. See _ptr_off for the map."""
 
     _K_BASE = (0, 8, 64, 72)
 
@@ -1247,11 +1157,9 @@ class S2RLoaderTr:
         width=128,
         wswz=False,
     ):
-        """wave_idx: this wave's index along the transposed coord (wave_n for B, wave_m for
-        A). tile_stride: per-wave coverage. chunk_stride must match the G2S writer.
-        inline_asm issues opaque-asm reads (caller drains via vmcnt_hint, needs
-        agpr_alloc>0). width: this buffer's LDS column span (defaults 128) -- MUST match the
-        paired compute_global_swizzle_nn `width` (see swz_K for why it scales with width)."""
+        """wave_idx: this wave's index along the transposed coord; tile_stride: per-wave
+        coverage; chunk_stride must match the G2S writer. inline_asm issues opaque-asm reads
+        (caller drains via vmcnt_hint). width: LDS column span, MUST match compute_global_swizzle_nn."""
         self.wave_idx = wave_idx
         self.n_tiles = n_tiles
         self.tile_stride = tile_stride
@@ -1395,15 +1303,9 @@ def block_mn(pid, num_pid_m, n_blocks, GM, GN):
 
 
 def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
-    """Buffer resource re-based at this workgroup's row band [base_row, c_rows), in
-    64-bit ``index`` arith, so a 32-bit offset only spans the band (handles outputs
-    whose flat M*N exceeds 2^31 / 4GB). base_row clamped to [0, c_rows] so a
-    partial/fully-OOB last row tile bases 0 records (its stores drop).
-
-    base/num_records are pinned to SGPRs via ``_readfirstlane_i32``: base_row is
-    uniform across a tile's wave but the compiler's divergence analysis lands the
-    SRD in VGPRs, waterfalling every buffer_store. Pinning collapses it to scalar
-    regs (see ``_readfirstlane_i32`` / ``StoreCPerTensor``)."""
+    """Buffer resource re-based at this workgroup's row band [base_row, c_rows) in 64-bit index
+    arith, so a 32-bit offset only spans the band (handles M*N > 2^31). base/num_records are
+    pinned to SGPRs via ``_readfirstlane_i32`` to stop the SRD waterfalling every buffer_store."""
     elem = arith.index(elem_bytes)
     cols_i = _as_index(c_cols)
     row_i = _as_index(base_row)
@@ -1419,9 +1321,8 @@ def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
 
 def make_row_band_resource_div(c_base, base_row, c_rows, c_cols, elem_bytes):
     """Divergent-``base_row`` variant of ``make_row_band_resource`` (each lane owns a distinct
-    row, e.g. the transposed col-major store): same 64-bit re-base but the SRD base is a VGPR
-    so the buffer op WATERFALLS. Use only when ``base_row`` is genuinely per-lane; prefer the
-    SGPR-pinned ``make_row_band_resource`` otherwise. base_row past c_rows -> 0 records (drop)."""
+    row): same 64-bit re-base but the SRD base is a VGPR so the buffer op WATERFALLS. Use only
+    when ``base_row`` is genuinely per-lane; base_row past c_rows -> 0 records (drop)."""
     elem = arith.index(elem_bytes)
     cols_i = _as_index(c_cols)
     row_i = _as_index(base_row)
@@ -1556,17 +1457,9 @@ def _emit_lds_repack(
 
 
 def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256, pack: int = 1):
-    """Build the fused A (layout 1) + B-comb (layout 3) scale-preshuffle @flyc.kernel.
-
-    Returns ``(kern, n_kt)``. ``kern`` is a bare KernelFunction (NOT a launch): the
-    mxfp8 GEMM factory calls it inside its own @flyc.jit so the preshuffle + gemm
-    issue from a single host stub. One workgroup repacks one (group, KT-chunk) of
-    raw E8M0 [DIM, K//32] (viewed int32 [DIM, K128]) into the broadcast int32 layout
-    the gemm's ScaleS2R / ScaleBComb consume; region by block id ([0,a_blocks)->A,
-    rest->B), bid being workgroup-uniform so the branch + its LDS barrier are
-    divergence-free. n_kt = ceildiv(K128, KT) is the per-group block count; the
-    caller sizes the grid as ``a_blocks + b_ngrp * n_kt``.
-    """
+    """Build the fused A (layout 1) + B-comb (layout 3) scale-preshuffle @flyc.kernel. Returns
+    ``(kern, n_kt)`` where kern is a bare KernelFunction the mxfp8 GEMM factory calls inside its
+    own @flyc.jit; one workgroup repacks one (group, KT-chunk) into the layout ScaleS2R consumes."""
     TILE = 64 * KT
     n_kt = ceildiv(K128, KT)
     K128p = ceildiv(K128, pack)  # packed K-groups (PACK scales / dword)
@@ -1611,11 +1504,8 @@ def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256,
     return kern, n_kt
 
 
-# ───────────────────────────────────────────────────────────────────────
-# Reusable bf16 GEMM primitives for the {gemm,grouped_gemm}_bf16_kernel.py pair
-# (mfma 32x32x16 / 16x16x32, tr_b16 loaders, swizzle, store).
-# bf16 counterpart of the fp8 block above.
-# ───────────────────────────────────────────────────────────────────────
+# Reusable bf16 GEMM primitives for the {gemm,grouped_gemm}_bf16_kernel.py pair (mfma
+# 32x32x16 / 16x16x32, tr_b16 loaders, swizzle, store). bf16 counterpart of the fp8 block.
 BLOCK_K = 64  # K depth per LDS tile (exported to the bf16 kernels)
 
 
