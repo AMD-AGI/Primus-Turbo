@@ -221,19 +221,23 @@ at::Tensor shuffle_weight_impl_meta(const at::Tensor weight, at::IntArrayRef lay
 //==================================================================
 
 at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
-                          bool transB, bool transC);
+                          bool transB, bool transC, const double beta,
+                          c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype,
-                               bool transA, bool transB, bool transC);
+                               bool transA, bool transB, bool transC, const double beta,
+                               c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                              bool transB, bool transC, const std::string &granularity);
+                              bool transB, bool transC, const std::string &granularity,
+                              const double beta, c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                                    at::Tensor scaleB_inv, const at::ScalarType out_dtype,
                                    bool transA, bool transB, bool transC,
-                                   const std::string &granularity);
+                                   const std::string &granularity, const double beta,
+                                   c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
@@ -314,23 +318,27 @@ at::Tensor ck_grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at:
 
 at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                   at::Tensor &group_offs, const bool transA, const bool transB,
-                                  const bool pre_sync);
+                                  const bool pre_sync, const double beta,
+                                  c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                        at::Tensor &group_offs, const bool transA, const bool transB,
-                                       const bool pre_sync);
+                                       const bool pre_sync, const double beta,
+                                       c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                       at::Tensor &b_scales, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
                                       at::ScalarType out_dtype, const std::string &granularity,
-                                      const bool pre_sync);
+                                      const bool pre_sync, const double beta,
+                                      c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                            at::Tensor &b_scales, at::Tensor &group_lens,
                                            at::Tensor &group_offs, const bool transA,
                                            const bool transB, at::ScalarType out_dtype,
-                                           const std::string &granularity, const bool pre_sync);
+                                           const std::string &granularity, const bool pre_sync,
+                                           const double beta, c10::optional<at::Tensor> out);
 
 at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 

@@ -12,12 +12,9 @@ from primus_turbo.pytorch.core.backend import (
 )
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
-    Format,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp8_support,
-    float8_e4m3,
-    float8_e5m2,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -26,6 +23,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_impl,
+    grouped_gemm_fp8_variable_k_accum_impl,
     grouped_gemm_fp8_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
@@ -39,27 +37,62 @@ from primus_turbo.pytorch.ops.quantization import (
     grouped_quantize_fp8_with_trans,
     quantize_fp8_with_trans,
 )
+from primus_turbo.pytorch.ops.utils import (
+    _ensure_contiguous_grad_out,
+    _get_dummy_wgrad,
+    _get_fp8_dtype,
+    _setup_fused_grad_accum,
+)
 
 __all__ = [
     "grouped_gemm_fp8",
 ]
 
 
-def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
-    if format == Format.E4M3:
-        return float8_e4m3
-    elif format == Format.E5M2:
-        return float8_e5m2
-    elif format == Format.HYBRID:
-        return float8_e4m3 if is_fwd_stage else float8_e5m2
-    else:
-        raise ValueError(f"Unsupported FP8 format: {format}")
+def _grouped_gemm_fp8_variable_k_impl_wrapper(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: Optional[int],
+    default_backend: int,
+    inplace_add_to_out: bool = False,
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked to.
 
+    Returns the weight gradient for autograd, or a dummy buffer when the wgrad went
+    straight into ``out``: forward already flagged the weight, so the training
+    framework's own accumulation step stands down. Megatron still expects a tensor
+    rather than None there, so its backward hooks stay on the main thread; the
+    contents are never read. It is handed back in the weight's own dtype, since a
+    mismatch would make autograd allocate and cast a full-size copy.
+    """
+    inputs = (a, b, a_scales, b_scales, group_lens, group_offs)
+    options = dict(
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        out_dtype=out_dtype,
+        granularity=granularity,
+        num_cu=num_cu,
+        default_backend=default_backend,
+    )
 
-def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
-    # Some upstream reductions can produce expanded zero-stride grad_out views.
-    # Custom grouped GEMM kernels expect dense layouts.
-    return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+    if not inplace_add_to_out:
+        return grouped_gemm_fp8_variable_k_impl(*inputs, **options)
+
+    assert out is not None, "out should not be None when inplace_add_to_out is True"
+    grouped_gemm_fp8_variable_k_accum_impl(*inputs, out=out, **options)
+
+    return _get_dummy_wgrad(out.shape, out_dtype)
 
 
 class FP8GroupedGemmBlockFunc(torch.autograd.Function):
@@ -78,7 +111,10 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         num_cu: int | None,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size in [128], "Only block_size 128 is supported currently."
         if isinstance(a, QuantizedTensor):
@@ -137,6 +173,8 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        ctx.main_grad = main_grad
 
         return out
 
@@ -184,7 +222,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             default_backend=BackendType.TRITON.value,
         )
 
-        grad_b = grouped_gemm_fp8_variable_k_impl(
+        grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             a_fp8_col,
             grad_out_fp8_col,
             a_scale_col,
@@ -198,6 +236,8 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.TRITON.value,
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
+            out=ctx.main_grad,
         )
 
         return (
@@ -211,6 +251,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # num_cu
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -228,7 +269,10 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         num_cu: int | None,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+
         assert config.granularity == ScalingGranularity.ROWWISE
 
         # --- A side: [total_m, k] grouped activation, row-wise scale on axis=-1 (K) ---
@@ -322,6 +366,8 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        ctx.main_grad = main_grad
         return out
 
     @staticmethod
@@ -366,7 +412,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             group_lens=group_lens,
         )
 
-        grad_b = grouped_gemm_fp8_variable_k_impl(
+        grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             a_fp8_col,
             quantized_grad_out_t.qdata,
             a_scale_inv_col,
@@ -380,6 +426,8 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.TRITON.value,
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
+            out=ctx.main_grad,
         )
 
         return (
@@ -393,6 +441,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # num_cu
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -410,7 +459,10 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         num_cu: int | None,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+
         assert config.granularity == ScalingGranularity.TENSORWISE
 
         if isinstance(a, QuantizedTensor):
@@ -472,6 +524,11 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        # Kept off save_for_backward on purpose: the wgrad GEMM writes into this
+        # buffer in place, which would bump the version counter that saved tensors
+        # are checked against.
+        ctx.main_grad = main_grad
 
         return out
 
@@ -505,7 +562,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             default_backend=BackendType.TRITON.value,
         )
 
-        grad_b = grouped_gemm_fp8_variable_k_impl(
+        grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             a_fp8,
             quantized_grad_out.qdata,
             a_scale_inv,
@@ -519,6 +576,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
             default_backend=BackendType.TRITON.value,
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
+            out=ctx.main_grad,
         )
 
         return (
@@ -532,6 +591,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # num_cu
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -561,7 +621,10 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         num_cu: int | None,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+
         supported_mxfp8_backend, reason = check_mxfp8_support()
         assert supported_mxfp8_backend, reason
 
@@ -685,6 +748,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
         ctx.total_m = total_m
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        ctx.main_grad = main_grad
         return out
 
     @staticmethod
@@ -732,7 +797,11 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         grad_a = grad_a[: ctx.total_m]
 
         # wgrad: grad_b[g] = grad_out_col[g] @ a_col[g]^T  (variable-K over colwise-128 M_g)
-        grad_b = grouped_gemm_fp8_variable_k_impl(
+        # FlyDSL is the default for the ordinary path, where it is faster. Its beta=1
+        # epilogue only writes 16-bit, so the fused path defaults to Triton, which also
+        # covers the fp32 main_grad Megatron allocates by default; pin FlyDSL through
+        # GlobalBackendManager when main_grad matches the weight's own bf16/fp16 dtype.
+        grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             grad_out_t_fp8,
             a_fp8_col,
             grad_out_t_scale,
@@ -745,7 +814,9 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.FLYDSL.value,
+            default_backend=(BackendType.TRITON.value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value),
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
+            out=ctx.main_grad,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
         return (
@@ -759,6 +830,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # num_cu
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -781,6 +853,7 @@ def grouped_gemm_fp8(
     out_dtype: Union[torch.dtype, None] = None,
     config: Union[Float8QuantConfig, None] = None,
     num_cu: int | None = None,
+    fuse_bgrad_accum_pattern: Union[None, str] = None,
 ) -> torch.Tensor:
     """Grouped GEMM with FP8 quantization.
 
@@ -836,6 +909,7 @@ def grouped_gemm_fp8(
             out_dtype,
             config,
             num_cu,
+            fuse_bgrad_accum_pattern,
         )
     elif config.granularity == ScalingGranularity.ROWWISE:
         return FP8GroupedGemmRowFunc.apply(
@@ -849,6 +923,7 @@ def grouped_gemm_fp8(
             out_dtype,
             config,
             num_cu,
+            fuse_bgrad_accum_pattern,
         )
     elif config.granularity == ScalingGranularity.BLOCKWISE:
         # BLOCKWISE accepts a pre-quantized 2D-block weight (``b``); the activation
@@ -865,6 +940,7 @@ def grouped_gemm_fp8(
             out_dtype,
             config,
             num_cu,
+            fuse_bgrad_accum_pattern,
         )
     elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
         return FP8GroupedGemmMXFunc.apply(
@@ -878,6 +954,7 @@ def grouped_gemm_fp8(
             out_dtype,
             config,
             num_cu,
+            fuse_bgrad_accum_pattern,
         )
     else:
         raise ValueError(f"Unsupported FP8 ScalingGranularity: {config.granularity}")

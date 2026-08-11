@@ -88,6 +88,8 @@ struct HipblasltGroupedGemmParams {
     hipDataType          c_type;
     std::vector<int64_t> c_shape;
 
+    float beta = 0.0f;
+
     const int64_t *group_lens_ptr = nullptr;
     const int64_t *group_offs_ptr = nullptr;
     bool           transA         = false;

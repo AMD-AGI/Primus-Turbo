@@ -21,10 +21,56 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import gemm_fp4_impl
+from primus_turbo.pytorch.kernels.gemm.gemm_fp4_impl import (
+    gemm_fp4_accum_impl,
+    gemm_fp4_impl,
+)
 from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
+from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, _setup_fused_grad_accum
 
 __all__ = ["gemm_fp4"]
+
+
+def _bgrad_gemm_fp4_impl_wrapper(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    granularity: int,
+    default_backend: int,
+    preshuffled: bool = False,
+    inplace_add_to_out: bool = False,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run the wgrad GEMM, accumulating into ``out`` when asked to.
+
+    Returns the weight gradient for autograd, or a dummy buffer when the wgrad went
+    straight into ``out``: forward already flagged the weight, so the training
+    framework's own accumulation step stands down. Megatron still expects a tensor
+    rather than None there, so its backward hooks stay on the main thread; the
+    contents are never read. It is handed back in the weight's own dtype, since a
+    mismatch would make autograd allocate and cast a full-size copy.
+    """
+    inputs = (a, a_scale_inv, trans_a, b, b_scale_inv, trans_b)
+    options = dict(
+        out_dtype=out_dtype,
+        trans_c=trans_c,
+        granularity=granularity,
+        default_backend=default_backend,
+        preshuffled=preshuffled,
+    )
+
+    if not inplace_add_to_out:
+        return gemm_fp4_impl(*inputs, **options)
+
+    assert out is not None, "out should not be None when inplace_add_to_out is True"
+    gemm_fp4_accum_impl(*inputs, out=out, **options)
+
+    return _get_dummy_wgrad(out.shape, out_dtype)
 
 
 class FP4GemmMXFunction(torch.autograd.Function):
@@ -50,9 +96,12 @@ class FP4GemmMXFunction(torch.autograd.Function):
         trans_b: bool,
         out_dtype: torch.dtype,
         config: Float4QuantConfig,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
         supported_mxfp4_backend, reason = check_mxfp4_support()
         assert supported_mxfp4_backend, reason
+
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         dest_dtype = FP4GemmMXFunction.get_fp4_dtype(
             config.format,
@@ -155,6 +204,8 @@ class FP4GemmMXFunction(torch.autograd.Function):
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
         ctx.config = config
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        ctx.main_grad = main_grad
 
         return out
 
@@ -210,7 +261,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
         )
 
         # NOTE: convert TN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.
-        grad_b = gemm_fp4_impl(
+        grad_b = _bgrad_gemm_fp4_impl_wrapper(
             g_col,
             g_col_scale,
             False,
@@ -222,6 +273,8 @@ class FP4GemmMXFunction(torch.autograd.Function):
             granularity=ctx.config.granularity.value,
             default_backend=default_backend,
             preshuffled=preshuffle,
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
+            out=ctx.main_grad,
         )
 
         return (
@@ -233,6 +286,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             None,  # trans_b
             None,  # out_dtype
             None,  # config
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -251,6 +305,7 @@ def gemm_fp4(
     trans_b: bool = False,
     out_dtype: Union[torch.dtype, None] = None,
     config: Union[Float4QuantConfig, None] = None,
+    fuse_bgrad_accum_pattern: Union[None, str] = None,
 ) -> torch.Tensor:
     """General matrix multiplication (GEMM) with FP4 quantization, supporting autograd.
 
@@ -290,6 +345,11 @@ def gemm_fp4(
         trans_b: Whether to transpose matrix b, if True b shape is (N, K)
         out_dtype: Output data type, defaults to None (auto-inferred)
         config: FP4 quantization config
+        fuse_bgrad_accum_pattern: Enables fusing the weight-gradient accumulation
+            into the wgrad GEMM epilogue, so backward writes ``b.main_grad``
+            directly instead of returning a gradient the framework then adds.
+            ``"megatron"`` is the only supported pattern; ``b`` must carry
+            ``main_grad`` / ``grad_added_to_main_grad``. Defaults to None (no fusion).
 
     Returns:
         torch.Tensor: Output matrix with shape (M, N)
@@ -331,9 +391,13 @@ def gemm_fp4(
     if out_dtype is None:
         out_dtype = torch.promote_types(a_data.dtype, b_data.dtype)
 
+    assert fuse_bgrad_accum_pattern is None, (
+        f"fuse_bgrad_accum_pattern is not supported for FP4, got {config.granularity}"
+    )
+
     if config.granularity == ScalingGranularity.MX_BLOCKWISE:
         return FP4GemmMXFunction.apply(
-            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config
+            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern
         )
     else:
         raise ValueError(f"Unsupported FP4 ScalingGranularity: {config.granularity}")

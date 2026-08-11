@@ -32,6 +32,42 @@ def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def resolve_accum_out(out, beta, shape, device, out_dtype):
+    """Validate an optional caller-owned ``out``, or allocate one.
+
+    ``beta=0.0`` overwrites and is the default; ``beta=1.0`` makes the epilogue
+    accumulate, which only works against a buffer the caller supplies. The store
+    paths bake a 2-byte element into their address arithmetic, so an accumulate
+    target has to be 16-bit and contiguous -- a non-contiguous ``out`` would be
+    silently replaced by a ``.contiguous()`` copy and the accumulation would land
+    nowhere the caller can see.
+    """
+    assert beta in (0.0, 1.0), f"Only beta=0 (overwrite) or beta=1 (accumulate) supported, got {beta}"
+    if out is None:
+        assert beta == 0.0, "beta=1.0 requires an explicit `out` buffer to accumulate into"
+        return torch.empty(shape, device=device, dtype=out_dtype)
+    assert tuple(out.shape) == tuple(shape), f"out shape {tuple(out.shape)} must equal {tuple(shape)}"
+    assert out.dtype in (torch.bfloat16, torch.float16), (
+        f"FlyDSL accumulate epilogue writes bf16/fp16; got out dtype {out.dtype}"
+    )
+    assert out.dtype == out_dtype, f"out dtype {out.dtype} must match out_dtype {out_dtype}"
+    assert out.device == device, "out must be on the same device as the inputs"
+    assert out.is_contiguous(), "out must be contiguous to accumulate in place"
+    return out
+
+
+def compile_with_scratch_out(launch, args, out_index=2):
+    """``flyc.compile`` the launch, with the output argument pointed at a scratch buffer.
+
+    Compilation builds its artifact by running the kernel once (see ``_compile_impl``),
+    which an accumulate (beta=1) build would fold into the caller's buffer as a second
+    GEMM. The artifact is keyed on shapes, not pointers, so compiling against a scratch
+    of the same shape and then calling it on the real buffer runs exactly once.
+    """
+    scratch = torch.zeros_like(args[out_index])
+    return flyc.compile(launch, *args[:out_index], scratch, *args[out_index + 1 :])
+
+
 _PRESHUF_KT = 16  # scale-preshuffle k-tile (rows*KT dwords staged in LDS per workgroup)
 
 
@@ -514,10 +550,26 @@ class StoreCPerTensor:
     re-based per row band in 64-bit index (int64-safe, M*N > 4GB) via
     ``make_row_band_resource``; columns past c_cols clamp to an OOB index (HW SRD
     drop). out_ty bf16/fp16; pass C as 2D so its shape packs within int32.
+
+    ``beta_is_one`` turns the store into an accumulate (``C = C + acc``): each
+    element is read back through the same band SRD, widened to f32 and added
+    before the single rounding to out_ty. Masked-out lanes read OOB (0) and
+    their store is dropped, so the read-back needs no extra bounds logic.
     """
 
     def __init__(
-        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, elem_fn=None
+        self,
+        A_scale,
+        B_scale,
+        C,
+        c_rows,
+        c_cols,
+        c_idx_fn,
+        n_tiles_a,
+        n_tiles_b,
+        out_ty,
+        elem_fn=None,
+        beta_is_one=False,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
@@ -526,6 +578,7 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
+        self.beta_is_one = beta_is_one
         # Optional f32->f32 epilogue node chain (bias/act), post-scale pre-cast.
         self.elem_fn = elem_fn
         self.scaled = A_scale is not None
@@ -542,23 +595,54 @@ class StoreCPerTensor:
         fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
-    def store(self, c_frag, base_row, base_col):
-        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div) if self.scaled else None
-        # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
-        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+    def _addresses(self, base_col):
+        """(element offset, column-valid) per (ti, tj, i), in store order."""
+        out = []
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
                 col_valid = col < self.c_cols
+                for i in range_constexpr(4):
+                    out.append(((row_local + i) * self.c_cols + col, col_valid))
+        return out
+
+    def prefetch(self, base_row, base_col):
+        """Issue this sub-tile's beta=1 read-back; returns the handle ``store`` consumes.
+
+        Kept separate from ``store`` so a caller writing several sub-tiles (see
+        ``_store_quadrants``) can put every load in flight before the first store waits
+        on one -- the epilogue is latency-bound otherwise, not bandwidth-bound.
+        """
+        if not const_expr(self.beta_is_one):
+            return None
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        return [
+            _buffer_ops.buffer_load(rsrc, off_e, vec_width=1, dtype=self.out_ty.ir_type, mask=valid)
+            for off_e, valid in self._addresses(base_col)
+        ]
+
+    def store(self, c_frag, base_row, base_col, prev=None):
+        scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div) if self.scaled else None
+        # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        addrs = self._addresses(base_col)
+        if const_expr(self.beta_is_one) and prev is None:
+            prev = self.prefetch(base_row, base_col)
+        n = 0
+        for ti in range_constexpr(self.n_tiles_a):
+            for tj in range_constexpr(self.n_tiles_b):
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
+                    off_e, col_valid = addrs[n]
                     val = vec_f32[i] * scale if self.scaled else vec_f32[i]
                     if self.elem_fn is not None:
                         val = self.elem_fn(val)  # bias/act epilogue node chain
+                    if const_expr(self.beta_is_one):
+                        val = val + self.out_ty(prev[n]).to(fx.Float32)  # add in f32: one rounding
                     val = val.to(self.out_ty)
-                    off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
-                    _buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
+                    _buffer_ops.buffer_store(val, rsrc, off_e * 2, mask=col_valid, offset_is_bytes=True)
+                    n += 1
 
 
 class StoreCPerTensorCShuffle:
@@ -567,7 +651,10 @@ class StoreCPerTensorCShuffle:
     re-reads it N-contiguous, and emits one vectorized 128b global store per lane
     (vs 128 column-strided scalar buffer_store_short). Assumes BLOCK_N=256 (EPL=8
     out_ty/lane=128b) and c_cols % Cc == 0, base_col % Cc == 0 (true for FFN N dims);
-    invalid runs clamp to an OOB element index (HW SRD drop), as the scalar path does."""
+    invalid runs clamp to an OOB element index (HW SRD drop), as the scalar path does.
+
+    ``beta_is_one`` turns the store into an accumulate (``C = C + acc``) by loading
+    the same 128b run back before storing it; see ``store``."""
 
     def __init__(
         self,
@@ -583,6 +670,7 @@ class StoreCPerTensorCShuffle:
         c_lds,
         wave_id,
         row_pad=0,
+        beta_is_one=False,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
@@ -592,6 +680,7 @@ class StoreCPerTensorCShuffle:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
+        self.beta_is_one = beta_is_one
         self.Cc = n_tiles_b * 16  # columns in one 16-row shuffle tile
         self.EPL = (16 * self.Cc) // 64  # out_ty elements each lane re-reads (16*Cc rows/cols / 64 lanes)
         # One coalesced global store is 128 bits = 8 x 16b (buffer_store_dwordx4). If a
@@ -628,13 +717,67 @@ class StoreCPerTensorCShuffle:
         fx.copy(self.scale_atom_1, fx.slice(div, (None, fx.Int32(0))), self.reg_f32_1)
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
-    def store(self, c_frag, base_row, base_col):
+    def _band(self, base_row, ti, cols_i, rows_i, out_b):
+        """Output SRD re-based (i64) at the 16-row band this sub-tile writes."""
+        band_row = arith.index_cast(T.index, base_row + ti * 16)
+        row_c = arith.minui(band_row, rows_i)
+        band_base = self.c_base + row_c * cols_i * arith.index(out_b)
+        nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0x7FFFFFFF))
+        band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
+        nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
+        return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
+
+    def _runs(self, base_col):
+        """(sub-run column offset, global column, valid) per 128b run, in store order."""
+        row_in = (self.lane_id * self.EPL) // self.Cc
+        col0 = (self.lane_id * self.EPL) % self.Cc
+        runs = []
+        for sub in range_constexpr(self.EPL // self.elems_per_store):
+            col_in = col0 + sub * self.elems_per_store
+            gcol = base_col + col_in
+            runs.append((col_in, gcol, (gcol + fx.Int32(self.elems_per_store)) <= self.c_cols))
+        return row_in, runs
+
+    def prefetch(self, base_row, base_col):
+        """Issue this sub-tile's beta=1 read-back; returns the handle ``store`` consumes.
+
+        The addresses depend only on base_row/base_col, so the loads can go out before
+        the LDS staging runs -- and, via ``_store_quadrants``, before any other
+        sub-tile's store waits on one. A sub-tile only has n_tiles_a runs of them, which
+        is far too few to cover HBM latency on its own.
+        """
+        if not const_expr(self.beta_is_one):
+            return None
+        cols_i = _as_index(self.c_cols)
+        rows_i = _as_index(self.c_rows)
+        row_in, runs = self._runs(base_col)
+        prev = []
+        for ti in range_constexpr(self.n_tiles_a):
+            rsrc_i = self._band(base_row, ti, cols_i, rows_i, 2)
+            for _col_in, gcol, valid in runs:
+                prev.append(
+                    Vec(
+                        _buffer_ops.buffer_load(
+                            rsrc_i,
+                            row_in * self.c_cols + gcol,
+                            vec_width=self.elems_per_store,
+                            dtype=self.out_ty.ir_type,
+                            mask=valid,
+                        )
+                    )
+                )
+        return prev
+
+    def store(self, c_frag, base_row, base_col, prev=None):
         scale = self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div)
         lds_base = fx.Int32(fx.ptrtoint(self.c_lds.ptr))
         wave_off = self.wave_id * self.wave_lds_elems  # element offset of this wave's region
         out_b = 2  # bf16/fp16 = 2 bytes
         cols_i = _as_index(self.c_cols)
         rows_i = _as_index(self.c_rows)
+        if const_expr(self.beta_is_one) and prev is None:
+            prev = self.prefetch(base_row, base_col)
+        n = 0
         for ti in range_constexpr(self.n_tiles_a):
             # --- stage this 16-row sub-tile row-major into the per-wave LDS region ---
             for tj in range_constexpr(self.n_tiles_b):
@@ -649,24 +792,19 @@ class StoreCPerTensorCShuffle:
             S2RLoaderTr._wait_lgkmcnt(0)
             # Re-base output at this 16-row band (i64), re-read N-contiguous (one EPL-col
             # run/lane) + one 128b store at a small in-band i32 offset; band num_records OOB-drops.
-            band_row = arith.index_cast(T.index, base_row + ti * 16)
-            row_c = arith.minui(band_row, rows_i)
-            band_base = self.c_base + row_c * cols_i * arith.index(out_b)
-            nrec = arith.minui((rows_i - row_c) * cols_i * arith.index(out_b), arith.index(0x7FFFFFFF))
-            band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
-            nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
-            rsrc = _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
-            row_in = (self.lane_id * self.EPL) // self.Cc
-            col0 = (self.lane_id * self.EPL) % self.Cc
-            for sub in range_constexpr(self.EPL // self.elems_per_store):
-                col_in = col0 + sub * self.elems_per_store
+            rsrc = self._band(base_row, ti, cols_i, rows_i, out_b)
+            row_in, runs = self._runs(base_col)
+            for col_in, gcol, valid in runs:
                 lane_e = wave_off + row_in * self.row_stride + col_in
                 rptr = fx.inttoptr(self._read_ptr_t, lds_base + lane_e * 2)
                 vec = fx.make_view(rptr, fx.make_layout(self.elems_per_store, 1)).load()
-                gcol = base_col + col_in
-                valid = (gcol + fx.Int32(self.elems_per_store)) <= self.c_cols
-                off = (row_in * self.c_cols + gcol) * out_b  # i32-small within band
-                _buffer_ops.buffer_store(vec, rsrc, off, mask=valid, offset_is_bytes=True)
+                off_e = row_in * self.c_cols + gcol  # elements, i32-small within band
+                if const_expr(self.beta_is_one):
+                    # The staged value is already rounded to out_ty, so the add runs in
+                    # f32 to keep the sum from rounding a second time in the narrow type.
+                    vec = (vec.to(fx.Float32) + prev[n].to(fx.Float32)).to(self.out_ty)
+                    n += 1
+                _buffer_ops.buffer_store(vec, rsrc, off_e * out_b, mask=valid, offset_is_bytes=True)
             S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
 
 

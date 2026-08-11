@@ -44,9 +44,12 @@ import torch
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     ceildiv,
+    compile_with_scratch_out,
     make_fp8_rebased_tensor_and_srd,
     make_row_band_resource,
+    resolve_accum_out,
     wait_barrier,
+    xcd_remap_pid,
 )
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -116,14 +119,16 @@ def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row, swizzle=False):
 def grouped_xcd_pid(pid, c_m, c_n, BLOCK_M, BLOCK_N, group_m=4, num_xcds=8, group_n=0):
     """Map block_idx -> (block_m, block_n) with XCD-aware remap + GROUP_M tiling for
     L2 locality. group_n>0 enables a 2D super-block (N-band) swizzle on top (locks an
-    A-slab AND a B-slab into L2). Pure index math; exact bijection when
-    total_tiles % num_xcds == 0, falls back safely otherwise."""
+    A-slab AND a B-slab into L2). Pure index math, a bijection for any tile count.
+
+    The XCD remap must be exact: one workgroup owns one tile, so a mapping that
+    collides drops whichever tile lost the collision and leaves it at whatever the
+    output allocation happened to hold.
+    """
     num_pid_m = ceildiv(c_m, BLOCK_M)
     num_pid_n = ceildiv(c_n, BLOCK_N)
     total = num_pid_m * num_pid_n
-    pids_per_xcd = (total + num_xcds - 1) // num_xcds
-    pid_r = (pid % num_xcds) * pids_per_xcd + pid // num_xcds
-    pid_r = arith.select(pid_r < total, pid_r, pid)
+    pid_r = xcd_remap_pid(pid, total, num_xcds)
 
     if group_n and group_n > 0:
         band_tiles = num_pid_m * group_n  # tiles in one full band
@@ -208,9 +213,13 @@ class StoreCPlain:
 
     ``out_ty`` is bf16 or fp16 (both 2 bytes). The narrow ``store`` path uses a generic
     f32->out_ty ``.to()`` cast so it serves either; the wide ``store_tacc_wide`` fast
-    path packs through ``_pack_pair``, which serves either too."""
+    path packs through ``_pack_pair``, which serves either too.
 
-    def __init__(self, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty=None):
+    ``beta_is_one`` turns both paths into an accumulate (``C = C + acc``): the value is
+    read back through the same SRD and offset it is about to be stored to, widened to
+    f32 and added. Lanes whose store is masked/OOB read 0, so no extra bounds logic."""
+
+    def __init__(self, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty=None, beta_is_one=False):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
@@ -218,6 +227,7 @@ class StoreCPlain:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty if out_ty is not None else fx.BFloat16
+        self.beta_is_one = beta_is_one
         # int64 byte base: the store re-bases per row band (make_row_band_resource) so a
         # C whose flat rows*cols exceeds 2^31 (large-G wgrad grad_b [G,N,K]) addresses
         # correctly. Pass C as 2D so its shape packs within int32.
@@ -229,16 +239,34 @@ class StoreCPlain:
         # mask cols >= n_valid so the kernel runs the REAL N with no host N-pad.
         _mask = n_valid is not None
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        addrs = []
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
                 col_valid = (col < fx.Int32(n_valid)) if _mask else None
+                for i in range_constexpr(4):
+                    addrs.append(((row_local + i) * self.c_cols + col, col_valid))
+        prev = []
+        if const_expr(self.beta_is_one):
+            # Issue every read-back before the first store: one dependent load per store
+            # would leave the epilogue waiting on memory latency instead of overlapping.
+            prev = [
+                buffer_ops.buffer_load(rsrc, off_e, vec_width=1, dtype=self.out_ty.ir_type, mask=valid)
+                for off_e, valid in addrs
+            ]
+        n = 0
+        for ti in range_constexpr(self.n_tiles_a):
+            for tj in range_constexpr(self.n_tiles_b):
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
-                    val = vec_f32[i].to(self.out_ty)
-                    off = ((row_local + i) * self.c_cols + col) * 2  # i32-small within band
-                    buffer_ops.buffer_store(val, rsrc, off, mask=col_valid, offset_is_bytes=True)
+                    off_e, col_valid = addrs[n]
+                    val = vec_f32[i]
+                    if const_expr(self.beta_is_one):
+                        val = val + self.out_ty(prev[n]).to(fx.Float32)  # add in f32: one rounding
+                    val = val.to(self.out_ty)
+                    buffer_ops.buffer_store(val, rsrc, off_e * 2, mask=col_valid, offset_is_bytes=True)
+                    n += 1
 
     def _pack_pair(self, x0, x1):
         if const_expr(self.out_ty is fx.Float16):
@@ -291,10 +319,10 @@ class StoreCPlain:
         # Hoisted per-lane base byte offset relative to base_row: (base_col + lane%16*c_cols
         # + col_off)*2. Per-store delta (ti*16*c_cols + tj*16)*2 is a compile-time constant ->
         # one v_add per store instead of recomputing r*c_cols (matches AITER's voffset+imm).
-        lane_base = (base_col + (self.lane_id % 16) * self.c_cols + col_off) * fx.Int32(2)
+        lane_base_e = base_col + (self.lane_id % 16) * self.c_cols + col_off
 
-        def _off(ti, tj):
-            return lane_base + fx.Int32((ti * 16 * self.c_cols + tj * 16) * 2)
+        def _off_e(ti, tj):
+            return lane_base_e + fx.Int32(ti * 16 * self.c_cols + tj * 16)
 
         def _xpose(ti, tj):
             A = Vec(c_frag[self.c_idx_fn(ti, tj)])
@@ -311,9 +339,23 @@ class StoreCPlain:
         # permlane16_swap->store RAW hazard (~80 exposed s_nop) is filled by independent
         # permlane work of later tiles instead of stalls.
         slots = [(ti, 2 * p) for ti in range_constexpr(nta) for p in range_constexpr(ntb // 2)]
+        # Read-backs first, then the cvt/permlane work, then the stores: the loads get
+        # the whole phase-1 shuffle to hide behind instead of stalling their own store.
+        prev = (
+            [
+                Vec(buffer_ops.buffer_load(rsrc, _off_e(ti, tj), vec_width=8, dtype=self.out_ty.ir_type))
+                for (ti, tj) in slots
+            ]
+            if const_expr(self.beta_is_one)
+            else []
+        )
         vecs = [_xpose(ti, tj) for (ti, tj) in slots]
-        for vec_out, (ti, tj) in zip(vecs, slots):
-            buffer_ops.buffer_store(vec_out, rsrc, _off(ti, tj), offset_is_bytes=True)
+        for n, (vec_out, (ti, tj)) in enumerate(zip(vecs, slots)):
+            if const_expr(self.beta_is_one):
+                # The packed value is already out_ty, so widen both sides and add in f32
+                # to keep the sum from rounding twice.
+                vec_out = (vec_out.to(fx.Float32) + prev[n].to(fx.Float32)).to(self.out_ty)
+            buffer_ops.buffer_store(vec_out, rsrc, _off_e(ti, tj) * 2, offset_is_bytes=True)
 
 
 # ── Scaled MFMA whole-loop emitter ───────────────────────────────────────────
@@ -926,10 +968,14 @@ def _build_mxfp4_gemm_kernel(
     ksplit: int = 1,
     taccw: bool = False,
     out_fp16: bool = False,
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     BLOCK_M = 256
     BLOCK_N = 256
     BLOCK_K = 256
+    # Split-K stores partials into a scratch row band that the host then reduces, so the
+    # accumulate belongs to that reduce, not to this store.
+    assert not (beta_is_one and ksplit > 1), "split-K accumulates in the host reduce, not the epilogue"
     # const_expr() resolves compile-time branches from LOCALS/params, not reliably from
     # module globals -> alias the per-shape epilogue selection to locals before traced use.
     _l_taccw = taccw  # autotune-selected per shape (never-regress epilogue variant axis)
@@ -1055,7 +1101,9 @@ def _build_mxfp4_gemm_kernel(
         # bf16/fp16 output: only the f32->out_ty cast in the store differs. Both the narrow
         # scalar store (generic ``.to``) and the wide TACCW store serve either dtype.
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        store_c = StoreCPlain(C, _c_store_rows, c_n, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty)
+        store_c = StoreCPlain(
+            C, _c_store_rows, c_n, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty, beta_is_one=beta_is_one
+        )
 
         wave_m_off = wave_m * (N_TILES_A * 16)  # 0 or 128
         wave_n_off = wave_n * (N_TILES_BH * 16)  # 0 or 64
@@ -1390,11 +1438,11 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False):
     for _wlv, _elgk in _wl_opts:
         for gm, gn, xcd in _mxfp4_swizzle_candidates(M, N, K):
             try:
-                at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, False, False, out_fp16)
+                at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, False, False, out_fp16, False)
                 entry = _MXFP4_AT_CACHE.get(at_key)
                 if entry is None:
                     raw = _get_mxfp4_fused_launch(K, gm, xcd, gn, _wlv, _elgk, coop=False, out_fp16=out_fp16)
-                    entry = [raw, flyc.compile(raw, *args)]
+                    entry = [raw, compile_with_scratch_out(raw, args)]
                     _MXFP4_AT_CACHE[at_key] = entry
                 compiled_cands.append(((gm, gn, xcd, _wlv, _elgk), entry[1]))
             except Exception:  # noqa: BLE001 -- a bad config must not break the GEMM
@@ -1445,16 +1493,16 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False):
     if _try_var:
         gm0, gn0, xcd0, w0, e0 = best[:5]
         try:
-            df_compiled = _MXFP4_AT_CACHE[(M, N, K, gm0, xcd0, gn0, w0, e0, False, False, out_fp16)][1]
+            df_compiled = _MXFP4_AT_CACHE[(M, N, K, gm0, xcd0, gn0, w0, e0, False, False, out_fp16, False)][1]
             variants = []  # (taccw, coop, compiled)
             for _cp, _tw in ((False, True), (True, False), (True, True)):
-                vkey = (M, N, K, gm0, xcd0, gn0, w0, e0, _tw, _cp, out_fp16)
+                vkey = (M, N, K, gm0, xcd0, gn0, w0, e0, _tw, _cp, out_fp16, False)
                 ventry = _MXFP4_AT_CACHE.get(vkey)
                 if ventry is None:
                     vraw = _get_mxfp4_fused_launch(
                         K, gm0, xcd0, gn0, w0, e0, taccw=_tw, coop=_cp, out_fp16=out_fp16
                     )
-                    ventry = [vraw, flyc.compile(vraw, *args)]
+                    ventry = [vraw, compile_with_scratch_out(vraw, args)]
                     _MXFP4_AT_CACHE[vkey] = ventry
                 variants.append((_tw, _cp, ventry[1]))
             for _ in range(5):  # warm every twin + the winner into the same L2/clock state
@@ -1517,7 +1565,9 @@ def _ksplit_candidates(M, N, K):
     return [1, *splits[-2:]]
 
 
-def _compile_mxfp4_fused(K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, coop=False, out_fp16=False):
+def _compile_mxfp4_fused(
+    K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, coop=False, out_fp16=False, beta_is_one=False
+):
     """Turbo/mxfp8-style fused @flyc.jit stub: ONE host dispatch enqueues the A scale
     preshuffle, the B scale preshuffle, then the NT GEMM on the same stream (no separate
     preshuffle launch, no CPU sync). The preshuffle kernels repack raw E8M0 (int32-viewed)
@@ -1537,6 +1587,7 @@ def _compile_mxfp4_fused(K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, 
         ksplit=ksplit,
         taccw=taccw,
         out_fp16=out_fp16,
+        beta_is_one=beta_is_one,
     )
     _PGRID = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_BLK  # threads-per-block * fan-out
 
@@ -1577,17 +1628,27 @@ def _compile_mxfp4_fused(K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, 
 
 
 def _get_mxfp4_fused_launch(
-    K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, coop=False, out_fp16=False
+    K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, coop=False, out_fp16=False, beta_is_one=False
 ):
     # wlv/elgk pick the phase-barrier in-flight memory depth (autotuned per shape).
     # ksplit>1 compiles a K/ksplit slice kernel for few-tile large-K shapes.
     # coop/taccw are the never-regress scale-load / wide-store autotune axes.
     # out_fp16 selects the store cast dtype (fp16 vs bf16); fp16 implies taccw=False.
-    lk = (K, gm, xcd, gn, wlv, elgk, coop, ksplit, taccw, out_fp16)
+    lk = (K, gm, xcd, gn, wlv, elgk, coop, ksplit, taccw, out_fp16, beta_is_one)
     launch = _MXFP4_LAUNCH_CACHE.get(lk)
     if launch is None:
         launch = _compile_mxfp4_fused(
-            K, gm, xcd, gn, wlv=wlv, elgk=elgk, ksplit=ksplit, taccw=taccw, coop=coop, out_fp16=out_fp16
+            K,
+            gm,
+            xcd,
+            gn,
+            wlv=wlv,
+            elgk=elgk,
+            ksplit=ksplit,
+            taccw=taccw,
+            coop=coop,
+            out_fp16=out_fp16,
+            beta_is_one=beta_is_one,
         )
         _MXFP4_LAUNCH_CACHE[lk] = launch
     return launch
@@ -1711,6 +1772,8 @@ def gemm_mxfp4_flydsl_kernel(
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
+    beta: float = 0.0,
+    out: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """MXFP4 (per-32-K E8M0 block-scaled) dense GEMM, gfx950 (4-wave whole-loop).
 
@@ -1729,13 +1792,21 @@ def gemm_mxfp4_flydsl_kernel(
     The whole-loop bare-asm body is an unroll-2 ping-pong that processes K in PAIRS
     of BLOCK_K=256. An odd number of 256-K blocks (K % 512 == 256) is handled by a
     single MFMA-only phase-A tail emitted after the hardware loop (see
-    ``call_mxfp4_wholeloop``'s ``ki``/tail path); the loop runs ``KI//2`` full pairs
+    ``call_mxfp4_wholeloop``'s ``ki``/tail path);     the loop runs ``KI//2`` full pairs
     and the trailing block is accumulated by the tail. K=256 (KI==1) omits the loop
     entirely and runs only the tail. No host-side K padding is required.
+
+    ``beta=1.0`` accumulates into ``out`` (``out += a @ b^T``) instead of overwriting it,
+    and therefore requires ``out``. It is incompatible with ``trans_c``, whose transpose
+    is a post-kernel copy.
     """
     assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
     assert out_dtype in (torch.bfloat16, torch.float16), "mxfp4 FlyDSL store emits bf16/fp16"
     out_fp16 = out_dtype == torch.float16
+    assert not (beta == 1.0 and trans_c), (
+        "beta=1.0 cannot be combined with trans_c: the transpose is a post-kernel copy, "
+        "so the accumulation would land in a buffer the caller never sees."
+    )
     if not ((not trans_a) and trans_b):
         raise NotImplementedError(
             "mxfp4 FlyDSL GEMM is NT only (trans_a=False, trans_b=True); "
@@ -1762,7 +1833,8 @@ def gemm_mxfp4_flydsl_kernel(
     a_sp, b_sp = _get_mxfp4_scale_ws(M, N, K, a.device)
     a_raw = a_scale.contiguous().view(torch.int32).reshape(-1)
     b_raw = b_scale.contiguous().view(torch.int32).reshape(-1)
-    out = torch.empty((M, N), dtype=out_dtype, device=a.device)
+    out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
+    beta_is_one = beta == 1.0
     # Keep the fp4 operands 2D (do NOT flatten): M*K/2 / N*K/2 exceed 2^31 int8s for
     # large M*K / N*K, which flydsl packs as an int32 dim (host CABI overflow). Both the
     # prologue G2S and the in-loop asm refill address off the rebased flat base
@@ -1773,15 +1845,37 @@ def gemm_mxfp4_flydsl_kernel(
     # Fused stub args: (A, B_T, C, A_raw, B_raw, A_scale_ws, B_scale_ws, c_m, c_n, stream).
     # C stays 2D (StoreCPlain re-bases per row band from C's base + c_n); a 1D M*N view
     # overflows the CABI for large M*N.
-    fused_args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, M, N, stream)
+    def _args_for(target):
+        return (a8, b8, target, a_raw, b_raw, a_sp, b_sp, M, N, stream)
 
-    def _exec_plain():
+    # Both autotunes launch the GEMM dozens of times. Against a beta=1 build that would
+    # fold every one of them into the caller's buffer, so tuning runs the beta=0 build
+    # into a scratch and only the final launch touches `out`. Allocated lazily: a warm
+    # cache never tunes and never needs it.
+    _tune_ws = []
+
+    def _tune_args():
+        if not beta_is_one:
+            return _args_for(out)
+        if not _tune_ws:
+            _tune_ws.append(torch.zeros_like(out))
+        return _args_for(_tune_ws[0])
+
+    def _tune_target():
+        return _tune_args()[2]
+
+    def _exec_plain(target=None, accum=False):
         # default one-WG-per-tile path (autotuned swizzle / pipe depth / scale-load / wide store).
-        gm, gn, xcd, _wlv, _elgk, _tw, _coop = _autotune_mxfp4_config(M, N, K, fused_args, out_fp16)
+        target = out if target is None else target
+        cfg = _MXFP4_CFG_CACHE.get((M, N, K, out_fp16))
+        if cfg is None:
+            cfg = _autotune_mxfp4_config(M, N, K, _tune_args(), out_fp16)
+        gm, gn, xcd, _wlv, _elgk, _tw, _coop = cfg
         launch = _get_mxfp4_fused_launch(
-            K, gm, xcd, gn, _wlv, _elgk, taccw=_tw, coop=_coop, out_fp16=out_fp16
+            K, gm, xcd, gn, _wlv, _elgk, taccw=_tw, coop=_coop, out_fp16=out_fp16, beta_is_one=accum
         )
-        at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16)
+        at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum)
+        fused_args = _args_for(target)
         entry = _MXFP4_AT_CACHE.get(at_key)
         if entry is None:
             entry = [launch, None]
@@ -1791,12 +1885,12 @@ def gemm_mxfp4_flydsl_kernel(
             raw(*fused_args)
         else:
             if compiled is None:
-                compiled = flyc.compile(raw, *fused_args)
+                compiled = compile_with_scratch_out(raw, fused_args)
                 entry[1] = compiled
             compiled(*fused_args)
-        return out
+        return target
 
-    def _exec_split(ksplit):
+    def _exec_split(ksplit, target=None, accum=False):
         # split-K: grid x ksplit fills the CUs on few-tile large-K shapes. Each split writes
         # its K/ksplit partial into an out_dtype workspace[ksplit*M, N]; host sums the ksplit
         # row bands (BW-bound reduce, faster than an atomic-fused reduce for these shapes).
@@ -1816,10 +1910,15 @@ def gemm_mxfp4_flydsl_kernel(
             raw(*sk_args)
         else:
             if compiled is None:
-                compiled = flyc.compile(raw, *sk_args)
+                compiled = compile_with_scratch_out(raw, sk_args)
                 entry[1] = compiled
             compiled(*sk_args)
-        return ws.view(ksplit, M, N).sum(dim=0)
+        reduced = ws.view(ksplit, M, N).sum(dim=0)
+        if accum:
+            # The splits went to a scratch, so the epilogue could not accumulate; the
+            # reduce pass this path already runs absorbs it for free.
+            return (out if target is None else target).add_(reduced)
+        return reduced
 
     # ── Choose ksplit: cached timed pick > timed autotune.
     # The autotune times {plain, split+reduce} end-to-end on the real operands and takes the
@@ -1851,14 +1950,15 @@ def gemm_mxfp4_flydsl_kernel(
                 return best
 
             times = {}
+            tgt = _tune_target()
             for s in cands:
                 try:
-                    fn = _exec_plain if s == 1 else (lambda s=s: _exec_split(s))
+                    fn = (lambda: _exec_plain(tgt)) if s == 1 else (lambda s=s: _exec_split(s, tgt))
                     times[s] = _bench(fn)
                 except Exception:  # noqa: BLE001 -- a bad variant must not break the GEMM
                     continue
             ks = min(times, key=times.get) if times else 1
             _MXFP4_KSPLIT_CACHE[(M, N, K, out_fp16)] = ks
 
-    out2 = _exec_split(ks) if ks > 1 else _exec_plain()
+    out2 = _exec_split(ks, out, beta_is_one) if ks > 1 else _exec_plain(out, beta_is_one)
     return out2.t().contiguous() if trans_c else out2

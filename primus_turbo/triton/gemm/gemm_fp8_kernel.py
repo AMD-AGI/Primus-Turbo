@@ -146,7 +146,9 @@ def _fp8_persistent_gemm_kernel(
     EVEN_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
+    BETA_IS_ONE: tl.constexpr = False,
 ):
+    """Persistent per-tensor-scaled FP8 GEMM."""
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
@@ -227,7 +229,6 @@ def _fp8_persistent_gemm_kernel(
 
         # Apply per-tensor scale
         acc *= scale
-        c = acc.to(C.type.element_ty)
 
         rm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         rn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -235,6 +236,9 @@ def _fp8_persistent_gemm_kernel(
         rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm[:, None] < M) & (rn[None, :] < N)
         C_ = C + rm[:, None].to(tl.int64) * stride_cm + rn[None, :].to(tl.int64) * stride_cn
+        if BETA_IS_ONE:
+            acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
+        c = acc.to(C.type.element_ty)
         tl.store(C_, c, c_mask)
 
 
@@ -253,10 +257,12 @@ def gemm_fp8_tensorwise_triton_kernel(
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
+    beta: float = 0.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """General-purpose FP8 GEMM with per-tensor scaling.
 
-    Computes: C = op(A) @ op(B) * a_scale_inv * b_scale_inv
+    Computes: C = beta * C + op(A) @ op(B) * a_scale_inv * b_scale_inv
     If trans_c=True, returns C^T (contiguous, shape N×M).
 
     Args:
@@ -266,12 +272,32 @@ def gemm_fp8_tensorwise_triton_kernel(
         b_scale_inv: Per-tensor dequantization scale for B, shape (1,), fp32.
         trans_a: Whether A is transposed.
         trans_b: Whether B is transposed.
-        out_dtype: Output dtype (default bfloat16).
+        out_dtype: Output dtype (default bfloat16). Ignored when ``out`` is given,
+            since the kernel then writes in whatever dtype ``out`` has.
         trans_c: If True, return transposed output C^T (shape N×M).
+        beta: Either ``0.0`` (overwrite, the default) or ``1.0`` (accumulate:
+            ``out += op(A) @ op(B)``); no other value is supported. ``beta=1.0``
+            requires ``out`` and folds the accumulation into the GEMM epilogue,
+            removing the separate elementwise add the caller would otherwise run
+            over the whole output.
+        out: Optional pre-allocated output buffer, shape (N, M) if ``trans_c``
+            else (M, N). When given, the kernel writes (or accumulates, see
+            ``beta``) into it instead of allocating. Strides are read off the
+            tensor, so non-contiguous views are fine.
 
     Returns:
         C of shape (M, N) if trans_c=False, or (N, M) if trans_c=True.
     """
+    # C^T = (op(A) @ op(B))^T = op(B)^T @ op(A)^T, so swapping the operands lets the
+    # kernel write the transposed result directly. Everything below then works on a
+    # plain row-major store: no swapped output strides, which would make the beta=1
+    # read-back column-major and force Triton to stage it through LDS (a 256x256 fp32
+    # tile needs 256KB, over the 160KB limit).
+    if trans_c:
+        a, b = b, a
+        a_scale_inv, b_scale_inv = b_scale_inv, a_scale_inv
+        trans_a, trans_b = not trans_b, not trans_a
+
     if trans_a:
         K, M = a.shape
         A_view = a.T
@@ -294,15 +320,17 @@ def gemm_fp8_tensorwise_triton_kernel(
     if B_view.stride(0) == 0 or B_view.stride(1) == 0:
         B_view = B_view.contiguous()
 
-    # Handle trans_c by writing to (N, M) buffer with swapped strides
-    if trans_c:
-        out = torch.empty((N, M), device=a.device, dtype=out_dtype)
-        stride_cm = out.stride(1)  # = 1
-        stride_cn = out.stride(0)  # = M
+    out_shape = (M, N)
+    assert beta in (0.0, 1.0), f"Only beta=0 (overwrite) or beta=1 (accumulate) supported, got {beta}"
+    if out is None:
+        assert beta == 0.0, "beta=1.0 requires an explicit `out` buffer to accumulate into"
+        out = torch.empty(out_shape, device=a.device, dtype=out_dtype)
     else:
-        out = torch.empty((M, N), device=a.device, dtype=out_dtype)
-        stride_cm = out.stride(0)  # = N
-        stride_cn = out.stride(1)  # = 1
+        assert tuple(out.shape) == out_shape, f"out shape {tuple(out.shape)} must equal {out_shape}"
+        assert out.device == a.device, "out must be on same device as a"
+
+    stride_cm = out.stride(0)
+    stride_cn = out.stride(1)
 
     # Stride constexprs for compiler optimisation
     s_ak = A_view.stride(1)
@@ -389,6 +417,7 @@ def gemm_fp8_tensorwise_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        BETA_IS_ONE=(beta == 1.0),
         num_warps=8,
         num_stages=2,
         waves_per_eu=waves_per_eu,

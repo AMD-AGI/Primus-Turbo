@@ -56,8 +56,8 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const int64_t rows_b, const int64_t cols_b, const int64_t ldb,
                          const void *scaleB_inv, hipblasOperation_t transB, void *D,
                          const hipDataType D_type, const int64_t rows_d, const int64_t cols_d,
-                         const int64_t ldd, void *workspace, const int64_t workspace_size,
-                         const bool                         use_low_precision,
+                         const int64_t ldd, const float beta, void *workspace,
+                         const int64_t workspace_size, const bool use_low_precision,
                          const hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
                          hipStream_t stream);
 

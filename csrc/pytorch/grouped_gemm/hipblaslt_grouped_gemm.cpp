@@ -16,6 +16,22 @@
 
 namespace primus_turbo::pytorch {
 
+inline at::Tensor resolve_grouped_gemm_out(const c10::optional<at::Tensor> &out,
+                                           const std::vector<int64_t>      &c_shape,
+                                           const at::TensorOptions &options, const double beta) {
+    if (!out.has_value()) {
+        PRIMUS_TURBO_CHECK(beta == 0.0, "beta != 0 requires an `out` Tensor to accumulate into.");
+        return at::empty(c_shape, options);
+    }
+
+    const at::Tensor &c = out.value();
+    PRIMUS_TURBO_CHECK(c.is_contiguous(), "out must be contiguous");
+    PRIMUS_TURBO_CHECK(is_floating_point_dtype(c.scalar_type()),
+                       "out must be a fp16/bf16/fp32 Tensor.");
+    PRIMUS_TURBO_CHECK(c.sizes().vec() == c_shape, "out shape mismatch");
+    return c;
+}
+
 inline HipblasltGroupedGemmParams
 make_hipblaslt_grouped_gemm_params(const at::Tensor &a, const at::Tensor &b, at::Tensor &c,
                                    const at::Tensor &group_lens, const at::Tensor &group_offs,
@@ -83,7 +99,8 @@ inline HipblasltGroupedGemmParams make_hipblaslt_grouped_gemm_fp8_params(
 
 at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                   at::Tensor &group_offs, const bool transA, const bool transB,
-                                  const bool pre_sync) {
+                                  const bool pre_sync, const double beta,
+                                  c10::optional<at::Tensor> out) {
     // Check
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(a.scalar_type()),
                        "hipblaslt_grouped_gemm only supports float16 and bfloat16");
@@ -94,17 +111,18 @@ at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &grou
     PRIMUS_TURBO_CHECK(a.scalar_type() == b.scalar_type(), "a and b dtype mismatch");
 
     // Create output tensor
-    at::Tensor c;
+    std::vector<int64_t> c_shape;
     if (transA) {
         const int64_t bs = group_lens.numel();
         const int64_t m  = a.size(1);
         const int64_t n  = transB ? b.size(0) : b.size(1);
-        c                = at::empty({bs, m, n}, a.options());
+        c_shape          = {bs, m, n};
     } else {
         const int64_t m = a.size(0);
         const int64_t n = transB ? b.size(1) : b.size(2);
-        c               = at::empty({m, n}, a.options());
+        c_shape         = {m, n};
     }
+    at::Tensor c = resolve_grouped_gemm_out(out, c_shape, a.options(), beta);
 
     const int64_t workspace_size = primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
     at::Tensor    workspace =
@@ -112,6 +130,7 @@ at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &grou
 
     auto params = make_hipblaslt_grouped_gemm_params(a, b, c, group_lens, group_offs, transA,
                                                      transB, workspace);
+    params.beta = static_cast<float>(beta);
     primus_turbo::hipblaslt_grouped_gemm(params, pre_sync);
     return c;
 }
@@ -120,7 +139,8 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
                                       at::Tensor &b_scales, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
                                       at::ScalarType out_dtype, const std::string &granularity,
-                                      const bool pre_sync) {
+                                      const bool pre_sync, const double beta,
+                                      c10::optional<at::Tensor> out) {
     // Check
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(a.scalar_type()));
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(b.scalar_type()));
@@ -139,17 +159,18 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
     }
 
     // Create output tensor
-    at::Tensor c;
+    std::vector<int64_t> c_shape;
     if (transA) {
         const int64_t bs = group_lens.numel();
         const int64_t m  = a.size(1);
         const int64_t n  = transB ? b.size(0) : b.size(1);
-        c                = at::empty({bs, m, n}, a.options().dtype(out_dtype));
+        c_shape          = {bs, m, n};
     } else {
         const int64_t m = a.size(0);
         const int64_t n = transB ? b.size(1) : b.size(2);
-        c               = at::empty({m, n}, a.options().dtype(out_dtype));
+        c_shape         = {m, n};
     }
+    at::Tensor c = resolve_grouped_gemm_out(out, c_shape, a.options().dtype(out_dtype), beta);
 
     const int64_t workspace_size = primus_turbo::get_hipblaslt_grouped_gemm_workspace_size();
     at::Tensor    workspace =
@@ -157,6 +178,7 @@ at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &
 
     auto params = make_hipblaslt_grouped_gemm_fp8_params(
         a, b, c, a_scales, b_scales, group_lens, group_offs, transA, transB, scale_mode, workspace);
+    params.beta = static_cast<float>(beta);
     primus_turbo::hipblaslt_grouped_gemm(params, pre_sync);
 
     return c;
