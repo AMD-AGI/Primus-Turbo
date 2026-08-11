@@ -45,6 +45,11 @@ def _as_index(v):
     return arith.index(v) if isinstance(v, int) else arith.index_cast(T.index, v)
 
 
+def _i64(v):
+    # widen an i32 runtime value to i64 (avoids overflow in worst-case base offsets)
+    return ArithValue(arith.extsi(T.i64, _buffer_ops._unwrap_value(v)), signed=True)
+
+
 def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_bytes):
     """Build an fp8 BufferDesc tensor with the SRD base advanced by ``base_elems`` (fp8/int8
     = 1 byte/elem), in 64-bit. Folds a per-tile huge element offset into the
@@ -1170,8 +1175,9 @@ def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256,
 
 
 # ───────────────────────────────────────────────────────────────────────
-# Reusable bf16 GEMM primitives for gemm_bf16_kernel.py (mfma 32x32x16 / 16x16x32,
-# tr_b16 loaders, swizzle, store). bf16 counterpart of the fp8 block above.
+# Reusable bf16 GEMM primitives for the {gemm,grouped_gemm}_bf16_kernel.py pair
+# (mfma 32x32x16 / 16x16x32, tr_b16 loaders, swizzle, store).
+# bf16 counterpart of the fp8 block above.
 # ───────────────────────────────────────────────────────────────────────
 BLOCK_K = 64  # K depth per LDS tile (exported to the bf16 kernels)
 
@@ -1349,12 +1355,18 @@ class StoreCBf16:
         self.out_ty = out_ty
         self.cache_modifier = cache_modifier
         c_nbytes = c_rows * c_cols * 2
-        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        # Rebuild a rank-1 view: store indices are linear, so C's host rank must not leak in.
+        c_ptr_ty = PointerType.get(elem_ty=out_ty.ir_type, address_space=AddressSpace.Global, alignment=16)
+        c_base = ArithValue(arith.index_cast(T.i64, _buffer_ops.extract_base_index(C)), signed=True)
+        c_lin = fx.Tensor(fx.make_view(fx.inttoptr(c_ptr_ty, c_base), fx.make_layout(c_rows * c_cols, 1)))
+        gC = fx.rocdl.make_buffer_tensor(c_lin, max_size=False, num_records_bytes=c_nbytes)
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
         self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_ty)
         self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), out_ty)
         self.c_rsrc = (
-            create_buffer_resource(C, max_size=False, num_records_bytes=c_nbytes) if cache_modifier else None
+            create_buffer_resource(c_lin, max_size=False, num_records_bytes=c_nbytes)
+            if cache_modifier
+            else None
         )
         self.oob = fx.Int32(c_rows * c_cols)  # out-of-bounds sink index
 

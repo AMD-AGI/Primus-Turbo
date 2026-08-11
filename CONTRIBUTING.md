@@ -8,6 +8,7 @@ Welcome! We appreciate your interest in contributing to **Primus-Turbo**. This d
   - [Table of Contents](#table-of-contents)
   - [📋 Before You Start](#-before-you-start)
   - [📂 Project Structure](#-project-structure)
+  - [🧩 Kernel File Naming Convention](#-kernel-file-naming-convention)
   - [🎨 Code Style \& Linting](#-code-style--linting)
   - [🌿 Branch Naming Convention](#-branch-naming-convention)
     - [Type](#type)
@@ -44,6 +45,54 @@ Primus-Turbo/
 ├── tests/                 # Unit & Integration Tests
 └── benchmark/             # Performance benchmarks
 ```
+
+
+## 🧩 Kernel File Naming Convention
+
+Kernel files follow a uniform **`<op>_<dtype>_<role>.py`** pattern so new kernels
+slot in predictably. Read the name left-to-right: **operation → data type → role**.
+
+| Segment   | Values | Notes |
+|-----------|--------|-------|
+| `<op>`    | `gemm`, `grouped_gemm`, `attention`, `rmsnorm`, `swiglu`, ... | The mathematical operation. **Always first**; matches the containing directory. |
+| `<dtype>` | see below | **Optional** — omit for dtype-agnostic files (e.g. `grouped_gemm_utils.py`). |
+| `<role>`  | `impl`, `kernel`, `utils`, `heuristic` | What the file *is*. **Always last**. |
+
+### Two layers, two `<dtype>` vocabularies (intentional)
+
+The frontend and the FlyDSL kernel layer use `<dtype>` at **different abstraction
+levels** — do not "unify" them, the difference carries meaning:
+
+* **PyTorch frontend** — `primus_turbo/pytorch/kernels/<op>/<op>_<family>_impl.py`.
+  Here `<dtype>` names the **dtype *family* the dispatcher handles**, not one
+  concrete format:
+  * `fp8` → the fp8 family (tensorwise / rowwise / blockwise / **mx**-blockwise)
+  * `fp4` → the fp4 family (currently mx; routed across hipBLASLt / AITER backends)
+  * So `gemm_fp8_impl.py` legitimately dispatches into **both** the plain-fp8 and
+    the mxfp8 kernels — do **not** rename it to `mxfp8`.
+
+* **FlyDSL kernel layer** — `primus_turbo/flydsl/<op>/<op>_<format>_kernel.py`.
+  Here `<dtype>` names **one concrete on-wire format**, because each file is a
+  single format-specific kernel: `bf16`, `fp16`, `fp8` (tensorwise), `mxfp8`, `mxfp4`.
+
+### `<role>` vocabulary
+
+* `impl`      — PyTorch frontend op implementation / backend dispatch
+* `kernel`    — a FlyDSL / Triton compute kernel
+* `utils`     — shared helpers for one op
+* `heuristic` — parameter-selection logic for a kernel
+
+### Examples
+
+```
+primus_turbo/pytorch/kernels/gemm/gemm_fp8_impl.py               # frontend, fp8 family
+primus_turbo/pytorch/kernels/grouped_gemm/grouped_gemm_utils.py  # dtype-agnostic helpers
+primus_turbo/flydsl/gemm/gemm_mxfp8_kernel.py                    # concrete mxfp8 kernel
+primus_turbo/flydsl/grouped_gemm/grouped_gemm_fp8_kernel.py      # concrete fp8 grouped kernel
+```
+
+When adding a kernel: take `<op>` from the directory name, pick the **narrowest
+correct** `<dtype>` for that layer, and end with the matching `<role>`.
 
 
 ## 🎨 Code Style & Linting

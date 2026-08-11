@@ -56,11 +56,12 @@ import primus_turbo.pytorch  # noqa: E402,F401
 # original mega_utils order; the two fused kernels below need pytorch first).
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (  # noqa: E402
     _compile_dense_nt,
-    _compile_grouped_variable_k_bf16,
     _get_compiled_dense,
-    _i64,
     _make_shared_storage,
     gemm_bf16_tile,
+)
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (  # noqa: E402
+    _compile_grouped_bf16_wgrad,
 )
 from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_grouped_gemm_bf16_flydsl_kernel,
@@ -86,6 +87,7 @@ from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (  # noqa: E402
+    _i64,
     ceildiv,
     make_value_attrs,
     xcd_remap_pid,
@@ -166,12 +168,17 @@ def compile_grouped_gemm_bf16(
             block_m = first_pid_m + (pid_in_group % group_size_m)
             block_n = pid_in_group // group_size_m
             g_idx = buffer_load(group_res, block_m, vec_width=1, dtype=fx.T.i32())
-            gbase = g_idx * fx.Int32(K) * c_n
+            pool_ptr_ty = PointerType.get(
+                elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
+            )
+            # Per-group weight slab rebased in int64: G*K*N overflows an int32 b_group_base.
+            w_base = fx.arith.ArithValue(arith.index_cast(fx.T.i64(), extract_base_index(B)), signed=True)
+            b_byte_off = _i64(g_idx) * fx.Int64(K * 2) * _i64(c_n)
+            B_tile = fx.make_view(
+                fx.inttoptr(pool_ptr_ty, w_base + b_byte_off), fx.make_layout(fx.Int32(K) * c_n, 1)
+            )
             # Worst-case pool (cap*K > 2^31): rebase A/C per tile in int64, int32 in-resource offset. Mirrors fused nt/nn.
             if layout in ("nt", "nn"):
-                pool_ptr_ty = PointerType.get(
-                    elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
-                )
                 a_byte_off = _i64(block_m) * fx.Int64(BLOCK_M * K * 2)
                 c_byte_off = _i64(block_m * fx.Int32(BLOCK_M)) * _i64(c_n) * fx.Int64(2)
                 a_base = fx.arith.ArithValue(arith.index_cast(fx.T.i64(), extract_base_index(A)), signed=True)
@@ -185,7 +192,7 @@ def compile_grouped_gemm_bf16(
                 )
                 gemm_tile(
                     A_tile,
-                    B,
+                    B_tile,
                     C_tile,
                     fx.Int32(BLOCK_M),
                     c_n,
@@ -197,12 +204,11 @@ def compile_grouped_gemm_bf16(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
-                    b_group_base=gbase,
                 )
             else:
                 gemm_tile(
                     A,
-                    B,
+                    B_tile,
                     C,
                     c_m,
                     c_n,
@@ -214,7 +220,6 @@ def compile_grouped_gemm_bf16(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
-                    b_group_base=gbase,
                 )
 
         if fx.block_idx.x < real_grid:
@@ -360,7 +365,7 @@ def grouped_gemm_variable_k_only(
         lhs_e, rhs_e, OUT_M_e, OUT_N_e = rhs_pool, lhs_pool, OUT_N, OUT_M
     else:
         lhs_e, rhs_e, OUT_M_e, OUT_N_e = lhs_pool, rhs_pool, OUT_M, OUT_N
-    launch = _compile_grouped_variable_k_bf16(
+    launch = _compile_grouped_bf16_wgrad(
         OUT_M_e,
         OUT_N_e,
         G,
@@ -374,7 +379,7 @@ def grouped_gemm_variable_k_only(
     args = (
         lhs_e.contiguous(),
         rhs_e.contiguous(),
-        out_dw.view(-1),  # output: view (not contiguous) so writes hit the real buffer
+        flyc.from_torch_tensor(out_dw),  # static memref: full rank, no int32 shape kernarg
         prefix_i64,
         masked_k_i64,
         OUT_M_e,
@@ -417,10 +422,10 @@ def grouped_gemm_bf16_only(
         c_m, hidden_size = pool.shape
     if layout == "nt":  # weight [G, N, K]
         G, N, K = weight.shape
-        weight_flat = weight.reshape(G * N, K).contiguous().view(-1)
+        weight_flat = weight.reshape(G * N, K).contiguous()
     else:  # NN / TN: weight [G, K, N]
         G, K, N = weight.shape
-        weight_flat = weight.reshape(G * K, N).contiguous().view(-1)
+        weight_flat = weight.reshape(G * K, N).contiguous()
     assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
     out_features = N
     launch = compile_grouped_gemm_bf16(
@@ -437,7 +442,7 @@ def grouped_gemm_bf16_only(
     # Pass A/C as 2-D (flat view(-1) overflows int32 shape ABI); kernel rebases per tile.
     launch(
         pool.contiguous(),
-        weight_flat,
+        flyc.from_torch_tensor(weight_flat),
         output,
         tile_to_expert,
         num_tile_blocks,
@@ -465,7 +470,7 @@ def dispatch_only(
     assert x.dtype == torch.bfloat16
     hidden_size = x.size(1)
     pool_capacity = symm.num_max_pool_tokens
-    x_i32 = x.contiguous().view(torch.int32).view(-1)
+    x_i32 = x.contiguous().view(torch.int32)
     launch = _compile_dispatch_only(
         hidden_size,
         pool_capacity,
@@ -535,9 +540,17 @@ def bench(fn, *, warmup=20, iters=30):
 # --------------------------------------------------------------------------- #
 def gate3(out, ref, *, cos_thresh=0.99, rel_thresh=0.05):
     """(cos, rel_rmse, ok) of a kernel output vs its reference (flattened, fp32)."""
-    g, r = out.float().flatten(), ref.float().flatten()
-    cos = float(torch.dot(g, r) / (g.norm() * r.norm() + 1e-12))
-    rel = float((g - r).norm() / (r.norm() + 1e-12))
+    g, r = out.flatten(), ref.flatten()
+    # chunked fp64 accumulation: torch.dot/norm cap numel at int32
+    dot = gg = rr = dd = 0.0
+    for i in range(0, g.numel(), 1 << 28):
+        gc, rc = g[i : i + (1 << 28)].float(), r[i : i + (1 << 28)].float()
+        dot += float((gc * rc).sum())
+        gg += float((gc * gc).sum())
+        rr += float((rc * rc).sum())
+        dd += float(((gc - rc) ** 2).sum())
+    cos = dot / (math.sqrt(gg) * math.sqrt(rr) + 1e-12)
+    rel = math.sqrt(dd) / (math.sqrt(rr) + 1e-12)
     return cos, rel, (cos >= cos_thresh and rel <= rel_thresh)
 
 

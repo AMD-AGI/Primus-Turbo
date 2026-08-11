@@ -17,6 +17,8 @@ ENV_LOG_LEVEL = "PRIMUS_TURBO_LOG_LEVEL"
 
 # GEMM backend selection (e.g. HIPBLASLT, AITER).
 # Supports per-precision format: "FP4:HIPBLASLT,FP8:AITER" or a single value.
+# Any backend slot also accepts "autotune" to auto-tune that precision only,
+# e.g. "autotune" or "FP8:autotune,other:HIPBLASLT".
 # Default: None (auto-select)
 ENV_GEMM_BACKEND = "PRIMUS_TURBO_GEMM_BACKEND"
 
@@ -25,10 +27,13 @@ ENV_GEMM_BACKEND = "PRIMUS_TURBO_GEMM_BACKEND"
 ENV_GROUPED_GEMM_BACKEND = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 
 # MoE dispatch/combine EP backend (TURBO, DEEP_EP, or custom names like UCCL_EP).
+# Auto-tune is not supported here; "autotune" raises an AssertionError.
 # Default: TURBO
 ENV_MOE_DISPATCH_COMBINE_BACKEND = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
 
 # Enable auto-tuning across registered kernel backends ("1" to enable).
+# Global switch: it turns auto-tune on for every op. An explicit per-op backend
+# (e.g. "<OP>_BACKEND=HIPBLASLT") still takes precedence over it.
 # Default: "0" (disabled)
 ENV_AUTO_TUNE = "PRIMUS_TURBO_AUTO_TUNE"
 

@@ -7,6 +7,7 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import (
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -14,30 +15,15 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
-from primus_turbo.pytorch.core.utils import _get_device_compute_capability
-
-
-def _is_gfx950_device(device: torch.device) -> bool:
-    """Compute capability check bound to a specific tensor's device.
-
-    ``is_gfx950()`` inspects the *current* CUDA device via
-    ``torch.cuda.current_device()``, which is wrong when the tensor lives
-    on a different device than the ambient one (multi-GPU / mixed-arch
-    hosts). Route by the tensor's device instead.
-    """
-    if device.type != "cuda":
-        return False
-    return _get_device_compute_capability(device) == (9, 5)
-
-
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
-    BaseGroupedGEMMKernelDispatcher,
-    BaseGroupedGEMMVariableKKernelDispatcher,
-)
-from primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic import (
+from primus_turbo.pytorch.core.utils import build_ck, is_gfx950, is_gfx1250
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_ck_ws_heuristic import (
     approximate_ck_standard_total_tiles,
     compute_ck_variable_k_total_tiles,
     resolve_ck_ws_local_per_xcd,
+)
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+    BaseGroupedGEMMKernelDispatcher,
+    BaseGroupedGEMMVariableKKernelDispatcher,
 )
 from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     grouped_gemm_output_tail_kernel,
@@ -100,6 +86,8 @@ class GroupedGEMMCKBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
+        supported &= build_ck()
+        supported &= not is_gfx1250()
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= not trans_a
@@ -108,9 +96,7 @@ class GroupedGEMMCKBackend(KernelBackend):
         # broadcast slot, which fits on gfx950 (MI355X) but overflows
         # gfx942's 64 KB LDS budget. The device-side WS body is stubbed
         # out on gfx942, so refuse to dispatch WS to CK on that arch.
-        # Check the *tensor's* device (multi-GPU safe), not the ambient
-        # ``current_device()``.
-        if schedule == "work_steal" and not _is_gfx950_device(a.device):
+        if schedule == "work_steal" and not is_gfx950():
             supported = False
         return supported
 
@@ -177,13 +163,15 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
+        supported &= build_ck()
+        supported &= not is_gfx1250()
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
         supported &= schedule in _WS_SUPPORTED_SCHEDULES
         # See GroupedGEMMCKBackend.can_handle: the CK WS kernel is
-        # gfx950-only due to LDS budget. Route by the tensor's device.
-        if schedule == "work_steal" and not _is_gfx950_device(a.device):
+        # gfx950-only due to LDS budget.
+        if schedule == "work_steal" and not is_gfx950():
             supported = False
         return supported
 
@@ -481,8 +469,8 @@ def grouped_gemm_impl(
     maybe_pre_sync: bool = False,
     schedule: str = "static",
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
 
     kwargs = dict(
         a=a,
@@ -496,7 +484,7 @@ def grouped_gemm_impl(
         schedule=schedule,
     )
 
-    out = GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
     out = grouped_gemm_output_tail_kernel(out, group_offs)
     return out
 
@@ -515,8 +503,8 @@ def grouped_gemm_variable_k_impl(
     maybe_pre_sync: bool = False,
     schedule: str = "static",
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
     kwargs = dict(
         a=a,
         b=b,
@@ -529,7 +517,9 @@ def grouped_gemm_variable_k_impl(
         maybe_pre_sync=maybe_pre_sync,
         schedule=schedule,
     )
-    return GroupedGEMMVariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GroupedGEMMVariableKKernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, **kwargs
+    )
 
 
 @grouped_gemm_impl.register_fake
