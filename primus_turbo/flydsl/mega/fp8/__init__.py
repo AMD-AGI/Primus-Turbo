@@ -44,7 +44,6 @@ from .symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 #     variable-K wgrad operands: dW2 / dW1) ---
 from .quant import (
     colwise_grouped_meta,
-    colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     preshuffle_b_scale,
@@ -65,7 +64,6 @@ __all__ = [
     "quantize_rowwise_mxfp8_flydsl",
     "preshuffle_b_scale",
     "colwise_grouped_meta",
-    "colwise_quant_mxfp8_grouped_flydsl",
     "colwise_requant_mxfp8_grouped_fp8in_flydsl",
     "colwise_requant_fp8in_and_quant_bf16_grouped_flydsl",
     "swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl",

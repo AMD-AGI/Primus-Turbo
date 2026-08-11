@@ -23,20 +23,17 @@ max 448, target 2^8) or E5M2 (``cvt_pk_bf8_f32``, max 57344, target 2^15; the dW
 matching the grad range).
 
 ROWWISE (along K): one thread owns one 1x32 K-block, so there is no cross-lane reduction.
-Optionally fuses the A-scale ScaleS2R preshuffle (``pack=4`` variant repacks through LDS) so
-the GEMM's scale operand comes straight out of the quant kernel.
+Optionally fuses the A-scale ScaleS2R preshuffle (``pack=4`` repacks through LDS) so the GEMM's
+scale operand comes straight out of the quant kernel.
 
 COLWISE (along M, transposed out): dW2/dW1 contract over M, so their operands need the E8M0
-block to group 32 consecutive M rows and the fp8 output to be the transpose ``[F, M]``.  The
-production C++ ``grouped_quantize_mxfp8_dual`` also emits the (here unused) rowwise half; at
-the DSv3 dW2 shape that costs ~1.0 ms and makes fp8 dW2 net-negative vs bf16.  Emitting only
-the colwise operand roughly halves the write traffic (~0.61 ms for both dW2 operands, 1.6x,
-byte-exact vs the dual).  Each thread owns one output column and privately reduces its 32
-M-values; consecutive threads own consecutive columns so the reads stay coalesced.  One
-workgroup handles one (32-M block, ``BT``-wide F-tile): the kernel is memory-*latency* bound
-(VALU and VMEM issue are <1% of runtime), so the large grid is what hides the strided-load
-latency -- an earlier single-workgroup-per-column version left ~2 waves/SIMD and ran 1.4x
-slower.  A fp8-in variant fuses the dequant->requant round-trip for the L2-dgrad pool operand.
+block to group 32 consecutive M rows and the fp8 output to be the transpose ``[F, M]``.  Only
+that colwise half is emitted; the production C++ ``grouped_quantize_mxfp8_dual`` also writes a
+rowwise half nothing here reads.  Each thread owns one output column and privately reduces its
+32 M-values, consecutive threads owning consecutive columns to keep the reads coalesced.  One
+workgroup handles one (32-M block, ``BT``-wide F-tile): the kernel is memory-*latency* bound,
+so the large grid is what hides the strided-load latency.  A fp8-in variant fuses the
+dequant->requant round-trip for the L2-dgrad pool operand.
 """
 
 import functools
@@ -58,26 +55,24 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     ceildiv,
 )
 
-MXFP8_BLOCK = 32
-_BLK = 32  # mxfp8 block (elements per E8M0 scale)
-_VEC = 8   # sub-vector width for the bf16 load / f32 compute
-# Match grouped GEMM / gemm_mxfp8_nt_tile (_SCALE_PACK).
-_SCALE_PACK = 4
+MXFP8_BLOCK = 32  # mxfp8 block (elements per E8M0 scale)
+MXFP8_VEC = 8     # sub-vector width for the bf16 load / f32 compute
+# Match grouped GEMM / gemm_mxfp8_nt_tile (its local _SCALE_PACK).
+MXFP8_SCALE_PACK = 4
 
 
 # ── shared MXFP8 block math ───────────────────────────────────────────────────────────────
 
 
-def _mxfp8_words_from_f32_subvecs(fvs):
-    """Quantize one 1x32 f32 block given as ``subs`` vectors of width ``_VEC`` to MXFP8.
+def mxfp8_words_from_f32_subvecs(fvs):
+    """Quantize one 1x32 f32 block, given as ``subs`` vectors of width ``MXFP8_VEC``, to E4M3.
 
-    Returns ``(words, biased)`` (same layout as ``_quant_block_words``). Used by the standalone
-    quant kernel and the fused SwiGLU+mxfp8 epilogue."""
-    f32v = fx.T.VectorType.get([_VEC], fx.T.f32())
+    Returns ``(words, biased)``, the layout ``_quant_block_words`` also returns."""
+    f32v = fx.T.VectorType.get([MXFP8_VEC], fx.T.f32())
     neg1 = fx.arith.constant_vector(-1.0, f32v)
     lim = fx.arith.constant_vector(448.0, f32v)
     neglim = fx.arith.constant_vector(-448.0, f32v)
-    subs = _BLK // _VEC  # 4
+    subs = MXFP8_BLOCK // MXFP8_VEC
 
     sub_amax = []
     for s in range_constexpr(subs):
@@ -97,13 +92,10 @@ def _mxfp8_words_from_f32_subvecs(fvs):
     exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
     exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
     biased = fx.arith.ArithValue(exp) + fx.Int32(127)
-    # Build 1/scale from the exponent bits, as _e8m0_quant_pack does, rather than dividing by
-    # `bits(biased << 23)`. The two agree bit-for-bit on every scale a finite input can produce,
-    # but they differ on the one an all-zero block produces: there amax is 0, exp clamps to -127
-    # and biased is 0, so the float form is 1.0/0.0 = inf and every element quantizes to 0*inf =
-    # NaN. A token the loss masks out has an exactly-zero gradient row, so training hits this
-    # where fixed random benchmark data never does. 2^(127-biased) is also what the stored E8M0
-    # byte actually means, which the divide-by-zero form was not.
+    # Build 1/scale from the exponent bits rather than dividing by `bits(biased << 23)`: an
+    # all-zero block clamps biased to 0, where the divide form gives 1.0/0.0 = inf and every
+    # element quantizes to 0*inf = NaN. Loss-masked tokens have exactly-zero gradient rows, so
+    # training hits that case. 2^(127-biased) is also what the stored E8M0 byte means.
     inv_scale = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32())
     inv_v = _vector.broadcast(f32v, arith._to_raw(inv_scale))
 
@@ -111,7 +103,7 @@ def _mxfp8_words_from_f32_subvecs(fvs):
     for s in range_constexpr(subs):
         qraw = fx.arith.mulf(fvs[s], inv_v)
         qf = Vec(fx.arith.minimumf(fx.arith.maximumf(qraw, neglim), lim))  # soft-clamp to fp8 max
-        e = [qf[i] for i in range_constexpr(_VEC)]
+        e = [qf[i] for i in range_constexpr(MXFP8_VEC)]
         w0 = cvt_pk_fp8_f32(fx.T.i32(), e[0], e[1], fx.Int32(0), False)
         w0 = cvt_pk_fp8_f32(fx.T.i32(), e[2], e[3], w0, True)
         w1 = cvt_pk_fp8_f32(fx.T.i32(), e[4], e[5], fx.Int32(0), False)
@@ -124,26 +116,23 @@ def _mxfp8_words_from_f32_subvecs(fvs):
 def _quant_block_words(xr, base_elem):
     """Quantize one 1x32 bf16 block at ``xr[base_elem : base_elem+32]`` to MXFP8.
 
-    Returns ``(words, biased)``: ``words`` = 8 i32 packing the 32 fp8 (E4M3) values
-    (4 fp8/word, via the HW ``cvt_pk_fp8_f32``); ``biased`` = the E8M0 scale byte in an
-    i32. Mirrors the production ``compute_tile_scale`` (round-even exp, target 2^8,
-    soft-clamp before cvt). Shared by the standalone quant kernel and the fused push."""
-    f32v = fx.T.VectorType.get([_VEC], fx.T.f32())
-    subs = _BLK // _VEC  # 4
+    Returns ``(words, biased)``: ``words`` = 8 i32 packing the 32 E4M3 values (4 fp8/word, via
+    the HW ``cvt_pk_fp8_f32``); ``biased`` = the E8M0 scale byte in an i32."""
+    f32v = fx.T.VectorType.get([MXFP8_VEC], fx.T.f32())
+    subs = MXFP8_BLOCK // MXFP8_VEC
 
     fvs = []
     for s in range_constexpr(subs):
-        vv = buffer_load(xr, base_elem + fx.Int32(s * _VEC), vec_width=_VEC, dtype=fx.T.bf16())
+        vv = buffer_load(xr, base_elem + fx.Int32(s * MXFP8_VEC), vec_width=MXFP8_VEC, dtype=fx.T.bf16())
         fvs.append(fx.arith.extf(f32v, vv))
-    return _mxfp8_words_from_f32_subvecs(fvs)
+    return mxfp8_words_from_f32_subvecs(fvs)
 
 
 def _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32):
     """Scalar-input MXFP8 block math: 32 f32 ``vals`` -> (8 packed i32 fp8 words, E8M0 biased byte).
 
-    Encoding-parametric twin of ``_mxfp8_words_from_f32_subvecs`` (which is hard-wired to E4M3
-    and takes ``_VEC``-wide vectors).  Used by the colwise kernels, whose 32 values come from a
-    strided gather rather than a contiguous vector load."""
+    Encoding-parametric twin of ``mxfp8_words_from_f32_subvecs``, which is hard-wired to E4M3 and
+    takes vectors; the colwise kernels gather their 32 values stride-wise, one scalar at a time."""
     amax = None
     for fv in vals:
         a = fmath.absf(fv)
@@ -154,16 +143,16 @@ def _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32):
     exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
     exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
     biased = fx.arith.ArithValue(exp) + fx.Int32(127)
-    # scale = 2^(biased-127) is an exact power of two, so 1/scale = 2^(127-biased) = float bits
-    # ((254 - biased) << 23). Bit-identical to 1.0/scale (IEEE div by pow2 is exact) but replaces
-    # a VALU fdiv sequence with one sub+shift. Valid for every finite scale (exp<128).
+    # scale is an exact power of two, so 1/scale = 2^(127-biased) = float bits ((254-biased) << 23):
+    # bit-identical to 1.0/scale but a sub+shift instead of an fdiv. See the all-zero-block trap in
+    # mxfp8_words_from_f32_subvecs.
     inv_scale = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32())
     qs = []
     for fv in vals:
         q = fmath.clampf(fx.arith.ArithValue(fv) * inv_scale, lo, hi)
         qs.append(fx.arith._to_raw(q))
     words = []
-    for wi in range_constexpr(_BLK // 4):
+    for wi in range_constexpr(MXFP8_BLOCK // 4):
         j = wi * 4
         w = cvt(fx.T.i32(), qs[j], qs[j + 1], zero_i32, False)
         w = cvt(fx.T.i32(), qs[j + 2], qs[j + 3], w, True)
@@ -188,10 +177,10 @@ def _preshuffle_a_pack4_idx(dest_row, kkp, g, K128p):
 
 @functools.lru_cache(maxsize=32)
 def _compile_quant(K: int, BT: int = 256):
-    assert K % _BLK == 0, f"K={K} must be a multiple of {_BLK}"
-    n_blk = K // _BLK
+    assert K % MXFP8_BLOCK == 0, f"K={K} must be a multiple of {MXFP8_BLOCK}"
+    n_blk = K // MXFP8_BLOCK
     K_fp8_i32 = K // 4
-    blk_i32 = _BLK // 4
+    blk_i32 = MXFP8_BLOCK // 4
 
     @flyc.kernel(known_block_size=[BT, 1, 1])
     def kern(X: fx.Tensor, Q: fx.Tensor, S: fx.Tensor, c_m: fx.Int32):
@@ -204,7 +193,7 @@ def _compile_quant(K: int, BT: int = 256):
 
         b = tid
         while b < fx.Int32(n_blk):
-            base = row * fx.Int32(K) + b * fx.Int32(_BLK)
+            base = row * fx.Int32(K) + b * fx.Int32(MXFP8_BLOCK)
             words, biased = _quant_block_words(xr, base)
 
             buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8()), sr, row * fx.Int32(n_blk) + b)
@@ -226,13 +215,13 @@ _QUANT_COMPILED: dict = {}
 _BSCALE_PS_COMPILED: dict = {}
 
 
-def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int, *, pack: int = _SCALE_PACK):
+def preshuffle_b_scale(b_scale: torch.Tensor, G: int, N: int, K: int, *, pack: int = MXFP8_SCALE_PACK):
     """Host preshuffle of a grouped weight E8M0 scale into the ScaleBComb layout-3 ``b_sp``.
 
     ``b_scale`` = raw E8M0 [G, N, K//32] (or [G*N, K//32]) uint8 -> ``b_sp`` int32
     [b_ngrp*K128*256], b_ngrp=ceildiv(G*N,256)*4, read by ``ScaleBComb``. Runs the shared
-    ``build_preshuffle_ab_kernel`` (B region only; A is a 64-row dummy). Weights are static,
-    so callers cache the result per (G,N,K)."""
+    ``build_preshuffle_ab_kernel`` on the B region only (A is a 64-row dummy). Weights are
+    static, so callers cache the result per (G,N,K)."""
     GN = G * N
     K128 = K // 128
     K128p = ceildiv(K128, pack)
@@ -274,7 +263,7 @@ def quantize_rowwise_mxfp8_flydsl(x: torch.Tensor):
     x = x.contiguous()
     q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     q_i32 = q.view(torch.int32)
-    s = torch.empty((M, K // _BLK), dtype=torch.uint8, device=x.device)
+    s = torch.empty((M, K // MXFP8_BLOCK), dtype=torch.uint8, device=x.device)
     launch = _compile_quant(int(K))
     args = (x, q_i32, s, M, torch.cuda.current_stream())
     ck = (M, K)
@@ -289,11 +278,9 @@ def quantize_rowwise_mxfp8_flydsl(x: torch.Tensor):
 def quantize_grouped_weight_mxfp8_flydsl(w: torch.Tensor):
     """Per-group MXFP8 quant of grouped weights ``[G, N, K]`` along K (block=32), E4M3.
 
-    Rowwise-along-K quant is per-row independent, so group boundaries don't matter:
-    ``[G, N, K] -> [G*N, K]`` and run the rowwise kernel above (~5.9 TB/s, near HBM peak vs the
-    generic ~2.3 TB/s), then reshape back -- one kernel instead of a ``G``-launch Python loop
-    (~2 ms at G=32 / DSv3 w1, a static-weight cost otherwise paid every step). The scale is
-    viewed as ``float8_e8m0fnu`` (byte-identical raw E8M0). Returns
+    Rowwise-along-K quant is per-row independent, so group boundaries don't matter: reshape to
+    ``[G*N, K]``, run the rowwise kernel above in ONE launch (not a ``G``-launch Python loop),
+    reshape back. The scale is viewed as ``float8_e8m0fnu`` (byte-identical raw E8M0). Returns
     ``(w_fp8 [G,N,K] e4m3, w_scale [G,N,K//32] e8m0)``."""
     assert w.dim() == 3, f"expected 3D [G,N,K], got {tuple(w.shape)}"
     G, N, K = w.shape
@@ -312,7 +299,7 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
     else they are pad (value 0 => fp8 0).  Runtime row strides (padded total M) come in as the
     ``mpad_i32`` / ``npblk`` scalar args."""
     assert F % BT == 0, f"F={F} must be a multiple of BT={BT}"
-    blk_i32 = _BLK // 4
+    blk_i32 = MXFP8_BLOCK // 4
     n_ftile = F // BT
     fp8_max = 57344.0 if is_e5m2 else 448.0
     cvt = cvt_pk_bf8_f32 if is_e5m2 else cvt_pk_fp8_f32
@@ -348,10 +335,10 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
         offs_pc_g = buffer_load(opr, g, vec_width=1, dtype=fx.T.i32())
         in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32())
         len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32())
-        m_local0 = pmb * fx.Int32(_BLK) - fx.arith.ArithValue(offs_pc_g)  # M-offset within group
+        m_local0 = pmb * fx.Int32(MXFP8_BLOCK) - fx.arith.ArithValue(offs_pc_g)  # M-offset within group
 
         vals = []
-        for i in range_constexpr(_BLK):
+        for i in range_constexpr(MXFP8_BLOCK):
             m_local = fx.arith.ArithValue(m_local0) + fx.Int32(i)
             real = m_local < fx.arith.ArithValue(len_g)
             # clamp pad rows to the group's first row (in-bounds); select 0 for the value.
@@ -380,18 +367,14 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
 def colwise_grouped_meta(
     group_lens: torch.Tensor, group_offs: torch.Tensor, pool_rows: Optional[int] = None
 ):
-    """Precompute the (device) grouping metadata for the grouped colwise quant.  Both dW2
-    operands share the same group structure, so compute this ONCE and pass to both calls
-    (avoids re-running cumsum/repeat_interleave twice).
+    """Precompute the (device) grouping metadata for the grouped colwise quant.  Both dW2 operands
+    share the same group structure, so compute this ONCE and pass it to both calls.
 
-    ``pool_rows`` is the M extent of the pool the groups live in. Given it, the padded total is
-    bounded without reading the device: each group is padded to 128 here while the pool already
-    pads each group to BLOCK_M=256, and 128 divides 256, so the 128-padded total can never exceed
-    the pool. Taking the bound instead of the exact value removes a D2H per call -- which does not
-    just cost the copy but blocks until every kernel already queued has retired, so in a training
-    step it serialises the whole pipeline (it measured ~1 s per call, 72% of the op's host time;
-    the bf16 path takes no host read at all). Rows past the real groups are masked by ``len_g`` in
-    the kernels and never read downstream, which bound per-group offsets from ``offs_pc``.
+    ``pool_rows`` is the M extent of the pool the groups live in; given it, the padded total is
+    bounded without reading the device (each group is padded to 128 here and to BLOCK_M=256 in the
+    pool, and 128 divides 256, so the 128-padded total can never exceed the pool). Taking the bound
+    avoids a D2H, which would block until every queued kernel retired and serialise the training
+    step. Rows past the real groups are masked by ``len_g`` in the kernels.
     """
     dev = group_lens.device
     lens = group_lens.to(torch.int32)
@@ -402,17 +385,17 @@ def colwise_grouped_meta(
     if pool_rows is None:
         total_M_pad = int(offs_pc[-1].item())                               # D2H (sizes output/grid)
     else:
-        assert int(pool_rows) % _BLK == 0, f"pool_rows {pool_rows} must be a multiple of {_BLK}"
+        assert int(pool_rows) % MXFP8_BLOCK == 0, f"pool_rows {pool_rows} must be a multiple of {MXFP8_BLOCK}"
         total_M_pad = int(pool_rows)
-    n_pblk = total_M_pad // _BLK
-    # group id per 32-M block via searchsorted on the block offsets (fixed output size =>
-    # no hidden D2H, unlike repeat_interleave which syncs to size its dynamic output). Blocks past
-    # the last real group land on index G, which none of the per-group tables below can hold, so
-    # clamp them onto the last group; their rows fail the len_g mask anyway.
+    n_pblk = total_M_pad // MXFP8_BLOCK
+    # group id per 32-M block via searchsorted on the block offsets: fixed output size, so no
+    # hidden D2H (repeat_interleave would sync to size its dynamic output). Blocks past the last
+    # real group land on index G, which no per-group table below can hold, so clamp them onto the
+    # last group; their rows fail the len_g mask anyway.
     offs32 = group_offs.to(torch.int32)
     blk2grp = (
         torch.searchsorted(
-            offs_pc // _BLK, torch.arange(n_pblk, dtype=torch.int32, device=dev), right=True
+            offs_pc // MXFP8_BLOCK, torch.arange(n_pblk, dtype=torch.int32, device=dev), right=True
         )
         - 1
     ).clamp_(0, lens.numel() - 1).to(torch.int32)
@@ -420,7 +403,7 @@ def colwise_grouped_meta(
     offs_pc_g = offs_pc[grp]
     in_off_g = offs32[grp]
     len_g = lens[grp]
-    m_local0 = torch.arange(n_pblk, dtype=torch.int32, device=dev) * _BLK - offs_pc_g
+    m_local0 = torch.arange(n_pblk, dtype=torch.int32, device=dev) * MXFP8_BLOCK - offs_pc_g
     # Per-pmb WG metadata [offs_pc_g, in_off_g, len_g, m_local0] — avoids dependent VMEM chain + barrier.
     pmb_meta = torch.stack([offs_pc_g, in_off_g, len_g, m_local0], dim=1).contiguous()
     return {
@@ -430,47 +413,12 @@ def colwise_grouped_meta(
     }
 
 
-def colwise_quant_mxfp8_grouped_flydsl(
-    x: torch.Tensor, out_dtype: torch.dtype,
-    group_lens: torch.Tensor = None, group_offs: torch.Tensor = None,
-    meta: dict = None, BT: int = 256,
-):
-    """Grouped colwise (along-M) MXFP8 transpose-quant, per-group M padded to 128.
-
-    Args:
-        x: bf16 ``[total_M, F]`` (groups stacked along M).
-        group_lens/group_offs: int ``[G]`` / ``[G+1]`` (unpadded) -- used if ``meta`` is None.
-        meta: precomputed ``colwise_grouped_meta`` (share across both dW2 operands).
-
-    Returns ``(q, s, lens_pc, offs_pc)`` (drop-in for the wgrad's colwise operand):
-        q: fp8 ``[F, total_M_pad]``   s: uint8 ``[F, total_M_pad//32]``.
-    """
-    assert x.dim() == 2 and x.dtype == torch.bfloat16, "x must be bf16 [total_M, F]"
-    M, F = x.shape
-    is_e5m2 = out_dtype == torch.float8_e5m2
-    if meta is None:
-        meta = colwise_grouped_meta(group_lens, group_offs, pool_rows=M)
-    total_M_pad, n_pblk = meta["total_M_pad"], meta["n_pblk"]
-    q = torch.empty((F, total_M_pad), dtype=out_dtype, device=x.device)
-    s = torch.empty((F, n_pblk), dtype=torch.uint8, device=x.device)
-    while F % BT != 0:
-        BT //= 2
-    _compile_colwise_quant_grouped(F, is_e5m2, BT)(
-        x, q, s, meta["blk2grp"], meta["lens"], meta["offs32"], meta["offs_pc"],
-        total_M_pad // 4, n_pblk, n_pblk,
-    )
-    return q, s, meta["lens_pc"], meta["offs_pc"]
-
-
 # ── fp8-in fused dequant->colwise-requant (a-branch producer fusion) ─────────────────────────
-# The dW2 `a` operand (`dispatch_l2_grad`) originates from the backward L2-dgrad fp8 pool, which is
-# ROWWISE MXFP8 (E4M3 [P,H] + per-1x32-H E8M0 scale [P,H//32]) because that layout is what the
-# L2 dgrad MMA contracts. dW2, however, contracts over P and needs the operand quantized
-# COLWISE (along P). The current path dequants the pool to a bf16 `dispatch_l2_grad` (HBM
-# round-trip) then re-quantizes it colwise. This kernel FUSES both: it reads the rowwise-fp8 pool
-# directly, dequants in-register (cvt_f32_fp8 * 2^(e8m0-127)), and emits the colwise (transposed)
-# fp8 operand dW2 wants -- eliminating the bf16 intermediate. Numerically identical to
-# dequant->requant (the pool fp8 dequants exactly), just without the bf16 materialization.
+# The dW2 `a` operand comes out of the L2-dgrad pool as ROWWISE MXFP8 (E4M3 [P,H] + E8M0 [P,H//32]),
+# the layout that MMA contracts, but dW2 contracts over P and needs it COLWISE. This kernel reads
+# the rowwise-fp8 pool directly, dequants in-register (cvt_f32_fp8 * 2^(e8m0-127)) and emits the
+# transposed operand, with no bf16 intermediate. The pool fp8 dequants exactly, so the result is
+# numerically identical to a dequant->requant round-trip through HBM.
 
 
 @functools.lru_cache(maxsize=64)
@@ -481,24 +429,23 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
     column ``f`` and colwise-quantizes its ``MB*32`` M-values (decode ROWWISE-fp8 E4M3 + raw E8M0
     ``2^(e8m0-127)``, then per-32-M-block amax/requant).
 
-    KEY (write coalescing): the naive path has each thread write its column's fp8 to the transposed
-    output ``[F, total_M_pad]`` -- consecutive threads (columns) hit consecutive output ROWS (stride
-    ``mpad``), so a wavefront scatters to 64 different cache lines (``TCC_WRREQ`` 3.6x ``RDREQ``).
-    Here the computed fp8 is first staged in LDS (``[BT col][MB*8 i32]``), then written back with
-    threads re-mapped so 32 consecutive lanes emit 32 consecutive M-i32 of ONE row (128 B, one full
-    line) -- turning the scattered per-lane writes into coalesced full-line writes."""
+    The LDS stage exists for write coalescing: writing each column straight to the transposed output
+    ``[F, total_M_pad]`` puts consecutive threads on consecutive output ROWS (stride ``mpad``), so a
+    wavefront scatters over 64 cache lines. Staging the fp8 in LDS (``[BT col][MB*8 i32]``) lets the
+    write-back re-map threads so 32 consecutive lanes emit 32 consecutive M-i32 of ONE row (a full
+    128 B line)."""
     assert F % BT == 0, f"F={F} must be a multiple of BT={BT}"
-    assert F % _BLK == 0, f"F={F} must be a multiple of {_BLK} (rowwise scale columns)"
-    blk_i32 = _BLK // 4                # fp8 i32 words per 32-block (=8)
+    assert F % MXFP8_BLOCK == 0, f"F={F} must be a multiple of {MXFP8_BLOCK} (rowwise scale columns)"
+    blk_i32 = MXFP8_BLOCK // 4      # fp8 i32 words per 32-block (=8)
     n_ftile = F // BT
-    F32 = F // _BLK                    # rowwise E8M0 scale columns (per input row)
-    RPT = MB * blk_i32                 # output i32 per column (MB blocks * 8 words)
-    TILE_I32 = BT * RPT                # LDS out-tile size
+    F32 = F // MXFP8_BLOCK          # rowwise E8M0 scale columns (per input row)
+    RPT = MB * blk_i32              # output i32 per column (MB blocks * 8 words)
+    TILE_I32 = BT * RPT             # LDS out-tile size
     assert TILE_I32 % BT == 0
-    n_wr = TILE_I32 // BT              # coalesced-write iterations (= RPT)
-    SCPT = BT // _BLK                  # rowwise scale columns per F-tile (shared 32-wide)
-    MROWS = MB * _BLK                  # M-rows per workgroup
-    SC_N = MROWS * SCPT                # scale slab entries (= MB*BT)
+    n_wr = TILE_I32 // BT           # coalesced-write iterations (= RPT)
+    SCPT = BT // MXFP8_BLOCK        # rowwise scale columns per F-tile (shared 32-wide)
+    MROWS = MB * MXFP8_BLOCK        # M-rows per workgroup
+    SC_N = MROWS * SCPT             # scale slab entries (= MB*BT)
     fp8_max = 57344.0 if is_e5m2_out else 448.0
     cvt = cvt_pk_bf8_f32 if is_e5m2_out else cvt_pk_fp8_f32
     mbits = 2 if is_e5m2_out else 3
@@ -544,9 +491,9 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
         offs_pc_g = buffer_load(opr, g, vec_width=1, dtype=fx.T.i32())
         in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32())
         len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32())
-        m_local0 = pmb0 * fx.Int32(_BLK) - fx.arith.ArithValue(offs_pc_g)
-        scol_base = ftile * fx.Int32(SCPT)          # first rowwise scale col of this F-tile
-        scol_local = tid // fx.Int32(_BLK)          # this column's scol within the tile
+        m_local0 = pmb0 * fx.Int32(MXFP8_BLOCK) - fx.arith.ArithValue(offs_pc_g)
+        scol_base = ftile * fx.Int32(SCPT)         # first rowwise scale col of this F-tile
+        scol_local = tid // fx.Int32(MXFP8_BLOCK)  # this column's scol within the tile
 
         def row_of(r):
             m_local = fx.arith.ArithValue(m_local0) + r
@@ -569,8 +516,8 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
         # ── compute: each column's MB blocks -> fp8 words into LDS out-tile + scale to global ──
         for mb in range_constexpr(MB):
             vals = []
-            for i in range_constexpr(_BLK):
-                r = mb * _BLK + i
+            for i in range_constexpr(MXFP8_BLOCK):
+                r = mb * MXFP8_BLOCK + i
                 real, row = row_of(fx.Int32(r))
                 qb = buffer_load(xqr, row * fx.Int32(F) + f, vec_width=1, dtype=fx.T.i8())
                 qb_i32 = fx.arith.ArithValue(qb).extui(fx.T.i32())
@@ -616,8 +563,8 @@ def colwise_requant_mxfp8_grouped_fp8in_flydsl(
 ):
     """Grouped fp8-in colwise (along-M) MXFP8 transpose-requant, per-group M padded to 128.
 
-    Drop-in replacement for ``colwise_quant_mxfp8_grouped_flydsl`` when the operand is already the
-    L2-dgrad rowwise-fp8 pool (fusing the dequant->requant round-trip).
+    Takes the operand straight from the L2-dgrad rowwise-fp8 pool, fusing away the
+    dequant->bf16->requant round-trip.
 
     Args:
         q_in: rowwise-fp8 (E4M3) ``[total_M, F]`` (the dispatched-dy pool).
@@ -626,12 +573,12 @@ def colwise_requant_mxfp8_grouped_fp8in_flydsl(
         group_lens/group_offs: int ``[G]`` / ``[G+1]`` (unpadded) -- used if ``meta`` is None.
         meta: precomputed ``colwise_grouped_meta`` (share across both dW2 operands).
 
-    Returns ``(q, s, lens_pc, offs_pc)`` (identical layout to ``colwise_quant_mxfp8_grouped_flydsl``):
+    Returns ``(q, s, lens_pc, offs_pc)``:
         q: fp8 ``[F, total_M_pad]``   s: uint8 ``[F, total_M_pad//32]``.
     """
     assert q_in.dim() == 2 and s_in.dim() == 2, "q_in [total_M, F], s_in [total_M, F//32]"
     M, F = q_in.shape
-    assert s_in.shape[1] == F // _BLK, f"s_in cols {s_in.shape[1]} != F//32 {F // _BLK}"
+    assert s_in.shape[1] == F // MXFP8_BLOCK, f"s_in cols {s_in.shape[1]} != F//32 {F // MXFP8_BLOCK}"
     is_e5m2_out = out_dtype == torch.float8_e5m2
     if meta is None:
         meta = colwise_grouped_meta(group_lens, group_offs, pool_rows=M)
@@ -654,9 +601,9 @@ def colwise_requant_mxfp8_grouped_fp8in_flydsl(
 
 
 # ── dW2 dual-launch: fp8-in pool requant (a) + bf16 act colwise-quant (b) ────────────────────
-# Independent grids (requant ``n_mwg*(H/BT)`` heavy + quant ``n_pblk*(I/BT)`` light LDS=0), same
-# ``meta``, back-to-back on one stream.  Byte-exact to the two shipped kernels; avoids the
-# single-WG serial-tail fusion that held 36KB LDS through the act phase.
+# Two independent grids (heavy requant + light LDS-free quant) sharing one ``meta``, back-to-back on
+# one stream. Byte-exact to calling the two kernels separately, and unlike a single-workgroup fusion
+# it does not hold the requant's 36KB LDS through the act phase.
 
 
 @functools.lru_cache(maxsize=64)
@@ -690,15 +637,15 @@ def colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
     """dW2 colwise operands: pool rowwise-fp8 requant (a) + bf16 act quant (b), dual-launch.
 
     Uses two independent kernels (heavy requant grid + light quant grid) on one stream with
-    shared ``meta``.  Returns ``(a_t, a_ts, b_t, b_ts, lens_pc, offs_pc)`` -- byte-exact to
-    ``colwise_requant_mxfp8_grouped_fp8in_flydsl`` +
-    ``colwise_quant_mxfp8_grouped_flydsl``."""
+    shared ``meta``.  Returns ``(a_t, a_ts, b_t, b_ts, lens_pc, offs_pc)``; the ``a`` half is
+    byte-exact to ``colwise_requant_mxfp8_grouped_fp8in_flydsl``, and the roles reverse for dW1
+    (bf16 operand as ``a``), so callers there read the two halves swapped."""
     assert q_in.dim() == 2 and s_in.dim() == 2 and x_bf16.dim() == 2
     assert x_bf16.dtype == torch.bfloat16
     M, F_a = q_in.shape
     M_b, F_b = x_bf16.shape
     assert M == M_b, f"pool rows {M} != act rows {M_b}"
-    assert s_in.shape[1] == F_a // _BLK
+    assert s_in.shape[1] == F_a // MXFP8_BLOCK
     is_e5m2_out = out_dtype == torch.float8_e5m2
     if meta is None:
         meta = colwise_grouped_meta(group_lens, group_offs, pool_rows=M)
@@ -727,19 +674,19 @@ def colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
 
 # ── FUSED rowwise + colwise dual-quant (one read of grad_l1 -> both operands) ─────────────────
 # grad_l1 [P, F] bf16 is needed BOTH rowwise-preshuffled (E4M3, the L1 fc1-dgrad) and colwise-grouped
-# (E5M2, dW1 wgrad). Reading it twice (the two shipped kernels) costs an extra HBM read; this fuses
-# both from ONE read via a 32xBT bf16 tile staged in LDS -> colwise reads down columns, rowwise reads
-# across each 32-feature block. Rowwise ``q`` matches ``quantize_rowwise_mxfp8_flydsl``;
-# ``a_sp`` pack=4 fused in-kernel: one workgroup/pool M-block loops all F-tiles then packs (single launch).
+# (E5M2, dW1 wgrad). Both come from ONE read via a 32xBT bf16 tile staged in LDS: colwise reads down
+# columns, rowwise across each 32-feature block. Rowwise ``q`` matches
+# ``quantize_rowwise_mxfp8_flydsl``; the pack=4 ``a_sp`` preshuffle is fused in, one workgroup per
+# pool M-block looping all F-tiles then packing, so it stays a single launch.
 
 
 @functools.lru_cache(maxsize=64)
-def _compile_rowcol_dual_pack_grouped(F: int, BT: int = 256):
+def compile_rowcol_dual_pack_grouped(F: int, BT: int = 256):
     """Pack=4 a_sp preshuffle for grouped rowcol dual-quant (reads s_raw written by quant kernel)."""
-    n_blk = F // _BLK
+    n_blk = F // MXFP8_BLOCK
     K128p = ceildiv(F // 128, 4)
     n_out_pack = K128p * 4
-    n_row_pack_slots = _BLK * n_out_pack
+    n_row_pack_slots = MXFP8_BLOCK * n_out_pack
     n_pack_rounds = (n_row_pack_slots + BT - 1) // BT
 
     @flyc.kernel(known_block_size=[BT, 1, 1])

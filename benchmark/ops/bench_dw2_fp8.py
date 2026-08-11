@@ -29,8 +29,7 @@ import torch.distributed as dist
 import primus_turbo.pytorch  # noqa: F401
 from primus_turbo.flydsl.mega.fp8 import (
     colwise_grouped_meta,
-    colwise_quant_mxfp8_grouped_flydsl,
-    colwise_requant_mxfp8_grouped_fp8in_flydsl,
+    colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
     extend_handle,
@@ -168,14 +167,14 @@ def profile(group, args):
             default_backend=BackendType.TRITON.value,
         )
 
-    # BREAKDOWN: pre-quantize the two operands ONCE (outside the timed loop) so we can time the
-    # ISOLATED fp8 variable-K GEMM (the ~2x-vs-bf16 win) apart from the requant(pool)/quant(act)
-    # overhead that the `full` fp8 wgrad pays per call. Mirrors the source test_dw2_bench breakdown.
+    # BREAKDOWN: produce both operands ONCE (outside the timed loop) so we can time the ISOLATED fp8
+    # variable-K GEMM (the ~2x-vs-bf16 win) apart from the operand-quant overhead the `full` fp8 wgrad
+    # pays per call. One dual launch produces both, exactly as production does: the `a` half requants
+    # the fp8 pool and the `b` half quantizes act_weighted, so timing the halves apart would not add up.
     meta0 = colwise_grouped_meta(group_lens, group_offs)
-    a_t, a_ts, lens_pc, offs_pc = colwise_requant_mxfp8_grouped_fp8in_flydsl(
-        pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta0
+    a_t, a_ts, b_t, b_ts, lens_pc, offs_pc = colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
+        pool_fp8, pool_scale, act_weighted, _DW_FP8_FORMAT, meta=meta0
     )
-    b_t, b_ts, _, _ = colwise_quant_mxfp8_grouped_flydsl(act_weighted, _DW_FP8_FORMAT, meta=meta0)
 
     def _gemm():  # isolated fp8 variable-K GEMM on pre-quantized operands (no requant/quant)
         return grouped_gemm_fp8_variable_k_impl(
@@ -186,11 +185,10 @@ def profile(group, args):
             default_backend=BackendType.FLYDSL.value,
         )
 
-    def _req():  # requant the fp8 pool colwise (dW2 `a` operand producer fusion)
-        return colwise_requant_mxfp8_grouped_fp8in_flydsl(pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta0)
-
-    def _qnt():  # colwise-quant act_weighted (dW2 `b` operand)
-        return colwise_quant_mxfp8_grouped_flydsl(act_weighted, _DW_FP8_FORMAT, meta=meta0)
+    def _dual():  # both dW2 operands in one launch (requant fp8 pool + quant act_weighted)
+        return colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
+            pool_fp8, pool_scale, act_weighted, _DW_FP8_FORMAT, meta=meta0
+        )
 
     dW2_fp8 = _fp8()
     dW2_bf = _bf16()
@@ -201,13 +199,12 @@ def profile(group, args):
     t_dw2 = _bench(_fp8, warmup=args.warmup, iters=args.iters, group=group)
     t_dw2_bf = _bench(_bf16, warmup=args.warmup, iters=args.iters, group=group)
     t_gemm = _bench(_gemm, warmup=args.warmup, iters=args.iters, group=group)
-    t_req = _bench(_req, warmup=args.warmup, iters=args.iters, group=group)
-    t_qnt = _bench(_qnt, warmup=args.warmup, iters=args.iters, group=group)
+    t_dual = _bench(_dual, warmup=args.warmup, iters=args.iters, group=group)
     m_pad = int(group_offs[-1].item())
     flops = 2.0 * m_pad * H * I
     symm.destroy()
     return {"snr": snr, "nan": float(nan), "t_dw2": t_dw2, "t_dw2_bf": t_dw2_bf,
-            "t_gemm": t_gemm, "t_req": t_req, "t_qnt": t_qnt, "flops": flops, "m_pad": m_pad}
+            "t_gemm": t_gemm, "t_dual": t_dual, "flops": flops, "m_pad": m_pad}
 
 
 def _amax(group, v):
@@ -233,7 +230,7 @@ def worker(local_rank, world, args):
         r = profile(group, args)
         snr, nan = _amin(group, r["snr"]), _amax(group, r["nan"])
         t_dw2, t_dw2_bf = _amax(group, r["t_dw2"]), _amax(group, r["t_dw2_bf"])
-        t_gemm, t_req, t_qnt = _amax(group, r["t_gemm"]), _amax(group, r["t_req"]), _amax(group, r["t_qnt"])
+        t_gemm, t_dual = _amax(group, r["t_gemm"]), _amax(group, r["t_dual"])
         if rank == 0:
             tf = lambda ms: r["flops"] / (ms * 1e-3) / 1e12
             print(f"\n{'='*72}")
@@ -244,8 +241,8 @@ def worker(local_rank, world, args):
             print(f"  dW2 bf16 ref : {t_dw2_bf:8.3f} ms | {tf(t_dw2_bf):8.1f} TFLOPS")
             print(f"  fp8/bf16     : FULL {t_dw2 / t_dw2_bf:.3f}x  |  GEMM-only {t_gemm / t_dw2_bf:.3f}x  "
                   f"({'fp8 faster' if t_dw2 < t_dw2_bf else 'fp8 SLOWER'} full)")
-            print(f"  breakdown    : requant(pool)={t_req:.3f}  quant(act)={t_qnt:.3f}  "
-                  f"GEMM={t_gemm:.3f} ms ({tf(t_gemm):.0f} TFLOPS)  [sum={t_req + t_qnt + t_gemm:.3f}]")
+            print(f"  breakdown    : operands(dual)={t_dual:.3f}  "
+                  f"GEMM={t_gemm:.3f} ms ({tf(t_gemm):.0f} TFLOPS)  [sum={t_dual + t_gemm:.3f}]")
             print(f"  [acc] dW2 fp8 vs bf16: SNR={snr:.2f} dB  nan={bool(nan)}  "
                   f"{'PASS' if snr >= 15.0 and not nan else 'FAIL'} (gate SNR>=15dB)")
         torch.cuda.synchronize(); group.barrier()

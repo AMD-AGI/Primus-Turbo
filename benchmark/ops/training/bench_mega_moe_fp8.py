@@ -84,7 +84,6 @@ from primus_turbo.flydsl.mega import (  # noqa: E402  (SwiGLU fwd/bwd; shared wi
 )
 from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402  (vendored fp8 stack)
     colwise_grouped_meta,
-    colwise_quant_mxfp8_grouped_flydsl,
     colwise_requant_mxfp8_grouped_fp8in_flydsl,
     colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     dispatch_grouped_gemm_mxfp8,
@@ -459,10 +458,9 @@ def profile_fc2_wgrad(group, args, mode):
     # BREAKDOWN: pre-quantize both operands ONCE (outside the timed loop) -> time the ISOLATED fp8
     # variable-K GEMM apart from the per-call requant(pool)/quant(act) the FULL fp8 wgrad pays.
     meta0 = colwise_grouped_meta(group_lens, group_offs)
-    a_t, a_ts, lens_pc, offs_pc = colwise_requant_mxfp8_grouped_fp8in_flydsl(
-        pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta0
+    a_t, a_ts, b_t, b_ts, lens_pc, offs_pc = colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
+        pool_fp8, pool_scale, act_weighted, _DW_FP8_FORMAT, meta=meta0
     )
-    b_t, b_ts, _, _ = colwise_quant_mxfp8_grouped_flydsl(act_weighted, _DW_FP8_FORMAT, meta=meta0)
 
     def _gemm():  # isolated fp8 variable-K GEMM on pre-quantized operands (no requant/quant)
         return grouped_gemm_fp8_variable_k_impl(
@@ -478,11 +476,8 @@ def profile_fc2_wgrad(group, args, mode):
             pool_fp8, pool_scale, act_weighted, _DW_FP8_FORMAT, meta=meta0,
         )
 
-    def _req():  # requant the fp8 pool colwise (dW2 `a` operand producer)
+    def _req():  # the dual's heavy half alone: requant the fp8 pool colwise (dW2 `a` operand)
         return colwise_requant_mxfp8_grouped_fp8in_flydsl(pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta0)
-
-    def _qnt():  # colwise-quant act_weighted (dW2 `b` operand)
-        return colwise_quant_mxfp8_grouped_flydsl(act_weighted, _DW_FP8_FORMAT, meta=meta0)
 
     def _meta():  # grouped meta (one total_M_pad D2H); shared by requant/quant inside the FULL op
         return colwise_grouped_meta(group_lens, group_offs)
@@ -495,25 +490,23 @@ def profile_fc2_wgrad(group, args, mode):
     t_gemm = _bench_b2b(_gemm, warmup=args.warmup, iters=args.iters, group=group)
     t_pair = _bench_b2b(_pair, warmup=args.warmup, iters=args.iters, group=group)
     t_req = _bench_b2b(_req, warmup=args.warmup, iters=args.iters, group=group)
-    t_qnt = _bench_b2b(_qnt, warmup=args.warmup, iters=args.iters, group=group)
     t_meta = _bench_b2b(_meta, warmup=args.warmup, iters=args.iters, group=group)
     m_pad = int(group_offs[-1].item())
     flops = 2.0 * m_pad * H * I  # wgrad GEMM: [P,H]^T @ [P,I] -> [H,I] over the pool
     symm.destroy()
     return {"nan": float(nan), "fp8_ms": t_fp8, "gemm_ms": t_gemm,
-            "req_ms": t_req, "qnt_ms": t_qnt, "pair_ms": t_pair, "meta_ms": t_meta, "flops": flops, "m_pad": m_pad}
+            "req_ms": t_req, "pair_ms": t_pair, "meta_ms": t_meta, "flops": flops, "m_pad": m_pad}
 
 
 def profile_fc1_wgrad(group, args, mode):
     """Backward fc1 wgrad (dW1), MXFP8 variable-K wgrad, LOCAL. Replays backward up to dW1 on the
     real mega pool: fwd L1 -> (l1, dispatch_weights) + CLONE the forward-dispatched fc1-input pool
     (pool_x, native rowwise-fp8) BEFORE the dispatch_fc2_dgrad stage overwrites symm.pool_fp8; dispatch(dy)+fc2-dgrad ->
-    grad_swiglu; swiglu_backward -> grad_l1. Then dW1 = grad_l1^T @ pool_x (variable-K) BOTH ways:
-      * fp8  : ``_mxfp8_variable_k_wgrad_dw1`` (colwise-quant grad_l1 + colwise-requant fp8 pool_x -> fp8 GEMM)
-      * bf16 : ``grouped_gemm_variable_k_impl`` (Triton) on the dequant'd pool.
-    LOCAL: reuses the forward-dispatched pool, so unlike the bf16 fused path there is NO cross-rank
-    re-dispatch of saved_x -> the real fp8 advantage is LARGER than the GEMM-only ratio here (which
-    compares both on the same local pool). Back-to-back timing; FULL vs GEMM-only + breakdown; SNR gate."""
+    grad_swiglu; the swiglu-bwd dual quant -> colwise grad_l1. Then dW1 = grad_l1^T @ pool_x (variable-K)
+    via ``_mxfp8_variable_k_wgrad_dw1`` (colwise-requant fp8 pool_x -> fp8 GEMM); the bf16 reference for
+    this stage lives in bench_mega_moe_bf16.py. LOCAL: reuses the forward-dispatched pool, so unlike the
+    bf16 fused path there is NO cross-rank re-dispatch of saved_x -> the real fp8 advantage is LARGER
+    than the GEMM-only ratio here. Back-to-back timing; FULL vs GEMM-only + breakdown; finite check."""
     rank, world = group.rank(), group.size()
     H, I, E, K, T, BM, BN = args.hidden, args.inter, args.num_experts, args.num_topk, args.num_tokens, args.bm, args.bn
     epr = E // world
@@ -542,23 +535,22 @@ def profile_fc1_wgrad(group, args, mode):
     pool_x_fp8 = (symm.pool_fp8.clone(), symm.pool_scale.reshape(Pp, Hp // 32).clone())
 
     grad_swiglu, _ = _dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, W2, group, handle)
-    grad_l1, _, _ = swiglu_backward_flydsl_kernel(
-        grad_swiglu, l1, symm.meta_scalars[1:2], scale=dispatch_weights, return_gate=True, return_act_w=True,
-    )
     group_lens, group_offs = handle[_H_GROUP_LENS], handle[_H_GROUP_OFFS]
-
-    def _fp8():  # FULL dW1 (isolated): meta + colwise-quant grad_l1 + colwise-requant pool_x + GEMM.
-        # dW1 now takes the colwise grad_l1 operand PRE-quantized (shared with the L1 dgrad via the fused
-        # dual-quant in the real backward); in isolation we still quantize it here so FULL is comparable.
-        meta_f = colwise_grouped_meta(group_lens, group_offs)
-        a_colwise = colwise_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=meta_f)[:2]
-        return _mxfp8_variable_k_wgrad_dw1(a_colwise, pool_x_fp8, meta_f, pool_x_is_colwise=False)
-
-    # BREAKDOWN: pre-quantize both operands ONCE -> isolate the fp8 variable-K GEMM from the per-call
-    # colwise quant(grad_l1)/requant(pool_x). (dW1: `a`=grad_l1 quant, `b`=pool_x requant.)
     pool_fp8, pool_scale = pool_x_fp8
+
+    # dW1's `a` operand is the colwise grad_l1 that the production swiglu-bwd dual quant emits (shared
+    # with the L1 dgrad), so produce it once here -- dW1 itself never pays a quant for it.
     meta0 = colwise_grouped_meta(group_lens, group_offs)
-    a_t, a_ts, lens_pc, offs_pc = colwise_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=meta0)
+    _, _, a_t, a_ts, _, _ = swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
+        grad_swiglu, l1, dispatch_weights, _DW_FP8_FORMAT, meta=meta0,
+    )
+    lens_pc, offs_pc = meta0["lens_pc"], meta0["offs_pc"]
+
+    def _fp8():  # FULL dW1 (isolated): colwise-requant pool_x + GEMM, meta and `a` shared per step
+        return _mxfp8_variable_k_wgrad_dw1((a_t, a_ts), pool_x_fp8, meta0, pool_x_is_colwise=False)
+
+    # BREAKDOWN: pre-requant the `b` operand too -> isolate the fp8 variable-K GEMM from the per-call
+    # colwise requant(pool_x).
     b_t, b_ts, _, _ = colwise_requant_mxfp8_grouped_fp8in_flydsl(pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta0)
 
     def _gemm():  # isolated fp8 variable-K GEMM on pre-quantized operands
@@ -570,13 +562,10 @@ def profile_fc1_wgrad(group, args, mode):
             default_backend=BackendType.FLYDSL.value,
         )
 
-    def _qnt():  # colwise-quant grad_l1 (dW1 `a` operand)
-        return colwise_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=meta0)
-
     def _req():  # requant the fp8 pool_x colwise (dW1 `b` operand)
         return colwise_requant_mxfp8_grouped_fp8in_flydsl(pool_fp8, pool_scale, _DW_FP8_FORMAT, meta=meta0)
 
-    def _meta():  # grouped meta (one total_M_pad D2H); shared inside the FULL op
+    def _meta():  # grouped meta (one total_M_pad D2H); built once per step, shared by both wgrads
         return colwise_grouped_meta(group_lens, group_offs)
 
     dW1_fp8 = _fp8()
@@ -585,14 +574,13 @@ def profile_fc1_wgrad(group, args, mode):
 
     t_fp8 = _bench_b2b(_fp8, warmup=args.warmup, iters=args.iters, group=group)
     t_gemm = _bench_b2b(_gemm, warmup=args.warmup, iters=args.iters, group=group)
-    t_qnt = _bench_b2b(_qnt, warmup=args.warmup, iters=args.iters, group=group)
     t_req = _bench_b2b(_req, warmup=args.warmup, iters=args.iters, group=group)
     t_meta = _bench_b2b(_meta, warmup=args.warmup, iters=args.iters, group=group)
     m_pad = int(group_offs[-1].item())
     flops = 2.0 * m_pad * (2 * I) * H  # wgrad GEMM: [P,2I]^T @ [P,H] -> [2I,H] over the pool
     symm.destroy()
     return {"nan": float(nan), "fp8_ms": t_fp8, "gemm_ms": t_gemm,
-            "req_ms": t_req, "qnt_ms": t_qnt, "meta_ms": t_meta, "flops": flops, "m_pad": m_pad}
+            "req_ms": t_req, "meta_ms": t_meta, "flops": flops, "m_pad": m_pad}
 
 
 def profile_fc1_dgrad_combine(group, args, mode):
@@ -744,14 +732,14 @@ def worker(local_rank, world, args):
                 r = profile_fc2_wgrad(group, args, mode)
                 nan = _amax(group, r["nan"])
                 fp8_ms = _amax(group, r["fp8_ms"])
-                gemm_ms, req_ms, qnt_ms = _amax(group, r["gemm_ms"]), _amax(group, r["req_ms"]), _amax(group, r["qnt_ms"])
+                gemm_ms, req_ms = _amax(group, r["gemm_ms"]), _amax(group, r["req_ms"])
                 pair_ms, meta_ms = _amax(group, r["pair_ms"]), _amax(group, r["meta_ms"])
                 if rank == 0:
                     tf = lambda ms: r["flops"] / (ms * 1e-3) / 1e12
                     print(f"\n{'='*80}\n[mega MoE bwd fc2 wgrad (dW2, variable-K)  fp8]  {hdr}\n{'='*80}")
                     print(f"  fp8  FULL : {fp8_ms:8.3f} ms | {tf(fp8_ms):8.1f} TFLOPS  (dual quant+GEMM; meta once/step; M_pool={r['m_pad']})")
                     print(f"  breakdown: meta(step)={meta_ms:.3f}  dual(requant+quant)={pair_ms:.3f}  "
-                          f"[sep: requant={req_ms:.3f} quant={qnt_ms:.3f}]  "
+                          f"[requant half alone={req_ms:.3f}]  "
                           f"GEMM={gemm_ms:.3f} ms ({tf(gemm_ms):.0f} TFLOPS)  "
                           f"[sum={pair_ms + gemm_ms:.3f} excl meta]")
                     print(f"  [acc] dW2 fp8 finite={not bool(nan >= 1.0)}  "
@@ -762,14 +750,14 @@ def worker(local_rank, world, args):
                 r = profile_fc1_wgrad(group, args, mode)
                 nan = _amax(group, r["nan"])
                 fp8_ms = _amax(group, r["fp8_ms"])
-                gemm_ms, req_ms, qnt_ms = _amax(group, r["gemm_ms"]), _amax(group, r["req_ms"]), _amax(group, r["qnt_ms"])
+                gemm_ms, req_ms = _amax(group, r["gemm_ms"]), _amax(group, r["req_ms"])
                 meta_ms = _amax(group, r["meta_ms"])
                 if rank == 0:
                     tf = lambda ms: r["flops"] / (ms * 1e-3) / 1e12
                     print(f"\n{'='*80}\n[mega MoE bwd fc1 wgrad (dW1, variable-K, LOCAL)  fp8]  {hdr}\n{'='*80}")
-                    print(f"  fp8  FULL : {fp8_ms:8.3f} ms | {tf(fp8_ms):8.1f} TFLOPS  (meta+quant+requant+GEMM; M_pool={r['m_pad']})")
-                    print(f"  breakdown: meta={meta_ms:.3f}  quant(grad_l1)={qnt_ms:.3f}  requant(pool_x)={req_ms:.3f}  "
-                          f"GEMM={gemm_ms:.3f} ms ({tf(gemm_ms):.0f} TFLOPS)  [sum={meta_ms + qnt_ms + req_ms + gemm_ms:.3f}]")
+                    print(f"  fp8  FULL : {fp8_ms:8.3f} ms | {tf(fp8_ms):8.1f} TFLOPS  (requant+GEMM; meta and colwise grad_l1 once/step; M_pool={r['m_pad']})")
+                    print(f"  breakdown: meta(step)={meta_ms:.3f}  requant(pool_x)={req_ms:.3f}  "
+                          f"GEMM={gemm_ms:.3f} ms ({tf(gemm_ms):.0f} TFLOPS)  [sum={req_ms + gemm_ms:.3f} excl meta]")
                     print(f"  [acc] dW1 fp8 finite={not bool(nan >= 1.0)}  (fp8-vs-bf16 SNR -> e2e gradcheck; "
                           f"bf16 ref -> bench_mega_moe_bf16.py). fp8 dW1 is LOCAL (reuses fwd pool).")
                 torch.cuda.synchronize(); group.barrier()

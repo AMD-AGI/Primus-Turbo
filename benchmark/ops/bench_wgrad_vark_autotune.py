@@ -39,15 +39,17 @@ def _setup_dw2(M, H, I, G, meta):
 
 def _setup_dw1(M, H, I, G, meta):
     from primus_turbo.flydsl.mega.fp8 import (
-        colwise_quant_mxfp8_grouped_flydsl,
-        colwise_requant_mxfp8_grouped_fp8in_flydsl,
+        colwise_requant_fp8in_and_quant_bf16_grouped_flydsl,
     )
 
     gl1 = torch.randn(M, 2 * I, device="cuda", dtype=torch.bfloat16)
     pool = torch.randn(M, H, device="cuda").to(torch.float8_e4m3fn)
     psc = torch.randint(120, 140, (M, H // 32), device="cuda", dtype=torch.uint8)
-    a_t, a_ts, _, _ = colwise_quant_mxfp8_grouped_flydsl(gl1, float8_e5m2, meta=meta)
-    b_t, b_ts, _, _ = colwise_requant_mxfp8_grouped_fp8in_flydsl(pool, psc, float8_e5m2, meta=meta)
+    # dW1 takes the operand roles the other way round from dW2 -- `a` is the bf16 grad_l1 quant and
+    # `b` the fp8 pool requant -- so the dual's two outputs land swapped here.
+    b_t, b_ts, a_t, a_ts, _, _ = colwise_requant_fp8in_and_quant_bf16_grouped_flydsl(
+        pool, psc, gl1, float8_e5m2, meta=meta,
+    )
     return a_t, a_ts, b_t, b_ts, 2 * I, H
 
 

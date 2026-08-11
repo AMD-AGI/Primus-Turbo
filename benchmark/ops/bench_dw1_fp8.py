@@ -9,8 +9,8 @@
 Replicates the backward up to dW1 on real mega-pool data: forward L1 -> (l1, dispatch_weights) and
 CLONE the forward-dispatched fc1-input pool (pool_x, native rowwise-fp8) BEFORE the L2 dgrad overwrites it;
 the L2 dgrad (dispatch(dy)+fc2); SwiGLU^T -> grad_l1. Then dW1 = grad_l1^T @ pool_x
-(variable-K over the pool) BOTH ways on the SAME tensors -- fp8 (``_mxfp8_variable_k_wgrad_dw1``,
-colwise-quant grad_l1 + requant the fp8 pool colwise) vs bf16 (``grouped_gemm_variable_k_impl`` on
+(variable-K over the pool) BOTH ways on the SAME tensors -- fp8 (``_mxfp8_variable_k_wgrad_dw1`` on the
+dual-quant's colwise grad_l1, requanting the fp8 pool colwise) vs bf16 (``grouped_gemm_variable_k_impl`` on
 the dequant'd pool) -- and gates by SNR. dW1's fp8 path is LOCAL (reuses the forward pool, no
 cross-rank re-dispatch of saved_x). NOTE: this isolates the wgrad GEMM (both on the same local pool);
 the production bf16 dW1 additionally re-dispatches saved_x cross-rank, which fp8 avoids.
@@ -31,12 +31,12 @@ import torch.distributed as dist
 import primus_turbo.pytorch  # noqa: F401
 from primus_turbo.flydsl.mega.fp8 import (
     colwise_grouped_meta,
-    colwise_quant_mxfp8_grouped_flydsl,
     dispatch_grouped_gemm_mxfp8,
     dispatch_prologue,
     extend_handle,
     get_symm_buffer_for_mega_moe,
     quantize_grouped_weight_mxfp8_flydsl as quantize_grouped_weight_mxfp8,
+    swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
 )
 from primus_turbo.flydsl.mega import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.core.backend import BackendType
@@ -139,13 +139,18 @@ def profile(group, args):
     sc = torch.exp2((ps - 127).to(torch.float32)).view(Pp, Hp // 32, 1)
     pool_x_bf = (pf * sc).view(Pp, Hp).to(torch.bfloat16)
 
-    # Production pre-quantizes both operands elsewhere (grad_l1 in the L1 dgrad's dual quant, the pool in
-    # the forward); this isolate times them as part of dW1, so it reads HIGH against the fused path.
+    # Production pre-quantizes both operands elsewhere (grad_l1 by the swiglu-bwd dual quant, the pool in
+    # the forward). The `a` operand comes from that same dual quant here, hoisted out of the timed loop
+    # like production; the pool requant stays inside, so this still reads HIGH against the fused path.
     dw1_meta = colwise_grouped_meta(group_lens, group_offs)
+    _, _, gl1_q_col, gl1_s_col, _, _ = swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
+        grad_swiglu, l1, dispatch_weights, _DW_FP8_FORMAT, meta=dw1_meta,
+    )
 
-    def _fp8():  # colwise-quant grad_l1 + requant fp8 pool colwise -> mxfp8 variable-K wgrad (LOCAL)
-        a_col = colwise_quant_mxfp8_grouped_flydsl(grad_l1, _DW_FP8_FORMAT, meta=dw1_meta)[:2]
-        return _mxfp8_variable_k_wgrad_dw1(a_col, pool_x_fp8, dw1_meta, pool_x_is_colwise=False)
+    def _fp8():  # requant fp8 pool colwise -> mxfp8 variable-K wgrad on the dual-quant `a` (LOCAL)
+        return _mxfp8_variable_k_wgrad_dw1(
+            (gl1_q_col, gl1_s_col), pool_x_fp8, dw1_meta, pool_x_is_colwise=False
+        )
 
     def _bf16():  # bf16 variable-K wgrad on the dequant'd pool
         return grouped_gemm_variable_k_impl(
