@@ -37,7 +37,9 @@ routing at all. Routing only decides whether the leftover bytes happen to equal 
 FIXED: the GEMM's release kept only one `s_waitcnt(0)` + `s_barrier` before storing the done flag.
 The bf16 combine has always carried a second rendezvous there, with a note that one is not enough
 and that the `s_waitcnt` between the two barriers matters because LLVM folds adjacent `s_barrier`s.
-Set PT_COMBINE_DOUBLE_BARRIER=0 to get the old behaviour back and watch every mode above light up.
+Delete the second `s_waitcnt(0)` + `s_barrier` pair in the combine's GEMM-done release to get the
+old behaviour back and watch every mode above light up. That pair is the whole fix, and it is a
+timing workaround rather than a real release -- see the note at its emission site.
 
 What was ruled out on the way, so nobody repeats it:
   - stale origin_rank in the pool: the live-row count matches num_tokens_per_expert.sum() exactly
