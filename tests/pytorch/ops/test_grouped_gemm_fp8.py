@@ -8,7 +8,7 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from primus_turbo.pytorch.core.backend import BackendChoice, BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     MXFP8_BLOCK_SIZE,
     Float8QuantConfig,
@@ -46,7 +46,7 @@ def test_fused_wgrad_backend_gate(monkeypatch, enabled, backend, expected):
     monkeypatch.setattr(
         GlobalBackendManager,
         "get_grouped_gemm_backend",
-        lambda precision: backend,
+        lambda precision: BackendChoice(backend=backend),
     )
 
     assert _fused_wgrad_enabled() is expected
