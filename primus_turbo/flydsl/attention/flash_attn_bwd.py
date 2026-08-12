@@ -4705,6 +4705,9 @@ def _blockkv_for(Skv, head_dim=64, window_left=-1):
     # NOTE: the bench's SNR/det gate never exercises this tier -- re-verify dQ/dK/dV SNR
     # and determinism at Skv >= 8192 directly whenever these thresholds move.
     if head_dim >= 128:
+        # SWA: narrow band lifts attended-fraction and re-enables Q_PAIR (see below).
+        if window_left >= 0:
+            return 64
         return 192 if Skv >= 8192 else 64
     if window_left >= 0:
         # Narrowing the band raises the attended fraction BLOCK_KV/(BLOCK_KV+W) and kills
@@ -5259,13 +5262,13 @@ def _get_bwd(
         # under a window (each wave's own window is a fraction of the group's kv extent).
         # Splitting by GQA q head instead (one sharer head per wave) makes every wave want
         # every staged tile, at unchanged rows/accumulators/LDS/occupancy/work-group count;
-        # needs four sharers to spend the waves on, so D128 and odd GQA ratios fall back
-        # to the row split.
-        _dq_hpw = 4 if (_swa and D != 128 and (Hq // Hkv) % 4 == 0) else 1
+        # block_m shrinks with hpw (below) so D128 accumulators stay put, hence only odd
+        # GQA ratios (fewer than four sharers) fall back to the row split.
+        _dq_hpw = 4 if (_swa and (Hq // Hkv) % 4 == 0) else 1
         # Dispatch a run of 8 q tiles before advancing the GQA sharer group, so work-groups
         # that overlap most of their window rows stay co-resident.
         _dq_qgrp = 8 if _swa else 1
-        dq_block_m = 32 * (4 // _dq_hpw) if (_swa and D != 128) else (128 if D == 128 else 192)
+        dq_block_m = 32 * (4 // _dq_hpw) if _swa else (128 if D == 128 else 192)
         dq_l = (
             None
             if fuse_dq
