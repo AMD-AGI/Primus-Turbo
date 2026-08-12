@@ -26,8 +26,7 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
       // An idle pool stream still burns one of GPU_MAX_HW_QUEUES.
       comm_stream(is_ep_force_current_stream() ? at::cuda::getCurrentCUDAStream()
                                                : at::cuda::getStreamFromPool(true)),
-      explicitly_destroy(explicitly_destroy),
-      force_current_stream(is_ep_force_current_stream()) {
+      explicitly_destroy(explicitly_destroy), force_current_stream(is_ep_force_current_stream()) {
     // Metadata memory
     int64_t barrier_signal_bytes     = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes         = NUM_MAX_NVL_PEERS * sizeof(void *);
