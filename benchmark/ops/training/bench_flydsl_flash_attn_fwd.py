@@ -167,5 +167,7 @@ def main(output_csv=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark FlyDSL flash-attention forward")
     parser.add_argument("--output", "-o", type=str, default=None, help="Output CSV filename.")
+    parser.add_argument("--dim", type=int, default=64, choices=(64, 128), help="Head dim D (64 or 128).")
     args = parser.parse_args()
+    D = args.dim
     main(output_csv=args.output)
