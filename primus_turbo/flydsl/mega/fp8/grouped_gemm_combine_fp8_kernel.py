@@ -31,6 +31,7 @@ LOCAL fp8 L2Y buffers (``L2Y_FP8`` uint8 [pool*H], ``L2Y_SCALE`` uint8 [pool*H/3
 """
 
 import functools
+from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -698,54 +699,18 @@ def _compile(
 _L2Y_FP8_SCRATCH: dict = {}
 
 
-def _combine_mxfp8(
-    weights_fp8, handle, act_fp8, *, topk_indices, apply_weights, with_gate, default_combine_cu,
-    topk_weights=None, grad_gate=None, BM=256, BN=256,
-    num_combine_cu=None, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
-):
-    """Shared body of the two combine entries -- everything that does not depend on the direction.
+def _combine_ctx(handle, act_fp8):
+    """Everything about a combine launch that the direction does not change.
 
-    The direction reaches here already resolved: ``act_fp8`` is the (quantized, scale) pair whichever
-    entry supplied it, and ``apply_weights`` / ``with_gate`` are the constexpr flags that pick the
-    reduce's shape inside ``_compile``. Returns ``(output, d_topk_w)``; ``d_topk_w`` is None unless
-    ``with_gate``.
-
-    PURE COMPUTE: the weight comes in ALREADY prepared as ``weights_fp8 = (weight_flat, b_sp)`` (build
-    once with the op-layer ``prepare_w2_fp8``; fwd on ``w2`` [G,H,I], bwd on ``w1^T`` [G,H,2I]; op-layer
-    version-keyed) -- NO weight quant/preshuffle and NO caching here.
-
-    Self-resetting: the combine_flag / reduce_flag epoch gates are double-banked + device epoch-bumped,
-    so NO host flag reset / rendezvous.
-
-    ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 removes one, which
-    is how the benches isolate a stage. ``num_reduce_cu`` caps how many of the grid's empty blocks run
-    the reduce, the bf16 combine's meaning for the same name; see ``_compile``."""
-    weight_flat, b_sp = weights_fp8
-    tile_to_expert = handle[7]
-    symm = get_symm_buffer_for_mega_moe()
-    sym_layout = symm.make_sym_layout()
+    Kept in one place because the two entries would otherwise both carry it, and the handle reads
+    below are not the kind of thing that should exist in two copies that can drift."""
     aq, a_sp = act_fp8
     M, K = aq.shape  # K = I for the fc2 forward, 2I for the fc1^T dgrad
     dev = aq.device
+    symm = get_symm_buffer_for_mega_moe()
+    sym_layout = symm.make_sym_layout()
     H = int(sym_layout.hidden)
-    G = int(sym_layout.num_experts_per_rank)
     assert M == int(sym_layout.num_max_pool_tokens)
-    out_features = H
-    combine_slots = int(sym_layout.combine_slots)
-    num_ranks = int(sym_layout.num_ranks)
-    rank = int(sym_layout.rank_idx)
-    topk = int(sym_layout.num_topk)
-    num_experts = int(sym_layout.num_experts)
-    # Everything below that varies per call comes off the handle, never out of the live symm state.
-    # A layer's backward runs long after later layers' prologues have rewritten the shared scratch,
-    # so reading it there picks up another layer's dispatch: the tile count came back too large and
-    # exposed tiles this call never filled (they still hold the prologue's out-of-range expert
-    # sentinel, which indexed WEIGHTS one expert stride past its end), and the pool-row -> slot map
-    # came back describing another layer's routing. The three have to move together -- fixing only
-    # the count leaves the push sending rows to the wrong slots, which hangs peers' reduce.
-    num_tile_blocks = handle[_H_NUM_TILE_BLOCKS]
-    origin_rank, origin_slot = handle[_H_ORIGIN_RANK], handle[_H_ORIGIN_SLOT]
-    num_tokens = int(symm.num_tokens)
 
     sk = (M, H, dev)
     scratch = _L2Y_FP8_SCRATCH.get(sk)
@@ -753,78 +718,116 @@ def _combine_mxfp8(
         l2y_fp8 = torch.empty(M * H, dtype=torch.uint8, device=dev)
         l2y_scale = torch.empty(M * (H // 32), dtype=torch.uint8, device=dev)
         _L2Y_FP8_SCRATCH[sk] = scratch = (l2y_fp8, l2y_scale)
-    l2y_fp8, l2y_scale = scratch
+
+    # Everything below that varies per call comes off the handle, never out of the live symm state.
+    # A layer's backward runs long after later layers' prologues have rewritten the shared scratch,
+    # so reading it there picks up another layer's dispatch: the tile count came back too large and
+    # exposed tiles this call never filled (they still hold the prologue's out-of-range expert
+    # sentinel, which indexed WEIGHTS one expert stride past its end), and the pool-row -> slot map
+    # came back describing another layer's routing. The three have to move together -- fixing only
+    # the count leaves the push sending rows to the wrong slots, which hangs peers' reduce.
+    return SimpleNamespace(
+        aq=aq, a_sp=a_sp, act_flat=aq.view(torch.int8).reshape(-1), M=M, K=K, dev=dev,
+        symm=symm, sym_layout=sym_layout, out_features=H,
+        G=int(sym_layout.num_experts_per_rank),
+        combine_slots=int(sym_layout.combine_slots),
+        num_ranks=int(sym_layout.num_ranks),
+        rank=int(sym_layout.rank_idx),
+        topk=int(sym_layout.num_topk),
+        num_experts=int(sym_layout.num_experts),
+        num_tokens=int(symm.num_tokens),
+        tile_to_expert=handle[7],
+        num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
+        origin_rank=handle[_H_ORIGIN_RANK],
+        origin_slot=handle[_H_ORIGIN_SLOT],
+        l2y_fp8=scratch[0], l2y_scale=scratch[1],
+        # An unused per-role slot gets this size-1 tensor so the kernel's create_buffer_resource has a
+        # valid (never-indexed) one: TOPK_WEIGHTS is only read when apply_weights, GRAD_GATE and
+        # D_TOPK_W only when with_gate.
+        dummy_f32=torch.empty(1, dtype=torch.float32, device=dev),
+    )
 
 
-    output = torch.empty(num_tokens, out_features, dtype=torch.bfloat16, device=dev)
-    topk_indices_d = topk_indices.contiguous().view(-1)
-    # per-role tensors: an unused slot gets a size-1 dummy so the kernel's create_buffer_resource
-    # has a valid (never-indexed) tensor. TOPK_WEIGHTS only read when apply_weights; GRAD_GATE /
-    # D_TOPK_W only touched when with_gate.
-    _dummy_f32 = torch.empty(1, dtype=torch.float32, device=dev)
-    topk_weights_arg = topk_weights.contiguous().view(-1) if apply_weights else _dummy_f32
-    if with_gate:
-        d_topk_w = torch.empty(combine_slots, dtype=torch.float32, device=dev)
-        grad_gate_arg = grad_gate.contiguous().view(-1)
-    else:
-        d_topk_w, grad_gate_arg = _dummy_f32, _dummy_f32
+def _combine_launch(
+    c, weights_fp8, *, topk_indices, topk_weights_arg, grad_gate_arg, d_topk_w,
+    apply_weights, with_gate, BM, BN, combine_cu, num_reduce_cu, num_gemm_cu,
+):
+    """Compile (once per shape) and run the fused GEMM + PUSH + reduce; returns the output tensor.
 
-    act_flat = aq.view(torch.int8).reshape(-1)
-
-    def _run_with_cu(cu: int) -> None:
-        stream = torch.cuda.current_stream()
-        gemm_push_args = (
-            act_flat, weight_flat, l2y_fp8, l2y_scale, tile_to_expert, num_tile_blocks, output.view(-1),
-            topk_indices_d, symm.num_tokens_per_rank, topk_weights_arg, grad_gate_arg, d_topk_w, a_sp, b_sp,
-            origin_rank, origin_slot,
-            symm._combine_parity, symm._combine_expected, symm._reduce_expected,
-            sym_layout, out_features, stream,
-        )
-        launch = _compile(
-            out_features, K, M, BM, BN, int(cu), int(num_reduce_cu),
-            int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks),
-            apply_weights, with_gate, num_groups=int(G), num_gemm_cu=num_gemm_cu,
-        )
-        ck = (out_features, K, M, BM, BN, int(cu), int(num_reduce_cu), num_gemm_cu,
-              int(combine_slots), int(topk), int(num_experts), int(rank), int(num_ranks), int(G),
-              apply_weights, with_gate,
-              _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU)
-        run_compiled(_FP8_COMBINE_COMPILED, ck, launch, *gemm_push_args)
-
-    _run_with_cu(int(num_combine_cu) if num_combine_cu is not None else default_combine_cu)
-    return output, (d_topk_w if with_gate else None)
+    ``apply_weights`` / ``with_gate`` are forwarded, not branched on: they are constexpr in
+    ``_compile`` and select the reduce's shape inside the one kernel both directions share."""
+    weight_flat, b_sp = weights_fp8
+    output = torch.empty(c.num_tokens, c.out_features, dtype=torch.bfloat16, device=c.dev)
+    args = (
+        c.act_flat, weight_flat, c.l2y_fp8, c.l2y_scale, c.tile_to_expert, c.num_tile_blocks,
+        output.view(-1), topk_indices.contiguous().view(-1), c.symm.num_tokens_per_rank,
+        topk_weights_arg, grad_gate_arg, d_topk_w, c.a_sp, b_sp, c.origin_rank, c.origin_slot,
+        c.symm._combine_parity, c.symm._combine_expected, c.symm._reduce_expected,
+        c.sym_layout, c.out_features, torch.cuda.current_stream(),
+    )
+    launch = _compile(
+        c.out_features, c.K, c.M, BM, BN, int(combine_cu), int(num_reduce_cu),
+        c.combine_slots, c.topk, c.num_experts, c.rank, c.num_ranks,
+        apply_weights, with_gate, num_groups=c.G, num_gemm_cu=num_gemm_cu,
+    )
+    ck = (c.out_features, c.K, c.M, BM, BN, int(combine_cu), int(num_reduce_cu), num_gemm_cu,
+          c.combine_slots, c.topk, c.num_experts, c.rank, c.num_ranks, c.G,
+          apply_weights, with_gate, _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU)
+    run_compiled(_FP8_COMBINE_COMPILED, ck, launch, *args)
+    return output
 
 
 def combine_l2_fwd_mxfp8_flydsl_kernel(
     weights_fp8, handle, *, topk_indices, topk_weights, x_fp8, BM=256, BN=256,
-    num_combine_cu=None, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
+    num_combine_cu=32, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
 ):
     """Forward L2: ``act @ w2`` (K=I) + fp8 combine PUSH + WEIGHTED top-k reduce -> ``y`` [T, H] bf16.
 
     ``x_fp8 = (act_fp8, a_sp)`` comes pre-quantized from ``swiglu_mxfp8_flydsl_kernel``; there is no A
-    quant here. The routing weight is applied by the reduce, which is what ``topk_weights`` is for."""
-    y, _ = _combine_mxfp8(
-        weights_fp8, handle, x_fp8, topk_indices=topk_indices, topk_weights=topk_weights,
-        apply_weights=True, with_gate=False, default_combine_cu=32,
-        BM=BM, BN=BN, num_combine_cu=num_combine_cu, num_reduce_cu=num_reduce_cu,
-        num_gemm_cu=num_gemm_cu,
+    quant here. The routing weight is applied by the reduce, which is what ``topk_weights`` is for.
+
+    PURE COMPUTE: ``weights_fp8 = (weight_flat, b_sp)`` arrives ALREADY prepared (op-layer
+    ``prepare_w2_fp8`` on ``w2`` [G,H,I], version-keyed there) -- no weight quant/preshuffle, no
+    caching here. The combine_flag / reduce_flag epoch gates are double-banked and bumped on device,
+    so there is no host flag reset or rendezvous.
+
+    ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 removes one, which
+    is how the benches isolate a stage. See ``_compile`` for what each means."""
+    c = _combine_ctx(handle, x_fp8)
+    return _combine_launch(
+        c, weights_fp8, topk_indices=topk_indices,
+        topk_weights_arg=topk_weights.contiguous().view(-1),
+        grad_gate_arg=c.dummy_f32, d_topk_w=c.dummy_f32,
+        apply_weights=True, with_gate=False,
+        BM=BM, BN=BN, combine_cu=num_combine_cu, num_reduce_cu=num_reduce_cu, num_gemm_cu=num_gemm_cu,
     )
-    return y
 
 
 def combine_l1_dgrad_mxfp8_flydsl_kernel(
     weights_fp8, handle, *, topk_indices, grad_gate, x_fp8_rowwise, BM=256, BN=256,
-    num_combine_cu=None, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
+    num_combine_cu=24, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
 ):
     """Backward L1 dgrad: ``grad_l1 @ w1^T`` (K=2I) + fp8 combine PUSH + gate scatter + UNWEIGHTED
     top-k reduce -> ``(dx [T, H] bf16, d_topk_w [combine_slots] f32)``.
 
     ``x_fp8_rowwise = (q_row, a_sp)`` comes pre-quantized from
     ``swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl``. The reduce is unweighted because the routing weight
-    was already folded upstream; ``grad_gate`` is scattered into ``d_topk_w`` alongside it."""
-    return _combine_mxfp8(
-        weights_fp8, handle, x_fp8_rowwise, topk_indices=topk_indices, grad_gate=grad_gate,
-        apply_weights=False, with_gate=True, default_combine_cu=24,
-        BM=BM, BN=BN, num_combine_cu=num_combine_cu, num_reduce_cu=num_reduce_cu,
-        num_gemm_cu=num_gemm_cu,
+    was folded upstream; ``grad_gate`` is scattered into ``d_topk_w`` alongside it.
+
+    PURE COMPUTE: ``weights_fp8 = (weight_flat, b_sp)`` arrives ALREADY prepared (op-layer prep on
+    ``w1^T`` [G,H,2I], version-keyed there) -- no weight quant/preshuffle, no caching here. The
+    combine_flag / reduce_flag epoch gates are double-banked and bumped on device, so there is no host
+    flag reset or rendezvous.
+
+    ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 removes one, which
+    is how the benches isolate a stage. See ``_compile`` for what each means."""
+    c = _combine_ctx(handle, x_fp8_rowwise)
+    d_topk_w = torch.empty(c.combine_slots, dtype=torch.float32, device=c.dev)
+    dx = _combine_launch(
+        c, weights_fp8, topk_indices=topk_indices,
+        topk_weights_arg=c.dummy_f32,
+        grad_gate_arg=grad_gate.contiguous().view(-1), d_topk_w=d_topk_w,
+        apply_weights=False, with_gate=True,
+        BM=BM, BN=BN, combine_cu=num_combine_cu, num_reduce_cu=num_reduce_cu, num_gemm_cu=num_gemm_cu,
     )
+    return dx, d_topk_w
