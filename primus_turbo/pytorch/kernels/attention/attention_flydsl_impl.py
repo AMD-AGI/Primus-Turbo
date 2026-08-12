@@ -197,6 +197,44 @@ def flash_attn_varlen_flydsl_backward_impl(
             sink=sink,
         )
 
+    # Sparse block-diagonal (CP): empty q-segs give zero dk/dv but still launch early-exit
+    # WGs; when non-empty segs are sparse (~<=1/8), run only those as rect16 sub-problems.
+    cq = cu_seqlens_q.cpu().tolist()
+    n_seg = len(cq) - 1
+    nonempty = [s for s in range(n_seg) if cq[s + 1] > cq[s]]
+    n_ne = len(nonempty)
+    if sink is None and n_ne * 8 <= n_seg and (n_seg - n_ne) >= 8:
+        ck = cu_seqlens_k.cpu().tolist()
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+        for s in nonempty:
+            q0, q1 = cq[s], cq[s + 1]
+            k0, k1 = ck[s], ck[s + 1]
+            lq, lk = q1 - q0, k1 - k0
+            # lse is packed [total_q,Hq]; rect16 wants head-major [B=1,Hq,Sq].
+            lse_bhsq = lse[q0:q1].reshape(1, lq, Hq).permute(0, 2, 1)
+            dqs, dks, dvs = flydsl_varlen_backward(
+                dout[q0:q1].contiguous(),
+                q[q0:q1],
+                k[k0:k1],
+                v[k0:k1],
+                out[q0:q1],
+                lse_bhsq,
+                1,
+                lq,
+                lk,
+                Hq,
+                Hkv,
+                D,
+                softmax_scale,
+                window_left=window_left,
+            )
+            dq[q0:q1] = dqs
+            dk[k0:k1] = dks
+            dv[k0:k1] = dvs
+        return dq, dk, dv
+
     # Ragged / block-causal: per-segment [tok_base,tok_end) from cu_seqlens.
     B = cu_seqlens_q.numel() - 1
     Bk = cu_seqlens_k.numel() - 1
