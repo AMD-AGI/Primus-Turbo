@@ -5674,12 +5674,11 @@ def flydsl_varlen_backward(
     # correct but ~7-9x SLOWER than the split pair for every finite window (see _FUSE_DQ_SWA
     # for the measured sweep + root cause), so a finite window takes the split path by
     # default; full-causal (window_left<0) always fuses. Set _FUSE_DQ_SWA to force-fuse SWA.
-    # SBHD rides the fused path only at D128 (the reduce's dQ store is sbhd-aware there); D64 SBHD
-    # stays byte-for-byte on the split pair until its own fused migration -- (not sbhd or D == 128).
+    # SBHD now fuses at D64 too: the reduce's dQ store is sbhd-aware for any D (splits the
+    # [B,Sq] workspace row into the [Sq,B,H,D] permute) and D64's pad/ilv fall back to dense.
     fuse_dq = (
         _FUSE_DQ
         and D in (64, 128)
-        and (not sbhd or D == 128)
         and (window_left < 0 or _FUSE_DQ_SWA)
         and Sq * Skv >= 1024 * 1024
         and Sq % fuse_kv == 0
@@ -5718,6 +5717,8 @@ def flydsl_varlen_backward(
         fuse_dq
         and _DQ_PIPE
         and Sq * Skv >= 2048 * 2048
+        # THD overlaps chunks across batches; SBHD's split-axis pipeline lost to the
+        # micro-dispatch cost (4096^2 dropped 752->572TF), so keep SBHD single-dispatch.
         and (B > 1 if not sbhd else _qsp_absolute(D, block_kv, q_split))
     )
     if (fuse_dq or not _FUSE_DELTA) and not pipe:
