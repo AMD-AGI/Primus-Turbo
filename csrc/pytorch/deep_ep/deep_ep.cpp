@@ -23,12 +23,10 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
                bool low_latency_mode, bool explicitly_destroy)
     : low_latency_mode(low_latency_mode), num_nvl_bytes(num_nvl_bytes),
       num_rdma_bytes(num_rdma_bytes), rank(rank), num_ranks(num_ranks),
-      // ``comm_stream`` is always a dedicated high-priority pool stream.  When
-      // ``force_current_stream`` is true (default) it is left idle and all
-      // kernels run on the caller's current stream; otherwise it hosts the
-      // async EP communication path that overlaps with compute.
-      comm_stream(at::cuda::getStreamFromPool(true)), explicitly_destroy(explicitly_destroy),
-      force_current_stream(is_ep_force_current_stream()) {
+      // An idle pool stream still burns one of GPU_MAX_HW_QUEUES.
+      comm_stream(is_ep_force_current_stream() ? at::cuda::getCurrentCUDAStream()
+                                               : at::cuda::getStreamFromPool(true)),
+      explicitly_destroy(explicitly_destroy), force_current_stream(is_ep_force_current_stream()) {
     // Metadata memory
     int64_t barrier_signal_bytes     = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes         = NUM_MAX_NVL_PEERS * sizeof(void *);
