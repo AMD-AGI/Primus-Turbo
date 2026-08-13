@@ -35,26 +35,26 @@ D = 64
 SNR_THRESHOLD = 40.0  # bf16
 
 # (B, Hq, Hkv, Sq, Skv, window_left); window_left < 0 means full causal.
-# B>=2: with B=1 the sbhd storage is byte-identical to bshd and _infer_qkv_format
-# cannot tell them apart, so it would fall back off FlyDSL.
 SQUARE = [(2, 128, 16, s, s, -1) for s in (2048, 4096, 8192, 16384)]
-# Meta's rectangular configs (B=4), each run full-causal and with its SWA window.
+# Meta's rectangular configs, each run full-causal and with its SWA window. B=4 except at
+# 16384^2, where the fused dQ split-K workspace is one whole dQ per kv band -- 64 GiB per
+# batch at D128 -- so B=1 is what a real long-context step can afford to fuse.
 _META = [
-    (128, 16, 2048, 16384, 2048),
-    (128, 16, 4096, 16384, 2048),
-    (128, 16, 8192, 16384, 2048),
-    (128, 16, 16384, 16384, 2048),
-    (48, 6, 4096, 4096, 2047),
-    (48, 6, 4096, 8192, 2047),
-    (48, 6, 4096, 12288, 2047),
-    (48, 6, 4096, 16384, 2047),
-    (64, 8, 1024, 1024, 2047),
-    (64, 8, 1024, 16384, 2047),
+    (4, 128, 16, 2048, 16384, 2048),
+    (4, 128, 16, 4096, 16384, 2048),
+    (4, 128, 16, 8192, 16384, 2048),
+    (1, 128, 16, 16384, 16384, 2048),
+    (4, 48, 6, 4096, 4096, 2047),
+    (4, 48, 6, 4096, 8192, 2047),
+    (4, 48, 6, 4096, 12288, 2047),
+    (4, 48, 6, 4096, 16384, 2047),
+    (4, 64, 8, 1024, 1024, 2047),
+    (4, 64, 8, 1024, 16384, 2047),
 ]
 META = []
-for hq, hkv, sq, skv, w in _META:
-    META.append((4, hq, hkv, sq, skv, -1))
-    META.append((4, hq, hkv, sq, skv, w))
+for b, hq, hkv, sq, skv, w in _META:
+    META.append((b, hq, hkv, sq, skv, -1))
+    META.append((b, hq, hkv, sq, skv, w))
 
 
 def _bottom_right_mask(Sq, Skv, window_left, device):
@@ -93,6 +93,9 @@ def profile_case(B, Hq, Hkv, Sq, Skv, window_left):
     """Backward perf + grad SNR for one shape. Returns (bwd_ms, bwd_tf, check, backend)."""
     sm_scale = D ** (-0.5)
     window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
+    # The largest shapes ask for most of the card in one workspace block, so hand back the
+    # previous case's cached segments first (fragmentation alone fails the allocation).
+    torch.cuda.empty_cache()
     torch.manual_seed(0)
     # FlyDSL dense is SBHD-native: leaves are stored [S,B,H,D] and viewed as logical
     # [B,S,H,D] so _infer_qkv_format sees sbhd stride (else it falls back to aiter).

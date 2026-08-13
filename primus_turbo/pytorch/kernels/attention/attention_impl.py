@@ -163,9 +163,13 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         # FlyDSL dense forward is SBHD-native: only the no-copy sbhd layout is eligible.
+        # A single-batch tensor is that layout whichever name it gets: [1,s,h,d] and [s,1,h,d]
+        # hold the same bytes, so the batch and sequence strides tie and _infer_qkv_format
+        # settles on bshd. Admitting it keeps b=1 (long-context training) on this path.
         if k is None or not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
             return False
-        return qkv_format == "sbhd" and _flydsl_common_ok(
+        sbhd_storage = qkv_format == "sbhd" or (qkv_format == "bshd" and q.shape[0] == 1)
+        return sbhd_storage and _flydsl_common_ok(
             q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes
         )
 
