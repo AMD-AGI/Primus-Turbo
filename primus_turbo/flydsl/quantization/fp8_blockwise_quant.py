@@ -363,7 +363,7 @@ def quantize_blockwise_fp8_weight(x: torch.Tensor):
         raise ValueError("FlyDSL weight quant requires contiguous 2D BF16 input")
     M, N = x.shape
     if N % 16 or M * N * x.element_size() > 0xFFFFFFFF:
-        raise ValueError("FlyDSL weight quant requires N%16==0 and input no larger than 4 GiB")
+        raise ValueError("FlyDSL weight quant requires N%16==0 and input smaller than 4 GiB")
     q = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
     scale = torch.empty(((M + 127) // 128, (N + 127) // 128), dtype=torch.float32, device=x.device)
     stream = torch.cuda.current_stream(x.device)
@@ -380,7 +380,7 @@ def quantize_blockwise_fp8_dual(x: torch.Tensor, *, row_scale_transposed: bool):
         raise ValueError("FlyDSL dual quant requires contiguous 2D BF16 input")
     M, N = x.shape
     if M % 128 or N % 128 or M * N * x.element_size() > 0xFFFFFFFF:
-        raise ValueError("FlyDSL dual quant requires 128-aligned input no larger than 4 GiB")
+        raise ValueError("FlyDSL dual quant requires 128-aligned input smaller than 4 GiB")
     q_row = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
     scale_row_shape = (N // 128, M) if row_scale_transposed else (M, N // 128)
     scale_row = torch.empty(scale_row_shape, dtype=torch.float32, device=x.device)

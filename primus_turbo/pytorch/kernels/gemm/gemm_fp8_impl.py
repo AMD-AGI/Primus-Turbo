@@ -396,7 +396,7 @@ class GEMMFP8TurboBackend(KernelBackend):
 class GEMMFP8FlyDSLBackend(KernelBackend):
     """FlyDSL 8-wave fp8 dense GEMM backend (gfx950 only).
 
-    TENSORWISE: scalar a_scale/b_scale, bf16/fp16 out, arbitrary M/N/K, layouts
+    TENSORWISE: scalar a_scale/b_scale, bf16/fp16 out, K >= 129, layouts
     NT/NN/TN (TT unsupported). trans_c via post-hoc transpose.
 
     BLOCKWISE: FP32 inverse scales with block size 128, E4M3 operands and
@@ -451,19 +451,31 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
                 return False
 
             if not trans_a and not trans_c:
-                from primus_turbo.flydsl.gemm import flydsl_blockwise_gemm_supported
+                if trans_b:
+                    from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+                        flydsl_blockwise_4wave_forward_supported,
+                    )
 
-                return flydsl_blockwise_gemm_supported(
-                    m,
-                    n,
-                    k,
-                    allow_partial_n=trans_b,
+                    return flydsl_blockwise_4wave_forward_supported(m, n, k)
+
+                from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+                    flydsl_blockwise_4wave_dgrad_supported,
                 )
 
-            if trans_a and not trans_b:
-                from primus_turbo.flydsl.gemm import flydsl_blockwise_wgrad_supported
+                return flydsl_blockwise_4wave_dgrad_supported(m, k, n)
 
-                return flydsl_blockwise_wgrad_supported(m, n, k)
+            if trans_a and not trans_b:
+                from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+                    flydsl_blockwise_4wave_wgrad_supported,
+                )
+
+                normalized = a.T.is_contiguous() and b.T.is_contiguous()
+                return flydsl_blockwise_4wave_wgrad_supported(
+                    k,
+                    n,
+                    m,
+                    require_workspace=not normalized,
+                )
 
             return False
 
@@ -499,19 +511,25 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
     ):
         if granularity == ScalingGranularity.BLOCKWISE:
             if trans_a and not trans_b:
-                from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl_wgrad
+                from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+                    gemm_fp8_blockwise_wgrad,
+                )
 
-                out = gemm_fp8_blockwise_flydsl_wgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+                out = gemm_fp8_blockwise_wgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
                 return out if trans_c else out.t().contiguous()
 
             if trans_b:
-                from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl
+                from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+                    gemm_fp8_blockwise_forward,
+                )
 
-                return gemm_fp8_blockwise_flydsl(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+                return gemm_fp8_blockwise_forward(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
 
-            from primus_turbo.flydsl.gemm import gemm_fp8_blockwise_flydsl_dgrad
+            from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+                gemm_fp8_blockwise_dgrad,
+            )
 
-            return gemm_fp8_blockwise_flydsl_dgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+            return gemm_fp8_blockwise_dgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             res = gemm_mxfp8_flydsl_kernel(

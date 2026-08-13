@@ -10,8 +10,3 @@
 # This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
-"""FlyDSL-backed kernels for Primus-Turbo.
-
-This package initializer deliberately imports no implementation modules, so
-importing ``primus_turbo.flydsl`` does not load the external FlyDSL package.
-"""

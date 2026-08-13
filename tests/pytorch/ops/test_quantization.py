@@ -17,6 +17,7 @@ from primus_turbo.pytorch.core.low_precision import (
     check_mxfp4_support,
     check_mxfp8_support,
 )
+from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
 from primus_turbo.pytorch.ops.quantization import (
     dequantize_fp4,
@@ -282,13 +283,12 @@ def test_quantize_fp8_blockwise_for_weight(orig_dtype, dest_dtype, batched, B, M
 
 
 @pytest.mark.parametrize("row_scale_transposed", [False, True])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_device_compute_capability() < (9, 5),
+    reason="FlyDSL blockwise FP8 quantization is gfx950-only",
+)
 def test_quantize_fp8_blockwise_flydsl(row_scale_transposed):
-    from flydsl.runtime.device import get_rocm_arch
-
-    if not str(get_rocm_arch()).startswith("gfx95"):
-        pytest.skip("FlyDSL blockwise FP8 quantization is gfx950-only")
-
-    from primus_turbo.flydsl.quantization.blockwise_fp8_quant import (
+    from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
         quantize_blockwise_fp8_dual,
         quantize_blockwise_fp8_weight,
     )
@@ -324,38 +324,55 @@ def test_quantize_fp8_blockwise_flydsl(row_scale_transposed):
     torch.testing.assert_close(weight_scale, weight_scale_ref, rtol=0, atol=0)
 
 
+def test_quantize_fp8_blockwise_layouts_byte_exact():
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        quant_fp8_blockwise_dual_impl,
+    )
+
+    x = torch.randn((384, 192), dtype=torch.bfloat16, device="cuda")
+    plain = quant_fp8_blockwise_dual_impl(x, turbo.float8_e4m3, 128)
+    kmajor = quant_fp8_blockwise_dual_impl(
+        x,
+        turbo.float8_e4m3,
+        128,
+        row_scale_transposed=True,
+    )
+    transposed = quant_fp8_blockwise_dual_impl(
+        x,
+        turbo.float8_e4m3,
+        128,
+        col_transposed=True,
+    )
+    row_padded = quant_fp8_blockwise_dual_impl(
+        x,
+        turbo.float8_e4m3,
+        128,
+        row_pad_to_block=True,
+    )
+
+    torch.testing.assert_close(transposed[0], plain[0], rtol=0, atol=0)
+    torch.testing.assert_close(transposed[1], plain[1], rtol=0, atol=0)
+    torch.testing.assert_close(transposed[2].T, plain[2], rtol=0, atol=0)
+    torch.testing.assert_close(transposed[3], plain[3], rtol=0, atol=0)
+    torch.testing.assert_close(kmajor[0], plain[0], rtol=0, atol=0)
+    torch.testing.assert_close(kmajor[1], plain[1].T.contiguous(), rtol=0, atol=0)
+    torch.testing.assert_close(kmajor[2], plain[2], rtol=0, atol=0)
+    torch.testing.assert_close(kmajor[3], plain[3], rtol=0, atol=0)
+
+    assert row_padded[0].shape == (384, 256)
+    torch.testing.assert_close(row_padded[0][:, :192], plain[0], rtol=0, atol=0)
+    assert torch.count_nonzero(row_padded[0][:, 192:]).item() == 0
+    torch.testing.assert_close(row_padded[1], plain[1], rtol=0, atol=0)
+    torch.testing.assert_close(row_padded[2], plain[2], rtol=0, atol=0)
+    torch.testing.assert_close(row_padded[3], plain[3], rtol=0, atol=0)
+
+
 def padding_size(n: int, padding_align_size: int) -> int:
     return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
 
 
-def mxfp8_padded_ref(x: torch.Tensor, axis: int, padding_align_size: int, dtype: torch.dtype) -> torch.Tensor:
-    """Build zero-padded reference matching MXFP8 quantize/dequantize padding."""
-    if x.dim() == 2:
-        if axis == 0:
-            # Colwise: dequant output [M_pad, N].
-            pad_amt = padding_size(x.size(0), padding_align_size)
-            zeros = torch.zeros(pad_amt, x.size(1), device=x.device, dtype=dtype)
-            return torch.cat([x, zeros], dim=0)
-        # Rowwise: dequant output [M, N_pad].
-        pad_amt = padding_size(x.size(1), padding_align_size)
-        zeros = torch.zeros(x.size(0), pad_amt, device=x.device, dtype=dtype)
-        return torch.cat([x, zeros], dim=1)
-
-    # 3D batched [B, M, N]
-    if axis == 1:
-        # Colwise: quant/dequant layout [B, N, M_pad].
-        x_bn = x.transpose(1, 2).contiguous()
-        pad_amt = padding_size(x_bn.size(2), padding_align_size)
-        zeros = torch.zeros(x_bn.size(0), x_bn.size(1), pad_amt, device=x.device, dtype=dtype)
-        return torch.cat([x_bn, zeros], dim=2)
-    # Rowwise (axis == 2): dequant output [B, M, N_pad].
-    pad_amt = padding_size(x.size(2), padding_align_size)
-    zeros = torch.zeros(x.size(0), x.size(1), pad_amt, device=x.device, dtype=dtype)
-    return torch.cat([x, zeros], dim=2)
-
-
-def mxfp4_padded_ref(x: torch.Tensor, axis: int, padding_align_size: int, dtype: torch.dtype) -> torch.Tensor:
-    """Build zero-padded reference matching MXFP4 quantize/dequantize padding."""
+def mx_padded_ref(x: torch.Tensor, axis: int, padding_align_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """Build a zero-padded reference matching microscaling quantization."""
     if x.dim() == 2:
         if axis == 0:
             # Colwise: dequant output [M_pad, N].
@@ -409,7 +426,7 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, batched, B, M, N, axis, granular
         # 2D MXFP8: axis 0 = colwise, axis 1 = rowwise.
         quantize_axis = axis
 
-    x_ref = mxfp8_padded_ref(x, quantize_axis, padding_align_size, orig_dtype)
+    x_ref = mx_padded_ref(x, quantize_axis, padding_align_size, orig_dtype)
 
     scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,
@@ -626,7 +643,7 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, batched, B, M, N, axis, granular
         # 2D MXFP4: axis 0 = colwise, axis 1 = rowwise.
         quantize_axis = axis
 
-    x_ref = mxfp4_padded_ref(x, quantize_axis, padding_align_size, orig_dtype)
+    x_ref = mx_padded_ref(x, quantize_axis, padding_align_size, orig_dtype)
 
     scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,

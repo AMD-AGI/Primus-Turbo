@@ -25,7 +25,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.core.utils import is_gfx942
+from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_accum_impl,
     gemm_fp8_impl,
@@ -439,7 +439,6 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         a: Union[torch.Tensor, QuantizedTensor],
         b: Union[torch.Tensor, QuantizedTensor],
         a_t: Optional[QuantizedTensor],
-        b_t: Optional[QuantizedTensor],  # not used
         trans_a: bool,
         trans_b: bool,
         out_dtype: torch.dtype,
@@ -448,23 +447,20 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         assert trans_a == False, "trans_a has to be False"
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
-        flydsl_blockwise = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8) == BackendType.FLYDSL
+        backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
+        flydsl_blockwise = (
+            backend_choice is not None and backend_choice.backend == BackendType.FLYDSL and is_gfx950()
+        )
         if flydsl_blockwise and config.block_size != 128:
             raise ValueError("FlyDSL BLOCKWISE GEMM requires block_size=128")
         scale_a_k_major = False
-        if flydsl_blockwise:
-            from primus_turbo.flydsl.gemm.blockscale_fp8_gemm import (
-                select_blockscale_fp8_forward_kernel,
+        if flydsl_blockwise and trans_b:
+            from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+                flydsl_blockwise_forward_scale_a_k_major,
             )
 
             a_shape = a.qdata.shape if isinstance(a, QuantizedTensor) else a.shape
-            b_shape = b.qdata.shape if isinstance(b, QuantizedTensor) else b.shape
-            if trans_b:
-                scale_a_k_major = select_blockscale_fp8_forward_kernel(
-                    a_shape[0],
-                    b_shape[0],
-                    a_shape[1],
-                )["scale_a_k_major"]
+            scale_a_k_major = flydsl_blockwise_forward_scale_a_k_major(a_shape[1])
 
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, axis=-1)
@@ -489,7 +485,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                     and a.shape[1] % config.block_size == 0
                     and a.numel() * a.element_size() <= 0xFFFFFFFF
                 ):
-                    from primus_turbo.flydsl.quantization.blockwise_fp8_quant import (
+                    from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
                         quantize_blockwise_fp8_dual,
                     )
 
@@ -538,7 +534,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 and b.shape[1] % 16 == 0
                 and b.numel() * b.element_size() <= 0xFFFFFFFF
             ):
-                from primus_turbo.flydsl.quantization.blockwise_fp8_quant import (
+                from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
                     quantize_blockwise_fp8_weight,
                 )
 
@@ -600,7 +596,7 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 and grad_out.shape[1] % ctx.config.block_size == 0
                 and grad_out.numel() * grad_out.element_size() <= 0xFFFFFFFF
             ):
-                from primus_turbo.flydsl.quantization.blockwise_fp8_quant import (
+                from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
                     quantize_blockwise_fp8_dual,
                 )
 
@@ -644,16 +640,11 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                 dgrad_b = dgrad_b_padded
 
         if flydsl_blockwise and not ctx.trans_b:
-            from primus_turbo.flydsl.gemm.blockscale_fp8_gemm import (
-                select_blockscale_fp8_forward_kernel,
+            from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+                flydsl_blockwise_forward_scale_a_k_major,
             )
 
-            dgrad_config = select_blockscale_fp8_forward_kernel(
-                g_row.shape[0],
-                dgrad_b.shape[0],
-                g_row.shape[1],
-            )
-            if dgrad_config["scale_a_k_major"]:
+            if flydsl_blockwise_forward_scale_a_k_major(g_row.shape[1]):
                 g_row_scale = g_row_scale.T.contiguous()
 
         grad_a = gemm_fp8_impl(
@@ -685,7 +676,6 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             grad_a,  # a
             grad_b,  # b
             None,  # a_t
-            None,  # b_t
             None,  # trans_a
             None,  # trans_b
             None,  # out_dtype
@@ -905,6 +895,7 @@ def gemm_fp8(
     FP8 Format (config.format):
         - E4M3
         - E5M2
+        - HYBRID
 
     Example::
 
@@ -918,7 +909,8 @@ def gemm_fp8(
         ...     format=Format.E4M3,
         ...     granularity=ScalingGranularity.ROWWISE
         ... )
-        >>> out = gemm_fp8(a, b, trans_b=True, config=config)
+        >>> b_t = torch.randn(256, 512, device='cuda')
+        >>> out = gemm_fp8(a, b_t, trans_b=True, config=config)
 
     """
     if config is None:
