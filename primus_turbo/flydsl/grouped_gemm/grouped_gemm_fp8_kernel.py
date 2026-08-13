@@ -1596,12 +1596,8 @@ _WGRAD_XCD_RCP_SHIFT = 16  # fixed-point reciprocal of the compile-time swizzle 
 
 def _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, nxcd=_WGRAD_XCD_HW):
     """(h, w) for the XCD-affine wgrad swizzle, or None when the grid is too small. Reorders each
-    XCD's residue class into a contiguous width-w column band so its operand footprint is compact,
-    leaving the dispatch order (and the hardware's even tile split) alone. h>1 reuses A-slabs.
-    The rectangle's two sides are CONCURRENT operand streams (A rows, B columns), so the run is set
-    by the LARGER side, not by their sum: on this shape's 12x12 grid the sum calls w=3/4/6 a
-    three-way tie at 9 while they measure 946.7 / 940.8 / 947.5 us, and the larger side orders the
-    whole field (5 -> 941, 6 -> 946-953, 9 -> 955)."""
+    XCD's residue class into a contiguous width-w column band (h>1 reuses A-slabs); the rectangle's
+    two sides are CONCURRENT operand streams, so its run is set by the LARGER side, not their sum."""
     sz = tiles_per_group // nxcd
     if sz < 2 or n_blocks_m < 2 or n_blocks_n < 2:
         return None
@@ -3320,22 +3316,16 @@ def _wave4_do_tile_tn(
     store_base = None
     assert split_kb0 is None or not swap_n, "deep-K slicing is incompatible with the swap_n body"
     if split_kb0 is not None:
-        # Deep-K token split. The token axis carries a fixed chunk grid (_wgrad_chunk_geom), and a
-        # group whose own K covers FIRE half-chunks has every chunk boundary inside it cut. This
-        # work item owns one piece of its own group: the leading one (band_row < 0) keeps C and the
-        # group's row origin, a later one moves the row origin by its own kb0 and banks its partial
-        # in the scratch band at band_row, which a reduce pass sums back in ascending chunk order.
-        # Both sides are derived from the group's own row range only -- nothing here can see another
-        # group. A cut group never reaches a plain tile (the dispatch drops it there), so a plain
-        # tile runs its group's whole K and the chunk grid costs it nothing at all.
+        # Deep-K token split: this work item owns one piece of its own group. The leading piece
+        # (band_row < 0) keeps C and the row origin; a later one shifts the origin by its own kb0 and
+        # banks its partial in scratch band band_row, summed back by the reduce pass. Own rows only.
         m_off = fx.Int32(split_kb0) * fx.Int32(BLOCK_K)
         m_start = _readfirstlane_i32(m_start + m_off)
         mg = _readfirstlane_i32(mg - m_off)
         k_iters = fx.Int32(_readfirstlane_i32(fx.Int32(split_kbe) - fx.Int32(split_kb0)))
-        # The band offset rides on the SRD BASE, not on the row index: the epilogue then computes
-        # its row addresses exactly as the unsliced store does (shifting base_row instead put the
-        # split's own scalar chain in front of every store address and cost 4.6 us on a launch that
-        # slices nothing).
+        # The band offset rides on the SRD BASE, not the row index, so the epilogue computes row
+        # addresses exactly as the unsliced store does (shifting base_row instead would put the
+        # split's scalar chain in front of every store address, penalising launches that slice nothing).
         _shift = _readfirstlane_i32(fx.Int32(band_row) - fx.Int32(group_idx) * fx.Int32(OUT_M))
         _obytes = 2  # bf16/fp16 output
         # band_row < 0 = the group's leading piece: it holds K from 0, so it owns C and only the
@@ -3537,126 +3527,56 @@ def _wave4_geometry(*, block_m, block_n, block_k, cs, csa, out_fp16):
     )
 
 
-# Distribution-agnostic deep-K auto-split for the variable-K wgrad dispatch. The makespan of a
-# variable-K launch is set by its LONGEST work atom (a tile's whole K-loop): with a group holding
-# most of the tokens, one atom alone can outrun the per-CU ideal, and no dispatch order fixes
-# that. So the token axis carries a FIXED grid of chunks, CHD K-blocks wide, cut out of the
-# launch's own contraction length; a group whose own K covers at least _WGRAD_SPLIT_FIRE chunks
-# has every chunk boundary inside it turned into a slice boundary. No atom is then longer than one
-# chunk whatever the distribution does, and the schedule follows the TOTAL work instead of its
-# spread. A work item reads only its own group's [row0, row1) -- no group is ever compared with
-# another, and the rule is the same for every group of every launch.
-#
-# Chunk c > 0 belongs to the ONE group whose rows strictly contain global row c*CHR, so the slices
-# are addressed by CHUNK, not by a per-group slice index: slice c stores its partial into scratch
-# band c-1 (no two groups can collide), and the dispatch id space carries (chunk, tile) directly --
-# a work item inverts the chunk to its group with one wave-wide gather of the offset table plus one
-# ballot, needing no scan over the groups and no per-group slice count. The chunk grid also fixes
-# the slice's K range with no division: the group's blocks [ceil((c*CHR-row0)/BLOCK_K), +CHD).
-# kernel_grouped_tn_wgrad_reduce folds each group's bands back in ascending chunk order
-# (atomic-free, bit-reproducible), re-deriving the same boundaries from the same scalars.
-#
-# The SLICES OWN THE FRONT OF THE DISPATCH. That is the point of the chunk id space: a slice is
-# the longest atom in the launch, so it must be dispatched before the short ones, and a plain tile
-# id then runs the frozen body with NO slice arithmetic and no extra table read at all -- carrying
-# slices as extra iterations of the plain tiles instead cost 0.7% of every launch that splits
-# nothing (four scalar bound loads in front of the first tile address, all four waves) and left the
-# slice's start time to wherever its carrier happened to sit in the dispatch, which capped the
-# recovery at ~45% of the gap to the balanced ceiling on every firing distribution measured.
-# Token chunks the contraction length is cut into (chunk = ktot/NB K-blocks). The chunk IS the bar:
-# a group is cut iff its own K covers a whole chunk, so ONE constant sets both how long an atom may
-# stay and how big a share of the launch a group must hold to be worth cutting -- 1/8 of the tokens
-# here. Both sides of that constant are measured, and both are steep. Cutting below the bar is all
-# cost: a cut group pays a band write, then a band read and a C read-modify-write in the fold,
-# whatever its K is, while what it can win is bounded by the tail its own atom leaves -- at a 1/16
-# bar the GEMM did drop 34 us on a mid-skew launch but its fold went 4.8 -> 126 us, and the same bar
-# re-measured on the wide fold grid below, which cuts that back to ~60 us, still lost 4% on that
-# cell and 0.5% overall. A chunk narrower than the atom needs to be is also all cost:
-# the recovery curve against atom length is flat below ~1/8 of the contraction length, so halving
-# the chunk from there only doubles the bands the fold streams (at ktot/16 the marginal cells lost
-# up to 6%). It also keeps the deploy balanced load whole: there every K is ktot/32 < ktot/NB, so no
-# group is cut and the launch runs the frozen body.
-_WGRAD_SPLIT_NB = 8
-# Half-chunks of own K a group must hold to be cut. At 1 -- promoting every group over a sixteenth
-# of the tokens, which under LEAD is free of bands and of fold -- the marginal promotions measured
-# net-negative anyway (gm 1.2571 -> 1.2517, min 0.9609 -> 0.9110): moving a group that small to the
-# front only trades which tiles the dispatch leaves for last.
+# Distribution-agnostic deep-K auto-split for variable-K wgrad: the token axis carries a FIXED chunk
+# grid so a group whose own K covers >= _WGRAD_SPLIT_FIRE chunks is cut at every interior boundary,
+# capping every work atom at one chunk regardless of how the tokens are distributed.
+_WGRAD_SPLIT_NB = 8  # token chunks the contraction length is cut into (chunk = ktot/NB K-blocks)
+# Half-chunks of own K a group must hold to be cut; below the bar the extra band write and fold pass
+# cost more than the shortened atom can win back.
 _WGRAD_SPLIT_FIRE = 2
-# Half-chunks of own K a group must hold for the head ids to run it AT ALL, on the shape that takes
-# it (see _wgrad_split_geom). Below the FIRE bar nothing is banked, so this only moves the group's
-# tiles from the plain map to the head ids, which dispatches them in FRONT where the plain map
-# leaves the last group's tiles for last. It is a bar and not simply "every group holding a
-# boundary" because the head is walked in token order: promoting the short groups too puts their
-# tiles AHEAD of the long pieces a cut group banks, and the launches that cut anything then lose
-# more than the short ones gain. It must also stay within one chunk of the FIRE bar, so that a
-# group promoted without being cut cannot span two chunk boundaries -- see the leading piece's end.
+# Half-chunks of own K to promote a group's tiles to the head ids (front of dispatch) without
+# banking; kept below FIRE so a promoted-but-uncut group cannot span two chunk boundaries.
 _WGRAD_SPLIT_HOLD = 1
 _WGRAD_SPLIT_KMIN = 6  # K-blocks a chunk must keep (the whole-loop fused-tail floor)
-# Live groups the fold walks in parallel, and reduce workgroups per sliced tile: together they set
-# the fold's workgroup count. The pass moves few enough bytes that it is LATENCY-bound rather than
-# bandwidth-bound, and the bands a cut group never wrote are dropped by the addresser, so a
-# workgroup only ever has as many loads in flight as the group it is on has bands -- which makes the
-# launches that cut the MOST groups the ones with the FEWEST: a fold spread over several cut groups
-# ran at 2.4 TB/s where a single-group one ran at 3.8, both far under this HBM. So the grid is a few
-# times the CU count on BOTH axes, which is what lets a workgroup have several groups' bands in
-# flight at once: 27.2 us against 32.2 on a multi-group fold, 35.7 against 39.5 on a single-group
-# one. It is free on the launches that fold nothing -- the empty pass costs 4.8 us at 288 workgroups
-# and 4.9 at 1152, i.e. the launch itself, not the dispatch -- but not unbounded: at 4416 (this
-# shape's next doubling) the balanced gate_up ratio fell to 0.9895.
+# Live groups the fold walks in parallel, and reduce workgroups per sliced tile: together the fold's
+# workgroup count. The pass is latency-bound, so the grid is a few times the CU count on both axes.
 _WGRAD_RED_JS = 2
 _WGRAD_RED_WPT = 4
 _WGRAD_RED_VEC = 8  # out_ty elements (128b) each reduce lane moves per pass
 
 
 def _wgrad_split_geom(tiles_per_group, total, ncu):
-    """Compile-time deep-K split geometry ``(NB, BANDS, FIRE, HOLD)``, shared by the factory and the
-    host entry: NB = global token chunks (see _WGRAD_SPLIT_NB), BANDS = scratch row bands (one per
-    chunk boundary), FIRE = half-chunks of its own K a group must hold to be cut, HOLD = the same
-    for merely moving it to the head ids. NB == 1 disables the path. Static shape only -- tiles per
-    group against CUs; nothing here or downstream looks at how the tokens are distributed."""
+    """Compile-time deep-K split geometry ``(NB, BANDS, FIRE, HOLD)`` shared by factory and host
+    entry: NB token chunks, BANDS = NB-1 scratch bands, FIRE/HOLD the cut/promote bars. NB == 1
+    disables the path. Static shape only (tiles per group vs CUs); never inspects the distribution."""
     if total <= ncu or ncu <= 0 or tiles_per_group <= 0:
         return 1, 0, 0, 0
     # A group whose own tiles already cover the device needs its atom SHORTENED, not spread, so its
-    # chunk -- and with it its bar -- is twice as wide: such a shape holds full speed with a group
-    # at half the tokens and loses a fifth of it at four fifths, while every extra chunk is another
-    # id in front of every launch, split or not. Halving this shape's chunk again (both shapes on
-    # the fine grid) measured gm 1.257 -> 1.183.
-    # ... and the same test turns the head PROMOTION off there. Now that the plain map deals every
-    # group to every XCD, moving an uncut group to the head buys it one thing, an early start, and
-    # that is worth having only while the group does NOT already fill the device on its own: it is
-    # worth 0.25% of the score on the shape below the CU count and it was the three losing cells on
-    # the shape above it (0.948 / 0.971 / 0.986, at a chunk that shape only cuts above a quarter of
-    # the tokens, so those launches paid the promotion and never reached the cut it leads to).
+    # chunk (and its bar) is twice as wide, and the head PROMOTION is off there: an early start only
+    # helps a group that does not already fill the device on its own.
     deep = tiles_per_group < ncu
     nb = _WGRAD_SPLIT_NB if deep else _WGRAD_SPLIT_NB // 2
     return nb, nb - 1, _WGRAD_SPLIT_FIRE, _WGRAD_SPLIT_HOLD if deep else _WGRAD_SPLIT_FIRE
 
 
 def _wgrad_chunk_kb0(r0, key, BLOCK_K):
-    """First K-block of the group at row origin ``r0`` that the token chunk starting at global row
-    ``key`` owns: ceil((key - r0) / BLOCK_K), i.e. the chunk boundary rounded up to the group's own
-    K-block grid. The GEMM's slice and the fold's band must agree exactly on where a slice starts,
-    so both call this on the same scalars instead of deriving it two ways."""
+    """First K-block of the group at row origin ``r0`` owned by the token chunk starting at global
+    row ``key``: ceil((key - r0) / BLOCK_K). GEMM slice and fold band call this on the same scalars
+    so they agree exactly on where a slice starts."""
     return fx.Int32(fx.Int32(key - r0 + fx.Int32(BLOCK_K - 1)) >> (BLOCK_K.bit_length() - 1))
 
 
 def _wgrad_go_read(rsrc, i):
     """Entry ``i`` of the int64 [G+1] offset table (low word at i32 element 2*i) on the SCALAR path.
-    s_buffer_load lands in an SGPR under lgkmcnt, which is what makes the deep-K rule affordable:
-    a per-lane gather of the same table either drains vmcnt in front of the tile's first global
-    address (one drain per bound read) or keeps a VGPR live across the MAC loop -- measured at
-    +3.4 us and +2.2 us respectively on a 900 us balanced launch that slices nothing."""
+    s_buffer_load lands in an SGPR under lgkmcnt, which makes the deep-K rule affordable; a per-lane
+    gather instead drains vmcnt or keeps a VGPR live across the MAC loop."""
     return _sload_i32(rsrc, 2 * i)
 
 
 def _wgrad_chunk_geom(m_total, BLOCK_K, NB):
-    """``(CHD, CHR)``: the global token-chunk grid -- CHD = the chunk width in K-blocks (the
-    contraction length over NB, or the whole-loop fused-tail floor if that is coarser) and CHR the
-    same width in rows. The grid is cut out of the launch's own contraction length ``m_total`` =
-    lhs.shape[0], which the host passes as the plain SHAPE it already reads for the i64 addressing
-    test -- the same number under every distribution, so this fixes a SCALE and measures nothing
-    about how the tokens are spread over the groups. Pure SALU: deriving it on-device instead cost
-    every workgroup two more dependent table reads in front of its first tile address."""
+    """``(CHD, CHR)``: the global token-chunk grid, CHD the chunk width in K-blocks (contraction
+    length over NB, floored at the fused-tail minimum) and CHR the same in rows. Cut from
+    ``m_total`` = lhs.shape[0], a plain SHAPE the host already reads -- a scale, not a distribution."""
     ktot = ceildiv_pow2(m_total, BLOCK_K)
     ch = ceildiv_pow2(ktot, NB)
     chd = arith.select(ch > fx.Int32(_WGRAD_SPLIT_KMIN), ch, fx.Int32(_WGRAD_SPLIT_KMIN))
@@ -3664,10 +3584,9 @@ def _wgrad_chunk_geom(m_total, BLOCK_K, NB):
 
 
 def _wgrad_chunk_of(off, chr_, NB, uni=True):
-    """Token chunk holding global row ``off``, i.e. ``off // CHR`` saturated at the last chunk. A
-    count of NB-1 compares instead of a division: the GEMM and the fold both re-derive chunk
-    indices, so it has to be exactly reproducible and cheap on the scalar path. ``uni=False`` keeps
-    it per-lane, for the fold's one-lane-per-group enumeration."""
+    """Token chunk holding global row ``off`` (``off // CHR`` saturated at the last chunk), as NB-1
+    compares so GEMM and fold re-derive chunk indices identically and cheaply on the scalar path.
+    ``uni=False`` keeps it per-lane for the fold's one-lane-per-group enumeration."""
     c0 = fx.Int32(0)
     for c in range_constexpr(1, NB):
         c0 = c0 + fx.Int32(arith.select(off >= fx.Int32(c) * chr_, fx.Int32(1), fx.Int32(0)))
@@ -3681,14 +3600,8 @@ def _wgrad_fire_bar(chd, FIRE):
 
 def _wgrad_is_cut(r0, kg, chd, chr_, NB, FIRE, HOLD, BLOCK_K, uni=True):
     """``(held, cut, first in-group K-block boundary)`` for the group at row origin ``r0`` with own
-    K ``kg``. HELD iff the next chunk boundary, rounded up to this group's own K-block grid, still
-    leaves work: the head ids own that group, whether or not there is anything to bank, because the
-    chunk grid hands the head an id per in-group block and dispatches those ids FIRST, where the
-    plain map walks the groups in token order and leaves the last one's tiles for last. CUT iff it
-    is also FIRE chunks of its own K long, i.e. long enough that the pieces behind that first
-    boundary are worth banding. Every side re-derives the verdict from
-    these same scalars -- the head to know a piece exists, the plain map to know the group is not
-    its business, the fold to know a band was written -- so it lives in one place."""
+    K ``kg``. HELD iff the next chunk boundary rounded to this group's K-block grid still leaves
+    work (the head owns it); CUT iff it is also FIRE chunks long. Every side re-derives this here."""
     c0 = _wgrad_chunk_of(r0, chr_, NB, uni=uni)
     kb1 = _wgrad_chunk_kb0(r0, (c0 + fx.Int32(1)) * chr_, BLOCK_K)
     held = arith.andi(kb1 < kg, kg >= _wgrad_fire_bar(chd, HOLD))
@@ -3780,18 +3693,9 @@ def _compile_grouped_tn_wgrad_4wave(
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
     _NCU = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    # (group_m, group_n) are the XCD-affine (h, w) under xcd_aff; it carries its own class rotation
-    # (_XCD_ROT) instead of the band maps' tile_rot, which would break the run's compactness.
-    # The super-block spans ONE group, so every XCD is dealt TILES_PER_GROUP/nxcd tiles of EVERY
-    # group. That is the only span whose XCD loads are equal under EVERY token split: each XCD holds
-    # the same fraction of every group's K, so its work is 1/nxcd of the launch whatever the split
-    # does. A super-block over gp>1 groups hands each of them to nxcd/gp XCDs instead, and an XCD's
-    # work becomes the sum of the K of the groups it was dealt -- which tracks the split exactly.
-    # It buys a longer operand run in exchange (0.33 operand blocks per tile against 0.5 on the
-    # shape that could take a wider span, which is worth 1.8% of its balanced launch), and that
-    # trade measured badly: every mildly uneven down cell, where no group is long enough for any of
-    # the deep-K rules to reach and the pinned span was therefore the whole loss, gained 5 to 8
-    # points, for +2.0% on the score.
+    # (group_m, group_n) are the XCD-affine (h, w) under xcd_aff, carrying their own class rotation
+    # (_XCD_ROT) instead of the band maps' tile_rot. The super-block spans ONE group so every XCD
+    # holds the same fraction of every group's K -- loads stay equal under ANY token split.
     _XCD_GP, _XCD_K = 1, _WGRAD_XCD_HW
     _XCD_AFF = (group_m, group_n, _XCD_GP) if xcd_aff else None
     _XCD_ROT = _XCD_AFF is not None and xcd_rot and _wgrad_xcd_rot_ok(TILES_PER_GROUP, _XCD_GP)
@@ -3827,43 +3731,28 @@ def _compile_grouped_tn_wgrad_4wave(
     # Every stored column is < OUT_N at compile time, so the epilogue per-element OOB select is
     # dead: the b0-only body ends exactly on OUT_N and no full body reaches the last N-block.
     _COL_SAFE = (OUT_N % BLOCK_N == 0) or (_HALF_N and _BND_NTB * _WAVE_N * 16 == OUT_N % BLOCK_N)
-    # Deep-K split geometry. Independent of the tile map: a slice brings its own group index and
-    # takes a plain in-group block position, so any remap/affine super-block the plain tiles use is
-    # left alone. It is also independent of the chosen candidate, so the host scratch and every
-    # candidate agree on bands.
+    # Deep-K split geometry, independent of the tile map and the chosen candidate: a slice brings its
+    # own group index and a plain in-group block position, so the host scratch and every candidate
+    # agree on bands.
     _NB, _SP_BANDS, _FIRE, _HOLD = (
         _wgrad_split_geom(TILES_PER_GROUP, TOTAL, _NCU) if split_k else (1, 0, 0, 0)
     )
     _SPLIT = _NB > 1
-    # One dispatch id per (token chunk, in-group block), AHEAD of the plain tile ids: a chunk is the
-    # longest atom a launch has, so it has to be dispatched before the short ones. The head is
-    # padded to the hardware XCD count so a plain tile keeps the XCD class its id had in the frozen
-    # grid (the affine tile map is built on bid % _WGRAD_XCD_HW).
-    # Head ids are the scarce resource here: each one is a dependent table gather on a workgroup
-    # that a launch cutting nothing then finds no work for, and 1000 of them are worth ~0.8% of the
-    # balanced down launch -- a second id per boundary, to carry the leading piece on its own,
-    # measured bal_dn 0.9908 against this build's 0.999. So there is exactly ONE id per (chunk
-    # boundary, in-group block) and the group's FIRST boundary id ABSORBS the leading piece instead:
-    # it runs [0, boundary+chunk) where a later boundary runs one chunk. Its atom is up to two
-    # chunks long, which costs nothing because that id sits at the FRONT of the dispatch -- only an
-    # atom left for the END sets the tail.
+    # One dispatch id per (chunk boundary, in-group block), AHEAD of the plain tile ids since a chunk
+    # is the longest atom; padded to the XCD count so a plain tile keeps its frozen-grid class. The
+    # group's FIRST boundary id absorbs the leading piece rather than spending a second head id on it.
     _SP_A = (_NB - 1) * TILES_PER_GROUP if _SPLIT else 0
     _SP_SPS = _SP_A
     _SP_HEAD = ceildiv(_SP_SPS, _WGRAD_XCD_HW) * _WGRAD_XCD_HW if _SPLIT else 0
     _GRID_EXT = _SP_HEAD + TOTAL
-    # The grid stays at TOTAL and the head rides the grid-stride loop's SECOND turn: the first
-    # _SP_HEAD workgroups take a slice id and then their OWN plain tile, the rest take one plain
-    # tile. The alternative (grid = _SP_HEAD + TOTAL, one work item per workgroup) dispatches
-    # _SP_HEAD extra workgroups that a launch splitting nothing retires empty -- 1.2% of the balanced
-    # down launch, straight through the no-regress gate. Both _SP_HEAD and TOTAL are multiples of the
-    # XCD count, so a plain tile still lands on the XCD its id had in the frozen grid.
+    # The grid stays at TOTAL and the head rides the grid-stride loop's SECOND turn (the first
+    # _SP_HEAD workgroups take a slice id then their own plain tile); growing the grid instead would
+    # dispatch extra workgroups a non-splitting launch retires empty. Both are XCD-count multiples.
     assert _SP_HEAD <= TOTAL, "slice head must fit one grid-stride turn"
     _ONE_TURN = cap_cu <= 0  # grid == TOTAL: every workgroup takes exactly one plain tile
-    # Reduce: one workgroup covers BLOCK_M//_WGRAD_RED_WPT rows x BLOCK_N cols of a sliced tile.
-    # Its id space is (tile, sub) only -- the banked CHUNKS are walked inside the workgroup, so the
-    # workgroup count does not grow with NB. Every launch pays this walk, and a workgroup costs a
-    # dispatch plus one dependent group-table gather whether or not it finds work, so folding the
-    # chunk axis inward is what keeps a launch that slices nothing at the frozen cost.
+    # Reduce: one workgroup covers BLOCK_M//_WGRAD_RED_WPT rows x BLOCK_N cols of a sliced tile. Its
+    # id space is (tile, sub) only -- the banked chunks are walked inside the workgroup, so the count
+    # does not grow with NB and a launch that slices nothing stays at the frozen cost.
     _RED_ROWS = BLOCK_M // _WGRAD_RED_WPT
     _RED_LPR = BLOCK_N // _WGRAD_RED_VEC  # lanes spanning one tile row
     _RED_RPP = 256 // _RED_LPR  # rows one 256-thread pass covers
@@ -4048,14 +3937,9 @@ def _compile_grouped_tn_wgrad_4wave(
             _chd, _chr = _wgrad_chunk_geom(m_total, BLOCK_K, _NB)
 
             def _emit_chunk(d):
-                """A head id carries (token chunk boundary, in-group block) and runs the piece that
-                boundary starts. The boundary belongs to the ONE group whose rows strictly contain
-                its global row, so the id inverts to a group with a single wave-wide gather of the
-                offset table plus a ballot (lanes past the table read 0 and are pushed above every
-                key) -- no scan over the groups, no per-group slice count, and the plain tiles pay
-                none of it. Where the group STARTS inside this chunk the boundary is its first, and
-                under LEAD that piece extends back to K=0 to carry the group's leading piece with
-                it: it then holds C, and only the boundaries behind it bank."""
+                """A head id carries (chunk boundary, in-group block) and runs the piece that
+                boundary starts, inverting to its group with one wave-wide offset-table gather plus a
+                ballot. The group's first boundary extends back to K=0 to carry the leading piece."""
                 _cb = _readfirstlane_i32(udiv(d, TILES_PER_GROUP))
                 _q = _readfirstlane_i32(d - _cb * fx.Int32(TILES_PER_GROUP))
                 _key = _readfirstlane_i32((_cb + fx.Int32(1)) * _chr)
@@ -4083,22 +3967,13 @@ def _compile_grouped_tn_wgrad_4wave(
                 )
                 _mb = _readfirstlane_i32(_mb)
                 _nb = _readfirstlane_i32(_nb)
-                # The piece needs the boundary to fall strictly inside a group whose own K covers
-                # _WGRAD_SPLIT_FIRE half-chunks -- the same scalars the fold and the plain test
-                # re-derive, so no piece is ever emitted twice or dropped. A chunk past the last row
-                # belongs to no group (the chunk grid is rounded up) and would invert to the G-th
-                # table entry, so it is gated on the contraction length as well.
-                # The group starts inside this chunk => this is its first boundary, so the piece
-                # runs from K=0 and keeps C -- exactly the tile the plain map no longer runs for a
-                # cut group. Every other piece banks, and no two can want one band: a chunk boundary
-                # lies strictly inside ONE group.
+                # The boundary must fall strictly inside a group long enough to cut and inside the
+                # contraction length. A group starting inside this chunk hits its first boundary, so
+                # the piece runs from K=0 and keeps C; every other piece banks into its own band.
                 _lead = _r0 >= _cb * _chr
-                # A leading piece clears the lower HOLD bar: it holds C and covers the group's whole
-                # K up to the next boundary, so for a group shorter than one chunk it simply IS that
-                # group's tile, run from a head id instead of the plain map -- same work, same
-                # store, but dealt round robin over the XCDs and dispatched in front. Only a piece
-                # that has to BANK clears the FIRE bar, because only that one costs a band and a
-                # fold pass.
+                # A leading piece clears the lower HOLD bar: for a group shorter than one chunk it
+                # simply IS that group's tile, run from a head id (dealt round robin over the XCDs and
+                # dispatched in front). Only a piece that has to BANK clears the higher FIRE bar.
                 _cut = _kg >= _wgrad_fire_bar(_chd, _FIRE)
                 _live = arith.andi(
                     arith.andi(_r0 < _key, _key < m_total),
@@ -4107,11 +3982,9 @@ def _compile_grouped_tn_wgrad_4wave(
                         _kb0 < _kg,
                     ),
                 )
-                # Only a CUT group has a piece behind every one of its boundaries; a merely promoted
-                # one is carried by this leading piece alone, so that piece has to run to the end of
-                # the group instead of stopping at the next chunk. Stopping there drops the K past
-                # it with nothing reporting the loss -- the launch stays bit-reproducible and only
-                # the SNR gate sees it (11.7 dB against the 25 dB floor).
+                # Only a CUT group banks behind every boundary; a merely promoted one is carried by
+                # this leading piece alone, so it must run to the end of the group. Stopping at the
+                # next chunk would silently drop the K past it (visible only as an SNR drop).
                 _end = arith.andi(_cut, _kb0 + _chd < _kg)
                 _kbe = _readfirstlane_i32(arith.select(_end, _kb0 + _chd, _kg))
                 _kbs = _readfirstlane_i32(arith.select(_lead, fx.Int32(0), _kb0))
@@ -4133,9 +4006,8 @@ def _compile_grouped_tn_wgrad_4wave(
 
         def _emit_plain(t):
             """A plain tile id runs the frozen body over its group's whole K. Every piece of a cut
-            group is a head id, so this one only has to know whether its group is cut at all -- one
-            scalar verdict off the two bounds the body loads anyway, and the group's trip count
-            needs no chunk arithmetic."""
+            group is a head id, so this one only needs one scalar verdict (off the two bounds the
+            body loads anyway) to know whether its group is cut at all."""
             _tt = xcd_remap_pid(t, TOTAL, num_xcd)
             _pg, _pm, _pn = _wgrad_block_mn(
                 _tt,
@@ -4164,16 +4036,9 @@ def _compile_grouped_tn_wgrad_4wave(
                 )
 
         if const_expr(_SPLIT and _ONE_TURN):
-            # The grid IS the whole id space here (grid = TOTAL, TOTAL + _SP_HEAD work items), so the
-            # turns are known at compile time -- the first _SP_HEAD workgroups take a slice id and
-            # then a plain tile, every other one takes a plain tile -- and the loop below is a
-            # dynamic loop whose trip count is 1 or 2. Emitting the two turns straight-line instead
-            # is worth 0.65% of the score and of both balanced launches (gm 1.3297 -> 1.3384, and
-            # again 1.3250 -> 1.3334 under a second id numbering, so it is the loop itself and not
-            # which tile a workgroup gets). What the loop costs is not its compare: this body runs at
-            # occ=1 with the register file fully allocated (256 operand + 256 accumulator), so
-            # whatever it has to keep live across a turn has nowhere to go. The grid-stride loop
-            # below stays for a capped grid, where the trip count really is dynamic.
+            # With grid == TOTAL the turns are known at compile time (the first _SP_HEAD workgroups
+            # take a slice id then a plain tile, the rest one plain tile), so emit them straight-line
+            # rather than a trip-count 1-or-2 loop whose live state has nowhere to go at occupancy 1.
             _lead_wg = pid < fx.Int32(_SP_HEAD)
             if _readfirstlane_i32(arith.select(_lead_wg, fx.Int32(1), fx.Int32(0))) > fx.Int32(0):
                 _emit_chunk(pid)
@@ -4185,11 +4050,9 @@ def _compile_grouped_tn_wgrad_4wave(
             return
         for d in range(pid, _GRID_EXT, nsms):
             if const_expr(_SPLIT):
-                # TWO BODIES, chosen by a wave-uniform scalar test on the id alone, and that is the
-                # point: a plain tile id runs the frozen body and reads nothing but its own group's
-                # bounds. Merging the two through selects instead made every workgroup of a launch
-                # that cuts nothing carry the banked store's scalar chain, 11.9 us of a 913 us
-                # balanced launch.
+                # TWO BODIES chosen by a wave-uniform scalar test on the id alone, so a plain tile id
+                # runs the frozen body and reads nothing but its own group's bounds. Merging them via
+                # selects would make every workgroup carry the banked store's scalar chain.
                 if _readfirstlane_i32(
                     arith.select(d >= fx.Int32(_SP_HEAD), fx.Int32(1), fx.Int32(0))
                 ) > fx.Int32(0):
@@ -4201,17 +4064,9 @@ def _compile_grouped_tn_wgrad_4wave(
 
     @flyc.kernel(known_block_size=[256, 1, 1])
     def kernel_grouped_tn_wgrad_reduce(C: fx.Tensor, group_offs: fx.Tensor, WS: fx.Tensor, m_total: fx.Int32):
-        """Fold the deep-K scratch bands back into C. Work item (tile q, sub) walks the groups that
-        banked anything, re-deriving each one's chunk span with the same scalars the GEMM used, and
-        sums its bands into its tile in ascending chunk order, in fp32 (no atomics, so the store
-        stays bit-reproducible).
-        The walk is sized by an on-device SCAN of the per-group rule, exactly as the persistent
-        forward kernel sizes its tile-iteration space off group_offs: lane g evaluates ITS OWN
-        group's K, and a wave prefix-sum turns those independent verdicts into the walk's trip count
-        and the g-th entry's index. Nothing compares one group against another. Sizing the walk this
-        way is also what keeps the pass off the balanced hard gate: re-deriving the group behind
-        every one of the NB token chunks instead ran a row->group ballot per chunk unconditionally
-        and cost 4.4 us of GPU time on a launch with nothing to fold, where this exits at once."""
+        """Fold the deep-K scratch bands back into C: work item (tile q, sub) sums the banked groups'
+        bands into its tile in ascending chunk order, in fp32 (no atomics, bit-reproducible). The
+        walk is sized by a wave scan of the per-group rule, so a launch with nothing to fold exits at once."""
         _ = str(fx.thread_idx.x)
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
         _ir_ty = _out_ty.ir_type
@@ -4222,11 +4077,9 @@ def _compile_grouped_tn_wgrad_4wave(
         ws_base = _buffer_ops.extract_base_index(WS)
         tid = fx.thread_idx.x
         _chd, _chr = _wgrad_chunk_geom(m_total, BLOCK_K, _NB)
-        # Lane g = group g, so the cut rule runs for all G groups at once and the whole enumeration
-        # is one gather pair plus one wave scan. The row count is clamped at zero first: lanes past
-        # the table read 0 for BOTH bounds, but lane G reads its own start and a 0 upper bound, and
-        # ceildiv_pow2's shift is logical -- an unclamped negative span scores as a huge K and puts
-        # a group index past C in the walk.
+        # Lane g = group g, so the cut rule runs for all G groups at once (one gather pair plus one
+        # wave scan). The row count is clamped at zero first: an unclamped negative span (lane G's
+        # 0 upper bound, logical shift) would score as a huge K and put a group index past C.
         _lane_g = tid % fx.Int32(64)
         _g0 = _lane_tbl_load(go_rs, _lane_g, G + 1, stride=2)[0]
         _g1 = _lane_tbl_load(go_rs, _lane_g, G + 1, stride=2, first=1)[0]
@@ -4266,14 +4119,9 @@ def _compile_grouped_tn_wgrad_4wave(
                 _c1 = _wgrad_chunk_of(_readfirstlane_i32(_readlane_i32(_g1, gi)) - fx.Int32(1), _chr, _NB)
                 # Rows past OUT_M fall outside the band SRD (dropped); columns wrap -> col_ok.
                 rs_c = make_row_band_resource(c_base, gi * OUT_M + bm_off, (gi + 1) * OUT_M, OUT_N, 2)
-                # The band sweep is COMPILE-TIME: every band's address is either this pass's row or
-                # out of its SRD, so a band the group never wrote costs no memory request (the
-                # addresser drops it) and the bands it did write all have their loads in flight at
-                # once. Walking only the live chunks in a runtime loop instead put one dependent
-                # HBM round trip per band on the critical path -- 138-158 us per firing launch,
-                # 12% of it, at 1.5 TB/s on a pass that moves under 250 MB.
-                # The group's FIRST boundary went into C with the leading piece, so the bands start
-                # one chunk later; the GEMM decides that from the same _c0.
+                # The band sweep is COMPILE-TIME: a band the group never wrote is out of SRD and
+                # costs no request, while the written ones have all loads in flight at once. The
+                # first boundary went into C with the leading piece, so bands start one chunk later.
                 _cf = _c0 + fx.Int32(1)
                 _sel = [
                     arith.andi(
@@ -4441,15 +4289,9 @@ _WGRAD_RACE_MARGIN = 0.985
 
 
 def _wgrad_4wave_cands(OUT_M, OUT_N, G, ncu, block=256):
-    """Order the candidates so cands[0] -- the incumbent the race below only displaces on a real
-    margin -- is the one the tile geometry argues for. The XCD-affine run leads only once the launch
-    is deep enough, and the band behind it is the NARROW one: the XCD classes are every nxcd-th tile
-    of the band order, so a wider band spreads a class over twice the columns instead of lengthening
-    its run, and it is the LARGER side of a class's tile rectangle that sets how much operand it has
-    to stream (the same argument _wgrad_xcd_aff_geom picks (h, w) by). Measured on the shape whose
-    group already covers the device, where the wide band used to lead: 13 band maps timed
-    interleaved put gn2 first and gn4 0.65% behind it, and in the race gn2 reads 1701.06 us against
-    1711.44 -- close enough that only a stable order keeps the faster one."""
+    """Order the candidates so cands[0] -- the incumbent the race only displaces on a real margin --
+    is the one the tile geometry argues for: the XCD-affine run leads once the launch is deep, and
+    the band behind it is the NARROW one (the larger rectangle side sets the operand it streams)."""
     n_blocks_m = (OUT_M + block - 1) // block
     n_blocks_n = (OUT_N + block - 1) // block
     tiles_per_group = n_blocks_m * n_blocks_n
@@ -4475,15 +4317,12 @@ def _wgrad_4wave_cands(OUT_M, OUT_N, G, ncu, block=256):
         return cands
     # The boundary bodies, which a deep launch otherwise gates off, keep the deep-K rule: offering
     # them WITHOUT it lets the balanced race -- all the tuner sees -- trade the whole mechanism for
-    # the boundary tiles' MFMA, and the mechanism is worth far more than 1.5% off balanced.
+    # the boundary tiles' MFMA, which is worth far less than the deep-K rule.
     cands += tuple(c[:4] + (3, True) for c in cands[:2])
     if lead_aff:
-        # A taller band than the geometry asks for only ever rode in front because a super-block
-        # spanning several groups gave its XCD a run long enough to absorb the extra operand rows.
-        # With one group per super-block the run is the group's own share and the geometry's (h, w)
-        # is the narrowest LARGER SIDE that holds it, so it goes LAST and has to beat that geometry
-        # by the hysteresis -- ahead of it, it was instead the first candidate to reach the deep-K
-        # bodies and so won the pair on a 0.07% reading (905.34 us against 905.93).
+        # A taller band than the geometry asks for only rode in front when a super-block spanning
+        # several groups absorbed the extra operand rows; with one group per super-block it goes LAST
+        # and must beat the geometry by the hysteresis rather than winning on dispatch order.
         h = 2 * aff[0]
         if n_blocks_m % h == 0 and h * aff[1] <= tiles_per_group // xcd_k:
             cands += ((h, aff[1], 1, 1, 3, True),)
@@ -4606,21 +4445,9 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
         except Exception:
             continue
         s = _score(l)  # numeric guard folded in: None -> skip
-        # EVERY displacement clears the hysteresis, not just the first: the race scores the
-        # candidates in a fixed order under one clock, so a reading carries the order as a
-        # systematic bias -- the same two maps read 12-16 us apart here and are indistinguishable
-        # when timed interleaved. With the bar frozen off the FIRST best instead, everything after
-        # the first displacement was decided by that bias, and the two band geometries this shape
-        # offers are a few tenths of a percent apart (1709.90 us against 1712.57).
-        # A reading can also come in far too HIGH -- this race was seen handing single candidates
-        # 2.8x their steady time -- and then every later candidate clears the bar, so re-timing the
-        # standing best before giving it up looks like the fix. It is NOT, at least not on its own:
-        # keeping the best's fastest of two readings makes it harder to displace than the margin
-        # says, and the two candidates this race must displace to reach the deep-K bodies are worth
-        # 4-8% of a balanced launch, so suppressing that displacement ships a map that misses the
-        # balanced hard gate (bal_dn 0.946, and the score with it: 1.335 -> 1.223 on one run in
-        # five). A re-time has to leave BOTH sides on the same footing -- the challenger confirming
-        # on a fresh reading too -- or it just moves which side the noise decides.
+        # EVERY displacement clears the hysteresis, not just the first: scoring candidates in a fixed
+        # order under one clock makes a reading carry that order as a systematic bias, so a bar
+        # frozen off the FIRST best would let the bias decide every later swap.
         if s is not None and s < best_s * _WGRAD_RACE_MARGIN:
             best_l, best_s = l, s
     return best_l
@@ -4665,10 +4492,9 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     M_total = lhs.shape[0]
     i64_tr = (M_total * OUT_M >= 2**32) or (M_total * OUT_N >= 2**32)
     at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, i64_tr)
-    # out as 2D [G*OUT_M, OUT_N] (the kernel's stacked-group view).
-    # m_total = the contraction length, a plain SHAPE (same one the i64 test above reads): the
-    # kernel cuts its token-chunk grid out of it instead of re-deriving it from the offset table on
-    # every workgroup. Nothing here looks at the table's CONTENT.
+    # out as 2D [G*OUT_M, OUT_N] (the kernel's stacked-group view). m_total = the contraction
+    # length, a plain SHAPE (the same one the i64 test reads): the kernel cuts its token-chunk grid
+    # out of it, never looking at the offset table's CONTENT.
     wargs = (lhs_i8, rhs_i8, out2d, lsf, rsf, go32, ws, M_total, stream)
     entry = _GROUPED_WGRAD_AT_CACHE.get(at_key)
     if entry is None:
