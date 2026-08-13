@@ -163,26 +163,23 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         # FlyDSL dense forward is SBHD-native: only the no-copy sbhd layout is eligible.
-        # A single-batch tensor is that layout whichever name it gets: [1,s,h,d] and [s,1,h,d]
-        # hold the same bytes, so the batch and sequence strides tie and _infer_qkv_format
-        # settles on bshd. Admitting it keeps b=1 (long-context training) on this path.
+        # A single-batch tensor is that layout whichever name it gets -- [1,s,h,d] and
+        # [s,1,h,d] hold the same bytes -- so a b=1 caller passes qkv_format="sbhd" rather
+        # than leaving the tied strides to be guessed (see flash_attn_func).
         if k is None or not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
             return False
-        sbhd_storage = qkv_format == "sbhd" or (qkv_format == "bshd" and q.shape[0] == 1)
-        return sbhd_storage and _flydsl_common_ok(
+        return qkv_format == "sbhd" and _flydsl_common_ok(
             q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes
         )
 
     @staticmethod
     def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
-        # Logical [b,s,h,d] with sbhd storage -> [s,b,h,d] contiguous (no copy).
-        q_s = q.permute(1, 0, 2, 3)
-        k_s = k.permute(1, 0, 2, 3)
-        v_s = v.permute(1, 0, 2, 3)
+        # q/k/v reach here as [s,b,h,d] already: flash_attn_func relabels a caller's
+        # [b,s,h,d] view before it resolves a backend, so there is nothing to convert.
         return flash_attn_sbhd_flydsl_forward_impl(
-            q_s,
-            k_s,
-            v_s,
+            q,
+            k,
+            v,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,

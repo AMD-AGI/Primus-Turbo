@@ -240,19 +240,16 @@ class AiterFlashAttnFunc(torch.autograd.Function):
 class FlydslFlashAttnFunc(torch.autograd.Function):
     """Dense FlyDSL flash-attention (SBHD-native, gfx950, causal, bf16, D in {64,128}).
 
-    Inputs are logical ``[b, s, h, d]`` with sbhd storage; ``permute(1, 0, 2, 3)``
-    yields the ``[s, b, h, d]`` contiguous layout the kernel consumes with no copy.
-    fwd and bwd run on the same backend by construction (this Function is FlyDSL-only),
+    q/k/v and out are ``[s, b, h, d]`` -- the one layout these kernels have -- so nothing
+    here permutes or copies. A caller that hands ``flash_attn_func`` the ``[b, s, h, d]``
+    view instead is relabelled once at that boundary. fwd and bwd run on the same backend by construction (this Function is FlyDSL-only),
     so no ctx.backend threading is needed.
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, softmax_scale, causal, window_size, return_lse, is_grad_enabled, sink=None):
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+    def forward(ctx, q_s, k_s, v_s, softmax_scale, causal, window_size, return_lse, is_grad_enabled, sink=None):
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q_s, k_s, v_s])
 
-        q_s = q.permute(1, 0, 2, 3).contiguous()
-        k_s = k.permute(1, 0, 2, 3).contiguous()
-        v_s = v.permute(1, 0, 2, 3).contiguous()
         out_s, lse = flash_attn_sbhd_flydsl_forward_impl(
             q_s,
             k_s,
@@ -264,7 +261,6 @@ class FlydslFlashAttnFunc(torch.autograd.Function):
             sink=sink,
         )
         Sq, B, Hq, _ = q_s.shape
-        out = out_s.permute(1, 0, 2, 3)  # [b, s, h, d] view
 
         if is_grad:
             ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
@@ -278,14 +274,16 @@ class FlydslFlashAttnFunc(torch.autograd.Function):
 
         if return_lse:
             # kernel LSE is [B*Sq, Hq] (batch-major) -> [B, Hq, Sq]
-            return out, lse.view(B, Sq, Hq).permute(0, 2, 1)
-        return out
+            return out_s, lse.view(B, Sq, Hq).permute(0, 2, 1)
+        return out_s
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout_s, *args):
         q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
-        dout_s = dout.permute(1, 0, 2, 3).contiguous()
-        lse_bhsq = lse.view(ctx.B, ctx.Sq, ctx.Hq).permute(0, 2, 1).contiguous()  # [B, Hq, Sq]
+        # [B, Hq, Sq], left as the view: the backward's -log2e prescale has an LDS-tiled
+        # kernel that folds this transpose into its one pass, and materialising it here both
+        # pays for a torch transpose and puts that kernel's stride check off its fast path.
+        lse_bhsq = lse.view(ctx.B, ctx.Sq, ctx.Hq).permute(0, 2, 1)
 
         grads = flash_attn_sbhd_flydsl_backward_impl(
             dout_s,
@@ -300,12 +298,8 @@ class FlydslFlashAttnFunc(torch.autograd.Function):
             sink=ctx.sink,
         )
         # backward returns (dq,dk,dv) or (dq,dk,dv,dsink) when sink is present.
-        dq_s, dk_s, dv_s = grads[0], grads[1], grads[2]
         dsink = grads[3] if len(grads) > 3 else None
-        dq = dq_s.permute(1, 0, 2, 3)
-        dk = dk_s.permute(1, 0, 2, 3)
-        dv = dv_s.permute(1, 0, 2, 3)
-        return dq, dk, dv, None, None, None, None, None, dsink
+        return grads[0], grads[1], grads[2], None, None, None, None, None, dsink
 
 
 class TritonFlashAttnFunc(torch.autograd.Function):
@@ -425,8 +419,19 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink: Optional[torch.Tensor] = None,
+    qkv_format: Optional[str] = None,
 ):
-    qkv_format = _infer_qkv_format(q, k, v)
+    # ``qkv_format="sbhd"`` says the tensors ARE [s, b, h, d] -- the layout FlyDSL has, and
+    # the one that has to be stated rather than guessed, since at b=1 sbhd and bshd hold the
+    # very same bytes. Leaving it None keeps the old inference, which reads the tensors as
+    # [b, s, h, d] whatever their storage; that view is relabelled here, once, so nothing
+    # below has to permute.
+    bshd_view_in = False
+    if qkv_format is None:
+        qkv_format = _infer_qkv_format(q, k, v)
+        if qkv_format == "sbhd":
+            q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+            bshd_view_in = True
 
     backend = resolve_flash_attn_backend(
         varlen=False,
@@ -445,10 +450,16 @@ def flash_attn_func(
     )
     # FlyDSL emits no dropout softmax matrix; keep return_attn_probs on aiter.
     if backend == BackendType.FLYDSL and not return_attn_probs:
-        return FlydslFlashAttnFunc.apply(
+        res = FlydslFlashAttnFunc.apply(
             q, k, v, softmax_scale, causal, window_size, return_lse, torch.is_grad_enabled(), sink
         )
+        if not bshd_view_in:
+            return res
+        # give a caller that came in on [b, s, h, d] its own axes back
+        return (res[0].permute(1, 0, 2, 3), res[1]) if return_lse else res.permute(1, 0, 2, 3)
 
+    if bshd_view_in:  # aiter takes logical [b, s, h, d] plus the storage name
+        q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
     result = AiterFlashAttnFunc.apply(
         q,
         k,

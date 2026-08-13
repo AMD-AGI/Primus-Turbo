@@ -97,22 +97,21 @@ def profile_case(B, Hq, Hkv, Sq, Skv, window_left):
     # previous case's cached segments first (fragmentation alone fails the allocation).
     torch.cuda.empty_cache()
     torch.manual_seed(0)
-    # FlyDSL dense is SBHD-native: leaves are stored [S,B,H,D] and viewed as logical
-    # [B,S,H,D] so _infer_qkv_format sees sbhd stride (else it falls back to aiter).
+    # FlyDSL dense is SBHD-native, so hand it [S,B,H,D] and name the layout -- at B=1 the
+    # sbhd storage is byte-identical to bshd and only the caller knows which one it built.
     qb = torch.randn((Sq, B, Hq, D), device=DEV, dtype=DT, requires_grad=True)
     kb = torch.randn((Skv, B, Hkv, D), device=DEV, dtype=DT, requires_grad=True)
     vb = torch.randn((Skv, B, Hkv, D), device=DEV, dtype=DT, requires_grad=True)
-    q, k, v = (t.permute(1, 0, 2, 3) for t in (qb, kb, vb))
 
     # Confirm the case actually routes to FlyDSL (not the aiter fallback).
     backend = resolve_flash_attn_backend(
-        varlen=False, user_backend=BackendType.FLYDSL, q=q, k=k, v=v,
+        varlen=False, user_backend=BackendType.FLYDSL, q=qb, k=kb, v=vb,
         dropout_p=0.0, softmax_scale=sm_scale, causal=True, window_size=window_size,
         bias=None, alibi_slopes=None, sink=None, qkv_format="sbhd",
     ).name
 
     fwd = lambda: turbo.ops.flash_attn_func(
-        q, k, v, softmax_scale=sm_scale, causal=True, window_size=window_size
+        qb, kb, vb, softmax_scale=sm_scale, causal=True, window_size=window_size, qkv_format="sbhd"
     )
     out = fwd()
     grad_out = torch.randn_like(out)
@@ -124,7 +123,7 @@ def profile_case(B, Hq, Hkv, Sq, Skv, window_left):
         o_ref = attention_ref(
             qr.permute(1, 0, 2, 3), kr.permute(1, 0, 2, 3), vr.permute(1, 0, 2, 3), sm_scale, window_left
         )
-        o_ref.backward(grad_out)
+        o_ref.backward(grad_out.permute(1, 0, 2, 3))  # ref is [B,S,H,D], flydsl out is [S,B,H,D]
         out.backward(grad_out, retain_graph=True)
         snrs = [compute_snr(r.grad, x.grad) for r, x in ((qr, qb), (kr, kb), (vr, vb))]
         check = "PASS" if all(s > SNR_THRESHOLD for s in snrs) else f"FAIL({min(snrs):.0f})"
