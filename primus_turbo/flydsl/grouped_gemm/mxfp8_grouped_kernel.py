@@ -59,6 +59,7 @@ from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
     _WGRAD_RED_WPT,
     _grouped_block_mn,
     _load_go,
+    _num_cus,
     _wgrad_block_mn,
     _wgrad_split_div,
     _wgrad_split_geom,
@@ -1464,6 +1465,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
     out_fp16: bool = False,
     chunk: int = 8,
     pack: int = 1,
+    split_k: bool = True,
 ):
     """Grouped MXFP8 variable-K wgrad (runtime per-group contraction M_g).
 
@@ -1504,9 +1506,13 @@ def _build_grouped_mxfp8_wgrad_kernel(
     # window of tiles' contraction dim -- slice 0 writes C, slices 1.. write scratch bands a
     # reduce kernel folds back. The window is picked on-device from group_offs; the grid is a
     # compile-time bound truncated by a runtime live count (dead workgroups exit before any memory op).
+    # `split_k` gates the whole path: the window only pays on grids shallow enough for one CU
+    # round to be a big share of the makespan (see _wgrad_split_pays), and it needs num_xcd <= 1
+    # because the window is a contiguous run of the PRE-remap pid space -- under an XCD remap that
+    # run scatters across groups and the reduce would fold bands the policy never sliced.
     _NCU = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     _S_MAX, _S_A, _S_B, _N_MAX, _SP_EXT = (
-        _wgrad_split_geom(TILES_PER_GROUP, TOTAL, _NCU) if num_xcd <= 1 else (1, 1, 1, 0, 0)
+        _wgrad_split_geom(TILES_PER_GROUP, TOTAL, _NCU) if (split_k and num_xcd <= 1) else (1, 1, 1, 0, 0)
     )
     _SPLIT = _S_MAX > 1
     _SP_POW2 = _wgrad_split_rcp_cfg(TILES_PER_GROUP, _S_A, _S_B, _NCU)[0]
@@ -1945,10 +1951,37 @@ def _build_grouped_mxfp8_wgrad_kernel(
 _GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16) -> launch
 _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
 _GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16) -> [raw, compiled]
+_GWG_CFG_CACHE: dict = {}  # cfg_key (NO M_total) -> (gm, xcd, gn) chosen by autotune
+
+# wgrad tile-swizzle autotune. The tile grid is G*ceildiv(OUT_M,bm)*ceildiv(OUT_N,bn) -- fixed
+# by the static shape alone -- so the race keys on that shape and is reused for every M_total.
+_GWG_DEFAULT_CFG = (4, 1, 0)  # (GROUP_M, num_xcd, group_n); the base every candidate must beat
+# gn>0 switches the walk to _band_block_mn's 2D super-block: N is cut into width-gn bands and a
+# gm x gn block of tiles is walked inside one, so a tile's A slab is re-read gn times and its B
+# slab gm times over a working set of (gm + gn) slabs -- gm=4/gn=2 asks 6 slabs of an XCD's 4 MB
+# L2 slice where gn=0 (gm M blocks against the whole N row) asks gm + N_BLOCKS_N = 27.
+# Every candidate keeps num_xcd=1: an XCD remap wins 3.8-4.5% on evenly split groups and gives
+# 50-63% back on top-heavy routing (it reorders the walk across groups, so a tail group's tiles
+# land on CUs still chewing the head group's), besides disabling split-K in the factory.
+_GWG_CANDS = ((4, 1, 2), (2, 1, 2), (2, 1, 4))
+# One tokens/group point, both distributions: the swizzle only reorders the tile grid, which is
+# M-independent, but WHICH tiles are hot is not -- a balanced-only race adopts cfgs that cost
+# several % on the top-heavy routing real MoE produces.
+_GWG_PM_CANON = ((2048, False), (2048, True))
+# Per-point hysteresis, above the interleaved-A/B noise band (<=0.5%, worst 0.9%).
+_GWG_AT_MARGIN = 0.99
+# Share of the makespan the split-K window must win back to be worth compiling in. Slicing one
+# window's contraction dim buys at best the exposed tail round, (1 - 1/S_A) of one CU round out
+# of the ceildiv(TOTAL, NCU) a launch takes. It costs the per-tile slice bookkeeping (runtime
+# slice bounds, the C-vs-scratch store base select, the row-band shift) in EVERY tile whether the
+# window fires or not, and at 1 WG/CU that sits latency-exposed in the tile prologue/epilogue:
+# +1483 static instructions, measured 2.3% (12x23 tile grid) / 3.2% (12x12) of the kernel on
+# distributions where the policy picks S=1.
+_GWG_SPLIT_TAX = 0.03
 
 
 def _compile_grouped_mxfp8_wgrad_fused(
-    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack=1, preshuffle=True
+    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack=1, preshuffle=True, split_k=True
 ):
     pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N, G, pack=pack)
     gemm_kern, red_kern, wpe, grid_x, red_grid = _build_grouped_mxfp8_wgrad_kernel(
@@ -1964,6 +1997,7 @@ def _compile_grouped_mxfp8_wgrad_fused(
         blgp=blgp,
         out_fp16=out_fp16,
         pack=pack,
+        split_k=split_k,
     )
 
     @flyc.jit
@@ -2025,6 +2059,155 @@ def _get_grouped_wgrad_workspace(OUT_M, OUT_N, K128, G, pack, device, stream):
     return e
 
 
+def _wgrad_split_pays(OUT_M, OUT_N, G, bm, bn, ncu):
+    """Is the split-K window worth compiling into every tile of THIS tile grid?
+
+    Rule A -- the distribution-independent half of the policy -- slices the `TOTAL % NCU` tiles of
+    the one exposed partial round S_A-fold, so it buys at most (1 - 1/S_A) of a CU round out of the
+    ceildiv(TOTAL, NCU) rounds a launch takes, and its extra slices always fit that round (rule A
+    picks S_A*rem <= NCU). Against that, the per-tile slice bookkeeping is paid by every tile of
+    every round whether the window fires or not: _GWG_SPLIT_TAX. So the window pays on a shallow
+    grid, where one round is a large share of the makespan, and stops paying as the grid deepens.
+    Rule B (slicing a hot group's own tile chain) rides along whenever the path is compiled in;
+    its payoff is a function of the runtime token distribution, which no compile-time key sees."""
+    tiles_per_group = ceildiv(OUT_M, bm) * ceildiv(OUT_N, bn)
+    total = G * tiles_per_group
+    s_max, s_a, _s_b, _n_max, _ext = _wgrad_split_geom(tiles_per_group, total, ncu)
+    if s_max <= 1 or s_a <= 1:
+        return False
+    return (1.0 - 1.0 / s_a) / ceildiv(total, ncu) >= _GWG_SPLIT_TAX
+
+
+def _get_wgrad_launch(
+    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle, split_k
+):
+    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle, split_k)
+    launch = _GWG_FUSED_CACHE.get(fk)
+    if launch is None:
+        launch = _compile_grouped_mxfp8_wgrad_fused(
+            OUT_M,
+            OUT_N,
+            G,
+            bm,
+            bn,
+            gm,
+            xcd,
+            gn,
+            cbsz,
+            blgp,
+            out_fp16,
+            pack=pack,
+            preshuffle=preshuffle,
+            split_k=split_k,
+        )
+        _GWG_FUSED_CACHE[fk] = launch
+    return launch
+
+
+def _canon_wgrad_targs(args, OUT_M, OUT_N, G, pack, pm, skew):
+    """Synthetic args at `pm` tokens/group (dummy content, only shapes drive timing), groups evenly
+    split or top-heavy per `skew`. Both operands carry the contraction dim here, so neither side can
+    be reused from `args`; C is M-independent and every launch overwrites all of it, so the race
+    scores into the caller's own output buffer instead of a second one."""
+    dev, stream = args[2].device, args[14]
+    M_c = G * pm
+    K128 = M_c // 128
+    a8_c = torch.randint(0, 127, (OUT_M, M_c), device=dev, dtype=torch.int8)
+    b8_c = torch.randint(0, 127, (OUT_N, M_c), device=dev, dtype=torch.int8)
+    a_raw_c = torch.randint(120, 128, (OUT_M, M_c // 32), device=dev, dtype=torch.uint8)
+    b_raw_c = torch.randint(120, 128, (OUT_N, M_c // 32), device=dev, dtype=torch.uint8)
+    a_sp_c, b_sp_c = _get_grouped_wgrad_workspace(OUT_M, OUT_N, K128, G, pack, dev, stream)
+    n_ck = K128 // _PRESHUF_KT + G
+    a_blocks = ceildiv(OUT_M, 64) * n_ck
+    pre_grid = a_blocks + ((OUT_N + 255) // 256) * 4 * n_ck
+    targs = (
+        a8_c,
+        b8_c,
+        args[2],  # C (M-independent, fully overwritten by every launch)
+        a_raw_c.view(torch.int32).reshape(-1),
+        b_raw_c.view(torch.int32).reshape(-1),
+        a_sp_c,
+        b_sp_c,
+        _canon_go(G, pm, skew, dev).view(torch.int32),
+        args[8],  # split-K scratch (M-independent)
+        M_c,
+        K128,
+        n_ck,
+        a_blocks,
+        pre_grid,
+        stream,
+    )
+    return targs, args[2]
+
+
+def _select_wgrad_cfg(cfg_key, OUT_M, OUT_N, G, bm, bn, cbsz, blgp, out_fp16, pack, split_k, args):
+    """First-call race on synthetic canonical tensors; cache the winning swizzle per static shape
+    (cfg_key, no M_total -> reused for every token count of the same tile grid).
+
+    Both points share the canonical shape's scale workspace, and the packing is per-group, so each
+    point's is refilled (one preshuffling launch) before it is used and only the GEMM is timed: the
+    preshuffle dispatches thousands of tiny workgroups over the whole scale buffer, which would both
+    dilute every ratio and hand the GEMM a perturbed L2 -- the very thing this race scores."""
+    cached = _GWG_CFG_CACHE.get(cfg_key)
+    if cached is not None:
+        return cached
+    _GWG_CFG_CACHE[cfg_key] = _GWG_DEFAULT_CFG  # any failure below leaves the default in place
+
+    def _launch_of(cfg, preshuffle=False):
+        return _get_wgrad_launch(
+            OUT_M, OUT_N, G, bm, bn, *cfg, cbsz, blgp, out_fp16, pack, preshuffle, split_k
+        )
+
+    try:
+        points = [
+            _canon_wgrad_targs(args, OUT_M, OUT_N, G, pack, pm, skew) for pm, skew in _GWG_PM_CANON
+        ]
+        fill = _launch_of(_GWG_DEFAULT_CFG, preshuffle=True)
+        base = _launch_of(_GWG_DEFAULT_CFG)
+        refs = []
+        for targs, out_view in points:
+            fill(*targs)
+            base(*targs)
+            torch.cuda.synchronize()
+            r = out_view.detach().clone().float()
+            if not torch.isfinite(r.reshape(-1)[:1024]).all().item():
+                raise RuntimeError("base cfg produced non-finite output")
+            refs.append((r, float((r * r).sum().item()) or 1.0))
+        _robust_time(base, points[0][0])  # ramp to the sustained-load clock before racing
+    except Exception:
+        return _GWG_DEFAULT_CFG
+
+    best_cfg, best_ratio = _GWG_DEFAULT_CFG, 1.0
+    for cfg in _GWG_CANDS:
+        try:
+            launch = _launch_of(cfg)
+            rs, matched = [], True
+            for (targs, out_view), (ref, ref_n) in zip(points, refs):
+                fill(*targs)  # the other point's packing is in the shared workspace
+                launch(*targs)
+                torch.cuda.synchronize()
+                o = out_view.detach().float()
+                err = float(((o - ref) * (o - ref)).sum().item())
+                # never adopt a cfg that drifts from the base at any point: a swizzle change moves
+                # the split-K window, and a window over different tiles reduces in another order
+                if not ((err / ref_n) < (2e-2**2) and torch.isfinite(o.reshape(-1)[:1024]).all().item()):
+                    matched = False
+                    break
+                rs.append(_robust_ab_ratio(base, launch, targs))
+            if not matched:
+                continue
+        except Exception:
+            continue
+        # Adopt only a cfg that clears the hysteresis at EVERY point, then keep the fastest such
+        # cfg -- ties keep the earlier candidate, so the fixed list order decides.
+        score = math.exp(sum(math.log(r) for r in rs) / len(rs))
+        if max(rs) < _GWG_AT_MARGIN and score < best_ratio:
+            best_cfg, best_ratio = cfg, score
+
+    _GWG_CFG_CACHE[cfg_key] = best_cfg
+    return best_cfg
+
+
 def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     lhs: "torch.Tensor",
     lhs_scale: "torch.Tensor",
@@ -2080,21 +2263,23 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     a_blocks = a_ngrp * n_ck
     pre_grid = a_blocks + b_ngrp * n_ck
 
-    bm, bn, gm, xcd, gn = 256, 256, 4, 1, 0
+    bm, bn = 256, 256
+    ncu = _num_cus()
+    split_k = _wgrad_split_pays(OUT_M, OUT_N, G, bm, bn, ncu)
     # Split-K slice scratch (S_MAX-1 row bands at C's pitch), persistent per shape+device.
     ws = _wgrad_split_ws(OUT_M, OUT_N, G, lhs.device, out_dtype, BLOCK_M=bm, BLOCK_N=bn)
-    # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
-    # The split-K window geometry is a pure function of (OUT_M, OUT_N, G, bm, bn) plus the
-    # device CU count, all of which the key already pins.
-    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle)
-    launch = _GWG_FUSED_CACHE.get(fk)
-    if launch is None:
-        launch = _compile_grouped_mxfp8_wgrad_fused(
-            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack=pack, preshuffle=preshuffle
-        )
-        _GWG_FUSED_CACHE[fk] = launch
-
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, ws, M_total, K128, n_ck, a_blocks, pre_grid, stream)
+    # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
+    # The tile swizzle and the split-K window geometry are pure functions of (OUT_M, OUT_N, G, bm,
+    # bn) plus the device CU count, so the cfg race keys on those alone and every token count of
+    # the shape reuses its winner.
+    cfg_key = (OUT_M, OUT_N, G, bm, bn, cbsz, blgp, out_fp16, pack, split_k, ncu)
+    gm, xcd, gn = _select_wgrad_cfg(
+        cfg_key, OUT_M, OUT_N, G, bm, bn, cbsz, blgp, out_fp16, pack, split_k, args
+    )
+    launch = _get_wgrad_launch(
+        OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle, split_k
+    )
     at_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16, pack, preshuffle)
     entry = _GWG_AT_CACHE.get(at_key)
     if entry is None:
