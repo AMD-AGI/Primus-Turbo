@@ -264,6 +264,41 @@ def get_symm_buffer_size_for_mega_moe(
     return num_bytes, slice_input_buffers
 
 
+_SYMM_HEAP_CACHE: dict = {}
+
+
+def _acquire_symm_heap(group, num_bytes: int):
+    """Grow-only per-group IPC heap.
+
+    hipIpcGetMemHandle pins the allocation for the process lifetime: hipFree then
+    returns success but reclaims nothing, so every realloc is a permanent leak.
+    Reuse the heap whenever it is already large enough.
+    """
+    from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
+
+    cached = _SYMM_HEAP_CACHE.get(group.group_name)
+    if cached is not None and not cached.is_destroyed and cached.buffer_size >= num_bytes:
+        # Reused heap carries stale flags/parity; the ctor only zeroes fresh ones.
+        cached.get_buffer(cached.rank, (cached.buffer_size,), torch.int8).zero_()
+        torch.cuda.synchronize()
+        group.barrier()
+        return cached
+
+    grown = max(int(num_bytes), cached.buffer_size if cached is not None else 0)
+    heap = SymmetricMemory(group, grown, signal_pad_size=0)
+    if cached is not None:
+        cached.destroy()
+    _SYMM_HEAP_CACHE[group.group_name] = heap
+    return heap
+
+
+def release_symm_heaps() -> None:
+    """Explicit teardown; the VRAM itself stays pinned until the process exits."""
+    for heap in _SYMM_HEAP_CACHE.values():
+        heap.destroy()
+    _SYMM_HEAP_CACHE.clear()
+
+
 class SymmBuffer:
     """Host owner of the IPC heap + parity bookkeeping; hands the kernel a lean ``SymBuffer``."""
 
@@ -319,10 +354,8 @@ class SymmBuffer:
         self.num_combine_slots = workspace.num_combine_slots
         self.num_tokens = self.num_max_tokens_per_rank  # back-compat alias
 
-        # allocate the single symmetric-memory heap (custom HIP IPC; ctor zeroes it, skip signal pad)
-        from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
-
-        self.symm_mem = SymmetricMemory(group, self.num_bytes, signal_pad_size=0)
+        # the single symmetric-memory heap, shared and grow-only (see _acquire_symm_heap)
+        self.symm_mem = _acquire_symm_heap(group, self.num_bytes)
         self.buffer = self.symm_mem.get_buffer(self.rank, (self.num_bytes,), torch.int8)
         heap = self.buffer
         self.group.barrier()
@@ -348,9 +381,13 @@ class SymmBuffer:
         # device epoch state (parity + per-bank expected); bumped by the device bump kernel
         self._disp_parity = torch.zeros(1, dtype=torch.int64, device="cuda")  # index into the 2 banks
         self._disp_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._disp_copy_flag = torch.zeros(
+            2 * workspace.num_max_pool_blocks, dtype=torch.int64, device="cuda"
+        )
         self._combine_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
         self._combine_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._reduce_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._combine_dedup_done = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._sym_buffer = None  # cached so its peer-delta table stays alive with this heap
 
     def get_sym_buffer(self) -> SymBuffer:
@@ -365,10 +402,9 @@ class SymmBuffer:
         global _CURRENT_SYMM_BUFFER
         if _CURRENT_SYMM_BUFFER is self:
             _CURRENT_SYMM_BUFFER = None
-        # region views are non-owning aliases of the raw heap ptr; free the heap, then drop refs
+        # region views are non-owning aliases of the raw heap ptr; just drop refs.
+        # The heap itself stays in _SYMM_HEAP_CACHE for reuse: it cannot be freed.
         self._sym_buffer = None
-        if self.symm_mem is not None:
-            self.symm_mem.destroy()
         self.symm_mem = None
         self.buffer = None
 

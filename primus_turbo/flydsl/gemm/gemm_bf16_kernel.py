@@ -37,6 +37,8 @@ from flydsl.expr.utils.arith import ArithValue
 from primus_turbo.flydsl.utils.gemm_helper import (
     BLOCK_K,
     G2SLoader,
+    GatherG2SLoaderBf16,
+    GatherVarKG2SLoaderBf16,
     Mfma16x16x32,
     Mfma32x32x16,
     S2RLoaderBf16,
@@ -45,7 +47,9 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     StoreCBf16,
     ceildiv,
     compute_global_swizzle_bf16,
+    compute_global_swizzle_bf16_rc,
     compute_global_swizzle_nn_bf16,
+    compute_global_swizzle_nn_bf16_rc,
     make_bf16_buffer_tensor_rebased,
     make_fp16_bf16_buffer_tensor,
     make_value_attrs,
@@ -76,9 +80,33 @@ def _load_i64_as_i32(base, offset):
     return ArithValue(trunc.result, signed=True)
 
 
-def _make_shared_storage(BLOCK_M, BLOCK_N):
+# Staged slot ids per block, in entries. The K loop reads slots from here instead
+# of issuing a buffer load per chunk. One direct-to-LDS pass stages SLOT_LDS_PASS
+# entries (4 dwords per lane, WGRAD_WAVES waves); only as many passes as the group
+# needs are issued, so a small group does not pay for the whole array.
+SLOT_LDS_PASS = 8 * 64 * 4
+SLOT_LDS_CAP = 2 * SLOT_LDS_PASS
+
+
+def _make_shared_storage(BLOCK_M, BLOCK_N, slot_lds=False):
     a_lds_size = (BLOCK_M // 2) * BLOCK_K
     b_lds_size = (BLOCK_N // 2) * BLOCK_K
+
+    if slot_lds:
+
+        @fx.struct
+        class SharedStorage:
+            A_lds_cur_0: fx.Array[fx.BFloat16, a_lds_size, 16]
+            A_lds_cur_1: fx.Array[fx.BFloat16, a_lds_size, 16]
+            A_lds_next_0: fx.Array[fx.BFloat16, a_lds_size, 16]
+            A_lds_next_1: fx.Array[fx.BFloat16, a_lds_size, 16]
+            B_lds_cur_0: fx.Array[fx.BFloat16, b_lds_size, 16]
+            B_lds_cur_1: fx.Array[fx.BFloat16, b_lds_size, 16]
+            B_lds_next_0: fx.Array[fx.BFloat16, b_lds_size, 16]
+            B_lds_next_1: fx.Array[fx.BFloat16, b_lds_size, 16]
+            SLOT_lds: fx.Array[fx.Int32, SLOT_LDS_CAP, 16]
+
+        return SharedStorage
 
     @fx.struct
     class SharedStorage:
@@ -137,6 +165,7 @@ def dense_mma_pipeline_bf16(
     b_cur1 = lds.B_lds_cur_1
     b_next0 = lds.B_lds_next_0
     b_next1 = lds.B_lds_next_1
+    a_g2s0, a_g2s1 = a_g2s
 
     c00_frag = [mfma.zero_value] * N_ACCUMS
     c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -144,16 +173,16 @@ def dense_mma_pipeline_bf16(
     c11_frag = [mfma.zero_value] * N_ACCUMS
 
     b_g2s.load(b_cur0, B0_gl_offset + 0 * b_k_step)
-    a_g2s.load(a_cur0, A0_gl_offset + 0 * a_k_step)
+    a_g2s0.load(a_cur0, A0_gl_offset + 0 * a_k_step)
     b_g2s.load(b_cur1, B1_gl_offset + 0 * b_k_step)
-    a_g2s.load(a_cur1, A1_gl_offset + 0 * a_k_step)
+    a_g2s1.load(a_cur1, A1_gl_offset + 0 * a_k_step)
 
     if wave_m == 1:
         rocdl.s_barrier()
     wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
     b_g2s.load(b_next0, B0_gl_offset + 1 * b_k_step)
-    a_g2s.load(a_next0, A0_gl_offset + 1 * a_k_step)
+    a_g2s0.load(a_next0, A0_gl_offset + 1 * a_k_step)
     b_g2s.load(b_next1, B1_gl_offset + 1 * b_k_step)
 
     wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
@@ -161,7 +190,7 @@ def dense_mma_pipeline_bf16(
     for k in range_constexpr(K_ITERS - 2):
         b0_frag = b_s2r.load(b_cur0)
         a0_frag = a_s2r.load(a_cur0)
-        a_g2s.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+        a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -179,7 +208,7 @@ def dense_mma_pipeline_bf16(
         rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
-        a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * a_k_step)
+        a_g2s0.load(a_cur0, A0_gl_offset + (k + 2) * a_k_step)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -232,7 +261,7 @@ def dense_mma_pipeline_bf16(
     rocdl.s_barrier()
 
     b0_frag = b_s2r.load(b_next0)
-    a_g2s.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+    a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
     c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
@@ -296,6 +325,8 @@ def gemm_bf16_nt_tile(
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
+    a_slot_ids=None,
+    a_block_m=None,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
@@ -324,25 +355,58 @@ def gemm_bf16_nt_tile(
         block_m = first_pid_m + (pid_in_group % group_size_m)
         block_n = pid_in_group // group_size_m
 
-    A0_gl_offset = (block_m * BLOCK_M) * K
-    A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
+    if a_block_m is None:
+        a_block_m = block_m
+    if a_slot_ids is None:
+        A0_gl_offset = (a_block_m * BLOCK_M) * K
+        A1_gl_offset = (a_block_m * BLOCK_M + LDS_BLOCK_M) * K
+    else:
+        # Gather resolves the row base through slot_ids, so the pipeline's A
+        # offset is a pure K column and stays a compile-time constant.
+        A0_gl_offset = 0
+        A1_gl_offset = 0
     B0_gl_offset = (block_n * BLOCK_N) * K
     B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
     if b_group_base is not None:
         B0_gl_offset = B0_gl_offset + b_group_base
         B1_gl_offset = B1_gl_offset + b_group_base
 
-    gA = make_fp16_bf16_buffer_tensor(A)
     gB = make_fp16_bf16_buffer_tensor(B_T)
-    a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
     b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+    if a_slot_ids is None:
+        gA = make_fp16_bf16_buffer_tensor(A)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
 
-    gl_off_a = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
     gl_off_b = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
 
     mfma = Mfma32x32x16(N_TILES_A, N_TILES_B)
 
-    a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, fx.BFloat16.ir_type, wave_id)
+    if a_slot_ids is None:
+        gl_off_a = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
+        dense_loader = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, fx.BFloat16.ir_type, wave_id)
+        a_g2s = (dense_loader, dense_loader)
+    else:
+        gl_rc_a = compute_global_swizzle_bf16_rc(lane_id, wave_id, N_LDS_ROUNDS)
+        a_g2s = (
+            GatherG2SLoaderBf16(
+                A,
+                gl_rc_a,
+                N_LDS_STEPS_A,
+                wave_id,
+                a_slot_ids,
+                K,
+                a_block_m * fx.Int32(BLOCK_M),
+            ),
+            GatherG2SLoaderBf16(
+                A,
+                gl_rc_a,
+                N_LDS_STEPS_A,
+                wave_id,
+                a_slot_ids,
+                K,
+                a_block_m * fx.Int32(BLOCK_M) + fx.Int32(LDS_BLOCK_M),
+            ),
+        )
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
     a_s2r = S2RLoaderBf16(wave_m, N_TILES_A)
     b_s2r = S2RLoaderBf16(wave_n, N_TILES_B)
@@ -375,6 +439,11 @@ def gemm_bf16_nt_tile(
     )
 
 
+def gemm_bf16_gather_a_tile(*args, a_slot_ids, **kwargs):
+    """NT BF16 tile whose logical A rows gather from physical dispatch slots."""
+    return gemm_bf16_nt_tile(*args, a_slot_ids=a_slot_ids, **kwargs)
+
+
 def _gemm_bf16_nn_tn_tile_impl(
     A,
     B,
@@ -396,9 +465,14 @@ def _gemm_bf16_nn_tn_tile_impl(
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
+    a_slot_ids=None,
+    a_block_m=None,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NN/TN needs K % {BLOCK_K} == 0 (got K={K})"
+    # NN's A is [M,K] row-major like NT, so it shares the gather loader. TN's A is
+    # transposed, where the gathered index would sit on the contraction axis.
+    assert a_slot_ids is None or not a_transpose, "gather-A is only defined for the NN layout here"
     N_TILES_A = BLOCK_M // 128
     N_TILES_B = BLOCK_N // 256
     LDS_BLOCK_M = BLOCK_M // 2
@@ -424,13 +498,21 @@ def _gemm_bf16_nn_tn_tile_impl(
         block_m = first_pid_m + (pid_in_group % group_size_m)
         block_n = pid_in_group // group_size_m
 
+    if a_block_m is None:
+        a_block_m = block_m
     if a_transpose:
         A0_gl_offset = block_m * BLOCK_M + 0
         A1_gl_offset = block_m * BLOCK_M + LDS_BLOCK_M
         a_k_step = BLOCK_K * c_m
+    elif a_slot_ids is None:
+        A0_gl_offset = (a_block_m * BLOCK_M) * K
+        A1_gl_offset = (a_block_m * BLOCK_M + LDS_BLOCK_M) * K
+        a_k_step = BLOCK_K
     else:
-        A0_gl_offset = (block_m * BLOCK_M) * K
-        A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
+        # Gather resolves the row base through slot_ids, so the pipeline's A
+        # offset is a pure K column and stays a compile-time constant.
+        A0_gl_offset = 0
+        A1_gl_offset = 0
         a_k_step = BLOCK_K
     B0_gl_offset = block_n * BLOCK_N + 0
     B1_gl_offset = block_n * BLOCK_N + LDS_BLOCK_N
@@ -439,18 +521,42 @@ def _gemm_bf16_nn_tn_tile_impl(
         B0_gl_offset = B0_gl_offset + b_group_base
         B1_gl_offset = B1_gl_offset + b_group_base
 
-    gA = make_fp16_bf16_buffer_tensor(A)
     gB = make_fp16_bf16_buffer_tensor(B)
-    a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
     b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
-    if a_transpose:
-        gl_off_a = compute_global_swizzle_nn_bf16(lane_id, wave_id, c_m, N_LDS_STEPS_A)
-    else:
-        gl_off_a = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
     gl_off_b = compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, N_LDS_STEPS_B)
 
     mfma = Mfma32x32x16(N_TILES_A, N_TILES_B)
-    a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, fx.BFloat16.ir_type, wave_id)
+    if a_slot_ids is None:
+        gA = make_fp16_bf16_buffer_tensor(A)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+        if a_transpose:
+            gl_off_a = compute_global_swizzle_nn_bf16(lane_id, wave_id, c_m, N_LDS_STEPS_A)
+        else:
+            gl_off_a = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
+        dense_a_loader = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, fx.BFloat16.ir_type, wave_id)
+        a_g2s = (dense_a_loader, dense_a_loader)
+    else:
+        gl_rc_a = compute_global_swizzle_bf16_rc(lane_id, wave_id, N_LDS_ROUNDS)
+        a_g2s = (
+            GatherG2SLoaderBf16(
+                A,
+                gl_rc_a,
+                N_LDS_STEPS_A,
+                wave_id,
+                a_slot_ids,
+                K,
+                a_block_m * fx.Int32(BLOCK_M),
+            ),
+            GatherG2SLoaderBf16(
+                A,
+                gl_rc_a,
+                N_LDS_STEPS_A,
+                wave_id,
+                a_slot_ids,
+                K,
+                a_block_m * fx.Int32(BLOCK_M) + fx.Int32(LDS_BLOCK_M),
+            ),
+        )
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
     a_s2r = S2RLoaderTrBf16(wave_m, N_TILES_A) if a_transpose else S2RLoaderBf16(wave_m, N_TILES_A)
     b_s2r = S2RLoaderTrBf16(wave_n, N_TILES_B)
@@ -502,6 +608,8 @@ def gemm_bf16_nn_tile(
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
+    a_slot_ids=None,
+    a_block_m=None,
 ):
     _gemm_bf16_nn_tn_tile_impl(
         A,
@@ -513,6 +621,8 @@ def gemm_bf16_nn_tile(
         block_m,
         block_n,
         a_transpose=False,
+        a_slot_ids=a_slot_ids,
+        a_block_m=a_block_m,
         K=K,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -799,8 +909,26 @@ def gemm_bf16_variable_k_tile(
     out_fp16=False,
     c_cache_modifier=0,
     trans_c=False,
+    a_slot_ids=None,
+    b_slot_ids=None,
+    slot_len=None,
+    slot_x4=False,
+    slot_unroll=1,
+    slot_lds=False,
+    slot_alu=False,
+    slot_u16=False,
 ):
     CHUNK = 4
+    # slot_x4 folds a chunk's slot loads into one dwordx4; without it a wider window
+    # still costs one dwordx1 per k, but it is the number of drain points that matters.
+    # the staged table is read linearly from LDS, so the interleave buys nothing
+    assert not (slot_lds and slot_x4), "slot_lds and slot_x4 are alternatives"
+    # slot_lds removes the drain slot_unroll amortizes, and windowing assumes 1-chunk lookahead
+    assert not (slot_lds and slot_unroll > 1), "slot_lds implies slot_unroll == 1"
+    # probe only: slot_alu ignores the table, so it cannot combine with either scheme
+    assert not (slot_alu and (slot_lds or slot_x4)), "slot_alu excludes slot_lds/slot_x4"
+    # slot_u16 is the same interleaved table at half width; the others read i32
+    assert not (slot_u16 and (slot_x4 or slot_lds or slot_alu)), "slot_u16 excludes the other modes"
     WGRAD_WAVES = 8  # fixed 8 waves per block
     assert BLOCK_M >= 128 and BLOCK_N >= 64 and BLOCK_M % 128 == 0 and BLOCK_N % 64 == 0
     N_TILES_A = BLOCK_M // 128
@@ -824,13 +952,6 @@ def gemm_bf16_variable_k_tile(
     b_base_off = _i64(m_start) * fx.Int64(OUT_N * 2)
     a_span = _i64(group_tokens) * _i64(out_m_rt) * fx.Int64(2)
     b_span = _i64(group_tokens) * _i64(out_n_rt) * fx.Int64(2)
-    gA = make_bf16_buffer_tensor_rebased(A, bf16_ir, a_base_off, a_span)
-    gB = make_bf16_buffer_tensor_rebased(B, bf16_ir, b_base_off, b_span)
-    a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
-    b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
-
-    gl_off_a = compute_global_swizzle_nn_bf16(lane_id, wave_id, OUT_M, N_LDS_STEPS_A)
-    gl_off_b = compute_global_swizzle_nn_bf16(lane_id, wave_id, OUT_N, N_LDS_STEPS_B)
 
     a0_off = block_m * BLOCK_M
     a1_off = a0_off + LDS_BLOCK_M
@@ -847,8 +968,77 @@ def gemm_bf16_variable_k_tile(
     b_s2r = S2RLoaderTr16x32Bf16(wave_n, NTB16)
     ACC_VEC_N = 4
     N_ACCUMS_EFF = N_ACCUMS16
-    a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, bf16_ir, wave_id)
-    b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, bf16_ir, wave_id)
+
+    a_offs = [a0_off, a1_off]
+    b_offs = [b0_off, b1_off]
+
+    def _make_g2s(operand, slot_ids, row_stride, n_steps, base_off, span, cols):
+        """Dense rebased loader, or one gather loader serving both LDS halves."""
+        if const_expr(slot_ids is None):
+            g = make_bf16_buffer_tensor_rebased(operand, bf16_ir, base_off, span)
+            gl_off = compute_global_swizzle_nn_bf16(lane_id, wave_id, row_stride, n_steps)
+            return G2SLoader(fx.logical_divide(g, fx.make_layout(1, 1)), gl_off, n_steps, bf16_ir, wave_id)
+        gl_rc = compute_global_swizzle_nn_bf16_rc(lane_id, wave_id, n_steps, WGRAD_WAVES)
+        x4 = (CHUNK * BLOCK_K, CHUNK) if (slot_x4 or slot_u16) else None
+        return GatherVarKG2SLoaderBf16(
+            operand,
+            gl_rc,
+            n_steps,
+            wave_id,
+            slot_ids,
+            slot_len,
+            row_stride,
+            m_start,
+            cols,
+            slot_x4=x4,
+            slot_u16=slot_u16,
+        )
+
+    a_g2s = _make_g2s(A, a_slot_ids, OUT_M, N_LDS_STEPS_A, a_base_off, a_span, a_offs)
+    b_g2s = _make_g2s(B, b_slot_ids, OUT_N, N_LDS_STEPS_B, b_base_off, b_span, b_offs)
+
+    # Dense loaders take the fused (column + k * row_stride) offset; gather loaders
+    # hold the column base and take voffsets resolved ahead of the MFMA quadrants.
+    def _load_a(dst, half, k, voffs):
+        if const_expr(a_slot_ids is None):
+            a_g2s.load(dst, a_offs[half] + k * a_k_step)
+        elif const_expr(slot_u16):
+            # the window hands back a thunk: unpack here, not at the window head
+            a_g2s.load(dst, half, voffs())
+        else:
+            a_g2s.load(dst, half, voffs)
+
+    def _load_b(dst, half, k, voffs):
+        if const_expr(b_slot_ids is None):
+            b_g2s.load(dst, b_offs[half] + k * b_k_step)
+        elif const_expr(slot_u16):
+            b_g2s.load(dst, half, voffs())
+        else:
+            b_g2s.load(dst, half, voffs)
+
+    def _voffs(loader, slot_ids, k, wbase=None, wlim=None):
+        if const_expr(slot_ids is None):
+            return None
+        if const_expr(slot_lds):
+            return loader.voffsets_lds(lds.SLOT_lds, k * fx.Int32(BLOCK_K) - wbase, wlim)
+        if const_expr(slot_alu):
+            return loader.voffsets_alu(k * fx.Int32(BLOCK_K))
+        return loader.voffsets(k * fx.Int32(BLOCK_K))
+
+    def _voffs_x4(loader, slot_ids, chunk_idx):
+        if const_expr(slot_ids is None):
+            return None
+        return loader.voffsets_x4(chunk_idx)
+
+    def _packs_u16(loader, slot_ids, chunk_idx):
+        if const_expr(slot_ids is None):
+            return None
+        return loader.slot_pack_u16(chunk_idx)
+
+    def _lazy_u16(loader, packs, j):
+        """Thunk unpacking k step j at the use site, keeping voffsets short-lived."""
+        return lambda: loader.unpack_u16(packs, j)
+
     out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     if const_expr(trans_c):
         store_c = StoreCBf16(C, G * OUT_N, OUT_M, out_ty, cache_modifier=c_cache_modifier)
@@ -863,35 +1053,145 @@ def gemm_bf16_variable_k_tile(
         for reg in quad:
             fx.memref_store_vec(mfma.zero_value, reg)
 
+    # A window stages SLOT_LDS_CAP entries but advances by one chunk less, because
+    # the K pipeline looks a chunk ahead and must still find those slots staged.
+    WIN_CHUNKS = SLOT_LDS_CAP // (CHUNK * BLOCK_K) - 1
+    WIN_TOKENS = WIN_CHUNKS * CHUNK * BLOCK_K
+
+    def _win_fills(w):
+        """Passes needed for window w: enough to cover it, never more."""
+        rem = group_tokens - ArithValue(w) * fx.Int32(WIN_TOKENS)
+        n = (rem + fx.Int32(SLOT_LDS_PASS - 1)) // fx.Int32(SLOT_LDS_PASS)
+        return ArithValue(
+            arith.minsi(arith._to_raw(n), arith._to_raw(fx.Int32(SLOT_LDS_CAP // SLOT_LDS_PASS))),
+            signed=True,
+        )
+
+    def _win_limit(w):
+        return _win_fills(w) * fx.Int32(SLOT_LDS_PASS) - fx.Int32(1)
+
+    if const_expr(slot_lds):
+        # Stage before any pool prefetch is in flight: this fill is the tile's only
+        # slot-side VMEM traffic, so the drain it costs is paid once, not per chunk.
+        slot_g2s = a_g2s if const_expr(a_slot_ids is not None) else b_g2s
+
+        # plain call so the dynamic for does not make slot_g2s/lds loop-carried
+        def _fill_pass(base, p):
+            slot_g2s.fill_lds(lds.SLOT_lds, base, ArithValue(p), WGRAD_WAVES)
+
+        def _fill_win(w):
+            base = ArithValue(w) * fx.Int32(WIN_TOKENS)
+            for fill_iv in range(_win_fills(w)):
+                _fill_pass(base, fill_iv)
+            wait_barrier(0)
+            rocdl.s_barrier()
+
+        _fill_win(fx.Int32(0))
+        w0_base = fx.Int32(0)
+        w0_lim = _win_limit(fx.Int32(0))
+    else:
+        w0_base = None
+        w0_lim = None
+
     wait_barrier(0)
-    b_g2s.load(lds.B_lds_cur_0, b0_off + 0 * b_k_step)
-    a_g2s.load(lds.A_lds_cur_0, a0_off + 0 * a_k_step)
-    b_g2s.load(lds.B_lds_cur_1, b1_off + 0 * b_k_step)
-    a_g2s.load(lds.A_lds_cur_1, a1_off + 0 * a_k_step)
+    av1 = None
+    bv1 = None
+    if const_expr(slot_x4):
+        # one dwordx4 already covers the preamble's k = 0 and k = 1
+        aw = _voffs_x4(a_g2s, a_slot_ids, fx.Int32(0))
+        bw = _voffs_x4(b_g2s, b_slot_ids, fx.Int32(0))
+        av0 = aw[0] if const_expr(a_slot_ids is not None) else None
+        bv0 = bw[0] if const_expr(b_slot_ids is not None) else None
+        if const_expr(a_slot_ids is not None):
+            av1 = aw[1]
+        if const_expr(b_slot_ids is not None):
+            bv1 = bw[1]
+    elif const_expr(slot_u16):
+        # one dwordx2 already covers the preamble's k = 0 and k = 1
+        ap = _packs_u16(a_g2s, a_slot_ids, fx.Int32(0))
+        bp = _packs_u16(b_g2s, b_slot_ids, fx.Int32(0))
+        av0 = _lazy_u16(a_g2s, ap, 0) if const_expr(a_slot_ids is not None) else None
+        bv0 = _lazy_u16(b_g2s, bp, 0) if const_expr(b_slot_ids is not None) else None
+        if const_expr(a_slot_ids is not None):
+            av1 = _lazy_u16(a_g2s, ap, 1)
+        if const_expr(b_slot_ids is not None):
+            bv1 = _lazy_u16(b_g2s, bp, 1)
+    else:
+        av0 = _voffs(a_g2s, a_slot_ids, fx.Int32(0), w0_base, w0_lim)
+        bv0 = _voffs(b_g2s, b_slot_ids, fx.Int32(0), w0_base, w0_lim)
+    _load_b(lds.B_lds_cur_0, 0, 0, bv0)
+    _load_a(lds.A_lds_cur_0, 0, 0, av0)
+    _load_b(lds.B_lds_cur_1, 1, 0, bv0)
+    _load_a(lds.A_lds_cur_1, 1, 0, av0)
     if wave_m == 1:
         rocdl.s_barrier()
     wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
-    b_g2s.load(lds.B_lds_next_0, b0_off + 1 * b_k_step)
-    a_g2s.load(lds.A_lds_next_0, a0_off + 1 * a_k_step)
-    b_g2s.load(lds.B_lds_next_1, b1_off + 1 * b_k_step)
+    if const_expr(not slot_x4 and not slot_u16):
+        av1 = _voffs(a_g2s, a_slot_ids, fx.Int32(1), w0_base, w0_lim)
+        bv1 = _voffs(b_g2s, b_slot_ids, fx.Int32(1), w0_base, w0_lim)
+    _load_b(lds.B_lds_next_0, 0, 1, bv1)
+    _load_a(lds.A_lds_next_0, 0, 1, av1)
+    _load_b(lds.B_lds_next_1, 1, 1, bv1)
     wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
     k_iters = (group_tokens + (BLOCK_K - 1)) // BLOCK_K
     n_chunks = (k_iters + (CHUNK - 1)) // CHUNK
 
     # nested to isolate Python-level buffer rotation from the runtime chunk loop
-    def _chunk(chunk_iv):
-        chunk_idx = ArithValue(chunk_iv)
+    def _window(chunk_idx, n_chunk, wbase=None, wlim=None):
+        """Slot voffsets for n_chunk consecutive chunks, indexed by k offset.
+
+        Batched here because the body only reads k+1 and k+2: offsets
+        1..n_chunk*CHUNK+1 cover the whole span and the VMEM latency is paid once
+        per window instead of once per MFMA quadrant. Both halves reuse them.
+        """
+        av = [None] * (n_chunk * CHUNK + 2)
+        bv = [None] * (n_chunk * CHUNK + 2)
+        if const_expr(slot_x4):
+            # n_chunk+1 dwordx4 span k = c*CHUNK .. c*CHUNK+(n_chunk+1)*CHUNK-1,
+            # which contains the window; the last one runs off the table on the
+            # final chunk and the SRD clamp turns it into pool row 0, same as the
+            # linear path.
+            aw = [_voffs_x4(a_g2s, a_slot_ids, chunk_idx + c) for c in range_constexpr(n_chunk + 1)]
+            bw = [_voffs_x4(b_g2s, b_slot_ids, chunk_idx + c) for c in range_constexpr(n_chunk + 1)]
+            for ko in range_constexpr(1, n_chunk * CHUNK + 2):
+                if const_expr(a_slot_ids is not None):
+                    av[ko] = aw[ko // CHUNK][ko % CHUNK]
+                if const_expr(b_slot_ids is not None):
+                    bv[ko] = bw[ko // CHUNK][ko % CHUNK]
+        elif const_expr(slot_u16):
+            # same span as slot_x4, but each chunk costs CHUNK/2 dwords instead of
+            # CHUNK, so a window this wide fits where the i32 one spills
+            ap = [_packs_u16(a_g2s, a_slot_ids, chunk_idx + c) for c in range_constexpr(n_chunk + 1)]
+            bp = [_packs_u16(b_g2s, b_slot_ids, chunk_idx + c) for c in range_constexpr(n_chunk + 1)]
+            for ko in range_constexpr(1, n_chunk * CHUNK + 2):
+                if const_expr(a_slot_ids is not None):
+                    av[ko] = _lazy_u16(a_g2s, ap[ko // CHUNK], ko % CHUNK)
+                if const_expr(b_slot_ids is not None):
+                    bv[ko] = _lazy_u16(b_g2s, bp[ko // CHUNK], ko % CHUNK)
+        else:
+            for ko in range_constexpr(1, n_chunk * CHUNK + 2):
+                av[ko] = _voffs(a_g2s, a_slot_ids, chunk_idx * CHUNK + ko, wbase, wlim)
+                bv[ko] = _voffs(b_g2s, b_slot_ids, chunk_idx * CHUNK + ko, wbase, wlim)
+        return av, bv
+
+    def _steps(k_base, av, bv, off):
+        """CHUNK pipelined k steps reading the window at off+j.
+
+        Starts from the LDS buffers in their declared roles and swaps them CHUNK
+        (even) times, so the rotation is parity-neutral and no state crosses calls.
+        """
         a_cur0, a_cur1 = lds.A_lds_cur_0, lds.A_lds_cur_1
         a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
         b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
         b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
         for j in range_constexpr(CHUNK):
-            k = chunk_idx * CHUNK + j
+            k = k_base + j
+            jw = off + j
             # 4-buffer pipelined body: interleave s2r/g2s with the 4 mfma quadrants
             b0 = b_s2r.load(b_cur0)
             a0 = a_s2r.load(a_cur0)
-            a_g2s.load(a_next1, a1_off + (k + 1) * a_k_step)
+            _load_a(a_next1, 1, k + 1, av[jw + 1])
             rocdl.s_barrier()
             rocdl.s_setprio(1)
             c = [Vec(fx.memref_load_vec(r)) for r in acc00]
@@ -901,7 +1201,7 @@ def gemm_bf16_variable_k_tile(
             rocdl.s_setprio(0)
             rocdl.s_barrier()
             b1 = b_s2r.load(b_cur1)
-            b_g2s.load(b_cur0, b0_off + (k + 2) * b_k_step)
+            _load_b(b_cur0, 0, k + 2, bv[jw + 2])
             rocdl.s_barrier()
             rocdl.s_setprio(1)
             c = [Vec(fx.memref_load_vec(r)) for r in acc01]
@@ -911,7 +1211,7 @@ def gemm_bf16_variable_k_tile(
             rocdl.s_setprio(0)
             rocdl.s_barrier()
             a1 = a_s2r.load(a_cur1)
-            a_g2s.load(a_cur0, a0_off + (k + 2) * a_k_step)
+            _load_a(a_cur0, 0, k + 2, av[jw + 2])
             rocdl.s_barrier()
             rocdl.s_setprio(1)
             c = [Vec(fx.memref_load_vec(r)) for r in acc10]
@@ -920,7 +1220,7 @@ def gemm_bf16_variable_k_tile(
                 fx.memref_store_vec(c[idx], acc10[idx])
             rocdl.s_setprio(0)
             rocdl.s_barrier()
-            b_g2s.load(b_cur1, b1_off + (k + 2) * b_k_step)
+            _load_b(b_cur1, 1, k + 2, bv[jw + 2])
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
             rocdl.s_setprio(1)
             c = [Vec(fx.memref_load_vec(r)) for r in acc11]
@@ -934,8 +1234,55 @@ def gemm_bf16_variable_k_tile(
             b_cur0, b_next0 = b_next0, b_cur0
             b_cur1, b_next1 = b_next1, b_cur1
 
-    for chunk_iv in range(n_chunks):
-        _chunk(chunk_iv)
+    def _chunk(chunk_iv):
+        chunk_idx = ArithValue(chunk_iv)
+        av, bv = _window(chunk_idx, 1)
+        _steps(chunk_idx * CHUNK, av, bv, 0)
+
+    def _chunk_w(chunk_iv, win_iv):
+        """One chunk resolving slots from the LDS window that holds them."""
+        chunk_idx = ArithValue(chunk_iv)
+        wbase = ArithValue(win_iv) * fx.Int32(WIN_TOKENS)
+        av, bv = _window(chunk_idx, 1, wbase, _win_limit(win_iv))
+        _steps(chunk_idx * CHUNK, av, bv, 0)
+
+    def _win_lo(w):
+        return ArithValue(w) * fx.Int32(WIN_CHUNKS)
+
+    def _win_hi(w):
+        hi = (ArithValue(w) + fx.Int32(1)) * fx.Int32(WIN_CHUNKS)
+        return ArithValue(arith.minsi(arith._to_raw(hi), arith._to_raw(n_chunks)), signed=True)
+
+    def _n_win(nc):
+        return (ArithValue(nc) + fx.Int32(WIN_CHUNKS - 1)) // fx.Int32(WIN_CHUNKS)
+
+    def _chunk_n(chunk_iv):
+        # One window per slot_unroll chunks. vmcnt retires in order, so a slot load
+        # drains the previous chunk's outstanding pool prefetches; sharing a window
+        # divides the number of those drains by slot_unroll.
+        chunk_idx = ArithValue(chunk_iv)
+        av, bv = _window(chunk_idx, slot_unroll)
+        for c in range_constexpr(slot_unroll):
+            _steps((chunk_idx + fx.Int32(c)) * CHUNK, av, bv, c * CHUNK)
+
+    if const_expr(slot_lds):
+        # Window 0 is peeled: its fill has to precede the preamble, which already
+        # resolves k = 0 and k = 1. Later windows refill the same LDS array in place.
+        for chunk_iv in range(_win_hi(fx.Int32(0))):
+            _chunk_w(chunk_iv, fx.Int32(0))
+        for win_iv in range(fx.Int32(1), _n_win(n_chunks)):
+            _fill_win(win_iv)
+            for chunk_iv in range(_win_lo(win_iv), _win_hi(win_iv)):
+                _chunk_w(chunk_iv, win_iv)
+    elif const_expr(slot_unroll > 1):
+        n_grouped = (n_chunks // slot_unroll) * slot_unroll
+        for chunk_iv in range(0, n_grouped, slot_unroll):
+            _chunk_n(chunk_iv)
+        for chunk_iv in range(n_grouped, n_chunks):
+            _chunk(chunk_iv)
+    else:
+        for chunk_iv in range(n_chunks):
+            _chunk(chunk_iv)
 
     c00 = [Vec(fx.memref_load_vec(reg)) for reg in acc00]
     c01 = [Vec(fx.memref_load_vec(reg)) for reg in acc01]
@@ -979,13 +1326,20 @@ def _compile_grouped_variable_k_bf16(
     agpr_alloc=0,
     out_fp16=False,
     trans_c=False,
+    gather_a=False,
+    gather_b=False,
+    slot_x4=False,
+    slot_unroll=1,
+    slot_lds=False,
+    slot_alu=False,
+    slot_u16=False,
 ):
     assert OUT_M % BLOCK_M == 0, "OUT_M (unclamped store dim) must divide BLOCK_M"
     N_BLOCKS_M = OUT_M // BLOCK_M
     N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
-    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
+    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N, slot_lds=slot_lds)
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_grouped_variable_k(
@@ -994,6 +1348,8 @@ def _compile_grouped_variable_k_bf16(
         C: fx.Tensor,
         group_k_offsets: fx.Tensor,
         masked_k: fx.Tensor,
+        A_SLOT_IDS: fx.Tensor,
+        slot_len: fx.Int32,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
     ):
@@ -1035,6 +1391,14 @@ def _compile_grouped_variable_k_bf16(
                 BLOCK_N=BLOCK_N,
                 out_fp16=out_fp16,
                 trans_c=trans_c,
+                a_slot_ids=A_SLOT_IDS if const_expr(gather_a) else None,
+                b_slot_ids=A_SLOT_IDS if const_expr(gather_b) else None,
+                slot_len=slot_len,
+                slot_x4=slot_x4,
+                slot_unroll=slot_unroll,
+                slot_lds=slot_lds,
+                slot_alu=slot_alu,
+                slot_u16=slot_u16,
             )
 
         _do_tile(pid)
@@ -1046,6 +1410,8 @@ def _compile_grouped_variable_k_bf16(
         C,
         group_k_offsets,
         masked_k,
+        a_slot_ids,
+        slot_len: fx.Int32,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
         stream: fx.Stream,
@@ -1057,6 +1423,8 @@ def _compile_grouped_variable_k_bf16(
             C,
             group_k_offsets,
             masked_k,
+            a_slot_ids,
+            slot_len,
             out_m_rt,
             out_n_rt,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
@@ -1082,9 +1450,22 @@ def grouped_gemm_variable_k_bf16(
     BLOCK_N: int = 256,
     num_xcd: int = 8,
     trans_c: bool = False,
+    a_slot_ids: torch.Tensor = None,
+    b_slot_ids: torch.Tensor = None,
+    slot_x4: bool = False,
+    slot_unroll: int = 1,
+    slot_lds: bool = False,
+    slot_alu: bool = False,
+    slot_u16: bool = False,
 ) -> torch.Tensor:
-    """Variable-K grouped wgrad: out[g]=a[g_rows].T@b[g_rows], K=[offsets[g],offsets[g]+masked_k[g])."""
-    assert a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
+    """Variable-K grouped wgrad: out[g]=a[g_rows].T@b[g_rows], K=[offsets[g],offsets[g]+masked_k[g]).
+
+    ``a_slot_ids`` makes the A rows indirect: row r reads a[a_slot_ids[r]]. Used
+    when the dispatch pool is deduplicated, so a[] holds unique slots while the
+    K axis still walks logical route rows."""
+    assert a.dim() == 2 and b.dim() == 2
+    assert a_slot_ids is None or b_slot_ids is None, "only one operand may be gathered"
+    assert a_slot_ids is not None or b_slot_ids is not None or a.shape[0] == b.shape[0]
     assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
     OUT_M = a.shape[1]
     OUT_N = b.shape[1]
@@ -1109,18 +1490,46 @@ def grouped_gemm_variable_k_bf16(
         num_xcd=num_xcd,
         out_fp16=out_fp16,
         trans_c=trans_c,
+        gather_a=a_slot_ids is not None,
+        gather_b=b_slot_ids is not None,
+        slot_x4=slot_x4,
+        slot_unroll=slot_unroll,
+        slot_lds=slot_lds,
+        slot_alu=slot_alu,
+        slot_u16=slot_u16,
     )
+    # static memref: create_buffer_resource needs a real memref, not a raw ptr arg
+    slots = a_slot_ids if a_slot_ids is not None else b_slot_ids
+    slot_src = slots.contiguous() if slots is not None else masked_k_i64.view(torch.int32)
+    slot_arg = flyc.from_torch_tensor(slot_src)
     args = (
         _ptr_only_view(a),
         _ptr_only_view(b),
         flyc.from_torch_tensor(out),
         offsets_i64,
         masked_k_i64,
+        slot_arg,
+        slot_src.numel(),
         OUT_M,
         OUT_N,
         torch.cuda.current_stream(),
     )
-    key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, out_fp16, trans_c)
+    key = (
+        OUT_M,
+        OUT_N,
+        G,
+        BLOCK_M,
+        BLOCK_N,
+        out_fp16,
+        trans_c,
+        a_slot_ids is not None,
+        b_slot_ids is not None,
+        slot_x4,
+        slot_unroll,
+        slot_lds,
+        slot_alu,
+        slot_u16,
+    )
     compiled = _COMPILED_GROUPED_GEMM_CACHE.get(key)
     if compiled is None:
         compiled = flyc.compile(launch, *args)

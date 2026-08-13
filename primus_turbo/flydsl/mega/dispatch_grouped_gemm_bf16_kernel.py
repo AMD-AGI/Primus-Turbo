@@ -5,6 +5,7 @@
 ###############################################################################
 
 import functools
+import os as _os
 from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
@@ -27,17 +28,16 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
     dispatch_prologue_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
+from primus_turbo.flydsl.mega.ep_intranode import (
+    _BLOCK_THREADS,
+    dispatch_bf16_tile,
+)
 from primus_turbo.flydsl.mega.prims import cast, ld, read_clock, spin_timed_out
 from primus_turbo.flydsl.mega.symm_buffer import (
     TOKEN_DTYPE,
     SymBuffer,
     Workspace,
     get_symm_buffer_for_mega_moe,
-)
-from primus_turbo.flydsl.mega.tune_utils import (
-    Config,
-    autotune,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (
     make_bf16_fp16_tile_tensor,
@@ -46,9 +46,9 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 
 
-@functools.lru_cache(maxsize=1)
-def get_dummy_tensor():
-    return torch.empty(1, dtype=torch.int32)
+@functools.lru_cache(maxsize=8)
+def get_dummy_tensor(device):
+    return torch.empty(1, dtype=torch.int32, device=device)
 
 
 @functools.lru_cache(maxsize=256)
@@ -68,12 +68,17 @@ def _make_kernel(
     G=0,
     num_xcd=8,
     num_ranks=8,
+    rank=0,
     num_experts=0,
     num_max_tokens_per_rank=0,
     num_topk=0,
+    dedup=True,
 ):
     K = hidden_size
     is_tn = layout == "tn"
+    # nn's A operand is [M,K] row-major exactly like nt's, so both share the gather
+    # loader; tn indexes the gathered axis on K and goes through the variable-K tile.
+    use_gather = dedup
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
     assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     if is_tn:
@@ -88,8 +93,13 @@ def _make_kernel(
         gemm_tile = functools.partial(gemm_bf16_tile, layout)
         assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
         n_blocks = out_features // BLOCK_N
+        # Grid is sized for the worst case; the ~29k no-op blocks were measured free.
         worst_case_tiles = num_max_pool_tokens // BLOCK_M
     NPB = num_max_pool_tokens // BLOCK_M
+    # expert-ready poll uses one thread per local expert
+    assert num_ranks == 0 or num_experts // num_ranks <= _BLOCK_THREADS
+    gemm_base = num_dispatch_cu
+    wait_sleep = 64
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_kernel(
@@ -104,6 +114,9 @@ def _make_kernel(
         OUTPUT: fx.Tensor,
         TILE_TO_GROUP: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
+        SOURCE_SLOT_KIND: fx.Tensor,
+        DEDUP_SRC_ROW: fx.Tensor,
+        SORTED_DISPATCH_SLOT_IDS: fx.Tensor,
         GROUP_OFFS: fx.Tensor,
         c_n: fx.Int32,
         out_m_rt: fx.Int32,
@@ -143,15 +156,15 @@ def _make_kernel(
         expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
         expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
         dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
+        source_slot_kind_resource = create_buffer_resource(SOURCE_SLOT_KIND, max_size=True)
+        group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
+        num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
         if const_expr(is_tn):
             go_base = fx.arith.ArithValue(
                 arith.index_cast(fx.T.i64(), extract_base_index(GROUP_OFFS)), signed=True
             )
             # tn reuses TILE_TO_GROUP to carry per-expert REAL token counts (K bound)
-            real_count_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
-        else:
-            group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
-            num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
+            real_count_resource = group_resource
 
         if block_index < comm_block_count:
             local_task_count = (
@@ -169,13 +182,19 @@ def _make_kernel(
                     expert_send_count_res=expert_send_count_resource,
                     expert_send_offset_res=expert_send_offset_resource,
                     dispatched_token_idx_res=dispatched_token_idx_resource,
+                    source_slot_kind_res=source_slot_kind_resource,
                     task_index=block_index + task_iteration * comm_block_count,
                     signal=True,
+                    block_m=BLOCK_M,
                     disp_parity=disp_parity,
                     num_ranks=num_ranks,
+                    num_topk=num_topk,
+                    skip_duplicates=dedup,
+                    direct_unique_slots=use_gather,
+                    source_rank=rank,
                 )
         elif const_expr(is_tn):
-            tile_index = block_index - comm_block_count
+            tile_index = block_index - fx.Int32(gemm_base)
             if tile_index < fx.Int32(TOTAL):
                 group_idx = tile_index // fx.Int32(TILES_PER_GROUP)
                 local_raw = tile_index % fx.Int32(TILES_PER_GROUP)
@@ -190,23 +209,40 @@ def _make_kernel(
                 # bound K to REAL rows: [m_start, m_start+real); padding tail never read
                 real_count = buffer_load(real_count_resource, group_idx, vec_width=1, dtype=fx.T.i32())
                 m_end = m_start + real_count
-                ge_blk = bank_offset + group_idx
-                if thread_index == fx.Int32(0):
+                # Under gather a token's unique slot is written by its lowest-numbered
+                # expert, so this group needs experts [0, group_idx]; without gather the
+                # rows are materialized in place and only this expert matters.
+                if const_expr(use_gather):
+                    first_expert = fx.Int32(0)
+                else:
+                    first_expert = group_idx
+                # One thread per producer expert: the whole scan is one sys-scope round
+                # trip instead of group_idx dependent ones.
+                producer_expert = first_expert + thread_index
+                if producer_expert <= group_idx:
                     spin_start = read_clock()
-                    fx.rocdl.s_waitcnt(0)
-                    sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
-                    while sig != expected_dispatch_i64:
-                        fx.rocdl.s_sleep(fx.Int32(1))
+                    expert_signal = ld(
+                        dispatch_flag_base,
+                        bank_offset + producer_expert,
+                        scope="sys",
+                        dtype=fx.T.i64(),
+                    )
+                    while expert_signal != expected_dispatch_i64:
+                        fx.rocdl.s_sleep(fx.Int32(wait_sleep))
                         if spin_timed_out(spin_start):
                             fx.printf(
-                                "MEGA tn variable-K gate timeout: expert={} sig={} exp={}\n",
-                                group_idx,
-                                sig,
+                                "MEGA tn expert-ready timeout: expert={} signal={} expected={}\n",
+                                producer_expert,
+                                expert_signal,
                                 expected_dispatch_i64,
                             )
                             spin_start = read_clock()
-                        fx.rocdl.s_waitcnt(0)
-                        sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
+                        expert_signal = ld(
+                            dispatch_flag_base,
+                            bank_offset + producer_expert,
+                            scope="sys",
+                            dtype=fx.T.i64(),
+                        )
                 fx.gpu.barrier()
                 pool_ptr_ty = PointerType.get(
                     elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
@@ -215,10 +251,17 @@ def _make_kernel(
                     fx.inttoptr(pool_ptr_ty, dispatch_token_pool_base),
                     fx.make_layout(num_max_pool_tokens * OUT_M, 1),
                 )
+                if const_expr(use_gather):
+                    gather_slot_ids = SORTED_DISPATCH_SLOT_IDS
+                else:
+                    gather_slot_ids = None
+                # the pool is the gathered operand: B for dW1 (trans_c), A otherwise
                 if const_expr(trans_c):
                     gemm_a, gemm_b, rt_m, rt_n = WEIGHTS, pool_tensor, out_n_rt, out_m_rt
+                    a_slots, b_slots = None, gather_slot_ids
                 else:
                     gemm_a, gemm_b, rt_m, rt_n = pool_tensor, WEIGHTS, out_m_rt, out_n_rt
+                    a_slots, b_slots = gather_slot_ids, None
                 gemm_bf16_variable_k_tile(
                     gemm_a,
                     gemm_b,
@@ -237,9 +280,12 @@ def _make_kernel(
                     BLOCK_M=BLOCK_M,
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
+                    a_slot_ids=a_slots,
+                    b_slot_ids=b_slots,
+                    slot_len=fx.Int32(num_max_pool_tokens),
                 )
         else:
-            tile_index = block_index - comm_block_count
+            tile_index = block_index - fx.Int32(gemm_base)
             real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
             real_grid = real_tiles * fx.Int32(n_blocks)
             if tile_index < real_grid:
@@ -249,71 +295,120 @@ def _make_kernel(
                 first_pid_m = group_id * fx.Int32(GROUP_M)
                 remaining_m = real_tiles - first_pid_m
                 group_size_m = arith.select(remaining_m < fx.Int32(GROUP_M), remaining_m, fx.Int32(GROUP_M))
+                # No xcd_remap here on purpose: the raw HW round-robin already pins one
+                # block_m per XCD (8 % GROUP_M == 0), so each XCD gathers a single A tile
+                # and reuses it across 8 block_n. Remapping was measured 1.9% slower.
                 block_m = first_pid_m + (pid_in_group % group_size_m)
                 block_n = pid_in_group // group_size_m
                 g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
-                blk = bank_offset + g_idx
-                if thread_index == fx.Int32(0):
+                # A token's unique slot is written by its lowest-numbered expert, so a
+                # gather tile needs experts [0, g_idx] -- not all of them. Dispatch runs
+                # in expert order, so this keeps the non-dedup dispatch/GEMM overlap.
+                if const_expr(use_gather):
+                    first_expert = fx.Int32(0)
+                else:
+                    first_expert = g_idx
+                # One thread per producer expert: the whole scan is one sys-scope round
+                # trip instead of g_idx dependent ones.
+                producer_expert = first_expert + thread_index
+                if producer_expert <= g_idx:
                     spin_start = read_clock()
-                    fx.rocdl.s_waitcnt(0)
-                    signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
-                    while signal != expected_dispatch_i64:
-                        fx.rocdl.s_sleep(fx.Int32(1))
+                    expert_signal = ld(
+                        dispatch_flag_base,
+                        bank_offset + producer_expert,
+                        scope="sys",
+                        dtype=fx.T.i64(),
+                    )
+                    while expert_signal != expected_dispatch_i64:
+                        fx.rocdl.s_sleep(fx.Int32(wait_sleep))
                         if spin_timed_out(spin_start):
                             fx.printf(
-                                "MEGA dispatch GEMM gate timeout: expert={} signal={} expected={}\n",
-                                g_idx,
-                                signal,
+                                "MEGA dispatch expert-ready timeout: expert={} signal={} expected={}\n",
+                                producer_expert,
+                                expert_signal,
                                 expected_dispatch_i64,
                             )
                             spin_start = read_clock()
-                        fx.rocdl.s_waitcnt(0)
-                        signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
+                        expert_signal = ld(
+                            dispatch_flag_base,
+                            bank_offset + producer_expert,
+                            scope="sys",
+                            dtype=fx.T.i64(),
+                        )
                 fx.gpu.barrier()
 
-                # A base = dispatch_token_pool (int64 symm addr); B/C base = WEIGHTS/OUTPUT tensors.
+                gbase = g_idx * fx.Int32(K) * c_n
+                # A base = dispatch_token_pool (int64 symm addr); C base = OUTPUT tensor.
                 out_base = fx.arith.ArithValue(
                     arith.index_cast(fx.T.i64(), extract_base_index(OUTPUT)), signed=True
                 )
-                w_base = fx.arith.ArithValue(
-                    arith.index_cast(fx.T.i64(), extract_base_index(WEIGHTS)), signed=True
-                )
-                # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A/B: precise bound; C: HW num_records via 0x40000000.
+                # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
                 a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
-                b_off = cast(g_idx, fx.T.i64()) * fx.Int64(K * out_features * 2)
                 c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
                 A_tile = make_bf16_fp16_tile_tensor(dispatch_token_pool_base, a_off, BLOCK_M * K)
-                B_tile = make_bf16_fp16_tile_tensor(w_base, b_off, K * out_features)
                 C_tile = make_bf16_fp16_tile_tensor(out_base, c_off, 0x40000000)
-                gemm_tile(
-                    A_tile,
-                    B_tile,
-                    C_tile,
-                    fx.Int32(BLOCK_M),
-                    c_n,
-                    lds,
-                    fx.Int32(0),
-                    block_n,
-                    K=K,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                    out_fp16=out_fp16,
-                    nt_vmcnt=nt_vmcnt,
-                )
+                if const_expr(use_gather):
+                    pool_ptr_ty = PointerType.get(
+                        elem_ty=fx.BFloat16.ir_type,
+                        address_space=AddressSpace.Global,
+                        alignment=16,
+                    )
+                    full_pool = fx.make_view(
+                        fx.inttoptr(pool_ptr_ty, dispatch_token_pool_base),
+                        fx.make_layout(num_max_pool_tokens * K, 1),
+                    )
+                    gemm_tile(
+                        full_pool,
+                        WEIGHTS,
+                        C_tile,
+                        fx.Int32(BLOCK_M),
+                        c_n,
+                        lds,
+                        fx.Int32(0),
+                        block_n,
+                        K=K,
+                        BLOCK_M=BLOCK_M,
+                        BLOCK_N=BLOCK_N,
+                        out_fp16=out_fp16,
+                        nt_vmcnt=nt_vmcnt,
+                        b_group_base=gbase,
+                        a_slot_ids=SORTED_DISPATCH_SLOT_IDS,
+                        a_block_m=block_m,
+                    )
+                else:
+                    gemm_tile(
+                        A_tile,
+                        WEIGHTS,
+                        C_tile,
+                        fx.Int32(BLOCK_M),
+                        c_n,
+                        lds,
+                        fx.Int32(0),
+                        block_n,
+                        K=K,
+                        BLOCK_M=BLOCK_M,
+                        BLOCK_N=BLOCK_N,
+                        out_fp16=out_fp16,
+                        nt_vmcnt=nt_vmcnt,
+                        b_group_base=gbase,
+                    )
 
-    grid_size = num_dispatch_cu + (TOTAL if is_tn else worst_case_tiles * n_blocks)
+    grid_size = gemm_base + (TOTAL if is_tn else worst_case_tiles * n_blocks)
     return dispatch_grouped_gemm_kernel, grid_size
 
 
-@functools.lru_cache(maxsize=4)
+@functools.lru_cache(maxsize=8)
 def _make_epoch_bump(addend):
-    """Single-block kernel: flip parity, bump the new bank's expected by addend."""
+    """Advance the dispatch epoch: flip parity, raise that bank's expected count."""
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-    def epoch_bump_kernel(PARITY: fx.Tensor, EXPECTED: fx.Tensor):
+    def epoch_bump_kernel(
+        PARITY: fx.Tensor,
+        EXPECTED: fx.Tensor,
+    ):
+        parity_res = create_buffer_resource(PARITY, max_size=True)
+        expected_res = create_buffer_resource(EXPECTED, max_size=True)
         if fx.thread_idx.x == fx.Int32(0):
-            parity_res = create_buffer_resource(PARITY, max_size=True)
-            expected_res = create_buffer_resource(EXPECTED, max_size=True)
             new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
             buffer_store(new_parity, parity_res, fx.Int32(0))
             idx = cast(new_parity, fx.T.i32())
@@ -323,23 +418,6 @@ def _make_epoch_bump(addend):
     return epoch_bump_kernel
 
 
-@autotune(
-    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=3) for cu in (16, 32, 64)],
-    key=[
-        "out_features",
-        "hidden_size",
-        "num_max_pool_tokens",
-        "BLOCK_M",
-        "BLOCK_N",
-        "num_comm",
-        "GROUP_M",
-        "layout_code",
-        "trans_c",
-        "G",
-        "num_ranks",
-    ],
-    rep=5,
-)
 @flyc.jit
 def _compiled_dispatch_grouped_gemm(
     INPUT_TOKENS,
@@ -353,6 +431,9 @@ def _compiled_dispatch_grouped_gemm(
     OUTPUT,
     TILE_TO_GROUP,
     NUM_TILE_BLOCKS,
+    SOURCE_SLOT_KIND,
+    DEDUP_SRC_ROW,
+    SORTED_DISPATCH_SLOT_IDS,
     GROUP_OFFS,
     c_n: int,
     out_m_rt: int,
@@ -371,11 +452,13 @@ def _compiled_dispatch_grouped_gemm(
     G: fx.Constexpr[int],
     out_fp16: fx.Constexpr[bool],
     num_ranks: fx.Constexpr[int],
+    rank: fx.Constexpr[int],
     num_dispatch_cu: fx.Constexpr[int],
     nt_vmcnt: fx.Constexpr[int],
     num_experts: fx.Constexpr[int],
     num_max_tokens_per_rank: fx.Constexpr[int],
     num_topk: fx.Constexpr[int],
+    dedup: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     # layout_code: 0=nt, 1=nn, 2=tn; tn uses 2 XCDs, nt/nn use 8
@@ -401,9 +484,11 @@ def _compiled_dispatch_grouped_gemm(
         G=int(G),
         num_xcd=num_xcd,
         num_ranks=int(num_ranks),
+        rank=int(rank),
         num_experts=int(num_experts),
         num_max_tokens_per_rank=int(num_max_tokens_per_rank),
         num_topk=int(num_topk),
+        dedup=bool(dedup),
     )
     kernel(
         INPUT_TOKENS,
@@ -417,6 +502,9 @@ def _compiled_dispatch_grouped_gemm(
         OUTPUT,
         TILE_TO_GROUP,
         NUM_TILE_BLOCKS,
+        SOURCE_SLOT_KIND,
+        DEDUP_SRC_ROW,
+        SORTED_DISPATCH_SLOT_IDS,
         GROUP_OFFS,
         c_n,
         out_m_rt,
@@ -440,6 +528,8 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     GROUP_M=4,
     trans_c: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
+    dedup: bool = True,
+    num_dispatch_cu: Optional[int] = None,
 ):
     if handle is None:
         assert topk_idx is not None, "handle=None requires topk_idx to run the prologue"
@@ -457,7 +547,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
             intermediate_hidden=l1_weights.shape[1] // 2,
         )
         sym_buffer = symm.get_sym_buffer()
-        handle = tuple(
+        prologue_outputs = tuple(
             dispatch_prologue_flydsl_kernel(
                 topk_idx,
                 topk_weights,
@@ -472,10 +562,11 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
                 num_max_pool_tokens=symm.num_max_pool_tokens,
                 hidden=symm.hidden,
                 num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
+                dedup=dedup,
             )
         )
-
-        handle = handle + (symm.pool_src_slot.clone(),)
+        # pool_src_slot rides at index 12; dedup metadata follows when enabled.
+        handle = prologue_outputs[:12] + (symm.pool_src_slot.clone(),) + prologue_outputs[12:]
     else:
         symm = get_symm_buffer_for_mega_moe()
         sym_buffer = symm.get_sym_buffer()
@@ -492,14 +583,21 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         num_tile_blocks,
         *_combine_recv_and_pool_src,
     ) = handle
-
     num_comm = expert_send_dst_rank.numel()
     num_ranks = symm.world
     assert x.dtype == torch.bfloat16 and l1_weights.dtype == torch.bfloat16
     hidden_size = x.size(1)
     num_max_pool_tokens = int(symm.num_max_pool_tokens)
-    dummy_i32 = get_dummy_tensor()
-    x_i32 = x.contiguous().view(torch.int32)
+    dummy_i32 = get_dummy_tensor(x.device)
+    if dedup:
+        source_slot_kind = handle[13]
+        dedup_src_row = handle[14]
+        sorted_dispatch_slot_ids = handle[19]
+    else:
+        source_slot_kind = dummy_i32
+        dedup_src_row = dummy_i32
+        sorted_dispatch_slot_ids = dummy_i32
+    x_i32 = x.contiguous().view(torch.int32).view(-1)
 
     assert layout in ("nt", "nn", "tn"), f"unsupported layout {layout}"
     out_fp16 = out_dtype == torch.float16
@@ -520,30 +618,43 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         G = num_tokens_per_expert_prefix.numel() - 1
         out_shape = (G, OUT_N, OUT_M) if trans_c else (G, OUT_M, OUT_N)
         output = torch.empty(out_shape, device=x.device, dtype=out_dtype)
-        weight_arg, output_arg = rhs.contiguous(), flyc.from_torch_tensor(output)
+        weight_arg, output_arg = rhs.contiguous(), output.view(-1)
         # Bound the wgrad K-contraction to each expert's REAL (unpadded) token count so the
         # GEMM never reads stale block-padding rows (the dW1 floor). real[e] = sum over source
         # ranks of the combine recv counts (seg = e*num_ranks + src). Passed via the TILE arg,
         # which the tn path otherwise ignores. Bounds-clamped buffers zero the partial tail tile.
         combine_recv_count = _combine_recv_and_pool_src[2]  # handle[11]
         real_count = combine_recv_count.view(G, num_ranks).sum(dim=1).to(torch.int32).contiguous()
-        tile_arg, num_tile_arg, group_offs_arg = real_count, dummy_i32, num_tokens_per_expert_prefix
+        tile_arg, num_tile_arg, group_offs_arg = (
+            real_count,
+            num_tile_blocks,
+            num_tokens_per_expert_prefix,
+        )
         c_n, out_m_rt, out_n_rt = 0, int(OUT_M), int(OUT_N)
         out_features_ce, hidden_size_ce = OUT_N, OUT_M
     else:
         if layout == "nt":
             G, N, K = l1_weights.shape
-            weight_flat = l1_weights.reshape(G * N, K).contiguous()
+            weight_flat = l1_weights.reshape(G * N, K).contiguous().view(-1)
         else:
             G, K, N = l1_weights.shape
-            weight_flat = l1_weights.reshape(G * K, N).contiguous()
+            weight_flat = l1_weights.reshape(G * K, N).contiguous().view(-1)
         assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
         output = torch.empty((num_max_pool_tokens, N), dtype=x.dtype, device=x.device)
-        weight_arg, output_arg = flyc.from_torch_tensor(weight_flat), output
+        weight_arg, output_arg = weight_flat, output
         tile_arg, num_tile_arg, group_offs_arg = tile_to_expert, num_tile_blocks, dummy_i32
         c_n, out_m_rt, out_n_rt = N, 0, 0
         out_features_ce, hidden_size_ce = N, hidden_size
         G, trans_c = 0, False  # nt/nn grid uses worst_case_tiles; C never transposed
+
+    if num_dispatch_cu is None:
+        # Comm blocks sit at the front of the grid and spin, so they steal CUs from the
+        # GEMM tiles behind them; 16 is the measured optimum (8/32/64 are all worse).
+        # nt and nn were swept separately and landed on the same value; keep both hooks.
+        if layout == "nt":
+            num_dispatch_cu = int(_os.environ.get("TURBO_NUM_DISPATCH_CU", 16))
+        else:
+            num_dispatch_cu = int(_os.environ.get("TURBO_NUM_DISPATCH_CU_NN", 16))
 
     # epoch tensors are bumped by _make_epoch_bump inside _compiled; just pass them through
     _compiled_dispatch_grouped_gemm(
@@ -558,6 +669,9 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         output_arg,
         tile_arg,
         num_tile_arg,
+        source_slot_kind,
+        dedup_src_row,
+        sorted_dispatch_slot_ids,
         group_offs_arg,
         c_n,
         out_m_rt,
@@ -576,9 +690,13 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         G=int(G),
         out_fp16=bool(out_fp16),
         num_ranks=int(num_ranks),
+        rank=int(symm.rank),
         num_experts=int(symm.num_experts),
         num_max_tokens_per_rank=int(symm.num_max_tokens_per_rank),
         num_topk=int(symm.num_topk),
+        num_dispatch_cu=int(num_dispatch_cu),
+        nt_vmcnt=3,
+        dedup=bool(dedup),
         stream=torch.cuda.current_stream(),
     )
     return output, symm.dispatch_token_pool, symm.weight_recv_buf, handle

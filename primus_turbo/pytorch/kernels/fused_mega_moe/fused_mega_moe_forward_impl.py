@@ -28,8 +28,10 @@ _SUPPORTED_DTYPES = (torch.bfloat16,)
 
 # dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
 # 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
-# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
-_HANDLE_LEN = 13
+# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot,
+# 13 source_slot_kind, 14 dedup_src_row, 15 dup_groups, 16 dup_loffs, 17 dup_counts,
+# 18 tile_copy_expected, 19 sorted_dispatch_slot_ids, 20 dedup_key_row.
+_HANDLE_LEN = 21
 _H_NUM_TILE_BLOCKS = 8
 
 
@@ -195,6 +197,14 @@ def _fused_mega_moe_forward_meta(
         i32(),
         i32(),  # 9-11 combine_recv_dst_rank/start_row/count
         i32(),  # 12 pool_src_slot
+        i32(),  # 13 source_slot_kind
+        i32(),  # 14 dedup_src_row
+        i32(),  # 15 dup_groups
+        i32(),  # 16 dup_loffs
+        i32(),  # 17 dup_counts
+        i32(),  # 18 tile_copy_expected
+        i32(),  # 19 sorted_dispatch_slot_ids
+        i32(),  # 20 dedup_key_row
     ]
     assert len(handle) == _HANDLE_LEN
     return y, l1_out, dispatch_weights_in_buf, handle

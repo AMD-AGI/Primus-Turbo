@@ -5,10 +5,13 @@
 ###############################################################################
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import const_expr
 from flydsl.expr.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -23,6 +26,7 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
 )
 from primus_turbo.flydsl.mega.ep_intranode import (
     combine_bf16_tile,
+    combine_dedup_bf16_tile,
     topk_reduce_bf16_tile,
 )
 from primus_turbo.flydsl.mega.prims import (
@@ -57,6 +61,96 @@ _NUM_WARPS = _BLOCK_THREADS // _WARP
 _LAYOUTS = ("nt", "nn", "tn")
 _LAYOUT_CODES = {name: code for code, name in enumerate(_LAYOUTS)}
 
+# A/B switch for sender-side combine dedup (fold a token's local routes into one push).
+_COMBINE_DEDUP = os.environ.get("TURBO_COMBINE_DEDUP", "0") == "1"
+# accumulator chunks live per pass; 2 keeps the gather-reduce under the GEMM VGPR budget
+_COMBINE_DEDUP_NPASS = int(os.environ.get("TURBO_COMBINE_DEDUP_NPASS", "2"))
+# Role timeline probe: s_memrealtime is a global constant-rate counter, so raw
+# stamps from different blocks are directly comparable. Off by default.
+_PROFILE_LEVEL = int(os.environ.get("TURBO_MEGA_PROFILE", "0"))
+# 1 = combine spin only, 2 = gemm/reduce edges only (few printfs), 3 = both
+_PROF_COMBINE = bool(_PROFILE_LEVEL & 1)
+_PROF_GEMM_REDUCE = bool(_PROFILE_LEVEL & 2)
+_MEGA_PROFILE = _PROFILE_LEVEL != 0
+_PROFILE_STRIDE = int(os.environ.get("TURBO_MEGA_PROFILE_STRIDE", "32"))
+_PROFILE_RSTRIDE = int(os.environ.get("TURBO_MEGA_PROFILE_RSTRIDE", "64"))
+
+
+def _prof_stamp():
+    """Probe timestamp; a folded 0 when the probe is off (plain Python, not traced)."""
+    return read_clock() if _MEGA_PROFILE else fx.Int64(0)
+
+
+def _prof_add(acc, since):
+    """Accumulate elapsed probe cycles; identity when the probe is off."""
+    return acc + (read_clock() - since) if _MEGA_PROFILE else acc
+
+
+_H_SOURCE_SLOT_KIND = 13
+_H_SORTED_DISPATCH_SLOT_IDS = 19
+_H_DEDUP_KEY_ROW = 20
+
+
+@ASTRewriter.transform
+def _gemm_tile_and_signal(
+    gemm_tile,
+    ACT,
+    WEIGHTS,
+    lds,
+    group_resource,
+    l2_token_buffer_base,
+    combine_flag_base,
+    combine_bank,
+    thread_index,
+    block_m,
+    block_n,
+    c_n,
+    K: int = 0,
+    BLOCK_M: int = 0,
+    BLOCK_N: int = 0,
+    out_fp16: bool = False,
+    nt_vmcnt: int = 3,
+):
+    """One GEMM tile into the L2 pool, then publish its completion flag."""
+    group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
+    group_base = group_index * fx.Int32(K) * c_n
+    # A base = ACT tensor; C base = l2_token_buffer (int64 symm addr).
+    act_base = fx.arith.ArithValue(fx.arith.index_cast(fx.T.i64(), extract_base_index(ACT)), signed=True)
+    # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
+    a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
+    c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
+    A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
+    C_tile = make_bf16_fp16_tile_tensor(l2_token_buffer_base, c_off, 0x40000000)
+    gemm_tile(
+        A_tile,
+        WEIGHTS,
+        C_tile,
+        fx.Int32(BLOCK_M),
+        c_n,
+        lds,
+        fx.Int32(0),
+        block_n,
+        K=K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        out_fp16=out_fp16,
+        nt_vmcnt=nt_vmcnt,
+        b_group_base=group_base,
+        c_cache_modifier=18,  # sc1|nt: agent-visible non-temporal local stage.
+    )
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    # Keep a separator: LLVM folds adjacent barriers, but two rendezvous are required.
+    fx.rocdl.s_waitcnt(0)
+    fx.gpu.barrier()
+    if thread_index == fx.Int32(0):
+        atomic_add(
+            combine_flag_base,
+            combine_bank + block_m,
+            fx.Int64(1),
+            scope="sys",
+        )
+
 
 def _make_grouped_gemm_combine(
     out_features,
@@ -77,6 +171,8 @@ def _make_grouped_gemm_combine(
     layout="nt",
     apply_weights=False,
     with_gate=False,
+    combine_dedup=False,
+    dedup_npass=2,
 ):
     K = hidden_size
     gemm_tile = functools.partial(gemm_bf16_tile, layout)
@@ -90,6 +186,8 @@ def _make_grouped_gemm_combine(
     comb_records = num_combine_slots * out_features * 2
     gate_records = num_combine_slots * 4
     gemm_base = num_combine_cu
+    # Dedup weights at the sender, so the reduce must not apply them a second time.
+    reduce_apply_weights = apply_weights and not combine_dedup
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -107,6 +205,9 @@ def _make_grouped_gemm_combine(
         TOPK_WEIGHTS: fx.Tensor,
         GRAD_GATE: fx.Tensor,
         D_TOPK_W: fx.Tensor,
+        SORTED_SLOT_IDS: fx.Tensor,
+        DEDUP_KEY_ROW: fx.Tensor,
+        SOURCE_SLOT_KIND: fx.Tensor,
         sym_buffer: SymBuffer,
         c_n: fx.Int32,
         COMBINE_PARITY: fx.Tensor,
@@ -116,7 +217,8 @@ def _make_grouped_gemm_combine(
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         combine_cu = fx.Int32(num_combine_cu)
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        _alloc = fx.SharedAllocator()
+        lds = _alloc.allocate(SharedStorage).peek()
         # build the layout from explicit dims (bf16 path -> TOKEN_DTYPE); the token pools are
         # out_features-wide (the model hidden), not the down-proj K (hidden_size)
         workspace = Workspace(
@@ -152,6 +254,9 @@ def _make_grouped_gemm_combine(
         recv_start_row_res = create_buffer_resource(RECV_START_ROW, max_size=True)
         recv_count_res = create_buffer_resource(RECV_COUNT, max_size=True)
         origin_slot_res = create_buffer_resource(POOL_SRC_SLOT, max_size=True)
+        sorted_slot_res = create_buffer_resource(SORTED_SLOT_IDS, max_size=True) if combine_dedup else None
+        key_row_res = create_buffer_resource(DEDUP_KEY_ROW, max_size=True) if combine_dedup else None
+        kind_res = create_buffer_resource(SOURCE_SLOT_KIND, max_size=True) if combine_dedup else None
 
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         num_tile_blocks_res = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
@@ -170,15 +275,26 @@ def _make_grouped_gemm_combine(
         if block_index < combine_cu:
             # Task-based combine: one warp per recv-segment, gated on its spanned GEMM tiles.
             seg_local = (fx.Int32(num_experts) - block_index + combine_cu - fx.Int32(1)) // combine_cu
+            # Dedup gathers rows below the segment, so it gates on the whole tile prefix.
+            # The cursor rides seg_iter (task_index is row-ordered), so each tile polls once.
+            combine_cursor = fx.Int32(0)
+            # Declared unconditionally: the rewriter pre-scans nested assignments.
+            # Left at 0 when the probe is off, so LLVM folds them away.
+            prof_spin = fx.Int64(0)
+            prof_work = fx.Int64(0)
+            prof_w0 = fx.Int64(0)
+            prof_born = _prof_stamp()
             for seg_iter in range(seg_local):
                 task_index = block_index + seg_iter * combine_cu
                 seg_start = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
                 seg_count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
                 if seg_count > fx.Int32(0):
-                    t0 = seg_start // fx.Int32(BLOCK_M)
                     t1 = (seg_start + seg_count - fx.Int32(1)) // fx.Int32(BLOCK_M)
+                    tile_cursor = combine_cursor
+                    if const_expr(not combine_dedup):
+                        tile_cursor = seg_start // fx.Int32(BLOCK_M)
                     if thread_index == fx.Int32(0):
-                        tile_cursor = t0
+                        prof_gate = _prof_stamp()
                         while tile_cursor <= t1:
                             spin_start = read_clock()
                             fx.rocdl.s_waitcnt(0)
@@ -207,76 +323,101 @@ def _make_grouped_gemm_combine(
                                     dtype=fx.T.i64(),
                                 )
                             tile_cursor = tile_cursor + fx.Int32(1)
+                        prof_spin = _prof_add(prof_spin, prof_gate)
+                    if const_expr(combine_dedup):
+                        combine_cursor = tile_cursor
                     fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()
-                    combine_bf16_tile(
-                        sym_buffer,
-                        workspace,
-                        thread_index=thread_index,
-                        task_index=task_index,
-                        recv_dst_rank_res=recv_dst_rank_res,
-                        recv_start_row_res=recv_start_row_res,
-                        recv_count_res=recv_count_res,
-                        origin_slot_res=origin_slot_res,
-                        grad_gate_res=grad_gate_res,
-                        signal=True,
-                        epoch=expected_reduce_i64,
-                        bank_offset=reduce_bank,
-                        with_gate=with_gate,
+                    prof_w0 = _prof_stamp()
+                    if const_expr(combine_dedup):
+                        combine_dedup_bf16_tile(
+                            sym_buffer,
+                            workspace,
+                            thread_index=thread_index,
+                            task_index=task_index,
+                            recv_dst_rank_res=recv_dst_rank_res,
+                            recv_start_row_res=recv_start_row_res,
+                            recv_count_res=recv_count_res,
+                            origin_slot_res=origin_slot_res,
+                            sorted_slot_res=sorted_slot_res,
+                            key_row_res=key_row_res,
+                            grad_gate_res=grad_gate_res,
+                            topk=topk,
+                            apply_weights=apply_weights,
+                            signal=True,
+                            epoch=expected_reduce_i64,
+                            bank_offset=reduce_bank,
+                            with_gate=with_gate,
+                            npass=dedup_npass,
+                        )
+                    else:
+                        combine_bf16_tile(
+                            sym_buffer,
+                            workspace,
+                            thread_index=thread_index,
+                            task_index=task_index,
+                            recv_dst_rank_res=recv_dst_rank_res,
+                            recv_start_row_res=recv_start_row_res,
+                            recv_count_res=recv_count_res,
+                            origin_slot_res=origin_slot_res,
+                            grad_gate_res=grad_gate_res,
+                            signal=True,
+                            epoch=expected_reduce_i64,
+                            bank_offset=reduce_bank,
+                            with_gate=with_gate,
+                        )
+                    prof_work = _prof_add(prof_work, prof_w0)
+            if const_expr(_PROF_COMBINE and rank == 0):
+                if thread_index == fx.Int32(0):
+                    fx.printf(
+                        "PROF C {} {} {} {} {}\n",
+                        block_index,
+                        prof_born,
+                        prof_spin,
+                        prof_work,
+                        read_clock(),
                     )
         else:
             gemm_tile_index = block_index - fx.Int32(gemm_base)
             block_m = gemm_tile_index // fx.Int32(n_blocks)
             block_n = gemm_tile_index % fx.Int32(n_blocks)
             if block_m < real_tiles:
-                # GEMM role: one real tile (block_m, block_n) per block (unchanged).
-                group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
-                # A/B base = ACT/WEIGHTS tensors; C base = l2_token_buffer (int64 symm addr).
-                act_base = fx.arith.ArithValue(
-                    fx.arith.index_cast(fx.T.i64(), extract_base_index(ACT)), signed=True
-                )
-                w_base = fx.arith.ArithValue(
-                    fx.arith.index_cast(fx.T.i64(), extract_base_index(WEIGHTS)), signed=True
-                )
-                # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A/B: precise bound; C: HW num_records via 0x40000000.
-                a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
-                b_off = cast(group_index, fx.T.i64()) * fx.Int64(K * out_features * 2)
-                c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
-                A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
-                B_tile = make_bf16_fp16_tile_tensor(w_base, b_off, K * out_features)
-                C_tile = make_bf16_fp16_tile_tensor(l2_token_buffer_base, c_off, 0x40000000)
-                gemm_tile(
-                    A_tile,
-                    B_tile,
-                    C_tile,
-                    fx.Int32(BLOCK_M),
-                    c_n,
+                # GEMM role: one real tile (block_m, block_n) per block.
+                prof_born = _prof_stamp()
+                _gemm_tile_and_signal(
+                    gemm_tile,
+                    ACT,
+                    WEIGHTS,
                     lds,
-                    fx.Int32(0),
+                    group_resource,
+                    l2_token_buffer_base,
+                    combine_flag_base,
+                    combine_bank,
+                    thread_index,
+                    block_m,
                     block_n,
+                    c_n,
                     K=K,
                     BLOCK_M=BLOCK_M,
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
-                    c_cache_modifier=18,  # sc1|nt: agent-visible non-temporal local stage.
                 )
-                fx.rocdl.s_waitcnt(0)
-                fx.gpu.barrier()
-                # Keep a separator: LLVM folds adjacent barriers, but two rendezvous are required.
-                fx.rocdl.s_waitcnt(0)
-                fx.gpu.barrier()
-                if thread_index == fx.Int32(0):
-                    atomic_add(
-                        combine_flag_base,
-                        combine_bank + block_m,
-                        fx.Int64(1),
-                        scope="sys",
-                    )
+                if const_expr(_PROF_GEMM_REDUCE and rank == 0):
+                    # Grid-order last GEMM block: its end marks when the tile region drains.
+                    if gemm_tile_index >= real_tiles * fx.Int32(n_blocks) - fx.Int32(_PROFILE_STRIDE):
+                        if thread_index == fx.Int32(0):
+                            fx.printf("PROF G {} {} {}\n", gemm_tile_index, prof_born, read_clock())
+                    if gemm_tile_index < fx.Int32(2):
+                        if thread_index == fx.Int32(0):
+                            fx.printf("PROF G {} {} {}\n", gemm_tile_index, prof_born, read_clock())
             else:
                 # Empty region: first num_reduce_cu blocks do topk reduce, rest early-exit.
+                # Keep them at the grid tail: occupancy is 1 block/CU, so resident spinners
+                # placed ahead of the GEMM tiles starve the tiles and deadlock.
                 empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
                 if empty_ordinal < fx.Int32(num_reduce_cu):
+                    prof_born = _prof_stamp()
                     # Never-reset alignment: reduce blocks bump empty block_m's combine_flag to cumulative expected.
                     n_empty = fx.Int32(worst_case_tiles) - real_tiles
                     reduce_stride = fx.Int32(num_reduce_cu)
@@ -297,7 +438,7 @@ def _make_grouped_gemm_combine(
                     )
                     topk_reduce_bf16_tile(
                         True,
-                        apply_weights,
+                        reduce_apply_weights,
                         with_gate,
                         thread_index,
                         empty_ordinal,
@@ -316,7 +457,14 @@ def _make_grouped_gemm_combine(
                         gate_local_res,
                         d_topk_w_res,
                         expected_reduce_i64,
+                        dedup=combine_dedup,
+                        kind_res=kind_res,
+                        num_combine_slots=num_combine_slots if combine_dedup else 0,
                     )
+                    if const_expr(_PROF_GEMM_REDUCE and rank == 0):
+                        if empty_ordinal % fx.Int32(_PROFILE_RSTRIDE) == fx.Int32(0):
+                            if thread_index == fx.Int32(0):
+                                fx.printf("PROF R {} {} {}\n", empty_ordinal, prof_born, read_clock())
 
     return grouped_gemm_combine_kernel
 
@@ -342,8 +490,14 @@ def _make_epoch_bump(add_combine, add_reduce):
     return epoch_bump_kernel
 
 
+_FORCE_COMBINE_CU = os.environ.get("TURBO_FORCE_COMBINE_CU")
+_COMBINE_CU_CANDS = (int(_FORCE_COMBINE_CU),) if _FORCE_COMBINE_CU else (16, 24, 32, 48, 64, 96)
+
+
 @autotune(
-    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64) for rc in (256,)],
+    # Occupancy is 1 block/CU: every combine block costs the GEMM a CU for the whole kernel,
+    # so the optimum is a narrow trade and the space needs the odd multiples (48 wins on nt).
+    configs=[Config(num_combine_cu=cc, num_reduce_cu=256) for cc in _COMBINE_CU_CANDS],
     # layout_code MUST be a key: nt/nn have OPPOSITE combine_cu optima (see wrapper note).
     key=[
         "out_features",
@@ -359,6 +513,8 @@ def _make_epoch_bump(add_combine, add_reduce):
         "apply_weights",
         "with_gate",
         "out_fp16",
+        # dedup shifts work from the reduce side to the send side; optima differ
+        "combine_dedup",
     ],
     rep=5,
 )
@@ -378,6 +534,9 @@ def _compiled_grouped_gemm_combine(
     TOPK_WEIGHTS,
     GRAD_GATE,
     D_TOPK_W,
+    SORTED_SLOT_IDS,
+    DEDUP_KEY_ROW,
+    SOURCE_SLOT_KIND,
     sym_buffer,
     c_n,
     COMBINE_PARITY,
@@ -398,12 +557,14 @@ def _compiled_grouped_gemm_combine(
     apply_weights: fx.Constexpr[bool],
     with_gate: fx.Constexpr[bool],
     out_fp16: fx.Constexpr[bool],
+    combine_dedup: fx.Constexpr[bool],
     stream: fx.Stream,
     num_combine_cu: fx.Constexpr[int] = 64,
     num_reduce_cu: fx.Constexpr[int] = 256,
     nt_vmcnt: fx.Constexpr[int] = 3,
     agpr_alloc: fx.Constexpr[int] = 0,
     waves: fx.Constexpr[int] = 2,
+    dedup_npass: fx.Constexpr[int] = 2,
 ):
     kernel = _make_grouped_gemm_combine(
         out_features,
@@ -424,11 +585,13 @@ def _compiled_grouped_gemm_combine(
         _LAYOUTS[layout_code],
         apply_weights,
         with_gate,
+        combine_dedup,
+        dedup_npass,
     )
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
     grid_size = num_combine_cu + worst_case_tiles * n_blocks
-    # bump epoch on device (combine += n_blocks, reduce += 1) before the GEMM; same-stream visible
+    # Epoch bump from one block.
     _make_epoch_bump(int(n_blocks), 1)(COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED).launch(
         grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
     )
@@ -447,6 +610,9 @@ def _compiled_grouped_gemm_combine(
         TOPK_WEIGHTS,
         GRAD_GATE,
         D_TOPK_W,
+        SORTED_SLOT_IDS,
+        DEDUP_KEY_ROW,
+        SOURCE_SLOT_KIND,
         sym_buffer,
         c_n,
         COMBINE_PARITY,
@@ -506,20 +672,26 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
 
     apply_weights = topk_weights is not None
     with_gate = grad_gate is not None
+    # Needs the prologue's key->row member table; it is a 1-element stub when dispatch
+    # dedup is off, so check the real size, not just the handle length.
+    combine_dedup = _COMBINE_DEDUP and len(handle) > _H_DEDUP_KEY_ROW and handle[_H_DEDUP_KEY_ROW].numel() > 1
+    sorted_slot_ids = handle[_H_SORTED_DISPATCH_SLOT_IDS] if combine_dedup else dummy
+    dedup_key_row = handle[_H_DEDUP_KEY_ROW] if combine_dedup else dummy
+    source_slot_kind = handle[_H_SOURCE_SLOT_KIND] if combine_dedup else dummy
 
     # Pass 2D: kernel advances ACT base per-tile in int64 (flat MxK overflows int32 ABI).
     act_2d = x.contiguous()
     if layout == "nt":
-        weight_flat = l2_weights.reshape(G * N, K).contiguous()
+        weight_flat = l2_weights.reshape(G * N, K).contiguous().view(-1)
     else:
-        weight_flat = l2_weights.reshape(G * K, N).contiguous()
+        weight_flat = l2_weights.reshape(G * K, N).contiguous().view(-1)
     num_tokens = int(symm.num_tokens)
     output = torch.empty(num_tokens, out_features, dtype=torch.bfloat16, device=device)
-    output_d = output
-    topk_indices_d = topk_indices.contiguous()
+    output_d = output.view(-1)
+    topk_indices_d = topk_indices.contiguous().view(-1)
     num_tokens_d = symm.num_tokens_per_rank
-    topk_weights_d = topk_weights.contiguous() if apply_weights else dummy
-    grad_gate_d = grad_gate.contiguous() if with_gate else dummy
+    topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else dummy
+    grad_gate_d = grad_gate.contiguous().view(-1) if with_gate else dummy
     d_topk_w = torch.empty(num_combine_slots, dtype=torch.float32, device=device) if with_gate else None
     d_topk_w_d = d_topk_w if with_gate else dummy
 
@@ -527,7 +699,7 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     # num_combine_cu / num_reduce_cu are tunable per shape+layout (nt/nn optima differ).
     _compiled_grouped_gemm_combine(
         act_2d,
-        flyc.from_torch_tensor(weight_flat),
+        weight_flat,
         tile_to_expert,
         num_tile_blocks,
         recv_dst_rank,
@@ -540,6 +712,9 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         topk_weights_d,
         grad_gate_d,
         d_topk_w_d,
+        sorted_slot_ids,
+        dedup_key_row,
+        source_slot_kind,
         sym_buffer,
         c_n,
         COMBINE_PARITY=symm._combine_parity,
@@ -560,6 +735,8 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         apply_weights=bool(apply_weights),
         with_gate=bool(with_gate),
         out_fp16=False,
+        combine_dedup=bool(combine_dedup),
+        dedup_npass=int(_COMBINE_DEDUP_NPASS),
         stream=torch.cuda.current_stream(),
     )
     return output, d_topk_w

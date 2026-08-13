@@ -29,11 +29,70 @@ _SUPPORTED_DTYPES = (torch.bfloat16,)
 
 # dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
 # 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
-# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
-_HANDLE_LEN = 13
+# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot,
+# 13 source_slot_kind, 14 dedup_src_row, 15 dup_groups, 16 dup_loffs, 17 dup_counts,
+# 18 tile_copy_expected, 19 sorted_dispatch_slot_ids, 20 dedup_key_row.
+_HANDLE_LEN = 21
 _H_NUM_TILE_BLOCKS = 8
 _H_REAL_COUNT_PER_EXPERT = 6
 _H_NUM_TOKENS_PER_EXPERT_PREFIX = 7
+_H_SORTED_DISPATCH_SLOT_IDS = 19
+
+# perf probes (env-gated); _PROBE_NO_GATHER makes dW2 numerically wrong on purpose
+import os as _os
+
+_PROBE_NO_GATHER = _os.environ.get("TURBO_PROBE_NO_GATHER", "0") == "1"
+_SLOT_LDS = _os.environ.get("TURBO_SLOT_LDS", "0") == "1"
+_PROBE_DUMP_GEOM = _os.environ.get("TURBO_DUMP_GEOM", "0") == "1"
+# identity slots keep every gather instruction but remove the address scatter
+_PROBE_IDENTITY_SLOTS = _os.environ.get("TURBO_PROBE_IDENTITY_SLOTS", "0") == "1"
+# identity slots resolved by ALU: gather instruction form, no slot load at all
+_PROBE_SLOT_ALU = _os.environ.get("TURBO_PROBE_SLOT_ALU", "0") == "1"
+# chunks sharing one slot window; halves the vmcnt drain points in the K loop
+_SLOT_UNROLL = int(_os.environ.get("TURBO_SLOT_UNROLL", "2"))
+_probe_cache = {}
+
+
+def _probe_slots(slot_ids):
+    if _PROBE_NO_GATHER:
+        return None
+    if not _PROBE_IDENTITY_SLOTS:
+        return slot_ids
+    key = (slot_ids.numel(), slot_ids.device)
+    if key not in _probe_cache:
+        _probe_cache[key] = torch.arange(slot_ids.numel(), device=slot_ids.device, dtype=slot_ids.dtype)
+    return _probe_cache[key]
+
+
+_dumped = [False]
+
+
+def _dump_geom(a, b, prefix, masked_k, slot_ids=None):
+    if _dumped[0]:
+        return
+    _dumped[0] = True
+    import torch.distributed as _dist
+
+    if _dist.is_initialized() and _dist.get_rank() != 0:
+        return
+    pre = prefix.detach().cpu().tolist()
+    mk = masked_k.detach().cpu().tolist()
+    gt = [pre[i + 1] - pre[i] for i in range(len(pre) - 1)]
+    print(
+        f"[GEOM] pool_a={tuple(a.shape)} b={tuple(b.shape)} G={len(gt)} "
+        f"group_tokens min/max/sum={min(gt)}/{max(gt)}/{sum(gt)} "
+        f"masked_k min/max/sum={min(mk)}/{max(mk)}/{sum(mk)}",
+        flush=True,
+    )
+    print(f"[GEOM] group_tokens={gt}", flush=True)
+    print(f"[GEOM] masked_k={mk}", flush=True)
+    if slot_ids is not None:
+        # voffset is a 32-bit HW field: max_slot * row_stride * 2 must stay under 2^32
+        ms = int(slot_ids.max().item())
+        print(
+            f"[GEOM] slots n={slot_ids.numel()} max={ms} max_byte_off={ms * a.shape[1] * 2} (2^32={2**32})",
+            flush=True,
+        )
 
 
 class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
@@ -98,12 +157,27 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
             num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
         )
 
+        # the dispatch pool is unique-slot indexed and duplicate route rows are never
+        # materialized, so the wgrad K axis resolves them through the slot table.
+        if _PROBE_DUMP_GEOM:
+            _dump_geom(
+                dispatch_l2_grad,
+                act_weighted,
+                num_tokens_per_expert_prefix,
+                real_count_per_expert,
+                handle[_H_SORTED_DISPATCH_SLOT_IDS],
+            )
+
         dW2 = grouped_gemm_variable_k_bf16(
             dispatch_l2_grad,
             act_weighted,
             num_tokens_per_expert_prefix,
             masked_k=real_count_per_expert,
             trans_c=False,
+            a_slot_ids=_probe_slots(handle[_H_SORTED_DISPATCH_SLOT_IDS]),
+            slot_lds=_SLOT_LDS and not _PROBE_NO_GATHER,
+            slot_alu=_PROBE_SLOT_ALU and not _PROBE_NO_GATHER,
+            slot_unroll=1 if (_PROBE_NO_GATHER or _PROBE_SLOT_ALU) else _SLOT_UNROLL,
         )
 
         # L1 dgrad (grad_l1 @ w1, nn) + combine PUSH + dx reduce + grad_gate scatter

@@ -23,10 +23,16 @@ except ImportError:  # pragma: no cover - non-POSIX
 __all__ = ["Config", "autotune", "Autotuner"]
 
 
+# TURBO_TUNE_VERBOSE=1 keeps per-config compile errors visible while tuning.
+_TUNE_VERBOSE = os.environ.get("TURBO_TUNE_VERBOSE", "0") == "1"
+
+
 class _suppress_stdout_stderr:
     """Redirect stdout/stderr to /dev/null (silences flydsl JIT prints)."""
 
     def __enter__(self):
+        if _TUNE_VERBOSE:
+            return self
         # Flush pending Python-buffered output before swapping the fd.
         sys.stdout.flush()
         sys.stderr.flush()
@@ -39,6 +45,8 @@ class _suppress_stdout_stderr:
         return self
 
     def __exit__(self, *_):
+        if _TUNE_VERBOSE:
+            return
         # Flush into /dev/null before restoring the real fd, else buffered output leaks.
         sys.stdout.flush()
         sys.stderr.flush()

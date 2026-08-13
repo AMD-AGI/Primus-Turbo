@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
 import flydsl.compiler as flyc  # noqa: E402
 import flydsl.expr as fx  # noqa: E402
-from flydsl.expr import arith  # noqa: E402
+from flydsl.expr import arith, const_expr  # noqa: E402
 from flydsl.expr.buffer_ops import (  # noqa: E402
     buffer_load,
     create_buffer_resource,
@@ -73,6 +73,7 @@ from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
     _NUM_WARPS,
     _PVEC,
     combine_bf16_tile,
+    combine_dedup_bf16_tile,
     dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
@@ -254,6 +255,7 @@ def _compile_dispatch_only(
     num_max_tokens_per_rank,
     num_topk,
     waves_per_eu=2,
+    skip_duplicates=False,
 ):
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_only_k(
@@ -263,6 +265,7 @@ def _compile_dispatch_only(
         EXPERT_SEND_COUNT: fx.Tensor,
         EXPERT_SEND_OFFSET: fx.Tensor,
         DISPATCHED_TOKEN_IDX: fx.Tensor,
+        SOURCE_SLOT_KIND: fx.Tensor,
         sym_buffer: SymBuffer,
     ):
         thread_index = fx.thread_idx.x
@@ -284,6 +287,9 @@ def _compile_dispatch_only(
         expert_send_count_res = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
         expert_send_offset_res = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
         dispatched_token_idx_res = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
+        source_slot_kind_res = (
+            create_buffer_resource(SOURCE_SLOT_KIND, max_size=True) if skip_duplicates else None
+        )
 
         if block_index < comm_block_count:
             local_count = (
@@ -301,8 +307,12 @@ def _compile_dispatch_only(
                     expert_send_count_res=expert_send_count_res,
                     expert_send_offset_res=expert_send_offset_res,
                     dispatched_token_idx_res=dispatched_token_idx_res,
+                    source_slot_kind_res=source_slot_kind_res,
                     task_index=block_index + local_iter * comm_block_count,
                     signal=False,
+                    num_topk=num_topk,
+                    skip_duplicates=skip_duplicates,
+                    pair_slots=True,  # prologue runs with dedup on: slots are token*topk+k
                 )
 
     @flyc.jit
@@ -313,6 +323,7 @@ def _compile_dispatch_only(
         EXPERT_SEND_COUNT,
         EXPERT_SEND_OFFSET,
         DISPATCHED_TOKEN_IDX,
+        SOURCE_SLOT_KIND,
         sym_buffer,
         stream: fx.Stream,
     ):
@@ -323,6 +334,7 @@ def _compile_dispatch_only(
             EXPERT_SEND_COUNT,
             EXPERT_SEND_OFFSET,
             DISPATCHED_TOKEN_IDX,
+            SOURCE_SLOT_KIND,
             sym_buffer,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_dispatch_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -457,6 +469,7 @@ def dispatch_only(
     symm,  # SymmBuffer owning the peer pool + delta tables
     *,
     num_dispatch_cu=32,
+    skip_duplicates=False,
 ):
     """Cross-rank dispatch PUSH only (no GEMM) — pushes ``x`` token rows to peer
     pools over XGMI via the two-heap delta addressing (matches the fused kernel).
@@ -469,6 +482,9 @@ def dispatch_only(
     hidden_size = x.size(1)
     pool_capacity = symm.num_max_pool_tokens
     x_i32 = x.contiguous().view(torch.int32)
+    # handle[13] is source_slot_kind on the forward path (pool_src_slot rides at 12)
+    skip_duplicates = bool(skip_duplicates) and len(handle) > 13
+    source_slot_kind = handle[13] if skip_duplicates else expert_send_count
     launch = _compile_dispatch_only(
         hidden_size,
         pool_capacity,
@@ -478,6 +494,7 @@ def dispatch_only(
         int(symm.num_experts),
         int(symm.num_max_tokens_per_rank),
         int(symm.num_topk),
+        skip_duplicates=skip_duplicates,
     )
     launch(
         x_i32,
@@ -486,6 +503,7 @@ def dispatch_only(
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
+        source_slot_kind,
         symm.get_sym_buffer(),
         stream=torch.cuda.current_stream(),
     )
@@ -626,7 +644,8 @@ def _get_dispatch_handle(symm, *, T, H, E, K):
         num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
     )
     # pool_src_slot is cross-rank (symm); ride it on the handle like the production path
-    handle = tuple(handle) + (symm.pool_src_slot,)
+    handle = tuple(handle)
+    handle = handle[:12] + (symm.pool_src_slot,) + handle[12:]
     tile_to_expert = handle[5]
     num_tile_blocks = handle[8]  # device real-tile count (prologue-written, per-forward)
     return x, topk_idx, topk_weight, handle, tile_to_expert, num_tile_blocks
@@ -896,6 +915,7 @@ def _compile_reduce_only(
     rank,
     waves_per_eu=2,
     apply_weights=False,
+    dedup=False,
 ):
     assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
     assert topk >= 1, "topk must be >= 1"
@@ -908,6 +928,7 @@ def _compile_reduce_only(
         TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor,
         TOPK_WEIGHTS: fx.Tensor,
+        SOURCE_SLOT_KIND: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
@@ -916,6 +937,7 @@ def _compile_reduce_only(
         topk_indices_res = create_buffer_resource(TOPK_INDICES, max_size=True)
         num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
+        kind_res = create_buffer_resource(SOURCE_SLOT_KIND, max_size=True)
         barrier_base = extract_base_index(BARRIER_LOCAL, address_space=1)
         topk_reduce_bf16_tile(
             False,
@@ -938,6 +960,9 @@ def _compile_reduce_only(
             None,
             None,
             fx.Int64(0),
+            dedup=dedup,
+            kind_res=kind_res if dedup else None,
+            num_combine_slots=num_combine_slots,
         )
 
     @flyc.jit
@@ -948,6 +973,7 @@ def _compile_reduce_only(
         TOPK_INDICES,
         NUM_TOKENS_PER_RANK,
         TOPK_WEIGHTS,
+        SOURCE_SLOT_KIND,
         stream: fx.Stream,
     ):
         reduce_only_k(
@@ -957,6 +983,7 @@ def _compile_reduce_only(
             TOPK_INDICES,
             NUM_TOKENS_PER_RANK,
             TOPK_WEIGHTS,
+            SOURCE_SLOT_KIND,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_reduce_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -973,6 +1000,9 @@ def _compile_combine_only_task(
     num_topk,
     waves_per_eu=2,
     with_gate=False,
+    dedup=False,
+    apply_weights=False,
+    npass=2,
 ):
     """Task-based combine push: grid strides over num_experts recv-segments; a warp
     sustains ONE peer per segment (mirror of dispatch) -> sustained XGMI link."""
@@ -984,6 +1014,9 @@ def _compile_combine_only_task(
         RECV_START_ROW: fx.Tensor,
         RECV_COUNT: fx.Tensor,
         POOL_SRC_SLOT: fx.Tensor,
+        DEDUP_SRC_ROW: fx.Tensor,
+        SORTED_SLOT: fx.Tensor,
+        KEY_ROW: fx.Tensor,
         sym_buffer: SymBuffer,
     ):
         thread_index = fx.thread_idx.x
@@ -1004,22 +1037,43 @@ def _compile_combine_only_task(
         recv_start_row_res = create_buffer_resource(RECV_START_ROW, max_size=True)
         recv_count_res = create_buffer_resource(RECV_COUNT, max_size=True)
         origin_slot_res = create_buffer_resource(POOL_SRC_SLOT, max_size=True)
+        sorted_slot_res = create_buffer_resource(SORTED_SLOT, max_size=True) if dedup else None
+        key_row_res = create_buffer_resource(KEY_ROW, max_size=True) if dedup else None
         grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
 
         local_count = (fx.Int32(num_experts) - block_index + combine_cu - fx.Int32(1)) // combine_cu
         for local_iter in range(local_count):
-            combine_bf16_tile(
-                sym_buffer,
-                workspace,
-                thread_index=thread_index,
-                task_index=block_index + local_iter * combine_cu,
-                recv_dst_rank_res=recv_dst_rank_res,
-                recv_start_row_res=recv_start_row_res,
-                recv_count_res=recv_count_res,
-                origin_slot_res=origin_slot_res,
-                grad_gate_res=grad_gate_res,
-                with_gate=with_gate,
-            )
+            if const_expr(dedup):
+                combine_dedup_bf16_tile(
+                    sym_buffer,
+                    workspace,
+                    thread_index=thread_index,
+                    task_index=block_index + local_iter * combine_cu,
+                    recv_dst_rank_res=recv_dst_rank_res,
+                    recv_start_row_res=recv_start_row_res,
+                    recv_count_res=recv_count_res,
+                    origin_slot_res=origin_slot_res,
+                    sorted_slot_res=sorted_slot_res,
+                    key_row_res=key_row_res,
+                    grad_gate_res=grad_gate_res,
+                    topk=num_topk,
+                    apply_weights=apply_weights,
+                    with_gate=with_gate,
+                    npass=npass,
+                )
+            else:
+                combine_bf16_tile(
+                    sym_buffer,
+                    workspace,
+                    thread_index=thread_index,
+                    task_index=block_index + local_iter * combine_cu,
+                    recv_dst_rank_res=recv_dst_rank_res,
+                    recv_start_row_res=recv_start_row_res,
+                    recv_count_res=recv_count_res,
+                    origin_slot_res=origin_slot_res,
+                    grad_gate_res=grad_gate_res,
+                    with_gate=with_gate,
+                )
 
     @flyc.jit
     def launch(
@@ -1028,6 +1082,9 @@ def _compile_combine_only_task(
         RECV_START_ROW,
         RECV_COUNT,
         POOL_SRC_SLOT,
+        DEDUP_SRC_ROW,
+        SORTED_SLOT,
+        KEY_ROW,
         sym_buffer,
         stream: fx.Stream,
     ):
@@ -1037,11 +1094,22 @@ def _compile_combine_only_task(
             RECV_START_ROW,
             RECV_COUNT,
             POOL_SRC_SLOT,
+            DEDUP_SRC_ROW,
+            SORTED_SLOT,
+            KEY_ROW,
             sym_buffer,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_combine_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch
+
+
+def combine_dedup_enabled(handle) -> bool:
+    """Bench combine baseline follows TURBO_COMBINE_DEDUP; TURBO_BENCH_COMBINE_DEDUP overrides it."""
+    override = os.environ.get("TURBO_BENCH_COMBINE_DEDUP")
+    want = (override if override is not None else os.environ.get("TURBO_COMBINE_DEDUP", "0")) == "1"
+    # handle[20] is a 1-element stub when the prologue's dedup table is off
+    return want and len(handle) > 20 and handle[20].numel() > 1
 
 
 def combine_only(
@@ -1051,23 +1119,32 @@ def combine_only(
     BLOCK_M=256,
     num_combine_cu=None,
     grad_gate=None,
+    apply_weights=False,
 ):
     symm = get_symm_buffer_for_mega_moe()
     sym_buffer = symm.get_sym_buffer()  # pure addressing handle
     out_features = int(symm.hidden)  # dims live on SymmBuffer, not the handle
     num_max_pool_tokens = int(symm.num_max_pool_tokens)
     if num_combine_cu is None:
-        num_combine_cu = num_max_pool_tokens // BLOCK_M
+        # MEGA_COMB_CU probes how many CUs it takes to saturate XGMI
+        num_combine_cu = int(os.environ.get("MEGA_COMB_CU") or (num_max_pool_tokens // BLOCK_M))
     # recv-segment table + origin slots ride the handle (per-forward, not shared symm)
-    recv_dst_rank, recv_start_row, recv_count, pool_src_slot = (
+    recv_dst_rank, recv_start_row, recv_count, pool_src_slot, dedup_src_row = (
         handle[9],
         handle[10],
         handle[11],
         handle[12],
+        handle[13],
     )
     with_gate = grad_gate is not None
     waves = int(os.environ.get("MEGA_COMB_WAVES") or "2")  # combine push occupancy knob
     grad_gate_arg = grad_gate.contiguous().view(-1) if with_gate else recv_count
+    # Sender-dedup push in isolation (no GEMM to wait on): fewer XGMI bytes, so the
+    # comm baseline must match the fused kernel's dedup setting or roofline is bogus.
+    dedup = combine_dedup_enabled(handle)
+    npass = int(os.environ.get("TURBO_COMBINE_DEDUP_NPASS", "2"))
+    sorted_slot = handle[19] if dedup else recv_count
+    key_row = handle[20] if dedup else recv_count
     # task-based push (sustained per-peer): strides over num_experts recv-segments
     launch = _compile_combine_only_task(
         out_features,
@@ -1078,6 +1155,9 @@ def combine_only(
         int(symm.num_topk),
         waves_per_eu=waves,
         with_gate=with_gate,
+        dedup=dedup,
+        apply_weights=apply_weights,
+        npass=npass,
     )
     launch(
         grad_gate_arg,
@@ -1085,6 +1165,9 @@ def combine_only(
         recv_start_row,
         recv_count,
         pool_src_slot,
+        dedup_src_row,
+        sorted_slot,
+        key_row,
         sym_buffer,
         stream=torch.cuda.current_stream(),
     )
@@ -1104,10 +1187,12 @@ def topk_reduce_only(
     rank=0,
     num_reduce_cu=32,
     topk_weights=None,
+    source_slot_kind=None,
 ):
     assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"
     out_features = output.size(1)
     apply_weights = topk_weights is not None
+    dedup = source_slot_kind is not None
     launch = _compile_reduce_only(
         out_features,
         int(num_combine_slots),
@@ -1116,6 +1201,7 @@ def topk_reduce_only(
         int(num_experts),
         int(rank),
         apply_weights=apply_weights,
+        dedup=dedup,
     )
     topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else num_tokens_per_rank
     launch(
@@ -1125,6 +1211,7 @@ def topk_reduce_only(
         topk_indices.contiguous().view(-1),
         num_tokens_per_rank,
         topk_weights_d,
+        source_slot_kind if dedup else num_tokens_per_rank,
         stream=torch.cuda.current_stream(),
     )
     return output
@@ -1203,6 +1290,31 @@ class StageRunner:
         out = self.synced_fn(spec.fused_fn)[0]
         check = check_accuracy(self.group, spec.name, out[spec.acc_slice], ref_out[spec.acc_slice])
         return metrics, check, out
+
+    def _probe_two_stream(self, spec, t_gemm, t_comm, t_fused):
+        """Feasibility probe (timing only, output is garbage): run GEMM and the combine
+        push as two kernels on two streams. LDS occupancy is per-kernel, so combine
+        blocks can share a CU with GEMM blocks instead of costing one CU each."""
+        alt = torch.cuda.Stream()
+
+        def overlap():
+            main = torch.cuda.current_stream()
+            alt.wait_stream(main)
+            # GEMM enqueued first so it claims CUs before the combine blocks arrive
+            spec.gemm_fn()
+            with torch.cuda.stream(alt):
+                spec.comm_fn()
+            main.wait_stream(alt)
+
+        sync_ranks(self.group)
+        t_ov = bench(overlap, iters=self.args.iters)
+        sync_ranks(self.group)
+        if self.group.rank() == 0:
+            print(
+                f"  [probe] {spec.name}: two-stream = {t_ov:.3f} ms "
+                f"(gemm {t_gemm:.3f} | comm {t_comm:.3f} | fused {t_fused:.3f})",
+                flush=True,
+            )
 
 
 def _make_runner(group, args):
@@ -1293,9 +1405,27 @@ def _dispatch_make_fused_call(ctx, lhs, rhs, layout, *, trans_c=False):
     )
 
 
+def dispatch_dedup_enabled(handle) -> bool:
+    """The fused dispatch path skips duplicate routes, so its comm baseline must too."""
+    return len(handle) > 13 and handle[13].numel() > 1
+
+
+def _dispatch_remote_rows(ctx, dedup: bool) -> int:
+    """Rows this rank pushes over XGMI; dedup sends one row per (dest_rank, token)."""
+    if not dedup:
+        dest_cpu, count_cpu = ctx.inp.destination.cpu(), ctx.inp.count.cpu()
+        return int(count_cpu[dest_cpu != ctx.rank].sum().item())
+    dest_rank = (ctx.inp.topk_idx // ctx.experts_per_rank).long()
+    hit = torch.zeros(dest_rank.size(0), ctx.symm.world, dtype=torch.bool, device=dest_rank.device)
+    hit.scatter_(1, dest_rank, True)
+    hit[:, ctx.rank] = False
+    return int(hit.sum().item())
+
+
 def _dispatch_make_comm_call(ctx, operand):
     """Build the dispatch-only call (the comm baseline for one stage)."""
-    return lambda: dispatch_only(operand, ctx.inp.handle, ctx.symm)
+    dedup = dispatch_dedup_enabled(ctx.inp.handle)
+    return lambda: dispatch_only(operand, ctx.inp.handle, ctx.symm, skip_duplicates=dedup)
 
 
 def _dispatch_stage_fwd(runner, ctx):
@@ -1305,8 +1435,7 @@ def _dispatch_stage_fwd(runner, ctx):
     M_eff, N_fwd, K = ctx.M_eff, 2 * args.inter, args.hidden
     flops = 2.0 * M_eff * N_fwd * K
     # XGMI push bytes per rank = remote rows (dest != rank) x hidden x bf16
-    dest_cpu, count_cpu = inp.destination.cpu(), inp.count.cpu()
-    remote_rows = int(count_cpu[dest_cpu != ctx.rank].sum().item())
+    remote_rows = _dispatch_remote_rows(ctx, dispatch_dedup_enabled(inp.handle))
     xgmi_bytes = remote_rows * args.hidden * BF16_BYTES
 
     spec = StageSpec(
@@ -1480,7 +1609,16 @@ def _combine_make_context(group, args, symm):
     M_eff = real_tiles * 256
     # combine push bytes per rank = remote rows (origin_rank != rank, valid) x H x bf16
     origin = symm.pool_src_rank
-    remote_rows = int(((origin != rank) & (origin >= 0)).sum().item())
+    remote = (origin != rank) & (origin >= 0)
+    if combine_dedup_enabled(inp.handle):
+        # Dedup folds all local routes of one source token into a single push, so the
+        # pushed row count is the number of distinct (origin_rank, source_token) groups.
+        topk = int(symm.num_topk)
+        src_token = symm.pool_src_slot.to(torch.int64) // topk
+        key = origin.to(torch.int64) * (1 << 32) + src_token
+        remote_rows = int(torch.unique(key[remote]).numel())
+    else:
+        remote_rows = int(remote.sum().item())
     xgmi_bytes = remote_rows * args.hidden * BF16_BYTES
     # kernel reads topk_indices as i64 (like the production forward); int32 -> OOB slot
     topk_idx_flat = inp.topk_idx.to(torch.int64).contiguous().view(-1)
@@ -1515,9 +1653,12 @@ def _combine_make_fused_call(ctx, lhs, rhs, *, layout="nt", topk_weights):
     )
 
 
-def _combine_make_comm_call(ctx):
-    """Build the combine-only call (the comm baseline; CU count autotuned)."""
-    return lambda: combine_only(ctx.group, handle=ctx.inp.handle)
+def _combine_make_comm_call(ctx, *, apply_weights):
+    """Build the combine-only call (the comm baseline; CU count autotuned).
+
+    Under dedup the fold is weighted at push time, so fwd must pass the routing
+    weights here and leave the downstream topk reduce unweighted."""
+    return lambda: combine_only(ctx.group, handle=ctx.inp.handle, apply_weights=apply_weights)
 
 
 def _combine_stage_fwd(runner, ctx):
@@ -1541,7 +1682,7 @@ def _combine_stage_fwd(runner, ctx):
             GROUP_M=8,
         )
         sync_ranks(ctx.group)
-        combine_only(ctx.group, handle=ctx.inp.handle)
+        combine_only(ctx.group, handle=ctx.inp.handle, apply_weights=True)
         sync_ranks(ctx.group)
         ctx.reduce_ready.zero_()  # 0 == ready (reduce_only does not spin)
         topk_reduce_only(
@@ -1554,7 +1695,8 @@ def _combine_stage_fwd(runner, ctx):
             topk=int(symm.num_topk),
             num_experts=int(symm.num_experts),
             rank=ctx.rank,
-            topk_weights=ctx.topk_w_flat,  # weighted (forward routing weights)
+            # dedup already folded the weights in at push time
+            topk_weights=None if combine_dedup_enabled(inp.handle) else ctx.topk_w_flat,
         )
         return ref_y
 
@@ -1573,7 +1715,7 @@ def _combine_stage_fwd(runner, ctx):
             BLOCK_N=256,
             GROUP_M=8,
         ),
-        comm_fn=_combine_make_comm_call(ctx),
+        comm_fn=_combine_make_comm_call(ctx, apply_weights=True),
         fused_fn=_combine_make_fused_call(ctx, inp.act, inp.W2, topk_weights=ctx.topk_w_flat),
         ref_fn=_ref_fwd,
     )
@@ -1602,7 +1744,7 @@ def _combine_stage_bwd(runner, ctx):
             GROUP_M=8,
         )
         sync_ranks(ctx.group)
-        combine_only(ctx.group, handle=ctx.inp.handle)
+        combine_only(ctx.group, handle=ctx.inp.handle, apply_weights=False)
         sync_ranks(ctx.group)
         ctx.reduce_ready.zero_()  # 0 == ready (reduce_only does not spin)
         topk_reduce_only(
@@ -1634,7 +1776,7 @@ def _combine_stage_bwd(runner, ctx):
             BLOCK_N=256,
             GROUP_M=8,
         ),
-        comm_fn=_combine_make_comm_call(ctx),
+        comm_fn=_combine_make_comm_call(ctx, apply_weights=False),
         fused_fn=_combine_make_fused_call(ctx, grad_l1, inp.W1, layout="nn", topk_weights=None),
         ref_fn=_ref_bwd,
     )

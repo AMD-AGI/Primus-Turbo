@@ -182,19 +182,27 @@ class SymmetricMemory:
         except Exception as e:
             warnings.warn(f"hipFree failed during cleanup: {e}")
 
-    def _cleanup_ptrs(self):
-        """Release all allocated memory and IPC handles, tolerating individual failures."""
+    def _release_ptrs(self, *, peers: bool, own: bool):
+        """Close peer IPC handles and/or free this rank's allocations, tolerating failures."""
         for ptrs in (self.buffer_ptrs, self.signal_pad_ptrs):
             for rank in range(min(self.world_size, len(ptrs))):
                 if ptrs[rank] == 0:
                     continue
+                is_own = rank == self.rank
+                if not (own if is_own else peers):
+                    continue
                 try:
-                    if rank == self.rank:
+                    if is_own:
                         self.lib.hipFree(ptrs[rank])
                     else:
                         self.lib.hipIpcCloseMemHandle(ptrs[rank])
                 except Exception as e:
                     warnings.warn(f"SymmetricMemory cleanup error for rank {rank}: {e}")
+                ptrs[rank] = 0
+
+    def _cleanup_ptrs(self):
+        """Uncoordinated best-effort release; only for the constructor's failure path."""
+        self._release_ptrs(peers=True, own=True)
         self.buffer_ptrs = []
         self.signal_pad_ptrs = []
 
@@ -286,9 +294,24 @@ class SymmetricMemory:
         if self.is_destroyed:
             return
         self.is_destroyed = True
-        self._cleanup_ptrs()
+        # A peer's open IPC handle pins our allocation, so hipFree would leak it.
+        # Every rank must close its peer handles before anyone frees its own buffer.
+        self._release_ptrs(peers=True, own=False)
+        self._barrier_ranks()
+        self._release_ptrs(peers=False, own=True)
+        self.buffer_ptrs = []
+        self.signal_pad_ptrs = []
         self.buffer_ptrs_dev = None
         self.signal_pad_ptrs_dev = None
+
+    def _barrier_ranks(self):
+        """Host barrier between closing peer handles and freeing our own."""
+        try:
+            if dist.is_available() and dist.is_initialized():
+                torch.cuda.synchronize()
+                dist.barrier(group=self.group)
+        except Exception as e:  # interpreter teardown: fall through and free anyway
+            warnings.warn(f"SymmetricMemory destroy barrier skipped: {e}")
 
     def __del__(self):
         try:

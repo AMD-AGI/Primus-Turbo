@@ -14,7 +14,7 @@ from primus_turbo.flydsl.mega import (
 )
 
 # dispatch handle layout (see dispatch_prologue ABI).
-_HANDLE_LEN = 13
+_HANDLE_LEN = 21
 
 
 def fused_mega_moe_stage1_forward_impl(
