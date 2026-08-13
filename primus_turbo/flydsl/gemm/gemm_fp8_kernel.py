@@ -33,11 +33,13 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     StoreCPerTensor,
     asm_mma_do,
     ceildiv,
+    compile_with_scratch_out,
     compute_global_swizzle,
     compute_global_swizzle_nn,
     make_fp8_buffer_tensor_rebased,
     make_value_attrs,
     mask_a_tail,
+    resolve_accum_out,
     wait_barrier,
     xcd_remap_pid,
 )
@@ -64,6 +66,7 @@ def _compile_dense_nt(
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # StoreCPerTensor out dtype: True -> fp16, else bf16
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     """Build & cache the (K, BLOCK_M, BLOCK_N, GROUP_M)-specialised NT launch.
 
@@ -186,7 +189,9 @@ def _compile_dense_nt(
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        store_c = StoreCPerTensor(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
+        store_c = StoreCPerTensor(
+            A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty, beta_is_one=beta_is_one
+        )
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -392,6 +397,7 @@ def _compile_dense_nn(
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # StoreCPerTensor out dtype: True -> fp16, else bf16
     i64_traverse: bool = False,  # B[K,N] traversal via per-load i64 SRD re-base (lifts k*n < 2^32 cap)
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     """NN-layout fp8 dense kernel. A [M, K], B [K, N], C [M, N].
 
@@ -516,7 +522,9 @@ def _compile_dense_nn(
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoaderTr(wave_n, N_TILES_B, 32, inline_asm=b_inline_asm_load, vmcnt_hint=vmcnt_hint)
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        store_c = StoreCPerTensor(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
+        store_c = StoreCPerTensor(
+            A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty, beta_is_one=beta_is_one
+        )
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -703,6 +711,7 @@ def _compile_dense_tn(
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # StoreCPerTensor out dtype: True -> fp16, else bf16
     i64_traverse: bool = False,  # A[K,M] & B[K,N] traversal via per-load i64 SRD re-base (lifts cap)
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     """TN-layout fp8 dense kernel: A [K, M], B [K, N], C [M, N] = A^T @ B.
     Both A and B are K-row strided, so both go through the wave-coop
@@ -867,7 +876,9 @@ def _compile_dense_tn(
             wave_n, N_TILES_B, 32, inline_asm=_b_inline, vmcnt_hint=vmcnt_hint, chunk_stride=_LDS_CS
         )
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        store_c = StoreCPerTensor(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
+        store_c = StoreCPerTensor(
+            A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty, beta_is_one=beta_is_one
+        )
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -1043,9 +1054,34 @@ def _get_compiled_dense(launch, args):
     key = tuple(key_parts)
     cached = _COMPILED_DENSE_CACHE.get(key)
     if cached is None:
-        cached = flyc.compile(launch, *args)
+        cached = compile_with_scratch_out(launch, args)
         _COMPILED_DENSE_CACHE[key] = cached
     return cached
+
+
+def _bench_dense_args(args):
+    """Bench copy of the launch args with a scratch C, plus that scratch.
+
+    Each candidate is run 23 times while racing. Against a beta=1 build that would
+    fold 23 GEMMs into the caller's accumulation buffer, so the race never touches
+    it: the winning config is re-compiled with the accumulate epilogue afterwards.
+    """
+    bench_c = torch.empty_like(args[2])
+    return (args[0], args[1], bench_c) + tuple(args[3:]), bench_c
+
+
+def _dense_beta1_entry(cache, key, tuned):
+    """The beta=1 build of an already-tuned config (same config, accumulate epilogue).
+
+    ``tuned[3]`` is the config's compile factory; the compile functions are
+    lru_cached, so this only ever traces once per (shape, config).
+    """
+    bkey = key + (True,)
+    entry = cache.get(bkey)
+    if entry is None:
+        entry = [tuned[3](beta_is_one=True), tuned[1], None, tuned[3]]
+        cache[bkey] = entry
+    return entry
 
 
 def _run_dense(entry, args):
@@ -1057,7 +1093,7 @@ def _run_dense(entry, args):
         entry[0](*args)
     else:
         if entry[2] is None:
-            entry[2] = flyc.compile(entry[0], *args)
+            entry[2] = compile_with_scratch_out(entry[0], args)
         entry[2](*args)
 
 
@@ -1090,20 +1126,25 @@ _NN_CANDIDATES = [
 _NN_AUTOTUNE_CACHE: dict = {}
 
 
-def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_traverse=False):
+def _autotune_nn_dispatch(
+    args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_traverse=False, beta_is_one=False
+):
     """First-call bench NN candidates, cache best (launch, cfg) by (M,N,K).
 
     Runtime micro-benches each (BM, GROUP_M, num_xcd, AG) candidate,
     finite-checks the output, times 2-warmup + 20-iter, and caches the
     fastest by shape. ``i64_traverse`` re-bases B's SRD per load (lifts the
-    k*n < 2^32 cap; threaded to _compile_dense_nn).
+    k*n < 2^32 cap; threaded to _compile_dense_nn). The race always runs the
+    beta=0 build; ``beta_is_one`` re-compiles the winner with the accumulate
+    epilogue.
     """
     import torch as _torch
 
     key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
-    if key in _NN_AUTOTUNE_CACHE:
-        return _NN_AUTOTUNE_CACHE[key]
-    out_view = args[2]
+    tuned = _NN_AUTOTUNE_CACHE.get(key)
+    if tuned is not None:
+        return _dense_beta1_entry(_NN_AUTOTUNE_CACHE, key, tuned) if beta_is_one else tuned
+    bargs, out_view = _bench_dense_args(args)
     best_us = float("inf")
     best = None
     for bm, gm, xcd, ag in _NN_CANDIDATES:
@@ -1113,7 +1154,8 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_tra
         try:
             # inline-asm ds_read_b64_tr_b8 on by default (drops the per-K-iter
             # compiler-auto vmcnt(0) drains).
-            launch = _compile_dense_nn(
+            mk = functools.partial(
+                _compile_dense_nn,
                 K=K,
                 BLOCK_M=bm,
                 BLOCK_N=256,
@@ -1127,33 +1169,34 @@ def _autotune_nn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_tra
                 out_fp16=out_fp16,
                 i64_traverse=i64_traverse,
             )
-            c = _get_compiled_dense(launch, args)
-            c(*args)
+            launch = mk(beta_is_one=False)
+            c = _get_compiled_dense(launch, bargs)
+            c(*bargs)
             _torch.cuda.synchronize()
             sample = out_view.view(-1)[:1024].float()
             if not _torch.isfinite(sample).all().item():
                 continue
             for _ in range(2):
-                c(*args)
+                c(*bargs)
             _torch.cuda.synchronize()
             e0 = _torch.cuda.Event(enable_timing=True)
             e1 = _torch.cuda.Event(enable_timing=True)
             _torch.cuda.synchronize()
             e0.record()
             for _ in range(20):
-                c(*args)
+                c(*bargs)
             e1.record()
             _torch.cuda.synchronize()
             us = e0.elapsed_time(e1) * 1000.0 / 20
             if us < best_us:
                 best_us = us
-                best = [launch, (bm, gm, xcd, ag), c]  # c: compiled winner (reused eager)
+                best = [launch, (bm, gm, xcd, ag), c, mk]  # c: compiled winner (reused eager)
         except Exception:
             continue
     if best is None:
         raise RuntimeError(f"NN autotune found no working cfg for ({M},{N},{K})")
     _NN_AUTOTUNE_CACHE[key] = best
-    return best
+    return _dense_beta1_entry(_NN_AUTOTUNE_CACHE, key, best) if beta_is_one else best
 
 
 # NT per-shape autotune candidates (BLOCK_M, GROUP_M, num_xcd, AGPR). GROUP_M
@@ -1168,19 +1211,21 @@ _NT_CANDIDATES = [
 _NT_AUTOTUNE_CACHE: dict = {}
 
 
-def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
+def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, beta_is_one=False):
     """First-call bench NT candidates, cache best (launch, cfg) by (M,N,K).
 
     Runtime micro-benches each (BM, GROUP_M, num_xcd, AG) candidate,
     finite-checks the output, times 2-warmup + 20-iter, and caches the
-    fastest by shape.
+    fastest by shape. The race always runs the beta=0 build; ``beta_is_one``
+    re-compiles the winner with the accumulate epilogue.
     """
     import torch as _torch
 
     key = (M, N, K, cbsz, blgp, out_fp16)
-    if key in _NT_AUTOTUNE_CACHE:
-        return _NT_AUTOTUNE_CACHE[key]
-    out_view = args[2]
+    tuned = _NT_AUTOTUNE_CACHE.get(key)
+    if tuned is not None:
+        return _dense_beta1_entry(_NT_AUTOTUNE_CACHE, key, tuned) if beta_is_one else tuned
+    bargs, out_view = _bench_dense_args(args)
     best_us = float("inf")
     best = None
     for bm, gm, xcd, ag in _NT_CANDIDATES:
@@ -1188,7 +1233,8 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
         # bounded by c_m (StoreCPerTensor clamp) and the global SRD (HW OOB
         # clamp on the A G2S load), so no even-tiling filter is needed.
         try:
-            launch = _compile_dense_nt(
+            mk = functools.partial(
+                _compile_dense_nt,
                 K=K,
                 BLOCK_M=bm,
                 BLOCK_N=256,
@@ -1199,33 +1245,34 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
                 blgp=blgp,
                 out_fp16=out_fp16,
             )
-            c = _get_compiled_dense(launch, args)
-            c(*args)
+            launch = mk(beta_is_one=False)
+            c = _get_compiled_dense(launch, bargs)
+            c(*bargs)
             _torch.cuda.synchronize()
             sample = out_view.view(-1)[:1024].float()
             if not _torch.isfinite(sample).all().item():
                 continue
             for _ in range(2):
-                c(*args)
+                c(*bargs)
             _torch.cuda.synchronize()
             e0 = _torch.cuda.Event(enable_timing=True)
             e1 = _torch.cuda.Event(enable_timing=True)
             _torch.cuda.synchronize()
             e0.record()
             for _ in range(20):
-                c(*args)
+                c(*bargs)
             e1.record()
             _torch.cuda.synchronize()
             us = e0.elapsed_time(e1) * 1000.0 / 20
             if us < best_us:
                 best_us = us
-                best = [launch, (bm, gm, xcd, ag), c]  # c: compiled winner (reused eager)
+                best = [launch, (bm, gm, xcd, ag), c, mk]  # c: compiled winner (reused eager)
         except Exception:
             continue
     if best is None:
         raise RuntimeError(f"NT autotune found no working cfg for ({M},{N},{K})")
     _NT_AUTOTUNE_CACHE[key] = best
-    return best
+    return _dense_beta1_entry(_NT_AUTOTUNE_CACHE, key, best) if beta_is_one else best
 
 
 # TN dispatch: a single inplace-A kernel (inline-asm tr8 on both operands +
@@ -1237,31 +1284,37 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False):
 _TN_AUTOTUNE_CACHE: dict = {}
 
 
-def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_traverse=False):
+def _autotune_tn_dispatch(
+    args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_traverse=False, beta_is_one=False
+):
     """First-call bench TN candidates, cache best (launch, cfg) by (M,N,K).
 
     1D GROUP_M=4 with num_xcd 8 vs 1 (XCD-aware PID remap); large
     (HBM-streaming) shapes expose the per-XCD L2 reuse on the hot bench,
     L2-resident shapes pick num_xcd=1. ``i64_traverse`` re-bases A's and B's
     SRDs per load (lifts the k*m / k*n < 2^32 cap; threaded to _compile_dense_tn).
+    The race always runs the beta=0 build; ``beta_is_one`` re-compiles the winner
+    with the accumulate epilogue.
     """
     import torch as _torch
 
     key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
-    if key in _TN_AUTOTUNE_CACHE:
-        return _TN_AUTOTUNE_CACHE[key]
+    tuned = _TN_AUTOTUNE_CACHE.get(key)
+    if tuned is not None:
+        return _dense_beta1_entry(_TN_AUTOTUNE_CACHE, key, tuned) if beta_is_one else tuned
     # Occupancy routing: BLOCK_M=BLOCK_N=256 yields ceil(M/256)*ceil(N/256)
     # tiles; below NUM_CUS the grid can't fill every CU, so BLOCK_M=128 doubles
     # the M-tile count. Above it the smaller block's per-tile overhead dominates.
     NUM_CUS = 256
     tiles_256 = ((M + 255) // 256) * ((N + 255) // 256)
     bm = 128 if tiles_256 < NUM_CUS else 256
-    out_view = args[2]
+    bargs, out_view = _bench_dense_args(args)
     best_us = float("inf")
     best = None
     for xcd in (8, 1):
         try:
-            launch = _compile_dense_tn(
+            mk = functools.partial(
+                _compile_dense_tn,
                 K=K,
                 BLOCK_M=bm,
                 BLOCK_N=256,
@@ -1274,33 +1327,34 @@ def _autotune_tn_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_tra
                 out_fp16=out_fp16,
                 i64_traverse=i64_traverse,
             )
-            c = _get_compiled_dense(launch, args)
-            c(*args)
+            launch = mk(beta_is_one=False)
+            c = _get_compiled_dense(launch, bargs)
+            c(*bargs)
             _torch.cuda.synchronize()
             sample = out_view.view(-1)[:1024].float()
             if not _torch.isfinite(sample).all().item():
                 continue
             for _ in range(2):
-                c(*args)
+                c(*bargs)
             _torch.cuda.synchronize()
             e0 = _torch.cuda.Event(enable_timing=True)
             e1 = _torch.cuda.Event(enable_timing=True)
             _torch.cuda.synchronize()
             e0.record()
             for _ in range(20):
-                c(*args)
+                c(*bargs)
             e1.record()
             _torch.cuda.synchronize()
             us = e0.elapsed_time(e1) * 1000.0 / 20
             if us < best_us:
                 best_us = us
-                best = [launch, (bm, 4, 0, xcd), c]  # c: compiled winner (reused eager)
+                best = [launch, (bm, 4, 0, xcd), c, mk]  # c: compiled winner (reused eager)
         except Exception:
             continue
     if best is None:
         raise RuntimeError(f"TN autotune found no working cfg for ({M},{N},{K})")
     _TN_AUTOTUNE_CACHE[key] = best
-    return best
+    return _dense_beta1_entry(_TN_AUTOTUNE_CACHE, key, best) if beta_is_one else best
 
 
 def gemm_fp8_tensorwise_flydsl_kernel(
@@ -1312,14 +1366,26 @@ def gemm_fp8_tensorwise_flydsl_kernel(
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
     trans_c: bool = False,
+    beta: float = 0.0,
+    out: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """Dense FP8 GEMM, per-tensor scaling. Inputs E4M3/E5M2/hybrid, out bf16/fp16,
     arbitrary K (native K-tail). Dispatch by (trans_a, trans_b): NT (F,T), NN
     (F,F, dgrad), TN (T,F) run native; TT (T,T) unsupported. trans_c=True returns
-    out.t().contiguous()."""
+    out.t().contiguous().
+
+    ``beta=1.0`` accumulates into ``out`` (``out += a @ b``) in the epilogue instead
+    of overwriting it, and therefore requires ``out``. It is incompatible with
+    ``trans_c``, whose transpose happens after the kernel has already written.
+    """
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise NotImplementedError(f"FlyDSL wrapper emits bf16 or fp16. Got {out_dtype}.")
     assert a.dim() == 2 and b.dim() == 2
+    beta_is_one = beta == 1.0
+    assert not (beta_is_one and trans_c), (
+        "beta=1.0 cannot be combined with trans_c: the transpose is a post-kernel copy, "
+        "so the accumulation would land in a buffer the caller never sees."
+    )
     # Element-count threshold past which a contraction-traversal operand's 32-bit
     # soffset wraps (fp8 = 1 byte/elem). At/above it the kernel re-bases the SRD per
     # load in i64; below it the cheaper fixed-base + 32-bit soffset path is used.
@@ -1338,12 +1404,12 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         K = K_a
         a_scale_v = _scalar_scale(a_scale_inv, a.device)
         b_scale_v = _scalar_scale(b_scale_inv, a.device)
-        out = torch.empty((M, N), dtype=out_dtype, device=a.device)
+        out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
         # TN: per-shape autotune picks the best candidate cfg, cached by (M,N,K).
         args = (
             _as_i8_flat(a),
             _as_i8_flat(b),
-            out.contiguous(),
+            out,
             a_scale_v,
             b_scale_v,
             M,
@@ -1353,7 +1419,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         # TN both operands traverse K: span k*m / k*n past 2^32 fp8 needs the
         # per-load i64 SRD re-base (else the 32-bit soffset wraps).
         i64_tr = (K * M >= cap) or (K * N >= cap)
-        _run_dense(_autotune_tn_dispatch(args, M, N, K, cbsz, blgp, out_fp16, i64_tr), args)
+        _run_dense(_autotune_tn_dispatch(args, M, N, K, cbsz, blgp, out_fp16, i64_tr, beta_is_one), args)
         if trans_c:
             return out.t().contiguous()
         return out
@@ -1367,13 +1433,13 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         K = K_a
         a_scale_v = _scalar_scale(a_scale_inv, a.device)
         b_scale_v = _scalar_scale(b_scale_inv, a.device)
-        out = torch.empty((M, N), dtype=out_dtype, device=a.device)
+        out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
         # NN: per-shape runtime autotune over the candidate tiles, caches by
         # (M,N,K). Build args before autotune (it benches against them).
         args = (
             _as_i8_flat(a),
             _as_i8_flat(b),
-            out.contiguous(),
+            out,
             a_scale_v,
             b_scale_v,
             M,
@@ -1382,7 +1448,7 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         )
         # NN: only B[K,N] traverses K; k*n past 2^32 fp8 needs the i64 re-base.
         i64_tr = K * N >= cap
-        _run_dense(_autotune_nn_dispatch(args, M, N, K, cbsz, blgp, out_fp16, i64_tr), args)
+        _run_dense(_autotune_nn_dispatch(args, M, N, K, cbsz, blgp, out_fp16, i64_tr, beta_is_one), args)
     elif (not trans_a) and trans_b:
         # NT native: A [M, K], B [N, K] (B^T storage of [K, N]).
         M, K_a = a.shape
@@ -1391,20 +1457,20 @@ def gemm_fp8_tensorwise_flydsl_kernel(
         K = K_a
         a_scale_v = _scalar_scale(a_scale_inv, a.device)
         b_scale_v = _scalar_scale(b_scale_inv, a.device)
-        out = torch.empty((M, N), dtype=out_dtype, device=a.device)
+        out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
         # NT: per-shape runtime autotune over the 8w/v3 candidate tiles, caches
         # by (M,N,K). Build args before autotune (it benches against them).
         args = (
             _as_i8_flat(a),
             _as_i8_flat(b),
-            out.contiguous(),
+            out,
             a_scale_v,
             b_scale_v,
             M,
             N,
             torch.cuda.current_stream(),
         )
-        _run_dense(_autotune_nt_dispatch(args, M, N, K, cbsz, blgp, out_fp16), args)
+        _run_dense(_autotune_nt_dispatch(args, M, N, K, cbsz, blgp, out_fp16, beta_is_one), args)
     else:
         raise NotImplementedError(
             f"FlyDSL fp8 GEMM does not support the TT layout (trans_a={trans_a}, trans_b={trans_b})."
