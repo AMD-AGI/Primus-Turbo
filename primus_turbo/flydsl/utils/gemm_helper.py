@@ -179,20 +179,16 @@ def swizzle_128(row, col, width=128):
     return row, col ^ (lds_row_swizzle(row, width // 16) * 16)
 
 
-def pair_major_row(row, pair=2):
-    """Pack-major renumbering inside each 16*pair-row wave slice:
-    16p*q + 16t + j -> 16p*q + p*j + t. An n-operand's ``pair`` mfma fragments (t) sit 16
-    LDS rows apart, so a lane holds output columns 16 apart; feeding LDS row 16p*q+16t+j
-    from global row 16p*q+p*j+t instead makes them ADJACENT and lets the epilogue store the
-    whole group in one 2*pair-byte access. Bijective inside the slice, so the LDS layout,
-    its swizzle key and the operand's row bound are unchanged."""
-    span = 16 * pair
-    return (row // span) * span + (row % 16) * pair + (row % span) // 16
+def pair_major_row(row):
+    """Pair-major renumbering inside each 32-row wave slice: 32q + 16t + j -> 32q + 2j + t.
+    An n-operand's two mfma fragments (t) sit 16 LDS rows apart, so a lane holds output
+    columns 16 apart; feeding LDS row 32q+16t+j from global row 32q+2j+t instead makes the
+    pair ADJACENT and lets the epilogue store both in one dword. Bijective inside the
+    slice, so the LDS layout, its swizzle key and the operand's row bound are unchanged."""
+    return (row // 32) * 32 + (row % 16) * 2 + (row % 32) // 16
 
 
-def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled, row_pair=0):
-    """Per-lane global operand offsets for one wave's g2s steps. ``row_pair`` (0 = off)
-    is the pack width the consumer reads its n-fragments at (see pair_major_row)."""
+def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled, row_pair=False):
     offsets = []
     n_waves = fx.block_dim.x // 64
     for round in range_constexpr(n_rounds):
@@ -211,7 +207,7 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled, row_pair=
             col = (lane_id % 8) * 16
             r, c = swizzle_128(row, col)
             if const_expr(row_pair):
-                r = pair_major_row(r, row_pair)
+                r = pair_major_row(r)
             offsets.append(r * K + c)
     return offsets
 
@@ -394,11 +390,12 @@ def _asm_mma_scale_do(a, b, c, sa, sb, opsel, cbsz=0, blgp=0):
     lo = opsel & 1
     hi = (opsel >> 1) & 1
     osel = f"op_sel:[{lo},{lo},0] op_sel_hi:[{hi},{hi},0]"
+    cons = "=&v,v,v,0,v,v"  # VGPR early-clobber accumulator
     op = _llvm.InlineAsmOp(
         res=v4f32,
         operands_=[_raw(a), _raw(b), _raw(c), _raw(sa), _raw(sb)],
-        asm_string=f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 {osel} cbsz:{cbsz} blgp:{blgp}",
-        constraints="=&v,v,v,0,v,v",
+        asm_string=f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 cbsz:{cbsz} blgp:{blgp} {osel}",
+        constraints=cons,
         has_side_effects=False,
     )
     return Vec(op.result)
@@ -668,11 +665,6 @@ class StoreCPerTensor:
     ``c_base``: byte base index overriding the one extracted from ``C``, so a caller can
     steer a tile's store to a second buffer of the same row pitch (the split-K wgrad
     slices write a scratch band instead of C). Wave-uniform; it lands in the band SRD.
-
-    ``pipe_store``: emit one row group's converts as a batch and only then its stores,
-    fenced so the scheduler keeps that order. Left off the value math is unchanged but
-    the pressure-driven scheduler pairs every convert with its own store through a single
-    temp, so a tile's tail is one serial convert/store chain with no ILP.
     """
 
     def __init__(
@@ -692,23 +684,18 @@ class StoreCPerTensor:
         trans=False,
         c_base=None,
         pack_cols=0,
-        pipe_store=False,
     ):
-        self.pipe_store = bool(pipe_store)
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.col_safe = col_safe
-        # pack_cols (0=off, 2, 4): the caller has permuted its B feed so a lane's
-        # n-fragments are ADJACENT output columns (pack_cols*(lane%16)+t) instead of 16
-        # apart, so one buffer_store carries the whole group and the f32->out_ty converts
-        # pack into v_cvt_pk_bf16_f32. A row's coalesced run grows to 32*pack_cols B. Needs
-        # n_tiles_b==pack_cols and col_safe (the group is written as one unit, so it cannot
-        # be OOB-clamped per column).
+        # pack_cols (0=off, 2): the caller has permuted its B feed so a lane's two
+        # n-fragments are ADJACENT output columns (2*(lane%16)+t) instead of 16 apart, so one
+        # buffer_store carries both and the f32->out_ty converts pack into v_cvt_pk_bf16_f32.
+        # A row's coalesced run grows 32B -> 64B. Needs n_tiles_b==2 and col_safe (the pair
+        # is written as one unit, so it cannot be OOB-clamped per column).
         self.pack_cols = int(pack_cols)
-        assert self.pack_cols in (0, 2, 4)
-        assert not pack_cols or (n_tiles_b == self.pack_cols and col_safe), (
-            "pack_cols needs n_tiles_b==pack_cols + col_safe"
-        )
+        assert self.pack_cols in (0, 2)
+        assert not pack_cols or (n_tiles_b == 2 and col_safe), "pack_cols needs n_tiles_b==2 + col_safe"
         # trans: transposed scalar store for the A/B-swapped wgrad swap_n boundary body (frag row=N, col=M, written C[m,n]); square OUT_M==OUT_N tiles only.
         self.trans = trans
         self.store_aux = store_aux
@@ -766,9 +753,7 @@ class StoreCPerTensor:
         # One packed store per quadrant: the quadrants stay apart (their column delta rides
         # the buffer immediate) and the pair inside one is the n-fragment order tj.
         if const_expr(self.pack_cols):
-            _groups = [
-                [(q, tj) for tj in range_constexpr(self.n_tiles_b)] for q in range_constexpr(len(quads))
-            ]
+            _groups = [[(q, tj) for tj in range_constexpr(self.n_tiles_b)] for q in range_constexpr(len(quads))]
         else:
             _groups = []
         for ti in range_constexpr(self.n_tiles_a):
@@ -781,7 +766,6 @@ class StoreCPerTensor:
                 ]
                 for _, f in quads
             ]
-            pend = []
             for i in range_constexpr(4):
                 row_off = ((row_local + i) * self.c_cols + col0) * 2  # i32-small within band
                 if const_expr(self.pack_cols):
@@ -794,14 +778,13 @@ class StoreCPerTensor:
                                 v = self.elem_fn(v)
                             vals.append(v.to(self.out_ty))
                         dcol = quads[_groups[g][0][0]][0]
-                        pend.append(
-                            (
-                                row_off if dcol == 0 else row_off + dcol * 2,
-                                Vec.from_elements(vals, self.out_ty),
-                            )
+                        _buffer_ops.buffer_store(
+                            Vec.from_elements(vals, self.out_ty),
+                            rsrc,
+                            row_off if dcol == 0 else row_off + dcol * 2,
+                            cache_modifier=self.store_aux,
+                            offset_is_bytes=True,
                         )
-                        if not self.pipe_store:
-                            self._flush(rsrc, pend)
                     continue
                 for q in range_constexpr(len(quads)):
                     for tj in range_constexpr(self.n_tiles_b):
@@ -819,18 +802,6 @@ class StoreCPerTensor:
                             cache_modifier=self.store_aux,
                             offset_is_bytes=True,
                         )
-            if pend:
-                # The converts of a whole row group first, then its stores. Without the
-                # fence the scheduler sinks each convert onto its own store and reuses one
-                # temp, so the chain is serial; a convert also retires two accumulators, so
-                # batching lowers peak pressure rather than raising it.
-                rocdl.sched_barrier(0)
-                self._flush(rsrc, pend)
-
-    def _flush(self, rsrc, pend):
-        for off, val in pend:
-            _buffer_ops.buffer_store(val, rsrc, off, cache_modifier=self.store_aux, offset_is_bytes=True)
-        del pend[:]
 
     def _store_trans(self, c_frag, base_row, base_col, scale):
         """Transposed twin of store() for the A/B-swapped wgrad boundary body. c_frag holds
@@ -1451,10 +1422,7 @@ def _emit_lds_repack(
     pack=1,
     kbound=None,
     k128p=None,
-    b_pair=0,
-    pitch=None,
-    phase=0,
-    lds_off=0,
+    b_pair=False,
 ):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
@@ -1462,21 +1430,11 @@ def _emit_lds_repack(
     # ceildiv(K128,pack)) is the output k-stride: the variable-K wgrad passes a
     # group-local k0 with the group's own bound and the shared packed stride, so every
     # group packs from its own contraction start (rd_base/wr_base carry its raw/packed base).
-    # pitch (default KT = dense rows) is the staged row stride in dwords. The packed store
-    # reads 16 rows KT apart at a fixed k, so a 16-multiple KT puts all 16 on two to four
-    # of the 64 LDS banks; an odd pitch spreads them over 16 banks. The caller sizes its
-    # LDS tile as 64*pitch and pays (pitch-KT)*64 dwords for it.
-    # phase (default 0 = stage, barrier and store in one call) splits the body so a caller
-    # can stage several tiles under a single barrier: 1 = raw->LDS only (no barrier),
-    # 2 = LDS->packed only (the caller owns the barrier between the two). lds_off (default 0)
-    # is this call's slab base inside a caller-shared staging array, in dwords.
     NT = 4
-    P = KT if pitch is None else pitch
     TILE = 64 * KT
     assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
-    assert P >= KT
     KBND = K128 if kbound is None else kbound
-    for i in range_constexpr(0 if phase == 2 else TILE // BLK):
+    for i in range_constexpr(TILE // BLK):
         idx = tid + i * BLK
         rr = idx // KT
         kk = idx % KT
@@ -1486,14 +1444,9 @@ def _emit_lds_repack(
         else:
             s = rr // 16  # B-comb: row = nblk*256 + wn*32 + OFF[s] + rinner
             if b_pair:
-                # b_pair: the reader's n-operand is fed pack-major at width b_pair (see
-                # pair_major_row), so fragment s of lane rinner takes the scale of column
-                # b_pair*rinner + s inside the wave's 16*b_pair-wide span. One wave spans
-                # b_pair//2 of these 32-column groups (a group holds 2 fragments per pool),
-                # so past width 2 a group's own 32-column base folds back into that span.
-                off = (grp % 4) * 32 + (s // 2) * fx.Int32(128) + (rr % 16) * b_pair + (s % 2)
-                if const_expr(b_pair > 2):
-                    off = off - (grp % (b_pair // 2)) * 30
+                # b_pair: the reader's n-operand is fed pair-major (see pair_major_row), so
+                # fragment s of lane rinner takes the scale of row 128*(s//2) + 2*rinner + s%2.
+                off = (grp % 4) * 32 + (s // 2) * fx.Int32(128) + (rr % 16) * 2 + (s % 2)
             else:
                 off = (grp % 4) * 32 + (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128) + (rr % 16)
             grow = (grp // 4) * 256 + off
@@ -1504,22 +1457,17 @@ def _emit_lds_repack(
             dtype=T.i32,
             mask=(gk < KBND) & (grow < dim),
         )
-        si = rr * P + kk if P != KT else idx
-        if lds_off:
-            si = si + lds_off
-        fx.make_view(
-            fx.add_offset(tile.ptr, fx.make_int_tuple(si)),
-            fx.make_layout(1, 1),
-        ).store(Vec.from_elements([fx.Int32(dw)], fx.Int32))
-    if phase == 0:
-        _lds_barrier()
+        fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
+            Vec.from_elements([fx.Int32(dw)], fx.Int32)
+        )
+    _lds_barrier()
     # Packed store: pack PACK consecutive K-iters into one output dword per lane (the
     # reader mirrors this via kk=k//PACK + MFMA op_sel). PACK=1 = unpacked.
     PACK = pack
     K128p = ceildiv(K128, PACK) if k128p is None else k128p
     NGP = KT // PACK  # packed groups produced per KT-chunk
     NOUTp = NGP * 64
-    for j in range_constexpr(0 if phase == 1 else NOUTp // BLK):
+    for j in range_constexpr(NOUTp // BLK):
         ol = tid + j * BLK
         kkp = ol // 64
         lane = ol % 64
@@ -1530,9 +1478,7 @@ def _emit_lds_repack(
         for s in range_constexpr(NT):
             packed = fx.Int32(0)
             for bb in range_constexpr(PACK):
-                so = (s * 16 + r) * P + (kkp * PACK + bb)
-                if lds_off:
-                    so = so + lds_off
+                so = (s * 16 + r) * KT + (kkp * PACK + bb)
                 val = Vec(
                     fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(so)), fx.make_layout(1, 1)).load()
                 )
