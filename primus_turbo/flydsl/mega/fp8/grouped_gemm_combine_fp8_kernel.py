@@ -70,11 +70,11 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
 from primus_turbo.flydsl.mega.prims import cast, read_clock, spin_timed_out
-from primus_turbo.flydsl.utils.gemm_helper import emit_if_then, make_value_attrs, run_compiled
+from primus_turbo.flydsl.utils.gemm_helper import emit_if_then, run_compiled
 
-# GEMM launch attrs (nt_vmcnt / waves_per_eu); included in flyc compile cache key below.
+# s_waitcnt vmcnt bound for the GEMM main loop; changes the emitted kernel, so it is in the flyc
+# compile cache key below.
 _COMBINE_NT_VMCNT = 3
-_COMBINE_WAVES_PER_EU = 2
 # The GEMM role is one workgroup per tile, tiles mapped row-major, and the grid carries one block
 # per REAL tile (plus the tail-reduce reservation) rather than the pool's worst case. Three
 # alternatives were plumbed through here and none earned its keep: a persistent grid (a fixed CU
@@ -84,11 +84,6 @@ _COMBINE_WAVES_PER_EU = 2
 # (num_xcd=1, group_m=group_n=0) it computed exactly the row-major mapping anyway; and the
 # worst-case grid only added blocks that exit on arrival. Bring any of them back per-shape if a
 # measurement asks.
-_REDUCE_VW = 4  # top-k reduce payload load width in i32 words per lane (4 -> b128)
-# Cap on the empty blocks running the reduce. Matches the bf16 combine's default; the empty
-# region is far smaller than this in practice, so the cap does not bind and every empty block
-# joins in.
-_COMBINE_REDUCE_CAP = 256
 
 
 def wait_lgkmcnt(n):
@@ -314,12 +309,11 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
     H4 = hidden // 4
     payload_i32_total = combine_slots * H4
     SC = hidden // 128
-    # A lane loads VW consecutive payload words as one b128, matching the PUSH path. Words are
-    # 4-aligned, so a group of 4 stays inside one E8M0 32-block and one scale word plus one shift
-    # serves all 4 (``sword_idx`` / ``shift`` below); a narrower VW would need per-word scale
-    # indexing. Divides because the fp8 push requires hidden % 1024 == 0 -- asserted here too, since
-    # this file does not otherwise state the constraint it depends on.
-    VW = _REDUCE_VW
+    # Payload words per lane: 4 of them are one b128, matching the PUSH path, and stay inside one
+    # E8M0 32-block so a single scale word and shift serve all 4 (``sword_idx`` / ``shift`` below).
+    # Divides because the fp8 push requires hidden % 1024 == 0, asserted here since this file does
+    # not otherwise state the constraint it depends on.
+    VW = 4
     assert H4 % (_WARP * VW) == 0, f"fp8 reduce needs hidden % 1024 == 0, got hidden={hidden}"
     steps_per_lane = H4 // (_WARP * VW)
 
@@ -420,7 +414,7 @@ _FP8_COMBINE_COMPILED: dict = {}
 def _compile(
     out_features, hidden_size, num_max_pool_tokens, BLOCK_M, BLOCK_N, num_combine_cu, num_reduce_cu,
     combine_slots, topk, num_experts, rank, num_ranks, apply_weights, with_gate,
-    num_groups=0, nt_vmcnt=_COMBINE_NT_VMCNT, waves_per_eu=_COMBINE_WAVES_PER_EU, agpr_alloc=0,
+    num_groups=0, nt_vmcnt=_COMBINE_NT_VMCNT,
     num_gemm_cu=None,
 ):
     """Unified fp8 combine: mxfp8 GEMM (CShuffle mxfp8-quant epilogue -> local fp8 pool) + FP8 combine
@@ -436,12 +430,15 @@ def _compile(
       ``num_combine_cu``  blocks running the cross-rank PUSH.
       ``num_reduce_cu``   cap on how many of the grid's EMPTY blocks run the reduce, the rest exiting
                           on arrival; they stride over the empty tiles, so the cap only binds when
-                          the pool is nearly full. 0 removes the role. Same meaning as the bf16
-                          combine's argument of that name -- there is no separate reduce region in
-                          the grid, here or there.
+                          the pool is nearly full, which the shipped 256 never does. 0 removes the
+                          role. Same meaning and default as the bf16 combine's argument of that name
+                          -- there is no separate reduce region in the grid, here or there.
       ``num_gemm_cu``     None runs one workgroup per real tile, which is the only production shape:
-                          the block count follows the routing, so it is derived, not tuned. 0 removes
-                          the role. A positive count would mean a persistent grid, deleted as slower.
+                          the block count follows the routing, so it is derived, not tuned. 0 keeps
+                          those blocks and their done-flag release but drops the tile's compute, so
+                          the PUSH still sees the protocol it always sees -- no role has to know
+                          another is absent. A positive count would mean a persistent grid, deleted
+                          as slower.
 
     Because the reduce rides the empty blocks rather than a reserved region, the grid is
     ``num_combine_cu + worst_case_tiles * n_blocks`` whatever the routing does -- so no launch ever
@@ -563,76 +560,61 @@ def _compile(
             local_count = (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
             for tile_iter in range(local_count):
                 block_m = block_index + tile_iter * combine_cu
-                # No GEMM role means no one ever sets the GEMM-done flag, so waiting on it would hang:
-                # the PUSH then ships whatever the local L2Y already holds (incorrect, timing only).
-                if not _no_gemm:
-                    if thread_index == fx.Int32(0):
-                        spin_start = read_clock()
-                        flag_base = combine_bank + block_m * n_blocks_i32
-                        waiting = fx.Int32(1)
-                        while waiting != fx.Int32(0):
-                            ready = fx.Int32(0)
-                            for bn in range_constexpr(n_blocks):
-                                sig = ld(
-                                    combine_flag_base, flag_base + fx.Int32(bn),
-                                    scope="agent", dtype=fx.T.i64(),
+                if thread_index == fx.Int32(0):
+                    spin_start = read_clock()
+                    flag_base = combine_bank + block_m * n_blocks_i32
+                    waiting = fx.Int32(1)
+                    while waiting != fx.Int32(0):
+                        ready = fx.Int32(0)
+                        for bn in range_constexpr(n_blocks):
+                            sig = ld(
+                                combine_flag_base, flag_base + fx.Int32(bn),
+                                scope="agent", dtype=fx.T.i64(),
+                            )
+                            if sig == expected_combine:
+                                ready = ready + fx.Int32(1)
+                        if ready == n_blocks_i32:
+                            waiting = fx.Int32(0)
+                        else:
+                            fx.rocdl.s_sleep(fx.Int32(2))
+                            if spin_timed_out(spin_start):
+                                fx.printf(
+                                    "MEGA fp8 ep combine gate timeout: block={} ready={}\n",
+                                    block_m, ready,
                                 )
-                                if sig == expected_combine:
-                                    ready = ready + fx.Int32(1)
-                            if ready == n_blocks_i32:
-                                waiting = fx.Int32(0)
-                            else:
-                                fx.rocdl.s_sleep(fx.Int32(2))
-                                if spin_timed_out(spin_start):
-                                    fx.printf(
-                                        "MEGA fp8 ep combine gate timeout: block={} ready={}\n",
-                                        block_m, ready,
-                                    )
-                                    spin_start = read_clock()
-                    fx.gpu.barrier()
-                    l2_invalidate()
+                                spin_start = read_clock()
+                fx.gpu.barrier()
+                l2_invalidate()
                 push_block(block_m)
             fx.rocdl.s_waitcnt(0)
         else:
 
             def _do_gemm_tile(block_m, block_n):
-                c_m_const = fx.Int32(num_max_pool_tokens)
-                group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
-                n_tiles_a = BLOCK_M // 64
-                n_tiles_b = BLOCK_N // 128
-                c_idx_fn = lambda i, j: i * n_tiles_b + j
-                store_c = StoreCQuantMxfp8CShuffle(
-                    L2Y_FP8, L2Y_SCALE, c_m_const, out_features,
-                    c_idx_fn, n_tiles_a, n_tiles_b,
-                    fx.BFloat16, lds.C_lds_shuffle, thread_index // fx.Int32(64),
-                )
-                emit_gemm_mxfp8_nt_tile(
-                    ACT, A_SCALE, WEIGHTS, B_SCALE, lds, block_m, block_n,
-                    K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, G=num_groups, group_idx=group_index,
-                    c_m=c_m_const, c_n=c_n, nt_vmcnt=nt_vmcnt, scale_pack=4,
-                    store_c=store_c,
-                )
-                # GEMM-done release. The second rendezvous is NOT extra ordering and must not be read
-                # as such: diffing the emitted ISA with and without it shows the two builds identical
-                # apart from these two instructions, and after the first `s_waitcnt(0)` vmcnt is
-                # already 0 with no memory op between, so it has nothing to wait for and no wave left
-                # to sync. What it buys is time. Without it the PUSH ships L2Y bytes this call's GEMM
-                # has not written yet -- ~800 of 8192 output tokens per rank against the poison
-                # amplifier in repro_fp8_combine_gate.py, torn at 32-column granularity inside tiles
-                # rather than whole tiles missing, which is a propagation race, not a missing gate.
-                # The `s_waitcnt` between the barriers is load-bearing: LLVM folds adjacent
-                # `s_barrier`s.
-                #
-                # So this is a timing workaround for a gap in the release, not a fix for it, and it
-                # could reopen under a different compiler or schedule. Ruled out by measurement, so
-                # nobody repeats them: `buffer_wbl2` sc1 / sc0|sc1 on the release (worse, ~1100),
-                # dropping sc1 from the C stores and releasing with wbl2 (worse still, ~1400),
-                # `gpu.barrier` in place of the bare `s_barrier` (no change), sc0|sc1 on the C stores,
-                # sc1 on the PUSH's L2Y loads, dropping the PUSH's `buffer_inv`, sys-scope flag
-                # traffic, and an `s_waitcnt` before every flag read. Untried: making the flag store a
-                # release atomic rather than a plain sc1 store.
+                # num_gemm_cu=0 drops the tile's compute, not the tile: the release and the done flag
+                # still happen, so the PUSH sees the protocol it always sees and nobody downstream
+                # has to know this build computed nothing.
+                if const_expr(not _no_gemm):
+                    c_m_const = fx.Int32(num_max_pool_tokens)
+                    group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                    n_tiles_a = BLOCK_M // 64
+                    n_tiles_b = BLOCK_N // 128
+                    c_idx_fn = lambda i, j: i * n_tiles_b + j
+                    store_c = StoreCQuantMxfp8CShuffle(
+                        L2Y_FP8, L2Y_SCALE, c_m_const, out_features,
+                        c_idx_fn, n_tiles_a, n_tiles_b,
+                        fx.BFloat16, lds.C_lds_shuffle, thread_index // fx.Int32(64),
+                    )
+                    emit_gemm_mxfp8_nt_tile(
+                        ACT, A_SCALE, WEIGHTS, B_SCALE, lds, block_m, block_n,
+                        K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, G=num_groups, group_idx=group_index,
+                        c_m=c_m_const, c_n=c_n, nt_vmcnt=nt_vmcnt, scale_pack=4,
+                        store_c=store_c,
+                    )
+                # GEMM-done release. Two rendezvous are required, and the second buys time rather
+                # than ordering -- a timing workaround, not a fix; see repro_fp8_combine_gate.py.
                 fx.rocdl.s_waitcnt(0)
                 rocdl.s_barrier()
+                # Keep a separator: LLVM folds adjacent barriers.
                 fx.rocdl.s_waitcnt(0)
                 rocdl.s_barrier()
                 flag_off = combine_bank + block_m * n_blocks_i32 + block_n
@@ -647,10 +629,7 @@ def _compile(
             role_idx = block_index - fx.Int32(gemm_base)
             real_gemm_blocks = real_tiles * fx.Int32(n_blocks)
             if role_idx < real_gemm_blocks:
-                block_m = role_idx // fx.Int32(n_blocks)
-                block_n = role_idx % fx.Int32(n_blocks)
-                if not _no_gemm:
-                    _do_gemm_tile(block_m, block_n)
+                _do_gemm_tile(role_idx // fx.Int32(n_blocks), role_idx % fx.Int32(n_blocks))
             elif const_expr(num_reduce_cu > 0):
                 empty_ordinal = role_idx - real_gemm_blocks
                 if empty_ordinal < fx.Int32(num_reduce_cu):
@@ -690,7 +669,6 @@ def _compile(
             NUM_TOKENS_PER_RANK, TOPK_WEIGHTS, GRAD_GATE, D_TOPK_W, A_SCALE, B_SCALE,
             ORIGIN_RANK, ORIGIN_SLOT,
             COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED, sym_layout, c_n,
-            value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch
@@ -772,14 +750,14 @@ def _combine_launch(
     )
     ck = (c.out_features, c.K, c.M, BM, BN, int(combine_cu), int(num_reduce_cu), num_gemm_cu,
           c.combine_slots, c.topk, c.num_experts, c.rank, c.num_ranks, c.G,
-          apply_weights, with_gate, _COMBINE_NT_VMCNT, _COMBINE_WAVES_PER_EU)
+          apply_weights, with_gate, _COMBINE_NT_VMCNT)
     run_compiled(_FP8_COMBINE_COMPILED, ck, launch, *args)
     return output
 
 
 def combine_l2_fwd_mxfp8_flydsl_kernel(
     weights_fp8, handle, *, topk_indices, topk_weights, x_fp8, BM=256, BN=256,
-    num_combine_cu=32, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
+    num_combine_cu=32, num_reduce_cu=256, num_gemm_cu=None,
 ):
     """Forward L2: ``act @ w2`` (K=I) + fp8 combine PUSH + WEIGHTED top-k reduce -> ``y`` [T, H] bf16.
 
@@ -791,8 +769,8 @@ def combine_l2_fwd_mxfp8_flydsl_kernel(
     caching here. The combine_flag / reduce_flag epoch gates are double-banked and bumped on device,
     so there is no host flag reset or rendezvous.
 
-    ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 removes one, which
-    is how the benches isolate a stage. See ``_compile`` for what each means."""
+    ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 drops one's work,
+    which is how the benches isolate a stage. See ``_compile`` for what each means."""
     c = _combine_ctx(handle, x_fp8)
     return _combine_launch(
         c, weights_fp8, topk_indices=topk_indices,
@@ -805,7 +783,7 @@ def combine_l2_fwd_mxfp8_flydsl_kernel(
 
 def combine_l1_dgrad_mxfp8_flydsl_kernel(
     weights_fp8, handle, *, topk_indices, grad_gate, x_fp8_rowwise, BM=256, BN=256,
-    num_combine_cu=24, num_reduce_cu=_COMBINE_REDUCE_CAP, num_gemm_cu=None,
+    num_combine_cu=24, num_reduce_cu=256, num_gemm_cu=None,
 ):
     """Backward L1 dgrad: ``grad_l1 @ w1^T`` (K=2I) + fp8 combine PUSH + gate scatter + UNWEIGHTED
     top-k reduce -> ``(dx [T, H] bf16, d_topk_w [combine_slots] f32)``.
@@ -819,8 +797,8 @@ def combine_l1_dgrad_mxfp8_flydsl_kernel(
     combine_flag / reduce_flag epoch gates are double-banked and bumped on device, so there is no host
     flag reset or rendezvous.
 
-    ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 removes one, which
-    is how the benches isolate a stage. See ``_compile`` for what each means."""
+    ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 drops one's work,
+    which is how the benches isolate a stage. See ``_compile`` for what each means."""
     c = _combine_ctx(handle, x_fp8_rowwise)
     d_topk_w = torch.empty(c.combine_slots, dtype=torch.float32, device=c.dev)
     dx = _combine_launch(
