@@ -380,21 +380,24 @@ class Mfma16x16x128:
 #    scales are pre-shuffled by the quant / FlyDSL preshuffle.
 
 
-def _asm_mma_scale_do(a, b, c, sa, sb, opsel, cbsz=0, blgp=0):
+def _asm_mma_scale_do(a, b, c, sa, sb, opsel, cbsz=0, blgp=0, acc="v"):
     """Inline-asm scaled MFMA v_mfma_scale_f32_16x16x128_f8f6f4. =&v early-clobber
     forces dst disjoint from srcA/srcB; opaque to the backend so it co-schedules with
     the asm ds_read_b64_tr_b8 loads. opsel (0..3) picks the packed E8M0 byte via
     op_sel (low bit) / op_sel_hi (high bit). cbsz/blgp select srcA/srcB fp8 format
-    (0=E4M3, 1=E5M2)."""
+    (0=E4M3, 1=E5M2). ``acc="a"`` ties the accumulator to the AGPR file instead: at
+    1 wave/SIMD that is a second 256-register pool, so a 256-register accumulator
+    costs no arch VGPR (srcA/srcB/scales stay in VGPRs)."""
     v4f32 = ir.VectorType.get([4], ir.F32Type.get())
     lo = opsel & 1
     hi = (opsel >> 1) & 1
     osel = f"op_sel:[{lo},{lo},0] op_sel_hi:[{hi},{hi},0]"
-    cons = "=&v,v,v,0,v,v"  # VGPR early-clobber accumulator
+    cons = "=a,v,v,0,v,v" if acc == "a" else "=&v,v,v,0,v,v"
     op = _llvm.InlineAsmOp(
         res=v4f32,
         operands_=[_raw(a), _raw(b), _raw(c), _raw(sa), _raw(sb)],
-        asm_string=f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 cbsz:{cbsz} blgp:{blgp} {osel}",
+        # modifier order is fixed by the assembler: op_sel, op_sel_hi, cbsz, blgp
+        asm_string=f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 {osel} cbsz:{cbsz} blgp:{blgp}",
         constraints=cons,
         has_side_effects=False,
     )
@@ -408,14 +411,16 @@ class MfmaScale16x16x128:
     the (scale_a, scale_b) i32 operands can be supplied per call.
     """
 
-    def __init__(self, n_tiles_a, n_tiles_b, asm_mma=False, cbsz=0, blgp=0):
+    def __init__(self, n_tiles_a, n_tiles_b, asm_mma=False, cbsz=0, blgp=0, acc_agpr=False):
         self.res_ty = Vec.make_type(4, fx.Float32)
         self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         # opsel picks the packed dword's E8M0 byte (k%PACK); pack==1 -> stays 0.
         self.opsel = 0
-        self.asm_mma = asm_mma
+        # acc_agpr pins the accumulator to the AGPR file, which needs the asm form.
+        self.asm_mma = asm_mma or acc_agpr
+        self.acc = "a" if acc_agpr else "v"
         self.cbsz = cbsz  # srcA fp8 format: 0=E4M3, 1=E5M2
         self.blgp = blgp  # srcB fp8 format: 0=E4M3, 1=E5M2
 
@@ -425,7 +430,7 @@ class MfmaScale16x16x128:
     def _do_mma(self, a, b, c, sa, sb):
         # operand order: a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b
         if self.asm_mma:  # inline-asm scaled MFMA (co-schedules with asm tr8 loads)
-            return _asm_mma_scale_do(a, b, c, sa, sb, self.opsel, self.cbsz, self.blgp)
+            return _asm_mma_scale_do(a, b, c, sa, sb, self.opsel, self.cbsz, self.blgp, self.acc)
         return rocdl.mfma_scale_f32_16x16x128_f8f6f4(
             self.res_ty,
             [a, b, c, self.cbsz, self.blgp, self.opsel, sa, self.opsel, sb],
