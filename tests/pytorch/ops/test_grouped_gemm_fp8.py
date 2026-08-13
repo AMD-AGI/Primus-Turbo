@@ -1335,15 +1335,9 @@ def _run_grouped_gemm_fp8_fused_grad_accum_test(
 
 
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize(
-    "granularity, trans_b",
-    [
-        (ScalingGranularity.TENSORWISE, True),
-        (ScalingGranularity.TENSORWISE, False),
-    ],
-)
+@pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT, BackendType.FLYDSL])
-def test_grouped_gemm_fp8_fused_grad_accum(ori_dtype, granularity, trans_b, backend):
+def test_grouped_gemm_fp8_tensorwise_fused_grad_accum(ori_dtype, trans_b, backend):
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
     # FlyDSL's accumulate epilogue stores 16-bit, so it only takes a main_grad matching
@@ -1355,8 +1349,28 @@ def test_grouped_gemm_fp8_fused_grad_accum(ori_dtype, granularity, trans_b, back
         N=512,
         K=256,
         ori_dtype=ori_dtype,
-        granularity=granularity,
+        granularity=ScalingGranularity.TENSORWISE,
         trans_b=trans_b,
+        backend=backend,
+        main_grad_dtype=main_grad_dtype,
+    )
+
+
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.FLYDSL])
+def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend):
+    """MXFP8 grouped GEMM is NT-only, so trans_b is fixed rather than swept."""
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL MXFP8 grouped GEMM is gfx950-only")
+    main_grad_dtype = ori_dtype if backend == BackendType.FLYDSL else torch.float32
+    _run_grouped_gemm_fp8_fused_grad_accum_test(
+        B=4,
+        M=256,
+        N=512,
+        K=256,
+        ori_dtype=ori_dtype,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        trans_b=True,
         backend=backend,
         main_grad_dtype=main_grad_dtype,
     )

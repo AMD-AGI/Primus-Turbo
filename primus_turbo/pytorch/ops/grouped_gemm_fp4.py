@@ -354,7 +354,9 @@ def grouped_gemm_fp4(
             into the wgrad GEMM epilogue, so backward writes ``b.main_grad``
             directly instead of returning a gradient the framework then adds.
             ``"megatron"`` is the only supported pattern; ``b`` must carry
-            ``main_grad`` / ``grad_added_to_main_grad``. Defaults to None (no fusion).
+            ``main_grad`` / ``grad_added_to_main_grad``. FlyDSL is the only backend
+            with the FP4 accumulate epilogue and its store is 16-bit, so ``main_grad``
+            must be in the weight's own dtype. Defaults to None (no fusion).
 
     Returns:
         Output [total_m, N].
@@ -379,10 +381,6 @@ def grouped_gemm_fp4(
 
     assert a_data.ndim == 2, "a must be 2D [total_m, K]"
     assert b_data.ndim == 3, "b must be 3D [G, N, K]"
-
-    assert fuse_bgrad_accum_pattern is None, (
-        f"fuse_bgrad_accum_pattern is not supported for FP4, got {config.granularity}"
-    )
 
     if config.granularity == ScalingGranularity.MX_BLOCKWISE:
         return FP4GroupedGemmMXFunc.apply(

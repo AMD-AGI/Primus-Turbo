@@ -10,6 +10,7 @@ import torch
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP8_BLOCK_SIZE,
     Float8QuantConfig,
     Format,
     ScaleDtype,
@@ -662,7 +663,17 @@ def test_gemm_fp8_blockwise_triton_deterministic(m, n, k, layout, format, dtype,
 
 
 def _run_gemm_fp8_fused_grad_accum_test(
-    m, n, k, layout, dtype, format, backend, main_grad_dtype=torch.float32
+    m,
+    n,
+    k,
+    layout,
+    dtype,
+    format,
+    backend,
+    main_grad_dtype=torch.float32,
+    granularity=ScalingGranularity.TENSORWISE,
+    block_size=None,
+    scale_dtype=ScaleDtype.FP32,
 ):
     """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
 
@@ -678,7 +689,10 @@ def _run_gemm_fp8_fused_grad_accum_test(
     torch.cuda.manual_seed_all(seed)
 
     device = "cuda:0"
-    print(f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, backend={backend}")
+    print(
+        f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, "
+        f"granularity={granularity}, backend={backend}"
+    )
 
     # A pinned backend exercises that backend's beta=1 accumulate epilogue; ``None``
     # leaves the dispatcher to resolve one, which is how training actually runs.
@@ -690,7 +704,9 @@ def _run_gemm_fp8_fused_grad_accum_test(
     a_shape = (k, m) if trans_a else (m, k)
     b_shape = (n, k) if trans_b else (k, n)
 
-    config = Float8QuantConfig(format=format, granularity=ScalingGranularity.TENSORWISE)
+    config = Float8QuantConfig(
+        format=format, granularity=granularity, block_size=block_size, scale_dtype=scale_dtype
+    )
 
     a = torch.randn(a_shape, dtype=dtype, device=device, requires_grad=True)
     b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
@@ -751,20 +767,11 @@ def _run_gemm_fp8_fused_grad_accum_test(
 @pytest.mark.parametrize("layout", ["NT", "NN", "TN"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT])
-def test_gemm_fp8_fused_grad_accum(layout, dtype, format, backend):
-    _run_gemm_fp8_fused_grad_accum_test(
-        m=256, n=512, k=256, layout=layout, dtype=dtype, format=format, backend=backend
-    )
-
-
-@pytest.mark.parametrize("layout", ["NT", "NN", "TN"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
-def test_gemm_fp8_fused_grad_accum_flydsl(layout, dtype, format):
-    """FlyDSL's beta=1 wgrad epilogue, against a main_grad in the weight's own dtype."""
-    if get_device_compute_capability() < (9, 5):
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT, BackendType.FLYDSL])
+def test_gemm_fp8_tensorwise_fused_grad_accum(layout, dtype, format, backend):
+    if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
+    main_grad_dtype = dtype if backend == BackendType.FLYDSL else torch.float32
     _run_gemm_fp8_fused_grad_accum_test(
         m=256,
         n=512,
@@ -772,6 +779,30 @@ def test_gemm_fp8_fused_grad_accum_flydsl(layout, dtype, format):
         layout=layout,
         dtype=dtype,
         format=format,
-        backend=BackendType.FLYDSL,
-        main_grad_dtype=dtype,
+        backend=backend,
+        main_grad_dtype=main_grad_dtype,
+        granularity=ScalingGranularity.TENSORWISE,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
+@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.FLYDSL])
+def test_gemm_fp8_mx_fused_grad_accum(dtype, format, backend):
+    """MXFP8 is NT-only, so the layout sweep collapses to a single entry."""
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("MXFP8 GEMM is gfx950-only")
+    main_grad_dtype = dtype if backend == BackendType.FLYDSL else torch.float32
+    _run_gemm_fp8_fused_grad_accum_test(
+        m=256,
+        n=512,
+        k=256,
+        layout="NT",
+        dtype=dtype,
+        format=format,
+        backend=backend,
+        main_grad_dtype=main_grad_dtype,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        block_size=MXFP8_BLOCK_SIZE,
+        scale_dtype=ScaleDtype.E8M0,
     )

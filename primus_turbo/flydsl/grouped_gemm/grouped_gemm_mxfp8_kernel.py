@@ -37,10 +37,13 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     _emit_lds_repack,
     _readfirstlane_i32,
     _robust_time,
+    _store_quadrants,
     ceildiv,
+    compile_with_scratch_out,
     compute_global_swizzle,
     make_fp8_buffer_tensor_rebased,
     make_value_attrs,
+    resolve_accum_out,
     wait_barrier,
     xcd_remap_pid,
 )
@@ -69,7 +72,7 @@ def run_eager_or_capture(entry, args, compiled_idx):
         entry[0](*args)
     else:
         if entry[compiled_idx] is None:
-            entry[compiled_idx] = flyc.compile(entry[0], *args)
+            entry[compiled_idx] = compile_with_scratch_out(entry[0], args)
         entry[compiled_idx](*args)
 
 
@@ -1059,6 +1062,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
     blgp: int = 0,
     out_fp16: bool = False,
     chunk: int = 8,
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     """Grouped MXFP8 variable-K wgrad (runtime per-group contraction M_g)."""
     BLOCK_K = 128
@@ -1163,7 +1167,16 @@ def _build_grouped_mxfp8_wgrad_kernel(
             sa_s2r = ScaleS2R(A_scale, OUT_M, m_total, SA_TILES, pack=1)  # wgrad: unpacked scales
             sb_s2r = ScaleBComb(B_scale, OUT_N, m_total, pack=1)
             store_c = StoreCPerTensor(
-                None, None, C, (group_idx + 1) * OUT_M, OUT_N, mfma.idx, N_TILES_A, N_TILES_B, _out_ty
+                None,
+                None,
+                C,
+                (group_idx + 1) * OUT_M,
+                OUT_N,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
+                _out_ty,
+                beta_is_one=beta_is_one,
             )
 
             wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -1282,10 +1295,17 @@ def _build_grouped_mxfp8_wgrad_kernel(
             c01_frag = [Vec(fx.memref_load_vec(r)) for r in acc01]
             c10_frag = [Vec(fx.memref_load_vec(r)) for r in acc10]
             c11_frag = [Vec(fx.memref_load_vec(r)) for r in acc11]
-            store_c.store(c00_frag, base_row + 0, base_col + 0)
-            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+            _store_quadrants(
+                store_c,
+                c00_frag,
+                c01_frag,
+                c10_frag,
+                c11_frag,
+                base_row,
+                base_col,
+                LDS_BLOCK_M,
+                LDS_BLOCK_N,
+            )
 
         _do_tile(pid)
 
@@ -1294,12 +1314,14 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
 # ── wgrad host wrapper ───────────────────────────────────────────────────────
 
-_GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16) -> launch
+_GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch
 _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
-_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16) -> [raw, compiled]
+_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16, beta1) -> [raw, compiled]
 
 
-def _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16):
+def _compile_grouped_mxfp8_wgrad_fused(
+    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one=False
+):
     pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N)
     gemm_kern, BM, BN, wpe, TOTAL = _build_grouped_mxfp8_wgrad_kernel(
         OUT_M=OUT_M,
@@ -1313,6 +1335,7 @@ def _compile_grouped_mxfp8_wgrad_fused(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbs
         cbsz=cbsz,
         blgp=blgp,
         out_fp16=out_fp16,
+        beta_is_one=beta_is_one,
     )
 
     @flyc.jit
@@ -1374,8 +1397,14 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     G: int,
     out_dtype: torch.dtype = torch.bfloat16,
     num_cu: "int | None" = -1,
+    beta: float = 0.0,
+    out: "torch.Tensor | None" = None,
 ) -> "torch.Tensor":
-    """FlyDSL MXFP8 grouped variable-K wgrad. Returns C [G, OUT_M, OUT_N]."""
+    """FlyDSL MXFP8 grouped variable-K wgrad. Returns C [G, OUT_M, OUT_N].
+
+    ``beta=1.0`` accumulates into ``out`` (``out[g] += lhs[:,g] @ rhs[:,g]^T``) in the
+    epilogue instead of overwriting it, and therefore requires ``out``.
+    """
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == OUT_M and rhs.shape[0] == OUT_N
     M_total = lhs.shape[1]
@@ -1390,7 +1419,8 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     b_raw = (rhs_scale if rhs_scale.is_contiguous() else rhs_scale.contiguous()).view(torch.int32).reshape(-1)
     a8 = lhs.contiguous().view(torch.int8)
     b8 = rhs.contiguous().view(torch.int8)
-    out = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=lhs.device)
+    out = resolve_accum_out(out, beta, (G, OUT_M, OUT_N), lhs.device, out_dtype)
+    beta_is_one = beta == 1.0
 
     _go = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
     go = _go.view(torch.int32)
@@ -1406,16 +1436,16 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
 
     bm, bn, gm, xcd, gn = 256, 256, 4, 8, 0
     # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
-    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16)
+    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
     launch = _GWG_FUSED_CACHE.get(fk)
     if launch is None:
         launch = _compile_grouped_mxfp8_wgrad_fused(
-            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16
+            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one
         )
         _GWG_FUSED_CACHE[fk] = launch
 
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
-    at_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16)
+    at_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16, beta_is_one)
     entry = _GWG_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]

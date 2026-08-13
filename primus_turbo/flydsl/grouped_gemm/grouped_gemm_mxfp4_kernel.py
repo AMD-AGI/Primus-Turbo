@@ -39,6 +39,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     _robust_time,
     ceildiv,
     make_fp8_rebased_tensor_and_srd,
+    resolve_accum_out,
     wait_barrier,
     xcd_remap_pid,
 )
@@ -724,7 +725,17 @@ def grouped_gemm_mxfp4_flydsl_kernel(
 
 
 def _build_grouped_mxfp4_wgrad_kernel(
-    OUT_M, OUT_N, G, M_total, group_m=4, num_xcds=8, group_n=0, wlv=10, elgk=9, out_fp16=False
+    OUT_M,
+    OUT_N,
+    G,
+    M_total,
+    group_m=4,
+    num_xcds=8,
+    group_n=0,
+    wlv=10,
+    elgk=9,
+    out_fp16=False,
+    beta_is_one=False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     BLOCK_M = BLOCK_N = BLOCK_K = _BLOCK
     swizzle = True
@@ -938,7 +949,14 @@ def _build_grouped_mxfp4_wgrad_kernel(
         base_col_r = b_row + I32(LDS_BN_HALF) + I32(wave_n_off)
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
         store_c = StoreCPlain(
-            C, (group_idx + I32(1)) * I32(OUT_M), OUT_N, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty
+            C,
+            (group_idx + I32(1)) * I32(OUT_M),
+            OUT_N,
+            mfma.idx,
+            N_TILES_A,
+            N_TILES_BH,
+            _out_ty,
+            beta_is_one=beta_is_one,
         )
         store_c.store(accL, base_row, base_col_l, n_valid=_NV)
         store_c.store(accR, base_row, base_col_r, n_valid=_NV)
@@ -950,7 +968,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
 
 _GMXFP4_WGRAD_LAUNCH_CACHE: dict = {}
 _GMXFP4_WGRAD_WS_CACHE: dict = {}
-_GMXFP4_WGRAD_AT_CACHE: dict = {}  # (OUT_M_p, OUT_N_p, M_alloc, G, out_fp16) -> [raw, compiled]
+_GMXFP4_WGRAD_AT_CACHE: dict = {}  # (OUT_M_p, OUT_N_p, M_alloc, G, out_fp16, beta1) -> [raw, compiled]
 
 
 def _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, device):
@@ -966,11 +984,23 @@ def _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, device):
     return e
 
 
-def _compile_grouped_mxfp4_wgrad_fused(OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16):
+def _compile_grouped_mxfp4_wgrad_fused(
+    OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16, beta_is_one=False
+):
     K128m = M_total // 128
     pre_ab = _build_mxfp4_preshuffle_kernel_ab()
     gemm_k, attrs, TOTAL = _build_grouped_mxfp4_wgrad_kernel(
-        OUT_M, OUT_N, G, M_total, group_m=gm, num_xcds=xcd, group_n=gn, wlv=wlv, elgk=elgk, out_fp16=out_fp16
+        OUT_M,
+        OUT_N,
+        G,
+        M_total,
+        group_m=gm,
+        num_xcds=xcd,
+        group_n=gn,
+        wlv=wlv,
+        elgk=elgk,
+        out_fp16=out_fp16,
+        beta_is_one=beta_is_one,
     )
     _PGRID = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_BLK
 
@@ -999,14 +1029,28 @@ def _compile_grouped_mxfp4_wgrad_fused(OUT_M, OUT_N, G, M_total, gm, xcd, gn, wl
 
 
 def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
-    lhs, lhs_scale, rhs, rhs_scale, group_offs, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=-1
+    lhs,
+    lhs_scale,
+    rhs,
+    rhs_scale,
+    group_offs,
+    OUT_M,
+    OUT_N,
+    G,
+    out_dtype=torch.bfloat16,
+    num_cu=-1,
+    beta=0.0,
+    out=None,
 ):
     """FlyDSL MXFP4 grouped variable-K wgrad (bare-asm whole-loop). lhs [OUT_M, M/2] /
     rhs [OUT_N, M/2] fp4 in the FlyDSL-quant colwise layout (each group's M already
     512-aligned), group_offs [G+1] the matching 512-padded per-group M offsets. Runs the
     NT whole-loop with a runtime nval directly -- no on-GPU repack, no free-dim pad (the
     non-256 OUT_M rows are SRD-dropped, OUT_N cols masked in the store). Returns
-    C [G, OUT_M, OUT_N]."""
+    C [G, OUT_M, OUT_N].
+
+    ``beta=1.0`` accumulates into ``out`` (``out[g] += lhs[:,g] @ rhs[:,g]^T``) in the
+    epilogue instead of overwriting it, and therefore requires ``out``."""
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == OUT_M and rhs.shape[0] == OUT_N
     M_total = lhs.shape[1] * 2  # colwise contraction width (512-padded per group by the quant)
@@ -1027,7 +1071,8 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     a_sp, b_sp = _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, dev)
     # 3D C (NOT flattened): StoreCPlain re-bases per row band from C's base + OUT_N; a 1D
     # G*OUT_M*OUT_N view overflows the CABI for large-G MoE grad_b (> 2^31 elems).
-    out = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=dev)
+    out = resolve_accum_out(out, beta, (G, OUT_M, OUT_N), dev, out_dtype)
+    beta_is_one = beta == 1.0
 
     stream = torch.cuda.current_stream()
     wlv, elgk = 10, 9
@@ -1035,14 +1080,14 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
 
     def _entry(cfg):
         gm, xcd, gn = cfg
-        lk = (OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16)
+        lk = (OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16, beta_is_one)
         ent = _GMXFP4_WGRAD_LAUNCH_CACHE.get(lk)
         if ent is None:
             ent = _compile_grouped_mxfp4_wgrad_fused(
-                OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16
+                OUT_M, OUT_N, G, M_total, gm, xcd, gn, wlv, elgk, out_fp16, beta_is_one
             )
             _GMXFP4_WGRAD_LAUNCH_CACHE[lk] = ent
-        atk = (OUT_M, OUT_N, M_total, G, gm, xcd, gn, out_fp16)
+        atk = (OUT_M, OUT_N, M_total, G, gm, xcd, gn, out_fp16, beta_is_one)
         e2 = _GMXFP4_WGRAD_AT_CACHE.get(atk)
         if e2 is None:
             e2 = [ent[0], None]

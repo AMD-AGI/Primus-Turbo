@@ -60,10 +60,12 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     StoreCPerTensorCShuffle,
     _readfirstlane_i32,
     _robust_time,
+    _store_quadrants,
     asm_mma_do,
     ceildiv,
     compute_global_swizzle,
     compute_global_swizzle_nn,
+    lds_barrier,
     make_fp8_buffer_tensor_rebased,
     make_value_attrs,
     mask_a_tail,
@@ -109,29 +111,6 @@ def _build_mfma(N_TILES_A, N_TILES_B, cbsz, blgp, asm_mode=None):
     if asm_mode is not None:
         mfma._do_mma = lambda _a, _b, _c: asm_mma_do(_a, _b, _c, mode=asm_mode, cbsz=cbsz, blgp=blgp)
     return mfma
-
-
-def _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N):
-    """Store the four accumulator quadrants at their (row, col) sub-tile offsets.
-
-    A beta=1 epilogue read-back is software-pipelined by one quadrant: quadrant i+1's
-    loads go out before quadrant i stores, so they overlap without keeping all four
-    quadrants' worth of loaded values live at once. The 4-wave wgrad runs at occupancy
-    1, so it has neither a co-resident wave to hide the latency nor the registers to
-    spare for prefetching everything up front.
-    """
-    quads = (
-        (c00, base_row + 0, base_col + 0),
-        (c01, base_row + 0, base_col + LDS_BLOCK_N),
-        (c10, base_row + LDS_BLOCK_M, base_col + 0),
-        (c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N),
-    )
-    nxt = store_c.prefetch(quads[0][1], quads[0][2])
-    for i, (frag, r, c) in enumerate(quads):
-        cur = nxt
-        if i + 1 < len(quads):
-            nxt = store_c.prefetch(quads[i + 1][1], quads[i + 1][2])
-        store_c.store(frag, r, c, prev=cur)
 
 
 # ── PERSISTENT grouped NN dgrad: a fixed grid of num_sms WGs strides the tile space
@@ -2364,7 +2343,11 @@ def _wholeloop_asm_3buf(
         for p in range(4):
             L.append(f"s_mov_b32 ${o_wsoff[p]}, ${i_soff0[p]}")
         L += [ds_line(refill0, tt) for tt in range(NT, NT + ntmp)]
+        # lgkmcnt(0) only retires THIS wave's prime reads; phase 0's g2s refills the very
+        # buffer they read, so without a barrier a wave that runs ahead can overwrite a
+        # lagging wave's source.
         L.append("s_waitcnt lgkmcnt(0)")
+        L.append("s_barrier")
         L.append("1:")
         for ph in range(n_phases):
             L += _emit_phase_block(ph, _ipend)
@@ -2632,6 +2615,9 @@ def _wave4_do_tile_tn(
     _cm,
     _cn,
     beta_is_one=False,
+    epi_cshuffle=False,
+    c_lds=None,
+    epi_lds_fence=False,
 ):
     tt = xcd_remap_pid(t, TOTAL, num_xcd)
     group_idx, block_m, block_n = _wgrad_block_mn(
@@ -2699,10 +2685,7 @@ def _wave4_do_tile_tn(
         wswz=_wswz,
     )
 
-    if (
-        os.environ.get("PT_EPI_PLAIN", "0") == "1"
-        or os.environ.get("PT_WL_2BPOOL", "1") == "1"  # 2bpool forces scalar store
-    ):
+    if const_expr(not epi_cshuffle):
         store_c = StoreCPerTensor(
             A_scale,
             B_scale,
@@ -2726,7 +2709,7 @@ def _wave4_do_tile_tn(
             N_TILES_A,
             N_TILES_B,
             _out_ty,
-            lds.C_lds_shuffle,
+            c_lds,
             wave_id,
             row_pad=4,  # must match epi_pad in _wave4_geometry's C_lds_shuffle sizing (cshuf_n)
             beta_is_one=beta_is_one,
@@ -2774,6 +2757,9 @@ def _wave4_do_tile_tn(
         tail_nval=tail_k_u,
         b0_extra_buf=_b0x,
     )
+    if const_expr(epi_lds_fence):
+        # c_lds aliases a loop buffer; fence before the next tile's prologue refills it.
+        lds_barrier()
 
 
 def _make_wave4_smem(*, a_lds_size, b_lds_size, cshuf_ty, cshuf_n, tail):
@@ -2902,6 +2888,12 @@ def _compile_grouped_tn_wgrad_4wave(
         cshuf_n=(16 if _2BPOOL else _cshuf_n),
         tail=["C", "B_extra_1"] + (["B_extra_0"] if _2BPOOL else []),
     )
+    # beta=1 always takes the CShuffle epilogue.
+    _epi_cshuffle = beta_is_one or not _2BPOOL
+    _epi_alias = _epi_cshuffle and _2BPOOL
+    assert not _epi_alias or a_lds_size >= _cshuf_n * 2, (
+        f"aliased C staging needs {_cshuf_n * 2}B, A_lds_cur_0 holds {a_lds_size}B"
+    )
 
     @flyc.kernel(known_block_size=[256, 1, 1])
     def kernel_grouped_tn_wgrad_4wave(
@@ -2981,6 +2973,9 @@ def _compile_grouped_tn_wgrad_4wave(
                 _cm=_cm,
                 _cn=_cn,
                 beta_is_one=beta_is_one,
+                epi_cshuffle=_epi_cshuffle,
+                c_lds=(lds.A_lds_cur_0 if _epi_alias else lds.C_lds_shuffle),
+                epi_lds_fence=_epi_alias,
             )
 
         # Persistent: a fixed grid of <=ncus WGs strides the tile space (scf.for).
