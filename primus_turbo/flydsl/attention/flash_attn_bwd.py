@@ -5368,6 +5368,14 @@ def _get_bwd(
             g3_kreg=_fuse_wide and not _pair,
             k_reg=not _pair,
             g3d=2 if _pair else None,
+            # The dQ partial store is this path's one uncovered burst: emitted inside GEMM3 it
+            # lands where the carrier wave has no MFMA left to hide it, and at one wave per SIMD
+            # there is no sibling wave to cover it either. Hand it to the head-step hook instead,
+            # which spreads the same stores two at a time across the softmax run that follows,
+            # and keep the sched_barrier so LLVM cannot sink them back into one burst.
+            g3_st_at=2 if _fuse_d128 else None,
+            g3_st_n=2 if _fuse_d128 else None,
+            g3_sb=1 if _fuse_d128 else None,
             # A windowed band is only BLOCK_KV + W q rows wide, so the default four-wave
             # split gives each wave a single kv tile and a repeated Q/dO fragment read;
             # halving to two waves shares that fragment read across two tiles per wave.
