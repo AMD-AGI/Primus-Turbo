@@ -325,8 +325,28 @@ def _make_epoch_bump(addend):
     return epoch_bump_kernel
 
 
+def _prune_dispatch_configs(configs, sig_args):
+    if int(sig_args.get("layout_code", 0)) != 2:
+        return configs
+    seen, kept = set(), []
+    for cfg in configs:
+        sig = tuple(sorted((k, v) for k, v in cfg.kwargs.items() if k != "GROUP_M"))
+        if sig not in seen:
+            seen.add(sig)
+            kept.append(cfg)
+    return kept
+
+
 @autotune(
-    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=3) for cu in (16, 32, 64)],
+    # num_dispatch_cu is a clean U with the minimum at 16 (min-over-rank, 2 runs each:
+    # 8 -> 5.912, 12 -> 4.874, 16 -> 4.479, 24 -> 4.553, 32 -> 4.591 ms on the fwd nt leg).
+    # Below 16 the comm stops saturating XGMI and becomes the critical path; above it, every
+    # extra comm block holds a whole CU for the comm duration (the GEMM's 128 KB of LDS
+    # allows one workgroup per CU), which costs T_comm * cu / 256. The window is kept narrow
+    # because the in-process tuner's own timing is noisy on this shared box: given 12-32 to
+    # choose from it still picked 32, which the paired runs show is 2.4% off the optimum.
+    configs=[Config(num_dispatch_cu=cu, GROUP_M=gm, nt_vmcnt=3) for cu in (16, 24) for gm in (1, 2, 4)],
+    prune_configs_by=_prune_dispatch_configs,
     key=[
         "out_features",
         "hidden_size",
@@ -334,13 +354,12 @@ def _make_epoch_bump(addend):
         "BLOCK_M",
         "BLOCK_N",
         "num_comm",
-        "GROUP_M",
         "layout_code",
         "trans_c",
         "G",
         "num_ranks",
     ],
-    rep=5,
+    rep=15,
 )
 @flyc.jit
 def _compiled_dispatch_grouped_gemm(
@@ -367,7 +386,6 @@ def _compiled_dispatch_grouped_gemm(
     BLOCK_M: fx.Constexpr[int],
     BLOCK_N: fx.Constexpr[int],
     num_comm: fx.Constexpr[int],
-    GROUP_M: fx.Constexpr[int],
     layout_code: fx.Constexpr[int],
     trans_c: fx.Constexpr[bool],
     G: fx.Constexpr[int],
@@ -379,6 +397,9 @@ def _compiled_dispatch_grouped_gemm(
     num_max_tokens_per_rank: fx.Constexpr[int],
     num_topk: fx.Constexpr[int],
     stream: fx.Stream,
+    GROUP_M: fx.Constexpr[int] = 1,
+    waves_per_eu: fx.Constexpr[int] = 2,
+    agpr_alloc: fx.Constexpr[int] = 0,
 ):
     # layout_code: 0=nt, 1=nn, 2=tn; tn uses 2 XCDs, nt/nn use 8
     layout = ("nt", "nn", "tn")[int(layout_code)]
@@ -425,7 +446,7 @@ def _compiled_dispatch_grouped_gemm(
         out_n_rt,
         DISP_PARITY,
         DISP_EXPECTED,
-        value_attrs=make_value_attrs(2, 0, "512,512"),
+        value_attrs=make_value_attrs(int(waves_per_eu), int(agpr_alloc), "512,512"),
     ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
 
@@ -439,7 +460,6 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     layout: str = "nt",
     BM=256,
     BN=256,
-    GROUP_M=4,
     trans_c: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
 ):
@@ -572,7 +592,6 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         BLOCK_M=int(BM),
         BLOCK_N=int(BN),
         num_comm=int(num_comm),
-        GROUP_M=int(GROUP_M),
         layout_code=int(layout_code),
         trans_c=bool(trans_c),
         G=int(G),

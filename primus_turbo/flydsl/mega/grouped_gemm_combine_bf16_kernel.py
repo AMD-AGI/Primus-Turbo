@@ -77,6 +77,7 @@ def _make_grouped_gemm_combine(
     layout="nt",
     apply_weights=False,
     with_gate=False,
+    GROUP_M=1,
 ):
     K = hidden_size
     gemm_tile = functools.partial(gemm_bf16_tile, layout)
@@ -223,9 +224,24 @@ def _make_grouped_gemm_combine(
                     )
         else:
             gemm_tile_index = block_index - fx.Int32(gemm_base)
-            block_m = gemm_tile_index // fx.Int32(n_blocks)
-            block_n = gemm_tile_index % fx.Int32(n_blocks)
-            if block_m < real_tiles:
+            real_grid = real_tiles * fx.Int32(n_blocks)
+            if gemm_tile_index < real_grid:
+                # GROUP_M tile grouping over the REAL tile range, as in the standalone
+                # grouped GEMM. GROUP_M=1 reproduces the previous mapping exactly
+                # (block_m = idx // n_blocks, block_n = idx % n_blocks), so it is the safe
+                # default; larger values trade GEMM locality against combine start latency
+                # (a segment's comm cannot start until every tile of its block_m is done,
+                # and grouping delays the first block_m's completion), hence autotuned.
+                num_pid_in_group = fx.Int32(GROUP_M * n_blocks)
+                group_id = gemm_tile_index // num_pid_in_group
+                pid_in_group = gemm_tile_index % num_pid_in_group
+                first_pid_m = group_id * fx.Int32(GROUP_M)
+                remaining_m = real_tiles - first_pid_m
+                group_size_m = fx.arith.select(
+                    remaining_m < fx.Int32(GROUP_M), remaining_m, fx.Int32(GROUP_M)
+                )
+                block_m = first_pid_m + (pid_in_group % group_size_m)
+                block_n = pid_in_group // group_size_m
                 # GEMM role: one real tile (block_m, block_n) per block (unchanged).
                 group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 # A/B base = ACT/WEIGHTS tensors; C base = l2_token_buffer (int64 symm addr).
@@ -271,7 +287,7 @@ def _make_grouped_gemm_combine(
                     )
             else:
                 # Empty region: first num_reduce_cu blocks do topk reduce, rest early-exit.
-                empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
+                empty_ordinal = gemm_tile_index - real_grid
                 if empty_ordinal < fx.Int32(num_reduce_cu):
                     # Never-reset alignment: reduce blocks bump empty block_m's combine_flag to cumulative expected.
                     n_empty = fx.Int32(worst_case_tiles) - real_tiles
@@ -338,7 +354,19 @@ def _make_epoch_bump(add_combine, add_reduce):
 
 
 @autotune(
-    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64) for rc in (256,)],
+    # num_combine_cu bottoms out at 16 like the dispatch side (min-over-rank on the bwd nn
+    # leg: 8 -> 6.234, 12 -> 5.151, 16 -> 4.997, 24 -> 5.004, 32 -> 5.035 ms). Below 16 the
+    # comm stops saturating XGMI and becomes the critical path; above it each comm block
+    # holds a whole CU. 48/64 were only ever chosen by the in-process tuner, whose own
+    # timing cannot resolve a 2% effect on this shared box.
+    # GROUP_M in {1, 2}: 4 is never competitive on either combine shape, and the two useful
+    # values sit within ~1.5% (min over 3 runs: fwd 2.830 vs 2.863, bwd 5.127 vs 5.040).
+    configs=[
+        Config(num_combine_cu=cc, num_reduce_cu=rc, GROUP_M=gm)
+        for cc in (16, 24)
+        for rc in (256,)
+        for gm in (1, 2)
+    ],
     # layout_code MUST be a key: nt/nn have OPPOSITE combine_cu optima (see wrapper note).
     key=[
         "out_features",
@@ -355,7 +383,7 @@ def _make_epoch_bump(add_combine, add_reduce):
         "with_gate",
         "out_fp16",
     ],
-    rep=5,
+    rep=15,
 )
 @flyc.jit
 def _compiled_grouped_gemm_combine(
@@ -399,6 +427,7 @@ def _compiled_grouped_gemm_combine(
     nt_vmcnt: fx.Constexpr[int] = 3,
     agpr_alloc: fx.Constexpr[int] = 0,
     waves: fx.Constexpr[int] = 2,
+    GROUP_M: fx.Constexpr[int] = 1,
 ):
     kernel = _make_grouped_gemm_combine(
         out_features,
@@ -419,6 +448,7 @@ def _compiled_grouped_gemm_combine(
         _LAYOUTS[layout_code],
         apply_weights,
         with_gate,
+        int(GROUP_M),
     )
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M

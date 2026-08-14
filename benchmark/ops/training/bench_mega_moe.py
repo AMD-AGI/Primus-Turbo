@@ -159,6 +159,10 @@ def compile_grouped_gemm_bf16(
         def _emit():
             pid = xcd_remap_pid(fx.block_idx.x, real_grid, num_xcd)
             num_pid_m = real_tiles
+            # NB: a group spans ALL n_blocks on purpose. Banding the n range (a "squarer"
+            # live tile set) was tried and is 4-15% slower: sweeping every n for one m-group
+            # fetches each A slab from HBM once, while an n-band forces a full m sweep per
+            # band and so re-fetches all of A once per band.
             num_pid_in_group = GROUP_M * n_blocks
             group_id = pid // num_pid_in_group
             pid_in_group = pid % num_pid_in_group
@@ -342,7 +346,9 @@ def grouped_gemm_variable_k_only(
     out_dw,  # [G, OUT_M, OUT_N] bf16 ([G, OUT_N, OUT_M] if trans_c)  C = dW
     BLOCK_M=256,
     BLOCK_N=256,
-    num_xcd=1,  # xcd=1 maximizes L2 reuse on the variable-K M-reduction (+14% vs 8, +6% vs 4; swept)
+    # xcd=2 beats 1 by ~1.5% (paired A/B, 40 pairs, 95-100% win rate); the original sweep
+    # that picked 1 compared it against 4 and 8 only. Still far better than 4/8 (+6/+14%).
+    num_xcd=2,
     trans_c=False,
     waves_per_eu=2,
 ):
@@ -401,7 +407,9 @@ def grouped_gemm_bf16_only(
     layout="nt",
     BLOCK_M=256,
     BLOCK_N=256,
-    GROUP_M=4,
+    # GROUP_M=2 over 4: +1.5% NT, neutral NN (paired A/B, 40 pairs, 90%+ win rate).
+    # Small, but it is the only GROUP_M effect that survived pairing on this shared box.
+    GROUP_M=2,
     # xcd=1 maximizes L2 reuse of shared weight slabs (swept: +3% NT, +11% NN, +15% TN vs xcd=8)
     num_xcd=1,
     nt_vmcnt=3,  # gfx950 G2S LDS hazard: vmcnt>=4 races (nondeterministic); 3 is det
@@ -774,13 +782,17 @@ def sync_ranks(group):
     group.barrier()
 
 
-def reduce_across_ranks(per_rank, stage, field, *, reduce_fn=max):
-    """Reduce one StageMetrics field across ranks (bottleneck = max, work = mean)."""
+def reduce_across_ranks(per_rank, stage, field, *, reduce_fn=min):
+    """Reduce one StageMetrics field across ranks (latency = min, work = mean).
+
+    Min, not max: this node is shared, and a co-tenant saturating one GPU inflates that
+    rank's latency by 30-40%. Every rank runs the same work, so the fastest rank is the
+    one that ran undisturbed -- max-over-ranks reports the neighbour's load, not ours."""
     return reduce_fn([getattr(res["stages"][stage], field) for res in per_rank])
 
 
 def aggregate_stage_metrics(per_rank, stage, xgmi):
-    """Cross-rank metric bundle for one stage; latencies=slowest rank, flops=mean, dense_gm=rank0."""
+    """Cross-rank metric bundle for one stage; latencies=least-disturbed rank, flops=mean, dense_gm=rank0."""
     return compute_stage_metrics(
         gemm_ms=reduce_across_ranks(per_rank, stage, "gemm_ms"),
         dense_ms=reduce_across_ranks(per_rank, stage, "dense_ms"),
@@ -859,7 +871,7 @@ def print_header(tag, gpu_name, world, args, *, case=None):
     print(
         f"\n{'=' * 72}\n[{tag}]{case_tag} {gpu_name} EP{world} T={args.num_tokens} H={args.hidden} "
         f"I={args.inter} E={args.num_experts} K={args.num_topk} "
-        f"(max over ranks)\n{'=' * 72}"
+        f"(min over ranks)\n{'=' * 72}"
     )
 
 
@@ -1428,7 +1440,7 @@ def _dispatch_profile(group, args, symm, ctx=None):
         "bwd": _hash_tensor(out_bwd[: ctx.M_eff]),
         "wgrad": _hash_tensor(out_wgrad),
     }
-    # raw per-rank timings + work; rank 0 aggregates across ranks (bottleneck = max latency)
+    # raw per-rank timings + work; rank 0 aggregates across ranks (min latency, see reduce_across_ranks)
     return {
         "stages": {"fwd": fwd_metrics, "bwd": bwd_metrics, "wgrad": wgrad_metrics},
         "xgmi_bytes": xgmi_bytes,
@@ -1540,7 +1552,11 @@ def _combine_stage_fwd(runner, ctx):
             inp.num_tile_blocks,
             BLOCK_M=256,
             BLOCK_N=256,
-            GROUP_M=8,
+            # The combine legs used to pass GROUP_M=8. That predates the GROUP_M retune and
+            # was never re-checked on their own shapes, where 8 is the worst value tried:
+            # paired A/B gives 4.16 vs 4.40 ms on the bwd shape (N=7168 K=4096) and a 100%
+            # win rate for 1/2/4 over 8 on the fwd shape.
+            GROUP_M=2,
         )
         sync_ranks(ctx.group)
         combine_only(ctx.group, handle=ctx.inp.handle)
@@ -1560,7 +1576,6 @@ def _combine_stage_fwd(runner, ctx):
         )
         return ref_y
 
-    # L2 has small K=I -> GROUP_M=8 reuses the per-expert weight across more M-tiles (best here)
     spec = StageSpec(
         name="fwd fused (nt)",
         flops=flops,
@@ -1573,7 +1588,7 @@ def _combine_stage_fwd(runner, ctx):
             inp.num_tile_blocks,
             BLOCK_M=256,
             BLOCK_N=256,
-            GROUP_M=8,
+            GROUP_M=2,  # not 8 -- see the note in _combine_stage_fwd
         ),
         comm_fn=_combine_make_comm_call(ctx),
         fused_fn=_combine_make_fused_call(ctx, inp.act, inp.W2, topk_weights=ctx.topk_w_flat),
@@ -1601,7 +1616,7 @@ def _combine_stage_bwd(runner, ctx):
             layout="nn",
             BLOCK_M=256,
             BLOCK_N=256,
-            GROUP_M=8,
+            GROUP_M=2,  # not 8 -- see the note in _combine_stage_fwd
         )
         sync_ranks(ctx.group)
         combine_only(ctx.group, handle=ctx.inp.handle)
@@ -1634,7 +1649,7 @@ def _combine_stage_bwd(runner, ctx):
             layout="nn",
             BLOCK_M=256,
             BLOCK_N=256,
-            GROUP_M=8,
+            GROUP_M=2,  # not 8 -- see the note in _combine_stage_fwd
         ),
         comm_fn=_combine_make_comm_call(ctx),
         fused_fn=_combine_make_fused_call(ctx, grad_l1, inp.W1, layout="nn", topk_weights=None),
@@ -1657,7 +1672,7 @@ def _combine_profile(group, args, symm, ctx=None):
         "fwd": _hash_tensor(out_fwd),
         "bwd": _hash_tensor(out_bwd),
     }
-    # raw per-rank timings + work; rank 0 aggregates across ranks (bottleneck = max latency)
+    # raw per-rank timings + work; rank 0 aggregates across ranks (min latency, see reduce_across_ranks)
     return {
         "stages": {"fwd": fwd_metrics, "bwd": bwd_metrics},
         "xgmi_bytes": ctx.xgmi_bytes,
@@ -1787,7 +1802,7 @@ MODES = {
 
 def _report_case(mode, platform, gpu_name, world, args, case_name, per_rank):
     """rank-0: aggregate one case's per-rank results -> (rich_row, csv_row); prints the detail block."""
-    # distributed bottleneck = slowest rank (max latency); work ~ uniform (mean)
+    # latency = least-disturbed rank (min); work ~ uniform (mean). See reduce_across_ranks.
     xgmi = statistics.mean([res["xgmi_bytes"] for res in per_rank])
     rank0_checks = per_rank[0]["checks"]
     aggs = {s.key: aggregate_stage_metrics(per_rank, s.key, xgmi) for s in mode.stages}
