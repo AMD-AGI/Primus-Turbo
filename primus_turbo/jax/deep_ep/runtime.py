@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import logging
 import os
@@ -524,6 +525,38 @@ def _bootstrap_barrier(num_ranks: int) -> None:
         raise
 
 
+_atexit_hook_registered: bool = False
+
+
+def _destroy_at_exit() -> None:
+    """Release the per-process DeepEP buffer while HIP is still usable.
+
+    The C++ owner is a file-scope ``std::unique_ptr<Buffer>``, so without
+    this hook the buffer is only released during static destruction — after
+    the Python interpreter has finalized and the HIP runtime / PJRT client
+    have begun tearing down.  ``Buffer::Destroy()`` then issues
+    ``hipDeviceSynchronize`` / a device-side peer barrier /
+    ``hipIpcCloseMemHandle`` against a half-dismantled runtime, which
+    reliably ends in SIGSEGV or glibc heap corruption (SIGABRT).
+    """
+    try:
+        dep = _get_c_deep_ep()
+        if dep.is_per_process_buffer_ready():
+            dep.destroy_per_process_buffer()
+    except BaseException:  # pragma: no cover  pylint: disable=broad-except
+        log.debug("DeepEP atexit buffer destroy failed", exc_info=True)
+
+
+def _register_atexit_hook() -> None:
+    """Register ``_destroy_at_exit`` once per process (idempotent)."""
+    global _atexit_hook_registered
+
+    if _atexit_hook_registered:
+        return
+    atexit.register(_destroy_at_exit)
+    _atexit_hook_registered = True
+
+
 def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
     """Create (or grow) the per-process IPC buffer and exchange handles.
 
@@ -621,6 +654,7 @@ def _bootstrap_per_process(*, hidden_bytes: int, config) -> None:
             dep.sync_per_process_buffer(ipc_handles_list, root_uid)
         _per_process_nvl_bytes = num_nvl_bytes
         _per_process_rdma_bytes = num_rdma_bytes
+        _register_atexit_hook()
     except BaseException:
         # If bootstrap fails after the local IPC buffer is created, leave the C++
         # singleton in a clean state instead of relying on process teardown.

@@ -12,6 +12,13 @@ from primus_turbo.pytorch.ops.normalization import rmsnorm, rmsnorm_residual
 from tests.pytorch.test_utils import get_tolerances
 
 
+def _dgamma_tolerances(dtype):
+    """Tolerances for ``dgamma``, which is a reduction over all ``B`` rows."""
+    if dtype == torch.float32:
+        return dict(rtol=1e-3, atol=1e-3)
+    return get_tolerances(dtype)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("outer_shape", [(1,), (511,), (4096,), (8192,)])
 @pytest.mark.parametrize("inner_shape", [33, 128, 513, 4096, 5120, 7168, 8192])
@@ -38,7 +45,7 @@ def test_rmsnorm_ops(dtype, outer_shape, inner_shape):
     y_ref.backward(grad_out)
 
     torch.testing.assert_close(x.grad, x_ref.grad, **get_tolerances(dtype))
-    torch.testing.assert_close(gamma.grad, gamma_ref.grad, **get_tolerances(dtype))
+    torch.testing.assert_close(gamma.grad, gamma_ref.grad, **_dgamma_tolerances(dtype))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -69,7 +76,7 @@ def test_rmsnorm_zero_centered_ops(dtype, outer_shape, inner_shape):
     y_ref.backward(grad_out)
 
     torch.testing.assert_close(x.grad, x_ref.grad, **get_tolerances(dtype))
-    torch.testing.assert_close(gamma.grad, gamma_ref.grad, **get_tolerances(dtype))
+    torch.testing.assert_close(gamma.grad, gamma_ref.grad, **_dgamma_tolerances(dtype))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -105,10 +112,10 @@ def test_rmsnorm_residual_ops(dtype, outer_shape, inner_shape):
 
     torch.testing.assert_close(x.grad, x_ref.grad, **get_tolerances(dtype))
     torch.testing.assert_close(residual.grad, r_ref.grad, **get_tolerances(dtype))
-    # ``dgamma`` is a reduction over ``B`` rows; the residual variant doubles the
-    # input magnitude entering the sum, so for low-precision dtypes we use a
-    # slightly looser tolerance to absorb the extra bf16/fp16 reduction noise.
-    dg_tol = get_tolerances(dtype)
+    # The residual variant doubles the input magnitude entering the dgamma sum,
+    # so for low-precision dtypes we use a slightly looser tolerance to absorb
+    # the extra bf16/fp16 reduction noise.
+    dg_tol = _dgamma_tolerances(dtype)
     if dtype in (torch.float16, torch.bfloat16):
         dg_tol = dict(rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(gamma.grad, gamma_ref.grad, **dg_tol)
