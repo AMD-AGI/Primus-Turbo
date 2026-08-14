@@ -15,21 +15,16 @@
 Forward (NT) and dgrad (NN) for MoE GEMM; group_offs [G+1] splits M into G groups.
 Grid is over-launched; each WG resolves its (group, tile) on-device (no CPU sync)."""
 
-import os
 from collections import namedtuple
-from contextlib import nullcontext as _nullctx
 
-# PT_GG_SCHED picks the eager NT/NN LLVM pre-RA schedule: mmc (default) / pm / bundled.
+# Eager NT/NN pre-RA schedule: max-memory-clause interleaves ds_read incremental waits
+# with MFMA, which is what the feed-latency regime wants.
 _GG_SCHED_HINTS = {
-    "pm": {"llvm_options": {"enable-post-misched": True}},
-    "mmc": {
-        "llvm_options": {
-            "amdgpu-sched-strategy": "max-memory-clause",
-            "enable-post-misched": True,
-            "lsr-drop-solution": True,
-        }
-    },
-    "": None,
+    "llvm_options": {
+        "amdgpu-sched-strategy": "max-memory-clause",
+        "enable-post-misched": True,
+        "lsr-drop-solution": True,
+    }
 }
 
 import flydsl.compiler as flyc
@@ -66,6 +61,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     asm_mma_do,
     ceildiv,
     ceildiv_pow2,
+    compile_with_scratch_out,
     compute_global_swizzle,
     compute_global_swizzle_nn,
     compute_global_swizzle_shear,
@@ -73,6 +69,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_row_band_resource,
     make_value_attrs,
     mask_a_tail,
+    resolve_accum_out,
     shear_mbias,
     udiv,
     uindex,
@@ -116,29 +113,6 @@ def _load_go(div, idx):
     return _load_i32(div, idx * 2)
 
 
-def _lds_store1_i32(lds_ptr, off, val):
-    """Store one int32 to an LDS Array at element offset ``off``."""
-    fx.make_view(fx.add_offset(lds_ptr, fx.make_int_tuple(off)), fx.make_layout(1, 1)).store(
-        Vec.from_elements([val], fx.Int32)
-    )
-
-
-def _lds_load1_i32(lds_ptr, off):
-    """Load one int32 from an LDS Array at element offset ``off``."""
-    return fx.make_view(fx.add_offset(lds_ptr, fx.make_int_tuple(off)), fx.make_layout(1, 1)).load()[0]
-
-
-def _tree_add_i32(xs):
-    """Pairwise (log-depth) reduction of an fx.Int32 list -> one fx.Int32."""
-    xs = list(xs)
-    while len(xs) > 1:
-        nxt = [xs[i] + xs[i + 1] for i in range(0, len(xs) - 1, 2)]
-        if len(xs) % 2:
-            nxt.append(xs[-1])
-        xs = nxt
-    return xs[0]
-
-
 def _build_mfma(N_TILES_A, N_TILES_B, cbsz, blgp, asm_mode=None):
     """Mfma16x16x128 with the e5m2/hybrid atom applied when cbsz|blgp, and (when asm_mode
     is given) an inline-asm _do_mma at that mode ("2"=AGPR in-place, "3"=VGPR in-place).
@@ -177,12 +151,26 @@ def _nn_b_tr_mfma(mfma, raw, a_frag, c):
 
 
 def _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N):
-    """Store the four output quadrants (shared by all 6 kernels; base_row/base_col are
-    computed per-kernel by the caller)."""
-    store_c.store(c00, base_row + 0, base_col + 0)
-    store_c.store(c01, base_row + 0, base_col + LDS_BLOCK_N)
-    store_c.store(c10, base_row + LDS_BLOCK_M, base_col + 0)
-    store_c.store(c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+    """Store the four accumulator quadrants at their (row, col) sub-tile offsets.
+
+    A beta=1 epilogue read-back is software-pipelined by one quadrant: quadrant i+1's
+    loads go out before quadrant i stores, so they overlap without keeping all four
+    quadrants' worth of loaded values live at once. The 4-wave wgrad runs at occupancy
+    1, so it has neither a co-resident wave to hide the latency nor the registers to
+    spare for prefetching everything up front.
+    """
+    quads = (
+        (c00, base_row + 0, base_col + 0),
+        (c01, base_row + 0, base_col + LDS_BLOCK_N),
+        (c10, base_row + LDS_BLOCK_M, base_col + 0),
+        (c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N),
+    )
+    nxt = store_c.prefetch(quads[0][1], quads[0][2])
+    for i, (frag, r, c) in enumerate(quads):
+        cur = nxt
+        if i + 1 < len(quads):
+            nxt = store_c.prefetch(quads[i + 1][1], quads[i + 1][2])
+        store_c.store(frag, r, c, prev=cur)
 
 
 def _store_split(store_c, quad, base_row, base_col, esplit, full):
@@ -239,6 +227,7 @@ def _compile_grouped_nn(
     nn_kshear: bool = True,  # K % 128 == 64: fetch A's line-aligned window per row instead of its raw K-block, so no row's 128B load splits a cache line (measured +25.7% TCP_TCC_READ_REQ on dY[M,2880]). Off = legacy split loads
     nn_elgk: bool = True,  # graded drain of the B transpose reads: the b0 stage rides the a0 fragment's compiler-scored wait, the b1 stage drains one tile at a time inside its mfma column. Off = one lgkmcnt(0) per stage with no mfma to cover it
     nn_esplit: int = 4,  # epilogue store schedule, see _NN_E_SCHED: how the tile's four accumulator quadrants are split into barrier-separated store batches. 0 = one 128-store burst after the trailing barrier
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     """Persistent (CPU-sync-free) grouped NN dgrad: a fixed grid of WGs strides the tile
     space via scf.for, amortising per-WG fixed cost. ``group_m``/``group_n`` port the NT
@@ -498,6 +487,7 @@ def _compile_grouped_nn(
                     _out_ty,
                     lds.C_lds_shuffle,
                     wave_id,
+                    beta_is_one=beta_is_one,
                 )
             else:
                 store_c = StoreCPerTensor(
@@ -512,6 +502,7 @@ def _compile_grouped_nn(
                     _out_ty,
                     store_aux=cstore_aux,
                     col_safe=_col_safe,
+                    beta_is_one=beta_is_one,
                 )
 
             # Before-mfma scheduling barrier; after-mfma barriers stay real (gfx950 mfma-src/ds-read VGPR-overlap race).
@@ -521,8 +512,7 @@ def _compile_grouped_nn(
                 else:
                     rocdl.s_barrier()
 
-            # PT_NT_VMCNT overrides nt_vmcnt (-1 disables the extra per-iter g2s drain after c11).
-            _nt_vmcnt = int(os.environ.get("PT_NT_VMCNT", str(nt_vmcnt)))
+            _nt_vmcnt = nt_vmcnt
 
             wave_n_offset = wave_n * (N_TILES_B * 16)
             wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -823,6 +813,7 @@ def _compile_grouped_nt(
     cap_cu: int = -1,  # >0: cap grid to this many WGs (= reserve device CUs for comm-compute overlap). <=0: use the full device CU count.
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
     nt_esplit: int = 4,  # epilogue store schedule (see _NN_E_SCHED), the twin of the NN dgrad's nn_esplit. 0 = one 128-store burst
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     """Grouped NT forward (out = a @ b^T). persistent=True: a fixed grid of WGs strides the
     tile space via scf.for (cap_cu reserves CUs for comm overlap); persistent=False: one tile
@@ -1035,6 +1026,7 @@ def _compile_grouped_nt(
                     wave_id,
                     pipe=_cs_pipe,
                     store_aux=_cstore_aux,
+                    beta_is_one=beta_is_one,
                 )
             else:
                 store_c = StoreCPerTensor(
@@ -1048,6 +1040,7 @@ def _compile_grouped_nt(
                     N_TILES_B,
                     _out_ty,
                     col_safe=_col_safe,
+                    beta_is_one=beta_is_one,
                 )
 
             c00_frag = [mfma.zero_value] * N_ACCUMS
@@ -1062,8 +1055,8 @@ def _compile_grouped_nt(
                 else:
                     rocdl.s_barrier()
 
-            # Extra per-iter g2s drain after c11 caps how far the next iter runs ahead; PT_NT_VMCNT overrides nt_vmcnt (-1 disables).
-            _nt_vmcnt = int(os.environ.get("PT_NT_VMCNT", str(nt_vmcnt)))
+            # Extra per-iter g2s drain after c11 caps how far the next iter runs ahead (-1 = off).
+            _nt_vmcnt = nt_vmcnt
 
             if const_expr(nt_dist2):
                 # Uniform distance-2 mainloop: A1 staged at k+2 so all four LDS pools prefetch a K-iter ahead; nq==1 drops the all-padding b1 half.
@@ -1098,6 +1091,7 @@ def _compile_grouped_nt(
                         _bnd_ntb,
                         _out_ty,
                         col_safe=_col_safe,
+                        beta_is_one=beta_is_one,
                     )
 
                 def _body_d2(nq):
@@ -1621,7 +1615,7 @@ def _wgrad_band_is_xcd_aff(n_blocks_m, n_blocks_n, group_m, group_n, nxcd=_WGRAD
 
 def _wgrad_xcd_div(x, d, xmax):
     """``x // d`` for a compile-time d, as one multiply plus one shift by a fixed-point reciprocal
-    verified exact over [0, xmax]. Same trick as _wgrad_split_div, same reason: a real divide in
+    exact over [0, xmax]. Same trick as _wgrad_split_div, same reason: a real divide in
     the per-tile prologue is a latency-exposed serial chain at occ=1."""
     m = -(-(1 << _WGRAD_XCD_RCP_SHIFT) // d)
     assert all((v * m) >> _WGRAD_XCD_RCP_SHIFT == v // d for v in range(xmax + 1)), (d, xmax)
@@ -1748,6 +1742,7 @@ def _compile_grouped_tn_wgrad_masked(
     chunk: int = 8,  # capacity-free chunked K-loop: outer runtime scf.for over
     # ceildiv(k_iters,chunk) x range_constexpr(chunk) of the 4-buffer body; over-run is SRD-clamped.
     i64_traverse: bool = False,  # A[m,OUT_M] & B[m,OUT_N] traversal via per-load i64 SRD re-base (lifts mg*OUT < 2^32 cap)
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     """Masked grouped TN wgrad: a capacity-free chunked K-loop over the 4-buffer inline body,
     with the per-group contraction masked by the SRD num_records clamp (over-read -> 0). acc_mode
@@ -1867,10 +1862,20 @@ def _compile_grouped_tn_wgrad_masked(
                 _out_ty,
                 lds.C_lds_shuffle,
                 wave_id,
+                beta_is_one=beta_is_one,
             )
         else:
             store_c = StoreCPerTensor(
-                A_scale, B_scale, C, (group_idx + 1) * OUT_M, OUT_N, mfma.idx, N_TILES_A, N_TILES_B, _out_ty
+                A_scale,
+                B_scale,
+                C,
+                (group_idx + 1) * OUT_M,
+                OUT_N,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_B,
+                _out_ty,
+                beta_is_one=beta_is_one,
             )
 
         # i64 index so A0_off + (k+2)*AM does not truncate when the per-group token span mg*OUT exceeds 2^31.
@@ -2004,6 +2009,7 @@ def _grouped_compile_cfg(
     nt_group_n=0,
     cap_cu=-1,
     i64_traverse=False,
+    beta_is_one=False,
 ):
     ckey = (
         "nt" if trans_b else "nn",
@@ -2023,6 +2029,7 @@ def _grouped_compile_cfg(
         nt_group_n,
         cap_cu,
         i64_traverse,
+        beta_is_one,  # baked into the epilogue (read-back), so it keys the artifact
     )
     l = _GROUPED_LAUNCH_CACHE.get(ckey)
     if l is None:
@@ -2044,6 +2051,7 @@ def _grouped_compile_cfg(
                 sched_schedbar=sched_schedbar,
                 persistent=True,
                 cap_cu=cap_cu,
+                beta_is_one=beta_is_one,
             )
         else:
             l = _compile_grouped_nn(
@@ -2064,6 +2072,7 @@ def _grouped_compile_cfg(
                 persistent=True,
                 cap_cu=cap_cu,
                 i64_traverse=i64_traverse,
+                beta_is_one=beta_is_one,
             )
         _GROUPED_LAUNCH_CACHE[ckey] = l
     return l
@@ -2105,12 +2114,6 @@ def _skewed_group_offs(mg_cpu, M_c, G, device, blk=256):
     return offs.view(torch.int32)
 
 
-def _canon_skew_offs(M_c, G, device):
-    """Synthetic group_offs [G+1] for a canonical skew load (1.07**i geometric)."""
-    w = [(1.07**i) for i in range(G)]
-    return _skewed_group_offs(w, M_c, G, device)
-
-
 _NP_8WAVE_CANDS = ((256, 8, 4, 0), (256, 8, 8, 0))
 # (num_xcd=4, group_m=8) is the measured static optimum across the deployed MoE shape family.
 # The online race cannot find it: it scores on synthetic *balanced* tensors, where this arm
@@ -2134,9 +2137,10 @@ def _np_regime(trans_b, N, K, G, M_total):
     return 0  # steady -> NK autotune
 
 
-def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
-    """Race the NT/NN candidates on synthetic balanced tensors at the canonical tokens/group
-    and cache per static (op,N,K,G,dtype,regime), never per M_total. regime==1 -> fixed bm128."""
+def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime, beta_is_one=False):
+    """Race the NT/NN candidates on balanced synthetic tensors, cached per static
+    (op,N,K,G,dtype,regime), never per M_total. regime==1 -> fixed bm128. Candidates carry the
+    caller's ``beta_is_one``; the probe owns its buffer and zeroes it per launch (C = 0 + acc)."""
     # NN B[K,N] traversal: re-base B SRD per load in i64 when the per-group span K*N reaches 2^32 fp8.
     i64_tr = (not trans_b) and (K * N >= 2**32)
 
@@ -2157,6 +2161,7 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
                 agpr_inplace=False,
                 store_cshuffle=False,
                 sched_schedbar=False,
+                beta_is_one=beta_is_one,
                 # Keep the loop-tail vmcnt on NT: measured net-negative to drop it here (unlike
                 # the NN twin, where this drain is redundant) -- see pitfalls/05 "NN 上能删,NT 上不能".
                 nt_vmcnt=3,
@@ -2181,6 +2186,7 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
             nt_vmcnt=-1,
             i64_traverse=i64_tr,
             N=N,
+            beta_is_one=beta_is_one,
         )
 
     if not trans_b and regime == 1:
@@ -2227,6 +2233,8 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
         any M (numeric guard). Timing each candidate at both ends picks an M-robust config."""
         prod = 1.0
         for targs, out_view, ref, refnorm in mps:
+            if beta_is_one:
+                out_view.zero_()  # C = 0 + acc, so the overwrite reference still applies
             launch(*targs)
             torch.cuda.synchronize()
             if ref is not None:
@@ -2239,6 +2247,8 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
 
     base = mk(*cands[0])
     for mp in mps:  # establish the per-M numeric reference from the base config
+        if beta_is_one:
+            mp[1].zero_()
         base(*mp[0])
         torch.cuda.synchronize()
         r = mp[1].detach().clone().float()
@@ -2262,6 +2272,8 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     trans_b: bool = False,
     out_dtype=torch.bfloat16,
     num_cu: "int | None" = -1,
+    beta: float = 0.0,
+    out: "torch.Tensor | None" = None,
 ) -> "torch.Tensor":
     """FlyDSL per-tensor grouped fp8 GEMM (M-grouped), matching the Triton entry.
     out[g] = a[g] @ B_view[g] * a_scale * b_scale. trans_b=True (forward) uses b [G, N, K] and
@@ -2273,7 +2285,8 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     K_b = b.shape[2] if trans_b else b.shape[1]
     assert K == K_b, f"K mismatch a={K} b={K_b}"
 
-    out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
+    out = resolve_accum_out(out, beta, (M_total, N), a.device, out_dtype)
+    beta_is_one = beta == 1.0
     # kernel reads group_offs as int64 low-words via a free int32-view; int32 callers are upcast once.
     _go64 = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
     go32 = _go64.view(torch.int32)
@@ -2289,7 +2302,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     nonpersist = not capped
     # NK autotune key excludes M_total; a coarse M-derived regime bucket covers every M_total (see _np_regime).
     regime = _np_regime(trans_b, N, K, G, M_total) if nonpersist else 0
-    at_key = (op, N, K, G, out_fp16, cbsz, blgp, regime, nonpersist, num_cu if capped else 0)
+    at_key = (op, N, K, G, out_fp16, cbsz, blgp, regime, nonpersist, num_cu if capped else 0, beta_is_one)
     # Full rank (not flattened): a flat reshape(-1) overflows the int32 shape pack when M_total*K > 2^31; the kernel re-bases via i64.
     a_i8 = a.view(torch.int8)
     b_i8 = b.view(torch.int8)
@@ -2308,7 +2321,9 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     if entry is None:
         if nonpersist:
             # num_cu<=0 (full device): autotune the non-persistent nt8w/nn8w swizzle (straight-line one-tile/WG body, no scf.for penalty).
-            launch = _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime)
+            launch = _autotune_np_dispatch(
+                trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime, beta_is_one=beta_is_one
+            )
         else:
             # Single persistent prod config (no autotune); reached only when num_cu>0 reserves CUs. Default goes to nt8w/nn8w.
             launch = _grouped_compile_cfg(
@@ -2328,6 +2343,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
                 cap_cu=(num_cu if capped else -1),
                 # NN B[K,N] per-group traversal: i64 re-base when K*N reaches 2^32 fp8.
                 i64_traverse=((not trans_b) and (K * N >= 2**32)),
+                beta_is_one=beta_is_one,
             )
         entry = [launch, None]  # [raw @flyc.jit closure, flyc.compile'd object (lazy)]
         _GROUPED_AT_CACHE[at_key] = entry
@@ -2337,12 +2353,8 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
         raw(*args)
     else:
         if compiled is None:
-            # Memory-clause pre-RA schedule + post-RA waitcnt cleanup interleaves ds_read incremental waits with MFMA (feed-latency regime). Scoped per-compile.
-            _sched = os.environ.get("PT_GG_SCHED", "mmc")
-            _hints = _GG_SCHED_HINTS.get(_sched)
-            _cctx = CompilationContext.compile_hints(_hints) if _hints else _nullctx()
-            with _cctx:
-                compiled = flyc.compile(raw, *args)
+            with CompilationContext.compile_hints(_GG_SCHED_HINTS):
+                compiled = compile_with_scratch_out(raw, args, out_index=2)
             entry[1] = compiled
         compiled(*args)
     return out
@@ -2434,6 +2446,7 @@ def _compile_grouped_tn_wgrad_persistent(
     unroll_n: int = -1,  # >=2: continuous-N chunk-unroll (dense-pipeline, capacity-free); -1 = use module env default
     cap_cu: int = -1,  # >0 caps grid to this many WGs (reserve CUs for comm overlap)
     i64_traverse: bool = False,  # A[m,OUT_M] & B[m,OUT_N] traversal via per-load i64 SRD re-base (lifts mg*OUT < 2^32 cap)
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     """PERSISTENT grouped TN wgrad (the production wgrad; fwd/dgrad are persistent
     so wgrad must be too). grid = min(G*TILES_PER_GROUP, num_cus); each WG
@@ -2649,6 +2662,7 @@ def _compile_grouped_tn_wgrad_persistent(
                     _out_ty,
                     lds.C_lds_shuffle,
                     wave_id,
+                    beta_is_one=beta_is_one,
                 )
             else:
                 store_c = StoreCPerTensor(
@@ -2661,6 +2675,7 @@ def _compile_grouped_tn_wgrad_persistent(
                     N_TILES_A,
                     N_TILES_B,
                     _out_ty,
+                    beta_is_one=beta_is_one,
                 )
             c00 = [Vec(fx.memref_load_vec(r)) for r in acc00]
             c01 = [Vec(fx.memref_load_vec(r)) for r in acc01]
@@ -2703,7 +2718,7 @@ def _compile_grouped_tn_wgrad_persistent(
     return launch_grouped_tn_persist
 
 
-# 3-buffer whole-loop: one pool at depth 3, rest depth 2; n_phases = lcm(nbuf), statically unrolled. PT_WL_VMCNT_MODE=partial skips the 3-buf write next-barrier drain (relies on buffer_load_lds FIFO order).
+# 3-buffer whole-loop: one pool at depth 3, rest depth 2; n_phases = lcm(nbuf), statically unrolled.
 _WL_ASM_CACHE_3BUF = {}
 # Phase drain leaves the last _WL_ELGK ds_reads in flight across the barrier; safe only because the next rewrite is a full global round trip away (short tail safe, long tail races).
 _WL_ELGK = 12
@@ -3280,6 +3295,7 @@ def _wave4_do_tile_tn(
     split_kbe=None,
     band_row=None,
     bounds=None,
+    beta_is_one=False,
     tile_mn=None,
     WS=None,
 ):
@@ -3420,6 +3436,8 @@ def _wave4_do_tile_tn(
         col_safe=col_safe and not swap_n,
         c_base=store_base,
         row_addr=True,
+        beta_is_one=beta_is_one,
+        accum_mask=(fx.Int32(band_row) < fx.Int32(0)) if (beta_is_one and split_kb0 is not None) else None,
     )
     _common = dict(
         a_g2s=a_g2s,
@@ -3661,6 +3679,7 @@ def _compile_grouped_tn_wgrad_4wave(
     cap_cu: int = -1,
     half_bnd: int = -1,
     split_k: bool = True,
+    beta_is_one: bool = False,
     _probe: int = 0,
 ):
     """4-wave (occ=1) grouped TN wgrad dW[g]=A[g]^T@B[g], variable-K per group. 256x256
@@ -3828,6 +3847,7 @@ def _compile_grouped_tn_wgrad_4wave(
             _ntb = _BND_NTB if tile_b_halves == 1 else N_TILES_B
             _wave4_do_tile_tn(
                 t,
+                beta_is_one=beta_is_one,
                 TOTAL=TOTAL,
                 num_xcd=num_xcd,
                 G=G,
@@ -4194,62 +4214,11 @@ def _compile_grouped_tn_wgrad_4wave(
     return launch_grouped_tn_wgrad_4wave
 
 
-def _wgrad_compile_cfg(
-    OUT_M,
-    OUT_N,
-    G,
-    out_fp16,
-    cbsz,
-    blgp,
-    num_xcd,
-    group_m,
-    group_n=0,
-    unroll_n=-1,
-    cap_cu=-1,
-    i64_traverse=False,
+def _wgrad_masked_cfg(
+    OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd, i64_traverse=False, beta_is_one=False
 ):
-    """Compile (or cache-hit) an asm_mma wgrad for one config."""
-    ck = (
-        OUT_M,
-        OUT_N,
-        G,
-        out_fp16,
-        cbsz,
-        blgp,
-        num_xcd,
-        group_m,
-        group_n,
-        unroll_n,
-        cap_cu,
-        i64_traverse,
-    )
-    l = _GROUPED_WGRAD_LAUNCH_CACHE.get(ck)
-    if l is None:
-        l = _compile_grouped_tn_wgrad_persistent(
-            OUT_M=OUT_M,
-            OUT_N=OUT_N,
-            G=G,
-            num_xcd=num_xcd,
-            out_fp16=out_fp16,
-            cbsz=cbsz,
-            blgp=blgp,
-            group_m=group_m,
-            group_n=group_n,
-            store_cshuffle=True,
-            asm_mma=True,  # mode-3 VGPR in-place accumulate (avoids the intrinsic accvgpr shuffle)
-            asm_acc_mode="vgpr",
-            s2r_inline=False,
-            unroll_n=unroll_n,
-            cap_cu=cap_cu,
-            i64_traverse=i64_traverse,
-        )
-        _GROUPED_WGRAD_LAUNCH_CACHE[ck] = l
-    return l
-
-
-def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd, i64_traverse=False):
     """Compile (or cache-hit) the masked chunked wgrad for one (chunk, group_m, num_xcd)."""
-    ck = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd, i64_traverse)
+    ck = ("masked", OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num_xcd, i64_traverse, beta_is_one)
     l = _GROUPED_WGRAD_LAUNCH_CACHE.get(ck)
     if l is None:
         l = _compile_grouped_tn_wgrad_masked(
@@ -4266,6 +4235,7 @@ def _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, chunk, group_m, num
             store_cshuffle=True,
             chunk=chunk,
             i64_traverse=i64_traverse,
+            beta_is_one=beta_is_one,
         )
         _GROUPED_WGRAD_LAUNCH_CACHE[ck] = l
     return l
@@ -4329,9 +4299,12 @@ def _wgrad_4wave_cands(OUT_M, OUT_N, G, ncu, block=256):
     return cands
 
 
-def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_traverse=False):
+def _autotune_wgrad_dispatch(
+    OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_traverse=False, beta_is_one=False
+):
     """Race the wgrad candidates and cache per static (OUT_M,OUT_N,G,dtype,i64), never per
-    m_total. The synthetic scoring load is balanced and static-shape only, CUDA-graph safe."""
+    m_total; the scoring load is balanced, static-shape, CUDA-graph safe. Candidates carry the
+    caller's ``beta_is_one`` and score into their own buffer, zeroed per launch (C = 0 + acc)."""
 
     lhs_live, rhs_live = args[0], args[1]
     M_total = lhs_live.shape[0]
@@ -4346,6 +4319,7 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
     # Distribution-agnostic: score the tuner on a BALANCED load only. No skew probe in the tuner --
     # the kernel serves every runtime distribution with one strategy and must not be tuned to any
     # particular (skewed) one.
+    bench_c = torch.empty_like(args[2])
     mps = []
     for offs_c in (_balanced_group_offs(M_c, G, lhs_live.device),):
         mps.append(
@@ -4353,7 +4327,7 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
                 (
                     lhs_c.view(torch.int8),
                     rhs_c.view(torch.int8),
-                    args[2],
+                    bench_c,
                     args[3],
                     args[4],
                     offs_c,
@@ -4361,7 +4335,7 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
                     M_c,
                     args[8],
                 ),
-                args[2],
+                bench_c,
                 None,
                 None,
             ]
@@ -4384,6 +4358,7 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
             xcd_aff=bool(aff),
             half_bnd=half,
             split_k=split,
+            beta_is_one=beta_is_one,
         )
 
     # Correctness reference: the first 4-wave candidate; masked kernel only as a compile/NaN fallback for i64 huge shapes.
@@ -4395,6 +4370,8 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
             cand = _compile_4wave(gm0, gn0, xcd0, aff0, hb0, sp0)
             ok = True
             for mp in mps:
+                if beta_is_one:
+                    mp[1].zero_()
                 cand(*mp[0])
                 torch.cuda.synchronize()
                 if not torch.isfinite(mp[1].view(-1)[:1024].float()).all().item():
@@ -4405,19 +4382,35 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
         except Exception:
             prod = None
     if prod is None:  # i64 huge shape or 4-wave failed to compile/produced NaN -> masked ref
-        _masked = _wgrad_masked_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, 8, 4, 1, i64_traverse=i64_traverse)
+        _masked = _wgrad_masked_cfg(
+            OUT_M,
+            OUT_N,
+            G,
+            out_fp16,
+            cbsz,
+            blgp,
+            8,
+            4,
+            1,
+            i64_traverse=i64_traverse,
+            beta_is_one=beta_is_one,
+        )
 
         def prod(*a):  # masked fallback takes neither the split-K scratch nor m_total, keeps stream
             return _masked(*a[:6], a[-1])
 
         prod_tag = "masked-fallback"
         for mp in mps:
+            if beta_is_one:
+                mp[1].zero_()
             prod(*mp[0])
             torch.cuda.synchronize()
             if not torch.isfinite(mp[1].view(-1)[:1024].float()).all().item():
                 return prod  # numeric guard: nothing else is safe to try
 
     for mp in mps:  # establish the per-M numeric reference from prod
+        if beta_is_one:
+            mp[1].zero_()
         prod(*mp[0])
         torch.cuda.synchronize()
         r = mp[1].detach().clone().float()
@@ -4427,6 +4420,8 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, i64_tr
         """Max launch time over the canonical loads, or None on rel-MSE drift / NaN."""
         worst = 0.0
         for targs, ov, ref, refnorm in mps:
+            if beta_is_one:
+                ov.zero_()
             launch(*targs)
             torch.cuda.synchronize()
             o = ov.detach().float()
@@ -4461,6 +4456,8 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     group_offs: "torch.Tensor",
     out_dtype=torch.bfloat16,
     num_cu: "int | None" = -1,
+    beta: float = 0.0,
+    out: "torch.Tensor | None" = None,
 ) -> "torch.Tensor":
     """FlyDSL per-tensor variable-K grouped fp8 GEMM (wgrad), matching the Triton entry.
     C[g] = lhs[g]^T @ rhs[g] * lhs_scale * rhs_scale, out [G, OUT_M, OUT_N]; group_offs [G+1]
@@ -4471,8 +4468,8 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out2d = torch.empty((G * OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
-    out = out2d.view(G, OUT_M, OUT_N)
+    out = resolve_accum_out(out, beta, (G, OUT_M, OUT_N), lhs.device, out_dtype)
+    beta_is_one = beta == 1.0
     # Split-K slice partials land in a persistent scratch; the reduce kernel folds them into C.
     ws = _wgrad_split_ws(OUT_M, OUT_N, G, lhs.device, out_dtype)
     # kernel reads group_offs as int64 low-words via a free int32-view (no .to(int32) cast).
@@ -4491,14 +4488,21 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
 
     M_total = lhs.shape[0]
     i64_tr = (M_total * OUT_M >= 2**32) or (M_total * OUT_N >= 2**32)
-    at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, i64_tr)
+    # beta_is_one is baked into the kernel (the epilogue reads C back), so it keys the cache.
+    at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, i64_tr, beta_is_one)
     # out as 2D [G*OUT_M, OUT_N] (the kernel's stacked-group view). m_total = the contraction
     # length, a plain SHAPE (the same one the i64 test reads): the kernel cuts its token-chunk grid
     # out of it, never looking at the offset table's CONTENT.
+    out2d = out.view(G * OUT_M, OUT_N)
     wargs = (lhs_i8, rhs_i8, out2d, lsf, rsf, go32, ws, M_total, stream)
     entry = _GROUPED_WGRAD_AT_CACHE.get(at_key)
     if entry is None:
-        entry = [_autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, i64_tr), None]
+        entry = [
+            _autotune_wgrad_dispatch(
+                OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, i64_tr, beta_is_one=beta_is_one
+            ),
+            None,
+        ]
         _GROUPED_WGRAD_AT_CACHE[at_key] = entry
     raw, compiled = entry
     # Mode-split, same as the forward entry: CUDA-graph capture takes the raw @flyc.jit closure,
@@ -4509,7 +4513,9 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     else:
         if compiled is None:
             try:
-                compiled = flyc.compile(raw, *wargs)
+                # compile runs the kernel once to build its artifact -- against the caller's
+                # buffer that would be a second accumulate, so beta=1 compiles on a scratch.
+                compiled = compile_with_scratch_out(raw, wargs, out_index=2)
             except Exception:  # masked fallback is a plain closure, not a @flyc.jit function
                 compiled = raw
             entry[1] = compiled

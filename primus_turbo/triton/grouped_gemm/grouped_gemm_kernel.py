@@ -793,8 +793,14 @@ def _process_variable_k_tile(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
+    BETA_IS_ONE: tl.constexpr,
 ):
-    """Compute one variable-K output tile given its global tile id."""
+    """Compute one variable-K output tile given its global tile id.
+
+    With ``BETA_IS_ONE=True`` the tile is accumulated into whatever ``C`` already
+    holds (``C += LHS_g^T @ RHS_g``) instead of overwriting it, which is the
+    ``D = beta*D + alpha*A*B`` pattern with beta=1.
+    """
     # -- Map to (group, local_tile) -- simple div/mod, O(1) --
     group_idx = global_tile // tiles_per_group
     local_tile = global_tile - group_idx * tiles_per_group
@@ -825,7 +831,8 @@ def _process_variable_k_tile(
 
     # -- K-loop over M_g (variable per group, always masked) --
     loop_k = tl.cdiv(M_g, BLOCK_SIZE_K)
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc_dtype = tl.float32
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
     for k in range(loop_k):
         k_start = k * BLOCK_SIZE_K
@@ -871,12 +878,19 @@ def _process_variable_k_tile(
     # -- Apply scaling and store --
     if IS_FP8:
         acc *= scale
-    c = acc.to(C.type.element_ty)
     rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
     C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+    if BETA_IS_ONE:
+        # Read the previous value of this tile and fold it into the FP32
+        # accumulator before the cast. Costs one extra HBM read per output tile,
+        # which is nearly free in the bandwidth-bound regime since the tile is
+        # written anyway, and it removes the standalone accumulation kernel the
+        # caller would otherwise have to launch over the whole output.
+        acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
+    c = acc.to(C.type.element_ty)
     tl.store(C_, c, c_mask)
 
 
@@ -911,8 +925,14 @@ def _grouped_variable_k_gemm_kernel(
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    BETA_IS_ONE: tl.constexpr = False,
 ):
-    """Persistent grouped variable-K GEMM kernel for backward (static stride)."""
+    """Persistent grouped variable-K GEMM kernel for backward (static stride).
+
+    With ``BETA_IS_ONE=True`` the kernel computes ``C = C + LHS_g^T @ RHS_g``, so a
+    caller holding a gradient-accumulation buffer can pass it as ``C`` and have the
+    accumulation folded into the GEMM's epilogue.
+    """
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
@@ -961,6 +981,7 @@ def _grouped_variable_k_gemm_kernel(
             CACHE_MODIFIER_A=CACHE_MODIFIER_A,
             CACHE_MODIFIER_B=CACHE_MODIFIER_B,
             ALLOW_TF32=ALLOW_TF32,
+            BETA_IS_ONE=BETA_IS_ONE,
         )
 
 
@@ -1002,8 +1023,12 @@ def _grouped_variable_k_gemm_kernel_ws(
     CACHE_MODIFIER_B: tl.constexpr,
     COUNTER_STRIDE: tl.constexpr,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
+    BETA_IS_ONE: tl.constexpr = False,
 ):
-    """Variable-K persistent GEMM with per-XCD + global-fallback work stealing."""
+    """Variable-K persistent GEMM with per-XCD + global-fallback work stealing.
+
+    ``BETA_IS_ONE`` behaves as in :func:`_grouped_variable_k_gemm_kernel`.
+    """
     pid = tl.program_id(0)
     tiles_m = tl.cdiv(OUT_M, BLOCK_SIZE_M)
     tiles_n = tl.cdiv(OUT_N, BLOCK_SIZE_N)
@@ -1067,6 +1092,7 @@ def _grouped_variable_k_gemm_kernel_ws(
             CACHE_MODIFIER_A=CACHE_MODIFIER_A,
             CACHE_MODIFIER_B=CACHE_MODIFIER_B,
             ALLOW_TF32=ALLOW_TF32,
+            BETA_IS_ONE=BETA_IS_ONE,
         )
         if in_phase2:
             g_idx = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope="gpu")
@@ -1094,10 +1120,12 @@ def grouped_gemm_variable_k_triton_kernel(
     work_steal: bool = False,
     ws_mode: str = "auto",
     ws_counter: torch.Tensor | None = None,
+    beta: float = 0.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Variable-K grouped BF16/FP16 GEMM (backward) using Triton.
 
-    Computes C[g] = lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]]
+    Computes C[g] = beta * C[g] + lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]]
     Output: [G, OUT_M, OUT_N].
 
     Args:
@@ -1112,9 +1140,18 @@ def grouped_gemm_variable_k_triton_kernel(
         ws_counter: Optional int32 buffer (per-device singleton managed by
             the higher-level wrapper when None). See
             ``grouped_gemm_triton_kernel`` for the single-stream caveat.
+        beta: Either ``0.0`` (overwrite, the default) or ``1.0`` (accumulate:
+            ``out += lhs^T @ rhs``); no other value is supported. ``beta=1.0``
+            requires ``out`` and folds the accumulation into the GEMM epilogue,
+            removing the separate elementwise add the caller would otherwise run
+            over the whole output.
+        out: Optional pre-allocated output buffer of shape ``(G, OUT_M, OUT_N)``.
+            When given, the kernel writes (or accumulates, see ``beta``) into it
+            instead of allocating, and its dtype decides the output dtype. Strides
+            are read off the tensor, so non-contiguous views are fine.
 
     Returns:
-        [G, OUT_M, OUT_N] output.
+        [G, OUT_M, OUT_N] output (the same tensor as ``out`` when it was given).
     """
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0]
@@ -1122,7 +1159,17 @@ def grouped_gemm_variable_k_triton_kernel(
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=lhs.dtype)
+    assert beta in (0.0, 1.0), f"Only beta=0 (overwrite) or beta=1 (accumulate) supported, got {beta}"
+    if out is None:
+        assert beta == 0.0, "beta=1.0 requires an explicit `out` buffer to accumulate into"
+        out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=lhs.dtype)
+    else:
+        expected_shape = (G, OUT_M, OUT_N)
+        assert tuple(out.shape) == expected_shape, (
+            f"out shape {tuple(out.shape)} must equal (G, OUT_M, OUT_N) = {expected_shape}"
+        )
+        assert out.device == lhs.device, "out must be on same device as lhs"
+
     device_num_cus = get_num_cus()
     num_sms = min(num_cu, device_num_cus) if num_cu is not None and num_cu > 0 else device_num_cus
     dummy_scale = torch.empty(1, device=lhs.device, dtype=torch.float32)
@@ -1193,6 +1240,7 @@ def grouped_gemm_variable_k_triton_kernel(
             CACHE_MODIFIER_A=cache_a,
             CACHE_MODIFIER_B=cache_b,
             COUNTER_STRIDE=COUNTER_STRIDE,
+            BETA_IS_ONE=(beta == 1.0),
             num_warps=8,
             num_stages=num_stages_val,
             waves_per_eu=0,
@@ -1228,6 +1276,7 @@ def grouped_gemm_variable_k_triton_kernel(
         IS_FP8=False,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        BETA_IS_ONE=(beta == 1.0),
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,

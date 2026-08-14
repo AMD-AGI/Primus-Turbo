@@ -148,6 +148,79 @@ def test_gemm_deterministic(m, n, k, layout, dtype, backend):
     GlobalBackendManager.reset()
 
 
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("main_grad_dtype", [torch.float32, None])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT])
+def test_gemm_fused_grad_accum(layout, dtype, main_grad_dtype, backend):
+    """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
+
+    The fused path hands the weight's ``main_grad`` to the wgrad GEMM as a beta=1
+    accumulate target instead of returning a gradient for autograd to add on top, so
+    the check is that the buffer moved by exactly the wgrad the ordinary path produces.
+    ``main_grad_dtype=None`` keeps the accumulator in the weight's own dtype; Megatron
+    uses FP32.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    m, n, k = 256, 512, 256
+    accum_dtype = main_grad_dtype if main_grad_dtype is not None else dtype
+
+    # A pinned backend exercises that backend's beta=1 accumulate epilogue; ``None``
+    # leaves the dispatcher to resolve one, which is how training actually runs.
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(False)
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    trans_a = layout[0] == "T"
+    trans_b = layout[1] == "T"
+    a_shape = (k, m) if trans_a else (m, k)
+    b_shape = (n, k) if trans_b else (k, n)
+
+    a = torch.randn(a_shape, dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+    grad_out = torch.randn((m, n), dtype=dtype, device=device)
+    a_fused = a.detach().clone().requires_grad_(True)
+    b_fused = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+
+    # Baseline: ordinary autograd, b.grad holds the weight gradient.
+    out = turbo.ops.gemm(a, b, trans_a, trans_b, dtype)
+    out.backward(grad_out)
+
+    # Fused: the wgrad is accumulated into a pre-seeded main_grad buffer.
+    previous = torch.randn(b_fused.shape, dtype=accum_dtype, device=device)
+    b_fused.main_grad = previous.clone()
+    b_fused.grad_added_to_main_grad = False
+
+    out_fused = turbo.ops.gemm(a_fused, b_fused, trans_a, trans_b, dtype, fuse_bgrad_accum_pattern="megatron")
+    out_fused.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # The forward is untouched, and the weight is flagged so the training framework's
+    # own accumulation step stands down. Following Megatron, backward still hands back
+    # a dummy tensor rather than None (it keeps the DDP hooks on the main thread), so
+    # what matters is the flag plus the dummy matching the weight's shape and dtype --
+    # a dtype mismatch would make autograd allocate and cast a full-size copy.
+    torch.testing.assert_close(out_fused, out)
+    assert b_fused.grad_added_to_main_grad is True, "weight must be flagged during forward"
+    assert b_fused.grad.shape == b_fused.shape, "dummy wgrad must keep the weight's shape"
+    assert b_fused.grad.dtype == b_fused.dtype, "dummy wgrad must keep the weight's dtype"
+
+    torch.testing.assert_close(a.grad, a_fused.grad, **get_tolerances(dtype))
+    # Compare the accumulated buffer rather than the wgrad recovered by subtracting
+    # `previous`: that subtraction cancels the leading digits and blows the rounding of
+    # a low-precision accumulator up past any sensible tolerance. Tolerances follow the
+    # GEMM's dtype, since the baseline wgrad was rounded to it before autograd stored it.
+    expected = (previous.float() + b.grad.float()).to(accum_dtype)
+    torch.testing.assert_close(b_fused.main_grad, expected, **get_tolerances(dtype))
+
+    GlobalBackendManager.reset()
+
+
 @pytest.mark.parametrize(
     "m, n, k, layout",
     [

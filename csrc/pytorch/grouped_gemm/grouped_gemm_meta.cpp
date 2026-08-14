@@ -64,7 +64,11 @@ at::Tensor ck_grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at:
 //==================================================================
 at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                        at::Tensor &group_offs, const bool transA, const bool transB,
-                                       const bool pre_sync) {
+                                       const bool pre_sync, const double beta,
+                                       c10::optional<at::Tensor> out) {
+    if (out.has_value()) {
+        return out.value();
+    }
     if (transA) {
         const int64_t bs = group_lens.numel();
         const int64_t m  = transA ? a.size(1) : a.size(0);
@@ -81,7 +85,11 @@ at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Ten
                                            at::Tensor &b_scales, at::Tensor &group_lens,
                                            at::Tensor &group_offs, const bool transA,
                                            const bool transB, at::ScalarType out_dtype,
-                                           const std::string &granularity, const bool pre_sync) {
+                                           const std::string &granularity, const bool pre_sync,
+                                           const double beta, c10::optional<at::Tensor> out) {
+    if (out.has_value()) {
+        return out.value();
+    }
     if (transA) {
         const int64_t bs = group_lens.numel();
         const int64_t m  = a.size(1);

@@ -160,9 +160,12 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
         **kwargs,
     ) -> bool:
         supported = True
+        # This backend has no beta=1 accumulate epilogue.
+        supported &= not inplace_add_to_out
         supported &= build_ck()
         supported &= not is_gfx1250()
         supported &= a.dim() == 2 and b.dim() == 2
@@ -278,6 +281,8 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
         supported = True
@@ -285,6 +290,11 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
         supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+
+        if inplace_add_to_out:
+            supported &= out is not None and out.is_contiguous()
+            supported &= out is not None and (out.dtype == a.dtype or out.dtype == torch.float32)
+
         return supported
 
     @staticmethod
@@ -299,6 +309,8 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         num_cu: int | None,
         maybe_pre_sync: bool = False,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if trans_c:
@@ -308,8 +320,9 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
             lhs, rhs = a, b
             trans_lhs, trans_rhs = trans_a, trans_b
 
+        beta = 1.0 if inplace_add_to_out else 0.0
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm(
-            lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs, maybe_pre_sync
+            lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs, maybe_pre_sync, beta, out
         )
 
 
@@ -399,6 +412,8 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if trans_c:
@@ -412,6 +427,8 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
             num_cu=num_cu,
             work_steal=(schedule == "work_steal"),
             ws_mode="auto",
+            beta=(1.0 if inplace_add_to_out else 0.0),
+            out=out,
         )
 
 
@@ -544,6 +561,78 @@ def grouped_gemm_impl_meta(
     m = a.shape[1] if trans_a else a.shape[0]
     n = b.shape[-2] if trans_b else b.shape[-1]
     return torch.empty((m, n), device=a.device, dtype=a.dtype)
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::grouped_gemm_variable_k_accum_impl", mutates_args={"out"}, device_types="cuda"
+)
+def grouped_gemm_variable_k_accum_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+    schedule: str = "static",
+) -> None:
+    """Variable-K grouped BF16/FP16 GEMM that accumulates into ``out``.
+
+    Computes ``out += A^T @ B`` per group, folding the accumulation into the GEMM
+    epilogue (beta=1)
+    """
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    kwargs = dict(
+        a=a,
+        b=b,
+        group_lens=group_lens,
+        group_offs=group_offs,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        num_cu=num_cu,
+        maybe_pre_sync=maybe_pre_sync,
+        schedule=schedule,
+        inplace_add_to_out=True,
+        out=out,
+    )
+
+    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
+    # the caller's buffer would accumulate the wgrad once per warmup and timing
+    # iteration.
+    if (
+        GlobalBackendManager.auto_tune_enabled()
+        and not GroupedGEMMVariableKKernelDispatcher._is_graph_capturing()
+    ):
+        GroupedGEMMVariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+
+    GroupedGEMMVariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+
+
+@grouped_gemm_variable_k_accum_impl.register_fake
+def grouped_gemm_variable_k_accum_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+    schedule: str = "static",
+) -> None:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
+    assert out.dim() == 3, f"out must be 3D, got {out.shape}"
+    return None
 
 
 @grouped_gemm_variable_k_impl.register_fake
