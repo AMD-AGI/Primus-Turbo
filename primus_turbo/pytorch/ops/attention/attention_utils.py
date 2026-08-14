@@ -25,14 +25,23 @@ def _check_and_convert(t, scale, float8_fw):
     return (t * scale).clamp(min=finfo.min, max=finfo.max).to(dtype=float8_fw) if t.dtype != float8_fw else t
 
 
-def _infer_qkv_format(
+def _infer_storage_order(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
 ) -> str:
-    """Infer whether the memory layout is ``"bshd"`` or ``"sbhd"``.
+    """Which memory order the bytes of ``[b, s, h, d]``-shaped q/k/v are in.
 
-    All three tensors are assumed to have **logical** shape ``[b, s, h, d]``.
+    This answers "how are the bytes laid out", NOT "what do the axes mean": all three
+    tensors are ``[b, s, h, d]``-shaped views here, and the answer says which of
+    bshd / sbhd / bhsd they would be contiguous in. The aiter backends need it to allocate
+    outputs and grads with strides matching the input; FlyDSL needs it because its kernels
+    are sbhd-native, so only a view over sbhd bytes permutes back into a *contiguous*
+    ``[s, b, h, d]``.
+
+    ⚠ It cannot recover a distinction the strides do not carry: at ``b == 1`` (or
+    ``s == 1``) sbhd and bshd are the very same bytes. A caller whose tensors really are
+    ``[s, b, h, d]``-shaped says so with ``qkv_format="sbhd"`` instead of letting this guess.
     """
 
     def _infer_format(t: torch.Tensor) -> str:

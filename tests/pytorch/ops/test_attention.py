@@ -307,6 +307,36 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal):
     assert value_grad_snr > 40, f"value_grad_snr too low: {value_grad_snr}"
 
 
+# (Hq, Hkv): the first passes the FlyDSL gate, the second is MHA -- a GQA group of 1 is
+# rejected there, so it exercises the fall-back to a backend that wants [b, s, h, d].
+@pytest.mark.parametrize("heads", [(8, 1), (8, 8)])
+def test_attention_declared_sbhd(heads):
+    """``flash_attn_func(qkv_format="sbhd")`` means the tensors ARE [s, b, h, d].
+
+    Whichever backend the shape resolves to has to see its own axis order: FlyDSL is
+    sbhd-native and takes them as they are, everything else wants [b, s, h, d] and must be
+    handed a permuted view. Regression for the case where the declared order was passed
+    straight through to a bshd backend, which then read s as the batch -- no error, just a
+    wrong answer (rel_err 4.3 at (s,b)=(256,2))."""
+    device, dtype = "cuda", torch.bfloat16
+    num_head_q, num_head_kv = heads
+    s, b, d = 256, 2, 64  # s != b so a swapped pair cannot go unnoticed
+    sm_scale = d ** (-0.5)
+    torch.manual_seed(0)
+
+    q = torch.randn(s, b, num_head_q, d, device=device, dtype=dtype)
+    k = torch.randn(s, b, num_head_kv, d, device=device, dtype=dtype)
+    v = torch.randn(s, b, num_head_kv, d, device=device, dtype=dtype)
+
+    o_ref = attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, True, "sbhd")
+    o = flash_attn_func(q, k, v, softmax_scale=sm_scale, causal=True, qkv_format="sbhd")
+
+    assert o.shape == (s, b, num_head_q, d), f"expected the caller's sbhd axes back, got {tuple(o.shape)}"
+    snr = compute_snr(o_ref, o)
+    print(f"\ndeclared-sbhd Hq={num_head_q} Hkv={num_head_kv}: out={snr:.1f}")
+    assert snr > 40, f"out SNR too low: {snr:.1f}"
+
+
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx950()), reason="flydsl flash-attn is gfx950-only"
 )

@@ -38,7 +38,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_forward_impl,
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
-    _infer_qkv_format,
+    _infer_storage_order,
     _resolve_is_v3_atomic_fp32_from_env,
     block_scaling_node,
     get_p_scale,
@@ -421,24 +421,34 @@ def flash_attn_func(
     sink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = None,
 ):
-    # ``qkv_format="sbhd"`` says the tensors ARE [s, b, h, d] -- the layout FlyDSL has, and
-    # the one that has to be stated rather than guessed, since at b=1 sbhd and bshd hold the
-    # very same bytes. Leaving it None keeps the old inference, which reads the tensors as
-    # [b, s, h, d] whatever their storage; that view is relabelled here, once, so nothing
-    # below has to permute.
-    bshd_view_in = False
-    if qkv_format is None:
-        qkv_format = _infer_qkv_format(q, k, v)
-        if qkv_format == "sbhd":
-            q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
-            bshd_view_in = True
+    """``qkv_format`` names the axis order of the q/k/v you pass:
+
+    * ``None`` / ``"bshd"`` -- ``[b, s, h, d]``. The storage order is then inferred from the
+      strides, which is all the aiter backends want (they allocate outputs and grads to
+      match) and what decides FlyDSL eligibility.
+    * ``"sbhd"`` -- ``[s, b, h, d]``, the order FlyDSL is native in. Say it rather than let
+      it be guessed: at ``b == 1`` the two orders are byte-identical.
+
+    Only FlyDSL is sbhd-native; every other backend takes ``[b, s, h, d]``. So this
+    boundary keeps one ``[b, s, h, d]`` view for dispatch and for aiter, hands FlyDSL the
+    ``[s, b, h, d]`` one, and puts the result back in the caller's order -- each tensor
+    crosses at most one permute in and one out, and none at all when an sbhd caller lands
+    on FlyDSL.
+    """
+    sbhd_in = qkv_format == "sbhd"
+    if sbhd_in:
+        q_bshd, k_bshd, v_bshd = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+        storage_order = "sbhd"  # declared: the strides could not have told us at b == 1
+    else:
+        q_bshd, k_bshd, v_bshd = q, k, v
+        storage_order = _infer_storage_order(q, k, v)
 
     backend = resolve_flash_attn_backend(
         varlen=False,
         user_backend=GlobalBackendManager.get_attn_backend(_ATTN_PRECISION),
-        q=q,
-        k=k,
-        v=v,
+        q=q_bshd,
+        k=k_bshd,
+        v=v_bshd,
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -446,24 +456,30 @@ def flash_attn_func(
         bias=bias,
         alibi_slopes=alibi_slopes,
         sink=sink,
-        qkv_format=qkv_format,
+        qkv_format=storage_order,
     )
+
+    def _to_caller_order(res):
+        """Only the attention output carries the s/b axes; LSE is [b, h, s] either way."""
+        if isinstance(res, tuple):
+            out, *rest = res
+            return (out.permute(1, 0, 2, 3), *rest)
+        return res.permute(1, 0, 2, 3)
+
     # FlyDSL emits no dropout softmax matrix; keep return_attn_probs on aiter.
     if backend == BackendType.FLYDSL and not return_attn_probs:
+        # FlyDSL wants a contiguous [s, b, h, d] -- which is what sbhd storage is, and the
+        # gate above only lets sbhd storage through.
+        q_s, k_s, v_s = (q, k, v) if sbhd_in else tuple(t.permute(1, 0, 2, 3) for t in (q_bshd, k_bshd, v_bshd))
         res = FlydslFlashAttnFunc.apply(
-            q, k, v, softmax_scale, causal, window_size, return_lse, torch.is_grad_enabled(), sink
+            q_s, k_s, v_s, softmax_scale, causal, window_size, return_lse, torch.is_grad_enabled(), sink
         )
-        if not bshd_view_in:
-            return res
-        # give a caller that came in on [b, s, h, d] its own axes back
-        return (res[0].permute(1, 0, 2, 3), res[1]) if return_lse else res.permute(1, 0, 2, 3)
+        return res if sbhd_in else _to_caller_order(res)
 
-    if bshd_view_in:  # aiter takes logical [b, s, h, d] plus the storage name
-        q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
     result = AiterFlashAttnFunc.apply(
-        q,
-        k,
-        v,
+        q_bshd,
+        k_bshd,
+        v_bshd,
         dropout_p,
         softmax_scale,
         causal,
@@ -476,10 +492,10 @@ def flash_attn_func(
         torch.is_grad_enabled(),
         1,  # how_v3_bf16_cvt
         sink,
-        qkv_format,
+        storage_order,
     )
 
-    return result
+    return _to_caller_order(result) if sbhd_in else result
 
 
 def flash_attn_fp8_func(
@@ -497,16 +513,12 @@ def flash_attn_fp8_func(
     return_attn_probs=False,
     fp8_config: Optional[Float8QuantConfig] = None,
 ):
-    qkv_format = _infer_qkv_format(q, k, v)
-
-    if qkv_format == "bhsd":
-        q = q.permute(0, 2, 1, 3).contiguous()
-        k = k.permute(0, 2, 1, 3).contiguous()
-        v = v.permute(0, 2, 1, 3).contiguous()
-    elif qkv_format == "sbhd":
-        q = q.permute(1, 0, 2, 3).contiguous()
-        k = k.permute(1, 0, 2, 3).contiguous()
-        v = v.permute(1, 0, 2, 3).contiguous()
+    # q/k/v are [b, s, h, d]-shaped; the triton fp8 path wants those bytes contiguous in
+    # that order. Materialise them when they are not -- do NOT permute the axes, which is
+    # what the old branches did: a bshd-shaped view over sbhd bytes came out [s, b, h, d]
+    # and was then read as [b, s, h, d], silently swapping b and s.
+    if _infer_storage_order(q, k, v) != "bshd":
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:
@@ -540,11 +552,6 @@ def flash_attn_fp8_func(
         torch.is_grad_enabled(),
         True,
     )
-
-    if qkv_format == "sbhd":
-        o = o.permute(1, 0, 2, 3).contiguous()
-    elif qkv_format == "bhsd":
-        o = o.permute(0, 2, 1, 3).contiguous()
 
     return o
 

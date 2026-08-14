@@ -162,10 +162,11 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         qkv_format="bshd",
         **kwargs,
     ) -> bool:
-        # FlyDSL dense forward is SBHD-native: only the no-copy sbhd layout is eligible.
-        # A single-batch tensor is that layout whichever name it gets -- [1,s,h,d] and
-        # [s,1,h,d] hold the same bytes -- so a b=1 caller passes qkv_format="sbhd" rather
-        # than leaving the tied strides to be guessed (see flash_attn_func).
+        # FlyDSL dense forward is SBHD-native, so it is eligible only when the bytes are
+        # already in sbhd order -- then the [s,b,h,d] view flash_attn_func hands it is
+        # contiguous and nothing is copied. ``qkv_format`` here is that *storage* order
+        # (flash_attn_func passes _infer_storage_order's answer, or "sbhd" when the caller
+        # declared sbhd axes), not the axis order of the caller's tensors.
         if k is None or not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
             return False
         return qkv_format == "sbhd" and _flydsl_common_ok(

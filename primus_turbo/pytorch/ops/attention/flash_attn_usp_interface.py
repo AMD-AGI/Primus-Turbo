@@ -25,7 +25,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_forward_impl,
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
-    _infer_qkv_format,
+    _infer_storage_order,
     _resolve_is_v3_atomic_fp32_from_env,
     block_scaling_node,
     get_p_scale,
@@ -745,7 +745,7 @@ def flash_attn_usp_func(
     qkv_format: Optional[str] = None,
 ):
     if qkv_format is None:
-        qkv_format = _infer_qkv_format(q, k, v)
+        qkv_format = _infer_storage_order(q, k, v)
 
     return AttentionCKFunctionCPA2A.apply(
         q,
@@ -837,7 +837,7 @@ def flash_attn_fp8_usp_func(
     ulysses_group=None,
     ring_group=None,
 ):
-    qkv_format = _infer_qkv_format(q, k, v)
+    qkv_format = _infer_storage_order(q, k, v)
 
     if qkv_format == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
