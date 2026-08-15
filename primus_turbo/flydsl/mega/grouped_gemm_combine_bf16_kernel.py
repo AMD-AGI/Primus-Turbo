@@ -5,6 +5,7 @@
 ###############################################################################
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -22,7 +23,7 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
     gemm_bf16_tile,
 )
 from primus_turbo.flydsl.mega.ep_intranode import (
-    combine_bf16_tile,
+    combine_dedup_bf16_tile,
     topk_reduce_bf16_tile,
 )
 from primus_turbo.flydsl.mega.prims import (
@@ -57,6 +58,13 @@ _NUM_WARPS = _BLOCK_THREADS // _WARP
 _LAYOUTS = ("nt", "nn", "tn")
 _LAYOUT_CODES = {name: code for code, name in enumerate(_LAYOUTS)}
 
+# accumulator chunks live per pass; 2 keeps the gather-reduce under the GEMM VGPR budget
+_COMBINE_DEDUP_NPASS = int(os.environ.get("TURBO_COMBINE_DEDUP_NPASS", "2"))
+
+_H_SOURCE_SLOT_KIND = 13
+_H_SORTED_DISPATCH_SLOT_IDS = 19
+_H_DEDUP_KEY_ROW = 20
+
 
 def _make_grouped_gemm_combine(
     out_features,
@@ -77,6 +85,7 @@ def _make_grouped_gemm_combine(
     layout="nt",
     apply_weights=False,
     with_gate=False,
+    dedup_npass=2,
 ):
     K = hidden_size
     gemm_tile = functools.partial(gemm_bf16_tile, layout)
@@ -107,6 +116,9 @@ def _make_grouped_gemm_combine(
         TOPK_WEIGHTS: fx.Tensor,
         GRAD_GATE: fx.Tensor,
         D_TOPK_W: fx.Tensor,
+        SORTED_SLOT_IDS: fx.Tensor,
+        DEDUP_KEY_ROW: fx.Tensor,
+        SOURCE_SLOT_KIND: fx.Tensor,
         sym_buffer: SymBuffer,
         c_n: fx.Int32,
         COMBINE_PARITY: fx.Tensor,
@@ -166,19 +178,24 @@ def _make_grouped_gemm_combine(
             create_buffer_resource_from_addr(gate_base, num_records_bytes=gate_records) if with_gate else None
         )
         d_topk_w_res = create_buffer_resource(D_TOPK_W, max_size=True) if with_gate else None
+        sorted_slot_res = create_buffer_resource(SORTED_SLOT_IDS, max_size=True)
+        key_row_res = create_buffer_resource(DEDUP_KEY_ROW, max_size=True)
+        kind_res = create_buffer_resource(SOURCE_SLOT_KIND, max_size=True)
 
         if block_index < combine_cu:
             # Task-based combine: one warp per recv-segment, gated on its spanned GEMM tiles.
             seg_local = (fx.Int32(num_experts) - block_index + combine_cu - fx.Int32(1)) // combine_cu
+            # Dedup gathers rows below the segment, so it gates on the whole tile prefix.
+            # The cursor rides seg_iter (task_index is row-ordered), so each tile polls once.
+            combine_cursor = fx.Int32(0)
             for seg_iter in range(seg_local):
                 task_index = block_index + seg_iter * combine_cu
                 seg_start = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
                 seg_count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
                 if seg_count > fx.Int32(0):
-                    t0 = seg_start // fx.Int32(BLOCK_M)
                     t1 = (seg_start + seg_count - fx.Int32(1)) // fx.Int32(BLOCK_M)
+                    tile_cursor = combine_cursor
                     if thread_index == fx.Int32(0):
-                        tile_cursor = t0
                         while tile_cursor <= t1:
                             spin_start = read_clock()
                             fx.rocdl.s_waitcnt(0)
@@ -207,9 +224,10 @@ def _make_grouped_gemm_combine(
                                     dtype=fx.T.i64(),
                                 )
                             tile_cursor = tile_cursor + fx.Int32(1)
+                    combine_cursor = tile_cursor
                     fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()
-                    combine_bf16_tile(
+                    combine_dedup_bf16_tile(
                         sym_buffer,
                         workspace,
                         thread_index=thread_index,
@@ -218,11 +236,16 @@ def _make_grouped_gemm_combine(
                         recv_start_row_res=recv_start_row_res,
                         recv_count_res=recv_count_res,
                         origin_slot_res=origin_slot_res,
+                        sorted_slot_res=sorted_slot_res,
+                        key_row_res=key_row_res,
                         grad_gate_res=grad_gate_res,
+                        topk=topk,
+                        apply_weights=apply_weights,
                         signal=True,
                         epoch=expected_reduce_i64,
                         bank_offset=reduce_bank,
                         with_gate=with_gate,
+                        npass=dedup_npass,
                     )
         else:
             gemm_tile_index = block_index - fx.Int32(gemm_base)
@@ -294,7 +317,7 @@ def _make_grouped_gemm_combine(
                     )
                     topk_reduce_bf16_tile(
                         True,
-                        apply_weights,
+                        False,  # dedup already applied the routing weight on the sender
                         with_gate,
                         thread_index,
                         empty_ordinal,
@@ -313,6 +336,9 @@ def _make_grouped_gemm_combine(
                         gate_local_res,
                         d_topk_w_res,
                         expected_reduce_i64,
+                        dedup=True,
+                        kind_res=kind_res,
+                        num_combine_slots=num_combine_slots,
                     )
 
     return grouped_gemm_combine_kernel
@@ -340,7 +366,8 @@ def _make_epoch_bump(add_combine, add_reduce):
 
 
 @autotune(
-    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64) for rc in (256,)],
+    # 96/128 are headroom for wider folds; DSv3 still tunes to 64 (nt) / 32 (nn).
+    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64, 96, 128) for rc in (256,)],
     # layout_code MUST be a key: nt/nn have OPPOSITE combine_cu optima (see wrapper note).
     key=[
         "out_features",
@@ -375,6 +402,9 @@ def _compiled_grouped_gemm_combine(
     TOPK_WEIGHTS,
     GRAD_GATE,
     D_TOPK_W,
+    SORTED_SLOT_IDS,
+    DEDUP_KEY_ROW,
+    SOURCE_SLOT_KIND,
     sym_buffer,
     c_n,
     COMBINE_PARITY,
@@ -395,6 +425,7 @@ def _compiled_grouped_gemm_combine(
     apply_weights: fx.Constexpr[bool],
     with_gate: fx.Constexpr[bool],
     out_fp16: fx.Constexpr[bool],
+    dedup_npass: fx.Constexpr[int],
     stream: fx.Stream,
     num_combine_cu: fx.Constexpr[int] = 64,
     num_reduce_cu: fx.Constexpr[int] = 256,
@@ -421,6 +452,7 @@ def _compiled_grouped_gemm_combine(
         _LAYOUTS[layout_code],
         apply_weights,
         with_gate,
+        dedup_npass,
     )
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
@@ -444,6 +476,9 @@ def _compiled_grouped_gemm_combine(
         TOPK_WEIGHTS,
         GRAD_GATE,
         D_TOPK_W,
+        SORTED_SLOT_IDS,
+        DEDUP_KEY_ROW,
+        SOURCE_SLOT_KIND,
         sym_buffer,
         c_n,
         COMBINE_PARITY,
@@ -520,6 +555,15 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     d_topk_w = torch.empty(num_combine_slots, dtype=torch.float32, device=device) if with_gate else None
     d_topk_w_d = d_topk_w if with_gate else dummy
 
+    # Sender-side dedup is the only combine path: it folds a token's local routes into
+    # one push, so combine moves exactly the bytes dispatch did.
+    assert len(handle) > _H_DEDUP_KEY_ROW and handle[_H_DEDUP_KEY_ROW].numel() > 1, (
+        "combine needs the dispatch dedup tables; run dispatch with dedup=True"
+    )
+    sorted_slot_ids = handle[_H_SORTED_DISPATCH_SLOT_IDS]
+    dedup_key_row = handle[_H_DEDUP_KEY_ROW]
+    source_slot_kind = handle[_H_SOURCE_SLOT_KIND]
+
     # epoch advance moved inside _compiled_grouped_gemm_combine (autotune-safe, no rewind)
     # num_combine_cu / num_reduce_cu are tunable per shape+layout (nt/nn optima differ).
     _compiled_grouped_gemm_combine(
@@ -537,6 +581,9 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         topk_weights_d,
         grad_gate_d,
         d_topk_w_d,
+        sorted_slot_ids,
+        dedup_key_row,
+        source_slot_kind,
         sym_buffer,
         c_n,
         COMBINE_PARITY=symm._combine_parity,
@@ -557,6 +604,7 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         apply_weights=bool(apply_weights),
         with_gate=bool(with_gate),
         out_fp16=False,
+        dedup_npass=int(_COMBINE_DEDUP_NPASS),
         stream=torch.cuda.current_stream(),
     )
     return output, d_topk_w

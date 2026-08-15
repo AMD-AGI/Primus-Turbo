@@ -18,6 +18,7 @@ from flydsl.expr.buffer_ops import (
 
 from primus_turbo.flydsl.mega.prims import (
     atomic_add,
+    cast,
     copy_warp,
     ld,
     read_clock,
@@ -34,6 +35,20 @@ _L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invali
 # Rows whose slot/kind lookups are batched per dispatch-loop iteration. See the
 # comment at the loop in dispatch_bf16_tile.
 _ROW_UNROLL = 4
+# Ceiling on in-flight gather loads per warp in the dedup send-side reduce. The arity
+# branches share one VGPR budget, so npass scales with the arity to keep every branch
+# under this. Not an env knob on purpose: it shapes the generated code but is not part
+# of the JIT cache key, so an override would silently reuse a stale kernel.
+# 64 measured best: the gather is latency-bound on scattered member rows, so fewer
+# passes wins. Do not raise it -- 128 unrolls arity 8 far enough to spill and hang.
+_GATHER_INFLIGHT = 64
+
+
+def _npass_for(arity, out_features, npass):
+    """Passes needed to hold ``arity`` members' loads within the in-flight budget."""
+    num_full_chunks = out_features // (_WARP * _PVEC)
+    need = (arity * num_full_chunks + _GATHER_INFLIGHT - 1) // _GATHER_INFLIGHT
+    return max(1, min(need, num_full_chunks))
 
 
 @ASTRewriter.transform
@@ -201,6 +216,301 @@ def combine_bf16_tile(
             st(barrier_addr, bank + slot, epoch, order="relaxed", scope="sys")
 
 
+def _member_row_resource(l2_ptr, row, present, row_bytes):
+    """One row-sized buffer descriptor. ``present`` false -> num_records 0.
+
+    The pool is >4 GB, so it cannot be addressed by one descriptor; a per-row base
+    keeps the offsets 32-bit and lets an absent member be nulled by size instead.
+    """
+    base = l2_ptr + cast(row, fx.T.i64()) * fx.Int64(row_bytes)
+    nbytes = row_bytes if present is None else arith.select(present, fx.Int32(row_bytes), fx.Int32(0))
+    return create_buffer_resource_from_addr(base, num_records_bytes=nbytes)
+
+
+def _gather_reduce_store(
+    member_res,
+    peer_res,
+    weights,
+    dst_base,
+    lane_col,
+    out_features,
+    npass,
+    oob_store_index,
+):
+    """Column-wise weighted sum of ``member_res`` -> one bf16 row at ``dst_base``.
+
+    Plain python (no ASTRewriter): every loop here is unrolled at trace time, so the
+    accumulator list never has to survive a traced branch.
+    """
+    f32_vec = fx.T.VectorType.get([_PVEC], fx.T.f32())
+    bf16_vec = fx.T.VectorType.get([_PVEC], fx.T.bf16())
+    cols_per_step = _WARP * _PVEC
+    num_full_chunks = out_features // cols_per_step
+    tail_cols = out_features % cols_per_step
+
+    def accumulate(cols):
+        accs = [None] * len(cols)
+        for res, weight in zip(member_res, weights):
+            values = [
+                buffer_load(
+                    res,
+                    col,
+                    vec_width=_PVEC,
+                    dtype=fx.T.bf16(),
+                    cache_modifier=18,  # sc1|nt: read the same-agent GEMM stage.
+                )
+                for col in cols
+            ]
+            for i, value in enumerate(values):
+                term = fx.arith.extf(f32_vec, value)
+                if weight is not None:
+                    term = fx.arith.mulf(term, _vector.broadcast(f32_vec, weight))
+                accs[i] = term if accs[i] is None else fx.arith.addf(accs[i], term)
+        return accs
+
+    # Split into passes so the live accumulator set stays under the GEMM path's VGPR budget.
+    chunk_step = max(1, (num_full_chunks + npass - 1) // npass)
+    for first in range(0, num_full_chunks, chunk_step):
+        cols = [
+            fx.Int32(c * cols_per_step) + lane_col
+            for c in range(first, min(first + chunk_step, num_full_chunks))
+        ]
+        accs = accumulate(cols)
+        for col, acc in zip(cols, accs):
+            buffer_store(
+                fx.arith.trunc_f(bf16_vec, acc),
+                peer_res,
+                dst_base + col,
+                cache_modifier=19,  # sc0|sc1|nt: publish to a remote agent.
+            )
+    if tail_cols:
+        col = fx.Int32(num_full_chunks * cols_per_step) + lane_col
+        in_tail = lane_col < fx.Int32(tail_cols)
+        safe_col = arith.select(in_tail, col, fx.Int32(out_features - _PVEC))
+        acc = accumulate([safe_col])[0]
+        dst = arith.select(in_tail, dst_base + col, oob_store_index)
+        buffer_store(fx.arith.trunc_f(bf16_vec, acc), peer_res, dst, cache_modifier=19)
+
+
+@ASTRewriter.transform
+def combine_dedup_bf16_tile(
+    sym: SymBuffer,
+    workspace: Workspace,
+    thread_index: fx.Int32,
+    task_index: fx.ArithValue,
+    recv_dst_rank_res: fx.ArithValue,
+    recv_start_row_res: fx.ArithValue,
+    recv_count_res: fx.ArithValue,
+    origin_slot_res: fx.ArithValue,
+    sorted_slot_res: fx.ArithValue,
+    key_row_res: fx.ArithValue,
+    grad_gate_res: Optional[fx.ArithValue] = None,
+    topk: int = 1,
+    apply_weights: bool = False,
+    signal: bool = False,
+    epoch: Optional[fx.Int64] = None,
+    bank_offset: Optional[fx.Int32] = None,
+    with_gate: bool = False,
+    npass: int = 2,
+):
+    # DeepEP-style sender dedup: the highest pool row of a source token folds every
+    # local route of that token into one weighted row and pushes it to the primary
+    # slot. That makes the push exactly the inverse of dispatch's unique-row send.
+    out_features = int(workspace.hidden)
+    n_slots = int(workspace.num_combine_slots)
+    num_pool_rows = int(workspace.num_max_pool_tokens)
+    comb_records = n_slots * out_features * 2
+    gate_records = n_slots * 4
+    row_bytes = out_features * 2
+    row_words = row_bytes // 4  # copy_warp offsets are i32 words
+    # Lone unweighted routes can be copied verbatim instead of folded.
+    plain_copy = (not apply_weights) and row_bytes % (_WARP * 16) == 0
+    warp_id = thread_index // fx.Int32(_WARP)
+    lane_id = thread_index % fx.Int32(_WARP)
+    lane_col = lane_id * fx.Int32(_PVEC)
+    oob_row = fx.Int32(num_pool_rows)
+    oob_slot = fx.Int32(n_slots)
+
+    dst_rank = buffer_load(recv_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
+    start_row = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
+    count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+    # hoist workspace-derived values before the dynamic loop (rewriter can't carry Workspace)
+    comb_addr = sym.map(workspace.get_combine_token_buffer_ptr(), dst_rank)
+    gate_addr = sym.map(workspace.get_combine_gate_ptr(), dst_rank) if with_gate else None
+    barrier_addr = sym.map(workspace.get_reduce_flag_ptr(), dst_rank) if signal else None
+    # Exactly-sized resources: an absent member indexes past num_records, so the
+    # hardware drops the request and returns 0 instead of moving any bytes.
+    l2_ptr = workspace.get_l2_token_buffer_ptr()
+    weight_res = (
+        create_buffer_resource_from_addr(
+            workspace.get_weight_recv_buf_ptr(), num_records_bytes=num_pool_rows * 4
+        )
+        if apply_weights
+        else None
+    )
+    peer_res = create_buffer_resource_from_addr(comb_addr, num_records_bytes=comb_records)
+    gate_peer_res = (
+        create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records) if with_gate else None
+    )
+
+    row_stride = fx.Int32(_NUM_WARPS)
+    row_off = warp_id
+
+    def _key(row):
+        return buffer_load(sorted_slot_res, row, vec_width=1, dtype=fx.T.i32())
+
+    def _pusher(key_base):
+        # Members are row-descending with a -1 tail: slot 0 pushes, the last valid is primary.
+        return buffer_load(key_row_res, key_base, vec_width=1, dtype=fx.T.i32())
+
+    def _push_group(row, key_base, pusher_row):
+        if row == pusher_row:
+            member_rows = [
+                buffer_load(key_row_res, key_base + fx.Int32(k), vec_width=1, dtype=fx.T.i32())
+                for k in range_constexpr(topk)
+            ]
+            primary_row = member_rows[0]
+            present = [None] * topk
+            safe_rows = [member_rows[0]]
+            for k in range_constexpr(topk):
+                if k > 0:
+                    present[k] = member_rows[k] >= fx.Int32(0)
+                    primary_row = arith.select(present[k], member_rows[k], primary_row)
+                    safe_rows.append(arith.select(present[k], member_rows[k], oob_row))
+            # slot 0 is the pusher itself: always present, so keep its size static.
+            member_res = [
+                _member_row_resource(l2_ptr, safe_rows[k], present[k], row_bytes)
+                for k in range_constexpr(topk)
+            ]
+            weights = [None] * topk
+            if const_expr(apply_weights):
+                weights = [buffer_load(weight_res, r, vec_width=1, dtype=fx.T.f32()) for r in safe_rows]
+            dst_slot = buffer_load(origin_slot_res, primary_row, vec_width=1, dtype=fx.T.i32())
+            dst_base = dst_slot * fx.Int32(out_features)
+            oob_store = oob_slot * fx.Int32(out_features)
+            if const_expr(topk == 1 and plain_copy):
+                copy_warp(
+                    comb_addr,
+                    l2_ptr,
+                    row_bytes,
+                    dst_off=dst_slot * fx.Int32(row_words),
+                    src_off=row * fx.Int32(row_words),
+                    load_cache_modifier=18,
+                    store_cache_modifier=19,
+                )
+            elif const_expr(topk == 1):
+                _gather_reduce_store(
+                    member_res[:1],
+                    peer_res,
+                    weights[:1],
+                    dst_base,
+                    lane_col,
+                    out_features,
+                    _npass_for(1, out_features, npass),
+                    oob_store,
+                )
+            else:
+                # An absent member costs no bandwidth but still issues its loads, so
+                # branch on the real arity. Routes land ~60% lone, ~30% pairs, ~10% more.
+                if member_rows[1] < fx.Int32(0):
+                    if const_expr(plain_copy):
+                        # Unweighted lone route: nothing to fold, so raw dwordx4 beats the
+                        # gather-reduce -- no extf/addf/truncf, and all copies stay in flight.
+                        copy_warp(
+                            comb_addr,
+                            l2_ptr,
+                            row_bytes,
+                            dst_off=dst_slot * fx.Int32(row_words),
+                            src_off=row * fx.Int32(row_words),
+                            load_cache_modifier=18,  # sc1|nt: read the same-agent GEMM stage.
+                            store_cache_modifier=19,  # sc0|sc1|nt: publish to a remote agent.
+                        )
+                    else:
+                        _gather_reduce_store(
+                            member_res[:1],
+                            peer_res,
+                            weights[:1],
+                            dst_base,
+                            lane_col,
+                            out_features,
+                            _npass_for(1, out_features, npass),
+                            oob_store,
+                        )
+                else:
+                    if const_expr(topk == 2):
+                        _gather_reduce_store(
+                            member_res,
+                            peer_res,
+                            weights,
+                            dst_base,
+                            lane_col,
+                            out_features,
+                            _npass_for(2, out_features, npass),
+                            oob_store,
+                        )
+                    else:
+                        if member_rows[2] < fx.Int32(0):
+                            _gather_reduce_store(
+                                member_res[:2],
+                                peer_res,
+                                weights[:2],
+                                dst_base,
+                                lane_col,
+                                out_features,
+                                _npass_for(2, out_features, npass),
+                                oob_store,
+                            )
+                        else:
+                            _gather_reduce_store(
+                                member_res,
+                                peer_res,
+                                weights,
+                                dst_base,
+                                lane_col,
+                                out_features,
+                                _npass_for(topk, out_features, npass),
+                                oob_store,
+                            )
+
+            if const_expr(with_gate):
+                # Gate is a per-slot scalar: push one per member, before the primary flag.
+                # Lane k owns member k, so the whole group costs one load pair and one
+                # store instead of topk of each on every lane. Lane 0 is the pusher row
+                # (always present); lanes past the group index OOB and are dropped.
+                lane_row = member_rows[0]
+                for k in range_constexpr(topk):
+                    if k > 0:
+                        lane_row = arith.select(lane_id == fx.Int32(k), member_rows[k], lane_row)
+                is_member = (lane_id < fx.Int32(topk)) & (lane_row >= fx.Int32(0))
+                gate_row = arith.select(is_member, lane_row, member_rows[0])
+                gate_value = buffer_load(grad_gate_res, gate_row, vec_width=1, dtype=fx.T.f32())
+                member_slot = buffer_load(origin_slot_res, gate_row, vec_width=1, dtype=fx.T.i32())
+                gate_dst = arith.select(is_member, member_slot, oob_slot)
+                buffer_store(gate_value, gate_peer_res, gate_dst, cache_modifier=19)
+
+            if const_expr(signal):
+                bank = fx.Int32(0) if bank_offset is None else bank_offset
+                # Wait for CM19 payload stores before publishing the relaxed flag.
+                fx.rocdl.s_waitcnt(0)
+                st(barrier_addr, bank + dst_slot, epoch, order="relaxed", scope="sys")
+
+    # Only ~58% of the rows push; the rest just pay the two-deep dependent lookup
+    # (sorted_slot -> key_row) before they can be dropped. Hoisting a group's worth
+    # of both loads collapses 2*U round trips into 2, same trick as dispatch.
+    local_count = (count - row_off + row_stride - fx.Int32(1)) // row_stride
+    n_grouped = (local_count // fx.Int32(_ROW_UNROLL)) * fx.Int32(_ROW_UNROLL)
+    for i in range(0, n_grouped, _ROW_UNROLL):
+        rows = [start_row + row_off + (i + u) * row_stride for u in range_constexpr(_ROW_UNROLL)]
+        key_bases = [_key(r) * fx.Int32(topk) for r in rows]
+        pushers = [_pusher(b) for b in key_bases]
+        for u in range_constexpr(_ROW_UNROLL):
+            _push_group(rows[u], key_bases[u], pushers[u])
+    for i in range(n_grouped, local_count):
+        row = start_row + row_off + i * row_stride
+        key_base = _key(row) * fx.Int32(topk)
+        _push_group(row, key_base, _pusher(key_base))
+
+
 @ASTRewriter.transform
 def topk_reduce_bf16_tile(
     signal: bool,
@@ -223,7 +533,11 @@ def topk_reduce_bf16_tile(
     gate_local_res: Optional[fx.ArithValue],
     d_topk_w_res: Optional[fx.ArithValue],
     epoch: fx.Int64,
+    dedup: bool = False,
+    kind_res: Optional[fx.ArithValue] = None,
+    num_combine_slots: int = 0,
 ):
+    assert not dedup or num_combine_slots > 0, "dedup reduce needs num_combine_slots for the OOB sentinel"
     f32_vec = fx.T.VectorType.get([_PVEC], fx.T.f32())
     bf16_vec = fx.T.VectorType.get([_PVEC], fx.T.bf16())
     num_vec_chunks = out_features // _PVEC
@@ -238,10 +552,39 @@ def topk_reduce_bf16_tile(
             for j in range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(j)
                 topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
-                if topk_index >= fx.Int64(0):
-                    if topk_index < fx.Int64(num_experts):
-                        if lane_id == fx.Int32(0):
-                            spin_start = read_clock()
+                awaited = (topk_index >= fx.Int64(0)) & (topk_index < fx.Int64(num_experts))
+                if const_expr(dedup):
+                    # kind 0 = duplicate route; the sender folded it into the primary slot.
+                    kind = buffer_load(kind_res, slot, vec_width=1, dtype=fx.T.i32())
+                    awaited = awaited & (kind != fx.Int32(0))
+                if awaited:
+                    if lane_id == fx.Int32(0):
+                        spin_start = read_clock()
+                        fx.rocdl.s_waitcnt(0)
+                        flag = ld(
+                            barrier_base,
+                            reduce_bank + slot,
+                            order="relaxed",
+                            scope="sys",
+                            dtype=fx.T.i64(),
+                        )
+                        while flag != epoch:
+                            fx.rocdl.s_sleep(fx.Int32(1))
+                            if spin_timed_out(spin_start):
+                                # rank is a compile-time constant, baked into the format string
+                                fx.printf(
+                                    "[MEGA rank=" + str(rank) + " topk_reduce] combine reduce-flag stuck: "
+                                    "GEMM has not written this expert's rows; token={} slot={} expert={} "
+                                    "reduce_flag_index={} (seen_flag={} expected_epoch={})\n",
+                                    token,
+                                    slot,
+                                    topk_index,
+                                    reduce_bank + slot,
+                                    flag,
+                                    epoch,
+                                )
+                                spin_start = read_clock()
+                            # re-read the flag each spin iteration (MUST stay inside the while)
                             fx.rocdl.s_waitcnt(0)
                             flag = ld(
                                 barrier_base,
@@ -250,54 +593,36 @@ def topk_reduce_bf16_tile(
                                 scope="sys",
                                 dtype=fx.T.i64(),
                             )
-                            while flag != epoch:
-                                fx.rocdl.s_sleep(fx.Int32(1))
-                                if spin_timed_out(spin_start):
-                                    # rank is a compile-time constant, baked into the format string
-                                    fx.printf(
-                                        "[MEGA rank="
-                                        + str(rank)
-                                        + " topk_reduce] combine reduce-flag stuck: "
-                                        "GEMM has not written this expert's rows; token={} slot={} expert={} "
-                                        "reduce_flag_index={} (seen_flag={} expected_epoch={})\n",
-                                        token,
-                                        slot,
-                                        topk_index,
-                                        reduce_bank + slot,
-                                        flag,
-                                        epoch,
-                                    )
-                                    spin_start = read_clock()
-                                # re-read the flag each spin iteration (MUST stay inside the while)
-                                fx.rocdl.s_waitcnt(0)
-                                flag = ld(
-                                    barrier_base,
-                                    reduce_bank + slot,
-                                    order="relaxed",
-                                    scope="sys",
-                                    dtype=fx.T.i64(),
-                                )
             fx.gpu.barrier()
 
         token_row_off = token * fx.Int32(topk) * fx.Int32(out_features)
         # Prefetch per-slot validity (scalar, once per token).
         valid = []
         for j in range_constexpr(topk):
-            idx = buffer_load(
-                topk_indices_res, token * fx.Int32(topk) + fx.Int32(j), vec_width=1, dtype=fx.T.i64()
-            )
-            valid.append((idx >= fx.Int64(0)) & (idx < fx.Int64(num_experts)))
+            slot = token * fx.Int32(topk) + fx.Int32(j)
+            idx = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+            ok = (idx >= fx.Int64(0)) & (idx < fx.Int64(num_experts))
+            if const_expr(dedup):
+                ok = ok & (buffer_load(kind_res, slot, vec_width=1, dtype=fx.T.i32()) != fx.Int32(0))
+            valid.append(ok)
+        # Point dead slots past num_records: the load is dropped and reads back 0,
+        # so a skipped slot costs no combine-buffer bandwidth at all.
+        slot_offs = []
+        for j in range_constexpr(topk):
+            live_off = token_row_off + fx.Int32(j * out_features)
+            if const_expr(num_combine_slots > 0):
+                live_off = arith.select(valid[j], live_off, fx.Int32(num_combine_slots * out_features))
+            slot_offs.append(live_off)
         zero_vec = fx.arith.constant_vector(0.0, f32_vec)
         vec_idx = lane_id
         while vec_idx < fx.Int32(num_vec_chunks):
             col = vec_idx * fx.Int32(_PVEC)
             topk_vals = []
             for j in range_constexpr(topk):
-                row_off = token_row_off + fx.Int32(j * out_features) + col
                 topk_vals.append(
                     buffer_load(
                         comb_local_res,
-                        row_off,
+                        slot_offs[j] + col,
                         vec_width=_PVEC,
                         dtype=fx.T.bf16(),
                         cache_modifier=19,  # sc0|sc1|nt: system-visible non-temporal read.
