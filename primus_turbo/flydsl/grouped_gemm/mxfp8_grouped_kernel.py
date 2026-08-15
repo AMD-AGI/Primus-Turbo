@@ -1736,7 +1736,6 @@ def _build_grouped_mxfp8_wgrad_kernel(
             a_cur0 = lds.A_lds_cur_0
             a_cur1 = lds.A_lds_cur_1
             a_next0 = lds.A_lds_next_0
-            a_next1 = lds.A_lds_next_1
             b_cur0 = lds.B_lds_cur_0
             b_cur1 = lds.B_lds_cur_1
             b_next0 = lds.B_lds_next_0
@@ -1947,13 +1946,9 @@ def _build_grouped_mxfp8_wgrad_kernel(
                 _run(quads)
                 _qm, _qn = quads
                 _c01 = ((LDS_BLOCK_N, [Vec(fx.memref_load_vec(r)) for r in acc01]),) if _qn == 2 else ()
-                store_c.store(
-                    [Vec(fx.memref_load_vec(r)) for r in acc00], base_row, base_col, _c01
-                )
+                store_c.store([Vec(fx.memref_load_vec(r)) for r in acc00], base_row, base_col, _c01)
                 if const_expr(_qm == 2):
-                    _c11 = (
-                        ((LDS_BLOCK_N, [Vec(fx.memref_load_vec(r)) for r in acc11]),) if _qn == 2 else ()
-                    )
+                    _c11 = ((LDS_BLOCK_N, [Vec(fx.memref_load_vec(r)) for r in acc11]),) if _qn == 2 else ()
                     store_c.store(
                         [Vec(fx.memref_load_vec(r)) for r in acc10],
                         base_row + LDS_BLOCK_M,
@@ -2084,12 +2079,11 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
 _GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16) -> launch
 _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
-_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16) -> [raw, compiled]
-_GWG_CFG_CACHE: dict = {}  # cfg_key (NO M_total) -> (gm, xcd, gn) chosen by autotune
+_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, ...) -> [launch, graph] for capture reuse
 
 # wgrad tile-swizzle autotune. The tile grid is G*ceildiv(OUT_M,bm)*ceildiv(OUT_N,bn) -- fixed
 # by the static shape alone -- so the race keys on that shape and is reused for every M_total.
-_GWG_DEFAULT_CFG = (4, 1, 0)  # (GROUP_M, num_xcd, group_n); the base every candidate must beat
+_GWG_CFG = (4, 1, 0)  # (GROUP_M, num_xcd, group_n) -- fixed; see the call site
 # gn>0 switches the walk to _band_block_mn's 2D super-block: N is cut into width-gn bands and a
 # gm x gn block of tiles is walked inside one, so a tile's A slab is re-read gn times and its B
 # slab gm times over a working set of (gm + gn) slabs -- gm=4/gn=2 asks 6 slabs of an XCD's 4 MB
@@ -2097,13 +2091,10 @@ _GWG_DEFAULT_CFG = (4, 1, 0)  # (GROUP_M, num_xcd, group_n); the base every cand
 # Every candidate keeps num_xcd=1: an XCD remap wins 3.8-4.5% on evenly split groups and gives
 # 50-63% back on top-heavy routing (it reorders the walk across groups, so a tail group's tiles
 # land on CUs still chewing the head group's), besides disabling split-K in the factory.
-_GWG_CANDS = ((4, 1, 2), (2, 1, 2), (2, 1, 4))
 # One tokens/group point, both distributions: the swizzle only reorders the tile grid, which is
 # M-independent, but WHICH tiles are hot is not -- a balanced-only race adopts cfgs that cost
 # several % on the top-heavy routing real MoE produces.
-_GWG_PM_CANON = ((2048, False), (2048, True))
 # Per-point hysteresis, above the interleaved-A/B noise band (<=0.5%, worst 0.9%).
-_GWG_AT_MARGIN = 0.99
 # Share of the makespan the split-K window must win back to be worth compiling in. Slicing one
 # window's contraction dim buys at best the exposed tail round, (1 - 1/S_A) of one CU round out
 # of the ceildiv(TOTAL, NCU) a launch takes. It costs the per-tile slice bookkeeping (runtime
@@ -2227,9 +2218,7 @@ def _wgrad_split_pays(OUT_M, OUT_N, G, bm, bn, ncu):
     return (1.0 - 1.0 / s_a) / ceildiv(total, ncu) >= _GWG_SPLIT_TAX
 
 
-def _get_wgrad_launch(
-    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle, split_k
-):
+def _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle, split_k):
     fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle, split_k)
     launch = _GWG_FUSED_CACHE.get(fk)
     if launch is None:
@@ -2287,74 +2276,6 @@ def _canon_wgrad_targs(args, OUT_M, OUT_N, G, pack, pm, skew):
         stream,
     )
     return targs, args[2]
-
-
-def _select_wgrad_cfg(cfg_key, OUT_M, OUT_N, G, bm, bn, cbsz, blgp, out_fp16, pack, split_k, args):
-    """First-call race on synthetic canonical tensors; cache the winning swizzle per static shape
-    (cfg_key, no M_total -> reused for every token count of the same tile grid).
-
-    Both points share the canonical shape's scale workspace, and the packing is per-group, so each
-    point's is refilled (one preshuffling launch) before it is used and only the GEMM is timed: the
-    preshuffle dispatches thousands of tiny workgroups over the whole scale buffer, which would both
-    dilute every ratio and hand the GEMM a perturbed L2 -- the very thing this race scores."""
-    cached = _GWG_CFG_CACHE.get(cfg_key)
-    if cached is not None:
-        return cached
-    _GWG_CFG_CACHE[cfg_key] = _GWG_DEFAULT_CFG  # any failure below leaves the default in place
-
-    def _launch_of(cfg, preshuffle=False):
-        return _get_wgrad_launch(
-            OUT_M, OUT_N, G, bm, bn, *cfg, cbsz, blgp, out_fp16, pack, preshuffle, split_k
-        )
-
-    try:
-        points = [
-            _canon_wgrad_targs(args, OUT_M, OUT_N, G, pack, pm, skew) for pm, skew in _GWG_PM_CANON
-        ]
-        fill = _launch_of(_GWG_DEFAULT_CFG, preshuffle=True)
-        base = _launch_of(_GWG_DEFAULT_CFG)
-        refs = []
-        for targs, out_view in points:
-            fill(*targs)
-            base(*targs)
-            torch.cuda.synchronize()
-            r = out_view.detach().clone().float()
-            if not torch.isfinite(r.reshape(-1)[:1024]).all().item():
-                raise RuntimeError("base cfg produced non-finite output")
-            refs.append((r, float((r * r).sum().item()) or 1.0))
-        _robust_time(base, points[0][0])  # ramp to the sustained-load clock before racing
-    except Exception:
-        return _GWG_DEFAULT_CFG
-
-    best_cfg, best_ratio = _GWG_DEFAULT_CFG, 1.0
-    for cfg in _GWG_CANDS:
-        try:
-            launch = _launch_of(cfg)
-            rs, matched = [], True
-            for (targs, out_view), (ref, ref_n) in zip(points, refs):
-                fill(*targs)  # the other point's packing is in the shared workspace
-                launch(*targs)
-                torch.cuda.synchronize()
-                o = out_view.detach().float()
-                err = float(((o - ref) * (o - ref)).sum().item())
-                # never adopt a cfg that drifts from the base at any point: a swizzle change moves
-                # the split-K window, and a window over different tiles reduces in another order
-                if not ((err / ref_n) < (2e-2**2) and torch.isfinite(o.reshape(-1)[:1024]).all().item()):
-                    matched = False
-                    break
-                rs.append(_robust_ab_ratio(base, launch, targs))
-            if not matched:
-                continue
-        except Exception:
-            continue
-        # Adopt only a cfg that clears the hysteresis at EVERY point, then keep the fastest such
-        # cfg -- ties keep the earlier candidate, so the fixed list order decides.
-        score = math.exp(sum(math.log(r) for r in rs) / len(rs))
-        if max(rs) < _GWG_AT_MARGIN and score < best_ratio:
-            best_cfg, best_ratio = cfg, score
-
-    _GWG_CFG_CACHE[cfg_key] = best_cfg
-    return best_cfg
 
 
 def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
@@ -2422,10 +2343,10 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     # The tile swizzle and the split-K window geometry are pure functions of (OUT_M, OUT_N, G, bm,
     # bn) plus the device CU count, so the cfg race keys on those alone and every token count of
     # the shape reuses its winner.
-    cfg_key = (OUT_M, OUT_N, G, bm, bn, cbsz, blgp, out_fp16, pack, split_k, ncu)
-    gm, xcd, gn = _select_wgrad_cfg(
-        cfg_key, OUT_M, OUT_N, G, bm, bn, cbsz, blgp, out_fp16, pack, split_k, args
-    )
+    # Tile swizzle is fixed: at the deployment regime (G=32 / per-expert 4096) all four
+    # candidates land within 0.1-0.9%, i.e. inside the measurement noise, so racing them on
+    # synthetic tensors bought nothing but a first-call stall and shape-dependent behaviour.
+    gm, xcd, gn = _GWG_CFG
     launch = _get_wgrad_launch(
         OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, pack, preshuffle, split_k
     )
