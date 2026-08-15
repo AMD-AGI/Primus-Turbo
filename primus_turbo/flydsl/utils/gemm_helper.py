@@ -1482,10 +1482,23 @@ def compute_global_swizzle_bf16_rc(lane_id, wave_id, n_rounds):
     return pairs
 
 
-def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps):
+def _tr_granule_swz_kk(kk):
+    """Swap the two 128-byte-granule selector bits of the tr16 sub-block index.
+
+    The transpose readers otherwise land their four 16-lane groups at byte
+    offsets all == 0 (mod 256) -> only banks 0-31 addressed, 512 B read takes
+    4 clk instead of 2. Permuting the row bits here (with the matching kb*64
+    spacing and a [0,256] read pair) alternates the two bank halves ->
+    conflict-free 2 clk. Pure prologue-time index math."""
+    return (kk % 4) + ((kk // 4) % 2) * 8 + (kk // 8) * 4
+
+
+def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps, swz=False):
     offsets = []
     n_waves = fx.block_dim.x // 64
     kk = (lane_id % 32) // 2
+    if swz:
+        kk = _tr_granule_swz_kk(kk)
     g = lane_id // 32
     n_in = g * 16 + (lane_id % 2) * 8
     for step in range_constexpr(n_steps):
@@ -1496,7 +1509,7 @@ def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps):
     return offsets
 
 
-def compute_global_swizzle_nn_bf16_rc(lane_id, wave_id, n_steps, n_waves=None):
+def compute_global_swizzle_nn_bf16_rc(lane_id, wave_id, n_steps, n_waves=None, swz=False):
     """Row/column split of compute_global_swizzle_nn_bf16.
 
     The NN loader applies no XOR swizzle, so the fused offset is exactly
@@ -1517,6 +1530,8 @@ def compute_global_swizzle_nn_bf16_rc(lane_id, wave_id, n_steps, n_waves=None):
     if n_waves is None:
         n_waves = fx.block_dim.x // 64
     kk = (lane_id % 32) // 2
+    if swz:
+        kk = _tr_granule_swz_kk(kk)
     g = lane_id // 32
     n_in = g * 16 + (lane_id % 2) * 8
     for step in range_constexpr(n_steps):
@@ -1546,11 +1561,15 @@ def _packed_ds_read_tr16(base_ptr, byte_offsets):
     return [Vec(_llvm.extractvalue(v2i32, op.result, [k])).bitcast(fx.BFloat16) for k in range(n)]
 
 
-def _read_tr16_sub(base_i32, sub16, row_off):
-    """One tr16 sub-block (512 elems/block): packed double-read, the pair 128 bytes
-    apart, at sub16*512 + row_off, then assembled."""
+def _read_tr16_sub(base_i32, sub16, row_off, swz=False):
+    """One tr16 sub-block (512 elems/block): packed double-read at sub16*512 +
+    row_off, then assembled. The pair is 128 bytes apart normally; with the bank
+    swizzle (swz=True, tn path) it is 256 bytes apart and the caller uses kb*64
+    spacing, so the four 16-lane groups straddle both bank halves -> 2 clk instead
+    of 4. See _tr_granule_swz_kk for the matching write-side permutation."""
+    pair = [0, 256] if swz else [0, 128]
     ptr = _lds_ptr_from_i32(base_i32 + (sub16 * 512 + row_off) * 2)
-    r0, r1 = _packed_ds_read_tr16(ptr, [0, 128])
+    r0, r1 = _packed_ds_read_tr16(ptr, pair)
     return r0.shuffle(r1, list(range(8)))
 
 
@@ -1627,16 +1646,22 @@ class S2RLoaderTr16x32Bf16(_S2RLoaderBf16):
     _SUB = (0, 2)
     _BLOCK = 4
 
+    def __init__(self, *args, swz=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.swz = swz
+
     def _tile(self, lds_src, i):
         octet, mm = self.lane_id // 16, self.lane_id % 16
         s_in_pair, kb = octet // 2, octet % 2
-        row_off = kb * 128 + mm * 4
+        # kb*64 spacing pairs with the [0,256] read and the write-side kk swizzle
+        # (bank-conflict-free transpose); kb*128 is the un-swizzled default.
+        row_off = kb * (64 if self.swz else 128) + mm * 4
         base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
         orig_tile = self.wave_idx * self.n_tiles + i
         n32_block, g16 = orig_tile // 2, orig_tile % 2
         row = g16 * 256 + row_off  # fold g16 block offset into row
         return [
-            _read_tr16_sub(base_i32, n32_block * self._BLOCK + self._SUB[c] + s_in_pair, row)
+            _read_tr16_sub(base_i32, n32_block * self._BLOCK + self._SUB[c] + s_in_pair, row, self.swz)
             for c in range_constexpr(len(self._SUB))
         ]
 
@@ -1687,7 +1712,17 @@ class StoreCBf16:
             if cache_modifier
             else None
         )
+        # Kept so the transposed epilogue can build an SRD on demand: its packed
+        # dwordx2 path needs buffer_store even when no cache_modifier was asked for.
+        self._c_lin, self._c_nbytes = c_lin, c_nbytes
         self.oob = fx.Int32(c_rows * c_cols)  # out-of-bounds sink index
+
+    def _rsrc(self):
+        if self.c_rsrc is None:
+            self.c_rsrc = create_buffer_resource(
+                self._c_lin, max_size=False, num_records_bytes=self._c_nbytes
+            )
+        return self.c_rsrc
 
     def _store_masked(self, value, c_index, valid):
         """Store one element to c_index (masked to the OOB sink when invalid)."""
@@ -1721,14 +1756,53 @@ class StoreCBf16:
                 row = base_row + ti * 16 + m_hi + r
                 self._store_masked(acc[r], row * self.c_cols + col, col_valid)
 
-    def store_trans16(self, c_frag, group_idx, base_m, base_n, out_m, out_n):
+    def store_trans16(self, c_frag, group_idx, base_m, base_n, out_m, out_n, m_align=1, n_exact=False):
+        """Transposed 16x16 epilogue: lane holds 4 values walking ``m``, the
+        contiguous output dim.
+
+        ``m_align`` is the caller-guaranteed alignment of ``base_m`` (in elements).
+        When base_m, out_m and the intra-lane offset are all 4-aligned the four
+        values a lane holds are 4 consecutive bf16 == one 8B store, so they pack
+        into a single ``buffer_store_dwordx2``. Otherwise each of the 16 lanes in
+        a row-group issues its own 2-byte request against rows ``out_m*2`` bytes
+        apart -- 16 line requests carrying 8 useful bytes each. Packing is a
+        straight 4x cut in store requests with no transpose and no LDS.
+
+        The packed path also drops the ``glob_n < out_n`` select: it is only taken
+        when the caller has proven the N range is exact (out_n % BLOCK_N == 0),
+        where the mask is statically true.
+        """
         n = self.lane_id % 16
-        m_hi = (self.lane_id // 16) * 4
+        m_hi = (self.lane_id // 16) * 4  # always 4-aligned
         glob_n = base_n + n
-        n_valid = glob_n < out_n
         row_base = (group_idx * out_n + glob_n) * out_m
-        for ti in range_constexpr(len(c_frag)):
-            acc = Vec(c_frag[ti])
-            for r in range_constexpr(4):
-                m = base_m + ti * 16 + m_hi + r
-                self._store_masked(acc[r], row_base + m, n_valid)
+        packed = (
+            bool(n_exact)
+            and self.out_ty is fx.BFloat16
+            and isinstance(out_m, int)
+            and out_m % 4 == 0
+            and isinstance(m_align, int)
+            and m_align % 4 == 0
+        )
+        if const_expr(packed):
+            rsrc = self._rsrc()
+            for ti in range_constexpr(len(c_frag)):
+                acc = Vec(c_frag[ti])
+                pk0 = fx.Int32(_raw(rocdl.cvt_pk_bf16_f32(_raw(acc[0]), _raw(acc[1]))))
+                pk1 = fx.Int32(_raw(rocdl.cvt_pk_bf16_f32(_raw(acc[2]), _raw(acc[3]))))
+                m = base_m + ti * 16 + m_hi
+                byte_off = (row_base + m) * fx.Int32(2)
+                buffer_store(
+                    _raw(Vec.from_elements([pk0, pk1], fx.Int32)),
+                    rsrc,
+                    byte_off,
+                    cache_modifier=self.cache_modifier,
+                    offset_is_bytes=True,
+                )
+        else:
+            n_valid = glob_n < out_n
+            for ti in range_constexpr(len(c_frag)):
+                acc = Vec(c_frag[ti])
+                for r in range_constexpr(4):
+                    m = base_m + ti * 16 + m_hi + r
+                    self._store_masked(acc[r], row_base + m, n_valid)

@@ -14,6 +14,7 @@
 """Primus-Turbo dense BF16 GEMM kernel (FlyDSL)."""
 
 import functools
+import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -964,8 +965,8 @@ def gemm_bf16_variable_k_tile(
     NTB16 = (BLOCK_N // 16) // (2 * N_WAVE_N)
     N_ACCUMS16 = NTA16 * NTB16
     mfma = Mfma16x16x32(NTA16, NTB16)
-    a_s2r = S2RLoaderTr16x32Bf16(wave_m, NTA16)
-    b_s2r = S2RLoaderTr16x32Bf16(wave_n, NTB16)
+    a_s2r = S2RLoaderTr16x32Bf16(wave_m, NTA16, swz=True)
+    b_s2r = S2RLoaderTr16x32Bf16(wave_n, NTB16, swz=True)
     ACC_VEC_N = 4
     N_ACCUMS_EFF = N_ACCUMS16
 
@@ -976,9 +977,9 @@ def gemm_bf16_variable_k_tile(
         """Dense rebased loader, or one gather loader serving both LDS halves."""
         if const_expr(slot_ids is None):
             g = make_bf16_buffer_tensor_rebased(operand, bf16_ir, base_off, span)
-            gl_off = compute_global_swizzle_nn_bf16(lane_id, wave_id, row_stride, n_steps)
+            gl_off = compute_global_swizzle_nn_bf16(lane_id, wave_id, row_stride, n_steps, swz=True)
             return G2SLoader(fx.logical_divide(g, fx.make_layout(1, 1)), gl_off, n_steps, bf16_ir, wave_id)
-        gl_rc = compute_global_swizzle_nn_bf16_rc(lane_id, wave_id, n_steps, WGRAD_WAVES)
+        gl_rc = compute_global_swizzle_nn_bf16_rc(lane_id, wave_id, n_steps, WGRAD_WAVES, swz=True)
         x4 = (CHUNK * BLOCK_K, CHUNK) if (slot_x4 or slot_u16) else None
         return GatherVarKG2SLoaderBf16(
             operand,
@@ -1289,12 +1290,27 @@ def gemm_bf16_variable_k_tile(
     c10 = [Vec(fx.memref_load_vec(reg)) for reg in acc10]
     c11 = [Vec(fx.memref_load_vec(reg)) for reg in acc11]
 
+    # Static facts the transposed epilogue needs to pack its stores: every q_row
+    # term is a multiple of 16, and the N range is tiled exactly so the per-lane
+    # column mask is statically true.
+    _trans_m_align = math.gcd(math.gcd(int(BLOCK_M), int(LDS_BLOCK_M)), 16)
+    _trans_n_exact = int(OUT_N) % int(BLOCK_N) == 0
+
     def _emit_q(cfrag, q_row, q_col):
         for i in range_constexpr(NTA16):
             for j in range_constexpr(NTB16):
                 blk = [cfrag[i * NTB16 + j]]
                 if const_expr(trans_c):
-                    store_c.store_trans16(blk, group_idx, q_row + i * 16, q_col + j * 16, OUT_M, OUT_N)
+                    store_c.store_trans16(
+                        blk,
+                        group_idx,
+                        q_row + i * 16,
+                        q_col + j * 16,
+                        OUT_M,
+                        OUT_N,
+                        m_align=_trans_m_align,
+                        n_exact=_trans_n_exact,
+                    )
                 else:
                     store_c.store16(blk, q_row + i * 16, q_col + j * 16)
 

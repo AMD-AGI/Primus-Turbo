@@ -79,7 +79,9 @@ def _make_kernel(
 ):
     K = hidden_size
     is_tn = layout == "tn"
-    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
+    # tn stages its slot table in LDS (+16 KiB, still 1 WG/CU), which moves the
+    # in-K-loop slot lookup off the in-order vmcnt queue and into the lgkm domain.
+    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N, slot_lds=is_tn)
     assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     if is_tn:
         OUT_M, OUT_N = hidden_size, out_features
@@ -270,6 +272,7 @@ def _make_kernel(
                     a_slot_ids=a_slots,
                     b_slot_ids=b_slots,
                     slot_len=fx.Int32(num_max_pool_tokens),
+                    slot_lds=True,
                 )
         else:
             tile_index = block_index - fx.Int32(gemm_base)
@@ -500,7 +503,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     layout: str = "nt",
     BM=256,
     BN=256,
-    GROUP_M=4,
+    GROUP_M=2,
     trans_c: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
 ):

@@ -31,6 +31,9 @@ _BLOCK_THREADS = 512
 _PVEC = 8
 _NUM_WARPS = _BLOCK_THREADS // _WARP
 _L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invalidate)
+# Rows whose slot/kind lookups are batched per dispatch-loop iteration. See the
+# comment at the loop in dispatch_bf16_tile.
+_ROW_UNROLL = 4
 
 
 @ASTRewriter.transform
@@ -67,21 +70,17 @@ def dispatch_bf16_tile(
     num_max_pool_blocks = int(workspace.num_max_pool_blocks)
 
     local_count = (token_count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
+    direct_base = fx.Int32(source_rank * int(workspace.num_max_tokens_per_rank))
 
-    for i in range(local_count):
-        row_index = warp_id + i * fx.Int32(_NUM_WARPS)
-        source_slot = buffer_load(
-            dispatched_token_idx_res, source_offset + row_index, vec_width=1, dtype=fx.T.i32()
-        )
+    def _push_row(source_slot, source_kind):
         # The prologue stores token*topk+k, so the source row needs the slot divided out.
         source_row = source_slot // fx.Int32(num_topk)
-        source_kind = buffer_load(source_slot_kind_res, source_slot, vec_width=1, dtype=fx.T.i32())
         # kind 0 = duplicate route: another route of this token already sends the row.
         should_copy = source_kind != fx.Int32(0)
         if should_copy:
             # dst = peer pool (base addr), src = local input (resource); offsets in i32 words.
             # A token owns one pool row per source rank, so the destination is direct.
-            direct_row = fx.Int32(source_rank * int(workspace.num_max_tokens_per_rank)) + source_row
+            direct_row = direct_base + source_row
             copy_warp(
                 pool_address,
                 input_res,
@@ -91,6 +90,30 @@ def dispatch_bf16_tile(
                 load_cache_modifier=19,
                 store_cache_modifier=19,
             )
+
+    def _slot(row_index):
+        return buffer_load(dispatched_token_idx_res, source_offset + row_index, vec_width=1, dtype=fx.T.i32())
+
+    def _kind(source_slot):
+        return buffer_load(source_slot_kind_res, source_slot, vec_width=1, dtype=fx.T.i32())
+
+    # Per row the push is gated on a two-deep dependent VMEM chain
+    # (dispatched_token_idx -> source_slot_kind), and copy_warp's own 14 loads
+    # cannot issue until it resolves. Serialized, that is two full round trips of
+    # dead time per 14 KiB row -- on the order of the measured expert-ready wait.
+    # Hoisting _ROW_UNROLL rows' worth of both lookups to the group head collapses
+    # those 2*U round trips into 2: the slot loads are mutually independent, and so
+    # are the kind loads once the slots have landed. The copies stay strictly
+    # sequential so the in-flight copy_warp register footprint is unchanged.
+    n_grouped = (local_count // fx.Int32(_ROW_UNROLL)) * fx.Int32(_ROW_UNROLL)
+    for i in range(0, n_grouped, _ROW_UNROLL):
+        slots = [_slot(warp_id + (i + u) * fx.Int32(_NUM_WARPS)) for u in range_constexpr(_ROW_UNROLL)]
+        kinds = [_kind(s) for s in slots]
+        for u in range_constexpr(_ROW_UNROLL):
+            _push_row(slots[u], kinds[u])
+    for i in range(n_grouped, local_count):
+        source_slot = _slot(warp_id + i * fx.Int32(_NUM_WARPS))
+        _push_row(source_slot, _kind(source_slot))
 
     if const_expr(signal):
         fx.rocdl.s_waitcnt(0)
