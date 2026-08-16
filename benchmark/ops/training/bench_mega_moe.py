@@ -1116,7 +1116,7 @@ def topk_reduce_only(
     topk,
     num_experts,
     rank=0,
-    num_reduce_cu=32,
+    num_reduce_cu=256,
     topk_weights=None,
 ):
     assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"

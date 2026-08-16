@@ -354,16 +354,9 @@ def _make_epoch_bump(add_combine, add_reduce):
 
 
 @autotune(
-    # num_combine_cu bottoms out at 16 like the dispatch side (min-over-rank on the bwd nn
-    # leg: 8 -> 6.234, 12 -> 5.151, 16 -> 4.997, 24 -> 5.004, 32 -> 5.035 ms). Below 16 the
-    # comm stops saturating XGMI and becomes the critical path; above it each comm block
-    # holds a whole CU. 48/64 were only ever chosen by the in-process tuner, whose own
-    # timing cannot resolve a 2% effect on this shared box.
-    # GROUP_M in {1, 2}: 4 is never competitive on either combine shape, and the two useful
-    # values sit within ~1.5% (min over 3 runs: fwd 2.830 vs 2.863, bwd 5.127 vs 5.040).
     configs=[
         Config(num_combine_cu=cc, num_reduce_cu=rc, GROUP_M=gm)
-        for cc in (16, 24)
+        for cc in (16, 24, 32, 48, 64)
         for rc in (256,)
         for gm in (1, 2)
     ],

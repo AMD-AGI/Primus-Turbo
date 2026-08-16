@@ -325,28 +325,10 @@ def _make_epoch_bump(addend):
     return epoch_bump_kernel
 
 
-def _prune_dispatch_configs(configs, sig_args):
-    if int(sig_args.get("layout_code", 0)) != 2:
-        return configs
-    seen, kept = set(), []
-    for cfg in configs:
-        sig = tuple(sorted((k, v) for k, v in cfg.kwargs.items() if k != "GROUP_M"))
-        if sig not in seen:
-            seen.add(sig)
-            kept.append(cfg)
-    return kept
-
-
 @autotune(
-    # num_dispatch_cu is a clean U with the minimum at 16 (min-over-rank, 2 runs each:
-    # 8 -> 5.912, 12 -> 4.874, 16 -> 4.479, 24 -> 4.553, 32 -> 4.591 ms on the fwd nt leg).
-    # Below 16 the comm stops saturating XGMI and becomes the critical path; above it, every
-    # extra comm block holds a whole CU for the comm duration (the GEMM's 128 KB of LDS
-    # allows one workgroup per CU), which costs T_comm * cu / 256. The window is kept narrow
-    # because the in-process tuner's own timing is noisy on this shared box: given 12-32 to
-    # choose from it still picked 32, which the paired runs show is 2.4% off the optimum.
-    configs=[Config(num_dispatch_cu=cu, GROUP_M=gm, nt_vmcnt=3) for cu in (16, 24) for gm in (1, 2, 4)],
-    prune_configs_by=_prune_dispatch_configs,
+    configs=[
+        Config(num_dispatch_cu=cu, GROUP_M=gm, nt_vmcnt=3) for cu in (16, 24, 32, 48) for gm in (1, 2, 4)
+    ],
     key=[
         "out_features",
         "hidden_size",
