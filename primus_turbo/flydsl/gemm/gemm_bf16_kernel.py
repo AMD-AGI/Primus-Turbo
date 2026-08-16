@@ -326,6 +326,7 @@ def gemm_bf16_nt_tile(
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
+    n_exact=False,
     a_slot_ids=None,
     a_block_m=None,
 ):
@@ -412,7 +413,7 @@ def gemm_bf16_nt_tile(
     a_s2r = S2RLoaderBf16(wave_m, N_TILES_A)
     b_s2r = S2RLoaderBf16(wave_n, N_TILES_B)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
+    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier, n_exact=n_exact)
 
     # NT: A is [M,K] row-major, B_T is [N,K] row-major -> both k-steps are BLOCK_K.
     dense_mma_pipeline_bf16(
@@ -466,6 +467,7 @@ def _gemm_bf16_nn_tn_tile_impl(
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
+    n_exact=False,
     a_slot_ids=None,
     a_block_m=None,
 ):
@@ -562,7 +564,7 @@ def _gemm_bf16_nn_tn_tile_impl(
     a_s2r = S2RLoaderTrBf16(wave_m, N_TILES_A) if a_transpose else S2RLoaderBf16(wave_m, N_TILES_A)
     b_s2r = S2RLoaderTrBf16(wave_n, N_TILES_B)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
+    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier, n_exact=n_exact)
 
     dense_mma_pipeline_bf16(
         lds,
@@ -609,6 +611,7 @@ def gemm_bf16_nn_tile(
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
+    n_exact=False,
     a_slot_ids=None,
     a_block_m=None,
 ):
@@ -634,6 +637,7 @@ def gemm_bf16_nn_tile(
         nt_vmcnt=nt_vmcnt,
         b_group_base=b_group_base,
         c_cache_modifier=c_cache_modifier,
+        n_exact=n_exact,
     )
 
 

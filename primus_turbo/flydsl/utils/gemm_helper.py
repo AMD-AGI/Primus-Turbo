@@ -1692,12 +1692,18 @@ class S2RLoaderBf16(_S2RLoaderBf16):
 
 
 class StoreCBf16:
-    def __init__(self, C, c_rows, c_cols, out_ty, cache_modifier=0):
+    def __init__(self, C, c_rows, c_cols, out_ty, cache_modifier=0, n_exact=False):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
         self.out_ty = out_ty
         self.cache_modifier = cache_modifier
+        # Caller guarantee that every column this epilogue touches is in range
+        # (c_cols is an exact multiple of BLOCK_N). The column mask is then
+        # statically true, so the per-element select to the OOB sink is dead:
+        # dropping it removes one full-rate VALU op per stored element, and the
+        # 32x32 epilogue stores 128 elements per lane per tile.
+        self.n_exact = bool(n_exact)
         c_nbytes = c_rows * c_cols * 2
         # Rebuild a rank-1 view: store indices are linear, so C's host rank must not leak in.
         c_ptr_ty = PointerType.get(elem_ty=out_ty.ir_type, address_space=AddressSpace.Global, alignment=16)
@@ -1726,7 +1732,7 @@ class StoreCBf16:
 
     def _store_masked(self, value, c_index, valid):
         """Store one element to c_index (masked to the OOB sink when invalid)."""
-        idx = arith.select(valid, c_index, self.oob)
+        idx = c_index if valid is None else arith.select(valid, c_index, self.oob)
         val = value.to(self.out_ty)
         if self.cache_modifier:
             buffer_store(val, self.c_rsrc, fx.Int32(idx), cache_modifier=self.cache_modifier)
@@ -1738,12 +1744,26 @@ class StoreCBf16:
         n = self.lane_id % 32
         m_hi = (self.lane_id // 32) * 4
         col = base_col + n
-        col_valid = col < self.c_cols
+        col_valid = None if self.n_exact else col < self.c_cols
+        # Strength-reduce the row addressing. The naive form issues one 32-bit
+        # `row * c_cols` multiply per element (128 per tile, quarter rate on CDNA);
+        # every row offset here differs from its neighbour by a compile-time
+        # multiple of c_cols, so the whole index set is reachable from one base
+        # plus an add chain over three precomputed strides.
+        s1 = self.c_cols
+        s8 = s1 * 8
+        s32 = s1 * 32
+        idx_ti = (base_row + m_hi) * s1 + col
         for ti in range_constexpr(len(c_frag)):
             acc = Vec(c_frag[ti])
-            for r in range_constexpr(16):
-                row = base_row + ti * 32 + (r // 4) * 8 + m_hi + (r % 4)
-                self._store_masked(acc[r], row * self.c_cols + col, col_valid)
+            idx_g = idx_ti
+            for g in range_constexpr(4):
+                idx_r = idx_g
+                for rr in range_constexpr(4):
+                    self._store_masked(acc[g * 4 + rr], idx_r, col_valid)
+                    idx_r = idx_r + s1
+                idx_g = idx_g + s8
+            idx_ti = idx_ti + s32
 
     def store16(self, c_frag, base_row, base_col):
         n = self.lane_id % 16

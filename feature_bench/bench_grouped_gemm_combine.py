@@ -51,7 +51,13 @@ NUM_GROUPS = 8
 GROUP_TOPK = 4
 ROUTING_SCALE = 2.5
 ALL_LAYOUTS = ("nt", "nn")
-_H_NUM_TILE_BLOCKS = 7
+# Handle slots, mirrored from the production callers (fused_mega_moe_*_impl.py).
+# Local constants on purpose: reading the kernel's private names would break on a
+# legal refactor of that file.
+_H_SOURCE_SLOT_KIND = 13
+_H_NUM_TILE_BLOCKS = 8
+_H_DEDUP_KEY_ROW = 20
+_MIN_HANDLE_LEN = 21
 
 
 def generate_deepseek_v3_routing(num_tokens):
@@ -151,12 +157,30 @@ def _worker(local_rank, world, args):
         l1_out, _, _, handle = dispatch_grouped_gemm_bf16_flydsl_kernel(
             x, w1, group, handle=None, topk_idx=topk_idx, topk_weights=topk_weight, layout="nt"
         )
+        # Fail loudly rather than silently reading the wrong tensor if the ABI moves.
+        if len(handle) < _MIN_HANDLE_LEN:
+            raise RuntimeError(f"handle has {len(handle)} entries, expected >= {_MIN_HANDLE_LEN}")
         act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
         del l1_out
         torch.cuda.synchronize()
         active_rows = int(handle[_H_NUM_TILE_BLOCKS][0].item()) * POOL_BLOCK_M
-        if handle[ggc._H_DEDUP_KEY_ROW].numel() <= 1:
-            raise RuntimeError("handle carries no dedup key table; the prologue ABI changed")
+
+        # Dedup's contract: combine pushes one row per (src_rank, src_token) that
+        # dispatch sent, i.e. the exact inverse volume. Only the EP-wide sums are
+        # comparable -- kind counts what this rank SENT, key_row what it pushes back
+        # for what it RECEIVED, and those two sets differ per rank.
+        key_row = handle[_H_DEDUP_KEY_ROW].view(-1, K)
+        volume = torch.tensor(
+            [
+                int((handle[_H_SOURCE_SLOT_KIND] != 0).sum().item()),  # dispatch sent
+                int((key_row[:, 0] >= 0).sum().item()),  # combine pushes back
+                int((key_row >= 0).sum().item()),  # un-deduped combine would push
+            ],
+            device="cuda",
+            dtype=torch.int64,
+        )
+        dist.all_reduce(volume, group=group)
+        dispatch_rows, combine_rows, naive_rows = (int(v) for v in volume.tolist())
 
         ggc._COMBINE_DEDUP_NPASS = args.npass
 
@@ -193,6 +217,13 @@ def _worker(local_rank, world, args):
                 f"T={T} H={H} I={I} E={E} K={K} EP={world} active_rows={active_rows} "
                 f"BM={POOL_BLOCK_M} BN={args.bn} npass={args.npass} routing={args.routing} "
                 f"sync_each={not args.back_to_back}"
+            )
+            row_mb = H * 2 / 1024 / 1024 / world
+            print(
+                f"  push volume (EP{world} total): combine {combine_rows} rows vs "
+                f"dispatch {dispatch_rows} rows, un-deduped {naive_rows} rows "
+                f"-> {combine_rows * row_mb:.0f} MB/rank, "
+                f"{100.0 * (1.0 - combine_rows / max(naive_rows, 1)):.1f}% saved"
             )
             header = f"{'layout':>6} {'ms':>9}"
             print(header)

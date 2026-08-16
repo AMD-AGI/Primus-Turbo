@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 from typing import Optional
 
 import flydsl.expr as fx
@@ -32,6 +33,16 @@ _BLOCK_THREADS = 512
 _PVEC = 8
 _NUM_WARPS = _BLOCK_THREADS // _WARP
 _L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invalidate)
+# Backoff for the topk-reduce arrival gate, in s_sleep units (~64 clocks each). This gate
+# is polled by lane 0 of every warp of every resident reduce block -- with num_reduce_cu at
+# 768 that is up to ~8 x 200 = 1.6k concurrent pollers through the reduce tail, each issuing
+# a scope="sys" (L2-bypassing, fabric-resolved) 8-byte load plus an s_memrealtime watchdog
+# read. At s_sleep(1) (~64 clk) that is a continuous uncached read storm against the very
+# lines the combine pushes are trying to publish into. See _COMBINE_GATE_SLEEP in
+# grouped_gemm_combine_bf16_kernel.py for the matching gate on the producer side -- the
+# two must move together (both asymmetric 8/32 arms measured worse than either symmetric
+# setting), and 32 is the fitted optimum of a flat basin, not a guess.
+_REDUCE_GATE_SLEEP = int(os.environ.get("TURBO_REDUCE_GATE_SLEEP", "32"))
 # Rows whose slot/kind lookups are batched per dispatch-loop iteration. See the
 # comment at the loop in dispatch_bf16_tile.
 _ROW_UNROLL = 4
@@ -569,7 +580,7 @@ def topk_reduce_bf16_tile(
                             dtype=fx.T.i64(),
                         )
                         while flag != epoch:
-                            fx.rocdl.s_sleep(fx.Int32(1))
+                            fx.rocdl.s_sleep(fx.Int32(_REDUCE_GATE_SLEEP))
                             if spin_timed_out(spin_start):
                                 # rank is a compile-time constant, baked into the format string
                                 fx.printf(

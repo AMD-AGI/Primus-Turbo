@@ -31,6 +31,18 @@ BLOCK_M = 256  # pool-block granularity + pool alignment
 TOKEN_DTYPE = torch.bfloat16
 TOKEN_ALIGNMENT = 128  # get_token_alignment_for_mega_moe
 
+# Stride, in i64 units, between adjacent combine_flag counters -- 16 == one 128B cache
+# line per counter. Densely packed, 16 block_m counters share a line, and the combine
+# handoff funnels essentially ALL of its coherence traffic onto a single line: block_m =
+# gemm_tile_index // n_blocks, so with n_blocks = 28 and one workgroup per CU the set of
+# block_m in flight at any instant spans only ~7 consecutive words, while each of those
+# block_m draws n_blocks release atomics plus a continuous sys-scope poll from the combine
+# warps. One counter per line turns that shared line into per-block_m private lines; the
+# residual n_blocks-way contention *within* one block_m is deliberately left alone.
+# The kernel indexes combine_flag as (bank + block_m) * COMBINE_FLAG_STRIDE, so this
+# constant is the single owner of the padding -- see grouped_gemm_combine_bf16_kernel.py.
+COMBINE_FLAG_STRIDE = 16
+
 
 def get_num_max_pool_tokens(
     num_ranks: int, num_max_tokens_per_rank: int, num_topk: int, num_experts_per_rank: int
@@ -164,7 +176,11 @@ class Workspace:
         return self.get_dispatch_flag_ptr() + align(2 * self.num_max_pool_blocks * 8, BLOCK_M)
 
     def get_reduce_flag_ptr(self):
-        return self.get_combine_flag_ptr() + align(2 * self.num_max_pool_blocks * 8, BLOCK_M)
+        # combine_flag is padded to COMBINE_FLAG_STRIDE i64 per counter (see the constant):
+        # ~33KB -> ~520KB against a multi-GB heap, and only this region's size changes.
+        return self.get_combine_flag_ptr() + align(
+            2 * self.num_max_pool_blocks * 8 * COMBINE_FLAG_STRIDE, BLOCK_M
+        )
 
     def get_expert_count_buffer_ptr(self):
         return self.get_reduce_flag_ptr() + align(2 * self.num_combine_slots * 8, BLOCK_M)
@@ -253,8 +269,13 @@ def get_symm_buffer_size_for_mega_moe(
             _tensor_from_device_ptr(
                 int(workspace.get_dispatch_flag_ptr()), (2 * workspace.num_max_pool_blocks,), torch.int64, dev
             ),
+            # padded view: must span the WHOLE region (stride included), or any caller
+            # that zeroes this slice would under-cover it and leave live counters behind
             _tensor_from_device_ptr(
-                int(workspace.get_combine_flag_ptr()), (2 * workspace.num_max_pool_blocks,), torch.int64, dev
+                int(workspace.get_combine_flag_ptr()),
+                (2 * workspace.num_max_pool_blocks * COMBINE_FLAG_STRIDE,),
+                torch.int64,
+                dev,
             ),
             _tensor_from_device_ptr(
                 int(workspace.get_reduce_flag_ptr()), (2 * workspace.num_combine_slots,), torch.int64, dev
