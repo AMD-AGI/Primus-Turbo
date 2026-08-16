@@ -5,7 +5,6 @@
 ###############################################################################
 
 import functools
-import os
 from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
@@ -102,7 +101,6 @@ def _make_kernel(
     assert num_ranks == 0 or num_experts // num_ranks <= _BLOCK_THREADS
     gemm_base = num_dispatch_cu
     wait_sleep = 64
-    no_wait = os.environ.get("MEGA_NO_WAIT", "0") == "1"
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_kernel(
@@ -211,7 +209,7 @@ def _make_kernel(
                 # One thread per producer expert: the whole scan is one sys-scope round
                 # trip instead of group_idx dependent ones.
                 producer_expert = first_expert + thread_index
-                if const_expr(not no_wait) and producer_expert <= group_idx:
+                if producer_expert <= group_idx:
                     spin_start = read_clock()
                     expert_signal = ld(
                         dispatch_flag_base,
@@ -298,7 +296,7 @@ def _make_kernel(
                 # One thread per producer expert: the whole scan is one sys-scope round
                 # trip instead of g_idx dependent ones.
                 producer_expert = first_expert + thread_index
-                if const_expr(not no_wait) and producer_expert <= g_idx:
+                if producer_expert <= g_idx:
                     spin_start = read_clock()
                     expert_signal = ld(
                         dispatch_flag_base,
