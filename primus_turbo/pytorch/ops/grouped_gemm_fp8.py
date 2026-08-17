@@ -467,11 +467,13 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
-        # FlyDSL-only K-pad fast path: respect an explicitly selected Triton
-        # backend instead of silently routing its forward pass through FlyDSL.
+        # K-pad fast path: a non-128-aligned K splits each fp8 vector load across a 128B line, so
+        # cast-and-pad both raw NT operands to Kp=ceil128(K) (pad cols contribute 0*0=0). It is a
+        # FlyDSL kernel, so gate on the selected backend instead of hijacking a Triton run.
+        backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
         _kpad = (
-            GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
-            == BackendType.FLYDSL
+            backend_choice is not None
+            and backend_choice.backend == BackendType.FLYDSL
             and trans_b
             and not isinstance(a, QuantizedTensor)
             and not isinstance(b, QuantizedTensor)
