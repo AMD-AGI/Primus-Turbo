@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 import torch
 
 from primus_turbo.pytorch.core.low_precision import (
+    AMDFP4_BLOCK_SIZE,
     MXFP4_BLOCK_SIZE,
     MXFP8_BLOCK_SIZE,
     ScalingGranularity,
@@ -18,6 +19,7 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequant_fp8_blockwise_for_weight_impl,
     dequant_fp8_blockwise_impl,
+    dequantize_amdfp4_impl,
     dequantize_fp8_rowwise_impl,
     dequantize_fp8_tensorwise_impl,
     dequantize_mxfp4_impl,
@@ -28,6 +30,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_dual_impl,
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
+    quantize_amdfp4_impl,
     quantize_fp8_rowwise_impl,
     quantize_fp8_tensorwise_impl,
     quantize_mxfp4_impl,
@@ -317,22 +320,36 @@ def quantize_fp4(
             2. The axis means direction of quantization. For 2D, ``axis == 1`` is
                row-wise and ``axis == 0`` is col-wise (transpose). For 3D, the last
                dim (``axis == 2``) is row-wise and ``axis == 1`` is col-wise.
-            3. The block size must be 32.
+            3. The block size must be 32 for MXFP4, or 16 for AMDFP4.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert block_size == MXFP4_BLOCK_SIZE, (
-            f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
-        )
-        assert axis is not None, "axis must be specified for MXFP4 quantization"
+        assert axis is not None, "axis must be specified for FP4 quantization"
 
-        return quantize_mxfp4_impl(
-            x,
-            out_dtype,
-            axis,
-            block_size,
-            with_trans=False,
-            scaling_recipe=scaling_recipe,
-        )
+        # Both FP4 flavours use MX_BLOCKWISE granularity; the block size is what
+        # picks between them.
+        if block_size == MXFP4_BLOCK_SIZE:
+            return quantize_mxfp4_impl(
+                x,
+                out_dtype,
+                axis,
+                block_size,
+                with_trans=False,
+                scaling_recipe=scaling_recipe,
+            )
+        elif block_size == AMDFP4_BLOCK_SIZE:
+            return quantize_amdfp4_impl(
+                x,
+                out_dtype,
+                axis,
+                block_size,
+                with_trans=False,
+                scaling_recipe=scaling_recipe,
+            )
+        else:
+            raise ValueError(
+                f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 or {AMDFP4_BLOCK_SIZE} "
+                f"for AMDFP4, but got {block_size}"
+            )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
@@ -463,22 +480,35 @@ def quantize_fp4_with_trans(
                3D ``(G, N, K)`` weights; each group is walked by ``blockIdx.z``.
             2. Both row-wise and col-wise outputs are produced in one pass; no
                ``axis`` argument is taken (it is implied by the dual direction).
-            3. The block size must be 32.
+            3. The block size must be 32 for MXFP4, or 16 for AMDFP4.
             4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert block_size == MXFP4_BLOCK_SIZE, (
-            f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
-        )
-        return quantize_mxfp4_impl(
-            x,
-            out_dtype,
-            axis,
-            block_size,
-            with_trans=True,
-            scaling_recipe=scaling_recipe,
-            scaling_recipe_for_trans=scaling_recipe_for_trans,
-        )
+        if block_size == MXFP4_BLOCK_SIZE:
+            return quantize_mxfp4_impl(
+                x,
+                out_dtype,
+                axis,
+                block_size,
+                with_trans=True,
+                scaling_recipe=scaling_recipe,
+                scaling_recipe_for_trans=scaling_recipe_for_trans,
+            )
+        elif block_size == AMDFP4_BLOCK_SIZE:
+            return quantize_amdfp4_impl(
+                x,
+                out_dtype,
+                axis,
+                block_size,
+                with_trans=True,
+                scaling_recipe=scaling_recipe,
+                scaling_recipe_for_trans=scaling_recipe_for_trans,
+            )
+        else:
+            raise ValueError(
+                f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 or {AMDFP4_BLOCK_SIZE} "
+                f"for AMDFP4, but got {block_size}"
+            )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
@@ -504,14 +534,18 @@ def dequantize_fp4(
             2. The axis means direction of de-quantization. For 2D, 0 means the column
                direction and 1 the row direction. For 3D, 1 means the column direction
                and 2 the row direction.
-            3. The block size must be 32.
+            3. The block size must be 32 for MXFP4, or 16 for AMDFP4.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
-        assert block_size == MXFP4_BLOCK_SIZE, (
-            f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
-        )
-
-        return dequantize_mxfp4_impl(x, out_dtype, axis, block_size, scale_inv)
+        if block_size == MXFP4_BLOCK_SIZE:
+            return dequantize_mxfp4_impl(x, out_dtype, axis, block_size, scale_inv)
+        elif block_size == AMDFP4_BLOCK_SIZE:
+            return dequantize_amdfp4_impl(x, out_dtype, axis, block_size, scale_inv)
+        else:
+            raise ValueError(
+                f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 or {AMDFP4_BLOCK_SIZE} "
+                f"for AMDFP4, but got {block_size}"
+            )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 

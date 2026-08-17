@@ -129,6 +129,34 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
                                             const bool use_rht, const bool shuffle_scale = false,
                                             const bool shuffle_out = false);
 
+std::vector<at::Tensor> quantize_amdfp4_dual(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
+    const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
+    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht);
+
+std::vector<at::Tensor> quantize_amdfp4_dual_meta(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
+    const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
+    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht);
+
+std::vector<at::Tensor> quantize_amdfp4(const at::Tensor input, const at::ScalarType dest_dtype,
+                                        const int64_t axis, const int64_t padding_align_size,
+                                        const bool use_2d_block, const bool use_sr,
+                                        const bool use_rht);
+
+std::vector<at::Tensor> quantize_amdfp4_meta(const at::Tensor     input,
+                                             const at::ScalarType dest_dtype, const int64_t axis,
+                                             const int64_t padding_align_size,
+                                             const bool use_2d_block, const bool use_sr,
+                                             const bool use_rht);
+
+at::Tensor dequantize_amdfp4(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,
+                             const int64_t block_size, const at::ScalarType dest_dtype);
+
+at::Tensor dequantize_amdfp4_meta(const at::Tensor input, const at::Tensor scale_inv,
+                                  const int64_t axis, const int64_t block_size,
+                                  const at::ScalarType dest_dtype);
+
 std::vector<at::Tensor>
 quantize_mxfp8_dual(const at::Tensor input, const at::ScalarType dest_dtype,
                     const int64_t padding_align_size, const bool rowwise_use_2d_block,

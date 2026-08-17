@@ -162,8 +162,12 @@ void dequantize_mxfp4_impl(const uint8_t *x, OType *y, const int64_t stride_x_ro
                            const int64_t stride_y_col, const int n_rows, const int n_cols,
                            const uint8_t *scale_inv, const int64_t stride_scale_row,
                            const int64_t stride_scale_col, const int scale_n_rows,
-                           const int scale_n_cols, const int block_size, const bool use_rowwise,
-                           hipStream_t stream) {
+                           const int scale_n_cols, const int block_size, const ScaleType scale_type,
+                           const bool use_rowwise, hipStream_t stream) {
+    // The kernel decodes the scale byte with ``e8m0_to_scale``. The 16-element
+    // E5M3/E4M3 formats also arrive as one byte per block, so they would be
+    // read without complaint and silently mis-scaled; reject them here.
+    PRIMUS_TURBO_CHECK(scale_type == ScaleType::E8M0, "MXFP4 requires E8M0 block scales");
     (void) stride_x_col; // packed input is contiguous along columns (stride == 1)
     if (n_rows == 0 || n_cols == 0)
         return;
@@ -192,7 +196,8 @@ void dequantize_mxfp4_impl(const uint8_t *x, OType *y, const int64_t stride_x_ro
         const int64_t stride_y_row, const int64_t stride_y_col, const int n_rows,                  \
         const int n_cols, const uint8_t *scale_inv, const int64_t stride_scale_row,                \
         const int64_t stride_scale_col, const int scale_n_rows, const int scale_n_cols,            \
-        const int block_size, const bool use_rowwise, hipStream_t stream);
+        const int block_size, const ScaleType scale_type, const bool use_rowwise,                  \
+        hipStream_t stream);
 
 DECL_DEQUANT_MXFP4_INSTANCE(dtype::float16)
 DECL_DEQUANT_MXFP4_INSTANCE(dtype::bfloat16)

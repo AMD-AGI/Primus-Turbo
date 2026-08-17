@@ -257,7 +257,9 @@ void grouped_dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t strid
                                    const int64_t stride_scale_row, const int64_t stride_scale_col,
                                    const int scale_n_rows, const int scale_n_cols,
                                    const int64_t *group_offs, const int64_t *group_offs_padded,
-                                   int G, int block_size, bool use_rowwise, hipStream_t stream) {
+                                   int G, int block_size, ScaleType scale_type, bool use_rowwise,
+                                   hipStream_t stream) {
+    PRIMUS_TURBO_CHECK(scale_type == ScaleType::E8M0, "MXFP8 requires E8M0 block scales");
     if (total_M == 0 || n_cols == 0)
         return;
 
@@ -283,8 +285,9 @@ void dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t stride_x_row,
                            const int64_t stride_y_col, const int n_rows, const int n_cols,
                            const uint8_t *scale_inv, const int64_t stride_scale_row,
                            const int64_t stride_scale_col, const int scale_n_rows,
-                           const int scale_n_cols, const int block_size, const bool use_rowwise,
-                           hipStream_t stream) {
+                           const int scale_n_cols, const int block_size, const ScaleType scale_type,
+                           const bool use_rowwise, hipStream_t stream) {
+    PRIMUS_TURBO_CHECK(scale_type == ScaleType::E8M0, "MXFP8 requires E8M0 block scales");
     (void) stride_x_col; // input is contiguous along columns (stride == 1)
     if (n_rows == 0 || n_cols == 0)
         return;
@@ -313,7 +316,8 @@ void dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t stride_x_row,
         const int64_t stride_y_row, const int64_t stride_y_col, const int n_rows,                  \
         const int n_cols, const uint8_t *scale_inv, const int64_t stride_scale_row,                \
         const int64_t stride_scale_col, const int scale_n_rows, const int scale_n_cols,            \
-        const int block_size, const bool use_rowwise, hipStream_t stream);
+        const int block_size, const ScaleType scale_type, const bool use_rowwise,                  \
+        hipStream_t stream);
 
 DECL_DEQUANT_MXFP8_INSTANCE(dtype::float16, dtype::float8_e4m3)
 DECL_DEQUANT_MXFP8_INSTANCE(dtype::float16, dtype::float8_e5m2)
@@ -330,7 +334,7 @@ DECL_DEQUANT_MXFP8_INSTANCE(dtype::float32, dtype::float8_e5m2)
         const int total_M, const int n_rows, const int n_cols, const uint8_t *scale_inv,           \
         const int64_t stride_scale_row, const int64_t stride_scale_col, const int scale_n_rows,    \
         const int scale_n_cols, const int64_t *group_offs, const int64_t *group_offs_padded,       \
-        int G, int block_size, bool use_rowwise, hipStream_t stream);
+        int G, int block_size, ScaleType scale_type, bool use_rowwise, hipStream_t stream);
 
 DECL_GROUPED_DEQUANT_MXFP8_INSTANCE(dtype::float16, dtype::float8_e4m3)
 DECL_GROUPED_DEQUANT_MXFP8_INSTANCE(dtype::float16, dtype::float8_e5m2)

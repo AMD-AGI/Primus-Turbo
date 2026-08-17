@@ -15,11 +15,14 @@ from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import (
     quant_mxfp8_raw_batched,
 )
 from primus_turbo.pytorch.core.low_precision import (
+    AMDFP4_BLOCK_SIZE,
+    AMDFP4_PADDING_ALIGN_SIZE,
     MXFP4_BLOCK_SIZE,
     MXFP4_PADDING_ALIGN_SIZE,
     MXFP8_BLOCK_SIZE,
     MXFP8_PADDING_ALIGN_SIZE,
     ScalingRecipe,
+    check_amdfp4_support,
     check_mxfp4_support,
     check_mxfp8_support,
 )
@@ -995,3 +998,111 @@ def dequantize_mxfp4_impl(
     )
 
     return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp4(x, scale_inv, axis, block_size, out_dtype)
+
+
+def quantize_amdfp4_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: Union[int, None],
+    block_size: int,
+    with_trans: bool = False,
+    scaling_recipe: Optional[ScalingRecipe] = None,
+    scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    amdfp4_support, reason = check_amdfp4_support()
+    assert amdfp4_support, reason
+
+    assert block_size == AMDFP4_BLOCK_SIZE, (
+        f"The block size must be {AMDFP4_BLOCK_SIZE} for AMDFP4 quantization"
+    )
+
+    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
+    if with_trans:
+        scaling_recipe_for_trans = (
+            ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+        )
+    else:
+        scaling_recipe_for_trans = scaling_recipe
+
+    for recipe in (scaling_recipe, scaling_recipe_for_trans):
+        assert not recipe.shuffle_out and not recipe.shuffle_scale, (
+            "AMDFP4 quantization does not support shuffle yet, "
+            "so shuffle_out and shuffle_scale must be False."
+        )
+
+    if not with_trans:
+        if x.ndim == 2:
+            assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False and x is 2D."
+        elif x.ndim == 3:
+            assert axis in (1, 2), "The axis must be 1 or 2 when with_trans is False and x is 3D."
+        else:
+            raise ValueError(f"The input tensor must be 2D or 3D but got {x.ndim}D.")
+    else:
+        assert axis is None, "The axis must be None when with_trans is True."
+
+    assert x.is_contiguous(), "The x tensor must be contiguous."
+
+    if with_trans:
+        return torch.ops.primus_turbo_cpp_extension.quantize_amdfp4_dual(
+            x,
+            out_dtype,
+            AMDFP4_PADDING_ALIGN_SIZE,
+            scaling_recipe.use_2d_block,
+            scaling_recipe.use_sr,
+            scaling_recipe.use_rht,
+            scaling_recipe_for_trans.use_2d_block,
+            scaling_recipe_for_trans.use_sr,
+            scaling_recipe_for_trans.use_rht,
+        )
+    else:
+        return torch.ops.primus_turbo_cpp_extension.quantize_amdfp4(
+            x,
+            out_dtype,
+            axis,
+            AMDFP4_PADDING_ALIGN_SIZE,
+            scaling_recipe.use_2d_block,
+            scaling_recipe.use_sr,
+            scaling_recipe.use_rht,
+        )
+
+
+def dequantize_amdfp4_impl(
+    x: torch.Tensor,
+    out_dtype: torch.dtype,
+    axis: int,
+    block_size: int,
+    scale_inv: torch.Tensor,
+) -> torch.Tensor:
+    amdfp4_support, reason = check_amdfp4_support()
+    assert amdfp4_support, reason
+
+    assert block_size == AMDFP4_BLOCK_SIZE, (
+        f"The block size must be {AMDFP4_BLOCK_SIZE} for AMDFP4 dequantization"
+    )
+
+    assert x.is_contiguous(), "The x tensor must be contiguous."
+    assert x.dim() in (2, 3), "The x must be a 2D or 3D tensor."
+    assert scale_inv.dim() == x.dim(), "The scale_inv rank must match x."
+    assert scale_inv.is_contiguous(), "The scale_inv tensor must be contiguous."
+    assert x.dtype == torch.float4_e2m1fn_x2, f"The x dtype must be torch.float4_e2m1fn_x2 but got {x.dtype}."
+    # E5M3 has no torch dtype, so the quantizer hands its scales back as bytes.
+    assert scale_inv.dtype == torch.uint8, (
+        f"The scale_inv dtype must be torch.uint8 but got {scale_inv.dtype}."
+    )
+    SUPPORTED_OUT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+    assert out_dtype in SUPPORTED_OUT_DTYPES, (
+        f"The out dtype must be one of {SUPPORTED_OUT_DTYPES} but got {out_dtype}."
+    )
+
+    if x.dim() == 2:
+        assert axis in (0, 1), "The axis must be 0 or 1 for 2D input."
+        # NOTE: x is packed in the last dimension (2 fp4 per byte).
+        row_length = x.size(1) * 2
+    else:
+        assert axis in (1, 2), "The axis must be 1 or 2 for 3D input."
+        row_length = x.size(2) * 2
+    assert row_length % block_size == 0, (
+        "The last dimension of the x tensor must be divisible by the block size."
+    )
+
+    return torch.ops.primus_turbo_cpp_extension.dequantize_amdfp4(x, scale_inv, axis, block_size, out_dtype)

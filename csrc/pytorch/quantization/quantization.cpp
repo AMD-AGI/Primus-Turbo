@@ -341,7 +341,8 @@ at::Tensor dequantize_mxfp8(const at::Tensor input, const at::Tensor scale_inv, 
                 input_2d.stride(1), output_2d.stride(0), output_2d.stride(1),
                 static_cast<int>(num_rows), static_cast<int>(row_length), scale_ptr,
                 scale_2d.stride(0), scale_2d.stride(1), static_cast<int>(scale_m),
-                static_cast<int>(scale_n), static_cast<int>(block_size), use_rowwise, stream);
+                static_cast<int>(scale_n), static_cast<int>(block_size), ScaleType::E8M0,
+                use_rowwise, stream);
         });
     });
 
@@ -422,7 +423,7 @@ at::Tensor grouped_dequantize_mxfp8(const at::Tensor input, const at::Tensor sca
                 scale_ptr, scale_inv.stride(0), scale_inv.stride(1), static_cast<int>(scale_m),
                 static_cast<int>(scale_n), group_offs.data_ptr<int64_t>(),
                 group_offs_padded.data_ptr<int64_t>(), static_cast<int>(G),
-                static_cast<int>(block_size), use_rowwise, stream);
+                static_cast<int>(block_size), ScaleType::E8M0, use_rowwise, stream);
         });
     });
 
@@ -492,7 +493,7 @@ at::Tensor dequantize_mxfp4(const at::Tensor input, const at::Tensor scale_inv, 
             input_2d.stride(1), output_2d.stride(0), output_2d.stride(1),
             static_cast<int>(num_rows), static_cast<int>(row_length), scale_ptr, scale_2d.stride(0),
             scale_2d.stride(1), static_cast<int>(scale_m), static_cast<int>(scale_n),
-            static_cast<int>(block_size), use_rowwise, stream);
+            static_cast<int>(block_size), ScaleType::E8M0, use_rowwise, stream);
     });
 
     if (is_batched) {
@@ -608,7 +609,7 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
             reinterpret_cast<dtype::float4x2_e2m1 *>(colwise_output.data_ptr()),
             colwise_scale.data_ptr<uint8_t>(), G, M, N, M_pad, N_pad, rowwise_scale_stride,
             colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N,
-            colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,
+            colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad, ScaleType::E8M0,
             ScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht,
                           shuffle_rowwise_scale, shuffle_rowwise),
             ScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht,
@@ -718,7 +719,7 @@ std::vector<at::Tensor> quantize_mxfp4(const at::Tensor input, const at::ScalarT
             reinterpret_cast<DType *>(input.data_ptr()),
             reinterpret_cast<dtype::float4x2_e2m1 *>(output.data_ptr()),
             scale_tensor.data_ptr<uint8_t>(), mode, G, M, N, M_pad, N_pad, scale_stride, scale_N,
-            scale_M_pad, scale_N_pad,
+            scale_M_pad, scale_N_pad, ScaleType::E8M0,
             ScalingRecipe(use_2d_block, use_sr, use_rht, shuffle_scale, shuffle_out), stream);
     });
 
@@ -729,6 +730,232 @@ std::vector<at::Tensor> quantize_mxfp4(const at::Tensor input, const at::ScalarT
     }
 
     return {output.view(at::kFloat4_e2m1fn_x2), scale_tensor.view(at::kFloat8_e8m0fnu)};
+}
+
+// Quantize AMDFP4 with dual mode. Same layouts as MXFP4 with a 16-element
+// block, except the E5M3 scale stays uint8 for lack of a torch dtype.
+std::vector<at::Tensor> quantize_amdfp4_dual(
+    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
+    const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
+    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht) {
+    using namespace primus_turbo::detail;
+
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
+                       "Input must be BFloat16 or Half");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2.");
+    PRIMUS_TURBO_CHECK(padding_align_size == AMDFP4_K_DIM_PADDING_ALIGN_SIZE,
+                       "padding_align_size must be ", AMDFP4_K_DIM_PADDING_ALIGN_SIZE,
+                       " for AMDFP4. But got padding_align_size=", padding_align_size);
+
+    int64_t G, M, N;
+    if (input.dim() == 2) {
+        G = 1;
+        M = input.size(0);
+        N = input.size(1);
+    } else if (input.dim() == 3) {
+        G = input.size(0);
+        M = input.size(1);
+        N = input.size(2);
+    } else {
+        PRIMUS_TURBO_ERROR("Input must be 2D or 3D");
+    }
+    const bool    is_batched = (input.dim() == 3);
+    const int64_t Gout       = is_batched ? G : 1;
+
+    const int64_t M_pad = cdiv(M, padding_align_size) * padding_align_size;
+    const int64_t N_pad = cdiv(N, padding_align_size) * padding_align_size;
+
+    PRIMUS_TURBO_CHECK(N % AMDFP4_BLOCK_SIZE == 0, "N must be divisible by ", AMDFP4_BLOCK_SIZE);
+
+    auto device = input.device();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int64_t    rowwise_scale_N = cdiv(N_pad, AMDFP4_BLOCK_SIZE);
+    at::Tensor rowwise_scale =
+        at::empty({Gout * M, rowwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+
+    // packed 2 fp4 values in N dimension
+    at::Tensor rowwise_output =
+        at::empty({Gout * M, N_pad / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+
+    int64_t    colwise_scale_N = cdiv(M_pad, AMDFP4_BLOCK_SIZE);
+    at::Tensor colwise_scale =
+        at::empty({Gout * N, colwise_scale_N}, at::TensorOptions().dtype(at::kByte).device(device));
+
+    // packed 2 fp4 values in N dimension
+    at::Tensor colwise_output =
+        at::empty({Gout * N, M_pad / 2}, at::TensorOptions().dtype(at::kByte).device(device));
+
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), DType, {
+        quantize_amdfp4_dual_impl<DType>(
+            reinterpret_cast<DType *>(input.data_ptr()),
+            reinterpret_cast<dtype::float4x2_e2m1 *>(rowwise_output.data_ptr()),
+            rowwise_scale.data_ptr<uint8_t>(),
+            reinterpret_cast<dtype::float4x2_e2m1 *>(colwise_output.data_ptr()),
+            colwise_scale.data_ptr<uint8_t>(), G, M, N, M_pad, N_pad,
+            /*rowwise_scale_stride=*/rowwise_scale_N, /*colwise_scale_stride=*/colwise_scale_N,
+            rowwise_scale_N, /*colwise_scale_M=*/N, colwise_scale_N, /*global_amax=*/nullptr,
+            ScaleType::E5M3, ScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht),
+            ScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht), stream);
+    });
+
+    if (is_batched) {
+        return {rowwise_output.view({G, M, N_pad / 2}).view(at::kFloat4_e2m1fn_x2),
+                rowwise_scale.view({G, M, -1}),
+                colwise_output.view({G, N, M_pad / 2}).view(at::kFloat4_e2m1fn_x2),
+                colwise_scale.view({G, N, -1})};
+    }
+
+    return {rowwise_output.view(at::kFloat4_e2m1fn_x2), rowwise_scale,
+            colwise_output.view(at::kFloat4_e2m1fn_x2), colwise_scale};
+}
+
+// Quantize AMDFP4 with single mode (rowwise or colwise)
+std::vector<at::Tensor> quantize_amdfp4(const at::Tensor input, const at::ScalarType dest_dtype,
+                                        const int64_t axis, const int64_t padding_align_size,
+                                        const bool use_2d_block, const bool use_sr,
+                                        const bool use_rht) {
+    using namespace primus_turbo::detail;
+
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
+                       "Input must be BFloat16 or Half");
+    PRIMUS_TURBO_CHECK(input.dim() == 2 || input.dim() == 3, "Input must be 2D or 3D");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2.");
+    PRIMUS_TURBO_CHECK(padding_align_size == AMDFP4_K_DIM_PADDING_ALIGN_SIZE,
+                       "padding_align_size must be ", AMDFP4_K_DIM_PADDING_ALIGN_SIZE,
+                       " for AMDFP4. But got padding_align_size=", padding_align_size);
+
+    int64_t      G, M, N;
+    QuantizeMode mode;
+    if (input.dim() == 2) {
+        PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1 for 2D input");
+        mode = (axis == 0) ? QuantizeMode::COLWISE : QuantizeMode::ROWWISE;
+        G    = 1;
+        M    = input.size(0);
+        N    = input.size(1);
+    } else {
+        PRIMUS_TURBO_CHECK(axis == 1 || axis == 2, "Axis must be 1 or 2 for 3D input");
+        mode = (axis == 1) ? QuantizeMode::COLWISE : QuantizeMode::ROWWISE;
+        G    = input.size(0);
+        M    = input.size(1);
+        N    = input.size(2);
+    }
+    const bool    is_rowwise = (mode == QuantizeMode::ROWWISE);
+    const bool    is_batched = (input.dim() == 3);
+    const int64_t Gout       = is_batched ? G : 1;
+
+    const int64_t M_pad = cdiv(M, padding_align_size) * padding_align_size;
+    const int64_t N_pad = cdiv(N, padding_align_size) * padding_align_size;
+
+    PRIMUS_TURBO_CHECK(N % AMDFP4_BLOCK_SIZE == 0, "N must be divisible by ", AMDFP4_BLOCK_SIZE);
+
+    auto device = input.device();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int64_t scale_outer = is_rowwise ? M : N;
+    int64_t scale_N = is_rowwise ? cdiv(N_pad, AMDFP4_BLOCK_SIZE) : cdiv(M_pad, AMDFP4_BLOCK_SIZE);
+    at::Tensor scale_tensor = at::empty({Gout * scale_outer, scale_N},
+                                        at::TensorOptions().dtype(at::kByte).device(device));
+
+    // packed 2 fp4 values in the quantized dimension
+    int64_t    output_rows = is_rowwise ? M : N;
+    int64_t    output_cols = is_rowwise ? (N_pad / 2) : (M_pad / 2);
+    at::Tensor output      = at::empty({Gout * output_rows, output_cols},
+                                       at::TensorOptions().dtype(at::kByte).device(device));
+
+    TORCH_TYPE_SWITCH_FP16_BF16(input.scalar_type(), DType, {
+        quantize_amdfp4_impl<DType>(reinterpret_cast<DType *>(input.data_ptr()),
+                                    reinterpret_cast<dtype::float4x2_e2m1 *>(output.data_ptr()),
+                                    scale_tensor.data_ptr<uint8_t>(), mode, G, M, N, M_pad, N_pad,
+                                    /*scale_stride=*/scale_N, scale_N, /*global_amax=*/nullptr,
+                                    ScaleType::E5M3, ScalingRecipe(use_2d_block, use_sr, use_rht),
+                                    stream);
+    });
+
+    if (is_batched) {
+        return {output.view({G, output_rows, output_cols}).view(at::kFloat4_e2m1fn_x2),
+                scale_tensor.view({G, scale_outer, -1})};
+    }
+
+    return {output.view(at::kFloat4_e2m1fn_x2), scale_tensor};
+}
+
+// De-Quantize AMDFP4
+at::Tensor dequantize_amdfp4(const at::Tensor input, const at::Tensor scale_inv, const int64_t axis,
+                             const int64_t block_size, const at::ScalarType dest_dtype) {
+    using namespace primus_turbo::detail;
+
+    PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "Input must be contiguous");
+    PRIMUS_TURBO_CHECK(input.dim() == 2 || input.dim() == 3, "Input must be 2D or 3D");
+    PRIMUS_TURBO_CHECK(input.scalar_type() == at::kFloat4_e2m1fn_x2,
+                       "Input must be Float4_e2m1fn_x2");
+    PRIMUS_TURBO_CHECK(scale_inv.is_cuda(), "scale_inv must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(scale_inv.dim() == input.dim(), "scale_inv rank must match input");
+    PRIMUS_TURBO_CHECK(scale_inv.is_contiguous(), "scale_inv must be contiguous");
+    // E5M3 has no torch dtype, so the quantizer hands its scales back as bytes.
+    PRIMUS_TURBO_CHECK(scale_inv.dtype() == at::kByte, "scale_inv must be a uint8 tensor");
+    PRIMUS_TURBO_CHECK(dest_dtype == at::kBFloat16 || dest_dtype == at::kHalf ||
+                           dest_dtype == at::kFloat,
+                       "Output dtype must be bf16/fp16/fp32");
+    PRIMUS_TURBO_CHECK(block_size == AMDFP4_BLOCK_SIZE, "block_size must be ", AMDFP4_BLOCK_SIZE);
+
+    const bool is_batched = (input.dim() == 3);
+
+    bool    use_rowwise;
+    int64_t num_rows;
+    int64_t row_length;
+    if (input.dim() == 2) {
+        PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1 for 2D input");
+        use_rowwise = (axis == 1);
+        num_rows    = input.size(0);
+        row_length  = input.size(1) * 2;
+    } else {
+        PRIMUS_TURBO_CHECK(axis == 1 || axis == 2, "Axis must be 1 or 2 for 3D input");
+        use_rowwise = (axis == 2);
+        num_rows    = input.size(0) * input.size(1);
+        row_length  = input.size(2) * 2;
+    }
+
+    PRIMUS_TURBO_CHECK(row_length % block_size == 0,
+                       "The last dimension must be divisible by block_size");
+
+    at::Tensor input_2d = input.reshape({num_rows, input.size(-1)});
+    at::Tensor scale_2d =
+        is_batched ? scale_inv.reshape({scale_inv.size(0) * scale_inv.size(1), scale_inv.size(2)})
+                   : scale_inv;
+    const int64_t scale_m = scale_2d.size(0);
+    const int64_t scale_n = scale_2d.size(1);
+
+    auto       stream = at::cuda::getCurrentCUDAStream();
+    at::Tensor output_2d =
+        use_rowwise ? at::empty({num_rows, row_length}, input.options().dtype(dest_dtype))
+                    : at::empty({row_length, num_rows}, input.options().dtype(dest_dtype));
+
+    const uint8_t *x_ptr     = reinterpret_cast<const uint8_t *>(input_2d.data_ptr());
+    const uint8_t *scale_ptr = reinterpret_cast<const uint8_t *>(scale_2d.data_ptr());
+
+    TORCH_TYPE_SWITCH_FP16_BF16_FP32(output_2d.scalar_type(), OType, {
+        dequantize_amdfp4_impl<OType>(
+            x_ptr, reinterpret_cast<OType *>(output_2d.data_ptr()), input_2d.stride(0),
+            input_2d.stride(1), output_2d.stride(0), output_2d.stride(1),
+            static_cast<int>(num_rows), static_cast<int>(row_length), scale_ptr, scale_2d.stride(0),
+            scale_2d.stride(1), static_cast<int>(scale_m), static_cast<int>(scale_n),
+            static_cast<int>(block_size), ScaleType::E5M3, use_rowwise, stream);
+    });
+
+    if (is_batched) {
+        if (use_rowwise) {
+            return output_2d.reshape({input.size(0), input.size(1), row_length});
+        }
+        return output_2d.reshape({row_length, input.size(0), input.size(1)}).permute({1, 2, 0});
+    }
+
+    return output_2d;
 }
 
 // Quantize MXFP8 with dual mode
@@ -836,7 +1063,7 @@ quantize_mxfp8_dual(const at::Tensor input, const at::ScalarType dest_dtype,
                 reinterpret_cast<OType *>(colwise_output.data_ptr()),
                 colwise_scale.data_ptr<uint8_t>(), G, M, N, M_pad, N_pad, rowwise_scale_stride,
                 colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, N,
-                colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,
+                colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad, ScaleType::E8M0,
                 ScalingRecipe(rowwise_use_2d_block, false, false, shuffle_rowwise_scale,
                               shuffle_rowwise),
                 ScalingRecipe(colwise_use_2d_block, false, false, shuffle_colwise_scale,
@@ -954,6 +1181,7 @@ std::vector<at::Tensor> quantize_mxfp8(const at::Tensor input, const at::ScalarT
                 reinterpret_cast<IType *>(input.data_ptr()),
                 reinterpret_cast<OType *>(output.data_ptr()), scale_tensor.data_ptr<uint8_t>(),
                 mode, G, M, N, M_pad, N_pad, scale_stride, scale_N, scale_M_pad, scale_N_pad,
+                ScaleType::E8M0,
                 ScalingRecipe(use_2d_block, false, false, shuffle_scale, shuffle_out), stream);
         })});
 
@@ -1063,7 +1291,7 @@ std::vector<at::Tensor> grouped_quantize_mxfp8(const at::Tensor input, const at:
                 group_offs.data_ptr<int64_t>(), group_offs_padded.data_ptr<int64_t>(), mode,
                 static_cast<int>(G), static_cast<int>(total_M), static_cast<int>(N),
                 static_cast<int>(N_pad), scale_stride, static_cast<int>(scale_N),
-                static_cast<int>(scale_M_pad), static_cast<int>(scale_N_pad),
+                static_cast<int>(scale_M_pad), static_cast<int>(scale_N_pad), ScaleType::E8M0,
                 ScalingRecipe(use_2d_block, false, false, shuffle_scale, shuffle_out), stream);
         })});
 
@@ -1189,6 +1417,7 @@ grouped_quantize_mxfp8_dual(const at::Tensor input, const at::Tensor group_lens,
                 static_cast<int>(total_M), static_cast<int>(N), static_cast<int>(N_pad),
                 rowwise_scale_stride, colwise_scale_stride, rowwise_scale_N, rowwise_scale_M_pad,
                 rowwise_scale_N_pad, N, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad,
+                ScaleType::E8M0,
                 ScalingRecipe(rowwise_use_2d_block, false, false, shuffle_rowwise_scale,
                               shuffle_rowwise),
                 ScalingRecipe(colwise_use_2d_block, false, false, shuffle_colwise_scale,
@@ -1280,7 +1509,7 @@ grouped_quantize_mxfp4_dual(const at::Tensor input, const at::Tensor group_lens,
             static_cast<int>(total_M), static_cast<int>(N), static_cast<int>(M_pad_col),
             static_cast<int>(N_pad), static_cast<int>(rowwise_scale_stride),
             static_cast<int>(colwise_scale_stride), static_cast<int>(rowwise_scale_N),
-            static_cast<int>(colwise_scale_N),
+            static_cast<int>(colwise_scale_N), ScaleType::E8M0,
             ScalingRecipe(rowwise_use_2d_block, rowwise_use_sr, rowwise_use_rht, false, false),
             ScalingRecipe(colwise_use_2d_block, colwise_use_sr, colwise_use_rht, false, false),
             stream);
@@ -1362,8 +1591,8 @@ std::vector<at::Tensor> grouped_quantize_mxfp4(const at::Tensor input, const at:
             group_offs.data_ptr<int64_t>(), group_offs_padded_colwise.data_ptr<int64_t>(), mode,
             static_cast<int>(G), static_cast<int>(total_M), static_cast<int>(N),
             static_cast<int>(M_pad_col), static_cast<int>(N_pad), static_cast<int>(scale_stride),
-            static_cast<int>(scale_N), ScalingRecipe(use_2d_block, use_sr, use_rht, false, false),
-            stream);
+            static_cast<int>(scale_N), ScaleType::E8M0,
+            ScalingRecipe(use_2d_block, use_sr, use_rht, false, false), stream);
     });
 
     // Rowwise FP4 is tight-M, so its "padded" layout is the original; colwise

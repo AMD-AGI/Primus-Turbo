@@ -273,11 +273,32 @@ PRIMUS_TURBO_DEVICE float warp_reduce_max_8_dpp(float val) {
     return val;
 }
 
+// Max over each aligned group of 4 lanes, for quantization recipes whose scale
+// block spans 4 threads (16 elements at 4 elements/thread) instead of 8.
+PRIMUS_TURBO_DEVICE float warp_reduce_max_4_dpp(float val) {
+    val = fmaxf(val, ds_swizzle_xor2(val));
+    val = fmaxf(val, ds_swizzle_xor1(val));
+    return val;
+}
+
 // Full-wavefront max reduction. ``ds_swizzle`` only exchanges within 32-lane
 // groups, so a 64-lane wavefront needs an extra cross-group (lane ^ 32) step
 // while a 32-lane wavefront (gfx1250) is already fully reduced after xor16.
 PRIMUS_TURBO_DEVICE float warp_reduce_max_64_dpp(float val) {
     val = warp_reduce_max_8_dpp(val);
+    val = fmaxf(val, ds_swizzle_xor8(val));
+    val = fmaxf(val, ds_swizzle_xor16(val));
+    if constexpr (THREADS_PER_WARP == 64) {
+        val = fmaxf(val, __shfl_xor_sync(FINAL_MASK, val, 32, THREADS_PER_WARP));
+    }
+    return val;
+}
+
+// Counterpart of ``warp_reduce_max_8_dpp``: reduces across the 8-lane groups
+// instead of within them, i.e. over the lanes that share a position in their
+// group and differ only in bits [5:3]. Kernels that map 8 threads onto a row use
+// this to finish a 2D reduction once each row has been reduced across lanes.
+PRIMUS_TURBO_DEVICE float warp_reduce_max_across_8_dpp(float val) {
     val = fmaxf(val, ds_swizzle_xor8(val));
     val = fmaxf(val, ds_swizzle_xor16(val));
     if constexpr (THREADS_PER_WARP == 64) {

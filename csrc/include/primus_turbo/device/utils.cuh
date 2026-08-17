@@ -123,4 +123,36 @@ PRIMUS_TURBO_DEVICE float e8m0_to_scale(uint8_t e8m0) {
     return uint_as_float(static_cast<uint32_t>(e8m0) << 23);
 }
 
+// Decode a CDNA5 E5M3 block scale into FP32. E5M3 is an unsigned 8-bit float
+// with a 5-bit exponent (bias 15) and 3 mantissa bits: 0x00 is zero, 0x01..0x07
+// are subnormals on the 2^-17 grid, 0x08 is the smallest normal (2^-14) and
+// 0xFE is the largest finite value (114688). 0xFF encodes NaN in hardware;
+// producers saturate to 0xFE so this maps it to the finite value instead.
+PRIMUS_TURBO_DEVICE float e5m3_to_scale(uint8_t e5m3) {
+    const uint32_t exp_field = static_cast<uint32_t>(e5m3) >> 3;
+    const uint32_t mantissa  = static_cast<uint32_t>(e5m3) & 0x7u;
+    if (exp_field == 0) {
+        return static_cast<float>(mantissa) * 0x1p-17f;
+    }
+    // FP32 bias 127 - E5M3 bias 15 = 112; the 3 mantissa bits are the top of
+    // the FP32 mantissa field.
+    return uint_as_float(((exp_field + 112u) << 23) | (mantissa << 20));
+}
+
+// Decode an OCP E4M3 block scale (NVFP4) into FP32: a 4-bit exponent with bias
+// 7 and 3 mantissa bits, so 0x00 is zero, 0x01..0x07 are subnormals on the
+// 2^-9 grid, 0x08 is the smallest normal (2^-6) and 0x7E is the largest finite
+// value (448). 0x7F encodes NaN; producers saturate to 0x7E so this maps it to
+// the finite value instead. Block scales are non-negative, so the sign bit is
+// ignored and codes >= 0x80 decode to their magnitude.
+PRIMUS_TURBO_DEVICE float e4m3_to_scale(uint8_t e4m3) {
+    const uint32_t exp_field = (static_cast<uint32_t>(e4m3) >> 3) & 0xFu;
+    const uint32_t mantissa  = static_cast<uint32_t>(e4m3) & 0x7u;
+    if (exp_field == 0) {
+        return static_cast<float>(mantissa) * 0x1p-9f;
+    }
+    // FP32 bias 127 - E4M3 bias 7 = 120.
+    return uint_as_float(((exp_field + 120u) << 23) | (mantissa << 20));
+}
+
 } // namespace primus_turbo

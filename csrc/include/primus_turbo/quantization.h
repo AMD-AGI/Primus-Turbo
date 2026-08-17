@@ -55,16 +55,23 @@ void quantize_rowwise_col_major_impl(const FType *x, float *scale, float *scale_
 namespace detail {
 
 enum class QuantizeMode { ROWWISE, COLWISE };
+enum class ScaleType { E5M3, E4M3, E8M0 };
 
 // MX format: each scale covers 32 elements
 constexpr int MXFP4_BLOCK_SIZE = 32;
 constexpr int MXFP8_BLOCK_SIZE = 32;
 
+// AMDFP4 (E5M3 scale) and NVFP4 (E4M3 scale): each scale covers 16 elements.
+// One kernel serves both, selected with ``ScaleType``.
+constexpr int AMDFP4_BLOCK_SIZE = 16;
+constexpr int NVFP4_BLOCK_SIZE  = 16;
+
 // Padding alignment expected for the public ``padding_align_size`` op argument.
 // Must stay in sync with ``MXFP4_PADDING_ALIGN_SIZE`` / ``MXFP8_PADDING_ALIGN_SIZE``
 // declared in ``primus_turbo/pytorch/core/low_precision.py``.
-constexpr int MXFP4_K_DIM_PADDING_ALIGN_SIZE = 128;
-constexpr int MXFP8_K_DIM_PADDING_ALIGN_SIZE = 128;
+constexpr int MXFP4_K_DIM_PADDING_ALIGN_SIZE  = 128;
+constexpr int MXFP8_K_DIM_PADDING_ALIGN_SIZE  = 128;
+constexpr int AMDFP4_K_DIM_PADDING_ALIGN_SIZE = 128;
 
 constexpr int MXFP8_GROUP_M_PADDING_ALIGN_SIZE = 32;
 
@@ -84,6 +91,9 @@ constexpr int FP32_EXPONENT_EXP_BIAS = 127;
 constexpr int FP4_MANTISSA_BITS   = 1;
 constexpr int FP4_EXPONENT_BITS   = 2;
 constexpr int FP4_TARGET_MAX_POW2 = 2;
+// Largest magnitude representable in FP4 E2M1.
+constexpr float FP4_E2M1_MAX     = 6.0f;
+constexpr float FP4_E2M1_MAX_INV = 1.0f / FP4_E2M1_MAX;
 
 constexpr int   FP8E5M2_MANTISSA_BITS   = 2;
 constexpr int   FP8E5M2_EXPONENT_BITS   = 5;
@@ -101,6 +111,20 @@ constexpr int   FP8E4M3_FNUZ_TARGET_MAX_POW2 = 7;
 
 constexpr int E8M0_EXPONENT_BIAS = 127;
 
+// AMDFP4 block scale: an unsigned 8-bit float, so unlike E8M0 it is not
+// restricted to powers of two. 0xFF is reserved for NaN, hence the max code.
+constexpr int     E5M3_EXPONENT_BIAS = 15;
+constexpr int     E5M3_MANTISSA_BITS = 3;
+constexpr uint8_t E5M3_MAX_CODE      = 0xFE;
+constexpr float   E5M3_MAX           = 114688.0f;
+
+// NVFP4 block scale: the OCP fp8 e4m3 encoding reused as an unsigned scale.
+// 0x7F is reserved for NaN, hence the max code.
+constexpr int     E4M3_EXPONENT_BIAS = 7;
+constexpr int     E4M3_MANTISSA_BITS = 3;
+constexpr uint8_t E4M3_MAX_CODE      = 0x7E;
+constexpr float   E4M3_MAX           = FP8E4M3_MAX;
+
 } // namespace detail
 
 template <typename DType>
@@ -110,14 +134,33 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
                               int rowwise_scale_stride, int colwise_scale_stride,
                               int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad,
                               int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
-                              int colwise_scale_N_pad, detail::ScalingRecipe rowwise_recipe,
+                              int colwise_scale_N_pad, detail::ScaleType scale_type,
+                              detail::ScalingRecipe rowwise_recipe,
                               detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
 template <typename DType>
 void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8_t *scale,
                          detail::QuantizeMode mode, int G, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
-                         detail::ScalingRecipe recipe, hipStream_t stream);
+                         detail::ScaleType scale_type, detail::ScalingRecipe recipe,
+                         hipStream_t stream);
+
+template <typename DType>
+void quantize_amdfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
+                               uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
+                               uint8_t *colwise_scale, int G, int M, int N, int M_pad, int N_pad,
+                               int rowwise_scale_stride, int colwise_scale_stride,
+                               int rowwise_scale_N, int colwise_scale_M, int colwise_scale_N,
+                               const float *global_amax, detail::ScaleType scale_type,
+                               detail::ScalingRecipe rowwise_recipe,
+                               detail::ScalingRecipe colwise_recipe, hipStream_t stream);
+
+template <typename DType>
+void quantize_amdfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8_t *scale,
+                          detail::QuantizeMode mode, int G, int M, int N, int M_pad, int N_pad,
+                          int scale_stride, int scale_N, const float *global_amax,
+                          detail::ScaleType scale_type, detail::ScalingRecipe recipe,
+                          hipStream_t stream);
 
 template <typename IType, typename OType>
 void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t *rowwise_scale,
@@ -126,14 +169,15 @@ void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t
                               int colwise_scale_stride, int rowwise_scale_N,
                               int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M,
                               int colwise_scale_N, int colwise_scale_M_pad, int colwise_scale_N_pad,
-                              detail::ScalingRecipe rowwise_recipe,
+                              detail::ScaleType scale_type, detail::ScalingRecipe rowwise_recipe,
                               detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
 template <typename IType, typename OType>
 void quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
                          detail::QuantizeMode mode, int G, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
-                         detail::ScalingRecipe recipe, hipStream_t stream);
+                         detail::ScaleType scale_type, detail::ScalingRecipe recipe,
+                         hipStream_t stream);
 
 template <typename IType, typename OType>
 void grouped_quantize_mxfp8_dual_impl(
@@ -142,15 +186,16 @@ void grouped_quantize_mxfp8_dual_impl(
     const int64_t *group_offs_padded_rowwise, int G, int total_M, int N, int N_pad,
     int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
-    int colwise_scale_M_pad, int colwise_scale_N_pad, detail::ScalingRecipe rowwise_recipe,
-    detail::ScalingRecipe colwise_recipe, hipStream_t stream);
+    int colwise_scale_M_pad, int colwise_scale_N_pad, detail::ScaleType scale_type,
+    detail::ScalingRecipe rowwise_recipe, detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
 template <typename IType, typename OType>
 void grouped_quantize_mxfp8_impl(const IType *input, OType *output, uint8_t *scale,
                                  const int64_t *group_offs, const int64_t *group_offs_padded,
                                  detail::QuantizeMode mode, int G, int total_M, int N, int N_pad,
                                  int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
-                                 detail::ScalingRecipe recipe, hipStream_t stream);
+                                 detail::ScaleType scale_type, detail::ScalingRecipe recipe,
+                                 hipStream_t stream);
 
 template <typename DType>
 void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
@@ -159,7 +204,8 @@ void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *
                                       const int64_t *group_offs_padded_colwise, int G, int total_M,
                                       int N, int M_pad_col, int N_pad, int rowwise_scale_stride,
                                       int colwise_scale_stride, int rowwise_scale_N,
-                                      int colwise_scale_N, detail::ScalingRecipe rowwise_recipe,
+                                      int colwise_scale_N, detail::ScaleType scale_type,
+                                      detail::ScalingRecipe rowwise_recipe,
                                       detail::ScalingRecipe colwise_recipe, hipStream_t stream);
 
 // Single-direction (rowwise OR colwise) grouped MXFP4 quant.
@@ -169,7 +215,8 @@ void grouped_quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *outpu
                                  const int64_t       *group_offs_padded_colwise,
                                  detail::QuantizeMode mode, int G, int total_M, int N,
                                  int M_pad_col, int N_pad, int scale_stride, int scale_N,
-                                 detail::ScalingRecipe recipe, hipStream_t stream);
+                                 detail::ScaleType scale_type, detail::ScalingRecipe recipe,
+                                 hipStream_t stream);
 
 // *************** Grouped Padded Layout ***************
 //
@@ -199,13 +246,15 @@ void dequantize_rowwise_col_major_impl(const QType *x, const float *scale_inv, F
                                        hipStream_t stream);
 
 // *************** MX Block-scaled DeQuantize ***************
+
 template <typename OType, typename QType>
 void dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t stride_x_row,
                            const int64_t stride_x_col, const int64_t stride_y_row,
                            const int64_t stride_y_col, const int n_rows, const int n_cols,
                            const uint8_t *scale_inv, const int64_t stride_scale_row,
                            const int64_t stride_scale_col, const int scale_n_rows,
-                           const int scale_n_cols, const int block_size, const bool use_rowwise,
+                           const int scale_n_cols, const int block_size,
+                           const detail::ScaleType scale_type, const bool use_rowwise,
                            hipStream_t stream);
 
 template <typename OType, typename QType>
@@ -215,7 +264,8 @@ void grouped_dequantize_mxfp8_impl(const QType *x, OType *y, const int64_t strid
                                    const int64_t stride_scale_row, const int64_t stride_scale_col,
                                    const int scale_n_rows, const int scale_n_cols,
                                    const int64_t *group_offs, const int64_t *group_offs_padded,
-                                   int G, int block_size, bool use_rowwise, hipStream_t stream);
+                                   int G, int block_size, detail::ScaleType scale_type,
+                                   bool use_rowwise, hipStream_t stream);
 
 template <typename OType>
 void dequantize_mxfp4_impl(const uint8_t *x, OType *y, const int64_t stride_x_row,
@@ -223,7 +273,18 @@ void dequantize_mxfp4_impl(const uint8_t *x, OType *y, const int64_t stride_x_ro
                            const int64_t stride_y_col, const int n_rows, const int n_cols,
                            const uint8_t *scale_inv, const int64_t stride_scale_row,
                            const int64_t stride_scale_col, const int scale_n_rows,
-                           const int scale_n_cols, const int block_size, const bool use_rowwise,
+                           const int scale_n_cols, const int block_size,
+                           const detail::ScaleType scale_type, const bool use_rowwise,
                            hipStream_t stream);
+
+template <typename OType>
+void dequantize_amdfp4_impl(const uint8_t *x, OType *y, const int64_t stride_x_row,
+                            const int64_t stride_x_col, const int64_t stride_y_row,
+                            const int64_t stride_y_col, const int n_rows, const int n_cols,
+                            const uint8_t *scale_inv, const int64_t stride_scale_row,
+                            const int64_t stride_scale_col, const int scale_n_rows,
+                            const int scale_n_cols, const int block_size,
+                            const detail::ScaleType scale_type, const bool use_rowwise,
+                            hipStream_t stream);
 
 } // namespace primus_turbo

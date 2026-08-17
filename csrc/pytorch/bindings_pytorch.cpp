@@ -67,6 +67,17 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "ScalarType dest_dtype, int axis, "
           "bool use_2d_block, bool use_sr, bool use_rht) -> Tensor[]");
 
+    // ********* AMDFP4 Quantization *********
+    m.def("quantize_amdfp4_dual(Tensor input, ScalarType dest_dtype, "
+          "int padding_align_size, "
+          "bool rowwise_use_2d_block, bool rowwise_use_sr, bool rowwise_use_rht, "
+          "bool colwise_use_2d_block, bool colwise_use_sr, bool colwise_use_rht) -> Tensor[]");
+    m.def("quantize_amdfp4(Tensor input, ScalarType dest_dtype, int axis, "
+          "int padding_align_size, "
+          "bool use_2d_block, bool use_sr, bool use_rht) -> Tensor[]");
+    m.def("dequantize_amdfp4(Tensor input, Tensor scale_inv, int axis, int block_size, "
+          "ScalarType dest_dtype) -> Tensor");
+
     // ********* MXFP8 Quantization *********
     m.def("quantize_mxfp8_dual(Tensor input, ScalarType dest_dtype, "
           "int padding_align_size, "
@@ -154,6 +165,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("dequantize_mxfp4", dequantize_mxfp4);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual);
     m.impl("grouped_quantize_mxfp4", grouped_quantize_mxfp4);
+    m.impl("quantize_amdfp4_dual", quantize_amdfp4_dual);
+    m.impl("quantize_amdfp4", quantize_amdfp4);
+    m.impl("dequantize_amdfp4", dequantize_amdfp4);
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual);
@@ -205,6 +219,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("dequantize_mxfp4", dequantize_mxfp4_meta);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual_meta);
     m.impl("grouped_quantize_mxfp4", grouped_quantize_mxfp4_meta);
+    m.impl("quantize_amdfp4_dual", quantize_amdfp4_dual_meta);
+    m.impl("quantize_amdfp4", quantize_amdfp4_meta);
+    m.impl("dequantize_amdfp4", dequantize_amdfp4_meta);
 
     // ********* MXFP8 Quantization *********
     m.impl("quantize_mxfp8_dual", quantize_mxfp8_dual_meta);

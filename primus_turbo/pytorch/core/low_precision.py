@@ -52,6 +52,17 @@ def check_mxfp4_support() -> Tuple[bool, str]:
     )
 
 
+def check_amdfp4_support() -> Tuple[bool, str]:
+    """Return if amdfp4 support is available"""
+    # Exact match rather than a floor: the kernel is built on gfx1250-only ISA.
+    if get_device_compute_capability() == (12, 5):
+        return True, ""
+    return (
+        False,
+        "Device compute capability gfx1250 required for AMDFP4 execution.",
+    )
+
+
 def check_fp8_ocp_support() -> Tuple[bool, str]:
     """Return if fp8 ocp support is available"""
     if get_device_compute_capability() >= (9, 5):
@@ -94,6 +105,10 @@ except AttributeError:
 MXFP4_BLOCK_SIZE = 32
 # Padding align size for MXFP4
 MXFP4_PADDING_ALIGN_SIZE = 128
+# Block size for AMDFP4
+AMDFP4_BLOCK_SIZE = 16
+# Padding align size for AMDFP4
+AMDFP4_PADDING_ALIGN_SIZE = 128
 # Block size for MXFP8
 MXFP8_BLOCK_SIZE = 32
 # Padding align size for MXFP8
@@ -120,6 +135,7 @@ class ScaleDtype(Enum):
 
     FP32 = auto()
     E8M0 = auto()
+    E5M3 = auto()  # amdfp4
 
 
 class ScalingGranularity(Enum):
@@ -200,14 +216,17 @@ class Float4QuantConfig:
         assert self.granularity == ScalingGranularity.MX_BLOCKWISE, (
             "Float4QuantConfig currently only supports MX_BLOCKWISE granularity"
         )
-
-        mx_support_block_size = [MXFP4_BLOCK_SIZE]
-        assert self.block_size in mx_support_block_size, (
-            f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
-        )
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
 
-        mx_support_scale_dtype = ScaleDtype.E8M0
-        assert self.scale_dtype == mx_support_scale_dtype, (
-            f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
+        # The block size and the scale encoding pick the format together, and
+        # each kernel accepts only its own pair.
+        supported = {
+            MXFP4_BLOCK_SIZE: ScaleDtype.E8M0,
+            AMDFP4_BLOCK_SIZE: ScaleDtype.E5M3,
+        }
+        assert self.block_size in supported, (
+            f"block_size should be one of {sorted(supported)} when granularity is MX_BLOCKWISE"
+        )
+        assert self.scale_dtype == supported[self.block_size], (
+            f"scale_dtype should be {supported[self.block_size]} for block_size {self.block_size}"
         )
