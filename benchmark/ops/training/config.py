@@ -510,6 +510,87 @@ def gen_grouped_gemm_test_cases():
     return all_test_cases
 
 
+# Attention regimes the model table above cannot express: a left sliding window, and a query
+# chunk attending a longer kv context (chunked prefill, or one context-parallel shard). Both
+# are what the deployment targets ask of the attention kernels, and both reach code the
+# square unwindowed model shapes never do.
+# (batch, num_head_q, num_head_kv, seqlen_q, seqlen_kv, window_left); window_left < 0 = none.
+ATTENTION_LONG_CONTEXT_CONFIGS = [
+    (2, 128, 16, 2048, 2048, -1),
+    (2, 128, 16, 4096, 4096, -1),
+    (2, 128, 16, 8192, 8192, -1),
+    (2, 128, 16, 16384, 16384, -1),
+    (4, 128, 16, 2048, 16384, 2048),
+    (4, 128, 16, 4096, 16384, 2048),
+    (4, 128, 16, 8192, 16384, 2048),
+    # 16384^2 at batch 4 would ask 64 GiB per batch of dQ split-K workspace; batch 1 is what
+    # a real long-context step can afford.
+    (1, 128, 16, 16384, 16384, 2048),
+    (4, 48, 6, 4096, 4096, 2047),
+    (4, 48, 6, 4096, 8192, 2047),
+    (4, 48, 6, 4096, 12288, 2047),
+    (4, 48, 6, 4096, 16384, 2047),
+    (4, 64, 8, 1024, 1024, 2047),
+    (4, 64, 8, 1024, 16384, 2047),
+]
+
+# THD document packing: uniform is the zero-waste baseline, the rest are ragged with
+# increasing segment-length skew, which is what a max_seqlen-tiled kernel pays for.
+# (name, segment lengths, window_left)
+ATTENTION_VARLEN_CONFIGS = [
+    (name, segments, window)
+    for name, segments in (
+        ("uniform", [2048, 2048, 2048, 2048]),
+        ("mild", [1024, 2048, 4096, 1024]),
+        ("skew", [512, 2048, 1024, 4096]),
+        ("longtail", [4096, 512, 256, 128]),
+    )
+    for window in (-1, 2048)
+]
+
+# Head dims the attention kernels are built for. The tables above are head-dim agnostic --
+# the shape is the same work at either -- so they sweep both rather than taking a flag.
+ATTENTION_HEAD_DIMS = (64, 128)
+
+
+def gen_attention_long_context_test_cases():
+    """Long-context attention cases: every config at both head dims, and each windowed
+    config run full-causal as well, so the window's cost is read against its own shape."""
+    cases = []
+    for head_dim in ATTENTION_HEAD_DIMS:
+        for batch, num_head_q, num_head_kv, seqlen, seqlen_kv, window in ATTENTION_LONG_CONTEXT_CONFIGS:
+            for window_left in (-1,) if window < 0 else (-1, window):
+                cases.append(
+                    {
+                        "batch": batch,
+                        "num_head_q": num_head_q,
+                        "num_head_kv": num_head_kv,
+                        "head_dim_qk": head_dim,
+                        "head_dim_v": head_dim,
+                        "seqlen": seqlen,
+                        "seqlen_kv": seqlen_kv,
+                        "window_left": window_left,
+                    }
+                )
+    return cases
+
+
+def gen_attention_varlen_test_cases():
+    """THD document-packing cases: every segment layout at both head dims."""
+    return [
+        {
+            "name": name,
+            "segments": segments,
+            "window_left": window,
+            "num_head_q": 64,
+            "num_head_kv": 8,  # GQA group 8: the smallest the deterministic backward takes
+            "head_dim": head_dim,
+        }
+        for head_dim in ATTENTION_HEAD_DIMS
+        for name, segments, window in ATTENTION_VARLEN_CONFIGS
+    ]
+
+
 def gen_attention_test_cases():
     """Generate attention test cases from model configs (deduplicated)."""
     seen = set()

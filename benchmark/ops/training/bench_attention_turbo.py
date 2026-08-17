@@ -14,7 +14,9 @@ import torch.utils.benchmark as benchmark
 from config import (
     BATCH_SIZE_LIST,
     compute_snr,
+    gen_attention_long_context_test_cases,
     gen_attention_test_cases,
+    gen_attention_varlen_test_cases,
     get_platform_info,
 )
 from tabulate import tabulate
@@ -50,36 +52,6 @@ ATTN_BACKENDS = [
     SDPBackend.EFFICIENT_ATTENTION,
     SDPBackend.MATH,
 ]
-
-# --shapes meta: the FlyDSL kernels' own table -- square, and Meta's rectangular configs run
-# both full-causal and with their sliding window. Model shapes (--shapes model, the default)
-# are square and unwindowed, so they never reach the windowed or rectangular code paths.
-# (B, Hq, Hkv, Sq, Skv, window_left); window_left < 0 means full causal.
-_SQUARE_SHAPES = [(2, 128, 16, s, s, -1) for s in (2048, 4096, 8192, 16384)]
-_META_SHAPES = [
-    (4, 128, 16, 2048, 16384, 2048),
-    (4, 128, 16, 4096, 16384, 2048),
-    (4, 128, 16, 8192, 16384, 2048),
-    # 16384^2 at B=4 would ask 64 GiB per batch of dQ split-K workspace; B=1 is what a real
-    # long-context step can afford to fuse.
-    (1, 128, 16, 16384, 16384, 2048),
-    (4, 48, 6, 4096, 4096, 2047),
-    (4, 48, 6, 4096, 8192, 2047),
-    (4, 48, 6, 4096, 12288, 2047),
-    (4, 48, 6, 4096, 16384, 2047),
-    (4, 64, 8, 1024, 1024, 2047),
-    (4, 64, 8, 1024, 16384, 2047),
-]
-
-# --varlen: THD document packing. uniform is the zero-waste baseline; the rest are ragged
-# with increasing segment-length skew, which is what the ragged tiling pays for.
-_VARLEN_SEGMENTS = [
-    ("uniform", [2048, 2048, 2048, 2048]),
-    ("mild", [1024, 2048, 4096, 1024]),
-    ("skew", [512, 2048, 1024, 4096]),
-    ("longtail", [4096, 512, 256, 128]),
-]
-_VARLEN_WINDOWS = [-1, 2048]
 
 
 def _bottom_right_mask(seqlen_q, seqlen_kv, window_left, device):
@@ -292,7 +264,6 @@ def profile_attention(
         except ValueError as e:  # a forced backend that cannot take this shape
             raise RuntimeError(f"backend rejected the shape: {e}") from e
 
-
     # Define forward function
     if use_fp8:
         fwd_func = lambda: turbo.ops.flash_attn_fp8_func(
@@ -357,9 +328,7 @@ def profile_attention(
     correct = None
     try:
         o_ref = attention_ref(q_ref, k_ref, v_ref, sm_scale, causal, window_left)
-        correct = check_attention_correctness(
-            q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out, use_fp8
-        )
+        correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out, use_fp8)
         del o_ref
     except torch.cuda.OutOfMemoryError:
         print("Correctness Check: SKIP (the torch reference does not fit)")
@@ -540,17 +509,23 @@ def profile_varlen(segments, window_left, num_head_q, num_head_kv, head_dim, bac
     return name, check, bwd_time, flops / (bwd_time * 1e-3) / 1e12
 
 
-def _dense_cases(shapes, head_dim):
+def _dense_cases(shapes):
     """(batch, causal, Hq, Hkv, Dqk, Dv, Sq, Skv, window_left) for the chosen shape set."""
-    if shapes == "meta":
-        cases = [
-            (batch, True, hq, hkv, head_dim, head_dim, sq, skv, -1)
-            for batch, hq, hkv, sq, skv, _ in _SQUARE_SHAPES
+    if shapes == "long-context":
+        return [
+            (
+                case["batch"],
+                True,  # a window and a rectangular shape are both causal-only
+                case["num_head_q"],
+                case["num_head_kv"],
+                case["head_dim_qk"],
+                case["head_dim_v"],
+                case["seqlen"],
+                case["seqlen_kv"],
+                case["window_left"],
+            )
+            for case in gen_attention_long_context_test_cases()
         ]
-        for batch, hq, hkv, sq, skv, win in _META_SHAPES:
-            for w in (-1, win):  # each config full-causal, then with its window
-                cases.append((batch, True, hq, hkv, head_dim, head_dim, sq, skv, w))
-        return cases
     return [
         (
             batch,
@@ -569,45 +544,50 @@ def _dense_cases(shapes, head_dim):
     ]
 
 
-def benchmark_varlen(output_csv, backend_enum, head_dim, num_head_q=64, num_head_kv=8):
+def benchmark_varlen(output_csv, backend_enum):
     """Run the THD document-packing backward table."""
     platform, gpu_name = get_platform_info()
     rows = []
-    for tag, segments in _VARLEN_SEGMENTS:
-        for window_left in _VARLEN_WINDOWS:
-            row = {
-                "Platform": platform,
-                "GPU": gpu_name,
-                "Tag": tag,
-                "Segments": str(segments),
-                "Total": sum(segments),
-                "Window": window_left if window_left >= 0 else "full",
-                "head_dim": head_dim,
-            }
-            try:
-                name, check, bwd_time, bwd_tflops = profile_varlen(
-                    segments, window_left, num_head_q, num_head_kv, head_dim, backend_enum
-                )
-                row.update(
-                    {
-                        "Backend": name,
-                        "Check": check,
-                        "Backward Time (ms)": f"{bwd_time:.3f}",
-                        "Backward TFLOPS": f"{bwd_tflops:.2f}",
-                    }
-                )
-            except Exception as e:  # noqa: BLE001
-                print(f"Failed varlen {tag} window={window_left}: {e}")
-                row.update(
-                    {
-                        "Backend": "ERROR",
-                        "Check": "ERROR",
-                        "Backward Time (ms)": "ERROR",
-                        "Backward TFLOPS": "0.00",
-                    }
-                )
-            print(row, flush=True)
-            rows.append(row)
+    for case in gen_attention_varlen_test_cases():
+        segments, window_left = case["segments"], case["window_left"]
+        row = {
+            "Platform": platform,
+            "GPU": gpu_name,
+            "Tag": case["name"],
+            "Segments": str(segments),
+            "Total": sum(segments),
+            "Window": window_left if window_left >= 0 else "full",
+            "head_dim": case["head_dim"],
+        }
+        try:
+            name, check, bwd_time, bwd_tflops = profile_varlen(
+                segments,
+                window_left,
+                case["num_head_q"],
+                case["num_head_kv"],
+                case["head_dim"],
+                backend_enum,
+            )
+            row.update(
+                {
+                    "Backend": name,
+                    "Check": check,
+                    "Backward Time (ms)": f"{bwd_time:.3f}",
+                    "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"Failed varlen {case['name']} window={window_left}: {e}")
+            row.update(
+                {
+                    "Backend": "ERROR",
+                    "Check": "ERROR",
+                    "Backward Time (ms)": "ERROR",
+                    "Backward TFLOPS": "0.00",
+                }
+            )
+        print(row, flush=True)
+        rows.append(row)
 
     results = pd.DataFrame(rows)
     print("\nFinal Results:")
@@ -625,12 +605,11 @@ def benchmark_attention(
     deterministic=False,
     shapes="model",
     layout="bshd",
-    head_dim=64,
 ):
     """Run attention benchmark."""
     platform, gpu_name = get_platform_info()
 
-    cases = _dense_cases(shapes, head_dim)
+    cases = _dense_cases(shapes)
 
     rows = []
     test_id = 0
@@ -750,11 +729,20 @@ def benchmark_attention(
     print("\nFinal Results:")
     print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
 
-    # Print average TFLOPS
+    # Print average TFLOPS, split by head dim where the table spans more than one: the two
+    # dims run at different per-flop efficiencies, so one mean over both says little.
     avg_fwd = results["Forward TFLOPS"].astype(float).mean()
     avg_bwd = results["Backward TFLOPS"].astype(float).mean()
     print(f"\nAverage Forward TFLOPS: {avg_fwd:.2f}")
     print(f"Average Backward TFLOPS: {avg_bwd:.2f}")
+    head_dims = sorted(results["head_dim_qk"].unique())
+    if len(head_dims) > 1:
+        for head_dim in head_dims:
+            part = results[results["head_dim_qk"] == head_dim]
+            print(
+                f"  head_dim={head_dim}: forward {part['Forward TFLOPS'].astype(float).mean():.2f}, "
+                f"backward {part['Backward TFLOPS'].astype(float).mean():.2f} TFLOPS"
+            )
 
     # Save to CSV
     if output_csv:
@@ -812,21 +800,14 @@ if __name__ == "__main__":
         "--shapes",
         type=str,
         default="model",
-        choices=("model", "meta"),
-        help="model: the model configs (square, unwindowed). meta: the FlyDSL table -- "
-        "rectangular and sliding-window shapes, each run both ways.",
+        choices=("model", "long-context"),
+        help="model: the model configs (square, unwindowed). long-context: sliding-window "
+        "and rectangular shapes at both head dims (see config.py).",
     )
     parser.add_argument(
         "--varlen",
         action="store_true",
         help="Benchmark the THD document-packing backward instead of the dense table.",
-    )
-    parser.add_argument(
-        "--dim",
-        type=int,
-        default=64,
-        choices=(64, 128),
-        help="Head dim for --shapes meta and --varlen (model shapes carry their own).",
     )
     args = parser.parse_args()
 
@@ -835,7 +816,7 @@ if __name__ == "__main__":
         GlobalBackendManager.set_attn_backend(backend_enum)
 
     if args.varlen:
-        benchmark_varlen(args.output, backend_enum, args.dim)
+        benchmark_varlen(args.output, backend_enum)
     else:
         benchmark_attention(
             output_csv=args.output,
@@ -843,5 +824,4 @@ if __name__ == "__main__":
             deterministic=args.deterministic,
             shapes=args.shapes,
             layout=args.layout,
-            head_dim=args.dim,
         )
