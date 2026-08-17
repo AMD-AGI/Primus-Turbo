@@ -1551,3 +1551,128 @@ class StoreCBf16:
             for r in range_constexpr(4):
                 m = base_m + ti * 16 + m_hi + r
                 self._store_masked(acc[r], row_base + m, n_valid)
+
+
+# MXFP4 kernel helpers: lane-table group search (with its DPP scan primitives),
+# power-of-two ceildiv/floordiv, and the XCD band remap.
+
+
+def xcd_band_remap_pid(pid, total_pids, num_xcd, band):
+    """Band-cyclic variant of ``xcd_remap_pid``: an XCD owns every ``num_xcd``-th run of
+    ``band`` tiles, keeping intra-run L2 reuse while every XCD samples the full tile range.
+    That balances a non-uniform per-tile cost the contiguous remap would strand on one XCD."""
+    if num_xcd <= 1 or band <= 0:
+        return pid
+    assert num_xcd & (num_xcd - 1) == 0
+    span = num_xcd * band
+    local = floordiv_pow2(pid, num_xcd)
+    xcd = pid - local * num_xcd
+    rnd = local // band
+    mapped = (rnd * num_xcd + xcd) * band + (local - rnd * band)
+    return arith.select(pid < (total_pids // span) * span, mapped, pid)
+
+
+def _lane_tbl_get(tbl, idx):
+    """Entry ``idx`` (wave-uniform, or a Python int) of a lane-resident table."""
+    if isinstance(idx, int):
+        return _readlane_i32(tbl[idx // 64], idx % 64)
+    v = _readlane_i32(tbl[0], idx)
+    for c in range(1, len(tbl)):
+        hit = idx >= fx.Int32(64 * c)
+        v = arith.select(hit, _readlane_i32(tbl[c], idx - fx.Int32(64 * c)), v)
+    return v
+
+
+def ceildiv_pow2(a, b: int):
+    """``ceildiv(a, b)`` for a power-of-two ``b`` and a non-negative device value ``a``.
+    Signed ``a // b`` lowers to a costly floordivsi (divide + sign correction); the shift is
+    one instruction. Use on runtime hot-path values; plain ``ceildiv`` stays for host ints."""
+    assert b > 0 and (b & (b - 1)) == 0
+    return (a + (b - 1)) >> (b.bit_length() - 1)
+
+
+def _lane_tbl_load(rsrc, lane, n_entries, stride=1, first=0):
+    """Gather entries [0, n_entries) of an i32 buffer view into lane-resident chunks.
+    Entry i reads i32 element ``(i + first) * stride``; lanes past the buffer bound read 0."""
+    n_chunk = ceildiv(n_entries, 64)
+    return [_lane_load_i32(rsrc, (lane + 64 * c + first) * stride) for c in range_constexpr(n_chunk)]
+
+
+def _lane_tbl_scan(tbl):
+    """Inclusive add-scan across a lane-resident table (chunk totals carried forward)."""
+    out = []
+    base = fx.Int32(0)
+    for v in tbl:
+        s = _wave_prefix_add_i32(v) + base
+        out.append(s)
+        base = _readlane_i32(s, 63)
+    return out
+
+
+def _lane_tbl_count_le(tbl, bound):
+    """Number of table entries <= ``bound``."""
+    n = _wave_count_le_i32(tbl[0], bound)
+    for c in range(1, len(tbl)):
+        n = n + _wave_count_le_i32(tbl[c], bound)
+    return n
+
+
+def _readlane_i32(v, lane):
+    """Broadcast one lane of a per-lane i32 into an SGPR; lane must be wave-uniform."""
+    raw = _raw(v)
+    return ArithValue(_res_of(rocdl.readlane(res=raw.type, src=raw, lane=lane)))
+
+
+def _wave_count_le_i32(v, bound):
+    """Number of lanes whose per-lane i32 is <= the wave-uniform bound. One ballot plus one
+    s_bcnt1; on a monotone table this is the first lane above bound, an O(1) stand-in for a
+    G-wide boundary compare chain."""
+    m = _res_of(rocdl.ballot(res=ir.IntegerType.get_signless(64), pred=_raw(v <= bound)))
+    n = _res_of(_llvm.intr_ctpop(m))
+    return ArithValue(arith.trunci(T.i32, n))
+
+
+def _res_of(op):
+    """Unwrap an op builder's single result (some rocdl builders already return one)."""
+    return op.result if hasattr(op, "result") else op
+
+
+def _lane_load_i32(rsrc, idx):
+    """One per-lane i32 gather from a buffer resource; out-of-range lanes read 0."""
+    return ArithValue(_buffer_ops.buffer_load(rsrc, idx, vec_width=1, dtype=T.i32))
+
+
+# A lane-resident int32 table (entry i in lane i%64 of chunk i//64) makes a lookup one v_readlane and a prefix sum one wave scan, avoiding SGPR overflow / an LDS barrier.
+
+
+def floordiv_pow2(a, b: int):
+    """``a // b`` for a power-of-two ``b`` and a non-negative device value ``a``; see
+    ``ceildiv_pow2`` for why the signed floordiv lowering is worth avoiding."""
+    assert b > 0 and (b & (b - 1)) == 0
+    return a >> (b.bit_length() - 1)
+
+
+def _wave_prefix_add_i32(v):
+    """Wave64 inclusive add-scan of a per-lane i32 (lane l ends with the sum of 0..l).
+    DPP steps replace the serial carry; bound_ctrl zeroes the shifted-in lanes. Requires a
+    full EXEC mask (kernel entry)."""
+    for _sh in (1, 2, 4, 8):
+        v = _dpp_add_i32(v, _DPP_ROW_SHR + _sh)
+    v = _dpp_add_i32(v, _DPP_ROW_BCAST15, row_mask=0xA)
+    return _dpp_add_i32(v, _DPP_ROW_BCAST31, row_mask=0xC)
+
+
+_DPP_ROW_SHR = 0x110
+
+
+_DPP_ROW_BCAST31 = 0x143
+
+
+_DPP_ROW_BCAST15 = 0x142
+
+
+def _dpp_add_i32(acc, ctrl, row_mask=0xF):
+    """acc + DPP(acc, ctrl); masked-off and shifted-in lanes contribute 0."""
+    raw = _raw(acc)
+    r = rocdl.update_dpp(raw.type, _raw(fx.Int32(0)), raw, ctrl, row_mask, 0xF, True)
+    return acc + ArithValue(_res_of(r))
