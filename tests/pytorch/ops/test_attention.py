@@ -308,32 +308,35 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal):
 
 
 # (Hq, Hkv): the first passes the FlyDSL gate, the second is MHA -- a GQA group of 1 is
-# rejected there, so it exercises the fall-back to a backend that wants [b, s, h, d].
+# rejected there, so it exercises the fall-back to a backend that reads the storage order.
+# b == 1 is the case the strides cannot name: sbhd and bshd are then the same bytes, so the
+# [s, b, h, d] view is contiguous either way and FlyDSL has to accept it.
 @pytest.mark.parametrize("heads", [(8, 1), (8, 8)])
-def test_attention_declared_sbhd(heads):
-    """``flash_attn_func(qkv_format="sbhd")`` means the tensors ARE [s, b, h, d].
+@pytest.mark.parametrize("b", [1, 2])
+def test_attention_sbhd_storage(heads, b):
+    """An sbhd caller hands over the [b, s, h, d] VIEW of its [s, b, h, d] tensors.
 
-    Whichever backend the shape resolves to has to see its own axis order: FlyDSL is
-    sbhd-native and takes them as they are, everything else wants [b, s, h, d] and must be
-    handed a permuted view. Regression for the case where the declared order was passed
-    straight through to a bshd backend, which then read s as the batch -- no error, just a
-    wrong answer (rel_err 4.3 at (s,b)=(256,2))."""
+    That view is what every backend takes; its strides say where the bytes are, which is
+    what aiter allocates its outputs to match and what makes FlyDSL eligible. Regression for
+    reading those axes in the stored order instead of the view's -- no error, just s taken
+    for the batch and a wrong answer (rel_err 4.3 at (s,b)=(256,2))."""
     device, dtype = "cuda", torch.bfloat16
     num_head_q, num_head_kv = heads
-    s, b, d = 256, 2, 64  # s != b so a swapped pair cannot go unnoticed
+    s, d = 256, 64  # s != b so a swapped pair cannot go unnoticed
     sm_scale = d ** (-0.5)
     torch.manual_seed(0)
 
-    q = torch.randn(s, b, num_head_q, d, device=device, dtype=dtype)
-    k = torch.randn(s, b, num_head_kv, d, device=device, dtype=dtype)
-    v = torch.randn(s, b, num_head_kv, d, device=device, dtype=dtype)
+    q, k, v = (
+        torch.randn(s, b, h, d, device=device, dtype=dtype).permute(1, 0, 2, 3)
+        for h in (num_head_q, num_head_kv, num_head_kv)
+    )
 
-    o_ref = attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, True, "sbhd")
-    o = flash_attn_func(q, k, v, softmax_scale=sm_scale, causal=True, qkv_format="sbhd")
+    o_ref = attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, True, "bshd")
+    o = flash_attn_func(q, k, v, softmax_scale=sm_scale, causal=True)
 
-    assert o.shape == (s, b, num_head_q, d), f"expected the caller's sbhd axes back, got {tuple(o.shape)}"
+    assert o.shape == (b, s, num_head_q, d), f"expected the caller's axes back, got {tuple(o.shape)}"
     snr = compute_snr(o_ref, o)
-    print(f"\ndeclared-sbhd Hq={num_head_q} Hkv={num_head_kv}: out={snr:.1f}")
+    print(f"\nsbhd-storage b={b} Hq={num_head_q} Hkv={num_head_kv}: out={snr:.1f}")
     assert snr > 40, f"out SNR too low: {snr:.1f}"
 
 

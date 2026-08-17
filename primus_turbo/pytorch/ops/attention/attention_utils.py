@@ -39,9 +39,10 @@ def _infer_storage_order(
     are sbhd-native, so only a view over sbhd bytes permutes back into a *contiguous*
     ``[s, b, h, d]``.
 
-    ⚠ It cannot recover a distinction the strides do not carry: at ``b == 1`` (or
-    ``s == 1``) sbhd and bshd are the very same bytes. A caller whose tensors really are
-    ``[s, b, h, d]``-shaped says so with ``qkv_format="sbhd"`` instead of letting this guess.
+    At ``b == 1`` (or ``s == 1``) sbhd and bshd are the very same bytes, so the strides
+    cannot name one -- and neither answer is wrong, since either reading addresses the same
+    elements. FlyDSL does not consult this at all; it asks whether the ``[s, b, h, d]`` view
+    is contiguous, which is the thing it actually needs (see DenseAttnFwdFlydslBackend).
     """
 
     def _infer_format(t: torch.Tensor) -> str:

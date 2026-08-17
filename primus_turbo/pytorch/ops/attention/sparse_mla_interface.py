@@ -25,6 +25,7 @@ from typing import Optional
 import torch
 
 from primus_turbo.pytorch.core.backend import (
+    BackendChoice,
     BackendType,
     GlobalBackendManager,
     PrecisionType,
@@ -56,8 +57,8 @@ class SparseMLAFunc(torch.autograd.Function):
             scale=scale,
         )
         o, lse = SparseMlaFwdDispatcher.dispatch(
-            BackendType.FLYDSL,
-            backend,
+            BackendChoice(BackendType.FLYDSL),
+            BackendChoice(backend),
             q=q,
             kv=kv,
             topk_indices=topk_indices,
@@ -78,8 +79,8 @@ class SparseMLAFunc(torch.autograd.Function):
     def backward(ctx, do, *args):
         q, kv, o, lse, topk_indices, attn_sink = ctx.saved_tensors
         dq, dkv, d_sink = SparseMlaBwdDispatcher.dispatch(
-            BackendType.FLYDSL,
-            ctx.backend,  # pinned to the forward's backend
+            BackendChoice(BackendType.FLYDSL),
+            BackendChoice(ctx.backend),  # pinned to the forward's backend
             q=q,
             kv=kv,
             o=o,

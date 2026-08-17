@@ -11,12 +11,11 @@ Mirrors the GEMM multi-backend convention (``kernels/gemm/gemm_impl.py``):
 ``PRIMUS_TURBO_ATTN_BACKEND`` / autotune.
 
 Attention differs from GEMM in that a forward+backward pair must run on the
-*same* backend (their saved-tensor / LSE conventions differ). Rather than one
-generic autograd.Function threading a backend enum through ctx, the op layer
-(``ops/attention/flash_attn_interface.py``) resolves the backend once via
-``resolve_flash_attn_backend`` and routes to a per-backend ``autograd.Function``
--- so consistency holds by construction and the existing aiter autograd path is
-untouched. ``execute`` here runs the forward only; it exists so autotune can
+*same* backend (their saved-tensor / LSE conventions differ). The op layer
+(``ops/attention/flash_attn_interface.py``) resolves it once per call via
+``resolve_flash_attn_backend`` and hands the enum to a single dispatching
+``autograd.Function``, which carries it on ctx -- so the backward cannot pick a
+different one. ``execute`` here runs the forward only; it exists so autotune can
 time each backend. FP8 (triton) stays on its own ``flash_attn_fp8_func`` path.
 """
 
@@ -43,6 +42,14 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
 )
 
 _GFX950 = (9, 5)
+# Narrowest left window the FlyDSL backward is correct on. The fused path picks its kv band
+# from the window (_fuse_blockkv_for rounds W down to a power of two), and the dQ reduce takes
+# the low edge of a q BLOCK's band range, not of each row -- which only agrees with what the
+# body wrote while a band covers whole q blocks. Below BLOCK_Q=64 the band is narrower than the
+# block, odd bands start mid-block, and the reduce then sums a band that wrote only the block's
+# first half: dQ picks up whatever was in the workspace (NaN, in a suite that ran before it).
+# Narrower windows go to aiter.
+_MIN_FLYDSL_WINDOW = 64
 
 
 def _scale_ok(softmax_scale: Optional[float], head_dim: int) -> bool:
@@ -95,6 +102,7 @@ def _flydsl_common_ok(
         and q.dtype == torch.bfloat16
         and head_dim in (64, 128)
         and int(window_size[1]) in (0, -1)
+        and (int(window_size[0]) < 0 or int(window_size[0]) >= _MIN_FLYDSL_WINDOW)
         and _scale_ok(softmax_scale, head_dim)
         and dropout_p == 0.0
         and bias is None
@@ -152,6 +160,7 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
     def can_handle(
         q,
         k=None,
+        v=None,
         dropout_p=0.0,
         softmax_scale=None,
         causal=True,
@@ -159,24 +168,23 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         bias=None,
         alibi_slopes=None,
         sink=None,
-        qkv_format="bshd",
         **kwargs,
     ) -> bool:
-        # FlyDSL dense forward is SBHD-native, so it is eligible only when the bytes are
-        # already in sbhd order -- then the [s,b,h,d] view flash_attn_func hands it is
-        # contiguous and nothing is copied. ``qkv_format`` here is that *storage* order
-        # (flash_attn_func passes _infer_storage_order's answer, or "sbhd" when the caller
-        # declared sbhd axes), not the axis order of the caller's tensors.
-        if k is None or not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
+        # FlyDSL dense forward is SBHD-native and copies nothing, so what it needs is for
+        # the [s,b,h,d] view of these [b,s,h,d]-shaped tensors to be contiguous -- which is
+        # the test, rather than a storage-order name. It holds for sbhd bytes at any batch,
+        # and at b == 1 for bshd bytes too, those being the same bytes.
+        if k is None or v is None or not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
             return False
-        return qkv_format == "sbhd" and _flydsl_common_ok(
+        return all(t.permute(1, 0, 2, 3).is_contiguous() for t in (q, k, v)) and _flydsl_common_ok(
             q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes
         )
 
     @staticmethod
     def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
-        # q/k/v reach here as [s,b,h,d] already: flash_attn_func relabels a caller's
-        # [b,s,h,d] view before it resolves a backend, so there is nothing to convert.
+        # Same [b,s,h,d] tensors the eligibility check saw (this runs under autotune, off
+        # the op layer's path), so the sbhd view is taken here as well.
+        q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
         return flash_attn_sbhd_flydsl_forward_impl(
             q,
             k,

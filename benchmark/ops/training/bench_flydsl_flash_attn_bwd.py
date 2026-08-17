@@ -97,21 +97,24 @@ def profile_case(B, Hq, Hkv, Sq, Skv, window_left):
     # previous case's cached segments first (fragmentation alone fails the allocation).
     torch.cuda.empty_cache()
     torch.manual_seed(0)
-    # FlyDSL dense is SBHD-native, so hand it [S,B,H,D] and name the layout -- at B=1 the
-    # sbhd storage is byte-identical to bshd and only the caller knows which one it built.
-    qb = torch.randn((Sq, B, Hq, D), device=DEV, dtype=DT, requires_grad=True)
-    kb = torch.randn((Skv, B, Hkv, D), device=DEV, dtype=DT, requires_grad=True)
-    vb = torch.randn((Skv, B, Hkv, D), device=DEV, dtype=DT, requires_grad=True)
+    # FlyDSL dense is SBHD-native: build the [S,B,H,D] tensors it wants and hand over their
+    # [B,S,H,D] view, which is the shape the interface takes and the sbhd storage is what
+    # makes the case eligible.
+    # requires_grad_ AFTER the permute, so the view itself is the leaf that collects .grad.
+    qb, kb, vb = (
+        torch.randn(shape, device=DEV, dtype=DT).permute(1, 0, 2, 3).requires_grad_()
+        for shape in ((Sq, B, Hq, D), (Skv, B, Hkv, D), (Skv, B, Hkv, D))
+    )
 
     # Confirm the case actually routes to FlyDSL (not the aiter fallback).
     backend = resolve_flash_attn_backend(
         varlen=False, user_backend=BackendType.FLYDSL, q=qb, k=kb, v=vb,
         dropout_p=0.0, softmax_scale=sm_scale, causal=True, window_size=window_size,
-        bias=None, alibi_slopes=None, sink=None, qkv_format="sbhd",
+        bias=None, alibi_slopes=None, sink=None,
     ).name
 
     fwd = lambda: turbo.ops.flash_attn_func(
-        qb, kb, vb, softmax_scale=sm_scale, causal=True, window_size=window_size, qkv_format="sbhd"
+        qb, kb, vb, softmax_scale=sm_scale, causal=True, window_size=window_size
     )
     out = fwd()
     grad_out = torch.randn_like(out)
@@ -120,10 +123,8 @@ def profile_case(B, Hq, Hkv, Sq, Skv, window_left):
     check = "SKIP"
     try:
         qr, kr, vr = (x.clone().detach().requires_grad_() for x in (qb, kb, vb))
-        o_ref = attention_ref(
-            qr.permute(1, 0, 2, 3), kr.permute(1, 0, 2, 3), vr.permute(1, 0, 2, 3), sm_scale, window_left
-        )
-        o_ref.backward(grad_out.permute(1, 0, 2, 3))  # ref is [B,S,H,D], flydsl out is [S,B,H,D]
+        o_ref = attention_ref(qr, kr, vr, sm_scale, window_left)
+        o_ref.backward(grad_out)
         out.backward(grad_out, retain_graph=True)
         snrs = [compute_snr(r.grad, x.grad) for r, x in ((qr, qb), (kr, kb), (vr, vb))]
         check = "PASS" if all(s > SNR_THRESHOLD for s in snrs) else f"FAIL({min(snrs):.0f})"

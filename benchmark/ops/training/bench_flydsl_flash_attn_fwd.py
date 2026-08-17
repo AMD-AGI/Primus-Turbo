@@ -35,8 +35,6 @@ D = 64
 SNR_THRESHOLD = 40.0  # bf16
 
 # (B, Hq, Hkv, Sq, Skv, window_left); window_left < 0 means full causal.
-# B>=2: with B=1 the sbhd storage is byte-identical to bshd and _infer_qkv_format
-# cannot tell them apart, so it would fall back off FlyDSL.
 SQUARE = [(2, 128, 16, s, s, -1) for s in (2048, 4096, 8192, 16384)]
 # Meta's rectangular configs (B=4), each run full-causal and with its SWA window.
 _META = [
@@ -94,8 +92,8 @@ def profile_case(B, Hq, Hkv, Sq, Skv, window_left):
     sm_scale = D ** (-0.5)
     window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
     torch.manual_seed(0)
-    # FlyDSL dense is SBHD-native: store [S,B,H,D] and view as logical [B,S,H,D]
-    # so _infer_qkv_format sees sbhd stride (else it falls back to aiter).
+    # FlyDSL dense is SBHD-native: store [S,B,H,D] and hand over the logical [B,S,H,D]
+    # view, whose sbhd strides are what makes the case eligible for it.
     q = torch.randn((Sq, B, Hq, D), device=DEV, dtype=DT).permute(1, 0, 2, 3)
     k = torch.randn((Skv, B, Hkv, D), device=DEV, dtype=DT).permute(1, 0, 2, 3)
     v = torch.randn((Skv, B, Hkv, D), device=DEV, dtype=DT).permute(1, 0, 2, 3)
@@ -104,7 +102,7 @@ def profile_case(B, Hq, Hkv, Sq, Skv, window_left):
     backend = resolve_flash_attn_backend(
         varlen=False, user_backend=BackendType.FLYDSL, q=q, k=k, v=v,
         dropout_p=0.0, softmax_scale=sm_scale, causal=True, window_size=window_size,
-        bias=None, alibi_slopes=None, sink=None, qkv_format="sbhd",
+        bias=None, alibi_slopes=None, sink=None,
     ).name
 
     fwd = lambda: turbo.ops.flash_attn_func(

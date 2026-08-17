@@ -463,6 +463,22 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> str:
     return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
 
 
+def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
+    """Say once that the default backend was not eligible and we fell back.
+
+    Skipped under torch.compile: dynamo cannot trace a logging.Logger call, and backend
+    selection is host-side dispatch, so tracing into it would fail the compile over a
+    diagnostic. Formatting the kwargs is not cheap either, and it sits inside the guard.
+    """
+    if torch.compiler.is_compiling():
+        return
+    logger.warning(
+        f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, "
+        f"fallback backend {backend_enum.name} is selected. The fallback backend may hurt performance!",
+        once=True,
+    )
+
+
 class AutoKernelDispatcher(ABC):  # noqa: B024
     """
     Base class for auto kernel dispatcher.
@@ -596,10 +612,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
-                logger.warning(
-                    f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, fallback backend {fallback_backend_enum.name} is selected. The fallback backend may hurt performance!",
-                    once=True,
-                )
+                _warn_fallback(fallback_backend_enum, kwargs)
                 return fallback_backend_entry.impl.execute(**kwargs)
 
         raise ValueError(
@@ -655,10 +668,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
-                logger.warning(
-                    f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, fallback backend {fallback_backend_enum.name} is selected. The fallback backend may hurt performance!",
-                    once=True,
-                )
+                _warn_fallback(fallback_backend_enum, kwargs)
                 return fallback_backend_enum
 
         raise ValueError(
