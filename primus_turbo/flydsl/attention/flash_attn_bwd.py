@@ -62,10 +62,14 @@ _FUSE_DQ = True
 # (see FQ_PAIR) -- the pairing the split pair's dedicated Q-outer dq kernel relies on. That,
 # plus cutting the kv a window puts out of range before the grid is sized rather than masking
 # it inside the body, is what makes the fused path the faster of the two where it is tuned.
-# It is off because two shape classes are not: D64 with Hq 48, and a short-Sq rectangle. Both
-# are the tuned path's assumptions failing on shapes it has not seen, so they are work to do
-# rather than shapes to gate away. Set True to take the fused path for windows everywhere.
-_FUSE_DQ_SWA = False
+# The two shape classes that used to hold this off -- D64 with Hq 48, and a short-Sq rectangle,
+# both around 2x the split pair -- are fixed, so windows take the fused path everywhere. On the
+# deployment benchmark that is 735.2 -> 743.0 TF at D64 and 692.0 -> 697.3 at D128. Per row the
+# windowed shapes it governs run +7 to +13% at Hq 48/64 and -3 to -4% at Hq 128, where the dQ
+# reduce is big enough to matter and has nothing to hide behind (a window pins q_split to 1, so
+# there is no second chunk to overlap it with -- see _pipe_chunks; q_split=2 to buy one back
+# measures -2.5 to -12.6% and is not the answer).
+_FUSE_DQ_SWA = True
 # Pads dQ split-K band groups off a power-of-two stride so QDESC's same-row groups do not co-alias. D128 only.
 _WSQ_BAND_PAD = 1 << 20
 # Bands per interleaved dQ partial row: adjacent bands share a row so their same-row groups fill
