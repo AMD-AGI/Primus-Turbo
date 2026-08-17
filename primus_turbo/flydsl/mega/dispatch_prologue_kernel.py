@@ -566,7 +566,7 @@ def get_dispatch_prologue_scratch(num_experts, device="cuda"):
 @autotune(
     configs=[
         Config(num_blocks=num_blocks, num_threads=num_threads)
-        for num_blocks, num_threads in itertools.product((32, 64, 96), (256, 512, 1024))
+        for num_blocks, num_threads in itertools.product((16, 32, 64, 96), (256, 512, 1024))
     ],
     rep=5,
     # Retune per shape; topk_idx dtype auto-joins the key via the tensor arg.
@@ -656,15 +656,6 @@ def _compiled_dispatch_prologue(
     )
 
 
-# One flat handle -- consumers unpack it by name, and it crosses the torch custom-op /
-# autograd boundaries as-is (those only accept a flat tensor sequence):
-#   (num_tile_blocks, sorted_slot_ids, tile_to_expert, source_slot_kind,
-#    recv_dst_rank, recv_start_row, recv_count, pool_src_slot, dedup_key_row,   <- combine
-#    send_dst_rank, send_count, send_offset, dispatched_token_idx,
-#    num_tokens_per_expert_prefix, real_count_per_expert)
-# Combine reads exactly the leading 9, so it unpacks a prefix instead of picking.
-
-
 def dispatch_prologue_flydsl_kernel(
     topk_idx,
     topk_weight,
@@ -745,8 +736,6 @@ def dispatch_prologue_flydsl_kernel(
         stream=stream,
     )
 
-    # pool_src_slot is written by peers into the symmetric buffer; snapshot it here so the
-    # handle owns a private copy (a later layer reuses the shared one).
     return (
         num_tile_blocks,
         sorted_dispatch_slot_ids,
