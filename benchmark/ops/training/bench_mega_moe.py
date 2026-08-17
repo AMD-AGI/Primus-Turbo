@@ -73,7 +73,7 @@ from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
     _BLOCK_THREADS,
     _NUM_WARPS,
     _PVEC,
-    combine_bf16_tile,
+    combine_dedup_bf16_tile,
     dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
@@ -96,6 +96,7 @@ from primus_turbo.pytorch.ops import grouped_gemm as turbo_grouped_gemm  # noqa:
 # dispatch handle slots the bench reads by index (see fused_mega_moe_forward_impl)
 _H_REAL_COUNT_PER_EXPERT = 6
 _H_SORTED_DISPATCH_SLOT_IDS = 19
+_H_DEDUP_KEY_ROW = 20
 
 
 # --------------------------------------------------------------------------- #
@@ -1032,7 +1033,10 @@ def _compile_combine_only_task(
     with_gate=False,
 ):
     """Task-based combine push: grid strides over num_experts recv-segments; a warp
-    sustains ONE peer per segment (mirror of dispatch) -> sustained XGMI link."""
+    sustains ONE peer per segment (mirror of dispatch) -> sustained XGMI link.
+
+    Sender dedup, like the fused kernel: a token's local routes fold into ONE pushed
+    row, so the XGMI volume matches dispatch's unique-row send."""
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def combine_task_k(
@@ -1041,6 +1045,8 @@ def _compile_combine_only_task(
         RECV_START_ROW: fx.Tensor,
         RECV_COUNT: fx.Tensor,
         POOL_SRC_SLOT: fx.Tensor,
+        SORTED_SLOT_IDS: fx.Tensor,
+        DEDUP_KEY_ROW: fx.Tensor,
         sym_buffer: SymBuffer,
     ):
         thread_index = fx.thread_idx.x
@@ -1063,9 +1069,12 @@ def _compile_combine_only_task(
         origin_slot_res = create_buffer_resource(POOL_SRC_SLOT, max_size=True)
         grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
 
+        sorted_slot_res = create_buffer_resource(SORTED_SLOT_IDS, max_size=True)
+        key_row_res = create_buffer_resource(DEDUP_KEY_ROW, max_size=True)
+
         local_count = (fx.Int32(num_experts) - block_index + combine_cu - fx.Int32(1)) // combine_cu
         for local_iter in range(local_count):
-            combine_bf16_tile(
+            combine_dedup_bf16_tile(
                 sym_buffer,
                 workspace,
                 thread_index=thread_index,
@@ -1074,7 +1083,11 @@ def _compile_combine_only_task(
                 recv_start_row_res=recv_start_row_res,
                 recv_count_res=recv_count_res,
                 origin_slot_res=origin_slot_res,
+                sorted_slot_res=sorted_slot_res,
+                key_row_res=key_row_res,
                 grad_gate_res=grad_gate_res,
+                topk=num_topk,
+                apply_weights=False,
                 with_gate=with_gate,
             )
 
@@ -1085,6 +1098,8 @@ def _compile_combine_only_task(
         RECV_START_ROW,
         RECV_COUNT,
         POOL_SRC_SLOT,
+        SORTED_SLOT_IDS,
+        DEDUP_KEY_ROW,
         sym_buffer,
         stream: fx.Stream,
     ):
@@ -1094,6 +1109,8 @@ def _compile_combine_only_task(
             RECV_START_ROW,
             RECV_COUNT,
             POOL_SRC_SLOT,
+            SORTED_SLOT_IDS,
+            DEDUP_KEY_ROW,
             sym_buffer,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
         ).launch(grid=(num_combine_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -1126,6 +1143,10 @@ def combine_only(
     with_gate = grad_gate is not None
     waves = int(os.environ.get("MEGA_COMB_WAVES") or "2")  # combine push occupancy knob
     grad_gate_arg = grad_gate.contiguous().view(-1) if with_gate else recv_count
+    # dedup tables: the baseline must push the same unique rows as the fused kernel
+    sorted_slot_ids = handle[_H_SORTED_DISPATCH_SLOT_IDS]
+    dedup_key_row = handle[_H_DEDUP_KEY_ROW]
+    assert dedup_key_row.numel() > 1, "combine_only needs the dispatch dedup tables (dedup=True)"
     # task-based push (sustained per-peer): strides over num_experts recv-segments
     launch = _compile_combine_only_task(
         out_features,
@@ -1143,6 +1164,8 @@ def combine_only(
         recv_start_row,
         recv_count,
         pool_src_slot,
+        sorted_slot_ids,
+        dedup_key_row,
         sym_buffer,
         stream=torch.cuda.current_stream(),
     )
