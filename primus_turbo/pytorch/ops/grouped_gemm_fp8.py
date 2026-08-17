@@ -474,6 +474,10 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         _kpad = (
             backend_choice is not None
             and backend_choice.backend == BackendType.FLYDSL
+            # Fused wgrad writes directly into the weight-shaped main_grad. The
+            # K-pad backward produces a padded last dimension, which cannot use
+            # that unpadded accumulation buffer.
+            and not fuse_bgrad_accum
             and trans_b
             and not isinstance(a, QuantizedTensor)
             and not isinstance(b, QuantizedTensor)

@@ -1360,3 +1360,21 @@ def test_grouped_gemm_fp8_fused_grad_accum(ori_dtype, granularity, trans_b, back
         backend=backend,
         main_grad_dtype=main_grad_dtype,
     )
+
+
+def test_grouped_gemm_fp8_flydsl_fused_grad_accum_unaligned_k():
+    """A weight-shaped main_grad must not receive the K-padded wgrad output."""
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
+
+    _run_grouped_gemm_fp8_fused_grad_accum_test(
+        B=2,
+        M=32,
+        N=64,
+        K=2880,
+        ori_dtype=torch.bfloat16,
+        granularity=ScalingGranularity.TENSORWISE,
+        trans_b=True,
+        backend=BackendType.FLYDSL,
+        main_grad_dtype=torch.bfloat16,
+    )
