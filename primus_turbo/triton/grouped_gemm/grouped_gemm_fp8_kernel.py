@@ -197,9 +197,14 @@ def _get_gg_fp8_tw_fwd_config(
 @functools.lru_cache(maxsize=256)
 def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
     """Cached kernel config for FP8 tensorwise grouped GEMM variable-K backward."""
+    # Mixed fp8 operands (HYBRID) need BLOCK_K=128. Below it Triton selects an MFMA whose
+    # opcode bakes one fp8 format for both operands, so the e4m3 side is decoded as e5m2 and
+    # its large codes read back as Inf/NaN. The forward config is pinned at 128 already,
+    # which is why only the variable-K (wgrad) pass ever hit this.
+    hybrid = a_dtype != b_dtype
     if is_gfx950():
         blk_m, blk_n = 256, 256
-        blk_k, num_stages_val = 64, 3
+        blk_k, num_stages_val = (128, 2) if hybrid else (64, 3)
         group_m = 4
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
@@ -217,11 +222,12 @@ def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
         if origami_params is not None:
             om, on, ok, ogm, oc_a, oc_b = origami_params
             tiles_default = G * ((OUT_M + 255) // 256) * ((OUT_N + 255) // 256)
-            if min(om, on) >= 128 and ok in (64, 128):
+            ok_ks = (128,) if hybrid else (64, 128)
+            if min(om, on) >= 128 and ok in ok_ks:
                 blk_m, blk_n, blk_k, group_m = om, on, ok, ogm
                 num_stages_val = 3 if ok <= 64 else 2
                 cache_a, cache_b = oc_a, oc_b
-            elif tiles_default < num_sms and min(om, on) >= 64:
+            elif tiles_default < num_sms and min(om, on) >= 64 and ok in ok_ks:
                 proposed_stages = 2 if ok >= 128 else 3
                 lds = origama_calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
                 if lds <= origama_hardware_info().lds_capacity:
@@ -304,9 +310,14 @@ def _get_gg_fp8_rw_fwd_config(
 @functools.lru_cache(maxsize=256)
 def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
     """Cached kernel config for FP8 rowwise grouped GEMM variable-K backward."""
+    # Mixed fp8 operands (HYBRID) need BLOCK_K=128. Below it Triton selects an MFMA whose
+    # opcode bakes one fp8 format for both operands, so the e4m3 side is decoded as e5m2 and
+    # its large codes read back as Inf/NaN. The forward config is pinned at 128 already,
+    # which is why only the variable-K (wgrad) pass ever hit this.
+    hybrid = a_dtype != b_dtype
     if is_gfx950():
         blk_m, blk_n = 256, 256
-        blk_k, num_stages_val = 64, 3
+        blk_k, num_stages_val = (128, 2) if hybrid else (64, 3)
         group_m = 4
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
@@ -324,11 +335,12 @@ def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
         if origami_params is not None:
             om, on, ok, ogm, oc_a, oc_b = origami_params
             tiles_default = G * ((OUT_M + 255) // 256) * ((OUT_N + 255) // 256)
-            if min(om, on) >= 128 and ok in (64, 128):
+            ok_ks = (128,) if hybrid else (64, 128)
+            if min(om, on) >= 128 and ok in ok_ks:
                 blk_m, blk_n, blk_k, group_m = om, on, ok, ogm
                 num_stages_val = 3 if ok <= 64 else 2
                 cache_a, cache_b = oc_a, oc_b
-            elif tiles_default < num_sms and min(om, on) >= 64:
+            elif tiles_default < num_sms and min(om, on) >= 64 and ok in ok_ks:
                 proposed_stages = 2 if ok >= 128 else 3
                 lds = origama_calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
                 if lds <= origama_hardware_info().lds_capacity:
