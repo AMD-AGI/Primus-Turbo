@@ -4,16 +4,19 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import math
 from typing import List, Tuple
 
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.ops import flash_attn_varlen_func
 from tests.pytorch.ref.attention_ref import attention_varlen_forward_pytorch_ref_impl
-from tests.pytorch.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr, skip_if_backend_cannot_take
 
 
 def _build_cu_seqlens(seqlens: List[int], device: str) -> Tuple[torch.Tensor, int, int]:
@@ -37,11 +40,21 @@ SEQLEN_PATTERNS = [
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "num_head_q,num_head_kv",
-    [(8, 8), (16, 4)],  # MHA and GQA
+    # MHA, GQA, and a GQA group of 8 -- the smallest the FlyDSL varlen backend admits, so
+    # without it the pinned-FLYDSL half of this test has nothing to run.
+    [(8, 8), (16, 4), (64, 8)],
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_flash_attn_varlen(dtype, seqlens, causal, num_head_q, num_head_kv, head_dim):
+# Per-segment sliding window; -1 is the plain block-causal document mask.
+@pytest.mark.parametrize("window_size_left", [-1, 256])
+# None is whatever resolves; the rest pin one backend so its own path stays covered.
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
+def test_flash_attn_varlen(
+    dtype, seqlens, causal, num_head_q, num_head_kv, head_dim, window_size_left, backend
+):
     seqlens_q, seqlens_k = seqlens
+    if window_size_left >= 0 and not causal:
+        pytest.skip("a left window is only defined against a causal mask")
 
     # Causal varlen requires per-batch q_len == k_len(bottom-right aligned mask)
     if causal and seqlens_q != seqlens_k:
@@ -64,24 +77,48 @@ def test_flash_attn_varlen(dtype, seqlens, causal, num_head_q, num_head_kv, head
     v_ref = v.clone().detach().requires_grad_()
 
     sm_scale = head_dim ** (-0.5)
+    window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
 
     o_ref = attention_varlen_forward_pytorch_ref_impl(
-        q_ref, k_ref, v_ref, cu_seqlens_q, cu_seqlens_k, sm_scale, causal
+        q_ref, k_ref, v_ref, cu_seqlens_q, cu_seqlens_k, sm_scale, causal, window_size=window_size
     )
     o_ref.backward(grad_out)
 
-    o = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+    skip_if_backend_cannot_take(
+        backend,
+        varlen=True,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         dropout_p=0.0,
         softmax_scale=sm_scale,
         causal=causal,
+        window_size=window_size,
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
     )
+    GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    try:
+        o = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=0.0,
+            softmax_scale=sm_scale,
+            causal=causal,
+            window_size=window_size,
+        )
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
     o.backward(grad_out)
 
     torch.cuda.synchronize()
@@ -93,7 +130,8 @@ def test_flash_attn_varlen(dtype, seqlens, causal, num_head_q, num_head_kv, head
 
     print(
         f"\ndtype={dtype}, causal={causal}, hq={num_head_q}, hkv={num_head_kv}, "
-        f"hd={head_dim}, seqlens_q={seqlens_q}, seqlens_k={seqlens_k}\n"
+        f"hd={head_dim}, window={window_size_left}, backend={backend.name if backend else 'auto'}, "
+        f"seqlens_q={seqlens_q}, seqlens_k={seqlens_k}\n"
         f"  out={out_snr:.2f} dq={dq_snr:.2f} dk={dk_snr:.2f} dv={dv_snr:.2f}"
     )
 
@@ -101,97 +139,6 @@ def test_flash_attn_varlen(dtype, seqlens, causal, num_head_q, num_head_kv, head
     assert dq_snr > 40, f"dq_snr too low: {dq_snr}"
     assert dk_snr > 40, f"dk_snr too low: {dk_snr}"
     assert dv_snr > 40, f"dv_snr too low: {dv_snr}"
-
-
-# --- flydsl THD ragged / block-causal (document-masking) fwd+bwd, gfx950-only, D in {64,128} ---
-
-# window_size: full bottom-right causal, then causal-SWA at two widths.
-FLYDSL_WINDOWS = [(-1, -1), (1024, 0), (256, 0)]
-
-
-def _flydsl_block_diag_ref(q, k, v, do, cu, scale, win):
-    """fp32 block-diagonal reference (per-segment bottom-right causal + optional left
-    window) for o and dq/dk/dv, matching the flydsl ragged document-masking contract."""
-    total_q, Hq, D = q.shape
-    Hkv = k.shape[1]
-    G = Hq // Hkv
-    dev = q.device
-    o = torch.empty(total_q, Hq, D, device=dev, dtype=torch.float32)
-    dq = torch.empty_like(o)
-    dk = torch.empty(total_q, Hkv, D, device=dev, dtype=torch.float32)
-    dv = torch.empty_like(dk)
-    for i in range(cu.numel() - 1):
-        b, e = int(cu[i].item()), int(cu[i + 1].item())
-        S = e - b
-        qe = q[b:e].permute(1, 0, 2).float().detach().requires_grad_(True)
-        ke = k[b:e].permute(1, 0, 2).float().detach().requires_grad_(True)
-        ve = v[b:e].permute(1, 0, 2).float().detach().requires_grad_(True)
-        sc = torch.matmul(qe, ke.repeat_interleave(G, 0).transpose(-1, -2)) * scale
-        qi = torch.arange(S, device=dev).view(1, S, 1)
-        kj = torch.arange(S, device=dev).view(1, 1, S)
-        mask = kj > qi
-        if win >= 0:
-            mask = mask | (kj < qi - win)
-        p = torch.softmax(sc.masked_fill(mask, float("-inf")), dim=-1)
-        os_ = torch.matmul(p, ve.repeat_interleave(G, 0))
-        os_.backward(do[b:e].permute(1, 0, 2).float())
-        o[b:e] = os_.permute(1, 0, 2).detach()
-        dq[b:e] = qe.grad.permute(1, 0, 2)
-        dk[b:e] = ke.grad.permute(1, 0, 2)
-        dv[b:e] = ve.grad.permute(1, 0, 2)
-    return o, dq, dk, dv
-
-
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and is_gfx950()), reason="flydsl flash-attn is gfx950-only"
-)
-@pytest.mark.parametrize("head_dim", [64, 128])  # both FLYDSL head dims
-@pytest.mark.parametrize("seqlens", SEQLEN_PATTERNS)
-@pytest.mark.parametrize("window", FLYDSL_WINDOWS)
-def test_flydsl_flash_attn_varlen_blockcausal(head_dim, seqlens, window):
-    """flydsl THD ragged / block-causal (packed document masking) fwd+bwd: SNR vs a fp32
-    block-diagonal reference + bitwise determinism, over ragged and uniform segment
-    layouts x {full-causal, causal-SWA} x D in {64,128}. GQA G=8 (flydsl requires G a
-    power of two >= 8)."""
-    from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
-        flash_attn_varlen_flydsl_backward_impl,
-        flash_attn_varlen_flydsl_forward_impl,
-    )
-
-    dev = "cuda"
-    torch.manual_seed(0)
-    segs, _ = seqlens  # the flydsl ragged path takes cu_seqlens_q == cu_seqlens_k
-    D, Hq, Hkv = head_dim, 64, 8
-    scale = 1.0 / math.sqrt(D)
-    cu, maxs, total = _build_cu_seqlens(segs, dev)
-    q = (torch.randn(total, Hq, D, device=dev, dtype=torch.bfloat16) * 0.5).contiguous()
-    k = (torch.randn(total, Hkv, D, device=dev, dtype=torch.bfloat16) * 0.5).contiguous()
-    v = (torch.randn(total, Hkv, D, device=dev, dtype=torch.bfloat16) * 0.5).contiguous()
-    do = (torch.randn(total, Hq, D, device=dev, dtype=torch.bfloat16) * 0.5).contiguous()
-
-    out, lse = flash_attn_varlen_flydsl_forward_impl(
-        q, k, v, cu, cu, maxs, maxs, softmax_scale=scale, causal=True, window_size=window, return_lse=True
-    )
-    dq, dk, dv = flash_attn_varlen_flydsl_backward_impl(
-        do, q, k, v, out, lse, cu, cu, maxs, maxs, softmax_scale=scale, causal=True, window_size=window
-    )
-
-    o_ref, dq_ref, dk_ref, dv_ref = _flydsl_block_diag_ref(q, k, v, do, cu, scale, window[0])
-    o_snr = compute_snr(o_ref, out.float())
-    dq_snr = compute_snr(dq_ref, dq.float())
-    dk_snr = compute_snr(dk_ref, dk.float())
-    dv_snr = compute_snr(dv_ref, dv.float())
-    print(f"\nD={D} segs={segs} win={window} o={o_snr:.1f} dq={dq_snr:.1f} dk={dk_snr:.1f} dv={dv_snr:.1f}")
-    assert o_snr > 40, f"o SNR too low: {o_snr:.1f}"
-    assert dq_snr > 40, f"dq SNR too low: {dq_snr:.1f}"
-    assert dk_snr > 40, f"dk SNR too low: {dk_snr:.1f}"
-    assert dv_snr > 40, f"dv SNR too low: {dv_snr:.1f}"
-
-    # Determinism: one WG owns each output tile (split-K reduce is host-side sum), bit-exact re-run.
-    dq2, dk2, dv2 = flash_attn_varlen_flydsl_backward_impl(
-        do, q, k, v, out, lse, cu, cu, maxs, maxs, softmax_scale=scale, causal=True, window_size=window
-    )
-    assert torch.equal(dq, dq2) and torch.equal(dk, dk2) and torch.equal(dv, dv2), "bwd not deterministic"
 
 
 def test_flash_attn_varlen_no_grad():

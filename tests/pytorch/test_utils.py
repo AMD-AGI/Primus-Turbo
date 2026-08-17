@@ -4,9 +4,13 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import pytest
 import torch
 
 from primus_turbo.pytorch.core.low_precision import is_fp8_dtype
+from primus_turbo.pytorch.kernels.attention.attention_impl import (
+    resolve_flash_attn_backend,
+)
 
 
 def is_ROCM():
@@ -72,3 +76,18 @@ def compute_snr(x: torch.Tensor, y: torch.Tensor):
     signal_power = torch.norm(x).pow(2)
     noise_power = torch.norm(x - y).pow(2)
     return 10 * torch.log10(signal_power / (noise_power + 1e-12)).detach().item()
+
+
+def skip_if_backend_cannot_take(backend, varlen=False, **kwargs):
+    """Skip the combos a pinned backend does not accept.
+
+    The eligibility rules live in the resolver (head dim, GQA group, storage order, window
+    width, dtype, ...); asking it is how the skip stays in step with them instead of
+    restating them here and drifting.
+    """
+    if backend is None:
+        return
+    try:
+        resolve_flash_attn_backend(varlen=varlen, user_backend=backend, **kwargs)
+    except ValueError as e:
+        pytest.skip(f"{backend.name} does not take this shape: {str(e).split(':')[0]}")
