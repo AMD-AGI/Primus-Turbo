@@ -558,10 +558,18 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     assert layout in ("nt", "nn", "tn"), f"unknown layout {layout}"
     assert x.dtype == torch.bfloat16 and l2_weights.dtype == torch.bfloat16
     assert topk_indices is not None, "topk reduce needs topk_indices"
-    num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
-    _prefix, _real_count, sorted_slot_ids = grouped_meta
-    tile_to_expert, source_slot_kind = dispatch_meta[4], dispatch_meta[5]
-    recv_dst_rank, recv_start_row, recv_count, pool_src_slot, dedup_key_row = combine_meta
+    (
+        num_tile_blocks,
+        sorted_slot_ids,
+        tile_to_expert,
+        source_slot_kind,
+        recv_dst_rank,
+        recv_start_row,
+        recv_count,
+        pool_src_slot,
+        dedup_key_row,
+        *_dispatch_only,
+    ) = handle
     symm = get_symm_buffer_for_mega_moe()
     sym_buffer = symm.get_sym_buffer()
     if layout == "tn":

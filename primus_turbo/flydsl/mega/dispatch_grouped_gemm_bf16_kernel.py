@@ -539,10 +539,11 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
             intermediate_hidden=l1_weights.shape[1] // 2,
         )
         sym_buffer = symm.get_sym_buffer()
-        num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = dispatch_prologue_flydsl_kernel(
+        handle = dispatch_prologue_flydsl_kernel(
             topk_idx,
             topk_weights,
             sym_buffer=sym_buffer,
+            pool_src_slot=symm.pool_src_slot,
             num_tokens=num_tokens,
             num_topk=num_topk,
             num_experts=symm.num_experts,
@@ -554,31 +555,27 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
             hidden=symm.hidden,
             num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
         )
-        # The prologue leaves pool_src_slot unset; snapshot it out of the symmetric buffer.
-        recv_dst_rank, recv_start_row, recv_count, _, dedup_key_row = combine_meta
-        combine_meta = (
-            recv_dst_rank,
-            recv_start_row,
-            recv_count,
-            symm.pool_src_slot.clone(),
-            dedup_key_row,
-        )
-        handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta)
     else:
         symm = get_symm_buffer_for_mega_moe()
         sym_buffer = symm.get_sym_buffer()
 
-    num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
-    num_tokens_per_expert_prefix, _real_count_per_expert, sorted_dispatch_slot_ids = grouped_meta
     (
+        num_tile_blocks,
+        sorted_dispatch_slot_ids,
+        tile_to_expert,
+        source_slot_kind,
+        _recv_dst_rank,
+        _recv_start_row,
+        combine_recv_count,
+        _pool_src_slot,
+        _dedup_key_row,
         expert_send_dst_rank,
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
-        tile_to_expert,
-        source_slot_kind,
-    ) = dispatch_meta
-    _recv_dst_rank, _recv_start_row, combine_recv_count, _pool_src_slot, _dedup_key_row = combine_meta
+        num_tokens_per_expert_prefix,
+        _real_count_per_expert,
+    ) = handle
     num_comm = expert_send_dst_rank.numel()
     num_ranks = symm.world
     assert x.dtype == torch.bfloat16 and l1_weights.dtype == torch.bfloat16

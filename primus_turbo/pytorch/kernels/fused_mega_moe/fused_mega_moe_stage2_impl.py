@@ -26,7 +26,7 @@ def fused_mega_moe_stage2_forward_impl(
 ) -> torch.Tensor:
     """SwiGLU + grouped L2 GEMM + combine (nt). Returns y."""
     topk_idx = topk_idx.to(torch.int64)
-    num_tile_blocks, *_meta = handle
+    num_tile_blocks, *_tables = handle
 
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
     act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=num_tile_blocks)
@@ -52,8 +52,7 @@ def fused_mega_moe_stage2_backward_impl(
     group,
 ):
     """L2 dgrad (nn) + SwiGLU^T + dW2. Returns ``(grad_l1, grad_gate, dW2)``."""
-    num_tile_blocks, grouped_meta, _dispatch_meta, _combine_meta = handle
-    num_tokens_per_expert_prefix, real_count_per_expert, _sorted_slot_ids = grouped_meta
+    num_tile_blocks, *_mid, num_tokens_per_expert_prefix, real_count_per_expert = handle
 
     dy = grad_y.contiguous().to(torch.bfloat16)
 

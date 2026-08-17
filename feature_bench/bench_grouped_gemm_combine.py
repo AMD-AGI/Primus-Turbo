@@ -152,9 +152,18 @@ def _worker(local_rank, world, args):
         l1_out, _, _, handle = dispatch_grouped_gemm_bf16_flydsl_kernel(
             x, w1, group, handle=None, topk_idx=topk_idx, topk_weights=topk_weight, layout="nt"
         )
-        num_tile_blocks, _grouped_meta, dispatch_meta, combine_meta = handle
-        source_slot_kind = dispatch_meta[5]
-        dedup_key_row = combine_meta[4]
+        (
+            num_tile_blocks,
+            _sorted_slot_ids,
+            _tile_to_expert,
+            source_slot_kind,
+            _recv_dst_rank,
+            _recv_start_row,
+            _recv_count,
+            _pool_src_slot,
+            dedup_key_row,
+            *_dispatch_only,
+        ) = handle
         act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=num_tile_blocks)
         del l1_out
         torch.cuda.synchronize()

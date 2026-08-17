@@ -87,7 +87,7 @@ def build_context(shape, group, rank, world):
     l1_out, _, _, handle = dispatch_grouped_gemm_bf16_flydsl_kernel(
         x, w1, group, handle=None, topk_idx=topk_idx, topk_weights=topk_weight, layout="nt"
     )
-    num_tile_blocks, *_meta = handle
+    num_tile_blocks, *_tables = handle
     act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=num_tile_blocks)
     del l1_out
     torch.cuda.synchronize()

@@ -86,10 +86,11 @@ def build_context(shape, group, rank, world):
         ),
     }
 
-    num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = dispatch_prologue_flydsl_kernel(
+    handle = dispatch_prologue_flydsl_kernel(
         topk_idx,
         topk_weight,
         sym_buffer=symm.get_sym_buffer(),
+        pool_src_slot=symm.pool_src_slot,
         num_tokens=tokens,
         num_topk=topk,
         num_experts=experts,
@@ -101,10 +102,7 @@ def build_context(shape, group, rank, world):
         hidden=hidden,
         num_max_tokens_per_rank=tokens,
     )
-    # Mirrors the dispatch launcher: the prologue leaves pool_src_slot unset.
-    recv_dst_rank, recv_start_row, recv_count, _, dedup_key_row = combine_meta
-    combine_meta = (recv_dst_rank, recv_start_row, recv_count, symm.pool_src_slot.clone(), dedup_key_row)
-    handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta)
+    num_tile_blocks, *_tables = handle
     torch.cuda.synchronize()
 
     # tn is wgrad: its rhs is indexed by pool row, so it can only be built after

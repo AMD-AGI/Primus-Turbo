@@ -60,10 +60,15 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
         **kwargs,
     ):
 
-        # custom op carries the handle flat: 1 + 3 (grouped) + 6 (dispatch) + 5 (combine)
-        handle = (handle[0], tuple(handle[1:4]), tuple(handle[4:10]), tuple(handle[10:]))
-        num_tile_blocks, grouped_meta, _dispatch_meta, _combine_meta = handle
-        num_tokens_per_expert_prefix, real_count_per_expert, sorted_slot_ids = grouped_meta
+        handle = tuple(handle)  # custom op hands it over as a list
+        # grouped-GEMM tables sit at the two ends of the handle
+        (
+            num_tile_blocks,
+            sorted_slot_ids,
+            *_mid,
+            num_tokens_per_expert_prefix,
+            real_count_per_expert,
+        ) = handle
 
         # int64 end-to-end (combine reads topk i64)
         topk_idx = topk_idx.to(torch.int64)
@@ -231,7 +236,6 @@ def fused_mega_moe_backward_impl(
 
     Returns (dx, grad_topk_weights, dW1, dW2).
     """
-    num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
     return _fused_mega_moe_backward(
         grad_y,
         saved_x,
@@ -240,7 +244,7 @@ def fused_mega_moe_backward_impl(
         w1,
         w2,
         topk_idx,
-        [num_tile_blocks, *grouped_meta, *dispatch_meta, *combine_meta],
+        list(handle),
         group.group_name,
         num_tokens,
         num_topk,

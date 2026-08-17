@@ -26,9 +26,7 @@ from primus_turbo.pytorch.core.backend import (
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
-# handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta); layout lives in
-# dispatch_prologue_kernel.py. The custom op can only carry a flat tensor list, so the
-# handle travels flattened across this boundary: 1 + 3 + 6 + 5 tensors.
+# Flat dispatch handle; its layout lives in dispatch_prologue_kernel.py.
 _HANDLE_LEN = 15
 
 
@@ -74,7 +72,7 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
             layout=layout,
         )
 
-        num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
+        num_tile_blocks, *_tables = handle
 
         # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
         act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=num_tile_blocks)
@@ -93,7 +91,7 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
             y,
             l1_out,
             dispatch_weights_in_buf,
-            [num_tile_blocks, *grouped_meta, *dispatch_meta, *combine_meta],
+            list(handle),
         )
 
 
@@ -179,10 +177,9 @@ def _fused_mega_moe_forward_meta(
     # and dtype matter here (opaque saved activations); real shapes come from eager.
     i32 = lambda: x.new_empty((0,), dtype=torch.int32)  # noqa: E731
     i64 = lambda: x.new_empty((0,), dtype=torch.int64)  # noqa: E731
-    grouped_meta = (i64(), i64(), i32())  # prefix, real_count_per_expert, sorted_slot_ids
-    dispatch_meta = (i32(), i32(), i32(), i32(), i32(), i32())  # send plan + tile map + slot kind
-    combine_meta = (i32(), i32(), i32(), i32(), i32())  # recv plan + pool_src_slot + key_row
-    handle = [i32(), *grouped_meta, *dispatch_meta, *combine_meta]
+    combine = [i32() for _ in range(8)]  # slot ids + tile map + kind + recv plan
+    dispatch = [i32() for _ in range(4)]  # send plan
+    handle = [i32(), *combine, *dispatch, i64(), i64()]  # tail: prefix, real_count
     assert len(handle) == _HANDLE_LEN
     return y, l1_out, dispatch_weights_in_buf, handle
 
@@ -216,10 +213,5 @@ def fused_mega_moe_forward_impl(
         topk_weights,
         layout,
     )
-    assert len(handle) == _HANDLE_LEN, f"flat handle has {len(handle)} tensors, expected {_HANDLE_LEN}"
-    return (
-        y,
-        l1_out,
-        dispatch_weights_in_buf,
-        (handle[0], tuple(handle[1:4]), tuple(handle[4:10]), tuple(handle[10:])),
-    )
+    assert len(handle) == _HANDLE_LEN, f"handle has {len(handle)} tensors, expected {_HANDLE_LEN}"
+    return y, l1_out, dispatch_weights_in_buf, tuple(handle)

@@ -491,7 +491,7 @@ def grouped_gemm_bf16_only(
 
 def dispatch_only(
     x,  # [num_src_tokens, K] bf16
-    handle,  # dispatch handle (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta)
+    handle,  # flat dispatch handle from the prologue
     symm,  # SymmBuffer owning the peer pool + delta tables
     *,
     num_dispatch_blocks=32,
@@ -499,15 +499,19 @@ def dispatch_only(
     """Cross-rank dispatch PUSH only (no GEMM) — pushes ``x`` token rows to peer
     pools over XGMI via the two-heap delta addressing (matches the fused kernel).
     Bytes pushed per rank = (sum expert_send_count) * hidden * 2."""
-    _num_tile_blocks, _grouped_meta, dispatch_meta, _combine_meta = handle
     (
+        _num_tile_blocks,
+        _sorted_slot_ids,
+        _tile_to_expert,
+        source_slot_kind,
+        *_recv,
         expert_send_dst_rank,
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
-        _tile_to_expert,
-        source_slot_kind,
-    ) = dispatch_meta
+        _prefix,
+        _real_count,
+    ) = handle
     num_comm = expert_send_dst_rank.numel()
     assert x.dtype == torch.bfloat16
     hidden_size = x.size(1)
@@ -655,10 +659,11 @@ def _get_dispatch_handle(symm, *, T, H, E, K):
     topk_idx, topk_weight = generate_routing(T, K, E, device="cuda")
 
     # prologue -> dispatch handle (same as test); resets scoreboard+barrier, cross-rank barrier.
-    num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = dispatch_prologue_flydsl_kernel(
+    handle = dispatch_prologue_flydsl_kernel(
         topk_idx,
         topk_weight,
         sym_buffer=symm.get_sym_buffer(),
+        pool_src_slot=symm.pool_src_slot,
         num_tokens=T,
         num_topk=K,
         num_experts=E,
@@ -670,11 +675,7 @@ def _get_dispatch_handle(symm, *, T, H, E, K):
         hidden=symm.hidden,
         num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
     )
-    # pool_src_slot is cross-rank (symm); ride it on the handle like the production path
-    recv_dst_rank, recv_start_row, recv_count, _, dedup_key_row = combine_meta
-    combine_meta = (recv_dst_rank, recv_start_row, recv_count, symm.pool_src_slot, dedup_key_row)
-    handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta)
-    tile_to_expert = dispatch_meta[4]
+    num_tile_blocks, _slot_ids, tile_to_expert, *_tables = handle
     return x, topk_idx, topk_weight, handle, tile_to_expert, num_tile_blocks
 
 
@@ -691,8 +692,7 @@ def _dispatch_and_settle(group, x, handle, symm, *, num_dispatch_blocks):
 def _pool_rows(symm, handle, M_eff):
     """Pool rows as the fused GEMM sees them: the pool stores unique slots only,
     so duplicate routes have to be resolved through the slot table."""
-    _num_tile_blocks, grouped_meta, _dispatch_meta, _combine_meta = handle
-    _prefix, _real_count, sorted_slot_ids = grouped_meta
+    _num_tile_blocks, sorted_slot_ids, *_tables = handle
     slots = sorted_slot_ids[:M_eff].long()
     return symm.dispatch_token_pool[slots].contiguous()
 
@@ -727,8 +727,8 @@ def generate_input(group, *, kind, symm, T, H, I, E, K, BLOCK_M, BLOCK_N, num_di
     if kind == "dispatch":
         # L1 GEMM output (2*inter wide) has no slot in the arena -> local scratch
         l1_out = torch.empty((symm.num_max_pool_tokens, 2 * I), dtype=torch.bfloat16, device="cuda")
-        _num_tile_blocks, _grouped_meta, dispatch_meta, _combine_meta = handle
-        destination, count = dispatch_meta[0], dispatch_meta[1]  # dst_rank, expert_send_count
+        # dst_rank, expert_send_count
+        _ntb, _ss, _tte, _sk, _rd, _rs, _rc, _ps, _dk, destination, count, *_tables = handle
         # fill the pool (real A) via dispatch_only (peers synced by the prologue)
         _dispatch_and_settle(group, x, handle, symm, num_dispatch_blocks=num_dispatch_blocks)
         return SimpleNamespace(
@@ -1132,13 +1132,22 @@ def combine_only(
         # MEGA_COMB_CU probes how many CUs it takes to saturate XGMI
         num_combine_blocks = int(os.environ.get("MEGA_COMB_CU") or (num_max_pool_tokens // BLOCK_M))
     # recv-segment table + origin slots ride the handle (per-forward, not shared symm)
-    _num_tile_blocks, grouped_meta, _dispatch_meta, combine_meta = handle
-    recv_dst_rank, recv_start_row, recv_count, pool_src_slot, dedup_key_row = combine_meta
+    (
+        _num_tile_blocks,
+        sorted_slot_ids,
+        _tile_to_expert,
+        _source_slot_kind,
+        recv_dst_rank,
+        recv_start_row,
+        recv_count,
+        pool_src_slot,
+        dedup_key_row,
+        *_dispatch_only,
+    ) = handle
     with_gate = grad_gate is not None
     waves = int(os.environ.get("MEGA_COMB_WAVES") or "2")  # combine push occupancy knob
     grad_gate_arg = grad_gate.contiguous().view(-1) if with_gate else recv_count
     # dedup tables: the baseline must push the same unique rows as the fused kernel
-    _prefix, _real_count, sorted_slot_ids = grouped_meta
     assert dedup_key_row.numel() > 1, "combine_only needs the dispatch dedup tables (dedup=True)"
     # task-based push (sustained per-peer): strides over num_experts recv-segments
     launch = _compile_combine_only_task(
@@ -1410,8 +1419,7 @@ def _dispatch_stage_fwd(runner, ctx):
     """forward (NT): N=2I, K=H; returns (metrics, check, xgmi_bytes)."""
     inp, args = ctx.inp, ctx.args
     pool = ctx.symm.dispatch_token_pool
-    _num_tile_blocks, grouped_meta, _dispatch_meta, _combine_meta = inp.handle
-    _prefix, _real_count, sorted_slot_ids = grouped_meta
+    _num_tile_blocks, sorted_slot_ids, *_tables = inp.handle
     M_eff, N_fwd, K = ctx.M_eff, 2 * args.inter, args.hidden
     flops = 2.0 * M_eff * N_fwd * K
     # XGMI push bytes per rank = remote rows (dest != rank) x hidden x bf16
@@ -1448,8 +1456,7 @@ def _dispatch_stage_bwd_dgrad(runner, ctx):
     """backward dgrad (NN): dispatch dy + L2 dgrad pool[M,H] @ w2 -> d_swiglu[M,I]; N=I, K=H."""
     inp, args, symm = ctx.inp, ctx.args, ctx.symm
     pool = symm.dispatch_token_pool
-    _num_tile_blocks, grouped_meta, _dispatch_meta, _combine_meta = inp.handle
-    _prefix, _real_count, sorted_slot_ids = grouped_meta
+    _num_tile_blocks, sorted_slot_ids, *_tables = inp.handle
     M_eff, N_bwd, K = ctx.M_eff, args.inter, args.hidden
     flops = 2.0 * M_eff * N_bwd * K
     dy = torch.ones(args.num_tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
@@ -1500,8 +1507,7 @@ def _dispatch_stage_bwd_wgrad(runner, ctx):
     ref_dW1 = torch.zeros_like(dW1)  # empty groups -> 0 (matches the fused padded output)
     offs_cpu = ctx.group_offs.tolist()
     # the fused tn bounds K to the real rows; a gathered pool has no zero padding
-    _num_tile_blocks, grouped_meta, _dispatch_meta, _combine_meta = inp.handle
-    _prefix, real_count_per_expert, _sorted_slot_ids = grouped_meta
+    _num_tile_blocks, *_tables, _prefix, real_count_per_expert = inp.handle
     real_cpu = real_count_per_expert.tolist()
 
     def _ref():

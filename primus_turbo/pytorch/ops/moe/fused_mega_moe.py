@@ -100,7 +100,6 @@ class FusedMegaMoEFunction(torch.autograd.Function):
                 ctx.group = group
                 ctx.num_tokens = num_tokens
                 ctx.num_topk = num_topk
-                num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
                 ctx.save_for_backward(
                     x,
                     l1_out,
@@ -108,10 +107,7 @@ class FusedMegaMoEFunction(torch.autograd.Function):
                     w1,
                     w2,
                     topk_idx,
-                    num_tile_blocks,
-                    *grouped_meta,
-                    *dispatch_meta,
-                    *combine_meta,
+                    *handle,
                 )
             return y
 
@@ -123,9 +119,8 @@ class FusedMegaMoEFunction(torch.autograd.Function):
             # grad_y is None when the output got no grad
             if grad_y is None:
                 return (None,) * 6
-            saved_x, l1_out, dispatch_weights_in_buf, w1, w2, topk_idx, *flat = ctx.saved_tensors
-            # saved flat: 1 + 3 (grouped) + 6 (dispatch) + 5 (combine)
-            handle = (flat[0], tuple(flat[1:4]), tuple(flat[4:10]), tuple(flat[10:]))
+            saved_x, l1_out, dispatch_weights_in_buf, w1, w2, topk_idx, *handle = ctx.saved_tensors
+            handle = tuple(handle)
 
             # fused MoE backward: L2 dgrad (nn) + SwiGLU^T + dW2 + L1 dgrad combine (nn) + dW1 (tn)
             dx, grad_topk_weights, dW1, dW2 = fused_mega_moe_backward_impl(
@@ -197,10 +192,8 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
                 ctx.topk_idx = topk_idx
                 ctx.save_for_backward(x, w1)
             # handle tensors are non-differentiable index/table tensors
-            num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
-            flat = (num_tile_blocks, *grouped_meta, *dispatch_meta, *combine_meta)
-            ctx.mark_non_differentiable(*flat)
-            return (l1_out, dispatch_weights, *flat)
+            ctx.mark_non_differentiable(*handle)
+            return (l1_out, dispatch_weights, *handle)
 
     @staticmethod
     @torch.no_grad()
@@ -243,8 +236,7 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
     ) -> torch.Tensor:
         with torch.profiler.record_function("fused_mega_moe_stage2_forward"):
             assert w2.is_cuda and w2.dim() == 3, "w2 must be a 3D CUDA tensor"
-            # apply() varargs deliver the handle flat: 1 + 3 + 6 + 5
-            handle = (handle[0], tuple(handle[1:4]), tuple(handle[4:10]), tuple(handle[10:]))
+            handle = tuple(handle)  # apply() varargs deliver it as a plain tensor tuple
 
             y = fused_mega_moe_stage2_forward_impl(l1_out, w2, handle, topk_idx, topk_weights)
 
@@ -262,8 +254,7 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
         """grad l1_out (via L2 dgrad + SwiGLU^T) + dW2; grad_gate rides the dispatch_weights slot."""
         with torch.profiler.record_function("fused_mega_moe_stage2_backward"):
             handle = ctx.handle
-            # handle came in flat; count its tensors back (num_tile_blocks + the three metas)
-            num_handle_tensors = 1 + sum(len(meta) for meta in handle[1:])
+            num_handle_tensors = len(handle)
             n_in = 6 + num_handle_tensors
             if grad_y is None:
                 return (None,) * n_in
@@ -298,10 +289,8 @@ def fused_mega_moe_stage1(
     ``dispatch_weights`` and ``handle`` are opaque forward state; pass them straight into
     :func:`fused_mega_moe_stage2`.
     """
-    l1_out, dispatch_weights, *flat = FusedMegaMoEStage1Function.apply(x, topk_idx, topk_weights, w1, group)
-    # regroup the flat handle: 1 + 3 (grouped) + 6 (dispatch) + 5 (combine)
-    handle = (flat[0], tuple(flat[1:4]), tuple(flat[4:10]), tuple(flat[10:]))
-    return l1_out, dispatch_weights, handle
+    l1_out, dispatch_weights, *handle = FusedMegaMoEStage1Function.apply(x, topk_idx, topk_weights, w1, group)
+    return l1_out, dispatch_weights, tuple(handle)
 
 
 def fused_mega_moe_stage2(
@@ -314,16 +303,6 @@ def fused_mega_moe_stage2(
     group: ProcessGroup,
 ) -> torch.Tensor:
     """Stage2 gate-down. Consumes stage1's ``(l1_out, dispatch_weights, handle)``; returns y."""
-    num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
     return FusedMegaMoEStage2Function.apply(
-        l1_out,
-        dispatch_weights,
-        topk_idx,
-        topk_weights,
-        w2,
-        group,
-        num_tile_blocks,
-        *grouped_meta,
-        *dispatch_meta,
-        *combine_meta,
+        l1_out, dispatch_weights, topk_idx, topk_weights, w2, group, *handle
     )

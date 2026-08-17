@@ -656,11 +656,13 @@ def _compiled_dispatch_prologue(
     )
 
 
-# handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta):
-#   grouped_meta  = (num_tokens_per_expert_prefix, real_count_per_expert, sorted_slot_ids)
-#   dispatch_meta = (send_dst_rank, send_count, send_offset, dispatched_token_idx,
-#                    tile_to_expert, source_slot_kind)
-#   combine_meta  = (recv_dst_rank, recv_start_row, recv_count, pool_src_slot, dedup_key_row)
+# One flat handle -- consumers unpack it by name, and it crosses the torch custom-op /
+# autograd boundaries as-is (those only accept a flat tensor sequence):
+#   (num_tile_blocks, sorted_slot_ids, tile_to_expert, source_slot_kind,
+#    recv_dst_rank, recv_start_row, recv_count, pool_src_slot, dedup_key_row,   <- combine
+#    send_dst_rank, send_count, send_offset, dispatched_token_idx,
+#    num_tokens_per_expert_prefix, real_count_per_expert)
+# Combine reads exactly the leading 9, so it unpacks a prefix instead of picking.
 
 
 def dispatch_prologue_flydsl_kernel(
@@ -668,6 +670,7 @@ def dispatch_prologue_flydsl_kernel(
     topk_weight,
     *,
     sym_buffer,
+    pool_src_slot,
     num_tokens,
     num_topk,
     num_experts,
@@ -742,20 +745,22 @@ def dispatch_prologue_flydsl_kernel(
         stream=stream,
     )
 
-    grouped_meta = (num_tokens_per_expert_prefix, num_tokens_per_expert, sorted_dispatch_slot_ids)
-    dispatch_meta = (
+    # pool_src_slot is written by peers into the symmetric buffer; snapshot it here so the
+    # handle owns a private copy (a later layer reuses the shared one).
+    return (
+        num_tile_blocks,
+        sorted_dispatch_slot_ids,
+        tile_to_expert,
+        source_slot_kind,
+        combine_recv_dst_rank,
+        combine_recv_start_row,
+        combine_recv_count,
+        pool_src_slot.clone(),
+        dedup_key_row,
         expert_send_dst_rank,
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
-        tile_to_expert,
-        source_slot_kind,
+        num_tokens_per_expert_prefix,
+        num_tokens_per_expert,
     )
-    combine_meta = (
-        combine_recv_dst_rank,
-        combine_recv_start_row,
-        combine_recv_count,
-        None,  # pool_src_slot
-        dedup_key_row,
-    )
-    return num_tile_blocks, grouped_meta, dispatch_meta, combine_meta
