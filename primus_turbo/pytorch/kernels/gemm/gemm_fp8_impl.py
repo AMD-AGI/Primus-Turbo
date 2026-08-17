@@ -449,35 +449,22 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES_BLOCKWISE
             if not supported:
                 return False
+            from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+                flydsl_blockwise_gemm_can_handle,
+            )
 
-            if not trans_a and not trans_c:
-                if trans_b:
-                    from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                        flydsl_blockwise_4wave_forward_supported,
-                    )
-
-                    return flydsl_blockwise_4wave_forward_supported(m, n, k)
-
-                from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                    flydsl_blockwise_4wave_dgrad_supported,
-                )
-
-                return flydsl_blockwise_4wave_dgrad_supported(m, k, n)
-
-            if trans_a and not trans_b:
-                from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                    flydsl_blockwise_4wave_wgrad_supported,
-                )
-
-                normalized = a.T.is_contiguous() and b.T.is_contiguous()
-                return flydsl_blockwise_4wave_wgrad_supported(
-                    k,
-                    n,
-                    m,
-                    require_workspace=not normalized,
-                )
-
-            return False
+            return flydsl_blockwise_gemm_can_handle(
+                a,
+                a_scale_inv,
+                b,
+                b_scale_inv,
+                m=m,
+                n=n,
+                k=k,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                trans_c=trans_c,
+            )
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # NT only; per-operand E4M3/E5M2; raw E8M0 2D scales [M,K//32]/[N,K//32].
@@ -510,26 +497,20 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         if granularity == ScalingGranularity.BLOCKWISE:
-            if trans_a and not trans_b:
-                from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                    gemm_fp8_blockwise_wgrad,
-                )
-
-                out = gemm_fp8_blockwise_wgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
-                return out if trans_c else out.t().contiguous()
-
-            if trans_b:
-                from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                    gemm_fp8_blockwise_forward,
-                )
-
-                return gemm_fp8_blockwise_forward(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
-
             from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                gemm_fp8_blockwise_dgrad,
+                gemm_fp8_blockwise_flydsl_kernel,
             )
 
-            return gemm_fp8_blockwise_dgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+            return gemm_fp8_blockwise_flydsl_kernel(
+                a,
+                a_scale_inv,
+                b,
+                b_scale_inv,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                trans_c=trans_c,
+                out_dtype=out_dtype,
+            )
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             res = gemm_mxfp8_flydsl_kernel(

@@ -276,39 +276,14 @@ def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
 @pytest.mark.parametrize("k", [256, 1024, 4096])
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
-@pytest.mark.parametrize("auto_tune", [False, True])
-def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
-    _run_gemm_fp8_test(
-        m=m,
-        n=n,
-        k=k,
-        layout=layout,
-        format=format,
-        dtype=dtype,
-        granularity=ScalingGranularity.BLOCKWISE,
-        backend=backend,
-        auto_tune=auto_tune,
-        block_size=block_size,
-    )
-
-
-# FlyDSL blockwise covers the fwd/dgrad/wgrad autograd path (NT/NN/TN).
-# Each dimension is a contraction for one of those GEMMs and therefore uses
-# shapes compatible with the 128-element scale block.
-@FLYDSL_GFX950_ONLY
-@pytest.mark.parametrize("m", [256, 512, 1024])
-@pytest.mark.parametrize("n", [256, 1024, 4096])
-@pytest.mark.parametrize("k", [256, 1024, 4096])
-@pytest.mark.parametrize("layout", ["NT", "NN"])
-@pytest.mark.parametrize("format", [Format.E4M3])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("backend", [BackendType.FLYDSL])
-@pytest.mark.parametrize("auto_tune", [False])
-def test_gemm_fp8_blockwise_flydsl(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK, BackendType.FLYDSL])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
+    if backend == BackendType.FLYDSL and format != Format.E4M3:
+        pytest.skip("FlyDSL blockwise FP8 GEMM supports E4M3 operands")
+
     _run_gemm_fp8_test(
         m=m,
         n=n,
@@ -321,6 +296,34 @@ def test_gemm_fp8_blockwise_flydsl(m, n, k, layout, format, dtype, block_size, b
         auto_tune=auto_tune,
         block_size=block_size,
     )
+
+
+@FLYDSL_GFX950_ONLY
+def test_gemm_fp8_blockwise_flydsl_square_scale_layout():
+    _run_gemm_fp8_test(
+        m=128,
+        n=128,
+        k=16384,
+        layout="NT",
+        format=Format.E4M3,
+        dtype=torch.bfloat16,
+        granularity=ScalingGranularity.BLOCKWISE,
+        backend=BackendType.FLYDSL,
+        auto_tune=False,
+        block_size=128,
+    )
+
+
+def test_gemm_fp8_blockwise_rejects_unsupported_block_size():
+    a = torch.randn((128, 128), dtype=torch.bfloat16)
+    b = torch.randn((128, 128), dtype=torch.bfloat16)
+    config = Float8QuantConfig(
+        granularity=ScalingGranularity.BLOCKWISE,
+        format=Format.E4M3,
+        block_size=64,
+    )
+    with pytest.raises(ValueError, match="BLOCKWISE FP8 GEMM requires block_size=128"):
+        gemm_fp8(a, b, trans_b=True, out_dtype=torch.bfloat16, config=config)
 
 
 @pytest.mark.parametrize("m", [256, 512])
@@ -628,9 +631,11 @@ def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.TRITON])
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.TRITON, BackendType.FLYDSL])
 def test_gemm_fp8_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     """BLOCKWISE gemm with pre-quantized QuantizedTensor inputs."""
+    if backend == BackendType.FLYDSL and format != Format.E4M3:
+        pytest.skip("FlyDSL blockwise FP8 GEMM supports E4M3 operands")
 
     _run_gemm_fp8_quantized_tensor_test(
         m=m,

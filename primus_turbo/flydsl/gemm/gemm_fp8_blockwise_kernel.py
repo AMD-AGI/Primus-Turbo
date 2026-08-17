@@ -2085,6 +2085,66 @@ def flydsl_blockwise_4wave_wgrad_supported(
     )
 
 
+def flydsl_blockwise_gemm_can_handle(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    *,
+    m: int,
+    n: int,
+    k: int,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+) -> bool:
+    """Return whether the FlyDSL blockwise facade accepts this canonical GEMM."""
+
+    if (
+        a_scale_inv.dtype != torch.float32
+        or b_scale_inv.dtype != torch.float32
+        or not a_scale_inv.is_contiguous()
+        or not b_scale_inv.is_contiguous()
+    ):
+        return False
+
+    if trans_a and not trans_b:
+        normalized = a.T.is_contiguous() and b.T.is_contiguous()
+        physical = a.is_contiguous() and b.is_contiguous()
+        return (
+            (normalized or physical)
+            and tuple(a_scale_inv.shape) == (ceildiv(k, 128), m)
+            and tuple(b_scale_inv.shape) == (ceildiv(k, 128), n)
+            and flydsl_blockwise_4wave_wgrad_supported(
+                k,
+                n,
+                m,
+                require_workspace=not normalized,
+            )
+        )
+
+    if not trans_a and not trans_b and not trans_c:
+        padded_k = ceildiv(k, 128) * 128
+        return (
+            a.is_contiguous()
+            and b.is_contiguous()
+            and tuple(a_scale_inv.shape) == (m, ceildiv(k, 128))
+            and tuple(b_scale_inv.shape) == (ceildiv(k, 128), ceildiv(n, 128))
+            and flydsl_blockwise_4wave_dgrad_supported(m, padded_k, n)
+        )
+
+    if not trans_a and trans_b and not trans_c:
+        return (
+            a.is_contiguous()
+            and b.is_contiguous()
+            and tuple(a_scale_inv.shape) == (m, ceildiv(k, 128))
+            and tuple(b_scale_inv.shape) == (ceildiv(n, 128), ceildiv(k, 128))
+            and flydsl_blockwise_4wave_forward_supported(m, n, k)
+        )
+
+    return False
+
+
 def flydsl_blockwise_forward_scale_a_k_major(K: int) -> bool:
     """Use the K-major scale producer until the contraction enters the deep-K regime."""
 
@@ -2585,6 +2645,55 @@ def gemm_fp8_blockwise_wgrad(
     )
 
 
+def gemm_fp8_blockwise_flydsl_kernel(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    *,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run canonical blockwise FP8 GEMM.
+
+    Dispatch by ``(trans_a, trans_b)``: NT ``(F,T)``, NN ``(F,F)`` and
+    TN ``(T,F)`` are supported; TT ``(T,T)`` is unsupported.
+    """
+
+    if trans_a and not trans_b:
+        out = gemm_fp8_blockwise_wgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+        return out if trans_c else out.t().contiguous()
+
+    if not trans_a and not trans_b:
+        m, k = a.shape
+        k_b, n = b.shape
+        assert k == k_b, f"NN K mismatch: a {a.shape}, b {b.shape}"
+        if k % 128 != 0:
+            padded_k = ceildiv(k, 128) * 128
+            a_padded = a.new_zeros((m, padded_k))
+            b_padded = b.new_zeros((padded_k, n))
+            a_padded[:, :k] = a
+            b_padded[:k, :] = b
+            a, b = a_padded, b_padded
+        return gemm_fp8_blockwise_dgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
+
+    if not trans_a and trans_b:
+        return gemm_fp8_blockwise_forward(
+            a,
+            b,
+            a_scale_inv,
+            b_scale_inv,
+            out_dtype=out_dtype,
+            scale_a_k_major=False,
+        )
+
+    raise NotImplementedError(
+        f"FlyDSL blockwise FP8 GEMM does not support TT (trans_a={trans_a}, trans_b={trans_b})."
+    )
+
+
 __all__ = [
     "compile_blockscale_fp8_gemm_4w",
     "compile_blockscale_fp8_gemm_8w_3stage",
@@ -2597,8 +2706,10 @@ __all__ = [
     "flydsl_blockwise_4wave_dgrad_supported",
     "flydsl_blockwise_4wave_forward_supported",
     "flydsl_blockwise_4wave_wgrad_supported",
+    "flydsl_blockwise_gemm_can_handle",
     "flydsl_blockwise_forward_scale_a_k_major",
     "gemm_fp8_blockwise_dgrad",
+    "gemm_fp8_blockwise_flydsl_kernel",
     "gemm_fp8_blockwise_forward",
     "gemm_fp8_blockwise_wgrad",
 ]
