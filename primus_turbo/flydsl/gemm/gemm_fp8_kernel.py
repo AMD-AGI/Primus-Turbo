@@ -2583,7 +2583,7 @@ def _dense_nt_wave4_tile(
 
 
 @functools.lru_cache(maxsize=128)
-def _compile_dense_nt_wave4(
+def _compile_dense_wave4(
     M: int,
     N: int,
     K: int,
@@ -2597,16 +2597,19 @@ def _compile_dense_nt_wave4(
     pair_n: bool = False,  # fold the n-fragment pair into one dword store (needs even N)
     col_safe: bool = False,  # N % BLOCK_N == 0: drop the epilogue's per-store column clamp
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
+    tr_b: bool = False,  # B is K-major (NN), so its side pays the transpose reader
+    ring: bool = False,  # carry the pool fills across the tile boundary
 ):
-    """Whole-loop dense NT over ``geom``'s macro tile: a resident workgroup per CU walks a
-    column of tiles. K must be whole BLOCK_K blocks -- a partial one would need the
-    read-ahead to mask, and the 8-wave kernel already carries the native K-tail."""
+    """Whole-loop dense NT (``tr_b=False``) or NN over ``geom``'s macro tile: a resident
+    workgroup per CU walks a column of tiles. K must be whole BLOCK_K blocks -- a partial one
+    would need the read-ahead to mask, and the 8-wave kernel carries the native K-tail."""
     BM, BN = geom.bm, geom.bn
+    NTHR = _tn4_nthr(geom)
     phases = _tn4_phases(geom)
-    # A whole-line epilogue needs a wave's n-fragments to form one run of columns, and the run
-    # is written as an unmasked unit; the fold must divide the wave's n-extent evenly.
+    # The whole-line epilogue interleaves the n-fragments by permuting B's global row order,
+    # which a K-major B cannot be given; the fold must also divide the wave's n-extent.
     _bt = sum(p.tiles for p in _tn4_pools(geom) if p.side == geom.gl_side)
-    fold = geom.fold if col_safe and _bt % geom.fold == 0 else 0
+    fold = 0 if tr_b else (geom.fold if col_safe and _bt % geom.fold == 0 else 0)
     _pools = _nt4_pools(geom, fold)
     NBM, NBN = ceildiv(M, BM), ceildiv(N, BN)
     n_tile = NBM * NBN
@@ -2616,130 +2619,9 @@ def _compile_dense_nt_wave4(
     tiles_per_wg = 1 if beta_is_one else ceildiv(n_tile, min(n_tile, _dense_num_cus()))
     n_wg = ceildiv(n_tile, tiles_per_wg)
     K_ITERS = K // _TN4_BLOCK_K
-    assert K % _TN4_BLOCK_K == 0, "4-wave dense NT has no K-tail path"
-    assert K_ITERS >= phases, "4-wave dense NT needs a K of at least one main-loop pass"
-    _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-
-    SharedStorage = fx.struct(
-        type(
-            "SharedStorage",
-            (),
-            {
-                "__annotations__": {
-                    f"p{i}": fx.Array[fx.Float8E4M3FN, p.nbuf * p.buf, 16] for i, p in enumerate(_pools)
-                }
-            },
-        )
-    )
-
-    @flyc.kernel(known_block_size=[256, 1, 1])
-    def kernel_dense_nt_wave4(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-    ):
-        _ = str(fx.thread_idx.x)
-        lane_id = fx.thread_idx.x % 64
-        wave_id = fx.thread_idx.x // 64
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        gl_off = {
-            k: (
-                _nt4_fold_gl_off(lane_id, wave_id, K, k[1] * _TN4_BLOCK_K // (256 * 16), k[2], fold)
-                if fold and k[0] == geom.gl_side
-                else compute_global_swizzle(
-                    lane_id, wave_id, K, k[1] * _TN4_BLOCK_K // (256 * 16), preshuffled=False
-                )
-            )
-            for k in _tn4_gl_keys(_pools)
-        }
-        targs = dict(
-            M=M,
-            N=N,
-            K=K,
-            K_ITERS=K_ITERS,
-            NBM=NBM,
-            NBN=NBN,
-            group_m=group_m,
-            group_n=group_n,
-            num_xcd=num_xcd,
-            store_aux=_CSTORE_AUX,
-            lds=lds,
-            geom=geom,
-            A=A,
-            B=B_T,
-            C=C,
-            A_scale=A_scale,
-            B_scale=B_scale,
-            gl_off=gl_off,
-            wave_id=wave_id,
-            **dict(zip(("wave_m", "wave_n"), _tn4_wave_coord(wave_id, geom))),
-            cbsz=cbsz,
-            blgp=blgp,
-            out_ty=_out_ty,
-            col_safe=col_safe,
-            beta_is_one=beta_is_one,
-            pair_n=pair_n,
-            fold=fold,
-        )
-
-        for t in range(fx.Int32(0), fx.Int32(tiles_per_wg), fx.Int32(1)):
-            d = fx.block_idx.x + t * n_wg
-            _dense_nt_wave4_tile(arith.select(d < fx.Int32(n_tile), d, fx.Int32(n_tile - 1)), **targs)
-
-    _ATTRS = make_value_attrs(1, 0, "256,256")
-
-    @flyc.jit
-    def launch_dense_nt_wave4(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-        c_m: fx.Int32,
-        c_n: fx.Int32,
-        stream: fx.Stream,
-    ):
-        _ = c_m, c_n  # the tile count is compile-time here; the grid is the resident set
-        kernel_dense_nt_wave4(A, B_T, C, A_scale, B_scale, value_attrs=_ATTRS).launch(
-            grid=(n_wg, 1, 1), block=(256, 1, 1), stream=stream
-        )
-
-    return launch_dense_nt_wave4
-
-
-@functools.lru_cache(maxsize=128)
-def _compile_dense_nn_wave4(
-    M: int,
-    N: int,
-    K: int,
-    group_m: int = 4,
-    group_n: int = 0,
-    num_xcd: int = 8,
-    geom=_NT4_SQUARE,
-    cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
-    blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
-    out_fp16: bool = False,
-    pair_n: bool = False,  # fold the n-fragment pair into one dword store (needs even N)
-    col_safe: bool = False,  # N % BLOCK_N == 0: drop the epilogue's per-store column clamp
-    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
-):
-    """Whole-loop dense NN: a resident workgroup per CU walks a column of ``geom``'s tiles."""
-    BM, BN = geom.bm, geom.bn
-    NTHR = _tn4_nthr(geom)
-    phases = _tn4_phases(geom)
-    # The whole-line epilogue interleaves the n-fragments by permuting B's global row order,
-    # which NN cannot do: its output columns are B's contiguous dim.
-    _pools = _nt4_pools(geom, 0)
-    NBM, NBN = ceildiv(M, BM), ceildiv(N, BN)
-    n_tile = NBM * NBN
-    tiles_per_wg = 1 if beta_is_one else ceildiv(n_tile, min(n_tile, _dense_num_cus()))
-    n_wg = ceildiv(n_tile, tiles_per_wg)
-    K_ITERS = K // _TN4_BLOCK_K
-    assert K % _TN4_BLOCK_K == 0, "whole-loop dense NN has no K-tail path"
-    assert K_ITERS >= phases, "whole-loop dense NN needs a K of at least one main-loop pass"
-    carry = K_ITERS % phases == 0
+    assert K % _TN4_BLOCK_K == 0, "the dense whole loop has no K-tail path"
+    assert K_ITERS >= phases, "the dense whole loop needs a K of at least one main-loop pass"
+    carry = ring and K_ITERS % phases == 0
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
 
     SharedStorage = fx.struct(
@@ -2755,7 +2637,7 @@ def _compile_dense_nn_wave4(
     )
 
     @flyc.kernel(known_block_size=[NTHR, 1, 1])
-    def kernel_dense_nn_wave4(
+    def kernel_dense_wave4(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
@@ -2766,16 +2648,18 @@ def _compile_dense_nn_wave4(
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        # The B pools are filled K-row by K-row and read back transposed, so their write side
-        # takes the bank swizzle the transpose reader looks for.
-        gl_off = {
-            _tn4_gl_key(p): (
-                compute_global_swizzle_nn(lane_id, wave_id, N, p.steps, width=p.width, wswz=True)
-                if p.side == 1
-                else compute_global_swizzle(lane_id, wave_id, K, p.steps, preshuffled=False)
-            )
-            for p in _pools
-        }
+        # A K-major B is filled row by row and read back transposed, so its write side takes
+        # the bank swizzle the transpose reader looks for.
+        gl_off = {}
+        for k in _tn4_gl_keys(_pools):
+            side, width, gq = k
+            steps = width * _TN4_BLOCK_K // (NTHR * 16)
+            if tr_b and side == 1:
+                gl_off[k] = compute_global_swizzle_nn(lane_id, wave_id, N, steps, width=width, wswz=True)
+            elif fold and side == geom.gl_side:
+                gl_off[k] = _nt4_fold_gl_off(lane_id, wave_id, K, steps, gq, fold)
+            else:
+                gl_off[k] = compute_global_swizzle(lane_id, wave_id, K, steps, preshuffled=False)
         targs = dict(
             M=M,
             N=N,
@@ -2803,23 +2687,23 @@ def _compile_dense_nn_wave4(
             col_safe=col_safe,
             beta_is_one=beta_is_one,
             pair_n=pair_n,
-            fold=0,
-            tr_b=True,
+            fold=fold,
+            tr_b=tr_b,
         )
 
         if const_expr(carry):
-            w0 = _nt4_tile_window(fx.block_idx.x, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, True)
+            w0 = _nt4_tile_window(fx.block_idx.x, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b)
             _nt4_prime(
                 _pools,
                 [getattr(lds, f"p{i}") for i in range(len(_pools))],
                 _nt4_g2s(A, B, w0[2], _pools, gl_off, wave_id),
                 _nt4_carry_bufs(_pools, True),
                 K,
-                _TN4_BLOCK_K * N,
-                True,
+                _TN4_BLOCK_K * N if tr_b else _TN4_BLOCK_K,
+                tr_b,
             )
 
-        scale = load_per_tensor_scale(A_scale, B_scale)
+        scale = load_per_tensor_scale(A_scale, B_scale) if carry else None
 
         for t in range(fx.Int32(0), fx.Int32(tiles_per_wg), fx.Int32(1)):
             d = fx.block_idx.x + t * n_wg
@@ -2834,7 +2718,7 @@ def _compile_dense_nn_wave4(
     _ATTRS = make_value_attrs(NTHR // 256, 0, f"{NTHR},{NTHR}")
 
     @flyc.jit
-    def launch_dense_nn_wave4(
+    def launch_dense_wave4(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
@@ -2845,11 +2729,15 @@ def _compile_dense_nn_wave4(
         stream: fx.Stream,
     ):
         _ = c_m, c_n  # the tile count is compile-time here; the grid is the resident set
-        kernel_dense_nn_wave4(A, B, C, A_scale, B_scale, value_attrs=_ATTRS).launch(
+        kernel_dense_wave4(A, B, C, A_scale, B_scale, value_attrs=_ATTRS).launch(
             grid=(n_wg, 1, 1), block=(NTHR, 1, 1), stream=stream
         )
 
-    return launch_dense_nn_wave4
+    return launch_dense_wave4
+
+
+_compile_dense_nt_wave4 = functools.partial(_compile_dense_wave4, tr_b=False, ring=False)
+_compile_dense_nn_wave4 = functools.partial(_compile_dense_wave4, tr_b=True, ring=True)
 
 
 _COMPILED_DENSE_CACHE: dict = {}
