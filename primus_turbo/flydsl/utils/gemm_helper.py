@@ -353,6 +353,17 @@ def wait_barrier(count):
     )
 
 
+def lds_barrier():
+    """Drain this wave's LDS traffic, then sync the workgroup."""
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="s_waitcnt lgkmcnt(0)\ns_barrier",
+        constraints="",
+        has_side_effects=True,
+    )
+
+
 class Mfma16x16x128:
     def __init__(self, n_tiles_a, n_tiles_b):
         self.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
@@ -1047,6 +1058,29 @@ class StoreCPerTensorCShuffle:
                     n += 1
                 _buffer_ops.buffer_store(vec, rsrc, off_e * out_b, mask=valid, offset_is_bytes=True)
             S2RLoaderTr._wait_lgkmcnt(0)  # drain re-read before next ti overwrites LDS
+
+
+def _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N):
+    """Store the four accumulator quadrants at their (row, col) sub-tile offsets.
+
+    A beta=1 epilogue read-back is software-pipelined by one quadrant: quadrant i+1's
+    loads go out before quadrant i stores, so they overlap without keeping all four
+    quadrants' worth of loaded values live at once. The 4-wave wgrad runs at occupancy
+    1, so it has neither a co-resident wave to hide the latency nor the registers to
+    spare for prefetching everything up front.
+    """
+    quads = (
+        (c00, base_row + 0, base_col + 0),
+        (c01, base_row + 0, base_col + LDS_BLOCK_N),
+        (c10, base_row + LDS_BLOCK_M, base_col + 0),
+        (c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N),
+    )
+    nxt = store_c.prefetch(quads[0][1], quads[0][2])
+    for i, (frag, r, c) in enumerate(quads):
+        cur = nxt
+        if i + 1 < len(quads):
+            nxt = store_c.prefetch(quads[i + 1][1], quads[i + 1][2])
+        store_c.store(frag, r, c, prev=cur)
 
 
 def _a_tail_mask_vec(lane_id, r):

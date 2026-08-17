@@ -625,7 +625,10 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP8VariableKTritonBackend.SUPPORTED_GRANULARITIES
         if inplace_add_to_out:
-            supported &= granularity == ScalingGranularity.TENSORWISE
+            supported &= granularity in (
+                ScalingGranularity.TENSORWISE,
+                ScalingGranularity.MX_BLOCKWISE,
+            )
         if granularity != ScalingGranularity.MX_BLOCKWISE:
             supported &= (
                 a.dtype,
@@ -757,7 +760,6 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
     ) -> bool:
         supported = True
         if inplace_add_to_out:
-            supported &= granularity == ScalingGranularity.TENSORWISE
             supported &= out is not None and out.dtype == out_dtype
             supported &= out_dtype in (torch.bfloat16, torch.float16)
         supported &= a.dim() == 2 and b.dim() == 2
@@ -829,6 +831,8 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
                 G,
                 out_dtype=out_dtype,
                 num_cu=num_cu,
+                beta=beta,
+                out=accum_out,
             )
 
         return grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(

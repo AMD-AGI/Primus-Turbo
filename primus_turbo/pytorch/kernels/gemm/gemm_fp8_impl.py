@@ -109,7 +109,6 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8HipBLASLtBackend.SUPPORTED_DTYPES
 
         if inplace_add_to_out:
-            supported &= granularity == ScalingGranularity.TENSORWISE
             supported &= out is not None and out.is_contiguous()
             supported &= out is not None and out.dtype in (
                 torch.float32,
@@ -425,7 +424,6 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
     ) -> bool:
         supported = True
         if inplace_add_to_out:
-            supported &= granularity == ScalingGranularity.TENSORWISE
             supported &= out is not None and out.dtype == out_dtype
             supported &= out_dtype in (torch.bfloat16, torch.float16)
         # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
@@ -440,6 +438,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             supported &= k % 128 == 0 and k >= 256
             supported &= a_scale_inv.shape == (m, k // 32) and b_scale_inv.shape == (n, k // 32)
             supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
+            supported &= not (inplace_add_to_out and trans_c)
             return supported
 
         # TENSORWISE: NT/NN/TN native (TT unsupported), scalar per-tensor scales.
@@ -464,9 +463,14 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            assert not inplace_add_to_out, "MXFP8 dense FlyDSL has no accumulate epilogue"
             res = gemm_mxfp8_flydsl_kernel(
-                a, a_scale_inv.view(torch.uint8), b, b_scale_inv.view(torch.uint8), out_dtype=out_dtype
+                a,
+                a_scale_inv.view(torch.uint8),
+                b,
+                b_scale_inv.view(torch.uint8),
+                out_dtype=out_dtype,
+                beta=1.0 if inplace_add_to_out else 0.0,
+                out=out if inplace_add_to_out else None,
             )
             return res.t().contiguous() if trans_c else res
 

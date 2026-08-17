@@ -50,13 +50,16 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     ScaleS2R,
     _PRESHUF_KT,
     _robust_time,
+    _store_quadrants,
     block_mn,
     build_preshuffle_ab_kernel,
     ceildiv,
+    compile_with_scratch_out,
     compute_global_swizzle,
     StoreCPerTensor,
     make_fp8_buffer_tensor_rebased,
     make_value_attrs,
+    resolve_accum_out,
     wait_barrier,
     xcd_remap_pid,
 )
@@ -80,6 +83,7 @@ def _build_mxfp8_nt_kernel(
     cbsz: int = 0,  # srcA fp8 format: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 format: 0=E4M3, 1=E5M2
     out_fp16: bool = False,  # fp16 output (else bf16)
+    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     BLOCK_K = 128
     assert GROUP_M >= 1
@@ -187,7 +191,9 @@ def _build_mxfp8_nt_kernel(
         sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
         sb_s2r = ScaleBComb(B_scale, c_n, K)  # one dwordx4 = b0+b1 scales
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        store_c = StoreCPerTensor(None, None, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty)
+        store_c = StoreCPerTensor(
+            None, None, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, _out_ty, beta_is_one=beta_is_one
+        )
 
         # Global row/col bases for the two M / N regions (region1 = +LDS half).
         wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -350,10 +356,17 @@ def _build_mxfp8_nt_kernel(
         base_row = block_m * BLOCK_M + wave_m_offset
         base_col = block_n * BLOCK_N + wave_n_offset
 
-        store_c.store(c00_frag, base_row + 0, base_col + 0)
-        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        _store_quadrants(
+            store_c,
+            c00_frag,
+            c01_frag,
+            c10_frag,
+            c11_frag,
+            base_row,
+            base_col,
+            LDS_BLOCK_M,
+            LDS_BLOCK_N,
+        )
 
     # Bare kernel (NOT a launch): the fused factory issues it + the preshuffle kernel
     # from a single @flyc.jit host stub. BLOCK_M/BLOCK_N/waves_per_eu are returned so
@@ -367,9 +380,9 @@ _BLOCK_M = 256
 _BLOCK_N = 256
 _PRESHUF_BLK = 256  # preshuffle kernel block size (matches build_preshuffle_ab_kernel)
 
-# (K, bm, gm, xcd, gn, cbsz, blgp, out_fp16) -> launch_mxfp8_fused (preshuffle+gemm jit)
+# (K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch_mxfp8_fused (preshuffle+gemm jit)
 _MXFP8_FUSED_CACHE: dict = {}
-_MXFP8_AT_CACHE: dict = {}  # (M,N,K,bm,gm,xcd,gn,cbsz,blgp,out_fp16) -> [raw_launch, compiled_or_None]
+_MXFP8_AT_CACHE: dict = {}  # (M,N,K,bm,gm,xcd,gn,cbsz,blgp,out_fp16,beta1) -> [raw_launch, compiled_or_None]
 # (M, N, K128, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp, b_ngrp). Caller-owned
 # scale workspace (turbo-style): the fused stub's preshuffle writes a_sp/b_sp then the
 # gemm reads them, in stream order, so reuse across same-shape calls on one stream is safe.
@@ -412,7 +425,7 @@ def _mx_nt_gn_cands(N):
     return [g for g in (4, 8, 16) if n_blocks >= 2 * g]
 
 
-def _compile_mxfp8_fused(K, bm, gm, xcd, gn=0, cbsz=0, blgp=0, out_fp16=False):
+def _compile_mxfp8_fused(K, bm, gm, xcd, gn=0, cbsz=0, blgp=0, out_fp16=False, beta_is_one=False):
     """Build the turbo-style fused @flyc.jit ``launch_mxfp8_fused``: ONE host stub
     that enqueues the A+B scale preshuffle kernel and then the NT mxfp8 GEMM kernel
     on the same stream (single Python dispatch, no separate preshuffle launch, no
@@ -436,6 +449,7 @@ def _compile_mxfp8_fused(K, bm, gm, xcd, gn=0, cbsz=0, blgp=0, out_fp16=False):
         cbsz=cbsz,
         blgp=blgp,
         out_fp16=out_fp16,
+        beta_is_one=beta_is_one,
     )
 
     @flyc.jit
@@ -474,11 +488,11 @@ def _compile_mxfp8_fused(K, bm, gm, xcd, gn=0, cbsz=0, blgp=0, out_fp16=False):
     return launch_mxfp8_fused
 
 
-def _get_mxfp8_fused_launch(K, bm, gm, xcd, gn=0, cbsz=0, blgp=0, out_fp16=False):
-    fk = (K, bm, gm, xcd, gn, cbsz, blgp, out_fp16)
+def _get_mxfp8_fused_launch(K, bm, gm, xcd, gn=0, cbsz=0, blgp=0, out_fp16=False, beta_is_one=False):
+    fk = (K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
     launch = _MXFP8_FUSED_CACHE.get(fk)
     if launch is None:
-        launch = _compile_mxfp8_fused(K, bm, gm, xcd, gn, cbsz, blgp, out_fp16)
+        launch = _compile_mxfp8_fused(K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
         _MXFP8_FUSED_CACHE[fk] = launch
     return launch
 
@@ -522,6 +536,9 @@ def _autotune_mxfp8(
         return cached
     cands = _MXFP8_NT_CANDIDATES
     stream = torch.cuda.current_stream()
+    # Race on a scratch: each candidate is run dozens of times, which a beta=1 build
+    # would fold into the caller's accumulation buffer.
+    out_view = torch.empty_like(out_view)
 
     def _time_cfg(bm, gm, xcd, gn):
         try:
@@ -579,10 +596,15 @@ def gemm_mxfp8_flydsl_kernel(
     trans_a: bool = False,
     trans_b: bool = True,
     out_dtype: torch.dtype = torch.bfloat16,
+    beta: float = 0.0,
+    out: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """MXFP8 (per-1x32 E8M0 block-scaled) dense GEMM, gfx950. Returns C [M,N].
 
     NT only (trans_a=False, trans_b=True): A [M,K], B [N,K], C = a @ b^T.
+
+    ``beta=1.0`` accumulates into ``out`` (``out += a @ b^T``) in the epilogue instead
+    of overwriting it, and therefore requires ``out``.
 
     ``a_scale`` / ``b_scale`` are the RAW E8M0 block scales ([M, K//32] / [N, K//32],
     uint8/e8m0): this kernel preshuffles them to the broadcast int32 layout itself,
@@ -621,7 +643,8 @@ def gemm_mxfp8_flydsl_kernel(
     # kernel reads grow*K128+gk); contiguous straight out of quant, copy only if a view broke it.
     a_raw = (a_scale if a_scale.is_contiguous() else a_scale.contiguous()).view(torch.int32).reshape(-1)
     b_raw = (b_scale if b_scale.is_contiguous() else b_scale.contiguous()).view(torch.int32).reshape(-1)
-    out = torch.empty((M, N), dtype=out_dtype, device=a.device)
+    out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
+    beta_is_one = beta == 1.0
     # Keep 2D int8 views (NOT flat 1D): FlyDSL marshals each shape dim as int32, so a
     # 1D [M*K] view overflows when M*K > 2^31. The kernel addresses via i64 SRD re-base
     # (extract_base_index reads only the base ptr), so the 2D shape is just metadata.
@@ -634,11 +657,13 @@ def gemm_mxfp8_flydsl_kernel(
     bm, gm, xcd, gn = _autotune_mxfp8(
         a8, b8, out, a_raw, b_raw, a_sp, b_sp, M, N, K, a_blocks, a_ngrp, b_ngrp, out_dtype, cbsz, blgp
     )
-    launch = _get_mxfp8_fused_launch(K, bm, gm, xcd, gn, cbsz=cbsz, blgp=blgp, out_fp16=out_fp16)
+    launch = _get_mxfp8_fused_launch(
+        K, bm, gm, xcd, gn, cbsz=cbsz, blgp=blgp, out_fp16=out_fp16, beta_is_one=beta_is_one
+    )
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, M, N, a_blocks, a_ngrp, b_ngrp, stream)
     # [raw, compiled]: raw for CUDA-graph capture (flyc.compile regresses under capture);
     # compiled for eager (skips per-call jit dispatch overhead). Mirrors _GROUPED_AT_CACHE.
-    at_key = (M, N, K, bm, gm, xcd, gn, cbsz, blgp, out_fp16)
+    at_key = (M, N, K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
     entry = _MXFP8_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]
@@ -648,7 +673,7 @@ def gemm_mxfp8_flydsl_kernel(
         raw(*args)
     else:
         if compiled is None:
-            compiled = flyc.compile(raw, *args)
+            compiled = compile_with_scratch_out(raw, args)
             entry[1] = compiled
         compiled(*args)
     return out
