@@ -33,6 +33,7 @@ from primus_turbo.flydsl.mega.ep_intranode import (
 )
 from primus_turbo.flydsl.mega.prims import cast, ld, read_clock, spin_timed_out
 from primus_turbo.flydsl.mega.symm_buffer import (
+    DISPATCH_CHUNK_BANK,
     TOKEN_DTYPE,
     SymBuffer,
     Workspace,
@@ -52,6 +53,15 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 @functools.lru_cache(maxsize=8)
 def get_dummy_tensor(device):
     return torch.empty(1, dtype=torch.int32, device=device)
+
+
+# Expert-ordered dispatch: every comm CU pushes one expert at a time, chunked row-wise
+# across its num_ranks tasks (one per peer link, so all links stay busy). The gate consumes
+# experts in order, so round-robin task hand-out left all local experts advancing together
+# and none complete until the whole first push wave was -- the link is saturated either way,
+# only the delivery ORDER was wrong. Worth -4.5% nt / -4.6% nn / -2.2% tn.
+# Kept as the only comm schedule; round-robin survives below purely as the fallback for
+# shapes the chunked form cannot express. See docs/mega_moe_gate_optimization.md.
 
 
 @functools.lru_cache(maxsize=256)
@@ -99,7 +109,22 @@ def _make_kernel(
     NPB = num_max_pool_tokens // BLOCK_M
     # expert-ready poll uses one thread per local expert
     assert num_ranks == 0 or num_experts // num_ranks <= _BLOCK_THREADS
+    # Expert-ordered comm role: num_ranks tasks per expert, one per peer link, each split
+    # row-wise across ordered_chunks CUs. Needs at least one CU per link and an
+    # expert-major task list; otherwise fall back to round-robin.
+    ordered_chunks = num_dispatch_cu // num_ranks if num_ranks > 0 else 0
+    if num_comm % max(num_ranks, 1) != 0:
+        ordered_chunks = 0
+    ordered_cu = ordered_chunks * num_ranks
+    num_local_experts = num_comm // num_ranks if num_ranks else 0
+    # One rendezvous bank per layout: nt/nn/tn tune to different CU splits, so they must
+    # not share a counter slot (see DISPATCH_CHUNK_BANK).
+    chunk_bank = ("nt", "nn", "tn").index(layout) * DISPATCH_CHUNK_BANK
+    if num_comm > DISPATCH_CHUNK_BANK:
+        ordered_chunks, ordered_cu = 0, 0
     gemm_base = num_dispatch_cu
+    # Poll backoff, in s_sleep units. Flat over a 16x range (8 to 127), which is a second
+    # proof that this gate is data lag and not poll contention.
     wait_sleep = 64
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
@@ -164,29 +189,57 @@ def _make_kernel(
             # tn reuses TILE_TO_GROUP to carry per-expert REAL token counts (K bound)
             real_count_resource = group_resource
 
-        if block_index < comm_block_count:
-            local_task_count = (
-                fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
-            ) // comm_block_count
-            for task_iteration in range(local_task_count):
-                dispatch_bf16_tile(
-                    sym_buffer,
-                    workspace,
-                    thread_index=thread_index,
-                    hidden_size=hidden_size,
-                    input_res=input_resource,
-                    expert_send_dst_rank_res=expert_send_dst_rank_resource,
-                    expert_send_count_res=expert_send_count_resource,
-                    expert_send_offset_res=expert_send_offset_resource,
-                    dispatched_token_idx_res=dispatched_token_idx_resource,
-                    source_slot_kind_res=source_slot_kind_resource,
-                    task_index=block_index + task_iteration * comm_block_count,
-                    signal=True,
-                    disp_parity=disp_parity,
-                    num_ranks=num_ranks,
-                    num_topk=num_topk,
-                    source_rank=rank,
-                )
+        if block_index < fx.Int32(gemm_base):
+            if const_expr(ordered_chunks > 0):
+                # Expert-ordered: every comm CU walks experts in gate order.
+                if block_index < fx.Int32(ordered_cu):
+                    link_slot = block_index % fx.Int32(num_ranks)
+                    chunk_id = block_index // fx.Int32(num_ranks)
+                    for expert_iteration in range(fx.Int32(num_local_experts)):
+                        dispatch_bf16_tile(
+                            sym_buffer,
+                            workspace,
+                            thread_index=thread_index,
+                            hidden_size=hidden_size,
+                            input_res=input_resource,
+                            expert_send_dst_rank_res=expert_send_dst_rank_resource,
+                            expert_send_count_res=expert_send_count_resource,
+                            expert_send_offset_res=expert_send_offset_resource,
+                            dispatched_token_idx_res=dispatched_token_idx_resource,
+                            source_slot_kind_res=source_slot_kind_resource,
+                            task_index=expert_iteration * fx.Int32(num_ranks) + link_slot,
+                            signal=True,
+                            disp_parity=disp_parity,
+                            num_ranks=num_ranks,
+                            num_topk=num_topk,
+                            source_rank=rank,
+                            chunk_index=chunk_id,
+                            num_chunks=ordered_chunks,
+                            chunk_bank=chunk_bank,
+                        )
+            else:
+                local_task_count = (
+                    fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
+                ) // comm_block_count
+                for task_iteration in range(local_task_count):
+                    dispatch_bf16_tile(
+                        sym_buffer,
+                        workspace,
+                        thread_index=thread_index,
+                        hidden_size=hidden_size,
+                        input_res=input_resource,
+                        expert_send_dst_rank_res=expert_send_dst_rank_resource,
+                        expert_send_count_res=expert_send_count_resource,
+                        expert_send_offset_res=expert_send_offset_resource,
+                        dispatched_token_idx_res=dispatched_token_idx_resource,
+                        source_slot_kind_res=source_slot_kind_resource,
+                        task_index=block_index + task_iteration * comm_block_count,
+                        signal=True,
+                        disp_parity=disp_parity,
+                        num_ranks=num_ranks,
+                        num_topk=num_topk,
+                        source_rank=rank,
+                    )
         elif const_expr(is_tn):
             tile_index = block_index - fx.Int32(gemm_base)
             if tile_index < fx.Int32(TOTAL):
@@ -209,27 +262,32 @@ def _make_kernel(
                 # One thread per producer expert: the whole scan is one sys-scope round
                 # trip instead of group_idx dependent ones.
                 producer_expert = first_expert + thread_index
-                if producer_expert <= group_idx:
+                # tn contracts the whole expert, so it needs every segment of experts
+                # [0, group_idx] -- the same prefix, just counted in segments.
+                gate_slot = producer_expert
+                gate_expected = expected_dispatch_i64
+                gate_need = producer_expert <= group_idx
+                if gate_need:
                     spin_start = read_clock()
                     expert_signal = ld(
                         dispatch_flag_base,
-                        bank_offset + producer_expert,
+                        bank_offset + gate_slot,
                         scope="sys",
                         dtype=fx.T.i64(),
                     )
-                    while expert_signal < expected_dispatch_i64:
+                    while expert_signal < gate_expected:
                         fx.rocdl.s_sleep(fx.Int32(wait_sleep))
                         if spin_timed_out(spin_start):
                             fx.printf(
-                                "MEGA tn expert-ready timeout: expert={} signal={} expected={}\n",
-                                producer_expert,
+                                "MEGA tn expert-ready timeout: slot={} signal={} expected={}\n",
+                                gate_slot,
                                 expert_signal,
-                                expected_dispatch_i64,
+                                gate_expected,
                             )
                             spin_start = read_clock()
                         expert_signal = ld(
                             dispatch_flag_base,
-                            bank_offset + producer_expert,
+                            bank_offset + gate_slot,
                             scope="sys",
                             dtype=fx.T.i64(),
                         )
@@ -296,27 +354,30 @@ def _make_kernel(
                 # One thread per producer expert: the whole scan is one sys-scope round
                 # trip instead of g_idx dependent ones.
                 producer_expert = first_expert + thread_index
-                if producer_expert <= g_idx:
+                gate_slot = producer_expert
+                gate_expected = expected_dispatch_i64
+                gate_need = producer_expert <= g_idx
+                if gate_need:
                     spin_start = read_clock()
                     expert_signal = ld(
                         dispatch_flag_base,
-                        bank_offset + producer_expert,
+                        bank_offset + gate_slot,
                         scope="sys",
                         dtype=fx.T.i64(),
                     )
-                    while expert_signal < expected_dispatch_i64:
+                    while expert_signal < gate_expected:
                         fx.rocdl.s_sleep(fx.Int32(wait_sleep))
                         if spin_timed_out(spin_start):
                             fx.printf(
-                                "MEGA dispatch expert-ready timeout: expert={} signal={} expected={}\n",
-                                producer_expert,
+                                "MEGA dispatch expert-ready timeout: slot={} signal={} expected={}\n",
+                                gate_slot,
                                 expert_signal,
-                                expected_dispatch_i64,
+                                gate_expected,
                             )
                             spin_start = read_clock()
                         expert_signal = ld(
                             dispatch_flag_base,
-                            bank_offset + producer_expert,
+                            bank_offset + gate_slot,
                             scope="sys",
                             dtype=fx.T.i64(),
                         )

@@ -43,6 +43,16 @@ TOKEN_ALIGNMENT = 128  # get_token_alignment_for_mega_moe
 # constant is the single owner of the padding -- see grouped_gemm_combine_bf16_kernel.py.
 COMBINE_FLAG_STRIDE = 16
 
+# Chunk-completion counters for the chunked dispatch roles, in i64 slots. A task is split
+# row-wise across several blocks, but the expert flag must still see exactly one signal per
+# source rank, so the chunks rendezvous here and only the last one signals.
+# Never reset: each launch adds chunks_per_task, so `old % chunks_per_task` still picks a
+# unique last chunk every epoch -- which requires the chunk count on a slot to never
+# change, hence one bank of DISPATCH_CHUNK_BANK slots per layout (they tune to different
+# CU splits and would otherwise mix two moduli on the same counter).
+DISPATCH_CHUNK_BANK = 512
+DISPATCH_CHUNK_SLOTS = DISPATCH_CHUNK_BANK * 3
+
 
 def get_num_max_pool_tokens(
     num_ranks: int, num_max_tokens_per_rank: int, num_topk: int, num_experts_per_rank: int
@@ -197,9 +207,13 @@ class Workspace:
     def get_combine_gate_ptr(self):
         return self.get_weight_recv_buf_ptr() + align(self.num_max_pool_tokens * 4, BLOCK_M)
 
+    def get_dispatch_chunk_ptr(self):
+        # per-task chunk rendezvous counters for the chunked dispatch comm role
+        return self.get_combine_gate_ptr() + align(self.num_max_tokens_per_rank * self.num_topk * 4, BLOCK_M)
+
     def get_end_ptr(self):
         # past the last region; on a base-0 Workspace this offset is the total heap size
-        return self.get_combine_gate_ptr() + align(self.num_max_tokens_per_rank * self.num_topk * 4, BLOCK_M)
+        return self.get_dispatch_chunk_ptr() + align(DISPATCH_CHUNK_SLOTS * 8, BLOCK_M)
 
     # Barrier: [0..15] 4 grid sync counters, [16..19] XGMI counter, [20..27] 2 signals
 

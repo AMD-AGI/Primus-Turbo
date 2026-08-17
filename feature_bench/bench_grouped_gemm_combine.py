@@ -47,6 +47,8 @@ from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
 )
 
 DSV3 = dict(hidden=7168, inter=2048, num_experts=256, num_topk=8)
+# Kimi-K2 is this same H/I with E=384; override to reach it without the full bench.
+DSV3["num_experts"] = int(os.environ.get("TURBO_BENCH_E", DSV3["num_experts"]))
 NUM_GROUPS = 8
 GROUP_TOPK = 4
 ROUTING_SCALE = 2.5

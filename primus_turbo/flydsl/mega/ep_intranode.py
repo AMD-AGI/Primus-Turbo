@@ -110,12 +110,21 @@ def dispatch_bf16_tile(
     num_ranks: int = 0,
     num_topk: int = 1,
     source_rank: int = 0,
+    chunk_index: Optional[fx.Int32] = None,
+    num_chunks: int = 1,
+    chunk_bank: int = 0,
 ):
     hidden_bytes = hidden_size * 2
     assert hidden_bytes % 1024 == 0, "hidden*2 must be a multiple of 1024 bytes -> hidden % 512 == 0"
     hidden_i32 = hidden_bytes // 4  # row stride in i32 words
 
+    # A task's rows are split across num_chunks blocks; chunk c takes warp rows
+    # c*_NUM_WARPS + warp_id, striding by num_chunks*_NUM_WARPS. num_chunks == 1
+    # reproduces the single-block indexing exactly.
     warp_id = thread_index // fx.Int32(_WARP)
+    if const_expr(num_chunks > 1):
+        warp_id = chunk_index * fx.Int32(_NUM_WARPS) + warp_id
+    row_stride = num_chunks * _NUM_WARPS
 
     dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
     source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
@@ -123,9 +132,10 @@ def dispatch_bf16_tile(
     # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
     pool_address = sym.map(workspace.get_dispatch_token_pool_ptr(), dst_rank)
     dispatch_flag_address = sym.map(workspace.get_dispatch_flag_ptr(), dst_rank)
+    chunk_count_address = workspace.get_dispatch_chunk_ptr()  # local, never reset
     num_max_pool_blocks = int(workspace.num_max_pool_blocks)
 
-    local_count = (token_count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
+    local_count = (token_count - warp_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
     direct_base = fx.Int32(source_rank * int(workspace.num_max_tokens_per_rank))
 
     def _push_row(source_slot, source_kind):
@@ -163,12 +173,12 @@ def dispatch_bf16_tile(
     # sequential so the in-flight copy_warp register footprint is unchanged.
     n_grouped = (local_count // fx.Int32(_ROW_UNROLL)) * fx.Int32(_ROW_UNROLL)
     for i in range(0, n_grouped, _ROW_UNROLL):
-        slots = [_slot(warp_id + (i + u) * fx.Int32(_NUM_WARPS)) for u in range_constexpr(_ROW_UNROLL)]
+        slots = [_slot(warp_id + (i + u) * fx.Int32(row_stride)) for u in range_constexpr(_ROW_UNROLL)]
         kinds = [_kind(s) for s in slots]
         for u in range_constexpr(_ROW_UNROLL):
             _push_row(slots[u], kinds[u])
     for i in range(n_grouped, local_count):
-        source_slot = _slot(warp_id + i * fx.Int32(_NUM_WARPS))
+        source_slot = _slot(warp_id + i * fx.Int32(row_stride))
         _push_row(source_slot, _kind(source_slot))
 
     if const_expr(signal):
@@ -177,7 +187,23 @@ def dispatch_bf16_tile(
         if thread_index == fx.Int32(0):
             bank = fx.Int32(0) if disp_parity is None else disp_parity * fx.Int32(num_max_pool_blocks)
             local_expert = task_index // fx.Int32(num_ranks)
-            atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
+            # Flag slot is per-expert: all num_ranks senders share one counter.
+            flag_slot = local_expert
+            if const_expr(num_chunks > 1):
+                # Chunks of one task must produce exactly one expert signal, or the
+                # peers' gates would see a non-uniform count. atomic_add returns the
+                # old value, so the chunk that sees old % num_chunks == num_chunks-1
+                # is the last one in this epoch -- no counter reset needed. That only
+                # holds while num_chunks is fixed per slot, so callers that use a
+                # different chunk count (other layout, other CU split) must pass their
+                # own chunk_bank; mixing two moduli on one slot desynchronises the gate.
+                done = atomic_add(
+                    chunk_count_address, fx.Int32(chunk_bank) + task_index, fx.Int64(1), scope="agent"
+                )
+                if done % fx.Int64(num_chunks) == fx.Int64(num_chunks - 1):
+                    atomic_add(dispatch_flag_address, bank + flag_slot, fx.Int64(1), scope="sys")
+            else:
+                atomic_add(dispatch_flag_address, bank + flag_slot, fx.Int64(1), scope="sys")
 
 
 @ASTRewriter.transform

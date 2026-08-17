@@ -174,8 +174,9 @@ def _worker(local_rank, world, args):
                 num_max_tokens_per_rank=T,
             )
         )
-        handle = prologue[:11] + (symm.pool_src_slot.clone(),) + prologue[11:]
-        active_rows = int(handle[7][0].item()) * POOL_BLOCK_M
+        # pool_src_slot rides at index 12 (handle ABI, see dispatch_prologue_kernel)
+        handle = prologue[:12] + (symm.pool_src_slot.clone(),) + prologue[12:]
+        active_rows = int(handle[8][0].item()) * POOL_BLOCK_M
 
         def presync():
             torch.cuda.synchronize()
