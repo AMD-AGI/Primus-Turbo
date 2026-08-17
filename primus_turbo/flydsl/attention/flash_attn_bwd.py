@@ -1138,39 +1138,16 @@ def build_flash_attn_bwd_dkdv_module(
     # SAME (kv,q) area in fewer staging trips -- 96 covers 64+128 in two instead of three.
     block_q=None,
     num_kv_heads=None,
-    unsafe_fp_math=True,
-    fast_fp_math=True,
-    daz=True,
     q_split=2,
-    enable_dma=True,
     window_left=-1,
-    # q_dbuf: stage the GQA group's Q/dO tiles into two alternating LDS slots so head h's
-    # step issues head h+1's DMA up front and drains it only at its own tail, halving the
-    # rendezvous count. Costs LDS_TOTAL extra bytes (only affordable at waves_per_eu=1);
-    # on the fused body the DMA's LDS writes then interleave with the GEMMs' LDS reads for
-    # a whole head-step, which costs more than the drain it hides.
-    q_dbuf=False,
-    fold_lse=None,  # None = fold on the hw-exp path only (see below)
     batch_size=None,  # compile-time B; required for SBHD seq-step stride bake
     sbhd=False,  # SBHD [S,B,H,D] native layout (seq-step = B*H*D)
     agpr=_DKDV_AGPR,  # force N MFMA accumulators into AGPRs (0 disables); layout-agnostic
-    # exp_intrin: FOLD bulk exp via exp2 intrinsic anchor (vs v_min+dead-op asm) -- a
-    # win once the body is VGPR-lean (spill-free). Layout-agnostic.
-    exp_intrin=True,
-    # exp_iglp: hand the head-step's scheduling region to LLVM's MFMAExpInterleave
-    # strategy (`iglp_opt(2)`), which is the pipeline built for exactly this shape --
-    # an MFMA chain feeding a quarter-rate transcendental chain. See EXP_IGLP.
-    exp_iglp=True,
     # g2d: GEMM2 transpose-read prefetch depth (ring across dt). Depth-1 wins even once
     # deeper rings are register-free, because the read-ahead burst displaces MFMA issue
     # more than it saves in fences -- cutting fences is not this body's currency,
     # MFMA-run density is.
     g2d=1,
-    # sched_strategy: LLVM amdgpu-sched-strategy override (None = compiler default). At D128
-    # the GEMM2 ds_read_tr16 transpose-reads are latency-bound and scattered across compute
-    # clusters (LdsUtil/MfmaUtil both <60%); "max-memory-clause" clusters those LDS reads to
-    # hide their latency. D64 (MfmaUtil-bound) keeps None -> byte-identical.
-    sched_strategy=None,
     # dma_grp: how many GQA heads stage their Q/dO tiles in one shot, see _q_body.
     dma_grp=1,
     # pf_ring: double the Q/dO slot ring (2*dma_grp deep) and stage one head-group ahead,
@@ -1193,36 +1170,17 @@ def build_flash_attn_bwd_dkdv_module(
     # scalar in the CuSeqKv slot, and seq_len_k is the group's own extent, so the grid, the
     # band decode and the workspace all size themselves to the group.
     band_span=0,
-    # v_lds: stage the owned V rows in LDS as GEMM1b's B operand instead of keeping them
-    # in registers. K has to be staged either way (GEMM3 transpose-reads it), V does not.
-    # Registers win: this body stalls on LDS instruction issue, not on LDS capacity, and
-    # the LDS a V stage would free stays unspent since every other use of it also loses.
-    # Also useful as a probe for whether the power budget is spent on LDS->VGPR reads: at
-    # the same power draw the staged-in-LDS arm clocks higher but is still slower, so a
-    # denser instruction mix (fewer LDS reads) is what DVFS rewards, not less LDS traffic.
-    v_lds=False,
     k_reg=True,  # feed GEMM1a's B from the K register packs, not the LDS tile (see K_REG)
     # g3_kreg: hold GEMM3's whole K^T fragment set live for the band instead of reading it
     # back per head-step. K^T is head-invariant, so this is pure read removal. See G3_KREG.
     g3_kreg=False,
-    # g3_qt/g3_krt: GEMM3's output patch shape and how much of its K^T set is resident.
-    # See G3_QT and G3_KRT -- both are priced against the co-residency budget, not the
-    # read count, so neither is a free knob.
-    g3_qt=2,
     g3_dbat=None,
-    g3_krt=None,  # None = all G3_DT D-tiles resident
     g3d=None,  # GEMM3 kstep prefetch ring depth (None = 6, capped by G3_KSTEPS). See G3D.
-    # qdo_tail: publish head h+1's Q/dO tile on the SAME fence that publishes head h's dS,
-    # halving the head-step's rendezvous count. See QDO_TAIL.
-    qdo_tail=False,
     # q_pref: stage the Q/dO tiles through VGPRs and issue head h+1's fetch at the top of
     # head-step h, so a whole head-step covers it. See Q_PREF.
     q_pref=False,
-    qdo_pp=None,
-    qpf_at=None,
     # g3_defer: run GEMM3 one head-step late off a second dS slot. See G3_DEFER.
     g3_defer=True,
-    g3_at=None,
     g3_st_at=None,
     g3_st_n=None,
     g3_sb=None,
@@ -1261,13 +1219,10 @@ def build_flash_attn_bwd_dkdv_module(
     # Prescale the owned K by sm*log2e and fold -log2e*lse into GEMM1a's MFMA C-init, so its
     # accumulator already IS the base-2 softmax exponent. Not combinable with Schraudolph:
     # its lse*2^23+bias addend loses the low mantissa bits through the f32 MFMA accumulator.
-    if fold_lse is None:
-        fold_lse = True
-
     # buffer_load_dwordx4 ... lds (16B DMA-to-LDS) needs gfx950+ (gfx94x has only
     # the 4B dword variant). DMA bypasses the VGPR staging of the Q/dO tile loads,
     # relieving register pressure on this VGPR-locked (236 VGPR, occ ~2) kernel.
-    ENABLE_DMA = enable_dma and not gpu_arch.startswith("gfx942")
+    ENABLE_DMA = not gpu_arch.startswith("gfx942")
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
@@ -1352,7 +1307,7 @@ def build_flash_attn_bwd_dkdv_module(
     # co-residency budget, not by LDS read count: growing G3_DT multiplies every wave's
     # resident set, not just its read count, so shrinking the patch only pays off if it
     # frees enough registers for the co-resident dQ-reduce wave (`_dq_partial_ws`) to fit.
-    G3_QT = min(MT, int(g3_qt) if G3_TILES >= 2 else 1)  # q 16-tiles per wave
+    G3_QT = min(MT, 2 if G3_TILES >= 2 else 1)  # q 16-tiles per wave
     G3_DT = G3_TILES // G3_QT  # D 16-tiles per wave
     G3_DBAT = G3_DT if g3_dbat is None else int(g3_dbat)
     G3_QGRP = MT // G3_QT  # q-tile groups; wave -> (D group, q group)
@@ -1370,7 +1325,6 @@ def build_flash_attn_bwd_dkdv_module(
     # already shadowed to the segment, so only the dQ workspace has to move from a
     # per-batch slab to rows packed by q token (see _wsq_band).
     assert head_dim in (64, 128)
-    assert fold_lse, "fused dQ reads the prescaled K tile; see _reduce_dq_partials"
     assert DT * MT == G3_WAVES * G3_DT * G3_QT, "GEMM3 tiles must partition over carriers"
     # A wave's D-tiles must pair up (and start even) for the permuted partial layout
     # the store in _gemm3_tiles and the reduce in build_flash_attn_bwd_dqred_module
@@ -1389,16 +1343,10 @@ def build_flash_attn_bwd_dkdv_module(
         "fused dQ rides the per-head Q/dO staging barriers as the dS WAR fence"
     )
 
-    # sched_barrier(TRANS) pins MFMA/ds_read/VALU in place and frees only the softmax's
-    # quarter-rate v_exp to migrate, so the exps are what fills GEMM1b's MFMA latency shadow
-    # (schedule-only: opcode multiset and output unchanged). It stays off on the exp2
-    # intrinsic path: forcing it on (alone or duplicated after GEMM1b) loses there, since
-    # the default placement of this body's MFMA runs is already a local optimum.
-    SCHED_TRANS = 0x400  # LLVM SchedGroupMask: TRANS (v_exp)
     # EXP_IGLP: at one wave/SIMD there's no sibling wave to hide exp2 latency under, so
     # hand the head-step region to LLVM's MFMAExpInterleave IGLP strategy instead of
     # hand-placed barriers. Gated to NUM_WAVES == 4 (see _dq_partial_ws for the call count).
-    EXP_IGLP = bool(exp_iglp) and NUM_WAVES == 4
+    EXP_IGLP = NUM_WAVES == 4
     IGLP_EXP_INTERLEAVE = 2  # LLVM IGLPStrategyID::MFMAExpInterleaveID
     # G2_HALF: run GEMM2 once per q-half instead of once per head-step. Fused-only -- the
     # split bodies keep the single call so their ISA stays byte-identical; see the
@@ -1413,7 +1361,6 @@ def build_flash_attn_bwd_dkdv_module(
         and NUM_WAVES == 4
         and Q_SPLIT == 1
         and ENABLE_DMA
-        and not q_dbuf
         and not bool(pf_ring)
         and PV_K_STEPS == 2
         and BLOCK_Q // 2 == PV_K_STEP
@@ -1434,7 +1381,7 @@ def build_flash_attn_bwd_dkdv_module(
     # WIN_FOLD: let the masked tiles take the lse C-init too instead of the zero one. Legal only
     # with exp_intrin, whose select+exp2 is then the accumulator read that carries the MFMA
     # hazard wait the identity fma used to buy (see _p_of)..
-    WIN_FOLD = window_left >= 0 and fold_lse and exp_intrin
+    WIN_FOLD = window_left >= 0
     # WIN_DIST: mask off one live band-relative distance instead of a live compare pair per element.
     WIN_DIST = window_left >= 0
     # WIN_KV_BELOW: a rectangle's low kv rows fall out of every q row's window, so give their K/V
@@ -1490,7 +1437,7 @@ def build_flash_attn_bwd_dkdv_module(
     # step of the group's last head rather than at the head boundary, which is what
     # actually pays: it leaves every head boundary fence-free, so head h+1's GEMM1 and
     # exp2 chain schedule into head h's GEMM2 shadow.
-    PF_RING = bool(pf_ring) and ENABLE_DMA and not q_dbuf
+    PF_RING = bool(pf_ring) and ENABLE_DMA
     # Q_PREF: fetch the Q/dO tile into VGPRs and ds_write it, instead of buffer_load ... lds.
     # The DMA route cannot be given a shadow at all: a pending buffer_load ... lds forces
     # vmcnt(0) before every later ds_read of the same LDS allocation, so wherever the issue
@@ -1500,9 +1447,9 @@ def build_flash_attn_bwd_dkdv_module(
     # only waited on at its ds_write one head-step later. Runs at LDS_SLOTS == 1: a 2-slot
     # ring would retire the staging pair's WAR barrier too, but the register cost of a
     # second live slot outweighs that barrier's price on this body.
-    Q_PREF = bool(q_pref) and ENABLE_DMA and not q_dbuf and not PF_RING and DMA_GRP == 1
+    Q_PREF = bool(q_pref) and ENABLE_DMA and not PF_RING and DMA_GRP == 1
     # gfx950 has one in-order vmcnt, so at D128 this fetch issues at point 0 to keep dQ partial stores in flight.
-    QPF_AT = (0 if HEAD_DIM == 128 else 2) if qpf_at is None else int(qpf_at)
+    QPF_AT = 0 if HEAD_DIM == 128 else 2
     # PF_QB: the LAST head-step of a q-block has no next head to fetch for, so it issues
     # head 0's fetch of the NEXT q-block instead -- Q/dO and the group's (-delta, lse) --
     # riding the q-loop's iter_args. The fused body runs ONE work-group per CU, so nothing
@@ -1535,10 +1482,10 @@ def build_flash_attn_bwd_dkdv_module(
     # of the reader. Disabled: even with the extra slot funded back out of GEMM3's
     # resident K^T set, a barrier is still cheaper here than any structure that removes
     # one -- the same conclusion G3_DEFER reaches independently below.
-    QDO_RING = bool(qdo_tail) and Q_PREF and not g3_defer
+    QDO_RING = False
     QDO_TAIL = QDO_RING  # the merged publish the second slots exist for
-    QDO_PP = Q_PREF and bool(qdo_pp)
-    LDS_SLOTS = 2 if (q_dbuf or QDO_RING or QDO_PP) else ((2 * DMA_GRP) if PF_RING else DMA_GRP)
+    QDO_PP = False
+    LDS_SLOTS = (2 * DMA_GRP) if PF_RING else DMA_GRP
     assert GQA_GROUP_SIZE % LDS_SLOTS == 0
     # Whole-window residency (the shape dq uses) does NOT port here: keeping a head's
     # Q/dO extent resident needs LDS this body doesn't have room for without dropping a
@@ -1582,7 +1529,7 @@ def build_flash_attn_bwd_dkdv_module(
     # view so every reader (_a_idx / _read_tr / _kv_lds_idx / _g3s_idx) addresses them the
     # same way.
     LDS_VIEW_ELEMS = LDS_TOTAL * LDS_SLOTS
-    V_LDS = bool(v_lds)
+    V_LDS = False
     # K_REG: GEMM3 transpose-reads the staged K tile, but GEMM1a's B operand can come
     # from the register packs that filled it instead of being re-read from LDS once per
     # q-half (the LDS copy stays -- this is a read-side choice, not a staging one). This
@@ -1593,7 +1540,7 @@ def build_flash_attn_bwd_dkdv_module(
     K_REG = bool(k_reg)
     G3_KREG = bool(g3_kreg)
     # D-tiles of the band-resident K^T set; the rest are re-read every head-step.
-    G3_KRT = min(G3_DT, G3_DT if g3_krt is None else int(g3_krt)) if G3_KREG else 0
+    G3_KRT = G3_DT if G3_KREG else 0
     G3K_BASE = LDS_VIEW_ELEMS  # prescaled K [BLOCK_KV][HEAD_DIM]
     G3V_BASE = G3K_BASE + BLOCK_KV * HEAD_DIM  # V [BLOCK_KV][HEAD_DIM]
     G3S_BASE = G3V_BASE + (BLOCK_KV * HEAD_DIM if V_LDS else 0)  # dS [slot][BLOCK_KV][BLOCK_Q]
@@ -1606,7 +1553,7 @@ def build_flash_attn_bwd_dkdv_module(
     # while the body ran eight waves per work-group and loses at four: the extra slot's
     # registers and LDS have no sibling MFMA run left to hide the retired fences under.
     G3_DEFER = bool(g3_defer)
-    G3_AT = 0 if g3_at is None else int(g3_at)
+    G3_AT = 0
     G3_ST_AT = -1 if g3_st_at is None else int(g3_st_at)
     G3_ST_N = G3_DT // 2 * G3_QT if g3_st_n is None else int(g3_st_n)
     assert G3_ST_AT < 0 or G3_WAVES == NUM_WAVES
@@ -2205,7 +2152,7 @@ def build_flash_attn_bwd_dkdv_module(
         # the GQA group's heads). K feeds GEMM1a only -- dK is a separate accumulator --
         # so scaling k_b_packs is safe. Together with -log2e*lse folded into GEMM1a's
         # C-init, GEMM1a's raw output already IS the base-2 softmax exponent. ----
-        if const_expr(fold_lse):
+        if const_expr(True):
             _kscale_v8 = Vec.filled(MFMA_LANE_K, sm_scale * _LOG2E, fx.Float32)
             for h in range_constexpr(KV_HALVES):
                 for nt in range_constexpr(NT):
@@ -2235,7 +2182,6 @@ def build_flash_attn_bwd_dkdv_module(
         # ---- Constants ----
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
-        c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
         c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
 
         def _vexp(x):
@@ -2274,18 +2220,9 @@ def build_flash_attn_bwd_dkdv_module(
             )
 
         def _p_of(s_r, lse_t, apply_mask):
-            if const_expr(fold_lse):
-                assert apply_mask, "FOLD bulk uses the hazard-anchored path in _head_step_lds"
-                s_r = fmath.fma(s_r, fx.Float32(1.0), lse_t, fastmath=fm_fast)
-                return _vexp(s_r)
-            # Exact path (fold_lse=False) expects lse_t = plain -log2e*lse, so
-            # diff = log2e*(s*sm - lse) is the true base-2 softmax exponent.
-            diff = fmath.fma(s_r, c_sm_scale_log2e, lse_t, fastmath=fm_fast)
-            return fx.Float32(
-                llvm.inline_asm(
-                    ir.F32Type.get(), [_raw(diff)], "v_exp_f32 $0, $1", "=v,v", has_side_effects=False
-                )
-            )
+            assert apply_mask, "FOLD bulk uses the hazard-anchored path in _head_step_lds"
+            s_r = fmath.fma(s_r, fx.Float32(1.0), lse_t, fastmath=fm_fast)
+            return _vexp(s_r)
 
         # A-operand read (Q/dO from LDS): A[m=q=lane16][k=D=kg*8+s]. mt selects the
         # 16-q tile (row = mt*16 + lane16), ks the D 32-step (D = ks*32 + kg*8).
@@ -2916,7 +2853,6 @@ def build_flash_attn_bwd_dkdv_module(
             hsel=None,
             nq=None,
         ):
-            sb_bulk = not apply_mask  # exps only exist on these paths
             # The next head's Q/dO fetch: the earlier it is issued the more of this step
             # covers it, and the longer its 16 B per tensor stay live over the body's
             # register peak (GEMM2's accumulators). QPF_AT picks that trade.
@@ -2963,13 +2899,7 @@ def build_flash_attn_bwd_dkdv_module(
                     _o = _o + fx.Int32(poff) - fx.Int32(BLOCK_Q // 2)
                 return q_start_i32 + _o
 
-            if const_expr(q_dbuf):
-                # This head's tile landed during the previous step; the barrier publishes it
-                # and simultaneously fences the slot that the prefetch below overwrites.
-                gpu.barrier()
-                if const_expr(head_local + 1 < GQA_GROUP_SIZE):
-                    _dma_head(head_local + 1, bases)
-            elif const_expr(Q_PREF):
+            if const_expr(Q_PREF):
                 # qdo already holds this head's tile, fetched one head-step ago. The
                 # ds_write is the only point that waits on it, and the next head's fetch
                 # is issued right after so it gets this whole step as its shadow.
@@ -3220,7 +3150,7 @@ def build_flash_attn_bwd_dkdv_module(
                     # One call per q-half: the region's MFMA -> exp chain is per half, and
                     # two calls is where the register outcome lands right (see EXP_IGLP).
                     rocdl.iglp_opt(IGLP_EXP_INTERLEAVE)
-                if const_expr(fold_lse and (not apply_mask or WIN_FOLD)):
+                if const_expr(not apply_mask or WIN_FOLD):
                     _st = _gemm_qk(
                         q_lds,
                         k_b_packs[_H[0]],
@@ -3235,8 +3165,6 @@ def build_flash_attn_bwd_dkdv_module(
                         mts=half,
                         pin=_q_apin,
                     )
-                if const_expr(sb_bulk and not exp_intrin):
-                    rocdl.sched_barrier(SCHED_TRANS)
                 _dpt = _gemm_dp(half)
                 # Extending the GEMM2 s_setprio(1) pair over this run too (so a SIMD's two
                 # waves also de-phase across GEMM1) is 7/11 then 6/11 = noise, even though it
@@ -3292,7 +3220,7 @@ def build_flash_attn_bwd_dkdv_module(
                 """
                 ma, mb = half
                 P = [[None] * NT for _ in range_constexpr(MT)]
-                if const_expr(fold_lse and (not apply_mask or WIN_FOLD)):
+                if const_expr(not apply_mask or WIN_FOLD):
                     for mt in half:
                         for nt in range_constexpr(NT):
                             s_v = Vec(s_tiles[mt][nt])
@@ -3301,7 +3229,7 @@ def build_flash_attn_bwd_dkdv_module(
                                     _vexp_intrin(_mask_lanes(mt, nt, t).select(c_neg_inf, fx.Float32(s_v[t])))
                                     for t in range_constexpr(4)
                                 ]
-                            elif const_expr(exp_intrin):
+                            elif const_expr(True):
                                 P[mt][nt] = [_vexp_intrin(fx.Float32(s_v[t])) for t in range_constexpr(4)]
                             else:
                                 _smin_anchor = fx.Float32(
@@ -3489,8 +3417,6 @@ def build_flash_attn_bwd_dkdv_module(
                     ),
                     poff=poff,
                 )
-            if const_expr(q_dbuf and head_local + 1 < GQA_GROUP_SIZE):
-                rocdl.s_waitcnt(0)  # prefetch landed; the next step's barrier publishes it
             return dv_cur, dk_cur, (_qdo_next if const_expr(Q_PREF) else [qdo, None])
 
         def _q_body(q_start, inner, apply_mask, poff=None, half=False, hsel=None, nq=None):
@@ -3516,8 +3442,6 @@ def build_flash_attn_bwd_dkdv_module(
                 _ldv = list(inner[_pfb + 2 * NUM_DMA_Q :])
             else:
                 _qdo = _qdo_issue(q_start, 0, poff) if const_expr(Q_PREF) else None
-            if const_expr(q_dbuf):
-                _q_prologue(q_start, _bases)
             if const_expr(PF_RING):
                 # Prime the whole ring up front; every later refill rides a rendezvous
                 # parked inside a GEMM2 run (see _head_step_lds).
@@ -3764,7 +3688,7 @@ def build_flash_attn_bwd_dkdv_module(
                 ["no-nans-fp-math", "true"],
                 ["unsafe-fp-math", "true"],
             ]
-            if const_expr(daz)
+            if const_expr(True)
             else []
         )
         if const_expr(agpr != 0):
@@ -3803,8 +3727,8 @@ def build_flash_attn_bwd_dkdv_module(
         )
 
     _hints = {
-        "fast_fp_math": fast_fp_math,
-        "unsafe_fp_math": unsafe_fp_math,
+        "fast_fp_math": True,
+        "unsafe_fp_math": True,
         # Backward is VALU/exp2-issue-bound with the MFMA pipe mostly idle; post-RA
         # misched hides the gradient-GEMM MFMAs in the exp2/reduce VALU shadow.
         # post-misched is load-bearing on the four-wave fused body: dropping it measures
@@ -3813,9 +3737,6 @@ def build_flash_attn_bwd_dkdv_module(
         # structure is what the default scheduler is being asked to preserve.
         "llvm_options": {"enable-post-misched": True, "lsr-drop-solution": True},
     }
-    if sched_strategy is not None:
-        _hints["llvm_options"]["amdgpu-sched-strategy"] = sched_strategy
-
     _compiled: dict = {}
 
     def _launch(*args, **kwargs):
