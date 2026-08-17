@@ -22,6 +22,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
+    float8_e4m3,
 )
 from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.triton.quantization.quant_blockwise import (
@@ -436,6 +437,72 @@ def quant_fp8_blockwise_for_weight_impl_meta(
         w_fp8 = w_fp8.squeeze(0)
         w_scales = w_scales.squeeze(0)
     return w_fp8, w_scales
+
+
+def _can_use_flydsl_blockwise_dual_quant(
+    x: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    block_size: int,
+) -> bool:
+    return (
+        fp8_dtype == float8_e4m3
+        and x.dtype == torch.bfloat16
+        and x.shape[0] % block_size == 0
+        and x.shape[1] % block_size == 0
+        and x.numel() * x.element_size() <= 0xFFFFFFFF
+    )
+
+
+def quantize_fp8_blockwise_dual_for_flydsl(
+    x: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    block_size: int,
+    *,
+    row_scale_transposed: bool = False,
+    row_pad_to_block: bool = False,
+):
+    if not row_pad_to_block and _can_use_flydsl_blockwise_dual_quant(x, fp8_dtype, block_size):
+        from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
+            quantize_blockwise_fp8_dual,
+        )
+
+        return quantize_blockwise_fp8_dual(
+            x,
+            row_scale_transposed=row_scale_transposed,
+        )
+    return quant_fp8_blockwise_dual_impl(
+        x,
+        fp8_dtype,
+        block_size,
+        col_transposed=True,
+        row_pad_to_block=row_pad_to_block,
+        row_scale_transposed=row_scale_transposed,
+    )
+
+
+def quantize_fp8_blockwise_weight_for_flydsl(
+    weight: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    block_size: int,
+):
+    if (
+        fp8_dtype == float8_e4m3
+        and weight.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and weight.is_contiguous()
+        and weight.shape[1] % 16 == 0
+        and weight.numel() * weight.element_size() <= 0xFFFFFFFF
+    ):
+        from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
+            quantize_blockwise_fp8_weight,
+        )
+
+        return quantize_blockwise_fp8_weight(weight)
+    return quant_fp8_blockwise_for_weight_impl(
+        weight,
+        fp8_dtype,
+        block_size=block_size,
+    )
 
 
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_segment_m_row_col_impl", mutates_args=())

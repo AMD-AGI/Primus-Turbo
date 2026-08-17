@@ -371,8 +371,34 @@ def padding_size(n: int, padding_align_size: int) -> int:
     return (n + padding_align_size - 1) // padding_align_size * padding_align_size - n
 
 
-def mx_padded_ref(x: torch.Tensor, axis: int, padding_align_size: int, dtype: torch.dtype) -> torch.Tensor:
-    """Build a zero-padded reference matching microscaling quantization."""
+def mxfp8_padded_ref(x: torch.Tensor, axis: int, padding_align_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """Build zero-padded reference matching MXFP8 quantize/dequantize padding."""
+    if x.dim() == 2:
+        if axis == 0:
+            # Colwise: dequant output [M_pad, N].
+            pad_amt = padding_size(x.size(0), padding_align_size)
+            zeros = torch.zeros(pad_amt, x.size(1), device=x.device, dtype=dtype)
+            return torch.cat([x, zeros], dim=0)
+        # Rowwise: dequant output [M, N_pad].
+        pad_amt = padding_size(x.size(1), padding_align_size)
+        zeros = torch.zeros(x.size(0), pad_amt, device=x.device, dtype=dtype)
+        return torch.cat([x, zeros], dim=1)
+
+    # 3D batched [B, M, N]
+    if axis == 1:
+        # Colwise: quant/dequant layout [B, N, M_pad].
+        x_bn = x.transpose(1, 2).contiguous()
+        pad_amt = padding_size(x_bn.size(2), padding_align_size)
+        zeros = torch.zeros(x_bn.size(0), x_bn.size(1), pad_amt, device=x.device, dtype=dtype)
+        return torch.cat([x_bn, zeros], dim=2)
+    # Rowwise (axis == 2): dequant output [B, M, N_pad].
+    pad_amt = padding_size(x.size(2), padding_align_size)
+    zeros = torch.zeros(x.size(0), x.size(1), pad_amt, device=x.device, dtype=dtype)
+    return torch.cat([x, zeros], dim=2)
+
+
+def mxfp4_padded_ref(x: torch.Tensor, axis: int, padding_align_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """Build zero-padded reference matching MXFP4 quantize/dequantize padding."""
     if x.dim() == 2:
         if axis == 0:
             # Colwise: dequant output [M_pad, N].
@@ -426,7 +452,7 @@ def test_quantize_mxfp8(orig_dtype, dest_dtype, batched, B, M, N, axis, granular
         # 2D MXFP8: axis 0 = colwise, axis 1 = rowwise.
         quantize_axis = axis
 
-    x_ref = mx_padded_ref(x, quantize_axis, padding_align_size, orig_dtype)
+    x_ref = mxfp8_padded_ref(x, quantize_axis, padding_align_size, orig_dtype)
 
     scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,
@@ -643,7 +669,7 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, batched, B, M, N, axis, granular
         # 2D MXFP4: axis 0 = colwise, axis 1 = rowwise.
         quantize_axis = axis
 
-    x_ref = mx_padded_ref(x, quantize_axis, padding_align_size, orig_dtype)
+    x_ref = mxfp4_padded_ref(x, quantize_axis, padding_align_size, orig_dtype)
 
     scaling_recipe = ScalingRecipe(
         use_2d_block=use_2d_block,

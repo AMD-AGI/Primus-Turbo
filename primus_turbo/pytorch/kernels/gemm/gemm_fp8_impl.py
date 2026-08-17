@@ -10,6 +10,10 @@ import torch
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
+from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+    flydsl_blockwise_gemm_can_handle,
+    gemm_fp8_blockwise_flydsl_kernel,
+)
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
 from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel import gemm_mxfp8_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
@@ -449,9 +453,6 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES_BLOCKWISE
             if not supported:
                 return False
-            from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                flydsl_blockwise_gemm_can_handle,
-            )
 
             return flydsl_blockwise_gemm_can_handle(
                 a,
@@ -497,10 +498,6 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         if granularity == ScalingGranularity.BLOCKWISE:
-            from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                gemm_fp8_blockwise_flydsl_kernel,
-            )
-
             return gemm_fp8_blockwise_flydsl_kernel(
                 a,
                 a_scale_inv,
