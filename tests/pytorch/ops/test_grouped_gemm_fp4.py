@@ -287,6 +287,73 @@ def test_grouped_gemm_fp4_zero_group_lens(dtype):
     assert b_grad_snr > SNR_THRESHOLD, f"b_grad_snr={b_grad_snr:.2f} too low"
 
 
+# ----------------------------------------------------------------------------
+# Fused gradient accumulation (Megatron main_grad written from the wgrad epilogue).
+# ----------------------------------------------------------------------------
+@pytest.mark.parametrize("dtype", DTYPE_VALUES)
+@pytest.mark.parametrize("balance", BALANCE_VALUES)
+def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance):
+    """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
+
+    FlyDSL is the only FP4 variable-K backend with the accumulate epilogue and its store
+    is 16-bit, so ``main_grad`` is allocated in the weight's dtype, not Megatron's fp32.
+    """
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    device = "cuda:0"
+    B, M, N, K = 4, 256, 512, 256
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    print(f"\nB={B}, M={M}, N={N}, K={K}, dtype={dtype}, balance={balance}")
+
+    config = _make_config()
+
+    a = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
+    grad_out = torch.randn((B * M, N), dtype=dtype, device=device)
+    a_fused = a.detach().clone().requires_grad_(True)
+    b_fused = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+
+    # Baseline: ordinary autograd, b.grad holds the weight gradient.
+    out = grouped_gemm_fp4(a, b, group_lens, trans_b=True, config=config)
+    out.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # Fused: the wgrad is accumulated into a pre-seeded main_grad buffer.
+    previous = torch.randn(b_fused.shape, dtype=dtype, device=device)
+    b_fused.main_grad = previous.clone()
+    b_fused.grad_added_to_main_grad = False
+
+    out_fused = grouped_gemm_fp4(
+        a_fused,
+        b_fused,
+        group_lens,
+        trans_b=True,
+        config=config,
+        fuse_bgrad_accum_pattern="megatron",
+    )
+    out_fused.backward(grad_out)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_fused, out)
+    assert b_fused.grad_added_to_main_grad is True, "weight must be flagged during forward"
+    assert b_fused.grad.shape == b_fused.shape, "dummy wgrad must keep the weight's shape"
+    assert b_fused.grad.dtype == b_fused.dtype, "dummy wgrad must keep the weight's dtype"
+
+    a_grad_snr = compute_snr(a.grad, a_fused.grad)
+    accumulated = b_fused.main_grad.float() - previous.float()
+    b_grad_snr = compute_snr(b.grad.float(), accumulated)
+    print(f"AGrad-SNR={a_grad_snr:.2f} dB  BGrad-SNR={b_grad_snr:.2f} dB")
+    assert a_grad_snr > SNR_THRESHOLD, f"a_grad_snr={a_grad_snr:.2f} too low"
+    assert b_grad_snr > SNR_THRESHOLD, f"b_grad_snr={b_grad_snr:.2f} too low"
+
+
 # CUDA-graph capturability (forward). The forward uses no D2H sync, so it is
 # graph-capturable and a replay with in-place-updated group_lens must re-route.
 # Only the forward is captured: fwd+bwd through autograd segfaults at capture_end

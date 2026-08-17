@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+
 import torch
 
 from primus_turbo.pytorch.core.backend import (
@@ -147,9 +148,12 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
         **kwargs,
     ) -> bool:
         supported = True
+        # This backend has no beta=1 accumulate epilogue.
+        supported &= not inplace_add_to_out
         # check the CK backend was compiled into this build
         supported &= build_ck()
         supported &= not is_gfx1250()
@@ -279,6 +283,8 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
         supported = True
@@ -286,6 +292,15 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_GRANULARITIES
         supported &= trans_a and not trans_b
+
+        if inplace_add_to_out:
+            supported &= out is not None and out.is_contiguous()
+            supported &= out is not None and out.dtype in (
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+            )
+
         return supported
 
     @staticmethod
@@ -303,6 +318,8 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         granularity: ScalingGranularity,
         num_cu: int | None,
         maybe_pre_sync: bool = False,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ):
         if trans_c:
@@ -313,6 +330,7 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
             trans_lhs, trans_rhs = trans_a, trans_b
+        beta = 1.0 if inplace_add_to_out else 0.0
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm_fp8(
             lhs,
             rhs,
@@ -325,6 +343,8 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
             out_dtype,
             granularity.name,
             maybe_pre_sync,
+            beta,
+            out,
         )
 
 
@@ -598,11 +618,17 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
         **kwargs,
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP8VariableKTritonBackend.SUPPORTED_GRANULARITIES
+        if inplace_add_to_out:
+            supported &= granularity in (
+                ScalingGranularity.TENSORWISE,
+                ScalingGranularity.MX_BLOCKWISE,
+            )
         if granularity != ScalingGranularity.MX_BLOCKWISE:
             supported &= (
                 a.dtype,
@@ -634,6 +660,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ):
         if trans_c:
@@ -642,6 +670,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         else:
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
+
+        beta = 1.0 if inplace_add_to_out else 0.0
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # wgrad: C[g](OUT_M,OUT_N) = lhs[:,g](OUT_M,M_g) @ rhs[:,g](OUT_N,M_g)^T
@@ -661,6 +691,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 G,
                 out_dtype=out_dtype,
                 num_cu=num_cu,
+                out=out,
+                beta=beta,
             )
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
@@ -670,6 +702,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 rhs_scales,
                 group_offs,
                 out_dtype=out_dtype,
+                out=out,
+                beta=beta,
             )
         elif granularity == ScalingGranularity.ROWWISE:
             return grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
@@ -679,6 +713,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 rhs_scales,
                 group_offs,
                 out_dtype=out_dtype,
+                out=out,
+                beta=beta,
             )
         return grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
             lhs,
@@ -687,6 +723,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
             rhs_scales,
             group_offs,
             out_dtype=out_dtype,
+            out=out,
+            beta=beta,
         )
 
 
@@ -716,9 +754,14 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
         supported = True
+        if inplace_add_to_out:
+            supported &= out is not None and out.dtype == out_dtype
+            supported &= out_dtype in (torch.bfloat16, torch.float16)
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
@@ -750,6 +793,8 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ):
         from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
@@ -763,6 +808,9 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         else:
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
+
+        beta = 1.0 if inplace_add_to_out else 0.0
+        accum_out = out if inplace_add_to_out else None
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import (
@@ -783,10 +831,20 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
                 G,
                 out_dtype=out_dtype,
                 num_cu=num_cu,
+                beta=beta,
+                out=accum_out,
             )
 
         return grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
-            lhs, rhs, lhs_scales, rhs_scales, group_offs, out_dtype=out_dtype, num_cu=num_cu
+            lhs,
+            rhs,
+            lhs_scales,
+            rhs_scales,
+            group_offs,
+            out_dtype=out_dtype,
+            num_cu=num_cu,
+            beta=beta,
+            out=accum_out,
         )
 
 
@@ -915,6 +973,86 @@ def grouped_gemm_fp8_variable_k_impl(
     return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(
         default_backend_choice, user_backend_choice, **kwargs
     )
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::grouped_gemm_fp8_variable_k_accum_impl", mutates_args={"out"}, device_types="cuda"
+)
+def grouped_gemm_fp8_variable_k_accum_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+) -> None:
+    """Variable-K grouped FP8 GEMM that accumulates into ``out`` instead of returning.
+
+    Computes ``out += A^T @ B`` per group, folding the accumulation into the GEMM
+    epilogue (beta=1)
+    """
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    granularity_enum = ScalingGranularity(granularity)
+
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scales=a_scales,
+        b_scales=b_scales,
+        group_lens=group_lens,
+        group_offs=group_offs,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        out_dtype=out_dtype,
+        granularity=granularity_enum,
+        num_cu=num_cu,
+        maybe_pre_sync=maybe_pre_sync,
+        inplace_add_to_out=True,
+        out=out,
+    )
+
+    if (
+        GlobalBackendManager.auto_tune_enabled()
+        and not GroupedGEMMFP8VariableKKernelDispatcher._is_graph_capturing()
+    ):
+        GroupedGEMMFP8VariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+
+    GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+
+
+@grouped_gemm_fp8_variable_k_accum_impl.register_fake
+def grouped_gemm_fp8_variable_k_accum_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+) -> None:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
+    assert out.dim() == 3, f"out must be 3D, got {out.shape}"
+    return None
 
 
 @grouped_gemm_fp8_impl.register_fake

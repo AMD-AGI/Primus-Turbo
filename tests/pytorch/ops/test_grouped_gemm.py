@@ -209,6 +209,69 @@ def generate_grouped_gemm_group_lens_with_zeros(b, m, num_zero):
     return group_lens
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("trans_b", [True, False])
+@pytest.mark.parametrize("num_zero", [0, 2])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT])
+def test_grouped_gemm_fused_grad_accum(dtype, trans_b, num_zero, backend):
+    """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
+
+    The fused path hands the weight's ``main_grad`` to the wgrad GEMM as a beta=1
+    accumulate target instead of returning a gradient for autograd to add on top, so
+    the check is that the buffer moved by exactly the wgrad the ordinary path produces.
+    Experts that got no tokens must come out untouched rather than zeroed -- zeroing
+    an empty group's slice is right for a fresh output buffer but would wipe the
+    caller's running sum here.
+    """
+    B, M, N, K = 4, 256, 512, 256
+    device = "cuda"
+
+    # A pinned backend exercises that backend's beta=1 accumulate epilogue; ``None``
+    # leaves the dispatcher to resolve one, which is how training actually runs.
+    GlobalBackendManager.set_grouped_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(False)
+    torch.manual_seed(42)
+
+    if num_zero:
+        group_lens = generate_grouped_gemm_group_lens_with_zeros(B, M, num_zero=num_zero).to(device)
+    else:
+        group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+
+    b_shape = (B, N, K) if trans_b else (B, K, N)
+    a = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn(b_shape, dtype=dtype, device=device, requires_grad=True)
+    grad_out = torch.randn((B * M, N), dtype=dtype, device=device)
+    a_fused = a.detach().clone().requires_grad_(True)
+    b_fused = b.detach().clone().requires_grad_(True)
+
+    # Baseline: ordinary autograd, b.grad holds the weight gradient.
+    out = grouped_gemm(a, b, group_lens, trans_b=trans_b)
+    out.backward(grad_out)
+
+    # Fused: the wgrad is accumulated into a pre-seeded main_grad buffer.
+    previous = torch.randn(b_fused.shape, dtype=torch.float32, device=device)
+    b_fused.main_grad = previous.clone()
+    b_fused.grad_added_to_main_grad = False
+
+    out_fused = grouped_gemm(
+        a_fused, b_fused, group_lens, trans_b=trans_b, fuse_bgrad_accum_pattern="megatron"
+    )
+    out_fused.backward(grad_out)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_fused, out)
+    assert b_fused.grad_added_to_main_grad is True, "weight must be flagged during forward"
+    torch.testing.assert_close(a.grad, a_fused.grad, **get_tolerances(dtype))
+
+    # Compare the accumulated buffer rather than the wgrad recovered by subtracting
+    # `previous`: that subtraction cancels the leading digits and blows the rounding up
+    # past any sensible tolerance. Tolerances follow the GEMM's dtype, since the
+    # baseline wgrad was rounded to it before autograd stored it.
+    expected = previous + b.grad.float()
+    torch.testing.assert_close(b_fused.main_grad, expected, **get_tolerances(dtype))
+    GlobalBackendManager.reset()
+
+
 @pytest.mark.parametrize("B", [8])
 @pytest.mark.parametrize("M", [2048])
 @pytest.mark.parametrize("N_K", [(4096, 4096)])

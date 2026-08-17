@@ -33,9 +33,10 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                          const int64_t rows_b, const int64_t cols_b, const int64_t ldb,
                          const void *scaleB_inv, hipblasOperation_t transB, void *D,
                          const hipDataType D_type, const int64_t rows_d, const int64_t cols_d,
-                         const int64_t ldd, void *workspace, const int64_t workspace_size,
-                         const bool use_low_precision, hipblasLtMatmulMatrixScale_t scale_mode,
-                         hipblasLtHandle_t handle, hipStream_t stream) {
+                         const int64_t ldd, const float beta, void *workspace,
+                         const int64_t workspace_size, const bool use_low_precision,
+                         hipblasLtMatmulMatrixScale_t scale_mode, hipblasLtHandle_t handle,
+                         hipStream_t stream) {
     hipblasLtMatmulDesc_t       operation_desc = nullptr;
     hipblasLtMatrixLayout_t     A_desc = nullptr, B_desc = nullptr, D_desc = nullptr;
     hipblasLtMatmulPreference_t preference        = nullptr;
@@ -94,7 +95,6 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                        "hipBLASLt: no valid algorithm found for current matmul config");
 
     const float alpha = 1.0;
-    const float beta  = 0.0;
     // clang-format off
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmul(
         handle,

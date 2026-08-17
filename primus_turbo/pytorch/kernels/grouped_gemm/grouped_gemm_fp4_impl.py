@@ -242,9 +242,12 @@ class GroupedGEMMFP4VariableKTritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
         **kwargs,
     ) -> bool:
         supported = True
+        # TODO: this backend has no beta=1 accumulate epilogue yet.
+        supported &= not inplace_add_to_out
         supported &= not is_gfx942()
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKTritonBackend.SUPPORTED_GRANULARITIES
@@ -318,9 +321,13 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
         supported = True
+        if inplace_add_to_out:
+            supported &= out is not None and out.dtype == out_dtype
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
@@ -348,6 +355,8 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ):
         from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel import (
@@ -376,6 +385,8 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
             G,
             out_dtype=out_dtype,
             num_cu=num_cu if num_cu is not None else -1,
+            beta=1.0 if inplace_add_to_out else 0.0,
+            out=out if inplace_add_to_out else None,
         )
 
 
@@ -504,6 +515,89 @@ def grouped_gemm_fp4_variable_k_impl(
     return GroupedGEMMFP4VariableKKernelDispatcher.dispatch(
         default_backend_choice, user_backend_choice, **kwargs
     )
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::grouped_gemm_fp4_variable_k_accum_impl", mutates_args={"out"}, device_types="cuda"
+)
+def grouped_gemm_fp4_variable_k_accum_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+) -> None:
+    """Variable-K grouped MXFP4 GEMM that accumulates into ``out`` instead of returning.
+
+    Computes ``out += lhs[:,g] @ rhs[:,g]^T`` per group, folding the accumulation into
+    the GEMM epilogue (beta=1)
+    """
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)
+    granularity_enum = ScalingGranularity(granularity)
+
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scales=a_scales,
+        b_scales=b_scales,
+        group_lens=group_lens,
+        group_offs=group_offs,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        out_dtype=out_dtype,
+        granularity=granularity_enum,
+        num_cu=num_cu,
+        maybe_pre_sync=maybe_pre_sync,
+        inplace_add_to_out=True,
+        out=out,
+    )
+
+    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
+    # the caller's buffer would accumulate the wgrad once per warmup and timing
+    # iteration.
+    if (
+        GlobalBackendManager.auto_tune_enabled()
+        and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing()
+    ):
+        GroupedGEMMFP4VariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+
+    GroupedGEMMFP4VariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+
+
+@grouped_gemm_fp4_variable_k_accum_impl.register_fake
+def grouped_gemm_fp4_variable_k_accum_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+) -> None:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
+    assert out.dim() == 3, f"out must be 3D, got {out.shape}"
+    return None
 
 
 @grouped_gemm_fp4_impl.register_fake

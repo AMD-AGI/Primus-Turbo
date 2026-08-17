@@ -10,11 +10,18 @@
 namespace primus_turbo::pytorch {
 
 at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
-                          bool transB, bool transC) {
+                          bool transB, bool transC, const double beta,
+                          c10::optional<at::Tensor> out) {
     PRIMUS_TURBO_CHECK(is_floating_point_dtype(A.scalar_type()));
     PRIMUS_TURBO_CHECK(is_floating_point_dtype(B.scalar_type()));
     PRIMUS_TURBO_CHECK(A.scalar_type() == B.scalar_type(), "A and B dtype mismatch");
-    PRIMUS_TURBO_CHECK(is_floating_point_dtype(out_dtype));
+    if (out.has_value()) {
+        PRIMUS_TURBO_CHECK(is_floating_point_dtype(out->scalar_type()),
+                           "out must be a fp16/bf16/fp32 Tensor.");
+    } else {
+        PRIMUS_TURBO_CHECK(beta == 0.0, "beta != 0 requires an `out` Tensor to accumulate into.");
+        PRIMUS_TURBO_CHECK(is_floating_point_dtype(out_dtype));
+    }
 
     // contiguous check
     PRIMUS_TURBO_CHECK(A.is_contiguous(), "A must be contiguous");
@@ -61,7 +68,14 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
         PRIMUS_TURBO_ERROR("Not support layout.");
     }
 
-    at::Tensor C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
+    at::Tensor C;
+    if (out.has_value()) {
+        C = out.value();
+        PRIMUS_TURBO_CHECK(C.is_contiguous(), "out must be contiguous");
+        PRIMUS_TURBO_CHECK(C.dim() == 2 && C.size(0) == m && C.size(1) == n, "out shape mismatch");
+    } else {
+        C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream();
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
@@ -89,6 +103,7 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
         trans_operation_A,
         static_cast<void *>(C.data_ptr()), C_type,
         rows_d, cols_d, ldd,
+        static_cast<float>(beta),
         static_cast<void *>(workspace.data_ptr()), workspace_size,
         false,
         HIPBLASLT_MATMUL_MATRIX_SCALE_END,
@@ -100,7 +115,8 @@ at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_d
 
 at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                              bool transB, bool transC, const std::string &granularity) {
+                              bool transB, bool transC, const std::string &granularity,
+                              const double beta, c10::optional<at::Tensor> out) {
     const bool use_fp8 = is_8bit_floating_point_dtype(A.scalar_type()) &&
                          is_8bit_floating_point_dtype(B.scalar_type());
 
@@ -118,7 +134,13 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
 
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(A.scalar_type()));
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(B.scalar_type()));
-    PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(out_dtype));
+    if (out.has_value()) {
+        PRIMUS_TURBO_CHECK(is_floating_point_dtype(out->scalar_type()),
+                           "out must be a fp16/bf16/fp32 Tensor.");
+    } else {
+        PRIMUS_TURBO_CHECK(beta == 0.0, "beta != 0 requires an `out` Tensor to accumulate into.");
+        PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(out_dtype));
+    }
     if (granularity != "MX_BLOCKWISE") {
         PRIMUS_TURBO_CHECK(scaleA_inv.scalar_type() == at::kFloat);
         PRIMUS_TURBO_CHECK(scaleB_inv.scalar_type() == at::kFloat);
@@ -187,7 +209,14 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
         PRIMUS_TURBO_CHECK(scaleB_inv.dim() == 2, "Scale B must be a 2-D tensor.");
     }
 
-    at::Tensor C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
+    at::Tensor C;
+    if (out.has_value()) {
+        C = out.value();
+        PRIMUS_TURBO_CHECK(C.is_contiguous(), "out must be contiguous");
+        PRIMUS_TURBO_CHECK(C.dim() == 2 && C.size(0) == m && C.size(1) == n, "out shape mismatch");
+    } else {
+        C = at::empty({m, n}, torch::dtype(out_dtype).device(at::kCUDA));
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream();
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
@@ -215,6 +244,7 @@ at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
         trans_operation_A,
         static_cast<void *>(C.data_ptr()), C_type,
         rows_d, cols_d, ldd,
+        static_cast<float>(beta),
         static_cast<void *>(workspace.data_ptr()), workspace_size,
         use_fp8,
         scale_mode,
@@ -338,6 +368,7 @@ at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
         trans_operation_A,
         static_cast<void *>(C.data_ptr()), C_type,
         rows_d, cols_d, ldd,
+        0.0f,
         static_cast<void *>(workspace.data_ptr()), workspace_size,
         use_fp4,
         scale_mode,

@@ -117,7 +117,7 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'ci:gpu')
-    runs-on: turbo-torch-ut-v2602 # launch in the container turbo_torch_github_runner_v2602 based on the image rocm/primus:v26.2
+    runs-on: turbo-torch-ut-v2605 # launch in the container turbo_torch_github_runner_v2605 based on the image rocm/primus:v26.5
     env:
       PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_ci/actions-runner-torch
     steps:
@@ -232,7 +232,7 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'ci:gpu')
-    runs-on: turbo-jax-ut-v2602 # launch in the container turbo_jax_github_runner_v2602 based on the image rocm/jax-training:maxtext-v26.2
+    runs-on: turbo-jax-ut-v2605 # launch in the container turbo_jax_github_runner_v2605 based on the image rocm/jax-training:maxtext-v26.5
     env:
       PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_ci/actions-runner-jax
     steps:

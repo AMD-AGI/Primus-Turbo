@@ -135,6 +135,7 @@ public:
                     gemm_ptrs_[idx].a_scale_ptr,
                     params.transA ? HIPBLAS_OP_T : HIPBLAS_OP_N,
                     gemm_ptrs_[idx].c_ptr, params.c_type, rows_c_[idx], cols_c_[idx], ld_c_[idx],
+                    params.beta,
                     workspace, get_hipblaslt_workspace_size_in_byte(),
                     params.use_low_precision,
                     params.scale_mode,
@@ -197,11 +198,16 @@ private:
 
             // For grad_b (transA), if the group len is 0, set the output memory to 0
             // c shape is [group_num, k, n], so each group's c size is k * n
+            // NOTE: when accumulating (beta != 0) C already holds the caller's running
+            // sum, and an expert that got no tokens simply contributes nothing to it --
+            // zeroing the slice would instead wipe out what was accumulated before.
             if (params.transA && len == 0) {
                 int64_t c_rows_t = get_dim(params.c_shape, -1);
                 int64_t c_cols_t = get_dim(params.c_shape, -2);
                 int64_t c_size_t = c_rows_t * c_cols_t * hipblaslt_dtype_bytes(params.c_type);
-                PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(c_ptr, 0, c_size_t, params.stream));
+                if (params.beta == 0.0f) {
+                    PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(c_ptr, 0, c_size_t, params.stream));
+                }
                 c_ptr += c_size_t;
             }
 

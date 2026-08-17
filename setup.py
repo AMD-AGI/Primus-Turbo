@@ -335,6 +335,8 @@ def get_common_flags():
     cxx_flags += offload_arch_list  # hipcc needs --offload-arch for CK headers in .cpp files
     nvcc_flags += macro_arch_list
     nvcc_flags += offload_arch_list
+    # -fgpu-rdc defers device codegen to the link, so the link needs the archs too.
+    extra_link_args += offload_arch_list
 
     # Composable-Kernel (ck_tile) GEMM backend: define the guard macro only when built.
     if ck_backend_enabled():
@@ -504,7 +506,7 @@ if __name__ == "__main__":
         "scipy",
     ]
 
-    # TODO(ruibin): Triton 3.7.0 and flydsl 0.2.0 does not support gfx1250, so we skip their installation when building for gfx1250.
+    # TODO(ruibin): Triton 3.7.0 and flydsl 0.2.4 does not support gfx1250, so we skip their installation when building for gfx1250.
     offload_arch_list, _ = get_offload_archs()
     if "--offload-arch=gfx1250" not in offload_arch_list:
         install_requires.append("triton>=3.7.0")
