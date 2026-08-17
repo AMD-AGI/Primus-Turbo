@@ -105,9 +105,7 @@ def _make_kernel(
         # Grid is sized for the worst case; the ~29k no-op blocks were measured free.
         worst_case_tiles = num_max_pool_tokens // BLOCK_M
     NPB = num_max_pool_tokens // BLOCK_M
-    # expert-ready poll uses one thread per local expert
     assert num_ranks > 0, "expert-ordered dispatch needs num_ranks > 0"
-    assert num_experts // num_ranks <= _BLOCK_THREADS, "one poll thread per local expert"
     # Comm role: num_ranks tasks per expert, one per peer link, each split row-wise across
     # chunks_per_link blocks. The chunk count is runtime (it follows the tuned block split).
     assert num_comm % num_ranks == 0, "num_comm must be a multiple of num_ranks"
@@ -243,13 +241,13 @@ def _make_kernel(
                 real_count = buffer_load(real_count_resource, group_idx, vec_width=1, dtype=fx.T.i32())
                 m_end = m_start + real_count
                 # A token's unique slot is written by its lowest-numbered expert, so
-                # this group needs experts [0, group_idx]. One thread per producer expert:
-                # the whole scan is one sys-scope round trip instead of group_idx of them.
-                gate_slot = thread_index
-                if gate_slot <= group_idx:
+                # this group needs experts [0, group_idx]. Every sender walks experts in
+                # ascending order, so flag[group_idx] done implies all lower ones done --
+                # one thread polling one flag replaces a group_idx-wide poll storm.
+                if thread_index == fx.Int32(0):
                     expert_signal = ld(
                         dispatch_flag_base,
-                        bank_offset + gate_slot,
+                        bank_offset + group_idx,
                         scope="sys",
                         dtype=fx.T.i64(),
                     )
@@ -257,7 +255,7 @@ def _make_kernel(
                         fx.rocdl.s_sleep(fx.Int32(wait_sleep))
                         expert_signal = ld(
                             dispatch_flag_base,
-                            bank_offset + gate_slot,
+                            bank_offset + group_idx,
                             scope="sys",
                             dtype=fx.T.i64(),
                         )
@@ -320,13 +318,12 @@ def _make_kernel(
                 # A token's unique slot is written by its lowest-numbered expert, so a
                 # gather tile needs experts [0, g_idx] -- not all of them. Dispatch runs
                 # in expert order, so this keeps the dispatch/GEMM overlap.
-                # One thread per producer expert: the whole scan is one sys-scope round
-                # trip instead of g_idx dependent ones.
-                gate_slot = thread_index
-                if gate_slot <= g_idx:
+                # Senders walk experts ascending, so flag[g_idx] done implies all lower
+                # ones done -- one thread on one flag, not a g_idx-wide poll storm.
+                if thread_index == fx.Int32(0):
                     expert_signal = ld(
                         dispatch_flag_base,
-                        bank_offset + gate_slot,
+                        bank_offset + g_idx,
                         scope="sys",
                         dtype=fx.T.i64(),
                     )
@@ -334,7 +331,7 @@ def _make_kernel(
                         fx.rocdl.s_sleep(fx.Int32(wait_sleep))
                         expert_signal = ld(
                             dispatch_flag_base,
-                            bank_offset + gate_slot,
+                            bank_offset + g_idx,
                             scope="sys",
                             dtype=fx.T.i64(),
                         )
