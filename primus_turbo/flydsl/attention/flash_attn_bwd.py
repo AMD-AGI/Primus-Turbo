@@ -131,7 +131,13 @@ def _wsq_ring_for(n_bands, block_kv, window_left, ilv, band_bytes, block_q=_BWD_
     return 0 if grp * ilv >= n_bands else grp
 
 
-_BAND_LO: dict = {}
+# NOTE: nothing here keeps a device tensor across calls. Under torch.compile's cudagraph
+# trees the allocator is pointed at the graph pool for the whole tree, so a tensor cached by
+# a kernel launched in that window stays resident in the pool while being no output of any
+# graph -- which is exactly what "live storage data ptrs are in the cudagraph pool but not
+# accounted for" reports. Re-allocating instead costs nothing measurable (the caching
+# allocator hands back the same block): the deployment table moves 874.05 -> 872.37 backward
+# TFLOPS and the varlen table is flat, both inside this node's noise.
 
 
 def _band_lo_table(n_bands, span, device):
@@ -141,12 +147,7 @@ def _band_lo_table(n_bands, span, device):
     so a per-pass value would recompile both kernels once per pass. A one-element SLICE of this
     table is a tensor argument instead, which that cache ignores.
     """
-    key = (n_bands, span, device)
-    t = _BAND_LO.get(key)
-    if t is None:
-        t = torch.arange(0, n_bands, span, device=device, dtype=torch.int32)
-        _BAND_LO[key] = t
-    return t
+    return torch.arange(0, n_bands, span, device=device, dtype=torch.int32)
 
 
 def _cu_band_rows(cu_kv, n_bands, span):
@@ -3821,21 +3822,12 @@ def _fuse_blockkv_for(Skv, D=64, window_left=-1):
 
 
 _BWD_CACHE: dict = {}
-_DQ_WS: dict = {}
 _DQRED_CACHE: dict = {}
-_CU_PH: dict = {}
 
 
 def _cu_placeholder(device):
-    """Unused cu_seqlens argument slot (read only under ``const_expr(varlen)``).
-
-    Cached per device: a fresh one costs a fill kernel launch inside the timed backward.
-    """
-    ph = _CU_PH.get(device)
-    if ph is None:
-        ph = torch.zeros(1, device=device, dtype=torch.int32)
-        _CU_PH[device] = ph
-    return ph
+    """Unused cu_seqlens argument slot (read only under ``const_expr(varlen)``)."""
+    return torch.zeros(1, device=device, dtype=torch.int32)
 
 
 def _dq_partial_ws(nb, B, Sq, hd, device, dtype, pad_bytes=0, ilv=1, carry=False):
@@ -3916,27 +3908,22 @@ def _dq_partial_ws(nb, B, Sq, hd, device, dtype, pad_bytes=0, ilv=1, carry=False
     a second reduce wave back after that is not worth it here since no available register
     donor is large enough to clear the threshold without a body-side regression.
     """
-    key = (nb, B, Sq, hd, device, dtype, pad_bytes, ilv, carry)
-    ws = _DQ_WS.get(key)
-    if ws is None:
-        _DQ_WS.clear()
-        assert nb % ilv == 0, "the band interleave must divide the band count"
-        ng, ghd = nb // ilv, hd * ilv
-        slab = B * Sq * ghd
-        pad = pad_bytes // dtype.itemsize
-        assert pad * dtype.itemsize == pad_bytes, "band padding must be a whole element count"
-        # The band-group carry (fp32, one dQ image) is the tail of this same allocation: it
-        # is the other half of the same workspace decision and has to be freed with it.
-        tail = (B * Sq * hd * 4 // dtype.itemsize) if carry else 0
-        if pad or tail:
-            flat = torch.empty(ng * (slab + pad) + tail, device=device, dtype=dtype)
-            ws = (
-                flat[: ng * (slab + pad)].as_strided((ng, B, Sq, ghd), (slab + pad, Sq * ghd, ghd, 1)),
-                flat[ng * (slab + pad) :].view(torch.float32) if tail else None,
-            )
-        else:
-            ws = (torch.empty(ng, B, Sq, ghd, device=device, dtype=dtype), None)
-        _DQ_WS[key] = ws
+    assert nb % ilv == 0, "the band interleave must divide the band count"
+    ng, ghd = nb // ilv, hd * ilv
+    slab = B * Sq * ghd
+    pad = pad_bytes // dtype.itemsize
+    assert pad * dtype.itemsize == pad_bytes, "band padding must be a whole element count"
+    # The band-group carry (fp32, one dQ image) is the tail of this same allocation: it
+    # is the other half of the same workspace decision and has to be freed with it.
+    tail = (B * Sq * hd * 4 // dtype.itemsize) if carry else 0
+    if pad or tail:
+        flat = torch.empty(ng * (slab + pad) + tail, device=device, dtype=dtype)
+        ws = (
+            flat[: ng * (slab + pad)].as_strided((ng, B, Sq, ghd), (slab + pad, Sq * ghd, ghd, 1)),
+            flat[ng * (slab + pad) :].view(torch.float32) if tail else None,
+        )
+    else:
+        ws = (torch.empty(ng, B, Sq, ghd, device=device, dtype=dtype), None)
     return ws
 
 
