@@ -9,7 +9,11 @@ import os
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.kernels.attention.attention_impl import (
+    resolve_flash_attn_backend,
+)
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
     attention_triton_backward_impl,
@@ -41,6 +45,20 @@ test_cases = [
     AttnConfig(seqlen_q=2048, seqlen_kv=2048, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     # end regression tests for https://ontrack-internal.amd.com/browse/SWDEV-548136
     AttnConfig(seqlen_q=512, seqlen_kv=512, num_head_q=40, num_head_kv=40, head_dim_qk=192, head_dim_v=128),
+]
+
+# The table above is MHA or small-group GQA at head_dim 128/192, which the FlyDSL backend
+# does not take: it wants bf16 causal, a head dim of 64 or 128, and a GQA group that is a
+# power of two in [8, 256]. These are the shapes that reach it, square and rectangular --
+# a query chunk against a longer kv context is its own path (bottom-right causal offset).
+flydsl_test_cases = [
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=64, head_dim_v=64),
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
+    AttnConfig(
+        seqlen_q=2048, seqlen_kv=2048, num_head_q=128, num_head_kv=16, head_dim_qk=128, head_dim_v=128
+    ),
+    AttnConfig(seqlen_q=512, seqlen_kv=2048, num_head_q=64, num_head_kv=8, head_dim_qk=64, head_dim_v=64),
+    AttnConfig(seqlen_q=1024, seqlen_kv=4096, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
 ]
 
 
@@ -343,65 +361,80 @@ def test_attention_sbhd_storage(heads, b):
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx950()), reason="flydsl flash-attn is gfx950-only"
 )
-@pytest.mark.parametrize("seqlen", [1024, 2048])
-@pytest.mark.parametrize("heads", [(64, 8), (64, 4)])  # GQA group must be a power of two >= 8
-@pytest.mark.parametrize("head_dim", [64, 128])  # both FLYDSL head dims
-def test_attention_flydsl(seqlen, heads, head_dim):
-    """Force the FLYDSL dense backend through the public ``flash_attn_func`` and check
-    fwd+bwd (SBHD, causal, bf16, D in {64,128}) vs the pytorch reference. Independent of
-    the aiter package so the fast path is covered even where aiter is stale."""
-    from primus_turbo.pytorch.core.backend import (
-        BackendType,
-        GlobalBackendManager,
-        PrecisionType,
-    )
+@pytest.mark.parametrize("batch", [2])  # >= 2 so the sbhd and bshd strides are unambiguous
+@pytest.mark.parametrize("config", flydsl_test_cases)
+# Windows either side of BLOCK_Q=64: one narrower than a q block used to return NaN dQ,
+# since the dQ reduce took a whole block's band range while the body wrote half of it.
+@pytest.mark.parametrize("window_size_left", [-1, 32, 128])
+def test_attention_flydsl(batch, config, window_size_left):
+    """Dense FlyDSL fwd+bwd (SBHD, causal, bf16) against an fp32 reference.
 
+    The backend is left to resolve rather than pinned: a window narrower than a q block is
+    not FlyDSL-eligible and still has to come back correct from whoever takes it. Where it
+    IS eligible the resolution is asserted, so the fast path stays covered even when the
+    aiter package is stale."""
     device, dtype = "cuda", torch.bfloat16
-    num_head_q, num_head_kv = heads
-    batch, d = 2, head_dim  # batch>=2 so sbhd vs bshd strides are unambiguous
-    sm_scale = d ** (-0.5)
+    seqlen_q, seqlen_kv = config.seqlen_q, config.seqlen_kv
+    num_head_q, num_head_kv, head_dim = config.num_head_q, config.num_head_kv, config.head_dim_qk
+    sm_scale = head_dim ** (-0.5)
+    window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
+    torch.manual_seed(0)
 
-    # SBHD storage: allocate [s, b, h, d], permute to logical [b, s, h, d] with no copy.
-    q0 = torch.randn(seqlen, batch, num_head_q, d, device=device, dtype=dtype, requires_grad=True)
-    k0 = torch.randn(seqlen, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
-    v0 = torch.randn(seqlen, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
-    grad_out = torch.randn(seqlen, batch, num_head_q, d, device=device, dtype=dtype)
-    q_ref = q0.clone().detach().requires_grad_()
-    k_ref = k0.clone().detach().requires_grad_()
-    v_ref = v0.clone().detach().requires_grad_()
+    # SBHD storage: allocate [s, b, h, d], hand over the logical [b, s, h, d] view.
+    q0, k0, v0 = (
+        torch.randn(s, batch, h, head_dim, device=device, dtype=dtype, requires_grad=True)
+        for s, h in ((seqlen_q, num_head_q), (seqlen_kv, num_head_kv), (seqlen_kv, num_head_kv))
+    )
+    grad_out = torch.randn(seqlen_q, batch, num_head_q, head_dim, device=device, dtype=dtype)
+    q_ref, k_ref, v_ref = (t.clone().detach().requires_grad_() for t in (q0, k0, v0))
 
-    o_ref = attention_vanilla_forward_pytorch_ref_impl(q_ref, k_ref, v_ref, sm_scale, True, "sbhd")
+    o_ref = attention_with_sink_ref_impl(
+        q_ref, k_ref, v_ref, None, sm_scale, True, window_size=window_size, qkv_format="sbhd"
+    )
     o_ref.backward(grad_out)
 
-    GlobalBackendManager.set_attn_backend(BackendType.FLYDSL, PrecisionType.BF16_FP16_FP32)
-    try:
-        o = flash_attn_func(
-            q0.permute(1, 0, 2, 3),
-            k0.permute(1, 0, 2, 3),
-            v0.permute(1, 0, 2, 3),
-            softmax_scale=sm_scale,
-            causal=True,
-        )
-        o.permute(1, 0, 2, 3).backward(grad_out)
-    finally:
-        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
+    q, k, v = (t.permute(1, 0, 2, 3) for t in (q0, k0, v0))
+    backend = resolve_flash_attn_backend(
+        varlen=False,
+        user_backend=None,
+        q=q,
+        k=k,
+        v=v,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=True,
+        window_size=window_size,
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+        qkv_format="sbhd",
+    )
+    if window_size_left < 0 or window_size_left >= 64:
+        assert backend == BackendType.FLYDSL, f"expected FlyDSL to take this shape, got {backend}"
 
-    out_snr = compute_snr(o_ref, o.permute(1, 0, 2, 3))
-    dq_snr = compute_snr(q_ref.grad, q0.grad)
-    dk_snr = compute_snr(k_ref.grad, k0.grad)
-    dv_snr = compute_snr(v_ref.grad, v0.grad)
-    print(f"\nflydsl S={seqlen} H={heads}: out={out_snr:.1f} dq={dq_snr:.1f} dk={dk_snr:.1f} dv={dv_snr:.1f}")
-    assert out_snr > 40 and dq_snr > 40 and dk_snr > 40 and dv_snr > 40
+    o = flash_attn_func(q, k, v, softmax_scale=sm_scale, causal=True, window_size=window_size)
+    o.permute(1, 0, 2, 3).backward(grad_out)
+
+    grads = {"dq": (q_ref.grad, q0.grad), "dk": (k_ref.grad, k0.grad), "dv": (v_ref.grad, v0.grad)}
+    for name, (_, got) in grads.items():
+        assert torch.isfinite(got).all(), f"{name} is not finite at window={window_size_left}"
+    snrs = {"out": compute_snr(o_ref, o.permute(1, 0, 2, 3))}
+    snrs.update({name: compute_snr(ref, got) for name, (ref, got) in grads.items()})
+    print(
+        f"\nflydsl {backend.name} {seqlen_q}x{seqlen_kv} H={num_head_q}/{num_head_kv} "
+        f"D={head_dim} WL={window_size_left}: " + " ".join(f"{k}={v:.1f}" for k, v in snrs.items())
+    )
+    for name, snr in snrs.items():
+        assert snr > 40, f"{name} SNR too low: {snr:.1f}"
 
 
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx950()), reason="flydsl flash-attn is gfx950-only"
 )
-@pytest.mark.parametrize("seqlen", [1024, 2048])
-@pytest.mark.parametrize("heads", [(64, 8), (128, 16)])  # gpt-oss / Meta GQA groups (power-of-two >= 8)
+@pytest.mark.parametrize("batch", [2])  # >= 2 so the sbhd and bshd strides are unambiguous
+@pytest.mark.parametrize("config", flydsl_test_cases)
 @pytest.mark.parametrize("window_size_left", [-1, 128])  # full causal + sliding window
-@pytest.mark.parametrize("head_dim", [64, 128])  # both FLYDSL head dims
-def test_attention_flydsl_sink(seqlen, heads, window_size_left, head_dim):
+def test_attention_flydsl_sink(batch, config, window_size_left):
     """Force the FLYDSL dense backend through ``flash_attn_func`` WITH a learned per-q-head
     attention sink (gpt-oss style) and check fwd O + bwd dq/dk/dv/dsink (SBHD, causal, bf16,
     D in {64,128}) vs the pytorch sink reference. Covers the sink fold in the fwd softmax
@@ -414,17 +447,17 @@ def test_attention_flydsl_sink(seqlen, heads, window_size_left, head_dim):
     )
 
     device, dtype = "cuda", torch.bfloat16
-    num_head_q, num_head_kv = heads
-    batch, d = 2, head_dim  # batch>=2 so sbhd vs bshd strides are unambiguous
+    seqlen_q, seqlen_kv = config.seqlen_q, config.seqlen_kv
+    num_head_q, num_head_kv, d = config.num_head_q, config.num_head_kv, config.head_dim_qk
     sm_scale = d ** (-0.5)
     window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
 
     # SBHD storage: allocate [s, b, h, d], permute to logical [b, s, h, d] with no copy.
-    q0 = torch.randn(seqlen, batch, num_head_q, d, device=device, dtype=dtype, requires_grad=True)
-    k0 = torch.randn(seqlen, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
-    v0 = torch.randn(seqlen, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
+    q0 = torch.randn(seqlen_q, batch, num_head_q, d, device=device, dtype=dtype, requires_grad=True)
+    k0 = torch.randn(seqlen_kv, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
+    v0 = torch.randn(seqlen_kv, batch, num_head_kv, d, device=device, dtype=dtype, requires_grad=True)
     sink = torch.randn(num_head_q, device=device, dtype=torch.float32, requires_grad=True)
-    grad_out = torch.randn(seqlen, batch, num_head_q, d, device=device, dtype=dtype)
+    grad_out = torch.randn(seqlen_q, batch, num_head_q, d, device=device, dtype=dtype)
     q_ref = q0.clone().detach().requires_grad_()
     k_ref = k0.clone().detach().requires_grad_()
     v_ref = v0.clone().detach().requires_grad_()
@@ -456,7 +489,8 @@ def test_attention_flydsl_sink(seqlen, heads, window_size_left, head_dim):
     dv_snr = compute_snr(v_ref.grad, v0.grad)
     dsink_snr = compute_snr(sink_ref.grad, sink.grad)
     print(
-        f"\nflydsl-sink S={seqlen} H={heads} WL={window_size_left}: out={out_snr:.1f} "
+        f"\nflydsl-sink {seqlen_q}x{seqlen_kv} H={num_head_q}/{num_head_kv} D={d} "
+        f"WL={window_size_left}: out={out_snr:.1f} "
         f"dq={dq_snr:.1f} dk={dk_snr:.1f} dv={dv_snr:.1f} dsink={dsink_snr:.1f}"
     )
     assert out_snr > 40 and dq_snr > 40 and dk_snr > 40 and dv_snr > 40 and dsink_snr > 40

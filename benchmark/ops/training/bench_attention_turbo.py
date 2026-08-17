@@ -14,7 +14,6 @@ import torch.utils.benchmark as benchmark
 from config import (
     BATCH_SIZE_LIST,
     compute_snr,
-    gen_attention_long_context_test_cases,
     gen_attention_test_cases,
     gen_attention_varlen_test_cases,
     get_platform_info,
@@ -227,9 +226,9 @@ def profile_attention(
     dtype = torch.bfloat16
     seqlen_kv = seqlen if seqlen_kv is None else seqlen_kv
     window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
-    # The largest shapes ask for most of the card in one workspace block, so hand back the
-    # previous case's cached segments first (fragmentation alone fails the allocation).
-    torch.cuda.empty_cache()
+    # NOTE: do not empty_cache between cases. Handing the cached blocks back makes the
+    # allocator re-acquire large contiguous ones from the driver, which fragments worse than
+    # reusing them: --deterministic goes from 10 OOM cases to 18 with one call here.
 
     # Create tensors
     q = _make_qkv((batch, seqlen, num_head_q, head_dim_qk), layout, device, dtype)
@@ -240,6 +239,18 @@ def profile_attention(
     v_ref = v.clone().detach().requires_grad_()
 
     sm_scale = head_dim_qk ** (-0.5)
+
+    # Reference forward, taken here rather than beside the correctness check below: the
+    # reference graph and the measured one would otherwise be alive at once, which costs the
+    # long shapes nine more OOM cases under --deterministic. A masked SDPA falls back to the
+    # math kernel and materialises [b, h, Sq, Skv] scores, so a reference that does not fit
+    # downgrades the case to SKIP instead of failing it -- its backward is guarded likewise.
+    try:
+        o_ref = attention_ref(q_ref, k_ref, v_ref, sm_scale, causal, window_left)
+    except torch.cuda.OutOfMemoryError:
+        o_ref = None
+        del q_ref, k_ref, v_ref
+        torch.cuda.empty_cache()
 
     # Which backend this shape resolves to -- worth reporting, since eligibility turns on
     # the head dims, the GQA group and (for FlyDSL) the storage order.
@@ -320,22 +331,18 @@ def profile_attention(
             det_dv_max_abs_diff,
         ) = check_attention_determinism(fwd_func, q, k, v, grad_out)
 
-    # Forward pass and correctness check. A masked SDPA falls back to the math kernel, which
-    # materialises [b, h, Sq, Skv] scores and saves them for its own backward -- tens of GB
-    # on the long rectangular shapes -- so a reference that does not fit downgrades the case
-    # to SKIP rather than failing it. Both of its passes sit inside the guard.
+    # Forward pass and correctness check
     out = fwd_func()
     correct = None
-    try:
-        o_ref = attention_ref(q_ref, k_ref, v_ref, sm_scale, causal, window_left)
-        correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out, use_fp8)
-        del o_ref
-    except torch.cuda.OutOfMemoryError:
-        print("Correctness Check: SKIP (the torch reference does not fit)")
-    # The reference holds a second copy of q/k/v and their grads; the timing below needs
-    # none of it, and the long shapes cannot afford to keep it.
-    del q_ref, k_ref, v_ref
-    torch.cuda.empty_cache()
+    if o_ref is not None:
+        try:
+            correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out, use_fp8)
+        except torch.cuda.OutOfMemoryError:
+            print("Correctness Check: SKIP (the reference's backward does not fit)")
+        # The reference holds a second copy of q/k/v and their grads; the timing below needs
+        # none of it, and the long shapes cannot afford to keep it. Freeing is enough -- see
+        # the note above on why the cache is left alone.
+        del o_ref, q_ref, k_ref, v_ref
 
     # Print deterministic status only when deterministic is enabled
     if deterministic:
@@ -509,23 +516,8 @@ def profile_varlen(segments, window_left, num_head_q, num_head_kv, head_dim, bac
     return name, check, bwd_time, flops / (bwd_time * 1e-3) / 1e12
 
 
-def _dense_cases(shapes):
-    """(batch, causal, Hq, Hkv, Dqk, Dv, Sq, Skv, window_left) for the chosen shape set."""
-    if shapes == "long-context":
-        return [
-            (
-                case["batch"],
-                True,  # a window and a rectangular shape are both causal-only
-                case["num_head_q"],
-                case["num_head_kv"],
-                case["head_dim_qk"],
-                case["head_dim_v"],
-                case["seqlen"],
-                case["seqlen_kv"],
-                case["window_left"],
-            )
-            for case in gen_attention_long_context_test_cases()
-        ]
+def _dense_cases():
+    """(batch, causal, Hq, Hkv, Dqk, Dv, Sq, Skv, window_left) for the model shapes."""
     return [
         (
             batch,
@@ -603,20 +595,16 @@ def benchmark_attention(
     output_csv=None,
     use_fp8=False,
     deterministic=False,
-    shapes="model",
     layout="bshd",
 ):
     """Run attention benchmark."""
     platform, gpu_name = get_platform_info()
 
-    cases = _dense_cases(shapes)
+    cases = _dense_cases()
 
     rows = []
     test_id = 0
-    print(
-        f"Total tests: {len(cases)}, shapes: {shapes}, layout: {layout}, FP8: {use_fp8}, "
-        f"deterministic: {deterministic}"
-    )
+    print(f"Total tests: {len(cases)}, layout: {layout}, FP8: {use_fp8}, deterministic: {deterministic}")
 
     for (
         batch,
@@ -797,14 +785,6 @@ if __name__ == "__main__":
         "(any bshd batch of 1 is the same bytes, so it qualifies too).",
     )
     parser.add_argument(
-        "--shapes",
-        type=str,
-        default="model",
-        choices=("model", "long-context"),
-        help="model: the model configs (square, unwindowed). long-context: sliding-window "
-        "and rectangular shapes at both head dims (see config.py).",
-    )
-    parser.add_argument(
         "--varlen",
         action="store_true",
         help="Benchmark the THD document-packing backward instead of the dense table.",
@@ -822,6 +802,5 @@ if __name__ == "__main__":
             output_csv=args.output,
             use_fp8=args.fp8,
             deterministic=args.deterministic,
-            shapes=args.shapes,
             layout=args.layout,
         )

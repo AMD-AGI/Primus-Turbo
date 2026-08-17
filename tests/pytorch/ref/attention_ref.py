@@ -80,7 +80,11 @@ def _construct_local_mask(seqlen_q, seqlen_k, window_size, device):
 
 
 def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-1, -1), qkv_format="bshd"):
-    """Reference implementation of attention with sink and optional sliding window."""
+    """Reference attention with an optional sink and an optional sliding window.
+
+    ``sink=None`` is plain attention -- the windowed and rectangular reference, which the
+    vanilla impl above cannot give: is_causal is top-left aligned, so it only matches the
+    kernels while seqlen_q == seqlen_k, and it cannot express a left window at all."""
 
     if qkv_format == "sbhd":
         q = q.permute(1, 0, 2, 3).contiguous()
@@ -95,7 +99,6 @@ def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-
 
     dtype_og = q.dtype
     q, k, v = q.float(), k.float(), v.float()
-    sink = sink.float()
 
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     if causal:
@@ -113,16 +116,18 @@ def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-
         scores = scores.masked_fill(local_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf"))
 
     # Concatenate sink scores
-    batch_size = scores.shape[0]
-    nheads = scores.shape[1]
-    sink_expanded = sink.view(1, nheads, 1, 1).expand(batch_size, -1, seqlen_q, -1)
-    scores = torch.cat([scores, sink_expanded], dim=-1)
+    if sink is not None:
+        batch_size = scores.shape[0]
+        nheads = scores.shape[1]
+        sink_expanded = sink.float().view(1, nheads, 1, 1).expand(batch_size, -1, seqlen_q, -1)
+        scores = torch.cat([scores, sink_expanded], dim=-1)
 
     # Softmax
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
 
     # Remove sink attention weights before computing output
-    attention = attention[..., :-1]
+    if sink is not None:
+        attention = attention[..., :-1]
 
     # Compute output
     output = torch.einsum("bhts,bshd->bthd", attention, v)

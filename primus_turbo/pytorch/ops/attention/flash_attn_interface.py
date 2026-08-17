@@ -216,35 +216,40 @@ class FlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
 
-        batch_size, seq_len, num_heads_q, head_dim_qk = q.size()
-        _, _, num_heads_k, head_dim_k = k.size()
+        # dk/dv span the KEY sequence, which is only q's on a square shape.
+        batch_size, seq_len_q, num_heads_q, head_dim_qk = q.size()
+        _, seq_len_kv, num_heads_k, head_dim_k = k.size()
         _, _, num_heads_v, head_dim_v = v.size()
 
         if qkv_format == "sbhd":
             dq = torch.ones(
-                (seq_len, batch_size, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
+                (seq_len_q, batch_size, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
             ).permute(1, 0, 2, 3)
             dk = torch.empty(
-                (seq_len, batch_size, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device
+                (seq_len_kv, batch_size, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device
             ).permute(1, 0, 2, 3)
             dv_padded = torch.empty(
-                (seq_len, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
+                (seq_len_kv, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
             ).permute(1, 0, 2, 3)
         elif qkv_format == "bhsd":
             dq = torch.ones(
-                (batch_size, num_heads_q, seq_len, head_dim_qk), dtype=q.dtype, device=q.device
+                (batch_size, num_heads_q, seq_len_q, head_dim_qk), dtype=q.dtype, device=q.device
             ).permute(0, 2, 1, 3)
             dk = torch.empty(
-                (batch_size, num_heads_k, seq_len, head_dim_k), dtype=k.dtype, device=k.device
+                (batch_size, num_heads_k, seq_len_kv, head_dim_k), dtype=k.dtype, device=k.device
             ).permute(0, 2, 1, 3)
             dv_padded = torch.empty(
-                (batch_size, num_heads_v, seq_len, head_dim_v), dtype=v.dtype, device=v.device
+                (batch_size, num_heads_v, seq_len_kv, head_dim_v), dtype=v.dtype, device=v.device
             ).permute(0, 2, 1, 3)
         else:
-            dq = torch.ones((batch_size, seq_len, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device)
-            dk = torch.empty((batch_size, seq_len, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device)
+            dq = torch.ones(
+                (batch_size, seq_len_q, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
+            )
+            dk = torch.empty(
+                (batch_size, seq_len_kv, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device
+            )
             dv_padded = torch.empty(
-                (batch_size, seq_len, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
+                (batch_size, seq_len_kv, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
             )
         dbias = torch.empty_like(ctx.bias) if ctx.bias is not None else None
         dsink = torch.zeros_like(ctx.sink, dtype=torch.float32) if ctx.sink is not None else None

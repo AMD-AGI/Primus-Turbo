@@ -105,12 +105,6 @@ def test_flash_attn_varlen(dtype, seqlens, causal, num_head_q, num_head_kv, head
 
 # --- flydsl THD ragged / block-causal (document-masking) fwd+bwd, gfx950-only, D in {64,128} ---
 
-# Packed segment layouts: two ragged (unequal segments) + one uniform (rect16 fast path).
-FLYDSL_SEGS = [
-    [512, 2048, 1024, 4096],
-    [256, 512, 128, 384],
-    [2048, 2048, 2048, 2048],
-]
 # window_size: full bottom-right causal, then causal-SWA at two widths.
 FLYDSL_WINDOWS = [(-1, -1), (1024, 0), (256, 0)]
 
@@ -152,9 +146,9 @@ def _flydsl_block_diag_ref(q, k, v, do, cu, scale, win):
     not (torch.cuda.is_available() and is_gfx950()), reason="flydsl flash-attn is gfx950-only"
 )
 @pytest.mark.parametrize("head_dim", [64, 128])  # both FLYDSL head dims
-@pytest.mark.parametrize("segs", FLYDSL_SEGS)
+@pytest.mark.parametrize("seqlens", SEQLEN_PATTERNS)
 @pytest.mark.parametrize("window", FLYDSL_WINDOWS)
-def test_flydsl_flash_attn_varlen_blockcausal(head_dim, segs, window):
+def test_flydsl_flash_attn_varlen_blockcausal(head_dim, seqlens, window):
     """flydsl THD ragged / block-causal (packed document masking) fwd+bwd: SNR vs a fp32
     block-diagonal reference + bitwise determinism, over ragged and uniform segment
     layouts x {full-causal, causal-SWA} x D in {64,128}. GQA G=8 (flydsl requires G a
@@ -166,6 +160,7 @@ def test_flydsl_flash_attn_varlen_blockcausal(head_dim, segs, window):
 
     dev = "cuda"
     torch.manual_seed(0)
+    segs, _ = seqlens  # the flydsl ragged path takes cu_seqlens_q == cu_seqlens_k
     D, Hq, Hkv = head_dim, 64, 8
     scale = 1.0 / math.sqrt(D)
     cu, maxs, total = _build_cu_seqlens(segs, dev)
