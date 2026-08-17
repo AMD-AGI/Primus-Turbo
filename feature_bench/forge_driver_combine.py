@@ -54,11 +54,6 @@ from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
 GOLDEN = "combine"
 LAYOUTS = ("nt", "nn")
 CASES = {layout: f"combine_{layout}" for layout in LAYOUTS}
-# Same value the production callers use (fused_mega_moe_*_impl.py). Deliberately
-# a local constant, not an import from the kernel: forge may edit that file, and
-# a driver that reads its private names breaks on a legal refactor.
-_H_NUM_TILE_BLOCKS = 8
-_MIN_HANDLE_LEN = 21
 
 
 def build_context(shape, group, rank, world):
@@ -92,10 +87,8 @@ def build_context(shape, group, rank, world):
     l1_out, _, _, handle = dispatch_grouped_gemm_bf16_flydsl_kernel(
         x, w1, group, handle=None, topk_idx=topk_idx, topk_weights=topk_weight, layout="nt"
     )
-    # Fail loudly rather than silently reading the wrong tensor if the ABI moves.
-    if len(handle) < _MIN_HANDLE_LEN:
-        raise RuntimeError(f"handle has {len(handle)} entries, expected >= {_MIN_HANDLE_LEN}")
-    act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
+    num_tile_blocks, *_meta = handle
+    act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=num_tile_blocks)
     del l1_out
     torch.cuda.synchronize()
 

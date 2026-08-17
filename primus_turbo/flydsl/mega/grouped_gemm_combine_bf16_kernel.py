@@ -5,7 +5,6 @@
 ###############################################################################
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -30,8 +29,6 @@ from primus_turbo.flydsl.mega.prims import (
     atomic_add,
     cast,
     ld,
-    read_clock,
-    spin_timed_out,
 )
 from primus_turbo.flydsl.mega.symm_buffer import (
     COMBINE_FLAG_STRIDE,
@@ -59,102 +56,29 @@ _NUM_WARPS = _BLOCK_THREADS // _WARP
 _LAYOUTS = ("nt", "nn", "tn")
 _LAYOUT_CODES = {name: code for code, name in enumerate(_LAYOUTS)}
 
-# accumulator chunks live per pass; 2 keeps the gather-reduce under the GEMM VGPR budget
-_COMBINE_DEDUP_NPASS = int(os.environ.get("TURBO_COMBINE_DEDUP_NPASS", "2"))
+_COMBINE_DEDUP_NPASS = 2
 
-_H_SOURCE_SLOT_KIND = 13
-_H_SORTED_DISPATCH_SLOT_IDS = 19
-_H_DEDUP_KEY_ROW = 20
+_NUM_REDUCE_BLOCKS = 2048
 
-# Grid role split, pinned in source per layout (see _compiled_grouped_gemm_combine).
-# TURBO_COMBINE_CCRC="nt:48/768,nn:32/768" overrides for a sweep; unset in production.
-# Measured (rc=768, both cases per run, ms):
-#   nt  cc=64 2.479/2.489 | 56 2.440/2.448/2.448 | 48 2.441/2.426/2.431/2.429 | 40 2.446
-#   nn  cc=48 4.326       | 40 4.271            | 32 4.064/4.094/4.065       | 24 4.199/4.217 | 16 4.776 | 8 7.145
-# nn has a sharp optimum at 32 and degrades hard in both directions -- it is push-bound
-# below 32, while every CU past 32 is stolen from a GEMM that is already the critical
-# path. That is a quantization edge, not a plateau: nn runs ~4704 tile blocks, so cc=32
-# leaves 224 GEMM CUs = exactly 21 rounds, and cc=40 tips it to 22 (+4.8%, measured
-# 3.96 -> 4.12/4.14). Re-measured at 24/28/32/36/48/64: 4.075 / 4.062 / 3.956 / 4.118 /
-# 4.143 / 4.254. Leave nn at 32.
-#
-# nt's old entry (48, "flat 40-56 plateau, cliff at 64") was fitted at rc=768 and did NOT
-# survive the move to rc=2048 -- the whole curve shifted right. Re-swept, counterbalanced:
-#   cc    40     48     56     64     68     72     80     96
-#   nt  2.395  2.360  2.339  2.338  2.502  2.505  2.522  2.506
-# nt's GEMM is half of nn's (K=inter, not 2*inter), so it is push-bound over a much wider
-# range and wants the extra push CUs; the cliff is real but sits between 64 and 68, not at
-# 64. 56 and 64 are a dead heat (2.3386 vs 2.3379 over 2 and 6 runs), so 56 is taken for
-# the extra step of margin -- 64 is directly on the edge of a 7% cliff. Worth ~1.0% on nt.
-# Lesson: cc and rc interact. Any future rc change invalidates this table; re-sweep both.
-_CC_PINNED = {"nt": 56, "nn": 32, "tn": 64}
-# rc had never actually been swept -- the cc table above was taken at a fixed rc=768,
-# which was itself inherited rather than measured. It behaves nothing like cc: reduce
-# blocks are drawn from the HEAD of the empty ordinal region, so they only ever occupy
-# CU slots that tile blocks have already released, and raising the count just widens the
-# tail's parallelism (the kernel self-clamps to n_reduce_tiles, so an oversized rc costs
-# only immediate exits). It also collapses the never-reset alignment loop below: once
-# rc >= n_empty every reduce block does at most ONE far atomic instead of ~3 serial ones.
-# Counterbalanced pairs, ms:
-#   rc   512   768   1536   2048   3072
-#   nt  2.375 2.372  2.369  2.360  2.370
-#   nn  3.986 3.998  3.972  3.974  3.973
-# 768 -> 1536 is the real step; 1536..3072 is one flat basin, so 2048 is taken as its
-# interior. The gain lands mostly on nn, the weaker of the two cases.
-_RC_PINNED = {"nt": 2048, "nn": 2048, "tn": 768}
+_COMBINE_FLAG_SCOPE = "sys"
+_COMBINE_GATE_SLEEP = 32
 
-# combine_flag is a purely intra-device handoff (never sym.map()'d to a peer), so agent
-# scope is *semantically* sufficient -- but it is measurably WORSE: nt 2.421 -> 2.446,
-# nn 4.062 -> 4.085. The 8 XCDs have private, mutually incoherent L2s, so an agent-scope
-# atomic/poll on a line shared by GEMM producers and combine consumers sitting on different
-# XCDs still has to resolve past L2 and now pays line migration on top. sys scope keeps it a
-# straight far-atomic at the fabric point. Keep "sys"; the knob exists only to re-run the A/B.
-_COMBINE_FLAG_SCOPE = os.environ.get("TURBO_COMBINE_FLAG_SCOPE", "sys")
-
-# Spin backoff for the two producer->consumer gates, in s_sleep units (~64 clocks each).
-# Both gates used to spin at s_sleep(1), i.e. re-read every ~64 clocks. That poll is a
-# scope="sys" load, so it bypasses L2 and costs a fabric/memory round trip EVERY time, and
-# each iteration additionally issues s_memrealtime (+ s_waitcnt lgkmcnt(0)) for the watchdog.
-# The combine gate has num_combine_cu pollers running for the whole kernel; the reduce gate
-# has up to 8 warps x ~200 resident reduce blocks polling through the tail. At s_sleep(1)
-# that is a continuous uncached read storm aimed at exactly the lines the release atomics
-# need, on a kernel that is already co-critical on memory. Backing off costs at most a
-# fraction of a microsecond of wake latency per gate crossing.
-#
-# 8 -> 32 measured over 22 counterbalanced canonical runs: nt -1.00%, nn -0.41%
-# (t = -3.10 / -2.97). Fitting the observed arms to Dt = a/(64s + c) + b*s recovers an
-# interior optimum at s* ~= 32.3 with a very flat basin -- 24 and 48 sit within 0.1% of
-# it, i.e. far under the ~0.5% single-run sd, so there is nothing left to sweep here.
-# Move this gate and _REDUCE_GATE_SLEEP together: both asymmetric arms measured worse
-# than either symmetric one. (S_SLEEP takes SIMM16[6:0], so N <= 127 regardless.)
-#
-# CAVEAT, measured after COMBINE_FLAG_STRIDE landed: that -1.00%/-0.41% was fitted on the
-# DENSE flag array, where the basin was steep because a slow poll rate was stealing a
-# contended line. On the padded build 8 and 32 are a dead heat (nt 2.387/nn 4.036 at 8 vs
-# nt 2.392,2.382/nn 4.022,4.048 at 32), i.e. padding absorbed most of what backoff was
-# buying. 32 is kept as the better-evidenced constant, but treat this knob as spent --
-# the remaining win is in the flag traffic itself, not in how often it is sampled.
-_COMBINE_GATE_SLEEP = int(os.environ.get("TURBO_COMBINE_GATE_SLEEP", "32"))
+# Traversal order inside the rectangle tile map: 2 rows at a time, column-minor.
+_RECT_P = 2
 
 
-def _combine_role_split(layout):
-    override = os.environ.get("TURBO_COMBINE_CCRC", "")
-    if override:
-        table = dict(part.split(":", 1) for part in override.split(",") if part)
-        if layout in table:
-            cc, _, rc = table[layout].partition("/")
-            return int(cc), int(rc)
-    return _CC_PINNED[layout], _RC_PINNED[layout]
+@functools.lru_cache(maxsize=8)
+def _get_dummy_tensor(device):
+    return torch.empty(1, dtype=torch.int32, device=device)
 
 
+@functools.lru_cache(maxsize=256)
 def _make_grouped_gemm_combine(
     out_features,
     hidden_size,
     num_max_pool_tokens,
     BLOCK_M,
     BLOCK_N,
-    num_combine_cu,
-    num_reduce_cu,
     num_combine_slots,
     topk,
     num_experts,
@@ -179,35 +103,17 @@ def _make_grouped_gemm_combine(
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
     comb_records = num_combine_slots * out_features * 2
     gate_records = num_combine_slots * 4
-    gemm_base = num_combine_cu
-    # Per-tile-row rotation of block_n that cancels the XCD drift of the row-major tile
-    # map (see the use site). Only enabled for the nt layout: measured a consistent win
-    # there and a consistent loss for nn, whose B operand is walked column-wise so the
-    # rotation buys no extra panel residency and only perturbs the A-tile sharing.
-    # _RECT used to lose to _N_ROT on nt, but that was measured with the row-major
-    # rectangle order, which throws away all of the B-panel sharing (see _RECT_P). With
-    # the 2-row-interleaved order the rectangle is a strictly stronger map, so the choice
-    # is worth re-deciding per layout; knob lets either be forced. Re-measured on nt with
-    # a same-session counterbalanced A/B (nn, which this knob cannot reach, held to 0.14%
-    # as the noise control): rectangle 2.3785/2.3619 vs rotation 2.3799/2.4197 ms, i.e.
-    # -1.23% with both arms strictly ordered -- so the rectangle now wins on nt as well
-    # and the rotation is off by default.
-    _NROT_OK = os.environ.get("TURBO_COMBINE_NROT", "0") not in ("0", "")
-    _N_ROT = (
-        ((n_blocks - (n_blocks % 8)) % n_blocks)
-        if (layout == "nt" and n_blocks and _NROT_OK)
-        else 0
+    # Blocks [0, num_max_combine_blocks) are the combine role, the rest are GEMM tiles.
+    # Reserving the widest split the sweep can pick lets every config share one compiled
+    # kernel; the unused combine blocks exit immediately. The boundary is rounded up to a
+    # multiple of the XCD count so that gemm_tile_index = block_index - boundary keeps the
+    # block_index % 8 residue the rectangle tile map is affine to.
+    widest_blocks = max(
+        config.kwargs["num_combine_blocks"] for config in _compiled_grouped_gemm_combine.configs
     )
-    # Mutually exclusive with _N_ROT; needs n_blocks divisible by 4 and gemm_base by 8
-    # for the band remap to preserve the XCD residue. See the seam in the tile branch.
-    _RECT = bool(n_blocks) and n_blocks % 4 == 0 and _N_ROT == 0 and os.environ.get(
-        "TURBO_COMBINE_RECT", "1"
-    ) not in ("0", "")
-    # Traversal order INSIDE the 4(row) x _nsub(col) rectangle. Any bijection of the 28
-    # slots is legal -- the tile SET an XCD owns, its XCD residue and the prefix/tail seam
-    # are all untouched -- but the order fixes the L2 reuse DISTANCE, which is what decides
-    # whether the sharing the rectangle creates is actually captured. See the use site.
-    _RECT_P = int(os.environ.get("TURBO_COMBINE_RECT_P", "2"))
+    num_max_combine_blocks = (widest_blocks + 7) // 8 * 8
+    # Rectangular XCD-affine tile map; needs n_blocks divisible by 4.
+    use_rect = bool(n_blocks) and n_blocks % 4 == 0
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -222,7 +128,6 @@ def _make_grouped_gemm_combine(
         OUTPUT: fx.Tensor,
         TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor,
-        TOPK_WEIGHTS: fx.Tensor,
         GRAD_GATE: fx.Tensor,
         D_TOPK_W: fx.Tensor,
         SORTED_SLOT_IDS: fx.Tensor,
@@ -230,28 +135,26 @@ def _make_grouped_gemm_combine(
         SOURCE_SLOT_KIND: fx.Tensor,
         sym_buffer: SymBuffer,
         c_n: fx.Int32,
+        num_combine_blocks: fx.Int32,
         COMBINE_PARITY: fx.Tensor,
         COMBINE_EXPECTED: fx.Tensor,
         REDUCE_EXPECTED: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
-        combine_cu = fx.Int32(num_combine_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        # build the layout from explicit dims (bf16 path -> TOKEN_DTYPE); the token pools are
-        # out_features-wide (the model hidden), not the down-proj K (hidden_size)
-        # Early-out gate for the worst-case padding blocks. The grid is sized for
-        # worst_case_tiles*n_blocks so the launch shape stays static under HIP-graph
-        # capture, but at run time only gemm_base + real_tiles*n_blocks + num_reduce_cu
-        # blocks have anything to do -- the other ~87% of workgroups used to execute the
-        # whole prologue (epoch parity load, expected-count loads, ~20 buffer descriptors)
-        # before discovering they were empty. Each holds a full 128 KB LDS slot (one WG per
-        # CU) for the duration, so that prologue latency serializes across the padding
-        # rounds. Gating on real_tiles alone leaves a single dependent scalar load.
+        # Only the reserved combine blocks exist; a wider split would corrupt the role
+        # boundary. Clamped here (not host-side) because the split is a runtime value.
+        num_combine_blocks = fx.arith.select(
+            num_combine_blocks < fx.Int32(num_max_combine_blocks),
+            num_combine_blocks,
+            fx.Int32(num_max_combine_blocks),
+        )
+        # Early-out for the worst-case padding blocks, before any prologue work.
         num_tile_blocks_res = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
         real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
         blocks_live = (
-            fx.Int32(gemm_base) + real_tiles * fx.Int32(n_blocks) + fx.Int32(num_reduce_cu)
+            fx.Int32(num_max_combine_blocks) + real_tiles * fx.Int32(n_blocks) + fx.Int32(_NUM_REDUCE_BLOCKS)
         )
         if block_index < blocks_live:
             workspace = Workspace(
@@ -263,191 +166,134 @@ def _make_grouped_gemm_combine(
                 out_features,
                 token_dtype=TOKEN_DTYPE,
             )
-            # read epoch (already bumped by the bump kernel): parity -> bank, expected -> spin target.
-            # Only the parity load itself is shared by all three roles, so it is the only
-            # thing that stays here. Everything downstream of it -- in particular the two
-            # expected-count loads, which are a SECOND dependent global load hanging off
-            # `combine_parity` -- is sunk into the branch that actually consumes it. The
-            # GEMM role is ~7.4k of the ~7.5k live workgroups and needs none of it until
-            # its epilogue, so the old prologue put a 2-deep dependent load chain plus ~20
-            # buffer descriptors in front of every tile's first B fetch.
+            # Epoch parity is the only prologue value all three roles share.
             combine_parity_res = create_buffer_resource(COMBINE_PARITY, max_size=True)
             combine_parity = cast(
                 buffer_load(combine_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
             )
-            # combine_flag counters are strided one per cache line (COMBINE_FLAG_STRIDE
-            # i64 = 128B) so that the ~7 block_m in flight at any instant, each drawing
-            # n_blocks release atomics against a continuous sys-scope poll, stop sharing
-            # one line. Fold the stride into the bank so the per-index cost is a shift.
+            # Fold the per-cache-line flag stride into the bank.
             combine_bank = combine_parity * fx.Int32(worst_case_tiles * COMBINE_FLAG_STRIDE)
-            # These are constant-offset i64 adds on the symmetric base -- no loads, a few
-            # SALU each -- and they must be evaluated here regardless: the AST rewriter
-            # treats `workspace.<method>()` inside a traced branch as if/else state and
-            # rejects it, since a Workspace is not an MLIR value.
+            # Must be hoisted: the rewriter rejects workspace.<method>() inside a traced branch.
             combine_flag_base = workspace.get_combine_flag_ptr()
             l2_token_buffer_base = workspace.get_l2_token_buffer_ptr()
             comb_base = workspace.get_combine_token_buffer_ptr()
             reduce_flag_base = workspace.get_reduce_flag_ptr()
             gate_base = workspace.get_combine_gate_ptr() if with_gate else None
 
-            if block_index < combine_cu:
-                # Task-based combine: one warp per recv-segment, gated on its spanned GEMM tiles.
-                reduce_bank = combine_parity * fx.Int32(num_combine_slots)
-                combine_expected_res = create_buffer_resource(COMBINE_EXPECTED, max_size=True)
-                reduce_expected_res = create_buffer_resource(REDUCE_EXPECTED, max_size=True)
-                expected_combine_i64 = buffer_load(
-                    combine_expected_res, combine_parity, vec_width=1, dtype=fx.T.i64()
-                )
-                expected_reduce_i64 = buffer_load(
-                    reduce_expected_res, combine_parity, vec_width=1, dtype=fx.T.i64()
-                )
-                # recv-segment table + origin slots ride the handle (per-forward), NOT shared symm -> else bwd reads stale.
-                recv_dst_rank_res = create_buffer_resource(RECV_DST_RANK, max_size=True)
-                recv_start_row_res = create_buffer_resource(RECV_START_ROW, max_size=True)
-                recv_count_res = create_buffer_resource(RECV_COUNT, max_size=True)
-                origin_slot_res = create_buffer_resource(POOL_SRC_SLOT, max_size=True)
-                sorted_slot_res = create_buffer_resource(SORTED_SLOT_IDS, max_size=True)
-                key_row_res = create_buffer_resource(DEDUP_KEY_ROW, max_size=True)
-                grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
-                seg_local = (fx.Int32(num_experts) - block_index + combine_cu - fx.Int32(1)) // combine_cu
-                # Dedup gathers rows below the segment, so it gates on the whole tile prefix.
-                # The cursor rides seg_iter (task_index is row-ordered), so each tile polls once.
-                combine_cursor = fx.Int32(0)
-                for seg_iter in range(seg_local):
-                    task_index = block_index + seg_iter * combine_cu
-                    seg_start = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
-                    seg_count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
-                    if seg_count > fx.Int32(0):
-                        t1 = (seg_start + seg_count - fx.Int32(1)) // fx.Int32(BLOCK_M)
-                        tile_cursor = combine_cursor
-                        if thread_index == fx.Int32(0):
-                            while tile_cursor <= t1:
-                                spin_start = read_clock()
-                                fx.rocdl.s_waitcnt(0)
-                                signal_count = ld(
-                                    combine_flag_base,
-                                    combine_bank + tile_cursor * fx.Int32(COMBINE_FLAG_STRIDE),
-                                    scope=_COMBINE_FLAG_SCOPE,
-                                    dtype=fx.T.i64(),
-                                )
-                                while signal_count != expected_combine_i64:
-                                    fx.rocdl.s_sleep(fx.Int32(_COMBINE_GATE_SLEEP))
-                                    if spin_timed_out(spin_start):
-                                        fx.printf(
-                                            "MEGA combine(task) gate timeout: tile={} signal={} thr={}\n",
-                                            tile_cursor,
-                                            signal_count,
-                                            expected_combine_i64,
-                                        )
-                                        spin_start = read_clock()
+            # Region test uses the reserved width; blocks past the live split exit.
+            if block_index < fx.Int32(num_max_combine_blocks):
+                if block_index < num_combine_blocks:
+                    # Task-based combine: one warp per recv-segment, gated on its spanned GEMM tiles.
+                    reduce_bank = combine_parity * fx.Int32(num_combine_slots)
+                    combine_expected_res = create_buffer_resource(COMBINE_EXPECTED, max_size=True)
+                    reduce_expected_res = create_buffer_resource(REDUCE_EXPECTED, max_size=True)
+                    expected_combine_i64 = buffer_load(
+                        combine_expected_res, combine_parity, vec_width=1, dtype=fx.T.i64()
+                    )
+                    expected_reduce_i64 = buffer_load(
+                        reduce_expected_res, combine_parity, vec_width=1, dtype=fx.T.i64()
+                    )
+                    # These tables ride the handle, not shared symm, else bwd reads stale.
+                    recv_dst_rank_res = create_buffer_resource(RECV_DST_RANK, max_size=True)
+                    recv_start_row_res = create_buffer_resource(RECV_START_ROW, max_size=True)
+                    recv_count_res = create_buffer_resource(RECV_COUNT, max_size=True)
+                    origin_slot_res = create_buffer_resource(POOL_SRC_SLOT, max_size=True)
+                    sorted_slot_res = create_buffer_resource(SORTED_SLOT_IDS, max_size=True)
+                    key_row_res = create_buffer_resource(DEDUP_KEY_ROW, max_size=True)
+                    grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
+                    seg_local = (
+                        fx.Int32(num_experts) - block_index + num_combine_blocks - fx.Int32(1)
+                    ) // num_combine_blocks
+                    # Cursor rides seg_iter so each tile is polled once.
+                    combine_cursor = fx.Int32(0)
+                    for seg_iter in range(seg_local):
+                        task_index = block_index + seg_iter * num_combine_blocks
+                        seg_start = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
+                        seg_count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+                        if seg_count > fx.Int32(0):
+                            t1 = (seg_start + seg_count - fx.Int32(1)) // fx.Int32(BLOCK_M)
+                            tile_cursor = combine_cursor
+                            if thread_index == fx.Int32(0):
+                                while tile_cursor <= t1:
                                     fx.rocdl.s_waitcnt(0)
                                     signal_count = ld(
                                         combine_flag_base,
                                         combine_bank + tile_cursor * fx.Int32(COMBINE_FLAG_STRIDE),
-                                        order="relaxed",
                                         scope=_COMBINE_FLAG_SCOPE,
                                         dtype=fx.T.i64(),
                                     )
-                                tile_cursor = tile_cursor + fx.Int32(1)
-                        combine_cursor = tile_cursor
-                        fx.rocdl.s_waitcnt(0)
-                        fx.gpu.barrier()
-                        combine_dedup_bf16_tile(
-                            sym_buffer,
-                            workspace,
-                            thread_index=thread_index,
-                            task_index=task_index,
-                            recv_dst_rank_res=recv_dst_rank_res,
-                            recv_start_row_res=recv_start_row_res,
-                            recv_count_res=recv_count_res,
-                            origin_slot_res=origin_slot_res,
-                            sorted_slot_res=sorted_slot_res,
-                            key_row_res=key_row_res,
-                            grad_gate_res=grad_gate_res,
-                            topk=topk,
-                            apply_weights=apply_weights,
-                            signal=True,
-                            epoch=expected_reduce_i64,
-                            bank_offset=reduce_bank,
-                            with_gate=with_gate,
-                            npass=dedup_npass,
-                        )
+                                    while signal_count != expected_combine_i64:
+                                        fx.rocdl.s_sleep(fx.Int32(_COMBINE_GATE_SLEEP))
+                                        fx.rocdl.s_waitcnt(0)
+                                        signal_count = ld(
+                                            combine_flag_base,
+                                            combine_bank + tile_cursor * fx.Int32(COMBINE_FLAG_STRIDE),
+                                            order="relaxed",
+                                            scope=_COMBINE_FLAG_SCOPE,
+                                            dtype=fx.T.i64(),
+                                        )
+                                    tile_cursor = tile_cursor + fx.Int32(1)
+                            combine_cursor = tile_cursor
+                            fx.rocdl.s_waitcnt(0)
+                            fx.gpu.barrier()
+                            combine_dedup_bf16_tile(
+                                sym_buffer,
+                                workspace,
+                                thread_index=thread_index,
+                                task_index=task_index,
+                                recv_dst_rank_res=recv_dst_rank_res,
+                                recv_start_row_res=recv_start_row_res,
+                                recv_count_res=recv_count_res,
+                                origin_slot_res=origin_slot_res,
+                                sorted_slot_res=sorted_slot_res,
+                                key_row_res=key_row_res,
+                                grad_gate_res=grad_gate_res,
+                                topk=topk,
+                                apply_weights=apply_weights,
+                                signal=True,
+                                epoch=expected_reduce_i64,
+                                bank_offset=reduce_bank,
+                                with_gate=with_gate,
+                                npass=dedup_npass,
+                            )
 
             else:
-                gemm_tile_index = block_index - fx.Int32(gemm_base)
+                gemm_tile_index = block_index - fx.Int32(num_max_combine_blocks)
                 block_m = gemm_tile_index // fx.Int32(n_blocks)
                 block_n = gemm_tile_index % fx.Int32(n_blocks)
-                if _N_ROT != 0:
-                    # XCD-affine N rotation. Workgroups round-robin over the 8 XCDs by
-                    # index, so under the plain row-major tile map the n-panel a given XCD
-                    # works on drifts by (n_blocks % 8) every tile row; over the kernel each
-                    # XCD ends up touching about twice as many distinct B panels as its L2
-                    # slice can hold. Rotating block_n by that same drift per row cancels it,
-                    # pinning each XCD to a fixed residue class of block_n whose panels then
-                    # stay resident. It is a per-row constant rotation, so still a bijection
-                    # over the tile set, and block_m is untouched -- the combine gate's
-                    # tile-prefix ordering is unchanged.
-                    block_n = (block_n + block_m * fx.Int32(_N_ROT)) % fx.Int32(n_blocks)
-                if _RECT:
-                    # Rectangular XCD-affine tile map (the nn counterpart of _N_ROT).
-                    #
-                    # Workgroups round-robin over the 8 XCDs by index, and gemm_base is a
-                    # multiple of 8, so XCD == gemm_tile_index % 8 exactly. Under row-major
-                    # the 8 tiles an XCD holds concurrently form a 1x8 sliver that walks
-                    # across a whole tile row, so per band an XCD touches ~9 distinct A
-                    # panels and ~7 B panels -- ~16 streams against a 4 MiB private L2.
-                    # Give each XCD a 4(block_m) x 7(block_n) RECTANGLE of the band instead:
-                    # the same 28 tiles now need only 4 A panels + 7 B panels = 11 streams,
-                    # lifting the reuse ceiling from ~3.7x to ~5.1x. nn is where this should
-                    # pay: K is twice nt's, so every A/B panel byte is re-read twice as often.
-                    #
-                    # x = XCD id splits into g = x//2 (which seventh of N) and h = x%2 (which
-                    # half of the 8 rows); j enumerates the 7x4 rectangle. A band is
-                    # 8*n_blocks tiles and 8*n_blocks % 8 == 0, so t % 8 -- the XCD -- is
-                    # untouched by the remap. Applied only on the whole-band prefix, with
-                    # identity on the row tail AND over the entire empty/reduce ordinal
-                    # range, so empty_ordinal and the combine gate's prefix accounting see
-                    # the same tile numbering they always did.
-                    _band = fx.Int32(8 * n_blocks)
-                    _nsub = fx.Int32(n_blocks // 4)
-                    _t_sw = (real_tiles // fx.Int32(8)) * _band
-                    _b = gemm_tile_index // _band
-                    _tp = gemm_tile_index % _band
-                    _x = _tp % fx.Int32(8)
-                    _j = _tp // fx.Int32(8)
-                    # Order within the 4 x C rectangle (C = n_blocks//4 = 7 here). The
-                    # rectangle only creates the SHARING (4 A panels + C B panels feed 4*C
-                    # tiles); whether L2 keeps it depends on the reuse DISTANCE, i.e. how
-                    # far apart in dispatch order two tiles sharing a panel are. Tiles on
-                    # one XCD start ~tau/32 apart, so distance d ~ 2d k-steps of skew, and
-                    # a slab only survives a few k-steps of the XCD's fetch stream.
-                    #   P=1 (row-major): A-distance 1 (captured), B-distance C=7 (lost)
-                    #                    -> 4 + 4*C = 32 panel fetches per 28 tiles.
-                    #   P=2: walk 2 rows at a time, column-minor. A-distance 2, B-distance 1
-                    #        inside a row pair -> 4 + 2*C = 18 fetches. Both stay in window.
-                    #   P=4 (column-major): B-distance 1, A-distance 4 -> 4*C + C = 35 if
-                    #        the A reuse falls out of the window, C + 4 = 11 if it holds.
-                    _P = _RECT_P if _RECT_P in (1, 2, 4) else 1
-                    _C = n_blocks // 4
-                    _pg = _j // fx.Int32(_P * _C)
-                    _q = _j % fx.Int32(_P * _C)
-                    _rm_l = _pg * fx.Int32(_P) + (_q % fx.Int32(_P))
-                    _rn_l = _q // fx.Int32(_P)
-                    _rn = (_x // fx.Int32(2)) * _nsub + _rn_l
-                    _rm = _b * fx.Int32(8) + (_x % fx.Int32(2)) * fx.Int32(4) + _rm_l
-                    _use = gemm_tile_index < _t_sw
-                    block_m = fx.arith.select(_use, _rm, block_m)
-                    block_n = fx.arith.select(_use, _rn, block_n)
+                if use_rect:
+                    # Give each XCD a 4(block_m) x cols_per_xcd(block_n) rectangle of the
+                    # band instead of a 1x8 sliver, so its A/B panels stay L2-resident. A
+                    # band is 8*n_blocks tiles, so the XCD residue (t % 8) survives the
+                    # remap. Applied only on the whole-band prefix; the row tail and the
+                    # empty/reduce ordinal range keep the identity numbering the combine
+                    # gate's prefix accounting depends on.
+                    cols_per_xcd = n_blocks // 4
+                    pass_size = _RECT_P * cols_per_xcd
+                    band_tiles = fx.Int32(8 * n_blocks)
+                    whole_band_tiles = (real_tiles // fx.Int32(8)) * band_tiles
+                    band_idx = gemm_tile_index // band_tiles
+                    tile_in_band = gemm_tile_index % band_tiles
+                    xcd = tile_in_band % fx.Int32(8)
+                    slot_in_xcd = tile_in_band // fx.Int32(8)
+                    pass_group = slot_in_xcd // fx.Int32(pass_size)
+                    pos_in_pass = slot_in_xcd % fx.Int32(pass_size)
+                    row_local = pass_group * fx.Int32(_RECT_P) + (pos_in_pass % fx.Int32(_RECT_P))
+                    col_local = pos_in_pass // fx.Int32(_RECT_P)
+                    rect_n = (xcd // fx.Int32(2)) * fx.Int32(cols_per_xcd) + col_local
+                    rect_m = band_idx * fx.Int32(8) + (xcd % fx.Int32(2)) * fx.Int32(4) + row_local
+                    in_rect = gemm_tile_index < whole_band_tiles
+                    block_m = fx.arith.select(in_rect, rect_m, block_m)
+                    block_n = fx.arith.select(in_rect, rect_n, block_n)
                 if block_m < real_tiles:
-                    # GEMM role: one real tile (block_m, block_n) per block (unchanged).
+                    # GEMM role: one real tile (block_m, block_n) per block.
                     group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
                     group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                     group_base = group_index * fx.Int32(K) * c_n
-                    # A base = ACT tensor; C base = l2_token_buffer (int64 symm addr).
                     act_base = fx.arith.ArithValue(
                         fx.arith.index_cast(fx.T.i64(), extract_base_index(ACT)), signed=True
                     )
-                    # Fold per-tile base in int64 (pool >4GB), voffset stays int32. A: precise bound; C: HW num_records via 0x40000000.
+                    # Fold per-tile base in int64 (pool >4GB); voffset stays int32.
                     a_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * K * 2)
                     c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
                     A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
@@ -467,33 +313,15 @@ def _make_grouped_gemm_combine(
                         out_fp16=out_fp16,
                         nt_vmcnt=nt_vmcnt,
                         b_group_base=group_base,
-                        # sc1 only (16), NOT sc1|nt (18). sc1 is load-bearing for
-                        # cross-XCD visibility and must stay. Dropping NT lets the
-                        # epilogue's 0.94 GB C stream retire into L2 instead of being
-                        # forced past it, which shortens the s_waitcnt(0) drain that
-                        # sits between the last store and the release atomic. The five
-                        # ep_intranode *load* sites stay at 18 on purpose: they read the
-                        # stage exactly once, so making them L2-allocating would spend
-                        # residency nn does not have (iter 7 bundled all six and nn
-                        # captured only 1.1%).
+                        # sc1 only (16), NOT sc1|nt: sc1 is load-bearing for cross-XCD
+                        # visibility, and letting C retire into L2 shortens the drain.
                         c_cache_modifier=16,
-                        # out_features % BLOCK_N == 0 is asserted above and the grid only
-                        # ever produces block_n < out_features // BLOCK_N, so every column
-                        # this epilogue writes is in range: the store's per-element column
-                        # mask is statically true and can be dropped.
                         n_exact=True,
                     )
-                    # Release rendezvous. Per-wave release (each wave drains its own stores
-                    # and signals with its own lane-0 atomic, consumer counting _NUM_WARPS
-                    # signals per tile) was measured and is a large LOSS: nt 2.420 -> 2.690,
-                    # nn 4.084 -> 4.308. The 8x sys-scope atomic traffic lands on the one
-                    # 64-bit combine_flag word that the combine warps are simultaneously
-                    # polling with sys-scope loads, so every extra atomic steals the line
-                    # from the poller. The whole-workgroup rendezvous is cheaper than the
-                    # coherence ping-pong it avoids -- do not re-try this.
+                    # Whole-workgroup release rendezvous; two are required, and LLVM
+                    # folds adjacent barriers, so keep the separator.
                     fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()
-                    # Keep a separator: LLVM folds adjacent barriers, but two rendezvous are required.
                     fx.rocdl.s_waitcnt(0)
                     fx.gpu.barrier()
                     if thread_index == fx.Int32(0):
@@ -504,9 +332,9 @@ def _make_grouped_gemm_combine(
                             scope=_COMBINE_FLAG_SCOPE,
                         )
                 else:
-                    # Empty region: first num_reduce_cu blocks do topk reduce, rest early-exit.
+                    # Empty region: the first _NUM_REDUCE_BLOCKS blocks do topk reduce, rest exit.
                     empty_ordinal = gemm_tile_index - real_tiles * fx.Int32(n_blocks)
-                    if empty_ordinal < fx.Int32(num_reduce_cu):
+                    if empty_ordinal < fx.Int32(_NUM_REDUCE_BLOCKS):
                         reduce_bank = combine_parity * fx.Int32(num_combine_slots)
                         reduce_expected_res = create_buffer_resource(REDUCE_EXPECTED, max_size=True)
                         expected_reduce_i64 = buffer_load(
@@ -518,7 +346,6 @@ def _make_grouped_gemm_combine(
                         output_res = create_buffer_resource(OUTPUT, max_size=True)
                         topk_indices_res = create_buffer_resource(TOPK_INDICES, max_size=True)
                         num_tokens_res = create_buffer_resource(NUM_TOKENS_PER_RANK, max_size=True)
-                        topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
                         gate_local_res = (
                             create_buffer_resource_from_addr(gate_base, num_records_bytes=gate_records)
                             if with_gate
@@ -526,9 +353,9 @@ def _make_grouped_gemm_combine(
                         )
                         d_topk_w_res = create_buffer_resource(D_TOPK_W, max_size=True) if with_gate else None
                         kind_res = create_buffer_resource(SOURCE_SLOT_KIND, max_size=True)
-                        # Never-reset alignment: reduce blocks bump empty block_m's combine_flag to cumulative expected.
+                        # Never-reset alignment: bump empty block_m flags to cumulative expected.
                         n_empty = fx.Int32(worst_case_tiles) - real_tiles
-                        reduce_stride = fx.Int32(num_reduce_cu)
+                        reduce_stride = fx.Int32(_NUM_REDUCE_BLOCKS)
                         align_count = (n_empty - empty_ordinal + reduce_stride - fx.Int32(1)) // reduce_stride
                         for align_iter in range(align_count):
                             empty_block_m = real_tiles + empty_ordinal + align_iter * reduce_stride
@@ -542,7 +369,9 @@ def _make_grouped_gemm_combine(
 
                         n_reduce_tiles = n_empty * fx.Int32(n_blocks)
                         active_reduce_blocks = fx.arith.select(
-                            n_reduce_tiles < fx.Int32(num_reduce_cu), n_reduce_tiles, fx.Int32(num_reduce_cu)
+                            n_reduce_tiles < fx.Int32(_NUM_REDUCE_BLOCKS),
+                            n_reduce_tiles,
+                            fx.Int32(_NUM_REDUCE_BLOCKS),
                         )
                         topk_reduce_bf16_tile(
                             True,
@@ -561,7 +390,7 @@ def _make_grouped_gemm_combine(
                             num_tokens_res,
                             reduce_flag_base,
                             reduce_bank,
-                            topk_weights_res,
+                            None,  # weights already folded in by the sender-side dedup
                             gate_local_res,
                             d_topk_w_res,
                             expected_reduce_i64,
@@ -570,7 +399,7 @@ def _make_grouped_gemm_combine(
                             num_combine_slots=num_combine_slots,
                         )
 
-    return grouped_gemm_combine_kernel
+    return grouped_gemm_combine_kernel, num_max_combine_blocks
 
 
 @functools.lru_cache(maxsize=4)
@@ -595,9 +424,8 @@ def _make_epoch_bump(add_combine, add_reduce):
 
 
 @autotune(
-    # 96/128 are headroom for wider folds; DSv3 still tunes to 64 (nt) / 32 (nn).
-    configs=[Config(num_combine_cu=cc, num_reduce_cu=rc) for cc in (16, 32, 64, 96, 128) for rc in (256,)],
-    # layout_code MUST be a key: nt/nn have OPPOSITE combine_cu optima (see wrapper note).
+    configs=[Config(num_combine_blocks=nb) for nb in (16, 24, 32, 40, 48, 56, 64, 96, 128)],
+    # layout_code MUST be a key: nt/nn have opposite num_combine_blocks optima.
     key=[
         "out_features",
         "hidden_size",
@@ -628,7 +456,6 @@ def _compiled_grouped_gemm_combine(
     OUTPUT,
     TOPK_INDICES,
     NUM_TOKENS_PER_RANK,
-    TOPK_WEIGHTS,
     GRAD_GATE,
     D_TOPK_W,
     SORTED_SLOT_IDS,
@@ -636,6 +463,7 @@ def _compiled_grouped_gemm_combine(
     SOURCE_SLOT_KIND,
     sym_buffer,
     c_n,
+    num_combine_blocks: int,
     COMBINE_PARITY,
     COMBINE_EXPECTED,
     REDUCE_EXPECTED,
@@ -656,42 +484,16 @@ def _compiled_grouped_gemm_combine(
     out_fp16: fx.Constexpr[bool],
     dedup_npass: fx.Constexpr[int],
     stream: fx.Stream,
-    num_combine_cu: fx.Constexpr[int] = 64,
-    num_reduce_cu: fx.Constexpr[int] = 256,
     nt_vmcnt: fx.Constexpr[int] = 3,
     agpr_alloc: fx.Constexpr[int] = 0,
     waves: fx.Constexpr[int] = 2,
 ):
-    # Grid role split, pinned here rather than swept: the autotune cache is keyed on
-    # shapes+layout only and carries no code version, so the values it serves are
-    # whatever a parent-era sweep happened to pick, and widening the swept config list
-    # silently does nothing for shapes that have been tuned once. Pinning both makes
-    # the launch geometry a property of the source, not of ~/.flydsl.
-    #
-    # num_combine_cu trades push CUs against math CUs: the GEMM makespan scales as
-    # 1/(256 - cc) at ~39 tile rounds, so every 8 CUs handed to combine costs ~3.5% of
-    # the GEMM window, and combine only pays that back while pushes are the binding
-    # constraint. nt (forward L2) and nn (backward L1 dgrad) push the same ~0.94 GB but
-    # nn's window is 1.65x longer, so nn needs fewer push CUs to stay ahead -- hence the
-    # asymmetric pin.
-    #
-    # Reduce-region width:
-    # 256 reduce blocks cannot all be resident -- one workgroup per CU (128 KB LDS) and
-    # the combine region already owns 32-48 of the 256 CUs -- so the reduce tail ran as
-    # two ragged rounds, the second only ~a quarter full. Splitting the same token work
-    # over 768 blocks makes each slice ~3x shorter, so the tail packs into whatever CUs
-    # free up as GEMM tiles retire and the final ragged round costs a third as much.
-    # The extra blocks are free: they are carved out of the ~50k padding blocks the
-    # worst-case grid already launches. Measured nt 2.486 -> 2.465, nn 4.106 -> 4.064 ms.
-    num_combine_cu, num_reduce_cu = _combine_role_split(_LAYOUTS[layout_code])
-    kernel = _make_grouped_gemm_combine(
+    kernel, num_max_combine_blocks = _make_grouped_gemm_combine(
         out_features,
         hidden_size,
         num_max_pool_tokens,
         BLOCK_M,
         BLOCK_N,
-        num_combine_cu,
-        num_reduce_cu,
         num_combine_slots,
         topk,
         num_experts,
@@ -707,14 +509,10 @@ def _compiled_grouped_gemm_combine(
     )
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
-    # The grid is sized for the worst case (every pool slot occupied), so at the bench
-    # shape ~47.5k of the ~58.3k blocks launched retire as null tiles. MEASURED: capping
-    # worst_case_tiles 2080 -> 384 (grid 58272 -> 10784) moved both cases by +0.19%, i.e.
-    # the null-block drain costs nothing -- an empty block is dispatch-limited, not
-    # occupancy-limited, and the tail is set by the real tiles. Do NOT spend effort on a
-    # persistent/compacted GEMM grid; there is no headroom under it.
-    grid_size = num_combine_cu + worst_case_tiles * n_blocks
-    # bump epoch on device (combine += n_blocks, reduce += 1) before the GEMM; same-stream visible
+    # Sized for the worst case so the launch shape stays static under graph capture;
+    # the null tiles are dispatch-limited and measured free.
+    grid_size = num_max_combine_blocks + worst_case_tiles * n_blocks
+    # Bump the epoch on device before the GEMM; same-stream makes it visible.
     _make_epoch_bump(int(n_blocks), 1)(COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED).launch(
         grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
     )
@@ -730,7 +528,6 @@ def _compiled_grouped_gemm_combine(
         OUTPUT,
         TOPK_INDICES,
         NUM_TOKENS_PER_RANK,
-        TOPK_WEIGHTS,
         GRAD_GATE,
         D_TOPK_W,
         SORTED_SLOT_IDS,
@@ -738,6 +535,7 @@ def _compiled_grouped_gemm_combine(
         SOURCE_SLOT_KIND,
         sym_buffer,
         c_n,
+        num_combine_blocks,
         COMBINE_PARITY,
         COMBINE_EXPECTED,
         REDUCE_EXPECTED,
@@ -760,12 +558,10 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     assert layout in ("nt", "nn", "tn"), f"unknown layout {layout}"
     assert x.dtype == torch.bfloat16 and l2_weights.dtype == torch.bfloat16
     assert topk_indices is not None, "topk reduce needs topk_indices"
-    tile_to_expert = handle[5]
-    num_tile_blocks = handle[8]
-    recv_dst_rank = handle[9]
-    recv_start_row = handle[10]
-    recv_count = handle[11]
-    pool_src_slot = handle[12]
+    num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
+    _prefix, _real_count, sorted_slot_ids = grouped_meta
+    tile_to_expert, source_slot_kind = dispatch_meta[4], dispatch_meta[5]
+    recv_dst_rank, recv_start_row, recv_count, pool_src_slot, dedup_key_row = combine_meta
     symm = get_symm_buffer_for_mega_moe()
     sym_buffer = symm.get_sym_buffer()
     if layout == "tn":
@@ -791,8 +587,6 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     num_experts = int(symm.num_experts)
     assert topk >= 1 and num_experts > 0, "topk reduce needs topk>=1 and num_experts>0"
 
-    dummy = num_tile_blocks
-
     apply_weights = topk_weights is not None
     with_gate = grad_gate is not None
 
@@ -807,22 +601,15 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     output_d = output.view(-1)
     topk_indices_d = topk_indices.contiguous().view(-1)
     num_tokens_d = symm.num_tokens_per_rank
-    topk_weights_d = topk_weights.contiguous().view(-1) if apply_weights else dummy
+    # Gate tensors are traced out when with_gate is False; the kernel still needs an arg.
+    dummy = _get_dummy_tensor(device)
     grad_gate_d = grad_gate.contiguous().view(-1) if with_gate else dummy
     d_topk_w = torch.empty(num_combine_slots, dtype=torch.float32, device=device) if with_gate else None
     d_topk_w_d = d_topk_w if with_gate else dummy
 
-    # Sender-side dedup is the only combine path: it folds a token's local routes into
-    # one push, so combine moves exactly the bytes dispatch did.
-    assert len(handle) > _H_DEDUP_KEY_ROW and handle[_H_DEDUP_KEY_ROW].numel() > 1, (
-        "combine needs the dispatch dedup tables; run dispatch with dedup=True"
-    )
-    sorted_slot_ids = handle[_H_SORTED_DISPATCH_SLOT_IDS]
-    dedup_key_row = handle[_H_DEDUP_KEY_ROW]
-    source_slot_kind = handle[_H_SOURCE_SLOT_KIND]
+    # Sender-side dedup is the only combine path.
+    assert dedup_key_row.numel() > 1, "combine needs the dispatch dedup tables; run dispatch with dedup=True"
 
-    # epoch advance moved inside _compiled_grouped_gemm_combine (autotune-safe, no rewind)
-    # num_combine_cu / num_reduce_cu are tunable per shape+layout (nt/nn optima differ).
     _compiled_grouped_gemm_combine(
         act_2d,
         weight_flat,
@@ -835,7 +622,6 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         output_d,
         topk_indices_d,
         num_tokens_d,
-        topk_weights_d,
         grad_gate_d,
         d_topk_w_d,
         sorted_slot_ids,

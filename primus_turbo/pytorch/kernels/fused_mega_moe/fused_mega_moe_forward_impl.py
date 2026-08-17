@@ -26,13 +26,10 @@ from primus_turbo.pytorch.core.backend import (
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
-# dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
-# 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
-# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot,
-# 13 source_slot_kind, 14 dedup_src_row, 15 dup_groups, 16 dup_loffs, 17 dup_counts,
-# 18 tile_copy_expected, 19 sorted_dispatch_slot_ids, 20 dedup_key_row.
-_HANDLE_LEN = 21
-_H_NUM_TILE_BLOCKS = 8
+# handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta); layout lives in
+# dispatch_prologue_kernel.py. The custom op can only carry a flat tensor list, so the
+# handle travels flattened across this boundary: 1 + 3 + 6 + 5 tensors.
+_HANDLE_LEN = 15
 
 
 class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
@@ -77,8 +74,10 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
             layout=layout,
         )
 
+        num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
+
         # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
+        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=num_tile_blocks)
 
         # fused grouped L2 GEMM + combine PUSH + topk reduce
         y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
@@ -90,13 +89,11 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
             layout=layout,
         )
 
-        # ABI guard: catch a kernel return-order change loudly.
-        assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
         return (
             y,
             l1_out,
             dispatch_weights_in_buf,
-            list(handle),
+            [num_tile_blocks, *grouped_meta, *dispatch_meta, *combine_meta],
         )
 
 
@@ -179,33 +176,13 @@ def _fused_mega_moe_forward_meta(
 
     # Handle must have real length under compile: save_for_backward(..., *handle) fixes
     # its length at trace time, so an empty fake -> len-0 handle in backward. Only count
-    # and dtype matter here (opaque saved activations); real shapes come from eager. See
-    # dispatch_prologue_flydsl_kernel for the ABI (0-11) + dispatch launcher (12).
+    # and dtype matter here (opaque saved activations); real shapes come from eager.
     i32 = lambda: x.new_empty((0,), dtype=torch.int32)  # noqa: E731
     i64 = lambda: x.new_empty((0,), dtype=torch.int64)  # noqa: E731
-    handle = [
-        i32(),
-        i32(),
-        i32(),
-        i32(),  # 0-3 expert_send_dst_rank/dst_row/count/offset
-        i32(),
-        i32(),  # 4 dispatched_token_idx  5 tile_to_expert
-        i64(),
-        i64(),  # 6 real_count_per_expert  7 padded-prefix
-        i32(),  # 8 num_tile_blocks
-        i32(),
-        i32(),
-        i32(),  # 9-11 combine_recv_dst_rank/start_row/count
-        i32(),  # 12 pool_src_slot
-        i32(),  # 13 source_slot_kind
-        i32(),  # 14 dedup_src_row
-        i32(),  # 15 dup_groups
-        i32(),  # 16 dup_loffs
-        i32(),  # 17 dup_counts
-        i32(),  # 18 tile_copy_expected
-        i32(),  # 19 sorted_dispatch_slot_ids
-        i32(),  # 20 dedup_key_row
-    ]
+    grouped_meta = (i64(), i64(), i32())  # prefix, real_count_per_expert, sorted_slot_ids
+    dispatch_meta = (i32(), i32(), i32(), i32(), i32(), i32())  # send plan + tile map + slot kind
+    combine_meta = (i32(), i32(), i32(), i32(), i32())  # recv plan + pool_src_slot + key_row
+    handle = [i32(), *grouped_meta, *dispatch_meta, *combine_meta]
     assert len(handle) == _HANDLE_LEN
     return y, l1_out, dispatch_weights_in_buf, handle
 
@@ -239,9 +216,10 @@ def fused_mega_moe_forward_impl(
         topk_weights,
         layout,
     )
+    assert len(handle) == _HANDLE_LEN, f"flat handle has {len(handle)} tensors, expected {_HANDLE_LEN}"
     return (
         y,
         l1_out,
         dispatch_weights_in_buf,
-        tuple(handle),
+        (handle[0], tuple(handle[1:4]), tuple(handle[4:10]), tuple(handle[10:])),
     )

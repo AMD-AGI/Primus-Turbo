@@ -53,13 +53,6 @@ NUM_GROUPS = 8
 GROUP_TOPK = 4
 ROUTING_SCALE = 2.5
 ALL_LAYOUTS = ("nt", "nn")
-# Handle slots, mirrored from the production callers (fused_mega_moe_*_impl.py).
-# Local constants on purpose: reading the kernel's private names would break on a
-# legal refactor of that file.
-_H_SOURCE_SLOT_KIND = 13
-_H_NUM_TILE_BLOCKS = 8
-_H_DEDUP_KEY_ROW = 20
-_MIN_HANDLE_LEN = 21
 
 
 def generate_deepseek_v3_routing(num_tokens):
@@ -159,22 +152,22 @@ def _worker(local_rank, world, args):
         l1_out, _, _, handle = dispatch_grouped_gemm_bf16_flydsl_kernel(
             x, w1, group, handle=None, topk_idx=topk_idx, topk_weights=topk_weight, layout="nt"
         )
-        # Fail loudly rather than silently reading the wrong tensor if the ABI moves.
-        if len(handle) < _MIN_HANDLE_LEN:
-            raise RuntimeError(f"handle has {len(handle)} entries, expected >= {_MIN_HANDLE_LEN}")
-        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
+        num_tile_blocks, _grouped_meta, dispatch_meta, combine_meta = handle
+        source_slot_kind = dispatch_meta[5]
+        dedup_key_row = combine_meta[4]
+        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=num_tile_blocks)
         del l1_out
         torch.cuda.synchronize()
-        active_rows = int(handle[_H_NUM_TILE_BLOCKS][0].item()) * POOL_BLOCK_M
+        active_rows = int(num_tile_blocks[0].item()) * POOL_BLOCK_M
 
         # Dedup's contract: combine pushes one row per (src_rank, src_token) that
         # dispatch sent, i.e. the exact inverse volume. Only the EP-wide sums are
         # comparable -- kind counts what this rank SENT, key_row what it pushes back
         # for what it RECEIVED, and those two sets differ per rank.
-        key_row = handle[_H_DEDUP_KEY_ROW].view(-1, K)
+        key_row = dedup_key_row.view(-1, K)
         volume = torch.tensor(
             [
-                int((handle[_H_SOURCE_SLOT_KIND] != 0).sum().item()),  # dispatch sent
+                int((source_slot_kind != 0).sum().item()),  # dispatch sent
                 int((key_row[:, 0] >= 0).sum().item()),  # combine pushes back
                 int((key_row >= 0).sum().item()),  # un-deduped combine would push
             ],

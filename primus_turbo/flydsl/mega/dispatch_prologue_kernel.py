@@ -45,22 +45,17 @@ def _make_dispatch_prologue(
     num_max_tokens_per_rank,
     grid_blocks=64,
     block_threads=256,
-    dedup=True,
 ):
     total_pairs = num_tokens * num_topk
     grid_stride = grid_blocks * block_threads
-    num_pool_blocks = num_max_pool_tokens // block_m
     c_buffer_bytes = num_ranks * num_experts * 4
     origin_buffer_bytes = num_max_pool_tokens * 4
     SCRATCH_SEND, SCRATCH_WITHIN = 0, num_experts
     SCRATCH_START, SCRATCH_SROFF, SCRATCH_POOLBASE = 2 * num_experts, 3 * num_experts, 4 * num_experts
-    num_keys, num_pool_blocks, num_slots, num_pool_rows = (
-        num_ranks * num_max_tokens_per_rank,
-        num_max_pool_tokens // block_m,
-        num_tokens * num_topk,
-        num_max_pool_tokens,
-    )
-    POOL_OOB = num_max_pool_tokens  # HW-dropped index (dedup resources are exactly sized)
+    # LDS: [0,E) per-block histogram, then the two folded per-expert write bases.
+    LDS_DST_BASE, LDS_SRC_BASE = num_experts, 2 * num_experts
+    num_keys = num_ranks * num_max_tokens_per_rank
+    num_pool_blocks = num_max_pool_tokens // block_m
 
     def _ext_i64(v):
         """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
@@ -72,7 +67,6 @@ def _make_dispatch_prologue(
         SCRATCH: fx.Tensor,
         sym_buffer: SymBuffer,
         EXPERT_SEND_DST_RANK: fx.Tensor,
-        EXPERT_SEND_DST_ROW: fx.Tensor,
         EXPERT_SEND_COUNT: fx.Tensor,
         EXPERT_SEND_OFFSET: fx.Tensor,
         TILE_TO_EXPERT: fx.Tensor,
@@ -85,11 +79,6 @@ def _make_dispatch_prologue(
         COMBINE_RECV_START_ROW: fx.Tensor,
         COMBINE_RECV_COUNT: fx.Tensor,
         SOURCE_SLOT_KIND: fx.Tensor,
-        DEDUP_SRC_ROW: fx.Tensor,
-        DUP_GROUPS: fx.Tensor,
-        DUP_LOFFS: fx.Tensor,
-        DUP_COUNTS: fx.Tensor,
-        TILE_COPY_EXPECTED: fx.Tensor,
         SORTED_DISPATCH_SLOT_IDS: fx.Tensor,
         DEDUP_KEY_ROW: fx.Tensor,
     ):
@@ -127,7 +116,6 @@ def _make_dispatch_prologue(
         scratch_resource = create_buffer_resource(SCRATCH, max_size=True)
         scratch_base = extract_base_index(SCRATCH, address_space=1)
         expert_send_dst_rank_resource = create_buffer_resource(EXPERT_SEND_DST_RANK, max_size=True)
-        expert_send_dst_row_resource = create_buffer_resource(EXPERT_SEND_DST_ROW, max_size=True)
         expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
         expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
         tile_to_expert_resource = create_buffer_resource(TILE_TO_EXPERT, max_size=True)
@@ -143,109 +131,84 @@ def _make_dispatch_prologue(
         my_origin_rank_resource = create_buffer_resource_from_addr(
             pool_src_rank_base, num_records_bytes=origin_buffer_bytes
         )
-        if fx.const_expr(dedup):
-            my_origin_slot_resource = create_buffer_resource_from_addr(
-                pool_src_slot_base, num_records_bytes=origin_buffer_bytes
-            )
-            # Exactly sized so the OOB sentinel indices below are dropped by the buffer hardware.
-            kind_resource = create_buffer_resource(SOURCE_SLOT_KIND, num_records_bytes=num_slots * 4)
-            src_row_resource = create_buffer_resource(DEDUP_SRC_ROW, num_records_bytes=num_pool_rows * 4)
-            groups_resource = create_buffer_resource(DUP_GROUPS, num_records_bytes=num_keys * 3 * 4)
-            loffs_resource = create_buffer_resource(DUP_LOFFS, num_records_bytes=num_pool_rows * 4)
-            counts_resource = create_buffer_resource(DUP_COUNTS, num_records_bytes=2 * 4)
-            tile_resource = create_buffer_resource(TILE_COPY_EXPECTED, num_records_bytes=num_pool_blocks * 4)
-            sorted_slot_resource = create_buffer_resource(
-                SORTED_DISPATCH_SLOT_IDS, num_records_bytes=num_pool_rows * 4
-            )
-            compact_pool_rows = num_ranks * num_max_tokens_per_rank + 1
-            compact_pool_resource = create_buffer_resource_from_addr(
-                dispatch_pool_base,
-                num_records_bytes=compact_pool_rows * hidden * 2,
-            )
-            key_row_resource = create_buffer_resource(
-                DEDUP_KEY_ROW, num_records_bytes=num_keys * num_topk * 4
-            )
-            counts_base = extract_base_index(DUP_COUNTS, address_space=1)
-            tile_base = extract_base_index(TILE_COPY_EXPECTED, address_space=1)
+        my_origin_slot_resource = create_buffer_resource_from_addr(
+            pool_src_slot_base, num_records_bytes=origin_buffer_bytes
+        )
+        kind_resource = create_buffer_resource(SOURCE_SLOT_KIND, num_records_bytes=total_pairs * 4)
+        sorted_slot_resource = create_buffer_resource(
+            SORTED_DISPATCH_SLOT_IDS, num_records_bytes=num_max_pool_tokens * 4
+        )
+        compact_pool_rows = num_ranks * num_max_tokens_per_rank + 1
+        compact_pool_resource = create_buffer_resource_from_addr(
+            dispatch_pool_base,
+            num_records_bytes=compact_pool_rows * hidden * 2,
+        )
+        key_row_resource = create_buffer_resource(DEDUP_KEY_ROW, num_records_bytes=num_keys * num_topk * 4)
         # combine recv-segment table: one (local_expert, source_rank) entry each
         combine_recv_dst_rank_resource = create_buffer_resource(COMBINE_RECV_DST_RANK, max_size=True)
         combine_recv_start_row_resource = create_buffer_resource(COMBINE_RECV_START_ROW, max_size=True)
         combine_recv_count_resource = create_buffer_resource(COMBINE_RECV_COUNT, max_size=True)
-        origin_init_index = block_index * fx.Int32(block_threads) + thread_index
-        while origin_init_index < fx.Int32(num_max_pool_tokens):
-            buffer_store(fx.Int32(-1), my_origin_rank_resource, origin_init_index)
-            origin_init_index = origin_init_index + fx.Int32(grid_stride)
-        # Init the per-pool-block expert table (sentinel = experts_per_rank for unused blocks).
+        # Init overlaps the barriers that gate the pool-side passes.
+        # One grid-stride sweep per distinct extent: pool rows, pool blocks, key table, pad row.
+        pool_row_init_index = block_index * fx.Int32(block_threads) + thread_index
+        while pool_row_init_index < fx.Int32(num_max_pool_tokens):
+            buffer_store(fx.Int32(-1), my_origin_rank_resource, pool_row_init_index)
+            buffer_store(
+                fx.Int32(num_ranks * num_max_tokens_per_rank),
+                sorted_slot_resource,
+                pool_row_init_index,
+            )
+            pool_row_init_index = pool_row_init_index + fx.Int32(grid_stride)
+        # tile_to_expert sentinel = experts_per_rank marks an unused block.
         pool_block_init_index = block_index * fx.Int32(block_threads) + thread_index
         while pool_block_init_index < fx.Int32(num_pool_blocks):
             buffer_store(fx.Int32(experts_per_rank), tile_to_expert_resource, pool_block_init_index)
             pool_block_init_index = pool_block_init_index + fx.Int32(grid_stride)
+        key_row_init_index = block_index * fx.Int32(block_threads) + thread_index
+        while key_row_init_index < fx.Int32(num_keys * num_topk):
+            buffer_store(fx.Int32(-1), key_row_resource, key_row_init_index)
+            key_row_init_index = key_row_init_index + fx.Int32(grid_stride)
+        pad_word = block_index * fx.Int32(block_threads) + thread_index
+        while pad_word < fx.Int32(hidden // 2):
+            buffer_store(
+                fx.Int32(0),
+                compact_pool_resource,
+                fx.Int32(num_ranks * num_max_tokens_per_rank * (hidden // 2)) + pad_word,
+            )
+            pad_word = pad_word + fx.Int32(grid_stride)
 
-        if fx.const_expr(dedup):
-            # Dedup init; overlaps the barriers that gate the pool-side passes.
-            key_row_init_index = block_index * fx.Int32(block_threads) + thread_index
-            while key_row_init_index < fx.Int32(num_keys * num_topk):
-                buffer_store(fx.Int32(-1), key_row_resource, key_row_init_index)
-                key_row_init_index = key_row_init_index + fx.Int32(grid_stride)
-            src_row_init_index = block_index * fx.Int32(block_threads) + thread_index
-            while src_row_init_index < fx.Int32(num_max_pool_tokens):
-                buffer_store(fx.Int32(-1), src_row_resource, src_row_init_index)
-                buffer_store(
-                    fx.Int32(num_ranks * num_max_tokens_per_rank),
-                    sorted_slot_resource,
-                    src_row_init_index,
-                )
-                src_row_init_index = src_row_init_index + fx.Int32(grid_stride)
-            pad_word = block_index * fx.Int32(block_threads) + thread_index
-            while pad_word < fx.Int32(hidden // 2):
-                buffer_store(
-                    fx.Int32(0),
-                    compact_pool_resource,
-                    fx.Int32(num_ranks * num_max_tokens_per_rank * (hidden // 2)) + pad_word,
-                )
-                pad_word = pad_word + fx.Int32(grid_stride)
-            tile_init_index = block_index * fx.Int32(block_threads) + thread_index
-            while tile_init_index < fx.Int32(num_pool_blocks):
-                buffer_store(fx.Int32(0), tile_resource, tile_init_index)
-                tile_init_index = tile_init_index + fx.Int32(grid_stride)
-            if block_index == fx.Int32(0):
-                if thread_index < fx.Int32(2):
-                    buffer_store(fx.Int32(0), counts_resource, thread_index)
-
-            # source_slot_kind: 0 duplicate route, 1 lone primary, 2 primary with duplicates.
-            kind_token_index = block_index * fx.Int32(block_threads) + thread_index
-            while kind_token_index < fx.Int32(num_tokens):
-                slot_base = kind_token_index * fx.Int32(num_topk)
-                slot_valid, slot_rank, slot_expert_id = [], [], []
-                for slot in fx.range_constexpr(num_topk):
-                    slot_expert = load_expert_id(slot_base + fx.Int32(slot))
-                    slot_valid.append(slot_expert >= fx.Int32(0))
-                    slot_rank.append(slot_expert // fx.Int32(experts_per_rank))
-                    slot_expert_id.append(slot_expert)
-                for slot in fx.range_constexpr(num_topk):
-                    # Fully unrolled pairwise compare; no traced control flow here.
-                    same = []
-                    for other in fx.range_constexpr(num_topk):
-                        same.append(
-                            slot_valid[other] & slot_valid[slot] & (slot_rank[other] == slot_rank[slot])
+        # source_slot_kind: 0 duplicate route, 1 lone primary, 2 primary with duplicates.
+        kind_token_index = block_index * fx.Int32(block_threads) + thread_index
+        while kind_token_index < fx.Int32(num_tokens):
+            slot_base = kind_token_index * fx.Int32(num_topk)
+            slot_valid, slot_rank, slot_expert_id = [], [], []
+            for slot in fx.range_constexpr(num_topk):
+                slot_expert = load_expert_id(slot_base + fx.Int32(slot))
+                slot_valid.append(slot_expert >= fx.Int32(0))
+                slot_rank.append(slot_expert // fx.Int32(experts_per_rank))
+                slot_expert_id.append(slot_expert)
+            for slot in fx.range_constexpr(num_topk):
+                # Fully unrolled pairwise compare; no traced control flow here.
+                same = []
+                for other in fx.range_constexpr(num_topk):
+                    same.append(slot_valid[other] & slot_valid[slot] & (slot_rank[other] == slot_rank[slot]))
+                # Primary = smallest expert id in the group. Route rows are
+                # expert-sorted, so this makes the writer of a token's unique
+                # slot the lowest expert that reads it -- which is what lets a
+                # GEMM tile wait on a prefix of experts instead of all of them.
+                is_primary = slot_valid[slot]
+                for other in fx.range_constexpr(num_topk):
+                    if other != slot:
+                        is_primary = is_primary & ~(
+                            same[other] & (slot_expert_id[other] < slot_expert_id[slot])
                         )
-                    # Primary = smallest expert id in the group. Route rows are
-                    # expert-sorted, so this makes the writer of a token's unique
-                    # slot the lowest expert that reads it -- which is what lets a
-                    # GEMM tile wait on a prefix of experts instead of all of them.
-                    is_primary = slot_valid[slot]
-                    for other in fx.range_constexpr(num_topk):
-                        if other != slot:
-                            is_primary = is_primary & ~(
-                                same[other] & (slot_expert_id[other] < slot_expert_id[slot])
-                            )
-                    kind = fx.Int32(1)
-                    for other in fx.range_constexpr(num_topk):
-                        if other != slot:
-                            kind = fx.arith.select(same[other], fx.Int32(2), kind)
-                    kind = fx.arith.select(is_primary, kind, fx.Int32(0))
-                    buffer_store(kind, kind_resource, slot_base + fx.Int32(slot))
-                kind_token_index = kind_token_index + fx.Int32(grid_stride)
+                kind = fx.Int32(1)
+                for other in fx.range_constexpr(num_topk):
+                    if other != slot:
+                        kind = fx.arith.select(same[other], fx.Int32(2), kind)
+                kind = fx.arith.select(is_primary, kind, fx.Int32(0))
+                buffer_store(kind, kind_resource, slot_base + fx.Int32(slot))
+            kind_token_index = kind_token_index + fx.Int32(grid_stride)
 
         lds_clear_index = thread_index
         while lds_clear_index < fx.Int32(num_experts):
@@ -353,11 +316,7 @@ def _make_dispatch_prologue(
                 local_expert_index = comm_task_index // fx.Int32(num_ranks)
                 expert_id = destination_rank * fx.Int32(experts_per_rank) + local_expert_index
                 count_value = ld(expert_count_base, fx.Int32(rank * num_experts) + expert_id, scope="sys")
-                start_value = buffer_load(
-                    scratch_resource, fx.Int32(SCRATCH_START) + expert_id, vec_width=1, dtype=fx.T.i32()
-                )
                 buffer_store(destination_rank, expert_send_dst_rank_resource, comm_task_index)
-                buffer_store(start_value, expert_send_dst_row_resource, comm_task_index)
                 buffer_store(count_value, expert_send_count_resource, comm_task_index)
                 comm_task_index = comm_task_index + fx.Int32(block_threads)
             fx.gpu.barrier()
@@ -436,6 +395,8 @@ def _make_dispatch_prologue(
         grid_sync(workspace, thread_index, block_index, grid_blocks, rank, "dispatch_prologue/C:table-built")
 
         # Reuse Phase A's per-block histogram in LDS (untouched by barriers) -- skip clear + recount.
+        # Fold the per-expert scratch bases into the reservation once, so the pair loop below
+        # is two LDS reads instead of two global loads plus a separate within-expert add.
         reserve_index = thread_index
         while reserve_index < fx.Int32(num_experts):
             block_expert_count = ld(lds_base, reserve_index, scope="workgroup", space=3)
@@ -447,10 +408,23 @@ def _make_dispatch_prologue(
                     "agent",
                     1,
                 )
+                expert_start = buffer_load(
+                    scratch_resource, fx.Int32(SCRATCH_START) + reserve_index, vec_width=1, dtype=fx.T.i32()
+                )
+                expert_source_offset = buffer_load(
+                    scratch_resource, fx.Int32(SCRATCH_SROFF) + reserve_index, vec_width=1, dtype=fx.T.i32()
+                )
                 st(
                     lds_base,
-                    fx.Int32(num_experts) + reserve_index,
-                    reserved_base,
+                    fx.Int32(LDS_DST_BASE) + reserve_index,
+                    expert_start + reserved_base,
+                    scope="workgroup",
+                    space=3,
+                )
+                st(
+                    lds_base,
+                    fx.Int32(LDS_SRC_BASE) + reserve_index,
+                    expert_source_offset + reserved_base,
                     scope="workgroup",
                     space=3,
                 )
@@ -461,32 +435,17 @@ def _make_dispatch_prologue(
         while pair_index < fx.Int32(total_pairs):
             expert_id = load_expert_id(pair_index)
             if expert_id >= fx.Int32(0):
-                token_index = pair_index // fx.Int32(num_topk)
-                topk_slot = pair_index % fx.Int32(num_topk)
                 local_position = atomic_add(lds_base, expert_id, fx.Int32(1), "workgroup", 3)
-                within_expert_position = (
-                    ld(lds_base, fx.Int32(num_experts) + expert_id, scope="workgroup", space=3)
+                destination_row = (
+                    ld(lds_base, fx.Int32(LDS_DST_BASE) + expert_id, scope="workgroup", space=3)
                     + local_position
                 )
-                expert_start = buffer_load(
-                    scratch_resource, fx.Int32(SCRATCH_START) + expert_id, vec_width=1, dtype=fx.T.i32()
+                buffer_store(
+                    pair_index,
+                    dispatched_token_idx_resource,
+                    ld(lds_base, fx.Int32(LDS_SRC_BASE) + expert_id, scope="workgroup", space=3)
+                    + local_position,
                 )
-                expert_source_offset = buffer_load(
-                    scratch_resource, fx.Int32(SCRATCH_SROFF) + expert_id, vec_width=1, dtype=fx.T.i32()
-                )
-                destination_row = expert_start + within_expert_position
-                if fx.const_expr(dedup):
-                    buffer_store(
-                        pair_index,
-                        dispatched_token_idx_resource,
-                        expert_source_offset + within_expert_position,
-                    )
-                else:
-                    buffer_store(
-                        token_index,
-                        dispatched_token_idx_resource,
-                        expert_source_offset + within_expert_position,
-                    )
                 routing_weight = buffer_load(topk_weight_resource, pair_index, vec_width=1, dtype=fx.T.f32())
                 destination_rank = expert_id // fx.Int32(experts_per_rank)
                 # Symmetric buffers on the destination rank.
@@ -503,11 +462,8 @@ def _make_dispatch_prologue(
                     num_records_bytes=origin_buffer_bytes,
                 )
                 buffer_store(fx.Int32(rank), peer_origin_rank_resource, destination_row)
-                buffer_store(
-                    token_index * fx.Int32(num_topk) + topk_slot,
-                    peer_origin_slot_resource,
-                    destination_row,
-                )
+                # pair_index == token_index * num_topk + topk_slot
+                buffer_store(pair_index, peer_origin_slot_resource, destination_row)
                 buffer_store(routing_weight, peer_weight_resource, destination_row)
             pair_index = pair_index + fx.Int32(grid_stride)
 
@@ -530,130 +486,66 @@ def _make_dispatch_prologue(
             "dispatch_prologue/E:origins-landed",
         )
 
-        if fx.const_expr(dedup):
-            # xgmi_barrier only stalls block 0; every block must see the peer origin writes.
-            grid_sync(
-                workspace,
-                thread_index,
-                block_index,
-                grid_blocks,
-                rank,
-                "dispatch_prologue/F0:origins-visible",
-            )
+        # xgmi_barrier only stalls block 0; every block must see the peer origin writes.
+        grid_sync(
+            workspace,
+            thread_index,
+            block_index,
+            grid_blocks,
+            rank,
+            "dispatch_prologue/F0:origins-visible",
+        )
 
-            # Pool scan: key_row[(src_rank * T + src_token) * num_topk + src_k] = pool row.
-            scan_row = block_index * fx.Int32(block_threads) + thread_index
-            while scan_row < fx.Int32(num_max_pool_tokens):
-                source_rank_value = buffer_load(
-                    my_origin_rank_resource, scan_row, vec_width=1, dtype=fx.T.i32()
+        # Pool scan: key_row[(src_rank * T + src_token) * num_topk + src_k] = pool row.
+        scan_row = block_index * fx.Int32(block_threads) + thread_index
+        while scan_row < fx.Int32(num_max_pool_tokens):
+            source_rank_value = buffer_load(my_origin_rank_resource, scan_row, vec_width=1, dtype=fx.T.i32())
+            if source_rank_value >= fx.Int32(0):
+                source_slot_value = buffer_load(
+                    my_origin_slot_resource, scan_row, vec_width=1, dtype=fx.T.i32()
                 )
-                if source_rank_value >= fx.Int32(0):
-                    source_slot_value = buffer_load(
-                        my_origin_slot_resource, scan_row, vec_width=1, dtype=fx.T.i32()
-                    )
-                    source_key = source_rank_value * fx.Int32(
-                        num_max_tokens_per_rank
-                    ) + source_slot_value // fx.Int32(num_topk)
-                    buffer_store(source_key, sorted_slot_resource, scan_row)
-                    buffer_store(
-                        scan_row,
-                        key_row_resource,
-                        source_key * fx.Int32(num_topk) + source_slot_value % fx.Int32(num_topk),
-                    )
-                scan_row = scan_row + fx.Int32(grid_stride)
+                source_key = source_rank_value * fx.Int32(
+                    num_max_tokens_per_rank
+                ) + source_slot_value // fx.Int32(num_topk)
+                buffer_store(source_key, sorted_slot_resource, scan_row)
+                buffer_store(
+                    scan_row,
+                    key_row_resource,
+                    source_key * fx.Int32(num_topk) + source_slot_value % fx.Int32(num_topk),
+                )
+            scan_row = scan_row + fx.Int32(grid_stride)
 
-            grid_sync(
-                workspace,
-                thread_index,
-                block_index,
-                grid_blocks,
-                rank,
-                "dispatch_prologue/F1:key-table-built",
-            )
+        grid_sync(
+            workspace,
+            thread_index,
+            block_index,
+            grid_blocks,
+            rank,
+            "dispatch_prologue/F1:key-table-built",
+        )
 
-            # One thread per source token: fold its routes on this rank into a dedup group.
-            key_index = block_index * fx.Int32(block_threads) + thread_index
-            while key_index < fx.Int32(num_keys):
-                key_base = key_index * fx.Int32(num_topk)
-                key_rows = []
-                for slot in fx.range_constexpr(num_topk):
-                    key_rows.append(
-                        buffer_load(
-                            key_row_resource, key_base + fx.Int32(slot), vec_width=1, dtype=fx.T.i32()
-                        )
-                    )
-                route_count = fx.Int32(0)
-                for slot in fx.range_constexpr(num_topk):
-                    route_count = route_count + fx.arith.select(
-                        key_rows[slot] >= fx.Int32(0), fx.Int32(1), fx.Int32(0)
-                    )
-                # Lowest valid route row wins. Rows are expert-sorted, so this is the
-                # group's smallest expert -- the same primary source_slot_kind picks.
-                primary_row = fx.Int32(-1)
-                for slot in fx.range_constexpr(num_topk):
-                    row_value = key_rows[slot]
-                    take = (row_value >= fx.Int32(0)) & (
-                        (primary_row < fx.Int32(0)) | (row_value < primary_row)
-                    )
-                    primary_row = fx.arith.select(take, row_value, primary_row)
-
-                # Compact the member list in place, descending by row (-1 sinks to the tail).
-                # Combine-dedup reads slot 0 as the pusher and the last valid slot as primary;
-                # the fixed order also makes the send-side reduction bit-reproducible.
-                member_rows = list(key_rows)
-                for upper in fx.range_constexpr(num_topk - 1):
-                    for slot in fx.range_constexpr(num_topk - 1 - upper):
-                        left = member_rows[slot]
-                        right = member_rows[slot + 1]
-                        swap = right > left
-                        member_rows[slot] = fx.arith.select(swap, right, left)
-                        member_rows[slot + 1] = fx.arith.select(swap, left, right)
-                for slot in fx.range_constexpr(num_topk):
-                    buffer_store(member_rows[slot], key_row_resource, key_base + fx.Int32(slot))
-
-                if route_count > fx.Int32(1):
-                    group_index = atomic_add(counts_base, fx.Int32(0), fx.Int32(1), "agent", 1)
-                    duplicate_start = atomic_add(
-                        counts_base, fx.Int32(1), route_count - fx.Int32(1), "agent", 1
-                    )
-                    group_base = group_index * fx.Int32(3)
-                    buffer_store(primary_row, groups_resource, group_base)
-                    buffer_store(duplicate_start, groups_resource, group_base + fx.Int32(1))
-                    buffer_store(route_count - fx.Int32(1), groups_resource, group_base + fx.Int32(2))
-
-                    duplicate_ordinal = fx.Int32(0)
-                    for slot in fx.range_constexpr(num_topk):
-                        member_row = key_rows[slot]
-                        is_member = member_row >= fx.Int32(0)
-                        is_duplicate = is_member & (member_row != primary_row)
-                        # OOB index nullifies the store for absent slots (arena is exactly sized).
-                        buffer_store(
-                            primary_row,
-                            src_row_resource,
-                            fx.arith.select(is_member, member_row, fx.Int32(POOL_OOB)),
-                        )
-                        buffer_store(
-                            member_row,
-                            loffs_resource,
-                            fx.arith.select(
-                                is_duplicate, duplicate_start + duplicate_ordinal, fx.Int32(POOL_OOB)
-                            ),
-                        )
-                        # One expected copy per (group, distinct tile) over the duplicates.
-                        member_tile = member_row // fx.Int32(block_m)
-                        first_in_tile = is_duplicate
-                        for earlier in fx.range_constexpr(slot):
-                            earlier_row = key_rows[earlier]
-                            earlier_duplicate = (earlier_row >= fx.Int32(0)) & (earlier_row != primary_row)
-                            first_in_tile = first_in_tile & ~(
-                                earlier_duplicate & (earlier_row // fx.Int32(block_m) == member_tile)
-                            )
-                        if first_in_tile:
-                            atomic_add(tile_base, member_tile, fx.Int32(1), "agent", 1)
-                        duplicate_ordinal = duplicate_ordinal + fx.arith.select(
-                            is_duplicate, fx.Int32(1), fx.Int32(0)
-                        )
-                key_index = key_index + fx.Int32(grid_stride)
+        # One thread per source token: sort its routes on this rank into the group order
+        # combine-dedup expects -- descending by row, so -1 sinks to the tail. Combine reads
+        # slot 0 as the pusher and the last valid slot as primary; the fixed order also
+        # makes the send-side reduction bit-reproducible.
+        key_index = block_index * fx.Int32(block_threads) + thread_index
+        while key_index < fx.Int32(num_keys):
+            key_base = key_index * fx.Int32(num_topk)
+            member_rows = []
+            for slot in fx.range_constexpr(num_topk):
+                member_rows.append(
+                    buffer_load(key_row_resource, key_base + fx.Int32(slot), vec_width=1, dtype=fx.T.i32())
+                )
+            for upper in fx.range_constexpr(num_topk - 1):
+                for slot in fx.range_constexpr(num_topk - 1 - upper):
+                    left = member_rows[slot]
+                    right = member_rows[slot + 1]
+                    swap = right > left
+                    member_rows[slot] = fx.arith.select(swap, right, left)
+                    member_rows[slot + 1] = fx.arith.select(swap, left, right)
+            for slot in fx.range_constexpr(num_topk):
+                buffer_store(member_rows[slot], key_row_resource, key_base + fx.Int32(slot))
+            key_index = key_index + fx.Int32(grid_stride)
 
     # Return the raw KernelFunction; the @flyc.jit launcher below drives launch.
     return dispatch_prologue_kernel
@@ -673,8 +565,8 @@ def get_dispatch_prologue_scratch(num_experts, device="cuda"):
 
 @autotune(
     configs=[
-        Config(num_cu=num_cu, num_threads=num_threads)
-        for num_cu, num_threads in itertools.product((32, 64, 96), (256, 512, 1024))
+        Config(num_blocks=num_blocks, num_threads=num_threads)
+        for num_blocks, num_threads in itertools.product((32, 64, 96), (256, 512, 1024))
     ],
     rep=5,
     # Retune per shape; topk_idx dtype auto-joins the key via the tensor arg.
@@ -687,7 +579,6 @@ def get_dispatch_prologue_scratch(num_experts, device="cuda"):
         "experts_per_rank",
         "block_m",
         "num_max_pool_tokens",
-        "dedup",
     ],
 )
 @flyc.jit
@@ -696,7 +587,6 @@ def _compiled_dispatch_prologue(
     scratch,
     sym_buffer,
     expert_send_dst_rank,
-    expert_send_dst_row,
     expert_send_count,
     expert_send_offset,
     tile_to_expert,
@@ -709,11 +599,6 @@ def _compiled_dispatch_prologue(
     combine_recv_start_row,
     combine_recv_count,
     source_slot_kind,
-    dedup_src_row,
-    dup_groups,
-    dup_loffs,
-    dup_counts,
-    tile_copy_expected,
     sorted_dispatch_slot_ids,
     dedup_key_row,
     num_tokens: fx.Constexpr[int],
@@ -726,8 +611,7 @@ def _compiled_dispatch_prologue(
     num_max_pool_tokens: fx.Constexpr[int],
     hidden: fx.Constexpr[int],
     num_max_tokens_per_rank: fx.Constexpr[int],
-    dedup: fx.Constexpr[int],
-    num_cu: fx.Constexpr[int],
+    num_blocks: fx.Constexpr[int],
     num_threads: fx.Constexpr[int],
     stream: fx.Stream,
 ):
@@ -742,16 +626,14 @@ def _compiled_dispatch_prologue(
         num_max_pool_tokens,
         hidden,
         num_max_tokens_per_rank,
-        grid_blocks=num_cu,
+        grid_blocks=num_blocks,
         block_threads=num_threads,
-        dedup=bool(dedup),
     )
     kernel(
         topk_idx_flat,
         scratch,
         sym_buffer,
         expert_send_dst_rank,
-        expert_send_dst_row,
         expert_send_count,
         expert_send_offset,
         tile_to_expert,
@@ -764,19 +646,21 @@ def _compiled_dispatch_prologue(
         combine_recv_start_row,
         combine_recv_count,
         source_slot_kind,
-        dedup_src_row,
-        dup_groups,
-        dup_loffs,
-        dup_counts,
-        tile_copy_expected,
         sorted_dispatch_slot_ids,
         dedup_key_row,
     ).launch(
-        grid=(num_cu, 1, 1),
+        grid=(num_blocks, 1, 1),
         block=(num_threads, 1, 1),
         stream=stream,
-        smem=2 * num_experts * 4,
+        smem=3 * num_experts * 4,
     )
+
+
+# handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta):
+#   grouped_meta  = (num_tokens_per_expert_prefix, real_count_per_expert, sorted_slot_ids)
+#   dispatch_meta = (send_dst_rank, send_count, send_offset, dispatched_token_idx,
+#                    tile_to_expert, source_slot_kind)
+#   combine_meta  = (recv_dst_rank, recv_start_row, recv_count, pool_src_slot, dedup_key_row)
 
 
 def dispatch_prologue_flydsl_kernel(
@@ -794,7 +678,6 @@ def dispatch_prologue_flydsl_kernel(
     num_max_pool_tokens,
     hidden,
     num_max_tokens_per_rank,
-    dedup=True,
 ):
     if topk_idx.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"topk_idx must be int32 or int64, got {topk_idx.dtype}")
@@ -804,7 +687,6 @@ def dispatch_prologue_flydsl_kernel(
 
     num_max_blocks = num_max_pool_tokens // block_m
     expert_send_dst_rank = torch.empty(num_experts, dtype=torch.int32, device=dev)
-    expert_send_dst_row = torch.empty(num_experts, dtype=torch.int32, device=dev)
     expert_send_count = torch.empty(num_experts, dtype=torch.int32, device=dev)
     expert_send_offset = torch.empty(num_experts, dtype=torch.int32, device=dev)
     tile_to_expert = torch.empty(num_max_blocks, dtype=torch.int32, device=dev)
@@ -821,22 +703,11 @@ def dispatch_prologue_flydsl_kernel(
         topk_weight_flat = torch.zeros(num_tokens * num_topk, dtype=torch.float32, device=dev)
 
     # Dedup outputs are separate allocations: they ride a torch custom-op return, which
-    # rejects outputs aliasing each other. Sized to 1 when dedup is off (operand must exist).
-    num_keys, num_pool_blocks, num_slots, num_pool_rows = (
-        num_ranks * num_max_tokens_per_rank,
-        num_max_pool_tokens // block_m,
-        num_tokens * num_topk,
-        num_max_pool_tokens,
-    )
-    dedup_empty = lambda n: torch.empty(n if dedup else 1, dtype=torch.int32, device=dev)  # noqa: E731
-    source_slot_kind = dedup_empty(num_slots)
-    dedup_src_row = dedup_empty(num_pool_rows)
-    dup_groups = dedup_empty(num_keys * 3)
-    dup_loffs = dedup_empty(num_pool_rows)
-    dup_counts = dedup_empty(2)
-    tile_copy_expected = dedup_empty(num_pool_blocks)
-    sorted_dispatch_slot_ids = dedup_empty(num_pool_rows)
-    dedup_key_row = dedup_empty(num_keys * num_topk)
+    # rejects outputs aliasing each other.
+    num_keys = num_ranks * num_max_tokens_per_rank
+    source_slot_kind = torch.empty(num_tokens * num_topk, dtype=torch.int32, device=dev)
+    sorted_dispatch_slot_ids = torch.empty(num_max_pool_tokens, dtype=torch.int32, device=dev)
+    dedup_key_row = torch.empty(num_keys * num_topk, dtype=torch.int32, device=dev)
 
     stream = torch.cuda.current_stream()
     _compiled_dispatch_prologue(
@@ -844,7 +715,6 @@ def dispatch_prologue_flydsl_kernel(
         scratch=scratch,
         sym_buffer=sym_buffer,
         expert_send_dst_rank=expert_send_dst_rank,
-        expert_send_dst_row=expert_send_dst_row,
         expert_send_count=expert_send_count,
         expert_send_offset=expert_send_offset,
         tile_to_expert=tile_to_expert,
@@ -857,11 +727,6 @@ def dispatch_prologue_flydsl_kernel(
         combine_recv_start_row=combine_recv_start_row,
         combine_recv_count=combine_recv_count,
         source_slot_kind=source_slot_kind,
-        dedup_src_row=dedup_src_row,
-        dup_groups=dup_groups,
-        dup_loffs=dup_loffs,
-        dup_counts=dup_counts,
-        tile_copy_expected=tile_copy_expected,
         sorted_dispatch_slot_ids=sorted_dispatch_slot_ids,
         dedup_key_row=dedup_key_row,
         num_tokens=num_tokens,
@@ -874,40 +739,23 @@ def dispatch_prologue_flydsl_kernel(
         num_max_pool_tokens=num_max_pool_tokens,
         hidden=hidden,
         num_max_tokens_per_rank=num_max_tokens_per_rank,
-        dedup=int(bool(dedup)),
         stream=stream,
     )
-    # Handle ABI (indices consumed by fwd combine + bwd dispatch/combine):
-    #   0 expert_send_dst_rank   1 expert_send_dst_row   2 expert_send_count
-    #   3 expert_send_offset     4 dispatched_token_idx  5 tile_to_expert
-    #   6 real_count_per_expert  7 num_tokens_per_expert_prefix  8 num_tile_blocks
-    #   9 combine_recv_dst_rank  10 combine_recv_start_row  11 combine_recv_count
-    # (12 pool_src_slot is appended by the dispatch launcher on the forward path.)
-    #   12.. source_slot_kind, dedup_src_row, dup_groups, dup_loffs, dup_counts,
-    #        tile_copy_expected, sorted_dispatch_slot_ids, dedup_key_row.
-    prologue = (
+
+    grouped_meta = (num_tokens_per_expert_prefix, num_tokens_per_expert, sorted_dispatch_slot_ids)
+    dispatch_meta = (
         expert_send_dst_rank,
-        expert_send_dst_row,
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
         tile_to_expert,
-        num_tokens_per_expert,
-        num_tokens_per_expert_prefix,
-        num_tile_blocks,
+        source_slot_kind,
+    )
+    combine_meta = (
         combine_recv_dst_rank,
         combine_recv_start_row,
         combine_recv_count,
-    )
-    if not dedup:
-        return prologue
-    return prologue + (
-        source_slot_kind,
-        dedup_src_row,
-        dup_groups.view(num_keys, 3),
-        dup_loffs,
-        dup_counts,
-        tile_copy_expected,
-        sorted_dispatch_slot_ids,
+        None,  # pool_src_slot
         dedup_key_row,
     )
+    return num_tile_blocks, grouped_meta, dispatch_meta, combine_meta

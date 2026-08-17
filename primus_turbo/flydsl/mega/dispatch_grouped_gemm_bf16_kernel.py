@@ -31,7 +31,7 @@ from primus_turbo.flydsl.mega.ep_intranode import (
     _BLOCK_THREADS,
     dispatch_bf16_tile,
 )
-from primus_turbo.flydsl.mega.prims import cast, ld, read_clock, spin_timed_out
+from primus_turbo.flydsl.mega.prims import cast, ld
 from primus_turbo.flydsl.mega.symm_buffer import (
     DISPATCH_CHUNK_BANK,
     TOKEN_DTYPE,
@@ -55,13 +55,12 @@ def get_dummy_tensor(device):
     return torch.empty(1, dtype=torch.int32, device=device)
 
 
-# Expert-ordered dispatch: every comm CU pushes one expert at a time, chunked row-wise
-# across its num_ranks tasks (one per peer link, so all links stay busy). The gate consumes
-# experts in order, so round-robin task hand-out left all local experts advancing together
-# and none complete until the whole first push wave was -- the link is saturated either way,
-# only the delivery ORDER was wrong. Worth -4.5% nt / -4.6% nn / -2.2% tn.
-# Kept as the only comm schedule; round-robin survives below purely as the fallback for
-# shapes the chunked form cannot express. See docs/mega_moe_gate_optimization.md.
+# Expert-ordered dispatch, the only comm schedule: every comm block pushes one expert at a
+# time, chunked row-wise across its num_ranks tasks (one per peer link, so all links stay
+# busy). The gate consumes experts in order, so the old round-robin hand-out advanced all
+# local experts together and completed none until the first push wave was done -- the link
+# is saturated either way, only the delivery ORDER was wrong. Worth -4.5% nt / -4.6% nn /
+# -2.2% tn. See docs/mega_moe_gate_optimization.md.
 
 
 @functools.lru_cache(maxsize=256)
@@ -71,7 +70,6 @@ def _make_kernel(
     num_max_pool_tokens,
     BLOCK_M,
     BLOCK_N,
-    num_dispatch_cu,
     num_comm,
     nt_vmcnt=3,
     out_fp16=False,
@@ -108,21 +106,20 @@ def _make_kernel(
         worst_case_tiles = num_max_pool_tokens // BLOCK_M
     NPB = num_max_pool_tokens // BLOCK_M
     # expert-ready poll uses one thread per local expert
-    assert num_ranks == 0 or num_experts // num_ranks <= _BLOCK_THREADS
-    # Expert-ordered comm role: num_ranks tasks per expert, one per peer link, each split
-    # row-wise across ordered_chunks CUs. Needs at least one CU per link and an
-    # expert-major task list; otherwise fall back to round-robin.
-    ordered_chunks = num_dispatch_cu // num_ranks if num_ranks > 0 else 0
-    if num_comm % max(num_ranks, 1) != 0:
-        ordered_chunks = 0
-    ordered_cu = ordered_chunks * num_ranks
-    num_local_experts = num_comm // num_ranks if num_ranks else 0
-    # One rendezvous bank per layout: nt/nn/tn tune to different CU splits, so they must
+    assert num_ranks > 0, "expert-ordered dispatch needs num_ranks > 0"
+    assert num_experts // num_ranks <= _BLOCK_THREADS, "one poll thread per local expert"
+    # Comm role: num_ranks tasks per expert, one per peer link, each split row-wise across
+    # chunks_per_link blocks. The chunk count is runtime (it follows the tuned block split).
+    assert num_comm % num_ranks == 0, "num_comm must be a multiple of num_ranks"
+    assert num_comm <= DISPATCH_CHUNK_BANK, "num_comm exceeds the rendezvous bank"
+    num_local_experts = num_comm // num_ranks
+    num_max_dispatch_blocks = max(
+        config.kwargs["num_dispatch_blocks"] for config in _compiled_dispatch_grouped_gemm.configs
+    )
+
+    # One rendezvous bank per layout: nt/nn/tn tune to different block splits, so they must
     # not share a counter slot (see DISPATCH_CHUNK_BANK).
     chunk_bank = ("nt", "nn", "tn").index(layout) * DISPATCH_CHUNK_BANK
-    if num_comm > DISPATCH_CHUNK_BANK:
-        ordered_chunks, ordered_cu = 0, 0
-    gemm_base = num_dispatch_cu
     # Poll backoff, in s_sleep units. Flat over a 16x range (8 to 127), which is a second
     # proof that this gate is data lag and not poll contention.
     wait_sleep = 64
@@ -145,13 +142,20 @@ def _make_kernel(
         c_n: fx.Int32,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
+        num_dispatch_blocks: fx.Int32,
         DISP_PARITY: fx.Tensor,
         DISP_EXPECTED: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
-        comm_block_count = fx.Int32(num_dispatch_cu)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        # Only the reserved comm blocks exist; a wider split would corrupt the role
+        # boundary. Clamped here (not host-side) because the split is a runtime value.
+        num_dispatch_blocks = arith.select(
+            num_dispatch_blocks < fx.Int32(num_max_dispatch_blocks),
+            num_dispatch_blocks,
+            fx.Int32(num_max_dispatch_blocks),
+        )
         # build the layout from explicit dims (bf16 path -> TOKEN_DTYPE), then hoist region
         # pointers before dynamic branches (rewriter can't carry SymBuffer/Workspace)
         workspace = Workspace(
@@ -189,39 +193,18 @@ def _make_kernel(
             # tn reuses TILE_TO_GROUP to carry per-expert REAL token counts (K bound)
             real_count_resource = group_resource
 
-        if block_index < fx.Int32(gemm_base):
-            if const_expr(ordered_chunks > 0):
-                # Expert-ordered: every comm CU walks experts in gate order.
-                if block_index < fx.Int32(ordered_cu):
-                    link_slot = block_index % fx.Int32(num_ranks)
-                    chunk_id = block_index // fx.Int32(num_ranks)
-                    for expert_iteration in range(fx.Int32(num_local_experts)):
-                        dispatch_bf16_tile(
-                            sym_buffer,
-                            workspace,
-                            thread_index=thread_index,
-                            hidden_size=hidden_size,
-                            input_res=input_resource,
-                            expert_send_dst_rank_res=expert_send_dst_rank_resource,
-                            expert_send_count_res=expert_send_count_resource,
-                            expert_send_offset_res=expert_send_offset_resource,
-                            dispatched_token_idx_res=dispatched_token_idx_resource,
-                            source_slot_kind_res=source_slot_kind_resource,
-                            task_index=expert_iteration * fx.Int32(num_ranks) + link_slot,
-                            signal=True,
-                            disp_parity=disp_parity,
-                            num_ranks=num_ranks,
-                            num_topk=num_topk,
-                            source_rank=rank,
-                            chunk_index=chunk_id,
-                            num_chunks=ordered_chunks,
-                            chunk_bank=chunk_bank,
-                        )
-            else:
-                local_task_count = (
-                    fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
-                ) // comm_block_count
-                for task_iteration in range(local_task_count):
+        if block_index < fx.Int32(num_max_dispatch_blocks):
+            # Every comm block walks experts in gate order.
+            # Clamp to one chunk per link so an undersized split still covers every link.
+            chunks_per_link_raw = num_dispatch_blocks // fx.Int32(num_ranks)
+            chunks_per_link = arith.select(
+                chunks_per_link_raw < fx.Int32(1), fx.Int32(1), chunks_per_link_raw
+            )
+            active_comm_blocks = chunks_per_link * fx.Int32(num_ranks)
+            if block_index < active_comm_blocks:
+                link_slot = block_index % fx.Int32(num_ranks)
+                chunk_id = block_index // fx.Int32(num_ranks)
+                for expert_idx in range(fx.Int32(num_local_experts)):
                     dispatch_bf16_tile(
                         sym_buffer,
                         workspace,
@@ -233,15 +216,18 @@ def _make_kernel(
                         expert_send_offset_res=expert_send_offset_resource,
                         dispatched_token_idx_res=dispatched_token_idx_resource,
                         source_slot_kind_res=source_slot_kind_resource,
-                        task_index=block_index + task_iteration * comm_block_count,
+                        task_index=expert_idx * fx.Int32(num_ranks) + link_slot,
                         signal=True,
                         disp_parity=disp_parity,
                         num_ranks=num_ranks,
                         num_topk=num_topk,
                         source_rank=rank,
+                        chunk_index=chunk_id,
+                        num_chunks_dyn=chunks_per_link,
+                        chunk_bank=chunk_bank,
                     )
         elif const_expr(is_tn):
-            tile_index = block_index - fx.Int32(gemm_base)
+            tile_index = block_index - fx.Int32(num_max_dispatch_blocks)
             if tile_index < fx.Int32(TOTAL):
                 group_idx = tile_index // fx.Int32(TILES_PER_GROUP)
                 local_raw = tile_index % fx.Int32(TILES_PER_GROUP)
@@ -257,34 +243,18 @@ def _make_kernel(
                 real_count = buffer_load(real_count_resource, group_idx, vec_width=1, dtype=fx.T.i32())
                 m_end = m_start + real_count
                 # A token's unique slot is written by its lowest-numbered expert, so
-                # this group needs experts [0, group_idx].
-                first_expert = fx.Int32(0)
-                # One thread per producer expert: the whole scan is one sys-scope round
-                # trip instead of group_idx dependent ones.
-                producer_expert = first_expert + thread_index
-                # tn contracts the whole expert, so it needs every segment of experts
-                # [0, group_idx] -- the same prefix, just counted in segments.
-                gate_slot = producer_expert
-                gate_expected = expected_dispatch_i64
-                gate_need = producer_expert <= group_idx
-                if gate_need:
-                    spin_start = read_clock()
+                # this group needs experts [0, group_idx]. One thread per producer expert:
+                # the whole scan is one sys-scope round trip instead of group_idx of them.
+                gate_slot = thread_index
+                if gate_slot <= group_idx:
                     expert_signal = ld(
                         dispatch_flag_base,
                         bank_offset + gate_slot,
                         scope="sys",
                         dtype=fx.T.i64(),
                     )
-                    while expert_signal < gate_expected:
+                    while expert_signal < expected_dispatch_i64:
                         fx.rocdl.s_sleep(fx.Int32(wait_sleep))
-                        if spin_timed_out(spin_start):
-                            fx.printf(
-                                "MEGA tn expert-ready timeout: slot={} signal={} expected={}\n",
-                                gate_slot,
-                                expert_signal,
-                                gate_expected,
-                            )
-                            spin_start = read_clock()
                         expert_signal = ld(
                             dispatch_flag_base,
                             bank_offset + gate_slot,
@@ -331,7 +301,7 @@ def _make_kernel(
                     slot_lds=True,
                 )
         else:
-            tile_index = block_index - fx.Int32(gemm_base)
+            tile_index = block_index - fx.Int32(num_max_dispatch_blocks)
             real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
             real_grid = real_tiles * fx.Int32(n_blocks)
             if tile_index < real_grid:
@@ -350,31 +320,18 @@ def _make_kernel(
                 # A token's unique slot is written by its lowest-numbered expert, so a
                 # gather tile needs experts [0, g_idx] -- not all of them. Dispatch runs
                 # in expert order, so this keeps the dispatch/GEMM overlap.
-                first_expert = fx.Int32(0)
                 # One thread per producer expert: the whole scan is one sys-scope round
                 # trip instead of g_idx dependent ones.
-                producer_expert = first_expert + thread_index
-                gate_slot = producer_expert
-                gate_expected = expected_dispatch_i64
-                gate_need = producer_expert <= g_idx
-                if gate_need:
-                    spin_start = read_clock()
+                gate_slot = thread_index
+                if gate_slot <= g_idx:
                     expert_signal = ld(
                         dispatch_flag_base,
                         bank_offset + gate_slot,
                         scope="sys",
                         dtype=fx.T.i64(),
                     )
-                    while expert_signal < gate_expected:
+                    while expert_signal < expected_dispatch_i64:
                         fx.rocdl.s_sleep(fx.Int32(wait_sleep))
-                        if spin_timed_out(spin_start):
-                            fx.printf(
-                                "MEGA dispatch expert-ready timeout: slot={} signal={} expected={}\n",
-                                gate_slot,
-                                expert_signal,
-                                gate_expected,
-                            )
-                            spin_start = read_clock()
                         expert_signal = ld(
                             dispatch_flag_base,
                             bank_offset + gate_slot,
@@ -419,8 +376,8 @@ def _make_kernel(
                     a_block_m=block_m,
                 )
 
-    grid_size = gemm_base + (TOTAL if is_tn else worst_case_tiles * n_blocks)
-    return dispatch_grouped_gemm_kernel, grid_size
+    grid_size = num_max_dispatch_blocks + (TOTAL if is_tn else worst_case_tiles * n_blocks)
+    return dispatch_grouped_gemm_kernel, grid_size, num_max_dispatch_blocks
 
 
 @functools.lru_cache(maxsize=8)
@@ -445,7 +402,7 @@ def _make_epoch_bump(addend):
 
 
 @autotune(
-    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=3) for cu in (16, 32, 64)],
+    configs=[Config(num_dispatch_blocks=nb, nt_vmcnt=3) for nb in (8, 16, 24, 32, 48, 64)],
     key=[
         "out_features",
         "hidden_size",
@@ -479,6 +436,7 @@ def _compiled_dispatch_grouped_gemm(
     c_n: int,
     out_m_rt: int,
     out_n_rt: int,
+    num_dispatch_blocks: int,
     DISP_PARITY,
     DISP_EXPECTED,
     out_features: fx.Constexpr[int],
@@ -494,7 +452,6 @@ def _compiled_dispatch_grouped_gemm(
     out_fp16: fx.Constexpr[bool],
     num_ranks: fx.Constexpr[int],
     rank: fx.Constexpr[int],
-    num_dispatch_cu: fx.Constexpr[int],
     nt_vmcnt: fx.Constexpr[int],
     num_experts: fx.Constexpr[int],
     num_max_tokens_per_rank: fx.Constexpr[int],
@@ -508,13 +465,12 @@ def _compiled_dispatch_grouped_gemm(
     _make_epoch_bump(int(num_ranks))(DISP_PARITY, DISP_EXPECTED).launch(
         grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
     )
-    kernel, grid_size = _make_kernel(
+    kernel, grid_size, num_max_dispatch_blocks = _make_kernel(
         out_features,
         hidden_size,
         num_max_pool_tokens,
         BLOCK_M,
         BLOCK_N,
-        int(num_dispatch_cu),
         int(num_comm),
         nt_vmcnt=int(nt_vmcnt),
         out_fp16=bool(out_fp16),
@@ -546,6 +502,7 @@ def _compiled_dispatch_grouped_gemm(
         c_n,
         out_m_rt,
         out_n_rt,
+        num_dispatch_blocks,
         DISP_PARITY,
         DISP_EXPECTED,
         value_attrs=make_value_attrs(2, 0, "512,512"),
@@ -582,49 +539,52 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
             intermediate_hidden=l1_weights.shape[1] // 2,
         )
         sym_buffer = symm.get_sym_buffer()
-        prologue_outputs = tuple(
-            dispatch_prologue_flydsl_kernel(
-                topk_idx,
-                topk_weights,
-                sym_buffer=sym_buffer,
-                num_tokens=num_tokens,
-                num_topk=num_topk,
-                num_experts=symm.num_experts,
-                num_ranks=symm.world,
-                rank=symm.rank,
-                experts_per_rank=experts_per_rank,
-                block_m=BM,
-                num_max_pool_tokens=symm.num_max_pool_tokens,
-                hidden=symm.hidden,
-                num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
-            )
+        num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = dispatch_prologue_flydsl_kernel(
+            topk_idx,
+            topk_weights,
+            sym_buffer=sym_buffer,
+            num_tokens=num_tokens,
+            num_topk=num_topk,
+            num_experts=symm.num_experts,
+            num_ranks=symm.world,
+            rank=symm.rank,
+            experts_per_rank=experts_per_rank,
+            block_m=BM,
+            num_max_pool_tokens=symm.num_max_pool_tokens,
+            hidden=symm.hidden,
+            num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
         )
-        # pool_src_slot rides at index 12; dedup metadata follows.
-        handle = prologue_outputs[:12] + (symm.pool_src_slot.clone(),) + prologue_outputs[12:]
+        # The prologue leaves pool_src_slot unset; snapshot it out of the symmetric buffer.
+        recv_dst_rank, recv_start_row, recv_count, _, dedup_key_row = combine_meta
+        combine_meta = (
+            recv_dst_rank,
+            recv_start_row,
+            recv_count,
+            symm.pool_src_slot.clone(),
+            dedup_key_row,
+        )
+        handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta)
     else:
         symm = get_symm_buffer_for_mega_moe()
         sym_buffer = symm.get_sym_buffer()
 
+    num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = handle
+    num_tokens_per_expert_prefix, _real_count_per_expert, sorted_dispatch_slot_ids = grouped_meta
     (
         expert_send_dst_rank,
-        _expert_send_dst_row,
         expert_send_count,
         expert_send_offset,
         dispatched_token_idx,
         tile_to_expert,
-        _,
-        num_tokens_per_expert_prefix,
-        num_tile_blocks,
-        *_combine_recv_and_pool_src,
-    ) = handle
+        source_slot_kind,
+    ) = dispatch_meta
+    _recv_dst_rank, _recv_start_row, combine_recv_count, _pool_src_slot, _dedup_key_row = combine_meta
     num_comm = expert_send_dst_rank.numel()
     num_ranks = symm.world
     assert x.dtype == torch.bfloat16 and l1_weights.dtype == torch.bfloat16
     hidden_size = x.size(1)
     num_max_pool_tokens = int(symm.num_max_pool_tokens)
     dummy_i32 = get_dummy_tensor(x.device)
-    source_slot_kind = handle[13]
-    sorted_dispatch_slot_ids = handle[19]
     x_i32 = x.contiguous().view(torch.int32).view(-1)
 
     assert layout in ("nt", "nn", "tn"), f"unsupported layout {layout}"
@@ -651,7 +611,6 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         # GEMM never reads stale block-padding rows (the dW1 floor). real[e] = sum over source
         # ranks of the combine recv counts (seg = e*num_ranks + src). Passed via the TILE arg,
         # which the tn path otherwise ignores. Bounds-clamped buffers zero the partial tail tile.
-        combine_recv_count = _combine_recv_and_pool_src[2]  # handle[11]
         real_count = combine_recv_count.view(G, num_ranks).sum(dim=1).to(torch.int32).contiguous()
         tile_arg, num_tile_arg, group_offs_arg = (
             real_count,

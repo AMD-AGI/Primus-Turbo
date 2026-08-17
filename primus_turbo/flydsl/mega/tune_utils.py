@@ -75,8 +75,8 @@ class Autotuner(_BaseAutotuner):
         if key in self.cache:
             return self._run_config(self.cache[key], args, kwargs)
         # First tune for this key: silence flydsl's per-config progress prints.
-        with _suppress_stdout_stderr():
-            return super().__call__(*args, **kwargs)
+        # with _suppress_stdout_stderr():
+        return super().__call__(*args, **kwargs)
 
     def _lock_file(self):
         return self._cache_file.with_suffix(".lock")

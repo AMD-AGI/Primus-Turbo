@@ -13,9 +13,6 @@ from primus_turbo.flydsl.mega import (
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
 
-# dispatch handle layout (see dispatch_prologue ABI).
-_HANDLE_LEN = 21
-
 
 def fused_mega_moe_stage1_forward_impl(
     x: torch.Tensor,
@@ -37,8 +34,7 @@ def fused_mega_moe_stage1_forward_impl(
         topk_weights=topk_weights,
         layout="nt",
     )
-    assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
-    return l1_out, dispatch_weights_in_buf.clone(), tuple(handle)
+    return l1_out, dispatch_weights_in_buf.clone(), handle
 
 
 def fused_mega_moe_stage1_backward_impl(

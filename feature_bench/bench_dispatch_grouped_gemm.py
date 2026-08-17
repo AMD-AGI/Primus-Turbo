@@ -157,26 +157,32 @@ def _worker(local_rank, world, args):
                 return fill((T, H), 1.0), fill((experts_per_rank, H, I), 1.0 / math.sqrt(I))
             return x, fill((pool_rows, 2 * I), 1.0 / math.sqrt(H))
 
-        prologue = tuple(
-            dispatch_prologue_flydsl_kernel(
-                topk_idx,
-                topk_weight,
-                sym_buffer=symm.get_sym_buffer(),
-                num_tokens=T,
-                num_topk=K,
-                num_experts=E,
-                num_ranks=world,
-                rank=rank,
-                experts_per_rank=experts_per_rank,
-                block_m=POOL_BLOCK_M,
-                num_max_pool_tokens=symm.num_max_pool_tokens,
-                hidden=H,
-                num_max_tokens_per_rank=T,
-            )
+        num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = dispatch_prologue_flydsl_kernel(
+            topk_idx,
+            topk_weight,
+            sym_buffer=symm.get_sym_buffer(),
+            num_tokens=T,
+            num_topk=K,
+            num_experts=E,
+            num_ranks=world,
+            rank=rank,
+            experts_per_rank=experts_per_rank,
+            block_m=POOL_BLOCK_M,
+            num_max_pool_tokens=symm.num_max_pool_tokens,
+            hidden=H,
+            num_max_tokens_per_rank=T,
         )
-        # pool_src_slot rides at index 12 (handle ABI, see dispatch_prologue_kernel)
-        handle = prologue[:12] + (symm.pool_src_slot.clone(),) + prologue[12:]
-        active_rows = int(handle[8][0].item()) * POOL_BLOCK_M
+        # The prologue leaves pool_src_slot unset; the launcher normally fills it.
+        recv_dst_rank, recv_start_row, recv_count, _, dedup_key_row = combine_meta
+        combine_meta = (
+            recv_dst_rank,
+            recv_start_row,
+            recv_count,
+            symm.pool_src_slot.clone(),
+            dedup_key_row,
+        )
+        handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta)
+        active_rows = int(num_tile_blocks[0].item()) * POOL_BLOCK_M
 
         def presync():
             torch.cuda.synchronize()

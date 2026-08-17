@@ -50,10 +50,6 @@ from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
 GOLDEN = "dispatch"
 LAYOUTS = ("nt", "nn", "tn")
 CASES = {layout: f"dispatch_{layout}" for layout in LAYOUTS}
-# Mirrors dispatch_grouped_gemm_bf16_kernel.py's own splice; see the ABI comment
-# at the end of dispatch_prologue_flydsl_kernel.
-_PROLOGUE_LEN = 20
-_H_POOL_SRC_SLOT = 12
 
 
 def build_context(shape, group, rank, world):
@@ -90,33 +86,25 @@ def build_context(shape, group, rank, world):
         ),
     }
 
-    prologue = tuple(
-        dispatch_prologue_flydsl_kernel(
-            topk_idx,
-            topk_weight,
-            sym_buffer=symm.get_sym_buffer(),
-            num_tokens=tokens,
-            num_topk=topk,
-            num_experts=experts,
-            num_ranks=world,
-            rank=rank,
-            experts_per_rank=experts_per_rank,
-            block_m=POOL_BLOCK_M,
-            num_max_pool_tokens=pool_rows,
-            hidden=hidden,
-            num_max_tokens_per_rank=tokens,
-        )
+    num_tile_blocks, grouped_meta, dispatch_meta, combine_meta = dispatch_prologue_flydsl_kernel(
+        topk_idx,
+        topk_weight,
+        sym_buffer=symm.get_sym_buffer(),
+        num_tokens=tokens,
+        num_topk=topk,
+        num_experts=experts,
+        num_ranks=world,
+        rank=rank,
+        experts_per_rank=experts_per_rank,
+        block_m=POOL_BLOCK_M,
+        num_max_pool_tokens=pool_rows,
+        hidden=hidden,
+        num_max_tokens_per_rank=tokens,
     )
-    # The launcher splices pool_src_slot in at 12, so everything from
-    # source_slot_kind on shifts by one. Splicing anywhere else hands the kernel
-    # combine_recv_count and pool_src_slot swapped, which only the tn path reads
-    # -- nt and nn would keep producing plausible, wrong numbers.
-    if len(prologue) != _PROLOGUE_LEN:
-        raise RuntimeError(
-            f"prologue returned {len(prologue)} entries, expected {_PROLOGUE_LEN}; "
-            "the handle ABI moved, re-check the splice index"
-        )
-    handle = prologue[:_H_POOL_SRC_SLOT] + (symm.pool_src_slot.clone(),) + prologue[_H_POOL_SRC_SLOT:]
+    # Mirrors the dispatch launcher: the prologue leaves pool_src_slot unset.
+    recv_dst_rank, recv_start_row, recv_count, _, dedup_key_row = combine_meta
+    combine_meta = (recv_dst_rank, recv_start_row, recv_count, symm.pool_src_slot.clone(), dedup_key_row)
+    handle = (num_tile_blocks, grouped_meta, dispatch_meta, combine_meta)
     torch.cuda.synchronize()
 
     # tn is wgrad: its rhs is indexed by pool row, so it can only be built after

@@ -4,7 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import os
 from typing import Optional
 
 import flydsl.expr as fx
@@ -42,10 +41,9 @@ _L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invali
 # grouped_gemm_combine_bf16_kernel.py for the matching gate on the producer side -- the
 # two must move together (both asymmetric 8/32 arms measured worse than either symmetric
 # setting), and 32 is the fitted optimum of a flat basin, not a guess.
-_REDUCE_GATE_SLEEP = int(os.environ.get("TURBO_REDUCE_GATE_SLEEP", "32"))
-# What separates the topk-reduce arrival gate from the gather that consumes it.
-#   0 = fx.gpu.barrier()          -- workgroup-wide s_barrier (historical)
-#   1 = fx.rocdl.sched_barrier(0) -- compile-time fence only, no runtime WG sync
+_REDUCE_GATE_SLEEP = 32
+# The topk-reduce arrival gate is separated from the gather that consumes it by a
+# compile-time fence only (sched_barrier(0)), never a workgroup barrier (historical).
 # The gate is per-WARP work: warp w owns token `base_pid*8 + w` and spins, in lane
 # 0 only, on that token's own topk reduce flags. A *workgroup* barrier therefore
 # couples 8 independent tokens: every round, all 8 warps advance at the speed of
@@ -64,7 +62,7 @@ _REDUCE_GATE_SLEEP = int(os.environ.get("TURBO_REDUCE_GATE_SLEEP", "32"))
 # guarantee (nothing crosses it at compile time) and drops only the runtime
 # rendezvous. NOTE: this is specific to a gate whose consumer is the same wave --
 # do not generalize it to the GEMM tail, where barrier COUNT is load-bearing.
-_REDUCE_GATE_FENCE = int(os.environ.get("TURBO_REDUCE_GATE_FENCE", "1"))
+#
 # Column rounds of the topk-reduce gather issued back-to-back before any is consumed.
 # The gather is sc0|sc1|nt (L2-bypassing), so each round is a full dependent HBM round
 # trip and the old one-round-at-a-time loop serialized out_features/(64*8) of them per
@@ -72,7 +70,7 @@ _REDUCE_GATE_FENCE = int(os.environ.get("TURBO_REDUCE_GATE_FENCE", "1"))
 # GEMM block, so that chain is an exposed tail, not something the GEMM hides. U cuts the
 # chain to n_full/U at U*topk loads in flight; keep it small -- the wave has ~256 VGPRs
 # and each round holds topk bf16x8 vectors, so U=4 is already at the spill edge.
-_REDUCE_VEC_UNROLL = max(1, int(os.environ.get("TURBO_REDUCE_VEC_UNROLL", "2")))
+_REDUCE_VEC_UNROLL = 2
 # Rows whose slot/kind lookups are batched per dispatch-loop iteration. See the
 # comment at the loop in dispatch_bf16_tile.
 _ROW_UNROLL = 4
@@ -112,6 +110,7 @@ def dispatch_bf16_tile(
     source_rank: int = 0,
     chunk_index: Optional[fx.Int32] = None,
     num_chunks: int = 1,
+    num_chunks_dyn: Optional[fx.Int32] = None,
     chunk_bank: int = 0,
 ):
     hidden_bytes = hidden_size * 2
@@ -121,10 +120,19 @@ def dispatch_bf16_tile(
     # A task's rows are split across num_chunks blocks; chunk c takes warp rows
     # c*_NUM_WARPS + warp_id, striding by num_chunks*_NUM_WARPS. num_chunks == 1
     # reproduces the single-block indexing exactly.
+    # num_chunks_dyn carries the chunk count as a runtime value so the CU split can
+    # be autotuned without recompiling (see dispatch_grouped_gemm_bf16_kernel).
+    DYN_CHUNKS = num_chunks_dyn is not None
+    CHUNKED = DYN_CHUNKS or num_chunks > 1
     warp_id = thread_index // fx.Int32(_WARP)
-    if const_expr(num_chunks > 1):
+    if const_expr(CHUNKED):
         warp_id = chunk_index * fx.Int32(_NUM_WARPS) + warp_id
-    row_stride = num_chunks * _NUM_WARPS
+    if const_expr(DYN_CHUNKS):
+        row_stride = num_chunks_dyn * fx.Int32(_NUM_WARPS)
+        row_stride_m1 = row_stride - fx.Int32(1)
+    else:
+        row_stride = fx.Int32(num_chunks * _NUM_WARPS)
+        row_stride_m1 = fx.Int32(num_chunks * _NUM_WARPS - 1)
 
     dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
     source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
@@ -135,7 +143,7 @@ def dispatch_bf16_tile(
     chunk_count_address = workspace.get_dispatch_chunk_ptr()  # local, never reset
     num_max_pool_blocks = int(workspace.num_max_pool_blocks)
 
-    local_count = (token_count - warp_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
+    local_count = (token_count - warp_id + row_stride_m1) // row_stride
     direct_base = fx.Int32(source_rank * int(workspace.num_max_tokens_per_rank))
 
     def _push_row(source_slot, source_kind):
@@ -153,8 +161,9 @@ def dispatch_bf16_tile(
                 hidden_bytes,
                 dst_off=direct_row * fx.Int32(hidden_i32),
                 src_off=source_row * fx.Int32(hidden_i32),
-                load_cache_modifier=19,
-                store_cache_modifier=19,
+                # Local x is read-only for every agent, so keep it in L2: the same
+                # token row is re-read once per destination rank (~5.25x at K=8/EP=8).
+                store_cache_modifier=19,  # sc0|sc1|nt: publish to a remote agent.
             )
 
     def _slot(row_index):
@@ -173,12 +182,12 @@ def dispatch_bf16_tile(
     # sequential so the in-flight copy_warp register footprint is unchanged.
     n_grouped = (local_count // fx.Int32(_ROW_UNROLL)) * fx.Int32(_ROW_UNROLL)
     for i in range(0, n_grouped, _ROW_UNROLL):
-        slots = [_slot(warp_id + (i + u) * fx.Int32(row_stride)) for u in range_constexpr(_ROW_UNROLL)]
+        slots = [_slot(warp_id + (i + u) * row_stride) for u in range_constexpr(_ROW_UNROLL)]
         kinds = [_kind(s) for s in slots]
         for u in range_constexpr(_ROW_UNROLL):
             _push_row(slots[u], kinds[u])
     for i in range(n_grouped, local_count):
-        source_slot = _slot(warp_id + i * fx.Int32(row_stride))
+        source_slot = _slot(warp_id + i * row_stride)
         _push_row(source_slot, _kind(source_slot))
 
     if const_expr(signal):
@@ -189,18 +198,25 @@ def dispatch_bf16_tile(
             local_expert = task_index // fx.Int32(num_ranks)
             # Flag slot is per-expert: all num_ranks senders share one counter.
             flag_slot = local_expert
-            if const_expr(num_chunks > 1):
+            if const_expr(CHUNKED):
                 # Chunks of one task must produce exactly one expert signal, or the
                 # peers' gates would see a non-uniform count. atomic_add returns the
                 # old value, so the chunk that sees old % num_chunks == num_chunks-1
-                # is the last one in this epoch -- no counter reset needed. That only
-                # holds while num_chunks is fixed per slot, so callers that use a
-                # different chunk count (other layout, other CU split) must pass their
-                # own chunk_bank; mixing two moduli on one slot desynchronises the gate.
+                # is the last one in this epoch -- no counter reset needed. That needs
+                # num_chunks uniform within a launch, so concurrent users of one slot
+                # (another layout) must pass their own chunk_bank.
                 done = atomic_add(
                     chunk_count_address, fx.Int32(chunk_bank) + task_index, fx.Int64(1), scope="agent"
                 )
-                if done % fx.Int64(num_chunks) == fx.Int64(num_chunks - 1):
+                # Any n consecutive integers hold exactly one x with x % n == n-1, so the
+                # start value is irrelevant: a launch may use a different chunk count than
+                # the previous one on the same slot, as long as it is uniform within it.
+                if const_expr(DYN_CHUNKS):
+                    nc = cast(num_chunks_dyn, fx.T.i64())
+                    is_last = done % nc == nc - fx.Int64(1)
+                else:
+                    is_last = done % fx.Int64(num_chunks) == fx.Int64(num_chunks - 1)
+                if is_last:
                     atomic_add(dispatch_flag_address, bank + flag_slot, fx.Int64(1), scope="sys")
             else:
                 atomic_add(dispatch_flag_address, bank + flag_slot, fx.Int64(1), scope="sys")
@@ -671,11 +687,8 @@ def topk_reduce_bf16_tile(
                                 scope="sys",
                                 dtype=fx.T.i64(),
                             )
-            # Per-warp gate -> per-warp fence. See _REDUCE_GATE_FENCE.
-            if const_expr(_REDUCE_GATE_FENCE == 0):
-                fx.gpu.barrier()
-            if const_expr(_REDUCE_GATE_FENCE == 1):
-                fx.rocdl.sched_barrier(0)
+            # Per-warp gate -> per-warp fence; see the note at _REDUCE_GATE_SLEEP.
+            fx.rocdl.sched_barrier(0)
 
         token_row_off = token * fx.Int32(topk) * fx.Int32(out_features)
         # Point dead slots past num_records: the load is dropped and reads back 0,
@@ -700,7 +713,6 @@ def topk_reduce_bf16_tile(
                             token * fx.Int32(topk) + fx.Int32(j),
                             vec_width=1,
                             dtype=fx.T.f32(),
-                            cache_modifier=19,
                         ),
                     )
                 )
