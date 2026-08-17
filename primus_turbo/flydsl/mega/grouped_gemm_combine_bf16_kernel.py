@@ -71,12 +71,37 @@ _H_DEDUP_KEY_ROW = 20
 # Measured (rc=768, both cases per run, ms):
 #   nt  cc=64 2.479/2.489 | 56 2.440/2.448/2.448 | 48 2.441/2.426/2.431/2.429 | 40 2.446
 #   nn  cc=48 4.326       | 40 4.271            | 32 4.064/4.094/4.065       | 24 4.199/4.217 | 16 4.776 | 8 7.145
-# nt sits on a flat 40-56 plateau ~2.43 and falls off a cliff at 64; nn has a sharp
-# optimum at 32 and degrades hard in both directions -- its longer window means the
-# pushes it must keep ahead of are denser per unit time, so it is push-bound below 32
-# while every CU past 32 is stolen from a GEMM that is already the critical path.
-_CC_PINNED = {"nt": 48, "nn": 32, "tn": 64}
-_RC_PINNED = {"nt": 768, "nn": 768, "tn": 768}
+# nn has a sharp optimum at 32 and degrades hard in both directions -- it is push-bound
+# below 32, while every CU past 32 is stolen from a GEMM that is already the critical
+# path. That is a quantization edge, not a plateau: nn runs ~4704 tile blocks, so cc=32
+# leaves 224 GEMM CUs = exactly 21 rounds, and cc=40 tips it to 22 (+4.8%, measured
+# 3.96 -> 4.12/4.14). Re-measured at 24/28/32/36/48/64: 4.075 / 4.062 / 3.956 / 4.118 /
+# 4.143 / 4.254. Leave nn at 32.
+#
+# nt's old entry (48, "flat 40-56 plateau, cliff at 64") was fitted at rc=768 and did NOT
+# survive the move to rc=2048 -- the whole curve shifted right. Re-swept, counterbalanced:
+#   cc    40     48     56     64     68     72     80     96
+#   nt  2.395  2.360  2.339  2.338  2.502  2.505  2.522  2.506
+# nt's GEMM is half of nn's (K=inter, not 2*inter), so it is push-bound over a much wider
+# range and wants the extra push CUs; the cliff is real but sits between 64 and 68, not at
+# 64. 56 and 64 are a dead heat (2.3386 vs 2.3379 over 2 and 6 runs), so 56 is taken for
+# the extra step of margin -- 64 is directly on the edge of a 7% cliff. Worth ~1.0% on nt.
+# Lesson: cc and rc interact. Any future rc change invalidates this table; re-sweep both.
+_CC_PINNED = {"nt": 56, "nn": 32, "tn": 64}
+# rc had never actually been swept -- the cc table above was taken at a fixed rc=768,
+# which was itself inherited rather than measured. It behaves nothing like cc: reduce
+# blocks are drawn from the HEAD of the empty ordinal region, so they only ever occupy
+# CU slots that tile blocks have already released, and raising the count just widens the
+# tail's parallelism (the kernel self-clamps to n_reduce_tiles, so an oversized rc costs
+# only immediate exits). It also collapses the never-reset alignment loop below: once
+# rc >= n_empty every reduce block does at most ONE far atomic instead of ~3 serial ones.
+# Counterbalanced pairs, ms:
+#   rc   512   768   1536   2048   3072
+#   nt  2.375 2.372  2.369  2.360  2.370
+#   nn  3.986 3.998  3.972  3.974  3.973
+# 768 -> 1536 is the real step; 1536..3072 is one flat basin, so 2048 is taken as its
+# interior. The gain lands mostly on nn, the weaker of the two cases.
+_RC_PINNED = {"nt": 2048, "nn": 2048, "tn": 768}
 
 # combine_flag is a purely intra-device handoff (never sym.map()'d to a peer), so agent
 # scope is *semantically* sufficient -- but it is measurably WORSE: nt 2.421 -> 2.446,
@@ -159,7 +184,30 @@ def _make_grouped_gemm_combine(
     # map (see the use site). Only enabled for the nt layout: measured a consistent win
     # there and a consistent loss for nn, whose B operand is walked column-wise so the
     # rotation buys no extra panel residency and only perturbs the A-tile sharing.
-    _N_ROT = ((n_blocks - (n_blocks % 8)) % n_blocks) if (layout == "nt" and n_blocks) else 0
+    # _RECT used to lose to _N_ROT on nt, but that was measured with the row-major
+    # rectangle order, which throws away all of the B-panel sharing (see _RECT_P). With
+    # the 2-row-interleaved order the rectangle is a strictly stronger map, so the choice
+    # is worth re-deciding per layout; knob lets either be forced. Re-measured on nt with
+    # a same-session counterbalanced A/B (nn, which this knob cannot reach, held to 0.14%
+    # as the noise control): rectangle 2.3785/2.3619 vs rotation 2.3799/2.4197 ms, i.e.
+    # -1.23% with both arms strictly ordered -- so the rectangle now wins on nt as well
+    # and the rotation is off by default.
+    _NROT_OK = os.environ.get("TURBO_COMBINE_NROT", "0") not in ("0", "")
+    _N_ROT = (
+        ((n_blocks - (n_blocks % 8)) % n_blocks)
+        if (layout == "nt" and n_blocks and _NROT_OK)
+        else 0
+    )
+    # Mutually exclusive with _N_ROT; needs n_blocks divisible by 4 and gemm_base by 8
+    # for the band remap to preserve the XCD residue. See the seam in the tile branch.
+    _RECT = bool(n_blocks) and n_blocks % 4 == 0 and _N_ROT == 0 and os.environ.get(
+        "TURBO_COMBINE_RECT", "1"
+    ) not in ("0", "")
+    # Traversal order INSIDE the 4(row) x _nsub(col) rectangle. Any bijection of the 28
+    # slots is legal -- the tile SET an XCD owns, its XCD residue and the prefix/tail seam
+    # are all untouched -- but the order fixes the L2 reuse DISTANCE, which is what decides
+    # whether the sharing the rectangle creates is actually captured. See the use site.
+    _RECT_P = int(os.environ.get("TURBO_COMBINE_RECT_P", "2"))
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -340,6 +388,56 @@ def _make_grouped_gemm_combine(
                     # over the tile set, and block_m is untouched -- the combine gate's
                     # tile-prefix ordering is unchanged.
                     block_n = (block_n + block_m * fx.Int32(_N_ROT)) % fx.Int32(n_blocks)
+                if _RECT:
+                    # Rectangular XCD-affine tile map (the nn counterpart of _N_ROT).
+                    #
+                    # Workgroups round-robin over the 8 XCDs by index, and gemm_base is a
+                    # multiple of 8, so XCD == gemm_tile_index % 8 exactly. Under row-major
+                    # the 8 tiles an XCD holds concurrently form a 1x8 sliver that walks
+                    # across a whole tile row, so per band an XCD touches ~9 distinct A
+                    # panels and ~7 B panels -- ~16 streams against a 4 MiB private L2.
+                    # Give each XCD a 4(block_m) x 7(block_n) RECTANGLE of the band instead:
+                    # the same 28 tiles now need only 4 A panels + 7 B panels = 11 streams,
+                    # lifting the reuse ceiling from ~3.7x to ~5.1x. nn is where this should
+                    # pay: K is twice nt's, so every A/B panel byte is re-read twice as often.
+                    #
+                    # x = XCD id splits into g = x//2 (which seventh of N) and h = x%2 (which
+                    # half of the 8 rows); j enumerates the 7x4 rectangle. A band is
+                    # 8*n_blocks tiles and 8*n_blocks % 8 == 0, so t % 8 -- the XCD -- is
+                    # untouched by the remap. Applied only on the whole-band prefix, with
+                    # identity on the row tail AND over the entire empty/reduce ordinal
+                    # range, so empty_ordinal and the combine gate's prefix accounting see
+                    # the same tile numbering they always did.
+                    _band = fx.Int32(8 * n_blocks)
+                    _nsub = fx.Int32(n_blocks // 4)
+                    _t_sw = (real_tiles // fx.Int32(8)) * _band
+                    _b = gemm_tile_index // _band
+                    _tp = gemm_tile_index % _band
+                    _x = _tp % fx.Int32(8)
+                    _j = _tp // fx.Int32(8)
+                    # Order within the 4 x C rectangle (C = n_blocks//4 = 7 here). The
+                    # rectangle only creates the SHARING (4 A panels + C B panels feed 4*C
+                    # tiles); whether L2 keeps it depends on the reuse DISTANCE, i.e. how
+                    # far apart in dispatch order two tiles sharing a panel are. Tiles on
+                    # one XCD start ~tau/32 apart, so distance d ~ 2d k-steps of skew, and
+                    # a slab only survives a few k-steps of the XCD's fetch stream.
+                    #   P=1 (row-major): A-distance 1 (captured), B-distance C=7 (lost)
+                    #                    -> 4 + 4*C = 32 panel fetches per 28 tiles.
+                    #   P=2: walk 2 rows at a time, column-minor. A-distance 2, B-distance 1
+                    #        inside a row pair -> 4 + 2*C = 18 fetches. Both stay in window.
+                    #   P=4 (column-major): B-distance 1, A-distance 4 -> 4*C + C = 35 if
+                    #        the A reuse falls out of the window, C + 4 = 11 if it holds.
+                    _P = _RECT_P if _RECT_P in (1, 2, 4) else 1
+                    _C = n_blocks // 4
+                    _pg = _j // fx.Int32(_P * _C)
+                    _q = _j % fx.Int32(_P * _C)
+                    _rm_l = _pg * fx.Int32(_P) + (_q % fx.Int32(_P))
+                    _rn_l = _q // fx.Int32(_P)
+                    _rn = (_x // fx.Int32(2)) * _nsub + _rn_l
+                    _rm = _b * fx.Int32(8) + (_x % fx.Int32(2)) * fx.Int32(4) + _rm_l
+                    _use = gemm_tile_index < _t_sw
+                    block_m = fx.arith.select(_use, _rm, block_m)
+                    block_n = fx.arith.select(_use, _rn, block_n)
                 if block_m < real_tiles:
                     # GEMM role: one real tile (block_m, block_n) per block (unchanged).
                     group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
@@ -369,7 +467,16 @@ def _make_grouped_gemm_combine(
                         out_fp16=out_fp16,
                         nt_vmcnt=nt_vmcnt,
                         b_group_base=group_base,
-                        c_cache_modifier=18,  # sc1|nt: agent-visible non-temporal local stage.
+                        # sc1 only (16), NOT sc1|nt (18). sc1 is load-bearing for
+                        # cross-XCD visibility and must stay. Dropping NT lets the
+                        # epilogue's 0.94 GB C stream retire into L2 instead of being
+                        # forced past it, which shortens the s_waitcnt(0) drain that
+                        # sits between the last store and the release atomic. The five
+                        # ep_intranode *load* sites stay at 18 on purpose: they read the
+                        # stage exactly once, so making them L2-allocating would spend
+                        # residency nn does not have (iter 7 bundled all six and nn
+                        # captured only 1.1%).
+                        c_cache_modifier=16,
                         # out_features % BLOCK_N == 0 is asserted above and the grid only
                         # ever produces block_n < out_features // BLOCK_N, so every column
                         # this epilogue writes is in range: the store's per-element column
@@ -600,6 +707,12 @@ def _compiled_grouped_gemm_combine(
     )
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
+    # The grid is sized for the worst case (every pool slot occupied), so at the bench
+    # shape ~47.5k of the ~58.3k blocks launched retire as null tiles. MEASURED: capping
+    # worst_case_tiles 2080 -> 384 (grid 58272 -> 10784) moved both cases by +0.19%, i.e.
+    # the null-block drain costs nothing -- an empty block is dispatch-limited, not
+    # occupancy-limited, and the tail is set by the real tiles. Do NOT spend effort on a
+    # persistent/compacted GEMM grid; there is no headroom under it.
     grid_size = num_combine_cu + worst_case_tiles * n_blocks
     # bump epoch on device (combine += n_blocks, reduce += 1) before the GEMM; same-stream visible
     _make_epoch_bump(int(n_blocks), 1)(COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED).launch(

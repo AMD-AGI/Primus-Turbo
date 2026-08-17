@@ -43,6 +43,36 @@ _L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invali
 # two must move together (both asymmetric 8/32 arms measured worse than either symmetric
 # setting), and 32 is the fitted optimum of a flat basin, not a guess.
 _REDUCE_GATE_SLEEP = int(os.environ.get("TURBO_REDUCE_GATE_SLEEP", "32"))
+# What separates the topk-reduce arrival gate from the gather that consumes it.
+#   0 = fx.gpu.barrier()          -- workgroup-wide s_barrier (historical)
+#   1 = fx.rocdl.sched_barrier(0) -- compile-time fence only, no runtime WG sync
+# The gate is per-WARP work: warp w owns token `base_pid*8 + w` and spins, in lane
+# 0 only, on that token's own topk reduce flags. A *workgroup* barrier therefore
+# couples 8 independent tokens: every round, all 8 warps advance at the speed of
+# the slowest, and each token's readiness is itself a max over up to `topk`
+# remote routes, i.e. a long-tailed draw -- so the workgroup pays the max of 8
+# long tails per round instead of its own. It is also a latently divergent
+# barrier (warps differ in trip count when num_tokens % total_warps != 0).
+#
+# It is not load-bearing for correctness: no lane but lane 0 ever reads the flag,
+# intra-wave ordering after the spin comes from reconvergence plus the s_waitcnt(0)
+# already inside the spin, and the gather loads below use cache_modifier=19
+# (sc0|sc1|nt, system-scope non-temporal) so they cannot be served a stale line.
+# What the barrier *did* provide incidentally is a scheduling fence: the gather
+# addresses do not depend on the flag value, so without one the compiler is free
+# to hoist those loads above the spin. sched_barrier(0) keeps exactly that
+# guarantee (nothing crosses it at compile time) and drops only the runtime
+# rendezvous. NOTE: this is specific to a gate whose consumer is the same wave --
+# do not generalize it to the GEMM tail, where barrier COUNT is load-bearing.
+_REDUCE_GATE_FENCE = int(os.environ.get("TURBO_REDUCE_GATE_FENCE", "1"))
+# Column rounds of the topk-reduce gather issued back-to-back before any is consumed.
+# The gather is sc0|sc1|nt (L2-bypassing), so each round is a full dependent HBM round
+# trip and the old one-round-at-a-time loop serialized out_features/(64*8) of them per
+# token with only topk loads ever in flight. The reduce region is dispatched after every
+# GEMM block, so that chain is an exposed tail, not something the GEMM hides. U cuts the
+# chain to n_full/U at U*topk loads in flight; keep it small -- the wave has ~256 VGPRs
+# and each round holds topk bf16x8 vectors, so U=4 is already at the spill edge.
+_REDUCE_VEC_UNROLL = max(1, int(os.environ.get("TURBO_REDUCE_VEC_UNROLL", "2")))
 # Rows whose slot/kind lookups are batched per dispatch-loop iteration. See the
 # comment at the loop in dispatch_bf16_tile.
 _ROW_UNROLL = 4
@@ -558,17 +588,28 @@ def topk_reduce_bf16_tile(
     num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=fx.T.i32())
     token = global_warp_id
     while token < num_tokens:
+        # Per-slot validity, hoisted ABOVE the arrival gate. It used to be derived twice
+        # per token from the same two tables -- once as `awaited` inside the gate, once as
+        # `valid` after it -- i.e. 2*topk dependent loads re-issued for values the warp
+        # already held. It also depends on no flag, so computing it first lets those loads
+        # fly while lane 0 is parked in the spin instead of after it.
+        idxs = []
+        valid = []
+        for j in range_constexpr(topk):
+            slot = token * fx.Int32(topk) + fx.Int32(j)
+            idx = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+            ok = (idx >= fx.Int64(0)) & (idx < fx.Int64(num_experts))
+            if const_expr(dedup):
+                # kind 0 = duplicate route; the sender folded it into the primary slot.
+                ok = ok & (buffer_load(kind_res, slot, vec_width=1, dtype=fx.T.i32()) != fx.Int32(0))
+            idxs.append(idx)
+            valid.append(ok)
         if const_expr(signal):
             # Wait each slot's flag == epoch. Loop MUST stay inline (rewriter needs the control flow).
             for j in range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(j)
-                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
-                awaited = (topk_index >= fx.Int64(0)) & (topk_index < fx.Int64(num_experts))
-                if const_expr(dedup):
-                    # kind 0 = duplicate route; the sender folded it into the primary slot.
-                    kind = buffer_load(kind_res, slot, vec_width=1, dtype=fx.T.i32())
-                    awaited = awaited & (kind != fx.Int32(0))
-                if awaited:
+                topk_index = idxs[j]
+                if valid[j]:
                     if lane_id == fx.Int32(0):
                         spin_start = read_clock()
                         fx.rocdl.s_waitcnt(0)
@@ -604,18 +645,13 @@ def topk_reduce_bf16_tile(
                                 scope="sys",
                                 dtype=fx.T.i64(),
                             )
-            fx.gpu.barrier()
+            # Per-warp gate -> per-warp fence. See _REDUCE_GATE_FENCE.
+            if const_expr(_REDUCE_GATE_FENCE == 0):
+                fx.gpu.barrier()
+            if const_expr(_REDUCE_GATE_FENCE == 1):
+                fx.rocdl.sched_barrier(0)
 
         token_row_off = token * fx.Int32(topk) * fx.Int32(out_features)
-        # Prefetch per-slot validity (scalar, once per token).
-        valid = []
-        for j in range_constexpr(topk):
-            slot = token * fx.Int32(topk) + fx.Int32(j)
-            idx = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
-            ok = (idx >= fx.Int64(0)) & (idx < fx.Int64(num_experts))
-            if const_expr(dedup):
-                ok = ok & (buffer_load(kind_res, slot, vec_width=1, dtype=fx.T.i32()) != fx.Int32(0))
-            valid.append(ok)
         # Point dead slots past num_records: the load is dropped and reads back 0,
         # so a skipped slot costs no combine-buffer bandwidth at all.
         slot_offs = []
@@ -625,12 +661,36 @@ def topk_reduce_bf16_tile(
                 live_off = arith.select(valid[j], live_off, fx.Int32(num_combine_slots * out_features))
             slot_offs.append(live_off)
         zero_vec = fx.arith.constant_vector(0.0, f32_vec)
-        vec_idx = lane_id
-        while vec_idx < fx.Int32(num_vec_chunks):
-            col = vec_idx * fx.Int32(_PVEC)
-            topk_vals = []
+        # Routing weights are per (token, slot) -- constant down the whole hidden row --
+        # but the old shape reloaded all topk of them on every column round. Hoist.
+        if const_expr(apply_weights):
+            w_vecs = []
             for j in range_constexpr(topk):
-                topk_vals.append(
+                w_vecs.append(
+                    _vector.broadcast(
+                        f32_vec,
+                        buffer_load(
+                            topk_weights_res,
+                            token * fx.Int32(topk) + fx.Int32(j),
+                            vec_width=1,
+                            dtype=fx.T.f32(),
+                            cache_modifier=19,
+                        ),
+                    )
+                )
+        out_row = token * fx.Int32(out_features)
+        # Column rounds per warp. num_vec_chunks is a compile-time constant
+        # (out_features // 8) and the stride is a full wave, so the trip count is known
+        # at trace time and identical for every lane -- the runtime `while` this replaces
+        # was hiding that from the scheduler.
+        n_full = num_vec_chunks // _WARP
+        n_rem = num_vec_chunks - n_full * _WARP
+        n_grouped = (n_full // _REDUCE_VEC_UNROLL) * _REDUCE_VEC_UNROLL
+
+        def _round(col):
+            vals = []
+            for j in range_constexpr(topk):
+                vals.append(
                     buffer_load(
                         comb_local_res,
                         slot_offs[j] + col,
@@ -639,26 +699,46 @@ def topk_reduce_bf16_tile(
                         cache_modifier=19,  # sc0|sc1|nt: system-visible non-temporal read.
                     )
                 )
-            if const_expr(apply_weights):
-                weights = [
-                    buffer_load(
-                        topk_weights_res,
-                        token * fx.Int32(topk) + fx.Int32(j),
-                        vec_width=1,
-                        dtype=fx.T.f32(),
-                        cache_modifier=19,
-                    )
-                    for j in range_constexpr(topk)
-                ]
+            return vals
+
+        def _reduce_store(vals, col):
             acc = None
             for j in range_constexpr(topk):
-                term = fx.arith.extf(f32_vec, topk_vals[j])
+                term = fx.arith.extf(f32_vec, vals[j])
                 if const_expr(apply_weights):
-                    term = fx.arith.mulf(term, _vector.broadcast(f32_vec, weights[j]))
+                    term = fx.arith.mulf(term, w_vecs[j])
                 term = fx.arith.select(valid[j], term, zero_vec)
                 acc = term if acc is None else fx.arith.addf(acc, term)
-            buffer_store(fx.arith.trunc_f(bf16_vec, acc), output_res, token * fx.Int32(out_features) + col)
-            vec_idx = vec_idx + fx.Int32(_WARP)
+            buffer_store(fx.arith.trunc_f(bf16_vec, acc), output_res, out_row + col)
+
+        # Unrolled body: issue U rounds' worth of gathers back to back, THEN consume them.
+        # Each round is one dependent HBM round trip (the gather is sc0|sc1|nt, so it is
+        # resolved past L2), and the warp cannot start round i+1 until round i's s_waitcnt
+        # retires -- so the old one-round-at-a-time shape serialized n_full round trips per
+        # token with only topk loads ever in flight. The reduce region is dispatched after
+        # every GEMM block, so those round trips are an exposed tail, not something the
+        # GEMM hides. Unrolling by U cuts the serialized chain to n_full/U at U*topk loads
+        # in flight; the dead slots are already redirected out of range and issue no
+        # request, so the real in-flight count is U * (live slots).
+        for i in range_constexpr(0, n_grouped, _REDUCE_VEC_UNROLL):
+            cols = []
+            for u in range_constexpr(_REDUCE_VEC_UNROLL):
+                cols.append((lane_id + fx.Int32((i + u) * _WARP)) * fx.Int32(_PVEC))
+            group = []
+            for u in range_constexpr(_REDUCE_VEC_UNROLL):
+                group.append(_round(cols[u]))
+            for u in range_constexpr(_REDUCE_VEC_UNROLL):
+                _reduce_store(group[u], cols[u])
+        for i in range_constexpr(n_grouped, n_full):
+            col = (lane_id + fx.Int32(i * _WARP)) * fx.Int32(_PVEC)
+            _reduce_store(_round(col), col)
+        if const_expr(n_rem > 0):
+            # out_features is only required to be a multiple of _PVEC, so the last partial
+            # wave-round needs the bound check the unrolled rounds statically don't.
+            tail_idx = lane_id + fx.Int32(n_full * _WARP)
+            if tail_idx < fx.Int32(num_vec_chunks):
+                col = tail_idx * fx.Int32(_PVEC)
+                _reduce_store(_round(col), col)
         if const_expr(signal and with_gate):
             for j in range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(j)

@@ -1561,15 +1561,22 @@ def _packed_ds_read_tr16(base_ptr, byte_offsets):
     return [Vec(_llvm.extractvalue(v2i32, op.result, [k])).bitcast(fx.BFloat16) for k in range(n)]
 
 
-def _read_tr16_sub(base_i32, sub16, row_off, swz=False):
+def _read_tr16_sub(base_i32, sub16, row_off, swz=False, sub_const=0):
     """One tr16 sub-block (512 elems/block): packed double-read at sub16*512 +
     row_off, then assembled. The pair is 128 bytes apart normally; with the bank
     swizzle (swz=True, tn path) it is 256 bytes apart and the caller uses kb*64
     spacing, so the four 16-lane groups straddle both bank halves -> 2 clk instead
-    of 4. See _tr_granule_swz_kk for the matching write-side permutation."""
+    of 4. See _tr_granule_swz_kk for the matching write-side permutation.
+
+    ``sub_const`` is a COMPILE-TIME sub-block delta. The consecutive subs of a tile
+    differ only by that constant, so folding it into the ds_read immediate instead
+    of the address VGPR leaves one shared base per tile: 1 v_add instead of 4. DS
+    ops carry a 16-bit offset and the largest fold here is 3*1024 + 256, so it
+    always encodes."""
     pair = [0, 256] if swz else [0, 128]
+    imm = sub_const * 1024
     ptr = _lds_ptr_from_i32(base_i32 + (sub16 * 512 + row_off) * 2)
-    r0, r1 = _packed_ds_read_tr16(ptr, pair)
+    r0, r1 = _packed_ds_read_tr16(ptr, [imm + p for p in pair])
     return r0.shuffle(r1, list(range(8)))
 
 
@@ -1595,8 +1602,11 @@ class S2RLoaderTrBf16(_S2RLoaderBf16):
         row_off = (m // 16) * 256 + kblk * 128 + (m % 16) * 4
         base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
         sub0 = (self.wave_idx * self.n_tiles + i) * len(self._SUB)
+        # _SUB is consecutive and compile-time, so hand it to the immediate field
+        # rather than the address: all four subs then share one base VGPR.
         return [
-            _read_tr16_sub(base_i32, sub0 + self._SUB[c], row_off) for c in range_constexpr(len(self._SUB))
+            _read_tr16_sub(base_i32, sub0, row_off, sub_const=self._SUB[c])
+            for c in range_constexpr(len(self._SUB))
         ]
 
 
@@ -1683,11 +1693,24 @@ class S2RLoaderBf16(_S2RLoaderBf16):
     def _tile(self, lds_src, i):
         m, kblk = self.lane_id % 32, self.lane_id // 32
         row = self.wave_idx * (self.n_tiles * 32) + i * 32 + m
+        # The three address fields are bit-disjoint, so the whole sub set is one
+        # base XOR a compile-time literal. Byte column of sub c is
+        #   col_c = _K_BASE[c]*2 + kblk*16 = c*32 + kblk*16   (bits [4,7))
+        # and the XOR swizzle S = ((row % 16) >> 1) << 4 also lives in bits [4,7),
+        # while row*128 owns bits >= 7. Hence
+        #   addr_c = row*128 + (col_c ^ S) = (row*128 + (kblk*16 ^ S)) ^ (c*32),
+        # an algebraic identity (verified bit-exact), not an approximation.
+        # Re-deriving the swizzle per sub costs the mask/shift/xor chain four times
+        # over; this pays it once per tile -- and `row` is k-invariant, so the base
+        # is hoisted out of the unrolled k-loop entirely, leaving exactly one
+        # v_xor_b32 with an inline constant per sub (c == 0 is free). The mainloop
+        # issues 24 of these reads per k-iteration on nt, and at 2 waves/SIMD there
+        # is no second wave to hide the VALU issue slots behind.
+        _, cs0 = swizzle_128(row, kblk * 16)
+        base = row * 128 + cs0
         subs = []
         for c in range_constexpr(len(self._K_BASE)):
-            col_byte = (self._K_BASE[c] + kblk * 8) * 2
-            _, cs = swizzle_128(row, col_byte)
-            subs.append(_load8_bf16(lds_src, row * 128 + cs))
+            subs.append(_load8_bf16(lds_src, base if c == 0 else base ^ (c * 32)))
         return subs
 
 

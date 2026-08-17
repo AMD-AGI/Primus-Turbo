@@ -15,6 +15,7 @@
 
 import functools
 import math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -59,6 +60,14 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 )
 
 # isort: on
+
+# Epilogue C-store placement inside dense_mma_pipeline_bf16's MFMA tail (see the use
+# site for the reasoning and the measurements):
+#   0 = batched after the tail (the original), 1 = hoisted into the idle inter-barrier
+#   gap BEFORE the next MFMA group, 2 = hoisted into the SHADOW of the next MFMA group
+#   (default, measured fastest: 2.3915 / 2.3862 / 2.3705 ms on nt for modes 0/1/2).
+# The knob exists only so the arms can be re-run as a same-session A/B; production is 2.
+_HOIST_MODE = int(os.environ.get("TURBO_GEMM_HOIST_C", "2"))
 
 
 def _i64(v):
@@ -274,6 +283,13 @@ def dense_mma_pipeline_bf16(
     b_cur0, b_next0 = b_next0, b_cur0
     b_cur1, b_next1 = b_next1, b_cur1
 
+    # Address math is needed BEFORE the last MFMA group once the stores are hoisted, and
+    # it is loop-invariant scalar/lane arithmetic either way, so sinking it costs nothing.
+    wave_n_offset = wave_n * (N_TILES_B * 32)
+    wave_m_offset = wave_m * (N_TILES_A * 32)
+    base_row = block_m * BLOCK_M + wave_m_offset
+    base_col = block_n * BLOCK_N + wave_n_offset
+
     a0_frag = a_s2r.load(a_cur0)
     wait_barrier(0)
     rocdl.s_setprio(1)
@@ -282,28 +298,77 @@ def dense_mma_pipeline_bf16(
     rocdl.s_barrier()
 
     b1_frag = b_s2r.load(b_cur1)
+    # Epilogue store hoist. c00/c01/c10/c11 go final at four different points in this
+    # tail, but batching all four stores after it leaves the whole per-workgroup C drain
+    # (128 KB, ~4 cycles of address-unit time per instruction) fully exposed after the
+    # last MFMA. Issuing each quadrant as soon as ITS last MFMA has retired puts three
+    # quarters of that drain in the shadow of the remaining MFMA groups: the matrix pipe
+    # and the address unit are separate, so both the store issue and the ack traffic run
+    # underneath work that has to happen anyway. Safe by construction -- the only vmcnt
+    # wait left in the tail is the wait_barrier(0) ABOVE the first hoist, so nothing
+    # downstream force-drains a hoisted store mid-sequence, and the release rendezvous in
+    # the caller still waits vmcnt(0) before signalling.
+    #
+    # Placement matters as much as the hoist. Mode 1 parks a quadrant's stores in the
+    # inter-barrier gap BEFORE the next MFMA group, where the wave has nothing else in
+    # flight, so only the ack traffic (not the ~4-cycle-per-instruction issue cost) lands
+    # in the MFMA shadow. Mode 2 issues them immediately AFTER the group has been handed
+    # to the matrix pipe: the MFMAs occupy that pipe for a few hundred cycles while the
+    # wave stays free to issue VMEM, so the issue cost overlaps too. Measured on nt:
+    # mode 0 2.3915, mode 1 2.3862, mode 2 2.3705 ms -- placement alone is worth 0.66%.
+    if const_expr(_HOIST_MODE == 1):
+        store_c.store(c00_frag, base_row + 0, base_col + 0)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
     c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
     rocdl.s_setprio(0)
+    # Deliberately OUTSIDE the s_setprio(1) window: mode 2's whole advantage is that the
+    # matrix pipe is already loaded when the stores issue, and raising priority here
+    # would steal those issue slots back.
+    if const_expr(_HOIST_MODE >= 2):
+        store_c.store(c00_frag, base_row + 0, base_col + 0)
     rocdl.s_barrier()
 
     a1_frag = a_s2r.load(a_cur1)
+    if const_expr(_HOIST_MODE == 1):
+        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
     c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
     c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
     rocdl.s_setprio(0)
+    # Splitting this last MFMA pair across an EXTRA s_barrier -- so c10 goes final a group
+    # earlier and gets a full group of store cover too -- is NOT valid: the barrier count
+    # through this tail is load-bearing for the surrounding mega-kernel and adding one
+    # destroys the result (SNR 51.34 -> 1.21 dB). Stores may move between the existing
+    # barriers; the barriers themselves may not be added to or removed.
+    if const_expr(_HOIST_MODE >= 2):
+        # c01 is independent of the group just issued, so it drains under it; c10 then
+        # interlocks on its own MFMA, by which point those stores have covered it.
+        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+    if const_expr(_HOIST_MODE == 3):
+        # Mode 3 = mode 2 plus the last quadrant. c11 is produced by the second MFMA of
+        # the pair just issued, so its store cannot dodge that RAW interlock wherever it
+        # sits -- but sitting HERE instead of after the barrier hands it the barrier's
+        # own resync window (all 8 waves must arrive) as free drain time, and that window
+        # is on the critical path to the release rendezvous' vmcnt(0) in the caller. No
+        # barrier is added or removed; only the store moves across an existing one.
+        # MEASURED AND REJECTED (correct at SNR 51.34, but slower): counterbalanced 2x2,
+        # nt 2.3722 -> 2.3870 (+0.62%), nn 3.9766 -> 3.9733 (-0.08%). The barrier window
+        # is not free time here -- this wave is the last to arrive as often as not, so
+        # what the move actually does is put a stalled store between the MFMA pair and
+        # the barrier, delaying every OTHER wave's release. Keep the default at 2.
+        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
     rocdl.s_barrier()
 
-    wave_n_offset = wave_n * (N_TILES_B * 32)
-    wave_m_offset = wave_m * (N_TILES_A * 32)
-    base_row = block_m * BLOCK_M + wave_m_offset
-    base_col = block_n * BLOCK_N + wave_n_offset
-    store_c.store(c00_frag, base_row + 0, base_col + 0)
-    store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-    store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-    store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+    if const_expr(_HOIST_MODE == 0):
+        store_c.store(c00_frag, base_row + 0, base_col + 0)
+        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+    if const_expr(_HOIST_MODE < 2):
+        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+    if const_expr(_HOIST_MODE != 3):
+        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
 
 def gemm_bf16_nt_tile(
