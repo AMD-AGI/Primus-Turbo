@@ -1370,7 +1370,7 @@ def test_grouped_gemm_fp8_flydsl_fused_grad_accum_unaligned_k():
     _run_grouped_gemm_fp8_fused_grad_accum_test(
         B=2,
         M=32,
-        N=64,
+        N=256,
         K=2880,
         ori_dtype=torch.bfloat16,
         granularity=ScalingGranularity.TENSORWISE,
