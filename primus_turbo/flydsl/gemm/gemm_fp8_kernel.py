@@ -1452,29 +1452,10 @@ def _dense_tn_wave4_asm(geom, cbsz, blgp):
 
     def mfma_seq():
         # srcA pool outer (this mfma is srcA-movement sensitive); the diagonal spreads refills.
-        bm, bn = 2, geom.bstep or nb // 2
-        n_row_steps, n_col_steps = nt // bm, nb // bn
-        seq = []
-        for d in range(n_row_steps + n_col_steps - 1):
-            for iib in range(n_row_steps):
-                if not 0 <= d - iib < n_col_steps:
-                    continue
-                for di in range(bm):
-                    for ah in range(len(ap)):
-                        for dj in range(bn):
-                            col, ii = (d - iib) * bn + dj, iib * bm + di
-                            bi, bt = bcol[col]
-                            q = qoff[(ah, bi)] + ii * pools[bp[bi]].tiles + bt
-                            at = nacc + ah * nt + ii
-                            br = nacc + na + col
-                            seq.append(
-                                (
-                                    f"v_mfma_f32_16x16x128_f8f6f4 ${q}, ${at}, ${br}, ${q}{mods}",
-                                    at,
-                                    br,
-                                )
-                            )
-        return seq
+        return [
+            (f"v_mfma_f32_16x16x128_f8f6f4 ${q}, ${at}, ${br}, ${q}{mods}", at, br)
+            for q, at, br in _tn4_mfma_order(geom, nt, nb, na, nacc, ap, bp, bcol, qoff, pools)
+        ]
 
     def emit_phase(rbuf, wbuf):
         # Refill a fragment right after its last consumer; global writes take the free slots.
@@ -2061,6 +2042,27 @@ def _nt4_fold_gl_off(lane_id, wave_id, K, n_rounds, gq, fold):
     return out
 
 
+def _tn4_mfma_order(geom, nt, nb, na, nacc, ap, bp, bcol, qoff, pools):
+    """(accumulator, srcA, srcB) of one phase's mfma, in issue order: the srcA pool is outer
+    because this mfma is srcA-movement sensitive, and the diagonal spreads the refills."""
+    bm, bn = 2, geom.bstep or nb // 2
+    n_row_steps, n_col_steps = nt // bm, nb // bn
+    for d in range(n_row_steps + n_col_steps - 1):
+        for iib in range(n_row_steps):
+            if not 0 <= d - iib < n_col_steps:
+                continue
+            for di in range(bm):
+                for ah in range(len(ap)):
+                    for dj in range(bn):
+                        col, ii = (d - iib) * bn + dj, iib * bm + di
+                        bi, bt = bcol[col]
+                        yield (
+                            qoff[(ah, bi)] + ii * pools[bp[bi]].tiles + bt,
+                            nacc + ah * nt + ii,
+                            nacc + na + col,
+                        )
+
+
 def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN4_BLOCK_K, carry=False):
     """Bare-asm K body for one NT output tile; ``carry`` hands the closing fills to the next tile."""
     key = (geom, k_iters, cbsz, blgp, fold, tr_b, b_kstep, carry)
@@ -2165,30 +2167,10 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
         ]
 
     def mfma_seq(init):
-        bm, bn = 2, geom.bstep or nb // 2
-        n_row_steps, n_col_steps = nt // bm, nb // bn
-        seq = []
-        for d in range(n_row_steps + n_col_steps - 1):
-            for iib in range(n_row_steps):
-                if not 0 <= d - iib < n_col_steps:
-                    continue
-                for di in range(bm):
-                    for ah in range(len(ap)):
-                        for dj in range(bn):
-                            col, ii = (d - iib) * bn + dj, iib * bm + di
-                            bi, bt = bcol[col]
-                            q = qoff[(ah, bi)] + ii * pools[bp[bi]].tiles + bt
-                            at = nacc + ah * nt + ii
-                            br = nacc + na + col
-                            seq.append(
-                                (
-                                    f"v_mfma_f32_16x16x128_f8f6f4 ${q}, ${at}, ${br}, {src2(q, init)}{mods}",
-                                    at,
-                                    br,
-                                    q,
-                                )
-                            )
-        return seq
+        return [
+            (f"v_mfma_f32_16x16x128_f8f6f4 ${q}, ${at}, ${br}, {src2(q, init)}{mods}", at, br, q)
+            for q, at, br in _tn4_mfma_order(geom, nt, nb, na, nacc, ap, bp, bcol, qoff, pools)
+        ]
 
     def emit_phase(rbuf, wbuf, init, left):
         g2sl, mlist = emit_g2s(wbuf, left), mfma_seq(init)
@@ -2802,6 +2784,31 @@ def _dense_beta1_entry(cache, key, tuned):
     return entry
 
 
+def _dense_race(cache, key, args, layout, builders, beta_is_one):
+    """First-call race of ``builders`` -- (cfg, factory) pairs -- with the winner cached by
+    ``key``. A candidate that fails to build, or whose output sample is not finite, is dropped
+    before it is timed, so a geometry that does not hold for the shape just leaves the race."""
+    tuned = cache.get(key)
+    if tuned is None:
+        bargs, out_view = _bench_dense_args(args)
+        cands = []
+        for cfg, build in builders:
+            try:
+                launch = build(beta_is_one=False)
+                c = _get_compiled_dense(launch, bargs)
+                c(*bargs)
+                torch.cuda.synchronize()
+                if not torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
+                    continue
+                cands.append([launch, cfg, c, build])  # c: compiled, reused eager
+            except Exception:
+                continue
+        if not cands:
+            raise RuntimeError(f"{layout} autotune found no working cfg for {key[:3]}")
+        cache[key] = tuned = _pick_dense_candidate(cands, bargs)
+    return _dense_beta1_entry(cache, key, tuned) if beta_is_one else tuned
+
+
 def _pick_dense_candidate(cands, args):
     """Fastest of ``cands`` = [[launch, cfg, compiled, factory], ...], sampled twice with the second
     pass reversed and kept at its min, behind a throwaway pass: the leading candidates sit
@@ -2843,7 +2850,6 @@ def _scalar_scale(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
     return scale.to(dtype=torch.float32, device=device).reshape(1)
 
 
-# (BLOCK_M, GROUP_M, group_n, num_xcd, AGPR)
 # (BLOCK_M, GROUP_M, group_n, num_xcd, AGPR), keyed on whether the whole loop is eligible:
 # it takes two of the four slots when it is, so a shape never races more than four builds.
 _NN_CANDIDATES = {
@@ -2861,36 +2867,13 @@ _NN_AUTOTUNE_CACHE: dict = {}
 def _autotune_nn_dispatch(
     args, M, N, K, cbsz=0, blgp=0, out_fp16=False, i64_traverse=False, beta_is_one=False
 ):
-    """First-call bench of the NN candidates, best (launch, cfg) cached by (M,N,K); each is
-    finite-checked before it is timed (see _pick_dense_candidate). ``i64_traverse`` re-bases
-    B's SRD per load, lifting the k*n < 2^32 cap."""
-    import torch as _torch
-
-    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
-    tuned = _NN_AUTOTUNE_CACHE.get(key)
-    if tuned is not None:
-        return _dense_beta1_entry(_NN_AUTOTUNE_CACHE, key, tuned) if beta_is_one else tuned
-    bargs, out_view = _bench_dense_args(args)
-    cands = []
+    """NN candidates for the shape, raced on first call (see _dense_race). ``i64_traverse``
+    re-bases B's SRD per load, lifting the k*n < 2^32 cap."""
     pair_n, col_safe = N % 2 == 0 and not out_fp16, N % 256 == 0
-
     w4 = not i64_traverse and K % _TN4_BLOCK_K == 0 and K // _TN4_BLOCK_K >= _NN4_MIN_K_ITERS
-
-    def add(build, cfg):
-        # clamp on the A G2S load), so no even-tiling filter is needed.
-        try:
-            launch = build(beta_is_one=False)
-            c = _get_compiled_dense(launch, bargs)
-            c(*bargs)
-            _torch.cuda.synchronize()
-            if not _torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
-                return
-            cands.append([launch, cfg, c, build])  # c: compiled, reused eager
-        except Exception:
-            return
-
-    for bm, gm, gn, xcd, ag in _NN_CANDIDATES[w4]:
-        add(
+    builders = [
+        (
+            (bm, gm, gn, xcd, ag),
             functools.partial(
                 _compile_dense_nn,
                 K=K,
@@ -2909,14 +2892,16 @@ def _autotune_nn_dispatch(
                 pair_n=pair_n,
                 col_safe=col_safe,
             ),
-            (bm, gm, gn, xcd, ag),
         )
+        for bm, gm, gn, xcd, ag in _NN_CANDIDATES[w4]
+    ]
     # The whole-loop joins the race where it applies: one barrier per K-block and a wave
     # tile twice as wide, against an epilogue occ=1 cannot shadow. Its B side is one
     # 32-bit soffset chain, so a span needing the i64 re-base stays with the 8-wave tiles.
     if w4:
-        for gm, gn, xcd in _NN4_BANDS:
-            add(
+        builders += [
+            (
+                ("nn4", gm, gn, xcd),
                 functools.partial(
                     _compile_dense_nn_wave4,
                     M,
@@ -2931,16 +2916,13 @@ def _autotune_nn_dispatch(
                     pair_n=pair_n,
                     col_safe=col_safe,
                 ),
-                ("nn4", gm, gn, xcd),
             )
-    if not cands:
-        raise RuntimeError(f"NN autotune found no working cfg for ({M},{N},{K})")
-    best = _pick_dense_candidate(cands, bargs)
-    _NN_AUTOTUNE_CACHE[key] = best
-    return _dense_beta1_entry(_NN_AUTOTUNE_CACHE, key, best) if beta_is_one else best
+            for gm, gn, xcd in _NN4_BANDS
+        ]
+    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
+    return _dense_race(_NN_AUTOTUNE_CACHE, key, args, "NN", builders, beta_is_one)
 
 
-# (BLOCK_M, GROUP_M, num_xcd, AGPR); the live band is a GROUP_M-wide super-row of A
 # (BLOCK_M, GROUP_M, num_xcd, AGPR); the live band is a GROUP_M-wide super-row of A. One
 # table per regime, four wide: a race compiles every entry, so the list is what first-call
 # latency costs. Once the band outgrows an XCD L2 slice, clustering onto XCDs buys no reuse
@@ -2962,35 +2944,14 @@ _NT_AUTOTUNE_CACHE: dict = {}
 
 
 def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, beta_is_one=False):
-    """First-call bench of the NT candidates, best (launch, cfg) cached by (M,N,K); each is
-    finite-checked before it is timed (see _pick_dense_candidate). The 8-wave tiles are joined
-    by the 4-wave whole-loop on the long-K shapes whose steady state pays for it."""
-    import torch as _torch
-
-    key = (M, N, K, cbsz, blgp, out_fp16)
-    tuned = _NT_AUTOTUNE_CACHE.get(key)
-    if tuned is not None:
-        return _dense_beta1_entry(_NT_AUTOTUNE_CACHE, key, tuned) if beta_is_one else tuned
-    bargs, out_view = _bench_dense_args(args)
-    cands = []
+    """NT candidates for the shape, raced on first call (see _dense_race). The 8-wave tiles are
+    joined by the 4-wave whole-loop on the long-K shapes whose steady state pays for it."""
     pair_n, col_safe = N % 2 == 0 and not out_fp16, N % 256 == 0
-
-    def add(build, cfg):
-        try:
-            launch = build(beta_is_one=False)
-            c = _get_compiled_dense(launch, bargs)
-            c(*bargs)
-            _torch.cuda.synchronize()
-            if not _torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
-                return
-            cands.append([launch, cfg, c, build])  # c: compiled, reused eager
-        except Exception:
-            return
-
     w4 = K % _TN4_BLOCK_K == 0 and K // _TN4_BLOCK_K >= _NT4_MIN_K_ITERS
     wide = 4 * 256 * K > _NT_BAND_L2_BYTES  # GROUP_M * BLOCK_M * K of the leading cfg
-    for bm, gm, xcd, ag in _NT_CANDIDATES[(w4, wide)]:
-        add(
+    builders = [
+        (
+            (bm, gm, xcd, ag),
             functools.partial(
                 _compile_dense_nt,
                 K=K,
@@ -3005,11 +2966,13 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, beta_is
                 pair_n=pair_n,
                 col_safe=col_safe,
             ),
-            (bm, gm, xcd, ag),
         )
+        for bm, gm, xcd, ag in _NT_CANDIDATES[(w4, wide)]
+    ]
     if w4:
-        for gm, xcd in _NT4_BANDS:
-            add(
+        builders += [
+            (
+                ("nt4", gm, xcd),
                 functools.partial(
                     _compile_dense_nt_wave4,
                     M,
@@ -3023,13 +2986,11 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, beta_is
                     pair_n=pair_n,
                     col_safe=col_safe,
                 ),
-                ("nt4", gm, xcd),
             )
-    if not cands:
-        raise RuntimeError(f"NT autotune found no working cfg for ({M},{N},{K})")
-    best = _pick_dense_candidate(cands, bargs)
-    _NT_AUTOTUNE_CACHE[key] = best
-    return _dense_beta1_entry(_NT_AUTOTUNE_CACHE, key, best) if beta_is_one else best
+            for gm, xcd in _NT4_BANDS
+        ]
+    key = (M, N, K, cbsz, blgp, out_fp16)
+    return _dense_race(_NT_AUTOTUNE_CACHE, key, args, "NT", builders, beta_is_one)
 
 
 _TN_WAVE4_CACHE: dict = {}
@@ -3193,18 +3154,11 @@ def _autotune_tn_dispatch(
     L2-resident shapes pick num_xcd=1. ``i64_traverse`` re-bases A's and B's
     SRDs per load (lifts the k*m / k*n < 2^32 cap; threaded to _compile_dense_tn).
     """
-    import torch as _torch
-
-    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
-    tuned = _TN_AUTOTUNE_CACHE.get(key)
-    if tuned is not None:
-        return _dense_beta1_entry(_TN_AUTOTUNE_CACHE, key, tuned) if beta_is_one else tuned
     bm = 256
-    bargs, out_view = _bench_dense_args(args)
-    cands = []
-    for xcd in (8, 1):
-        try:
-            mk = functools.partial(
+    builders = [
+        (
+            (bm, 4, 0, xcd),
+            functools.partial(
                 _compile_dense_tn,
                 K=K,
                 BLOCK_M=bm,
@@ -3217,22 +3171,12 @@ def _autotune_tn_dispatch(
                 blgp=blgp,
                 out_fp16=out_fp16,
                 i64_traverse=i64_traverse,
-            )
-            launch = mk(beta_is_one=False)
-            c = _get_compiled_dense(launch, bargs)
-            c(*bargs)
-            _torch.cuda.synchronize()
-            sample = out_view.view(-1)[:1024].float()
-            if not _torch.isfinite(sample).all().item():
-                continue
-            cands.append([launch, (bm, 4, 0, xcd), c, mk])  # c: compiled, reused eager
-        except Exception:
-            continue
-    if not cands:
-        raise RuntimeError(f"TN autotune found no working cfg for ({M},{N},{K})")
-    best = _pick_dense_candidate(cands, bargs)
-    _TN_AUTOTUNE_CACHE[key] = best
-    return _dense_beta1_entry(_TN_AUTOTUNE_CACHE, key, best) if beta_is_one else best
+            ),
+        )
+        for xcd in (8, 1)
+    ]
+    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
+    return _dense_race(_TN_AUTOTUNE_CACHE, key, args, "TN", builders, beta_is_one)
 
 
 def gemm_fp8_tensorwise_flydsl_kernel(
