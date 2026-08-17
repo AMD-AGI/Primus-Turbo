@@ -242,9 +242,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 (batch_size, num_heads_v, seq_len_kv, head_dim_v), dtype=v.dtype, device=v.device
             ).permute(0, 2, 1, 3)
         else:
-            dq = torch.ones(
-                (batch_size, seq_len_q, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
-            )
+            dq = torch.ones((batch_size, seq_len_q, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device)
             dk = torch.empty(
                 (batch_size, seq_len_kv, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device
             )

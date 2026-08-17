@@ -174,7 +174,12 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         # the [s,b,h,d] view of these [b,s,h,d]-shaped tensors to be contiguous -- which is
         # the test, rather than a storage-order name. It holds for sbhd bytes at any batch,
         # and at b == 1 for bshd bytes too, those being the same bytes.
-        if k is None or v is None or not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
+        if (
+            k is None
+            or v is None
+            or not _gqa_group_ok(q.shape[2], k.shape[2])
+            or not _sink_ok(sink, q.shape[2])
+        ):
             return False
         return all(t.permute(1, 0, 2, 3).is_contiguous() for t in (q, k, v)) and _flydsl_common_ok(
             q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes

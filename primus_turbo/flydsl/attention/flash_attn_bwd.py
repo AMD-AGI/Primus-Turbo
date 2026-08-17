@@ -106,11 +106,7 @@ def _band_span_for(n_bands, band_bytes, ilv, whole=True):
         span = max(1, _WSQ_BUDGET_BYTES // band_bytes)
         return span - span % _NUM_XCD if span >= _NUM_XCD else span
     span = ilv
-    while (
-        span * 2 < n_bands
-        and n_bands % (span * 2) == 0
-        and span * 2 * band_bytes <= _WSQ_BUDGET_BYTES
-    ):
+    while span * 2 < n_bands and n_bands % (span * 2) == 0 and span * 2 * band_bytes <= _WSQ_BUDGET_BYTES:
         span *= 2
     return span if span < n_bands else 0
 
@@ -793,9 +789,7 @@ def build_flash_attn_bwd_dqred_module(
                 _lonum = _qloc - (_qloc % fx.Index(BQ)) + _kvlen
                 _losub = _qlen + fx.Index(window_left)
                 g_lo = fx.Index(
-                    ArithValue(_lonum > _losub).select(
-                        (_lonum - _losub) // fx.Index(block_kv), fx.Index(0)
-                    )
+                    ArithValue(_lonum > _losub).select((_lonum - _losub) // fx.Index(block_kv), fx.Index(0))
                 )
             else:
                 g_lo = fx.Index(0)
@@ -829,9 +823,7 @@ def build_flash_attn_bwd_dqred_module(
             else:
                 _lo_rsrc = buffer_ops.create_buffer_resource(CuSeqKv, max_size=True)
                 _lo_idx = fx.Index(0)
-            _blo = fx.Index(
-                fx.Int32(buffer_ops.buffer_load(_lo_rsrc, _lo_idx, vec_width=1, dtype=fx.Int32))
-            )
+            _blo = fx.Index(fx.Int32(buffer_ops.buffer_load(_lo_rsrc, _lo_idx, vec_width=1, dtype=fx.Int32)))
             _bhi = _blo + fx.Index(SPAN)
             _abs_lo, _abs_hi = g_lo, g_hi
             _top = fx.Index(ArithValue(_abs_hi < _bhi).select(_abs_hi, _bhi))
@@ -843,9 +835,7 @@ def build_flash_attn_bwd_dqred_module(
                 # A ragged row can see no key at all (its segment has fewer keys than
                 # queries), which makes it live in NO group -- so the first group also owns
                 # the zero store such a row gets for free when one pass folds every band.
-                _final = _final | (
-                    ArithValue(_abs_hi <= _abs_lo) & ArithValue(_blo == fx.Index(0))
-                )
+                _final = _final | (ArithValue(_abs_hi <= _abs_lo) & ArithValue(_blo == fx.Index(0)))
             _carry_on = _live & ArithValue(_abs_hi > _bhi)
         base = row0 * fx.Index(HD) + chunk * fx.Index(CHUNK_ELEMS) + tid * fx.Index(VEC)
         offs = [base + fx.Index(c * BLOCK * VEC) for c in range_constexpr(UC)]
@@ -867,20 +857,14 @@ def build_flash_attn_bwd_dqred_module(
                 max_size=False,
                 num_records_bytes=_raw(
                     fx.Index(
-                        (_live & ArithValue(_blo > fx.Index(0))).select(
-                            fx.Index(CARRY_BYTES), fx.Index(0)
-                        )
+                        (_live & ArithValue(_blo > fx.Index(0))).select(fx.Index(CARRY_BYTES), fx.Index(0))
                     )
                 ),
             )
             acc = [
                 Vec(buffer_ops.buffer_load(_carry_rd, o, vec_width=4, dtype=fx.Float32))
                 .shuffle(
-                    Vec(
-                        buffer_ops.buffer_load(
-                            _carry_rd, o + fx.Index(4), vec_width=4, dtype=fx.Float32
-                        )
-                    ),
+                    Vec(buffer_ops.buffer_load(_carry_rd, o + fx.Index(4), vec_width=4, dtype=fx.Float32)),
                     list(range(VEC)),
                 )
                 .ir_value()
@@ -921,9 +905,7 @@ def build_flash_attn_bwd_dqred_module(
             _carry_wr = buffer_ops.create_buffer_resource(
                 CARRY,
                 max_size=False,
-                num_records_bytes=_raw(
-                    fx.Index(_carry_on.select(fx.Index(CARRY_BYTES), fx.Index(0)))
-                ),
+                num_records_bytes=_raw(fx.Index(_carry_on.select(fx.Index(CARRY_BYTES), fx.Index(0)))),
             )
             for c in range_constexpr(UC):
                 for s in range_constexpr(VEC // 4):
@@ -1706,11 +1688,7 @@ def build_flash_attn_bwd_dkdv_module(
             # last cu_seqlens entry -- one more wave-uniform scalar load, rather than an
             # argument slot every non-fused body would have to carry as well.
             total_q_v = fx.Index(
-                fx.Int32(
-                    buffer_ops.buffer_load(
-                        _cuq_rsrc, fx.Index(batch_size), vec_width=1, dtype=fx.Int32
-                    )
-                )
+                fx.Int32(buffer_ops.buffer_load(_cuq_rsrc, fx.Index(batch_size), vec_width=1, dtype=fx.Int32))
             )
             if const_expr(BAND_SPAN):
                 # This pass's first band, one entry past the segment table (see _cu_band_rows).
@@ -1919,8 +1897,7 @@ def build_flash_attn_bwd_dkdv_module(
             # The group enters K/V at its own first kv row; num_records then covers exactly
             # the group, so the loads of a band that the causal edge leaves empty fall out.
             _kv_batch_byte_off = _raw(
-                (batch_idx * fx.Index(STRIDE_TOKEN_KV) + _kv_lift * fx.Index(RD_STRIDE_KV))
-                * fx.Index(2)
+                (batch_idx * fx.Index(STRIDE_TOKEN_KV) + _kv_lift * fx.Index(RD_STRIDE_KV)) * fx.Index(2)
             )
         elif const_expr(sbhd):
             _kv_batch_byte_off = _raw(batch_idx * fx.Index(STRIDE_TOKEN_KV * 2))
@@ -2660,9 +2637,7 @@ def build_flash_attn_bwd_dkdv_module(
         if const_expr(BAND_LIFT):
             _kv_first_q = kv_start + _kv_lift
         else:
-            _kv_first_q = ArithValue(kv_start >= causal_offset).select(
-                kv_start - causal_offset, fx.Index(0)
-            )
+            _kv_first_q = ArithValue(kv_start >= causal_offset).select(kv_start - causal_offset, fx.Index(0))
         if const_expr(QSP_ABS):
             _qsp_ph = (_kv_first_q // fx.Index(BLOCK_Q)) % fx.Index(Q_SPLIT)
             _q_loop_start = _kv_first_q + (
@@ -3288,9 +3263,9 @@ def build_flash_attn_bwd_dkdv_module(
                         _ds_write_vec(
                             (_g3wb ^ _qx) ^ fx.Index(2 * M_TILE),
                             _g3wo,
-                            Vec.from_elements(
-                                [fx.Int32(0) for _ in range_constexpr(4)], fx.Int32
-                            ).bitcast(elem_dtype),
+                            Vec.from_elements([fx.Int32(0) for _ in range_constexpr(4)], fx.Int32).bitcast(
+                                elem_dtype
+                            ),
                         )
                     else:
                         _ds_write_vec(_g3wb ^ fx.Index(pks * 2 * M_TILE), _g3wo, ds_pack[pks][nt])
@@ -4858,9 +4833,7 @@ def flydsl_varlen_backward(
     # ilv packing assumes whole band groups; a non-aligned Skv's ragged top band breaks
     # it, so interleave only when Skv tiles the band exactly (D128 or windowed only).
     wsq_ilv = (
-        _wsq_ilv(n_bands, B, Sq, Hq * D)
-        if Skv % block_kv == 0 and (D == 128 or window_left >= 0)
-        else 1
+        _wsq_ilv(n_bands, B, Sq, Hq * D) if Skv % block_kv == 0 and (D == 128 or window_left >= 0) else 1
     )
     # Long context: the dQ partial workspace is bands*|dQ| and outgrows the card, so walk the
     # band axis in groups instead of asking for all of it at once (see _band_span_for).
@@ -4898,11 +4871,7 @@ def flydsl_varlen_backward(
         # a ragged top band makes the split->q-block map band-dependent (see _pipe_chunks),
         # so a non-aligned Skv must take the single whole-batch dispatch.
         and Skv % block_kv == 0
-        and (
-            (_qsp_absolute(D, block_kv, q_split) and _qsp_cuttable(Sq, q_split))
-            if sbhd
-            else B > 1
-        )
+        and ((_qsp_absolute(D, block_kv, q_split) and _qsp_cuttable(Sq, q_split)) if sbhd else B > 1)
     )
     if not pipe:
         odo_l(o16, dout.to(q.dtype).reshape(-1), delta.reshape(-1), B, Sq, st)
