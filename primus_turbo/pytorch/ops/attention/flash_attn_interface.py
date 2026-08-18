@@ -101,9 +101,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.backend = backend
         if backend == BackendType.HIPKITTENS:
             # Same sbhd precondition as FlyDSL below, and for the same reason.
-            assert _sbhd_layout(
-                q, qkv_format
-            ), f"hipkittens dense attention is sbhd only, got {qkv_format}"
+            assert _sbhd_layout(q, qkv_format), f"hipkittens dense attention is sbhd only, got {qkv_format}"
             q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
             out_s, lse = flash_attn_sbhd_hipkittens_forward_impl(
                 q_s,

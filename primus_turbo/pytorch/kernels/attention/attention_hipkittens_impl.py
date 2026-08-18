@@ -85,6 +85,13 @@ def flash_attn_sbhd_hipkittens_backward_impl(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SBHD backward. Returns ``(dq, dk, dv)`` in the layouts of q, k and v."""
     return _layer().hipkittens_attn_backward(
-        dout, q, k, v, out, lse,
-        softmax_scale=softmax_scale, causal=causal, window_size=window_size,
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
     )

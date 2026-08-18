@@ -23,9 +23,8 @@ namespace primus_turbo::hipkittens {
 // The descriptor holds a raw pointer, so the caller must keep the buffer alive for the
 // launch. Every call site is a launcher that takes the descriptor by reference and launches
 // before returning, so that holds by construction.
-template <typename GL>
-GL make_gl_from_desc(const HkTensorDesc &t) {
+template <typename GL> GL make_gl_from_desc(const HkTensorDesc &t) {
     return kittens::make_gl<GL>(reinterpret_cast<uint64_t>(t.data), t.d0, t.d1, t.d2, t.d3);
 }
 
-}  // namespace primus_turbo::hipkittens
+} // namespace primus_turbo::hipkittens

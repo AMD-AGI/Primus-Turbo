@@ -401,7 +401,6 @@ void register_odc_rocshmem_host(pybind11::module_ &m);
 void register_odc_rocshmem_gda(pybind11::module_ &m);
 #endif
 
-
 //==================================================================
 //  HipKittens attention (gfx950)
 //==================================================================

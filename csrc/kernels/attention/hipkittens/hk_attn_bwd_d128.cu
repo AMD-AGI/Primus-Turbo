@@ -97,7 +97,7 @@ namespace primus_turbo::hipkittens {
 namespace {
 
 using _gl_QKVO = gl<bf16, -1, -1, -1, -1>;
-using _gl_L = gl<float, -1, -1, -1, -1>;
+using _gl_L    = gl<float, -1, -1, -1, -1>;
 
 // LOG2E folded into the scale so every exponential is the native exp2.
 constexpr float LOG2E = 1.44269504088896340736f;
@@ -120,26 +120,26 @@ constexpr float LOG2E = 1.44269504088896340736f;
 // respectively; raising dkdv's sharing means slicing a 64-row staged tile into two
 // 32-row compute passes, which is a queued idea rather than baseline material.
 // ---------------------------------------------------------------------------------
-constexpr int DQ_Q_BLOCK = 32;    // q rows per wave
-constexpr int DQ_KV_BLOCK = 64;   // kv rows per staged tile
+constexpr int DQ_Q_BLOCK  = 32; // q rows per wave
+constexpr int DQ_KV_BLOCK = 64; // kv rows per staged tile
 #define DQ_NUM_WARPS 8
 #define DQ_NUM_THREADS (kittens::WARP_THREADS * DQ_NUM_WARPS)
 
-constexpr int DKDV_KV_WAVE = 32;  // kv rows per wave
-constexpr int DKDV_Q_BLOCK = 32;  // q rows per staged tile
+constexpr int DKDV_KV_WAVE = 32; // kv rows per wave
+constexpr int DKDV_Q_BLOCK = 32; // q rows per staged tile
 #define DKDV_NUM_WARPS 4
 #define DKDV_NUM_THREADS (kittens::WARP_THREADS * DKDV_NUM_WARPS)
-constexpr int DKDV_KV_BLOCK = DKDV_KV_WAVE * DKDV_NUM_WARPS;  // kv rows per workgroup
+constexpr int DKDV_KV_BLOCK = DKDV_KV_WAVE * DKDV_NUM_WARPS; // kv rows per workgroup
 
 // The fused single-pass kernel (idea B5): one workgroup owns a KV block and computes all
 // five products, so dS never has to be recomputed. NUM_WARPS is bounded above by the head
 // dim -- the fifth product partitions dQ^T's D axis across the waves and an MFMA operand
 // cannot be narrower than 16, so D / BW_NUM_WARPS >= 16, which caps it at 4 for D = 64.
-constexpr int BW_KV_WAVE = 32;   // key rows per wave
-constexpr int BW_Q_BLOCK = 32;   // query rows per staged tile
+constexpr int BW_KV_WAVE = 32; // key rows per wave
+constexpr int BW_Q_BLOCK = 32; // query rows per staged tile
 #define BW_NUM_WARPS 4
 #define BW_NUM_THREADS (kittens::WARP_THREADS * BW_NUM_WARPS)
-constexpr int BW_KV_BLOCK = BW_KV_WAVE * BW_NUM_WARPS;  // key rows per workgroup
+constexpr int BW_KV_BLOCK = BW_KV_WAVE * BW_NUM_WARPS; // key rows per workgroup
 
 constexpr int PREP_Q_BLOCK = 32;
 #define PREP_NUM_WARPS 4
@@ -244,7 +244,7 @@ __device__ inline void load(ST &dst, const GL &src, const COORD &idx, int unifor
     using T = typename ST::dtype;
 
     constexpr int bytes_per_thread = ST::underlying_subtile_bytes_per_thread;
-    constexpr int bytes_per_warp = bytes_per_thread * kittens::WARP_THREADS;
+    constexpr int bytes_per_warp   = bytes_per_thread * kittens::WARP_THREADS;
     constexpr int memcpy_per_tile =
         ST::rows * ST::cols * sizeof(T) / (bytes_per_thread * N_THREADS);
     static_assert(ST::rows * ST::cols * sizeof(T) >= bytes_per_warp,
@@ -252,18 +252,19 @@ __device__ inline void load(ST &dst, const GL &src, const COORD &idx, int unifor
     static_assert(memcpy_per_tile >= 1,
                   "staged tile is smaller than one cooperative DMA round; raise the tile "
                   "or lower N_THREADS");
-    static_assert(memcpy_per_tile * (bytes_per_thread * N_THREADS) == ST::rows * ST::cols * sizeof(T),
-                  "cooperative fill leaves a remainder; transcribe the library's leftover path too");
+    static_assert(
+        memcpy_per_tile * (bytes_per_thread * N_THREADS) == ST::rows * ST::cols * sizeof(T),
+        "cooperative fill leaves a remainder; transcribe the library's leftover path too");
 
     constexpr int num_warps = N_THREADS / kittens::WARP_THREADS;
-    const int laneid = kittens::laneid();
-    const int warpid = uniform_warpid % num_warps;
+    const int     laneid    = kittens::laneid();
+    const int     warpid    = uniform_warpid % num_warps;
 
     const int row_stride = src.template stride<axis>();
 
     coord<> unit_coord = idx.template unit_coord<axis, 3>();
-    T *global_ptr = (T *)&src[unit_coord];
-    i32x4 srsrc = make_srsrc(global_ptr, row_stride * ST::rows * sizeof(T));
+    T      *global_ptr = (T *) &src[unit_coord];
+    i32x4   srsrc      = make_srsrc(global_ptr, row_stride * ST::rows * sizeof(T));
 
     const uintptr_t lds_base =
         reinterpret_cast<uintptr_t>(&dst.data[0]) + (warpid * bytes_per_warp);
@@ -272,9 +273,9 @@ __device__ inline void load(ST &dst, const GL &src, const COORD &idx, int unifor
     for (int i = 0; i < memcpy_per_tile; i++) {
         const int lane_byte_offset = (laneid * bytes_per_thread) + (warpid * bytes_per_warp) +
                                      (i * num_warps * bytes_per_warp);
-        const int subtile_id = lane_byte_offset / ST::underlying_subtile_bytes;
-        const int subtile_row = subtile_id / ST::underlying_subtiles_per_row;
-        const int subtile_col = subtile_id % ST::underlying_subtiles_per_row;
+        const int subtile_id               = lane_byte_offset / ST::underlying_subtile_bytes;
+        const int subtile_row              = subtile_id / ST::underlying_subtiles_per_row;
+        const int subtile_col              = subtile_id % ST::underlying_subtiles_per_row;
         const int subtile_lane_byte_offset = lane_byte_offset % ST::underlying_subtile_bytes;
 
         const int row = subtile_lane_byte_offset / ST::underlying_subtile_row_bytes;
@@ -291,15 +292,15 @@ __device__ inline void load(ST &dst, const GL &src, const COORD &idx, int unifor
         const uint32_t swizzled_global_byte_offset =
             (swizzled_global_row * row_stride + swizzled_global_col) * sizeof(T);
 
-        uintptr_t lds_addr = lds_base + (i * num_warps * bytes_per_warp);
-        as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
+        uintptr_t      lds_addr = lds_base + (i * num_warps * bytes_per_warp);
+        as3_uint32_ptr lds_ptr  = (as3_uint32_ptr) (lds_addr);
 
         llvm_amdgcn_raw_buffer_load_lds(srsrc, lds_ptr, bytes_per_thread,
                                         swizzled_global_byte_offset, 0, 0,
                                         static_cast<int>(coherency::cache_all));
     }
 }
-}  // namespace hk_stage
+} // namespace hk_stage
 
 // ---------------------------------------------------------------------------------
 // THE ALIAS FIX, PART 1 -- a local transcription of the library's COLUMN-LAYOUT
@@ -349,157 +350,177 @@ __device__ inline void load(ST &dst, const GL &src, const COORD &idx, int unifor
 // aliasing pairs goes 4 -> 0.
 // ---------------------------------------------------------------------------------
 namespace hk_tr {
-template<ducks::rt::col_layout RT, ducks::st::all ST>
+template <ducks::rt::col_layout RT, ducks::st::all ST>
 __device__ inline static void load(RT &dst, const ST &src) {
 
     static_assert(RT::rows == ST::rows, "register tile and shared tile must match rows");
-    static_assert(RT::cols == ST::cols,  "register tile and shared tile must match cols");
+    static_assert(RT::cols == ST::cols, "register tile and shared tile must match cols");
 
-    using T2 = RT::dtype;
-    using T  = base_types::packing<T2>::unpacked_type;
-    using U  = ST::dtype;
-    using U2 = base_types::packing<U >::packed_type;
+    using T2              = RT::dtype;
+    using T               = base_types::packing<T2>::unpacked_type;
+    using U               = ST::dtype;
+    using U2              = base_types::packing<U>::packed_type;
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
 
     const int laneid = kittens::laneid();
 
-    const int row_offset = ((laneid % 16) / 4) + ((laneid / dst.base_tile_cols) * dst.base_tile_stride);
+    const int row_offset =
+        ((laneid % 16) / 4) + ((laneid / dst.base_tile_cols) * dst.base_tile_stride);
     const int col_offset = ((laneid % 4) * 4) + (16 * ((laneid % dst.base_tile_cols) / 16));
 
     const uint32_t src_ptr = reinterpret_cast<uintptr_t>(&src.data[0]);
 
     // shared subtile is greater than or equal to register subtile
-    if constexpr (ST::underlying_subtile_rows >= RT::base_tile_rows && ST::underlying_subtile_cols >= RT::base_tile_cols) {
-        constexpr int register_subtiles_per_shared_subtile_row = ST::underlying_subtile_cols / RT::base_tile_cols;
-        constexpr int register_subtiles_per_shared_subtile_col = ST::underlying_subtile_rows / RT::base_tile_rows;
+    if constexpr (ST::underlying_subtile_rows >= RT::base_tile_rows &&
+                  ST::underlying_subtile_cols >= RT::base_tile_cols) {
+        constexpr int register_subtiles_per_shared_subtile_row =
+            ST::underlying_subtile_cols / RT::base_tile_cols;
+        constexpr int register_subtiles_per_shared_subtile_col =
+            ST::underlying_subtile_rows / RT::base_tile_rows;
 
-        #pragma unroll
+#pragma unroll
         for (int k = 0; k < RT::base_tile_num_strides; k++) {
-            #pragma unroll
+#pragma unroll
             for (int i = 0; i < register_subtiles_per_shared_subtile_col; i++) {
-                #pragma unroll
+#pragma unroll
                 for (int j = 0; j < register_subtiles_per_shared_subtile_row; j++) {
-                    const int row = i * RT::base_tile_rows + row_offset + k * RT::base_tile_elements_per_stride_group;
-                    const int col = j * RT::base_tile_cols + col_offset;
-                    const uint32_t swizzled_offset = src.swizzle({row, col});
+                    const int row = i * RT::base_tile_rows + row_offset +
+                                    k * RT::base_tile_elements_per_stride_group;
+                    const int      col                  = j * RT::base_tile_cols + col_offset;
+                    const uint32_t swizzled_offset      = src.swizzle({row, col});
                     const uint32_t next_swizzled_offset = src.swizzle({row + 4, col});
-                    const uint32_t addr = src_ptr + swizzled_offset;
-                    const uint32_t next_addr = src_ptr + next_swizzled_offset;
+                    const uint32_t addr                 = src_ptr + swizzled_offset;
+                    const uint32_t next_addr            = src_ptr + next_swizzled_offset;
 
                     const int idx = k * RT::base_tile_stride / packing;
 
-                    #pragma unroll
+#pragma unroll
                     for (int ii = 0; ii < ST::subtiles_per_col; ii++) {
-                        #pragma unroll
+#pragma unroll
                         for (int jj = 0; jj < ST::subtiles_per_row; jj++) {
                             const int shared_subtile_id = ii * ST::underlying_subtiles_per_row + jj;
                             const int offset = shared_subtile_id * ST::underlying_subtile_bytes;
 
-                            const int register_row = ii * register_subtiles_per_shared_subtile_col + i;
-                            const int register_col = jj * register_subtiles_per_shared_subtile_row + j;
+                            const int register_row =
+                                ii * register_subtiles_per_shared_subtile_col + i;
+                            const int register_col =
+                                jj * register_subtiles_per_shared_subtile_row + j;
 
-                            if constexpr (std::is_same_v<U2, bf16_2> || std::is_same_v<U2, half_2>) {
+                            if constexpr (std::is_same_v<U2, bf16_2> ||
+                                          std::is_same_v<U2, half_2>) {
                                 // Special handling for stride == 8, shared tile shape == 16x32
-                                if constexpr (RT::base_tile_stride == 8 && std::is_same_v<typename ST::shape, st_16x32_s>) {
+                                if constexpr (RT::base_tile_stride == 8 &&
+                                              std::is_same_v<typename ST::shape, st_16x32_s>) {
                                     asm volatile(
                                         "ds_read_b64_tr_b16 %0, %2 offset:%3\n"
                                         "ds_read_b64_tr_b16 %1, %2 offset:%4\n"
                                         // "s_waitcnt lgkmcnt(0)\n"
-                                        : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])),
-                                        "=&v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
-                                        : "v"(addr), "i"(offset), "i"(offset + 4 * ST::underlying_subtile_row_bytes)
-                                        : "memory"
-                                    );
-                                // Use two ds_read_b64_tr_b16 for stride == 8, dtype == bf16
+                                        : "=&v"(*reinterpret_cast<float2 *>(
+                                              &dst.tiles[register_row][register_col].data[idx])),
+                                          "=&v"(*reinterpret_cast<float2 *>(
+                                              &dst.tiles[register_row][register_col].data[idx + 2]))
+                                        : "v"(addr), "i"(offset),
+                                          "i"(offset + 4 * ST::underlying_subtile_row_bytes)
+                                        : "memory");
+                                    // Use two ds_read_b64_tr_b16 for stride == 8, dtype == bf16
                                 } else if constexpr (RT::base_tile_stride == 8) {
                                     asm volatile(
                                         "ds_read_b64_tr_b16 %0, %2 offset:%4\n"
                                         "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
                                         // "s_waitcnt lgkmcnt(0)\n"
-                                        : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])),
-                                        "=&v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
+                                        : "=&v"(*reinterpret_cast<float2 *>(
+                                              &dst.tiles[register_row][register_col].data[idx])),
+                                          "=&v"(*reinterpret_cast<float2 *>(
+                                              &dst.tiles[register_row][register_col].data[idx + 2]))
                                         : "v"(addr), "v"(next_addr), "i"(offset)
-                                        : "memory"
-                                    );
-                                // Use one ds_read_b64_tr_b16 for stride == 4, dtype == bf16
+                                        : "memory");
+                                    // Use one ds_read_b64_tr_b16 for stride == 4, dtype == bf16
                                 } else if constexpr (RT::base_tile_stride == 4) {
                                     asm volatile(
                                         "ds_read_b64_tr_b16 %0, %1 offset:%2\n"
                                         // "s_waitcnt lgkmcnt(0)\n"
-                                        : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx]))
+                                        : "=v"(*reinterpret_cast<float2 *>(
+                                            &dst.tiles[register_row][register_col].data[idx]))
                                         : "v"(addr), "i"(offset)
-                                        : "memory"
-                                    );
+                                        : "memory");
                                 } else {
                                     static_assert(false, "Unsupported stride");
                                 }
                             } else {
                                 static_assert(false, "Unsupported type");
                             }
-
                         }
                     }
                 }
             }
         }
 
-    // shared subtile is less than or equal to register subtile
-    } else if constexpr (ST::underlying_subtile_rows <= RT::base_tile_rows && ST::underlying_subtile_cols <= RT::base_tile_cols) {
-        constexpr int shared_subtiles_per_register_subtile_row = RT::base_tile_cols / ST::underlying_subtile_cols;
-        constexpr int shared_subtiles_per_register_subtile_col = RT::base_tile_rows / ST::underlying_subtile_rows;
+        // shared subtile is less than or equal to register subtile
+    } else if constexpr (ST::underlying_subtile_rows <= RT::base_tile_rows &&
+                         ST::underlying_subtile_cols <= RT::base_tile_cols) {
+        constexpr int shared_subtiles_per_register_subtile_row =
+            RT::base_tile_cols / ST::underlying_subtile_cols;
+        constexpr int shared_subtiles_per_register_subtile_col =
+            RT::base_tile_rows / ST::underlying_subtile_rows;
 
-        constexpr int stride_groups_per_shared_subtile_col = ST::underlying_subtile_rows / RT::base_tile_elements_per_stride_group;
+        constexpr int stride_groups_per_shared_subtile_col =
+            ST::underlying_subtile_rows / RT::base_tile_elements_per_stride_group;
 
         // Special handling for cases where there is a constant offset between stride groups
         if constexpr (stride_groups_per_shared_subtile_col) {
-            const int col = (col_offset) % ST::underlying_subtile_cols;
+            const int col             = (col_offset) % ST::underlying_subtile_cols;
             const int shared_base_col = (col_offset) / ST::underlying_subtile_cols;
-            #pragma unroll
+#pragma unroll
             for (int l = 0; l < stride_groups_per_shared_subtile_col; l++) {
                 const int row = row_offset + l * RT::base_tile_elements_per_stride_group;
 
-                const uint32_t swizzled_offset = src.swizzle({row, col});
+                const uint32_t swizzled_offset      = src.swizzle({row, col});
                 const uint32_t next_swizzled_offset = src.swizzle({row + 4, col});
-                const uint32_t addr = src_ptr + swizzled_offset;
-                const uint32_t next_addr = src_ptr + next_swizzled_offset;
+                const uint32_t addr                 = src_ptr + swizzled_offset;
+                const uint32_t next_addr            = src_ptr + next_swizzled_offset;
 
-                #pragma unroll
-                for (int k = 0; k < RT::base_tile_num_strides / stride_groups_per_shared_subtile_col; k++) {
+#pragma unroll
+                for (int k = 0;
+                     k < RT::base_tile_num_strides / stride_groups_per_shared_subtile_col; k++) {
                     const int shared_base_row = k;
 
-                    const int shared_base_subtile_id = shared_base_row * ST::underlying_subtiles_per_row + shared_base_col;
-                    const int shared_base_offset = shared_base_subtile_id * ST::underlying_subtile_bytes;
+                    const int shared_base_subtile_id =
+                        shared_base_row * ST::underlying_subtiles_per_row + shared_base_col;
+                    const int shared_base_offset =
+                        shared_base_subtile_id * ST::underlying_subtile_bytes;
 
                     int idx = k * RT::base_tile_stride / packing;
 
-                    #pragma unroll
+#pragma unroll
                     for (int i = 0; i < RT::height; i++) {
                         const int shared_row = i * shared_subtiles_per_register_subtile_col;
-                        #pragma unroll
+#pragma unroll
                         for (int j = 0; j < RT::width; j++) {
                             const int shared_col = j * shared_subtiles_per_register_subtile_row;
-                            const int shared_subtile_id = shared_row * ST::underlying_subtiles_per_row + shared_col;
-                            const int offset = shared_subtile_id * ST::underlying_subtile_bytes + shared_base_offset;
+                            const int shared_subtile_id =
+                                shared_row * ST::underlying_subtiles_per_row + shared_col;
+                            const int offset = shared_subtile_id * ST::underlying_subtile_bytes +
+                                               shared_base_offset;
 
-                            if constexpr (std::is_same_v<U2, bf16_2> || std::is_same_v<U2, half_2>) {
+                            if constexpr (std::is_same_v<U2, bf16_2> ||
+                                          std::is_same_v<U2, half_2>) {
                                 // Use two ds_read_b64_tr_b16 for stride == 8, dtype == bf16
                                 if constexpr (RT::base_tile_stride == 8) {
-                                    asm volatile(
-                                        "ds_read_b64_tr_b16 %0, %2 offset:%4\n"
-                                        "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
-                                        : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx])),
-                                        "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx + 2]))
-                                        : "v"(addr), "v"(next_addr), "i"(offset)
-                                        : "memory"
-                                    );
-                                // Use one ds_read_b64_tr_b16 for stride == 4, dtype == bf16
+                                    asm volatile("ds_read_b64_tr_b16 %0, %2 offset:%4\n"
+                                                 "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
+                                                 : "=&v"(*reinterpret_cast<float2 *>(
+                                                       &dst.tiles[i][j].data[idx])),
+                                                   "=&v"(*reinterpret_cast<float2 *>(
+                                                       &dst.tiles[i][j].data[idx + 2]))
+                                                 : "v"(addr), "v"(next_addr), "i"(offset)
+                                                 : "memory");
+                                    // Use one ds_read_b64_tr_b16 for stride == 4, dtype == bf16
                                 } else if constexpr (RT::base_tile_stride == 4) {
-                                    asm volatile(
-                                        "ds_read_b64_tr_b16 %0, %1 offset:%2\n"
-                                        : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx]))
-                                        : "v"(addr), "i"(offset)
-                                        : "memory"
-                                    );
+                                    asm volatile("ds_read_b64_tr_b16 %0, %1 offset:%2\n"
+                                                 : "=v"(*reinterpret_cast<float2 *>(
+                                                     &dst.tiles[i][j].data[idx]))
+                                                 : "v"(addr), "i"(offset)
+                                                 : "memory");
                                 } else {
                                     static_assert(false, "Unsupported stride");
                                 }
@@ -511,51 +532,56 @@ __device__ inline static void load(RT &dst, const ST &src) {
                 }
             }
         } else {
-            const int col = (col_offset) % ST::underlying_subtile_cols;
+            const int col             = (col_offset) % ST::underlying_subtile_cols;
             const int shared_base_col = (col_offset) / ST::underlying_subtile_cols;
-            #pragma unroll
+#pragma unroll
             for (int k = 0; k < RT::base_tile_num_strides; k++) {
-                const int row = (row_offset + k * RT::base_tile_elements_per_stride_group) % ST::underlying_subtile_rows;
-                const int shared_base_row = (row_offset + k * RT::base_tile_elements_per_stride_group) / ST::underlying_subtile_rows;
+                const int row = (row_offset + k * RT::base_tile_elements_per_stride_group) %
+                                ST::underlying_subtile_rows;
+                const int shared_base_row =
+                    (row_offset + k * RT::base_tile_elements_per_stride_group) /
+                    ST::underlying_subtile_rows;
 
-                const int shared_base_subtile_id = shared_base_row * ST::underlying_subtiles_per_row + shared_base_col;
-                const int shared_base_offset = shared_base_subtile_id * ST::underlying_subtile_bytes;
+                const int shared_base_subtile_id =
+                    shared_base_row * ST::underlying_subtiles_per_row + shared_base_col;
+                const int shared_base_offset =
+                    shared_base_subtile_id * ST::underlying_subtile_bytes;
 
-                const uint32_t swizzled_offset = src.swizzle({row, col});
+                const uint32_t swizzled_offset      = src.swizzle({row, col});
                 const uint32_t next_swizzled_offset = src.swizzle({row + 4, col});
-                const uint32_t addr = src_ptr + swizzled_offset + shared_base_offset;
+                const uint32_t addr      = src_ptr + swizzled_offset + shared_base_offset;
                 const uint32_t next_addr = src_ptr + next_swizzled_offset + shared_base_offset;
 
                 int idx = k * RT::base_tile_stride / packing;
 
-                #pragma unroll
+#pragma unroll
                 for (int i = 0; i < RT::height; i++) {
                     const int shared_row = i * shared_subtiles_per_register_subtile_col;
-                    #pragma unroll
+#pragma unroll
                     for (int j = 0; j < RT::width; j++) {
                         const int shared_col = j * shared_subtiles_per_register_subtile_row;
-                        const int shared_subtile_id = shared_row * ST::underlying_subtiles_per_row + shared_col;
+                        const int shared_subtile_id =
+                            shared_row * ST::underlying_subtiles_per_row + shared_col;
                         const int offset = shared_subtile_id * ST::underlying_subtile_bytes;
 
                         if constexpr (std::is_same_v<U2, bf16_2>) {
                             // Use two ds_read_b64_tr_b16 for stride == 8, dtype == bf16
                             if constexpr (RT::base_tile_stride == 8) {
-                                asm volatile(
-                                    "ds_read_b64_tr_b16 %0, %2 offset:%4\n"
-                                    "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
-                                    : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx])),
-                                    "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx + 2]))
-                                    : "v"(addr), "v"(next_addr), "i"(offset)
-                                    : "memory"
-                                );
-                            // Use one ds_read_b64_tr_b16 for stride == 4, dtype == bf16
+                                asm volatile("ds_read_b64_tr_b16 %0, %2 offset:%4\n"
+                                             "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
+                                             : "=&v"(*reinterpret_cast<float2 *>(
+                                                   &dst.tiles[i][j].data[idx])),
+                                               "=&v"(*reinterpret_cast<float2 *>(
+                                                   &dst.tiles[i][j].data[idx + 2]))
+                                             : "v"(addr), "v"(next_addr), "i"(offset)
+                                             : "memory");
+                                // Use one ds_read_b64_tr_b16 for stride == 4, dtype == bf16
                             } else if constexpr (RT::base_tile_stride == 4) {
                                 asm volatile(
                                     "ds_read_b64_tr_b16 %0, %1 offset:%2\n"
-                                    : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx]))
+                                    : "=v"(*reinterpret_cast<float2 *>(&dst.tiles[i][j].data[idx]))
                                     : "v"(addr), "i"(offset)
-                                    : "memory"
-                                );
+                                    : "memory");
                             } else {
                                 static_assert(false, "Unsupported stride");
                             }
@@ -570,7 +596,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
         static_assert(false, "Unsupported subtile sizes");
     }
 }
-}  // namespace hk_tr
+} // namespace hk_tr
 
 // Publish the staged tiles and close the write-after-read hazard on the buffer just
 // consumed. The memory clobber and the sched_barriers pin this against the compiler,
@@ -637,8 +663,8 @@ __device__ __forceinline__ void init_row_scaled(RT &dst, const RV &vec, float sc
                                                            typename RT::shape>::col_vec_layout>,
                   "vec must be dst's own col_vec type");
     static_assert(std::is_same_v<typename RV::dtype, typename RT::dtype>, "packed dtype");
-    static_assert((int)RV::outer_dim == (int)RT::height, "compatible size");
-    using dtype = typename RT::dtype;
+    static_assert((int) RV::outer_dim == (int) RT::height, "compatible size");
+    using dtype   = typename RT::dtype;
     const dtype s = kittens::base_types::packing<float>::pack(scale);
 #pragma unroll
     for (int i = 0; i < RT::height; ++i) {
@@ -646,8 +672,7 @@ __device__ __forceinline__ void init_row_scaled(RT &dst, const RV &vec, float sc
         for (int j = 0; j < RT::width; ++j) {
 #pragma unroll
             for (int k = 0; k < RT::packed_per_base_tile; ++k) {
-                dst.tiles[i][j].data[k] =
-                    kittens::base_ops::mul::template op<dtype>(vec[i][k], s);
+                dst.tiles[i][j].data[k] = kittens::base_ops::mul::template op<dtype>(vec[i][k], s);
             }
         }
     }
@@ -663,13 +688,14 @@ __device__ __forceinline__ void init_row(RT &dst, const RV &vec) {
                                                            typename RT::shape>::col_vec_layout>,
                   "vec must be dst's own col_vec type");
     static_assert(std::is_same_v<typename RV::dtype, typename RT::dtype>, "packed dtype");
-    static_assert((int)RV::outer_dim == (int)RT::height, "compatible size");
+    static_assert((int) RV::outer_dim == (int) RT::height, "compatible size");
 #pragma unroll
     for (int i = 0; i < RT::height; ++i) {
 #pragma unroll
         for (int j = 0; j < RT::width; ++j) {
 #pragma unroll
-            for (int k = 0; k < RT::packed_per_base_tile; ++k) dst.tiles[i][j].data[k] = vec[i][k];
+            for (int k = 0; k < RT::packed_per_base_tile; ++k)
+                dst.tiles[i][j].data[k] = vec[i][k];
         }
     }
 }
@@ -707,14 +733,15 @@ __device__ __forceinline__ void init_col(RT &dst, const RV &vec) {
         std::is_same_v<typename kittens::base_types::packing<typename RV::dtype>::packed_type,
                        dtype>,
         "compatible type");
-    static_assert((int)RV::outer_dim == (int)RT::width, "compatible size");
+    static_assert((int) RV::outer_dim == (int) RT::width, "compatible size");
 #pragma unroll
     for (int j = 0; j < RT::width; ++j) {
         const dtype packed_val = kittens::base_types::packing<dtype>::pack(vec[j][0]);
 #pragma unroll
         for (int i = 0; i < RT::height; ++i) {
 #pragma unroll
-            for (int k = 0; k < RT::packed_per_base_tile; ++k) dst.tiles[i][j].data[k] = packed_val;
+            for (int k = 0; k < RT::packed_per_base_tile; ++k)
+                dst.tiles[i][j].data[k] = packed_val;
         }
     }
 }
@@ -741,8 +768,7 @@ __device__ __forceinline__ const hka_f32x2 &hka_v2(const float2 &f) {
 }
 
 // dst = a . b elementwise, fp32, one v_pk_mul_f32 per packed pair.
-template <typename RT>
-__device__ __forceinline__ void mul_pk(RT &dst, const RT &a, const RT &b) {
+template <typename RT> __device__ __forceinline__ void mul_pk(RT &dst, const RT &a, const RT &b) {
 #pragma unroll
     for (int i = 0; i < RT::height; ++i) {
 #pragma unroll
@@ -762,8 +788,7 @@ __device__ __forceinline__ void mul_pk(RT &dst, const RT &a, const RT &b) {
 // Without one, the MFMA -> store hazard is invisible to the hazard recogniser (an asm block
 // is not a modelled reader) and nothing supplies the required wait states. Deleting this
 // multiply rather than replacing it reintroduces exactly that defect.
-template <typename RT>
-__device__ __forceinline__ void mul_pk_s(RT &dst, const RT &a, float s) {
+template <typename RT> __device__ __forceinline__ void mul_pk_s(RT &dst, const RT &a, float s) {
     const hka_f32x2 ss = {s, s};
 #pragma unroll
     for (int i = 0; i < RT::height; ++i) {
@@ -794,19 +819,18 @@ __device__ __forceinline__ void mul_pk_s(RT &dst, const RT &a, float s) {
 // ---------------------------------------------------------------------------------
 template <typename DST, typename SRC>
 __device__ __forceinline__ void relabel_16x16_to_32x16_4(DST &dst, const SRC &src) {
-    static_assert((int)DST::height == 1 && (int)DST::width == (int)SRC::width, "shape");
-    static_assert((int)SRC::height * (int)SRC::packed_per_base_tile
-                      == (int)DST::packed_per_base_tile, "register count");
+    static_assert((int) DST::height == 1 && (int) DST::width == (int) SRC::width, "shape");
+    static_assert((int) SRC::height * (int) SRC::packed_per_base_tile ==
+                      (int) DST::packed_per_base_tile,
+                  "register count");
 #pragma unroll
     for (int i = 0; i < SRC::height; ++i) {
 #pragma unroll
         for (int j = 0; j < SRC::width; ++j) {
 #pragma unroll
             for (int m = 0; m < SRC::packed_per_base_tile; ++m) {
-                dst.tiles[0][j].data[2 * i + m] =
-                    kittens::base_types::convertor<typename DST::dtype,
-                                                   typename SRC::dtype>::convert(
-                        src.tiles[i][j].data[m]);
+                dst.tiles[0][j].data[2 * i + m] = kittens::base_types::convertor<
+                    typename DST::dtype, typename SRC::dtype>::convert(src.tiles[i][j].data[m]);
             }
         }
     }
@@ -920,9 +944,10 @@ constexpr int HK_VM_MAX = 23;
 static inline int bwd_vm() {
     static const int v = [] {
         const char *e = getenv("HK_BWD_VM");
-        if (!e || !*e) return (int)HK_BWD_VM_DEFAULT;
+        if (!e || !*e)
+            return (int) HK_BWD_VM_DEFAULT;
         const int r = atoi(e);
-        return (r >= 0 && r <= HK_VM_MAX) ? r : (int)HK_BWD_VM_DEFAULT;
+        return (r >= 0 && r <= HK_VM_MAX) ? r : (int) HK_BWD_VM_DEFAULT;
     }();
     return v;
 }
@@ -961,13 +986,14 @@ static inline int bwd_vm() {
 #ifndef HK_D128_RUNG_DEFAULT
 #define HK_D128_RUNG_DEFAULT 3
 #endif
-constexpr int HK_D128_RUNG_MAX = 7;
+constexpr int     HK_D128_RUNG_MAX = 7;
 static inline int d128_bm_rung() {
     static const int v = [] {
         const char *e = getenv("HK_BWD_D128_RUNG");
-        if (!e || !*e) return (int)HK_D128_RUNG_DEFAULT;
+        if (!e || !*e)
+            return (int) HK_D128_RUNG_DEFAULT;
         const int r = atoi(e);
-        return (r >= 0 && r <= HK_D128_RUNG_MAX) ? r : (int)HK_D128_RUNG_DEFAULT;
+        return (r >= 0 && r <= HK_D128_RUNG_MAX) ? r : (int) HK_D128_RUNG_DEFAULT;
     }();
     return v;
 }
@@ -1008,16 +1034,23 @@ static inline int d128_bm_rung() {
 static inline int d128_qc() {
     static const int v = [] {
         const char *e = getenv("HK_BWD_D128_QC");
-        if (!e || !*e) return (int)HK_D128_QC_DEFAULT;
+        if (!e || !*e)
+            return (int) HK_D128_QC_DEFAULT;
         const int r = atoi(e);
-        return (r >= 0 && r <= 3) ? r : (int)HK_D128_QC_DEFAULT;
+        return (r >= 0 && r <= 3) ? r : (int) HK_D128_QC_DEFAULT;
     }();
     return v;
 }
 // W1 / W2 / W3, the windowed-shape items. W1 is host-side only, so it is __host__ alone.
-__host__ constexpr bool vm_w1(int vm) { return vm >= 20; }
-__host__ __device__ constexpr bool vm_dl(int vm) { return vm == 21 || vm == 23; }
-__host__ __device__ constexpr bool vm_nqk(int vm) { return vm >= 22; }
+__host__ constexpr bool vm_w1(int vm) {
+    return vm >= 20;
+}
+__host__ __device__ constexpr bool vm_dl(int vm) {
+    return vm == 21 || vm == 23;
+}
+__host__ __device__ constexpr bool vm_nqk(int vm) {
+    return vm >= 22;
+}
 // A5 / M1 / the mask re-key. The dq half of A5 is its own gate, because the two halves had
 // to be separated after the bundle measured negative.
 __host__ __device__ constexpr bool vm_pk(int vm) {
@@ -1026,39 +1059,63 @@ __host__ __device__ constexpr bool vm_pk(int vm) {
 __host__ __device__ constexpr bool vm_pkdkdv(int vm) {
     return (vm >= 11 && vm <= 14) || vm == 18;
 }
-__host__ __device__ constexpr bool vm_m1(int vm) { return vm == 12 || vm == 13 || vm >= 15; }
+__host__ __device__ constexpr bool vm_m1(int vm) {
+    return vm == 12 || vm == 13 || vm >= 15;
+}
 __host__ __device__ constexpr bool vm_mkey(int vm) {
     return vm == 13 || vm == 14 || vm >= 16;
 }
 // B33: dkdv's staged Q/dO swizzle. Only reachable with M1 on, since M1 is what creates the
 // bank conflict it removes.
-__host__ __device__ constexpr bool vm_dsw(int vm) { return vm >= 19; }
+__host__ __device__ constexpr bool vm_dsw(int vm) {
+    return vm >= 19;
+}
 // bit 0 = A5's dkdv half (A1 + A4), bit 1 = M1, bit 2 = the mask re-key, bit 3 = B33,
 // bit 4 = W2 (the K/V prologue behind `nq > 0`).
 __host__ __device__ constexpr int vm_bundle(int vm) {
     return (vm_pkdkdv(vm) ? 1 : 0) | (vm_m1(vm) ? 2 : 0) | (vm_mkey(vm) ? 4 : 0) |
            (vm_dsw(vm) ? 8 : 0) | (vm_nqk(vm) ? 16 : 0);
 }
-__host__ __device__ constexpr bool vm_cinit(int vm) { return vm >= 1; }
-__host__ __device__ constexpr bool vm_pneg(int vm) { return vm == 2 || vm == 3 || vm >= 5; }
-__host__ __device__ constexpr bool vm_sr(int vm) { return vm == 3 || vm == 4 || vm >= 5; }
+__host__ __device__ constexpr bool vm_cinit(int vm) {
+    return vm >= 1;
+}
+__host__ __device__ constexpr bool vm_pneg(int vm) {
+    return vm == 2 || vm == 3 || vm >= 5;
+}
+__host__ __device__ constexpr bool vm_sr(int vm) {
+    return vm == 3 || vm == 4 || vm >= 5;
+}
 // ITEM A (tail bundle): pin the four per-iteration runtime-stride address chains.
 // dkdv-local rung only; reached as dkdv<D, NS, 5>.
 #ifndef HK_TAIL_A
 #define HK_TAIL_A 3
 #endif
-__host__ __device__ constexpr bool vm_pinq(int vm) { return vm >= 5 && (HK_TAIL_A & 1); }
-__host__ __device__ constexpr bool vm_pinl(int vm) { return vm >= 5 && (HK_TAIL_A & 2); }
+__host__ __device__ constexpr bool vm_pinq(int vm) {
+    return vm >= 5 && (HK_TAIL_A & 1);
+}
+__host__ __device__ constexpr bool vm_pinl(int vm) {
+    return vm >= 5 && (HK_TAIL_A & 2);
+}
 // dq's own C-init fold and staging swizzle. dkdv is UNCHANGED at vm 5 and 6 -- both launch
 // dkdv<D,NS,3> -- so these two rungs add no dkdv instantiation and vm 5 differs from vm 3 in
 // dq alone.
-__host__ __device__ constexpr bool vm_qci(int vm) { return vm >= 5; }
-__host__ __device__ constexpr bool vm_qsw(int vm) { return vm >= 6; }
+__host__ __device__ constexpr bool vm_qci(int vm) {
+    return vm >= 5;
+}
+__host__ __device__ constexpr bool vm_qsw(int vm) {
+    return vm >= 6;
+}
 // Item C (dq's masked-chunk skip) is on at vm 9 and 10; item B (the dkdv grid re-order) at
 // vm 8 and 9 only, so vm 10 is A + C with B left out.
-__host__ __device__ constexpr bool vm_qcs(int vm) { return vm >= 9; }
-__host__ __device__ constexpr int vm_dkdv(int vm) { return vm >= 7 ? 5 : (vm >= 5 ? 3 : vm); }
-__host__ __device__ constexpr bool vm_b11b(int vm) { return vm == 8 || vm == 9; }
+__host__ __device__ constexpr bool vm_qcs(int vm) {
+    return vm >= 9;
+}
+__host__ __device__ constexpr int vm_dkdv(int vm) {
+    return vm >= 7 ? 5 : (vm >= 5 ? 3 : vm);
+}
+__host__ __device__ constexpr bool vm_b11b(int vm) {
+    return vm == 8 || vm == 9;
+}
 __host__ __device__ constexpr int vm_qm(int vm) {
     return vm_qci(vm) ? 2 : (vm_pneg(vm) ? 1 : 0);
 }
@@ -1073,15 +1130,16 @@ __host__ __device__ constexpr int vm_qm(int vm) {
 // [begin(lowest q_base), end(highest q_base)).
 template <int QB, int KVB>
 __device__ inline int kv_tile_end_for(int q_base, int causal_offset, int kv_tile_max) {
-    const int kv_hi_pos = q_base + (QB - 1) + causal_offset;  // largest key index
-    const int e = (kv_hi_pos + 1 + KVB - 1) / KVB;
+    const int kv_hi_pos = q_base + (QB - 1) + causal_offset; // largest key index
+    const int e         = (kv_hi_pos + 1 + KVB - 1) / KVB;
     return e > kv_tile_max ? kv_tile_max : e;
 }
 
 template <int KVB>
 __device__ inline int kv_tile_begin_for(int q_base, int causal_offset, int window_left) {
-    if (window_left < 0) return 0;
-    const int lo = q_base + causal_offset - window_left;  // smallest key any row needs
+    if (window_left < 0)
+        return 0;
+    const int lo = q_base + causal_offset - window_left; // smallest key any row needs
     return lo > 0 ? lo / KVB : 0;
 }
 
@@ -1091,7 +1149,8 @@ __device__ inline int kv_tile_begin_for(int q_base, int causal_offset, int windo
 template <int QB>
 __device__ inline int q_tile_begin_for(int kv_lo, int causal_offset, int q_tile_max) {
     const int q = kv_lo - causal_offset;
-    if (q <= 0) return 0;
+    if (q <= 0)
+        return 0;
     const int b = q / QB;
     return b > q_tile_max ? q_tile_max : b;
 }
@@ -1099,9 +1158,11 @@ __device__ inline int q_tile_begin_for(int kv_lo, int causal_offset, int q_tile_
 template <int QB>
 __device__ inline int q_tile_end_for(int kv_hi, int causal_offset, int window_left,
                                      int q_tile_max) {
-    if (window_left < 0) return q_tile_max;
-    const int q = kv_hi - causal_offset + window_left;  // largest query index in range
-    if (q < 0) return 0;
+    if (window_left < 0)
+        return q_tile_max;
+    const int q = kv_hi - causal_offset + window_left; // largest query index in range
+    if (q < 0)
+        return 0;
     const int e = q / QB + 1;
     return e > q_tile_max ? q_tile_max : e;
 }
@@ -1117,8 +1178,8 @@ __device__ inline int q_tile_end_for(int kv_hi, int causal_offset, int window_le
 template <int QB, int KVB>
 __device__ inline bool tile_needs_mask(int q_base, int kv_base, int Skv, int causal_offset,
                                        int window_left) {
-    const int kv_first = kv_base;
-    const int kv_last = kv_base + KVB - 1;
+    const int  kv_first    = kv_base;
+    const int  kv_last     = kv_base + KVB - 1;
     const bool causal_edge = kv_last > q_base + causal_offset;
     const bool window_edge =
         (window_left >= 0) & (kv_first < q_base + (QB - 1) + causal_offset - window_left);
@@ -1147,8 +1208,8 @@ __device__ inline bool tile_needs_mask(int q_base, int kv_base, int Skv, int cau
 // halves of a packed float2 share one q, so one bound pair covers them and the .y test
 // is the .x test shifted by one kv.
 template <int KVB, typename RT>
-__device__ inline void mask_prob_kvq(RT &att, int q_base, int kv_base, int Skv,
-                                     int causal_offset, int window_left, int lane) {
+__device__ inline void mask_prob_kvq(RT &att, int q_base, int kv_base, int Skv, int causal_offset,
+                                     int window_left, int lane) {
     const int row_half = (lane >> 4) << 2;
 
 #pragma unroll
@@ -1156,21 +1217,24 @@ __device__ inline void mask_prob_kvq(RT &att, int q_base, int kv_base, int Skv,
         const int kv_causal = q_base + j * 16 + (lane & 15) + causal_offset;
         // Fold the Skv tail into the causal bound and the no-window case into the lower one.
         const int hi = kv_causal < (Skv - 1) ? kv_causal : (Skv - 1);
-        int lo = (window_left < 0) ? 0 : (kv_causal - window_left);
-        if (lo < 0) lo = 0;
+        int       lo = (window_left < 0) ? 0 : (kv_causal - window_left);
+        if (lo < 0)
+            lo = 0;
         // A row can legitimately keep nothing -- bottom-right alignment with Skv < Sq
         // puts the first Q rows before every key. An empty range would pass the unsigned
         // test for every kv, so push the base past the end of the tile.
-        const bool empty = hi < lo;
-        const unsigned span = empty ? 0u : (unsigned)(hi - lo);
-        const int base = (empty ? (kv_base + KVB) : lo) - kv_base - row_half;
+        const bool     empty = hi < lo;
+        const unsigned span  = empty ? 0u : (unsigned) (hi - lo);
+        const int      base  = (empty ? (kv_base + KVB) : lo) - kv_base - row_half;
 #pragma unroll
         for (int i = 0; i < RT::height; ++i) {
 #pragma unroll
             for (int m = 0; m < 2; ++m) {
-                const unsigned off = (unsigned)(i * 16 + 2 * m - base);
-                if (off > span) att.tiles[i][j].data[m].x = 0.0f;
-                if (off + 1u > span) att.tiles[i][j].data[m].y = 0.0f;
+                const unsigned off = (unsigned) (i * 16 + 2 * m - base);
+                if (off > span)
+                    att.tiles[i][j].data[m].x = 0.0f;
+                if (off + 1u > span)
+                    att.tiles[i][j].data[m].y = 0.0f;
             }
             // Keep the scheduler from hoisting every base tile's comparisons above every
             // select; the resulting simultaneously-live SGPR pairs are what push the
@@ -1225,30 +1289,31 @@ __device__ inline void mask_prob_kvq(RT &att, int q_base, int kv_base, int Skv,
 // same predicate -- so a padded row is masked exactly where it was before and the zero
 // contribution is preserved either way.
 template <int KVB, int INV, typename RT>
-__device__ inline void mask_prob_qkv(RT &att, int q_base, int kv_base, int Skv,
-                                     int causal_offset, int window_left, int lane) {
-    const int q_half = (lane >> 4) << 2;
+__device__ inline void mask_prob_qkv(RT &att, int q_base, int kv_base, int Skv, int causal_offset,
+                                     int window_left, int lane) {
+    const int q_half  = (lane >> 4) << 2;
     const int kv_lane = lane & 15;
 
     if constexpr (INV) {
         // Wave-uniform, so this is one SALU select, not a per-lane one.
-        const unsigned span = (window_left < 0) ? 0x40000000u : (unsigned)window_left;
+        const unsigned span = (window_left < 0) ? 0x40000000u : (unsigned) window_left;
 #pragma unroll
         for (int j = 0; j < RT::width; ++j) {
-            const int kv = kv_base + j * 16 + kv_lane;
+            const int kv   = kv_base + j * 16 + kv_lane;
             const int q_lo = kv - causal_offset;
             // A key past Skv is kept by no query; pushing the base a whole tile past the
             // end makes the unsigned test fail for every q, exactly as the shipped
             // `empty` branch does.
-            const int base =
-                (kv >= Skv ? (q_base + 2 * (int)RT::rows) : q_lo) - q_base - q_half;
+            const int base = (kv >= Skv ? (q_base + 2 * (int) RT::rows) : q_lo) - q_base - q_half;
 #pragma unroll
             for (int i = 0; i < RT::height; ++i) {
 #pragma unroll
                 for (int m = 0; m < 2; ++m) {
-                    const unsigned off = (unsigned)(i * 16 + 2 * m - base);
-                    if (off > span) att.tiles[i][j].data[m].x = 0.0f;
-                    if (off + 1u > span) att.tiles[i][j].data[m].y = 0.0f;
+                    const unsigned off = (unsigned) (i * 16 + 2 * m - base);
+                    if (off > span)
+                        att.tiles[i][j].data[m].x = 0.0f;
+                    if (off + 1u > span)
+                        att.tiles[i][j].data[m].y = 0.0f;
                 }
                 // Same reason as the shipped spelling: fence per base tile so the
                 // scheduler cannot hoist all sixteen compares above all sixteen selects
@@ -1266,15 +1331,16 @@ __device__ inline void mask_prob_qkv(RT &att, int q_base, int kv_base, int Skv,
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
                 const int kv_causal = q_base + i * 16 + q_half + 2 * m + half + causal_offset;
-                const int hi = kv_causal < (Skv - 1) ? kv_causal : (Skv - 1);
-                int lo = (window_left < 0) ? 0 : (kv_causal - window_left);
-                if (lo < 0) lo = 0;
-                const bool empty = hi < lo;
-                const unsigned span = empty ? 0u : (unsigned)(hi - lo);
-                const int base = (empty ? (kv_base + KVB) : lo) - kv_base - kv_lane;
+                const int hi        = kv_causal < (Skv - 1) ? kv_causal : (Skv - 1);
+                int       lo        = (window_left < 0) ? 0 : (kv_causal - window_left);
+                if (lo < 0)
+                    lo = 0;
+                const bool     empty = hi < lo;
+                const unsigned span  = empty ? 0u : (unsigned) (hi - lo);
+                const int      base  = (empty ? (kv_base + KVB) : lo) - kv_base - kv_lane;
 #pragma unroll
                 for (int j = 0; j < RT::width; ++j) {
-                    const unsigned off = (unsigned)(j * 16 - base);
+                    const unsigned off = (unsigned) (j * 16 - base);
                     if (off > span) {
                         if (half == 0)
                             att.tiles[i][j].data[m].x = 0.0f;
@@ -1311,9 +1377,10 @@ __device__ inline void mask_prob_qkv(RT &att, int q_base, int kv_base, int Skv,
 // and every tile below q_tiles_prep passes the guard.
 // ---------------------------------------------------------------------------------
 template <int D, int PNEG>
-__global__ __launch_bounds__(PREP_NUM_THREADS, 8) void hk_attn_bwd_prep_ker(
-    const _gl_QKVO Og, const _gl_QKVO dOg, const _gl_L Dg, const _gl_L Lg,
-    const _gl_L Lng, int Sq) {
+__global__ __launch_bounds__(PREP_NUM_THREADS,
+                             8) void hk_attn_bwd_prep_ker(const _gl_QKVO Og, const _gl_QKVO dOg,
+                                                          const _gl_L Dg, const _gl_L Lg,
+                                                          const _gl_L Lng, int Sq) {
 #if !defined(__gfx950__)
     // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
     // other device pass the body is replaced rather than compiled -- which is what lets one
@@ -1322,12 +1389,13 @@ __global__ __launch_bounds__(PREP_NUM_THREADS, 8) void hk_attn_bwd_prep_ker(
     assert(false && "hipkittens attention requires gfx950");
     return;
 #else
-    const int wid = __builtin_amdgcn_readfirstlane(warpid());
-    const int q_tile = blockIdx.x * PREP_NUM_WARPS + wid;
-    const int head_idx = blockIdx.y;
+    const int wid       = __builtin_amdgcn_readfirstlane(warpid());
+    const int q_tile    = blockIdx.x * PREP_NUM_WARPS + wid;
+    const int head_idx  = blockIdx.y;
     const int batch_idx = blockIdx.z;
 
-    if (q_tile * PREP_Q_BLOCK >= Sq) return;
+    if (q_tile * PREP_Q_BLOCK >= Sq)
+        return;
 
     rt<float, PREP_Q_BLOCK, D, row_l, rt_16x32_s> o_fl, do_fl;
     load<0>(o_fl, Og, {q_tile, batch_idx, head_idx, 0});
@@ -1346,7 +1414,7 @@ __global__ __launch_bounds__(PREP_NUM_THREADS, 8) void hk_attn_bwd_prep_ker(
     } else {
         store(Dg, d_vec, {batch_idx, head_idx, 0, q_tile});
     }
-#endif  // __gfx950__
+#endif // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -1430,22 +1498,19 @@ __global__ __launch_bounds__(PREP_NUM_THREADS, 8) void hk_attn_bwd_prep_ker(
 // library, but ducks::st::all only asks for the identifier typedef and swizzle() is always
 // reached through the STATIC type -- including through st_subtile, which forwards to
 // ST::swizzle -- so deriving and shadowing the one function is enough.
-template <int D, int KVB>
-struct dq_stage_st : st_bf<KVB, D, st_32x32_s> {
+template <int D, int KVB> struct dq_stage_st : st_bf<KVB, D, st_32x32_s> {
     using base = st_bf<KVB, D, st_32x32_s>;
     __device__ __forceinline__ static const uint32_t swizzle(int2 coord) {
-        const uint32_t offset =
-            sizeof(bf16) * (coord.x * base::underlying_subtile_cols + coord.y);
-        return offset ^ (((offset % 512) >> 8) << 5)      // r bit 2 -> bank bit 3, the new term
-                      ^ (((offset % 2048) >> 10) << 4);   // r bit 4 -> bank bit 2, library's
+        const uint32_t offset = sizeof(bf16) * (coord.x * base::underlying_subtile_cols + coord.y);
+        return offset ^ (((offset % 512) >> 8) << 5) // r bit 2 -> bank bit 3, the new term
+               ^ (((offset % 2048) >> 10) << 4);     // r bit 4 -> bank bit 2, library's
         // The library's other term, (((offset % 1024) >> 9) << 5) = r bit 3 -> bank bit 3, is
         // the one this type REMOVES: keeping it alongside r bit 2 breaks the row-layout read.
     }
 };
 
 template <int D, int KVB = DQ_KV_BLOCK, int SW = 0>
-using dq_stage_tile =
-    std::conditional_t<SW == 0, st_bf<KVB, D, st_32x32_s>, dq_stage_st<D, KVB>>;
+using dq_stage_tile = std::conditional_t<SW == 0, st_bf<KVB, D, st_32x32_s>, dq_stage_st<D, KVB>>;
 
 // HPW -- q HEADS PER WORKGROUP -- and KVB -- kv rows per staged tile -- are the two
 // shape-keyed knobs.  Both are compile-time so the decode folds; dq_shape_config()
@@ -1493,12 +1558,11 @@ using dq_stage_tile =
 // deleted. Og and Lrg (the RAW lse; Lg is the lneg slot both consumers read) are passed
 // unconditionally, because an argument no instantiation uses is never s_load-ed and so costs
 // nothing -- build-confirmed, all sixteen dq<64,*> instantiations unmoved at 118/120/124/128.
-template <int D, int HPW, int KVB, int QM = 0, int SW = 0, int CS = 0, int PK = 0,
-          int DL = 0>
+template <int D, int HPW, int KVB, int QM = 0, int SW = 0, int CS = 0, int PK = 0, int DL = 0>
 __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
-    const _gl_QKVO Qg, const _gl_QKVO Kg, const _gl_QKVO Vg, const _gl_QKVO dOg,
-    const _gl_QKVO dQg, const _gl_L Lg, const _gl_L Dg, int Sq, int Skv, int Hq, int Hkv,
-    int window_left, float softmax_scale, const _gl_QKVO Og, const _gl_L Lrg) {
+    const _gl_QKVO Qg, const _gl_QKVO Kg, const _gl_QKVO Vg, const _gl_QKVO dOg, const _gl_QKVO dQg,
+    const _gl_L Lg, const _gl_L Dg, int Sq, int Skv, int Hq, int Hkv, int window_left,
+    float softmax_scale, const _gl_QKVO Og, const _gl_L Lrg) {
 #if !defined(__gfx950__)
     // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
     // other device pass the body is replaced rather than compiled -- which is what lets one
@@ -1513,7 +1577,7 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
     // predicates its own compute. No wave may leave early -- one with no Q rows at all
     // still has to reach every barrier -- so the early exits are flags.
     extern __shared__ alignment_dummy __shm[];
-    shared_allocator al((int *)&__shm[0]);
+    shared_allocator                  al((int *) &__shm[0]);
     dq_stage_tile<D, KVB, SW>(&k_smem)[STAGE_BUFS] =
         al.allocate<dq_stage_tile<D, KVB, SW>, STAGE_BUFS>();
     dq_stage_tile<D, KVB, SW>(&v_smem)[STAGE_BUFS] =
@@ -1534,10 +1598,10 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
     static_assert(RG >= 1 && DQ_NUM_WARPS % HPW == 0, "HPW must divide DQ_NUM_WARPS");
     int head_idx, q_tile, batch_idx, qy;
     if constexpr (HPW == 1) {
-        head_idx = blockIdx.x;
-        qy = blockIdx.y;
+        head_idx  = blockIdx.x;
+        qy        = blockIdx.y;
         batch_idx = blockIdx.z;
-        q_tile = qy * DQ_NUM_WARPS + wid;
+        q_tile    = qy * DQ_NUM_WARPS + wid;
     } else {
         // Grid is (Hq/HPW, B, q-tile groups): the head group and the batch are on the
         // two FAST axes, so XCD = (head_group + (Hq/HPW)*batch) mod 8 whenever
@@ -1545,24 +1609,23 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
         // 1.0000 by construction because work depends on the q tile alone.  It also moves
         // the eight GQA sharers of a kv head from eight PRIVATE L2s (XCD = h mod 8 in the
         // unpermuted grid) into one workgroup's LDS.
-        head_idx = blockIdx.x * HPW + wid / RG;
-        qy = blockIdx.z;
+        head_idx  = blockIdx.x * HPW + wid / RG;
+        qy        = blockIdx.z;
         batch_idx = blockIdx.y;
-        q_tile = qy * RG + (wid % RG);
+        q_tile    = qy * RG + (wid % RG);
     }
-    const int group_size = Hq / Hkv;
-    const int head_idx_kv = head_idx / group_size;
-    const int q_base = q_tile * DQ_Q_BLOCK;
-    const bool wave_valid = (q_base < Sq);
+    const int  group_size  = Hq / Hkv;
+    const int  head_idx_kv = head_idx / group_size;
+    const int  q_base      = q_tile * DQ_Q_BLOCK;
+    const bool wave_valid  = (q_base < Sq);
 
-    const int causal_offset = Skv - Sq;  // bottom-right alignment
-    const int lane = laneid();
-    const int kv_tile_max = (Skv + KVB - 1) / KVB;
+    const int causal_offset = Skv - Sq; // bottom-right alignment
+    const int lane          = laneid();
+    const int kv_tile_max   = (Skv + KVB - 1) / KVB;
 
-    const int kv_tile_end =
-        kv_tile_end_for<DQ_Q_BLOCK, KVB>(q_base, causal_offset, kv_tile_max);
-    const int kv_tile_begin = kv_tile_begin_for<KVB>(q_base, causal_offset, window_left);
-    const bool has_work = wave_valid && (kv_tile_end > kv_tile_begin);
+    const int  kv_tile_end   = kv_tile_end_for<DQ_Q_BLOCK, KVB>(q_base, causal_offset, kv_tile_max);
+    const int  kv_tile_begin = kv_tile_begin_for<KVB>(q_base, causal_offset, window_left);
+    const bool has_work      = wave_valid && (kv_tile_end > kv_tile_begin);
 
     // Union of the workgroup's RG row-group ranges.  At HPW == DQ_NUM_WARPS, RG == 1 and
     // the union IS this wave's own range: writing it as the same two values, rather than
@@ -1571,13 +1634,14 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
     int j_begin, j_end;
     if constexpr (RG == 1) {
         j_begin = kv_tile_begin;
-        j_end = kv_tile_end;
+        j_end   = kv_tile_end;
     } else {
-        const int q_base_lo = qy * RG * DQ_Q_BLOCK;
+        const int q_base_lo  = qy * RG * DQ_Q_BLOCK;
         const int q_base_top = ((Sq - 1) / DQ_Q_BLOCK) * DQ_Q_BLOCK;
-        int q_base_hi = q_base_lo + (RG - 1) * DQ_Q_BLOCK;
-        if (q_base_hi > q_base_top) q_base_hi = q_base_top;
-        j_end = kv_tile_end_for<DQ_Q_BLOCK, KVB>(q_base_hi, causal_offset, kv_tile_max);
+        int       q_base_hi  = q_base_lo + (RG - 1) * DQ_Q_BLOCK;
+        if (q_base_hi > q_base_top)
+            q_base_hi = q_base_top;
+        j_end   = kv_tile_end_for<DQ_Q_BLOCK, KVB>(q_base_hi, causal_offset, kv_tile_max);
         j_begin = kv_tile_begin_for<KVB>(q_base_lo, causal_offset, window_left);
     }
 
@@ -1601,29 +1665,28 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
     // subtile_inplace<32, D> lands exactly on subtile row c, so a 32-row view addresses whole
     // subtiles. A 16-row chunk would straddle one, and ds_bf16's rt_32x16_4_s shape requires
     // rows to be a multiple of 32 anyway.
-    constexpr int KVC = 32;
+    constexpr int KVC    = 32;
     constexpr int NCHUNK = KVB / KVC;
     static_assert(KVB % KVC == 0, "the chunk must tile the staged rows exactly");
-    static_assert(KVB % 64 == 0,
-                  "a staged tile must be a whole multiple of 16 B x DQ_NUM_THREADS");
+    static_assert(KVB % 64 == 0, "a staged tile must be a whole multiple of 16 B x DQ_NUM_THREADS");
 
-    rt<bf16, D, DQ_Q_BLOCK, col_l, rt_32x16_s> q_reg_t, do_reg_t;
+    rt<bf16, D, DQ_Q_BLOCK, col_l, rt_32x16_s>  q_reg_t, do_reg_t;
     rt<float, D, DQ_Q_BLOCK, col_l, rt_16x16_s> dq_acc;
-    rt<bf16, KVC, D, row_l, rt_16x32_s> kv_reg;
-    rt<bf16, D, KVC, col_l, rt_32x16_s> kv_reg_t;
+    rt<bf16, KVC, D, row_l, rt_16x32_s>         kv_reg;
+    rt<bf16, D, KVC, col_l, rt_32x16_s>         kv_reg_t;
     // The dQ operands are rt_32x16_*4*, i.e. stride 4, where K and Q above are stride 8.
     // Both encode a 32-row operand of a 16x16x32, but the stride-4 form lays the
     // reduction axis out as kv = 16*(s/4) + 4*(lane>>4) + (s%4) instead of the canonical
     // 8*(lane>>4) + s. An MFMA is invariant under any permutation of its reduction axis
     // provided *both* operands carry it, and this permutation is the one the rt_16x16
     // accumulator forces on dS -- so K has to be read in the same form.
-    rt<bf16, KVC, D, col_l, rt_32x16_4_s> k_reg_col;
+    rt<bf16, KVC, D, col_l, rt_32x16_4_s>         k_reg_col;
     rt<float, KVC, DQ_Q_BLOCK, col_l, rt_16x16_s> att, dp;
     // P is narrowed to bf16 the moment the softmax finishes, so the fp32 form dies BEFORE dP
     // is live. P only ever multiplies (dP - delta) and the product is stored as bf16, so this
     // is the precision dS ends up in either way. Without it att would still be KVC fp32
     // registers at the dP^T MFMA, which is where the peak is.
-    rt<bf16, KVC, DQ_Q_BLOCK, col_l, rt_16x16_s> att_bf16;
+    rt<bf16, KVC, DQ_Q_BLOCK, col_l, rt_16x16_s>   att_bf16;
     rt<bf16, KVC, DQ_Q_BLOCK, col_l, rt_32x16_4_s> ds_bf16;
     // row_vec depends on cols, base_tile_cols and shape, never on rows, so these two are the
     // same type they were at DQ_KV_BLOCK.
@@ -1635,24 +1698,29 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
     int cs_hi_last = NCHUNK, cs_lo_first = 0;
     if constexpr (CS) {
         const int last_base = (kv_tile_end - 1) * KVB;
-        const int e = q_base + DQ_Q_BLOCK + causal_offset - last_base;
-        int h = (e + KVC - 1) / KVC;
-        const int t = (Skv - last_base + KVC - 1) / KVC;   // the Skv tail edge
-        if (t < h) h = t;
-        if (h < cs_hi_last) cs_hi_last = h;
-        if (cs_hi_last < 1) cs_hi_last = 1;
+        const int e         = q_base + DQ_Q_BLOCK + causal_offset - last_base;
+        int       h         = (e + KVC - 1) / KVC;
+        const int t         = (Skv - last_base + KVC - 1) / KVC; // the Skv tail edge
+        if (t < h)
+            h = t;
+        if (h < cs_hi_last)
+            cs_hi_last = h;
+        if (cs_hi_last < 1)
+            cs_hi_last = 1;
         if (window_left >= 0) {
             const int s = q_base + causal_offset - window_left - kv_tile_begin * KVB;
             const int l = s > 0 ? s / KVC : 0;
-            if (l > cs_lo_first) cs_lo_first = l;
-            if (cs_lo_first > NCHUNK - 1) cs_lo_first = NCHUNK - 1;
+            if (l > cs_lo_first)
+                cs_lo_first = l;
+            if (cs_lo_first > NCHUNK - 1)
+                cs_lo_first = NCHUNK - 1;
         }
     }
 
     // A wave past the end of Q still runs the loop for the barriers, so its Q index is
     // clamped to a real tile rather than read out of bounds; nothing it computes is stored.
     {
-        const int q_tile_safe = wave_valid ? q_tile : 0;
+        const int                                  q_tile_safe = wave_valid ? q_tile : 0;
         rt<bf16, DQ_Q_BLOCK, D, row_l, rt_16x32_s> tmp;
         {
             rt<float, DQ_Q_BLOCK, D, row_l, rt_16x32_s> q_fl;
@@ -1722,7 +1790,7 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
 #pragma unroll
             for (int o = 0; o < qvec_t::outer_dim; ++o) {
                 delta_vec[o][0] = d_vec[o][0];
-                l_vec[o][0] = ln_vec[o][0];
+                l_vec[o][0]     = ln_vec[o][0];
             }
             // Stored for dkdv. Guarded, because a wave past the end of Q clamped its index
             // to tile 0 and must not write over tile 0's real owner.
@@ -1733,7 +1801,8 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
         } else {
             load(l_vec, Lg, {batch_idx, head_idx, 0, q_tile_safe});
             load(delta_vec, Dg, {batch_idx, head_idx, 0, q_tile_safe});
-            if constexpr (QM == 0) mul(l_vec, l_vec, LOG2E);
+            if constexpr (QM == 0)
+                mul(l_vec, l_vec, LOG2E);
         }
     }
 
@@ -1770,7 +1839,7 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
         // *next* tile, so they have the whole body below to land in. The index is clamped
         // on the last trip so every wave issues exactly two DMAs per iteration.
         const int nbuf = buf ^ 1;
-        const int jn = (j + 1 < j_end) ? (j + 1) : j;
+        const int jn   = (j + 1 < j_end) ? (j + 1) : j;
         hk_stage::load<0, false, dq_stage_tile<D, KVB, SW>, _gl_QKVO,
                        coord<dq_stage_tile<D, KVB, SW>>, DQ_NUM_THREADS>(
             k_smem[nbuf], Kg, {jn, batch_idx, head_idx_kv, 0}, wid);
@@ -1820,8 +1889,10 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
             // shapes run hundreds of trips against at most NCHUNK-1 masked chunks.
             int c_lo = 0, c_hi = NCHUNK;
             if constexpr (CS) {
-                if (j == kv_tile_end - 1) c_hi = cs_hi_last;
-                if (j == kv_tile_begin) c_lo = cs_lo_first;
+                if (j == kv_tile_end - 1)
+                    c_hi = cs_hi_last;
+                if (j == kv_tile_begin)
+                    c_lo = cs_lo_first;
             }
             // ROLLED ON PURPOSE. Unrolling lets the two chunks' operands overlap, which
             // costs 4 registers at D=64 and 5 at D=128 -- the same mechanism that makes a
@@ -1858,19 +1929,22 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
                 // instructions with real register operands, so the hazard recogniser can see
                 // the edge. That is NOT true when the reader is an `asm volatile` block; see
                 // the dS store below.
-                if constexpr (QM >= 2) init_col(att, l_vec);
-                else zero(att);
+                if constexpr (QM >= 2)
+                    init_col(att, l_vec);
+                else
+                    zero(att);
                 mma_AtB(att, kv_reg_t, q_reg_t, att);
 
                 // P^T = exp2(S^T * log2e - L * log2e). Q carries the scale and log2(e), and
                 // l_vec was scaled in the prologue, so this is one subtract and one exp2.
                 // Narrowed to bf16 immediately: see att_bf16's declaration.
-                if constexpr (QM == 1) add_col(att, att, l_vec);
-                else if constexpr (QM == 0) sub_col(att, att, l_vec);
+                if constexpr (QM == 1)
+                    add_col(att, att, l_vec);
+                else if constexpr (QM == 0)
+                    sub_col(att, att, l_vec);
                 exp2(att, att);
                 if (needs_mask) {
-                    mask_prob_kvq<KVC>(att, q_base, kv_base, Skv, causal_offset,
-                                       window_left, lane);
+                    mask_prob_kvq<KVC>(att, q_base, kv_base, Skv, causal_offset, window_left, lane);
                 }
                 copy(att_bf16, att);
 
@@ -1882,14 +1956,18 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
                 lds_read_fence();
                 transpose(kv_reg_t, kv_reg);
                 // Likewise starting at -delta under QM 2.
-                if constexpr (QM >= 2) init_col(dp, delta_vec);
-                else zero(dp);
+                if constexpr (QM >= 2)
+                    init_col(dp, delta_vec);
+                else
+                    zero(dp);
                 mma_AtB(dp, kv_reg_t, do_reg_t, dp);
 
                 // dS^T = P^T . (dP^T - delta); the P factor is folded into the shape remap
                 // below so P never has to be widened back to a whole fp32 tile.
-                if constexpr (QM == 1) add_col(dp, dp, delta_vec);
-                else if constexpr (QM == 0) sub_col(dp, dp, delta_vec);
+                if constexpr (QM == 1)
+                    add_col(dp, dp, delta_vec);
+                else if constexpr (QM == 0)
+                    sub_col(dp, dp, delta_vec);
 
                 // fp32 -> bf16 and, in the same v_cvt_pk_bf16_f32, into the dQ operand's
                 // shape. This cannot be a reinterpret_cast: an rt_16x16 tile orders its
@@ -1939,17 +2017,20 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
         buf = nbuf;
     }
 
-    if (!wave_valid) return;
+    if (!wave_valid)
+        return;
 
     // dQ = dS K * s. dS carries no part of Q's scale, so softmax_scale is the whole
     // correction; a wave with no work in range stores the zero it started with, which is
     // the right answer for a query that attends to nothing.
-    if constexpr (PK) mul_pk_s(dq_acc, dq_acc, softmax_scale);
-    else mul(dq_acc, dq_acc, softmax_scale);
+    if constexpr (PK)
+        mul_pk_s(dq_acc, dq_acc, softmax_scale);
+    else
+        mul(dq_acc, dq_acc, softmax_scale);
     rt<float, DQ_Q_BLOCK, D, row_l, rt_16x16_s> dq_row;
     transpose(dq_row, dq_acc);
     store<0>(dQg, dq_row, {q_tile, batch_idx, head_idx, 0});
-#endif  // __gfx950__
+#endif // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -1958,7 +2039,7 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
 // dkdvred has to sit next to the kernel whose partials it folds. Pure motion.
 // ---------------------------------------------------------------------------------
 #define DQRED_THREADS 256
-constexpr int DQRED_PER_THREAD = 8;  // bf16 lanes per thread, i.e. one dwordx4
+constexpr int DQRED_PER_THREAD = 8; // bf16 lanes per thread, i.e. one dwordx4
 
 struct alignas(16) bf16x8 {
     bf16 v[DQRED_PER_THREAD];
@@ -1976,15 +2057,17 @@ struct alignas(16) bf16x8 {
 // a gradient -- every value the kernel writes is still the sum of the same terms.
 static inline int q_tile_begin_host(int kv_lo, int causal_offset, int q_tile_max) {
     const int q = kv_lo - causal_offset;
-    if (q <= 0) return 0;
+    if (q <= 0)
+        return 0;
     const int b = q / DKDV_Q_BLOCK;
     return b > q_tile_max ? q_tile_max : b;
 }
-static inline int q_tile_end_host(int kv_hi, int causal_offset, int window_left,
-                                  int q_tile_max) {
-    if (window_left < 0) return q_tile_max;
+static inline int q_tile_end_host(int kv_hi, int causal_offset, int window_left, int q_tile_max) {
+    if (window_left < 0)
+        return q_tile_max;
     const int q = kv_hi - causal_offset + window_left;
-    if (q < 0) return 0;
+    if (q < 0)
+        return 0;
     const int e = q / DKDV_Q_BLOCK + 1;
     return e > q_tile_max ? q_tile_max : e;
 }
@@ -1995,7 +2078,7 @@ static inline int q_tile_end_host(int kv_hi, int causal_offset, int window_left,
 // silently truncated rather than rejected.
 static inline unsigned long long dkdv_ws_bytes(int Skv, int B, int Hkv, int D, int n_split) {
     const int kv_blocks = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
-    return (unsigned long long)n_split * kv_blocks * DKDV_KV_BLOCK * B * Hkv * D * 2ull;
+    return (unsigned long long) n_split * kv_blocks * DKDV_KV_BLOCK * B * Hkv * D * 2ull;
 }
 static constexpr unsigned long long DKDV_WS_LIMIT = 1ull << 32;
 
@@ -2077,7 +2160,8 @@ static inline int dq_kv_end_host(int q_base, int causal_offset, int kv_tile_max,
     return e > kv_tile_max ? kv_tile_max : e;
 }
 static inline int dq_kv_begin_host(int q_base, int causal_offset, int window_left, int kvb) {
-    if (window_left < 0) return 0;
+    if (window_left < 0)
+        return 0;
     const int lo = q_base + causal_offset - window_left;
     return lo > 0 ? lo / kvb : 0;
 }
@@ -2100,31 +2184,34 @@ static inline int dq_kv_begin_host(int q_base, int causal_offset, int window_lef
 // chunk work (windowed) and +5.88% (4x64/8 1024x1024) that has been exactly zero since round
 // 010. `cs = 1` charges the KVB-free count and the comparison then reduces to `rounds`, which
 // KVB = 128 halves.
-static inline void dq_counts(int Sq, int Skv, int B, int Hq, int window_left, int rg,
-                             int kvb, double *rounds, double *chunks, bool cs = false) {
+static inline void dq_counts(int Sq, int Skv, int B, int Hq, int window_left, int rg, int kvb,
+                             double *rounds, double *chunks, bool cs = false) {
     const int causal_offset = Skv - Sq;
-    const int q_tiles = (Sq + DQ_Q_BLOCK - 1) / DQ_Q_BLOCK;
-    const int kv_tile_max = (Skv + kvb - 1) / kvb;
-    const int nchunk = kvb / 32;
-    const int ny = (q_tiles + rg - 1) / rg;
-    const int q_base_top = ((Sq - 1) / DQ_Q_BLOCK) * DQ_Q_BLOCK;
+    const int q_tiles       = (Sq + DQ_Q_BLOCK - 1) / DQ_Q_BLOCK;
+    const int kv_tile_max   = (Skv + kvb - 1) / kvb;
+    const int nchunk        = kvb / 32;
+    const int ny            = (q_tiles + rg - 1) / rg;
+    const int q_base_top    = ((Sq - 1) / DQ_Q_BLOCK) * DQ_Q_BLOCK;
     long long r = 0, a = 0;
     for (int y = 0; y < ny; ++y) {
         const int q_lo = y * rg * DQ_Q_BLOCK;
-        int q_hi = q_lo + (rg - 1) * DQ_Q_BLOCK;
-        if (q_hi > q_base_top) q_hi = q_base_top;
+        int       q_hi = q_lo + (rg - 1) * DQ_Q_BLOCK;
+        if (q_hi > q_base_top)
+            q_hi = q_base_top;
         const int jb = dq_kv_begin_host(q_lo, causal_offset, window_left, kvb);
         const int je = dq_kv_end_host(q_hi, causal_offset, kv_tile_max, kvb);
         r += je > jb ? je - jb : 0;
         for (int c = 0; c < rg; ++c) {
             const int qb = q_lo + c * DQ_Q_BLOCK;
-            if (qb >= Sq) continue;
+            if (qb >= Sq)
+                continue;
             const int bw = dq_kv_begin_host(qb, causal_offset, window_left, kvb);
             const int ew = dq_kv_end_host(qb, causal_offset, kv_tile_max, kvb);
             const int lo = bw > jb ? bw : jb, hi = ew < je ? ew : je;
-            if (hi <= lo) continue;
+            if (hi <= lo)
+                continue;
             if (!cs) {
-                a += (long long)(hi - lo) * nchunk;
+                a += (long long) (hi - lo) * nchunk;
                 continue;
             }
             // ITEM C's own two bounds, transcribed from the kernel verbatim: cs_hi_last on
@@ -2132,42 +2219,49 @@ static inline void dq_counts(int Sq, int Skv, int B, int Hq, int window_left, in
             int cs_hi_last = nchunk, cs_lo_first = 0;
             {
                 const int last_base = (ew - 1) * kvb;
-                const int e = qb + DQ_Q_BLOCK + causal_offset - last_base;
-                int h = (e + 31) / 32;
-                const int t = (Skv - last_base + 31) / 32;
-                if (t < h) h = t;
-                if (h < cs_hi_last) cs_hi_last = h;
-                if (cs_hi_last < 1) cs_hi_last = 1;
+                const int e         = qb + DQ_Q_BLOCK + causal_offset - last_base;
+                int       h         = (e + 31) / 32;
+                const int t         = (Skv - last_base + 31) / 32;
+                if (t < h)
+                    h = t;
+                if (h < cs_hi_last)
+                    cs_hi_last = h;
+                if (cs_hi_last < 1)
+                    cs_hi_last = 1;
                 if (window_left >= 0) {
                     const int s = qb + causal_offset - window_left - bw * kvb;
                     const int l = s > 0 ? s / 32 : 0;
-                    if (l > cs_lo_first) cs_lo_first = l;
-                    if (cs_lo_first > nchunk - 1) cs_lo_first = nchunk - 1;
+                    if (l > cs_lo_first)
+                        cs_lo_first = l;
+                    if (cs_lo_first > nchunk - 1)
+                        cs_lo_first = nchunk - 1;
                 }
             }
             for (int j = lo; j < hi; ++j) {
                 int c_lo = 0, c_hi = nchunk;
-                if (j == ew - 1) c_hi = cs_hi_last;
-                if (j == bw) c_lo = cs_lo_first;
-                if (c_hi > c_lo) a += c_hi - c_lo;
+                if (j == ew - 1)
+                    c_hi = cs_hi_last;
+                if (j == bw)
+                    c_lo = cs_lo_first;
+                if (c_hi > c_lo)
+                    a += c_hi - c_lo;
             }
         }
     }
     // The loop covered ONE (head group, batch); the grid holds Hq/HPW head groups and B
     // batches, and each of the rg row-group waves counted in `a` exists once per head in
     // the group, i.e. HPW times.  HPW = DQ_NUM_WARPS / rg.
-    const double head_groups = (double)Hq * rg / (double)DQ_NUM_WARPS;
-    *rounds = (double)r * head_groups * B;
-    *chunks = (double)a * (double)Hq * B;   // a already carries KVB/32
+    const double head_groups = (double) Hq * rg / (double) DQ_NUM_WARPS;
+    *rounds                  = (double) r * head_groups * B;
+    *chunks                  = (double) a * (double) Hq * B; // a already carries KVB/32
 }
 
 // Pick (HPW, KVB).  Memoised on the shape: the loop is O(Sq/32) and a 0.24 ms row
 // cannot pay for it per launch.  HK_BWD_DQ_HPW / HK_BWD_DQ_KVB force a rung of the
 // ladder from one binary, which is what makes a paired anchor and a forced-on control
 // runnable without a rebuild; neither may ask for an illegal value.
-static inline void dq_shape_config(int Sq, int Skv, int B, int Hq, int Hkv,
-                                   int window_left, int D, int *out_hpw, int *out_kvb,
-                                   bool w1 = true) {
+static inline void dq_shape_config(int Sq, int Skv, int B, int Hq, int Hkv, int window_left, int D,
+                                   int *out_hpw, int *out_kvb, bool w1 = true) {
     // ONE-ENTRY MEMO, and it is not decoration: dq_counts() walks O(Sq/DQ_Q_BLOCK) q-tile
     // groups twice and launch_bwd runs per backward call, so on the 0.24 ms rows the loop
     // would be a measurable host-side tax charged to every rung equally. A benchmark or a
@@ -2177,8 +2271,8 @@ static inline void dq_shape_config(int Sq, int Skv, int B, int Hq, int Hkv,
         int sq, skv, b, hq, hkv, w, d, w1, hpw, kvb;
     };
     static thread_local Memo memo{-1, -1, -1, -1, -1, -1, -1, -1, 1, DQ_KV_BLOCK};
-    if (memo.sq == Sq && memo.skv == Skv && memo.b == B && memo.hq == Hq &&
-        memo.hkv == Hkv && memo.w == window_left && memo.d == D && memo.w1 == (int)w1) {
+    if (memo.sq == Sq && memo.skv == Skv && memo.b == B && memo.hq == Hq && memo.hkv == Hkv &&
+        memo.w == window_left && memo.d == D && memo.w1 == (int) w1) {
         *out_hpw = memo.hpw;
         *out_kvb = memo.kvb;
         return;
@@ -2188,7 +2282,8 @@ static inline void dq_shape_config(int Sq, int Skv, int B, int Hq, int Hkv,
     // mathematically full causal.  Normalising here is what stops a window-keyed
     // predicate mis-firing on 4x64/8 1024x1024 w2047; the kernel's own bounds already
     // collapse to the full-causal ones there, so this changes no value.
-    if (window_left >= 0 && window_left >= Skv - 1) window_left = -1;
+    if (window_left >= 0 && window_left >= Skv - 1)
+        window_left = -1;
 
     const int group_size = (Hkv > 0 && Hq % Hkv == 0) ? Hq / Hkv : 1;
     // HPW IS A PREDICATE, NOT A COST COMPARISON, and no constant enters it.  At fixed
@@ -2198,8 +2293,8 @@ static inline void dq_shape_config(int Sq, int Skv, int B, int Hq, int Hkv,
     // which is every shape except Sq <= DQ_Q_BLOCK.  It needs the GQA group to supply
     // DQ_NUM_WARPS distinct q heads per workgroup; anything else falls back to 1, which
     // is the shipped kernel to the instruction.
-    const int hpw_max = (group_size % DQ_NUM_WARPS == 0 && Hq % DQ_NUM_WARPS == 0)
-                            ? DQ_NUM_WARPS : 1;
+    const int hpw_max =
+        (group_size % DQ_NUM_WARPS == 0 && Hq % DQ_NUM_WARPS == 0) ? DQ_NUM_WARPS : 1;
     int bh = hpw_max;
     // KVB > 64 doubles the staged tile; at D = 128 that is 128 KB per workgroup and the
     // second workgroup no longer fits in 160 KB of LDS, so the wider tile is D <= 64.
@@ -2221,22 +2316,24 @@ static inline void dq_shape_config(int Sq, int Skv, int B, int Hq, int Hkv,
         // trusted -- see the comment on DQ_ROUND_FIXED above.
         if (const char *e = getenv("HK_BWD_DQ_RF")) {
             const double v = atof(e);
-            if (v > 0.0 && v < 1.0) rf = v;
+            if (v > 0.0 && v < 1.0)
+                rf = v;
         }
         const double k = rf * DQ_NUM_WARPS;
-        if (c1 + k * r1 < (c0 + k * r0) * 0.995) bk = 128;   // never move for noise
+        if (c1 + k * r1 < (c0 + k * r0) * 0.995)
+            bk = 128; // never move for noise
     }
     if (const char *e = getenv("HK_BWD_DQ_HPW")) {
         const int v = atoi(e);
-        bh = (v == 1 || (v == DQ_NUM_WARPS && hpw_max == DQ_NUM_WARPS)) ? v : bh;
+        bh          = (v == 1 || (v == DQ_NUM_WARPS && hpw_max == DQ_NUM_WARPS)) ? v : bh;
     }
     if (const char *e = getenv("HK_BWD_DQ_KVB")) {
         const int v = atoi(e);
-        bk = (v == 64 || (v == 128 && kvb_hi == 128)) ? v : bk;
+        bk          = (v == 64 || (v == 128 && kvb_hi == 128)) ? v : bk;
     }
     *out_hpw = bh;
     *out_kvb = bk;
-    memo = Memo{Sq, Skv, B, Hq, Hkv, w_in, D, (int)w1, bh, bk};
+    memo     = Memo{Sq, Skv, B, Hq, Hkv, w_in, D, (int) w1, bh, bk};
 }
 
 // ---------------------------------------------------------------------------------
@@ -2293,17 +2390,19 @@ static inline void dq_shape_config(int Sq, int Skv, int B, int Hq, int Hkv,
 // ---------------------------------------------------------------------------------
 static inline int dkdv_head_split_sim(int Sq, int Skv, int B, int Hq, int Hkv, int window_left,
                                       int D) {
-    if (B <= 0 || Hkv <= 0 || Hq % Hkv) return 1;
+    if (B <= 0 || Hkv <= 0 || Hq % Hkv)
+        return 1;
     const int group_size = Hq / Hkv;
-    if (group_size < 2) return 1;
-    const int kv_blocks = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
-    const int q_tile_max = (Sq + DKDV_Q_BLOCK - 1) / DKDV_Q_BLOCK;
-    const int causal_offset = Skv - Sq;
-    constexpr int XCDS = 8;
+    if (group_size < 2)
+        return 1;
+    const int     kv_blocks     = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
+    const int     q_tile_max    = (Sq + DKDV_Q_BLOCK - 1) / DKDV_Q_BLOCK;
+    const int     causal_offset = Skv - Sq;
+    constexpr int XCDS          = 8;
     // Straight off __launch_bounds__(DKDV_NUM_THREADS, (D <= 64 ? 3 : 2)) x 256 CUs.
     const int slots = (D <= 64 ? 3 : 2) * 256;
-    const int spx = slots / XCDS;                       // slots per XCD
-    const int ns = (B * Hkv) / XCDS > 0 ? (B * Hkv) / XCDS : 1;  // streams per XCD
+    const int spx   = slots / XCDS;                                // slots per XCD
+    const int ns    = (B * Hkv) / XCDS > 0 ? (B * Hkv) / XCDS : 1; // streams per XCD
 
     // Per-kv-block work in `it` iterations at n_split = 1, from the kernel's own bounds.
     std::vector<int> w;
@@ -2314,9 +2413,10 @@ static inline int dkdv_head_split_sim(int Sq, int Skv, int B, int Hq, int Hkv, i
         const int ib = q_tile_begin_host(lo, causal_offset, q_tile_max);
         const int ie = q_tile_end_host(hi, causal_offset, window_left, q_tile_max);
         w.push_back((ie > ib ? ie - ib : 0) * group_size);
-        total += (long long)w.back() * B * Hkv;
+        total += (long long) w.back() * B * Hkv;
     }
-    if (!total) return 1;
+    if (!total)
+        return 1;
     // DESCENDING, and the sort is not decorative: nq falls with the kv block only on the
     // full-causal shapes. Under a left window nq is 0 near block 0, rises, plateaus and
     // then falls, so ranking by block index would put the SHORTEST jobs first and the
@@ -2325,60 +2425,68 @@ static inline int dkdv_head_split_sim(int Sq, int Skv, int B, int Hq, int Hkv, i
     std::sort(w.begin(), w.end(), std::greater<int>());
 
     // --- stage 1: the guard ---------------------------------------------------------
-    const double thr = (double)total / slots;
-    double quant = 0.0;
+    const double thr   = (double) total / slots;
+    double       quant = 0.0;
     for (int r = 0; r < kv_blocks; ++r) {
-        const long long rank = (long long)(r + 1) * ns;
-        const double rounds = (double)((rank + spx - 1) / spx);
-        const double q = rounds * w[r];
-        if (q > quant) quant = q;
+        const long long rank   = (long long) (r + 1) * ns;
+        const double    rounds = (double) ((rank + spx - 1) / spx);
+        const double    q      = rounds * w[r];
+        if (q > quant)
+            quant = q;
     }
-    if (quant <= thr * 1.03) return 1;
+    if (quant <= thr * 1.03)
+        return 1;
 
     // --- stage 2: simulate the per-XCD dispatch exactly -----------------------------
     // Per-workgroup prologue (K/V into registers) plus epilogue (one dK/dV tile per wave),
     // in iteration-equivalents. The picks are unchanged for F anywhere in [1, 4].
     constexpr double F = 2.0;
     // The fold reads n_split slots and writes one, for each of dK and dV, streaming.
-    const double slot_bytes = (double)dkdv_ws_bytes(Skv, B, Hkv, D, 1);
+    const double slot_bytes = (double) dkdv_ws_bytes(Skv, B, Hkv, D, 1);
     const double t_iter = 1.45e-6, bw = 4.0e12;
 
-    std::vector<double> free_slots((size_t)spx);
-    double best = 0.0;
-    int best_s = 1;
+    std::vector<double> free_slots((size_t) spx);
+    double              best   = 0.0;
+    int                 best_s = 1;
     for (int s = 1; s <= DKDV_SPLIT_CAP; s <<= 1) {
-        if (group_size % s) continue;
-        if (dkdv_ws_bytes(Skv, B, Hkv, D, s) >= DKDV_WS_LIMIT) break;  // CORRECTNESS
+        if (group_size % s)
+            continue;
+        if (dkdv_ws_bytes(Skv, B, Hkv, D, s) >= DKDV_WS_LIMIT)
+            break; // CORRECTNESS
         const int hpw = group_size / s;
-        double mk = 0.0;
+        double    mk  = 0.0;
         for (int xcd = 0; xcd < XCDS; ++xcd) {
             std::fill(free_slots.begin(), free_slots.end(), 0.0);
             for (int z = 0; z < kv_blocks * s; ++z) {
-                const int j = z / s;
-                const int lo = j * DKDV_KV_BLOCK, hi = lo + DKDV_KV_BLOCK - 1;
-                const int ib = q_tile_begin_host(lo, causal_offset, q_tile_max);
-                const int ie = q_tile_end_host(hi, causal_offset, window_left, q_tile_max);
-                const double iters = (double)(ie > ib ? ie - ib : 0) * hpw;
+                const int    j  = z / s;
+                const int    lo = j * DKDV_KV_BLOCK, hi = lo + DKDV_KV_BLOCK - 1;
+                const int    ib    = q_tile_begin_host(lo, causal_offset, q_tile_max);
+                const int    ie    = q_tile_end_host(hi, causal_offset, window_left, q_tile_max);
+                const double iters = (double) (ie > ib ? ie - ib : 0) * hpw;
                 for (int b = 0; b < B; ++b) {
                     for (int c = 0; c < Hkv; ++c) {
-                        if ((c + Hkv * (b + B * z)) % XCDS != xcd) continue;
+                        if ((c + Hkv * (b + B * z)) % XCDS != xcd)
+                            continue;
                         // Earliest-freeing slot: the dispatcher is in-order, so this is
                         // list scheduling with a fixed job order.
                         int best_slot = 0;
                         for (int t = 1; t < spx; ++t)
-                            if (free_slots[t] < free_slots[best_slot]) best_slot = t;
+                            if (free_slots[t] < free_slots[best_slot])
+                                best_slot = t;
                         free_slots[best_slot] += iters + F;
                     }
                 }
             }
             for (int t = 0; t < spx; ++t)
-                if (free_slots[t] > mk) mk = free_slots[t];
+                if (free_slots[t] > mk)
+                    mk = free_slots[t];
         }
-        if (s > 1) mk += (s + 1) * 2.0 * slot_bytes / bw / t_iter;
+        if (s > 1)
+            mk += (s + 1) * 2.0 * slot_bytes / bw / t_iter;
         if (s == 1) {
             best = mk;
-        } else if (mk < best * 0.97) {  // 3% hysteresis: never split for model noise
-            best = mk;
+        } else if (mk < best * 0.97) { // 3% hysteresis: never split for model noise
+            best   = mk;
             best_s = s;
         }
     }
@@ -2418,14 +2526,14 @@ static inline int dkdv_head_split_sim(int Sq, int Skv, int B, int Hq, int Hkv, i
 // ---------------------------------------------------------------------------------
 static inline int dkdv_head_split_nq(int Sq, int Skv, int B, int Hq, int Hkv, int window_left,
                                      int D) {
-    const int group_size = Hq / Hkv;
-    const int kv_blocks = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
-    const int q_tile_max = (Sq + DKDV_Q_BLOCK - 1) / DKDV_Q_BLOCK;
+    const int group_size    = Hq / Hkv;
+    const int kv_blocks     = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
+    const int q_tile_max    = (Sq + DKDV_Q_BLOCK - 1) / DKDV_Q_BLOCK;
     const int causal_offset = Skv - Sq;
     // Straight off __launch_bounds__(DKDV_NUM_THREADS, (D <= 64 ? 3 : 2)) x 256 CUs, the
     // same machine constant the simulation reads. Moving that tier moves this too.
-    const int slots = (D <= 64 ? 3 : 2) * 256;
-    const long long grid = (long long)kv_blocks * Hkv * B;
+    const int       slots = (D <= 64 ? 3 : 2) * 256;
+    const long long grid  = (long long) kv_blocks * Hkv * B;
 
     long long visited = 0;
     for (int j = 0; j < kv_blocks; ++j) {
@@ -2434,14 +2542,19 @@ static inline int dkdv_head_split_nq(int Sq, int Skv, int B, int Hq, int Hkv, in
         const int ie = q_tile_end_host(hi, causal_offset, window_left, q_tile_max);
         visited += ie > ib ? ie - ib : 0;
     }
-    if (!visited) return 1;
-    const double nq = (double)visited / kv_blocks;
+    if (!visited)
+        return 1;
+    const double nq = (double) visited / kv_blocks;
 
     int target = 1;
-    if (grid <= slots) target = 4;
-    else if (grid <= 4ll * slots && nq >= 48.0) target = 2;
-    if (target > DKDV_SPLIT_CAP) target = DKDV_SPLIT_CAP;
-    if (target < 2) return 1;
+    if (grid <= slots)
+        target = 4;
+    else if (grid <= 4ll * slots && nq >= 48.0)
+        target = 2;
+    if (target > DKDV_SPLIT_CAP)
+        target = DKDV_SPLIT_CAP;
+    if (target < 2)
+        return 1;
 
     // THE PAIRED ANCHOR RUNG for this selector, on the same pattern HK_BWD_VM /
     // HK_BWD_D128_RUNG / HK_BWD_D128_QC / HK_BWD_DKDV_SEL use. HK_BWD_D128_DIVSEL=0 restores
@@ -2454,8 +2567,7 @@ static inline int dkdv_head_split_nq(int Sq, int Skv, int B, int Hq, int Hkv, in
     if (const char *e = getenv("HK_BWD_D128_DIVSEL")) {
         if (atoi(e) == 0) {
             int s = target;
-            while (s > 1 && (group_size % s ||
-                             dkdv_ws_bytes(Skv, B, Hkv, D, s) >= DKDV_WS_LIMIT))
+            while (s > 1 && (group_size % s || dkdv_ws_bytes(Skv, B, Hkv, D, s) >= DKDV_WS_LIMIT))
                 s >>= 1;
             return s;
         }
@@ -2479,19 +2591,23 @@ static inline int dkdv_head_split_nq(int Sq, int Skv, int B, int Hq, int Hkv, in
     // Every input is a shape or machine property; there is no per-shape table. Over the eleven
     // benchmark shapes this reproduces the previous pick on NINE and changes only the two
     // llama4 shapes, 1 -> 5.
-    int best = 1;
+    int    best     = 1;
     double best_err = 0.0;
     for (int d = 2; d <= group_size && d <= 2 * target; ++d) {
-        if (group_size % d) continue;
-        if (!dkdv_split_instantiated(d)) continue;
+        if (group_size % d)
+            continue;
+        if (!dkdv_split_instantiated(d))
+            continue;
         // Correctness, not tuning, and it may not be overridden: the partials `gl` must fit a
         // 32-bit num_records -- see dkdv_ws_bytes -- and gridDim.z caps kv_blocks*d.
-        if (dkdv_ws_bytes(Skv, B, Hkv, D, d) >= DKDV_WS_LIMIT) continue;
-        if ((long long)kv_blocks * d > 65535ll) continue;
-        const double err = std::abs(std::log((double)d / (double)target));
+        if (dkdv_ws_bytes(Skv, B, Hkv, D, d) >= DKDV_WS_LIMIT)
+            continue;
+        if ((long long) kv_blocks * d > 65535ll)
+            continue;
+        const double err = std::abs(std::log((double) d / (double) target));
         // d ascends, so `<=` sends a tie to the LARGER factor.
         if (best == 1 || err <= best_err + 1e-12) {
-            best = d;
+            best     = d;
             best_err = err;
         }
     }
@@ -2500,43 +2616,50 @@ static inline int dkdv_head_split_nq(int Sq, int Skv, int B, int Hq, int Hkv, in
 
 static inline int dkdv_streams_before(int Skv, int B, int Hkv, int D, int n_split) {
     const int kv_blocks = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
-    const int slots = (D <= 64 ? 3 : 2) * 256;
-    const int per = (slots + kv_blocks * n_split - 1) / (kv_blocks * n_split);
+    const int slots     = (D <= 64 ? 3 : 2) * 256;
+    const int per       = (slots + kv_blocks * n_split - 1) / (kv_blocks * n_split);
     return per < Hkv * B ? per : Hkv * B;
 }
 
-static inline bool dkdv_use_b11b(int Sq, int Skv, int B, int Hq, int Hkv, int window_left,
-                                 int D, int n_split, bool enabled) {
+static inline bool dkdv_use_b11b(int Sq, int Skv, int B, int Hq, int Hkv, int window_left, int D,
+                                 int n_split, bool enabled) {
     // HK_BWD_DKDV_GRID forces the permutation on or off whatever the rung asks for, which is
     // what lets the gate run the whole 44-shape sweep both ways and require md5 identity.
-    if (const char *e = getenv("HK_BWD_DKDV_GRID")) return atoi(e) != 0;
-    if (!enabled) return false;                           // the rung does not select item B
-    if (B < 2 || Hkv % 8) return false;
+    if (const char *e = getenv("HK_BWD_DKDV_GRID"))
+        return atoi(e) != 0;
+    if (!enabled)
+        return false; // the rung does not select item B
+    if (B < 2 || Hkv % 8)
+        return false;
     // A window at least as wide as the sequence keeps every causal key, so normalise it
     // to full causal exactly as dq_shape_config does.
     const bool full_causal = (window_left < 0) || (window_left >= Skv - 1);
-    if (!full_causal) return false;                       // term 1: C1 bought phase here
-    const int kv_blocks = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
-    const int q_tile_max = (Sq + DKDV_Q_BLOCK - 1) / DKDV_Q_BLOCK;
+    if (!full_causal)
+        return false; // term 1: C1 bought phase here
+    const int kv_blocks     = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
+    const int q_tile_max    = (Sq + DKDV_Q_BLOCK - 1) / DKDV_Q_BLOCK;
     const int causal_offset = Skv - Sq;
-    int cophased = 0;
+    int       cophased      = 0;
     for (int j = 0; j < kv_blocks; ++j) {
         const int lo = j * DKDV_KV_BLOCK, hi = lo + DKDV_KV_BLOCK - 1;
         if (q_tile_begin_host(lo, causal_offset, q_tile_max) == 0 &&
             q_tile_end_host(hi, causal_offset, -1, q_tile_max) == q_tile_max)
             ++cophased;
     }
-    if (2 * cophased < kv_blocks) return false;           // term 1, as a count
+    if (2 * cophased < kv_blocks)
+        return false; // term 1, as a count
     // term 2: C1 raised the streams resident per XCD rather than lowering them.
     return Hkv * B / 8 > dkdv_streams_before(Skv, B, Hkv, D, n_split);
 }
 
-static inline int dkdv_head_split(int Sq, int Skv, int B, int Hq, int Hkv, int window_left,
-                                  int D) {
-    if (B <= 0 || Hkv <= 0 || Hq % Hkv) return 1;
-    if (Hq / Hkv < 2) return 1;
+static inline int dkdv_head_split(int Sq, int Skv, int B, int Hq, int Hkv, int window_left, int D) {
+    if (B <= 0 || Hkv <= 0 || Hq % Hkv)
+        return 1;
+    if (Hq / Hkv < 2)
+        return 1;
     bool use_nq = true;
-    if (const char *e = getenv("HK_BWD_DKDV_SEL")) use_nq = (atoi(e) != 0);
+    if (const char *e = getenv("HK_BWD_DKDV_SEL"))
+        use_nq = (atoi(e) != 0);
     return use_nq ? dkdv_head_split_nq(Sq, Skv, B, Hq, Hkv, window_left, D)
                   : dkdv_head_split_sim(Sq, Skv, B, Hq, Hkv, window_left, D);
 }
@@ -2622,14 +2745,12 @@ static inline int dkdv_head_split(int Sq, int Skv, int B, int Hq, int Hkv, int w
 // swizzled_offset / underlying_subtile_row_bytes and lane L of warp w fetches chunk L%4 of
 // row L/4 + 16*(w%2), so a per-row chunk permutation leaves the SET of global bytes per
 // 64 B segment untouched and VMEM/L2 traffic is untouched.
-template <int D>
-struct dkdv_stage_st : st_bf<DKDV_Q_BLOCK, D, st_32x32_s> {
+template <int D> struct dkdv_stage_st : st_bf<DKDV_Q_BLOCK, D, st_32x32_s> {
     using base = st_bf<DKDV_Q_BLOCK, D, st_32x32_s>;
     __device__ __forceinline__ static const uint32_t swizzle(int2 coord) {
-        const uint32_t offset =
-            sizeof(bf16) * (coord.x * base::underlying_subtile_cols + coord.y);
-        return offset ^ (((offset % 512) >> 8) << 5)      // r bit 2 -> bank bit 3, the new term
-                      ^ (((offset % 2048) >> 10) << 4);   // r bit 4 -> bank bit 2, library's
+        const uint32_t offset = sizeof(bf16) * (coord.x * base::underlying_subtile_cols + coord.y);
+        return offset ^ (((offset % 512) >> 8) << 5) // r bit 2 -> bank bit 3, the new term
+               ^ (((offset % 2048) >> 10) << 4);     // r bit 4 -> bank bit 2, library's
         // stock's other term, (((offset % 1024) >> 9) << 5) = r bit 3 -> bank bit 3, is the
         // one this type REMOVES: keeping it alongside r bit 2 breaks the row-layout read.
     }
@@ -2684,9 +2805,9 @@ using dkdv_stage_tile =
 // instantiation is byte-identical to the un-chunked kernel.
 template <int D, int NSPLIT, int VM = 0, int GRID = 0, int BUN = 0, int BM = 1, int QCH = 0>
 __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
-    const _gl_QKVO Qg, const _gl_QKVO Kg, const _gl_QKVO Vg, const _gl_QKVO dOg,
-    const _gl_QKVO dKg, const _gl_QKVO dVg, const _gl_L Lg, const _gl_L Dg, int Sq, int Skv,
-    int Hq, int Hkv, int window_left, float softmax_scale, int kv_tiles_pad) {
+    const _gl_QKVO Qg, const _gl_QKVO Kg, const _gl_QKVO Vg, const _gl_QKVO dOg, const _gl_QKVO dKg,
+    const _gl_QKVO dVg, const _gl_L Lg, const _gl_L Dg, int Sq, int Skv, int Hq, int Hkv,
+    int window_left, float softmax_scale, int kv_tiles_pad) {
 #if !defined(__gfx950__)
     // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
     // other device pass the body is replaced rather than compiled -- which is what lets one
@@ -2705,11 +2826,11 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // B33 (BUN bit 3): the staged tile's swizzle. Only meaningful with M1, since the
     // conflict is a property of M1's stride-4 column operand.
     constexpr int DSW = ((BUNE & 8) != 0 && (BUNE & 2) != 0) ? 1 : 0;
-    using stage_t = dkdv_stage_tile<D, DSW>;
+    using stage_t     = dkdv_stage_tile<D, DSW>;
 
     extern __shared__ alignment_dummy __shm[];
-    shared_allocator al((int *)&__shm[0]);
-    stage_t(&q_smem)[STAGE_BUFS] = al.allocate<stage_t, STAGE_BUFS>();
+    shared_allocator                  al((int *) &__shm[0]);
+    stage_t(&q_smem)[STAGE_BUFS]  = al.allocate<stage_t, STAGE_BUFS>();
     stage_t(&do_smem)[STAGE_BUFS] = al.allocate<stage_t, STAGE_BUFS>();
 
     // Grid is (Hkv, B, kv_blocks): the kv head and the batch are on the two FAST axes and
@@ -2729,9 +2850,9 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // axes, not a relabel: the same (kv block, kv head, batch) triples exist, each computes
     // bit-identically what it computed before, no accumulation order changes, and it costs
     // zero instructions.
-    const int head_idx_kv = blockIdx.x;
-    const int batch_idx = (int)((GRID == 0) ? blockIdx.y : blockIdx.z);
-    const unsigned z_axis = (GRID == 0) ? blockIdx.z : blockIdx.y;
+    const int      head_idx_kv = blockIdx.x;
+    const int      batch_idx   = (int) ((GRID == 0) ? blockIdx.y : blockIdx.z);
+    const unsigned z_axis      = (GRID == 0) ? blockIdx.z : blockIdx.y;
     // z carries (kv block, split) with the SPLIT ON THE FAST PART, so the split axis never
     // reaches the XCD: lin = c + Hkv*(b + B*(j*NSPLIT + s)), and NSPLIT divides out of
     // `lin mod 8` exactly as j did, leaving XCD = (c + Hkv*b) mod 8 whenever 8 | Hkv*B.
@@ -2756,10 +2877,10 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // The ternary is on a template constant and folds at compile time, so at NSPLIT in
     // {1, 2, 4, 8} the emitted code is byte-for-byte the code that shipped.
     static_assert(NSPLIT >= 1, "NSPLIT must be positive");
-    const int kv_blk = (int)(z_axis / NSPLIT);
-    const int split_idx = ((NSPLIT & (NSPLIT - 1)) == 0)
-                              ? (int)(z_axis & (NSPLIT - 1))
-                              : (int)(z_axis - (unsigned)(kv_blk * NSPLIT));
+    const int kv_blk     = (int) (z_axis / NSPLIT);
+    const int split_idx  = ((NSPLIT & (NSPLIT - 1)) == 0)
+                               ? (int) (z_axis & (NSPLIT - 1))
+                               : (int) (z_axis - (unsigned) (kv_blk * NSPLIT));
     const int group_size = Hq / Hkv;
     // The head sub-range this workgroup owns. group_size % NSPLIT == 0 is enforced by the
     // launcher, so the NSPLIT sub-ranges partition the group exactly and every (kv block,
@@ -2768,25 +2889,24 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     const int heads_per_wg = group_size / NSPLIT;
     const int first_q_head = head_idx_kv * group_size + split_idx * heads_per_wg;
 
-    const int wid = __builtin_amdgcn_readfirstlane(warpid());
-    const int kv_base = kv_blk * DKDV_KV_BLOCK + wid * DKDV_KV_WAVE;
+    const int wid         = __builtin_amdgcn_readfirstlane(warpid());
+    const int kv_base     = kv_blk * DKDV_KV_BLOCK + wid * DKDV_KV_WAVE;
     const int kv_row_tile = kv_base / DKDV_KV_WAVE;
 
     const int causal_offset = Skv - Sq;
-    const int lane = laneid();
-    const int q_tile_max = (Sq + DKDV_Q_BLOCK - 1) / DKDV_Q_BLOCK;
+    const int lane          = laneid();
+    const int q_tile_max    = (Sq + DKDV_Q_BLOCK - 1) / DKDV_Q_BLOCK;
 
     // The q tile range for the whole WORKGROUP's kv band; every wave walks it and
     // predicates, so the staged tiles stay whole-workgroup operations.
-    const int blk_lo = kv_blk * DKDV_KV_BLOCK;
-    const int blk_hi = blk_lo + DKDV_KV_BLOCK - 1;
+    const int blk_lo  = kv_blk * DKDV_KV_BLOCK;
+    const int blk_hi  = blk_lo + DKDV_KV_BLOCK - 1;
     const int i_begin = q_tile_begin_for<DKDV_Q_BLOCK>(blk_lo, causal_offset, q_tile_max);
-    const int i_end =
-        q_tile_end_for<DKDV_Q_BLOCK>(blk_hi, causal_offset, window_left, q_tile_max);
+    const int i_end = q_tile_end_for<DKDV_Q_BLOCK>(blk_hi, causal_offset, window_left, q_tile_max);
 
     // This wave's own range inside that band.
-    const int wave_lo = kv_base;
-    const int wave_hi = kv_base + DKDV_KV_WAVE - 1;
+    const int wave_lo  = kv_base;
+    const int wave_hi  = kv_base + DKDV_KV_WAVE - 1;
     const int wi_begin = q_tile_begin_for<DKDV_Q_BLOCK>(wave_lo, causal_offset, q_tile_max);
     const int wi_end =
         q_tile_end_for<DKDV_Q_BLOCK>(wave_hi, causal_offset, window_left, q_tile_max);
@@ -2853,8 +2973,8 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // subtiles_per_row addresses both. The base offset 2c * 2048 B is a multiple of the
     // 256 B bank cycle, so B33's swizzle -- which st_subtile forwards on the WITHIN-subtile
     // coordinate -- and the measured zero bank-conflict rate both survive.
-    constexpr int QR = (QCH & 1) ? 2 : 1;  // D-chunks on the row-layout operands + K/V
-    constexpr int QK = (QCH & 2) ? 2 : 1;  // D-chunks on the col-layout operands + the accs
+    constexpr int QR = (QCH & 1) ? 2 : 1; // D-chunks on the row-layout operands + K/V
+    constexpr int QK = (QCH & 2) ? 2 : 1; // D-chunks on the col-layout operands + the accs
     constexpr int DR = D / QR;
     constexpr int DK = D / QK;
     static_assert(D % (32 * QR) == 0 && D % (32 * QK) == 0,
@@ -2865,14 +2985,16 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
 
     rt<bf16, DKDV_KV_WAVE, DR, row_l, rt_16x32_s> k_reg[QR], v_reg[QR];
     std::conditional_t<M1, rt<float, DK, DKDV_KV_WAVE, col_l, rt_16x16_s>,
-                       rt<float, DK, DKDV_KV_WAVE, col_l, rt_32x32_s>> dk_acc[QK], dv_acc[QK];
+                       rt<float, DK, DKDV_KV_WAVE, col_l, rt_32x32_s>>
+                                                  dk_acc[QK], dv_acc[QK];
     rt<bf16, DKDV_Q_BLOCK, DR, row_l, rt_16x32_s> q_reg, do_reg;
     std::conditional_t<M1, rt<bf16, DKDV_Q_BLOCK, DK, col_l, rt_32x16_4_s>,
-                       rt<bf16, DKDV_Q_BLOCK, DK, col_l, rt_16x32_s>> q_reg_col, do_reg_col;
+                       rt<bf16, DKDV_Q_BLOCK, DK, col_l, rt_16x32_s>>
+                                                             q_reg_col, do_reg_col;
     rt<float, DKDV_Q_BLOCK, DKDV_KV_WAVE, col_l, rt_16x16_s> p_reg, dp_reg;
     std::conditional_t<M1, rt<bf16, DKDV_Q_BLOCK, DKDV_KV_WAVE, col_l, rt_32x16_4_s>,
-                       rt<bf16, DKDV_Q_BLOCK, DKDV_KV_WAVE, col_l, rt_16x16_s>> p_bf16,
-        dp_bf16;
+                       rt<bf16, DKDV_Q_BLOCK, DKDV_KV_WAVE, col_l, rt_16x16_s>>
+                                                                               p_bf16, dp_bf16;
     typename rt<float, DKDV_Q_BLOCK, DKDV_KV_WAVE, col_l, rt_16x16_s>::col_vec l_vec, delta_vec;
 
 #pragma unroll
@@ -2949,12 +3071,12 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // Flatten (q head, q tile) so the prefetch index is a single counter that carries
     // across the head boundary; every wave in the workgroup walks the same sequence.
     auto stage_at = [&](int it, int b) {
-        const int h = first_q_head + it / nq;
+        const int h  = first_q_head + it / nq;
         const int qt = i_begin + it % nq;
-        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>,
-                       DKDV_NUM_THREADS>(q_smem[b], Qg, {qt, batch_idx, h, 0}, wid);
-        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>,
-                       DKDV_NUM_THREADS>(do_smem[b], dOg, {qt, batch_idx, h, 0}, wid);
+        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>, DKDV_NUM_THREADS>(
+            q_smem[b], Qg, {qt, batch_idx, h, 0}, wid);
+        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>, DKDV_NUM_THREADS>(
+            do_smem[b], dOg, {qt, batch_idx, h, 0}, wid);
     };
 
     // vm_sr: the same fill addressed by (q head, q tile) directly, so the caller can carry
@@ -2973,10 +3095,10 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // the division's temporaries out. The nested spelling spills 8 VGPRs in two
     // independent forms, and the bare-pointer variant discussed below spills 6.
     auto stage_at_hq = [&](int h, int qt, int b) {
-        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>,
-                       DKDV_NUM_THREADS>(q_smem[b], Qg, {qt, batch_idx, h, 0}, wid);
-        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>,
-                       DKDV_NUM_THREADS>(do_smem[b], dOg, {qt, batch_idx, h, 0}, wid);
+        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>, DKDV_NUM_THREADS>(
+            q_smem[b], Qg, {qt, batch_idx, h, 0}, wid);
+        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>, DKDV_NUM_THREADS>(
+            do_smem[b], dOg, {qt, batch_idx, h, 0}, wid);
     };
 
     // ITEM A -- the four per-iteration runtime-stride address chains, pinned.
@@ -2998,37 +3120,40 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // `buffer_load_dwordx4 ... lds` off an SGPR quad, which is the form the shipped
     // kernel already emits, so there is no vaddr form to fall into.
     long long qo_step = 0, qo_wrap = 0, lo_step = 0, lo_wrap = 0;
-    _gl_QKVO Qc = Qg, dOc = dOg;
-    _gl_L Lc = Lg, Dc = Dg;
-    bf16 *qs_ptr = nullptr, *os_ptr = nullptr;
-    float *lv_ptr = nullptr, *dv_ptr = nullptr;
+    _gl_QKVO  Qc = Qg, dOc = dOg;
+    _gl_L     Lc = Lg, Dc = Dg;
+    bf16     *qs_ptr = nullptr, *os_ptr = nullptr;
+    float    *lv_ptr = nullptr, *dv_ptr = nullptr;
     if constexpr (vm_pinq(VM)) {
-        qo_step = (long long)DKDV_Q_BLOCK * (long long)Qg.template stride<0>();
-        qo_wrap = (long long)D - (long long)(nq - 1) * qo_step;
-        qs_ptr = &Qg[coord<>(i_begin * DKDV_Q_BLOCK, batch_idx, first_q_head, 0)];
-        os_ptr = &dOg[coord<>(i_begin * DKDV_Q_BLOCK, batch_idx, first_q_head, 0)];
+        qo_step = (long long) DKDV_Q_BLOCK * (long long) Qg.template stride<0>();
+        qo_wrap = (long long) D - (long long) (nq - 1) * qo_step;
+        qs_ptr  = &Qg[coord<>(i_begin * DKDV_Q_BLOCK, batch_idx, first_q_head, 0)];
+        os_ptr  = &dOg[coord<>(i_begin * DKDV_Q_BLOCK, batch_idx, first_q_head, 0)];
     }
     if constexpr (vm_pinl(VM)) {
-        lo_step = (long long)DKDV_Q_BLOCK;
-        lo_wrap = (long long)Lg.template stride<1>() - (long long)(nq - 1) * lo_step;
-        lv_ptr = &Lg[coord<>(batch_idx, first_q_head, 0, i_begin * DKDV_Q_BLOCK)];
-        dv_ptr = &Dg[coord<>(batch_idx, first_q_head, 0, i_begin * DKDV_Q_BLOCK)];
+        lo_step = (long long) DKDV_Q_BLOCK;
+        lo_wrap = (long long) Lg.template stride<1>() - (long long) (nq - 1) * lo_step;
+        lv_ptr  = &Lg[coord<>(batch_idx, first_q_head, 0, i_begin * DKDV_Q_BLOCK)];
+        dv_ptr  = &Dg[coord<>(batch_idx, first_q_head, 0, i_begin * DKDV_Q_BLOCK)];
     }
 
     auto stage_at_ptr = [&](int b) {
-        Qc.raw_ptr = qs_ptr;
+        Qc.raw_ptr  = qs_ptr;
         dOc.raw_ptr = os_ptr;
-        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>,
-                       DKDV_NUM_THREADS>(q_smem[b], Qc, {0, 0, 0, 0}, wid);
-        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>,
-                       DKDV_NUM_THREADS>(do_smem[b], dOc, {0, 0, 0, 0}, wid);
+        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>, DKDV_NUM_THREADS>(
+            q_smem[b], Qc, {0, 0, 0, 0}, wid);
+        hk_stage::load<0, false, stage_t, _gl_QKVO, coord<stage_t>, DKDV_NUM_THREADS>(
+            do_smem[b], dOc, {0, 0, 0, 0}, wid);
     };
 
 #if !HK_BWD_SINGLE_BUF
     if (n_iter > 0) {
-        if constexpr (vm_pinq(VM)) stage_at_ptr(0);
-        else if constexpr (vm_sr(VM)) stage_at_hq(first_q_head, i_begin, 0);
-        else stage_at(0, 0);
+        if constexpr (vm_pinq(VM))
+            stage_at_ptr(0);
+        else if constexpr (vm_sr(VM))
+            stage_at_hq(first_q_head, i_begin, 0);
+        else
+            stage_at(0, 0);
         stage_rendezvous();
     }
 #endif
@@ -3047,7 +3172,7 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // The epilogue below scales dK by softmax_scale and stores both accumulators. Neither
     // needs a cross-block reduction unless NSPLIT > 1, in which case each split writes its
     // own slice of a workspace that dkdvred folds in fixed order.
-    int buf = 0;
+    int buf     = 0;
     int sr_head = first_q_head, sr_tile = i_begin;
     for (int it = 0; it < n_iter; ++it) {
         int q_head, q_tile;
@@ -3058,7 +3183,7 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
             q_head = first_q_head + it / nq;
             q_tile = i_begin + it % nq;
         }
-        const int q_base = q_tile * DKDV_Q_BLOCK;
+        const int  q_base = q_tile * DKDV_Q_BLOCK;
         const bool active = (q_tile >= wi_begin) && (q_tile < wi_end);
 
         // L and delta are issued NEXT TO the staging DMA rather than inside the compute
@@ -3083,8 +3208,8 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
         // Unconditional on purpose. Under `if (active)` the pair is conditionally live
         // across the s_barrier and the allocator answers with 10 spilled VGPRs / 44 B of
         // scratch AND one ds_read_b64_tr_b16 aliasing pair -- the LDS-alias hazard documented
-        // at hk_tr::load, armed in a build that is not even prefetched. Unconditional, dkdv stays at
-        // 168 VGPRs / 3 waves per SIMD / 0 spills / 0 aliases with a bit-identical static
+        // at hk_tr::load, armed in a build that is not even prefetched. Unconditional, dkdv stays
+        // at 168 VGPRs / 3 waves per SIMD / 0 spills / 0 aliases with a bit-identical static
         // instruction mix. The cost is 4 global_load_dwordx4 on the ~2.3% of wave-iterations
         // that have no compute of their own; the address is always the (q head, q tile) the
         // workgroup is staging this iteration, so it is in bounds and inside the same
@@ -3092,8 +3217,10 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
         // there. Do NOT re-add the guard to save those instructions.
 #if HK_BWD_SINGLE_BUF
         const int nbuf = 0;
-        if constexpr (vm_sr(VM)) stage_at_hq(q_head, q_tile, 0);
-        else stage_at(it, 0);
+        if constexpr (vm_sr(VM))
+            stage_at_hq(q_head, q_tile, 0);
+        else
+            stage_at(it, 0);
         load(l_vec, Lg, {batch_idx, q_head, 0, q_tile});
         load(delta_vec, Dg, {batch_idx, q_head, 0, q_tile});
         stage_rendezvous();
@@ -3111,9 +3238,9 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
         if constexpr (vm_pinq(VM)) {
             // Same clamp as the counter form: on the last trip the prefetch re-stages
             // the tile it already holds, so the pointer does not move either.
-            const bool wrap = (q_tile + 1 >= i_end);
-            const bool last = (it + 1 >= n_iter);
-            const long long adv = last ? 0ll : (wrap ? qo_wrap : qo_step);
+            const bool      wrap = (q_tile + 1 >= i_end);
+            const bool      last = (it + 1 >= n_iter);
+            const long long adv  = last ? 0ll : (wrap ? qo_wrap : qo_step);
             qs_ptr += adv;
             os_ptr += adv;
             stage_at_ptr(nbuf);
@@ -3133,7 +3260,8 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
             const bool needs_mask = tile_needs_mask<DKDV_Q_BLOCK, DKDV_KV_WAVE>(
                 q_base, kv_base, Skv, causal_offset, window_left);
 
-            if constexpr (!vm_cinit(VM)) mul(l_vec, l_vec, LOG2E);
+            if constexpr (!vm_cinit(VM))
+                mul(l_vec, l_vec, LOG2E);
 
             // S = Q K^T -> [Q, KV]; under vm_cinit the accumulator starts at -L*log2(e)
             // rather than at zero, so the softmax's subtraction rides in the MFMA's own C
@@ -3146,13 +3274,18 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
             // passed straight through, so the emitted order is that of the unchunked kernel.
 #pragma unroll
             for (int c = 0; c < QR; ++c) {
-                if constexpr (QR == 1) load(q_reg, q_smem[buf]);
-                else load(q_reg, subtile_inplace<DKDV_Q_BLOCK, DR>(q_smem[buf], {0, c}));
+                if constexpr (QR == 1)
+                    load(q_reg, q_smem[buf]);
+                else
+                    load(q_reg, subtile_inplace<DKDV_Q_BLOCK, DR>(q_smem[buf], {0, c}));
                 lds_read_fence();
                 if (c == 0) {
-                    if constexpr (vm_pneg(VM)) init_row(p_reg, l_vec);
-                    else if constexpr (vm_cinit(VM)) init_row_scaled(p_reg, l_vec, -LOG2E);
-                    else zero(p_reg);
+                    if constexpr (vm_pneg(VM))
+                        init_row(p_reg, l_vec);
+                    else if constexpr (vm_cinit(VM))
+                        init_row_scaled(p_reg, l_vec, -LOG2E);
+                    else
+                        zero(p_reg);
                 }
                 mma_ABt(p_reg, q_reg, k_reg[c], p_reg);
             }
@@ -3160,37 +3293,50 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
             // dP = dO V^T -> [Q, KV]; likewise starting at -delta.
 #pragma unroll
             for (int c = 0; c < QR; ++c) {
-                if constexpr (QR == 1) load(do_reg, do_smem[buf]);
-                else load(do_reg, subtile_inplace<DKDV_Q_BLOCK, DR>(do_smem[buf], {0, c}));
+                if constexpr (QR == 1)
+                    load(do_reg, do_smem[buf]);
+                else
+                    load(do_reg, subtile_inplace<DKDV_Q_BLOCK, DR>(do_smem[buf], {0, c}));
                 lds_read_fence();
                 if (c == 0) {
-                    if constexpr (vm_pneg(VM)) init_row(dp_reg, delta_vec);
-                    else if constexpr (vm_cinit(VM)) init_row_scaled(dp_reg, delta_vec, -1.0f);
-                    else zero(dp_reg);
+                    if constexpr (vm_pneg(VM))
+                        init_row(dp_reg, delta_vec);
+                    else if constexpr (vm_cinit(VM))
+                        init_row_scaled(dp_reg, delta_vec, -1.0f);
+                    else
+                        zero(dp_reg);
                 }
                 mma_ABt(dp_reg, do_reg, v_reg[c], dp_reg);
             }
 
-            if constexpr (!vm_cinit(VM)) sub_row(p_reg, p_reg, l_vec);
+            if constexpr (!vm_cinit(VM))
+                sub_row(p_reg, p_reg, l_vec);
             exp2(p_reg, p_reg);
             if (needs_mask) {
-                mask_prob_qkv<DKDV_KV_WAVE, (BUNE & 4) ? 1 : 0>(
-                    p_reg, q_base, kv_base, Skv, causal_offset, window_left, lane);
+                mask_prob_qkv<DKDV_KV_WAVE, (BUNE & 4) ? 1 : 0>(p_reg, q_base, kv_base, Skv,
+                                                                causal_offset, window_left, lane);
             }
             // Under M1 the narrowing convert also relabels: the same 8
             // v_cvt_pk_bf16_f32, written to the rt_32x16_4 operand slot instead of the
             // rt_16x16 accumulator slot, so the layout change costs zero instructions.
-            if constexpr (M1) relabel_16x16_to_32x16_4(p_bf16, p_reg);
-            else copy(p_bf16, p_reg);
+            if constexpr (M1)
+                relabel_16x16_to_32x16_4(p_bf16, p_reg);
+            else
+                copy(p_bf16, p_reg);
 
             // dS = P . (dP - delta); the subtraction rides in dp_reg's C operand under
             // vm_cinit, so only the product is left here. A5's A1 halves the multiply:
             // 16 v_mul_f32_e32 -> 8 v_pk_mul_f32, bit-identical.
-            if constexpr (!vm_cinit(VM)) sub_row(dp_reg, dp_reg, delta_vec);
-            if constexpr (BUNE & 1) mul_pk(dp_reg, dp_reg, p_reg);
-            else mul(dp_reg, dp_reg, p_reg);
-            if constexpr (M1) relabel_16x16_to_32x16_4(dp_bf16, dp_reg);
-            else copy(dp_bf16, dp_reg);
+            if constexpr (!vm_cinit(VM))
+                sub_row(dp_reg, dp_reg, delta_vec);
+            if constexpr (BUNE & 1)
+                mul_pk(dp_reg, dp_reg, p_reg);
+            else
+                mul(dp_reg, dp_reg, p_reg);
+            if constexpr (M1)
+                relabel_16x16_to_32x16_4(dp_bf16, dp_reg);
+            else
+                copy(dp_bf16, dp_reg);
 
             // dV^T += dO^T P and dK^T += Q^T dS, both reducing over q. The operands need
             // a 16x32 base tile where the exp2 above produced 16x16, and swap_layout_
@@ -3209,8 +3355,7 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
                     hk_tr::load(q_reg_col, q_smem[buf]);
                     hk_tr::load(do_reg_col, do_smem[buf]);
                 } else {
-                    hk_tr::load(q_reg_col,
-                                subtile_inplace<DKDV_Q_BLOCK, DK>(q_smem[buf], {0, c}));
+                    hk_tr::load(q_reg_col, subtile_inplace<DKDV_Q_BLOCK, DK>(q_smem[buf], {0, c}));
                     hk_tr::load(do_reg_col,
                                 subtile_inplace<DKDV_Q_BLOCK, DK>(do_smem[buf], {0, c}));
                 }
@@ -3220,7 +3365,7 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
                     mma_AtB(dv_acc[c], do_reg_col, p_bf16, dv_acc[c]);
                     mma_AtB(dk_acc[c], q_reg_col, dp_bf16, dk_acc[c]);
                 } else {
-                    auto &p_col = swap_layout_inplace<col_l, rt_16x32_s>(p_bf16);
+                    auto &p_col  = swap_layout_inplace<col_l, rt_16x32_s>(p_bf16);
                     auto &dp_col = swap_layout_inplace<col_l, rt_16x32_s>(dp_bf16);
                     mma_AtB(dv_acc[c], do_reg_col, p_col, dv_acc[c]);
                     mma_AtB(dk_acc[c], q_reg_col, dp_col, dk_acc[c]);
@@ -3274,7 +3419,8 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // that of the unchunked kernel.
     const int out_tile = NSPLIT == 1 ? kv_row_tile : split_idx * kv_tiles_pad + kv_row_tile;
     std::conditional_t<M1, rt<float, DKDV_KV_WAVE, DK, row_l, rt_16x16_s>,
-                       rt<float, DKDV_KV_WAVE, DK, row_l, rt_32x32_s>> out_row;
+                       rt<float, DKDV_KV_WAVE, DK, row_l, rt_32x32_s>>
+        out_row;
 #pragma unroll
     for (int c = 0; c < QK; ++c) {
         transpose(out_row, dv_acc[c]);
@@ -3285,12 +3431,14 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 2) void hk_attn_bwd_dkdv_ker(
     // asm-volatile store is preserved.
 #pragma unroll
     for (int c = 0; c < QK; ++c) {
-        if constexpr (BUNE & 1) mul_pk_s(dk_acc[c], dk_acc[c], softmax_scale);
-        else mul(dk_acc[c], dk_acc[c], softmax_scale);
+        if constexpr (BUNE & 1)
+            mul_pk_s(dk_acc[c], dk_acc[c], softmax_scale);
+        else
+            mul(dk_acc[c], dk_acc[c], softmax_scale);
         transpose(out_row, dk_acc[c]);
         store<0>(dKg, out_row, {out_tile, batch_idx, head_idx_kv, c});
     }
-#endif  // __gfx950__
+#endif // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -3329,8 +3477,9 @@ __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dkdvred_ker(
     return;
 #else
 
-    long idx = (long)blockIdx.x * DQRED_THREADS + threadIdx.x;
-    if (idx >= total) return;
+    long idx = (long) blockIdx.x * DQRED_THREADS + threadIdx.x;
+    if (idx >= total)
+        return;
     const long off = idx * DQRED_PER_THREAD;
 
     float ak[DQRED_PER_THREAD], av[DQRED_PER_THREAD];
@@ -3340,25 +3489,25 @@ __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dkdvred_ker(
         av[i] = 0.0f;
     }
 
-    for (int s = 0; s < n_split; ++s) {  // ASCENDING: the fixed order
-        const bf16x8 pk = *(const bf16x8 *)(wsk + (long)s * slot_stride + off);
-        const bf16x8 pv = *(const bf16x8 *)(wsv + (long)s * slot_stride + off);
+    for (int s = 0; s < n_split; ++s) { // ASCENDING: the fixed order
+        const bf16x8 pk = *(const bf16x8 *) (wsk + (long) s * slot_stride + off);
+        const bf16x8 pv = *(const bf16x8 *) (wsv + (long) s * slot_stride + off);
 #pragma unroll
         for (int i = 0; i < DQRED_PER_THREAD; ++i) {
-            ak[i] += (float)pk.v[i];
-            av[i] += (float)pv.v[i];
+            ak[i] += (float) pk.v[i];
+            av[i] += (float) pv.v[i];
         }
     }
 
     bf16x8 ok, ov;
 #pragma unroll
     for (int i = 0; i < DQRED_PER_THREAD; ++i) {
-        ok.v[i] = (bf16)ak[i];
-        ov.v[i] = (bf16)av[i];
+        ok.v[i] = (bf16) ak[i];
+        ov.v[i] = (bf16) av[i];
     }
-    *(bf16x8 *)(dk + off) = ok;
-    *(bf16x8 *)(dv + off) = ov;
-#endif  // __gfx950__
+    *(bf16x8 *) (dk + off) = ok;
+    *(bf16x8 *) (dv + off) = ov;
+#endif // __gfx950__
 }
 
 // =================================================================================
@@ -3399,22 +3548,24 @@ __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dkdvred_ker(
 template <int QB, int KVB>
 __device__ inline int band_q_begin(int band, int causal_offset, int q_tile_max) {
     const int q = band * KVB - causal_offset;
-    if (q <= 0) return 0;
+    if (q <= 0)
+        return 0;
     const int b = q / QB;
     return b > q_tile_max ? q_tile_max : b;
 }
 
 template <int QB, int KVB>
 __device__ inline int band_q_end(int band, int causal_offset, int window_left, int q_tile_max) {
-    if (window_left < 0) return q_tile_max;
+    if (window_left < 0)
+        return q_tile_max;
     const int q = band * KVB + KVB - 1 - causal_offset + window_left;
-    if (q < 0) return 0;
+    if (q < 0)
+        return 0;
     const int e = q / QB + 1;
     return e > q_tile_max ? q_tile_max : e;
 }
 
-template <int D>
-using bw_qo_tile = st_bf<BW_Q_BLOCK, D, st_32x32_s>;
+template <int D> using bw_qo_tile = st_bf<BW_Q_BLOCK, D, st_32x32_s>;
 // dS gathered across the workgroup, stored [KV, Q] because the fifth product wants KV as
 // its reduction axis. st_16x16_swizzled_s is the shape tuned for the 64-bit ds_write the
 // store below uses.
@@ -3437,10 +3588,9 @@ using bw_ds_tile = st_bf<BW_KV_BLOCK, BW_Q_SLICE, st_16x16_swizzled_s>;
 // registers and needs no reduction.
 template <int D>
 __global__ __launch_bounds__(BW_NUM_THREADS, 2) void hk_attn_bwd_fused_ker(
-    const _gl_QKVO Qg, const _gl_QKVO Kg, const _gl_QKVO Vg, const _gl_QKVO dOg,
-    const _gl_QKVO dKg, const _gl_QKVO dVg, const _gl_QKVO WSg, const _gl_L Lg,
-    const _gl_L Dg, int Sq, int Skv, int Hq, int Hkv, int window_left, float softmax_scale,
-    int q_tiles_pad) {
+    const _gl_QKVO Qg, const _gl_QKVO Kg, const _gl_QKVO Vg, const _gl_QKVO dOg, const _gl_QKVO dKg,
+    const _gl_QKVO dVg, const _gl_QKVO WSg, const _gl_L Lg, const _gl_L Dg, int Sq, int Skv, int Hq,
+    int Hkv, int window_left, float softmax_scale, int q_tiles_pad) {
 #if !defined(__gfx950__)
     // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
     // other device pass the body is replaced rather than compiled -- which is what lets one
@@ -3456,24 +3606,24 @@ __global__ __launch_bounds__(BW_NUM_THREADS, 2) void hk_attn_bwd_fused_ker(
     static_assert(BW_D_SLICE >= 16, "an MFMA operand cannot be narrower than 16");
 
     extern __shared__ alignment_dummy __shm[];
-    shared_allocator al((int *)&__shm[0]);
-    bw_qo_tile<D> &q_smem = al.allocate<bw_qo_tile<D>>();
-    bw_qo_tile<D> &do_smem = al.allocate<bw_qo_tile<D>>();
-    bw_ds_tile &ds_smem = al.allocate<bw_ds_tile>();
+    shared_allocator                  al((int *) &__shm[0]);
+    bw_qo_tile<D>                    &q_smem  = al.allocate<bw_qo_tile<D>>();
+    bw_qo_tile<D>                    &do_smem = al.allocate<bw_qo_tile<D>>();
+    bw_ds_tile                       &ds_smem = al.allocate<bw_ds_tile>();
 
-    const int band = blockIdx.x;
-    const int head_idx_kv = blockIdx.y;
-    const int batch_idx = blockIdx.z;
-    const int group_size = Hq / Hkv;
+    const int band         = blockIdx.x;
+    const int head_idx_kv  = blockIdx.y;
+    const int batch_idx    = blockIdx.z;
+    const int group_size   = Hq / Hkv;
     const int first_q_head = head_idx_kv * group_size;
 
-    const int wid = __builtin_amdgcn_readfirstlane(warpid());
-    const int kv_base = band * BW_KV_BLOCK + wid * BW_KV_WAVE;
+    const int wid         = __builtin_amdgcn_readfirstlane(warpid());
+    const int kv_base     = band * BW_KV_BLOCK + wid * BW_KV_WAVE;
     const int kv_row_tile = kv_base / BW_KV_WAVE;
 
-    const int causal_offset = Skv - Sq;  // bottom-right alignment
-    const int lane = laneid();
-    const int q_tile_max = (Sq + BW_Q_BLOCK - 1) / BW_Q_BLOCK;
+    const int causal_offset = Skv - Sq; // bottom-right alignment
+    const int lane          = laneid();
+    const int q_tile_max    = (Sq + BW_Q_BLOCK - 1) / BW_Q_BLOCK;
 
     // The q tile range for the whole WORKGROUP's kv band; every wave walks it and
     // predicates, so the staged tiles stay whole-workgroup operations.
@@ -3482,25 +3632,25 @@ __global__ __launch_bounds__(BW_NUM_THREADS, 2) void hk_attn_bwd_fused_ker(
         band_q_end<BW_Q_BLOCK, BW_KV_BLOCK>(band, causal_offset, window_left, q_tile_max);
 
     // This wave's own range inside that band, in units of the wave's 32 key rows.
-    const int w_band = kv_base / BW_KV_WAVE;
+    const int w_band   = kv_base / BW_KV_WAVE;
     const int wi_begin = band_q_begin<BW_Q_BLOCK, BW_KV_WAVE>(w_band, causal_offset, q_tile_max);
     const int wi_end =
         band_q_end<BW_Q_BLOCK, BW_KV_WAVE>(w_band, causal_offset, window_left, q_tile_max);
 
-    rt<bf16, BW_KV_WAVE, D, row_l, rt_16x32_s> k_reg, v_reg;
-    rt<float, D, BW_KV_WAVE, col_l, rt_32x32_s> dk_acc, dv_acc;
-    rt<bf16, BW_Q_BLOCK, D, row_l, rt_16x32_s> q_reg, do_reg;
-    rt<bf16, BW_Q_BLOCK, D, col_l, rt_16x32_s> q_reg_col, do_reg_col;
+    rt<bf16, BW_KV_WAVE, D, row_l, rt_16x32_s>           k_reg, v_reg;
+    rt<float, D, BW_KV_WAVE, col_l, rt_32x32_s>          dk_acc, dv_acc;
+    rt<bf16, BW_Q_BLOCK, D, row_l, rt_16x32_s>           q_reg, do_reg;
+    rt<bf16, BW_Q_BLOCK, D, col_l, rt_16x32_s>           q_reg_col, do_reg_col;
     rt<float, BW_Q_BLOCK, BW_KV_WAVE, col_l, rt_16x16_s> p_reg, dp_reg;
-    rt<bf16, BW_Q_BLOCK, BW_KV_WAVE, col_l, rt_16x16_s> p_bf16, dp_bf16;
-    rt<bf16, BW_KV_WAVE, BW_Q_BLOCK, row_l, rt_16x16_s> ds_row;
+    rt<bf16, BW_Q_BLOCK, BW_KV_WAVE, col_l, rt_16x16_s>  p_bf16, dp_bf16;
+    rt<bf16, BW_KV_WAVE, BW_Q_BLOCK, row_l, rt_16x16_s>  ds_row;
     // THE dK/dV OPERANDS ARE BUILT OUT OF PLACE, deliberately. transpose() copies base
     // tiles verbatim, so on a square tile grid its diagonal tiles are identity copies the
     // register allocator will happily coalesce with the source, and swap_layout_inplace()
     // rewrites its argument with v_permlane16_swap -- which would silently corrupt exactly
     // those tiles of the transposed copy dS is staged from. That costs dK and dV nothing
     // (they want the swapped form) and quietly wrecks dQ.
-    rt<bf16, BW_Q_BLOCK, BW_KV_WAVE, col_l, rt_16x32_s> p_col, dp_col;
+    rt<bf16, BW_Q_BLOCK, BW_KV_WAVE, col_l, rt_16x32_s>                    p_col, dp_col;
     typename rt<float, BW_Q_BLOCK, BW_KV_WAVE, col_l, rt_16x16_s>::col_vec l_vec, delta_vec;
 
     // The fifth product's operands. ds_col is read out of LDS and k_col straight out of
@@ -3508,8 +3658,8 @@ __global__ __launch_bounds__(BW_NUM_THREADS, 2) void hk_attn_bwd_fused_ker(
     // reduction axis cancels between them.
     rt<bf16, BW_KV_BLOCK, BW_D_SLICE, col_l, rt_32x16_4_s> k_col;
     rt<bf16, BW_KV_BLOCK, BW_Q_SLICE, col_l, rt_32x16_4_s> ds_col;
-    rt<float, BW_D_SLICE, BW_Q_SLICE, col_l, rt_16x16_s> dq_acc;
-    rt<bf16, BW_KV_WAVE, BW_Q_SLICE, row_l, rt_16x16_s> ds_half;
+    rt<float, BW_D_SLICE, BW_Q_SLICE, col_l, rt_16x16_s>   dq_acc;
+    rt<bf16, BW_KV_WAVE, BW_Q_SLICE, row_l, rt_16x16_s>    ds_half;
 
     zero(dk_acc);
     zero(dv_acc);
@@ -3541,7 +3691,7 @@ __global__ __launch_bounds__(BW_NUM_THREADS, 2) void hk_attn_bwd_fused_ker(
                 k_col.tiles[i][j].data[e] = base_types::constants<bf16_2>::ones();
 #endif
 
-    const int nq = (i_end > i_begin) ? (i_end - i_begin) : 0;
+    const int nq     = (i_end > i_begin) ? (i_end - i_begin) : 0;
     const int n_iter = nq * group_size;
 
     for (int it = 0; it < n_iter; ++it) {
@@ -3633,7 +3783,7 @@ __global__ __launch_bounds__(BW_NUM_THREADS, 2) void hk_attn_bwd_fused_ker(
             // of the slots that actually reached it): every subset has a distinct value
             // where wid + 1 tags would alias. Full sum 32 * 15 = 480.
             const bf16_2 dsv = base_types::packing<bf16_2>::pack(
-                (bf16)(float)(HK_BWD_DS_ONES > 1 ? (1 << wid) : 1));
+                (bf16) (float) (HK_BWD_DS_ONES > 1 ? (1 << wid) : 1));
 #pragma unroll
             for (int i = 0; i < ds_half.height; ++i)
 #pragma unroll
@@ -3681,7 +3831,7 @@ __global__ __launch_bounds__(BW_NUM_THREADS, 2) void hk_attn_bwd_fused_ker(
     mul(dk_acc, dk_acc, softmax_scale);
     transpose(out_row, dk_acc);
     store<0>(dKg, out_row, {kv_row_tile, batch_idx, head_idx_kv, 0});
-#endif  // __gfx950__
+#endif // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -3714,41 +3864,46 @@ __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dqred_ker(
 #else
 
     constexpr int VEC_PER_ROW = D / DQRED_PER_THREAD;
-    const int Sq_pad = q_tiles_pad * BW_Q_BLOCK;
-    const long total = (long)Sq_pad * BH * VEC_PER_ROW;
-    long idx = (long)blockIdx.x * DQRED_THREADS + threadIdx.x;
-    if (idx >= total) return;
+    const int     Sq_pad      = q_tiles_pad * BW_Q_BLOCK;
+    const long    total       = (long) Sq_pad * BH * VEC_PER_ROW;
+    long          idx         = (long) blockIdx.x * DQRED_THREADS + threadIdx.x;
+    if (idx >= total)
+        return;
 
-    const int d8 = idx % VEC_PER_ROW;
-    const int bh = (idx / VEC_PER_ROW) % BH;
-    const int q = (int)(idx / ((long)VEC_PER_ROW * BH));
-    const int q_tile = q / BW_Q_BLOCK;
+    const int d8         = idx % VEC_PER_ROW;
+    const int bh         = (idx / VEC_PER_ROW) % BH;
+    const int q          = (int) (idx / ((long) VEC_PER_ROW * BH));
+    const int q_tile     = q / BW_Q_BLOCK;
     const int q_tile_max = (Sq + BW_Q_BLOCK - 1) / BW_Q_BLOCK;
 
     float acc[DQRED_PER_THREAD];
 #pragma unroll
-    for (int i = 0; i < DQRED_PER_THREAD; ++i) acc[i] = 0.0f;
+    for (int i = 0; i < DQRED_PER_THREAD; ++i)
+        acc[i] = 0.0f;
 
     // Row stride of the workspace, in bf16 elements; a band advances q_tiles_pad rows.
-    const long row = (long)q * BH * D + (long)bh * D + (long)d8 * DQRED_PER_THREAD;
-    const long band_stride = (long)Sq_pad * BH * D;
+    const long row         = (long) q * BH * D + (long) bh * D + (long) d8 * DQRED_PER_THREAD;
+    const long band_stride = (long) Sq_pad * BH * D;
 
     for (int b = 0; b < n_bands; ++b) {
         const int lo = band_q_begin<BW_Q_BLOCK, BW_KV_BLOCK>(b, causal_offset, q_tile_max);
-        const int hi = band_q_end<BW_Q_BLOCK, BW_KV_BLOCK>(b, causal_offset, window_left,
-                                                           q_tile_max);
-        if (q_tile < lo || q_tile >= hi) continue;
-        const bf16x8 part = *(const bf16x8 *)(ws + (long)b * band_stride + row);
+        const int hi =
+            band_q_end<BW_Q_BLOCK, BW_KV_BLOCK>(b, causal_offset, window_left, q_tile_max);
+        if (q_tile < lo || q_tile >= hi)
+            continue;
+        const bf16x8 part = *(const bf16x8 *) (ws + (long) b * band_stride + row);
 #pragma unroll
-        for (int i = 0; i < DQRED_PER_THREAD; ++i) acc[i] += (float)part.v[i];
+        for (int i = 0; i < DQRED_PER_THREAD; ++i)
+            acc[i] += (float) part.v[i];
     }
 
     // softmax_scale is already folded into every partial by the kernel above.
     bf16x8 out;
 #pragma unroll
-    for (int i = 0; i < DQRED_PER_THREAD; ++i) out.v[i] = (bf16)acc[i];
-    *(bf16x8 *)(dq + row) = out;
-#endif  // __gfx950__
+    for (int i = 0; i < DQRED_PER_THREAD; ++i)
+        out.v[i] = (bf16) acc[i];
+    *(bf16x8 *) (dq + row) = out;
+#endif // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -3762,16 +3917,16 @@ static void launch_bwd(const HkTensorDesc &q, const HkTensorDesc &k, const HkTen
                        const HkTensorDesc &delta, const HkTensorDesc &lneg, const HkTensorDesc &wsk,
                        const HkTensorDesc &wsv, int Sq, int Skv, int B, int Hq, int Hkv,
                        int window_left, float softmax_scale, int n_split_req) {
-    auto Qg = make_gl_from_desc<_gl_QKVO>(q);
-    auto Kg = make_gl_from_desc<_gl_QKVO>(k);
-    auto Vg = make_gl_from_desc<_gl_QKVO>(v);
-    auto Og = make_gl_from_desc<_gl_QKVO>(o);
+    auto Qg  = make_gl_from_desc<_gl_QKVO>(q);
+    auto Kg  = make_gl_from_desc<_gl_QKVO>(k);
+    auto Vg  = make_gl_from_desc<_gl_QKVO>(v);
+    auto Og  = make_gl_from_desc<_gl_QKVO>(o);
     auto dOg = make_gl_from_desc<_gl_QKVO>(dO);
     auto dQg = make_gl_from_desc<_gl_QKVO>(dq);
     auto dKg = make_gl_from_desc<_gl_QKVO>(dk);
     auto dVg = make_gl_from_desc<_gl_QKVO>(dv);
-    auto Lg = make_gl_from_desc<_gl_L>(lse);
-    auto Dg = make_gl_from_desc<_gl_L>(delta);
+    auto Lg  = make_gl_from_desc<_gl_L>(lse);
+    auto Dg  = make_gl_from_desc<_gl_L>(delta);
     auto Lng = make_gl_from_desc<_gl_L>(lneg);
 
     // The variant ladder, read once. Same shape as the HK_BWD_DQ_* knobs: every rung is a
@@ -3792,9 +3947,8 @@ static void launch_bwd(const HkTensorDesc &q, const HkTensorDesc &k, const HkTen
     // One entry per instantiated KVB.  The wider tile is 64 KB per workgroup at D = 64,
     // so two workgroups need 128 KB of the CU's 160 KB and the tier survives; at D = 128
     // it would need 256 KB, which is why dq_shape_config() caps kvb_hi on D.
-    constexpr size_t dq_smem = STAGE_BUFS * 2 * sizeof(dq_stage_tile<D, 64>) + HK_BWD_SMEM_EXTRA;
-    constexpr size_t dq_smem_w =
-        STAGE_BUFS * 2 * sizeof(dq_stage_tile<D, 128>) + HK_BWD_SMEM_EXTRA;
+    constexpr size_t dq_smem   = STAGE_BUFS * 2 * sizeof(dq_stage_tile<D, 64>) + HK_BWD_SMEM_EXTRA;
+    constexpr size_t dq_smem_w = STAGE_BUFS * 2 * sizeof(dq_stage_tile<D, 128>) + HK_BWD_SMEM_EXTRA;
     constexpr size_t dkdv_smem = STAGE_BUFS * 2 * sizeof(dkdv_stage_tile<D>) + HK_BWD_SMEM_EXTRA;
     static_assert(dq_smem <= kittens::MAX_SHARED_MEMORY, "dq staging exceeds LDS");
     // dq_smem_w is the KVB=128 staging request. At D=128 dq_shape_config() caps kvb_hi at
@@ -3816,48 +3970,47 @@ static void launch_bwd(const HkTensorDesc &q, const HkTensorDesc &k, const HkTen
     // Past 64 KB this has to be dynamic shared memory with the opt-in requested once
     // per kernel, which is why the opt-in is here even at D=64 where it is under.
     [[maybe_unused]] static const bool smem_opt_in = [] {
-#define HK_DQ_OPTIN(PN, SWV)                                                           \
-    do {                                                                               \
+#define HK_DQ_OPTIN(PN, SWV)                                                                       \
+    do {                                                                                           \
         hipFuncSetAttribute(reinterpret_cast<const void *>(hk_attn_bwd_dq_ker<D, 1, 64, PN, SWV>), \
-                            hipFuncAttributeMaxDynamicSharedMemorySize, dq_smem);       \
-        hipFuncSetAttribute(                                                            \
-            reinterpret_cast<const void *>(hk_attn_bwd_dq_ker<D, DQ_NUM_WARPS, 64, PN, SWV>), \
-            hipFuncAttributeMaxDynamicSharedMemorySize, dq_smem);                       \
+                            hipFuncAttributeMaxDynamicSharedMemorySize, dq_smem);                  \
+        hipFuncSetAttribute(                                                                       \
+            reinterpret_cast<const void *>(hk_attn_bwd_dq_ker<D, DQ_NUM_WARPS, 64, PN, SWV>),      \
+            hipFuncAttributeMaxDynamicSharedMemorySize, dq_smem);                                  \
     } while (0)
         HK_DQ_OPTIN(0, 0);
         HK_DQ_OPTIN(1, 0);
         HK_DQ_OPTIN(2, 0);
         HK_DQ_OPTIN(2, 1);
 #undef HK_DQ_OPTIN
-#define HK_DQ_OPTIN_K(PN, SWV, CSV, PKV)                                               \
-    do {                                                                               \
-        hipFuncSetAttribute(                                                            \
-            reinterpret_cast<const void *>(                                             \
-                hk_attn_bwd_dq_ker<D, 1, 64, PN, SWV, CSV, PKV>),                       \
-            hipFuncAttributeMaxDynamicSharedMemorySize, dq_smem);                       \
-        hipFuncSetAttribute(reinterpret_cast<const void *>(                             \
-                                hk_attn_bwd_dq_ker<D, DQ_NUM_WARPS, 64, PN, SWV, CSV, PKV>), \
-                            hipFuncAttributeMaxDynamicSharedMemorySize, dq_smem);       \
+#define HK_DQ_OPTIN_K(PN, SWV, CSV, PKV)                                                           \
+    do {                                                                                           \
+        hipFuncSetAttribute(                                                                       \
+            reinterpret_cast<const void *>(hk_attn_bwd_dq_ker<D, 1, 64, PN, SWV, CSV, PKV>),       \
+            hipFuncAttributeMaxDynamicSharedMemorySize, dq_smem);                                  \
+        hipFuncSetAttribute(reinterpret_cast<const void *>(                                        \
+                                hk_attn_bwd_dq_ker<D, DQ_NUM_WARPS, 64, PN, SWV, CSV, PKV>),       \
+                            hipFuncAttributeMaxDynamicSharedMemorySize, dq_smem);                  \
     } while (0)
 #define HK_DQ_OPTIN_C(PN, SWV, CSV) HK_DQ_OPTIN_K(PN, SWV, CSV, 0)
         HK_DQ_OPTIN_C(2, 1, 1);
         HK_DQ_OPTIN_K(2, 1, 1, 1);
 #undef HK_DQ_OPTIN_C
 #undef HK_DQ_OPTIN_K
-#define HK_DKDV_OPTIN_B(VMV, GV, BV)                                                   \
-    do {                                                                               \
-        hipFuncSetAttribute(                                                            \
-            reinterpret_cast<const void *>(hk_attn_bwd_dkdv_ker<D, 1, VMV, GV, BV>),    \
-            hipFuncAttributeMaxDynamicSharedMemorySize, dkdv_smem);                     \
-        hipFuncSetAttribute(                                                            \
-            reinterpret_cast<const void *>(hk_attn_bwd_dkdv_ker<D, 2, VMV, GV, BV>),    \
-            hipFuncAttributeMaxDynamicSharedMemorySize, dkdv_smem);                     \
-        hipFuncSetAttribute(                                                            \
-            reinterpret_cast<const void *>(hk_attn_bwd_dkdv_ker<D, 4, VMV, GV, BV>),    \
-            hipFuncAttributeMaxDynamicSharedMemorySize, dkdv_smem);                     \
-        hipFuncSetAttribute(                                                            \
-            reinterpret_cast<const void *>(hk_attn_bwd_dkdv_ker<D, 8, VMV, GV, BV>),    \
-            hipFuncAttributeMaxDynamicSharedMemorySize, dkdv_smem);                     \
+#define HK_DKDV_OPTIN_B(VMV, GV, BV)                                                               \
+    do {                                                                                           \
+        hipFuncSetAttribute(                                                                       \
+            reinterpret_cast<const void *>(hk_attn_bwd_dkdv_ker<D, 1, VMV, GV, BV>),               \
+            hipFuncAttributeMaxDynamicSharedMemorySize, dkdv_smem);                                \
+        hipFuncSetAttribute(                                                                       \
+            reinterpret_cast<const void *>(hk_attn_bwd_dkdv_ker<D, 2, VMV, GV, BV>),               \
+            hipFuncAttributeMaxDynamicSharedMemorySize, dkdv_smem);                                \
+        hipFuncSetAttribute(                                                                       \
+            reinterpret_cast<const void *>(hk_attn_bwd_dkdv_ker<D, 4, VMV, GV, BV>),               \
+            hipFuncAttributeMaxDynamicSharedMemorySize, dkdv_smem);                                \
+        hipFuncSetAttribute(                                                                       \
+            reinterpret_cast<const void *>(hk_attn_bwd_dkdv_ker<D, 8, VMV, GV, BV>),               \
+            hipFuncAttributeMaxDynamicSharedMemorySize, dkdv_smem);                                \
     } while (0)
 #define HK_DKDV_OPTIN_G(VMV, GV) HK_DKDV_OPTIN_B(VMV, GV, 0)
 #define HK_DKDV_OPTIN(VMV) HK_DKDV_OPTIN_G(VMV, 0)
@@ -3891,48 +4044,54 @@ static void launch_bwd(const HkTensorDesc &q, const HkTensorDesc &k, const HkTen
     // row's work scales as Sq*Skv*attended_frac, so its share is 0.37-0.98% of a long-Skv
     // full-causal row but 1.88-3.28% of its windowed twin and 6.5% of 4x64/8 1024x1024.
     const int q_tiles_prep = (Sq + PREP_Q_BLOCK - 1) / PREP_Q_BLOCK;
-    const int prep_blocks = (q_tiles_prep + PREP_NUM_WARPS - 1) / PREP_NUM_WARPS;
+    const int prep_blocks  = (q_tiles_prep + PREP_NUM_WARPS - 1) / PREP_NUM_WARPS;
     if (!vm_dl(vm)) {
         if (vm_pneg(vm))
-            hk_attn_bwd_prep_ker<D, 1><<<dim3(prep_blocks, Hq, B), dim3(PREP_NUM_THREADS)>>>(
-                Og, dOg, Dg, Lg, Lng, Sq);
+            hk_attn_bwd_prep_ker<D, 1>
+                <<<dim3(prep_blocks, Hq, B), dim3(PREP_NUM_THREADS)>>>(Og, dOg, Dg, Lg, Lng, Sq);
         else
-            hk_attn_bwd_prep_ker<D, 0><<<dim3(prep_blocks, Hq, B), dim3(PREP_NUM_THREADS)>>>(
-                Og, dOg, Dg, Lg, Lng, Sq);
+            hk_attn_bwd_prep_ker<D, 0>
+                <<<dim3(prep_blocks, Hq, B), dim3(PREP_NUM_THREADS)>>>(Og, dOg, Dg, Lg, Lng, Sq);
     }
 
     const int q_tiles = (Sq + DQ_Q_BLOCK - 1) / DQ_Q_BLOCK;
-    int dq_hpw = 1, dq_kvb = DQ_KV_BLOCK;
+    int       dq_hpw = 1, dq_kvb = DQ_KV_BLOCK;
     dq_shape_config(Sq, Skv, B, Hq, Hkv, window_left, D, &dq_hpw, &dq_kvb, vm_w1(vm));
     // At HPW == 1 the grid keeps its shipped axis order so the anchor instantiation is
     // byte-identical; at HPW > 1 the head group and the batch move to the two fast axes
     // (see the decode in the kernel).
 #define HK_DQ_LAUNCH_P(HPW, KVBW, PN, SWV) HK_DQ_LAUNCH_C(HPW, KVBW, PN, SWV, 0)
 #define HK_DQ_LAUNCH_C(HPW, KVBW, PN, SWV, CSV) HK_DQ_LAUNCH_K(HPW, KVBW, PN, SWV, CSV, 0)
-#define HK_DQ_LAUNCH_K(HPW, KVBW, PN, SWV, CSV, PKV)                                   \
-    HK_DQ_LAUNCH_D(HPW, KVBW, PN, SWV, CSV, PKV, 0)
-#define HK_DQ_LAUNCH_D(HPW, KVBW, PN, SWV, CSV, PKV, DLV)                              \
-    do {                                                                               \
-        constexpr int RG_ = DQ_NUM_WARPS / (HPW);                                      \
-        const int ny_ = (q_tiles + RG_ - 1) / RG_;                                     \
-        const dim3 g_ = (HPW) == 1 ? dim3(Hq, ny_, B) : dim3(Hq / (HPW), B, ny_);      \
-        hk_attn_bwd_dq_ker<D, HPW, KVBW, PN, SWV, CSV, PKV, DLV>                       \
-            <<<g_, dim3(DQ_NUM_THREADS), ((KVBW) == 64 ? dq_smem : dq_smem_w)>>>(      \
-                Qg, Kg, Vg, dOg, dQg, LgSel, Dg, Sq, Skv, Hq, Hkv, window_left,        \
-                softmax_scale, Og, Lg);                                                \
+#define HK_DQ_LAUNCH_K(HPW, KVBW, PN, SWV, CSV, PKV) HK_DQ_LAUNCH_D(HPW, KVBW, PN, SWV, CSV, PKV, 0)
+#define HK_DQ_LAUNCH_D(HPW, KVBW, PN, SWV, CSV, PKV, DLV)                                          \
+    do {                                                                                           \
+        constexpr int RG_ = DQ_NUM_WARPS / (HPW);                                                  \
+        const int     ny_ = (q_tiles + RG_ - 1) / RG_;                                             \
+        const dim3    g_  = (HPW) == 1 ? dim3(Hq, ny_, B) : dim3(Hq / (HPW), B, ny_);              \
+        hk_attn_bwd_dq_ker<D, HPW, KVBW, PN, SWV, CSV, PKV, DLV>                                   \
+            <<<g_, dim3(DQ_NUM_THREADS), ((KVBW) == 64 ? dq_smem : dq_smem_w)>>>(                  \
+                Qg, Kg, Vg, dOg, dQg, LgSel, Dg, Sq, Skv, Hq, Hkv, window_left, softmax_scale, Og, \
+                Lg);                                                                               \
     } while (0)
 // dq's two extra rungs live on the (QM, SW) pair; only the four reachable combinations are
 // instantiated, so vm 0-4 launch the kernels from before those rungs existed. W3 adds a fifth
 // on top of the (2, 1, 1) rung, so vm 0-20 and 22 are untouched.
-#define HK_DQ_LAUNCH(HPW, KVBW)                                                        \
-    do {                                                                               \
-        if (vm_dl(vm)) HK_DQ_LAUNCH_D(HPW, KVBW, 2, 1, 1, 0, 1);                       \
-        else if (vm_pk(vm)) HK_DQ_LAUNCH_K(HPW, KVBW, 2, 1, 1, 1);                     \
-        else if (vm_qcs(vm)) HK_DQ_LAUNCH_C(HPW, KVBW, 2, 1, 1);                       \
-        else if (vm_qsw(vm)) HK_DQ_LAUNCH_P(HPW, KVBW, 2, 1);                          \
-        else if (vm_qci(vm)) HK_DQ_LAUNCH_P(HPW, KVBW, 2, 0);                          \
-        else if (vm_pneg(vm)) HK_DQ_LAUNCH_P(HPW, KVBW, 1, 0);                         \
-        else HK_DQ_LAUNCH_P(HPW, KVBW, 0, 0);                                          \
+#define HK_DQ_LAUNCH(HPW, KVBW)                                                                    \
+    do {                                                                                           \
+        if (vm_dl(vm))                                                                             \
+            HK_DQ_LAUNCH_D(HPW, KVBW, 2, 1, 1, 0, 1);                                              \
+        else if (vm_pk(vm))                                                                        \
+            HK_DQ_LAUNCH_K(HPW, KVBW, 2, 1, 1, 1);                                                 \
+        else if (vm_qcs(vm))                                                                       \
+            HK_DQ_LAUNCH_C(HPW, KVBW, 2, 1, 1);                                                    \
+        else if (vm_qsw(vm))                                                                       \
+            HK_DQ_LAUNCH_P(HPW, KVBW, 2, 1);                                                       \
+        else if (vm_qci(vm))                                                                       \
+            HK_DQ_LAUNCH_P(HPW, KVBW, 2, 0);                                                       \
+        else if (vm_pneg(vm))                                                                      \
+            HK_DQ_LAUNCH_P(HPW, KVBW, 1, 0);                                                       \
+        else                                                                                       \
+            HK_DQ_LAUNCH_P(HPW, KVBW, 0, 0);                                                       \
     } while (0)
     // No KVB=128 arm: dq_shape_config() caps kvb_hi at 64 for D=128 because the wide staged
     // tile is 128 KB per workgroup there and a second workgroup no longer fits in the CU's
@@ -3946,7 +4105,7 @@ static void launch_bwd(const HkTensorDesc &q, const HkTensorDesc &k, const HkTen
 #undef HK_DQ_LAUNCH
 #undef HK_DQ_LAUNCH_P
 
-    const int kv_blocks = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
+    const int kv_blocks  = (Skv + DKDV_KV_BLOCK - 1) / DKDV_KV_BLOCK;
     const int group_size = Hq / Hkv;
     // The wrapper is the single decision point -- it is what allocates the partials tensor,
     // and a wrapper/kernel disagreement about n_split would read past the end of it rather
@@ -3965,9 +4124,8 @@ static void launch_bwd(const HkTensorDesc &q, const HkTensorDesc &k, const HkTen
     // is what makes the head sub-ranges partition the group. gridDim.z is now tested here
     // too rather than only argued in a comment.
     int n_split = 1;
-    if (n_split_req >= 2 && dkdv_split_instantiated(n_split_req) &&
-        group_size % n_split_req == 0 &&
-        (long long)kv_blocks * n_split_req <= 65535ll &&
+    if (n_split_req >= 2 && dkdv_split_instantiated(n_split_req) && group_size % n_split_req == 0 &&
+        (long long) kv_blocks * n_split_req <= 65535ll &&
         dkdv_ws_bytes(Skv, B, Hkv, D, n_split_req) < DKDV_WS_LIMIT) {
         n_split = n_split_req;
     }
@@ -3975,51 +4133,73 @@ static void launch_bwd(const HkTensorDesc &q, const HkTensorDesc &k, const HkTen
     // (kv head, batch) on the fast axes, (kv block, split) on the slowest with the split on
     // the fast PART of z -- see the decode in the kernel. gridDim.z caps kv_blocks*n_split
     // at 65535; the worst meta row is 128 * 8 = 1024.
-    auto WSKg = n_split > 1 ? make_gl_from_desc<_gl_QKVO>(wsk) : dKg;
-    auto WSVg = n_split > 1 ? make_gl_from_desc<_gl_QKVO>(wsv) : dVg;
-    const bool b11b =
-        dkdv_use_b11b(Sq, Skv, B, Hq, Hkv, window_left, D, n_split, vm_b11b(vm));
-    const dim3 dkdv_grid = b11b ? dim3(Hkv, kv_blocks * n_split, B)
-                                : dim3(Hkv, B, kv_blocks * n_split);
+    auto       WSKg = n_split > 1 ? make_gl_from_desc<_gl_QKVO>(wsk) : dKg;
+    auto       WSVg = n_split > 1 ? make_gl_from_desc<_gl_QKVO>(wsv) : dVg;
+    const bool b11b = dkdv_use_b11b(Sq, Skv, B, Hq, Hkv, window_left, D, n_split, vm_b11b(vm));
+    const dim3 dkdv_grid =
+        b11b ? dim3(Hkv, kv_blocks * n_split, B) : dim3(Hkv, B, kv_blocks * n_split);
     const dim3 dkdv_blk(DKDV_NUM_THREADS);
-#define HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, BMV)                                        \
-    hk_attn_bwd_dkdv_ker<D, NS, VMV, GV, BV, BMV><<<dkdv_grid, dkdv_blk, dkdv_smem>>>(\
-        Qg, Kg, Vg, dOg, WSKg, WSVg, LgSel, Dg, Sq, Skv, Hq, Hkv, window_left,        \
-        softmax_scale, kv_tiles_pad)
+#define HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, BMV)                                                     \
+    hk_attn_bwd_dkdv_ker<D, NS, VMV, GV, BV, BMV>                                                  \
+        <<<dkdv_grid, dkdv_blk, dkdv_smem>>>(Qg, Kg, Vg, dOg, WSKg, WSVg, LgSel, Dg, Sq, Skv, Hq,  \
+                                             Hkv, window_left, softmax_scale, kv_tiles_pad)
 #define HK_DKDV_LAUNCH_B(NS, VMV, GV, BV) HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 1)
 // The D-chunk ladder, on the shipped rung only. QC 0 is HK_DKDV_LAUNCH_M(..., 15), i.e.
 // byte-identical to the un-chunked kernel, so the anchor block launches the same kernel.
-#define HK_DKDV_LAUNCH_Q(NS, VMV, GV, BV, BMV, QV)                                    \
-    hk_attn_bwd_dkdv_ker<D, NS, VMV, GV, BV, BMV, QV><<<dkdv_grid, dkdv_blk,          \
-                                                       dkdv_smem>>>(                  \
-        Qg, Kg, Vg, dOg, WSKg, WSVg, LgSel, Dg, Sq, Skv, Hq, Hkv, window_left,        \
-        softmax_scale, kv_tiles_pad)
-#define HK_DKDV_LAUNCH_QC(NS, VMV, GV, BV)                                            \
-    do {                                                                              \
-        switch (d128_qc()) {                                                          \
-            case 1: HK_DKDV_LAUNCH_Q(NS, VMV, GV, BV, 15, 1); break;                  \
-            case 2: HK_DKDV_LAUNCH_Q(NS, VMV, GV, BV, 15, 2); break;                  \
-            case 3: HK_DKDV_LAUNCH_Q(NS, VMV, GV, BV, 15, 3); break;                  \
-            default: HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 15); break;                    \
-        }                                                                             \
+#define HK_DKDV_LAUNCH_Q(NS, VMV, GV, BV, BMV, QV)                                                 \
+    hk_attn_bwd_dkdv_ker<D, NS, VMV, GV, BV, BMV, QV>                                              \
+        <<<dkdv_grid, dkdv_blk, dkdv_smem>>>(Qg, Kg, Vg, dOg, WSKg, WSVg, LgSel, Dg, Sq, Skv, Hq,  \
+                                             Hkv, window_left, softmax_scale, kv_tiles_pad)
+#define HK_DKDV_LAUNCH_QC(NS, VMV, GV, BV)                                                         \
+    do {                                                                                           \
+        switch (d128_qc()) {                                                                       \
+        case 1:                                                                                    \
+            HK_DKDV_LAUNCH_Q(NS, VMV, GV, BV, 15, 1);                                              \
+            break;                                                                                 \
+        case 2:                                                                                    \
+            HK_DKDV_LAUNCH_Q(NS, VMV, GV, BV, 15, 2);                                              \
+            break;                                                                                 \
+        case 3:                                                                                    \
+            HK_DKDV_LAUNCH_Q(NS, VMV, GV, BV, 15, 3);                                              \
+            break;                                                                                 \
+        default:                                                                                   \
+            HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 15);                                                 \
+            break;                                                                                 \
+        }                                                                                          \
     } while (0)
 // The bundle ladder, on the SHIPPED bundle only. Rung 0 is HK_DKDV_LAUNCH_B, i.e. the
 // hard-coded `BUN & 1` mask, so the anchor block launches a byte-identical kernel. Applied to
 // BOTH the b11b and the non-b11b arm, for the reason recorded below: a forced
 // HK_BWD_DKDV_GRID must not silently drop back to a DIFFERENT kernel, or the grid-permutation
 // identity gate compares two kernels instead of one kernel under two grids.
-#define HK_DKDV_LAUNCH_R(NS, VMV, GV, BV)                                             \
-    do {                                                                              \
-        switch (d128_bm_rung()) {                                                     \
-            case 1: HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 5); break;                      \
-            case 2: HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 7); break;                      \
-            case 3: HK_DKDV_LAUNCH_QC(NS, VMV, GV, BV); break;                        \
-            case 4: HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 17); break;                     \
-            case 5: HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 21); break;                     \
-            case 6: HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 31); break;                     \
-            case 7: HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 3); break;                      \
-            default: HK_DKDV_LAUNCH_B(NS, VMV, GV, BV); break;                        \
-        }                                                                             \
+#define HK_DKDV_LAUNCH_R(NS, VMV, GV, BV)                                                          \
+    do {                                                                                           \
+        switch (d128_bm_rung()) {                                                                  \
+        case 1:                                                                                    \
+            HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 5);                                                  \
+            break;                                                                                 \
+        case 2:                                                                                    \
+            HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 7);                                                  \
+            break;                                                                                 \
+        case 3:                                                                                    \
+            HK_DKDV_LAUNCH_QC(NS, VMV, GV, BV);                                                    \
+            break;                                                                                 \
+        case 4:                                                                                    \
+            HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 17);                                                 \
+            break;                                                                                 \
+        case 5:                                                                                    \
+            HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 21);                                                 \
+            break;                                                                                 \
+        case 6:                                                                                    \
+            HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 31);                                                 \
+            break;                                                                                 \
+        case 7:                                                                                    \
+            HK_DKDV_LAUNCH_M(NS, VMV, GV, BV, 3);                                                  \
+            break;                                                                                 \
+        default:                                                                                   \
+            HK_DKDV_LAUNCH_B(NS, VMV, GV, BV);                                                     \
+            break;                                                                                 \
+        }                                                                                          \
     } while (0)
 #define HK_DKDV_LAUNCH_G(NS, VMV, GV) HK_DKDV_LAUNCH_B(NS, VMV, GV, 0)
 #define HK_DKDV_LAUNCH_V(NS, VMV) HK_DKDV_LAUNCH_G(NS, VMV, 0)
@@ -4034,55 +4214,100 @@ static void launch_bwd(const HkTensorDesc &q, const HkTensorDesc &k, const HkTen
 // dispatch. Falling back to the un-bundled rung under a forced override would compare two
 // different kernels rather than one kernel under two grids, which is exactly the bug this
 // spelling was written to fix. Other subsets are measurement-only and do fall back.
-#define HK_DKDV_LAUNCH(NS)                                                            \
-    do {                                                                              \
-        if (b11b) {                                                                    \
-            if (vm_bundle(vm) == 30) HK_DKDV_LAUNCH_R(NS, 5, 1, 30);                   \
-            else if (vm_bundle(vm) == 14) HK_DKDV_LAUNCH_B(NS, 5, 1, 14);              \
-            else if (vm_bundle(vm) == 6) HK_DKDV_LAUNCH_B(NS, 5, 1, 6);                \
-            else if (vm_dkdv(vm) == 5) HK_DKDV_LAUNCH_G(NS, 5, 1);                     \
-            else HK_DKDV_LAUNCH_G(NS, 3, 1);                                           \
-            break;                                                                     \
-        }                                                                              \
-        switch (vm_bundle(vm)) {                                                       \
-            case 1: HK_DKDV_LAUNCH_B(NS, 5, 0, 1); break;                              \
-            case 2: HK_DKDV_LAUNCH_B(NS, 5, 0, 2); break;                               \
-            case 3: HK_DKDV_LAUNCH_B(NS, 5, 0, 3); break;                              \
-            case 5: HK_DKDV_LAUNCH_B(NS, 5, 0, 5); break;                              \
-            case 6: HK_DKDV_LAUNCH_B(NS, 5, 0, 6); break;                               \
-            case 7: HK_DKDV_LAUNCH_B(NS, 5, 0, 7); break;                              \
-            case 14: HK_DKDV_LAUNCH_B(NS, 5, 0, 14); break;                            \
-            case 30: HK_DKDV_LAUNCH_R(NS, 5, 0, 30); break;                            \
-            default: break;                                                            \
-        }                                                                              \
-        if (vm_bundle(vm)) break;                                                      \
-        switch (vm_dkdv(vm)) {                                                         \
-            case 1: HK_DKDV_LAUNCH_V(NS, 1); break;                                    \
-            case 2: HK_DKDV_LAUNCH_V(NS, 2); break;                                    \
-            case 3: HK_DKDV_LAUNCH_V(NS, 3); break;                                    \
-            case 4: HK_DKDV_LAUNCH_V(NS, 4); break;                                    \
-            case 5: HK_DKDV_LAUNCH_V(NS, 5); break;                                    \
-            default: HK_DKDV_LAUNCH_V(NS, 0); break;                                   \
-        }                                                                              \
+#define HK_DKDV_LAUNCH(NS)                                                                         \
+    do {                                                                                           \
+        if (b11b) {                                                                                \
+            if (vm_bundle(vm) == 30)                                                               \
+                HK_DKDV_LAUNCH_R(NS, 5, 1, 30);                                                    \
+            else if (vm_bundle(vm) == 14)                                                          \
+                HK_DKDV_LAUNCH_B(NS, 5, 1, 14);                                                    \
+            else if (vm_bundle(vm) == 6)                                                           \
+                HK_DKDV_LAUNCH_B(NS, 5, 1, 6);                                                     \
+            else if (vm_dkdv(vm) == 5)                                                             \
+                HK_DKDV_LAUNCH_G(NS, 5, 1);                                                        \
+            else                                                                                   \
+                HK_DKDV_LAUNCH_G(NS, 3, 1);                                                        \
+            break;                                                                                 \
+        }                                                                                          \
+        switch (vm_bundle(vm)) {                                                                   \
+        case 1:                                                                                    \
+            HK_DKDV_LAUNCH_B(NS, 5, 0, 1);                                                         \
+            break;                                                                                 \
+        case 2:                                                                                    \
+            HK_DKDV_LAUNCH_B(NS, 5, 0, 2);                                                         \
+            break;                                                                                 \
+        case 3:                                                                                    \
+            HK_DKDV_LAUNCH_B(NS, 5, 0, 3);                                                         \
+            break;                                                                                 \
+        case 5:                                                                                    \
+            HK_DKDV_LAUNCH_B(NS, 5, 0, 5);                                                         \
+            break;                                                                                 \
+        case 6:                                                                                    \
+            HK_DKDV_LAUNCH_B(NS, 5, 0, 6);                                                         \
+            break;                                                                                 \
+        case 7:                                                                                    \
+            HK_DKDV_LAUNCH_B(NS, 5, 0, 7);                                                         \
+            break;                                                                                 \
+        case 14:                                                                                   \
+            HK_DKDV_LAUNCH_B(NS, 5, 0, 14);                                                        \
+            break;                                                                                 \
+        case 30:                                                                                   \
+            HK_DKDV_LAUNCH_R(NS, 5, 0, 30);                                                        \
+            break;                                                                                 \
+        default:                                                                                   \
+            break;                                                                                 \
+        }                                                                                          \
+        if (vm_bundle(vm))                                                                         \
+            break;                                                                                 \
+        switch (vm_dkdv(vm)) {                                                                     \
+        case 1:                                                                                    \
+            HK_DKDV_LAUNCH_V(NS, 1);                                                               \
+            break;                                                                                 \
+        case 2:                                                                                    \
+            HK_DKDV_LAUNCH_V(NS, 2);                                                               \
+            break;                                                                                 \
+        case 3:                                                                                    \
+            HK_DKDV_LAUNCH_V(NS, 3);                                                               \
+            break;                                                                                 \
+        case 4:                                                                                    \
+            HK_DKDV_LAUNCH_V(NS, 4);                                                               \
+            break;                                                                                 \
+        case 5:                                                                                    \
+            HK_DKDV_LAUNCH_V(NS, 5);                                                               \
+            break;                                                                                 \
+        default:                                                                                   \
+            HK_DKDV_LAUNCH_V(NS, 0);                                                               \
+            break;                                                                                 \
+        }                                                                                          \
     } while (0)
     // Every case here must be in dkdv_split_instantiated() and vice versa. 5 is in the set
     // because it is the only split a GQA group of 5 admits.
     switch (n_split) {
-        case 8: HK_DKDV_LAUNCH(8); break;
-        case 5: HK_DKDV_LAUNCH(5); break;
-        case 4: HK_DKDV_LAUNCH(4); break;
-        case 2: HK_DKDV_LAUNCH(2); break;
-        default: HK_DKDV_LAUNCH(1); break;
+    case 8:
+        HK_DKDV_LAUNCH(8);
+        break;
+    case 5:
+        HK_DKDV_LAUNCH(5);
+        break;
+    case 4:
+        HK_DKDV_LAUNCH(4);
+        break;
+    case 2:
+        HK_DKDV_LAUNCH(2);
+        break;
+    default:
+        HK_DKDV_LAUNCH(1);
+        break;
     }
 #undef HK_DKDV_LAUNCH
 #undef HK_DKDV_LAUNCH_V
     if (n_split > 1) {
-        const long slot_stride = (long)kv_tiles_pad * DKDV_KV_WAVE * B * Hkv * D;
-        const long total = slot_stride / DQRED_PER_THREAD;
-        const int red_blocks = (int)((total + DQRED_THREADS - 1) / DQRED_THREADS);
+        const long slot_stride = (long) kv_tiles_pad * DKDV_KV_WAVE * B * Hkv * D;
+        const long total       = slot_stride / DQRED_PER_THREAD;
+        const int  red_blocks  = (int) ((total + DQRED_THREADS - 1) / DQRED_THREADS);
         hk_attn_bwd_dkdvred_ker<D><<<dim3(red_blocks), dim3(DQRED_THREADS)>>>(
-            (const bf16 *)WSKg.raw_ptr, (const bf16 *)WSVg.raw_ptr, (bf16 *)dKg.raw_ptr,
-            (bf16 *)dVg.raw_ptr, n_split, slot_stride, total);
+            (const bf16 *) WSKg.raw_ptr, (const bf16 *) WSVg.raw_ptr, (bf16 *) dKg.raw_ptr,
+            (bf16 *) dVg.raw_ptr, n_split, slot_stride, total);
     }
 }
 
@@ -4095,17 +4320,17 @@ static void launch_bwd_fused(const HkTensorDesc &q, const HkTensorDesc &k, const
                              const HkTensorDesc &dk, const HkTensorDesc &dv, const HkTensorDesc &ws,
                              const HkTensorDesc &lse, const HkTensorDesc &delta, int Sq, int Skv,
                              int B, int Hq, int Hkv, int window_left, float softmax_scale) {
-    auto Qg = make_gl_from_desc<_gl_QKVO>(q);
-    auto Kg = make_gl_from_desc<_gl_QKVO>(k);
-    auto Vg = make_gl_from_desc<_gl_QKVO>(v);
-    auto Og = make_gl_from_desc<_gl_QKVO>(o);
+    auto Qg  = make_gl_from_desc<_gl_QKVO>(q);
+    auto Kg  = make_gl_from_desc<_gl_QKVO>(k);
+    auto Vg  = make_gl_from_desc<_gl_QKVO>(v);
+    auto Og  = make_gl_from_desc<_gl_QKVO>(o);
     auto dOg = make_gl_from_desc<_gl_QKVO>(dO);
     auto dQg = make_gl_from_desc<_gl_QKVO>(dq);
     auto dKg = make_gl_from_desc<_gl_QKVO>(dk);
     auto dVg = make_gl_from_desc<_gl_QKVO>(dv);
     auto WSg = make_gl_from_desc<_gl_QKVO>(ws);
-    auto Lg = make_gl_from_desc<_gl_L>(lse);
-    auto Dg = make_gl_from_desc<_gl_L>(delta);
+    auto Lg  = make_gl_from_desc<_gl_L>(lse);
+    auto Dg  = make_gl_from_desc<_gl_L>(delta);
 
     constexpr size_t bwd_smem = 2 * sizeof(bw_qo_tile<D>) + sizeof(bw_ds_tile);
     static_assert(bwd_smem <= kittens::MAX_SHARED_MEMORY, "fused staging exceeds LDS");
@@ -4117,11 +4342,11 @@ static void launch_bwd_fused(const HkTensorDesc &q, const HkTensorDesc &k, const
     }();
 
     const int q_tiles_prep = (Sq + PREP_Q_BLOCK - 1) / PREP_Q_BLOCK;
-    const int prep_blocks = (q_tiles_prep + PREP_NUM_WARPS - 1) / PREP_NUM_WARPS;
+    const int prep_blocks  = (q_tiles_prep + PREP_NUM_WARPS - 1) / PREP_NUM_WARPS;
     // Always PNEG = 0: the fused kernel keeps the un-negated convention, so HK_BWD_VM has
     // no reach into this path and fused_sweep.py is a pure regression check.
-    hk_attn_bwd_prep_ker<D, 0><<<dim3(prep_blocks, Hq, B), dim3(PREP_NUM_THREADS)>>>(
-        Og, dOg, Dg, Lg, Lg, Sq);
+    hk_attn_bwd_prep_ker<D, 0>
+        <<<dim3(prep_blocks, Hq, B), dim3(PREP_NUM_THREADS)>>>(Og, dOg, Dg, Lg, Lg, Sq);
 
     const int q_tiles = (Sq + BW_Q_BLOCK - 1) / BW_Q_BLOCK;
     const int n_bands = (Skv + BW_KV_BLOCK - 1) / BW_KV_BLOCK;
@@ -4129,26 +4354,26 @@ static void launch_bwd_fused(const HkTensorDesc &q, const HkTensorDesc &k, const
         Qg, Kg, Vg, dOg, dKg, dVg, WSg, Lg, Dg, Sq, Skv, Hq, Hkv, window_left, softmax_scale,
         q_tiles);
 
-    const bf16 *ws_ptr = (const bf16 *)WSg.raw_ptr;
-    bf16 *dq_ptr = (bf16 *)dQg.raw_ptr;
-    const long total = (long)q_tiles * BW_Q_BLOCK * B * Hq * (D / DQRED_PER_THREAD);
-    const int red_blocks = (int)((total + DQRED_THREADS - 1) / DQRED_THREADS);
+    const bf16 *ws_ptr     = (const bf16 *) WSg.raw_ptr;
+    bf16       *dq_ptr     = (bf16 *) dQg.raw_ptr;
+    const long  total      = (long) q_tiles * BW_Q_BLOCK * B * Hq * (D / DQRED_PER_THREAD);
+    const int   red_blocks = (int) ((total + DQRED_THREADS - 1) / DQRED_THREADS);
     hk_attn_bwd_dqred_ker<D><<<dim3(red_blocks), dim3(DQRED_THREADS)>>>(
         ws_ptr, dq_ptr, n_bands, q_tiles, B * Hq, Sq, Skv - Sq, window_left);
 }
 
-}  // namespace
+} // namespace
 
 // The block sizes the Python wrapper pads Sq/Skv to (it uses the lcm of them). A disagreement
 // between the two reads PAST THE END of a tensor rather than failing, so they are reported
 // here and checked there rather than duplicated on trust.
 void hk_attn_bwd_d128_blocks(HkBwdBlocks *out) {
-    out->dq_q = DQ_Q_BLOCK;
-    out->dq_kv = DQ_KV_BLOCK;
-    out->dkdv_q = DKDV_Q_BLOCK;
-    out->dkdv_kv = DKDV_KV_BLOCK;
-    out->prep_q = PREP_Q_BLOCK;
-    out->fused_q = BW_Q_BLOCK;
+    out->dq_q     = DQ_Q_BLOCK;
+    out->dq_kv    = DQ_KV_BLOCK;
+    out->dkdv_q   = DKDV_Q_BLOCK;
+    out->dkdv_kv  = DKDV_KV_BLOCK;
+    out->prep_q   = PREP_Q_BLOCK;
+    out->fused_q  = BW_Q_BLOCK;
     out->fused_kv = BW_KV_BLOCK;
 }
 
@@ -4178,4 +4403,4 @@ void hk_attn_bwd_fused_d128(const HkTensorDesc &q, const HkTensorDesc &k, const 
                           window_left, softmax_scale);
 }
 
-}  // namespace primus_turbo::hipkittens
+} // namespace primus_turbo::hipkittens

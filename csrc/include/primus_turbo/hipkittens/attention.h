@@ -29,10 +29,10 @@ namespace primus_turbo::hipkittens {
 // ragged tail rather than failing.
 struct HkTensorDesc {
     const void *data;
-    int d0;
-    int d1;
-    int d2;
-    int d3;
+    int         d0;
+    int         d1;
+    int         d2;
+    int         d3;
 };
 
 // The tile sizes the caller must pad the sequence axes up to. Reported by the kernels rather
@@ -42,8 +42,8 @@ void hk_attn_fwd_d64_blocks(int64_t *q_block, int64_t *kv_block);
 void hk_attn_fwd_d128_blocks(int64_t *q_block, int64_t *kv_block);
 
 void hk_attn_fwd_d64(const HkTensorDesc &q, const HkTensorDesc &k, const HkTensorDesc &v,
-                     const HkTensorDesc &o, const HkTensorDesc &lse, int Sq, int Skv, int B,
-                     int Hq, int Hkv, int window_left, float softmax_scale);
+                     const HkTensorDesc &o, const HkTensorDesc &lse, int Sq, int Skv, int B, int Hq,
+                     int Hkv, int window_left, float softmax_scale);
 
 void hk_attn_fwd_d128(const HkTensorDesc &q, const HkTensorDesc &k, const HkTensorDesc &v,
                       const HkTensorDesc &o, const HkTensorDesc &lse, int Sq, int Skv, int B,
@@ -101,4 +101,4 @@ void hk_attn_bwd_fused_d128(const HkTensorDesc &q, const HkTensorDesc &k, const 
                             const HkTensorDesc &lse, const HkTensorDesc &delta, int Sq, int Skv,
                             int B, int Hq, int Hkv, int window_left, float softmax_scale);
 
-}  // namespace primus_turbo::hipkittens
+} // namespace primus_turbo::hipkittens

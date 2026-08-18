@@ -77,13 +77,13 @@ namespace {
 // parameterised on it.
 constexpr int D = 64;
 
-constexpr int Q_BLOCK_SIZE = 32;
+constexpr int Q_BLOCK_SIZE  = 32;
 constexpr int KV_BLOCK_SIZE = 64;
 #define NUM_WARPS 8
 #define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
 
 using _gl_QKVO = gl<bf16, -1, -1, -1, -1>;
-using _gl_L = gl<float, -1, -1, -1, -1>;
+using _gl_L    = gl<float, -1, -1, -1, -1>;
 
 // LOG2E folded into the softmax scale so every exponential is the native exp2.
 constexpr float LOG2E = 1.44269504088896340736f;
@@ -117,9 +117,9 @@ using attn_tile = rt<T, KV_BLOCK_SIZE, Q_BLOCK_SIZE, L, S>;
 //   {0, u&1, ((u>>1)&1)^k, j^(r bit3), t&1, (t>>1)&1}.
 // Bank bit 0 is always zero, so a phase's 32 lanes must cover 32 distinct even banks, i.e. bank
 // bits 1-5 must be a bijection of the five free lane bits (u:2, t:2, g&1:1). They are not: r bit 2
-// *is* g&1, it lands on offset bit 8, and nothing folds it into the bank field -- bank bit 3 carries
-// r bit 3 = g>>1, which is constant within a ds_read_b64_tr_b16 phase (lanes 0-31, then 32-63).
-// Two lanes per bank, 2 extra cycles per instruction, 16 instructions: 32 conflicts per
+// *is* g&1, it lands on offset bit 8, and nothing folds it into the bank field -- bank bit 3
+// carries r bit 3 = g>>1, which is constant within a ds_read_b64_tr_b16 phase (lanes 0-31, then
+// 32-63). Two lanes per bank, 2 extra cycles per instruction, 16 instructions: 32 conflicts per
 // wave-KV-tile, which is exactly the 25,559,040 / 24,576 / 32.5 the profiler reported.
 //
 // Folding r bit 2 into offset bit 5 as well makes bank bit 3 = j ^ (g>>1) ^ (g&1) and the map a
@@ -141,11 +141,10 @@ using attn_tile = rt<T, KV_BLOCK_SIZE, Q_BLOCK_SIZE, L, S>;
 struct v_stage_st : st_bf<KV_BLOCK_SIZE, D, st_32x32_s> {
     using base = st_bf<KV_BLOCK_SIZE, D, st_32x32_s>;
     __device__ __forceinline__ static const uint32_t swizzle(int2 coord) {
-        const uint32_t offset =
-            sizeof(bf16) * (coord.x * base::underlying_subtile_cols + coord.y);
-        return offset ^ (((offset % 1024) >> 9) << 5)   // r bit 3 -> bank bit 3, library's
-                      ^ (((offset % 2048) >> 10) << 4)  // r bit 4 -> bank bit 2, library's
-                      ^ (((offset % 512) >> 8) << 5);   // r bit 2 -> bank bit 3, the extra term
+        const uint32_t offset = sizeof(bf16) * (coord.x * base::underlying_subtile_cols + coord.y);
+        return offset ^ (((offset % 1024) >> 9) << 5) // r bit 3 -> bank bit 3, library's
+               ^ (((offset % 2048) >> 10) << 4)       // r bit 4 -> bank bit 2, library's
+               ^ (((offset % 512) >> 8) << 5);        // r bit 2 -> bank bit 3, the extra term
     }
 };
 
@@ -207,21 +206,21 @@ __device__ inline void load(ST &dst, const typename ST::dtype *global_ptr, int r
     using T = typename ST::dtype;
 
     constexpr int bytes_per_thread = ST::underlying_subtile_bytes_per_thread;
-    constexpr int bytes_per_warp = bytes_per_thread * kittens::WARP_THREADS;
+    constexpr int bytes_per_warp   = bytes_per_thread * kittens::WARP_THREADS;
     constexpr int memcpy_per_tile =
         ST::rows * ST::cols * sizeof(T) / (bytes_per_thread * N_THREADS);
     static_assert(ST::rows * ST::cols * sizeof(T) >= bytes_per_warp,
                   "shared tile must be at least 1024 bytes");
 
     constexpr int num_warps = N_THREADS / kittens::WARP_THREADS;
-    const int laneid = kittens::laneid();
+    const int     laneid    = kittens::laneid();
     // CHANGE 1: the library reads kittens::warpid() here, i.e. threadIdx.x >> 6, which is
     // wave-uniform by construction but divergent to LLVM. The caller passes the same value,
     // already asserted uniform in the prologue.
     const int warpid = uniform_warpid % num_warps;
 
-    // Identical num_records to the coordinate-taking form -- one tile's byte span -- so the buffer's
-    // out-of-range behaviour is byte for byte what it was.
+    // Identical num_records to the coordinate-taking form -- one tile's byte span -- so the
+    // buffer's out-of-range behaviour is byte for byte what it was.
     i32x4 srsrc = make_srsrc(global_ptr, row_stride * ST::rows * sizeof(T));
 
     const uintptr_t lds_base =
@@ -232,9 +231,9 @@ __device__ inline void load(ST &dst, const typename ST::dtype *global_ptr, int r
         for (int i = 0; i < memcpy_per_tile; i++) {
             const int lane_byte_offset = (laneid * bytes_per_thread) + (warpid * bytes_per_warp) +
                                          (i * num_warps * bytes_per_warp);
-            const int subtile_id = lane_byte_offset / ST::underlying_subtile_bytes;
-            const int subtile_row = subtile_id / ST::underlying_subtiles_per_row;
-            const int subtile_col = subtile_id % ST::underlying_subtiles_per_row;
+            const int subtile_id               = lane_byte_offset / ST::underlying_subtile_bytes;
+            const int subtile_row              = subtile_id / ST::underlying_subtiles_per_row;
+            const int subtile_col              = subtile_id % ST::underlying_subtiles_per_row;
             const int subtile_lane_byte_offset = lane_byte_offset % ST::underlying_subtile_bytes;
 
             const int row = subtile_lane_byte_offset / ST::underlying_subtile_row_bytes;
@@ -252,21 +251,22 @@ __device__ inline void load(ST &dst, const typename ST::dtype *global_ptr, int r
             const uint32_t swizzled_global_byte_offset =
                 (swizzled_global_row * row_stride + swizzled_global_col) * sizeof(T);
 
-            uintptr_t lds_addr = lds_base + (i * num_warps * bytes_per_warp);
-            as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
+            uintptr_t      lds_addr = lds_base + (i * num_warps * bytes_per_warp);
+            as3_uint32_ptr lds_ptr  = (as3_uint32_ptr) (lds_addr);
 
             llvm_amdgcn_raw_buffer_load_lds(srsrc, lds_ptr, bytes_per_thread,
                                             swizzled_global_byte_offset, 0, 0,
                                             static_cast<int>(coherency::cache_all));
         }
     }
-    // This kernel's configuration leaves no remainder -- 8192 B tiles, 16 B per thread, 512 threads,
-    // so memcpy_per_tile is exactly 1 -- and the static_assert makes that a build-time guarantee
-    // rather than an assumption, so the library's leftover path is not transcribed.
-    static_assert(memcpy_per_tile * (bytes_per_thread * N_THREADS) == ST::rows * ST::cols * sizeof(T),
+    // This kernel's configuration leaves no remainder -- 8192 B tiles, 16 B per thread, 512
+    // threads, so memcpy_per_tile is exactly 1 -- and the static_assert makes that a build-time
+    // guarantee rather than an assumption, so the library's leftover path is not transcribed.
+    static_assert(memcpy_per_tile * (bytes_per_thread * N_THREADS) ==
+                      ST::rows * ST::cols * sizeof(T),
                   "cooperative fill leaves a remainder; transcribe the leftover path too");
 }
-}  // namespace hk_stage
+} // namespace hk_stage
 
 using v_stage_tile = v_stage_st;
 
@@ -317,14 +317,15 @@ constexpr size_t k_stage_bytes = V_STAGE_BUFS * sizeof(k_stage_tile);
 // waves' ranges: end is monotone increasing in q_base and begin is monotone
 // non-decreasing, so the union is [begin(lowest q_base), end(highest q_base)).
 __device__ inline int kv_tile_end_for(int q_base, int causal_offset, int kv_tile_max) {
-    const int kv_hi_pos = q_base + (Q_BLOCK_SIZE - 1) + causal_offset;  // largest key index
-    const int e = (kv_hi_pos + 1 + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+    const int kv_hi_pos = q_base + (Q_BLOCK_SIZE - 1) + causal_offset; // largest key index
+    const int e         = (kv_hi_pos + 1 + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
     return e > kv_tile_max ? kv_tile_max : e;
 }
 
 __device__ inline int kv_tile_begin_for(int q_base, int causal_offset, int window_left) {
-    if (window_left < 0) return 0;
-    const int lo = q_base + causal_offset - window_left;  // smallest key any row needs
+    if (window_left < 0)
+        return 0;
+    const int lo = q_base + causal_offset - window_left; // smallest key any row needs
     return lo > 0 ? lo / KV_BLOCK_SIZE : 0;
 }
 
@@ -335,15 +336,15 @@ __device__ inline int kv_tile_begin_for(int q_base, int causal_offset, int windo
 __device__ inline bool tile_needs_mask(int q_base, int kv_base, int Skv, int causal_offset,
                                        int window_left) {
     const int kv_first = kv_base;
-    const int kv_last = kv_base + KV_BLOCK_SIZE - 1;
+    const int kv_last  = kv_base + KV_BLOCK_SIZE - 1;
     // Written with non-short-circuit operators on purpose. Each early return here used to emit
     // its own branch, and those branches landed between the QK MFMA and the exp2 and split them
     // into separate scheduling regions, which is what stops the two from being interleaved.
     // Upper (causal) edge: the tightest bound is the first row of the Q tile.
     const bool causal_edge = kv_last > q_base + causal_offset;
     // Lower (window) edge: the tightest bound is the last row of the Q tile.
-    const bool window_edge = (window_left >= 0) &
-                             (kv_first < q_base + (Q_BLOCK_SIZE - 1) + causal_offset - window_left);
+    const bool window_edge =
+        (window_left >= 0) & (kv_first < q_base + (Q_BLOCK_SIZE - 1) + causal_offset - window_left);
     // Skv tail.
     const bool tail_edge = kv_last >= Skv;
     return causal_edge | window_edge | tail_edge;
@@ -380,21 +381,24 @@ __device__ inline void mask_prob_tile(RT &att, int q_base, int kv_base, int Skv,
         const int kv_causal = q_base + j * 16 + (lane & 15) + causal_offset;
         // Fold the Skv tail into the causal bound, and the negative-window case into the lower one.
         const int hi = kv_causal < (Skv - 1) ? kv_causal : (Skv - 1);
-        int lo = (window_left < 0) ? 0 : (kv_causal - window_left);
-        if (lo < 0) lo = 0;
+        int       lo = (window_left < 0) ? 0 : (kv_causal - window_left);
+        if (lo < 0)
+            lo = 0;
         // A row can legitimately keep nothing -- bottom-right alignment with Skv < Sq puts the
         // first Q rows before every key. An empty range would pass the unsigned test below for
         // every kv, so push the base past the end of the tile and let the span go to zero.
-        const bool empty = hi < lo;
-        const unsigned span = empty ? 0u : (unsigned)(hi - lo);
-        const int base = (empty ? (kv_base + KV_BLOCK_SIZE) : lo) - kv_base - row_half;
+        const bool     empty = hi < lo;
+        const unsigned span  = empty ? 0u : (unsigned) (hi - lo);
+        const int      base  = (empty ? (kv_base + KV_BLOCK_SIZE) : lo) - kv_base - row_half;
 #pragma unroll
         for (int i = 0; i < RT::height; ++i) {
 #pragma unroll
             for (int m = 0; m < 2; ++m) {
-                const unsigned off = (unsigned)(i * 16 + 2 * m - base);
-                if (off > span) att.tiles[i][j].data[m].x = 0.0f;
-                if (off + 1u > span) att.tiles[i][j].data[m].y = 0.0f;
+                const unsigned off = (unsigned) (i * 16 + 2 * m - base);
+                if (off > span)
+                    att.tiles[i][j].data[m].x = 0.0f;
+                if (off + 1u > span)
+                    att.tiles[i][j].data[m].y = 0.0f;
             }
             // Keep the scheduler from hoisting every base tile's comparisons above every select.
             // It has no reason not to -- this block is one long dependence-free run -- and the
@@ -441,12 +445,12 @@ __device__ inline void mask_prob_tile(RT &att, int q_base, int kv_base, int Skv,
 //
 // The natural way to write it -- `s_waitcnt lgkmcnt(N)` in bare asm followed by
 // __builtin_amdgcn_sched_barrier(0x402) -- does not work: the ISA comes out with the first MFMA
-// *above* every one of the four waits. SCHED_BARRIER's mask machinery classifies each instruction as
-// VALU / SALU / MFMA / VMEM / DS / TRANS, and an INLINEASM matches none of those classes, so LLVM
-// links inline asm to no sched_barrier at any mask and is free to move it. That version still passes
-// every accuracy test, because with nothing between the reads and the first MFMA the data happens to
-// arrive in time -- i.e. a missing waitcnt is invisible to the correctness gate and will surface as
-// a wrong answer on some unrelated scheduling change.
+// *above* every one of the four waits. SCHED_BARRIER's mask machinery classifies each instruction
+// as VALU / SALU / MFMA / VMEM / DS / TRANS, and an INLINEASM matches none of those classes, so
+// LLVM links inline asm to no sched_barrier at any mask and is free to move it. That version still
+// passes every accuracy test, because with nothing between the reads and the first MFMA the data
+// happens to arrive in time -- i.e. a missing waitcnt is invisible to the correctness gate and will
+// surface as a wrong answer on some unrelated scheduling change.
 //
 // So the wait is given the two base tiles it releases as read-write operands. It emits nothing but
 // the s_waitcnt, and every MFMA that consumes those registers is ordered below it by a real def-use
@@ -461,8 +465,8 @@ typedef __attribute__((__vector_size__(8 * sizeof(__bf16)))) __bf16 hk_bf16x8_t;
 
 template <int N>
 __device__ __forceinline__ void wait_lgkmcnt_release(bf16_2 (&d0)[4], bf16_2 (&d1)[4]) {
-    hk_bf16x8_t v0 = *(hk_bf16x8_t *)d0;
-    hk_bf16x8_t v1 = *(hk_bf16x8_t *)d1;
+    hk_bf16x8_t v0 = *(hk_bf16x8_t *) d0;
+    hk_bf16x8_t v1 = *(hk_bf16x8_t *) d1;
     if constexpr (N == 6) {
         asm volatile("s_waitcnt lgkmcnt(6)" : "+v"(v0), "+v"(v1) : : "memory");
     } else if constexpr (N == 4) {
@@ -473,18 +477,18 @@ __device__ __forceinline__ void wait_lgkmcnt_release(bf16_2 (&d0)[4], bf16_2 (&d
         static_assert(N == 0, "unsupported lgkm count");
         asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(v0), "+v"(v1) : : "memory");
     }
-    *(hk_bf16x8_t *)d0 = v0;
-    *(hk_bf16x8_t *)d1 = v1;
+    *(hk_bf16x8_t *) d0 = v0;
+    *(hk_bf16x8_t *) d1 = v1;
 }
 
 // The same construction on V's read, and here it is a correctness requirement rather than a
 // scheduling preference.
 //
 // V's 16 ds_read_b64_tr_b16 fill the eight base tiles of v_reg and are consumed by the sixteen PV
-// MFMAs below the per-iteration barrier. The weak idiom -- bare asm volatile("s_waitcnt lgkmcnt(0)")
-// followed by sched_barrier(0) -- does not order them, for the reason recorded above: an INLINEASM
-// matches none of the instruction classes SCHED_BARRIER knows about, so LLVM links the two not at
-// all and may sink the wait past the very MFMAs the fence was written to gate.
+// MFMAs below the per-iteration barrier. The weak idiom -- bare asm volatile("s_waitcnt
+// lgkmcnt(0)") followed by sched_barrier(0) -- does not order them, for the reason recorded above:
+// an INLINEASM matches none of the instruction classes SCHED_BARRIER knows about, so LLVM links the
+// two not at all and may sink the wait past the very MFMAs the fence was written to gate.
 //
 // What holds the order in that form is worth writing down, because it is three unrelated statements
 // and none of them is local to the wait:
@@ -504,40 +508,40 @@ __device__ __forceinline__ void wait_lgkmcnt_release(bf16_2 (&d0)[4], bf16_2 (&d
 // dereferenced pointer is rejected outright ("cannot handle tied indirect register inputs"), so
 // each base tile's four bf16_2 are pulled into one 16-byte vector, laundered, and written back --
 // the same cast kittens::mfma161632 applies to the same array, and the round trip coalesces away.
-template <typename VT>
-__device__ __forceinline__ void wait_lgkmcnt0_release_v(VT &v) {
+template <typename VT> __device__ __forceinline__ void wait_lgkmcnt0_release_v(VT &v) {
     static_assert(VT::height == 2 && VT::width == 4,
                   "V's PV operand is a 2x4 grid of base tiles and the launder names all eight");
     static_assert(sizeof(v.tiles[0][0].data) == sizeof(hk_bf16x8_t),
                   "a base tile must be exactly one 16-byte vector for the launder to be a no-op");
-    hk_bf16x8_t a0 = *(hk_bf16x8_t *)v.tiles[0][0].data;
-    hk_bf16x8_t a1 = *(hk_bf16x8_t *)v.tiles[0][1].data;
-    hk_bf16x8_t a2 = *(hk_bf16x8_t *)v.tiles[0][2].data;
-    hk_bf16x8_t a3 = *(hk_bf16x8_t *)v.tiles[0][3].data;
-    hk_bf16x8_t a4 = *(hk_bf16x8_t *)v.tiles[1][0].data;
-    hk_bf16x8_t a5 = *(hk_bf16x8_t *)v.tiles[1][1].data;
-    hk_bf16x8_t a6 = *(hk_bf16x8_t *)v.tiles[1][2].data;
-    hk_bf16x8_t a7 = *(hk_bf16x8_t *)v.tiles[1][3].data;
+    hk_bf16x8_t a0 = *(hk_bf16x8_t *) v.tiles[0][0].data;
+    hk_bf16x8_t a1 = *(hk_bf16x8_t *) v.tiles[0][1].data;
+    hk_bf16x8_t a2 = *(hk_bf16x8_t *) v.tiles[0][2].data;
+    hk_bf16x8_t a3 = *(hk_bf16x8_t *) v.tiles[0][3].data;
+    hk_bf16x8_t a4 = *(hk_bf16x8_t *) v.tiles[1][0].data;
+    hk_bf16x8_t a5 = *(hk_bf16x8_t *) v.tiles[1][1].data;
+    hk_bf16x8_t a6 = *(hk_bf16x8_t *) v.tiles[1][2].data;
+    hk_bf16x8_t a7 = *(hk_bf16x8_t *) v.tiles[1][3].data;
     asm volatile("s_waitcnt lgkmcnt(0)"
                  : "+v"(a0), "+v"(a1), "+v"(a2), "+v"(a3), "+v"(a4), "+v"(a5), "+v"(a6), "+v"(a7)
                  :
                  : "memory");
-    *(hk_bf16x8_t *)v.tiles[0][0].data = a0;
-    *(hk_bf16x8_t *)v.tiles[0][1].data = a1;
-    *(hk_bf16x8_t *)v.tiles[0][2].data = a2;
-    *(hk_bf16x8_t *)v.tiles[0][3].data = a3;
-    *(hk_bf16x8_t *)v.tiles[1][0].data = a4;
-    *(hk_bf16x8_t *)v.tiles[1][1].data = a5;
-    *(hk_bf16x8_t *)v.tiles[1][2].data = a6;
-    *(hk_bf16x8_t *)v.tiles[1][3].data = a7;
+    *(hk_bf16x8_t *) v.tiles[0][0].data = a0;
+    *(hk_bf16x8_t *) v.tiles[0][1].data = a1;
+    *(hk_bf16x8_t *) v.tiles[0][2].data = a2;
+    *(hk_bf16x8_t *) v.tiles[0][3].data = a3;
+    *(hk_bf16x8_t *) v.tiles[1][0].data = a4;
+    *(hk_bf16x8_t *) v.tiles[1][1].data = a5;
+    *(hk_bf16x8_t *) v.tiles[1][2].data = a6;
+    *(hk_bf16x8_t *) v.tiles[1][3].data = a7;
 }
 
 // k_reg.tiles[n][kk] reinterpreted as the [32 x 16] col-layout A operand of a 16x16x32 -- the same
 // pun transpose() performs by copying data[] verbatim, with the tile-index transposition handled by
 // the caller's indexing instead.
-__device__ __forceinline__ rt_base<bf16, col_l, rt_32x16_s> &as_qk_operand(
-    rt_base<bf16, row_l, rt_16x32_s> &t) {
-    static_assert(sizeof(rt_base<bf16, col_l, rt_32x16_s>) == sizeof(rt_base<bf16, row_l, rt_16x32_s>),
+__device__ __forceinline__ rt_base<bf16, col_l, rt_32x16_s>                            &
+as_qk_operand(rt_base<bf16, row_l, rt_16x32_s> &t) {
+    static_assert(sizeof(rt_base<bf16, col_l, rt_32x16_s>) ==
+                      sizeof(rt_base<bf16, row_l, rt_16x32_s>),
                   "the QK A-operand pun must not change the register footprint");
     return *reinterpret_cast<rt_base<bf16, col_l, rt_32x16_s> *>(&t);
 }
@@ -547,14 +551,14 @@ __device__ __forceinline__ void qk_counted_group(DT &d, KT &k, const BT &b) {
     constexpr int rows_per_group = DT::height / NGROUPS;
     // KV base-tile rows in the order the loader's eight reads complete them.
     constexpr int read_order[4] = {0, 2, 1, 3};
-    constexpr int first = G * rows_per_group;
+    constexpr int first         = G * rows_per_group;
 
 #pragma unroll
     for (int r = 0; r < rows_per_group; ++r) {
         const int n = read_order[first + r];
         // Two reads fill each KV base row, so after this group's rows the last read still in
         // flight is number 2*rows_per_group*(G+1) of 8.
-        wait_lgkmcnt_release<8 - 2 * rows_per_group * (G + 1)>(k.tiles[n][0].data,
+        wait_lgkmcnt_release<8 - 2 * rows_per_group *(G + 1)>(k.tiles[n][0].data,
                                                               k.tiles[n][1].data);
 #pragma unroll
         for (int m = 0; m < DT::width; ++m) {
@@ -562,7 +566,8 @@ __device__ __forceinline__ void qk_counted_group(DT &d, KT &k, const BT &b) {
             mma_AtB_base(d.tiles[n][m], as_qk_operand(k.tiles[n][1]), b.tiles[1][m], d.tiles[n][m]);
         }
     }
-    if constexpr (G + 1 < NGROUPS) qk_counted_group<NGROUPS, G + 1>(d, k, b);
+    if constexpr (G + 1 < NGROUPS)
+        qk_counted_group<NGROUPS, G + 1>(d, k, b);
 }
 
 template <int NGROUPS, typename DT, typename KT, typename BT>
@@ -599,7 +604,7 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     // its own compute. That also means no wave may leave early -- one that has no Q rows at all
     // still has to reach every barrier -- so the early exits are flags.
     extern __shared__ alignment_dummy __shm[];
-    shared_allocator al((int *)&__shm[0]);
+    shared_allocator                  al((int *) &__shm[0]);
     v_stage_tile(&v_smem)[V_STAGE_BUFS] = al.allocate<v_stage_tile, V_STAGE_BUFS>();
     k_stage_tile(&k_smem)[V_STAGE_BUFS] = al.allocate<k_stage_tile, V_STAGE_BUFS>();
 
@@ -623,12 +628,12 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     // per-XCD work stays exactly 1.000x. That last property is the binding constraint: a relabel
     // that improves locality but skews per-XCD work costs more than the locality gains, measured
     // at -5.74%.
-    const int nhx = Hq >> 3;
+    const int nhx            = Hq >> 3;
     const int head_xcd_major = ((blockIdx.x & 7) * nhx) + (blockIdx.x >> 3);
-    const int head_idx = Q_FAST ? blockIdx.y : ((Hq & 7) ? (int)blockIdx.x : head_xcd_major);
-    const int batch_idx = blockIdx.z;
-    const int group_size = Hq / Hkv;
-    const int head_idx_kv = head_idx / group_size;
+    const int head_idx       = Q_FAST ? blockIdx.y : ((Hq & 7) ? (int) blockIdx.x : head_xcd_major);
+    const int batch_idx      = blockIdx.z;
+    const int group_size     = Hq / Hkv;
+    const int head_idx_kv    = head_idx / group_size;
 
     // Each wave owns one Q tile of Q_BLOCK_SIZE rows.
     //
@@ -668,33 +673,34 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     // readfirstlane/m0 pair per staging DMA in the loop header and an exec-mask dance where the
     // active predicate wants an s_cmp. Reading lane 0's copy asserts the uniformity that was always
     // true and costs one instruction.
-    const int wid = __builtin_amdgcn_readfirstlane(warpid());
-    const int q_tile = yblk * NUM_WARPS + wid;
-    const int q_base = q_tile * Q_BLOCK_SIZE;
+    const int  wid        = __builtin_amdgcn_readfirstlane(warpid());
+    const int  q_tile     = yblk * NUM_WARPS + wid;
+    const int  q_base     = q_tile * Q_BLOCK_SIZE;
     const bool wave_valid = (q_base < Sq);
 
-    const int causal_offset = Skv - Sq;  // bottom-right alignment
-    const int lane = laneid();
-    const int kv_tile_max = (Skv + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+    const int causal_offset = Skv - Sq; // bottom-right alignment
+    const int lane          = laneid();
+    const int kv_tile_max   = (Skv + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 
     // KV tile range this Q tile can attend to.
-    const int kv_tile_end = kv_tile_end_for(q_base, causal_offset, kv_tile_max);
-    const int kv_tile_begin = kv_tile_begin_for(q_base, causal_offset, window_left);
-    const bool has_work = wave_valid && (kv_tile_end > kv_tile_begin);
+    const int  kv_tile_end   = kv_tile_end_for(q_base, causal_offset, kv_tile_max);
+    const int  kv_tile_begin = kv_tile_begin_for(q_base, causal_offset, window_left);
+    const bool has_work      = wave_valid && (kv_tile_end > kv_tile_begin);
 
     // Union of the workgroup's eight ranges. The lowest Q tile of a launched block always
     // exists, and clamping the highest to the last in-range Q tile keeps the union from
     // running past what any real wave needs.
-    const int q_base_lo = yblk * NUM_WARPS * Q_BLOCK_SIZE;
+    const int q_base_lo  = yblk * NUM_WARPS * Q_BLOCK_SIZE;
     const int q_base_top = ((Sq - 1) / Q_BLOCK_SIZE) * Q_BLOCK_SIZE;
-    int q_base_hi = q_base_lo + (NUM_WARPS - 1) * Q_BLOCK_SIZE;
-    if (q_base_hi > q_base_top) q_base_hi = q_base_top;
-    const int kv_u_end = kv_tile_end_for(q_base_hi, causal_offset, kv_tile_max);
+    int       q_base_hi  = q_base_lo + (NUM_WARPS - 1) * Q_BLOCK_SIZE;
+    if (q_base_hi > q_base_top)
+        q_base_hi = q_base_top;
+    const int kv_u_end   = kv_tile_end_for(q_base_hi, causal_offset, kv_tile_max);
     const int kv_u_begin = kv_tile_begin_for(q_base_lo, causal_offset, window_left);
 
-    qo_tile<bf16> q_reg;
+    qo_tile<bf16>            q_reg;
     qo_tile_transposed<bf16> q_reg_transposed;
-    kv_tile<bf16> k_reg;
+    kv_tile<bf16>            k_reg;
     // The PV operands are rt_32x16_*4*, i.e. stride 4, where K and Q are stride 8. Both encode a
     // 32-row operand of a 16x16x32, but the stride-4 form lays the reduction axis out as
     // kv = 16*(s/4) + 4*(lane>>4) + (s%4) instead of the canonical 8*(lane>>4) + s. An MFMA is
@@ -703,11 +709,11 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     // att_bf16_in fill below) -- so V has to be read in the same form. mma_AtB_base only requires
     // A_stride == B_stride, which is why the two GEMMs may disagree on stride but their own
     // operands may not.
-    rt<bf16, KV_BLOCK_SIZE, D, col_l, rt_32x16_4_s> v_reg;
-    qo_tile_transposed<float, col_l, rt_16x16_s> o_reg;
-    attn_tile<float> att_block;
+    rt<bf16, KV_BLOCK_SIZE, D, col_l, rt_32x16_4_s>            v_reg;
+    qo_tile_transposed<float, col_l, rt_16x16_s>               o_reg;
+    attn_tile<float>                                           att_block;
     rt<bf16, KV_BLOCK_SIZE, Q_BLOCK_SIZE, col_l, rt_32x16_4_s> att_bf16_in;
-    typename attn_tile<float>::row_vec norm_vec;
+    typename attn_tile<float>::row_vec                         norm_vec;
 
     // The softmax denominator is accumulated by an MFMA against a ones operand rather than by a
     // VALU reduction, which moves it off the pipe this kernel is limited by (VALU ~57% utilised)
@@ -736,7 +742,7 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     // q half -- which is also exactly the two-entry ortho row_vec that div_col and the LSE store
     // want, so the epilogue is still one assignment per half and no cross-lane move.
     rt_base<bf16, col_l, rt_32x16_4_s> ones_a;
-    rt_base<float, col_l, rt_16x16_s> l_acc[2];
+    rt_base<float, col_l, rt_16x16_s>  l_acc[2];
 
     zero(o_reg);
 #pragma unroll
@@ -745,14 +751,15 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
         l_acc[t].data[1] = base_types::constants<float2>::zero();
     }
 #pragma unroll
-    for (int k = 0; k < 4; ++k) ones_a.data[k] = base_types::constants<bf16_2>::ones();
+    for (int k = 0; k < 4; ++k)
+        ones_a.data[k] = base_types::constants<bf16_2>::ones();
 
     // Q is scaled once, with log2(e) folded in so the softmax uses exp2 directly.
     // A wave past the end of Q still runs the loop for the barriers, so its Q index is
     // clamped to a real tile rather than read out of bounds; nothing it computes is stored.
     {
         qo_tile<float> q_fl;
-        const int q_tile_safe = wave_valid ? q_tile : 0;
+        const int      q_tile_safe = wave_valid ? q_tile : 0;
         load<0, qo_tile<float>, _gl_QKVO>(q_fl, Qg, {q_tile_safe, batch_idx, head_idx, 0});
         mul(q_fl, q_fl, softmax_scale * LOG2E);
         copy(q_reg, q_fl);
@@ -762,7 +769,7 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     // The waves cooperate on the staged tiles, so the loop walks the UNION of their eight ranges
     // rather than this wave's own range; `active` inside the body is what restricts the compute.
     const int j_begin = kv_u_begin;
-    const int j_end = kv_u_end;
+    const int j_end   = kv_u_end;
 
     // Everything about K's and V's global addresses that does not depend on the KV tile index,
     // computed once here instead of inside the loop -- see the note on hk_stage::load. The row
@@ -771,21 +778,21 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     // KV_BLOCK_SIZE * B * Hkv * D * sizeof(bf16), so overflowing it needs a single KV tile of 2 GB,
     // and a 32-bit stride is what makes the per-tile offset one s_mul_i32 / s_mul_hi_u32 pair
     // rather than a 64x64 multiply.
-    const int kv_row_stride = (int)Kg.template stride<0>();
+    const int      kv_row_stride = (int) Kg.template stride<0>();
     const uint32_t kv_tile_bytes =
-        (uint32_t)KV_BLOCK_SIZE * (uint32_t)kv_row_stride * (uint32_t)sizeof(bf16);
-    const char *k_slice = (const char *)&Kg[coord<>(0, batch_idx, head_idx_kv, 0)];
-    const char *v_slice = (const char *)&Vg[coord<>(0, batch_idx, head_idx_kv, 0)];
+        (uint32_t) KV_BLOCK_SIZE * (uint32_t) kv_row_stride * (uint32_t) sizeof(bf16);
+    const char *k_slice = (const char *) &Kg[coord<>(0, batch_idx, head_idx_kv, 0)];
+    const char *v_slice = (const char *) &Vg[coord<>(0, batch_idx, head_idx_kv, 0)];
 
     // PIPELINE FILL. K and V are both staged one iteration ahead, so the loop consumes tile j from
     // a buffer the previous barrier published and never reads a tile it filled itself. This is the
     // fill for the first iteration; the condition is workgroup-uniform, so either every wave takes
     // the barrier below or none does.
     if (j_end > j_begin) {
-        const uint64_t off = (uint64_t)(uint32_t)j_begin * (uint64_t)kv_tile_bytes;
-        hk_stage::load<k_stage_tile, NUM_THREADS>(k_smem[0], (const bf16 *)(k_slice + off),
+        const uint64_t off = (uint64_t) (uint32_t) j_begin * (uint64_t) kv_tile_bytes;
+        hk_stage::load<k_stage_tile, NUM_THREADS>(k_smem[0], (const bf16 *) (k_slice + off),
                                                   kv_row_stride, wid);
-        hk_stage::load<v_stage_tile, NUM_THREADS>(v_smem[0], (const bf16 *)(v_slice + off),
+        hk_stage::load<v_stage_tile, NUM_THREADS>(v_smem[0], (const bf16 *) (v_slice + off),
                                                   kv_row_stride, wid);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         __builtin_amdgcn_sched_barrier(0);
@@ -821,10 +828,10 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
             const int jn = (j + 1 < j_end) ? (j + 1) : j;
             // The whole per-tile address cost, for both tensors: one 32x32 -> 64 multiply and one
             // 64-bit add each. K and V share the offset because they share a shape.
-            const uint64_t off = (uint64_t)(uint32_t)jn * (uint64_t)kv_tile_bytes;
-            hk_stage::load<v_stage_tile, NUM_THREADS>(v_smem[nbuf], (const bf16 *)(v_slice + off),
+            const uint64_t off = (uint64_t) (uint32_t) jn * (uint64_t) kv_tile_bytes;
+            hk_stage::load<v_stage_tile, NUM_THREADS>(v_smem[nbuf], (const bf16 *) (v_slice + off),
                                                       kv_row_stride, wid);
-            hk_stage::load<k_stage_tile, NUM_THREADS>(k_smem[nbuf], (const bf16 *)(k_slice + off),
+            hk_stage::load<k_stage_tile, NUM_THREADS>(k_smem[nbuf], (const bf16 *) (k_slice + off),
                                                       kv_row_stride, wid);
         }
 
@@ -903,8 +910,9 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
                 for (int J = 0; J < att_bf16_in.width; ++J) {
 #pragma unroll
                     for (int d = 0; d < 4; ++d) {
-                        att_bf16_in.tiles[I][J].data[d] = base_types::convertor<bf16_2, float2>::
-                            convert(att_block.tiles[2 * I + (d >> 1)][J].data[d & 1]);
+                        att_bf16_in.tiles[I][J].data[d] =
+                            base_types::convertor<bf16_2, float2>::convert(
+                                att_block.tiles[2 * I + (d >> 1)][J].data[d & 1]);
                     }
                 }
             }
@@ -978,11 +986,12 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     //
     // DO NOT DELETE THE ROLLED BODY BECAUSE NOTHING REACHES IT. Every shape of interest has a
     // minimum trip count of four, so the rolled copy is effectively dead code -- and compiling it
-    // anyway is what takes this kernel from 3 spilled VGPRs and 16 B/lane of scratch to 1 and 8, and
-    // its steady-state SALU per KV tile from 91.33 to 90.00, at the same 128 VGPRs and 4 waves/SIMD.
-    // Deleting it reverts all three numbers exactly and costs ~0.4% on the long full-causal shapes.
-    // This is an allocator side-effect rather than a designed one, so it is fragile: any round that
-    // restructures this loop must re-read the resource report rather than assume it survives.
+    // anyway is what takes this kernel from 3 spilled VGPRs and 16 B/lane of scratch to 1 and 8,
+    // and its steady-state SALU per KV tile from 91.33 to 90.00, at the same 128 VGPRs and 4
+    // waves/SIMD. Deleting it reverts all three numbers exactly and costs ~0.4% on the long
+    // full-causal shapes. This is an allocator side-effect rather than a designed one, so it is
+    // fragile: any round that restructures this loop must re-read the resource report rather than
+    // assume it survives.
     if (j_end - j_begin >= UNROLL_MIN_TRIPS) {
         for (int j_blk = j_begin; j_blk < j_end; j_blk += V_STAGE_BUFS) {
 #pragma unroll
@@ -990,7 +999,8 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
                 // j_begin and j_end both derive from the workgroup's q range, so this exit is
                 // workgroup-uniform and every wave takes it on the same trip. That is what keeps
                 // the s_barrier inside balanced; a per-wave exit condition here would hang.
-                if (j_blk + u >= j_end) break;
+                if (j_blk + u >= j_end)
+                    break;
                 kv_tile_body(j_blk + u, u, (u + 1 == V_STAGE_BUFS) ? 0 : (u + 1));
             }
         }
@@ -1003,12 +1013,14 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
         }
     }
 
-    if (!has_work) return;
+    if (!has_work)
+        return;
 
     // Element 0 of each MFMA accumulator is this lane's own q sum for that q half, in the one
     // float per lane an ortho row_vec holds -- see the derivation above.
 #pragma unroll
-    for (int J = 0; J < norm_vec.outer_dim; ++J) norm_vec[J][0] = l_acc[J].data[0].x;
+    for (int J = 0; J < norm_vec.outer_dim; ++J)
+        norm_vec[J][0] = l_acc[J].data[0].x;
 
     div_col(o_reg, o_reg, norm_vec);
 
@@ -1021,7 +1033,7 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     // exp2 above a natural exp. So lse = ln(sum), and kittens' log() is the natural log.
     log(norm_vec, norm_vec);
     store(Lg, norm_vec, {batch_idx, head_idx, 0, q_tile});
-#endif  // __gfx950__
+#endif // __gfx950__
 }
 
 // Does a CTA's union KV extent depend on which q block it is? Evaluated with the kernel's own
@@ -1029,35 +1041,39 @@ __global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
 // bottom-right-aligned rectangular ones and the windows that clip at kv = 0. This is the predicate
 // that chooses the grid's axis order; it is derived from Sq/Skv/window_left and nothing else.
 static bool u_varies_with_qblock(int Sq, int Skv, int window_left, int ny) {
-    const int off = Skv - Sq;
-    const int kv_max = (Skv + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
-    const int top = ((Sq - 1) / Q_BLOCK_SIZE) * Q_BLOCK_SIZE;
-    int u_first = -1;
+    const int off     = Skv - Sq;
+    const int kv_max  = (Skv + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+    const int top     = ((Sq - 1) / Q_BLOCK_SIZE) * Q_BLOCK_SIZE;
+    int       u_first = -1;
     for (int y = 0; y < ny; ++y) {
         const int lo = y * NUM_WARPS * Q_BLOCK_SIZE;
-        int hi = lo + (NUM_WARPS - 1) * Q_BLOCK_SIZE;
-        if (hi > top) hi = top;
+        int       hi = lo + (NUM_WARPS - 1) * Q_BLOCK_SIZE;
+        if (hi > top)
+            hi = top;
         int end = (hi + Q_BLOCK_SIZE + off + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
-        if (end > kv_max) end = kv_max;
+        if (end > kv_max)
+            end = kv_max;
         int begin = 0;
         if (window_left >= 0) {
             const int l = lo + off - window_left;
-            begin = l > 0 ? l / KV_BLOCK_SIZE : 0;
+            begin       = l > 0 ? l / KV_BLOCK_SIZE : 0;
         }
         const int u = end > begin ? end - begin : 0;
-        if (u_first < 0) u_first = u;
-        else if (u != u_first) return true;
+        if (u_first < 0)
+            u_first = u;
+        else if (u != u_first)
+            return true;
     }
     return false;
 }
 
-}  // namespace
+} // namespace
 
 // The block sizes the Python wrapper zero-pads Sq/Skv to. A disagreement between the two reads
 // past the end of a tensor rather than failing, so they are exported and checked there rather
 // than duplicated on trust.
 void hk_attn_fwd_d64_blocks(int64_t *q_block, int64_t *kv_block) {
-    *q_block = Q_BLOCK_SIZE;
+    *q_block  = Q_BLOCK_SIZE;
     *kv_block = KV_BLOCK_SIZE;
 }
 
@@ -1071,7 +1087,7 @@ void hk_attn_fwd_d64(const HkTensorDesc &q, const HkTensorDesc &k, const HkTenso
     auto Lg = make_gl_from_desc<_gl_L>(lse);
 
     const int q_tiles = (Sq + Q_BLOCK_SIZE - 1) / Q_BLOCK_SIZE;
-    const int ny = (q_tiles + NUM_WARPS - 1) / NUM_WARPS;
+    const int ny      = (q_tiles + NUM_WARPS - 1) / NUM_WARPS;
 
     // 48 KB: K and V, each triple-buffered at 8 KB, against CDNA4's 160 KB -- so two workgroups per
     // CU is 96 KB and still fits. Past 64 KB this would have to be dynamic shared memory with the
@@ -1100,4 +1116,4 @@ void hk_attn_fwd_d64(const HkTensorDesc &q, const HkTensorDesc &k, const HkTenso
     }
 }
 
-}  // namespace primus_turbo::hipkittens
+} // namespace primus_turbo::hipkittens

@@ -807,14 +807,14 @@ for _hq, _hkv, _sq, _skv, _w in _HK_META:
 # it double weight. All head dim 128; gpt-oss is excluded as head dim 64, which the meta set
 # above already covers.
 _HK_MODEL_HEADS = [
-    (40, 8),   # llama4_17B128E, llama4_17B16E
-    (48, 8),   # minimax_m2.5
-    (64, 4),   # qwen3_235B_A22B
-    (32, 4),   # qwen3_30B_A3B
-    (32, 8),   # lfm2_8B_A1B, mixtral_8x7B_v0.1
+    (40, 8),  # llama4_17B128E, llama4_17B16E
+    (48, 8),  # minimax_m2.5
+    (64, 4),  # qwen3_235B_A22B
+    (32, 4),  # qwen3_30B_A3B
+    (32, 8),  # lfm2_8B_A1B, mixtral_8x7B_v0.1
     (16, 16),  # deepseek_v2_lite (MHA)
-    (64, 8),   # grok2
-    (48, 8),   # grok1, mixtral_8x22B_v0.1
+    (64, 8),  # grok2
+    (48, 8),  # grok1, mixtral_8x22B_v0.1
 ]
 _HK_MODEL_SEQLEN = 1024
 
@@ -849,7 +849,7 @@ def _run_hk_case(Sq, Skv, B, Hq, Hkv, D, window_left, bar=40.0):
     )
 
     torch.manual_seed(0)
-    scale = D ** -0.5
+    scale = D**-0.5
 
     def mk(s, h):
         return torch.randn(s, B, h, D, device="cuda", dtype=torch.bfloat16) * 0.5
@@ -902,7 +902,7 @@ def test_attention_hipkittens_deterministic():
 
     D, S, B, Hq, Hkv = 128, 1024, 2, 32, 4
     torch.manual_seed(0)
-    scale = D ** -0.5
+    scale = D**-0.5
     q = torch.randn(S, B, Hq, D, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(S, B, Hkv, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(S, B, Hkv, D, device="cuda", dtype=torch.bfloat16)
