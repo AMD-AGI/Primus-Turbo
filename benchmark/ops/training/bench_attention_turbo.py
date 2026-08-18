@@ -773,8 +773,10 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="auto",
-        choices=("auto", "aiter", "flydsl", "triton"),
-        help="Pin the attention backend (default: auto, i.e. whatever resolves).",
+        choices=("auto", "aiter", "flydsl", "triton", "hipkittens"),
+        help="Pin the attention backend (default: auto, i.e. whatever resolves). "
+        "hipkittens is gfx950-only and takes bf16 causal sbhd with Sq <= Skv; anything "
+        "outside that is refused rather than silently handed to another backend.",
     )
     parser.add_argument(
         "--layout",
