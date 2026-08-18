@@ -190,9 +190,82 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         )
 
 
+def _hipkittens_verdict(q, k, v, causal, window_size, sink, dropout_p, bias, alibi_slopes):
+    """Ask the HipKittens layer whether it takes this call, on the sbhd view of it.
+
+    Imported lazily and behind a guard: the extension is only compiled on gfx950, so on any
+    other build importing it at module scope would make this whole file unimportable.
+    """
+    try:
+        from primus_turbo.hipkittens.attention.gfx950 import hipkittens_attn_supported
+    except ImportError:
+        return False, "hipkittens extension is not built"
+    qs, ks, vs = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+    return hipkittens_attn_supported(
+        qs,
+        ks,
+        vs,
+        causal=causal,
+        window_size=window_size,
+        sink=sink,
+        dropout_p=dropout_p,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+    )
+
+
+class DenseAttnFwdHipkittensBackend(KernelBackend):
+    """HipKittens attention, gfx950 only.
+
+    A narrow backend by construction: bf16, causal, sbhd, head dim 64 or 128, Sq <= Skv, no
+    sink and no varlen. Everything outside that is refused here rather than computed wrongly
+    -- these kernels read out of bounds or leave output unwritten instead of failing -- so a
+    shape that does not qualify falls back to whichever backend does.
+    """
+
+    @staticmethod
+    def can_handle(
+        q,
+        k=None,
+        v=None,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=True,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+        qkv_format="bshd",
+        **kwargs,
+    ) -> bool:
+        # Same layout gate as FlyDSL: the kernels address sbhd and take the [s,b,h,d] view of
+        # these [b,s,h,d]-shaped tensors with no copy, so the bytes have to already be in that
+        # order. _sbhd_layout is what decides that, rather than a stride test, because at
+        # b == 1 the two orders are indistinguishable.
+        if k is None or v is None or not _sbhd_layout(q, qkv_format):
+            return False
+        ok, _ = _hipkittens_verdict(
+            q, k, v, causal, window_size, sink, dropout_p, bias, alibi_slopes
+        )
+        return ok
+
+    @staticmethod
+    def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
+        from primus_turbo.hipkittens.attention.gfx950 import hipkittens_attn_forward
+
+        q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+        out, lse = hipkittens_attn_forward(
+            q, k, v, softmax_scale=softmax_scale, causal=causal, window_size=window_size
+        )
+        # Back to the [b, s, h, d] view the caller handed us.
+        out = out.permute(1, 0, 2, 3)
+        return (out, lse) if return_lse else out
+
+
 _DENSE_FWD_BACKENDS = {
     BackendType.FLYDSL: BackendEntry(DenseAttnFwdFlydslBackend),
     BackendType.AITER: BackendEntry(DenseAttnFwdAiterBackend),
+    BackendType.HIPKITTENS: BackendEntry(DenseAttnFwdHipkittensBackend),
 }
 
 
