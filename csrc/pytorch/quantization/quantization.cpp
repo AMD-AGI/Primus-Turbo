@@ -45,6 +45,7 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
                        input.scalar_type() == at::kFloat);
     PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
+    PRIMUS_TURBO_CHECK(input.is_contiguous(), "input must be contiguous");
     auto stream = at::cuda::getCurrentCUDAStream();
 
     at::Tensor scale     = torch::empty({}, input.options().dtype(at::kFloat));
@@ -55,7 +56,7 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
         PRIMUS_TURBO_CHECK(scale.numel() == 1, "tensorwise scale must be scalar tensor");
         scale_inv = 1.0f / scale;
     } else {
-        // Reduce
+        // Whole-tensor abs-amax -> scalar scale.
         auto          amax      = torch::empty({}, input.options().dtype(at::kFloat));
         const int64_t ws_size   = get_reduce_row_workspace_sizes<float>(1, input.numel());
         auto          workspace = torch::empty({ws_size}, input.options().dtype(at::kByte));
@@ -65,7 +66,6 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                 amax.data_ptr<float>(), 1, input.numel(), ws_size, workspace.data_ptr(), stream);
         });
 
-        // Compute Scale
         const float fp8_max = get_float8_max(dest_dtype);
         compute_scale_from_amax<float>(reinterpret_cast<const float *>(amax.data_ptr()), fp8_max,
                                        reinterpret_cast<float *>(scale.data_ptr()),
@@ -73,8 +73,8 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                        amax.numel(), stream);
     }
 
-    // Quantize
-    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype).device(input.device()));
+    at::Tensor output = torch::empty_like(input, torch::dtype(dest_dtype));
+
     TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), FType, {
         TORCH_TYPE_SWITCH_FP8(output.scalar_type(), QType, {
             quantize_tensorwise_impl<FType, QType>(
