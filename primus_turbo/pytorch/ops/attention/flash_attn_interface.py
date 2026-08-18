@@ -30,6 +30,10 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_varlen_flydsl_backward_impl,
     flash_attn_varlen_flydsl_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
+    flash_attn_sbhd_hipkittens_backward_impl,
+    flash_attn_sbhd_hipkittens_forward_impl,
+)
 from primus_turbo.pytorch.kernels.attention.attention_impl import (
     _sbhd_layout,
     resolve_flash_attn_backend,
@@ -95,6 +99,31 @@ class FlashAttnFunc(torch.autograd.Function):
         backend: BackendType = BackendType.AITER,
     ):
         ctx.backend = backend
+        if backend == BackendType.HIPKITTENS:
+            # Same sbhd precondition as FlyDSL below, and for the same reason.
+            assert _sbhd_layout(
+                q, qkv_format
+            ), f"hipkittens dense attention is sbhd only, got {qkv_format}"
+            q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+            out_s, lse = flash_attn_sbhd_hipkittens_forward_impl(
+                q_s,
+                k_s,
+                v_s,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                return_lse=True,
+            )
+            if is_grad_enabled and _any_requires_grad(q, k, v, sink):
+                ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
+                ctx.softmax_scale = softmax_scale
+                ctx.causal = causal
+                ctx.window_size = window_size
+            out = out_s.permute(1, 0, 2, 3)
+            # These kernels already return lse as [B, Hq, 1, Sq]; drop the singleton axis so it
+            # matches the [B, Hq, Sq] every other backend hands back.
+            return (out, lse.squeeze(2)) if return_lse else out
+
         if backend == BackendType.FLYDSL:
             # Only sbhd bytes make the [s,b,h,d] view a relabel rather than a reinterpretation.
             # The dispatcher checked that before naming this backend, but apply() can be called
@@ -195,6 +224,22 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        if ctx.backend == BackendType.HIPKITTENS:
+            q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
+            dq, dk, dv = flash_attn_sbhd_hipkittens_backward_impl(
+                dout.permute(1, 0, 2, 3).contiguous(),
+                q_s,
+                k_s,
+                v_s,
+                out_s,
+                lse,  # already [B, Hq, 1, Sq], which is the layout the backward wants
+                softmax_scale=ctx.softmax_scale,
+                causal=ctx.causal,
+                window_size=ctx.window_size,
+            )
+            dq, dk, dv = (g.permute(1, 0, 2, 3) for g in (dq, dk, dv))
+            return _flash_attn_grads(dq, dk, dv, None, None)
+
         if ctx.backend == BackendType.FLYDSL:
             q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
             B, Sq, Hq = ctx.lse_shape
