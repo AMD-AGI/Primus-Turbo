@@ -169,11 +169,16 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         alibi_slopes=None,
         sink=None,
         qkv_format="bshd",
+        return_softmax=False,
         **kwargs,
     ) -> bool:
         # sbhd only: the kernel is compiled to address that order and takes the [s,b,h,d]
         # view of these [b,s,h,d]-shaped tensors with no copy. Everything else goes to aiter.
         if k is None or v is None or not _sbhd_layout(q, qkv_format):
+            return False
+        # These kernels never materialise the dropout softmax matrix, so a caller that asked
+        # for it has to go to aiter, which does.
+        if return_softmax:
             return False
         if not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
             return False
@@ -216,6 +221,7 @@ class DenseAttnFwdHipkittensBackend(KernelBackend):
         alibi_slopes=None,
         sink=None,
         qkv_format="bshd",
+        return_softmax=False,
         **kwargs,
     ) -> bool:
         # Same layout gate as FlyDSL: the kernels address sbhd and take the [s,b,h,d] view of
@@ -223,6 +229,9 @@ class DenseAttnFwdHipkittensBackend(KernelBackend):
         # order. _sbhd_layout is what decides that, rather than a stride test, because at
         # b == 1 the two orders are indistinguishable.
         if k is None or v is None or not _sbhd_layout(q, qkv_format):
+            return False
+        # No dropout softmax matrix here either, for the same reason as FlyDSL above.
+        if return_softmax:
             return False
         # Ask the backend rather than restating its rules here, so the two cannot drift. It
         # answers on the sbhd view, which is what it will be handed.
@@ -272,10 +281,35 @@ class FlashAttnDenseDispatcher(AutoKernelDispatcher):
     _cache = TuneCache(1024)
 
     @classmethod
-    def make_key(cls, q, k, causal=True, window_size=(-1, -1), qkv_format="bshd", sink=None, **kwargs):
+    def make_key(
+        cls,
+        q,
+        k,
+        causal=True,
+        window_size=(-1, -1),
+        qkv_format="bshd",
+        sink=None,
+        return_softmax=False,
+        **kwargs,
+    ):
         b, s, hq, d = q.shape
         hkv = k.shape[2]
-        return (b, s, hq, hkv, d, q.dtype, bool(causal), tuple(window_size), qkv_format, sink is not None)
+        # return_softmax belongs in the key because it decides eligibility, not just output:
+        # only aiter can produce the dropout matrix, so a tuned entry cached without it would
+        # hand a return_softmax call to a backend that silently drops it.
+        return (
+            b,
+            s,
+            hq,
+            hkv,
+            d,
+            q.dtype,
+            bool(causal),
+            tuple(window_size),
+            qkv_format,
+            sink is not None,
+            bool(return_softmax),
+        )
 
 
 # =============================================================================
