@@ -50,6 +50,7 @@ def dispatch_bf16_tile(
     block_m: int = 0,
     disp_parity: Optional[fx.Int32] = None,
     num_ranks: int = 0,
+    chunks: int = 1,
 ):
     hidden_bytes = hidden_size * 2
     assert hidden_bytes % 1024 == 0, "hidden*2 must be a multiple of 1024 bytes -> hidden % 512 == 0"
@@ -57,19 +58,39 @@ def dispatch_bf16_tile(
 
     warp_id = thread_index // fx.Int32(_WARP)
 
-    dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
-    dest_row_start = buffer_load(expert_send_dst_row_res, task_index, vec_width=1, dtype=fx.T.i32())
-    source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
-    token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+    # Split each (expert, dst_rank) segment into `chunks` row-interleaved pieces, ordered
+    # expert-major, so every comm block works on the earliest expert first instead of one block
+    # owning a whole segment. The consumer gates expert e on all source ranks having finished e,
+    # so this shortens the pipeline fill; steady-state bandwidth is unchanged. chunks=1 is
+    # bit-identical to the unchunked mapping.
+    assert chunks == 1 or num_ranks > 0, "chunks>1 requires num_ranks>0"
+    if const_expr(chunks > 1):
+        ranks_x_chunks = fx.Int32(num_ranks * chunks)
+        local_expert = task_index // ranks_x_chunks
+        rem = task_index % ranks_x_chunks
+        chunk_id = rem // fx.Int32(num_ranks)
+        seg_index = local_expert * fx.Int32(num_ranks) + rem % fx.Int32(num_ranks)
+    else:
+        seg_index = task_index
+        chunk_id = fx.Int32(0)
+        local_expert = task_index // fx.Int32(num_ranks) if num_ranks else fx.Int32(0)
+
+    dst_rank = buffer_load(expert_send_dst_rank_res, seg_index, vec_width=1, dtype=fx.T.i32())
+    dest_row_start = buffer_load(expert_send_dst_row_res, seg_index, vec_width=1, dtype=fx.T.i32())
+    source_offset = buffer_load(expert_send_offset_res, seg_index, vec_width=1, dtype=fx.T.i32())
+    token_count = buffer_load(expert_send_count_res, seg_index, vec_width=1, dtype=fx.T.i32())
     # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
     pool_address = sym.map(workspace.get_dispatch_token_pool_ptr(), dst_rank)
     dispatch_flag_address = sym.map(workspace.get_dispatch_flag_ptr(), dst_rank)
     num_max_pool_blocks = int(workspace.num_max_pool_blocks)
 
-    local_count = (token_count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
+    # row_start < row_stride always, so the ceildiv numerator can never go negative.
+    row_stride = fx.Int32(chunks * _NUM_WARPS)
+    row_start = fx.Int32(chunks) * warp_id + chunk_id
+    local_count = (token_count - row_start + row_stride - fx.Int32(1)) // row_stride
 
     for i in range(local_count):
-        row_index = warp_id + i * fx.Int32(_NUM_WARPS)
+        row_index = row_start + i * row_stride
         source_row = buffer_load(
             dispatched_token_idx_res, source_offset + row_index, vec_width=1, dtype=fx.T.i32()
         )
@@ -90,8 +111,8 @@ def dispatch_bf16_tile(
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):
             bank = fx.Int32(0) if disp_parity is None else disp_parity * fx.Int32(num_max_pool_blocks)
-            # each task bumps dst expert counter +1, so the total is host-predictable
-            local_expert = task_index // fx.Int32(num_ranks)
+            # Every chunk signals unconditionally (even one that pushed 0 rows), so expert e gets
+            # exactly num_ranks*chunks increments -- host-predictable and not data dependent.
             atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
 
 

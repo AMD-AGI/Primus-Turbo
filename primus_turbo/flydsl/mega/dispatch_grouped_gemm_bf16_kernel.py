@@ -47,6 +47,12 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     xcd_remap_pid,
 )
 
+# Dispatch push chunking. Chosen on the host from a constant so every rank necessarily agrees:
+# this changes the cross-rank flag protocol (expert e expects num_ranks*chunks increments), so
+# ranks disagreeing would deadlock. Deliberately not an autotuned Config field, since autotune
+# arms are not rank-synchronised.
+_DISP_CHUNKS = 4
+
 
 @functools.lru_cache(maxsize=1)
 def get_dummy_tensor():
@@ -73,6 +79,7 @@ def _make_kernel(
     num_experts=0,
     num_max_tokens_per_rank=0,
     num_topk=0,
+    disp_chunks=1,
 ):
     K = hidden_size
     is_tn = layout == "tn"
@@ -157,7 +164,7 @@ def _make_kernel(
 
         if block_index < comm_block_count:
             local_task_count = (
-                fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
+                fx.Int32(num_comm * disp_chunks) - block_index + comm_block_count - fx.Int32(1)
             ) // comm_block_count
             for task_iteration in range(local_task_count):
                 dispatch_bf16_tile(
@@ -175,6 +182,7 @@ def _make_kernel(
                     signal=True,
                     disp_parity=disp_parity,
                     num_ranks=num_ranks,
+                    chunks=disp_chunks,
                 )
         elif const_expr(is_tn):
             tile_index = block_index - comm_block_count
@@ -382,12 +390,14 @@ def _compiled_dispatch_grouped_gemm(
     GROUP_M: fx.Constexpr[int] = 1,
     waves_per_eu: fx.Constexpr[int] = 2,
     agpr_alloc: fx.Constexpr[int] = 0,
+    disp_chunks: fx.Constexpr[int] = 1,
 ):
     # layout_code: 0=nt, 1=nn, 2=tn; tn uses 2 XCDs, nt/nn use 8
     layout = ("nt", "nn", "tn")[int(layout_code)]
     num_xcd = 2 if layout == "tn" else 8
-    # bump epoch on device (expected += num_ranks) before the GEMM; same-stream makes it visible
-    _make_epoch_bump(int(num_ranks))(DISP_PARITY, DISP_EXPECTED).launch(
+    # bump epoch on device before the GEMM; same-stream makes it visible. Each expert receives
+    # num_ranks*disp_chunks increments, so the addend must match exactly.
+    _make_epoch_bump(int(num_ranks) * int(disp_chunks))(DISP_PARITY, DISP_EXPECTED).launch(
         grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
     )
     kernel, grid_size = _make_kernel(
@@ -409,6 +419,7 @@ def _compiled_dispatch_grouped_gemm(
         num_experts=int(num_experts),
         num_max_tokens_per_rank=int(num_max_tokens_per_rank),
         num_topk=int(num_topk),
+        disp_chunks=int(disp_chunks),
     )
     kernel(
         INPUT_TOKENS,
@@ -582,6 +593,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         num_experts=int(symm.num_experts),
         num_max_tokens_per_rank=int(symm.num_max_tokens_per_rank),
         num_topk=int(symm.num_topk),
+        disp_chunks=_DISP_CHUNKS,
         stream=torch.cuda.current_stream(),
     )
     return output, symm.dispatch_token_pool, symm.weight_recv_buf, handle
