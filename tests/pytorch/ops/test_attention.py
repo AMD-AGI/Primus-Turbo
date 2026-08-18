@@ -686,7 +686,7 @@ def test_sparse_mla(variant, cr, seqlen):
 @pytest.mark.parametrize("cr", [0, 4, 128])
 def test_sparse_mla_op(variant, cr, seqlen):
     """Public multi-backend training op ``sparse_mla_func``: autograd fwd+bwd (default
-    FLYDSL) vs triton oracle, plus the PRIMUS_TURBO_SPARSE_ATTN_BACKEND=TRITON override."""
+    FLYDSL) vs triton oracle, plus the PRIMUS_TURBO_ATTN_BACKEND=TRITON override."""
     import math
 
     from primus_turbo.pytorch.core.backend import (
@@ -730,9 +730,9 @@ def test_sparse_mla_op(variant, cr, seqlen):
         assert compute_snr(dsink_ref, dsink) > 40.0, "op dsink SNR <= 40"
 
         # Backend override: force TRITON through the public op; grads must match the oracle tightly.
-        GlobalBackendManager.set_sparse_attn_backend(BackendType.TRITON, PrecisionType.BF16_FP16_FP32)
+        GlobalBackendManager.set_attn_backend(BackendType.TRITON, PrecisionType.BF16_FP16_FP32)
         out_t, dq_t, dkv_t, dsink_t = _run_op()
         assert compute_snr(out_ref, out_t) > 60.0, "TRITON-override op fwd disagrees with oracle"
         assert compute_snr(dq_ref, dq_t) > 60.0, "TRITON-override op dq disagrees with oracle"
     finally:
-        GlobalBackendManager.set_sparse_attn_backend(None)
+        GlobalBackendManager.set_attn_backend(None)

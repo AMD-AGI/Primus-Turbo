@@ -7,7 +7,7 @@
 
 Mirrors the flash-attn multi-backend layer (``attention_impl.py``): per-backend
 ``KernelBackend`` (can_handle / execute) registered in an ``AutoKernelDispatcher``
-and selected by ``GlobalBackendManager`` / ``PRIMUS_TURBO_SPARSE_ATTN_BACKEND`` /
+and selected by ``GlobalBackendManager`` / ``PRIMUS_TURBO_ATTN_BACKEND`` /
 autotune. FLYDSL is the fast default (gfx950); TRITON is the reference oracle and
 non-gfx950 fallback.
 
@@ -154,5 +154,13 @@ class SparseMlaBwdDispatcher(AutoKernelDispatcher):
 
 
 def resolve_sparse_mla_fwd_backend(user_backend: Optional[BackendType], **kwargs) -> BackendType:
-    """Resolve the sparse-MLA backend enum (default FLYDSL, else TRITON oracle)."""
+    """Resolve the sparse-MLA backend enum (default FLYDSL, else TRITON oracle).
+
+    PRIMUS_TURBO_ATTN_BACKEND names one backend for both attention dispatchers, which do not
+    carry the same set -- sparse-MLA has no aiter path. A name this one does not have is
+    taken as no preference rather than an error, so pinning aiter for flash-attention does
+    not take sparse-MLA down with it.
+    """
+    if user_backend is not None and user_backend not in SparseMlaFwdDispatcher._backends:
+        user_backend = None
     return SparseMlaFwdDispatcher.resolve(BackendType.FLYDSL, user_backend, **kwargs)

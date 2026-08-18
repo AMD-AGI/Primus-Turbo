@@ -19,7 +19,6 @@ from primus_turbo.common.constants import (
     ENV_GEMM_BACKEND,
     ENV_GROUPED_GEMM_BACKEND,
     ENV_MOE_DISPATCH_COMBINE_BACKEND,
-    ENV_SPARSE_ATTN_BACKEND,
 )
 from primus_turbo.common.logger import logger
 from primus_turbo.triton.utils.origami import origami_clear_caches
@@ -95,7 +94,6 @@ class GlobalBackendManager:
     _grouped_gemm_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _moe_dispatch_combine_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _attn_backend: Optional[Dict[PrecisionType, Optional[BackendType]]] = None
-    _sparse_attn_backend: Optional[Dict[PrecisionType, Optional[BackendType]]] = None
     _auto_tune: Optional[bool] = None
     _env_cache: Dict[str, Dict["PrecisionType", "BackendChoice"]] = {}
 
@@ -286,7 +284,7 @@ class GlobalBackendManager:
     def set_attn_backend(
         cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
     ) -> None:
-        """Set the flash-attention backend in code."""
+        """Set the attention backend in code; flash-attention and sparse-MLA share it."""
         if backend is None:
             cls._attn_backend = None
             return
@@ -301,36 +299,15 @@ class GlobalBackendManager:
 
     @classmethod
     def get_attn_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
-        """Get the flash-attention backend configuration. Returns None if not set."""
+        """Get the attention backend configuration. Returns None if not set.
+
+        Flash-attention and sparse-MLA read the same setting; they do not have the same
+        backends, so each dispatcher drops a name it does not carry (see
+        resolve_sparse_mla_fwd_backend) rather than failing on it."""
         if cls._attn_backend is not None:
             return cls._attn_backend.get(precision)
         # env parsing yields BackendChoice; attn dispatch consumes the bare enum.
         choice = cls._backend_from_env(ENV_ATTN_BACKEND, precision)
-        return choice.backend if choice is not None else None
-
-    @classmethod
-    def set_sparse_attn_backend(
-        cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
-    ) -> None:
-        """Set the sparse-MLA (DeepSeek-V4) attention backend in code."""
-        if backend is None:
-            cls._sparse_attn_backend = None
-            return
-
-        if cls._sparse_attn_backend is None:
-            cls._sparse_attn_backend = {}
-
-        if precision is None:
-            cls._sparse_attn_backend = {precision: backend for precision in _PRECISION_TYPE_SET}
-        else:
-            cls._sparse_attn_backend[precision] = backend
-
-    @classmethod
-    def get_sparse_attn_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
-        """Get the sparse-MLA attention backend configuration. Returns None if not set."""
-        if cls._sparse_attn_backend is not None:
-            return cls._sparse_attn_backend.get(precision)
-        choice = cls._backend_from_env(ENV_SPARSE_ATTN_BACKEND, precision)
         return choice.backend if choice is not None else None
 
     @classmethod
@@ -381,7 +358,6 @@ class GlobalBackendManager:
         cls._grouped_gemm_backend = None
         cls._moe_dispatch_combine_backend = None
         cls._attn_backend = None
-        cls._sparse_attn_backend = None
         cls._auto_tune = None
         cls._env_cache = {}
         AutoKernelDispatcher.clear_all_caches()

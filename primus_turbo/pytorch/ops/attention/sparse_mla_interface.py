@@ -48,7 +48,7 @@ class SparseMLAFunc(torch.autograd.Function):
         is_grad = is_grad_enabled and any(x is not None and x.requires_grad for x in (q, kv, attn_sink))
 
         backend = resolve_sparse_mla_fwd_backend(
-            GlobalBackendManager.get_sparse_attn_backend(_SPARSE_ATTN_PRECISION),
+            GlobalBackendManager.get_attn_backend(_SPARSE_ATTN_PRECISION),
             q=q,
             kv=kv,
             topk_indices=topk_indices,
