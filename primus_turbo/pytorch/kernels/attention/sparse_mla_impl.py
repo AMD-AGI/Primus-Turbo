@@ -5,17 +5,9 @@
 ###############################################################################
 """Multi-backend selection for DeepSeek-V4 single-latent sparse-MLA attention.
 
-Mirrors the flash-attn multi-backend layer (``attention_impl.py``): per-backend
-``KernelBackend`` (can_handle / execute) registered in an ``AutoKernelDispatcher``
-and selected by ``GlobalBackendManager`` / ``PRIMUS_TURBO_ATTN_BACKEND`` /
-autotune. FLYDSL is the fast default (gfx950); TRITON is the reference oracle and
-non-gfx950 fallback.
-
-As with flash-attn, a forward+backward pair must run on the *same* backend. The
-op layer (``ops/attention/sparse_mla_interface.py``) resolves the backend once in
-the forward via ``resolve_sparse_mla_fwd_backend``, stores it in ``ctx.backend``,
-and pins that enum for the backward -- so consistency holds by construction.
-``execute`` runs one pass (fwd or bwd); it exists so autotune can time backends.
+Mirrors the flash-attn layer (``attention_impl.py``), down to resolving the backend once
+in the forward and pinning it on ctx for the backward. FLYDSL is the fast default
+(gfx950); TRITON is the reference oracle and non-gfx950 fallback.
 """
 
 from typing import Optional
@@ -28,19 +20,19 @@ from primus_turbo.pytorch.core.backend import (
     BackendType,
     KernelBackend,
     TuneCache,
+    drop_unregistered_backend,
 )
 from primus_turbo.pytorch.core.utils import is_gfx950
 
-# NOTE: the flydsl/triton sparse-MLA kernels are imported lazily inside execute()
-# (not at module top) so that importing this package stays cheap and does not pull
-# in the gfx950-only flydsl sparse kernels on non-gfx950 hosts / at test collection.
+# The flydsl/triton kernels are imported lazily inside execute() so importing this package
+# stays cheap and does not pull gfx950-only kernels in on other hosts / at test collection.
 
 _DSV4_QK_DIM = 576  # kv_lora_rank(512) + rope(64)
 
 
 def _shape_ok(q: torch.Tensor, topk_indices: torch.Tensor) -> bool:
-    """DSV4 sparse-MLA shape gate shared by both backends: q head-dim 576, bf16,
-    num_heads multiple of 32, topk (padded) multiple of 32."""
+    """Shape gate shared by both backends: q head-dim 576, bf16, num_heads and (padded)
+    topk both multiples of 32."""
     _, num_heads, d_qk = q.shape
     topk = topk_indices.shape[1]
     return d_qk == _DSV4_QK_DIM and q.dtype == torch.bfloat16 and num_heads % 32 == 0 and topk % 32 == 0
@@ -154,13 +146,6 @@ class SparseMlaBwdDispatcher(AutoKernelDispatcher):
 
 
 def resolve_sparse_mla_fwd_backend(user_backend: Optional[BackendType], **kwargs) -> BackendType:
-    """Resolve the sparse-MLA backend enum (default FLYDSL, else TRITON oracle).
-
-    PRIMUS_TURBO_ATTN_BACKEND names one backend for both attention dispatchers, which do not
-    carry the same set -- sparse-MLA has no aiter path. A name this one does not have is
-    taken as no preference rather than an error, so pinning aiter for flash-attention does
-    not take sparse-MLA down with it.
-    """
-    if user_backend is not None and user_backend not in SparseMlaFwdDispatcher._backends:
-        user_backend = None
+    """Resolve the sparse-MLA backend enum (default FLYDSL, else TRITON oracle)."""
+    user_backend = drop_unregistered_backend(SparseMlaFwdDispatcher, user_backend)
     return SparseMlaFwdDispatcher.resolve(BackendType.FLYDSL, user_backend, **kwargs)

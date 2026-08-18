@@ -9,6 +9,8 @@ import torch
 
 from primus_turbo.pytorch.core.low_precision import is_fp8_dtype
 from primus_turbo.pytorch.kernels.attention.attention_impl import (
+    FlashAttnDenseDispatcher,
+    FlashAttnVarlenDispatcher,
     resolve_flash_attn_backend,
 )
 
@@ -78,16 +80,18 @@ def compute_snr(x: torch.Tensor, y: torch.Tensor):
     return 10 * torch.log10(signal_power / (noise_power + 1e-12)).detach().item()
 
 
-def skip_if_backend_cannot_take(backend, varlen=False, **kwargs):
-    """Skip the combos a pinned backend does not accept.
+def pinned_backend_takes(backend, varlen=False, **kwargs) -> bool:
+    """Whether a pinned backend implements these inputs (True when nothing is pinned).
 
-    The eligibility rules live in the resolver (head dim, GQA group, storage order, window
-    width, dtype, ...); asking it is how the skip stays in step with them instead of
-    restating them here and drifting.
+    A False also asserts the resolver refuses them outright: a backend the caller pinned must
+    never be swapped for another one behind their back. So the combos this returns False for
+    stay covered -- by that refusal -- instead of dropping out of the run as skips.
     """
     if backend is None:
-        return
-    try:
+        return True
+    dispatcher = FlashAttnVarlenDispatcher if varlen else FlashAttnDenseDispatcher
+    if dispatcher._backends[backend].impl.can_handle(**kwargs):
+        return True
+    with pytest.raises(ValueError, match="cannot handle the given inputs"):
         resolve_flash_attn_backend(varlen=varlen, user_backend=backend, **kwargs)
-    except ValueError as e:
-        pytest.skip(f"{backend.name} does not take this shape: {str(e).split(':')[0]}")
+    return False

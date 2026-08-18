@@ -455,6 +455,25 @@ def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
     )
 
 
+def drop_unregistered_backend(dispatcher, user_backend: Optional[BackendType]) -> Optional[BackendType]:
+    """Treat a backend this dispatcher has no entry for as "no preference".
+
+    One env var names a backend for several dispatchers that do not carry the same set
+    (both attention ones share PRIMUS_TURBO_ATTN_BACKEND, and only flash-attn has aiter),
+    so a name meant for its sibling must not take this one down. Say so once, since the
+    name being ignored here is otherwise indistinguishable from it being honoured.
+    """
+    if user_backend is None or user_backend in dispatcher._backends:
+        return user_backend
+    if not torch.compiler.is_compiling():
+        logger.warning(
+            f"Backend {user_backend.name} is not one of {dispatcher.__name__}'s "
+            f"({[b.name for b in dispatcher._backends]}); ignoring it for this op.",
+            once=True,
+        )
+    return None
+
+
 class AutoKernelDispatcher(ABC):  # noqa: B024
     """
     Base class for auto kernel dispatcher.

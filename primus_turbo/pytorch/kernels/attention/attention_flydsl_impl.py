@@ -3,21 +3,11 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""FlyDSL hd64 flash-attention operators (Meta shape family), gfx950 / MI355X.
+"""FlyDSL flash-attention forward/backward impls (THD varlen and SBHD), gfx950 / MI355X.
 
-Two independent operators (not fused into a single autograd op):
-
-* ``flash_attn_varlen_flydsl_forward_impl`` — native dual-wave software-pipelined
-  FlyDSL forward (``flash_attn_gfx950``). Returns O (and optionally LSE).
-* ``flash_attn_varlen_flydsl_backward_impl`` — deterministic 16x16x32 FlyDSL
-  backward (``flash_attn_bwd_rect16_kernel`` via ``flydsl_varlen_backward``).
-  Returns dQ / dK / dV.
-
-Constraints (both operators): THD/varlen packed layout with UNIFORM per-batch
-seqlens, bottom-right causal, GQA, D in {64, 128}, bf16. The softmax scale is
-baked to 1/sqrt(D) by the forward kernel; the backward takes it explicitly.
-These mirror the ``attention_aiter_impl`` / ``attention_triton_impl`` impl layer;
-higher-level dispatch/autograd wiring is intentionally left to the caller.
+Bottom-right causal, GQA, D in {64, 128}, bf16. The forward bakes softmax_scale to
+1/sqrt(D); the backward takes it explicitly. Mirrors the ``attention_aiter_impl`` /
+``attention_triton_impl`` layer -- dispatch and autograd wiring belong to the caller.
 """
 
 import functools
@@ -33,16 +23,10 @@ from primus_turbo.flydsl.attention.flash_attn_fwd import (
     build_flash_attn_dualwave_swp_module,
 )
 
-# FlyDSL builds and JIT-compiles a kernel on first use, which shells out for the GPU arch
-# and takes locks -- none of it traceable. Registering the entry points as torch custom ops
-# makes each one an opaque node instead, the way the aiter impls already are, so a compiled
-# caller neither traces into the build nor has to break its graph for it (fullgraph=True
-# forbids the break, which is what torch.compiler.disable would have cost).
-#
-# cudagraph_unsafe because the kernels keep module-level state -- the dQ split-K workspace,
-# the reduce's side stream, the cu_seqlens placeholder -- which a capture would allocate in
-# the graph pool and then hold across replays. The tag makes inductor run these eagerly
-# instead of capturing them; without it max-autotune fails on live pool pointers.
+# Custom ops so a compiled caller sees opaque nodes instead of tracing into FlyDSL's JIT
+# build (which shells out and takes locks) -- a graph break there is what fullgraph=True
+# forbids. cudagraph_unsafe because the kernels keep module-level state a capture would
+# strand in the graph pool; without it max-autotune fails on live pool pointers.
 _custom_op = functools.partial(torch.library.custom_op, tags=(torch._C.Tag.cudagraph_unsafe,))
 
 
@@ -84,19 +68,12 @@ def _check_fwd(q, k, v, softmax_scale, causal, window_size, sink, num_heads_q, h
 
 
 def _uniform_shape(cu_seqlens: "torch.Tensor", max_seqlen, total):
-    """(batch, S) iff every segment is exactly ``max_seqlen``, else None.
+    """(batch, S) iff every segment is exactly ``max_seqlen``, else None -- i.e. whether
+    the uniform rect16 fast path applies rather than the ragged one.
 
-    Routes to the rectangular rect16 fast path, which is compiled for a uniform
-    per-batch length; the ragged / block-causal path reads per-segment boundaries
-    from cu_seqlens inside the kernel instead.
-
-    The test is host-only on purpose. Every segment is <= max_seqlen (the caller's
-    contract, which the grid already relies on) and they sum to ``total``, so
-    total == batch*max_seqlen forces all of them to equal max_seqlen. Deriving it
-    from cu_seqlens instead costs a .item() -- a full device sync plus a handful of
-    tiny reduce kernels -- on EVERY backward call, which at the gpt-oss prefill
-    shape measured ~1.1% of the backward wall and blocks the host from running the
-    launch sequence ahead of the GPU.
+    Host-only on purpose: segments are <= max_seqlen and sum to ``total``, so the equality
+    forces all of them equal. Reading cu_seqlens instead costs a .item() (device sync) on
+    every backward call, ~1.1% of the backward wall at the gpt-oss prefill shape.
     """
     B = cu_seqlens.numel() - 1
     S = int(max_seqlen)
@@ -105,9 +82,8 @@ def _uniform_shape(cu_seqlens: "torch.Tensor", max_seqlen, total):
 
 @functools.lru_cache(maxsize=64)
 def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=False, has_sink=False):
-    # D in (64,128) use the tuned stagger-off config (block_m=128, waves_per_eu=2):
-    # stagger-off lifts MFMA utilization for both. The raw 8-wave build default halves
-    # occupancy; this is the same point D64 was tuned to. Other head dims keep the default.
+    # D in (64,128): stagger-off lifts MFMA utilization, and the raw 8-wave build default
+    # halves occupancy. Other head dims keep the build defaults.
     cfg = {}
     if D in (64, 128):
         cfg = dict(waves_per_eu=2, dualwave_swp_enable_stagger=False, block_m=128)
@@ -151,8 +127,8 @@ def _varlen_forward_op(
     out = torch.empty_like(q)
     stream = torch.cuda.current_stream()
     kw = dict(seq_len_kv=Skv, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_k, sink=sink, stream=stream)
-    # LSE flows through the DebugCounts slot; kernel layout is [total_q, Hq] fp32. The op's
-    # arity is fixed, so an unwanted LSE comes back empty rather than absent.
+    # LSE flows through the DebugCounts slot, [total_q, Hq] fp32. The op returns a fixed
+    # number of tensors, so an unwanted LSE comes back empty rather than absent.
     lse = torch.zeros((total_q, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
     if return_lse:
         kw["debug_counts"] = lse
@@ -182,15 +158,10 @@ def flash_attn_varlen_flydsl_forward_impl(
     return_lse=False,
     sink=None,
 ):
-    """Native FlyDSL forward. q:[total_q,Hq,D], k/v:[total_kv,Hkv,D] bf16 (THD packed).
-    Segment boundaries come from ``cu_seqlens_q/k`` -- ragged (block-causal / document
-    masking) is supported natively: the kernel reads per-segment [tok_base,tok_end)
-    from cu_seqlens and applies a per-segment bottom-right causal (offset =
-    seglen_kv-seglen_q). Uniform seqlens are just the special case where every segment
-    is equal. Grid tiles by ``max_seqlen_q``; out-of-segment tiles early-exit.
-    ``sink`` (optional [Hq] fp32) is a learned per-q-head attention sink folded into the
-    softmax denominator by the kernel. Returns O:[total_q,Hq,D] (and LSE:[total_q,Hq]
-    fp32 when ``return_lse`` -- sink-inclusive when ``sink`` is given)."""
+    """THD forward: q [total_q,Hq,D], k/v [total_kv,Hkv,D] bf16. Ragged is native -- the
+    kernel reads each segment from cu_seqlens and applies bottom-right causal per segment;
+    uniform seqlens are the special case. ``sink`` ([Hq] fp32) folds into the softmax
+    denominator. Returns O (and a sink-inclusive LSE [total_q,Hq] fp32 if ``return_lse``)."""
     Hq, D = q.shape[1], q.shape[2]
     assert cu_seqlens_q.numel() == cu_seqlens_k.numel(), "q/k batch mismatch"
     window_left = _check_fwd(q, k, v, softmax_scale, causal, window_size, sink, Hq, D)
@@ -241,7 +212,7 @@ def _varlen_backward_op(
         Bk, Skv = uk
         assert B == Bk, f"q/k batch mismatch ({B} vs {Bk})"
         # rect16 wants head-major [B,Hq,Sq]; left non-contiguous so the -log2e prescale
-        # inside the backward materialises it in ONE pass instead of copy-then-scale.
+        # inside the backward materialises it in one pass instead of copy-then-scale.
         lse_bhsq = lse.reshape(B, Sq, Hq).permute(0, 2, 1)
         grads = flydsl_varlen_backward(
             dout.contiguous(),
@@ -369,12 +340,9 @@ def flash_attn_varlen_flydsl_backward_impl(
     window_size=(-1, -1),
     sink=None,
 ):
-    """Deterministic 16x16x32 FlyDSL backward. ``lse`` is packed [total_q,Hq] fp32 (as
-    emitted by the forward) for both paths; the uniform path transposes it to [B,Hq,Sq]
-    internally. Returns dQ:[total_q,Hq,D], dK/dV:[total_kv,Hkv,D] (and dsink:[Hq] fp32
-    when ``sink`` is given -- uniform path only). ``sink`` (optional [Hq] fp32) is the
-    learned per-q-head attention sink; dQ/dK/dV are sink-agnostic (the saved LSE is
-    already sink-inclusive), only dsink is added. Ragged/block-causal has no sink."""
+    """Deterministic 16x16x32 THD backward. ``lse`` is packed [total_q,Hq] fp32 as the
+    forward emits it. Returns dQ, dK/dV (and dsink [Hq] fp32 with a ``sink``, uniform path
+    only -- dQ/dK/dV are sink-agnostic since the saved LSE already includes it)."""
     Hq, D = q.shape[1], q.shape[2]
     softmax_scale, window_left = _check_bwd(q, k, v, softmax_scale, causal, window_size, sink, Hq, D)
     dq, dk, dv, dsink = _varlen_backward_op(
@@ -422,8 +390,7 @@ def _sbhd_forward_op(
         sink=sink,
         stream=stream,
     )
-    # LSE is batch-major [B*Sq, Hq] fp32 (layout-independent of SBHD q/k/v). The op's
-    # arity is fixed, so an unwanted LSE comes back empty rather than absent.
+    # LSE is batch-major [B*Sq, Hq] fp32, independent of the SBHD q/k/v layout.
     lse = torch.zeros((B * Sq, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
     if return_lse:
         kw["debug_counts"] = lse
@@ -448,11 +415,9 @@ def flash_attn_sbhd_flydsl_forward_impl(
     return_lse=False,
     sink=None,
 ):
-    """Native SBHD FlyDSL forward. q:[Sq,B,Hq,D], k/v:[Skv,B,Hkv,D] bf16 (the trace
-    layout -- batch interleaved inside the seq axis). NO permute/copy: the kernel
-    addresses SBHD directly via a compile-time SBHD trait + runtime seq-step stride
-    (B*H*D). ``sink`` (optional [Hq] fp32) is folded into the softmax denominator.
-    Returns O:[Sq,B,Hq,D] (and LSE:[B*Sq,Hq] fp32, sink-inclusive, when ``return_lse``)."""
+    """SBHD forward: q [Sq,B,Hq,D], k/v [Skv,B,Hkv,D] bf16. No permute/copy -- the kernel
+    addresses SBHD via a compile-time trait plus a runtime seq-step stride. Returns O (and
+    LSE [B*Sq,Hq] fp32 when ``return_lse``)."""
     Hq, D = q.shape[2], q.shape[3]
     window_left = _check_fwd(q, k, v, softmax_scale, causal, window_size, sink, Hq, D, sbhd=True)
     out, lse = _sbhd_forward_op(q, k, v, window_left, bool(return_lse), sink)
@@ -493,7 +458,6 @@ def _sbhd_backward_op(
         sbhd=True,
         sink=sink,
     )
-    # The op's arity is fixed, so a run without a sink returns an empty dsink.
     dsink = grads[3] if len(grads) > 3 else lse.new_empty((0,))
     return grads[0], grads[1], grads[2], dsink
 
@@ -521,13 +485,9 @@ def flash_attn_sbhd_flydsl_backward_impl(
     window_size=(-1, -1),
     sink=None,
 ):
-    """Native SBHD deterministic 16x16x32 FlyDSL backward. q/dout/out:[Sq,B,Hq,D],
-    k/v:[Skv,B,Hkv,D] bf16; ``lse`` is natural-log softmax LSE in [B,Hq,Sq] fp32.
-    NO permute/copy: SBHD is addressed natively and the dk/dv workspace is laid out
-    so the slot reduction is contiguous. Returns dQ:[Sq,B,Hq,D], dK/dV:[Skv,B,Hkv,D]
-    (and dsink:[Hq] fp32 when ``sink`` is given). ``sink`` (optional [Hq] fp32) is the
-    learned per-q-head attention sink; dQ/dK/dV are sink-agnostic (saved LSE is already
-    sink-inclusive), only dsink is added."""
+    """SBHD deterministic 16x16x32 backward; ``lse`` is [B,Hq,Sq] fp32 natural-log. No
+    permute/copy -- SBHD is addressed natively and the dk/dv workspace is laid out so the
+    slot reduction is contiguous. Returns dQ, dK/dV (and dsink [Hq] fp32 with a ``sink``)."""
     Hq, D = q.shape[2], q.shape[3]
     softmax_scale, window_left = _check_bwd(
         q, k, v, softmax_scale, causal, window_size, sink, Hq, D, sbhd=True

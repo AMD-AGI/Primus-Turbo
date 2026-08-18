@@ -5,18 +5,14 @@
 ###############################################################################
 """Unified multi-backend selection for dense flash-attention (bf16).
 
-Mirrors the GEMM multi-backend convention (``kernels/gemm/gemm_impl.py``):
-``KernelBackend`` subclasses (``can_handle`` / ``execute``) registered in an
-``AutoKernelDispatcher`` and selected by ``GlobalBackendManager`` /
+Mirrors the GEMM convention (``kernels/gemm/gemm_impl.py``): ``KernelBackend`` subclasses
+registered in an ``AutoKernelDispatcher``, selected by ``GlobalBackendManager`` /
 ``PRIMUS_TURBO_ATTN_BACKEND`` / autotune.
 
-Attention differs from GEMM in that a forward+backward pair must run on the
-*same* backend (their saved-tensor / LSE conventions differ). The op layer
-(``ops/attention/flash_attn_interface.py``) resolves it once per call via
-``resolve_flash_attn_backend`` and hands the enum to a single dispatching
-``autograd.Function``, which carries it on ctx -- so the backward cannot pick a
-different one. ``execute`` here runs the forward only; it exists so autotune can
-time each backend. FP8 (triton) stays on its own ``flash_attn_fp8_func`` path.
+Unlike GEMM, a forward+backward pair must run on the *same* backend (saved-tensor and LSE
+conventions differ), so the op layer resolves once per call and carries the enum on ctx.
+``execute`` here runs the forward only; it exists so autotune can time each backend.
+FP8 (triton) stays on its own ``flash_attn_fp8_func`` path.
 """
 
 import math
@@ -30,6 +26,7 @@ from primus_turbo.pytorch.core.backend import (
     BackendType,
     KernelBackend,
     TuneCache,
+    drop_unregistered_backend,
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
@@ -42,13 +39,10 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
 )
 
 _GFX950 = (9, 5)
-# Narrowest left window the FlyDSL backward is correct on. The fused path picks its kv band
-# from the window (_fuse_blockkv_for rounds W down to a power of two), and the dQ reduce takes
-# the low edge of a q BLOCK's band range, not of each row -- which only agrees with what the
-# body wrote while a band covers whole q blocks. Below BLOCK_Q=64 the band is narrower than the
-# block, odd bands start mid-block, and the reduce then sums a band that wrote only the block's
-# first half: dQ picks up whatever was in the workspace (NaN, in a suite that ran before it).
-# Narrower windows go to aiter.
+# Narrowest left window the FlyDSL backward is correct on. The kv band comes from the window
+# rounded down to a power of two, and the dQ reduce takes the low edge of a whole q BLOCK's
+# band range. Below BLOCK_Q=64 a band is narrower than the block, so odd bands start mid-block
+# and the reduce sums workspace the body never wrote (NaN). Narrower windows go to aiter.
 _MIN_FLYDSL_WINDOW = 64
 
 
@@ -58,18 +52,15 @@ def _scale_ok(softmax_scale: Optional[float], head_dim: int) -> bool:
 
 
 def _sink_ok(sink: Optional[torch.Tensor], num_heads_q: int) -> bool:
-    """FlyDSL folds a learned per-q-head attention sink into the softmax denominator; it
-    must be an fp32 [Hq] tensor. None (no sink) is always fine; a malformed sink falls
-    back to aiter."""
+    """A sink must be fp32 [Hq] for FlyDSL to fold it into the softmax denominator; None
+    (no sink) is fine, anything else falls back to aiter."""
     return sink is None or (sink.dtype == torch.float32 and sink.numel() == num_heads_q)
 
 
 def _gqa_group_ok(num_heads_q: int, num_heads_kv: int) -> bool:
-    """FlyDSL deterministic dkdv backward (BLOCK_SIZE=256, BLOCK_Q=64) needs the GQA
-    group size G = Hq // Hkv to be a power of two in [8, 256]: its LDS-staged (delta,
-    lse) load uses LD_VEC = BLOCK_Q // (BLOCK_SIZE // G) = 64 // (256 // G), which must
-    be >= 2 (G >= 8) for the cooperative vector store. MHA (G==1) and small/non-power-of-2
-    groups fall back to aiter."""
+    """The deterministic dkdv backward needs G = Hq // Hkv to be a power of two in [8, 256]:
+    its LDS-staged (delta, lse) load uses LD_VEC = 64 // (256 // G), which must be >= 2.
+    MHA and small/non-power-of-2 groups fall back to aiter."""
     if num_heads_kv <= 0 or num_heads_q % num_heads_kv != 0:
         return False
     g = num_heads_q // num_heads_kv
@@ -87,13 +78,7 @@ def _flydsl_common_ok(
 ) -> bool:
     """Shared FlyDSL eligibility gate (gfx950, causal, D in {64,128}, bf16, ...).
 
-    Both D=64 and D=128 are supported: the fwd handles D in {64,128}, and the
-    deterministic 16x16 backward's LDS pack is now D-dependent -- D64 packs two
-    64-wide rows per 128-wide block, D128 uses one 128-wide row per block. Other
-    head dims fall back to aiter.
-
-    ``sink`` is validated separately (``_sink_ok``) where Hq is known: FlyDSL folds a
-    learned per-head sink into the softmax denominator, so a valid sink stays on FlyDSL.
+    ``sink`` and the GQA group are checked separately, where Hq is known.
     """
     head_dim = q.shape[-1]
     return (
@@ -170,10 +155,9 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         sink=None,
         **kwargs,
     ) -> bool:
-        # FlyDSL dense forward is SBHD-native and copies nothing, so what it needs is for
-        # the [s,b,h,d] view of these [b,s,h,d]-shaped tensors to be contiguous -- which is
-        # the test, rather than a storage-order name. It holds for sbhd bytes at any batch,
-        # and at b == 1 for bshd bytes too, those being the same bytes.
+        # SBHD-native and copy-free, so the requirement is that the [s,b,h,d] view of these
+        # [b,s,h,d]-shaped tensors be contiguous -- not that a storage order be named. True
+        # for sbhd bytes at any batch, and at b == 1 for bshd bytes, being the same bytes.
         if (
             k is None
             or v is None
@@ -187,8 +171,7 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
 
     @staticmethod
     def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
-        # Same [b,s,h,d] tensors the eligibility check saw (this runs under autotune, off
-        # the op layer's path), so the sbhd view is taken here as well.
+        # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
         return flash_attn_sbhd_flydsl_forward_impl(
             q,
@@ -366,4 +349,5 @@ class FlashAttnVarlenDispatcher(AutoKernelDispatcher):
 def resolve_flash_attn_backend(varlen: bool, user_backend: Optional[BackendType], **kwargs) -> BackendType:
     """Resolve the dense/varlen flash-attn backend enum (default FLYDSL, else AITER)."""
     dispatcher = FlashAttnVarlenDispatcher if varlen else FlashAttnDenseDispatcher
+    user_backend = drop_unregistered_backend(dispatcher, user_backend)
     return dispatcher.resolve(BackendType.FLYDSL, user_backend, **kwargs)

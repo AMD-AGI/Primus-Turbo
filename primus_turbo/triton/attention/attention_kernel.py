@@ -1196,8 +1196,12 @@ def _bwd_kernel_dkdv(
         do_descale_offset = None
 
     if CAUSAL:
-        causal_boundary = start_n * BLOCK_N - BLOCK_M
-        lo = (causal_boundary + 1) // BLOCK_M * BLOCK_M
+        # The mask below is bottom-right aligned (col_offset = N_CTX_Q - N_CTX_K), so the
+        # first unmasked q row for this k block moves with that offset too. Leaving it out
+        # skipped every m block past N_CTX_Q on a rectangular shape, zeroing most of dk/dv.
+        # Clamped before the divide so a negative boundary does not depend on how // rounds.
+        causal_boundary = start_n * BLOCK_N + (N_CTX_Q - N_CTX_K) - BLOCK_M
+        lo = tl.maximum(causal_boundary + 1, 0) // BLOCK_M * BLOCK_M
 
     else:
         causal_boundary = 0
@@ -1570,8 +1574,12 @@ def _bwd_kernel_dq(
         v_descale = 1.0
 
     if CAUSAL:
+        # Bottom-right aligned, as in the dk/dv kernel: the last unmasked k for this q block
+        # is at N_CTX_K - N_CTX_Q past the top-left one. Without it dq saw only the first
+        # N_CTX_Q keys of a longer context.
         causal_boundary = start_m * BLOCK_M - BLOCK_N
-        hi = (tl.minimum(BLOCK_M // BLOCK_N * (start_m + 1), num_block_n)) * BLOCK_N  # start_n == start_m
+        n_end = (start_m + 1) * BLOCK_M + (N_CTX_K - N_CTX_Q)
+        hi = tl.minimum(tl.cdiv(tl.maximum(n_end, 0), BLOCK_N), num_block_n) * BLOCK_N
 
     else:
         causal_boundary = 0

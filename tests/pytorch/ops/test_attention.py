@@ -22,7 +22,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
 )
 from primus_turbo.pytorch.ops import flash_attn_fp8_func, flash_attn_func
 from primus_turbo.pytorch.ops.attention.attention_utils import (
-    _infer_storage_order,
+    _infer_qkv_format,
     block_scaling_node,
 )
 from tests.pytorch.ref.attention_ref import (
@@ -30,7 +30,7 @@ from tests.pytorch.ref.attention_ref import (
     attention_vanilla_forward_pytorch_ref_impl,
     attention_with_sink_ref_impl,
 )
-from tests.pytorch.test_utils import compute_snr, skip_if_backend_cannot_take
+from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
 test_cases = [
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
@@ -149,6 +149,26 @@ def test_attention_16bit(
     sink_ref = None
     if enable_sink:
         sink = torch.randn((num_head_q,), device=device, dtype=torch.float32, requires_grad=True)
+
+    # Ahead of the reference, which is the expensive part and pointless for a combo the
+    # pinned backend does not implement (that case is covered by the refusal assert inside).
+    if not pinned_backend_takes(
+        backend,
+        q=query,
+        k=key,
+        v=value,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=window_size,
+        bias=None,
+        alibi_slopes=None,
+        sink=sink,
+        qkv_format=_infer_qkv_format(query, key, value),
+    ):
+        return
+
+    if enable_sink:
         sink_ref = sink.clone().detach().requires_grad_()
         o_ref = attention_with_sink_ref_impl(
             query_ref,
@@ -166,20 +186,6 @@ def test_attention_16bit(
         )
 
     o_ref.backward(grad_out_ref)
-    skip_if_backend_cannot_take(
-        backend,
-        q=query,
-        k=key,
-        v=value,
-        dropout_p=0.0,
-        softmax_scale=sm_scale,
-        causal=causal,
-        window_size=window_size,
-        bias=None,
-        alibi_slopes=None,
-        sink=sink,
-        qkv_format=_infer_storage_order(query, key, value),
-    )
     GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
     try:
         o = flash_attn_func(
@@ -277,6 +283,24 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal, backend):
 
     sm_scale = head_dim_qk ** (-0.5)
 
+    # Ahead of the reference, which is the expensive part and pointless for a combo the
+    # pinned backend does not implement (that case is covered by the refusal assert inside).
+    if not pinned_backend_takes(
+        backend,
+        q=q0,
+        k=k0,
+        v=v0,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+        qkv_format="bshd",
+    ):
+        return
+
     # Correctness check against reference implementation
     q_ref = q0.clone().detach().requires_grad_()
     k_ref = k0.clone().detach().requires_grad_()
@@ -315,9 +339,13 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal, backend):
     # Determinism check (bitwise identical across multiple runs).
     repeats = 10
     outs = []
-    for _ in range(repeats):
-        outs.append(_run_once())
-        torch.cuda.synchronize()
+    GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    try:
+        for _ in range(repeats):
+            outs.append(_run_once())
+            torch.cuda.synchronize()
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
 
     o1, dq1, dk1, dv1 = outs[0]
     for i in range(1, repeats):
@@ -346,12 +374,6 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal, backend):
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
 def test_attention_fp8(batch, dtype, config, causal):
-    if causal and config.seqlen_q != config.seqlen_kv:
-        # The fp8 triton path disagrees with the bottom-right causal reference on a query
-        # chunk against a longer kv context (dq SNR 0.69 at 512x2048), which reads as a
-        # top-left aligned mask. Left to that path's owner; the 16-bit backends are fine.
-        pytest.skip("fp8 attention does not match bottom-right causal on a rectangular shape")
-
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,

@@ -16,7 +16,7 @@ from primus_turbo.pytorch.core.backend import (
 )
 from primus_turbo.pytorch.ops import flash_attn_varlen_func
 from tests.pytorch.ref.attention_ref import attention_varlen_forward_pytorch_ref_impl
-from tests.pytorch.test_utils import compute_snr, skip_if_backend_cannot_take
+from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
 
 def _build_cu_seqlens(seqlens: List[int], device: str) -> Tuple[torch.Tensor, int, int]:
@@ -79,12 +79,9 @@ def test_flash_attn_varlen(
     sm_scale = head_dim ** (-0.5)
     window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
 
-    o_ref = attention_varlen_forward_pytorch_ref_impl(
-        q_ref, k_ref, v_ref, cu_seqlens_q, cu_seqlens_k, sm_scale, causal, window_size=window_size
-    )
-    o_ref.backward(grad_out)
-
-    skip_if_backend_cannot_take(
+    # Ahead of the reference, which is the expensive part and pointless for a combo the
+    # pinned backend does not implement (that case is covered by the refusal assert inside).
+    if not pinned_backend_takes(
         backend,
         varlen=True,
         q=q,
@@ -101,7 +98,14 @@ def test_flash_attn_varlen(
         bias=None,
         alibi_slopes=None,
         sink=None,
+    ):
+        return
+
+    o_ref = attention_varlen_forward_pytorch_ref_impl(
+        q_ref, k_ref, v_ref, cu_seqlens_q, cu_seqlens_k, sm_scale, causal, window_size=window_size
     )
+    o_ref.backward(grad_out)
+
     GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
     try:
         o = flash_attn_varlen_func(
