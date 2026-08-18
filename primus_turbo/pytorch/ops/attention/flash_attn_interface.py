@@ -102,6 +102,14 @@ class FlashAttnFunc(torch.autograd.Function):
         if backend == BackendType.HIPKITTENS:
             # Same sbhd precondition as FlyDSL below, and for the same reason.
             assert _sbhd_layout(q, qkv_format), f"hipkittens dense attention is sbhd only, got {qkv_format}"
+            if return_softmax:
+                raise ValueError("hipkittens attention does not support return_attn_probs/return_softmax")
+            if dropout_p != 0.0:
+                raise ValueError("hipkittens attention does not implement dropout")
+            if bias is not None or alibi_slopes is not None:
+                raise ValueError("hipkittens attention does not implement bias/alibi")
+            if sink is not None:
+                raise ValueError("hipkittens attention does not implement a learned sink")
             q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
             out_s, lse = flash_attn_sbhd_hipkittens_forward_impl(
                 q_s,

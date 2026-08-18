@@ -69,9 +69,9 @@ class BackendType(Enum):
     DEEP_EP = auto()
     TURBO = auto()
     FLYDSL = auto()
-    # HipKittens attention. gfx950-only and compiled only on gfx950, so it is absent from
-    # every other build; the dispatcher's can_handle reports that rather than raising on
-    # import.
+    # HipKittens attention. gfx950-only at runtime: the kernels are built into the shared extension
+    # in all arch configurations but are guarded on __gfx950__ and must be capability-gated before
+    # launch (see is_gfx950()/hipkittens_attn_supported).
     HIPKITTENS = auto()
 
 
