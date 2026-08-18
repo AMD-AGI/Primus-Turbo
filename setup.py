@@ -378,6 +378,12 @@ def build_kernels_extension():
 
     kernels_source_files = Path(PROJECT_ROOT / "csrc" / "kernels")
     kernels_sources = all_files_in_dir(kernels_source_files, name_extensions=["cpp", "cc", "cu"])
+    # HipKittens lives under csrc/kernels but is built by build_hipkittens_extension, which is
+    # the only place its one-arch flag set is correct. Compiling it here as well would hand it
+    # this build's whole --offload-arch list; see hipkittens_enabled().
+    kernels_sources = [
+        s for s in kernels_sources if "/attention/hipkittens/" not in str(s).replace(os.sep, "/")
+    ]
 
     include_dirs = [
         Path(PROJECT_ROOT / "csrc"),
@@ -410,6 +416,66 @@ def build_kernels_extension():
     )
 
 
+def hipkittens_enabled():
+    """Whether the HipKittens attention kernels are compiled into this build.
+
+    gfx950 (CDNA4) only, and unlike the CK backend this cannot ride the usual per-file arch
+    filter. That filter keys on the `_gfx950.cu` suffix but the resulting sources are then
+    compiled with the WHOLE build's --offload-arch list, and PRIMUS_TURBO_GFX950 is defined
+    per build rather than per compiled arch -- so in a gfx942+gfx950 build the HipKittens
+    sources would also be compiled for gfx942, whose ISA their CDNA4 assumptions do not
+    survive. They therefore get their own extension below, carrying only
+    --offload-arch=gfx950, and are skipped entirely when gfx950 is not requested.
+    """
+    offload_arch_list, _ = get_offload_archs()
+    return "--offload-arch=gfx950" in offload_arch_list
+
+
+def build_hipkittens_extension():
+    """The HipKittens attention kernels, as their own gfx950-only torch extension.
+
+    Separate from primus_turbo.pytorch._C because the flags differ in ways that cannot be
+    reconciled with a multi-arch build: exactly one --offload-arch, -DKITTENS_CDNA4, and
+    HipKittens' own include tree. It still registers plain torch ops, so callers reach it
+    through torch.ops.primus_turbo_hipkittens like any other backend.
+    """
+    if not BUILD_TORCH or not hipkittens_enabled():
+        return None
+
+    from torch.utils.cpp_extension import CUDAExtension
+
+    # Deliberately NOT get_common_flags(): that carries the whole build's arch list.
+    cxx_flags = ["-O3", "-std=c++20", "-Wno-unknown-warning-option", "-DKITTENS_CDNA4"]
+    nvcc_flags = [
+        "-O3",
+        "-std=c++20",
+        "-w",  # HipKittens' own headers are noisy; its Makefile does the same.
+        "-ffast-math",
+        "-DKITTENS_CDNA4",
+        "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
+        "--offload-arch=gfx950",
+    ]
+    max_jobs = int(os.getenv("MAX_JOBS", "64"))
+    nvcc_flags.append(f"-parallel-jobs={max_jobs}")
+
+    hk_sources = sorted(
+        str(p) for p in Path(PROJECT_ROOT / "csrc" / "kernels" / "attention" / "hipkittens").glob("*.cu")
+    )
+    hk_sources.append(str(PROJECT_ROOT / "csrc" / "pytorch" / "hipkittens" / "attention.cpp"))
+
+    return CUDAExtension(
+        name="primus_turbo.pytorch._C_hipkittens",
+        sources=hk_sources,
+        include_dirs=[
+            Path(PROJECT_ROOT / "csrc"),
+            Path(PROJECT_ROOT / "csrc" / "include"),
+            Path(PROJECT_ROOT / "3rdparty" / "hipkittens" / "include"),
+        ],
+        extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
+        extra_link_args=["--offload-arch=gfx950"],
+    )
+
+
 def build_torch_extension():
     if not BUILD_TORCH:
         return None
@@ -432,6 +498,9 @@ def build_torch_extension():
     # CPP
     pytorch_csrc_source_files = Path(PROJECT_ROOT / "csrc" / "pytorch")
     sources = all_files_in_dir(pytorch_csrc_source_files, name_extensions=["cpp", "cc", "cu"])
+    # The HipKittens op registration belongs to its own extension, which is where the kernels
+    # it calls are linked; see build_hipkittens_extension.
+    sources = [s for s in sources if "/pytorch/hipkittens/" not in str(s).replace(os.sep, "/")]
 
     return CUDAExtension(
         name="primus_turbo.pytorch._C",
@@ -498,7 +567,8 @@ if __name__ == "__main__":
 
     torch_ext = build_torch_extension()
     jax_ext = build_jax_extension()
-    ext_modules = [kernels_ext] + [e for e in (torch_ext, jax_ext) if e is not None]
+    hk_ext = build_hipkittens_extension()
+    ext_modules = [kernels_ext] + [e for e in (torch_ext, jax_ext, hk_ext) if e is not None]
 
     # Entry points and Install Requires
     entry_points = {}

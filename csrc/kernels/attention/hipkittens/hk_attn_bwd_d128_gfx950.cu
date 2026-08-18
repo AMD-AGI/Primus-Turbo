@@ -1,7 +1,15 @@
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (c) 2025 HipKittens Project Contributors
+ *
+ * Adapted from HipKittens (https://github.com/HazyResearch/HipKittens).
+ * Modified by the Primus-Turbo team.
+ **************************************************************************************************/
+
 // Flash-attention BACKWARD for gfx950, head dim 128.
 //
-// THIS SOURCE BUILDS THE D=128 MODULE `hk_attn_bwd_d128` AND NOTHING ELSE. Head dim 64
-// lives in hk_attn_bwd_d64.cpp and builds its own module, so the two head dims can be
+// THIS SOURCE CARRIES THE D=128 BACKWARD AND NOTHING ELSE. Head dim 64 lives in
+// hk_attn_bwd_d64_gfx950.cu, so the two head dims can be
 // optimized, rebuilt and broken independently.
 //
 // READ THIS BEFORE TRUSTING ANY NUMBER QUOTED IN A COMMENT BELOW. This file began as a copy
@@ -78,10 +86,13 @@
 //      itself, for the same reason one level down. Worth +1.85%.
 
 #include "kittens.cuh"
-#include "pyutils/pyutils.cuh"
+#include "primus_turbo/hipkittens/attention.h"
+#include "primus_turbo/hipkittens/tensor_gl.h"
 
 using namespace kittens;
-using namespace pybind11::literals;
+
+namespace primus_turbo::hipkittens {
+namespace {
 
 using _gl_QKVO = gl<bf16, -1, -1, -1, -1>;
 using _gl_L = gl<float, -1, -1, -1, -1>;
@@ -3689,23 +3700,23 @@ __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dqred_ker(
 // way to pass runtime scalars, so the bindings are written out by hand.
 // ---------------------------------------------------------------------------------
 template <int D>
-static void launch_bwd(pybind11::object q, pybind11::object k, pybind11::object v,
-                       pybind11::object o, pybind11::object dO, pybind11::object dq,
-                       pybind11::object dk, pybind11::object dv, pybind11::object lse,
-                       pybind11::object delta, pybind11::object lneg, pybind11::object wsk,
-                       pybind11::object wsv, int Sq, int Skv, int B, int Hq, int Hkv,
+static void launch_bwd(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                       const at::Tensor &o, const at::Tensor &dO, const at::Tensor &dq,
+                       const at::Tensor &dk, const at::Tensor &dv, const at::Tensor &lse,
+                       const at::Tensor &delta, const at::Tensor &lneg, const at::Tensor &wsk,
+                       const at::Tensor &wsv, int Sq, int Skv, int B, int Hq, int Hkv,
                        int window_left, float softmax_scale, int n_split_req) {
-    auto Qg = py::from_object<_gl_QKVO>::make(q);
-    auto Kg = py::from_object<_gl_QKVO>::make(k);
-    auto Vg = py::from_object<_gl_QKVO>::make(v);
-    auto Og = py::from_object<_gl_QKVO>::make(o);
-    auto dOg = py::from_object<_gl_QKVO>::make(dO);
-    auto dQg = py::from_object<_gl_QKVO>::make(dq);
-    auto dKg = py::from_object<_gl_QKVO>::make(dk);
-    auto dVg = py::from_object<_gl_QKVO>::make(dv);
-    auto Lg = py::from_object<_gl_L>::make(lse);
-    auto Dg = py::from_object<_gl_L>::make(delta);
-    auto Lng = py::from_object<_gl_L>::make(lneg);
+    auto Qg = make_gl_from_tensor<_gl_QKVO>(q, "q");
+    auto Kg = make_gl_from_tensor<_gl_QKVO>(k, "k");
+    auto Vg = make_gl_from_tensor<_gl_QKVO>(v, "v");
+    auto Og = make_gl_from_tensor<_gl_QKVO>(o, "o");
+    auto dOg = make_gl_from_tensor<_gl_QKVO>(dO, "dO");
+    auto dQg = make_gl_from_tensor<_gl_QKVO>(dq, "dq");
+    auto dKg = make_gl_from_tensor<_gl_QKVO>(dk, "dk");
+    auto dVg = make_gl_from_tensor<_gl_QKVO>(dv, "dv");
+    auto Lg = make_gl_from_tensor<_gl_L>(lse, "lse");
+    auto Dg = make_gl_from_tensor<_gl_L>(delta, "delta");
+    auto Lng = make_gl_from_tensor<_gl_L>(lneg, "lneg");
 
     // The variant ladder, read once. Same shape as the HK_BWD_DQ_* knobs: every rung is a
     // compile-time template argument and the env var only picks which instantiation is
@@ -3908,8 +3919,8 @@ static void launch_bwd(pybind11::object q, pybind11::object k, pybind11::object 
     // (kv head, batch) on the fast axes, (kv block, split) on the slowest with the split on
     // the fast PART of z -- see the decode in the kernel. gridDim.z caps kv_blocks*n_split
     // at 65535; the worst meta row is 128 * 8 = 1024.
-    auto WSKg = n_split > 1 ? py::from_object<_gl_QKVO>::make(wsk) : dKg;
-    auto WSVg = n_split > 1 ? py::from_object<_gl_QKVO>::make(wsv) : dVg;
+    auto WSKg = n_split > 1 ? make_gl_from_tensor<_gl_QKVO>(wsk, "wsk") : dKg;
+    auto WSVg = n_split > 1 ? make_gl_from_tensor<_gl_QKVO>(wsv, "wsv") : dVg;
     const bool b11b =
         dkdv_use_b11b(Sq, Skv, B, Hq, Hkv, window_left, D, n_split, vm_b11b(vm));
     const dim3 dkdv_grid = b11b ? dim3(Hkv, kv_blocks * n_split, B)
@@ -4023,22 +4034,22 @@ static void launch_bwd(pybind11::object q, pybind11::object k, pybind11::object 
 // Same prep kernel and same delta layout as the split path, so the two are interchangeable
 // per call and the wrapper can pick on a shape property.
 template <int D>
-static void launch_bwd_fused(pybind11::object q, pybind11::object k, pybind11::object v,
-                             pybind11::object o, pybind11::object dO, pybind11::object dq,
-                             pybind11::object dk, pybind11::object dv, pybind11::object ws,
-                             pybind11::object lse, pybind11::object delta, int Sq, int Skv,
+static void launch_bwd_fused(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                             const at::Tensor &o, const at::Tensor &dO, const at::Tensor &dq,
+                             const at::Tensor &dk, const at::Tensor &dv, const at::Tensor &ws,
+                             const at::Tensor &lse, const at::Tensor &delta, int Sq, int Skv,
                              int B, int Hq, int Hkv, int window_left, float softmax_scale) {
-    auto Qg = py::from_object<_gl_QKVO>::make(q);
-    auto Kg = py::from_object<_gl_QKVO>::make(k);
-    auto Vg = py::from_object<_gl_QKVO>::make(v);
-    auto Og = py::from_object<_gl_QKVO>::make(o);
-    auto dOg = py::from_object<_gl_QKVO>::make(dO);
-    auto dQg = py::from_object<_gl_QKVO>::make(dq);
-    auto dKg = py::from_object<_gl_QKVO>::make(dk);
-    auto dVg = py::from_object<_gl_QKVO>::make(dv);
-    auto WSg = py::from_object<_gl_QKVO>::make(ws);
-    auto Lg = py::from_object<_gl_L>::make(lse);
-    auto Dg = py::from_object<_gl_L>::make(delta);
+    auto Qg = make_gl_from_tensor<_gl_QKVO>(q, "q");
+    auto Kg = make_gl_from_tensor<_gl_QKVO>(k, "k");
+    auto Vg = make_gl_from_tensor<_gl_QKVO>(v, "v");
+    auto Og = make_gl_from_tensor<_gl_QKVO>(o, "o");
+    auto dOg = make_gl_from_tensor<_gl_QKVO>(dO, "dO");
+    auto dQg = make_gl_from_tensor<_gl_QKVO>(dq, "dq");
+    auto dKg = make_gl_from_tensor<_gl_QKVO>(dk, "dk");
+    auto dVg = make_gl_from_tensor<_gl_QKVO>(dv, "dv");
+    auto WSg = make_gl_from_tensor<_gl_QKVO>(ws, "ws");
+    auto Lg = make_gl_from_tensor<_gl_L>(lse, "lse");
+    auto Dg = make_gl_from_tensor<_gl_L>(delta, "delta");
 
     constexpr size_t bwd_smem = 2 * sizeof(bw_qo_tile<D>) + sizeof(bw_ds_tile);
     static_assert(bwd_smem <= kittens::MAX_SHARED_MEMORY, "fused staging exceeds LDS");
@@ -4070,51 +4081,45 @@ static void launch_bwd_fused(pybind11::object q, pybind11::object k, pybind11::o
         ws_ptr, dq_ptr, n_bands, q_tiles, B * Hq, Sq, Skv - Sq, window_left);
 }
 
-PYBIND11_MODULE(hk_attn_bwd_d128, m) {
-    m.doc() = "Flash-attention backward, head dim 128 (SBHD, causal + sliding window)";
-    // The wrapper zero-pads Sq/Skv to the lcm of these before the launch, and a disagreement
-    // reads PAST THE END of a tensor rather than failing, so they are exported and checked
-    // against the wrapper's table rather than duplicated on trust. Now that each head dim is
-    // its own kernel the two may diverge, which is exactly why this is a per-module export.
-    m.attr("DQ_Q_BLOCK") = DQ_Q_BLOCK;
-    m.attr("DQ_KV_BLOCK") = DQ_KV_BLOCK;
-    m.attr("DKDV_Q_BLOCK") = DKDV_Q_BLOCK;
-    m.attr("DKDV_KV_BLOCK") = DKDV_KV_BLOCK;
-    m.attr("PREP_Q_BLOCK") = PREP_Q_BLOCK;
-    m.attr("FUSED_Q_BLOCK") = BW_Q_BLOCK;
-    m.attr("FUSED_KV_BLOCK") = BW_KV_BLOCK;
-    m.attr("HEAD_DIM") = 128;
-    m.def("bwd_d128", &launch_bwd<128>, "q"_a, "k"_a, "v"_a, "o"_a, "do"_a, "dq"_a, "dk"_a, "dv"_a,
-          "lse"_a, "delta"_a, "lneg"_a, "wsk"_a, "wsv"_a, "Sq"_a, "Skv"_a, "B"_a, "Hq"_a, "Hkv"_a,
-          "window_left"_a, "softmax_scale"_a, "n_split_req"_a);
-    // Bound so the wrapper -- which allocates the partials tensor -- is the single decision
-    // point. The result must be memoised on the shape by the caller: stage 2 simulates the
-    // per-XCD dispatch and a 0.4 ms kernel cannot pay for that per launch.
-    // Exported so the wrapper reads the launcher's instantiation set instead of keeping a
-    // second copy of it. A wrapper that asks for an NSPLIT with no `case` sizes the
-    // partials tensor for a split the kernel does not perform -- see dkdv_split_instantiated.
-    m.def("dkdv_split_instantiated", &dkdv_split_instantiated, "n_split"_a);
-    m.def("dkdv_head_split", &dkdv_head_split, "Sq"_a, "Skv"_a, "B"_a, "Hq"_a, "Hkv"_a,
-          "window_left"_a, "D"_a);
-    m.def("dkdv_ws_bytes", &dkdv_ws_bytes, "Skv"_a, "B"_a, "Hkv"_a, "D"_a, "n_split"_a);
-    // Bound for the gate: the sweep has to be able to assert which branch of the dq
-    // predicate each shape takes without launching anything.
-    m.def("dq_shape_config",
-          [](int Sq, int Skv, int B, int Hq, int Hkv, int window_left, int D) {
-              int h = 1, k = DQ_KV_BLOCK;
-              // vm_w1(bwd_vm()), not a default: the gate must assert which instantiation the
-              // SHIPPED selector reaches at the rung under test.
-              dq_shape_config(Sq, Skv, B, Hq, Hkv, window_left, D, &h, &k,
-                              vm_w1(bwd_vm()));
-              return pybind11::make_tuple(h, k);
-          },
-          "Sq"_a, "Skv"_a, "B"_a, "Hq"_a, "Hkv"_a, "window_left"_a, "D"_a);
-    // Kept, though the wrapper's _use_fused() declines D=128 unconditionally (the fused
-    // kernel spills 92 VGPRs / 372 B of scratch there against far less on the split pair).
-    // It is exported so this module's API is the D=128 half of what the combined build
-    // exported, and so that the resource report prices it. Deleting it would be a
-    // compile-time-only change.
-    m.def("bwd_fused_d128", &launch_bwd_fused<128>, "q"_a, "k"_a, "v"_a, "o"_a, "do"_a, "dq"_a,
-          "dk"_a, "dv"_a, "ws"_a, "lse"_a, "delta"_a, "Sq"_a, "Skv"_a, "B"_a, "Hq"_a, "Hkv"_a,
-          "window_left"_a, "softmax_scale"_a);
+}  // namespace
+
+// The block sizes the Python wrapper pads Sq/Skv to (it uses the lcm of them). A disagreement
+// between the two reads PAST THE END of a tensor rather than failing, so they are reported
+// here and checked there rather than duplicated on trust.
+void hk_attn_bwd_d128_blocks(HkBwdBlocks *out) {
+    out->dq_q = DQ_Q_BLOCK;
+    out->dq_kv = DQ_KV_BLOCK;
+    out->dkdv_q = DKDV_Q_BLOCK;
+    out->dkdv_kv = DKDV_KV_BLOCK;
+    out->prep_q = PREP_Q_BLOCK;
+    out->fused_q = BW_Q_BLOCK;
+    out->fused_kv = BW_KV_BLOCK;
 }
+
+// Exposed so the Python layer -- which allocates the dK/dV partials tensor -- is the single
+// decision point on how deep to split. Memoise it on the shape: stage 2 simulates the per-XCD
+// dispatch, which a sub-millisecond kernel cannot pay for on every launch.
+int hk_attn_bwd_d128_dkdv_head_split(int Sq, int Skv, int B, int Hq, int Hkv, int window_left) {
+    return dkdv_head_split(Sq, Skv, B, Hq, Hkv, window_left, 128);
+}
+
+void hk_attn_bwd_d128(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                      const at::Tensor &o, const at::Tensor &dO, const at::Tensor &dq,
+                      const at::Tensor &dk, const at::Tensor &dv, const at::Tensor &lse,
+                      const at::Tensor &delta, const at::Tensor &lneg, const at::Tensor &wsk,
+                      const at::Tensor &wsv, int Sq, int Skv, int B, int Hq, int Hkv,
+                      int window_left, float softmax_scale, int n_split_req) {
+    launch_bwd<128>(q, k, v, o, dO, dq, dk, dv, lse, delta, lneg, wsk, wsv, Sq, Skv, B, Hq, Hkv,
+                    window_left, softmax_scale, n_split_req);
+}
+
+void hk_attn_bwd_fused_d128(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                            const at::Tensor &o, const at::Tensor &dO, const at::Tensor &dq,
+                            const at::Tensor &dk, const at::Tensor &dv, const at::Tensor &ws,
+                            const at::Tensor &lse, const at::Tensor &delta, int Sq, int Skv,
+                            int B, int Hq, int Hkv, int window_left, float softmax_scale) {
+    launch_bwd_fused<128>(q, k, v, o, dO, dq, dk, dv, ws, lse, delta, Sq, Skv, B, Hq, Hkv,
+                          window_left, softmax_scale);
+}
+
+}  // namespace primus_turbo::hipkittens
