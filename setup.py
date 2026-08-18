@@ -381,9 +381,7 @@ def build_kernels_extension():
     # HipKittens lives under csrc/kernels but is built by build_hipkittens_extension, which is
     # the only place its one-arch flag set is correct. Compiling it here as well would hand it
     # this build's whole --offload-arch list; see hipkittens_enabled().
-    kernels_sources = [
-        s for s in kernels_sources if "/attention/hipkittens/" not in str(s).replace(os.sep, "/")
-    ]
+    kernels_sources = [s for s in kernels_sources if not _is_hipkittens_source(s)]
 
     include_dirs = [
         Path(PROJECT_ROOT / "csrc"),
@@ -431,6 +429,25 @@ def hipkittens_enabled():
     return "--offload-arch=gfx950" in offload_arch_list
 
 
+def hipkittens_sources():
+    """Every source that belongs to the HipKittens extension.
+
+    The other two extensions exclude exactly this set, so the three cannot disagree about who
+    compiles what -- these files live under csrc/kernels and csrc/pytorch like everything
+    else, and would otherwise be swept up by their directory globs.
+    """
+    hk = sorted(
+        Path(PROJECT_ROOT / "csrc" / "kernels" / "attention" / "hipkittens").glob("*.cu")
+    )
+    hk.append(Path(PROJECT_ROOT / "csrc" / "pytorch" / "attention" / "hk_attn.cpp"))
+    return hk
+
+
+def _is_hipkittens_source(path):
+    hk = {str(p.resolve()) for p in hipkittens_sources()}
+    return str(Path(path).resolve()) in hk
+
+
 def build_hipkittens_extension():
     """The HipKittens attention kernels, as their own gfx950-only torch extension.
 
@@ -458,14 +475,9 @@ def build_hipkittens_extension():
     max_jobs = int(os.getenv("MAX_JOBS", "64"))
     nvcc_flags.append(f"-parallel-jobs={max_jobs}")
 
-    hk_sources = sorted(
-        str(p) for p in Path(PROJECT_ROOT / "csrc" / "kernels" / "attention" / "hipkittens").glob("*.cu")
-    )
-    hk_sources.append(str(PROJECT_ROOT / "csrc" / "pytorch" / "hipkittens" / "attention.cpp"))
-
     return CUDAExtension(
         name="primus_turbo.pytorch._C_hipkittens",
-        sources=hk_sources,
+        sources=[str(p) for p in hipkittens_sources()],
         include_dirs=[
             Path(PROJECT_ROOT / "csrc"),
             Path(PROJECT_ROOT / "csrc" / "include"),
@@ -500,7 +512,7 @@ def build_torch_extension():
     sources = all_files_in_dir(pytorch_csrc_source_files, name_extensions=["cpp", "cc", "cu"])
     # The HipKittens op registration belongs to its own extension, which is where the kernels
     # it calls are linked; see build_hipkittens_extension.
-    sources = [s for s in sources if "/pytorch/hipkittens/" not in str(s).replace(os.sep, "/")]
+    sources = [s for s in sources if not _is_hipkittens_source(s)]
 
     return CUDAExtension(
         name="primus_turbo.pytorch._C",
