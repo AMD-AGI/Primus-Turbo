@@ -27,13 +27,11 @@ namespace primus_turbo::pytorch {
 
 std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                                 const at::ScalarType      dest_dtype,
-                                                c10::optional<at::Tensor> scale_opt,
-                                                const int64_t             padding_align_size);
+                                                c10::optional<at::Tensor> scale_opt);
 
 std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          input,
                                                      const at::ScalarType      dest_dtype,
-                                                     c10::optional<at::Tensor> scale_opt,
-                                                     const int64_t             padding_align_size);
+                                                     c10::optional<at::Tensor> scale_opt);
 
 std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tensor     input,
                                                                  const at::ScalarType dest_dtype,
