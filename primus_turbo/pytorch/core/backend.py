@@ -19,6 +19,7 @@ from primus_turbo.common.constants import (
     ENV_GEMM_BACKEND,
     ENV_GROUPED_GEMM_BACKEND,
     ENV_MOE_DISPATCH_COMBINE_BACKEND,
+    ENV_SPARSE_ATTN_BACKEND,
 )
 from primus_turbo.common.logger import logger
 from primus_turbo.triton.utils.origami import origami_clear_caches
@@ -94,6 +95,7 @@ class GlobalBackendManager:
     _grouped_gemm_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _moe_dispatch_combine_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _attn_backend: Optional[Dict[PrecisionType, Optional[BackendType]]] = None
+    _sparse_attn_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _auto_tune: Optional[bool] = None
     _env_cache: Dict[str, Dict["PrecisionType", "BackendChoice"]] = {}
 
@@ -284,7 +286,7 @@ class GlobalBackendManager:
     def set_attn_backend(
         cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
     ) -> None:
-        """Set the attention backend in code; flash-attention and sparse-MLA share it."""
+        """Set the flash-attention backend in code (dense and varlen alike)."""
         if backend is None:
             cls._attn_backend = None
             return
@@ -299,16 +301,36 @@ class GlobalBackendManager:
 
     @classmethod
     def get_attn_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
-        """Get the attention backend configuration. Returns None if not set.
-
-        Flash-attention and sparse-MLA read the same setting; they do not have the same
-        backends, so each dispatcher drops a name it does not carry (see
-        resolve_sparse_mla_fwd_backend) rather than failing on it."""
+        """Get the flash-attention backend configuration. Returns None if not set."""
         if cls._attn_backend is not None:
             return cls._attn_backend.get(precision)
         # env parsing yields BackendChoice; attn dispatch consumes the bare enum.
         choice = cls._backend_from_env(ENV_ATTN_BACKEND, precision)
         return choice.backend if choice is not None else None
+
+    @classmethod
+    def set_sparse_attn_backend(
+        cls,
+        backend: Optional[BackendType] = None,
+        precision: Optional[PrecisionType] = None,
+        auto_tune: bool = False,
+    ) -> None:
+        """Set the sparse-attention backend in code."""
+        cls._sparse_attn_backend = cls._updated_backend_table(
+            cls._sparse_attn_backend, backend, precision, auto_tune
+        )
+
+    @classmethod
+    def get_sparse_attn_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
+        """Get the sparse-attention backend configuration. Returns None if not set.
+
+        Unlike get_attn_backend this hands back the whole BackendChoice, so
+        PRIMUS_TURBO_SPARSE_ATTN_BACKEND=AUTOTUNE reaches dispatch() as an auto-tune
+        request instead of being flattened to "no preference".
+        """
+        if cls._sparse_attn_backend is not None:
+            return cls._sparse_attn_backend.get(precision)
+        return cls._backend_from_env(ENV_SPARSE_ATTN_BACKEND, precision)
 
     @classmethod
     def get_moe_dispatch_combine_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
@@ -358,6 +380,7 @@ class GlobalBackendManager:
         cls._grouped_gemm_backend = None
         cls._moe_dispatch_combine_backend = None
         cls._attn_backend = None
+        cls._sparse_attn_backend = None
         cls._auto_tune = None
         cls._env_cache = {}
         AutoKernelDispatcher.clear_all_caches()
@@ -453,25 +476,6 @@ def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
         f"fallback backend {backend_enum.name} is selected. The fallback backend may hurt performance!",
         once=True,
     )
-
-
-def drop_unregistered_backend(dispatcher, user_backend: Optional[BackendType]) -> Optional[BackendType]:
-    """Treat a backend this dispatcher has no entry for as "no preference".
-
-    One env var names a backend for several dispatchers that do not carry the same set
-    (both attention ones share PRIMUS_TURBO_ATTN_BACKEND, and only flash-attn has aiter),
-    so a name meant for its sibling must not take this one down. Say so once, since the
-    name being ignored here is otherwise indistinguishable from it being honoured.
-    """
-    if user_backend is None or user_backend in dispatcher._backends:
-        return user_backend
-    if not torch.compiler.is_compiling():
-        logger.warning(
-            f"Backend {user_backend.name} is not one of {dispatcher.__name__}'s "
-            f"({[b.name for b in dispatcher._backends]}); ignoring it for this op.",
-            once=True,
-        )
-    return None
 
 
 class AutoKernelDispatcher(ABC):  # noqa: B024

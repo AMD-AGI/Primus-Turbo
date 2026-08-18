@@ -26,7 +26,6 @@ from primus_turbo.pytorch.core.backend import (
     BackendType,
     KernelBackend,
     TuneCache,
-    drop_unregistered_backend,
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
@@ -357,5 +356,4 @@ class FlashAttnVarlenDispatcher(AutoKernelDispatcher):
 def resolve_flash_attn_backend(varlen: bool, user_backend: Optional[BackendType], **kwargs) -> BackendType:
     """Resolve the dense/varlen flash-attn backend enum (default FLYDSL, else AITER)."""
     dispatcher = FlashAttnVarlenDispatcher if varlen else FlashAttnDenseDispatcher
-    user_backend = drop_unregistered_backend(dispatcher, user_backend)
     return dispatcher.resolve(BackendType.FLYDSL, user_backend, **kwargs)

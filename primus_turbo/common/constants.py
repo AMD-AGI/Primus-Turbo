@@ -31,10 +31,17 @@ ENV_GROUPED_GEMM_BACKEND = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 # Default: TURBO
 ENV_MOE_DISPATCH_COMBINE_BACKEND = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
 
-# Attention backend selection (e.g. FLYDSL, AITER, TRITON), for flash-attention and for
-# sparse-MLA alike. Same per-precision format as ENV_GEMM_BACKEND.
+# Attention backend selection, one key per family: flash-attention and sparse attention do
+# not carry the same backends (only the former has AITER, only the latter TRITON), so a
+# shared key would name backends one of the two dispatchers reading it cannot run.
+# Same per-precision format as ENV_GEMM_BACKEND.
 # Default: None (auto-select; FLYDSL when eligible, else the op's fallback)
+
+# Dense and varlen flash-attention (e.g. FLYDSL, AITER).
 ENV_ATTN_BACKEND = "PRIMUS_TURBO_ATTN_BACKEND"
+
+# Sparse attention: DeepSeek-V4 sparse-MLA (e.g. FLYDSL, TRITON).
+ENV_SPARSE_ATTN_BACKEND = "PRIMUS_TURBO_SPARSE_ATTN_BACKEND"
 
 # Enable auto-tuning across registered kernel backends ("1" to enable).
 # Global switch: it turns auto-tune on for every op. An explicit per-op backend
