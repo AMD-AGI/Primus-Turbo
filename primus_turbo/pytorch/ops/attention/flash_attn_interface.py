@@ -60,6 +60,12 @@ def _flash_attn_varlen_grads(dq, dk, dv, dsink):
     return (dq, dk, dv) + (None,) * 14 + (dsink, None)
 
 
+def _any_requires_grad(*tensors) -> bool:
+    """A sink is a learned parameter, so it can be the only input asking for a grad -- and
+    then the backward still runs and needs everything ctx would have saved."""
+    return any(t is not None and t.requires_grad for t in tensors)
+
+
 class FlashAttnFunc(torch.autograd.Function):
     """Dense flash attention; ``backend`` picks the implementation and ctx carries it so the
     backward takes the same one. q/k/v arrive ``[b, s, h, d]``-shaped, so FlyDSL -- the one
@@ -101,7 +107,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 sink=sink,
             )
             B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
-            if is_grad_enabled and any(x.requires_grad for x in (q, k, v)):
+            if is_grad_enabled and _any_requires_grad(q, k, v, sink):
                 ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
                 ctx.softmax_scale = softmax_scale
                 ctx.causal = causal
@@ -124,7 +130,7 @@ class FlashAttnFunc(torch.autograd.Function):
         if get_device_compute_capability() >= (9, 5):
             how_v3_bf16_cvt = 0
 
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        is_grad = is_grad_enabled and _any_requires_grad(q, k, v, sink)
 
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -569,7 +575,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             B = cu_seqlens_q.numel() - 1
             Hq = q.shape[1]
             Sq = q.shape[0] // B  # uniform seqlens (enforced by the flydsl eligibility gate)
-            if is_grad_enabled and any(x.requires_grad for x in (q, k, v)):
+            if is_grad_enabled and _any_requires_grad(q, k, v, sink):
                 ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)
                 ctx.max_seqlen_q = max_seqlen_q
                 ctx.max_seqlen_k = max_seqlen_k
@@ -584,7 +590,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # Avoid aiter print warning when how_v3_bf16_cvt!=0 in gfx950.
         how_v3_bf16_cvt = 0 if get_device_compute_capability() >= (9, 5) else 1
 
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        is_grad = is_grad_enabled and _any_requires_grad(q, k, v, sink)
 
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)

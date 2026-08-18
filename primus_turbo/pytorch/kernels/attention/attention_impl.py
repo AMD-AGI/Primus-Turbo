@@ -217,8 +217,10 @@ def _uniform_cu_seqlens(cu_seqlens_q, cu_seqlens_k) -> bool:
 
 class VarlenAttnFwdAiterBackend(KernelBackend):
     @staticmethod
-    def can_handle(q: torch.Tensor, **kwargs) -> bool:
-        return q.dtype in (torch.float16, torch.bfloat16) and q.ndim == 3
+    def can_handle(q: torch.Tensor, sink=None, **kwargs) -> bool:
+        # No sink: the aiter varlen kernels take none, and the dense ones do, so saying so
+        # here is what keeps a varlen sink from being dropped on the floor.
+        return q.dtype in (torch.float16, torch.bfloat16) and q.ndim == 3 and sink is None
 
     @staticmethod
     def execute(
