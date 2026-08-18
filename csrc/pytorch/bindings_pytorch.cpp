@@ -130,6 +130,34 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "ScalarType out_dtype, str granularity, bool pre_sync,"
           "float beta=0.0, Tensor(a!)? out=None) -> Tensor");
     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
+
+    // ********* HipKittens attention (gfx950) *********
+    // Built into every arch configuration but only functional on gfx950 -- the kernel bodies
+    // are guarded on __gfx950__ and the Python layer refuses any other device before launch.
+    // The kernels write through their outputs, so these are mutating and return nothing.
+    m.def("hk_attn_fwd_d64(Tensor q, Tensor k, Tensor v, Tensor(a!) o, Tensor(b!) lse, int Sq, "
+          "int Skv, int B, int Hq, int Hkv, int window_left, float softmax_scale) -> ()");
+    m.def("hk_attn_fwd_d128(Tensor q, Tensor k, Tensor v, Tensor(a!) o, Tensor(b!) lse, int Sq, "
+          "int Skv, int B, int Hq, int Hkv, int window_left, float softmax_scale) -> ()");
+    m.def("hk_attn_bwd_d64(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
+          "Tensor(b!) dk, Tensor(c!) dv, Tensor lse, Tensor(d!) delta, Tensor(e!) lneg, "
+          "Tensor(f!) wsk, Tensor(g!) wsv, int Sq, int Skv, int B, int Hq, int Hkv, "
+          "int window_left, float softmax_scale, int n_split_req) -> ()");
+    m.def("hk_attn_bwd_d128(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
+          "Tensor(b!) dk, Tensor(c!) dv, Tensor lse, Tensor(d!) delta, Tensor(e!) lneg, "
+          "Tensor(f!) wsk, Tensor(g!) wsv, int Sq, int Skv, int B, int Hq, int Hkv, "
+          "int window_left, float softmax_scale, int n_split_req) -> ()");
+    m.def("hk_attn_bwd_fused_d64(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, "
+          "Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, Tensor(d!) ws, Tensor lse, "
+          "Tensor(e!) delta, int Sq, int Skv, int B, int Hq, int Hkv, int window_left, "
+          "float softmax_scale) -> ()");
+    m.def("hk_attn_bwd_fused_d128(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, "
+          "Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, Tensor(d!) ws, Tensor lse, "
+          "Tensor(e!) delta, int Sq, int Skv, int B, int Hq, int Hkv, int window_left, "
+          "float softmax_scale) -> ()");
+    m.def("hk_attn_dkdv_head_split(int head_dim, int Sq, int Skv, int B, int Hq, int Hkv, "
+          "int window_left) -> int");
+    m.def("hk_attn_block_sizes(int head_dim) -> int[]");
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
@@ -180,6 +208,14 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("grouped_gemm_compute_offs", grouped_gemm_compute_offs);
     m.impl("hipblaslt_grouped_gemm", hipblaslt_grouped_gemm);
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8);
+
+    // ********* HipKittens attention (gfx950) *********
+    m.impl("hk_attn_fwd_d64", hk_attn_fwd_d64);
+    m.impl("hk_attn_fwd_d128", hk_attn_fwd_d128);
+    m.impl("hk_attn_bwd_d64", hk_attn_bwd_d64);
+    m.impl("hk_attn_bwd_d128", hk_attn_bwd_d128);
+    m.impl("hk_attn_bwd_fused_d64", hk_attn_bwd_fused_d64);
+    m.impl("hk_attn_bwd_fused_d128", hk_attn_bwd_fused_d128);
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -288,6 +324,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     register_odc_rocshmem_host(m);
     register_odc_rocshmem_gda(m);
 #endif
+}
+
+// Shape-only HipKittens queries: no tensors, so they answer the same on any device and do not
+// belong on a device-specific key.
+TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CompositeExplicitAutograd, m) {
+    m.impl("hk_attn_dkdv_head_split", hk_attn_dkdv_head_split);
+    m.impl("hk_attn_block_sizes", hk_attn_block_sizes);
 }
 
 /********************************************/

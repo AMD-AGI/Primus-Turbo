@@ -9,7 +9,7 @@
 // Flash-attention BACKWARD for gfx950, head dim 64.
 //
 // THIS SOURCE CARRIES THE D=64 BACKWARD AND NOTHING ELSE. Head dim 128 lives in
-// hk_attn_bwd_d128_gfx950.cu, so the two head dims can be
+// hk_attn_bwd_d128.cu, so the two head dims can be
 // optimized, rebuilt and broken independently. Every D=128 instantiation and every
 // compile-time branch on `D <= 64` is gone from this one, which is why the kernel
 // templates below still carry `template <int D>` but are only ever reached at D = 64.
@@ -79,6 +79,8 @@
 //   3. The cooperative global->LDS fill is a local transcription of kittens::load
 //      that takes the wave id as an argument instead of calling kittens::warpid()
 //      itself, for the same reason one level down. Worth +1.85%.
+
+#include <cassert>
 
 #include "kittens.cuh"
 #include "primus_turbo/hipkittens/attention.h"
@@ -1215,6 +1217,14 @@ template <int D, int PNEG>
 __global__ __launch_bounds__(PREP_NUM_THREADS, 8) void hk_attn_bwd_prep_ker(
     const _gl_QKVO Og, const _gl_QKVO dOg, const _gl_L Dg, const _gl_L Lg,
     const _gl_L Lng, int Sq) {
+#if !defined(__gfx950__)
+    // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
+    // other device pass the body is replaced rather than compiled -- which is what lets one
+    // multi-arch build carry these sources. Unreachable at runtime: the Python layer refuses
+    // a non-gfx950 device before it can launch.
+    assert(false && "hipkittens attention requires gfx950");
+    return;
+#else
     const int wid = __builtin_amdgcn_readfirstlane(warpid());
     const int q_tile = blockIdx.x * PREP_NUM_WARPS + wid;
     const int head_idx = blockIdx.y;
@@ -1239,6 +1249,7 @@ __global__ __launch_bounds__(PREP_NUM_THREADS, 8) void hk_attn_bwd_prep_ker(
     } else {
         store(Dg, d_vec, {batch_idx, head_idx, 0, q_tile});
     }
+#endif  // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -1394,6 +1405,14 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
     const _gl_QKVO Qg, const _gl_QKVO Kg, const _gl_QKVO Vg, const _gl_QKVO dOg,
     const _gl_QKVO dQg, const _gl_L Lg, const _gl_L Dg, int Sq, int Skv, int Hq, int Hkv,
     int window_left, float softmax_scale, const _gl_QKVO Og, const _gl_L Lrg) {
+#if !defined(__gfx950__)
+    // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
+    // other device pass the body is replaced rather than compiled -- which is what lets one
+    // multi-arch build carry these sources. Unreachable at runtime: the Python layer refuses
+    // a non-gfx950 device before it can launch.
+    assert(false && "hipkittens attention requires gfx950");
+    return;
+#else
 
     // The eight waves cooperate on the staged K/V tiles, so they must be on the same KV
     // tile at the same time: the loop runs the union of their eight ranges and each wave
@@ -1835,6 +1854,7 @@ __global__ __launch_bounds__(DQ_NUM_THREADS, 2) void hk_attn_bwd_dq_ker(
     rt<float, DQ_Q_BLOCK, D, row_l, rt_16x16_s> dq_row;
     transpose(dq_row, dq_acc);
     store<0>(dQg, dq_row, {q_tile, batch_idx, head_idx, 0});
+#endif  // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -2500,6 +2520,14 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 3) void hk_attn_bwd_dkdv_ker(
     const _gl_QKVO Qg, const _gl_QKVO Kg, const _gl_QKVO Vg, const _gl_QKVO dOg,
     const _gl_QKVO dKg, const _gl_QKVO dVg, const _gl_L Lg, const _gl_L Dg, int Sq, int Skv,
     int Hq, int Hkv, int window_left, float softmax_scale, int kv_tiles_pad) {
+#if !defined(__gfx950__)
+    // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
+    // other device pass the body is replaced rather than compiled -- which is what lets one
+    // multi-arch build carry these sources. Unreachable at runtime: the Python layer refuses
+    // a non-gfx950 device before it can launch.
+    assert(false && "hipkittens attention requires gfx950");
+    return;
+#else
 
     // The whole bundle is live here. It used to be masked by `(D <= 64) ? BUN : (BUN & 1)`
     // because M1, the mask re-key and B33 all made D=128 spill; this source is D=64 only,
@@ -2967,6 +2995,7 @@ __global__ __launch_bounds__(DKDV_NUM_THREADS, 3) void hk_attn_bwd_dkdv_ker(
     else mul(dk_acc, dk_acc, softmax_scale);
     transpose(out_row, dk_acc);
     store<0>(dKg, out_row, {out_tile, batch_idx, head_idx_kv, 0});
+#endif  // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -2996,6 +3025,14 @@ template <int D>
 __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dkdvred_ker(
     const bf16 *__restrict__ wsk, const bf16 *__restrict__ wsv, bf16 *__restrict__ dk,
     bf16 *__restrict__ dv, int n_split, long slot_stride, long total) {
+#if !defined(__gfx950__)
+    // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
+    // other device pass the body is replaced rather than compiled -- which is what lets one
+    // multi-arch build carry these sources. Unreachable at runtime: the Python layer refuses
+    // a non-gfx950 device before it can launch.
+    assert(false && "hipkittens attention requires gfx950");
+    return;
+#else
 
     long idx = (long)blockIdx.x * DQRED_THREADS + threadIdx.x;
     if (idx >= total) return;
@@ -3026,6 +3063,7 @@ __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dkdvred_ker(
     }
     *(bf16x8 *)(dk + off) = ok;
     *(bf16x8 *)(dv + off) = ov;
+#endif  // __gfx950__
 }
 
 // =================================================================================
@@ -3108,6 +3146,14 @@ __global__ __launch_bounds__(BW_NUM_THREADS, 2) void hk_attn_bwd_fused_ker(
     const _gl_QKVO dKg, const _gl_QKVO dVg, const _gl_QKVO WSg, const _gl_L Lg,
     const _gl_L Dg, int Sq, int Skv, int Hq, int Hkv, int window_left, float softmax_scale,
     int q_tiles_pad) {
+#if !defined(__gfx950__)
+    // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
+    // other device pass the body is replaced rather than compiled -- which is what lets one
+    // multi-arch build carry these sources. Unreachable at runtime: the Python layer refuses
+    // a non-gfx950 device before it can launch.
+    assert(false && "hipkittens attention requires gfx950");
+    return;
+#else
 
     // D columns of dQ^T per wave; the waves partition the output rows of the fifth
     // product rather than its reduction axis.
@@ -3340,6 +3386,7 @@ __global__ __launch_bounds__(BW_NUM_THREADS, 2) void hk_attn_bwd_fused_ker(
     mul(dk_acc, dk_acc, softmax_scale);
     transpose(out_row, dk_acc);
     store<0>(dKg, out_row, {kv_row_tile, batch_idx, head_idx_kv, 0});
+#endif  // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -3362,6 +3409,14 @@ template <int D>
 __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dqred_ker(
     const bf16 *__restrict__ ws, bf16 *__restrict__ dq, int n_bands, int q_tiles_pad, int BH,
     int Sq, int causal_offset, int window_left) {
+#if !defined(__gfx950__)
+    // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
+    // other device pass the body is replaced rather than compiled -- which is what lets one
+    // multi-arch build carry these sources. Unreachable at runtime: the Python layer refuses
+    // a non-gfx950 device before it can launch.
+    assert(false && "hipkittens attention requires gfx950");
+    return;
+#else
 
     constexpr int VEC_PER_ROW = D / DQRED_PER_THREAD;
     const int Sq_pad = q_tiles_pad * BW_Q_BLOCK;
@@ -3398,6 +3453,7 @@ __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dqred_ker(
 #pragma unroll
     for (int i = 0; i < DQRED_PER_THREAD; ++i) out.v[i] = (bf16)acc[i];
     *(bf16x8 *)(dq + row) = out;
+#endif  // __gfx950__
 }
 
 // ---------------------------------------------------------------------------------
@@ -3408,23 +3464,23 @@ __global__ __launch_bounds__(DQRED_THREADS) void hk_attn_bwd_dqred_ker(
 // plain tensors here rather than optionals.
 // ---------------------------------------------------------------------------------
 template <int D>
-static void launch_bwd(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
-                       const at::Tensor &o, const at::Tensor &dO, const at::Tensor &dq,
-                       const at::Tensor &dk, const at::Tensor &dv, const at::Tensor &lse,
-                       const at::Tensor &delta, const at::Tensor &lneg, const at::Tensor &wsk,
-                       const at::Tensor &wsv, int Sq, int Skv, int B, int Hq, int Hkv,
+static void launch_bwd(const HkTensorDesc &q, const HkTensorDesc &k, const HkTensorDesc &v,
+                       const HkTensorDesc &o, const HkTensorDesc &dO, const HkTensorDesc &dq,
+                       const HkTensorDesc &dk, const HkTensorDesc &dv, const HkTensorDesc &lse,
+                       const HkTensorDesc &delta, const HkTensorDesc &lneg, const HkTensorDesc &wsk,
+                       const HkTensorDesc &wsv, int Sq, int Skv, int B, int Hq, int Hkv,
                        int window_left, float softmax_scale, int n_split_req) {
-    auto Qg = make_gl_from_tensor<_gl_QKVO>(q, "q");
-    auto Kg = make_gl_from_tensor<_gl_QKVO>(k, "k");
-    auto Vg = make_gl_from_tensor<_gl_QKVO>(v, "v");
-    auto Og = make_gl_from_tensor<_gl_QKVO>(o, "o");
-    auto dOg = make_gl_from_tensor<_gl_QKVO>(dO, "dO");
-    auto dQg = make_gl_from_tensor<_gl_QKVO>(dq, "dq");
-    auto dKg = make_gl_from_tensor<_gl_QKVO>(dk, "dk");
-    auto dVg = make_gl_from_tensor<_gl_QKVO>(dv, "dv");
-    auto Lg = make_gl_from_tensor<_gl_L>(lse, "lse");
-    auto Dg = make_gl_from_tensor<_gl_L>(delta, "delta");
-    auto Lng = make_gl_from_tensor<_gl_L>(lneg, "lneg");
+    auto Qg = make_gl_from_desc<_gl_QKVO>(q);
+    auto Kg = make_gl_from_desc<_gl_QKVO>(k);
+    auto Vg = make_gl_from_desc<_gl_QKVO>(v);
+    auto Og = make_gl_from_desc<_gl_QKVO>(o);
+    auto dOg = make_gl_from_desc<_gl_QKVO>(dO);
+    auto dQg = make_gl_from_desc<_gl_QKVO>(dq);
+    auto dKg = make_gl_from_desc<_gl_QKVO>(dk);
+    auto dVg = make_gl_from_desc<_gl_QKVO>(dv);
+    auto Lg = make_gl_from_desc<_gl_L>(lse);
+    auto Dg = make_gl_from_desc<_gl_L>(delta);
+    auto Lng = make_gl_from_desc<_gl_L>(lneg);
 
     // The variant ladder, read once. Same shape as the HK_BWD_DQ_* knobs:
     // every rung is a compile-time template argument and the env var only picks which
@@ -3629,8 +3685,8 @@ static void launch_bwd(const at::Tensor &q, const at::Tensor &k, const at::Tenso
     // (kv head, batch) on the fast axes, (kv block, split) on the slowest with the split on
     // the fast PART of z -- see the decode in the kernel. gridDim.z caps kv_blocks*n_split
     // at 65535; the worst meta row is 128 * 8 = 1024.
-    auto WSKg = n_split > 1 ? make_gl_from_tensor<_gl_QKVO>(wsk, "wsk") : dKg;
-    auto WSVg = n_split > 1 ? make_gl_from_tensor<_gl_QKVO>(wsv, "wsv") : dVg;
+    auto WSKg = n_split > 1 ? make_gl_from_desc<_gl_QKVO>(wsk) : dKg;
+    auto WSVg = n_split > 1 ? make_gl_from_desc<_gl_QKVO>(wsv) : dVg;
     const bool b11b =
         dkdv_use_b11b(Sq, Skv, B, Hq, Hkv, window_left, D, n_split, vm_b11b(vm));
     const dim3 dkdv_grid = b11b ? dim3(Hkv, kv_blocks * n_split, B)
@@ -3706,22 +3762,22 @@ static void launch_bwd(const at::Tensor &q, const at::Tensor &k, const at::Tenso
 // Same prep kernel and same delta layout as the split path, so the two are interchangeable
 // per call and the wrapper can pick on a shape property.
 template <int D>
-static void launch_bwd_fused(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
-                             const at::Tensor &o, const at::Tensor &dO, const at::Tensor &dq,
-                             const at::Tensor &dk, const at::Tensor &dv, const at::Tensor &ws,
-                             const at::Tensor &lse, const at::Tensor &delta, int Sq, int Skv,
+static void launch_bwd_fused(const HkTensorDesc &q, const HkTensorDesc &k, const HkTensorDesc &v,
+                             const HkTensorDesc &o, const HkTensorDesc &dO, const HkTensorDesc &dq,
+                             const HkTensorDesc &dk, const HkTensorDesc &dv, const HkTensorDesc &ws,
+                             const HkTensorDesc &lse, const HkTensorDesc &delta, int Sq, int Skv,
                              int B, int Hq, int Hkv, int window_left, float softmax_scale) {
-    auto Qg = make_gl_from_tensor<_gl_QKVO>(q, "q");
-    auto Kg = make_gl_from_tensor<_gl_QKVO>(k, "k");
-    auto Vg = make_gl_from_tensor<_gl_QKVO>(v, "v");
-    auto Og = make_gl_from_tensor<_gl_QKVO>(o, "o");
-    auto dOg = make_gl_from_tensor<_gl_QKVO>(dO, "dO");
-    auto dQg = make_gl_from_tensor<_gl_QKVO>(dq, "dq");
-    auto dKg = make_gl_from_tensor<_gl_QKVO>(dk, "dk");
-    auto dVg = make_gl_from_tensor<_gl_QKVO>(dv, "dv");
-    auto WSg = make_gl_from_tensor<_gl_QKVO>(ws, "ws");
-    auto Lg = make_gl_from_tensor<_gl_L>(lse, "lse");
-    auto Dg = make_gl_from_tensor<_gl_L>(delta, "delta");
+    auto Qg = make_gl_from_desc<_gl_QKVO>(q);
+    auto Kg = make_gl_from_desc<_gl_QKVO>(k);
+    auto Vg = make_gl_from_desc<_gl_QKVO>(v);
+    auto Og = make_gl_from_desc<_gl_QKVO>(o);
+    auto dOg = make_gl_from_desc<_gl_QKVO>(dO);
+    auto dQg = make_gl_from_desc<_gl_QKVO>(dq);
+    auto dKg = make_gl_from_desc<_gl_QKVO>(dk);
+    auto dVg = make_gl_from_desc<_gl_QKVO>(dv);
+    auto WSg = make_gl_from_desc<_gl_QKVO>(ws);
+    auto Lg = make_gl_from_desc<_gl_L>(lse);
+    auto Dg = make_gl_from_desc<_gl_L>(delta);
 
     constexpr size_t bwd_smem = 2 * sizeof(bw_qo_tile<D>) + sizeof(bw_ds_tile);
     static_assert(bwd_smem <= kittens::MAX_SHARED_MEMORY, "fused staging exceeds LDS");
@@ -3775,20 +3831,20 @@ int hk_attn_bwd_d64_dkdv_head_split(int Sq, int Skv, int B, int Hq, int Hkv, int
     return dkdv_head_split(Sq, Skv, B, Hq, Hkv, window_left, 64);
 }
 
-void hk_attn_bwd_d64(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
-                      const at::Tensor &o, const at::Tensor &dO, const at::Tensor &dq,
-                      const at::Tensor &dk, const at::Tensor &dv, const at::Tensor &lse,
-                      const at::Tensor &delta, const at::Tensor &lneg, const at::Tensor &wsk,
-                      const at::Tensor &wsv, int Sq, int Skv, int B, int Hq, int Hkv,
+void hk_attn_bwd_d64(const HkTensorDesc &q, const HkTensorDesc &k, const HkTensorDesc &v,
+                      const HkTensorDesc &o, const HkTensorDesc &dO, const HkTensorDesc &dq,
+                      const HkTensorDesc &dk, const HkTensorDesc &dv, const HkTensorDesc &lse,
+                      const HkTensorDesc &delta, const HkTensorDesc &lneg, const HkTensorDesc &wsk,
+                      const HkTensorDesc &wsv, int Sq, int Skv, int B, int Hq, int Hkv,
                       int window_left, float softmax_scale, int n_split_req) {
     launch_bwd<64>(q, k, v, o, dO, dq, dk, dv, lse, delta, lneg, wsk, wsv, Sq, Skv, B, Hq, Hkv,
                     window_left, softmax_scale, n_split_req);
 }
 
-void hk_attn_bwd_fused_d64(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
-                            const at::Tensor &o, const at::Tensor &dO, const at::Tensor &dq,
-                            const at::Tensor &dk, const at::Tensor &dv, const at::Tensor &ws,
-                            const at::Tensor &lse, const at::Tensor &delta, int Sq, int Skv,
+void hk_attn_bwd_fused_d64(const HkTensorDesc &q, const HkTensorDesc &k, const HkTensorDesc &v,
+                            const HkTensorDesc &o, const HkTensorDesc &dO, const HkTensorDesc &dq,
+                            const HkTensorDesc &dk, const HkTensorDesc &dv, const HkTensorDesc &ws,
+                            const HkTensorDesc &lse, const HkTensorDesc &delta, int Sq, int Skv,
                             int B, int Hq, int Hkv, int window_left, float softmax_scale) {
     launch_bwd_fused<64>(q, k, v, o, dO, dq, dk, dv, ws, lse, delta, Sq, Skv, B, Hq, Hkv,
                           window_left, softmax_scale);

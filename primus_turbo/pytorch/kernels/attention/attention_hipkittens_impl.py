@@ -27,14 +27,11 @@ __all__ = [
 
 
 def _layer():
-    """Imported lazily and per call site.
+    """The gfx950 layer, imported lazily.
 
-    The extension is built in every arch configuration but carries gfx950 device code only,
-    so on another card it imports and registers its ops and then has no kernel to launch --
-    which is what the is_gfx950() check inside the layer is for. The import still stays lazy
-    because PRIMUS_TURBO_BUILD_HIPKITTENS=0 can skip the extension entirely, and a dispatcher
-    that cannot be imported at all is a worse failure than a backend that reports it cannot
-    take the call.
+    The ops themselves are always present -- they are built into _C in every arch
+    configuration and guarded on __gfx950__ inside the kernel -- so this import cannot fail
+    for want of a build. It stays lazy only to keep the dispatcher's import graph shallow.
     """
     from primus_turbo.hipkittens.attention import gfx950
 
@@ -55,7 +52,7 @@ def hipkittens_attn_supported_impl(
     try:
         layer = _layer()
     except ImportError:
-        return False, "hipkittens extension is not built (gfx950-only)"
+        return False, "hipkittens attention is unavailable in this build"
     return layer.hipkittens_attn_supported(q, k, v, **kwargs)
 
 

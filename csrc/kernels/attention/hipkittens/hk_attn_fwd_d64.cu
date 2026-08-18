@@ -6,10 +6,10 @@
  * Modified by the Primus-Turbo team.
  **************************************************************************************************/
 
-// Flash-attention forward for gfx950, head dim 128.
+// Flash-attention forward for gfx950, head dim 64.
 //
-// THIS SOURCE CARRIES THE D=128 FORWARD AND NOTHING ELSE. Head dim 64 lives in
-// hk_attn_fwd_d64_gfx950.cu, so the two head dims can be optimized, rebuilt and broken
+// THIS SOURCE CARRIES THE D=64 FORWARD AND NOTHING ELSE. Head dim 128 lives in
+// hk_attn_fwd_d128.cu, so the two head dims can be optimized, rebuilt and broken
 // independently.
 //
 // WHAT IT COMPUTES
@@ -60,18 +60,9 @@
 //      register-file traffic by 20% -- measured at 6.5% of socket power at a pinned clock. The
 //      atom fixes the operand lane map, so the whole QK -> softmax -> PV chain moves with it.
 //
-// WHAT D = 128 COSTS RELATIVE TO D = 64, since the two kernels are structurally the same and
-// the differences are all consequences of the wider head:
-//   - every operand carrying the D axis doubles: k_reg 4x2 -> 4x4 base tiles, v_reg 2x4 -> 2x8,
-//     q_reg_transposed 2x2 -> 4x2, o_reg 4x2 -> 8x2 (32 -> 64 fp32 VGPRs), so a KV tile in LDS
-//     is 16 KB instead of 8 KB;
-//   - the QK reduction is 4 chunks of 32 rather than 2, so each of the four counted waits
-//     releases four K base tiles and the counts run 12/8/4/0 over 16 ds_read_b128;
-//   - V's release wait covers sixteen base tiles instead of eight, split into two lgkmcnt(0)
-//     statements so no single inline asm ties 64 VGPRs at once;
-//   - occupancy is 2 waves/SIMD, not 4: the fp32 accumulator alone is 64 VGPRs.
-//
 // There is no ping-pong stagger between the waves yet.
+
+#include <cassert>
 
 #include "kittens.cuh"
 #include "primus_turbo/hipkittens/attention.h"
@@ -84,40 +75,12 @@ namespace {
 
 // The head dim this source is specialised for. Named `D` because every tile alias below is
 // parameterised on it.
-constexpr int D = 128;
+constexpr int D = 64;
 
 constexpr int Q_BLOCK_SIZE = 32;
 constexpr int KV_BLOCK_SIZE = 64;
 #define NUM_WARPS 8
 #define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
-
-// THE QK SOFTWARE-PIPELINE DEPTH, in sched_group_barrier groups.
-//
-// The `qk` block issues 32 QK MFMAs as eight independent four-deep accumulation chains and
-// 32 v_exp_f32 that read those accumulators back. On CDNA an MFMA's destination is not
-// interlocked: W = 8 wait states must separate the write from a VALU read of it, supplied
-// by any mixture of independent instructions and `s_nop`. Left to itself the scheduler
-// interposes only 1-5 real instructions and pads the residual, 46 times per wave-KV-tile,
-// for 32 wait-state cycles = 1.52% of runtime. The work to fill the window exists -- seven
-// other chains -- and both opcodes are compiler-schedulable builtins rather than inline asm,
-// so the window is a scheduling failure and not a floor.
-//
-// The hints below rotate the exponentials LEAD groups behind the MFMAs: LEAD groups of
-// MFMA, then TRANS/MFMA alternating, then the trailing TRANS. A chain's terminal MFMA is
-// then LEAD*GRP issue slots ahead of the exponentials that read it, so the window is filled
-// with real work instead of nops. GRP=4 would be one chain per group.
-//
-// SAFETY. These are hints to the *scheduler*; the hazard recognizer still runs afterwards
-// and still emits whatever `s_nop` the final order requires, so no schedule reachable from
-// here can under-supply W. That is not a licence to skip the check: the producer-to-consumer
-// distance on the emitted ISA must be >= W, and that is what should be asserted after any
-// change here.
-#ifndef HK_QK_EXP_GRP
-#define HK_QK_EXP_GRP 2
-#endif
-#ifndef HK_QK_EXP_LEAD
-#define HK_QK_EXP_LEAD 7
-#endif
 
 using _gl_QKVO = gl<bf16, -1, -1, -1, -1>;
 using _gl_L = gl<float, -1, -1, -1, -1>;
@@ -142,7 +105,7 @@ using attn_tile = rt<T, KV_BLOCK_SIZE, Q_BLOCK_SIZE, L, S>;
 // V's staging tile in LDS, one per workgroup. Its geometry is st_32x32_s -- K's own shape -- rather
 // than st_8x32_s: the shared->register reader requires the shared subtile to be >= or <= the
 // register base tile in *both* dimensions, and 8x32 against a 32x16 operand is neither (8 <= 32 but
-// 32 > 16). 32x32 is >= in both. Same bytes, same 16 ds_read_b64_tr_b16 per 64x64 quadrant.
+// 32 > 16). 32x32 is >= in both. Same 8 KB, same 16 ds_read_b64_tr_b16.
 //
 // The swizzle, however, is st_32x32_s's plus one extra term, because the library's leaves V's
 // transposing read with a uniform 2-way bank conflict on every instruction. Derivation, with
@@ -217,21 +180,23 @@ struct v_stage_st : st_bf<KV_BLOCK_SIZE, D, st_32x32_s> {
 // Reaching the address through kittens::gl::operator[] evaluates
 //     ((int64_t(j*KV_BLOCK_SIZE) * depth() + batch) * rows() + head) * cols()
 // -- three nested 64-bit multiply-adds, recomputed from scratch on every KV tile, for each of K and
-// V. That was roughly half the loop's entire scalar instruction budget, at ~1.39 wall cycles each.
-// None of it depends on the tile index except through the leading term, so the caller computes the
-// (batch, kv head) slice base and the byte stride of one KV tile ONCE and hands over a finished
-// pointer; per tile what is left is one 32x32 -> 64 multiply and one 64-bit add per tensor.
+// V. That was 46 of the 90 steady-state SALU per KV tile, 51% of the loop's whole scalar budget, at
+// ~1.39 wall cycles each. None of it depends on the tile index except through the leading term, so
+// the caller computes the (batch, kv head) slice base and the byte stride of one KV tile ONCE and
+// hands over a finished pointer; per tile what is left is one 32x32 -> 64 multiply and one 64-bit
+// add per tensor. Measured 90 -> 52 SALU per tile.
 //
 // AND THE ALTERNATIVE IS WORSE, which is worth recording because it is the obvious thing to try:
-// making Sq/Skv/Hq/Hkv compile-time constants folds exactly ONE of those SALU, because the gl's
+// making Sq/Skv/Hq/Hkv compile-time constants folds exactly ONE of those 46 SALU, because the gl's
 // axis-0 extent never appears in the index -- the sequence lengths are simply not in this
-// arithmetic. Making the strides compile-time as well (which needs the batch size static) folds
-// most but not all of the rest and still leaves a 64-bit Horner multiply by Hkv. Hoisting beats
-// the fully specialised form outright, and it specialises on nothing: no shape key, no
+// arithmetic. Making the strides compile-time as well (which needs the batch size static) reaches
+// 60 and still leaves a 64-bit Horner multiply by Hkv. Hoisting reaches 52, beating the fully
+// specialised form by 8 SALU per tile, and it specialises on nothing: no shape key, no
 // instantiation count, no shape that fails to match.
 //
 // The library's leftover-loads path is also dropped, replaced by a static_assert that this
-// configuration leaves no leftover.
+// configuration leaves no leftover (8192 B tiles, 16 B per thread, 512 threads, so
+// memcpy_per_tile is exactly 1).
 namespace hk_stage {
 // `global_ptr` is the first element of the tile to fetch and `row_stride` the element stride
 // between consecutive tile rows, i.e. what src.stride<axis>() used to return. Both are computed by
@@ -306,7 +271,7 @@ __device__ inline void load(ST &dst, const typename ST::dtype *global_ptr, int r
 using v_stage_tile = v_stage_st;
 
 // K's staging tile. st_32x32_s is the swizzled shape that pairs with k_reg's rt_16x32_s base
-// tiles -- the pairing is not a free choice, it is what keeps the read at ds_read_b128 -- and
+// tiles -- the pairing is not a free choice, it is what keeps the read at 8 ds_read_b128 -- and
 // 32x32 is >= 16x32 in both dimensions, which is the reader's requirement.
 using k_stage_tile = st_bf<KV_BLOCK_SIZE, D, st_32x32_s>;
 
@@ -320,28 +285,18 @@ using k_stage_tile = st_bf<KV_BLOCK_SIZE, D, st_32x32_s>;
 //
 // WHY TWO BUFFERS IS NOT ENOUGH, since that is the natural choice and it does work correctly. With
 // two, the tile read at iteration j is refilled by the DMAs issued at iteration j+1, i.e.
-// immediately after that barrier -- so every one of V's ds_read_b64_tr_b16 has to be retired before
-// the wave arrives at the rendezvous, which forces the wait ABOVE the barrier and no counted wait
-// can relax it. The third buffer buys a whole extra barrier of slack, which lets the wait sit
-// immediately in front of the PV MFMA that consumes it (see the bottom of kv_tile_body). That puts
-// the barrier's own arrival skew into the read's shadow on top of V's drain latency.
+// immediately after that barrier -- so every one of V's sixteen ds_read_b64_tr_b16 has to be
+// retired before the wave arrives at the rendezvous, which forces the wait ABOVE the barrier and no
+// counted wait can relax it. The third buffer buys a whole extra barrier of slack, which lets the
+// wait sit immediately in front of the PV MFMA that consumes it (see the bottom of kv_tile_body).
+// That puts the barrier's own arrival skew into the read's shadow on top of V's drain latency.
 //
 // It is NOT a deeper prefetch distance: the DMA schedule is byte-identical and still exactly one
-// tile ahead.
+// tile ahead. The cost is LDS, 32 KB -> 48 KB per workgroup, which at two workgroups per CU is
+// 96 KB of CDNA4's 160 KB, so no occupancy tier is at risk.
 //
 // Three is not a power of two, so the buffer index is a rotating counter rather than a mask. It is
 // wave-uniform, so the wrap lowers to an s_cselect and no `%` is emitted.
-//
-// THE COST OF THE THIRD BUFFER IS DIFFERENT AT D = 128 AND HAS TO BE PRICED AGAINST OCCUPANCY,
-// not assumed. A KV tile is KV_BLOCK_SIZE * D * 2 B = 64 * 128 * 2 = 16 KB, twice D=64's 8 KB, so
-// K and V together cost 32 KB per buffer: 96 KB at three buffers, 64 KB at two, against CDNA4's
-// 160 KB per CU. What makes 96 KB free rather than expensive is that this kernel gets ONE workgroup
-// per CU regardless: 512 threads is 8 waves, the fp32 output accumulator alone is
-// Q_BLOCK_SIZE * D / WARP_THREADS = 64 VGPRs per lane, and the allocation lands in the
-// 2-waves-per-SIMD tier (512 / 2 = 256 VGPR budget). Two waves per SIMD times four SIMDs is exactly
-// one workgroup, so a second could not be resident whatever LDS asked for, and 96 KB of 160 KB
-// costs nothing. At D=64, where four waves/SIMD makes two workgroups resident, the same choice is
-// 96 KB of *shared* LDS and the arithmetic is not the same one.
 constexpr int V_STAGE_BUFS = 3;
 
 // A workgroup whose whole KV range is shorter than the unroll factor cannot fill even one unrolled
@@ -451,37 +406,35 @@ __device__ inline void mask_prob_tile(RT &att, int q_base, int kv_base, int Skv,
 }
 
 // The QK product, with K's LDS reads consumed under *counted* waits instead of one full drain.
-// Same 16 ds_read_b128, same 32 MFMAs, same accumulation order within every output tile, and no
+// Same 8 ds_read_b128, same 16 MFMAs, same accumulation order within every output tile, and no
 // live range changed -- the reads are issued exactly where they were and the consumers only move
 // earlier -- so this is the one form of LDS-read/MFMA overlap that cannot cost a register.
 //
 // Why the counting is exact. lgkmcnt counts outstanding LDS ops and LDS returns in order, so after
-// the loader's 16 reads a wait at lgkmcnt(16-4r) guarantees the first 4r have landed. That holds
-// even if this iteration's four staging `buffer_load ... lds` also increment lgkmcnt: they are
-// issued *before* the reads, so of the 16+d outstanding ops a wait at N retires at least 16-N of
-// them that are ds_reads, and ds_reads retire in order. (There are four DMAs, not two, because a
-// 16 KB tile at 16 B per thread over 512 threads is two buffer_load_dwordx4 per tensor.)
+// the loader's 8 reads a wait at lgkmcnt(8-2r) guarantees the first 2r have landed. That holds even
+// if this iteration's two staging `buffer_load ... lds` also increment lgkmcnt: they are issued
+// *before* the reads, so of the 8+d outstanding ops a wait at N retires at least 8-N of them that
+// are ds_reads, and ds_reads retire in order.
 //
 // The read -> register map is derived from the library's row-layout shared->register loader, not
-// guessed; verify against the ISA again if that loader changes.
-// For k_reg = rt<bf16,64,128,row_l,rt_16x32_s> out of st_bf<64,128,st_32x32_s> the loader's nest
-// is (k: 1 stride group) x (i: 2 register subtiles per shared subtile column) x (j: 1) x (ii: 2,
-// jj: 4 shared subtiles), emitting register_row = 2*ii + i, register_col = jj at shared-subtile
-// byte offset 2048*(4*ii + jj). So the sixteen reads fill, in order,
-//     tiles[0][0..3], tiles[2][0..3],   (i=0, ii=0 then ii=1)
-//     tiles[1][0..3], tiles[3][0..3].   (i=1, the same eight offsets)
-// This is D=64's pattern with the D axis four subtiles wide instead of two, so the group order
-// below is unchanged; only the number of reads per KV base row is (2 -> 4).
+// guessed. For k_reg = rt<bf16,64,64,row_l,rt_16x32_s> out of st_bf<64,64,st_32x32_s> the loader's
+// nest is (k: 1 stride group) x (i: 2 register subtiles per shared subtile column) x (j: 1) x
+// (ii,jj: the 2x2 shared subtiles), emitting register_row = 2*ii + i, register_col = jj at
+// shared-subtile byte offset 2048*(2*ii + jj). So the eight reads fill, in order,
+//     tiles[0][0], tiles[0][1], tiles[2][0], tiles[2][1],   (i=0, offsets 0/0x800/0x1000/0x1800)
+//     tiles[1][0], tiles[1][1], tiles[3][0], tiles[3][1].   (i=1, the same four offsets)
+// The ISA confirms it instruction for instruction: eight ds_read_b128 with exactly those offsets in
+// that order, and the MFMAs consuming reads 1-2 are the ones whose accumulator is
+// att_block.tiles[0][*]. Verify against the ISA again if the library's loader changes.
 //
-// mma_AtB pairs output tile [n][m] with a.tiles[kk][n] for kk over the reduction, and a is k_reg
-// transposed -- which for these paired shapes is a pure type pun, so a.tiles[kk][n] IS
-// k_reg.tiles[n][kk] and as_qk_operand() below takes the pun directly rather than through
-// transpose(), which keeps the dependence exact instead of routing it through a copy the coalescer
-// is expected to remove. That pun is what keeps a second 64-VGPR copy of K off the books at D=128.
-// Output row n therefore needs exactly the four reads that fill k_reg.tiles[n][0..3]:
-//     n = 0 -> reads 1-4    n = 2 -> reads 5-8    n = 1 -> reads 9-12    n = 3 -> reads 13-16
+// mma_AtB pairs output tile [n][m] with a.tiles[0][n] and a.tiles[1][n], and a is k_reg transposed
+// -- which for these paired shapes is a pure type pun, so a.tiles[kk][n] IS k_reg.tiles[n][kk] and
+// as_qk_operand() below takes the pun directly rather than through transpose(), which keeps the
+// dependence exact instead of routing it through a copy the coalescer is expected to remove.
+// Output row n therefore needs exactly the two reads that fill k_reg.tiles[n][0..1]:
+//     n = 0 -> reads 1,2     n = 2 -> reads 3,4     n = 1 -> reads 5,6     n = 3 -> reads 7,8
 // which is why the groups run in KV order 0, 2, 1, 3: that is *read* order, and it is what makes
-// the waits monotone (12, 8, 4, 0).
+// the waits monotone.
 //
 // THE WAIT HAS TO BE A DATA DEPENDENCE, NOT A FENCE. This is the one non-obvious piece, and getting
 // it wrong is silent.
@@ -495,8 +448,8 @@ __device__ inline void mask_prob_tile(RT &att, int q_base, int kv_base, int Skv,
 // arrive in time -- i.e. a missing waitcnt is invisible to the correctness gate and will surface as
 // a wrong answer on some unrelated scheduling change.
 //
-// So the wait is given the base tiles it releases as read-write operands. It emits nothing but the
-// s_waitcnt, and every MFMA that consumes those registers is ordered below it by a real def-use
+// So the wait is given the two base tiles it releases as read-write operands. It emits nothing but
+// the s_waitcnt, and every MFMA that consumes those registers is ordered below it by a real def-use
 // edge. That also means no fence is needed at all, so the scheduler keeps the freedom to interleave
 // the 32 v_exp_f32 into the MFMA bursts.
 //
@@ -507,39 +460,31 @@ __device__ inline void mask_prob_tile(RT &att, int q_base, int kv_base, int Skv,
 typedef __attribute__((__vector_size__(8 * sizeof(__bf16)))) __bf16 hk_bf16x8_t;
 
 template <int N>
-__device__ __forceinline__ void wait_lgkmcnt_release(bf16_2 (&d0)[4], bf16_2 (&d1)[4],
-                                                     bf16_2 (&d2)[4], bf16_2 (&d3)[4]) {
+__device__ __forceinline__ void wait_lgkmcnt_release(bf16_2 (&d0)[4], bf16_2 (&d1)[4]) {
     hk_bf16x8_t v0 = *(hk_bf16x8_t *)d0;
     hk_bf16x8_t v1 = *(hk_bf16x8_t *)d1;
-    hk_bf16x8_t v2 = *(hk_bf16x8_t *)d2;
-    hk_bf16x8_t v3 = *(hk_bf16x8_t *)d3;
-    if constexpr (N == 12) {
-        asm volatile("s_waitcnt lgkmcnt(12)"
-                     : "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3) : : "memory");
-    } else if constexpr (N == 8) {
-        asm volatile("s_waitcnt lgkmcnt(8)"
-                     : "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3) : : "memory");
+    if constexpr (N == 6) {
+        asm volatile("s_waitcnt lgkmcnt(6)" : "+v"(v0), "+v"(v1) : : "memory");
     } else if constexpr (N == 4) {
-        asm volatile("s_waitcnt lgkmcnt(4)"
-                     : "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3) : : "memory");
+        asm volatile("s_waitcnt lgkmcnt(4)" : "+v"(v0), "+v"(v1) : : "memory");
+    } else if constexpr (N == 2) {
+        asm volatile("s_waitcnt lgkmcnt(2)" : "+v"(v0), "+v"(v1) : : "memory");
     } else {
         static_assert(N == 0, "unsupported lgkm count");
-        asm volatile("s_waitcnt lgkmcnt(0)"
-                     : "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3) : : "memory");
+        asm volatile("s_waitcnt lgkmcnt(0)" : "+v"(v0), "+v"(v1) : : "memory");
     }
     *(hk_bf16x8_t *)d0 = v0;
     *(hk_bf16x8_t *)d1 = v1;
-    *(hk_bf16x8_t *)d2 = v2;
-    *(hk_bf16x8_t *)d3 = v3;
 }
 
-// The same construction on V's read, and it is a correctness fix rather than a schedule change.
+// The same construction on V's read, and here it is a correctness requirement rather than a
+// scheduling preference.
 //
-// V's ds_read_b64_tr_b16 fill the base tiles of v_reg and are consumed by the PV MFMAs below the
-// per-iteration barrier. The weak idiom -- bare asm volatile("s_waitcnt lgkmcnt(0)") followed by
-// sched_barrier(0) -- does not order them, for the reason recorded above: an INLINEASM matches none
-// of the instruction classes SCHED_BARRIER knows about, so LLVM links the two not at all and may
-// sink the wait past the very MFMAs the fence was written to gate.
+// V's 16 ds_read_b64_tr_b16 fill the eight base tiles of v_reg and are consumed by the sixteen PV
+// MFMAs below the per-iteration barrier. The weak idiom -- bare asm volatile("s_waitcnt lgkmcnt(0)")
+// followed by sched_barrier(0) -- does not order them, for the reason recorded above: an INLINEASM
+// matches none of the instruction classes SCHED_BARRIER knows about, so LLVM links the two not at
+// all and may sink the wait past the very MFMAs the fence was written to gate.
 //
 // What holds the order in that form is worth writing down, because it is three unrelated statements
 // and none of them is local to the wait:
@@ -559,46 +504,32 @@ __device__ __forceinline__ void wait_lgkmcnt_release(bf16_2 (&d0)[4], bf16_2 (&d
 // dereferenced pointer is rejected outright ("cannot handle tied indirect register inputs"), so
 // each base tile's four bf16_2 are pulled into one 16-byte vector, laundered, and written back --
 // the same cast kittens::mfma161632 applies to the same array, and the round trip coalesces away.
-//
-// At D = 128 v_reg is a 2x8 grid, i.e. sixteen base tiles and 64 VGPRs, filled by 32
-// ds_read_b64_tr_b16. The release is issued as one lgkmcnt(0) per base-tile ROW rather than one
-// statement naming all sixteen: two side-effecting asm blocks may not be reordered against each
-// other, and both are lgkmcnt(0), so the pair is exactly as strong as a single wait would be --
-// while asking the allocator to hold "only" eight 16-byte vectors in VGPRs across one asm boundary
-// instead of sixteen. The second s_waitcnt costs one instruction and retires nothing.
-template <int ROW, typename VT>
-__device__ __forceinline__ void wait_lgkmcnt0_release_v_row(VT &v) {
-    static_assert(VT::width == 8,
-                  "V's PV operand is 8 base tiles wide at D=128 and the launder names all eight");
+template <typename VT>
+__device__ __forceinline__ void wait_lgkmcnt0_release_v(VT &v) {
+    static_assert(VT::height == 2 && VT::width == 4,
+                  "V's PV operand is a 2x4 grid of base tiles and the launder names all eight");
     static_assert(sizeof(v.tiles[0][0].data) == sizeof(hk_bf16x8_t),
                   "a base tile must be exactly one 16-byte vector for the launder to be a no-op");
-    hk_bf16x8_t a0 = *(hk_bf16x8_t *)v.tiles[ROW][0].data;
-    hk_bf16x8_t a1 = *(hk_bf16x8_t *)v.tiles[ROW][1].data;
-    hk_bf16x8_t a2 = *(hk_bf16x8_t *)v.tiles[ROW][2].data;
-    hk_bf16x8_t a3 = *(hk_bf16x8_t *)v.tiles[ROW][3].data;
-    hk_bf16x8_t a4 = *(hk_bf16x8_t *)v.tiles[ROW][4].data;
-    hk_bf16x8_t a5 = *(hk_bf16x8_t *)v.tiles[ROW][5].data;
-    hk_bf16x8_t a6 = *(hk_bf16x8_t *)v.tiles[ROW][6].data;
-    hk_bf16x8_t a7 = *(hk_bf16x8_t *)v.tiles[ROW][7].data;
+    hk_bf16x8_t a0 = *(hk_bf16x8_t *)v.tiles[0][0].data;
+    hk_bf16x8_t a1 = *(hk_bf16x8_t *)v.tiles[0][1].data;
+    hk_bf16x8_t a2 = *(hk_bf16x8_t *)v.tiles[0][2].data;
+    hk_bf16x8_t a3 = *(hk_bf16x8_t *)v.tiles[0][3].data;
+    hk_bf16x8_t a4 = *(hk_bf16x8_t *)v.tiles[1][0].data;
+    hk_bf16x8_t a5 = *(hk_bf16x8_t *)v.tiles[1][1].data;
+    hk_bf16x8_t a6 = *(hk_bf16x8_t *)v.tiles[1][2].data;
+    hk_bf16x8_t a7 = *(hk_bf16x8_t *)v.tiles[1][3].data;
     asm volatile("s_waitcnt lgkmcnt(0)"
                  : "+v"(a0), "+v"(a1), "+v"(a2), "+v"(a3), "+v"(a4), "+v"(a5), "+v"(a6), "+v"(a7)
                  :
                  : "memory");
-    *(hk_bf16x8_t *)v.tiles[ROW][0].data = a0;
-    *(hk_bf16x8_t *)v.tiles[ROW][1].data = a1;
-    *(hk_bf16x8_t *)v.tiles[ROW][2].data = a2;
-    *(hk_bf16x8_t *)v.tiles[ROW][3].data = a3;
-    *(hk_bf16x8_t *)v.tiles[ROW][4].data = a4;
-    *(hk_bf16x8_t *)v.tiles[ROW][5].data = a5;
-    *(hk_bf16x8_t *)v.tiles[ROW][6].data = a6;
-    *(hk_bf16x8_t *)v.tiles[ROW][7].data = a7;
-}
-
-template <typename VT>
-__device__ __forceinline__ void wait_lgkmcnt0_release_v(VT &v) {
-    static_assert(VT::height == 2, "V's PV operand is two base-tile rows at D=128");
-    wait_lgkmcnt0_release_v_row<0>(v);
-    wait_lgkmcnt0_release_v_row<1>(v);
+    *(hk_bf16x8_t *)v.tiles[0][0].data = a0;
+    *(hk_bf16x8_t *)v.tiles[0][1].data = a1;
+    *(hk_bf16x8_t *)v.tiles[0][2].data = a2;
+    *(hk_bf16x8_t *)v.tiles[0][3].data = a3;
+    *(hk_bf16x8_t *)v.tiles[1][0].data = a4;
+    *(hk_bf16x8_t *)v.tiles[1][1].data = a5;
+    *(hk_bf16x8_t *)v.tiles[1][2].data = a6;
+    *(hk_bf16x8_t *)v.tiles[1][3].data = a7;
 }
 
 // k_reg.tiles[n][kk] reinterpreted as the [32 x 16] col-layout A operand of a 16x16x32 -- the same
@@ -614,26 +545,21 @@ __device__ __forceinline__ rt_base<bf16, col_l, rt_32x16_s> &as_qk_operand(
 template <int NGROUPS, int G, typename DT, typename KT, typename BT>
 __device__ __forceinline__ void qk_counted_group(DT &d, KT &k, const BT &b) {
     constexpr int rows_per_group = DT::height / NGROUPS;
-    // KV base-tile rows in the order the loader's sixteen reads complete them.
+    // KV base-tile rows in the order the loader's eight reads complete them.
     constexpr int read_order[4] = {0, 2, 1, 3};
     constexpr int first = G * rows_per_group;
-    // The reduction is D/32 chunks wide, which is also how many reads fill one KV base row.
-    constexpr int KW = KT::width;
 
 #pragma unroll
     for (int r = 0; r < rows_per_group; ++r) {
         const int n = read_order[first + r];
-        // KW reads fill each KV base row, so after this group's rows the last read still in
-        // flight is number KW*rows_per_group*(G+1) of 4*KW.
-        wait_lgkmcnt_release<4 * KW - KW * rows_per_group * (G + 1)>(
-            k.tiles[n][0].data, k.tiles[n][1].data, k.tiles[n][2].data, k.tiles[n][3].data);
+        // Two reads fill each KV base row, so after this group's rows the last read still in
+        // flight is number 2*rows_per_group*(G+1) of 8.
+        wait_lgkmcnt_release<8 - 2 * rows_per_group * (G + 1)>(k.tiles[n][0].data,
+                                                              k.tiles[n][1].data);
 #pragma unroll
         for (int m = 0; m < DT::width; ++m) {
-#pragma unroll
-            for (int kk = 0; kk < KW; ++kk) {
-                mma_AtB_base(d.tiles[n][m], as_qk_operand(k.tiles[n][kk]), b.tiles[kk][m],
-                             d.tiles[n][m]);
-            }
+            mma_AtB_base(d.tiles[n][m], as_qk_operand(k.tiles[n][0]), b.tiles[0][m], d.tiles[n][m]);
+            mma_AtB_base(d.tiles[n][m], as_qk_operand(k.tiles[n][1]), b.tiles[1][m], d.tiles[n][m]);
         }
     }
     if constexpr (G + 1 < NGROUPS) qk_counted_group<NGROUPS, G + 1>(d, k, b);
@@ -641,33 +567,32 @@ __device__ __forceinline__ void qk_counted_group(DT &d, KT &k, const BT &b) {
 
 template <int NGROUPS, typename DT, typename KT, typename BT>
 __device__ __forceinline__ void qk_counted_lds(DT &d, KT &k, const BT &b) {
-    static_assert(DT::height == 4 && KT::width == 4, "read order derived for a 4x4 QK product");
+    static_assert(DT::height == 4 && KT::width == 2, "read order derived for a 4x2 QK product");
     static_assert(NGROUPS == 2 || NGROUPS == 4, "group count must divide the four KV base rows");
     qk_counted_group<NGROUPS, 0>(d, k, b);
 }
 
-// The second __launch_bounds__ argument is HIP's *minimum waves per EU*, i.e. a floor on occupancy
-// and therefore a ceiling on the VGPR budget: 512 / waves. D=64 asks for 4 because its tier
-// boundary is 128 registers and the allocator would otherwise spend a whole tier to save a
-// rematerialization.
-//
-// D=128 cannot ask for that and it is not close. The fp32 output accumulator alone is
-// Q_BLOCK_SIZE * D / WARP_THREADS = 64 VGPRs per lane -- twice D=64's -- and q_reg_transposed
-// doubles from 16 to 32, so the floor is roughly D=64's 128 plus 48 before any transient. The
-// ladder is floor(512 / waves): 128 buys 4 waves/SIMD, 170 buys 3, 256 buys 2. Three is arithmetically
-// out of reach once k_reg (64 VGPRs) and v_reg (64) are added to that floor, so asking for it would
-// only buy spills, and spilling a 64-VGPR accumulator to scratch costs far more than the tier. At
-// 8 waves per workgroup, 2 waves/SIMD is exactly one workgroup per CU -- which is what makes
-// V_STAGE_BUFS = 3 free. The resource report is therefore part of this kernel's contract:
-// 251 VGPRs or fewer / 0 spills / 2 waves per SIMD.
+// The second __launch_bounds__ argument is HIP's *minimum waves per EU*. Leaving it at the default
+// hands the allocator a 256-VGPR budget, and it will happily spend a whole occupancy tier to save a
+// rematerialization; asking for 4 pins the tier this kernel wants, whose boundary is 128 registers.
+// The resource report is therefore part of this kernel's contract: 128 VGPRs / 0 AGPRs / 4 waves
+// per SIMD. Any change that moves VGPRs above 128 has silently bought a 2x occupancy loss.
 //
 // Q_FAST selects which grid axis carries the q block, and it is a template parameter so the two
 // index decodes below fold away entirely. The launcher picks it from the shape's own work profile;
 // see u_varies_with_qblock().
 template <bool Q_FAST>
-__global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
+__global__ __launch_bounds__(NUM_THREADS, 4) void hk_attn_fwd_ker(
     const _gl_QKVO Qg, const _gl_QKVO Kg, const _gl_QKVO Vg, const _gl_QKVO Og, const _gl_L Lg,
     int Sq, int Skv, int Hq, int Hkv, int window_left, float softmax_scale) {
+#if !defined(__gfx950__)
+    // Every MFMA and transposing-LDS atom this kernel is built on is gfx950-only, so on any
+    // other device pass the body is replaced rather than compiled -- which is what lets one
+    // multi-arch build carry these sources. Unreachable at runtime: the Python layer refuses
+    // a non-gfx950 device before it can launch.
+    assert(false && "hipkittens attention requires gfx950");
+    return;
+#else
 
     // The eight waves cooperate on the K and V tiles, so they must be on the same KV tile at the
     // same time: the loop below runs the union of their eight KV ranges and each wave predicates
@@ -691,12 +616,13 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
     // Relabelling the head axis XCD-major fixes that without touching the histogram. Reading x as
     // an 8 x (Hq/8) array and transposing it gives residue r the *contiguous* head block
     // [r*Hq/8, (r+1)*Hq/8), so a kv head's whole q-head group is on one XCD: streams per XCD 16 ->
-    // 2 and sharers per stream 4 -> 32 on the 4x128/16 rows. It is a bijection on [0, Hq) whenever
-    // 8 divides Hq, so the same (head, q block, batch) triples exist, each CTA computes exactly
-    // what it computed before, no accumulation order changes, and the q-block dispatch sequence --
-    // hence the descending longest-processing-time order below -- is untouched. Every head
-    // carries the same work, so per-XCD work stays exactly 1.000x, which is the constraint round
-    // 022 measured the violation of at -5.74%.
+    // 2 and sharers per stream 4 -> 32. It is a bijection on [0, Hq) whenever 8 divides Hq, so the
+    // same (head, q block, batch) triples exist, each CTA computes exactly what it computed before,
+    // no accumulation order changes, and the q-block dispatch sequence -- hence the descending
+    // longest-processing-time order below -- is untouched. Every head carries the same work, so
+    // per-XCD work stays exactly 1.000x. That last property is the binding constraint: a relabel
+    // that improves locality but skews per-XCD work costs more than the locality gains, measured
+    // at -5.74%.
     const int nhx = Hq >> 3;
     const int head_xcd_major = ((blockIdx.x & 7) * nhx) + (blockIdx.x >> 3);
     const int head_idx = Q_FAST ? blockIdx.y : ((Hq & 7) ? (int)blockIdx.x : head_xcd_major);
@@ -722,9 +648,9 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
     //     varies with the q block, which costs far more than the locality gains.
     //
     // So the axis choice is a shape property: U constant => q block fastest, for the locality;
-    // U varying => q block slow and descending, for the balance. Both ends were measured and
-    // the crossover is exact -- every constant-U row gains 1.5-3.9% from the fast axis and every
-    // varying-U row loses 0.9-32%. The launcher evaluates the predicate exactly, from the same
+    // U varying => q block slow and descending, for the balance. Both ends were measured and the
+    // crossover is clean -- every constant-U shape gains 1.5-3.9% from the fast axis and every
+    // varying-U shape loses 0.9-32%. The launcher evaluates the predicate exactly, from the same
     // bound functions the kernel uses.
     //
     // Either way this is a pure relabel: the same (head, q block, batch) triples exist, each CTA
@@ -737,7 +663,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
     // A buffer descriptor has to be in SGPRs, so a divergent one makes the backend wrap every load
     // and store in a waterfall loop: four v_readfirstlane, two 64-lane 64-bit v_cmp, an exec
     // save/xor and a back edge to peel one descriptor value per iteration. The value is identical
-    // in all 64 lanes, so each loop ran exactly once and eleven of its twelve instructions were
+    // in all 64 lanes, so each loop runs exactly once and eleven of its twelve instructions are
     // overhead -- 144 instructions per wave to issue 12 memory instructions, plus a
     // readfirstlane/m0 pair per staging DMA in the loop header and an exec-mask dance where the
     // active predicate wants an s_cmp. Reading lane 0's copy asserts the uniformity that was always
@@ -769,8 +695,6 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
     qo_tile<bf16> q_reg;
     qo_tile_transposed<bf16> q_reg_transposed;
     kv_tile<bf16> k_reg;
-    // There is deliberately no materialized k_reg_transposed: the QK A operand is reached through
-    // as_qk_operand()'s type pun instead. At D=128 that copy would have been another 64 VGPRs.
     // The PV operands are rt_32x16_*4*, i.e. stride 4, where K and Q are stride 8. Both encode a
     // 32-row operand of a 16x16x32, but the stride-4 form lays the reduction axis out as
     // kv = 16*(s/4) + 4*(lane>>4) + (s%4) instead of the canonical 8*(lane>>4) + s. An MFMA is
@@ -791,8 +715,8 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
     // MFMA accumulator cannot be rescaled in place, so a running max that rebases the denominator
     // mid-loop would rule this out.
     //
-    // The reduction is [1 x KV] x [KV x Q], which the library's mma wrappers cannot express (no
-    // one-row operand), so this drops to kittens::mfma161632 -- the thin wrapper over
+    // The reduction is [1 x KV] x [KV x Q], which the library's mma wrappers cannot express (they
+    // have no one-row operand), so this drops to kittens::mfma161632 -- the thin wrapper over
     // __builtin_amdgcn_mfma_f32_16x16x32_bf16 -- fed the register quads already held.
     //
     // Each of att_bf16_in's base tiles is a [32 kv x 16 q] B operand of a 16x16x32, i.e.
@@ -881,6 +805,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
     // the benefit of a static trip count actually lands, and it is obtained by unrolling -- no
     // compile-time shape is needed for it.
     auto kv_tile_body = [&](const int j, const int buf, const int nbuf) {
+        // Both fills are unconditional: they are whole-workgroup operations, so every wave owes
         // ---- STAGE 1: issue the NEXT tile's K and V global->LDS DMAs -------------------------
         // Unconditional, because they are whole-workgroup operations: every wave owes its share on
         // every union iteration, even one that has no compute of its own. Both go to the buffer
@@ -890,8 +815,8 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
         // below is a constant.
         //
         // Staging V through LDS rather than loading it global->register is not optional: a col_l
-        // global->register load of V is 128 two-byte gathers at D=128, which alone overruns the
-        // 6-bit vmcnt counter.
+        // global->register load of V is 64 two-byte gathers, which alone overruns the 6-bit vmcnt
+        // counter.
         {
             const int jn = (j + 1 < j_end) ? (j + 1) : j;
             // The whole per-tile address cost, for both tensors: one 32x32 -> 64 multiply and one
@@ -951,35 +876,6 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
             // tile fully masked for some row made its rescale compute exp2((-inf) - (-inf)) = NaN,
             // and with no rescale that failure mode does not exist.
             exp2(att_block, att_block);
-
-            // The QK software pipeline, stated as a DEPTH rather than just a pairing: the 32 MFMAs
-            // and the 32 exponentials are dealt into alternating groups with the exponentials
-            // running HK_QK_EXP_LEAD groups behind, so that every chain's terminal MFMA is at least
-            // LEAD*GRP issue slots ahead of the exponentials that read its accumulators. That
-            // window is W = 8, of which the scheduler left to itself fills only 1-4 with real work
-            // and pads the rest with s_nop. See the note at HK_QK_EXP_GRP.
-#if HK_QK_EXP_LEAD
-            {
-                constexpr int GRP = HK_QK_EXP_GRP;
-                constexpr int NG = 32 / GRP;
-                constexpr int LEAD = HK_QK_EXP_LEAD;
-                static_assert(LEAD >= 1 && LEAD <= NG,
-                              "the pipeline lead must fit inside the group count");
-                static_assert(LEAD * GRP >= 8,
-                              "a lead shorter than W = 8 slots cannot fill the hazard window");
-#pragma unroll
-                for (int g = 0; g < LEAD; ++g)
-                    __builtin_amdgcn_sched_group_barrier(0x008, GRP, 0);  // MFMA
-#pragma unroll
-                for (int g = 0; g < NG - LEAD; ++g) {
-                    __builtin_amdgcn_sched_group_barrier(0x400, GRP, 0);  // TRANS
-                    __builtin_amdgcn_sched_group_barrier(0x008, GRP, 0);  // MFMA
-                }
-#pragma unroll
-                for (int g = 0; g < LEAD; ++g)
-                    __builtin_amdgcn_sched_group_barrier(0x400, GRP, 0);  // TRANS
-            }
-#endif
 
             // ---- STAGE 4: mask, on the probabilities ------------------------------------------
             // A masked entry is set to 0, which is exactly the value exp2(-inf) would have
@@ -1055,15 +951,15 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
         __builtin_amdgcn_sched_barrier(0);
 
         // O^T += V^T * P^T. Kept below the barrier even though both operands are ready above it:
-        // the rendezvous releases every wave at the same instant, and the PV MFMAs are the
+        // the rendezvous releases every wave at the same instant, and sixteen MFMAs are the
         // cheapest independent work to hand them there.
         if (active) {
-            // The wait that releases V's ds_read_b64_tr_b16, on the far side of the rendezvous and
-            // immediately in front of the only thing that consumes them. This is only safe because
-            // the wait carries those registers as read-write operands: the two side-effecting
-            // statements that would otherwise pin it in place -- the pre-barrier vmcnt(0) and the
-            // s_barrier -- are ABOVE it, so a fence-based wait here would be free to sink below the
-            // very MFMAs it gates. See wait_lgkmcnt0_release_v.
+            // The wait that releases V's sixteen ds_read_b64_tr_b16, on the far side of the
+            // rendezvous and immediately in front of the only thing that consumes them. This is
+            // only safe because the wait carries those registers as read-write operands: the two
+            // side-effecting statements that would otherwise pin it in place -- the pre-barrier
+            // vmcnt(0) and the s_barrier -- are ABOVE it, so a fence-based wait here would be free
+            // to sink below the very MFMAs it gates. See wait_lgkmcnt0_release_v.
             wait_lgkmcnt0_release_v(v_reg);
             mma_AtB(o_reg, v_reg, att_bf16_in, o_reg);
         }
@@ -1080,11 +976,13 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
     // selected into an SGPR: `? 1 : 0` canonicalises to `zext i1` and lowers through v_cndmask_b32,
     // which would put a workgroup-uniform predicate on the vector unit.
     //
-    // BE CAREFUL DELETING THE ROLLED BODY BECAUSE NOTHING REACHES IT. At D=64, compiling the
-    // rarely-taken copy anyway measurably improves the allocator's choices inside the copy that
-    // does run -- spills and scratch both halve -- and deleting it reverts that exactly. Whether the
-    // same holds here, where register pressure is a whole tier higher, has not been measured either
-    // way. Re-read the resource report rather than assuming.
+    // DO NOT DELETE THE ROLLED BODY BECAUSE NOTHING REACHES IT. Every shape of interest has a
+    // minimum trip count of four, so the rolled copy is effectively dead code -- and compiling it
+    // anyway is what takes this kernel from 3 spilled VGPRs and 16 B/lane of scratch to 1 and 8, and
+    // its steady-state SALU per KV tile from 91.33 to 90.00, at the same 128 VGPRs and 4 waves/SIMD.
+    // Deleting it reverts all three numbers exactly and costs ~0.4% on the long full-causal shapes.
+    // This is an allocator side-effect rather than a designed one, so it is fragile: any round that
+    // restructures this loop must re-read the resource report rather than assume it survives.
     if (j_end - j_begin >= UNROLL_MIN_TRIPS) {
         for (int j_blk = j_begin; j_blk < j_end; j_blk += V_STAGE_BUFS) {
 #pragma unroll
@@ -1123,6 +1021,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void hk_attn_fwd_ker(
     // exp2 above a natural exp. So lse = ln(sum), and kittens' log() is the natural log.
     log(norm_vec, norm_vec);
     store(Lg, norm_vec, {batch_idx, head_idx, 0, q_tile});
+#endif  // __gfx950__
 }
 
 // Does a CTA's union KV extent depend on which q block it is? Evaluated with the kernel's own
@@ -1152,34 +1051,32 @@ static bool u_varies_with_qblock(int Sq, int Skv, int window_left, int ny) {
     return false;
 }
 
-// py::bind_function only forwards a globals struct built from tensors, with no way to pass runtime
-// scalars, so the binding is written out by hand here.
 }  // namespace
 
-// See the note on the D=64 twin: these are what the Python wrapper pads Sq/Skv to, exported so
-// the two cannot drift apart silently.
-void hk_attn_fwd_d128_blocks(int64_t *q_block, int64_t *kv_block) {
+// The block sizes the Python wrapper zero-pads Sq/Skv to. A disagreement between the two reads
+// past the end of a tensor rather than failing, so they are exported and checked there rather
+// than duplicated on trust.
+void hk_attn_fwd_d64_blocks(int64_t *q_block, int64_t *kv_block) {
     *q_block = Q_BLOCK_SIZE;
     *kv_block = KV_BLOCK_SIZE;
 }
 
-void hk_attn_fwd_d128(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
-                      const at::Tensor &o, const at::Tensor &lse, int Sq, int Skv, int B, int Hq,
-                      int Hkv, int window_left, float softmax_scale) {
-    auto Qg = make_gl_from_tensor<_gl_QKVO>(q, "q");
-    auto Kg = make_gl_from_tensor<_gl_QKVO>(k, "k");
-    auto Vg = make_gl_from_tensor<_gl_QKVO>(v, "v");
-    auto Og = make_gl_from_tensor<_gl_QKVO>(o, "o");
-    auto Lg = make_gl_from_tensor<_gl_L>(lse, "lse");
+void hk_attn_fwd_d64(const HkTensorDesc &q, const HkTensorDesc &k, const HkTensorDesc &v,
+                     const HkTensorDesc &o, const HkTensorDesc &lse, int Sq, int Skv, int B, int Hq,
+                     int Hkv, int window_left, float softmax_scale) {
+    auto Qg = make_gl_from_desc<_gl_QKVO>(q);
+    auto Kg = make_gl_from_desc<_gl_QKVO>(k);
+    auto Vg = make_gl_from_desc<_gl_QKVO>(v);
+    auto Og = make_gl_from_desc<_gl_QKVO>(o);
+    auto Lg = make_gl_from_desc<_gl_L>(lse);
 
     const int q_tiles = (Sq + Q_BLOCK_SIZE - 1) / Q_BLOCK_SIZE;
     const int ny = (q_tiles + NUM_WARPS - 1) / NUM_WARPS;
 
-    // 96 KB: K and V, each triple-buffered at 16 KB, against CDNA4's 160 KB per CU. This is past
-    // the 64 KB static limit, so it MUST be dynamic shared memory with the opt-in below -- the
-    // launch would otherwise fail outright rather than quietly do the wrong thing. Only one
-    // workgroup is resident per CU at 2 waves/SIMD (see __launch_bounds__), so 96 KB of 160 KB is
-    // not shared with anybody and the third buffer is free.
+    // 48 KB: K and V, each triple-buffered at 8 KB, against CDNA4's 160 KB -- so two workgroups per
+    // CU is 96 KB and still fits. Past 64 KB this would have to be dynamic shared memory with the
+    // opt-in requested once per kernel, which is why the opt-in is here even though the current
+    // request is well under the static limit.
     constexpr size_t smem_bytes = v_stage_bytes + k_stage_bytes;
     static_assert(smem_bytes <= kittens::MAX_SHARED_MEMORY, "K/V staging exceeds LDS");
     [[maybe_unused]] static const bool smem_opt_in = [] {

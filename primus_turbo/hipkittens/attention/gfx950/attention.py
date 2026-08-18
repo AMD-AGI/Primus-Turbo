@@ -8,10 +8,12 @@
 
 """HipKittens flash attention for gfx950 (MI355X), forward and backward.
 
-The kernels are compiled into ``primus_turbo.pytorch._C_hipkittens``, which is only built
-when the build targets gfx950 -- see ``build_hipkittens_extension`` in setup.py. This module
-is the layer between them and the op API: it checks the envelope, pads the sequence axes to
-the tile sizes the kernels report, and owns every workspace allocation.
+The kernels are compiled into ``primus_turbo.pytorch._C`` like every other turbo kernel and
+reached through ``torch.ops.primus_turbo_cpp_extension.hk_attn_*``. They are built in every
+arch configuration but each body is guarded on ``__gfx950__``, so on any other card they
+compile to an assert-and-return; nothing in the build stops them being called, which is what
+this module is for. It checks the envelope, pads the sequence axes to the tile sizes the
+kernels report, and owns every workspace allocation.
 
 WHAT THESE KERNELS ADMIT, all enforced by :func:`hipkittens_attn_supported`:
 
@@ -65,14 +67,13 @@ _DKDV_SPLIT_VALUES = {64: (1, 2, 4, 8), 128: (1, 2, 4, 5, 8)}
 
 
 def _ops():
-    """The op namespace, imported lazily so a non-gfx950 build can still import this module.
+    """The op namespace. These are ordinary primus_turbo_cpp_extension ops.
 
-    The ops live in primus_turbo_cpp_extension like every other turbo op; the gfx950-only
-    extension adds them to it with TORCH_LIBRARY_FRAGMENT, so importing it is what makes them
-    resolvable.
+    The kernels are compiled into every arch configuration -- each body is guarded on
+    __gfx950__ and asserts on any other device pass -- so there is no separate extension to
+    import and no build in which these ops are absent. What keeps them off the wrong card is
+    the is_gfx950() check in hipkittens_attn_supported, not the build.
     """
-    import primus_turbo.pytorch._C_hipkittens  # noqa: F401  (registers the ops)
-
     return torch.ops.primus_turbo_cpp_extension
 
 

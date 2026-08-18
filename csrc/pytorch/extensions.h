@@ -401,4 +401,48 @@ void register_odc_rocshmem_host(pybind11::module_ &m);
 void register_odc_rocshmem_gda(pybind11::module_ &m);
 #endif
 
+
+//==================================================================
+//  HipKittens attention (gfx950)
+//==================================================================
+
+void hk_attn_fwd_d64(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at::Tensor &o,
+                     at::Tensor &lse, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq, int64_t Hkv,
+                     int64_t window_left, double softmax_scale);
+
+void hk_attn_fwd_d128(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at::Tensor &o,
+                      at::Tensor &lse, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq, int64_t Hkv,
+                      int64_t window_left, double softmax_scale);
+
+void hk_attn_bwd_d64(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                     const at::Tensor &o, const at::Tensor &dO, at::Tensor &dq, at::Tensor &dk,
+                     at::Tensor &dv, const at::Tensor &lse, at::Tensor &delta, at::Tensor &lneg,
+                     at::Tensor &wsk, at::Tensor &wsv, int64_t Sq, int64_t Skv, int64_t B,
+                     int64_t Hq, int64_t Hkv, int64_t window_left, double softmax_scale,
+                     int64_t n_split_req);
+
+void hk_attn_bwd_d128(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                      const at::Tensor &o, const at::Tensor &dO, at::Tensor &dq, at::Tensor &dk,
+                      at::Tensor &dv, const at::Tensor &lse, at::Tensor &delta, at::Tensor &lneg,
+                      at::Tensor &wsk, at::Tensor &wsv, int64_t Sq, int64_t Skv, int64_t B,
+                      int64_t Hq, int64_t Hkv, int64_t window_left, double softmax_scale,
+                      int64_t n_split_req);
+
+void hk_attn_bwd_fused_d64(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                           const at::Tensor &o, const at::Tensor &dO, at::Tensor &dq,
+                           at::Tensor &dk, at::Tensor &dv, at::Tensor &ws, const at::Tensor &lse,
+                           at::Tensor &delta, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq,
+                           int64_t Hkv, int64_t window_left, double softmax_scale);
+
+void hk_attn_bwd_fused_d128(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                            const at::Tensor &o, const at::Tensor &dO, at::Tensor &dq,
+                            at::Tensor &dk, at::Tensor &dv, at::Tensor &ws, const at::Tensor &lse,
+                            at::Tensor &delta, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq,
+                            int64_t Hkv, int64_t window_left, double softmax_scale);
+
+int64_t hk_attn_dkdv_head_split(int64_t head_dim, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq,
+                                int64_t Hkv, int64_t window_left);
+
+std::vector<int64_t> hk_attn_block_sizes(int64_t head_dim);
+
 } // namespace primus_turbo::pytorch
