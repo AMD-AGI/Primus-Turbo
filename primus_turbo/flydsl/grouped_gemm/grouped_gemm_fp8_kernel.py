@@ -57,6 +57,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     _sgpr_tbl_pick,
     _sgpr_tbl_scan,
     _sload_i32,
+    _store_quadrants,
     _wave_count_le_i32,
     asm_mma_do,
     ceildiv,
@@ -148,29 +149,6 @@ def _nn_b_tr_mfma(mfma, raw, a_frag, c):
         for i in range_constexpr(mfma.n_tiles_a):
             c[mfma.idx(i, j)] = mfma._do_mma(a_frag[i], b_frag[j], c[mfma.idx(i, j)])
     return c, b_frag
-
-
-def _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N):
-    """Store the four accumulator quadrants at their (row, col) sub-tile offsets.
-
-    A beta=1 epilogue read-back is software-pipelined by one quadrant: quadrant i+1's
-    loads go out before quadrant i stores, so they overlap without keeping all four
-    quadrants' worth of loaded values live at once. The 4-wave wgrad runs at occupancy
-    1, so it has neither a co-resident wave to hide the latency nor the registers to
-    spare for prefetching everything up front.
-    """
-    quads = (
-        (c00, base_row + 0, base_col + 0),
-        (c01, base_row + 0, base_col + LDS_BLOCK_N),
-        (c10, base_row + LDS_BLOCK_M, base_col + 0),
-        (c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N),
-    )
-    nxt = store_c.prefetch(quads[0][1], quads[0][2])
-    for i, (frag, r, c) in enumerate(quads):
-        cur = nxt
-        if i + 1 < len(quads):
-            nxt = store_c.prefetch(quads[i + 1][1], quads[i + 1][2])
-        store_c.store(frag, r, c, prev=cur)
 
 
 def _store_split(store_c, quad, base_row, base_col, esplit, full):
@@ -3435,7 +3413,6 @@ def _wave4_do_tile_tn(
         trans=swap_n,
         col_safe=col_safe and not swap_n,
         c_base=store_base,
-        row_addr=True,
         beta_is_one=beta_is_one,
         accum_mask=(fx.Int32(band_row) < fx.Int32(0)) if (beta_is_one and split_kb0 is not None) else None,
     )

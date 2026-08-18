@@ -565,11 +565,14 @@ class FP8GemmMXFunction(torch.autograd.Function):
         trans_b: bool,
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
         supported_mxfp8_backend, reason = check_mxfp8_support()
         assert supported_mxfp8_backend, reason
 
         assert trans_a == False and trans_b == True, "trans_a has to be False and trans_b has to be True"
+
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         # Scale preshuffle is NOT done here: the quant emits raw E8M0 [dim, K//32]
         # scales and each GEMM backend implicitly preshuffles right before its own
@@ -645,6 +648,8 @@ class FP8GemmMXFunction(torch.autograd.Function):
         ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
         ctx.out_dtype = out_dtype
         ctx.config = config
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        ctx.main_grad = main_grad
 
         return out
 
@@ -682,7 +687,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             default_backend=BackendType.FLYDSL.value,
         )
 
-        grad_b = gemm_fp8_impl(
+        grad_b = _bgrad_gemm_fp8_impl_wrapper(
             g_col,
             g_col_scale,
             False,
@@ -692,7 +697,11 @@ class FP8GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=BackendType.FLYDSL.value,
+            default_backend=(
+                BackendType.HIPBLASLT.value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value
+            ),
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
+            out=ctx.main_grad,
         )
 
         return (
@@ -704,6 +713,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             None,  # trans_b
             None,  # out_dtype
             None,  # config
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -740,8 +750,8 @@ def gemm_fp8(
             into the wgrad GEMM epilogue, so backward writes ``b.main_grad``
             directly instead of returning a gradient the framework then adds.
             ``"megatron"`` is the only supported pattern; ``b`` must carry
-            ``main_grad`` / ``grad_added_to_main_grad``. TENSORWISE only.
-            Defaults to None (no fusion).
+            ``main_grad`` / ``grad_added_to_main_grad``. TENSORWISE and
+            MX_BLOCKWISE only. Defaults to None (no fusion).
 
     Returns:
         torch.Tensor: Output matrix with shape (M, N)
@@ -794,11 +804,15 @@ def gemm_fp8(
         return FP8GemmTensorFunction.apply(
             a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern
         )
+    elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
+        return FP8GemmMXFunction.apply(
+            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern
+        )
 
-    # The other granularities silently ignore the flag rather than fusing, which
+    # The remaining granularities silently ignore the flag rather than fusing, which
     # would leave main_grad unwritten and the weight without a gradient.
     assert fuse_bgrad_accum_pattern is None, (
-        f"fuse_bgrad_accum_pattern is only supported for TENSORWISE, got {config.granularity}"
+        f"fuse_bgrad_accum_pattern is not supported for {config.granularity}"
     )
     if config.granularity == ScalingGranularity.ROWWISE:
         return FP8GemmRowFunction.apply(
@@ -806,10 +820,6 @@ def gemm_fp8(
         )
     elif config.granularity == ScalingGranularity.BLOCKWISE:
         return FP8GemmBlockFunction.apply(
-            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config
-        )
-    elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
-        return FP8GemmMXFunction.apply(
             a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config
         )
     else:

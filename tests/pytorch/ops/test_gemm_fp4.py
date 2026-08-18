@@ -292,6 +292,85 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
+def test_gemm_fp4_mx_fused_grad_accum(dtype, backend):
+    """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
+
+    FlyDSL is the only FP4 backend with the accumulate epilogue and its store is 16-bit,
+    so ``main_grad`` is allocated in the weight's own dtype rather than Megatron's fp32.
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    device = "cuda:0"
+    m, n, k = 256, 512, 256  # FlyDSL MXFP4 needs M/N/K all multiples of 256
+
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(False)
+
+    config = Float4QuantConfig(
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        format=Format.E2M1_X2,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+        use_gradient_sr=False,  # the two runs must quantize grad_out identically
+    )
+
+    a = torch.randn((m, k), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((n, k), dtype=dtype, device=device, requires_grad=True)
+    grad_out = torch.randn((m, n), dtype=dtype, device=device)
+    a_fused = a.detach().clone().requires_grad_(True)
+    b_fused = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+
+    # Baseline: ordinary autograd, b.grad holds the weight gradient.
+    out = gemm_fp4(a, b, trans_b=True, out_dtype=dtype, config=config)
+    out.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # Fused: the wgrad is accumulated into a pre-seeded main_grad buffer.
+    previous = torch.randn(b_fused.shape, dtype=dtype, device=device)
+    b_fused.main_grad = previous.clone()
+    b_fused.grad_added_to_main_grad = False
+
+    out_fused = gemm_fp4(
+        a_fused,
+        b_fused,
+        trans_b=True,
+        out_dtype=dtype,
+        config=config,
+        fuse_bgrad_accum_pattern="megatron",
+    )
+    out_fused.backward(grad_out)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_fused, out)
+    assert b_fused.grad_added_to_main_grad is True, "weight must be flagged during forward"
+    assert b_fused.grad.shape == b_fused.shape, "dummy wgrad must keep the weight's shape"
+    assert b_fused.grad.dtype == b_fused.dtype, "dummy wgrad must keep the weight's dtype"
+
+    snr_threshold = 10
+
+    a_grad_snr = compute_snr(a.grad, a_fused.grad)
+    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
+    assert a_grad_snr > snr_threshold, "a_grad_snr too low"
+
+    accumulated = b_fused.main_grad.float() - previous.float()
+    b_grad_snr = compute_snr(b.grad.float(), accumulated)
+    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
+    assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+    GlobalBackendManager.reset()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_use_gradient_sr_false():
     """Gradient quantization with use_gradient_sr=False should be deterministic (identical)."""

@@ -326,8 +326,8 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
-        # This backend has no beta=1 accumulate epilogue.
-        supported &= not inplace_add_to_out
+        if inplace_add_to_out:
+            supported &= out is not None and out.dtype == out_dtype
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
@@ -385,6 +385,8 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
             G,
             out_dtype=out_dtype,
             num_cu=num_cu if num_cu is not None else -1,
+            beta=1.0 if inplace_add_to_out else 0.0,
+            out=out if inplace_add_to_out else None,
         )
 
 

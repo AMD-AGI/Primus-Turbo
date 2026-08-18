@@ -335,6 +335,8 @@ def get_common_flags():
     cxx_flags += offload_arch_list  # hipcc needs --offload-arch for CK headers in .cpp files
     nvcc_flags += macro_arch_list
     nvcc_flags += offload_arch_list
+    # -fgpu-rdc defers device codegen to the link, so the link needs the archs too.
+    extra_link_args += offload_arch_list
 
     # Composable-Kernel (ck_tile) GEMM backend: define the guard macro only when built.
     if ck_backend_enabled():

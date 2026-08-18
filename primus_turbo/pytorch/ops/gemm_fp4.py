@@ -349,7 +349,10 @@ def gemm_fp4(
             into the wgrad GEMM epilogue, so backward writes ``b.main_grad``
             directly instead of returning a gradient the framework then adds.
             ``"megatron"`` is the only supported pattern; ``b`` must carry
-            ``main_grad`` / ``grad_added_to_main_grad``. Defaults to None (no fusion).
+            ``main_grad`` / ``grad_added_to_main_grad``. FlyDSL is the only backend
+            with the FP4 accumulate epilogue, so this requires ``use_preshuffle=False``
+            and a ``main_grad`` in the weight's own dtype (its store is 16-bit).
+            Defaults to None (no fusion).
 
     Returns:
         torch.Tensor: Output matrix with shape (M, N)
@@ -391,8 +394,9 @@ def gemm_fp4(
     if out_dtype is None:
         out_dtype = torch.promote_types(a_data.dtype, b_data.dtype)
 
-    assert fuse_bgrad_accum_pattern is None, (
-        f"fuse_bgrad_accum_pattern is not supported for FP4, got {config.granularity}"
+    assert not (fuse_bgrad_accum_pattern is not None and config.use_preshuffle), (
+        "fuse_bgrad_accum_pattern requires use_preshuffle=False: only the FlyDSL backend "
+        "carries the FP4 beta=1 wgrad epilogue, and it takes raw (non-preshuffled) E8M0 scales."
     )
 
     if config.granularity == ScalingGranularity.MX_BLOCKWISE:
