@@ -86,7 +86,11 @@ class SymmetricMemory:
     """GPU symmetric memory backed by HIP IPC; caller must set the correct CUDA device (local rank) first."""
 
     def __init__(
-        self, group: dist.ProcessGroup, alloc_size: int, signal_pad_size: int = _DEFAULT_SIGNAL_PAD_SIZE
+        self,
+        group: dist.ProcessGroup,
+        alloc_size: int,
+        signal_pad_size: int = _DEFAULT_SIGNAL_PAD_SIZE,
+        uncached_signal_pad: bool = False,
     ):
         if alloc_size <= 0:
             raise ValueError(f"requested alloc size must be greater than 0, got {alloc_size}")
@@ -115,9 +119,20 @@ class SymmetricMemory:
             buffer_ptr = self.lib.hipMalloc(alloc_size)
             self.lib.hipMemset(buffer_ptr, 0, alloc_size)
             self.buffer_ptrs = self._rendezvous(buffer_ptr)
-            # signal_pad allocated only when requested (mega-moe passes 0 and skips it).
+            # signal_pad allocated only when requested (bf16 mega passes 0 and skips it).
+            #
+            # ``uncached_signal_pad`` is for a caller that puts DATA in the pad, not just flags. The
+            # fp8 mega combine does: its two-heap layout keeps the combine buffer here, a peer PUSHes
+            # the payload + E8M0 and the local reduce reads it, and a cached pad leaves that write in
+            # a stale L2 line -- the reduce then reads a garbage E8M0 exponent (=+inf) and the output
+            # goes non-finite. Uncached bypasses L2, so the cross-rank read sees what landed.
+            #
+            # It is off by default because it is not free: uncached traffic skips L2 for local access
+            # too, and a pad holding only spin-wait flags (async_tp's few bytes per split, or the
+            # 1 KB default this class hands out) does not need it.
             if self.signal_pad_size > 0:
-                signal_pad_ptr = self.lib.hipMalloc(self.signal_pad_size)
+                alloc_pad = self.lib.hipMallocUncached if uncached_signal_pad else self.lib.hipMalloc
+                signal_pad_ptr = alloc_pad(self.signal_pad_size)
                 self.lib.hipMemset(signal_pad_ptr, 0, self.signal_pad_size)
                 self.signal_pad_ptrs = self._rendezvous(signal_pad_ptr)
         except Exception:
