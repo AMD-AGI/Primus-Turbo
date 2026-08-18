@@ -65,10 +65,15 @@ _DKDV_SPLIT_VALUES = {64: (1, 2, 4, 8), 128: (1, 2, 4, 5, 8)}
 
 
 def _ops():
-    """The op namespace, imported lazily so a non-gfx950 build can still import this module."""
+    """The op namespace, imported lazily so a non-gfx950 build can still import this module.
+
+    The ops live in primus_turbo_cpp_extension like every other turbo op; the gfx950-only
+    extension adds them to it with TORCH_LIBRARY_FRAGMENT, so importing it is what makes them
+    resolvable.
+    """
     import primus_turbo.pytorch._C_hipkittens  # noqa: F401  (registers the ops)
 
-    return torch.ops.primus_turbo_hipkittens
+    return torch.ops.primus_turbo_cpp_extension
 
 
 @functools.lru_cache(maxsize=None)
@@ -78,7 +83,7 @@ def _blocks(head_dim: int) -> dict:
     Not restated here: the sequence axes are padded up to these, so a table that drifted from
     the build would pad to the wrong multiple and read past the end of a tensor.
     """
-    b = _ops().block_sizes(head_dim)
+    b = _ops().hk_attn_block_sizes(head_dim)
     keys = (
         "FWD_Q",
         "FWD_KV",
@@ -209,7 +214,7 @@ def hipkittens_attn_forward(
     # spill the last tile into the next (b, h) slice; pad and hand back a view.
     lse_pad = torch.empty((B, Hq, 1, Sq_pad), device=q.device, dtype=torch.float32)
 
-    op = _ops().attn_fwd_d64 if D == 64 else _ops().attn_fwd_d128
+    op = _ops().hk_attn_fwd_d64 if D == 64 else _ops().hk_attn_fwd_d128
     op(q_k, k_k, v_k, out, lse_pad, Sq, Skv, B, Hq, Hkv, window_left, float(softmax_scale))
     return out[:Sq], lse_pad[..., :Sq]
 
@@ -222,7 +227,7 @@ def _dkdv_split(Sq, Skv, B, Hq, Hkv, window_left, D, Skv_pad) -> int:
     this layer allocates the partials tensor: a disagreement between the two reads past the
     end of it rather than failing.
     """
-    n = int(_ops().dkdv_head_split(D, Sq, Skv, B, Hq, Hkv, window_left))
+    n = int(_ops().hk_attn_dkdv_head_split(D, Sq, Skv, B, Hq, Hkv, window_left))
     if n not in _DKDV_SPLIT_VALUES[D]:
         return 1
     while n > 1 and (n * Skv_pad * B * Hkv * D * 2) >= _WS_LIMIT:
@@ -305,7 +310,7 @@ def hipkittens_attn_backward(
     if _use_fused(D, window_left, Sq, Sq_pad, Skv_pad, B, Hq):
         n_bands = Skv_pad // _blocks(D)["FUSED_KV"]
         ws = torch.empty((n_bands * Sq_pad, B, Hq, D), device=q.device, dtype=q_k.dtype)
-        op = ops.attn_bwd_fused_d64 if D == 64 else ops.attn_bwd_fused_d128
+        op = ops.hk_attn_bwd_fused_d64 if D == 64 else ops.hk_attn_bwd_fused_d128
         op(args["q"], args["k"], args["v"], args["o"], args["dO"], dq, dk, dv, ws,
            args["lse"], delta, Sq, Skv, B, Hq, Hkv, window_left, float(softmax_scale))
     else:
@@ -317,7 +322,7 @@ def hipkittens_attn_backward(
             # Never dereferenced at n_split == 1, and the op schema takes tensors rather than
             # optionals, so alias them onto dk.
             wsk = wsv = dk
-        op = ops.attn_bwd_d64 if D == 64 else ops.attn_bwd_d128
+        op = ops.hk_attn_bwd_d64 if D == 64 else ops.hk_attn_bwd_d128
         op(args["q"], args["k"], args["v"], args["o"], args["dO"], dq, dk, dv, args["lse"],
            delta, lneg, wsk, wsv, Sq, Skv, B, Hq, Hkv, window_left, float(softmax_scale),
            n_split)

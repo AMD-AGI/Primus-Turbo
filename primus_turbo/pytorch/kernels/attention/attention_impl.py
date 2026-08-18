@@ -37,6 +37,10 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_sbhd_flydsl_forward_impl,
     flash_attn_varlen_flydsl_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
+    flash_attn_sbhd_hipkittens_forward_impl,
+    hipkittens_attn_supported_impl,
+)
 
 _GFX950 = (9, 5)
 # Narrowest left window the FlyDSL backward is correct on. The kv band comes from the window
@@ -190,30 +194,6 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         )
 
 
-def _hipkittens_verdict(q, k, v, causal, window_size, sink, dropout_p, bias, alibi_slopes):
-    """Ask the HipKittens layer whether it takes this call, on the sbhd view of it.
-
-    Imported lazily and behind a guard: the extension is only compiled on gfx950, so on any
-    other build importing it at module scope would make this whole file unimportable.
-    """
-    try:
-        from primus_turbo.hipkittens.attention.gfx950 import hipkittens_attn_supported
-    except ImportError:
-        return False, "hipkittens extension is not built"
-    qs, ks, vs = (t.permute(1, 0, 2, 3) for t in (q, k, v))
-    return hipkittens_attn_supported(
-        qs,
-        ks,
-        vs,
-        causal=causal,
-        window_size=window_size,
-        sink=sink,
-        dropout_p=dropout_p,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-    )
-
-
 class DenseAttnFwdHipkittensBackend(KernelBackend):
     """HipKittens attention, gfx950 only.
 
@@ -244,22 +224,40 @@ class DenseAttnFwdHipkittensBackend(KernelBackend):
         # b == 1 the two orders are indistinguishable.
         if k is None or v is None or not _sbhd_layout(q, qkv_format):
             return False
-        ok, _ = _hipkittens_verdict(
-            q, k, v, causal, window_size, sink, dropout_p, bias, alibi_slopes
+        # Ask the backend rather than restating its rules here, so the two cannot drift. It
+        # answers on the sbhd view, which is what it will be handed.
+        qs, ks, vs = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+        ok, _ = hipkittens_attn_supported_impl(
+            qs,
+            ks,
+            vs,
+            causal=causal,
+            window_size=window_size,
+            sink=sink,
+            dropout_p=dropout_p,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
         )
         return ok
 
     @staticmethod
     def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
-        from primus_turbo.hipkittens.attention.gfx950 import hipkittens_attn_forward
-
+        # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
-        out, lse = hipkittens_attn_forward(
-            q, k, v, softmax_scale=softmax_scale, causal=causal, window_size=window_size
+        res = flash_attn_sbhd_hipkittens_forward_impl(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_lse=return_lse,
         )
         # Back to the [b, s, h, d] view the caller handed us.
-        out = out.permute(1, 0, 2, 3)
-        return (out, lse) if return_lse else out
+        if return_lse:
+            out, lse = res
+            return out.permute(1, 0, 2, 3), lse
+        return res.permute(1, 0, 2, 3)
 
 
 _DENSE_FWD_BACKENDS = {

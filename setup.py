@@ -417,16 +417,29 @@ def build_kernels_extension():
 def hipkittens_enabled():
     """Whether the HipKittens attention kernels are compiled into this build.
 
-    gfx950 (CDNA4) only, and unlike the CK backend this cannot ride the usual per-file arch
-    filter. That filter keys on the `_gfx950.cu` suffix but the resulting sources are then
-    compiled with the WHOLE build's --offload-arch list, and PRIMUS_TURBO_GFX950 is defined
-    per build rather than per compiled arch -- so in a gfx942+gfx950 build the HipKittens
-    sources would also be compiled for gfx942, whose ISA their CDNA4 assumptions do not
-    survive. They therefore get their own extension below, carrying only
-    --offload-arch=gfx950, and are skipped entirely when gfx950 is not requested.
+    Built by default in EVERY arch configuration, and always as gfx950-only device code --
+    which is not a contradiction. The extension below passes exactly one --offload-arch, and
+    torch's _get_rocm_arch_flags leaves a user-supplied arch list alone, so the object it
+    produces contains gfx950 code and nothing else no matter what GPU_ARCHS asked for. On any
+    other card the module still imports and its ops still register; what stops a launch is the
+    is_gfx950() gate in primus_turbo/hipkittens/attention/gfx950/, not the absence of the
+    build.
+
+    It cannot be folded into the other extensions, which is why it is separate at all. The
+    per-file `_gfx950.cu` arch filter only decides whether a source is INCLUDED; the sources
+    it keeps are then compiled with the whole build's --offload-arch list, and
+    PRIMUS_TURBO_GFX950 is a per-build macro rather than a per-arch one. In a gfx942+gfx950
+    build that would compile these for gfx942 too, which fails outright:
+    __builtin_amdgcn_mfma_f32_16x16x32_bf16 needs target feature gfx950-insts.
+
+    PRIMUS_TURBO_BUILD_HIPKITTENS=0 skips it, same convention as PRIMUS_TURBO_BUILD_CK. Worth
+    reaching for on a toolchain too old to target gfx950 at all, where the build would
+    otherwise fail on an arch nobody asked for.
     """
-    offload_arch_list, _ = get_offload_archs()
-    return "--offload-arch=gfx950" in offload_arch_list
+    val = os.environ.get("PRIMUS_TURBO_BUILD_HIPKITTENS")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "off", "")
 
 
 def hipkittens_sources():
@@ -454,15 +467,35 @@ def build_hipkittens_extension():
     Separate from primus_turbo.pytorch._C because the flags differ in ways that cannot be
     reconciled with a multi-arch build: exactly one --offload-arch, -DKITTENS_CDNA4, and
     HipKittens' own include tree. It still registers plain torch ops, so callers reach it
-    through torch.ops.primus_turbo_hipkittens like any other backend.
+    through torch.ops.primus_turbo_cpp_extension.hk_attn_* like any other backend -- it joins
+    that namespace with TORCH_LIBRARY_FRAGMENT rather than opening one of its own.
     """
     if not BUILD_TORCH or not hipkittens_enabled():
         return None
 
     from torch.utils.cpp_extension import CUDAExtension
 
-    # Deliberately NOT get_common_flags(): that carries the whole build's arch list.
-    cxx_flags = ["-O3", "-std=c++20", "-Wno-unknown-warning-option", "-DKITTENS_CDNA4"]
+    # Deliberately NOT get_common_flags(): that carries the whole build's arch list, and one
+    # --offload-arch is the entire point of this extension. What must be copied from it are
+    # the six -U below. torch's CUDAExtension injects -D__HIP_NO_HALF_OPERATORS__ and friends,
+    # which turn off the half/bfloat16 operator overloads that HipKittens' headers use; the
+    # main extension undoes them the same way. Without these the build dies inside ROCm's own
+    # amd_hip_fp4.h, several includes deep, on a __half2 constructor.
+    _undef_half_guards = [
+        "-U__HIP_NO_HALF_OPERATORS__",
+        "-U__HIP_NO_HALF_CONVERSIONS__",
+        "-U__HIP_NO_BFLOAT16_OPERATORS__",
+        "-U__HIP_NO_BFLOAT16_CONVERSIONS__",
+        "-U__HIP_NO_BFLOAT162_OPERATORS__",
+        "-U__HIP_NO_BFLOAT162_CONVERSIONS__",
+    ]
+    cxx_flags = [
+        "-O3",
+        "-std=c++20",
+        "-Wno-unknown-warning-option",
+        "-DKITTENS_CDNA4",
+        *_undef_half_guards,
+    ]
     nvcc_flags = [
         "-O3",
         "-std=c++20",
@@ -471,6 +504,7 @@ def build_hipkittens_extension():
         "-DKITTENS_CDNA4",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         "--offload-arch=gfx950",
+        *_undef_half_guards,
     ]
     max_jobs = int(os.getenv("MAX_JOBS", "64"))
     nvcc_flags.append(f"-parallel-jobs={max_jobs}")

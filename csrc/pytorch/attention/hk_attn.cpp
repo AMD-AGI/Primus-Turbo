@@ -15,7 +15,12 @@
 // build_hipkittens_extension in setup.py -- so a caller must check the arch before reaching
 // here. primus_turbo/hipkittens/attention/gfx950/ does that, along with the rest of the
 // envelope these kernels admit.
+//
+// Importing this extension requires primus_turbo.pytorch._C to have been imported first: the
+// FRAGMENT below extends a namespace that _C owns. That ordering holds by construction,
+// since primus_turbo.pytorch's own __init__ imports _C.
 
+#include <torch/extension.h>
 #include <torch/library.h>
 
 #include "primus_turbo/hipkittens/attention.h"
@@ -113,50 +118,72 @@ std::vector<int64_t> block_sizes_op(int64_t head_dim) {
 
 }  // namespace
 
-TORCH_LIBRARY(primus_turbo_hipkittens, m) {
+// FRAGMENT, not TORCH_LIBRARY, and that is forced rather than stylistic.
+//
+// Every op in this repo lives in the primus_turbo_cpp_extension namespace, and these should
+// too -- a second namespace would make HipKittens the one backend callers reach differently.
+// But the namespace's TORCH_LIBRARY is owned by csrc/pytorch/bindings_pytorch.cpp, which
+// compiles into primus_turbo.pytorch._C, and a namespace may only be defined once per
+// process. These ops cannot join that file either: their implementations live in the
+// gfx950-only _C_hipkittens, so declaring them from _C would put a schema in every build
+// while the kernel behind it exists in one.
+//
+// TORCH_LIBRARY_FRAGMENT is the mechanism for exactly this -- extending an existing
+// namespace from a separately linked library. The op names carry the hk_ prefix because the
+// namespace is now shared.
+TORCH_LIBRARY_FRAGMENT(primus_turbo_cpp_extension, m) {
     m.def(
-        "attn_fwd_d64(Tensor q, Tensor k, Tensor v, Tensor(a!) o, Tensor(b!) lse, int Sq, int Skv, "
-        "int B, int Hq, int Hkv, int window_left, float softmax_scale) -> ()");
+        "hk_attn_fwd_d64(Tensor q, Tensor k, Tensor v, Tensor(a!) o, Tensor(b!) lse, int Sq, "
+        "int Skv, int B, int Hq, int Hkv, int window_left, float softmax_scale) -> ()");
     m.def(
-        "attn_fwd_d128(Tensor q, Tensor k, Tensor v, Tensor(a!) o, Tensor(b!) lse, int Sq, int Skv, "
-        "int B, int Hq, int Hkv, int window_left, float softmax_scale) -> ()");
+        "hk_attn_fwd_d128(Tensor q, Tensor k, Tensor v, Tensor(a!) o, Tensor(b!) lse, int Sq, "
+        "int Skv, int B, int Hq, int Hkv, int window_left, float softmax_scale) -> ()");
     m.def(
-        "attn_bwd_d64(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
+        "hk_attn_bwd_d64(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
         "Tensor(b!) dk, Tensor(c!) dv, Tensor lse, Tensor(d!) delta, Tensor(e!) lneg, "
         "Tensor(f!) wsk, Tensor(g!) wsv, int Sq, int Skv, int B, int Hq, int Hkv, "
         "int window_left, float softmax_scale, int n_split_req) -> ()");
     m.def(
-        "attn_bwd_d128(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
+        "hk_attn_bwd_d128(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
         "Tensor(b!) dk, Tensor(c!) dv, Tensor lse, Tensor(d!) delta, Tensor(e!) lneg, "
         "Tensor(f!) wsk, Tensor(g!) wsv, int Sq, int Skv, int B, int Hq, int Hkv, "
         "int window_left, float softmax_scale, int n_split_req) -> ()");
     m.def(
-        "attn_bwd_fused_d64(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
+        "hk_attn_bwd_fused_d64(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
         "Tensor(b!) dk, Tensor(c!) dv, Tensor(d!) ws, Tensor lse, Tensor(e!) delta, int Sq, "
         "int Skv, int B, int Hq, int Hkv, int window_left, float softmax_scale) -> ()");
     m.def(
-        "attn_bwd_fused_d128(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
+        "hk_attn_bwd_fused_d128(Tensor q, Tensor k, Tensor v, Tensor o, Tensor dO, Tensor(a!) dq, "
         "Tensor(b!) dk, Tensor(c!) dv, Tensor(d!) ws, Tensor lse, Tensor(e!) delta, int Sq, "
         "int Skv, int B, int Hq, int Hkv, int window_left, float softmax_scale) -> ()");
     m.def(
-        "dkdv_head_split(int head_dim, int Sq, int Skv, int B, int Hq, int Hkv, "
+        "hk_attn_dkdv_head_split(int head_dim, int Sq, int Skv, int B, int Hq, int Hkv, "
         "int window_left) -> int");
-    m.def("block_sizes(int head_dim) -> int[]");
+    m.def("hk_attn_block_sizes(int head_dim) -> int[]");
 }
 
-TORCH_LIBRARY_IMPL(primus_turbo_hipkittens, CUDA, m) {
-    m.impl("attn_fwd_d64", &fwd_d64_op);
-    m.impl("attn_fwd_d128", &fwd_d128_op);
-    m.impl("attn_bwd_d64", &bwd_d64_op);
-    m.impl("attn_bwd_d128", &bwd_d128_op);
-    m.impl("attn_bwd_fused_d64", &bwd_fused_d64_op);
-    m.impl("attn_bwd_fused_d128", &bwd_fused_d128_op);
+TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
+    m.impl("hk_attn_fwd_d64", &fwd_d64_op);
+    m.impl("hk_attn_fwd_d128", &fwd_d128_op);
+    m.impl("hk_attn_bwd_d64", &bwd_d64_op);
+    m.impl("hk_attn_bwd_d128", &bwd_d128_op);
+    m.impl("hk_attn_bwd_fused_d64", &bwd_fused_d64_op);
+    m.impl("hk_attn_bwd_fused_d128", &bwd_fused_d128_op);
 }
 
 // Shape-only entry points: no tensors, so they answer the same on any device.
-TORCH_LIBRARY_IMPL(primus_turbo_hipkittens, CompositeExplicitAutograd, m) {
-    m.impl("dkdv_head_split", &dkdv_head_split_op);
-    m.impl("block_sizes", &block_sizes_op);
+TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CompositeExplicitAutograd, m) {
+    m.impl("hk_attn_dkdv_head_split", &dkdv_head_split_op);
+    m.impl("hk_attn_block_sizes", &block_sizes_op);
 }
 
 }  // namespace primus_turbo::hipkittens
+
+// The extension exports no Python symbols of its own -- everything above reaches callers
+// through torch.ops.primus_turbo_cpp_extension, registered by the static initialisers that run
+// when this library is loaded. It still needs a module init function, because that is what
+// Python's import machinery looks for; without it the import fails with "dynamic module does
+// not define module export function" and the ops never get a chance to register.
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "HipKittens attention kernels for gfx950. Reached via torch.ops.primus_turbo_cpp_extension.";
+}
