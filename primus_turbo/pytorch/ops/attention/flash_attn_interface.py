@@ -31,6 +31,7 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_varlen_flydsl_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_impl import (
+    _sbhd_layout,
     resolve_flash_attn_backend,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
@@ -95,6 +96,10 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         ctx.backend = backend
         if backend == BackendType.FLYDSL:
+            # Only sbhd bytes make the [s,b,h,d] view a relabel rather than a reinterpretation.
+            # The dispatcher checked that before naming this backend, but apply() can be called
+            # straight, and then reading bshd bytes as sbhd would just return the wrong answer.
+            assert _sbhd_layout(q, qkv_format), f"flydsl dense attention is sbhd only, got {qkv_format}"
             q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
             out_s, lse = flash_attn_sbhd_flydsl_forward_impl(
                 q_s,
@@ -412,8 +417,7 @@ def flash_attn_func(
 ):
     """q/k/v are ``[b, s, h, d]``-shaped; an sbhd caller passes a permuted view and permutes
     the result back. aiter reads the memory layout to allocate outputs and grads matching it;
-    FlyDSL is sbhd-native, so it is eligible exactly when the ``[s, b, h, d]`` view is
-    contiguous.
+    FlyDSL is sbhd-native and takes that layout only.
     """
     qkv_format = _infer_qkv_format(q, k, v)
 

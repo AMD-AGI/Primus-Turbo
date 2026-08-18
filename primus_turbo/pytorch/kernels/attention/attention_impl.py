@@ -140,6 +140,17 @@ class DenseAttnFwdAiterBackend(KernelBackend):
         )
 
 
+def _sbhd_layout(q: torch.Tensor, qkv_format: str) -> bool:
+    """Whether q's bytes are in sbhd order, the one the FlyDSL kernels address.
+
+    A batch of one is sbhd and bshd at once -- the same bytes, and strides that cannot name
+    one -- so _infer_qkv_format has to break the tie and breaks it toward bshd. Reading only
+    its answer would send every b == 1 shape to aiter, which for a prefill batch of one is
+    most of them. bhsd is a different order at any batch and is not covered by this.
+    """
+    return qkv_format == "sbhd" or (qkv_format == "bshd" and q.shape[0] == 1)
+
+
 class DenseAttnFwdFlydslBackend(KernelBackend):
     @staticmethod
     def can_handle(
@@ -153,21 +164,16 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         bias=None,
         alibi_slopes=None,
         sink=None,
+        qkv_format="bshd",
         **kwargs,
     ) -> bool:
-        # SBHD-native and copy-free, so the requirement is that the [s,b,h,d] view of these
-        # [b,s,h,d]-shaped tensors be contiguous -- not that a storage order be named. True
-        # for sbhd bytes at any batch, and at b == 1 for bshd bytes, being the same bytes.
-        if (
-            k is None
-            or v is None
-            or not _gqa_group_ok(q.shape[2], k.shape[2])
-            or not _sink_ok(sink, q.shape[2])
-        ):
+        # sbhd only: the kernel is compiled to address that order and takes the [s,b,h,d]
+        # view of these [b,s,h,d]-shaped tensors with no copy. Everything else goes to aiter.
+        if k is None or v is None or not _sbhd_layout(q, qkv_format):
             return False
-        return all(t.permute(1, 0, 2, 3).is_contiguous() for t in (q, k, v)) and _flydsl_common_ok(
-            q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes
-        )
+        if not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
+            return False
+        return _flydsl_common_ok(q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes)
 
     @staticmethod
     def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
