@@ -163,7 +163,9 @@ def dispatch_bf16_tile(
                 src_off=source_row * fx.Int32(hidden_i32),
                 # Local x is read-only for every agent, so keep it in L2: the same
                 # token row is re-read once per destination rank (~5.25x at K=8/EP=8).
-                store_cache_modifier=19,  # sc0|sc1|nt: publish to a remote agent.
+                # 3 = sc0|sc1 is already system-coherent; nt (19) only skips the local
+                # L2 allocation, and that halves per-CU push bandwidth.
+                store_cache_modifier=3,
             )
 
     def _slot(row_index):
