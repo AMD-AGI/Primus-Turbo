@@ -4,9 +4,15 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import pytest
 import torch
 
 from primus_turbo.pytorch.core.low_precision import is_fp8_dtype
+from primus_turbo.pytorch.kernels.attention.attention_impl import (
+    FlashAttnDenseDispatcher,
+    FlashAttnVarlenDispatcher,
+    resolve_flash_attn_backend,
+)
 
 
 def is_ROCM():
@@ -72,3 +78,20 @@ def compute_snr(x: torch.Tensor, y: torch.Tensor):
     signal_power = torch.norm(x).pow(2)
     noise_power = torch.norm(x - y).pow(2)
     return 10 * torch.log10(signal_power / (noise_power + 1e-12)).detach().item()
+
+
+def pinned_backend_takes(backend, varlen=False, **kwargs) -> bool:
+    """Whether a pinned backend implements these inputs (True when nothing is pinned).
+
+    A False also asserts the resolver refuses them outright: a backend the caller pinned must
+    never be swapped for another one behind their back. So the combos this returns False for
+    stay covered -- by that refusal -- instead of dropping out of the run as skips.
+    """
+    if backend is None:
+        return True
+    dispatcher = FlashAttnVarlenDispatcher if varlen else FlashAttnDenseDispatcher
+    if dispatcher._backends[backend].impl.can_handle(**kwargs):
+        return True
+    with pytest.raises(ValueError, match="cannot handle the given inputs"):
+        resolve_flash_attn_backend(varlen=varlen, user_backend=backend, **kwargs)
+    return False

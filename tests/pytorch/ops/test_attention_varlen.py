@@ -9,9 +9,14 @@ from typing import List, Tuple
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.ops import flash_attn_varlen_func
 from tests.pytorch.ref.attention_ref import attention_varlen_forward_pytorch_ref_impl
-from tests.pytorch.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
 
 def _build_cu_seqlens(seqlens: List[int], device: str) -> Tuple[torch.Tensor, int, int]:
@@ -35,11 +40,21 @@ SEQLEN_PATTERNS = [
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "num_head_q,num_head_kv",
-    [(8, 8), (16, 4)],  # MHA and GQA
+    # MHA, GQA, and a GQA group of 8 -- the smallest the FlyDSL varlen backend admits, so
+    # without it the pinned-FLYDSL half of this test has nothing to run.
+    [(8, 8), (16, 4), (64, 8)],
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_flash_attn_varlen(dtype, seqlens, causal, num_head_q, num_head_kv, head_dim):
+# Per-segment sliding window; -1 is the plain block-causal document mask.
+@pytest.mark.parametrize("window_size_left", [-1, 256])
+# None is whatever resolves; the rest pin one backend so its own path stays covered.
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
+def test_flash_attn_varlen(
+    dtype, seqlens, causal, num_head_q, num_head_kv, head_dim, window_size_left, backend
+):
     seqlens_q, seqlens_k = seqlens
+    if window_size_left >= 0 and not causal:
+        pytest.skip("a left window is only defined against a causal mask")
 
     # Causal varlen requires per-batch q_len == k_len(bottom-right aligned mask)
     if causal and seqlens_q != seqlens_k:
@@ -62,24 +77,52 @@ def test_flash_attn_varlen(dtype, seqlens, causal, num_head_q, num_head_kv, head
     v_ref = v.clone().detach().requires_grad_()
 
     sm_scale = head_dim ** (-0.5)
+    window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
 
-    o_ref = attention_varlen_forward_pytorch_ref_impl(
-        q_ref, k_ref, v_ref, cu_seqlens_q, cu_seqlens_k, sm_scale, causal
-    )
-    o_ref.backward(grad_out)
-
-    o = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+    # Ahead of the reference, which is the expensive part and pointless for a combo the
+    # pinned backend does not implement (that case is covered by the refusal assert inside).
+    if not pinned_backend_takes(
+        backend,
+        varlen=True,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         dropout_p=0.0,
         softmax_scale=sm_scale,
         causal=causal,
+        window_size=window_size,
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+    ):
+        return
+
+    o_ref = attention_varlen_forward_pytorch_ref_impl(
+        q_ref, k_ref, v_ref, cu_seqlens_q, cu_seqlens_k, sm_scale, causal, window_size=window_size
     )
+    o_ref.backward(grad_out)
+
+    GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    try:
+        o = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=0.0,
+            softmax_scale=sm_scale,
+            causal=causal,
+            window_size=window_size,
+        )
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
     o.backward(grad_out)
 
     torch.cuda.synchronize()
@@ -91,7 +134,8 @@ def test_flash_attn_varlen(dtype, seqlens, causal, num_head_q, num_head_kv, head
 
     print(
         f"\ndtype={dtype}, causal={causal}, hq={num_head_q}, hkv={num_head_kv}, "
-        f"hd={head_dim}, seqlens_q={seqlens_q}, seqlens_k={seqlens_k}\n"
+        f"hd={head_dim}, window={window_size_left}, backend={backend.name if backend else 'auto'}, "
+        f"seqlens_q={seqlens_q}, seqlens_k={seqlens_k}\n"
         f"  out={out_snr:.2f} dq={dq_snr:.2f} dk={dk_snr:.2f} dv={dv_snr:.2f}"
     )
 

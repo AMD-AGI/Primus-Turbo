@@ -31,6 +31,11 @@ ENV_GROUPED_GEMM_BACKEND = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 # Default: TURBO
 ENV_MOE_DISPATCH_COMBINE_BACKEND = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
 
+# Attention backend selection (e.g. FLYDSL, AITER, TRITON), for flash-attention and for
+# sparse-MLA alike. Same per-precision format as ENV_GEMM_BACKEND.
+# Default: None (auto-select; FLYDSL when eligible, else the op's fallback)
+ENV_ATTN_BACKEND = "PRIMUS_TURBO_ATTN_BACKEND"
+
 # Enable auto-tuning across registered kernel backends ("1" to enable).
 # Global switch: it turns auto-tune on for every op. An explicit per-op backend
 # (e.g. "<OP>_BACKEND=HIPBLASLT") still takes precedence over it.
