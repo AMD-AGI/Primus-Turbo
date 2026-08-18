@@ -92,7 +92,7 @@ def compile_grouped_mxfp4_qdual(
     N_pad,
     row_rht,
     col_rht,
-    bm=64,
+    bm=128,
     bk=256,
     is_fp16=False,
     row_sr=False,
@@ -111,8 +111,10 @@ def compile_grouped_mxfp4_qdual(
     # the LDS tile, then a coalesced transposed COL write-back from an LDS stage
     # (ldsc). BK=256 -> each row-output store is 32 contiguous i32 = 128B coalesced
     # (fp4 = 0.5B, so 256 cols = 128B); the COL transpose write is decoupled + coalesced
-    # via ldsc. BM=64 keeps tile+ldsc within the LDS budget (one tile -> one group
-    # since BM divides 128 divides 512). BK divides N_pad via ceil + overshoot mask.
+    # via ldsc. BM=128 amortizes the grouped metadata/prologue and doubles the
+    # useful rows written per launch while remaining within the LDS budget. Since
+    # BM divides the 512-row colwise padding alignment, one tile stays in one group.
+    # BK divides N_pad via ceil + overshoot mask.
     assert 128 % bm == 0 and bm % 32 == 0 and bk % 32 == 0
     BM = bm
     BK = bk
@@ -344,7 +346,7 @@ _GQ_MXFP4_CACHE_CAP = 64  # bound the per-(total_M) compiled-quant cache (broad-
 
 
 def grouped_quant_mxfp4_raw(
-    x, group_lens, group_offs, out_dtype, row_rht, col_rht, bm=64, bk=256, row_sr=False, col_sr=False
+    x, group_lens, group_offs, out_dtype, row_rht, col_rht, bm=128, bk=256, row_sr=False, col_sr=False
 ):
     """FlyDSL grouped mxfp4 dual quant, drop-in for the HIP grouped_quantize_mxfp4_dual
     (non-shuffle, non-2d recipes; SR supported = unbiased, not bit-exact). Returns the 6-tuple:
