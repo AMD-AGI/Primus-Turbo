@@ -465,52 +465,6 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
-        # K-pad fast path: a non-128-aligned K makes the fp8 row stride split each vector load across a 128B line, so cast-and-pad both operands to Kp=ceil128(K) (pad cols contribute 0*0=0, GEMM unchanged). Raw NT inputs only.
-        _kpad = (
-            trans_b
-            and not isinstance(a, QuantizedTensor)
-            and not isinstance(b, QuantizedTensor)
-            and a.dim() == 2
-            and b.dim() == 3
-            and (a.shape[-1] % 128 != 0)
-            and a.shape[-1] >= 129
-        )
-        if _kpad:
-            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
-                grouped_gemm_fp8_tensorwise_flydsl_kernel,
-            )
-            from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-                quantize_fp8_tensorwise_pad_impl,
-            )
-
-            go = group_offs if group_offs is not None else group_offs_from_lens(group_lens)
-            fp8_dtype = _get_fp8_dtype(config.format, True)
-            a_q, a_sc = quantize_fp8_tensorwise_pad_impl(a, fp8_dtype)  # [M, Kp]
-            b_q, b_sc = quantize_fp8_tensorwise_pad_impl(b, fp8_dtype)  # [G, N, Kp]
-            out = grouped_gemm_fp8_tensorwise_flydsl_kernel(
-                a_q,
-                b_q,
-                a_sc,
-                b_sc,
-                go,
-                trans_b=True,
-                out_dtype=out_dtype,
-                num_cu=(num_cu if num_cu is not None else -1),
-            )
-            ctx.save_for_backward(a_q, b_q, a_sc, b_sc, group_lens, go)
-            ctx.trans_a = False
-            ctx.trans_b = trans_b
-            ctx.config = config
-            ctx.out_dtype = out_dtype
-            ctx.num_cu = num_cu
-            ctx.k_pad_real = a.shape[-1]
-            # This path returns early, so it has to set the grad-accum context the shared
-            # backward reads; leaving it to the tail below skips it (AttributeError:
-            # 'FP8GroupedGemmTensorFuncBackward' object has no attribute 'fuse_bgrad_accum').
-            ctx.fuse_bgrad_accum = fuse_bgrad_accum
-            ctx.main_grad = main_grad
-            return out
-
         if isinstance(a, QuantizedTensor):
             assert a._is_grouped_tensor, "A QuantizedTensor input must be a grouped tensor"
             check_quantized_tensor(a, config)
