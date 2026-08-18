@@ -53,11 +53,11 @@ SUPPORTED_HEAD_DIMS = (64, 128)
 # This bounds the split-K workspaces below. It is a correctness limit, not a memory budget.
 _WS_LIMIT = 2**32
 
-# The fused single-pass backward holds one whole dQ per kv band, which is far larger than the
-# dK/dV partials. Cap it at a fraction of the card rather than at the descriptor limit alone.
-_FUSED_WS_FRACTION = 8
-# Below this Skv:Sq ratio the fused path's fifth GEMM walks more band than it saves.
-_FUSED_MIN_KV_RATIO = 1.0
+# The backward always takes the split dq + dkdv pair. A fused single-pass variant exists in the
+# kernels (hk_attn_bwd_fused_d*) and is not dispatched to: it holds one whole dQ per kv band, so
+# its workspace only fits for D=64 at small B*Hq, and measured over every shape in that window it
+# ran 2.2x to 3.6x slower than the split pair on the backward. Outside the window the workspace
+# passes _WS_LIMIT and the results go silently wrong, so there is no larger shape to win on.
 
 # The launcher has one `switch` case per split, per head dim. Sizing the partials tensor for a
 # split the launcher has no case for makes it run the NSPLIT == 1 kernel against a grid built
@@ -85,6 +85,8 @@ def _blocks(head_dim: int) -> dict:
     the build would pad to the wrong multiple and read past the end of a tensor.
     """
     b = _ops().hk_attn_block_sizes(head_dim)
+    # FUSED_Q/FUSED_KV name tiles of the undispatched fused backward. They stay in this tuple
+    # because it is positional -- the kernel decides the order -- not because anything reads them.
     keys = (
         "FWD_Q",
         "FWD_KV",
@@ -101,12 +103,12 @@ def _blocks(head_dim: int) -> dict:
 
 def _q_align(head_dim: int) -> int:
     b = _blocks(head_dim)
-    return math.lcm(b["FWD_Q"], b["DQ_Q"], b["DKDV_Q"], b["PREP_Q"], b["FUSED_Q"])
+    return math.lcm(b["FWD_Q"], b["DQ_Q"], b["DKDV_Q"], b["PREP_Q"])
 
 
 def _kv_align(head_dim: int) -> int:
     b = _blocks(head_dim)
-    return math.lcm(b["FWD_KV"], b["DQ_KV"], b["DKDV_KV"], b["FUSED_KV"])
+    return math.lcm(b["FWD_KV"], b["DQ_KV"], b["DKDV_KV"])
 
 
 def hipkittens_attn_supported(
@@ -169,9 +171,7 @@ def hipkittens_attn_supported(
 
 
 def _require_supported(q, k, v, *, causal, window_size, sink=None, **kw) -> None:
-    ok, why = hipkittens_attn_supported(
-        q, k, v, causal=causal, window_size=window_size, sink=sink, **kw
-    )
+    ok, why = hipkittens_attn_supported(q, k, v, causal=causal, window_size=window_size, sink=sink, **kw)
     if not ok:
         raise NotImplementedError(why)
 
@@ -236,20 +236,6 @@ def _dkdv_split(Sq, Skv, B, Hq, Hkv, window_left, D, Skv_pad) -> int:
     return n
 
 
-def _use_fused(D, window_left, Sq, Sq_pad, Skv_pad, B, Hq) -> bool:
-    """Whether to take the fused single-pass backward instead of the split dq + dkdv pair."""
-    if D != 64 or window_left >= 0:
-        return False
-    if Skv_pad < _FUSED_MIN_KV_RATIO * Sq:
-        return False
-    n_bands = Skv_pad // _blocks(D)["FUSED_KV"]
-    ws_bytes = n_bands * Sq_pad * B * Hq * D * 2
-    if ws_bytes >= _WS_LIMIT:
-        return False
-    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
-    return ws_bytes <= total // _FUSED_WS_FRACTION
-
-
 def hipkittens_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -301,31 +287,38 @@ def hipkittens_attn_backward(
     delta = torch.empty((B, Hq, 1, Sq_pad), device=q.device, dtype=torch.float32)
     lneg = torch.empty((B, Hq, 1, Sq_pad), device=q.device, dtype=torch.float32)
 
-    args = dict(
-        q=q_k, k=k_k, v=v_k, o=o_k, dO=do_k, dq=dq, dk=dk, dv=dv, lse=lse_k,
-        Sq=Sq, Skv=Skv, B=B, Hq=Hq, Hkv=Hkv,
-        window_left=window_left, softmax_scale=float(softmax_scale),
-    )
-    ops = _ops()
-
-    if _use_fused(D, window_left, Sq, Sq_pad, Skv_pad, B, Hq):
-        n_bands = Skv_pad // _blocks(D)["FUSED_KV"]
-        ws = torch.empty((n_bands * Sq_pad, B, Hq, D), device=q.device, dtype=q_k.dtype)
-        op = ops.hk_attn_bwd_fused_d64 if D == 64 else ops.hk_attn_bwd_fused_d128
-        op(args["q"], args["k"], args["v"], args["o"], args["dO"], dq, dk, dv, ws,
-           args["lse"], delta, Sq, Skv, B, Hq, Hkv, window_left, float(softmax_scale))
+    n_split = _dkdv_split(Sq, Skv, B, Hq, Hkv, window_left, D, Skv_pad)
+    if n_split > 1:
+        wsk = torch.empty((n_split * Skv_pad, B, Hkv, D), device=q.device, dtype=k_k.dtype)
+        wsv = torch.empty_like(wsk)
     else:
-        n_split = _dkdv_split(Sq, Skv, B, Hq, Hkv, window_left, D, Skv_pad)
-        if n_split > 1:
-            wsk = torch.empty((n_split * Skv_pad, B, Hkv, D), device=q.device, dtype=k_k.dtype)
-            wsv = torch.empty_like(wsk)
-        else:
-            # Never dereferenced at n_split == 1, and the op schema takes tensors rather than
-            # optionals, so alias them onto dk.
-            wsk = wsv = dk
-        op = ops.hk_attn_bwd_d64 if D == 64 else ops.hk_attn_bwd_d128
-        op(args["q"], args["k"], args["v"], args["o"], args["dO"], dq, dk, dv, args["lse"],
-           delta, lneg, wsk, wsv, Sq, Skv, B, Hq, Hkv, window_left, float(softmax_scale),
-           n_split)
+        # Never dereferenced at n_split == 1, and the op schema takes tensors rather than
+        # optionals, so alias them onto dk.
+        wsk = wsv = dk
+
+    op = _ops().hk_attn_bwd_d64 if D == 64 else _ops().hk_attn_bwd_d128
+    op(
+        q_k,
+        k_k,
+        v_k,
+        o_k,
+        do_k,
+        dq,
+        dk,
+        dv,
+        lse_k,
+        delta,
+        lneg,
+        wsk,
+        wsv,
+        Sq,
+        Skv,
+        B,
+        Hq,
+        Hkv,
+        window_left,
+        float(softmax_scale),
+        n_split,
+    )
 
     return dq[:Sq], dk[:Skv], dv[:Skv]
