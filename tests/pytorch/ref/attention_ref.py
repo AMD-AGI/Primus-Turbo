@@ -25,6 +25,22 @@ class AttnConfig:
         self.head_dim_v = head_dim_v
 
 
+def _construct_local_mask(seqlen_q, seqlen_k, window_size, device):
+    """Build the local attention mask using the same indexing rule as aiter."""
+    row_idx = torch.arange(seqlen_q, device=device).view(-1, 1)
+    col_idx = torch.arange(seqlen_k, device=device)
+    shift = seqlen_k - seqlen_q
+
+    if window_size[0] < 0:
+        return col_idx > row_idx + shift + window_size[1]
+
+    max_col_idx = torch.full_like(col_idx, seqlen_k)
+    return torch.logical_or(
+        col_idx > torch.minimum(row_idx + shift + window_size[1], max_col_idx),
+        col_idx < row_idx + shift - window_size[0],
+    )
+
+
 def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, qkv_format="bshd"):
     """Compute reference output and softmax_lse using PyTorch's built-in function"""
 
@@ -51,10 +67,22 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, qkv_fo
     else:
         raise ValueError(f"Unknown qkv format {qkv_format}")
 
+    # is_causal is TOP-LEFT aligned, which is the kernels' bottom-right masking only while
+    # seqlen_q == seqlen_k; a query chunk against a longer kv context needs the shifted mask.
+    mask = None
+    if causal and q.shape[2] != k.shape[2]:
+        mask = ~_construct_local_mask(q.shape[2], k.shape[2], (-1, 0), q.device)
+
     with sdpa_kernel(ATTN_BACKENDS):
         # NOTE: expect input layout is bhsd.
         o_ref = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=causal, scale=sm_scale, enable_gqa=n_rep > 1
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            is_causal=causal and mask is None,
+            scale=sm_scale,
+            enable_gqa=n_rep > 1,
         )
     if qkv_format == "bshd":
         o_ref = o_ref.transpose(1, 2).contiguous()
@@ -63,24 +91,12 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, qkv_fo
     return o_ref
 
 
-def _construct_local_mask(seqlen_q, seqlen_k, window_size, device):
-    """Build the local attention mask using the same indexing rule as aiter."""
-    row_idx = torch.arange(seqlen_q, device=device).view(-1, 1)
-    col_idx = torch.arange(seqlen_k, device=device)
-    shift = seqlen_k - seqlen_q
-
-    if window_size[0] < 0:
-        return col_idx > row_idx + shift + window_size[1]
-
-    max_col_idx = torch.full_like(col_idx, seqlen_k)
-    return torch.logical_or(
-        col_idx > torch.minimum(row_idx + shift + window_size[1], max_col_idx),
-        col_idx < row_idx + shift - window_size[0],
-    )
-
-
 def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-1, -1), qkv_format="bshd"):
-    """Reference implementation of attention with sink and optional sliding window."""
+    """Reference attention with an optional sink and an optional sliding window.
+
+    ``sink=None`` is plain attention -- the windowed and rectangular reference, which the
+    vanilla impl above cannot give: is_causal is top-left aligned, so it only matches the
+    kernels while seqlen_q == seqlen_k, and it cannot express a left window at all."""
 
     if qkv_format == "sbhd":
         q = q.permute(1, 0, 2, 3).contiguous()
@@ -95,7 +111,6 @@ def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-
 
     dtype_og = q.dtype
     q, k, v = q.float(), k.float(), v.float()
-    sink = sink.float()
 
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     if causal:
@@ -113,16 +128,18 @@ def attention_with_sink_ref_impl(q, k, v, sink, sm_scale, causal, window_size=(-
         scores = scores.masked_fill(local_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf"))
 
     # Concatenate sink scores
-    batch_size = scores.shape[0]
-    nheads = scores.shape[1]
-    sink_expanded = sink.view(1, nheads, 1, 1).expand(batch_size, -1, seqlen_q, -1)
-    scores = torch.cat([scores, sink_expanded], dim=-1)
+    if sink is not None:
+        batch_size = scores.shape[0]
+        nheads = scores.shape[1]
+        sink_expanded = sink.float().view(1, nheads, 1, 1).expand(batch_size, -1, seqlen_q, -1)
+        scores = torch.cat([scores, sink_expanded], dim=-1)
 
     # Softmax
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
 
     # Remove sink attention weights before computing output
-    attention = attention[..., :-1]
+    if sink is not None:
+        attention = attention[..., :-1]
 
     # Compute output
     output = torch.einsum("bhts,bshd->bthd", attention, v)
@@ -144,8 +161,13 @@ def attention_varlen_forward_pytorch_ref_impl(
     cu_seqlens_k,
     sm_scale,
     causal,
+    window_size=(-1, -1),
 ):
-    """Reference varlen attention; Loops per sequence using cu_seqlens."""
+    """Reference varlen attention; Loops per sequence using cu_seqlens.
+
+    ``window_size`` is per segment, like the kernels' block-diagonal document masking. A
+    window, or a segment whose q and kv lengths differ, needs the explicit mask: is_causal
+    is top-left aligned and cannot express either."""
     total_q, nheads_q, _ = q.shape
     head_dim_v = v.shape[-1]
     out = torch.empty((total_q, nheads_q, head_dim_v), dtype=q.dtype, device=q.device)
@@ -166,9 +188,18 @@ def attention_varlen_forward_pytorch_ref_impl(
         qi = q[q_start:q_end].transpose(0, 1).unsqueeze(0).contiguous()
         ki = k[k_start:k_end].transpose(0, 1).unsqueeze(0).contiguous()
         vi = v[k_start:k_end].transpose(0, 1).unsqueeze(0).contiguous()
+        mask = None
+        if causal and (window_size[0] >= 0 or (q_end - q_start) != (k_end - k_start)):
+            mask = ~_construct_local_mask(q_end - q_start, k_end - k_start, (window_size[0], 0), q.device)
         with sdpa_kernel(ATTN_BACKENDS):
             oi = torch.nn.functional.scaled_dot_product_attention(
-                qi, ki, vi, is_causal=causal, scale=sm_scale, enable_gqa=n_rep > 1
+                qi,
+                ki,
+                vi,
+                attn_mask=mask,
+                is_causal=causal and mask is None,
+                scale=sm_scale,
+                enable_gqa=n_rep > 1,
             )
         out[q_start:q_end] = oi.squeeze(0).transpose(0, 1).contiguous()
 

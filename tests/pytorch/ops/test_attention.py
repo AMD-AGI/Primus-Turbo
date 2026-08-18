@@ -9,6 +9,11 @@ import os
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
@@ -16,13 +21,16 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_forward_impl,
 )
 from primus_turbo.pytorch.ops import flash_attn_fp8_func, flash_attn_func
-from primus_turbo.pytorch.ops.attention.attention_utils import block_scaling_node
+from primus_turbo.pytorch.ops.attention.attention_utils import (
+    _infer_qkv_format,
+    block_scaling_node,
+)
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
     attention_vanilla_forward_pytorch_ref_impl,
     attention_with_sink_ref_impl,
 )
-from tests.pytorch.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
 test_cases = [
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
@@ -41,6 +49,11 @@ test_cases = [
     AttnConfig(seqlen_q=2048, seqlen_kv=2048, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     # end regression tests for https://ontrack-internal.amd.com/browse/SWDEV-548136
     AttnConfig(seqlen_q=512, seqlen_kv=512, num_head_q=40, num_head_kv=40, head_dim_qk=192, head_dim_v=128),
+    # head_dim 64, and a query chunk against a longer kv context: the rest of the table is
+    # square at head_dim 128/192, so neither the 64-wide kernels nor the bottom-right causal
+    # offset a rectangular shape carries would be reached otherwise.
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=64, head_dim_v=64),
+    AttnConfig(seqlen_q=512, seqlen_kv=2048, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
 ]
 
 
@@ -52,8 +65,10 @@ test_cases = [
 @pytest.mark.parametrize("window_size_left", [-1, 32, 64, 128])
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
 @pytest.mark.parametrize("is_v3_atomic_fp32", [False, True])
+# None is whatever resolves; the rest pin one backend so its own path stays covered.
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
 def test_attention_16bit(
-    batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32
+    batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32, backend
 ):
     os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "1" if is_v3_atomic_fp32 else "0"
 
@@ -134,6 +149,26 @@ def test_attention_16bit(
     sink_ref = None
     if enable_sink:
         sink = torch.randn((num_head_q,), device=device, dtype=torch.float32, requires_grad=True)
+
+    # Ahead of the reference, which is the expensive part and pointless for a combo the
+    # pinned backend does not implement (that case is covered by the refusal assert inside).
+    if not pinned_backend_takes(
+        backend,
+        q=query,
+        k=key,
+        v=value,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=window_size,
+        bias=None,
+        alibi_slopes=None,
+        sink=sink,
+        qkv_format=_infer_qkv_format(query, key, value),
+    ):
+        return
+
+    if enable_sink:
         sink_ref = sink.clone().detach().requires_grad_()
         o_ref = attention_with_sink_ref_impl(
             query_ref,
@@ -151,21 +186,25 @@ def test_attention_16bit(
         )
 
     o_ref.backward(grad_out_ref)
-    o = flash_attn_func(
-        query,
-        key,
-        value,
-        dropout_p=0.0,
-        softmax_scale=sm_scale,
-        causal=causal,
-        window_size=window_size,
-        bias=None,
-        alibi_slopes=None,
-        deterministic=False,
-        return_lse=False,
-        return_attn_probs=False,
-        sink=sink,
-    )
+    GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    try:
+        o = flash_attn_func(
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            softmax_scale=sm_scale,
+            causal=causal,
+            window_size=window_size,
+            bias=None,
+            alibi_slopes=None,
+            deterministic=False,
+            return_lse=False,
+            return_attn_probs=False,
+            sink=sink,
+        )
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
     o.backward(grad_out)
 
     torch.cuda.synchronize()
@@ -205,9 +244,10 @@ def test_attention_16bit(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
 @pytest.mark.skip(reason="Temporarily disabled due to external dependency issues.")
 @pytest.mark.deterministic
-def test_attention_16bit_deterministic(batch, dtype, config, causal):
+def test_attention_16bit_deterministic(batch, dtype, config, causal, backend):
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
@@ -242,6 +282,24 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal):
     grad_out = torch.randn(o_layout, device=device, dtype=dtype)
 
     sm_scale = head_dim_qk ** (-0.5)
+
+    # Ahead of the reference, which is the expensive part and pointless for a combo the
+    # pinned backend does not implement (that case is covered by the refusal assert inside).
+    if not pinned_backend_takes(
+        backend,
+        q=q0,
+        k=k0,
+        v=v0,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+        qkv_format="bshd",
+    ):
+        return
 
     # Correctness check against reference implementation
     q_ref = q0.clone().detach().requires_grad_()
@@ -281,9 +339,13 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal):
     # Determinism check (bitwise identical across multiple runs).
     repeats = 10
     outs = []
-    for _ in range(repeats):
-        outs.append(_run_once())
-        torch.cuda.synchronize()
+    GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    try:
+        for _ in range(repeats):
+            outs.append(_run_once())
+            torch.cuda.synchronize()
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
 
     o1, dq1, dk1, dv1 = outs[0]
     for i in range(1, repeats):
@@ -636,3 +698,63 @@ def test_sparse_mla(variant, cr, seqlen):
         q, kv, out, grad_out, topk_idx, lse, attn_sink=sink, kv_lora_rank=d, scale=scale
     )
     assert torch.equal(dq, dq2) and torch.equal(dkv, dkv2), "backward is not deterministic"
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="sparse-MLA (flydsl) is gfx950-only"
+)
+@pytest.mark.parametrize("seqlen", [1024, 2048])
+@pytest.mark.parametrize("variant", ["flash", "pro"])
+@pytest.mark.parametrize("cr", [0, 4, 128])
+def test_sparse_mla_op(variant, cr, seqlen):
+    """Public multi-backend training op ``sparse_mla_func``: autograd fwd+bwd (default
+    FLYDSL) vs triton oracle, plus the PRIMUS_TURBO_ATTN_BACKEND=TRITON override."""
+    import math
+
+    from primus_turbo.pytorch.core.backend import (
+        BackendType,
+        GlobalBackendManager,
+        PrecisionType,
+    )
+    from primus_turbo.pytorch.ops import sparse_mla_func
+    from primus_turbo.triton.attention.sparse_mla import (
+        sparse_mla_bwd_triton,
+        sparse_mla_fwd_triton,
+    )
+
+    d = SPARSE_MLA_HEAD_DIM
+    num_heads = SPARSE_MLA_VARIANTS[variant][0]
+    pool, topk_pool, _ = _sparse_mla_topk(variant, cr, seqlen)
+    scale = 1.0 / math.sqrt(d)
+    q, kv, topk_idx, sink, grad_out = _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool)
+
+    # Triton oracle (fwd + bwd), computed directly on the kernels.
+    out_ref, lse_ref = sparse_mla_fwd_triton(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
+    dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_triton(
+        q, kv, out_ref, grad_out, topk_idx, lse_ref, attn_sink=sink, kv_lora_rank=d, scale=scale
+    )
+
+    def _run_op():
+        qg = q.clone().requires_grad_(True)
+        kvg = kv.clone().requires_grad_(True)
+        sg = sink.clone().requires_grad_(True)
+        o = sparse_mla_func(qg, kvg, topk_idx, attn_sink=sg, kv_lora_rank=d, scale=scale)
+        o.backward(grad_out)
+        return o, qg.grad, kvg.grad, sg.grad
+
+    # Default backend (FLYDSL): autograd fwd + bwd through the public op.
+    try:
+        out, dq, dkv, dsink = _run_op()
+        assert torch.isfinite(out).all(), "op forward produced non-finite values"
+        assert compute_snr(out_ref, out) > 40.0, "op fwd SNR <= 40"
+        assert compute_snr(dq_ref, dq) > 40.0, "op dq SNR <= 40"
+        assert compute_snr(dkv_ref, dkv) > 40.0, "op dkv SNR <= 40"
+        assert compute_snr(dsink_ref, dsink) > 40.0, "op dsink SNR <= 40"
+
+        # Backend override: force TRITON through the public op; grads must match the oracle tightly.
+        GlobalBackendManager.set_attn_backend(BackendType.TRITON, PrecisionType.BF16_FP16_FP32)
+        out_t, dq_t, dkv_t, dsink_t = _run_op()
+        assert compute_snr(out_ref, out_t) > 60.0, "TRITON-override op fwd disagrees with oracle"
+        assert compute_snr(dq_ref, dq_t) > 60.0, "TRITON-override op dq disagrees with oracle"
+    finally:
+        GlobalBackendManager.set_attn_backend(None)

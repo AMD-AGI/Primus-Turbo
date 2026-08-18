@@ -510,6 +510,41 @@ def gen_grouped_gemm_test_cases():
     return all_test_cases
 
 
+# THD document packing: uniform is the zero-waste baseline, the rest are ragged with
+# increasing segment-length skew, which is what a max_seqlen-tiled kernel pays for.
+# (name, segment lengths, window_left)
+ATTENTION_VARLEN_CONFIGS = [
+    (name, segments, window)
+    for name, segments in (
+        ("uniform", [2048, 2048, 2048, 2048]),
+        ("mild", [1024, 2048, 4096, 1024]),
+        ("skew", [512, 2048, 1024, 4096]),
+        ("longtail", [4096, 512, 256, 128]),
+    )
+    for window in (-1, 2048)
+]
+
+# Head dims the attention kernels are built for. The table above is head-dim agnostic --
+# the same packing is the same work at either -- so it sweeps both rather than taking a flag.
+ATTENTION_HEAD_DIMS = (64, 128)
+
+
+def gen_attention_varlen_test_cases():
+    """THD document-packing cases: every segment layout at both head dims."""
+    return [
+        {
+            "name": name,
+            "segments": segments,
+            "window_left": window,
+            "num_head_q": 64,
+            "num_head_kv": 8,  # GQA group 8: the smallest the deterministic backward takes
+            "head_dim": head_dim,
+        }
+        for head_dim in ATTENTION_HEAD_DIMS
+        for name, segments, window in ATTENTION_VARLEN_CONFIGS
+    ]
+
+
 def gen_attention_test_cases():
     """Generate attention test cases from model configs (deduplicated)."""
     seen = set()

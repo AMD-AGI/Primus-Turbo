@@ -14,6 +14,7 @@ from typing import Any, Dict, Hashable, List, Optional, Type
 import torch
 
 from primus_turbo.common.constants import (
+    ENV_ATTN_BACKEND,
     ENV_AUTO_TUNE,
     ENV_GEMM_BACKEND,
     ENV_GROUPED_GEMM_BACKEND,
@@ -92,6 +93,7 @@ class GlobalBackendManager:
     _gemm_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _grouped_gemm_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
     _moe_dispatch_combine_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
+    _attn_backend: Optional[Dict[PrecisionType, Optional[BackendType]]] = None
     _auto_tune: Optional[bool] = None
     _env_cache: Dict[str, Dict["PrecisionType", "BackendChoice"]] = {}
 
@@ -279,6 +281,36 @@ class GlobalBackendManager:
         return cls._backend_from_env(ENV_GROUPED_GEMM_BACKEND, precision)
 
     @classmethod
+    def set_attn_backend(
+        cls, backend: Optional[BackendType] = None, precision: Optional[PrecisionType] = None
+    ) -> None:
+        """Set the attention backend in code; flash-attention and sparse-MLA share it."""
+        if backend is None:
+            cls._attn_backend = None
+            return
+
+        if cls._attn_backend is None:
+            cls._attn_backend = {}
+
+        if precision is None:
+            cls._attn_backend = {precision: backend for precision in _PRECISION_TYPE_SET}
+        else:
+            cls._attn_backend[precision] = backend
+
+    @classmethod
+    def get_attn_backend(cls, precision: PrecisionType) -> Optional[BackendType]:
+        """Get the attention backend configuration. Returns None if not set.
+
+        Flash-attention and sparse-MLA read the same setting; they do not have the same
+        backends, so each dispatcher drops a name it does not carry (see
+        resolve_sparse_mla_fwd_backend) rather than failing on it."""
+        if cls._attn_backend is not None:
+            return cls._attn_backend.get(precision)
+        # env parsing yields BackendChoice; attn dispatch consumes the bare enum.
+        choice = cls._backend_from_env(ENV_ATTN_BACKEND, precision)
+        return choice.backend if choice is not None else None
+
+    @classmethod
     def get_moe_dispatch_combine_backend(cls, precision: PrecisionType) -> Optional[BackendChoice]:
         """Get the MoE dispatch combine backend configuration. Returns None if not set.
 
@@ -325,6 +357,7 @@ class GlobalBackendManager:
         cls._gemm_backend = None
         cls._grouped_gemm_backend = None
         cls._moe_dispatch_combine_backend = None
+        cls._attn_backend = None
         cls._auto_tune = None
         cls._env_cache = {}
         AutoKernelDispatcher.clear_all_caches()
@@ -404,6 +437,41 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> str:
         return repr(v)
 
     return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
+
+
+def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
+    """Say once that the default backend was not eligible and we fell back.
+
+    Skipped under torch.compile: dynamo cannot trace a logging.Logger call, and backend
+    selection is host-side dispatch, so tracing into it would fail the compile over a
+    diagnostic. Formatting the kwargs is not cheap either, and it sits inside the guard.
+    """
+    if torch.compiler.is_compiling():
+        return
+    logger.warning(
+        f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, "
+        f"fallback backend {backend_enum.name} is selected. The fallback backend may hurt performance!",
+        once=True,
+    )
+
+
+def drop_unregistered_backend(dispatcher, user_backend: Optional[BackendType]) -> Optional[BackendType]:
+    """Treat a backend this dispatcher has no entry for as "no preference".
+
+    One env var names a backend for several dispatchers that do not carry the same set
+    (both attention ones share PRIMUS_TURBO_ATTN_BACKEND, and only flash-attn has aiter),
+    so a name meant for its sibling must not take this one down. Say so once, since the
+    name being ignored here is otherwise indistinguishable from it being honoured.
+    """
+    if user_backend is None or user_backend in dispatcher._backends:
+        return user_backend
+    if not torch.compiler.is_compiling():
+        logger.warning(
+            f"Backend {user_backend.name} is not one of {dispatcher.__name__}'s "
+            f"({[b.name for b in dispatcher._backends]}); ignoring it for this op.",
+            once=True,
+        )
+    return None
 
 
 class AutoKernelDispatcher(ABC):  # noqa: B024
@@ -539,11 +607,64 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
-                logger.warning(
-                    f"For inputs: {_format_kwargs(kwargs)}, the default backend is not compatible, fallback backend {fallback_backend_enum.name} is selected. The fallback backend may hurt performance!",
-                    once=True,
-                )
+                _warn_fallback(fallback_backend_enum, kwargs)
                 return fallback_backend_entry.impl.execute(**kwargs)
+
+        raise ValueError(
+            f"No compatible backend found for {cls.__name__} with inputs: {_format_kwargs(kwargs)}"
+        )
+
+    @classmethod
+    def _enum_for_impl(cls, impl: Type[KernelBackend]) -> Optional[BackendType]:
+        """Reverse-lookup the BackendType enum for a registered backend impl class."""
+        for backend_enum, entry in cls._backends.items():
+            if entry.impl is impl:
+                return backend_enum
+        return None
+
+    @classmethod
+    def resolve(
+        cls, default_backend_enum: BackendType, user_backend_enum: Optional[BackendType] = None, **kwargs
+    ) -> BackendType:
+        """Select (but do not execute) the backend enum for the given inputs.
+
+        Follows the same priority order as ``dispatch``: user > autotune >
+        default > fallback. Exposed so callers that run a kernel across multiple
+        passes (e.g. an autograd forward/backward pair) can pin the *same*
+        backend for every pass by resolving once and threading the enum through.
+        """
+        # 1. User specified backend (env or code) - highest priority
+        if user_backend_enum is not None:
+            if user_backend_enum not in cls._backends:
+                raise ValueError(
+                    f"User specified backend {user_backend_enum.name} is not registered for {cls.__name__}. "
+                    f"Available backends: {[b.name for b in cls._backends.keys()]}"
+                )
+            if not cls._backends[user_backend_enum].impl.can_handle(**kwargs):
+                raise ValueError(
+                    f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
+                    f"Please check input constraints or choose a different backend."
+                )
+            return user_backend_enum
+
+        # 2. Auto tune
+        # NOTE: Skip autotune during cuda graph capture.
+        if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
+            backend_cls = cls.tune(**kwargs)
+            tuned_enum = cls._enum_for_impl(backend_cls) if backend_cls is not None else None
+            if tuned_enum is not None:
+                return tuned_enum
+
+        # 3. Default backend
+        default_entry = cls._backends.get(default_backend_enum)
+        if default_entry is not None and default_entry.impl.can_handle(**kwargs):
+            return default_backend_enum
+
+        # 4. Fallback: try all backends
+        for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
+            if fallback_backend_entry.impl.can_handle(**kwargs):
+                _warn_fallback(fallback_backend_enum, kwargs)
+                return fallback_backend_enum
 
         raise ValueError(
             f"No compatible backend found for {cls.__name__} with inputs: {_format_kwargs(kwargs)}"
