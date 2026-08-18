@@ -23,6 +23,7 @@ Run inside the dev container (8 GPUs):
 
 import math
 import os
+import unittest
 
 import numpy as np
 import torch
@@ -59,6 +60,13 @@ def _dequant_mxfp8(q, s_raw, block=_MXFP8_BLOCK):
     qf = q.float().view(*lead, K // block, block)
     scale = torch.exp2(s_raw.view(torch.uint8).float() - 127.0).unsqueeze(-1)
     return (qf * scale).view(*lead, K)
+
+
+# Decorating the test methods, not their bodies: unittest honours a method-level skip before it
+# calls setUp, so on a non-gfx950 host the 8 worker processes are never spawned at all.
+skip_unless_mxfp8 = unittest.skipUnless(
+    torch.cuda.is_available() and check_mxfp8_support()[0], "mxfp8 mega MoE requires gfx950"
+)
 
 
 @instantiate_parametrized_tests
@@ -126,6 +134,7 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         return float(np.average([s.elapsed_time(e) for s, e in zip(ev_s, ev_e)][1:]))
 
     # ───────────────────────── Stage 1: L1 (dispatch + fc1) ─────────────────────────
+    @skip_unless_mxfp8
     @skip_if_lt_x_gpu(_WORLD)
     @parametrize("top_k", [8])
     def test_l1_dispatch_fc1_bench(self, top_k):
@@ -134,8 +143,6 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         Correctness: torch dequant grouped-GEMM over the kernel's OWN dispatched pool
         (``symm.pool_fp8``/``pool_scale``) -> cos/rel gate. Latency: token-quant (rowwise mxfp8,
         per-forward) + the fused dispatch+GEMM kernel."""
-        if not check_mxfp8_support():
-            self.skipTest("MXFP8 requires gfx950")
         self._init_process()
         group = self._ep_group()
         from primus_turbo.flydsl.mega.fp8 import (
@@ -276,6 +283,7 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         self.assertGreaterEqual(cos_m, 0.99, f"L1 cos {cos_m:.5f} < 0.99")
         self.assertLessEqual(rel_m, 0.05, f"L1 rel {rel_m:.4f} > 0.05")
 
+    @skip_unless_mxfp8
     @skip_if_lt_x_gpu(_WORLD)
     @parametrize("top_k", [8])
     def test_training_loop_fwd_bwd(self, top_k):
@@ -296,8 +304,6 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
         Asserts only that every step produces finite y / dx / dW: this is a liveness and
         state-threading test, not a precision one. It prints per step so a hang says which one.
         """
-        if not check_mxfp8_support():
-            self.skipTest("MXFP8 requires gfx950")
         self._init_process()
         group = self._ep_group()
         from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
