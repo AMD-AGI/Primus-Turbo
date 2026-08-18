@@ -4,8 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from enum import Enum, auto
-from typing import NamedTuple, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
@@ -28,7 +27,6 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
-    float8_e4m3,
 )
 from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
 from primus_turbo.triton.quantization.quant_blockwise import (
@@ -257,6 +255,11 @@ def _blockwise_dual_output_shapes(
     return row_shape, row_scale_shape, col_shape, col_scale_shape
 
 
+def _use_flydsl_fp8_blockwise_quant() -> bool:
+    backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
+    return backend_choice is not None and backend_choice.backend == BackendType.FLYDSL and is_gfx950()
+
+
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_dual_impl", mutates_args=())
 def quant_fp8_blockwise_dual_impl(
     x: torch.Tensor,
@@ -277,8 +280,7 @@ def quant_fp8_blockwise_dual_impl(
 
     When ``row_pad_to_block`` is True, the row-quantized output's trailing
     dimension is extended to a block boundary. The existing final block scale
-    covers the zero-filled suffix, so dgrad can consume a contraction length
-    divisible by ``block_size`` without another tensor copy.
+    covers the zero-filled suffix.
 
     When ``row_scale_transposed`` is True, row scales are written directly as
     ``[ceil(N / block_size), M]``. The scale values are unchanged; this layout
@@ -302,6 +304,16 @@ def quant_fp8_blockwise_dual_impl(
         raise ValueError("input must be a contiguous 2D tensor")
 
     M, N = x.shape
+    if col_transposed and not row_pad_to_block and _use_flydsl_fp8_blockwise_quant():
+        from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
+            quantize_blockwise_fp8_dual,
+        )
+
+        return quantize_blockwise_fp8_dual(
+            x,
+            row_scale_transposed=row_scale_transposed,
+        )
+
     row_shape, row_scales_shape, col_fp8_shape, col_scales_shape = _blockwise_dual_output_shapes(
         M,
         N,
@@ -379,6 +391,13 @@ def quant_fp8_blockwise_for_weight_impl(
     """
 
     assert w.dim() in (2, 3)
+    if _use_flydsl_fp8_blockwise_quant():
+        from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
+            quantize_blockwise_fp8_weight,
+        )
+
+        return quantize_blockwise_fp8_weight(w)
+
     if not w.is_contiguous():
         w = w.contiguous()
 
@@ -443,172 +462,6 @@ def quant_fp8_blockwise_for_weight_impl_meta(
         w_fp8 = w_fp8.squeeze(0)
         w_scales = w_scales.squeeze(0)
     return w_fp8, w_scales
-
-
-class FP8BlockwiseQuantRole(Enum):
-    ACTIVATION = auto()
-    WEIGHT = auto()
-    GRAD_OUT = auto()
-
-
-class FP8BlockwiseQuantResult(NamedTuple):
-    row: torch.Tensor
-    row_scale: torch.Tensor
-    col: torch.Tensor
-    col_scale: torch.Tensor
-    row_padded: bool
-
-
-def _can_use_flydsl_blockwise_dual_quant(
-    x: torch.Tensor,
-    fp8_dtype: torch.dtype,
-    block_size: int,
-) -> bool:
-    return (
-        fp8_dtype == float8_e4m3
-        and x.dtype == torch.bfloat16
-        and x.shape[0] % block_size == 0
-        and x.shape[1] % block_size == 0
-        and x.numel() * x.element_size() <= 0xFFFFFFFF
-    )
-
-
-def _quantize_fp8_blockwise_dual_for_flydsl(
-    x: torch.Tensor,
-    fp8_dtype: torch.dtype,
-    block_size: int,
-    *,
-    row_scale_transposed: bool = False,
-    row_pad_to_block: bool = False,
-):
-    if not row_pad_to_block and _can_use_flydsl_blockwise_dual_quant(x, fp8_dtype, block_size):
-        from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
-            quantize_blockwise_fp8_dual,
-        )
-
-        return quantize_blockwise_fp8_dual(
-            x,
-            row_scale_transposed=row_scale_transposed,
-        )
-    return quant_fp8_blockwise_dual_impl(
-        x,
-        fp8_dtype,
-        block_size,
-        col_transposed=True,
-        row_pad_to_block=row_pad_to_block,
-        row_scale_transposed=row_scale_transposed,
-    )
-
-
-def _quantize_fp8_blockwise_weight_for_flydsl(
-    weight: torch.Tensor,
-    fp8_dtype: torch.dtype,
-    block_size: int,
-):
-    if (
-        fp8_dtype == float8_e4m3
-        and weight.dtype == torch.bfloat16
-        and weight.dim() == 2
-        and weight.is_contiguous()
-        and weight.shape[1] % 16 == 0
-        and weight.numel() * weight.element_size() <= 0xFFFFFFFF
-    ):
-        from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
-            quantize_blockwise_fp8_weight,
-        )
-
-        return quantize_blockwise_fp8_weight(weight)
-    return quant_fp8_blockwise_for_weight_impl(
-        weight,
-        fp8_dtype,
-        block_size=block_size,
-    )
-
-
-def quantize_fp8_blockwise_for_gemm(
-    x: torch.Tensor,
-    fp8_dtype: torch.dtype,
-    block_size: int,
-    *,
-    role: FP8BlockwiseQuantRole,
-    trans_b: bool,
-    contract_size: Optional[int] = None,
-    scale_inv: Optional[torch.Tensor] = None,
-) -> FP8BlockwiseQuantResult:
-    backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
-    use_flydsl = backend_choice is not None and backend_choice.backend == BackendType.FLYDSL and is_gfx950()
-
-    if scale_inv is not None:
-        if role == FP8BlockwiseQuantRole.ACTIVATION and use_flydsl and trans_b:
-            from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                flydsl_blockwise_forward_scale_a_k_major,
-            )
-
-            if flydsl_blockwise_forward_scale_a_k_major(x.shape[1]):
-                row_major_shape = (x.shape[0], (x.shape[1] + block_size - 1) // block_size)
-                if tuple(scale_inv.shape) == row_major_shape:
-                    scale_inv = scale_inv.T.contiguous()
-        return FP8BlockwiseQuantResult(x, scale_inv, x, scale_inv, False)
-
-    if role == FP8BlockwiseQuantRole.WEIGHT:
-        if use_flydsl:
-            row, row_scale = _quantize_fp8_blockwise_weight_for_flydsl(x, fp8_dtype, block_size)
-        else:
-            row, row_scale = quant_fp8_blockwise_for_weight_impl(x, fp8_dtype, block_size=block_size)
-        return FP8BlockwiseQuantResult(row, row_scale, row, row_scale, False)
-
-    if role == FP8BlockwiseQuantRole.ACTIVATION:
-        if use_flydsl and trans_b:
-            from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-                flydsl_blockwise_forward_scale_a_k_major,
-            )
-
-            row_scale_transposed = flydsl_blockwise_forward_scale_a_k_major(x.shape[1])
-            row, row_scale, col, col_scale = _quantize_fp8_blockwise_dual_for_flydsl(
-                x,
-                fp8_dtype,
-                block_size,
-                row_scale_transposed=row_scale_transposed,
-            )
-            col = col.transpose(0, 1)
-        else:
-            row, row_scale, col, col_scale = quant_fp8_blockwise_dual_impl(
-                x,
-                fp8_dtype,
-                block_size,
-            )
-        return FP8BlockwiseQuantResult(row, row_scale, col, col_scale, False)
-
-    if role != FP8BlockwiseQuantRole.GRAD_OUT:
-        raise ValueError(f"unsupported blockwise quantization role: {role}")
-
-    if contract_size is None:
-        raise ValueError("contract_size is required for grad_out blockwise quantization")
-    row_padded = use_flydsl and trans_b and contract_size % block_size != 0
-    if use_flydsl and trans_b:
-        row, row_scale, col, col_scale = _quantize_fp8_blockwise_dual_for_flydsl(
-            x,
-            fp8_dtype,
-            block_size,
-            row_pad_to_block=row_padded,
-        )
-        col = col.transpose(0, 1)
-    else:
-        row, row_scale, col, col_scale = quant_fp8_blockwise_dual_impl(
-            x,
-            fp8_dtype,
-            block_size,
-        )
-
-    if use_flydsl and not trans_b:
-        from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
-            flydsl_blockwise_forward_scale_a_k_major,
-        )
-
-        if flydsl_blockwise_forward_scale_a_k_major(row.shape[1]):
-            row_scale = row_scale.T.contiguous()
-
-    return FP8BlockwiseQuantResult(row, row_scale, col, col_scale, row_padded)
 
 
 @torch.library.custom_op("primus_turbo::quant_fp8_blockwise_segment_m_row_col_impl", mutates_args=())

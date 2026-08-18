@@ -10,7 +10,6 @@ import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
-    DEFAULT_BLOCK_SIZE,
     Float8QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
@@ -26,10 +25,11 @@ from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_accum_impl,
     gemm_fp8_impl,
 )
-from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-    FP8BlockwiseQuantRole,
-    quantize_fp8_blockwise_for_gemm,
-    quantize_mxfp8_impl,
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import quantize_mxfp8_impl
+from primus_turbo.pytorch.ops.quantization import (
+    get_fp8_blockwise_gemm_recipes,
+    quantize_fp8,
+    quantize_fp8_with_trans,
 )
 from primus_turbo.pytorch.ops.utils import (
     _get_dummy_wgrad,
@@ -441,18 +441,15 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         assert trans_a == False, "trans_a has to be False"
         a_dtype = _get_fp8_dtype(config.format, True)
         b_dtype = _get_fp8_dtype(config.format, True)
+        a_shape = a.qdata.shape if isinstance(a, QuantizedTensor) else a.shape
+        row_recipe, col_recipe = get_fp8_blockwise_gemm_recipes(
+            a_shape,
+            trans_b,
+            config.block_size,
+        )
 
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, axis=-1)
-            a_quant = quantize_fp8_blockwise_for_gemm(
-                a.qdata,
-                a_dtype,
-                config.block_size,
-                role=FP8BlockwiseQuantRole.ACTIVATION,
-                trans_b=trans_b,
-                scale_inv=a.scale_inv,
-            )
-            a_row, a_row_scale = a_quant.row, a_quant.row_scale
             if a_t is None:
                 a_t = QuantizedTensor.quantize(
                     a.dequantize(),
@@ -460,42 +457,38 @@ class FP8GemmBlockFunction(torch.autograd.Function):
                     config.granularity,
                     axis=-2,
                     block_size=config.block_size,
+                    scaling_recipe=col_recipe,
                 )
+                a_col, a_col_scale = a_t.qdata, a_t.scale_inv
+            else:
+                a_col, a_col_scale = a_t.apply_scaling_recipe_layout(col_recipe)
 
-            a_col, a_col_scale = a_t.qdata, a_t.scale_inv
+            a_row, a_row_scale = a.apply_scaling_recipe_layout(row_recipe)
         else:
-            a_quant = quantize_fp8_blockwise_for_gemm(
+            a_row, a_row_scale, a_col, a_col_scale = quantize_fp8_with_trans(
                 a,
                 a_dtype,
-                config.block_size,
-                role=FP8BlockwiseQuantRole.ACTIVATION,
-                trans_b=trans_b,
+                config.granularity,
+                block_size=config.block_size,
+                scaling_recipe=row_recipe,
+                scaling_recipe_for_trans=col_recipe,
             )
-            a_row, a_row_scale = a_quant.row, a_quant.row_scale
-            a_col, a_col_scale = a_quant.col, a_quant.col_scale
+            if col_recipe.col_transposed:
+                a_col = a_col.transpose(0, 1)
 
         # --- B side: 2D-block weight, reused unchanged in fwd + bwd. ---
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
-            b_quant = quantize_fp8_blockwise_for_gemm(
-                b.qdata,
-                b_dtype,
-                config.block_size,
-                role=FP8BlockwiseQuantRole.WEIGHT,
-                trans_b=trans_b,
-                scale_inv=b.scale_inv,
-            )
-            b_row, b_row_scale = b_quant.row, b_quant.row_scale
+            b_row, b_row_scale = b.qdata, b.scale_inv
         else:
-            b_quant = quantize_fp8_blockwise_for_gemm(
+            b_row, b_row_scale = quantize_fp8(
                 b,
                 b_dtype,
-                config.block_size,
-                role=FP8BlockwiseQuantRole.WEIGHT,
-                trans_b=trans_b,
+                config.granularity,
+                block_size=config.block_size,
+                scaling_recipe=b_scaling_recipe,
             )
-            b_row, b_row_scale = b_quant.row, b_quant.row_scale
         b_col, b_col_scale = b_row, b_row_scale
 
         out = gemm_fp8_impl(
@@ -526,24 +519,30 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         grad_out = grad_out.contiguous()
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
         dgrad_contract = b_col.shape[0]
+        row_recipe, col_recipe = get_fp8_blockwise_gemm_recipes(
+            grad_out.shape,
+            ctx.trans_b,
+            ctx.config.block_size,
+            contract_size=dgrad_contract,
+        )
 
         # Quantize grad_out in both row-wise and column-wise directions:
         # - row-wise: for dgrad (grad_x)
         # - col-wise: for wgrad (grad_w)
-        g_quant = quantize_fp8_blockwise_for_gemm(
+        g_row, g_row_scale, g_col, g_col_scale = quantize_fp8_with_trans(
             grad_out,
             grad_out_dtype,
-            ctx.config.block_size,
-            role=FP8BlockwiseQuantRole.GRAD_OUT,
-            trans_b=ctx.trans_b,
-            contract_size=dgrad_contract,
+            ctx.config.granularity,
+            block_size=ctx.config.block_size,
+            scaling_recipe=row_recipe,
+            scaling_recipe_for_trans=col_recipe,
         )
-        g_row, g_row_scale = g_quant.row, g_quant.row_scale
-        g_col, g_col_scale = g_quant.col, g_quant.col_scale
+        if col_recipe.col_transposed:
+            g_col = g_col.transpose(0, 1)
 
         dgrad_b = b_col
         dgrad_b_scale = b_col_scale
-        if g_quant.row_padded:
+        if row_recipe.row_pad_to_block:
             dgrad_m = (dgrad_contract + ctx.config.block_size - 1) // ctx.config.block_size
             dgrad_m *= ctx.config.block_size
             dgrad_b_padded = b_col.new_zeros((dgrad_m, b_col.shape[1]))
@@ -800,7 +799,6 @@ def gemm_fp8(
     FP8 Format (config.format):
         - E4M3
         - E5M2
-        - HYBRID
 
     Example::
 
@@ -820,8 +818,6 @@ def gemm_fp8(
     """
     if config is None:
         config = Float8QuantConfig()
-    if config.granularity == ScalingGranularity.BLOCKWISE and config.block_size != DEFAULT_BLOCK_SIZE:
-        raise ValueError(f"BLOCKWISE FP8 GEMM requires block_size={DEFAULT_BLOCK_SIZE}")
 
     if isinstance(a, QuantizedTensorPair):
         a_data, a_data_t = a.data, a.data_t

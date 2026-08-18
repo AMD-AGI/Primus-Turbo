@@ -198,6 +198,61 @@ class QuantizedTensor(torch.Tensor):
 
         return self
 
+    @staticmethod
+    def _apply_blockwise_layout(
+        data: torch.Tensor,
+        scale_inv: torch.Tensor,
+        granularity: ScalingGranularity,
+        axis: Optional[int],
+        block_size: Optional[int],
+        scaling_recipe: Optional[ScalingRecipe],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply BLOCKWISE physical-layout directives without changing logical values.
+
+        Row-wise quantization can store inverse scales as either
+        ``[M, ceil(N / block_size)]`` or block-major
+        ``[ceil(N / block_size), M]``. Column-wise quantization can expose a
+        logical ``[M, N]`` tensor backed by contiguous ``[N, M]`` storage, so its
+        transpose is contiguous for wgrad. Shape checks keep both conversions
+        idempotent when an existing ``QuantizedTensor`` already uses the requested
+        layout.
+
+        ``row_pad_to_block`` changes the quantized data shape and must be handled
+        by the dual blockwise quantizer.
+        """
+        if granularity != ScalingGranularity.BLOCKWISE or scaling_recipe is None:
+            return data, scale_inv
+        if scaling_recipe.row_pad_to_block:
+            raise ValueError("row_pad_to_block requires dual blockwise quantization")
+
+        normalized_axis = axis % data.ndim if axis is not None else None
+        if scaling_recipe.row_scale_transposed and data.ndim == 2 and normalized_axis == data.ndim - 1:
+            assert block_size is not None
+            row_major_shape = (data.shape[0], (data.shape[1] + block_size - 1) // block_size)
+            if tuple(scale_inv.shape) == row_major_shape:
+                scale_inv = scale_inv.T.contiguous()
+        if (
+            scaling_recipe.col_transposed
+            and data.ndim == 2
+            and normalized_axis == 0
+            and not data.T.is_contiguous()
+        ):
+            data = data.T.contiguous().T
+        return data, scale_inv
+
+    def apply_scaling_recipe_layout(
+        self,
+        scaling_recipe: ScalingRecipe,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._apply_blockwise_layout(
+            self._data,
+            self._scale_inv,
+            self._granularity,
+            self._quantized_axis,
+            self._block_size,
+            scaling_recipe,
+        )
+
     # ------------------------------------------------------------------
     # Factory: quantize a high-precision tensor and wrap the result.
     # ------------------------------------------------------------------
@@ -346,6 +401,15 @@ class QuantizedTensor(torch.Tensor):
                 axis=axis,
                 scaling_recipe=scaling_recipe,
             )
+
+        data, scale_inv = cls._apply_blockwise_layout(
+            data,
+            scale_inv,
+            granularity,
+            axis,
+            block_size,
+            scaling_recipe,
+        )
 
         return cls(
             data,

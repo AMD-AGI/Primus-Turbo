@@ -8,6 +8,11 @@ from typing import Optional, Tuple
 
 import torch
 
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     MXFP8_BLOCK_SIZE,
@@ -15,6 +20,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
     float4_e2m1fn_x2,
 )
+from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequant_fp8_blockwise_for_weight_impl,
     dequant_fp8_blockwise_impl,
@@ -47,6 +53,35 @@ __all__ = [
     "grouped_quantize_fp4",
     "grouped_dequantize_fp4",
 ]
+
+
+def get_fp8_blockwise_gemm_recipes(
+    shape: torch.Size,
+    trans_b: bool,
+    block_size: int,
+    *,
+    contract_size: Optional[int] = None,
+) -> Tuple[ScalingRecipe, ScalingRecipe]:
+    backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
+    use_flydsl = backend_choice is not None and backend_choice.backend == BackendType.FLYDSL and is_gfx950()
+    if not use_flydsl:
+        return ScalingRecipe(), ScalingRecipe()
+
+    from primus_turbo.flydsl.gemm.gemm_fp8_blockwise_kernel import (
+        flydsl_blockwise_forward_scale_a_k_major,
+    )
+
+    row_scale_transposed = (
+        (trans_b and contract_size is None) or (not trans_b and contract_size is not None)
+    ) and flydsl_blockwise_forward_scale_a_k_major(shape[1])
+    row_pad_to_block = contract_size is not None and trans_b and contract_size % block_size != 0
+    return (
+        ScalingRecipe(
+            row_pad_to_block=row_pad_to_block,
+            row_scale_transposed=row_scale_transposed,
+        ),
+        ScalingRecipe(col_transposed=trans_b),
+    )
 
 
 def quantize_fp8(
@@ -121,6 +156,8 @@ def quantize_fp8_with_trans(
                ``axis`` argument is taken (it is implied by the dual direction).
             3. The block size must be 32.
             4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
+        For BLOCKWISE quantization, the rowwise output's trailing dimension is
+        padded to ``block_size`` when ``scaling_recipe.row_pad_to_block`` is set.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MXFP8_BLOCK_SIZE, (
@@ -136,7 +173,18 @@ def quantize_fp8_with_trans(
             scaling_recipe_for_trans,
         )
     elif granularity == ScalingGranularity.BLOCKWISE:
-        return quant_fp8_blockwise_dual_impl(x, out_dtype, block_size=block_size)
+        scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
+        scaling_recipe_for_trans = (
+            ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+        )
+        return quant_fp8_blockwise_dual_impl(
+            x,
+            out_dtype,
+            block_size=block_size,
+            col_transposed=scaling_recipe_for_trans.col_transposed,
+            row_pad_to_block=scaling_recipe.row_pad_to_block,
+            row_scale_transposed=scaling_recipe.row_scale_transposed,
+        )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 

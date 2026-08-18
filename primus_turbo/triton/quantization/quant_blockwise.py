@@ -88,14 +88,7 @@ def quant_fp8_blockwise_dual_kernel(
     x_tile_abs = tl.abs(x_tile)
 
     x_fp8_row_tile, x_scales_row_tile = compute_scale_and_quant(x_tile, x_tile_abs, 1, FP8_MAX)
-    # Col-axis (axis=0) reduction routed through a single tl.trans so the max-reduction
-    # runs along the contiguous axis (axis=1 of the transposed tile). This swizzles the
-    # LDS staging and eliminates the strided cross-lane bank conflicts of the direct
-    # axis=0 reduction. The transposed tile (and everything derived from it) stays in
-    # [n, m] orientation: abs commutes with transpose so x_tile_abs_t is taken directly
-    # from x_tile_t (no second LDS transpose), and the col fp8/scale results are kept
-    # transposed and stored from there. Algebraically/byte-identical: same per-column
-    # max, scale, and quant.
+    # Reduce the transposed tile along its contiguous axis and keep col results in [n, m].
     x_tile_t = tl.trans(x_tile)
     x_tile_abs_t = tl.abs(x_tile_t)
     x_fp8_col_tile_t, x_scales_col_tile_t = compute_scale_and_quant(x_tile_t, x_tile_abs_t, 1, FP8_MAX)
@@ -104,18 +97,8 @@ def quant_fp8_blockwise_dual_kernel(
     row_mask = (offs_m[:, None] < M) & (offs_n[None, :] < ROW_N)
     tl.store(x_fp8_row_ptrs, x_fp8_row_tile.to(x_fp8_row_ptr.dtype.element_ty), mask=row_mask)
 
-    # Col-quant data store. With COL_TRANSPOSED the column-quantized tile is
-    # written directly into an [N, M] output buffer (element (m, n) -> flat
-    # n*M + m) instead of the default [M, N] (element (m, n) -> flat m*N + n).
-    # The col results are already in [n, m] (transposed) orientation, so the
-    # COL_TRANSPOSED store writes x_fp8_col_tile_t straight out with a transposed
-    # pointer/mask -- byte-identical to the previous trans-then-store-into-[N,M]
-    # path but with both output transposes removed. The [N, M] layout matches
-    # exactly the operand the FlyDSL wgrad kernel needs for grad_out
-    # (A = grad_out^T), so the separate elementwise transpose-copy in the wgrad
-    # launcher collapses to a zero-cost view. The default [M, N] col path keeps
-    # the output transpose. The col-scale layout ([M//128, N], stored below) is
-    # unchanged.
+    # Store col output as [N, M] when transposed, otherwise as [M, N].
+    # Col-scale layout remains [M_blocks, N].
     if COL_TRANSPOSED:
         x_fp8_col_ptrs = x_fp8_col_ptr + offs_n[:, None] * M + offs_m[None, :]
         col_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)

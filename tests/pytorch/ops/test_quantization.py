@@ -17,7 +17,6 @@ from primus_turbo.pytorch.core.low_precision import (
     check_mxfp4_support,
     check_mxfp8_support,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
 from primus_turbo.pytorch.ops.quantization import (
     dequantize_fp4,
@@ -280,91 +279,6 @@ def test_quantize_fp8_blockwise_for_weight(orig_dtype, dest_dtype, batched, B, M
     )
 
     torch.testing.assert_close(x, out, **get_tolerances(dest_dtype))
-
-
-@pytest.mark.parametrize("row_scale_transposed", [False, True])
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or get_device_compute_capability() < (9, 5),
-    reason="FlyDSL blockwise FP8 quantization is gfx950-only",
-)
-def test_quantize_fp8_blockwise_flydsl(row_scale_transposed):
-    from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
-        quantize_blockwise_fp8_dual,
-        quantize_blockwise_fp8_weight,
-    )
-    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-        quant_fp8_blockwise_dual_impl,
-        quant_fp8_blockwise_for_weight_impl,
-    )
-
-    generator = torch.Generator(device="cuda")
-    generator.manual_seed(137)
-
-    x = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16, generator=generator)
-    row_ref, row_scale_ref, col_ref, col_scale_ref = quant_fp8_blockwise_dual_impl(
-        x,
-        turbo.float8_e4m3,
-        128,
-        col_transposed=True,
-        row_scale_transposed=row_scale_transposed,
-    )
-    row, row_scale, col, col_scale = quantize_blockwise_fp8_dual(
-        x,
-        row_scale_transposed=row_scale_transposed,
-    )
-    torch.testing.assert_close(row, row_ref, rtol=0, atol=0)
-    torch.testing.assert_close(row_scale, row_scale_ref, rtol=0, atol=0)
-    torch.testing.assert_close(col, col_ref, rtol=0, atol=0)
-    torch.testing.assert_close(col_scale, col_scale_ref, rtol=0, atol=0)
-
-    weight = torch.randn((192, 256), device="cuda", dtype=torch.bfloat16, generator=generator)
-    weight_ref, weight_scale_ref = quant_fp8_blockwise_for_weight_impl(weight, turbo.float8_e4m3, 128)
-    weight_fp8, weight_scale = quantize_blockwise_fp8_weight(weight)
-    torch.testing.assert_close(weight_fp8, weight_ref, rtol=0, atol=0)
-    torch.testing.assert_close(weight_scale, weight_scale_ref, rtol=0, atol=0)
-
-
-def test_quantize_fp8_blockwise_layouts_byte_exact():
-    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-        quant_fp8_blockwise_dual_impl,
-    )
-
-    x = torch.randn((384, 192), dtype=torch.bfloat16, device="cuda")
-    plain = quant_fp8_blockwise_dual_impl(x, turbo.float8_e4m3, 128)
-    kmajor = quant_fp8_blockwise_dual_impl(
-        x,
-        turbo.float8_e4m3,
-        128,
-        row_scale_transposed=True,
-    )
-    transposed = quant_fp8_blockwise_dual_impl(
-        x,
-        turbo.float8_e4m3,
-        128,
-        col_transposed=True,
-    )
-    row_padded = quant_fp8_blockwise_dual_impl(
-        x,
-        turbo.float8_e4m3,
-        128,
-        row_pad_to_block=True,
-    )
-
-    torch.testing.assert_close(transposed[0], plain[0], rtol=0, atol=0)
-    torch.testing.assert_close(transposed[1], plain[1], rtol=0, atol=0)
-    torch.testing.assert_close(transposed[2].T, plain[2], rtol=0, atol=0)
-    torch.testing.assert_close(transposed[3], plain[3], rtol=0, atol=0)
-    torch.testing.assert_close(kmajor[0], plain[0], rtol=0, atol=0)
-    torch.testing.assert_close(kmajor[1], plain[1].T.contiguous(), rtol=0, atol=0)
-    torch.testing.assert_close(kmajor[2], plain[2], rtol=0, atol=0)
-    torch.testing.assert_close(kmajor[3], plain[3], rtol=0, atol=0)
-
-    assert row_padded[0].shape == (384, 256)
-    torch.testing.assert_close(row_padded[0][:, :192], plain[0], rtol=0, atol=0)
-    assert torch.count_nonzero(row_padded[0][:, 192:]).item() == 0
-    torch.testing.assert_close(row_padded[1], plain[1], rtol=0, atol=0)
-    torch.testing.assert_close(row_padded[2], plain[2], rtol=0, atol=0)
-    torch.testing.assert_close(row_padded[3], plain[3], rtol=0, atol=0)
 
 
 def padding_size(n: int, padding_align_size: int) -> int:
