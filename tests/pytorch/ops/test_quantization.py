@@ -707,6 +707,49 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     torch.testing.assert_close(x_2d_ref_colwise, out_colwise, **get_tolerances(dest_dtype))
 
 
+@pytest.mark.parametrize("N,K", [(64, 192), (192, 64)])
+def test_quantize_mxfp4_with_trans_batched_3d_padding(N, K):
+    """The FlyDSL batched dual kernel must materialize both padded tails as zero."""
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    torch.manual_seed(42)
+    x = torch.randn((2, N, K), device="cuda", dtype=torch.bfloat16)
+    recipe = ScalingRecipe(use_2d_block=False)
+    rowwise, row_scale, colwise, col_scale = quantize_fp4_with_trans(
+        x,
+        turbo.float4_e2m1fn_x2,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        block_size=MXFP4_BLOCK_SIZE,
+        scaling_recipe=recipe,
+        scaling_recipe_for_trans=recipe,
+    )
+
+    row_ref = torch.nn.functional.pad(x, (0, padding_size(K, 128)))
+    col_ref = torch.nn.functional.pad(x.transpose(1, 2), (0, padding_size(N, 128)))
+    row_out = dequantize_fp4(
+        rowwise,
+        torch.bfloat16,
+        ScalingGranularity.MX_BLOCKWISE,
+        block_size=MXFP4_BLOCK_SIZE,
+        axis=2,
+        scale_inv=row_scale,
+        scaling_recipe=recipe,
+    )
+    col_out = dequantize_fp4(
+        colwise,
+        torch.bfloat16,
+        ScalingGranularity.MX_BLOCKWISE,
+        block_size=MXFP4_BLOCK_SIZE,
+        axis=2,
+        scale_inv=col_scale,
+        scaling_recipe=recipe,
+    )
+    torch.testing.assert_close(row_ref, row_out, **get_tolerances(turbo.float4_e2m1fn_x2))
+    torch.testing.assert_close(col_ref, col_out, **get_tolerances(turbo.float4_e2m1fn_x2))
+
+
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "dest_dtype",
