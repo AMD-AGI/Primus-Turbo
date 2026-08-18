@@ -66,6 +66,18 @@ def uindex(v):
     return ArithValue(arith.index_castui(T.index, _raw(v)))
 
 
+_cuda_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def current_stream(dev):
+    """Current-stream handle for a FlyDSL Stream argument, which takes the raw pointer as an int.
+    Building a torch Stream object costs ~2 us of device-index plumbing per launch, which a
+    per-expert-call kernel pays inside the timed region."""
+    if _cuda_raw_stream is None:
+        return torch.cuda.current_stream()
+    return _cuda_raw_stream(dev.index if dev.index is not None else torch.cuda.current_device())
+
+
 def resolve_accum_out(out, beta, shape, device, out_dtype):
     """Validate an optional caller-owned ``out``, or allocate one.
 
@@ -1427,6 +1439,28 @@ def xcd_remap_pid_u(pid, total_pids, num_xcd):
     return offset + local
 
 
+def xcd_remap_pid_blocked(pid, total_pids, num_xcd, blk):
+    """Hand each XCD whole ``blk``-tile runs round-robin instead of one contiguous
+    1/num_xcd slice of the id space (``xcd_remap_pid``).
+
+    Same per-XCD L2 reuse as long as ``blk`` covers the reuse window, but any work
+    imbalance that is CONCENTRATED in one part of the id space -- a grid whose trailing
+    tiles are cheap padding, say -- is spread over all the dies instead of landing on the
+    last one, which otherwise runs dry while the others still carry the whole kernel.
+    Bijection over [0, total_pids); the tail that does not fill a whole num_xcd*blk round
+    keeps the identity map. Identity when num_xcd <= 1."""
+    if num_xcd <= 1 or blk <= 1:
+        return xcd_remap_pid(pid, total_pids, num_xcd)
+    step = num_xcd * blk
+    full = (total_pids // step) * step
+    if full == 0:
+        return xcd_remap_pid(pid, total_pids, num_xcd)
+    xcd = pid % num_xcd
+    local = pid // num_xcd
+    mapped = ((local // blk) * num_xcd + xcd) * blk + local % blk
+    return mapped if full == total_pids else arith.select(pid < fx.Int32(full), mapped, pid)
+
+
 def _inttoptr_lds(byte_addr):
     """Integer byte address -> !llvm.ptr<3> (LDS). Parsed per call: the type is
     bound to the current MLIRContext and cannot be cached across compiles."""
@@ -1666,9 +1700,9 @@ def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes):
     rows_i = _as_index(c_rows)
     row_c = arith.minui(row_i, rows_i)
     band_base = c_base + row_c * cols_i * elem
+    band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
     # cap at 0x7FFFFFFF so a masked-out buffer_store (voffset=0x7FFFFFFF) is always OOB
     nrec = arith.minui((rows_i - row_c) * cols_i * elem, arith.index(0x7FFFFFFF))
-    band_base_i64 = _readfirstlane_i32(arith.index_cast(T.i64, band_base))
     nrec_pinned = arith.index_cast(T.index, _readfirstlane_i32(arith.index_cast(T.i64, nrec)))
     return _buffer_ops.create_buffer_resource_from_addr(band_base_i64, num_records_bytes=nrec_pinned)
 
