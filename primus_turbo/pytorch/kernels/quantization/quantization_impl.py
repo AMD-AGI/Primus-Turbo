@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Union
 import torch
 import triton
 
+from primus_turbo.flydsl.quantization.fp8_blockwise_quant import quantize_blockwise_fp8_dual
 from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import (
     grouped_quant_mxfp8_raw,
     quant_mxfp8_raw,
@@ -242,16 +243,14 @@ def _blockwise_dual_output_shapes(
     M,
     N,
     block_size: int,
-    col_transposed: bool,
     row_pad_to_block: bool,
-    row_scale_transposed: bool,
 ):
     row_n = ceil_div(N, block_size) * block_size if row_pad_to_block else N
     row_shape = (M, row_n)
     row_blocks = ceil_div(N, block_size)
-    row_scale_shape = (row_blocks, M) if row_scale_transposed else (M, row_blocks)
+    row_scale_shape = (row_blocks, M)
     col_scale_shape = (ceil_div(M, block_size), N)
-    col_shape = (N, M) if col_transposed else (M, N)
+    col_shape = (N, M)
     return row_shape, row_scale_shape, col_shape, col_scale_shape
 
 
@@ -265,14 +264,12 @@ def quant_fp8_blockwise_dual_impl(
     x: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
-    col_transposed: bool = False,
     row_pad_to_block: bool = False,
-    row_scale_transposed: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor in both blockwise row and column modes in one pass.
 
-    When ``col_transposed`` is True the column-quantized FP8 output is stored
-    directly in transposed ``[N, M]`` layout (byte-identical to
+    The column-quantized FP8 output is stored directly in transposed ``[N, M]``
+    layout (byte-identical to
     ``x_fp8_col[M,N].transpose(0,1).contiguous()``) so a downstream TN GEMM that
     needs ``x^T`` (the FlyDSL wgrad path consuming grad_out) can use it without a
     separate elementwise transpose-copy. The col-scale shape ``[M//128, N]`` is
@@ -282,9 +279,9 @@ def quant_fp8_blockwise_dual_impl(
     dimension is extended to a block boundary. The existing final block scale
     covers the zero-filled suffix.
 
-    When ``row_scale_transposed`` is True, row scales are written directly as
-    ``[ceil(N / block_size), M]``. The scale values are unchanged; this layout
-    gives the FlyDSL forward GEMM contiguous row-scale vectors for each K block.
+    Row scales are written directly as ``[ceil(N / block_size), M]``. The scale
+    values are unchanged; this layout gives GEMM contiguous row-scale vectors
+    for each K block.
 
     NOTE: This op is registered as ``torch.library.custom_op`` (opaque to
     inductor) instead of ``triton_op`` + ``wrap_triton``. On the AMD MI300
@@ -304,23 +301,19 @@ def quant_fp8_blockwise_dual_impl(
         raise ValueError("input must be a contiguous 2D tensor")
 
     M, N = x.shape
-    if col_transposed and not row_pad_to_block and _use_flydsl_fp8_blockwise_quant():
-        from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
-            quantize_blockwise_fp8_dual,
-        )
-
-        return quantize_blockwise_fp8_dual(
-            x,
-            row_scale_transposed=row_scale_transposed,
-        )
+    if (
+        not row_pad_to_block
+        and _use_flydsl_fp8_blockwise_quant()
+        and x.dtype == torch.bfloat16
+        and x.numel() * x.element_size() <= 0xFFFFFFFF
+    ):
+        return quantize_blockwise_fp8_dual(x)
 
     row_shape, row_scales_shape, col_fp8_shape, col_scales_shape = _blockwise_dual_output_shapes(
         M,
         N,
         block_size,
-        col_transposed,
         row_pad_to_block,
-        row_scale_transposed,
     )
 
     x_fp8_row = torch.empty(row_shape, dtype=dtype, device=x.device)
@@ -340,8 +333,6 @@ def quant_fp8_blockwise_dual_impl(
         row_shape[1],
         block_size,
         torch.finfo(dtype).max,
-        COL_TRANSPOSED=col_transposed,
-        ROW_SCALE_TRANSPOSED=row_scale_transposed,
     )
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 
@@ -351,9 +342,7 @@ def quant_fp8_blockwise_dual_impl_meta(
     x: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
-    col_transposed: bool = False,
     row_pad_to_block: bool = False,
-    row_scale_transposed: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if x.dim() != 2:
         raise ValueError("input must be 2D")
@@ -362,9 +351,7 @@ def quant_fp8_blockwise_dual_impl_meta(
         M,
         N,
         block_size,
-        col_transposed,
         row_pad_to_block,
-        row_scale_transposed,
     )
     x_fp8_row = torch.empty(row_shape, dtype=dtype, device=x.device)
     x_scales_row = torch.empty(row_scales_shape, dtype=torch.float32, device=x.device)
@@ -378,6 +365,8 @@ def quant_fp8_blockwise_for_weight_impl(
     w: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
+    pad_m: bool = False,
+    pad_n: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantization for fp8 blockwise (weight).
@@ -386,12 +375,17 @@ def quant_fp8_blockwise_for_weight_impl(
     Assumes `w` is contiguous and 2D or 3D.
 
     Returns:
-        w_fp8: FP8-quantized weight tensor.
+        w_fp8: FP8-quantized weight tensor, optionally padded by block.
         w_scales: Per-block scale tensor in float32.
     """
 
     assert w.dim() in (2, 3)
-    if _use_flydsl_fp8_blockwise_quant():
+    M, N = w.shape[-2:]
+    out_M = ceil_div(M, block_size) * block_size if pad_m else M
+    out_N = ceil_div(N, block_size) * block_size if pad_n else N
+    needs_padding = out_M != M or out_N != N
+
+    if _use_flydsl_fp8_blockwise_quant() and w.dtype == torch.bfloat16 and not needs_padding:
         from primus_turbo.flydsl.quantization.fp8_blockwise_quant import (
             quantize_blockwise_fp8_weight,
         )
@@ -405,18 +399,20 @@ def quant_fp8_blockwise_for_weight_impl(
     # only when the C++ op is built and block_size == 128 (its only supported size),
     # else fall through to the Triton kernel. Benefits both the grouped and
     # non-grouped blockwise paths that quantize weights through here.
-    if block_size == 128 and hasattr(
-        torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_for_weight"
+    if (
+        not needs_padding
+        and block_size == 128
+        and hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_fp8_blockwise_for_weight")
     ):
         return torch.ops.primus_turbo_cpp_extension.quantize_fp8_blockwise_for_weight(w, dtype, block_size)
 
     ori_dims = w.dim()
     if ori_dims == 2:
-        B, M, N = 1, *w.shape
+        B = 1
         w = w.unsqueeze(0)
     else:
-        B, M, N = w.shape
-    w_fp8 = torch.empty((B, M, N), dtype=dtype, device=w.device)
+        B = w.shape[0]
+    w_fp8 = torch.empty((B, out_M, out_N), dtype=dtype, device=w.device)
     w_scales = torch.empty(
         (B, ceil_div(M, block_size), ceil_div(N, block_size)),
         dtype=torch.float32,
@@ -429,6 +425,8 @@ def quant_fp8_blockwise_for_weight_impl(
         w_scales,
         M,
         N,
+        out_M,
+        out_N,
         block_size,
         torch.finfo(dtype).max,
     )
@@ -444,15 +442,19 @@ def quant_fp8_blockwise_for_weight_impl_meta(
     w: torch.Tensor,
     dtype: torch.dtype,
     block_size: int = 128,
+    pad_m: bool = False,
+    pad_n: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert w.dim() in (2, 3)
+    M, N = w.shape[-2:]
+    out_M = ceil_div(M, block_size) * block_size if pad_m else M
+    out_N = ceil_div(N, block_size) * block_size if pad_n else N
     ori_dims = w.dim()
     if ori_dims == 2:
-        B, M, N = 1, *w.shape
-        w = w.unsqueeze(0)
+        B = 1
     else:
-        B, M, N = w.shape
-    w_fp8 = torch.empty((B, M, N), dtype=dtype, device=w.device)
+        B = w.shape[0]
+    w_fp8 = torch.empty((B, out_M, out_N), dtype=dtype, device=w.device)
     w_scales = torch.empty(
         (B, ceil_div(M, block_size), ceil_div(N, block_size)),
         dtype=torch.float32,

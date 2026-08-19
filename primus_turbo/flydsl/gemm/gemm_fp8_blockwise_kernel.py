@@ -1,9 +1,14 @@
 ###############################################################################
+# SPDX-License-Identifier: Apache-2.0
+#
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2025 FlyDSL Project Contributors
-# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL); see LICENSE-APACHE for the Apache-2.0 terms.
 #
-# See LICENSE for license information.
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """gfx950 blockwise FP8 GEMM kernels and runtime dispatch."""
@@ -997,7 +1002,7 @@ def compile_blockscale_fp8_gemm_nn_physical_4w(*, M: int, N: int, K: int, **kwar
     The returned launcher takes
     ``(A, B, C, A_scale, B_scale, B_workspace, stream)``. ``B_workspace`` is
     contiguous FP8 storage of shape ``[N, K]``. Physical scales are consumed
-    directly as ``A_scale[M, K/128]`` and ``B_scale[K/128, ceil(N/128)]``.
+    directly as ``A_scale[K/128, M]`` and ``B_scale[K/128, ceil(N/128)]``.
     """
 
     if "BLOCK_M" not in kwargs:
@@ -1007,7 +1012,7 @@ def compile_blockscale_fp8_gemm_nn_physical_4w(*, M: int, N: int, K: int, **kwar
         K=K,
         M=M,
         N=N,
-        scale_a_k_major=False,
+        scale_a_k_major=True,
         scale_b_k_major=True,
         **kwargs,
     )
@@ -1591,7 +1596,7 @@ def compile_blockscale_fp8_gemm_nn_fused_8w(*, M: int, N: int, K: int, **kwargs)
         K=K,
         M=M,
         N=N,
-        scale_a_k_major=False,
+        scale_a_k_major=True,
         physical_b_nn=True,
         **kwargs,
     )
@@ -1699,7 +1704,7 @@ def flydsl_blockwise_gemm_can_handle(
         return (
             a.is_contiguous()
             and b.is_contiguous()
-            and tuple(a_scale_inv.shape) == (m, ceildiv(k, 128))
+            and tuple(a_scale_inv.shape) == (ceildiv(k, 128), m)
             and tuple(b_scale_inv.shape) == (ceildiv(k, 128), ceildiv(n, 128))
             and flydsl_blockwise_4wave_dgrad_supported(m, padded_k, n)
         )
@@ -1716,12 +1721,6 @@ def flydsl_blockwise_gemm_can_handle(
         )
 
     return False
-
-
-def flydsl_blockwise_forward_scale_a_k_major(K: int) -> bool:
-    """Use the K-major scale producer until the contraction enters the deep-K regime."""
-
-    return K < _DEEP_K_BLOCKS * 128
 
 
 def _autotune_configs(M: int, N: int, K: int) -> list[dict]:
@@ -1969,7 +1968,7 @@ def gemm_fp8_blockwise_forward(
         elif scale_shape == row_major_scale_shape and scale_shape != k_major_scale_shape:
             scale_a_k_major = False
         elif scale_shape == row_major_scale_shape:
-            scale_a_k_major = flydsl_blockwise_forward_scale_a_k_major(K)
+            scale_a_k_major = True
         else:
             raise ValueError(f"invalid forward activation-scale shape {activation_scale_inv.shape}")
     else:
@@ -2040,7 +2039,7 @@ def gemm_fp8_blockwise_dgrad(
         raise ValueError(f"unsupported dgrad shape: grad={grad_out_fp8.shape}, weight={weight_fp8.shape}")
     if not grad_out_fp8.is_contiguous() or not weight_fp8.is_contiguous():
         raise ValueError("dgrad inputs must be contiguous")
-    if tuple(grad_out_scale_inv.shape) != (M, N // 128):
+    if tuple(grad_out_scale_inv.shape) != (N // 128, M):
         raise ValueError(f"invalid dgrad A-scale shape {grad_out_scale_inv.shape}")
     if tuple(weight_scale_inv.shape) != (N // 128, K // 128):
         raise ValueError(f"invalid dgrad B-scale shape {weight_scale_inv.shape}")

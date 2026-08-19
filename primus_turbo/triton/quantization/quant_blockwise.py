@@ -74,8 +74,6 @@ def quant_fp8_blockwise_dual_kernel(
     ROW_N,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    COL_TRANSPOSED: tl.constexpr = False,
-    ROW_SCALE_TRANSPOSED: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -97,21 +95,12 @@ def quant_fp8_blockwise_dual_kernel(
     row_mask = (offs_m[:, None] < M) & (offs_n[None, :] < ROW_N)
     tl.store(x_fp8_row_ptrs, x_fp8_row_tile.to(x_fp8_row_ptr.dtype.element_ty), mask=row_mask)
 
-    # Store col output as [N, M] when transposed, otherwise as [M, N].
-    # Col-scale layout remains [M_blocks, N].
-    if COL_TRANSPOSED:
-        x_fp8_col_ptrs = x_fp8_col_ptr + offs_n[:, None] * M + offs_m[None, :]
-        col_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
-        tl.store(x_fp8_col_ptrs, x_fp8_col_tile_t.to(x_fp8_col_ptr.dtype.element_ty), mask=col_mask)
-    else:
-        x_fp8_col_tile = tl.trans(x_fp8_col_tile_t)
-        x_fp8_col_ptrs = x_fp8_col_ptr + offs_m[:, None] * N + offs_n[None, :]
-        tl.store(x_fp8_col_ptrs, x_fp8_col_tile.to(x_fp8_col_ptr.dtype.element_ty), mask=mask)
+    # Col output is contiguous [N, M]; col scales remain [M_blocks, N].
+    x_fp8_col_ptrs = x_fp8_col_ptr + offs_n[:, None] * M + offs_m[None, :]
+    col_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    tl.store(x_fp8_col_ptrs, x_fp8_col_tile_t.to(x_fp8_col_ptr.dtype.element_ty), mask=col_mask)
 
-    if ROW_SCALE_TRANSPOSED:
-        row_scale_offs = pid_n * M + offs_m
-    else:
-        row_scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
+    row_scale_offs = pid_n * M + offs_m
     row_scale_mask = offs_m < M
     x_scales_row_tile_inv = tl.reshape(1.0 / x_scales_row_tile, BLOCK_SIZE)
     tl.store(
@@ -143,6 +132,8 @@ def quant_fp8_blockwise_for_weight_kernel(
     w_scales_ptr,
     M,
     N,
+    OUT_M,
+    OUT_N,
     BLOCK_SIZE: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
@@ -151,15 +142,16 @@ def quant_fp8_blockwise_for_weight_kernel(
     pid_n = tl.program_id(axis=2)
 
     batch_offset_w = bid * M * N
+    batch_offset_out = bid * OUT_M * OUT_N
     batch_offset_scales = bid * tl.cdiv(M, BLOCK_SIZE) * tl.cdiv(N, BLOCK_SIZE)
 
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    input_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
     # Load [BLOCK_SIZE, BLOCK_SIZE]
     w_ptrs = w_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
-    w_tile = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
+    w_tile = tl.load(w_ptrs, mask=input_mask, other=0.0).to(tl.float32)
 
     w_tile_abs = tl.abs(w_tile)
     w_tile_max = tl.max(w_tile_abs)  # [1]
@@ -169,8 +161,9 @@ def quant_fp8_blockwise_for_weight_kernel(
     w_fp8_tile = tl.clamp(w_fp8_tile, min=-FP8_MAX, max=FP8_MAX)
 
     # Store
-    w_fp8_ptrs = w_fp8_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
-    tl.store(w_fp8_ptrs, w_fp8_tile.to(w_fp8_ptr.dtype.element_ty), mask=mask)
+    output_mask = (offs_m[:, None] < OUT_M) & (offs_n[None, :] < OUT_N)
+    w_fp8_ptrs = w_fp8_ptr + batch_offset_out + offs_m[:, None] * OUT_N + offs_n[None, :]
+    tl.store(w_fp8_ptrs, w_fp8_tile.to(w_fp8_ptr.dtype.element_ty), mask=output_mask)
     # Store scale
     scale_offs = batch_offset_scales + pid_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
     w_scales_inv = 1.0 / w_scales

@@ -151,9 +151,6 @@ class ScalingRecipe(NamedTuple):
     - use_rht: The tensor will be apply by random Hadamard transform. Available in MXFP4.
     - shuffle_scale: Whether to shuffle the scale tensor. Available in MXFP4.
     - shuffle_output: Whether to shuffle the output tensor. Available in MXFP4.
-    - col_transposed: Whether the column-quantized output uses transposed physical storage. Available in BLOCKWISE.
-    - row_pad_to_block: Whether the row-quantized output pads its trailing dimension. Available in BLOCKWISE.
-    - row_scale_transposed: Whether row scales store the block dimension first. Available in BLOCKWISE.
     """
 
     use_2d_block: bool = False
@@ -163,9 +160,6 @@ class ScalingRecipe(NamedTuple):
     # Memory Layout Shuffle
     shuffle_scale: bool = False
     shuffle_out: bool = False
-    col_transposed: bool = False
-    row_pad_to_block: bool = False
-    row_scale_transposed: bool = False
 
 
 @dataclass

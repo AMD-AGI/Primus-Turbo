@@ -198,61 +198,6 @@ class QuantizedTensor(torch.Tensor):
 
         return self
 
-    @staticmethod
-    def _apply_blockwise_layout(
-        data: torch.Tensor,
-        scale_inv: torch.Tensor,
-        granularity: ScalingGranularity,
-        axis: Optional[int],
-        block_size: Optional[int],
-        scaling_recipe: Optional[ScalingRecipe],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply BLOCKWISE physical-layout directives without changing logical values.
-
-        Row-wise quantization can store inverse scales as either
-        ``[M, ceil(N / block_size)]`` or block-major
-        ``[ceil(N / block_size), M]``. Column-wise quantization can expose a
-        logical ``[M, N]`` tensor backed by contiguous ``[N, M]`` storage, so its
-        transpose is contiguous for wgrad. Shape checks keep both conversions
-        idempotent when an existing ``QuantizedTensor`` already uses the requested
-        layout.
-
-        ``row_pad_to_block`` changes the quantized data shape and must be handled
-        by the dual blockwise quantizer.
-        """
-        if granularity != ScalingGranularity.BLOCKWISE or scaling_recipe is None:
-            return data, scale_inv
-        if scaling_recipe.row_pad_to_block:
-            raise ValueError("row_pad_to_block requires dual blockwise quantization")
-
-        normalized_axis = axis % data.ndim if axis is not None else None
-        if scaling_recipe.row_scale_transposed and data.ndim == 2 and normalized_axis == data.ndim - 1:
-            assert block_size is not None
-            row_major_shape = (data.shape[0], (data.shape[1] + block_size - 1) // block_size)
-            if tuple(scale_inv.shape) == row_major_shape:
-                scale_inv = scale_inv.T.contiguous()
-        if (
-            scaling_recipe.col_transposed
-            and data.ndim == 2
-            and normalized_axis == 0
-            and not data.T.is_contiguous()
-        ):
-            data = data.T.contiguous().T
-        return data, scale_inv
-
-    def apply_scaling_recipe_layout(
-        self,
-        scaling_recipe: ScalingRecipe,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._apply_blockwise_layout(
-            self._data,
-            self._scale_inv,
-            self._granularity,
-            self._quantized_axis,
-            self._block_size,
-            scaling_recipe,
-        )
-
     # ------------------------------------------------------------------
     # Factory: quantize a high-precision tensor and wrap the result.
     # ------------------------------------------------------------------
@@ -402,15 +347,6 @@ class QuantizedTensor(torch.Tensor):
                 scaling_recipe=scaling_recipe,
             )
 
-        data, scale_inv = cls._apply_blockwise_layout(
-            data,
-            scale_inv,
-            granularity,
-            axis,
-            block_size,
-            scaling_recipe,
-        )
-
         return cls(
             data,
             scale_inv,
@@ -447,14 +383,38 @@ class QuantizedTensor(torch.Tensor):
         axis = _normalize_axis(axis, data.ndim)
 
         if dest_dtype in [float8_e4m3, float8_e5m2]:
-            data_, scale_inv = quantize_fp8(
-                data,
-                dest_dtype,
-                granularity,
-                block_size=block_size,
-                axis=axis,
-                scaling_recipe=scaling_recipe,
-            )
+            if (
+                granularity == ScalingGranularity.BLOCKWISE
+                and scaling_recipe is not None
+                and scaling_recipe.use_2d_block
+            ):
+                from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+                    quant_fp8_blockwise_for_weight_impl,
+                )
+
+                assert block_size is not None
+                data_, scale_inv = quant_fp8_blockwise_for_weight_impl(
+                    data,
+                    dest_dtype,
+                    block_size,
+                    pad_m=axis == data.ndim - 1,
+                    pad_n=axis == data.ndim - 2,
+                )
+            else:
+                data_, scale_inv = quantize_fp8(
+                    data,
+                    dest_dtype,
+                    granularity,
+                    block_size=block_size,
+                    axis=axis,
+                    scaling_recipe=scaling_recipe,
+                )
+            if (
+                granularity == ScalingGranularity.BLOCKWISE
+                and axis == data.ndim - 1
+                and not (scaling_recipe is not None and scaling_recipe.use_2d_block)
+            ):
+                scale_inv = scale_inv.T.contiguous()
             return data_, scale_inv
         else:
             assert dest_dtype == float4_e2m1fn_x2
@@ -630,15 +590,28 @@ class QuantizedTensor(torch.Tensor):
         axis = _normalize_axis(self._quantized_axis, self._data.ndim)
 
         if self._dest_dtype in [float8_e4m3, float8_e5m2]:
+            scale_inv = self._scale_inv
+            if (
+                self._granularity == ScalingGranularity.BLOCKWISE
+                and axis == self._data.ndim - 1
+                and not (self._scaling_recipe is not None and self._scaling_recipe.use_2d_block)
+            ):
+                scale_inv = scale_inv.T.contiguous()
             out = dequantize_fp8(
                 self._data,
                 self._orig_dtype,
                 self._granularity,
                 block_size=self._block_size,
                 axis=axis,
-                scale_inv=self._scale_inv,
+                scale_inv=scale_inv,
                 scaling_recipe=self._scaling_recipe,
             )
+            if (
+                self._granularity == ScalingGranularity.BLOCKWISE
+                and self._scaling_recipe is not None
+                and self._scaling_recipe.use_2d_block
+            ):
+                out = out[tuple(slice(0, dim) for dim in self.shape)].contiguous()
         elif self._dest_dtype == float4_e2m1fn_x2:
             out = dequantize_fp4(
                 self._data,

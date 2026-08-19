@@ -203,47 +203,6 @@ def test_quantize_fp8_blockwise(orig_dtype, dest_dtype, M, N, axis, granularity)
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
-@pytest.mark.parametrize("M", [128, 256, 320])
-@pytest.mark.parametrize("N", [128, 256, 320])
-@pytest.mark.parametrize("granularity", [ScalingGranularity.BLOCKWISE])
-def test_quantize_fp8_blockwise_with_trans(orig_dtype, dest_dtype, M, N, granularity):
-    """Fused row + col blockwise FP8 quant, dequantized in both directions."""
-    torch.manual_seed(42)
-
-    x = torch.randn((M, N), device="cuda", dtype=orig_dtype)
-
-    x_fp8_row, x_scale_inv_row, x_fp8_col, x_scale_inv_col = quantize_fp8_with_trans(
-        x,
-        dest_dtype,
-        granularity=granularity,
-        block_size=DEFAULT_BLOCK_SIZE,
-    )
-
-    # Rowwise (axis == 1) dequantize.
-    out_row = dequantize_fp8(
-        x_fp8_row,
-        orig_dtype,
-        granularity=granularity,
-        block_size=DEFAULT_BLOCK_SIZE,
-        axis=1,
-        scale_inv=x_scale_inv_row,
-    )
-    torch.testing.assert_close(x, out_row, **get_tolerances(dest_dtype))
-
-    # Colwise (axis == 0) dequantize.
-    out_col = dequantize_fp8(
-        x_fp8_col,
-        orig_dtype,
-        granularity=granularity,
-        block_size=DEFAULT_BLOCK_SIZE,
-        axis=0,
-        scale_inv=x_scale_inv_col,
-    )
-    torch.testing.assert_close(x, out_col, **get_tolerances(dest_dtype))
-
-
-@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("B", [1, 4])
 @pytest.mark.parametrize("M", [128, 256, 320])

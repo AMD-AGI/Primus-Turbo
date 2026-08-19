@@ -1,9 +1,14 @@
 ###############################################################################
+# SPDX-License-Identifier: Apache-2.0
+#
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2025 FlyDSL Project Contributors
-# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL); see LICENSE-APACHE for the Apache-2.0 terms.
 #
-# See LICENSE for license information.
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 import flydsl.compiler as flyc
@@ -189,7 +194,7 @@ def compile_blockwise_fp8_weight_quant(M: int, N: int):
     return launch
 
 
-def compile_blockwise_fp8_dual_quant(M: int, N: int, *, row_scale_transposed: bool = True):
+def compile_blockwise_fp8_dual_quant(M: int, N: int):
     """Compile aligned BF16 row+column blockwise E4M3 quantization."""
 
     TILE = 128
@@ -312,9 +317,7 @@ def compile_blockwise_fp8_dual_quant(M: int, N: int, *, row_scale_transposed: bo
             q_row_rsrc,
             global_row * I32(N) + global_col,
         )
-        row_scale_idx = (
-            block_n * I32(M) + global_row if row_scale_transposed else global_row * I32(N_BLOCKS) + block_n
-        )
+        row_scale_idx = block_n * I32(M) + global_row
         if lane == I32(0):
             bo.buffer_store(F32(1.0) / row_qscale, scale_row_rsrc, row_scale_idx)
 
@@ -373,7 +376,7 @@ def quantize_blockwise_fp8_weight(x: torch.Tensor):
     return q, scale
 
 
-def quantize_blockwise_fp8_dual(x: torch.Tensor, *, row_scale_transposed: bool):
+def quantize_blockwise_fp8_dual(x: torch.Tensor):
     if not str(get_rocm_arch()).startswith("gfx95"):
         raise ValueError("FlyDSL blockwise FP8 quantization is gfx950-only")
     if x.dtype != torch.bfloat16 or x.dim() != 2 or not x.is_contiguous():
@@ -382,16 +385,15 @@ def quantize_blockwise_fp8_dual(x: torch.Tensor, *, row_scale_transposed: bool):
     if M % 128 or N % 128 or M * N * x.element_size() > 0xFFFFFFFF:
         raise ValueError("FlyDSL dual quant requires 128-aligned input smaller than 4 GiB")
     q_row = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
-    scale_row_shape = (N // 128, M) if row_scale_transposed else (M, N // 128)
-    scale_row = torch.empty(scale_row_shape, dtype=torch.float32, device=x.device)
+    scale_row = torch.empty((N // 128, M), dtype=torch.float32, device=x.device)
     q_col = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
     scale_col = torch.empty((M // 128, N), dtype=torch.float32, device=x.device)
     stream = torch.cuda.current_stream(x.device)
     args = (x, q_row, scale_row, q_col, scale_col, stream)
-    key = ("dual", str(get_rocm_arch()), M, N, row_scale_transposed)
+    key = ("dual", str(get_rocm_arch()), M, N)
     _run_cached(
         key,
-        lambda: compile_blockwise_fp8_dual_quant(M, N, row_scale_transposed=row_scale_transposed),
+        lambda: compile_blockwise_fp8_dual_quant(M, N),
         args,
     )
     return q_row, scale_row, q_col, scale_col

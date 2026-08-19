@@ -225,6 +225,25 @@ class GEMMFP8CKBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
+        if granularity == ScalingGranularity.BLOCKWISE:
+            # CK keeps the legacy physical contract. Canonical BLOCKWISE
+            # quantization exposes transpose-backed data and K-major row scales;
+            # normalize them here so CK itself needs no layout changes.
+            a = a.contiguous()
+            b = b.contiguous()
+            if not trans_a:
+                M, K = a.shape
+                k_blocks = (K + 127) // 128
+                k_major_shape = (k_blocks, M)
+                row_major_shape = (M, k_blocks)
+                if tuple(a_scale_inv.shape) == k_major_shape:
+                    a_scale_inv = a_scale_inv.T.contiguous()
+                elif tuple(a_scale_inv.shape) != row_major_shape:
+                    raise ValueError(
+                        f"invalid CK BLOCKWISE A-scale shape {a_scale_inv.shape}; "
+                        f"expected {k_major_shape} or {row_major_shape}"
+                    )
+
         if trans_c:
             lhs, rhs = b, a
             lhs_scale_inv, rhs_scale_inv = b_scale_inv, a_scale_inv
