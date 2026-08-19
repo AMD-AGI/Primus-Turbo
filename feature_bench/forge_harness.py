@@ -13,17 +13,22 @@ file that only exists while the campaign is being set up.
 What this module provides:
   * torchrun self-launch (the mega kernels are EP8 collectives)
   * graph-timed benchmarking (forge rejects eager timing; it counts replays)
-  * golden-projection correctness (see below)
+  * correctness, delegated to benchmark/ops/training/bench_mega_moe.py
+    (see reference_snrs)
 
-Why a golden fingerprint instead of a torch reference: the operators write their
-GEMM output in *pool* space, whose row order is decided by the dispatch
-prologue's slot atomics -- the same inputs give the same rows in a different
-order on every process. Rebuilding that mapping in the driver would make the
-driver depend on an ABI the optimizer is allowed to change, so instead we
-snapshot the pristine kernel's output once and reduce it to a small fingerprint
-(see project(); order-invariant for pool-space outputs, order-preserving for
-token-space ones). Regenerate with --make-golden whenever the kernel is
-*intentionally* changed numerically.
+Correctness used to be a golden fingerprint: snapshot the pristine kernel's
+output once, reduce it to a small order-invariant projection (project() below),
+and compare later runs against it. It does not work on this build. A golden
+written by a driver fails on the very next run of the same code -- dispatch_nn
+worst of all, at a forced 0 dB because the projected row count itself moves --
+and all three drivers failed their own goldens the same way. The fingerprint is
+left here, unused, because the reasoning behind it is still the right reasoning
+for a snapshot-based check and re-deriving it would be wasteful.
+
+What replaced it is the gate the kernels are actually developed against: build
+the reference *inside the run*, over the same handle and the same symmetric
+buffer, and compare only the real pool rows. The pool layout is then identical
+on both sides, so the nondeterminism cancels instead of being fingerprinted.
 
 The same nondeterminism governs the *inputs*: any operand indexed by pool row
 must be built with pool_keyed_operand(), never with a raw randn.
@@ -31,6 +36,7 @@ must be built with pool_keyed_operand(), never with a raw randn.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import subprocess
@@ -372,6 +378,137 @@ def load_golden(name: str, rank: int, cases=()) -> dict:
     return golden
 
 
+def baseline_path(name: str) -> Path:
+    """Where the pristine per-case times live, beside the golden."""
+    return HERE / f"forge_baseline_{name}.json"
+
+
+def save_baseline(name: str, case_times: dict, rank: int, group):
+    """Record the pristine per-case times a driver-side regression guard reads.
+
+    Refused inside a campaign, for the same reason save_golden is: recorded from
+    a candidate's run it would enshrine that candidate's regression as the floor,
+    and the guard would then wave through everything slower than the kernel the
+    campaign started from.
+    """
+    if os.environ.get("FORGE_NPROC_PER_NODE") or os.environ.get("GRAPH_PROBE_OUT"):
+        raise RuntimeError(
+            "refusing to write a baseline from inside a forge run; record it by hand on the pristine kernel"
+        )
+    if rank == 0:
+        payload = {"case_ms": {str(case): float(ms) for case, ms in case_times.items()}}
+        baseline_path(name).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(f"baseline written: {baseline_path(name)}", flush=True)
+    dist.barrier(group)
+
+
+def load_baseline(name: str) -> dict:
+    """Per-case pristine times, or {} when none was ever recorded.
+
+    Missing is not an error: the guard it feeds is an extra gate on top of the
+    measurement, and a driver run by hand before the baseline exists should still
+    report its timings rather than refuse to run.
+    """
+    path = baseline_path(name)
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text())
+    return {str(case): float(ms) for case, ms in (payload.get("case_ms") or {}).items()}
+
+
+# --------------------------------------------------------------------------
+# correctness: the benchmark script's in-process reference
+# --------------------------------------------------------------------------
+
+# gate3 passes at rel_rmse <= 0.05, which is this in dB. A campaign's
+# --snr-threshold set at or below it reproduces the benchmark's own verdict.
+REF_GATE_DB = 26.02
+REF_MODEL = "DeepSeek-V3"
+REF_TOKENS = 8192
+
+
+def load_reference_module():
+    """Import benchmark/ops/training/bench_mega_moe.py, the accuracy authority.
+
+    Its own directory has to be importable: it does `from config import ...` and
+    expects to have been started from there. Appended rather than inserted --
+    `config` is a name worth not hoisting over anything else. Imported on demand
+    so a bench or profile run does not pay for pandas and tabulate.
+
+    It is under benchmark/, which forge's workspace policy protects from edits,
+    so a campaign cannot weaken the oracle it is judged by.
+    """
+    ref_dir = HERE.parent / "benchmark" / "ops" / "training"
+    if str(ref_dir) not in sys.path:
+        sys.path.append(str(ref_dir))
+    import bench_mega_moe
+
+    return bench_mega_moe
+
+
+def snr_from_check(check) -> float:
+    """One gate3 verdict as the dB figure forge's threshold reads.
+
+    rel_rmse is ||out - ref|| / ||ref||, so -20log10(rel) is the same SNR
+    snr_db() computes. Capped at 100 dB like snr_db, because these references
+    land on rel = 0.0 exactly. A stage gate3 failed reports 0 dB rather than its
+    own rel: forge reads one number, and the cosine is the half of gate3 that
+    number cannot otherwise carry.
+    """
+    if check is None or not bool(check.ok):
+        return 0.0
+    return min(-20.0 * math.log10(max(float(check.rel), 1e-12)), 100.0)
+
+
+def reference_snrs(group, rank: int, modes, *, model=REF_MODEL, tokens=REF_TOKENS, iters=1) -> dict:
+    """Run the benchmark's accuracy gate for `modes`; return {case_id: dB}.
+
+    `modes` is a sequence of (mode name, {benchmark stage key: our case id}) --
+    one entry per operator the caller measures, in pipeline order.
+
+    Everything up to and including the per-rank seed mirrors the benchmark's own
+    case loop, so the stages see exactly the inputs their references were
+    written for. `iters` only feeds the stage runner's timing calls, which the
+    drivers do not read; one is enough to reach the accuracy probe.
+    """
+    from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
+
+    ref = load_reference_module()
+    ref_args = ref._build_parser().parse_args(
+        ["--mode", modes[0][0], "--num-tokens", str(tokens), "--iters", str(iters)]
+    )
+    cases = ref.gen_moe_test_cases([model])
+    if not cases:
+        raise ValueError(f"unknown reference model {model!r}")
+    ref.apply_case(ref_args, cases[0])
+
+    snrs = {}
+    for mode_name, stage_cases in modes:
+        symm = get_symm_buffer_for_mega_moe(
+            group,
+            num_experts=ref_args.num_experts,
+            num_max_tokens_per_rank=ref_args.num_tokens,
+            num_topk=ref_args.num_topk,
+            hidden=ref_args.hidden,
+            intermediate_hidden=ref_args.inter,
+        )
+        ref.sync_ranks(group)
+        # Per-rank seed so ranks get distinct tokens/routing, exactly as the
+        # benchmark does before it calls profile().
+        torch.manual_seed(rank)
+        checks = ref.MODES[mode_name].profile(group, ref_args, symm)["checks"]
+        for stage, case in stage_cases.items():
+            snrs[case] = snr_from_check(checks.get(stage))
+        ref.sync_ranks(group)
+        # Hand the next mode back what this one used. profile() drops its own
+        # context on return, but the caching allocator keeps the blocks, and a
+        # caller running both modes needs the peak of one, not the sum: at the
+        # DeepSeek-V3 shape the difference is what makes it fit next to somebody
+        # else's job on the same cards.
+        torch.cuda.empty_cache()
+    return snrs
+
+
 def report_snr(per_case_snr: dict, rank: int, group):
     """Print the WORST rank's worst case: one wrong rank is a wrong collective."""
     gathered = [None] * dist.get_world_size()
@@ -458,8 +595,8 @@ def cuda_graph_bench(step, *, warmup, iters, group, dirty=None, verify=None):
     return {"times_ms": times, "out": out, "graph": graph}
 
 
-def report_case(case_id: str, rounds: list, rank: int, group):
-    """Print the per-round samples and the case time.
+def report_case(case_id: str, rounds: list, rank: int, group, tag: str = ""):
+    """Print the per-round samples and the case time; return it on rank 0.
 
     Each round is reduced with a per-quantile MAX over the ranks' sorted
     samples: a collective is only as fast as its slowest participant, and
@@ -467,6 +604,12 @@ def report_case(case_id: str, rounds: list, rank: int, group):
     ranks. The case time is then the median of the per-round medians, not of the
     pooled samples -- pooling hides the between-round drift that repeating the
     measurement exists to expose.
+
+    `tag` rides along on the case line: "unscored" tells forge to measure and
+    show the case but keep it out of the KEEP score. The return value is for a
+    driver that aggregates several cases into one scored total -- it has to sum
+    them from here rather than print its own case line, because forge fails a
+    run that reports the same case id twice.
     """
 
     def _slowest(samples):
@@ -482,9 +625,11 @@ def report_case(case_id: str, rounds: list, rank: int, group):
             for value in slowest:
                 print(f"wall_ms: {value:.6f}")
     if rank != 0:
-        return
+        return None
     medians.sort()
-    print(f"case_ms: {case_id} {medians[len(medians) // 2]:.6f}", flush=True)
+    case_ms = medians[len(medians) // 2]
+    print(f"case_ms: {case_id} {case_ms:.6f}{' ' + tag if tag else ''}", flush=True)
+    return case_ms
 
 
 def add_common_args(parser):
@@ -493,6 +638,16 @@ def add_common_args(parser):
     parser.add_argument("--repeat", type=int, default=1, help="median over N in-process repeats")
     parser.add_argument("--bench-mode", action="store_true")
     parser.add_argument("--profile-run", action="store_true")
-    parser.add_argument("--make-golden", action="store_true", help="snapshot the current kernel as reference")
     parser.add_argument("--bn", type=int, default=256)
+    # Correctness knobs: which geometry the in-process reference runs at. There
+    # is no --make-golden any more; see this module's docstring.
+    parser.add_argument("--ref-model", default=REF_MODEL, help="MoE model the correctness reference runs at")
+    parser.add_argument("--ref-tokens", type=int, default=REF_TOKENS, help="tokens per rank for correctness")
+    parser.add_argument(
+        "--ref-iters",
+        type=int,
+        default=1,
+        help="the reference runner times each stage before checking it; the drivers do not read "
+        "those timings, so one iteration is enough",
+    )
     return parser
