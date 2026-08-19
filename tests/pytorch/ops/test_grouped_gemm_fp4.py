@@ -31,7 +31,8 @@ torch.manual_seed(42)
 # Sweep parameters. MXFP4 is NT-only (trans_b=True), single E2M1 format, Triton
 # backend only, so we drop those axes and keep full B / M / NK / dtype / balance.
 # N, K need only be multiples of MXFP4_BLOCK_SIZE (=32); the quantizer zero-pads
-# the contraction dims up to 128. M is grouped along rows (wgrad zero-pads to 128).
+# the contraction dims up to 128. M is grouped along rows; the FlyDSL wgrad
+# operand uses a compact 256-aligned span per group.
 B_VALUES = [1, 2, 3, 8, 16, 32]
 M_VALUES = [128, 256, 512, 1024, 2048]
 NK_VALUES = [
@@ -128,6 +129,42 @@ def test_grouped_gemm_fp4_mx_blockwise(B, M, NK, dtype, balance):
     """MXFP4 grouped GEMM fwd + dgrad + wgrad on the Triton backend."""
     N, K = NK
     _run(B, M, N, K, dtype, balance)
+
+
+def test_grouped_gemm_fp4_flydsl_k256_zero_even_odd_wgrad():
+    """The compact producer/consumer contract must handle zero, odd, and even spans."""
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+
+    device = "cuda:0"
+    dtype = torch.bfloat16
+    group_lens = torch.tensor([0, 1, 255, 257, 511, 513], device=device, dtype=torch.int64)
+    total_m = int(group_lens.sum().item())
+    n = k = 256
+    a = torch.randn((total_m, k), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((group_lens.numel(), n, k), dtype=dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_(True)
+    b_ref = b.detach().clone().requires_grad_(True)
+    grad_out = torch.randn((total_m, n), dtype=dtype, device=device)
+
+    out_ref = grouped_gemm_ref(a_ref, b_ref, group_lens, trans_b=True)
+    out_ref.backward(grad_out)
+
+    GlobalBackendManager.set_grouped_gemm_backend(BackendType.FLYDSL)
+    GlobalBackendManager.set_auto_tune(False)
+    try:
+        out = grouped_gemm_fp4(a, b, group_lens, trans_b=True, config=_make_config())
+        out.backward(grad_out)
+        torch.cuda.synchronize()
+    finally:
+        GlobalBackendManager.set_grouped_gemm_backend(None)
+        GlobalBackendManager.set_auto_tune(None)
+
+    nonempty = group_lens > 0
+    assert compute_snr(out_ref, out) > SNR_THRESHOLD
+    assert compute_snr(a_ref.grad, a.grad) > SNR_THRESHOLD
+    assert compute_snr(b_ref.grad[nonempty], b.grad[nonempty]) > SNR_THRESHOLD
 
 
 # ----------------------------------------------------------------------------

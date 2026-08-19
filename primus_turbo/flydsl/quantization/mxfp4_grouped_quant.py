@@ -11,13 +11,13 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Fused grouped MXFP4 dual-cast quant (rowwise tight-M + colwise 512-aligned-M).
+"""Fused grouped MXFP4 dual-cast quant (rowwise tight-M + colwise 256-aligned-M).
 
 Drop-in for the HIP ``grouped_quantize_mxfp4_dual`` (non-shuffle, per-1x32 E8M0).
 One 16-bit (bf16/fp16) read of ``x`` [total_M, N] emits both:
   * rowwise fp4 [total_M, N_pad/2] + E8M0 [total_M, N_pad/32] -- TIGHT M layout
     (row i == input row i), the fwd/dgrad operand;
-  * colwise fp4 [N, M_pad_col/2] + E8M0 [N, M_pad_col/32] -- 512-aligned per-group
+  * colwise fp4 [N, M_pad_col/2] + E8M0 [N, M_pad_col/32] -- 256-aligned per-group
     M layout (transposed), the variable-K wgrad operand.
 The per-group padded offsets are filled on-device by a fused ``pad`` prologue
 (no D2H). Numerics reuse the mxfp4 microblock primitives (RHT + all-int E8M0 +
@@ -101,11 +101,11 @@ def compile_grouped_mxfp4_qdual(
     """Compile the fused grouped mxfp4 dual quant. Shapes/recipes are baked.
 
     Prologue chain (one @flyc.jit stub, no host metadata ops / D2H):
-      1) ``pad`` (1 thread): tight GO -> 512-aligned col lens/offs (LC/OC);
+      1) ``pad`` (1 thread): tight GO -> 256-aligned col lens/offs (LC/OC);
       2) ``meta`` (1 thread/tile): O(G) group search -> per-bm-row-block
          (RB=abs input row of local 0, RE=abs input row end of the group);
       3) ``kern``: the fused dual tile.
-    ``bm`` (tile rows) must divide 128 (subset of the 512 col-pad align, so one
+    ``bm`` (tile rows) must divide 128 (subset of the 256 col-pad align, so one
     tile stays within one group)."""
     # mxfp8-quant-style kernel: concurrent ROW/COL halves (256+256 of nth=512) sharing
     # the LDS tile, then a coalesced transposed COL write-back from an LDS stage
@@ -113,7 +113,7 @@ def compile_grouped_mxfp4_qdual(
     # (fp4 = 0.5B, so 256 cols = 128B); the COL transpose write is decoupled + coalesced
     # via ldsc. BM=128 amortizes the grouped metadata/prologue and doubles the
     # useful rows written per launch while remaining within the LDS budget. Since
-    # BM divides the 512-row colwise padding alignment, one tile stays in one group.
+    # BM divides the 256-row colwise padding alignment, one tile stays in one group.
     # BK divides N_pad via ceil + overshoot mask.
     assert 128 % bm == 0 and bm % 32 == 0 and bk % 32 == 0
     BM = bm
@@ -150,13 +150,13 @@ def compile_grouped_mxfp4_qdual(
         COL_OUT: fx.Tensor,  # int32 view fp4 [N, M_pad_col/8]
         COL_SC: fx.Tensor,  # uint8 [N, M_pad_col/32]
         GO: fx.Tensor,  # tight per-group offs (int32 view of int64 [G+1])
-        LC: fx.Tensor,  # OUT: 512-aligned per-group lens (int64 [G])
-        OC: fx.Tensor,  # OUT: 512-aligned per-group offs (int64 [G+1])
+        LC: fx.Tensor,  # OUT: 256-aligned per-group lens (int64 [G])
+        OC: fx.Tensor,  # OUT: 256-aligned per-group offs (int64 [G+1])
         SR_SEED: fx.Int32,  # per-launch stochastic-rounding seed (0 when SR off)
     ):
         # Fused dual tile (one BM x BK tile / WG, one microblock/thread). The per-tile
         # group metadata is computed INLINE (no meta prologue kernel): each WG does the
-        # O(G) 512-aligned-offset scan from GO (loaded to registers first, so no dependent
+        # O(G) 256-aligned-offset scan from GO (loaded to registers first, so no dependent
         # load chain), yielding in_rebase (abs input row of local 0) / in_end (group input
         # end). The pid==0 WG also emits the padded lens/offs outputs (threads tid<=G).
         I32 = fx.Int32
@@ -185,10 +185,9 @@ def compile_grouped_mxfp4_qdual(
         for g in range_constexpr(G):
             prev = go_vals[g]
             nxt = go_vals[g + 1]
-            # 512-align each group's colwise (wgrad-contraction) span: the mxfp4 whole-loop
-            # wgrad runs an even count of 256-K blocks (unroll-2), so per-group M must be a
-            # 512-multiple -- emit it here (zero pad) so the wgrad needs no on-GPU repack.
-            lpad = ((nxt - prev + I32(511)) // I32(512)) * I32(512)
+            # 256-align each group's colwise wgrad span. The consumer handles raw
+            # zero/even/odd counts of 256-K phases without an on-GPU repack.
+            lpad = ((nxt - prev + I32(255)) // I32(256)) * I32(256)
             acc_next = acc + lpad
             inq = (base_c >= acc) & (base_c < acc_next)
             oc_g = arith.select(inq, acc, oc_g)
@@ -364,7 +363,7 @@ def grouped_quant_mxfp4_raw(
     G = int(group_lens.shape[0])
     assert N % MB == 0, f"N must be a multiple of {MB}"
     N_pad = (N + 127) // 128 * 128
-    M_pad_col = (total_M + G * 512 + 511) // 512 * 512  # 512-align per-group col (wgrad)
+    M_pad_col = (total_M + G * 256 + 255) // 256 * 256  # 256-align per-group col (wgrad)
 
     dev = x.device
     row_out = torch.empty(total_M, N_pad // 2, dtype=torch.uint8, device=dev)
@@ -375,7 +374,7 @@ def grouped_quant_mxfp4_raw(
     offs_col = torch.empty(G + 1, dtype=torch.int64, device=dev)
 
     # int32 views of the int64 [G+1] offs (low word carries the value; token offsets
-    # < 2^31). The kernel reads GO and fills the 512-aligned col lens/offs (lc/oc) on-device.
+    # < 2^31). The kernel reads GO and fills the 256-aligned col lens/offs (lc/oc) on-device.
     go = group_offs.to(torch.int64).view(torch.int32)
     lc = lens_col.view(torch.int32)
     oc = offs_col.view(torch.int32)

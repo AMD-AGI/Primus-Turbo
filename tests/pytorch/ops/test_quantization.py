@@ -20,6 +20,7 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
 from primus_turbo.pytorch.ops.quantization import (
     dequantize_fp4,
+    grouped_quantize_fp4_with_trans,
     quantize_fp4_with_trans,
     quantize_fp8_with_trans,
 )
@@ -747,6 +748,49 @@ def test_quantize_mxfp4_with_trans_batched_3d_padding(N, K):
     )
     torch.testing.assert_close(row_ref, row_out, **get_tolerances(turbo.float4_e2m1fn_x2))
     torch.testing.assert_close(col_ref, col_out, **get_tolerances(turbo.float4_e2m1fn_x2))
+
+
+def test_grouped_quantize_mxfp4_colwise_uses_256_aligned_spans():
+    """Grouped colwise metadata must expose raw zero/even/odd 256-row spans."""
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    group_lens = torch.tensor(
+        [0, 1, 255, 256, 257, 511, 512, 513], device="cuda", dtype=torch.int64
+    )
+    group_offs = torch.cat(
+        [torch.zeros(1, device="cuda", dtype=torch.int64), group_lens.cumsum(0)]
+    )
+    total_m = int(group_offs[-1].item())
+    n = 256
+    x = torch.randn((total_m, n), device="cuda", dtype=torch.bfloat16)
+
+    row, row_scale, col, col_scale, row_lens, row_offs, col_lens, col_offs = (
+        grouped_quantize_fp4_with_trans(
+            x,
+            turbo.float4_e2m1fn_x2,
+            ScalingGranularity.MX_BLOCKWISE,
+            group_lens,
+            group_offs,
+            block_size=MXFP4_BLOCK_SIZE,
+        )
+    )
+
+    expected_col_lens = ((group_lens + 255) // 256) * 256
+    expected_col_offs = torch.cat(
+        [torch.zeros(1, device="cuda", dtype=torch.int64), expected_col_lens.cumsum(0)]
+    )
+    expected_alloc_m = (total_m + group_lens.numel() * 256 + 255) // 256 * 256
+
+    torch.testing.assert_close(row_lens, group_lens, rtol=0, atol=0)
+    torch.testing.assert_close(row_offs, group_offs, rtol=0, atol=0)
+    torch.testing.assert_close(col_lens, expected_col_lens, rtol=0, atol=0)
+    torch.testing.assert_close(col_offs, expected_col_offs, rtol=0, atol=0)
+    assert row.shape == (total_m, n // 2)
+    assert row_scale.shape == (total_m, n // MXFP4_BLOCK_SIZE)
+    assert col.shape == (n, expected_alloc_m // 2)
+    assert col_scale.shape == (n, expected_alloc_m // MXFP4_BLOCK_SIZE)
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])

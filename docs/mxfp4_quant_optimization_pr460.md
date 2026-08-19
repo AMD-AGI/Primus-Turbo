@@ -1,8 +1,13 @@
-# MXFP4 Quant 优化在 Primus-Turbo PR #460 上的验证报告
+# MXFP4 Quant 与 K256 紧凑 wgrad 优化在 Primus-Turbo PR #460 上的验证报告
 
 ## 结论
 
-本分支将现有的两项 MXFP4 Quant 优化以 Quant-only 方式移植到 Primus-Turbo PR #460（下文简称 `primus-460`）。在相同的 PR #460 MoE GEMM、相同 routing、相同进程和交替配对计时条件下，三次独立 full-op session 的等权汇总结果为：
+本分支最初将两项 MXFP4 Quant 优化移植到 Primus-Turbo PR #460（下文简称
+`primus-460`），现在进一步加入已经在该 parent 上独立验证的 K256 wgrad
+producer/consumer 原子合约。两组结果必须按各自的 exact source boundary 解读。
+
+两项 Quant-only 优化在相同 PR #460 GEMM、相同 routing、相同进程和交替配对计时
+条件下，三次独立 full-op session 的等权汇总结果为：
 
 | 指标 | primus-460 原生 Quant | 优化后 Quant | 加速比 | 性能提升 |
 |---|---:|---:|---:|---:|
@@ -11,16 +16,32 @@
 
 这里的“性能提升”定义为 `(baseline_latency / candidate_latency - 1) * 100%`。对应的延迟下降分别为 22.5070%（Quant）和 8.8755%（full-op）。
 
-结论是：**Quant 优化在 primus-460 上仍然明确有效**。三次独立 session 的 full-op 加速均为 1.0932x～1.1019x，95% bootstrap CI 下界均大于 1，同 session A/A 噪声门限也全部通过。Fwd、dgrad、wgrad 三个 GEMM phase 汇总均在 ±0.12% 内，且两臂 GEMM 文件 SHA256 完全相同，因此 full-op 收益可归因于 Quant 优化，而不是 GEMM 配置或实现差异。
+结论是：**Quant 优化在 primus-460 上仍然明确有效**。三次独立 session 的 full-op 加速均为 1.0932x～1.1019x，95% bootstrap CI 下界均大于 1，同 session A/A 噪声门限也全部通过。Fwd、dgrad、wgrad 三个 GEMM phase 汇总均在 ±0.12% 内，且两臂 GEMM 文件 SHA256 完全相同，因此该轮 full-op 收益可归因于 Quant 优化，而不是 GEMM 配置或实现差异。
+
+K256-only 候选在 primus-460 上的另一组三 session 正式复测结果为：
+
+| 指标 | K256-only 加速比 | 性能提升 |
+|---|---:|---:|
+| Quant collateral benefit | **1.045990x** | **+4.5990%** |
+| Wgrad | **1.016496x** | **+1.6496%** |
+| 六 GEMM aggregate | **1.005547x** | **+0.5547%** |
+| Full-op | **1.020800x** | **+2.0800%** |
+
+K256 的三个 full-op session 为 `1.021137x / 1.020317x / 1.020949x`，全部通过
+CI、MDE99、route floor、correctness、zero fallback、cache 和 selector gate。当前 branch
+把两项 Quant 优化与 K256 合并到同一源码，但这个**精确组合后的 branch head 尚未单独执行
+一次 paired full-op A/B**，因此不能把 `1.097399x` 与 `1.020800x` 直接相乘后称为实测结果。
 
 ## PR 状态与依赖
 
-- Quant PR branch：`codex/quant-mxfp4-pr460`
+- branch：`zhitwang17:codex/quant-mxfp4-pr460`
 - stacked base：`dev/kyle/gptoss-mxfp4-grouped-pr`
 - `primus-460` PR：https://github.com/AMD-AGI/Primus-Turbo/pull/460
 - `primus-460` head commit：`0f3972175fdbe3621d5bf67b23f2b15decfccbf3`
 
-本 PR 以 #460 的 head branch 为 base，目的是让 PR diff 仅包含 Quant 相关修改，不重复包含 #460 的 grouped GEMM 改动。#460 合并后，应将本 PR retarget/rebase 到 `main`。
+本 branch 以 #460 的 head branch 为 base，不重复包含 #460 本身的 grouped GEMM 调优。
+PR #463 当前保持关闭；本次只更新 branch 内容，不 reopen PR。#460 合并或更新后，需要
+重新 rebase 并复跑完整验证。
 
 ## 优化策略与代码范围
 
@@ -45,13 +66,36 @@
 - 仅对没有 producer thread 覆盖的 col-output N-pad suffix 显式执行 `zero_()`；
 - 避免与有效输出规模等大的冗余 memset，同时保持 padding 区域为零的接口契约。
 
-### 3. Padding 回归测试
+### 3. K256 紧凑 producer/consumer 原子合约
+
+涉及文件：
+
+- `primus_turbo/flydsl/quantization/mxfp4_grouped_quant.py`
+- `primus_turbo/flydsl/grouped_gemm/grouped_gemm_mxfp4_kernel.py`
+- `primus_turbo/flydsl/gemm/gemm_mxfp4_kernel.py`
+
+该优化将 grouped colwise Quant 的每组 M span 从 512 对齐收紧为 256 对齐，并同步修改
+wgrad consumer：
+
+1. producer 输出 256-aligned `group_lens/group_offs`，减少 Quant grid 和 colwise 写回；
+2. consumer 使用 raw `nval = span / 256`，不再假定 trip count 必为偶数；
+3. runtime whole-loop 显式处理 zero、even pair 和 odd-256 MFMA-only tail，并 drain
+   speculative preload，防止 odd span 越过 expert 边界。
+
+这三部分是不可拆分的正确性合约：只改 producer/trip 会在 odd span 上产生错误；只改
+runtime loop 而保留 512 padding 则路径基本休眠，没有可测收益。
+
+### 4. Padding 与 K256 回归测试
 
 文件：`tests/pytorch/ops/test_quantization.py`
 
-新增 3D batched dual-quant padding 测试，覆盖 `(N,K)=(64,192)` 和 `(192,64)`，同时覆盖 row/col 两侧 padding。测试通过 dequant 检查有效区数值，并确认所有 padded region 均为零。
+新增或保留三类覆盖：
 
-本 PR 不修改任何 GEMM kernel、selector 或配置，也不包含后续 K256 wgrad producer/consumer 联合优化。
+- 3D batched dual-quant padding：覆盖 `(N,K)=(64,192)` 和 `(192,64)`；
+- grouped Quant metadata：覆盖 zero、1、255、256、257、511、512、513 行 group，确认
+  colwise lens/offs 严格按 256 对齐；
+- FlyDSL full forward/backward：覆盖 zero、odd 和 even 256-block span，检查 fwd、dgrad、
+  wgrad SNR。
 
 ## 测试版本与环境
 
@@ -64,23 +108,32 @@
 | ROCm runtime | `7.2.53211-671d39a71e` |
 | FlyDSL | `0.2.4` |
 | Baseline | `primus-460` commit `0f3972175fdbe3621d5bf67b23f2b15decfccbf3`，原生 Quant |
-| Candidate | 同一 commit 上仅应用本 PR 的两个 Quant 优化 |
+| Candidate | Quant-only 与 K256-only 分别在同一 commit 上独立 A/B；当前 branch head 合并两者 |
 | Public operator boundary | `grouped_gemm_fp4` 的 quantization + fwd + dgrad + wgrad |
 | Backend 环境 | `PRIMUS_TURBO_GROUPED_GEMM_BACKEND=FLYDSL`、`TURBO_GROUPED_GEMM_WITHOUT_PADDING=true`、`PRIMUS_TURBO_AUTO_TUNE=0` |
 
-动态绑定收据证明两臂使用完全相同的 PR #460 GEMM 源码：
+下列哈希来自 Quant-only paired A/B，证明该轮两臂使用完全相同的 PR #460 GEMM 源码：
 
 | 文件 | Baseline/Candidate SHA256 |
 |---|---|
 | `gemm_mxfp4_kernel.py` | `c4643df5ae36d3f1514338d4a4d2f10b4b7788026f53f413d86f9da3a0a191c1` |
 | `grouped_gemm_mxfp4_kernel.py` | `78a498c584c4abddd4b9407a67cdd4dae42de12fce419d40ec10858814329f51` |
 
-用于测试的 candidate Quant 源码 SHA256：
+用于 Quant-only 测试的 candidate Quant 源码 SHA256：
 
 | 文件 | SHA256 |
 |---|---|
 | `mxfp4_grouped_quant.py` | `b7827da16587bf5c59a29b4a0a2c28c7fb75e27a44449e970a73c96912cb8008` |
 | `mxfp4_quant_kernel.py` | `52e16bdd3b71cccb83ab9f9f3478be7b636b5803faff5a46b27f3cfc8ccbb597` |
+
+当前 Quant + K256 组合 branch head 的相关源码 SHA256：
+
+| 文件 | SHA256 |
+|---|---|
+| `mxfp4_grouped_quant.py` | `9e2001ac40a6647bda51a94c8fa523ba4a597b2a41653c6c1248c9bc0cc3b706` |
+| `mxfp4_quant_kernel.py` | `52e16bdd3b71cccb83ab9f9f3478be7b636b5803faff5a46b27f3cfc8ccbb597` |
+| `gemm_mxfp4_kernel.py` | `7814871974d464955aabf3696198be7da2e8608e0793616c63d10a52c39833e2` |
+| `grouped_gemm_mxfp4_kernel.py` | `6d2cd68e75d31a45cb38fe995e515b85bd24d7e7c146f68702afd26673945e21` |
 
 ## Full-op shape、routing 与统计方法
 
@@ -97,9 +150,13 @@
 - 每个 session 做 10,000 次 stratified paired bootstrap，报告 95% CI。
 - 三个 session 使用独立 seed；最终结果先在 session 内做 route-weighted latency，再对三个 session 等权平均，最后计算 baseline/candidate ratio。
 
+K256-only 复测使用相同的 24-route × GG1/GG2 public-op 合同和三个 seed；正式结果来自
+独立 git worktree，runner 在每个 session 前后校验 source SHA，排除了早期 mutable
+workspace 污染的无效轮次。
+
 有效性门禁包括：sampled correctness、full-op CI 下界大于 1、收益大于同 session MDE99、每条 route 不低于 0.97x、零 fallback、计时 cache 稳定、selector contract 一致以及 source-selector receipt 完整。三次 session 的全部八项门禁均通过。
 
-## 原始性能数据
+## Quant-only 原始性能数据
 
 ### 三次独立 session
 
@@ -130,27 +187,54 @@ GEMM phases 的微小正负波动属于计时噪声；三者合计没有显示�
 
 两项机制单独启用时均有显著收益，说明总体结果不是由单一偶然波动产生。
 
+## K256-only 原始性能数据
+
+| Phase | 加速比 | 三 session 范围/说明 |
+|---|---:|---|
+| Quant | **1.045990x** | 256-aligned producer 减少 padding/grid/write |
+| Fwd | 0.999588x | 中性 control |
+| Dgrad | 1.000308x | 中性 control |
+| Wgrad | **1.016496x** | `1.0161x–1.0168x` |
+| 六 GEMM aggregate | **1.005547x** | 收益集中在 wgrad |
+| Full-op | **1.020800x** | `1.0203x–1.0211x` |
+
+当前 routing 下，32 个 expert span 从 512 对齐缩到 256 对齐后，route-weighted padded M
+从 `140394.667` 降到 `135412.000`，减少 `3.549%`；平均每条 route 有 `19.464` 个
+odd-256 span 和 `2.281` 个 zero expert，因此 zero/even/odd runtime 分支都是真实路径，
+不是只为 synthetic test 添加的死代码。
+
 ## Correctness 与单元测试
 
-- Full-op correctness：24 routes × GG1/GG2，共 **48/48 PASS**。
-- Baseline/candidate 的 fwd、dgrad、wgrad SNR 判定完全一致。
-- Fallback 次数为 0，selector/config receipt 两臂一致。
-- Quant pytest：**130 passed, 3787 deselected in 10.82s**。
+- Quant-only full-op correctness：24 routes × GG1/GG2，共 **48/48 PASS**；
+  baseline/candidate 的 fwd、dgrad、wgrad SNR 判定完全一致，fallback=0，selector/config
+  receipt 两臂一致。
+- K256-only 正式复测：**48/48 PASS**，最小 SNR `12.899 dB`，fallback=0。
+- 当前 Quant + K256 组合 head 的新增 metadata 与 zero/even/odd forward/backward 测试：
+  **4 passed, 6151 deselected**。
+- 当前组合 head 的既有 dual-quant 回归：**130 passed, 3788 deselected**。
 - 新增测试特别验证 batched 3D dual quant 的 row K-pad 与 col N-pad 都被物化为零。
+- 新增 grouped Quant 256-alignment metadata 和 zero/even/odd wgrad 回归测试。
+- 当前组合 head 尚未单独重跑 48-cell correctness harness；上面的两组 48/48 收据分别属于
+  Quant-only 与 K256-only 冻结候选，不能替代组合 head 的 promotion gate。
 
-## 与 latest-new 约 +32% 结果的差异
+## 与 latest-new 约 +32% 结果及 K256 新证据的关系
 
 此前 `latest-new` 组合候选中记录的 Quant 结果约为：
 
 - 3.260968 ms → 2.470426 ms
 - 1.32000x，即约 +32.0%
 
-本 PR 在 primus-460 上测得 1.290438x（+29.0438%）。差异主要来自优化边界，而不是 PR #460 令 Quant 优化失效：
+两项 Quant-only 代码在 primus-460 上测得 1.290438x（+29.0438%）。差异主要来自
+优化边界，而不是 PR #460 令 Quant 优化失效：
 
-1. 本 PR 只移植原始 Quant 的两项独立优化：grouped dual quant 的 BM=128，以及 batched dual quant 的 selective tail-zero。
-2. 旧的组合候选还包含后续 K256 wgrad producer/consumer 联合优化带来的 per-group colwise padding `512→256`。虽然它服务于 K256 wgrad 协同路径，但也缩小了 colwise quant grid/write，曾额外贡献约 +2.1% Quant 收益；为保持 PR 的 Quant-only 边界，本 PR 刻意不包含该改动。
+1. 原始 PR #463 commit 只包含 grouped dual quant 的 BM=128 与 batched dual quant 的
+   selective tail-zero。
+2. 本次 branch 更新已加入 K256 `512→256` 紧凑 padding 原子合约。它在最新 primus-460
+   K256-only 复测中的 Quant collateral benefit 为 `1.045990x`，高于旧 parent 上的
+   `1.021431x`；差异来自 routing 与 tile/grid 取整。
 3. 旧的 exact latest-new 独立验证本身也出现过 1.281401x，与本次三个 session 的 1.281402x～1.298471x 区间一致。剩余差异可由 exact source boundary、routing/seed 和 session 间测量变化解释。
-4. PR #460 修改的是 GEMM 路径，没有修改上述 Quant kernel。当前 A/B 中两臂 PR #460 GEMM 哈希完全一致，直接证明 Quant 优化机制可以迁移。
+4. Quant-only A/B 中 GEMM 哈希完全一致，证明两项 Quant 机制可以迁移；K256-only A/B
+   则单独证明 producer/consumer 联合机制仍然有效。精确合并 branch 仍需共同 A/B。
 
 PR #460 的 GEMM 更快后，Quant 在 baseline full-op 中约占 39.62%，因此约 +29.04% 的 Quant throughput 提升最终转化为约 +9.74% 的 full-op throughput 提升，符合 Amdahl 分解。
 
@@ -208,13 +292,16 @@ python /campaign/experiments/quant_on_pr460_20260818/bench/summarize_sessions.py
   --csv /campaign/experiments/quant_on_pr460_20260818/results/session_phase_metrics.csv
 ```
 
-### Quant 单元测试
+### Quant 与 K256 单元测试
 
 在已有 Primus-Turbo extension 可加载的环境中执行：
 
 ```bash
 pytest -q tests/pytorch/ops/test_quantization.py \
-  -k "test_quantize_mxfp4_with_trans"
+  -k "mxfp4_with_trans or grouped_quantize_mxfp4_colwise"
+
+pytest -q tests/pytorch/ops/test_grouped_gemm_fp4.py \
+  -k "k256_zero_even_odd_wgrad"
 ```
 
 ## 原始收据
@@ -229,6 +316,11 @@ pytest -q tests/pytorch/ops/test_quantization.py \
 /home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/ablation_bm128.json
 /home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/ablation_tail_zero.json
 /home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/summary.json
+
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/latest_new_gemm_on_pr460_20260818/rounds/round-6/artifacts/full_op_clean_s1.json
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/latest_new_gemm_on_pr460_20260818/rounds/round-6/artifacts/full_op_clean_s2.json
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/latest_new_gemm_on_pr460_20260818/rounds/round-6/artifacts/full_op_clean_s3.json
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/latest_new_gemm_on_pr460_20260818/rounds/round-6/artifacts/full_op_clean_summary/summary.json
 ```
 
 ## 已知限制、风险与后续建议
@@ -236,5 +328,11 @@ pytest -q tests/pytorch/ops/test_quantization.py \
 - 当前性能结论针对 MI355X/gfx950、EP1/G32、GPT-OSS-20B 的两组训练 shape 和 24 条真实 routing representatives；其他 GPU、EP 配置、shape 和 routing 仍应单独验证。
 - `BM=128` 依赖当前 grouped quant 的 LDS/tiling 约束；未来调整 tile 布局或扩大临时 LDS 使用时应重新检查资源预算。
 - selective tail-zero 依赖 kernel 继续完整写入 row-output K-pad tail。若 producer mapping 或 masked-load/store 语义变化，必须保留本 PR 新增的 padding 回归测试。
-- 本 PR 没有包含 K256 wgrad 的 `512→256` padding 协同优化。建议后续以 producer/consumer 联合 PR 单独评估，避免把 Quant 与 wgrad 接口约束混在同一个变更中。
-- 本 PR 是依赖 #460 的 stacked PR；#460 合并或更新后，需要重新 rebase，并至少复跑 Quant pytest、48-cell correctness 和一轮 paired full-op performance。
+- K256 必须保持 producer、consumer trip 与 runtime whole-loop 原子一致；任何一部分变化都要
+  重跑 zero/even/odd correctness。
+- 当前 branch 的“BM128 + selective tail-zero + K256”精确组合尚未单独执行 promotion-grade
+  paired A/B；现有数字分别来自 Quant-only 与 K256-only exact-source 实验。
+- 仍缺真实 GPT-OSS training-step transfer：目前证明的是完整 public operator replay 变快，
+  尚未证明装回完整训练图后整步时间稳定下降。
+- 本 branch 依赖 #460；#460 合并或更新后，需要重新 rebase，并至少复跑 Quant pytest、
+  K256 zero/even/odd test、48-cell correctness 和一轮 paired full-op performance。
