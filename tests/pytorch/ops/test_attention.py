@@ -66,7 +66,10 @@ test_cases = [
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
 @pytest.mark.parametrize("is_v3_atomic_fp32", [False, True])
 # None is whatever resolves; the rest pin one backend so its own path stays covered.
-@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
+# HIPKITTENS takes a narrow slice of this table -- bf16, causal, sbhd, head dim 64/128, no
+# sink -- and pinned_backend_takes asserts it refuses the rest rather than letting another
+# backend answer for it.
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL, BackendType.HIPKITTENS])
 def test_attention_16bit(
     batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32, backend
 ):
@@ -244,7 +247,7 @@ def test_attention_16bit(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL, BackendType.HIPKITTENS])
 @pytest.mark.skip(reason="Temporarily disabled due to external dependency issues.")
 @pytest.mark.deterministic
 def test_attention_16bit_deterministic(batch, dtype, config, causal, backend):
@@ -758,3 +761,208 @@ def test_sparse_mla_op(variant, cr, seqlen):
         assert compute_snr(dq_ref, dq_t) > 60.0, "TRITON-override op dq disagrees with oracle"
     finally:
         GlobalBackendManager.set_attn_backend(None)
+
+
+# =============================================================================
+# HipKittens attention (gfx950). The shape families the kernels were tuned against.
+#
+# The backend axis above already crosses HipKittens with the shared table, which is what
+# covers its eligibility and its refusals. What that table does not have is the two shape
+# families these kernels were measured on, so they live here: the rectangular/windowed meta
+# configs, and the head structures real pretrains run at.
+# =============================================================================
+
+hipkittens_only = pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()),
+    reason="HipKittens attention is gfx950-only",
+)
+
+# (Hq, Hkv, Sq, Skv, window_left), each run full-causal and windowed. Run at 1/8 the measured
+# sequence lengths: the fp32 reference materialises a whole [B, Hq, Sq, Skv] score matrix,
+# which at the real lengths cannot share a device with anything else. The head structure, the
+# rectangular ratios and the window are what this set covers, and all three survive the
+# scale-down.
+_HK_META = [
+    (128, 16, 2048, 16384, 2048),
+    (128, 16, 4096, 16384, 2048),
+    (128, 16, 8192, 16384, 2048),
+    (128, 16, 16384, 16384, 2048),
+    (48, 6, 4096, 4096, 2047),
+    (48, 6, 4096, 8192, 2047),
+    (48, 6, 4096, 12288, 2047),
+    (48, 6, 4096, 16384, 2047),
+    (64, 8, 1024, 1024, 2047),
+    (64, 8, 1024, 16384, 2047),
+]
+_HK_META_SCALE = 8
+
+_HK_META_CASES = []
+for _hq, _hkv, _sq, _skv, _w in _HK_META:
+    _sq_s, _skv_s = _sq // _HK_META_SCALE, _skv // _HK_META_SCALE
+    _HK_META_CASES.append((_hq, _hkv, _sq_s, _skv_s, -1))
+    _HK_META_CASES.append((_hq, _hkv, _sq_s, _skv_s, max(1, _w // _HK_META_SCALE)))
+
+# (Hq, Hkv) of eleven real pretrain configs, deduplicated to eight -- an average over this set
+# is meant to become an accept metric, and a set that measures one shape twice silently gives
+# it double weight. All head dim 128; gpt-oss is excluded as head dim 64, which the meta set
+# above already covers.
+_HK_MODEL_HEADS = [
+    (40, 8),  # llama4_17B128E, llama4_17B16E
+    (48, 8),  # minimax_m2.5
+    (64, 4),  # qwen3_235B_A22B
+    (32, 4),  # qwen3_30B_A3B
+    (32, 8),  # lfm2_8B_A1B, mixtral_8x7B_v0.1
+    (16, 16),  # deepseek_v2_lite (MHA)
+    (64, 8),  # grok2
+    (48, 8),  # grok1, mixtral_8x22B_v0.1
+]
+_HK_MODEL_SEQLEN = 1024
+
+
+def _hk_ref(q, k, v, window_left, scale):
+    """fp32 reference over SBHD tensors, bottom-right aligned.
+
+    Not attention_vanilla_forward_pytorch_ref_impl: that takes the op's [b, s, h, d] view,
+    and these kernels are driven directly here in their own layout.
+    """
+    Sq, _, Hq, _ = q.shape
+    Skv, _, Hkv, _ = k.shape
+    g = Hq // Hkv
+    qf = q.float().permute(1, 2, 0, 3)
+    kf = k.float().permute(1, 2, 0, 3).repeat_interleave(g, 1)
+    vf = v.float().permute(1, 2, 0, 3).repeat_interleave(g, 1)
+    s = (qf @ kf.transpose(-1, -2)) * scale
+    off = Skv - Sq
+    qi = torch.arange(Sq, device=q.device)[:, None]
+    ki = torch.arange(Skv, device=q.device)[None, :]
+    keep = ki <= qi + off
+    if window_left >= 0:
+        keep &= ki >= qi + off - window_left
+    p = torch.softmax(s.masked_fill(~keep, float("-inf")), dim=-1)
+    return (p @ vf).permute(2, 0, 1, 3)
+
+
+def _run_hk_case(Sq, Skv, B, Hq, Hkv, D, window_left, bar=40.0):
+    from primus_turbo.hipkittens.attention import (
+        hipkittens_attn_backward,
+        hipkittens_attn_forward,
+    )
+
+    torch.manual_seed(0)
+    scale = D**-0.5
+
+    def mk(s, h):
+        return torch.randn(s, B, h, D, device="cuda", dtype=torch.bfloat16) * 0.5
+
+    q, k, v = mk(Sq, Hq), mk(Skv, Hkv), mk(Skv, Hkv)
+    out, lse = hipkittens_attn_forward(q, k, v, scale, True, (window_left, 0))
+    assert out.shape == q.shape
+    assert lse.shape == (B, Hq, 1, Sq)
+    assert compute_snr(_hk_ref(q, k, v, window_left, scale), out) > bar, "forward SNR too low"
+
+    dout = torch.randn_like(out)
+    dq, dk, dv = hipkittens_attn_backward(dout, q, k, v, out, lse, scale, True, (window_left, 0))
+    assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
+
+    qd, kd, vd = (t.detach().clone().float().requires_grad_(True) for t in (q, k, v))
+    _hk_ref(qd, kd, vd, window_left, scale).backward(dout.float())
+    for name, ref_g, got in (("dq", qd.grad, dq), ("dk", kd.grad, dk), ("dv", vd.grad, dv)):
+        assert compute_snr(ref_g, got) > bar, f"{name} SNR too low"
+
+
+@hipkittens_only
+@pytest.mark.parametrize("Hq, Hkv, Sq, Skv, window_left", _HK_META_CASES, ids=str)
+def test_attention_hipkittens_meta_shapes(Hq, Hkv, Sq, Skv, window_left):
+    """Rectangular Sq < Skv, GQA, full-causal and sliding-window, head dim 64."""
+    _run_hk_case(Sq, Skv, 1, Hq, Hkv, 64, window_left)
+
+
+@hipkittens_only
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("heads", _HK_MODEL_HEADS, ids=lambda h: f"H{h[0]}x{h[1]}")
+def test_attention_hipkittens_model_shapes(heads, batch):
+    """Head dim 128, square, full causal -- the head structures real pretrains run at, over
+    the batches the benchmark sweeps. Small batches change the grid and hence which CTAs are
+    masked at the causal boundary, so this is not redundant with the head sweep."""
+    Hq, Hkv = heads
+    _run_hk_case(_HK_MODEL_SEQLEN, _HK_MODEL_SEQLEN, batch, Hq, Hkv, 128, -1)
+
+
+@hipkittens_only
+def test_attention_hipkittens_deterministic():
+    """Same inputs must give bit-identical results across launches, forward and backward.
+
+    Constructive rather than hopeful: one workgroup owns each output tile, there are no float
+    atomics, and the split-K partials are folded in a fixed band order.
+    """
+    from primus_turbo.hipkittens.attention import (
+        hipkittens_attn_backward,
+        hipkittens_attn_forward,
+    )
+
+    D, S, B, Hq, Hkv = 128, 1024, 2, 32, 4
+    torch.manual_seed(0)
+    scale = D**-0.5
+    q = torch.randn(S, B, Hq, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(S, B, Hkv, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(S, B, Hkv, D, device="cuda", dtype=torch.bfloat16)
+
+    o1, l1 = hipkittens_attn_forward(q, k, v, scale, True, (-1, 0))
+    o2, l2 = hipkittens_attn_forward(q, k, v, scale, True, (-1, 0))
+    assert torch.equal(o1, o2) and torch.equal(l1, l2), "forward is not run-to-run deterministic"
+
+    do = torch.randn_like(o1)
+    g1 = hipkittens_attn_backward(do, q, k, v, o1, l1, scale, True, (-1, 0))
+    g2 = hipkittens_attn_backward(do, q, k, v, o1, l1, scale, True, (-1, 0))
+    for name, a, b in zip(("dq", "dk", "dv"), g1, g2):
+        assert torch.equal(a, b), f"{name} is not run-to-run deterministic"
+
+
+@hipkittens_only
+@pytest.mark.parametrize(
+    "case, needle",
+    [
+        ("fp16", "bf16"),
+        ("non_causal", "causal"),
+        ("sink", "sink"),
+        ("right_window", "left window"),
+        ("head_dim", "head dim"),
+        ("sq_gt_skv", "Sq > Skv"),
+        ("varlen", "varlen"),
+        ("non_contiguous", "contiguous"),
+    ],
+)
+def test_attention_hipkittens_envelope(case, needle):
+    """Everything outside the envelope must be refused with a reason, not computed wrongly.
+
+    These kernels read out of bounds or leave output unwritten rather than failing, so the
+    checks are load-bearing. Two are worth naming: fp16 would be reinterpreted bit-for-bit
+    because the kernels declare gl<bf16, ...>, and Sq > Skv leaves the leading Sq - Skv query
+    rows -- which attend to no key at all -- unwritten by the forward.
+    """
+    from primus_turbo.hipkittens.attention import hipkittens_attn_supported
+
+    dtype = torch.float16 if case == "fp16" else torch.bfloat16
+    D = 32 if case == "head_dim" else 64
+    Sq, Skv = (256, 128) if case == "sq_gt_skv" else (128, 128)
+    kw = dict(causal=True, window_size=(-1, -1))
+
+    if case == "varlen":
+        t = torch.randn(1024, 8, D, device="cuda", dtype=dtype)  # THD packing is 3-D
+        q = k = v = t
+    else:
+        q = torch.randn(Sq, 1, 8, D, device="cuda", dtype=dtype)
+        k = v = torch.randn(Skv, 1, 8, D, device="cuda", dtype=dtype)
+
+    if case == "non_causal":
+        kw["causal"] = False
+    elif case == "sink":
+        kw["sink"] = torch.zeros(8, device="cuda", dtype=torch.float32)
+    elif case == "right_window":
+        kw["window_size"] = (64, 64)
+    elif case == "non_contiguous":
+        q = torch.randn(Sq, 2, 8, D, device="cuda", dtype=dtype).transpose(0, 1)
+        k = v = torch.randn(Skv, 2, 8, D, device="cuda", dtype=dtype)
+
+    ok, why = hipkittens_attn_supported(q, k, v, **kw)
+    assert not ok and needle in why, f"expected a refusal mentioning {needle!r}, got {ok} / {why!r}"
