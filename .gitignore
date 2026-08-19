@@ -13,6 +13,8 @@ test-reports/
 agent/tmp/
 agent/workspace/
 logs/
+report/runs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
 .coverage*
+*.csv

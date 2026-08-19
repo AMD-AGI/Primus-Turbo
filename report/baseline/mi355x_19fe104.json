@@ -1,0 +1,65 @@
+{
+  "name": "MI355X @ 19fe104",
+  "gpu": "MI355X",
+  "commit": "19fe104",
+  "branch": "feat/mega-moe-dedup-dispatch-combine",
+  "date": "2026-08-19",
+  "source": "docs/README_Mega_MoE.md (Performance section, --iters 30)",
+  "case": "DeepSeek-V3",
+  "config": {
+    "ep": 8,
+    "tokens_per_rank": 8192,
+    "hidden": 7168,
+    "inter": 2048,
+    "experts": 256,
+    "topk": 8,
+    "dtype": "bf16"
+  },
+  "stages": {
+    "dispatch/fwd": {
+      "comm_ms": 1.570,
+      "comm_gbps": 346.6,
+      "gemm_ms": 3.148,
+      "fused_ms": 3.382,
+      "fused_tflops": 1203.9,
+      "roofline_pct": 93.1,
+      "speedup": 1.39
+    },
+    "dispatch/bwd": {
+      "comm_ms": 1.564,
+      "comm_gbps": 348.0,
+      "gemm_ms": 1.606,
+      "fused_ms": 1.933,
+      "fused_tflops": 1053.4,
+      "roofline_pct": 83.1,
+      "speedup": 1.64
+    },
+    "dispatch/wgrad": {
+      "comm_ms": 1.573,
+      "comm_gbps": 345.9,
+      "gemm_ms": 3.337,
+      "fused_ms": 3.770,
+      "fused_tflops": 1080.0,
+      "roofline_pct": 88.5,
+      "speedup": 1.30
+    },
+    "combine/fwd": {
+      "comm_ms": 1.457,
+      "comm_gbps": 373.6,
+      "gemm_ms": 1.732,
+      "fused_ms": 2.143,
+      "fused_tflops": 950.2,
+      "roofline_pct": 80.8,
+      "speedup": 1.49
+    },
+    "combine/bwd": {
+      "comm_ms": 1.517,
+      "comm_gbps": 358.8,
+      "gemm_ms": 3.520,
+      "fused_ms": 3.695,
+      "fused_tflops": 1102.1,
+      "roofline_pct": 95.3,
+      "speedup": 1.36
+    }
+  }
+}
