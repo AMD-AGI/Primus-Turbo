@@ -465,6 +465,63 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
+        # pad fast path: a non-128-aligned K makes the fp8 row stride split each vector load across
+        # a 128B line, so cast-and-pad both operands' contraction K to Kp=ceil128(K) (pad cols
+        # contribute 0*0=0, GEMM unchanged), and also cast-and-pad the weight's HIDDEN=N (penultimate)
+        # dim to Np=ceil128(N) so the GEMM sees a fully 128-aligned [G, Np, Kp] weight and dgrad's NN
+        # contraction (=N) is 128-aligned. The pad rows/cols are exact zero (fused in the quant
+        # kernel), so the extra contractions add exact 0 and the real extents come back untouched --
+        # copy-free native throughout fwd + bwd, no host un-pad slice. Raw NT only.
+        _pad = (
+            trans_b
+            and not isinstance(a, QuantizedTensor)
+            and not isinstance(b, QuantizedTensor)
+            and a.dim() == 2
+            and b.dim() == 3
+            and (a.shape[-1] % 128 != 0)
+            and a.shape[-1] >= 129
+        )
+        if _pad:
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
+                grouped_gemm_fp8_tensorwise_flydsl_kernel,
+            )
+            from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+                quantize_fp8_tensorwise_pad_impl,
+            )
+
+            go = group_offs if group_offs is not None else group_offs_from_lens(group_lens)
+            fp8_dtype = _get_fp8_dtype(config.format, True)
+            n_real = b.shape[1]  # real HIDDEN=N before the N-pad
+            a_q, a_sc = quantize_fp8_tensorwise_pad_impl(a, fp8_dtype)  # [M, Kp]
+            # Pad the weight's HIDDEN=N to Np=ceil128(N) -> b is [G, Np, Kp] (both K and N padded).
+            # The GEMM keeps the padded row pitch but iterates the real N, so out is [M, N] with no
+            # un-pad slice (n_real recovers the real extent inside the kernel).
+            b_q, b_sc = quantize_fp8_tensorwise_pad_impl(b, fp8_dtype, pad_n=True)
+            out = grouped_gemm_fp8_tensorwise_flydsl_kernel(
+                a_q,
+                b_q,
+                a_sc,
+                b_sc,
+                go,
+                trans_b=True,
+                out_dtype=out_dtype,
+                num_cu=(num_cu if num_cu is not None else -1),
+                n_real=n_real,
+            )  # [M, N]
+            ctx.save_for_backward(a_q, b_q, a_sc, b_sc, group_lens, go)
+            ctx.trans_a = False
+            ctx.trans_b = trans_b
+            ctx.config = config
+            ctx.out_dtype = out_dtype
+            ctx.num_cu = num_cu
+            ctx.k_pad_real = a.shape[-1]
+            # This path returns early, so it has to set the grad-accum context the shared
+            # backward reads; leaving it to the tail below skips it.
+            ctx.fuse_bgrad_accum = fuse_bgrad_accum
+            ctx.main_grad = main_grad
+            ctx.n_pad_real = n_real
+            return out
+
         if isinstance(a, QuantizedTensor):
             assert a._is_grouped_tensor, "A QuantizedTensor input must be a grouped tensor"
             check_quantized_tensor(a, config)
@@ -536,49 +593,125 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
     def backward(ctx, grad_out):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
+        k_pad_real = getattr(ctx, "k_pad_real", None)
+        n_pad_real = getattr(ctx, "n_pad_real", None)
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
-        quantized_grad_out = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            axis=-1,
-            block_size=ctx.config.block_size,
-            group_lens=group_lens,
-        )
+        if n_pad_real is not None:
+            from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+                quantize_fp8_tensorwise_pad_impl,
+            )
 
-        grad_a = grouped_gemm_fp8_impl(
-            quantized_grad_out.qdata,
-            b_fp8,
-            quantized_grad_out.scale_inv,
-            b_scale_inv,
-            group_lens,
-            group_offs,
-            trans_a=False,
-            trans_b=not ctx.trans_b,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
-        )
+            # The saved weight b_fp8 is [G, Np, Kp] (HIDDEN padded to Np). dgrad NN contracts
+            # grad_out's last dim (=N) against b_fp8's penultimate dim, so grad_out must be widened
+            # N->Np so its last dim matches b_fp8.shape[-2] == Np. The pad columns are zero (and b's
+            # pad rows are exact zero), so the extra contractions add exact 0 -> grad_a is unchanged.
+            # The widening rides inside the quant kernel (k_align=128 -> ceil128(N)==Np): no F.pad,
+            # no host staging / slice.
+            go_qdata, go_scale_inv = quantize_fp8_tensorwise_pad_impl(
+                grad_out, grad_out_dtype, k_align=128
+            )
+            assert go_qdata.shape[-1] == b_fp8.shape[-2]
+        else:
+            quantized_grad_out = QuantizedTensor.quantize(
+                grad_out,
+                grad_out_dtype,
+                ctx.config.granularity,
+                axis=-1,
+                block_size=ctx.config.block_size,
+                group_lens=group_lens,
+            )
+            go_qdata, go_scale_inv = quantized_grad_out.qdata, quantized_grad_out.scale_inv
 
-        grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
-            a_fp8,
-            quantized_grad_out.qdata,
-            a_scale_inv,
-            quantized_grad_out.scale_inv,
-            group_lens,
-            group_offs,
-            trans_a=not ctx.trans_a,
-            trans_b=False,
-            trans_c=ctx.trans_b,
-            out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
-            num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
-            inplace_add_to_out=ctx.fuse_bgrad_accum,
-            out=ctx.main_grad,
-        )
+        if n_pad_real is not None:
+            # Same flydsl NN dgrad the FLYDSL backend would pick, entered directly so b's K-pad can
+            # be declared: b_fp8 is [G, Np, Kp] and only its first K columns are real, so telling
+            # the kernel keeps Kp as b's row pitch but shrinks the last block's boundary body to the
+            # real K remainder -- the pad costs neither MFMA nor a store and grad_a comes back
+            # contiguous [M, K] with no un-pad slice.
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
+                grouped_gemm_fp8_tensorwise_flydsl_kernel,
+            )
+
+            grad_a = grouped_gemm_fp8_tensorwise_flydsl_kernel(
+                go_qdata,
+                b_fp8,
+                go_scale_inv,
+                b_scale_inv,
+                group_offs,
+                trans_b=not ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                num_cu=(ctx.num_cu if ctx.num_cu is not None else -1),
+                n_real=k_pad_real,
+            )
+        else:
+            grad_a = grouped_gemm_fp8_impl(
+                go_qdata,
+                b_fp8,
+                go_scale_inv,
+                b_scale_inv,
+                group_lens,
+                group_offs,
+                trans_a=False,
+                trans_b=not ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.TRITON.value,
+            )
+
+        if n_pad_real is not None:
+            # Same flydsl wgrad the FLYDSL backend would pick, entered directly so both pads can be
+            # declared: the trans_c swap makes grad_out the lhs and a the rhs, so grad_b comes out
+            # [G, Np, Kp] while only [:, :N, :K] is ever read back. m_real/n_real keep Np/Kp as the
+            # pitches but shrink each last block's boundary body to the real remainder, so no pad
+            # costs MFMA or a store. c_tight moves C itself onto the real extents so grad_b comes
+            # back contiguous [G, N, K] (AccumulateGrad clones a non-contiguous grad into .grad).
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
+                grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel,
+            )
+
+            # Fused bgrad-accum on the pad path: main_grad is the real [G, N, K] weight-grad buffer
+            # == the tight extents. We emit a fresh tight grad at beta=0 and add it into main_grad on
+            # the host. The kernel's beta=1 epilogue (accumulate straight into main_grad) is NOT used
+            # here: fp32 main_grad cannot use it (flydsl's accumulate epilogue writes 16-bit only)
+            # and the 16-bit tight+beta=1 store path is not yet correct (read-back band faults).
+            # host add_ covers both dtypes and stays copy-free/native. autograd is handed a dummy so
+            # the framework's own accumulation stands down.
+            grad_b = grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
+                go_qdata,
+                a_fp8,
+                go_scale_inv,
+                a_scale_inv,
+                group_offs,
+                out_dtype=ctx.out_dtype,
+                num_cu=(ctx.num_cu if ctx.num_cu is not None else -1),
+                m_real=n_pad_real,
+                n_real=k_pad_real,
+                c_tight=True,
+            )
+            if ctx.fuse_bgrad_accum:
+                ctx.main_grad.add_(grad_b)  # main_grad (fp32 or 16-bit) += fresh tight grad
+                # Dummy carries the WEIGHT's dtype (not main_grad's), matching the wrapper.
+                grad_b = _get_dummy_wgrad(ctx.main_grad.shape, ctx.out_dtype)
+        else:
+            grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
+                a_fp8,
+                go_qdata,
+                a_scale_inv,
+                go_scale_inv,
+                group_lens,
+                group_offs,
+                trans_a=not ctx.trans_a,
+                trans_b=False,
+                trans_c=ctx.trans_b,
+                out_dtype=ctx.out_dtype,
+                granularity=ctx.config.granularity.value,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.TRITON.value,
+                inplace_add_to_out=ctx.fuse_bgrad_accum,
+                out=ctx.main_grad,
+            )
 
         return (
             grad_a,  # a

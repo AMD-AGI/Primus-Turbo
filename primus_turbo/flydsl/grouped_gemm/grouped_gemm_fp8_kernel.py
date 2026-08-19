@@ -147,6 +147,8 @@ def _compile_grouped_nn(
     persistent: bool = True,  # True = scf.for tile loop (fixed grid, cap_cu reserves CUs); False = one tile/WG + s_endpgm over-launch guard (full-device default)
     cap_cu: int = -1,  # >0: cap grid to this many WGs (reserve device CUs for comm-compute overlap). <=0: full device.
     i64_traverse: bool = False,  # B[K,N] traversal via per-load i64 SRD re-base (lifts G*K*n < 2^32 cap)
+    n_stride: int = 0,  # >0: padded N storage pitch for B (rows stored at n_stride, real width fed via c_n)
+    N: int = 0,  # real N compile const, only used (paired with n_stride) to assert n_stride>=N
 ):
     """Persistent (CPU-sync-free) grouped NN dgrad. Same math as the dense NN
     kernel but a fixed grid of ``num_sms`` WGs strides over the
@@ -175,6 +177,12 @@ def _compile_grouped_nn(
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
+
+    # Pad-both: B is stored with a padded N pitch (n_stride) but only the real N columns
+    # (runtime c_n) are computed/stored. NS = the compile-time B row pitch; c_n stays the
+    # real compute/output width (n_blocks + store column clamp). NS==0 -> tight (no pad).
+    NS = n_stride if n_stride else N
+    assert n_stride == 0 or NS >= N > 0, f"n_stride={n_stride} must be >= real N={N}"
 
     # CShuffle epilogue staging (see NT): 8 waves x 16 rows x Cc(=N_TILES_B*16) out_ty.
     _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
@@ -282,7 +290,8 @@ def _compile_grouped_nn(
             m_row = m_start + local_block_m * BLOCK_M
             # Fold each tile's huge element base (m_row*K for A, group/N-block for B) into
             # the i64 SRD base; in-tile offsets stay int32, num_records clamps to the group.
-            cn_i = arith.index_cast(T.index, c_n)
+            # B row pitch = padded storage pitch NS when n_stride is set; else runtime c_n.
+            cn_i = arith.index(NS) if const_expr(n_stride) else arith.index_cast(T.index, c_n)
             a_base = arith.index_cast(T.index, m_row) * arith.index(K)
             b_base = arith.index_cast(T.index, group_idx) * arith.index(K) * cn_i + arith.index_cast(
                 T.index, block_n * BLOCK_N
@@ -303,8 +312,10 @@ def _compile_grouped_nn(
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
             _nnwz = os.environ.get("PT_NN_WSWZ", "1") == "1"  # wave-swizzle dgrad B, default on
+            # B g2s pitch also rides the padded storage pitch NS when n_stride is set.
+            _b_pitch = fx.Int32(NS) if const_expr(n_stride) else c_n
             gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-            gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, c_n, N_LDS_ROUNDS, wswz=_nnwz)
+            gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, _b_pitch, N_LDS_ROUNDS, wswz=_nnwz)
 
             # AGPR in-place accum (mode 2) when agpr_inplace -> off the VGPR file (spill-free).
             mfma = _build_mfma(
@@ -545,6 +556,8 @@ def _compile_grouped_nt(
     sched_schedbar: bool = False,  # True = inner per-mfma s_barrier -> sched_barrier(0) (compile-time fence, no runtime WG sync)
     persistent: bool = True,  # True = scf.for tile loop (fixed grid, cap_cu reserves CUs); False = one tile/WG + s_endpgm over-launch guard (full-device default)
     cap_cu: int = -1,  # >0: cap grid to this many WGs (= reserve device CUs for comm-compute overlap). <=0: use the full device CU count.
+    n_stride: int = 0,  # >0: padded N storage pitch for B_T (rows stored at n_stride, real width fed via c_n)
+    N: int = 0,  # real N compile const, only used (paired with n_stride) to assert n_stride>=N
 ):
     """Grouped NT forward (out = a @ b^T). persistent=True: a fixed grid of WGs strides
     the tile space via scf.for (cap_cu reserves CUs for comm overlap). persistent=False:
@@ -573,6 +586,12 @@ def _compile_grouped_nt(
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
+
+    # Pad-both: B_T=[G,N,K] is stored with a padded N pitch (n_stride) but only the real N
+    # rows (runtime c_n) are computed/stored. NS = the compile-time B_T group row pitch;
+    # c_n stays the real compute/output width (n_blocks + store column clamp).
+    NS = n_stride if n_stride else N
+    assert n_stride == 0 or NS >= N > 0, f"n_stride={n_stride} must be >= real N={N}"
 
     # CShuffle epilogue staging (8 waves x 16 rows x N_TILES_B*16 out_ty elems); used
     # only when store_cshuffle=True (vectorized 128b store vs scalar buffer_store_short).
@@ -681,7 +700,8 @@ def _compile_grouped_nt(
             m_row = m_start + local_block_m * BLOCK_M
             # Fold each tile's huge element base into the i64 SRD base (in-tile offsets stay
             # int32, A/B > 2^31 / > 4GB). B_T=[G,N,K]: base group_idx*c_n*K + block_n*BLOCK_N.
-            cn_i = arith.index_cast(T.index, c_n)
+            # B_T group row pitch = padded storage pitch NS when n_stride is set; else c_n.
+            cn_i = arith.index(NS) if const_expr(n_stride) else arith.index_cast(T.index, c_n)
             a_base = arith.index_cast(T.index, m_row) * arith.index(K)
             b_base = (
                 arith.index_cast(T.index, group_idx) * cn_i + arith.index_cast(T.index, block_n * BLOCK_N)
@@ -1410,7 +1430,10 @@ def _grouped_compile_cfg(
     nt_group_n=0,
     cap_cu=-1,
     i64_traverse=False,
+    n_stride=0,
+    N=0,
 ):
+    assert n_stride == 0 or N > 0, f"n_stride={n_stride} requires real N>0"
     ckey = (
         "nt" if trans_b else "nn",
         K,
@@ -1429,6 +1452,8 @@ def _grouped_compile_cfg(
         nt_group_n,
         cap_cu,
         i64_traverse,
+        n_stride,
+        N,
     )
     l = _GROUPED_LAUNCH_CACHE.get(ckey)
     if l is None:
@@ -1450,6 +1475,8 @@ def _grouped_compile_cfg(
                 sched_schedbar=sched_schedbar,
                 persistent=True,
                 cap_cu=cap_cu,
+                n_stride=n_stride,
+                N=N,
             )
         else:
             l = _compile_grouped_nn(
@@ -1470,6 +1497,8 @@ def _grouped_compile_cfg(
                 persistent=True,
                 cap_cu=cap_cu,
                 i64_traverse=i64_traverse,
+                n_stride=n_stride,
+                N=N,
             )
         _GROUPED_LAUNCH_CACHE[ckey] = l
     return l
@@ -1509,12 +1538,13 @@ def _np_regime(trans_b, N, K, G, M_total):
     return 0  # steady -> NK autotune
 
 
-def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
+def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime, n_stride=0):
     """Race the NT/NN candidates on synthetic balanced tensors at the canonical tokens/group
     and cache per static (op,N,K,G,dtype,regime), never per M_total. regime==1 -> fixed bm128."""
     # NN B[K,N] per-group traversal: k*BLOCK_K*N rides the 32-bit soffset, so when the
     # per-group span K*N reaches 2^32 fp8 re-base B's SRD per load in i64 (M-independent).
-    i64_tr = (not trans_b) and (K * N >= 2**32)
+    # Under pad-both the physical B pitch is n_stride (>=N), so key i64 on the padded span.
+    i64_tr = (not trans_b) and (K * max(N, n_stride) >= 2**32)
 
     def mk(bm, xcd, gm, gn):
         if trans_b:  # NT: merged factory, non-persistent mode (intrinsic MMA, scalar store)
@@ -1534,6 +1564,8 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
                 store_cshuffle=False,
                 sched_schedbar=False,
                 nt_vmcnt=3,
+                n_stride=n_stride,
+                N=N,
             )
         # NN: merged factory, non-persistent mode (AGPR in-place, scalar store).
         return _compile_grouped_nn(
@@ -1553,6 +1585,8 @@ def _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime):
             sched_schedbar=False,
             nt_vmcnt=3,
             i64_traverse=i64_tr,
+            n_stride=n_stride,
+            N=N,
         )
 
     if not trans_b and regime == 1:
@@ -1655,6 +1689,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     trans_b: bool = False,
     out_dtype=torch.bfloat16,
     num_cu: "int | None" = -1,
+    n_real: "int | None" = None,
 ) -> "torch.Tensor":
     """FlyDSL per-tensor grouped fp8 GEMM (M-grouped), matching the Triton entry.
 
@@ -1669,6 +1704,13 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     N = b.shape[1] if trans_b else b.shape[2]
     K_b = b.shape[2] if trans_b else b.shape[1]
     assert K == K_b, f"K mismatch a={K} b={K_b}"
+
+    # Pad-both: b is stored with a padded N pitch; n_real gives the true compute/output
+    # width. n_stride = the padded storage pitch (b.shape N), N collapses to the real width.
+    n_stride = 0
+    if n_real is not None and n_real != N:
+        assert 0 < n_real < N, f"n_real={n_real} must be in (0, N={N})"
+        n_stride, N = N, n_real
 
     out = torch.empty((M_total, N), device=a.device, dtype=out_dtype)
     # kernel reads group_offs as int64 low-words via a free int32-view (no .to(int32)
@@ -1690,7 +1732,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     # NK autotune key: M_total is NOT in the key; instead a coarse M-derived regime bucket
     # (steady vs small-M dgrad) is, so one tune covers every M_total (see _np_regime).
     regime = _np_regime(trans_b, N, K, G, M_total) if nonpersist else 0
-    at_key = (op, N, K, G, out_fp16, cbsz, blgp, regime, nonpersist, num_cu if capped else 0)
+    at_key = (op, N, K, G, out_fp16, cbsz, blgp, regime, nonpersist, num_cu if capped else 0, n_stride)
     # Full rank (not flattened): a flat reshape(-1) overflows the int32 shape pack
     # when M_total*K / G*N*K > 2^31; the kernel re-bases A/B via i64 base.
     a_i8 = a.view(torch.int8)
@@ -1712,7 +1754,9 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
             # num_cu<=0 (full device): per-shape autotune the NON-PERSISTENT nt8w/nn8w
             # L2-reuse swizzle (3 candidates, balanced-timed). The straight-line one-
             # tile/WG body avoids the persistent scf.for tile-loop scheduling penalty.
-            launch = _autotune_np_dispatch(trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime)
+            launch = _autotune_np_dispatch(
+                trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime, n_stride=n_stride
+            )
         else:
             # Single persistent prod config (xcd8/agpr/cshuffle/sched), NO autotune.
             # Reached only by capped (num_cu>0 -> reserve CUs for comm overlap, grid
@@ -1733,7 +1777,9 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
                 sched_schedbar=True,
                 cap_cu=(num_cu if capped else -1),
                 # NN B[K,N] per-group traversal: i64 re-base when K*N reaches 2^32 fp8.
-                i64_traverse=((not trans_b) and (K * N >= 2**32)),
+                i64_traverse=((not trans_b) and (K * max(N, n_stride) >= 2**32)),
+                n_stride=n_stride,
+                N=(N if n_stride else 0),
             )
         entry = [launch, None]  # [raw @flyc.jit closure, flyc.compile'd object (lazy)]
         _GROUPED_AT_CACHE[at_key] = entry
@@ -2614,6 +2660,8 @@ def _wave4_do_tile_tn(
     lds,
     _cm,
     _cn,
+    C_M,
+    C_N,
     beta_is_one=False,
     epi_cshuffle=False,
     c_lds=None,
@@ -2690,8 +2738,8 @@ def _wave4_do_tile_tn(
             A_scale,
             B_scale,
             C,
-            (group_idx + 1) * OUT_M,
-            _cn,
+            (group_idx + 1) * C_M,
+            fx.Int32(C_N),
             mfma.idx,
             N_TILES_A,
             N_TILES_B,
@@ -2703,8 +2751,8 @@ def _wave4_do_tile_tn(
             A_scale,
             B_scale,
             C,
-            (group_idx + 1) * OUT_M,
-            _cn,
+            (group_idx + 1) * C_M,
+            fx.Int32(C_N),
             mfma.idx,
             N_TILES_A,
             N_TILES_B,
@@ -2743,7 +2791,7 @@ def _wave4_do_tile_tn(
         nw=N_WAVES,
         cbsz=cbsz,
         blgp=blgp,
-        base_row=group_idx * OUT_M + bm_off + wave_m * (N_TILES_A * 16),
+        base_row=group_idx * C_M + bm_off + wave_m * (N_TILES_A * 16),
         base_col=bn_off + wave_n * (N_TILES_B * 16),
         lds_block_m=LDS_BLOCK_M,
         lds_block_n=LDS_BLOCK_N,
@@ -2841,6 +2889,9 @@ def _compile_grouped_tn_wgrad_4wave(
     vmcnt_hint: int = 2,
     cap_cu: int = -1,
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
+    m_real: int = 0,  # >0: real N (hidden) extent; A/B operands stay padded to OUT_M/OUT_N
+    n_real: int = 0,  # >0: real K extent; with c_tight, C collapses onto [G, m_real, n_real]
+    c_tight: bool = False,  # C output has the real (tight) pitch, not the padded OUT_M/OUT_N
 ):
     """4-wave (occ=1) grouped TN wgrad dW[g]=A[g]^T@B[g], variable-K per group. 256x256
     whole-loop bare-asm body: runtime nval (floored to x6) + in-asm fused tail; partial
@@ -2874,8 +2925,17 @@ def _compile_grouped_tn_wgrad_4wave(
     b_lds_size = _geo.b_lds_size
     _cshuf_n = _geo.cshuf_n
     _cshuf_ty = _geo.cshuf_ty
-    N_BLOCKS_M = (OUT_M + BLOCK_M - 1) // BLOCK_M
-    N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
+    # Pad-both tight output: operands A/B keep their padded pitch (OUT_M/OUT_N); the tile
+    # grid only covers the real extent (_M_VALID/_N_VALID) and C uses the real pitch
+    # (_C_M/_C_N) when c_tight, so no pad rows/cols are ever launched or written.
+    _M_VALID = m_real if m_real else OUT_M
+    _N_VALID = n_real if n_real else OUT_N
+    assert 0 < _M_VALID <= OUT_M, f"m_real={m_real} out of range for OUT_M={OUT_M}"
+    assert 0 < _N_VALID <= OUT_N, f"n_real={n_real} out of range for OUT_N={OUT_N}"
+    _C_M = _M_VALID if c_tight else OUT_M
+    _C_N = _N_VALID if c_tight else OUT_N
+    N_BLOCKS_M = (_M_VALID + BLOCK_M - 1) // BLOCK_M
+    N_BLOCKS_N = (_N_VALID + BLOCK_N - 1) // BLOCK_N
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     TOTAL = G * TILES_PER_GROUP
 
@@ -2972,6 +3032,8 @@ def _compile_grouped_tn_wgrad_4wave(
                 lds=lds,
                 _cm=_cm,
                 _cn=_cn,
+                C_M=_C_M,
+                C_N=_C_N,
                 beta_is_one=beta_is_one,
                 epi_cshuffle=_epi_cshuffle,
                 c_lds=(lds.A_lds_cur_0 if _epi_alias else lds.C_lds_shuffle),
@@ -3093,9 +3155,15 @@ def _wgrad_masked_cfg(
     return l
 
 
-def _wgrad_4wave_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, group_m, group_n, num_xcd, beta_is_one=False):
+def _wgrad_4wave_cfg(
+    OUT_M, OUT_N, G, out_fp16, cbsz, blgp, group_m, group_n, num_xcd, beta_is_one=False,
+    m_real=0, n_real=0, c_tight=False,
+):
     """Compile (or cache-hit) the 4-wave whole-loop wgrad for one (group_m, group_n, num_xcd)."""
-    ck = ("4wave", OUT_M, OUT_N, G, out_fp16, cbsz, blgp, group_m, group_n, num_xcd, beta_is_one)
+    ck = (
+        "4wave", OUT_M, OUT_N, G, out_fp16, cbsz, blgp, group_m, group_n, num_xcd, beta_is_one,
+        m_real, n_real, c_tight,
+    )
     l = _GROUPED_WGRAD_LAUNCH_CACHE.get(ck)
     if l is None:
         l = _compile_grouped_tn_wgrad_4wave(
@@ -3109,6 +3177,9 @@ def _wgrad_4wave_cfg(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, group_m, group_n, nu
             group_m=group_m,
             group_n=group_n,
             beta_is_one=beta_is_one,
+            m_real=m_real,
+            n_real=n_real,
+            c_tight=c_tight,
         )
         _GROUPED_WGRAD_LAUNCH_CACHE[ck] = l
     return l
@@ -3121,7 +3192,10 @@ _WGRAD_4WAVE_CANDS_SHORT = ((8, 4, 4), (4, 4, 8))  # M_total<=4096 (persist regi
 _WGRAD_4WAVE_CANDS_LONG_BASE = ((8, 4, 4), (4, 4, 8))  # M_total>4096
 
 
-def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, short, i64_traverse=False):
+def _autotune_wgrad_dispatch(
+    OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, short, i64_traverse=False,
+    m_real=0, n_real=0, c_tight=False,
+):
     """Race the wgrad candidates on synthetic balanced tensors at the live tokens/group and
     cache per static (OUT_M,OUT_N,G,dtype,short,i64), never per m_total. short -> persistent
     8-wave pool; long -> masked ref + full 4-wave pool. cands[0] is the correctness ref.
@@ -3189,7 +3263,16 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, short,
             )
         ]
 
-    prod = cands[0]  # correctness reference + fallback
+    if c_tight:
+        # tight C: the persistent/masked pool writes the padded OUT_N pitch and cannot fill
+        # the tight [G*C_M, C_N] buffer -> the correctness reference must be a 4-wave build.
+        _gm0, _gn0, _xcd0 = (_WGRAD_4WAVE_CANDS_SHORT if short else _WGRAD_4WAVE_CANDS_LONG_BASE)[0]
+        prod = functools.partial(
+            _wgrad_4wave_cfg, OUT_M, OUT_N, G, out_fp16, cbsz, blgp, _gm0, _gn0, _xcd0,
+            m_real=m_real, n_real=n_real, c_tight=c_tight,
+        )
+    else:
+        prod = cands[0]  # correctness reference + fallback
     prod_l = prod(beta_is_one=False)
     for mp in mps:  # establish the per-M numeric reference from prod
         prod_l(*mp[0])
@@ -3214,17 +3297,23 @@ def _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, args, short,
         return prodt ** (1.0 / len(mps))
 
     best_mk, best_s = prod, _score(prod_l)
-    for mk in cands[1:]:  # same-family pool: 1.5% hysteresis (geomean)
-        s = _score(mk(beta_is_one=False))
-        if s is not None and s < best_s * 0.985:
-            best_mk, best_s = mk, s
+    # tight C skips the same-family (persistent/masked) pool: those write the padded OUT_N
+    # pitch and would mis-fill the tight bench buffer; only the 4-wave pool is tight-aware.
+    if not c_tight:
+        for mk in cands[1:]:  # same-family pool: 1.5% hysteresis (geomean)
+            s = _score(mk(beta_is_one=False))
+            if s is not None and s < best_s * 0.985:
+                best_mk, best_s = mk, s
 
     if short:
         wave4_cands = _WGRAD_4WAVE_CANDS_SHORT
     else:
         wave4_cands = _WGRAD_4WAVE_CANDS_LONG_BASE + ((0, 0, 2), (4, 16, 8))
     for gm, gn, xcd in wave4_cands:
-        mk = functools.partial(_wgrad_4wave_cfg, OUT_M, OUT_N, G, out_fp16, cbsz, blgp, gm, gn, xcd)
+        mk = functools.partial(
+            _wgrad_4wave_cfg, OUT_M, OUT_N, G, out_fp16, cbsz, blgp, gm, gn, xcd,
+            m_real=m_real, n_real=n_real, c_tight=c_tight,
+        )
         s = _score(mk(beta_is_one=False))  # numeric guard folded in: None -> skip
         if s is not None and s < best_s * 0.985:
             best_mk, best_s = mk, s
@@ -3241,6 +3330,9 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     num_cu: "int | None" = -1,
     beta: float = 0.0,
     out: "torch.Tensor | None" = None,
+    m_real: "int | None" = None,
+    n_real: "int | None" = None,
+    c_tight: bool = False,
 ) -> "torch.Tensor":
     """FlyDSL per-tensor variable-K grouped fp8 GEMM (wgrad), matching the
     Triton variable-K entry.
@@ -3259,8 +3351,26 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out = resolve_accum_out(out, beta, (G, OUT_M, OUT_N), lhs.device, out_dtype)
-    beta_is_one = beta == 1.0
+    # Pad-both tight output: operands lhs/rhs stay padded to OUT_M/OUT_N; C is written at
+    # the real extent [G, m_real, n_real]. Tight cannot accumulate (the beta=1 read-back
+    # band faults) -> deploy uses beta=0 + host add_.
+    _m_real = int(m_real) if m_real and int(m_real) < OUT_M else 0
+    _n_real = int(n_real) if n_real and int(n_real) < OUT_N else 0
+    _tight = bool(c_tight) and (_m_real or _n_real) > 0
+    if _tight:
+        assert beta == 0.0 and out is None, (
+            "tight (c_tight) wgrad does not support accumulate (beta=1 / out=): "
+            "the tight beta read-back band faults; use a fresh grad + host add_ instead"
+        )
+        C_M = _m_real or OUT_M
+        C_N = _n_real or OUT_N
+        out = resolve_accum_out(out, beta, (G, C_M, C_N), lhs.device, out_dtype)
+        beta_is_one = beta == 1.0
+        out2d = out.view(G * C_M, C_N)
+    else:
+        out = resolve_accum_out(out, beta, (G, OUT_M, OUT_N), lhs.device, out_dtype)
+        beta_is_one = beta == 1.0
+        out2d = out.view(G * OUT_M, OUT_N)
     # kernel reads group_offs as int64 low-words via a free int32-view (no .to(int32) cast).
     _go64 = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
     go32 = _go64.view(torch.int32)
@@ -3279,15 +3389,18 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     M_total = lhs.shape[0]
     short = M_total <= 4096
     i64_tr = (M_total * OUT_M >= 2**32) or (M_total * OUT_N >= 2**32)
-    at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, short, i64_tr)
-    # out as 2D [G*OUT_M, OUT_N] (the kernel's stacked-group view).
-    wargs = (lhs_i8, rhs_i8, out.view(G * OUT_M, OUT_N), lsf, rsf, go32, stream)
+    at_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, short, i64_tr, _m_real, _n_real, _tight)
+    # out as 2D (padded [G*OUT_M, OUT_N] or tight [G*C_M, C_N]); the kernel's stacked view.
+    wargs = (lhs_i8, rhs_i8, out2d, lsf, rsf, go32, stream)
     # The cached entry is the winning config, not a launch: the beta=0 and beta=1
     # builds share a config but not a compiled kernel, and the race only ever runs
     # the beta=0 one (see _autotune_wgrad_dispatch).
     make_launch = _GROUPED_WGRAD_AT_CACHE.get(at_key)
     if make_launch is None:
-        make_launch = _autotune_wgrad_dispatch(OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, short, i64_tr)
+        make_launch = _autotune_wgrad_dispatch(
+            OUT_M, OUT_N, G, out_fp16, cbsz, blgp, wargs, short, i64_tr,
+            m_real=_m_real, n_real=_n_real, c_tight=_tight,
+        )
         _GROUPED_WGRAD_AT_CACHE[at_key] = make_launch
     make_launch(beta_is_one=beta_is_one)(*wargs)
     return out

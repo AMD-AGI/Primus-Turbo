@@ -14,10 +14,33 @@ template <typename T>
 void compute_scale_from_amax(const T *amax, const T q_max, T *scale, T *scale_inv, const int64_t n,
                              hipStream_t stream, const float eps = 1e-12);
 
+// Whole-tensor abs-amax -> scale / scale_inv for the tensorwise quant recipe.
+// Replaces the generic reduce_row<AbsMaxOp> chain plus compute_scale_from_amax
+// (four launches, cached read) with a nontemporal streaming pass and a single
+// finalising launch. `workspace` must hold at least
+// `tensorwise_amax_workspace_elems()` floats. The amax, and therefore the
+// quantized output, is bit-identical to the shared path.
+int64_t tensorwise_amax_workspace_elems();
+
+template <typename FType>
+void quantize_tensorwise_amax_scale_impl(const FType *x, const int64_t n, const float q_max,
+                                         float *amax, float *scale, float *scale_inv,
+                                         float *workspace, hipStream_t stream);
+
 // *************** Quantize ***************
 template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
                               hipStream_t stream);
+
+// Tensorwise FP8 quant that also K-pads the innermost dim: input rows of length
+// ``K`` are cast into output rows of length ``Kp`` (``Kp = ceil(K/128)*128``),
+// with columns ``[K, Kp)`` written 0. Real columns ``[0, K)`` are byte-identical
+// to ``quantize_tensorwise_impl`` for the same scalar scale. This feeds the
+// grouped GEMM 128-aligned operands (kills the K%128 cache-line split tax).
+template <typename FType, typename QType, typename ComputeType = float>
+void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, const int64_t rows,
+                                  const int64_t K, const int64_t Kp, hipStream_t stream,
+                                  const int64_t n_pen = 0, const int64_t np_pen = 0);
 
 // Segment-padded group offsets (each segment rounded up to block_size), on-device.
 template <typename IndexType>

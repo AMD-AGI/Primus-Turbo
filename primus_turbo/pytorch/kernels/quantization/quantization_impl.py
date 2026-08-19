@@ -44,7 +44,30 @@ def quantize_fp8_tensorwise_impl(
     """
     Quantize FP8 Tensor-Wise
     """
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
+    # padding_align_size=1 -> Kp == K, shape-preserving (byte-identical to the legacy quant).
+    x = x.contiguous()
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None, 1)
+    return x_fp8, scale_inv
+
+
+def quantize_fp8_tensorwise_pad_impl(
+    x: torch.Tensor, out_dtype: torch.dtype, pad_n: bool = False, k_align: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor fp8 cast + last-dim (K) pad to Kp=ceil(K, k_align).
+
+    ``k_align`` is the last-dim pad alignment (the cpp op's ``padding_align_size``; only
+    ``>= 1`` is required, 128 is not hard-baked). The default 128 gives the K-aligned
+    contraction operand; pass a K-divisor (e.g. 64 for a 64-aligned width, or 1) to get an
+    UNPADDED output -- for gpt-oss down (K=N=2880=45*64), ``k_align=64`` emits [..., 2880]
+    with no pad columns, so the padK-only path stays copy-free with no N widening.
+
+    ``pad_n`` (penultimate/N pad-to-128) is the padN path; leave False to keep N tight.
+    Real data in [..., :K], pad columns zeroed. Any ndim >= 1 ([B, N, K] weight in one launch)."""
+    x = x.contiguous()
+    pad_n_align = 128 if pad_n else 1
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(
+        x, out_dtype, None, k_align, pad_n_align
+    )
     return x_fp8, scale_inv
 
 

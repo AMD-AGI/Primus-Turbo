@@ -1374,3 +1374,64 @@ def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend):
         backend=backend,
         main_grad_dtype=main_grad_dtype,
     )
+
+
+# --- Native pad path (non-128-aligned K/N) --------------------------------------------------
+# The tensorwise entry routes a raw NT GEMM with a non-128-aligned K onto the flydsl "pad" fast
+# path (cast-and-pad both K->ceil128(K) and the weight's N->ceil128(N); backward stays native and
+# copy-free at the real extents). Every shape above uses 128-aligned K/N, so nothing else covers
+# it. gpt-oss down-proj is the deploy shape (N=K=2880, ceil128=2944); a small (K=257, N=384) case
+# keeps the sweep cheap. The path fires on shape alone, so the backend is irrelevant here.
+PAD_NK_VALUES = [(2880, 2880), (384, 257)]
+
+
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("N, K", PAD_NK_VALUES)
+def test_grouped_gemm_fp8_tensorwise_pad_path(ori_dtype, N, K):
+    """fwd + grad_a + grad_b on the native pad path (non-128-aligned K), vs the fp32 reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
+    assert K % 128 != 0, "this test must exercise the non-aligned-K pad path"
+    _run_grouped_gemm_fp8_test(
+        B=8,
+        M=512,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        format=Format.E4M3,
+        granularity=ScalingGranularity.TENSORWISE,
+        trans_b=True,  # pad path is NT-only
+        balance=False,
+        backend=None,
+    )
+
+
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("N, K", PAD_NK_VALUES)
+@pytest.mark.parametrize(
+    "main_grad_dtype",
+    # 16-bit -> flydsl beta=1 epilogue accumulates straight into main_grad; fp32 (Megatron's
+    # default) can't (that epilogue writes 16-bit only) -> fresh tight grad + host add_.
+    [torch.bfloat16, torch.float32],
+    ids=["mg16", "mgfp32"],
+)
+def test_grouped_gemm_fp8_pad_path_fused_grad_accum(ori_dtype, N, K, main_grad_dtype):
+    """Fused bgrad-accum on the native pad path, for both 16-bit and fp32 main_grad."""
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
+    assert K % 128 != 0, "this test must exercise the non-aligned-K pad path"
+    # keep the 16-bit accumulator matched to the weight dtype (flydsl epilogue constraint)
+    mg_dtype = ori_dtype if main_grad_dtype != torch.float32 else torch.float32
+    _run_grouped_gemm_fp8_fused_grad_accum_test(
+        B=8,
+        M=512,
+        N=N,
+        K=K,
+        ori_dtype=ori_dtype,
+        granularity=ScalingGranularity.TENSORWISE,
+        trans_b=True,  # pad path is NT-only
+        backend=None,
+        main_grad_dtype=mg_dtype,
+    )

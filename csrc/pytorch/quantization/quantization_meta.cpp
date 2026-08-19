@@ -10,8 +10,24 @@ namespace primus_turbo::pytorch {
 
 std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          input,
                                                      const at::ScalarType      dest_dtype,
-                                                     c10::optional<at::Tensor> scale_opt) {
-    auto input_fp8 = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
+                                                     c10::optional<at::Tensor> scale_opt,
+                                                     const int64_t             padding_align_size,
+                                                     const int64_t pad_penultimate_align_size) {
+    PRIMUS_TURBO_CHECK(input.dim() >= 1, "input must have at least 1 dim");
+    PRIMUS_TURBO_CHECK(padding_align_size >= 1, "padding_align_size must be >= 1");
+    const int64_t K  = input.size(-1);
+    const int64_t Kp = ((K + padding_align_size - 1) / padding_align_size) * padding_align_size;
+
+    std::vector<int64_t> out_shape(input.sizes().begin(), input.sizes().end());
+    out_shape.back() = Kp;
+    if (pad_penultimate_align_size > 1 && input.dim() >= 2) {
+        const int64_t N  = input.size(-2);
+        const int64_t Np = ((N + pad_penultimate_align_size - 1) / pad_penultimate_align_size) *
+                           pad_penultimate_align_size;
+        if (Np > N)
+            out_shape[out_shape.size() - 2] = Np;
+    }
+    auto input_fp8 = at::empty(out_shape, at::dtype(dest_dtype).device(at::kMeta));
     auto scale_inv = at::empty({}, input.options().dtype(at::kFloat).device(at::kMeta));
     return {input_fp8, scale_inv};
 }
