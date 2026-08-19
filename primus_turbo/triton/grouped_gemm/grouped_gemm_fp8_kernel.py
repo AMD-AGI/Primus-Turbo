@@ -520,6 +520,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     group_offs: torch.Tensor,
     trans_b: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
+    n_real: "int | None" = None,
 ) -> torch.Tensor:
     """Persistent grouped FP8 GEMM (CPU-sync-free, per-tensor scaling) using Triton.
 
@@ -536,9 +537,11 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         group_offs: [G+1] int64 prefix sum of group lengths.
         trans_b: If True, b[g] is [N, K] (transposed).
         out_dtype: Output dtype (default bfloat16).
+        n_real: N/K-pad tight output width. b keeps its padded row pitch, but only the
+            real ``n_real`` output columns are computed/stored (no un-pad slice).
 
     Returns:
-        [M_total, N] output in out_dtype.
+        [M_total, N] output in out_dtype (N = n_real if given, else b's output dim).
     """
     assert a.ndim == 2, f"a must be 2D, got {a.shape}"
     assert b.ndim == 3, f"b must be 3D, got {b.shape}"
@@ -557,6 +560,12 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
 
     assert K_a == K_b, f"K mismatch: a has K={K_a}, b has K={K_b}"
     K = K_a
+
+    # N/K-pad tight: shrink the compute/store width to the real N; the padded operand
+    # pitch (stride_bn) is untouched, so the kernel reads padded rows but writes tight.
+    if n_real is not None:
+        assert 0 < n_real <= N, f"n_real={n_real} must be in (0, N={N}]"
+        N = n_real
 
     stride_bg = b.stride(0)
     stride_ak = a.stride(1)  # =1 for contiguous a
@@ -634,6 +643,8 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     out_dtype: torch.dtype = torch.bfloat16,
     beta: float = 0.0,
     out: torch.Tensor | None = None,
+    m_real: "int | None" = None,
+    n_real: "int | None" = None,
 ) -> torch.Tensor:
     """Variable-K grouped FP8 GEMM (backward, per-tensor scaling) using Triton.
 
@@ -657,15 +668,29 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
             When given, the kernel writes (or accumulates, see ``beta``) into it
             instead of allocating. Strides are read off the tensor, so
             non-contiguous views are fine.
+        m_real/n_real: N/K-pad tight output widths for the OUT_M (=N) / OUT_N (=K)
+            dims. Operands keep their padded free-dim pitch; only the real block is
+            computed and stored tight. ``None`` (or ==full dim) is a no-op.
 
     Returns:
-        [G, OUT_M, OUT_N] output (the same tensor as ``out`` when it was given).
+        [G, OUT_M, OUT_N] output (the same tensor as ``out`` when it was given),
+        where OUT_M/OUT_N are the real widths when ``m_real``/``n_real`` are set.
     """
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0]
     OUT_M = lhs.shape[1]
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
+
+    # N/K-pad tight output: operands carry padded output free dims (OUT_M=Np, OUT_N=Kp)
+    # but only the real (m_real, n_real) block is computed/stored -> tight, no un-pad
+    # slice. Operand pitches stay padded; the contraction (token) dim is never padded.
+    if m_real is not None:
+        assert 0 < m_real <= OUT_M, f"m_real={m_real} must be in (0, OUT_M={OUT_M}]"
+        OUT_M = m_real
+    if n_real is not None:
+        assert 0 < n_real <= OUT_N, f"n_real={n_real} must be in (0, OUT_N={OUT_N}]"
+        OUT_N = n_real
 
     out = _resolve_variable_k_out(out, beta, (G, OUT_M, OUT_N), lhs.device, out_dtype)
     num_sms = get_num_cus()

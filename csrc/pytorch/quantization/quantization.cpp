@@ -59,12 +59,9 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
         PRIMUS_TURBO_CHECK(scale.numel() == 1, "tensorwise scale must be scalar tensor");
         scale_inv = 1.0f / scale;
     } else {
-        // Whole-tensor abs-amax over the real (unpadded) data -> scalar scale.
-        // Block partials fill [0, W) and the three scalars sit right after them,
-        // so the amax -> scale handoff costs one allocation instead of four.
-        // These run before the op's first kernel is enqueued, and the scored
-        // shapes leave the GPU idle for all of it: an empty allocation is ~1 us
-        // of host time and the whole op is 200-305 us.
+        // Whole-tensor abs-amax over the real (unpadded) data -> scalar scale. Block
+        // partials fill [0, W); the three trailing scalars pack the amax -> scale
+        // handoff into one allocation instead of four.
         const at::IntArrayRef scalar_shape{};
         const int64_t         w       = tensorwise_amax_workspace_elems();
         at::Tensor            ws      = torch::empty({w + 3}, input.options().dtype(at::kFloat));
@@ -82,9 +79,9 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
     // Output: last dim K -> Kp (Kp == K when padding_align_size divides K).
     std::vector<int64_t> out_shape(input.sizes().begin(), input.sizes().end());
     out_shape.back() = Kp;
-    // Optional padN: also pad the penultimate dim N -> Np (pad rows are zeroed by
-    // the kernel). Feeds the grouped GEMM a fully 128-aligned weight [G, Np, Kp];
-    // amax/scale are unchanged (over the real data) so the numerics are identical.
+    // Optional penultimate pad: also pad N -> Np (pad rows zeroed by the kernel) so the
+    // grouped GEMM gets a fully 128-aligned weight [G, Np, Kp]; amax/scale are unchanged
+    // (over the real data) so the numerics are identical.
     int64_t n_pen = 0, np_pen = 0;
     if (pad_penultimate_align_size > 1 && input.dim() >= 2) {
         const int64_t N  = input.size(-2);

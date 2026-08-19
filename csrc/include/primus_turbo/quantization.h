@@ -14,12 +14,9 @@ template <typename T>
 void compute_scale_from_amax(const T *amax, const T q_max, T *scale, T *scale_inv, const int64_t n,
                              hipStream_t stream, const float eps = 1e-12);
 
-// Whole-tensor abs-amax -> scale / scale_inv for the tensorwise quant recipe.
-// Replaces the generic reduce_row<AbsMaxOp> chain plus compute_scale_from_amax
-// (four launches, cached read) with a nontemporal streaming pass and a single
-// finalising launch. `workspace` must hold at least
-// `tensorwise_amax_workspace_elems()` floats. The amax, and therefore the
-// quantized output, is bit-identical to the shared path.
+// Whole-tensor abs-amax -> scale / scale_inv for tensorwise quant: two launches
+// (nontemporal stream + finalise) vs the generic reduce_row chain's four, output
+// bit-identical. `workspace` needs `tensorwise_amax_workspace_elems()` floats.
 int64_t tensorwise_amax_workspace_elems();
 
 template <typename FType>
@@ -32,11 +29,9 @@ template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
                               hipStream_t stream);
 
-// Tensorwise FP8 quant that also K-pads the innermost dim: input rows of length
-// ``K`` are cast into output rows of length ``Kp`` (``Kp = ceil(K/128)*128``),
-// with columns ``[K, Kp)`` written 0. Real columns ``[0, K)`` are byte-identical
-// to ``quantize_tensorwise_impl`` for the same scalar scale. This feeds the
-// grouped GEMM 128-aligned operands (kills the K%128 cache-line split tax).
+// Tensorwise FP8 quant that K-pads the innermost dim K -> Kp=ceil128(K), columns
+// [K, Kp) zeroed; real columns [0, K) byte-identical to quantize_tensorwise_impl.
+// Optionally also pads the penultimate dim N -> np_pen (n_pen real rows).
 template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, const int64_t rows,
                                   const int64_t K, const int64_t Kp, hipStream_t stream,

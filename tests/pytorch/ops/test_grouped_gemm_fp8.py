@@ -1192,6 +1192,11 @@ def test_grouped_gemm_fp8_padded_tail_zeroed(ori_dtype, trans_b, backend):
     torch.manual_seed(42)
     device = "cuda:0"
     G, K, N = 8, 2048, 2880
+    # A raw NT tensorwise GEMM with non-128-aligned N pads the weight to ceil128(N) for
+    # a tight output; CK/hipBLASLt have no tight-output epilogue and decline by design,
+    # so dispatch falls to Triton/FlyDSL and a forced CK/hipBLASLt cannot serve it.
+    if trans_b and N % 128 != 0 and backend in (BackendType.CK, BackendType.HIPBLASLT):
+        pytest.skip(f"{backend.name} declines the tight-output pad path (N={N} not 128-aligned)")
     group_lens = torch.tensor([4096, 0, 3072, 0, 0, 5120, 0, 0], dtype=torch.int64, device=device)
     S = int(group_lens.sum())
     PAD = 224
@@ -1376,12 +1381,9 @@ def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend):
     )
 
 
-# --- Native pad path (non-128-aligned K/N) --------------------------------------------------
-# The tensorwise entry routes a raw NT GEMM with a non-128-aligned K onto the flydsl "pad" fast
-# path (cast-and-pad both K->ceil128(K) and the weight's N->ceil128(N); backward stays native and
-# copy-free at the real extents). Every shape above uses 128-aligned K/N, so nothing else covers
-# it. gpt-oss down-proj is the deploy shape (N=K=2880, ceil128=2944); a small (K=257, N=384) case
-# keeps the sweep cheap. The path fires on shape alone, so the backend is irrelevant here.
+# The tensorwise entry pads a raw NT GEMM with non-128-aligned K/N (K->ceil128(K),
+# weight N->ceil128(N)) for a tight copy-free output; every shape above is 128-aligned so
+# only these cover it. Deploy shape N=K=2880 (ceil128=2944); (K=257, N=384) stays cheap.
 PAD_NK_VALUES = [(2880, 2880), (384, 257)]
 
 
