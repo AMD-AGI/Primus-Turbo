@@ -48,13 +48,193 @@ Quant-only source boundary，不包含 K256，也没有给出对应的 fwd、dgr
 实测。因此不能把 `1.0206x` 与 `1.290438x`、`1.045990x` 或 `1.097399x` 相乘后称为
 当前组合 branch 的实测收益。
 
+## 背景：这项优化在 GPT-OSS-20B MoE 训练中的位置
+
+### 1. 从普通 GEMM 到 grouped GEMM
+
+GPT-OSS-20B 的 MoE（Mixture of Experts，专家混合）层会先由 router 为每个 token 选择
+少数几个 expert。本报告对应的 capture 使用 `topk=4`：一个逻辑 token 会产生 4 份
+token→expert 计算任务。完成 routing 后，发往同一个 expert 的任务会被排在一起，形成
+长度不同的 32 个 group：
+
+- `G=32`：当前设备上有 32 个本地 expert，也就是 grouped GEMM 的 32 个 group；
+- `group_lens[g]`：expert `g` 实际收到的 token-assignment 数；
+- `group_offs[g]`：`group_lens` 的前缀和，指明每个 expert 在 packed activation 中的起点；
+- `total_M = sum(group_lens) = 131072`：所有 token→expert assignment 的总数，不是去重后的
+  token 数量。
+
+`EP1`（部分记录中也简写为 `E1`）表示 expert-parallel size 为 1，因此 32 个全局 expert
+都在本地，当前算子不需要在不同 expert-parallel rank 之间切分 expert。`G32` 则强调一次
+grouped operation 同时处理 32 个 expert。由于 router 的分配通常不均匀，各 expert 的
+`M_g=group_lens[g]` 可能相差很多，还可能出现很小的 group 或 zero expert。这种不均匀性
+正是 padding、tile 利用率和 variable-K wgrad 性能必须使用真实 routing 验证的原因。
+
+对于一个 grouped linear，输入与权重可写成：
+
+```text
+A: [total_M, K]             packed activation，按 expert 在 M 维连续排列
+B: [G, N, K]                每个 expert 一份权重
+C_g = A_g @ B_g^T           每个 expert 独立做 GEMM
+C: [total_M, N]             再按原 packed-M 顺序拼接
+```
+
+本报告覆盖 GPT-OSS-20B 的两组生产 shape：
+
+| 名称 | `G` | `N` | `K` | 直观含义 |
+|---|---:|---:|---:|---|
+| GG1 | 32 | 5760 | 2880 | free dimension 较大、N-block 更多的 grouped linear |
+| GG2 | 32 | 2880 | 2880 | 方形的 grouped linear |
+
+### 2. 本报告中的 “full-op” 到底是什么
+
+这里的 full-op 不是“一个 GPU launch 内完成所有工作”的单体 fused kernel，而是公开接口
+`grouped_gemm_fp4` 的一次完整 forward + backward replay。它由自定义 autograd function
+把 Quant、fwd、dgrad 和 wgrad 组织成一条训练算子流水线；对调用者而言它是一个完整的
+MXFP4 grouped linear，对 GPU 而言内部仍会启动多个 kernel。
+
+```mermaid
+flowchart LR
+    A["Activation A<br/>bf16/fp16<br/>[total_M, K]"] --> AQ["Grouped dual quant"]
+    B["Weight B<br/>bf16/fp16<br/>[G, N, K]"] --> BQ["Batched dual quant"]
+    AQ --> AR["A rowwise"]
+    AQ --> AC["A colwise + RHT"]
+    BQ --> BR["B rowwise"]
+    BQ --> BC["B colwise"]
+    AR --> FWD["Fwd GEMM<br/>C = A · Bᵀ"]
+    BR --> FWD
+    GO["grad_out<br/>bf16/fp16<br/>[total_M, N]"] --> GQ["Grouped dual quant"]
+    GQ --> GR["gradO rowwise"]
+    GQ --> GC["gradO colwise + RHT"]
+    GR --> DGRAD["Dgrad GEMM<br/>dA = dO · B"]
+    BC --> DGRAD
+    GC --> WGRAD["Variable-K wgrad<br/>dB = dOᵀ · A"]
+    AC --> WGRAD
+```
+
+按 benchmark 的计时定义：
+
+- `Quant`：三次量化调用的总时间，即 activation grouped dual quant、weight batched dual
+  quant 和 backward `grad_out` grouped dual quant；
+- `Fwd`：使用 rowwise activation/weight 的 grouped GEMM；
+- `Dgrad`：计算输入梯度 `grad_a` 的 grouped GEMM；
+- `Wgrad`：按每个 expert 的真实 `M_g` 做 contraction，计算 `[G,N,K]` 权重梯度；
+- `Full-op`：从调用 `grouped_gemm_fp4`、完成 forward 到 `output.backward(grad_out)` 返回的
+  整段 GPU 时间，包括上述阶段以及它们之间的 dispatch、workspace/preshuffle、tail 处理等。
+
+因此，Quant kernel 变快会直接降低 `Quant` latency；只有当节省的时间没有被其他阶段或
+调度开销抵消时，才会转化为 `Full-op` 收益。`Full-op` 又只是一个完整公共算子的 replay，
+仍不等同于包含 router、通信、其他层和优化器的真实 GPT-OSS training step。
+
+### 3. MXFP4 与 block scale 的基本概念
+
+MXFP4 使用 E2M1 FP4 数值格式：每个数只有 4 bit，包含 1 个符号位、2 个指数位和 1 个
+尾数位。代码中的 `float4_e2m1fn_x2` 表示一个 byte 打包两个 FP4 数。FP4 本身动态范围很
+有限，因此每连续 32 个数共享一个 E8M0 scale；可以近似理解为：
+
+```text
+原始值 ≈ FP4 小数值 × E8M0 block scale
+```
+
+当前路径的输入和最终 GEMM 输出使用 `bfloat16` 或 `float16`，中间 operand 使用 packed
+FP4，scale 使用 `float8_e8m0fnu`（某些环境中以 `uint8` 保存同一 8-bit 编码）。Activation
+和 gradient 使用常规 1D block scale：一个连续 32 元素 microblock 对应一个 scale。Weight
+则启用 2D block scale：一个 32×32 tile 共同计算一个 scale；为了保持 GEMM consumer 的
+既有接口，scale buffer 的外观 shape 仍然是“每行、每 32 元素一个槽位”，同一 tile 覆盖的
+32 个槽位写入相同 scale，而不是把 tensor shape 压缩成二维 tile 数。
+
+无论是 1D 还是 2D scale，FP4 data 和 scale 都必须采用 consumer 约定的 layout、padding
+和 group offset；只优化 data 而没有同步 metadata/consumer 会直接造成数值错误。
+
+MXFP4 是有损格式。正确性标准不是要求逐 bit 等于 BF16 reference，而是要求：
+
+- layout、padding 和 group boundary 完全正确；
+- 误差处于 E2M1 量化应有的范围；
+- fwd、dgrad、wgrad 的 SNR 均高于预先设定的门限。
+
+### 4. 什么是 dual quant
+
+“Dual quant”不是把同一个 tensor 转成两种不同的数值格式，而是**一次读取同一份 16-bit
+输入，同时生成两种内存方向的 MXFP4 operand**：
+
+- **rowwise**：输出仍以原始行作为主序；activation/gradient 沿最后一维每 32 个元素计算
+  scale，weight 则按 32×32 tile 共享 scale；适合 fwd 和 dgrad 的 NT GEMM；
+- **colwise / transposed**：沿原始 M 方向分块，并把结果存成转置后的 feature-major layout；
+  activation/gradient 使用 1D 32-element scale，weight 使用转置方向的 32×32 tile scale；
+  适合 wgrad 对每个 expert 的 `M_g` 做 variable-K contraction。
+
+如果分别运行两个单向 quantizer，就需要重复读取 BF16/FP16 输入、重复计算部分 metadata，
+并增加 kernel launch。Fused dual quant 让两半线程共享一次输入 tile 和部分 prologue，同时
+产出 forward/backward 所需的两套表示。这也是本报告中 BM、grid collapse、LDS write-back
+和 K256 padding 都集中在 grouped dual quant 的原因。
+
+### 5. Quant 的输入、输出 shape 与 datatype
+
+设：
+
+```text
+M      = total_M
+M_g    = 第 g 个 expert 的实际行数
+N_pad  = ceil(N / 128) × 128
+K_pad  = ceil(K / 128) × 128
+M_pad  = Σ_g ceil(M_g / 256) × 256    # K256 合约下 colwise 的逻辑使用宽度
+```
+
+FP4 data shape 以 packed storage 表示，所以最后一维除以 2；scale storage 每 32 个逻辑元素
+保留一个槽位。
+
+| Quant 调用 | 16-bit 输入 | Rowwise 输出 | Colwise 输出 | 下游用途 |
+|---|---|---|---|---|
+| Activation grouped dual quant | `A [M,K]`, bf16/fp16 | data `[M,K_pad/2]` FP4；scale `[M,K_pad/32]` E8M0 | data `[K,M_pad/2]` FP4；scale `[K,M_pad/32]` E8M0 | row→fwd；col→wgrad |
+| Weight batched dual quant | `B [G,N,K]`, bf16/fp16 | data `[G,N,K_pad/2]` FP4；scale `[G,N,K_pad/32]` E8M0 | data `[G,K,N_pad/2]` FP4；scale `[G,K,N_pad/32]` E8M0 | row→fwd；col→dgrad |
+| Gradient grouped dual quant | `grad_out [M,N]`, bf16/fp16 | data `[M,N_pad/2]` FP4；scale `[M,N_pad/32]` E8M0 | data `[N,M_pad/2]` FP4；scale `[N,M_pad/32]` E8M0 | row→dgrad；col→wgrad |
+
+上表描述的是 public consumer 实际看到的 storage shape。Activation 与 `grad_out` 的每个
+scale 槽位各自对应一个 32-element microblock；weight 的 row/col 两个方向都启用
+`use_2d_block=True`，一个 32×32 tile 只计算一个 scale，但会把同一个 E8M0 值复制到该
+tile 对应的 32 个 scale 槽位。因此 weight 的 scale **语义**是 2D tile-wise，buffer
+**形状**仍分别为 `[G,N,K_pad/32]` 和 `[G,K,N_pad/32]`。
+
+Grouped dual quant 还输出两套 `int64` metadata：
+
+- rowwise `group_lens/group_offs`：M 维保持 tight layout，与输入 routing 相同；
+- colwise `group_lens/group_offs`：每个 `M_g` 独立向上对齐到 256，供 wgrad consumer 定位。
+
+实际 buffer allocation 可以比 `M_pad` 略大，用来提供安全容量；consumer 只根据 colwise
+offset metadata 访问每个 expert 的逻辑 span。不能用总 buffer shape 反推出单个 expert 的
+边界。
+
+### 6. Padding、RHT 与 stochastic rounding 为什么与优化有关
+
+- **32-element block**：是 MXFP4/E8M0 的基本 scale 单位；N、K 至少必须是 32 的倍数。
+- **128 alignment**：fwd/dgrad kernel 为便于 tiling，会把 contraction dimension 补到 128；
+  padding 必须真实写成零，不能只扩大 shape。
+- **256 alignment**：当前 K256 合约对 wgrad 的每个 `M_g` 独立向上对齐到 256。相比旧的
+  512 alignment，它减少 Quant grid/write，也缩短 wgrad contraction，但允许出现奇数个
+  256 block，因此 consumer 必须新增 zero/even/odd runtime 路径。
+- **RHT（Random Hadamard Transform）**：当前 recipe 只对 wgrad 的两个 contracted colwise
+  operand 同时启用，用于改善低比特量化分布。RHT 是成对约束；只变换一侧会破坏 GEMM
+  数学关系。
+- **Stochastic rounding**：可选地用于 gradient quant，减少长期训练中的舍入偏差。开启后
+  不要求 bit-exact，但仍必须满足统计正确性和 SNR 标准。
+
+从优化归属看：BM=128、GEAK grid-collapse/direct-store 和 K256 producer 主要影响两次
+grouped dual quant（activation 与 `grad_out`）；selective tail-zero 主要影响 batched weight
+dual quant；K256 consumer 则直接影响 wgrad。这个对应关系解释了为什么不同优化在 Quant、
+Wgrad 和 Full-op 上表现不同。
+
+“K256” 是 kernel 内部 contraction tile 的命名。对 fwd/dgrad，模型公式中的 contraction
+dimension 叫 `K`；对 wgrad，数学上真正被 reduction 的是每个 expert 的 `M_g`，但底层
+whole-loop 仍沿用 K-loop 的术语，把它切成 256-element phase。因此 K256 指的是“wgrad
+每次消费 256 个 routed rows”，不要与 GG1/GG2 中固定的模型 hidden dimension `K=2880`
+混为一谈。
+
 ## PR 状态与依赖
 
 - branch：`zhitwang17:codex/quant-mxfp4-pr460`
 - stacked base：`dev/kyle/gptoss-mxfp4-grouped-pr`
 - `primus-460` PR：https://github.com/AMD-AGI/Primus-Turbo/pull/460
 - `primus-460` head commit：`0f3972175fdbe3621d5bf67b23f2b15decfccbf3`
-- 当前 fork branch head：`5a8860733570e651d26ff009330b5cf7df91e1cb`
+- 当前已提交的 Quant + K256 kernel code head：`5a8860733570e651d26ff009330b5cf7df91e1cb`
 - GEAK 新 Quant 证据 commit：`b9bf93f4f25365604b6ce38b6e753120e2efc003`
 
 本 branch 以 #460 的 head branch 为 base，不重复包含 #460 本身的 grouped GEMM 调优。
@@ -130,7 +310,10 @@ archived patch 为准，不把尚未出现在 patch 中的二分搜索算作已�
 
 ### 5. Padding 与 K256 回归测试
 
-文件：`tests/pytorch/ops/test_quantization.py`
+涉及文件：
+
+- `tests/pytorch/ops/test_quantization.py`
+- `tests/pytorch/ops/test_grouped_gemm_fp4.py`
 
 新增或保留三类覆盖：
 
@@ -189,32 +372,233 @@ archived patch 为准，不把尚未出现在 patch 中的二分搜索算作已�
 - 该 baseline 已包含 `BM=128`，但仍为 512-aligned colwise padding；因此这轮证据不包含
   K256 `512→256` producer/consumer 合约，也不对应当前 `5a886073` branch head。
 
-## Full-op shape、routing 与统计方法
+## 测试方案：从真实 routing 到可重复的 public-op A/B
 
-- EP1 / G=32；每条 route 的 `total_M=131072`。
-- 使用真实 GPT-OSS-20B 训练 capture 产生的 24 条加权 routing representatives。
-- 每条 route 测试两个 grouped GEMM shape，共 48 个 route×shape cell：
-  - GG1：`N=5760, K=2880`
-  - GG2：`N=2880, K=2880`
-- routing manifest SHA256：`d7c81df6ae0608124baeaad7ad83ed7e9bd8bce6765cc39669721072c6c83693`。
-- 两臂在同一进程内动态绑定 Quant 源文件，public op runtime 和 PR #460 GEMM 保持不变。
-- 每个 cell 先 warmup 1 次，再运行 8 个 ABBA/BAAB 交替 supercycle；每个 block 1 次调用。
-- 正式 A/B 前后各做 2 个独立加载的 baseline A/A supercycle，用于估计同 session 的 99% MDE。
-- CUDA event 计时；按 route 权重汇总 latency。
-- 每个 session 做 10,000 次 stratified paired bootstrap，报告 95% CI。
-- 三个 session 使用独立 seed；最终结果先在 session 内做 route-weighted latency，再对三个 session 等权平均，最后计算 baseline/candidate ratio。
+### 1. 测试目标与分层
 
-K256-only 复测使用相同的 24-route × GG1/GG2 public-op 合同和三个 seed；正式结果来自
-独立 git worktree，runner 在每个 session 前后校验 source SHA，排除了早期 mutable
-workspace 污染的无效轮次。
+本项目不是只测一个孤立的 micro-kernel。验证分成四层，每层回答不同问题：
+
+| 层级 | 回答的问题 | 主要手段 |
+|---|---|---|
+| Layout/metadata 单元测试 | padding、shape、offset 是否严格符合接口契约？ | 精确比较 shape、lens、offs 和 padded-zero |
+| 数值单元测试 | 极端 zero/even/odd span 下，fwd/dgrad/wgrad 是否仍然正确？ | 与 BF16 reference 比较 SNR |
+| 真实 routing public-op correctness | 在 GPT-OSS-20B 的 24 条代表性 routing 和两个生产 shape 上是否正确？ | 48 个 route×shape cell 的 sampled FP32 reference |
+| Paired performance | 收益是否超过同 session 噪声，并能转化为 full-op 收益？ | 同进程 ABBA/BAAB、A/A、bootstrap 和 promotion gates |
+
+这种分层很重要：microbenchmark 变快只能说明某一 kernel 变快；只有公共算子 correctness
+和 paired full-op 同时通过，才能说明优化可以在当前算子边界内安全采用。真实 training
+step transfer 则仍是更外层、尚未完成的第五层。
+
+### 2. 真实 EP1/G32 routing 是怎样得到的
+
+Routing manifest 来自 GPT-OSS-20B 的 Primus 训练 capture：
+
+- model：`gpt-oss-20b`；
+- expert parallel：`EP1`；
+- global/local experts：32/32；
+- router：`topk=4`；
+- capture scope：`gbs32 / mbs4 / initial step0`；
+- source corpus：192 条 routing record，occurrence mass 也是 192；
+- 每条 route 均满足 `sum(group_lens)=total_M=131072`。
+
+测试不是简单挑一条“看起来平均”的 route，而是对每条 routing 计算一组与 kernel 行为直接
+相关、且对 expert 编号置换不敏感的特征：
+
+- 负载不均衡：`max/mean`、coefficient of variation、normalized entropy；
+- 热点集中度：top-1 和 top-4 expert 占比；
+- 小/空 expert：zero expert 数，以及 `<32/<128/<256/<512` 的 expert 数；
+- padding 效率：align-32 和旧 wgrad align-512 efficiency；
+- tile 效率：按 `BLOCK_M=256` 后的 padded M、tile 数和 tail waste。
+
+这些特征被分成 16 个 strata：balance tertile × wgrad-padding 高/低 ×
+regular/tiny-heavy/zero。然后使用 deterministic stratified weighted k-medoids，从 192 条
+记录中选择 24 条 scored representative。每条 representative 的测试权重等于它所代表的
+cluster occurrence mass / 192，24 条权重之和为 1。
+
+Manifest 还保留了 8 条 unweighted stress route，分别针对 zero expert、极小 expert、最大
+padding waste、tile waste、最大 skew 和 entropy deficit 等风险；它们的 timed weight 为 0，
+不进入本文 primary performance score。当前正式 48-cell public-op 结果使用的是 24 条
+scored representative，而不是 8 条 stress route。
+
+必须说明一个限制：这份 capture 只有一个可隔离的 window/data-offset unit，因此 manifest
+状态为 `DEGRADED`，没有形成真正独立的 blind holdout。24 条代表路由能覆盖当前 initial
+step0 corpus 的主要 routing 形态，但不能代替跨 step、跨 window 或跨训练阶段的泛化验证。
+
+### 3. 从 routing matrix 构造 48 个测试 cell
+
+每条代表 route 与 GG1/GG2 两个生产 shape 组合：
+
+```text
+24 routes × 2 shapes = 48 route×shape cells
+```
+
+对每个 cell，harness 构造：
+
+| Tensor | Shape | Datatype | 来源 |
+|---|---|---|---|
+| `a` | `[131072,K]` | BF16 | 固定 seed 的随机值 |
+| `b` | `[32,N,K]` | BF16 | 固定 seed 的随机值 |
+| `grad_out` | `[131072,N]` | BF16 | 固定 seed 的随机值 |
+| `group_lens` | `[32]` | INT64 | 真实 capture 的 pre-padding 长度 |
+| `group_offs` | `[33]` | INT64 | 对真实 `group_lens` 做前缀和 |
+
+两条 A/B arm 使用完全相同的 route、随机 tensor 和 seed。真实的是 routing/shape，数值采用
+随机 BF16：这是因为本优化主要受 shape、padding、tile 和 memory traffic 影响；随机值既能
+稳定复现，也能为 SNR reference 提供非退化数据。它仍不能完全代表训练中 activation 的
+真实分布，因此 stochastic rounding、异常值分布和长期训练收敛还需要 training-step 验证。
+
+`group_lens_pre_padding` 会原样传给 public operator，不在 harness 侧提前变成 32/256/512
+对齐。这样 padding 量、zero expert 和 odd-256 span 都由被测 Quant producer 自己生成，
+测试才能真正覆盖本次优化，而不是只 replay 一个已经处理好的理想输入。
+
+### 4. Public-op correctness：具体比较什么
+
+每个 48-cell correctness case 都分别运行 baseline 和 candidate 的完整：
+
+```text
+grouped_gemm_fp4(a, b, group_lens) → output
+output.backward(grad_out)          → grad_a, grad_b
+```
+
+由于完整 BF16 reference tensor 很大，harness 使用覆盖所有非空 expert 的 sampled reference：
+
+1. 在每个非空 expert 的本地行范围内均匀取样，避免只检查大 expert；
+2. 在 `N`、`K` 维使用跨全维度的均匀 index；
+3. fwd reference 用 FP32 计算 `a[row] @ b[group]^T`；
+4. dgrad reference 用 FP32 计算 `grad_out[row] @ b[group]`；
+5. wgrad reference 针对每个非空 expert 取多个 `(n,k)` 点，计算
+   `dot(grad_out[group_rows,n], a[group_rows,k])`；
+6. 分别计算 fwd、dgrad、wgrad 的 SNR。
+
+SNR 定义为：
+
+```text
+SNR(dB) = 10 × log10(Σ reference² / Σ(reference - observed)²)
+```
+
+Pass 标准是三项 SNR 的最小值不低于 `8 dB`，并且没有任何 Triton fallback。8 dB 看起来
+低于常见 FP8 标准，是因为 E2M1 只有 1 bit mantissa，本身量化误差更大；在现有测试中该
+门限能清楚区分“正常的 FP4 误差”和“layout/offset 已损坏”。K256 正式复测的观测最小值为
+`12.899 dB`，高于门限。
+
+Correctness-only 模式还检查 source selector receipt：除非显式允许，否则 baseline 与
+candidate 的 selector contract 必须一致。每个 cell 记录 route、shape、seed、SNR、backend
+dispatch、selector/config 和 source hash，最终要求 48/48 PASS。
+
+### 5. Quant 与 K256 单元测试
+
+Public-op correctness 用真实 routing 检查“整体是否对”，单元测试则故意构造边界值，定位
+具体接口是否被破坏：
+
+#### 5.1 Batched dual-quant padded-zero
+
+- 输入 shape：`[2,N,K]` BF16；
+- case：`(N,K)=(64,192)` 与 `(192,64)`，分别触发 row K-tail 和 col N-tail；
+- 做法：将 rowwise/colwise FP4 反量化，与显式补零后的 BF16 reference 比较；
+- 目的：证明 `torch.empty + selective zero_` 没有把未初始化 padding 暴露给 GEMM。
+
+#### 5.2 Grouped colwise metadata
+
+- `group_lens=[0,1,255,256,257,511,512,513]`；
+- 精确检查 `col_lens = ceil(group_lens/256)×256`；
+- 精确检查 `[G+1]` col offsets、rowwise tight offsets 和输出 storage shape；
+- 目的：同时覆盖 zero、边界前一行、正好对齐和跨边界一行。
+
+#### 5.3 Zero/even/odd wgrad end-to-end
+
+- `group_lens=[0,1,255,257,511,513]`，`N=K=256`；
+- 完整运行 `grouped_gemm_fp4` forward + backward；
+- 与 BF16 grouped GEMM reference 比较 output、`a.grad`、非空 expert 的 `b.grad`；
+- 三项均要求 `SNR > 8 dB`；
+- 目的：直接触发 wgrad runtime 的 zero、偶数 pair 和 odd-256 tail。
+
+此外，既有 MXFP4 suite 还覆盖 BF16/FP16、balanced/unbalanced group、多个 G/M/N/K、N/K
+不是 128 倍数但仍为 32 倍数的 padded contraction，以及 pre-quantized tensor 路径。报告中
+的 `130 passed` 是这组 dual-quant 回归，新增 K256/metadata 定向测试为 `4 passed`。
+
+### 6. Paired performance 协议
+
+性能测试的原则是只让目标 source boundary 变化，并尽量消除 session drift：
+
+1. **同进程动态绑定。** Public `grouped_gemm_fp4` 与 dispatcher 只从 baseline tree 导入
+   一次；baseline/candidate 仅动态替换四个 canonical FlyDSL module。Public runtime 文件
+   必须 hash 相同。
+2. **相同输入。** 同一个 cell 的两臂共享 route、shape、tensor 和 seed。
+3. **固定 backend。** 强制 FlyDSL、关闭 autotune，并检查所有 fwd/dgrad/wgrad dispatch；
+   fallback 次数必须为 0。
+4. **预热。** 每个 source bundle 先运行 1 次完整 public op，确保 compile/config cache 已建立；
+   正式计时区间内不允许 cache 增长，即不允许把 JIT 成本混入或只让某一臂承担。
+5. **交替顺序。** 主测试运行 8 个 supercycle，依次使用 ABBA、BAAB；每个位置调用 1 次。
+   每个 cycle 中同一 arm 出现两次，先取 geometric mean，再形成 paired ratio。
+6. **同 session A/A。** 正式 A/B 前后各运行 2 个 baseline-vs-fresh-baseline supercycle，
+   用独立加载的 baseline duplicate 估算当次 session 的 99% minimum detectable effect。
+7. **重复 session。** 使用 `20260811/20261811/20262811` 三个独立 seed 各跑一轮；先在
+   session 内按 workload weight 聚合，再对三个 session 等权汇总。
+
+PhaseRecorder 用 CUDA event 分别包围 activation/weight/grad Quant、fwd backend、dgrad
+backend 和 wgrad backend，并用最外层 event 记录 full-op。因此 phase latency 适合解释收益
+来源，而 full-op latency 是 promotion 的最终算子指标。各 phase 相加可能与 full-op 略有
+差异，因为 full-op 还包含 phase wrapper 外的 tail-zero、workspace、dispatch 和空隙。
+
+### 7. 聚合与统计方法
+
+Primary score 不是 48 个 speedup 的简单平均，而是 workload-weighted latency ratio：
+
+```text
+speedup = Σ(weight_i × baseline_latency_i)
+          / Σ(weight_i × candidate_latency_i)
+```
+
+每条 route 的权重来自它代表的 corpus occurrence mass；GG1/GG2 平分该 route 的权重。
+每个 phase 使用 stratified paired bootstrap 重新采样每个 cell 的 paired cycle，执行 10,000
+次，报告 95% confidence interval。这样既保留 route 权重，也不会让高方差 cell 因为样本
+更多而获得额外权重。
+
+同 session A/A 的 paired log-ratio 使用 median/MAD 计算 robust MDE99。这里的 MDE99 可以
+通俗理解为“本次机器和 session 的噪声至少会制造多大的假收益”；candidate 的 point gain
+必须大于它，才认为收益不只是计时抖动。
+
+### 8. Promotion gates
+
+正式 full-op 结论必须同时通过以下门禁：
+
+| Gate | 标准 | 防止的问题 |
+|---|---|---|
+| Sampled correctness | 48 cells 的 fwd/dgrad/wgrad SNR 均达标 | 数值或 layout 错误 |
+| Zero fallback | correctness 和计时阶段均为 0 fallback | 实际跑到另一 backend |
+| Timed cache stable | 正式计时前后 cache 无变化 | JIT/autotune 污染时间 |
+| Selector contract | selector receipt 符合实验约束 | 两臂使用不同 GEMM 配置 |
+| Source receipt | canonical module SHA 和 public runtime SHA 完整 | 测错源码或 mutable workspace 污染 |
+| Route floor | 每条 route 的 full-op ≥ `0.97x` | 平均收益掩盖严重回退 |
+| Confidence | full-op 95% CI 下界 > `1.0` | 统计上不能确认收益 |
+| Noise floor | point gain > 同 session MDE99 | 收益低于测量分辨率 |
+
+Quant-only 与 K256-only 的三次正式 session 均通过上述门禁。K256-only 复测来自独立 git
+worktree，runner 在 session 前后校验 source SHA，排除了早期 mutable workspace 污染的
+无效轮次。
 
 GEAK stacked Quant 使用同样的 24 个 trace hash 和 GG1/GG2 两个 shape，形成 48-case
-Quant kernel 表；其 headline metric 是按 workload time weight 计算的 ratio-of-sums，另报
-unweighted geomean 与 arithmetic mean。它经历 4 个 round、共 8 个方向，最终 `r4_d0`
-被标记为 VERIFIED winner。这套统计边界与上面的三 session public full-op paired A/B
-不同，不能把两者的 gate 或聚合方式混写。
+Quant kernel 表；其 headline metric 是 workload time-weighted ratio-of-sums，另报
+unweighted geomean 与 arithmetic mean。它经历 4 个 round、8 个方向，最终 `r4_d0` 被
+标记为 VERIFIED winner。这是 Quant kernel-only 验证，统计边界不同于上面的三 session
+public full-op paired A/B，不能混用两者的 gate 或直接推导 full-op 收益。
 
-有效性门禁包括：sampled correctness、full-op CI 下界大于 1、收益大于同 session MDE99、每条 route 不低于 0.97x、零 fallback、计时 cache 稳定、selector contract 一致以及 source-selector receipt 完整。三次 session 的全部八项门禁均通过。
+### 9. 当前覆盖范围与有效性边界
+
+当前方案较强的地方是：使用真实 routing、覆盖两个生产 shape、完整执行 forward/backward、
+同进程 paired A/B，并把 correctness、backend、selector、cache、source hash 和统计显著性
+都纳入 promotion gate。
+
+仍然没有覆盖：
+
+- 真实 activation/gradient 的数值分布与长期 stochastic-rounding 行为；
+- initial step0 之外的 routing 漂移，以及独立 blind holdout；
+- EP8/G4 或其他 expert-parallel 配置；
+- 其他 GPU、ROCm/FlyDSL 版本和 selector 配置；
+- 通信、router、SwiGLU、其他 layer 和 optimizer 共同作用下的真实 training-step time。
+
+因此本文可以回答“当前 EP1/G32 public MXFP4 grouped linear 是否正确、是否变快”，不能单独
+回答“完整 GPT-OSS-20B 训练是否按相同比例变快”。
 
 ## Quant-only 原始性能数据
 
