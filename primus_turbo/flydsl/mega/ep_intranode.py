@@ -397,6 +397,8 @@ def combine_dedup_bf16_tile(
     bank_offset: Optional[fx.Int32] = None,
     with_gate: bool = False,
     npass: int = 2,
+    row_start: Optional[fx.Int32] = None,
+    row_count: Optional[fx.Int32] = None,
 ):
     # DeepEP-style sender dedup: the highest pool row of a source token folds every
     # local route of that token into one weighted row and pushes it to the primary
@@ -417,8 +419,17 @@ def combine_dedup_bf16_tile(
     oob_slot = fx.Int32(n_slots)
 
     dst_rank = buffer_load(recv_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
-    start_row = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
-    count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+    # Callers that slice one segment across blocks pass the sub-range directly.
+    start_row = (
+        buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
+        if row_start is None
+        else row_start
+    )
+    count = (
+        buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+        if row_count is None
+        else row_count
+    )
     # hoist workspace-derived values before the dynamic loop (rewriter can't carry Workspace)
     comb_addr = sym.map(workspace.get_combine_token_buffer_ptr(), dst_rank)
     gate_addr = sym.map(workspace.get_combine_gate_ptr(), dst_rank) if with_gate else None

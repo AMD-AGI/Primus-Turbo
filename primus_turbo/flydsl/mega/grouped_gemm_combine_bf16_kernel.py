@@ -37,10 +37,6 @@ from primus_turbo.flydsl.mega.symm_buffer import (
     Workspace,
     get_symm_buffer_for_mega_moe,
 )
-from primus_turbo.flydsl.mega.tune_utils import (
-    Config,
-    autotune,
-)
 from primus_turbo.flydsl.utils.gemm_helper import (
     make_bf16_fp16_tile_tensor,
     make_value_attrs,
@@ -63,8 +59,41 @@ _NUM_REDUCE_BLOCKS = 2048
 _COMBINE_FLAG_SCOPE = "sys"
 _COMBINE_GATE_SLEEP = 32
 
+# Lead GEMM blocks placed BEFORE the combine region in the grid. Workgroups are
+# dispatched in block order and 128 KB of LDS pins occupancy at 1 WG/CU, so a
+# combine region at ordinal 0 parks CUs in the gate spin before any tile exists.
+# Putting one full machine's worth of GEMM tiles first lets the GEMM open at the
+# full 256 CUs; the combine blocks land as those retire, with data already there.
+# Must be a multiple of 8 (the XCD residue the rect tile map is affine to), and it
+# is pinned per layout alongside the block count below.
+
+# Sub-segment tickets. A block cannot push a segment before the GEMM has produced
+# every tile it spans, so a coarse atom drawn just after a tile release is dead
+# wall time. Slicing each segment into _COMBINE_SEG_PARTS pieces, round-robined
+# across blocks, spreads each release burst over more CUs. 4 is the optimum: 8 and
+# a 16-way split of just the tail segments both lose to the per-task floor.
+_COMBINE_SEG_PARTS = 4
+
 # Traversal order inside the rectangle tile map: 2 rows at a time, column-minor.
 _RECT_P = 2
+
+# TEMPORARY: autotune replaced by a per-layout pin. nt/nn from the 2026-08-17
+# corrected both-directions sweep (nt plateau 56-64, cliff at 72; nn sharp at 32).
+# combine only ever runs nt (fwd) and nn (bwd dgrad) -- tn mirrors nn, unswept.
+# These counts are NOT "enough CUs to fill the link" -- the dedup push tops out near
+# 13 GB/s per CU (gather-reduce over scattered member rows into slot-scattered
+# destinations), vs ~45 GB/s per CU for dispatch's contiguous copy. Standalone push
+# scaling: 16 CU 211 GB/s, 32 CU 315, 64 CU 360, 128 CU 367. So 32 is already on the
+# steep part of the curve, traded against leaving the GEMM its CUs; halving it to 16
+# costs far more than the 16 CUs are worth (nn 3.68 -> 4.74 ms).
+_PINNED_CONFIG = {
+    "nt": {"num_combine_blocks": 64, "lead_gemm_blocks": 1024},
+    "nn": {"num_combine_blocks": 32, "lead_gemm_blocks": 2048},
+    "tn": {"num_combine_blocks": 32, "lead_gemm_blocks": 2048},
+}
+# Reserved combine region: kept at the old sweep's widest split so pinning does
+# not move the role boundary or the grid shape.
+_WIDEST_COMBINE_BLOCKS = 128
 
 
 @functools.lru_cache(maxsize=8)
@@ -91,6 +120,8 @@ def _make_grouped_gemm_combine(
     apply_weights=False,
     with_gate=False,
     dedup_npass=2,
+    seg_parts=1,
+    lead_gemm_blocks=0,
 ):
     K = hidden_size
     gemm_tile = functools.partial(gemm_bf16_tile, layout)
@@ -108,12 +139,12 @@ def _make_grouped_gemm_combine(
     # kernel; the unused combine blocks exit immediately. The boundary is rounded up to a
     # multiple of the XCD count so that gemm_tile_index = block_index - boundary keeps the
     # block_index % 8 residue the rectangle tile map is affine to.
-    widest_blocks = max(
-        config.kwargs["num_combine_blocks"] for config in _compiled_grouped_gemm_combine.configs
-    )
-    num_max_combine_blocks = (widest_blocks + 7) // 8 * 8
+    num_max_combine_blocks = (_WIDEST_COMBINE_BLOCKS + 7) // 8 * 8
     # Rectangular XCD-affine tile map; needs n_blocks divisible by 4.
     use_rect = bool(n_blocks) and n_blocks % 4 == 0
+    num_tasks = num_experts * seg_parts
+    # Never lead with more tiles than exist, and keep the XCD residue intact.
+    lead_blocks = min(lead_gemm_blocks, worst_case_tiles * n_blocks) // 8 * 8
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -142,6 +173,20 @@ def _make_grouped_gemm_combine(
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
+        # Rotate the dispatch order back into the old [combine | gemm] ordinal space:
+        # ordinals 0..lead_blocks-1 of the grid are GEMM tiles, the combine region
+        # follows them, then the GEMM resumes. lead_blocks and num_max_combine_blocks
+        # are both multiples of 8, so gemm_tile_index keeps its block_index % 8 residue.
+        if lead_blocks:
+            block_index = fx.arith.select(
+                block_index < fx.Int32(lead_blocks),
+                block_index + fx.Int32(num_max_combine_blocks),
+                fx.arith.select(
+                    block_index < fx.Int32(lead_blocks + num_max_combine_blocks),
+                    block_index - fx.Int32(lead_blocks),
+                    block_index,
+                ),
+            )
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         # Only the reserved combine blocks exist; a wider split would corrupt the role
         # boundary. Clamped here (not host-side) because the split is a runtime value.
@@ -202,14 +247,22 @@ def _make_grouped_gemm_combine(
                     key_row_res = create_buffer_resource(DEDUP_KEY_ROW, max_size=True)
                     grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
                     seg_local = (
-                        fx.Int32(num_experts) - block_index + num_combine_blocks - fx.Int32(1)
+                        fx.Int32(num_tasks) - block_index + num_combine_blocks - fx.Int32(1)
                     ) // num_combine_blocks
                     # Cursor rides seg_iter so each tile is polled once.
                     combine_cursor = fx.Int32(0)
                     for seg_iter in range(seg_local):
                         task_index = block_index + seg_iter * num_combine_blocks
-                        seg_start = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
-                        seg_count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+                        seg_index = task_index // fx.Int32(seg_parts)
+                        seg_part = task_index % fx.Int32(seg_parts)
+                        full_start = buffer_load(recv_start_row_res, seg_index, vec_width=1, dtype=fx.T.i32())
+                        full_count = buffer_load(recv_count_res, seg_index, vec_width=1, dtype=fx.T.i32())
+                        # Even row split; the last part absorbs the shorter remainder.
+                        part_rows = (full_count + fx.Int32(seg_parts - 1)) // fx.Int32(seg_parts)
+                        part_off = seg_part * part_rows
+                        seg_start = full_start + part_off
+                        part_rest = full_count - part_off
+                        seg_count = fx.arith.select(part_rest < part_rows, part_rest, part_rows)
                         if seg_count > fx.Int32(0):
                             t1 = (seg_start + seg_count - fx.Int32(1)) // fx.Int32(BLOCK_M)
                             tile_cursor = combine_cursor
@@ -240,7 +293,9 @@ def _make_grouped_gemm_combine(
                                 sym_buffer,
                                 workspace,
                                 thread_index=thread_index,
-                                task_index=task_index,
+                                task_index=seg_index,
+                                row_start=seg_start,
+                                row_count=seg_count,
                                 recv_dst_rank_res=recv_dst_rank_res,
                                 recv_start_row_res=recv_start_row_res,
                                 recv_count_res=recv_count_res,
@@ -423,26 +478,6 @@ def _make_epoch_bump(add_combine, add_reduce):
     return epoch_bump_kernel
 
 
-@autotune(
-    configs=[Config(num_combine_blocks=nb) for nb in (16, 24, 32, 40, 48, 56, 64, 96, 128)],
-    # layout_code MUST be a key: nt/nn have opposite num_combine_blocks optima.
-    key=[
-        "out_features",
-        "hidden_size",
-        "num_max_pool_tokens",
-        "BLOCK_M",
-        "BLOCK_N",
-        "num_combine_slots",
-        "topk",
-        "num_experts",
-        "rank",
-        "layout_code",
-        "apply_weights",
-        "with_gate",
-        "out_fp16",
-    ],
-    rep=5,
-)
 @flyc.jit
 def _compiled_grouped_gemm_combine(
     ACT,
@@ -483,6 +518,8 @@ def _compiled_grouped_gemm_combine(
     with_gate: fx.Constexpr[bool],
     out_fp16: fx.Constexpr[bool],
     dedup_npass: fx.Constexpr[int],
+    seg_parts: fx.Constexpr[int],
+    lead_gemm_blocks: fx.Constexpr[int],
     stream: fx.Stream,
     nt_vmcnt: fx.Constexpr[int] = 3,
     agpr_alloc: fx.Constexpr[int] = 0,
@@ -506,6 +543,8 @@ def _compiled_grouped_gemm_combine(
         apply_weights,
         with_gate,
         dedup_npass,
+        seg_parts,
+        lead_gemm_blocks,
     )
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
@@ -637,6 +676,7 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         source_slot_kind,
         sym_buffer,
         c_n,
+        num_combine_blocks=int(_PINNED_CONFIG[layout]["num_combine_blocks"]),
         COMBINE_PARITY=symm._combine_parity,
         COMBINE_EXPECTED=symm._combine_expected,
         REDUCE_EXPECTED=symm._reduce_expected,
@@ -656,6 +696,8 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         with_gate=bool(with_gate),
         out_fp16=False,
         dedup_npass=int(_COMBINE_DEDUP_NPASS),
+        seg_parts=int(_COMBINE_SEG_PARTS),
+        lead_gemm_blocks=int(_PINNED_CONFIG[layout]["lead_gemm_blocks"]),
         stream=torch.cuda.current_stream(),
     )
     return output, d_topk_w
