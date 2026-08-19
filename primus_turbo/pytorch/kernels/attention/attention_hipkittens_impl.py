@@ -9,7 +9,7 @@
 The same position in the stack as ``attention_aiter_impl`` / ``attention_flydsl_impl``:
 plain forward and backward entry points over the backend's own code, with dispatch and
 autograd wiring left to the caller. The kernels and everything specific to them live under
-``primus_turbo.hipkittens.attention.gfx950``; this module is what the dispatcher imports.
+``primus_turbo.hipkittens.attention``; this module is what the dispatcher imports.
 
 Everything here is a thin pass-through, so the eligibility rules and the padding stay in one
 place rather than being restated at the dispatcher.
@@ -27,15 +27,15 @@ __all__ = [
 
 
 def _layer():
-    """The gfx950 layer, imported lazily.
+    """The HipKittens attention layer, imported lazily.
 
-    The ops themselves are always present -- they are built into _C in every arch
-    configuration and guarded on __gfx950__ inside the kernel -- so this import cannot fail
-    for want of a build. It stays lazy only to keep the dispatcher's import graph shallow.
+    Pure Python, so the import itself cannot fail for want of a build -- the kernels it
+    drives can be absent, which is what hipkittens_attn_supported reports. It stays lazy only
+    to keep the dispatcher's import graph shallow.
     """
-    from primus_turbo.hipkittens.attention import gfx950
+    from primus_turbo.hipkittens import attention
 
-    return gfx950
+    return attention
 
 
 def hipkittens_attn_supported_impl(

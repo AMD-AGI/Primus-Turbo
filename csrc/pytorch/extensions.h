@@ -404,6 +404,8 @@ void register_odc_rocshmem_gda(pybind11::module_ &m);
 //==================================================================
 //  HipKittens attention (gfx950)
 //==================================================================
+// Only present when the *_gfx950.cu kernels were built; see setup.py.
+#ifdef BUILD_HIPKITTENS_BACKEND
 
 void hk_attn_fwd_d64(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at::Tensor &o,
                      at::Tensor &lse, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq, int64_t Hkv,
@@ -443,5 +445,7 @@ int64_t hk_attn_dkdv_head_split(int64_t head_dim, int64_t Sq, int64_t Skv, int64
                                 int64_t Hkv, int64_t window_left);
 
 std::vector<int64_t> hk_attn_block_sizes(int64_t head_dim);
+
+#endif // BUILD_HIPKITTENS_BACKEND
 
 } // namespace primus_turbo::pytorch

@@ -843,7 +843,7 @@ def _hk_ref(q, k, v, window_left, scale):
 
 
 def _run_hk_case(Sq, Skv, B, Hq, Hkv, D, window_left, bar=40.0):
-    from primus_turbo.hipkittens.attention.gfx950 import (
+    from primus_turbo.hipkittens.attention import (
         hipkittens_attn_backward,
         hipkittens_attn_forward,
     )
@@ -895,7 +895,7 @@ def test_attention_hipkittens_deterministic():
     Constructive rather than hopeful: one workgroup owns each output tile, there are no float
     atomics, and the split-K partials are folded in a fixed band order.
     """
-    from primus_turbo.hipkittens.attention.gfx950 import (
+    from primus_turbo.hipkittens.attention import (
         hipkittens_attn_backward,
         hipkittens_attn_forward,
     )
@@ -940,7 +940,7 @@ def test_attention_hipkittens_envelope(case, needle):
     because the kernels declare gl<bf16, ...>, and Sq > Skv leaves the leading Sq - Skv query
     rows -- which attend to no key at all -- unwritten by the forward.
     """
-    from primus_turbo.hipkittens.attention.gfx950 import hipkittens_attn_supported
+    from primus_turbo.hipkittens.attention import hipkittens_attn_supported
 
     dtype = torch.float16 if case == "fp16" else torch.bfloat16
     D = 32 if case == "head_dim" else 64

@@ -9,10 +9,14 @@
 // Only the argument marshalling lives here; the schemas and the dispatcher registrations are in
 // bindings_pytorch.cpp with every other op, and the declarations in extensions.h.
 //
-// The kernels behind these are compiled in every arch configuration but do nothing off gfx950 --
-// each body sits behind `#if !defined(__gfx950__)` and asserts. Reaching them on another card is
-// a caller bug: primus_turbo/hipkittens/attention/gfx950/ refuses a non-gfx950 device, along with
-// the rest of the envelope these kernels admit.
+// The kernels behind these are named *_gfx950.cu, so a build whose offload archs leave out gfx950
+// has none of them and this file would reference symbols nothing defined -- hence the same guard
+// setup.py puts on their compilation. Where they are built, one object covers every arch and the
+// non-gfx950 passes are an assert-and-return, so reaching them on another card is a caller bug:
+// primus_turbo/hipkittens/attention/ refuses a non-gfx950 device, along with the rest of the
+// envelope these kernels admit.
+
+#ifdef BUILD_HIPKITTENS_BACKEND
 
 #include "../extensions.h"
 #include "primus_turbo/hipkittens/attention.h"
@@ -145,3 +149,5 @@ std::vector<int64_t> hk_attn_block_sizes(int64_t head_dim) {
 }
 
 } // namespace primus_turbo::pytorch
+
+#endif // BUILD_HIPKITTENS_BACKEND

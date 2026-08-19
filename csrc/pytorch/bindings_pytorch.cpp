@@ -132,9 +132,12 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("grouped_gemm_compute_offs(Tensor group_lens) -> Tensor");
 
     // ********* HipKittens attention (gfx950) *********
-    // Built into every arch configuration but only functional on gfx950 -- the kernel bodies
-    // are guarded on __gfx950__ and the Python layer refuses any other device before launch.
-    // The kernels write through their outputs, so these are mutating and return nothing.
+    // Registered only where the *_gfx950.cu kernels were built, i.e. where gfx950 is among the
+    // offload archs; hipkittens_attn_supported reports their absence rather than letting the op
+    // lookup fail. Even then they are only functional ON gfx950 -- the kernel bodies are guarded
+    // on __gfx950__ and the Python layer refuses any other device before launch. The kernels
+    // write through their outputs, so these are mutating and return nothing.
+#ifdef BUILD_HIPKITTENS_BACKEND
     m.def("hk_attn_fwd_d64(Tensor q, Tensor k, Tensor v, Tensor(a!) o, Tensor(b!) lse, int Sq, "
           "int Skv, int B, int Hq, int Hkv, int window_left, float softmax_scale) -> ()");
     m.def("hk_attn_fwd_d128(Tensor q, Tensor k, Tensor v, Tensor(a!) o, Tensor(b!) lse, int Sq, "
@@ -158,6 +161,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("hk_attn_dkdv_head_split(int head_dim, int Sq, int Skv, int B, int Hq, int Hkv, "
           "int window_left) -> int");
     m.def("hk_attn_block_sizes(int head_dim) -> int[]");
+#endif // BUILD_HIPKITTENS_BACKEND
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
@@ -210,12 +214,14 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("hipblaslt_grouped_gemm_fp8", hipblaslt_grouped_gemm_fp8);
 
     // ********* HipKittens attention (gfx950) *********
+#ifdef BUILD_HIPKITTENS_BACKEND
     m.impl("hk_attn_fwd_d64", hk_attn_fwd_d64);
     m.impl("hk_attn_fwd_d128", hk_attn_fwd_d128);
     m.impl("hk_attn_bwd_d64", hk_attn_bwd_d64);
     m.impl("hk_attn_bwd_d128", hk_attn_bwd_d128);
     m.impl("hk_attn_bwd_fused_d64", hk_attn_bwd_fused_d64);
     m.impl("hk_attn_bwd_fused_d128", hk_attn_bwd_fused_d128);
+#endif // BUILD_HIPKITTENS_BACKEND
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
@@ -328,10 +334,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 // Shape-only HipKittens queries: no tensors, so they answer the same on any device and do not
 // belong on a device-specific key.
+#ifdef BUILD_HIPKITTENS_BACKEND
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CompositeExplicitAutograd, m) {
     m.impl("hk_attn_dkdv_head_split", hk_attn_dkdv_head_split);
     m.impl("hk_attn_block_sizes", hk_attn_block_sizes);
 }
+#endif // BUILD_HIPKITTENS_BACKEND
 
 /********************************************/
 

@@ -344,13 +344,22 @@ def get_common_flags():
         nvcc_flags.append("-DBUILD_CK_BACKEND")
 
     # HipKittens selects its architecture family from this define, and its attention kernels
-    # are written against CDNA4. They are compiled in EVERY arch configuration: each kernel
-    # body sits behind `#if !defined(__gfx950__)`, which is a per-device-pass macro, so the
-    # gfx942 pass gets an assert-and-return and emits none of the gfx950-only atoms. Without
-    # that guard the gfx942 pass fails on
-    # '__builtin_amdgcn_mfma_f32_16x16x32_bf16 needs target feature gfx950-insts'.
+    # are written against CDNA4.
     cxx_flags.append("-DKITTENS_CDNA4")
     nvcc_flags.append("-DKITTENS_CDNA4")
+
+    # Those kernels are named *_gfx950.cu, so filter_files_by_arch drops them from a build whose
+    # offload archs leave gfx950 out. Their torch entry points are ordinary .cpp and would still
+    # compile, referencing symbols nothing defined, so this gates those on the same condition.
+    #
+    # Where the kernels ARE built, one object covers every arch in the list and each body sits
+    # behind `#if !defined(__gfx950__)` -- a per-device-pass macro, so the gfx942 pass of a
+    # gfx942+gfx950 build becomes an assert-and-return and emits none of the gfx950-only atoms.
+    # Without that guard it fails on
+    # '__builtin_amdgcn_mfma_f32_16x16x32_bf16 needs target feature gfx950-insts'.
+    if "--offload-arch=gfx950" in offload_arch_list:
+        cxx_flags.append("-DBUILD_HIPKITTENS_BACKEND")
+        nvcc_flags.append("-DBUILD_HIPKITTENS_BACKEND")
 
     # Max Jobs
     max_jobs = int(os.getenv("MAX_JOBS", "64"))

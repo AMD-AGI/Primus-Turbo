@@ -9,11 +9,13 @@
 """HipKittens flash attention for gfx950 (MI355X), forward and backward.
 
 The kernels are compiled into ``primus_turbo.pytorch._C`` like every other turbo kernel and
-reached through ``torch.ops.primus_turbo_cpp_extension.hk_attn_*``. They are built in every
-arch configuration but each body is guarded on ``__gfx950__``, so on any other card they
-compile to an assert-and-return; nothing in the build stops them being called, which is what
-this module is for. It checks the envelope, pads the sequence axes to the tile sizes the
-kernels report, and owns every workspace allocation.
+reached through ``torch.ops.primus_turbo_cpp_extension.hk_attn_*``. Their sources carry the
+``_gfx950`` suffix, so the build leaves them out entirely unless gfx950 is among the offload
+archs; a build that does include them compiles one object for every arch in the list, and
+each body is guarded on ``__gfx950__`` so the other passes emit an assert-and-return. Neither
+the build nor the guard stops a wrong call being made, which is what this module is for. It
+checks the envelope, pads the sequence axes to the tile sizes the kernels report, and owns
+every workspace allocation.
 
 WHAT THESE KERNELS ADMIT, all enforced by :func:`hipkittens_attn_supported`:
 
@@ -67,14 +69,22 @@ _DKDV_SPLIT_VALUES = {64: (1, 2, 4, 8), 128: (1, 2, 4, 5, 8)}
 
 
 def _ops():
-    """The op namespace. These are ordinary primus_turbo_cpp_extension ops.
-
-    The kernels are compiled into every arch configuration -- each body is guarded on
-    __gfx950__ and asserts on any other device pass -- so there is no separate extension to
-    import and no build in which these ops are absent. What keeps them off the wrong card is
-    the is_gfx950() check in hipkittens_attn_supported, not the build.
-    """
+    """The op namespace. These are ordinary primus_turbo_cpp_extension ops -- there is no
+    separate extension to import."""
     return torch.ops.primus_turbo_cpp_extension
+
+
+@functools.lru_cache(maxsize=None)
+def _ops_built() -> bool:
+    """Whether this build carries the kernels at all.
+
+    The sources are named _gfx950.cu, so a build whose offload archs exclude gfx950 drops
+    them and the ops never get registered. On such a build every entry point has to refuse
+    before it touches torch.ops, or the caller gets an AttributeError from the op lookup
+    instead of an answer. is_gfx950() does not cover this: it reads the card, and a gfx942
+    build can be run on a gfx950 one.
+    """
+    return hasattr(_ops(), "hk_attn_fwd_d64")
 
 
 @functools.lru_cache(maxsize=None)
@@ -132,6 +142,8 @@ def hipkittens_attn_supported(
     """
     if not (torch.cuda.is_available() and is_gfx950()):
         return False, "hipkittens attention is gfx950-only"
+    if not _ops_built():
+        return False, "hipkittens attention was not built (gfx950 is not among the offload archs)"
     if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16 or v.dtype is not torch.bfloat16:
         # The kernels declare gl<bf16, ...>, so any other 16-bit dtype is reinterpreted
         # bit-for-bit rather than converted or rejected -- garbage with no error.
