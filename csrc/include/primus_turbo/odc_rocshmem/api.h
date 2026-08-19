@@ -1,18 +1,19 @@
-// Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-
-// Kernel-level API for the ODC rocSHMEM distributed backends.
-//
-// Declares the single-node host-API surface and the multi-node GPU-Direct Async
-// (GDA) surface (host launchers for the device gather / reduce-scatter kernels).
-// The implementations live in csrc/kernels/odc_rocshmem/ and are compiled into
-// libprimus_turbo_kernels.so (which links rocSHMEM); the pytorch/jax bindings only
-// include this header and link the kernels library, so they need no rocSHMEM
-// include/link flags themselves (mirrors DeepEP's csrc/include .. api.h split).
-//
-// Only plain scalar / pointer types cross this boundary (no rocSHMEM, HIP-device,
-// or torch types), so the header is safe to include from a rocSHMEM-agnostic TU.
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ * Kernel-level API for the ODC rocSHMEM distributed backends.
+ *
+ * Declares the single-node host-API surface and the multi-node GPU-Direct Async
+ * (GDA) surface (host launchers for the device gather / reduce-scatter kernels).
+ * The implementations live in csrc/kernels/odc_rocshmem/ and are compiled into
+ * libprimus_turbo_kernels.so (which links rocSHMEM); the pytorch/jax bindings only
+ * include this header and link the kernels library, so they need no rocSHMEM
+ * include/link flags themselves (mirrors DeepEP's csrc/include .. api.h split).
+ *
+ * Only plain scalar / pointer types cross this boundary (no rocSHMEM, HIP-device,
+ * or torch types), so the header is safe to include from a rocSHMEM-agnostic TU.
+ **************************************************************************************************/
 
 #pragma once
 

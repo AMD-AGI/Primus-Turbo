@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Multi-backend selection for DeepSeek-V4 single-latent sparse-MLA attention.
 
 Mirrors the flash-attn layer (``attention_impl.py``), down to resolving the backend once

@@ -1,8 +1,10 @@
-// Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-//
-// Batched 2D transpose of the last two dims, for arbitrary element dtype.
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ *
+ * Batched 2D transpose of the last two dims, for arbitrary element dtype.
+ **************************************************************************************************/
 
 #include "primus_turbo/common.h"
 #include "primus_turbo/transpose.h"

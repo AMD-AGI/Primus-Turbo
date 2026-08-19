@@ -4,7 +4,7 @@
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2025 FlyDSL Project Contributors
 #
-# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL) (kernels/gemm/).
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
 # Modified by the Primus-Turbo team.
 #
 # This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),

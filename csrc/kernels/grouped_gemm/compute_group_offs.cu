@@ -1,10 +1,11 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-
-// Standalone, CK-free implementation of compute_group_offs. This is the single definition
-// of the kernel and is always built, regardless of which GEMM backends are enabled, so the
-// symbol is available to both CK and non-CK host bindings.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ * Standalone, CK-free implementation of compute_group_offs. This is the single definition
+ * of the kernel and is always built, regardless of which GEMM backends are enabled, so the
+ * symbol is available to both CK and non-CK host bindings.
+ **************************************************************************************************/
 
 #include <cstdint>
 #include <hip/hip_runtime.h>

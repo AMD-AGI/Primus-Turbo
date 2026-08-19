@@ -4,12 +4,13 @@
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2025 FlyDSL Project Contributors
 #
-# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL) (kernels/gemm/).
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
 # Modified by the Primus-Turbo team.
 #
 # This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
+
 """FlyDSL MXFP4 (per-32-K E8M0 block-scaled) grouped GEMM for gfx950 (NT fwd/dgrad).
 
 A [total_M, K] fp4 (groups along M), B [G, N, K] fp4, out [total_M, N] bf16;

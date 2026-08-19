@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Shared JAX batching rules for running Primus-Turbo primitives under
 MaxText pipeline parallelism.
 

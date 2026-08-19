@@ -1,33 +1,42 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// SPDX-License-Identifier: MIT
-//
-// Vendored work-stealing variant of ck_tile::GroupedGemmKernel. Inherits all
-// host-side machinery (BlockSize, MakeKargs, IsSupportedArgument, ...) and
-// the device-side per-tile compute (Run) from the upstream kernel; replaces
-// the persistent operator() with an atomicAdd-based tile claim.
-//
-// Source: 3rdparty/composable_kernel/include/ck_tile/ops/gemm/kernel/grouped_gemm_kernel.hpp
-// (specifically the persistent `operator()` at lines 540-573).
-//
-// The static-stride persistent loop (block_id += grid_size) gives no
-// straggler tolerance: when one CU is preempted by RCCL, the kernel waits
-// for it to grind through its full quota of tiles. The work-stealing variant
-// has each CU claim the next tile via atomicAdd, so faster CUs absorb work
-// that slow CUs would otherwise have done.
-//
-// Counter layout (caller-allocated int32 buffer of size NUM_XCDS_WS + 2):
-//   [0..NUM_XCDS_WS-1] : per-XCD slots
-//   [NUM_XCDS_WS]      : global slot
-//   [NUM_XCDS_WS + 1]  : done slot (last-out CTA detection for self-reset)
-// `local_per_xcd` selects the mode:
-//   = 0                                : global-only (phase 1 empty)
-//   = ceil(total_tiles / NUM_XCDS_WS)  : per-XCD-only (phase 2 empty)
-//   = anything in-between              : hierarchical (some local + global tail)
-//
-// Self-reset: the kernel guarantees the entire counter buffer is back to 0
-// before it exits. The last CTA out (detected via atomicAdd on the done slot)
-// writes zeros to all slots. Stream ordering then makes those zeros visible
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
+
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ * Vendored work-stealing variant of ck_tile::GroupedGemmKernel. Inherits all
+ * host-side machinery (BlockSize, MakeKargs, IsSupportedArgument, ...) and
+ * the device-side per-tile compute (Run) from the upstream kernel; replaces
+ * the persistent operator() with an atomicAdd-based tile claim.
+ *
+ * Source: 3rdparty/composable_kernel/include/ck_tile/ops/gemm/kernel/grouped_gemm_kernel.hpp
+ * (specifically the persistent `operator()` at lines 540-573).
+ *
+ * The static-stride persistent loop (block_id += grid_size) gives no
+ * straggler tolerance: when one CU is preempted by RCCL, the kernel waits
+ * for it to grind through its full quota of tiles. The work-stealing variant
+ * has each CU claim the next tile via atomicAdd, so faster CUs absorb work
+ * that slow CUs would otherwise have done.
+ *
+ * Counter layout (caller-allocated int32 buffer of size NUM_XCDS_WS + 2):
+ * [0..NUM_XCDS_WS-1] : per-XCD slots
+ * [NUM_XCDS_WS]      : global slot
+ * [NUM_XCDS_WS + 1]  : done slot (last-out CTA detection for self-reset)
+ * `local_per_xcd` selects the mode:
+ * = 0                                : global-only (phase 1 empty)
+ * = ceil(total_tiles / NUM_XCDS_WS)  : per-XCD-only (phase 2 empty)
+ * = anything in-between              : hierarchical (some local + global tail)
+ *
+ * Self-reset: the kernel guarantees the entire counter buffer is back to 0
+ * before it exits. The last CTA out (detected via atomicAdd on the done slot)
+ * writes zeros to all slots. Stream ordering then makes those zeros visible
+ **************************************************************************************************/
+
 // to the next kernel launch -- no host-side `counter.zero_()` needed.
 
 #pragma once

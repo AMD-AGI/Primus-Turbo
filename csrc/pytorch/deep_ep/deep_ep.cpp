@@ -1,10 +1,11 @@
-/*
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2025 DeepSeek. All rights reserved.
  *
  * Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE for license information.
- */
+ **************************************************************************************************/
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>

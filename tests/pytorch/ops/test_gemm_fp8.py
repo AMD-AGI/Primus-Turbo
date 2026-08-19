@@ -4,7 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-
 import pytest
 import torch
 

@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """FlyDSL flash-attention forward/backward impls (THD varlen and SBHD), gfx950 / MI355X.
 
 Bottom-right causal, GQA, D in {64, 128}, bf16. The forward bakes softmax_scale to

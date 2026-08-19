@@ -1,20 +1,22 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-//
-// Quant helpers shared by tensorwise and rowwise kernels.
-//
-//   * QuantOpBase / QuantOp  : the (x * scale) -> clamp(min,max) op used by all
-//                              FP8 quant paths.
-//   * compute_scale_from_amax_device_kernel : per-element amax -> scale on device.
-//   * compute_scale_from_amax_kernel        : __global__ over a [n] amax buffer.
-//   * compute_scale_from_amax               : host wrapper that launches the
-//                                             kernel above.
-//
-// All entries are header-only template definitions; the corresponding host
-// wrappers are launched directly from including .cu files, and the explicit
-// instantiation of `compute_scale_from_amax<float>` lives in
-// quantization_tensorwise.cu so the symbol is exported by libprimus_turbo.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ *
+ * Quant helpers shared by tensorwise and rowwise kernels.
+ *
+ * * QuantOpBase / QuantOp  : the (x * scale) -> clamp(min,max) op used by all
+ * FP8 quant paths.
+ * * compute_scale_from_amax_device_kernel : per-element amax -> scale on device.
+ * * compute_scale_from_amax_kernel        : __global__ over a [n] amax buffer.
+ * * compute_scale_from_amax               : host wrapper that launches the
+ * kernel above.
+ *
+ * All entries are header-only template definitions; the corresponding host
+ * wrappers are launched directly from including .cu files, and the explicit
+ * instantiation of `compute_scale_from_amax<float>` lives in
+ * quantization_tensorwise.cu so the symbol is exported by libprimus_turbo.
+ **************************************************************************************************/
 
 #pragma once
 
