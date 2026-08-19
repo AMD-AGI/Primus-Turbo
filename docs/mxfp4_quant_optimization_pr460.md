@@ -5,8 +5,8 @@
 本报告覆盖三套必须按 exact source boundary 分开解读的证据：最初移植到
 Primus-Turbo PR #460（下文简称 `primus-460`）的两项 Quant-only 优化、随后加入当前
 branch 的 K256 wgrad producer/consumer 原子合约，以及 2026-08-19 新归档的 GEAK
-stacked grouped-Quant winner。当前 branch head 只包含前两者；GEAK 新 patch 目前仅作为
-已验证候选记录在本报告中，尚未集成到 branch 代码。
+stacked grouped-Quant winner。kernel-bearing commit `84b61690` 已将三者合入同一 source
+snapshot；其后的提交只更新报告，kernel code 完全相同。
 
 两项 Quant-only 优化在相同 PR #460 GEMM、相同 routing、相同进程和交替配对计时
 条件下，三次独立 full-op session 的等权汇总结果为：
@@ -30,9 +30,7 @@ K256-only 候选在 primus-460 上的另一组三 session 正式复测结果为�
 | Full-op | **1.020800x** | **+2.0800%** |
 
 K256 的三个 full-op session 为 `1.021137x / 1.020317x / 1.020949x`，全部通过
-CI、MDE99、route floor、correctness、zero fallback、cache 和 selector gate。当前 branch
-把两项 Quant 优化与 K256 合并到同一源码，但这个**精确组合后的 branch head 尚未单独执行
-一次 paired full-op A/B**，因此不能把 `1.097399x` 与 `1.020800x` 直接相乘后称为实测结果。
+CI、MDE99、route floor、correctness、zero fallback、cache 和 selector gate。
 
 新归档的 GEAK stacked grouped-Quant candidate 在 48 个 route×shape case 上给出：
 
@@ -42,11 +40,27 @@ CI、MDE99、route floor、correctness、zero fallback、cache 和 selector gate
 | Unweighted geomean | **1.02158x** | **+2.158%** |
 | Arithmetic mean | **1.02164x** | **+2.164%** |
 
-该数字是 **grouped Quant kernel-only** 结果，baseline geomean latency 为 `3.7122 ms`，
-优化后约为 `3.634 ms`。它来自 BM=128、仍使用 512-aligned colwise padding 的旧
-Quant-only source boundary，不包含 K256，也没有给出对应的 fwd、dgrad、wgrad 或 full-op
-实测。因此不能把 `1.0206x` 与 `1.290438x`、`1.045990x` 或 `1.097399x` 相乘后称为
-当前组合 branch 的实测收益。
+该数字是原始 GEAK **grouped Quant kernel-only** 结果，baseline geomean latency 为
+`3.7122 ms`，优化后约为 `3.634 ms`。它来自 BM=128、仍使用 512-aligned colwise padding
+的旧 Quant-only source boundary，不包含 K256。
+
+将相同 GEAK patch 合入当前 K256 producer 后，我们又以 pre-GEAK `5a886073` 代码为
+baseline、以 `84b61690` 为 candidate，完成了 exact incremental 三 session paired A/B：
+
+| Phase | Baseline | Candidate | 加速比 | 性能提升 |
+|---|---:|---:|---:|---:|
+| Quant | 2.504113 ms | 2.457435 ms | **1.018995x** | **+1.8995%** |
+| Fwd | 1.644913 ms | 1.645629 ms | 0.999565x | -0.0435% |
+| Dgrad | 1.552311 ms | 1.557998 ms | 0.996350x | -0.3650% |
+| Wgrad | 1.633654 ms | 1.627675 ms | 1.003673x | +0.3673% |
+| Full-op | 7.502051 ms | 7.458372 ms | **1.005856x** | **+0.5856%** |
+
+三轮 Quant 增量均为正（`1.013361x / 1.020937x / 1.022695x`），三轮 full-op 的
+95% CI 下界也都大于 1；但 S1/S2 的 full-op 收益没有超过各自偏高的 same-session
+MDE99，只有 S3 通过全部八项 promotion gate。因此当前结论是：**GEAK 改动与 K256
+组合后的 correctness 已关闭，Quant 增量可复现；full-op 点估计为正，但尚未达到三轮全部
+promotion 的证据强度。**这些 exact incremental 数字也不能与旧的 `1.290438x` 或
+`1.045990x` 再相乘后称为 end-to-end 实测。
 
 ## 背景：这项优化在 GPT-OSS-20B MoE 训练中的位置
 
@@ -234,13 +248,14 @@ whole-loop 仍沿用 K-loop 的术语，把它切成 256-element phase。因此 
 - stacked base：`dev/kyle/gptoss-mxfp4-grouped-pr`
 - `primus-460` PR：https://github.com/AMD-AGI/Primus-Turbo/pull/460
 - `primus-460` head commit：`0f3972175fdbe3621d5bf67b23f2b15decfccbf3`
-- 当前已提交的 Quant + K256 kernel code head：`5a8860733570e651d26ff009330b5cf7df91e1cb`
+- pre-GEAK Quant + K256 code commit：`5a8860733570e651d26ff009330b5cf7df91e1cb`
+- 当前完整 kernel code commit：`84b6169078776be42722a1650eebe5364530b864`
 - GEAK 新 Quant 证据 commit：`b9bf93f4f25365604b6ce38b6e753120e2efc003`
 
 本 branch 以 #460 的 head branch 为 base，不重复包含 #460 本身的 grouped GEMM 调优。
 PR #463 当前保持关闭；本次只更新 branch 内容，不 reopen PR。#460 合并或更新后，需要
-重新 rebase 并复跑完整验证。GEAK 新 Quant patch 尚未应用到该 branch；本节新增的是
-验证记录与后续集成边界，不代表 branch 已包含新 kernel code。
+重新 rebase 并复跑完整验证。GEAK 新 Quant patch 已在 `84b61690` 中与 K256 256-padding
+producer/consumer 合并；其后的 branch 提交不再修改 kernel。
 
 ## 优化策略与代码范围
 
@@ -284,7 +299,7 @@ wgrad consumer：
 这三部分是不可拆分的正确性合约：只改 producer/trip 会在 odd span 上产生错误；只改
 runtime loop 而保留 512 padding 则路径基本休眠，没有可测收益。
 
-### 4. GEAK stacked grouped-Quant candidate（新证据，尚未集成）
+### 4. GEAK stacked grouped-Quant candidate（已集成）
 
 文件：`primus_turbo/flydsl/quantization/mxfp4_grouped_quant.py`
 
@@ -302,6 +317,11 @@ GEAK round-4 winner `r4_d0` 将两个正交 lever 合成一个 candidate：
 这两个 lever 单独运行时约处于同 session 噪声门限附近，GEAK 在 round 2–3 观察到 A/A
 MDE99 在约 `0.00285–0.0068` 间波动，因此最终以 stacked candidate 把 point estimate
 抬到噪声门限之上。
+
+归档 patch 已 clean apply 到 K256 256-padding producer。合并结果仍保留
+`lpad=ceil(span/256)×256` 和 256-aligned `M_pad_col`，同时启用 collapsed N-grid、WG 内
+NBK loop 与 direct COL store；对应的 grouped wgrad consumer 和底层 zero/even/odd runtime
+继续由 `grouped_gemm_mxfp4_kernel.py` 与 `gemm_mxfp4_kernel.py` 提供。
 
 需要特别说明：GEAK final report 的摘要将 group-boundary lookup 描述成 `O(log G)`；但
 commit 中归档的实际 patch 仍使用 `for g in range_constexpr(G)` 的 O(G=32) register scan。
@@ -334,7 +354,7 @@ archived patch 为准，不把尚未出现在 patch 中的二分搜索算作已�
 | ROCm runtime | `7.2.53211-671d39a71e` |
 | FlyDSL | `0.2.4` |
 | Baseline | `primus-460` commit `0f3972175fdbe3621d5bf67b23f2b15decfccbf3`，原生 Quant |
-| Candidate | Quant-only 与 K256-only 分别在同一 commit 上独立 A/B；当前 branch head 合并两者 |
+| Candidate | Quant-only、K256-only 分别独立 A/B；当前 `84b61690` 合并 Quant + K256 + GEAK stacked Quant |
 | Public operator boundary | `grouped_gemm_fp4` 的 quantization + fwd + dgrad + wgrad |
 | Backend 环境 | `PRIMUS_TURBO_GROUPED_GEMM_BACKEND=FLYDSL`、`TURBO_GROUPED_GEMM_WITHOUT_PADDING=true`、`PRIMUS_TURBO_AUTO_TUNE=0` |
 
@@ -352,11 +372,20 @@ archived patch 为准，不把尚未出现在 patch 中的二分搜索算作已�
 | `mxfp4_grouped_quant.py` | `b7827da16587bf5c59a29b4a0a2c28c7fb75e27a44449e970a73c96912cb8008` |
 | `mxfp4_quant_kernel.py` | `52e16bdd3b71cccb83ab9f9f3478be7b636b5803faff5a46b27f3cfc8ccbb597` |
 
-当前 Quant + K256 组合 branch head 的相关源码 SHA256：
+pre-GEAK Quant + K256 commit `5a886073` 的相关源码 SHA256：
 
 | 文件 | SHA256 |
 |---|---|
 | `mxfp4_grouped_quant.py` | `9e2001ac40a6647bda51a94c8fa523ba4a597b2a41653c6c1248c9bc0cc3b706` |
+| `mxfp4_quant_kernel.py` | `52e16bdd3b71cccb83ab9f9f3478be7b636b5803faff5a46b27f3cfc8ccbb597` |
+| `gemm_mxfp4_kernel.py` | `7814871974d464955aabf3696198be7da2e8608e0793616c63d10a52c39833e2` |
+| `grouped_gemm_mxfp4_kernel.py` | `6d2cd68e75d31a45cb38fe995e515b85bd24d7e7c146f68702afd26673945e21` |
+
+当前完整 kernel commit `84b61690`（其后 report-only commits 同代码）的相关源码 SHA256：
+
+| 文件 | SHA256 |
+|---|---|
+| `mxfp4_grouped_quant.py` | `0b119717e478440e7f9d67e8a8cc7cf59408da51e98385a8905a1e3eb3d20ec8` |
 | `mxfp4_quant_kernel.py` | `52e16bdd3b71cccb83ab9f9f3478be7b636b5803faff5a46b27f3cfc8ccbb597` |
 | `gemm_mxfp4_kernel.py` | `7814871974d464955aabf3696198be7da2e8608e0793616c63d10a52c39833e2` |
 | `grouped_gemm_mxfp4_kernel.py` | `6d2cd68e75d31a45cb38fe995e515b85bd24d7e7c146f68702afd26673945e21` |
@@ -370,7 +399,8 @@ archived patch 为准，不把尚未出现在 patch 中的二分搜索算作已�
   `f35cb9e0715c2296fe9ee2b1a437ebe867744e5a:primus_turbo/flydsl/quantization/mxfp4_grouped_quant.py`；
 - archived patch candidate index：`33745c4`；
 - 该 baseline 已包含 `BM=128`，但仍为 512-aligned colwise padding；因此这轮证据不包含
-  K256 `512→256` producer/consumer 合约，也不对应当前 `5a886073` branch head。
+  K256 `512→256` producer/consumer 合约；当前 `84b61690` 则是该 patch 与 K256 合并后的
+  production candidate，grouped Quant 文件 SHA256 为 `0b119717...20ec8`。
 
 ## 测试方案：从真实 routing 到可重复的 public-op A/B
 
@@ -583,6 +613,15 @@ unweighted geomean 与 arithmetic mean。它经历 4 个 round、8 个方向，�
 标记为 VERIFIED winner。这是 Quant kernel-only 验证，统计边界不同于上面的三 session
 public full-op paired A/B，不能混用两者的 gate 或直接推导 full-op 收益。
 
+完成代码集成后，又执行了一套 exact incremental public-op A/B：baseline 使用
+`5a886073` 的 Quant + K256 kernel（实验 worktree 当时位于 report-only commit
+`aba83476`，但四个 canonical kernel SHA 与 `5a886073` 相同），candidate 使用
+`84b61690`。两臂只有 `mxfp4_grouped_quant.py` 不同；GEMM、consumer、batched Quant 和
+public runtime hash 均保持一致。三轮都通过 correctness、zero fallback、cache、selector、
+source receipt、route floor 与 CI gate，S1/S2 仅因为 point gain 未超过各自 MDE99 而未
+promotion，S3 通过全部八项 gate。因此 `all_sessions_pass=false`，不能将汇总 full-op
+`1.005856x` 表述为三轮正式 promotion winner。
+
 ### 9. 当前覆盖范围与有效性边界
 
 当前方案较强的地方是：使用真实 routing、覆盖两个生产 shape、完整执行 forward/backward、
@@ -665,22 +704,50 @@ latency。round 4 将两者叠加后才稳定越过最差观测 MDE99，得到�
 weighted winner。该表没有对应的 fwd、dgrad、wgrad 或 public full-op latency，不能从
 Quant kernel ratio 直接推导完整算子收益。
 
+### 与 K256 合并后的 exact incremental 三 session A/B
+
+本轮只比较 GEAK grid-collapse + direct COL store 的增量：baseline 为 `5a886073`，candidate
+为 `84b61690`。两臂都已经包含 BM=128、selective tail-zero 和 K256 producer/consumer
+合约。
+
+| Session / seed | Quant 加速 | Full-op 加速 | Full-op 95% CI | MDE99 | 最差 route | Gate 结果 |
+|---|---:|---:|---:|---:|---:|---|
+| S1 / `20260811` | 1.013361x | 1.003823x | [1.002537, 1.005348] | 1.0323% | 0.998802x | 仅 MDE99 未过 |
+| S2 / `20261811` | 1.020937x | 1.006237x | [1.003995, 1.007249] | 0.9372% | 0.997698x | 仅 MDE99 未过 |
+| S3 / `20262811` | 1.022695x | 1.007507x | [1.005868, 1.008794] | 0.4432% | 1.002511x | 全部通过 |
+
+三个 session 等权汇总：
+
+| Phase | Baseline | Candidate | 加速比 | 性能提升 |
+|---|---:|---:|---:|---:|
+| Quant | 2.504113 ms | 2.457435 ms | **1.018995x** | **+1.8995%** |
+| Fwd | 1.644913 ms | 1.645629 ms | 0.999565x | -0.0435% |
+| Dgrad | 1.552311 ms | 1.557998 ms | 0.996350x | -0.3650% |
+| Wgrad | 1.633654 ms | 1.627675 ms | 1.003673x | +0.3673% |
+| Full-op | 7.502051 ms | 7.458372 ms | **1.005856x** | **+0.5856%** |
+
+Quant 在三轮中均有正收益，范围为 `1.013361x–1.022695x`，说明 archived GEAK lever 在
+256-padding producer 上仍然生效。Fwd/dgrad/wgrad 的小幅正负变化不是该 patch 的目标路径；
+当前证据只支持“Quant 增量可复现、full-op 点估计为正”，不支持“三轮 full-op promotion
+全部通过”。
+
 ## Correctness 与单元测试
 
 - Quant-only full-op correctness：24 routes × GG1/GG2，共 **48/48 PASS**；
   baseline/candidate 的 fwd、dgrad、wgrad SNR 判定完全一致，fallback=0，selector/config
   receipt 两臂一致。
 - K256-only 正式复测：**48/48 PASS**，最小 SNR `12.899 dB`，fallback=0。
-- 当前 Quant + K256 组合 head 的新增 metadata 与 zero/even/odd forward/backward 测试：
-  **4 passed, 6151 deselected**。
-- 当前组合 head 的既有 dual-quant 回归：**130 passed, 3788 deselected**。
+- GEAK + K256 完整组合的 targeted metadata 与 zero/even/odd forward/backward 测试：
+  **2 passed, 6153 deselected**。
+- 完整组合的既有 dual-quant 回归：**130 passed, 3788 deselected**。
 - 新增测试特别验证 batched 3D dual quant 的 row K-pad 与 col N-pad 都被物化为零。
 - 新增 grouped Quant 256-alignment metadata 和 zero/even/odd wgrad 回归测试。
-- 当前组合 head 尚未单独重跑 48-cell correctness harness；上面的两组 48/48 收据分别属于
-  Quant-only 与 K256-only 冻结候选，不能替代组合 head 的 promotion gate。
+- 当前 `84b61690` 完整组合已单独重跑 48-cell correctness harness：**48/48 PASS**，
+  最小 fwd/dgrad/wgrad SNR 为 **13.418 dB**，candidate fallback=0，validation error 为空。
+  Source receipt 中 candidate grouped Quant SHA256 为 `0b119717...20ec8`。
 - GEAK final report 将 stacked candidate 标记为 VERIFIED winner，并提供完整 48-case
-  performance 表；这属于旧 512-padding Quant source boundary 的 kernel verification，
-  不能替代将该 patch 与 K256 合并后的 correctness、paired full-op 或 training-step gate。
+  performance 表；那一轮属于旧 512-padding Quant source boundary。现在新增的 48/48
+  correctness 与三 session exact A/B 则属于 GEAK + K256 的真实组合 source boundary。
 
 ## 与 latest-new 约 +32% 结果、K256 及 GEAK 新 Quant 证据的关系
 
@@ -702,13 +769,17 @@ Quant kernel ratio 直接推导完整算子收益。
    COL store，独立给出 `1.0206x` workload-weighted Quant kernel 收益；其 baseline 仍为
    512 padding，因此不包含 K256 的 `+4.5990%` Quant collateral benefit。
 5. Quant-only A/B 中 GEMM 哈希完全一致，证明最初两项 Quant 机制可以迁移；K256-only A/B
-   则单独证明 producer/consumer 联合机制仍然有效；GEAK 48-case 表证明新的 stacked
-   Quant kernel candidate 有效。三套证据的 source boundary 不同，精确合并仍需共同 A/B。
+   则单独证明 producer/consumer 联合机制仍然有效；旧 512-padding GEAK 48-case 表证明新的
+   stacked Quant lever 有效。现在又补齐了 GEAK-on-K256 的 exact incremental A/B 和完整组合
+   48-cell correctness，证明该 lever 已正确落到 256-padding producer 上。仍然缺少的是“原生
+   PR #460 → 当前最终 branch”这一整段的单一 direct paired performance A/B，而不是 GEAK 与
+   K256 是否能够组合。
 
 PR #460 的 GEMM 更快后，Quant 在 baseline full-op 中约占 39.62%，因此约 +29.04% 的 Quant throughput 提升最终转化为约 +9.74% 的 full-op throughput 提升，符合 Amdahl 分解。
-GEAK 新 `1.0206x` 只能作为这一 Quant 路径上的额外独立证据；在没有 exact combined
-measurement 前，不能将 `1.290438 × 1.045990 × 1.0206` 宣称为当前 branch 的 Quant
-实测，更不能据此直接推导 full-op 或 training-step 加速。
+当前 `1.018995x` Quant / `1.005856x` full-op 是在 K256 已存在时加入 GEAK lever 的 exact
+incremental 实测，已经关闭“GEAK 与 K256 组合后是否仍生效”这一问题；它不是原生 PR #460
+到最终 branch 的 direct end-to-end ratio。不能将 `1.290438 × 1.045990 × 1.0206` 或任何
+独立实验比例的连乘值宣称为当前 branch 实测，更不能据此直接推导 training-step 加速。
 
 ## 复现命令
 
@@ -728,20 +799,23 @@ python /campaign/experiments/quant_on_pr460_20260818/bench/benchmark_gptoss20b_e
   --baseline-root /campaign/src/latest-460 \
   --candidate-root /campaign/experiments/quant_on_pr460_20260818/src/candidate \
   --extension-path /workspace/primus/primus_turbo/pytorch/_C.cpython-310-x86_64-linux-gnu.so \
-  --output-json /campaign/experiments/quant_on_pr460_20260818/results/correctness.json \
+  --output-json /campaign/experiments/quant_on_pr460_20260818/results/combined_geak_k256_correctness.json \
   --seed 20260811 \
   --correctness-only
 ```
 
-### Full-op paired performance
+### 原 Quant-only full-op paired performance
 
-对 seed `20260811`、`20261811`、`20262811` 分别执行：
+`full_op_s1/s2/s3.json` 对应 `f35cb9e0` 的 Quant-only candidate，而不是当前 combined
+worktree。复现时应先准备该 commit 的独立 worktree；其 grouped/batched Quant SHA256 必须
+分别为 `b7827da1...8008` 与 `52e16bdd...597`。对 seed `20260811`、`20261811`、
+`20262811` 分别执行：
 
 ```bash
 python /campaign/experiments/quant_on_pr460_20260818/bench/benchmark_gptoss20b_ep1_full_op_pr460.py \
   --manifest /campaign/evidence/geak_runs/c5_direct_20260731/operator_campaign_20260803/evidence/real_training_routing/gptoss20b_primus_ep1_gbs32_mbs4_fp8_capture_20260811/pilot_v2/gptoss20b_primus_ep1_g32_initial_step0_matrix.json \
   --baseline-root /campaign/src/latest-460 \
-  --candidate-root /campaign/experiments/quant_on_pr460_20260818/src/candidate \
+  --candidate-root /campaign/experiments/quant_on_pr460_20260818/src/quant-only-f35cb9 \
   --extension-path /workspace/primus/primus_turbo/pytorch/_C.cpython-310-x86_64-linux-gnu.so \
   --output-json /campaign/experiments/quant_on_pr460_20260818/results/full_op_s1.json \
   --seed 20260811 \
@@ -763,6 +837,32 @@ python /campaign/experiments/quant_on_pr460_20260818/bench/summarize_sessions.py
   --json /campaign/experiments/quant_on_pr460_20260818/results/summary.json \
   --csv /campaign/experiments/quant_on_pr460_20260818/results/session_phase_metrics.csv
 ```
+
+### GEAK-on-K256 exact incremental A/B
+
+本轮 combined 验证沿用同一 harness 与三组 seed，只把两臂收紧为 pre-GEAK K256 snapshot
+与最终 combined kernel：
+
+```bash
+python /campaign/experiments/quant_on_pr460_20260818/bench/benchmark_gptoss20b_ep1_full_op_pr460.py \
+  --manifest /campaign/evidence/geak_runs/c5_direct_20260731/operator_campaign_20260803/evidence/real_training_routing/gptoss20b_primus_ep1_gbs32_mbs4_fp8_capture_20260811/pilot_v2/gptoss20b_primus_ep1_g32_initial_step0_matrix.json \
+  --baseline-root /campaign/experiments/quant_on_pr460_20260818/src/pre-geak-aba834 \
+  --candidate-root /campaign/experiments/quant_on_pr460_20260818/src/candidate \
+  --extension-path /workspace/primus/primus_turbo/pytorch/_C.cpython-310-x86_64-linux-gnu.so \
+  --output-json /campaign/experiments/quant_on_pr460_20260818/results/geak_increment_s1.json \
+  --seed 20260811 \
+  --warmup 1 \
+  --block-calls 1 \
+  --supercycles 8 \
+  --aa-supercycles 2 \
+  --bootstrap-resamples 10000 \
+  --confidence 0.95
+```
+
+对 `20261811`、`20262811` 分别生成 S2/S3，然后使用同一汇总脚本生成
+`geak_increment_summary.json` 与 `geak_increment_metrics.csv`。收据中的 source hash 是
+复现边界的最终依据：baseline grouped Quant 为 `9e2001ac...b706`，candidate 为
+`0b119717...20ec8`，另外三个 canonical kernel hash 完全相同。
 
 ### Quant 与 K256 单元测试
 
@@ -788,6 +888,12 @@ pytest -q tests/pytorch/ops/test_grouped_gemm_fp4.py \
 /home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/ablation_bm128.json
 /home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/ablation_tail_zero.json
 /home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/summary.json
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/combined_geak_k256_correctness.json
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/geak_increment_s1.json
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/geak_increment_s2.json
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/geak_increment_s3.json
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/geak_increment_summary.json
+/home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/quant_on_pr460_20260818/results/geak_increment_metrics.csv
 
 /home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/latest_new_gemm_on_pr460_20260818/rounds/round-6/artifacts/full_op_clean_s1.json
 /home/zhitwang/GEAK/agent/workspace/mxfp4_moe_fullop_flydsl_gfx950_20260817/experiments/latest_new_gemm_on_pr460_20260818/rounds/round-6/artifacts/full_op_clean_s2.json
@@ -811,18 +917,20 @@ https://github.com/zhitwang17/geak-mxfp4-gpt-oss-kb/commit/b9bf93f4f25365604b6ce
 - selective tail-zero 依赖 kernel 继续完整写入 row-output K-pad tail。若 producer mapping 或 masked-load/store 语义变化，必须保留本 PR 新增的 padding 回归测试。
 - K256 必须保持 producer、consumer trip 与 runtime whole-loop 原子一致；任何一部分变化都要
   重跑 zero/even/odd correctness。
-- GEAK grid-collapse patch 与 K256 都修改 `mxfp4_grouped_quant.py`，集成时必须以当前
-  256-padding producer 为 base 手工迁移，不能直接把归档 patch 套到 `5a886073`；同时需要
+- GEAK grid-collapse patch 与 K256 都修改 `mxfp4_grouped_quant.py`；当前 `84b61690` 已以
+  256-padding producer 为 base 完成迁移并通过组合 correctness。未来重放或 rebase 时仍不能
+  盲目套用旧 512-padding archived patch，必须保留 `lpad/M_pad_col` 的 256-alignment，并重新
   验证内部 NBK loop、direct COL store 与 256-aligned `lens/offs` 的组合正确性。
 - Direct COL store 依赖当前 feature-major、M-contiguous 布局和连续 COL thread 的写合并；
   N-loop 末尾的 WAR barrier 不能随 `ldsc` visibility barrier 一起删除。
 - GEAK final report 中的 `O(log G)` 描述与 archived patch 不一致；在实际 patch 改成二分
   search 之前，应将当前实现视为“每 M-block 一次 O(G=32) scan”。
-- 当前 branch 的“BM128 + selective tail-zero + K256”精确组合尚未单独执行 promotion-grade
-  paired A/B；进一步加入 GEAK grid-collapse + direct-store 后更没有 exact combined 数据。
-  现有数字分别来自 Quant-only、K256-only 和 GEAK 旧 512-padding Quant exact-source 实验。
+- 当前已完成 GEAK-on-K256 的 exact incremental 三 session A/B，但 S1/S2 仅因 full-op 点收益
+  未超过 same-session MDE99 而未通过 promotion，只有 S3 八项 gate 全过；因此不能把 pooled
+  `1.005856x` 称为“三轮 promotion winner”。此外仍缺原生 PR #460 到最终 `84b61690` 的单一
+  direct paired performance A/B，独立 Quant-only、K256-only 与 GEAK 增量比例不能连乘冒充该结果。
 - 仍缺真实 GPT-OSS training-step transfer：目前证明的是完整 public operator replay 变快，
   尚未证明装回完整训练图后整步时间稳定下降。
 - 本 branch 依赖 #460；#460 合并或更新后，需要重新 rebase，并至少复跑 Quant pytest、
-  K256 zero/even/odd test、48-cell correctness 和一轮 paired full-op performance；若集成 GEAK
-  新 patch，还应重新生成 source receipt，并单独报告 combined Quant kernel 与 full-op 数据。
+  K256 zero/even/odd test、48-cell correctness 和三轮 paired full-op performance，同时重新
+  生成 source receipt，并分别报告 combined Quant kernel 与 full-op 数据。
