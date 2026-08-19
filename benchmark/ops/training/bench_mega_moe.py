@@ -11,8 +11,8 @@ Two modes, selected with --mode:
   grouped_gemm_combine  : fused grouped GEMM + combine
 
 Self-contained: the shared reference ops (routing/weight generation, the
-dense-GEMM roofline, the CUDA-event bench helper, the prologue-driven input
-builders, and the per-stage metric/print template) live in this file too.
+CUDA-event bench helper, the prologue-driven input builders, and the per-stage
+metric/print template) live in this file too.
 """
 
 import argparse
@@ -56,7 +56,6 @@ import primus_turbo.pytorch  # noqa: E402,F401
 # primus_turbo.flydsl.* imported before primus_turbo.pytorch (kept from the
 # original mega_utils order; the two fused kernels below need pytorch first).
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (  # noqa: E402
-    _compile_dense_nt,
     _compile_grouped_variable_k_bf16,
     _get_compiled_dense,
     _i64,
@@ -418,7 +417,7 @@ def grouped_gemm_variable_k_only(
         OUT_N_e,
         torch.cuda.current_stream(),
     )
-    # shared shape/dtype-keyed compile cache (same helper as dense_gemm_peak_ms)
+    # shared shape/dtype-keyed compile cache
     _get_compiled_dense(launch, args)(*args)
     return out_dw
 
@@ -631,25 +630,6 @@ def check_accuracy(group, name, out, ref, *, cos_thresh=0.99, rel_thresh=0.05):
     return AccuracyCheck(worst_cos, worst_rel, all_ok)
 
 
-def dense_gemm_peak_ms(M, N, K, BLOCK_M, BLOCK_N, iters, *, group_m_cands=(4,)):
-    """Dense NT bf16 GEMM (gemm_bf16_kernel) of the SAME M x N x K as the grouped
-    GEMM -> the single-weight compute roofline. Benches every GROUP_M in
-    group_m_cands (--dense-group-m supplies one value). Returns (best_ms, best_group_m)."""
-    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) / 8
-    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) / 8  # NT: B [N,K]
-    c = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    dense_args = (a.view(-1), b.view(-1), c.view(-1), M, N, torch.cuda.current_stream())
-    best_ms, best_group_m = float("inf"), None
-    for group_m in group_m_cands:
-        launch = _compile_dense_nt(K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, GROUP_M=group_m, num_xcd=8)
-        compiled = _get_compiled_dense(launch, dense_args)
-        ms = bench(lambda c=compiled: c(*dense_args), iters=iters)
-        if ms < best_ms:
-            best_ms, best_group_m = ms, group_m
-    del a, b, c
-    return best_ms, best_group_m
-
-
 # --------------------------------------------------------------------------- #
 # Input builders (like the EP test): build SymmBuffer, run prologue for the handle, fill pool/activation; `kind` picks the kernel.
 # --------------------------------------------------------------------------- #
@@ -789,10 +769,9 @@ def generate_input(group, *, kind, symm, T, H, I, E, K, BLOCK_M, BLOCK_N, num_di
 # --------------------------------------------------------------------------- #
 # Metric + print template: identical layout for dispatch and combine, fwd/bwd.
 # --------------------------------------------------------------------------- #
-def compute_stage_metrics(*, gemm_ms, dense_ms, dense_gm, comm_ms, fused_ms, flops, xgmi):
+def compute_stage_metrics(*, gemm_ms, comm_ms, fused_ms, flops, xgmi):
     """Derive the standard per-stage metrics shared by both benchmarks.
 
-    grouped/dense = grouped GEMM vs the dense single-weight roofline.
     hidden  = serial(gemm+comm) - fused      (comm time hidden under GEMM)
     speedup = serial / fused                 (fused vs serial)
     roofline= max(gemm,comm) / fused         (overlap floor: the slower leg)"""
@@ -801,14 +780,10 @@ def compute_stage_metrics(*, gemm_ms, dense_ms, dense_gm, comm_ms, fused_ms, flo
         flops=flops,
         gemm_ms=gemm_ms,
         gemm_tf=flops / (gemm_ms * 1e-3) / 1e12,
-        dense_ms=dense_ms,
-        dense_tf=flops / (dense_ms * 1e-3) / 1e12,
-        dense_gm=dense_gm,
         comm_ms=comm_ms,
         comm_bw=xgmi / (comm_ms * 1e-3) / 1e9,
         fused_ms=fused_ms,
         fused_tf=flops / (fused_ms * 1e-3) / 1e12,
-        grouped_eff_pct=(flops / (gemm_ms * 1e-3)) / (flops / (dense_ms * 1e-3)) * 100.0,
         serial_ms=serial_ms,
         hidden_ms=serial_ms - fused_ms,
         speedup=serial_ms / fused_ms,
@@ -817,9 +792,9 @@ def compute_stage_metrics(*, gemm_ms, dense_ms, dense_gm, comm_ms, fused_ms, flo
 
 
 # --------------------------------------------------------------------------- #
-# Cross-rank aggregation + CSV helpers; per-rank result {"stages": {stage: StageMetrics}} carries gemm/dense/comm/fused ms + flops.
+# Cross-rank aggregation + CSV helpers; per-rank result {"stages": {stage: StageMetrics}} carries gemm/comm/fused ms + flops.
 # --------------------------------------------------------------------------- #
-BF16_BYTES = 2  # bytes per bf16 element (XGMI push volume, dense-roofline sizing)
+BF16_BYTES = 2  # bytes per bf16 element (XGMI push volume)
 
 
 def sync_ranks(group):
@@ -834,11 +809,9 @@ def reduce_across_ranks(per_rank, stage, field, *, reduce_fn=max):
 
 
 def aggregate_stage_metrics(per_rank, stage, xgmi):
-    """Cross-rank metric bundle for one stage; latencies=slowest rank, flops=mean, dense_gm=rank0."""
+    """Cross-rank metric bundle for one stage; latencies=slowest rank, flops=mean."""
     return compute_stage_metrics(
         gemm_ms=reduce_across_ranks(per_rank, stage, "gemm_ms"),
-        dense_ms=reduce_across_ranks(per_rank, stage, "dense_ms"),
-        dense_gm=per_rank[0]["stages"][stage].dense_gm,
         comm_ms=reduce_across_ranks(per_rank, stage, "comm_ms"),
         fused_ms=reduce_across_ranks(per_rank, stage, "fused_ms"),
         flops=reduce_across_ranks(per_rank, stage, "flops", reduce_fn=statistics.mean),
@@ -846,15 +819,11 @@ def aggregate_stage_metrics(per_rank, stage, xgmi):
     )
 
 
-def stage_columns(prefix, m, check, *, comm_label, comm_short, dense_ms=False, xgmi=False, hidden=False):
+def stage_columns(prefix, m, check, *, comm_label, comm_short, xgmi=False, hidden=False):
     """One stage's CSV columns in canonical order; comm_label/comm_short name the comm leg, flags gate optional cols."""
     cols = {}
-    if dense_ms:
-        cols[f"{prefix}dense_gemm (ms)"] = f"{m.dense_ms:.3f}"
-    cols[f"{prefix}dense_gemm (TFLOPS)"] = f"{m.dense_tf:.1f}"
     cols[f"{prefix}gemm_only (ms)"] = f"{m.gemm_ms:.3f}"
     cols[f"{prefix}gemm_only (TFLOPS)"] = f"{m.gemm_tf:.1f}"
-    cols[f"{prefix}grouped/dense"] = f"{m.grouped_eff_pct:.1f}%"
     cols[f"{prefix}{comm_label} (ms)"] = f"{m.comm_ms:.3f}"
     if xgmi:
         cols[f"{prefix}{comm_label} (XGMI GB/s)"] = f"{m.comm_bw:.1f}"
@@ -926,14 +895,7 @@ def print_stage(m, *, comm_label, comm_unit, comm_tag, comm_extra="", fused_extr
     comm_extra / fused_extra : kernel-specific suffixes (e.g. CU sweep strings)."""
     if sub_header is not None:
         print(f"  {'-' * 68}  {sub_header}")
-    print(
-        f"  dense_gemm   : {m.dense_ms:8.3f} ms | {m.dense_tf:7.1f} TFLOPS "
-        f"(single-weight roofline, GROUP_M={m.dense_gm})"
-    )
-    print(
-        f"  gemm_only    : {m.gemm_ms:8.3f} ms | {m.gemm_tf:7.1f} TFLOPS | "
-        f"grouped/dense = {m.grouped_eff_pct:.1f}%"
-    )
+    print(f"  gemm_only    : {m.gemm_ms:8.3f} ms | {m.gemm_tf:7.1f} TFLOPS")
     print(f"  {comm_label:<13}: {m.comm_ms:8.3f} ms | {m.comm_bw:7.1f} {comm_unit}{comm_extra}")
     print(
         f"  fused        : {m.fused_ms:8.3f} ms | {m.fused_tf:7.1f} TFLOPS | "
@@ -1227,8 +1189,6 @@ class StageMetrics:
     """Raw per-rank timings + work for one stage (fields match compute_stage_metrics kwargs)."""
 
     gemm_ms: float
-    dense_ms: float
-    dense_gm: int
     comm_ms: float
     fused_ms: float
     flops: float
@@ -1240,7 +1200,6 @@ class StageSpec:
 
     name: str
     flops: float
-    dense_dims: tuple[int, int, int]
     gemm_fn: Callable
     comm_fn: Callable  # comm baseline (dispatch_only / combine_only)
     fused_fn: Callable
@@ -1251,32 +1210,25 @@ class StageSpec:
 class StageRunner:
     """Binds per-run context so each stage passes only its own knobs; run does the shared template."""
 
-    def __init__(self, group, args, synced_fn, group_m_cands, skip_benchmark=False):
+    def __init__(self, group, args, synced_fn, skip_benchmark=False):
         self.group = group
         self.args = args
         self.synced_fn = synced_fn
-        self.group_m_cands = group_m_cands
         self.skip_benchmark = skip_benchmark  # pressure test: run fused only, for the hash
 
     def run(self, spec):
-        """Time gemm / dense roofline / comm_only / fused, then gate accuracy under a synced
+        """Time gemm / comm_only / fused, then gate accuracy under a synced
         bracket. Returns (metrics, check, out); pressure mode skips timing+accuracy and returns
         (None, None, out) so the caller can hash the fused output."""
         args = self.args
         if self.skip_benchmark:
             out = self.synced_fn(spec.fused_fn)[0]
             return None, None, out
-        dense_m, dense_n, dense_k = spec.dense_dims
         t_gemm = bench(spec.gemm_fn, iters=args.iters)
-        t_dense, dense_gm = dense_gemm_peak_ms(
-            dense_m, dense_n, dense_k, 256, 256, args.iters, group_m_cands=self.group_m_cands
-        )
         t_comm = bench(spec.comm_fn, iters=args.iters)
         t_fused = bench(spec.fused_fn, iters=args.iters)
         metrics = StageMetrics(
             gemm_ms=t_gemm,
-            dense_ms=t_dense,
-            dense_gm=dense_gm,
             comm_ms=t_comm,
             fused_ms=t_fused,
             flops=spec.flops,
@@ -1323,8 +1275,7 @@ def _make_runner(group, args):
         sync_ranks(group)
         return out
 
-    group_m_cands = (args.dense_group_m,)
-    return StageRunner(group, args, _synced, group_m_cands, skip_benchmark=bool(args.pressure_test_mode))
+    return StageRunner(group, args, _synced, skip_benchmark=bool(args.pressure_test_mode))
 
 
 ###############################################################################
@@ -1429,7 +1380,6 @@ def _dispatch_stage_fwd(runner, ctx):
     spec = StageSpec(
         name="fwd fused (nt)",
         flops=flops,
-        dense_dims=(M_eff, N_fwd, K),
         gemm_fn=lambda: grouped_gemm_bf16_only(
             pool,
             inp.W1,
@@ -1470,7 +1420,6 @@ def _dispatch_stage_bwd_dgrad(runner, ctx):
     spec = StageSpec(
         name="bwd dgrad fused (nn)",
         flops=flops,
-        dense_dims=(M_eff, N_bwd, K),
         gemm_fn=lambda: grouped_gemm_bf16_only(
             pool,
             inp.W2,
@@ -1523,8 +1472,6 @@ def _dispatch_stage_bwd_wgrad(runner, ctx):
     spec = StageSpec(
         name="wgrad dW1 fused (tn)",
         flops=flops,
-        # dense roofline of the same total FLOPs (one [H,2I] GEMM contracting M_eff rows)
-        dense_dims=(M_out, N_out, ctx.M_eff),
         gemm_fn=lambda: grouped_gemm_variable_k_only(
             x_pool, grad_pool, ctx.group_offs, dW1, BLOCK_M=256, BLOCK_N=256, trans_c=True
         ),
@@ -1692,7 +1639,6 @@ def _combine_stage_fwd(runner, ctx):
     spec = StageSpec(
         name="fwd fused (nt)",
         flops=flops,
-        dense_dims=(ctx.M_eff, N, K),
         gemm_fn=lambda: grouped_gemm_bf16_only(
             inp.act,
             inp.W2,
@@ -1752,7 +1698,6 @@ def _combine_stage_bwd(runner, ctx):
     spec = StageSpec(
         name="bwd dgrad fused (nn)",
         flops=flops,
-        dense_dims=(ctx.M_eff, N, K),
         gemm_fn=lambda: grouped_gemm_bf16_only(
             grad_l1,
             inp.W1,
@@ -1858,7 +1803,7 @@ class StageReport:
 
     key: str  # per_rank["stages"] / checks key
     col_prefix: str  # stage_columns name prefix ("", "bwd ", "wgrad ")
-    col_flags: dict = field(default_factory=dict)  # extra stage_columns switches (dense_ms / xgmi / hidden)
+    col_flags: dict = field(default_factory=dict)  # extra stage_columns switches (xgmi / hidden)
     sub_header: str = ""  # print_stage sub_header ("" = none, used by the fwd stage)
 
 
@@ -1878,7 +1823,7 @@ class ModeSpec:
 
 
 # fwd / bwd share the same column flags across modes; only labels + the extra wgrad stage differ
-_FWD_REPORT = StageReport("fwd", "", {"dense_ms": True, "xgmi": True, "hidden": True})
+_FWD_REPORT = StageReport("fwd", "", {"xgmi": True, "hidden": True})
 
 MODES = {
     "dispatch_grouped_gemm": ModeSpec(
@@ -2078,8 +2023,6 @@ def _build_parser():
     parser.add_argument("--num-processes", type=int, default=8)
     # H/I/E/K come from each MoE model case (config.gen_moe_test_cases); no CLI knob
     parser.add_argument("--num-tokens", type=int, default=8192)
-    # GROUP_M for the dense roofline reference
-    parser.add_argument("--dense-group-m", type=int, default=4)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--output", "-o", type=str, default=None)
     # restrict the sweep to these MoE model names (default = all)
