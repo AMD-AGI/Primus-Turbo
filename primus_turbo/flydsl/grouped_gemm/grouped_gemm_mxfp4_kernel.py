@@ -1096,7 +1096,12 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     beta_is_one = beta == 1.0
 
     stream = current_stream(dev)
-    wlv, elgk = 10, 9
+    # elgk=0: the phase barrier has to drain lgkmcnt fully here.  A non-zero budget is
+    # calibrated against how many ds_reads the body issues, and the split A staging issues a
+    # different count than the 9 was tuned for -- reads left in flight let the next
+    # buffer_load_lds overwrite the LDS under them (WAR), surfacing as a rare wgrad mismatch
+    # on the partial last M tile.
+    wlv, elgk = 10, 0
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go_pad, stream)
 
     def _entry(cfg):
