@@ -409,12 +409,7 @@ def _mx_nt_gn_cands(N):
     pick can never regress. Only offer a band when there are >= 2*gn 256-col
     N-blocks (else the band can't create the cross-tile B reuse it exists for).
     Winners are shape-dependent (NT: 7B GateUp gn16, 70B QKV gn8/16), so the
-    per-shape bench picks rather than a single heuristic. Set env MX_DISABLE_NT_GN
-    to force the seed band (NT -> 1D swizzle)."""
-    import os
-
-    if os.environ.get("MX_DISABLE_NT_GN"):
-        return []
+    per-shape bench picks rather than a single heuristic."""
     n_blocks = (N + _BLOCK_N - 1) // _BLOCK_N
     # gn=32 was probed and dropped: its only win (NT 7B_GateUp +1.7% over gn16) is
     # coupled to tile (256,4), but stage-1 picks the tile at the seed band and lands
