@@ -155,8 +155,41 @@ def dense_mma_pipeline_bf16(
     BLOCK_M,
     BLOCK_N,
     nt_vmcnt,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
 ):
-    """Shared 4-quadrant pipelined MMA loop + store epilogue for the fixed-K bf16 tile (NT/NN/TN)."""
+    """Shared 4-quadrant pipelined MMA loop + store epilogue for the fixed-K bf16 tile (NT/NN/TN).
+
+    SKIP_A1 (compile-time): this wave's lower A half (accumulators c10/c11, tile rows
+    [LDS_BLOCK_M + wave_m*N_TILES_A*32, +N_TILES_A*32)) is known to be all-zero padding,
+    so its MFMA groups are provably no-ops -- c10/c11 stay at their zero init and the
+    epilogue stores the same zeros it would have stored anyway. ONLY the mfma.call is
+    dropped: every global load, every s_barrier, every wait_barrier argument, every
+    s_setprio and every store stay byte-for-byte identical, which is what makes it legal
+    for waves inside one workgroup to disagree on this flag (the A1 global->LDS copy is
+    cooperative across all 8 waves, so it must never be skipped per-wave, and the
+    vmcnt-based wait_barrier counts must not shift).
+
+    SKIP_A1_LOADS (compile-time, implies SKIP_A1): the ENTIRE workgroup's lower A half
+    (tile rows [LDS_BLOCK_M, BLOCK_M)) is all-zero padding, so on top of the dead MFMA
+    groups the cooperative A1 global->LDS copies are dead too and can be dropped, halving
+    this tile's A traffic. This is only legal when every wave in the workgroup agrees
+    (the copy is cooperative), which is why the caller must gate it on a wave-independent
+    probe row. Dropping vmem ops shifts the vmcnt bookkeeping, so the FIRST prologue wait
+    drops from N_LDS_STEPS_A + N_LDS_STEPS_B to N_LDS_STEPS_B; every other wait keeps its
+    argument (the steady-state loop wait 2*A+B and the no-A wait A+2*B happen to coincide
+    at 6 for the shapes in use, and the tail's wait_barrier(0) drains unconditionally).
+    Barriers, setprio and stores are untouched.
+
+    SKIP_A1_STORES (compile-time, implies SKIP_A1): the ENTIRE workgroup's lower A half
+    is all-zero padding AND the resulting lower C rows [LDS_BLOCK_M, BLOCK_M) are never
+    read back (combine C padding suffix). The c10/c11 accumulators are therefore known-zero
+    and their global stores are dead VMEM traffic; drop them. Legal only when the caller
+    gates on a wave-independent probe (all waves agree) and the leg never reads the padded
+    C rows. Barriers, setprio, the tail wait_barrier(0)/vmcnt drain and all MFMA/loads are
+    untouched -- this deletes only the store ops for the lower C half.
+    """
     K_ITERS = K // BLOCK_K
     assert K_ITERS >= 2, f"K_ITERS={K_ITERS} too small; need K >= {2 * BLOCK_K}"
     N_TILES_A = BLOCK_M // 128
@@ -185,11 +218,18 @@ def dense_mma_pipeline_bf16(
     b_g2s.load(b_cur0, B0_gl_offset + 0 * b_k_step)
     a_g2s0.load(a_cur0, A0_gl_offset + 0 * a_k_step)
     b_g2s.load(b_cur1, B1_gl_offset + 0 * b_k_step)
-    a_g2s1.load(a_cur1, A1_gl_offset + 0 * a_k_step)
+    if const_expr(not SKIP_A1_LOADS):
+        a_g2s1.load(a_cur1, A1_gl_offset + 0 * a_k_step)
 
     if wave_m == 1:
         rocdl.s_barrier()
-    wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+    if const_expr(SKIP_A1_LOADS):
+        # Without the A1 copy only b_cur0 + a_cur0 + b_cur1 are in flight here; leaving
+        # N_LDS_STEPS_B outstanding drains exactly b_cur0 and a_cur0, which is what the
+        # first loop iteration reads.
+        wait_barrier(N_LDS_STEPS_B)
+    else:
+        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
     b_g2s.load(b_next0, B0_gl_offset + 1 * b_k_step)
     a_g2s0.load(a_next0, A0_gl_offset + 1 * a_k_step)
@@ -200,7 +240,8 @@ def dense_mma_pipeline_bf16(
     for k in range_constexpr(K_ITERS - 2):
         b0_frag = b_s2r.load(b_cur0)
         a0_frag = a_s2r.load(a_cur0)
-        a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+        if const_expr(not SKIP_A1_LOADS):
+            a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -217,12 +258,14 @@ def dense_mma_pipeline_bf16(
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        a1_frag = a_s2r.load(a_cur1)
+        if const_expr(not SKIP_A1):
+            a1_frag = a_s2r.load(a_cur1)
         a_g2s0.load(a_cur0, A0_gl_offset + (k + 2) * a_k_step)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        if const_expr(not SKIP_A1):
+            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
@@ -230,7 +273,8 @@ def dense_mma_pipeline_bf16(
         wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
         rocdl.s_setprio(1)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+        if const_expr(not SKIP_A1):
+            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
@@ -263,18 +307,22 @@ def dense_mma_pipeline_bf16(
     rocdl.s_setprio(0)
     rocdl.s_barrier()
 
-    a1_frag = a_s2r.load(a_cur1)
+    if const_expr(not SKIP_A1):
+        a1_frag = a_s2r.load(a_cur1)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
-    c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+    if const_expr(not SKIP_A1):
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
 
     b0_frag = b_s2r.load(b_next0)
-    a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+    if const_expr(not SKIP_A1_LOADS):
+        a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
-    c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+    if const_expr(not SKIP_A1):
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
 
@@ -329,13 +377,15 @@ def dense_mma_pipeline_bf16(
         store_c.store(c00_frag, base_row + 0, base_col + 0)
     rocdl.s_barrier()
 
-    a1_frag = a_s2r.load(a_cur1)
+    if const_expr(not SKIP_A1):
+        a1_frag = a_s2r.load(a_cur1)
     if const_expr(_HOIST_MODE == 1):
         store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
-    c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-    c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+    if const_expr(not SKIP_A1):
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
     rocdl.s_setprio(0)
     # Splitting this last MFMA pair across an EXTRA s_barrier -- so c10 goes final a group
     # earlier and gets a full group of store cover too -- is NOT valid: the barrier count
@@ -346,7 +396,8 @@ def dense_mma_pipeline_bf16(
         # c01 is independent of the group just issued, so it drains under it; c10 then
         # interlocks on its own MFMA, by which point those stores have covered it.
         store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        if const_expr(not SKIP_A1_STORES):
+            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
     if const_expr(_HOIST_MODE == 3):
         # Mode 3 = mode 2 plus the last quadrant. c11 is produced by the second MFMA of
         # the pair just issued, so its store cannot dodge that RAW interlock wherever it
@@ -359,15 +410,16 @@ def dense_mma_pipeline_bf16(
         # is not free time here -- this wave is the last to arrive as often as not, so
         # what the move actually does is put a stalled store between the MFMA pair and
         # the barrier, delaying every OTHER wave's release. Keep the default at 2.
-        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        if const_expr(not SKIP_A1_STORES):
+            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
     rocdl.s_barrier()
 
     if const_expr(_HOIST_MODE == 0):
         store_c.store(c00_frag, base_row + 0, base_col + 0)
         store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-    if const_expr(_HOIST_MODE < 2):
+    if const_expr(_HOIST_MODE < 2 and not SKIP_A1_STORES):
         store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-    if const_expr(_HOIST_MODE != 3):
+    if const_expr(_HOIST_MODE != 3 and not SKIP_A1_STORES):
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
 
@@ -394,6 +446,9 @@ def gemm_bf16_nt_tile(
     n_exact=False,
     a_slot_ids=None,
     a_block_m=None,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
@@ -503,6 +558,9 @@ def gemm_bf16_nt_tile(
         BLOCK_M,
         BLOCK_N,
         nt_vmcnt,
+        SKIP_A1,
+        SKIP_A1_LOADS,
+        SKIP_A1_STORES,
     )
 
 
@@ -535,6 +593,9 @@ def _gemm_bf16_nn_tn_tile_impl(
     n_exact=False,
     a_slot_ids=None,
     a_block_m=None,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NN/TN needs K % {BLOCK_K} == 0 (got K={K})"
@@ -653,6 +714,9 @@ def _gemm_bf16_nn_tn_tile_impl(
         BLOCK_M,
         BLOCK_N,
         nt_vmcnt,
+        SKIP_A1,
+        SKIP_A1_LOADS,
+        SKIP_A1_STORES,
     )
 
 
@@ -679,6 +743,9 @@ def gemm_bf16_nn_tile(
     n_exact=False,
     a_slot_ids=None,
     a_block_m=None,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
 ):
     _gemm_bf16_nn_tn_tile_impl(
         A,
@@ -703,6 +770,9 @@ def gemm_bf16_nn_tile(
         b_group_base=b_group_base,
         c_cache_modifier=c_cache_modifier,
         n_exact=n_exact,
+        SKIP_A1=SKIP_A1,
+        SKIP_A1_LOADS=SKIP_A1_LOADS,
+        SKIP_A1_STORES=SKIP_A1_STORES,
     )
 
 
@@ -725,6 +795,9 @@ def gemm_bf16_tn_tile(
     out_fp16=False,
     nt_vmcnt=3,
     b_group_base=None,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
 ):
     _gemm_bf16_nn_tn_tile_impl(
         A,
@@ -745,6 +818,9 @@ def gemm_bf16_tn_tile(
         out_fp16=out_fp16,
         nt_vmcnt=nt_vmcnt,
         b_group_base=b_group_base,
+        SKIP_A1=SKIP_A1,
+        SKIP_A1_LOADS=SKIP_A1_LOADS,
+        SKIP_A1_STORES=SKIP_A1_STORES,
     )
 
 

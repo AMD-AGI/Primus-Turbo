@@ -758,7 +758,14 @@ def topk_reduce_bf16_tile(
                 term = fx.arith.extf(f32_vec, vals[j])
                 if const_expr(apply_weights):
                     term = fx.arith.mulf(term, w_vecs[j])
-                term = fx.arith.select(valid[j], term, zero_vec)
+                if const_expr(num_combine_slots <= 0):
+                    # When num_combine_slots > 0, slot_offs[] already redirects dead slots
+                    # past num_records, so their gather returns bf16 0x0000 (-> +0.0) and
+                    # the select is a dead VALU op (~34% of this epilogue). Only when the
+                    # redirect is disabled (num_combine_slots == 0) do dead slots gather
+                    # real data and the zeroing select is load-bearing. This mirrors the
+                    # sender-side _gather_reduce_store, which omits the select entirely.
+                    term = fx.arith.select(valid[j], term, zero_vec)
                 acc = term if acc is None else fx.arith.addf(acc, term)
             buffer_store(fx.arith.trunc_f(bf16_vec, acc), output_res, out_row + col)
 

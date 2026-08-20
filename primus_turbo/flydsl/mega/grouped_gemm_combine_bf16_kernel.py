@@ -87,7 +87,7 @@ _RECT_P = 2
 # steep part of the curve, traded against leaving the GEMM its CUs; halving it to 16
 # costs far more than the 16 CUs are worth (nn 3.68 -> 4.74 ms).
 _PINNED_CONFIG = {
-    "nt": {"num_combine_blocks": 64, "lead_gemm_blocks": 1024},
+    "nt": {"num_combine_blocks": 64, "lead_gemm_blocks": 3072},
     "nn": {"num_combine_blocks": 32, "lead_gemm_blocks": 2048},
     "tn": {"num_combine_blocks": 32, "lead_gemm_blocks": 2048},
 }
@@ -145,6 +145,11 @@ def _make_grouped_gemm_combine(
     num_tasks = num_experts * seg_parts
     # Never lead with more tiles than exist, and keep the XCD residue intact.
     lead_blocks = min(lead_gemm_blocks, worst_case_tiles * n_blocks) // 8 * 8
+    # The dispatch prologue initialises every pool row's slot id to this value and only
+    # real rows overwrite it, so slot_id >= sentinel <=> that pool row is block padding.
+    pad_slot_sentinel = num_ranks * num_max_tokens_per_rank
+    # tn's A rows are not pool rows, so the probe must never fire there.
+    probe_sentinel = 0x7FFFFFFF if layout == "tn" else pad_slot_sentinel
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -265,7 +270,16 @@ def _make_grouped_gemm_combine(
                         seg_count = fx.arith.select(part_rest < part_rows, part_rest, part_rows)
                         if seg_count > fx.Int32(0):
                             t1 = (seg_start + seg_count - fx.Int32(1)) // fx.Int32(BLOCK_M)
-                            tile_cursor = combine_cursor
+                            # Clamp the poll cursor to this segment's own first GEMM tile.
+                            # combine_cursor rides seg_iter to avoid re-polling confirmed
+                            # tiles, but its init of 0 forced the first segment to spin on
+                            # every tile below its own start (one dependent sys-scope flag
+                            # load each) -- tiles that hold no row this block consumes.
+                            # Bit-exact: each of tiles [t0, t1] is still gated; only tiles
+                            # strictly below t0 (not read here) are skipped. Monotonic seg
+                            # rows keep the cursor non-decreasing across segments.
+                            t0 = seg_start // fx.Int32(BLOCK_M)
+                            tile_cursor = fx.arith.select(combine_cursor > t0, combine_cursor, t0)
                             if thread_index == fx.Int32(0):
                                 while tile_cursor <= t1:
                                     fx.rocdl.s_waitcnt(0)
@@ -353,26 +367,94 @@ def _make_grouped_gemm_combine(
                     c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
                     A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
                     C_tile = make_bf16_fp16_tile_tensor(l2_token_buffer_base, c_off, 0x40000000)
-                    gemm_tile(
-                        A_tile,
-                        WEIGHTS,
-                        C_tile,
-                        fx.Int32(BLOCK_M),
-                        c_n,
-                        lds,
-                        fx.Int32(0),
-                        block_n,
-                        K=K,
-                        BLOCK_M=BLOCK_M,
-                        BLOCK_N=BLOCK_N,
-                        out_fp16=out_fp16,
-                        nt_vmcnt=nt_vmcnt,
-                        b_group_base=group_base,
-                        # sc1 only (16), NOT sc1|nt: sc1 is load-bearing for cross-XCD
-                        # visibility, and letting C retire into L2 shortens the drain.
-                        c_cache_modifier=16,
-                        n_exact=True,
+                    # Padding-skip probe -- see the same construct in the dispatch GEMM.
+                    # Each expert's pool region is padded up to a BLOCK_M multiple; those
+                    # rows hold the zeroed pad slot all the way through dispatch+act, and
+                    # nothing ever reads their C rows back (the combine role walks only
+                    # real recv segments). If the first row a wave's c10/c11 quadrants
+                    # cover is already padding, all 64 are, so those MFMA groups are
+                    # no-ops. Loads/barriers/stores are untouched, so waves may disagree.
+                    slot_probe_resource = create_buffer_resource(SORTED_SLOT_IDS, max_size=True)
+                    wave_m_probe = (thread_index // fx.Int32(64)) // fx.Int32(4)
+                    probe_row = (
+                        block_m * fx.Int32(BLOCK_M)
+                        + fx.Int32(BLOCK_M // 2)
+                        + wave_m_probe * fx.Int32((BLOCK_M // 128) * 32)
                     )
+                    pad_hi = buffer_load(
+                        slot_probe_resource, probe_row, vec_width=1, dtype=fx.T.i32()
+                    ) >= fx.Int32(probe_sentinel)
+                    # Wave-independent probe: when the whole workgroup agrees the lower A
+                    # half is padding, the cooperative A1 global->LDS copies are dead too.
+                    pad_uniform = buffer_load(
+                        slot_probe_resource,
+                        block_m * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M // 2),
+                        vec_width=1,
+                        dtype=fx.T.i32(),
+                    ) >= fx.Int32(probe_sentinel)
+                    if pad_uniform:
+                        gemm_tile(
+                            A_tile,
+                            WEIGHTS,
+                            C_tile,
+                            fx.Int32(BLOCK_M),
+                            c_n,
+                            lds,
+                            fx.Int32(0),
+                            block_n,
+                            K=K,
+                            BLOCK_M=BLOCK_M,
+                            BLOCK_N=BLOCK_N,
+                            out_fp16=out_fp16,
+                            nt_vmcnt=nt_vmcnt,
+                            b_group_base=group_base,
+                            c_cache_modifier=16,
+                            n_exact=True,
+                            SKIP_A1=True,
+                            SKIP_A1_STORES=True,
+                        )
+                    elif pad_hi:
+                        gemm_tile(
+                            A_tile,
+                            WEIGHTS,
+                            C_tile,
+                            fx.Int32(BLOCK_M),
+                            c_n,
+                            lds,
+                            fx.Int32(0),
+                            block_n,
+                            K=K,
+                            BLOCK_M=BLOCK_M,
+                            BLOCK_N=BLOCK_N,
+                            out_fp16=out_fp16,
+                            nt_vmcnt=nt_vmcnt,
+                            b_group_base=group_base,
+                            c_cache_modifier=16,
+                            n_exact=True,
+                            SKIP_A1=True,
+                        )
+                    else:
+                        gemm_tile(
+                            A_tile,
+                            WEIGHTS,
+                            C_tile,
+                            fx.Int32(BLOCK_M),
+                            c_n,
+                            lds,
+                            fx.Int32(0),
+                            block_n,
+                            K=K,
+                            BLOCK_M=BLOCK_M,
+                            BLOCK_N=BLOCK_N,
+                            out_fp16=out_fp16,
+                            nt_vmcnt=nt_vmcnt,
+                            b_group_base=group_base,
+                            # sc1 only (16), NOT sc1|nt: sc1 is load-bearing for cross-XCD
+                            # visibility, and letting C retire into L2 shortens the drain.
+                            c_cache_modifier=16,
+                            n_exact=True,
+                            SKIP_A1=False,
+                        )
                     # Whole-workgroup release rendezvous; two are required, and LLVM
                     # folds adjacent barriers, so keep the separator.
                     fx.rocdl.s_waitcnt(0)
