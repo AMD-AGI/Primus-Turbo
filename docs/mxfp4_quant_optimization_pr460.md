@@ -244,7 +244,7 @@ whole-loop 仍沿用 K-loop 的术语，把它切成 256-element phase。因此 
 
 ## PR 状态与依赖
 
-- branch：`zhitwang17:codex/quant-mxfp4-pr460`
+- branch：`zhitwang17:dev/zhitao/gpt-oss-mxfp4-quant`
 - stacked base：`dev/kyle/gptoss-mxfp4-grouped-pr`
 - `primus-460` PR：https://github.com/AMD-AGI/Primus-Turbo/pull/460
 - `primus-460` head commit：`0f3972175fdbe3621d5bf67b23f2b15decfccbf3`
