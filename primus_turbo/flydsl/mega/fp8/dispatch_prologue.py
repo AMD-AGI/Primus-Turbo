@@ -36,7 +36,6 @@ dispatch/combine kernels unpack. Depends only on ``flydsl`` + ``torch``.
 """
 
 import functools
-import os as _os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -57,7 +56,6 @@ from primus_turbo.flydsl.mega.fp8.prims import atomic_add, ld, st
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, sym_map
 from primus_turbo.flydsl.utils.gemm_helper import run_compiled
 
-_BLOCK_THREADS = int(_os.environ.get("PROLOGUE_BT", "256"))  # threads per block
 # grid_blocks (== num_cu) is a caller arg (default 64). Fewer blocks => cheaper
 # self-resetting grid_sync; 48-64 is the measured sweet spot. Must stay <= num_CU so
 # the persistent grid barrier keeps all blocks resident.
@@ -110,7 +108,7 @@ def _make_dispatch_prologue(
     block_m,
     num_max_pool_tokens,
     grid_blocks=_DEFAULT_GRID_BLOCKS,
-    block_threads=_BLOCK_THREADS,
+    block_threads=256,  # matches the bf16 dispatch_prologue_kernel
 ):
     total_pairs = num_tokens * num_topk
     grid_stride = grid_blocks * block_threads
