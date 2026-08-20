@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Unified multi-backend selection for dense flash-attention (bf16).
 
 Mirrors the GEMM convention (``kernels/gemm/gemm_impl.py``): ``KernelBackend`` subclasses
@@ -35,6 +36,10 @@ from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_sbhd_flydsl_forward_impl,
     flash_attn_varlen_flydsl_forward_impl,
+)
+from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
+    flash_attn_sbhd_hipkittens_forward_impl,
+    hipkittens_attn_supported_impl,
 )
 
 _GFX950 = (9, 5)
@@ -164,11 +169,16 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         alibi_slopes=None,
         sink=None,
         qkv_format="bshd",
+        return_softmax=False,
         **kwargs,
     ) -> bool:
         # sbhd only: the kernel is compiled to address that order and takes the [s,b,h,d]
         # view of these [b,s,h,d]-shaped tensors with no copy. Everything else goes to aiter.
         if k is None or v is None or not _sbhd_layout(q, qkv_format):
+            return False
+        # These kernels never materialise the dropout softmax matrix, so a caller that asked
+        # for it has to go to aiter, which does.
+        if return_softmax:
             return False
         if not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
             return False
@@ -189,9 +199,80 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         )
 
 
+class DenseAttnFwdHipkittensBackend(KernelBackend):
+    """HipKittens attention, gfx950 only.
+
+    A narrow backend by construction: bf16, causal, sbhd, head dim 64 or 128, Sq <= Skv, no
+    sink and no varlen. Everything outside that is refused here rather than computed wrongly
+    -- these kernels read out of bounds or leave output unwritten instead of failing -- so a
+    shape that does not qualify falls back to whichever backend does.
+    """
+
+    @staticmethod
+    def can_handle(
+        q,
+        k=None,
+        v=None,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=True,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+        qkv_format="bshd",
+        return_softmax=False,
+        **kwargs,
+    ) -> bool:
+        # Same layout gate as FlyDSL: the kernels address sbhd and take the [s,b,h,d] view of
+        # these [b,s,h,d]-shaped tensors with no copy, so the bytes have to already be in that
+        # order. _sbhd_layout is what decides that, rather than a stride test, because at
+        # b == 1 the two orders are indistinguishable.
+        if k is None or v is None or not _sbhd_layout(q, qkv_format):
+            return False
+        # No dropout softmax matrix here either, for the same reason as FlyDSL above.
+        if return_softmax:
+            return False
+        # Ask the backend rather than restating its rules here, so the two cannot drift. It
+        # answers on the sbhd view, which is what it will be handed.
+        qs, ks, vs = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+        ok, _ = hipkittens_attn_supported_impl(
+            qs,
+            ks,
+            vs,
+            causal=causal,
+            window_size=window_size,
+            sink=sink,
+            dropout_p=dropout_p,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+        )
+        return ok
+
+    @staticmethod
+    def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
+        # Under autotune, off the op layer's path, so the sbhd view is taken here too.
+        q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+        res = flash_attn_sbhd_hipkittens_forward_impl(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_lse=return_lse,
+        )
+        # Back to the [b, s, h, d] view the caller handed us.
+        if return_lse:
+            out, lse = res
+            return out.permute(1, 0, 2, 3), lse
+        return res.permute(1, 0, 2, 3)
+
+
 _DENSE_FWD_BACKENDS = {
     BackendType.FLYDSL: BackendEntry(DenseAttnFwdFlydslBackend),
     BackendType.AITER: BackendEntry(DenseAttnFwdAiterBackend),
+    BackendType.HIPKITTENS: BackendEntry(DenseAttnFwdHipkittensBackend),
 }
 
 
@@ -200,10 +281,35 @@ class FlashAttnDenseDispatcher(AutoKernelDispatcher):
     _cache = TuneCache(1024)
 
     @classmethod
-    def make_key(cls, q, k, causal=True, window_size=(-1, -1), qkv_format="bshd", sink=None, **kwargs):
+    def make_key(
+        cls,
+        q,
+        k,
+        causal=True,
+        window_size=(-1, -1),
+        qkv_format="bshd",
+        sink=None,
+        return_softmax=False,
+        **kwargs,
+    ):
         b, s, hq, d = q.shape
         hkv = k.shape[2]
-        return (b, s, hq, hkv, d, q.dtype, bool(causal), tuple(window_size), qkv_format, sink is not None)
+        # return_softmax belongs in the key because it decides eligibility, not just output:
+        # only aiter can produce the dropout matrix, so a tuned entry cached without it would
+        # hand a return_softmax call to a backend that silently drops it.
+        return (
+            b,
+            s,
+            hq,
+            hkv,
+            d,
+            q.dtype,
+            bool(causal),
+            tuple(window_size),
+            qkv_format,
+            sink is not None,
+            bool(return_softmax),
+        )
 
 
 # =============================================================================

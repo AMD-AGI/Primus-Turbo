@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Heuristic for the Triton WS kernel's ``ws_local_per_xcd`` parameter.
 
 The Triton WS kernel takes a single ``ws_local_per_xcd`` integer that

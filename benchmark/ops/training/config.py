@@ -244,6 +244,27 @@ MoEModelConfigs = {
         "seqlen": 8192,
         "num_topk": 2,
     },
+    # https://huggingface.co/openai/gpt-oss-20b/blob/main/config.json
+    #
+    # seqlen is initial_context_length (4096), not max_position_embeddings (131072): the
+    # latter is what YaRN scaling reaches at inference, and this table is what training runs
+    # attention at.
+    #
+    # Note the attention table below only emits full-causal shapes, while gpt-oss alternates
+    # sliding_attention and full_attention layer by layer -- 12 of its 24 layers run a
+    # 128-wide left window. So the row this contributes is the full-causal half; the windowed
+    # half is not covered here.
+    "GPT-OSS-20B": {
+        "n_routed_experts": 32,
+        "moe_intermediate_size": 2880,
+        "hidden_size": 2880,
+        # GQA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "seqlen": 4096,
+        "num_topk": 4,
+    },
     # https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507/file/view/master/config.json
     "Qwen3-30B-A3B": {
         "n_routed_experts": 128,

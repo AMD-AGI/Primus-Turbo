@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Heuristic for the CK WS kernel's ``ws_local_per_xcd`` parameter.
 
 The CK WS kernel takes a single ``ws_local_per_xcd`` integer:

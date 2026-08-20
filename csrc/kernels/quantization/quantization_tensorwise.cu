@@ -1,13 +1,15 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-//
-// Tensorwise FP8 quantize / dequantize.
-//
-// The actual quant op and the host-side amax -> scale helper are shared with
-// the rowwise kernels and live in primus_turbo/device/quant_utils.cuh. This
-// file also instantiates `compute_scale_from_amax<float>` so its symbol is
-// exported by libprimus_turbo_kernels.so for the binding layer.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ *
+ * Tensorwise FP8 quantize / dequantize.
+ *
+ * The actual quant op and the host-side amax -> scale helper are shared with
+ * the rowwise kernels and live in primus_turbo/device/quant_utils.cuh. This
+ * file also instantiates `compute_scale_from_amax<float>` so its symbol is
+ * exported by libprimus_turbo_kernels.so for the binding layer.
+ **************************************************************************************************/
 
 #include "primus_turbo/common.h"
 #include "primus_turbo/device/quant_utils.cuh"

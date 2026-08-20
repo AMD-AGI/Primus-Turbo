@@ -4,3 +4,7 @@
 [submodule "3rdparty/hipify_torch"]
 	path = 3rdparty/hipify_torch
 	url = https://github.com/ROCm/hipify_torch.git
+[submodule "3rdparty/hipkittens"]
+	path = 3rdparty/hipkittens
+	url = https://github.com/HazyResearch/HipKittens.git
+	branch = main

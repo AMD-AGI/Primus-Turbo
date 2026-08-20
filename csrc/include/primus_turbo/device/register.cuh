@@ -1,8 +1,10 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-//
-// Pinned AGPR/VGPR register primitives for hand-tuned kernels.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ *
+ * Pinned AGPR/VGPR register primitives for hand-tuned kernels.
+ **************************************************************************************************/
 
 #pragma once
 

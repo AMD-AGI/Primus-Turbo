@@ -1,8 +1,10 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-//
-// Memory operation primitives: synchronization, SRD, GMEM->SMEM, pinned LDS read.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ *
+ * Memory operation primitives: synchronization, SRD, GMEM->SMEM, pinned LDS read.
+ **************************************************************************************************/
 
 #pragma once
 

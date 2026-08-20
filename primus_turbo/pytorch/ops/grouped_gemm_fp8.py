@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 from typing import Optional, Union
 
 import torch
@@ -536,6 +537,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
     def backward(ctx, grad_out):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
+        k_pad_real = getattr(ctx, "k_pad_real", None)
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
         quantized_grad_out = QuantizedTensor.quantize(
@@ -579,6 +581,10 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
         )
+
+        if k_pad_real is not None:
+            grad_a = grad_a[:, :k_pad_real].contiguous()
+            grad_b = grad_b[..., :k_pad_real].contiguous()
 
         return (
             grad_a,  # a
