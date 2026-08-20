@@ -1578,7 +1578,6 @@ def build_interm_blocked(topk_len, num_heads, BD, qpad=16, spad=8):
 # v2: LDS-staged, coalesced. Each WG owns one token x one d-tile(16): 256 threads coalesced-
 # stage that d-tile's Q/dO[H][16] into LDS once, then 4 waves loop rank-tiles feeding the MFMA
 # A operand via ds_read_tr16_b64. MFMA = mfma_f32_16x16x16bf16_1k (K=16). Grid=(T, D_V//16).
-QLDS = 16  # staged d-width per h-row (one d-tile)
 
 
 # ============================================================================

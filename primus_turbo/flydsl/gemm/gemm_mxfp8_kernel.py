@@ -375,7 +375,6 @@ def _build_mxfp8_nt_kernel(
 
 # ── Primus-Turbo host wrapper ────────────────────────────────────────────────
 
-_BLOCK_M = 256
 _BLOCK_N = 256
 _PRESHUF_BLK = 256  # preshuffle kernel block size (matches build_preshuffle_ab_kernel)
 

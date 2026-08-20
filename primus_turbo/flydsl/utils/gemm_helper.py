@@ -444,17 +444,6 @@ def wait_barrier(count):
     )
 
 
-def lds_barrier():
-    """Drain this wave's LDS traffic, then sync the workgroup."""
-    _llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="s_waitcnt lgkmcnt(0)\ns_barrier",
-        constraints="",
-        has_side_effects=True,
-    )
-
-
 class Mfma16x16x128:
     def __init__(self, n_tiles_a, n_tiles_b):
         self.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
