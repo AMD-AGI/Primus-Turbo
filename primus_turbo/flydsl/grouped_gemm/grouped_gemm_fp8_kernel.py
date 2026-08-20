@@ -2073,25 +2073,6 @@ def _balanced_group_offs(m_total, G, device):
     return offs.view(torch.int32)
 
 
-def _skewed_group_offs(mg_cpu, M_c, G, device, blk=256):
-    """Synthetic group_offs [G+1] int64 (int32-view) at the canonical M_c, blk-aligned with
-    a one-block floor (keeps every group non-empty). Falls back to balanced when degenerate
-    (G*blk exceeds M_c, or all-zero)."""
-    tot = sum(mg_cpu)
-    if tot <= 0 or G * blk > M_c:
-        return _balanced_group_offs(M_c, G, device)
-    raw = [max(m, 0) / tot * M_c for m in mg_cpu]
-    sizes = [max(blk, int(round(r / blk)) * blk) for r in raw]
-    diff = M_c - sum(sizes)
-    j = max(range(G), key=lambda i: sizes[i])  # settle rounding on the hottest group
-    sizes[j] += diff
-    if sizes[j] < blk:
-        return _balanced_group_offs(M_c, G, device)
-    offs = torch.zeros(G + 1, dtype=torch.int64, device=device)
-    offs[1:] = torch.tensor(sizes, dtype=torch.int64, device=device).cumsum(0)
-    return offs.view(torch.int32)
-
-
 _NP_8WAVE_CANDS = ((256, 8, 4, 0), (256, 8, 8, 0))
 # (num_xcd=4, group_m=8) is the measured static optimum across the deployed MoE shape family.
 # The online race cannot find it: it scores on synthetic *balanced* tensors, where this arm
@@ -2340,360 +2321,6 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
 
 _GROUPED_WGRAD_LAUNCH_CACHE: dict = {}
 _GROUPED_WGRAD_AT_CACHE: dict = {}
-
-
-def _wgrad_loop_body_pipe(
-    k,
-    a_g2s,
-    b_g2s,
-    a_s2r,
-    b_s2r,
-    mfma,
-    a_cur0,
-    a_cur1,
-    b_cur0,
-    b_cur1,
-    acc00,
-    acc01,
-    acc10,
-    acc11,
-    A0_off,
-    A1_off,
-    B0_off,
-    B1_off,
-    out_m,
-    out_n,
-    stage_bytes,
-    parity=None,
-):
-    """One K-tile of the 2-stage prefetch-overlap loop: reads THIS tile from LDS stage (k%2)
-    and issues the NEXT tile's G2S into stage ((k+1)%2) so its vmem latency overlaps THIS tile's
-    mma. K-tail over-read SRD-clamped to 0; caller's prologue must G2S K-tile 0 into stage 0."""
-    BLOCK_K = 128
-    if parity is not None:
-        # UNROLL mode: compile-time parity (j%2 in range_constexpr) gives constant read/write offsets so the backend fully overlaps blocks.
-        read_off = fx.Int32(parity * stage_bytes)
-        write_off = fx.Int32((1 - parity) * stage_bytes)
-        kn = (k + 1) * BLOCK_K
-        kna = kn * out_m
-        knb = kn * out_n
-        # ds_read reads stage[read_off] filled by the previous block G2S; vmcnt(0) drains it first (a coop barrier alone would race).
-        wait_barrier(0)
-    else:
-        k_mod = k % 2
-        read_off = fx.Int32(k_mod * stage_bytes)
-        write_off = fx.Int32(((k + 1) % 2) * stage_bytes)
-        kn = (k + 1) * BLOCK_K
-        kna = kn * out_m
-        knb = kn * out_n
-        wait_barrier(0)  # drain this tile's G2S (issued prev iter/prologue) + barrier
-    # Read this tile first, then spread the 4 next-tile G2S across the 4 MFMA to overlap vmem latency with matrix issue.
-    a0 = a_s2r.load(a_cur0, base_off=read_off)
-    a1 = a_s2r.load(a_cur1, base_off=read_off)
-    b0 = b_s2r.load(b_cur0, base_off=read_off)
-    b1 = b_s2r.load(b_cur1, base_off=read_off)
-    a_g2s.load(a_cur0, A0_off + kna, base_off=write_off)
-    _wgrad_accum(mfma, a0, b0, acc00)
-    a_g2s.load(a_cur1, A1_off + kna, base_off=write_off)
-    _wgrad_accum(mfma, a0, b1, acc01)
-    b_g2s.load(b_cur0, B0_off + knb, base_off=write_off)
-    _wgrad_accum(mfma, a1, b0, acc10)
-    b_g2s.load(b_cur1, B1_off + knb, base_off=write_off)
-    _wgrad_accum(mfma, a1, b1, acc11)
-
-
-def _compile_grouped_tn_wgrad_persistent(
-    *,
-    OUT_M: int,
-    OUT_N: int,
-    G: int,
-    BLOCK_M: int = 256,
-    BLOCK_N: int = 256,
-    waves_per_eu: int = 2,
-    num_xcd: int = 8,
-    cbsz: int = 0,
-    blgp: int = 0,
-    out_fp16: bool = False,
-    group_m: int = 0,
-    group_n: int = 0,
-    store_cshuffle: bool = True,
-    asm_mma: bool = True,
-    asm_acc_mode: str = "vgpr",
-    s2r_inline: bool = False,
-    nt_vmcnt: int = 3,
-    unroll_n: int = -1,  # >=2: continuous-N chunk-unroll (dense-pipeline, capacity-free); -1 = use module env default
-    cap_cu: int = -1,  # >0 caps grid to this many WGs (reserve CUs for comm overlap)
-    i64_traverse: bool = False,  # A[m,OUT_M] & B[m,OUT_N] traversal via per-load i64 SRD re-base (lifts mg*OUT < 2^32 cap)
-    beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
-):
-    """PERSISTENT grouped TN wgrad (the production wgrad; fwd/dgrad are persistent
-    so wgrad must be too). grid = min(G*TILES_PER_GROUP, num_cus); each WG
-    strides `for t in range(pid, TOTAL, nsms)` over the tile space in XCD-remapped +
-    band order. TOTAL is compile-time (OUT dims fixed) -> no device scan. Per-group
-    SRD num_records clamp handles the K-tail; rmem accs reset per tile."""
-    BLOCK_K = 128
-    # unroll_n<0 -> plain scf.for; else the explicit continuous-N unroll factor (a per-shape autotune knob).
-    _un = 0 if unroll_n < 0 else unroll_n
-    assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
-    assert G >= 1
-    N_TILES_A = BLOCK_M // 64
-    N_TILES_B = BLOCK_N // 128
-    N_ACCUMS = N_TILES_A * N_TILES_B
-    LDS_BLOCK_M = BLOCK_M // 2
-    LDS_BLOCK_N = BLOCK_N // 2
-    N_LDS_STEPS_A = max(LDS_BLOCK_M // 64, 2)
-    N_LDS_STEPS_B = LDS_BLOCK_N // 64
-    N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
-    _LDS_CS = 1056
-    a_lds_size = max(LDS_BLOCK_M * BLOCK_K, 2 * 8 * 1024) // 1024 * _LDS_CS
-    b_lds_size = (LDS_BLOCK_N * BLOCK_K) // 1024 * _LDS_CS
-    assert a_lds_size == b_lds_size
-    _WG_STAGE_BYTES = a_lds_size
-    N_BLOCKS_M = (OUT_M + BLOCK_M - 1) // BLOCK_M
-    N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
-    TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
-    TOTAL = G * TILES_PER_GROUP
-    _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    _cshuf_n = 8 * 16 * (N_TILES_B * 16)
-
-    @fx.struct
-    class SharedStorage:
-        A_lds_0: fx.Array[fx.Float8E4M3FN, 2 * a_lds_size, 16]
-        A_lds_1: fx.Array[fx.Float8E4M3FN, 2 * a_lds_size, 16]
-        B_lds_0: fx.Array[fx.Float8E4M3FN, 2 * b_lds_size, 16]
-        B_lds_1: fx.Array[fx.Float8E4M3FN, 2 * b_lds_size, 16]
-        C_lds_shuffle: fx.Array[_cshuf_ty, _cshuf_n, 16]
-
-    @flyc.kernel(known_block_size=[512, 1, 1])
-    def kernel_grouped_tn_persist(
-        A: fx.Tensor,
-        B: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-        group_offs: fx.Tensor,
-    ):
-        _ = str(fx.thread_idx.x)
-        F8_IR_t = fx.Float8E4M3FN.ir_type
-        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        go = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
-        go_div = fx.logical_divide(go, fx.make_layout(1, 1))
-
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        a_cur0 = lds.A_lds_0
-        a_cur1 = lds.A_lds_1
-        b_cur0 = lds.B_lds_0
-        b_cur1 = lds.B_lds_1
-        lane_id = fx.thread_idx.x % 64
-        wave_id = fx.thread_idx.x // 64
-        wave_m = wave_id // 4
-        wave_n = wave_id % 4
-        gl_off_a = compute_global_swizzle_nn(lane_id, wave_id, OUT_M, N_LDS_ROUNDS)
-        gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, OUT_N, N_LDS_ROUNDS)
-        mfma = _build_mfma(
-            N_TILES_A,
-            N_TILES_B,
-            cbsz,
-            blgp,
-            asm_mode=("2" if asm_acc_mode == "agpr" else "3") if asm_mma else None,
-        )
-        a_s2r = S2RLoaderTr(
-            wave_m,
-            N_TILES_A,
-            LDS_BLOCK_M // 2,
-            inline_asm=s2r_inline,
-            vmcnt_hint=nt_vmcnt,
-            chunk_stride=_LDS_CS,
-        )
-        b_s2r = S2RLoaderTr(
-            wave_n, N_TILES_B, 32, inline_asm=s2r_inline, vmcnt_hint=nt_vmcnt, chunk_stride=_LDS_CS
-        )
-        acc00 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range(N_ACCUMS)]
-        acc01 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range(N_ACCUMS)]
-        acc10 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range(N_ACCUMS)]
-        acc11 = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range(N_ACCUMS)]
-        wave_n_offset = wave_n * (N_TILES_B * 16)
-        wave_m_offset = wave_m * (N_TILES_A * 16)
-
-        def _tile_meta(tidx):
-            # All per-tile addressing/loaders as a pure function of the tile index, evaluable for both current and prefetched-next tiles.
-            tt = xcd_remap_pid(tidx, TOTAL, num_xcd)
-            group_idx, block_m, block_n = _wgrad_block_mn(
-                tt, G, TILES_PER_GROUP, N_BLOCKS_M, N_BLOCKS_N, group_m, group_n, False
-            )
-            m_start = _load_go(go_div, group_idx)
-            m_end = _load_go(go_div, group_idx + 1)
-            k_iters = (m_end - m_start + (BLOCK_K - 1)) // BLOCK_K
-
-            a_div, b_div, a_rb, b_rb = _wgrad_rebase(A, B, m_start, m_end, OUT_M, OUT_N, F8_IR_t)
-            # A and B both stride the contraction (token) dim: re-base both SRDs per load in i64 mode.
-            a_rebase = a_rb if i64_traverse else None
-            b_rebase = b_rb if i64_traverse else None
-            a_g2s = G2SLoader(
-                a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=a_rebase
-            )
-            b_g2s = G2SLoader(
-                b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id, chunk_stride=_LDS_CS, rebase=b_rebase
-            )
-
-            # i32 offsets: persistent wgrad runs only in the short regime (M_total <= 4096), so mg*OUT never reaches 2^31.
-            A0_off = block_m * BLOCK_M  # relative to the m_start-folded i64 SRD base
-            A1_off = A0_off + LDS_BLOCK_M
-            B0_off = block_n * BLOCK_N
-            B1_off = B0_off + LDS_BLOCK_N
-            return (group_idx, block_m, block_n, k_iters, a_g2s, b_g2s, A0_off, A1_off, B0_off, B1_off)
-
-        def _wgrad_prologue(meta):
-            # Load K-block 0 into LDS stage 0; the s_barrier is the WAR guard vs the previous tile last-stage reads.
-            a_g2s, b_g2s = meta[4], meta[5]
-            A0_off, A1_off, B0_off, B1_off = meta[6], meta[7], meta[8], meta[9]
-            _z = fx.Int32(0)
-            rocdl.s_barrier()
-            a_g2s.load(a_cur0, A0_off, base_off=_z)
-            a_g2s.load(a_cur1, A1_off, base_off=_z)
-            b_g2s.load(b_cur0, B0_off, base_off=_z)
-            b_g2s.load(b_cur1, B1_off, base_off=_z)
-
-        pid = fx.block_idx.x
-        nsms = fx.grid_dim.x
-
-        # Top-prologue per tile (no inter-tile prefetch: a 2nd SRD calc spills past the 8-wave cap; TN is LDS-transpose/MFMA-bound, not prologue-bound).
-        def _do_tile(t):  # per-tile body (the runtime K-loop stays inside)
-            (group_idx, block_m, block_n, k_iters, a_g2s, b_g2s, A0_off, A1_off, B0_off, B1_off) = _tile_meta(
-                t
-            )
-
-            for q in (acc00, acc01, acc10, acc11):
-                for r in q:
-                    fx.memref_store_vec(mfma.zero_value, r)
-
-            _wgrad_prologue(
-                (group_idx, block_m, block_n, k_iters, a_g2s, b_g2s, A0_off, A1_off, B0_off, B1_off)
-            )
-            if const_expr(_un >= 2):
-                # continuous-N-unroll: outer runtime chunk x inner range_constexpr(N), compile-time parity; over-run -> 0.
-                _N = _un
-                n_outer = (k_iters + (_N - 1)) // _N
-                for c in range(n_outer):
-                    base = c * _N
-                    for j in range_constexpr(_N):
-                        _wgrad_loop_body_pipe(
-                            base + j,
-                            a_g2s,
-                            b_g2s,
-                            a_s2r,
-                            b_s2r,
-                            mfma,
-                            a_cur0,
-                            a_cur1,
-                            b_cur0,
-                            b_cur1,
-                            acc00,
-                            acc01,
-                            acc10,
-                            acc11,
-                            A0_off,
-                            A1_off,
-                            B0_off,
-                            B1_off,
-                            OUT_M,
-                            OUT_N,
-                            _WG_STAGE_BYTES,
-                            parity=(j % 2),
-                        )
-            else:
-                for k in range(k_iters):
-                    _wgrad_loop_body_pipe(
-                        k,
-                        a_g2s,
-                        b_g2s,
-                        a_s2r,
-                        b_s2r,
-                        mfma,
-                        a_cur0,
-                        a_cur1,
-                        b_cur0,
-                        b_cur1,
-                        acc00,
-                        acc01,
-                        acc10,
-                        acc11,
-                        A0_off,
-                        A1_off,
-                        B0_off,
-                        B1_off,
-                        OUT_M,
-                        OUT_N,
-                        _WG_STAGE_BYTES,
-                    )
-
-            if const_expr(store_cshuffle):
-                store_c = StoreCPerTensorCShuffle(
-                    A_scale,
-                    B_scale,
-                    C,
-                    (group_idx + 1) * OUT_M,
-                    OUT_N,
-                    mfma.idx,
-                    N_TILES_A,
-                    N_TILES_B,
-                    _out_ty,
-                    lds.C_lds_shuffle,
-                    wave_id,
-                    beta_is_one=beta_is_one,
-                )
-            else:
-                store_c = StoreCPerTensor(
-                    A_scale,
-                    B_scale,
-                    C,
-                    (group_idx + 1) * OUT_M,
-                    OUT_N,
-                    mfma.idx,
-                    N_TILES_A,
-                    N_TILES_B,
-                    _out_ty,
-                    beta_is_one=beta_is_one,
-                )
-            c00 = [Vec(fx.memref_load_vec(r)) for r in acc00]
-            c01 = [Vec(fx.memref_load_vec(r)) for r in acc01]
-            c10 = [Vec(fx.memref_load_vec(r)) for r in acc10]
-            c11 = [Vec(fx.memref_load_vec(r)) for r in acc11]
-            base_row = group_idx * OUT_M + block_m * BLOCK_M + wave_m_offset
-            base_col = block_n * BLOCK_N + wave_n_offset
-            _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_M, LDS_BLOCK_N)
-
-        # Persistent: a fixed grid of <=ncus WGs strides the tile space (scf.for).
-        for t in range(pid, TOTAL, nsms):
-            _do_tile(t)
-
-    @flyc.jit
-    def launch_grouped_tn_persist(
-        A: fx.Tensor,
-        B: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-        group_offs: fx.Tensor,
-        stream: fx.Stream,
-    ):
-        ncus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-        # Cap the grid to ncus WGs (or cap_cu when reserving CUs for comm overlap).
-        cap = ncus if cap_cu <= 0 else min(int(cap_cu), ncus)
-        grid_x = arith.select(fx.Int32(TOTAL) < cap, fx.Int32(TOTAL), fx.Int32(cap))
-        _ag = 128 if (asm_mma and asm_acc_mode == "agpr") else 0
-        attrs = make_value_attrs(waves_per_eu, _ag, "512,512")
-        kernel_grouped_tn_persist(
-            A,
-            B,
-            C,
-            A_scale,
-            B_scale,
-            group_offs,
-            value_attrs=attrs,
-        ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
-
-    return launch_grouped_tn_persist
 
 
 # 3-buffer whole-loop: one pool at depth 3, rest depth 2; n_phases = lcm(nbuf), statically unrolled.
@@ -3075,8 +2702,7 @@ def _wholeloop_tile_3buf(
     tail_nval=None,  # pass through to _wholeloop_asm_3buf
     a_plain=False,  # see _wholeloop_tile_3buf's a_plain/a_row_stride
     a_row_stride=None,
-    b0_extra_buf=None,  # optional 3rd buffer for pool2 (B0), giving both B pools 3-deep
-    # buffering instead of just pool3 (B1). None = 1-pool-3buf behavior.
+    b0_extra_buf,  # pool2's (B0) 3rd buffer, so both B pools are 3-deep, not just pool3 (B1)
     a_halves=2,  # 2 = full a0+a1; 1 = a0-only (last <=128-valid M-block boundary skip)
     b_halves=2,  # 2 = full b0+b1; 1 = b0-only (last <=128-valid N-block boundary skip)
     nval_can_be_zero=False,  # see _wholeloop_asm_3buf
@@ -3116,14 +2742,13 @@ def _wholeloop_tile_3buf(
         a_g2s.load(a_next1, A1_gl_offset + 1 * A_K_STEP)
     if b_halves == 2:
         b_g2s.load(b_extra1, B1_gl_offset + 2 * B_K_STEP)  # pool3's 3rd prime (K-block 2)
-    if b0_extra_buf is not None:
-        b_g2s.load(b0_extra_buf, B0_gl_offset + 2 * B_K_STEP)  # pool2's 3rd prime
+    b_g2s.load(b0_extra_buf, B0_gl_offset + 2 * B_K_STEP)  # pool2's 3rd prime
     # This rendezvous covers only the buf0 primes (consumed by the whole-loop own prologue reads); buf1 and 3rd-buffer primes are waited later inside the asm.
-    _n_deep_b = (1 if b0_extra_buf is not None else 0) + (1 if b_halves == 2 else 0)
+    _n_deep_b = 1 + (1 if b_halves == 2 else 0)
     wait_barrier(a_halves * nsa + b_halves * nsb + _n_deep_b * nsb)
 
     # pools[p] = (buf_tuple, s2r); 3buf pools buf_tuple has 3 entries, others 2.
-    pool2_bufs = (b_cur0, b_next0) if b0_extra_buf is None else (b_cur0, b_next0, b0_extra_buf)
+    pool2_bufs = (b_cur0, b_next0, b0_extra_buf)
     a_pools = [((a_cur0, a_next0), a_s2r)]
     if a_halves == 2:
         a_pools.append(((a_cur1, a_next1), a_s2r))
@@ -3162,11 +2787,7 @@ def _wholeloop_tile_3buf(
     soff0_a = [rocdl.readfirstlane(T.i32, fx.Int32(A0_gl_offset) + fx.Int32(2) * kstep_a)]
     if a_halves == 2:
         soff0_a.append(rocdl.readfirstlane(T.i32, A1_soff0 + fx.Int32(2) * kstep_a))
-    soff0_b = [
-        rocdl.readfirstlane(
-            T.i32, fx.Int32(B0_gl_offset) + fx.Int32(3 if b0_extra_buf is not None else 2) * kstep_b
-        )
-    ]
+    soff0_b = [rocdl.readfirstlane(T.i32, fx.Int32(B0_gl_offset) + fx.Int32(3) * kstep_b)]
     if b_halves == 2:
         soff0_b.append(rocdl.readfirstlane(T.i32, fx.Int32(B1_gl_offset) + fx.Int32(3) * kstep_b))
     acc0 = [[mfma.zero_value] * n_accums for _ in range_constexpr(a_halves * b_halves)]
