@@ -191,7 +191,8 @@ def _make_kernel(
             # See the padding-skip probe at the gemm_tile call below.
             slot_probe_resource = create_buffer_resource(SORTED_DISPATCH_SLOT_IDS, max_size=True)
             wave_m_probe = (thread_index // fx.Int32(64)) // fx.Int32(4)
-            probe_row_in_tile = fx.Int32(BLOCK_M // 2) + wave_m_probe * fx.Int32((BLOCK_M // 128) * 32)
+            probe_row_a0 = wave_m_probe * fx.Int32((BLOCK_M // 128) * 32)
+            probe_row_in_tile = fx.Int32(BLOCK_M // 2) + probe_row_a0
         if const_expr(is_tn):
             go_base = fx.arith.ArithValue(
                 arith.index_cast(fx.T.i64(), extract_base_index(GROUP_OFFS)), signed=True
@@ -379,8 +380,14 @@ def _make_kernel(
                 # SKIP_A1_LOADS drops them, halving this tile's A traffic on top of the
                 # dead MFMAs. The INNER one is per-wave and only removes MFMAs, which waves
                 # may legally disagree on.
-                pad_uniform = (
-                    buffer_load(slot_probe_resource, block_m * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M // 2),
+                # Per-wave, 64-row-exact: a wave's c00/c01 band is [wave_m*64, +64) and
+                # its c10/c11 band is [BLOCK_M/2 + wave_m*64, +64). Padding is a suffix
+                # inside an expert region, so probing each band's FIRST row classifies
+                # the whole band, and a padding band's C rows are never read back -- both
+                # its MFMA groups and its stores are dead. Only mfma/store ops are
+                # dropped, so waves may disagree.
+                pad_all = (
+                    buffer_load(slot_probe_resource, block_m * fx.Int32(BLOCK_M) + probe_row_a0,
                                 vec_width=1, dtype=fx.T.i32())
                     >= fx.Int32(pad_slot_sentinel)
                 )
@@ -389,7 +396,7 @@ def _make_kernel(
                                 vec_width=1, dtype=fx.T.i32())
                     >= fx.Int32(pad_slot_sentinel)
                 )
-                if pad_uniform:
+                if pad_all:
                     gemm_tile(
                         full_pool,
                         WEIGHTS,
@@ -407,8 +414,12 @@ def _make_kernel(
                         b_group_base=gbase,
                         a_slot_ids=SORTED_DISPATCH_SLOT_IDS,
                         a_block_m=block_m,
+                        n_exact=True,
+                        c_cache_modifier=16,
                         SKIP_A1=True,
                         SKIP_A1_STORES=True,
+                        SKIP_A0=True,
+                        SKIP_A0_STORES=True,
                     )
                 elif pad_hi:
                     gemm_tile(
@@ -428,7 +439,10 @@ def _make_kernel(
                         b_group_base=gbase,
                         a_slot_ids=SORTED_DISPATCH_SLOT_IDS,
                         a_block_m=block_m,
+                        n_exact=True,
+                        c_cache_modifier=16,
                         SKIP_A1=True,
+                        SKIP_A1_STORES=True,
                     )
                 else:
                     gemm_tile(
@@ -448,6 +462,8 @@ def _make_kernel(
                         b_group_base=gbase,
                         a_slot_ids=SORTED_DISPATCH_SLOT_IDS,
                         a_block_m=block_m,
+                        n_exact=True,
+                        c_cache_modifier=16,
                         SKIP_A1=False,
                     )
 
@@ -477,7 +493,7 @@ def _make_epoch_bump(addend):
 
 
 @autotune(
-    configs=[Config(num_dispatch_blocks=nb, nt_vmcnt=4) for nb in (8, 16, 24, 32, 48, 64)],
+    configs=[Config(num_dispatch_blocks=nb, nt_vmcnt=3) for nb in (8, 16, 24, 32, 48, 64)],
     key=[
         "out_features",
         "hidden_size",

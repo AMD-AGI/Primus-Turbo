@@ -150,6 +150,10 @@ def _make_grouped_gemm_combine(
     pad_slot_sentinel = num_ranks * num_max_tokens_per_rank
     # tn's A rows are not pool rows, so the probe must never fire there.
     probe_sentinel = 0x7FFFFFFF if layout == "tn" else pad_slot_sentinel
+    # Exact pad classifier threshold: rows [pad_start, BLOCK_M) of a tile are block
+    # padding, where pad_start = (expert's last real pool row) - block_m*BLOCK_M. A
+    # very negative threshold disables the skip entirely (tn's A rows are not pool rows).
+    pad_thresh = -(1 << 30) if layout == "tn" else BLOCK_M // 2
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def grouped_gemm_combine_kernel(
@@ -374,25 +378,35 @@ def _make_grouped_gemm_combine(
                     # real recv segments). If the first row a wave's c10/c11 quadrants
                     # cover is already padding, all 64 are, so those MFMA groups are
                     # no-ops. Loads/barriers/stores are untouched, so waves may disagree.
-                    slot_probe_resource = create_buffer_resource(SORTED_SLOT_IDS, max_size=True)
+                    # EXACT pad classifier (replaces the sentinel probe). An expert's pool
+                    # region ends at the last rank segment's end row, and everything after
+                    # it up to the BLOCK_M boundary is block padding, so the first padding
+                    # row inside this tile is known in closed form from two scalar loads of
+                    # tables the kernel already carries -- no dependency on the prologue's
+                    # sentinel ever reaching SORTED_SLOT_IDS, which is what made the old
+                    # probe under-fire relative to the dispatch side.
                     wave_m_probe = (thread_index // fx.Int32(64)) // fx.Int32(4)
-                    probe_row = (
-                        block_m * fx.Int32(BLOCK_M)
-                        + fx.Int32(BLOCK_M // 2)
-                        + wave_m_probe * fx.Int32((BLOCK_M // 128) * 32)
+                    pad_recv_start_res = create_buffer_resource(RECV_START_ROW, max_size=True)
+                    pad_recv_count_res = create_buffer_resource(RECV_COUNT, max_size=True)
+                    pad_last_seg = group_index * fx.Int32(num_ranks) + fx.Int32(num_ranks - 1)
+                    pad_real_end = buffer_load(
+                        pad_recv_start_res, pad_last_seg, vec_width=1, dtype=fx.T.i32()
+                    ) + buffer_load(pad_recv_count_res, pad_last_seg, vec_width=1, dtype=fx.T.i32())
+                    pad_start = pad_real_end - block_m * fx.Int32(BLOCK_M)
+                    # Per-wave, 64-row-exact classifier. A wave owns two disjoint 64-row
+                    # bands: c00/c01 cover [wave_m*64, +64) and c10/c11 cover
+                    # [BLOCK_M/2 + wave_m*64, +64). A band is entirely padding iff
+                    # pad_start <= its first row, and the C rows of a padding band are
+                    # never read back, so BOTH its MFMA groups and its stores are dead.
+                    # Skipping per wave (instead of only when the whole workgroup agrees
+                    # the lower half is padding) is legal because the bands are disjoint
+                    # across waves and only mfma/store ops are dropped -- barriers, LDS
+                    # traffic and the cooperative global->LDS copies are untouched.
+                    pad_hi = pad_start <= fx.Int32(pad_thresh) + wave_m_probe * fx.Int32(BLOCK_M // 4)
+                    pad_all = pad_start <= fx.Int32(pad_thresh - BLOCK_M // 2) + wave_m_probe * fx.Int32(
+                        BLOCK_M // 4
                     )
-                    pad_hi = buffer_load(
-                        slot_probe_resource, probe_row, vec_width=1, dtype=fx.T.i32()
-                    ) >= fx.Int32(probe_sentinel)
-                    # Wave-independent probe: when the whole workgroup agrees the lower A
-                    # half is padding, the cooperative A1 global->LDS copies are dead too.
-                    pad_uniform = buffer_load(
-                        slot_probe_resource,
-                        block_m * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M // 2),
-                        vec_width=1,
-                        dtype=fx.T.i32(),
-                    ) >= fx.Int32(probe_sentinel)
-                    if pad_uniform:
+                    if pad_all:
                         gemm_tile(
                             A_tile,
                             WEIGHTS,
@@ -412,6 +426,8 @@ def _make_grouped_gemm_combine(
                             n_exact=True,
                             SKIP_A1=True,
                             SKIP_A1_STORES=True,
+                            SKIP_A0=True,
+                            SKIP_A0_STORES=True,
                         )
                     elif pad_hi:
                         gemm_tile(
@@ -432,6 +448,7 @@ def _make_grouped_gemm_combine(
                             c_cache_modifier=16,
                             n_exact=True,
                             SKIP_A1=True,
+                            SKIP_A1_STORES=True,
                         )
                     else:
                         gemm_tile(
