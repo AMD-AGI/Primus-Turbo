@@ -37,7 +37,6 @@ _WARP = 64
 _BLOCK_THREADS = 512
 _PVEC = 8
 _NUM_WARPS = _BLOCK_THREADS // _WARP
-_L1_BYPASS = 1  # buffer cache_modifier: skip L1 (read fresh L2Y after l2_invalidate)
 
 
 @ASTRewriter.transform

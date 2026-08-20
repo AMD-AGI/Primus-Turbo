@@ -1319,7 +1319,7 @@ _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
 _GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16, beta1) -> [raw, compiled]
 _GWG_CFG_CACHE: dict = {}  # at_key -> (bm, bn, gm, xcd, gn) chosen by autotune
 
-# variable-K wgrad config autotune (mirrors the fwd/dgrad NT path). Shares PT_MXGG_AUTOTUNE.
+# variable-K wgrad config autotune (mirrors the fwd/dgrad NT path).
 _GWG_WGRAD_DEFAULT_CFG = (256, 256, 4, 8, 0)  # (bm, bn, gm, xcd, gn); cand[0] = base ref (prior fixed cfg)
 
 

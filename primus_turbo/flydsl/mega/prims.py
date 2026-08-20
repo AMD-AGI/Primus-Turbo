@@ -152,10 +152,6 @@ def elem_ptr(
     return get_element_ptr(ptr, byte_offset=byte_off, elem_type=fx.T.i8())
 
 
-def addr_elem_ptr_i32(addr_i64: Union[int, fx.ArithValue], idx: Union[int, fx.ArithValue]) -> ir.Value:
-    return elem_ptr(addr_i64, idx, "global")
-
-
 def atomic_add(
     base: Union[int, fx.ArithValue],
     offset: Union[int, fx.ArithValue],
