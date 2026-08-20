@@ -5,6 +5,15 @@
 # 1. pip install pre-commit
 # 2. pre-commit install(the first time you download the repo, it will be cached for future use)
 repos:
+  - repo: local
+    hooks:
+      - id: check-license
+        name: Check copyright headers
+        entry: python tools/check_license.py
+        args: [--fix]
+        language: system
+        files: \.(py|cpp|cc|cxx|c|h|hpp|cu|cuh|hip)$
+        exclude: ^3rdparty/
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:

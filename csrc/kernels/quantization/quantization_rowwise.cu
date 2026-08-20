@@ -1,12 +1,14 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-//
-// Rowwise FP8 quantize / dequantize (row-major & col-major layouts).
-//
-// The quant op (QuantOpBase) and the amax -> scale helpers live in
-// primus_turbo/device/quant_utils.cuh so they can be shared with the
-// tensorwise kernels.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ *
+ * Rowwise FP8 quantize / dequantize (row-major & col-major layouts).
+ *
+ * The quant op (QuantOpBase) and the amax -> scale helpers live in
+ * primus_turbo/device/quant_utils.cuh so they can be shared with the
+ * tensorwise kernels.
+ **************************************************************************************************/
 
 #include "primus_turbo/common.h"
 #include "primus_turbo/device/quant_utils.cuh"

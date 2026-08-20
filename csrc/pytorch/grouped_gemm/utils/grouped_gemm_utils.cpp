@@ -1,10 +1,11 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-
-// Backend-agnostic grouped GEMM host utilities. These are always built, regardless of which
-// GEMM backends (CK / turbo) are enabled, so that helpers such as group-offset computation
-// remain available even when a particular backend is disabled.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ * Backend-agnostic grouped GEMM host utilities. These are always built, regardless of which
+ * GEMM backends (CK / turbo) are enabled, so that helpers such as group-offset computation
+ * remain available even when a particular backend is disabled.
+ **************************************************************************************************/
 
 #include "primus_turbo/grouped_gemm.h"
 #include "pytorch/extensions.h"

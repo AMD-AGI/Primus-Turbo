@@ -1,6 +1,8 @@
-// Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
 
 #include "primus_turbo/shuffle.h"
 #include "primus_turbo/quantization.h"

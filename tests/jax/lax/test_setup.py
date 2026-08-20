@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Pre-alloc state-machine tests for ``primus_turbo.jax.lax.moe.setup``.
 
 These tests exercise only the Python-level early-fail validation and the

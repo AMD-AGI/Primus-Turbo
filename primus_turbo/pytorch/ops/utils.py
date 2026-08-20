@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Helpers shared across the GEMM / grouped-GEMM op implementations."""
 
 from typing import Optional

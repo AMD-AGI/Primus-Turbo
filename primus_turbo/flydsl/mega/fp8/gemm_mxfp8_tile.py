@@ -1,7 +1,14 @@
 ###############################################################################
-# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# See LICENSE for license information.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 FlyDSL Project Contributors
+#
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """Per-tile MXFP8 NT GEMM closure for the fused dispatch/combine mega kernels.

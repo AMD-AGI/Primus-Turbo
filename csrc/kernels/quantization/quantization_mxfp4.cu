@@ -1,8 +1,5 @@
-// Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-
-/*
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  * MXFP4 Quantization Kernel (CUDA/HIP)
  * =========================================
  *
@@ -10,15 +7,15 @@
  * supporting both rowwise and colwise quantization.
  *
  * Block/Tile Structure:
- *   - Block size: 64x64 (BLOCK_M x BLOCK_N)
- *   - MXFP4 tile: 32x32 elements per quantization block
- *   - Thread block: 256 threads (4 warps of 64 threads each)
+ * - Block size: 64x64 (BLOCK_M x BLOCK_N)
+ * - MXFP4 tile: 32x32 elements per quantization block
+ * - Thread block: 256 threads (4 warps of 64 threads each)
  *
  * Memory Layout:
- *   - Input: bfloat16 or half matrix (M x N)
- *   - Rowwise output: FP4 packed (M x N/2) + E8M0 scales (M x N/32)
- *   - Colwise output: FP4 packed (N x M/2) + E8M0 scales (N x M/32)
- */
+ * - Input: bfloat16 or half matrix (M x N)
+ * - Rowwise output: FP4 packed (M x N/2) + E8M0 scales (M x N/32)
+ * - Colwise output: FP4 packed (N x M/2) + E8M0 scales (N x M/32)
+ **************************************************************************************************/
 
 #include <atomic>
 

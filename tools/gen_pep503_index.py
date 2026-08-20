@@ -4,6 +4,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Generate a PEP 503 "simple" repository index for GitHub Pages.
 
 Scans the repo's GitHub Releases, collects distribution files and emits a static

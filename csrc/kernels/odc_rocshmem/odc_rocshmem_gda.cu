@@ -1,28 +1,29 @@
-// Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-
-// Combined rocSHMEM GDA host launchers + GPU-direct device kernels for ODC
-// (kernel-library implementation).
-//
-// Holds BOTH the host init/heap surface AND the device gather / reduce-scatter
-// kernels in ONE translation unit (rdc-linked with GDA librocshmem.a inside
-// libprimus_turbo_kernels.so), so the device default context set up by
-// rocshmem_init is visible to the kernels (validated by the ctypes probe).
-//
-// Host ABI mirrors the single-node backend (rs_my_pe/n_pes/malloc/ptr/barrier/
-// finalize) so ODC's python backend can reuse it, plus:
-//   rs_get_uid()/rs_init_uid() -> unique-id bootstrap over a TCP socket
-//                                 (ROCSHMEM_INIT_WITH_UNIQUEID); no MPI/mpirun
-//   gda_gather(...)        -> per cross-node peer device rocshmem_getmem_wg
-//   gda_reduce_scatter_acc -> pull-based, on-chip fp32 accumulate (race-free)
-//
-// Migrated into Primus-Turbo from ODC's gda_backend/rs_host_gda.cpp (originally
-// shipped as librs_host_gda.so, loaded via ctypes by _rocshmem_backend.py). The
-// device kernels and host launchers below are preserved verbatim; they are
-// declared in primus_turbo/odc_rocshmem/api.h so the thin pytorch/jax binding
-// can call them without linking rocSHMEM itself. Everything is guarded by
-// DISABLE_ROCSHMEM so the kernels library still builds without rocSHMEM.
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ * Combined rocSHMEM GDA host launchers + GPU-direct device kernels for ODC
+ * (kernel-library implementation).
+ *
+ * Holds BOTH the host init/heap surface AND the device gather / reduce-scatter
+ * kernels in ONE translation unit (rdc-linked with GDA librocshmem.a inside
+ * libprimus_turbo_kernels.so), so the device default context set up by
+ * rocshmem_init is visible to the kernels (validated by the ctypes probe).
+ *
+ * Host ABI mirrors the single-node backend (rs_my_pe/n_pes/malloc/ptr/barrier/
+ * finalize) so ODC's python backend can reuse it, plus:
+ * rs_get_uid()/rs_init_uid() -> unique-id bootstrap over a TCP socket
+ * (ROCSHMEM_INIT_WITH_UNIQUEID); no MPI/mpirun
+ * gda_gather(...)        -> per cross-node peer device rocshmem_getmem_wg
+ * gda_reduce_scatter_acc -> pull-based, on-chip fp32 accumulate (race-free)
+ *
+ * Migrated into Primus-Turbo from ODC's gda_backend/rs_host_gda.cpp (originally
+ * shipped as librs_host_gda.so, loaded via ctypes by _rocshmem_backend.py). The
+ * device kernels and host launchers below are preserved verbatim; they are
+ * declared in primus_turbo/odc_rocshmem/api.h so the thin pytorch/jax binding
+ * can call them without linking rocSHMEM itself. Everything is guarded by
+ * DISABLE_ROCSHMEM so the kernels library still builds without rocSHMEM.
+ **************************************************************************************************/
 
 #ifndef DISABLE_ROCSHMEM
 

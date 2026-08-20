@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """MXFP4 grouped GEMM (MX_BLOCKWISE, Triton backend, gfx950).
 
 The MXFP4 training recipe (https://arxiv.org/pdf/2509.25149) applies a 16-point Random Hadamard

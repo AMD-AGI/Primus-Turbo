@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Triton RMSNorm kernels (single-row + multi-row fwd/bwd, plus residual variant).
 
 The kernels are stride-aware on both batch and hidden dims so callers can pass

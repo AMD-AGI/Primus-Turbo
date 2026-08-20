@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """DeepSeek-V4 single-latent sparse-MLA attention as a multi-backend training op.
 
 Public API (``sparse_mla_func``) mirrors the DSV4 sparse-MLA convention:

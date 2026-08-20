@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Triton-backed RMSNorm ops (standard + fused residual variant).
 
 Public API:
