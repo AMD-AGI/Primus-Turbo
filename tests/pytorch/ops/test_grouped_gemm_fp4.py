@@ -133,6 +133,7 @@ def test_grouped_gemm_fp4_mx_blockwise(B, M, NK, dtype, balance):
 
 def test_grouped_gemm_fp4_flydsl_k256_zero_even_odd_wgrad():
     """The compact producer/consumer contract must handle zero, odd, and even spans."""
+    # Regression guard: force FlyDSL through zero, even-pair, and odd-tail K256 consumer trip counts.
     supported, reason = check_mxfp4_support()
     if not supported:
         pytest.skip(reason)

@@ -710,6 +710,7 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
 @pytest.mark.parametrize("N,K", [(64, 192), (192, 64)])
 def test_quantize_mxfp4_with_trans_batched_3d_padding(N, K):
     """The FlyDSL batched dual kernel must materialize both padded tails as zero."""
+    # Regression guard: torch.empty-backed outputs must still zero row-K and transposed-N tails.
     mxfp4_supported, reason = check_mxfp4_support()
     if not mxfp4_supported:
         pytest.skip(reason)
@@ -752,29 +753,24 @@ def test_quantize_mxfp4_with_trans_batched_3d_padding(N, K):
 
 def test_grouped_quantize_mxfp4_colwise_uses_256_aligned_spans():
     """Grouped colwise metadata must expose raw zero/even/odd 256-row spans."""
+    # Regression guard: keep the compact K256 producer metadata/storage contract from reverting to K512.
     mxfp4_supported, reason = check_mxfp4_support()
     if not mxfp4_supported:
         pytest.skip(reason)
 
-    group_lens = torch.tensor(
-        [0, 1, 255, 256, 257, 511, 512, 513], device="cuda", dtype=torch.int64
-    )
-    group_offs = torch.cat(
-        [torch.zeros(1, device="cuda", dtype=torch.int64), group_lens.cumsum(0)]
-    )
+    group_lens = torch.tensor([0, 1, 255, 256, 257, 511, 512, 513], device="cuda", dtype=torch.int64)
+    group_offs = torch.cat([torch.zeros(1, device="cuda", dtype=torch.int64), group_lens.cumsum(0)])
     total_m = int(group_offs[-1].item())
     n = 256
     x = torch.randn((total_m, n), device="cuda", dtype=torch.bfloat16)
 
-    row, row_scale, col, col_scale, row_lens, row_offs, col_lens, col_offs = (
-        grouped_quantize_fp4_with_trans(
-            x,
-            turbo.float4_e2m1fn_x2,
-            ScalingGranularity.MX_BLOCKWISE,
-            group_lens,
-            group_offs,
-            block_size=MXFP4_BLOCK_SIZE,
-        )
+    row, row_scale, col, col_scale, row_lens, row_offs, col_lens, col_offs = grouped_quantize_fp4_with_trans(
+        x,
+        turbo.float4_e2m1fn_x2,
+        ScalingGranularity.MX_BLOCKWISE,
+        group_lens,
+        group_offs,
+        block_size=MXFP4_BLOCK_SIZE,
     )
 
     expected_col_lens = ((group_lens + 255) // 256) * 256
