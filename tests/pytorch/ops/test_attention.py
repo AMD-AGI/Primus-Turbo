@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import math
 import os
 
 import pytest
@@ -20,10 +21,18 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
 )
-from primus_turbo.pytorch.ops import flash_attn_fp8_func, flash_attn_func
+from primus_turbo.pytorch.kernels.attention.sparse_mla_impl import (
+    SparseMlaBwdDispatcher,
+    SparseMlaFwdDispatcher,
+)
+from primus_turbo.pytorch.ops import flash_attn_fp8_func, flash_attn_func, sparse_mla_func
 from primus_turbo.pytorch.ops.attention.attention_utils import (
     _infer_qkv_format,
     block_scaling_node,
+)
+from primus_turbo.triton.attention.sparse_mla import (
+    sparse_mla_bwd_triton,
+    sparse_mla_fwd_triton,
 )
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
@@ -658,19 +667,16 @@ def _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool, seed=0):
 @pytest.mark.parametrize("seqlen", [512, 1024, 2048])
 @pytest.mark.parametrize("variant", ["flash", "pro"])
 @pytest.mark.parametrize("cr", [0, 4, 128])
-def test_sparse_mla(variant, cr, seqlen):
-    """flydsl sparse-MLA fwd/bwd correctness (SNR vs triton oracle) + determinism, over the
-    pure-SWA (cr=0), random-pool (cr=4) and deterministic-pool/HCA (cr=128) paths. seqlen=512
-    also exercises the cr=4 small-seq dkv-dispatch guard."""
-    import math
-
-    # Lazy import: keeps collection working on non-gfx950 (flydsl sparse-MLA is gfx950-only).
-    from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_flydsl
-    from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_flydsl
-    from primus_turbo.triton.attention.sparse_mla import (
-        sparse_mla_bwd_triton,
-        sparse_mla_fwd_triton,
-    )
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL, BackendType.TRITON])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_sparse_mla_op(variant, cr, seqlen, backend, auto_tune):
+    """Public multi-backend training op ``sparse_mla_func``, against the triton kernels called
+    directly as oracle. Covers the pure-SWA (cr=0), random-pool (cr=4) and
+    deterministic-pool/HCA (cr=128) paths; seqlen=512 also exercises the cr=4 small-seq
+    dkv-dispatch guard."""
+    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
 
     d = SPARSE_MLA_HEAD_DIM
     num_heads = SPARSE_MLA_VARIANTS[variant][0]
@@ -678,64 +684,16 @@ def test_sparse_mla(variant, cr, seqlen):
     scale = 1.0 / math.sqrt(d)
     q, kv, topk_idx, sink, grad_out = _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool)
 
-    out, lse = sparse_mla_fwd_flydsl(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
-    out_ref, lse_ref = sparse_mla_fwd_triton(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
-    assert torch.isfinite(out).all(), "forward produced non-finite values"
-    fwd_snr = compute_snr(out_ref, out)
-    assert fwd_snr > 40.0, f"fwd SNR {fwd_snr:.1f} <= 40"
-
-    dq, dkv, dsink = sparse_mla_bwd_flydsl(
-        q, kv, out, grad_out, topk_idx, lse, attn_sink=sink, kv_lora_rank=d, scale=scale
-    )
-    dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_triton(
-        q, kv, out_ref, grad_out, topk_idx, lse_ref, attn_sink=sink, kv_lora_rank=d, scale=scale
-    )
-    assert torch.isfinite(dq).all() and torch.isfinite(dkv).all(), "backward produced non-finite values"
-    assert compute_snr(dq_ref, dq) > 40.0, "dq SNR <= 40"
-    assert compute_snr(dkv_ref, dkv) > 40.0, "dkv SNR <= 40"
-    if dsink is not None:
-        assert compute_snr(dsink_ref, dsink) > 40.0, "dsink SNR <= 40"
-
-    # Determinism: one WG owns each output tile (no float atomics), so a re-run is bit-exact.
-    dq2, dkv2, _ = sparse_mla_bwd_flydsl(
-        q, kv, out, grad_out, topk_idx, lse, attn_sink=sink, kv_lora_rank=d, scale=scale
-    )
-    assert torch.equal(dq, dq2) and torch.equal(dkv, dkv2), "backward is not deterministic"
-
-
-@pytest.mark.skipif(
-    not (torch.cuda.is_available() and is_gfx950()), reason="sparse-MLA (flydsl) is gfx950-only"
-)
-@pytest.mark.parametrize("seqlen", [1024, 2048])
-@pytest.mark.parametrize("variant", ["flash", "pro"])
-@pytest.mark.parametrize("cr", [0, 4, 128])
-def test_sparse_mla_op(variant, cr, seqlen):
-    """Public multi-backend training op ``sparse_mla_func``: autograd fwd+bwd (default
-    FLYDSL) vs triton oracle, plus the PRIMUS_TURBO_ATTN_BACKEND=TRITON override."""
-    import math
-
-    from primus_turbo.pytorch.core.backend import (
-        BackendType,
-        GlobalBackendManager,
-        PrecisionType,
-    )
-    from primus_turbo.pytorch.ops import sparse_mla_func
-    from primus_turbo.triton.attention.sparse_mla import (
-        sparse_mla_bwd_triton,
-        sparse_mla_fwd_triton,
-    )
-
-    d = SPARSE_MLA_HEAD_DIM
-    num_heads = SPARSE_MLA_VARIANTS[variant][0]
-    pool, topk_pool, _ = _sparse_mla_topk(variant, cr, seqlen)
-    scale = 1.0 / math.sqrt(d)
-    q, kv, topk_idx, sink, grad_out = _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool)
-
-    # Triton oracle (fwd + bwd), computed directly on the kernels.
+    # Oracle: the triton kernels called directly, outside the op.
     out_ref, lse_ref = sparse_mla_fwd_triton(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
     dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_triton(
         q, kv, out_ref, grad_out, topk_idx, lse_ref, attn_sink=sink, kv_lora_rank=d, scale=scale
     )
+    # Pinned TRITON is the oracle's own kernels; FLYDSL is a separate bf16 implementation.
+    snr_floor = 60.0 if backend == BackendType.TRITON else 40.0
+
+    GlobalBackendManager.set_sparse_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    GlobalBackendManager.set_auto_tune(auto_tune)
 
     def _run_op():
         qg = q.clone().requires_grad_(True)
@@ -745,22 +703,27 @@ def test_sparse_mla_op(variant, cr, seqlen):
         o.backward(grad_out)
         return o, qg.grad, kvg.grad, sg.grad
 
-    # Default backend (FLYDSL): autograd fwd + bwd through the public op.
     try:
         out, dq, dkv, dsink = _run_op()
         assert torch.isfinite(out).all(), "op forward produced non-finite values"
-        assert compute_snr(out_ref, out) > 40.0, "op fwd SNR <= 40"
-        assert compute_snr(dq_ref, dq) > 40.0, "op dq SNR <= 40"
-        assert compute_snr(dkv_ref, dkv) > 40.0, "op dkv SNR <= 40"
-        assert compute_snr(dsink_ref, dsink) > 40.0, "op dsink SNR <= 40"
+        assert compute_snr(out_ref, out) > snr_floor, f"op fwd SNR <= {snr_floor}"
+        assert compute_snr(dq_ref, dq) > snr_floor, f"op dq SNR <= {snr_floor}"
+        assert compute_snr(dkv_ref, dkv) > snr_floor, f"op dkv SNR <= {snr_floor}"
+        assert compute_snr(dsink_ref, dsink) > snr_floor, f"op dsink SNR <= {snr_floor}"
 
-        # Backend override: force TRITON through the public op; grads must match the oracle tightly.
-        GlobalBackendManager.set_attn_backend(BackendType.TRITON, PrecisionType.BF16_FP16_FP32)
-        out_t, dq_t, dkv_t, dsink_t = _run_op()
-        assert compute_snr(out_ref, out_t) > 60.0, "TRITON-override op fwd disagrees with oracle"
-        assert compute_snr(dq_ref, dq_t) > 60.0, "TRITON-override op dq disagrees with oracle"
+        # Determinism: one WG owns each output tile (no float atomics), so a re-run is bit-exact.
+        out2, dq2, dkv2, dsink2 = _run_op()
+        assert torch.equal(out, out2), "op forward is not deterministic"
+        assert torch.equal(dq, dq2), "op dq is not deterministic"
+        assert torch.equal(dkv, dkv2), "op dkv is not deterministic"
+        assert torch.equal(dsink, dsink2), "op dsink is not deterministic"
+
+        # Each pass owns a dispatcher, so auto-tune has to leave a winner in both tune caches.
+        if auto_tune:
+            assert len(SparseMlaFwdDispatcher._cache) == 1, "forward was not auto-tuned"
+            assert len(SparseMlaBwdDispatcher._cache) == 1, "backward was not auto-tuned"
     finally:
-        GlobalBackendManager.set_attn_backend(None)
+        GlobalBackendManager.reset()
 
 
 # =============================================================================

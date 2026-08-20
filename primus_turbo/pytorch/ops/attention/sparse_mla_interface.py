@@ -17,83 +17,62 @@ Public API (``sparse_mla_func``) mirrors the DSV4 sparse-MLA convention:
 * returns ``o`` : ``[T, H, 512]`` bf16 (and ``lse`` ``[T, H]`` fp32 when
   ``return_lse``).
 
-The backend (flydsl fast default / triton oracle-fallback) is resolved once in
-the forward and pinned through ``ctx.backend`` so fwd and bwd never mix backends.
+Backend selection lives in ``kernels/attention/sparse_mla_impl.py``; each pass dispatches
+on its own.
 """
 
 from typing import Optional
 
 import torch
 
-from primus_turbo.pytorch.core.backend import (
-    BackendChoice,
-    BackendType,
-    GlobalBackendManager,
-    PrecisionType,
-)
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.attention.sparse_mla_impl import (
-    SparseMlaBwdDispatcher,
-    SparseMlaFwdDispatcher,
-    resolve_sparse_mla_fwd_backend,
+    sparse_mla_bwd_impl,
+    sparse_mla_fwd_impl,
 )
 
 __all__ = ["sparse_mla_func"]
-
-# Sparse-MLA selects its backend on the bf16/fp16/fp32 precision bucket.
-_SPARSE_ATTN_PRECISION = PrecisionType.BF16_FP16_FP32
 
 
 class SparseMLAFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, kv, topk_indices, attn_sink, kv_lora_rank, scale, return_lse, is_grad_enabled):
+        # attn_sink is a learned parameter, so it can be the only input asking for a grad.
         is_grad = is_grad_enabled and any(x is not None and x.requires_grad for x in (q, kv, attn_sink))
-
-        backend = resolve_sparse_mla_fwd_backend(
-            GlobalBackendManager.get_attn_backend(_SPARSE_ATTN_PRECISION),
-            q=q,
-            kv=kv,
-            topk_indices=topk_indices,
-            attn_sink=attn_sink,
-            kv_lora_rank=kv_lora_rank,
-            scale=scale,
-        )
-        o, lse = SparseMlaFwdDispatcher.dispatch(
-            BackendChoice(BackendType.FLYDSL),
-            BackendChoice(backend),
-            q=q,
-            kv=kv,
-            topk_indices=topk_indices,
-            attn_sink=attn_sink,
-            kv_lora_rank=kv_lora_rank,
-            scale=scale,
+        o, lse = sparse_mla_fwd_impl(
+            q,
+            kv,
+            topk_indices,
+            attn_sink,
+            kv_lora_rank,
+            scale,
+            default_backend=BackendType.FLYDSL.value,
         )
 
         if is_grad:
             ctx.save_for_backward(q, kv, o, lse, topk_indices, attn_sink)
             ctx.kv_lora_rank = kv_lora_rank
             ctx.scale = scale
-            ctx.backend = backend
 
         return (o, lse) if return_lse else o
 
     @staticmethod
     def backward(ctx, do, *args):
         q, kv, o, lse, topk_indices, attn_sink = ctx.saved_tensors
-        dq, dkv, d_sink = SparseMlaBwdDispatcher.dispatch(
-            BackendChoice(BackendType.FLYDSL),
-            BackendChoice(ctx.backend),  # pinned to the forward's backend
-            q=q,
-            kv=kv,
-            o=o,
-            do=do.contiguous(),
-            topk_indices=topk_indices,
-            lse=lse,
-            attn_sink=attn_sink,
-            kv_lora_rank=ctx.kv_lora_rank,
-            scale=ctx.scale,
+        dq, dkv, dsink = sparse_mla_bwd_impl(
+            q,
+            kv,
+            o,
+            do.contiguous(),
+            topk_indices,
+            lse,
+            attn_sink,
+            ctx.kv_lora_rank,
+            ctx.scale,
+            default_backend=BackendType.FLYDSL.value,
         )
         # inputs: q, kv, topk_indices, attn_sink, kv_lora_rank, scale, return_lse, is_grad_enabled
-        return dq, dkv, None, d_sink, None, None, None, None
+        return dq, dkv, None, (dsink if dsink.numel() else None), None, None, None, None
 
 
 def sparse_mla_func(
