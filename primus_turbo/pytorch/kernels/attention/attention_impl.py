@@ -17,6 +17,7 @@ FP8 (triton) stays on its own ``flash_attn_fp8_func`` path.
 """
 
 import math
+from numbers import Real
 from typing import Optional
 
 import torch
@@ -155,6 +156,33 @@ def _sbhd_layout(q: torch.Tensor, qkv_format: str) -> bool:
     return qkv_format == "sbhd" or (qkv_format == "bshd" and q.shape[0] == 1)
 
 
+_GFX950_DEVICE_CACHE: dict[torch.device, bool] = {}
+
+
+def _is_gfx950_device(device: torch.device) -> bool:
+    cached = _GFX950_DEVICE_CACHE.get(device)
+    if cached is not None:
+        return cached
+    props = torch.cuda.get_device_properties(device)
+    is_gfx950 = getattr(props, "gcnArchName", "").split(":", 1)[0] == "gfx950"
+    _GFX950_DEVICE_CACHE[device] = is_gfx950
+    return is_gfx950
+
+
+def _is_gfx950_tensor(tensor: torch.Tensor) -> bool:
+    return tensor.is_cuda and _is_gfx950_device(tensor.device)
+
+
+def _gluon_layout_ok(tensor: torch.Tensor, qkv_format: str) -> bool:
+    if tensor.stride(-1) != 1:
+        return False
+    if qkv_format == "bshd":
+        return tensor.is_contiguous()
+    if qkv_format == "bhsd":
+        return tensor.transpose(1, 2).is_contiguous()
+    return False
+
+
 class DenseAttnFwdFlydslBackend(KernelBackend):
     @staticmethod
     def can_handle(
@@ -269,10 +297,76 @@ class DenseAttnFwdHipkittensBackend(KernelBackend):
         return res.permute(1, 0, 2, 3)
 
 
+class DenseAttnFwdGluonBackend(KernelBackend):
+    @staticmethod
+    def can_handle(
+        q,
+        k=None,
+        v=None,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+        qkv_format="bshd",
+        return_softmax=False,
+        needs_backward=False,
+        **kwargs,
+    ) -> bool:
+        if k is None or v is None:
+            return False
+        if any(t.ndim != 4 for t in (q, k, v)):
+            return False
+        if not all(t.is_cuda for t in (q, k, v)) or not _is_gfx950_tensor(q):
+            return False
+        if q.device != k.device or q.device != v.device:
+            return False
+        if q.dtype not in (torch.float16, torch.bfloat16) or q.dtype != k.dtype or q.dtype != v.dtype:
+            return False
+        if k.shape != v.shape or q.shape[0] != k.shape[0] or q.shape[-1] != k.shape[-1]:
+            return False
+
+        batch, seqlen_q, num_heads_q, head_dim = q.shape
+        _, seqlen_kv, num_heads_kv, _ = k.shape
+        if (
+            min(batch, seqlen_q, seqlen_kv, num_heads_q, num_heads_kv, head_dim) <= 0
+            or head_dim > 256
+            or num_heads_q % num_heads_kv != 0
+        ):
+            return False
+        if not all(_gluon_layout_ok(t, qkv_format) for t in (q, k, v)):
+            return False
+        return (
+            dropout_p == 0.0
+            and (
+                softmax_scale is None
+                or (isinstance(softmax_scale, Real) and not isinstance(softmax_scale, bool))
+            )
+            and bias is None
+            and alibi_slopes is None
+            and sink is None
+            and window_size == (-1, -1)
+            and not return_softmax
+            and (not causal or seqlen_q <= seqlen_kv)
+            and not needs_backward
+        )
+
+    @staticmethod
+    def execute(q, k, v, softmax_scale, causal, qkv_format, **kwargs):
+        from .attention_gluon_impl import flash_attn_gluon_forward_impl
+
+        return flash_attn_gluon_forward_impl(
+            q, k, v, softmax_scale=softmax_scale, causal=causal, qkv_format=qkv_format
+        )
+
+
 _DENSE_FWD_BACKENDS = {
     BackendType.FLYDSL: BackendEntry(DenseAttnFwdFlydslBackend),
     BackendType.AITER: BackendEntry(DenseAttnFwdAiterBackend),
     BackendType.HIPKITTENS: BackendEntry(DenseAttnFwdHipkittensBackend),
+    BackendType.GLUON: BackendEntry(DenseAttnFwdGluonBackend, autotune=False),
 }
 
 
