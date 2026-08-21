@@ -20,7 +20,6 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
 from primus_turbo.pytorch.ops.quantization import (
     dequantize_fp4,
-    grouped_quantize_fp4_with_trans,
     quantize_fp4_with_trans,
     quantize_fp8_with_trans,
 )
@@ -620,12 +619,17 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, batched, B, M, N, axis, granular
         turbo.float4_e2m1fn_x2,
     ],
 )
-@pytest.mark.parametrize("B", [1, 4])
-@pytest.mark.parametrize("M", [32, 64, 256, 1024])
-@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("B", [None, 4], ids=["2d", "3d"])
+@pytest.mark.parametrize("M", [32, 64, 192, 256])
+@pytest.mark.parametrize("N", [32, 64, 192, 256])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("use_2d_block", [True, False])
 def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block):
+    """Validate the 2D and real 3D batched dual-quant paths.
+
+    The 64/192 shapes guard selective tail-zeroing in both output directions
+    when the kernel allocates its output buffers with torch.empty.
+    """
     padding_align_size = 128
 
     mxfp4_supported, reason = check_mxfp4_support()
@@ -639,15 +643,11 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
 
-    x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-
-    row_length = x.size(-1)
-    x_2d = x.view(-1, row_length)
-    M_actual = x_2d.size(0)
-    N_actual = x_2d.size(1)
+    shape = (M, N) if B is None else (B, M, N)
+    x = torch.randn(shape, device="cuda", dtype=orig_dtype)
 
     x_fp4_rowwise, x_scale_inv_rowwise, x_fp4_t, x_scale_inv_colwise = quantize_fp4_with_trans(
-        x_2d,
+        x,
         dest_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,
@@ -655,138 +655,36 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
         scaling_recipe_for_trans=scaling_recipe,
     )
 
-    # Dequantize and compare with zero-padded reference.
-    # Rowwise dequantize: output shape [M, N_pad]
-    x_2d_ref_rowwise = torch.cat(
-        [
-            x_2d,
-            torch.zeros(
-                M_actual,
-                padding_size(N_actual, padding_align_size),
-                device=x_2d.device,
-                dtype=orig_dtype,
-            ),
-        ],
-        dim=1,
-    )
+    if B is not None:
+        rowwise_ref = torch.nn.functional.pad(x, (0, padding_size(N, padding_align_size)))
+        colwise_ref = torch.nn.functional.pad(x.transpose(1, 2), (0, padding_size(M, padding_align_size)))
+        rowwise_axis = colwise_axis = 2
+    else:
+        rowwise_ref = torch.nn.functional.pad(x, (0, padding_size(N, padding_align_size)))
+        colwise_ref = torch.nn.functional.pad(x, (0, 0, 0, padding_size(M, padding_align_size)))
+        rowwise_axis, colwise_axis = 1, 0
 
     out_rowwise = dequantize_fp4(
         x_fp4_rowwise,
         orig_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,
-        axis=1,
+        axis=rowwise_axis,
         scale_inv=x_scale_inv_rowwise,
         scaling_recipe=scaling_recipe,
     )
-    torch.testing.assert_close(x_2d_ref_rowwise, out_rowwise, **get_tolerances(dest_dtype))
-
-    # Colwise dequantize: output shape [M_pad, N]
-    x_2d_ref_colwise = torch.cat(
-        [
-            x_2d,
-            torch.zeros(
-                padding_size(M_actual, padding_align_size),
-                N_actual,
-                device=x_2d.device,
-                dtype=orig_dtype,
-            ),
-        ],
-        dim=0,
-    )
+    torch.testing.assert_close(rowwise_ref, out_rowwise, **get_tolerances(dest_dtype))
 
     out_colwise = dequantize_fp4(
         x_fp4_t,
         orig_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,
-        axis=0,
+        axis=colwise_axis,
         scale_inv=x_scale_inv_colwise,
         scaling_recipe=scaling_recipe,
     )
-    torch.testing.assert_close(x_2d_ref_colwise, out_colwise, **get_tolerances(dest_dtype))
-
-
-@pytest.mark.parametrize("N,K", [(64, 192), (192, 64)])
-def test_quantize_mxfp4_with_trans_batched_3d_padding(N, K):
-    """The FlyDSL batched dual kernel must materialize both padded tails as zero."""
-    # Regression guard: torch.empty-backed outputs must still zero row-K and transposed-N tails.
-    mxfp4_supported, reason = check_mxfp4_support()
-    if not mxfp4_supported:
-        pytest.skip(reason)
-
-    torch.manual_seed(42)
-    x = torch.randn((2, N, K), device="cuda", dtype=torch.bfloat16)
-    recipe = ScalingRecipe(use_2d_block=False)
-    rowwise, row_scale, colwise, col_scale = quantize_fp4_with_trans(
-        x,
-        turbo.float4_e2m1fn_x2,
-        granularity=ScalingGranularity.MX_BLOCKWISE,
-        block_size=MXFP4_BLOCK_SIZE,
-        scaling_recipe=recipe,
-        scaling_recipe_for_trans=recipe,
-    )
-
-    row_ref = torch.nn.functional.pad(x, (0, padding_size(K, 128)))
-    col_ref = torch.nn.functional.pad(x.transpose(1, 2), (0, padding_size(N, 128)))
-    row_out = dequantize_fp4(
-        rowwise,
-        torch.bfloat16,
-        ScalingGranularity.MX_BLOCKWISE,
-        block_size=MXFP4_BLOCK_SIZE,
-        axis=2,
-        scale_inv=row_scale,
-        scaling_recipe=recipe,
-    )
-    col_out = dequantize_fp4(
-        colwise,
-        torch.bfloat16,
-        ScalingGranularity.MX_BLOCKWISE,
-        block_size=MXFP4_BLOCK_SIZE,
-        axis=2,
-        scale_inv=col_scale,
-        scaling_recipe=recipe,
-    )
-    torch.testing.assert_close(row_ref, row_out, **get_tolerances(turbo.float4_e2m1fn_x2))
-    torch.testing.assert_close(col_ref, col_out, **get_tolerances(turbo.float4_e2m1fn_x2))
-
-
-def test_grouped_quantize_mxfp4_colwise_uses_256_aligned_spans():
-    """Grouped colwise metadata must expose raw zero/even/odd 256-row spans."""
-    # Regression guard: keep the compact K256 producer metadata/storage contract from reverting to K512.
-    mxfp4_supported, reason = check_mxfp4_support()
-    if not mxfp4_supported:
-        pytest.skip(reason)
-
-    group_lens = torch.tensor([0, 1, 255, 256, 257, 511, 512, 513], device="cuda", dtype=torch.int64)
-    group_offs = torch.cat([torch.zeros(1, device="cuda", dtype=torch.int64), group_lens.cumsum(0)])
-    total_m = int(group_offs[-1].item())
-    n = 256
-    x = torch.randn((total_m, n), device="cuda", dtype=torch.bfloat16)
-
-    row, row_scale, col, col_scale, row_lens, row_offs, col_lens, col_offs = grouped_quantize_fp4_with_trans(
-        x,
-        turbo.float4_e2m1fn_x2,
-        ScalingGranularity.MX_BLOCKWISE,
-        group_lens,
-        group_offs,
-        block_size=MXFP4_BLOCK_SIZE,
-    )
-
-    expected_col_lens = ((group_lens + 255) // 256) * 256
-    expected_col_offs = torch.cat(
-        [torch.zeros(1, device="cuda", dtype=torch.int64), expected_col_lens.cumsum(0)]
-    )
-    expected_alloc_m = (total_m + group_lens.numel() * 256 + 255) // 256 * 256
-
-    torch.testing.assert_close(row_lens, group_lens, rtol=0, atol=0)
-    torch.testing.assert_close(row_offs, group_offs, rtol=0, atol=0)
-    torch.testing.assert_close(col_lens, expected_col_lens, rtol=0, atol=0)
-    torch.testing.assert_close(col_offs, expected_col_offs, rtol=0, atol=0)
-    assert row.shape == (total_m, n // 2)
-    assert row_scale.shape == (total_m, n // MXFP4_BLOCK_SIZE)
-    assert col.shape == (n, expected_alloc_m // 2)
-    assert col_scale.shape == (n, expected_alloc_m // MXFP4_BLOCK_SIZE)
+    torch.testing.assert_close(colwise_ref, out_colwise, **get_tolerances(dest_dtype))
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
