@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import primus_turbo.pytorch as turbo
+from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import _mxfp4_scale_rounding_bias
 from primus_turbo.pytorch.core.low_precision import (
     DEFAULT_BLOCK_SIZE,
     MXFP4_BLOCK_SIZE,
@@ -26,6 +27,30 @@ from primus_turbo.pytorch.ops.quantization import (
 )
 from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
 from tests.pytorch.test_utils import get_tolerances
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        (None, 1 << 21),
+        ("", 1 << 21),
+        ("0", 1 << 21),
+        ("1", 1 << 22),
+        ("2", 3 << 19),
+    ],
+)
+def test_mxfp4_scale_rounding_bias(monkeypatch, mode, expected):
+    if mode is None:
+        monkeypatch.delenv("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING", raising=False)
+    else:
+        monkeypatch.setenv("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING", mode)
+    assert _mxfp4_scale_rounding_bias() == expected
+
+
+def test_mxfp4_scale_rounding_bias_rejects_invalid_mode(monkeypatch):
+    monkeypatch.setenv("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING", "invalid")
+    with pytest.raises(RuntimeError, match="must be 0, 1, or 2"):
+        _mxfp4_scale_rounding_bias()
 
 
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
@@ -707,6 +732,66 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     torch.testing.assert_close(x_2d_ref_colwise, out_colwise, **get_tolerances(dest_dtype))
 
 
+def test_mxfp4_scale_rounding_flydsl_matches_hip(monkeypatch):
+    """All scale-rounding modes must be bit-exact across FlyDSL and shuffled HIP quant."""
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    torch.manual_seed(42)
+    x = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16)
+    plain_recipe = ScalingRecipe()
+    hip_recipe = ScalingRecipe(shuffle_scale=True, shuffle_out=True)
+    observed_scales = []
+
+    for mode in ("0", "1", "2"):
+        monkeypatch.setenv("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING", mode)
+        fly_row, fly_row_scale, fly_col, fly_col_scale = quantize_fp4_with_trans(
+            x,
+            turbo.float4_e2m1fn_x2,
+            granularity=ScalingGranularity.MX_BLOCKWISE,
+            block_size=MXFP4_BLOCK_SIZE,
+            scaling_recipe=plain_recipe,
+            scaling_recipe_for_trans=plain_recipe,
+        )
+        hip_row, hip_row_scale, hip_col, hip_col_scale = quantize_fp4_with_trans(
+            x,
+            turbo.float4_e2m1fn_x2,
+            granularity=ScalingGranularity.MX_BLOCKWISE,
+            block_size=MXFP4_BLOCK_SIZE,
+            scaling_recipe=hip_recipe,
+            scaling_recipe_for_trans=hip_recipe,
+        )
+
+        torch.testing.assert_close(
+            torch.ops.primus_turbo_cpp_extension.shuffle_weight(fly_row, [16, 16]).view(torch.uint8),
+            hip_row.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            torch.ops.primus_turbo_cpp_extension.shuffle_scale(fly_row_scale, [16, 16]).view(torch.uint8),
+            hip_row_scale.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            torch.ops.primus_turbo_cpp_extension.shuffle_weight(fly_col, [16, 16]).view(torch.uint8),
+            hip_col.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            torch.ops.primus_turbo_cpp_extension.shuffle_scale(fly_col_scale, [16, 16]).view(torch.uint8),
+            hip_col_scale.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        observed_scales.append(fly_row_scale.view(torch.uint8).clone())
+
+    assert any(not torch.equal(observed_scales[0], scale) for scale in observed_scales[1:])
+
+
 @pytest.mark.parametrize("N,K", [(64, 192), (192, 64)])
 def test_quantize_mxfp4_with_trans_batched_3d_padding(N, K):
     """The FlyDSL batched dual kernel must materialize both padded tails as zero."""
@@ -787,6 +872,61 @@ def test_grouped_quantize_mxfp4_colwise_uses_256_aligned_spans():
     assert row_scale.shape == (total_m, n // MXFP4_BLOCK_SIZE)
     assert col.shape == (n, expected_alloc_m // 2)
     assert col_scale.shape == (n, expected_alloc_m // MXFP4_BLOCK_SIZE)
+
+
+def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip(monkeypatch):
+    """The optimized GEAK/K256 producer must preserve HIP scale-rounding numerics."""
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    torch.manual_seed(42)
+    group_lens = torch.tensor([256, 256], device="cuda", dtype=torch.int64)
+    group_offs = torch.tensor([0, 256, 512], device="cuda", dtype=torch.int64)
+    x = torch.randn((512, 256), device="cuda", dtype=torch.bfloat16)
+    observed_scales = []
+
+    for mode in ("0", "1", "2"):
+        monkeypatch.setenv("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING", mode)
+        fly = grouped_quantize_fp4_with_trans(
+            x,
+            turbo.float4_e2m1fn_x2,
+            ScalingGranularity.MX_BLOCKWISE,
+            group_lens,
+            group_offs,
+            block_size=MXFP4_BLOCK_SIZE,
+        )
+        hip = torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
+            x,
+            group_lens,
+            group_offs,
+            turbo.float4_e2m1fn_x2,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+        )
+
+        torch.testing.assert_close(fly[0].view(torch.uint8), hip[0].view(torch.uint8), rtol=0, atol=0)
+        torch.testing.assert_close(fly[1].view(torch.uint8), hip[1].view(torch.uint8), rtol=0, atol=0)
+        logical_m = int(group_offs[-1].item())
+        torch.testing.assert_close(
+            fly[2].view(torch.uint8)[:, : logical_m // 2],
+            hip[2].view(torch.uint8)[:, : logical_m // 2],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            fly[3].view(torch.uint8)[:, : logical_m // MXFP4_BLOCK_SIZE],
+            hip[3].view(torch.uint8)[:, : logical_m // MXFP4_BLOCK_SIZE],
+            rtol=0,
+            atol=0,
+        )
+        observed_scales.append(fly[1].view(torch.uint8).clone())
+
+    assert any(not torch.equal(observed_scales[0], scale) for scale in observed_scales[1:])
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])

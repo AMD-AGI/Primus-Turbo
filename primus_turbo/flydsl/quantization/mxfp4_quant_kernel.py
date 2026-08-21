@@ -25,6 +25,8 @@ Numerics reproduce ``csrc/kernels/quantization/quantization_mxfp4.cu`` exactly:
     groups), bit-identical to the C++ distributed ds_swizzle version.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
@@ -35,6 +37,19 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 _OOB = 0x7FFFFFFF  # word offset past any SRD -> buffer_load returns 0 / buffer_store dropped
 BLK = 256
 MB = 32  # MXFP4 micro-block size (elements per e8m0 scale)
+_SCALE_ROUNDING_ENV = "PRIMUS_TURBO_MXFP4_SCALE_ROUNDING"
+
+
+def _mxfp4_scale_rounding_bias():
+    """Return the host-selected E8M0 exponent rounding bias used by the HIP path."""
+    mode = os.getenv(_SCALE_ROUNDING_ENV, "0")
+    if mode in ("", "0"):
+        return 1 << 21
+    if mode == "1":
+        return 1 << 22
+    if mode == "2":
+        return 3 << 19
+    raise RuntimeError(f"{_SCALE_ROUNDING_ENV} must be 0, 1, or 2")
 
 
 def _abs_i32(fbits):
@@ -75,10 +90,9 @@ def _sr_hash(seed):
     return seed
 
 
-def _compute_scale_native(amax_bits):
+def _compute_scale_native(amax_bits, val_to_add):
     """e8m0 scale, all-int32 (matches compute_tile_scale). Returns
     (scale_native_f32bits_i32, scale_e8m0_biased_i32)."""
-    val_to_add = 1 << 21  # 1 << (23 - 1 - 1)
     hp_exp_mask = 0x1FF  # (1 << 9) - 1
     extracted = ((amax_bits + val_to_add) >> 23) & hp_exp_mask
     extracted = extracted - 127 - 2  # - hp_exp_bias - FP4_TARGET_MAX_POW2
@@ -190,13 +204,13 @@ def _microblock_amax(vf):
     return amax
 
 
-def _finish_microblock(vbits, use_rht, seed=None):
+def _finish_microblock(vbits, use_rht, scale_rounding_bias, seed=None):
     """32 f32-bit i32 values -> (4 fp4 i32 words, scale_e8m0 i8-ready i32).
     ``seed`` (i32 Value) enables stochastic rounding in the final cvt (amax/scale
     stay deterministic)."""
     vf = _microblock_vf(vbits, use_rht)
     amax = _microblock_amax(vf)
-    native_bits, biased = _compute_scale_native(amax)
+    native_bits, biased = _compute_scale_native(amax, scale_rounding_bias)
     words = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), seed)
     return words, biased
 
@@ -245,6 +259,7 @@ def _emit_dual_body(
     R,
     C,
     bid,
+    scale_rounding_bias,
     gx=0,
     gro=0,
     grsc=0,
@@ -384,7 +399,7 @@ def _emit_dual_body(
             tile_amax = fx.Int32(0)
             for i in range_constexpr(32):
                 tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, (row_base + i) * _RMBC + cmb))
-            native_bits, rbiased = _compute_scale_native(tile_amax)
+            native_bits, rbiased = _compute_scale_native(tile_amax, scale_rounding_bias)
             rwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), _row_seed(k))
             grow = _row0 + r_row
             gcmb = cblk * _RMBC + cmb
@@ -409,7 +424,7 @@ def _emit_dual_body(
                     word = v4[j]
                     rbits.append(word << 16)
                     rbits.append(word & 0xFFFF0000)
-            rwords, rbiased = _finish_microblock(rbits, row_rht, _row_seed(k))
+            rwords, rbiased = _finish_microblock(rbits, row_rht, scale_rounding_bias, _row_seed(k))
             grow = _row0 + r_row
             gcmb = cblk * (_TC // 32) + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
@@ -448,7 +463,7 @@ def _emit_dual_body(
             tile_amax = fx.Int32(0)
             for i in range_constexpr(32):
                 tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, mmb * _TC + col_base + i))
-            native_bits, cbiased = _compute_scale_native(tile_amax)
+            native_bits, cbiased = _compute_scale_native(tile_amax, scale_rounding_bias)
             cwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), _col_seed(mmb))
             gcol = _col0 + c_col
             gmmb = rblk * _RMB + mmb
@@ -468,7 +483,7 @@ def _emit_dual_body(
                 word = _lds_load1(lds.buf.ptr, (row0 + row) * _TCW + cw)
                 fb = arith.select(half != 0, word & fx.Int32(-65536), word << 16)
                 cbits.append(fb)
-            cwords, cbiased = _finish_microblock(cbits, col_rht, _col_seed(mmb))
+            cwords, cbiased = _finish_microblock(cbits, col_rht, scale_rounding_bias, _col_seed(mmb))
             gcol = _col0 + c_col
             gmmb = rblk * _RMB + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
@@ -501,6 +516,7 @@ def _build_dual_kernel(
         R: fx.Int32,
         C: fx.Int32,
         SR_SEED: fx.Int32,  # per-launch stochastic-rounding seed (0 when SR off)
+        SCALE_ROUNDING_BIAS: fx.Int32,
     ):
         lds = fx.SharedAllocator().allocate(_DualSS).peek()
         tid = fx.thread_idx.x
@@ -519,6 +535,7 @@ def _build_dual_kernel(
             R,
             C,
             fx.block_idx.x,
+            SCALE_ROUNDING_BIAS,
             col_locality=col_locality,
             row_sr=row_sr,
             col_sr=col_sr,
@@ -544,10 +561,11 @@ def _build_dual_launch(
         R: fx.Int32,
         C: fx.Int32,
         SR_SEED: fx.Int32,
+        SCALE_ROUNDING_BIAS: fx.Int32,
         grid_x: fx.Int32,
         stream: fx.Stream,
     ):
-        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, SR_SEED).launch(
+        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, SR_SEED, SCALE_ROUNDING_BIAS).launch(
             grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream
         )
 
@@ -591,7 +609,19 @@ def flydsl_dual_quant(
     cs = torch.empty((C, R // 32), dtype=torch.uint8, device=dev)
     fn, grid_x = get_dual_cast(R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr)
     sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
-    fn(x_i32, ro, rs, co, cs, R, C, sr_seed, grid_x, torch.cuda.current_stream())
+    fn(
+        x_i32,
+        ro,
+        rs,
+        co,
+        cs,
+        R,
+        C,
+        sr_seed,
+        _mxfp4_scale_rounding_bias(),
+        grid_x,
+        torch.cuda.current_stream(),
+    )
     row_data = ro.view(torch.uint8).view(fp4_dtype)  # [R, C/2] fp4
     col_data = co.view(torch.uint8).view(fp4_dtype)  # [C, R/2] fp4
     row_scale = rs.view(torch.float8_e8m0fnu)
@@ -632,7 +662,7 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=Fal
         cs = torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda")
         grid_x = (R // _TR) * (C // _TC)
         stream = torch.cuda.current_stream()
-        fn = flyc.compile(raw, x, ro, rs, co, cs, R, C, 0, grid_x, stream)
+        fn = flyc.compile(raw, x, ro, rs, co, cs, R, C, 0, 1 << 21, grid_x, stream)
         ent = (fn, grid_x)
         _DUAL_COMPILED[key] = ent
     return ent
@@ -660,6 +690,7 @@ def _build_dual3_kernel(
         CP: fx.Int32,  # K_pad (row-out cols); == C when aligned
         RP: fx.Int32,  # N_pad (col-out cols); == R when aligned
         SR_SEED: fx.Int32,
+        SCALE_ROUNDING_BIAS: fx.Int32,
     ):
         lds = fx.SharedAllocator().allocate(_DualSS).peek()
         tid = fx.thread_idx.x
@@ -684,6 +715,7 @@ def _build_dual3_kernel(
             R,
             C,
             lbid,
+            SCALE_ROUNDING_BIAS,
             # per-expert element bases in index (64-bit): g * per_expert_elems overflows
             # int32 for large-G MoE (e.g. G=64: 63 * N*K/2 > 2^31); _emit_dual_body folds
             # these into per-expert int64 SRD bases.
@@ -715,8 +747,10 @@ def _build_dual3_launch(
     kern = _build_dual3_kernel(row_rht, col_rht, row_2d, col_2d, padded, col_locality, row_sr, col_sr)
 
     @flyc.jit
-    def _dual3_launch(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, SR_SEED, grid_x, stream):
-        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, SR_SEED).launch(
+    def _dual3_launch(
+        X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, SR_SEED, SCALE_ROUNDING_BIAS, grid_x, stream
+    ):
+        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, SR_SEED, SCALE_ROUNDING_BIAS).launch(
             grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream
         )
 
@@ -785,7 +819,9 @@ def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False, row_sr
         cs = torch.zeros((G, K, Np // 32), dtype=torch.uint8, device="cuda")
         ncblk = ((K + _TC - 1) // _TC) if padded else (K // _TC)
         grid_x = (N // _TR) * ncblk * G
-        fn = flyc.compile(raw, x, ro, rs, co, cs, N, K, G, Kp, Np, 0, grid_x, torch.cuda.current_stream())
+        fn = flyc.compile(
+            raw, x, ro, rs, co, cs, N, K, G, Kp, Np, 0, 1 << 21, grid_x, torch.cuda.current_stream()
+        )
         ent = (fn, grid_x, Kp, Np, padded)
         _DUAL3_COMPILED[key] = ent
     return ent
@@ -815,7 +851,22 @@ def flydsl_dual_quant_batched(
         co[:, :, N // 8 :].zero_()
         cs[:, :, N // 32 :].zero_()
     sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
-    fn(x_i32, ro, rs, co, cs, N, K, G, Kp, Np, sr_seed, grid_x, torch.cuda.current_stream())
+    fn(
+        x_i32,
+        ro,
+        rs,
+        co,
+        cs,
+        N,
+        K,
+        G,
+        Kp,
+        Np,
+        sr_seed,
+        _mxfp4_scale_rounding_bias(),
+        grid_x,
+        torch.cuda.current_stream(),
+    )
     return (
         ro.view(torch.uint8).view(fp4_dtype),
         rs.view(torch.float8_e8m0fnu),
