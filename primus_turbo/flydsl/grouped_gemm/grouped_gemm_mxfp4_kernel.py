@@ -1101,7 +1101,14 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     # different count than the 9 was tuned for -- reads left in flight let the next
     # buffer_load_lds overwrite the LDS under them (WAR), surfacing as a rare wgrad mismatch
     # on the partial last M tile.
-    wlv, elgk = 10, 0
+    # The lgkmcnt budget at the phase barrier is per-schedule, not a global constant: it is
+    # calibrated against how many ds_reads the body leaves in flight.  The bf16 path fuses the
+    # C store into the loop, which reorders those reads enough that a non-zero budget lets the
+    # next buffer_load_lds overwrite LDS under them (a WAR hazard, seen as a rare wgrad
+    # mismatch on the partial last M tile); it needs a full drain.  The fp16 path keeps the
+    # standalone store and the 9 it was tuned with -- draining it there costs correctness.
+    wlv = 10
+    elgk = 9 if out_fp16 else 0
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go_pad, stream)
 
     def _entry(cfg):
