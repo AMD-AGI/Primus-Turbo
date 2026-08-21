@@ -1324,23 +1324,29 @@ class MfmaScaleFp4:
                                 mi += 1
                     return B + _CST_HAZ + cq.flush()
 
-                def emit_runtime_odd_tail(half, zacc=False):
+                def emit_runtime_odd_tail(half, no_loop=False):
                     """Consume the staged final phase-A block without issuing a refill.
 
-                    ``zacc`` clears the accumulators first.  Init is normally folded into the
-                    head phase's src2-immediate MFMAs (see _ZACC), so a branch that reaches
-                    here without running the loop -- nval=1, reachable only once a group can
-                    be a single 256-block -- has to materialize the zeros itself."""
+                    Set 0 already holds this block's scales on both entries -- the nval=1 one
+                    still carries the prologue's set, and the loop runs an even phase count
+                    here, so the ring lands back on set 0 with its last prefetch aimed at this
+                    block (the compile-time odd tail relies on the same thing).  Reloading them
+                    is not merely redundant: the load goes to the OTHER ping-pong set, which
+                    nothing below reads, and it is still in flight when the block ends, so the
+                    next tile a wg_tiles>1 workgroup walks gets its own set overwritten under
+                    it -- rare, timing-dependent, and it surfaces as inf in that tile's C.
+
+                    ``no_loop`` marks the nval=1 entry: it has not run the src2-immediate head,
+                    so under _ZACC the accumulators have to be materialized here.  Without
+                    _ZACC they arrive as tied zero operands and need no clear."""
                     _scb[0] = 0
                     B = ["s_waitcnt vmcnt(0) lgkmcnt(0)"]
-                    if zacc:
+                    if no_loop and _ZACC:
                         B += emit_acc_clear(0, nq if half else NT)
-                    else:
-                        # Reached by falling out of the loop, which has advanced the scale
-                        # pointer past this block's set; reload it the way the peel does.
-                        # (The nval=1 entry skips this: the prologue's set is still current.)
-                        B.append("s_barrier")
-                        B += emit_sc_vgpr(nsct)
+                    # The g2s that staged this block is per-wave: s_waitcnt retires only the
+                    # issuing wave's loads, while the ds_reads below consume LDS the whole
+                    # workgroup filled.
+                    B.append("s_barrier")
                     return B + emit_inplace(
                         0,
                         [],
@@ -1388,7 +1394,7 @@ class MfmaScaleFp4:
                     B.append(f"{odd_tail}:")
                     B += emit_runtime_odd_tail(half)
                     B += [f"s_branch {done}f", f"{odd_one}:"]
-                    B += emit_runtime_odd_tail(half, zacc=_ZACC)
+                    B += emit_runtime_odd_tail(half, no_loop=True)
                     B += [f"s_branch {done}f", f"{even}:"]
                     if _RTPEEL:
                         B.append(f"s_sub_u32 ${bound}, ${i_nval}, 2")
