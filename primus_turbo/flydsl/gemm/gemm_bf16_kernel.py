@@ -1248,7 +1248,10 @@ def gemm_bf16_variable_k_tile(
         )
 
     def _win_limit(w):
-        return _win_fills(w) * fx.Int32(SLOT_LDS_PASS) - fx.Int32(1)
+        # Clamped at 0: the tail chunk resolves its window before it is known to
+        # have work, and an empty window must still clamp to a valid LDS entry.
+        lim = _win_fills(w) * fx.Int32(SLOT_LDS_PASS) - fx.Int32(1)
+        return ArithValue(arith.maxsi(arith._to_raw(lim), arith._to_raw(fx.Int32(0))), signed=True)
 
     if const_expr(slot_lds):
         # Stage before any pool prefetch is in flight: this fill is the tile's only
@@ -1316,6 +1319,18 @@ def gemm_bf16_variable_k_tile(
 
     k_iters = (group_tokens + (BLOCK_K - 1)) // BLOCK_K
     n_chunks = (k_iters + (CHUNK - 1)) // CHUNK
+    # Whole chunks, then the 0..CHUNK-1 leftover k steps emitted explicitly.
+    # Rounding the chunk loop up instead rounds every group's contraction to
+    # CHUNK*BLOCK_K (= the pool's own BLOCK_M padding, so ~6% of the wgrad leg
+    # is padding twice over). The steps the tail replaces read past the group's
+    # real token count, gather the prologue's zero slot (see
+    # GatherVarKG2SLoaderBf16) and accumulate exact +0.0 -- dropping them is
+    # bit-exact and takes the quantisation down to BLOCK_K.
+    n_body = k_iters // CHUNK
+    n_tail = k_iters - n_body * CHUNK
+
+    def _min_chunks(a, b):
+        return ArithValue(arith.minsi(arith._to_raw(a), arith._to_raw(b)), signed=True)
 
     # nested to isolate Python-level buffer rotation from the runtime chunk loop
     def _window(chunk_idx, n_chunk, wbase=None, wlim=None):
@@ -1355,6 +1370,54 @@ def gemm_bf16_variable_k_tile(
                 bv[ko] = _voffs(b_g2s, b_slot_ids, chunk_idx * CHUNK + ko, wbase, wlim)
         return av, bv
 
+    def _one_step(k, jw, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1):
+        """One pipelined k step reading the window at jw.
+
+        4-buffer pipelined body: interleave s2r/g2s with the 4 mfma quadrants.
+        Only the buffers this step touches are passed; the caller owns the
+        rotation, so the same body serves the unrolled chunk and the tail.
+        """
+        b0 = b_s2r.load(b_cur0)
+        a0 = a_s2r.load(a_cur0)
+        _load_a(a_next1, 1, k + 1, av[jw + 1])
+        rocdl.s_barrier()
+        rocdl.s_setprio(1)
+        c = [Vec(fx.memref_load_vec(r)) for r in acc00]
+        c = mfma.call(a0, b0, c)
+        for idx in range_constexpr(len(acc00)):
+            fx.memref_store_vec(c[idx], acc00[idx])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+        b1 = b_s2r.load(b_cur1)
+        _load_b(b_cur0, 0, k + 2, bv[jw + 2])
+        rocdl.s_barrier()
+        rocdl.s_setprio(1)
+        c = [Vec(fx.memref_load_vec(r)) for r in acc01]
+        c = mfma.call(a0, b1, c)
+        for idx in range_constexpr(len(acc01)):
+            fx.memref_store_vec(c[idx], acc01[idx])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+        a1 = a_s2r.load(a_cur1)
+        _load_a(a_cur0, 0, k + 2, av[jw + 2])
+        rocdl.s_barrier()
+        rocdl.s_setprio(1)
+        c = [Vec(fx.memref_load_vec(r)) for r in acc10]
+        c = mfma.call(a1, b0, c)
+        for idx in range_constexpr(len(acc10)):
+            fx.memref_store_vec(c[idx], acc10[idx])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+        _load_b(b_cur1, 1, k + 2, bv[jw + 2])
+        wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+        rocdl.s_setprio(1)
+        c = [Vec(fx.memref_load_vec(r)) for r in acc11]
+        c = mfma.call(a1, b1, c)
+        for idx in range_constexpr(len(acc11)):
+            fx.memref_store_vec(c[idx], acc11[idx])
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
     def _steps(k_base, av, bv, off):
         """CHUNK pipelined k steps reading the window at off+j.
 
@@ -1366,49 +1429,7 @@ def gemm_bf16_variable_k_tile(
         b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
         b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
         for j in range_constexpr(CHUNK):
-            k = k_base + j
-            jw = off + j
-            # 4-buffer pipelined body: interleave s2r/g2s with the 4 mfma quadrants
-            b0 = b_s2r.load(b_cur0)
-            a0 = a_s2r.load(a_cur0)
-            _load_a(a_next1, 1, k + 1, av[jw + 1])
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c = [Vec(fx.memref_load_vec(r)) for r in acc00]
-            c = mfma.call(a0, b0, c)
-            for idx in range_constexpr(len(acc00)):
-                fx.memref_store_vec(c[idx], acc00[idx])
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            b1 = b_s2r.load(b_cur1)
-            _load_b(b_cur0, 0, k + 2, bv[jw + 2])
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c = [Vec(fx.memref_load_vec(r)) for r in acc01]
-            c = mfma.call(a0, b1, c)
-            for idx in range_constexpr(len(acc01)):
-                fx.memref_store_vec(c[idx], acc01[idx])
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            a1 = a_s2r.load(a_cur1)
-            _load_a(a_cur0, 0, k + 2, av[jw + 2])
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c = [Vec(fx.memref_load_vec(r)) for r in acc10]
-            c = mfma.call(a1, b0, c)
-            for idx in range_constexpr(len(acc10)):
-                fx.memref_store_vec(c[idx], acc10[idx])
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            _load_b(b_cur1, 1, k + 2, bv[jw + 2])
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
-            rocdl.s_setprio(1)
-            c = [Vec(fx.memref_load_vec(r)) for r in acc11]
-            c = mfma.call(a1, b1, c)
-            for idx in range_constexpr(len(acc11)):
-                fx.memref_store_vec(c[idx], acc11[idx])
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
+            _one_step(k_base + j, off + j, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1)
             a_cur0, a_next0 = a_next0, a_cur0
             a_cur1, a_next1 = a_next1, a_cur1
             b_cur0, b_next0 = b_next0, b_cur0
@@ -1448,21 +1469,69 @@ def gemm_bf16_variable_k_tile(
     if const_expr(slot_lds):
         # Window 0 is peeled: its fill has to precede the preamble, which already
         # resolves k = 0 and k = 1. Later windows refill the same LDS array in place.
-        for chunk_iv in range(_win_hi(fx.Int32(0))):
+        for chunk_iv in range(_min_chunks(_win_hi(fx.Int32(0)), n_body)):
             _chunk_w(chunk_iv, fx.Int32(0))
         for win_iv in range(fx.Int32(1), _n_win(n_chunks)):
             _fill_win(win_iv)
-            for chunk_iv in range(_win_lo(win_iv), _win_hi(win_iv)):
+            for chunk_iv in range(_win_lo(win_iv), _min_chunks(_win_hi(win_iv), n_body)):
                 _chunk_w(chunk_iv, win_iv)
+        # n_body // WIN_CHUNKS is the window the tail chunk falls in, and it is
+        # the last one staged: with a tail, n_chunks = n_body + 1, so
+        # _n_win(n_chunks) - 1 == n_body // WIN_CHUNKS.
+        w_tail = n_body // WIN_CHUNKS
+        av_t, bv_t = _window(n_body, 1, w_tail * fx.Int32(WIN_TOKENS), _win_limit(w_tail))
     elif const_expr(slot_unroll > 1):
-        n_grouped = (n_chunks // slot_unroll) * slot_unroll
+        n_grouped = (n_body // slot_unroll) * slot_unroll
         for chunk_iv in range(0, n_grouped, slot_unroll):
             _chunk_n(chunk_iv)
-        for chunk_iv in range(n_grouped, n_chunks):
+        for chunk_iv in range(n_grouped, n_body):
             _chunk(chunk_iv)
+        av_t, bv_t = _window(n_body, 1)
     else:
-        for chunk_iv in range(n_chunks):
+        for chunk_iv in range(n_body):
             _chunk(chunk_iv)
+        av_t, bv_t = _window(n_body, 1)
+
+    # Leftover k steps, guarded monotonically so one body serves all three
+    # counts. _steps leaves the LDS buffers in their declared roles, and one
+    # step swaps cur/next, so step j reads the roles swapped j % 2 times.
+    if n_tail > fx.Int32(0):
+        k_tail = n_body * CHUNK
+        _one_step(
+            k_tail,
+            0,
+            av_t,
+            bv_t,
+            lds.A_lds_cur_0,
+            lds.A_lds_cur_1,
+            lds.A_lds_next_1,
+            lds.B_lds_cur_0,
+            lds.B_lds_cur_1,
+        )
+        if n_tail > fx.Int32(1):
+            _one_step(
+                k_tail + fx.Int32(1),
+                1,
+                av_t,
+                bv_t,
+                lds.A_lds_next_0,
+                lds.A_lds_next_1,
+                lds.A_lds_cur_1,
+                lds.B_lds_next_0,
+                lds.B_lds_next_1,
+            )
+            if n_tail > fx.Int32(2):
+                _one_step(
+                    k_tail + fx.Int32(2),
+                    2,
+                    av_t,
+                    bv_t,
+                    lds.A_lds_cur_0,
+                    lds.A_lds_cur_1,
+                    lds.A_lds_next_1,
+                    lds.B_lds_cur_0,
+                    lds.B_lds_cur_1,
+                )
 
     c00 = [Vec(fx.memref_load_vec(reg)) for reg in acc00]
     c01 = [Vec(fx.memref_load_vec(reg)) for reg in acc01]

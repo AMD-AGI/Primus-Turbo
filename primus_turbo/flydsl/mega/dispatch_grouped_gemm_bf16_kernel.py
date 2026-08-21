@@ -305,7 +305,7 @@ def _make_kernel(
                     a_slot_ids=a_slots,
                     b_slot_ids=b_slots,
                     slot_len=fx.Int32(num_max_pool_tokens),
-                    slot_lds=True,
+                    slot_unroll=2,
                 )
         else:
             tile_index = block_index - fx.Int32(num_max_dispatch_blocks)
