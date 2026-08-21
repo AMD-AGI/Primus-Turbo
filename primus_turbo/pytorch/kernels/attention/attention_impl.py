@@ -62,13 +62,12 @@ def _sink_ok(sink: Optional[torch.Tensor], num_heads_q: int) -> bool:
 
 
 def _gqa_group_ok(num_heads_q: int, num_heads_kv: int) -> bool:
-    """The deterministic dkdv backward needs G = Hq // Hkv to be a power of two in [8, 256]:
-    its LDS-staged (delta, lse) load uses LD_VEC = 64 // (256 // G), which must be >= 2.
-    MHA and small/non-power-of-2 groups fall back to aiter."""
+    """G = Hq // Hkv must be a power of two in [1, 256], so it divides BLOCK_SIZE for the
+    dkdv backward's cooperative (delta, lse) stage. Anything else falls back to aiter."""
     if num_heads_kv <= 0 or num_heads_q % num_heads_kv != 0:
         return False
     g = num_heads_q // num_heads_kv
-    return 8 <= g <= 256 and (g & (g - 1)) == 0
+    return 1 <= g <= 256 and (g & (g - 1)) == 0
 
 
 def _flydsl_common_ok(

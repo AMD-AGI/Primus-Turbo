@@ -1496,8 +1496,14 @@ def build_flash_attn_bwd_dkdv_module(
     LD_HEAD_ELEMS = BLOCK_Q
     LD_ARR_ELEMS = GQA_GROUP_SIZE * LD_HEAD_ELEMS
     LD_ELEMS = 2 * LD_ARR_ELEMS
-    LD_THREADS_PER_HEAD = BLOCK_SIZE // GQA_GROUP_SIZE
+    # A group with fewer than BLOCK_SIZE // BLOCK_Q heads has fewer elements to stage than
+    # the work-group has threads, so cap a head's span at one element per thread. The
+    # threads past LD_ACTIVE then repeat the first ones -- same source, same LDS address,
+    # same value -- so the duplicate loads and stores are idempotent and cost no branch.
+    # At larger groups LD_ACTIVE is BLOCK_SIZE and the wrap below is not emitted at all.
+    LD_THREADS_PER_HEAD = min(BLOCK_SIZE // GQA_GROUP_SIZE, LD_HEAD_ELEMS)
     LD_VEC = LD_HEAD_ELEMS // LD_THREADS_PER_HEAD
+    LD_ACTIVE = GQA_GROUP_SIZE * LD_THREADS_PER_HEAD
     assert BLOCK_SIZE % GQA_GROUP_SIZE == 0 and LD_HEAD_ELEMS % LD_THREADS_PER_HEAD == 0
     # buffer_load takes power-of-two vectors up to dwordx4, so a per-thread run that is not
     # one (block_q=96 leaves 6 floats) is issued as its greedy power-of-two pieces.
@@ -2680,7 +2686,8 @@ def build_flash_attn_bwd_dkdv_module(
         # MFMA shadow; accumulating dv/dk across heads is a pure reassociation (det-neutral).
         ld_lds = SmemPtr(base_ptr, ld_off, fx.Float32.ir_type, shape=(LD_ELEMS,)).get()
         # Thread t owns LD_VEC consecutive q of one GQA head.
-        _ld_head = tid // fx.Index(LD_THREADS_PER_HEAD)
+        _ld_tid = tid if const_expr(LD_ACTIVE == BLOCK_SIZE) else (tid % fx.Index(LD_ACTIVE))
+        _ld_head = _ld_tid // fx.Index(LD_THREADS_PER_HEAD)
         _ld_q = (tid % fx.Index(LD_THREADS_PER_HEAD)) * fx.Index(LD_VEC)
 
         def _stage_ld_issue(q_start, poff=None):
