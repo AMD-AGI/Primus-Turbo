@@ -76,8 +76,8 @@ def _load_i32_at(div, idx):
 
 def _half_to_f32bits(raw16, is_fp16):
     """16-bit float (in the low 16 bits of i32 ``raw16``) -> i32 bit-pattern of its
-    f32 value (the shared microblock cvt bitcasts i32->f32). bf16 IS the top 16 bits
-    of an f32 (shift, bit-identical to the old path); fp16 needs a real fpext."""
+    f32 value (the shared microblock cvt bitcasts i32->f32). bf16 occupies the top
+    16 bits of f32, while fp16 requires a real fpext."""
     if not is_fp16:
         return raw16 << 16
     f16v = Vec.from_elements([fx.Int16(raw16)], fx.Int16).bitcast(fx.Float16)[0]
@@ -100,21 +100,12 @@ def compile_grouped_mxfp4_qdual(
 ):
     """Compile the fused grouped mxfp4 dual quant. Shapes/recipes are baked.
 
-    Prologue chain (one @flyc.jit stub, no host metadata ops / D2H):
-      1) ``pad`` (1 thread): tight GO -> 256-aligned col lens/offs (LC/OC);
-      2) ``meta`` (1 thread/tile): O(G) group search -> per-bm-row-block
-         (RB=abs input row of local 0, RE=abs input row end of the group);
-      3) ``kern``: the fused dual tile.
-    ``bm`` (tile rows) must divide 128 (subset of the 256 col-pad align, so one
-    tile stays within one group)."""
-    # mxfp8-quant-style kernel: concurrent ROW/COL halves (256+256 of nth=512) sharing
-    # the LDS tile, then direct feature-major COL writes to global memory. BK=256 ->
-    # each row-output store is 32 contiguous i32 = 128B coalesced (fp4 = 0.5B, so
-    # 256 cols = 128B); consecutive COL threads form coalesced 64B bursts without an
-    # intermediate LDS write-back stage. BM=128 amortizes the grouped metadata/prologue and doubles the
-    # useful rows written per launch while remaining within the LDS budget. Since
-    # BM divides the 256-row colwise padding alignment, one tile stays in one group.
-    # BK divides N_pad via ceil + overshoot mask.
+    Each workgroup owns one padded-M block, scans the group offsets, and loops
+    over all N blocks. ``bm`` must divide both 128 and the 256-row per-group
+    colwise padding so that a tile never crosses a group boundary.
+    """
+    # Split the workgroup evenly between rowwise and colwise quantization. BM=128
+    # fits in LDS, while BK tail accesses beyond N_pad are masked.
     assert 128 % bm == 0 and bm % 32 == 0 and bk % 32 == 0
     BM = bm
     BK = bk
@@ -138,14 +129,6 @@ def compile_grouped_mxfp4_qdual(
     @fx.struct
     class Smem:
         buf: fx.Array[fx.Int32, _NW, 16]
-        # ldsc removed (Lever B stacked on Lever A): the COL half now buffer_stores its
-        # fp4 vec4 DIRECTLY to COL_OUT (feature-major, M contiguous -> this feature's 4 fp4
-        # i32 words are already contiguous, and 4 consecutive COL threads = 64B burst), so
-        # the stage-to-ldsc + read-back write loop are gone. Frees ~16KB LDS. NOTE: unlike
-        # the single-tile baseline, the collapsed N-loop still needs the end-of-iter barrier
-        # as a WAR guard so iter N+1's tile-load does not overwrite buf while iter N's
-        # ROW/COL halves are still reading it -- that barrier is retained (it is no longer
-        # the ldsc-visibility barrier, which is what Lever B removed).
 
     @flyc.kernel(known_block_size=[nth, 1, 1])
     def kern(
@@ -159,25 +142,17 @@ def compile_grouped_mxfp4_qdual(
         OC: fx.Tensor,  # OUT: 256-aligned per-group offs (int64 [G+1])
         SR_SEED: fx.Int32,  # per-launch stochastic-rounding seed (0 when SR off)
     ):
-        # Fused dual tile (one BM x BK tile / WG, one microblock/thread). The per-tile
-        # group metadata is computed INLINE (no meta prologue kernel): each WG does the
-        # O(G) 256-aligned-offset scan from GO (loaded to registers first, so no dependent
-        # load chain), yielding in_rebase (abs input row of local 0) / in_end (group input
-        # end). The pid==0 WG also emits the padded lens/offs outputs (threads tid<=G).
+        # Map this padded-M block to its source group. The first block also emits
+        # the 256-aligned colwise lengths and offsets.
         I32 = fx.Int32
         z = I32(0)
         lds = fx.SharedAllocator().allocate(Smem).peek()
         tid = fx.thread_idx.x
-        # GRID COLLAPSED OVER N: one WG per padded-M block (grid=NBM). The O(G) group scan
-        # depends only on the M-block (base_c=bt*BM), NOT on the N-block, so we run it ONCE
-        # here and loop the N-blocks (bkc in [0,NBK)) internally -- amortizing the 33 GO
-        # loads + G-iter select scan that the old grid=(NBM*NBK) recomputed NBK times/M-block.
-        # XCD-aware M-block remap over the collapsed grid extent for L2 locality.
+        # One workgroup handles all N blocks for a single padded-M block.
         bt = xcd_remap_pid(fx.block_idx.x, I32(NBM), 8)  # padded-M block; one tile -> one group
         base_c = bt * I32(BM)
 
-        # Parallel-load GO[0..G] then scan in registers (avoids the prev=nxt dependent
-        # load chain the mxfp8 per-WG scan suffered from). Runs ONCE per M-block.
+        # Load the group offsets in parallel and scan them from registers.
         go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
         go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
         go_vals = [_load_i32_at(go_div, 2 * g) for g in range_constexpr(G + 1)]
@@ -215,8 +190,7 @@ def compile_grouped_mxfp4_qdual(
             buffer_ops.buffer_store(cap_off, oc_r, 2 * tid)
             buffer_ops.buffer_store(z, oc_r, 2 * tid + I32(1))
 
-        # ROW-band SRDs depend only on the M-block (in_rebase/in_end / bt) -> hoist out of
-        # the N-block loop. X read band + rowwise fp4/scale output bands are all M-fixed.
+        # These row-band resources are shared by all N-block iterations.
         rsrc = make_row_band_resource(buffer_ops.extract_base_index(X), in_rebase, in_end, I32(N >> 1), 4)
         orsrc = make_row_band_resource(
             buffer_ops.extract_base_index(ROW_OUT), in_rebase, in_end, I32(ROW_OUT_W), 4
@@ -224,22 +198,15 @@ def compile_grouped_mxfp4_qdual(
         rscrsrc = make_row_band_resource(
             buffer_ops.extract_base_index(ROW_SC), in_rebase, in_end, I32(ROW_SC_N), 1
         )
-        # COL output tensor bases (band re-base per N-block happens inside the loop).
         col_out_base = buffer_ops.extract_base_index(COL_OUT)
         col_sc_base = buffer_ops.extract_base_index(COL_SC)
-        # Concurrent-half assignment is N-block-invariant -> hoist.
         half = tid // I32(HALF)
         lt = tid - half * I32(HALF)
 
-        # ---- N-block loop: each iteration is the original single-tile body. The LDS buf
-        # is reused across iterations; the barrier after the tile load is the RAW guard
-        # (buf visible before the halves read it) and the barrier at the end of the body is
-        # the WAR guard (all buf readers done before iter N+1's load overwrites buf). The
-        # COL fp4 is stored DIRECTLY to HBM (Lever B), so the old ldsc stage + write-back
-        # loop + its LDS-visibility barrier are gone. ----
+        # Reuse LDS for each N block. The barriers around quantization protect the
+        # producer/consumer ordering between loop iterations.
         for bkc in range_constexpr(NBK):
-            # ---- coalesced tile load: X[in_rebase + tr, bkc*BK + col] -> LDS (all
-            # loads issued first for read MLP; past-group rows / >=N cols -> 0) ----
+            # Load one BM x BK tile; out-of-range rows and columns are zero-filled.
             c0w = bkc * I32(_TCW)
             _vecs = []
             for chunk in range_constexpr(_NLOAD):
@@ -255,16 +222,13 @@ def compile_grouped_mxfp4_qdual(
                 _lds_store_vec4(lds.buf.ptr, chunk * (nth * 4) + tid * 4, _vecs[chunk])
             fx.barrier()
 
-            # COL_* SRDs re-based over the N-feature band [bkc*BK, N) (whole-tensor spans
-            # exceed 2^31 for large total_M).
+            # Rebase colwise resources to keep offsets within int32 range.
             col_base = bkc * I32(BK)
             corsrc = make_row_band_resource(col_out_base, col_base, I32(N), I32(COL_OUT_W), 4)
             cscrsrc = make_row_band_resource(col_sc_base, col_base, I32(N), I32(COL_SC_N), 1)
 
-            # Concurrent halves: ROW half (tid<HALF) casts tight-M + 128B-coalesced store;
-            # COL half (tid>=HALF) casts the transpose and writes fp4 directly to COL_OUT.
-            # The two run in different warps so the row HBM writes overlap the col compute.
-            if half == z:  # ROW half
+            # Separate wave groups quantize the rowwise and colwise outputs concurrently.
+            if half == z:  # rowwise half
                 for kk in range_constexpr(_NROWT):
                     task = kk * I32(HALF) + lt
                     r_row = task // I32(_CMB)
@@ -290,7 +254,7 @@ def compile_grouped_mxfp4_qdual(
                     buffer_ops.buffer_store(
                         arith.trunci(T.i8, rbiased & 0xFF), rscrsrc, r_row * I32(ROW_SC_N) + gcmb, mask=row_ok
                     )
-            if half != z:  # COL half: cast transpose -> DIRECT store to COL_OUT (no ldsc round-trip)
+            if half != z:  # colwise half
                 for kk in range_constexpr(_NCOLT):
                     task = kk * I32(HALF) + lt
                     c_col = task // I32(_RMB)
@@ -311,10 +275,8 @@ def compile_grouped_mxfp4_qdual(
                     cseed = _sr_hash((SR_SEED ^ _SR_COL_SALT) ^ (gcol * COL_SC_N + gmmb)) if col_sr else None
                     cwords = _cvt_microblock_to_fp4(cvf, arith.bitcast(T.f32, cnative), cseed)
                     col_ok = gcol < I32(N)
-                    # COL_OUT is feature-major with M contiguous, so this feature's 4 fp4 i32
-                    # words (one M-microblock) are already contiguous at the band-local offset,
-                    # and 4 consecutive COL threads (mblk 0..3 of one feature, _RMB=BM/32=4) form
-                    # a 64B contiguous burst -- same coalescing the write-back had, minus the LDS.
+                    # COL_OUT is feature-major, so adjacent M microblocks form
+                    # contiguous stores.
                     cob = c_col * I32(COL_OUT_W) + bt * I32(DWPC) + mblk * I32(4)  # bkc*BK folded into SRD
                     buffer_ops.buffer_store(
                         Vec.from_elements(cwords, fx.Int32), corsrc, col_ok.select(cob, I32(_OOB))
@@ -325,9 +287,8 @@ def compile_grouped_mxfp4_qdual(
                         c_col * I32(COL_SC_N) + gmmb,  # band-local (bkc*BK folded into SRD)
                         mask=col_ok,
                     )
-            # WAR guard: iter N's ROW/COL halves finished reading buf before iter N+1's
-            # tile-load overwrites it. (This is NOT the ldsc-visibility barrier Lever B
-            # deleted; the direct COL store above writes global HBM, needing no barrier.)
+            # Prevent the next iteration from overwriting LDS before both halves
+            # finish reading the current tile.
             fx.barrier()
 
     @flyc.jit
@@ -343,9 +304,7 @@ def compile_grouped_mxfp4_qdual(
         SR_SEED: fx.Int32,
         stream: fx.Stream,
     ):
-        # Single kernel: grid collapsed over N -> one WG per padded-M block (NBM). Each WG
-        # runs the O(G) group scan ONCE and loops the NBK N-blocks internally. Padded
-        # lens/offs emitted by the bt==0 WG.
+        # One workgroup per padded-M block; each loops over all N blocks.
         kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, GO, LC, OC, SR_SEED).launch(
             grid=(NBM, 1, 1), block=(nth, 1, 1), stream=stream
         )
@@ -354,7 +313,7 @@ def compile_grouped_mxfp4_qdual(
 
 
 _GQ_MXFP4_CACHE: dict = {}
-_GQ_MXFP4_CACHE_CAP = 64  # bound the per-(total_M) compiled-quant cache (broad-sweep OOM guard)
+_GQ_MXFP4_CACHE_CAP = 64  # bound the compiled specializations retained across shape sweeps
 
 
 def grouped_quant_mxfp4_raw(
