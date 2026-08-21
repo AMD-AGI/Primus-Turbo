@@ -66,15 +66,12 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     default_backend: int,
     inplace_add_to_out: bool = False,
     out: Optional[torch.Tensor] = None,
+    m_real: Optional[int] = None,
+    n_real: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
-    """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked to.
-
-    Returns the weight gradient for autograd, or a dummy buffer when the wgrad went
-    straight into ``out``: forward already flagged the weight, so the training
-    framework's own accumulation step stands down. Megatron still expects a tensor
-    rather than None there, so its backward hooks stay on the main thread; the
-    contents are never read. It is handed back in the weight's own dtype, since a
-    mismatch would make autograd allocate and cast a full-size copy.
+    """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked. Returns the
+    weight grad, or a dummy buffer (weight dtype, never read) when it accumulated in
+    place -- forward flagged the weight so the framework's own accum stands down.
     """
     inputs = (a, b, a_scales, b_scales, group_lens, group_offs)
     options = dict(
@@ -88,11 +85,16 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     )
 
     if not inplace_add_to_out:
-        return grouped_gemm_fp8_variable_k_impl(*inputs, **options)
+        return grouped_gemm_fp8_variable_k_impl(*inputs, m_real=m_real, n_real=n_real, **options)
 
-    assert out is not None, "out should not be None when inplace_add_to_out is True"
-    grouped_gemm_fp8_variable_k_accum_impl(*inputs, out=out, **options)
-
+    # Fused bgrad-accum: the wgrad accumulates straight into ``out`` (beta=1). Tight (N/K-pad)
+    # output accumulates natively in the FlyDSL fast CShuffle 128b epilogue (fp32-/pad-aware,
+    # scalar store only as fallback for a non-Cc-multiple N) -- no host add_ / branch. The
+    # accumulate target (Megatron's main_grad) may be fp32 while the weight -- and thus the
+    # dummy wgrad handed back to autograd -- is 16-bit; each backend reconciles the fp32 ``out``
+    # against the (16-bit) ``out_dtype`` internally, so ``out_dtype`` stays the weight dtype here.
+    assert out is not None, "out is required when inplace_add_to_out is True"
+    grouped_gemm_fp8_variable_k_accum_impl(*inputs, out=out, m_real=m_real, n_real=n_real, **options)
     return _get_dummy_wgrad(out.shape, out_dtype)
 
 
@@ -466,6 +468,60 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
+        # Raw-tensor NT path pads both operands' K to Kp=ceil128(K) and the weight's HIDDEN=N to
+        # Np=ceil128(N) at cast time; pad rows/cols are exact zero so the real extents come back
+        # untouched (copy-free) and n_real recovers the real output width inside the backend.
+        raw_nt = (
+            trans_b
+            and not isinstance(a, QuantizedTensor)
+            and not isinstance(b, QuantizedTensor)
+            and a.dim() == 2
+            and b.dim() == 3
+        )
+        if raw_nt:
+            from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+                quantize_fp8_tensorwise_pad_impl,
+            )
+
+            go = group_offs if group_offs is not None else group_offs_from_lens(group_lens)
+            fp8_dtype = _get_fp8_dtype(config.format, True)
+            k_real = a.shape[-1]  # real contraction K before the K-pad
+            n_real = b.shape[1]  # real HIDDEN=N before the N-pad
+            # Request a tight output only when the pad actually shrinks a dim; an aligned shape is a
+            # bit-exact no-op and stays a plain generic GEMM (every backend eligible, CK/hbl included).
+            tight = (k_real % 128 != 0) or (n_real % 128 != 0)
+            a_q, a_sc = quantize_fp8_tensorwise_pad_impl(a, fp8_dtype)  # [M, Kp]
+            b_q, b_sc = quantize_fp8_tensorwise_pad_impl(b, fp8_dtype, pad_n=True)  # [G, Np, Kp]
+            out = grouped_gemm_fp8_impl(
+                a_q,
+                b_q,
+                a_sc,
+                b_sc,
+                group_lens,
+                go,
+                trans_a=False,
+                trans_b=True,
+                out_dtype=out_dtype,
+                granularity=config.granularity.value,
+                num_cu=num_cu,
+                default_backend=(BackendType.FLYDSL.value if tight else BackendType.TRITON.value),
+                maybe_pre_sync=True,
+                n_real=(n_real if tight else None),
+            )  # [M, N]
+            ctx.save_for_backward(a_q, b_q, a_sc, b_sc, group_lens, go)
+            ctx.trans_a = False
+            ctx.trans_b = trans_b
+            ctx.config = config
+            ctx.out_dtype = out_dtype
+            ctx.num_cu = num_cu
+            ctx.k_real = k_real
+            # This path returns early, so it sets the grad-accum context the shared backward reads.
+            ctx.fuse_bgrad_accum = fuse_bgrad_accum
+            ctx.main_grad = main_grad
+            ctx.n_real = n_real
+            ctx.tight = tight
+            return out
+
         if isinstance(a, QuantizedTensor):
             assert a._is_grouped_tensor, "A QuantizedTensor input must be a grouped tensor"
             check_quantized_tensor(a, config)
@@ -537,22 +593,41 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
     def backward(ctx, grad_out):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
-        k_pad_real = getattr(ctx, "k_pad_real", None)
+        # Set by the raw-tensor NT forward (None on the pre-quantized path); ``tight`` only when the
+        # pad actually grew a dim.
+        k_real = getattr(ctx, "k_real", None)  # real K = dgrad output free dim
+        n_real = getattr(ctx, "n_real", None)  # real N = dgrad contraction / wgrad OUT_M
+        raw = k_real is not None
+        tight = getattr(ctx, "tight", False)
+        default_backend = BackendType.FLYDSL.value if tight else BackendType.TRITON.value
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
-        quantized_grad_out = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            axis=-1,
-            block_size=ctx.config.block_size,
-            group_lens=group_lens,
-        )
+        if raw:
+            from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+                quantize_fp8_tensorwise_pad_impl,
+            )
 
+            # dgrad NN contracts grad_out's last dim (=N) against b_fp8's penultimate dim (=Np), so
+            # grad_out is widened N->Np inside the quant kernel (k_align=128); the zero pad adds
+            # exact 0, no F.pad / host slice.
+            go_qdata, go_scale_inv = quantize_fp8_tensorwise_pad_impl(grad_out, grad_out_dtype, k_align=128)
+            assert go_qdata.shape[-1] == b_fp8.shape[-2]
+        else:
+            quantized_grad_out = QuantizedTensor.quantize(
+                grad_out,
+                grad_out_dtype,
+                ctx.config.granularity,
+                axis=-1,
+                block_size=ctx.config.block_size,
+                group_lens=group_lens,
+            )
+            go_qdata, go_scale_inv = quantized_grad_out.qdata, quantized_grad_out.scale_inv
+
+        # dgrad NN: contract N; n_real=k_real shrinks the output free dim Kp->K so grad_a is tight.
         grad_a = grouped_gemm_fp8_impl(
-            quantized_grad_out.qdata,
+            go_qdata,
             b_fp8,
-            quantized_grad_out.scale_inv,
+            go_scale_inv,
             b_scale_inv,
             group_lens,
             group_offs,
@@ -561,14 +636,17 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=default_backend,
+            n_real=(k_real if tight else None),
         )
 
+        # wgrad TN variable-K: m_real=N / n_real=K shrink the [G, Np, Kp] output to a tight
+        # [G, N, K]. Fused accum is folded inside the wrapper (tight + beta=1 has no kernel path).
         grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             a_fp8,
-            quantized_grad_out.qdata,
+            go_qdata,
             a_scale_inv,
-            quantized_grad_out.scale_inv,
+            go_scale_inv,
             group_lens,
             group_offs,
             trans_a=not ctx.trans_a,
@@ -577,14 +655,12 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=default_backend,
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
+            m_real=(n_real if tight else None),
+            n_real=(k_real if tight else None),
         )
-
-        if k_pad_real is not None:
-            grad_a = grad_a[:, :k_pad_real].contiguous()
-            grad_b = grad_b[..., :k_pad_real].contiguous()
 
         return (
             grad_a,  # a
