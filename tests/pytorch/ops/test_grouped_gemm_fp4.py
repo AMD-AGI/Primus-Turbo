@@ -20,6 +20,7 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.pytorch.ops.grouped_gemm_fp4 import grouped_gemm_fp4
+from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp4_with_trans
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
@@ -31,7 +32,8 @@ torch.manual_seed(42)
 # Sweep parameters. MXFP4 is NT-only (trans_b=True), single E2M1 format, Triton
 # backend only, so we drop those axes and keep full B / M / NK / dtype / balance.
 # N, K need only be multiples of MXFP4_BLOCK_SIZE (=32); the quantizer zero-pads
-# the contraction dims up to 128. M is grouped along rows (wgrad zero-pads to 128).
+# the contraction dims up to 128. M is grouped along rows; the FlyDSL wgrad
+# operand uses a compact 256-aligned span per group.
 B_VALUES = [1, 2, 3, 8, 16, 32]
 M_VALUES = [128, 256, 512, 1024, 2048]
 NK_VALUES = [
@@ -242,19 +244,32 @@ def test_grouped_gemm_fp4_unaligned_nk(B, M, NK, dtype, balance):
 # Zero-length groups (MoE routing where some experts get no tokens).
 # ----------------------------------------------------------------------------
 @pytest.mark.parametrize("dtype", DTYPE_VALUES)
-def test_grouped_gemm_fp4_zero_group_lens(dtype):
+@pytest.mark.parametrize(
+    "group_lens_values,N,K",
+    [
+        ((8192, 8192, 0, 0, 0, 0, 0, 0), 8192, 2048),
+        ((0, 1, 255, 257, 511, 513), 256, 256),
+    ],
+    ids=["empty-experts", "k256-zero-even-odd"],
+)
+def test_grouped_gemm_fp4_zero_group_lens(dtype, group_lens_values, N, K):
     """group_lens containing zeros must not crash fwd/bwd (illegal-memory-access
-    regression guard) and must stay correct on the non-empty groups."""
+    regression guard) and must stay correct on the non-empty groups.
+
+    The K256 routing case also guards the compact producer/consumer contract:
+    after 256-row alignment its groups exercise zero, one, two, and three wgrad
+    K-blocks, covering both the even-pair loop and the odd-tail path.
+    """
     supported, reason = check_mxfp4_support()
     if not supported:
         pytest.skip(reason)
     device = "cuda:0"
 
-    E, K, N = 8, 2048, 8192
-    group_lens_list = [8192, 8192, 0, 0, 0, 0, 0, 0]
-    group_lens = torch.tensor(group_lens_list, dtype=torch.int64, device=device)
+    E = len(group_lens_values)
+    group_lens = torch.tensor(group_lens_values, dtype=torch.int64, device=device)
+    group_offs = torch.cat([torch.zeros(1, dtype=torch.int64, device=device), group_lens.cumsum(0)])
     total_m = int(group_lens.sum().item())
-    print(f"\ngroup_lens={group_lens_list}, total_M={total_m}, N={N}, K={K}, dtype={dtype}")
+    print(f"\ngroup_lens={group_lens_values}, total_M={total_m}, N={N}, K={K}, dtype={dtype}")
 
     a = torch.randn((total_m, K), dtype=dtype, device=device, requires_grad=True)
     b = torch.randn((E, N, K), dtype=dtype, device=device, requires_grad=True)
@@ -266,6 +281,39 @@ def test_grouped_gemm_fp4_zero_group_lens(dtype):
     grad_out = torch.randn_like(out_ref)
     out_ref.backward(grad_out)
     torch.cuda.synchronize()
+
+    if N == K == 256:
+        (
+            row,
+            row_scale,
+            col,
+            col_scale,
+            row_lens,
+            row_offs,
+            col_lens,
+            col_offs,
+        ) = grouped_quantize_fp4_with_trans(
+            a.detach(),
+            float4_e2m1fn_x2,
+            ScalingGranularity.MX_BLOCKWISE,
+            group_lens,
+            group_offs,
+            block_size=MXFP4_BLOCK_SIZE,
+        )
+        expected_col_lens = ((group_lens + 255) // 256) * 256
+        expected_col_offs = torch.cat(
+            [torch.zeros(1, dtype=torch.int64, device=device), expected_col_lens.cumsum(0)]
+        )
+        expected_alloc_m = (total_m + E * 256 + 255) // 256 * 256
+
+        torch.testing.assert_close(row_lens, group_lens, rtol=0, atol=0)
+        torch.testing.assert_close(row_offs, group_offs, rtol=0, atol=0)
+        torch.testing.assert_close(col_lens, expected_col_lens, rtol=0, atol=0)
+        torch.testing.assert_close(col_offs, expected_col_offs, rtol=0, atol=0)
+        assert row.shape == (total_m, K // 2)
+        assert row_scale.shape == (total_m, K // MXFP4_BLOCK_SIZE)
+        assert col.shape == (K, expected_alloc_m // 2)
+        assert col_scale.shape == (K, expected_alloc_m // MXFP4_BLOCK_SIZE)
 
     config = _make_config()
     out = grouped_gemm_fp4(a, b, group_lens, trans_b=True, config=config)
