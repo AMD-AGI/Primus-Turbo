@@ -38,6 +38,7 @@ Environment variable: PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON activates these k
 from __future__ import annotations
 
 import functools
+import warnings
 
 import torch
 import triton
@@ -84,6 +85,74 @@ def _resolve_variable_k_out(
     return out
 
 
+@triton.jit
+def _fp8_block_k_probe_kernel(A, B, C, K, N, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """Plain fp8 matmul used only by :func:`largest_sane_fp8_block_k`."""
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    rn = tl.program_id(1) * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    ap = A + rm[:, None] * K + rk[None, :]
+    bp = B + rk[:, None] * N + rn[None, :]
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, BK)):
+        acc += tl.dot(tl.load(ap), tl.load(bp))
+        ap += BK
+        bp += BK * N
+    tl.store(C + rm[:, None] * N + rn[None, :], acc)
+
+
+@functools.lru_cache(maxsize=32)
+def _fp8_block_k_is_sane(block_k: int) -> bool:
+    """Whether an fp8 ``tl.dot`` at this BLOCK_K compiles to correct code on this device.
+
+    Some Triton/arch combinations miscompile fp8 ``tl.dot`` at particular tile sizes and
+    return NaN (or silently wrong values) from finite inputs. Observed on gfx1250:
+    BLOCK_K=128 is broken under Triton 3.6.0, and 3.7.1 additionally breaks BLOCK_K=64 --
+    so a hardcoded per-arch cap goes stale. Probe instead, once per process.
+    """
+    try:
+        device = torch.cuda.current_device()
+        M = N = 512
+        K = 512
+        BM = BN = 128
+        gen = torch.Generator(device=device).manual_seed(0)
+        a = (torch.randn(M, K, device=device, generator=gen) * 0.3).to(torch.float8_e4m3fn)
+        b = (torch.randn(K, N, device=device, generator=gen) * 0.3).to(torch.float8_e4m3fn)
+        out = torch.empty(M, N, device=device, dtype=torch.float32)
+        _fp8_block_k_probe_kernel[(M // BM, N // BN)](a, b, out, K, N, BM=BM, BN=BN, BK=block_k)
+        torch.cuda.synchronize()
+        if not torch.isfinite(out).all():
+            return False
+        ref = a.float() @ b.float()
+        snr = 10 * torch.log10(ref.norm().pow(2) / ((ref - out).norm().pow(2) + 1e-12))
+        return bool(snr > 20)
+    except Exception:
+        return False
+
+
+@functools.lru_cache(maxsize=32)
+def largest_sane_fp8_block_k(preferred: int) -> int:
+    """``preferred`` if fp8 ``tl.dot`` is correct at that tile size here, else the largest
+    smaller power-of-two that is. Raises when no candidate works."""
+    candidates = [bk for bk in (256, 128, 64, 32) if bk <= preferred]
+    for block_k in candidates:
+        if _fp8_block_k_is_sane(block_k):
+            if block_k != preferred:
+                warnings.warn(
+                    f"fp8 tl.dot miscompiles at BLOCK_K={preferred} on this device/Triton "
+                    f"({triton.__version__}); falling back to BLOCK_K={block_k}. "
+                    "This is a Triton codegen bug, not a config error.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return block_k
+    raise RuntimeError(
+        f"fp8 tl.dot produces NaN at every BLOCK_K in {candidates} on this device with "
+        f"Triton {triton.__version__}. Use a non-Triton grouped-GEMM backend "
+        "(PRIMUS_TURBO_GROUPED_GEMM_BACKEND=fp8:hipblaslt)."
+    )
+
+
 def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
     """FP8 grouped GEMM config from MI300X bench (out_gg_fp8_persistent_full.yaml).
 
@@ -94,6 +163,7 @@ def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
 
     BM, BN = 256, 256
     BK = 128 if is_tn else 64
+    BK = largest_sane_fp8_block_k(BK)
 
     tiles_m_g = max(1, (avg_m + BM - 1) // BM)
     tiles_n = (N + BN - 1) // BN
@@ -296,6 +366,7 @@ def _get_gg_fp8_rw_fwd_config(
     else:
         blk_m, blk_n = 256, 256
         blk_k = 128 if (stride_ak == 1 and stride_bk == 1) else 64
+        blk_k = largest_sane_fp8_block_k(blk_k)
         num_stages_val = 2
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
