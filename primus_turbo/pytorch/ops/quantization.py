@@ -29,7 +29,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,
-    quantize_fp8_tensorwise_impl,
+    quantize_fp8_tensorwise_pad_impl,
     quantize_mxfp4_impl,
     quantize_mxfp8_impl,
 )
@@ -57,6 +57,8 @@ def quantize_fp8(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
+    pad_align_last: int = 0,
+    pad_align_penultimate: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP8 Quantize
@@ -69,9 +71,23 @@ def quantize_fp8(
             1. The x must be 2D tensor.
             2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
+
+        ``pad_align_last`` / ``pad_align_penultimate`` are OPT-IN (default 0 =
+        off) and only apply to TENSORWISE fp8: when >0 the cast also widens the
+        last (K) / penultimate (weight N) dim to a multiple of 128 with exact-zero
+        pad. The scalar amax is computed over the real data before padding, so the
+        scale is pad-invariant.
     """
     if granularity == ScalingGranularity.TENSORWISE:
-        return quantize_fp8_tensorwise_impl(x, out_dtype)
+        # Single path: (k_align=1, pad_n=False) hits the same cpp op with the same (1, 1)
+        # args as the legacy non-pad cast, so it is byte-identical for dense/aligned callers;
+        # only grouped weights that request a pad widen K/N.
+        return quantize_fp8_tensorwise_pad_impl(
+            x,
+            out_dtype,
+            pad_n=(pad_align_penultimate > 0),
+            k_align=(pad_align_last or 1),
+        )
 
     elif granularity == ScalingGranularity.ROWWISE:
         return quantize_fp8_rowwise_impl(x, out_dtype, axis)
