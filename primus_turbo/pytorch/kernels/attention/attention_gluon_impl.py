@@ -120,11 +120,14 @@ def _flash_attn_gluon_forward_op(
 
 @_flash_attn_gluon_forward_op.register_fake
 def _flash_attn_gluon_forward_op_fake(q, k, v, softmax_scale, causal, qkv_format):
-    if qkv_format == "bshd":
-        out = torch.empty_like(q, memory_format=torch.contiguous_format)
-    else:
-        raw = q.new_empty((q.shape[0], q.shape[2], q.shape[1], q.shape[3]))
-        out = raw.transpose(1, 2)
+    raw_q = q if qkv_format == "bshd" else q.transpose(1, 2)
+    raw_out = torch.empty_strided(
+        raw_q.shape,
+        raw_q.stride(),
+        dtype=raw_q.dtype,
+        device=raw_q.device,
+    )
+    out = raw_out if qkv_format == "bshd" else raw_out.transpose(1, 2)
     lse = q.new_empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32)
     return out, lse
 

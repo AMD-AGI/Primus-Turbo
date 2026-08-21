@@ -301,7 +301,7 @@ def fake_gluon_raw(monkeypatch):
                 "stream": torch.cuda.current_stream(q.device),
             }
         )
-        out = torch.full(q.shape, softmax_scale + float(causal), device=q.device, dtype=q.dtype)
+        out = torch.full_like(q, softmax_scale + float(causal))
         lse = torch.full((batch, num_heads_q, seqlen_q), softmax_scale, device=q.device, dtype=torch.float32)
         return out, lse
 
@@ -412,6 +412,54 @@ def test_gluon_fake_matches_eager_metadata_and_exact_strides(qkv_format, expecte
     assert lse.shape == (2, 8, 3)
     assert lse.dtype == torch.float32
     assert lse.device == q.device
+
+
+def test_gluon_fake_preserves_bshd_singleton_batch_stride():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        q = torch.empty((5, 1, 8, 64), device="cuda", dtype=torch.float16).permute(1, 0, 2, 3)
+        k = torch.empty((7, 1, 2, 64), device="cuda", dtype=torch.float16).permute(1, 0, 2, 3)
+        v = torch.empty_like(k)
+
+        out, _ = attention_gluon_impl.flash_attn_gluon_forward_impl(
+            q, k, v, softmax_scale=None, causal=False, qkv_format="bshd"
+        )
+
+    assert q.is_contiguous()
+    assert q.stride() == (512, 512, 64, 1)
+    assert out.stride() == (512, 512, 64, 1)
+
+
+def test_gluon_compile_preserves_bshd_singleton_batch_stride(gluon_cuda_device, fake_gluon_raw):
+    q = torch.empty((5, 1, 8, 64), device=gluon_cuda_device, dtype=torch.float16).permute(1, 0, 2, 3)
+    k = torch.empty((7, 1, 2, 64), device=gluon_cuda_device, dtype=torch.float16).permute(1, 0, 2, 3)
+    v = torch.empty_like(k)
+
+    def forward(query, key, value):
+        out, _ = attention_gluon_impl.flash_attn_gluon_forward_impl(
+            query,
+            key,
+            value,
+            softmax_scale=None,
+            causal=False,
+            qkv_format="bshd",
+        )
+        return out, out.stride(0)
+
+    eager_out, eager_stride = forward(q, k, v)
+    torch._dynamo.reset()
+    try:
+        compiled_forward = torch.compile(forward, backend="eager", fullgraph=True)
+        compiled_out, compiled_stride = compiled_forward(q, k, v)
+    finally:
+        torch._dynamo.reset()
+
+    assert q.stride() == (512, 512, 64, 1)
+    assert eager_out.stride() == (512, 512, 64, 1)
+    assert compiled_out.stride() == (512, 512, 64, 1)
+    assert eager_stride == 512
+    assert compiled_stride == 512
 
 
 @pytest.mark.parametrize("use_fake", [False, True], ids=["eager", "fake"])
@@ -992,7 +1040,6 @@ def _gluon_attention_fp32_reference(q, k, v, softmax_scale, causal):
     return output, lse
 
 
-_RUN_LONG_GLUON_TESTS = os.environ.get("PRIMUS_TURBO_TEST_LONG") == "1"
 _GLUON_CORRECTNESS_CASES = [
     pytest.param(
         torch.float16,
@@ -1046,16 +1093,48 @@ _GLUON_CORRECTNESS_CASES = [
         torch.float16,
         "bshd",
         False,
+        17,
+        19,
+        2,
+        1,
+        63,
+        None,
+        id="fp16-bshd-noncausal-mqa-d63-padded-d64-tail",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        "bhsd",
+        False,
+        17,
+        19,
+        2,
+        1,
+        127,
+        None,
+        id="bf16-bhsd-noncausal-mqa-d127-padded-d128-tail",
+    ),
+    pytest.param(
+        torch.bfloat16,
+        "bhsd",
+        True,
+        9,
+        13,
+        2,
+        1,
+        255,
+        None,
+        id="bf16-bhsd-causal-mqa-d255-padded-d256-tail",
+    ),
+    pytest.param(
+        torch.float16,
+        "bshd",
+        False,
         1024,
         2048,
         16,
         4,
         128,
         0.11,
-        marks=pytest.mark.skipif(
-            not _RUN_LONG_GLUON_TESTS,
-            reason="set PRIMUS_TURBO_TEST_LONG=1 to run selected long Gluon cases",
-        ),
         id="fp16-bshd-noncausal-gqa-d128-long-rectangular",
     ),
     pytest.param(
@@ -1068,10 +1147,6 @@ _GLUON_CORRECTNESS_CASES = [
         8,
         64,
         None,
-        marks=pytest.mark.skipif(
-            not _RUN_LONG_GLUON_TESTS,
-            reason="set PRIMUS_TURBO_TEST_LONG=1 to run selected long Gluon cases",
-        ),
         id="bf16-bhsd-causal-mha-d64-long-square",
     ),
 ]

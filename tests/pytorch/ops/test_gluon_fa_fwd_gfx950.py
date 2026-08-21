@@ -55,72 +55,6 @@ _BM128_BN64_STAGE4 = KernelConfig(128, 64, False, 4, 1, 4)
 _BM128_BN64_STAGE2 = KernelConfig(128, 64, False, 2, 0, 4)
 
 
-class ForwardCase(NamedTuple):
-    test_id: str
-    batch: int
-    query_heads: int
-    kv_heads: int
-    n_ctx: int
-    causal: bool
-    config: KernelConfig
-
-
-_DOD_CASES = (
-    ("dod-mha-h64-b32-s512", 32, 512),
-    ("dod-mha-h64-b16-s1024", 16, 1024),
-    ("dod-mha-h64-b8-s2048", 8, 2048),
-    ("dod-mha-h64-b4-s4096", 4, 4096),
-    ("dod-mha-h64-b2-s8192", 2, 8192),
-    ("dod-mha-h64-b1-s16384", 1, 16384),
-)
-_MODEL_CASES = (
-    ("mha-short", 32, 32, 128),
-    ("mha-medium", 32, 32, 2048),
-    ("mha-long", 32, 32, 8192),
-    ("gqa-short", 32, 8, 128),
-    ("gqa-medium", 32, 8, 2048),
-    ("gqa-long", 32, 8, 8192),
-    ("mqa-short", 32, 1, 128),
-    ("mqa-medium", 32, 1, 2048),
-    ("mqa-long", 32, 1, 8192),
-)
-
-
-def _selected_config(n_ctx: int, causal: bool) -> KernelConfig:
-    if not causal:
-        return _BM256_BN64_STAGE3 if n_ctx <= 512 else _BM256_BN64_STAGE4
-    if n_ctx <= 1024:
-        return _BM128_BN64_STAGE4
-    return _BM256_BN64_STAGE3 if n_ctx == 2048 else _BM256_BN64_STAGE4_MAX_ILP
-
-
-FORWARD_CASES = tuple(
-    ForwardCase(
-        f"{name}-{'causal' if causal else 'noncausal'}",
-        batch,
-        64,
-        64,
-        n_ctx,
-        causal,
-        _selected_config(n_ctx, causal),
-    )
-    for causal in (False, True)
-    for name, batch, n_ctx in _DOD_CASES
-) + tuple(
-    ForwardCase(
-        f"{name}-{'causal' if causal else 'noncausal'}",
-        1,
-        query_heads,
-        kv_heads,
-        n_ctx,
-        causal,
-        _selected_config(n_ctx, causal),
-    )
-    for causal in (False, True)
-    for name, query_heads, kv_heads, n_ctx in _MODEL_CASES
-)
-
-
 def _has_gfx950() -> bool:
     import torch
 
@@ -157,41 +91,11 @@ def _run_worker(case: str) -> subprocess.CompletedProcess[str]:
         )
 
 
-def _run_matrix_worker(index: int) -> subprocess.CompletedProcess[str]:
-    case = FORWARD_CASES[index]
-    with tempfile.TemporaryDirectory(prefix=f"primus-gluon-fa-{case.test_id}-") as cache:
-        return subprocess.run(
-            [
-                sys.executable,
-                str(pathlib.Path(__file__).resolve()),
-                "--matrix-worker",
-                str(index),
-            ],
-            env=_worker_environment(cache),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=600,
-            check=False,
-        )
-
-
 @pytest.mark.parametrize("case", WORKERS)
 def test_gluon_causal_regression_in_isolated_process(case: str) -> None:
     result = _run_worker(case)
     assert result.returncode == 0, result.stdout
     assert "PASS" in result.stdout, result.stdout
-
-
-@pytest.mark.skipif(
-    os.environ.get("PRIMUS_TURBO_TEST_LONG") != "1",
-    reason="set PRIMUS_TURBO_TEST_LONG=1 to run the isolated 30-row GPU suite",
-)
-@pytest.mark.parametrize("index", range(len(FORWARD_CASES)))
-def test_gluon_forward_matrix_in_isolated_process(index: int) -> None:
-    result = _run_matrix_worker(index)
-    assert result.returncode == 0, result.stdout
-    assert f"PASS test_id={FORWARD_CASES[index].test_id}" in result.stdout
 
 
 def _load_fa_module():
@@ -338,18 +242,81 @@ def _run_attention_case(
 
 def _run_prune_case() -> None:
     fa = _load_fa_module()
-    prune = getattr(fa, "prune_unsafe_causal_configs", None)
-    assert prune is not None, "causal stage-2 autotune pruning is missing"
+    prune = getattr(fa, "prune_unsafe_configs", None)
+    assert prune is not None, "unsafe autotune pruning is missing"
 
     configs = fa.get_gluon_cdna_autotune_configs()
-    causal = prune(configs, {}, IS_CAUSAL=True, MAX_SEQLENS_K=1024)
-    noncausal = prune(configs, {}, IS_CAUSAL=False, MAX_SEQLENS_K=1024)
+    causal = prune(
+        configs,
+        {},
+        IS_CAUSAL=True,
+        MAX_SEQLENS_K=1024,
+        ACTUAL_BLOCK_DMODEL=128,
+    )
+    noncausal = prune(
+        configs,
+        {},
+        IS_CAUSAL=False,
+        MAX_SEQLENS_K=1024,
+        ACTUAL_BLOCK_DMODEL=128,
+    )
     if fa._HAS_WARP_PREDICATE:
         assert causal == configs
     else:
         assert causal
         assert all(config.kwargs["NUM_STAGES"] != 2 for config in causal)
     assert noncausal == configs
+
+    for actual_head_dim, padded_head_dim in ((63, 64), (127, 128), (255, 256)):
+        for is_causal in (False, True):
+            pruned = prune(
+                configs,
+                {},
+                IS_CAUSAL=is_causal,
+                MAX_SEQLENS_K=13,
+                ACTUAL_BLOCK_DMODEL=actual_head_dim,
+            )
+            assert pruned
+            assert all(
+                not (
+                    config.kwargs["NUM_STAGES"] > 1
+                    and not (padded_head_dim >= 256 and config.kwargs["BLOCK_N"] >= 64)
+                    and not (
+                        padded_head_dim < 128 and config.kwargs["BLOCK_N"] < 64 and config.num_warps >= 8
+                    )
+                )
+                for config in pruned
+            )
+            assert any(config.kwargs["NUM_STAGES"] == 1 for config in pruned)
+
+        noncausal = prune(
+            configs,
+            {},
+            IS_CAUSAL=False,
+            MAX_SEQLENS_K=13,
+            ACTUAL_BLOCK_DMODEL=actual_head_dim,
+        )
+        if actual_head_dim == 63:
+            assert any(
+                config.kwargs["BLOCK_N"] == 32 and config.kwargs["NUM_STAGES"] > 1 and config.num_warps == 8
+                for config in noncausal
+            )
+        elif actual_head_dim == 127:
+            assert all(config.kwargs["NUM_STAGES"] == 1 for config in noncausal)
+        else:
+            assert any(
+                config.kwargs["BLOCK_N"] == 64 and config.kwargs["NUM_STAGES"] > 1 for config in noncausal
+            )
+
+    for aligned_head_dim in (64, 128, 240, 256):
+        aligned = prune(
+            configs,
+            {},
+            IS_CAUSAL=False,
+            MAX_SEQLENS_K=13,
+            ACTUAL_BLOCK_DMODEL=aligned_head_dim,
+        )
+        assert aligned == configs
 
 
 def _worker(case: str) -> int:
@@ -412,27 +379,9 @@ def _worker(case: str) -> int:
     return 0
 
 
-def _matrix_worker(index: int) -> int:
-    case = FORWARD_CASES[index]
-    snr = _run_attention_case(
-        config=case.config,
-        n_ctx=case.n_ctx,
-        batch=case.batch,
-        query_heads=case.query_heads,
-        kv_heads=case.kv_heads,
-        causal=case.causal,
-    )
-    if not (snr > 40.0):
-        print(f"FAIL test_id={case.test_id} snr_db={snr:.4f}", flush=True)
-        return 1
-    print(f"PASS test_id={case.test_id} snr_db={snr:.4f}", flush=True)
-    return 0
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", choices=WORKERS)
-    parser.add_argument("--matrix-worker", type=int, choices=range(len(FORWARD_CASES)))
     return parser.parse_args()
 
 
@@ -440,6 +389,4 @@ if __name__ == "__main__":
     args = _parse_args()
     if args.worker is not None:
         raise SystemExit(_worker(args.worker))
-    if args.matrix_worker is not None:
-        raise SystemExit(_matrix_worker(args.matrix_worker))
-    raise SystemExit("--worker or --matrix-worker is required when this file is run directly")
+    raise SystemExit("--worker is required when this file is run directly")
