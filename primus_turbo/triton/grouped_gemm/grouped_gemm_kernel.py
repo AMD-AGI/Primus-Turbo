@@ -162,7 +162,12 @@ def _get_gg_bf16_vk_config(OUT_M, OUT_N, avg_k, dtype_lhs, dtype_rhs, G, num_sms
                 BLOCK_M, BLOCK_N, group_m = om, on, ogm
                 cache_a, cache_b = oc_a, oc_b
     else:
-        BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
+        # BLOCK_K=32 (not 64): on Triton 3.8.0 the 256x256x64 variable-K tile
+        # overflows the VGPR file and spills (n_regs=256, n_spills=65), making
+        # this kernel up to 5.4x slower than on Triton 3.7.1 (AIMA-250). BK=32
+        # keeps the 256x256 output tile, drops spills to 0, and is 1.6-3.5x
+        # faster in microbench / 1.44x faster end-to-end. Matches gfx950 above.
+        BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 32
         group_m = 4
         num_stages_val = 2
         cache_a, cache_b = ".ca", ".ca"
