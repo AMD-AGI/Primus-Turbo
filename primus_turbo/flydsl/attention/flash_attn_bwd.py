@@ -4103,10 +4103,11 @@ def _fuse_blockkv_for(Skv, D=64, window_left=-1):
 
 _BWD_CACHE: dict = {}
 _DQRED_CACHE: dict = {}
-# Launchers the dQ fold keeps built. A hidden fold goes out in _DQ_FOLD_SLICES slices, each
-# its own (qsp, batch) key, so ONE shape asks for slices*(chunks-1)+1 of these. A cap a single
-# shape can reach is not a cap, it is a rebuild of every launcher on every call: pushed past
-# it the target reads 1424 ms against 5.85, because the JIT then runs inside the timed loop.
+# Launchers the dQ fold keeps built. A hidden fold goes out in up to _DQ_FOLD_SLICES slices,
+# each its own (qsp, batch) key, so ONE shape asks for slices*(chunks-1)+1 of these -- 49 at
+# the widest plan a D128 cell reaches. A cap a single shape can reach is not a cap, it is a
+# rebuild of every launcher on every call: pushed past it the target reads 1424 ms against
+# 5.85, because the JIT then runs inside the timed loop.
 # Holds several shapes' worth -- these are launchers, and no device tensor is cached here.
 _DQRED_CACHE_MAX = 256
 
@@ -4446,6 +4447,16 @@ _DQ_PIPE_AREA_FLOOR = 2048 * 2048
 # +56.9%. The cliff is therefore somewhere in (2, 4] fills; it is taken at 4, the narrowest
 # chunk measured to pay. Every chunk _pipe_chunks emits is at least one split wide, so the
 # rule is checked once on a single-split chunk and holds for every plan.
+# All four of those readings are at the 256-row band, and the threshold does NOT hold across
+# band widths: what a chunk BUYS is the fold bytes it hides, and those go as 1/(2*BLOCK_KV)
+# per unit of body work, while what it COSTS -- one drain of the longest band's walk -- is a
+# body quantity that the band width leaves alone. So the same 512-work-group chunk that costs
+# d64_hq32_b4 +36.4% at bkv=256 is the other sign at bkv=128: l70b_b1 (D128, B=1, the one
+# cell of the seven that falls under the flat rule) reads 3.3226 / 3.3551 unpiped against
+# 3.1997 / 3.1869 piped, -4.4%, palindrome 2/2, bitwise deterministic, with the four cells
+# already above the threshold flat. The profiler names the mechanism rather than leaving it
+# to the wall: under the flat rule B=1 issues ONE dqred launch against B=2's three, so none
+# of its 0.74 ms of fold can hide under a following body and all of it is exposed.
 _DQ_PIPE_FILLS = 4
 # Queues the pipeline's chunks alternate across. One queue serialises them, so every chunk
 # boundary drains the CU array before the next chunk starts filling it, and at one
@@ -4475,9 +4486,30 @@ _DQ_TAIL_SERIAL = True
 # gptoss_full against 5.7334 for eight (eight readings each, own process, palindrome-ordered)
 # and 0.3% down on d128_hq64_b2, and scaling by width lands between them. Four readings each
 # had shown sixteen 0.8% ahead, which is the host's swing, not a result.
-_DQ_FOLD_SLICES = 8
+#
+# The count alone does NOT carry across shapes, and once the equal chunk plan made every
+# hidden fold one subset wide the two D128 cells say so from opposite directions. Sixteen
+# slices, own process, min of 40, palindrome-ordered (four readings an arm): d128_hq64_b2
+# 6.2455 / 6.2511 / 6.2628 / 6.2631 against 6.2915 / 6.2934 / 6.2972 / 6.3034 at eight, all
+# four below all four, -0.65% -- while d128_hq32_b2, the SAME grid (1024 work-groups, 64
+# bands, B=2, q_split=4, so the same 256 q rows a slice) at HALF the bytes a row, reads
+# 3.7528 / 3.7630 against 3.3110 / 3.3321, +13.1%. Their slice counts, row counts and
+# resident rounds are identical, so what separates them is the only term left: the BYTES one
+# slice hands over, 134 MB against 67 MB. Below that the ramp is no longer amortized and the
+# fold stops keeping up with the body it is meant to hide under.
+_DQ_FOLD_SLICES = 16
+# So the count is a cap and this is the floor that stops it: the fold's bytes, per slice.
+# 134 MB pays and 67 MB does not, at both head dims (gptoss_full's narrow chunk sits at 134
+# and its own sixteen-slice arm, which lands at 67, is the flat reading recorded above), so
+# the line is taken at 128 MiB -- the widest power of two the measured pair allows.
+_DQ_FOLD_SLICE_BYTES = 1 << 27
 _SIDE_STREAM: dict = {}
 _PIPE_EVENTS: dict = {}
+
+
+def _dq_pipe_fills(block_kv):
+    """Fills of the CU array one chunk must be worth, at THIS band width (see _DQ_PIPE_FILLS)."""
+    return max(1, _DQ_PIPE_FILLS * block_kv // 256)
 
 
 def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False):
@@ -4554,8 +4586,17 @@ def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False):
     # moving the exposed tail to the reduce queue under this plan is level too (6.4810 against
     # 6.4894). [2,2] confirms the tail term from the other side -- one boundary fewer still,
     # and both guards lose to the doubled tail.
+    #
+    # The MERGE is taken at the wide band only, and the table above is what says so: the two
+    # cells it wins are the two 256-row bands, and the one it loses is the 128-row one
+    # ([1,1,1,1] 6.3816 against [1,2,1] 6.5033 on d128_hq64_b2 -- the "margin given back"
+    # sentence above). Same term as everywhere else on this path: a merged pair hides a
+    # TWO-subset fold under a one-subset body, a window subscribed 2:1, and what a unit of
+    # body absorbs is 1/(2*BLOCK_KV), so halving the band doubles the over-subscription and
+    # that one window stops covering. The equal cut pays one more boundary (~0.11 ms) for it
+    # and keeps the same one-subset tail.
     if sbhd:
-        if q_split < 4:
+        if q_split < 4 or block_kv < 256:
             return [(None, s, 1) for s in range(q_split)]
         return [(None, 0, 1), (None, 1, 2)] + [(None, s, 1) for s in range(3, q_split)]
     abs_map = block_kv % (q_split * _BWD_BLOCK_Q) == 0 or _qsp_absolute(head_dim, block_kv, q_split)
@@ -4569,8 +4610,8 @@ def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False):
     )
 
 
-def _fold_slices(B, Sq, q_split, lo, n):
-    """One hidden dQ fold as ``(batch kwargs, qsp)`` slices, at least _DQ_FOLD_SLICES of them.
+def _fold_slices(B, Sq, q_split, lo, n, fold_bytes):
+    """One hidden dQ fold as ``(batch kwargs, qsp)`` slices, at most _DQ_FOLD_SLICES of them.
 
     The BATCH axis first, since a batch owns a contiguous slab of every band's partial row and
     of dQ. Then the q axis: split ``s`` of ``q_split`` is the q blocks with
@@ -4581,9 +4622,17 @@ def _fold_slices(B, Sq, q_split, lo, n):
     what a single launch produces -- checked directly against the unsliced schedule, not just
     through the determinism gate. Doubling stops where the finer splits would no longer tile
     the q blocks (see _qsp_cuttable), which would leave a remainder block unreduced.
+
+    ``fold_bytes`` is what this whole fold reads, so the cut also stops while a slice would
+    fall under _DQ_FOLD_SLICE_BYTES: past that the slices are the same rows and rounds but
+    too few bytes each to pay for their own ramp (see the constants).
     """
     qs = [(q_split, lo, n)]
-    while B * len(qs) < _DQ_FOLD_SLICES and _qsp_cuttable(Sq, q_split * len(qs) * 2):
+    while (
+        B * len(qs) * 2 <= _DQ_FOLD_SLICES
+        and _qsp_cuttable(Sq, q_split * len(qs) * 2)
+        and fold_bytes >= _DQ_FOLD_SLICE_BYTES * B * len(qs) * 2
+    ):
         qs = [(q * 2, l + j * q, m) for q, l, m in qs for j in (0, 1)]
     bats = [dict(bat_lo=b, n_bat=1) for b in range(B)] if B > 1 else [{}]
     return [(bat, q) for bat in bats for q in qs]
@@ -4739,8 +4788,13 @@ def _fused_pipelined(
         # under, so there is no burst to break up and slicing only costs it the extra ramps
         # (5.874 against 5.854). A per-batch chunk is already one batch of a far smaller
         # workspace and takes the plain launch too.
+        #
+        # What a chunk's fold reads: the causal half of the bands, times the dQ image, times the
+        # chunk's share of the q blocks (_reduce_dq_partials does the same accounting for the
+        # whole fold). It is what floors how small _fold_slices may cut.
+        fold_bytes = (Skv // block_kv) // 2 * (B * Sq * Hq * D * 2) * (n or q_split) // q_split
         slices = (
-            _fold_slices(B, Sq, q_split, lo, n)
+            _fold_slices(B, Sq, q_split, lo, n, fold_bytes)
             if not per_batch and n is not None and i < nc - 1
             else [(bat, (q_split, lo, n))]
         )
@@ -5373,7 +5427,7 @@ def flydsl_varlen_backward(
                 q_split > 1
                 and (block_kv % (q_split * _BWD_BLOCK_Q) == 0 or _qsp_absolute(D, block_kv, q_split))
                 and _qsp_cuttable(Sq, q_split)
-                and n_bands * Hkv * B >= _DQ_PIPE_FILLS * _NUM_CU
+                and n_bands * Hkv * B >= _dq_pipe_fills(block_kv) * _NUM_CU
             )
             if sbhd
             else B > 1
