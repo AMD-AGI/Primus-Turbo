@@ -38,18 +38,6 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
-def quantize_fp8_tensorwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize FP8 Tensor-Wise
-    """
-    # padding_align_size=1 -> Kp == K, shape-preserving (byte-identical to the legacy quant).
-    x = x.contiguous()
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None, 1)
-    return x_fp8, scale_inv
-
-
 def quantize_fp8_tensorwise_pad_impl(
     x: torch.Tensor, out_dtype: torch.dtype, pad_n: bool = False, k_align: int = 128
 ) -> Tuple[torch.Tensor, torch.Tensor]:

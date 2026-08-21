@@ -159,8 +159,16 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         supported = True
         # This backend has no beta=1 accumulate epilogue.
         supported &= not inplace_add_to_out
-        # No N/K-pad tight-output path here.
-        supported &= kwargs.get("m_real", None) is None and kwargs.get("n_real", None) is None
+        # This backend writes the full operand pitch, so it can't produce a tight (shrunk) output;
+        # admit a real-dim hint only when it equals the operand pitch (an aligned shape = no-op).
+        mr = kwargs.get("m_real", None)
+        nr = kwargs.get("n_real", None)
+        if mr is not None or nr is not None:
+            m = a.shape[1] if trans_a else a.shape[0]
+            n = b.shape[-2] if trans_b else b.shape[-1]
+            if trans_c:
+                m, n = n, m
+            supported &= (mr is None or mr == m) and (nr is None or nr == n)
         # check the CK backend was compiled into this build
         supported &= build_ck()
         supported &= not is_gfx1250()
@@ -300,8 +308,16 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
-        # No N/K-pad tight-output path here.
-        supported &= kwargs.get("m_real", None) is None and kwargs.get("n_real", None) is None
+        # This backend writes the full operand pitch, so it can't produce a tight (shrunk) output;
+        # admit a real-dim hint only when it equals the operand pitch (an aligned shape = no-op).
+        mr = kwargs.get("m_real", None)
+        nr = kwargs.get("n_real", None)
+        if mr is not None or nr is not None:
+            m = a.shape[1] if trans_a else a.shape[0]
+            n = b.shape[-2] if trans_b else b.shape[-1]
+            if trans_c:
+                m, n = n, m
+            supported &= (mr is None or mr == m) and (nr is None or nr == n)
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_GRANULARITIES
