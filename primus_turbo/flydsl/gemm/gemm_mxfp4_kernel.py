@@ -545,7 +545,8 @@ class MfmaScaleFp4:
         assert _BSPL == (b_base_even is not None)
         # The fused store needs a g2s-free tail phase to ride (unified vmcnt): a peel or odd KI.
         assert not _CST or (not self.coop and (ki is None or (half_k and ((ki & 1) or ki >= 4))))
-        _RTPEEL = _CST and ki is None
+        _RUNTIME = ki is None
+        _RTPEEL = _CST and _RUNTIME
         # 3-slot odd ring (skewed rows) rotates ds_read bases; a 2-slot ring is byte-exact/static.
         _ROT = _SPLIT and len(split[0]) == 3
         _NOD = len(split[0]) if _SPLIT else 0
@@ -1080,8 +1081,6 @@ class MfmaScaleFp4:
             ]
             for g in range(4):
                 L.append(f"s_mov_b32 ${o_sca[g]}, ${i_sca0[g]}")
-            if _RTPEEL:
-                L.append(f"s_sub_u32 ${o_npv}, ${i_nval}, 2")
             if _ROT:
                 for t in range(3):
                     for j in range(3):
@@ -1116,6 +1115,10 @@ class MfmaScaleFp4:
                 L += emit_ds(0, 0)
                 L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
                 L.append("s_barrier")
+            # K%256 (odd KI): the do-while processes 256-blocks in PAIRS; an odd trailing block is an MFMA tail (or _OPEEL).
+            _has_loop = _RUNTIME or (ki >= 2)
+            _has_tail = (ki is not None) and bool(ki & 1) and not _OPEEL
+
             if _has_loop:
                 # unroll-2 body (phase A even-k, phase B odd-k); scale loads lead the mfma stream.
                 def emit_phase_a(half, zero=False):
@@ -1180,7 +1183,8 @@ class MfmaScaleFp4:
                         B.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
                         B.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
                     B.append(f"s_add_u32 ${o_cnt}, ${o_cnt}, 2")
-                    B.append(f"s_cmp_lt_u32 ${o_cnt}, ${o_npv if _RTPEEL else i_nval}")
+                    _loop_bound = o_npv if _RTPEEL else (o_sct if _RUNTIME else i_nval)
+                    B.append(f"s_cmp_lt_u32 ${o_cnt}, ${_loop_bound}")
                     B.append(f"s_cbranch_scc1 {lbl}b")
                     return B
 
@@ -1294,6 +1298,61 @@ class MfmaScaleFp4:
                         )
                     return B
 
+                def emit_runtime_zero(half):
+                    """Drain speculative prologue traffic and materialize zero accumulators."""
+                    B = ["s_waitcnt vmcnt(0) lgkmcnt(0)"]
+                    if not _CST:
+                        return B
+                    cq = CstSched()
+                    mi = 0
+                    for ii in range(nta):
+                        for sl in range(1 if half else 2):
+                            for ji in range(ntb):
+                                cq.done(mi, ii, sl, ji)
+                                mi += 1
+                    return B + _CST_HAZ + cq.flush()
+
+                def emit_runtime_odd_tail(half):
+                    """Consume the staged final phase-A block without issuing a refill."""
+                    _scb[0] = 0
+                    return ["s_waitcnt vmcnt(0) lgkmcnt(0)"] + emit_inplace(
+                        0,
+                        [],
+                        half,
+                        refill=False,
+                        cstq=CstSched() if _CST else None,
+                    )
+
+                def emit_runtime(half, tag):
+                    """Uniform zero/even/odd dispatcher for a raw count of 256-K phases."""
+                    bound = o_npv if _RTPEEL else o_sct
+                    base = 10 if half else 5
+                    zero, even, odd_tail, even_peel, done = range(base, base + 5)
+                    B = [
+                        f"s_cmp_eq_u32 ${i_nval}, 0",
+                        f"s_cbranch_scc1 {zero}f",
+                        f"s_and_b32 ${bound}, ${i_nval}, 1",
+                        f"s_cmp_eq_u32 ${bound}, 0",
+                        f"s_cbranch_scc1 {even}f",
+                        f"s_sub_u32 ${bound}, ${i_nval}, 1",
+                        f"s_cmp_eq_u32 ${bound}, 0",
+                        f"s_cbranch_scc1 {odd_tail}f",
+                    ]
+                    B += emit_loop("2" if half else "1", half)
+                    B.append(f"{odd_tail}:")
+                    B += emit_runtime_odd_tail(half)
+                    B += [f"s_branch {done}f", f"{even}:"]
+                    if _RTPEEL:
+                        B.append(f"s_sub_u32 ${bound}, ${i_nval}, 2")
+                        B += emit_peel_rt(half, even_peel)
+                    else:
+                        B.append(f"s_mov_b32 ${bound}, ${i_nval}")
+                        B += emit_loop("2" if half else "1", half)
+                    B += [f"s_branch {done}f", f"{zero}:"]
+                    B += emit_runtime_zero(half)
+                    B.append(f"{done}:")
+                    return B
+
                 def emit_peel_odd(half):
                     """Odd trip count: peel the last full pair's phase A so the trailing half
                     k-block merges into the phase behind it, giving the fused store the same
@@ -1307,8 +1366,8 @@ class MfmaScaleFp4:
                 _peel = emit_peel_fold if _CST else emit_peel
 
                 def emit_body(lbl, half):
-                    if _RTPEEL:
-                        return emit_peel_rt(half, lbl)
+                    if _RUNTIME:
+                        return emit_runtime(half, lbl)
                     B = (emit_head(half) if _ZACC else []) + emit_loop("2" if half else "1", half)
                     if _KPEEL:
                         B += _peel(half)

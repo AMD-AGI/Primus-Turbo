@@ -11,13 +11,13 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Fused grouped MXFP4 dual-cast quant (rowwise tight-M + colwise 512-aligned-M).
+"""Fused grouped MXFP4 dual-cast quant (rowwise tight-M + colwise 256-aligned-M).
 
 Drop-in for the HIP ``grouped_quantize_mxfp4_dual`` (non-shuffle, per-1x32 E8M0).
 One 16-bit (bf16/fp16) read of ``x`` [total_M, N] emits both:
   * rowwise fp4 [total_M, N_pad/2] + E8M0 [total_M, N_pad/32] -- TIGHT M layout
     (row i == input row i), the fwd/dgrad operand;
-  * colwise fp4 [N, M_pad_col/2] + E8M0 [N, M_pad_col/32] -- 512-aligned per-group
+  * colwise fp4 [N, M_pad_col/2] + E8M0 [N, M_pad_col/32] -- 256-aligned per-group
     M layout (transposed), the variable-K wgrad operand.
 The per-group padded offsets are filled on-device by a fused ``pad`` prologue
 (no D2H). Numerics reuse the mxfp4 microblock primitives (RHT + all-int E8M0 +
@@ -122,7 +122,7 @@ def _tile_group_span(tbl, G, base_c):
     ``base_c``: one ballot+ctpop over the monotone padded end offsets picks the group,
     three readlanes fetch its padded begin / tight begin / tight end. ``base_c`` past the
     padded total selects nothing, which zeroes the input band, so the returned span is
-    <= 0 exactly when the whole tile is 512-alignment padding."""
+    <= 0 exactly when the whole tile is 256-alignment padding."""
     oc_end, oc_beg, go0, go1 = tbl
     z = fx.Int32(0)
     gsel = _lane_tbl_count_le(oc_end, _readfirstlane_i32(base_c))
@@ -191,7 +191,7 @@ def compile_grouped_mxfp4_qdual(
 ):
     """Compile the fused grouped mxfp4 dual quant. Shapes/recipes are baked.
 
-    ``bm`` (tile rows) must divide the 512 col-pad alignment, so one tile stays within one
+    ``bm`` (tile rows) must divide the 256 col-pad alignment, so one tile stays within one
     group. The ldsc write-back walks the stage as ``4 words x nth`` per iteration and masks
     the partial tail iteration, so any ``bm``/``bk`` in that domain is legal (an unmasked
     walk silently stored the overshoot into the colwise output for e.g. bm=128/bk=128)."""
@@ -208,7 +208,7 @@ def compile_grouped_mxfp4_qdual(
     # slower, so occupancy is not this kernel's axis -- L2 store requests are.
     # BK divides N_pad via ceil + overshoot mask.
     nth = 1024  # threads/block (hardware max; 8 waves/SIMD at this VGPR count)
-    assert 512 % bm == 0 and bm % 32 == 0 and bk % 32 == 0
+    assert 256 % bm == 0 and bm % 32 == 0 and bk % 32 == 0
     BM = bm
     BK = bk
     _TCW = BK // 2  # i32 words per tile row (2 bf16/i32)
@@ -256,8 +256,8 @@ def compile_grouped_mxfp4_qdual(
         COL_OUT: fx.Tensor,  # int32 view fp4 [N, M_pad_col/8]
         COL_SC: fx.Tensor,  # uint8 [N, M_pad_col/32]
         GO: fx.Tensor,  # tight per-group offs (int32 view of int64 [G+1])
-        LC: fx.Tensor,  # OUT: 512-aligned per-group lens (int64 [G])
-        OC: fx.Tensor,  # OUT: 512-aligned per-group offs (int64 [G+1])
+        LC: fx.Tensor,  # OUT: 256-aligned per-group lens (int64 [G])
+        OC: fx.Tensor,  # OUT: 256-aligned per-group offs (int64 [G+1])
         SR_SEED: fx.Int32,  # per-launch stochastic-rounding seed (0 when SR off)
     ):
         # Fused dual tile (one BM x BK tile / WG, one microblock/thread). The per-tile
@@ -286,18 +286,18 @@ def compile_grouped_mxfp4_qdual(
         # Lane-resident group table (entry g in lane g%64 of chunk g//64), the same
         # primitives the grouped GEMM prologue uses: one buffer_load per chunk plus a wave
         # add-scan replace the per-thread O(G) compare chain, and ceildiv_pow2 replaces the
-        # signed //512 divide chain. The whole scan is VALU the tile cast cannot hide.
+        # signed //256 divide chain. The whole scan is VALU the tile cast cannot hide.
         lane = tid % I32(64)
         wave = tid // I32(64)
         go_rs = buffer_ops.create_buffer_resource(GO, max_size=False, num_records_bytes=(G + 1) * 8)
         go0 = _lane_tbl_load(go_rs, lane, G + 1, stride=2)
         go1 = _lane_tbl_load(go_rs, lane, G + 1, stride=2, first=1)
         _own = [lane + I32(64 * c) < I32(G) for c in range_constexpr(len(go0))]
-        # 512-align each group's colwise (wgrad-contraction) span: the mxfp4 whole-loop
+        # 256-align each group's colwise (wgrad-contraction) span: the mxfp4 whole-loop
         # wgrad runs an even count of 256-K blocks (unroll-2), so per-group M must be a
-        # 512-multiple -- emit it here (zero pad) so the wgrad needs no on-GPU repack.
+        # 256-multiple -- emit it here (zero pad) so the wgrad needs no on-GPU repack.
         lpad = [
-            arith.select(_own[c], ceildiv_pow2(go1[c] - go0[c], 512) * I32(512), z)
+            arith.select(_own[c], ceildiv_pow2(go1[c] - go0[c], 256) * I32(256), z)
             for c in range_constexpr(len(go0))
         ]
         oc_end = _lane_tbl_scan(lpad)  # entry g = padded col rows owned by groups <= g
@@ -340,7 +340,7 @@ def compile_grouped_mxfp4_qdual(
         )
 
         # Rows [bt*BM, bt*BM+BM) of the padded colwise layout, mapped back to the input.
-        # BM divides the 512 col-pad alignment, so the tile lies inside ONE group and
+        # BM divides the 256 col-pad alignment, so the tile lies inside ONE group and
         # ``span`` (its owning group's remaining tight rows) is workgroup-uniform.
         in_rebase, in_end = _tile_group_span(gtbl, G, bt * I32(BM))
         span = _readfirstlane_i32(in_end - in_rebase)
@@ -506,7 +506,7 @@ def compile_grouped_mxfp4_qdual(
 
         # ---- all-padding tile: skip straight to the zero fill ----
         # ``span <= 0`` means tile row 0 already sits past its group's tight end, so every
-        # row of the tile is 512-alignment padding: the load would return zeros, every
+        # row of the tile is 256-alignment padding: the load would return zeros, every
         # rowwise store would be dropped by the band SRD, and the colwise result is exactly
         # the zero microblock (amax 0 -> biased exponent 0 -> fp4 nibble 0). Those tiles
         # still have to WRITE their zeros -- the colwise operand is torch.empty and the
@@ -583,7 +583,7 @@ def grouped_quant_mxfp4_raw(
     G = int(group_lens.shape[0])
     assert N % MB == 0, f"N must be a multiple of {MB}"
     N_pad = (N + 127) // 128 * 128
-    M_pad_col = (total_M + G * 512 + 511) // 512 * 512  # 512-align per-group col (wgrad)
+    M_pad_col = (total_M + G * 256 + 255) // 256 * 256  # 256-align per-group col (wgrad)
 
     dev = x.device
     row_out = torch.empty(total_M, N_pad // 2, dtype=torch.uint8, device=dev)
@@ -594,7 +594,7 @@ def grouped_quant_mxfp4_raw(
     offs_col = torch.empty(G + 1, dtype=torch.int64, device=dev)
 
     # int32 views of the int64 [G+1] offs (low word carries the value; token offsets
-    # < 2^31). The kernel reads GO and fills the 512-aligned col lens/offs (lc/oc) on-device.
+    # < 2^31). The kernel reads GO and fills the 256-aligned col lens/offs (lc/oc) on-device.
     go = (group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)).view(torch.int32)
     lc = lens_col.view(torch.int32)
     oc = offs_col.view(torch.int32)
