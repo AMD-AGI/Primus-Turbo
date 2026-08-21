@@ -1059,11 +1059,11 @@ def gemm_fp8_blockwise_triton_kernel(
 
     Supported layouts:
       NT/RCR (forward):  trans_a=False, trans_b=True
-        A: [M, K], A_scales: [K//128, M] or [M, K//128]
+        A: [M, K], A_scales: [M, K//128]
         B: [N, K], B_scales: [N//128, K//128]  (2D block scaling)
 
       NN/RRR (grad_X):   trans_a=False, trans_b=False
-        A: [M, K], A_scales: [K//128, M] or [M, K//128]
+        A: [M, K], A_scales: [M, K//128]
         B: [K, N], B_scales: [N//128, K//128]  (2D, transposed internally)
 
       TN/CRR (grad_W):   trans_a=True, trans_b=False
@@ -1105,20 +1105,9 @@ def gemm_fp8_blockwise_triton_kernel(
     #   * EVEN_K=False keeps the mask-load path for the dual strided-K loads, the
     #     matched-pair safety net for the Triton 3.7 `Begin <= End` LLVM-backend
     #     assertion (the TN autotune wrapper already drops num_stages=3).
-    a_scale_k_major_shape = ((K + 127) // 128, M)
-    a_scale_row_major_shape = (M, (K + 127) // 128)
-    if tuple(a_scale_inv.shape) == a_scale_k_major_shape:
-        A_scales_arg = a_scale_inv
-    elif tuple(a_scale_inv.shape) == a_scale_row_major_shape:
-        A_scales_arg = a_scale_inv.T.contiguous()
-    else:
-        raise ValueError(
-            f"invalid A scale shape {a_scale_inv.shape}; "
-            f"expected {a_scale_k_major_shape} or {a_scale_row_major_shape}"
-        )
-
     if not trans_a and trans_b:
         # NT
+        A_scales_arg = a_scale_inv.T.contiguous()
         B_scales_arg = b_scale_inv  # [N//128, K//128]
         autotune_kernel = _blockwise_fp8_nt_kernel
         SCALE_2D_B, EVEN_K, TRANS_C_STORE = True, (K % 128) == 0, False
@@ -1126,6 +1115,7 @@ def gemm_fp8_blockwise_triton_kernel(
         # NN — kernel expects [N_output_blocks, K_inner_blocks] for B_scales,
         # while quantization stores it as [N//128, K//128] over the original
         # weight; the .T.contiguous() rebuilds the indexing the kernel reads.
+        A_scales_arg = a_scale_inv.T.contiguous()
         B_scales_arg = b_scale_inv.T.contiguous()
         autotune_kernel = _blockwise_fp8_nn_kernel
         SCALE_2D_B, EVEN_K, TRANS_C_STORE = True, (K % 128) == 0, False

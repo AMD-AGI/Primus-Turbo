@@ -58,6 +58,55 @@ def get_gemm_logical_shape(
     return M, N, Ka
 
 
+def _get_flydsl_blockwise_logical_shape(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+) -> Tuple[int, int, int] | None:
+    M = a.shape[1] if trans_a else a.shape[0]
+    Ka = a.shape[0] if trans_a else a.shape[1]
+    Kb = b.shape[1] if trans_b else b.shape[0]
+    N = b.shape[0] if trans_b else b.shape[1]
+    target_k = (max(Ka, Kb) + 127) // 128 * 128
+    if Ka == Kb:
+        return M, N, target_k
+    if Ka == target_k and (Kb + 127) // 128 * 128 == target_k:
+        return M, N, target_k
+    if Kb == target_k and (Ka + 127) // 128 * 128 == target_k:
+        return M, N, target_k
+    return None
+
+
+def _pad_tensor_dim(
+    tensor: torch.Tensor,
+    dim: int,
+    size: int,
+) -> torch.Tensor:
+    if tensor.shape[dim] == size:
+        return tensor
+    padded_shape = list(tensor.shape)
+    padded_shape[dim] = size
+    padded = tensor.new_zeros(padded_shape)
+    padded[tuple(slice(0, extent) for extent in tensor.shape)] = tensor
+    return padded
+
+
+def _pad_flydsl_blockwise_contraction(
+    a: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    trans_b: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    logical_shape = _get_flydsl_blockwise_logical_shape(a, b, trans_a, trans_b)
+    if logical_shape is None:
+        raise ValueError(f"incompatible BLOCKWISE contraction shapes: a={a.shape}, b={b.shape}")
+    target_k = logical_shape[2]
+    a = _pad_tensor_dim(a, 0 if trans_a else 1, target_k)
+    b = _pad_tensor_dim(b, 1 if trans_b else 0, target_k)
+    return a, b
+
+
 _COMMON_SUPPORTED_DTYPES = (
     (float8_e4m3, float8_e4m3, torch.float16),
     (float8_e4m3, float8_e4m3, torch.bfloat16),
@@ -225,25 +274,6 @@ class GEMMFP8CKBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
     ):
-        if granularity == ScalingGranularity.BLOCKWISE:
-            # CK keeps the legacy physical contract. Canonical BLOCKWISE
-            # quantization exposes transpose-backed data and K-major row scales;
-            # normalize them here so CK itself needs no layout changes.
-            a = a.contiguous()
-            b = b.contiguous()
-            if not trans_a:
-                M, K = a.shape
-                k_blocks = (K + 127) // 128
-                k_major_shape = (k_blocks, M)
-                row_major_shape = (M, k_blocks)
-                if tuple(a_scale_inv.shape) == k_major_shape:
-                    a_scale_inv = a_scale_inv.T.contiguous()
-                elif tuple(a_scale_inv.shape) != row_major_shape:
-                    raise ValueError(
-                        f"invalid CK BLOCKWISE A-scale shape {a_scale_inv.shape}; "
-                        f"expected {k_major_shape} or {row_major_shape}"
-                    )
-
         if trans_c:
             lhs, rhs = b, a
             lhs_scale_inv, rhs_scale_inv = b_scale_inv, a_scale_inv
@@ -465,13 +495,21 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         supported &= is_gfx950()
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
-        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
 
         if granularity == ScalingGranularity.BLOCKWISE:
             supported &= not inplace_add_to_out
             supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES_BLOCKWISE
             if not supported:
                 return False
+            logical_shape = _get_flydsl_blockwise_logical_shape(
+                a,
+                b,
+                trans_a,
+                trans_b,
+            )
+            if logical_shape is None:
+                return False
+            m, n, k = logical_shape
 
             return flydsl_blockwise_gemm_can_handle(
                 a,
@@ -486,6 +524,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
                 trans_c=trans_c,
             )
 
+        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # NT only; per-operand E4M3/E5M2; raw E8M0 2D scales [M,K//32]/[N,K//32].
             supported &= (not trans_a) and trans_b
@@ -517,6 +556,9 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         if granularity == ScalingGranularity.BLOCKWISE:
+            a, b = _pad_flydsl_blockwise_contraction(a, trans_a, b, trans_b)
+            if not trans_a:
+                a_scale_inv = a_scale_inv.T.contiguous()
             return gemm_fp8_blockwise_flydsl_kernel(
                 a,
                 a_scale_inv,
@@ -577,7 +619,14 @@ class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
 
     @classmethod
     def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, **kwargs):
-        m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+        logical_shape = (
+            _get_flydsl_blockwise_logical_shape(a, b, trans_a, trans_b)
+            if granularity == ScalingGranularity.BLOCKWISE
+            else None
+        )
+        if logical_shape is None:
+            logical_shape = get_gemm_logical_shape(a, b, trans_a, trans_b)
+        m, n, k = logical_shape
         return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
 
 

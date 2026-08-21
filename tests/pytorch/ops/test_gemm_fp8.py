@@ -421,6 +421,20 @@ def _run_gemm_fp8_quantized_tensor_test(
         axis=-1,
         **a_kwargs,
     )
+    qt_a_t = None
+    if granularity == ScalingGranularity.BLOCKWISE:
+        assert block_size is not None
+        qt_a_t = QuantizedTensor.quantize(
+            a,
+            fwd_dtype,
+            config.granularity,
+            block_size=config.block_size,
+            axis=-2,
+        )
+        assert qt_a.qdata.shape == qt_a_t.qdata.shape == a.shape
+        assert qt_a.qdata.is_contiguous() and qt_a_t.qdata.is_contiguous()
+        assert qt_a.scale_inv.shape == (m, (k + block_size - 1) // block_size)
+        assert qt_a_t.scale_inv.shape == ((m + block_size - 1) // block_size, k)
 
     b_kwargs = dict()
     if granularity in (ScalingGranularity.MX_BLOCKWISE, ScalingGranularity.BLOCKWISE):
@@ -435,6 +449,9 @@ def _run_gemm_fp8_quantized_tensor_test(
         axis=-1 if trans_b else -2,
         **b_kwargs,
     )
+    if granularity == ScalingGranularity.BLOCKWISE:
+        assert qt_b.qdata.shape == b.shape
+        assert qt_b.qdata.is_contiguous()
 
     # Reference
     a_mat = a_ref
@@ -444,7 +461,7 @@ def _run_gemm_fp8_quantized_tensor_test(
     c_ref.backward(grad_c)
 
     c = gemm_fp8(
-        QuantizedTensorPair(data=qt_a, data_t=None),
+        QuantizedTensorPair(data=qt_a, data_t=qt_a_t),
         QuantizedTensorPair(data=qt_b, data_t=None),
         trans_a,
         trans_b,

@@ -8,7 +8,9 @@ from typing import Optional, Union
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
@@ -445,42 +447,31 @@ class FP8GemmBlockFunction(torch.autograd.Function):
             check_quantized_tensor(a, config, axis=-1)
             a_row, a_row_scale = a.qdata, a.scale_inv
             if a_t is None:
-                _, _, a_col_t, a_col_scale = quant_fp8_blockwise_dual_impl(
+                a_t = QuantizedTensor.quantize(
                     a.dequantize(),
                     a_dtype,
-                    config.block_size,
+                    config.granularity,
+                    axis=-2,
+                    block_size=config.block_size,
                 )
-                a_col = a_col_t.transpose(0, 1)
-            else:
-                check_quantized_tensor(a_t, config, axis=-2)
-                a_col, a_col_scale = a_t.qdata, a_t.scale_inv
-                if not a_col.T.is_contiguous():
-                    a_col = a_col.T.contiguous().T
+
+            a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
-            a_row, a_row_scale, a_col_t, a_col_scale = quant_fp8_blockwise_dual_impl(
-                a,
-                a_dtype,
-                config.block_size,
-            )
-            a_col = a_col_t.transpose(0, 1)
+            (
+                a_row,
+                a_row_scale,
+                a_col,
+                a_col_scale,
+            ) = quant_fp8_blockwise_dual_impl(a, a_dtype, config.block_size)
 
         # --- B side: 2D-block weight, reused unchanged in fwd + bwd. ---
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, scaling_recipe=b_scaling_recipe)
-            b_col, b_row_scale = b.qdata, b.scale_inv
+            b_row, b_row_scale = b.qdata, b.scale_inv
         else:
-            b_col, b_row_scale = quant_fp8_blockwise_for_weight_impl(
-                b,
-                b_dtype,
-                config.block_size,
-                pad_m=trans_b,
-                pad_n=not trans_b,
-            )
-        b_row = b_col[: b.shape[0], : b.shape[1]]
-        if not b_row.is_contiguous():
-            b_row = b_row.contiguous()
-        b_col_scale = b_row_scale
+            b_row, b_row_scale = quant_fp8_blockwise_for_weight_impl(b, b_dtype, config.block_size)
+        b_col, b_col_scale = b_row, b_row_scale
 
         out = gemm_fp8_impl(
             a_row,
@@ -500,7 +491,6 @@ class FP8GemmBlockFunction(torch.autograd.Function):
         ctx.trans_b = trans_b
         ctx.out_dtype = out_dtype
         ctx.config = config
-        ctx.dgrad_contract = b.shape[0] if trans_b else b.shape[1]
 
         return out
 
@@ -508,31 +498,25 @@ class FP8GemmBlockFunction(torch.autograd.Function):
     def backward(ctx, grad_out: torch.Tensor):
         a_col, a_col_scale, b_col, b_col_scale = ctx.saved_tensors
 
-        grad_out = grad_out.contiguous()
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
-        dgrad_contract = ctx.dgrad_contract
-        row_pad_to_block = dgrad_contract % ctx.config.block_size != 0
+        grad_out = grad_out.contiguous()
 
         # Quantize grad_out in both row-wise and column-wise directions:
         # - row-wise: for dgrad (grad_x)
         # - col-wise: for wgrad (grad_w)
-        g_row, g_row_scale, g_col_t, g_col_scale = quant_fp8_blockwise_dual_impl(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.block_size,
-            row_pad_to_block,
-        )
-        g_col = g_col_t.transpose(0, 1)
-
-        dgrad_b = b_col
-        dgrad_b_scale = b_col_scale
+        (
+            g_row,
+            g_row_scale,
+            g_col,
+            g_col_scale,
+        ) = quant_fp8_blockwise_dual_impl(grad_out, grad_out_dtype, ctx.config.block_size)
 
         grad_a = gemm_fp8_impl(
             g_row,
             g_row_scale,
             False,
-            dgrad_b,
-            dgrad_b_scale,
+            b_col,
+            b_col_scale,
             not ctx.trans_b,
             ctx.out_dtype,
             False,
@@ -790,8 +774,7 @@ def gemm_fp8(
         ...     format=Format.E4M3,
         ...     granularity=ScalingGranularity.ROWWISE
         ... )
-        >>> b_t = torch.randn(256, 512, device='cuda')
-        >>> out = gemm_fp8(a, b_t, trans_b=True, config=config)
+        >>> out = gemm_fp8(a, b, trans_b=True, config=config)
 
     """
     if config is None:

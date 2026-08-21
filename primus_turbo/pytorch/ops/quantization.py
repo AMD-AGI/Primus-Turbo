@@ -25,6 +25,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     grouped_dequantize_mxfp8_impl,
     grouped_quantize_mxfp4_impl,
     grouped_quantize_mxfp8_impl,
+    quant_fp8_blockwise_dual_impl,
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,
@@ -134,6 +135,8 @@ def quantize_fp8_with_trans(
             scaling_recipe,
             scaling_recipe_for_trans,
         )
+    elif granularity == ScalingGranularity.BLOCKWISE:
+        return quant_fp8_blockwise_dual_impl(x, out_dtype, block_size=block_size)
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 

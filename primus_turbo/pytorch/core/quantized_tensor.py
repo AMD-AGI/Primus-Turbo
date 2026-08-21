@@ -383,38 +383,14 @@ class QuantizedTensor(torch.Tensor):
         axis = _normalize_axis(axis, data.ndim)
 
         if dest_dtype in [float8_e4m3, float8_e5m2]:
-            if (
-                granularity == ScalingGranularity.BLOCKWISE
-                and scaling_recipe is not None
-                and scaling_recipe.use_2d_block
-            ):
-                from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-                    quant_fp8_blockwise_for_weight_impl,
-                )
-
-                assert block_size is not None
-                data_, scale_inv = quant_fp8_blockwise_for_weight_impl(
-                    data,
-                    dest_dtype,
-                    block_size,
-                    pad_m=axis == data.ndim - 1,
-                    pad_n=axis == data.ndim - 2,
-                )
-            else:
-                data_, scale_inv = quantize_fp8(
-                    data,
-                    dest_dtype,
-                    granularity,
-                    block_size=block_size,
-                    axis=axis,
-                    scaling_recipe=scaling_recipe,
-                )
-            if (
-                granularity == ScalingGranularity.BLOCKWISE
-                and axis == data.ndim - 1
-                and not (scaling_recipe is not None and scaling_recipe.use_2d_block)
-            ):
-                scale_inv = scale_inv.T.contiguous()
+            data_, scale_inv = quantize_fp8(
+                data,
+                dest_dtype,
+                granularity,
+                block_size=block_size,
+                axis=axis,
+                scaling_recipe=scaling_recipe,
+            )
             return data_, scale_inv
         else:
             assert dest_dtype == float4_e2m1fn_x2
@@ -590,28 +566,15 @@ class QuantizedTensor(torch.Tensor):
         axis = _normalize_axis(self._quantized_axis, self._data.ndim)
 
         if self._dest_dtype in [float8_e4m3, float8_e5m2]:
-            scale_inv = self._scale_inv
-            if (
-                self._granularity == ScalingGranularity.BLOCKWISE
-                and axis == self._data.ndim - 1
-                and not (self._scaling_recipe is not None and self._scaling_recipe.use_2d_block)
-            ):
-                scale_inv = scale_inv.T.contiguous()
             out = dequantize_fp8(
                 self._data,
                 self._orig_dtype,
                 self._granularity,
                 block_size=self._block_size,
                 axis=axis,
-                scale_inv=scale_inv,
+                scale_inv=self._scale_inv,
                 scaling_recipe=self._scaling_recipe,
             )
-            if (
-                self._granularity == ScalingGranularity.BLOCKWISE
-                and self._scaling_recipe is not None
-                and self._scaling_recipe.use_2d_block
-            ):
-                out = out[tuple(slice(0, dim) for dim in self.shape)].contiguous()
         elif self._dest_dtype == float4_e2m1fn_x2:
             out = dequantize_fp4(
                 self._data,

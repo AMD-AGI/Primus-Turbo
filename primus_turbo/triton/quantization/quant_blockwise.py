@@ -95,12 +95,12 @@ def quant_fp8_blockwise_dual_kernel(
     row_mask = (offs_m[:, None] < M) & (offs_n[None, :] < ROW_N)
     tl.store(x_fp8_row_ptrs, x_fp8_row_tile.to(x_fp8_row_ptr.dtype.element_ty), mask=row_mask)
 
-    # Col output is contiguous [N, M]; col scales remain [M_blocks, N].
-    x_fp8_col_ptrs = x_fp8_col_ptr + offs_n[:, None] * M + offs_m[None, :]
-    col_mask = (offs_n[:, None] < N) & (offs_m[None, :] < M)
-    tl.store(x_fp8_col_ptrs, x_fp8_col_tile_t.to(x_fp8_col_ptr.dtype.element_ty), mask=col_mask)
+    # Col output retains standard [M, N]; col scales remain [M_blocks, N].
+    x_fp8_col_tile = tl.trans(x_fp8_col_tile_t)
+    x_fp8_col_ptrs = x_fp8_col_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(x_fp8_col_ptrs, x_fp8_col_tile.to(x_fp8_col_ptr.dtype.element_ty), mask=mask)
 
-    row_scale_offs = pid_n * M + offs_m
+    row_scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
     row_scale_mask = offs_m < M
     x_scales_row_tile_inv = tl.reshape(1.0 / x_scales_row_tile, BLOCK_SIZE)
     tl.store(

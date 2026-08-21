@@ -210,6 +210,7 @@ def compile_blockwise_fp8_dual_quant(M: int, N: int):
     @fx.struct
     class SharedStorage:
         tile: fx.Array[fx.BFloat16, TILE * TILE, 16]
+        col_qscale: fx.Array[fx.Float32, TILE, 16]
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def quant_kernel(
@@ -230,6 +231,7 @@ def compile_blockwise_fp8_dual_quant(M: int, N: int):
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         tile = lds.tile
+        col_qscale_lds = lds.col_qscale.view(fx.make_layout(TILE, 1))
 
         x_rsrc = bo.create_buffer_resource(x, max_size=False, num_records_bytes=M * N * 2)
         q_row_rsrc = bo.create_buffer_resource(q_row, max_size=False, num_records_bytes=M * N)
@@ -317,7 +319,7 @@ def compile_blockwise_fp8_dual_quant(M: int, N: int):
             q_row_rsrc,
             global_row * I32(N) + global_col,
         )
-        row_scale_idx = block_n * I32(M) + global_row
+        row_scale_idx = global_row * I32(N_BLOCKS) + block_n
         if lane == I32(0):
             bo.buffer_store(F32(1.0) / row_qscale, scale_row_rsrc, row_scale_idx)
 
@@ -328,18 +330,35 @@ def compile_blockwise_fp8_dual_quant(M: int, N: int):
         col_max = reduce_8(fm.absf(col_values).reduce("max")).maximumf(F32(1e-4))
         col_qscale = F32(FP8_MAX) / col_max
         global_col = block_n * I32(TILE) + local_col
-        global_row = block_m * I32(TILE) + local_row
-        pack_and_store(
-            col_values * col_qscale,
-            q_col_rsrc,
-            global_col * I32(M) + global_row,
-        )
         if lane == I32(0):
+            fx.memref_store(col_qscale, col_qscale_lds, local_col)
             bo.buffer_store(
                 F32(1.0) / col_qscale,
                 scale_col_rsrc,
                 block_m * I32(N) + global_col,
             )
+        _llvm.inline_asm(
+            res=None,
+            operands_=[],
+            asm_string="s_waitcnt lgkmcnt(0)",
+            constraints="",
+            has_side_effects=True,
+        )
+        rocdl.s_barrier()
+
+        local_row = group
+        local_col = lane * I32(ELEMS_PER_THREAD)
+        row_ptr = fx.add_offset(tile.ptr, fx.make_int_tuple(local_row * I32(TILE) + local_col))
+        row_values = Vec(fx.make_view(row_ptr, fx.make_layout(ELEMS_PER_THREAD, 1)).load()).to(F32)
+        qscale_ptr = fx.add_offset(fx.get_iter(col_qscale_lds), fx.make_int_tuple(local_col))
+        col_qscales = Vec(fx.make_view(qscale_ptr, fx.make_layout(ELEMS_PER_THREAD, 1)).load())
+        global_row = block_m * I32(TILE) + local_row
+        global_col = block_n * I32(TILE) + local_col
+        pack_and_store(
+            row_values * col_qscales,
+            q_col_rsrc,
+            global_row * I32(N) + global_col,
+        )
 
     @flyc.jit
     def launch(
@@ -385,8 +404,8 @@ def quantize_blockwise_fp8_dual(x: torch.Tensor):
     if M % 128 or N % 128 or M * N * x.element_size() > 0xFFFFFFFF:
         raise ValueError("FlyDSL dual quant requires 128-aligned input smaller than 4 GiB")
     q_row = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
-    scale_row = torch.empty((N // 128, M), dtype=torch.float32, device=x.device)
-    q_col = torch.empty((N, M), dtype=torch.float8_e4m3fn, device=x.device)
+    scale_row = torch.empty((M, N // 128), dtype=torch.float32, device=x.device)
+    q_col = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x.device)
     scale_col = torch.empty((M // 128, N), dtype=torch.float32, device=x.device)
     stream = torch.cuda.current_stream(x.device)
     args = (x, q_row, scale_row, q_col, scale_col, stream)

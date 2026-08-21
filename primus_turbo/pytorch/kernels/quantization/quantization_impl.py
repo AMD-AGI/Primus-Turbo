@@ -248,9 +248,9 @@ def _blockwise_dual_output_shapes(
     row_n = ceil_div(N, block_size) * block_size if row_pad_to_block else N
     row_shape = (M, row_n)
     row_blocks = ceil_div(N, block_size)
-    row_scale_shape = (row_blocks, M)
+    row_scale_shape = (M, row_blocks)
     col_scale_shape = (ceil_div(M, block_size), N)
-    col_shape = (N, M)
+    col_shape = (M, N)
     return row_shape, row_scale_shape, col_shape, col_scale_shape
 
 
@@ -268,20 +268,13 @@ def quant_fp8_blockwise_dual_impl(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor in both blockwise row and column modes in one pass.
 
-    The column-quantized FP8 output is stored directly in transposed ``[N, M]``
-    layout (byte-identical to
-    ``x_fp8_col[M,N].transpose(0,1).contiguous()``) so a downstream TN GEMM that
-    needs ``x^T`` (the FlyDSL wgrad path consuming grad_out) can use it without a
-    separate elementwise transpose-copy. The col-scale shape ``[M//128, N]`` is
-    unchanged. The row output and row scale are unaffected.
+    Both quantized tensors are contiguous ``[M, N]``. Row scales use
+    ``[M, ceil(N / block_size)]`` and column scales use
+    ``[ceil(M / block_size), N]``.
 
     When ``row_pad_to_block`` is True, the row-quantized output's trailing
     dimension is extended to a block boundary. The existing final block scale
     covers the zero-filled suffix.
-
-    Row scales are written directly as ``[ceil(N / block_size), M]``. The scale
-    values are unchanged; this layout gives GEMM contiguous row-scale vectors
-    for each K block.
 
     NOTE: This op is registered as ``torch.library.custom_op`` (opaque to
     inductor) instead of ``triton_op`` + ``wrap_triton``. On the AMD MI300
@@ -303,6 +296,9 @@ def quant_fp8_blockwise_dual_impl(
     M, N = x.shape
     if (
         not row_pad_to_block
+        and block_size == 128
+        and M % block_size == 0
+        and N % block_size == 0
         and _use_flydsl_fp8_blockwise_quant()
         and x.dtype == torch.bfloat16
         and x.numel() * x.element_size() <= 0xFFFFFFFF

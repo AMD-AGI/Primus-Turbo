@@ -165,6 +165,17 @@ def _s2r_thunks(s2r, src, holder, n_tiles):
     return thunks
 
 
+def _s2r_tr_thunks(s2r, src, holder, n_tiles):
+    thunks = []
+    for tile in range(n_tiles):
+
+        def load(tile=tile):
+            holder[tile] = s2r._issue_one(src, tile)
+
+        thunks.append(load)
+    return thunks
+
+
 class _BlockScaleMfma(Mfma16x16x128):
     """Fold one K128 MFMA partial immediately into a VGPR-readable accumulator."""
 
@@ -229,95 +240,6 @@ class _BlockScaleMfma(Mfma16x16x128):
         return global_acc
 
 
-def compile_fp8_transpose_32x32(rows: int, cols: int):
-    """Return a launcher computing ``dst[cols, rows] = src[rows, cols].T``.
-
-    Rows and columns must be multiples of 32. Global traffic uses one packed
-    dword per thread. LDS uses a padded 32x36 byte tile to avoid column-read
-    bank aliasing.
-    """
-
-    TILE = 32
-    PACKED = 4
-    LDS_STRIDE = 36
-    THREADS = TILE * TILE // PACKED
-
-    if rows <= 0 or cols <= 0 or rows % TILE != 0 or cols % TILE != 0:
-        raise ValueError(f"rows and cols must be positive multiples of {TILE}, got ({rows}, {cols})")
-
-    @fx.struct
-    class SharedStorage:
-        data: fx.Array[fx.Uint8, TILE * LDS_STRIDE, 16]
-
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
-    def transpose_kernel(src: fx.Tensor, dst: fx.Tensor):
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek().data
-        src_rsrc = _buffer_ops.create_buffer_resource(
-            src,
-            max_size=False,
-            num_records_bytes=rows * cols,
-        )
-        dst_rsrc = _buffer_ops.create_buffer_resource(
-            dst,
-            max_size=False,
-            num_records_bytes=rows * cols,
-        )
-
-        tid = fx.Int32(fx.thread_idx.x)
-        input_row = tid // (TILE // PACKED)
-        input_col = (tid % (TILE // PACKED)) * PACKED
-        global_row = fx.Int32(fx.block_idx.y) * TILE + input_row
-        global_col = fx.Int32(fx.block_idx.x) * TILE + input_col
-        input_byte_offset = global_row * cols + global_col
-        packed_input = _buffer_ops.buffer_load(
-            src_rsrc,
-            input_byte_offset // PACKED,
-            vec_width=1,
-            dtype=_T.i32,
-        )
-
-        lds_byte_offset = input_row * LDS_STRIDE + input_col
-        lds_i32_type = fx.PointerType.get(fx.Int32.ir_type, lds.ptr.memspace, 4)
-        lds_i32 = fx.inttoptr(
-            lds_i32_type,
-            fx.Int32(fx.ptrtoint(lds.ptr)) + lds_byte_offset,
-        )
-        fx.ptr_store(packed_input, lds_i32)
-        fx.gpu.barrier()
-
-        output_row = tid // (TILE // PACKED)
-        output_col = (tid % (TILE // PACKED)) * PACKED
-        output_bytes = []
-        for element in range_constexpr(PACKED):
-            lds_offset = (output_col + element) * LDS_STRIDE + output_row
-            output_bytes.append(fx.ptr_load(lds.ptr + lds_offset))
-        packed_output = fx.Vector.from_elements(output_bytes, fx.Uint8).bitcast(fx.Int32)[0]
-
-        dst_row = fx.Int32(fx.block_idx.x) * TILE + output_row
-        dst_col = fx.Int32(fx.block_idx.y) * TILE + output_col
-        output_byte_offset = dst_row * rows + dst_col
-        _buffer_ops.buffer_store(
-            packed_output,
-            dst_rsrc,
-            output_byte_offset,
-            offset_is_bytes=True,
-        )
-
-    @flyc.jit
-    def launch_transpose(
-        src: fx.Tensor,
-        dst: fx.Tensor,
-        stream: fx.Stream,
-    ):
-        transpose_kernel(src, dst).launch(
-            grid=(cols // TILE, rows // TILE, 1),
-            block=(THREADS, 1, 1),
-            stream=stream,
-        )
-
-    return launch_transpose
-
-
 def compile_blockscale_fp8_gemm_4w(
     *,
     K: int,
@@ -330,12 +252,19 @@ def compile_blockscale_fp8_gemm_4w(
     scale_b_mode: str = "block2d",
     scale_a_k_major: bool = True,
     scale_b_k_major: bool = False,
+    physical_a_tn: bool = False,
+    physical_b_tn: bool = False,
+    output_transposed: bool = False,
 ):
     """Return a fixed-shape gfx950 4-wave block-scaled FP8 GEMM launcher.
 
     The returned launcher has arguments
     ``(A, B, C, A_scale, B_scale, stream)``.  A and B are contiguous
     row-major FP8 tensors with logical shapes ``[M, K]`` and ``[N, K]``.
+    ``physical_a_tn`` and ``physical_b_tn`` instead read standard contiguous
+    ``[K, M]`` and ``[K, N]`` operands through an LDS/S2R fused transpose.
+    ``output_transposed`` stores the same logical result directly as contiguous
+    ``[N, M]``.
     ``scale_b_mode="block2d"`` uses one B scale per 128 output columns;
     ``"col1d"`` uses one B scale per output column for normalized TN/wgrad.
     ``scale_a_k_major`` and ``scale_b_k_major`` select whether each scale
@@ -353,8 +282,13 @@ def compile_blockscale_fp8_gemm_4w(
     n_tiles_a = block_m // 4 // mfma_mn
     n_tiles_b = block_n // 4 // mfma_mn
     n_accums = n_tiles_a * n_tiles_b
-    n_lds_rounds_a = lds_half_m // 32
-    n_lds_rounds_b = lds_half_n // 32
+    # A BM192 half spans 96 output columns. The transpose loader uses a
+    # power-of-two LDS row width, so map it into a padded 128-byte row and read
+    # only the three live 16-column tiles.
+    physical_a_width = 128 if lds_half_m == 96 else lds_half_m
+    physical_b_width = lds_half_n
+    n_lds_rounds_a = block_k // (4 * (64 // (physical_a_width // 16))) if physical_a_tn else lds_half_m // 32
+    n_lds_rounds_b = block_k // (4 * (64 // (physical_b_width // 16))) if physical_b_tn else lds_half_n // 32
     main_wait_count = 2 * n_lds_rounds_a + 2 * n_lds_rounds_b
     tail_wait_count = n_lds_rounds_a + n_lds_rounds_b
     prologue_a_wait_count = 3 * n_lds_rounds_a + 4 * n_lds_rounds_b
@@ -362,6 +296,9 @@ def compile_blockscale_fp8_gemm_4w(
 
     if BLOCK_M not in (128, 192):
         raise ValueError(f"BLOCK_M must be 128 or 192, got {BLOCK_M!r}")
+    output_window_bytes = (block_n * M if output_transposed else block_m * N) * 2
+    if output_window_bytes > 0xFFFFFFFF:
+        raise ValueError(f"output resource window exceeds 4 GiB: {output_window_bytes} bytes")
     if not isinstance(K, int) or K < block_k or K % block_k != 0:
         raise ValueError(f"K must be a positive multiple of {block_k}, got {K!r}")
     if out_dtype not in ("bf16", "fp16"):
@@ -384,8 +321,8 @@ def compile_blockscale_fp8_gemm_4w(
     large_b = N * K > 0xFFFFFFFF
     large_output = M * N * 2 > 0xFFFFFFFF
 
-    a_lds_size = lds_half_m * block_k
-    b_lds_size = lds_half_n * block_k
+    a_lds_size = n_lds_rounds_a * 4 * 1024 if physical_a_tn else lds_half_m * block_k
+    b_lds_size = n_lds_rounds_b * 4 * 1024 if physical_b_tn else lds_half_n * block_k
 
     @fx.struct
     class SharedStorage:
@@ -431,13 +368,19 @@ def compile_blockscale_fp8_gemm_4w(
 
         if const_expr(large_a):
             a0_global_offset = fx.Int32(0)
-            a1_global_offset = fx.Int32(lds_half_m * K)
+            a1_global_offset = fx.Int32(lds_half_m if physical_a_tn else lds_half_m * K)
+        elif const_expr(physical_a_tn):
+            a0_global_offset = tile_i * block_m
+            a1_global_offset = tile_i * block_m + lds_half_m
         else:
             a0_global_offset = (tile_i * block_m) * K
             a1_global_offset = (tile_i * block_m + lds_half_m) * K
         if const_expr(large_b):
             b0_global_offset = fx.Int32(0)
-            b1_global_offset = fx.Int32(lds_half_n * K)
+            b1_global_offset = fx.Int32(lds_half_n if physical_b_tn else lds_half_n * K)
+        elif const_expr(physical_b_tn):
+            b0_global_offset = tile_j * block_n
+            b1_global_offset = tile_j * block_n + lds_half_n
         else:
             b0_global_offset = (tile_j * block_n) * K
             b1_global_offset = (tile_j * block_n + lds_half_n) * K
@@ -446,10 +389,14 @@ def compile_blockscale_fp8_gemm_4w(
         # storage or ordinary contiguous [M,K]/[N,K] tensors.
         if const_expr(large_a):
             a_total_bytes = fx.Index(M) * K
-            a_base_off_bytes = fx.Index(tile_i) * block_m * K
+            if const_expr(physical_a_tn):
+                a_base_off_bytes = fx.Index(tile_i) * block_m
+            else:
+                a_base_off_bytes = fx.Index(tile_i) * block_m * K
+            a_records_full = a_total_bytes - a_base_off_bytes
             a_records_bytes = fx.Index(
                 arith.minsi(
-                    (a_total_bytes - a_base_off_bytes).ir_value(),
+                    a_records_full.ir_value(),
                     fx.Index(0xFFFFFFFF).ir_value(),
                 )
             )
@@ -465,10 +412,14 @@ def compile_blockscale_fp8_gemm_4w(
             gA = fx.make_view(fx.get_iter(gA_base), fx.make_layout(m_extent * K, 1))
         if const_expr(large_b):
             b_total_bytes = fx.Index(N) * K
-            b_base_off_bytes = fx.Index(tile_j) * block_n * K
+            if const_expr(physical_b_tn):
+                b_base_off_bytes = fx.Index(tile_j) * block_n
+            else:
+                b_base_off_bytes = fx.Index(tile_j) * block_n * K
+            b_records_full = b_total_bytes - b_base_off_bytes
             b_records_bytes = fx.Index(
                 arith.minsi(
-                    (b_total_bytes - b_base_off_bytes).ir_value(),
+                    b_records_full.ir_value(),
                     fx.Index(0xFFFFFFFF).ir_value(),
                 )
             )
@@ -485,12 +436,68 @@ def compile_blockscale_fp8_gemm_4w(
         ga_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         gb_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-        gl_off_a = compute_global_swizzle(lane_id, wave_id, K, n_lds_rounds_a)
-        gl_off_b = compute_global_swizzle(lane_id, wave_id, K, n_lds_rounds_b)
-        a_g2s = G2SLoader(ga_div, gl_off_a, n_lds_rounds_a, f8_ir_type, wave_id)
-        b_g2s = G2SLoader(gb_div, gl_off_b, n_lds_rounds_b, f8_ir_type, wave_id)
-        a_s2r = S2RLoader(wave_i, n_tiles_a)
-        b_s2r = S2RLoader(wave_j, n_tiles_b)
+        if const_expr(physical_a_tn):
+            gl_off_a = compute_global_swizzle_nn(
+                lane_id,
+                wave_id,
+                m_extent,
+                n_lds_rounds_a,
+                width=physical_a_width,
+            )
+        else:
+            gl_off_a = compute_global_swizzle(lane_id, wave_id, K, n_lds_rounds_a)
+        if const_expr(physical_b_tn):
+            gl_off_b = compute_global_swizzle_nn(
+                lane_id,
+                wave_id,
+                n_extent,
+                n_lds_rounds_b,
+                width=physical_b_width,
+            )
+        else:
+            gl_off_b = compute_global_swizzle(lane_id, wave_id, K, n_lds_rounds_b)
+        a_rebase = (A, f8_ir_type, a_base_off_bytes, a_records_full) if large_a and physical_a_tn else None
+        b_rebase = (B, f8_ir_type, b_base_off_bytes, b_records_full) if large_b and physical_b_tn else None
+        a_g2s = G2SLoader(
+            ga_div,
+            gl_off_a,
+            n_lds_rounds_a,
+            f8_ir_type,
+            wave_id,
+            rebase=a_rebase,
+        )
+        b_g2s = G2SLoader(
+            gb_div,
+            gl_off_b,
+            n_lds_rounds_b,
+            f8_ir_type,
+            wave_id,
+            rebase=b_rebase,
+        )
+        if const_expr(physical_a_tn):
+            a_s2r = S2RLoaderTr(
+                wave_i,
+                n_tiles_a,
+                n_tiles_a * mfma_mn,
+                inline_asm=True,
+                vmcnt_hint=-1,
+                n_waves=4,
+                width=physical_a_width,
+            )
+        else:
+            a_s2r = S2RLoader(wave_i, n_tiles_a)
+        if const_expr(physical_b_tn):
+            b_s2r = S2RLoaderTr(
+                wave_j,
+                n_tiles_b,
+                n_tiles_b * mfma_mn,
+                inline_asm=True,
+                vmcnt_hint=-1,
+                n_waves=4,
+                width=physical_b_width,
+            )
+        else:
+            b_s2r = S2RLoader(wave_j, n_tiles_b)
         mfma = _BlockScaleMfma(
             n_tiles_a,
             n_tiles_b,
@@ -514,7 +521,10 @@ def compile_blockscale_fp8_gemm_4w(
         )
         if const_expr(large_output):
             c_total_bytes = fx.Index(M) * fx.Index(N) * 2
-            c_base_off_bytes = fx.Index(tile_i) * block_m * fx.Index(N) * 2
+            if const_expr(output_transposed):
+                c_base_off_bytes = fx.Index(tile_j) * block_n * fx.Index(M) * 2
+            else:
+                c_base_off_bytes = fx.Index(tile_i) * block_m * fx.Index(N) * 2
             c_records_bytes = fx.Index(
                 arith.minsi(
                     (c_total_bytes - c_base_off_bytes).ir_value(),
@@ -665,7 +675,12 @@ def compile_blockscale_fp8_gemm_4w(
                         vec_f32 = fx.Vector(c_frag[mfma.idx(ti, tj)])
                         for elem in range_constexpr(4):
                             out_row = row + elem
-                            if const_expr(large_output):
+                            if const_expr(output_transposed and large_output):
+                                col_local = col - fx.Int32(tile_j * block_n)
+                                c_idx = col_local * m_extent + out_row
+                            elif const_expr(output_transposed):
+                                c_idx = col * m_extent + out_row
+                            elif const_expr(large_output):
                                 row_local = out_row - fx.Int32(tile_i * block_m)
                                 c_idx = row_local * n_extent + col
                             else:
@@ -681,7 +696,21 @@ def compile_blockscale_fp8_gemm_4w(
                         for elem in range_constexpr(4):
                             out_row = row + elem
                             valid = (out_row < m_extent) & col_valid
-                            if const_expr(large_output):
+                            if const_expr(output_transposed and large_output):
+                                col_local = col - fx.Int32(tile_j * block_n)
+                                c_idx = col_local * m_extent + out_row
+                                _buffer_ops.buffer_store(
+                                    vec_f32[elem].to(out_type),
+                                    c_rsrc,
+                                    c_idx,
+                                    mask=valid,
+                                )
+                            elif const_expr(output_transposed):
+                                c_idx = col * m_extent + out_row
+                                oob = m_extent * n_extent
+                                safe_idx = arith.select(valid, c_idx, oob)
+                                _buffer_ops.buffer_store(vec_f32[elem].to(out_type), c_rsrc, safe_idx)
+                            elif const_expr(large_output):
                                 row_local = out_row - fx.Int32(tile_i * block_m)
                                 c_idx = row_local * n_extent + col
                                 _buffer_ops.buffer_store(
@@ -714,10 +743,15 @@ def compile_blockscale_fp8_gemm_4w(
             b_frag,
             c_frag,
             combined_scales,
+            s2r_transposed,
         ):
-            next_halves = [[None, None] for _ in range(s2r_tiles)]
             g2s_thunks = _g2s_thunks(g2s, lds_dst, global_offset, g2s_steps)
-            s2r_thunks = _s2r_thunks(s2r, lds_src, next_halves, s2r_tiles)
+            if const_expr(s2r_transposed):
+                next_calls = [None for _ in range(s2r_tiles)]
+                s2r_thunks = _s2r_tr_thunks(s2r, lds_src, next_calls, s2r_tiles)
+            else:
+                next_halves = [[None, None] for _ in range(s2r_tiles)]
+                s2r_thunks = _s2r_thunks(s2r, lds_src, next_halves, s2r_tiles)
             c_frag = mfma.fold(
                 a_frag,
                 b_frag,
@@ -725,7 +759,11 @@ def compile_blockscale_fp8_gemm_4w(
                 combined_scales,
                 interleave=g2s_thunks + s2r_thunks,
             )
-            next_frag = [pack_i32x4_i32x8(halves[0], halves[1]) for halves in next_halves]
+            if const_expr(s2r_transposed):
+                S2RLoaderTr._wait_lgkmcnt(0)
+                next_frag = [S2RLoaderTr._assemble(calls) for calls in next_calls]
+            else:
+                next_frag = [pack_i32x4_i32x8(halves[0], halves[1]) for halves in next_halves]
             return c_frag, next_frag
 
         def _one_step(k_block, a0_frag, b0_frag, accs, bufs):
@@ -734,10 +772,22 @@ def compile_blockscale_fp8_gemm_4w(
 
             k_i32 = fx.Int32(k_block)
             next_k = (k_i32 + fx.Int32(2)) * fx.Int32(block_k)
-            a0_offset = fx.Int32(a0_global_offset) + next_k
-            a1_offset = fx.Int32(a1_global_offset) + next_k
-            b0_offset = fx.Int32(b0_global_offset) + next_k
-            b1_offset = fx.Int32(b1_global_offset) + next_k
+            if const_expr(large_a and physical_a_tn):
+                a_next_k = arith.index_cast(_T.index, next_k) * fx.Index(M)
+                a0_offset = arith.index_cast(_T.index, a0_global_offset) + a_next_k
+                a1_offset = arith.index_cast(_T.index, a1_global_offset) + a_next_k
+            else:
+                a_next_k = next_k * fx.Int32(M if physical_a_tn else 1)
+                a0_offset = fx.Int32(a0_global_offset) + a_next_k
+                a1_offset = fx.Int32(a1_global_offset) + a_next_k
+            if const_expr(large_b and physical_b_tn):
+                b_next_k = arith.index_cast(_T.index, next_k) * fx.Index(N)
+                b0_offset = arith.index_cast(_T.index, b0_global_offset) + b_next_k
+                b1_offset = arith.index_cast(_T.index, b1_global_offset) + b_next_k
+            else:
+                b_next_k = next_k * fx.Int32(N if physical_b_tn else 1)
+                b0_offset = fx.Int32(b0_global_offset) + b_next_k
+                b1_offset = fx.Int32(b1_global_offset) + b_next_k
 
             wait_barrier(main_wait_count)
             scale_r00, scale_r01, scale_r10, scale_r11 = _load_combined_scales(k_i32)
@@ -754,6 +804,7 @@ def compile_blockscale_fp8_gemm_4w(
                 b0_frag,
                 c00,
                 scale_r00,
+                physical_b_tn,
             )
             c01, a1_frag = _compute_stage(
                 bc0,
@@ -767,6 +818,7 @@ def compile_blockscale_fp8_gemm_4w(
                 b1_frag,
                 c01,
                 scale_r01,
+                physical_a_tn,
             )
 
             wait_barrier(main_wait_count)
@@ -783,6 +835,7 @@ def compile_blockscale_fp8_gemm_4w(
                 b0_frag,
                 c10,
                 scale_r10,
+                physical_a_tn,
             )
             c11, b0_next_frag = _compute_stage(
                 ac1,
@@ -796,6 +849,7 @@ def compile_blockscale_fp8_gemm_4w(
                 b1_frag,
                 c11,
                 scale_r11,
+                physical_b_tn,
             )
 
             next_bufs = an0, an1, ac0, ac1, bn0, bn1, bc0, bc1
@@ -843,10 +897,22 @@ def compile_blockscale_fp8_gemm_4w(
 
         if const_expr(k_iters > 1):
             # Next K128 tile.  These four buffers become current after a swap.
-            a_g2s.load(a_next0, a0_global_offset + block_k)
-            b_g2s.load(b_next0, b0_global_offset + block_k)
-            b_g2s.load(b_next1, b1_global_offset + block_k)
-            a_g2s.load(a_next1, a1_global_offset + block_k)
+            if const_expr(large_a and physical_a_tn):
+                a_next_offset0 = arith.index_cast(_T.index, a0_global_offset) + fx.Index(block_k) * M
+                a_next_offset1 = arith.index_cast(_T.index, a1_global_offset) + fx.Index(block_k) * M
+            else:
+                a_next_offset0 = a0_global_offset + block_k * (M if physical_a_tn else 1)
+                a_next_offset1 = a1_global_offset + block_k * (M if physical_a_tn else 1)
+            if const_expr(large_b and physical_b_tn):
+                b_next_offset0 = arith.index_cast(_T.index, b0_global_offset) + fx.Index(block_k) * N
+                b_next_offset1 = arith.index_cast(_T.index, b1_global_offset) + fx.Index(block_k) * N
+            else:
+                b_next_offset0 = b0_global_offset + block_k * (N if physical_b_tn else 1)
+                b_next_offset1 = b1_global_offset + block_k * (N if physical_b_tn else 1)
+            a_g2s.load(a_next0, a_next_offset0)
+            b_g2s.load(b_next0, b_next_offset0)
+            b_g2s.load(b_next1, b_next_offset1)
+            a_g2s.load(a_next1, a_next_offset1)
 
         if const_expr(k_iters > 1):
             wait_barrier(prologue_a_wait_count)
@@ -997,80 +1063,47 @@ def compile_blockscale_fp8_gemm_tn_4w(**kwargs):
 
 
 def compile_blockscale_fp8_gemm_nn_physical_4w(*, M: int, N: int, K: int, **kwargs):
-    """Compile physical NN ``A[M,K] @ B[K,N]`` plus B transpose.
+    """Compile physical NN ``A[M,K] @ B[K,N]`` with fused local transpose.
 
-    The returned launcher takes
-    ``(A, B, C, A_scale, B_scale, B_workspace, stream)``. ``B_workspace`` is
-    contiguous FP8 storage of shape ``[N, K]``. Physical scales are consumed
-    directly as ``A_scale[K/128, M]`` and ``B_scale[K/128, ceil(N/128)]``.
+    The standard contiguous B tensor is loaded into LDS in K-major order and
+    converted to the MFMA register layout by ``S2RLoaderTr``. No full-tensor
+    transpose workspace is allocated.
     """
 
     if "BLOCK_M" not in kwargs:
         kwargs["BLOCK_M"] = 192 if M % 192 == 0 else 128
-    transpose_b = compile_fp8_transpose_32x32(K, N)
-    gemm = compile_blockscale_fp8_gemm_nn_4w(
+    return compile_blockscale_fp8_gemm_4w(
         K=K,
         M=M,
         N=N,
+        scale_b_mode="block2d",
         scale_a_k_major=True,
         scale_b_k_major=True,
+        physical_b_tn=True,
         **kwargs,
     )
-
-    @flyc.jit
-    def launch(
-        A: fx.Tensor,
-        B: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-        B_workspace: fx.Tensor,
-        stream: fx.Stream,
-    ):
-        transpose_b(B, B_workspace, stream)
-        gemm(A, B_workspace, C, A_scale, B_scale, stream)
-
-    return launch
 
 
 def compile_blockscale_fp8_gemm_tn_physical_4w(*, M: int, N: int, K: int, **kwargs):
-    """Compile physical TN ``A[K,M].T @ B[K,N]`` plus both transposes.
+    """Compile physical TN ``A[K,M].T @ B[K,N]`` with fused local transposes.
 
-    The returned launcher takes
-    ``(A, B, C, A_scale, B_scale, A_workspace, B_workspace, stream)``.
-    Workspaces are contiguous FP8 tensors with shapes ``[M,K]`` and ``[N,K]``.
-    Scales remain in their physical ``[K/128,M]`` and ``[K/128,N]`` layouts.
+    Both standard contiguous operands are converted in LDS/S2R. Scales remain
+    in their physical ``[K/128,M]`` and ``[K/128,N]`` layouts.
     """
 
     if "BLOCK_M" not in kwargs:
         kwargs["BLOCK_M"] = 192 if M % 192 == 0 else 128
-    transpose_a = compile_fp8_transpose_32x32(K, M)
-    transpose_b = compile_fp8_transpose_32x32(K, N)
-    gemm = compile_blockscale_fp8_gemm_tn_4w(
+    return compile_blockscale_fp8_gemm_4w(
         K=K,
         M=M,
         N=N,
+        scale_b_mode="col1d",
         scale_a_k_major=True,
         scale_b_k_major=True,
+        physical_a_tn=True,
+        physical_b_tn=True,
         **kwargs,
     )
-
-    @flyc.jit
-    def launch(
-        A: fx.Tensor,
-        B: fx.Tensor,
-        C: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-        A_workspace: fx.Tensor,
-        B_workspace: fx.Tensor,
-        stream: fx.Stream,
-    ):
-        transpose_a(A, A_workspace, stream)
-        transpose_b(B, B_workspace, stream)
-        gemm(A_workspace, B_workspace, C, A_scale, B_scale, stream)
-
-    return launch
 
 
 def compile_blockscale_fp8_gemm_8w_3stage(
@@ -1108,6 +1141,9 @@ def compile_blockscale_fp8_gemm_8w_3stage(
         raise ValueError(f"M must be a positive integer, got {M!r}")
     if not isinstance(N, int) or N <= 0:
         raise ValueError(f"N must be a positive integer, got {N!r}")
+    output_window_bytes = block_m * N * 2
+    if output_window_bytes > 0xFFFFFFFF:
+        raise ValueError(f"output resource window exceeds 4 GiB: {output_window_bytes} bytes")
     if out_dtype not in ("bf16", "fp16"):
         raise ValueError(f"out_dtype must be 'bf16' or 'fp16', got {out_dtype!r}")
     if not isinstance(fold_group_size, int) or not 1 <= fold_group_size <= n_accums:
@@ -1609,6 +1645,10 @@ _MAX_BUFFER_BYTES = 0xFFFFFFFF
 _DEEP_K_BLOCKS = 256
 
 
+def _output_window_supported(rows_per_resource: int, row_length: int) -> bool:
+    return 0 < rows_per_resource * row_length * 2 <= _MAX_BUFFER_BYTES
+
+
 def _shape_supported(M: int, N: int, K: int) -> bool:
     return (
         str(get_rocm_arch()).startswith("gfx95")
@@ -1621,14 +1661,19 @@ def _shape_supported(M: int, N: int, K: int) -> bool:
     )
 
 
-def _buffers_fit(*byte_counts: int) -> bool:
-    return all(0 < count <= _MAX_BUFFER_BYTES for count in byte_counts)
-
-
 def flydsl_blockwise_4wave_dgrad_supported(M: int, N: int, K: int) -> bool:
     """Check ``grad[M,N] @ weight[N,K] -> dA[M,K]`` support."""
 
-    return _shape_supported(M, K, N) and _buffers_fit(N * K)
+    return (
+        str(get_rocm_arch()).startswith("gfx95")
+        and M >= 128
+        and N >= 128
+        and K >= 16
+        and M % 128 == 0
+        and N % 128 == 0
+        and K % 16 == 0
+        and _output_window_supported(128, K)
+    )
 
 
 def _forward_wgrad_shape_supported(M: int, N: int, K: int) -> bool:
@@ -1646,19 +1691,17 @@ def _forward_wgrad_shape_supported(M: int, N: int, K: int) -> bool:
 def flydsl_blockwise_4wave_forward_supported(M: int, N: int, K: int) -> bool:
     """Check ``activation[M,K] @ weight[N,K].T`` support."""
 
-    return _forward_wgrad_shape_supported(M, N, K)
+    return _forward_wgrad_shape_supported(M, N, K) and _output_window_supported(128, N)
 
 
 def flydsl_blockwise_4wave_wgrad_supported(
     M: int,
     N: int,
     K: int,
-    *,
-    require_workspace: bool = True,
 ) -> bool:
     """Check ``grad[M,N].T @ activation[M,K] -> dW[N,K]`` support."""
 
-    return _forward_wgrad_shape_supported(M, N, K) and (not require_workspace or _buffers_fit(M * N, M * K))
+    return _forward_wgrad_shape_supported(M, N, K)
 
 
 def flydsl_blockwise_gemm_can_handle(
@@ -1685,17 +1728,16 @@ def flydsl_blockwise_gemm_can_handle(
         return False
 
     if trans_a and not trans_b:
-        normalized = a.T.is_contiguous() and b.T.is_contiguous()
-        physical = a.is_contiguous() and b.is_contiguous()
         return (
-            (normalized or physical)
+            a.is_contiguous()
+            and b.is_contiguous()
             and tuple(a_scale_inv.shape) == (ceildiv(k, 128), m)
             and tuple(b_scale_inv.shape) == (ceildiv(k, 128), n)
+            and (_output_window_supported(128, m) if trans_c else _output_window_supported(128, n))
             and flydsl_blockwise_4wave_wgrad_supported(
                 k,
                 n,
                 m,
-                require_workspace=not normalized,
             )
         )
 
@@ -1704,18 +1746,17 @@ def flydsl_blockwise_gemm_can_handle(
         return (
             a.is_contiguous()
             and b.is_contiguous()
-            and tuple(a_scale_inv.shape) == (ceildiv(k, 128), m)
+            and tuple(a_scale_inv.shape) == (m, ceildiv(k, 128))
             and tuple(b_scale_inv.shape) == (ceildiv(k, 128), ceildiv(n, 128))
             and flydsl_blockwise_4wave_dgrad_supported(m, padded_k, n)
         )
 
     if not trans_a and trans_b and not trans_c:
         k_blocks = ceildiv(k, 128)
-        activation_scale_shape = tuple(a_scale_inv.shape)
         return (
             a.is_contiguous()
             and b.is_contiguous()
-            and activation_scale_shape in ((m, k_blocks), (k_blocks, m))
+            and tuple(a_scale_inv.shape) == (m, k_blocks)
             and tuple(b_scale_inv.shape) == (ceildiv(n, 128), k_blocks)
             and flydsl_blockwise_4wave_forward_supported(m, n, k)
         )
@@ -1806,6 +1847,11 @@ def _wgrad_autotune_configs(output_rows: int) -> list[dict]:
             "block_m": 128,
             "fold_group_size": 6,
             "k_loop_unroll": 2,
+        },
+        {
+            "block_m": 128,
+            "fold_group_size": 6,
+            "k_loop_unroll": 4,
         },
     ]
     if output_rows >= 192:
@@ -1992,8 +2038,16 @@ def gemm_fp8_blockwise_forward(
         stream,
     )
     out_dtype_name = _out_dtype_name(out_dtype)
+    configs = [
+        config
+        for config in _autotune_configs(M, N, K)
+        if _output_window_supported(
+            256 if config["family"] == "8wave" else config["block_m"],
+            N,
+        )
+    ]
     candidates = []
-    for config in _autotune_configs(M, N, K):
+    for config in configs:
         if config["family"] == "8wave":
             build = lambda config=config: compile_blockscale_fp8_gemm_8w_3stage(
                 K=K,
@@ -2041,22 +2095,29 @@ def gemm_fp8_blockwise_dgrad(
         raise ValueError("dgrad inputs must be contiguous")
     if tuple(grad_out_scale_inv.shape) != (N // 128, M):
         raise ValueError(f"invalid dgrad A-scale shape {grad_out_scale_inv.shape}")
-    if tuple(weight_scale_inv.shape) != (N // 128, K // 128):
+    if tuple(weight_scale_inv.shape) != (N // 128, ceildiv(K, 128)):
         raise ValueError(f"invalid dgrad B-scale shape {weight_scale_inv.shape}")
 
     out = torch.empty((M, K), dtype=out_dtype, device=grad_out_fp8.device)
     stream = torch.cuda.current_stream(grad_out_fp8.device)
     out_dtype_name = _out_dtype_name(out_dtype)
     configs = _autotune_configs(M, K, N)
+    configs = [
+        config
+        for config in configs
+        if _output_window_supported(
+            256 if config["family"] == "8wave" else config["block_m"],
+            K,
+        )
+        and not (config["family"] == "8wave" and weight_fp8.numel() > _MAX_BUFFER_BYTES)
+    ]
     key = ("dgrad", str(get_rocm_arch()), M, K, N, out_dtype_name)
     selected_key = _autotune_cache.get(key)
     if selected_key not in {_config_key(config) for config in configs}:
         _autotune_cache.pop(key, None)
         selected_key = None
     selected = dict(selected_key or ())
-    need_4wave = not selected or selected.get("family") == "4wave"
     need_8wave = not selected or selected.get("family") == "8wave"
-    weight_t = torch.empty((K, N), dtype=weight_fp8.dtype, device=weight_fp8.device) if need_4wave else None
     weight_scale_k_major = (
         weight_scale_inv.T.contiguous()
         if need_8wave and any(config["family"] == "8wave" for config in configs)
@@ -2089,7 +2150,6 @@ def gemm_fp8_blockwise_dgrad(
                 out,
                 grad_out_scale_inv,
                 weight_scale_inv,
-                weight_t.view(torch.int8) if weight_t is not None else None,
                 stream,
             )
             build = lambda config=config: compile_blockscale_fp8_gemm_nn_physical_4w(
@@ -2113,17 +2173,16 @@ def gemm_fp8_blockwise_wgrad(
     activation_scale_inv: torch.Tensor,
     grad_out_scale_inv: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    output_transposed: bool = False,
 ) -> torch.Tensor:
-    """Run TN wgrad using the available operand storage layout."""
+    """Run TN wgrad directly from standard contiguous operand storage."""
 
-    normalized = activation_fp8.T.is_contiguous() and grad_out_fp8.T.is_contiguous()
     M, K = activation_fp8.shape
     M_grad, N = grad_out_fp8.shape
     if M != M_grad or not flydsl_blockwise_4wave_wgrad_supported(
         M,
         N,
         K,
-        require_workspace=not normalized,
     ):
         raise ValueError(
             f"unsupported wgrad shape: activation={activation_fp8.shape}, grad={grad_out_fp8.shape}"
@@ -2132,67 +2191,51 @@ def gemm_fp8_blockwise_wgrad(
         raise ValueError(f"invalid wgrad activation-scale shape {activation_scale_inv.shape}")
     if tuple(grad_out_scale_inv.shape) != (M // 128, N):
         raise ValueError(f"invalid wgrad gradient-scale shape {grad_out_scale_inv.shape}")
+    if not activation_fp8.is_contiguous() or not grad_out_fp8.is_contiguous():
+        raise ValueError("wgrad inputs must be contiguous")
+    output_window_supported = (
+        _output_window_supported(128, N) if output_transposed else _output_window_supported(128, K)
+    )
+    if not output_window_supported:
+        raise ValueError("wgrad output leading dimension exceeds the buffer resource window")
 
-    out = torch.empty((N, K), dtype=out_dtype, device=activation_fp8.device)
+    out_shape = (K, N) if output_transposed else (N, K)
+    out = torch.empty(out_shape, dtype=out_dtype, device=activation_fp8.device)
     stream = torch.cuda.current_stream(activation_fp8.device)
     out_dtype_name = _out_dtype_name(out_dtype)
-    if normalized:
-        activation_t = activation_fp8.T
-        grad_t = grad_out_fp8.T
-        if not activation_t.is_contiguous() or not grad_t.is_contiguous():
-            raise ValueError("normalized wgrad requires transpose views over contiguous storage")
-        args = (
-            grad_t.view(torch.int8),
-            activation_t.view(torch.int8),
-            out,
-            grad_out_scale_inv,
-            activation_scale_inv,
-            stream,
-        )
-    else:
-        if not activation_fp8.is_contiguous() or not grad_out_fp8.is_contiguous():
-            raise ValueError("physical wgrad inputs must be contiguous")
-        grad_t = torch.empty((N, M), dtype=grad_out_fp8.dtype, device=grad_out_fp8.device)
-        activation_t = torch.empty((K, M), dtype=activation_fp8.dtype, device=activation_fp8.device)
-        args = (
-            grad_out_fp8.view(torch.int8),
-            activation_fp8.view(torch.int8),
-            out,
-            grad_out_scale_inv,
-            activation_scale_inv,
-            grad_t.view(torch.int8),
-            activation_t.view(torch.int8),
-            stream,
-        )
+    args = (
+        grad_out_fp8.view(torch.int8),
+        activation_fp8.view(torch.int8),
+        out,
+        grad_out_scale_inv,
+        activation_scale_inv,
+        stream,
+    )
 
     candidates = []
-    for config in _wgrad_autotune_configs(N):
-        if normalized:
-            build = lambda config=config: compile_blockscale_fp8_gemm_tn_4w(
-                K=M,
-                M=N,
-                N=K,
-                BLOCK_M=config["block_m"],
-                out_dtype=out_dtype_name,
-                scale_a_k_major=True,
-                scale_b_k_major=True,
-                fold_group_size=config["fold_group_size"],
-                k_loop_unroll=config["k_loop_unroll"],
-            )
-        else:
-            build = lambda config=config: compile_blockscale_fp8_gemm_tn_physical_4w(
-                M=N,
-                N=K,
-                K=M,
-                BLOCK_M=config["block_m"],
-                out_dtype=out_dtype_name,
-                fold_group_size=config["fold_group_size"],
-                k_loop_unroll=config["k_loop_unroll"],
-            )
+    configs = [
+        config
+        for config in _wgrad_autotune_configs(N)
+        if (
+            _output_window_supported(128, N)
+            if output_transposed
+            else _output_window_supported(config["block_m"], K)
+        )
+    ]
+    for config in configs:
+        build = lambda config=config: compile_blockscale_fp8_gemm_tn_physical_4w(
+            M=N,
+            N=K,
+            K=M,
+            BLOCK_M=config["block_m"],
+            out_dtype=out_dtype_name,
+            output_transposed=output_transposed,
+            fold_group_size=config["fold_group_size"],
+            k_loop_unroll=config["k_loop_unroll"],
+        )
         candidates.append((config, build, args))
 
-    direction = "wgrad_normalized" if normalized else "wgrad"
-    key = (direction, str(get_rocm_arch()), N, K, M, out_dtype_name)
+    key = ("wgrad", str(get_rocm_arch()), N, K, M, out_dtype_name, output_transposed)
     _autotune_and_run(key, candidates, out)
     return out
 
@@ -2215,8 +2258,14 @@ def gemm_fp8_blockwise_flydsl_kernel(
     """
 
     if trans_a and not trans_b:
-        out = gemm_fp8_blockwise_wgrad(a, b, a_scale_inv, b_scale_inv, out_dtype=out_dtype)
-        return out if trans_c else out.t().contiguous()
+        return gemm_fp8_blockwise_wgrad(
+            a,
+            b,
+            a_scale_inv,
+            b_scale_inv,
+            out_dtype=out_dtype,
+            output_transposed=not trans_c,
+        )
 
     if not trans_a and trans_c:
         layout = "NT" if trans_b else "NN"
@@ -2257,7 +2306,6 @@ __all__ = [
     "compile_blockscale_fp8_gemm_nn_physical_4w",
     "compile_blockscale_fp8_gemm_tn_4w",
     "compile_blockscale_fp8_gemm_tn_physical_4w",
-    "compile_fp8_transpose_32x32",
     "flydsl_blockwise_gemm_can_handle",
     "gemm_fp8_blockwise_flydsl_kernel",
 ]
