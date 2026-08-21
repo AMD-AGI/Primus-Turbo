@@ -1209,12 +1209,21 @@ def build_flash_attn_bwd_dkdv_module(
     wsq_pad=0,  # padding bytes between dQ partial band groups (see _WSQ_BAND_PAD)
     wsq_ilv=1,  # adjacent bands sharing one partial row (see _WSQ_BAND_ILV)
     wsq_ring=0,  # >0: band groups reuse this many workspace slots (see _wsq_ring_for)
+    # wsq_nrec: PROBE (dQ wrong, deterministic), the write end of the split-K round trip.
+    # Divides the partial slot's num_records by N so the hardware drops every store past
+    # seq_len_q/N while the instructions, address chains and registers stay byte-identical --
+    # the only arm that prices the store stream's VOLUME. Aliasing the bands onto one slab
+    # (wsq_ring) shrinks the FOOTPRINT instead and so prices cache residency, not volume.
+    wsq_nrec=None,
     # band_span: >0 = this launch owns ONE GROUP of that many kv bands (see _band_span_for).
     # K/V/DK/DV still span the whole kv axis; the group's first kv row arrives as a device
     # scalar in the CuSeqKv slot, and seq_len_k is the group's own extent, so the grid, the
     # band decode and the workspace all size themselves to the group.
     band_span=0,
     k_reg=True,  # feed GEMM1a's B from the K register packs, not the LDS tile (see K_REG)
+    # s_ovl: overlay the dS ring on the band's K tile, whose elements are dead after the
+    # prologue's one transpose read (see S_OVL). Frees the ring's whole allocation.
+    s_ovl=False,
     # g3_kreg: hold GEMM3's whole K^T fragment set live for the band instead of reading it
     # back per head-step. K^T is head-invariant, so this is pure read removal. See G3_KREG.
     g3_kreg=False,
@@ -1347,6 +1356,7 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_PAD = int(wsq_pad)
     WSQ_ILV = int(wsq_ilv)
     WSQ_RING = int(wsq_ring)
+    WSQ_NREC = max(1, int(wsq_nrec or 1))
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
     # body has to still hold, so it rides the plain full-causal path only -- square SBHD, or
     # ragged (whose bands are per segment).
@@ -1666,6 +1676,10 @@ def build_flash_attn_bwd_dkdv_module(
     # view so every reader (_a_idx / _read_tr / _kv_lds_idx / _g3s_idx) addresses them the
     # same way.
     LDS_VIEW_ELEMS = LDS_TOTAL * LDS_SLOTS
+    # Staging GEMM1b's V B-operand through LDS instead of holding its register packs live for
+    # the band was measured against the LDS that S_OVL frees: it does NOT free the architected
+    # registers it is supposed to (the ISA reads 487 dwords against 462, +25) because LLVM
+    # keeps the packs live to feed the ds_write anyway, and it costs +9.5% of wall at D128.
     V_LDS = False
     # K_REG: GEMM3 transpose-reads the staged K tile, but GEMM1a's B operand can come
     # from the register packs that filled it instead of being re-read from LDS once per
@@ -1680,13 +1694,13 @@ def build_flash_attn_bwd_dkdv_module(
     G3_KRT = G3_DT if G3_KREG else 0
     G3K_BASE = LDS_VIEW_ELEMS  # prescaled K [BLOCK_KV][HEAD_DIM]
     G3V_BASE = G3K_BASE + BLOCK_KV * HEAD_DIM  # V [BLOCK_KV][HEAD_DIM]
-    # dS [slot][BLOCK_KV][BLOCK_Q]. Staging it over the K tile's elements (which K_REG and
-    # G3_KREG leave read-once, so the overlay is legal after one release rendezvous) halves
-    # the body's LDS, 86016 -> 53248 B at D64, and buys NO occupancy: the ISA allocates 461
-    # unified VGPRs (.amdhsa_next_free_vgpr 461 = 256 arch saturated + 205 accum, no spill),
-    # so one wave per SIMD is what the register file says whatever the LDS says. The 81920 B
-    # two-work-group line is out of reach through LDS at any dS packing; reaching it needs a
-    # body that fits 256 registers, which is 205 accumulator dwords away.
+    # dS [slot][BLOCK_KV][BLOCK_Q]. Staging it over the K tile's read-once elements (S_OVL
+    # below) buys NO occupancy on its own: the ISA allocates 462 unified VGPRs (256 arch
+    # saturated + 206 accum, no spill), so one wave per SIMD is what the register file says
+    # whatever the LDS says. The 81920 B two-work-group line is out of reach through LDS at
+    # any dS packing; reaching it needs a body that fits 256 registers, which is 206
+    # accumulator dwords away. The overlay is a donor for a candidate that needs LDS, not a
+    # candidate on its own.
     G3S_BASE = G3V_BASE + (BLOCK_KV * HEAD_DIM if V_LDS else 0)
     G3S_SLOT_ELEMS = BKV_H * BLOCK_Q
     G3S_GRP_ELEMS = KV_HALVES * G3S_SLOT_ELEMS
@@ -1724,7 +1738,21 @@ def build_flash_attn_bwd_dkdv_module(
     # begins. Keeping the barrier anyway is then pure rendezvous cost plus a scheduling
     # wall between GEMM3's MFMAs and the ds_write pair that refills the slot.
     HS_WAR_BAR = G3_DEFER and not QDO_TAIL and not QDO_PP
-    LDS_VIEW_ELEMS = G3S_BASE + G3S_SLOTS * G3S_GRP_ELEMS
+    # S_OVL: the band's prescaled K tile is read EXACTLY once. K_REG feeds GEMM1a's B from the
+    # register packs that filled the tile, and G3_KREG holds every D-tile a wave reads live for
+    # the whole band, so after the prologue's transpose read no head-step touches those
+    # elements again. Laying the dS ring over them costs one release rendezvous per band --
+    # amortised over the band's whole q walk -- and frees the ring's entire allocation:
+    # 102400 -> 69632 B at D128, the only LDS donor this body has that is not a scheduling
+    # knob (the g3d / g3_dbat ring depths hold no LDS at any depth). It buys nothing by
+    # itself -- the wall reads +0.4% and one wave per SIMD is what the 462-dword register
+    # allocation says whatever the LDS says -- so it is off until a candidate needs the
+    # 32768 B, and the price it is measured at is that one rendezvous.
+    S_OVL = bool(s_ovl) and K_REG and G3_KREG and G3_KRT >= G3_DT and not V_LDS
+    if S_OVL:
+        G3S_BASE = G3K_BASE
+    _KV_LDS_END = G3V_BASE + (BLOCK_KV * HEAD_DIM if V_LDS else 0)
+    LDS_VIEW_ELEMS = max(G3S_BASE + G3S_SLOTS * G3S_GRP_ELEMS, _KV_LDS_END)
 
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="flash_attn_bwd_smem_dkdv")
     lds_off = allocator._align(allocator.ptr, 16)
@@ -2141,7 +2169,7 @@ def build_flash_attn_bwd_dkdv_module(
         wsq_rsrc = buffer_ops.create_buffer_resource(
             WSQ,
             max_size=False,
-            num_records_bytes=_raw(_wsq_slice),
+            num_records_bytes=_raw(_wsq_slice // fx.Index(WSQ_NREC) if WSQ_NREC > 1 else _wsq_slice),
             base_byte_offset=_raw(_wsq_grp * _wsq_band + _wsq_off),
         )
         _lse_per_batch = seq_len_q_v * fx.Index(NUM_HEADS_Q)
@@ -2808,6 +2836,11 @@ def build_flash_attn_bwd_dkdv_module(
                 [_g3_tr(_g3kb, i, kk, G3_KROW_STRIDE) for i in range_constexpr(G3_KRT)]
                 for kk in range_constexpr(G3_KSTEPS)
             ]
+            if const_expr(S_OVL):
+                # The dS ring lies over these elements, so every wave's read of the tile has
+                # to retire before the first head-step publishes dS into them.
+                rocdl.s_waitcnt(WAIT_LGKM)
+                gpu.barrier()
 
         H_ACCS = KV_HALVES * DT * NT
         dv_accs = [c_zero_v4f32 for _ in range_constexpr(H_ACCS)]
