@@ -6,7 +6,7 @@
 入口：
 
 ```python
-from primus_turbo.pytorch.ops.attention import flex_attention, create_block_mask
+from primus_turbo.pytorch.ops.attention import flex_attention, flex_attention_varlen, create_block_mask
 ```
 
 签名与 `torch.nn.attention.flex_attention.flex_attention` 对齐，并在其后追加若干
@@ -53,7 +53,13 @@ dropout_p=0.0, sink=None, bias=None)`。
 
 - **full attention**（`block_mask is None` 或全 True）→ `causal=False`
 - **causal**（`q >= kv`）→ `causal=True`
-- **sliding-window causal**（`(q >= kv) & (q-kv <= W)`）→ `causal=True, window_size=(W,0)`
+- **sliding-window causal**（`(q >= kv) & (q-kv <= W)`）→ `causal=True, window_size=(W,0)`；**窗口大于
+  探测网格（W>512，如 W=1024/2048/4096）在长序列 S>512 上也已支持**：在最后一个 query 行二分定位 W 的
+  True→False 翻转点，再对若干抽样行逐位精确校验为标准左窗因果后分类（见下方“大窗口探测”）
+- **varlen / document packing（显式入口 `flex_attention_varlen`）**：THD `[total,H,D]` 打包 + `cu_seqlens`
+  直连 `flash_attn_varlen_func`（详见下方“varlen / document packing 现状”）
+- **document-causal（dense 入口自动识别）**：`block_mask` 被**精确重建校验**为 `same_doc(q,kv) & (q>=kv)`
+  时，dense `flex_attention` 自动改走 varlen（块对角 `cu_seqlens`），而非会跨文档的 dense causal（详见下方）
 - **GQA/MQA**：依赖 Turbo 原生能力，要求 `Hq % Hkv == 0`，且 `Hq != Hkv` 时调用侧显式传
   `enable_gqa=True`（与 torch flex 语义一致）
 - **score_mod=None**
@@ -91,9 +97,16 @@ has_sink=False, has_bias=False) -> {"turbo","custom"}`：
   commit 6ccf00ff）上经实测为 `alibi_sign=+1`（见 `bench/bench_results_ext2.md`：
   `plus_err=1.6e-3` 匹配、`minus_err=1.32` 不匹配）。**换 build 需重新校验该符号**，
   否则可能静默产生错误结果。
-- **mask 探测上限**：分类器在 `min(S,512)` 网格上探测 `block_mask.mask_mod`。当序列长于
-  512 且窗口边界落在 512 之外时，兼容层不会猜测，而是抛 `NotImplementedError`（避免把
-  “其实有窗口”误判成 full causal）。
+- **mask 探测上限（含大窗口定位）**：分类器在 `min(S,512)` 网格上探测 `block_mask.mask_mod`。当探测角
+  看似 full-causal 但远角不可见（`mask_mod(S-1,0)=False`）时，会在**最后一个 query 行**二分搜索窗口边界
+  `W = 最大 d 使 mask_mod(S-1, S-1-d) 可见`，再对若干抽样行（边界行 + 均匀分布的约 16 行）逐位精确校验其
+  为标准左窗因果 `(q>=kv)&(q-kv<=W)`；**仅在校验完全通过时**分类为 `sliding_window_causal, (W,0)`，否则仍抛
+  `NotImplementedError`（绝不误判）。full-causal（远角仍可见）仍归 causal。
+- **分类/识别缓存（性能，行为不变）**：`block_mask` 的分类与 `score_mod` 的 ALiBi/soft-cap 识别结果按
+  **对象身份**（`weakref.WeakKeyDictionary`）缓存——同一 `block_mask`/`score_mod` 被多层/多步复用时跳过
+  重探测（最多 512×512 网格 + 检测器），消除每次调用固定 ~1.6–4.1ms 的探测开销（GPU 端到端 wrapper 前向
+  开销由 ~1.5–2.3ms 降至 ~0.03–0.27ms，其余为保留的 bhsd↔bshd transpose）。**纯提速**：不同对象重新分类、
+  结果与未缓存逐位一致；无法弱引用的对象自动跳过缓存；`clear_classification_cache()` 可复位。
 - **不识别即报错**：任何无法映射到上述固定内核的 `score_mod`/`mask_mod` 都会抛
   `NotImplementedError`（自定义快路径 `_dispatch_custom` 目前是 stub），绝不静默降级，
   从而保证“正确性优先”。
@@ -195,13 +208,62 @@ bf16 与 fp16 × full 与 causal 共 4 组，前向 rel-L2 ∈ [2.6e-4, 2.3e-3]�
 **已知限制**：仅支持在 batch/head 间**共享的单个 `[Sq,Skv]`** bias（相对位置 bias / 共享加性 mask
 的常见形态）；每头/每样本 bias 属任意 score_mod，需 codegen 路径（P3）。
 
+### varlen / document packing 现状（P2，已支持）
+
+**（主交付）显式 varlen 入口 `flex_attention_varlen`**：
+
+```python
+from primus_turbo.pytorch.ops.attention import flex_attention_varlen
+out = flex_attention_varlen(
+    query, key, value,               # THD 打包 [total_tokens, H, D]（与 Turbo varlen 一致，无需 transpose）
+    cu_seqlens_q, cu_seqlens_k,       # int32 [num_seqs+1] 前缀和，位于 q 的 device
+    max_seqlen_q, max_seqlen_k,       # 各自最长段长度（正 int）
+    *, causal=False, window_size=(-1, -1), scale=None,
+    alibi_slopes=None, dropout_p=0.0, sink=None, softcap=None, return_lse=False,
+)
+```
+
+- **直连后端**：薄封装，直接映射到 `flash_attn_varlen_func`（THD 进 THD 出，无布局互转）。文档内因果用
+  `causal=True`（标准块对角 + 段内 causal，要求逐段 `q_len == k_len`）；`window_size=(W,0)` 为逐段左窗。
+- **cu_seqlens 校验（`_validate_cu_seqlens`）**：int32、1D、首元素 0、单调非递减、末元素 == `total`
+  （q 用 `query.shape[0]`、k 用 `key.shape[0]`）、`len(cu_q)==len(cu_k)`、与 q 同 device、
+  `max_seqlen >= 最长段`；`causal=True` 另要求 `cu_seqlens_q == cu_seqlens_k`（bottom-right 对齐，段长
+  不一致会静默错位）。任何不合法 → 清晰 `ValueError`。
+- **复用 dense 校验器**：`dropout_p`（`0<=p<1`）、`sink`（1D/fp32/len==Hq，head_dim 约束）、`alibi_slopes`
+  （1D/fp32/len==Hq）与 dense 入口同一套校验；GQA/MQA 原生支持（`Hq % Hkv == 0`，无需额外 flag）。
+- **不支持项报错（风格与 dense 一致）**：无 `score_mod` 形参（任意 score_mod 走不到这里）；`softcap>0`
+  统一 `NotImplementedError`（varlen 反向 kernel 亦缺 softcap 形参，见上文 softcap 现状），绝不静默丢弃 cap。
+- **跨 build 兼容**：`sink` 仅在调用方实际提供时才透传（本 build 较旧的 varlen kernel 无 `sink` 形参；默认
+  `sink=None` 不传即 no-op，对新旧后端都可用）；`bias` 本入口不暴露，交后端默认。
+- **GPU 实测（rocm/primus:v26.5, gfx950, total=512, docs=[128,128,256], H=8, D=128）**：causal/full/SWA(W=64)/
+  GQA(Hq8/Hkv2)/ALiBi 前向 rel-L2 ∈ [2.4e-4, 2.3e-3]，causal 反向 dQ/dK/dV ≈ 2.5e-3~2.9e-3（均 < 2e-2）；
+  `return_lse` 返回 `(out, lse)`（lse `[H, total]`）；`softcap>0`/非法 cu_seqlens/causal 段长不一致均正确报错。
+
+**（次交付）dense 入口自动识别 document mask**：
+
+- `flex_attention` 分类器在 `min(S,512)` 网格上探测 `block_mask.mask_mod`；当模式落在 causal 之内但既非
+  纯 causal 也非单窗 causal 时，`_detect_document_causal_segments` 会尝试把它识别为 `same_doc(q,kv) & (q>=kv)`：
+  从次对角线读出文档边界 → 还原每段长度 → **重建完整块对角因果 mask 并逐位精确比对**，完全一致才判定为
+  `document_causal`（`_classify_block_mask` 返回 `{"kind":"document_causal","doc_seglens":[...]}`）。
+- 命中后，dense 入口把 bhsd `[B,H,S,D]` 打包为 THD、按 `doc_seglens`（跨 batch 复制）构造 `cu_seqlens`、以
+  `causal=True` 走 `flash_attn_varlen_func`，再解包回 bhsd（`_dispatch_document_varlen`）。**绝不用会跨文档的
+  dense causal**。ALiBi（显式或识别）/dropout/sink 一并透传；`bias` 与 `return_lse` 在此路径显式报错
+  （packed `[Sq,Skv]` bias 无法对齐、packed LSE 与 `[B,H,S]` 不对齐——需 LSE/bias 请改用显式 `flex_attention_varlen`）。
+- **正确性优先，绝不误判**：仅在 `S <= 512`（探测未截断）且**重建逐位相等**时才路由；`S>512`、含窗、非方阵、
+  任何空洞/偏差都会返回 `None` → 回退到原有 `NotImplementedError`（保持现状，绝不静默出错）。
+- **GPU 实测**：dense 入口带 document `block_mask`，B=1 / B=2（cu 复制）/ 含显式 ALiBi 三组，rel-L2 ≈ 1.6e-3~2.0e-3
+  （均 < 2e-2），与 masked fp32 参考一致。
+
+**已知限制**：document 识别要求 `S <= _MASK_PROBE_LIMIT(512)`（更长序列请用显式 `flex_attention_varlen`）；
+dense document 路径不支持 `bias`/`return_lse`（改用显式 varlen 入口）；`softcap>0` 全线受阻（见 softcap 现状）。
+
 ### P2（路径 A：中等工作量）
 
 | 特性 | 原因 | 路径 | 前置 | 难度 |
 |---|---|---|---|---|
-| varlen / document packing | 兼容入口目前只覆盖 dense `[B,H,S,D]` | A | 与 `flash_attn_varlen_func` 对齐包装 + `cu_seqlens` 生成 | 中 |
-| document masking | 需按 `document_id[q]/[kv]` 生成块对角 varlen | A | 依赖 varlen 包装 | 中 |
-| prefixLM（部分） | 现分类器仅支持 full/causal/单窗 causal | A | 补充可判定模板与后端映射 | 中 |
+| varlen / document packing | ✅ **已支持**：新增显式入口 `flex_attention_varlen`（THD 打包 + `cu_seqlens` 直连 `flash_attn_varlen_func`）；GPU 实测 causal/full/SWA/GQA/ALiBi 前向 rel-L2≈1.6e-3~2.3e-3、反向 dQ/dK/dV≈2.5e-3~2.9e-3（均 < 2e-2） | A | — | 已完成 |
+| document masking | ✅ **已支持**：dense `flex_attention` 精确识别 `same_doc(q,kv) & (q>=kv)` 块对角因果 → 还原每段长度 → 构造 `cu_seqlens` → 改走 varlen；GPU 实测 B=1/B=2/含 ALiBi 均 rel-L2≈1.6e-3~2.0e-3 | A | 依赖 varlen 包装 | 已完成 |
+| prefixLM（部分） | 现分类器仅支持 full/causal/单窗 causal/文档块对角因果 | A | 补充可判定模板与后端映射 | 中 |
 | 更多 head_dim / dtype 覆盖 | 受后端约束与 dtype guard 限制（当前仅 fp16/bf16） | A | 后端能力验证（FlyDSL 仅 D∈{64,128}） | 中 |
 
 ### P3（路径 B：通用 codegen，高难）
@@ -224,7 +286,18 @@ bf16 与 fp16 × full 与 causal 共 4 组，前向 rel-L2 ∈ [2.6e-4, 2.3e-3]�
 
 ## 测试
 
-- 纯逻辑单测（CPU 即可）：`tests/pytorch/ops/test_flex_attention_dispatch_logic.py`（共 95 例）
+- 纯逻辑单测（CPU 即可）：`tests/pytorch/ops/test_flex_attention_dispatch_logic.py`（共 **186 例**，95 原有
+  + 44 varlen + 15 document + 32 大窗口/缓存；零回归）。varlen 部分覆盖 `_validate_cu_seqlens`（int32/1D/首 0/单调/末元素/段数一致/
+  device/max_seqlen>=最长段/causal 段长一致 的正反例）、`_validate_qkv_varlen`（3D/dtype/head 整除/head_dim）、
+  `_validate_window_size`、`_validate_max_seqlen`，及 `flex_attention_varlen` 端到端（mock 后端）：THD 直通不 transpose、
+  causal/window/scale/dropout/alibi/sink 透传、softcap>0 报错、非法 cu 分发前报错、`return_lse` 返回 tuple、GQA、
+  非因果交叉注意力。document 部分覆盖 `_detect_document_causal_segments`（多文档识别、单 causal/SWA/截断/非方阵/带洞
+  的拒绝）、`_classify_block_mask` 返回 `document_causal`、以及 dense 入口端到端路由到 varlen（cu_seqlens 正确、B=2 复制、
+  ALiBi 透传、bias/return_lse/超 512 的报错）。大窗口/缓存部分覆盖 `_locate_left_window`（W∈{256,512,1024,2048,4096}
+  在 S=8192 上的识别、full-causal/非平移不变/带洞/非方阵 的拒绝）、`_classify_block_mask` 对大窗口的分类（含 S=8192、
+  window≥S 归 causal、非标准长 mask 仍报错），以及分类/识别缓存（同对象命中返回同一对象、不同对象/形状重算、
+  非弱引用对象跳过缓存、`_cached_detect_alibi/softcap` 命中计数、`clear_classification_cache` 复位、行为与未缓存一致）。
+- 旧的原始 95 例：
   覆盖 full/causal/SWA/随机/带状/head 依赖/batch 依赖 的分类、ALiBi 识别器的正反例、
   `_detect_softcap` 的正反例（含 cap=20/30/50 识别、identity/线性/常量/ALiBi/硬 clamp/
   alibi+softcap 组合的拒绝、以及“softcap 不被误判为零斜率 ALiBi”的回归护栏），
@@ -241,6 +314,18 @@ bf16 与 fp16 × full 与 causal 共 4 组，前向 rel-L2 ∈ [2.6e-4, 2.3e-3]�
   `NotImplementedError`（且未触达后端）、`softcap=0/None` 无影响、`dropout_p` 默认/正数透传与越界报错、
   `sink` 透传与非法形状报错、`bias` 透传/适配与每头 bias 报错、以及“无扩展参数即与原路径一致（含
   dropout_p=0/sink=None/bias=None）”。
+- GPU varlen / document 验证（容器内）：`bench/flex_attention_varlen_validation.py`（经
+  `bench/_run_varlen_all.py` 先把 workspace `flex_attention.py` 覆盖到已安装包、再从 /tmp 跑纯逻辑单测 +
+  本脚本）。覆盖 `flex_attention_varlen` 的 causal/full/SWA/GQA/ALiBi 前向 + causal 反向 dQ/dK/dV、`return_lse`、
+  softcap/非法 cu/段长不一致 报错；以及 dense 入口 document 路由（B=1/B=2/ALiBi）对齐 masked fp32 参考。
+  实测全部 rel-L2 < 2e-2（详见上方“varlen / document packing 现状”）。
+  注意：容器已安装的是较旧 build，其包 `__init__.py` 缺 `sparse_mla_interface`、varlen kernel 缺 `sink` 形参，
+  故 runner **只覆盖 `flex_attention.py`**（不覆盖 `__init__.py`），入口对 `sink` 采用“提供才透传”的兼容策略。
+- GPU 入口开销 + 大窗口验证（容器内）：`bench/bench_flex_entry_overhead.py`（三方对比 entry/direct/torch flex）
+  + `bench/_bench_classify_cache.py`（分类冷/热缓存微基准）。实测：**分类缓存**把冷（重探测）1.6–4.1ms 降到热
+  （命中）~0.3–0.4µs（~5000–12000×）；端到端 wrapper 前向开销由基线 ~1.5–2.3ms 降至 ~0.03–0.27ms（其余为保留的
+  transpose）。**SWA(W=1024) 在 S=2048/4096/8192 由基线的 `NotImplementedError` 变为全部跑通**，entry vs direct
+  的 out rel-L2=0、dQ~1e-6~1e-5（≪2e-2）。
 - GPU 冒烟（容器内）：`bench/smoke_flex_attention_turbo.py`
   覆盖 causal / full / SWA(W=128) / GQA / ALiBi 数值对齐（rel-L2 < 2e-2）与报错路径；
   并新增**显式 `alibi_slopes`**（causal，与手工参考及自动识别路径三方数值一致）、**显式

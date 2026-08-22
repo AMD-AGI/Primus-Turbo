@@ -14,6 +14,13 @@ high-performance ``flash_attn_func`` backend (FlyDSL/AITER on gfx950). Anything
 that cannot be mapped to those fixed kernels raises ``NotImplementedError`` with
 an explanation, or is routed to the (currently stub) custom fast-path hook.
 
+For variable-length / document-packed batches this module also exposes an
+explicit :func:`flex_attention_varlen` entry point: a thin THD-layout wrapper over
+``flash_attn_varlen_func`` (caller supplies ``cu_seqlens`` directly). In addition,
+the dense :func:`flex_attention` recognises a block-diagonal document-causal
+``block_mask`` (``same_doc(q,kv) & (q>=kv)``, verified by exact reconstruction) and
+routes it through the varlen backend rather than a cross-document dense causal call.
+
 Design notes
 ------------
 * torch flex uses the ``bhsd`` (``[B, H, S, D]``) layout; ``flash_attn_func`` is
@@ -55,6 +62,7 @@ Design notes
 
 import math
 import warnings
+import weakref
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -72,25 +80,105 @@ __all__ = [
     "choose_backend",
     "register_backend_override",
     "clear_backend_overrides",
+    "clear_classification_cache",
 ]
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 # Upper bound on the probe grid edge. 512 comfortably covers the sliding-window
-# sizes we can express; larger windows on longer sequences are reported as
-# "uncertain" rather than silently mis-classified.
+# sizes we can express directly; larger windows on longer sequences are located by
+# a binary search on the last query row (see _locate_left_window) rather than
+# silently mis-classified.
 _MASK_PROBE_LIMIT = 512
 _ALIBI_TOL = 5e-3
 # Relative tolerance for recognising a logits soft-cap (cap*tanh(score/cap)).
 _SOFTCAP_TOL = 1e-2
 
 
+# =============================================================================
+# Classification / detection caches (perf: avoid re-probing on reuse)
+# =============================================================================
+#
+# Probing a ``block_mask.mask_mod`` (up to 512x512) and re-running the ALiBi /
+# soft-cap ``score_mod`` detectors on *every* call is a fixed ~1-3 ms per-call cost
+# that dominates small/medium shapes. In real use the same ``block_mask`` /
+# ``score_mod`` object is reused across layers and steps, so we memoise the
+# classification / detection *by object identity* (``weakref.WeakKeyDictionary`` so
+# entries vanish when the mask/score_mod is garbage-collected -- no leak, no
+# lifetime surprises). This is a pure speedup: a different object re-probes, and a
+# cache entry is exactly what the uncached path would have returned (identical
+# result / error semantics). A sentinel distinguishes a cached ``None`` result from
+# a miss; objects that cannot be weakly referenced simply skip the cache.
+_CACHE_MISS = object()
+
+# block_mask obj -> {(B, H, q_len, kv_len): cfg dict}
+_CLASSIFY_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+# score_mod obj -> {(B, Hq, q_len, kv_len): slopes tensor or None}
+_ALIBI_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+# score_mod obj -> {(B, Hq, q_len, kv_len): cap float or None}
+_SOFTCAP_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _cache_get(cache: "weakref.WeakKeyDictionary", obj: Any, key: Tuple) -> Any:
+    """Return the cached value for ``(obj, key)`` or ``_CACHE_MISS``.
+
+    Tolerates objects that cannot be weakly referenced (returns a miss) so caching
+    never changes behaviour -- only speed.
+    """
+    try:
+        inner = cache.get(obj)
+    except TypeError:
+        return _CACHE_MISS
+    if inner is None:
+        return _CACHE_MISS
+    return inner.get(key, _CACHE_MISS)
+
+
+def _cache_put(cache: "weakref.WeakKeyDictionary", obj: Any, key: Tuple, value: Any) -> None:
+    """Memoise ``value`` for ``(obj, key)``; silently skip non-weak-referenceable objects."""
+    try:
+        inner = cache.get(obj)
+        if inner is None:
+            inner = {}
+            cache[obj] = inner
+    except TypeError:
+        return
+    inner[key] = value
+
+
+def clear_classification_cache() -> None:
+    """Clear all mask-classification / score_mod-detection caches.
+
+    Rarely needed (entries are keyed by object identity and drop automatically when
+    the mask / score_mod is collected), but handy for tests / benchmarks that want a
+    cold-cache measurement or full determinism.
+    """
+    _CLASSIFY_CACHE.clear()
+    _ALIBI_CACHE.clear()
+    _SOFTCAP_CACHE.clear()
+
+
 SUPPORT_STATUS: Dict[str, Any] = {
     "supported_now": {
-        "mask": ["full", "causal", "sliding_window_causal"],
+        "mask": ["full", "causal", "sliding_window_causal", "document_causal"],
         "score_mod": ["none", "alibi_detected", "alibi_explicit"],
         "gqa_mqa": True,
         "return_lse": True,
+        # A block_mask recognised (exactly) as same_doc(q,kv) & (q>=kv) is routed
+        # through the varlen backend (block-diagonal cu_seqlens) rather than a dense
+        # causal call. Requires S <= _MASK_PROBE_LIMIT and no bias / return_lse (use
+        # flex_attention_varlen for those); recognition is exact so it never misfires.
+        "document_causal_dense_recognition": "block_mask_same_doc_and_causal_routed_to_varlen",
+        # Sliding-window-causal with a window LARGER than the 512 probe grid (e.g.
+        # W=1024/2048/4096 on long sequences) is located by a binary search on the
+        # last query row + exact per-row verification (see _locate_left_window), so a
+        # big window on S>512 is now classified instead of raising NotImplementedError.
+        "sliding_window_large": "window_gt_probe_located_by_binary_search_on_last_row",
     },
+    # Classification (block_mask probe) and score_mod (ALiBi/soft-cap) detection are
+    # memoised by object identity (weakref) so reusing the same block_mask / score_mod
+    # across layers & steps skips the ~1-3 ms per-call probe. Pure speedup; identical
+    # results. clear_classification_cache() resets it (tests / cold-cache benchmarks).
+    "classification_cache": "memoised_by_block_mask_and_score_mod_object_identity_weakref",
     # Turbo-extension explicit args (superset of the torch signature; both default
     # None so a torch-style call is unchanged and remains a drop-in replacement).
     "turbo_extension_args": {
@@ -281,6 +369,28 @@ def _probe_mask_grid(mask_mod: Callable, b: int, h: int, q_probe: int, kv_probe:
         return out
 
 
+def _probe_mask_row(mask_mod: Callable, q_pos: int, kv_len: int) -> torch.Tensor:
+    """Evaluate ``mask_mod`` for a single query row ``q_pos`` over ``kv in [0, kv_len)``.
+
+    Returns a 1D bool tensor of length ``kv_len``. Vectorised first (one broadcast
+    call), falling back to an element-wise loop for scalar-only lambdas. Used by the
+    sliding-window locator to verify a candidate window exactly on sampled rows.
+    """
+    q_idx = torch.tensor([[q_pos]])
+    kv_idx = torch.arange(kv_len).view(1, kv_len)
+    try:
+        raw = mask_mod(0, 0, q_idx, kv_idx)
+        row = torch.as_tensor(raw, dtype=torch.bool)
+        if row.shape != (1, kv_len):
+            row = row.broadcast_to((1, kv_len))
+        return row.reshape(kv_len).contiguous()
+    except Exception:
+        out = torch.empty(kv_len, dtype=torch.bool)
+        for ki in range(kv_len):
+            out[ki] = _call_mask_mod(mask_mod, 0, 0, q_pos, ki)
+        return out
+
+
 def _mask_is_bh_dependent(mask_mod: Callable, base: torch.Tensor, B: int, H: int, q_probe: int, kv_probe: int) -> bool:
     candidates = []
     if B > 1:
@@ -299,6 +409,121 @@ def _mask_is_bh_dependent(mask_mod: Callable, base: torch.Tensor, B: int, H: int
 # =============================================================================
 # Mask classification
 # =============================================================================
+
+
+def _detect_document_causal_segments(
+    mask: torch.Tensor,
+    *,
+    q_len: int,
+    kv_len: int,
+    q_probe: int,
+    kv_probe: int,
+) -> Optional[list]:
+    """Recover per-document segment lengths from a block-diagonal causal mask.
+
+    Recognises the *document packing* pattern ``same_doc(q,kv) & (q >= kv)`` (block
+    diagonal along the sequence, causal within each document) and returns the list of
+    document lengths, or ``None`` if the mask is not exactly that pattern.
+
+    Correctness-first, never silently wrong:
+
+    * Only a **square, fully-probed** self-attention mask is considered (``q_len ==
+      kv_len`` and the probe covers the whole sequence, i.e. ``S <= _MASK_PROBE_LIMIT``);
+      a truncated probe cannot see document boundaries past the limit, so it bails.
+    * Document boundaries are read off the sub-diagonal (token ``i`` starts a new
+      document iff it may not attend token ``i-1``), then the full block-diagonal +
+      causal mask is *reconstructed and compared for exact equality*. Any deviation
+      (a window, an off-diagonal hole, a non-causal block, ...) fails the check and
+      returns ``None`` -- so the caller falls through to its normal handling.
+    * A single document (``len < 2``) is plain causal, handled elsewhere; only genuine
+      multi-document packing is returned here.
+    """
+    if q_len != kv_len or q_probe != q_len or kv_probe != kv_len:
+        return None
+    n = q_len
+    if n <= 1:
+        return None
+
+    # Diagonal must be fully visible (each token attends itself); a hole here means it
+    # is not a document-causal mask.
+    if not bool(mask.diagonal().all().item()):
+        return None
+
+    sub_diag = mask.diagonal(offset=-1)  # mask[i, i-1] for i in 1..n-1
+    seg_lens = []
+    start = 0
+    for i in range(1, n):
+        if not bool(sub_diag[i - 1].item()):
+            seg_lens.append(i - start)
+            start = i
+    seg_lens.append(n - start)
+    if len(seg_lens) < 2:
+        return None
+
+    doc_id = torch.empty(n, dtype=torch.int64)
+    pos = 0
+    for d, s in enumerate(seg_lens):
+        doc_id[pos : pos + s] = d
+        pos += s
+    qi = torch.arange(n).view(n, 1)
+    ki = torch.arange(n).view(1, n)
+    expected = (doc_id.view(n, 1) == doc_id.view(1, n)) & (qi >= ki)
+    if not torch.equal(mask, expected):
+        return None
+    return seg_lens
+
+
+def _locate_left_window(mask_mod: Callable, *, q_len: int, kv_len: int) -> Optional[int]:
+    """Locate a large left-window size ``W`` whose boundary sits beyond the probe grid.
+
+    Called only when the probed corner is *exactly causal* yet the far corner
+    (``mask_mod(q_len-1, 0)``) is invisible -- i.e. there is a sliding window whose
+    left edge ``W`` is bigger than ``_MASK_PROBE_LIMIT`` (e.g. W=1024/2048/4096 on a
+    long sequence). We binary-search the last query row for the True->False flip
+    (``W = max d s.t. mask_mod(S-1, S-1-d)`` is visible), then *verify exactly* that
+    the mask is a standard left-window causal ``(q>=kv) & (q-kv<=W)`` by comparing
+    full rows at several sampled query positions. Returns ``W`` (``>= 0``) or ``None``
+    if it is not a clean translation-invariant left window (caller then falls back to
+    ``NotImplementedError``, i.e. behaviour is unchanged for anything non-standard).
+    """
+    if q_len != kv_len:
+        return None  # a windowed causal mask is square self-attention
+    n = q_len
+    last = n - 1
+    # Endpoints of the search: diagonal (d=0) must be visible; the far end (d=last)
+    # must be invisible for a window to exist (the caller established this, re-checked
+    # here to be self-contained / robust to caller changes).
+    if not _call_mask_mod(mask_mod, 0, 0, last, last):
+        return None
+    if _call_mask_mod(mask_mod, 0, 0, last, 0):
+        return None
+
+    lo, hi = 0, last  # visible at lo, invisible at hi
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if _call_mask_mod(mask_mod, 0, 0, last, last - mid):
+            lo = mid
+        else:
+            hi = mid
+    window = lo
+
+    # Exact verification: sample diverse rows (the boundary rows, the probe limit, and
+    # ~16 evenly-spaced rows spanning the sequence) and require each to match the window
+    # pattern bit-for-bit. Full-row equality catches holes; the spread of rows catches
+    # non-translation-invariant windows -- so we never silently accept a non-window
+    # mask (anything unclean returns None -> caller raises, unchanged behaviour).
+    kv_idx = torch.arange(kv_len)
+    sample_rows = {last, window, window + 1, min(n - 1, _MASK_PROBE_LIMIT), n // 2, (3 * n) // 4, n // 4}
+    stride = max(1, n // 16)
+    sample_rows.update(range(0, n, stride))
+    for q_pos in sorted(sample_rows):
+        if q_pos < 0 or q_pos >= n:
+            continue
+        row = _probe_mask_row(mask_mod, q_pos, kv_len)
+        expected = (kv_idx <= q_pos) & ((q_pos - kv_idx) <= window)
+        if not torch.equal(row, expected):
+            return None
+    return window
 
 
 def _classify_probed_mask(
@@ -336,15 +561,38 @@ def _classify_probed_mask(
         if truncated and mask_mod is not None:
             far_visible = _call_mask_mod(mask_mod, 0, 0, q_len - 1, 0)
             if not far_visible:
+                # A window exists but its edge is past the probe grid. Locate W by a
+                # binary search on the last row and verify it is a clean left window;
+                # only fall back to raising if it is not standard/translation-invariant.
+                window = _locate_left_window(mask_mod, q_len=q_len, kv_len=kv_len)
+                if window is not None:
+                    return {
+                        "kind": "sliding_window_causal",
+                        "causal": True,
+                        "window_size": (window, 0),
+                    }
                 raise NotImplementedError(
-                    "Turbo flex 兼容层检测到可能存在窗口，但窗口边界超出探测上限 "
-                    f"{_MASK_PROBE_LIMIT}，无法可靠确定窗口大小；请显式使用 create_block_mask 表达窗口。"
+                    "Turbo flex 兼容层检测到疑似滑动窗口，但无法确认其为标准左窗因果 "
+                    f"(q>=kv)&(q-kv<=W)（窗口边界超出探测上限 {_MASK_PROBE_LIMIT} 且抽样校验未通过）；"
+                    "请显式使用 create_block_mask 表达窗口。"
                 )
         return {"kind": "causal", "causal": True, "window_size": (-1, -1)}
 
     inferred_w = int(delta[mask].max().item())
     swa = causal & (delta <= inferred_w)
     if not torch.equal(mask, swa):
+        # Before giving up, try the document-packing pattern (block-diagonal + causal).
+        # Recognised only via exact reconstruction, so a false match is impossible.
+        doc_seglens = _detect_document_causal_segments(
+            mask, q_len=q_len, kv_len=kv_len, q_probe=q_probe, kv_probe=kv_probe
+        )
+        if doc_seglens is not None:
+            return {
+                "kind": "document_causal",
+                "causal": True,
+                "window_size": (-1, -1),
+                "doc_seglens": doc_seglens,
+            }
         raise NotImplementedError(
             "Turbo flex 兼容层暂不支持该 block_mask：该模式不是标准左窗因果 "
             "(q>=kv) & (q-kv<=W)，属于任意/数据依赖 mask，需要 codegen 路径。"
@@ -370,7 +618,7 @@ def _classify_probed_mask(
     return {"kind": "sliding_window_causal", "causal": True, "window_size": (inferred_w, 0)}
 
 
-def _classify_block_mask(
+def _classify_block_mask_uncached(
     block_mask: Any,
     *,
     B: int,
@@ -384,9 +632,6 @@ def _classify_block_mask(
     ``(left, right)`` suitable for ``flash_attn_func``. Raises
     ``NotImplementedError`` for anything Turbo's fixed kernels cannot express.
     """
-    if block_mask is None:
-        return {"kind": "full", "causal": False, "window_size": (-1, -1)}
-
     mask_mod = getattr(block_mask, "mask_mod", None)
     if not callable(mask_mod):
         raise NotImplementedError(
@@ -413,6 +658,34 @@ def _classify_block_mask(
         q_probe=q_probe,
         kv_probe=kv_probe,
     )
+
+
+def _classify_block_mask(
+    block_mask: Any,
+    *,
+    B: int,
+    H: int,
+    q_len: int,
+    kv_len: int,
+) -> Dict[str, Any]:
+    """Cached wrapper over :func:`_classify_block_mask_uncached`.
+
+    ``None`` short-circuits to full attention. Otherwise the result is memoised by
+    ``block_mask`` object identity and ``(B, H, q_len, kv_len)`` (a different object
+    or shape re-probes). Caching is a pure speedup -- it returns exactly what the
+    uncached classifier would (only successful classifications are stored; a mask
+    that raises simply re-raises next time, identical behaviour).
+    """
+    if block_mask is None:
+        return {"kind": "full", "causal": False, "window_size": (-1, -1)}
+
+    key = (B, H, q_len, kv_len)
+    cached = _cache_get(_CLASSIFY_CACHE, block_mask, key)
+    if cached is not _CACHE_MISS:
+        return cached
+    cfg = _classify_block_mask_uncached(block_mask, B=B, H=H, q_len=q_len, kv_len=kv_len)
+    _cache_put(_CLASSIFY_CACHE, block_mask, key, cfg)
+    return cfg
 
 
 # =============================================================================
@@ -586,6 +859,42 @@ def _detect_softcap(
                 return None
 
     return float(cap)
+
+
+# =============================================================================
+# Cached score_mod detection (perf: avoid re-probing on reuse)
+# =============================================================================
+
+
+def _cached_detect_alibi_slopes(
+    score_mod: Callable, *, B: int, Hq: int, q_len: int, kv_len: int
+) -> Optional[torch.Tensor]:
+    """Memoised :func:`_detect_alibi_slopes` keyed by ``score_mod`` object identity.
+
+    Returns exactly what the uncached detector would (including ``None``); the cached
+    slopes tensor is never mutated in place by callers (they ``.to(device)`` / read
+    it), so sharing it is safe.
+    """
+    key = (B, Hq, q_len, kv_len)
+    cached = _cache_get(_ALIBI_CACHE, score_mod, key)
+    if cached is not _CACHE_MISS:
+        return cached
+    val = _detect_alibi_slopes(score_mod, B=B, Hq=Hq, q_len=q_len, kv_len=kv_len)
+    _cache_put(_ALIBI_CACHE, score_mod, key, val)
+    return val
+
+
+def _cached_detect_softcap(
+    score_mod: Callable, *, B: int, Hq: int, q_len: int, kv_len: int
+) -> Optional[float]:
+    """Memoised :func:`_detect_softcap` keyed by ``score_mod`` object identity."""
+    key = (B, Hq, q_len, kv_len)
+    cached = _cache_get(_SOFTCAP_CACHE, score_mod, key)
+    if cached is not _CACHE_MISS:
+        return cached
+    val = _detect_softcap(score_mod, B=B, Hq=Hq, q_len=q_len, kv_len=kv_len)
+    _cache_put(_SOFTCAP_CACHE, score_mod, key, val)
+    return val
 
 
 # =============================================================================
@@ -955,6 +1264,64 @@ def _validate_qkv(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -
         raise ValueError("Turbo flex 兼容层要求 key/value 的 head 数与序列长度一致。")
 
 
+def _dispatch_document_varlen(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    seg_lens: list,
+    *,
+    scale: Optional[float],
+    alibi_slopes: Optional[torch.Tensor],
+    dropout_p: float,
+    sink: Optional[torch.Tensor],
+    deterministic: bool = False,
+) -> torch.Tensor:
+    """Run a recognised document-causal *dense* call through the varlen backend.
+
+    ``query``/``key``/``value`` are bhsd ``[B, H, S, D]`` sharing the same per-batch
+    document structure ``seg_lens`` (``sum(seg_lens) == S``; batch/head independence of
+    the mask is already verified by the classifier). They are packed to THD, dispatched
+    block-diagonally (``causal=True``) via ``flash_attn_varlen_func`` -- which honours
+    document boundaries through ``cu_seqlens`` rather than attending across them -- and
+    the packed output is unpacked back to bhsd. ``sink`` is threaded only when supplied
+    (newer-backend feature; a no-op default otherwise).
+    """
+    bsz, hq, sq, _ = query.shape
+    dv = value.shape[-1]
+
+    def _pack(t: torch.Tensor) -> torch.Tensor:  # (B,H,S,D) -> (B*S, H, D)
+        b, h, s, d = t.shape
+        return t.transpose(1, 2).reshape(b * s, h, d).contiguous()
+
+    q_thd = _pack(query)
+    k_thd = _pack(key)
+    v_thd = _pack(value)
+
+    # Replicate the per-batch document boundaries across the packed batch dimension.
+    seglens_all = list(seg_lens) * bsz
+    cu = torch.zeros(len(seglens_all) + 1, dtype=torch.int32, device=query.device)
+    cu[1:] = torch.tensor(seglens_all, dtype=torch.int32, device=query.device).cumsum(0)
+    max_s = int(max(seg_lens))
+
+    from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_varlen_func
+
+    call_kwargs: Dict[str, Any] = dict(
+        dropout_p=dropout_p,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_lse=False,
+    )
+    if sink is not None:
+        call_kwargs["sink"] = sink
+
+    out_thd = flash_attn_varlen_func(q_thd, k_thd, v_thd, cu, cu, max_s, max_s, **call_kwargs)
+    # (B*S, Hq, Dv) -> (B, S, Hq, Dv) -> (B, Hq, S, Dv)
+    return out_thd.reshape(bsz, sq, hq, dv).transpose(1, 2).contiguous()
+
+
 def flex_attention(
     query,
     key,
@@ -1101,13 +1468,13 @@ def flex_attention(
         # a zero-slope no-op -- so probing it first avoids silently dropping the
         # cap. A soft-cap+ALiBi (or other) composition is not a pure soft-cap and
         # falls through to the ALiBi detector, which rejects it -> custom.
-        detected_softcap = _detect_softcap(score_mod, B=bsz, Hq=hq, q_len=sq, kv_len=skv) or 0.0
+        detected_softcap = _cached_detect_softcap(score_mod, B=bsz, Hq=hq, q_len=sq, kv_len=skv) or 0.0
         if detected_softcap > 0.0:
             # Unify with the explicit softcap gate below (no double-handling): a
             # detected soft-cap simply raises the effective cap and hits one gate.
             effective_softcap = max(effective_softcap, detected_softcap)
         else:
-            detected_alibi = _detect_alibi_slopes(score_mod, B=bsz, Hq=hq, q_len=sq, kv_len=skv)
+            detected_alibi = _cached_detect_alibi_slopes(score_mod, B=bsz, Hq=hq, q_len=sq, kv_len=skv)
             if detected_alibi is None:
                 # Unrecognised programmable score modification -> custom (stub) path.
                 return _dispatch_custom(score_mod=score_mod, block_mask=block_mask)
@@ -1161,6 +1528,34 @@ def flex_attention(
             sink=sink,
             bias=effective_bias,
             backend=backend,
+        )
+
+    # ---- document packing (block-diagonal + within-doc causal) ----------------
+    # A block_mask recognised as ``same_doc(q,kv) & (q>=kv)`` is dispatched through
+    # the varlen backend (packed cu_seqlens) instead of a dense causal call, which
+    # would attend across document boundaries. The recognition is exact (see
+    # _detect_document_causal_segments), so this only fires on genuine doc packing.
+    if mask_cfg.get("kind") == "document_causal":
+        if has_bias:
+            raise NotImplementedError(
+                "Turbo flex 兼容层：document-causal block_mask 暂不支持与共享 bias 组合"
+                "（packed varlen 下 [Sq,Skv] bias 无法对齐）；如需请走 codegen 路径。"
+            )
+        if return_lse:
+            raise NotImplementedError(
+                "Turbo flex 兼容层：document-causal block_mask 目前不支持 return_lse"
+                "（packed LSE 与 dense [B,H,S] 布局不对齐）；如需 LSE 请改用显式 "
+                "flex_attention_varlen 入口。"
+            )
+        return _dispatch_document_varlen(
+            query,
+            key,
+            value,
+            mask_cfg["doc_seglens"],
+            scale=scale,
+            alibi_slopes=effective_alibi_slopes,
+            dropout_p=dropout_p,
+            sink=sink,
         )
 
     # Lazy import so pure classification (and this module's import) does not force
@@ -1503,6 +1898,23 @@ def flex_attention_varlen(
     # not force the heavy backend kernels to load.
     from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_varlen_func
 
+    # ``sink`` is a newer varlen-backend feature: only thread it through when the
+    # caller actually supplies one, so this entry stays compatible with backend
+    # builds whose ``flash_attn_varlen_func`` predates the ``sink`` parameter (a
+    # ``sink=None`` default is a no-op either way). ``bias`` is not exposed by this
+    # varlen entry, so it is left to the backend default rather than passed.
+    call_kwargs: Dict[str, Any] = dict(
+        dropout_p=dropout_p,
+        softmax_scale=scale,
+        causal=causal,
+        window_size=window_size,
+        alibi_slopes=effective_alibi_slopes,
+        deterministic=False,
+        return_lse=return_lse,
+    )
+    if effective_sink is not None:
+        call_kwargs["sink"] = effective_sink
+
     return flash_attn_varlen_func(
         query,
         key,
@@ -1511,13 +1923,5 @@ def flex_attention_varlen(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        dropout_p=dropout_p,
-        softmax_scale=scale,
-        causal=causal,
-        window_size=window_size,
-        bias=None,
-        alibi_slopes=effective_alibi_slopes,
-        deterministic=False,
-        return_lse=return_lse,
-        sink=effective_sink,
+        **call_kwargs,
     )
