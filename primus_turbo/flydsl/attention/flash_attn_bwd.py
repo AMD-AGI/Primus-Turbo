@@ -1230,6 +1230,14 @@ def build_flash_attn_bwd_dkdv_module(
     # qdesc: walk the unmasked q blocks downwards (None = every full-causal shape, see QDESC).
     qdesc=None,
     qdesc_r=None,  # bands per QDESC phase group (None = QDESC_R)
+    # num_xcd: PROBE, the XCD-major decode's fan-out (None = _NUM_XCD). It sets how many
+    # (batch, kv_head) groups the resident work-groups spread over, i.e. how many bands of
+    # one group share an XCD's L2 slice. See the block_id decode. Swept at l70b_b2 against
+    # the deployed 8: 4 is +2.8%, 2 is +17.6%, 1 is +29.5%, and the byte counter agrees
+    # (dkdv FetchSize 4.40 GB at 8 against 7.46 GB at 4, fold off) -- each XCD's Q/dO image
+    # is private to its (batch, kv_head) groups, so the fan-out belongs at the physical
+    # XCD count and there is nothing on this axis to tune.
+    num_xcd=None,
     g3_dbat=None,
     g3d=None,  # GEMM3 kstep prefetch ring depth (None = 6, capped by G3_KSTEPS). See G3D.
     # q_pref: stage the Q/dO tiles through VGPRs and issue head h+1's fetch at the top of
@@ -1307,7 +1315,7 @@ def build_flash_attn_bwd_dkdv_module(
 
     BLOCK_Q = _BWD_BLOCK_Q if block_q is None else int(block_q)
     WARP_SIZE = 64
-    NUM_XCD = _NUM_XCD
+    NUM_XCD = _NUM_XCD if num_xcd is None else int(num_xcd)
     BLOCK_KV = block_kv
     Q_SPLIT = q_split
     assert q_split >= 1
@@ -1600,10 +1608,19 @@ def build_flash_attn_bwd_dkdv_module(
     # this is full-causal only.
     QDESC = (True if qdesc is None else bool(qdesc)) and window_left < 0
     # Bands per phase group. The phases keep the gathered bands off each OTHER's partial rows
-    # and are not free to drop: R=1 (every band on the same q block) costs gptoss_full +1.6%.
-    # Widening them past a pair of concurrent sharers does nothing -- R=8 and R=16 both read
-    # flat against 4 over ten alternating readings.
-    QDESC_R = 4 if qdesc_r is None else int(qdesc_r)
+    # and are not free to drop: R=1 (every band on the same q block) costs gptoss_full +1.6%
+    # and l8b_b2 +0.8%, while widening past the concurrent sharers does nothing -- R=8 and
+    # R=16 read flat to +1.0% against 4 at Hq=64, R=8 is +0.7% at Hq=32.
+    #
+    # What sets how many bands pile onto one q block's partial rows is the DWELL: a
+    # work-group holds a q block for GQA_GROUP_SIZE head-steps, so halving the group halves
+    # the pile and half the phases carry the same separation. Every R above was tuned at a
+    # group of 8; at 4 the phase group is one step too wide and R=2 measures l8b_b2 -1.37% on
+    # the mean and -1.55% on the min of 28 readings over three strict-palindrome batches of
+    # min-of-40 (every batch negative on its own), and d64_hq32_b4 -0.1% -- flat, so the rule
+    # costs the narrow-group D64 shapes nothing. Every GUARD cell has a group of 8, so they
+    # all compile byte-identical to the literal 4 this replaces.
+    QDESC_R = max(1, GQA_GROUP_SIZE // 2) if qdesc_r is None else int(qdesc_r)
     # GEMM1 emits ks-outer: the four kv tiles of one k-step first, so consecutive MFMAs
     # write different accumulators and the next one issues without waiting on the last
     # one's result. At D128 (one wave per SIMD) there is no sibling wave to cover that
