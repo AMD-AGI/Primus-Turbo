@@ -681,8 +681,8 @@ def _build_grouped_mxfp8_nt_kernel(
 
 _GNT_FUSED_CACHE: dict = {}  # (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persist) -> launch
 _GNT_WS_CACHE: dict = {}  # (M_pad, N, K128, G, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp)
-_GNT_AT_CACHE: dict = {}  # (M_pad, N, K, G, cbsz, blgp, out_fp16, persist) -> [raw, compiled]
-_GNT_CFG_CACHE: dict = {}  # cfg_key (NO M_pad) -> (bm, gm, xcd, gn) chosen by autotune
+_GNT_AT_CACHE: dict = {}  # (N, K, G, cbsz, blgp, out_fp16, persist) -> [raw, compiled]
+_GNT_CFG_CACHE: dict = {}  # same key (NO M_pad) -> (bm, gm, xcd, gn) chosen by autotune
 
 # fwd/dgrad NT autotune. The launch is M-generic (M is a runtime arg), so the config race
 # keys on the static shape only (cfg_key, no M_pad) and is reused for every M.
@@ -956,13 +956,11 @@ def grouped_gemm_mxfp8_flydsl_kernel(
         grid_upper,
         stream,
     )
-    # at_key bakes buffers/workspace per M_pad; cfg_key (no M_pad) picks the swizzle once/shape.
-    at_key = (M_pad, N, K, G, cbsz, blgp, out_fp16, persistent)
-    cfg_key = (N, K, G, cbsz, blgp, out_fp16, persistent)
+    at_key = (N, K, G, cbsz, blgp, out_fp16, persistent)
     entry = _GNT_AT_CACHE.get(at_key)
     if entry is None:
         # race on canonical synthetic tensors -> needs only the static shape (args' b-side)
-        bm, gm, xcd, gn = _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args)
+        bm, gm, xcd, gn = _select_nt_cfg(at_key, K, G, N, cbsz, blgp, out_fp16, persistent, args)
         launch = _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent)
         entry = [launch, None]
         _GNT_AT_CACHE[at_key] = entry
@@ -1316,7 +1314,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
 _GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch
 _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
-_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16, beta1) -> [raw, compiled]
+_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta1) -> [raw, compiled]
 _GWG_CFG_CACHE: dict = {}  # at_key -> (bm, bn, gm, xcd, gn) chosen by autotune
 
 # variable-K wgrad config autotune (mirrors the fwd/dgrad NT path).
@@ -1517,7 +1515,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
 
     # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
-    at_key = (OUT_M, OUT_N, M_total, G, cbsz, blgp, out_fp16, beta_is_one)
+    at_key = (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one)
     entry = _GWG_AT_CACHE.get(at_key)
     if entry is None:
         # first call for this shape: autotune (bm,bn,gm,xcd,gn) (eager only; base cfg under capture).

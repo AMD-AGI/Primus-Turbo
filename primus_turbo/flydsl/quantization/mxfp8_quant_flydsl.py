@@ -619,6 +619,14 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype, row_2d=False, col_2d=False):
 # => each tile lives in one group); real rows are remapped from the tight input to the row-64 /
 # col-128 output, pad rows emit zero data / E8M0=127. Output layout: see grouped_quant_mxfp8_raw.
 
+_GQD_BM, _GQD_BK, _GQD_NTH = 64, 128, 512
+
+
+def grouped_qdual_grid(M_pad_col, N):
+    """Grid (in workgroups) for ``compile_grouped_qdual``'s kernel at this runtime M_pad_col.
+    The M extent is a launch argument, so the host owns the tiling arithmetic."""
+    return (M_pad_col // _GQD_BM) * (_ceil128(N) // _GQD_BK)
+
 
 def _load_i32_at(div, idx):
     """Read one int32 scalar at element ``idx`` (runtime fx value OR python const) from an
@@ -651,34 +659,28 @@ def _col_store_res(band, base_index, tile_feat_base, gc, feat_local, num_feat, s
 
 
 def compile_grouped_qdual(
-    total_M,
     N,
     G,
-    M_pad_row,
-    M_pad_col,
     elt=None,
     out_fp8="e4m3",
     pad_extra=4,
+    col_data_band=True,
+    col_scale_band=True,
 ):
     """Compile the grouped dual-cast mxfp8 quant. Tile [bm=64 x bk=128] (bm=64 divides the
     128-aligned col-pad boundary so each tile stays in one group). Each WG computes its per-tile
-    group metadata (RB/RO/RE/RIE) inline via an O(G) offset scan (no prologue kernel). Shapes baked."""
+    group metadata (RB/RO/RE/RIE) inline via an O(G) offset scan (no prologue kernel)."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
     N_pad = _ceil128(N)
     assert N % 32 == 0
-    assert M_pad_col % 128 == 0 and M_pad_row % 64 == 0
-    # bm=64,bk=128 (512 thr): the robust grouped choice -- the bm=128 dense big-tile is neutral/
-    # worse here (the 4 per-tile scalar metadata loads need occupancy to hide, bm=128 starves it).
-    bm, bk, nth = 64, 128, 512
-    assert bm * bk == 16 * nth and 128 % bm == 0 and bm % 32 == 0 and bk % 32 == 0
-    BMv, BKv, NTHv = bm, bk, nth
+    BMv, BKv, NTHv = _GQD_BM, _GQD_BK, _GQD_NTH
+    assert BMv * BKv == 16 * NTHv and 128 % BMv == 0 and BMv % 32 == 0 and BKv % 32 == 0
     HALF = NTHv // 2
     PAD_L = BKv + pad_extra
     LMASK = N_pad != N
     NBK = N_pad // BKv
-    NBM = M_pad_col // BMv
     NKB = BKv // 32
     NMB = BMv // 32
     DWPC = BMv // 4
@@ -686,11 +688,10 @@ def compile_grouped_qdual(
     CW_ITERS_V = LDSC_DW // 4 // NTHv
     assert DWPC % 4 == 0
     SCALEN_ROW = N_pad // 32
-    SCALEN_COL = M_pad_col // 32
     # Transposed-store re-base: cheap feature-band when the i32 voffset (< BKv*stride) can't
     # overflow, else per-feature-row divergent (waterfalls) for any size. See _col_store_res.
-    COL_DATA_BAND = BKv * M_pad_col < (1 << 31)
-    COL_SCALE_BAND = BKv * SCALEN_COL < (1 << 31)
+    COL_DATA_BAND = col_data_band
+    COL_SCALE_BAND = col_scale_band
 
     @flyc.kernel(known_block_size=[NTHv, 1, 1])
     def kern(
@@ -704,6 +705,9 @@ def compile_grouped_qdual(
         GR: fx.Tensor,  # OUT: 64-padded per-group offs (int64 [G+1])
         LC: fx.Tensor,  # OUT: 128-padded per-group lens (int64 [G])
         GC: fx.Tensor,  # OUT: 128-padded per-group offs (int64 [G+1])
+        m_pad_row: fx.Int32,  # rows of Qr / ASp (64-padded M extent)
+        m_pad_col: fx.Int32,  # cols of AtQd (128-padded M extent)
+        scalen_col: fx.Int32,  # cols of AtSp = m_pad_col // 32
     ):
         I32 = fx.Int32
         BF = elt.ir_type
@@ -721,7 +725,7 @@ def compile_grouped_qdual(
         ldsc = sm.ldsc
         t = fx.thread_idx.x
         pid = fx.block_idx.x
-        br, bkc = _decode_pid(pid, I32(NBK), I32(NBM), False)
+        br, bkc = _decode_pid(pid, I32(NBK), None, False)
         base_m = br * I32(BMv)
 
         # ---- per-tile group metadata computed INLINE (no pad/meta prologue kernels):
@@ -834,9 +838,7 @@ def compile_grouped_qdual(
             inv = F32(1.0) / fm.exp2(ep.to(F32))
             # Re-base Qr at this tile's output row so the i32 voffset spans only the tile
             # (base-0 row_out*N_pad overflows once M_pad_row*N_pad > 2^31).
-            rqr = make_row_band_resource(
-                bo.extract_base_index(Qr), rowbase_out, I32(M_pad_row), I32(N_pad), 1
-            )
+            rqr = make_row_band_resource(bo.extract_base_index(Qr), rowbase_out, m_pad_row, I32(N_pad), 1)
             words = []
             for wi in range_constexpr(8):
                 qf = chunks[wi] * inv
@@ -852,7 +854,7 @@ def compile_grouped_qdual(
             kcol = bkc * I32(BKv // 32) + kb
             # Row scale byte matrix [M_pad_row, SCALEN_ROW]: same re-base at rowbase_out.
             rasp = make_row_band_resource(
-                bo.extract_base_index(ASp), rowbase_out, I32(M_pad_row), I32(SCALEN_ROW), 1
+                bo.extract_base_index(ASp), rowbase_out, m_pad_row, I32(SCALEN_ROW), 1
             )
             e8b = _e8_or_one(amax, ep)
             bo.buffer_store(
@@ -898,7 +900,7 @@ def compile_grouped_qdual(
                 gc,
                 c,
                 I32(N),
-                I32(SCALEN_COL),
+                scalen_col,
                 mcol,
             )
             bo.buffer_store(
@@ -928,7 +930,7 @@ def compile_grouped_qdual(
                 gc,
                 cc,
                 I32(N),
-                I32(M_pad_col),
+                m_pad_col,
                 base_m + dwi0 * I32(4),
             )
             bo.buffer_store(
@@ -951,12 +953,15 @@ def compile_grouped_qdual(
         GC: fx.Tensor,
         LR: fx.Tensor,
         LC: fx.Tensor,
+        m_pad_row: fx.Int32,
+        m_pad_col: fx.Int32,
+        scalen_col: fx.Int32,
+        grid: fx.Int32,
         stream: fx.Stream,
     ):
         # Single kernel: per-tile group metadata computed inline (no pad/meta prologue),
         # the pid==0 WG emits the padded lens/offs outputs (LR/GR/LC/GC).
-        grid = NBM * NBK
-        kern(X, Qr, ASp, AtQd, AtSp, GO, LR, GR, LC, GC).launch(
+        kern(X, Qr, ASp, AtQd, AtSp, GO, LR, GR, LC, GC, m_pad_row, m_pad_col, scalen_col).launch(
             grid=(grid, 1, 1), block=(NTHv, 1, 1), stream=stream
         )
 
@@ -998,6 +1003,7 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     N_pad = _ceil128(N)
     M_pad_row = ((total_M + G * 64) + 63) // 64 * 64
     M_pad_col = ((total_M + G * 128) + 127) // 128 * 128
+    grid = grouped_qdual_grid(M_pad_col, N)
     out_fp8 = "e5m2" if out_dtype == torch.float8_e5m2 else "e4m3"
 
     # Padded per-group lens/offs are filled ON-DEVICE by the quant kernel (no host torch launches).
@@ -1019,16 +1025,26 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     lr = lens_row.view(torch.int32)
     lc = lens_col.view(torch.int32)
 
-    key = (total_M, N, G, M_pad_row, M_pad_col, x.dtype, out_dtype)
+    scalen_col = M_pad_col // 32
+    col_data_band = _GQD_BK * M_pad_col < (1 << 31)
+    col_scale_band = _GQD_BK * scalen_col < (1 << 31)
+    key = (N, G, x.dtype, out_dtype, col_data_band, col_scale_band)
     comp = _GROUPED_QDUAL_CACHE.get(key)
     stream = torch.cuda.current_stream()
     if comp is None:
         launch = compile_grouped_qdual(
-            total_M, N, G, M_pad_row, M_pad_col, elt=in_elt(x.dtype), out_fp8=out_fp8
+            N,
+            G,
+            elt=in_elt(x.dtype),
+            out_fp8=out_fp8,
+            col_data_band=col_data_band,
+            col_scale_band=col_scale_band,
         )
-        comp = _flyc.compile(launch, x, Qr, ASp, AtQd, AtSp, go, gr, gc, lr, lc, stream)
+        comp = _flyc.compile(
+            launch, x, Qr, ASp, AtQd, AtSp, go, gr, gc, lr, lc, M_pad_row, M_pad_col, scalen_col, grid, stream
+        )
         _GROUPED_QDUAL_CACHE[key] = comp
-    comp(x, Qr, ASp, AtQd, AtSp, go, gr, gc, lr, lc, stream)
+    comp(x, Qr, ASp, AtQd, AtSp, go, gr, gc, lr, lc, M_pad_row, M_pad_col, scalen_col, grid, stream)
 
     e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
     rowwise_scale = ASp.view(torch.uint8)[: M_pad_row * (N_pad // 32)].view(M_pad_row, N_pad // 32).view(e8)
