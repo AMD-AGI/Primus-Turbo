@@ -1324,6 +1324,13 @@ def build_flash_attn_bwd_dkdv_module(
     # and per-work-group work are otherwise untouched, so dQ/dK/dV stay bitwise identical.
     qsp_lo=0,
     n_qsp=None,  # None = all q_split subsets (single whole-band dispatch)
+    # bat_lo: dispatch only batches [bat_lo, bat_lo+batch_size), where batch_size is the
+    # LAUNCH argument. A batch is a whole slab of every workspace this kernel writes (dQ
+    # partials stride by band then batch, dk/dv slots carry batch as their own axis) and of
+    # every tensor it reads, so restricting it is a pure grid restriction -- no tensor has to
+    # be sliced, which is what an SBHD seq-major layout cannot do. dQ/dK/dV stay bitwise
+    # identical to the whole-batch launch. See _fused_pipelined's tail cut.
+    bat_lo=0,
     # flat_wg: work-group size, and on this part it is really a REGISTER-FILE choice.
     # 512 (8 waves) puts two waves on every SIMD, capping each at 256 architected
     # registers; 256 (4 waves, one per SIMD) opens the whole 512-register file to a
@@ -1374,7 +1381,9 @@ def build_flash_attn_bwd_dkdv_module(
     assert q_split >= 1
     N_QSP = Q_SPLIT if n_qsp is None else n_qsp
     QSP_LO = qsp_lo
+    BAT_LO = int(bat_lo)
     assert 1 <= N_QSP <= Q_SPLIT and 0 <= QSP_LO <= Q_SPLIT - N_QSP
+    assert BAT_LO == 0 or (batch_size is not None and 0 < BAT_LO < batch_size)
     flat_work_group_size = flat_wg
     NUM_WAVES = flat_work_group_size // WARP_SIZE
     BLOCK_SIZE = flat_work_group_size
@@ -2001,6 +2010,11 @@ def build_flash_attn_bwd_dkdv_module(
                 split_idx = fx.Index(QSP_LO)
             kv_tile_idx = _rest % num_kv_tiles
             batch_idx = _rest // num_kv_tiles
+        # A batch sub-range launch keeps the decode above and shifts its result: the grid
+        # carries the COUNT (the launch's batch_size) and this carries the base, so every
+        # address downstream is the one the whole-batch launch would have formed. See bat_lo.
+        if const_expr(BAT_LO):
+            batch_idx = batch_idx + fx.Index(BAT_LO)
         # SHADOW seq_len_q_v/k_v to the per-segment length so downstream base/SRD/loop-bounds follow the segment (byte-identical when uniform; grid tiles were fixed from max above).
         if const_expr(varlen):
             _seg = batch_idx
@@ -4689,6 +4703,13 @@ _DQ_PIPE_AREA_FLOOR = 2048 * 2048
 # already above the threshold flat. The profiler names the mechanism rather than leaving it
 # to the wall: under the flat rule B=1 issues ONE dqred launch against B=2's three, so none
 # of its 0.74 ms of fold can hide under a following body and all of it is exposed.
+# A chunk under the rule is not a shape without a pipeline: the rule is a chunk WIDTH, and
+# merging subsets widens the chunk until it clears (see _dq_pipe_qsp). d64_hq64_b2 is the one
+# scored cell that lands there -- 32 bands * 8 kv-heads * 2 batches = 512 work-groups a subset
+# against the 1024 the 256-row band asks -- and it was taking the unpiped path with its WHOLE
+# fold exposed. At two subsets a chunk it clears the same rule and reads 2.9060 / 2.8879
+# against 2.9489 / 2.9390 unpiped (own process, min of 40, palindrome), -1.6%, bitwise equal
+# to the unpiped result on dq/dk/dv.
 _DQ_PIPE_FILLS = 4
 # Queues the pipeline's chunks alternate across. One queue serialises them, so every chunk
 # boundary drains the CU array before the next chunk starts filling it, and at one
@@ -4699,6 +4720,29 @@ _DQ_PIPE_FILLS = 4
 # Whether the last SPLIT chunk's dQ reduce stays on the caller's stream, so the dk/dv slot
 # reduce the caller enqueues next runs behind it rather than beside it. See _fused_pipelined.
 _DQ_TAIL_SERIAL = True
+# Fills of the CU array one piece of a BATCH-CUT tail must be worth. The last chunk's fold is
+# the one with no next chunk over it, and it is measured pure exposure -- 0.347 ms on
+# d128_hq64_b2, 0.275 on gptoss_full, bytes that the hidden folds pay too, so the position is
+# the whole cost. Cutting that chunk on the BATCH axis hands all but its last piece a body to
+# hide under, and unlike a finer q_split cut it re-stages nothing: the pieces own different
+# batches, so the work-group count, the K/V each stages and the dk/dv slot traffic are what the
+# uncut tail had, and the only new cost is one dispatch boundary. Priced first on the q_split
+# axis, where the same structure comes with the re-staging attached: at D128 halving the tail
+# alone is worth -0.097 ms (plan [2,2,2,1,1] 6.4300 against [2,2,2,2] 6.5269 at q_split=8, own
+# process, min of 40, palindrome) while raising q_split 4 -> 8 to get it costs +0.213.
+#
+# Taken at the WIDE band only, and measured that way from both sides (own process, min of 40,
+# palindrome-ordered, two readings an arm inside one batch): gptoss_full 5.6338 / 5.6913 cut
+# against 5.7656 / 5.7330 uncut, -1.5% with both readings below both, while the same cut at
+# the 128-row band is the other sign -- d128_hq64_b2 6.286 / 6.3857 against 6.3233 / 6.2640
+# and d128_hq32_b2 3.4524 / 3.4296 against 3.3268 / 3.3829, +2.6% with both above both. The
+# dispatch boundary is not what separates them: with the fold OFF, d128_hq64_b2 reads 5.4999
+# at one chunk, 5.4223 at two and 5.4725 at four, i.e. a D128 boundary prices at ~0 in the
+# body. What is left is the term this file measures everywhere else -- a unit of body absorbs
+# 1/(2*BLOCK_KV) of partial bytes, twice as much to pay at D128 -- so moving tail bytes from
+# EXPOSED to HIDDEN buys back less than it costs the body it now runs under. Same gate, and
+# for the same reason, as the pair merge in _pipe_chunks.
+_DQ_TAIL_CUT_FILLS = 2
 # Slices a HIDDEN dQ fold is issued in (see _fold_slices). What a hidden fold costs is not its
 # own latency but what it does to the body it runs under, and that is paid per BURST rather
 # than per byte, so the same bytes handed to the fabric in narrow slices cost the body less.
@@ -4744,8 +4788,46 @@ def _dq_pipe_fills(block_kv):
     return max(1, _DQ_PIPE_FILLS * block_kv // 256)
 
 
-def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False):
+def _dq_pipe_qsp(wgs, q_split, block_kv):
+    """q_split subsets one chunk must hold to be worth the fill rule; 0 = do not pipe.
+
+    ``wgs`` is what ONE subset dispatches, ``n_bands*Hkv*B``. The rule (_DQ_PIPE_FILLS) is a
+    chunk WIDTH, and a shape whose one-subset chunk falls under it is not out of reach of the
+    pipeline: merging subsets widens the chunk until it clears, which is a plan the same rule
+    already licenses -- the alternative is not a narrow chunk but NO chunk, i.e. the whole fold
+    exposed on the caller's stream. Widening stops at two chunks, below which there is nothing
+    left for a fold to hide under.
+    """
+    floor = _dq_pipe_fills(block_kv) * _NUM_CU
+    per = 1
+    while per * 2 <= q_split and wgs * per < floor:
+        per *= 2
+    return 0 if wgs * per < floor and per * 2 > q_split else per
+
+
+def _dq_tail_cut(B, n_bands, Hkv, n_qsp, block_kv):
+    """Batch pieces the exposed tail chunk is dispatched in (see _DQ_TAIL_CUT_FILLS).
+
+    A piece holds ``n_bands*Hkv*(B/pieces)*n_qsp`` work-groups; halving keeps going while a
+    piece is still worth _DQ_TAIL_CUT_FILLS fills, and while the batch divides. Two fills is
+    also where it stops paying from below: at one fill gptoss_full's tail cuts into four
+    256-work-group pieces and reads 6.6013 / 6.5740 against 5.6866 / 5.6465 at two, +16%.
+    """
+    if _DQ_TAIL_CUT_FILLS <= 0 or block_kv < 256:
+        return 1
+    floor = _DQ_TAIL_CUT_FILLS * _NUM_CU
+    cut = 1
+    while cut * 2 <= B and n_bands * Hkv * (B // (cut * 2)) * n_qsp >= floor:
+        cut *= 2
+    return cut
+
+
+def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False, wgs=None):
     """Pipeline stages as (batch, qsp_lo, n_qsp), in dispatch order; batch None = all.
+
+    ``wgs`` is what ONE q_split subset dispatches (``n_bands*Hkv*B``), which is what decides
+    how many subsets a chunk has to hold to be worth the fill rule; None keeps the one-subset
+    plans below. See _dq_pipe_qsp.
 
     A split owns the q blocks with (q/BLOCK_Q) % q_split == split only if every band
     starts on a q_split boundary; otherwise the split -> q-block map depends on the band
@@ -4827,7 +4909,23 @@ def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False):
     # body absorbs is 1/(2*BLOCK_KV), so halving the band doubles the over-subscription and
     # that one window stops covering. The equal cut pays one more boundary (~0.11 ms) for it
     # and keeps the same one-subset tail.
+    # The SPLIT axis is what an SBHD chunk cuts, and the batch axis is not an alternative to it
+    # even though bat_lo makes one dispatchable. A whole-batch-per-chunk plan gives the better
+    # BODY -- one (batch, kv-head) per XCD instead of four, worth gptoss_full 5.229 against
+    # 5.352 with the fold off -- and then loses all of it and more at the fold, because a chunk
+    # that owns a whole batch owns a whole batch of PARTIALS too: gptoss_full 9.62 against
+    # 5.68 (+70%) and d64_hq64_b2 4.23 against 2.94 (+44%), neither of which the slicing
+    # explains (unsliced reads the same 4.19). Cutting BOTH axes at once to keep the subset's
+    # fold cadence with the batch's locality is worse still, +15% on gptoss_full at eight
+    # (batch pair, subset) chunks. The batch axis pays only where the alternative is exposure
+    # rather than a different chunk -- i.e. on the tail, see _dq_tail_cut.
     if sbhd:
+        # A shape whose one-subset chunk is under the fill rule takes the widest plan the rule
+        # does license instead of no pipeline at all (see _dq_pipe_qsp). Equal chunks: the two
+        # windows a merge trades between are the same width here, so there is nothing to trade.
+        per = _dq_pipe_qsp(wgs, q_split, block_kv) if wgs else 1
+        if per > 1:
+            return [(None, s, min(per, q_split - s)) for s in range(0, q_split, per)]
         if q_split < 4 or block_kv < 256:
             return [(None, s, 1) for s in range(q_split)]
         return [(None, 0, 1), (None, 1, 2)] + [(None, s, 1) for s in range(3, q_split)]
@@ -4842,7 +4940,7 @@ def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False):
     )
 
 
-def _fold_slices(B, Sq, q_split, lo, n, fold_bytes):
+def _fold_slices(B, Sq, q_split, lo, n, fold_bytes, bat_lo=0, n_bat=None):
     """One hidden dQ fold as ``(batch kwargs, qsp)`` slices, at most _DQ_FOLD_SLICES of them.
 
     The BATCH axis first, since a batch owns a contiguous slab of every band's partial row and
@@ -4859,14 +4957,19 @@ def _fold_slices(B, Sq, q_split, lo, n, fold_bytes):
     fall under _DQ_FOLD_SLICE_BYTES: past that the slices are the same rows and rounds but
     too few bytes each to pay for their own ramp (see the constants).
     """
-    qs = [(q_split, lo, n)]
+    nb = B if n_bat is None else n_bat
+    # ``n_qsp=None`` is "all q_split subsets"; name the count so a finer modulus can halve it.
+    qs = [(q_split, lo, q_split if n is None else n)]
     while (
-        B * len(qs) * 2 <= _DQ_FOLD_SLICES
+        nb * len(qs) * 2 <= _DQ_FOLD_SLICES
         and _qsp_cuttable(Sq, q_split * len(qs) * 2)
-        and fold_bytes >= _DQ_FOLD_SLICE_BYTES * B * len(qs) * 2
+        and fold_bytes >= _DQ_FOLD_SLICE_BYTES * nb * len(qs) * 2
     ):
         qs = [(q * 2, l + j * q, m) for q, l, m in qs for j in (0, 1)]
-    bats = [dict(bat_lo=b, n_bat=1) for b in range(B)] if B > 1 else [{}]
+    if nb > 1:
+        bats = [dict(bat_lo=bat_lo + j, n_bat=1) for j in range(nb)]
+    else:
+        bats = [{}] if n_bat is None else [dict(bat_lo=bat_lo, n_bat=1)]
     return [(bat, q) for bat in bats for q in qs]
 
 
@@ -4881,6 +4984,7 @@ def _fused_pipelined(
     Skv,
     block_kv,
     Hq,
+    Hkv,
     D,
     q_split,
     stream,
@@ -4940,7 +5044,30 @@ def _fused_pipelined(
     if side is None:
         side = torch.cuda.Stream(device=dq.device)
         _SIDE_STREAM[dq.device] = side
-    chunks = _pipe_chunks(B, q_split, block_kv, Sq, D, sbhd)
+    # A stage is (batch, qsp_lo, n_qsp, bat_lo, n_bat): the first three are the plan's, the
+    # last two the SBHD batch sub-range (None = the whole batch, see the builder's bat_lo).
+    plan = _pipe_chunks(B, q_split, block_kv, Sq, D, sbhd, wgs=(Skv // block_kv) * Hkv * B)
+    chunks = [c if len(c) == 5 else tuple(c) + (0, None) for c in plan]
+    # Cut the EXPOSED tail on the batch axis, so all but its last piece gets a body over it.
+    # Legal for SBHD without slicing a single tensor because the body takes its batch range as
+    # a compile-time base plus the grid's count (see the builder's bat_lo), and every piece
+    # folds only the rows its own body just completed -- same bands, same ascending order,
+    # same fp32 accumulator, so dQ stays bitwise what one launch produces.
+    # The plan the tail is cut out of is still the merged one, and that is now worth re-asking:
+    # the merge was chosen against an UNCUT tail, and with the cut in place gptoss_full reads
+    # 5.6392 / 5.5977 and 5.5833 / 5.6388 on the equal-wide [2,2] plan (whose two-subset tail
+    # cuts into four 512-work-group pieces) against 5.6866 / 5.6465 and 5.6619 / 5.6772 on
+    # [1,2,1], -1.0% over two batches. Left alone here because it reverses a verdict taken
+    # across more shapes than this campaign scores.
+    tail_cut = (
+        _dq_tail_cut(B, Skv // block_kv, Hkv, chunks[-1][2] or q_split, block_kv)
+        if sbhd and chunks[-1][0] is None
+        else 1
+    )
+    if tail_cut > 1:
+        b, lo, n, _, _ = chunks[-1]
+        per = B // tail_cut
+        chunks = chunks[:-1] + [(b, lo, n, j * per, per) for j in range(tail_cut)]
     nc = len(chunks)
     evs = _PIPE_EVENTS.get(nc)
     if evs is None:
@@ -4969,7 +5096,9 @@ def _fused_pipelined(
         # rest -- three quarters of a 79 us pass that used to sit wholly in front of the
         # first chunk -- runs on the side queue underneath it, which the trace confirms it
         # finishes inside (58 us against a 1354 us first chunk). Worth gptoss_full -1.03%.
-        cut_odo = odo_l.chunk is not None and nc > 1
+        # Only a SPLIT-axis plan leaves delta to cut: a batch chunk owns every q block of its
+        # own batch, so the whole q range of delta is due before the first chunk either way.
+        cut_odo = odo_l.chunk is not None and nc > 1 and chunks[0][2] not in (None, q_split)
         odo_first = odo_l.chunk(chunks[0][1], chunks[0][2]) if cut_odo else odo_l
         odo_first(o16, dof, df, B, Sq, stream)
         side.wait_stream(stream)
@@ -4977,7 +5106,7 @@ def _fused_pipelined(
             rest = chunks[0][1] + chunks[0][2]
             odo_l.chunk(rest, q_split - rest)(o16, dof, df, B, Sq, side)
             ev_delta.record(side)
-    for i, (b, lo, n) in enumerate(chunks):
+    for i, (b, lo, n, blo, nbt) in enumerate(chunks):
         if i == 1 and (per_batch or cut_odo):
             stream.wait_event(ev_delta)
         if per_batch:
@@ -4985,7 +5114,8 @@ def _fused_pipelined(
             ws_arg, nb, bat = ws_dq[0, b], 1, dict(bat_lo=b, n_bat=1)
         else:
             args = (qf, kf, vf, dof, lsef, df, wk, wv)
-            ws_arg, nb, bat = ws_dq[0, 0], B, {}
+            ws_arg, nb = ws_dq[0, 0], B if nbt is None else nbt
+            bat = {} if nbt is None else dict(bat_lo=blo, n_bat=nbt)
         # The LAST chunk's reduce is the one whose queue is a free choice: it has no next
         # chunk to hide under, so on the reduce queue it runs beside whatever the caller
         # enqueues next (the dk/dv slot fold) and on the caller's it runs in front of it.
@@ -4998,7 +5128,7 @@ def _fused_pipelined(
         # not saturate, so there the two folds genuinely do overlap and serialising them
         # costs varlen_d64_u +1.2%: that branch keeps the reduce queue.
         red_q = stream if (_DQ_TAIL_SERIAL and not per_batch and i == nc - 1) else side
-        body = dkdv_l if n is None else dkdv_l.chunk(lo, n)
+        body = dkdv_l if (not blo and n in (None, q_split)) else dkdv_l.chunk(lo, n, blo)
         body(
             *args,
             cu_ph,
@@ -5024,10 +5154,10 @@ def _fused_pipelined(
         # What a chunk's fold reads: the causal half of the bands, times the dQ image, times the
         # chunk's share of the q blocks (_reduce_dq_partials does the same accounting for the
         # whole fold). It is what floors how small _fold_slices may cut.
-        fold_bytes = (Skv // block_kv) // 2 * (B * Sq * Hq * D * 2) * (n or q_split) // q_split
+        fold_bytes = (Skv // block_kv) // 2 * ((nbt or B) * Sq * Hq * D * 2) * (n or q_split) // q_split
         slices = (
-            _fold_slices(B, Sq, q_split, lo, n, fold_bytes)
-            if not per_batch and n is not None and i < nc - 1
+            _fold_slices(B, Sq, q_split, lo, n, fold_bytes, bat_lo=blo, n_bat=nbt)
+            if not per_batch and (n is not None or nbt is not None) and i < nc - 1
             else [(bat, (q_split, lo, n))]
         )
         for bat_kw, qsp in slices:
@@ -5246,12 +5376,14 @@ def _get_bwd(
         dkdv_l = build_flash_attn_bwd_dkdv_module(**dkdv_kw)
         _dkdv_subs: dict = {}
 
-        def _dkdv_chunk(qsp_lo, n_qsp):
-            """Same body, dispatching only the q_split sub-range (see _fused_pipelined)."""
-            sub = _dkdv_subs.get((qsp_lo, n_qsp))
+        def _dkdv_chunk(qsp_lo, n_qsp, bat_lo=0):
+            """Same body, dispatching only the q_split / batch sub-range (see _fused_pipelined)."""
+            sub = _dkdv_subs.get((qsp_lo, n_qsp, bat_lo))
             if sub is None:
-                sub = build_flash_attn_bwd_dkdv_module(qsp_lo=qsp_lo, n_qsp=n_qsp, **dkdv_kw)
-                _dkdv_subs[(qsp_lo, n_qsp)] = sub
+                sub = build_flash_attn_bwd_dkdv_module(
+                    qsp_lo=qsp_lo, n_qsp=n_qsp, bat_lo=bat_lo, **dkdv_kw
+                )
+                _dkdv_subs[(qsp_lo, n_qsp, bat_lo)] = sub
             return sub
 
         dkdv_l.chunk = _dkdv_chunk
@@ -5659,7 +5791,7 @@ def flydsl_varlen_backward(
                 q_split > 1
                 and (block_kv % (q_split * _BWD_BLOCK_Q) == 0 or _qsp_absolute(D, block_kv, q_split))
                 and _qsp_cuttable(Sq, q_split)
-                and n_bands * Hkv * B >= _dq_pipe_fills(block_kv) * _NUM_CU
+                and _dq_pipe_qsp(n_bands * Hkv * B, q_split, block_kv) > 0
             )
             if sbhd
             else B > 1
@@ -5732,6 +5864,7 @@ def flydsl_varlen_backward(
             Skv,
             block_kv,
             Hq,
+            Hkv,
             D,
             q_split,
             st,
