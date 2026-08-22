@@ -40,8 +40,32 @@ _LOG2E = host_math.log2(host_math.e)
 # Warp specialisation (splitting the head-step across a wave pair by role) is
 # register-walled: each role's live set needs more than half the 512-dword pool, so the
 # pair cannot co-reside two waves per SIMD, and no register donor closes the gap.
-# q rows one dkdv work-group folds per q-loop step. 128 is spill-free and cheaper per
-# unit of work, but loses on the wall due to the wider band's dS ring rendezvous cost.
+# q rows one dkdv work-group folds per q-loop step. 128 halves the (band, q-block) trips
+# at an identical MFMA count per unit of work, and the halving itself measures -6.5% at
+# l8b_b2 -- but every register form that fits costs more than the halving pays, so the item
+# is FUNDING-bound, not mechanism-bound. Probe it with `_probe_bwdcfg.py`'s `bq<N>` arm:
+# `kw:block_q=` desyncs the fold from the body and reports det=false, because six host
+# planners capture this constant as a def-time default.
+#
+#   form (all at l8b_b2, spill/scratch from 21_final_isa.s)        dw   spill   verdict
+#   g3_defer=0                                                    512   268 B   over
+#   g3_defer=0,g3_kreg=0                                          500     0     over
+#   g3_defer=0,g3_kreg=0,g2d=1                                    498     0     g2d frees 2
+#   g3_defer=0,kv_halves=2                                        512   156 B   over
+#   g3_defer=0,g3_kreg=0,q_pref=0                                 438     0     donors +25%
+#   g3_defer=0,g3_kreg=0,kv_halves=2                              447     0     halving = 0
+#
+# The last row is the only form that clears the 464 co-residency line while KEEPING the
+# Q_PREF staging, and it collects none of the prize: 4.3251 ms against 4.3280 for the same
+# three donors at BLOCK_Q=64 (min of 40, palindrome, same-binary control spread 0.32%), so
+# the trip halving delivers -0.07% instead of -6.5%. `kv_halves=2` halves NT, which makes
+# every q fragment feed two passes instead of one -- 2832 `ds_read_b64_tr_b16` against 1792
+# and 13614 instructions against 11212 -- so it does not fund BLOCK_Q=128, it SPENDS it.
+# => the 36 dwords still have to come from somewhere that does not touch the q-side read
+# count. The one named, never-dumped source is a half-width Q_PREF stage (`_qdo_issue`
+# issues NUM_DMA_Q*2 loads of 4 dwords = 32 in flight at BQ=64 and 64 at BQ=128, so
+# issuing half of them a hook later is worth ~32), which lands 500 -> ~468 and is then
+# inside `red:vec=4`'s 480 line at the +0.1% that arm costs a 470-dword body.
 _BWD_BLOCK_Q = 64
 
 # dkdv MFMA-accumulator AGPR forcing (amdgpu-agpr-alloc): only pays off once the body
@@ -56,6 +80,9 @@ _WSQ_BAND_PAD = 1 << 20
 _WSQ_BAND_ILV = 8
 # DPP quad_perm:[1,0,3,2], swaps a value between the two halves of every lane pair.
 _QUAD_SWAP = 0xB1
+# LLVMSchedGroupMask::VALU. flydsl's rocdl module exports the MFMA / DS / VMEM masks but
+# not this one; the forward kernel drives its exp and VALU blocks with the same value.
+_SCHED_VALU_MASK = 0x002
 # gfx950: 8 XCDs each with a private L2 slice, picked by block_id % _NUM_XCD.
 _NUM_XCD = 8
 # gfx950 compute units. Only used to ask whether a dispatch is narrower than the machine.
@@ -263,10 +290,15 @@ def _mc_clear(mt, nt):
 
 
 def _mc_diag(mt, nt):
-    """Mask class of a 16-tile on the diagonal wave: its kv 16-tile nt and q 16-tile mt
-    start on the same row, so nt > mt is entirely above the edge and nt < mt entirely
-    below it, whatever the causal offset (see MASK_ALIGN)."""
-    return 0 if nt < mt else (1 if nt == mt else 2)
+    """Mask classes of the DIAGONAL wave, whose first kv row is the q block's first row.
+
+    Its kv 16-tile nt then starts exactly on q 16-tile mt = nt: above that tile it is
+    entirely past the causal edge, below it entirely under the edge, whatever the causal
+    offset (see MASK_ALIGN). Only the one tile per row where the two coincide needs the
+    compare/select set.
+    """
+    _d = nt - mt
+    return 0 if _d < 0 else (1 if _d == 0 else 2)
 
 
 def dtype_to_elem_type(dtype_str):
@@ -1215,6 +1247,25 @@ def build_flash_attn_bwd_dkdv_module(
     # the only arm that prices the store stream's VOLUME. Aliasing the bands onto one slab
     # (wsq_ring) shrinks the FOOTPRINT instead and so prices cache residency, not volume.
     wsq_nrec=None,
+    # wsq_rmw: PROBE (dQ/dK/dV stay EXACT -- the value read is pinned live and discarded).
+    # A slot-indexed dQ partial workspace (one slot per resident work-group instead of one
+    # per kv band, so nsplits falls from Skv/BLOCK_KV to that over the bands a slot owns)
+    # does NOT remove bytes. Every (band, q row) pair still has to be written, so the
+    # writes stay put and the fold's reads fall by 1 - 1/k only because the body now READS
+    # each slot back once per extra band it owns: the scheme moves (1 - 1/k) of one read
+    # stream from the fold kernel into the body and its whole net is
+    #     (1 - 1/k) * |partials| * (fold read ms/GB - body read ms/GB).
+    # The first rate is measured and linear with no fixed part (0.086 ms/GB, see
+    # _reduce_dq_partials); the second has never been measured on this body, and it is the
+    # only unknown in front of the scheme. This arm issues exactly that read -- same
+    # address as the store, same buffer, ahead of the MFMA run so its latency lands in the
+    # same shadow a real read-modify-write C-init would use -- at k -> infinity, so the
+    # slope is read off ONE arm. Read it with the fold OFF (`nored`): the loads cost
+    # registers, and with the fold on that cost is a co-residency eviction, not the stream.
+    wsq_rmw=False,
+    # kv_refetch: PROBE (dQ/dK/dV stay EXACT), N extra re-reads of the band's owned K/V
+    # packs per q block -- the one cost a q-outer loop nest would add. See KV_REFETCH.
+    kv_refetch=0,
     # band_span: >0 = this launch owns ONE GROUP of that many kv bands (see _band_span_for).
     # K/V/DK/DV still span the whole kv axis; the group's first kv row arrives as a device
     # scalar in the CuSeqKv slot, and seq_len_k is the group's own extent, so the grid, the
@@ -1261,6 +1312,8 @@ def build_flash_attn_bwd_dkdv_module(
     g3_st_at=None,
     g3_st_n=None,
     g3_sb=None,
+    g3_at=None,  # _hs_hook position of the deferred GEMM3 run. See G3_AT.
+    g3_valu=None,  # VALU per MFMA in the GEMM3 co-execution pipeline. See G3_VALU.
     # g2_half: flush GEMM2 per q-half instead of once per q-loop trip (None = fused only).
     # It shortens the pack live ranges, which is what lets BLOCK_Q grow past 64. See G2_HALF.
     g2_half=None,
@@ -1365,6 +1418,8 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_ILV = int(wsq_ilv)
     WSQ_RING = int(wsq_ring)
     WSQ_NREC = max(1, int(wsq_nrec or 1))
+    WSQ_RMW = bool(wsq_rmw)
+    KV_REFETCH = max(0, int(kv_refetch or 0))
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
     # body has to still hold, so it rides the plain full-causal path only -- square SBHD, or
     # ragged (whose bands are per segment).
@@ -1564,30 +1619,50 @@ def build_flash_attn_bwd_dkdv_module(
     # MASK_SKIP: let a wave sit out a diagonal q-block whose kv rows it cannot see. Its
     # P and dS are zero there, so this only removes work -- the output is bitwise equal.
     MASK_SKIP = window_left < 0
-    # MASK_ALIGN: the diagonal q-block's THREE wave classes, resolved per wave instead of
+    # MASK_ALIGN: the diagonal q-block's wave classes, resolved per wave instead of
     # masking every live wave's whole 16-tile set.
     #
     # The masked q-block's first row and the band's first kv row both come off kv_start
     # (_q_loop_start = kv_start - causal_offset + m*BLOCK_Q, kv_row_wave = kv_start +
-    # w*ROWS_PER_WAVE_KV), so their difference is (m - w)*BLOCK_Q with the causal offset
-    # cancelling -- an exact multiple of ROWS_PER_WAVE_KV when the two block sizes match.
-    # A wave is therefore in exactly one of three states, with no partially-aligned case:
-    #   w < m  every kv row is at or below the causal edge -> NO mask anywhere
-    #   w == m the diagonal wave, its (mt, nt) 16-tiles split by nt vs mt alone:
-    #          nt > mt fully masked (P = dS = 0), nt == mt masked, nt < mt clear
-    #   w > m  dead (the existing zero-publishing arm)
-    # This is worth three arms because the four waves are barrier-locked into the same
+    # w*ROWS_PER_WAVE_KV), so their difference is m*BLOCK_Q - w*ROWS_PER_WAVE_KV with the
+    # causal offset cancelling. That is an exact multiple of ROWS_PER_WAVE_KV whenever the
+    # wave's kv extent DIVIDES BLOCK_Q -- not only when the two are equal -- so a wave is
+    # always in exactly one of BLOCK_Q/R + 2 states, with no partially-aligned case:
+    #   kvw + R <= q_first          every kv row is at or below the causal edge -> NO mask
+    #   kvw == q_first + dn*R       aligned dn wave-rows above the block's first row: its
+    #                               (mt, nt) 16-tiles split by nt + dn*NT vs mt alone
+    #                               (fully masked above, masked on, clear below)
+    #   kvw > q_last                dead (the existing zero-publishing arm)
+    #
+    # ★ So the R == BLOCK_Q gate below is SUFFICIENT, NOT NECESSARY -- and the general form
+    # was BUILT AND MEASURED at D128 (BLOCK_Q/R = 2, so a clear arm plus TWO aligned arms)
+    # and is a large LOSS, so the gate stays. l70b_b2, min of 40, one cell per process,
+    # palindrome, same-binary control (spread 0.21% and 0.5%):
+    #   two aligned arms, unfunded    6.8482 against 6.3283   +8.2%   (473 dwords)
+    #   the same, red:vec=4 funded    6.8885 against 6.5325   +5.4%   (line moved to 480)
+    # Both legs separated 3/3, and the funded leg is the one that prices the SPECIALISATION
+    # rather than the co-residency it evicts: paying the reduce wave back still leaves +5.4%.
+    # The cost is code REPLICATION, which the D64 reading below cannot see because one
+    # aligned arm needs no extra copy of the region: three arms take the dkdv body from
+    # 10220 to 14487 instructions and 2560 to 3968 static MFMA (+42% / +55%) while each wave
+    # still executes ONE arm, so the DYNAMIC saving stays bounded by the 3.1% masked-trip
+    # share and the static cost is not. At D128 each arm's region is twice as wide as at
+    # D64, which is what inverts the sign. The next thing to try on this axis is an arm
+    # count that does NOT grow with BLOCK_Q/R -- one aligned arm plus a masked fallthrough
+    # for the rest -- priced on the ISA first, since this form spent 4267 instructions on a
+    # <=3.1% dynamic prize.
+    # At D64 this is worth an arm each because the four waves are barrier-locked into the same
     # head-step: the q-block costs the MAX over waves, and before this every live wave paid
     # the full 64-element mask compare/select set plus the MFMAs, exp2 chain and packs of
-    # six 16-tiles that can only be zero. Per head-step the diagonal wave's in-branch MFMAs
-    # go 128 -> 88 and the block's critical path 675 -> 560 instructions (560 = exactly what
+    # 16-tiles that can only be zero. At D64 the diagonal wave's in-branch MFMAs go
+    # 128 -> 88 and the block's critical path 675 -> 560 instructions (560 = exactly what
     # an interior q-block costs, so the below waves set the floor), or -> 430 when the
     # diagonal wave is the only live one. dK/dV/dQ stay BITWISE equal to the single-arm
     # form (verified both head dims): every removed MFMA had an exactly-zero B operand.
     # The clamp in _kv_first_q (kv_start < causal_offset, i.e. a rectangular shape's lowest
     # bands) is the one case that breaks the exact multiple, hence square-only; BAND_LIFT
     # and the FQ_PAIR half-tile map re-base q the same way and are excluded for the same
-    # reason, and D128's ROWS_PER_WAVE_KV is 32 against BLOCK_Q 64, so it keeps one arm.
+    # reason.
     MASK_ALIGN = (
         MASK_SKIP
         and (square and not varlen and not BAND_SPAN and not FQ_PAIR)
@@ -1728,13 +1803,60 @@ def build_flash_attn_bwd_dkdv_module(
     # while the body ran eight waves per work-group and loses at four: the extra slot's
     # registers and LDS have no sibling MFMA run left to hide the retired fences under.
     G3_DEFER = bool(g3_defer)
-    # G3_AT: _hs_hook position of the deferred GEMM3. 0 = the head-step top; 3*pks+1 would
-    # put its MFMAs on q-half pks's exp2 chain, the body's one bare-VALU window. Only the
+    # G3_AT: _hs_hook position of the deferred GEMM3. 0 = the head-step top; 3*pks+1 puts
+    # its MFMAs on q-half pks's dS/pack window, the body's one bare-VALU run. Only the
     # DEFERRED path has a call to move, and at D64 deferring is itself gptoss_full +3.5%
     # (5.931 against 5.731, three palindrome rounds) -- moving it to position 1 on top of
-    # that is +5.0%. So the exp window has to be filled from the undeferred emission point,
-    # not from here.
-    G3_AT = 0
+    # that is +5.0%, which is why the D64 exp window is filled from the undeferred emission
+    # point instead. At D128 the deferred path IS the deployed one, and there the move is
+    # priced on the ISA rather than inherited from D64: see G3_VALU for what the position
+    # buys and what it costs.
+    G3_AT = 0 if g3_at is None else int(g3_at)
+    # G3_VALU: request an MFMA<->VALU co-execution pipeline (sched_group_barrier group 1,
+    # `(MFMA 1, VALU n)` repeated) over the window that holds GEMM3's MFMA run and the
+    # dS/pack VALU block. GEMM3 is the only matrix work in the head-step that depends on
+    # nothing this q-half computes, so it is the only run those packs can hide under; the
+    # in-half alternatives are all measured losses (see _half_gemm1's docstring). 0 = off,
+    # which is byte-identical. The forward kernel drives its exp/VALU blocks the same way
+    # (`_sched_barrier_pairs`); the backward has only ever named MFMA and DS_READ, so its
+    # VALU has always been free-floating and PMC measures it 5.6% co-executed against the
+    # exp segment's 34.3%.
+    #
+    # BUILT AND MEASURED at D128, l70b_b2, and the pipeline WORKS while the wall does not.
+    # ISA, fraction of the body's VALU that sits inside an MFMA run (gap threshold 8):
+    #
+    #   G3_AT=0 (deployed)  462 dw  60.3% hidden    G3_AT=4          462 dw  61.8% hidden
+    #   G3_AT=1             466 dw  58.8%           G3_AT=1,G3_VALU=3 472 dw  57.7%
+    #
+    # so the position DOES deal the packs out under the run -- 553 of the 1182 pack/multiply
+    # instructions move inside one, `SQ_INSTS_VALU` and `SQ_INSTS_MFMA` unchanged, spill 0.
+    # The wall goes the other way on every arm, min of 40, strict palindrome, same-binary
+    # control spread 0.53% (fold on) / 0.36% (fold off):
+    #
+    #   fold on   G3_AT=4 6.4837 against 6.3212   +2.6%      G3_AT=4,G3_ST_AT=5  +11.9%
+    #   fold off  G3_AT=4 5.5473 against 5.4498   +1.8%      (so it is not co-residency)
+    #   gptoss_full D64 (undeferred path, unreachable)       byte-identical, 5.7749
+    #
+    # Mechanism, from the dumps: GEMM3's run is not idle time the packs can be poured into.
+    # Its 32 MFMAs are already 1:1 interleaved with the 32 `ds_read_b64_tr_b16` that feed
+    # them, so a `(MFMA 1, VALU n)` request competes with the DS_READ pairing rather than
+    # filling a hole, and the pack block's own producers then wait one whole GEMM3 pass.
+    # The exp segment hides 34.3% because `iglp_opt(2)` interleaves it into GEMM1's run,
+    # where the operands are already resident in registers and there is no LDS ladder to
+    # displace. => the exposed-VALU pool (0.318 ms, R17-3) is real but POSITION does not
+    # collect it, and this is the sixth position-only lever to price at <=0 on this body
+    # (goal 3.4). The next thing to try on the pool is not where the block sits but how
+    # many instructions it is: the 864 `v_cvt_pk_bf16_f32` are two per written dQ dword
+    # pair, so the lever with a different mechanism is the dQ partial's LAYOUT (one pack
+    # per 4 dwords instead of 2) rather than its schedule.
+    #
+    # ALSO MEASURED, and the reason to keep this knob rather than delete it: the ISA
+    # hidden-VALU fraction moved 1.5 points in the right direction while the wall lost
+    # 1.8-2.6%, on the same four builds. `SQ_VALU_MFMA_COEXEC_CYCLES` therefore carries no
+    # sign information for an accept decision here, the same way `FetchSize` does not on
+    # the dispatch-order axis (goal 3.2). Gate on it, then judge on the wall.
+    G3_VALU = 0 if g3_valu is None else int(g3_valu)
+    G3_MFMA = G3_DT * G3_QT * G3_KSTEPS  # MFMAs one whole GEMM3 pass emits per wave
     G3_ST_AT = -1 if g3_st_at is None else int(g3_st_at)
     G3_ST_N = G3_DT // 2 * G3_QT if g3_st_n is None else int(g3_st_n)
     assert G3_ST_AT < 0 or G3_WAVES == NUM_WAVES
@@ -2775,7 +2897,8 @@ def build_flash_attn_bwd_dkdv_module(
             # non-temporal policy would lose the L2 write-combining the 64 B pairing sets up.
             _g3qh = kv_head_idx * fx.Index(GQA_GROUP_SIZE) + fx.Index(head_local)
 
-            def _g3_store(_g3p, i, j):
+            def _g3_elem(i, j):
+                """This store's element offset into the partial slot (see the D permutation)."""
                 _g3t = _g3q0 + fx.Index(j * G3_SPL_STRIDE)
                 _g3row = q_start + _g3_qrow(_g3t)
                 if const_expr(poff is not None):
@@ -2784,16 +2907,36 @@ def build_flash_attn_bwd_dkdv_module(
                 _g3qrow = _g3row * fx.Index(NUM_HEADS_Q) + _g3qh
                 if const_expr(WSQ_ILV > 1):
                     _g3qrow = _g3qrow * fx.Index(WSQ_ILV) + kv_tile_idx % fx.Index(WSQ_ILV)
+                return _g3qrow * fx.Index(HEAD_DIM) + _g3col
+
+            def _g3_store(_g3p, i, j):
                 buffer_ops.buffer_store(
                     _g3p.ir_value(),
                     wsq_rsrc,
-                    (_g3qrow * fx.Index(HEAD_DIM) + _g3col) * fx.Index(2),
+                    _g3_elem(i, j) * fx.Index(2),
                     offset_is_bytes=True,
                 )
 
             for _gi in range_constexpr(len(_dgs)):
                 _dg = _dgs[_gi]
                 _g3 = [[c_zero_v4f32 for _ in _qs] for _ in range_constexpr(len(_dg))]
+                _rmw = []
+                if const_expr(WSQ_RMW):
+                    # Issued here, a whole GEMM3 run ahead of the store that shares its
+                    # address, and ONE PER STORE (the store packs a d-tile pair into its
+                    # 16 B, so the loop is over pairs) so the arm's extra volume is exactly
+                    # the partial volume. bf16 element offsets are multiples of 8, so >> 1
+                    # is the same address in f32 units and the load is the store's own line.
+                    _rmw = [
+                        buffer_ops.buffer_load(
+                            wsq_rsrc,
+                            _g3_elem(_dg[2 * i2], _qs[jj]) >> fx.Index(1),
+                            vec_width=4,
+                            dtype=fx.Float32,
+                        )
+                        for i2 in range_constexpr(len(_dg) // 2)
+                        for jj in range_constexpr(len(_qs))
+                    ]
                 _ring = [_g3_frags(kk, _dg) for kk in range_constexpr(_gd)]
                 for _kk in range_constexpr(G3_KSTEPS):
                     _g3k, _g3s = _ring[_kk % _gd]
@@ -2816,6 +2959,8 @@ def build_flash_attn_bwd_dkdv_module(
                             _g3_store(_g3p, _gd0, j)
                         else:
                             st_sink.append(lambda p=_g3p, _i=_gd0, _j=j: _g3_store(p, _i, _j))
+                if const_expr(WSQ_RMW):
+                    _keepalive_v4(_rmw)
 
         # HOIST_PIN: the pinned bases are functions of wave_id and lane only, invariant
         # over the whole q-loop. `_opaque_idx` stops LICM from hoisting the individual
@@ -3062,6 +3207,34 @@ def build_flash_attn_bwd_dkdv_module(
             hsel=None,
             nq=None,
         ):
+            if const_expr(KV_REFETCH and head_local == 0):
+                # PROBE (dK/dV/dQ stay EXACT -- the values are pinned live and discarded):
+                # the ONE cost a q-outer walk would add. This body is kv-outer, so the
+                # owned K/V B-operand packs are loaded once per band and reused for every
+                # (q block, head) trip; q-outer reloads them per q block instead. Re-issue
+                # exactly that set here, at the top of a q block ahead of the whole
+                # GQA_GROUP_SIZE head loop, which is where the flip would put it and the
+                # most cover it could ever get. One level adds the band's whole K+V once
+                # per q block = 2 * BLOCK_KV * HEAD_DIM * 2 B per trip, so the wall slope
+                # per level IS the flip's bill. `_opaque_idx` on the row keeps LICM from
+                # hoisting it back out of the q loop.
+                _refetch = [
+                    buffer_ops.buffer_load(
+                        _r,
+                        global_idx_kv(
+                            _opaque_idx(kv_row_of(nt, h)),
+                            fx.Index(ks * K_STEP_QK) + kg * MFMA_LANE_K,
+                        ),
+                        vec_width=MFMA_LANE_K,
+                        dtype=elem_dtype,
+                    )
+                    for _ in range_constexpr(KV_REFETCH)
+                    for h in range_constexpr(KV_HALVES)
+                    for nt in range_constexpr(NT)
+                    for ks in range_constexpr(K_STEPS_QK)
+                    for _r in (k_rsrc, v_rsrc)
+                ]
+                _keepalive_v4([Vec(_p).bitcast(fx.Float32).ir_value() for _p in _refetch])
             # The next head's Q/dO fetch: the earlier it is issued the more of this step
             # covers it, and the longer its 16 B per tensor stay live over the body's
             # register peak (GEMM2's accumulators). QPF_AT picks that trade.
@@ -3178,6 +3351,15 @@ def build_flash_attn_bwd_dkdv_module(
             def _hs_hook(pos):
                 if const_expr(G3_AT == pos and len(_g3_call) > 0):
                     _g3_call.pop()()
+                if const_expr(G3_VALU > 0 and G3_AT > 0 and pos == G3_AT + 1):
+                    # GEMM3 ran one hook back and the q-half's dS/pack block sits between
+                    # then and here, so both are in this scheduling region: deal the block's
+                    # VALU out under GEMM3's MFMA run instead of leaving them to trail it.
+                    # Group 1 -- group 0 is GEMM2's MFMA/DS_READ pipeline and appending to it
+                    # would shift every one of its pairs.
+                    for _ in range_constexpr(G3_MFMA):
+                        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 1)
+                        rocdl.sched_group_barrier(_SCHED_VALU_MASK, G3_VALU, 1)
                 if const_expr(G3_ST_AT >= 0 and pos >= G3_ST_AT):
                     _hs_flush(G3_ST_N)
 
@@ -3677,8 +3859,8 @@ def build_flash_attn_bwd_dkdv_module(
                         # instructions against the single-arm form are a whole-function
                         # allocation effect, not motion a fence can pin back.
                         _bcond = ArithValue(_kvw + fx.Index(ROWS_PER_WAVE_KV - 1) <= _q_first)
-                        _dcond = ArithValue(_kvw == _q_first)
                         _base[0] = _if_wave(_bcond, _base[0], _arm(_mc_clear), _keep)
+                        _dcond = ArithValue(_kvw == _q_first)
                         _base[0] = _if_wave(_dcond, _base[0], _arm(_mc_diag), _keep)
                         _set_accs(_if_wave(_cond, _base[0], _keep, _dead))
                     else:
