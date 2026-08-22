@@ -4743,6 +4743,26 @@ _DQ_TAIL_SERIAL = True
 # EXPOSED to HIDDEN buys back less than it costs the body it now runs under. Same gate, and
 # for the same reason, as the pair merge in _pipe_chunks.
 _DQ_TAIL_CUT_FILLS = 2
+# Fold bytes one piece of a UNIFORM batch cut must still carry (see _dq_grid_cut). Cutting the
+# tail alone leaves the plan UNEVEN -- the chunk in front of the tail keeps its whole-batch
+# fold and now has only a tail PIECE to hide it under -- and at the 128-row band that window is
+# subscribed 2:1 against a body that absorbs half as many partial bytes per unit of work, which
+# is why the tail-only cut measures d128_hq64_b2 +1.4%. Cutting EVERY chunk instead keeps every
+# window 1:1 and halves the exposed tail with it, and it is the only member of the family that
+# wins: paired A/B inside one process, 30 pairs, the two arms alternating so the host's swing is
+# common mode (_probe_ab.py, whose null control reads +0.003 ms / 15 of 30), d128_hq64_b2
+# -0.0844 ms with B ahead in 28 of the 30 pairs, min 6.2574 against 6.3411. Cutting only the
+# head is +0.33% and cutting all but the tail +0.80% (own process, min of 40, palindrome), so
+# it is the evenness that pays rather than the piece count.
+# The gate is the fold a PIECE still carries, and the two D128 cells set it from both sides:
+# d128_hq64_b2's piece is 1 GiB and wins, while d128_hq32_b2 -- same grid, same bands, same
+# q_split, HALF the bytes a row -- puts 512 MiB in a piece and reads +0.0383 ms with A ahead in
+# 27 of 30. What the cut buys goes with those bytes (the exposed tail it halves) while what it
+# costs does not: the extra boundaries re-stage the same K/V and drain the same grid whatever
+# Hq is. So the line is taken at the piece's fold bytes, at the widest power of two the measured
+# pair allows, and not at a work-group count -- both cells cut to the same 512 work-groups, and
+# both sit exactly on the fill floor their band asks for.
+_DQ_CHUNK_FOLD_BYTES = 1 << 30
 # Slices a HIDDEN dQ fold is issued in (see _fold_slices). What a hidden fold costs is not its
 # own latency but what it does to the body it runs under, and that is paid per BURST rather
 # than per byte, so the same bytes handed to the fabric in narrow slices cost the body less.
@@ -4788,36 +4808,98 @@ def _dq_pipe_fills(block_kv):
     return max(1, _DQ_PIPE_FILLS * block_kv // 256)
 
 
-def _dq_pipe_qsp(wgs, q_split, block_kv):
+def _dq_pipe_qsp(wgs, q_split, block_kv, batch=1):
     """q_split subsets one chunk must hold to be worth the fill rule; 0 = do not pipe.
 
-    ``wgs`` is what ONE subset dispatches, ``n_bands*Hkv*B``. The rule (_DQ_PIPE_FILLS) is a
-    chunk WIDTH, and a shape whose one-subset chunk falls under it is not out of reach of the
-    pipeline: merging subsets widens the chunk until it clears, which is a plan the same rule
-    already licenses -- the alternative is not a narrow chunk but NO chunk, i.e. the whole fold
-    exposed on the caller's stream. Widening stops at two chunks, below which there is nothing
-    left for a fold to hide under.
+    ``wgs`` is what ONE subset dispatches over the whole batch, ``n_bands*Hkv*B``. The rule
+    (_DQ_PIPE_FILLS) is a chunk WIDTH, and a shape whose one-subset chunk falls under it is not
+    out of reach of the pipeline: merging subsets widens the chunk until it clears, which is a
+    plan the same rule already licenses -- the alternative is not a narrow chunk but NO chunk,
+    i.e. the whole fold exposed on the caller's stream. Widening stops at two chunks, below
+    which there is nothing left for a fold to hide under.
+
+    Past the fill rule, widening is what the merged pair in _pipe_chunks was avoiding: a wider
+    chunk is a wider TAIL, and the tail is the one fold with nothing over it. That stops being
+    true once the tail is cut on the batch axis (see _dq_tail_cut) -- the cut divides the wide
+    tail back to the same exposed bytes -- and then the only thing left to choose is how the
+    HIDDEN folds are spread, where equal-wide chunks subscribe every window 1:1 against the
+    merged pair's one window at 2:1. So the second widening below is taken only while the cut
+    keeps up with it, which leaves the merge in place wherever the cut cannot answer: B=1, and
+    the 128-row band, where the cut is not taken at all.
+    Measured on gptoss_full, own process, min of 40, palindrome-ordered, six readings an arm:
+    5.5699 / 5.5824 / 5.5842 / 5.5849 / 5.5924 / 5.5990 on the equal-wide [2,2] plan with a
+    four-piece tail against 5.6404 / 5.6638 / 5.6657 / 5.6693 / 5.6827 / 5.6848 on [1,2,1] with
+    a two-piece one -- all six below all six, -1.45%. The same widening at the 128-row band,
+    where no cut answers it, is d128_hq64_b2 +2.9% (6.4452 / 6.5037 / 6.5040 / 6.5054 against
+    6.2939 / 6.2966 / 6.3011 / 6.3360), which is the gate below reading from the other side.
     """
     floor = _dq_pipe_fills(block_kv) * _NUM_CU
     per = 1
     while per * 2 <= q_split and wgs * per < floor:
         per *= 2
-    return 0 if wgs * per < floor and per * 2 > q_split else per
+    if wgs * per < floor and per * 2 > q_split:
+        return 0
+    while per * 4 <= q_split and _dq_tail_cut(wgs, batch, per * 2, block_kv) >= 2 * _dq_tail_cut(
+        wgs, batch, per, block_kv
+    ):
+        per *= 2
+    return per
 
 
-def _dq_tail_cut(B, n_bands, Hkv, n_qsp, block_kv):
+def _dq_tail_cut(wgs, batch, n_qsp, block_kv):
     """Batch pieces the exposed tail chunk is dispatched in (see _DQ_TAIL_CUT_FILLS).
 
-    A piece holds ``n_bands*Hkv*(B/pieces)*n_qsp`` work-groups; halving keeps going while a
-    piece is still worth _DQ_TAIL_CUT_FILLS fills, and while the batch divides. Two fills is
-    also where it stops paying from below: at one fill gptoss_full's tail cuts into four
+    ``wgs`` is one subset's whole-batch grid, so a piece of an ``n_qsp``-wide tail holds
+    ``wgs*n_qsp/pieces`` work-groups; halving keeps going while a piece is still worth
+    _DQ_TAIL_CUT_FILLS fills, and while the batch divides EVENLY -- an uneven cut would hand
+    the pieces ``batch//pieces`` batches each and leave the remainder undispatched. Two fills
+    is also where it stops paying from below: at one fill gptoss_full's tail cuts into four
     256-work-group pieces and reads 6.6013 / 6.5740 against 5.6866 / 5.6465 at two, +16%.
     """
     if _DQ_TAIL_CUT_FILLS <= 0 or block_kv < 256:
         return 1
     floor = _DQ_TAIL_CUT_FILLS * _NUM_CU
     cut = 1
-    while cut * 2 <= B and n_bands * Hkv * (B // (cut * 2)) * n_qsp >= floor:
+    while cut * 2 <= batch and batch % (cut * 2) == 0 and wgs * n_qsp // (cut * 2) >= floor:
+        cut *= 2
+    return cut
+
+
+def _dq_grid_cut(wgs, batch, n_qsp, block_kv, fold_bytes):
+    """Batch pieces EVERY chunk of the plan is dispatched in (see _DQ_CHUNK_FOLD_BYTES).
+
+    The tail cut answers "can the last fold stop being exposed"; this answers the same question
+    for the plan as a whole, and it is a different trade because a piece that is not the tail
+    still has to HIDE a fold. Cutting one chunk narrows the window the chunk before it folds
+    into, so the cut only pays when every chunk takes it: then the plan is a uniform grid over
+    (q_split subset x batch), every window is subscribed 1:1, and the tail is one piece rather
+    than one chunk. ``fold_bytes`` is what one whole chunk's fold reads, so a piece carries
+    ``fold_bytes/pieces``, and halving stops while that clears _DQ_CHUNK_FOLD_BYTES, while a
+    piece is still a legal chunk width (_dq_pipe_fills) and while the batch divides evenly.
+
+    Taken at the NARROW band only, and that is the mirror of _dq_tail_cut rather than a second
+    opinion about it: what a unit of body absorbs is 1/(2*BLOCK_KV) of partial bytes, so at the
+    256-row band a hidden fold is cheap enough that the plan would rather stay WIDE and pay one
+    boundary for the tail, while at the 128-row band the same over-subscription is twice as
+    expensive and evenness is worth more than width. Measured from both sides on the two cells
+    whose pieces carry the SAME 1 GiB, so bytes are not what separates them (paired A/B, 30
+    pairs, arms alternating inside one process, the uniform plan against the tail-only one it
+    replaces; the null control reads +0.011 ms / 18 of 30 at gptoss_full and +0.003 / 15 of 30
+    at d128_hq64_b2): d128_hq64_b2 -0.0585 ms for the uniform plan with 27 of 30 pairs behind
+    it, gptoss_full +0.0885 ms with 28 of 30 the other way. The same verdict on the deployed
+    instrument -- own process, min of 40, palindrome-ordered inside one batch -- is 6.3238 /
+    6.2244 / 6.3170 uniform against 6.3919 / 6.3811 / 6.3073 tail-only, -1.13%.
+    """
+    if block_kv >= 256:
+        return 1
+    floor = _dq_pipe_fills(block_kv) * _NUM_CU
+    cut = 1
+    while (
+        cut * 2 <= batch
+        and batch % (cut * 2) == 0
+        and wgs * n_qsp // (cut * 2) >= floor
+        and fold_bytes // (cut * 2) >= _DQ_CHUNK_FOLD_BYTES
+    ):
         cut *= 2
     return cut
 
@@ -4908,7 +4990,10 @@ def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False, wgs=N
     # TWO-subset fold under a one-subset body, a window subscribed 2:1, and what a unit of
     # body absorbs is 1/(2*BLOCK_KV), so halving the band doubles the over-subscription and
     # that one window stops covering. The equal cut pays one more boundary (~0.11 ms) for it
-    # and keeps the same one-subset tail.
+    # and keeps the same one-subset tail. Both readings above are UNCUT tails, which is why the
+    # merge is now reached only where the batch cannot cut the tail (see _dq_pipe_qsp): where it
+    # can, the equal-WIDE plan gets the same one-subset exposure without over-subscribing a
+    # window, and wins by more than the boundary costs.
     # The SPLIT axis is what an SBHD chunk cuts, and the batch axis is not an alternative to it
     # even though bat_lo makes one dispatchable. A whole-batch-per-chunk plan gives the better
     # BODY -- one (batch, kv-head) per XCD instead of four, worth gptoss_full 5.229 against
@@ -4923,7 +5008,7 @@ def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False, wgs=N
         # A shape whose one-subset chunk is under the fill rule takes the widest plan the rule
         # does license instead of no pipeline at all (see _dq_pipe_qsp). Equal chunks: the two
         # windows a merge trades between are the same width here, so there is nothing to trade.
-        per = _dq_pipe_qsp(wgs, q_split, block_kv) if wgs else 1
+        per = _dq_pipe_qsp(wgs, q_split, block_kv, B) if wgs else 1
         if per > 1:
             return [(None, s, min(per, q_split - s)) for s in range(0, q_split, per)]
         if q_split < 4 or block_kv < 256:
@@ -4938,6 +5023,15 @@ def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False, wgs=N
     return [(b, 0, None) for b in range(B - 1)] + (
         [(B - 1, 0, h), (B - 1, h, h)] if cut else [(B - 1, 0, None)]
     )
+
+
+def _dq_fold_bytes(n_bat, Sq, Hq, D, Skv, block_kv, q_split, n_qsp):
+    """What one chunk's dQ fold reads: the causal half of the bands, times the dQ image the
+    chunk's batches hold, times its share of the q blocks (_reduce_dq_partials does the same
+    accounting for the whole fold). It is what gates the batch cut (_dq_grid_cut) and what
+    floors how small _fold_slices may cut.
+    """
+    return (Skv // block_kv) // 2 * (n_bat * Sq * Hq * D * 2) * (n_qsp or q_split) // q_split
 
 
 def _fold_slices(B, Sq, q_split, lo, n, fold_bytes, bat_lo=0, n_bat=None):
@@ -5046,25 +5140,35 @@ def _fused_pipelined(
         _SIDE_STREAM[dq.device] = side
     # A stage is (batch, qsp_lo, n_qsp, bat_lo, n_bat): the first three are the plan's, the
     # last two the SBHD batch sub-range (None = the whole batch, see the builder's bat_lo).
-    plan = _pipe_chunks(B, q_split, block_kv, Sq, D, sbhd, wgs=(Skv // block_kv) * Hkv * B)
+    wgs = (Skv // block_kv) * Hkv * B
+    plan = _pipe_chunks(B, q_split, block_kv, Sq, D, sbhd, wgs=wgs)
     chunks = [c if len(c) == 5 else tuple(c) + (0, None) for c in plan]
-    # Cut the EXPOSED tail on the batch axis, so all but its last piece gets a body over it.
-    # Legal for SBHD without slicing a single tensor because the body takes its batch range as
-    # a compile-time base plus the grid's count (see the builder's bat_lo), and every piece
-    # folds only the rows its own body just completed -- same bands, same ascending order,
-    # same fp32 accumulator, so dQ stays bitwise what one launch produces.
-    # The plan the tail is cut out of is still the merged one, and that is now worth re-asking:
-    # the merge was chosen against an UNCUT tail, and with the cut in place gptoss_full reads
-    # 5.6392 / 5.5977 and 5.5833 / 5.6388 on the equal-wide [2,2] plan (whose two-subset tail
-    # cuts into four 512-work-group pieces) against 5.6866 / 5.6465 and 5.6619 / 5.6772 on
-    # [1,2,1], -1.0% over two batches. Left alone here because it reverses a verdict taken
-    # across more shapes than this campaign scores.
-    tail_cut = (
-        _dq_tail_cut(B, Skv // block_kv, Hkv, chunks[-1][2] or q_split, block_kv)
-        if sbhd and chunks[-1][0] is None
+    # Cut the plan on the batch axis, so a fold gets a body over it that would otherwise be
+    # exposed. Legal for SBHD without slicing a single tensor because the body takes its batch
+    # range as a compile-time base plus the grid's count (see the builder's bat_lo), and every
+    # piece folds only the rows its own body just completed -- same bands, same ascending
+    # order, same fp32 accumulator, so dQ stays bitwise what one launch produces.
+    # Two scopes, and they are alternatives rather than stages: cutting EVERY chunk keeps the
+    # plan uniform and is what pays wherever a piece still carries a fold worth the boundary
+    # (_dq_grid_cut); where it does not, only the tail -- the one fold with nothing over it --
+    # is worth a boundary of its own (_dq_tail_cut). The plan the tail is cut out of answers to
+    # that cut, not the other way round: the merged pair was chosen against an UNCUT tail, so
+    # wherever the cut is available the plan widens instead of merging (see _dq_pipe_qsp).
+    cuttable = sbhd and chunks[-1][0] is None
+    n_tail = chunks[-1][2] or q_split
+    # Only a plan that is already uniform on the SPLIT axis can stay uniform under the cut; the
+    # merged pair (_pipe_chunks) is the one that is not, and it is chosen where no cut answers.
+    uniform = len(chunks) > 1 and len({c[2] for c in chunks}) == 1
+    grid_cut = (
+        _dq_grid_cut(wgs, B, n_tail, block_kv, _dq_fold_bytes(B, Sq, Hq, D, Skv, block_kv, q_split, n_tail))
+        if cuttable and uniform
         else 1
     )
-    if tail_cut > 1:
+    tail_cut = _dq_tail_cut(wgs, B, n_tail, block_kv) if cuttable and grid_cut == 1 else 1
+    if grid_cut > 1:
+        per = B // grid_cut
+        chunks = [(b, lo, n, j * per, per) for b, lo, n, _, _ in chunks for j in range(grid_cut)]
+    elif tail_cut > 1:
         b, lo, n, _, _ = chunks[-1]
         per = B // tail_cut
         chunks = chunks[:-1] + [(b, lo, n, j * per, per) for j in range(tail_cut)]
@@ -5151,10 +5255,7 @@ def _fused_pipelined(
         # (5.874 against 5.854). A per-batch chunk is already one batch of a far smaller
         # workspace and takes the plain launch too.
         #
-        # What a chunk's fold reads: the causal half of the bands, times the dQ image, times the
-        # chunk's share of the q blocks (_reduce_dq_partials does the same accounting for the
-        # whole fold). It is what floors how small _fold_slices may cut.
-        fold_bytes = (Skv // block_kv) // 2 * ((nbt or B) * Sq * Hq * D * 2) * (n or q_split) // q_split
+        fold_bytes = _dq_fold_bytes(nbt or B, Sq, Hq, D, Skv, block_kv, q_split, n)
         slices = (
             _fold_slices(B, Sq, q_split, lo, n, fold_bytes, bat_lo=blo, n_bat=nbt)
             if not per_batch and (n is not None or nbt is not None) and i < nc - 1
