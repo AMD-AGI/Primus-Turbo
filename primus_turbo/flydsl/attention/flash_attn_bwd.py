@@ -1247,6 +1247,28 @@ def build_flash_attn_bwd_dkdv_module(
     # the only arm that prices the store stream's VOLUME. Aliasing the bands onto one slab
     # (wsq_ring) shrinks the FOOTPRINT instead and so prices cache residency, not volume.
     wsq_nrec=None,
+    # wsq_atomic: PROBE, and dQ IS WRONG WHILE IT IS ON -- the buffer is never zeroed, the
+    # sm_scale still lives in the fold and there is no fp32->bf16 cast pass. It prices the
+    # accumulation and nothing else. Non-zero replaces the bf16 partial store with the pair's
+    # 8 floats as 8 consecutive-dword `buffer_atomic_add_f32` into one band-less fp32 image --
+    # aiter's hd128 scheme -- so band axis, workspace and fold all disappear, and so does
+    # bitwise reproducibility. The value is the atomic's CPol aux plus one; aux 0 is cheapest
+    # and is not by itself correct across XCDs, since an agent-scope atomic must be performed
+    # past the local L2 to see the other XCDs' adds.
+    #
+    # Measured, and the verdict is arithmetic rather than tuning. The ISA is clean (512
+    # atomics, 486 VGPR, 0 scratch, LDS unchanged) but d128_70b_b2 reads 105.5 ms against
+    # 6.34, where the whole dQ split-K round trip it would replace costs 1.229 ms. The payload
+    # is why: an element takes one contribution per kv band that causally sees it, ~32 here,
+    # the same count aiter pays, so either scheme moves 4.3 G element-updates -- 8.6 GB stored
+    # plus 8.6 GB folded as bf16 partials, against 17.2 GB of fp32 read-modify-write, already
+    # 2x at the memory side. Then this C layout hands a lane 8 floats of ONE q row, so a
+    # wave's 64 lanes touch 32 lines two dwords at a time: 2.15 G line-RMWs, 275 GB, which is
+    # the 105 ms. Transposing the epilogue so a wave covers 4 whole lines would recover that
+    # 8x and land near 6 ms -- still 5x the leg. The lever that would re-price it is a larger
+    # BLOCK_KV, and that is measured shut from the other side: +17% at D128, +65% at D64,
+    # spill-free arms included (see _fuse_blockkv_for).
+    wsq_atomic=0,
     # wsq_rmw: PROBE (dQ/dK/dV stay EXACT -- the value read is pinned live and discarded).
     # A slot-indexed dQ partial workspace (one slot per resident work-group instead of one
     # per kv band, so nsplits falls from Skv/BLOCK_KV to that over the bands a slot owns)
@@ -1427,6 +1449,7 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_ILV = int(wsq_ilv)
     WSQ_RING = int(wsq_ring)
     WSQ_NREC = max(1, int(wsq_nrec or 1))
+    WSQ_ATOMIC = int(wsq_atomic or 0)
     WSQ_RMW = bool(wsq_rmw)
     KV_REFETCH = max(0, int(kv_refetch or 0))
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
@@ -2325,6 +2348,20 @@ def build_flash_attn_bwd_dkdv_module(
             num_records_bytes=_raw(_wsq_slice // fx.Index(WSQ_NREC) if WSQ_NREC > 1 else _wsq_slice),
             base_byte_offset=_raw(_wsq_grp * _wsq_band + _wsq_off),
         )
+        if const_expr(WSQ_ATOMIC):
+            # The fp32 dQ accumulator has NO band axis and no interleave: every band adds into
+            # the same image, so one batch slice of Sq*Hq*D floats is the whole resource.
+            _wsq32_slice = seq_len_q_v * fx.Index(NUM_HEADS_Q * HEAD_DIM * 4)
+            wsq32_rsrc = buffer_ops.create_buffer_resource(
+                WSQ,
+                max_size=False,
+                num_records_bytes=_raw(_wsq32_slice),
+                base_byte_offset=_raw(
+                    (q_tok_base * fx.Index(NUM_HEADS_Q * HEAD_DIM * 4))
+                    if const_expr(varlen)
+                    else (batch_idx * _wsq32_slice)
+                ),
+            )
         _lse_per_batch = seq_len_q_v * fx.Index(NUM_HEADS_Q)
         _lse_nrec_bytes = _raw(_lse_per_batch * fx.Index(4))
         if const_expr(varlen):
@@ -2909,17 +2946,24 @@ def build_flash_attn_bwd_dkdv_module(
             # dwordx4, with no LDS trip or barrier needed to get there.
             # The store stays CACHED: the partials are read back by the reduce, and a
             # non-temporal policy would lose the L2 write-combining the 64 B pairing sets up.
+            # Re-checked under the pipelined fold, where that reason no longer holds: every
+            # CPol on this store is inside the noise channel, so the write stream is not
+            # displacing the q window QDESC gathers either.
             _g3qh = kv_head_idx * fx.Index(GQA_GROUP_SIZE) + fx.Index(head_local)
 
-            def _g3_elem(i, j):
-                """This store's element offset into the partial slot (see the D permutation)."""
+            def _g3_elem(i, j, ilv=True):
+                """This store's element offset into the partial slot (see the D permutation).
+
+                ``ilv=False`` drops the band interleave, i.e. addresses a plain dQ image --
+                which is what the fp32 atomic accumulator is.
+                """
                 _g3t = _g3q0 + fx.Index(j * G3_SPL_STRIDE)
                 _g3row = q_start + _g3_qrow(_g3t)
                 if const_expr(poff is not None):
                     _g3row = _g3row + (_g3t >> fx.Index(1)) * (poff - fx.Index(BLOCK_Q // 2))
                 _g3col = (_g3d0 + fx.Index(i)) * fx.Index(D_TILE) + kg * fx.Index(8)
                 _g3qrow = _g3row * fx.Index(NUM_HEADS_Q) + _g3qh
-                if const_expr(WSQ_ILV > 1):
+                if const_expr(WSQ_ILV > 1 and ilv):
                     _g3qrow = _g3qrow * fx.Index(WSQ_ILV) + kv_tile_idx % fx.Index(WSQ_ILV)
                 return _g3qrow * fx.Index(HEAD_DIM) + _g3col
 
@@ -2930,6 +2974,27 @@ def build_flash_attn_bwd_dkdv_module(
                     _g3_elem(i, j) * fx.Index(2),
                     offset_is_bytes=True,
                 )
+
+            def _g3_atomic(_lo, _hi, i, j):
+                """The same D-tile pair, added into the fp32 dQ image instead of stored.
+
+                The permuted D axis pays off here too: the pair's 8 floats are 8 CONSECUTIVE
+                dwords, so one voffset plus an immediate soffset covers the lot and the 4 kg
+                lanes of a q row still cover 128 B between them. No bf16 pack, no rounding of
+                the partial -- the accumulation itself is fp32, which is what keeps dQ inside
+                its 1 dB SNR margin once the fold's fixed band order is gone.
+                """
+                _a32 = ArithValue(_raw(_g3_elem(i, j, ilv=False) * fx.Index(4))).index_cast(
+                    fx.Int32.ir_type
+                )
+                for _w in range_constexpr(4):
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        _raw(_lo[_w]), wsq32_rsrc, _a32, 4 * _w, WSQ_ATOMIC - 1
+                    )
+                for _w in range_constexpr(4):
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        _raw(_hi[_w]), wsq32_rsrc, _a32, 16 + 4 * _w, WSQ_ATOMIC - 1
+                    )
 
             for _gi in range_constexpr(len(_dgs)):
                 _dg = _dgs[_gi]
@@ -2965,10 +3030,19 @@ def build_flash_attn_bwd_dkdv_module(
                     i = 2 * i2
                     for jj in range_constexpr(len(_qs)):
                         j = _qs[jj]
+                        _gd0 = _dg[i]
+                        if const_expr(WSQ_ATOMIC):
+                            _lo, _hi = Vec(_g3[i][jj]), Vec(_g3[i + 1][jj])
+                            if const_expr(st_sink is None):
+                                _g3_atomic(_lo, _hi, _gd0, j)
+                            else:
+                                st_sink.append(
+                                    lambda a=_lo, b=_hi, _i=_gd0, _j=j: _g3_atomic(a, b, _i, _j)
+                                )
+                            continue
                         _g3p = bf16_trunc_scored_v4(_g3[i][jj]).shuffle(
                             bf16_trunc_scored_v4(_g3[i + 1][jj]), [0, 1, 2, 3]
                         )
-                        _gd0 = _dg[i]
                         if const_expr(st_sink is None):
                             _g3_store(_g3p, _gd0, j)
                         else:
@@ -4328,8 +4402,14 @@ def _fuse_blockkv_for(Skv, D=64, window_left=-1):
     # 256 only fits because the K/V B-operands live in LDS (see `_kv_lds_idx`): it
     # doubles the dK/dV accumulators, and the packs it displaces are exactly what pays
     # for them (with the packs still in registers this spilled catastrophically). 512
-    # would halve the band count again, but its dK/dV accumulators alone exceed even the
-    # four-wave body's whole register file, so the band stays 256.
+    # would halve the band count again, and it does compile -- but its dK/dV accumulators
+    # alone are 512 dwords across four waves, so it buys the halved traffic with scratch:
+    # d64_gptoss_b4 reads 9.218 ms against the deployed 256's 5.601, and 512 with BLOCK_Q
+    # dropped to 32 to fund it reads 8.427 and no longer matches the 256 build bitwise.
+    # The same wall stands at D128 one step earlier: 256 reads 8.82/8.89 against 6.29 with
+    # 880 scratch ops, and 256 with BLOCK_Q=32 -- the one knob that zeroes that spill --
+    # still reads 7.428 against a 6.375/6.311 palindromic base. So widening the band is not
+    # the way to cut the split-K leg's byte count, at either head dim.
     # Register cost is `dk+dv dwords = D*block_kv/(32*waves)`; D128's non-accumulator state caps it at 128.
     if window_left >= 0:
         # A window wants the widest FILLED band; round W down to a power of two, capped by LDS/wave count.
