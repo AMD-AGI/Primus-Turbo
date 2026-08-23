@@ -1370,70 +1370,102 @@ def gemm_bf16_variable_k_tile(
                 bv[ko] = _voffs(b_g2s, b_slot_ids, chunk_idx * CHUNK + ko, wbase, wlim)
         return av, bv
 
-    def _one_step(k, jw, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1):
+    def _one_step_core(k, jw, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1, c00, c01, c10, c11):
         """One pipelined k step reading the window at jw.
 
         4-buffer pipelined body: interleave s2r/g2s with the 4 mfma quadrants.
         Only the buffers this step touches are passed; the caller owns the
-        rotation, so the same body serves the unrolled chunk and the tail.
+        rotation, so the same body serves the unrolled chunk and the tail. The
+        four accumulator quadrants are threaded IN and OUT as SSA values -- the
+        caller loads them from the rmem allocas once at chunk entry and stores
+        once at exit, so the per-quadrant memref load/store that used to bracket
+        every mfma is gone from the hot region. Barriers, s_setprio and the mfma
+        calls are byte-identical to the alloca form (load-bearing schedule
+        parity); only the redundant accumulator traffic is removed.
         """
         b0 = b_s2r.load(b_cur0)
         a0 = a_s2r.load(a_cur0)
         _load_a(a_next1, 1, k + 1, av[jw + 1])
         rocdl.s_barrier()
         rocdl.s_setprio(1)
-        c = [Vec(fx.memref_load_vec(r)) for r in acc00]
-        c = mfma.call(a0, b0, c)
-        for idx in range_constexpr(len(acc00)):
-            fx.memref_store_vec(c[idx], acc00[idx])
+        c00 = mfma.call(a0, b0, c00)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
         b1 = b_s2r.load(b_cur1)
         _load_b(b_cur0, 0, k + 2, bv[jw + 2])
         rocdl.s_barrier()
         rocdl.s_setprio(1)
-        c = [Vec(fx.memref_load_vec(r)) for r in acc01]
-        c = mfma.call(a0, b1, c)
-        for idx in range_constexpr(len(acc01)):
-            fx.memref_store_vec(c[idx], acc01[idx])
+        c01 = mfma.call(a0, b1, c01)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
         a1 = a_s2r.load(a_cur1)
         _load_a(a_cur0, 0, k + 2, av[jw + 2])
         rocdl.s_barrier()
         rocdl.s_setprio(1)
-        c = [Vec(fx.memref_load_vec(r)) for r in acc10]
-        c = mfma.call(a1, b0, c)
-        for idx in range_constexpr(len(acc10)):
-            fx.memref_store_vec(c[idx], acc10[idx])
+        c10 = mfma.call(a1, b0, c10)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
         _load_b(b_cur1, 1, k + 2, bv[jw + 2])
         wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
         rocdl.s_setprio(1)
-        c = [Vec(fx.memref_load_vec(r)) for r in acc11]
-        c = mfma.call(a1, b1, c)
-        for idx in range_constexpr(len(acc11)):
-            fx.memref_store_vec(c[idx], acc11[idx])
+        c11 = mfma.call(a1, b1, c11)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
+        return c00, c01, c10, c11
+
+    def _load_acc():
+        return (
+            [Vec(fx.memref_load_vec(r)) for r in acc00],
+            [Vec(fx.memref_load_vec(r)) for r in acc01],
+            [Vec(fx.memref_load_vec(r)) for r in acc10],
+            [Vec(fx.memref_load_vec(r)) for r in acc11],
+        )
+
+    def _store_acc(c00, c01, c10, c11):
+        for idx in range_constexpr(N_ACCUMS_EFF):
+            fx.memref_store_vec(c00[idx], acc00[idx])
+            fx.memref_store_vec(c01[idx], acc01[idx])
+            fx.memref_store_vec(c10[idx], acc10[idx])
+            fx.memref_store_vec(c11[idx], acc11[idx])
+
+    def _one_step(k, jw, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1):
+        """Alloca-backed single step for the tail (at most CHUNK-1 = 3 steps).
+
+        The tail sits behind runtime n_tail guards where threading SSA across the
+        nested traced ifs is not worth the plumbing, so it keeps the load->step->
+        store around the one call; the body is the same core.
+        """
+        c00, c01, c10, c11 = _load_acc()
+        c00, c01, c10, c11 = _one_step_core(
+            k, jw, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1, c00, c01, c10, c11
+        )
+        _store_acc(c00, c01, c10, c11)
 
     def _steps(k_base, av, bv, off):
         """CHUNK pipelined k steps reading the window at off+j.
 
         Starts from the LDS buffers in their declared roles and swaps them CHUNK
         (even) times, so the rotation is parity-neutral and no state crosses calls.
+        The accumulators are loaded from the allocas once here and threaded as SSA
+        through all CHUNK steps, then stored once -- so the dynamic chunk loop above
+        _chunk still carries state through the allocas (no scf.for iter_args, no
+        loop-boundary spill) while the inner CHUNK*4 memref load/stores per k step
+        collapse to one set per chunk.
         """
         a_cur0, a_cur1 = lds.A_lds_cur_0, lds.A_lds_cur_1
         a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
         b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
         b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
+        c00, c01, c10, c11 = _load_acc()
         for j in range_constexpr(CHUNK):
-            _one_step(k_base + j, off + j, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1)
+            c00, c01, c10, c11 = _one_step_core(
+                k_base + j, off + j, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1, c00, c01, c10, c11
+            )
             a_cur0, a_next0 = a_next0, a_cur0
             a_cur1, a_next1 = a_next1, a_cur1
             b_cur0, b_next0 = b_next0, b_cur0
             b_cur1, b_next1 = b_next1, b_cur1
+        _store_acc(c00, c01, c10, c11)
 
     def _chunk(chunk_iv):
         chunk_idx = ArithValue(chunk_iv)

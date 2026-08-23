@@ -305,7 +305,7 @@ def _make_kernel(
                     a_slot_ids=a_slots,
                     b_slot_ids=b_slots,
                     slot_len=fx.Int32(num_max_pool_tokens),
-                    slot_unroll=2,
+                    slot_unroll=4,
                 )
         else:
             tile_index = block_index - fx.Int32(num_max_dispatch_blocks)
@@ -596,7 +596,7 @@ def _compiled_dispatch_grouped_gemm(
         num_dispatch_blocks,
         DISP_PARITY,
         DISP_EXPECTED,
-        value_attrs=make_value_attrs(2, 0, "512,512"),
+        value_attrs=make_value_attrs(3 if layout == "nn" else 2, 0, "512,512"),
     ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
 
@@ -676,6 +676,15 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     x_i32 = x.contiguous().view(torch.int32).view(-1)
 
     assert layout in ("nt", "nn", "tn"), f"unsupported layout {layout}"
+    # nt (forward L1) is expert-arrival bound, not A-reuse bound: it waits on the peer
+    # dispatch of each tile's expert, so the finest grouping lets a group retire the
+    # moment its single expert lands and the extra A gather hides under that wait.
+    # Measured 4.316 -> 4.27 ms. nn (backward dgrad) has no such wait and is A-reuse
+    # bound -- it loses ~1% at GROUP_M=1 -- so this stays nt-only.
+    if layout == "nt" and GROUP_M == 2:
+        GROUP_M = 1
+    # nn (backward dgrad) is A-reuse bound: GROUP_M=1 lost ~1%, and GROUP_M=4 measured
+    # NEUTRAL vs 2 (interleaved A/B within 0.04%), so 2 is the plateau. Leave nn at 2.
     out_fp16 = out_dtype == torch.float16
     layout_code = {"nt": 0, "nn": 1, "tn": 2}[layout]
 

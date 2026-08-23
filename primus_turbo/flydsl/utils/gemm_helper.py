@@ -1670,8 +1670,14 @@ class S2RLoaderTr16x32Bf16(_S2RLoaderBf16):
         orig_tile = self.wave_idx * self.n_tiles + i
         n32_block, g16 = orig_tile // 2, orig_tile % 2
         row = g16 * 256 + row_off  # fold g16 block offset into row
+        # _SUB is compile-time, so hand it to the ds_read immediate rather than the
+        # address VGPR (cf. S2RLoaderTrBf16): the subs of a tile then share one base,
+        # trimming per-k-step v_adds on the issue-bound tn (dW1) leg. _SUB=(0,2) ->
+        # sub_const in {0,2} -> immediate in {0, 2048} B, plus the swz read-pair {0,256}
+        # gives offsets {0,256,2048,2304}, all inside the 16-bit DS field. Bit-exact.
+        sub0 = n32_block * self._BLOCK + s_in_pair
         return [
-            _read_tr16_sub(base_i32, n32_block * self._BLOCK + self._SUB[c] + s_in_pair, row, self.swz)
+            _read_tr16_sub(base_i32, sub0, row, self.swz, sub_const=self._SUB[c])
             for c in range_constexpr(len(self._SUB))
         ]
 

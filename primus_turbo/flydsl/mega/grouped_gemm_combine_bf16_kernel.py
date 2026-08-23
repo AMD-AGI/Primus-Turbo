@@ -54,7 +54,20 @@ _LAYOUT_CODES = {name: code for code, name in enumerate(_LAYOUTS)}
 
 _COMBINE_DEDUP_NPASS = 2
 
-_NUM_REDUCE_BLOCKS = 2048
+# Blocks of the empty region that run the topk reduce. The reduce hands each warp a
+# warp-strided slice of the tokens (stride = _NUM_REDUCE_BLOCKS * _NUM_WARPS), so every
+# value covers each token exactly once and the alignment atomics -- whose stride is the
+# same constant -- stay exact for ANY block count (the ordinal gate below is == this
+# constant, so ordinals 0..stride-1 always run and cover every residue exactly once).
+# 1024 blocks is 8192 warps for 8192 tokens: every warp keeps its single token, so the
+# per-warp reduce work and the arrival spins are bit-for-bit what they were at 2048.
+# 2048 was 16384 warps -- every block past ordinal 1023 ran zero reduce iterations while
+# still paying a block launch, a dependent scalar prologue and a 128 KB LDS allocation
+# that pins it to a whole CU. The region is an exposed tail (dispatched after every GEMM
+# tile), so those empty rounds were pure wall time; 1024 drops exactly the provably-idle
+# half. Going further (256, four tokens per warp) serializes the arrival spins and
+# measured ~0.7% slower on both combine legs.
+_NUM_REDUCE_BLOCKS = 1024
 
 _COMBINE_FLAG_SCOPE = "sys"
 _COMBINE_GATE_SLEEP = 32
@@ -139,6 +152,12 @@ def _make_grouped_gemm_combine(
     # kernel; the unused combine blocks exit immediately. The boundary is rounded up to a
     # multiple of the XCD count so that gemm_tile_index = block_index - boundary keeps the
     # block_index % 8 residue the rectangle tile map is affine to.
+    #
+    # NOTE: tightening this reservation to each layout's pinned count (nt 64, nn/tn 32)
+    # was measured NEGATIVE (interleaved B/A/B: trim ~0.9% slower on combine_nt, ~0.4%
+    # on combine_nn). The wide 128-block reservation is beneficial -- the early-out
+    # combine blocks stage the GEMM tiles behind the inter-node combine comm, easing HBM
+    # contention. Do not trim.
     num_max_combine_blocks = (_WIDEST_COMBINE_BLOCKS + 7) // 8 * 8
     # Rectangular XCD-affine tile map; needs n_blocks divisible by 4.
     use_rect = bool(n_blocks) and n_blocks % 4 == 0
@@ -645,6 +664,9 @@ def _compiled_grouped_gemm_combine(
         seg_parts,
         lead_gemm_blocks,
     )
+    # NOTE: combine_nn waves=3 was measured NEUTRAL (w3 mean 4.5199 vs w2 4.5235, within
+    # the 0.6% combine_nn noise band) -- the combine kernel's bottleneck is the protected
+    # comm/dedup-push, not HBM-load-latency, so extra waves don't help. Keep waves=2.
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
     # Sized for the worst case so the launch shape stays static under graph capture;
