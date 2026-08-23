@@ -46,12 +46,14 @@ __all__ = [
 
 class PrecisionType(Enum):
     FP4 = auto()
+    FP6 = auto()
     FP8 = auto()
     BF16_FP16_FP32 = auto()
 
 
 _PRECISION_TYPE_MAPPING = {
     "FP4": PrecisionType.FP4,
+    "FP6": PrecisionType.FP6,
     "FP8": PrecisionType.FP8,
     "BF16": PrecisionType.BF16_FP16_FP32,
     "FP16": PrecisionType.BF16_FP16_FP32,

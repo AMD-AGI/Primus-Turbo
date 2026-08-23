@@ -95,6 +95,10 @@ except AttributeError:
 MXFP4_BLOCK_SIZE = 32
 # Padding align size for MXFP4
 MXFP4_PADDING_ALIGN_SIZE = 128
+# Block size for MXFP6
+MXFP6_BLOCK_SIZE = 32
+# Padding align size for MXFP6. The A6W6 ASM consumes K in units of 128.
+MXFP6_PADDING_ALIGN_SIZE = 128
 # Block size for MXFP8
 MXFP8_BLOCK_SIZE = 32
 # Padding align size for MXFP8
@@ -102,15 +106,27 @@ MXFP8_PADDING_ALIGN_SIZE = 128
 # Block size for BLOCKWISE scaling
 DEFAULT_BLOCK_SIZE = 128
 
+# Geometry of AITER's "mxfp6_c0c1_256_padk2" packed blob, which the A6W6 ASM kernels
+# consume directly. These are not tunable: the assembly has them baked in, and it
+# derives its row-tile stride from MXFP6_K_TILES(K) + MXFP6_GUARD_K_TILES.
+MXFP6_TILE_SIZE = 256
+MXFP6_K_TILE_SIZE = 128
+# Trailing K-tiles the blob must be sized for. Their contents are never read -- see
+# the guard-tile probe -- but omitting the space makes every row-tile stride wrong.
+MXFP6_GUARD_K_TILES = 2
+MXFP6_PACKED_TILE_BYTES = 24576
+MXFP6_SCALE_TILE_BYTES = 1024
+
 
 class Format(Enum):
     """
-    Supported FP8/FP4 formats.
+    Supported FP8/FP6/FP4 formats.
     """
 
     E4M3 = auto()
     E5M2 = auto()
     E2M1_X2 = auto()
+    E2M3 = auto()
     HYBRID = auto()
 
 
@@ -262,10 +278,60 @@ class Float4QuantConfig:
         return self.granularity == ScalingGranularity.MX_BLOCKWISE and self.scale_dtype == ScaleDtype.E8M0
 
 
+@dataclass
+class Float6QuantConfig:
+    """MXFP6 (E2M3) quantization config.
+
+    Deliberately narrower than ``Float4QuantConfig``, because MXFP6 has far fewer
+    degrees of freedom:
+
+    - The 32-point Hadamard rotation is **mandatory**, not a recipe flag. It is fused
+      into the packer and the GEMM relies on it cancelling between the two operands
+      (``(A H)(B H)^T == A B^T``), so there is no un-rotated MXFP6 to opt into.
+    - Scaling is strictly per-1x32 along the contraction axis, so a 2D block has no
+      meaning.
+    - There is no un-shuffled layout to choose. The A6W6 kernels read the packed
+      C0/C1 tile blob directly, so the layout is part of the format rather than an
+      option applied on top of it.
+    """
+
+    format: Format = Format.E2M3
+    granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
+    strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
+    scale_dtype: ScaleDtype = ScaleDtype.E8M0
+    block_size: int = MXFP6_BLOCK_SIZE
+    # Accepted but not yet implemented; asserted off rather than silently ignored, so
+    # a caller asking for SR gets an error instead of round-to-nearest.
+    use_gradient_sr: bool = False
+
+    def __post_init__(self):
+        assert self.granularity == ScalingGranularity.MX_BLOCKWISE, (
+            "Float6QuantConfig currently only supports MX_BLOCKWISE granularity"
+        )
+        assert self.format == Format.E2M3, "Format must be E2M3 for Float6QuantConfig"
+
+        mx_support_block_size = [MXFP6_BLOCK_SIZE]
+        assert self.block_size in mx_support_block_size, (
+            f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
+        )
+
+        mx_support_scale_dtype = ScaleDtype.E8M0
+        assert self.scale_dtype == mx_support_scale_dtype, (
+            f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
+        )
+
+        assert not self.use_gradient_sr, (
+            "use_gradient_sr is not implemented for MXFP6 yet. With 3 mantissa bits the "
+            "MXFP4 motivation for stochastic rounding largely does not apply; remove this "
+            "assert together with the SR path in the packer."
+        )
+
+
 # Lets a config travel through a torch.library custom op as a single argument rather
 # than being flattened into scalars. A "value" type is specialized into the compiled
 # graph and guarded on equality, which is what a static recipe wants. Note the schema
 # admits these only as required parameters: neither a default nor an Optional of an
-# opaque type is inferrable.
+# opaque type is inferrable. Float6QuantConfig is absent because the MXFP6 ops take
+# packed blobs rather than a config, so it never crosses a custom-op boundary.
 for _opaque_cls in (Float8QuantConfig, Float4QuantConfig, ScalingRecipe):
     register_opaque_type(_opaque_cls, typ="value")

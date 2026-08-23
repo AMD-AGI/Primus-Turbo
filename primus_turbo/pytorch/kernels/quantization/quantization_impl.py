@@ -17,6 +17,7 @@ from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import (
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     MXFP4_PADDING_ALIGN_SIZE,
+    MXFP6_BLOCK_SIZE,
     MXFP8_BLOCK_SIZE,
     MXFP8_PADDING_ALIGN_SIZE,
     ScalingRecipe,
@@ -999,3 +1000,80 @@ def dequantize_mxfp4_impl(
     )
 
     return torch.ops.primus_turbo_cpp_extension.dequantize_mxfp4(x, scale_inv, axis, block_size, out_dtype)
+
+
+@torch.library.custom_op("primus_turbo::quantize_mxfp6_impl", mutates_args=(), device_types="cuda")
+def quantize_mxfp6_impl(
+    x: torch.Tensor,
+    axis: int,
+    block_size: int = MXFP6_BLOCK_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize + pack a 2D tensor to MXFP6, contracting along ``axis``.
+
+    ``axis=-1`` / ``1`` packs along the last dimension, ``axis=-2`` / ``0`` along the
+    first. Returns two opaque 1-D uint8 blobs ``(operand, scale)``; the logical shape is
+    not recoverable from them, so the caller must carry it to the GEMM.
+
+    Opaque ``custom_op`` rather than ``triton_op``: the packer reaches into AITER, whose
+    kernel selection does lru_cached pandas lookups on M/N/K that cannot see SymInts.
+    """
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import (
+        quantize_mxfp6_col,
+        quantize_mxfp6_row,
+    )
+
+    assert x.dim() == 2, f"MXFP6 quantization expects a 2D tensor, got {x.dim()}D"
+    if axis in (1, -1):
+        return quantize_mxfp6_row(x, block_size)
+    if axis in (0, -2):
+        return quantize_mxfp6_col(x, block_size)
+    raise ValueError(f"axis must be one of 0, 1, -1, -2 for a 2D MXFP6 quantize, got {axis}")
+
+
+@quantize_mxfp6_impl.register_fake
+def quantize_mxfp6_impl_meta(
+    x: torch.Tensor,
+    axis: int,
+    block_size: int = MXFP6_BLOCK_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_sizes
+
+    assert x.dim() == 2, f"MXFP6 quantization expects a 2D tensor, got {x.dim()}D"
+    rows, cols = x.shape
+    if axis in (0, -2):
+        rows, cols = cols, rows
+    operand_bytes, scale_bytes = mxfp6_pack_sizes(rows, cols)
+    return (
+        torch.empty(operand_bytes, dtype=torch.uint8, device=x.device),
+        torch.empty(scale_bytes, dtype=torch.uint8, device=x.device),
+    )
+
+
+@torch.library.custom_op("primus_turbo::quantize_mxfp6_dual_impl", mutates_args=(), device_types="cuda")
+def quantize_mxfp6_dual_impl(
+    x: torch.Tensor,
+    block_size: int = MXFP6_BLOCK_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack ``x`` along both axes, returning ``(row, row_scale, col, col_scale)``.
+
+    Training needs every tensor in both directions, because the three GEMM directions
+    contract over different dimensions -- see ``mxfp6_pack`` for the derivation.
+    """
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import quantize_mxfp6_dual
+
+    return quantize_mxfp6_dual(x, block_size)
+
+
+@quantize_mxfp6_dual_impl.register_fake
+def quantize_mxfp6_dual_impl_meta(
+    x: torch.Tensor,
+    block_size: int = MXFP6_BLOCK_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_sizes
+
+    assert x.dim() == 2, f"MXFP6 quantization expects a 2D tensor, got {x.dim()}D"
+    rows, cols = x.shape
+    row_operand, row_scale = mxfp6_pack_sizes(rows, cols)
+    col_operand, col_scale = mxfp6_pack_sizes(cols, rows)
+    empty = lambda n: torch.empty(n, dtype=torch.uint8, device=x.device)  # noqa: E731
+    return empty(row_operand), empty(row_scale), empty(col_operand), empty(col_scale)
