@@ -102,10 +102,34 @@ def _wsq_ilv(nb, B, Sq, hd, elem_bytes=2):
 # asks for none -- capacity, not speed, is what still needs the Q-outer dq kernel there. Past
 # the cap the band axis is walked in groups (see _band_span_for) and the reduce carries the
 # running fp32 sum from group to group, so the footprint follows the cap instead of the context.
-# A smaller cap hands the next group a running sum to re-read one more time, but that traffic
-# measures flat against the group count, so the cap is set at what a long context can afford to
-# reserve rather than at what the carry would like.
-_WSQ_BUDGET_BYTES = 16 << 30
+# A smaller cap hands the next group a running sum to re-read one more time. That traffic does
+# measure flat against the group count, but walking the axis in groups is NOT free: it costs
+# 11% at (4, 64, 8, 8192, 128) and 11% at (1, 64, 8, 16384, 128), and 9-23% across a span sweep
+# at both head dims, bitwise identical either way. So the cap should be as large as the card can
+# actually spare, not a round number.
+#
+# It scales with TOTAL memory, not free memory. Free memory moves between calls, and a cap that
+# moves with it flips the plan between the grouped and whole-axis paths on the same shape -- two
+# guard cells were seen reading either 14 or 28 ms for exactly that reason. Total memory is a
+# property of the device, so the plan a shape gets is fixed.
+_WSQ_BUDGET_FRACTION = 0.15
+
+
+def _wsq_budget_bytes():
+    """Cap on the dQ split-K partial workspace, at least the old fixed 16 GiB."""
+    fixed = 16 << 30
+    try:
+        total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    except Exception:
+        return fixed
+    return max(fixed, int(total * _WSQ_BUDGET_FRACTION))
+
+
+_WSQ_BUDGET_BYTES = None  # set to a byte count to override; probes use it to price a span
+
+
+def _wsq_budget():
+    return _WSQ_BUDGET_BYTES if _WSQ_BUDGET_BYTES is not None else _wsq_budget_bytes()
 
 
 def _band_span_for(n_bands, band_bytes, ilv, whole=True):
@@ -127,13 +151,13 @@ def _band_span_for(n_bands, band_bytes, ilv, whole=True):
     the same run, whose makespan is the longest walk in it. Rounding the span down to a run
     beats every span between two runs by more than the extra pass it costs.
     """
-    if n_bands * band_bytes <= _WSQ_BUDGET_BYTES:
+    if n_bands * band_bytes <= _wsq_budget():
         return 0
     if not whole:
-        span = max(1, _WSQ_BUDGET_BYTES // band_bytes)
+        span = max(1, _wsq_budget() // band_bytes)
         return span - span % _NUM_XCD if span >= _NUM_XCD else span
     span = ilv
-    while span * 2 < n_bands and n_bands % (span * 2) == 0 and span * 2 * band_bytes <= _WSQ_BUDGET_BYTES:
+    while span * 2 < n_bands and n_bands % (span * 2) == 0 and span * 2 * band_bytes <= _wsq_budget():
         span *= 2
     return span if span < n_bands else 0
 
@@ -148,13 +172,13 @@ def _wsq_ring_for(n_bands, block_kv, window_left, ilv, band_bytes, block_q=_BWD_
     changes neither what is written nor the ascending order it is read back in. Only the
     workspace shrinks, from the band axis to the window. Gated on BYTES rather than on having
     a window, so a shape whose bands already fit keeps the plain band index (see
-    _WSQ_BUDGET_BYTES); the group, not the band, is the unit because interleaved bands share
+    _wsq_budget()); the group, not the band, is the unit because interleaved bands share
     a row (see _wsq_ilv). Opening it on the window alone is a CAPACITY lever, not a speed one:
     it takes gptoss_swa's workspace from 16 GiB to 4 GiB, and paired against this gate on the
     same host it measures gptoss_swa +0.72% and swa_d128_hq64 +0.08% -- the slots a window
     skips cost neither descriptor nor page walk, so shrinking them buys no wall time.
     """
-    if window_left < 0 or n_bands * band_bytes <= _WSQ_BUDGET_BYTES:
+    if window_left < 0 or n_bands * band_bytes <= _wsq_budget():
         return 0
     span = (window_left + block_q - 1) // block_kv + 2
     grp = span // ilv + 2
@@ -1269,6 +1293,8 @@ def build_flash_attn_bwd_dkdv_module(
     # BLOCK_KV, and that is measured shut from the other side: +17% at D128, +65% at D64,
     # spill-free arms included (see _fuse_blockkv_for).
     wsq_atomic=0,
+    # wsq_acoal: with wsq_atomic on, issue the atomics COALESCED (see _g3_atomic).
+    wsq_acoal=0,
     # wsq_rmw: PROBE (dQ/dK/dV stay EXACT -- the value read is pinned live and discarded).
     # A slot-indexed dQ partial workspace (one slot per resident work-group instead of one
     # per kv band, so nsplits falls from Skv/BLOCK_KV to that over the bands a slot owns)
@@ -1450,6 +1476,7 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_RING = int(wsq_ring)
     WSQ_NREC = max(1, int(wsq_nrec or 1))
     WSQ_ATOMIC = int(wsq_atomic or 0)
+    WSQ_ACOAL = int(wsq_acoal or 0)
     WSQ_RMW = bool(wsq_rmw)
     KV_REFETCH = max(0, int(kv_refetch or 0))
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
@@ -2984,16 +3011,41 @@ def build_flash_attn_bwd_dkdv_module(
                 the partial -- the accumulation itself is fp32, which is what keeps dQ inside
                 its 1 dB SNR margin once the fold's fixed band order is gone.
                 """
-                _a32 = ArithValue(_raw(_g3_elem(i, j, ilv=False) * fx.Index(4))).index_cast(
-                    fx.Int32.ir_type
-                )
+                if const_expr(WSQ_ACOAL):
+                    # A PROBE ON A PROBE, and dQ is wrong under either. Same eight atomics per
+                    # lane, same dwords, same image -- only the address pattern moves, from 64
+                    # lanes scattered over 32 lines (each taking two dwords of one) to 64 lanes
+                    # covering one contiguous 256 B run. The wave's base is its own q row and
+                    # D-tile with the lane terms dropped, so the footprint stays the real dQ
+                    # image rather than collapsing somewhere cache-resident. This isolates the
+                    # 8x line amplification from the payload, which is the whole question:
+                    # the payload is arithmetic and cannot be tuned away, the amplification is
+                    # a layout and can (that is what aiter's 64 v_permlane16_swap_b32 buy).
+                    _t = _g3q0 + fx.Index(j * G3_SPL_STRIDE)
+                    _row0 = (
+                        q_start
+                        + ((_t >> fx.Index(1)) << fx.Index(5))
+                        + ((_t & fx.Index(1)) << fx.Index(3))
+                    )
+                    _e0 = (_row0 * fx.Index(NUM_HEADS_Q) + _g3qh) * fx.Index(HEAD_DIM) + (
+                        _g3d0 + fx.Index(i)
+                    ) * fx.Index(D_TILE)
+                    _a32 = ArithValue(_raw((_e0 + lane) * fx.Index(4))).index_cast(
+                        fx.Int32.ir_type
+                    )
+                    _step = 256
+                else:
+                    _a32 = ArithValue(_raw(_g3_elem(i, j, ilv=False) * fx.Index(4))).index_cast(
+                        fx.Int32.ir_type
+                    )
+                    _step = 4
                 for _w in range_constexpr(4):
                     rocdl.raw_ptr_buffer_atomic_fadd(
-                        _raw(_lo[_w]), wsq32_rsrc, _a32, 4 * _w, WSQ_ATOMIC - 1
+                        _raw(_lo[_w]), wsq32_rsrc, _a32, _step * _w, WSQ_ATOMIC - 1
                     )
                 for _w in range_constexpr(4):
                     rocdl.raw_ptr_buffer_atomic_fadd(
-                        _raw(_hi[_w]), wsq32_rsrc, _a32, 16 + 4 * _w, WSQ_ATOMIC - 1
+                        _raw(_hi[_w]), wsq32_rsrc, _a32, _step * (4 + _w), WSQ_ATOMIC - 1
                     )
 
             for _gi in range_constexpr(len(_dgs)):
