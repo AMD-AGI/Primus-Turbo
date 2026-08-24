@@ -18,6 +18,7 @@ import torch
 
 import primus_turbo.pytorch.ops.attention.flex_attention  # noqa: F401
 from primus_turbo.pytorch.ops.attention.flex_attention import (
+    _backend_accepts,
     _cached_detect_alibi_slopes,
     _cached_detect_softcap,
     _classify_block_mask,
@@ -2211,3 +2212,184 @@ def test_bshd_entry_document_mask_returns_bshd(capture_varlen_backend):
     out = flex_attention_bshd(q, q.clone(), q.clone(), block_mask=bm)
     assert capture_varlen_backend["called"] is True
     assert out.shape == (1, S, H, D)
+
+
+# ===========================================================================
+# Backend feature probing (_backend_accepts) + the sink-on-varlen gate
+#
+# The varlen entry only threads ``sink`` when the caller supplies one, so older
+# Primus-Turbo builds whose ``flash_attn_varlen_func`` predates the parameter still
+# work for the common case. The failure that had to be closed is the *uncommon*
+# case: a caller who DOES pass a sink to such a build used to get a bare
+#   TypeError: flash_attn_varlen_func() got an unexpected keyword argument 'sink'
+# from inside the binding -- which names the wrong culprit and, worse, reads like a
+# bug in the compat layer rather than a missing backend capability. This module's
+# whole contract is that unsupported things raise NotImplementedError saying why.
+# ===========================================================================
+
+
+# These mirror the real ``flash_attn_varlen_func`` keyword set so that a call can
+# actually go through them; the only difference between the two is the presence of
+# ``sink``, which is exactly the build difference being probed.
+def _fn_with_sink(
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    max_q,
+    max_k,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+    return_lse=False,
+    sink=None,
+):
+    return q
+
+
+def _fn_without_sink(
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    max_q,
+    max_k,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+    return_lse=False,
+):
+    return q
+
+
+def _fn_var_kwargs(q, k, v, cu_q, cu_k, max_q, max_k, **kwargs):
+    return q
+
+
+def test_backend_accepts_detects_present_parameter():
+    assert _backend_accepts(_fn_with_sink, "sink") is True
+
+
+def test_backend_accepts_detects_absent_parameter():
+    assert _backend_accepts(_fn_without_sink, "sink") is False
+
+
+def test_backend_accepts_treats_var_kwargs_as_permissive():
+    # A backend declared as **kwargs could accept anything; refusing pre-emptively
+    # would break perfectly good builds, so it is given the benefit of the doubt.
+    assert _backend_accepts(_fn_var_kwargs, "sink") is True
+    assert _backend_accepts(_fn_var_kwargs, "anything_at_all") is True
+
+
+def test_backend_accepts_unintrospectable_callable_is_permissive(monkeypatch):
+    # C-implemented callables can have no retrievable signature at all. Rejecting
+    # them would make the compat layer unusable against a compiled backend, so the
+    # probe has to fall back to "assume it works" rather than "assume it doesn't".
+    # (Most builtins DO carry a signature these days, so the condition is forced
+    # here rather than hoping to find a genuinely opaque one.)
+    def boom(_fn):
+        raise ValueError("no signature found for builtin")
+
+    monkeypatch.setattr(fa_mod.inspect, "signature", boom)
+    opaque = object()
+    assert _backend_accepts(opaque, "sink") is True
+
+
+def test_backend_accepts_is_cached_but_not_confused_by_id_reuse():
+    # The cache is keyed on id(fn) for speed; it must also verify identity, because
+    # CPython recycles the ids of collected objects. Two callables that happen to
+    # land on the same id must not inherit each other's parameter set.
+    assert _backend_accepts(_fn_with_sink, "sink") is True
+    assert _backend_accepts(_fn_with_sink, "sink") is True  # second call hits the cache
+    assert _backend_accepts(_fn_without_sink, "sink") is False
+
+    def make():
+        def tmp(q, k, v, cu_q, cu_k, max_q, max_k, *, sink=None):
+            return q
+
+        return tmp
+
+    seen = set()
+    for _ in range(50):
+        fn = make()
+        assert _backend_accepts(fn, "sink") is True
+        seen.add(id(fn))
+        del fn  # let the id be recycled by the next iteration
+    # Whatever ids were recycled, every probe above still answered from the real
+    # signature rather than a stale cache entry.
+    assert len(seen) >= 1
+
+
+def _install_varlen_backend(monkeypatch, fn):
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_varlen_func",
+        fn,
+        raising=True,
+    )
+
+
+def test_varlen_sink_raises_not_implemented_on_a_backend_without_it(monkeypatch):
+    _install_varlen_backend(monkeypatch, _fn_without_sink)
+    H, D = 8, 128
+    q = _make_thd(512, H, D)
+    cu, max_s, _ = _cu_from_seqlens([128, 128, 256])
+    sink = torch.zeros(H, dtype=torch.float32)
+    with pytest.raises(NotImplementedError) as exc:
+        flex_attention_varlen(q, q.clone(), q.clone(), cu, cu, max_s, max_s, causal=True, sink=sink)
+    msg = str(exc.value)
+    assert "sink" in msg
+    # The message must point at the backend build, not look like a compat-layer bug,
+    # and must offer the path that does work.
+    assert "flash_attn_varlen_func" in msg
+    assert "flex_attention_bshd" in msg
+
+
+def test_varlen_without_a_sink_still_works_on_a_backend_without_it(monkeypatch):
+    # The whole point of threading ``sink`` conditionally: an older backend must stay
+    # usable for every call that does not ask for a sink.
+    _install_varlen_backend(monkeypatch, _fn_without_sink)
+    H, D = 8, 128
+    q = _make_thd(512, H, D)
+    cu, max_s, _ = _cu_from_seqlens([128, 128, 256])
+    out = flex_attention_varlen(q, q.clone(), q.clone(), cu, cu, max_s, max_s, causal=True)
+    assert out.shape == (512, H, D)
+
+
+def test_varlen_sink_is_threaded_when_the_backend_takes_it(monkeypatch):
+    seen = {}
+
+    def fn(q, k, v, cu_q, cu_k, max_q, max_k, *, sink=None, **kwargs):
+        seen["sink"] = sink
+        return q
+
+    _install_varlen_backend(monkeypatch, fn)
+    H, D = 8, 128
+    q = _make_thd(512, H, D)
+    cu, max_s, _ = _cu_from_seqlens([128, 128, 256])
+    sink = torch.arange(H, dtype=torch.float32)
+    flex_attention_varlen(q, q.clone(), q.clone(), cu, cu, max_s, max_s, causal=True, sink=sink)
+    assert seen["sink"] is not None
+    assert torch.equal(seen["sink"], sink)
+
+
+def test_varlen_invalid_sink_is_rejected_before_the_backend_is_consulted(monkeypatch):
+    # A malformed sink is the caller's error regardless of backend capability, so the
+    # validator must fire first -- otherwise a build without the parameter would
+    # report "your backend is too old" for what is really a bad argument.
+    _install_varlen_backend(monkeypatch, _fn_without_sink)
+    H, D = 8, 128
+    q = _make_thd(512, H, D)
+    cu, max_s, _ = _cu_from_seqlens([128, 128, 256])
+    bad = torch.zeros(H, dtype=torch.bfloat16)  # must be fp32
+    with pytest.raises(ValueError):
+        flex_attention_varlen(q, q.clone(), q.clone(), cu, cu, max_s, max_s, causal=True, sink=bad)

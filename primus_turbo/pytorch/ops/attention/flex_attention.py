@@ -60,6 +60,7 @@ Design notes
   FLEX_COMPAT_STATUS.md for the aiter-signature evidence and options.
 """
 
+import inspect
 import math
 import warnings
 import weakref
@@ -2117,6 +2118,44 @@ def flex_attention_bshd(
     return out
 
 
+# id(fn) -> (fn, params). The callable itself is retained deliberately: keying on
+# id() alone is unsound because CPython recycles ids of collected objects, and a
+# recycled id would hand back another function's parameter set. Backends are
+# module-level functions that live for the process anyway, so pinning a handful of
+# them costs nothing.
+_BACKEND_PARAM_CACHE: Dict[int, Tuple[Callable, Optional[frozenset]]] = {}
+
+
+def _backend_accepts(fn: Callable, name: str) -> bool:
+    """Does ``fn`` take a keyword argument called ``name``?
+
+    Used to tell "this Primus-Turbo build predates the parameter" apart from "the
+    caller asked for something we support". Getting that wrong in either direction is
+    bad: passing an unknown kwarg surfaces a bare ``TypeError`` from inside the backend
+    binding (unreadable, and it names the wrong culprit), while silently dropping the
+    argument changes the numbers without telling anyone. A backend that takes
+    ``**kwargs`` is assumed to accept everything, and an unintrospectable callable
+    (C extension, no signature) is given the benefit of the doubt rather than
+    pre-emptively rejected.
+    """
+    key = id(fn)
+    cached = _BACKEND_PARAM_CACHE.get(key)
+    if cached is not None and cached[0] is fn:
+        params = cached[1]
+    else:
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):  # pragma: no cover - C callables
+            params = None
+        else:
+            if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                params = None
+            else:
+                params = frozenset(sig.parameters)
+        _BACKEND_PARAM_CACHE[key] = (fn, params)
+    return True if params is None else name in params
+
+
 def flex_attention_varlen(
     query,
     key,
@@ -2253,6 +2292,16 @@ def flex_attention_varlen(
         return_lse=return_lse,
     )
     if effective_sink is not None:
+        if not _backend_accepts(flash_attn_varlen_func, "sink"):
+            raise NotImplementedError(
+                "Turbo flex varlen entry: an attention sink was supplied, but this "
+                "Primus-Turbo build's flash_attn_varlen_func has no 'sink' parameter, so the "
+                "sink logits cannot reach the packed kernel. Dropping them would change the "
+                "softmax denominator for every query in the batch and silently produce "
+                "different numbers, so this raises instead. Use the dense entries "
+                "(flex_attention / flex_attention_bshd), whose backend does take a sink, or "
+                "upgrade Primus-Turbo."
+            )
         call_kwargs["sink"] = effective_sink
 
     return flash_attn_varlen_func(
