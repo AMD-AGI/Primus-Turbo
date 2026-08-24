@@ -39,6 +39,7 @@ from primus_turbo.pytorch.ops.attention.flex_attention import (
     clear_backend_overrides,
     clear_classification_cache,
     flex_attention,
+    flex_attention_bshd,
     flex_attention_varlen,
     register_backend_override,
 )
@@ -1637,11 +1638,111 @@ def test_flex_document_return_lse_rejected(capture_varlen_backend):
     assert "called" not in capture_varlen_backend
 
 
-def test_flex_document_too_long_rejected(capture_varlen_backend):
-    # S beyond the probe limit (512): boundaries can't be verified -> not routed,
-    # falls through to NotImplementedError (never silently wrong).
+# ===========================================================================
+# Document packing beyond the 512 probe grid (_locate_document_segments)
+# ===========================================================================
+
+
+def test_classify_document_beyond_probe_short_docs():
+    # Docs shorter than the probe grid, sequence longer than it: the probed corner is
+    # block-diagonal (neither causal nor a window), so recovery goes through the
+    # full-sequence locator.
+    seg = [128] * 8  # total 1024 > 512
+    bm = _doc_causal_block_mask(seg)
+    cfg = _classify_block_mask(bm, B=1, H=1, q_len=1024, kv_len=1024)
+    assert cfg["kind"] == "document_causal"
+    assert cfg["doc_seglens"] == seg
+
+
+def test_classify_document_beyond_probe_first_doc_longer_than_probe():
+    # The first document covers the whole probe grid, so the corner looks exactly
+    # causal; only the far-position check plus the locator can tell it apart from a
+    # plain causal / large sliding window mask.
+    seg = [1024, 512, 512]
+    bm = _doc_causal_block_mask(seg)
+    cfg = _classify_block_mask(bm, B=1, H=1, q_len=2048, kv_len=2048)
+    assert cfg["kind"] == "document_causal"
+    assert cfg["doc_seglens"] == seg
+
+
+def test_classify_document_beyond_probe_uneven_segments():
+    seg = [37, 611, 1, 200, 175]
+    total = sum(seg)
+    bm = _doc_causal_block_mask(seg)
+    cfg = _classify_block_mask(bm, B=1, H=1, q_len=total, kv_len=total)
+    assert cfg["kind"] == "document_causal"
+    assert cfg["doc_seglens"] == seg
+
+
+def test_locate_document_segments_direct():
+    seg = [300, 300, 424]
+    bm = _doc_causal_block_mask(seg)
+    assert fa_mod._locate_document_segments(bm.mask_mod, q_len=1024, kv_len=1024) == seg
+
+
+def test_locate_document_segments_single_doc_returns_none():
+    # No boundary at all == plain causal; the locator must not claim a document mask.
+    def causal(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    assert fa_mod._locate_document_segments(causal, q_len=1024, kv_len=1024) is None
+
+
+def test_locate_document_segments_rejects_holed_mask():
+    # Block-diagonal boundaries look right on the sub-diagonal, but an extra hole makes
+    # the exact reconstruction fail -> None (caller raises, never silently wrong).
+    seg = [256, 256, 512]
+    base = _doc_causal_block_mask(seg).mask_mod
+
+    def holed(b, h, q_idx, kv_idx):
+        return base(b, h, q_idx, kv_idx) & ~((q_idx == 700) & (kv_idx == 600))
+
+    assert fa_mod._locate_document_segments(holed, q_len=1024, kv_len=1024) is None
+
+
+def test_locate_document_segments_rejects_window_mask():
+    # A large sliding window also has an invisible far corner; it must not be mistaken
+    # for document packing.
+    def swa(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & ((q_idx - kv_idx) <= 600)
+
+    assert fa_mod._locate_document_segments(swa, q_len=1024, kv_len=1024) is None
+
+
+def test_locate_document_segments_rejects_non_square():
+    seg = [128, 128]
+    bm = _doc_causal_block_mask(seg)
+    assert fa_mod._locate_document_segments(bm.mask_mod, q_len=256, kv_len=512) is None
+
+
+def test_locate_document_segments_beyond_exact_verify_limit():
+    # Past _DOC_EXACT_VERIFY_LIMIT the O(S^2) verification is refused rather than
+    # downgraded to sampling: we decline to classify instead of risking a wrong route.
+    seg = [512, 512]
+    bm = _doc_causal_block_mask(seg)
+    limit = fa_mod._DOC_EXACT_VERIFY_LIMIT
+    assert fa_mod._locate_document_segments(bm.mask_mod, q_len=limit + 1, kv_len=limit + 1) is None
+
+
+def test_flex_document_beyond_probe_routes_to_varlen(capture_varlen_backend):
+    # Used to raise NotImplementedError (S > 512); now recovered and routed to varlen.
     seg = [128] * 8  # total 1024 > 512
     total, H, D = 1024, 8, 128
+    q = _make_bhsd(1, H, total, D)
+    bm = _doc_causal_block_mask(seg)
+    out = flex_attention(q, q.clone(), q.clone(), block_mask=bm)
+    assert capture_varlen_backend["called"] is True
+    assert capture_varlen_backend["cu_q"].tolist() == [0, 128, 256, 384, 512, 640, 768, 896, 1024]
+    assert capture_varlen_backend["max_q"] == 128
+    assert out.shape == (1, H, total, D)
+
+
+def test_flex_document_too_long_rejected(capture_varlen_backend):
+    # Beyond the exact-verification limit the boundaries cannot be verified in full ->
+    # not routed, falls through to NotImplementedError (never silently wrong).
+    total = fa_mod._DOC_EXACT_VERIFY_LIMIT + 512
+    seg = [512] * (total // 512)
+    H, D = 2, 64
     q = _make_bhsd(1, H, total, D)
     bm = _doc_causal_block_mask(seg)
     with pytest.raises(NotImplementedError):
@@ -1921,3 +2022,184 @@ def test_clear_classification_cache_forces_recompute():
     cfg2 = _classify_block_mask(bm, B=1, H=1, q_len=64, kv_len=64)
     assert cfg1 is not cfg2  # cache cleared -> recomputed (new object)
     assert cfg1 == cfg2
+
+
+# ===========================================================================
+# ALiBi sign-convention build self-check
+# ===========================================================================
+
+
+def _fake_alibi_backend(sign):
+    """A CPU stand-in for flash_attn_func that applies ALiBi with the given sign."""
+
+    def fake(q, k, v, causal=False, alibi_slopes=None, **kwargs):
+        q_b, k_b, v_b = (t.transpose(1, 2) for t in (q, k, v))
+        out = fa_mod._reference_attention_with_alibi(q_b, k_b, v_b, alibi_slopes, sign, causal=causal)
+        return out.transpose(1, 2).to(q.dtype)
+
+    return fake
+
+
+@pytest.fixture
+def patch_alibi_backend(monkeypatch):
+    def _apply(sign):
+        monkeypatch.setattr(
+            "primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_func",
+            _fake_alibi_backend(sign),
+        )
+
+    return _apply
+
+
+def test_check_alibi_sign_detects_plus(patch_alibi_backend):
+    patch_alibi_backend(1.0)
+    rep = fa_mod.check_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
+    assert rep["sign"] == 1.0
+    assert rep["matches_assumption"] is True
+    assert rep["plus_err"] < rep["minus_err"]
+
+
+def test_check_alibi_sign_detects_minus(patch_alibi_backend):
+    patch_alibi_backend(-1.0)
+    rep = fa_mod.check_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
+    assert rep["sign"] == -1.0
+    assert rep["matches_assumption"] is False
+
+
+def test_assert_alibi_sign_passes_on_matching_build(patch_alibi_backend):
+    patch_alibi_backend(fa_mod._ASSUMED_ALIBI_SIGN)
+    rep = fa_mod.assert_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
+    assert rep["matches_assumption"] is True
+
+
+def test_assert_alibi_sign_raises_on_flipped_build(patch_alibi_backend):
+    patch_alibi_backend(-fa_mod._ASSUMED_ALIBI_SIGN)
+    with pytest.raises(RuntimeError, match="ALiBi sign convention"):
+        fa_mod.assert_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
+
+
+def test_check_alibi_sign_reports_unknown_for_unrelated_backend(monkeypatch):
+    # A backend that ignores ALiBi entirely matches neither hypothesis: report None
+    # rather than picking the "less wrong" sign.
+    def no_alibi(q, k, v, causal=False, alibi_slopes=None, **kwargs):
+        zeros = torch.zeros_like(alibi_slopes)
+        q_b, k_b, v_b = (t.transpose(1, 2) for t in (q, k, v))
+        out = fa_mod._reference_attention_with_alibi(q_b, k_b, v_b, zeros, 1.0, causal=causal)
+        return out.transpose(1, 2).to(q.dtype)
+
+    monkeypatch.setattr("primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_func", no_alibi)
+    rep = fa_mod.check_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
+    assert rep["sign"] is None
+    assert rep["matches_assumption"] is False
+
+
+# ===========================================================================
+# bshd-native entry point (transpose/copy elimination)
+# ===========================================================================
+
+
+def _make_bshd(B=2, S=32, H=4, D=16, dtype=torch.float16):
+    return torch.randn(B, S, H, D, dtype=dtype)
+
+
+def test_bshd_entry_returns_bshd_and_dispatches(capture_backend):
+    B, S, H, D = 2, 32, 4, 16
+    q, k, v = (_make_bshd(B, S, H, D) for _ in range(3))
+    out = flex_attention_bshd(q, k, v)
+    assert capture_backend["called"] is True
+    # Backend sees bshd, and so does the caller -- no layout round-trip.
+    assert capture_backend["q_shape"] == (B, S, H, D)
+    assert out.shape == (B, S, H, D)
+
+
+def test_bshd_entry_passes_qkv_without_copying(monkeypatch):
+    seen = {}
+
+    def fake(q, k, v, **kwargs):
+        seen["q_ptr"] = q.data_ptr()
+        seen["k_ptr"] = k.data_ptr()
+        seen["v_ptr"] = v.data_ptr()
+        return q.clone()
+
+    monkeypatch.setattr("primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_func", fake)
+    q, k, v = (_make_bshd() for _ in range(3))
+    flex_attention_bshd(q, k, v)
+    # A bshd-contiguous input reaches the kernel as the very same buffer.
+    assert seen["q_ptr"] == q.data_ptr()
+    assert seen["k_ptr"] == k.data_ptr()
+    assert seen["v_ptr"] == v.data_ptr()
+
+
+def test_bshd_entry_returns_backend_output_without_copying(monkeypatch):
+    made = {}
+
+    def fake(q, k, v, **kwargs):
+        out = q.clone()
+        made["ptr"] = out.data_ptr()
+        return out
+
+    monkeypatch.setattr("primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_func", fake)
+    q, k, v = (_make_bshd() for _ in range(3))
+    out = flex_attention_bshd(q, k, v)
+    assert out.data_ptr() == made["ptr"]
+
+
+def test_bhsd_entry_still_returns_bhsd(capture_backend):
+    # The torch-compatible entry is untouched: bhsd in, bhsd out.
+    B, H, S, D = 2, 4, 32, 16
+    q, k, v = _make_qkv(B=B, Hq=H, S=S, D=D)
+    out = flex_attention(q, k, v)
+    assert capture_backend["q_shape"] == (B, S, H, D)
+    assert out.shape == (B, H, S, D)
+
+
+def test_bshd_and_bhsd_entries_agree(monkeypatch):
+    # Same numbers either way: the bshd entry is a layout change, not a semantic one.
+    def fake(q, k, v, **kwargs):
+        return (q.float() + k.float() + v.float()).to(q.dtype)
+
+    monkeypatch.setattr("primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_func", fake)
+    B, S, H, D = 2, 32, 4, 16
+    q, k, v = (_make_bshd(B, S, H, D) for _ in range(3))
+    out_bshd = flex_attention_bshd(q, k, v)
+    out_bhsd = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+    assert torch.equal(out_bshd, out_bhsd.transpose(1, 2))
+
+
+def test_bshd_entry_return_lse(capture_backend):
+    B, S, H, D = 1, 32, 4, 16
+    q, k, v = (_make_bshd(B, S, H, D) for _ in range(3))
+    out, lse = flex_attention_bshd(q, k, v, return_lse=True)
+    assert out.shape == (B, S, H, D)
+    assert lse.shape == (B, H, S)
+
+
+def test_bshd_entry_forwards_turbo_extension_args(capture_backend):
+    B, S, H, D = 1, 32, 4, 16
+    q, k, v = (_make_bshd(B, S, H, D) for _ in range(3))
+    slopes = torch.tensor([1.0, 0.5, 0.25, 0.125], dtype=torch.float32)
+    flex_attention_bshd(q, k, v, alibi_slopes=slopes.clone(), dropout_p=0.1, scale=0.5)
+    kw = capture_backend["kwargs"]
+    assert torch.allclose(kw["alibi_slopes"].cpu(), slopes)
+    assert kw["dropout_p"] == pytest.approx(0.1)
+    assert kw["softmax_scale"] == pytest.approx(0.5)
+
+
+def test_bshd_entry_validation_errors_match_bhsd():
+    # Same rejections as the bhsd entry (softcap is gated, GQA needs the flag).
+    q, k, v = (_make_bshd() for _ in range(3))
+    with pytest.raises(NotImplementedError):
+        flex_attention_bshd(q, k, v, softcap=30.0)
+    q8 = _make_bshd(H=8)
+    with pytest.raises(ValueError):
+        flex_attention_bshd(q8, k, v)
+
+
+def test_bshd_entry_document_mask_returns_bshd(capture_varlen_backend):
+    seg = [128, 128]
+    S, H, D = 256, 4, 64
+    q = _make_bshd(1, S, H, D)
+    bm = _doc_causal_block_mask(seg)
+    out = flex_attention_bshd(q, q.clone(), q.clone(), block_mask=bm)
+    assert capture_varlen_backend["called"] is True
+    assert out.shape == (1, S, H, D)

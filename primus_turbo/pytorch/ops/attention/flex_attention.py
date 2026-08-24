@@ -74,6 +74,7 @@ except Exception:  # pragma: no cover - depends on torch version
 
 __all__ = [
     "flex_attention",
+    "flex_attention_bshd",
     "flex_attention_varlen",
     "create_block_mask",
     "SUPPORT_STATUS",
@@ -81,6 +82,8 @@ __all__ = [
     "register_backend_override",
     "clear_backend_overrides",
     "clear_classification_cache",
+    "check_alibi_sign_convention",
+    "assert_alibi_sign_convention",
 ]
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
@@ -89,7 +92,19 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 # a binary search on the last query row (see _locate_left_window) rather than
 # silently mis-classified.
 _MASK_PROBE_LIMIT = 512
+# Document packing longer than the probe grid is recovered from mask_mod directly
+# (see _locate_document_segments). Verification there is *exact*, which costs O(S^2)
+# bool comparisons, so it is bounded: beyond this sequence length we decline to
+# classify rather than downgrade to sampled verification.
+_DOC_EXACT_VERIFY_LIMIT = 16384
+# Rows per vectorised mask_mod call during that exact verification (keeps peak
+# memory at chunk*S bools instead of S*S).
+_DOC_VERIFY_CHUNK = 256
 _ALIBI_TOL = 5e-3
+# The ALiBi sign convention this layer assumes: Turbo's positive ``alibi_slopes``
+# behaves like flex's ``+slope*(kv-q)``. Empirically resolved on rocm/primus:v26.5;
+# ``check_alibi_sign_convention()`` re-validates it on any other build.
+_ASSUMED_ALIBI_SIGN = 1.0
 # Relative tolerance for recognising a logits soft-cap (cap*tanh(score/cap)).
 _SOFTCAP_TOL = 1e-2
 
@@ -145,6 +160,113 @@ def _cache_put(cache: "weakref.WeakKeyDictionary", obj: Any, key: Tuple, value: 
     inner[key] = value
 
 
+def _reference_attention_with_alibi(
+    q_bhsd: torch.Tensor,
+    k_bhsd: torch.Tensor,
+    v_bhsd: torch.Tensor,
+    slopes: torch.Tensor,
+    sign: float,
+    *,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Dense fp32 reference for ``softmax(QK^T/sqrt(d) + sign*slope[h]*(kv-q)) V``."""
+    q = q_bhsd.float()
+    k = k_bhsd.float()
+    v = v_bhsd.float()
+    s_q, s_k = q.shape[-2], k.shape[-2]
+    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(q.shape[-1])
+    q_idx = torch.arange(s_q, device=q.device).view(s_q, 1)
+    kv_idx = torch.arange(s_k, device=q.device).view(1, s_k)
+    scores = scores + sign * slopes.float().view(1, -1, 1, 1) * (kv_idx - q_idx).float()
+    if causal:
+        scores = scores.masked_fill(kv_idx > q_idx, float("-inf"))
+    return torch.matmul(torch.softmax(scores, dim=-1), v)
+
+
+def check_alibi_sign_convention(
+    *,
+    device: Any = None,
+    dtype: torch.dtype = torch.float16,
+    seqlen: int = 256,
+    num_heads: int = 4,
+    head_dim: int = 64,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """Empirically determine this build's ALiBi sign convention.
+
+    The compat layer maps a flex ``score_mod`` of the form ``score + slope*(kv-q)``
+    onto ``flash_attn_func(alibi_slopes=slope)``. Whether the kernel adds
+    ``+slope*(kv-q)`` or ``-slope*(kv-q)`` is a property of the *installed aiter build*,
+    not of this file -- get it wrong and ALiBi results are silently incorrect. This
+    helper runs one small attention through the real backend and scores it against both
+    fp32 references, so a new container/build can be validated in seconds instead of
+    trusting a comment.
+
+    Returns a dict with ``sign`` (``+1.0``/``-1.0``, or ``None`` if neither reference
+    matches), ``plus_err`` / ``minus_err`` (relative L2), ``matches_assumption`` and the
+    ``assumed_sign`` this layer is coded against. Requires a GPU (it calls the real
+    kernel); it raises whatever the backend raises if one is unavailable.
+    """
+    from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_func
+
+    if device is None:
+        device = "cuda"
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    shape = (1, seqlen, num_heads, head_dim)  # bshd for the Turbo backend
+    q = torch.randn(shape, generator=gen, dtype=torch.float32).to(device=device, dtype=dtype)
+    k = torch.randn(shape, generator=gen, dtype=torch.float32).to(device=device, dtype=dtype)
+    v = torch.randn(shape, generator=gen, dtype=torch.float32).to(device=device, dtype=dtype)
+    # Distinct, clearly separated slopes so the two sign hypotheses cannot alias.
+    slopes = torch.tensor([2.0 ** -(i + 1) for i in range(num_heads)], dtype=torch.float32, device=device)
+
+    out = flash_attn_func(q, k, v, causal=True, alibi_slopes=slopes)
+    if isinstance(out, tuple):
+        out = out[0]
+    got = out.transpose(1, 2).float()  # -> bhsd for comparison
+
+    q_b, k_b, v_b = (t.transpose(1, 2) for t in (q, k, v))
+
+    def _rel_l2(sign: float) -> float:
+        ref = _reference_attention_with_alibi(q_b, k_b, v_b, slopes, sign)
+        return float((got - ref).norm() / ref.norm().clamp_min(1e-12))
+
+    plus_err = _rel_l2(1.0)
+    minus_err = _rel_l2(-1.0)
+    # A match must be both small in absolute terms and decisively better than the other
+    # hypothesis; otherwise report "unknown" rather than guessing.
+    best_err, best_sign = min((plus_err, 1.0), (minus_err, -1.0))
+    other_err = max(plus_err, minus_err)
+    sign = best_sign if (best_err < 2e-2 and other_err > 10.0 * best_err) else None
+    return {
+        "sign": sign,
+        "plus_err": plus_err,
+        "minus_err": minus_err,
+        "assumed_sign": _ASSUMED_ALIBI_SIGN,
+        "matches_assumption": sign == _ASSUMED_ALIBI_SIGN,
+        "dtype": str(dtype),
+        "shape": {"seqlen": seqlen, "num_heads": num_heads, "head_dim": head_dim},
+    }
+
+
+def assert_alibi_sign_convention(**kwargs: Any) -> Dict[str, Any]:
+    """Run :func:`check_alibi_sign_convention` and raise unless it matches the assumption.
+
+    Intended as a one-line build gate (CI job, container smoke test, or the first thing
+    a new environment runs) so a flipped-sign build fails loudly instead of quietly
+    producing wrong ALiBi outputs.
+    """
+    report = check_alibi_sign_convention(**kwargs)
+    if not report["matches_assumption"]:
+        raise RuntimeError(
+            "Turbo flex compat layer: the ALiBi sign convention of this build does not match the "
+            f"assumed +slope*(kv-q) (assumed_sign={report['assumed_sign']}, measured "
+            f"sign={report['sign']}, plus_err={report['plus_err']:.3g}, "
+            f"minus_err={report['minus_err']:.3g}). ALiBi results would be silently wrong on this "
+            "build -- see FLEX_COMPAT_STATUS.md ('ALiBi sign convention (build-dependent)')."
+        )
+    return report
+
+
 def clear_classification_cache() -> None:
     """Clear all mask-classification / score_mod-detection caches.
 
@@ -168,6 +290,11 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # causal call. Requires S <= _MASK_PROBE_LIMIT and no bias / return_lse (use
         # flex_attention_varlen for those); recognition is exact so it never misfires.
         "document_causal_dense_recognition": "block_mask_same_doc_and_causal_routed_to_varlen",
+        # Document packing is no longer capped at the 512 probe grid: when the probe is
+        # truncated, boundaries are read off mask_mod's diagonal/sub-diagonal over the
+        # full sequence and the pattern is verified *exactly* (chunked, no sampling) up
+        # to _DOC_EXACT_VERIFY_LIMIT; beyond that we decline instead of guessing.
+        "document_causal_beyond_probe": "boundaries_from_mask_mod_with_exact_chunked_verification",
         # Sliding-window-causal with a window LARGER than the 512 probe grid (e.g.
         # W=1024/2048/4096 on long sequences) is located by a binary search on the
         # last query row + exact per-row verification (see _locate_left_window), so a
@@ -233,7 +360,13 @@ SUPPORT_STATUS: Dict[str, Any] = {
         ],
     },
     # The empirically resolved ALiBi sign for this build; see module docstring.
+    # check_alibi_sign_convention() / assert_alibi_sign_convention() re-measure it
+    # against the real kernel so a build with the opposite convention fails loudly.
     "alibi_sign_convention": "+slope*(kv-q)",
+    "alibi_sign_self_check": "check_alibi_sign_convention/assert_alibi_sign_convention",
+    # Layout-native entry: [B,S,H,D] in and out, skipping the 4 transpose+contiguous
+    # copies per forward (and their backward mirrors) that the torch-layout entry needs.
+    "bshd_native_entry": "flex_attention_bshd",
     # A recognised variant is routed through choose_backend before dispatch.
     # Default policy is "turbo" for everything; register_backend_override lets a
     # tuner steer specific shapes/kinds to the (currently stub) custom hook.
@@ -475,6 +608,99 @@ def _detect_document_causal_segments(
     return seg_lens
 
 
+def _probe_mask_pairs(
+    mask_mod: Callable, q_positions: torch.Tensor, kv_positions: torch.Tensor
+) -> torch.Tensor:
+    """Evaluate ``mask_mod`` on the *element-wise pairs* ``zip(q_positions, kv_positions)``.
+
+    Both inputs are 1D int64 tensors of equal length; the result is a 1D bool tensor of
+    the same length. One vectorised broadcast call first (the shape passed to the
+    mask_mod is ``[n, 1]`` for both indices, which every ``create_block_mask``-style
+    mask_mod handles), falling back to an element-wise loop for scalar-only lambdas.
+    Used to read a diagonal / sub-diagonal in O(1) kernel-free calls instead of O(S).
+    """
+    n = int(q_positions.numel())
+    try:
+        raw = mask_mod(0, 0, q_positions.view(n, 1), kv_positions.view(n, 1))
+        out = torch.as_tensor(raw, dtype=torch.bool)
+        if out.shape != (n, 1):
+            out = out.broadcast_to((n, 1))
+        return out.reshape(n).contiguous()
+    except Exception:
+        out = torch.empty(n, dtype=torch.bool)
+        for i in range(n):
+            out[i] = _call_mask_mod(mask_mod, 0, 0, int(q_positions[i]), int(kv_positions[i]))
+        return out
+
+
+def _locate_document_segments(mask_mod: Callable, *, q_len: int, kv_len: int) -> Optional[list]:
+    """Recover document lengths for a packed mask whose sequence exceeds the probe grid.
+
+    :func:`_detect_document_causal_segments` only looks at the already-probed
+    ``<= _MASK_PROBE_LIMIT`` corner, so packed sequences longer than that used to raise
+    ``NotImplementedError`` even though the pattern is perfectly expressible. This
+    variant works directly on ``mask_mod`` over the *full* sequence:
+
+    1. Read the diagonal and the sub-diagonal with two vectorised calls (O(S) elements,
+       O(1) python-level mask_mod invocations). Token ``i`` starts a new document iff it
+       may not attend token ``i-1``; the diagonal must be fully visible.
+    2. **Verify exactly, never by sampling**: reconstruct ``same_doc(q,kv) & (q>=kv)``
+       and compare it row-block by row-block against the real mask (one vectorised call
+       per ``_DOC_VERIFY_CHUNK`` rows, so peak memory stays at a few MB instead of
+       ``S^2``). Any deviation returns ``None`` and the caller raises, exactly as before.
+
+    Guarded by ``_DOC_EXACT_VERIFY_LIMIT``: beyond it the full comparison would cost
+    ``O(S^2)``, so we decline rather than downgrade to sampled verification -- an
+    unverifiable mask must never be routed.
+    """
+    if q_len != kv_len:
+        return None
+    n = q_len
+    if n <= 1 or n > _DOC_EXACT_VERIFY_LIMIT:
+        return None
+
+    idx = torch.arange(n)
+    if not bool(_probe_mask_pairs(mask_mod, idx, idx).all().item()):
+        return None  # a hole on the diagonal: not document-causal
+
+    sub_diag = _probe_mask_pairs(mask_mod, idx[1:], idx[:-1])  # mask[i, i-1]
+    boundaries = (~sub_diag).nonzero().flatten().add(1).tolist()
+    if not boundaries:
+        return None  # single document == plain causal, handled elsewhere
+
+    seg_lens = []
+    start = 0
+    for b in boundaries:
+        seg_lens.append(b - start)
+        start = b
+    seg_lens.append(n - start)
+    if len(seg_lens) < 2:
+        return None
+
+    doc_id = torch.empty(n, dtype=torch.int64)
+    pos = 0
+    for d, s in enumerate(seg_lens):
+        doc_id[pos : pos + s] = d
+        pos += s
+
+    kv_idx = torch.arange(n).view(1, n)
+    for lo in range(0, n, _DOC_VERIFY_CHUNK):
+        hi = min(n, lo + _DOC_VERIFY_CHUNK)
+        q_rows = torch.arange(lo, hi)
+        q_idx = q_rows.view(-1, 1)
+        try:
+            raw = mask_mod(0, 0, q_idx, kv_idx)
+            block = torch.as_tensor(raw, dtype=torch.bool)
+            if block.shape != (hi - lo, n):
+                block = block.broadcast_to((hi - lo, n))
+        except Exception:
+            block = torch.stack([_probe_mask_row(mask_mod, int(q), n) for q in q_rows])
+        expected = (doc_id[q_rows].view(-1, 1) == doc_id.view(1, n)) & (q_idx >= kv_idx)
+        if not torch.equal(block, expected):
+            return None
+    return seg_lens
+
+
 def _locate_left_window(mask_mod: Callable, *, q_len: int, kv_len: int) -> Optional[int]:
     """Locate a large left-window size ``W`` whose boundary sits beyond the probe grid.
 
@@ -575,6 +801,18 @@ def _classify_probed_mask(
                         "causal": True,
                         "window_size": (window, 0),
                     }
+                # Not a window: the other pattern that looks causal in the corner yet
+                # hides the far-left position is document packing whose first document
+                # is longer than the probe grid. Recovered (and exactly verified) from
+                # mask_mod over the full sequence.
+                doc_seglens = _locate_document_segments(mask_mod, q_len=q_len, kv_len=kv_len)
+                if doc_seglens is not None:
+                    return {
+                        "kind": "document_causal",
+                        "causal": True,
+                        "window_size": (-1, -1),
+                        "doc_seglens": doc_seglens,
+                    }
                 raise NotImplementedError(
                     "Turbo flex compat layer detected a probable sliding window but could not confirm "
                     "it is standard left-window causal (q>=kv)&(q-kv<=W): the window boundary exceeds "
@@ -591,6 +829,10 @@ def _classify_probed_mask(
         doc_seglens = _detect_document_causal_segments(
             mask, q_len=q_len, kv_len=kv_len, q_probe=q_probe, kv_probe=kv_probe
         )
+        if doc_seglens is None and truncated and mask_mod is not None:
+            # The probe only saw the first corner of a longer packed sequence; recover
+            # the boundaries from mask_mod itself (exactly verified over the full S).
+            doc_seglens = _locate_document_segments(mask_mod, q_len=q_len, kv_len=kv_len)
         if doc_seglens is not None:
             return {
                 "kind": "document_causal",
@@ -1286,6 +1528,7 @@ def _dispatch_document_varlen(
     dropout_p: float,
     sink: Optional[torch.Tensor],
     deterministic: bool = False,
+    return_bshd: bool = False,
 ) -> torch.Tensor:
     """Run a recognised document-causal *dense* call through the varlen backend.
 
@@ -1329,8 +1572,10 @@ def _dispatch_document_varlen(
         call_kwargs["sink"] = sink
 
     out_thd = flash_attn_varlen_func(q_thd, k_thd, v_thd, cu, cu, max_s, max_s, **call_kwargs)
-    # (B*S, Hq, Dv) -> (B, S, Hq, Dv) -> (B, Hq, S, Dv)
-    return out_thd.reshape(bsz, sq, hq, dv).transpose(1, 2).contiguous()
+    out_bshd = out_thd.reshape(bsz, sq, hq, dv)  # (B*S, Hq, Dv) -> (B, S, Hq, Dv)
+    if return_bshd:
+        return out_bshd
+    return out_bshd.transpose(1, 2).contiguous()  # -> (B, Hq, S, Dv)
 
 
 def flex_attention(
@@ -1348,6 +1593,7 @@ def flex_attention(
     dropout_p: float = 0.0,
     sink: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    _return_bshd: bool = False,
 ):
     """Drop-in compatible ``flex_attention`` dispatching to Turbo fast paths.
 
@@ -1575,6 +1821,7 @@ def flex_attention(
             alibi_slopes=effective_alibi_slopes,
             dropout_p=dropout_p,
             sink=sink,
+            return_bshd=_return_bshd,
         )
 
     # Lazy import so pure classification (and this module's import) does not force
@@ -1603,9 +1850,16 @@ def flex_attention(
         #   currently always 0.0).
     )
 
+    # ``_return_bshd`` (private, used by flex_attention_bshd) keeps the backend's native
+    # bshd output instead of transposing + copying it back to bhsd -- one full [B,H,S,D]
+    # copy saved per forward (and the matching one per backward).
     if return_lse:
         out_bshd, lse = out
+        if _return_bshd:
+            return out_bshd, lse
         return out_bshd.transpose(1, 2).contiguous(), lse
+    if _return_bshd:
+        return out
     return out.transpose(1, 2).contiguous()
 
 
@@ -1799,6 +2053,68 @@ def _validate_cu_seqlens(
         )
 
     return max_seqlen_q, max_seqlen_k
+
+
+def flex_attention_bshd(
+    query,
+    key,
+    value,
+    score_mod=None,
+    block_mask=None,
+    scale=None,
+    enable_gqa=False,
+    return_lse=False,
+    kernel_options=None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    softcap: Optional[float] = None,
+    dropout_p: float = 0.0,
+    sink: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+):
+    """Layout-native entry: ``[B, S, H, D]`` in, ``[B, S, H, D]`` out (no transposes).
+
+    Semantically identical to :func:`flex_attention` -- same classification, same
+    validation, same errors, same numerics -- but it speaks the backend's own **bshd**
+    layout, so the layout plumbing disappears:
+
+    * :func:`flex_attention` takes torch-flex's ``[B, H, S, D]``. Internally the Turbo
+      kernel wants ``[B, S, H, D]``, so it does ``transpose(1, 2).contiguous()`` on q, k
+      and v and transposes the output back -- **4 full tensor copies per forward**, plus
+      the mirror-image copies on the gradients in backward.
+    * Callers that already hold bshd (or sbhd, one free permute away -- Megatron/
+      Primus-LM attention layers do) pay all of that for nothing. This entry hands the
+      backend the tensor it already has: q/k/v are passed straight through when they are
+      bshd-contiguous, and the output is returned in bshd, so **zero layout copies**.
+
+    Not a drop-in for ``torch.nn.attention.flex_attention.flex_attention`` (its layout
+    differs) -- that contract belongs to :func:`flex_attention`, which is unchanged. Use
+    this one deliberately when your tensors are bshd.
+
+    ``score_mod`` / ``block_mask`` index semantics are unaffected: ``q_idx`` / ``kv_idx``
+    are sequence positions in both layouts.
+    """
+    # transpose(1, 2) on a bshd tensor is a *view* (no copy). The result is the bhsd
+    # tensor flex_attention expects, and its own `.transpose(1, 2).contiguous()` then
+    # collapses back to the original bshd-contiguous buffer -- torch's contiguous() is a
+    # no-op on an already-contiguous tensor, so nothing is copied on the way in either.
+    out = flex_attention(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        score_mod=score_mod,
+        block_mask=block_mask,
+        scale=scale,
+        enable_gqa=enable_gqa,
+        return_lse=return_lse,
+        kernel_options=kernel_options,
+        alibi_slopes=alibi_slopes,
+        softcap=softcap,
+        dropout_p=dropout_p,
+        sink=sink,
+        bias=bias,
+        _return_bshd=True,
+    )
+    return out
 
 
 def flex_attention_varlen(

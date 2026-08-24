@@ -8,7 +8,12 @@ the remaining gaps?"
 Entry points:
 
 ```python
-from primus_turbo.pytorch.ops.attention import flex_attention, flex_attention_varlen, create_block_mask
+from primus_turbo.pytorch.ops.attention import (
+    flex_attention,        # torch-compatible: bhsd [B,H,S,D] in and out
+    flex_attention_bshd,   # layout-native:   bshd [B,S,H,D] in and out
+    flex_attention_varlen, # THD packed + cu_seqlens
+    create_block_mask,
+)
 ```
 
 The signature matches `torch.nn.attention.flex_attention.flex_attention` and appends a few
@@ -19,6 +24,20 @@ enable_gqa=False, return_lse=False, kernel_options=None, alibi_slopes=None, soft
 dropout_p=0.0, sink=None, bias=None)`.
 Internally it converts between `bhsd ([B,H,S,D])` and `bshd ([B,S,H,D])` layouts and maps every
 recognised variant onto `flash_attn_func` (which auto-selects FlyDSL/AITER on gfx950).
+
+**`flex_attention_bshd` -- the layout-native entry (no transposes).** torch flex speaks bhsd; the
+Turbo kernel speaks bshd. `flex_attention` therefore does `transpose(1,2).contiguous()` on q, k and
+v and transposes the output back -- **4 full tensor copies per forward**, plus their mirror images
+on the gradients in backward. That is the residual wrapper overhead left after the classification
+cache (measured at ~0.03-0.27 ms, i.e. ~0.5-1.2% of an E2E step). Callers that already hold bshd --
+or sbhd, which is one *free* permute away, as in Megatron / Primus-LM attention layers -- were
+paying all of it for nothing. `flex_attention_bshd` takes exactly the same arguments and has exactly
+the same semantics, validation and error messages, but takes `[B,S,H,D]` in and returns `[B,S,H,D]`
+out, so a bshd-contiguous q/k/v reaches the kernel as the *same buffer* (verified by `data_ptr()` in
+the unit tests) and the kernel's output is returned untouched: **zero layout copies**. It is
+deliberately *not* a torch drop-in (its layout differs) -- that contract stays with
+`flex_attention`, which is unchanged. `score_mod` / `block_mask` index semantics are identical:
+`q_idx` / `kv_idx` are sequence positions in either layout.
 
 ### Turbo extension parameters (superset, disabled by default)
 
@@ -127,6 +146,13 @@ has_sink=False, has_bias=False) -> {"turbo","custom"}`:
   `alibi_sign=+1` on `rocm/primus:v26.5` (primus_turbo 0.3.2.dev48, commit 6ccf00ff) -- see
   `bench/bench_results_ext2.md`: `plus_err=1.6e-3` matches, `minus_err=1.32` does not.
   **The sign must be re-validated when changing builds**, otherwise results may be silently wrong.
+  A self-check is now shipped for exactly that: `check_alibi_sign_convention()` runs one small
+  attention through the real kernel and scores it against both `+slope*(kv-q)` and
+  `-slope*(kv-q)` fp32 references, returning the measured `sign`, both relative-L2 errors and
+  `matches_assumption`; it reports `sign=None` (rather than guessing) when neither hypothesis
+  matches decisively. `assert_alibi_sign_convention()` is the same check as a hard build gate --
+  it raises `RuntimeError` unless the build matches, so a flipped-sign container fails loudly
+  instead of quietly producing wrong ALiBi outputs. Run it once per new build/container.
 - **Mask probe limit (including large-window location)**: the classifier probes
   `block_mask.mask_mod` on a `min(S,512)` grid. When the probed corner looks full-causal but the far
   corner is invisible (`mask_mod(S-1,0)=False`), it binary-searches the window boundary on the
@@ -135,6 +161,19 @@ has_sink=False, has_bias=False) -> {"turbo","custom"}`:
   left-window causal `(q>=kv)&(q-kv<=W)`. **Only when that verification passes completely** is it
   classified as `sliding_window_causal, (W,0)`; otherwise it still raises `NotImplementedError`
   (never a misclassification). Full-causal (far corner still visible) remains causal.
+- **Document packing beyond the probe grid**: packed sequences used to be capped at the same
+  512 probe grid, because the boundaries simply were not visible in the probed corner. They no
+  longer are. When the probe is truncated, `_locate_document_segments` reads the boundaries off
+  `mask_mod` itself over the full sequence -- the diagonal and the sub-diagonal, two vectorised
+  calls, `O(S)` elements -- and then **verifies the reconstruction exactly, not by sampling**:
+  `same_doc(q,kv) & (q>=kv)` is compared against the real mask row-block by row-block (256 rows
+  per vectorised call, so peak memory is a few MB rather than `S^2`). Any deviation -- a window,
+  a hole, a non-causal block -- returns `None` and the caller raises exactly as before. Because
+  the full comparison costs `O(S^2)`, it is bounded by `_DOC_EXACT_VERIFY_LIMIT` (16384): past
+  that length we decline to classify rather than downgrade to sampled verification. Both
+  truncation shapes are handled: documents shorter than the probe (the corner looks
+  block-diagonal) and a first document longer than it (the corner looks exactly causal, and only
+  the invisible far position distinguishes it from plain causal / a large window).
 - **Classification/detection cache (performance, behaviour unchanged)**: `block_mask` classification
   and `score_mod` ALiBi/soft-cap detection results are cached by **object identity**
   (`weakref.WeakKeyDictionary`) -- when the same `block_mask`/`score_mod` is reused across layers or
@@ -339,7 +378,7 @@ softcap status).
 | Feature | Reason | Path | Prerequisite | Difficulty |
 |---|---|---|---|---|
 | varlen / document packing | **supported**: new explicit entry `flex_attention_varlen` (THD packing + `cu_seqlens` straight to `flash_attn_varlen_func`); measured on GPU, causal/full/SWA/GQA/ALiBi forward rel-L2 ~ 1.6e-3 to 2.3e-3, backward dQ/dK/dV ~ 2.5e-3 to 2.9e-3 (all < 2e-2) | A | - | done |
-| document masking | **supported**: the dense `flex_attention` exactly recognises `same_doc(q,kv) & (q>=kv)` block-diagonal causal -> recovers segment lengths -> builds `cu_seqlens` -> routes through varlen; measured on GPU, B=1/B=2/with ALiBi all rel-L2 ~ 1.6e-3 to 2.0e-3 | A | depends on the varlen wrapper | done |
+| document masking | **supported**: the dense `flex_attention` exactly recognises `same_doc(q,kv) & (q>=kv)` block-diagonal causal -> recovers segment lengths -> builds `cu_seqlens` -> routes through varlen; measured on GPU, B=1/B=2/with ALiBi all rel-L2 ~ 1.6e-3 to 2.0e-3. **No longer capped at the 512 probe grid**: beyond it the boundaries come from `mask_mod` directly and the pattern is verified exactly (chunked) up to `_DOC_EXACT_VERIFY_LIMIT`=16384 | A | depends on the varlen wrapper | done |
 | prefixLM (partial) | the current classifier only supports full/causal/single-window causal/document block-diagonal causal | A | add decidable templates and backend mappings | medium |
 | broader head_dim / dtype coverage | limited by backend constraints and the dtype guard (currently fp16/bf16 only) | A | backend capability validation (FlyDSL only supports D in {64,128}) | medium |
 
@@ -364,8 +403,9 @@ currently only raises `NotImplementedError` (no real kernel is implemented).
 ## Tests
 
 - Pure-logic unit tests (CPU only): `tests/pytorch/ops/test_flex_attention_dispatch_logic.py`
-  (**186 cases** total: 95 pre-existing + 44 varlen + 15 document + 32 large-window/cache; zero
-  regressions). The varlen part covers `_validate_cu_seqlens` (int32/1D/leading 0/monotonic/last
+  (**210 cases** total: 95 pre-existing + 44 varlen + 15 document + 32 large-window/cache + 10
+  document-beyond-probe + 5 ALiBi-sign self-check + 9 bshd-native entry; zero regressions). Runnable
+  on CPU with the backend mocked -- no GPU required. The varlen part covers `_validate_cu_seqlens` (int32/1D/leading 0/monotonic/last
   element/matching segment counts/device/`max_seqlen>=longest segment`/matching causal segment
   lengths, positive and negative cases), `_validate_qkv_varlen` (3D/dtype/head divisibility/head_dim),
   `_validate_window_size`, `_validate_max_seqlen`, and `flex_attention_varlen` end to end (mocked
@@ -383,6 +423,21 @@ currently only raises `NotImplementedError` (no real kernel is implemented).
   objects/shapes recompute, non-weakly-referenceable objects skip the cache,
   `_cached_detect_alibi/softcap` hit counts, `clear_classification_cache` resets, and behaviour
   identical to the uncached path).
+- The document-beyond-probe part covers `_locate_document_segments` directly (uneven segments; a
+  single document, a large sliding window, a holed block-diagonal mask and a non-square shape all
+  correctly returning `None`; and the refusal past `_DOC_EXACT_VERIFY_LIMIT`) plus
+  `_classify_block_mask` on both truncation shapes (short documents at S=1024, and a first document
+  longer than the probe at S=2048) and the dense entry routing S=1024 packing end-to-end to varlen
+  with the right `cu_seqlens`.
+- The ALiBi-sign part drives `check_alibi_sign_convention` / `assert_alibi_sign_convention` against
+  a mocked backend that applies a *known* sign: the `+1` build is detected and accepted, the `-1`
+  build is detected and `assert_...` raises, and a backend that ignores ALiBi entirely is reported
+  as `sign=None` rather than being assigned the "less wrong" sign.
+- The bshd part checks that `flex_attention_bshd` dispatches with the caller's own buffers
+  (`data_ptr()` equality on q/k/v and on the returned output -- i.e. the copies really are gone),
+  returns `[B,S,H,D]`, agrees numerically with the bhsd entry, forwards the Turbo extension
+  arguments, raises the same validation errors, handles `return_lse`, routes a document mask to
+  varlen in bshd, and leaves the bhsd entry's own contract untouched.
 - The original 95 cases cover: classification of full/causal/SWA/random/banded/head-dependent/
   batch-dependent masks; positive and negative cases for the ALiBi detector; positive and negative
   cases for `_detect_softcap` (recognising cap=20/30/50; rejecting identity/linear/constant/ALiBi/
