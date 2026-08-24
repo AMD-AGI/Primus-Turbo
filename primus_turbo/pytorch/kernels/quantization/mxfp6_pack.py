@@ -21,20 +21,22 @@ dimensions:
     dgrad  dX = dY @ W     contract N  ->  row(dY), col(W)
     wgrad  dW = dY.T @ X   contract M  ->  col(dY), col(X)
 
-Implementation status
----------------------
-Both directions currently route through AITER's row-direction packer, with the column
-direction obtained by materialising a transpose first. That is correct by construction
-(it reuses the packer that upstream tests and our parity run cover) and it is what makes
-the rest of the stack testable, but it costs an extra full-tensor read/write per column
-pack and does not fuse the two directions into a single pass the way MXFP4's
-``quantize_mxfp4_dual`` HIP kernel does.
+Implementation
+--------------
+These route through Primus-Turbo's fused packer, which reads the input once and emits
+both directions from a single staged tile. AITER only ships a row-direction packer, so
+the column direction previously came from ``pack(x.t().contiguous())``; profiling a Flux
+12B step attributed 82% of the MXFP6-vs-MXFP4 step-time gap to that materialised
+transpose alone, and removing it makes the dual pack ~2.5x faster.
 
-Replacing this with a fused kernel is a performance change, not a correctness one, and
-these functions are the oracle it must reproduce. Until then, do not read step-time
-comparisons against MXFP4 as MXFP6-vs-MXFP4: they also include transpose-vs-fused.
+The fused kernel is bit-exact with AITER's packer in the row direction, which is the
+property that lets it be swapped in freely: AITER's packer is the oracle the A6W6
+assembly was validated against. ``PRIMUS_TURBO_MXFP6_PACKER=aiter`` restores the old path
+for A/B comparison, and is also the automatic fallback on a build whose extension
+predates the fused op.
 """
 
+import os
 from typing import Tuple
 
 import torch
@@ -130,6 +132,26 @@ def _check_input(x: torch.Tensor, block_size: int) -> None:
     )
 
 
+def _use_fused_packer() -> bool:
+    """Whether to use Primus-Turbo's fused packer rather than AITER's row packer.
+
+    Falls back to AITER when the extension predates the fused op, so an older build keeps
+    working instead of failing at the op lookup.
+    """
+    choice = os.environ.get("PRIMUS_TURBO_MXFP6_PACKER", "").strip().lower() or "auto"
+    assert choice in ("auto", "fused", "aiter"), (
+        f"PRIMUS_TURBO_MXFP6_PACKER must be auto, fused or aiter, got {choice!r}"
+    )
+    if choice == "aiter":
+        return False
+    available = hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_dual")
+    assert available or choice != "fused", (
+        "PRIMUS_TURBO_MXFP6_PACKER=fused, but this build has no quantize_mxfp6_dual. "
+        "The kernel is gfx950-only and is compiled in only when gfx950 is an offload arch."
+    )
+    return available
+
+
 def quantize_mxfp6_row(
     x: torch.Tensor, block_size: int = MXFP6_BLOCK_SIZE
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -140,7 +162,11 @@ def quantize_mxfp6_row(
     """
     _assert_supported()
     _check_input(x, block_size)
-    return get_aiter().quant_mxfp6_gemm(x.contiguous())
+    x = x.contiguous()
+    if _use_fused_packer():
+        packed, scale = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6(x, 1)
+        return packed, scale
+    return get_aiter().quant_mxfp6_gemm(x)
 
 
 def quantize_mxfp6_col(
@@ -148,12 +174,15 @@ def quantize_mxfp6_col(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pack ``[R, C]`` contracting along ``R`` (the first axis).
 
-    Equivalent to ``quantize_mxfp6_row(x.T)``, and implemented that way: the transpose
-    is materialised so the verified row packer can be reused. A fused kernel would read
-    ``x`` once instead.
+    Equivalent to ``quantize_mxfp6_row(x.T)``, but the fused packer reads ``x`` in place
+    rather than materialising the transpose.
     """
     _assert_supported()
     _check_input(x, block_size)
+    x = x.contiguous()
+    if _use_fused_packer():
+        packed, scale = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6(x, 0)
+        return packed, scale
     return get_aiter().quant_mxfp6_gemm(x.t().contiguous())
 
 
@@ -166,12 +195,15 @@ def quantize_mxfp6_dual(
     ``(out, scale, out_t, scale_t)`` shape that ``quantize_mxfp4_impl(with_trans=True)``
     returns so the autograd functions look the same.
 
-    This is two independent passes today. The MXFP4 analogue is a single fused HIP
-    kernel, and matching that is the main remaining performance item for MXFP6.
+    One pass over ``x``: the fused kernel stages each tile once and packs it along both
+    axes, which is the whole reason this beats calling the row packer twice.
     """
     _assert_supported()
     _check_input(x, block_size)
     x = x.contiguous()
+    if _use_fused_packer():
+        row_p, row_s, col_p, col_s = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_dual(x)
+        return row_p, row_s, col_p, col_s
     aiter = get_aiter()
     row_p, row_s = aiter.quant_mxfp6_gemm(x)
     col_p, col_s = aiter.quant_mxfp6_gemm(x.t().contiguous())

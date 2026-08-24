@@ -360,6 +360,10 @@ def get_common_flags():
     if "--offload-arch=gfx950" in offload_arch_list:
         cxx_flags.append("-DBUILD_HIPKITTENS_BACKEND")
         nvcc_flags.append("-DBUILD_HIPKITTENS_BACKEND")
+        # Same reasoning for the fused MXFP6 packer: quantization_mxfp6_gfx950.cu is dropped
+        # from non-gfx950 builds, so its torch entry points have to go with it.
+        cxx_flags.append("-DBUILD_MXFP6_BACKEND")
+        nvcc_flags.append("-DBUILD_MXFP6_BACKEND")
 
     # Max Jobs
     max_jobs = int(os.getenv("MAX_JOBS", "64"))
