@@ -3693,9 +3693,9 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(EXP_IGLP):
                     # One call per q-half: the region's MFMA -> exp chain is per half, and
                     # two calls is where the register outcome lands right (see EXP_IGLP).
-# Not a tuning hint but a load-bearing one: with the strategy off the body costs
-# +8.9%, ID0 +10.2% and ID3 +9.3%, and ID1 core-dumps LLVM. Anything that reorders
-# the head step has to keep it.
+                    # Not a tuning hint but a load-bearing one: with the strategy off the body costs
+                    # +8.9%, ID0 +10.2% and ID3 +9.3%, and ID1 core-dumps LLVM. Anything that reorders
+                    # the head step has to keep it.
                     rocdl.iglp_opt(IGLP_EXP_INTERLEAVE)
 
                 def _drop(mt, nt):
