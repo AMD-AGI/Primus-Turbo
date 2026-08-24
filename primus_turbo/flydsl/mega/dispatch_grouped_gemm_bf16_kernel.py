@@ -118,6 +118,9 @@ def _make_kernel(
     # One rendezvous bank per layout: nt/nn/tn tune to different block splits, so they must
     # not share a counter slot (see DISPATCH_CHUNK_BANK).
     chunk_bank = ("nt", "nn", "tn").index(layout) * DISPATCH_CHUNK_BANK
+    # The prologue initialises every pool row's slot id to this value and only real rows
+    # overwrite it, so slot_id >= sentinel <=> that pool row is block padding.
+    pad_slot_sentinel = num_ranks * num_max_tokens_per_rank
     # Poll backoff, in s_sleep units. Flat over a 16x range (8 to 127), which is a second
     # proof that this gate is data lag and not poll contention.
     wait_sleep = 64
@@ -184,6 +187,12 @@ def _make_kernel(
         source_slot_kind_resource = create_buffer_resource(SOURCE_SLOT_KIND, max_size=True)
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
+        if const_expr(not is_tn):
+            # See the padding-skip probe at the gemm_tile call below.
+            slot_probe_resource = create_buffer_resource(SORTED_DISPATCH_SLOT_IDS, max_size=True)
+            wave_m_probe = (thread_index // fx.Int32(64)) // fx.Int32(4)
+            probe_row_a0 = wave_m_probe * fx.Int32((BLOCK_M // 128) * 32)
+            probe_row_in_tile = fx.Int32(BLOCK_M // 2) + probe_row_a0
         if const_expr(is_tn):
             go_base = fx.arith.ArithValue(
                 arith.index_cast(fx.T.i64(), extract_base_index(GROUP_OFFS)), signed=True
@@ -296,7 +305,7 @@ def _make_kernel(
                     a_slot_ids=a_slots,
                     b_slot_ids=b_slots,
                     slot_len=fx.Int32(num_max_pool_tokens),
-                    slot_lds=True,
+                    slot_unroll=4,
                 )
         else:
             tile_index = block_index - fx.Int32(num_max_dispatch_blocks)
@@ -354,24 +363,109 @@ def _make_kernel(
                     fx.inttoptr(pool_ptr_ty, dispatch_token_pool_base),
                     fx.make_layout(num_max_pool_tokens * K, 1),
                 )
-                gemm_tile(
-                    full_pool,
-                    WEIGHTS,
-                    C_tile,
-                    fx.Int32(BLOCK_M),
-                    c_n,
-                    lds,
-                    fx.Int32(0),
-                    block_n,
-                    K=K,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                    out_fp16=out_fp16,
-                    nt_vmcnt=nt_vmcnt,
-                    b_group_base=gbase,
-                    a_slot_ids=SORTED_DISPATCH_SLOT_IDS,
-                    a_block_m=block_m,
+                # Padding-skip probe. Every expert's pool region is block-padded up to a
+                # BLOCK_M multiple, so its last tile carries up to BLOCK_M-1 rows that are
+                # pure padding -- and padding rows gather the prologue's zeroed sentinel
+                # slot, so the accumulators covering them are exactly zero today. A wave's
+                # c10/c11 quadrants cover tile rows [BLOCK_M/2 + wave_m*64, +64); if the
+                # FIRST of those rows is already padding, all of them are (padding is a
+                # suffix inside an expert region), so those MFMA groups are provable
+                # no-ops. The probe is one scalar load of the slot table that is already
+                # a kernel argument -- no new tensor, no host-side work, no prologue
+                # change. Bit-exact: c10/c11 keep their zero init and store the same zeros.
+                #
+                # Two nested probes. The OUTER one is wave-independent (row BLOCK_M/2), so
+                # when it fires the whole workgroup agrees the entire lower A half is
+                # padding -- then the cooperative A1 global->LDS copies are dead too and
+                # SKIP_A1_LOADS drops them, halving this tile's A traffic on top of the
+                # dead MFMAs. The INNER one is per-wave and only removes MFMAs, which waves
+                # may legally disagree on.
+                # Per-wave, 64-row-exact: a wave's c00/c01 band is [wave_m*64, +64) and
+                # its c10/c11 band is [BLOCK_M/2 + wave_m*64, +64). Padding is a suffix
+                # inside an expert region, so probing each band's FIRST row classifies
+                # the whole band, and a padding band's C rows are never read back -- both
+                # its MFMA groups and its stores are dead. Only mfma/store ops are
+                # dropped, so waves may disagree.
+                pad_all = (
+                    buffer_load(slot_probe_resource, block_m * fx.Int32(BLOCK_M) + probe_row_a0,
+                                vec_width=1, dtype=fx.T.i32())
+                    >= fx.Int32(pad_slot_sentinel)
                 )
+                pad_hi = (
+                    buffer_load(slot_probe_resource, block_m * fx.Int32(BLOCK_M) + probe_row_in_tile,
+                                vec_width=1, dtype=fx.T.i32())
+                    >= fx.Int32(pad_slot_sentinel)
+                )
+                if pad_all:
+                    gemm_tile(
+                        full_pool,
+                        WEIGHTS,
+                        C_tile,
+                        fx.Int32(BLOCK_M),
+                        c_n,
+                        lds,
+                        fx.Int32(0),
+                        block_n,
+                        K=K,
+                        BLOCK_M=BLOCK_M,
+                        BLOCK_N=BLOCK_N,
+                        out_fp16=out_fp16,
+                        nt_vmcnt=nt_vmcnt,
+                        b_group_base=gbase,
+                        a_slot_ids=SORTED_DISPATCH_SLOT_IDS,
+                        a_block_m=block_m,
+                        n_exact=True,
+                        c_cache_modifier=16,
+                        SKIP_A1=True,
+                        SKIP_A1_STORES=True,
+                        SKIP_A0=True,
+                        SKIP_A0_STORES=True,
+                    )
+                elif pad_hi:
+                    gemm_tile(
+                        full_pool,
+                        WEIGHTS,
+                        C_tile,
+                        fx.Int32(BLOCK_M),
+                        c_n,
+                        lds,
+                        fx.Int32(0),
+                        block_n,
+                        K=K,
+                        BLOCK_M=BLOCK_M,
+                        BLOCK_N=BLOCK_N,
+                        out_fp16=out_fp16,
+                        nt_vmcnt=nt_vmcnt,
+                        b_group_base=gbase,
+                        a_slot_ids=SORTED_DISPATCH_SLOT_IDS,
+                        a_block_m=block_m,
+                        n_exact=True,
+                        c_cache_modifier=16,
+                        SKIP_A1=True,
+                        SKIP_A1_STORES=True,
+                    )
+                else:
+                    gemm_tile(
+                        full_pool,
+                        WEIGHTS,
+                        C_tile,
+                        fx.Int32(BLOCK_M),
+                        c_n,
+                        lds,
+                        fx.Int32(0),
+                        block_n,
+                        K=K,
+                        BLOCK_M=BLOCK_M,
+                        BLOCK_N=BLOCK_N,
+                        out_fp16=out_fp16,
+                        nt_vmcnt=nt_vmcnt,
+                        b_group_base=gbase,
+                        a_slot_ids=SORTED_DISPATCH_SLOT_IDS,
+                        a_block_m=block_m,
+                        n_exact=True,
+                        c_cache_modifier=16,
+                        SKIP_A1=False,
+                    )
 
     grid_size = num_max_dispatch_blocks + (TOTAL if is_tn else worst_case_tiles * n_blocks)
     return dispatch_grouped_gemm_kernel, grid_size, num_max_dispatch_blocks
@@ -502,7 +596,7 @@ def _compiled_dispatch_grouped_gemm(
         num_dispatch_blocks,
         DISP_PARITY,
         DISP_EXPECTED,
-        value_attrs=make_value_attrs(2, 0, "512,512"),
+        value_attrs=make_value_attrs(3 if layout == "nn" else 2, 0, "512,512"),
     ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
 
@@ -582,6 +676,15 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     x_i32 = x.contiguous().view(torch.int32).view(-1)
 
     assert layout in ("nt", "nn", "tn"), f"unsupported layout {layout}"
+    # nt (forward L1) is expert-arrival bound, not A-reuse bound: it waits on the peer
+    # dispatch of each tile's expert, so the finest grouping lets a group retire the
+    # moment its single expert lands and the extra A gather hides under that wait.
+    # Measured 4.316 -> 4.27 ms. nn (backward dgrad) has no such wait and is A-reuse
+    # bound -- it loses ~1% at GROUP_M=1 -- so this stays nt-only.
+    if layout == "nt" and GROUP_M == 2:
+        GROUP_M = 1
+    # nn (backward dgrad) is A-reuse bound: GROUP_M=1 lost ~1%, and GROUP_M=4 measured
+    # NEUTRAL vs 2 (interleaved A/B within 0.04%), so 2 is the plateau. Leave nn at 2.
     out_fp16 = out_dtype == torch.float16
     layout_code = {"nt": 0, "nn": 1, "tn": 2}[layout]
 

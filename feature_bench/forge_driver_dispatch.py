@@ -11,13 +11,14 @@ Three cases, one per layout the operator is used with:
     dispatch_nn   backward L2 dgrad dy @ w2         -> pool grad
     dispatch_tn   backward dW1      pool(x)^T @ g   -> per-expert weight grad
 
+Correctness defers to benchmark/ops/training/bench_mega_moe.py's in-process
+reference; nothing has to be recorded before a campaign starts. See
+forge_harness's docstring for what that replaced and why.
+
 Usage (forge-loop drives these three, the driver launches its own 8 ranks):
     python forge_driver_dispatch.py                                # SNR
     python forge_driver_dispatch.py --warmup 10 --iters 30 --bench-mode
     python forge_driver_dispatch.py --profile-run
-
-One-off, before the campaign starts, on the pristine kernel:
-    python forge_driver_dispatch.py --make-golden && git add forge_golden_dispatch.pt
 """
 
 from __future__ import annotations
@@ -47,9 +48,13 @@ from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
 )
 
-GOLDEN = "dispatch"
 LAYOUTS = ("nt", "nn", "tn")
 CASES = {layout: f"dispatch_{layout}" for layout in LAYOUTS}
+# Correctness comes from benchmark/ops/training/bench_mega_moe.py; this maps its
+# stage keys onto the case ids this driver reports.
+REF_STAGES = (
+    ("dispatch_grouped_gemm", {"fwd": CASES["nt"], "bwd": CASES["nn"], "wgrad": CASES["tn"]}),
+)
 
 
 def build_context(shape, group, rank, world):
@@ -155,42 +160,17 @@ def scrub(symm):
 
 
 def run_correctness(args, group, rank, world):
-    """Compare every layout against the golden projection (or write it)."""
-    symm, handle, operands = build_context(fh.CORRECT_SHAPE, group, rank, world)
-    golden = None if args.make_golden else fh.load_golden(GOLDEN, rank, CASES.values())
+    """Gate all three layouts against bench_mega_moe.py's in-process reference.
 
-    projections, snrs = {}, {}
-    for layout in LAYOUTS:
-        case = CASES[layout]
-        step = make_step(layout, operands, group, handle, args.bn)
-        # Graph-captured, same as bench: the output is then a fixed buffer we can
-        # scrub, so the pool rows the kernel never writes read as a stable zero
-        # instead of whatever the last allocation left there.
-        result = fh.cuda_graph_bench(
-            step,
-            warmup=2,
-            iters=2,
-            group=group,
-            dirty=scrub(symm),
-            # Whole tensor, not a prefix: after the scrub, a replay that wrote
-            # nothing is all zeros, and the leading rows may legitimately be
-            # padding. Cheap at the correctness shape.
-            verify=lambda out: bool(out.float().abs().sum() > 0),
-        )
-        out = result["out"]
-
-        proj = fh.project(out)
-        if args.make_golden:
-            projections[case] = proj
-        else:
-            snrs[case] = fh.compare(golden[case], proj)
-        # Drop the graph and its output before capturing the next layout.
-        del out, result
-
-    if args.make_golden:
-        fh.save_golden(GOLDEN, rank, projections, group)
-    else:
-        fh.report_snr(snrs, rank, group)
+    Not the golden projection this driver used to write: it does not reproduce
+    on this build -- a golden fails on the very next run of the same code, worst
+    of all on nn, where the projected row count itself moves and the comparison
+    is forced to 0 dB. See forge_harness's docstring.
+    """
+    snrs = fh.reference_snrs(
+        group, rank, REF_STAGES, model=args.ref_model, tokens=args.ref_tokens, iters=args.ref_iters
+    )
+    fh.report_snr(snrs, rank, group)
     return 0
 
 

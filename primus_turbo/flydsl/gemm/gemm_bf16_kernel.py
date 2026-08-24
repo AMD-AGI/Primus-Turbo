@@ -155,8 +155,52 @@ def dense_mma_pipeline_bf16(
     BLOCK_M,
     BLOCK_N,
     nt_vmcnt,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
+    SKIP_A0=False,
+    SKIP_A0_STORES=False,
 ):
-    """Shared 4-quadrant pipelined MMA loop + store epilogue for the fixed-K bf16 tile (NT/NN/TN)."""
+    """Shared 4-quadrant pipelined MMA loop + store epilogue for the fixed-K bf16 tile (NT/NN/TN).
+
+    SKIP_A1 (compile-time): this wave's lower A half (accumulators c10/c11, tile rows
+    [LDS_BLOCK_M + wave_m*N_TILES_A*32, +N_TILES_A*32)) is known to be all-zero padding,
+    so its MFMA groups are provably no-ops -- c10/c11 stay at their zero init and the
+    epilogue stores the same zeros it would have stored anyway. ONLY the mfma.call is
+    dropped: every global load, every s_barrier, every wait_barrier argument, every
+    s_setprio and every store stay byte-for-byte identical, which is what makes it legal
+    for waves inside one workgroup to disagree on this flag (the A1 global->LDS copy is
+    cooperative across all 8 waves, so it must never be skipped per-wave, and the
+    vmcnt-based wait_barrier counts must not shift).
+
+    SKIP_A1_LOADS (compile-time, implies SKIP_A1): the ENTIRE workgroup's lower A half
+    (tile rows [LDS_BLOCK_M, BLOCK_M)) is all-zero padding, so on top of the dead MFMA
+    groups the cooperative A1 global->LDS copies are dead too and can be dropped, halving
+    this tile's A traffic. This is only legal when every wave in the workgroup agrees
+    (the copy is cooperative), which is why the caller must gate it on a wave-independent
+    probe row. Dropping vmem ops shifts the vmcnt bookkeeping, so the FIRST prologue wait
+    drops from N_LDS_STEPS_A + N_LDS_STEPS_B to N_LDS_STEPS_B; every other wait keeps its
+    argument (the steady-state loop wait 2*A+B and the no-A wait A+2*B happen to coincide
+    at 6 for the shapes in use, and the tail's wait_barrier(0) drains unconditionally).
+    Barriers, setprio and stores are untouched.
+
+    SKIP_A1_STORES (compile-time, implies SKIP_A1): the ENTIRE workgroup's lower A half
+    is all-zero padding AND the resulting lower C rows [LDS_BLOCK_M, BLOCK_M) are never
+    read back (combine C padding suffix). The c10/c11 accumulators are therefore known-zero
+    and their global stores are dead VMEM traffic; drop them. Legal only when the caller
+    gates on a wave-independent probe (all waves agree) and the leg never reads the padded
+    C rows. Barriers, setprio, the tail wait_barrier(0)/vmcnt drain and all MFMA/loads are
+    untouched -- this deletes only the store ops for the lower C half.
+
+    SKIP_A0 / SKIP_A0_STORES (compile-time): the same argument one quadrant-band up.
+    This wave's UPPER A half (accumulators c00/c01, tile rows [wave_m*N_TILES_A*32,
+    +N_TILES_A*32)) is all-zero padding, so its MFMA groups are no-ops and -- when the
+    leg never reads the padded C rows -- its stores are dead too. Padding is a suffix
+    inside an expert's pool region, so SKIP_A0 implies SKIP_A1 for the same wave (rows
+    [LDS_BLOCK_M + wave_m*..) sit above the a0 band). Only mfma.call and store ops are
+    dropped: barriers, setprio, wait_barrier arguments, LDS reads and every global load
+    are byte-for-byte identical, which is what makes per-wave disagreement legal.
+    """
     K_ITERS = K // BLOCK_K
     assert K_ITERS >= 2, f"K_ITERS={K_ITERS} too small; need K >= {2 * BLOCK_K}"
     N_TILES_A = BLOCK_M // 128
@@ -185,11 +229,18 @@ def dense_mma_pipeline_bf16(
     b_g2s.load(b_cur0, B0_gl_offset + 0 * b_k_step)
     a_g2s0.load(a_cur0, A0_gl_offset + 0 * a_k_step)
     b_g2s.load(b_cur1, B1_gl_offset + 0 * b_k_step)
-    a_g2s1.load(a_cur1, A1_gl_offset + 0 * a_k_step)
+    if const_expr(not SKIP_A1_LOADS):
+        a_g2s1.load(a_cur1, A1_gl_offset + 0 * a_k_step)
 
     if wave_m == 1:
         rocdl.s_barrier()
-    wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+    if const_expr(SKIP_A1_LOADS):
+        # Without the A1 copy only b_cur0 + a_cur0 + b_cur1 are in flight here; leaving
+        # N_LDS_STEPS_B outstanding drains exactly b_cur0 and a_cur0, which is what the
+        # first loop iteration reads.
+        wait_barrier(N_LDS_STEPS_B)
+    else:
+        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
     b_g2s.load(b_next0, B0_gl_offset + 1 * b_k_step)
     a_g2s0.load(a_next0, A0_gl_offset + 1 * a_k_step)
@@ -200,11 +251,13 @@ def dense_mma_pipeline_bf16(
     for k in range_constexpr(K_ITERS - 2):
         b0_frag = b_s2r.load(b_cur0)
         a0_frag = a_s2r.load(a_cur0)
-        a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+        if const_expr(not SKIP_A1_LOADS):
+            a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        if const_expr(not SKIP_A0):
+            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
@@ -213,16 +266,19 @@ def dense_mma_pipeline_bf16(
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        if const_expr(not SKIP_A0):
+            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        a1_frag = a_s2r.load(a_cur1)
+        if const_expr(not SKIP_A1):
+            a1_frag = a_s2r.load(a_cur1)
         a_g2s0.load(a_cur0, A0_gl_offset + (k + 2) * a_k_step)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        if const_expr(not SKIP_A1):
+            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
@@ -230,7 +286,8 @@ def dense_mma_pipeline_bf16(
         wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
         rocdl.s_setprio(1)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+        if const_expr(not SKIP_A1):
+            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
@@ -252,29 +309,35 @@ def dense_mma_pipeline_bf16(
     a0_frag = a_s2r.load(a_cur0)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
-    c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+    if const_expr(not SKIP_A0):
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
 
     b1_frag = b_s2r.load(b_cur1)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
-    c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+    if const_expr(not SKIP_A0):
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
 
-    a1_frag = a_s2r.load(a_cur1)
+    if const_expr(not SKIP_A1):
+        a1_frag = a_s2r.load(a_cur1)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
-    c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+    if const_expr(not SKIP_A1):
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
 
     b0_frag = b_s2r.load(b_next0)
-    a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+    if const_expr(not SKIP_A1_LOADS):
+        a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
-    c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+    if const_expr(not SKIP_A1):
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
 
@@ -293,7 +356,8 @@ def dense_mma_pipeline_bf16(
     a0_frag = a_s2r.load(a_cur0)
     wait_barrier(0)
     rocdl.s_setprio(1)
-    c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+    if const_expr(not SKIP_A0):
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
     rocdl.s_setprio(0)
     rocdl.s_barrier()
 
@@ -316,26 +380,29 @@ def dense_mma_pipeline_bf16(
     # to the matrix pipe: the MFMAs occupy that pipe for a few hundred cycles while the
     # wave stays free to issue VMEM, so the issue cost overlaps too. Measured on nt:
     # mode 0 2.3915, mode 1 2.3862, mode 2 2.3705 ms -- placement alone is worth 0.66%.
-    if const_expr(_HOIST_MODE == 1):
+    if const_expr(_HOIST_MODE == 1 and not SKIP_A0_STORES):
         store_c.store(c00_frag, base_row + 0, base_col + 0)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
-    c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+    if const_expr(not SKIP_A0):
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
     rocdl.s_setprio(0)
     # Deliberately OUTSIDE the s_setprio(1) window: mode 2's whole advantage is that the
     # matrix pipe is already loaded when the stores issue, and raising priority here
     # would steal those issue slots back.
-    if const_expr(_HOIST_MODE >= 2):
+    if const_expr(_HOIST_MODE >= 2 and not SKIP_A0_STORES):
         store_c.store(c00_frag, base_row + 0, base_col + 0)
     rocdl.s_barrier()
 
-    a1_frag = a_s2r.load(a_cur1)
-    if const_expr(_HOIST_MODE == 1):
+    if const_expr(not SKIP_A1):
+        a1_frag = a_s2r.load(a_cur1)
+    if const_expr(_HOIST_MODE == 1 and not SKIP_A0_STORES):
         store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
     rocdl.s_barrier()
     rocdl.s_setprio(1)
-    c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-    c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+    if const_expr(not SKIP_A1):
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
     rocdl.s_setprio(0)
     # Splitting this last MFMA pair across an EXTRA s_barrier -- so c10 goes final a group
     # earlier and gets a full group of store cover too -- is NOT valid: the barrier count
@@ -345,8 +412,10 @@ def dense_mma_pipeline_bf16(
     if const_expr(_HOIST_MODE >= 2):
         # c01 is independent of the group just issued, so it drains under it; c10 then
         # interlocks on its own MFMA, by which point those stores have covered it.
-        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        if const_expr(not SKIP_A0_STORES):
+            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+        if const_expr(not SKIP_A1_STORES):
+            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
     if const_expr(_HOIST_MODE == 3):
         # Mode 3 = mode 2 plus the last quadrant. c11 is produced by the second MFMA of
         # the pair just issued, so its store cannot dodge that RAW interlock wherever it
@@ -359,15 +428,16 @@ def dense_mma_pipeline_bf16(
         # is not free time here -- this wave is the last to arrive as often as not, so
         # what the move actually does is put a stalled store between the MFMA pair and
         # the barrier, delaying every OTHER wave's release. Keep the default at 2.
-        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        if const_expr(not SKIP_A1_STORES):
+            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
     rocdl.s_barrier()
 
-    if const_expr(_HOIST_MODE == 0):
+    if const_expr(_HOIST_MODE == 0 and not SKIP_A0_STORES):
         store_c.store(c00_frag, base_row + 0, base_col + 0)
         store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-    if const_expr(_HOIST_MODE < 2):
+    if const_expr(_HOIST_MODE < 2 and not SKIP_A1_STORES):
         store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-    if const_expr(_HOIST_MODE != 3):
+    if const_expr(_HOIST_MODE != 3 and not SKIP_A1_STORES):
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
 
@@ -394,6 +464,11 @@ def gemm_bf16_nt_tile(
     n_exact=False,
     a_slot_ids=None,
     a_block_m=None,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
+    SKIP_A0=False,
+    SKIP_A0_STORES=False,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
@@ -503,6 +578,11 @@ def gemm_bf16_nt_tile(
         BLOCK_M,
         BLOCK_N,
         nt_vmcnt,
+        SKIP_A1,
+        SKIP_A1_LOADS,
+        SKIP_A1_STORES,
+        SKIP_A0,
+        SKIP_A0_STORES,
     )
 
 
@@ -535,6 +615,11 @@ def _gemm_bf16_nn_tn_tile_impl(
     n_exact=False,
     a_slot_ids=None,
     a_block_m=None,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
+    SKIP_A0=False,
+    SKIP_A0_STORES=False,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NN/TN needs K % {BLOCK_K} == 0 (got K={K})"
@@ -653,6 +738,11 @@ def _gemm_bf16_nn_tn_tile_impl(
         BLOCK_M,
         BLOCK_N,
         nt_vmcnt,
+        SKIP_A1,
+        SKIP_A1_LOADS,
+        SKIP_A1_STORES,
+        SKIP_A0,
+        SKIP_A0_STORES,
     )
 
 
@@ -679,6 +769,11 @@ def gemm_bf16_nn_tile(
     n_exact=False,
     a_slot_ids=None,
     a_block_m=None,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
+    SKIP_A0=False,
+    SKIP_A0_STORES=False,
 ):
     _gemm_bf16_nn_tn_tile_impl(
         A,
@@ -703,6 +798,11 @@ def gemm_bf16_nn_tile(
         b_group_base=b_group_base,
         c_cache_modifier=c_cache_modifier,
         n_exact=n_exact,
+        SKIP_A1=SKIP_A1,
+        SKIP_A1_LOADS=SKIP_A1_LOADS,
+        SKIP_A1_STORES=SKIP_A1_STORES,
+        SKIP_A0=SKIP_A0,
+        SKIP_A0_STORES=SKIP_A0_STORES,
     )
 
 
@@ -725,6 +825,11 @@ def gemm_bf16_tn_tile(
     out_fp16=False,
     nt_vmcnt=3,
     b_group_base=None,
+    SKIP_A1=False,
+    SKIP_A1_LOADS=False,
+    SKIP_A1_STORES=False,
+    SKIP_A0=False,
+    SKIP_A0_STORES=False,
 ):
     _gemm_bf16_nn_tn_tile_impl(
         A,
@@ -745,6 +850,11 @@ def gemm_bf16_tn_tile(
         out_fp16=out_fp16,
         nt_vmcnt=nt_vmcnt,
         b_group_base=b_group_base,
+        SKIP_A1=SKIP_A1,
+        SKIP_A1_LOADS=SKIP_A1_LOADS,
+        SKIP_A1_STORES=SKIP_A1_STORES,
+        SKIP_A0=SKIP_A0,
+        SKIP_A0_STORES=SKIP_A0_STORES,
     )
 
 
@@ -1138,7 +1248,10 @@ def gemm_bf16_variable_k_tile(
         )
 
     def _win_limit(w):
-        return _win_fills(w) * fx.Int32(SLOT_LDS_PASS) - fx.Int32(1)
+        # Clamped at 0: the tail chunk resolves its window before it is known to
+        # have work, and an empty window must still clamp to a valid LDS entry.
+        lim = _win_fills(w) * fx.Int32(SLOT_LDS_PASS) - fx.Int32(1)
+        return ArithValue(arith.maxsi(arith._to_raw(lim), arith._to_raw(fx.Int32(0))), signed=True)
 
     if const_expr(slot_lds):
         # Stage before any pool prefetch is in flight: this fill is the tile's only
@@ -1206,6 +1319,18 @@ def gemm_bf16_variable_k_tile(
 
     k_iters = (group_tokens + (BLOCK_K - 1)) // BLOCK_K
     n_chunks = (k_iters + (CHUNK - 1)) // CHUNK
+    # Whole chunks, then the 0..CHUNK-1 leftover k steps emitted explicitly.
+    # Rounding the chunk loop up instead rounds every group's contraction to
+    # CHUNK*BLOCK_K (= the pool's own BLOCK_M padding, so ~6% of the wgrad leg
+    # is padding twice over). The steps the tail replaces read past the group's
+    # real token count, gather the prologue's zero slot (see
+    # GatherVarKG2SLoaderBf16) and accumulate exact +0.0 -- dropping them is
+    # bit-exact and takes the quantisation down to BLOCK_K.
+    n_body = k_iters // CHUNK
+    n_tail = k_iters - n_body * CHUNK
+
+    def _min_chunks(a, b):
+        return ArithValue(arith.minsi(arith._to_raw(a), arith._to_raw(b)), signed=True)
 
     # nested to isolate Python-level buffer rotation from the runtime chunk loop
     def _window(chunk_idx, n_chunk, wbase=None, wlim=None):
@@ -1245,64 +1370,102 @@ def gemm_bf16_variable_k_tile(
                 bv[ko] = _voffs(b_g2s, b_slot_ids, chunk_idx * CHUNK + ko, wbase, wlim)
         return av, bv
 
+    def _one_step_core(k, jw, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1, c00, c01, c10, c11):
+        """One pipelined k step reading the window at jw.
+
+        4-buffer pipelined body: interleave s2r/g2s with the 4 mfma quadrants.
+        Only the buffers this step touches are passed; the caller owns the
+        rotation, so the same body serves the unrolled chunk and the tail. The
+        four accumulator quadrants are threaded IN and OUT as SSA values -- the
+        caller loads them from the rmem allocas once at chunk entry and stores
+        once at exit, so the per-quadrant memref load/store that used to bracket
+        every mfma is gone from the hot region. Barriers, s_setprio and the mfma
+        calls are byte-identical to the alloca form (load-bearing schedule
+        parity); only the redundant accumulator traffic is removed.
+        """
+        b0 = b_s2r.load(b_cur0)
+        a0 = a_s2r.load(a_cur0)
+        _load_a(a_next1, 1, k + 1, av[jw + 1])
+        rocdl.s_barrier()
+        rocdl.s_setprio(1)
+        c00 = mfma.call(a0, b0, c00)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+        b1 = b_s2r.load(b_cur1)
+        _load_b(b_cur0, 0, k + 2, bv[jw + 2])
+        rocdl.s_barrier()
+        rocdl.s_setprio(1)
+        c01 = mfma.call(a0, b1, c01)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+        a1 = a_s2r.load(a_cur1)
+        _load_a(a_cur0, 0, k + 2, av[jw + 2])
+        rocdl.s_barrier()
+        rocdl.s_setprio(1)
+        c10 = mfma.call(a1, b0, c10)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+        _load_b(b_cur1, 1, k + 2, bv[jw + 2])
+        wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+        rocdl.s_setprio(1)
+        c11 = mfma.call(a1, b1, c11)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+        return c00, c01, c10, c11
+
+    def _load_acc():
+        return (
+            [Vec(fx.memref_load_vec(r)) for r in acc00],
+            [Vec(fx.memref_load_vec(r)) for r in acc01],
+            [Vec(fx.memref_load_vec(r)) for r in acc10],
+            [Vec(fx.memref_load_vec(r)) for r in acc11],
+        )
+
+    def _store_acc(c00, c01, c10, c11):
+        for idx in range_constexpr(N_ACCUMS_EFF):
+            fx.memref_store_vec(c00[idx], acc00[idx])
+            fx.memref_store_vec(c01[idx], acc01[idx])
+            fx.memref_store_vec(c10[idx], acc10[idx])
+            fx.memref_store_vec(c11[idx], acc11[idx])
+
+    def _one_step(k, jw, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1):
+        """Alloca-backed single step for the tail (at most CHUNK-1 = 3 steps).
+
+        The tail sits behind runtime n_tail guards where threading SSA across the
+        nested traced ifs is not worth the plumbing, so it keeps the load->step->
+        store around the one call; the body is the same core.
+        """
+        c00, c01, c10, c11 = _load_acc()
+        c00, c01, c10, c11 = _one_step_core(
+            k, jw, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1, c00, c01, c10, c11
+        )
+        _store_acc(c00, c01, c10, c11)
+
     def _steps(k_base, av, bv, off):
         """CHUNK pipelined k steps reading the window at off+j.
 
         Starts from the LDS buffers in their declared roles and swaps them CHUNK
         (even) times, so the rotation is parity-neutral and no state crosses calls.
+        The accumulators are loaded from the allocas once here and threaded as SSA
+        through all CHUNK steps, then stored once -- so the dynamic chunk loop above
+        _chunk still carries state through the allocas (no scf.for iter_args, no
+        loop-boundary spill) while the inner CHUNK*4 memref load/stores per k step
+        collapse to one set per chunk.
         """
         a_cur0, a_cur1 = lds.A_lds_cur_0, lds.A_lds_cur_1
         a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
         b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
         b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
+        c00, c01, c10, c11 = _load_acc()
         for j in range_constexpr(CHUNK):
-            k = k_base + j
-            jw = off + j
-            # 4-buffer pipelined body: interleave s2r/g2s with the 4 mfma quadrants
-            b0 = b_s2r.load(b_cur0)
-            a0 = a_s2r.load(a_cur0)
-            _load_a(a_next1, 1, k + 1, av[jw + 1])
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c = [Vec(fx.memref_load_vec(r)) for r in acc00]
-            c = mfma.call(a0, b0, c)
-            for idx in range_constexpr(len(acc00)):
-                fx.memref_store_vec(c[idx], acc00[idx])
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            b1 = b_s2r.load(b_cur1)
-            _load_b(b_cur0, 0, k + 2, bv[jw + 2])
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c = [Vec(fx.memref_load_vec(r)) for r in acc01]
-            c = mfma.call(a0, b1, c)
-            for idx in range_constexpr(len(acc01)):
-                fx.memref_store_vec(c[idx], acc01[idx])
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            a1 = a_s2r.load(a_cur1)
-            _load_a(a_cur0, 0, k + 2, av[jw + 2])
-            rocdl.s_barrier()
-            rocdl.s_setprio(1)
-            c = [Vec(fx.memref_load_vec(r)) for r in acc10]
-            c = mfma.call(a1, b0, c)
-            for idx in range_constexpr(len(acc10)):
-                fx.memref_store_vec(c[idx], acc10[idx])
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-            _load_b(b_cur1, 1, k + 2, bv[jw + 2])
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
-            rocdl.s_setprio(1)
-            c = [Vec(fx.memref_load_vec(r)) for r in acc11]
-            c = mfma.call(a1, b1, c)
-            for idx in range_constexpr(len(acc11)):
-                fx.memref_store_vec(c[idx], acc11[idx])
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
+            c00, c01, c10, c11 = _one_step_core(
+                k_base + j, off + j, av, bv, a_cur0, a_cur1, a_next1, b_cur0, b_cur1, c00, c01, c10, c11
+            )
             a_cur0, a_next0 = a_next0, a_cur0
             a_cur1, a_next1 = a_next1, a_cur1
             b_cur0, b_next0 = b_next0, b_cur0
             b_cur1, b_next1 = b_next1, b_cur1
+        _store_acc(c00, c01, c10, c11)
 
     def _chunk(chunk_iv):
         chunk_idx = ArithValue(chunk_iv)
@@ -1338,21 +1501,69 @@ def gemm_bf16_variable_k_tile(
     if const_expr(slot_lds):
         # Window 0 is peeled: its fill has to precede the preamble, which already
         # resolves k = 0 and k = 1. Later windows refill the same LDS array in place.
-        for chunk_iv in range(_win_hi(fx.Int32(0))):
+        for chunk_iv in range(_min_chunks(_win_hi(fx.Int32(0)), n_body)):
             _chunk_w(chunk_iv, fx.Int32(0))
         for win_iv in range(fx.Int32(1), _n_win(n_chunks)):
             _fill_win(win_iv)
-            for chunk_iv in range(_win_lo(win_iv), _win_hi(win_iv)):
+            for chunk_iv in range(_win_lo(win_iv), _min_chunks(_win_hi(win_iv), n_body)):
                 _chunk_w(chunk_iv, win_iv)
+        # n_body // WIN_CHUNKS is the window the tail chunk falls in, and it is
+        # the last one staged: with a tail, n_chunks = n_body + 1, so
+        # _n_win(n_chunks) - 1 == n_body // WIN_CHUNKS.
+        w_tail = n_body // WIN_CHUNKS
+        av_t, bv_t = _window(n_body, 1, w_tail * fx.Int32(WIN_TOKENS), _win_limit(w_tail))
     elif const_expr(slot_unroll > 1):
-        n_grouped = (n_chunks // slot_unroll) * slot_unroll
+        n_grouped = (n_body // slot_unroll) * slot_unroll
         for chunk_iv in range(0, n_grouped, slot_unroll):
             _chunk_n(chunk_iv)
-        for chunk_iv in range(n_grouped, n_chunks):
+        for chunk_iv in range(n_grouped, n_body):
             _chunk(chunk_iv)
+        av_t, bv_t = _window(n_body, 1)
     else:
-        for chunk_iv in range(n_chunks):
+        for chunk_iv in range(n_body):
             _chunk(chunk_iv)
+        av_t, bv_t = _window(n_body, 1)
+
+    # Leftover k steps, guarded monotonically so one body serves all three
+    # counts. _steps leaves the LDS buffers in their declared roles, and one
+    # step swaps cur/next, so step j reads the roles swapped j % 2 times.
+    if n_tail > fx.Int32(0):
+        k_tail = n_body * CHUNK
+        _one_step(
+            k_tail,
+            0,
+            av_t,
+            bv_t,
+            lds.A_lds_cur_0,
+            lds.A_lds_cur_1,
+            lds.A_lds_next_1,
+            lds.B_lds_cur_0,
+            lds.B_lds_cur_1,
+        )
+        if n_tail > fx.Int32(1):
+            _one_step(
+                k_tail + fx.Int32(1),
+                1,
+                av_t,
+                bv_t,
+                lds.A_lds_next_0,
+                lds.A_lds_next_1,
+                lds.A_lds_cur_1,
+                lds.B_lds_next_0,
+                lds.B_lds_next_1,
+            )
+            if n_tail > fx.Int32(2):
+                _one_step(
+                    k_tail + fx.Int32(2),
+                    2,
+                    av_t,
+                    bv_t,
+                    lds.A_lds_cur_0,
+                    lds.A_lds_cur_1,
+                    lds.A_lds_next_1,
+                    lds.B_lds_cur_0,
+                    lds.B_lds_cur_1,
+                )
 
     c00 = [Vec(fx.memref_load_vec(reg)) for reg in acc00]
     c01 = [Vec(fx.memref_load_vec(reg)) for reg in acc01]
