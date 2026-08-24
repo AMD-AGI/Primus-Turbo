@@ -3693,6 +3693,9 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(EXP_IGLP):
                     # One call per q-half: the region's MFMA -> exp chain is per half, and
                     # two calls is where the register outcome lands right (see EXP_IGLP).
+# Not a tuning hint but a load-bearing one: with the strategy off the body costs
+# +8.9%, ID0 +10.2% and ID3 +9.3%, and ID1 core-dumps LLVM. Anything that reorders
+# the head step has to keep it.
                     rocdl.iglp_opt(IGLP_EXP_INTERLEAVE)
 
                 def _drop(mt, nt):
@@ -4375,7 +4378,7 @@ def build_flash_attn_bwd_dkdv_module(
 # ===========================================================================
 
 
-def _qsplit_for(Sq, window_left=-1):
+def _qsplit_for(Sq, window_left=-1, head_dim=64):
     # q_split fans the dK/dV KV-owner WGs across the CU grid; the optimum rises with
     # Sq before split-reduction overhead dominates. Re-swept once the fused path started
     # dispatching one batch at a time (fewer work-groups per dispatch, so list-scheduling
@@ -4398,6 +4401,19 @@ def _qsplit_for(Sq, window_left=-1):
     # all to spend them on). The exposed tail is worth less than the slots it costs.
     # 2 loses from the other side, gptoss_full +1.35%: the body does amortize a prologue
     # over half as many work-groups, but a two-chunk cut doubles the tail it cannot hide.
+    #
+    # That trade turns over at D=128, and it is the head dim that turns it: the amortized
+    # side scales with what a work-group re-stages per q-loop trip, which is D per kv row,
+    # while the tail it doubles is the fold of ONE q subset, whose bytes are the same share
+    # of a dQ image that also grew with D. So halving the splits buys twice as much at D128
+    # as at D64 and costs the same fraction. Measured on (2, 64, 8, 8192, 128), own process,
+    # min of 40, interleaved and palindromic in one batch: 6.2017 / 6.2020 / 6.1945 at 2
+    # against 6.2389 / 6.2407 / 6.2481 / 6.2510 at 4 -- all three below all four, -0.73%,
+    # and dq/dk/dv stay bitwise identical (a split count moves WHICH work-group writes a
+    # partial, never the fold's ascending band sum). D64 keeps 4 on its own reading above;
+    # do not lift this gate without re-running that cell.
+    if head_dim >= 128:
+        return 2
     return 4
 
 
@@ -5955,7 +5971,7 @@ def flydsl_varlen_backward(
     # q_split=1 and cannot fuse. Bit-identical result (no key is ever outside the window).
     if window_left >= 0 and window_left >= Skv - 1:
         window_left = -1
-    q_split = _qsplit_for(Sq, window_left)
+    q_split = _qsplit_for(Sq, window_left, D)
     # Every causal shape rides the fused path, down to the smallest: bands are ceil-counted so
     # a non-aligned Skv keeps its ragged top band, rectangular (Skv>Sq) bottom-right causal
     # needs nothing extra (the G3 dQ emission and the reduce are both causal_offset-aware), and
