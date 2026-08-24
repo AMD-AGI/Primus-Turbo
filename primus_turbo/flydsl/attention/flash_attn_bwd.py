@@ -1295,6 +1295,39 @@ def build_flash_attn_bwd_dkdv_module(
     wsq_atomic=0,
     # wsq_acoal: with wsq_atomic on, issue the atomics COALESCED (see _g3_atomic).
     wsq_acoal=0,
+    # wsq_a16: PROBE, and dQ IS WRONG WHILE IT IS ON -- the image is never zeroed, the
+    # sm_scale still lives in the fold, and the D axis stays permuted (a real build would
+    # need a final un-permute pass, ~0.5 GB against the 17.2 GB this removes). Non-zero
+    # replaces the bf16 partial store with four `buffer_atomic_pk_add_bf16` into a band-less
+    # bf16 dQ image -- aiter's a16 scheme, which is what its prod backward runs and what
+    # takes it to 2.80 ms where its own fp32-atomic a32 takes 3.74. Same addresses and the
+    # same 64 B per four kg lanes the partial store already reaches, so this prices the
+    # ATOMIC against the store and not a layout change. Value is the CPol aux plus one.
+    #
+    # Measured on d128_70b_b2 against the 5.40 ms `nored` floor (the body with its partial
+    # stores and no fold), so the number below IS the accumulation:
+    #   store layout   26.66 / 26.58 ms  -> the atomics cost 21.2 ms
+    #   WSQ_ACOAL       7.93 /  7.78 ms  -> the atomics cost  2.46 ms
+    # i.e. the address pattern alone is 8.6x, and the ISA is otherwise the same 256
+    # buffer_atomic_pk_add_bf16 (+3.5% instructions, VGPR 462 -> 494, no spill). Coalesced,
+    # the hardware sustains 874 G pk_add_bf16/s, which is not the problem. The COUNT is: at
+    # BLOCK_KV 128 a q row takes ~32 contributions, so the scheme must move 2.15 G atomics
+    # whatever the layout, and 2.46 ms is more than THREE TIMES what the deterministic fold
+    # it would replace costs (0.75 ms, base 6.15 vs nored 5.40). The split-K fold is the
+    # better scheme at this geometry and this arm does not change that.
+    #
+    # What makes it pay for aiter is the kv tile, not the atomic. Its a16 launch for this
+    # shape is grid=(4096,64,2) wg=256, i.e. 2048 work-groups = 16 kv tiles x Hq x B: a
+    # 512-row kv tile (4x ours) and ONE q head per work-group, so a q row takes ~8
+    # contributions, not 32, and 2.46 ms becomes 0.6 ms. It affords that tile because its
+    # 512 VGPRs are almost all accumulator (512 kv x 128 D x dK+dV over 256 lanes is exactly
+    # 512 dwords) with the whole 160 KB of LDS carrying everything else; our body spends
+    # 334 of its 462 on non-accumulator state, so BLOCK_KV 256 already spills (+17%, see
+    # _fuse_blockkv_for). Widening the kv tile is the one lever both schemes share, and it
+    # is a register-discipline problem, not an atomic one. It also pays the price back
+    # elsewhere: a per-q-head work-group cannot share the GQA group, so aiter's dk/dv leave
+    # the kernel per q head and two torch reduce_kernels (143 us) fold them.
+    wsq_a16=0,
     # wsq_rmw: PROBE (dQ/dK/dV stay EXACT -- the value read is pinned live and discarded).
     # A slot-indexed dQ partial workspace (one slot per resident work-group instead of one
     # per kv band, so nsplits falls from Skv/BLOCK_KV to that over the bands a slot owns)
@@ -1477,6 +1510,7 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_NREC = max(1, int(wsq_nrec or 1))
     WSQ_ATOMIC = int(wsq_atomic or 0)
     WSQ_ACOAL = int(wsq_acoal or 0)
+    WSQ_A16 = int(wsq_a16 or 0)
     WSQ_RMW = bool(wsq_rmw)
     KV_REFETCH = max(0, int(kv_refetch or 0))
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
@@ -2375,6 +2409,19 @@ def build_flash_attn_bwd_dkdv_module(
             num_records_bytes=_raw(_wsq_slice // fx.Index(WSQ_NREC) if WSQ_NREC > 1 else _wsq_slice),
             base_byte_offset=_raw(_wsq_grp * _wsq_band + _wsq_off),
         )
+        if const_expr(WSQ_A16):
+            # Same band-less image as the fp32 one below, at half the bytes.
+            _wsq16_slice = seq_len_q_v * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2)
+            wsq16_rsrc = buffer_ops.create_buffer_resource(
+                WSQ,
+                max_size=False,
+                num_records_bytes=_raw(_wsq16_slice),
+                base_byte_offset=_raw(
+                    (q_tok_base * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2))
+                    if const_expr(varlen)
+                    else (batch_idx * _wsq16_slice)
+                ),
+            )
         if const_expr(WSQ_ATOMIC):
             # The fp32 dQ accumulator has NO band axis and no interleave: every band adds into
             # the same image, so one batch slice of Sq*Hq*D floats is the whole resource.
@@ -3002,6 +3049,49 @@ def build_flash_attn_bwd_dkdv_module(
                     offset_is_bytes=True,
                 )
 
+            def _g3_a16(_g3p, i, j):
+                """The store's own 16 B, added in as four packed-bf16 atomics.
+
+                WSQ_ACOAL moves the address pattern the way it does for the fp32 arm, and
+                here it is the whole question. In the store's layout a lane owns 16 B of ONE
+                q row and the four kg lanes of that row cover a line, so for a FIXED _w the
+                wave's 64 lanes sit 16 B apart across 16 rows: one instruction, 16 lines,
+                four lanes each. aiter's a16 lane map is lane -> dword, so its 64 lanes cover
+                one contiguous 256 B run: one instruction, 4 lines. A store does not care
+                (the coalescer merges 4 lanes into one 64 B line write) but an atomic is a
+                line RMW at the TCC, so the difference is 4x line transactions per
+                instruction -- on top of the 4x fewer instructions aiter's wider kv tile
+                already buys.
+                """
+                if const_expr(WSQ_ACOAL):
+                    _t = _g3q0 + fx.Index(j * G3_SPL_STRIDE)
+                    _row0 = (
+                        q_start
+                        + ((_t >> fx.Index(1)) << fx.Index(5))
+                        + ((_t & fx.Index(1)) << fx.Index(3))
+                    )
+                    _e0 = (_row0 * fx.Index(NUM_HEADS_Q) + _g3qh) * fx.Index(HEAD_DIM) + (
+                        _g3d0 + fx.Index(i)
+                    ) * fx.Index(D_TILE)
+                    _a16 = ArithValue(
+                        _raw((_e0 + lane * fx.Index(2)) * fx.Index(2))
+                    ).index_cast(fx.Int32.ir_type)
+                    _step = 256
+                else:
+                    _a16 = ArithValue(_raw(_g3_elem(i, j, ilv=False) * fx.Index(2))).index_cast(
+                        fx.Int32.ir_type
+                    )
+                    _step = 4
+                _pk = Vec(_g3p)
+                for _w in range_constexpr(4):
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
+                        wsq16_rsrc,
+                        _a16,
+                        _step * _w,
+                        WSQ_A16 - 1,
+                    )
+
             def _g3_atomic(_lo, _hi, i, j):
                 """The same D-tile pair, added into the fp32 dQ image instead of stored.
 
@@ -3095,10 +3185,11 @@ def build_flash_attn_bwd_dkdv_module(
                         _g3p = bf16_trunc_scored_v4(_g3[i][jj]).shuffle(
                             bf16_trunc_scored_v4(_g3[i + 1][jj]), [0, 1, 2, 3]
                         )
+                        _st_fn = _g3_a16 if const_expr(WSQ_A16) else _g3_store
                         if const_expr(st_sink is None):
-                            _g3_store(_g3p, _gd0, j)
+                            _st_fn(_g3p, _gd0, j)
                         else:
-                            st_sink.append(lambda p=_g3p, _i=_gd0, _j=j: _g3_store(p, _i, _j))
+                            st_sink.append(lambda p=_g3p, _i=_gd0, _j=j: _st_fn(p, _i, _j))
                 if const_expr(WSQ_RMW):
                     _keepalive_v4(_rmw)
 
