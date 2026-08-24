@@ -391,7 +391,9 @@ def _probe_mask_row(mask_mod: Callable, q_pos: int, kv_len: int) -> torch.Tensor
         return out
 
 
-def _mask_is_bh_dependent(mask_mod: Callable, base: torch.Tensor, B: int, H: int, q_probe: int, kv_probe: int) -> bool:
+def _mask_is_bh_dependent(
+    mask_mod: Callable, base: torch.Tensor, B: int, H: int, q_probe: int, kv_probe: int
+) -> bool:
     candidates = []
     if B > 1:
         candidates.append((B - 1, 0))
@@ -825,7 +827,7 @@ def _detect_softcap(
         ctx_points.append((B - 1, 0, 0, 0))
     for s in (0.5, 1.7, -1.3):
         base = _call_score_mod(score_mod, s, 0, 0, 0, 0)
-        for (b, h, qi, ki) in ctx_points[1:]:
+        for b, h, qi, ki in ctx_points[1:]:
             if abs(_call_score_mod(score_mod, s, b, h, qi, ki) - base) > tol * (1.0 + abs(base)):
                 return None
 
@@ -1242,9 +1244,7 @@ def choose_backend(
         try:
             hit = matcher(ctx)
         except Exception as exc:  # a broken matcher must fail loud, never silently reroute
-            raise RuntimeError(
-                f"choose_backend: backend override matcher raised: {exc!r}"
-            ) from exc
+            raise RuntimeError(f"choose_backend: backend override matcher raised: {exc!r}") from exc
         if hit:
             return backend
     return "turbo"
@@ -1404,8 +1404,8 @@ def flex_attention(
 
     if kernel_options:
         warnings.warn(
-                "Turbo flex compat layer does not support kernel_options yet; ignoring: "
-                f"{sorted(kernel_options.keys())}",
+            "Turbo flex compat layer does not support kernel_options yet; ignoring: "
+            f"{sorted(kernel_options.keys())}",
             stacklevel=2,
         )
 
@@ -1726,9 +1726,7 @@ def _validate_cu_seqlens(
                 f"Turbo flex varlen entry requires {name} to be a torch.Tensor, got {type(cu).__name__}."
             )
         if cu.dtype != torch.int32:
-            raise ValueError(
-                f"Turbo flex varlen entry requires {name} to be int32, got dtype={cu.dtype}."
-            )
+            raise ValueError(f"Turbo flex varlen entry requires {name} to be int32, got dtype={cu.dtype}.")
         if cu.ndim != 1:
             raise ValueError(
                 f"Turbo flex varlen entry requires {name} to be a 1D [num_seqs+1] tensor, "

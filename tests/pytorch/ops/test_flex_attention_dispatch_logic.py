@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 """Pure-logic unit tests for the Turbo flex_attention dispatcher.
 
 These exercise the mask classifier and the ALiBi score_mod detector without a
@@ -288,9 +294,7 @@ def test_softcap_not_misdetected_as_zero_alibi():
 
 def test_choose_backend_defaults_to_turbo():
     # No overrides registered -> every recognised variant stays on Turbo.
-    got = choose_backend(
-        _CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False
-    )
+    got = choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False)
     assert got == "turbo"
 
 
@@ -300,37 +304,28 @@ def test_choose_backend_default_turbo_across_kinds():
         {"kind": "causal", "causal": True, "window_size": (-1, -1)},
         {"kind": "sliding_window_causal", "causal": True, "window_size": (128, 0)},
     ):
-        assert (
-            choose_backend(cfg, shape=(2, 4, 256, 64), dtype=torch.float16, has_alibi=True)
-            == "turbo"
-        )
+        assert choose_backend(cfg, shape=(2, 4, 256, 64), dtype=torch.float16, has_alibi=True) == "turbo"
 
 
 def test_register_backend_override_routes_custom():
     # An override matching this mask kind must reroute it to the custom hook.
     register_backend_override(lambda ctx: ctx["kind"] == "causal", "custom")
     assert (
-        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False)
-        == "custom"
+        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False) == "custom"
     )
     # A non-matching kind is unaffected.
     full_cfg = {"kind": "full", "causal": False, "window_size": (-1, -1)}
-    assert (
-        choose_backend(full_cfg, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False)
-        == "turbo"
-    )
+    assert choose_backend(full_cfg, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False) == "turbo"
 
 
 def test_clear_backend_overrides_restores_turbo():
     register_backend_override(lambda ctx: True, "custom")
     assert (
-        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False)
-        == "custom"
+        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False) == "custom"
     )
     clear_backend_overrides()
     assert (
-        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False)
-        == "turbo"
+        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False) == "turbo"
     )
 
 
@@ -338,8 +333,7 @@ def test_backend_override_first_match_wins():
     register_backend_override(lambda ctx: ctx["kind"] == "causal", "custom")
     register_backend_override(lambda ctx: ctx["kind"] == "causal", "turbo")
     assert (
-        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False)
-        == "custom"
+        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False) == "custom"
     )
 
 
@@ -347,12 +341,10 @@ def test_backend_override_matches_on_shape_and_softcap():
     # Matchers can key off any routing-context field, e.g. a large head dim or softcap.
     register_backend_override(lambda ctx: ctx["shape"][-1] > 128, "custom")
     assert (
-        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 256), dtype=torch.bfloat16, has_alibi=False)
-        == "custom"
+        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 256), dtype=torch.bfloat16, has_alibi=False) == "custom"
     )
     assert (
-        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False)
-        == "turbo"
+        choose_backend(_CAUSAL_CFG, shape=(1, 8, 512, 128), dtype=torch.bfloat16, has_alibi=False) == "turbo"
     )
 
     clear_backend_overrides()
@@ -541,9 +533,7 @@ def test_is_identity_score_mod_false_for_alibi():
 
 
 def test_is_identity_score_mod_false_for_constant_bias():
-    assert not _is_identity_score_mod(
-        lambda s, b, h, q, kv: s + 1.0, B=1, Hq=4, q_len=16, kv_len=16
-    )
+    assert not _is_identity_score_mod(lambda s, b, h, q, kv: s + 1.0, B=1, Hq=4, q_len=16, kv_len=16)
 
 
 # ---------------------------------------------------------------------------
@@ -749,21 +739,33 @@ def test_validate_explicit_sink_rejects_non_tensor():
 def test_validate_explicit_sink_rejects_2d():
     with pytest.raises(ValueError):
         _validate_explicit_sink(
-            torch.zeros((2, 4), dtype=torch.float32), hq=4, head_dim_qk=64, head_dim_v=64, device=torch.device("cpu")
+            torch.zeros((2, 4), dtype=torch.float32),
+            hq=4,
+            head_dim_qk=64,
+            head_dim_v=64,
+            device=torch.device("cpu"),
         )
 
 
 def test_validate_explicit_sink_rejects_wrong_length():
     with pytest.raises(ValueError):
         _validate_explicit_sink(
-            torch.zeros(3, dtype=torch.float32), hq=8, head_dim_qk=64, head_dim_v=64, device=torch.device("cpu")
+            torch.zeros(3, dtype=torch.float32),
+            hq=8,
+            head_dim_qk=64,
+            head_dim_v=64,
+            device=torch.device("cpu"),
         )
 
 
 def test_validate_explicit_sink_rejects_non_fp32():
     with pytest.raises(ValueError):
         _validate_explicit_sink(
-            torch.zeros(4, dtype=torch.float16), hq=4, head_dim_qk=64, head_dim_v=64, device=torch.device("cpu")
+            torch.zeros(4, dtype=torch.float16),
+            hq=4,
+            head_dim_qk=64,
+            head_dim_v=64,
+            device=torch.device("cpu"),
         )
 
 
@@ -771,7 +773,11 @@ def test_validate_explicit_sink_rejects_mismatched_head_dim():
     # Sink kernel path requires head_dim_qk == head_dim_v.
     with pytest.raises(ValueError):
         _validate_explicit_sink(
-            torch.zeros(4, dtype=torch.float32), hq=4, head_dim_qk=128, head_dim_v=64, device=torch.device("cpu")
+            torch.zeros(4, dtype=torch.float32),
+            hq=4,
+            head_dim_qk=128,
+            head_dim_v=64,
+            device=torch.device("cpu"),
         )
 
 
@@ -779,7 +785,11 @@ def test_validate_explicit_sink_rejects_non_pow2_head_dim():
     # Sink kernel path requires a power-of-two head dim (48 is not).
     with pytest.raises(ValueError):
         _validate_explicit_sink(
-            torch.zeros(4, dtype=torch.float32), hq=4, head_dim_qk=48, head_dim_v=48, device=torch.device("cpu")
+            torch.zeros(4, dtype=torch.float32),
+            hq=4,
+            head_dim_qk=48,
+            head_dim_v=48,
+            device=torch.device("cpu"),
         )
 
 
@@ -897,7 +907,9 @@ def test_validate_and_adapt_bias_rejects_wrong_last_dims():
 
 def test_validate_and_adapt_bias_rejects_non_tensor():
     with pytest.raises(ValueError):
-        _validate_and_adapt_bias([[0.0] * 16] * 16, sq=16, skv=16, dtype=torch.bfloat16, device=torch.device("cpu"))
+        _validate_and_adapt_bias(
+            [[0.0] * 16] * 16, sq=16, skv=16, dtype=torch.bfloat16, device=torch.device("cpu")
+        )
 
 
 def test_validate_and_adapt_bias_rejects_non_float():
@@ -1079,8 +1091,14 @@ def test_validate_qkv_varlen_rejects_non_divisible_heads():
 def test_validate_cu_seqlens_ok_causal():
     cu, max_s, total = _cu_from_seqlens([128, 128, 256])
     got = _validate_cu_seqlens(
-        cu, cu, total_q=total, total_k=total, max_seqlen_q=max_s, max_seqlen_k=max_s,
-        causal=True, device=torch.device("cpu"),
+        cu,
+        cu,
+        total_q=total,
+        total_k=total,
+        max_seqlen_q=max_s,
+        max_seqlen_k=max_s,
+        causal=True,
+        device=torch.device("cpu"),
     )
     assert got == (256, 256)
 
@@ -1091,8 +1109,14 @@ def test_validate_cu_seqlens_ok_full_cross_lengths():
     cu_q, max_q, total_q = _cu_from_seqlens([128, 256])
     cu_k, max_k, total_k = _cu_from_seqlens([300, 84])
     _validate_cu_seqlens(
-        cu_q, cu_k, total_q=total_q, total_k=total_k, max_seqlen_q=max_q, max_seqlen_k=max_k,
-        causal=False, device=torch.device("cpu"),
+        cu_q,
+        cu_k,
+        total_q=total_q,
+        total_k=total_k,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        causal=False,
+        device=torch.device("cpu"),
     )  # no raise
 
 
@@ -1101,8 +1125,14 @@ def test_validate_cu_seqlens_rejects_non_int32():
     cu_long = cu.to(torch.int64)
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            cu_long, cu_long, total_q=total, total_k=total, max_seqlen_q=max_s, max_seqlen_k=max_s,
-            causal=True, device=torch.device("cpu"),
+            cu_long,
+            cu_long,
+            total_q=total,
+            total_k=total,
+            max_seqlen_q=max_s,
+            max_seqlen_k=max_s,
+            causal=True,
+            device=torch.device("cpu"),
         )
 
 
@@ -1111,8 +1141,14 @@ def test_validate_cu_seqlens_rejects_non_1d():
     cu2d = cu.view(1, -1)
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            cu2d, cu2d, total_q=total, total_k=total, max_seqlen_q=max_s, max_seqlen_k=max_s,
-            causal=True, device=torch.device("cpu"),
+            cu2d,
+            cu2d,
+            total_q=total,
+            total_k=total,
+            max_seqlen_q=max_s,
+            max_seqlen_k=max_s,
+            causal=True,
+            device=torch.device("cpu"),
         )
 
 
@@ -1120,8 +1156,14 @@ def test_validate_cu_seqlens_rejects_too_short():
     cu = torch.zeros(1, dtype=torch.int32)  # numel < 2
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            cu, cu, total_q=0, total_k=0, max_seqlen_q=1, max_seqlen_k=1,
-            causal=True, device=torch.device("cpu"),
+            cu,
+            cu,
+            total_q=0,
+            total_k=0,
+            max_seqlen_q=1,
+            max_seqlen_k=1,
+            causal=True,
+            device=torch.device("cpu"),
         )
 
 
@@ -1131,8 +1173,14 @@ def test_validate_cu_seqlens_rejects_nonzero_first():
     bad[0] = 5  # first must be 0
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            bad, bad, total_q=total, total_k=total, max_seqlen_q=max_s, max_seqlen_k=max_s,
-            causal=True, device=torch.device("cpu"),
+            bad,
+            bad,
+            total_q=total,
+            total_k=total,
+            max_seqlen_q=max_s,
+            max_seqlen_k=max_s,
+            causal=True,
+            device=torch.device("cpu"),
         )
 
 
@@ -1140,8 +1188,14 @@ def test_validate_cu_seqlens_rejects_non_monotone():
     bad = torch.tensor([0, 256, 128, 512], dtype=torch.int32)  # decreasing in the middle
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            bad, bad, total_q=512, total_k=512, max_seqlen_q=256, max_seqlen_k=256,
-            causal=True, device=torch.device("cpu"),
+            bad,
+            bad,
+            total_q=512,
+            total_k=512,
+            max_seqlen_q=256,
+            max_seqlen_k=256,
+            causal=True,
+            device=torch.device("cpu"),
         )
 
 
@@ -1149,8 +1203,14 @@ def test_validate_cu_seqlens_rejects_last_ne_total():
     cu, max_s, total = _cu_from_seqlens([128, 128, 256])
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            cu, cu, total_q=total + 1, total_k=total, max_seqlen_q=max_s, max_seqlen_k=max_s,
-            causal=True, device=torch.device("cpu"),
+            cu,
+            cu,
+            total_q=total + 1,
+            total_k=total,
+            max_seqlen_q=max_s,
+            max_seqlen_k=max_s,
+            causal=True,
+            device=torch.device("cpu"),
         )
 
 
@@ -1159,8 +1219,14 @@ def test_validate_cu_seqlens_rejects_length_mismatch():
     cu_k, max_k, _ = _cu_from_seqlens([256, 256])  # len 3, same total 512
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            cu_q, cu_k, total_q=total, total_k=512, max_seqlen_q=max_q, max_seqlen_k=max_k,
-            causal=False, device=torch.device("cpu"),
+            cu_q,
+            cu_k,
+            total_q=total,
+            total_k=512,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            causal=False,
+            device=torch.device("cpu"),
         )
 
 
@@ -1168,8 +1234,14 @@ def test_validate_cu_seqlens_rejects_max_seqlen_too_small():
     cu, max_s, total = _cu_from_seqlens([128, 128, 256])
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            cu, cu, total_q=total, total_k=total, max_seqlen_q=100, max_seqlen_k=max_s,
-            causal=True, device=torch.device("cpu"),
+            cu,
+            cu,
+            total_q=total,
+            total_k=total,
+            max_seqlen_q=100,
+            max_seqlen_k=max_s,
+            causal=True,
+            device=torch.device("cpu"),
         )
 
 
@@ -1178,8 +1250,14 @@ def test_validate_cu_seqlens_rejects_causal_len_mismatch():
     cu_k, max_k, _ = _cu_from_seqlens([256, 128, 128])  # same total/segments, different split
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            cu_q, cu_k, total_q=total, total_k=total, max_seqlen_q=max_q, max_seqlen_k=max_k,
-            causal=True, device=torch.device("cpu"),
+            cu_q,
+            cu_k,
+            total_q=total,
+            total_k=total,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            causal=True,
+            device=torch.device("cpu"),
         )
 
 
@@ -1187,8 +1265,14 @@ def test_validate_cu_seqlens_rejects_device_mismatch():
     cu, max_s, total = _cu_from_seqlens([128, 128, 256])  # on cpu
     with pytest.raises(ValueError):
         _validate_cu_seqlens(
-            cu, cu, total_q=total, total_k=total, max_seqlen_q=max_s, max_seqlen_k=max_s,
-            causal=True, device=torch.device("meta"),  # cpu != meta
+            cu,
+            cu,
+            total_q=total,
+            total_k=total,
+            max_seqlen_q=max_s,
+            max_seqlen_k=max_s,
+            causal=True,
+            device=torch.device("meta"),  # cpu != meta
         )
 
 
@@ -1280,7 +1364,9 @@ def test_varlen_alibi_passed_through(capture_varlen_backend):
     q = _make_thd(256, H, D)
     cu, max_s, total = _cu_from_seqlens([128, 128])
     slopes = torch.tensor([1.0, 0.5, 0.25, 0.125], dtype=torch.float32)
-    flex_attention_varlen(q, q.clone(), q.clone(), cu, cu, max_s, max_s, causal=True, alibi_slopes=slopes.clone())
+    flex_attention_varlen(
+        q, q.clone(), q.clone(), cu, cu, max_s, max_s, causal=True, alibi_slopes=slopes.clone()
+    )
     passed = capture_varlen_backend["kwargs"]["alibi_slopes"]
     assert passed is not None
     assert passed.dtype == torch.float32
@@ -1392,19 +1478,14 @@ def test_varlen_full_cross_attention_dispatches(capture_varlen_backend):
 
 def _doc_causal_dense_mask(seg_lens):
     total = sum(seg_lens)
-    document_id = torch.cat(
-        [torch.full((s,), i, dtype=torch.int64) for i, s in enumerate(seg_lens)]
-    )
+    document_id = torch.cat([torch.full((s,), i, dtype=torch.int64) for i, s in enumerate(seg_lens)])
     qi = torch.arange(total).view(total, 1)
     ki = torch.arange(total).view(1, total)
     return (document_id.view(total, 1) == document_id.view(1, total)) & (qi >= ki)
 
 
 def _doc_causal_block_mask(seg_lens):
-    total = sum(seg_lens)
-    document_id = torch.cat(
-        [torch.full((s,), i, dtype=torch.int64) for i, s in enumerate(seg_lens)]
-    )
+    document_id = torch.cat([torch.full((s,), i, dtype=torch.int64) for i, s in enumerate(seg_lens)])
 
     def mask_mod(b, h, q_idx, kv_idx):
         same_doc = document_id[q_idx] == document_id[kv_idx]
@@ -1419,9 +1500,7 @@ def _doc_causal_block_mask(seg_lens):
 def test_detect_document_segments_basic():
     seg = [128, 128, 256]
     mask = _doc_causal_dense_mask(seg)
-    got = _detect_document_causal_segments(
-        mask, q_len=512, kv_len=512, q_probe=512, kv_probe=512
-    )
+    got = _detect_document_causal_segments(mask, q_len=512, kv_len=512, q_probe=512, kv_probe=512)
     assert got == seg
 
 
