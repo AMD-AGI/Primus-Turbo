@@ -1,340 +1,441 @@
-# Primus-Turbo `flex_attention` 兼容层状态
+# Primus-Turbo `flex_attention` compatibility layer status
 
-本文档对应 `primus_turbo.pytorch.ops.attention.flex_attention` 的当前能力边界，
-用于回答“哪些 torch flex 变体现在能直连 Turbo 高性能内核、哪些会报错、后续如何补”。
+This document describes the current capability boundary of
+`primus_turbo.pytorch.ops.attention.flex_attention`. It answers: "which torch flex variants can
+dispatch straight to Turbo's high-performance kernels today, which ones raise, and how do we close
+the remaining gaps?"
 
-入口：
+Entry points:
 
 ```python
 from primus_turbo.pytorch.ops.attention import flex_attention, flex_attention_varlen, create_block_mask
 ```
 
-签名与 `torch.nn.attention.flex_attention.flex_attention` 对齐，并在其后追加若干
-**可选的 Turbo 扩展参数**（超集，默认关闭 `None`/`0.0`，torch 风格调用零改动、仍可 drop-in 替换 torch）：
+The signature matches `torch.nn.attention.flex_attention.flex_attention` and appends a few
+**optional Turbo extension parameters** (a superset; all disabled by default via `None`/`0.0`, so
+torch-style calls need zero changes and remain a drop-in replacement for torch):
 `flex_attention(query, key, value, score_mod=None, block_mask=None, scale=None,
 enable_gqa=False, return_lse=False, kernel_options=None, alibi_slopes=None, softcap=None,
-dropout_p=0.0, sink=None, bias=None)`。
-内部完成 `bhsd([B,H,S,D]) <-> bshd([B,S,H,D])` 布局互转，并把可识别的变体映射到
-`flash_attn_func`（gfx950 上自动选 FlyDSL/AITER）。
+dropout_p=0.0, sink=None, bias=None)`.
+Internally it converts between `bhsd ([B,H,S,D])` and `bshd ([B,S,H,D])` layouts and maps every
+recognised variant onto `flash_attn_func` (which auto-selects FlyDSL/AITER on gfx950).
 
-### Turbo 扩展参数（超集，默认关闭）
+### Turbo extension parameters (superset, disabled by default)
 
-- **`alibi_slopes: Optional[torch.Tensor] = None`（现在就能直连 Turbo）**：显式的每头 ALiBi
-  斜率，要求 1D、`length == Hq`（query 头数）、fp32（否则报清晰 `ValueError`），device 自动
-  对齐到 q。给了就**跳过 `_detect_alibi_slopes` 自动识别**，直接把该 slopes 透传到
-  `flash_attn_func(alibi_slopes=...)`——因此**绕开识别器的保守限制、当前即生效**，可与
-  causal / 滑窗 mask 组合（ALiBi 常配 causal）。**冲突处理**：同时给了显式 `alibi_slopes`
-  和**非平凡（非恒等）**`score_mod` 视为歧义，抛 `ValueError`（明确二选一）；`score_mod` 为
-  `None`/恒等时允许与显式 slopes 共存。
-- **`softcap: Optional[float] = None`（接口就位、当前门控报错）**：logits 软上限
-  （`cap*tanh(score/cap)`，Gemma2/Grok）。`None` 或 `0/0.0` = 禁用（no-op，不影响现有路径）；
-  正数当前**抛 `NotImplementedError`**（接口已就位，但受阻于本 build 的 aiter dense 前/反向
-  kernel 缺 softcap 形参，详见下方“softcap 现状”；上游 kernel 支持后本参数即生效）。显式
-  `softcap` 与从 `score_mod` 识别到的 soft-cap **统一走同一处报错**（不重复、不冲突），
-  **绝不静默丢弃 cap**。
-- **`dropout_p: float = 0.0`（现在就能直连 Turbo）**：注意力 dropout 概率，校验 `0 <= p < 1`
-  （`0` = 禁用，drop-in 默认），直接透传 `flash_attn_func(dropout_p=...)`。与 flash-attn /
-  torch `scaled_dot_product_attention` 一致：`p>0` 即生效（训练态语义，eval 请传 `0`）；可与
-  `return_lse` 并存，兼容层恒以 `deterministic=False` 分发，故无 dropout/确定性冲突需拒绝。
-  经 GPU 实测：`p=0` 与不传逐字节一致（零回归），`p=0.1` 前向+反向可正常跑通（输出/梯度有限、形状正确）。
-- **`sink: Optional[torch.Tensor] = None`（现在就能直连 Turbo）**：注意力 sink（每个 query 头一个
-  可学习 logit），要求 1D、`length == Hq`、fp32（否则清晰 `ValueError`），device 自动对齐到 q；
-  sink kernel 路径另要求 `head_dim_qk == head_dim_v` 且 head_dim 为 2 的幂（后端约束，见
-  `attention_aiter_impl.AttnFwdAiterBackend`）。直接透传 `flash_attn_func(sink=...)`。经 GPU 实测：
-  透传结果与直接调 `flash_attn_func(sink=...)` **逐字节一致**（identity），`sink=None` 零回归。
-- **`bias: Optional[torch.Tensor] = None`（现在就能直连 Turbo）**：pre-softmax logits 的加性 bias，
-  直接透传 `flash_attn_func(bias=...)`。**关键约束（实测取证，见下方“bias 现状”）**：aiter dense
-  kernel 只接受**单个 `[Sq, Skv]`** bias（在 batch/head 间共享）、且 dtype 必须与 q 一致（fp16/bf16；
-  **fp32 会 NaN**、4D/每头 bias 被 kernel 拒绝报 `bias shape should be [sq, sk]`）。入口接受
-  `[Sq,Skv]` 或前导 singleton 的可广播形状（`[1,Sq,Skv]`/`[1,1,Sq,Skv]`），自动 cast 到 q 的 dtype
-  并对齐 device；真正的每头/每样本 bias 抛 `ValueError`。经 GPU 实测前向+反向数值正确。
+- **`alibi_slopes: Optional[torch.Tensor] = None` (dispatches to Turbo today)**: explicit per-head
+  ALiBi slopes. Must be 1D, `length == Hq` (query head count) and fp32 (otherwise a clear
+  `ValueError`); the device is aligned to q automatically. Passing it **skips the
+  `_detect_alibi_slopes` auto-detection** and forwards the slopes directly to
+  `flash_attn_func(alibi_slopes=...)` -- so it **bypasses the detector's conservative limits and
+  works right now**, and can be combined with causal / sliding-window masks (ALiBi is usually paired
+  with causal). **Conflict handling**: passing both an explicit `alibi_slopes` and a
+  **non-trivial (non-identity)** `score_mod` is treated as ambiguous and raises `ValueError` (pick
+  one); a `None`/identity `score_mod` may coexist with explicit slopes.
+- **`softcap: Optional[float] = None` (interface in place, currently gated with a raise)**: logits
+  soft cap (`cap*tanh(score/cap)`, Gemma2/Grok). `None` or `0`/`0.0` = disabled (no-op, existing
+  paths unaffected); a positive value currently **raises `NotImplementedError`** (the interface is
+  in place but is blocked by this build's aiter dense fwd/bwd kernels, which lack a softcap
+  parameter -- see "softcap status" below; the parameter takes effect as soon as the upstream kernel
+  supports it). An explicit `softcap` and a soft-cap detected from `score_mod` **funnel into the
+  same single raise site** (no duplication, no conflict) and the cap is **never silently dropped**.
+- **`dropout_p: float = 0.0` (dispatches to Turbo today)**: attention dropout probability, validated
+  as `0 <= p < 1` (`0` = disabled, the drop-in default), forwarded directly to
+  `flash_attn_func(dropout_p=...)`. Consistent with flash-attn / torch
+  `scaled_dot_product_attention`: `p>0` takes effect (training semantics -- pass `0` for eval). It
+  can coexist with `return_lse`; the compat layer always dispatches with `deterministic=False`, so
+  there is no dropout/determinism conflict to reject. Measured on GPU: `p=0` is byte-for-byte
+  identical to not passing it (zero regression), and `p=0.1` runs forward+backward correctly
+  (finite outputs/gradients, correct shapes).
+- **`sink: Optional[torch.Tensor] = None` (dispatches to Turbo today)**: attention sink (one
+  learnable logit per query head). Must be 1D, `length == Hq` and fp32 (otherwise a clear
+  `ValueError`); the device is aligned to q automatically. The sink kernel path additionally
+  requires `head_dim_qk == head_dim_v` and a power-of-two head_dim (backend constraint, see
+  `attention_aiter_impl.AttnFwdAiterBackend`). Forwarded directly to `flash_attn_func(sink=...)`.
+  Measured on GPU: the forwarded result is **byte-for-byte identical** to calling
+  `flash_attn_func(sink=...)` directly (identity), and `sink=None` is a zero regression.
+- **`bias: Optional[torch.Tensor] = None` (dispatches to Turbo today)**: additive bias on the
+  pre-softmax logits, forwarded directly to `flash_attn_func(bias=...)`. **Key constraint (verified
+  empirically, see "bias status" below)**: the aiter dense kernel only accepts a **single
+  `[Sq, Skv]`** bias (shared across batch/head) whose dtype must match q (fp16/bf16;
+  **fp32 produces NaN**, and 4D / per-head bias is rejected by the kernel with
+  `bias shape should be [sq, sk]`). The entry point accepts `[Sq,Skv]` or broadcastable shapes with
+  leading singletons (`[1,Sq,Skv]`/`[1,1,Sq,Skv]`), casts to q's dtype and aligns the device; a true
+  per-head/per-sample bias raises `ValueError`. Forward and backward were verified numerically on
+  GPU.
 
-## 已支持（可直接分发到 Turbo）
+## Supported (dispatches directly to Turbo)
 
-- **full attention**（`block_mask is None` 或全 True）→ `causal=False`
-- **causal**（`q >= kv`）→ `causal=True`
-- **sliding-window causal**（`(q >= kv) & (q-kv <= W)`）→ `causal=True, window_size=(W,0)`；**窗口大于
-  探测网格（W>512，如 W=1024/2048/4096）在长序列 S>512 上也已支持**：在最后一个 query 行二分定位 W 的
-  True→False 翻转点，再对若干抽样行逐位精确校验为标准左窗因果后分类（见下方“大窗口探测”）
-- **varlen / document packing（显式入口 `flex_attention_varlen`）**：THD `[total,H,D]` 打包 + `cu_seqlens`
-  直连 `flash_attn_varlen_func`（详见下方“varlen / document packing 现状”）
-- **document-causal（dense 入口自动识别）**：`block_mask` 被**精确重建校验**为 `same_doc(q,kv) & (q>=kv)`
-  时，dense `flex_attention` 自动改走 varlen（块对角 `cu_seqlens`），而非会跨文档的 dense causal（详见下方）
-- **GQA/MQA**：依赖 Turbo 原生能力，要求 `Hq % Hkv == 0`，且 `Hq != Hkv` 时调用侧显式传
-  `enable_gqa=True`（与 torch flex 语义一致）
+- **full attention** (`block_mask is None` or all-True) -> `causal=False`
+- **causal** (`q >= kv`) -> `causal=True`
+- **sliding-window causal** (`(q >= kv) & (q-kv <= W)`) -> `causal=True, window_size=(W,0)`; **windows
+  larger than the probe grid (W>512, e.g. W=1024/2048/4096) are also supported on long sequences
+  S>512**: the True->False flip point of W is located by binary search on the last query row, then
+  several sampled rows are verified bit-exactly as standard left-window causal before classifying
+  (see "large-window probing" below)
+- **varlen / document packing (explicit entry `flex_attention_varlen`)**: THD `[total,H,D]` packing +
+  `cu_seqlens` dispatched straight to `flash_attn_varlen_func` (see "varlen / document packing
+  status" below)
+- **document-causal (auto-detected in the dense entry)**: when a `block_mask` is **verified by exact
+  reconstruction** to be `same_doc(q,kv) & (q>=kv)`, the dense `flex_attention` automatically routes
+  through varlen (block-diagonal `cu_seqlens`) instead of a dense causal that would attend across
+  documents (details below)
+- **GQA/MQA**: relies on Turbo's native support; requires `Hq % Hkv == 0`, and when `Hq != Hkv` the
+  caller must pass `enable_gqa=True` explicitly (matching torch flex semantics)
 - **score_mod=None**
-- **ALiBi（自动识别）**：仅当 `score_mod` 被严格验证为 `score + slope[h] * (kv-q)`（对 score
-  加性且系数为 1、随 (kv-q) 线性、平移不变、与 batch 无关）时，映射为 `alibi_slopes`；否则不识别
-- **ALiBi（显式参数）**：通过 `alibi_slopes=` 直接传入每头斜率（1D/fp32/len==Hq），**跳过自动
-  识别、直连 `flash_attn_func`**，用于绕开识别器的保守限制；与自动识别在相同 slopes 下等价
-- **return_lse**：透传 Turbo 的 `softmax_lse`（返回 `(out, lse)`）
-- **scale**：默认 `1/sqrt(D)`，与 torch flex 对齐；显式 scale 透传给后端
-- **dropout（显式参数）**：`dropout_p` 透传 `flash_attn_func(dropout_p=...)`，`0` 禁用（drop-in 默认）；
-  GPU 实测 `p=0` 零回归、`p=0.1` 前向+反向通过
-- **attention sink（显式参数）**：`sink` 透传 `flash_attn_func(sink=...)`（1D/fp32/len==Hq，
-  head_dim 约束见上）；GPU 实测与直接后端调用逐字节一致、`sink=None` 零回归
-- **加性 bias（显式参数）**：`bias` 透传 `flash_attn_func(bias=...)`，需 `[Sq,Skv]`/q-dtype（见上）；
-  GPU 实测前向+反向数值正确（bf16/fp16、full/causal 均 rel-L2 < 2e-2）
+- **ALiBi (auto-detected)**: only when `score_mod` is strictly verified to be
+  `score + slope[h] * (kv-q)` (additive on score with coefficient 1, linear in `(kv-q)`,
+  translation-invariant, batch-independent) is it mapped to `alibi_slopes`; otherwise it is not
+  recognised
+- **ALiBi (explicit parameter)**: pass per-head slopes via `alibi_slopes=` (1D/fp32/len==Hq), which
+  **skips auto-detection and dispatches straight to `flash_attn_func`**, bypassing the detector's
+  conservative limits; equivalent to auto-detection for the same slopes
+- **return_lse**: forwards Turbo's `softmax_lse` (returns `(out, lse)`)
+- **scale**: defaults to `1/sqrt(D)`, matching torch flex; an explicit scale is forwarded to the
+  backend
+- **dropout (explicit parameter)**: `dropout_p` forwarded to `flash_attn_func(dropout_p=...)`, `0`
+  disables it (the drop-in default); measured on GPU, `p=0` is a zero regression and `p=0.1` passes
+  forward+backward
+- **attention sink (explicit parameter)**: `sink` forwarded to `flash_attn_func(sink=...)`
+  (1D/fp32/len==Hq, head_dim constraints above); measured on GPU as byte-for-byte identical to a
+  direct backend call, with `sink=None` a zero regression
+- **additive bias (explicit parameter)**: `bias` forwarded to `flash_attn_func(bias=...)`, requires
+  `[Sq,Skv]` / q's dtype (see above); forward and backward verified numerically on GPU (bf16/fp16,
+  full/causal, all rel-L2 < 2e-2)
 
-### 性能路由层（`choose_backend`，默认全走 Turbo）
+### Performance routing layer (`choose_backend`, everything routes to Turbo by default)
 
-识别成功（mask 分类 + score_mod 映射）后，分发前会经过一层轻量的性能路由
+Once a variant is recognised (mask classification + score_mod mapping), dispatch passes through a
+thin performance routing layer:
 `choose_backend(mask_cfg, *, shape, dtype, has_alibi, has_softcap=False, has_dropout=False,
-has_sink=False, has_bias=False) -> {"turbo","custom"}`：
+has_sink=False, has_bias=False) -> {"turbo","custom"}`:
 
-- **默认返回 `"turbo"`**，即所有受支持变体仍直连 `flash_attn_func`，行为与之前逐字节一致。
-- 提供注册表 API：`register_backend_override(matcher, backend)` / `clear_backend_overrides()`。
-  `matcher(ctx)->bool` 可读取路由上下文（`kind/causal/window_size/shape/dtype/has_alibi/has_softcap/
-  has_dropout/has_sink/has_bias/mask_cfg`），命中则强制该 backend（按注册顺序、首个命中生效）。用于让
-  tuner 把特定 shape/kind 引到 `_dispatch_custom` 钩子，而无需改动分类器。
-- `custom` 分支共用 `_dispatch_custom(...)`（当前仍是抛 `NotImplementedError` 的 stub），
-  既是“任意 score_mod”的入口，也是“被显式路由为 custom 的受支持变体”的入口。
+- **Returns `"turbo"` by default**, i.e. every supported variant still dispatches straight to
+  `flash_attn_func`, byte-for-byte identical to previous behaviour.
+- Provides a registry API: `register_backend_override(matcher, backend)` /
+  `clear_backend_overrides()`. `matcher(ctx)->bool` can read the routing context
+  (`kind/causal/window_size/shape/dtype/has_alibi/has_softcap/has_dropout/has_sink/has_bias/mask_cfg`);
+  a match forces that backend (registration order, first match wins). This lets a tuner steer
+  specific shapes/kinds to the `_dispatch_custom` hook without touching the classifier.
+- The `custom` branch shares `_dispatch_custom(...)` (still a stub that raises
+  `NotImplementedError`). It is both the entry point for "arbitrary score_mod" and for "a supported
+  variant explicitly routed to custom".
 
-### 关键前提 / 已知约束
+### Key assumptions / known constraints
 
-- **ALiBi 符号约定（build 相关）**：本兼容层假设 Turbo `alibi_slopes`（正斜率）等价于
-  flex 的 `+slope*(kv-q)`。该符号在 `rocm/primus:v26.5`（primus_turbo 0.3.2.dev48,
-  commit 6ccf00ff）上经实测为 `alibi_sign=+1`（见 `bench/bench_results_ext2.md`：
-  `plus_err=1.6e-3` 匹配、`minus_err=1.32` 不匹配）。**换 build 需重新校验该符号**，
-  否则可能静默产生错误结果。
-- **mask 探测上限（含大窗口定位）**：分类器在 `min(S,512)` 网格上探测 `block_mask.mask_mod`。当探测角
-  看似 full-causal 但远角不可见（`mask_mod(S-1,0)=False`）时，会在**最后一个 query 行**二分搜索窗口边界
-  `W = 最大 d 使 mask_mod(S-1, S-1-d) 可见`，再对若干抽样行（边界行 + 均匀分布的约 16 行）逐位精确校验其
-  为标准左窗因果 `(q>=kv)&(q-kv<=W)`；**仅在校验完全通过时**分类为 `sliding_window_causal, (W,0)`，否则仍抛
-  `NotImplementedError`（绝不误判）。full-causal（远角仍可见）仍归 causal。
-- **分类/识别缓存（性能，行为不变）**：`block_mask` 的分类与 `score_mod` 的 ALiBi/soft-cap 识别结果按
-  **对象身份**（`weakref.WeakKeyDictionary`）缓存——同一 `block_mask`/`score_mod` 被多层/多步复用时跳过
-  重探测（最多 512×512 网格 + 检测器），消除每次调用固定 ~1.6–4.1ms 的探测开销（GPU 端到端 wrapper 前向
-  开销由 ~1.5–2.3ms 降至 ~0.03–0.27ms，其余为保留的 bhsd↔bshd transpose）。**纯提速**：不同对象重新分类、
-  结果与未缓存逐位一致；无法弱引用的对象自动跳过缓存；`clear_classification_cache()` 可复位。
-- **不识别即报错**：任何无法映射到上述固定内核的 `score_mod`/`mask_mod` 都会抛
-  `NotImplementedError`（自定义快路径 `_dispatch_custom` 目前是 stub），绝不静默降级，
-  从而保证“正确性优先”。
+- **ALiBi sign convention (build-dependent)**: this compat layer assumes Turbo's `alibi_slopes`
+  (positive slopes) is equivalent to flex's `+slope*(kv-q)`. That sign was measured as
+  `alibi_sign=+1` on `rocm/primus:v26.5` (primus_turbo 0.3.2.dev48, commit 6ccf00ff) -- see
+  `bench/bench_results_ext2.md`: `plus_err=1.6e-3` matches, `minus_err=1.32` does not.
+  **The sign must be re-validated when changing builds**, otherwise results may be silently wrong.
+- **Mask probe limit (including large-window location)**: the classifier probes
+  `block_mask.mask_mod` on a `min(S,512)` grid. When the probed corner looks full-causal but the far
+  corner is invisible (`mask_mod(S-1,0)=False`), it binary-searches the window boundary on the
+  **last query row** (`W = the largest d such that mask_mod(S-1, S-1-d) is visible`), then verifies
+  several sampled rows (the boundary row plus ~16 evenly spaced rows) bit-exactly as standard
+  left-window causal `(q>=kv)&(q-kv<=W)`. **Only when that verification passes completely** is it
+  classified as `sliding_window_causal, (W,0)`; otherwise it still raises `NotImplementedError`
+  (never a misclassification). Full-causal (far corner still visible) remains causal.
+- **Classification/detection cache (performance, behaviour unchanged)**: `block_mask` classification
+  and `score_mod` ALiBi/soft-cap detection results are cached by **object identity**
+  (`weakref.WeakKeyDictionary`) -- when the same `block_mask`/`score_mod` is reused across layers or
+  steps, re-probing (up to a 512x512 grid plus the detectors) is skipped, removing a fixed
+  ~1.6-4.1ms probe cost per call (the GPU end-to-end wrapper forward overhead drops from ~1.5-2.3ms
+  to ~0.03-0.27ms, the remainder being the retained bhsd<->bshd transposes). **Pure speedup**:
+  different objects are re-classified, results are bit-identical to the uncached path, objects that
+  cannot be weakly referenced skip the cache automatically, and `clear_classification_cache()`
+  resets it.
+- **Unrecognised means raise**: any `score_mod`/`mask_mod` that cannot be mapped onto the fixed
+  kernels above raises `NotImplementedError` (the custom fast path `_dispatch_custom` is currently a
+  stub). It never silently degrades, which keeps correctness first.
 
-## 不支持 / 待补（按优先级）
+## Unsupported / to do (by priority)
 
-### P0/P1（路径 A：模式识别映射，小改动高收益）
+### P0/P1 (path A: pattern-recognition mapping, small change, high value)
 
-| 特性 | 原因 | 路径 | 前置 | 难度 |
+| Feature | Reason | Path | Prerequisite | Difficulty |
 |---|---|---|---|---|
-| ALiBi（超出保守识别器的等价写法） | 当前自动识别只接受严格线性形式，复杂等价写法会被判为不识别 | ✅ 已提供**显式 `alibi_slopes` 参数入口**绕开识别器；如需增强自动识别器另计 | 补齐等价形式与符号回归单测 | 已缓解 |
-| softcap（`logits_soft_cap`） | **受阻于 kernel 层**：本 build 的 aiter dense 前/反向 kernel 无 softcap 形参（详见下方“softcap 现状”） | A（需上游 aiter 支持） | 上游 aiter 的 dense `mha_fwd`/`fmha_v3_fwd`/`mha_bwd` 暴露并实现 softcap（fwd+bwd） | 受阻 |
-| attention sink | ✅ **已支持**：入口新增显式 `sink` 参数（1D/fp32/len==Hq，head_dim 约束），透传 `flash_attn_func(sink=...)`；GPU 实测与直接后端调用逐字节一致 | A | — | 已完成 |
-| dropout | ✅ **已支持**：入口新增显式 `dropout_p`（`0<=p<1`）透传后端；GPU 实测 `p=0` 零回归、`p=0.1` 前向+反向通过 | A | — | 已完成 |
-| 加性 bias / relative position bias | ✅ **已支持**：经 AITER dense，需**形状 `[Sq,Skv]`、dtype 同 q（bf16/fp16）**（fp32→NaN、4D 每头被 kernel 拒绝）；入口自动适配形状/精度后透传（详见下方“bias 现状”） | A | — | 已完成 |
+| ALiBi (equivalent formulations beyond the conservative detector) | auto-detection currently accepts only the strictly linear form, so complex equivalent formulations are treated as unrecognised | Provided: an **explicit `alibi_slopes` parameter** that bypasses the detector; strengthening the auto-detector is tracked separately | add equivalent-form and sign regression unit tests | mitigated |
+| softcap (`logits_soft_cap`) | **blocked at the kernel layer**: this build's aiter dense fwd/bwd kernels have no softcap parameter (see "softcap status" below) | A (needs upstream aiter support) | upstream aiter's dense `mha_fwd`/`fmha_v3_fwd`/`mha_bwd` must expose and implement softcap (fwd+bwd) | blocked |
+| attention sink | **supported**: the entry point gained an explicit `sink` parameter (1D/fp32/len==Hq, head_dim constraints), forwarded to `flash_attn_func(sink=...)`; measured on GPU as byte-for-byte identical to a direct backend call | A | - | done |
+| dropout | **supported**: the entry point gained an explicit `dropout_p` (`0<=p<1`) forwarded to the backend; measured on GPU, `p=0` is a zero regression and `p=0.1` passes forward+backward | A | - | done |
+| additive bias / relative position bias | **supported**: via AITER dense, requires **shape `[Sq,Skv]` and q's dtype (bf16/fp16)** (fp32 -> NaN, 4D per-head rejected by the kernel); the entry point adapts shape/precision automatically before forwarding (see "bias status" below) | A | - | done |
 
-### softcap 现状（P0，已调查：识别到但受阻于 kernel 层）
+### softcap status (P0, investigated: detected but blocked at the kernel layer)
 
-softcap（logits 软上限，Gemma2/Grok）：`score = cap * tanh(score / cap)`（cap>0；0/None=禁用）。
+softcap (logits soft cap, Gemma2/Grok): `score = cap * tanh(score / cap)` (cap>0; 0/None = disabled).
 
-**Python 侧已就位**：
+**The Python side is in place**:
 
-- 自动识别：`_detect_softcap(score_mod)` 严格识别纯 softcap（仅依赖 score、与 b/h/q/kv 无关、
-  `f(0)=0`、尾部饱和到 cap、全网格拟合 `cap*tanh(s/cap)` 且奇对称）。
-- 显式参数：入口新增 `softcap: Optional[float] = None`，`None`/`0` 禁用，正数请求 softcap。
-- **单一启用点**：显式 `softcap>0` 与识别到的 soft-cap 汇入 `effective_softcap`，一并把
-  `has_softcap=True` 传入 `choose_backend`，随后在 `flex_attention` 内的**同一处** `if
-  effective_softcap > 0.0:` 显式抛 `NotImplementedError`（**绝不静默丢弃 cap**）。该处标注了
-  `# TODO(softcap)`：上游 aiter dense fwd+bwd 支持后，删除此拦截并把 `effective_softcap`
-  thread 到 `flash_attn_func(softcap=...)` 即可**一行切换启用**。
+- Auto-detection: `_detect_softcap(score_mod)` strictly recognises pure softcap (depends only on
+  score, independent of b/h/q/kv, `f(0)=0`, tail saturates to cap, fits `cap*tanh(s/cap)` across the
+  whole grid, and is odd-symmetric).
+- Explicit parameter: the entry point gained `softcap: Optional[float] = None`; `None`/`0` disables
+  it, a positive value requests softcap.
+- **Single enable point**: an explicit `softcap>0` and a detected soft-cap both funnel into
+  `effective_softcap`, which also sets `has_softcap=True` for `choose_backend`, and then hit the
+  **same single** `if effective_softcap > 0.0:` inside `flex_attention` that raises
+  `NotImplementedError` (**the cap is never silently dropped**). That site is marked
+  `# TODO(softcap)`: once upstream aiter dense fwd+bwd supports it, deleting the guard and threading
+  `effective_softcap` into `flash_attn_func(softcap=...)` is a **one-line switch to enable**.
 
-**为何必须显式识别（修复一处静默错误风险）**：ALiBi 识别器 `_detect_alibi_slopes` 只在
-`score=0` 处探测，而 `cap*tanh(0)=0`，因此它会把一个纯 softcap 误判为“零斜率 ALiBi（no-op）”，
-进而落到 `alibi_slopes=None` → 直连 Turbo **忽略 cap**，产生静默错误结果。对典型 cap（20–50）
-该误判确会发生（`|f(1)-1| < 5e-3` 容差内）。`_detect_softcap` 先行拦截，把静默错误变为显式报错。
-实测：`bench/softcap_flex_validation.py` 中 active cap=1.0 时 `rel_l2(no-cap vs cap)=0.576`
-（丢弃 cap 会严重错误）；cap=30 在 ~N(0,1) logits 上 gap=0.0048（大 cap 近似 no-op，但仍须遵从）。
+**Why explicit detection is required (fixes a silent-wrongness risk)**: the ALiBi detector
+`_detect_alibi_slopes` only probes at `score=0`, and `cap*tanh(0)=0`, so it would misclassify a pure
+softcap as "zero-slope ALiBi (no-op)" and fall through to `alibi_slopes=None` -> dispatch straight to
+Turbo **ignoring the cap**, producing silently wrong results. For typical caps (20-50) this
+misclassification does occur (within the `|f(1)-1| < 5e-3` tolerance). `_detect_softcap` intercepts
+first, turning a silent error into an explicit one.
+Measured: in `bench/softcap_flex_validation.py`, an active cap=1.0 gives
+`rel_l2(no-cap vs cap)=0.576` (dropping the cap would be badly wrong); cap=30 on ~N(0,1) logits gives
+gap=0.0048 (a large cap is nearly a no-op, but must still be honoured).
 
-**受阻点（kernel 层，实测 aiter 签名，rocm/primus:v26.5）**：
+**Blocking point (kernel layer, measured aiter signatures, rocm/primus:v26.5)**:
 
-- dense 前向 `aiter.ops.mha._flash_attn_forward`（兼容层经 `attention_aiter_forward_impl` →
-  `AttnFwdAiterBackend` 调用）签名**无** `logits_soft_cap`/`softcap`：
+- The dense forward `aiter.ops.mha._flash_attn_forward` (which the compat layer reaches via
+  `attention_aiter_forward_impl` -> `AttnFwdAiterBackend`) has **no** `logits_soft_cap`/`softcap`
+  parameter:
   `(q,k,v,dropout_p,softmax_scale,causal,window_size_left,window_size_right,sink_size,bias,
   alibi_slopes,q_descale,k_descale,v_descale,return_lse,return_softmax,how_v3_bf16_cvt=1,
-  cu_seqlens_q=None,cu_seqlens_kv=None,sink_ptr=None,out=None)`。底层 `mha_fwd`/`fmha_v3_fwd`
-  运行时类型提示同样无 softcap 形参。
-- dense 反向 `aiter.ops.mha._flash_attn_backward` 为 `torch_compile_guard` 包装
-  （`(*args, **kwargs)` 透传到 `torch.ops.aiter.<name>`），当前调用未传 softcap；底层
-  `mha_bwd`/`fmha_v3_bwd` 亦为无 softcap 形参的包装。**softcap 会改变梯度，反向缺形参 =
-  无法正确训练。**
-- varlen 前向 `_flash_attn_varlen_forward` **有** `logits_soft_cap: float = 0.0`（且有
-  `ret = ret and logits_soft_cap == 0.0` 门控），但 varlen 反向 `_flash_attn_varlen_backward`
-  **无** softcap 形参 → 即便走 varlen 也无法训练；且兼容层入口目前仅 dense。
-- FlyDSL：本 build 的安装包**不含** `attention_flydsl_impl`（`ModuleNotFoundError`），不可用。
-- aiter Triton dense 前向 `aiter.ops.triton.attention.mha._flash_attn_forward`：内部对
-  softcap **硬编码 `softcap=0.0`** 且 Python 包装未暴露该形参；Triton 反向
-  `flash_attn_onekernel_backward` 无 softcap 形参。
+  cu_seqlens_q=None,cu_seqlens_kv=None,sink_ptr=None,out=None)`. The underlying
+  `mha_fwd`/`fmha_v3_fwd` runtime type hints likewise have no softcap parameter.
+- The dense backward `aiter.ops.mha._flash_attn_backward` is a `torch_compile_guard` wrapper
+  (`(*args, **kwargs)` forwarded to `torch.ops.aiter.<name>`) and the current call does not pass
+  softcap; the underlying `mha_bwd`/`fmha_v3_bwd` are likewise wrappers without a softcap parameter.
+  **softcap changes the gradient, so a backward without the parameter means it cannot be trained
+  correctly.**
+- The varlen forward `_flash_attn_varlen_forward` **does have** `logits_soft_cap: float = 0.0` (with
+  a `ret = ret and logits_soft_cap == 0.0` gate), but the varlen backward
+  `_flash_attn_varlen_backward` has **no** softcap parameter -> even the varlen route cannot train;
+  and the compat layer's entry point is dense-only for now.
+- FlyDSL: this build's installed package **does not include** `attention_flydsl_impl`
+  (`ModuleNotFoundError`), so it is unavailable.
+- The aiter Triton dense forward `aiter.ops.triton.attention.mha._flash_attn_forward`
+  **hardcodes `softcap=0.0`** internally and its Python wrapper does not expose the parameter; the
+  Triton backward `flash_attn_onekernel_backward` has no softcap parameter.
 
-**结论**：在不改 C 扩展/不重编译 aiter 的前提下（本任务约束），dense 前+反向都无法接出
-softcap。故 softcap 在兼容层标记为“**识别到但受阻于 kernel 层**”。
+**Conclusion**: without modifying the C extension or recompiling aiter (a constraint of this task),
+softcap cannot be wired through for both dense forward and backward. softcap is therefore marked
+"**detected but blocked at the kernel layer**" in the compat layer.
 
-**可选推进路径（需上游改动，超出本任务范围）**：
+**Possible ways forward (require upstream changes, out of scope here)**:
 
-1. 上游 aiter 的 dense `mha_fwd`/`fmha_v3_fwd`/`mha_bwd`（及对应 CK/汇编 kernel）增加并实现
-   `logits_soft_cap`（fwd+bwd 一致），随后本兼容层把 `softcap` 从 `flash_attn_func` 一路 thread
-   到 `attention_aiter_forward/backward_impl` 并解除拦截即可（Python 侧改动已经预演清楚）。
-2. 暴露 aiter Triton dense 路径的内部 `softcap`（当前硬编码 0.0），但需同时补 Triton 反向的
-   softcap 支持，且 Triton 路径当前仅在 sink 分支启用。
-3. 用 Triton epilogue 近似（自写 `cap*tanh` 前/反向）——工作量与风险高，非最小改动。
+1. Upstream aiter adds and implements `logits_soft_cap` in the dense
+   `mha_fwd`/`fmha_v3_fwd`/`mha_bwd` (and the corresponding CK/assembly kernels), consistently for
+   fwd+bwd. This compat layer would then thread `softcap` from `flash_attn_func` all the way to
+   `attention_aiter_forward/backward_impl` and lift the guard (the Python-side change is already
+   fully scoped out).
+2. Expose the internal `softcap` of the aiter Triton dense path (currently hardcoded to 0.0), but
+   this also needs softcap support in the Triton backward, and the Triton path is currently only
+   enabled on the sink branch.
+3. Approximate with a Triton epilogue (hand-written `cap*tanh` forward/backward) -- high effort and
+   risk, not a minimal change.
 
-### bias 现状（P0，已调查并修复：形状/精度问题，非 kernel 死路）
+### bias status (P0, investigated and fixed: a shape/precision issue, not a kernel dead end)
 
-加性 bias（作用于 pre-softmax logits：`score = q·kᵀ/√d + bias`）。之前报告的 “NaN” 经取证
-**不是 kernel 死路，而是形状/精度用错**。在 `rocm/primus:v26.5`（gfx950/MI355X）上用小 shape
-（B=2,H=2,S=64,D=64）逐一试 `flash_attn_func(q,k,v, bias=...)`，与 fp32 手工加性 bias 参考
-（`softmax(qk/√d + bias) @ v`）对比，结论如下：
+Additive bias (applied to the pre-softmax logits: `score = q.k^T/sqrt(d) + bias`). The previously
+reported "NaN" turned out **not to be a kernel dead end but incorrect shape/precision usage**. On
+`rocm/primus:v26.5` (gfx950/MI355X), a small shape (B=2,H=2,S=64,D=64) was swept through
+`flash_attn_func(q,k,v, bias=...)` and compared against an fp32 manual additive-bias reference
+(`softmax(qk/sqrt(d) + bias) @ v`), with these results:
 
-| bias dtype / 形状 | 现象 |
+| bias dtype / shape | Behaviour |
 |---|---|
-| bf16 `[B,H,Sq,Skv]` / `[1,H,Sq,Skv]` / `[1,1,Sq,Skv]` / `[B,1,Sq,Skv]`（4D） | `RuntimeError: bias shape should be [sq, sk]`（kernel 只收 2D） |
-| fp32 `[B,H,Sq,Skv]`（4D） | 同上 `RuntimeError` |
-| **fp32 `[Sq,Skv]`（2D）** | **输出 NaN**（这就是此前“NaN”的真因：2D 但用了 fp32） |
-| **bf16 `[Sq,Skv]`（2D）** | ✅ **正确**：前向 rel-L2 = 2.1e-3（< 2e-2）；反向 dQ/dK/dV/dBias 均有限、rel-L2 ≈ 2.5e-3 |
+| bf16 `[B,H,Sq,Skv]` / `[1,H,Sq,Skv]` / `[1,1,Sq,Skv]` / `[B,1,Sq,Skv]` (4D) | `RuntimeError: bias shape should be [sq, sk]` (the kernel only accepts 2D) |
+| fp32 `[B,H,Sq,Skv]` (4D) | same `RuntimeError` |
+| **fp32 `[Sq,Skv]` (2D)** | **NaN output** (this was the real cause of the earlier "NaN": 2D but fp32) |
+| **bf16 `[Sq,Skv]` (2D)** | **correct**: forward rel-L2 = 2.1e-3 (< 2e-2); backward dQ/dK/dV/dBias all finite, rel-L2 ~ 2.5e-3 |
 
-**根因**：aiter dense（`aiter.ops.mha._flash_attn_forward` → 底层 `mha_fwd`/`fmha_v3_fwd`）的 bias
-形参**只接受单个 `[Sq, Skv]`** 矩阵（在 batch/head 间共享）、且 dtype 必须与 q 一致（fp16/bf16）。
-底层 `mha_fwd(..., bias)` 与 `mha_bwd(..., dbias, bias)` 均有 bias/dbias 形参（实测 aiter 运行时
-type hints 确认），故**前向+反向都支持**。
+**Root cause**: the bias parameter of aiter dense (`aiter.ops.mha._flash_attn_forward` -> underlying
+`mha_fwd`/`fmha_v3_fwd`) **only accepts a single `[Sq, Skv]`** matrix (shared across batch/head) and
+its dtype must match q (fp16/bf16). The underlying `mha_fwd(..., bias)` and
+`mha_bwd(..., dbias, bias)` both have bias/dbias parameters (confirmed from aiter's runtime type
+hints), so **both forward and backward are supported**.
 
-**修复（最小改动，仅在 flex 入口侧适配，不动 `flash_attn_interface.py`/`attention_aiter_impl.py`）**：
-入口新增显式 `bias` 参数，`_validate_and_adapt_bias` 把用户传入的 bias 适配为 kernel 期望的
-`[Sq,Skv]`（接受 `[Sq,Skv]` 或前导 singleton 的 `[1,Sq,Skv]`/`[1,1,Sq,Skv]`；真正的每头/每样本
-bias 抛清晰 `ValueError`），并 cast 到 q 的 dtype、对齐 device，再透传 `flash_attn_func(bias=...)`。
+**Fix (minimal change, adaptation only on the flex entry side, leaving
+`flash_attn_interface.py`/`attention_aiter_impl.py` untouched)**: the entry point gained an explicit
+`bias` parameter, and `_validate_and_adapt_bias` adapts the user-provided bias to the `[Sq,Skv]` the
+kernel expects (accepting `[Sq,Skv]` or leading-singleton `[1,Sq,Skv]`/`[1,1,Sq,Skv]`; a true
+per-head/per-sample bias raises a clear `ValueError`), casts it to q's dtype, aligns the device and
+forwards it to `flash_attn_func(bias=...)`.
 
-**验证（经 flex 入口，端到端 fwd+bwd，见 `bench/_investigate_bias.py` 与 `bench/_run_taskB.py`）**：
-bf16 与 fp16 × full 与 causal 共 4 组，前向 rel-L2 ∈ [2.6e-4, 2.3e-3]、dQ rel-L2 ∈ [3.2e-4, 2.7e-3]
-（均 < 2e-2），且 gap(vs no-bias) ≈ 0.41–0.49（确认 bias 实质生效、非静默 no-op）。
+**Validation (through the flex entry point, end-to-end fwd+bwd, see `bench/_investigate_bias.py` and
+`bench/_run_taskB.py`)**: bf16 and fp16 x full and causal, 4 combinations total; forward
+rel-L2 in [2.6e-4, 2.3e-3] and dQ rel-L2 in [3.2e-4, 2.7e-3] (all < 2e-2), with
+gap(vs no-bias) ~ 0.41-0.49 (confirming the bias really takes effect and is not a silent no-op).
 
-**已知限制**：仅支持在 batch/head 间**共享的单个 `[Sq,Skv]`** bias（相对位置 bias / 共享加性 mask
-的常见形态）；每头/每样本 bias 属任意 score_mod，需 codegen 路径（P3）。
+**Known limitation**: only a **single `[Sq,Skv]` bias shared across batch/head** is supported (the
+common form for relative position bias / a shared additive mask); per-head/per-sample bias is an
+arbitrary score_mod and needs the codegen path (P3).
 
-### varlen / document packing 现状（P2，已支持）
+### varlen / document packing status (P2, supported)
 
-**（主交付）显式 varlen 入口 `flex_attention_varlen`**：
+**(Primary deliverable) explicit varlen entry `flex_attention_varlen`**:
 
 ```python
 from primus_turbo.pytorch.ops.attention import flex_attention_varlen
 out = flex_attention_varlen(
-    query, key, value,               # THD 打包 [total_tokens, H, D]（与 Turbo varlen 一致，无需 transpose）
-    cu_seqlens_q, cu_seqlens_k,       # int32 [num_seqs+1] 前缀和，位于 q 的 device
-    max_seqlen_q, max_seqlen_k,       # 各自最长段长度（正 int）
+    query, key, value,               # THD packed [total_tokens, H, D] (same as Turbo varlen, no transpose needed)
+    cu_seqlens_q, cu_seqlens_k,       # int32 [num_seqs+1] prefix sums, on q's device
+    max_seqlen_q, max_seqlen_k,       # longest segment length for each (positive int)
     *, causal=False, window_size=(-1, -1), scale=None,
     alibi_slopes=None, dropout_p=0.0, sink=None, softcap=None, return_lse=False,
 )
 ```
 
-- **直连后端**：薄封装，直接映射到 `flash_attn_varlen_func`（THD 进 THD 出，无布局互转）。文档内因果用
-  `causal=True`（标准块对角 + 段内 causal，要求逐段 `q_len == k_len`）；`window_size=(W,0)` 为逐段左窗。
-- **cu_seqlens 校验（`_validate_cu_seqlens`）**：int32、1D、首元素 0、单调非递减、末元素 == `total`
-  （q 用 `query.shape[0]`、k 用 `key.shape[0]`）、`len(cu_q)==len(cu_k)`、与 q 同 device、
-  `max_seqlen >= 最长段`；`causal=True` 另要求 `cu_seqlens_q == cu_seqlens_k`（bottom-right 对齐，段长
-  不一致会静默错位）。任何不合法 → 清晰 `ValueError`。
-- **复用 dense 校验器**：`dropout_p`（`0<=p<1`）、`sink`（1D/fp32/len==Hq，head_dim 约束）、`alibi_slopes`
-  （1D/fp32/len==Hq）与 dense 入口同一套校验；GQA/MQA 原生支持（`Hq % Hkv == 0`，无需额外 flag）。
-- **不支持项报错（风格与 dense 一致）**：无 `score_mod` 形参（任意 score_mod 走不到这里）；`softcap>0`
-  统一 `NotImplementedError`（varlen 反向 kernel 亦缺 softcap 形参，见上文 softcap 现状），绝不静默丢弃 cap。
-- **跨 build 兼容**：`sink` 仅在调用方实际提供时才透传（本 build 较旧的 varlen kernel 无 `sink` 形参；默认
-  `sink=None` 不传即 no-op，对新旧后端都可用）；`bias` 本入口不暴露，交后端默认。
-- **GPU 实测（rocm/primus:v26.5, gfx950, total=512, docs=[128,128,256], H=8, D=128）**：causal/full/SWA(W=64)/
-  GQA(Hq8/Hkv2)/ALiBi 前向 rel-L2 ∈ [2.4e-4, 2.3e-3]，causal 反向 dQ/dK/dV ≈ 2.5e-3~2.9e-3（均 < 2e-2）；
-  `return_lse` 返回 `(out, lse)`（lse `[H, total]`）；`softcap>0`/非法 cu_seqlens/causal 段长不一致均正确报错。
+- **Direct backend dispatch**: a thin wrapper mapping straight onto `flash_attn_varlen_func` (THD in,
+  THD out, no layout conversion). In-document causal uses `causal=True` (standard block-diagonal plus
+  in-segment causal, requiring `q_len == k_len` per segment); `window_size=(W,0)` gives a per-segment
+  left window.
+- **cu_seqlens validation (`_validate_cu_seqlens`)**: int32, 1D, first element 0, monotonically
+  non-decreasing, last element == `total` (`query.shape[0]` for q, `key.shape[0]` for k),
+  `len(cu_q)==len(cu_k)`, same device as q, `max_seqlen >= longest segment`; `causal=True`
+  additionally requires `cu_seqlens_q == cu_seqlens_k` (bottom-right alignment, mismatched segment
+  lengths would silently misalign). Anything invalid -> a clear `ValueError`.
+- **Reuses the dense validators**: `dropout_p` (`0<=p<1`), `sink` (1D/fp32/len==Hq, head_dim
+  constraints) and `alibi_slopes` (1D/fp32/len==Hq) share the same validators as the dense entry
+  point; GQA/MQA is natively supported (`Hq % Hkv == 0`, no extra flag needed).
+- **Unsupported items raise (same style as dense)**: there is no `score_mod` parameter (an arbitrary
+  score_mod never reaches here); `softcap>0` uniformly raises `NotImplementedError` (the varlen
+  backward kernel also lacks a softcap parameter, see softcap status above), never silently dropping
+  the cap.
+- **Cross-build compatibility**: `sink` is only forwarded when the caller actually provides it (this
+  build's older varlen kernel has no `sink` parameter; the default `sink=None` is simply not passed,
+  which works on both old and new backends); `bias` is not exposed by this entry point and is left
+  to the backend default.
+- **Measured on GPU (rocm/primus:v26.5, gfx950, total=512, docs=[128,128,256], H=8, D=128)**:
+  causal/full/SWA(W=64)/GQA(Hq8/Hkv2)/ALiBi forward rel-L2 in [2.4e-4, 2.3e-3], causal backward
+  dQ/dK/dV ~ 2.5e-3 to 2.9e-3 (all < 2e-2); `return_lse` returns `(out, lse)` (lse `[H, total]`);
+  `softcap>0`, invalid cu_seqlens and mismatched causal segment lengths all raise correctly.
 
-**（次交付）dense 入口自动识别 document mask**：
+**(Secondary deliverable) automatic document-mask detection in the dense entry**:
 
-- `flex_attention` 分类器在 `min(S,512)` 网格上探测 `block_mask.mask_mod`；当模式落在 causal 之内但既非
-  纯 causal 也非单窗 causal 时，`_detect_document_causal_segments` 会尝试把它识别为 `same_doc(q,kv) & (q>=kv)`：
-  从次对角线读出文档边界 → 还原每段长度 → **重建完整块对角因果 mask 并逐位精确比对**，完全一致才判定为
-  `document_causal`（`_classify_block_mask` 返回 `{"kind":"document_causal","doc_seglens":[...]}`）。
-- 命中后，dense 入口把 bhsd `[B,H,S,D]` 打包为 THD、按 `doc_seglens`（跨 batch 复制）构造 `cu_seqlens`、以
-  `causal=True` 走 `flash_attn_varlen_func`，再解包回 bhsd（`_dispatch_document_varlen`）。**绝不用会跨文档的
-  dense causal**。ALiBi（显式或识别）/dropout/sink 一并透传；`bias` 与 `return_lse` 在此路径显式报错
-  （packed `[Sq,Skv]` bias 无法对齐、packed LSE 与 `[B,H,S]` 不对齐——需 LSE/bias 请改用显式 `flex_attention_varlen`）。
-- **正确性优先，绝不误判**：仅在 `S <= 512`（探测未截断）且**重建逐位相等**时才路由；`S>512`、含窗、非方阵、
-  任何空洞/偏差都会返回 `None` → 回退到原有 `NotImplementedError`（保持现状，绝不静默出错）。
-- **GPU 实测**：dense 入口带 document `block_mask`，B=1 / B=2（cu 复制）/ 含显式 ALiBi 三组，rel-L2 ≈ 1.6e-3~2.0e-3
-  （均 < 2e-2），与 masked fp32 参考一致。
+- The `flex_attention` classifier probes `block_mask.mask_mod` on a `min(S,512)` grid; when the
+  pattern falls within causal but is neither pure causal nor single-window causal,
+  `_detect_document_causal_segments` tries to recognise it as `same_doc(q,kv) & (q>=kv)`: read the
+  document boundaries off the sub-diagonal -> recover each segment length -> **rebuild the full
+  block-diagonal causal mask and compare bit-exactly**; only on an exact match is it classified as
+  `document_causal` (`_classify_block_mask` returns `{"kind":"document_causal","doc_seglens":[...]}`).
+- On a hit, the dense entry packs bhsd `[B,H,S,D]` into THD, builds `cu_seqlens` from `doc_seglens`
+  (replicated across batch), dispatches through `flash_attn_varlen_func` with `causal=True`, and
+  unpacks back to bhsd (`_dispatch_document_varlen`). **It never uses a dense causal that would
+  attend across documents.** ALiBi (explicit or detected)/dropout/sink are forwarded along; `bias`
+  and `return_lse` raise explicitly on this path (a packed `[Sq,Skv]` bias cannot be aligned, and
+  packed LSE does not align with `[B,H,S]` -- use the explicit `flex_attention_varlen` if you need
+  LSE/bias).
+- **Correctness first, never a misclassification**: routing only happens when `S <= 512` (probing not
+  truncated) **and the reconstruction is bit-identical**; `S>512`, windowed, non-square, or any hole
+  or deviation returns `None` -> falls back to the existing `NotImplementedError` (status quo
+  preserved, never silently wrong).
+- **Measured on GPU**: the dense entry with a document `block_mask`, across three cases -- B=1, B=2
+  (cu replicated) and with explicit ALiBi -- gives rel-L2 ~ 1.6e-3 to 2.0e-3 (all < 2e-2), matching the
+  masked fp32 reference.
 
-**已知限制**：document 识别要求 `S <= _MASK_PROBE_LIMIT(512)`（更长序列请用显式 `flex_attention_varlen`）；
-dense document 路径不支持 `bias`/`return_lse`（改用显式 varlen 入口）；`softcap>0` 全线受阻（见 softcap 现状）。
+**Known limitations**: document detection requires `S <= _MASK_PROBE_LIMIT(512)` (use the explicit
+`flex_attention_varlen` for longer sequences); the dense document path does not support
+`bias`/`return_lse` (use the explicit varlen entry instead); `softcap>0` is blocked everywhere (see
+softcap status).
 
-### P2（路径 A：中等工作量）
+### P2 (path A: moderate effort)
 
-| 特性 | 原因 | 路径 | 前置 | 难度 |
+| Feature | Reason | Path | Prerequisite | Difficulty |
 |---|---|---|---|---|
-| varlen / document packing | ✅ **已支持**：新增显式入口 `flex_attention_varlen`（THD 打包 + `cu_seqlens` 直连 `flash_attn_varlen_func`）；GPU 实测 causal/full/SWA/GQA/ALiBi 前向 rel-L2≈1.6e-3~2.3e-3、反向 dQ/dK/dV≈2.5e-3~2.9e-3（均 < 2e-2） | A | — | 已完成 |
-| document masking | ✅ **已支持**：dense `flex_attention` 精确识别 `same_doc(q,kv) & (q>=kv)` 块对角因果 → 还原每段长度 → 构造 `cu_seqlens` → 改走 varlen；GPU 实测 B=1/B=2/含 ALiBi 均 rel-L2≈1.6e-3~2.0e-3 | A | 依赖 varlen 包装 | 已完成 |
-| prefixLM（部分） | 现分类器仅支持 full/causal/单窗 causal/文档块对角因果 | A | 补充可判定模板与后端映射 | 中 |
-| 更多 head_dim / dtype 覆盖 | 受后端约束与 dtype guard 限制（当前仅 fp16/bf16） | A | 后端能力验证（FlyDSL 仅 D∈{64,128}） | 中 |
+| varlen / document packing | **supported**: new explicit entry `flex_attention_varlen` (THD packing + `cu_seqlens` straight to `flash_attn_varlen_func`); measured on GPU, causal/full/SWA/GQA/ALiBi forward rel-L2 ~ 1.6e-3 to 2.3e-3, backward dQ/dK/dV ~ 2.5e-3 to 2.9e-3 (all < 2e-2) | A | - | done |
+| document masking | **supported**: the dense `flex_attention` exactly recognises `same_doc(q,kv) & (q>=kv)` block-diagonal causal -> recovers segment lengths -> builds `cu_seqlens` -> routes through varlen; measured on GPU, B=1/B=2/with ALiBi all rel-L2 ~ 1.6e-3 to 2.0e-3 | A | depends on the varlen wrapper | done |
+| prefixLM (partial) | the current classifier only supports full/causal/single-window causal/document block-diagonal causal | A | add decidable templates and backend mappings | medium |
+| broader head_dim / dtype coverage | limited by backend constraints and the dtype guard (currently fp16/bf16 only) | A | backend capability validation (FlyDSL only supports D in {64,128}) | medium |
 
-### P3（路径 B：通用 codegen，高难）
+### P3 (path B: general codegen, hard)
 
-| 特性 | 原因 | 路径 | 前置 | 难度 |
+| Feature | Reason | Path | Prerequisite | Difficulty |
 |---|---|---|---|---|
-| 任意 score_mod | 需把运行时函数编译为高性能 kernel | B（codegen + 自动反向） | IR 设计、算子模板、autograd 方案 | 高 |
-| 任意 mask_mod / 通用块稀疏 | 需要通用稀疏布局与调度 | B | mask IR + 稀疏计划器 + kernel 族 | 高 |
-| 任意 score_mod + mask_mod 组合 | 组合爆炸，需统一 codegen 管线 | B | 前两项完成后再做组合优化 | 很高 |
+| arbitrary score_mod | requires compiling a runtime function into a high-performance kernel | B (codegen + automatic backward) | IR design, operator templates, autograd plan | high |
+| arbitrary mask_mod / general block sparsity | requires a general sparse layout and scheduling | B | mask IR + sparse planner + kernel family | high |
+| arbitrary score_mod + mask_mod combinations | combinatorial explosion, needs a unified codegen pipeline | B | build on the two items above, then optimise combinations | very high |
 
-`flex_attention` 内已预留 `_dispatch_custom(...)` 钩子作为路径 B 的接入点，目前仅抛
-`NotImplementedError`（不实现真实 kernel）。
+`flex_attention` already reserves the `_dispatch_custom(...)` hook as the entry point for path B; it
+currently only raises `NotImplementedError` (no real kernel is implemented).
 
-### P4（暂不规划）
+### P4 (not planned for now)
 
-| 特性 | 原因 | 路径 | 前置 | 难度 |
+| Feature | Reason | Path | Prerequisite | Difficulty |
 |---|---|---|---|---|
-| FP8 + 任意 mod | 训练稳定性与量化标定复杂 | B（远期） | P3 成熟后再评估 | 很高 |
-| paged attention | 需要 KV paging 数据结构与调度体系 | 独立路线（非 A/B） | 缓存管理与服务侧协议 | 很高 |
+| FP8 + arbitrary mods | training stability and quantisation calibration are complex | B (long term) | re-evaluate once P3 matures | very high |
+| paged attention | needs KV paging data structures and a scheduling system | separate track (not A/B) | cache management and serving-side protocol | very high |
 
-## 测试
+## Tests
 
-- 纯逻辑单测（CPU 即可）：`tests/pytorch/ops/test_flex_attention_dispatch_logic.py`（共 **186 例**，95 原有
-  + 44 varlen + 15 document + 32 大窗口/缓存；零回归）。varlen 部分覆盖 `_validate_cu_seqlens`（int32/1D/首 0/单调/末元素/段数一致/
-  device/max_seqlen>=最长段/causal 段长一致 的正反例）、`_validate_qkv_varlen`（3D/dtype/head 整除/head_dim）、
-  `_validate_window_size`、`_validate_max_seqlen`，及 `flex_attention_varlen` 端到端（mock 后端）：THD 直通不 transpose、
-  causal/window/scale/dropout/alibi/sink 透传、softcap>0 报错、非法 cu 分发前报错、`return_lse` 返回 tuple、GQA、
-  非因果交叉注意力。document 部分覆盖 `_detect_document_causal_segments`（多文档识别、单 causal/SWA/截断/非方阵/带洞
-  的拒绝）、`_classify_block_mask` 返回 `document_causal`、以及 dense 入口端到端路由到 varlen（cu_seqlens 正确、B=2 复制、
-  ALiBi 透传、bias/return_lse/超 512 的报错）。大窗口/缓存部分覆盖 `_locate_left_window`（W∈{256,512,1024,2048,4096}
-  在 S=8192 上的识别、full-causal/非平移不变/带洞/非方阵 的拒绝）、`_classify_block_mask` 对大窗口的分类（含 S=8192、
-  window≥S 归 causal、非标准长 mask 仍报错），以及分类/识别缓存（同对象命中返回同一对象、不同对象/形状重算、
-  非弱引用对象跳过缓存、`_cached_detect_alibi/softcap` 命中计数、`clear_classification_cache` 复位、行为与未缓存一致）。
-- 旧的原始 95 例：
-  覆盖 full/causal/SWA/随机/带状/head 依赖/batch 依赖 的分类、ALiBi 识别器的正反例、
-  `_detect_softcap` 的正反例（含 cap=20/30/50 识别、identity/线性/常量/ALiBi/硬 clamp/
-  alibi+softcap 组合的拒绝、以及“softcap 不被误判为零斜率 ALiBi”的回归护栏），
-  `choose_backend`/注册表（默认 turbo、override 命中 custom、clear 复位、首个命中优先、
-  ctx 字段含 `has_dropout/has_sink/has_bias`、参数校验、matcher 异常包装、override 可按
-  dropout/sink 命中），以及**显式扩展参数**：`alibi_slopes` 校验器
-  （1D/长度/fp32/非张量的正反例）、`softcap` 归一化器（None/0 禁用、正数保留、负数/NaN 报错）、
-  `_validate_dropout_p`（0/合法值、>=1/负数/NaN/非数报错）、`_validate_explicit_sink`
-  （1D/len==Hq/fp32/head_dim 相等且 2 的幂 的正反例）、`_validate_and_adapt_bias`
-  （`[Sq,Skv]`/前导 singleton 广播/矩形形状 通过，每头 4D/每样本 3D/末两维不符/非张量/非浮点 报错、
-  dtype 适配到 q），`_is_identity_score_mod` 探测，及端到端分派（mock 掉 `flash_attn_func` 在 CPU 上跑）：
-  显式 slopes 被透传且跳过自动识别、显式与自动识别 slopes 等价、与 causal 组合、非平凡 score_mod
-  冲突→`ValueError`、恒等 score_mod 允许、非法长度→`ValueError`、显式 `softcap>0`→
-  `NotImplementedError`（且未触达后端）、`softcap=0/None` 无影响、`dropout_p` 默认/正数透传与越界报错、
-  `sink` 透传与非法形状报错、`bias` 透传/适配与每头 bias 报错、以及“无扩展参数即与原路径一致（含
-  dropout_p=0/sink=None/bias=None）”。
-- GPU varlen / document 验证（容器内）：`bench/flex_attention_varlen_validation.py`（经
-  `bench/_run_varlen_all.py` 先把 workspace `flex_attention.py` 覆盖到已安装包、再从 /tmp 跑纯逻辑单测 +
-  本脚本）。覆盖 `flex_attention_varlen` 的 causal/full/SWA/GQA/ALiBi 前向 + causal 反向 dQ/dK/dV、`return_lse`、
-  softcap/非法 cu/段长不一致 报错；以及 dense 入口 document 路由（B=1/B=2/ALiBi）对齐 masked fp32 参考。
-  实测全部 rel-L2 < 2e-2（详见上方“varlen / document packing 现状”）。
-  注意：容器已安装的是较旧 build，其包 `__init__.py` 缺 `sparse_mla_interface`、varlen kernel 缺 `sink` 形参，
-  故 runner **只覆盖 `flex_attention.py`**（不覆盖 `__init__.py`），入口对 `sink` 采用“提供才透传”的兼容策略。
-- GPU 入口开销 + 大窗口验证（容器内）：`bench/bench_flex_entry_overhead.py`（三方对比 entry/direct/torch flex）
-  + `bench/_bench_classify_cache.py`（分类冷/热缓存微基准）。实测：**分类缓存**把冷（重探测）1.6–4.1ms 降到热
-  （命中）~0.3–0.4µs（~5000–12000×）；端到端 wrapper 前向开销由基线 ~1.5–2.3ms 降至 ~0.03–0.27ms（其余为保留的
-  transpose）。**SWA(W=1024) 在 S=2048/4096/8192 由基线的 `NotImplementedError` 变为全部跑通**，entry vs direct
-  的 out rel-L2=0、dQ~1e-6~1e-5（≪2e-2）。
-- GPU 冒烟（容器内）：`bench/smoke_flex_attention_turbo.py`
-  覆盖 causal / full / SWA(W=128) / GQA / ALiBi 数值对齐（rel-L2 < 2e-2）与报错路径；
-  并新增**显式 `alibi_slopes`**（causal，与手工参考及自动识别路径三方数值一致）、**显式
-  `softcap=30`→`NotImplementedError`**、以及**dropout**（`p=0` 零回归、`p=0.1` 前向+反向通过）、
-  **sink**（透传与直接 `flash_attn_func(sink=...)` 逐字节一致、`sink=None` 零回归）、dropout 越界
-  与 sink 非法形状的报错路径。
-- GPU bias 验证（容器内）：`bench/_investigate_bias.py`（形状/精度取证：4D→RuntimeError、fp32
-  `[Sq,Skv]`→NaN、bf16 `[Sq,Skv]`→正确，并测 dQ/dK/dV/dBias）与 `bench/_run_taskB.py`
-  （经 flex 入口端到端 fwd+dQ，bf16/fp16 × full/causal 共 4 组，均 rel-L2 < 2e-2）。
-- GPU softcap 验证（容器内）：`bench/softcap_flex_validation.py`
-  验证 softcap `score_mod` 显式报错（非静默丢弃）、cap 的数值实质性、以及 `score_mod=None`
-  causal 无回归。aiter 签名取证脚本：`bench/_investigate_softcap.py`、`bench/_investigate_softcap2.py`。
+- Pure-logic unit tests (CPU only): `tests/pytorch/ops/test_flex_attention_dispatch_logic.py`
+  (**186 cases** total: 95 pre-existing + 44 varlen + 15 document + 32 large-window/cache; zero
+  regressions). The varlen part covers `_validate_cu_seqlens` (int32/1D/leading 0/monotonic/last
+  element/matching segment counts/device/`max_seqlen>=longest segment`/matching causal segment
+  lengths, positive and negative cases), `_validate_qkv_varlen` (3D/dtype/head divisibility/head_dim),
+  `_validate_window_size`, `_validate_max_seqlen`, and `flex_attention_varlen` end to end (mocked
+  backend): THD passthrough with no transpose, causal/window/scale/dropout/alibi/sink forwarding,
+  `softcap>0` raising, invalid cu raising before dispatch, `return_lse` returning a tuple, GQA, and
+  non-causal cross attention. The document part covers `_detect_document_causal_segments`
+  (multi-document recognition; rejection of single causal/SWA/truncated/non-square/holed patterns),
+  `_classify_block_mask` returning `document_causal`, and the dense entry routing end-to-end to
+  varlen (correct cu_seqlens, B=2 replication, ALiBi forwarding, and raising for
+  bias/return_lse/S>512). The large-window/cache part covers `_locate_left_window`
+  (W in {256,512,1024,2048,4096} recognised at S=8192; rejection of
+  full-causal/non-translation-invariant/holed/non-square), `_classify_block_mask` on large windows
+  (including S=8192, `window>=S` classified as causal, and non-standard long masks still raising),
+  and the classification/detection cache (same object hits and returns the same object, different
+  objects/shapes recompute, non-weakly-referenceable objects skip the cache,
+  `_cached_detect_alibi/softcap` hit counts, `clear_classification_cache` resets, and behaviour
+  identical to the uncached path).
+- The original 95 cases cover: classification of full/causal/SWA/random/banded/head-dependent/
+  batch-dependent masks; positive and negative cases for the ALiBi detector; positive and negative
+  cases for `_detect_softcap` (recognising cap=20/30/50; rejecting identity/linear/constant/ALiBi/
+  hard clamp/alibi+softcap combinations; plus the regression guard that "softcap is not
+  misclassified as zero-slope ALiBi"); `choose_backend`/the registry (turbo by default, override
+  hitting custom, clear resetting, first match winning, ctx fields including
+  `has_dropout/has_sink/has_bias`, parameter validation, matcher exception wrapping, overrides able
+  to match on dropout/sink); and the **explicit extension parameters**: the `alibi_slopes` validator
+  (1D/length/fp32/non-tensor, positive and negative), the `softcap` normaliser (None/0 disables,
+  positive preserved, negative/NaN raises), `_validate_dropout_p` (0/valid values; `>=1`/negative/
+  NaN/non-numeric raise), `_validate_explicit_sink` (1D/len==Hq/fp32/equal and power-of-two head_dim,
+  positive and negative), `_validate_and_adapt_bias` (`[Sq,Skv]`/leading-singleton broadcast/
+  rectangular shapes pass; per-head 4D/per-sample 3D/mismatched last two dims/non-tensor/
+  non-floating raise; dtype adapted to q), the `_is_identity_score_mod` probe, and end-to-end
+  dispatch (with `flash_attn_func` mocked, running on CPU): explicit slopes forwarded and skipping
+  auto-detection, explicit and auto-detected slopes equivalent, combination with causal, non-trivial
+  score_mod conflict -> `ValueError`, identity score_mod allowed, invalid length -> `ValueError`,
+  explicit `softcap>0` -> `NotImplementedError` (without reaching the backend), `softcap=0/None`
+  having no effect, `dropout_p` default/positive forwarding and out-of-range raising, `sink`
+  forwarding and invalid shapes raising, `bias` forwarding/adaptation and per-head bias raising, and
+  "no extension parameters is identical to the original path (including dropout_p=0/sink=None/
+  bias=None)".
+- GPU varlen / document validation (in-container):
+  `bench/flex_attention_varlen_validation.py` (via `bench/_run_varlen_all.py`, which first overlays
+  the workspace `flex_attention.py` onto the installed package, then runs the pure-logic unit tests
+  plus this script from /tmp). It covers `flex_attention_varlen` causal/full/SWA/GQA/ALiBi forward +
+  causal backward dQ/dK/dV, `return_lse`, and raising on softcap/invalid cu/mismatched segment
+  lengths; plus the dense entry's document routing (B=1/B=2/ALiBi) against a masked fp32 reference.
+  All measured rel-L2 < 2e-2 (see "varlen / document packing status" above).
+  Note: the container has an older installed build whose package `__init__.py` lacks
+  `sparse_mla_interface` and whose varlen kernel lacks a `sink` parameter, so the runner
+  **only overlays `flex_attention.py`** (not `__init__.py`), and the entry point uses a
+  "forward only when provided" strategy for `sink`.
+- GPU entry overhead + large-window validation (in-container):
+  `bench/bench_flex_entry_overhead.py` (three-way comparison of entry/direct/torch flex) plus
+  `bench/_bench_classify_cache.py` (a cold/warm classification-cache micro-benchmark). Measured: the
+  **classification cache** takes the cold path (re-probing) from 1.6-4.1ms down to ~0.3-0.4us on a
+  warm hit (~5000-12000x); the end-to-end wrapper forward overhead drops from a ~1.5-2.3ms baseline
+  to ~0.03-0.27ms (the remainder being the retained transposes). **SWA(W=1024) at S=2048/4096/8192
+  goes from the baseline's `NotImplementedError` to passing everywhere**, with entry vs direct
+  out rel-L2=0 and dQ ~1e-6 to 1e-5 (far below 2e-2).
+- GPU smoke test (in-container): `bench/smoke_flex_attention_turbo.py` covers numerical agreement for
+  causal / full / SWA(W=128) / GQA / ALiBi (rel-L2 < 2e-2) and the raising paths; it also adds
+  **explicit `alibi_slopes`** (causal, three-way agreement with the manual reference and the
+  auto-detected path), **explicit `softcap=30` -> `NotImplementedError`**, **dropout** (`p=0` zero
+  regression, `p=0.1` passing forward+backward), **sink** (forwarding byte-for-byte identical to a
+  direct `flash_attn_func(sink=...)`, `sink=None` a zero regression), and the raising paths for
+  out-of-range dropout and invalid sink shapes.
+- GPU bias validation (in-container): `bench/_investigate_bias.py` (shape/precision forensics:
+  4D -> RuntimeError, fp32 `[Sq,Skv]` -> NaN, bf16 `[Sq,Skv]` -> correct, also measuring
+  dQ/dK/dV/dBias) and `bench/_run_taskB.py` (end-to-end fwd+dQ through the flex entry point,
+  bf16/fp16 x full/causal, 4 combinations, all rel-L2 < 2e-2).
+- GPU softcap validation (in-container): `bench/softcap_flex_validation.py` verifies that a softcap
+  `score_mod` raises explicitly (rather than silently dropping the cap), that the cap is numerically
+  material, and that `score_mod=None` causal has no regression. aiter signature forensics scripts:
+  `bench/_investigate_softcap.py`, `bench/_investigate_softcap2.py`.

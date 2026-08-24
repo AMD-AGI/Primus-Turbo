@@ -264,8 +264,8 @@ def create_block_mask(
     """
     if _torch_create_block_mask is None:
         raise NotImplementedError(
-            "Turbo flex 兼容层无法提供 create_block_mask：当前 torch 版本缺少 "
-            "torch.nn.attention.flex_attention.create_block_mask。"
+            "Turbo flex compat layer cannot provide create_block_mask: the current torch build "
+            "lacks torch.nn.attention.flex_attention.create_block_mask."
         )
     try:
         return _torch_create_block_mask(
@@ -281,7 +281,7 @@ def create_block_mask(
     except TypeError:
         # Older torch builds may not expose ``_compile``.
         warnings.warn(
-            "当前 torch 版本的 create_block_mask 不支持 `_compile` 参数，已自动忽略。",
+            "The current torch build's create_block_mask lacks the `_compile` argument; ignoring it.",
             stacklevel=2,
         )
         return _torch_create_block_mask(
@@ -303,7 +303,7 @@ def create_block_mask(
 def _to_scalar_bool(value: Any) -> bool:
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
-            raise ValueError(f"mask_mod 必须返回标量布尔值，收到 shape={tuple(value.shape)}")
+            raise ValueError(f"mask_mod must return a scalar boolean, got shape={tuple(value.shape)}")
         return bool(value.item())
     return bool(value)
 
@@ -311,7 +311,7 @@ def _to_scalar_bool(value: Any) -> bool:
 def _to_scalar_float(value: Any) -> float:
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
-            raise ValueError(f"score_mod 必须返回标量分数，收到 shape={tuple(value.shape)}")
+            raise ValueError(f"score_mod must return a scalar score, got shape={tuple(value.shape)}")
         return float(value.item())
     return float(value)
 
@@ -545,12 +545,14 @@ def _classify_probed_mask(
 
     if bool((mask & (~causal)).any().item()):
         raise NotImplementedError(
-            "Turbo flex 兼容层暂不支持该 block_mask：检测到因果对角线以上仍有可见位置"
-            "（非 causal / 非左窗因果），属于任意 mask_mod，需要 codegen 路径（见 FLEX_COMPAT_STATUS.md）。"
+            "Turbo flex compat layer does not support this block_mask: visible positions were found "
+            "above the causal diagonal (neither causal nor left-window causal). This is an arbitrary "
+            "mask_mod and requires the codegen path (see FLEX_COMPAT_STATUS.md)."
         )
     if not bool(mask.any().item()):
         raise NotImplementedError(
-            "Turbo flex 兼容层暂不支持全空 block_mask（所有位置都被屏蔽），无法映射到 flash_attn。"
+            "Turbo flex compat layer does not support a fully-empty block_mask (every position "
+            "masked out); it cannot be mapped onto flash_attn."
         )
 
     truncated = q_len > q_probe or kv_len > kv_probe
@@ -572,9 +574,10 @@ def _classify_probed_mask(
                         "window_size": (window, 0),
                     }
                 raise NotImplementedError(
-                    "Turbo flex 兼容层检测到疑似滑动窗口，但无法确认其为标准左窗因果 "
-                    f"(q>=kv)&(q-kv<=W)（窗口边界超出探测上限 {_MASK_PROBE_LIMIT} 且抽样校验未通过）；"
-                    "请显式使用 create_block_mask 表达窗口。"
+                    "Turbo flex compat layer detected a probable sliding window but could not confirm "
+                    "it is standard left-window causal (q>=kv)&(q-kv<=W): the window boundary exceeds "
+                    f"the probe limit {_MASK_PROBE_LIMIT} and sampled verification failed. Please use "
+                    "create_block_mask to express the window explicitly."
                 )
         return {"kind": "causal", "causal": True, "window_size": (-1, -1)}
 
@@ -594,13 +597,15 @@ def _classify_probed_mask(
                 "doc_seglens": doc_seglens,
             }
         raise NotImplementedError(
-            "Turbo flex 兼容层暂不支持该 block_mask：该模式不是标准左窗因果 "
-            "(q>=kv) & (q-kv<=W)，属于任意/数据依赖 mask，需要 codegen 路径。"
+            "Turbo flex compat layer does not support this block_mask: the pattern is not standard "
+            "left-window causal (q>=kv) & (q-kv<=W); it is an arbitrary/data-dependent mask and "
+            "requires the codegen path."
         )
 
     if inferred_w >= q_probe - 1 and truncated:
         raise NotImplementedError(
-            f"Turbo flex 兼容层检测到滑动窗口可能 >= {q_probe}，超出探测上限，窗口大小待核实。"
+            f"Turbo flex compat layer detected a sliding window that may be >= {q_probe}, exceeding "
+            "the probe limit; the window size could not be verified."
         )
 
     # Confirm the window is translation invariant at a far query position too,
@@ -611,8 +616,9 @@ def _classify_probed_mask(
         outside = _call_mask_mod(mask_mod, 0, 0, far_q, far_q - inferred_w - 1)
         if not (inside and not outside):
             raise NotImplementedError(
-                "Turbo flex 兼容层暂不支持该 block_mask：窗口在长序列上非平移不变，"
-                "无法确定统一窗口大小。"
+                "Turbo flex compat layer does not support this block_mask: the window is not "
+                "translation-invariant over long sequences, so a single window size cannot be "
+                "determined."
             )
 
     return {"kind": "sliding_window_causal", "causal": True, "window_size": (inferred_w, 0)}
@@ -635,20 +641,21 @@ def _classify_block_mask_uncached(
     mask_mod = getattr(block_mask, "mask_mod", None)
     if not callable(mask_mod):
         raise NotImplementedError(
-            "Turbo flex 兼容层暂不支持该 block_mask：对象缺少可调用 `mask_mod`，"
-            "无法分类到 Turbo 可执行模式；请使用 create_block_mask 构造。"
+            "Turbo flex compat layer does not support this block_mask: the object has no callable "
+            "`mask_mod`, so it cannot be classified into a Turbo-executable pattern. Please build "
+            "it with create_block_mask."
         )
 
     q_probe = min(q_len, _MASK_PROBE_LIMIT)
     kv_probe = min(kv_len, _MASK_PROBE_LIMIT)
     if q_probe <= 0 or kv_probe <= 0:
-        raise ValueError("Turbo flex 兼容层要求 q/kv 序列长度为正。")
+        raise ValueError("Turbo flex compat layer requires positive q/kv sequence lengths.")
 
     base = _probe_mask_grid(mask_mod, 0, 0, q_probe, kv_probe)
     if _mask_is_bh_dependent(mask_mod, base, B, H, q_probe, kv_probe):
         raise NotImplementedError(
-            "Turbo flex 兼容层暂不支持依赖 batch/head 的 block_mask；"
-            "当前后端只支持全局统一的 full/causal/sliding-window。"
+            "Turbo flex compat layer does not support batch/head-dependent block_mask; the current "
+            "backend only supports globally uniform full/causal/sliding-window patterns."
         )
     return _classify_probed_mask(
         base,
@@ -916,23 +923,23 @@ def _validate_explicit_alibi_slopes(
     """
     if not isinstance(alibi_slopes, torch.Tensor):
         raise ValueError(
-            "Turbo flex 兼容层的显式 alibi_slopes 必须是 torch.Tensor，"
-            f"收到 {type(alibi_slopes).__name__}。"
+            "Turbo flex compat layer requires explicit alibi_slopes to be a torch.Tensor, "
+            f"got {type(alibi_slopes).__name__}."
         )
     if alibi_slopes.ndim != 1:
         raise ValueError(
-            "Turbo flex 兼容层要求显式 alibi_slopes 为 1D 张量，"
-            f"收到 ndim={alibi_slopes.ndim} (shape={tuple(alibi_slopes.shape)})。"
+            "Turbo flex compat layer requires explicit alibi_slopes to be a 1D tensor, "
+            f"got ndim={alibi_slopes.ndim} (shape={tuple(alibi_slopes.shape)})."
         )
     if alibi_slopes.shape[0] != hq:
         raise ValueError(
-            "Turbo flex 兼容层要求显式 alibi_slopes 的长度等于 query 头数 "
-            f"Hq={hq}，收到 length={alibi_slopes.shape[0]}。"
+            "Turbo flex compat layer requires len(alibi_slopes) to equal the query head count "
+            f"Hq={hq}, got length={alibi_slopes.shape[0]}."
         )
     if alibi_slopes.dtype != torch.float32:
         raise ValueError(
-            "Turbo flex 兼容层要求显式 alibi_slopes 为 fp32 (torch.float32)，"
-            f"收到 dtype={alibi_slopes.dtype}。"
+            "Turbo flex compat layer requires explicit alibi_slopes to be fp32 (torch.float32), "
+            f"got dtype={alibi_slopes.dtype}."
         )
     return alibi_slopes.to(device=device)
 
@@ -949,13 +956,14 @@ def _normalise_explicit_softcap(softcap: Any) -> float:
         cap = float(softcap)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"Turbo flex 兼容层的显式 softcap 必须是 float 或 None，无法转换 {softcap!r}: {exc}"
+            "Turbo flex compat layer requires explicit softcap to be a float or None; "
+            f"cannot convert {softcap!r}: {exc}"
         ) from exc
     if math.isnan(cap):
-        raise ValueError("Turbo flex 兼容层的显式 softcap 不能是 NaN。")
+        raise ValueError("Turbo flex compat layer's explicit softcap cannot be NaN.")
     if cap < 0.0:
         raise ValueError(
-            f"Turbo flex 兼容层的显式 softcap 必须 >= 0（0/None 表示禁用），收到 {cap}。"
+            f"Turbo flex compat layer requires explicit softcap >= 0 (0/None disables it), got {cap}."
         )
     return cap
 
@@ -984,13 +992,13 @@ def _validate_dropout_p(dropout_p: Any) -> float:
         p = float(dropout_p)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"Turbo flex 兼容层的 dropout_p 必须是 float，无法转换 {dropout_p!r}: {exc}"
+            f"Turbo flex compat layer requires dropout_p to be a float; cannot convert {dropout_p!r}: {exc}"
         ) from exc
     if math.isnan(p):
-        raise ValueError("Turbo flex 兼容层的 dropout_p 不能是 NaN。")
+        raise ValueError("Turbo flex compat layer's dropout_p cannot be NaN.")
     if not (0.0 <= p < 1.0):
         raise ValueError(
-            f"Turbo flex 兼容层要求 dropout_p ∈ [0, 1)（0 表示关闭 dropout），收到 {p}。"
+            f"Turbo flex compat layer requires dropout_p in [0, 1) (0 disables dropout), got {p}."
         )
     return p
 
@@ -1015,31 +1023,31 @@ def _validate_explicit_sink(
     """
     if not isinstance(sink, torch.Tensor):
         raise ValueError(
-            f"Turbo flex 兼容层的 sink 必须是 torch.Tensor，收到 {type(sink).__name__}。"
+            f"Turbo flex compat layer requires sink to be a torch.Tensor, got {type(sink).__name__}."
         )
     if sink.ndim != 1:
         raise ValueError(
-            "Turbo flex 兼容层要求 sink 为 1D 张量（每个 query 头一个 sink 值），"
-            f"收到 ndim={sink.ndim} (shape={tuple(sink.shape)})。"
+            "Turbo flex compat layer requires sink to be a 1D tensor (one sink value per query head), "
+            f"got ndim={sink.ndim} (shape={tuple(sink.shape)})."
         )
     if sink.shape[0] != hq:
         raise ValueError(
-            "Turbo flex 兼容层要求 sink 的长度等于 query 头数 "
-            f"Hq={hq}，收到 length={sink.shape[0]}。"
+            "Turbo flex compat layer requires len(sink) to equal the query head count "
+            f"Hq={hq}, got length={sink.shape[0]}."
         )
     if sink.dtype != torch.float32:
         raise ValueError(
-            f"Turbo flex 兼容层要求 sink 为 fp32 (torch.float32)，收到 dtype={sink.dtype}。"
+            f"Turbo flex compat layer requires sink to be fp32 (torch.float32), got dtype={sink.dtype}."
         )
     if head_dim_qk != head_dim_v:
         raise ValueError(
-            "Turbo flex 兼容层的 sink 路径要求 head_dim_qk == head_dim_v（后端约束），"
-            f"收到 head_dim_qk={head_dim_qk}, head_dim_v={head_dim_v}。"
+            "Turbo flex compat layer's sink path requires head_dim_qk == head_dim_v (backend "
+            f"constraint), got head_dim_qk={head_dim_qk}, head_dim_v={head_dim_v}."
         )
     if not _is_power_of_two(head_dim_qk):
         raise ValueError(
-            "Turbo flex 兼容层的 sink 路径要求 head_dim 为 2 的幂（后端约束），"
-            f"收到 head_dim={head_dim_qk}。"
+            "Turbo flex compat layer's sink path requires head_dim to be a power of two (backend "
+            f"constraint), got head_dim={head_dim_qk}."
         )
     return sink.to(device=device)
 
@@ -1066,37 +1074,40 @@ def _validate_and_adapt_bias(
     """
     if not isinstance(bias, torch.Tensor):
         raise ValueError(
-            f"Turbo flex 兼容层的 bias 必须是 torch.Tensor，收到 {type(bias).__name__}。"
+            f"Turbo flex compat layer requires bias to be a torch.Tensor, got {type(bias).__name__}."
         )
     b = bias
     if b.ndim == 4:
         if b.shape[0] != 1 or b.shape[1] != 1:
             raise ValueError(
-                "Turbo flex 兼容层的 bias 后端只支持在 batch/head 间共享的单个 [Sq,Skv]（AITER dense 约束），"
-                f"不支持随 batch/head 变化的 bias；收到 shape={tuple(bias.shape)}"
-                "（如需每头/每样本 bias，请走 codegen 路径，见 FLEX_COMPAT_STATUS.md）。"
+                "Turbo flex compat layer's bias backend only supports a single [Sq,Skv] shared across "
+                "batch/head (AITER dense constraint); a bias that varies per batch/head is not "
+                f"supported. Got shape={tuple(bias.shape)} (for per-head/per-sample bias use the "
+                "codegen path, see FLEX_COMPAT_STATUS.md)."
             )
         b = b.reshape(b.shape[2], b.shape[3])
     elif b.ndim == 3:
         if b.shape[0] != 1:
             raise ValueError(
-                "Turbo flex 兼容层的 bias 后端只支持共享的单个 [Sq,Skv]（AITER dense 约束），"
-                f"收到 3D shape={tuple(bias.shape)}（首维需为 1）。"
+                "Turbo flex compat layer's bias backend only supports a single shared [Sq,Skv] "
+                f"(AITER dense constraint), got 3D shape={tuple(bias.shape)} (leading dim must be 1)."
             )
         b = b.reshape(b.shape[1], b.shape[2])
     elif b.ndim != 2:
         raise ValueError(
-            "Turbo flex 兼容层要求 bias 为 2D [Sq,Skv]（或前导 singleton 的可广播形状 "
-            f"[1,Sq,Skv]/[1,1,Sq,Skv]），收到 ndim={b.ndim} (shape={tuple(bias.shape)})。"
+            "Turbo flex compat layer requires bias to be 2D [Sq,Skv] (or a broadcastable shape with "
+            f"leading singletons: [1,Sq,Skv]/[1,1,Sq,Skv]), got ndim={b.ndim} "
+            f"(shape={tuple(bias.shape)})."
         )
     if tuple(b.shape) != (sq, skv):
         raise ValueError(
-            "Turbo flex 兼容层要求 bias 的最后两维为 [Sq={0}, Skv={1}]（AITER dense 约束），"
-            "收到 {2}。".format(sq, skv, tuple(b.shape))
+            "Turbo flex compat layer requires the last two dims of bias to be "
+            "[Sq={0}, Skv={1}] (AITER dense constraint), got {2}.".format(sq, skv, tuple(b.shape))
         )
     if not b.is_floating_point():
         raise ValueError(
-            f"Turbo flex 兼容层要求 bias 为浮点张量（将适配为 q 的 dtype），收到 dtype={b.dtype}。"
+            "Turbo flex compat layer requires bias to be a floating-point tensor (it will be cast "
+            f"to q's dtype), got dtype={b.dtype}."
         )
     # Adapt precision to q's dtype: the kernel needs bias in q's dtype (fp16/bf16); an
     # fp32 bias produces NaN. Cast + move to q's device, contiguous for the kernel.
@@ -1179,10 +1190,10 @@ def register_backend_override(matcher: Callable[[Dict[str, Any]], bool], backend
     the classifier. Registering nothing keeps the default all-Turbo routing.
     """
     if not callable(matcher):
-        raise TypeError("register_backend_override: matcher 必须是 callable(ctx)->bool。")
+        raise TypeError("register_backend_override: matcher must be a callable(ctx)->bool.")
     if backend not in _VALID_BACKENDS:
         raise ValueError(
-            f"register_backend_override: backend 必须是 {_VALID_BACKENDS} 之一，收到 {backend!r}。"
+            f"register_backend_override: backend must be one of {_VALID_BACKENDS}, got {backend!r}."
         )
     _BACKEND_OVERRIDES.append((matcher, backend))
 
@@ -1232,7 +1243,7 @@ def choose_backend(
             hit = matcher(ctx)
         except Exception as exc:  # a broken matcher must fail loud, never silently reroute
             raise RuntimeError(
-                f"choose_backend: backend override matcher 抛出异常: {exc!r}"
+                f"choose_backend: backend override matcher raised: {exc!r}"
             ) from exc
         if hit:
             return backend
@@ -1247,21 +1258,21 @@ def choose_backend(
 def _validate_qkv(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> None:
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError(
-            "Turbo flex 兼容层要求 q/k/v 为 4D 的 [B,H,S,D] (bhsd) 张量；"
-            f"收到 ndim=({query.ndim},{key.ndim},{value.ndim})。"
+            "Turbo flex compat layer requires q/k/v to be 4D [B,H,S,D] (bhsd) tensors; "
+            f"got ndim=({query.ndim},{key.ndim},{value.ndim})."
         )
     for name, t in (("query", query), ("key", key), ("value", value)):
         if t.dtype not in _SUPPORTED_DTYPES:
             raise NotImplementedError(
-                f"Turbo flex 兼容层当前仅支持 fp16/bf16 输入；{name}.dtype={t.dtype}，"
-                "其他 dtype 请回退 torch flex_attention。"
+                "Turbo flex compat layer currently supports only fp16/bf16 inputs; "
+                f"{name}.dtype={t.dtype}, fall back to torch flex_attention for other dtypes."
             )
     if query.device != key.device or query.device != value.device:
-        raise ValueError("Turbo flex 兼容层要求 q/k/v 位于同一 device。")
+        raise ValueError("Turbo flex compat layer requires q/k/v to be on the same device.")
     if not (query.shape[0] == key.shape[0] == value.shape[0]):
-        raise ValueError("Turbo flex 兼容层要求 q/k/v 的 batch 维一致。")
+        raise ValueError("Turbo flex compat layer requires q/k/v to share the same batch dim.")
     if key.shape[1] != value.shape[1] or key.shape[2] != value.shape[2]:
-        raise ValueError("Turbo flex 兼容层要求 key/value 的 head 数与序列长度一致。")
+        raise ValueError("Turbo flex compat layer requires key/value to share head count and seqlen.")
 
 
 def _dispatch_document_varlen(
@@ -1393,7 +1404,8 @@ def flex_attention(
 
     if kernel_options:
         warnings.warn(
-            f"Turbo flex 兼容层暂不支持 kernel_options，当前将忽略: {sorted(kernel_options.keys())}",
+                "Turbo flex compat layer does not support kernel_options yet; ignoring: "
+                f"{sorted(kernel_options.keys())}",
             stacklevel=2,
         )
 
@@ -1402,11 +1414,12 @@ def flex_attention(
     if hq != hkv:
         if hkv <= 0 or hq % hkv != 0:
             raise ValueError(
-                f"Turbo flex 兼容层要求 Hq 可被 Hkv 整除，收到 Hq={hq}, Hkv={hkv}。"
+                f"Turbo flex compat layer requires Hq to be divisible by Hkv, got Hq={hq}, Hkv={hkv}."
             )
         if not enable_gqa:
             raise ValueError(
-                "Turbo flex 兼容层检测到 Hq!=Hkv，请显式传入 enable_gqa=True（与 torch flex 一致）。"
+                "Turbo flex compat layer detected Hq!=Hkv; please pass enable_gqa=True explicitly "
+                "(matching torch flex)."
             )
 
     # ------------------------------------------------------------------
@@ -1452,16 +1465,18 @@ def flex_attention(
         # non-trivial score_mod alongside explicit slopes is ambiguous -> reject.
         if score_mod is not None:
             if not callable(score_mod):
-                raise ValueError("Turbo flex 兼容层要求 score_mod 为可调用对象或 None。")
+                raise ValueError("Turbo flex compat layer requires score_mod to be callable or None.")
             if not _is_identity_score_mod(score_mod, B=bsz, Hq=hq, q_len=sq, kv_len=skv):
                 raise ValueError(
-                    "Turbo flex 兼容层：同时提供了显式 alibi_slopes 和非平凡 score_mod，语义歧义；"
-                    "请二选一（要么传显式 alibi_slopes，要么用 score_mod 表达 ALiBi 交给自动识别）。"
+                    "Turbo flex compat layer: both an explicit alibi_slopes and a non-trivial "
+                    "score_mod were provided, which is semantically ambiguous; please pick one "
+                    "(either pass explicit alibi_slopes, or express ALiBi via score_mod and let "
+                    "auto-detection handle it)."
                 )
         effective_alibi_slopes = alibi_slopes
     elif score_mod is not None:
         if not callable(score_mod):
-            raise ValueError("Turbo flex 兼容层要求 score_mod 为可调用对象或 None。")
+            raise ValueError("Turbo flex compat layer requires score_mod to be callable or None.")
         # Detect a pure logits soft-cap (cap*tanh(score/cap)) first. It cannot run
         # on the fixed dense kernels (no softcap param on this build), and the
         # ALiBi detector below only probes score=0 -- where a soft-cap looks like
@@ -1505,14 +1520,17 @@ def flex_attention(
     # the aiter dense fwd/bwd expose no softcap parameter (see FLEX_COMPAT_STATUS.md).
     # Centralising the "softcap>0 -> raise" here (never silently dropping the cap)
     # keeps a single switch to flip once the kernel supports it.
-    # TODO(softcap): 上游 aiter dense fwd+bwd 支持后，改为 thread 到 flash_attn_func(softcap=...)
-    #   —— 删除这一处拦截、并在下方 flash_attn_func 调用传入 effective_softcap，即可一行切换启用。
+    # TODO(softcap): once upstream aiter dense fwd+bwd supports it, thread through to
+    #   flash_attn_func(softcap=...): drop this guard and pass effective_softcap at the
+    #   flash_attn_func call below -- a one-line switch to enable.
     if effective_softcap > 0.0:
         raise NotImplementedError(
-            f"Turbo flex 兼容层 softcap 接口已就位（cap≈{effective_softcap:.4g}），但受阻于本 build 的 "
-            "aiter dense 前/反向 kernel 缺 softcap 形参（见 FLEX_COMPAT_STATUS.md）；上游 kernel 支持后 "
-            "本参数即生效。为避免静默丢弃 cap 产生错误结果，此处对显式 softcap 与从 score_mod 识别到的 "
-            "soft-cap 统一显式报错，绝不降级到忽略 cap 的路径。"
+            "Turbo flex compat layer: the softcap interface is in place "
+            f"(cap~={effective_softcap:.4g}), but it is blocked by this build's aiter dense fwd/bwd "
+            "kernels, which lack a softcap parameter (see FLEX_COMPAT_STATUS.md); it will take "
+            "effect once upstream kernels support it. To avoid silently dropping the cap and "
+            "producing wrong results, both an explicit softcap and a soft-cap detected from "
+            "score_mod raise here -- we never degrade to a path that ignores the cap."
         )
 
     if backend != "turbo":
@@ -1538,14 +1556,15 @@ def flex_attention(
     if mask_cfg.get("kind") == "document_causal":
         if has_bias:
             raise NotImplementedError(
-                "Turbo flex 兼容层：document-causal block_mask 暂不支持与共享 bias 组合"
-                "（packed varlen 下 [Sq,Skv] bias 无法对齐）；如需请走 codegen 路径。"
+                "Turbo flex compat layer: document-causal block_mask combined with a shared bias is "
+                "not supported yet (a [Sq,Skv] bias cannot be aligned under packed varlen); use the "
+                "codegen path if you need it."
             )
         if return_lse:
             raise NotImplementedError(
-                "Turbo flex 兼容层：document-causal block_mask 目前不支持 return_lse"
-                "（packed LSE 与 dense [B,H,S] 布局不对齐）；如需 LSE 请改用显式 "
-                "flex_attention_varlen 入口。"
+                "Turbo flex compat layer: document-causal block_mask does not currently support "
+                "return_lse (packed LSE does not align with the dense [B,H,S] layout); if you need "
+                "LSE, use the explicit flex_attention_varlen entry point."
             )
         return _dispatch_document_varlen(
             query,
@@ -1579,8 +1598,9 @@ def flex_attention(
         deterministic=False,
         return_lse=return_lse,
         sink=sink,
-        # TODO(softcap): 上游 aiter dense fwd+bwd 支持后，在此传入 softcap=effective_softcap
-        #   并删除上方的 softcap 拦截即可一行启用（当前 effective_softcap 恒为 0.0）。
+        # TODO(softcap): once upstream aiter dense fwd+bwd supports it, pass softcap=effective_softcap
+        #   here and delete the softcap guard above -- a one-line enable (effective_softcap is
+        #   currently always 0.0).
     )
 
     if return_lse:
@@ -1604,36 +1624,36 @@ def _validate_qkv_varlen(query: torch.Tensor, key: torch.Tensor, value: torch.Te
     """
     if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
         raise ValueError(
-            "Turbo flex varlen 入口要求 q/k/v 为 3D 的 [total_tokens, H, D] (THD 打包) 张量；"
-            f"收到 ndim=({query.ndim},{key.ndim},{value.ndim})。"
+            "Turbo flex varlen entry requires q/k/v to be 3D [total_tokens, H, D] (THD packed) "
+            f"tensors; got ndim=({query.ndim},{key.ndim},{value.ndim})."
         )
     for name, t in (("query", query), ("key", key), ("value", value)):
         if t.dtype not in _SUPPORTED_DTYPES:
             raise NotImplementedError(
-                f"Turbo flex varlen 入口当前仅支持 fp16/bf16 输入；{name}.dtype={t.dtype}，"
-                "其他 dtype 请回退 torch 参考实现。"
+                "Turbo flex varlen entry currently supports only fp16/bf16 inputs; "
+                f"{name}.dtype={t.dtype}, fall back to the torch reference implementation."
             )
     if query.device != key.device or query.device != value.device:
-        raise ValueError("Turbo flex varlen 入口要求 q/k/v 位于同一 device。")
+        raise ValueError("Turbo flex varlen entry requires q/k/v to be on the same device.")
     if key.shape[0] != value.shape[0]:
         raise ValueError(
-            "Turbo flex varlen 入口要求 key/value 的 total_tokens 一致，"
-            f"收到 key={key.shape[0]}, value={value.shape[0]}。"
+            "Turbo flex varlen entry requires key/value to have the same total_tokens, "
+            f"got key={key.shape[0]}, value={value.shape[0]}."
         )
     if key.shape[1] != value.shape[1]:
         raise ValueError(
-            "Turbo flex varlen 入口要求 key/value 的 head 数一致，"
-            f"收到 Hk={key.shape[1]}, Hv={value.shape[1]}。"
+            "Turbo flex varlen entry requires key/value to have the same head count, "
+            f"got Hk={key.shape[1]}, Hv={value.shape[1]}."
         )
     if query.shape[2] != key.shape[2]:
         raise ValueError(
-            "Turbo flex varlen 入口要求 query/key 的 head_dim 一致 (head_dim_qk)，"
-            f"收到 Dq={query.shape[2]}, Dk={key.shape[2]}。"
+            "Turbo flex varlen entry requires query/key to have the same head_dim (head_dim_qk), "
+            f"got Dq={query.shape[2]}, Dk={key.shape[2]}."
         )
     hq, hkv = query.shape[1], key.shape[1]
     if hq != hkv and (hkv <= 0 or hq % hkv != 0):
         raise ValueError(
-            f"Turbo flex varlen 入口要求 Hq 可被 Hkv 整除 (GQA/MQA)，收到 Hq={hq}, Hkv={hkv}。"
+            f"Turbo flex varlen entry requires Hq divisible by Hkv (GQA/MQA), got Hq={hq}, Hkv={hkv}."
         )
 
 
@@ -1645,17 +1665,18 @@ def _validate_window_size(window_size: Any) -> Tuple[int, int]:
     """
     if isinstance(window_size, torch.Tensor) or not isinstance(window_size, (tuple, list)):
         raise ValueError(
-            "Turbo flex varlen 入口要求 window_size 为长度 2 的 (left, right) 元组/列表，"
-            f"收到 {type(window_size).__name__}。"
+            "Turbo flex varlen entry requires window_size to be a length-2 (left, right) tuple/list, "
+            f"got {type(window_size).__name__}."
         )
     if len(window_size) != 2:
         raise ValueError(
-            f"Turbo flex varlen 入口要求 window_size 长度为 2 (left, right)，收到 length={len(window_size)}。"
+            "Turbo flex varlen entry requires window_size to have length 2 (left, right), "
+            f"got length={len(window_size)}."
         )
     left, right = window_size
     if any(isinstance(x, bool) or not isinstance(x, int) for x in (left, right)):
         raise ValueError(
-            f"Turbo flex varlen 入口要求 window_size 的两个元素均为 int，收到 {window_size!r}。"
+            f"Turbo flex varlen entry requires both window_size elements to be int, got {window_size!r}."
         )
     return (int(left), int(right))
 
@@ -1664,10 +1685,11 @@ def _validate_max_seqlen(name: str, value: Any) -> int:
     """Validate a ``max_seqlen_*`` argument (a positive Python int)."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(
-            f"Turbo flex varlen 入口要求 {name} 为 Python int，收到 {type(value).__name__}={value!r}。"
+            f"Turbo flex varlen entry requires {name} to be a Python int, "
+            f"got {type(value).__name__}={value!r}."
         )
     if value <= 0:
-        raise ValueError(f"Turbo flex varlen 入口要求 {name} 为正整数，收到 {value}。")
+        raise ValueError(f"Turbo flex varlen entry requires {name} to be a positive int, got {value}.")
     return int(value)
 
 
@@ -1701,30 +1723,31 @@ def _validate_cu_seqlens(
     for name, cu in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_k", cu_seqlens_k)):
         if not isinstance(cu, torch.Tensor):
             raise ValueError(
-                f"Turbo flex varlen 入口要求 {name} 为 torch.Tensor，收到 {type(cu).__name__}。"
+                f"Turbo flex varlen entry requires {name} to be a torch.Tensor, got {type(cu).__name__}."
             )
         if cu.dtype != torch.int32:
             raise ValueError(
-                f"Turbo flex varlen 入口要求 {name} 为 int32，收到 dtype={cu.dtype}。"
+                f"Turbo flex varlen entry requires {name} to be int32, got dtype={cu.dtype}."
             )
         if cu.ndim != 1:
             raise ValueError(
-                f"Turbo flex varlen 入口要求 {name} 为 1D [num_seqs+1] 张量，"
-                f"收到 ndim={cu.ndim} (shape={tuple(cu.shape)})。"
+                f"Turbo flex varlen entry requires {name} to be a 1D [num_seqs+1] tensor, "
+                f"got ndim={cu.ndim} (shape={tuple(cu.shape)})."
             )
         if cu.numel() < 2:
             raise ValueError(
-                f"Turbo flex varlen 入口要求 {name} 至少含 2 个元素 ([0, total])，"
-                f"收到 numel={cu.numel()}。"
+                f"Turbo flex varlen entry requires {name} to have at least 2 elements ([0, total]), "
+                f"got numel={cu.numel()}."
             )
         if cu.device != device:
             raise ValueError(
-                f"Turbo flex varlen 入口要求 {name} 与 q 同 device，收到 {cu.device} vs {device}。"
+                f"Turbo flex varlen entry requires {name} to be on the same device as q, "
+                f"got {cu.device} vs {device}."
             )
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
         raise ValueError(
-            "Turbo flex varlen 入口要求 cu_seqlens_q 与 cu_seqlens_k 段数一致 (len 相等)，"
-            f"收到 {cu_seqlens_q.numel()} vs {cu_seqlens_k.numel()}。"
+            "Turbo flex varlen entry requires cu_seqlens_q and cu_seqlens_k to have the same number "
+            f"of segments (equal len), got {cu_seqlens_q.numel()} vs {cu_seqlens_k.numel()}."
         )
 
     # These descriptors are tiny; inspect on CPU in int64 (avoids int32 overflow in
@@ -1734,46 +1757,47 @@ def _validate_cu_seqlens(
 
     if int(q_cpu[0]) != 0 or int(k_cpu[0]) != 0:
         raise ValueError(
-            "Turbo flex varlen 入口要求 cu_seqlens 首元素为 0，"
-            f"收到 cu_seqlens_q[0]={int(q_cpu[0])}, cu_seqlens_k[0]={int(k_cpu[0])}。"
+            "Turbo flex varlen entry requires the first cu_seqlens element to be 0, "
+            f"got cu_seqlens_q[0]={int(q_cpu[0])}, cu_seqlens_k[0]={int(k_cpu[0])}."
         )
 
     q_seg = q_cpu[1:] - q_cpu[:-1]
     k_seg = k_cpu[1:] - k_cpu[:-1]
     if bool((q_seg < 0).any()) or bool((k_seg < 0).any()):
         raise ValueError(
-            "Turbo flex varlen 入口要求 cu_seqlens 单调非递减 (每段长度 >= 0)，"
-            f"收到 cu_seqlens_q={q_cpu.tolist()}, cu_seqlens_k={k_cpu.tolist()}。"
+            "Turbo flex varlen entry requires cu_seqlens to be monotonically non-decreasing (every "
+            f"segment length >= 0), got cu_seqlens_q={q_cpu.tolist()}, cu_seqlens_k={k_cpu.tolist()}."
         )
 
     if int(q_cpu[-1]) != int(total_q):
         raise ValueError(
-            "Turbo flex varlen 入口要求 cu_seqlens_q 末元素等于 query 的 total_tokens，"
-            f"收到 cu_seqlens_q[-1]={int(q_cpu[-1])}, total_q={int(total_q)}。"
+            "Turbo flex varlen entry requires the last cu_seqlens_q element to equal query's "
+            f"total_tokens, got cu_seqlens_q[-1]={int(q_cpu[-1])}, total_q={int(total_q)}."
         )
     if int(k_cpu[-1]) != int(total_k):
         raise ValueError(
-            "Turbo flex varlen 入口要求 cu_seqlens_k 末元素等于 key/value 的 total_tokens，"
-            f"收到 cu_seqlens_k[-1]={int(k_cpu[-1])}, total_k={int(total_k)}。"
+            "Turbo flex varlen entry requires the last cu_seqlens_k element to equal key/value's "
+            f"total_tokens, got cu_seqlens_k[-1]={int(k_cpu[-1])}, total_k={int(total_k)}."
         )
 
     q_max_seg = int(q_seg.max()) if q_seg.numel() > 0 else 0
     k_max_seg = int(k_seg.max()) if k_seg.numel() > 0 else 0
     if max_seqlen_q < q_max_seg:
         raise ValueError(
-            "Turbo flex varlen 入口要求 max_seqlen_q >= 最长 query 段长度，"
-            f"收到 max_seqlen_q={max_seqlen_q}, 实际最长段={q_max_seg}。"
+            "Turbo flex varlen entry requires max_seqlen_q >= the longest query segment length, "
+            f"got max_seqlen_q={max_seqlen_q}, actual longest segment={q_max_seg}."
         )
     if max_seqlen_k < k_max_seg:
         raise ValueError(
-            "Turbo flex varlen 入口要求 max_seqlen_k >= 最长 key 段长度，"
-            f"收到 max_seqlen_k={max_seqlen_k}, 实际最长段={k_max_seg}。"
+            "Turbo flex varlen entry requires max_seqlen_k >= the longest key segment length, "
+            f"got max_seqlen_k={max_seqlen_k}, actual longest segment={k_max_seg}."
         )
 
     if causal and not torch.equal(q_cpu, k_cpu):
         raise ValueError(
-            "Turbo flex varlen 入口在 causal=True 下要求逐段 q_len == k_len（文档内因果为 bottom-right "
-            "对齐，段长不一致会静默错位）；请让 cu_seqlens_q == cu_seqlens_k，或对交叉注意力改用 causal=False。"
+            "Turbo flex varlen entry with causal=True requires q_len == k_len per segment "
+            "(in-document causal is bottom-right aligned, so mismatched segment lengths silently "
+            "misalign); make cu_seqlens_q == cu_seqlens_k, or use causal=False for cross-attention."
         )
 
     return max_seqlen_q, max_seqlen_k
@@ -1889,9 +1913,11 @@ def flex_attention_varlen(
     effective_softcap = _normalise_explicit_softcap(softcap)
     if effective_softcap > 0.0:
         raise NotImplementedError(
-            f"Turbo flex varlen 入口 softcap 接口已就位（cap≈{effective_softcap:.4g}），但受阻于本 build 的 "
-            "aiter 前/反向 kernel（varlen 反向缺 softcap 形参，见 FLEX_COMPAT_STATUS.md）；为避免静默丢弃 cap "
-            "产生错误结果，此处对 softcap>0 显式报错，绝不降级到忽略 cap 的路径。"
+            "Turbo flex varlen entry: the softcap interface is in place "
+            f"(cap~={effective_softcap:.4g}), but it is blocked by this build's aiter kernels (the "
+            "varlen backward lacks a softcap parameter, see FLEX_COMPAT_STATUS.md). To avoid "
+            "silently dropping the cap and producing wrong results, softcap>0 raises here -- we "
+            "never degrade to a path that ignores the cap."
         )
 
     # Lazy import so pure classification / validation (and this module's import) does
