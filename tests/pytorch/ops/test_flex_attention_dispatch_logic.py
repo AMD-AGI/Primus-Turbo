@@ -11,11 +11,12 @@ GPU: they only need torch on CPU.
 """
 
 import math
+import sys
 
 import pytest
 import torch
 
-import primus_turbo.pytorch.ops.attention.flex_attention as fa_mod
+import primus_turbo.pytorch.ops.attention.flex_attention  # noqa: F401
 from primus_turbo.pytorch.ops.attention.flex_attention import (
     _cached_detect_alibi_slopes,
     _cached_detect_softcap,
@@ -43,6 +44,13 @@ from primus_turbo.pytorch.ops.attention.flex_attention import (
     flex_attention_varlen,
     register_backend_override,
 )
+
+# The package __init__ re-exports the *function* ``flex_attention`` under the same
+# name as this submodule, so ``import ...flex_attention as fa_mod`` binds the
+# function, not the module (plain-attribute shadowing). sys.modules always holds
+# the real module, and works both against the installed package and against the
+# CPU-only file-loading harness.
+fa_mod = sys.modules["primus_turbo.pytorch.ops.attention.flex_attention"]
 
 
 class _DummyBlockMask:
