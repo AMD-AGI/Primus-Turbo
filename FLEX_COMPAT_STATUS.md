@@ -201,3 +201,18 @@ measurement here: it reported `0.770x` and `1.715x` on two runs of the same code
 bit-identical arms cannot genuinely differ by 70% in either direction. The first arm to
 run also pays aiter's one-off JIT kernel builds (~90 s), which is why whole-run averages
 must be discarded entirely.
+
+That run used a purpose-built 4-layer model, so it proves the path trains but not that it
+survives a production stack. The same switch was then A/B'd through Primus's own Megatron
+pretrain entry point (llama3.2_1B cut to 4 layers, seq 2048, 20 iterations, mock data, no
+checkpoints), the two arms differing only in `use_turbo_flex_attention`. Every iteration's
+`lm loss` was bit-identical between the arms (max diff `0.0`, 20/20 iterations), both arms
+converged 11.8590 -> 6.2901, and both exited 0.
+
+Both arms dispatch onto the same aiter kernels, which is the intent: with no `score_mod` or
+`mask_mod`, the compat layer is supposed to reach the same kernel the direct call reaches.
+The arms do take different code paths — the ON arm builds `build_turbo_flex_attention(...)`,
+and that path raises outright when the installed Primus-Turbo has no `flex_attention` module,
+which is exactly what happened on the first attempt against the released wheel. So `0.0` here
+is evidence that the integration preserves shape, scale and causal semantics, not evidence
+that the switch did nothing.
