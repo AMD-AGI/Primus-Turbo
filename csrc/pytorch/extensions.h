@@ -84,6 +84,16 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
     const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
 
+#ifdef BUILD_MXFP6_BACKEND
+// MXFP6 (E2M3) quantize + pack into AITER's mxfp6_c0c1_256_padk2 blob layout. Returns
+// (packed, scale) 1-D uint8 blobs, or all four for the dual form; the logical shape is
+// not recoverable from a blob and stays the caller's to carry.
+std::vector<at::Tensor> quantize_mxfp6(const at::Tensor input, const int64_t axis);
+std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input);
+std::vector<at::Tensor> quantize_mxfp6_meta(const at::Tensor input, const int64_t axis);
+std::vector<at::Tensor> quantize_mxfp6_dual_meta(const at::Tensor input);
+#endif // BUILD_MXFP6_BACKEND
+
 at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,
                                   const int64_t axis, const at::ScalarType dest_dtype);
 

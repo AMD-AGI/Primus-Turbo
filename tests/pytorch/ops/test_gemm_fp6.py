@@ -4,6 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
+from contextlib import contextmanager
+
 import pytest
 import torch
 
@@ -132,6 +135,141 @@ def test_mxfp6_col_pack_is_row_pack_of_transpose(rows, cols):
         mxfp6_data_region(col_s, cols, rows, is_scale=True),
         mxfp6_data_region(ref_s, cols, rows, is_scale=True),
     )
+
+
+def _fused_packer_available() -> bool:
+    return hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_dual")
+
+
+def _skip_without_fused_packer():
+    if not _fused_packer_available():
+        pytest.skip("build has no fused MXFP6 packer (gfx950-only)")
+
+
+@contextmanager
+def _packer(choice: str):
+    """Force the packer backend for the duration of a block."""
+    previous = os.environ.get("PRIMUS_TURBO_MXFP6_PACKER")
+    os.environ["PRIMUS_TURBO_MXFP6_PACKER"] = choice
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("PRIMUS_TURBO_MXFP6_PACKER", None)
+        else:
+            os.environ["PRIMUS_TURBO_MXFP6_PACKER"] = previous
+
+
+@pytest.mark.parametrize(
+    "rows,cols", [(256, 256), (256, 512), (512, 256), (1024, 1024), (256, 3072), (4096, 3072)]
+)
+@pytest.mark.parametrize("direction", ["row", "col"])
+def test_fused_packer_is_bit_exact_with_aiter(rows, cols, direction):
+    """The fused packer must reproduce AITER's packer byte for byte.
+
+    This is the property the whole substitution rests on. AITER's packer is the oracle the
+    A6W6 assembly was validated against, so anything short of bit-exactness would mean the
+    GEMM is consuming operands nothing has validated -- and MXFP6's Hadamard only cancels
+    if both operands were rotated identically, which a near-miss would silently break.
+
+    It is also easy to miss by a hair: the rotation's 1/sqrt(32) has to be the bf16-rounded
+    constant, because the reference applies the Hadamard as a bf16 dot. Using the exact
+    fp32 value shifts values by ~1e-4 relative, which changes ~0.1% of codes by one level
+    -- invisible to an SNR check, caught here.
+
+    Every shape here is 256-aligned on the packed row count, which is the only regime
+    where AITER can be compared against at all; see test_fused_packer_pads_with_zeros.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_packer()
+
+    x = torch.randn((rows, cols), dtype=torch.bfloat16, device="cuda:0")
+    pack = quantize_mxfp6_row if direction == "row" else quantize_mxfp6_col
+    # Packed rows/K are transposed for the column direction.
+    r, k = (rows, cols) if direction == "row" else (cols, rows)
+
+    with _packer("fused"):
+        got_p, got_s = pack(x)
+    with _packer("aiter"):
+        ref_p, ref_s = pack(x)
+
+    assert torch.equal(mxfp6_data_region(got_p, r, k), mxfp6_data_region(ref_p, r, k))
+    assert torch.equal(
+        mxfp6_data_region(got_s, r, k, is_scale=True),
+        mxfp6_data_region(ref_s, r, k, is_scale=True),
+    )
+
+
+@pytest.mark.parametrize("rows,cols", [(288, 256), (256, 320), (288, 320)])
+def test_fused_packer_pads_with_zeros(rows, cols):
+    """A shape that does not fill whole 256-row tiles must pack as if zero-extended.
+
+    Note that AITER is deliberately not the oracle here, unlike the bit-exactness test:
+    its packer reads past the end of the tensor when the packed row count is not a
+    multiple of 256, so its padded region reflects whatever memory follows the operand.
+    That is invisible in practice because the A6W6 path gates on 256-alignment
+    everywhere, but it does mean the only trustworthy reference for these shapes is an
+    explicitly zero-extended input.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_packer()
+
+    def ceil256(v):
+        return -(-v // 256) * 256
+
+    x = torch.randn((rows, cols), dtype=torch.bfloat16, device="cuda:0")
+    extended = torch.zeros((ceil256(rows), ceil256(cols)), dtype=torch.bfloat16, device="cuda:0")
+    extended[:rows, :cols] = x
+
+    with _packer("fused"):
+        got_rp, got_rs, got_cp, got_cs = quantize_mxfp6_dual(x)
+        ref_rp, ref_rs, ref_cp, ref_cs = quantize_mxfp6_dual(extended)
+
+    er, ec = extended.shape
+
+    def same(got, ref, got_rows, got_k, ref_rows, ref_k, is_scale=False):
+        # Zero-extending K gives the reference extra K-tiles the operand has no room for.
+        # Packing a row is per-32-block, so the tiles they share must agree exactly; the
+        # reference's surplus tiles have no counterpart to compare against.
+        g = mxfp6_data_region(got, got_rows, got_k, is_scale=is_scale)
+        r = mxfp6_data_region(ref, ref_rows, ref_k, is_scale=is_scale)
+        return torch.equal(g, r[:, : g.shape[1], :])
+
+    assert same(got_rp, ref_rp, rows, cols, er, ec)
+    assert same(got_rs, ref_rs, rows, cols, er, ec, is_scale=True)
+    assert same(got_cp, ref_cp, cols, rows, ec, er)
+    assert same(got_cs, ref_cs, cols, rows, ec, er, is_scale=True)
+
+
+def test_fused_packer_ignores_memory_past_the_operand():
+    """Packing must not depend on whatever happens to follow the tensor in memory.
+
+    The kernel tiles to 256 rows and reads a whole tile per block, so the rows past the
+    logical extent have to be masked rather than merely landing on quiet memory. Backing
+    the same values onto buffers with different tails is what distinguishes the two.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_packer()
+
+    rows, cols = 288, 256
+    values = torch.randn((rows, cols), dtype=torch.bfloat16, device="cuda:0")
+
+    packs = []
+    for filler in (0.0, 3.5, -100.0):
+        backing = torch.full((512, cols), filler, dtype=torch.bfloat16, device="cuda:0")
+        backing[:rows] = values
+        with _packer("fused"):
+            packed, scale = quantize_mxfp6_row(backing[:rows])
+        packs.append((packed, scale))
+
+    for packed, scale in packs[1:]:
+        assert torch.equal(
+            mxfp6_data_region(packed, rows, cols), mxfp6_data_region(packs[0][0], rows, cols)
+        )
+        assert torch.equal(
+            mxfp6_data_region(scale, rows, cols, is_scale=True),
+            mxfp6_data_region(packs[0][1], rows, cols, is_scale=True),
+        )
 
 
 @pytest.mark.parametrize("axis,expect_row", [(1, True), (-1, True), (0, False), (-2, False)])

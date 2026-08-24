@@ -123,6 +123,32 @@ constexpr int E8M0_EXPONENT_BIAS = 127;
 
 } // namespace detail
 
+// ---------------------------------------------------------------------------
+// MXFP6 (E2M3) quantize + pack into AITER's mxfp6_c0c1_256_padk2 blob layout.
+//
+// Unlike the other formats there is no strided output tensor here: the A6W6 assembly
+// consumes an opaque re-tiled blob whose logical shape is the caller's to remember.
+// The mandatory 32-point Hadamard along the contraction axis is folded in.
+// ---------------------------------------------------------------------------
+
+// Trailing K-tiles present in every packed blob. Their contents are never read, but the
+// space is mandatory: the assembly derives its row-tile stride from k/128 + 2.
+constexpr int MXFP6_GUARD_K_TILES = 2;
+
+enum class MXFP6Direction {
+    Row,  // contract along the last axis
+    Col,  // contract along the first axis, i.e. pack the rows of x.T
+    Dual, // both, from a single read of the input
+};
+
+// Writes (row_packed, row_scale) and/or (col_packed, col_scale) for a [M, N] input,
+// according to `direction`. Pointers for a direction that is not requested are unused
+// and may be null. Sizes must come from mxfp6_pack_sizes on the Python side.
+template <typename DType>
+void quantize_mxfp6_impl(const DType *input, uint8_t *row_packed, uint8_t *row_scale,
+                         uint8_t *col_packed, uint8_t *col_scale, const int M, const int N,
+                         const MXFP6Direction direction, hipStream_t stream);
+
 template <typename DType>
 void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
                               uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,

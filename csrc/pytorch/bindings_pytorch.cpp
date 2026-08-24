@@ -164,6 +164,14 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "int window_left) -> int");
     m.def("hk_attn_block_sizes(int head_dim) -> int[]");
 #endif // BUILD_HIPKITTENS_BACKEND
+
+    // ********* MXFP6 Quantization *********
+    // gfx950-only: the packer uses the hardware FP6 conversion, so like the hipkittens
+    // ops these are absent rather than failing at launch on other archs.
+#ifdef BUILD_MXFP6_BACKEND
+    m.def("quantize_mxfp6(Tensor input, int axis) -> Tensor[]");
+    m.def("quantize_mxfp6_dual(Tensor input) -> Tensor[]");
+#endif // BUILD_MXFP6_BACKEND
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
@@ -185,6 +193,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual);
     m.impl("quantize_mxfp4", quantize_mxfp4);
+#ifdef BUILD_MXFP6_BACKEND
+    m.impl("quantize_mxfp6", quantize_mxfp6);
+    m.impl("quantize_mxfp6_dual", quantize_mxfp6_dual);
+#endif // BUILD_MXFP6_BACKEND
     m.impl("dequantize_mxfp4", dequantize_mxfp4);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual);
     m.impl("grouped_quantize_mxfp4", grouped_quantize_mxfp4);
@@ -246,6 +258,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual_meta);
     m.impl("quantize_mxfp4", quantize_mxfp4_meta);
+#ifdef BUILD_MXFP6_BACKEND
+    m.impl("quantize_mxfp6", quantize_mxfp6_meta);
+    m.impl("quantize_mxfp6_dual", quantize_mxfp6_dual_meta);
+#endif // BUILD_MXFP6_BACKEND
     m.impl("dequantize_mxfp4", dequantize_mxfp4_meta);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual_meta);
     m.impl("grouped_quantize_mxfp4", grouped_quantize_mxfp4_meta);
