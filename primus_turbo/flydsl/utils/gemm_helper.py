@@ -1784,10 +1784,19 @@ def _emit_lds_repack(
     pack=1,
     kbound=None,
     k128p=None,
+    rd_cm=0,
+    st_cm=0,
 ):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
     # kbound (default K128) bounds this chunk's k index; k128p (default ceildiv(K128,pack)) is the output k-stride, so the variable-K wgrad packs each group from its own k0.
+    # rd_cm/st_cm (default 0 = cached): CPol bits on the raw load / broadcast store. On gfx950
+    # 1 emits sc0, 16 emits sc1, 2 emits nt. Host-side preshuffle callers
+    # (build_preshuffle_ab_kernel, the grouped mxfp8 kernels) keep the defaults: producer and
+    # consumer are in one kernel, so a barrier is enough. A fused-kernel preshuffle role, whose
+    # producer is a peer rank and whose consumer may sit on another XCD, passes rd_cm=1 (sc0
+    # acquire) + st_cm=16 (sc1 write-through release) so the transpose itself carries the fence --
+    # no whole-L2 buffer_inv before it and no device-wide buffer_wbl2 after it.
     NT = 4
     TILE = 64 * KT
     assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
@@ -1809,6 +1818,7 @@ def _emit_lds_repack(
             vec_width=1,
             dtype=T.i32,
             mask=(gk < KBND) & (grow < dim),
+            cache_modifier=rd_cm,
         )
         fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
             Vec.from_elements([fx.Int32(dw)], fx.Int32)
@@ -1844,6 +1854,7 @@ def _emit_lds_repack(
             rout,
             ((grp * K128p + gkp) * 64 + lane) * 4 + wr_base,
             mask=(k0 + kkp * PACK) < KBND,
+            cache_modifier=st_cm,
         )
 
 
