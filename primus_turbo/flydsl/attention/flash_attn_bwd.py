@@ -3226,15 +3226,12 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(_A16_TAG):
                     # Per-CALL-SITE weight so one readback decodes, in base 4, how many
                     # times each _gemm3 call site touched the element (see goal.md's 2x).
-                    if const_expr(_A16_TAG == 13 or _A16_TAG == 14):
+                    if const_expr(_A16_TAG == 13):
                         # Payload encodes the element's own q row (13) or d base (14) in the
                         # bf16 mantissa: the bits 0x4000+v are the value 2*(1+v/128), exact
                         # for v < 128, so reading the image back through a candidate
                         # un-permutation says directly whether that axis is mapped right.
-                        if const_expr(_A16_TAG == 13):
-                            _iv = q_start + _g3_qrow(_g3q0 + fx.Index(j * G3_SPL_STRIDE))
-                        else:
-                            _iv = (_g3d0 + fx.Index(i)) * fx.Index(D_TILE) + kg * fx.Index(4)
+                        _iv = q_start + _g3_qrow(_g3q0 + fx.Index(j * G3_SPL_STRIDE))
                         _pk = Vec.from_elements(
                             [
                                 fx.Int32(
@@ -3311,13 +3308,17 @@ def build_flash_attn_bwd_dkdv_module(
                             alignment=4,
                         )
                 else:
+                    # ★ CPol 0. The mode selector is NOT a CPol: wsq_a16=64 would pass 63,
+                    # whose sc0 bit costs 3/4 of the updates (measured: 25% of the image
+                    # written). Only the low modes carry a CPol in the selector.
+                    _cpol = const_expr(0 if WSQ_A16 >= 32 else WSQ_A16 - 1)
                     for _w in range_constexpr(4):
                         rocdl.raw_ptr_buffer_atomic_fadd(
                             _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
                             wsq16_rsrc,
                             _a16,
                             _step * _w,
-                            WSQ_A16 - 1,
+                            _cpol,
                         )
 
             def _g3_atomic(_lo, _hi, i, j):
