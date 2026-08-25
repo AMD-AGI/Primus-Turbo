@@ -193,8 +193,7 @@ on the same data also reports `3.906e-03`.
 
 Under the Primus integration switch `use_turbo_flex_attention`, a 20000-step training run
 with the switch ON and OFF produced **bit-identical loss at every single step** (max diff
-`0.0`), with both arms learning (5.6987 -> 4.2533). Steady-state overhead measured with
-interleaved A/B blocks: **1.064x**.
+`0.0`), with both arms learning (5.6987 -> 4.2533).
 
 Sequential timing — running all of one arm and then all of the other — is not a usable
 measurement here: it reported `0.770x` and `1.715x` on two runs of the same code, and
@@ -202,12 +201,78 @@ bit-identical arms cannot genuinely differ by 70% in either direction. The first
 run also pays aiter's one-off JIT kernel builds (~90 s), which is why whole-run averages
 must be discarded entirely.
 
+### Overhead, and why the earlier 1.064x figure was withdrawn
+
+An earlier revision of this document quoted **1.064x** steady-state overhead from
+interleaved A/B blocks. **That figure is withdrawn: it does not reproduce, and it was an
+artifact of a confound interleaving does not remove.**
+
+Interleaving fixes drift *between* arms. It does nothing about the penalty paid by
+whichever arm runs *first* in a fresh container — allocator state, caches, thermal ramp.
+The only way to see that penalty is to run the same arm twice. A four-arm
+`on off on off` pretrain (llama3.2_1B 16L, seq 8192, 8x MI355X, 500 iterations per arm)
+does exactly that, and the A/A pairs are what settle it:
+
+| kind | pair | step-time ratio | 95% CI (paired block bootstrap) |
+|---|---|---|---|
+| A/B | 1_on / 2_off | 1.0349 | [1.0270, 1.0418] |
+| A/B | **3_on / 4_off** | **1.0061** | **[0.9979, 1.0127]** |
+| A/A | 1_on / 3_on | 1.0245 | [1.0210, 1.0297] |
+| A/A | 2_off / 4_off | 0.9960 | [0.9865, 1.0065] |
+
+`2_off / 4_off` includes 1.0, so past the first run, step-time reproducibility is clean.
+`1_on / 3_on` — **the same arm, run twice** — is 1.0245 and excludes 1.0. So most of what
+`1_on / 2_off` = 1.0349 looks like is the first-run penalty wearing the costume of an
+overhead. The one uncontaminated A/B, `3_on / 4_off`, is 1.0061 with a CI that **contains
+1.0**: it does not clear the null.
+
+**Step-level overhead at production shapes is not resolvable from noise; 95% upper bound
+~1.3%.**
+
+Per *attention call*, measured on an exclusive node with a byte-identical third arm as an
+A/A floor (30 rounds, 40 calls per timing block, 20000-resample paired bootstrap):
+
+| shape | pass | flex/turbo | delta | clears the A/A floor? |
+|---|---|---|---|---|
+| B2 H8 S1024 D128 | fwd | **1.3110** | +16.74 us | yes |
+| B2 H8 S1024 D128 | fwd+bwd | **1.1802** | +49.39 us | yes |
+| B2 H16 S2048 D128 | fwd | 1.0067 | +0.52 us | no |
+| B2 H16 S2048 D128 | fwd+bwd | 1.0046 | +1.18 us | yes |
+| B2 H32 S4096 D128 | fwd | 0.9986 | -0.72 us | no |
+| B2 H32 S4096 D128 | fwd+bwd | 1.0009 | +1.39 us | floor itself is biased — unusable |
+| B1 H32 S8192 D128 | fwd | 0.9997 | -0.31 us | no |
+| B1 H32 S8192 D128 | fwd+bwd | 1.0006 | +1.68 us | no |
+
+The overhead is a **fixed CPU-side cost**, not a proportional one, and it is visible only
+while the attention kernel is short enough that the GPU cannot hide it. At S=1024 the
+forward kernel is 54 us and the layer's probe/classify/dispatch work is exposed — 1.31x.
+At S=2048 the kernel is 77 us, long enough to cover the next call's CPU work, and the
+delta collapses to +0.5 us. That is a launch-bound to compute-bound crossover, not an
+overhead that shrinks with size.
+
+The `S4096 fwd+bwd` row is the reason the A/A arm exists. Its A/B ratio of 1.0009 looks
+reportable until you notice that the **A/A floor's own delta CI is [-2.28, -0.05] us,
+excluding zero** — at that shape identical code does not even match itself. Without the
+third arm that row would have been written up as a real 0.09% overhead.
+
 That run used a purpose-built 4-layer model, so it proves the path trains but not that it
 survives a production stack. The same switch was then A/B'd through Primus's own Megatron
 pretrain entry point (llama3.2_1B cut to 4 layers, seq 2048, 20 iterations, mock data, no
 checkpoints), the two arms differing only in `use_turbo_flex_attention`. Every iteration's
 `lm loss` was bit-identical between the arms (max diff `0.0`, 20/20 iterations), both arms
 converged 11.8590 -> 6.2901, and both exited 0.
+
+At production scale (16 layers, seq 8192, 8x MI355X, 500 iterations per arm, ~131M tokens)
+the arms are **no longer bit-identical** — and the same self-vs-self rule decides what that
+means. The distribution of `|loss_on - loss_off|` over 500 iterations has median `3.76e-06`;
+the A/A distribution, from running the *same* arm twice, has median `3.49e-06`. A
+permutation test on the difference of medians gives **p = 0.43**: the A/B difference is
+indistinguishable from run-to-run nondeterminism. Reading the maxima instead would have
+been misleading in both directions — the worst A/B max is `2.759e-03` against an A/A max of
+`2.093e-03`, which invites a false alarm, while the worst *relative* disagreement in the
+whole experiment belongs to an **A/A** pair (`3.672e-03`), not to any A/B pair. All four
+arms converged identically (11.8490 -> 0.0109), produced no nan/inf, and exited 0, at
+518 TFLOP/s/GPU and 57.2k tokens/s/GPU.
 
 Both arms dispatch onto the same aiter kernels, which is the intent: with no `score_mod` or
 `mask_mod`, the compat layer is supposed to reach the same kernel the direct call reaches.
