@@ -1,73 +1,59 @@
 #!/usr/bin/env python3
-"""Per-basic-block opcode-class histogram of an ISA dump.
+"""Instruction histogram of an ISA dump, grouped by what the instruction COSTS.
 
-The campaign's own r9 finding is that wall follows the HOT BLOCK, not the kernel total, so
-size/scheduling candidates have to be judged per `.LBB`. usage: _isa_hist.py <isa.s> [top_n]
+At 462 unified registers the dkdv body runs one wave per SIMD, so nothing hides behind a
+sibling wave and every non-MFMA instruction is issue time the MFMA pipe does not get. This
+says which category to attack.
+
+usage: _isa_hist.py <isa.s> [top]
 """
 import collections
 import re
 import sys
 
-CLASS = [
+path = sys.argv[1]
+top = int(sys.argv[2]) if len(sys.argv) > 2 else 24
+
+CATS = (
     ("mfma", r"^v_mfma"),
-    ("ds_read_tr", r"^ds_read\w*_tr"),
     ("ds_read", r"^ds_read"),
     ("ds_write", r"^ds_write"),
-    ("buf_load", r"^(buffer_load|global_load)"),
-    ("buf_store", r"^(buffer_store|global_store)"),
-    ("atomic", r"atomic"),
+    ("buffer_load", r"^buffer_load"),
+    ("buffer_store", r"^buffer_store"),
+    ("global/flat", r"^(global|flat)_"),
     ("accvgpr", r"^v_accvgpr"),
-    ("v_mov", r"^v_mov"),
-    ("v_cvt", r"^v_cvt"),
-    ("v_exp", r"^v_exp"),
-    ("v_perm", r"^v_perm"),
+    ("permlane/dpp", r"^(v_permlane|v_mov_b32_dpp|ds_bpermute|ds_swizzle)"),
+    ("exp/trans", r"^v_(exp|log|rcp|rsq|sqrt)"),
+    ("v_cvt/pack", r"^v_(cvt|pack|pk_)"),
     ("valu", r"^v_"),
-    ("s_wait", r"^s_wait"),
-    ("s_barrier", r"^s_barrier"),
-    ("sched", r"^(sched_|s_setprio|iglp|s_nop)"),
-    ("salu", r"^s_"),
-]
+    ("salu", r"^s_(add|sub|mul|and|or|xor|lshl|lshr|ashr|mov|cmp|cselect|min|max|bfe|not|nand|abs|sext|bitcmp|cbranch_scc|getpc|setpc|pack)"),
+    ("s_wait/barrier", r"^s_(waitcnt|barrier|setprio|sleep|nop|sched|delay)"),
+    ("branch", r"^s_(branch|cbranch|endpgm|swappc)"),
+    ("s_load", r"^s_load"),
+)
 
-
-def classify(op):
-    for name, pat in CLASS:
+hist = collections.Counter()
+mnem = collections.Counter()
+for ln in open(path):
+    t = ln.strip()
+    if not t or t.startswith((".", ";", "/", "//")) or t.endswith(":"):
+        continue
+    op = t.split()[0]
+    if not re.match(r"^[a-z]", op):
+        continue
+    mnem[op] += 1
+    for name, pat in CATS:
         if re.match(pat, op):
-            return name
-    return "other"
+            hist[name] += 1
+            break
+    else:
+        hist["other"] += 1
 
-
-def main():
-    path = sys.argv[1]
-    top = int(sys.argv[2]) if len(sys.argv) > 2 else 8
-    blocks = collections.OrderedDict()
-    cur = "prologue"
-    blocks[cur] = collections.Counter()
-    size = collections.Counter()
-    for ln in open(path, errors="ignore"):
-        m = re.match(r"^(\.LBB[\w.]+):", ln.strip())
-        if m:
-            cur = m.group(1)
-            blocks.setdefault(cur, collections.Counter())
-            continue
-        m = re.match(r"^\s+([a-z][\w.]*)\s", ln)
-        if not m or ln.lstrip().startswith("."):
-            continue
-        op = m.group(1)
-        if not re.match(r"^(s_|v_|ds_|buffer_|global_|flat_|scratch_|sched_|iglp)", op):
-            continue
-        blocks[cur][classify(op)] += 1
-        size[cur] += 1
-    tot = sum(size.values())
-    print(f"total insts {tot} over {len(blocks)} blocks")
-    for blk, n in size.most_common(top):
-        c = blocks[blk]
-        parts = " ".join(f"{k}={v}" for k, v in c.most_common())
-        print(f"{blk:>14} n={n:6d} ({100.0*n/tot:5.1f}%)  {parts}")
-    agg = collections.Counter()
-    for c in blocks.values():
-        agg.update(c)
-    print("KERNEL  " + " ".join(f"{k}={v}" for k, v in agg.most_common()))
-
-
-if __name__ == "__main__":
-    main()
+tot = sum(hist.values())
+m = hist.get("mfma", 1)
+print("total %d instructions, %d mfma -> %.2f non-mfma per mfma" % (tot, m, (tot - m) / m))
+for k, v in hist.most_common():
+    print("  %-16s %6d  %5.1f%%   %5.2f / mfma" % (k, v, 100 * v / tot, v / m))
+print("top mnemonics:")
+for k, v in mnem.most_common(top):
+    print("  %-32s %6d" % (k, v))
