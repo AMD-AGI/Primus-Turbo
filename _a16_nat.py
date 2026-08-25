@@ -131,6 +131,9 @@ _restore()
 
 if os.environ.get("AXIS"):
     img = _held["ws"].reshape(-1)[: B * S * Hq * D]
+    print("  M._A16_TAG =", M._A16_TAG, " env:", os.environ.get("PT_A16_TAG"))
+    print("  image nonzero:", int((img != 0).sum()), "of", img.numel(),
+          " sample bits:", [hex(int(x) & 0xFFFF) for x in img[:4].view(torch.int16).tolist()])
     v = img.view(B, S // BQ, 2, 2, Hq, NPAIR // 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2)
     dec = ((v.float() / 2.0) - 1.0) * 128.0
     out = dec.permute(*PERM).reshape(B, S, Hq, D)
