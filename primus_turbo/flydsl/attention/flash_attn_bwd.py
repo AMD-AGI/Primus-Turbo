@@ -3226,7 +3226,36 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(_A16_TAG):
                     # Per-CALL-SITE weight so one readback decodes, in base 4, how many
                     # times each _gemm3 call site touched the element (see goal.md's 2x).
-                    if const_expr(_A16_TAG == 13):
+                    if const_expr(_A16_TAG == 15):
+                        pass
+                    elif const_expr(_A16_TAG == 16):
+                        pass
+                    elif const_expr(_A16_TAG == 17):
+                        _iv = _g3qh          # the head axis, the last one untested
+                        _pk = Vec.from_elements(
+                            [
+                                fx.Int32(
+                                    ArithValue(
+                                        _raw((fx.Index(0x4000) + _iv) * fx.Index(0x10001))
+                                    ).index_cast(fx.Int32.ir_type)
+                                )
+                            ],
+                            fx.Int32,
+                        ).broadcast_to(4)
+                    elif const_expr(_A16_TAG == 14):
+                        # dpair*32 + kg*4: the w-independent half of the D map.
+                        _iv = (_g3d0 + fx.Index(i)) * fx.Index(D_TILE) + kg * fx.Index(4)
+                        _pk = Vec.from_elements(
+                            [
+                                fx.Int32(
+                                    ArithValue(
+                                        _raw((fx.Index(0x4000) + _iv) * fx.Index(0x10001))
+                                    ).index_cast(fx.Int32.ir_type)
+                                )
+                            ],
+                            fx.Int32,
+                        ).broadcast_to(4)
+                    elif const_expr(_A16_TAG == 13):
                         # Payload encodes the element's own q row (13) or d base (14) in the
                         # bf16 mantissa: the bits 0x4000+v are the value 2*(1+v/128), exact
                         # for v < 128, so reading the image back through a candidate
@@ -3313,6 +3342,22 @@ def build_flash_attn_bwd_dkdv_module(
                     # written). Only the low modes carry a CPol in the selector.
                     _cpol = const_expr(0 if WSQ_A16 >= 32 else WSQ_A16 - 1)
                     for _w in range_constexpr(4):
+                        if const_expr(_A16_TAG == 16):
+                            # same, but the dword's two halves differ by one, so the
+                            # placement of `half` (bit 0 of d) is tested too.
+                            _v16 = 0x4000 + (_w // 2) * 16 + 2 * (_w % 2)
+                            _pk = Vec.from_elements(
+                                [fx.Int32(((_v16 + 1) << 16) | _v16)], fx.Int32
+                            ).broadcast_to(4)
+                        if const_expr(_A16_TAG == 15):
+                            # per-w payload: the p/s half of d, i.e. (w//2)*16 + 2*(w%2).
+                            # This is the only part of the D map that depends on which
+                            # dword of the packed store we are looking at, so it is what
+                            # says whether p is the HIGH bit of w or the low one.
+                            _pk = Vec.from_elements(
+                                [fx.Int32((0x4000 + (_w // 2) * 16 + 2 * (_w % 2)) * 0x10001)],
+                                fx.Int32,
+                            ).broadcast_to(4)
                         rocdl.raw_ptr_buffer_atomic_fadd(
                             _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
                             wsq16_rsrc,

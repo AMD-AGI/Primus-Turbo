@@ -119,6 +119,22 @@ def _bench(fn, reps):
 
 # ★ The impl CACHES the built launcher, so the builder patch has to be in place before the
 # very first call -- installing it after a reference run silently reuses the deployed module.
+# That is why the two arms have to be SEPARATE PROCESSES: MODE=ref then MODE=a16.
+MODE = os.environ.get("MODE")
+if MODE:
+    if MODE == "a16":
+        _install()
+    _run()  # cold: the first call dispatches the grid twice, never read or time it
+    dq = _run()[0].clone()
+    t = _bench(_run, REPS)
+    torch.save({"dq": dq.cpu(), "t": t}, "/tmp/dq_%s.pt" % MODE)
+    print("  %s: %.4f ms" % (MODE, t))
+    if MODE == "a16":
+        r = torch.load("/tmp/dq_ref.pt")
+        print("  dq SNR %6.1f dB   base %.4f ms  a16 %.4f ms  delta %+.2f%%"
+              % (_snr(r["dq"].cuda(), dq), r["t"], t, 100 * (t / r["t"] - 1)))
+    sys.exit(0)
+
 if os.environ.get("AXIS"):
     _install()
     _run()
@@ -145,15 +161,24 @@ if os.environ.get("AXIS"):
     v = img.view(B, S // BQ, 2, 2, Hq, NPAIR // 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2)
     dec = ((v.float() / 2.0) - 1.0) * 128.0
     out = dec.permute(*PERM).reshape(B, S, Hq, D)
+    d = torch.arange(D, device=out.device)
     if os.environ["AXIS"] == "13":
         want = torch.arange(S, device=out.device).view(1, S, 1, 1).expand_as(out).float()
+    elif os.environ["AXIS"] == "17":
+        want = torch.arange(Hq, device=out.device).view(1, 1, Hq, 1).expand_as(out).float()
+    elif os.environ["AXIS"] == "16":
+        want = ((d % 32) - ((d % 16) // 4) * 4).view(1, 1, 1, D).expand_as(out).float()
+    elif os.environ["AXIS"] == "15":
+        want = ((d % 32) - ((d % 16) // 4) * 4 - (d % 2)).view(1, 1, 1, D).expand_as(out).float()
     else:
-        d = torch.arange(D, device=out.device)
-        want = (d - d % 4).view(1, 1, 1, D).expand_as(out).float()
+        want = ((d - d % 32) + ((d % 16) - (d % 4))).view(1, 1, 1, D).expand_as(out).float()
     bad = (out - want).abs() > 0.4
     print("  axis %s: mismatch frac %.4f" % (os.environ["AXIS"], float(bad.float().mean())))
     print("  out[0,:4,0,0] =", out[0, :4, 0, 0].tolist(), " want", want[0, :4, 0, 0].tolist())
-    print("  out[0,0,0,:8] =", out[0, 0, 0, :8].tolist(), " want", want[0, 0, 0, :8].tolist())
+    print("  out[0,0,0,:8]  =", out[0, 0, 0, :8].tolist())
+    print("  want[0,0,0,:8] =", want[0, 0, 0, :8].tolist())
+    print("  out[0,0,0,16:24]  =", out[0, 0, 0, 16:24].tolist())
+    print("  want[0,0,0,16:24] =", want[0, 0, 0, 16:24].tolist())
     sys.exit(0)
 
 if os.environ.get("SOLVE"):
