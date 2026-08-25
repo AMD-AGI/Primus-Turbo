@@ -3226,7 +3226,7 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(_A16_TAG):
                     # Per-CALL-SITE weight so one readback decodes, in base 4, how many
                     # times each _gemm3 call site touched the element (see goal.md's 2x).
-                    if const_expr(_A16_TAG in (13, 14)):
+                    if const_expr(_A16_TAG == 13 or _A16_TAG == 14):
                         # Payload encodes the element's own q row (13) or d base (14) in the
                         # bf16 mantissa: the bits 0x4000+v are the value 2*(1+v/128), exact
                         # for v < 128, so reading the image back through a candidate
