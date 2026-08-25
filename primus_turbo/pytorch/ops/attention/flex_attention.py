@@ -58,6 +58,52 @@ Design notes
   gate (see :func:`flex_attention`) that raises ``NotImplementedError`` rather than
   silently dropping the cap (which the ALiBi detector alone would do). See
   FLEX_COMPAT_STATUS.md for the aiter-signature evidence and options.
+
+Relationship to PyTorch
+-----------------------
+This module is an **independent implementation**, not a port or a copy of
+``torch/nn/attention/flex_attention.py``. It matches torch's *interface* -- the
+module name, the ``flex_attention`` / ``create_block_mask`` entry points, and the
+``score_mod`` / ``mask_mod`` calling convention -- because it is meant to be a
+drop-in replacement. It shares none of torch's *implementation*: torch lowers
+``score_mod`` / ``mask_mod`` into generated Triton kernels through Inductor,
+whereas this module classifies them at runtime and dispatches onto Turbo's fixed
+aiter kernels. There is no codegen here at all (see :func:`_dispatch_custom`).
+
+That is why this file carries only the AMD copyright header. The repo's
+convention for adapted third-party code is the dual-copyright + SPDX +
+``Adapted from ...`` banner that ``tools/check_license.py`` emits (the
+``primus_turbo/flydsl`` tree is a live example); that banner deliberately does
+*not* apply here, and adding a PyTorch (BSD-3-Clause) notice would misattribute
+AMD-authored code.
+
+The only PyTorch code this module uses is used **by import**, never by copying:
+
+* ``torch.nn.attention.flex_attention.create_block_mask`` -- imported at module
+  scope and re-exported through the thin :func:`create_block_mask` passthrough, so
+  the returned object is a genuine torch ``BlockMask`` and stays compatible with
+  code that feeds the same mask to torch's own kernel.
+* ``BlockMask`` is never reimplemented; we consume the instances torch returns and
+  only read their ``.mask_mod`` attribute.
+
+Torch helpers deliberately *not* reused, with the reason:
+
+* ``create_mask`` cannot replace :func:`_probe_mask_grid`. It is built on
+  ``torch.vmap``, which raises ``RuntimeError`` ("data-dependent control flow")
+  for scalar-style ``mask_mod`` callables written with Python ``and``; the probe
+  helper falls back to an element-wise loop for exactly those. ``create_mask``
+  also
+  materialises the whole ``[B, H, Q_LEN, KV_LEN]`` mask, while
+  :func:`_probe_mask_row` and :func:`_locate_left_window` sample single rows on
+  purpose, keeping classification of a long-sequence mask O(S log S) rather than
+  O(S**2).
+* ``and_masks`` / ``or_masks`` / ``noop_mask`` are not reimplemented here either;
+  callers that want them should import them from torch directly.
+
+``tools/check_flex_provenance.py`` re-derives all of the above mechanically
+(shared-name check, per-function similarity, and k-gram fingerprint overlap
+against the installed torch), so this section stays checkable rather than
+asserted.
 """
 
 import inspect

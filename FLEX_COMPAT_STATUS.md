@@ -178,6 +178,66 @@ no, and the layer says so.
 
 ---
 
+## Relationship to PyTorch — why there is no BSD-3-Clause banner on this file
+
+The compat layer is a ~2.3k-line module named `flex_attention.py` that exposes a function
+named `flex_attention` and advertises itself as a drop-in replacement for
+`torch.nn.attention.flex_attention`. That is enough resemblance to make "is this a copy of
+torch's implementation?" a fair review question — and the repo has a real answer path for
+it: `tools/check_license.py` emits a dual-copyright `Adapted from ...` + SPDX banner for
+adapted third-party code (the `primus_turbo/flydsl` tree is the live example). If this file
+were derived from PyTorch it would need that treatment with a BSD-3-Clause notice.
+
+It is not derived from PyTorch, and the claim is checked mechanically by
+`tools/check_flex_provenance.py` rather than asserted. Three independent measures, run
+against the *installed* torch (measured on torch 2.13.0):
+
+| Measure | Clean tree | Threshold |
+|---|---|---|
+| Shared top-level names, excluding the two interface names | 0 | 0 |
+| Max per-function similarity (every local function vs every torch function, comments stripped) | **0.421** | 0.60 |
+| 12-token fingerprint overlap over raw text | **0.2233%** (52/23289) | 2% |
+
+The 0.421 top score is a 6-line scalar helper coinciding with an unrelated 6-line torch
+helper. The shared fingerprints are entirely unavoidable idiom: `query: torch.Tensor, key:
+torch.Tensor`, `query.transpose(1, 2)`, the `query.device != key.device` guard. The two
+shared names are `flex_attention` and `create_block_mask` — the interface we deliberately
+match, and `create_block_mask` is a passthrough that *calls* torch's.
+
+The measures are complementary, and the thresholds are calibrated against an injection
+rather than guessed. Pasting three whole torch functions (`or_masks`, `and_masks`,
+`_convert_mask_to_block_mask`) into a copy of the file is caught by all three — but it only
+moves the fingerprint overlap to 2.58%, so the original 5% threshold would have missed it.
+That is why the limit is 2%.
+
+### What is reused from torch, and what is not
+
+Reused **by import, never by copying**:
+
+* `create_block_mask` — imported at module scope, re-exported through a thin passthrough so
+  the returned object is a genuine torch `BlockMask` and stays compatible with code that
+  also feeds the same mask to torch's own kernel.
+* `BlockMask` — never reimplemented; we consume torch's instances and read `.mask_mod`.
+
+Deliberately **not** reused:
+
+* `create_mask` cannot replace `_probe_mask_grid`. It is built on `torch.vmap`, which
+  raises `RuntimeError: ... data-dependent control flow` for scalar-style `mask_mod`
+  callables written with Python `and` — verified, not assumed — and the probe helper falls
+  back to an element-wise loop for exactly those. `create_mask` also materialises the whole
+  `[B, H, Q_LEN, KV_LEN]` mask, whereas `_probe_mask_row` and `_locate_left_window` sample
+  single rows so that classifying a long-sequence mask stays O(S log S) instead of O(S²).
+  Its default device also resolves to the current accelerator, which would make
+  classification require a GPU; the probe path is CPU-only by design, which is what lets
+  the dispatch-logic unit tests run without one.
+* `and_masks` / `or_masks` / `noop_mask` — not reimplemented here; callers who want them
+  should import them from torch directly.
+
+Net: of torch's ten public flex-attention symbols, this module reimplements none. The one
+it needs, it imports.
+
+---
+
 ## Nondeterminism, and what a numerical diff means here
 
 aiter's backward accumulates with **fp32 atomics**, so two runs of *identical* code can
