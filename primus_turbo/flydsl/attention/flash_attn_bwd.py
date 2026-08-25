@@ -39,15 +39,22 @@ from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
 
 _LOG2E = host_math.log2(host_math.e)
 # Tagged touch-count probe for the a16 dQ emission: the payload becomes a constant that
-# encodes WHO emitted, so one readback of the image is a labelled touch map. This is what
-# localised the doubling (see the _g3_a16 comment) and it is the tool to reach for whenever
-# an emission's multiplicity is in question -- a store is idempotent, an atomic is not.
+# encodes WHO emitted, so one readback of the image is a labelled touch map. Reach for it
+# whenever an emission's multiplicity is in question -- a store is idempotent, an atomic is
+# not, so this is the only way to SEE a repeat.
 #   1 = _gemm3 call site (defer hook / undeferred / defer tail / shadow), weights 1,4,16,64
 #   2 = head_local        3 = (d-pair, q-tile) site        4 = wave_id
 #   5 = lane 0 only, asymmetric payload (1.0, 4.0): separates a doubled APPLICATION from a
 #       doubled operand, and makes the touched-element SET readable on its own
-#   8 = f32 atomicrmw at the same emission point (is it the packed-bf16 op?)
-#   9 = f32 atomicrmw at _gemm3_tiles' ENTRY, no other emission (is it the emission loop?)
+#   8 = f32 atomicrmw at the same emission point      9 = ... at _gemm3_tiles' ENTRY
+#  10 = ... at _gemm3's entry    11 = ... at the head-step's entry    12 = ... per WORK-GROUP,
+#       outside the q-loop entirely
+#
+# ★★ MEASURE ON A WARM CALL. The FIRST invocation of a compiled launcher dispatches the grid
+# TWICE, so every atomic in the kernel reads 2x on a cold call while every deployed output --
+# dK, dV and the dQ partials are all STORED -- is unaffected, because a store is idempotent.
+# A whole campaign read that 2x as a kernel bug. Warm, the touch map is 1,2,3,...,n_bands per
+# q block: the emission is a perfect causal partition and always was.
 _A16_TAG = int(_dbg_os.environ.get("PT_A16_TAG", "0"))
 # Warp specialisation (splitting the head-step across a wave pair by role) is
 # register-walled: each role's live set needs more than half the 512-dword pool, so the
@@ -2468,6 +2475,22 @@ def build_flash_attn_bwd_dkdv_module(
                     else (batch_idx * _wsq16_slice)
                 ),
             )
+        if const_expr(_A16_TAG == 12 and WSQ_A16):
+            # WORK-GROUP marker: one lane-0 f32 atomicrmw per (kv tile, split, wave), OUTSIDE
+            # the q-loop entirely. 1.0 means the grid is dispatched once and the doubling is
+            # inside the loop; 2.0 means the whole dispatch repeats (invisible on every
+            # deployed output, since they are all stored rather than accumulated).
+            _mw = (
+                (kv_tile_idx * fx.Index(8) + split_idx) * fx.Index(8) + wave_id
+            ) * fx.Index(HEAD_DIM)
+            llvm.atomicrmw(
+                llvm.AtomicBinOp.fadd,
+                buffer_ops.get_element_ptr(_wsq16_ptr, _raw(_mw * fx.Index(2))),
+                _raw(ArithValue(lane == fx.Index(0)).select(fx.Float32(1.0), fx.Float32(0.0))),
+                llvm.AtomicOrdering.monotonic,
+                syncscope="agent",
+                alignment=4,
+            )
         if const_expr(WSQ_ATOMIC):
             # The fp32 dQ accumulator has NO band axis and no interleave: every band adds into
             # the same image, so one batch slice of Sq*Hq*D floats is the whole resource.
@@ -2993,6 +3016,29 @@ def build_flash_attn_bwd_dkdv_module(
 
         _amask_cell = [None]
 
+        def _a16_mark(q_start, head_local):
+            """One lane-0 f32 atomicrmw at a (q_start, wave, head) slot of the dQ image.
+
+            Placed at successively higher levels (emission loop -> _gemm3_tiles entry ->
+            _gemm3 entry -> head-step entry) this binary-searches WHICH level repeats. See
+            the PT_A16_TAG legend at the top of the file.
+            """
+            _mi = (
+                (q_start + wave_id) * fx.Index(NUM_HEADS_Q)
+                + kv_head_idx * fx.Index(GQA_GROUP_SIZE)
+                + fx.Index(head_local)
+            ) * fx.Index(HEAD_DIM)
+            llvm.atomicrmw(
+                llvm.AtomicBinOp.fadd,
+                buffer_ops.get_element_ptr(
+                    _wsq16_ptr, _raw(_wsq16_boff + _mi * fx.Index(2))
+                ),
+                _raw(ArithValue(lane == fx.Index(0)).select(fx.Float32(1.0), fx.Float32(0.0))),
+                llvm.AtomicOrdering.monotonic,
+                syncscope="agent",
+                alignment=4,
+            )
+
         def _gemm3(q_start, head_local, slot, drain=None, qsel=None, depth=None, st_sink=None, poff=None, site=0):
             """Run the dQ pass on its carrier waves (see G3_WAVES).
 
@@ -3003,6 +3049,8 @@ def build_flash_attn_bwd_dkdv_module(
             the stores stay out of the wait (see G3_SHADOW). The non-carriers owe the same
             wait, hence the complementary guard rather than an else.
             """
+            if const_expr(_A16_TAG == 10 and WSQ_A16):
+                _a16_mark(q_start, head_local)
             if const_expr(G3_WAVES < NUM_WAVES):
                 if wave_id < fx.Index(G3_WAVES):
                     _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, poff=poff, site=site)
@@ -3050,8 +3098,6 @@ def build_flash_attn_bwd_dkdv_module(
             else:
                 _kb, _sb = _g3_kbase(_g3d0), _g3_sbase(_g3q0)
             _soff = slot * G3S_GRP_ELEMS
-            if const_expr(WSQ_A16):
-                _a16_half = Vec.from_elements([fx.Float32(0.5)], fx.Float32).broadcast_to(4)
             # qsel picks ONE of the wave's q-tiles (its dS columns come from that q-half
             # alone), so the pass can run as soon as that half's softmax has published.
             _qs = list(range_constexpr(G3_QT)) if qsel is None else [qsel]
@@ -3135,8 +3181,8 @@ def build_flash_attn_bwd_dkdv_module(
                 instruction -- on top of the 4x fewer instructions aiter's wider kv tile
                 already buys.
                 """
-                if const_expr(_A16_TAG == 9):
-                    return  # mode 9 measures only the entry marker
+                if const_expr(_A16_TAG >= 9):
+                    return  # marker modes measure only their own marker
                 if const_expr(WSQ_ACOAL):
                     _t = _g3q0 + fx.Index(j * G3_SPL_STRIDE)
                     _row0 = (
@@ -3344,27 +3390,8 @@ def build_flash_attn_bwd_dkdv_module(
                                     lambda a=_lo, b=_hi, _i=_gd0, _j=j: _g3_atomic(a, b, _i, _j)
                                 )
                             continue
-                        _alo, _ahi = _g3[i][jj], _g3[i + 1][jj]
-                        if const_expr(WSQ_A16):
-                            # ★★ THE dQ EMISSION REGION RUNS TWICE. Every atomic issued from
-                            # inside _gemm3_tiles lands twice, whatever it is: the packed-bf16
-                            # buffer form, an llvm.atomicrmw through a raw global pointer, and
-                            # a plain f32 atomicrmw all read back 2x, and so does a marker at
-                            # _gemm3_tiles' ENTRY, outside every emission loop. The element SET
-                            # is exactly right under all of them (a lane-0-only payload touches
-                            # exactly the 1024 slots it should) and stays right across
-                            # g3_defer / g3_st_at / g3_dbat / q_split, so it is not an address
-                            # collision and not a knob. The static ISA holds exactly one copy
-                            # (32 stores = 4 sites x 4 heads x masked|unmasked), so it is not a
-                            # traced duplicate either. Triton's tl.atomic_add on this same GPU
-                            # is exact, so it is not the hardware.
-                            # A STORE IS IDEMPOTENT, which is why the deployed split-K path has
-                            # never shown it. Halving is exact in bf16 (one exponent step) and
-                            # makes dQ right; it does NOT recover the cost.
-                            _alo = (Vec(_alo) * _a16_half).ir_value()
-                            _ahi = (Vec(_ahi) * _a16_half).ir_value()
-                        _g3p = bf16_trunc_scored_v4(_alo).shuffle(
-                            bf16_trunc_scored_v4(_ahi), [0, 1, 2, 3]
+                        _g3p = bf16_trunc_scored_v4(_g3[i][jj]).shuffle(
+                            bf16_trunc_scored_v4(_g3[i + 1][jj]), [0, 1, 2, 3]
                         )
                         _st_fn = _g3_a16 if const_expr(WSQ_A16) else _g3_store
                         if const_expr(st_sink is None):
@@ -4368,6 +4395,8 @@ def build_flash_attn_bwd_dkdv_module(
                                 min(_first, GQA_GROUP_SIZE), min(_first + DMA_GRP, GQA_GROUP_SIZE)
                             )
                         )
+                if const_expr(_A16_TAG == 11 and WSQ_A16):
+                    _a16_mark(q_start, head_local)
                 dv_cur, dk_cur, _pf = _head_step_lds(
                     q_start,
                     apply_mask,
