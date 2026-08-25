@@ -1191,10 +1191,13 @@ def test_grouped_gemm_fp8_padded_tail_zeroed(ori_dtype, trans_b, backend):
     torch.manual_seed(42)
     device = "cuda:0"
     G, K, N = 8, 2048, 2880
-    # A raw NT tensorwise GEMM with non-128-aligned N pads the weight to ceil128(N) for
-    # a tight output; CK/hipBLASLt have no tight-output epilogue and decline by design,
-    # so dispatch falls to Triton/FlyDSL and a forced CK/hipBLASLt cannot serve it.
-    if trans_b and N % 128 != 0 and backend in (BackendType.CK, BackendType.HIPBLASLT):
+    # A non-128-aligned N pads the weight to ceil128(N) and recovers a tight output via
+    # n_real -- for both orientations: trans_b=True pads N as the output-hidden operand,
+    # and trans_b=False must pad N too because the dgrad then contracts over N (a padded,
+    # 128-aligned contraction), so its forward is tight as well. CK/hipBLASLt have no
+    # tight-output epilogue and decline by design; dispatch falls to Triton/FlyDSL and a
+    # forced CK/hipBLASLt cannot serve it.
+    if N % 128 != 0 and backend in (BackendType.CK, BackendType.HIPBLASLT):
         pytest.skip(f"{backend.name} declines the tight-output pad path (N={N} not 128-aligned)")
     group_lens = torch.tensor([4096, 0, 3072, 0, 0, 5120, 0, 0], dtype=torch.int64, device=device)
     S = int(group_lens.sum())

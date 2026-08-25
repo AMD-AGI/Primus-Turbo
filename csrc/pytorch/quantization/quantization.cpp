@@ -63,20 +63,21 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
         scale_inv = 1.0f / scale;
     } else {
         // Whole-tensor abs-amax over the real (unpadded) data -> scalar scale. Block
-        // partials fill [0, W); the three trailing scalars pack the amax -> scale
-        // handoff into one allocation instead of four.
-        const at::IntArrayRef scalar_shape{};
-        const int64_t         w       = tensorwise_amax_workspace_elems();
-        at::Tensor            ws      = torch::empty({w + 3}, input.options().dtype(at::kFloat));
-        float                *wsp     = ws.data_ptr<float>();
-        const float           fp8_max = get_float8_max(dest_dtype);
+        // partials + the amax scalar pack into one workspace [0, W]; scale and scale_inv
+        // are their own allocations so the RETURNED scale_inv is 16-byte aligned. (A packed
+        // view at element offset W+2 has an 8200-byte storage_offset that fails
+        // torch.compile's cudagraph output-alignment assert on custom-op outputs.)
+        scale                 = torch::empty({}, input.options().dtype(at::kFloat));
+        scale_inv             = torch::empty({}, input.options().dtype(at::kFloat));
+        const int64_t w       = tensorwise_amax_workspace_elems();
+        at::Tensor    ws      = torch::empty({w + 1}, input.options().dtype(at::kFloat));
+        float        *wsp     = ws.data_ptr<float>();
+        const float   fp8_max = get_float8_max(dest_dtype);
         TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
             quantize_tensorwise_amax_scale_impl<InT>(
                 reinterpret_cast<const InT *>(input.data_ptr()), input.numel(), fp8_max, wsp + w,
-                wsp + w + 1, wsp + w + 2, wsp, stream);
+                scale.data_ptr<float>(), scale_inv.data_ptr<float>(), wsp, stream);
         });
-        scale     = ws.as_strided(scalar_shape, scalar_shape, w + 1);
-        scale_inv = ws.as_strided(scalar_shape, scalar_shape, w + 2);
     }
 
     // Output: last dim K -> Kp (Kp == K when padding_align_size divides K).
