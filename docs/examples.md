@@ -22,7 +22,6 @@ This page shows usage of **Primus-Turbo**.
   - [5.1 Backend Selection](#51-backend-selection)
   - [5.2 AutoTune](#52-autotune)
   - [5.3 Environment Variables](#53-environment-variables)
-  - [5.4 Explicit Gluon Forward Attention](#54-explicit-gluon-forward-attention)
 
 
 ## 1. Operators
@@ -696,55 +695,3 @@ export PRIMUS_TURBO_GEMM_BACKEND=autotune
 # AutoTune FP8 Grouped GEMM only; every other precision uses CK.
 export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=fp8:autotune,other:ck
 ```
-
-### 5.4 Explicit Gluon Forward Attention
-
-The Gluon dense attention example is an opt-in forward path for exactly an AMD
-`gfx950` device. Select it explicitly for a forward workload:
-
-```bash
-PRIMUS_TURBO_ATTN_BACKEND=GLUON python your_forward_workload.py
-```
-
-The same selection can be made programmatically while continuing to use the
-public `flash_attn_func` API:
-
-```python
-import torch
-import primus_turbo.pytorch as turbo
-from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
-
-device = "cuda:0"  # an AMD gfx950 device
-dtype = torch.bfloat16  # torch.float16 is also supported
-B, Sq, Skv, Hq, Hkv, D = 2, 1024, 2048, 32, 8, 128
-
-q = torch.randn((B, Sq, Hq, D), device=device, dtype=dtype)       # contiguous BSHD
-k = torch.randn((B, Skv, Hkv, D), device=device, dtype=dtype)
-v = torch.randn((B, Skv, Hkv, D), device=device, dtype=dtype)
-
-GlobalBackendManager.set_attn_backend(BackendType.GLUON)
-try:
-    with torch.inference_mode():
-        o = turbo.ops.flash_attn_func(q, k, v, causal=True)
-finally:
-    GlobalBackendManager.set_attn_backend(None)
-```
-
-Gluon accepts dense rank-4 FP16/BF16 Q/K/V with matching public layout:
-contiguous BSHD tensors or BHSD-backed tensors whose transposed storage is
-contiguous (all three tensors must use the same layout). MHA,
-GQA, and MQA head counts are valid when `Hq` is divisible by `Hkv`; head
-dimension `D` must be at most 256. Both causal and noncausal calls are supported,
-but causal calls require `Sq <= Skv`. Dropout, bias, ALiBi slopes, sinks,
-windows, and probability-matrix (`return_attn_probs`) output are unsupported.
-
-Gluon does not implement varlen/THD attention. Because dense and varlen
-attention share the same backend setting, an explicit `GLUON` selection makes
-the varlen dispatcher fail before launch; it is not silently ignored or
-replaced by a fallback. Clear the setting or select `FLYDSL`/`AITER` before
-calling `flash_attn_varlen_func`. For dense `flash_attn_func`, unsupported
-pinned calls also fail during validation before a kernel launch. This backend
-is forward-only: calls that require gradients for Q, K, or V fail before
-launch, so use `torch.inference_mode()`/`torch.no_grad()` and do not call
-`backward()` on Gluon outputs. Gluon is not the default backend, a fallback, or
-a cross-backend AutoTune candidate in this version.

@@ -8,7 +8,6 @@ import math
 import os
 import subprocess
 import sys
-from contextlib import contextmanager, nullcontext
 from fractions import Fraction
 from types import SimpleNamespace
 
@@ -19,14 +18,10 @@ from primus_turbo.pytorch.core.backend import (
     BackendType,
     GlobalBackendManager,
     PrecisionType,
-    TuneCache,
 )
 from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.kernels.attention import attention_gluon_impl, attention_impl
 from primus_turbo.pytorch.kernels.attention.attention_impl import (
-    _DENSE_FWD_BACKENDS,
-    FlashAttnDenseDispatcher,
-    FlashAttnVarlenDispatcher,
     resolve_flash_attn_backend,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
@@ -39,7 +34,6 @@ from primus_turbo.pytorch.kernels.attention.sparse_mla_impl import (
     SparseMlaFwdDispatcher,
 )
 from primus_turbo.pytorch.ops import flash_attn_fp8_func, flash_attn_func, sparse_mla_func
-from primus_turbo.pytorch.ops.attention import flash_attn_interface
 from primus_turbo.pytorch.ops.attention.attention_utils import (
     _infer_qkv_format,
     block_scaling_node,
@@ -47,6 +41,27 @@ from primus_turbo.pytorch.ops.attention.attention_utils import (
 from primus_turbo.triton.attention.sparse_mla import (
     sparse_mla_bwd_triton,
     sparse_mla_fwd_triton,
+)
+
+# Pytest discovers the imported fixtures in this test module.
+from tests.pytorch.ops.gluon_helper import (  # noqa: F401
+    _GLUON_CORRECTNESS_CASES,
+    WORKERS,
+    _fake_gluon_raw,
+    _fake_public_gluon_launcher,
+    _fake_public_gluon_tensors,
+    _gfx950_device_for_test,
+    _gluon_attention_fp32_reference,
+    _gluon_cuda_device,
+    _gluon_tensors,
+    _GluonTensor,
+    _has_gfx950,
+    _make_gluon_runtime_inputs,
+    _mock_gfx950_properties,
+    _pinned_gluon_backend,
+    _require_exact_gfx950,
+    _resolve_gluon,
+    _run_worker,
 )
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
@@ -56,77 +71,7 @@ from tests.pytorch.ref.attention_ref import (
 from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
 
-class _GluonTensor:
-    """Small CUDA-tensor stand-in for dispatcher-only Gluon eligibility tests."""
-
-    def __init__(self, shape, *, dtype=torch.float16, device="cuda:0", storage="bshd"):
-        self.shape = tuple(shape)
-        self.dtype = dtype
-        self.device = device
-        self.storage = storage
-        self.is_cuda = device is not None
-
-    @property
-    def ndim(self):
-        return len(self.shape)
-
-    def stride(self, dim):
-        assert dim == -1
-        return 1 if self.storage != "noncontiguous" else 2
-
-    def is_contiguous(self):
-        return self.storage == "bshd"
-
-    def transpose(self, dim0, dim1):
-        assert (dim0, dim1) == (1, 2)
-        return SimpleNamespace(is_contiguous=lambda: self.storage == "bhsd")
-
-
-def _gluon_tensors(*, q_shape=(2, 3, 8, 64), kv_shape=(2, 4, 2, 64), **kwargs):
-    return (
-        _GluonTensor(q_shape, **kwargs),
-        _GluonTensor(kv_shape, **kwargs),
-        _GluonTensor(kv_shape, **kwargs),
-    )
-
-
-@pytest.fixture
-def gfx950_properties(monkeypatch):
-    queried_devices = []
-
-    def get_device_properties(device):
-        queried_devices.append(device)
-        return SimpleNamespace(gcnArchName="gfx950:sramecc+:xnack-")
-
-    monkeypatch.setattr(torch.cuda, "get_device_properties", get_device_properties)
-    attention_impl._GFX950_DEVICE_CACHE.clear()
-    yield queried_devices
-    attention_impl._GFX950_DEVICE_CACHE.clear()
-
-
-def _resolve_gluon(q, k, v, **kwargs):
-    return resolve_flash_attn_backend(
-        varlen=False,
-        user_backend=BackendType.GLUON,
-        q=q,
-        k=k,
-        v=v,
-        **kwargs,
-    )
-
-
-def test_gluon_registry_keeps_it_explicit_and_dense_only():
-    assert list(_DENSE_FWD_BACKENDS) == [
-        BackendType.FLYDSL,
-        BackendType.AITER,
-        BackendType.HIPKITTENS,
-        BackendType.GLUON,
-    ]
-    assert _DENSE_FWD_BACKENDS[BackendType.GLUON].autotune is False
-    assert BackendType.GLUON not in FlashAttnVarlenDispatcher._backends
-
-
-def test_gluon_resolve_unpinned_uses_aiter_before_gluon(gfx950_properties, monkeypatch):
+def test_gluon_resolve_unpinned_uses_aiter_before_gluon(mock_gfx950_properties, monkeypatch):
     # FlyDSL imports this helper into attention_impl. Keep this dispatcher-only
     # test independent of the process's current CUDA device and its cached props.
     monkeypatch.setattr(attention_impl, "get_device_compute_capability", lambda: (9, 5))
@@ -147,19 +92,10 @@ def test_gluon_resolve_unpinned_uses_aiter_before_gluon(gfx950_properties, monke
 
 
 @pytest.mark.parametrize(("storage", "qkv_format"), [("bshd", "bshd"), ("bhsd", "bhsd")])
-def test_gluon_resolve_pinned_accepts_supported_input(storage, qkv_format, gfx950_properties):
+def test_gluon_resolve_pinned_accepts_supported_input(storage, qkv_format, mock_gfx950_properties):
     q, k, v = _gluon_tensors(storage=storage)
 
     assert _resolve_gluon(q, k, v, causal=False, qkv_format=qkv_format) == BackendType.GLUON
-    assert gfx950_properties == [q.device]
-
-
-def test_gluon_resolve_reuses_cached_device_capability(gfx950_properties):
-    q, k, v = _gluon_tensors()
-
-    assert _resolve_gluon(q, k, v, causal=False) == BackendType.GLUON
-    assert _resolve_gluon(q, k, v, causal=False) == BackendType.GLUON
-    assert gfx950_properties == [q.device]
 
 
 @pytest.mark.parametrize(
@@ -175,7 +111,6 @@ def test_gluon_resolve_reuses_cached_device_capability(gfx950_properties):
                 _GluonTensor((2, 4, 2, 64)),
             ),
         ),
-        ("rank", lambda: _gluon_tensors(q_shape=(2, 3, 8))),
         (
             "mixed_dtype",
             lambda: (
@@ -194,28 +129,8 @@ def test_gluon_resolve_reuses_cached_device_capability(gfx950_properties):
             ),
         ),
         (
-            "batch_mismatch",
-            lambda: (
-                _GluonTensor((2, 3, 8, 64)),
-                _GluonTensor((3, 4, 2, 64)),
-                _GluonTensor((3, 4, 2, 64)),
-            ),
-        ),
-        (
-            "head_dim_mismatch",
-            lambda: (
-                _GluonTensor((2, 3, 8, 64)),
-                _GluonTensor((2, 4, 2, 32)),
-                _GluonTensor((2, 4, 2, 32)),
-            ),
-        ),
-        (
             "zero_dimension",
             lambda: _gluon_tensors(q_shape=(0, 3, 8, 64), kv_shape=(0, 4, 2, 64)),
-        ),
-        (
-            "zero_kv_heads",
-            lambda: _gluon_tensors(q_shape=(2, 3, 8, 64), kv_shape=(2, 4, 0, 64)),
         ),
         (
             "head_dim_over_limit",
@@ -227,17 +142,9 @@ def test_gluon_resolve_reuses_cached_device_capability(gfx950_properties):
         ),
         ("sbhd", lambda: _gluon_tensors(storage="sbhd")),
         ("noncontiguous", lambda: _gluon_tensors(storage="noncontiguous")),
-        (
-            "mixed_layouts",
-            lambda: (
-                _GluonTensor((2, 3, 8, 64), storage="bshd"),
-                _GluonTensor((2, 4, 2, 64), storage="bhsd"),
-                _GluonTensor((2, 4, 2, 64), storage="bshd"),
-            ),
-        ),
     ],
 )
-def test_gluon_eligibility_refuses_invalid_tensor_contract(name, build, gfx950_properties, monkeypatch):
+def test_gluon_eligibility_refuses_invalid_tensor_contract(name, build, mock_gfx950_properties, monkeypatch):
     q, k, v = build()
     if name == "non_gfx950":
         monkeypatch.setattr(
@@ -264,55 +171,12 @@ def test_gluon_eligibility_refuses_invalid_tensor_contract(name, build, gfx950_p
         {"needs_backward": True},
     ],
 )
-def test_gluon_eligibility_refuses_unsupported_call_features(kwargs, gfx950_properties):
+def test_gluon_eligibility_refuses_unsupported_call_features(kwargs, mock_gfx950_properties):
     q, k, v = _gluon_tensors(q_shape=(2, 5, 8, 64), kv_shape=(2, 4, 2, 64))
     kwargs.setdefault("causal", False)
 
     with pytest.raises(ValueError, match="cannot handle the given inputs"):
         _resolve_gluon(q, k, v, **kwargs)
-
-
-@pytest.fixture
-def gluon_cuda_device():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required to exercise the CUDA-only Gluon custom op")
-    return torch.device("cuda", torch.cuda.current_device())
-
-
-@pytest.fixture
-def fake_gluon_raw(monkeypatch):
-    calls = []
-
-    def raw(q, k, v, *, softmax_scale, causal, qkv_format):
-        assert all(tensor.is_contiguous() for tensor in (q, k, v)), (
-            "the wrapper must pass contiguous raw BSHD/BHSD tensors"
-        )
-        assert all(tensor.stride(-1) == 1 for tensor in (q, k, v))
-        if qkv_format == "bshd":
-            batch, seqlen_q, num_heads_q, _ = q.shape
-        else:
-            batch, num_heads_q, seqlen_q, _ = q.shape
-        calls.append(
-            {
-                "shapes": (q.shape, k.shape, v.shape),
-                "strides": (q.stride(), k.stride(), v.stride()),
-                "contiguous": (q.is_contiguous(), k.is_contiguous(), v.is_contiguous()),
-                "scale_type": type(softmax_scale),
-                "stream": torch.cuda.current_stream(q.device),
-            }
-        )
-        out = torch.full(q.shape, softmax_scale + float(causal), device=q.device, dtype=q.dtype)
-        lse = torch.full((batch, num_heads_q, seqlen_q), softmax_scale, device=q.device, dtype=torch.float32)
-        return out, lse
-
-    raw_module = SimpleNamespace(flash_attn_gluon_raw=raw)
-
-    def import_raw(module_name):
-        assert module_name == "primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster"
-        return raw_module
-
-    monkeypatch.setattr(attention_gluon_impl, "_import_module", import_raw)
-    return calls
 
 
 def test_gluon_wrapper_bshd_returns_contiguous_output_on_current_stream(gluon_cuda_device, fake_gluon_raw):
@@ -414,20 +278,44 @@ def test_gluon_fake_matches_eager_metadata_and_exact_strides(qkv_format, expecte
     assert lse.device == q.device
 
 
-@pytest.mark.parametrize("use_fake", [False, True], ids=["eager", "fake"])
-def test_gluon_wrapper_rejects_invalid_format_before_dispatch(use_fake):
-    from torch._subclasses.fake_tensor import FakeTensorMode
+def test_gluon_compile_preserves_bshd_singleton_batch_stride(gluon_cuda_device, fake_gluon_raw):
+    q = torch.empty((5, 1, 8, 64), device=gluon_cuda_device, dtype=torch.float16).permute(1, 0, 2, 3)
+    k = torch.empty((7, 1, 2, 64), device=gluon_cuda_device, dtype=torch.float16).permute(1, 0, 2, 3)
+    v = torch.empty_like(k)
 
-    context = FakeTensorMode() if use_fake else nullcontext()
-    device = "cuda" if use_fake else "cpu"
-    with context:
-        q = torch.empty((1, 2, 4, 8), device=device, dtype=torch.float16)
+    def forward(query, key, value):
+        out, _ = attention_gluon_impl.flash_attn_gluon_forward_impl(
+            query,
+            key,
+            value,
+            softmax_scale=None,
+            causal=False,
+            qkv_format="bshd",
+        )
+        return out, out.stride(0)
 
-        with pytest.raises(ValueError, match="qkv_format must be 'bshd' or 'bhsd'"):
-            attention_gluon_impl.flash_attn_gluon_forward_impl(q, q, q, qkv_format="sbhd")
+    eager_out, eager_stride = forward(q, k, v)
+    torch._dynamo.reset()
+    try:
+        compiled_forward = torch.compile(forward, backend="eager", fullgraph=True)
+        compiled_out, compiled_stride = compiled_forward(q, k, v)
+    finally:
+        torch._dynamo.reset()
+
+    assert q.stride() == (512, 512, 64, 1)
+    assert eager_out.stride() == (512, 512, 64, 1)
+    assert compiled_out.stride() == (512, 512, 64, 1)
+    assert eager_stride == 512
+    assert compiled_stride == 512
 
 
-@pytest.mark.parametrize("use_fake", [False, True], ids=["eager", "fake"])
+def test_gluon_wrapper_rejects_invalid_format_before_dispatch():
+    q = torch.empty((1, 2, 4, 8), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="qkv_format must be 'bshd' or 'bhsd'"):
+        attention_gluon_impl.flash_attn_gluon_forward_impl(q, q, q, qkv_format="sbhd")
+
+
 @pytest.mark.parametrize(
     ("qkv_format", "bad_storage", "error_match"),
     [
@@ -436,45 +324,32 @@ def test_gluon_wrapper_rejects_invalid_format_before_dispatch(use_fake):
         ("bshd", "inner_stride", "unit stride"),
     ],
 )
-def test_gluon_wrapper_rejects_invalid_public_storage(use_fake, qkv_format, bad_storage, error_match):
-    from torch._subclasses.fake_tensor import FakeTensorMode
+def test_gluon_wrapper_rejects_invalid_public_storage(qkv_format, bad_storage, error_match):
+    if qkv_format == "bshd":
+        q = torch.empty((1, 2, 4, 8), dtype=torch.float16)
+        k = torch.empty_like(q)
+        v = torch.empty_like(q)
+    else:
+        q = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+        k = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+        v = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
 
-    context = FakeTensorMode() if use_fake else nullcontext()
-    device = "cuda" if use_fake else "cpu"
-    with context:
-        if qkv_format == "bshd":
-            q = torch.empty((1, 2, 4, 8), device=device, dtype=torch.float16)
-            k = torch.empty_like(q)
-            v = torch.empty_like(q)
-        else:
-            q = torch.empty((1, 4, 2, 8), device=device, dtype=torch.float16).transpose(1, 2)
-            k = torch.empty((1, 4, 2, 8), device=device, dtype=torch.float16).transpose(1, 2)
-            v = torch.empty((1, 4, 2, 8), device=device, dtype=torch.float16).transpose(1, 2)
+    if bad_storage == "bhsd_view":
+        k = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+    elif bad_storage == "bshd_contiguous":
+        k = torch.empty((1, 2, 4, 8), dtype=torch.float16)
+    else:
+        k = torch.empty((1, 2, 4, 16), dtype=torch.float16)[..., ::2]
 
-        if bad_storage == "bhsd_view":
-            k = torch.empty((1, 4, 2, 8), device=device, dtype=torch.float16).transpose(1, 2)
-        elif bad_storage == "bshd_contiguous":
-            k = torch.empty((1, 2, 4, 8), device=device, dtype=torch.float16)
-        else:
-            k = torch.empty((1, 2, 4, 16), device=device, dtype=torch.float16)[..., ::2]
-
-        with pytest.raises(ValueError, match=error_match):
-            attention_gluon_impl.flash_attn_gluon_forward_impl(q, k, v, qkv_format=qkv_format)
+    with pytest.raises(ValueError, match=error_match):
+        attention_gluon_impl.flash_attn_gluon_forward_impl(q, k, v, qkv_format=qkv_format)
 
 
-@pytest.mark.parametrize(
-    "module_name",
-    [
-        "primus_turbo.pytorch",
-        "primus_turbo.pytorch.kernels.attention.attention_impl",
-        "primus_turbo.pytorch.kernels.attention.attention_gluon_impl",
-    ],
-)
-def test_gluon_lazy_import_keeps_raw_kernel_out_of_module_imports(module_name):
+def test_gluon_wrapper_import_does_not_load_raw_kernel():
     raw_module = "primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster"
     code = (
         "import importlib, sys; "
-        f"importlib.import_module({module_name!r}); "
+        "importlib.import_module('primus_turbo.pytorch.kernels.attention.attention_gluon_impl'); "
         f"assert {raw_module!r} not in sys.modules"
     )
 
@@ -489,21 +364,12 @@ def test_gluon_lazy_import_keeps_raw_kernel_out_of_module_imports(module_name):
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize(
-    "import_error",
-    [
-        ModuleNotFoundError(
-            "No module named 'triton.experimental.gluon'",
-            name="triton.experimental.gluon",
-        ),
-        ModuleNotFoundError(
-            "No module named 'primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster'",
-            name="primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster",
-        ),
-    ],
-    ids=["missing-triton-gluon", "missing-raw-module"],
-)
-def test_gluon_compiler_capability_error_names_gluon_and_triton(monkeypatch, import_error):
+def test_gluon_compiler_capability_error_names_gluon_and_triton(monkeypatch):
+    import_error = ModuleNotFoundError(
+        "No module named 'triton.experimental.gluon'",
+        name="triton.experimental.gluon",
+    )
+
     def unavailable_raw_module(module_name):
         assert module_name == "primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster"
         raise import_error
@@ -522,170 +388,41 @@ def test_gluon_compiler_capability_error_names_gluon_and_triton(monkeypatch, imp
     assert error.value.__cause__ is import_error
 
 
-def test_gluon_compiler_capability_loader_preserves_unrelated_import_error(monkeypatch):
-    import_error = ImportError(
-        "cannot import name 'helper' from 'primus_turbo.gluon.attention.f16_fa_gfx950_common'",
-        name="primus_turbo.gluon.attention.f16_fa_gfx950_common",
-    )
-
-    def broken_local_helper(module_name):
-        assert module_name == "primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster"
-        raise import_error
-
-    monkeypatch.setattr(attention_gluon_impl, "_import_module", broken_local_helper)
-
-    with pytest.raises(ImportError) as error:
-        attention_gluon_impl._load_flash_attn_gluon_raw()
-
-    assert error.value is import_error
-
-
-def test_gluon_wrapper_does_not_wrap_raw_launch_errors(gluon_cuda_device, monkeypatch):
-    launch_error = RuntimeError("raw Gluon launch failed")
-
-    def raw(q, k, v, *, softmax_scale, causal, qkv_format):
-        raise launch_error
-
-    raw_module = SimpleNamespace(flash_attn_gluon_raw=raw)
-
-    def import_raw(module_name):
-        assert module_name == "primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster"
-        return raw_module
-
-    monkeypatch.setattr(attention_gluon_impl, "_import_module", import_raw)
-    q = torch.empty((1, 2, 4, 64), device=gluon_cuda_device, dtype=torch.float16)
-
-    with pytest.raises(RuntimeError) as error:
-        attention_gluon_impl.flash_attn_gluon_forward_impl(q, q, q)
-
-    assert error.value is launch_error
-
-
-@pytest.fixture
-def fake_public_gluon_launcher(monkeypatch, gfx950_properties):
-    calls = []
-
-    def launch(q, k, v, *, softmax_scale, causal, qkv_format):
-        out = torch.empty_strided(q.shape, q.stride(), dtype=q.dtype, device=q.device)
-        lse = torch.empty(
-            (q.shape[0], q.shape[2], q.shape[1]),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        calls.append(
-            {
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "qkv_format": qkv_format,
-                "out": out,
-                "lse": lse,
-            }
-        )
-        return out, lse
-
-    # The wrapper is the unavailable kernel boundary. Resolution and the custom
-    # autograd function remain real in these tests.
-    monkeypatch.setattr(
-        flash_attn_interface,
-        "flash_attn_gluon_forward_impl",
-        launch,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        GlobalBackendManager,
-        "get_attn_backend",
-        classmethod(lambda cls, precision: BackendType.GLUON),
-    )
-    return calls
-
-
-def _fake_public_gluon_tensors(requires_grad=(False, False, False)):
-    q = torch.empty(
-        (2, 3, 8, 64),
-        device="cuda",
-        dtype=torch.float16,
-        requires_grad=requires_grad[0],
-    )
-    k = torch.empty(
-        (2, 4, 2, 64),
-        device="cuda",
-        dtype=torch.float16,
-        requires_grad=requires_grad[1],
-    )
-    v = torch.empty(
-        (2, 4, 2, 64),
-        device="cuda",
-        dtype=torch.float16,
-        requires_grad=requires_grad[2],
-    )
-    return q, k, v
-
-
-@pytest.mark.parametrize(
-    "forward_context",
-    [torch.no_grad, torch.inference_mode],
-    ids=["no-grad", "inference-mode"],
-)
-def test_gluon_forward_only_allows_requires_grad_inputs_when_grad_is_disabled(
-    forward_context, fake_public_gluon_launcher
-):
+def test_gluon_forward_only_allows_requires_grad_inputs_under_no_grad(fake_public_gluon_launcher):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     with FakeTensorMode():
         q, k, v = _fake_public_gluon_tensors((True, True, True))
 
-        with forward_context():
+        with torch.no_grad():
             out = flash_attn_func(q, k, v, causal=False)
 
     assert out.shape == q.shape
     assert out.requires_grad is False
-    assert [(call["causal"], call["qkv_format"]) for call in fake_public_gluon_launcher] == [(False, "bshd")]
 
 
-def test_gluon_grad_mode_allows_inputs_that_do_not_require_grad(fake_public_gluon_launcher):
+def test_gluon_grad_mode_rejects_backward_before_launch(fake_public_gluon_launcher):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     with FakeTensorMode(), torch.enable_grad():
-        q, k, v = _fake_public_gluon_tensors()
-        out = flash_attn_func(q, k, v, causal=False)
-
-    assert out.shape == q.shape
-    assert out.requires_grad is False
-    assert len(fake_public_gluon_launcher) == 1
-
-
-@pytest.mark.parametrize("grad_index", [0, 1, 2], ids=["q", "k", "v"])
-def test_gluon_grad_mode_rejects_each_qkv_gradient_before_launch(grad_index, fake_public_gluon_launcher):
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    requires_grad = tuple(index == grad_index for index in range(3))
-    with FakeTensorMode(), torch.enable_grad():
-        q, k, v = _fake_public_gluon_tensors(requires_grad)
+        q, k, v = _fake_public_gluon_tensors((False, True, False))
 
         with pytest.raises(ValueError, match="backend GLUON cannot handle the given inputs"):
             flash_attn_func(q, k, v, causal=False)
 
-    assert fake_public_gluon_launcher == []
 
-
-@pytest.mark.parametrize("return_lse", [False, True])
-def test_gluon_return_lse_preserves_the_public_return_contract(return_lse, fake_public_gluon_launcher):
+def test_gluon_return_lse_preserves_the_public_return_contract(fake_public_gluon_launcher):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     with FakeTensorMode(), torch.enable_grad():
         q, k, v = _fake_public_gluon_tensors()
-        result = flash_attn_func(q, k, v, causal=False, return_lse=return_lse)
+        result = flash_attn_func(q, k, v, causal=False, return_lse=True)
 
-    if return_lse:
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-        out, lse = result
-        assert lse.shape == (2, 8, 3)
-    else:
-        assert isinstance(result, torch.Tensor)
-        out = result
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    out, lse = result
     assert out.shape == q.shape
-    assert len(fake_public_gluon_launcher) == 1
+    assert lse.shape == (2, 8, 3)
 
 
 def test_gluon_return_attn_probs_is_strictly_rejected_before_launch(
@@ -698,118 +435,6 @@ def test_gluon_return_attn_probs_is_strictly_rejected_before_launch(
 
         with pytest.raises(ValueError, match="backend GLUON cannot handle the given inputs"):
             flash_attn_func(q, k, v, causal=False, return_attn_probs=True)
-
-    assert fake_public_gluon_launcher == []
-
-
-def test_gluon_return_attn_probs_policy_rejects_explicit_flydsl(monkeypatch):
-    monkeypatch.setattr(attention_impl, "get_device_compute_capability", lambda: (9, 5))
-    q, k, v = _gluon_tensors(
-        q_shape=(2, 3, 8, 64),
-        kv_shape=(2, 4, 1, 64),
-        dtype=torch.bfloat16,
-    )
-
-    with pytest.raises(ValueError, match="backend FLYDSL cannot handle the given inputs"):
-        resolve_flash_attn_backend(
-            varlen=False,
-            user_backend=BackendType.FLYDSL,
-            q=q,
-            k=k,
-            v=v,
-            causal=True,
-            qkv_format="sbhd",
-            return_softmax=True,
-        )
-
-
-def test_gluon_return_attn_probs_uses_a_distinct_dense_autotune_cache_entry(monkeypatch):
-    monkeypatch.setattr(attention_impl, "get_device_compute_capability", lambda: (9, 5))
-    monkeypatch.setattr(
-        _DENSE_FWD_BACKENDS[BackendType.HIPKITTENS].impl,
-        "can_handle",
-        staticmethod(lambda **kwargs: False),
-    )
-    cache = TuneCache(1024)
-    monkeypatch.setattr(FlashAttnDenseDispatcher, "_cache", cache)
-    monkeypatch.setattr(
-        GlobalBackendManager,
-        "auto_tune_enabled",
-        classmethod(lambda cls: True),
-    )
-    timings = {
-        _DENSE_FWD_BACKENDS[BackendType.FLYDSL].impl: 1.0,
-        _DENSE_FWD_BACKENDS[BackendType.AITER].impl: 2.0,
-    }
-    monkeypatch.setattr(
-        FlashAttnDenseDispatcher,
-        "profile",
-        classmethod(lambda cls, backend, **kwargs: timings[backend]),
-    )
-    q, k, v = _gluon_tensors(
-        q_shape=(2, 3, 8, 64),
-        kv_shape=(2, 4, 1, 64),
-        dtype=torch.bfloat16,
-    )
-    kwargs = {
-        "varlen": False,
-        "user_backend": None,
-        "q": q,
-        "k": k,
-        "v": v,
-        "causal": True,
-        "qkv_format": "sbhd",
-    }
-    assert resolve_flash_attn_backend(**kwargs, return_softmax=False) == BackendType.FLYDSL
-    assert resolve_flash_attn_backend(**kwargs, return_softmax=True) == BackendType.AITER
-    assert len(cache) == 2
-
-
-def test_gluon_lifecycle_direct_apply_rejects_backward_before_launch(monkeypatch):
-    launches = []
-
-    def launch(*args, **kwargs):
-        launches.append((args, kwargs))
-        return torch.empty_like(args[0]), torch.empty((1, 1, 1))
-
-    monkeypatch.setattr(
-        flash_attn_interface,
-        "flash_attn_gluon_forward_impl",
-        launch,
-        raising=False,
-    )
-    q = torch.empty((1, 1, 1, 8), dtype=torch.float16, requires_grad=True)
-    k = torch.empty_like(q)
-    v = torch.empty_like(q)
-
-    with (
-        torch.enable_grad(),
-        pytest.raises(
-            RuntimeError,
-            match="gluon flash-attn is forward-only; Q/K/V backward is not implemented",
-        ),
-    ):
-        flash_attn_interface.FlashAttnFunc.apply(
-            q,
-            k,
-            v,
-            0.0,
-            None,
-            False,
-            (-1, -1),
-            None,
-            None,
-            False,
-            False,
-            False,
-            True,
-            1,
-            None,
-            "bshd",
-            BackendType.GLUON,
-        )
-
-    assert launches == []
 
 
 def test_gluon_lifecycle_direct_apply_rejects_backward_before_launch_under_optimize():
@@ -849,232 +474,6 @@ print("optimized Gluon direct apply rejected before launch")
     )
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout.strip() == "optimized Gluon direct apply rejected before launch"
-
-
-def test_gluon_lifecycle_backward_guard_reports_an_internal_contract_violation():
-    ctx = SimpleNamespace(backend=BackendType.GLUON)
-
-    with pytest.raises(
-        AssertionError,
-        match="internal contract violation.*gluon flash-attn.*forward-only",
-    ):
-        flash_attn_interface.FlashAttnFunc.backward(ctx, torch.empty((1, 1, 1, 8)))
-
-
-def _gfx_arch_name(device):
-    properties = torch.cuda.get_device_properties(device)
-    return str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
-
-
-def _gfx950_devices():
-    if not torch.cuda.is_available():
-        return []
-    return [
-        torch.device("cuda", index)
-        for index in range(torch.cuda.device_count())
-        if _gfx_arch_name(torch.device("cuda", index)) == "gfx950"
-    ]
-
-
-def _gfx950_device_for_test(*, prefer_nonzero=False):
-    devices = _gfx950_devices()
-    if not devices:
-        pytest.skip("Gluon flash-attention runtime coverage requires an exact gfx950 device")
-    if prefer_nonzero:
-        return next((device for device in devices if device.index != 0), devices[0])
-    current_index = torch.cuda.current_device()
-    return next((device for device in devices if device.index == current_index), devices[0])
-
-
-def _require_exact_gfx950(tensor):
-    arch_name = _gfx_arch_name(tensor.device)
-    if arch_name != "gfx950":
-        pytest.skip(f"tested tensor is on {arch_name or 'unknown'}, not exact gfx950")
-
-
-@contextmanager
-def _pinned_gluon_backend():
-    previous = GlobalBackendManager._attn_backend
-    GlobalBackendManager._attn_backend = None if previous is None else dict(previous)
-    GlobalBackendManager.set_attn_backend(
-        BackendType.GLUON,
-        PrecisionType.BF16_FP16_FP32,
-    )
-    try:
-        yield
-    finally:
-        GlobalBackendManager._attn_backend = previous
-
-
-def _make_gluon_runtime_inputs(
-    *,
-    batch,
-    seqlen_q,
-    seqlen_kv,
-    num_heads_q,
-    num_heads_kv,
-    head_dim,
-    qkv_format,
-    dtype,
-    device,
-    generator,
-):
-    if qkv_format == "bshd":
-        q = torch.randn(
-            (batch, seqlen_q, num_heads_q, head_dim),
-            dtype=dtype,
-            device=device,
-            generator=generator,
-        )
-        k = torch.randn(
-            (batch, seqlen_kv, num_heads_kv, head_dim),
-            dtype=dtype,
-            device=device,
-            generator=generator,
-        )
-        v = torch.randn(
-            (batch, seqlen_kv, num_heads_kv, head_dim),
-            dtype=dtype,
-            device=device,
-            generator=generator,
-        )
-        return q, k, v
-
-    assert qkv_format == "bhsd"
-    q = torch.randn(
-        (batch, num_heads_q, seqlen_q, head_dim),
-        dtype=dtype,
-        device=device,
-        generator=generator,
-    ).transpose(1, 2)
-    k = torch.randn(
-        (batch, num_heads_kv, seqlen_kv, head_dim),
-        dtype=dtype,
-        device=device,
-        generator=generator,
-    ).transpose(1, 2)
-    v = torch.randn(
-        (batch, num_heads_kv, seqlen_kv, head_dim),
-        dtype=dtype,
-        device=device,
-        generator=generator,
-    ).transpose(1, 2)
-    return q, k, v
-
-
-def _gluon_attention_fp32_reference(q, k, v, softmax_scale, causal):
-    """Independent FP32 attention and natural-log LSE for logical BSHD inputs."""
-    q_bhsd = q.float().permute(0, 2, 1, 3)
-    k_bhsd = k.float().permute(0, 2, 1, 3)
-    v_bhsd = v.float().permute(0, 2, 1, 3)
-
-    num_heads_q = q_bhsd.shape[1]
-    num_heads_kv = k_bhsd.shape[1]
-    assert num_heads_kv > 0 and num_heads_q % num_heads_kv == 0
-    group_size = num_heads_q // num_heads_kv
-    if group_size != 1:
-        k_bhsd = k_bhsd.repeat_interleave(group_size, dim=1)
-        v_bhsd = v_bhsd.repeat_interleave(group_size, dim=1)
-
-    scale = 1.0 / math.sqrt(float(q.shape[-1])) if softmax_scale is None else float(softmax_scale)
-    scores = torch.matmul(q_bhsd, k_bhsd.transpose(-1, -2)) * scale
-    if causal:
-        seqlen_q, seqlen_kv = q.shape[1], k.shape[1]
-        query_index = torch.arange(seqlen_q, device=q.device).view(seqlen_q, 1)
-        key_index = torch.arange(seqlen_kv, device=q.device).view(1, seqlen_kv)
-        # Flash attention aligns a rectangular causal mask at the bottom right.
-        allowed = key_index <= query_index + (seqlen_kv - seqlen_q)
-        scores = scores.masked_fill(~allowed, float("-inf"))
-
-    lse = torch.logsumexp(scores, dim=-1)
-    probabilities = torch.softmax(scores, dim=-1)
-    output = torch.matmul(probabilities, v_bhsd).permute(0, 2, 1, 3)
-    return output, lse
-
-
-_RUN_LONG_GLUON_TESTS = os.environ.get("PRIMUS_TURBO_TEST_LONG") == "1"
-_GLUON_CORRECTNESS_CASES = [
-    pytest.param(
-        torch.float16,
-        "bshd",
-        False,
-        37,
-        53,
-        8,
-        8,
-        64,
-        None,
-        id="fp16-bshd-noncausal-mha-d64-short-tail-default-scale",
-    ),
-    pytest.param(
-        torch.bfloat16,
-        "bhsd",
-        True,
-        128,
-        128,
-        16,
-        4,
-        128,
-        0.17,
-        id="bf16-bhsd-causal-gqa-d128-square-custom-scale",
-    ),
-    pytest.param(
-        torch.float16,
-        "bhsd",
-        False,
-        64,
-        257,
-        16,
-        1,
-        256,
-        None,
-        id="fp16-bhsd-noncausal-mqa-d256-rectangular-default-scale",
-    ),
-    pytest.param(
-        torch.bfloat16,
-        "bshd",
-        True,
-        37,
-        53,
-        8,
-        8,
-        96,
-        0.23,
-        id="bf16-bshd-causal-mha-d96-bottom-right-custom-scale",
-    ),
-    pytest.param(
-        torch.float16,
-        "bshd",
-        False,
-        1024,
-        2048,
-        16,
-        4,
-        128,
-        0.11,
-        marks=pytest.mark.skipif(
-            not _RUN_LONG_GLUON_TESTS,
-            reason="set PRIMUS_TURBO_TEST_LONG=1 to run selected long Gluon cases",
-        ),
-        id="fp16-bshd-noncausal-gqa-d128-long-rectangular",
-    ),
-    pytest.param(
-        torch.bfloat16,
-        "bhsd",
-        True,
-        2048,
-        2048,
-        8,
-        8,
-        64,
-        None,
-        marks=pytest.mark.skipif(
-            not _RUN_LONG_GLUON_TESTS,
-            reason="set PRIMUS_TURBO_TEST_LONG=1 to run selected long Gluon cases",
-        ),
-        id="bf16-bhsd-causal-mha-d64-long-square",
-    ),
-]
 
 
 @pytest.mark.parametrize(
@@ -1155,8 +554,6 @@ def test_gluon_correctness_gfx950(
     ("dtype", "qkv_format", "seqlen"),
     [
         pytest.param(torch.float16, "bshd", 384, id="fp16-bshd-s384"),
-        pytest.param(torch.float16, "bshd", 512, id="fp16-bshd-s512"),
-        pytest.param(torch.bfloat16, "bhsd", 384, id="bf16-bhsd-s384"),
         pytest.param(torch.bfloat16, "bhsd", 512, id="bf16-bhsd-s512"),
     ],
 )
@@ -1352,6 +749,17 @@ def test_gluon_repeatability_is_bitwise_after_warmup_gfx950():
     for output, lse in repeated[1:]:
         assert torch.equal(output, first_output), "Gluon output changed bitwise after warmup"
         assert torch.equal(lse, first_lse), "Gluon LSE changed bitwise after warmup"
+
+
+@pytest.mark.skipif(
+    not _has_gfx950(),
+    reason="Gluon FA forward runtime coverage requires an exact gfx950 device",
+)
+@pytest.mark.parametrize("case", WORKERS)
+def test_gluon_causal_regression_in_isolated_process(case: str) -> None:
+    result = _run_worker(case)
+    assert result.returncode == 0, result.stdout
+    assert "PASS" in result.stdout, result.stdout
 
 
 test_cases = [

@@ -2597,12 +2597,46 @@ def get_gluon_autotune_configs():
     return get_gluon_cdna_autotune_configs()
 
 
-def prune_unsafe_causal_configs(configs, named_args, **kwargs):
-    """Exclude the unsafe causal stage-2 async pipeline when unsupported."""
+def prune_unsafe_configs(configs, named_args, **kwargs):
+    """Exclude async-pipeline configurations unsupported by the launch."""
     is_causal = kwargs.get("IS_CAUSAL", named_args.get("IS_CAUSAL", False))
-    if _HAS_WARP_PREDICATE or not is_causal:
+    actual_block_dmodel = kwargs.get(
+        "ACTUAL_BLOCK_DMODEL",
+        named_args.get("ACTUAL_BLOCK_DMODEL"),
+    )
+    unsafe_causal_stage2 = not _HAS_WARP_PREDICATE and is_causal
+    unsafe_partial_head_dim = (
+        actual_block_dmodel is not None and actual_block_dmodel % 16 != 0
+    )
+    padded_block_dmodel = (
+        max(1 << (actual_block_dmodel - 1).bit_length(), 16)
+        if unsafe_partial_head_dim
+        else None
+    )
+    if not unsafe_causal_stage2 and not unsafe_partial_head_dim:
         return configs
-    return [config for config in configs if config.kwargs.get("NUM_STAGES") != 2]
+    # Partial 16-element head tails do not lower through the multi-stage
+    # shared-memory path. Mirror USE_PIPELINED below so non-pipelined
+    # candidates remain available in every padded head-dimension bucket.
+    return [
+        config
+        for config in configs
+        if not (unsafe_causal_stage2 and config.kwargs.get("NUM_STAGES") == 2)
+        and not (
+            unsafe_partial_head_dim
+            and config.kwargs.get("NUM_STAGES", 1) > 1
+            and padded_block_dmodel >= 64
+            and not (
+                padded_block_dmodel >= 256
+                and config.kwargs.get("BLOCK_N") >= 64
+            )
+            and not (
+                padded_block_dmodel < 128
+                and config.kwargs.get("BLOCK_N") < 64
+                and config.num_warps >= 8
+            )
+        )
+    ]
 
 
 GLUON_AUTOTUNE_KEYS = ['IS_CAUSAL', 'MAX_SEQLENS_Q', 'MAX_SEQLENS_K', 'ACTUAL_BLOCK_DMODEL', 'HQ', 'HK']
@@ -3515,7 +3549,7 @@ def _compute_attention_tile(
 @triton.autotune(
     configs=get_gluon_autotune_configs(),
     key=GLUON_AUTOTUNE_KEYS,
-    prune_configs_by={"early_config_prune": prune_unsafe_causal_configs},
+    prune_configs_by={"early_config_prune": prune_unsafe_configs},
 )
 @gluon.jit
 def gluon_attn_fwd(Q, K, V, SM_SCALE: gl.constexpr, L, Out,
