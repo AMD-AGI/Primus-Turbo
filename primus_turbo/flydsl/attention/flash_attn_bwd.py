@@ -1328,6 +1328,26 @@ def build_flash_attn_bwd_dkdv_module(
     # elsewhere: a per-q-head work-group cannot share the GQA group, so aiter's dk/dv leave
     # the kernel per q head and two torch reduce_kernels (143 us) fold them.
     wsq_a16=0,
+    # wsq_cnt: PROBE (dQ is WRONG -- the counter lands on a partial dword). One device-scope
+    # atomic per (work-group, q block), which is what a progressive fold would pay to announce
+    # "this band finished this q block". The fold that a counter unlocks is worth 0.334 ms at
+    # l70b (base 3.1798 against notailred 2.8462, 81% of the whole fold), so this prices the
+    # announcement before anything is built on it. Value is the CPol aux plus one; the
+    # semantics need sc0|sc1 = 17, i.e. wsq_cnt=18 (see _probe_sem.py: sc0 alone leaves one
+    # work-group in 64 never seeing the count).
+    #
+    # Measured at l70b (B1/Hq64/Hkv8/S8192/D128), own process, min of 30, palindrome:
+    # 3.2000 / 3.2422 against 3.1994 / 3.189 -- **+0.027 ms**, i.e. 8% of the 0.334 ms the
+    # fold it would unlock is worth. The announcement is not what stands in the way.
+    #
+    # What does stand in the way is the CONSUMER. A fold work-group that polls without
+    # waiting reads one snapshot taken when it happens to run, which is at the START of the
+    # body, so a no-spin pass catches nothing; and a spin is not free of risk here: a fold
+    # wave is 24 dwords against the body's 462 (granule 464), so 464 + 2*24 = 512 fits
+    # exactly and a THIRD fold work-group on a SIMD locks the body out of it -- the spin then
+    # waits on a body that can never be scheduled. Capping the fold's waves_per_eu at 2 makes
+    # that unlikely, not impossible, and a hang needs a host-side `rocm-smi --gpureset`.
+    wsq_cnt=0,
     # wsq_rmw: PROBE (dQ/dK/dV stay EXACT -- the value read is pinned live and discarded).
     # A slot-indexed dQ partial workspace (one slot per resident work-group instead of one
     # per kv band, so nsplits falls from Skv/BLOCK_KV to that over the bands a slot owns)
@@ -1511,6 +1531,7 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_ATOMIC = int(wsq_atomic or 0)
     WSQ_ACOAL = int(wsq_acoal or 0)
     WSQ_A16 = int(wsq_a16 or 0)
+    WSQ_CNT = int(wsq_cnt or 0)
     WSQ_RMW = bool(wsq_rmw)
     KV_REFETCH = max(0, int(kv_refetch or 0))
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
@@ -2963,6 +2984,28 @@ def build_flash_attn_bwd_dkdv_module(
                         drain()
             else:
                 _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, st_sink, poff)
+            if const_expr(WSQ_CNT and head_local == GQA_GROUP_SIZE - 1):
+                # The announcement a progressive fold needs: this work-group's band has
+                # finished every head of this q block. Once per (work-group, q block) and
+                # from ONE lane, which is what the real thing costs -- 256 lanes onto one
+                # address would price contention instead. The wait is the release: the
+                # partial stores above must be visible before the count that advertises them.
+                rocdl.s_waitcnt(0)
+                _if_wave(
+                    ArithValue(lane == fx.Index(0)),
+                    [],
+                    lambda: (
+                        rocdl.raw_ptr_buffer_atomic_fadd(
+                            _raw(fx.Float32(1.0)),
+                            wsq_rsrc,
+                            ArithValue(_raw(fx.Index(0))).index_cast(fx.Int32.ir_type),
+                            0,
+                            WSQ_CNT - 1,
+                        ),
+                        [],
+                    )[1],
+                    lambda: [],
+                )
 
         def _gemm3_tiles(
             q_start, head_local, slot, drain=None, qsel=None, depth=None, st_sink=None, poff=None
