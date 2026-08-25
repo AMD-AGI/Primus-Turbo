@@ -91,18 +91,12 @@ Torch helpers deliberately *not* reused, with the reason:
   ``torch.vmap``, which raises ``RuntimeError`` ("data-dependent control flow")
   for scalar-style ``mask_mod`` callables written with Python ``and``; the probe
   helper falls back to an element-wise loop for exactly those. ``create_mask``
-  also
-  materialises the whole ``[B, H, Q_LEN, KV_LEN]`` mask, while
+  also materialises the whole ``[B, H, Q_LEN, KV_LEN]`` mask, while
   :func:`_probe_mask_row` and :func:`_locate_left_window` sample single rows on
   purpose, keeping classification of a long-sequence mask O(S log S) rather than
   O(S**2).
 * ``and_masks`` / ``or_masks`` / ``noop_mask`` are not reimplemented here either;
   callers that want them should import them from torch directly.
-
-``tools/check_flex_provenance.py`` re-derives all of the above mechanically
-(shared-name check, per-function similarity, and k-gram fingerprint overlap
-against the installed torch), so this section stays checkable rather than
-asserted.
 """
 
 import inspect
