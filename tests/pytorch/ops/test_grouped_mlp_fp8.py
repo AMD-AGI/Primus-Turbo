@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from primus_turbo.pytorch.core.low_precision import Float8QuantConfig
+from primus_turbo.pytorch.core.utils import is_gfx942
 from primus_turbo.pytorch.ops.grouped_mlp_fp8 import grouped_mlp_fp8
 from tests.pytorch.test_utils import compute_snr
 
@@ -104,6 +105,9 @@ def test_grouped_mlp_fp8(shape):
     Output and gradients in one pass: the gradients need the forward anyway, so
     splitting them would only pay for the same kernels twice.
     """
+    if is_gfx942():
+        pytest.skip("grouped_mlp_fp8 is not supported on gfx942 currently.")
+
     M, K, I, G = shape
     offs, group_lens, leaves = _mlp_leaves(M, K, I, G)
     gen = torch.Generator(device="cuda").manual_seed(7)
