@@ -40,7 +40,7 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_mxfp8_triton_kernel,
     grouped_gemm_mxfp8_variable_k_triton_kernel,
 )
-from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+from primus_turbo.triton.grouped_gemm.grouped_gemm_helper import (
     grouped_gemm_output_tail_kernel,
 )
 
@@ -1214,3 +1214,223 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     if n_real is not None:
         n = n_real
     return torch.empty((bs, m, n), device=a.device, dtype=out_dtype)
+
+
+def _check_glu_dispatch(granularity: int, trans_a: bool) -> None:
+    """The fused GLU epilogue has one scaling mode and one A layout."""
+    assert ScalingGranularity(granularity) == ScalingGranularity.TENSORWISE, (
+        f"Fused GLU grouped GEMM is tensorwise-only, got {ScalingGranularity(granularity)}"
+    )
+    assert not trans_a, "Fused GLU grouped GEMM does not support trans_a"
+
+
+def _alloc_grad_probs_partial(spec, device: torch.device) -> torch.Tensor:
+    """The grad_probs partial buffer a fused dgrad asked for.
+
+    The kernels allocate nothing, and both the shape and ``needs_zero`` follow
+    from a tiling only they know, so the spec is asked for rather than
+    reconstructed here.
+    """
+    fill = torch.zeros if spec.needs_zero else torch.empty
+    return fill(spec.shape, device=device, dtype=torch.float32)
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_glu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_fp8_glu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,  # not used
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    activation: str = "silu",
+    k_real: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fc1 grouped GEMM with the GLU activation fused into its epilogue.
+
+    Returns ``(act, intermediate)``: the activation [M, N // 2] that feeds fc2,
+    and the pre-activation [M, N] that the backward needs. ``probs`` is folded
+    into ``act`` only -- ``intermediate`` is always the unscaled GEMM output.
+    """
+    _check_glu_dispatch(granularity, trans_a)
+
+    assert is_gfx950(), "grouped_gemm_fp8_glu_impl is only supported on gfx950"
+    assert trans_b == True, "trans_b must be True for grouped_gemm_fp8_glu_impl"
+    assert a.shape[1] >= 129, "a.shape[1] must be >= 129 for grouped_gemm_fp8_glu_impl"
+
+    M = a.shape[0]
+    N = b.shape[1] if trans_b else b.shape[2]
+
+    act = torch.empty((M, N // 2), device=a.device, dtype=out_dtype)
+    intermediate = torch.empty((M, N), device=a.device, dtype=out_dtype)
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_glu_kernel import (
+        grouped_gemm_fp8_glu_tensorwise_flydsl_kernel,
+    )
+
+    return grouped_gemm_fp8_glu_tensorwise_flydsl_kernel(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        probs,
+        group_offs,
+        act,
+        intermediate,
+        trans_b=trans_b,
+        activation=activation,
+        out_dtype=out_dtype,
+        num_cu=num_cu,
+        k_real=k_real,
+    )
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_dglu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_fp8_dglu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,  # not used
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    activation: str = "silu",
+    n_real: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fc2 dgrad with the GLU activation gradient fused into its epilogue.
+
+    ``a`` is the fc2 output gradient and ``b`` the fc2 weight oriented for the
+    dgrad, so ``a @ b`` is the gradient wrt the activation; the epilogue consumes
+    it in registers against ``intermediate`` (the pre-activation the forward
+    wrote).
+
+    Returns ``(grad_intermediate, grad_probs)``: the pre-activation gradient
+    [M, 2 * N], and [M] fp32 the gradient wrt the routing probabilities -- the
+    gradient wrt the activation, taken before the probs scaling, times the
+    activation, summed over the hidden dimension. The kernels leave that sum as
+    per-tile partials and this function folds them.
+    """
+    _check_glu_dispatch(granularity, trans_a)
+
+    assert is_gfx950(), "grouped_gemm_fp8_dglu_impl is only supported on gfx950"
+    assert trans_b == False, "trans_b must be False for grouped_gemm_fp8_dglu_impl"
+    assert a.shape[1] >= 129, "a.shape[1] must be >= 129 for grouped_gemm_fp8_dglu_impl"
+
+    M = a.shape[0]
+    N_pitch = b.shape[1] if trans_b else b.shape[2]
+    N = N_pitch if n_real is None else n_real
+    assert 0 < N <= N_pitch, f"n_real={n_real} must be in (0, N_pitch={N_pitch}]"
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_glu_kernel import (
+        grouped_gemm_fp8_dglu_grad_probs_partial_spec,
+        grouped_gemm_fp8_dglu_tensorwise_flydsl_kernel,
+    )
+
+    out = torch.empty((M, N * 2), device=a.device, dtype=out_dtype)
+    grad_probs_partial = _alloc_grad_probs_partial(
+        grouped_gemm_fp8_dglu_grad_probs_partial_spec(a, b, n_real=n_real), a.device
+    )
+    grouped_gemm_fp8_dglu_tensorwise_flydsl_kernel(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        intermediate,
+        group_offs,
+        probs,
+        out,
+        grad_probs_partial,
+        trans_b=trans_b,
+        activation=activation,
+        num_cu=num_cu,
+        n_real=n_real,
+    )
+
+    return out, torch.sum(grad_probs_partial, dim=0)
+
+
+@grouped_gemm_fp8_glu_impl.register_fake
+def grouped_gemm_fp8_glu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    activation: str = "silu",
+    k_real: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _check_glu_dispatch(granularity, trans_a)
+
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype in [
+        torch.float16,
+        torch.bfloat16,
+    ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
+
+    # b holds gate||up, so its N is twice the activation's width.
+    m = a.shape[0]
+    n = b.shape[1] if trans_b else b.shape[2]
+    act = torch.empty((m, n // 2), device=a.device, dtype=out_dtype)
+    intermediate = torch.empty((m, n), device=a.device, dtype=out_dtype)
+    return act, intermediate
+
+
+@grouped_gemm_fp8_dglu_impl.register_fake
+def grouped_gemm_fp8_dglu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    activation: str = "silu",
+    n_real: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _check_glu_dispatch(granularity, trans_a)
+
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype in [
+        torch.float16,
+        torch.bfloat16,
+    ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
+
+    # This is the dgrad wrt the activation, so the gate||up gradient it writes
+    # is twice as wide. grad_probs is per-row and always fp32, whatever out_dtype is.
+    m = a.shape[0]
+    n_pitch = b.shape[1] if trans_b else b.shape[2]
+    n = n_pitch if n_real is None else n_real
+    grad_intermediate = torch.empty((m, n * 2), device=a.device, dtype=out_dtype)
+    grad_probs = torch.empty((m,), device=a.device, dtype=torch.float32)
+    return grad_intermediate, grad_probs

@@ -871,7 +871,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
             _gi = _readfirstlane_i32(group_idx)
             m_start = _lane_tbl_get(go_tbl, _gi)
             m_end = _lane_tbl_get(go_tbl, _gi + I32(1))
-            nval = ((m_end - m_start) // I32(512)) * I32(2)  # even 256-block count
+            nval = (m_end - m_start) // I32(256)  # raw zero/even/odd 256-block count
 
             a_row = block_m * I32(BLOCK_M)
             b_row = block_n * I32(BLOCK_N)
@@ -1122,12 +1122,15 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     beta=0.0,
     out=None,
 ):
-    """MXFP4 grouped variable-K wgrad (bare-asm whole-loop) -> C [G, OUT_M, OUT_N]. lhs/rhs are
-    fp4 in the colwise 512-aligned quant layout with group_offs [G+1] the matching padded offsets,
-    so the NT whole-loop runs at a runtime nval. ``beta=1.0`` accumulates into ``out``."""
+    """MXFP4 grouped variable-K wgrad (bare-asm whole-loop) -> C [G, OUT_M, OUT_N].
+
+    ``lhs``/``rhs`` use the colwise 256-aligned quant layout and ``group_offs`` contains
+    the matching padded offsets. The NT whole-loop runs at a runtime ``nval`` without an
+    on-GPU repack. ``beta=1.0`` accumulates into ``out`` instead of overwriting it.
+    """
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == OUT_M and rhs.shape[0] == OUT_N
-    M_total = lhs.shape[1] * 2  # colwise contraction width (512-padded per group by the quant)
+    M_total = lhs.shape[1] * 2  # colwise contraction width (256-padded per group by the quant)
     assert rhs.shape[1] * 2 == M_total
     dev = lhs.device
     out_fp16 = out_dtype == torch.float16

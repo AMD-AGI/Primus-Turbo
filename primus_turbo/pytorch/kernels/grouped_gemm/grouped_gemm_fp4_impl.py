@@ -38,9 +38,7 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp4_kernel import (
     grouped_gemm_mxfp4_triton_kernel,
     grouped_gemm_mxfp4_variable_k_triton_kernel,
 )
-from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
-    grouped_gemm_output_tail_kernel,
-)
+from primus_turbo.triton.grouped_gemm.grouped_gemm_helper import grouped_gemm_output_tail_kernel
 
 
 class GroupedGEMMFP4TritonBackend(KernelBackend):

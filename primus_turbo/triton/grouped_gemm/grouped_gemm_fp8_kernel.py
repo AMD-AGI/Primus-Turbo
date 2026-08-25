@@ -562,6 +562,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     trans_b: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
     n_real: "int | None" = None,
+    epilogue: str | None = None,
 ) -> torch.Tensor:
     """Persistent grouped FP8 GEMM (CPU-sync-free, per-tensor scaling) using Triton.
 
@@ -578,6 +579,10 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         group_offs: [G+1] int64 prefix sum of group lengths.
         trans_b: If True, b[g] is [N, K] (transposed).
         out_dtype: Output dtype (default bfloat16).
+        n_real: Optional unpadded output width when B uses a padded row pitch.
+        epilogue: Optional fused activation epilogue. Routed here by
+            ``GroupedGEMMFP8TritonBackend`` for TENSORWISE only; the kernel
+            validates the epilogue type.
 
     Returns:
         [M_total, N] output in out_dtype.

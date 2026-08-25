@@ -44,8 +44,10 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     S2RLoader,
     S2RLoaderShear,
     S2RLoaderTr,
+    StoreCdSwiGLUCShuffle,
     StoreCPerTensor,
     StoreCPerTensorCShuffle,
+    StoreCSwiGLU,
     _lane_tbl_count_le,
     _lane_tbl_get,
     _lane_tbl_load,
@@ -207,6 +209,8 @@ def _compile_grouped_nn(
     nn_elgk: bool = True,  # graded drain of the B transpose reads: the b0 stage rides the a0 fragment's compiler-scored wait, the b1 stage drains one tile at a time inside its mfma column. Off = one lgkmcnt(0) per stage with no mfma to cover it
     nn_esplit: int = 4,  # epilogue store schedule, see _NN_E_SCHED: how the tile's four accumulator quadrants are split into barrier-separated store batches. 0 = one 128-store burst after the trailing barrier
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
+    dglu: bool = False,  # fuse the SwiGLU gradient into the epilogue: read l1, write dl1 [M,2I] and grad_probs partials, so dact never reaches HBM
+    glu_i: int = 0,  # activation width I; the GEMM's N already equals it, so no geometry changes (unlike the fwd)
 ):
     """Persistent (CPU-sync-free) grouped NN dgrad: a fixed grid of WGs strides the tile
     space via scf.for, amortising per-WG fixed cost. ``group_m``/``group_n`` port the NT
@@ -255,9 +259,27 @@ def _compile_grouped_nn(
     # The split reorders the quadrants of the scalar epilogue; the LDS-staged CShuffle one
     # shares a single staging buffer across them and has to keep the emitted order.
     _esplit = 0 if store_cshuffle else nn_esplit
+    if dglu:
+        assert glu_i > 0 and not store_cshuffle and not beta_is_one
+        assert N == glu_i, f"dglu needs the GEMM's N to be I, got N={N} I={glu_i}"
+        # The half-N skip is fine for the pair store: the quadrant it drops is
+        # entirely past I on the boundary block, so it contributes nothing to
+        # grad_probs either, and the epilogue takes c_hi=None for it.
+        _col_safe = N > 0 and (N % BLOCK_N == 0 or (nn_halfn and N % LDS_BLOCK_N == 0))
 
     _cshuf_ty = fx.Float16 if out_fp16 else fx.BFloat16
     _cshuf_n = 8 * 16 * (N_TILES_B * 16)
+    if dglu:
+        # The staging pool and the shear's two extra A slots cannot both fit in
+        # the 160 KB that keeps this at one workgroup per CU, so the shear goes;
+        # dropping it is also what turns _cshuf_lds on. f32 because it stages
+        # dact, an input to the gradient: rounding to out_ty first would add a
+        # second rounding ahead of the math. One staging region per wave_m group
+        # (16 rows x the full 256 columns) = 32 KB, what the shear returned.
+        _kshear = False
+        _cshuf_lds = True
+        _cshuf_ty = fx.Float32
+        _cshuf_n *= 2
 
     @fx.struct
     class SharedStorage:
@@ -287,7 +309,11 @@ def _compile_grouped_nn(
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         group_offs: fx.Tensor,  # int32 view of int64 [G+1]; _load_go reads low word at i32[2*idx]
+        L1: fx.Tensor,  # dglu only: saved fc1 pre-activation [M,2I]; C is passed twice otherwise
+        PROBS: fx.Tensor,  # dglu only: routing probs [M] fp32
+        GRAD_PROBS_PARTIAL: fx.Tensor,  # dglu only: [n_blocks*2, M] fp32 grad_probs partials
         c_n: fx.Int32,
+        grad_probs_stride: fx.Int32,
     ):
         _ = str(fx.thread_idx.x)  # materialize before S2RLoaderTr (dense NN note)
         F8_IR_t = fx.Float8E4M3FN.ir_type
@@ -463,7 +489,30 @@ def _compile_grouped_nn(
             b_s2r = S2RLoaderTr(
                 wave_n, N_TILES_B, 32, inline_asm=(agpr_inplace and acc_mode == "agpr"), wswz=_nnwz
             )
-            if const_expr(store_cshuffle):
+            if const_expr(dglu):
+                store_c = StoreCdSwiGLUCShuffle(
+                    A_scale,
+                    B_scale,
+                    C,
+                    L1,
+                    PROBS,
+                    GRAD_PROBS_PARTIAL,
+                    # Every wave's rows are disjoint, so a partial slice only has
+                    # to be distinct per (column block, 16-lane half).
+                    block_n * fx.Int32(2),
+                    grad_probs_stride,
+                    m_end,
+                    glu_i,
+                    mfma.idx,
+                    N_TILES_A,
+                    N_TILES_B,
+                    _out_ty,
+                    lds.C_lds_shuffle,
+                    wave_id,
+                    col_safe=_col_safe,
+                    store_aux=cstore_aux,
+                )
+            elif const_expr(store_cshuffle):
                 store_c = StoreCPerTensorCShuffle(
                     A_scale,
                     B_scale,
@@ -704,19 +753,28 @@ def _compile_grouped_nn(
                 # Epilogue store schedule: batching each quadrant behind a barrier keeps all
                 # waves inside one row/column band (contiguous columns) instead of one spread
                 # burst. Separator must be the barrier; a vmcnt throttle drains but never aligns.
-                _store_split(
-                    store_c,
-                    (
-                        (c00, 0, 0),
-                        (c01, 0, LDS_BLOCK_N),
-                        (c10, LDS_BLOCK_M, 0),
-                        (c11, LDS_BLOCK_M, LDS_BLOCK_N),
-                    ),
-                    base_row,
-                    base_col,
-                    _esplit,
-                    _full,
-                )
+                if const_expr(dglu):
+                    # Column pairs, not quadrants: grad_probs folds c00 with c01.
+                    # The half body has no c01/c11 to fold; that quadrant is all
+                    # past I, so it contributes nothing and the epilogue skips it.
+                    _hi0 = c01 if const_expr(_full) else None
+                    _hi1 = c11 if const_expr(_full) else None
+                    store_c.store_pair(c00, _hi0, base_row, base_col, LDS_BLOCK_N)
+                    store_c.store_pair(c10, _hi1, base_row + LDS_BLOCK_M, base_col, LDS_BLOCK_N)
+                else:
+                    _store_split(
+                        store_c,
+                        (
+                            (c00, 0, 0),
+                            (c01, 0, LDS_BLOCK_N),
+                            (c10, LDS_BLOCK_M, 0),
+                            (c11, LDS_BLOCK_M, LDS_BLOCK_N),
+                        ),
+                        base_row,
+                        base_col,
+                        _esplit,
+                        _full,
+                    )
 
             # Wave-uniform runtime half-N predicate (block_n is uniform per tile).
             _nb_last = n_blocks - fx.Int32(1)
@@ -769,9 +827,58 @@ def _compile_grouped_nn(
             A_scale,
             B_scale,
             group_offs,
+            # C into the unused dglu slots so one kernel body serves both; the
+            # const_expr branches keep the emitted code identical here.
+            C,
+            C,
+            C,
             c_n,
+            fx.Int32(0),
             value_attrs=attrs,
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+
+    if const_expr(dglu):
+
+        @flyc.jit
+        def launch_grouped_nn_dglu_persistent(
+            A: fx.Tensor,
+            B: fx.Tensor,
+            DL1: fx.Tensor,
+            A_scale: fx.Tensor,
+            B_scale: fx.Tensor,
+            group_offs: fx.Tensor,
+            L1: fx.Tensor,
+            PROBS: fx.Tensor,
+            GRAD_PROBS_PARTIAL: fx.Tensor,
+            m_total: int,
+            c_n: fx.Int32,
+            grad_probs_stride: fx.Int32,
+            stream: fx.Stream,
+        ):
+            n_blocks = ceildiv(c_n, BLOCK_N)
+            upper = (ceildiv(m_total, BLOCK_M) + G) * n_blocks
+            ncus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            _cap = ncus if cap_cu <= 0 else min(int(cap_cu), ncus)
+            grid_x = arith.select(upper < _cap, upper, fx.Int32(_cap)) if persistent else upper
+            attrs = make_value_attrs(
+                waves_per_eu, 128 if (agpr_inplace and acc_mode == "agpr") else 0, "512,512"
+            )
+            kernel_grouped_nn_persistent(
+                A,
+                B,
+                DL1,
+                A_scale,
+                B_scale,
+                group_offs,
+                L1,
+                PROBS,
+                GRAD_PROBS_PARTIAL,
+                c_n,
+                grad_probs_stride,
+                value_attrs=attrs,
+            ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+
+        return launch_grouped_nn_dglu_persistent
 
     return launch_grouped_nn_persistent
 
@@ -804,6 +911,9 @@ def _compile_grouped_nt(
     n_stride: int = 0,  # >0: padded N row-count pitch for B_T (stored at [G,n_stride,KS], real width fed via N/c_n)
     nt_esplit: int = 4,  # epilogue store schedule (see _NN_E_SCHED), the twin of the NN dgrad's nn_esplit. 0 = one 128-store burst
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
+    glu: bool = False,  # fuse a SwiGLU epilogue: B_T is [2I, K] gate||up, the tile pairs the two bands in registers and writes l1 [M,2I] + act [M,I]
+    glu_i: int = 0,  # gate half width I (required when glu); N is this same I, i.e. the activation's width
+    glu_act_aux: int = 0,  # aux immediate for the act store alone (it is pure streaming output, so evict-first may pay where it would not for l1)
 ):
     """Grouped NT forward (out = a @ b^T). persistent=True: a fixed grid of WGs strides the
     tile space via scf.for (cap_cu reserves CUs for comm overlap); persistent=False: one tile
@@ -829,24 +939,50 @@ def _compile_grouped_nt(
     b_lds_size = LDS_BLOCK_N * BLOCK_K
     KS = k_stride if k_stride else K  # addressing row stride (>= K); compute dim stays K
     assert KS >= K
+    # GLU mode retiles the N axis. A tile owns _NBLK = LDS_BLOCK_N columns of the
+    # *gate* half and pairs them with the same columns of the up half, so its two B
+    # LDS pools hold two 128-column *bands* of B_T (offset I apart) rather than the
+    # two halves of one 256-wide block. Total tiles are unchanged -- ceildiv(I, 128)
+    # equals ceildiv(2I, 256) -- so the mainloop does the same work; only where the
+    # second pool reads and where the results land differ.
+    if glu:
+        assert glu_i > 0 and N == glu_i, f"glu needs N == glu_i (the gate width); got N={N} glu_i={glu_i}"
+        # The pairing lives in the dist2 body's quadrant registers, and the pair
+        # store is the scalar path's (CShuffle stages one fragment through LDS).
+        assert nt_dist2 and not store_cshuffle, "fused GLU epilogue rides the scalar dist2 store path"
+        assert not beta_is_one, "fused GLU epilogue overwrites; there is nothing to accumulate into"
+    _NBLK = LDS_BLOCK_N if glu else BLOCK_N
     # Known N makes the scalar epilogue per-element OOB select dead (nt_dist2 supplies the in-bounds half-N boundary body).
-    _col_safe = N > 0 and (N % BLOCK_N == 0 or (nt_dist2 and N % LDS_BLOCK_N == 0))
-    _nb_c = ceildiv(N, BLOCK_N) if N > 0 else 0  # compile-time N-block count (0 = take it from c_n)
+    _col_safe = (
+        (N > 0 and N % _NBLK == 0)
+        if glu
+        else (N > 0 and (N % BLOCK_N == 0 or (nt_dist2 and N % LDS_BLOCK_N == 0)))
+    )
+    _nb_c = ceildiv(N, _NBLK) if N > 0 else 0  # compile-time N-block count (0 = take it from c_n)
     # Group-offs table form (see _SGPR_GO_MAX_G): SGPR/s_buffer_load vs lane-resident gather.
     _sgo = G <= _SGPR_GO_MAX_G
     # Boundary-N body width, in B column-tiles per wave (N_TILES_B=2 is the full tile). When
     # the last N-block's valid width fits the lower half of the b0 LDS pool its upper columns
     # are pure padding, so one column-tile per wave covers it. Needs the runtime half-N branch.
-    _bnd_ntb = 1 if (nt_dist2 and N > 0 and 0 < N % BLOCK_N <= LDS_BLOCK_N // 2) else N_TILES_B
-    # Pad-both: B_T=[G,NS,KS] is stored with a padded N row-count (n_stride) but only the real
-    # N rows are computed/stored. NS = the compile-time B_T group N-count (physical storage); N
-    # stays the real compute/output width (_nb_c, _col_safe, store clamp). NS==N when not padding.
-    NS = n_stride if n_stride else N
-    assert n_stride == 0 or NS >= N > 0, f"n_stride={n_stride} must be >= real N={N}"
+    # GLU never narrows: the second pool is the up band, not padding columns, so both
+    # column-tiles are always live and the N tail is handled by masking instead.
+    _bnd_ntb = (
+        N_TILES_B
+        if glu
+        else (1 if (nt_dist2 and N > 0 and 0 < N % BLOCK_N <= LDS_BLOCK_N // 2) else N_TILES_B)
+    )
+    # B_T uses a padded physical row pitch when requested. In GLU mode the real
+    # physical row count is 2I (gate||up), while N remains the I-wide activation
+    # output. Padding is appended after both bands and must affect only the group
+    # stride/SRD extent, not the gate-to-up offset.
+    real_bn_rows = 2 * glu_i if glu else N
+    NS = n_stride if n_stride else real_bn_rows
+    assert n_stride == 0 or NS >= real_bn_rows > 0, (
+        f"n_stride={n_stride} must be >= real B rows={real_bn_rows}"
+    )
     # B_T[G,NS,KS] spans < 2^31 elements: its SRD base/extent then stay int32, and each group's
     # base is a compile-time constant that drops straight out of the tile decode. _B_GRP=1 keeps
-    # the runtime form (the decode yields the plain group index and the caller scales it). Keyed
-    # on the physical span (NS row-count) so a padded B_T never folds to a too-small literal base.
+    # the runtime form (the decode yields the plain group index and the caller scales it).
     _b32 = N > 0 and G * NS * KS < 2**31
     _B_GRP = NS * KS if _b32 else 1
 
@@ -876,12 +1012,19 @@ def _compile_grouped_nt(
     def kernel_grouped_nt_persistent(
         A: fx.Tensor,
         B_T: fx.Tensor,
-        C: fx.Tensor,
+        C: fx.Tensor,  # glu: l1 [M, 2I]
+        ACT: fx.Tensor,  # glu: act [M, I]. Otherwise unused -- the launch aliases it to C.
+        PROBS: fx.Tensor,  # glu: routing probs [M] fp32. Otherwise unused, aliased to C.
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         group_offs: fx.Tensor,  # int32 view of int64 [G+1]; _load_go reads low word at i32[2*idx]
-        c_n: fx.Int32,
+        c_n: fx.Int32,  # glu: the gate width I, not the 2I the GEMM writes
     ):
+        # ACT/PROBS ride along in both modes because the body has to stay inside this
+        # decorator: @flyc.kernel rewrites the AST (dynamic `if` -> dispatch), and a
+        # body hoisted into a plain shared function would lose that. Under const_expr
+        # the plain GEMM never reads them, so they cost two dropped kernel args and
+        # nothing in the mainloop.
         F8_IR_t = fx.Float8E4M3FN.ir_type
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
         # Compile-time N (same autotune key supplies c_n): see the NN twin -- constant divisors
@@ -972,20 +1115,31 @@ def _compile_grouped_nt(
             a_nrec = (uindex(m_total) - uindex(m_row)) * arith.index(KS)
             if const_expr(_b32):
                 # Whole B_T fits in int32 -> base/extent are one int32 add and one int32 subtract.
-                _b_off = group_b + block_n * fx.Int32(BLOCK_N * KS)
+                _b_off = group_b + block_n * fx.Int32(_NBLK * KS)
                 b_base = uindex(_b_off)
                 b_nrec = arith.index(G * NS * KS) - b_base
             else:
-                # B_T group N-count = padded row-count NS when padding; else runtime c_n.
-                cn_i = arith.index(NS) if const_expr(n_stride) else arith.index_cast(T.index, c_n)
+                # Padded storage uses its compile-time row pitch. Without padding,
+                # GLU doubles c_n because c_n is only the gate width.
+                bn_i = (
+                    arith.index(NS)
+                    if const_expr(n_stride)
+                    else arith.index_cast(T.index, c_n * fx.Int32(2) if const_expr(glu) else c_n)
+                )
                 b_base = (
-                    arith.index_cast(T.index, group_b) * cn_i + arith.index_cast(T.index, block_n * BLOCK_N)
+                    arith.index_cast(T.index, group_b) * bn_i + arith.index_cast(T.index, block_n * _NBLK)
                 ) * arith.index(KS)
-                b_nrec = arith.index(G) * cn_i * arith.index(KS) - b_base
+                b_nrec = arith.index(G) * bn_i * arith.index(KS) - b_base
             A0_gl_offset = 0
             A1_gl_offset = LDS_BLOCK_M * KS
             B0_gl_offset = 0
-            B1_gl_offset = LDS_BLOCK_N * KS
+            # The one offset the whole fusion turns on: under glu the second B pool is
+            # the *up* band, I weight rows further in, not the next 128 columns. That is
+            # what puts gate[m, j] and up[m, j] in the same lane at the same fragment
+            # index, so the epilogue pairs them without a shuffle. Past the last full
+            # band both bands run off the end of B_T; the SRD clamps those reads and the
+            # epilogue's column mask drops the results.
+            B1_gl_offset = (glu_i * KS) if glu else (LDS_BLOCK_N * KS)
 
             gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
             gB = make_fp8_buffer_tensor_rebased(B_T, F8_IR_t, b_base, b_nrec)
@@ -1008,7 +1162,24 @@ def _compile_grouped_nt(
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             a_s2r = S2RLoader(wave_m, N_TILES_A)
             b_s2r = S2RLoader(wave_n, N_TILES_B)
-            if const_expr(store_cshuffle):
+            if const_expr(glu):
+                store_c = StoreCSwiGLU(
+                    A_scale,
+                    B_scale,
+                    C,  # l1 [M, 2I]
+                    ACT,  # act [M, I]
+                    PROBS,
+                    m_end,
+                    glu_i,
+                    mfma.idx,
+                    N_TILES_A,
+                    N_TILES_B,
+                    _out_ty,
+                    col_safe=_col_safe,
+                    store_aux=_cstore_aux,
+                    act_aux=glu_act_aux,
+                )
+            elif const_expr(store_cshuffle):
                 store_c = StoreCPerTensorCShuffle(
                     A_scale,
                     B_scale,
@@ -1062,7 +1233,8 @@ def _compile_grouped_nt(
                 wave_n_offset = wave_n * (N_TILES_B * 16)
                 wave_m_offset = wave_m * (N_TILES_A * 16)
                 _base_row = m_row + wave_m_offset
-                _base_col = block_n * BLOCK_N + wave_n_offset
+                # _NBLK == BLOCK_N unless glu, where a tile spans 128 gate columns.
+                _base_col = block_n * _NBLK + wave_n_offset
                 if const_expr(_bnd_ntb < N_TILES_B):
                     # Narrow twin of (mfma, b_s2r, b_g2s, store_c) for the boundary body: one B
                     # column-tile per wave and one g2s load step cover the same pool rows, so the
@@ -1227,21 +1399,34 @@ def _compile_grouped_nt(
                     if const_expr(_full):
                         c11 = _mm.call(a1_frag, b1_frag, c11)
                     rocdl.s_setprio(0)
-                    # Batched epilogue store, same lever as the NN dgrad body's; this one owns
-                    # the forward cells of the tw suite.
-                    _store_split(
-                        _st,
-                        (
-                            (c00, 0, 0),
-                            (c01 if _full else None, 0, LDS_BLOCK_N),
-                            (c10, LDS_BLOCK_M, 0),
-                            (c11 if _full else None, LDS_BLOCK_M, LDS_BLOCK_N),
-                        ),
-                        _base_row,
-                        _bcol,
-                        _esplit,
-                        _full,
-                    )
+                    if const_expr(glu):
+                        # The quadrants are (gate, up) pairs sharing rows rather than
+                        # four corners of one tile, so they leave in two pair stores.
+                        _st.store_pair(c00, c01, _base_row, _bcol)
+                        _st.store_pair(c10, c11, _base_row + LDS_BLOCK_M, _bcol)
+                    else:
+                        # Batched epilogue store, same lever as the NN dgrad body's; this one owns
+                        # the forward cells of the tw suite.
+                        _store_split(
+                            _st,
+                            (
+                                (c00, 0, 0),
+                                (c01 if _full else None, 0, LDS_BLOCK_N),
+                                (c10, LDS_BLOCK_M, 0),
+                                (c11 if _full else None, LDS_BLOCK_M, LDS_BLOCK_N),
+                            ),
+                            _base_row,
+                            _bcol,
+                            _esplit,
+                            _full,
+                        )
+
+                if const_expr(glu):
+                    # No half-N body under glu: the second pool holds the up band, not
+                    # padding columns, so both are always live and the N tail is masked
+                    # in the epilogue instead of being skipped here.
+                    _body_d2(2)
+                    return
 
                 # Wave-uniform runtime half-N predicate: last N-block whose valid width fits the b0 LDS half (b1 all padding).
                 _nb_last = n_blocks - fx.Int32(1)
@@ -1391,6 +1576,53 @@ def _compile_grouped_nt(
             gb, ts, ms, me = _find_group(tt)
             _do_tile(tt, gb, ts, ms, me)
 
+    def _grid_and_attrs(m_total, c_n):
+        """Tile count -> grid width, plus the launch value attrs. In GLU mode a tile
+        owns ``_NBLK`` columns of the *gate* half instead of BLOCK_N of the raw
+        output, and ``c_n`` is that gate width -- the tile count works out the same,
+        since two 128-wide bands replace one 256-wide block."""
+        n_blocks = ceildiv(c_n, _NBLK)
+        upper = (ceildiv(m_total, BLOCK_M) + G) * n_blocks
+        ncus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        # cap_cu>0 reserves CUs for comm-compute overlap; cap_cu<=0 = full device.
+        _cap = ncus if cap_cu <= 0 else min(int(cap_cu), ncus)
+        # persistent: cap to _cap WGs. non-persistent: full grid, over-launched WGs s_endpgm.
+        grid_x = arith.select(upper < _cap, upper, fx.Int32(_cap)) if persistent else upper
+        attrs = make_value_attrs(waves_per_eu, 128 if (agpr_inplace and acc_mode == "agpr") else 0, "512,512")
+        return grid_x, attrs
+
+    if const_expr(glu):
+
+        @flyc.jit
+        def launch_grouped_nt_glu_persistent(
+            A: fx.Tensor,
+            B_T: fx.Tensor,
+            L1: fx.Tensor,
+            ACT: fx.Tensor,
+            PROBS: fx.Tensor,
+            A_scale: fx.Tensor,
+            B_scale: fx.Tensor,
+            group_offs: fx.Tensor,
+            m_total: int,
+            c_n: fx.Int32,
+            stream: fx.Stream,
+        ):
+            grid_x, attrs = _grid_and_attrs(m_total, c_n)
+            kernel_grouped_nt_persistent(
+                A,
+                B_T,
+                L1,
+                ACT,
+                PROBS,
+                A_scale,
+                B_scale,
+                group_offs,
+                c_n,
+                value_attrs=attrs,
+            ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+
+        return launch_grouped_nt_glu_persistent
+
     @flyc.jit
     def launch_grouped_nt_persistent(
         A: fx.Tensor,
@@ -1403,18 +1635,13 @@ def _compile_grouped_nt(
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
-        n_blocks = ceildiv(c_n, BLOCK_N)
-        upper = (ceildiv(m_total, BLOCK_M) + G) * n_blocks
-        ncus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-        # cap_cu>0 reserves CUs for comm-compute overlap; cap_cu<=0 = full device.
-        _cap = ncus if cap_cu <= 0 else min(int(cap_cu), ncus)
-        # persistent: cap to _cap WGs. non-persistent: full grid, over-launched WGs s_endpgm.
-        grid_x = arith.select(upper < _cap, upper, fx.Int32(_cap)) if persistent else upper
-        attrs = make_value_attrs(waves_per_eu, 128 if (agpr_inplace and acc_mode == "agpr") else 0, "512,512")
+        grid_x, attrs = _grid_and_attrs(m_total, c_n)
         kernel_grouped_nt_persistent(
             A,
             B_T,
             C,
+            C,  # ACT unused without glu
+            C,  # PROBS unused without glu
             A_scale,
             B_scale,
             group_offs,

@@ -804,12 +804,16 @@ def flydsl_dual_quant_batched(
     dev = x3d.device
     x_i32 = x3d.contiguous().view(torch.int32)  # [G, N, K/2]
     fn, grid_x, Kp, Np, padded = get_dual3_cast(N, K, G, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr)
-    # Outputs sized on K_pad/N_pad; zeros so pad regions match the HIP dual (all-0).
-    alloc = torch.zeros if padded else torch.empty
-    ro = alloc((G, N, Kp // 8), dtype=torch.int32, device=dev)
-    rs = alloc((G, N, Kp // 32), dtype=torch.uint8, device=dev)
-    co = alloc((G, K, Np // 8), dtype=torch.int32, device=dev)
-    cs = alloc((G, K, Np // 32), dtype=torch.uint8, device=dev)
+    # Masked loads make the kernel write the complete K_pad row-output tail. Only
+    # the col-output N_pad suffix has no producer threads, so allocate without a
+    # full-tensor memset and clear that small unwritten suffix explicitly.
+    ro = torch.empty((G, N, Kp // 8), dtype=torch.int32, device=dev)
+    rs = torch.empty((G, N, Kp // 32), dtype=torch.uint8, device=dev)
+    co = torch.empty((G, K, Np // 8), dtype=torch.int32, device=dev)
+    cs = torch.empty((G, K, Np // 32), dtype=torch.uint8, device=dev)
+    if padded and Np > N:
+        co[:, :, N // 8 :].zero_()
+        cs[:, :, N // 32 :].zero_()
     sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
     fn(x_i32, ro, rs, co, cs, N, K, G, Kp, Np, sr_seed, grid_x, torch.cuda.current_stream())
     return (

@@ -25,8 +25,10 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
 )
-from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+from primus_turbo.triton.grouped_gemm.grouped_gemm_helper import (
     grouped_gemm_output_tail_kernel,
+)
+from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     grouped_gemm_triton_kernel,
     grouped_gemm_variable_k_triton_kernel,
 )

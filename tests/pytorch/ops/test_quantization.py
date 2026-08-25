@@ -619,12 +619,17 @@ def test_quantize_mxfp4(orig_dtype, dest_dtype, batched, B, M, N, axis, granular
         turbo.float4_e2m1fn_x2,
     ],
 )
-@pytest.mark.parametrize("B", [1, 4])
-@pytest.mark.parametrize("M", [32, 64, 256, 1024])
-@pytest.mark.parametrize("N", [32, 64, 256, 1024])
+@pytest.mark.parametrize("B", [None, 4], ids=["2d", "3d"])
+@pytest.mark.parametrize("M", [32, 64, 192, 256])
+@pytest.mark.parametrize("N", [32, 64, 192, 256])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
 @pytest.mark.parametrize("use_2d_block", [True, False])
 def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity, use_2d_block):
+    """Validate the 2D and real 3D batched dual-quant paths.
+
+    The 64/192 shapes guard selective tail-zeroing in both output directions
+    when the kernel allocates its output buffers with torch.empty.
+    """
     padding_align_size = 128
 
     mxfp4_supported, reason = check_mxfp4_support()
@@ -638,15 +643,11 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     MX_BLOCK_SIZE = 32
     torch.manual_seed(42)
 
-    x = torch.randn((B, M, N), device="cuda", dtype=orig_dtype)
-
-    row_length = x.size(-1)
-    x_2d = x.view(-1, row_length)
-    M_actual = x_2d.size(0)
-    N_actual = x_2d.size(1)
+    shape = (M, N) if B is None else (B, M, N)
+    x = torch.randn(shape, device="cuda", dtype=orig_dtype)
 
     x_fp4_rowwise, x_scale_inv_rowwise, x_fp4_t, x_scale_inv_colwise = quantize_fp4_with_trans(
-        x_2d,
+        x,
         dest_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,
@@ -654,56 +655,36 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
         scaling_recipe_for_trans=scaling_recipe,
     )
 
-    # Dequantize and compare with zero-padded reference.
-    # Rowwise dequantize: output shape [M, N_pad]
-    x_2d_ref_rowwise = torch.cat(
-        [
-            x_2d,
-            torch.zeros(
-                M_actual,
-                padding_size(N_actual, padding_align_size),
-                device=x_2d.device,
-                dtype=orig_dtype,
-            ),
-        ],
-        dim=1,
-    )
+    if B is not None:
+        rowwise_ref = torch.nn.functional.pad(x, (0, padding_size(N, padding_align_size)))
+        colwise_ref = torch.nn.functional.pad(x.transpose(1, 2), (0, padding_size(M, padding_align_size)))
+        rowwise_axis = colwise_axis = 2
+    else:
+        rowwise_ref = torch.nn.functional.pad(x, (0, padding_size(N, padding_align_size)))
+        colwise_ref = torch.nn.functional.pad(x, (0, 0, 0, padding_size(M, padding_align_size)))
+        rowwise_axis, colwise_axis = 1, 0
 
     out_rowwise = dequantize_fp4(
         x_fp4_rowwise,
         orig_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,
-        axis=1,
+        axis=rowwise_axis,
         scale_inv=x_scale_inv_rowwise,
         scaling_recipe=scaling_recipe,
     )
-    torch.testing.assert_close(x_2d_ref_rowwise, out_rowwise, **get_tolerances(dest_dtype))
-
-    # Colwise dequantize: output shape [M_pad, N]
-    x_2d_ref_colwise = torch.cat(
-        [
-            x_2d,
-            torch.zeros(
-                padding_size(M_actual, padding_align_size),
-                N_actual,
-                device=x_2d.device,
-                dtype=orig_dtype,
-            ),
-        ],
-        dim=0,
-    )
+    torch.testing.assert_close(rowwise_ref, out_rowwise, **get_tolerances(dest_dtype))
 
     out_colwise = dequantize_fp4(
         x_fp4_t,
         orig_dtype,
         granularity=granularity,
         block_size=MX_BLOCK_SIZE,
-        axis=0,
+        axis=colwise_axis,
         scale_inv=x_scale_inv_colwise,
         scaling_recipe=scaling_recipe,
     )
-    torch.testing.assert_close(x_2d_ref_colwise, out_colwise, **get_tolerances(dest_dtype))
+    torch.testing.assert_close(colwise_ref, out_colwise, **get_tolerances(dest_dtype))
 
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
