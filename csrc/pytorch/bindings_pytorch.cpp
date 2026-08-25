@@ -171,6 +171,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
 #ifdef BUILD_MXFP6_BACKEND
     m.def("quantize_mxfp6(Tensor input, int axis) -> Tensor[]");
     m.def("quantize_mxfp6_dual(Tensor input) -> Tensor[]");
+    m.def("quantize_mxfp6_fused_dual(Tensor input, Tensor? aux, Tensor? bias, int mode, "
+          "bool want_col_sum) -> Tensor[]");
 #endif // BUILD_MXFP6_BACKEND
 }
 
@@ -196,6 +198,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
 #ifdef BUILD_MXFP6_BACKEND
     m.impl("quantize_mxfp6", quantize_mxfp6);
     m.impl("quantize_mxfp6_dual", quantize_mxfp6_dual);
+    m.impl("quantize_mxfp6_fused_dual", quantize_mxfp6_fused_dual);
 #endif // BUILD_MXFP6_BACKEND
     m.impl("dequantize_mxfp4", dequantize_mxfp4);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual);
@@ -261,6 +264,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 #ifdef BUILD_MXFP6_BACKEND
     m.impl("quantize_mxfp6", quantize_mxfp6_meta);
     m.impl("quantize_mxfp6_dual", quantize_mxfp6_dual_meta);
+    m.impl("quantize_mxfp6_fused_dual", quantize_mxfp6_fused_dual_meta);
 #endif // BUILD_MXFP6_BACKEND
     m.impl("dequantize_mxfp4", dequantize_mxfp4_meta);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual_meta);

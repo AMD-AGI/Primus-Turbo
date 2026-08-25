@@ -92,6 +92,19 @@ std::vector<at::Tensor> quantize_mxfp6(const at::Tensor input, const int64_t axi
 std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input);
 std::vector<at::Tensor> quantize_mxfp6_meta(const at::Tensor input, const int64_t axis);
 std::vector<at::Tensor> quantize_mxfp6_dual_meta(const at::Tensor input);
+
+// Dual pack with an elementwise epilogue folded into the staging read, so the tensor the
+// epilogue produces never reaches HBM. `mode` selects the prologue: 0 identity, 1
+// bias+gelu, 2 bias+gelu backward (which is the only mode that reads `aux`). Returns the
+// four blobs plus a bias-gradient partial buffer, degenerate unless `want_col_sum`.
+std::vector<at::Tensor> quantize_mxfp6_fused_dual(const at::Tensor                input,
+                                                  const c10::optional<at::Tensor> aux,
+                                                  const c10::optional<at::Tensor> bias,
+                                                  const int64_t mode, const bool want_col_sum);
+std::vector<at::Tensor> quantize_mxfp6_fused_dual_meta(const at::Tensor                input,
+                                                       const c10::optional<at::Tensor> aux,
+                                                       const c10::optional<at::Tensor> bias,
+                                                       const int64_t mode, const bool want_col_sum);
 #endif // BUILD_MXFP6_BACKEND
 
 at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,

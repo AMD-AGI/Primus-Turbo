@@ -117,6 +117,17 @@ MXFP6_GUARD_K_TILES = 2
 MXFP6_PACKED_TILE_BYTES = 24576
 MXFP6_SCALE_TILE_BYTES = 1024
 
+# Elementwise epilogues the MXFP6 packer can fold into its staging read, so the tensor the
+# epilogue produces never reaches HBM. Must match enum MXFP6Prologue in
+# csrc/include/primus_turbo/quantization.h.
+MXFP6_PROLOGUE_IDENTITY = 0
+MXFP6_PROLOGUE_BIAS_GELU = 1
+MXFP6_PROLOGUE_BIAS_GELU_BACKWARD = 2
+
+# M-rows per row of the packer's bias-gradient partial buffer, i.e. its M-tile height.
+# Must match MXFP6_COL_SUM_TILE_M in csrc/include/primus_turbo/quantization.h.
+MXFP6_COL_SUM_TILE_M = 64
+
 
 class Format(Enum):
     """

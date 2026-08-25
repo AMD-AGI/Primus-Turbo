@@ -18,6 +18,7 @@ from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     MXFP4_PADDING_ALIGN_SIZE,
     MXFP6_BLOCK_SIZE,
+    MXFP6_PROLOGUE_IDENTITY,
     MXFP8_BLOCK_SIZE,
     MXFP8_PADDING_ALIGN_SIZE,
     ScalingRecipe,
@@ -1077,3 +1078,40 @@ def quantize_mxfp6_dual_impl_meta(
     col_operand, col_scale = mxfp6_pack_sizes(cols, rows)
     empty = lambda n: torch.empty(n, dtype=torch.uint8, device=x.device)  # noqa: E731
     return empty(row_operand), empty(row_scale), empty(col_operand), empty(col_scale)
+
+
+@torch.library.custom_op("primus_turbo::quantize_mxfp6_fused_dual_impl", mutates_args=(), device_types="cuda")
+def quantize_mxfp6_fused_dual_impl(
+    x: torch.Tensor,
+    aux: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    mode: int = MXFP6_PROLOGUE_IDENTITY,
+    want_col_sum: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dual pack with an elementwise epilogue folded into the packer's staging read.
+
+    Same four blobs as ``quantize_mxfp6_dual_impl``, but the tensor the epilogue produces
+    never reaches HBM, plus an optional bias-gradient partial buffer so a reduction over
+    that tensor is still possible. Opaque to inductor on purpose, like the plain packer:
+    the point is that inductor no longer has a pointwise kernel to emit ahead of the pack.
+    """
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import quantize_mxfp6_fused_dual
+
+    return quantize_mxfp6_fused_dual(x, aux, bias, mode, want_col_sum)
+
+
+@quantize_mxfp6_fused_dual_impl.register_fake
+def quantize_mxfp6_fused_dual_impl_meta(
+    x: torch.Tensor,
+    aux: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    mode: int = MXFP6_PROLOGUE_IDENTITY,
+    want_col_sum: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_col_sum_rows
+
+    # The prologue is elementwise, so it does not touch the blob geometry.
+    blobs = quantize_mxfp6_dual_impl_meta(x)
+    rows, cols = x.shape
+    shape = (mxfp6_col_sum_rows(rows), cols) if want_col_sum else (0, 0)
+    return (*blobs, torch.empty(shape, dtype=torch.float32, device=x.device))

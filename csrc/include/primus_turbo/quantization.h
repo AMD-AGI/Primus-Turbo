@@ -149,6 +149,46 @@ void quantize_mxfp6_impl(const DType *input, uint8_t *row_packed, uint8_t *row_s
                          uint8_t *col_packed, uint8_t *col_scale, const int M, const int N,
                          const MXFP6Direction direction, hipStream_t stream);
 
+// Elementwise epilogue folded into the packer's LDS staging read, so the tensor it
+// applies to never reaches HBM. The result is rounded back to DType before staging, which
+// makes the packed blob bit-identical to packing the epilogue's materialised output.
+enum class MXFP6Prologue {
+    Identity,         // stage the input unchanged
+    BiasGelu,         // gelu_tanh(input + bias)
+    BiasGeluBackward, // d/dx gelu_tanh(input + bias) * aux, where aux is the incoming grad
+};
+
+// M-rows per row of the bias-gradient partial buffer, i.e. the packer's M-tile height.
+// Declared here rather than left as a kernel-private tuning constant because the host and
+// Python both have to size that buffer; the kernel static_asserts they agree.
+constexpr int MXFP6_COL_SUM_TILE_M = 64;
+
+// Rows of the partial buffer for an [M, N] input. One per M-tile of the launch grid, which
+// covers M padded to whole 256-row tiles.
+constexpr int mxfp6_col_sum_rows(const int M) {
+    const int m_padded = ((M + 255) / 256) * 256;
+    return (m_padded + MXFP6_COL_SUM_TILE_M - 1) / MXFP6_COL_SUM_TILE_M;
+}
+
+// As quantize_mxfp6_impl with direction Dual, but applies `prologue` to the input while
+// staging it. `bias` is broadcast along N and may be null (no bias term). `aux` is only
+// read by BiasGeluBackward and may be null otherwise. Both must have the input's dtype,
+// and `aux` its shape. Only Dual is provided: the fused path always needs both directions,
+// and instantiating the prologue against the direction flags too would quadruple the
+// template expansion for no caller.
+//
+// `col_sum` is optional and may be null. When given it receives per-column sums of the
+// staged (post-prologue, pre-Hadamard) values as a
+// [mxfp6_col_sum_rows(M), N] fp32 buffer, one row per M-tile, to be finished with a sum
+// over that axis. This is how a bias gradient survives the fusion: the tensor it would
+// otherwise be reduced from never reaches HBM, and the tile is already in LDS here, so the
+// column sums cost a second pass over shared memory rather than a pass over HBM.
+template <typename DType>
+void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType *bias,
+                               uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
+                               uint8_t *col_scale, float *col_sum, const int M, const int N,
+                               const MXFP6Prologue prologue, hipStream_t stream);
+
 template <typename DType>
 void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
                               uint8_t *rowwise_scale, dtype::float4x2_e2m1 *colwise_output,
