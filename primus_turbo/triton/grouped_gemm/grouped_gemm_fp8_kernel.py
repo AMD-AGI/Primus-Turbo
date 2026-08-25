@@ -589,6 +589,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     """
     assert a.ndim == 2, f"a must be 2D, got {a.shape}"
     assert b.ndim == 3, f"b must be 3D, got {b.shape}"
+    assert epilogue is None, "Triton fused epilogues are not implemented by this entry point"
 
     M_total, K_a = a.shape
     G = b.shape[0]

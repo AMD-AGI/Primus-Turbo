@@ -172,12 +172,13 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
                 config.granularity,
                 axis=-1,
                 block_size=config.block_size,
-                **({"pad_align_last": 128} if trans_w2 else {"pad_align_penultimate": 128}),
+                pad_align_last=128,
+                pad_align_penultimate=128,
             )
 
-        # Keep only contraction dimensions padded. This preserves the real
-        # gate||up and model-hidden layouts while giving fc1/fc2 aligned K
-        # pitches. Pre-quantized inputs may carry the same padding already.
+        # Keep the fc1 gate||up layout unpadded, while fc2 pads both its
+        # contraction and output dimensions. Real extents below preserve the
+        # model-visible shapes through forward, dgrad, and wgrad.
         x_real = quantized_x.shape[-1]
         x_pitch = quantized_x.qdata.shape[-1]
         w1_k_real = quantized_w1.shape[-1] if trans_w1 else quantized_w1.shape[-2]
