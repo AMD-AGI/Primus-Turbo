@@ -56,8 +56,7 @@ Design notes
   so it cannot be threaded through ``flash_attn_func`` without patching/rebuilding
   aiter. Both a detected and an explicit ``softcap > 0`` therefore hit a *single*
   gate (see :func:`flex_attention`) that raises ``NotImplementedError`` rather than
-  silently dropping the cap (which the ALiBi detector alone would do). See
-  FLEX_COMPAT_STATUS.md for the aiter-signature evidence and options.
+  silently dropping the cap (which the ALiBi detector alone would do).
 
 Relationship to PyTorch
 -----------------------
@@ -309,7 +308,7 @@ def assert_alibi_sign_convention(**kwargs: Any) -> Dict[str, Any]:
             f"assumed +slope*(kv-q) (assumed_sign={report['assumed_sign']}, measured "
             f"sign={report['sign']}, plus_err={report['plus_err']:.3g}, "
             f"minus_err={report['minus_err']:.3g}). ALiBi results would be silently wrong on this "
-            "build -- see FLEX_COMPAT_STATUS.md ('ALiBi sign convention (build-dependent)')."
+            "build."
         )
     return report
 
@@ -822,7 +821,7 @@ def _classify_probed_mask(
         raise NotImplementedError(
             "Turbo flex compat layer does not support this block_mask: visible positions were found "
             "above the causal diagonal (neither causal nor left-window causal). This is an arbitrary "
-            "mask_mod and requires the codegen path (see FLEX_COMPAT_STATUS.md)."
+            "mask_mod and requires the codegen path."
         )
     if not bool(mask.any().item()):
         raise NotImplementedError(
@@ -1090,7 +1089,7 @@ def _detect_softcap(
     Detected explicitly for two reasons on this build:
 
     * The fixed Turbo dense kernels expose **no** softcap parameter (aiter dense
-      ``mha_fwd``/``fmha_v3_fwd``/``mha_bwd`` lack it; see FLEX_COMPAT_STATUS.md),
+      ``mha_fwd``/``fmha_v3_fwd``/``mha_bwd`` lack it),
       so a soft-cap cannot be silently dropped.
     * :func:`_detect_alibi_slopes` only ever probes ``score=0``, where
       ``cap*tanh(0)=0``; a soft-cap would therefore be misread as a zero-slope
@@ -1355,7 +1354,7 @@ def _validate_and_adapt_bias(
 
     The aiter dense kernel accepts a single **2D** bias of shape ``[Sq, Skv]`` in q's
     dtype (fp16/bf16), added to the pre-softmax logits and *shared across batch and
-    heads*. This is an empirically pinned constraint (see FLEX_COMPAT_STATUS.md): a 4D /
+    heads*. This is an empirically pinned constraint: a 4D /
     per-head bias raises ``RuntimeError: bias shape should be [sq, sk]`` and an fp32 bias
     yields ``NaN``; only a ``[Sq, Skv]`` bias in q's dtype is numerically correct (fwd &
     bwd). We therefore accept ``[Sq, Skv]`` or a leading-singleton broadcast of it
@@ -1374,7 +1373,7 @@ def _validate_and_adapt_bias(
                 "Turbo flex compat layer's bias backend only supports a single [Sq,Skv] shared across "
                 "batch/head (AITER dense constraint); a bias that varies per batch/head is not "
                 f"supported. Got shape={tuple(bias.shape)} (for per-head/per-sample bias use the "
-                "codegen path, see FLEX_COMPAT_STATUS.md)."
+                "codegen path)."
             )
         b = b.reshape(b.shape[2], b.shape[3])
     elif b.ndim == 3:
@@ -1448,8 +1447,7 @@ def _dispatch_custom(*_args, **_kwargs):
     :func:`flex_attention`), so ``softcap`` never reaches here as ``> 0``.
     """
     raise NotImplementedError(
-        "custom/arbitrary score_mod+mask_mod fast path not implemented yet "
-        "(planned: codegen 'path B'); see FLEX_COMPAT_STATUS.md"
+        "custom/arbitrary score_mod+mask_mod fast path not implemented yet (planned: codegen 'path B')"
     )
 
 
@@ -1669,8 +1667,8 @@ def flex_attention(
       (``cap*tanh(score/cap)``, Gemma2/Grok). ``None`` or ``0`` means disabled
       (no-op). A positive value currently raises ``NotImplementedError`` -- the
       interface is in place, but it is blocked at the kernel layer (the aiter
-      dense fwd/bwd on this build expose no softcap parameter; see
-      FLEX_COMPAT_STATUS.md). It will take effect once the upstream kernel adds the
+      dense fwd/bwd on this build expose no softcap parameter). It will take
+      effect once the upstream kernel adds the
       parameter.
     * ``dropout_p`` (``float``, default ``0.0``): attention-dropout probability
       threaded straight to ``flash_attn_func(dropout_p=...)``. Requires
@@ -1687,7 +1685,7 @@ def flex_attention(
       bias on the pre-softmax logits, threaded to ``flash_attn_func(bias=...)``.
       The aiter dense kernel accepts a single ``[Sq, Skv]`` bias in q's dtype
       shared across batch/heads (an fp32 bias yields NaN, a per-head 4D bias is
-      rejected by the kernel; see FLEX_COMPAT_STATUS.md). This entry accepts
+      rejected by the kernel). This entry accepts
       ``[Sq, Skv]`` (or a leading-singleton broadcast ``[1,Sq,Skv]`` /
       ``[1,1,Sq,Skv]``), casts it to q's dtype and moves it to q's device; a
       genuine per-batch/per-head bias raises ``ValueError``. Verified numerically
@@ -1810,7 +1808,7 @@ def flex_attention(
 
     # ---- single softcap enablement point --------------------------------------
     # softcap (explicit or detected) is blocked at the kernel layer on this build:
-    # the aiter dense fwd/bwd expose no softcap parameter (see FLEX_COMPAT_STATUS.md).
+    # the aiter dense fwd/bwd expose no softcap parameter.
     # Centralising the "softcap>0 -> raise" here (never silently dropping the cap)
     # keeps a single switch to flip once the kernel supports it.
     # TODO(softcap): once upstream aiter dense fwd+bwd supports it, thread through to
@@ -1820,7 +1818,7 @@ def flex_attention(
         raise NotImplementedError(
             "Turbo flex compat layer: the softcap interface is in place "
             f"(cap~={effective_softcap:.4g}), but it is blocked by this build's aiter dense fwd/bwd "
-            "kernels, which lack a softcap parameter (see FLEX_COMPAT_STATUS.md); it will take "
+            "kernels, which lack a softcap parameter; it will take "
             "effect once upstream kernels support it. To avoid silently dropping the cap and "
             "producing wrong results, both an explicit softcap and a soft-cap detected from "
             "score_mod raise here -- we never degrade to a path that ignores the cap."
@@ -2306,15 +2304,15 @@ def flex_attention_varlen(
         )
 
     # softcap (explicit) is blocked at the kernel layer on this build exactly like the
-    # dense entry: the aiter varlen backward exposes no softcap parameter (see
-    # FLEX_COMPAT_STATUS.md), so a positive cap hard-errors rather than being silently
+    # dense entry: the aiter varlen backward exposes no softcap parameter, so a
+    # positive cap hard-errors rather than being silently
     # dropped. None/0 is a no-op (drop-in default).
     effective_softcap = _normalise_explicit_softcap(softcap)
     if effective_softcap > 0.0:
         raise NotImplementedError(
             "Turbo flex varlen entry: the softcap interface is in place "
             f"(cap~={effective_softcap:.4g}), but it is blocked by this build's aiter kernels (the "
-            "varlen backward lacks a softcap parameter, see FLEX_COMPAT_STATUS.md). To avoid "
+            "varlen backward lacks a softcap parameter). To avoid "
             "silently dropping the cap and producing wrong results, softcap>0 raises here -- we "
             "never degrade to a path that ignores the cap."
         )
