@@ -11,6 +11,9 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP6_PROLOGUE_BIAS_GELU,
+    MXFP6_PROLOGUE_BIAS_GELU_BACKWARD,
+    MXFP6_PROLOGUE_IDENTITY,
     Float6QuantConfig,
     Format,
     ScaleDtype,
@@ -18,10 +21,13 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import (
     check_mxfp6_support,
+    mxfp6_apply_prologue,
+    mxfp6_col_sum_rows,
     mxfp6_data_region,
     mxfp6_pack_sizes,
     quantize_mxfp6_col,
     quantize_mxfp6_dual,
+    quantize_mxfp6_fused_dual,
     quantize_mxfp6_row,
 )
 from primus_turbo.pytorch.ops.gemm_fp6 import gemm_fp6
@@ -263,13 +269,416 @@ def test_fused_packer_ignores_memory_past_the_operand():
         packs.append((packed, scale))
 
     for packed, scale in packs[1:]:
-        assert torch.equal(
-            mxfp6_data_region(packed, rows, cols), mxfp6_data_region(packs[0][0], rows, cols)
-        )
+        assert torch.equal(mxfp6_data_region(packed, rows, cols), mxfp6_data_region(packs[0][0], rows, cols))
         assert torch.equal(
             mxfp6_data_region(scale, rows, cols, is_scale=True),
             mxfp6_data_region(packs[0][1], rows, cols, is_scale=True),
         )
+
+
+# ---------------------------------------------------------------------------
+# Fused epilogue prologue modes.
+#
+# The reference throughout is "apply the epilogue eagerly, then pack the result", because
+# that is literally the path being replaced: an inductor-generated pointwise kernel writing
+# bf16 to HBM followed by the packer reading it back.
+#
+# Everything about the fusion is exact against that reference except the tanh. The packer is
+# VALU bound the moment a prologue is switched on, and a libm tanh costs 54 instructions per
+# element against the 24 of the whole rest of the epilogue, so the prologue evaluates
+# 1 + tanh(u) as 2/(1 + e^-2u) from one hardware exp2 instead. That is a different rounding
+# of the same quantity, not a worse one -- ``test_fused_prologue_is_no_less_accurate_
+# than_aten`` is what holds it to that -- but it does mean the codes are not bit-identical,
+# so the comparisons below bound the divergence instead.
+#
+# The bounds are set orders of magnitude below the signature of a real bug. Applying the
+# wrong epilogue shows up as ~5% of bytes differing and the fp32 bias-add bug this file
+# caught showed as 4.6%, against the ~0.0003% two roundings of tanh produce. The E8M0
+# scales, being a per-32-block exponent, are unaffected and are still compared exactly.
+# ---------------------------------------------------------------------------
+
+# Fraction of packed bytes allowed to differ from the eager epilogue. Measured at 3e-6 over
+# the shapes here; the margin is for the tail of a different random draw, not for slop.
+_PROLOGUE_CODE_TOLERANCE = 5e-5
+
+_PROLOGUE_MODES = [MXFP6_PROLOGUE_BIAS_GELU, MXFP6_PROLOGUE_BIAS_GELU_BACKWARD]
+
+
+_GELU_BETA = 0.7978845608028654
+_GELU_KAPPA = 0.044715
+# The kernel's own constants: the change of base for E = e^-2u, and the u below which tanhf
+# returns exactly -1 and the kernel short-circuits to zero to match it.
+_GELU_NEG_TWO_LOG2E = -2.0 * 1.4426950408889634
+_GELU_SATURATE = -9.02
+
+
+def _skip_without_fused_prologue():
+    if not hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_fused_dual"):
+        pytest.skip("build has no fused MXFP6 prologue packer (gfx950-only)")
+
+
+def _closed_form_prologue(x, aux, bias, mode):
+    """The prologue's own arithmetic in torch, rounded to bf16 as the kernel stages it.
+
+    Deliberately not the kernel's output: this is the *formula* the kernel uses, so that the
+    accuracy of the substitution can be judged without the quantizer in the way.
+    """
+    xa = (x.float() + bias.float()).to(x.dtype).float()
+    inner = _GELU_BETA * (xa + _GELU_KAPPA * (xa * xa * xa))
+    e = torch.exp2(inner * _GELU_NEG_TWO_LOG2E)
+    d = 1.0 / (1.0 + e)
+    if mode == MXFP6_PROLOGUE_BIAS_GELU:
+        out = xa * d
+    else:
+        inner_d = 2.0 * _GELU_BETA * (1.0 + 3.0 * _GELU_KAPPA * xa * xa)
+        out = aux.float() * (d + xa * e * d * d * inner_d)
+    return torch.where(inner < _GELU_SATURATE, torch.zeros_like(out), out).to(x.dtype)
+
+
+def _prologue_operands(rows, cols, mode, dtype, *, with_bias=True, device="cuda:0"):
+    x = torch.randn((rows, cols), dtype=dtype, device=device)
+    aux = (
+        torch.randn((rows, cols), dtype=dtype, device=device)
+        if mode == MXFP6_PROLOGUE_BIAS_GELU_BACKWARD
+        else None
+    )
+    bias = torch.randn((cols,), dtype=dtype, device=device) if with_bias else None
+    return x, aux, bias
+
+
+def _blobs_equal(got, ref, rows, cols):
+    """Compare the four packed blobs on their data regions, ignoring any fifth output."""
+    got_rp, got_rs, got_cp, got_cs = got[:4]
+    ref_rp, ref_rs, ref_cp, ref_cs = ref[:4]
+
+    def same(lhs, rhs, r, k, is_scale=False):
+        return torch.equal(
+            mxfp6_data_region(lhs, r, k, is_scale=is_scale),
+            mxfp6_data_region(rhs, r, k, is_scale=is_scale),
+        )
+
+    return (
+        same(got_rp, ref_rp, rows, cols)
+        and same(got_rs, ref_rs, rows, cols, is_scale=True)
+        and same(got_cp, ref_cp, cols, rows)
+        and same(got_cs, ref_cs, cols, rows, is_scale=True)
+    )
+
+
+def _scale_blobs_equal(got, ref, rows, cols):
+    """Compare only the two E8M0 scale blobs."""
+
+    def same(lhs, rhs, r, k):
+        return torch.equal(
+            mxfp6_data_region(lhs, r, k, is_scale=True),
+            mxfp6_data_region(rhs, r, k, is_scale=True),
+        )
+
+    return same(got[1], ref[1], rows, cols) and same(got[3], ref[3], cols, rows)
+
+
+def _assert_blobs_agree(got, ref, rows, cols, tolerance=_PROLOGUE_CODE_TOLERANCE):
+    """Both directions' codes agree to within ``tolerance``, and the scales exactly.
+
+    ``ref`` may be packed from a larger, zero-extended operand than ``got``, in which case
+    it has trailing K-tiles ``got`` has no room for and only the shared ones are compared.
+    """
+    for name, g_blob, r_blob, r, k in (
+        ("row", got[0], ref[0], rows, cols),
+        ("col", got[2], ref[2], cols, rows),
+    ):
+        g = mxfp6_data_region(g_blob, r, k)
+        r_full = mxfp6_data_region(r_blob, r, k)
+        differing = (g != r_full).sum().item() / g.numel()
+        assert differing <= tolerance, f"{name} direction: {differing:.6%} of bytes differ"
+
+    assert _scale_blobs_equal(got, ref, rows, cols), "E8M0 scales differ"
+
+
+@pytest.mark.parametrize("rows,cols", [(256, 256), (512, 1024), (256, 3072)])
+@pytest.mark.parametrize("mode", _PROLOGUE_MODES)
+def test_fused_prologue_matches_eager_epilogue(rows, cols, mode):
+    """Fusing the epilogue must not change the operand the GEMM sees, beyond the tanh.
+
+    bf16 is the production dtype and the one the whole optimisation is justified on. Only the
+    tanh is inexact here; every other part of the epilogue is reproduced bit for bit, and two
+    details are what make that achievable -- both found by this test failing. The epilogue has
+    to be evaluated in fp32 and rounded back to the input dtype before staging, and the
+    bias-add has to be rounded *separately*, because in the graph being replaced it is a bf16
+    tensor op whose result the activation then reads. Carrying the bias-add on in fp32 instead
+    is a perfectly reasonable-looking choice that changes 21% of the resulting bf16 codes,
+    four orders of magnitude above the tolerance here.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    x, aux, bias = _prologue_operands(rows, cols, mode, torch.bfloat16)
+
+    with _packer("fused"):
+        got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
+        ref = quantize_mxfp6_dual(mxfp6_apply_prologue(x, aux, bias, mode))
+
+    _assert_blobs_agree(got, ref, rows, cols)
+
+
+@pytest.mark.parametrize("mode", _PROLOGUE_MODES)
+def test_fused_prologue_is_no_less_accurate_than_aten(mode):
+    """The closed-form tanh must not be a worse tanh, only a different rounding of one.
+
+    This is the test that licenses not being bit-exact with ATen. Both candidates are the
+    epilogue rounded to bf16, so both are compared against the activation evaluated in fp64,
+    and the claim is that neither is measurably closer to it. Were the closed form actually
+    losing precision -- which is the real risk, since 1 + tanh(u) cancels to nothing in the
+    left tail if it is formed via tanh -- it would show up here as a lower SNR, and the
+    divergence bounds elsewhere in this file would silently be absorbing an error rather
+    than a rounding difference.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    rows, cols = 1024, 2048
+    x, aux, bias = _prologue_operands(rows, cols, mode, torch.bfloat16)
+
+    xa = (x.double() + bias.double()).to(x.dtype).double()
+    inner = _GELU_BETA * (xa + _GELU_KAPPA * xa**3)
+    tanh = torch.tanh(inner)
+    if mode == MXFP6_PROLOGUE_BIAS_GELU:
+        truth = 0.5 * xa * (tanh + 1.0)
+    else:
+        inner_d = _GELU_BETA * (1.0 + 3.0 * _GELU_KAPPA * xa * xa)
+        truth = aux.double() * (0.5 * (1.0 + tanh) + 0.5 * xa * (1.0 - tanh * tanh) * inner_d)
+
+    def snr_db(candidate):
+        noise = ((candidate.double() - truth) ** 2).mean()
+        return float(10 * torch.log10((truth**2).mean() / noise))
+
+    aten = snr_db(mxfp6_apply_prologue(x, aux, bias, mode))
+    closed = snr_db(_closed_form_prologue(x, aux, bias, mode))
+
+    # Both are bf16 roundings of the same value, so both sit at bf16's own noise floor.
+    assert closed > aten - 0.5, f"closed form is less accurate: {closed:.2f} vs {aten:.2f} dB"
+
+
+@pytest.mark.parametrize("rows,cols", [(256, 256), (512, 1024)])
+@pytest.mark.parametrize("mode", _PROLOGUE_MODES)
+def test_fused_prologue_fp16_matches_eager_epilogue_to_a_few_codes(rows, cols, mode):
+    """fp16 gets a near-exactness bound rather than the bit-exact one bf16 gets.
+
+    Not a weaker property by choice. ATen's own tanh-GELU kernels are only reproducible to
+    1-2 fp32 ULP by any reimplementation, because the compiler is free to contract
+    ``a + b * c`` into an FMA and does so differently in different translation units. bf16
+    absorbs that entirely -- it has 7 mantissa bits, so a 1-ULP fp32 difference is invisible
+    -- while fp16's 10 bits occasionally resolve it, and the packer's own bf16 rounding of
+    the staged operand then lets a handful of those through to the codes.
+
+    The bound is set two orders of magnitude below the signature of a real bug: applying the
+    wrong epilogue shows up as ~5% of bytes differing, and the fp32 bias-add bug this file
+    caught showed as 4.6%, against the ~0.002% seen here.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    x, aux, bias = _prologue_operands(rows, cols, mode, torch.float16)
+
+    with _packer("fused"):
+        got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
+        ref = quantize_mxfp6_dual(mxfp6_apply_prologue(x, aux, bias, mode))
+
+    for name, g, r, r_rows, r_k in (
+        ("row", got[0], ref[0], rows, cols),
+        ("col", got[2], ref[2], cols, rows),
+    ):
+        gd = mxfp6_data_region(g, r_rows, r_k)
+        rd = mxfp6_data_region(r, r_rows, r_k)
+        differing = (gd != rd).sum().item() / gd.numel()
+        assert differing < 5e-4, f"{name} direction: {differing:.5%} of bytes differ"
+
+    # The scales are a per-32-block exponent, coarse enough that nothing should reach them.
+    assert _scale_blobs_equal(got, ref, rows, cols)
+
+
+@pytest.mark.parametrize("mode", _PROLOGUE_MODES)
+def test_fused_prologue_without_bias(mode):
+    """A null bias must skip the add rather than reading a zero vector that is not there."""
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    rows, cols = 256, 512
+    x, aux, _ = _prologue_operands(rows, cols, mode, torch.bfloat16, with_bias=False)
+
+    with _packer("fused"):
+        got = quantize_mxfp6_fused_dual(x, aux, None, mode)
+        ref = quantize_mxfp6_dual(mxfp6_apply_prologue(x, aux, None, mode))
+
+    _assert_blobs_agree(got, ref, rows, cols)
+
+
+@pytest.mark.parametrize("rows,cols", [(288, 256), (256, 320), (288, 320)])
+@pytest.mark.parametrize("mode", _PROLOGUE_MODES)
+def test_fused_prologue_pads_with_zeros(rows, cols, mode):
+    """The padded region must still encode zero once a prologue is active.
+
+    This is the sharpest test in the file. The grid covers the operand padded to 256 on
+    both axes, and the dual pack contracts N one way and M the other, so padding on either
+    axis lands on a contraction axis where a nonzero code adds a spurious term to the dot
+    product. The staged value there is zero, and ``gelu(0 + bias)`` is *not* zero -- so a
+    prologue applied to the zero-fill instead of being suppressed outside the logical
+    extent corrupts the blob. Every shape the model actually uses is 256-aligned, which
+    means production traffic cannot catch this and only these shapes can.
+
+    Each axis is misaligned independently, because suppressing the row guard while leaving
+    the column guard broken (or vice versa) would still pass a both-axes-misaligned case
+    on one of the two directions.
+
+    The tanh's rounding difference is bounded rather than excluded here, as everywhere else,
+    but it cannot hide the bug this test is for: a prologue leaking into the padding turns
+    whole rows or columns of a zero-encoded region into ``gelu(bias)``, which moves the
+    padded blocks' E8M0 exponents off zero. Those are still compared exactly.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    def ceil256(v):
+        return -(-v // 256) * 256
+
+    dtype = torch.bfloat16
+    x, aux, bias = _prologue_operands(rows, cols, mode, dtype)
+
+    # Reference: materialise the epilogue over the logical extent only, then zero-extend.
+    # Zero past the extent is the property under test, so it has to come from the
+    # reference's construction rather than from re-running the prologue on padding.
+    epilogue = mxfp6_apply_prologue(x, aux, bias, mode)
+    extended = torch.zeros((ceil256(rows), ceil256(cols)), dtype=dtype, device=x.device)
+    extended[:rows, :cols] = epilogue
+
+    with _packer("fused"):
+        got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
+        ref = quantize_mxfp6_dual(extended)
+
+    er, ec = extended.shape
+
+    # Zero-extending K gives the reference K-tiles the operand has no room for; the tiles
+    # they share must agree and the surplus has no counterpart.
+    for gi, ri, r, k, rr, rk in ((0, 0, rows, cols, er, ec), (2, 2, cols, rows, ec, er)):
+        g = mxfp6_data_region(got[gi], r, k)
+        ref_region = mxfp6_data_region(ref[ri], rr, rk)[:, : g.shape[1], :]
+        differing = (g != ref_region).sum().item() / g.numel()
+        assert differing <= _PROLOGUE_CODE_TOLERANCE, f"{differing:.6%} of bytes differ"
+
+    for gi, ri, r, k, rr, rk in ((1, 1, rows, cols, er, ec), (3, 3, cols, rows, ec, er)):
+        g = mxfp6_data_region(got[gi], r, k, is_scale=True)
+        ref_region = mxfp6_data_region(ref[ri], rr, rk, is_scale=True)[:, : g.shape[1], :]
+        assert torch.equal(g, ref_region), "padded region's E8M0 scales are not zero"
+
+
+@pytest.mark.parametrize("rows,cols", [(256, 256), (512, 1024), (288, 320), (32768, 512)])
+@pytest.mark.parametrize("mode", _PROLOGUE_MODES + [MXFP6_PROLOGUE_IDENTITY])
+def test_fused_packer_col_sum_matches_eager_reduction(rows, cols, mode):
+    """The bias-gradient side output must reduce to the same vector as the eager sum.
+
+    Not bit-exact, unlike the blobs: this is a different summation of the same values, and
+    deliberately a more accurate one (fp32 accumulation, tree-ordered over M-tiles) than a
+    single bf16-input reduction. The tolerance is on the *reduction*, so it scales with the
+    number of terms rather than being an elementwise epsilon; the 32768-row case is here
+    because that is the token count Flux 12B actually uses and the one where a naive
+    accumulation would visibly drift.
+
+    Misaligned shapes matter here too: rows past M are staged as zero, so they must not
+    contribute, and columns past N must not be written at all.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    x, aux, bias = _prologue_operands(rows, cols, mode, torch.bfloat16)
+
+    with _packer("fused"):
+        *_, partial = quantize_mxfp6_fused_dual(x, aux, bias, mode, want_col_sum=True)
+
+    assert partial.shape == (mxfp6_col_sum_rows(rows), cols)
+    assert partial.dtype == torch.float32
+
+    got = partial.sum(0)
+    ref = mxfp6_apply_prologue(x, aux, bias, mode).float().sum(0)
+    torch.testing.assert_close(got, ref, rtol=2e-3, atol=2e-3 * max(1.0, ref.abs().max().item()))
+
+
+def test_fused_packer_col_sum_is_absent_unless_requested():
+    """The fifth output is degenerate by default, so the common path allocates nothing."""
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    x, aux, bias = _prologue_operands(256, 512, MXFP6_PROLOGUE_BIAS_GELU, torch.bfloat16)
+    with _packer("fused"):
+        *_, partial = quantize_mxfp6_fused_dual(x, aux, bias, MXFP6_PROLOGUE_BIAS_GELU)
+    assert partial.numel() == 0
+
+
+def test_fused_prologue_identity_matches_plain_dual():
+    """Identity mode must be the plain dual pack, so the fused entry point is a superset."""
+    _skip_if_unsupported()
+    _skip_without_fused_packer()
+
+    rows, cols = 256, 512
+    x = torch.randn((rows, cols), dtype=torch.bfloat16, device="cuda:0")
+
+    with _packer("fused"):
+        got = quantize_mxfp6_fused_dual(x, None, None, MXFP6_PROLOGUE_IDENTITY)
+        ref = quantize_mxfp6_dual(x)
+
+    assert _blobs_equal(got, ref, rows, cols)
+
+
+@pytest.mark.parametrize("mode", _PROLOGUE_MODES)
+@pytest.mark.parametrize("want_col_sum", [False, True])
+def test_fused_prologue_custom_op_fake_matches_real(mode, want_col_sum):
+    """FakeTensor shapes must match the real op, or torch.compile traces wrong sizes.
+
+    The partial buffer makes this more than a formality: its row count is a function of M
+    that the header, the wrapper and the Python fake each compute separately, so a
+    disagreement is a wrong-sized allocation rather than a compile error.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    rows, cols = 288, 512
+    x, aux, bias = _prologue_operands(rows, cols, mode, torch.bfloat16)
+    op = torch.ops.primus_turbo.quantize_mxfp6_fused_dual_impl
+
+    real = op(x, aux, bias, mode, want_col_sum)
+    with torch._subclasses.FakeTensorMode() as fake_mode:
+        fake_x = fake_mode.from_tensor(x)
+        fake_aux = None if aux is None else fake_mode.from_tensor(aux)
+        fake_bias = fake_mode.from_tensor(bias)
+        fake = op(fake_x, fake_aux, fake_bias, mode, want_col_sum)
+
+    assert [t.shape for t in fake] == [t.shape for t in real]
+    assert [t.dtype for t in fake] == [t.dtype for t in real]
+
+
+def test_fused_prologue_rejects_inconsistent_arguments():
+    """aux is required by exactly one mode, and the bias has to match the column count."""
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    rows, cols = 256, 512
+    dtype = torch.bfloat16
+    x = torch.randn((rows, cols), dtype=dtype, device="cuda:0")
+    aux = torch.randn((rows, cols), dtype=dtype, device="cuda:0")
+    bias = torch.randn((cols,), dtype=dtype, device="cuda:0")
+
+    # Matching the message as well as the type, so that a different failure reaching the
+    # same line cannot pass for the check under test.
+    with _packer("fused"):
+        # Backward mode without the incoming gradient.
+        with pytest.raises(RuntimeError, match="aux is required"):
+            quantize_mxfp6_fused_dual(x, None, bias, MXFP6_PROLOGUE_BIAS_GELU_BACKWARD)
+        # Forward mode handed a gradient it has no use for.
+        with pytest.raises(RuntimeError, match="aux is required"):
+            quantize_mxfp6_fused_dual(x, aux, bias, MXFP6_PROLOGUE_BIAS_GELU)
+        # Bias sized for the wrong axis.
+        with pytest.raises(RuntimeError, match="one element per column"):
+            wrong = torch.randn((rows,), dtype=dtype, device="cuda:0")
+            quantize_mxfp6_fused_dual(x, None, wrong, MXFP6_PROLOGUE_BIAS_GELU)
 
 
 @pytest.mark.parametrize("axis,expect_row", [(1, True), (-1, True), (0, False), (-2, False)])

@@ -37,26 +37,33 @@ predates the fused op.
 """
 
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
 from primus_turbo.common.aiter_utils import get_aiter
 from primus_turbo.pytorch.core.low_precision import (
     MXFP6_BLOCK_SIZE,
+    MXFP6_COL_SUM_TILE_M,
     MXFP6_GUARD_K_TILES,
     MXFP6_K_TILE_SIZE,
     MXFP6_PACKED_TILE_BYTES,
+    MXFP6_PROLOGUE_BIAS_GELU,
+    MXFP6_PROLOGUE_BIAS_GELU_BACKWARD,
+    MXFP6_PROLOGUE_IDENTITY,
     MXFP6_SCALE_TILE_BYTES,
     MXFP6_TILE_SIZE,
 )
 
 __all__ = [
     "check_mxfp6_support",
+    "mxfp6_apply_prologue",
+    "mxfp6_col_sum_rows",
     "mxfp6_data_region",
     "mxfp6_pack_sizes",
     "quantize_mxfp6_col",
     "quantize_mxfp6_dual",
+    "quantize_mxfp6_fused_dual",
     "quantize_mxfp6_row",
 ]
 
@@ -208,3 +215,99 @@ def quantize_mxfp6_dual(
     row_p, row_s = aiter.quant_mxfp6_gemm(x)
     col_p, col_s = aiter.quant_mxfp6_gemm(x.t().contiguous())
     return row_p, row_s, col_p, col_s
+
+
+def mxfp6_col_sum_rows(m: int) -> int:
+    """Rows of the packer's bias-gradient partial buffer for an ``[m, n]`` input.
+
+    One per M-tile of the launch grid, which covers ``m`` padded to whole 256-row tiles.
+    Must agree with ``mxfp6_col_sum_rows`` in ``quantization.h``.
+    """
+    return _ceil(_ceil(m, MXFP6_TILE_SIZE), MXFP6_COL_SUM_TILE_M) // MXFP6_COL_SUM_TILE_M
+
+
+def mxfp6_apply_prologue(
+    x: torch.Tensor,
+    aux: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    mode: int,
+) -> torch.Tensor:
+    """Materialise the epilogue that ``quantize_mxfp6_fused_dual`` folds into the pack.
+
+    This is the reference the fused kernel is checked against, and the fallback when the
+    extension has no fused op. Kept in one place so the two cannot drift.
+
+    Deliberately ATen's own GELU rather than a transliteration of the kernel's: as the
+    fallback it should be the operation the model would have run anyway, and as the reference
+    it is only useful if it was written independently of what it is checking.
+    """
+    if mode == MXFP6_PROLOGUE_IDENTITY:
+        return x
+    pre = x if bias is None else x + bias
+    if mode == MXFP6_PROLOGUE_BIAS_GELU:
+        return torch.nn.functional.gelu(pre, approximate="tanh")
+    if mode == MXFP6_PROLOGUE_BIAS_GELU_BACKWARD:
+        assert aux is not None, "the backward prologue needs the incoming gradient"
+        return torch.ops.aten.gelu_backward(aux, pre, approximate="tanh")
+    raise ValueError(f"unknown MXFP6 prologue mode {mode}")
+
+
+def quantize_mxfp6_fused_dual(
+    x: torch.Tensor,
+    aux: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    mode: int = MXFP6_PROLOGUE_IDENTITY,
+    want_col_sum: bool = False,
+    block_size: int = MXFP6_BLOCK_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dual pack with an elementwise epilogue folded into the staging read.
+
+    The tensor the epilogue produces is never written to HBM: the packer computes it while
+    staging its tile into LDS, which removes both that write and the packer's read of it.
+    In a Flux 12B MXFP6 step those round-trips are the single largest remaining block of
+    non-GEMM traffic.
+
+    ``mode`` is one of the ``MXFP6_PROLOGUE_*`` constants. ``bias`` is broadcast along the
+    last axis and may be None. ``aux`` is the incoming gradient, required by
+    ``MXFP6_PROLOGUE_BIAS_GELU_BACKWARD`` and unused otherwise.
+
+    The four blobs reproduce ``quantize_mxfp6_dual(mxfp6_apply_prologue(...))``: the epilogue
+    is evaluated in fp32 and rounded back to ``x.dtype`` before staging, exactly as a
+    separate kernel writing bf16 to HBM would have. Every part of it is bit-identical except
+    the tanh, which the kernel evaluates in closed form from one hardware exp2 rather than
+    calling a libm tanh -- a 54-instruction-per-element difference that decides whether
+    fusing the epilogue is faster than running it separately at all. That is a different
+    rounding of the activation, not a less accurate one, and it leaves ~0.0003% of the packed
+    codes differing by one and the E8M0 scales untouched. ``MXFP6_PROLOGUE_IDENTITY`` has no
+    tanh and stays exactly equal.
+
+    ``want_col_sum`` additionally returns per-column sums of the staged values as a
+    ``[mxfp6_col_sum_rows(M), N]`` fp32 partial buffer, to be finished with ``.sum(0)``.
+    That is how a bias gradient survives the fusion: the tensor it would be reduced from no
+    longer exists in HBM. Unlike the blobs this is *not* bit-exact with the eager reduction
+    -- it is a different (tree-ordered, fp32-accumulated) summation of the same values.
+    The fifth return is a degenerate empty tensor when not requested.
+    """
+    _assert_supported()
+    _check_input(x, block_size)
+
+    x = x.contiguous()
+    if aux is not None:
+        aux = aux.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    if _use_fused_packer() and hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_fused_dual"):
+        blobs = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_fused_dual(
+            x, aux, bias, mode, want_col_sum
+        )
+        return tuple(blobs)
+
+    # Fallback: materialise the epilogue and pack that. Same values, more traffic.
+    staged = mxfp6_apply_prologue(x, aux, bias, mode)
+    row_p, row_s, col_p, col_s = quantize_mxfp6_dual(staged, block_size)
+    if not want_col_sum:
+        empty = torch.empty((0, 0), dtype=torch.float32, device=x.device)
+        return row_p, row_s, col_p, col_s, empty
+    # One row, so the caller's .sum(0) is a no-op reshape rather than a special case.
+    return row_p, row_s, col_p, col_s, staged.float().sum(0, keepdim=True)
