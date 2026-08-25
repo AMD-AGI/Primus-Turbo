@@ -3181,9 +3181,29 @@ def build_flash_attn_bwd_dkdv_module(
                 instruction -- on top of the 4x fewer instructions aiter's wider kv tile
                 already buys.
                 """
-                if const_expr(_A16_TAG >= 9):
+                if const_expr(9 <= _A16_TAG <= 12):
                     return  # marker modes measure only their own marker
-                if const_expr(WSQ_ACOAL):
+                if const_expr(WSQ_A16 == 64):
+                    # ★ NATIVE COALESCED LAYOUT. One instruction's 64 lanes cover 256 B of
+                    # ONE block, i.e. 4 cache lines instead of the store layout's 16 -- the
+                    # 8.6x the acoal pricing probe measured, but at addresses that are a
+                    # real, invertible image:
+                    #     blk  = ((qtile_g * Hq + qh) * NPAIR + dpair)   (1024 B each)
+                    #     byte = blk*1024 + w*256 + lane*4
+                    # Total size is exactly B*Sq*Hq*D bf16. dword (w, lane=kg*16+lane16) of
+                    # block (qtile_g, qh, dpair) holds dQ[q, d] and dQ[q, d+1] with
+                    #     q = q_start + _g3_qrow(tile, lane16)
+                    #     d = (2*dpair + w//2)*16 + kg*4 + (2w mod 4)
+                    # so the un-permute is a pure bit permutation of the flat index.
+                    _qt = (q_start >> fx.Index(4)) + _g3q0 + fx.Index(j * G3_SPL_STRIDE)
+                    _blk = (_qt * fx.Index(NUM_HEADS_Q) + _g3qh) * fx.Index(DT // 2) + (
+                        (_g3d0 + fx.Index(i)) >> fx.Index(1)
+                    )
+                    _a16 = ArithValue(
+                        _raw(_blk * fx.Index(1024) + lane * fx.Index(4))
+                    ).index_cast(fx.Int32.ir_type)
+                    _step = 256
+                elif const_expr(WSQ_ACOAL):
                     _t = _g3q0 + fx.Index(j * G3_SPL_STRIDE)
                     _row0 = (
                         q_start
@@ -3206,7 +3226,26 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(_A16_TAG):
                     # Per-CALL-SITE weight so one readback decodes, in base 4, how many
                     # times each _gemm3 call site touched the element (see goal.md's 2x).
-                    if const_expr(_A16_TAG == 5):
+                    if const_expr(_A16_TAG in (13, 14)):
+                        # Payload encodes the element's own q row (13) or d base (14) in the
+                        # bf16 mantissa: the bits 0x4000+v are the value 2*(1+v/128), exact
+                        # for v < 128, so reading the image back through a candidate
+                        # un-permutation says directly whether that axis is mapped right.
+                        if const_expr(_A16_TAG == 13):
+                            _iv = q_start + _g3_qrow(_g3q0 + fx.Index(j * G3_SPL_STRIDE))
+                        else:
+                            _iv = (_g3d0 + fx.Index(i)) * fx.Index(D_TILE) + kg * fx.Index(4)
+                        _pk = Vec.from_elements(
+                            [
+                                fx.Int32(
+                                    ArithValue(
+                                        _raw((fx.Index(0x4000) + _iv) * fx.Index(0x10001))
+                                    ).index_cast(fx.Int32.ir_type)
+                                )
+                            ],
+                            fx.Int32,
+                        ).broadcast_to(4)
+                    elif const_expr(_A16_TAG == 5):
                         # Only lane 0 carries a payload. If ITS element still reads 2, the
                         # single instruction applied twice; anything else is another emitter.
                         # payload = (low bf16 1.0, high bf16 4.0): asymmetric, so a
@@ -3255,7 +3294,7 @@ def build_flash_attn_bwd_dkdv_module(
                         syncscope="agent",
                         alignment=4,
                     )
-                elif const_expr(WSQ_A16 >= 32):
+                elif const_expr(32 <= WSQ_A16 < 64):
                     if const_expr(WSQ_ACOAL):
                         _gb = _wsq16_boff + (_e0 + lane * fx.Index(2)) * fx.Index(2)
                     else:
