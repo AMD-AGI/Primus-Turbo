@@ -836,6 +836,13 @@ class StoreCPerTensor:
     def flush(self):
         """Emit whatever a subclass left queued; a store that lands in its own call has none."""
 
+    def _pack(self, lo, hi):
+        """(lo, hi) as one dword of out_ty; bf16 takes the single packed convert."""
+        if const_expr(self.out_ty is fx.BFloat16):
+            return rocdl.cvt_pk_bf16_f32(lo, hi)
+        pair = Vec.from_elements([lo.to(self.out_ty), hi.to(self.out_ty)], self.out_ty)
+        return arith._to_raw(pair.bitcast(fx.Int32)[0])
+
     def _row_col(self, ti, i, tj, base_col):
         """Element address of the value at fragment (ti, tj), row ``i`` of this lane's four."""
         return (ti * 16 + (self.lane_id // 16) * 4 + i) * self.c_cols + base_col + tj * 16 + self.lane_id % 16
@@ -1083,6 +1090,79 @@ class StoreCSwiGLU(StoreCPerTensor):
             )
 
 
+def _permlane16_swap(a_i32, b_i32):
+    """``v_permlane16_swap_b32``: exchange a's odd 16-lane row groups with b's even ones, in place.
+    The wait state a VALU consumer needs rides inside the asm because an inline-asm result is
+    invisible to the hazard recognizer."""
+    r = _llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32, i32)>"),
+        [_raw(a_i32), _raw(b_i32)],
+        "v_permlane16_swap_b32 $0, $1\n\ts_nop 1",
+        "=v,=v,0,1",
+        has_side_effects=False,
+    )
+    i32 = ir.IntegerType.get_signless(32)
+    return _llvm.extractvalue(i32, r, [0]), _llvm.extractvalue(i32, r, [1])
+
+
+class StoreCPerTensorRowN(StoreCPerTensor):
+    """Row-merged scalar store: a lane's two n-fragments sit apart on the output's fast axis, so
+    one ``v_permlane16_swap_b32`` per fragment pair moves the second into the other 32-lane half
+    and each store covers a full row run instead of a half one, halving the write requests."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.n_tiles_b % 2 == 0, "the merge pairs adjacent n-fragments"
+        assert self.col_safe, "a merged row run spans two fragments and has no column mask"
+        assert not self.trans, "written for the untransposed fragment axes"
+        assert self.out_ty is fx.BFloat16, "the row pack is v_cvt_pk_bf16_f32"
+        self.merge_row = (self.lane_id // 32) * 8
+        self.merge_col = self.lane_id % 32
+
+    def store(self, c_frag, base_row, base_col, prev=None):
+        scale = self._scale()
+        if const_expr(self.beta_is_one) and prev is None:
+            prev = self.prefetch(base_row, base_col)
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        lane0 = self.merge_row * self.c_cols + base_col + self.merge_col
+        for ti in range_constexpr(self.n_tiles_a):
+            vecs = [
+                (Vec(c_frag[self.c_idx_fn(ti, tj)]) * scale)
+                if self.scaled
+                else Vec(c_frag[self.c_idx_fn(ti, tj)])
+                for tj in range_constexpr(self.n_tiles_b)
+            ]
+
+            def _val(tj, i, vecs=vecs, ti=ti):
+                val = vecs[tj][i]
+                if self.elem_fn is not None:
+                    val = self.elem_fn(val)
+                return self._accum(val, prev, ti, tj, i)
+
+            dw = [
+                [self._pack(_val(tj, 2 * h), _val(tj, 2 * h + 1)) for h in range_constexpr(2)]
+                for tj in range_constexpr(self.n_tiles_b)
+            ]
+            # All swaps first, then the store burst, to keep the permlane->store hazard off the
+            # critical path of each pair.
+            runs = [
+                (Vec.from_elements([fx.Int32(v)], fx.Int32).bitcast(self.out_ty), p, r, h)
+                for h in range_constexpr(2)
+                for p in range_constexpr(self.n_tiles_b // 2)
+                for v, r in zip(_permlane16_swap(dw[2 * p][h], dw[2 * p + 1][h]), (0, 4))
+            ]
+            for pair, p, r, h in runs:
+                for e in range_constexpr(2):
+                    row = ti * 16 + r + 2 * h + e
+                    _buffer_ops.buffer_store(
+                        pair[e],
+                        rsrc,
+                        (lane0 + row * self.c_cols) * 2 + p * 64,
+                        cache_modifier=self.store_aux,
+                        offset_is_bytes=True,
+                    )
+
+
 _DPP_QUAD_SWAP1 = 0xB1  # quad_perm:[1,0,3,2] -- exchange with the neighbouring lane
 _DPP_QUAD_SWAP2 = 0x4E  # quad_perm:[2,3,0,1] -- exchange with the lane two over
 _PERM_LO_PAIR = 0x05040100  # {own low half, right neighbour's low half}
@@ -1101,13 +1181,6 @@ class StoreCPerTensorPairN(StoreCPerTensor):
         # even lane e holds columns (e, e+1); odd lane o holds (16 + o - 1, 16 + o).
         self.pair_col = arith.select(hi, lane16 + 15, lane16)
         self.pair_sel = arith.select(hi, fx.Int32(_PERM_HI_PAIR), fx.Int32(_PERM_LO_PAIR))
-
-    def _pack(self, lo, hi):
-        """(lo, hi) as one dword of out_ty; bf16 takes the single packed convert."""
-        if const_expr(self.out_ty is fx.BFloat16):
-            return rocdl.cvt_pk_bf16_f32(lo, hi)
-        pair = Vec.from_elements([lo.to(self.out_ty), hi.to(self.out_ty)], self.out_ty)
-        return arith._to_raw(pair.bitcast(fx.Int32)[0])
 
     def store(self, c_frag, base_row, base_col, prev=None):
         scale = self._scale()
@@ -2029,10 +2102,9 @@ class S2RLoaderTr:
         return [self._assemble(self._issue_one(lds_src, t, base_off)) for t in range_constexpr(self.n_tiles)]
 
     def base_addr(self, lds_src):
-        """Per-lane LDS address pairs [[p0,p1]]*n_tiles for the whole-loop transpose reads:
-        tile i's 4 ds_read_b64_tr_b8 are p0[i]+0, p1[i]+0, p0[i]+RS, p1[i]+RS (RS =
-        8*chunk_stride). p0/p1 are not tile-strided (j_chunk carries an XOR), so each tile
-        needs its own pair."""
+        """Per-lane LDS address pairs [[p0,p1]]*n_tiles for the whole-loop transpose reads. The
+        K-sub-round jump RS = (width//16)*chunk_stride is this loader's own, since two operands fed
+        from different column spans need one RS each. p0/p1 are not tile-strided (j_chunk XOR)."""
         base = fx.Int32(fx.ptrtoint(lds_src.ptr))
         I = self.lane_id // 16
         L_in_sg = self.lane_id % 16
