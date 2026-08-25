@@ -19,6 +19,7 @@ are no float atomics. Built on the verified forward machine.
 """
 
 import math as host_math
+import os as _dbg_os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -37,6 +38,17 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
 
 _LOG2E = host_math.log2(host_math.e)
+# Tagged touch-count probe for the a16 dQ emission: the payload becomes a constant that
+# encodes WHO emitted, so one readback of the image is a labelled touch map. This is what
+# localised the doubling (see the _g3_a16 comment) and it is the tool to reach for whenever
+# an emission's multiplicity is in question -- a store is idempotent, an atomic is not.
+#   1 = _gemm3 call site (defer hook / undeferred / defer tail / shadow), weights 1,4,16,64
+#   2 = head_local        3 = (d-pair, q-tile) site        4 = wave_id
+#   5 = lane 0 only, asymmetric payload (1.0, 4.0): separates a doubled APPLICATION from a
+#       doubled operand, and makes the touched-element SET readable on its own
+#   8 = f32 atomicrmw at the same emission point (is it the packed-bf16 op?)
+#   9 = f32 atomicrmw at _gemm3_tiles' ENTRY, no other emission (is it the emission loop?)
+_A16_TAG = int(_dbg_os.environ.get("PT_A16_TAG", "0"))
 # Warp specialisation (splitting the head-step across a wave pair by role) is
 # register-walled: each role's live set needs more than half the 512-dword pool, so the
 # pair cannot co-reside two waves per SIMD, and no register donor closes the gap.
@@ -2433,6 +2445,19 @@ def build_flash_attn_bwd_dkdv_module(
         if const_expr(WSQ_A16):
             # Same band-less image as the fp32 one below, at half the bytes.
             _wsq16_slice = seq_len_q_v * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2)
+            # ★ A raw global pointer to the same image. buffer_atomic_pk_add_bf16 applies
+            # its addend TWICE on this stack (proved with a lane-0-only asymmetric payload);
+            # Triton's tl.atomic_add on the same GPU, which lowers to the GLOBAL form, is
+            # exact. WSQ_A16 >= 32 issues llvm.atomicrmw fadd through this pointer instead,
+            # which is the form flydsl's own extract_base_index docstring is there for.
+            _wsq16_ptr = buffer_ops.create_llvm_ptr(
+                buffer_ops.extract_base_index(WSQ, address_space=1), address_space=1
+            )
+            _wsq16_boff = (
+                (q_tok_base * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2))
+                if const_expr(varlen)
+                else (batch_idx * _wsq16_slice)
+            )
             wsq16_rsrc = buffer_ops.create_buffer_resource(
                 WSQ,
                 max_size=False,
@@ -2966,7 +2991,9 @@ def build_flash_attn_bwd_dkdv_module(
                 )
             )
 
-        def _gemm3(q_start, head_local, slot, drain=None, qsel=None, depth=None, st_sink=None, poff=None):
+        _amask_cell = [None]
+
+        def _gemm3(q_start, head_local, slot, drain=None, qsel=None, depth=None, st_sink=None, poff=None, site=0):
             """Run the dQ pass on its carrier waves (see G3_WAVES).
 
             The guard is wave-uniform, so it costs one s_cbranch and leaves the carriers'
@@ -2978,12 +3005,12 @@ def build_flash_attn_bwd_dkdv_module(
             """
             if const_expr(G3_WAVES < NUM_WAVES):
                 if wave_id < fx.Index(G3_WAVES):
-                    _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, poff=poff)
+                    _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, poff=poff, site=site)
                 if const_expr(drain is not None):
                     if wave_id >= fx.Index(G3_WAVES):
                         drain()
             else:
-                _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, st_sink, poff)
+                _gemm3_tiles(q_start, head_local, slot, drain, qsel, depth, st_sink, poff, site=site)
             if const_expr(WSQ_CNT and head_local == GQA_GROUP_SIZE - 1):
                 # The announcement a progressive fold needs: this work-group's band has
                 # finished every head of this q block. Once per (work-group, q block) and
@@ -3008,7 +3035,7 @@ def build_flash_attn_bwd_dkdv_module(
                 )
 
         def _gemm3_tiles(
-            q_start, head_local, slot, drain=None, qsel=None, depth=None, st_sink=None, poff=None
+            q_start, head_local, slot, drain=None, qsel=None, depth=None, st_sink=None, poff=None, site=0
         ):
             """dQ^T[m=D][n=q] += K^T . dS^T over this band's kv rows, for ONE head.
 
@@ -3023,6 +3050,8 @@ def build_flash_attn_bwd_dkdv_module(
             else:
                 _kb, _sb = _g3_kbase(_g3d0), _g3_sbase(_g3q0)
             _soff = slot * G3S_GRP_ELEMS
+            if const_expr(WSQ_A16):
+                _a16_half = Vec.from_elements([fx.Float32(0.5)], fx.Float32).broadcast_to(4)
             # qsel picks ONE of the wave's q-tiles (its dS columns come from that q-half
             # alone), so the pass can run as soon as that half's softmax has published.
             _qs = list(range_constexpr(G3_QT)) if qsel is None else [qsel]
@@ -3106,6 +3135,8 @@ def build_flash_attn_bwd_dkdv_module(
                 instruction -- on top of the 4x fewer instructions aiter's wider kv tile
                 already buys.
                 """
+                if const_expr(_A16_TAG == 9):
+                    return  # mode 9 measures only the entry marker
                 if const_expr(WSQ_ACOAL):
                     _t = _g3q0 + fx.Index(j * G3_SPL_STRIDE)
                     _row0 = (
@@ -3126,14 +3157,83 @@ def build_flash_attn_bwd_dkdv_module(
                     )
                     _step = 4
                 _pk = Vec(_g3p)
-                for _w in range_constexpr(4):
-                    rocdl.raw_ptr_buffer_atomic_fadd(
-                        _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
-                        wsq16_rsrc,
-                        _a16,
-                        _step * _w,
-                        WSQ_A16 - 1,
+                if const_expr(_A16_TAG):
+                    # Per-CALL-SITE weight so one readback decodes, in base 4, how many
+                    # times each _gemm3 call site touched the element (see goal.md's 2x).
+                    if const_expr(_A16_TAG == 5):
+                        # Only lane 0 carries a payload. If ITS element still reads 2, the
+                        # single instruction applied twice; anything else is another emitter.
+                        # payload = (low bf16 1.0, high bf16 4.0): asymmetric, so a
+                        # doubled APPLICATION reads (2.0, 8.0) while a doubled OPERAND
+                        # cannot produce that pair at all.
+                        _l0 = ArithValue(lane == fx.Index(0)).select(
+                            fx.Index(0x40803F80), fx.Index(0)
+                        )
+                        _pk = Vec.from_elements(
+                            [fx.Int32(ArithValue(_raw(_l0)).index_cast(fx.Int32.ir_type))],
+                            fx.Int32,
+                        ).broadcast_to(4)
+                    elif const_expr(_A16_TAG == 4):
+                        # Per-WAVE weight (1/4/16/64), so the readback says whether one wave
+                        # emitted twice or two waves landed on the same element.
+                        _w32 = fx.Int32(
+                            ArithValue(_raw(wave_id)).index_cast(fx.Int32.ir_type)
+                        )
+                        _pk = Vec.from_elements(
+                            [fx.Int32(0x3F803F80) + _w32 * fx.Int32(0x01000100)], fx.Int32
+                        ).broadcast_to(4)
+                    else:
+                        if const_expr(_A16_TAG == 3):
+                            _tagsel = ((i // 2) * 2 + j) % 4   # which (d-pair, q-tile) site
+                        elif const_expr(_A16_TAG == 2):
+                            _tagsel = head_local % 4
+                        else:
+                            _tagsel = site % 4
+                        _tagbits = (0x3F80, 0x4080, 0x4180, 0x4280)[_tagsel]
+                        _pk = Vec.from_elements(
+                            [fx.Int32((_tagbits << 16) | _tagbits)], fx.Int32
+                        ).broadcast_to(4)
+                if const_expr(_A16_TAG == 8):
+                    # SAME emission point, f32 payload: separates "this region runs twice"
+                    # from "the packed-bf16 atomic applies twice". lane 0 adds 1.0f, the rest
+                    # 0.0f, one atomicrmw; read back as f32.
+                    _gb8 = _wsq16_boff + _g3_elem(i, j, ilv=False) * fx.Index(2)
+                    _v8 = ArithValue(lane == fx.Index(0)).select(
+                        fx.Float32(1.0), fx.Float32(0.0)
                     )
+                    llvm.atomicrmw(
+                        llvm.AtomicBinOp.fadd,
+                        buffer_ops.get_element_ptr(_wsq16_ptr, _raw(_gb8)),
+                        _raw(_v8),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    )
+                elif const_expr(WSQ_A16 >= 32):
+                    if const_expr(WSQ_ACOAL):
+                        _gb = _wsq16_boff + (_e0 + lane * fx.Index(2)) * fx.Index(2)
+                    else:
+                        _gb = _wsq16_boff + _g3_elem(i, j, ilv=False) * fx.Index(2)
+                    for _w in range_constexpr(4):
+                        llvm.atomicrmw(
+                            llvm.AtomicBinOp.fadd,
+                            buffer_ops.get_element_ptr(
+                                _wsq16_ptr, _raw(_gb), static_byte_offset=_step * _w
+                            ),
+                            _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
+                            llvm.AtomicOrdering.monotonic,
+                            syncscope="agent",
+                            alignment=4,
+                        )
+                else:
+                    for _w in range_constexpr(4):
+                        rocdl.raw_ptr_buffer_atomic_fadd(
+                            _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
+                            wsq16_rsrc,
+                            _a16,
+                            _step * _w,
+                            WSQ_A16 - 1,
+                        )
 
             def _g3_atomic(_lo, _hi, i, j):
                 """The same D-tile pair, added into the fp32 dQ image instead of stored.
@@ -3181,6 +3281,25 @@ def build_flash_attn_bwd_dkdv_module(
                         _raw(_hi[_w]), wsq32_rsrc, _a32, _step * (4 + _w), WSQ_ATOMIC - 1
                     )
 
+            if const_expr(_A16_TAG == 9 and WSQ_A16):
+                # ENTRY marker: one lane-0 f32 atomic per _gemm3_tiles CALL, outside every
+                # emission loop. Reads 1.0 if the call runs once, 2.0 if the region repeats.
+                _v9 = ArithValue(lane == fx.Index(0)).select(fx.Float32(1.0), fx.Float32(0.0))
+                llvm.atomicrmw(
+                    llvm.AtomicBinOp.fadd,
+                    buffer_ops.get_element_ptr(
+                        _wsq16_ptr,
+                        _raw(
+                            _wsq16_boff
+                            + _g3_elem(0, _qs[0], ilv=False) * fx.Index(2)
+                        ),
+                    ),
+                    _raw(_v9),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                )
+
             for _gi in range_constexpr(len(_dgs)):
                 _dg = _dgs[_gi]
                 _g3 = [[c_zero_v4f32 for _ in _qs] for _ in range_constexpr(len(_dg))]
@@ -3225,8 +3344,27 @@ def build_flash_attn_bwd_dkdv_module(
                                     lambda a=_lo, b=_hi, _i=_gd0, _j=j: _g3_atomic(a, b, _i, _j)
                                 )
                             continue
-                        _g3p = bf16_trunc_scored_v4(_g3[i][jj]).shuffle(
-                            bf16_trunc_scored_v4(_g3[i + 1][jj]), [0, 1, 2, 3]
+                        _alo, _ahi = _g3[i][jj], _g3[i + 1][jj]
+                        if const_expr(WSQ_A16):
+                            # ★★ THE dQ EMISSION REGION RUNS TWICE. Every atomic issued from
+                            # inside _gemm3_tiles lands twice, whatever it is: the packed-bf16
+                            # buffer form, an llvm.atomicrmw through a raw global pointer, and
+                            # a plain f32 atomicrmw all read back 2x, and so does a marker at
+                            # _gemm3_tiles' ENTRY, outside every emission loop. The element SET
+                            # is exactly right under all of them (a lane-0-only payload touches
+                            # exactly the 1024 slots it should) and stays right across
+                            # g3_defer / g3_st_at / g3_dbat / q_split, so it is not an address
+                            # collision and not a knob. The static ISA holds exactly one copy
+                            # (32 stores = 4 sites x 4 heads x masked|unmasked), so it is not a
+                            # traced duplicate either. Triton's tl.atomic_add on this same GPU
+                            # is exact, so it is not the hardware.
+                            # A STORE IS IDEMPOTENT, which is why the deployed split-K path has
+                            # never shown it. Halving is exact in bf16 (one exponent step) and
+                            # makes dQ right; it does NOT recover the cost.
+                            _alo = (Vec(_alo) * _a16_half).ir_value()
+                            _ahi = (Vec(_ahi) * _a16_half).ir_value()
+                        _g3p = bf16_trunc_scored_v4(_alo).shuffle(
+                            bf16_trunc_scored_v4(_ahi), [0, 1, 2, 3]
                         )
                         _st_fn = _g3_a16 if const_expr(WSQ_A16) else _g3_store
                         if const_expr(st_sink is None):
@@ -3609,7 +3747,7 @@ def build_flash_attn_bwd_dkdv_module(
                         rocdl.s_waitcnt(0)
 
                     if const_expr(_shadow):
-                        _gemm3(q_start, head_local - 1, (head_local - 1) % G3S_SLOTS, _rdv_drain, poff=poff)
+                        _gemm3(q_start, head_local - 1, (head_local - 1) % G3S_SLOTS, _rdv_drain, poff=poff, site=3)
                     else:
                         _rdv_drain()
                 else:
@@ -3663,6 +3801,7 @@ def build_flash_attn_bwd_dkdv_module(
                         head_local - 1,
                         const_expr((head_local - 1) % G3S_SLOTS),
                         st_sink=_g3_pend if const_expr(G3_ST_AT >= 0) else None,
+                        site=0,
                     )
                 )
                 if const_expr(G3_SB & 1):
@@ -4171,10 +4310,12 @@ def build_flash_attn_bwd_dkdv_module(
                         PV_K_STEPS - 1 if (G3_SPLIT and not (MASK_SKIP and apply_mask)) else None
                     ),
                     poff=poff,
+                    site=1,
                 )
             return dv_cur, dk_cur, (_qdo_next if const_expr(Q_PREF) else [qdo, None])
 
         def _q_body(q_start, inner, apply_mask, poff=None, half=False, hsel=None, nq=None):
+            _amask_cell[0] = bool(apply_mask)
             # inner (loop-carried) = [dv accs][dk accs] (+ [Q/dO][-delta, lse] under PF_QB).
             _dk_base = H_ACCS
             dv_cur = [
@@ -4252,7 +4393,7 @@ def build_flash_attn_bwd_dkdv_module(
                 # head-step. gpu.barrier() alone is not a fence -- retire the ds_writes.
                 rocdl.s_waitcnt(WAIT_LGKM)
                 gpu.barrier()  # RAW: every wave's dS rows feed every wave's GEMM3
-                _gemm3(q_start, GQA_GROUP_SIZE - 1, (GQA_GROUP_SIZE - 1) % G3S_SLOTS)
+                _gemm3(q_start, GQA_GROUP_SIZE - 1, (GQA_GROUP_SIZE - 1) % G3S_SLOTS, site=2)
             out = [
                 dv_cur[h][dt][nt]
                 for h in range_constexpr(KV_HALVES)
