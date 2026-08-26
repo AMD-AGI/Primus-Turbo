@@ -41,7 +41,11 @@ from primus_turbo.pytorch.kernels.attention.attention_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
+)
+from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     dense_backward as triton_dense_backward,
+)
+from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     dense_forward as triton_dense_forward,
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
@@ -102,9 +106,9 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         ctx.backend = backend
         if backend == BackendType.TRITON:
-            out, lse = triton_dense_forward(q, k, v, softmax_scale=softmax_scale, causal=causal)
-            if is_grad_enabled and _any_requires_grad(q, k, v):
-                ctx.save_for_backward(q, k, v, out, lse)
+            out, lse = triton_dense_forward(q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink)
+            if is_grad_enabled and _any_requires_grad(q, k, v, sink):
+                ctx.save_for_backward(q, k, v, out, lse, sink)
                 ctx.softmax_scale = softmax_scale
                 ctx.causal = causal
             return (out, lse) if return_lse else out
@@ -249,11 +253,11 @@ class FlashAttnFunc(torch.autograd.Function):
             return _flash_attn_grads(dq, dk, dv, None, None)
 
         if ctx.backend == BackendType.TRITON:
-            q, k, v, out, lse = ctx.saved_tensors
-            dq, dk, dv = triton_dense_backward(
-                dout, q, k, v, out, lse, softmax_scale=ctx.softmax_scale, causal=ctx.causal
+            q, k, v, out, lse, sink = ctx.saved_tensors
+            dq, dk, dv, dsink = triton_dense_backward(
+                dout, q, k, v, out, lse, softmax_scale=ctx.softmax_scale, causal=ctx.causal, sink=sink
             )
-            return _flash_attn_grads(dq, dk, dv, None, None)
+            return _flash_attn_grads(dq, dk, dv, None, dsink)
 
         if ctx.backend == BackendType.FLYDSL:
             q_s, k_s, v_s, out_s, lse = ctx.saved_tensors

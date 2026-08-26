@@ -165,6 +165,8 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         k=None,
         v=None,
         dropout_p=0.0,
+        softmax_scale=None,
+        causal=True,
         window_size=(-1, -1),
         bias=None,
         alibi_slopes=None,
@@ -303,15 +305,18 @@ class DenseAttnFwdTritonBackend(KernelBackend):
         if tuple(window_size) != (-1, -1):
             return False
         # No kernel support for these; returning True would compute a wrong answer silently.
-        if bias is not None or alibi_slopes is not None or sink is not None:
+        if bias is not None or alibi_slopes is not None:
+            return False
+        # A sink is one extra softmax term per head, so it must be a per-head scalar.
+        if sink is not None and not _sink_ok(sink, q.shape[2]):
             return False
         if dropout_p != 0.0 or return_softmax:
             return False
         return q.dtype in (torch.bfloat16, torch.float16)
 
     @staticmethod
-    def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
-        out, lse = _triton_dense_forward(q, k, v, softmax_scale=softmax_scale, causal=causal)
+    def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, sink=None, **kwargs):
+        out, lse = _triton_dense_forward(q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink)
         return (out, lse) if return_lse else out
 
 

@@ -66,6 +66,7 @@ def attention_triton_forward_impl(
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool,
     use_fp8: bool,
+    sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     assert window_size_left == -1 and window_size_right == -1, (
@@ -226,6 +227,8 @@ def attention_triton_forward_impl(
         scores_scaled_shifted=scores_scaled_shifted,
         exp_scores=exp_scores,
         alibi_slopes=alibi_slopes,
+        sink=sink,
+        stride_sink_h=0 if sink is None else sink.stride(0),
         HQ=nheads_q,
         HK=nheads_k,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
@@ -238,6 +241,7 @@ def attention_triton_forward_impl(
         BLOCK_DMODEL_V=padded_d_model_v,
         USE_BIAS=False if bias is None else True,
         USE_ALIBI=False if alibi_slopes is None else True,
+        USE_SINK=False if sink is None else True,
         ENABLE_DROPOUT=dropout_p > 0.0,
         USE_EXP2=use_exp2,
         RETURN_SCORES=return_scores,
@@ -266,6 +270,7 @@ def _attention_triton_forward_impl_fake(
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool,
     use_fp8: bool,
+    sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     o_shape = list(q.shape)
     o_shape[-1] = v.shape[-1]  # output shape should match v's head dim
@@ -677,18 +682,62 @@ def dense_forward(
     v: torch.Tensor,
     softmax_scale: Optional[float],
     causal: bool,
+    sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dense bshd forward. Returns (out, softmax_lse)."""
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
     one = torch.ones(1, device=q.device, dtype=torch.float32)
     out, lse, _ = attention_triton_forward_impl(
-        q.contiguous(), k.contiguous(), v.contiguous(),
-        1.0, one, one, one,
-        0.0, softmax_scale, causal, -1, -1,
-        None, None, False, False,
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        1.0,
+        one,
+        one,
+        one,
+        0.0,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        None,
+        None,
+        False,
+        False,
+        None if sink is None else sink.contiguous().float(),
     )
     return out, lse
+
+
+def _lse_delta_views(lse_delta: torch.Tensor, seqlen_q: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split the [B, Hq, seqlen_q * 2] scratch into per-row (lse, delta).
+
+    The forward writes LSE at block offset ``m * BLOCK_M * 2`` and the backward preprocess
+    writes delta at ``+ BLOCK_M`` of the same block, so the two interleave per BLOCK_M rather
+    than per row. BLOCK_M is the module-level FIXED_BLOCK_M, not an autotuned value, so the
+    layout is knowable here. Both views are trimmed back to seqlen_q.
+    """
+    row = torch.arange(seqlen_q, device=lse_delta.device)
+    # Index rather than reshape: the scratch is allocated as seqlen_q * 2, which need not be
+    # a whole number of 2 * BLOCK_M blocks, so a view would be wrong on a ragged tail.
+    lse_idx = (row // FIXED_BLOCK_M) * (2 * FIXED_BLOCK_M) + (row % FIXED_BLOCK_M)
+    return lse_delta[:, :, lse_idx], lse_delta[:, :, lse_idx + FIXED_BLOCK_M]
+
+
+def dense_sink_grad(lse_delta: torch.Tensor, sink: torch.Tensor, seqlen_q: int) -> torch.Tensor:
+    """Gradient of the loss w.r.t. the per-head sink logits.
+
+    The sink is one extra softmax term with no value vector, so ``p_sink = exp(sink - lse)``
+    and its score gradient is ``p_sink * (0 - delta)`` with the same ``delta = o . do`` the
+    backward already computes -- which is also why dq/dk/dv need no kernel change: they read
+    p back from an LSE that already includes the sink.
+
+    Call this only after the backward kernel has filled in delta.
+    """
+    lse, delta = _lse_delta_views(lse_delta, seqlen_q)
+    p_sink = torch.exp(sink.float().view(1, -1, 1) - lse)
+    return -(p_sink * delta).sum(dim=(0, 2)).to(sink.dtype)
 
 
 def dense_backward(
@@ -700,16 +749,38 @@ def dense_backward(
     softmax_lse: torch.Tensor,
     softmax_scale: Optional[float],
     causal: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Dense bshd backward. Returns (dq, dk, dv)."""
+    sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Dense bshd backward. Returns (dq, dk, dv, dsink)."""
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
     one = torch.ones(1, device=q.device, dtype=torch.float32)
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
-    return attention_triton_backward_impl(
-        do.contiguous(), q, k, v, o,
-        one, one, one, 1.0, softmax_lse,
-        None, None, None,
-        None, None, seqlen_q, seqlen_k,
-        softmax_scale, causal, -1, -1, None, False,
+    dq, dk, dv = attention_triton_backward_impl(
+        do.contiguous(),
+        q,
+        k,
+        v,
+        o,
+        one,
+        one,
+        one,
+        1.0,
+        softmax_lse,
+        None,
+        None,
+        None,
+        None,
+        None,
+        seqlen_q,
+        seqlen_k,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        None,
+        False,
     )
+    # dsink needs delta, which the call above writes into softmax_lse in place.
+    dsink = None if sink is None else dense_sink_grad(softmax_lse, sink, seqlen_q)
+    return dq, dk, dv, dsink
