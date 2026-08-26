@@ -328,9 +328,9 @@ def test_locate_left_window_none_for_hole_on_last_row():
     S = 8192
 
     def mask_mod(b, h, q_idx, kv_idx):
-        base = (q_idx >= kv_idx) & ((q_idx - kv_idx) <= W)
-        hole = (q_idx == (S - 1)) & (kv_idx == (S - 1 - 500))  # inside the window
-        return base & (~hole)
+        base = (q_idx >= kv_idx) and ((q_idx - kv_idx) <= W)
+        hole = (q_idx == (S - 1)) and (kv_idx == (S - 1 - 500))  # inside the window
+        return base and not hole
 
     assert _locate_left_window(mask_mod, q_len=S, kv_len=S) is None
 
