@@ -522,6 +522,8 @@ def attn_fwd(
     scores_scaled_shifted,
     exp_scores,
     alibi_slopes,
+    sink,
+    stride_sink_h,
     HQ: tl.constexpr,
     HK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
@@ -539,6 +541,7 @@ def attn_fwd(
     ENABLE_DROPOUT: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     USE_ALIBI: tl.constexpr,
+    USE_SINK: tl.constexpr,
     USE_EXP2: tl.constexpr,
 ):
     start_m = tl.program_id(0)
@@ -867,6 +870,20 @@ def attn_fwd(
         acc *= acc_descale
 
     # epilogue
+    if USE_SINK:
+        # An attention sink is a per-head logit on the same scale as qk_scaled, with no value
+        # vector behind it: it enters the softmax denominator and nothing else. Folding it in
+        # here rather than in the inner loop keeps the running max untouched, and fixes both
+        # the output and the LSE below in one place.
+        # m_i is -inf for a fully masked row; exp(sink - -inf) would be inf, so leave those.
+        sink_logit = tl.load(sink + off_h_q * stride_sink_h).to(tl.float32)
+        if USE_EXP2:
+            RCP_LN2_SINK: tl.constexpr = 1.4426950408889634
+            sink_term = tl.math.exp2((sink_logit - m_i) * RCP_LN2_SINK)
+        else:
+            sink_term = tl.math.exp(sink_logit - m_i)
+        l_i += tl.where(m_i == float("-inf"), 0.0, sink_term)
+
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     l_recip = 1 / l_i[:, None]
     acc = acc * l_recip
