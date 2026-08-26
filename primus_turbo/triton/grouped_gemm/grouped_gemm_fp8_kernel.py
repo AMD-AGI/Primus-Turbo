@@ -91,9 +91,17 @@ class ProbeUnavailable(RuntimeError):
 
 @triton.jit
 def _fp8_block_k_probe_kernel(
-    A, B, C, K, N,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-    TRANS_B: tl.constexpr, CACHE_A: tl.constexpr, CACHE_B: tl.constexpr,
+    A,
+    B,
+    C,
+    K,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    TRANS_B: tl.constexpr,
+    CACHE_A: tl.constexpr,
+    CACHE_B: tl.constexpr,
 ):
     """fp8 matmul mirroring the real kernel's inner loop: same operand layout,
     ``tl.multiple_of`` hints and cache modifiers, so the probe compiles the same
@@ -144,8 +152,17 @@ def _fp8_block_k_is_sane(
         )
         out = torch.empty(M, N, device=device, dtype=torch.float32)
         _fp8_block_k_probe_kernel[(M // block_m, N // block_n)](
-            a, b, out, K, N, BM=block_m, BN=block_n, BK=block_k,
-            TRANS_B=trans_b, CACHE_A=cache_a, CACHE_B=cache_b,
+            a,
+            b,
+            out,
+            K,
+            N,
+            BM=block_m,
+            BN=block_n,
+            BK=block_k,
+            TRANS_B=trans_b,
+            CACHE_A=cache_a,
+            CACHE_B=cache_b,
         )
         torch.cuda.synchronize()
     except Exception as exc:
