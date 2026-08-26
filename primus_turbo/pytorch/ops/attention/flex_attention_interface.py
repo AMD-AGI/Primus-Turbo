@@ -28,15 +28,19 @@ subpackage, one concern per module::
     flex/_validate.py       argument validation
     flex/_routing.py        backend selection (performance routing layer)
     flex/_dispatch.py       lowering onto the varlen (THD) backend
+    flex/_layout.py         bhsd <-> backend layout, without needless copies
 
 The dependency graph is strictly layered and acyclic: ``_config`` / ``_cache`` /
-``_probe`` / ``_routing`` / ``_dispatch`` are leaves, ``_mask_classify`` and
-``_score_mod`` build on them, and only this module depends on everything.
+``_probe`` / ``_routing`` / ``_dispatch`` / ``_layout`` are leaves, ``_mask_classify``
+and ``_score_mod`` build on them, and only this module depends on everything.
 
 Design notes
 ------------
-* torch flex uses the ``bhsd`` (``[B, H, S, D]``) layout; ``flash_attn_func`` is
-  ``bshd`` (``[B, S, H, D]``). We transpose in/out around the backend call.
+* torch flex uses the ``bhsd`` (``[B, H, S, D]``) layout; ``flash_attn_func`` takes a
+  ``[B, S, H, D]``-shaped tensor and reads the real memory order out of its strides.
+  ``transpose(1, 2)`` supplies that shape as a *view*, and bhsd is a layout the backend
+  addresses natively, so the round-trip normally costs no copies at all -- see
+  ``flex/_layout.py`` for the one case that still materialises.
 * Mask semantics are recovered by probing ``block_mask.mask_mod`` on an index grid
   and matching it against fixed templates (see ``flex/_mask_classify.py``).
   Data-dependent / batch-or-head dependent masks are rejected.
@@ -101,6 +105,7 @@ except Exception:  # pragma: no cover - depends on torch version
 
 from .flex._config import _ALIBI_TOL
 from .flex._dispatch import _dispatch_document_varlen
+from .flex._layout import from_backend_layout, to_backend_layout
 from .flex._mask_classify import _classify_block_mask
 from .flex._routing import _backend_accepts, _dispatch_custom, choose_backend
 from .flex._score_mod import _cached_detect_alibi_slopes, _cached_detect_softcap, _is_identity_score_mod
@@ -432,14 +437,17 @@ def flex_attention(
     # the heavy backend kernels to load.
     from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_func
 
-    q_bshd = query.transpose(1, 2).contiguous()
-    k_bshd = key.transpose(1, 2).contiguous()
-    v_bshd = value.transpose(1, 2).contiguous()
+    # bhsd -> the backend's [B,S,H,D] logical shape. transpose(1, 2) is a view; the
+    # backend reads the real memory order out of the strides and addresses bhsd
+    # natively, so this normally copies nothing (see flex/_layout.py).
+    q_be = to_backend_layout(query)
+    k_be = to_backend_layout(key)
+    v_be = to_backend_layout(value)
 
     out = flash_attn_func(
-        q_bshd,
-        k_bshd,
-        v_bshd,
+        q_be,
+        k_be,
+        v_be,
         dropout_p=dropout_p,
         softmax_scale=scale,
         causal=mask_cfg["causal"],
@@ -454,17 +462,16 @@ def flex_attention(
         #   currently always 0.0).
     )
 
-    # ``_return_bshd`` (private, used by flex_attention_bshd) keeps the backend's native
-    # bshd output instead of transposing + copying it back to bhsd -- one full [B,H,S,D]
-    # copy saved per forward (and the matching one per backward).
+    # ``_return_bshd`` (private, used by flex_attention_bshd) hands the backend's native
+    # bshd output straight back instead of restoring the bhsd view.
     if return_lse:
         out_bshd, lse = out
         if _return_bshd:
             return out_bshd, lse
-        return out_bshd.transpose(1, 2).contiguous(), lse
+        return from_backend_layout(out_bshd), lse
     if _return_bshd:
         return out
-    return out.transpose(1, 2).contiguous()
+    return from_backend_layout(out)
 
 
 def flex_attention_bshd(
@@ -487,16 +494,18 @@ def flex_attention_bshd(
 
     Semantically identical to :func:`flex_attention` -- same classification, same
     validation, same errors, same numerics -- but it speaks the backend's own **bshd**
-    layout, so the layout plumbing disappears:
+    layout, so the layout plumbing disappears entirely:
 
-    * :func:`flex_attention` takes torch-flex's ``[B, H, S, D]``. Internally the Turbo
-      kernel wants ``[B, S, H, D]``, so it does ``transpose(1, 2).contiguous()`` on q, k
-      and v and transposes the output back -- **4 full tensor copies per forward**, plus
-      the mirror-image copies on the gradients in backward.
-    * Callers that already hold bshd (or sbhd, one free permute away -- Megatron/
-      Primus-LM attention layers do) pay all of that for nothing. This entry hands the
-      backend the tensor it already has: q/k/v are passed straight through when they are
-      bshd-contiguous, and the output is returned in bshd, so **zero layout copies**.
+    * A bshd caller going through :func:`flex_attention` would have to transpose into
+      bhsd first and take a bhsd-shaped result back, which forces the shape bookkeeping
+      onto the caller even where no bytes move.
+    * This entry hands the backend the tensor it already has and returns the backend's
+      own output buffer: q/k/v pass straight through when they are bshd-contiguous, so
+      **zero layout copies and no transposes on either side**.
+    * :func:`flex_attention` itself is no longer the copying path it once was -- a
+      bhsd-contiguous batch is handed through as a view as well (``flex/_layout.py``).
+      The remaining reason to pick this entry is that bshd in / bshd out needs no
+      transposes at all, and that a ``B == 1`` bhsd input does still get materialised.
 
     Not a drop-in for ``torch.nn.attention.flex_attention.flex_attention`` (its layout
     differs) -- that contract belongs to :func:`flex_attention`, which is unchanged. Use

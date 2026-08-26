@@ -42,8 +42,11 @@ def _dispatch_document_varlen(
     dv = value.shape[-1]
 
     def _pack(t: torch.Tensor) -> torch.Tensor:  # (B,H,S,D) -> (B*S, H, D)
+        # THD wants the tokens of a sequence adjacent, so this copy is real (bhsd bytes
+        # are head-major). ``reshape`` on the non-contiguous transpose already produces a
+        # contiguous result, so no further ``.contiguous()`` is needed.
         b, h, s, d = t.shape
-        return t.transpose(1, 2).reshape(b * s, h, d).contiguous()
+        return t.transpose(1, 2).reshape(b * s, h, d)
 
     q_thd = _pack(query)
     k_thd = _pack(key)

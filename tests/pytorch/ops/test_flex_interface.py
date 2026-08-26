@@ -564,3 +564,136 @@ def test_bshd_entry_document_mask_returns_bshd(capture_varlen_backend):
     out = flex_attention_bshd(q, q.clone(), q.clone(), block_mask=bm)
     assert capture_varlen_backend["called"] is True
     assert out.shape == (1, S, H, D)
+
+
+# ---------------------------------------------------------------------------
+# Layout plumbing: the bhsd entry must not copy q/k/v for nothing.
+#
+# flash_attn_func takes a [B,S,H,D]-shaped tensor and reads the real memory order
+# out of the strides; bhsd is one of the orders it addresses natively, so the
+# transpose can stay a view. See primus_turbo/pytorch/ops/attention/flex/_layout.py.
+# ---------------------------------------------------------------------------
+
+
+def _ptr_capture(monkeypatch, out_layout="bhsd"):
+    """Patch flash_attn_func to record the buffers it was handed.
+
+    ``out_layout`` mimics how the aiter forward allocates its output: bhsd-ordered
+    memory when it was given bhsd, plain bshd otherwise.
+    """
+    seen = {}
+
+    def fake(q, k, v, **kwargs):
+        seen["q_ptr"] = q.data_ptr()
+        seen["k_ptr"] = k.data_ptr()
+        seen["v_ptr"] = v.data_ptr()
+        seen["q_stride"] = tuple(q.stride())
+        seen["q_shape"] = tuple(q.shape)
+        b, s, h, d = q.shape
+        if out_layout == "bhsd":
+            out = torch.empty((b, h, s, d), dtype=q.dtype).permute(0, 2, 1, 3)
+        else:
+            out = torch.empty((b, s, h, d), dtype=q.dtype)
+        seen["out_ptr"] = out.data_ptr()
+        return out
+
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_func",
+        fake,
+        raising=True,
+    )
+    return seen
+
+
+def test_bhsd_entry_passes_qkv_without_copying(monkeypatch):
+    seen = _ptr_capture(monkeypatch)
+    B, H, S, D = 2, 4, 32, 16
+    q, k, v = (_make_bhsd(B, H, S, D) for _ in range(3))
+    flex_attention(q, k, v)
+    # Same buffers, only re-strided: this is the whole point of the change.
+    assert seen["q_ptr"] == q.data_ptr()
+    assert seen["k_ptr"] == k.data_ptr()
+    assert seen["v_ptr"] == v.data_ptr()
+    # Backend still sees the [B,S,H,D] logical shape it documents...
+    assert seen["q_shape"] == (B, S, H, D)
+    # ...with bhsd strides (s0 >= s2 >= s1), which _infer_qkv_format reads back as bhsd.
+    s0, s1, s2, s3 = seen["q_stride"]
+    assert s3 == 1 and s0 >= s2 >= s1
+
+
+def test_bhsd_entry_returns_backend_output_without_copying(monkeypatch):
+    seen = _ptr_capture(monkeypatch, out_layout="bhsd")
+    q, k, v = (_make_bhsd(2, 4, 32, 16) for _ in range(3))
+    out = flex_attention(q, k, v)
+    assert out.shape == (2, 4, 32, 16)
+    assert out.is_contiguous()
+    # The backend allocated in bhsd order, so transposing back is free.
+    assert out.data_ptr() == seen["out_ptr"]
+
+
+def test_bhsd_entry_still_returns_contiguous_when_backend_is_bshd(monkeypatch):
+    # A backend that allocates plain bshd (older/other kernels) must still yield a
+    # contiguous [B,H,S,D] to the caller -- there the copy is genuinely required.
+    seen = _ptr_capture(monkeypatch, out_layout="bshd")
+    q, k, v = (_make_bhsd(2, 4, 32, 16) for _ in range(3))
+    out = flex_attention(q, k, v)
+    assert out.shape == (2, 4, 32, 16)
+    assert out.is_contiguous()
+    assert out.data_ptr() != seen["out_ptr"]
+
+
+def test_bhsd_entry_materialises_at_batch_one(monkeypatch):
+    # B == 1 keeps the bshd-contiguous copy so the sbhd-only FlyDSL / HipKittens
+    # backends stay eligible (attention_impl._sbhd_layout).
+    seen = _ptr_capture(monkeypatch)
+    q, k, v = (_make_bhsd(1, 4, 32, 16) for _ in range(3))
+    flex_attention(q, k, v)
+    assert seen["q_ptr"] != q.data_ptr()
+    s0, s1, s2, s3 = seen["q_stride"]
+    assert s3 == 1 and s0 >= s1 >= s2  # plain bshd
+
+
+def test_bshd_entry_unaffected_by_passthrough_at_batch_one(monkeypatch):
+    # flex_attention_bshd hands in a transposed view of bshd memory; collapsing it
+    # lands back on the caller's own buffer, so nothing is copied at any batch size.
+    seen = _ptr_capture(monkeypatch, out_layout="bshd")
+    for b in (1, 2):
+        q, k, v = (_make_bshd(b, 32, 4, 16) for _ in range(3))
+        flex_attention_bshd(q, k, v)
+        assert seen["q_ptr"] == q.data_ptr()
+
+
+def test_bhsd_and_bshd_entries_agree_on_backend_arguments(monkeypatch):
+    # The layout branch must change buffers only -- never what the kernel is asked for.
+    seen_bhsd = {}
+    seen_bshd = {}
+
+    def make_fake(sink_dict):
+        def fake(q, k, v, **kwargs):
+            sink_dict.update(kwargs)
+            b, s, h, d = q.shape
+            return torch.empty((b, s, h, d), dtype=q.dtype)
+
+        return fake
+
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_func",
+        make_fake(seen_bhsd),
+        raising=True,
+    )
+    q = _make_bhsd(2, 4, 32, 16)
+    flex_attention(q, q.clone(), q.clone(), scale=0.25, dropout_p=0.1)
+
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_func",
+        make_fake(seen_bshd),
+        raising=True,
+    )
+    qb = _make_bshd(2, 32, 4, 16)
+    flex_attention_bshd(qb, qb.clone(), qb.clone(), scale=0.25, dropout_p=0.1)
+
+    assert seen_bhsd.keys() == seen_bshd.keys()
+    for key in seen_bhsd:
+        if isinstance(seen_bhsd[key], torch.Tensor):
+            continue
+        assert seen_bhsd[key] == seen_bshd[key], key
