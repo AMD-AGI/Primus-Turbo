@@ -38,11 +38,5 @@ _DOC_VERIFY_CHUNK = 256
 _ALIBI_TOL = 5e-3
 
 
-# The ALiBi sign convention this layer assumes: Turbo's positive ``alibi_slopes``
-# behaves like flex's ``+slope*(kv-q)``. Empirically resolved on rocm/primus:v26.5;
-# ``check_alibi_sign_convention()`` re-validates it on any other build.
-_ASSUMED_ALIBI_SIGN = 1.0
-
-
 # Relative tolerance for recognising a logits soft-cap (cap*tanh(score/cap)).
 _SOFTCAP_TOL = 1e-2

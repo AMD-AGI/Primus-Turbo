@@ -7,12 +7,11 @@
 """Unit tests for ``flex/_score_mod.py``: ALiBi / soft-cap detection and the sign-convention self-check."""
 
 import math
+from typing import Any, Dict
 
 import pytest
 import torch
 
-from primus_turbo.pytorch.ops.attention.flex import _config as flex_config
-from primus_turbo.pytorch.ops.attention.flex import _score_mod as flex_score_mod
 from primus_turbo.pytorch.ops.attention.flex._score_mod import (
     _detect_alibi_slopes,
     _detect_softcap,
@@ -170,7 +169,7 @@ def _fake_alibi_backend(sign):
 
     def fake(q, k, v, causal=False, alibi_slopes=None, **kwargs):
         q_b, k_b, v_b = (t.transpose(1, 2) for t in (q, k, v))
-        out = flex_score_mod._reference_attention_with_alibi(q_b, k_b, v_b, alibi_slopes, sign, causal=causal)
+        out = _reference_attention_with_alibi(q_b, k_b, v_b, alibi_slopes, sign, causal=causal)
         return out.transpose(1, 2).to(q.dtype)
 
     return fake
@@ -189,9 +188,7 @@ def patch_alibi_backend(monkeypatch):
 
 def test_check_alibi_sign_detects_plus(patch_alibi_backend):
     patch_alibi_backend(1.0)
-    rep = flex_score_mod.check_alibi_sign_convention(
-        device="cpu", dtype=torch.float32, seqlen=64, head_dim=32
-    )
+    rep = check_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
     assert rep["sign"] == 1.0
     assert rep["matches_assumption"] is True
     assert rep["plus_err"] < rep["minus_err"]
@@ -199,25 +196,21 @@ def test_check_alibi_sign_detects_plus(patch_alibi_backend):
 
 def test_check_alibi_sign_detects_minus(patch_alibi_backend):
     patch_alibi_backend(-1.0)
-    rep = flex_score_mod.check_alibi_sign_convention(
-        device="cpu", dtype=torch.float32, seqlen=64, head_dim=32
-    )
+    rep = check_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
     assert rep["sign"] == -1.0
     assert rep["matches_assumption"] is False
 
 
 def test_assert_alibi_sign_passes_on_matching_build(patch_alibi_backend):
-    patch_alibi_backend(flex_config._ASSUMED_ALIBI_SIGN)
-    rep = flex_score_mod.assert_alibi_sign_convention(
-        device="cpu", dtype=torch.float32, seqlen=64, head_dim=32
-    )
+    patch_alibi_backend(_ASSUMED_ALIBI_SIGN)
+    rep = assert_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
     assert rep["matches_assumption"] is True
 
 
 def test_assert_alibi_sign_raises_on_flipped_build(patch_alibi_backend):
-    patch_alibi_backend(-flex_config._ASSUMED_ALIBI_SIGN)
+    patch_alibi_backend(-_ASSUMED_ALIBI_SIGN)
     with pytest.raises(RuntimeError, match="ALiBi sign convention"):
-        flex_score_mod.assert_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
+        assert_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
 
 
 def test_check_alibi_sign_reports_unknown_for_unrelated_backend(monkeypatch):
@@ -226,12 +219,132 @@ def test_check_alibi_sign_reports_unknown_for_unrelated_backend(monkeypatch):
     def no_alibi(q, k, v, causal=False, alibi_slopes=None, **kwargs):
         zeros = torch.zeros_like(alibi_slopes)
         q_b, k_b, v_b = (t.transpose(1, 2) for t in (q, k, v))
-        out = flex_score_mod._reference_attention_with_alibi(q_b, k_b, v_b, zeros, 1.0, causal=causal)
+        out = _reference_attention_with_alibi(q_b, k_b, v_b, zeros, 1.0, causal=causal)
         return out.transpose(1, 2).to(q.dtype)
 
     monkeypatch.setattr("primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_func", no_alibi)
-    rep = flex_score_mod.check_alibi_sign_convention(
-        device="cpu", dtype=torch.float32, seqlen=64, head_dim=32
-    )
+    rep = check_alibi_sign_convention(device="cpu", dtype=torch.float32, seqlen=64, head_dim=32)
     assert rep["sign"] is None
     assert rep["matches_assumption"] is False
+
+
+# ---------------------------------------------------------------------------
+# ALiBi sign-convention self-check.
+#
+# These live in the test suite, not in ``primus_turbo``: they exist purely to
+# prove that this build's ``alibi_slopes`` sign matches what the compat layer
+# assumes, by running one small attention twice against a dense fp32 reference.
+# Nothing in the shipped library calls them.
+# ---------------------------------------------------------------------------
+
+# The ALiBi sign convention the compat layer assumes: Turbo's positive
+# ``alibi_slopes`` behaves like flex's ``+slope*(kv-q)``. Empirically resolved on
+# rocm/primus:v26.5; ``check_alibi_sign_convention()`` re-validates it elsewhere.
+_ASSUMED_ALIBI_SIGN = 1.0
+
+
+def _reference_attention_with_alibi(
+    q_bhsd: torch.Tensor,
+    k_bhsd: torch.Tensor,
+    v_bhsd: torch.Tensor,
+    slopes: torch.Tensor,
+    sign: float,
+    *,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Dense fp32 reference for ``softmax(QK^T/sqrt(d) + sign*slope[h]*(kv-q)) V``."""
+    q = q_bhsd.float()
+    k = k_bhsd.float()
+    v = v_bhsd.float()
+    s_q, s_k = q.shape[-2], k.shape[-2]
+    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(q.shape[-1])
+    q_idx = torch.arange(s_q, device=q.device).view(s_q, 1)
+    kv_idx = torch.arange(s_k, device=q.device).view(1, s_k)
+    scores = scores + sign * slopes.float().view(1, -1, 1, 1) * (kv_idx - q_idx).float()
+    if causal:
+        scores = scores.masked_fill(kv_idx > q_idx, float("-inf"))
+    return torch.matmul(torch.softmax(scores, dim=-1), v)
+
+
+def check_alibi_sign_convention(
+    *,
+    device: Any = None,
+    dtype: torch.dtype = torch.float16,
+    seqlen: int = 256,
+    num_heads: int = 4,
+    head_dim: int = 64,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """Empirically determine this build's ALiBi sign convention.
+
+    The compat layer maps a flex ``score_mod`` of the form ``score + slope*(kv-q)``
+    onto ``flash_attn_func(alibi_slopes=slope)``. Whether the kernel adds
+    ``+slope*(kv-q)`` or ``-slope*(kv-q)`` is a property of the *installed aiter build*,
+    not of this file -- get it wrong and ALiBi results are silently incorrect. This
+    helper runs one small attention through the real backend and scores it against both
+    fp32 references, so a new container/build can be validated in seconds instead of
+    trusting a comment.
+
+    Returns a dict with ``sign`` (``+1.0``/``-1.0``, or ``None`` if neither reference
+    matches), ``plus_err`` / ``minus_err`` (relative L2), ``matches_assumption`` and the
+    ``assumed_sign`` this layer is coded against. Requires a GPU (it calls the real
+    kernel); it raises whatever the backend raises if one is unavailable.
+    """
+    from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_func
+
+    if device is None:
+        device = "cuda"
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    shape = (1, seqlen, num_heads, head_dim)  # bshd for the Turbo backend
+    q = torch.randn(shape, generator=gen, dtype=torch.float32).to(device=device, dtype=dtype)
+    k = torch.randn(shape, generator=gen, dtype=torch.float32).to(device=device, dtype=dtype)
+    v = torch.randn(shape, generator=gen, dtype=torch.float32).to(device=device, dtype=dtype)
+    # Distinct, clearly separated slopes so the two sign hypotheses cannot alias.
+    slopes = torch.tensor([2.0 ** -(i + 1) for i in range(num_heads)], dtype=torch.float32, device=device)
+
+    out = flash_attn_func(q, k, v, causal=True, alibi_slopes=slopes)
+    if isinstance(out, tuple):
+        out = out[0]
+    got = out.transpose(1, 2).float()  # -> bhsd for comparison
+
+    q_b, k_b, v_b = (t.transpose(1, 2) for t in (q, k, v))
+
+    def _rel_l2(sign: float) -> float:
+        ref = _reference_attention_with_alibi(q_b, k_b, v_b, slopes, sign)
+        return float((got - ref).norm() / ref.norm().clamp_min(1e-12))
+
+    plus_err = _rel_l2(1.0)
+    minus_err = _rel_l2(-1.0)
+    # A match must be both small in absolute terms and decisively better than the other
+    # hypothesis; otherwise report "unknown" rather than guessing.
+    best_err, best_sign = min((plus_err, 1.0), (minus_err, -1.0))
+    other_err = max(plus_err, minus_err)
+    sign = best_sign if (best_err < 2e-2 and other_err > 10.0 * best_err) else None
+    return {
+        "sign": sign,
+        "plus_err": plus_err,
+        "minus_err": minus_err,
+        "assumed_sign": _ASSUMED_ALIBI_SIGN,
+        "matches_assumption": sign == _ASSUMED_ALIBI_SIGN,
+        "dtype": str(dtype),
+        "shape": {"seqlen": seqlen, "num_heads": num_heads, "head_dim": head_dim},
+    }
+
+
+def assert_alibi_sign_convention(**kwargs: Any) -> Dict[str, Any]:
+    """Run :func:`check_alibi_sign_convention` and raise unless it matches the assumption.
+
+    Intended as a one-line build gate (CI job, container smoke test, or the first thing
+    a new environment runs) so a flipped-sign build fails loudly instead of quietly
+    producing wrong ALiBi outputs.
+    """
+    report = check_alibi_sign_convention(**kwargs)
+    if not report["matches_assumption"]:
+        raise RuntimeError(
+            "Turbo flex compat layer: the ALiBi sign convention of this build does not match the "
+            f"assumed +slope*(kv-q) (assumed_sign={report['assumed_sign']}, measured "
+            f"sign={report['sign']}, plus_err={report['plus_err']:.3g}, "
+            f"minus_err={report['minus_err']:.3g}). ALiBi results would be silently wrong on this "
+            "build."
+        )
+    return report
