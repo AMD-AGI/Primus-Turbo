@@ -14,7 +14,7 @@ from .flash_attn_usp_interface import (
     flash_attn_usp_func,
     flash_attn_varlen_usp_func,
 )
-from .flex_attention import (
+from .flex_attention_interface import (
     create_block_mask,
     flex_attention,
     flex_attention_bshd,
