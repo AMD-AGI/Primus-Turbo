@@ -664,3 +664,52 @@ def _attention_triton_backward_impl_fake(
         torch.empty_like(v, dtype=bwd_torch_dtype),
     )
     return dq_out, dk_out, dv_out
+
+
+# bf16/fp16 adapters. The impls above take fp8 plumbing (descales, p_scale) that is identity
+# for a non-fp8 call; dq/dk/dv must be None, as passing preallocated returns of the custom op
+# trips torch's aliasing check.
+
+
+def dense_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dense bshd forward. Returns (out, softmax_lse)."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    one = torch.ones(1, device=q.device, dtype=torch.float32)
+    out, lse, _ = attention_triton_forward_impl(
+        q.contiguous(), k.contiguous(), v.contiguous(),
+        1.0, one, one, one,
+        0.0, softmax_scale, causal, -1, -1,
+        None, None, False, False,
+    )
+    return out, lse
+
+
+def dense_backward(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dense bshd backward. Returns (dq, dk, dv)."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    one = torch.ones(1, device=q.device, dtype=torch.float32)
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    return attention_triton_backward_impl(
+        do.contiguous(), q, k, v, o,
+        one, one, one, 1.0, softmax_lse,
+        None, None, None,
+        None, None, seqlen_q, seqlen_k,
+        softmax_scale, causal, -1, -1, None, False,
+    )

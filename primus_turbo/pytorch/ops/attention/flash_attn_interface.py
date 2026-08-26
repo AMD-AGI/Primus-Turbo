@@ -41,6 +41,8 @@ from primus_turbo.pytorch.kernels.attention.attention_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
+    dense_backward as triton_dense_backward,
+    dense_forward as triton_dense_forward,
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
     _infer_qkv_format,
@@ -99,6 +101,14 @@ class FlashAttnFunc(torch.autograd.Function):
         backend: BackendType = BackendType.AITER,
     ):
         ctx.backend = backend
+        if backend == BackendType.TRITON:
+            out, lse = triton_dense_forward(q, k, v, softmax_scale=softmax_scale, causal=causal)
+            if is_grad_enabled and _any_requires_grad(q, k, v):
+                ctx.save_for_backward(q, k, v, out, lse)
+                ctx.softmax_scale = softmax_scale
+                ctx.causal = causal
+            return (out, lse) if return_lse else out
+
         if backend == BackendType.HIPKITTENS:
             # Same sbhd precondition as FlyDSL below, and for the same reason.
             assert _sbhd_layout(q, qkv_format), f"hipkittens dense attention is sbhd only, got {qkv_format}"
@@ -236,6 +246,13 @@ class FlashAttnFunc(torch.autograd.Function):
                 window_size=ctx.window_size,
             )
             dq, dk, dv = (g.permute(1, 0, 2, 3) for g in (dq, dk, dv))
+            return _flash_attn_grads(dq, dk, dv, None, None)
+
+        if ctx.backend == BackendType.TRITON:
+            q, k, v, out, lse = ctx.saved_tensors
+            dq, dk, dv = triton_dense_backward(
+                dout, q, k, v, out, lse, softmax_scale=ctx.softmax_scale, causal=ctx.causal
+            )
             return _flash_attn_grads(dq, dk, dv, None, None)
 
         if ctx.backend == BackendType.FLYDSL:
