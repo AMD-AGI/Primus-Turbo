@@ -20,9 +20,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("hipblaslt_gemm_fp8(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
           "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity,"
           "float beta=0.0, Tensor(a!)? out=None) -> Tensor");
-    m.def(
-        "hipblaslt_gemm_fp4(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
-        "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> Tensor");
+    m.def("hipblaslt_gemm_fp4(Tensor A, Tensor scaleA_inv, Tensor B, Tensor scaleB_inv,"
+          "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity,"
+          "float beta=0.0, Tensor(a!)? out=None) -> Tensor");
     m.def("ck_gemm_fp8(Tensor a, Tensor b, Tensor a_scales, Tensor b_scales, bool transA,"
           "bool transB, ScalarType out_dtype, str granularity) -> Tensor");
 
