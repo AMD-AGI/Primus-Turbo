@@ -271,6 +271,8 @@ def _attn_fwd_inner(
     score_ptrs,
     scores_scaled_shifted_ptrs,
     IS_CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL_QK: tl.constexpr,
     BLOCK_DMODEL_V: tl.constexpr,
@@ -347,6 +349,17 @@ def _attn_fwd_inner(
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+        # Sliding window, in the same bottom-right aligned coordinates the causal mask uses.
+        # Applied on every step, not just the masked ones: a left edge cuts into blocks that
+        # are unmasked under causal alone. A negative bound means that side is unbounded, and
+        # the constexpr compare drops the branch entirely.
+        if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+            win_col = (start_n + tl.arange(0, BLOCK_N))[None, :]
+            win_row = OFFS_M[:, None] + (actual_seqlen_k - actual_seqlen_q)
+            if WINDOW_LEFT >= 0:
+                qk_scaled = tl.where(win_col >= win_row - WINDOW_LEFT, qk_scaled, float("-inf"))
+            if WINDOW_RIGHT >= 0:
+                qk_scaled = tl.where(win_col <= win_row + WINDOW_RIGHT, qk_scaled, float("-inf"))
         if bias_ptrs is not None:
             bias_offs_n = start_n + tl.arange(0, BLOCK_N) if MASK_STEPS else None
             bias = load_fn(bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
@@ -532,6 +545,8 @@ def attn_fwd(
     MAX_SEQLENS_K: tl.constexpr,
     VARLEN: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL_QK: tl.constexpr,
     BLOCK_DMODEL_V: tl.constexpr,
@@ -779,6 +794,8 @@ def attn_fwd(
             scores_scaled_shifted_ptrs,
             # IS_CAUSAL, ....
             False,
+            WINDOW_LEFT,
+            WINDOW_RIGHT,
             BLOCK_M,
             BLOCK_DMODEL_QK,
             BLOCK_DMODEL_V,
@@ -847,6 +864,8 @@ def attn_fwd(
             score_ptrs,
             scores_scaled_shifted_ptrs,
             IS_CAUSAL,
+            WINDOW_LEFT,
+            WINDOW_RIGHT,
             BLOCK_M,
             BLOCK_DMODEL_QK,
             BLOCK_DMODEL_V,
@@ -1155,6 +1174,8 @@ def _bwd_kernel_dkdv(
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     SEQUENCE_PARALLEL: tl.constexpr,
     CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_FP8: tl.constexpr,
@@ -1298,6 +1319,8 @@ def _bwd_kernel_dkdv(
             N_CTX_Q,
             N_CTX_K,
             CAUSAL,
+            WINDOW_LEFT,
+            WINDOW_RIGHT,
         )
 
         q_offset += stride_qh
@@ -1357,6 +1380,8 @@ def _attn_bwd_dkdv(
     N_CTX_Q: tl.constexpr,
     N_CTX_K: tl.constexpr,
     CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
 ):
     idx_block_m = lo // BLOCK_M - 1
 
@@ -1392,6 +1417,15 @@ def _attn_bwd_dkdv(
             col_offset = N_CTX_Q - N_CTX_K
             causal_mask = offs_m[:, None] >= (col_offset + offs_n[None, :])
             qk = tl.where(causal_mask, qk, float("-inf"))
+        # Same sliding window as the forward, in the same coordinates. Kept outside the
+        # CAUSAL branch: a window applies with or without a causal cap.
+        if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+            win_row = offs_m[:, None] + (N_CTX_K - N_CTX_Q)
+            win_col = offs_n[None, :]
+            if WINDOW_LEFT >= 0:
+                qk = tl.where(win_col >= win_row - WINDOW_LEFT, qk, float("-inf"))
+            if WINDOW_RIGHT >= 0:
+                qk = tl.where(win_col <= win_row + WINDOW_RIGHT, qk, float("-inf"))
 
         l_ptrs = ld_offset + (2 * start_m + tl.arange(0, 2 * BLOCK_M)) * stride_ldm
         mask_ldm = tl.ravel(tl.join(mask_m, mask_m))
@@ -1519,6 +1553,8 @@ def _bwd_kernel_dq(
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     SEQUENCE_PARALLEL: tl.constexpr,
     CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_FP8: tl.constexpr,
@@ -1673,6 +1709,8 @@ def _bwd_kernel_dq(
         N_CTX_Q,
         N_CTX_K,
         CAUSAL,
+        WINDOW_LEFT,
+        WINDOW_RIGHT,
     )
 
     dq_ptrs = dq_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
@@ -1715,6 +1753,8 @@ def _attn_bwd_dq(
     N_CTX_Q: tl.constexpr,
     N_CTX_K: tl.constexpr,
     CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
 ):
     idx_block_n = tl.full([1], -1, dtype=tl.int32)
     l_i = tl.gather(lds, index=tl.arange(0, BLOCK_M), axis=0)
@@ -1757,6 +1797,15 @@ def _attn_bwd_dq(
             col_offset = N_CTX_Q - N_CTX_K
             causal_mask = offs_m[:, None] >= (col_offset + offs_n[None, :])
             qk = tl.where(causal_mask, qk, float("-inf"))
+        # Same sliding window as the forward, in the same coordinates. Kept outside the
+        # CAUSAL branch: a window applies with or without a causal cap.
+        if WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0:
+            win_row = offs_m[:, None] + (N_CTX_K - N_CTX_Q)
+            win_col = offs_n[None, :]
+            if WINDOW_LEFT >= 0:
+                qk = tl.where(win_col >= win_row - WINDOW_LEFT, qk, float("-inf"))
+            if WINDOW_RIGHT >= 0:
+                qk = tl.where(win_col <= win_row + WINDOW_RIGHT, qk, float("-inf"))
 
         # compute p
         if USE_EXP2:
