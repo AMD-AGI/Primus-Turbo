@@ -62,10 +62,7 @@ def _get_padding_align_size(tensor: QuantizedTensor):
     """Return the padding alignment for *tensor* based on its granularity."""
     assert isinstance(tensor, QuantizedTensor), "tensor must be a QuantizedTensor"
     if tensor._granularity == ScalingGranularity.TENSORWISE:
-        # Opt-in K-pad: the quant kernel may have widened the last dim to a
-        # multiple of 128 (pad columns are exact zero). Report that alignment so
-        # view/reshape reconstruct the padded buffer; an unpadded tensorwise
-        # tensor (dense, and every aligned shape) reports 0 -> byte-identical.
+        # Report the pad alignment only when the buffer is actually padded, so unpadded stays 0.
         return 128 if tensor._data.size(-1) != tensor.size(-1) else 0
     if (
         tensor._granularity == ScalingGranularity.ROWWISE
@@ -222,12 +219,9 @@ class QuantizedTensor(torch.Tensor):
     ) -> "QuantizedTensor":
         """Quantize *hp_tensor* and return a ``QuantizedTensor`` wrapping it.
 
-        ``pad_align_last`` / ``pad_align_penultimate`` are OPT-IN (default 0 =
-        off, byte-identical to the legacy quant): when >0 the fp8 TENSORWISE
-        quant kernel widens the last / penultimate dim to a multiple of 128 with
-        exact-zero pad, while the wrapper keeps the real ``shape``. Only the fp8
-        TENSORWISE grouped-GEMM path requests this; dense / rowwise / blockwise /
-        MX callers leave them at 0.
+        ``pad_align_last`` / ``pad_align_penultimate`` are opt-in (default 0, off): when >0 the
+        fp8 TENSORWISE cast zero-pads the last / penultimate dim to a multiple of 128 while the
+        wrapper keeps the real ``shape``. Only grouped-GEMM weights request it.
 
         This is the standard way to construct a ``QuantizedTensor`` from a
         high-precision input.  Use ``__new__`` directly only when you already
@@ -625,9 +619,7 @@ class QuantizedTensor(torch.Tensor):
             out = self._dequantize()
 
         # TODO(ruibin): fused unpad in dequantize kernel
-        # Narrow the last dim back to the real extent (K-pad), and — for the
-        # opt-in penultimate pad (weight N -> Np) — the penultimate dim too. Both
-        # narrows are no-ops (contiguous copy only) when the buffer is unpadded.
+        # Narrow both padded dims (last=K, penultimate=weight N) back to real; no-op copy if unpadded.
         if out.ndim == 2:
             out = out[:, : self.size(-1)]
             if out.size(-2) != self.size(-2):

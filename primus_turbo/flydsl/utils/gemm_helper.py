@@ -69,12 +69,9 @@ def uindex(v):
 def resolve_accum_out(out, beta, shape, device, out_dtype):
     """Validate an optional caller-owned ``out``, or allocate one.
 
-    ``beta=0.0`` overwrites and is the default; ``beta=1.0`` makes the epilogue
-    accumulate, which only works against a buffer the caller supplies. The scalar
-    store derives its element byte width from ``out_ty`` (2 for bf16/fp16, 4 for
-    fp32), so an accumulate target may be bf16/fp16/fp32 -- it only has to be
-    contiguous; a non-contiguous ``out`` would be silently replaced by a
-    ``.contiguous()`` copy and the accumulation would land nowhere the caller can see.
+    ``beta=1.0`` accumulates into the caller's buffer, which must be contiguous:
+    a non-contiguous ``out`` is silently swapped for a ``.contiguous()`` copy, so
+    the accumulation would land nowhere the caller can see.
     """
     assert beta in (0.0, 1.0), f"Only beta=0 (overwrite) or beta=1 (accumulate) supported, got {beta}"
     if out is None:
@@ -798,8 +795,7 @@ class StoreCPerTensor:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
-        # Element byte width drives the row-band address arithmetic; fp32 accumulate
-        # targets (bf16/fp16 gemm out -> fp32 main_grad) store 4-byte elements.
+        # Element byte width drives the row-band address arithmetic; fp32 accum targets store 4B.
         self.out_bytes = 4 if out_ty is fx.Float32 else 2
         # Runtime predicate for the accumulate: the deep-K wgrad picks C vs the split scratch
         # on the SRD base at runtime, and only the C piece may add the read-back -- a banked
@@ -1143,8 +1139,7 @@ class StoreCPerTensorRowN(StoreCPerTensor):
                 [self._pack(_val(tj, 2 * h), _val(tj, 2 * h + 1)) for h in range_constexpr(2)]
                 for tj in range_constexpr(self.n_tiles_b)
             ]
-            # All swaps first, then the store burst, to keep the permlane->store hazard off the
-            # critical path of each pair.
+            # All swaps first, then the store burst, to keep the permlane->store hazard off-path.
             runs = [
                 (Vec.from_elements([fx.Int32(v)], fx.Int32).bitcast(self.out_ty), p, r, h)
                 for h in range_constexpr(2)
@@ -1395,16 +1390,10 @@ class StoreCPerTensorCShuffle:
         self.n_tiles_b = n_tiles_b
         self.out_ty = out_ty
         self.beta_is_one = beta_is_one
-        # Element byte width from out_ty: fp32=4, bf16/fp16=2. Everything below (LDS byte
-        # offsets, the read-back _band pitch, and how many elements pack a 128b store) is
-        # derived from it, so the same staging serves an fp32 fused-accum target.
         self.out_b = 4 if out_ty is fx.Float32 else 2
         self.Cc = n_tiles_b * 16  # columns in one 16-row shuffle tile
         self.EPL = (16 * self.Cc) // 64  # out_ty elements each lane re-reads (16*Cc rows/cols / 64 lanes)
-        # One coalesced global store is 128 bits = 16/out_b elements (buffer_store_dwordx4):
-        # 8 x bf16 or 4 x fp32. A lane re-reading more than that (EPL > elems_per_store) emits
-        # EPL//elems_per_store back-to-back 128b stores. EPL must be a multiple of it and fit
-        # in one row.
+        # EPL over one 128b store's worth emits back-to-back stores; must be a multiple and fit a row.
         self.elems_per_store = 16 // self.out_b  # elements packed into one 128b vector store
         assert self.EPL % self.elems_per_store == 0 and self.EPL <= self.Cc, (
             f"CShuffle expects EPL a multiple of {self.elems_per_store} within Cc={self.Cc}; got EPL={self.EPL}"
@@ -1435,8 +1424,7 @@ class StoreCPerTensorCShuffle:
             self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
             self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
         # addr-space 2 (LDS), mirroring G2SLoader.LdsPtr_t. Separate scalar-store
-        # (align = element width: b16 for 16-bit, b32 for fp32) and vector-read
-        # (align 16 = one 128b run) pointer types.
+        # (align 2) and vector-read (align 16) pointer types.
         self._store_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, self.out_b)
         self._read_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 16)
 

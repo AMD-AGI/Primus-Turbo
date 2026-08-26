@@ -62,11 +62,9 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
         PRIMUS_TURBO_CHECK(scale.numel() == 1, "tensorwise scale must be scalar tensor");
         scale_inv = 1.0f / scale;
     } else {
-        // Whole-tensor abs-amax over the real (unpadded) data -> scalar scale. Block
-        // partials + the amax scalar pack into one workspace [0, W]; scale and scale_inv
-        // are their own allocations so the RETURNED scale_inv is 16-byte aligned. (A packed
-        // view at element offset W+2 has an 8200-byte storage_offset that fails
-        // torch.compile's cudagraph output-alignment assert on custom-op outputs.)
+        // Whole-tensor abs-amax over the real (unpadded) data -> scalar scale. scale and
+        // scale_inv get their own allocations (not a packed workspace view) so the returned
+        // scale_inv stays 16-byte aligned for torch.compile's cudagraph output-alignment assert.
         scale                 = torch::empty({}, input.options().dtype(at::kFloat));
         scale_inv             = torch::empty({}, input.options().dtype(at::kFloat));
         const int64_t w       = tensorwise_amax_workspace_elems();

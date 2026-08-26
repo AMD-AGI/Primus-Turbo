@@ -92,8 +92,7 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8CKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8CKBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
-        # This backend writes the full operand pitch, so it can't produce a tight output;
-        # decline only when a shrinking tight output is requested (n_real < operand free dim).
+        # Writes the full operand pitch, so it can't shrink to a tight output; decline only when asked.
         n_real = kwargs.get("n_real", None)
         if n_real is not None:
             n_operand = b.shape[-2] if trans_b else b.shape[-1]
@@ -159,8 +158,6 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         supported = True
         # This backend has no beta=1 accumulate epilogue.
         supported &= not inplace_add_to_out
-        # This backend writes the full operand pitch, so it can't produce a tight (shrunk) output;
-        # admit a real-dim hint only when it equals the operand pitch (an aligned shape = no-op).
         mr = kwargs.get("m_real", None)
         nr = kwargs.get("n_real", None)
         if mr is not None or nr is not None:
@@ -244,7 +241,6 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8HipblasltBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8HipblasltBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
-        # Can't produce a tight output; decline only when one is requested (n_real < operand pitch).
         n_real = kwargs.get("n_real", None)
         if n_real is not None:
             n_operand = b.shape[-2] if trans_b else b.shape[-1]
@@ -308,8 +304,6 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
-        # This backend writes the full operand pitch, so it can't produce a tight (shrunk) output;
-        # admit a real-dim hint only when it equals the operand pitch (an aligned shape = no-op).
         mr = kwargs.get("m_real", None)
         nr = kwargs.get("n_real", None)
         if mr is not None or nr is not None:
@@ -801,10 +795,6 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
     ) -> bool:
         supported = True
         if inplace_add_to_out:
-            # Fused bgrad-accum: out_dtype stays the (16-bit) weight dtype and gates the fp8
-            # input pair below; the accumulate target ``out`` (Megatron main_grad) may be fp32.
-            # The store dtype is derived from ``out.dtype`` in execute -- fp32 is written
-            # natively by the scalar epilogue (tensorwise only; MX stays 16-bit).
             _out_allowed = (
                 (torch.bfloat16, torch.float16)
                 if granularity == ScalingGranularity.MX_BLOCKWISE
@@ -861,10 +851,7 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         beta = 1.0 if inplace_add_to_out else 0.0
         accum_out = out if inplace_add_to_out else None
 
-        # tensorwise N/K-pad: m_real=OUT_M (real N), n_real=OUT_N (real K) shrink the C
-        # extents from the padded operand pitch to the tight output. tight now accumulates
-        # natively in the scalar epilogue (beta=1 read-back rides the tight band SRD), so
-        # fused bgrad-accum folds straight into the tight fp32 main_grad -- no host add_.
+        # m_real/n_real shrink the C extents from the padded operand pitch to the tight output.
         m_real = kwargs.get("m_real", None)
         n_real = kwargs.get("n_real", None)
         c_tight = m_real is not None or n_real is not None
@@ -892,8 +879,6 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
                 out=accum_out,
             )
 
-        # When accumulating, the store width follows the real target (main_grad, possibly
-        # fp32); out_dtype only carried the 16-bit weight dtype for input gating.
         store_dtype = accum_out.dtype if accum_out is not None else out_dtype
         return grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
             lhs,
@@ -1158,10 +1143,6 @@ def grouped_gemm_fp8_impl_meta(
     ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
     assert trans_a == False, "Only trans_a=False is supported."
 
-    # MX over-allocates to the padded input rows; group_offs_out maps each group
-    # into the tight layout and the caller slices [:total_m]. n_real (tensorwise
-    # N/K-pad) shrinks the output free dim from the padded operand pitch to the
-    # real extent, so the returned tensor is already tight.
     m = a.shape[1] if trans_a else a.shape[0]
     n = n_real if n_real is not None else (b.shape[-2] if trans_b else b.shape[-1])
     return torch.empty((m, n), device=a.device, dtype=out_dtype)
@@ -1207,8 +1188,6 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     n = b.shape[-2] if trans_b else b.shape[-1]
     if trans_c:
         m, n = n, m
-    # tensorwise N/K-pad: C output free dims shrink from the padded operand pitch
-    # to the real (m_real=N, n_real=K) extents so grad_b comes back tight [G, N, K].
     if m_real is not None:
         m = m_real
     if n_real is not None:

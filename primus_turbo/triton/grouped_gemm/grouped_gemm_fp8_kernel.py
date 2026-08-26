@@ -604,8 +604,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     assert K_a == K_b, f"K mismatch: a has K={K_a}, b has K={K_b}"
     K = K_a
 
-    # N/K-pad tight: shrink the compute/store width to the real N; the padded operand
-    # pitch (stride_bn) is untouched, so the kernel reads padded rows but writes tight.
+    # Operand pitch stays padded, so the kernel reads padded rows but stores the real N.
     if n_real is not None:
         assert 0 < n_real <= N, f"n_real={n_real} must be in (0, N={N}]"
         N = n_real
@@ -741,9 +740,7 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    # N/K-pad tight output: operands carry padded output free dims (OUT_M=Np, OUT_N=Kp)
-    # but only the real (m_real, n_real) block is computed/stored -> tight, no un-pad
-    # slice. Operand pitches stay padded; the contraction (token) dim is never padded.
+    # Operand pitches stay padded; compute/store only the real (m_real, n_real) block.
     if m_real is not None:
         assert 0 < m_real <= OUT_M, f"m_real={m_real} must be in (0, OUT_M={OUT_M}]"
         OUT_M = m_real

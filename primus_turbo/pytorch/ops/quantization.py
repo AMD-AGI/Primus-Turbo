@@ -72,16 +72,12 @@ def quantize_fp8(
             2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
 
-        ``pad_align_last`` / ``pad_align_penultimate`` are OPT-IN (default 0 =
-        off) and only apply to TENSORWISE fp8: when >0 the cast also widens the
-        last (K) / penultimate (weight N) dim to a multiple of 128 with exact-zero
-        pad. The scalar amax is computed over the real data before padding, so the
-        scale is pad-invariant.
+        ``pad_align_last`` / ``pad_align_penultimate`` are opt-in (default 0, off), TENSORWISE
+        fp8 only: when >0 the cast zero-pads the last (K) / penultimate (weight N) dim to a
+        multiple of 128. The scale is computed pre-pad, so it stays pad-invariant.
     """
     if granularity == ScalingGranularity.TENSORWISE:
-        # Single path: (k_align=1, pad_n=False) hits the same cpp op with the same (1, 1)
-        # args as the legacy non-pad cast, so it is byte-identical for dense/aligned callers;
-        # only grouped weights that request a pad widen K/N.
+        # (k_align=1, pad_n=False) matches the legacy cast byte-for-byte; only padded callers widen K/N.
         return quantize_fp8_tensorwise_pad_impl(
             x,
             out_dtype,

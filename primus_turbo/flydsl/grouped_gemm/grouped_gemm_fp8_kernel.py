@@ -236,17 +236,11 @@ def _compile_grouped_nn(
     # Known N: scalar epilogue columns are always < N, so the per-element OOB compare is dead (mask kept when N % LDS_BLOCK_N != 0).
     _col_safe = N > 0 and (N % BLOCK_N == 0 or (nn_halfn and N % LDS_BLOCK_N == 0))
     _nb_c = ceildiv(N, BLOCK_N) if N > 0 else 0  # compile-time N-block count (0 = take it from c_n)
-    # Pad-both: B is stored with a padded N pitch (n_stride) but only the real N columns are
-    # computed/stored. NS = the compile-time B row/group pitch (physical storage); N stays the
-    # real compute/output width (_nb_c, _col_safe, store clamp). NS==N when not padding.
+    # Pad-both: B carries a padded N pitch NS; only the real N columns are computed/stored.
     NS = n_stride if n_stride else N
     assert n_stride == 0 or NS >= N > 0, f"n_stride={n_stride} must be >= real N={N}"
     # Group-offs table form (see _SGPR_GO_MAX_G): SGPR/s_buffer_load vs lane-resident gather.
     _sgo = G <= _SGPR_GO_MAX_G
-    # B[G,K,N] spans < 2^31 elements: its SRD base/extent then stay int32, and each group's base
-    # is a compile-time constant that drops straight out of the tile decode. _B_GRP=1 keeps the
-    # runtime form (the decode yields the plain group index and the caller scales it). Keyed on
-    # the physical span (NS pitch) so a padded B never folds to a too-small literal base.
     _b32 = N > 0 and G * K * NS < 2**31
     _B_GRP = K * NS if _b32 else 1
     # A (dY) row pitch is K, so K%128!=0 straddles every other row's K-block across a cache
@@ -399,8 +393,6 @@ def _compile_grouped_nn(
             # Fold each tile element base into the i64 SRD base; in-tile offsets stay int32, num_records clamps to the group.
             # All of these are non-negative, so index_castui: the signed cast sign-extends, which drags a
             # 64-bit multiply-and-carry chain behind every base and extent.
-            # B row pitch = padded storage pitch NS whenever it is a compile-time literal (_b32
-            # or padding); runtime c_n only when the physical span is unknown and unpadded.
             cn_i = arith.index(NS) if const_expr(_b32 or n_stride) else arith.index_cast(T.index, c_n)
             # Sheared A: the line-aligned windows start up to (m_row*K)%128 bytes before the
             # tile's first row, so the SRD base drops back by that much and every A offset
@@ -442,7 +434,6 @@ def _compile_grouped_nn(
                 )
             else:
                 gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-            # B g2s pitch also rides the padded storage pitch NS when padding is set.
             _b_pitch = fx.Int32(NS) if const_expr(n_stride) else c_n
             gl_off_b = compute_global_swizzle_nn(lane_id, wave_id, _b_pitch, N_LDS_ROUNDS, wswz=_nnwz)
 
@@ -972,16 +963,8 @@ def _compile_grouped_nt(
         if glu
         else (1 if (nt_dist2 and N > 0 and 0 < N % BLOCK_N <= LDS_BLOCK_N // 2) else N_TILES_B)
     )
-    # Pad-both: B_T=[G,NS,KS] is stored with a padded N row-count (n_stride) but only the real
-    # N rows are computed/stored. NS = the compile-time B_T group N-count (physical storage); N
-    # stays the real compute/output width (_nb_c, _col_safe, store clamp). NS==N when not padding.
     NS = n_stride if n_stride else N
     assert n_stride == 0 or NS >= N > 0, f"n_stride={n_stride} must be >= real N={N}"
-    # Physical B_T row-count per group: gate+up width 2*glu_i under GLU (weight [G, 2I, KS]),
-    # else the padded storage pitch NS. B_T[G,rows,KS] spans < 2^31 elements -> SRD base/extent
-    # stay int32 and each group's base is a compile-time constant that drops out of the tile
-    # decode. _B_GRP=1 keeps the runtime form. Keyed on the physical span so a padded/GLU B_T
-    # never folds to a too-small literal base.
     _bn_rows = 2 * glu_i if glu else NS
     _b32 = N > 0 and G * _bn_rows * KS < 2**31
     _B_GRP = _bn_rows * KS if _b32 else 1
@@ -1119,8 +1102,6 @@ def _compile_grouped_nt(
                 b_base = uindex(_b_off)
                 b_nrec = arith.index(G * _bn_rows * KS) - b_base
             else:
-                # Runtime B_T group N-count: 2*c_n under glu (gate+up rows), the padded NS under
-                # pad-both, else the plain runtime c_n. Mirrors _bn_rows (glu takes priority).
                 bn_i = (
                     arith.index_cast(T.index, c_n * fx.Int32(2))
                     if const_expr(glu)
@@ -2358,7 +2339,6 @@ def _autotune_np_dispatch(
     (op,N,K,G,dtype,regime), never per M_total. regime==1 -> fixed bm128. Candidates carry the
     caller's ``beta_is_one``; the probe owns its buffer and zeroes it per launch (C = 0 + acc)."""
     # NN B[K,N] traversal: re-base B SRD per load in i64 when the per-group span K*N reaches 2^32 fp8.
-    # Under pad-both the physical B pitch is n_stride (>=N), so key i64 on the padded span.
     i64_tr = (not trans_b) and (K * max(N, n_stride) >= 2**32)
 
     def mk(bm, xcd, gm, gn):
@@ -2505,9 +2485,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     K_b = b.shape[2] if trans_b else b.shape[1]
     assert K == K_b, f"K mismatch a={K} b={K_b}"
 
-    # Pad-both: b is stored with a padded N pitch; n_real gives the true compute/output width.
-    # n_stride = the padded storage pitch (b's N dim), N collapses to the real width so the out
-    # buffer, autotune key and epilogue clamps all track the real N.
+    # Pad-both: n_real is the real width -> n_stride carries the padded pitch, N collapses to real.
     n_stride = 0
     if n_real is not None and n_real != N:
         assert 0 < n_real < N, f"n_real={n_real} must be in (0, N={N})"
@@ -2615,8 +2593,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
 
 _GROUPED_WGRAD_LAUNCH_CACHE: dict = {}
 _GROUPED_WGRAD_AT_CACHE: dict = {}
-# Winning wgrad config, keyed beta-INDEPENDENTLY: the race times candidates at beta=0, so beta=0
-# and beta=1 share the same config -> the fused-accum launch gets identical geometry/perf.
+# Winning wgrad config keyed beta-INDEPENDENTLY: raced at beta=0, so beta=0/beta=1 reuse it (a tight beta=1 build would fault in the race).
 _GROUPED_WGRAD_CFG_CACHE: dict = {}
 
 
@@ -3200,8 +3177,7 @@ def _wave4_do_tile_tn(
     C_M=None,
     C_N=None,
 ):
-    # Pad-both tight output: operands A/B keep their padded pitch (OUT_M/OUT_N); C is written at
-    # the real (tight) pitch C_M/C_N when the caller shrinks it, else the padded OUT_M/OUT_N.
+    # Pad-both: A/B stay at padded OUT_M/OUT_N; C is written at the tight C_M/C_N (else padded).
     if C_M is None:
         C_M = OUT_M
     if C_N is None:
@@ -3430,8 +3406,7 @@ def _wave4_geometry(*, block_m, block_n, block_k, cs, csa, out_fp16, out_fp32=Fa
     """Derived 4-wave tile/LDS geometry shared by both grouped factories (trans_b-agnostic,
     factory-scope Python). ``csa``/``cs`` are the A/B LDS column strides (wgrad shares one
     _CS, dgrad uses _CSA/_CS); EPI_PAD keeps the CShuffle epilogue LDS-bank-conflict-free.
-    fp32 doubles the CShuffle staging byte width, so EPI_PAD drops to 0 to keep the aliased
-    C staging inside a single A buffer; the 16-bit path keeps the conflict-free pad."""
+    fp32 doubles the CShuffle staging width, so EPI_PAD drops to 0 to keep C staging in one A buffer."""
     n_waves = 4
     n_tiles_a = block_m // 64
     n_tiles_b = block_n // 64
@@ -3626,8 +3601,6 @@ def _compile_grouped_tn_wgrad_4wave(
     a_lds_size = _geo.a_lds_size
     b_lds_size = _geo.b_lds_size
     _cshuf_ty = _geo.cshuf_ty
-    # Pad-both tight output: A/B operands keep their padded pitch (OUT_M/OUT_N); the tile grid and
-    # C use the real extent (_C_M/_C_N) when c_tight, so no pad rows/cols are ever launched or written.
     _M_VALID = m_real if m_real else OUT_M
     _N_VALID = n_real if n_real else OUT_N
     assert 0 < _M_VALID <= OUT_M, f"m_real={m_real} out of range for OUT_M={OUT_M}"
@@ -3683,8 +3656,7 @@ def _compile_grouped_tn_wgrad_4wave(
     _BND_WN = LDS_BLOCK_N // 2
     _BND_B_NARROW = _HALF_N and _BND_NTB * _WAVE_N * 16 <= _BND_WN and (_BND_WN * BLOCK_K) % (256 * 16) == 0
     _BND_NSB = (_BND_WN * BLOCK_K) // (256 * 16) if _BND_B_NARROW else N_LDS_STEPS_B
-    # Every stored column is < _C_N at compile time, so the epilogue per-element OOB select is
-    # dead: the b0-only body ends exactly on _C_N and no full body reaches the last N-block.
+    # Every stored column is < _C_N at compile time, so the epilogue per-element OOB select is dead.
     _COL_SAFE = (_C_N % BLOCK_N == 0) or (_HALF_N and _BND_NTB * _WAVE_N * 16 == _C_N % BLOCK_N)
     # Deep-K split geometry, independent of the tile map and the chosen candidate: a slice brings its
     # own group index and a plain in-group block position, so the host scratch and every candidate
@@ -3880,11 +3852,7 @@ def _compile_grouped_tn_wgrad_4wave(
                 if const_expr(_HALF_M and _HALF_N):
                     if _readfirstlane_i32(_blk_m) == fx.Int32(N_BLOCKS_M - 1):
                         if _readfirstlane_i32(_blk_n) == fx.Int32(N_BLOCKS_N - 1):
-                            # The 2-pool (a0-only, b0-only) corner faults the tight beta=1 epilogue
-                            # read-back (flydsl codegen in the n_pools==2 whole-loop). tight routes
-                            # the corner to the 3-pool (full-M, b0-only) body -- keeps the half-N
-                            # column narrowing, drops half-M on this one tile. c_tight is compile
-                            # time and beta-independent, so beta=1 keeps beta=0's geometry/perf.
+                            # The 2-pool (a0-only,b0-only) corner faults the tight beta=1 read-back, so tight routes it to the 3-pool body.
                             if const_expr(c_tight):
                                 _do_tile_3buf(t, 2, 1, **_sl)
                             else:
@@ -4153,7 +4121,6 @@ def _compile_grouped_tn_wgrad_4wave(
                                 mask=col_ok,
                             )
                         )
-                    # fp32 C sums the bands directly; bf16/fp16 widens to fp32, sums, narrows on store.
                     if const_expr(out_fp32):
                         acc = parts[0]
                         for v in parts[1:]:
@@ -4301,14 +4268,8 @@ def _autotune_wgrad_dispatch(
     c_tight=False,
 ):
     """Race the wgrad candidates and return a ``finalize(beta_is_one) -> raw launch`` factory,
-    cached per static (OUT_M,OUT_N,G,dtype,i64,tight,fp32), never per m_total; the scoring load is
-    balanced, static-shape, CUDA-graph safe.
-
-    The race ALWAYS times candidates at beta=0 (plain overwrite into a scratch C): beta only adds
-    the epilogue read-back, which is prefetch-all-in-flight (non-blocking), so the winning config is
-    beta-independent. This keeps the fused-accum (beta=1) launch on the SAME config as the plain
-    (beta=0) one -- identical geometry, identical perf -- and never compiles a beta=1 build inside
-    the race (a tight beta=1 candidate would fault on the synthetic probe's padded operands)."""
+    cached per static (OUT_M,OUT_N,G,dtype,i64,tight,fp32), never per m_total. Racing at beta=0 keeps
+    the winner beta-independent (a beta=1 build never enters the race, where a tight one would fault)."""
 
     lhs_live, rhs_live = args[0], args[1]
     M_total = lhs_live.shape[0]
@@ -4346,8 +4307,7 @@ def _autotune_wgrad_dispatch(
         )
 
     _ncu = torch.cuda.get_device_properties(lhs_live.device).multi_processor_count
-    # Candidate tile geometry follows the C EXTENT (real when c_tight, padded otherwise), so the
-    # xcd-affine group_m/group_n divide the same N_BLOCKS the compile derives from _C_M/_C_N.
+    # Candidate tile geometry follows the C extent (real under c_tight) so group_m/group_n match the compile's N_BLOCKS.
     _GM = m_real if (c_tight and m_real) else OUT_M
     _GN = n_real if (c_tight and n_real) else OUT_N
     wave4_cands = _wgrad_4wave_cands(_GM, _GN, G, _ncu)
@@ -4397,9 +4357,6 @@ def _autotune_wgrad_dispatch(
 
         return prod
 
-    # Correctness reference: the first 4-wave candidate at beta=0; masked kernel only as a
-    # compile/NaN fallback for i64 huge shapes. ``best_cfg`` is the winning 4-wave config tuple,
-    # or None -> masked fallback.
     prod = None
     best_cfg = None
     if not i64_traverse:
@@ -4462,7 +4419,6 @@ def _autotune_wgrad_dispatch(
     if best_cfg is None:
         return _build_masked
     _cfg = best_cfg
-    # beta chosen only now, at the real launch -> beta=0 and beta=1 share this one config.
     return lambda beta_is_one: _compile_4wave(*_cfg, beta_is_one=beta_is_one)
 
 
@@ -4483,16 +4439,13 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     """FlyDSL per-tensor variable-K grouped fp8 GEMM (wgrad), matching the Triton entry.
     C[g] = lhs[g]^T @ rhs[g] * lhs_scale * rhs_scale, out [G, C_M, C_N]; group_offs [G+1]
     int splits M. The caller (backend) has already applied the trans_c lhs/rhs swap.
-    Pad-both tight output: lhs/rhs stay padded to OUT_M/OUT_N; when c_tight, m_real/n_real
-    give the real (N, K) extents and C collapses onto the tight [G, m_real, n_real]. out_dtype
-    may be fp32 (fused bgrad-accum target) -- the scalar epilogue derives its width from it."""
+    Pad-both: lhs/rhs stay padded to OUT_M/OUT_N; c_tight + m_real/n_real collapse C to [G, m_real, n_real]. out_dtype may be fp32."""
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0], f"M_total mismatch lhs={lhs.shape[0]} rhs={rhs.shape[0]}"
     OUT_M = lhs.shape[1]
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    # Real (tight) C extent: operands keep the padded OUT_M/OUT_N pitch; C shrinks to _C_M/_C_N.
     _m_real = m_real if m_real is not None else OUT_M
     _n_real = n_real if n_real is not None else OUT_N
     assert 0 < _m_real <= OUT_M and 0 < _n_real <= OUT_N
@@ -4502,7 +4455,6 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
 
     out = resolve_accum_out(out, beta, (G, C_M, C_N), lhs.device, out_dtype)
     beta_is_one = beta == 1.0
-    # Split-K scratch mirrors C's own layout (pitch C_M/C_N, out_dtype width) to keep the skew path live for a tight/fp32 C.
     ws = _wgrad_split_ws(C_M, C_N, G, lhs.device, out_dtype)
     # kernel reads group_offs as int64 low-words via a free int32-view (no .to(int32) cast).
     _go64 = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
@@ -4526,9 +4478,6 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
     # out of it, never looking at the offset table's CONTENT.
     out2d = out.view(G * C_M, C_N)
     wargs = (lhs_i8, rhs_i8, out2d, lsf, rsf, go32, ws, M_total, stream)
-    # The race is beta-independent (it times candidates at beta=0), so cache the winning config
-    # WITHOUT beta: beta=0 and beta=1 pick the SAME config -> the fused-accum launch has identical
-    # geometry/perf to the plain one, and no tight beta=1 build is ever raced (which would fault).
     cfg_key = (OUT_M, OUT_N, G, out_fp16, cbsz, blgp, i64_tr, out_fp32, C_M, C_N, _tight)
     finalize = _GROUPED_WGRAD_CFG_CACHE.get(cfg_key)
     if finalize is None:
@@ -4547,8 +4496,7 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
             c_tight=_tight,
         )
         _GROUPED_WGRAD_CFG_CACHE[cfg_key] = finalize
-    # beta_is_one is baked into the kernel (the epilogue reads C back), so the compiled artifact
-    # keys on it -- but it reuses the beta-independent winning config from the race above.
+    # beta_is_one is baked into the kernel (the epilogue reads C back), so the compiled artifact keys on it.
     at_key = (cfg_key, beta_is_one)
     entry = _GROUPED_WGRAD_AT_CACHE.get(at_key)
     if entry is None:
