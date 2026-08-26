@@ -106,11 +106,14 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         ctx.backend = backend
         if backend == BackendType.TRITON:
-            out, lse = triton_dense_forward(q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink)
+            out, lse = triton_dense_forward(
+                q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink, window_size=window_size
+            )
             if is_grad_enabled and _any_requires_grad(q, k, v, sink):
                 ctx.save_for_backward(q, k, v, out, lse, sink)
                 ctx.softmax_scale = softmax_scale
                 ctx.causal = causal
+                ctx.window_size = window_size
             return (out, lse) if return_lse else out
 
         if backend == BackendType.HIPKITTENS:
@@ -255,7 +258,16 @@ class FlashAttnFunc(torch.autograd.Function):
         if ctx.backend == BackendType.TRITON:
             q, k, v, out, lse, sink = ctx.saved_tensors
             dq, dk, dv, dsink = triton_dense_backward(
-                dout, q, k, v, out, lse, softmax_scale=ctx.softmax_scale, causal=ctx.causal, sink=sink
+                dout,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                softmax_scale=ctx.softmax_scale,
+                causal=ctx.causal,
+                sink=sink,
+                window_size=ctx.window_size,
             )
             return _flash_attn_grads(dq, dk, dv, None, dsink)
 

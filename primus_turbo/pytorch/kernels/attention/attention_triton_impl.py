@@ -69,9 +69,6 @@ def attention_triton_forward_impl(
     sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-    assert window_size_left == -1 and window_size_right == -1, (
-        "in triton attn kernel, window_size_left and window_size_right must be -1."
-    )
     assert q.is_contiguous()
     assert k.is_contiguous()
     assert v.is_contiguous()
@@ -236,6 +233,8 @@ def attention_triton_forward_impl(
         MAX_SEQLENS_Q=max_seqlens_q,
         MAX_SEQLENS_K=max_seqlens_k,
         IS_CAUSAL=causal,
+        WINDOW_LEFT=window_size_left,
+        WINDOW_RIGHT=window_size_right,
         VARLEN=is_varlen,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
@@ -324,10 +323,6 @@ def attention_triton_backward_impl(
     alibi_slopes: Optional[torch.Tensor],
     use_fp8: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
-    assert window_size_left == -1 and window_size_right == -1, (
-        "in triton attn kernel, window_size_left and window_size_right must be -1."
-    )
 
     use_exp2 = True
     layout = "bshd"
@@ -542,6 +537,8 @@ def attention_triton_backward_impl(
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
         SEQUENCE_PARALLEL=sequence_parallel,
         CAUSAL=causal,
+        WINDOW_LEFT=window_size_left,
+        WINDOW_RIGHT=window_size_right,
         USE_EXP2=use_exp2,
         IS_VARLEN=is_varlen,
         USE_FP8=use_fp8,
@@ -617,6 +614,8 @@ def attention_triton_backward_impl(
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
         SEQUENCE_PARALLEL=sequence_parallel,
         CAUSAL=causal,
+        WINDOW_LEFT=window_size_left,
+        WINDOW_RIGHT=window_size_right,
         USE_EXP2=use_exp2,
         IS_VARLEN=is_varlen,
         USE_FP8=use_fp8,
@@ -683,6 +682,7 @@ def dense_forward(
     softmax_scale: Optional[float],
     causal: bool,
     sink: Optional[torch.Tensor] = None,
+    window_size: Tuple[int, int] = (-1, -1),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dense bshd forward. Returns (out, softmax_lse)."""
     if softmax_scale is None:
@@ -699,8 +699,8 @@ def dense_forward(
         0.0,
         softmax_scale,
         causal,
-        -1,
-        -1,
+        window_size[0],
+        window_size[1],
         None,
         None,
         False,
@@ -750,6 +750,7 @@ def dense_backward(
     softmax_scale: Optional[float],
     causal: bool,
     sink: Optional[torch.Tensor] = None,
+    window_size: Tuple[int, int] = (-1, -1),
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Dense bshd backward. Returns (dq, dk, dv, dsink)."""
     if softmax_scale is None:
@@ -776,8 +777,8 @@ def dense_backward(
         seqlen_k,
         softmax_scale,
         causal,
-        -1,
-        -1,
+        window_size[0],
+        window_size[1],
         None,
         False,
     )

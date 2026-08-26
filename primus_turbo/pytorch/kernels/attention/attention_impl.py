@@ -301,9 +301,6 @@ class DenseAttnFwdTritonBackend(KernelBackend):
             return False
         if k is None or v is None or qkv_format != "bshd":
             return False
-        # attention_triton_forward_impl asserts window_size_left == window_size_right == -1.
-        if tuple(window_size) != (-1, -1):
-            return False
         # No kernel support for these; returning True would compute a wrong answer silently.
         if bias is not None or alibi_slopes is not None:
             return False
@@ -316,7 +313,9 @@ class DenseAttnFwdTritonBackend(KernelBackend):
 
     @staticmethod
     def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, sink=None, **kwargs):
-        out, lse = _triton_dense_forward(q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink)
+        out, lse = _triton_dense_forward(
+            q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink, window_size=window_size
+        )
         return (out, lse) if return_lse else out
 
 
