@@ -78,6 +78,7 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         granularity: ScalingGranularity,
         preshuffled: bool = False,
         inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
         # HipBLASLt vendor wrapper has no preshuffle plumbing (see
@@ -87,8 +88,13 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
             return False
 
         supported = True
-        # TODO: this backend has no beta=1 accumulate epilogue yet.
-        supported &= not inplace_add_to_out
+        if inplace_add_to_out:
+            supported &= out is not None and out.is_contiguous()
+            supported &= out is not None and out.dtype in (
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+            )
         supported &= not is_gfx942()
         # check ScalingGranularity
         supported &= granularity in GEMMFP4HipBLASLtBackend.SUPPORTED_GRANULARITIES
@@ -121,6 +127,9 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
     ):
         # preshuffled is accepted only so the dispatcher's uniform
         # execute(**kwargs) call works; can_handle already rejected the
@@ -128,7 +137,17 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         del preshuffled
         # TODO(ruibin): Add padding
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp4(
-            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
+            a,
+            a_scale_inv,
+            b,
+            b_scale_inv,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity.name,
+            1.0 if inplace_add_to_out else 0.0,
+            out if inplace_add_to_out else None,
         )
 
 
@@ -331,9 +350,37 @@ class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
     _cache = TuneCache(1024)
 
     @classmethod
-    def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, preshuffled=False, **kwargs):
+    def make_key(
+        cls,
+        a,
+        b,
+        trans_a,
+        trans_b,
+        trans_c,
+        out_dtype,
+        granularity,
+        preshuffled=False,
+        inplace_add_to_out=False,
+        **kwargs,
+    ):
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
-        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity, preshuffled)
+        # Not every backend carries the beta=1 epilogue, so a choice tuned for the
+        # plain GEMM must not be reused for the accumulating one (a cache hit skips
+        # can_handle and would call a backend that ignores `out`).
+        return (
+            m,
+            n,
+            k,
+            a.dtype,
+            b.dtype,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity,
+            preshuffled,
+            inplace_add_to_out,
+        )
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp4_impl", mutates_args=(), device_types="cuda")
