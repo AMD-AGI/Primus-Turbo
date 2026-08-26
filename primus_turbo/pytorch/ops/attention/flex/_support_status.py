@@ -1,6 +1,8 @@
+###############################################################################
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
+###############################################################################
 
 """Machine-readable capability manifest for the flex-attention compatibility layer.
 
