@@ -16,10 +16,28 @@ template <typename T>
 void compute_scale_from_amax(const T *amax, const T q_max, T *scale, T *scale_inv, const int64_t n,
                              hipStream_t stream, const float eps = 1e-12);
 
+// Whole-tensor abs-amax -> scale / scale_inv for tensorwise quant: two launches
+// (nontemporal stream + finalise) vs the generic reduce_row chain's four, output
+// bit-identical. `workspace` needs `tensorwise_amax_workspace_elems()` floats.
+int64_t tensorwise_amax_workspace_elems();
+
+template <typename FType>
+void quantize_tensorwise_amax_scale_impl(const FType *x, const int64_t n, const float q_max,
+                                         float *amax, float *scale, float *scale_inv,
+                                         float *workspace, hipStream_t stream);
+
 // *************** Quantize ***************
 template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
                               hipStream_t stream);
+
+// Tensorwise FP8 quant that K-pads the innermost dim K -> Kp=ceil128(K), columns
+// [K, Kp) zeroed; real columns [0, K) byte-identical to quantize_tensorwise_impl.
+// Optionally also pads the penultimate dim N -> np_pen (n_pen real rows).
+template <typename FType, typename QType, typename ComputeType = float>
+void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, const int64_t rows,
+                                  const int64_t K, const int64_t Kp, hipStream_t stream,
+                                  const int64_t n_pen = 0, const int64_t np_pen = 0);
 
 // Segment-padded group offsets (each segment rounded up to block_size), on-device.
 template <typename IndexType>

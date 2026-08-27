@@ -38,14 +38,17 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
-def quantize_fp8_tensorwise_impl(
-    x: torch.Tensor, out_dtype: torch.dtype
+def quantize_fp8_tensorwise_pad_impl(
+    x: torch.Tensor, out_dtype: torch.dtype, pad_n: bool = False, k_align: int = 128
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize FP8 Tensor-Wise
-    """
+    """Per-tensor fp8 cast + last-dim (K) pad to Kp=ceil(K, k_align), pad columns zeroed;
+    ``k_align`` is the cpp op's ``padding_align_size`` (128 = K-aligned operand, 1 =
+    unpadded copy-free). ``pad_n`` also pads penultimate N -> ceil128(N). Any ndim >= 1."""
     x = x.contiguous()
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x, out_dtype, None)
+    pad_n_align = 128 if pad_n else 1
+    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(
+        x, out_dtype, None, k_align, pad_n_align
+    )
     return x_fp8, scale_inv
 
 
