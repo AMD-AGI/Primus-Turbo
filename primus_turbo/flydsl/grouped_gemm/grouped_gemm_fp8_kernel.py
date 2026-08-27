@@ -894,6 +894,7 @@ def _compile_grouped_nt(
     cs_pipe=None,  # depth-2 cshuffle softpipe; needs persistent+store_cshuffle
     cstore_aux=None,  # non-temporal aux immediate for the C store (0 = default)
     nt_dist2: bool = True,  # True = uniform distance-2 mainloop (A1@k+2 like mx, one wait_barrier/iter, no vmcnt throttle) + runtime half-N padding-quadrant skip. False = legacy A1@k+1 + vmcnt drain
+    nt_kshear: bool = True,  # KS % 128 == 64: fetch A's line-aligned window per row instead of its raw K-block, so no row's 128B load splits a cache line. Off = legacy split loads
     persistent: bool = True,  # True = scf.for tile loop (fixed grid, cap_cu reserves CUs); False = one tile/WG + s_endpgm over-launch guard (full-device default)
     cap_cu: int = -1,  # >0: cap grid to this many WGs (= reserve device CUs for comm-compute overlap). <=0: use the full device CU count.
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
@@ -975,12 +976,31 @@ def _compile_grouped_nt(
     _esplit = 0 if store_cshuffle else nt_esplit
     _cshuf_alloc = (2 * _cshuf_n) if _cs_pipe else _cshuf_n
     _cstore_aux = 0 if cstore_aux is None else int(cstore_aux)
+    # A row pitch is KS, so KS%128!=0 straddles every other row's K-block across a cache line
+    # (two L1->L2 requests). Fetching each row's enclosing line restores one request/row; the
+    # halves then rotate over 3 LDS slots, which needs the CShuffle pool's LDS. Only the dist2
+    # body carries the splice; the legacy dist1 one reads its A fragment from a single slot.
+    _kshear = nt_kshear and nt_dist2 and KS % BLOCK_K == 64 and not store_cshuffle
+    # The splice addressing costs ~4 arch VGPRs on a body already at 252/256, so the scored
+    # MFMA path spills 2 dwords to scratch -- and scratch shares vmcnt with the g2s traffic,
+    # which would void the partial loop drain. Mode-3 in-place MFMA keeps the accumulators in
+    # the arch file with explicit tied live ranges: 232 VGPRs, no spill, no AGPR alloc.
+    _asm_mode = ("2" if acc_mode == "agpr" else "3") if agpr_inplace else ("3" if _kshear else None)
 
     _ss_anns = {
         "A_lds_cur_0": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
         "A_lds_cur_1": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
         "A_lds_next_0": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
         "A_lds_next_1": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
+        # 3rd slot per A half: holds the partner (k-1) window the splice reads.
+        **(
+            {
+                "A_lds_prev_0": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
+                "A_lds_prev_1": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
+            }
+            if _kshear
+            else {}
+        ),
         "B_lds_cur_0": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
         "B_lds_cur_1": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
         "B_lds_next_0": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
@@ -1077,6 +1097,11 @@ def _compile_grouped_nt(
             a_cur1 = lds.A_lds_cur_1
             a_next0 = lds.A_lds_next_0
             a_next1 = lds.A_lds_next_1
+            # Sheared: a third slot per half carries the partner (k-1) window, and the
+            # distance-2 fill lands in it once its splice has been consumed. Unsheared it
+            # aliases cur, which reproduces the original 2-slot fill-into-the-read-slot.
+            a_prev0 = lds.A_lds_prev_0 if const_expr(_kshear) else a_cur0
+            a_prev1 = lds.A_lds_prev_1 if const_expr(_kshear) else a_cur1
             b_cur0 = lds.B_lds_cur_0
             b_cur1 = lds.B_lds_cur_1
             b_next0 = lds.B_lds_next_0
@@ -1094,6 +1119,13 @@ def _compile_grouped_nt(
             m_total = _m_total_v if const_expr(_sgo) else _readfirstlane_i32(_m_total_v)
             a_base = uindex(m_row) * arith.index(KS)
             a_nrec = (uindex(m_total) - uindex(m_row)) * arith.index(KS)
+            if const_expr(_kshear):
+                # The shear rounds each row's fetch up to its enclosing line, past the tile's
+                # first row, so the SRD base drops back by that much and every A offset adds
+                # it again (m_row*KS == 0 => the bias is 0, so the base never goes negative).
+                _mb = shear_mbias(m_row, KS % BLOCK_K)
+                a_base = a_base - uindex(_mb)
+                a_nrec = a_nrec + uindex(_mb)
             if const_expr(_b32):
                 # Whole B_T fits in int32 -> base/extent are one int32 add and one int32 subtract.
                 _b_off = group_b + block_n * fx.Int32(_NBLK * KS)
@@ -1122,22 +1154,52 @@ def _compile_grouped_nt(
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-            gl_off_a = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
+            if const_expr(_kshear):
+                # LDS_BLOCK_M is even, so the A1 half's rows have the same line offset as the
+                # A0 half's: one offset list and one reader serve both.
+                gl_off_a = compute_global_swizzle_shear(
+                    lane_id, wave_id, KS, N_LDS_ROUNDS, m_row, KS % BLOCK_K, up=True
+                )
+            else:
+                gl_off_a = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
             gl_off_b = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
 
-            # AGPR in-place accum (mode 2) when agpr_inplace -> off the VGPR file (spill-free).
+            # _asm_mode: None = scored intrinsic MMA, "2" = AGPR in-place, "3" = VGPR in-place.
             mfma = _build_mfma(
                 N_TILES_A,
                 N_TILES_B,
                 cbsz,
                 blgp,
-                asm_mode=("2" if acc_mode == "agpr" else "3") if agpr_inplace else None,
+                asm_mode=_asm_mode,
             )
 
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            # Window -1 rides the offsets rather than a negative soffset (A0's k base is 0).
+            a_pv_g2s = (
+                G2SLoader(a_div, [o - fx.Int32(BLOCK_K) for o in gl_off_a], N_LDS_STEPS_A, F8_IR_t, wave_id)
+                if const_expr(_kshear)
+                else a_g2s
+            )
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
-            a_s2r = S2RLoader(wave_m, N_TILES_A)
+            a_s2r = (
+                S2RLoaderShear(wave_m, N_TILES_A, m_row, KS % BLOCK_K, up=True)
+                if const_expr(_kshear)
+                else S2RLoader(wave_m, N_TILES_A)
+            )
             b_s2r = S2RLoader(wave_n, N_TILES_B)
+
+            def _ld_a(cur, prev):
+                """A fragment; the sheared reader splices the current and partner windows."""
+                if const_expr(_kshear):
+                    return a_s2r.load(cur, prev)
+                return a_s2r.load(cur)
+
+            def _rot_a(prev, cur, nxt):
+                """Advance one A half by a phase: 3-slot rotate when sheared, otherwise the
+                original 2-slot swap with ``prev`` kept aliased to the slot being read."""
+                if const_expr(_kshear):
+                    return cur, nxt, prev
+                return nxt, nxt, cur
             if const_expr(glu):
                 store_c = StoreCSwiGLU(
                     A_scale,
@@ -1221,7 +1283,7 @@ def _compile_grouped_nt(
                         _bnd_ntb,
                         cbsz,
                         blgp,
-                        asm_mode=("2" if acc_mode == "agpr" else "3") if agpr_inplace else None,
+                        asm_mode=_asm_mode,
                     )
                     b_g2s_b = G2SLoader(b_div, gl_off_b, _bnd_ntb, F8_IR_t, wave_id)
                     b_s2r_b = S2RLoader(wave_n, _bnd_ntb)
@@ -1256,6 +1318,7 @@ def _compile_grouped_nt(
                     # unchanged (pitfalls/05: never move synchronization in a boundary variant).
                     _nd = _NB_DRAIN if _full else _NB_DRAIN_HALF
                     a_c0, a_c1, a_n0, a_n1 = a_cur0, a_cur1, a_next0, a_next1
+                    a_p0, a_p1 = a_prev0, a_prev1
                     b_c0, b_c1, b_n0, b_n1 = b_cur0, b_cur1, b_next0, b_next1
 
                     c00 = [_mm.zero_value] * _nacc
@@ -1269,6 +1332,10 @@ def _compile_grouped_nt(
                     if const_expr(_full):
                         _bg2s.load(b_c1, B1_gl_offset + 0 * BLOCK_K)
                     a_g2s.load(a_c1, A1_gl_offset + 0 * BLOCK_K)
+                    if const_expr(_kshear):
+                        # Window -1 carries k-block 0's low bytes for the rows the shear displaces.
+                        a_pv_g2s.load(a_p0, A0_gl_offset + 0 * BLOCK_K)
+                        a_g2s.load(a_p1, A1_gl_offset - 1 * BLOCK_K)
                     if const_expr(persistent):
                         rocdl.s_barrier()
                     else:
@@ -1284,7 +1351,7 @@ def _compile_grouped_nt(
 
                     for k in range_constexpr(K_ITERS - 2):
                         b0_frag = _bs2r.load(b_c0)
-                        a0_frag = a_s2r.load(a_c0)
+                        a0_frag = _ld_a(a_c0, a_p0)
                         if const_expr(_full):
                             b1_frag = _bs2r.load(b_c1)
                         rocdl.s_barrier()
@@ -1299,8 +1366,10 @@ def _compile_grouped_nt(
                             c01 = _mm.call(a0_frag, b1_frag, c01)
                             rocdl.s_setprio(0)
                             rocdl.s_barrier()
-                        a1_frag = a_s2r.load(a_c1)
-                        a_g2s.load(a_c0, A0_gl_offset + (k + 2) * BLOCK_K)
+                        a1_frag = _ld_a(a_c1, a_p1)
+                        # Sheared: a_p0 held window k-1, spliced into the c00/c01 mfma above,
+                        # so it is the slot this distance-2 fill reuses. Unsheared it is a_c0.
+                        a_g2s.load(a_p0, A0_gl_offset + (k + 2) * BLOCK_K)
                         rocdl.s_barrier()
                         rocdl.s_setprio(1)
                         c10 = _mm.call(a1_frag, b0_frag, c10)
@@ -1308,21 +1377,21 @@ def _compile_grouped_nt(
                         rocdl.s_barrier()
                         if const_expr(_full):
                             _bg2s.load(b_c1, B1_gl_offset + (k + 2) * BLOCK_K)
-                        a_g2s.load(a_c1, A1_gl_offset + (k + 2) * BLOCK_K)
+                        a_g2s.load(a_p1, A1_gl_offset + (k + 2) * BLOCK_K)
                         wait_barrier(_nd)
                         if const_expr(_full):
                             rocdl.s_setprio(1)
                             c11 = _mm.call(a1_frag, b1_frag, c11)
                             rocdl.s_setprio(0)
                             rocdl.s_barrier()
-                        a_c0, a_n0 = a_n0, a_c0
-                        a_c1, a_n1 = a_n1, a_c1
+                        a_p0, a_c0, a_n0 = _rot_a(a_p0, a_c0, a_n0)
+                        a_p1, a_c1, a_n1 = _rot_a(a_p1, a_c1, a_n1)
                         b_c0, b_n0 = b_n0, b_c0
                         b_c1, b_n1 = b_n1, b_c1
 
                     # Tail step K_ITERS-2: every stage already issued (distance 2), read only.
                     b0_frag = _bs2r.load(b_c0)
-                    a0_frag = a_s2r.load(a_c0)
+                    a0_frag = _ld_a(a_c0, a_p0)
                     rocdl.s_barrier()
                     rocdl.s_setprio(1)
                     c00 = _mm.call(a0_frag, b0_frag, c00)
@@ -1335,7 +1404,7 @@ def _compile_grouped_nt(
                         c01 = _mm.call(a0_frag, b1_frag, c01)
                         rocdl.s_setprio(0)
                         rocdl.s_barrier()
-                    a1_frag = a_s2r.load(a_c1)
+                    a1_frag = _ld_a(a_c1, a_p1)
                     rocdl.s_barrier()
                     rocdl.s_setprio(1)
                     c10 = _mm.call(a1_frag, b0_frag, c10)
@@ -1346,15 +1415,15 @@ def _compile_grouped_nt(
                         c11 = _mm.call(a1_frag, b1_frag, c11)
                         rocdl.s_setprio(0)
                         rocdl.s_barrier()
-                    a_c0, a_n0 = a_n0, a_c0
-                    a_c1, a_n1 = a_n1, a_c1
+                    a_p0, a_c0, a_n0 = _rot_a(a_p0, a_c0, a_n0)
+                    a_p1, a_c1, a_n1 = _rot_a(a_p1, a_c1, a_n1)
                     b_c0, b_n0 = b_n0, b_c0
                     b_c1, b_n1 = b_n1, b_c1
 
                     # Tail step K_ITERS-1: last stage issued a K-iter ago -> drain then read; K-tail mask applies to the final iter only.
                     wait_barrier(0)
                     b0_frag = _bs2r.load(b_c0)
-                    a0_frag = a_s2r.load(a_c0)
+                    a0_frag = _ld_a(a_c0, a_p0)
                     a0_frag = mask_a_tail(a0_frag, lane_id, K_TAIL)
                     rocdl.s_setprio(1)
                     c00 = _mm.call(a0_frag, b0_frag, c00)
@@ -1367,7 +1436,7 @@ def _compile_grouped_nt(
                         c01 = _mm.call(a0_frag, b1_frag, c01)
                         rocdl.s_setprio(0)
                         rocdl.s_barrier()
-                    a1_frag = a_s2r.load(a_c1)
+                    a1_frag = _ld_a(a_c1, a_p1)
                     a1_frag = mask_a_tail(a1_frag, lane_id, K_TAIL)
                     rocdl.s_barrier()
                     rocdl.s_setprio(1)
