@@ -1191,6 +1191,9 @@ def test_grouped_gemm_fp8_padded_tail_zeroed(ori_dtype, trans_b, backend):
     torch.manual_seed(42)
     device = "cuda:0"
     G, K, N = 8, 2048, 2880
+    # CK/hipBLASLt have no tight-output epilogue, so they decline the non-128-aligned pad path.
+    if N % 128 != 0 and backend in (BackendType.CK, BackendType.HIPBLASLT):
+        pytest.skip(f"{backend.name} declines the tight-output pad path (N={N} not 128-aligned)")
     group_lens = torch.tensor([4096, 0, 3072, 0, 0, 5120, 0, 0], dtype=torch.int64, device=device)
     S = int(group_lens.sum())
     PAD = 224
@@ -1236,8 +1239,9 @@ def _run_grouped_gemm_fp8_fused_grad_accum_test(
     accumulate target instead of returning a gradient for autograd to add on top, so
     the check is that the buffer moved by exactly the wgrad the ordinary path produces.
 
-    ``main_grad_dtype`` is fp32 as Megatron allocates it; FlyDSL's accumulate epilogue
-    writes 16-bit only, so its coverage passes the weight's own dtype instead.
+    ``main_grad_dtype`` is fp32 as Megatron allocates it; the tensorwise FlyDSL accumulate
+    epilogue now writes fp32 natively, so it takes the fp32 main_grad too. (MXFP8 FlyDSL
+    still stores 16-bit and keeps the weight's own dtype.)
     """
     seed = 42
     torch.manual_seed(seed)
@@ -1339,9 +1343,7 @@ def _run_grouped_gemm_fp8_fused_grad_accum_test(
 def test_grouped_gemm_fp8_tensorwise_fused_grad_accum(ori_dtype, trans_b, backend):
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
-    # FlyDSL's accumulate epilogue stores 16-bit, so it only takes a main_grad matching
-    # the weight; the others take the fp32 one Megatron allocates by default.
-    main_grad_dtype = ori_dtype if backend == BackendType.FLYDSL else torch.float32
+    # Tensorwise FlyDSL accumulate writes fp32, so every backend takes Megatron's fp32 main_grad.
     _run_grouped_gemm_fp8_fused_grad_accum_test(
         B=4,
         M=256,
@@ -1351,7 +1353,7 @@ def test_grouped_gemm_fp8_tensorwise_fused_grad_accum(ori_dtype, trans_b, backen
         granularity=ScalingGranularity.TENSORWISE,
         trans_b=trans_b,
         backend=backend,
-        main_grad_dtype=main_grad_dtype,
+        main_grad_dtype=torch.float32,
     )
 
 
@@ -1361,6 +1363,7 @@ def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend):
     """MXFP8 grouped GEMM is NT-only, so trans_b is fixed rather than swept."""
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL MXFP8 grouped GEMM is gfx950-only")
+    # MXFP8 FlyDSL keeps the weight dtype (fp32 native accumulate is tensorwise-only).
     main_grad_dtype = ori_dtype if backend == BackendType.FLYDSL else torch.float32
     _run_grouped_gemm_fp8_fused_grad_accum_test(
         B=4,
