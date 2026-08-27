@@ -266,10 +266,19 @@ class StoreCPlain:
         # correctly. Pass C as 2D so its shape packs within int32.
         self.c_base = buffer_ops.extract_base_index(C)
 
+    def _span_grid(self, n_valid):
+        """Is ``n_valid`` known to fall on the 16*n_tiles_b column grid one store call
+        spans? Only a compile-time value can be checked; a runtime one is the caller's
+        promise (testing it here would branch on a traced value)."""
+        return n_valid % (16 * self.n_tiles_b) == 0 if isinstance(n_valid, int) else True
+
     def store(self, c_frag, base_row, base_col, n_valid=None):
-        # n_valid drops whole out-of-range column spans via band SRD num_records (no per-store mask).
+        # n_valid drops whole out-of-range column spans via band SRD num_records (no per-store
+        # mask). That is exact only when n_valid lands on the 16*n_tiles_b column grid, so one
+        # call is wholly in or wholly out. A compile-time n_valid is tested here; a runtime one
+        # cannot be, and the caller owns the guarantee (the dense entry asserts N % 64 == 0).
         c_rows = self.c_rows
-        if n_valid is not None and n_valid % (16 * self.n_tiles_b) == 0:
+        if n_valid is not None and self._span_grid(n_valid):
             c_rows = arith.select(base_col < fx.Int32(n_valid), c_rows, base_row)
             n_valid = None
         rsrc = make_row_band_resource(self.c_base, base_row, c_rows, self.c_cols, 2)
@@ -368,15 +377,23 @@ class StoreCPlain:
         i32t = ir.IntegerType.get_signless(32)
         return _llvm.extractvalue(i32t, r, [0]), _llvm.extractvalue(i32t, r, [1])
 
-    def store_tacc_wide(self, c_frag, base_row, base_col):
+    def store_tacc_wide(self, c_frag, base_row, base_col, n_valid=None):
         """TACC + permlane16_swap wide store: two adjacent N sub-blocks become one
         16-row x 32-col region per lane, written with a single buffer_store_dwordx4.
         With acc = C^T a lane holds 4 consecutive columns; two swaps make them 8 contiguous."""
         nta, ntb = self.n_tiles_a, self.n_tiles_b
         assert ntb % 2 == 0, "store_tacc_wide pairs N sub-blocks (ntb must be even)"
+        # One call spans 16*n_tiles_b contiguous columns, so an n_valid on that grid leaves
+        # every call wholly in or wholly out: zero the band's row count for the out ones and
+        # the hardware drops their stores. Same trick as ``store`` -- and the only one here,
+        # since a dwordx4 of 8 packed columns has no per-column mask to fall back on.
+        c_rows = self.c_rows
+        if n_valid is not None:
+            assert self._span_grid(n_valid), "store_tacc_wide needs n_valid on the sub-block grid"
+            c_rows = arith.select(base_col < fx.Int32(n_valid), c_rows, base_row)
         # Re-base at this tile's row band in int64 (rows*cols may exceed 2^31); the per-lane
         # byte offset below is then intra-band int32.
-        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        rsrc = make_row_band_resource(self.c_base, base_row, c_rows, self.c_cols, 2)
         rg = self.lane_id // 16
         col_off = (rg % 2) * 16 + (rg // 2) * 8  # rg0->0 rg1->16 rg2->8 rg3->24
         # Hoisted per-lane base byte offset relative to base_row: (base_col + lane%16*c_cols
@@ -1627,6 +1644,7 @@ def _build_mxfp4_gemm_kernel(
     taccw: bool = False,
     out_fp16: bool = False,
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
+    n_partial: bool = False,  # N ends mid-tile: bound the store to c_n (see _store's _nv)
 ):
     BLOCK_M = 256
     BLOCK_N = 256
@@ -1736,10 +1754,12 @@ def _build_mxfp4_gemm_kernel(
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_BH, LDS_ROW_STRIDE, swizzle=swizzle)
 
         # A scale: 8 M-tiles span 2 x 64-row groups (4 tiles each). Packed -> ONE i32
-        # per group. group-span-ceil the dim so the floor in the loader's record count
-        # covers the edge scale group.
-        _qm = ((c_m + 63) // 64) * 64
-        _qn = ((c_n + 63) // 64) * 64
+        # per group. The extent has to be the PRESHUFFLE's group grid, not the loader's:
+        # _mxfp4_grp_from lays A out 128 rows at a time (grp = 2*wi + r_region) and B 256
+        # at a time (the wi%2 block interleave), so a dim that ends mid-group would leave
+        # the tail rows unwritten and read back as another group's scales. 256 covers both.
+        _qm = ((c_m + 255) // 256) * 256
+        _qn = ((c_n + 255) // 256) * 256
         sa_s2r = ScaleS2RPacked(A_scale, _qm, K, 4)
         sb_s2r = ScaleS2RPacked(B_scale, _qn, K, 4)
         # split-K writes partials to workspace C[ksplit*M, N] (row band split*M); the
@@ -1942,12 +1962,13 @@ def _build_mxfp4_gemm_kernel(
                 base_row = base_row + _split * c_m  # write to workspace row band split*M
             base_col_l = bn * BLOCK_N + wave_n_off
             base_col_r = bn * BLOCK_N + LDS_BN_HALF + wave_n_off
+            _nv = c_n if const_expr(n_partial) else None
             if const_expr(_l_taccw):
-                store_c.store_tacc_wide(accL, base_row, base_col_l)
-                store_c.store_tacc_wide(accR, base_row, base_col_r)
+                store_c.store_tacc_wide(accL, base_row, base_col_l, n_valid=_nv)
+                store_c.store_tacc_wide(accR, base_row, base_col_r, n_valid=_nv)
                 return
-            store_c.store(accL, base_row, base_col_l)
-            store_c.store(accR, base_row, base_col_r)
+            store_c.store(accL, base_row, base_col_l, n_valid=_nv)
+            store_c.store(accR, base_row, base_col_r, n_valid=_nv)
 
         def _split_shift(o, _split):
             # add this split's K-start to the A/B operand gmem offsets (row stride full-K).
@@ -2058,7 +2079,9 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False):
                 at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, False, False, out_fp16, False)
                 entry = _MXFP4_AT_CACHE.get(at_key)
                 if entry is None:
-                    raw = _get_mxfp4_fused_launch(K, gm, xcd, gn, _wlv, _elgk, coop=False, out_fp16=out_fp16)
+                    raw = _get_mxfp4_fused_launch(
+                        K, gm, xcd, gn, _wlv, _elgk, coop=False, out_fp16=out_fp16, n_partial=N % 256 != 0
+                    )
                     entry = [raw, compile_with_scratch_out(raw, args)]
                     _MXFP4_AT_CACHE[at_key] = entry
                 compiled_cands.append(((gm, gn, xcd, _wlv, _elgk), entry[1]))
@@ -2103,7 +2126,16 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False):
                 ventry = _MXFP4_AT_CACHE.get(vkey)
                 if ventry is None:
                     vraw = _get_mxfp4_fused_launch(
-                        K, gm0, xcd0, gn0, w0, e0, taccw=_tw, coop=_cp, out_fp16=out_fp16
+                        K,
+                        gm0,
+                        xcd0,
+                        gn0,
+                        w0,
+                        e0,
+                        taccw=_tw,
+                        coop=_cp,
+                        out_fp16=out_fp16,
+                        n_partial=N % 256 != 0,
                     )
                     ventry = [vraw, compile_with_scratch_out(vraw, args)]
                     _MXFP4_AT_CACHE[vkey] = ventry
@@ -2169,7 +2201,18 @@ def _ksplit_candidates(M, N, K):
 
 
 def _compile_mxfp4_fused(
-    K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, coop=False, out_fp16=False, beta_is_one=False
+    K,
+    gm,
+    xcd,
+    gn,
+    wlv=10,
+    elgk=9,
+    ksplit=1,
+    taccw=False,
+    coop=False,
+    out_fp16=False,
+    beta_is_one=False,
+    n_partial=False,
 ):
     """Turbo/mxfp8-style fused @flyc.jit stub: ONE host dispatch enqueues the A scale
     preshuffle, the B scale preshuffle, then the NT GEMM on the same stream (no separate
@@ -2191,6 +2234,7 @@ def _compile_mxfp4_fused(
         taccw=taccw,
         out_fp16=out_fp16,
         beta_is_one=beta_is_one,
+        n_partial=n_partial,
     )
     _PGRID = _MXFP4_PRESHUF_FO * _MXFP4_PRESHUF_BLK  # threads-per-block * fan-out
 
@@ -2208,10 +2252,15 @@ def _compile_mxfp4_fused(
         stream: fx.Stream,
     ):
         # Merge A + B scale preshuffle into ONE launch to drop a kernel launch/gap; grid = ceildiv(dim*K128, FO*BLK), dim*K128 % FO == 0.
-        grid_a = ceildiv(c_m * fx.Int32(K128), _PGRID)
-        grid_b = ceildiv(c_n * fx.Int32(K128), _PGRID)
-        # Dense enforces M/N % 256 == 0, so the packed extent equals the real row count.
-        pre_ab(A_raw, A_scale, B_raw, B_scale, c_m, c_n, c_m, c_n, fx.Int32(K128), grid_a).launch(
+        # Packed extent (dim_*) is 256-rounded to the preshuffle's group grid; the real row
+        # count (rd_*) still bounds the READ, so the surplus rows pack as zero bytes -- E8M0 0
+        # is 2^-127, and the operand rows they scale are themselves OOB-zero, so they add
+        # nothing. This is the same split the grouped wgrad uses.
+        qm = ceildiv(c_m, fx.Int32(256)) * fx.Int32(256)
+        qn = ceildiv(c_n, fx.Int32(256)) * fx.Int32(256)
+        grid_a = ceildiv(qm * fx.Int32(K128), _PGRID)
+        grid_b = ceildiv(qn * fx.Int32(K128), _PGRID)
+        pre_ab(A_raw, A_scale, B_raw, B_scale, qm, qn, c_m, c_n, fx.Int32(K128), grid_a).launch(
             grid=(grid_a + grid_b, 1, 1),
             block=(_MXFP4_PRESHUF_BLK, 1, 1),
             stream=stream,
@@ -2228,13 +2277,24 @@ def _compile_mxfp4_fused(
 
 
 def _get_mxfp4_fused_launch(
-    K, gm, xcd, gn, wlv=10, elgk=9, ksplit=1, taccw=False, coop=False, out_fp16=False, beta_is_one=False
+    K,
+    gm,
+    xcd,
+    gn,
+    wlv=10,
+    elgk=9,
+    ksplit=1,
+    taccw=False,
+    coop=False,
+    out_fp16=False,
+    beta_is_one=False,
+    n_partial=False,
 ):
     # wlv/elgk pick the phase-barrier in-flight memory depth (autotuned per shape).
     # ksplit>1 compiles a K/ksplit slice kernel for few-tile large-K shapes.
     # coop/taccw are the never-regress scale-load / wide-store autotune axes.
     # out_fp16 selects the store cast dtype (fp16 vs bf16); fp16 implies taccw=False.
-    lk = (K, gm, xcd, gn, wlv, elgk, coop, ksplit, taccw, out_fp16, beta_is_one)
+    lk = (K, gm, xcd, gn, wlv, elgk, coop, ksplit, taccw, out_fp16, beta_is_one, n_partial)
     launch = _MXFP4_LAUNCH_CACHE.get(lk)
     if launch is None:
         launch = _compile_mxfp4_fused(
@@ -2249,6 +2309,7 @@ def _get_mxfp4_fused_launch(
             coop=coop,
             out_fp16=out_fp16,
             beta_is_one=beta_is_one,
+            n_partial=n_partial,
         )
         _MXFP4_LAUNCH_CACHE[lk] = launch
     return launch
@@ -2373,11 +2434,15 @@ def _get_mxfp4_scale_ws(M, N, K, device):
     to the ScaleS2RPacked extent (dim * K/128 int32); the preshuffle writes it and the GEMM
     reads it in stream order, so same-shape reuse on one stream is safe."""
     K128 = K // 128
+    # 256-rounded: the preshuffle packs whole 128-row (A) / 256-row (B) groups, so an M or N
+    # that ends mid-group still needs the whole trailing group backed by storage.
+    qm = (M + 255) // 256 * 256
+    qn = (N + 255) // 256 * 256
     key = (M, N, K, device)
     e = _MXFP4_SCALE_WS.get(key)
     if e is None:
-        a_sp = torch.empty(M * K128, dtype=torch.int32, device=device)
-        b_sp = torch.empty(N * K128, dtype=torch.int32, device=device)
+        a_sp = torch.empty(qm * K128, dtype=torch.int32, device=device)
+        b_sp = torch.empty(qn * K128, dtype=torch.int32, device=device)
         _MXFP4_SCALE_WS[key] = e = (a_sp, b_sp)
     return e
 
@@ -2440,8 +2505,13 @@ def gemm_mxfp4_flydsl_kernel(
     # K % 256: the unroll-2 whole-loop runs KI//2 pairs + an MFMA-only tail for the
     # odd trailing 256-block (see the docstring / call_mxfp4_wholeloop).
     assert K % 256 == 0, f"K must be a multiple of 256, got {K}"
-    assert M % 256 == 0, f"M must be a multiple of 256, got {M}"
-    assert N % 256 == 0, f"N must be a multiple of 256, got {N}"
+    # M / N only have to land on 64: an M that ends mid-tile is already bounded by the A
+    # operand's num_records (OOB rows read zero) and by the store band's row count, and the
+    # packed scale extents are 64-group-ceiled. An N that ends mid-tile additionally needs
+    # the store to drop whole out-of-range column spans, which is what n_partial turns on --
+    # that trick is exact only on the 16*n_tiles_b == 64 grid.
+    assert M % 64 == 0, f"M must be a multiple of 64, got {M}"
+    assert N % 64 == 0, f"N must be a multiple of 64, got {N}"
 
     stream = torch.cuda.current_stream()
     # Fused (turbo/mxfp8-style) path: a single @flyc.jit stub enqueues the A+B scale preshuffle
@@ -2492,7 +2562,17 @@ def gemm_mxfp4_flydsl_kernel(
             cfg = _autotune_mxfp4_config(M, N, K, _tune_args(), out_fp16)
         gm, gn, xcd, _wlv, _elgk, _tw, _coop = cfg
         launch = _get_mxfp4_fused_launch(
-            K, gm, xcd, gn, _wlv, _elgk, taccw=_tw, coop=_coop, out_fp16=out_fp16, beta_is_one=accum
+            K,
+            gm,
+            xcd,
+            gn,
+            _wlv,
+            _elgk,
+            taccw=_tw,
+            coop=_coop,
+            out_fp16=out_fp16,
+            beta_is_one=accum,
+            n_partial=N % 256 != 0,
         )
         at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum)
         fused_args = _args_for(target)
@@ -2519,7 +2599,9 @@ def gemm_mxfp4_flydsl_kernel(
         ws = torch.empty((ksplit * M, N), dtype=out_dtype, device=a.device)
         cbuf = ws.view(-1)
         sk_args = (a8, b8, cbuf, a_raw, b_raw, a_sp, b_sp, M, N, stream)
-        launch = _get_mxfp4_fused_launch(K, gm, xcd, gn, 10, 9, ksplit=ksplit, out_fp16=out_fp16)
+        launch = _get_mxfp4_fused_launch(
+            K, gm, xcd, gn, 10, 9, ksplit=ksplit, out_fp16=out_fp16, n_partial=N % 256 != 0
+        )
         sk_key = (M, N, K, gm, xcd, gn, 10, 9, ksplit, out_fp16)
         entry = _MXFP4_AT_CACHE.get(sk_key)
         if entry is None:

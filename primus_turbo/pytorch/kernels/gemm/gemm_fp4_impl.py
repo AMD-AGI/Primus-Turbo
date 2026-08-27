@@ -252,7 +252,10 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
     # (trans_a, trans_b, trans_c)
     SUPPORTED_LAYOUTS = ((False, True, False),)
 
-    FLYDSL_FP4_MNK_MULTIPLE = 256
+    # M / N ride the store's 64-column drop grid; K is still whole 256-blocks of the
+    # unroll-2 whole-loop.
+    FLYDSL_FP4_MN_MULTIPLE = 64
+    FLYDSL_FP4_K_MULTIPLE = 256
 
     @staticmethod
     def can_handle(
@@ -291,8 +294,9 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
 
         m, n = a.size(0), b.size(0)
         k = a.size(1) * 2  # FP4 K dim is packed (2 values / byte)
-        mul = GEMMFP4FlyDSLBackend.FLYDSL_FP4_MNK_MULTIPLE
-        supported &= (m % mul == 0) and (n % mul == 0) and (k % mul == 0)
+        mn_mul = GEMMFP4FlyDSLBackend.FLYDSL_FP4_MN_MULTIPLE
+        supported &= (m % mn_mul == 0) and (n % mn_mul == 0)
+        supported &= k % GEMMFP4FlyDSLBackend.FLYDSL_FP4_K_MULTIPLE == 0
 
         # Raw E8M0 block scales, 1 byte/elem, [DIM, K//32] (the GEMM wrapper preshuffles
         # them into its lane-contiguous layout).
