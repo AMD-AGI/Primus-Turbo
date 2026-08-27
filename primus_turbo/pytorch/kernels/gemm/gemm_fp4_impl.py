@@ -303,7 +303,9 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         # Raw E8M0 block scales, 1 byte/elem, [DIM, K//32] (the GEMM wrapper preshuffles
         # them into its lane-contiguous layout).
         def _scale_ok(s, dim):
-            return s.ndim == 2 and s.shape == (dim, k // 32) and s.element_size() == 1
+            # k here is the row stride's worth; the scale carries the TRUE K, which may be
+            # shorter when the caller allocated its fp4 rows on the 128-byte line.
+            return s.ndim == 2 and s.shape[0] == dim and s.shape[1] * 64 <= k * 2 and s.element_size() == 1
 
         supported &= _scale_ok(a_scale_inv, m)
         supported &= _scale_ok(b_scale_inv, n)
