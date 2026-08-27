@@ -1645,6 +1645,7 @@ def _build_mxfp4_gemm_kernel(
     out_fp16: bool = False,
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
     n_partial: bool = False,  # N ends mid-tile: bound the store to c_n (see _store's _nv)
+    k_real: int = None,  # operands' true contraction; K is the 256-rounded loop/scale extent
 ):
     BLOCK_M = 256
     BLOCK_N = 256
@@ -1672,7 +1673,13 @@ def _build_mxfp4_gemm_kernel(
     N_SUB = BLOCK_K // 128
     BPR = BLOCK_K // 2  # packed-fp4 bytes per K-iter row in LDS
     KSTEP = BPR
-    K2 = K // 2  # packed-fp4 gmem row stride (bytes) -- FULL K (rows span all K)
+    # The operands are NOT K-padded: their rows keep the caller's true stride, so a trailing
+    # block reads past a row's K end into the next row. Those lanes are harmless because the
+    # packed scale for every past-K position is zero on BOTH operands -- E8M0 0 is 2^-127, and
+    # 2^-127 * 2^-127 = 2^-254 underflows fp32 (min denormal 2^-149) to exactly 0. The last
+    # row's overrun leaves the tensor and the SRD's num_records returns 0.
+    _KR = K if k_real is None else k_real  # operands' true contraction
+    K2 = _KR // 2  # packed-fp4 gmem row stride (bytes) -- rows span the TRUE K
     _AB_SPLIT_STEP = K_loop // 2
     _SC_SPLIT_STEP = KI * (64 * (2 * N_SUB) * 4)
 
@@ -1728,8 +1735,8 @@ def _build_mxfp4_gemm_kernel(
         # resources, NOT block_m/n) ──
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk, coop=coop, tacc=_l_tacc)
 
-        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR, swizzle=swizzle)
-        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_BH, BPR, swizzle=swizzle)
+        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, _KR, N_LDS_STEPS_A, BPR, swizzle=swizzle)
+        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, _KR, N_LDS_STEPS_BH, BPR, swizzle=swizzle)
         # Operand SRDs/loaders are rebased per-tile (_bind): the tile's row/col base exceeds int32 for large M*K/N*K.
         _ld: dict = {}
 
@@ -2044,7 +2051,7 @@ def _mxfp4_swizzle_candidates(M, N, K):
     return cands[:3]
 
 
-def _autotune_mxfp4_config(M, N, K, args, out_fp16=False):
+def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None):
     """Pick (group_m, group_n, num_xcds) for this (M, N, K, out dtype) by a quick timed
     sweep over ``_mxfp4_swizzle_candidates`` (<=3) on the real operands; cached per shape
     and store dtype.
@@ -2076,11 +2083,20 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False):
     for _wlv, _elgk in _wl_opts:
         for gm, gn, xcd in _mxfp4_swizzle_candidates(M, N, K):
             try:
-                at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, False, False, out_fp16, False)
+                at_key = (M, N, K, k_real, gm, xcd, gn, _wlv, _elgk, False, False, out_fp16, False)
                 entry = _MXFP4_AT_CACHE.get(at_key)
                 if entry is None:
                     raw = _get_mxfp4_fused_launch(
-                        K, gm, xcd, gn, _wlv, _elgk, coop=False, out_fp16=out_fp16, n_partial=N % 256 != 0
+                        K,
+                        gm,
+                        xcd,
+                        gn,
+                        _wlv,
+                        _elgk,
+                        coop=False,
+                        out_fp16=out_fp16,
+                        n_partial=N % 256 != 0,
+                        k_real=k_real,
                     )
                     entry = [raw, compile_with_scratch_out(raw, args)]
                     _MXFP4_AT_CACHE[at_key] = entry
@@ -2122,7 +2138,7 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False):
             df_compiled = _MXFP4_AT_CACHE[(M, N, K, gm0, xcd0, gn0, w0, e0, False, False, out_fp16, False)][1]
             variants = []  # (taccw, coop, compiled)
             for _cp, _tw in ((False, True), (True, False), (True, True)):
-                vkey = (M, N, K, gm0, xcd0, gn0, w0, e0, _tw, _cp, out_fp16, False)
+                vkey = (M, N, K, k_real, gm0, xcd0, gn0, w0, e0, _tw, _cp, out_fp16, False)
                 ventry = _MXFP4_AT_CACHE.get(vkey)
                 if ventry is None:
                     vraw = _get_mxfp4_fused_launch(
@@ -2136,6 +2152,7 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False):
                         coop=_cp,
                         out_fp16=out_fp16,
                         n_partial=N % 256 != 0,
+                        k_real=k_real,
                     )
                     ventry = [vraw, compile_with_scratch_out(vraw, args)]
                     _MXFP4_AT_CACHE[vkey] = ventry
@@ -2213,6 +2230,7 @@ def _compile_mxfp4_fused(
     out_fp16=False,
     beta_is_one=False,
     n_partial=False,
+    k_real=None,
 ):
     """Turbo/mxfp8-style fused @flyc.jit stub: ONE host dispatch enqueues the A scale
     preshuffle, the B scale preshuffle, then the NT GEMM on the same stream (no separate
@@ -2235,6 +2253,7 @@ def _compile_mxfp4_fused(
         out_fp16=out_fp16,
         beta_is_one=beta_is_one,
         n_partial=n_partial,
+        k_real=k_real,
     )
     _PGRID = _MXFP4_PRESHUF_FO * _MXFP4_PRESHUF_BLK  # threads-per-block * fan-out
 
@@ -2289,12 +2308,13 @@ def _get_mxfp4_fused_launch(
     out_fp16=False,
     beta_is_one=False,
     n_partial=False,
+    k_real=None,
 ):
     # wlv/elgk pick the phase-barrier in-flight memory depth (autotuned per shape).
     # ksplit>1 compiles a K/ksplit slice kernel for few-tile large-K shapes.
     # coop/taccw are the never-regress scale-load / wide-store autotune axes.
     # out_fp16 selects the store cast dtype (fp16 vs bf16); fp16 implies taccw=False.
-    lk = (K, gm, xcd, gn, wlv, elgk, coop, ksplit, taccw, out_fp16, beta_is_one, n_partial)
+    lk = (K, gm, xcd, gn, wlv, elgk, coop, ksplit, taccw, out_fp16, beta_is_one, n_partial, k_real)
     launch = _MXFP4_LAUNCH_CACHE.get(lk)
     if launch is None:
         launch = _compile_mxfp4_fused(
@@ -2310,6 +2330,7 @@ def _get_mxfp4_fused_launch(
             out_fp16=out_fp16,
             beta_is_one=beta_is_one,
             n_partial=n_partial,
+            k_real=k_real,
         )
         _MXFP4_LAUNCH_CACHE[lk] = launch
     return launch
@@ -2429,6 +2450,26 @@ def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0):
     return kern
 
 
+_MXFP4_KPAD_WS: dict = {}
+
+
+def _kpad_scale(sc, Kw, side):
+    """Canonical E8M0 [D, K/32] widened to [D, Kw/32] with zero fill, in a cached buffer.
+    A no-op when the row already spans Kw. The zeros are what make the trailing block's
+    past-K operand bytes contribute nothing. ``side`` keeps A and B apart: a square GEMM
+    gives them the same shape, and one buffer would have B overwrite A."""
+    want = Kw // 32
+    if sc.shape[1] == want:
+        return sc.contiguous()
+    key = (side, sc.shape[0], want, sc.dtype, sc.device)
+    buf = _MXFP4_KPAD_WS.get(key)
+    if buf is None:
+        buf = torch.zeros((sc.shape[0], want), dtype=sc.dtype, device=sc.device)
+        _MXFP4_KPAD_WS[key] = buf
+    buf[:, : sc.shape[1]].copy_(sc)
+    return buf
+
+
 def _get_mxfp4_scale_ws(M, N, K, device):
     """Caller-owned packed-scale workspace (a_sp/b_sp), cached per (M, N, K, device). Sized
     to the ScaleS2RPacked extent (dim * K/128 int32); the preshuffle writes it and the GEMM
@@ -2472,14 +2513,33 @@ def gemm_mxfp4_flydsl_kernel(
     the GEMM -- so the quant stays generic (no fused scale write). Mirrors the mxfp8
     GEMM's quant/preshuffle decoupling; ``a`` is always the A operand, ``b`` the B.
 
-    Constraints: K % 256 == 0; M % 256 == 0; N % 256 == 0.
+    Constraints: M, N, K all multiples of 64. Nothing has to be padded by the caller.
 
     The whole-loop bare-asm body is an unroll-2 ping-pong that processes K in PAIRS
     of BLOCK_K=256. An odd number of 256-K blocks (K % 512 == 256) is handled by a
     single MFMA-only phase-A tail emitted after the hardware loop (see
     ``call_mxfp4_wholeloop``'s ``ki``/tail path);     the loop runs ``KI//2`` full pairs
     and the trailing block is accumulated by the tail. K=256 (KI==1) omits the loop
-    entirely and runs only the tail. No host-side K padding is required.
+    entirely and runs only the tail.
+
+    A K that is not a whole number of 256-blocks still runs ceil256(K) of them: the
+    operands keep their true row stride (no host K-pad, no copy), and the scale rows are
+    widened to ceil256(K)/32 with zeros, which is what makes the trailing block's read past
+    a row's K end contribute nothing -- see ``_build_mxfp4_gemm_kernel``'s ``_KR``. Only the
+    scales are widened; the fp4 operands are 16x the bytes and are left untouched.
+
+    ⚠ K % 256 == 0 is still the FAST path, and not for a software reason: it is what puts the
+    fp4 row stride (K/2 bytes) on a 128-byte cache line. Measured at M=32768, N=5120 with the
+    block count held at 12 so the MFMA work is identical, only the stride phase varying:
+
+        K=3072  stride 1536  phase  0   0.2753 ms   --
+        K=2944  stride 1472  phase 64   0.2985 ms   +8.4%
+        K=2880  stride 1440  phase 32   0.3072 ms  +11.6%
+        K=3008  stride 1504  phase 96   0.3082 ms  +12.0%
+
+    So a caller that can afford the memory is still better off handing over a K-padded
+    operand; this path exists so that one that cannot gets a correct answer rather than an
+    assertion. (Phase 64 fares best because it still lands on a 64-byte sector.)
 
     ``beta=1.0`` accumulates into ``out`` (``out += a @ b^T``) instead of overwriting it,
     and therefore requires ``out``. It is incompatible with ``trans_c``, whose transpose
@@ -2502,9 +2562,11 @@ def gemm_mxfp4_flydsl_kernel(
     N, Kb_b = b.shape
     K = Kb_a * 2  # packed 2 fp4 / byte
     assert Kb_a == Kb_b, f"K mismatch: a {a.shape}, b {b.shape}"
-    # K % 256: the unroll-2 whole-loop runs KI//2 pairs + an MFMA-only tail for the
-    # odd trailing 256-block (see the docstring / call_mxfp4_wholeloop).
-    assert K % 256 == 0, f"K must be a multiple of 256, got {K}"
+    # K only has to land on 64. The whole-loop still consumes whole 256-K blocks, so the
+    # loop and the packed scale layout run on Kw = ceil256(K); the OPERANDS keep their true
+    # row stride, and the trailing block's read past a row's K end is neutralised by the
+    # zero scales the preshuffle writes there (see _build_mxfp4_gemm_kernel's _KR).
+    assert K % 64 == 0, f"K must be a multiple of 64, got {K}"
     # M / N only have to land on 64: an M that ends mid-tile is already bounded by the A
     # operand's num_records (OOB rows read zero) and by the store band's row count, and the
     # packed scale extents are 64-group-ceiled. An N that ends mid-tile additionally needs
@@ -2520,9 +2582,16 @@ def gemm_mxfp4_flydsl_kernel(
     # generic. Workspace cached per shape (stable across graph replays); the timed autotune
     # includes the fixed preshuffle so the config ranking is preserved.
     _capturing = torch.cuda.is_current_stream_capturing()
-    a_sp, b_sp = _get_mxfp4_scale_ws(M, N, K, a.device)
-    a_raw = a_scale.contiguous().view(torch.int32).reshape(-1)
-    b_raw = b_scale.contiguous().view(torch.int32).reshape(-1)
+    Kw = (K + 255) // 256 * 256  # loop + packed-scale extent
+    _k_real = None if K == Kw else K  # None keeps the aligned shapes' launch key unchanged
+    a_sp, b_sp = _get_mxfp4_scale_ws(M, N, Kw, a.device)
+    # The preshuffle reads the canonical E8M0 as int32 (4 K-blocks per dword), so a K whose
+    # K/32 bytes per row is not a whole number of dwords cannot even be viewed -- and a
+    # trailing block needs zero scales past the true K anyway. Widen the scale rows to Kw/32
+    # in a cached workspace; the operands themselves are left alone (they are 16x the bytes,
+    # and the zero scales already make their overrun harmless).
+    a_raw = _kpad_scale(a_scale, Kw, "a").view(torch.int32).reshape(-1)
+    b_raw = _kpad_scale(b_scale, Kw, "b").view(torch.int32).reshape(-1)
     out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
     beta_is_one = beta == 1.0
     # Keep the fp4 operands 2D (do NOT flatten): M*K/2 / N*K/2 exceed 2^31 int8s for
@@ -2559,10 +2628,10 @@ def gemm_mxfp4_flydsl_kernel(
         target = out if target is None else target
         cfg = _MXFP4_CFG_CACHE.get((M, N, K, out_fp16))
         if cfg is None:
-            cfg = _autotune_mxfp4_config(M, N, K, _tune_args(), out_fp16)
+            cfg = _autotune_mxfp4_config(M, N, Kw, _tune_args(), out_fp16, k_real=_k_real)
         gm, gn, xcd, _wlv, _elgk, _tw, _coop = cfg
         launch = _get_mxfp4_fused_launch(
-            K,
+            Kw,
             gm,
             xcd,
             gn,
@@ -2573,6 +2642,7 @@ def gemm_mxfp4_flydsl_kernel(
             out_fp16=out_fp16,
             beta_is_one=accum,
             n_partial=N % 256 != 0,
+            k_real=_k_real,
         )
         at_key = (M, N, K, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum)
         fused_args = _args_for(target)
@@ -2626,7 +2696,9 @@ def gemm_mxfp4_flydsl_kernel(
     # The autotune times {plain, split+reduce} end-to-end on the real operands and takes the
     # global min, so split-K is used ONLY where it actually wins and never regresses a shape.
     # Skipped during graph capture (uses the cached pick).
-    ks = _MXFP4_KSPLIT_CACHE.get((M, N, K, out_fp16))
+    # split-K derives its per-split operand byte offset from the loop extent (_AB_SPLIT_STEP),
+    # which only equals a true K-slice when the operands are not K-short of it.
+    ks = 1 if K != Kw else _MXFP4_KSPLIT_CACHE.get((M, N, K, out_fp16))
     if ks is None:
         cands = _ksplit_candidates(M, N, K)
         if _capturing or len(cands) == 1:
