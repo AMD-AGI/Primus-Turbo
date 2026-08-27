@@ -1680,6 +1680,11 @@ def _build_mxfp4_gemm_kernel(
     # 2^-127 * 2^-127 = 2^-254 underflows fp32 (min denormal 2^-149) to exactly 0. The last
     # row's overrun leaves the tensor and the SRD's num_records returns 0.
     _KR = K if k_real is None else k_real  # operands' true contraction
+    # The loop covers KI whole 256-K blocks = 2*KI of the 128-K MFMA sub-steps, but the true
+    # contraction only needs ceil(_KR/128) of them. When that is one short, half_k drops the
+    # last sub-step instead of feeding it a block of zeros -- the difference between doing
+    # 3072 K of MFMA for a 2880-K problem and doing 2944.
+    _HALF_K = ceildiv(_KR, 128) == 2 * (K // ksplit // 256) - 1
     # The row stride is whatever the caller ALLOCATED, which need not be the true K's width:
     # a row of K/2 bytes that is not a multiple of 128 starts mid-line for 3 rows in 4 and
     # its G2S costs two line requests instead of one, and the only way to avoid that is for
@@ -1967,6 +1972,7 @@ def _build_mxfp4_gemm_kernel(
                 sc_voff6,
                 sc_soff06,
                 ki=KI,
+                half_k=_HALF_K,
                 sc_buf_stride=(_SCBUF * 4),
             )
 
