@@ -431,6 +431,88 @@ def test_flex_document_b2_cu_replicated(capture_varlen_backend):
     assert out.shape == (B, H, total, D)
 
 
+def _bidirectional_doc_block_mask(seg_lens, window=None):
+    document_id = torch.cat([torch.full((s,), i, dtype=torch.int64) for i, s in enumerate(seg_lens)])
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        keep = document_id[q_idx] == document_id[kv_idx]
+        if window is not None:
+            left, right = window
+            keep = keep & (q_idx - kv_idx <= left) & (kv_idx - q_idx <= right)
+        return keep
+
+    return _DummyBlockMask(mask_mod)
+
+
+def test_flex_bidirectional_document_routes_to_varlen(capture_varlen_backend):
+    # Diffusion / encoder packing: samples concatenated into one sequence with no causal
+    # term. Same cu_seqlens as autoregressive packing, but causal must go through False.
+    seg = [128, 128, 256]
+    total, H, D = 512, 8, 128
+    q = _make_bhsd(1, H, total, D)
+    out = flex_attention(q, q.clone(), q.clone(), block_mask=_bidirectional_doc_block_mask(seg))
+    assert capture_varlen_backend["called"] is True
+    kw = capture_varlen_backend["kwargs"]
+    assert kw["causal"] is False
+    assert kw["window_size"] == (-1, -1)
+    assert capture_varlen_backend["cu_q"].tolist() == [0, 128, 256, 512]
+    assert out.shape == (1, H, total, D)
+
+
+def test_flex_bidirectional_document_with_window(capture_varlen_backend):
+    # Local attention *inside* each packed sample: the varlen kernels apply window_size
+    # within a segment, so both edges ride along with cu_seqlens.
+    seg = [64, 64]
+    total, H, D = 128, 8, 128
+    q = _make_bhsd(1, H, total, D)
+    bm = _bidirectional_doc_block_mask(seg, window=(4, 4))
+    flex_attention(q, q.clone(), q.clone(), block_mask=bm)
+    kw = capture_varlen_backend["kwargs"]
+    assert kw["causal"] is False
+    assert kw["window_size"] == (4, 4)
+    assert capture_varlen_backend["cu_q"].tolist() == [0, 64, 128]
+
+
+def test_flex_causal_document_with_window(capture_varlen_backend):
+    seg = [64, 64]
+    total, H, D = 128, 8, 128
+    q = _make_bhsd(1, H, total, D)
+
+    document_id = torch.cat([torch.full((s,), i, dtype=torch.int64) for i, s in enumerate(seg)])
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        same = document_id[q_idx] == document_id[kv_idx]
+        return same & (q_idx >= kv_idx) & (q_idx - kv_idx <= 3)
+
+    flex_attention(q, q.clone(), q.clone(), block_mask=_DummyBlockMask(mask_mod))
+    kw = capture_varlen_backend["kwargs"]
+    assert kw["causal"] is True
+    assert kw["window_size"] == (3, 0)
+    assert capture_varlen_backend["cu_q"].tolist() == [0, 64, 128]
+
+
+def test_flex_document_sink_with_ragged_lengths_raises(capture_varlen_backend):
+    # Only the FlyDSL varlen backend carries a sink, and it needs uniform segments; the
+    # aiter varlen kernels have no sink parameter at all. Say so instead of dropping it.
+    seg = [128, 256]
+    total, H, D = 384, 8, 128
+    q = _make_bhsd(1, H, total, D)
+    sink = torch.zeros(H, dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="sink"):
+        flex_attention(q, q.clone(), q.clone(), block_mask=_doc_causal_block_mask(seg), sink=sink)
+    assert "called" not in capture_varlen_backend
+
+
+def test_flex_document_sink_with_uniform_lengths_dispatches(capture_varlen_backend):
+    seg = [128, 128]
+    total, H, D = 256, 8, 128
+    q = _make_bhsd(1, H, total, D)
+    sink = torch.zeros(H, dtype=torch.float32)
+    flex_attention(q, q.clone(), q.clone(), block_mask=_doc_causal_block_mask(seg), sink=sink)
+    assert capture_varlen_backend["called"] is True
+    assert capture_varlen_backend["kwargs"]["sink"] is not None
+
+
 def test_flex_document_with_explicit_alibi(capture_varlen_backend):
     seg = [128, 128]
     total, H, D = 256, 4, 128
@@ -869,7 +951,7 @@ def test_fp8_rejects_return_lse(capture_fp8_backend):
 def test_fp8_rejects_document_packing(capture_fp8_backend, capture_varlen_backend):
     seg = [8, 8, 16]
     q, k, v = _make_bf16_qkv(Hq=4, S=sum(seg))
-    with pytest.raises(NotImplementedError, match="document-causal"):
+    with pytest.raises(NotImplementedError, match="document-packed"):
         flex_attention(q, k, v, block_mask=_doc_causal_block_mask(seg), fp8=True)
     assert "called" not in capture_fp8_backend
     assert "called" not in capture_varlen_backend

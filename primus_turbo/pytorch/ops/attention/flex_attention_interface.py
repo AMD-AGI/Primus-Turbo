@@ -514,9 +514,9 @@ def flex_attention(
                 "return_lse (the Triton fp8 LSE buffer is [B, H, 2*Sq], a different convention "
                 "from the dense path's [B, H, Sq])"
             )
-        if mask_cfg.get("kind") == "document_causal":
+        if mask_cfg.get("kind") in ("document_causal", "document"):
             _reject.append(
-                "a document-causal block_mask (there is no fp8 varlen entry to lower packing onto)"
+                "a document-packed block_mask (there is no fp8 varlen entry to lower packing onto)"
             )
         if query.dtype is not torch.bfloat16:
             _reject.append(
@@ -549,12 +549,16 @@ def flex_attention(
             backend=backend,
         )
 
-    # ---- document packing (block-diagonal + within-doc causal) ----------------
-    # A block_mask recognised as ``same_doc(q,kv) & (q>=kv)`` is dispatched through
-    # the varlen backend (packed cu_seqlens) instead of a dense causal call, which
-    # would attend across document boundaries. The recognition is exact (see
-    # _detect_document_causal_segments), so this only fires on genuine doc packing.
-    if mask_cfg.get("kind") == "document_causal":
+    # ---- document packing (block-diagonal, any within-document pattern) -------
+    # A block_mask recognised as ``same_doc(q,kv)`` -- optionally intersected with a
+    # causal term and/or a within-document window -- is dispatched through the varlen
+    # backend (packed cu_seqlens) instead of a dense call, which would attend across
+    # document boundaries. Recognition is by exact reconstruction (see
+    # _detect_document_blocks), so this only fires on genuine doc packing. "causal" is
+    # the historical kind for the autoregressive shape; "document" carries the recovered
+    # causal flag and within-document window for the general case (notably bidirectional
+    # packing, which is what non-autoregressive image / video models use).
+    if mask_cfg.get("kind") in ("document_causal", "document"):
         if has_bias:
             raise NotImplementedError(
                 "Turbo flex compat layer: document-causal block_mask combined with a shared bias is "
@@ -567,6 +571,19 @@ def flex_attention(
                 "return_lse (packed LSE does not align with the dense [B,H,S] layout); if you need "
                 "LSE, use the explicit flex_attention_varlen entry point."
             )
+        if has_sink and len(set(mask_cfg["doc_seglens"])) != 1:
+            # The varlen entry only carries a sink on the FlyDSL backend, which requires
+            # uniform segment lengths; with ragged documents the dispatcher finds no
+            # eligible backend and raises a generic "No compatible backend found" from
+            # deep inside kernel selection. The aiter varlen kernels take no sink at all
+            # (VarlenAttnFwdAiterBackend.can_handle returns False for one, which is what
+            # keeps it from being silently dropped). Say so here instead.
+            raise NotImplementedError(
+                "Turbo flex compat layer: a sink combined with document packing requires equal "
+                f"document lengths (only the FlyDSL varlen backend carries a sink), got "
+                f"{sorted(set(mask_cfg['doc_seglens']))}. The aiter varlen kernels have no sink "
+                "parameter. Drop the sink, or pad the documents to a common length."
+            )
         return _dispatch_document_varlen(
             query,
             key,
@@ -578,6 +595,8 @@ def flex_attention(
             sink=sink,
             deterministic=deterministic,
             return_bshd=_return_bshd,
+            causal=mask_cfg["causal"],
+            window_size=mask_cfg["window_size"],
         )
 
     # ---- dense route: deterministic + sink ------------------------------------

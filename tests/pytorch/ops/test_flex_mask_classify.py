@@ -445,3 +445,124 @@ def test_classify_nonstandard_long_mask_still_raises():
 
     with pytest.raises(NotImplementedError):
         _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=S, kv_len=S)
+
+
+# ---- document packing: the general (non-autoregressive / windowed) shapes --------
+# Packing is same_doc(q, kv) intersected with an optional causal term and an optional
+# within-document window. flash_attn_varlen_func applies causal and window_size *per
+# segment* on top of cu_seqlens, so all four combinations lower exactly. The
+# bidirectional ones are the ones image / video diffusion models actually use: those
+# models are not autoregressive, and multi-resolution training packs several samples
+# into one sequence.
+
+
+def _doc_id(seg_lens):
+    return torch.cat([torch.full((s,), i, dtype=torch.int64) for i, s in enumerate(seg_lens)])
+
+
+def _bidirectional_doc_mask(seg_lens):
+    document_id = _doc_id(seg_lens)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return document_id[q_idx] == document_id[kv_idx]
+
+    return _DummyBlockMask(mask_mod)
+
+
+def test_classify_bidirectional_document_packing():
+    seg = [6, 10, 4]
+    cfg = _classify_block_mask(_bidirectional_doc_mask(seg), B=1, H=1, q_len=sum(seg), kv_len=sum(seg))
+    assert cfg["kind"] == "document"
+    assert cfg["causal"] is False
+    assert cfg["window_size"] == (-1, -1)
+    assert cfg["doc_seglens"] == seg
+
+
+def test_classify_bidirectional_document_packing_beyond_the_probe():
+    # Longer than the 512 probe grid, so the boundaries have to come from mask_mod over
+    # the full sequence and be verified chunk by chunk.
+    seg = [700, 500, 824]
+    cfg = _classify_block_mask(_bidirectional_doc_mask(seg), B=1, H=1, q_len=sum(seg), kv_len=sum(seg))
+    assert cfg["kind"] == "document"
+    assert cfg["causal"] is False
+    assert cfg["doc_seglens"] == seg
+
+
+def test_classify_document_packing_with_within_document_window():
+    seg = [12, 20]
+    document_id = _doc_id(seg)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        same = document_id[q_idx] == document_id[kv_idx]
+        return same & (q_idx >= kv_idx) & ((q_idx - kv_idx) <= 3)
+
+    cfg = _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=sum(seg), kv_len=sum(seg))
+    assert cfg["kind"] == "document"
+    assert cfg["causal"] is True
+    assert cfg["window_size"] == (3, 0)
+    assert cfg["doc_seglens"] == seg
+
+
+def test_classify_bidirectional_document_packing_with_window():
+    seg = [14, 18]
+    document_id = _doc_id(seg)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        same = document_id[q_idx] == document_id[kv_idx]
+        return same & ((q_idx - kv_idx) <= 2) & ((kv_idx - q_idx) <= 2)
+
+    cfg = _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=sum(seg), kv_len=sum(seg))
+    assert cfg["kind"] == "document"
+    assert cfg["causal"] is False
+    assert cfg["window_size"] == (2, 2)
+    assert cfg["doc_seglens"] == seg
+
+
+def test_plain_document_causal_keeps_its_historical_kind():
+    # Regression: the autoregressive shape must still take the original path, so
+    # anything keying on kind == "document_causal" keeps working.
+    seg = [8, 8, 16]
+    cfg = _classify_block_mask(_doc_causal_block_mask(seg), B=1, H=1, q_len=sum(seg), kv_len=sum(seg))
+    assert cfg["kind"] == "document_causal"
+    assert cfg["causal"] is True
+    assert cfg["doc_seglens"] == seg
+
+
+def test_classify_cross_document_leak_unsupported():
+    # Block diagonal except one stray visible position across a boundary: the exact
+    # reconstruction must reject it rather than round it to clean packing.
+    seg = [8, 8]
+    document_id = _doc_id(seg)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        same = document_id[q_idx] == document_id[kv_idx]
+        return same | ((q_idx == 9) & (kv_idx == 0))
+
+    with pytest.raises(NotImplementedError):
+        _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=sum(seg), kv_len=sum(seg))
+
+
+def test_classify_identity_mask_is_a_degenerate_band_not_packing():
+    # Every "document" would be one token long, so this is not packing -- but it *is* a
+    # width-zero band, which window_size=(0, 0) expresses exactly. Take the band route
+    # rather than routing S single-token segments through varlen.
+    block_mask = _DummyBlockMask(lambda b, h, q, kv: q == kv)
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=32, kv_len=32)
+    assert cfg["window_size"] == (0, 0)
+    assert "doc_seglens" not in cfg
+
+
+def test_all_visible_probe_corner_does_not_silently_become_full():
+    # The probed corner is entirely visible, but the mask closes past the probe limit.
+    # Answering "full attention" on the strength of the corner would silently train a
+    # different model, so this must raise instead.
+    n = 4096
+    block_mask = _DummyBlockMask(lambda b, h, q, kv: (q - kv <= 2000) & (kv - q <= 2000))
+    with pytest.raises(NotImplementedError, match="fully visible"):
+        _classify_block_mask(block_mask, B=1, H=1, q_len=n, kv_len=n)
+
+
+def test_genuinely_full_mask_still_classifies_as_full_past_the_probe():
+    block_mask = _DummyBlockMask(lambda b, h, q, kv: q >= 0)
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=2048, kv_len=2048)
+    assert cfg["kind"] == "full"

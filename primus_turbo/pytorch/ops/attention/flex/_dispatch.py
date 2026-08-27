@@ -27,16 +27,23 @@ def _dispatch_document_varlen(
     sink: Optional[torch.Tensor],
     deterministic: bool = False,
     return_bshd: bool = False,
+    causal: bool = True,
+    window_size: tuple = (-1, -1),
 ) -> torch.Tensor:
-    """Run a recognised document-causal *dense* call through the varlen backend.
+    """Run a recognised document-packed *dense* call through the varlen backend.
 
     ``query``/``key``/``value`` are bhsd ``[B, H, S, D]`` sharing the same per-batch
     document structure ``seg_lens`` (``sum(seg_lens) == S``; batch/head independence of
     the mask is already verified by the classifier). They are packed to THD, dispatched
-    block-diagonally (``causal=True``) via ``flash_attn_varlen_func`` -- which honours
-    document boundaries through ``cu_seqlens`` rather than attending across them -- and
-    the packed output is unpacked back to bhsd. ``sink`` is threaded only when supplied
-    (newer-backend feature; a no-op default otherwise).
+    block-diagonally via ``flash_attn_varlen_func`` -- which honours document boundaries
+    through ``cu_seqlens`` rather than attending across them -- and the packed output is
+    unpacked back to bhsd. ``sink`` is threaded only when supplied (newer-backend
+    feature; a no-op default otherwise).
+
+    ``causal`` and ``window_size`` are the *within-document* pattern recovered by the
+    classifier: the varlen kernel applies them per segment, so bidirectional packing
+    (``causal=False``, what diffusion models use) and packing plus a local window both
+    come out of the same call. They default to the autoregressive unwindowed shape.
     """
     bsz, hq, sq, _ = query.shape
     dv = value.shape[-1]
@@ -63,8 +70,8 @@ def _dispatch_document_varlen(
     call_kwargs: Dict[str, Any] = dict(
         dropout_p=dropout_p,
         softmax_scale=scale,
-        causal=True,
-        window_size=(-1, -1),
+        causal=causal,
+        window_size=window_size,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
         return_lse=False,

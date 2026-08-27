@@ -20,6 +20,8 @@ SUPPORT_STATUS: Dict[str, Any] = {
             "sliding_window_causal",
             "sliding_window_bidirectional",
             "document_causal",
+            "document_bidirectional",
+            "document_windowed",
         ],
         "score_mod": ["none", "alibi_detected", "alibi_explicit"],
         "gqa_mqa": True,
@@ -48,6 +50,22 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # only, so the right edge would be silently dropped (see
         # bidirectional_window_with_sink under not_supported_yet).
         "sliding_window_bidirectional": "band_reconstructed_and_verified_then_window_size_left_right",
+        # Packing is no longer assumed to be autoregressive. The varlen kernels apply
+        # `causal` and `window_size` *within* each segment on top of cu_seqlens, so all
+        # four combinations of {causal, bidirectional} x {unwindowed, windowed} lower
+        # onto the same block-diagonal call and differ only in the two flags handed
+        # down. Bidirectional packing is the shape diffusion / encoder training uses:
+        # several samples concatenated into one sequence with no causal term at all.
+        # The within-document pattern is recovered from the fully-probed mask and
+        # required to reconstruct it exactly; on a truncated probe only the unwindowed
+        # shapes are recoverable (boundaries come from mask_mod, verified exactly).
+        "document_bidirectional_and_windowed": "same_cu_seqlens_with_causal_and_window_size_carried_into_varlen",
+        # A probe corner that is entirely visible no longer short-circuits to "full":
+        # bidirectional packing whose first document exceeds the probe, and bands wider
+        # than the probe, look identical there. Fullness is re-verified against mask_mod
+        # over the whole sequence, and an unverifiable mask raises instead of silently
+        # running dense attention.
+        "all_visible_probe_corner_reverified": "full_confirmed_over_whole_sequence_or_raise",
     },
     # Classification (block_mask probe) and score_mod (ALiBi/soft-cap) detection are
     # memoised by object identity (weakref) so reusing the same block_mask / score_mod
@@ -111,6 +129,11 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # deterministic and sink are never on together (no deterministic dQ accumulation
         # in the sink backward). Caught here so the error names the real culprit.
         "deterministic_with_sink_on_dense_route": "backend_asserts_no_deterministic_dq_accumulation_for_sink",
+        # Packing + sink: the aiter varlen kernels have no sink parameter, and the only
+        # varlen backend that carries one (FlyDSL) requires equal segment lengths. Ragged
+        # documents with a sink therefore raise at the flex layer, naming the constraint,
+        # rather than reaching a "no compatible backend" error deeper down.
+        "sink_with_ragged_document_packing": "aiter_varlen_has_no_sink_and_flydsl_needs_uniform_seglens",
     },
     # Explicit variable-length / document-packing entry point (THD layout). A
     # superset-free thin wrapper around ``flash_attn_varlen_func``: the caller
