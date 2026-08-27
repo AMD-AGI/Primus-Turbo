@@ -19,6 +19,7 @@ are no float atomics. Built on the verified forward machine.
 """
 
 import math as host_math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -79,30 +80,16 @@ def _wsq_ilv(nb, B, Sq, hd, elem_bytes=2):
 # asks for none -- capacity, not speed, is what still needs the Q-outer dq kernel there. Past
 # the cap the band axis is walked in groups (see _band_span_for) and the reduce carries the
 # running fp32 sum from group to group, so the footprint follows the cap instead of the context.
-# Walking the band axis in groups costs wall time -- bitwise identical either way -- so the cap
-# wants to be as large as the card can spare. It keys on TOTAL memory, not free: free memory
-# moves between calls and would flip one shape between the grouped and whole-axis plans.
-_WSQ_BUDGET_FRACTION = 0.15
+# A smaller cap hands the next group a running sum to re-read one more time, and the reduce
+# is already band-traffic bound, so that shows up about one for one: at the GPT-OSS 8K shape
+# 3 GiB reads 876 TFLOP/s against the whole axis's 990, and llama-70B D128 gives up 22%.
+# Capacity is therefore bought by LAYOUT first (see _wsq_pair_ok and _wsq_ring_for, both free)
+# and only then by this cap, which stays where it was. Keep an environment override for a
+# deployment that has to trade the throughput back for the last GiB.
+_WSQ_BUDGET_BYTES = int(os.environ.get("PRIMUS_TURBO_ATTN_WSQ_BUDGET_GIB", "16")) << 30
 
 
-def _wsq_budget_bytes():
-    """Cap on the dQ split-K partial workspace, at least the old fixed 16 GiB."""
-    fixed = 16 << 30
-    try:
-        total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
-    except Exception:
-        return fixed
-    return max(fixed, int(total * _WSQ_BUDGET_FRACTION))
-
-
-_WSQ_BUDGET_BYTES = None  # set to a byte count to override; probes use it to price a span
-
-
-def _wsq_budget():
-    return _WSQ_BUDGET_BYTES if _WSQ_BUDGET_BYTES is not None else _wsq_budget_bytes()
-
-
-def _band_span_for(n_bands, band_bytes, ilv, whole=True):
+def _band_span_for(n_bands, band_bytes, ilv, whole=True, axis_bytes=None):
     """Bands one dkdv pass owns; 0 when the whole band axis fits the workspace budget.
 
     A power-of-two multiple of the band interleave, so a pass boundary is also a band-group
@@ -121,18 +108,20 @@ def _band_span_for(n_bands, band_bytes, ilv, whole=True):
     the same run, whose makespan is the longest walk in it. Rounding the span down to a run
     beats every span between two runs by more than the extra pass it costs.
     """
-    if n_bands * band_bytes <= _wsq_budget():
+    # axis_bytes: what the whole axis really costs, which the causal fold halves
+    # (see _wsq_pair_ok). Only the fit test uses it; a span is still counted in bands.
+    if (n_bands * band_bytes if axis_bytes is None else axis_bytes) <= _WSQ_BUDGET_BYTES:
         return 0
     if not whole:
-        span = max(1, _wsq_budget() // band_bytes)
+        span = max(1, _WSQ_BUDGET_BYTES // band_bytes)
         return span - span % _NUM_XCD if span >= _NUM_XCD else span
     span = ilv
-    while span * 2 < n_bands and n_bands % (span * 2) == 0 and span * 2 * band_bytes <= _wsq_budget():
+    while span * 2 < n_bands and n_bands % (span * 2) == 0 and span * 2 * band_bytes <= _WSQ_BUDGET_BYTES:
         span *= 2
     return span if span < n_bands else 0
 
 
-def _wsq_ring_for(n_bands, block_kv, window_left, ilv, band_bytes, block_q=_BWD_BLOCK_Q):
+def _wsq_ring_for(n_bands, block_kv, window_left, ilv, block_q=_BWD_BLOCK_Q):
     """Band groups the dQ partial workspace keeps live; 0 = one group per band.
 
     A finite window bounds how far along the band axis a q BLOCK's dQ slot travels: the body
@@ -140,17 +129,39 @@ def _wsq_ring_for(n_bands, block_kv, window_left, ilv, band_bytes, block_q=_BWD_
     rows past it. Bands further apart than that write DISJOINT rows, so letting them share a
     slot keeps one writer per slot -- the property the fixed-order fp32 reduce rests on -- and
     changes neither what is written nor the ascending order it is read back in. Only the
-    workspace shrinks, from the band axis to the window. Gated on BYTES rather than on having
-    a window, so a shape whose bands already fit keeps the plain band index (see
-    _wsq_budget()); the group, not the band, is the unit because interleaved bands share
-    a row (see _wsq_ilv). Opening it on the window alone is a CAPACITY lever, not a speed one:
-    the slots a window skips cost neither descriptor nor page walk.
+    workspace shrinks, from the band axis to the window; the group, not the band, is the unit
+    because interleaved bands share a row (see _wsq_ilv).
+
+    Opened on the WINDOW rather than on the byte count, because the slots a window skips cost
+    neither descriptor nor page walk: at the GPT-OSS 8K shape the byte gate left a 0.6 ms
+    kernel holding the whole 16 GiB axis whenever the cap was wide enough to allow it, and
+    opening the ring there measures 0.6175 -> 0.6092 ms against 1.25 GiB.
     """
-    if window_left < 0 or n_bands * band_bytes <= _wsq_budget():
+    if window_left < 0:
         return 0
     span = (window_left + block_q - 1) // block_kv + 2
     grp = span // ilv + 2
     return 0 if grp * ilv >= n_bands else grp
+
+
+def _wsq_pair_ok(n_bands, ilv, block_kv, Sq, Skv, window_left, sbhd, band_span, ring):
+    """Band groups, when group g and group ng-g can share one slab; 0 = each keeps its own.
+
+    Under full causal a kv band takes only the q rows at or below it, so group g never writes
+    the first g*ilv*BLOCK_KV rows of its slab -- measured: the untouched fraction is exactly
+    g/ng -- and the reduce skips the same rows. Group ng-g needs (ng-g)*ilv*BLOCK_KV rows,
+    which is that dead prefix EXACTLY, so the two fold into one slab with the high group
+    shifted down by its own first row. The axis then costs ng//2+1 slabs and the same bytes
+    in flight, which is the one lever here that buys capacity without buying traffic.
+
+    Square and dense only: a window bounds the span itself (see _wsq_ring_for), a ragged
+    launch has no single diagonal, and a band GROUP pass holds one contiguous run whose
+    partners live in another pass. An odd ng would leave a group without a partner.
+    """
+    if not sbhd or window_left >= 0 or band_span or ring or Sq != Skv:
+        return 0
+    ng = n_bands // ilv
+    return ng if ng % 2 == 0 and ng * ilv * block_kv == Skv else 0
 
 
 # NOTE: nothing here keeps a device tensor across calls. Under torch.compile's cudagraph
@@ -615,6 +626,7 @@ def build_flash_attn_bwd_dqred_module(
     band_pad=0,  # padding bytes between band groups (see _WSQ_BAND_PAD); 0 = dense
     band_ilv=1,  # adjacent bands sharing one partial row (see _WSQ_BAND_ILV)
     band_ring=0,  # >0: band groups reuse this many workspace slots (see _wsq_ring_for)
+    band_pair=0,  # >0: total band groups, folded in pairs g / ng-g (see _wsq_pair_ok)
     varlen=False,  # True: rows are packed q tokens of ``num_seg`` segments (see below)
     num_seg=1,
     # band_span: >0 = the workspace holds ONE GROUP of that many bands and this launch folds
@@ -726,10 +738,14 @@ def build_flash_attn_bwd_dqred_module(
     RING = int(band_ring)
     BAND_BYTES = batch_size * SQ * HD * 2 * ILV
     BAND_STRIDE = BAND_BYTES + band_pad
+    PAIR = int(band_pair)
+    # Rows one band group leaves unwritten under causal, in bytes: its own first q row.
+    PAIR_ROW_BYTES = ILV * block_kv * HD * 2 * ILV
     assert BAND_BYTES < (1 << 32), "band group must fit a 32-bit num_records"
     ROW0 = bat_lo * SQ
     NSEG = num_seg
     SPAN = int(band_span)
+    assert not PAIR or (not RING and window_left < 0 and PAIR % 2 == 0 and not SPAN)
     DQ_BYTES = batch_size * SQ * HD * 2
     CARRY_BYTES = batch_size * SQ * HD * 4
     # Both are addressed by one descriptor whose num_records also does the row's "is this my
@@ -929,11 +945,19 @@ def build_flash_attn_bwd_dqred_module(
             _grp = band // fx.Index(ILV) if const_expr(ILV > 1) else band
             if const_expr(RING):
                 _grp = _grp % fx.Index(RING)
+            if const_expr(PAIR):
+                # The writer's fold, read back (see _wsq_pair_ok). Same two terms, same order.
+                _hi = ArithValue(_grp * fx.Index(2) > fx.Index(PAIR))
+                _shift = fx.Index(_hi.select(_grp * fx.Index(PAIR_ROW_BYTES), fx.Index(0)))
+                _grp = fx.Index(_hi.select(fx.Index(PAIR) - _grp, _grp))
+                _band_base = _grp * fx.Index(BAND_STRIDE) - _shift
+            else:
+                _band_base = _grp * fx.Index(BAND_STRIDE)
             band_rsrc = buffer_ops.create_buffer_resource(
                 WSQ,
                 max_size=False,
                 num_records_bytes=_raw(fx.Index(BAND_BYTES)),
-                base_byte_offset=_raw(_grp * fx.Index(BAND_STRIDE)),
+                base_byte_offset=_raw(_band_base),
             )
             _lane = (band % fx.Index(ILV)) * fx.Index(head_dim) if const_expr(ILV > 1) else None
             parts = [
@@ -1196,6 +1220,7 @@ def build_flash_attn_bwd_dkdv_module(
     wsq_pad=0,  # padding bytes between dQ partial band groups (see _WSQ_BAND_PAD)
     wsq_ilv=1,  # adjacent bands sharing one partial row (see _WSQ_BAND_ILV)
     wsq_ring=0,  # >0: band groups reuse this many workspace slots (see _wsq_ring_for)
+    wsq_pair=0,  # >0: total band groups, folded in pairs g / ng-g (see _wsq_pair_ok)
     # band_span: >0 = this launch owns ONE GROUP of that many kv bands (see _band_span_for).
     # K/V/DK/DV still span the whole kv axis; the group's first kv row arrives as a device
     # scalar in the CuSeqKv slot, and seq_len_k is the group's own extent, so the grid, the
@@ -1312,6 +1337,8 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_PAD = int(wsq_pad)
     WSQ_ILV = int(wsq_ilv)
     WSQ_RING = int(wsq_ring)
+    WSQ_PAIR = int(wsq_pair)
+    assert not WSQ_PAIR or (not WSQ_RING and window_left < 0 and WSQ_PAIR % 2 == 0)
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
     # body has to still hold, so it rides the plain full-causal path only -- square SBHD, or
     # ragged (whose bands are per segment).
@@ -2048,11 +2075,22 @@ def build_flash_attn_bwd_dkdv_module(
         _wsq_grp = kv_tile_idx // fx.Index(WSQ_ILV) if WSQ_ILV > 1 else kv_tile_idx
         if const_expr(WSQ_RING):
             _wsq_grp = _wsq_grp % fx.Index(WSQ_RING)
+        if const_expr(WSQ_PAIR):
+            # Groups above the midpoint ride their partner's dead prefix (see _wsq_pair_ok):
+            # slab ng-g, and the group's own first row lands at the slab's row 0. Folded into
+            # the descriptor base so the store's row offset stays the plain q index. The whole
+            # term is const_expr'd out when the fold is off, keeping that ISA byte-identical.
+            _hi = ArithValue(_wsq_grp * fx.Index(2) > fx.Index(WSQ_PAIR))
+            _wsq_shift = fx.Index(_hi.select(_wsq_grp * fx.Index(WSQ_ILV * BLOCK_KV) * _wsq_row, fx.Index(0)))
+            _wsq_grp = fx.Index(_hi.select(fx.Index(WSQ_PAIR) - _wsq_grp, _wsq_grp))
+            _wsq_base = _wsq_grp * _wsq_band + _wsq_off - _wsq_shift
+        else:
+            _wsq_base = _wsq_grp * _wsq_band + _wsq_off
         wsq_rsrc = buffer_ops.create_buffer_resource(
             WSQ,
             max_size=False,
             num_records_bytes=_raw(_wsq_slice),
-            base_byte_offset=_raw(_wsq_grp * _wsq_band + _wsq_off),
+            base_byte_offset=_raw(_wsq_base),
         )
         _lse_per_batch = seq_len_q_v * fx.Index(NUM_HEADS_Q)
         _lse_nrec_bytes = _raw(_lse_per_batch * fx.Index(4))
@@ -4013,11 +4051,16 @@ def _cu_placeholder(device):
     return torch.zeros(1, device=device, dtype=torch.int32)
 
 
-def _dq_partial_ws(nb, B, Sq, hd, device, dtype, pad_bytes=0, ilv=1, carry=False):
+def _dq_partial_ws(nb, B, Sq, hd, device, dtype, pad_bytes=0, ilv=1, carry=False, pair=False):
     """dQ split-K workspace [bands/ilv, B, Sq, Hq*D*ilv] for the fused KV-outer kernel.
 
     Returns (workspace, carry): ``carry`` is the fp32 running dQ sum the reduce hands from one
     band group to the next, or None when the whole band axis fits one workspace.
+
+    ``pair`` folds band group g and group ng-g into one slab (see _wsq_pair_ok). Causal
+    leaves group g's first g*ilv*BLOCK_KV rows unwritten, which is exactly the row count
+    group ng-g needs, so the axis costs ng//2+1 slabs instead of ng and no extra byte
+    moves: the rows the fold reuses are ones neither the body nor the reduce ever touched.
 
     ``ilv`` adjacent bands share a row and are interleaved at D granularity rather than
     getting a slab each; ``ilv=1`` is the plain [bands, B, Sq, Hq*D]. See _WSQ_BAND_ILV
@@ -4093,6 +4136,8 @@ def _dq_partial_ws(nb, B, Sq, hd, device, dtype, pad_bytes=0, ilv=1, carry=False
     """
     assert nb % ilv == 0, "the band interleave must divide the band count"
     ng, ghd = nb // ilv, hd * ilv
+    if pair:
+        ng = ng // 2 + 1
     slab = B * Sq * ghd
     pad = pad_bytes // dtype.itemsize
     assert pad * dtype.itemsize == pad_bytes, "band padding must be a whole element count"
@@ -4183,6 +4228,7 @@ def _reduce_dq_partials(
     cu=None,  # (cu_seqlens_q, cu_seqlens_kv): ragged rows, band window per segment
     band=None,  # (band_span, cu_seqlens_kv slot, carry): fold ONE band group (see _band_span_for)
     band_ring=0,  # >0: bands share workspace slots modulo this (see _wsq_ring_for)
+    band_pair=0,  # >0: total band groups, folded in pairs g / ng-g (see _wsq_pair_ok)
     ph=None,  # the caller's unused-slot placeholder, if it already has one (see below)
 ):
     """dQ[q] = scale * Sum_{b : b*BLOCK_KV <= q} ws[b][q], in ascending band order.
@@ -4253,6 +4299,7 @@ def _reduce_dq_partials(
         band_pad,
         band_ilv,
         band_ring,
+        band_pair,
         num_seg if cu is not None else None,
         band[0] if band is not None else 0,
     )
@@ -4281,6 +4328,7 @@ def _reduce_dq_partials(
             band_pad=band_pad,
             band_ilv=band_ilv,
             band_ring=band_ring,
+            band_pair=band_pair,
             varlen=cu is not None,
             num_seg=num_seg,
             band_span=band[0] if band is not None else 0,
@@ -4466,6 +4514,7 @@ def _fused_pipelined(
     window_left=-1,
     sbhd=False,
     band_ring=0,
+    band_pair=0,
 ):
     """Run the fused kernel in chunks -- on BATCH and on the q_split SUBSET -- and hide each chunk's
     dQ reduce under the next. A batch chunk needs a token-major layout (batch b contiguous); strides
@@ -4593,6 +4642,7 @@ def _fused_pipelined(
                 window_left=window_left,
                 sbhd=sbhd,
                 band_ring=band_ring,
+                band_pair=band_pair,
                 ph=cu_ph,
                 **bat_kw,
             )
@@ -4685,6 +4735,7 @@ def _get_bwd(
     square=True,
     wsq_ilv=1,
     wsq_ring=0,
+    wsq_pair=0,
     band_span=0,
 ):
     key = (
@@ -4701,6 +4752,7 @@ def _get_bwd(
         square,
         wsq_ilv,
         wsq_ring,
+        wsq_pair,
         band_span,
     )
     launchers = _BWD_CACHE.get(key)
@@ -4753,6 +4805,7 @@ def _get_bwd(
             wsq_pad=(_WSQ_BAND_PAD if D == 128 else 0),
             wsq_ilv=wsq_ilv,
             wsq_ring=wsq_ring,
+            wsq_pair=wsq_pair,
             band_span=band_span,
             q_pref=not _pair,
             g3_defer=_fuse_d128 and not _pair,
@@ -5029,7 +5082,7 @@ def flydsl_varlen_backward(
         # slots can be shared (see _wsq_ring_for); full causal has no such bound and walks the
         # band axis in groups instead (see _band_span_for). Rows are packed, so ilv stays 1.
         band_bytes = total_q * Hq * D * 2
-        wsq_ring = _wsq_ring_for(n_bands, block_kv, window_left, 1, band_bytes)
+        wsq_ring = _wsq_ring_for(n_bands, block_kv, window_left, 1)
         band_span = _band_span_for(n_bands, band_bytes, 1, whole=False) if window_left < 0 else 0
         dkdv_l, odo_l = _get_bwd(
             Hq,
@@ -5149,14 +5202,31 @@ def flydsl_varlen_backward(
     )
     # Long context: the dQ partial workspace is bands*|dQ| and outgrows the card, so walk the
     # band axis in groups instead of asking for all of it at once (see _band_span_for).
+    # The causal fold is free, so it is priced BEFORE the levers that are not: a shape whose
+    # folded axis fits the cap keeps the whole-axis plan instead of paying a carry for bytes
+    # the fold already saved (see _wsq_pair_ok).
+    _pair_ng = _wsq_pair_ok(n_bands, wsq_ilv, block_kv, Sq, Skv, window_left, sbhd, 0, 0)
+    _axis_bytes = (_pair_ng // 2 + 1) * wsq_ilv * B * Sq * Hq * D * 2 if _pair_ng else None
     band_span = (
-        _band_span_for(n_bands, B * Sq * Hq * D * 2, wsq_ilv)
+        _band_span_for(n_bands, B * Sq * Hq * D * 2, wsq_ilv, axis_bytes=_axis_bytes)
         if sbhd and window_left < 0 and Sq == Skv and Skv % block_kv == 0
         else 0
     )
     # A window bounds the band span a q block writes, so the same footprint problem is
     # answered without any pass structure at all: the bands share slots (see _wsq_ring_for).
-    wsq_ring = _wsq_ring_for(n_bands, block_kv, window_left, wsq_ilv, B * Sq * Hq * D * 2)
+    wsq_ring = _wsq_ring_for(n_bands, block_kv, window_left, wsq_ilv)
+    # Causal leaves half the axis unwritten; fold it away before any of the levers above
+    # start trading throughput for the same bytes (see _wsq_pair_ok).
+    wsq_pair = _pair_ng if not band_span and not wsq_ring else 0
+    # A ring is a whole number of band GROUPS, so the interleave is also the smallest ring a
+    # window can ask for: at the GPT-OSS 8K shape it rounds 5 bands up to 16 and holds 4 GiB
+    # where 1.25 would do. A ring exists only because the axis did not fit, so rounding it up
+    # is the one place the interleave is spending the very bytes the ring was opened to save;
+    # drop it there. Bit-identical, and the body measures 0.6196 -> 0.6050 ms at B4 and
+    # 0.3076 -> 0.3129 at B2, against 3.2x less workspace at both.
+    if wsq_ring:
+        wsq_ilv = 1
+        wsq_ring = _wsq_ring_for(n_bands, block_kv, window_left, 1)
     dkdv_l, odo_l = _get_bwd(
         Hq,
         Hkv,
@@ -5170,6 +5240,7 @@ def flydsl_varlen_backward(
         square=(Sq == Skv),
         wsq_ilv=wsq_ilv,
         wsq_ring=wsq_ring,
+        wsq_pair=wsq_pair,
         band_span=band_span,
     )
     # identity delta = -rowsum(O.dO); the body centers dP by it (exact).
@@ -5222,6 +5293,7 @@ def flydsl_varlen_backward(
         _WSQ_BAND_PAD if D == 128 else 0,
         wsq_ilv,
         carry=bool(band_span),
+        pair=bool(wsq_pair),
     )
     if band_span:
         _fused_bandgroups(
@@ -5271,6 +5343,7 @@ def flydsl_varlen_backward(
             window_left=window_left,
             sbhd=sbhd,
             band_ring=wsq_ring,
+            band_pair=wsq_pair,
         )
     else:
         # Pass ONE (band, batch) slice: the kernel rebases the SRD to its own slice with
@@ -5305,6 +5378,7 @@ def flydsl_varlen_backward(
             window_left=window_left,
             sbhd=sbhd,
             band_ring=wsq_ring,
+            band_pair=wsq_pair,
             ph=cu_ph,
         )
     if sbhd:
