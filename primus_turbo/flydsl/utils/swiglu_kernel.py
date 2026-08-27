@@ -11,7 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Mega-MoE SwiGLU epilogue kernels (FlyDSL)."""
+"""Standalone SwiGLU forward/backward kernels (FlyDSL)."""
 
 from __future__ import annotations
 
@@ -31,11 +31,11 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
-from primus_turbo.flydsl.mega.prims import ld, st
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
 )
+from primus_turbo.flydsl.utils.prims import ld, st
 
 ACTIVATION_CLAMP = 10.0
 
@@ -149,14 +149,22 @@ def _make_swiglu_bwd(
 
         def compute_tile(m, col, gate_parts=None, guard=False):
             row_base = m * fx.Int32(two_I)
+            # fx predicate for the partial tail (None when the tile is fully in bounds).
+            in_bounds = (col < fx.Int32(I)) if guard else None
+            # The resources are sized to the tensors, so a tail lane's load has to be
+            # folded back inside them: on the last row there is no next row to spill
+            # into. The value is discarded either way -- the stores below are guarded
+            # and the gate contribution is zeroed.
+            ld_col = fx.arith.select(in_bounds, col, fx.Int32(0)) if guard else col
             gate = fx.arith.extf(
-                f32v, buffer_load(acc_rsrc, row_base + col, vec_width=_VEC, dtype=fx.T.bf16())
+                f32v, buffer_load(acc_rsrc, row_base + ld_col, vec_width=_VEC, dtype=fx.T.bf16())
             )
             up = fx.arith.extf(
-                f32v, buffer_load(acc_rsrc, row_base + fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16())
+                f32v,
+                buffer_load(acc_rsrc, row_base + fx.Int32(I) + ld_col, vec_width=_VEC, dtype=fx.T.bf16()),
             )
             d = fx.arith.extf(
-                f32v, buffer_load(dact_rsrc, m * fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16())
+                f32v, buffer_load(dact_rsrc, m * fx.Int32(I) + ld_col, vec_width=_VEC, dtype=fx.T.bf16())
             )
             d_raw = d
             if with_scale:
@@ -175,8 +183,6 @@ def _make_swiglu_bwd(
             dgate = fx.arith.trunc_f(bf16v, fx.arith.mulf(dgc, mg))
             dup = fx.arith.trunc_f(bf16v, fx.arith.mulf(duc, mu))
 
-            # fx predicate for the partial tail (None when the tile is fully in bounds).
-            in_bounds = (col < fx.Int32(I)) if guard else None
             if not guard or in_bounds:
                 # Padding rows write garbage dx here; upstream must zero Xpad to keep dW1 clean.
                 buffer_store(dgate, dacc_rsrc, row_base + col)

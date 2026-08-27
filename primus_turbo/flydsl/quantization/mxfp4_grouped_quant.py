@@ -49,11 +49,13 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     _lane_tbl_get,
     _lane_tbl_load,
     _lane_tbl_scan,
-    _readfirstlane_i32,
-    ceildiv_pow2,
     current_stream,
     make_row_band_resource,
     xcd_remap_pid_blocked,
+)
+from primus_turbo.flydsl.utils.prims import (
+    _readfirstlane_i32,
+    ceildiv_pow2,
 )
 
 MB = 32  # MXFP4 microblock (elems per E8M0)

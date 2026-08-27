@@ -60,14 +60,18 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.mega.prims import cast, read_clock, spin_timed_out
 from primus_turbo.flydsl.utils.gemm_helper import (
     _emit_lds_repack,
-    ceildiv,
     emit_for,
     emit_if_then,
     make_value_attrs,
     run_compiled,
+)
+from primus_turbo.flydsl.utils.prims import (
+    cast,
+    ceildiv,
+    read_clock,
+    spin_timed_out,
 )
 
 _H_NUM_TILE_BLOCKS = 11  # appended by this module: the per-call real-tile count

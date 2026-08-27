@@ -59,13 +59,13 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     Mfma16x16x32,
     S2RLoaderTr16x32Bf16,
     StoreCBf16,
-    _i64,
     compute_global_swizzle_nn_bf16,
     make_bf16_buffer_tensor_rebased,
     make_value_attrs,
     wait_barrier,
     xcd_remap_pid,
 )
+from primus_turbo.flydsl.utils.prims import _i64
 
 
 def _load_i64_as_i32(base, offset):

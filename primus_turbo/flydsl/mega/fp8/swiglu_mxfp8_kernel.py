@@ -67,7 +67,8 @@ from primus_turbo.flydsl.mega.fp8.quant import (
     compile_rowcol_dual_pack_grouped,
     mxfp8_words_from_f32_subvecs,
 )
-from primus_turbo.flydsl.utils.gemm_helper import ceildiv, run_compiled
+from primus_turbo.flydsl.utils.gemm_helper import run_compiled
+from primus_turbo.flydsl.utils.prims import ceildiv
 
 ACTIVATION_CLAMP = 10.0
 _POOL_BLOCK_M = 256

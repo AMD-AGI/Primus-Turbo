@@ -23,7 +23,8 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
-from primus_turbo.flydsl.mega.prims import (
+from primus_turbo.flydsl.mega.symm_buffer import SymBuffer, Workspace
+from primus_turbo.flydsl.utils.prims import (
     atomic_add,
     copy_warp,
     ld,
@@ -31,7 +32,6 @@ from primus_turbo.flydsl.mega.prims import (
     spin_timed_out,
     st,
 )
-from primus_turbo.flydsl.mega.symm_buffer import SymBuffer, Workspace
 
 _WARP = 64
 _BLOCK_THREADS = 512
