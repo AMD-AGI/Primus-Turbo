@@ -9,7 +9,7 @@
 This module is the **only** entry point callers should import. It exposes a
 drop-in replacement for ``torch.nn.attention.flex_attention.flex_attention``:
 common variants that Turbo accelerates (full / causal / sliding-window-causal /
-document-causal masks, optional ALiBi score bias, GQA/MQA) are recognised at
+bidirectional band / document-causal masks, optional ALiBi score bias, GQA/MQA) are recognised at
 runtime and dispatched onto the high-performance ``flash_attn_func`` backend
 (FlyDSL/AITER on gfx950). Anything that cannot be mapped onto those fixed kernels
 raises ``NotImplementedError`` with an explanation -- it is never silently dropped.
@@ -187,6 +187,30 @@ def create_block_mask(
         )
 
 
+# torch flex_attention kernel_options that only steer Triton codegen for the kernel
+# torch would have generated. Turbo routes onto fixed backend kernels instead, so these
+# have no analogue here; dropping them costs (at most) performance, never correctness.
+_IGNORABLE_KERNEL_OPTIONS = frozenset(
+    {
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_M1",
+        "BLOCK_N1",
+        "BLOCK_M2",
+        "BLOCK_N2",
+        "num_stages",
+        "num_warps",
+        "PRESCALE_QK",
+        "ROWS_GUARANTEED_SAFE",
+        "BLOCKS_ARE_CONTIGUOUS",
+        "WRITE_DQ",
+        "FORCE_USE_FLEX_ATTENTION",
+        "OUTPUT_LOGSUMEXP",
+        "USE_TMA",
+    }
+)
+
+
 def flex_attention(
     query,
     key,
@@ -293,9 +317,32 @@ def flex_attention(
     _validate_qkv(query, key, value)
 
     if kernel_options:
+        # torch's flex_attention takes kernel_options as a bag of Triton autotuning
+        # knobs for the kernel it generates. Turbo does not generate a kernel -- it
+        # routes onto a fixed aiter/CK or Triton entry -- so none of them can be
+        # honoured. The known ones are safe to drop: BLOCK_M/BLOCK_N/num_stages/
+        # num_warps only pick a tile shape and occupancy (performance, not numerics),
+        # and PRESCALE_QK/ROWS_GUARANTEED_SAFE/BLOCKS_ARE_CONTIGUOUS/WRITE_DQ are
+        # opt-in fast paths whose default is the *more* conservative, more accurate
+        # behaviour, which is what the backend already does. FORCE_USE_FLEX_ATTENTION
+        # only disables torch's own decode shortcut, which this layer never takes.
+        # An unrecognised key is a different matter: it is either a typo or a knob
+        # that does change results, and silently ignoring it is exactly the
+        # silent-drop failure this layer exists to prevent -- so raise instead.
+        unknown = sorted(set(kernel_options) - _IGNORABLE_KERNEL_OPTIONS)
+        if unknown:
+            raise NotImplementedError(
+                "Turbo flex compat layer: unrecognised kernel_options "
+                f"{unknown}. Turbo dispatches onto fixed backend kernels instead of "
+                "generating one, so it cannot honour them, and ignoring an option it "
+                "does not recognise could silently change what gets computed. Known "
+                "performance-only options that are safe to ignore: "
+                f"{sorted(_IGNORABLE_KERNEL_OPTIONS)}."
+            )
         warnings.warn(
-            "Turbo flex compat layer does not support kernel_options yet; ignoring: "
-            f"{sorted(kernel_options.keys())}",
+            "Turbo flex compat layer ignores kernel_options (it dispatches onto fixed "
+            "backend kernels rather than generating one); these are performance-only "
+            f"knobs and dropping them does not change results: {sorted(kernel_options)}",
             stacklevel=2,
         )
 
@@ -404,6 +451,22 @@ def flex_attention(
         has_sink=has_sink,
         has_bias=has_bias,
     )
+
+    # ---- bidirectional band window + sink -------------------------------------
+    # A non-causal band mask lowers to window_size=(left, right). The csrc/CK entry
+    # forwards both edges to the forward *and* the backward, so it is exact there. The
+    # sink route is not: its backward calls triton_flash_attn_onekernel_backward with
+    # sliding_window=window_size_left only -- the right edge is dropped, so the backward
+    # would differentiate a wider mask than the forward computed and return silently
+    # wrong gradients. Refuse the combination instead.
+    if has_sink and mask_cfg["window_size"][1] > 0:
+        raise NotImplementedError(
+            "Turbo flex compat layer: a bidirectional (non-causal) window "
+            f"{mask_cfg['window_size']} cannot be combined with a sink -- the sink backward takes "
+            "only a left window (sliding_window=window_size_left), so it would compute gradients "
+            "for a wider mask than the forward used. Drop the sink, or use a causal left-window "
+            "mask."
+        )
 
     # ---- single softcap enablement point --------------------------------------
     # softcap (explicit or detected) is blocked at the kernel layer on this build:
@@ -517,6 +580,22 @@ def flex_attention(
             return_bshd=_return_bshd,
         )
 
+    # ---- dense route: deterministic + sink ------------------------------------
+    # ``FlashAttnFunc.forward`` asserts these two are never on together (the sink
+    # backward has no deterministic dQ accumulation path). Reaching that bare
+    # assertion from here would name the wrong culprit, and it only became reachable
+    # once this layer started threading ``deterministic`` instead of hard-coding it
+    # to False. Document packing is exempt on purpose: it lands on the varlen entry,
+    # which carries no such assertion, and it has already returned above.
+    if deterministic and has_sink:
+        raise NotImplementedError(
+            "Turbo flex compat layer: deterministic=True cannot be combined with a sink on the "
+            "dense route -- the backend asserts the same thing (flash_attn_interface.py: "
+            '"deterministic and sink cannot be enabled together currently"), because the sink '
+            "backward has no deterministic dQ accumulation. Set deterministic=False, or drop the "
+            "sink."
+        )
+
     # Lazy import so pure classification (and this module's import) does not force
     # the heavy backend kernels to load.
     if use_fp8:
@@ -534,6 +613,18 @@ def flex_attention(
         k_be = key.transpose(1, 2).contiguous()
         v_be = value.transpose(1, 2).contiguous()
 
+        # The Triton kernel behind the fp8 entry addresses the slopes as
+        # ``off_z * stride_az + off_h * stride_ah`` and reads ``alibi_slopes.stride(1)``,
+        # i.e. it wants a 2D ``[B, Hq]`` tensor. Every other backend in this layer takes
+        # the aiter 1D ``[Hq]`` convention, and _validate enforces 1D, so handing the 1D
+        # tensor straight through raises a bare IndexError from inside the kernel launch.
+        # Broadcasting over the batch is the faithful translation rather than a guess:
+        # ALiBi slopes are per-head and batch-independent by construction, which is
+        # exactly what _detect_alibi_slopes verifies before returning them.
+        fp8_alibi_slopes = effective_alibi_slopes
+        if fp8_alibi_slopes is not None and fp8_alibi_slopes.dim() == 1:
+            fp8_alibi_slopes = fp8_alibi_slopes.unsqueeze(0).expand(q_be.shape[0], -1).contiguous()
+
         out = flash_attn_fp8_func(
             q_be,
             k_be,
@@ -543,7 +634,7 @@ def flex_attention(
             causal=mask_cfg["causal"],
             window_size=mask_cfg["window_size"],  # gated to (-1, -1) above
             bias=None,  # gated to None above
-            alibi_slopes=effective_alibi_slopes,
+            alibi_slopes=fp8_alibi_slopes,  # 1D [Hq] -> 2D [B, Hq] for the Triton kernel
             deterministic=deterministic,  # gated to False above
             return_lse=return_lse,  # gated to False above
             fp8_config=fp8_config,  # None -> backend default (BLOCKWISE, block_size=64)

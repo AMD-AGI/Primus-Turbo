@@ -72,11 +72,72 @@ def test_classify_random_mask_unsupported():
         _classify_block_mask(block_mask, B=1, H=1, q_len=16, kv_len=16)
 
 
-def test_classify_bidirectional_band_unsupported():
-    # Symmetric band around the diagonal (non-causal) -> not expressible.
-    block_mask = _DummyBlockMask(lambda b, h, q, kv: (kv - q).__abs__() <= 2)
+# ---- bidirectional band windows -------------------------------------------------
+# A non-causal band ``-R <= q - kv <= L`` is exactly what flash_attn spells
+# ``window_size=(L, R)``, and the csrc/CK entry forwards both edges to the forward and
+# the backward alike, so the mapping is exact rather than an approximation.
+
+
+def test_classify_symmetric_band():
+    width = 2
+    block_mask = _DummyBlockMask(lambda b, h, q, kv: (q - kv).abs() <= width)
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=32, kv_len=32)
+    assert cfg["kind"] == "sliding_window"
+    assert cfg["causal"] is False
+    assert cfg["window_size"] == (width, width)
+
+
+def test_classify_asymmetric_band():
+    left, right = 4, 1
+    block_mask = _DummyBlockMask(lambda b, h, q, kv: ((q - kv) <= left) & ((q - kv) >= -right))
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=48, kv_len=48)
+    assert cfg["kind"] == "sliding_window"
+    assert cfg["causal"] is False
+    assert cfg["window_size"] == (left, right)
+
+
+def test_classify_band_python_and_scalar_fallback():
+    # ``and`` forces the element-wise probe path, as for the causal window above.
+    block_mask = _DummyBlockMask(lambda b, h, q, kv: ((q - kv) <= 3) and ((kv - q) <= 2))
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=32, kv_len=32)
+    assert cfg["kind"] == "sliding_window"
+    assert cfg["window_size"] == (3, 2)
+
+
+def test_classify_holey_band_unsupported():
+    # Band-shaped extent but with a hole in it: the reconstructed band would not match,
+    # so this must be refused rather than widened into a real band.
+    def mask_mod(b, h, q, kv):
+        return ((q - kv).abs() <= 3) & ((q - kv) != 1)
+
     with pytest.raises(NotImplementedError):
-        _classify_block_mask(block_mask, B=1, H=1, q_len=32, kv_len=32)
+        _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=32, kv_len=32)
+
+
+def test_classify_band_wider_than_probe_unsupported():
+    # Left edge parked on the probe boundary: on the truncated grid this is
+    # indistinguishable from any wider left edge, so refuse instead of guessing. The
+    # narrow right edge keeps the probe from being all-visible, which would classify as
+    # a full mask before the band logic is ever reached.
+    long_len = 4096
+
+    def mask_mod(b, h, q, kv):
+        return ((q - kv) <= long_len) & ((kv - q) <= 2)
+
+    with pytest.raises(NotImplementedError):
+        _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=long_len, kv_len=long_len)
+
+
+def test_classify_position_dependent_band_unsupported():
+    # Band width that grows with q is not translation invariant, so a single
+    # window_size cannot describe it. The far-q edge probes catch this.
+    long_len = 4096
+
+    def mask_mod(b, h, q, kv):
+        return (q - kv).abs() <= (q // 64 + 1)
+
+    with pytest.raises(NotImplementedError):
+        _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=long_len, kv_len=long_len)
 
 
 def test_classify_head_dependent_unsupported():

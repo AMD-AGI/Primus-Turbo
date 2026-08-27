@@ -212,6 +212,88 @@ def _locate_left_window(mask_mod: Callable, *, q_len: int, kv_len: int) -> Optio
     return window
 
 
+def _classify_band_mask(
+    mask: torch.Tensor,
+    *,
+    delta: torch.Tensor,
+    mask_mod: Optional[Callable],
+    q_len: int,
+    kv_len: int,
+    q_probe: int,
+    kv_probe: int,
+) -> Optional[Dict[str, Any]]:
+    """Recognise a non-causal band mask ``-R <= q - kv <= L`` (bidirectional local
+    attention), or return ``None`` if the probed mask is not exactly that.
+
+    ``flash_attn``'s ``window_size=(left, right)`` *is* this band, and the csrc/CK
+    entry forwards both edges verbatim, so the mapping is exact rather than an
+    approximation. Only reached once the caller has established that the mask is not
+    causal (something is visible above the diagonal) and not all-ones.
+
+    Never silently wrong:
+
+    * ``L`` and ``R`` are read off the probed grid and the band is then *reconstructed
+      and compared for exact equality*; any hole, block structure, or asymmetry fails.
+    * When the probe did not cover the whole sequence, an edge is only accepted if it
+      sits strictly inside the probed grid (so it was actually observed, not clipped)
+      **and** ``mask_mod`` confirms the same edge at a far query position -- a band that
+      is not translation invariant cannot be expressed as one ``window_size``.
+    """
+    visible_delta = delta[mask]
+    if visible_delta.numel() == 0:
+        return None
+    left = int(visible_delta.max().item())
+    right = int((-visible_delta).max().item())
+    if right <= 0:
+        # Causal or left-window causal; the caller's existing paths handle those and
+        # this function must not change their classification.
+        return None
+    if left < 0:
+        # Strictly above the diagonal: the query cannot even see itself. flash_attn's
+        # window is anchored on the diagonal and cannot express that.
+        return None
+
+    band = (delta <= left) & (delta >= -right)
+    if not torch.equal(mask, band):
+        return None
+
+    truncated = q_len > q_probe or kv_len > kv_probe
+    if truncated:
+        if mask_mod is None:
+            return None
+        # An edge that lands on the last probed offset may really be larger and merely
+        # clipped by the grid, so refuse rather than guess.
+        if left >= q_probe - 1 or right >= kv_probe - 1:
+            raise NotImplementedError(
+                f"Turbo flex compat layer detected a band mask whose edge may exceed the probe "
+                f"limit {_MASK_PROBE_LIMIT}; the window size could not be verified. Please express "
+                "the window explicitly via create_block_mask on a shorter probe, or use the "
+                "codegen path."
+            )
+        far_q = q_len - 1
+        checks = []
+        if far_q - left >= 0:
+            checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q - left), True))
+        if far_q - left - 1 >= 0:
+            checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q - left - 1), False))
+        if far_q + right < kv_len:
+            checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q + right), True))
+        if far_q + right + 1 < kv_len:
+            checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q + right + 1), False))
+        if any(bool(got) is not want for got, want in checks):
+            raise NotImplementedError(
+                "Turbo flex compat layer does not support this block_mask: the band around the "
+                "diagonal is not translation-invariant over long sequences, so a single "
+                "window_size cannot be determined."
+            )
+
+    return {
+        "kind": "sliding_window",
+        "causal": False,
+        "window_size": (left, right),
+    }
+
+
 def _classify_probed_mask(
     mask: torch.Tensor,
     *,
@@ -230,10 +312,28 @@ def _classify_probed_mask(
     causal = delta >= 0
 
     if bool((mask & (~causal)).any().item()):
+        # Something is visible above the diagonal, so this is not causal in any form.
+        # One non-causal shape still maps exactly onto the kernels: a *band* around the
+        # diagonal, ``-R <= q - kv <= L``. flash_attn's ``window_size=(left, right)`` is
+        # precisely that band, and the csrc/CK entry forwards both edges unchanged, so
+        # bidirectional local attention (the symmetric ``|q - kv| <= W`` that image and
+        # video models use) is dispatchable rather than codegen-only. Everything that is
+        # not exactly a band still raises below.
+        band = _classify_band_mask(
+            mask,
+            delta=delta,
+            mask_mod=mask_mod,
+            q_len=q_len,
+            kv_len=kv_len,
+            q_probe=q_probe,
+            kv_probe=kv_probe,
+        )
+        if band is not None:
+            return band
         raise NotImplementedError(
             "Turbo flex compat layer does not support this block_mask: visible positions were found "
-            "above the causal diagonal (neither causal nor left-window causal). This is an arbitrary "
-            "mask_mod and requires the codegen path."
+            "above the causal diagonal, and the pattern is not a band around the diagonal "
+            "(-R <= q - kv <= L) either. This is an arbitrary mask_mod and requires the codegen path."
         )
     if not bool(mask.any().item()):
         raise NotImplementedError(

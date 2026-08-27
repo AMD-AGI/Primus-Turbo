@@ -6,6 +6,8 @@
 
 """Unit tests for ``flex_attention_interface.py``: the public entry points, end-to-end with the backend mocked on CPU."""
 
+import warnings
+
 import pytest
 import torch
 
@@ -890,3 +892,192 @@ def test_fp8_rejection_lists_every_offending_feature_at_once(capture_fp8_backend
     assert "dropout_p" in message
     assert "deterministic" in message
     assert "return_lse" in message
+
+
+# ---------------------------------------------------------------------------
+# deterministic + sink on the dense route
+#
+# ``FlashAttnFunc.forward`` asserts the two are never on together (the sink backward
+# has no deterministic dQ accumulation). That assertion only became reachable from
+# here once this layer stopped hard-coding ``deterministic=False``; these tests pin
+# that the layer names the culprit itself, and that the varlen route -- which carries
+# no such assertion upstream -- is left alone.
+# ---------------------------------------------------------------------------
+
+
+def test_deterministic_with_sink_raises_on_the_dense_route(capture_backend):
+    q, k, v = _make_qkv()
+    sink = torch.zeros(4, dtype=torch.float32)
+    with pytest.raises(NotImplementedError) as excinfo:
+        flex_attention(q, k, v, sink=sink, deterministic=True)
+    message = str(excinfo.value)
+    assert "deterministic" in message
+    assert "sink" in message
+    assert "called" not in capture_backend
+
+
+def test_deterministic_with_sink_raises_from_the_bshd_entry(capture_backend):
+    q = _make_bshd(2, 32, 4, 16)
+    sink = torch.zeros(4, dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="sink"):
+        flex_attention_bshd(q, q.clone(), q.clone(), sink=sink, deterministic=True)
+    assert "called" not in capture_backend
+
+
+@pytest.mark.parametrize("deterministic,sink_on", [(True, False), (False, True), (False, False)])
+def test_deterministic_and_sink_are_fine_apart(capture_backend, deterministic, sink_on):
+    q, k, v = _make_qkv()
+    sink = torch.zeros(4, dtype=torch.float32) if sink_on else None
+    flex_attention(q, k, v, sink=sink, deterministic=deterministic)
+    assert capture_backend["called"] is True
+    assert capture_backend["kwargs"]["deterministic"] is deterministic
+
+
+def test_deterministic_with_sink_still_allowed_on_the_varlen_route(capture_varlen_backend):
+    # The varlen entry carries no such assertion upstream, so gating it here would
+    # reject a combination the backend actually supports.
+    q = _make_thd(512, 4, 16)
+    cu, max_s, _ = _cu_from_seqlens([128, 128, 256])
+    sink = torch.zeros(4, dtype=torch.float32)
+    flex_attention_varlen(
+        q, q.clone(), q.clone(), cu, cu, max_s, max_s, causal=True, sink=sink, deterministic=True
+    )
+    assert capture_varlen_backend["called"] is True
+    assert capture_varlen_backend["kwargs"]["deterministic"] is True
+
+
+# ---------------------------------------------------------------------------
+# fp8 + ALiBi tensor layout
+#
+# The Triton kernel behind the fp8 entry addresses the slopes as
+# ``off_z * stride_az + off_h * stride_ah`` and reads ``alibi_slopes.stride(1)``: it
+# wants 2D ``[B, Hq]``. Every other backend in this layer -- and _validate -- uses
+# aiter's 1D ``[Hq]`` convention. Passing the 1D tensor straight through raised a bare
+# IndexError from inside the kernel launch.
+# ---------------------------------------------------------------------------
+
+
+def test_fp8_expands_alibi_slopes_to_two_dimensions(capture_fp8_backend):
+    B, H = 3, 4
+    q, k, v = _make_bf16_qkv(B=B, Hq=H)
+    slopes = torch.tensor([1.0, 0.5, 0.25, 0.125], dtype=torch.float32)
+    flex_attention(q, k, v, alibi_slopes=slopes.clone(), fp8=True)
+    passed = capture_fp8_backend["kwargs"]["alibi_slopes"]
+    assert passed.dim() == 2
+    assert tuple(passed.shape) == (B, H)
+    assert passed.is_contiguous()
+    # Same slopes on every batch row: ALiBi is per-head and batch-independent.
+    for b in range(B):
+        assert torch.allclose(passed[b].cpu(), slopes)
+
+
+def test_fp8_leaves_alibi_none_alone(capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    flex_attention(q, k, v, fp8=True)
+    assert capture_fp8_backend["kwargs"]["alibi_slopes"] is None
+
+
+def test_dense_route_keeps_the_one_dimensional_alibi_convention(capture_backend):
+    # The expansion is fp8-only: aiter/CK wants 1D [Hq] and would misread a 2D tensor.
+    H = 4
+    q, k, v = _make_qkv(Hq=H)
+    slopes = torch.tensor([1.0, 0.5, 0.25, 0.125], dtype=torch.float32)
+    flex_attention(q, k, v, alibi_slopes=slopes.clone())
+    passed = capture_backend["kwargs"]["alibi_slopes"]
+    assert passed.dim() == 1
+    assert tuple(passed.shape) == (H,)
+
+
+# ---------------------------------------------------------------------------
+# kernel_options
+#
+# torch's flex_attention takes these as Triton autotuning knobs for the kernel it
+# generates. Turbo routes onto fixed backend kernels, so it can honour none of them.
+# The documented ones only steer tiling/occupancy or opt into a less conservative fast
+# path, so dropping them is performance-only and stays a warning. An unrecognised key
+# is either a typo or something that changes results, and dropping it silently is the
+# exact failure this layer exists to prevent -- so it raises.
+# ---------------------------------------------------------------------------
+
+
+def test_known_kernel_options_warn_and_dispatch(capture_backend):
+    q, k, v = _make_qkv()
+    with pytest.warns(UserWarning, match="kernel_options"):
+        flex_attention(q, k, v, kernel_options={"BLOCK_M": 64, "num_warps": 8})
+    assert capture_backend["called"] is True
+
+
+def test_unknown_kernel_option_raises(capture_backend):
+    q, k, v = _make_qkv()
+    with pytest.raises(NotImplementedError) as excinfo:
+        flex_attention(q, k, v, kernel_options={"BLOCK_M": 64, "NOT_A_REAL_KNOB": 1})
+    message = str(excinfo.value)
+    assert "NOT_A_REAL_KNOB" in message
+    assert "BLOCK_M" not in message.split("Known")[0]  # only the unknown one is blamed
+    assert "called" not in capture_backend
+
+
+def test_empty_kernel_options_is_silent(capture_backend):
+    q, k, v = _make_qkv()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        flex_attention(q, k, v, kernel_options={})
+    assert capture_backend["called"] is True
+
+
+def test_kernel_options_gate_applies_to_the_bshd_entry(capture_backend):
+    q = _make_bshd(2, 32, 4, 16)
+    with pytest.raises(NotImplementedError, match="NOT_A_REAL_KNOB"):
+        flex_attention_bshd(q, q.clone(), q.clone(), kernel_options={"NOT_A_REAL_KNOB": 1})
+    assert "called" not in capture_backend
+
+
+# ---- bidirectional band windows ------------------------------------------
+# A non-causal band ``-R <= q - kv <= L`` lowers to ``window_size=(L, R)`` with
+# ``causal=False``. The csrc/CK entry honours both edges in the forward and the
+# backward, so the route is exact -- but only when there is no sink: the sink backward
+# takes ``sliding_window=window_size_left`` only, silently dropping the right edge, so
+# that combination is refused rather than differentiated against the wrong mask.
+
+
+def _band_block_mask(left, right):
+    return _DummyBlockMask(lambda b, h, q, kv: ((q - kv) <= left) & ((kv - q) <= right))
+
+
+def test_symmetric_band_dispatches_with_both_window_edges(capture_backend):
+    q, k, v = _make_qkv(S=32)
+    flex_attention(q, k, v, block_mask=_band_block_mask(3, 3))
+    assert capture_backend["kwargs"]["causal"] is False
+    assert capture_backend["kwargs"]["window_size"] == (3, 3)
+
+
+def test_asymmetric_band_dispatches_with_both_window_edges(capture_backend):
+    q, k, v = _make_qkv(S=32)
+    flex_attention(q, k, v, block_mask=_band_block_mask(5, 1))
+    assert capture_backend["kwargs"]["causal"] is False
+    assert capture_backend["kwargs"]["window_size"] == (5, 1)
+
+
+def test_band_reaches_the_backend_from_the_bshd_entry(capture_backend):
+    q = _make_bshd(1, 32, 4, 16)
+    k = _make_bshd(1, 32, 4, 16)
+    v = _make_bshd(1, 32, 4, 16)
+    flex_attention_bshd(q, k, v, block_mask=_band_block_mask(4, 2))
+    assert capture_backend["kwargs"]["window_size"] == (4, 2)
+
+
+def test_band_with_sink_raises(capture_backend):
+    q, k, v = _make_qkv(Hq=4, S=32)
+    with pytest.raises(NotImplementedError, match="bidirectional"):
+        flex_attention(q, k, v, block_mask=_band_block_mask(4, 2), sink=torch.zeros(4))
+    assert "called" not in capture_backend
+
+
+def test_causal_left_window_with_sink_is_still_allowed(capture_backend):
+    # The gate keys on a positive *right* edge, not on windowing as such: a causal
+    # left-only window keeps working with a sink, which is the GPT-OSS shape.
+    q, k, v = _make_qkv(Hq=4, S=32)
+    block_mask = _DummyBlockMask(lambda b, h, q_idx, kv: (q_idx >= kv) & ((q_idx - kv) <= 4))
+    flex_attention(q, k, v, block_mask=block_mask, sink=torch.zeros(4))
+    assert capture_backend["kwargs"]["causal"] is True
+    assert capture_backend["kwargs"]["window_size"] == (4, 0)

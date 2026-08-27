@@ -14,7 +14,13 @@ from typing import Any, Dict
 
 SUPPORT_STATUS: Dict[str, Any] = {
     "supported_now": {
-        "mask": ["full", "causal", "sliding_window_causal", "document_causal"],
+        "mask": [
+            "full",
+            "causal",
+            "sliding_window_causal",
+            "sliding_window_bidirectional",
+            "document_causal",
+        ],
         "score_mod": ["none", "alibi_detected", "alibi_explicit"],
         "gqa_mqa": True,
         "return_lse": True,
@@ -33,6 +39,15 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # last query row + exact per-row verification (see _locate_left_window), so a
         # big window on S>512 is now classified instead of raising NotImplementedError.
         "sliding_window_large": "window_gt_probe_located_by_binary_search_on_last_row",
+        # A non-causal band ``-R <= q - kv <= L`` (the local-attention shape used by
+        # image / video models) maps exactly onto window_size=(L, R) with causal=False:
+        # the csrc/CK entry forwards both edges to the forward and the backward alike.
+        # The band is reconstructed from its two extreme diagonals and required to match
+        # the probe exactly, so a merely band-shaped-but-holey mask is still refused.
+        # Excluded with a sink: that backward takes sliding_window=window_size_left
+        # only, so the right edge would be silently dropped (see
+        # bidirectional_window_with_sink under not_supported_yet).
+        "sliding_window_bidirectional": "band_reconstructed_and_verified_then_window_size_left_right",
     },
     # Classification (block_mask probe) and score_mod (ALiBi/soft-cap) detection are
     # memoised by object identity (weakref) so reusing the same block_mask / score_mod
@@ -87,6 +102,15 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # bias is None and window_size == (-1,-1), has no dropout_p in its backward,
         # never reads `deterministic`, emits a [B,H,2*Sq] LSE, and has no varlen entry.
         "fp8_with_sink_bias_window_dropout_deterministic_lse_or_packing": "explicitly_rejected_triton_fp8_kernel_cannot_honour_them",
+        # A bidirectional band is exact on the csrc/CK route but not on the sink route:
+        # that backward calls triton_flash_attn_onekernel_backward with
+        # sliding_window=window_size_left, dropping the right edge, so it would
+        # differentiate a wider mask than the forward computed. Refused, not approximated.
+        "bidirectional_window_with_sink": "sink_backward_takes_left_window_only_right_edge_would_be_dropped",
+        # Same shape of gap on the dense route: FlashAttnFunc.forward itself asserts
+        # deterministic and sink are never on together (no deterministic dQ accumulation
+        # in the sink backward). Caught here so the error names the real culprit.
+        "deterministic_with_sink_on_dense_route": "backend_asserts_no_deterministic_dq_accumulation_for_sink",
     },
     # Explicit variable-length / document-packing entry point (THD layout). A
     # superset-free thin wrapper around ``flash_attn_varlen_func``: the caller
