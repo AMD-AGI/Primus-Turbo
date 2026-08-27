@@ -441,6 +441,32 @@ def wait_barrier(count):
     )
 
 
+def spin_flag_eq(rsrc, off, want):
+    """Poll the i32 flag at byte ``off`` of ``rsrc`` until it reads ``want``. ``sc0`` keeps the
+    load off L1, so the producer's L2 line is what the poll sees; a caller whose tile has no
+    producer passes a zero-record descriptor and ``want=0``, which exits on the first load.
+    Belongs ahead of a tile body: the s_waitcnt inside is vmcnt(0) and must see nothing in flight."""
+    _llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32, i32)>"),
+        [_raw(v) for v in (rsrc, off, want)],
+        "\n".join(
+            [
+                "1:",
+                "buffer_load_dword $0, $3, $2, 0 offen sc0",
+                "s_waitcnt vmcnt(0)",
+                "v_readfirstlane_b32 $1, $0",
+                "s_cmp_lg_u32 $1, $4",
+                "s_cbranch_scc0 2f",
+                "s_sleep 8",
+                "s_branch 1b",
+                "2:",
+            ]
+        ),
+        "=&v,=&s,s,v,s,~{memory}",
+        has_side_effects=True,
+    )
+
+
 class Mfma16x16x128:
     def __init__(self, n_tiles_a, n_tiles_b):
         self.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
@@ -782,6 +808,9 @@ class StoreCPerTensor:
         c_base=None,
         beta_is_one=False,
         accum_mask=None,
+        rd_base=None,
+        rd_rows=None,
+        rd_shift=None,
     ):
         self.beta_is_one = beta_is_one
         self.c_rows = c_rows
@@ -801,6 +830,12 @@ class StoreCPerTensor:
         # on the SRD base at runtime, and only the C piece may add the read-back -- a banked
         # slice that added its scratch back would fold the previous launch's partial in.
         self.accum_mask = accum_mask
+        # Read-back source, when it is not the store target: the deep-K wgrad's leading piece adds
+        # a peer piece's scratch band into its own accumulators, so the beta=1 load rides a
+        # different buffer, row origin and bound than the C store. rd_rows=0 = nothing to add.
+        self.rd_base = rd_base
+        self.rd_rows = rd_rows
+        self.rd_shift = rd_shift
         # Optional f32->f32 epilogue node chain (bias/act), post-scale pre-cast.
         self.elem_fn = elem_fn
         self.scaled = A_scale is not None
@@ -867,7 +902,15 @@ class StoreCPerTensor:
         if not const_expr(self.beta_is_one):
             return None
         band_row = base_col if self.trans else base_row  # trans pins the band to M
-        rsrc = make_row_band_resource(self.c_base, band_row, self.c_rows, self.c_cols, self.out_bytes)
+        if const_expr(self.rd_shift is not None):
+            band_row = band_row + self.rd_shift
+        rsrc = make_row_band_resource(
+            self.c_base if self.rd_base is None else self.rd_base,
+            band_row,
+            self.c_rows if self.rd_rows is None else self.rd_rows,
+            self.c_cols,
+            self.out_bytes,
+        )
         return [
             [
                 [self._read_back(rsrc, ti, i, tj, base_row, base_col) for i in range_constexpr(4)]
