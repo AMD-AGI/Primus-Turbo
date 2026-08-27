@@ -2239,7 +2239,14 @@ def _compile_mxfp4_fused(
     order. ksplit>1 writes K/ksplit partials into a [ksplit*M, N] workspace C (the host sums
     the row bands outside the stub)."""
     K128 = K // 128
-    pre_ab = _build_mxfp4_preshuffle_kernel_ab()
+    # A scale row is K_real/32 bytes; when that is not a whole number of dwords the source
+    # has to be read a byte at a time (see _load_sc_dwords). Compile-time so an aligned K
+    # keeps the single dwordx2 load.
+    _sc_row = (K if k_real is None else k_real) // 32
+    # The dwordx2 fast path indexes source rows by K128, i.e. the DESTINATION row stride, and
+    # loads two whole dwords at a time. Both only hold when the source rows already span the
+    # padded extent; anything shorter needs the byte path, whatever its dword alignment.
+    pre_ab = _build_mxfp4_preshuffle_kernel_ab(byte_src=_sc_row != K128 * 4)
     gemm_kern, BM, BN, _ks, gemm_value_attrs = _build_mxfp4_gemm_kernel(
         K=K,
         group_m=gm,
@@ -2279,7 +2286,19 @@ def _compile_mxfp4_fused(
         qn = ceildiv(c_n, fx.Int32(256)) * fx.Int32(256)
         grid_a = ceildiv(qm * fx.Int32(K128), _PGRID)
         grid_b = ceildiv(qn * fx.Int32(K128), _PGRID)
-        pre_ab(A_raw, A_scale, B_raw, B_scale, qm, qn, c_m, c_n, fx.Int32(K128), grid_a).launch(
+        pre_ab(
+            A_raw,
+            A_scale,
+            B_raw,
+            B_scale,
+            qm,
+            qn,
+            c_m,
+            c_n,
+            fx.Int32(K128),
+            grid_a,
+            fx.Int32(_sc_row),
+        ).launch(
             grid=(grid_a + grid_b, 1, 1),
             block=(_MXFP4_PRESHUF_BLK, 1, 1),
             stream=stream,
@@ -2376,7 +2395,28 @@ def _mxfp4_grp_from(wi, r_region, mode):
     return 4 * (wi // 2) + (wi % 2) + 2 * r_region
 
 
-def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0):
+def _load_sc_dwords(rin, row_base, k4, n_sub, sc_row, ok):
+    """``n_sub`` packed E8M0 dwords assembled a byte at a time.
+
+    A canonical E8M0 row is K/32 bytes, which is a whole number of dwords only when
+    K % 128 == 0. Otherwise the row base is not dword-aligned (K=2880 -> 90 bytes, so odd
+    rows start 2 mod 4) and a dword load would either fault or take four bytes of the next
+    row. Byte loads have neither problem, and bounding each one at the row's true width
+    gives zero past K -- exactly what the trailing block's scales have to be."""
+    words = []
+    for w in range_constexpr(n_sub):
+        acc = fx.Int32(0)
+        for j in range_constexpr(4):
+            in_row = k4 + fx.Int32(w * 4 + j)  # byte index WITHIN the row, not within the group
+            bt = buffer_ops.buffer_load(
+                rin, row_base + in_row, vec_width=1, dtype=T.i8, mask=ok & (in_row < sc_row)
+            )
+            acc = acc | ((fx.Int32(bt) & fx.Int32(0xFF)) << fx.Int32(j * 8))
+        words.append(acc)
+    return Vec.from_elements(words, fx.Int32)
+
+
+def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0, byte_src=False):
     # Merged A+B scale preshuffle: ONE grid repacks BOTH operands so the fused stub issues a
     # single preshuffle launch instead of two -> one fewer launch + gap per GEMM (bigger win
     # on small-M/N). Blocks [0, grid_a) do A (mode 0); [grid_a, ...) do B (mode 1); the A/B
@@ -2401,6 +2441,7 @@ def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0):
         rd_b: fx.Int32,
         K128: fx.Int32,
         grid_a: fx.Int32,
+        sc_row: fx.Int32,  # bytes per SOURCE row (K_real // 32); == K128 * 4 when aligned
     ):
         KK = K128 // n_sub  # K/256
         # workgroup-uniform block index -> SGPR so the segment cond is SCC (scalar), which
@@ -2411,9 +2452,12 @@ def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0):
         dim = arith.select(is_b, dim_b, dim_a)
         rd = arith.select(is_b, rd_b, rd_a)
         # Per-segment source/dest resources (each carries its own num_records bound).
-        a_rin = buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=rd_a * K128 * 4)
+        # The source is bounded by its OWN row width (sc_row), which is K128*4 only when the
+        # scale rows happen to be a whole number of dwords; the destination is always the
+        # 256-rounded packed extent.
+        a_rin = buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=rd_a * sc_row)
         a_rout = buffer_ops.create_buffer_resource(a_out, max_size=False, num_records_bytes=dim_a * K128 * 4)
-        b_rin = buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=rd_b * K128 * 4)
+        b_rin = buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=rd_b * sc_row)
         b_rout = buffer_ops.create_buffer_resource(b_out, max_size=False, num_records_bytes=dim_b * K128 * 4)
         rin = arith.select(is_b, b_rin, a_rin)
         rout = arith.select(is_b, b_rout, a_rout)
@@ -2436,38 +2480,22 @@ def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0):
             for t in range_constexpr(nd):
                 loc = arith.select(is_b, r * b_ilv + t, t * 16 + r) if b_ilv else (t * 16 + r)
                 row = grp * 64 + loc
-                dws.append(
-                    Vec(
-                        buffer_ops.buffer_load(
-                            rin, row * K128 + k128, vec_width=n_sub, dtype=T.i32, mask=ok & (row < rd)
+                _in = ok & (row < rd)
+                if const_expr(byte_src):
+                    dws.append(_load_sc_dwords(rin, row * sc_row, k128 * 4, n_sub, sc_row, _in))
+                else:
+                    dws.append(
+                        Vec(
+                            buffer_ops.buffer_load(
+                                rin, row * K128 + k128, vec_width=n_sub, dtype=T.i32, mask=_in
+                            )
                         )
                     )
-                )
         words = _mxfp4_pack_cell(dws, n_sub, nd, NG)
         for g in range_constexpr(NG):
             buffer_ops.buffer_store(Vec.from_elements(words[g]), rout, base + g * 64, mask=ok)
 
     return kern
-
-
-_MXFP4_KPAD_WS: dict = {}
-
-
-def _kpad_scale(sc, Kw, side):
-    """Canonical E8M0 [D, K/32] widened to [D, Kw/32] with zero fill, in a cached buffer.
-    A no-op when the row already spans Kw. The zeros are what make the trailing block's
-    past-K operand bytes contribute nothing. ``side`` keeps A and B apart: a square GEMM
-    gives them the same shape, and one buffer would have B overwrite A."""
-    want = Kw // 32
-    if sc.shape[1] == want:
-        return sc.contiguous()
-    key = (side, sc.shape[0], want, sc.dtype, sc.device)
-    buf = _MXFP4_KPAD_WS.get(key)
-    if buf is None:
-        buf = torch.zeros((sc.shape[0], want), dtype=sc.dtype, device=sc.device)
-        _MXFP4_KPAD_WS[key] = buf
-    buf[:, : sc.shape[1]].copy_(sc)
-    return buf
 
 
 def _get_mxfp4_scale_ws(M, N, K, device):
@@ -2585,13 +2613,10 @@ def gemm_mxfp4_flydsl_kernel(
     Kw = (K + 255) // 256 * 256  # loop + packed-scale extent
     _k_real = None if K == Kw else K  # None keeps the aligned shapes' launch key unchanged
     a_sp, b_sp = _get_mxfp4_scale_ws(M, N, Kw, a.device)
-    # The preshuffle reads the canonical E8M0 as int32 (4 K-blocks per dword), so a K whose
-    # K/32 bytes per row is not a whole number of dwords cannot even be viewed -- and a
-    # trailing block needs zero scales past the true K anyway. Widen the scale rows to Kw/32
-    # in a cached workspace; the operands themselves are left alone (they are 16x the bytes,
-    # and the zero scales already make their overrun harmless).
-    a_raw = _kpad_scale(a_scale, Kw, "a").view(torch.int32).reshape(-1)
-    b_raw = _kpad_scale(b_scale, Kw, "b").view(torch.int32).reshape(-1)
+    # Straight through, no widening: the preshuffle bounds each source read at the row's
+    # true K/32 bytes and zero-fills the packed tail itself.
+    a_raw = a_scale.contiguous().reshape(-1)
+    b_raw = b_scale.contiguous().reshape(-1)
     out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
     beta_is_one = beta == 1.0
     # Keep the fp4 operands 2D (do NOT flatten): M*K/2 / N*K/2 exceed 2^31 int8s for
