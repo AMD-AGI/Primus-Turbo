@@ -202,6 +202,9 @@ def flex_attention(
     dropout_p: float = 0.0,
     sink: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    fp8: bool = False,
+    fp8_config: Optional[Any] = None,
     _return_bshd: bool = False,
 ):
     """Drop-in compatible ``flex_attention`` dispatching to Turbo fast paths.
@@ -239,7 +242,7 @@ def flex_attention(
       ``0 <= p < 1`` (``0`` disables dropout, the drop-in default). As in
       flash-attn / torch ``scaled_dot_product_attention`` it is applied whenever
       ``p > 0`` (training convention -- pass ``0`` for eval); it composes with
-      ``return_lse`` and the layer always dispatches ``deterministic=False``.
+      ``return_lse`` and with the ``deterministic`` flag below.
     * ``sink`` (``Optional[torch.Tensor]``, default ``None``): attention-sink
       logits (one learned value per query head), threaded straight to
       ``flash_attn_func(sink=...)``. Requires a 1D fp32 tensor of length ``Hq``;
@@ -254,6 +257,38 @@ def flex_attention(
       ``[1,1,Sq,Skv]``), casts it to q's dtype and moves it to q's device; a
       genuine per-batch/per-head bias raises ``ValueError``. Verified numerically
       correct fwd+bwd (rel-L2 ~2e-3). ``None`` disables it (no-op).
+    * ``deterministic`` (``bool``, default ``False``): threaded straight to
+      ``flash_attn_func(deterministic=...)`` -- the same knob, with the same meaning
+      and the same backend guarantees, that a direct ``flash_attn_func`` caller gets.
+      It selects the backward's deterministic dQ accumulation where the backend
+      offers one. ``False`` (the default) reproduces the historical behaviour
+      byte-for-byte, so this stays a drop-in replacement; torch's own
+      ``flex_attention`` has no such parameter, so this is a Turbo extension.
+      Note this is *not* a promise of bit-reproducibility: what it does is
+      exactly what the underlying kernel does with the flag, no more. Previously
+      this layer hard-coded ``deterministic=False``, which meant a caller asking
+      for determinism silently did not get it.
+    * ``fp8`` (``bool``, default ``False``) / ``fp8_config``
+      (``Float8QuantConfig``, default ``None``): run the attention in fp8 via
+      :func:`primus_turbo.pytorch.ops.attention.flash_attn_fp8_func` instead of the
+      bf16/fp16 ``flash_attn_func``. Passing ``fp8_config`` implies ``fp8=True``;
+      passing ``fp8=True`` alone uses the backend default (BLOCKWISE, block_size=64).
+      ``False`` / ``None`` (the defaults) leave the historical path untouched.
+
+      fp8 lands on a *different kernel* (aiter's Triton attention) than the bf16 path
+      (aiter's CK attention), and that kernel supports strictly less. Every feature it
+      cannot do is rejected here rather than dropped: ``sink`` (``flash_attn_fp8_func``
+      has no such parameter), ``bias`` (its backward asserts ``bias is None``),
+      a sliding window (both its fwd and bwd assert ``window_size == (-1, -1)``),
+      ``dropout_p > 0`` (the forward applies dropout but the backward has no
+      ``dropout_p`` parameter at all, so the gradients would not match the forward),
+      ``deterministic=True`` (accepted by the signature and never read),
+      ``return_lse`` (the Triton LSE buffer is ``[B, H, 2*Sq]``, a different convention
+      from the dense path's ``[B, H, Sq]``), a document-causal ``block_mask`` (there is
+      no fp8 varlen entry to lower it onto), and a non-bf16 dtype (the backward asserts
+      the incoming grad is bfloat16). This is the whole point of the gate: an fp8 run
+      that quietly ignored the window or the sink would train a different model than
+      the config asked for.
     """
     _validate_qkv(query, key, value)
 
@@ -388,6 +423,53 @@ def flex_attention(
             "score_mod raise here -- we never degrade to a path that ignores the cap."
         )
 
+    # ---- fp8 gate --------------------------------------------------------------
+    # fp8 is a different kernel family with a strictly smaller feature set; see the
+    # docstring. Reject every combination it cannot honour instead of silently
+    # dropping the feature.
+    use_fp8 = bool(fp8) or fp8_config is not None
+    if use_fp8:
+        _reject = []
+        if has_sink:
+            _reject.append("sink (flash_attn_fp8_func has no 'sink' parameter)")
+        if has_bias:
+            _reject.append("bias (the fp8 backward asserts bias is None)")
+        if mask_cfg["window_size"] != (-1, -1):
+            _reject.append(
+                f"sliding window {mask_cfg['window_size']} (the Triton fp8 fwd and bwd both "
+                "assert window_size == (-1, -1))"
+            )
+        if has_dropout:
+            _reject.append(
+                "dropout_p > 0 (the Triton fp8 forward applies dropout but its backward takes "
+                "no dropout_p at all, so the gradients would not match the forward)"
+            )
+        if deterministic:
+            _reject.append("deterministic=True (flash_attn_fp8_func accepts the flag and never reads it)")
+        if return_lse:
+            _reject.append(
+                "return_lse (the Triton fp8 LSE buffer is [B, H, 2*Sq], a different convention "
+                "from the dense path's [B, H, Sq])"
+            )
+        if mask_cfg.get("kind") == "document_causal":
+            _reject.append(
+                "a document-causal block_mask (there is no fp8 varlen entry to lower packing onto)"
+            )
+        if query.dtype is not torch.bfloat16:
+            _reject.append(
+                f"dtype {query.dtype} (the Triton fp8 backward asserts the incoming grad is "
+                "bfloat16, so fp8 here is bf16-only)"
+            )
+        if _reject:
+            raise NotImplementedError(
+                "Turbo flex compat layer: fp8 attention cannot honour "
+                + "; ".join(_reject)
+                + ". fp8 runs on aiter's Triton attention kernel, which supports strictly less "
+                "than the bf16/fp16 CK kernel the rest of this layer dispatches to. These raise "
+                "rather than being ignored, because an fp8 run that silently dropped one of them "
+                "would compute a different attention than the one that was configured."
+            )
+
     if backend != "turbo":
         # A variant explicitly routed away from Turbo by a tuner override lands on
         # the (currently stub) custom hook instead of a silently wrong result.
@@ -400,6 +482,7 @@ def flex_attention(
             dropout_p=dropout_p,
             sink=sink,
             bias=effective_bias,
+            deterministic=deterministic,
             backend=backend,
         )
 
@@ -430,11 +513,45 @@ def flex_attention(
             alibi_slopes=effective_alibi_slopes,
             dropout_p=dropout_p,
             sink=sink,
+            deterministic=deterministic,
             return_bshd=_return_bshd,
         )
 
     # Lazy import so pure classification (and this module's import) does not force
     # the heavy backend kernels to load.
+    if use_fp8:
+        from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_fp8_func
+
+        # The fp8 entry lowers onto the Triton kernel, which hardcodes layout="bshd"
+        # and asserts q/k/v are contiguous. The zero-copy bhsd passthrough that the
+        # bf16 path uses (to_backend_layout) is deliberately not used here: it hands
+        # the backend a [B,S,H,D]-shaped *view* over bhsd bytes, which
+        # ``_infer_qkv_format`` reports as "bhsd" and ``flash_attn_fp8_func`` then
+        # permutes again -- a second transpose that the Triton path does not want.
+        # Materialising a plain bshd-contiguous buffer takes the unambiguous branch,
+        # and costs nothing extra: the fp8 entry calls ``.contiguous()`` regardless.
+        q_be = query.transpose(1, 2).contiguous()
+        k_be = key.transpose(1, 2).contiguous()
+        v_be = value.transpose(1, 2).contiguous()
+
+        out = flash_attn_fp8_func(
+            q_be,
+            k_be,
+            v_be,
+            dropout_p=dropout_p,  # gated to 0.0 above
+            softmax_scale=scale,
+            causal=mask_cfg["causal"],
+            window_size=mask_cfg["window_size"],  # gated to (-1, -1) above
+            bias=None,  # gated to None above
+            alibi_slopes=effective_alibi_slopes,
+            deterministic=deterministic,  # gated to False above
+            return_lse=return_lse,  # gated to False above
+            fp8_config=fp8_config,  # None -> backend default (BLOCKWISE, block_size=64)
+        )
+        if _return_bshd:
+            return out
+        return from_backend_layout(out)
+
     from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_func
 
     # bhsd -> the backend's [B,S,H,D] logical shape. transpose(1, 2) is a view; the
@@ -454,7 +571,7 @@ def flex_attention(
         window_size=mask_cfg["window_size"],
         bias=effective_bias,
         alibi_slopes=effective_alibi_slopes,
-        deterministic=False,
+        deterministic=deterministic,
         return_lse=return_lse,
         sink=sink,
         # TODO(softcap): once upstream aiter dense fwd+bwd supports it, pass softcap=effective_softcap
@@ -489,6 +606,9 @@ def flex_attention_bshd(
     dropout_p: float = 0.0,
     sink: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    fp8: bool = False,
+    fp8_config: Optional[Any] = None,
 ):
     """Layout-native entry: ``[B, S, H, D]`` in, ``[B, S, H, D]`` out (no transposes).
 
@@ -533,6 +653,9 @@ def flex_attention_bshd(
         dropout_p=dropout_p,
         sink=sink,
         bias=bias,
+        deterministic=deterministic,
+        fp8=fp8,
+        fp8_config=fp8_config,
         _return_bshd=True,
     )
     return out
@@ -554,6 +677,7 @@ def flex_attention_varlen(
     dropout_p: float = 0.0,
     sink: Optional[torch.Tensor] = None,
     softcap: Optional[float] = None,
+    deterministic: bool = False,
     return_lse: bool = False,
 ):
     """Explicit variable-length ("varlen" / document-packing) flex entry point.
@@ -602,6 +726,10 @@ def flex_attention_varlen(
         ``NotImplementedError`` (blocked at the kernel layer on this build -- the
         varlen backward has no softcap parameter -- exactly like the dense entry, so
         the cap is never silently dropped).
+    deterministic : bool, default False
+        Threaded straight to ``flash_attn_varlen_func(deterministic=...)``; same knob,
+        same meaning and same backend guarantees as a direct varlen call. ``False``
+        (the default) is the historical behaviour.
     return_lse : bool, default False
         Also return the backend's ``softmax_lse`` (returns ``(out, lse)``).
 
@@ -670,7 +798,7 @@ def flex_attention_varlen(
         causal=causal,
         window_size=window_size,
         alibi_slopes=effective_alibi_slopes,
-        deterministic=False,
+        deterministic=deterministic,
         return_lse=return_lse,
     )
     if effective_sink is not None:

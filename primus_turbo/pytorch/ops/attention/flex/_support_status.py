@@ -60,6 +60,21 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # across batch/heads (fp32 -> NaN, per-head 4D -> rejected by kernel). Verified
         # fwd+bwd correct. None (default) disables it.
         "bias": "live_explicit_passthrough_needs_Sq_Skv_qdtype_none_disables",
+        # Backward deterministic-accumulation flag -> flash_attn_func(deterministic=...)
+        # / flash_attn_varlen_func(deterministic=...); live on this build. False
+        # (default) is the historical behaviour. This is a passthrough of the backend's
+        # own flag, not an independent bit-reproducibility guarantee: the layer used to
+        # hard-code False, so a caller asking for determinism silently did not get it.
+        "deterministic": "live_explicit_passthrough_false_is_historical_default",
+        # fp8 attention -> flash_attn_fp8_func (aiter Triton kernel) instead of
+        # flash_attn_func (aiter CK kernel). fp8=True uses the backend default config
+        # (BLOCKWISE, block_size=64); fp8_config overrides it and implies fp8=True.
+        # False/None (default) leaves the bf16/fp16 path untouched. The Triton kernel
+        # supports strictly less than the CK one, so sink / bias / sliding window /
+        # dropout_p>0 / deterministic=True / return_lse / document-causal packing /
+        # non-bf16 dtypes are rejected explicitly rather than silently dropped.
+        "fp8": "live_explicit_routes_to_flash_attn_fp8_func_reduced_feature_set_gated",
+        "fp8_config": "live_explicit_implies_fp8_none_means_backend_default_blockwise_64",
     },
     "unsupported_paths": {
         "arbitrary_score_mod": "path_b_codegen_stub_only",
@@ -68,6 +83,10 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # the kernel layer: the aiter dense fwd/bwd on this build expose no softcap
         # parameter, so a soft-cap hard-errors instead of silently ignoring the cap.
         "softcap": "detected_or_explicit_but_blocked_aiter_dense_kernel_has_no_softcap_param",
+        # fp8 lands on the Triton kernel family, which has no sink parameter, asserts
+        # bias is None and window_size == (-1,-1), has no dropout_p in its backward,
+        # never reads `deterministic`, emits a [B,H,2*Sq] LSE, and has no varlen entry.
+        "fp8_with_sink_bias_window_dropout_deterministic_lse_or_packing": "explicitly_rejected_triton_fp8_kernel_cannot_honour_them",
     },
     # Explicit variable-length / document-packing entry point (THD layout). A
     # superset-free thin wrapper around ``flash_attn_varlen_func``: the caller
@@ -83,6 +102,7 @@ SUPPORT_STATUS: Dict[str, Any] = {
             "alibi_explicit",
             "dropout_p",
             "sink",
+            "deterministic",
             "return_lse",
         ],
         "document_masking": "explicit_cu_seqlens_block_diagonal_plus_causal_true",
@@ -90,6 +110,9 @@ SUPPORT_STATUS: Dict[str, Any] = {
             "arbitrary_score_mod_no_such_arg",
             "softcap_gt_0_gated",
             "bias",
+            # No fp8 varlen entry exists in Primus-Turbo (flash_attn_fp8_func is
+            # dense-only), so packed fp8 has nothing to lower onto.
+            "fp8",
         ],
     },
     # The empirically resolved ALiBi sign for this build; see the module docstring.

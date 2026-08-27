@@ -91,3 +91,22 @@ def capture_varlen_backend(monkeypatch):
         raising=True,
     )
     return captured
+
+
+@pytest.fixture
+def capture_fp8_backend(monkeypatch):
+    captured = {}
+
+    def fake_flash_attn_fp8_func(q, k, v, **kwargs):
+        captured["called"] = True
+        captured["kwargs"] = kwargs
+        captured["q_shape"] = tuple(q.shape)
+        captured["q_is_contiguous"] = q.is_contiguous()
+        return q.clone()
+
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_fp8_func",
+        fake_flash_attn_fp8_func,
+        raising=True,
+    )
+    return captured

@@ -697,3 +697,196 @@ def test_bhsd_and_bshd_entries_agree_on_backend_arguments(monkeypatch):
         if isinstance(seen_bhsd[key], torch.Tensor):
             continue
         assert seen_bhsd[key] == seen_bshd[key], key
+
+
+# ---------------------------------------------------------------------------
+# deterministic passthrough
+#
+# The layer used to hard-code ``deterministic=False`` at every dispatch site, so a
+# caller asking for the backend's deterministic backward silently did not get it --
+# the same silent-drop class this compat layer exists to prevent. These tests pin the
+# flag to the backend call on all three entries and on the document-packed route.
+# ---------------------------------------------------------------------------
+
+
+def test_deterministic_defaults_to_false_dense(capture_backend):
+    q, k, v = _make_qkv()
+    flex_attention(q, k, v)
+    assert capture_backend["kwargs"]["deterministic"] is False
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_deterministic_threaded_to_dense_backend(capture_backend, flag):
+    q, k, v = _make_qkv()
+    flex_attention(q, k, v, deterministic=flag)
+    assert capture_backend["kwargs"]["deterministic"] is flag
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_deterministic_threaded_from_bshd_entry(capture_backend, flag):
+    q = _make_bshd(2, 32, 4, 16)
+    flex_attention_bshd(q, q.clone(), q.clone(), deterministic=flag)
+    assert capture_backend["kwargs"]["deterministic"] is flag
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_deterministic_threaded_to_varlen_backend(capture_varlen_backend, flag):
+    q = _make_thd(512, 8, 128)
+    cu, max_s, _ = _cu_from_seqlens([128, 128, 256])
+    flex_attention_varlen(q, q.clone(), q.clone(), cu, cu, max_s, max_s, causal=True, deterministic=flag)
+    assert capture_varlen_backend["kwargs"]["deterministic"] is flag
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_deterministic_threaded_through_document_packing(capture_varlen_backend, flag):
+    # A document-causal block_mask on the *dense* entry is lowered onto the varlen
+    # backend; the flag has to survive that rewrite too.
+    seg = [8, 8, 16]
+    q, k, v = _make_qkv(Hq=4, S=sum(seg), D=16)
+    block_mask = _doc_causal_block_mask(seg)
+    flex_attention(q, k, v, block_mask=block_mask, deterministic=flag)
+    assert capture_varlen_backend["called"] is True
+    assert capture_varlen_backend["kwargs"]["deterministic"] is flag
+
+
+# ---------------------------------------------------------------------------
+# fp8
+#
+# fp8 lands on a different kernel family (aiter Triton) than the bf16/fp16 default
+# (aiter CK), and that kernel supports strictly less. The value of the gate is that
+# every feature it cannot honour raises instead of being dropped -- an fp8 run that
+# quietly ignored the sliding window or the sink would train a different model than
+# the config asked for. These tests pin both halves: the routing, and each rejection.
+# ---------------------------------------------------------------------------
+
+
+def _make_bf16_qkv(B=1, Hq=4, S=16, D=16):
+    return _make_qkv(B=B, Hq=Hq, S=S, D=D, dtype=torch.bfloat16)
+
+
+def _sliding_window_block_mask(window):
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & (q_idx - kv_idx < window)
+
+    return _DummyBlockMask(mask_mod)
+
+
+def test_fp8_is_off_by_default(capture_backend, capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    flex_attention(q, k, v)
+    assert capture_backend["called"] is True
+    assert "called" not in capture_fp8_backend
+
+
+def test_fp8_flag_routes_to_the_fp8_backend(capture_backend, capture_fp8_backend):
+    q, k, v = _make_bf16_qkv(B=2, S=32)
+    out = flex_attention(q, k, v, fp8=True)
+    assert capture_fp8_backend["called"] is True
+    assert "called" not in capture_backend
+    # The Triton fp8 kernel hardcodes layout="bshd" and asserts contiguity, so the
+    # zero-copy bhsd passthrough the bf16 path uses must not leak through here.
+    assert capture_fp8_backend["q_shape"] == (2, 32, 4, 16)
+    assert capture_fp8_backend["q_is_contiguous"] is True
+    # ... and the caller still gets its bhsd layout back.
+    assert out.shape == (2, 4, 32, 16)
+    assert capture_fp8_backend["kwargs"]["fp8_config"] is None
+
+
+def test_fp8_config_implies_fp8_and_is_forwarded(capture_fp8_backend):
+    sentinel = object()
+    q, k, v = _make_bf16_qkv()
+    flex_attention(q, k, v, fp8_config=sentinel)
+    assert capture_fp8_backend["called"] is True
+    assert capture_fp8_backend["kwargs"]["fp8_config"] is sentinel
+
+
+def test_fp8_routes_from_the_bshd_entry(capture_fp8_backend):
+    q = _make_bshd(2, 32, 4, 16, dtype=torch.bfloat16)
+    out = flex_attention_bshd(q, q.clone(), q.clone(), fp8=True)
+    assert capture_fp8_backend["called"] is True
+    assert out.shape == (2, 32, 4, 16)
+
+
+def test_fp8_forwards_causal_and_scale(capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    causal = _DummyBlockMask(lambda b, h, q_idx, kv_idx: q_idx >= kv_idx)
+    flex_attention(q, k, v, block_mask=causal, scale=0.25, fp8=True)
+    kwargs = capture_fp8_backend["kwargs"]
+    assert kwargs["causal"] is True
+    assert kwargs["softmax_scale"] == 0.25
+    assert kwargs["window_size"] == (-1, -1)
+    assert kwargs["bias"] is None
+    assert kwargs["dropout_p"] == 0.0
+    assert kwargs["deterministic"] is False
+
+
+def test_fp8_rejects_sink(capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    sink = torch.zeros(4, dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="sink"):
+        flex_attention(q, k, v, sink=sink, fp8=True)
+    assert "called" not in capture_fp8_backend
+
+
+def test_fp8_rejects_bias(capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    bias = torch.zeros(16, 16, dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="bias"):
+        flex_attention(q, k, v, bias=bias, fp8=True)
+    assert "called" not in capture_fp8_backend
+
+
+def test_fp8_rejects_a_sliding_window(capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    with pytest.raises(NotImplementedError, match="sliding window"):
+        flex_attention(q, k, v, block_mask=_sliding_window_block_mask(4), fp8=True)
+    assert "called" not in capture_fp8_backend
+
+
+def test_fp8_rejects_dropout(capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    with pytest.raises(NotImplementedError, match="dropout_p"):
+        flex_attention(q, k, v, dropout_p=0.1, fp8=True)
+    assert "called" not in capture_fp8_backend
+
+
+def test_fp8_rejects_deterministic(capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    with pytest.raises(NotImplementedError, match="deterministic"):
+        flex_attention(q, k, v, deterministic=True, fp8=True)
+    assert "called" not in capture_fp8_backend
+
+
+def test_fp8_rejects_return_lse(capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    with pytest.raises(NotImplementedError, match="return_lse"):
+        flex_attention(q, k, v, return_lse=True, fp8=True)
+    assert "called" not in capture_fp8_backend
+
+
+def test_fp8_rejects_document_packing(capture_fp8_backend, capture_varlen_backend):
+    seg = [8, 8, 16]
+    q, k, v = _make_bf16_qkv(Hq=4, S=sum(seg))
+    with pytest.raises(NotImplementedError, match="document-causal"):
+        flex_attention(q, k, v, block_mask=_doc_causal_block_mask(seg), fp8=True)
+    assert "called" not in capture_fp8_backend
+    assert "called" not in capture_varlen_backend
+
+
+def test_fp8_rejects_non_bf16_dtype(capture_fp8_backend):
+    # The Triton fp8 backward asserts the incoming grad is bfloat16, so an fp16 run
+    # would only fail on the backward pass -- after a forward that looked fine.
+    q, k, v = _make_qkv(dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="bfloat16"):
+        flex_attention(q, k, v, fp8=True)
+    assert "called" not in capture_fp8_backend
+
+
+def test_fp8_rejection_lists_every_offending_feature_at_once(capture_fp8_backend):
+    q, k, v = _make_bf16_qkv()
+    with pytest.raises(NotImplementedError) as excinfo:
+        flex_attention(q, k, v, dropout_p=0.1, deterministic=True, return_lse=True, fp8=True)
+    message = str(excinfo.value)
+    assert "dropout_p" in message
+    assert "deterministic" in message
+    assert "return_lse" in message
