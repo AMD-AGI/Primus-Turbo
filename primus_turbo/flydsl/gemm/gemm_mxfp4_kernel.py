@@ -2581,18 +2581,30 @@ def gemm_mxfp4_flydsl_kernel(
     a row's K end contribute nothing -- see ``_build_mxfp4_gemm_kernel``'s ``_KR``. Only the
     scales are widened; the fp4 operands are 16x the bytes and are left untouched.
 
-    ⚠ K % 256 == 0 is still the FAST path, and not for a software reason: it is what puts the
-    fp4 row stride (K/2 bytes) on a 128-byte cache line. Measured at M=32768, N=5120 with the
-    block count held at 12 so the MFMA work is identical, only the stride phase varying:
+    What costs -- and it is nothing to do with K itself -- is the fp4 ROW STRIDE missing a
+    128-byte cache line: three rows in four then start mid-line and their G2S splits into two
+    requests. Measured at M=32768, N=5120 with the block count held at 12, so the MFMA work
+    is identical and only the stride phase varies:
 
-        K=3072  stride 1536  phase  0   0.2753 ms   --
-        K=2944  stride 1472  phase 64   0.2985 ms   +8.4%
-        K=2880  stride 1440  phase 32   0.3072 ms  +11.6%
-        K=3008  stride 1504  phase 96   0.3082 ms  +12.0%
+        stride 1536  phase  0   0.2753 ms   --
+        stride 1472  phase 64   0.2985 ms   +8.4%
+        stride 1440  phase 32   0.3072 ms  +11.6%
+        stride 1504  phase 96   0.3082 ms  +12.0%
 
-    So a caller that can afford the memory is still better off handing over a K-padded
-    operand; this path exists so that one that cannot gets a correct answer rather than an
-    assertion. (Phase 64 fares best because it still lands on a 64-byte sector.)
+    (Phase 64 fares best because it still lands on a 64-byte sector.)
+
+    The stride is the caller's, though, not K's. This entry takes the true contraction from
+    the SCALE -- always K/32 canonical E8M0 columns -- and the row stride from the fp4
+    tensor's own width. A caller that allocates [M, ceil256(K)/2] and still writes only K/2
+    therefore gets the aligned kernel AT THE TRUE K: no copy, no extra arithmetic, no change
+    to what the quantiser computes, only where it put its rows. Against the same problem
+    fully padded to K=3072, over 25 interleaved rounds, that is a wash --
+
+        QKV fwd +0.6%   QKV dgrad +0.3%   AttnOut fwd +0.5%
+        AttnOut dgrad -0.0%   lm_head fwd -0.0%
+
+    -- and bit-identical to the tight-allocation result. A tight allocation stays correct and
+    simply pays the split-line read.
 
     ``beta=1.0`` accumulates into ``out`` (``out += a @ b^T``) instead of overwriting it,
     and therefore requires ``out``. It is incompatible with ``trans_c``, whose transpose
