@@ -41,13 +41,6 @@ void rs_init_uid(int rank, int nranks, const char *bytes) {
     rocshmem_set_attr_uniqueid_args(rank, nranks, &uid, &attr);
     rocshmem_init_attr(ROCSHMEM_INIT_WITH_UNIQUEID, &attr);
 }
-void rs_get_ctx_fields(long long *a, long long *b) {
-    void          *dctx = rocshmem_get_device_ctx();
-    rocshmem_ctx_t h;
-    hipMemcpy(&h, dctx, sizeof(rocshmem_ctx_t), hipMemcpyDeviceToHost);
-    *a = (long long) h.ctx_opaque;
-    *b = (long long) h.team_opaque;
-}
 int rs_my_pe() {
     return rocshmem_my_pe();
 }
