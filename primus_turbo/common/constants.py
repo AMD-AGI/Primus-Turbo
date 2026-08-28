@@ -34,10 +34,13 @@ ENV_MOE_DISPATCH_COMBINE_BACKEND = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
 # Attention backend selection, one key per family: flash-attention and sparse attention do
 # not carry the same backends (only the former has AITER, only the latter TRITON), so a
 # shared key would name backends one of the two dispatchers reading it cannot run.
-# Same per-precision format as ENV_GEMM_BACKEND.
+# Same per-precision format as ENV_GEMM_BACKEND. GLUON is explicit/forward-only rather
+# than part of automatic selection.
 # Default: None (auto-select; FLYDSL when eligible, else the op's fallback)
 
-# Dense and varlen flash-attention (e.g. FLYDSL, AITER).
+# Dense and varlen flash-attention share this key, but backend support remains
+# dispatcher-specific. GLUON is dense-only, so explicit selection makes varlen
+# dispatch fail before launch.
 ENV_ATTN_BACKEND = "PRIMUS_TURBO_ATTN_BACKEND"
 
 # Sparse attention: DeepSeek-V4 sparse-MLA (e.g. FLYDSL, TRITON).

@@ -30,6 +30,9 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_varlen_flydsl_backward_impl,
     flash_attn_varlen_flydsl_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_gluon_impl import (
+    flash_attn_gluon_forward_impl,
+)
 from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
     flash_attn_sbhd_hipkittens_backward_impl,
     flash_attn_sbhd_hipkittens_forward_impl,
@@ -114,6 +117,19 @@ class FlashAttnFunc(torch.autograd.Function):
                 ctx.softmax_scale = softmax_scale
                 ctx.causal = causal
                 ctx.window_size = window_size
+            return (out, lse) if return_lse else out
+
+        if backend == BackendType.GLUON:
+            if is_grad_enabled and _any_requires_grad(q, k, v):
+                raise RuntimeError("gluon flash-attn is forward-only; Q/K/V backward is not implemented")
+            out, lse = flash_attn_gluon_forward_impl(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                qkv_format=qkv_format,
+            )
             return (out, lse) if return_lse else out
 
         if backend == BackendType.HIPKITTENS:
@@ -239,6 +255,11 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        if ctx.backend == BackendType.GLUON:
+            raise AssertionError(
+                "internal contract violation: gluon flash-attn is forward-only and must not reach backward"
+            )
+
         if ctx.backend == BackendType.HIPKITTENS:
             q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
             dq, dk, dv = flash_attn_sbhd_hipkittens_backward_impl(
@@ -496,6 +517,8 @@ def flash_attn_func(
     FlyDSL is sbhd-native and takes that layout only.
     """
     qkv_format = _infer_qkv_format(q, k, v)
+    is_grad_enabled = torch.is_grad_enabled()
+    needs_backward = is_grad_enabled and _any_requires_grad(q, k, v)
 
     backend = resolve_flash_attn_backend(
         varlen=False,
@@ -512,6 +535,7 @@ def flash_attn_func(
         sink=sink,
         qkv_format=qkv_format,
         return_softmax=return_attn_probs,
+        needs_backward=needs_backward,
     )
 
     return FlashAttnFunc.apply(
@@ -527,7 +551,7 @@ def flash_attn_func(
         deterministic,
         return_lse,
         return_attn_probs,
-        torch.is_grad_enabled(),
+        is_grad_enabled,
         1,  # how_v3_bf16_cvt
         sink,
         qkv_format,

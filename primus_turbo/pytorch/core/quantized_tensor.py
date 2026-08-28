@@ -61,9 +61,11 @@ def _pad_inner_dim(shape, align):
 def _get_padding_align_size(tensor: QuantizedTensor):
     """Return the padding alignment for *tensor* based on its granularity."""
     assert isinstance(tensor, QuantizedTensor), "tensor must be a QuantizedTensor"
+    if tensor._granularity == ScalingGranularity.TENSORWISE:
+        # Report the pad alignment only when the buffer is actually padded, so unpadded stays 0.
+        return 128 if tensor._data.size(-1) != tensor.size(-1) else 0
     if (
-        tensor._granularity == ScalingGranularity.TENSORWISE
-        or tensor._granularity == ScalingGranularity.ROWWISE
+        tensor._granularity == ScalingGranularity.ROWWISE
         or tensor._granularity == ScalingGranularity.BLOCKWISE
     ):
         return 0
@@ -212,8 +214,14 @@ class QuantizedTensor(torch.Tensor):
         group_lens: Optional[torch.Tensor] = None,
         block_size: Optional[int] = None,
         scaling_recipe: Optional[ScalingRecipe] = None,
+        pad_align_last: int = 0,
+        pad_align_penultimate: int = 0,
     ) -> "QuantizedTensor":
         """Quantize *hp_tensor* and return a ``QuantizedTensor`` wrapping it.
+
+        ``pad_align_last`` / ``pad_align_penultimate`` are opt-in (default 0, off): when >0 the
+        fp8 TENSORWISE cast zero-pads the last / penultimate dim to a multiple of 128 while the
+        wrapper keeps the real ``shape``. Only grouped-GEMM weights request it.
 
         This is the standard way to construct a ``QuantizedTensor`` from a
         high-precision input.  Use ``__new__`` directly only when you already
@@ -322,6 +330,8 @@ class QuantizedTensor(torch.Tensor):
                     block_size=block_size,
                     axis=axis,
                     scaling_recipe=scaling_recipe,
+                    pad_align_last=pad_align_last,
+                    pad_align_penultimate=pad_align_penultimate,
                 )
             else:
                 orig_group_lens = group_lens
@@ -345,6 +355,8 @@ class QuantizedTensor(torch.Tensor):
                 block_size=block_size,
                 axis=axis,
                 scaling_recipe=scaling_recipe,
+                pad_align_last=pad_align_last,
+                pad_align_penultimate=pad_align_penultimate,
             )
 
         return cls(
@@ -377,6 +389,8 @@ class QuantizedTensor(torch.Tensor):
         block_size: Optional[int] = None,
         axis: Optional[int] = None,
         scaling_recipe: Optional[ScalingRecipe] = None,
+        pad_align_last: int = 0,
+        pad_align_penultimate: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from primus_turbo.pytorch.ops.quantization import quantize_fp4, quantize_fp8
 
@@ -390,6 +404,8 @@ class QuantizedTensor(torch.Tensor):
                 block_size=block_size,
                 axis=axis,
                 scaling_recipe=scaling_recipe,
+                pad_align_last=pad_align_last,
+                pad_align_penultimate=pad_align_penultimate,
             )
             return data_, scale_inv
         else:
@@ -603,10 +619,17 @@ class QuantizedTensor(torch.Tensor):
             out = self._dequantize()
 
         # TODO(ruibin): fused unpad in dequantize kernel
+        # Narrow both padded dims (last=K, penultimate=weight N) back to real; no-op copy if unpadded.
         if out.ndim == 2:
-            out = out[:, : self.size(-1)].contiguous()
+            out = out[:, : self.size(-1)]
+            if out.size(-2) != self.size(-2):
+                out = out[: self.size(-2), :]
+            out = out.contiguous()
         elif out.ndim == 3:
-            out = out[:, :, : self.size(-1)].contiguous()
+            out = out[:, :, : self.size(-1)]
+            if out.size(-2) != self.size(-2):
+                out = out[:, : self.size(-2), :]
+            out = out.contiguous()
         else:
             raise AssertionError("Unsupported ndim")
 

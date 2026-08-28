@@ -22,6 +22,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
+from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_impl,
     grouped_gemm_fp8_variable_k_accum_impl,
@@ -66,15 +67,12 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     default_backend: int,
     inplace_add_to_out: bool = False,
     out: Optional[torch.Tensor] = None,
+    m_real: Optional[int] = None,
+    n_real: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
-    """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked to.
-
-    Returns the weight gradient for autograd, or a dummy buffer when the wgrad went
-    straight into ``out``: forward already flagged the weight, so the training
-    framework's own accumulation step stands down. Megatron still expects a tensor
-    rather than None there, so its backward hooks stay on the main thread; the
-    contents are never read. It is handed back in the weight's own dtype, since a
-    mismatch would make autograd allocate and cast a full-size copy.
+    """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked. Returns the
+    weight grad, or a dummy buffer (weight dtype, never read) when it accumulated in
+    place -- forward flagged the weight so the framework's own accum stands down.
     """
     inputs = (a, b, a_scales, b_scales, group_lens, group_offs)
     options = dict(
@@ -88,11 +86,10 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     )
 
     if not inplace_add_to_out:
-        return grouped_gemm_fp8_variable_k_impl(*inputs, **options)
+        return grouped_gemm_fp8_variable_k_impl(*inputs, m_real=m_real, n_real=n_real, **options)
 
-    assert out is not None, "out should not be None when inplace_add_to_out is True"
-    grouped_gemm_fp8_variable_k_accum_impl(*inputs, out=out, **options)
-
+    assert out is not None, "out is required when inplace_add_to_out is True"
+    grouped_gemm_fp8_variable_k_accum_impl(*inputs, out=out, m_real=m_real, n_real=n_real, **options)
     return _get_dummy_wgrad(out.shape, out_dtype)
 
 
@@ -466,6 +463,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
+        # Opt-in pad zero-fills K->Kp and weight N->Np; n_real recovers the tight output.
         if isinstance(a, QuantizedTensor):
             assert a._is_grouped_tensor, "A QuantizedTensor input must be a grouped tensor"
             check_quantized_tensor(a, config)
@@ -480,7 +478,10 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                 axis=-1,
                 block_size=config.block_size,
                 group_lens=group_lens,
+                pad_align_last=128,
             )
+            if group_offs is None:
+                group_offs = group_offs_from_lens(group_lens)
 
         if isinstance(b, QuantizedTensor):
             assert not b._is_grouped_tensor, "B QuantizedTensor input must not be a grouped tensor"
@@ -494,7 +495,15 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
                 config.granularity,
                 axis=-1,
                 block_size=config.block_size,
+                pad_align_last=128,
+                pad_align_penultimate=128,
             )
+
+        k_real = quantized_a.shape[-1]
+        real_N = quantized_b.shape[-2] if trans_b else quantized_b.shape[-1]
+        n_pitch = quantized_b.qdata.shape[-2] if trans_b else quantized_b.qdata.shape[-1]
+        n_real = real_N if real_N != n_pitch else None
+        default_backend = BackendType.FLYDSL.value if is_gfx950() else BackendType.TRITON.value
 
         out = grouped_gemm_fp8_impl(
             quantized_a.qdata,
@@ -508,8 +517,9 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=config.granularity.value,
             num_cu=num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=default_backend,
             maybe_pre_sync=True,
+            n_real=n_real,
         )
 
         ctx.save_for_backward(
@@ -525,6 +535,8 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
+        ctx.k_real = k_real
+        ctx.n_real = real_N
         ctx.fuse_bgrad_accum = fuse_bgrad_accum
         # Kept off save_for_backward on purpose: the wgrad GEMM writes into this
         # buffer in place, which would bump the version counter that saved tensors
@@ -537,7 +549,12 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
     def backward(ctx, grad_out):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         a_fp8, b_fp8, a_scale_inv, b_scale_inv, group_lens, group_offs = ctx.saved_tensors
-        k_pad_real = getattr(ctx, "k_pad_real", None)
+
+        k_real = ctx.k_real
+        n_real = ctx.n_real
+        k_pitch = a_fp8.shape[-1]
+        n_pitch = b_fp8.shape[-2] if ctx.trans_b else b_fp8.shape[-1]
+        default_backend = BackendType.FLYDSL.value if is_gfx950() else BackendType.TRITON.value
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
         quantized_grad_out = QuantizedTensor.quantize(
@@ -547,12 +564,15 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             axis=-1,
             block_size=ctx.config.block_size,
             group_lens=group_lens,
+            pad_align_last=128,
         )
+        go_qdata, go_scale_inv = quantized_grad_out.qdata, quantized_grad_out.scale_inv
+        assert go_qdata.shape[-1] == n_pitch
 
         grad_a = grouped_gemm_fp8_impl(
-            quantized_grad_out.qdata,
+            go_qdata,
             b_fp8,
-            quantized_grad_out.scale_inv,
+            go_scale_inv,
             b_scale_inv,
             group_lens,
             group_offs,
@@ -561,14 +581,15 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=default_backend,
+            n_real=(k_real if k_real != k_pitch else None),
         )
 
         grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             a_fp8,
-            quantized_grad_out.qdata,
+            go_qdata,
             a_scale_inv,
-            quantized_grad_out.scale_inv,
+            go_scale_inv,
             group_lens,
             group_offs,
             trans_a=not ctx.trans_a,
@@ -577,14 +598,12 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=default_backend,
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
+            m_real=(n_real if n_real != n_pitch else None),
+            n_real=(k_real if k_real != k_pitch else None),
         )
-
-        if k_pad_real is not None:
-            grad_a = grad_a[:, :k_pad_real].contiguous()
-            grad_b = grad_b[..., :k_pad_real].contiguous()
 
         return (
             grad_a,  # a
