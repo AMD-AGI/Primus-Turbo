@@ -25,6 +25,8 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 # Disable FP32 atomic for better performance on gfx950
 def _is_gfx950():
     """Check if current GPU is gfx950 using torch."""
+    if not torch.cuda.is_available():
+        return False
     props = torch.cuda.get_device_properties(0)
     return props.major == 9 and props.minor == 5
 
@@ -44,6 +46,11 @@ from primus_turbo.pytorch.kernels.attention.attention_impl import (
 
 # Flash-attn selects its backend on the bf16/fp16/fp32 precision bucket.
 _ATTN_PRECISION = PrecisionType.BF16_FP16_FP32
+
+_DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+}
 
 # PyTorch SDPA backends for reference implementation
 ATTN_BACKENDS = [
@@ -138,6 +145,16 @@ def check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, o, o_ref, grad_out
     return correct
 
 
+def check_attention_forward_correctness(o, o_ref):
+    """Check forward-only output correctness against the PyTorch reference."""
+    out_snr = compute_snr(o_ref, o)
+    threshold = 40
+    correct = out_snr > threshold
+    status = "PASS" if correct else "FAIL"
+    print(f"Correctness Check (SNR>thr={threshold} vs torch-ref): {status} (out={out_snr:.1f})")
+    return correct
+
+
 def check_attention_determinism(fwd_func, q, k, v, grad_out):
     """Check deterministic for forward outputs and backward gradients (bitwise exact)."""
     # Forward: same input -> same output
@@ -195,16 +212,23 @@ def check_attention_determinism(fwd_func, q, k, v, grad_out):
     )
 
 
-def _make_qkv(shape, layout, device, dtype):
+def _make_qkv(shape, layout, device, dtype, requires_grad: bool = True):
     """A [b, s, h, d]-shaped leaf whose bytes are in ``layout`` order.
 
-    sbhd is stored as [s, b, h, d] and handed over as its permute, which is the shape the
-    op takes; requires_grad_ comes after the permute so the view itself collects .grad.
+    Non-BSHD layouts are allocated in their physical order and handed to the public op as
+    logical [b, s, h, d] views. requires_grad_ comes after the view so the view itself is the
+    leaf that collects .grad in the training benchmark.
     """
     b, s, h, d = shape
     if layout == "sbhd":
-        return torch.randn((s, b, h, d), device=device, dtype=dtype).permute(1, 0, 2, 3).requires_grad_()
-    return torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+        tensor = torch.randn((s, b, h, d), device=device, dtype=dtype).permute(1, 0, 2, 3)
+    elif layout == "bhsd":
+        tensor = torch.randn((b, h, s, d), device=device, dtype=dtype).transpose(1, 2)
+    elif layout == "bshd":
+        tensor = torch.randn(shape, device=device, dtype=dtype)
+    else:
+        raise ValueError(f"unsupported layout: {layout}")
+    return tensor.requires_grad_() if requires_grad else tensor
 
 
 def profile_attention(
@@ -220,44 +244,57 @@ def profile_attention(
     seqlen_kv=None,
     window_left=-1,
     layout="bshd",
+    forward_only: bool = False,
+    dtype: str = "bf16",
 ):
-    """Profile attention forward and backward performance."""
+    """Profile attention, optionally measuring a graph-free forward only."""
+    if forward_only and use_fp8:
+        raise ValueError("forward-only mode does not support FP8")
+    try:
+        torch_dtype = _DTYPES[dtype]
+    except KeyError as e:
+        raise ValueError(f"unsupported dtype: {dtype}") from e
+
     device = "cuda"
-    dtype = torch.bfloat16
     seqlen_kv = seqlen if seqlen_kv is None else seqlen_kv
     window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
     # NOTE: do not empty_cache between cases. Handing the cached blocks back makes the
     # allocator re-acquire large contiguous ones from the driver, which fragments worse than
     # reusing them: --deterministic goes from 10 OOM cases to 18 with one call here.
 
-    # Create tensors
-    q = _make_qkv((batch, seqlen, num_head_q, head_dim_qk), layout, device, dtype)
-    k = _make_qkv((batch, seqlen_kv, num_head_kv, head_dim_qk), layout, device, dtype)
-    v = _make_qkv((batch, seqlen_kv, num_head_kv, head_dim_v), layout, device, dtype)
-    q_ref = q.clone().detach().requires_grad_()
-    k_ref = k.clone().detach().requires_grad_()
-    v_ref = v.clone().detach().requires_grad_()
+    needs_backward = not forward_only
+    q = _make_qkv(
+        (batch, seqlen, num_head_q, head_dim_qk),
+        layout,
+        device,
+        torch_dtype,
+        requires_grad=needs_backward,
+    )
+    k = _make_qkv(
+        (batch, seqlen_kv, num_head_kv, head_dim_qk),
+        layout,
+        device,
+        torch_dtype,
+        requires_grad=needs_backward,
+    )
+    v = _make_qkv(
+        (batch, seqlen_kv, num_head_kv, head_dim_v),
+        layout,
+        device,
+        torch_dtype,
+        requires_grad=needs_backward,
+    )
 
     sm_scale = head_dim_qk ** (-0.5)
 
-    # Reference forward, taken here rather than beside the correctness check below: the
-    # reference graph and the measured one would otherwise be alive at once, which costs the
-    # long shapes nine more OOM cases under --deterministic. A masked SDPA falls back to the
-    # math kernel and materialises [b, h, Sq, Skv] scores, so a reference that does not fit
-    # downgrades the case to SKIP instead of failing it -- its backward is guarded likewise.
-    try:
-        o_ref = attention_ref(q_ref, k_ref, v_ref, sm_scale, causal, window_left)
-    except torch.cuda.OutOfMemoryError:
-        o_ref = None
-        del q_ref, k_ref, v_ref
-        torch.cuda.empty_cache()
-
     # Which backend this shape resolves to -- worth reporting, since eligibility turns on
-    # the head dims, the GQA group and (for FlyDSL) the storage order.
+    # the head dims, the GQA group and storage order. Resolve before any implementation
+    # launch so a pinned backend cannot silently turn an unsupported shape into fallback data.
     backend = "FP8/TRITON"
     if not use_fp8:
-        try:
-            backend = resolve_flash_attn_backend(
+
+        def resolve_backend():
+            return resolve_flash_attn_backend(
                 varlen=False,
                 user_backend=GlobalBackendManager.get_attn_backend(_ATTN_PRECISION),
                 q=q,
@@ -271,45 +308,80 @@ def profile_attention(
                 alibi_slopes=None,
                 sink=None,
                 qkv_format=layout,
-            ).name
+                return_softmax=False,
+                needs_backward=needs_backward,
+            )
+
+        try:
+            if forward_only:
+                with torch.inference_mode():
+                    backend = resolve_backend().name
+            else:
+                backend = resolve_backend().name
         except ValueError as e:  # a forced backend that cannot take this shape
             raise RuntimeError(f"backend rejected the shape: {e}") from e
 
+    # Take the reference after backend resolution. The training graph and the measured one
+    # would otherwise be alive at once, which costs the long shapes nine more OOM cases under
+    # --deterministic. A masked SDPA may materialise [b, h, Sq, Skv] scores, so a reference
+    # that does not fit downgrades the correctness check to SKIP.
+    q_ref = q.clone().detach()
+    k_ref = k.clone().detach()
+    v_ref = v.clone().detach()
+    if needs_backward:
+        q_ref.requires_grad_()
+        k_ref.requires_grad_()
+        v_ref.requires_grad_()
+    try:
+        if forward_only:
+            with torch.inference_mode():
+                o_ref = attention_ref(q_ref, k_ref, v_ref, sm_scale, causal, window_left)
+        else:
+            o_ref = attention_ref(q_ref, k_ref, v_ref, sm_scale, causal, window_left)
+    except torch.cuda.OutOfMemoryError:
+        o_ref = None
+        q_ref = k_ref = v_ref = None
+        torch.cuda.empty_cache()
+
     # Define forward function
     if use_fp8:
-        fwd_func = lambda: turbo.ops.flash_attn_fp8_func(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            softmax_scale=sm_scale,
-            causal=causal,
-            window_size=window_size,
-            bias=None,
-            alibi_slopes=None,
-            deterministic=deterministic,
-            return_lse=False,
-            return_attn_probs=False,
-        )
-    else:
-        fwd_func = lambda: turbo.ops.flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            softmax_scale=sm_scale,
-            causal=causal,
-            window_size=window_size,
-            bias=None,
-            alibi_slopes=None,
-            deterministic=deterministic,
-            return_lse=False,
-            return_attn_probs=False,
-        )
 
-    # Fixed grad_out for deterministic / correctness checks
-    out_for_grad = fwd_func()
-    grad_out = torch.randn_like(out_for_grad)
+        def raw_fwd_func():
+            return turbo.ops.flash_attn_fp8_func(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                softmax_scale=sm_scale,
+                causal=causal,
+                window_size=window_size,
+                bias=None,
+                alibi_slopes=None,
+                deterministic=deterministic,
+                return_lse=False,
+                return_attn_probs=False,
+            )
+    else:
+
+        def raw_fwd_func():
+            return turbo.ops.flash_attn_func(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                softmax_scale=sm_scale,
+                causal=causal,
+                window_size=window_size,
+                bias=None,
+                alibi_slopes=None,
+                deterministic=deterministic,
+                return_lse=False,
+                return_attn_probs=False,
+            )
+
+    # Decorating the callable keeps every warmup and Timer invocation in inference mode,
+    # rather than relying on a context that may have ended before Timer calls it.
+    fwd_func = torch.inference_mode()(raw_fwd_func) if forward_only else raw_fwd_func
 
     det_out_ok = None
     det_out_max_abs_diff = None
@@ -319,45 +391,84 @@ def profile_attention(
     det_dk_max_abs_diff = None
     det_dv_ok = None
     det_dv_max_abs_diff = None
-    if deterministic:
-        (
-            det_out_ok,
-            det_out_max_abs_diff,
-            det_dq_ok,
-            det_dq_max_abs_diff,
-            det_dk_ok,
-            det_dk_max_abs_diff,
-            det_dv_ok,
-            det_dv_max_abs_diff,
-        ) = check_attention_determinism(fwd_func, q, k, v, grad_out)
-
+    if deterministic and forward_only:
+        out1 = fwd_func()
+        out2 = fwd_func()
+        torch.cuda.synchronize()
+        det_out_ok = torch.equal(out1, out2)
+        det_out_max_abs_diff = (out1 - out2).abs().max().item()
+        del out1, out2
     # Forward pass and correctness check
-    out = fwd_func()
     correct = None
-    if o_ref is not None:
-        try:
-            correct = check_attention_correctness(q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out, use_fp8)
-        except torch.cuda.OutOfMemoryError:
-            print("Correctness Check: SKIP (the reference's backward does not fit)")
-        # The reference holds a second copy of q/k/v and their grads; the timing below needs
-        # none of it, and the long shapes cannot afford to keep it. Freeing is enough -- see
-        # the note above on why the cache is left alone.
-        del o_ref, q_ref, k_ref, v_ref
+    if forward_only:
+        if o_ref is not None:
+            out = fwd_func()
+            correct = check_attention_forward_correctness(out, o_ref)
+            del out, o_ref, q_ref, k_ref, v_ref
+    else:
+        # Fixed grad_out for deterministic / correctness checks. This allocation and every
+        # backward call remain entirely outside the forward-only control-flow path.
+        out_for_grad = fwd_func()
+        grad_out = torch.randn_like(out_for_grad)
+        del out_for_grad
+        if deterministic:
+            (
+                det_out_ok,
+                det_out_max_abs_diff,
+                det_dq_ok,
+                det_dq_max_abs_diff,
+                det_dk_ok,
+                det_dk_max_abs_diff,
+                det_dv_ok,
+                det_dv_max_abs_diff,
+            ) = check_attention_determinism(fwd_func, q, k, v, grad_out)
+
+        out = fwd_func()
+        if o_ref is not None:
+            try:
+                correct = check_attention_correctness(
+                    q, k, v, q_ref, k_ref, v_ref, out, o_ref, grad_out, use_fp8
+                )
+            except torch.cuda.OutOfMemoryError:
+                print("Correctness Check: SKIP (the reference's backward does not fit)")
+            # The reference holds a second copy of q/k/v and their grads; the timing below
+            # needs none of it, and the long shapes cannot afford to keep it.
+            del o_ref, q_ref, k_ref, v_ref
 
     # Print deterministic status only when deterministic is enabled
     if deterministic:
-        determinism_ok = bool(det_out_ok) and bool(det_dq_ok) and bool(det_dk_ok) and bool(det_dv_ok)
+        determinism_ok = bool(det_out_ok)
+        if not forward_only:
+            determinism_ok = determinism_ok and bool(det_dq_ok) and bool(det_dk_ok) and bool(det_dv_ok)
         status = "PASS" if determinism_ok else "FAIL"
-        print(
-            "Deterministic Check (bitwise; max_abs_diff): "
-            f"{status} (out={det_out_max_abs_diff}, dq={det_dq_max_abs_diff}, "
-            f"dk={det_dk_max_abs_diff}, dv={det_dv_max_abs_diff})"
-        )
+        if forward_only:
+            print(f"Deterministic Check (bitwise; max_abs_diff): {status} (out={det_out_max_abs_diff})")
+        else:
+            print(
+                "Deterministic Check (bitwise; max_abs_diff): "
+                f"{status} (out={det_out_max_abs_diff}, dq={det_dq_max_abs_diff}, "
+                f"dk={det_dk_max_abs_diff}, dv={det_dv_max_abs_diff})"
+            )
 
-    # Prepare benchmark functions
-    out = fwd_func()
-    bwd_func = lambda: out.backward(grad_out, retain_graph=True)
-    bwd_func()
+    if forward_only and correct is not True:
+        timing_status = "SKIP" if correct is None else "FAIL"
+        print(f"Forward timing: {timing_status} (correctness did not pass)")
+        return (
+            backend,
+            None,
+            None,
+            None,
+            None,
+            correct,
+            det_out_ok,
+            det_out_max_abs_diff,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
     # Calculate FLOPs. A window or a rectangular shape needs the real attended fraction;
     # square full-causal keeps the plain halving, which is that fraction to within a row.
@@ -367,6 +478,36 @@ def profile_attention(
             fwd_flops = int(fwd_flops * _attended_frac(seqlen, seqlen_kv, window_left))
         else:
             fwd_flops //= 2
+
+    if forward_only:
+        for _ in range(20):
+            fwd_func()
+        torch.cuda.synchronize()
+        fwd_time = benchmark.Timer(stmt="fn()", globals={"fn": fwd_func}).timeit(100).mean * 1e3
+        torch.cuda.synchronize()
+        fwd_tflops = fwd_flops / (fwd_time * 1e-3) / 1e12
+        print(f"Forward (warm-cache) Mean time: {fwd_time:.3f} ms | TFLOPS: {fwd_tflops:.2f}")
+        return (
+            backend,
+            fwd_time,
+            fwd_tflops,
+            None,
+            None,
+            correct,
+            det_out_ok,
+            det_out_max_abs_diff,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+    # Prepare and benchmark the original forward+backward training path.
+    out = fwd_func()
+    bwd_func = lambda: out.backward(grad_out, retain_graph=True)
+    bwd_func()
     bwd_flops = fwd_flops * 2.5
 
     # Warmup
@@ -536,6 +677,42 @@ def _dense_cases():
     ]
 
 
+def _forward_only_cases():
+    """Stable reference and MHA/GQA/MQA short/medium/long comparison cases."""
+    return [
+        ("dod-mha-h64-b32-s512-noncausal", 32, False, 64, 64, 128, 128, 512, 512, -1),
+        ("dod-mha-h64-b32-s512-causal", 32, True, 64, 64, 128, 128, 512, 512, -1),
+        ("dod-mha-h64-b16-s1024-noncausal", 16, False, 64, 64, 128, 128, 1024, 1024, -1),
+        ("dod-mha-h64-b16-s1024-causal", 16, True, 64, 64, 128, 128, 1024, 1024, -1),
+        ("dod-mha-h64-b8-s2048-noncausal", 8, False, 64, 64, 128, 128, 2048, 2048, -1),
+        ("dod-mha-h64-b8-s2048-causal", 8, True, 64, 64, 128, 128, 2048, 2048, -1),
+        ("dod-mha-h64-b4-s4096-noncausal", 4, False, 64, 64, 128, 128, 4096, 4096, -1),
+        ("dod-mha-h64-b4-s4096-causal", 4, True, 64, 64, 128, 128, 4096, 4096, -1),
+        ("dod-mha-h64-b2-s8192-noncausal", 2, False, 64, 64, 128, 128, 8192, 8192, -1),
+        ("dod-mha-h64-b2-s8192-causal", 2, True, 64, 64, 128, 128, 8192, 8192, -1),
+        ("dod-mha-h64-b1-s16384-noncausal", 1, False, 64, 64, 128, 128, 16384, 16384, -1),
+        ("dod-mha-h64-b1-s16384-causal", 1, True, 64, 64, 128, 128, 16384, 16384, -1),
+        ("mha-short-noncausal", 1, False, 32, 32, 128, 128, 128, 128, -1),
+        ("mha-short-causal", 1, True, 32, 32, 128, 128, 128, 128, -1),
+        ("mha-medium-noncausal", 1, False, 32, 32, 128, 128, 2048, 2048, -1),
+        ("mha-medium-causal", 1, True, 32, 32, 128, 128, 2048, 2048, -1),
+        ("mha-long-noncausal", 1, False, 32, 32, 128, 128, 8192, 8192, -1),
+        ("mha-long-causal", 1, True, 32, 32, 128, 128, 8192, 8192, -1),
+        ("gqa-short-noncausal", 1, False, 32, 8, 128, 128, 128, 128, -1),
+        ("gqa-short-causal", 1, True, 32, 8, 128, 128, 128, 128, -1),
+        ("gqa-medium-noncausal", 1, False, 32, 8, 128, 128, 2048, 2048, -1),
+        ("gqa-medium-causal", 1, True, 32, 8, 128, 128, 2048, 2048, -1),
+        ("gqa-long-noncausal", 1, False, 32, 8, 128, 128, 8192, 8192, -1),
+        ("gqa-long-causal", 1, True, 32, 8, 128, 128, 8192, 8192, -1),
+        ("mqa-short-noncausal", 1, False, 32, 1, 128, 128, 128, 128, -1),
+        ("mqa-short-causal", 1, True, 32, 1, 128, 128, 128, 128, -1),
+        ("mqa-medium-noncausal", 1, False, 32, 1, 128, 128, 2048, 2048, -1),
+        ("mqa-medium-causal", 1, True, 32, 1, 128, 128, 2048, 2048, -1),
+        ("mqa-long-noncausal", 1, False, 32, 1, 128, 128, 8192, 8192, -1),
+        ("mqa-long-causal", 1, True, 32, 1, 128, 128, 8192, 8192, -1),
+    ]
+
+
 def benchmark_varlen(output_csv, backend_enum):
     """Run the THD document-packing backward table."""
     platform, gpu_name = get_platform_info()
@@ -596,40 +773,49 @@ def benchmark_attention(
     use_fp8=False,
     deterministic=False,
     layout="bshd",
+    forward_only: bool = False,
+    dtype: str = "bf16",
 ):
     """Run attention benchmark."""
     platform, gpu_name = get_platform_info()
 
-    cases = _dense_cases()
+    cases = _forward_only_cases() if forward_only else _dense_cases()
 
     rows = []
     test_id = 0
-    print(f"Total tests: {len(cases)}, layout: {layout}, FP8: {use_fp8}, deterministic: {deterministic}")
+    mode = "forward-only" if forward_only else "training"
+    print(
+        f"Total tests: {len(cases)}, mode: {mode}, layout: {layout}, dtype: {dtype}, "
+        f"FP8: {use_fp8}, deterministic: {deterministic}"
+    )
 
-    for (
-        batch,
-        causal,
-        num_head_q,
-        num_head_kv,
-        head_dim_qk,
-        head_dim_v,
-        seqlen,
-        seqlen_kv,
-        window_left,
-    ) in cases:
+    for case in cases:
         test_id += 1
+        case_id = case[0] if forward_only else test_id
+        case_values = case[1:] if forward_only else case
+        (
+            batch,
+            causal,
+            num_head_q,
+            num_head_kv,
+            head_dim_qk,
+            head_dim_v,
+            seqlen,
+            seqlen_kv,
+            window_left,
+        ) = case_values
 
         print(f"\n{'=' * 60}")
         print(
-            f"TestID: {test_id}, batch={batch}, seqlen={seqlen}x{seqlen_kv}, "
+            f"TestID: {case_id}, batch={batch}, seqlen={seqlen}x{seqlen_kv}, "
             f"heads={num_head_q}/{num_head_kv}, dim={head_dim_qk}/{head_dim_v}, "
             f"causal={causal}, window={window_left}, layout={layout}, "
-            f"fp8={use_fp8}, deterministic={deterministic}"
+            f"dtype={dtype}, fp8={use_fp8}, deterministic={deterministic}"
         )
         print(f"{'=' * 60}")
 
         row = {
-            "TestID": test_id,
+            "TestID": case_id,
             "Platform": platform,
             "GPU": gpu_name,
             "Batch": batch,
@@ -642,6 +828,7 @@ def benchmark_attention(
             "Causal": causal,
             "Window": window_left if window_left >= 0 else "full",
             "Layout": layout,
+            "DType": dtype,
             "Deterministic": deterministic,
         }
 
@@ -674,21 +861,33 @@ def benchmark_attention(
                 seqlen_kv=seqlen_kv,
                 window_left=window_left,
                 layout=layout,
+                forward_only=forward_only,
+                dtype=dtype,
             )
+            check = "SKIP" if correct is None else ("PASS" if correct else "FAIL")
+            timing_status = check if fwd_time is None else "warm-cache"
             row.update(
                 {
                     "Backend": backend,
-                    "Check": "SKIP" if correct is None else ("PASS" if correct else "FAIL"),
-                    "Forward Time (ms)": f"{fwd_time:.2f}",
-                    "Forward TFLOPS": f"{fwd_tflops:.2f}",
-                    "Backward Time (ms)": f"{bwd_time:.2f}",
-                    "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                    "Check": check,
+                    "Forward Time (ms)": timing_status if fwd_time is None else f"{fwd_time:.2f}",
+                    "Forward TFLOPS": timing_status if fwd_tflops is None else f"{fwd_tflops:.2f}",
                 }
             )
-            if deterministic:
-                row["Deterministic Check"] = (
-                    "PASS" if (det_out_ok and det_dq_ok and det_dk_ok and det_dv_ok) else "FAIL"
+            if forward_only:
+                row["Forward Timing"] = timing_status
+            if not forward_only:
+                row.update(
+                    {
+                        "Backward Time (ms)": f"{bwd_time:.2f}",
+                        "Backward TFLOPS": f"{bwd_tflops:.2f}",
+                    }
                 )
+            if deterministic:
+                deterministic_ok = det_out_ok
+                if not forward_only:
+                    deterministic_ok = deterministic_ok and det_dq_ok and det_dk_ok and det_dv_ok
+                row["Deterministic Check"] = "PASS" if deterministic_ok else "FAIL"
         except Exception as e:
             print(f"Failed: {str(e)}")
             row.update(
@@ -696,11 +895,18 @@ def benchmark_attention(
                     "Backend": "ERROR",
                     "Check": "ERROR",
                     "Forward Time (ms)": "ERROR",
-                    "Forward TFLOPS": "0.00",
-                    "Backward Time (ms)": "ERROR",
-                    "Backward TFLOPS": "0.00",
+                    "Forward TFLOPS": "ERROR" if forward_only else "0.00",
                 }
             )
+            if forward_only:
+                row["Forward Timing"] = "not measured"
+            if not forward_only:
+                row.update(
+                    {
+                        "Backward Time (ms)": "ERROR",
+                        "Backward TFLOPS": "0.00",
+                    }
+                )
             if deterministic:
                 row["Deterministic Check"] = "ERROR"
 
@@ -719,25 +925,34 @@ def benchmark_attention(
 
     # Print average TFLOPS, split by head dim where the table spans more than one: the two
     # dims run at different per-flop efficiencies, so one mean over both says little.
-    avg_fwd = results["Forward TFLOPS"].astype(float).mean()
-    avg_bwd = results["Backward TFLOPS"].astype(float).mean()
-    print(f"\nAverage Forward TFLOPS: {avg_fwd:.2f}")
-    print(f"Average Backward TFLOPS: {avg_bwd:.2f}")
-    head_dims = sorted(results["head_dim_qk"].unique())
+    summary_results = results[results["Check"] == "PASS"] if forward_only else results
+    avg_fwd = pd.to_numeric(summary_results["Forward TFLOPS"], errors="coerce").mean()
+    summary_suffix = " (correctness-PASS rows only)" if forward_only else ""
+    print(f"\nAverage Forward TFLOPS{summary_suffix}: {avg_fwd:.2f}")
+    if not forward_only:
+        avg_bwd = pd.to_numeric(results["Backward TFLOPS"], errors="coerce").mean()
+        print(f"Average Backward TFLOPS: {avg_bwd:.2f}")
+    else:
+        print("Compare pinned backends only on matching PASS TestIDs across their CSV files.")
+    head_dims = sorted(summary_results["head_dim_qk"].unique())
     if len(head_dims) > 1:
         for head_dim in head_dims:
-            part = results[results["head_dim_qk"] == head_dim]
-            print(
-                f"  head_dim={head_dim}: forward {part['Forward TFLOPS'].astype(float).mean():.2f}, "
-                f"backward {part['Backward TFLOPS'].astype(float).mean():.2f} TFLOPS"
-            )
+            part = summary_results[summary_results["head_dim_qk"] == head_dim]
+            part_fwd = pd.to_numeric(part["Forward TFLOPS"], errors="coerce").mean()
+            if forward_only:
+                print(f"  head_dim={head_dim}: forward {part_fwd:.2f} TFLOPS")
+            else:
+                part_bwd = pd.to_numeric(part["Backward TFLOPS"], errors="coerce").mean()
+                print(f"  head_dim={head_dim}: forward {part_fwd:.2f}, backward {part_bwd:.2f} TFLOPS")
 
     # Save to CSV
     if output_csv:
         filename = output_csv
     else:
         timestamp = datetime.now().strftime("%Y%m%d")
-        if deterministic:
+        if forward_only:
+            prefix = f"attention_forward_only_{dtype}_benchmark_result"
+        elif deterministic:
             prefix = (
                 "attention_deterministic_fp8_benchmark_result"
                 if use_fp8
@@ -750,19 +965,30 @@ def benchmark_attention(
     print(f"Results saved to {filename}")
 
 
-if __name__ == "__main__":
+def _build_arg_parser():
     parser = argparse.ArgumentParser(description="Benchmark Attention operations")
     parser.add_argument(
         "--output",
         "-o",
         type=str,
         default=None,
-        help="Output CSV filename. Default: attention[_fp8]_benchmark_result_{date}_{gpu}.csv",
+        help="Output CSV filename. Defaults describe the selected training or forward-only mode.",
     )
     parser.add_argument(
         "--fp8",
         action="store_true",
         help="Enable FP8 attention benchmark (default: disabled)",
+    )
+    parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="Benchmark and validate forward latency only, without creating an autograd graph.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("bf16", "fp16"),
+        default="bf16",
+        help="Dense input dtype (default: bf16).",
     )
     parser.add_argument(
         "--deterministic",
@@ -773,7 +999,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="auto",
-        choices=("auto", "aiter", "flydsl", "triton", "hipkittens"),
+        choices=("auto", "aiter", "flydsl", "gluon", "triton", "hipkittens"),
         help="Pin the attention backend (default: auto, i.e. whatever resolves). "
         "hipkittens is gfx950-only and takes bf16 causal sbhd with Sq <= Skv; anything "
         "outside that is refused rather than silently handed to another backend.",
@@ -782,16 +1008,37 @@ if __name__ == "__main__":
         "--layout",
         type=str,
         default="bshd",
-        choices=("bshd", "sbhd"),
-        help="Storage order of q/k/v. FlyDSL is sbhd-native and only takes sbhd bytes "
-        "(any bshd batch of 1 is the same bytes, so it qualifies too).",
+        choices=("bshd", "sbhd", "bhsd"),
+        help="Storage order of q/k/v. The public operation always receives logical BSHD views.",
     )
     parser.add_argument(
         "--varlen",
         action="store_true",
         help="Benchmark the THD document-packing backward instead of the dense table.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def _parse_args(argv=None):
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    # These checks intentionally run before backend setup or benchmark dispatch, and thus
+    # before any benchmark tensor allocation.
+    if args.varlen and args.backend == "gluon":
+        parser.error("--backend gluon is dense-only and cannot be combined with --varlen")
+    if args.backend == "gluon" and not args.forward_only:
+        parser.error("--backend gluon is forward-only; add --forward-only")
+    if args.forward_only and args.fp8:
+        parser.error("--forward-only cannot be combined with --fp8; FP8 uses its separate TRITON path")
+    if args.varlen and args.forward_only:
+        parser.error("--forward-only is supported only by the dense benchmark, not --varlen")
+
+    return args
+
+
+if __name__ == "__main__":
+    args = _parse_args()
 
     backend_enum = None if args.backend == "auto" else BackendType[args.backend.upper()]
     if backend_enum is not None:
@@ -805,4 +1052,6 @@ if __name__ == "__main__":
             use_fp8=args.fp8,
             deterministic=args.deterministic,
             layout=args.layout,
+            forward_only=args.forward_only,
+            dtype=args.dtype,
         )

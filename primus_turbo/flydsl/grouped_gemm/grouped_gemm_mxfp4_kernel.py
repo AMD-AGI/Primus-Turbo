@@ -33,6 +33,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     _lane_tbl_get,
     _lane_tbl_load,
     _lane_tbl_scan,
+    current_stream,
     make_fp8_rebased_tensor_and_srd,
     resolve_accum_out,
     xcd_band_remap_pid,
@@ -899,14 +900,14 @@ def _build_grouped_mxfp4_nt_kernel(
 
 _GMXFP4_LAUNCH_CACHE: dict = {}
 _GMXFP4_WS_CACHE: dict = {}
-_GMXFP4_AT_CACHE: dict = {}  # (total_M, N, K, G, gm, xcd, gn, out_fp16) -> [raw_launch, compiled]
+_GMXFP4_AT_CACHE: dict = {}  # (N, K, G, gm, xcd, gn, span, nt, out_fp16, k_real) -> [raw, compiled]
 _GMXFP4_NT_CFG = (4, 8, 0, 16, False)
 # Thin groups: the write-only C stream evicts re-read weights, so non-temporal buys them back.
 _GMXFP4_NT_CFG_THIN = (4, 8, 0, 16, True)
-_GMXFP4_WGRAD_CFG = (2, 1, 4, False, 1, False)
-_GMXFP4_WGRAD_CFG_SHORT = (4, 1, 6, True, 2, True)  # short per-group contraction: see selector
+_GMXFP4_WGRAD_CFG = (2, 1, 4, False, 1)
+_GMXFP4_WGRAD_CFG_SHORT = (4, 1, 6, True, 2)  # short per-group contraction: see selector
 # When a group's tiles outnumber the CUs the band shape alone decides residency: narrower M.
-_GMXFP4_WGRAD_CFG_SHORT_SPAN = (2, 1, 8, True, 2, True)
+_GMXFP4_WGRAD_CFG_SHORT_SPAN = (2, 1, 8, True, 2)
 _GMXFP4_WGRAD_SHORT_MG = 8192  # per-group contraction at/below which the short-M blocking applies
 _GMXFP4_CACHE_CAP = 32  # drop caches past this; real MoE uses few shapes, a test sweep many
 _N_CU = 256  # gfx950 compute units, i.e. the width of one dispatch generation
@@ -1403,7 +1404,6 @@ def _build_grouped_mxfp4_wgrad_kernel(
     OUT_M,
     OUT_N,
     G,
-    M_total,
     group_m=4,
     num_xcds=8,
     group_n=0,
@@ -1412,7 +1412,6 @@ def _build_grouped_mxfp4_wgrad_kernel(
     out_fp16=False,
     cst_nt=False,
     wg_tiles=1,
-    half_m=False,
     beta_is_one=False,  # epilogue accumulates (C += acc) instead of overwriting
 ):
     BLOCK_M = BLOCK_N = BLOCK_K = _BLOCK
@@ -1421,7 +1420,6 @@ def _build_grouped_mxfp4_wgrad_kernel(
     N_SUB = BLOCK_K // 128
     BPR = BLOCK_K // 2
     KSTEP = BPR
-    M2 = M_total // 2  # operand row stride (bytes) = full contraction
     N_TILES_A = BLOCK_M // 32
     LDS_BN_HALF = BLOCK_N // 2
     N_TILES_BH = LDS_BN_HALF // 32
@@ -1432,7 +1430,6 @@ def _build_grouped_mxfp4_wgrad_kernel(
     N_LDS_STEPS_A = BLOCK_M // _ROWS_PER_STEP
     N_LDS_STEPS_BH = LDS_BN_HALF // _ROWS_PER_STEP
     _PRELL, _NSCBUF = 2, 2
-    K128m = M_total // 128  # scale packed row stride (contraction blocks)
     _SCBUF = 4 * 4 * (BLOCK_K // 128) * 64
     _SCW = 4 * N_SUB * 64
     _SCVSTEP = 64 * (2 * N_SUB) * 4  # scale byte advance per 256-K iter (whole-loop internal)
@@ -1441,9 +1438,6 @@ def _build_grouped_mxfp4_wgrad_kernel(
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
     _NV = OUT_N if (OUT_N % BLOCK_N != 0) else None  # non-256 OUT_N: mask store cols >= OUT_N
     _HALF_N = (OUT_N % BLOCK_N != 0) and (OUT_N % BLOCK_N <= LDS_BN_HALF)  # see the NT kernel
-    # Last M block is half padding, so idling wave_m==1 would not shorten the tile; instead it
-    # re-points its operand and store at the R half and runs the R-dropped body.
-    _HALF_M = half_m and (OUT_M % BLOCK_M != 0) and (OUT_M % BLOCK_M <= BLOCK_M // 2)
     # The in-loop fused store cannot read C back, so an accumulate takes the standalone one.
     _CSTORE = (not out_fp16) and not beta_is_one
     _BILV = N_TILES_BH if (_CSTORE and LDS_ROW_STRIDE == 128 and N_TILES_BH == 4) else 0
@@ -1469,6 +1463,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
         A_scale: fx.Tensor,  # packed lhs scale (whole-tensor)
         B_scale: fx.Tensor,  # packed rhs scale
         GO: fx.Tensor,  # padded per-group M offs (int32 view int64 [G+1])
+        m_total: fx.Int32,  # padded contraction length (A / B_T leading dim)
     ):
         F8 = fx.Float8E4M3FN.ir_type
         lds = fx.SharedAllocator().allocate(SS).peek()
@@ -1482,15 +1477,21 @@ def _build_grouped_mxfp4_wgrad_kernel(
         wave_n = wave_id % 2
         I32 = fx.Int32
 
+        # Both operand strides follow the padded contraction, which is a launch argument:
+        # m2 is the fp4 row stride in bytes, k128m the packed-scale row stride in K-blocks.
+        m2 = m_total // I32(2)
+        k128m = m_total // I32(128)
+        m2_idx = arith.index_cast(T.index, m2)
+
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk)
-        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, M_total, N_LDS_STEPS_A, BPR, swizzle=swizzle)
-        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, M_total, N_LDS_STEPS_BH, BPR, swizzle=swizzle, ilv=_BILV)
+        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, m_total, N_LDS_STEPS_A, BPR, swizzle=swizzle)
+        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, m_total, N_LDS_STEPS_BH, BPR, swizzle=swizzle, ilv=_BILV)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, LDS_ROW_STRIDE, swizzle=swizzle)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_BH, LDS_ROW_STRIDE, swizzle=swizzle)
         _qm = ceildiv(OUT_M, 256) * 256
         _qn = ceildiv(OUT_N, 256) * 256
-        sa_s2r = ScaleS2RPacked(A_scale, _qm, M_total, 4)
-        sb_s2r = ScaleS2RPacked(B_scale, _qn, M_total, 4)
+        sa_s2r = ScaleS2RPacked(A_scale, _qm, m_total, 4)
+        sb_s2r = ScaleS2RPacked(B_scale, _qn, m_total, 4)
         wave_m_off = wave_m * (N_TILES_A * 16)
         wave_n_off = wave_n * (N_TILES_BH * 16)
 
@@ -1503,12 +1504,6 @@ def _build_grouped_mxfp4_wgrad_kernel(
         br_base6 = [
             [b_s2r.base_addr(BR_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBB)
         ]
-        if const_expr(_HALF_M):
-            a_s2r_h = S2RLoaderFp4(0, N_TILES_A, LDS_ROW_STRIDE, swizzle=swizzle)
-            a_base6_h = [
-                [a_s2r_h.base_addr(A_buf[b], s) for s in range_constexpr(N_SUB)]
-                for b in range_constexpr(NABUF)
-            ]
 
         def _gbase(buf):
             v = fx.Int32(fx.ptrtoint(buf.ptr)) + fx.Int32(wave_id) * fx.Int32(1024)
@@ -1543,9 +1538,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
 
         def _scsoff(base, extra, ksb):
             grp = (base + fx.Int32(extra)) // fx.Int32(64)
-            return rocdl.readfirstlane(
-                T.i32, (grp * fx.Int32(K128m) + fx.Int32(_PRELL * N_SUB)) * fx.Int32(256) + ksb
-            )
+            return rocdl.readfirstlane(T.i32, (grp * k128m + fx.Int32(_PRELL * N_SUB)) * fx.Int32(256) + ksb)
 
         # Lane-resident group table: bounds cost a v_readlane, not a load occ=1 cannot hide.
         go_rs = buffer_ops.create_buffer_resource(GO, max_size=False, num_records_bytes=(G + 1) * 8)
@@ -1575,22 +1568,12 @@ def _build_grouped_mxfp4_wgrad_kernel(
 
             a_row = block_m * I32(BLOCK_M)
             b_row = block_n * I32(BLOCK_N)
-            # M-side half tile: wave_m == 1 re-points at the R half and runs the R-dropped body.
-            if const_expr(_HALF_M):
-                _lm = block_m == I32(N_BLOCKS_M - 1)
-                if const_expr(_HALF_N):
-                    _ln = block_n == I32(N_BLOCKS_N - 1)
-                    _hmf = I32(arith.select(_ln, I32(0), arith.select(_lm, I32(1), I32(0))))
-                else:
-                    _hmf = I32(arith.select(_lm, I32(1), I32(0)))
-                _hm = _hmf == I32(1)
-                _hmw = (_hmf + wave_m) == I32(2)  # this wave swaps onto the R column half
             # fold row base + contraction start into the int64 SRDs: large OUT_M/M_total pass 2^31
             _ms2 = arith.index_cast(T.index, m_start >> 1)
-            a_base_e = arith.index_cast(T.index, a_row) * arith.index(M2) + _ms2
-            b_base_e = arith.index_cast(T.index, b_row) * arith.index(M2) + _ms2
-            a_nrec = arith.index(OUT_M) * arith.index(M2) - a_base_e
-            b_nrec = arith.index(OUT_N) * arith.index(M2) - b_base_e
+            a_base_e = arith.index_cast(T.index, a_row) * m2_idx + _ms2
+            b_base_e = arith.index_cast(T.index, b_row) * m2_idx + _ms2
+            a_nrec = arith.index(OUT_M) * m2_idx - a_base_e
+            b_nrec = arith.index(OUT_N) * m2_idx - b_base_e
             gA, rsrc_a = make_fp8_rebased_tensor_and_srd(A, F8, a_base_e, a_nrec)
             gB, rsrc_b = make_fp8_rebased_tensor_and_srd(B_T, F8, b_base_e, b_nrec)
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
@@ -1600,12 +1583,10 @@ def _build_grouped_mxfp4_wgrad_kernel(
             br_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8, wave_id)
             a_off = I32(0)  # tile row base + contraction start folded into the SRDs above; only
             bl_off = I32(0)  # br's LDS-half row shift survives as an int32-safe residual.
-            br_off = I32(LDS_BN_HALF) * I32(M2)
+            br_off = I32(LDS_BN_HALF) * m2
             sa_b = a_row + I32(wave_m_off)
             sbl_b = b_row + I32(wave_n_off)
             sbr_b = b_row + I32(LDS_BN_HALF) + I32(wave_n_off)
-            if const_expr(_HALF_M):
-                sa_b = I32(arith.select(_hm, a_row, sa_b))
             ksb = (m_start // I32(256)) * I32(_SCVSTEP)  # contraction-start scale byte offset
 
             for _pp in range_constexpr(0, _PRELL):
@@ -1620,35 +1601,23 @@ def _build_grouped_mxfp4_wgrad_kernel(
             soff6_a = rocdl.readfirstlane(T.i32, a_off + fx.Int32(_PRELL * KSTEP))
             _blo = bl_off + fx.Int32(_PRELL * KSTEP)
             _bro = br_off + fx.Int32(_PRELL * KSTEP)
-            if const_expr(_HALF_M and _HALF_N):
-                # half_g2s off here, so a boundary N block's padding R half folds onto L rows.
-                _bro = I32(arith.select(_ln, _blo, _bro))
             soff6_bl = rocdl.readfirstlane(T.i32, _blo)
             soff6_br = rocdl.readfirstlane(T.i32, _bro)
             _sc1 = _scsoff(sa_b, 64, ksb)
             _sc3 = _scsoff(sbr_b, 0, ksb)
             _wia = sa_b // I32(128)
             _wib = (sbl_b // I32(256)) * I32(2) + (sbl_b % I32(256)) // I32(64)
-            _sob_v = _wib * I32(K128m) * I32(512) + ksb
-            if const_expr(_HALF_M):
-                _sob_v = I32(arith.select(_hmw, _sob_v + I32(8), _sob_v))
-            _soa = rocdl.readfirstlane(T.i32, _wia * I32(K128m) * I32(512) + ksb)
+            _sob_v = _wib * k128m * I32(512) + ksb
+            _soa = rocdl.readfirstlane(T.i32, _wia * k128m * I32(512) + ksb)
             _sob = rocdl.readfirstlane(T.i32, _sob_v)
             sc_soff06 = [_soa, _sc1, _sob, _sc3]
             _half_n = None
-            if const_expr(_HALF_N or _HALF_M):
-                _hnv = I32(0)
-                if const_expr(_HALF_N):
-                    _hnv = I32(arith.select(block_n == I32(N_BLOCKS_N - 1), I32(1), _hnv))
-                if const_expr(_HALF_M):
-                    _hnv = I32(arith.select(_lm, I32(1), _hnv))
+            if const_expr(_HALF_N):
+                _hnv = I32(arith.select(block_n == I32(N_BLOCKS_N - 1), I32(1), I32(0)))
                 _half_n = _readfirstlane_i32(_hnv)
             base_row = group_idx * I32(OUT_M) + a_row + I32(wave_m_off)
             base_col_l = b_row + I32(wave_n_off)
             base_col_r = b_row + I32(LDS_BN_HALF) + I32(wave_n_off)
-            if const_expr(_HALF_M):
-                base_row = I32(arith.select(_hm, group_idx * I32(OUT_M) + a_row, base_row))
-                base_col_l = I32(arith.select(_hmw, base_col_r, base_col_l))
             _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
             store_c = StoreCPlain(
                 C,
@@ -1662,20 +1631,9 @@ def _build_grouped_mxfp4_wgrad_kernel(
                 beta_is_one=beta_is_one,
             )
             _cst = store_c.fused_operands(base_row, base_col_l, base_col_r, n_valid=_NV) if _CSTORE else None
-            if const_expr(_HALF_M):
-                a_base_t = [
-                    [arith.select(_hmw, a_base6_h[b][s], a_base6[b][s]) for s in range_constexpr(N_SUB)]
-                    for b in range_constexpr(NABUF)
-                ]
-                bl_base_t = [
-                    [arith.select(_hmw, br_base6[b][s], bl_base6[b][s]) for s in range_constexpr(N_SUB)]
-                    for b in range_constexpr(NBB)
-                ]
-            else:
-                a_base_t, bl_base_t = a_base6, bl_base6
             accL, accR = mfma.call_mxfp4_wholeloop(
-                a_base_t,
-                bl_base_t,
+                a_base6,
+                bl_base6,
                 br_base6,
                 a_s2r.tile_stride,
                 b_s2r.tile_stride,
@@ -1706,7 +1664,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
                 ki=None,
                 sc_buf_stride=(_SCBUF * 4),
                 half_n=_half_n,
-                half_g2s=not _HALF_M,
+                half_g2s=True,
                 cst=_cst,
                 cst_gap=LDS_BN_HALF * 2,
                 cst_ilv=_BILV,
@@ -1723,20 +1681,22 @@ def _build_grouped_mxfp4_wgrad_kernel(
 
 _GMXFP4_WGRAD_LAUNCH_CACHE: dict = {}
 _GMXFP4_WGRAD_WS_CACHE: dict = {}
-_GMXFP4_WGRAD_AT_CACHE: dict = {}  # (OUT_M_p, OUT_N_p, M_alloc, G, out_fp16, beta1) -> [raw, compiled]
+_GMXFP4_WGRAD_AT_CACHE: dict = {}  # (OUT_M, OUT_N, G, cfg..., out_fp16, beta1) -> [raw, compiled]
 
 
 def _get_grouped_mxfp4_wgrad_ws(OUT_M, OUT_N, K128m, device):
-    key = (OUT_M, OUT_N, K128m, device)
+    # key on the static shape and grow the slabs only for a longer contraction, so a
+    # per-step token count re-uses one pair instead of stranding a pair per length
+    key = (OUT_M, OUT_N, device)
     e = _GMXFP4_WGRAD_WS_CACHE.get(key)
-    if e is None:
+    if e is None or e[2] < K128m:
         qm = ceildiv(OUT_M, 256) * 256
         qn = ceildiv(OUT_N, 256) * 256
         a_sp = torch.empty(qm * K128m, dtype=torch.int32, device=device)
         b_sp = torch.empty(qn * K128m, dtype=torch.int32, device=device)
-        e = (a_sp, b_sp)
+        e = (a_sp, b_sp, K128m)
         _GMXFP4_WGRAD_WS_CACHE[key] = e
-    return e
+    return e[0], e[1]
 
 
 def _select_gmxfp4_wgrad_cfg(M_total, G, OUT_M=0, OUT_N=0):
@@ -1751,14 +1711,12 @@ def _select_gmxfp4_wgrad_cfg(M_total, G, OUT_M=0, OUT_N=0):
 
 
 def _compile_grouped_mxfp4_wgrad_fused(
-    OUT_M, OUT_N, G, M_total, gm, xcd, gn, nt, wgt, hm, wlv, elgk, out_fp16, beta_is_one=False
+    OUT_M, OUT_N, G, gm, xcd, gn, nt, wgt, wlv, elgk, out_fp16, beta_is_one=False
 ):
-    K128m = M_total // 128
     gemm_k, attrs, GRID, b_ilv = _build_grouped_mxfp4_wgrad_kernel(
         OUT_M,
         OUT_N,
         G,
-        M_total,
         group_m=gm,
         num_xcds=xcd,
         group_n=gn,
@@ -1767,7 +1725,6 @@ def _compile_grouped_mxfp4_wgrad_fused(
         out_fp16=out_fp16,
         cst_nt=nt,
         wg_tiles=wgt,
-        half_m=hm,
         beta_is_one=beta_is_one,
     )
     pre_ab = _build_mxfp4_preshuffle_kernel_ab(b_ilv=b_ilv)  # b_ilv: rhs scale follows rhs row map
@@ -1785,10 +1742,12 @@ def _compile_grouped_mxfp4_wgrad_fused(
         a_sp: fx.Tensor,
         b_sp: fx.Tensor,
         GO: fx.Tensor,
+        m_total: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_a = ceildiv(fx.Int32(QM) * fx.Int32(K128m), _PGRID)
-        grid_b = ceildiv(fx.Int32(QN) * fx.Int32(K128m), _PGRID)
+        k128m = m_total // fx.Int32(128)
+        grid_a = ceildiv(fx.Int32(QM) * k128m, _PGRID)
+        grid_b = ceildiv(fx.Int32(QN) * k128m, _PGRID)
         pre_ab(
             a_raw,
             a_sp,
@@ -1798,10 +1757,10 @@ def _compile_grouped_mxfp4_wgrad_fused(
             fx.Int32(QN),
             fx.Int32(OUT_M),
             fx.Int32(OUT_N),
-            fx.Int32(K128m),
+            k128m,
             grid_a,
         ).launch(grid=(grid_a + grid_b, 1, 1), block=(_MXFP4_PRESHUF_BLK, 1, 1), stream=stream)
-        gemm_k(a8, b8, C, a_sp, b_sp, GO, value_attrs=attrs).launch(
+        gemm_k(a8, b8, C, a_sp, b_sp, GO, m_total, value_attrs=attrs).launch(
             grid=(GRID, 1, 1), block=(256, 1, 1), stream=stream
         )
 
@@ -1838,8 +1797,8 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     # keep fp4 operands 2D: a flat view of >2^31-int8 total_M overflows the CABI int32 dim
     a8 = lhs.contiguous().view(torch.int8)
     b8 = rhs.contiguous().view(torch.int8)
-    a_raw = lhs_scale.contiguous().view(torch.int32).reshape(-1)
-    b_raw = rhs_scale.contiguous().view(torch.int32).reshape(-1)
+    a_raw = lhs_scale.contiguous().view(torch.int32)  # rank unused: explicit-records SRD read
+    b_raw = rhs_scale.contiguous().view(torch.int32)
     go_pad = (group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)).view(torch.int32)
 
     K128m = M_total // 128
@@ -1848,20 +1807,32 @@ def grouped_gemm_mxfp4_variable_k_flydsl_kernel(
     out = resolve_accum_out(out, beta, (G, OUT_M, OUT_N), dev, out_dtype)
     beta_is_one = beta == 1.0
 
-    stream = torch.cuda.current_stream()
-    wlv, elgk = 10, 9
-    args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go_pad, stream)
+    stream = current_stream(dev)
+    # elgk=0: the phase barrier has to drain lgkmcnt fully here.  A non-zero budget is
+    # calibrated against how many ds_reads the body issues, and the split A staging issues a
+    # different count than the 9 was tuned for -- reads left in flight let the next
+    # buffer_load_lds overwrite the LDS under them (WAR), surfacing as a rare wgrad mismatch
+    # on the partial last M tile.
+    # The lgkmcnt budget at the phase barrier is per-schedule, not a global constant: it is
+    # calibrated against how many ds_reads the body leaves in flight.  The bf16 path fuses the
+    # C store into the loop, which reorders those reads enough that a non-zero budget lets the
+    # next buffer_load_lds overwrite LDS under them (a WAR hazard, seen as a rare wgrad
+    # mismatch on the partial last M tile); it needs a full drain.  The fp16 path keeps the
+    # standalone store and the 9 it was tuned with -- draining it there costs correctness.
+    wlv = 10
+    elgk = 9 if out_fp16 else 0
+    args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go_pad, M_total, stream)
 
     def _entry(cfg):
-        gm, xcd, gn, nt, wgt, hm = cfg
-        lk = (OUT_M, OUT_N, G, M_total, gm, xcd, gn, nt, wgt, hm, wlv, elgk, out_fp16, beta_is_one)
+        gm, xcd, gn, nt, wgt = cfg
+        lk = (OUT_M, OUT_N, G, gm, xcd, gn, nt, wgt, wlv, elgk, out_fp16, beta_is_one)
         ent = _GMXFP4_WGRAD_LAUNCH_CACHE.get(lk)
         if ent is None:
             ent = _compile_grouped_mxfp4_wgrad_fused(
-                OUT_M, OUT_N, G, M_total, gm, xcd, gn, nt, wgt, hm, wlv, elgk, out_fp16, beta_is_one
+                OUT_M, OUT_N, G, gm, xcd, gn, nt, wgt, wlv, elgk, out_fp16, beta_is_one
             )
             _GMXFP4_WGRAD_LAUNCH_CACHE[lk] = ent
-        atk = (OUT_M, OUT_N, M_total, G, gm, xcd, gn, nt, wgt, hm, out_fp16, beta_is_one)
+        atk = (OUT_M, OUT_N, G, gm, xcd, gn, nt, wgt, out_fp16, beta_is_one)
         e2 = _GMXFP4_WGRAD_AT_CACHE.get(atk)
         if e2 is None:
             e2 = [ent[0], None]
