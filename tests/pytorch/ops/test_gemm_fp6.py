@@ -4,9 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import os
-from contextlib import contextmanager
-
 import pytest
 import torch
 
@@ -143,29 +140,6 @@ def test_mxfp6_col_pack_is_row_pack_of_transpose(rows, cols):
     )
 
 
-def _fused_packer_available() -> bool:
-    return hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_dual")
-
-
-def _skip_without_fused_packer():
-    if not _fused_packer_available():
-        pytest.skip("build has no fused MXFP6 packer (gfx950-only)")
-
-
-@contextmanager
-def _packer(choice: str):
-    """Force the packer backend for the duration of a block."""
-    previous = os.environ.get("PRIMUS_TURBO_MXFP6_PACKER")
-    os.environ["PRIMUS_TURBO_MXFP6_PACKER"] = choice
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop("PRIMUS_TURBO_MXFP6_PACKER", None)
-        else:
-            os.environ["PRIMUS_TURBO_MXFP6_PACKER"] = previous
-
-
 @pytest.mark.parametrize(
     "rows,cols", [(256, 256), (256, 512), (512, 256), (1024, 1024), (256, 3072), (4096, 3072)]
 )
@@ -187,17 +161,17 @@ def test_fused_packer_is_bit_exact_with_aiter(rows, cols, direction):
     where AITER can be compared against at all; see test_fused_packer_pads_with_zeros.
     """
     _skip_if_unsupported()
-    _skip_without_fused_packer()
+    from primus_turbo.common.aiter_utils import get_aiter
 
     x = torch.randn((rows, cols), dtype=torch.bfloat16, device="cuda:0")
     pack = quantize_mxfp6_row if direction == "row" else quantize_mxfp6_col
     # Packed rows/K are transposed for the column direction.
     r, k = (rows, cols) if direction == "row" else (cols, rows)
 
-    with _packer("fused"):
-        got_p, got_s = pack(x)
-    with _packer("aiter"):
-        ref_p, ref_s = pack(x)
+    got_p, got_s = pack(x)
+    # AITER packs the row direction only, so the column reference has to go through the
+    # materialised transpose that the fused packer exists to avoid.
+    ref_p, ref_s = get_aiter().quant_mxfp6_gemm(x if direction == "row" else x.t().contiguous())
 
     assert torch.equal(mxfp6_data_region(got_p, r, k), mxfp6_data_region(ref_p, r, k))
     assert torch.equal(
@@ -218,7 +192,6 @@ def test_fused_packer_pads_with_zeros(rows, cols):
     explicitly zero-extended input.
     """
     _skip_if_unsupported()
-    _skip_without_fused_packer()
 
     def ceil256(v):
         return -(-v // 256) * 256
@@ -227,9 +200,8 @@ def test_fused_packer_pads_with_zeros(rows, cols):
     extended = torch.zeros((ceil256(rows), ceil256(cols)), dtype=torch.bfloat16, device="cuda:0")
     extended[:rows, :cols] = x
 
-    with _packer("fused"):
-        got_rp, got_rs, got_cp, got_cs = quantize_mxfp6_dual(x)
-        ref_rp, ref_rs, ref_cp, ref_cs = quantize_mxfp6_dual(extended)
+    got_rp, got_rs, got_cp, got_cs = quantize_mxfp6_dual(x)
+    ref_rp, ref_rs, ref_cp, ref_cs = quantize_mxfp6_dual(extended)
 
     er, ec = extended.shape
 
@@ -255,7 +227,6 @@ def test_fused_packer_ignores_memory_past_the_operand():
     the same values onto buffers with different tails is what distinguishes the two.
     """
     _skip_if_unsupported()
-    _skip_without_fused_packer()
 
     rows, cols = 288, 256
     values = torch.randn((rows, cols), dtype=torch.bfloat16, device="cuda:0")
@@ -264,9 +235,7 @@ def test_fused_packer_ignores_memory_past_the_operand():
     for filler in (0.0, 3.5, -100.0):
         backing = torch.full((512, cols), filler, dtype=torch.bfloat16, device="cuda:0")
         backing[:rows] = values
-        with _packer("fused"):
-            packed, scale = quantize_mxfp6_row(backing[:rows])
-        packs.append((packed, scale))
+        packs.append(quantize_mxfp6_row(backing[:rows]))
 
     for packed, scale in packs[1:]:
         assert torch.equal(mxfp6_data_region(packed, rows, cols), mxfp6_data_region(packs[0][0], rows, cols))
@@ -310,11 +279,6 @@ _GELU_KAPPA = 0.044715
 # returns exactly -1 and the kernel short-circuits to zero to match it.
 _GELU_NEG_TWO_LOG2E = -2.0 * 1.4426950408889634
 _GELU_SATURATE = -9.02
-
-
-def _skip_without_fused_prologue():
-    if not hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_fused_dual"):
-        pytest.skip("build has no fused MXFP6 prologue packer (gfx950-only)")
 
 
 def _closed_form_prologue(x, aux, bias, mode):
@@ -368,7 +332,6 @@ def test_fused_prologue_cutoff_matches_eager_for_adjacent_bf16_inputs(mode):
     from passing merely because the left tail is tiny.
     """
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     values = _adjacent_bf16_values_around_gelu_cutoff()
     inner = _GELU_BETA * (values.float() + _GELU_KAPPA * values.float() ** 3)
@@ -387,9 +350,8 @@ def test_fused_prologue_cutoff_matches_eager_for_adjacent_bf16_inputs(mode):
     eager = mxfp6_apply_prologue(x, aux, bias, mode)
     assert not torch.count_nonzero(eager)
 
-    with _packer("fused"):
-        got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
-        ref = quantize_mxfp6_dual(eager)
+    got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
+    ref = quantize_mxfp6_dual(eager)
 
     assert _blobs_equal(got, ref, rows, cols)
     assert not torch.count_nonzero(mxfp6_data_region(got[0], rows, cols))
@@ -399,8 +361,7 @@ def test_fused_prologue_cutoff_matches_eager_for_adjacent_bf16_inputs(mode):
     nearest_aux = torch.ones_like(nearest) if mode == MXFP6_PROLOGUE_BIAS_GELU_BACKWARD else None
     nearest_eager = mxfp6_apply_prologue(nearest, nearest_aux, bias, mode)
     assert torch.count_nonzero(nearest_eager)
-    with _packer("fused"):
-        nearest_got = quantize_mxfp6_fused_dual(nearest, nearest_aux, bias, mode)
+    nearest_got = quantize_mxfp6_fused_dual(nearest, nearest_aux, bias, mode)
     assert torch.count_nonzero(mxfp6_data_region(nearest_got[0], 32, cols))
 
 
@@ -479,13 +440,11 @@ def test_fused_prologue_matches_eager_epilogue(rows, cols, mode):
     four orders of magnitude above the tolerance here.
     """
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     x, aux, bias = _prologue_operands(rows, cols, mode, torch.bfloat16)
 
-    with _packer("fused"):
-        got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
-        ref = quantize_mxfp6_dual(mxfp6_apply_prologue(x, aux, bias, mode))
+    got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
+    ref = quantize_mxfp6_dual(mxfp6_apply_prologue(x, aux, bias, mode))
 
     _assert_blobs_agree(got, ref, rows, cols)
 
@@ -503,7 +462,6 @@ def test_fused_prologue_is_no_less_accurate_than_aten(mode):
     than a rounding difference.
     """
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     rows, cols = 1024, 2048
     x, aux, bias = _prologue_operands(rows, cols, mode, torch.bfloat16)
@@ -545,13 +503,11 @@ def test_fused_prologue_fp16_matches_eager_epilogue_to_a_few_codes(rows, cols, m
     caught showed as 4.6%, against the ~0.002% seen here.
     """
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     x, aux, bias = _prologue_operands(rows, cols, mode, torch.float16)
 
-    with _packer("fused"):
-        got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
-        ref = quantize_mxfp6_dual(mxfp6_apply_prologue(x, aux, bias, mode))
+    got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
+    ref = quantize_mxfp6_dual(mxfp6_apply_prologue(x, aux, bias, mode))
 
     for name, g, r, r_rows, r_k in (
         ("row", got[0], ref[0], rows, cols),
@@ -570,14 +526,12 @@ def test_fused_prologue_fp16_matches_eager_epilogue_to_a_few_codes(rows, cols, m
 def test_fused_prologue_without_bias(mode):
     """A null bias must skip the add rather than reading a zero vector that is not there."""
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     rows, cols = 256, 512
     x, aux, _ = _prologue_operands(rows, cols, mode, torch.bfloat16, with_bias=False)
 
-    with _packer("fused"):
-        got = quantize_mxfp6_fused_dual(x, aux, None, mode)
-        ref = quantize_mxfp6_dual(mxfp6_apply_prologue(x, aux, None, mode))
+    got = quantize_mxfp6_fused_dual(x, aux, None, mode)
+    ref = quantize_mxfp6_dual(mxfp6_apply_prologue(x, aux, None, mode))
 
     _assert_blobs_agree(got, ref, rows, cols)
 
@@ -605,7 +559,6 @@ def test_fused_prologue_pads_with_zeros(rows, cols, mode):
     padded blocks' E8M0 exponents off zero. Those are still compared exactly.
     """
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     def ceil256(v):
         return -(-v // 256) * 256
@@ -620,9 +573,8 @@ def test_fused_prologue_pads_with_zeros(rows, cols, mode):
     extended = torch.zeros((ceil256(rows), ceil256(cols)), dtype=dtype, device=x.device)
     extended[:rows, :cols] = epilogue
 
-    with _packer("fused"):
-        got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
-        ref = quantize_mxfp6_dual(extended)
+    got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
+    ref = quantize_mxfp6_dual(extended)
 
     er, ec = extended.shape
 
@@ -656,12 +608,10 @@ def test_fused_packer_col_sum_matches_eager_reduction(rows, cols, mode):
     contribute, and columns past N must not be written at all.
     """
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     x, aux, bias = _prologue_operands(rows, cols, mode, torch.bfloat16)
 
-    with _packer("fused"):
-        *_, partial = quantize_mxfp6_fused_dual(x, aux, bias, mode, want_col_sum=True)
+    *_, partial = quantize_mxfp6_fused_dual(x, aux, bias, mode, want_col_sum=True)
 
     assert partial.shape == (mxfp6_col_sum_rows(rows), cols)
     assert partial.dtype == torch.float32
@@ -674,25 +624,21 @@ def test_fused_packer_col_sum_matches_eager_reduction(rows, cols, mode):
 def test_fused_packer_col_sum_is_absent_unless_requested():
     """The fifth output is degenerate by default, so the common path allocates nothing."""
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     x, aux, bias = _prologue_operands(256, 512, MXFP6_PROLOGUE_BIAS_GELU, torch.bfloat16)
-    with _packer("fused"):
-        *_, partial = quantize_mxfp6_fused_dual(x, aux, bias, MXFP6_PROLOGUE_BIAS_GELU)
+    *_, partial = quantize_mxfp6_fused_dual(x, aux, bias, MXFP6_PROLOGUE_BIAS_GELU)
     assert partial.numel() == 0
 
 
 def test_fused_prologue_identity_matches_plain_dual():
     """Identity mode must be the plain dual pack, so the fused entry point is a superset."""
     _skip_if_unsupported()
-    _skip_without_fused_packer()
 
     rows, cols = 256, 512
     x = torch.randn((rows, cols), dtype=torch.bfloat16, device="cuda:0")
 
-    with _packer("fused"):
-        got = quantize_mxfp6_fused_dual(x, None, None, MXFP6_PROLOGUE_IDENTITY)
-        ref = quantize_mxfp6_dual(x)
+    got = quantize_mxfp6_fused_dual(x, None, None, MXFP6_PROLOGUE_IDENTITY)
+    ref = quantize_mxfp6_dual(x)
 
     assert _blobs_equal(got, ref, rows, cols)
 
@@ -707,7 +653,6 @@ def test_fused_prologue_custom_op_fake_matches_real(mode, want_col_sum):
     disagreement is a wrong-sized allocation rather than a compile error.
     """
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     rows, cols = 288, 512
     x, aux, bias = _prologue_operands(rows, cols, mode, torch.bfloat16)
@@ -727,7 +672,6 @@ def test_fused_prologue_custom_op_fake_matches_real(mode, want_col_sum):
 def test_fused_prologue_rejects_inconsistent_arguments():
     """aux is required by exactly one mode, and the bias has to match the column count."""
     _skip_if_unsupported()
-    _skip_without_fused_prologue()
 
     rows, cols = 256, 512
     dtype = torch.bfloat16
@@ -737,17 +681,17 @@ def test_fused_prologue_rejects_inconsistent_arguments():
 
     # Matching the message as well as the type, so that a different failure reaching the
     # same line cannot pass for the check under test.
-    with _packer("fused"):
-        # Backward mode without the incoming gradient.
-        with pytest.raises(RuntimeError, match="aux is required"):
-            quantize_mxfp6_fused_dual(x, None, bias, MXFP6_PROLOGUE_BIAS_GELU_BACKWARD)
-        # Forward mode handed a gradient it has no use for.
-        with pytest.raises(RuntimeError, match="aux is required"):
-            quantize_mxfp6_fused_dual(x, aux, bias, MXFP6_PROLOGUE_BIAS_GELU)
-        # Bias sized for the wrong axis.
-        with pytest.raises(RuntimeError, match="one element per column"):
-            wrong = torch.randn((rows,), dtype=dtype, device="cuda:0")
-            quantize_mxfp6_fused_dual(x, None, wrong, MXFP6_PROLOGUE_BIAS_GELU)
+    #
+    # Backward mode without the incoming gradient.
+    with pytest.raises(RuntimeError, match="aux is required"):
+        quantize_mxfp6_fused_dual(x, None, bias, MXFP6_PROLOGUE_BIAS_GELU_BACKWARD)
+    # Forward mode handed a gradient it has no use for.
+    with pytest.raises(RuntimeError, match="aux is required"):
+        quantize_mxfp6_fused_dual(x, aux, bias, MXFP6_PROLOGUE_BIAS_GELU)
+    # Bias sized for the wrong axis.
+    with pytest.raises(RuntimeError, match="one element per column"):
+        wrong = torch.randn((rows,), dtype=dtype, device="cuda:0")
+        quantize_mxfp6_fused_dual(x, None, wrong, MXFP6_PROLOGUE_BIAS_GELU)
 
 
 @pytest.mark.parametrize("axis,expect_row", [(1, True), (-1, True), (0, False), (-2, False)])
