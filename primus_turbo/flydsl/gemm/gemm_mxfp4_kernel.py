@@ -2844,8 +2844,10 @@ def gemm_mxfp4_flydsl_kernel(
     a_sp, b_sp = _get_mxfp4_scale_ws(M, N, Kw, a.device)
     # Straight through, no widening: the preshuffle bounds each source read at the row's
     # true K/32 bytes and zero-fills the packed tail itself.
-    a_raw = a_scale.contiguous().reshape(-1)
-    b_raw = b_scale.contiguous().reshape(-1)
+    # E8M0 has no memref element type, and a row of K/32 bytes need not be a whole number
+    # of dwords, so the bytes go in as u8 -- the resource bounds are in bytes either way.
+    a_raw = a_scale.contiguous().view(torch.uint8).reshape(-1)
+    b_raw = b_scale.contiguous().view(torch.uint8).reshape(-1)
     out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
     beta_is_one = beta == 1.0
     # Keep the fp4 operands 2D (do NOT flatten): M*K/2 / N*K/2 exceed 2^31 int8s for
