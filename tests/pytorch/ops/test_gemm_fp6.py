@@ -335,6 +335,75 @@ def _closed_form_prologue(x, aux, bias, mode):
     return torch.where(inner < _GELU_SATURATE, torch.zeros_like(out), out).to(x.dtype)
 
 
+def _solve_x_for_gelu_inner(target):
+    """Invert the monotonic negative branch of beta * (x + kappa*x^3)."""
+    low, high = -16.0, 0.0
+    for _ in range(100):
+        midpoint = (low + high) / 2.0
+        inner = _GELU_BETA * (midpoint + _GELU_KAPPA * midpoint**3)
+        if inner < target:
+            low = midpoint
+        else:
+            high = midpoint
+    return (low + high) / 2.0
+
+
+def _adjacent_bf16_values_around_gelu_cutoff(count=256):
+    """The consecutive BF16 inputs straddling the kernel's cutoff."""
+    root = torch.tensor(_solve_x_for_gelu_inner(_GELU_SATURATE), dtype=torch.bfloat16)
+    center = int(root.view(torch.uint16))
+    half = count // 2
+    bits = torch.arange(center - half, center + count - half, dtype=torch.int32).to(torch.uint16)
+    return bits.view(torch.bfloat16).float().sort().values.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("mode", _PROLOGUE_MODES)
+def test_fused_prologue_cutoff_matches_eager_for_adjacent_bf16_inputs(mode):
+    """Exercise the compiled gfx950 cutoff on every adjacent BF16 input around it.
+
+    The broad random prologue tests establish the ordinary rounding bound. This test
+    isolates the explicit ``inner < -9.02`` branch: every representable BF16 input below
+    it must pack exactly like eager ATen's zero, while the nearest input on the other side
+    must remain non-zero. The latter prevents an accidentally inclusive or shifted branch
+    from passing merely because the left tail is tiny.
+    """
+    _skip_if_unsupported()
+    _skip_without_fused_prologue()
+
+    values = _adjacent_bf16_values_around_gelu_cutoff()
+    inner = _GELU_BETA * (values.float() + _GELU_KAPPA * values.float() ** 3)
+    below_values = values[inner < _GELU_SATURATE]
+    at_or_above_values = values[inner >= _GELU_SATURATE]
+    assert below_values.numel() and at_or_above_values.numel()
+
+    # The packer needs whole 32-element blocks, and the fill value has to stay below the
+    # cutoff too, so that a block's E8M0 scale cannot be set by a value under test.
+    cols = 256
+    rows = -(-below_values.numel() // 32) * 32
+    x = torch.full((rows, cols), below_values[-1].item(), dtype=torch.bfloat16, device="cuda")
+    x[: below_values.numel()] = below_values[:, None].to("cuda")
+    bias = torch.zeros(cols, dtype=torch.bfloat16, device="cuda")
+    aux = torch.ones_like(x) if mode == MXFP6_PROLOGUE_BIAS_GELU_BACKWARD else None
+    eager = mxfp6_apply_prologue(x, aux, bias, mode)
+    assert not torch.count_nonzero(eager)
+
+    with _packer("fused"):
+        got = quantize_mxfp6_fused_dual(x, aux, bias, mode)
+        ref = quantize_mxfp6_dual(eager)
+
+    assert _blobs_equal(got, ref, rows, cols)
+    assert not torch.count_nonzero(mxfp6_data_region(got[0], rows, cols))
+
+    # The closest representable BF16 point on the non-saturating side, separately.
+    nearest = at_or_above_values[:1, None].expand(32, cols).contiguous().to("cuda")
+    nearest_aux = torch.ones_like(nearest) if mode == MXFP6_PROLOGUE_BIAS_GELU_BACKWARD else None
+    nearest_eager = mxfp6_apply_prologue(nearest, nearest_aux, bias, mode)
+    assert torch.count_nonzero(nearest_eager)
+    with _packer("fused"):
+        nearest_got = quantize_mxfp6_fused_dual(nearest, nearest_aux, bias, mode)
+    assert torch.count_nonzero(mxfp6_data_region(nearest_got[0], 32, cols))
+
+
 def _prologue_operands(rows, cols, mode, dtype, *, with_bias=True, device="cuda:0"):
     x = torch.randn((rows, cols), dtype=dtype, device=device)
     aux = (
