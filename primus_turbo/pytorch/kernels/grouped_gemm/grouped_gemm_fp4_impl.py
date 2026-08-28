@@ -28,7 +28,13 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
-from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float4_e2m1fn_x2
+from primus_turbo.pytorch.core.low_precision import (
+    MXFP4_BLOCK_SIZE,
+    Float4QuantConfig,
+    ScalingGranularity,
+    ScalingRecipe,
+    float4_e2m1fn_x2,
+)
 from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
@@ -598,6 +604,281 @@ def grouped_gemm_fp4_variable_k_accum_impl_meta(
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"
     assert out.dim() == 3, f"out must be 3D, got {out.shape}"
     return None
+
+
+def _check_glu_dispatch(config: Float4QuantConfig, trans_a: bool, trans_b: bool) -> None:
+    """The fused GLU epilogue rides the FlyDSL NT kernel, so it has one layout.
+
+    The whole config is held against ``mxfp4_scaling``, not just its granularity: the
+    epilogue emits E8M0 block scales, so anything else would be a different kernel even
+    at the same granularity.
+    """
+    assert config.mxfp4_scaling(), f"Fused GLU grouped MXFP4 GEMM is MX_BLOCKWISE-only, got {config}"
+    assert is_gfx950(), "Fused GLU grouped MXFP4 GEMM is only supported on gfx950"
+    assert not trans_a and trans_b, "Fused GLU grouped MXFP4 GEMM is NT only"
+
+
+def _check_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> tuple[bool, bool]:
+    """Hold the caller's recipes against the geometry the fused epilogue is built on.
+
+    The epilogue is not a general quantiser. Which axis gets the RHT is baked into the
+    kernel -- the col-wise operand, which is what a wgrad contracts over -- and it has
+    no 2-D block scaling and no shuffled layouts, so those three are contract checks
+    rather than knobs. Shapes wanting them belong on the standalone quantiser.
+
+    Returns the per-operand stochastic-rounding flags, which the epilogue does honour
+    independently.
+    """
+    assert not row.use_rht, "the fused epilogue puts the RHT on the col-wise operand only"
+    assert col.use_rht, "the fused epilogue always RHTs the col-wise operand"
+    for name, recipe in (("row", row), ("col", col)):
+        assert not recipe.use_2d_block, f"the fused epilogue has no 2-D block scaling, got {name}={recipe}"
+        assert not recipe.shuffle_scale and not recipe.shuffle_out, (
+            f"the fused epilogue writes unshuffled operands, got {name}={recipe}"
+        )
+    return row.use_sr, col.use_sr
+
+
+_COL_ALIGN = 256  # the col-wise operand's per-group M alignment, as the quantizer pads it
+_ROW_ALIGN = 128  # and the row-wise operand's N alignment
+
+
+def _alloc_act_buffers(M: int, I: int, G: int, device):
+    """The four MXFP4 operands ``grouped_quantize_fp4_with_trans`` would have made.
+
+    Byte-identical geometry to the standalone quantizer, because the wgrad and fc2
+    consume them under the same group tables it builds: the row-wise pair is tight-M
+    and padded to :data:`_ROW_ALIGN` columns, the col-wise pair is feature-major over
+    an M rounded up per group to :data:`_COL_ALIGN`.
+
+    Only the row-wise pad columns are zeroed. The epilogue writes every real column
+    and every padded col-wise row (a group's ragged tail included, as zeros), but the
+    columns past ``I`` belong to no tile and fc2 contracts over them.
+    """
+    I_pad = -(-I // _ROW_ALIGN) * _ROW_ALIGN
+    M_pad_col = -(-(M + G * _COL_ALIGN) // _COL_ALIGN) * _COL_ALIGN
+    row_out = torch.empty((M, I_pad // 2), dtype=torch.uint8, device=device)
+    row_sc = torch.empty((M, I_pad // MXFP4_BLOCK_SIZE), dtype=torch.uint8, device=device)
+    if I_pad != I:
+        row_out[:, I // 2 :].zero_()
+        row_sc[:, I // MXFP4_BLOCK_SIZE :].zero_()
+    col_out = torch.empty((I, M_pad_col // 2), dtype=torch.uint8, device=device)
+    col_sc = torch.empty((I, M_pad_col // MXFP4_BLOCK_SIZE), dtype=torch.uint8, device=device)
+    e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+    return (
+        row_out.view(float4_e2m1fn_x2),
+        row_sc.view(e8),
+        col_out.view(float4_e2m1fn_x2),
+        col_sc.view(e8),
+    )
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp4_glu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_fp4_glu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,  # not used
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    config: Float4QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fc1 grouped MXFP4 GEMM with the GLU activation and its quantisation fused in.
+
+    The activation is quantised from the accumulators instead of being written and read
+    back: what comes out is the row-wise pair fc2 contracts against and the col-wise
+    (RHT) pair the wgrad does, byte-for-byte what ``grouped_quantize_fp4_with_trans``
+    would have produced from the bf16 activation under the same two recipes.
+
+    Returns ``(intermediate, act_row, act_row_scale, act_col, act_col_scale)``, where
+    ``intermediate`` is the [M, N] pre-activation backward needs, still in
+    ``out_dtype``. The row-wise pair keeps the tight-M layout, so its group table is
+    ``group_offs``; the col-wise pair's is the per-group 256-aligned one the wgrad
+    already builds from the same ``group_lens``.
+
+    ``config`` and the recipes ride through as opaque value arguments, so torch.compile
+    bakes them into the graph and guards on their equality rather than tracing into
+    them. That is also why they carry no defaults: the schema admits an opaque type
+    only as a required parameter.
+    """
+    _check_glu_dispatch(config, trans_a, trans_b)
+    row_sr, col_sr = _check_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_glu_kernel import (
+        glu_epi_quant_supported,
+        grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel,
+    )
+
+    M, N, K = a.shape[0], b.shape[1], b.shape[2] * 2
+    assert glu_epi_quant_supported(K, N // 2, out_dtype), (
+        f"the fused GLU quant epilogue does not cover K={K} I={N // 2} out_dtype={out_dtype}"
+    )
+    intermediate = torch.empty((M, N), device=a.device, dtype=out_dtype)
+    row_out, row_sc, col_out, col_sc = _alloc_act_buffers(M, N // 2, group_lens.shape[0], a.device)
+    grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
+        a,
+        a_scales,
+        b,
+        b_scales,
+        probs,
+        group_offs,
+        intermediate,
+        row_out,
+        row_sc,
+        col_out,
+        col_sc,
+        N,
+        K,
+        activation=activation,
+        row_use_sr=row_sr,
+        col_use_sr=col_sr,
+        out_dtype=out_dtype,
+    )
+    return intermediate, row_out, row_sc, col_out, col_sc
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp4_dglu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_fp4_dglu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    config: Float4QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
+
+    ``a`` is the fc2 output gradient and ``b`` its weight quantised for the dgrad's
+    contraction, so ``a @ b^T`` is the gradient wrt the activation; the epilogue
+    consumes that against ``intermediate`` in registers, so it never reaches HBM.
+    ``grad_l1`` is quantized from the epilogue's values rather than written and read
+    back -- it is [M, 2I], the largest tensor the MLP touches, and backward reads it
+    exactly once, to quantize it, so that round trip is pure overhead.
+
+    Returns ``(grad_probs, row, row_scale, col, col_scale)``: [M] fp32 wrt the routing
+    probabilities, folded here from the per-tile partials the kernel leaves, then the
+    four operands, byte-for-byte what ``grouped_quantize_fp4_with_trans`` would have
+    produced from the bf16 ``grad_l1`` under the same two recipes. The row-wise pair
+    keeps the tight-M layout, so its group table is ``group_offs``; the col-wise pair's
+    is the per-group 256-aligned one the wgrad builds from the same ``group_lens``.
+
+    ``config`` and the recipes are opaque value arguments; see the forward's note on
+    why they carry no defaults.
+    """
+    _check_glu_dispatch(config, trans_a, trans_b)
+    row_sr, col_sr = _check_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_glu_kernel import (
+        dglu_epi_quant_supported,
+        grouped_gemm_mxfp4_dglu_grad_probs_partial_spec,
+        grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel,
+    )
+
+    M, I, K = a.shape[0], b.shape[1], b.shape[2] * 2
+    assert dglu_epi_quant_supported(K, I, out_dtype), (
+        f"the fused dglu quant epilogue does not cover I={I} out_dtype={out_dtype}"
+    )
+    spec = grouped_gemm_mxfp4_dglu_grad_probs_partial_spec(a, b)
+    fill = torch.zeros if spec.needs_zero else torch.empty
+    grad_probs_partial = fill(spec.shape, device=a.device, dtype=torch.float32)
+    row_out, row_sc, col_out, col_sc = _alloc_act_buffers(M, 2 * I, group_lens.shape[0], a.device)
+    grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
+        a,
+        a_scales,
+        b,
+        b_scales,
+        intermediate,
+        group_offs,
+        probs,
+        grad_probs_partial,
+        row_out,
+        row_sc,
+        col_out,
+        col_sc,
+        I,
+        K,
+        activation=activation,
+        row_use_sr=row_sr,
+        col_use_sr=col_sr,
+        out_dtype=out_dtype,
+    )
+    return torch.sum(grad_probs_partial, dim=0), row_out, row_sc, col_out, col_sc
+
+
+@grouped_gemm_fp4_dglu_impl.register_fake
+def grouped_gemm_fp4_dglu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    config: Float4QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert a.dim() == 2 and b.dim() == 3, f"a must be 2D and b 3D, got {a.shape} {b.shape}"
+    assert a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2, "operands must be fp4"
+    assert out_dtype in (torch.float16, torch.bfloat16), f"bad out_dtype {out_dtype}"
+    m, i = a.shape[0], b.shape[1]
+    return (
+        torch.empty((m,), device=a.device, dtype=torch.float32),
+        *_alloc_act_buffers(m, 2 * i, group_lens.shape[0], a.device),
+    )
+
+
+@grouped_gemm_fp4_glu_impl.register_fake
+def grouped_gemm_fp4_glu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    config: Float4QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert a.dim() == 2 and b.dim() == 3, f"a must be 2D and b 3D, got {a.shape} {b.shape}"
+    assert a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2, "operands must be fp4"
+    assert out_dtype in (torch.float16, torch.bfloat16), f"bad out_dtype {out_dtype}"
+    # b holds gate||up, so its N is twice the activation's width.
+    m, n = a.shape[0], b.shape[1]
+    return (
+        torch.empty((m, n), device=a.device, dtype=out_dtype),
+        *_alloc_act_buffers(m, n // 2, group_lens.shape[0], a.device),
+    )
 
 
 @grouped_gemm_fp4_impl.register_fake

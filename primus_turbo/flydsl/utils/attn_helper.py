@@ -29,6 +29,8 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
+from primus_turbo.flydsl.utils.prims import LOG2E
+
 
 def dtype_to_elem_type(dtype_str: str):
     if dtype_str == "f32":
@@ -42,7 +44,6 @@ def dtype_to_elem_type(dtype_str: str):
     raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', 'bf16', or 'fp8')")
 
 
-_LOG2E = host_math.log2(host_math.e)
 # s_waitcnt bitfield encoding
 _VMCNT_LO_MASK = 0xF
 _LGKMCNT_EXPCNT_BASE = 0x3F70
@@ -566,7 +567,7 @@ class DualwaveKernelContext:
         self.c_zero_f = fx.Float32(0.0)
         self.c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
         head_dim_f32 = fx.Float32(fx.Int32(head_dim_runtime))
-        c_log2e_f = fx.Float32(_LOG2E)
+        c_log2e_f = fx.Float32(LOG2E)
         self.c_sm_scale_log2e = fx.Float32(
             arith.mulf(
                 as_mlir_value(fmath.rsqrt(head_dim_f32, fastmath=self.fm_fast)),
@@ -1024,7 +1025,7 @@ class DualwaveKernelContext:
         Without HAS_SINK, af==1 and mf==m_row, so this is byte-identical to the plain 1/l path."""
         if const_expr(self.traits.HAS_SINK):
             fm = self.fm_fast
-            sink_log2 = _fmul(self.sink_h, fx.Float32(_LOG2E), fm)
+            sink_log2 = _fmul(self.sink_h, fx.Float32(LOG2E), fm)
             mf = fx.Float32(_fmax(m_row, sink_log2, fm))
             af = fx.Float32(rocdl.exp2(T.f32, _fsub(m_row, mf, fm)))
             st = fx.Float32(rocdl.exp2(T.f32, _fsub(sink_log2, mf, fm)))

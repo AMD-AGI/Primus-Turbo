@@ -31,12 +31,12 @@ from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.barrier import grid_sync, xgmi_barrier
-from primus_turbo.flydsl.mega.prims import atomic_add, ld, st
 from primus_turbo.flydsl.mega.symm_buffer import TOKEN_DTYPE, SymBuffer, Workspace
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
 )
+from primus_turbo.flydsl.utils.prims import atomic_add, ld, st
 
 
 def _make_dispatch_prologue(

@@ -32,13 +32,6 @@ from primus_turbo.flydsl.mega.ep_intranode import (
     combine_bf16_tile,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.prims import (
-    atomic_add,
-    cast,
-    ld,
-    read_clock,
-    spin_timed_out,
-)
 from primus_turbo.flydsl.mega.symm_buffer import (
     TOKEN_DTYPE,
     SymBuffer,
@@ -52,6 +45,13 @@ from primus_turbo.flydsl.mega.tune_utils import (
 from primus_turbo.flydsl.utils.gemm_helper import (
     make_bf16_fp16_tile_tensor,
     make_value_attrs,
+)
+from primus_turbo.flydsl.utils.prims import (
+    atomic_add,
+    cast,
+    ld,
+    read_clock,
+    spin_timed_out,
 )
 
 _WARP = 64

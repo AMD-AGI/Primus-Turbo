@@ -67,7 +67,6 @@ from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     dispatch_prologue_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
-    swiglu_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
     _BLOCK_THREADS,
@@ -92,6 +91,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (  # noqa: E402
     make_value_attrs,
     xcd_remap_pid,
 )
+from primus_turbo.flydsl.utils.swiglu_kernel import swiglu_flydsl_kernel  # noqa: E402
 from primus_turbo.pytorch.ops import grouped_gemm as turbo_grouped_gemm  # noqa: E402
 
 

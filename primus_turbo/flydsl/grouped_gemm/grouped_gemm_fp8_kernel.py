@@ -38,33 +38,29 @@ from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
+    StoreCdSwiGLUCShuffle,
+    StoreCSwiGLU,
+)
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     Mfma16x16x128,
     S2RLoader,
     S2RLoaderShear,
     S2RLoaderTr,
-    StoreCdSwiGLUCShuffle,
     StoreCPerTensor,
     StoreCPerTensorCShuffle,
     StoreCPerTensorRowN,
-    StoreCSwiGLU,
     _lane_tbl_count_le,
     _lane_tbl_get,
     _lane_tbl_load,
     _lane_tbl_scan,
-    _readfirstlane_i32,
-    _readlane_i32,
     _robust_time,
     _sgpr_tbl_load,
     _sgpr_tbl_pick,
     _sgpr_tbl_scan,
-    _sload_i32,
     _store_quadrants,
-    _wave_count_le_i32,
     asm_mma_do,
-    ceildiv,
-    ceildiv_pow2,
     compile_with_scratch_out,
     compute_global_swizzle,
     compute_global_swizzle_nn,
@@ -76,12 +72,20 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     resolve_accum_out,
     shear_mbias,
     spin_flag_eq,
-    udiv,
-    uindex,
-    umod,
     wait_barrier,
     xcd_remap_pid,
     xcd_remap_pid_u,
+)
+from primus_turbo.flydsl.utils.prims import (
+    _readfirstlane_i32,
+    _readlane_i32,
+    _sload_i32,
+    _wave_count_le_i32,
+    ceildiv,
+    ceildiv_pow2,
+    udiv,
+    uindex,
+    umod,
 )
 
 # Baked NT super-block swizzle width (0=row-major); autotune sweeps group_m per shape.

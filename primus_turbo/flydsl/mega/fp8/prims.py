@@ -14,7 +14,7 @@
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 
-from primus_turbo.flydsl.mega.prims import (  # shared with the bf16 path; only the ordering model differs here
+from primus_turbo.flydsl.utils.prims import (  # shared with the bf16 path; only the ordering model differs here
     _as_value,
     _unwrap_order,
     _unwrap_scope,

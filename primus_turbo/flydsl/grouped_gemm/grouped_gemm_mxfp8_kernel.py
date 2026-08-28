@@ -26,26 +26,28 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.utils.gemm_helper import (
-    G2SLoader,
-    MfmaScale16x16x128,
-    S2RLoader,
-    ScaleBComb,
-    ScaleS2R,
-    StoreCPerTensor,
-    _PRESHUF_KT,
-    scale_opsel,
-    _emit_lds_repack,
-    _readfirstlane_i32,
-    _robust_time,
-    _store_quadrants,
-    ceildiv,
     compile_with_scratch_out,
     compute_global_swizzle,
+    _emit_lds_repack,
+    G2SLoader,
     make_fp8_buffer_tensor_rebased,
     make_value_attrs,
+    MfmaScale16x16x128,
+    _PRESHUF_KT,
     resolve_accum_out,
+    _robust_time,
+    S2RLoader,
+    scale_opsel,
+    ScaleBComb,
+    ScaleS2R,
+    _store_quadrants,
+    StoreCPerTensor,
     wait_barrier,
     xcd_remap_pid,
+)
+from primus_turbo.flydsl.utils.prims import (
+    ceildiv,
+    _readfirstlane_i32,
 )
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _grouped_block_mn,
