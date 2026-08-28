@@ -7,7 +7,7 @@
 #include "jax/deep_ep/deep_ep.h"
 #include "jax/extensions.h"
 #include "primus_turbo/common.h"
-#include "primus_turbo/deep_ep/config.hpp"
+#include "pytorch/deep_ep/legacy/config.hpp"
 
 namespace primus_turbo::jax::deep_ep {
 

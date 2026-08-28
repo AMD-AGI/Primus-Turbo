@@ -9,11 +9,11 @@
 
 #include <cstring>
 
-#include "launch.cuh"
+#include "legacy/launch.cuh"
 #include "primus_turbo/common.h"
-#include "primus_turbo/deep_ep/api.h"
-#include "primus_turbo/deep_ep/configs.h"
-#include "utils.cuh"
+#include "legacy/api.cuh"
+#include "legacy/compiled.cuh"
+#include "legacy/utils.cuh"
 
 #ifndef DISABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>

@@ -18,7 +18,7 @@
 
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
 
-#include "deep_ep/deep_ep.hpp"
+#include "deep_ep/legacy/buffer.hpp"
 #include "primus_turbo/common.h"
 
 namespace primus_turbo::pytorch {

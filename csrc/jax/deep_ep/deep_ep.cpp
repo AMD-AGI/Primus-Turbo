@@ -8,7 +8,7 @@
  **************************************************************************************************/
 
 #include "primus_turbo/common.h"
-#include "primus_turbo/deep_ep/api.h"
+#include "kernels/deep_ep/legacy/api.cuh"
 #include <atomic>
 #include <barrier>
 #include <chrono>
