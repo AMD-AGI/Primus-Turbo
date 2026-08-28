@@ -21,6 +21,7 @@ from primus_turbo.pytorch.ops.attention.flex_attention_interface import flex_att
 from .flex_test_utils import (
     _doc_causal_block_mask,
     _doc_causal_dense_mask,
+    _doc_window_block_mask,
     _DummyBlockMask,
     _make_bhsd,
 )
@@ -243,12 +244,19 @@ def test_classify_document_beyond_probe_short_docs():
 
 def test_classify_document_beyond_probe_first_doc_longer_than_probe():
     # The first document covers the whole probe grid, so the corner looks exactly
-    # causal; only the far-position check plus the locator can tell it apart from a
-    # plain causal / large sliding window mask.
+    # causal; only the whole-sequence reconstruction plus the locator can tell it apart
+    # from a plain causal / large sliding window mask.
+    #
+    # The kind here is "document" rather than "document_causal": this branch now goes
+    # through the locator that recovers the within-document window too, and reports the
+    # causal flag and window it verified instead of assuming them. Both kinds dispatch
+    # identically (see flex_attention_interface, which accepts either).
     seg = [1024, 512, 512]
     bm = _doc_causal_block_mask(seg)
     cfg = _classify_block_mask(bm, B=1, H=1, q_len=2048, kv_len=2048)
-    assert cfg["kind"] == "document_causal"
+    assert cfg["kind"] in ("document", "document_causal")
+    assert cfg["causal"] is True
+    assert cfg["window_size"] == (-1, -1)
     assert cfg["doc_seglens"] == seg
 
 
@@ -566,3 +574,95 @@ def test_genuinely_full_mask_still_classifies_as_full_past_the_probe():
     block_mask = _DummyBlockMask(lambda b, h, q, kv: q >= 0)
     cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=2048, kv_len=2048)
     assert cfg["kind"] == "full"
+
+
+# ---- packed documents with a window inside each document, past the probe grid ----
+#
+# The probe grid is 512x512. Everything below uses S=2048 on purpose: these patterns are
+# indistinguishable from unpacked ones inside the corner, so a classifier that trusts the
+# corner gets them wrong *and says nothing*. Sequences at or under the probe are covered
+# by the tests above and cannot see this boundary.
+
+_SEG = [700, 800, 548]  # 2048 tokens, longest document 800 -- longer than every window
+_S = sum(_SEG)
+
+
+@pytest.mark.parametrize("window", [64, 128, 600])
+def test_classify_document_causal_window_past_probe(window):
+    block_mask = _doc_window_block_mask(_SEG, causal=True, left=window)
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=_S, kv_len=_S)
+    assert cfg["kind"] == "document"
+    assert cfg["causal"] is True
+    assert cfg["window_size"] == (window, 0)
+    assert cfg["doc_seglens"] == _SEG
+
+
+@pytest.mark.parametrize("left,right", [(96, 64), (64, 64), (200, 150)])
+def test_classify_document_bidirectional_window_past_probe(left, right):
+    block_mask = _doc_window_block_mask(_SEG, causal=False, left=left, right=right)
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=_S, kv_len=_S)
+    assert cfg["kind"] == "document"
+    assert cfg["causal"] is False
+    assert cfg["window_size"] == (left, right)
+    assert cfg["doc_seglens"] == _SEG
+
+
+@pytest.mark.parametrize("causal", [True, False])
+def test_classify_unwindowed_packing_past_probe_is_not_called_a_window(causal):
+    # Unbounded candidates are tried before windowed ones, so plain packing keeps
+    # window_size=(-1, -1) instead of being described by whatever edge a row happened
+    # to show.
+    block_mask = _doc_window_block_mask(_SEG, causal=causal)
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=_S, kv_len=_S)
+    assert cfg["kind"] in ("document", "document_causal")
+    assert cfg["causal"] is causal
+    assert cfg["window_size"] == (-1, -1)
+    assert cfg["doc_seglens"] == _SEG
+
+
+def test_classify_document_window_wider_than_every_document_is_unbounded():
+    # W=1024 exceeds the longest document (800), so the window never actually removes a
+    # position: the mask *is* plain packing. Reporting (-1, -1) is the exact answer, not
+    # a dropped parameter -- the kernel computes the identical mask either way.
+    block_mask = _doc_window_block_mask(_SEG, causal=True, left=1024)
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=_S, kv_len=_S)
+    assert cfg["window_size"] == (-1, -1)
+    assert cfg["doc_seglens"] == _SEG
+
+
+def test_document_causal_window_is_not_flattened_into_a_plain_sliding_window():
+    # The regression this whole block exists for. Inside the 512x512 corner this mask is
+    # byte-identical to a plain left-window causal mask with W=128, because the first
+    # document is 700 tokens long. Classifying it as one would drop every document
+    # boundary and let queries attend into the neighbouring document for the whole run.
+    block_mask = _doc_window_block_mask(_SEG, causal=True, left=128)
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=_S, kv_len=_S)
+    assert cfg["kind"] != "sliding_window_causal"
+    assert cfg["doc_seglens"] == _SEG
+
+
+def test_document_band_is_not_flattened_into_a_plain_band():
+    # Same trap on the bidirectional side: the corner is exactly the band -64 <= q-kv <= 96.
+    block_mask = _doc_window_block_mask(_SEG, causal=False, left=96, right=64)
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=_S, kv_len=_S)
+    assert cfg["kind"] != "sliding_window"
+    assert cfg["doc_seglens"] == _SEG
+
+
+def test_plain_sliding_window_past_probe_still_classifies_as_a_window():
+    # The guard above must not turn every long window into a document search.
+    block_mask = _DummyBlockMask(lambda b, h, q, kv: (q >= kv) & ((q - kv) <= 256))
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=_S, kv_len=_S)
+    assert cfg["kind"] == "sliding_window_causal"
+    assert cfg["window_size"] == (256, 0)
+
+
+def test_window_that_changes_past_the_probe_is_refused():
+    # Left-window causal W=64 in the corner, W=32 further along: not one window, not
+    # packing. Nothing here is expressible, so it must raise rather than pick a W.
+    def mask_mod(b, h, q_idx, kv_idx):
+        width = torch.where(q_idx < 1024, 64, 32)
+        return (q_idx >= kv_idx) & ((q_idx - kv_idx) <= width)
+
+    with pytest.raises(NotImplementedError):
+        _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=_S, kv_len=_S)

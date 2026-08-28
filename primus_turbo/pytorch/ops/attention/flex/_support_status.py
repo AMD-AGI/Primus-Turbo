@@ -56,10 +56,21 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # onto the same block-diagonal call and differ only in the two flags handed
         # down. Bidirectional packing is the shape diffusion / encoder training uses:
         # several samples concatenated into one sequence with no causal term at all.
-        # The within-document pattern is recovered from the fully-probed mask and
-        # required to reconstruct it exactly; on a truncated probe only the unwindowed
-        # shapes are recoverable (boundaries come from mask_mod, verified exactly).
+        # The within-document pattern is recovered from the mask and required to
+        # reconstruct it exactly. This is no longer capped at the probe grid: past it,
+        # boundaries come from mask_mod's diagonal/sub-diagonal, the window edges are
+        # read off two whole rows of the longest document, and every candidate is
+        # rebuilt and compared bit for bit (chunked, no sampling) up to
+        # _DOC_EXACT_VERIFY_LIMIT.
         "document_bidirectional_and_windowed": "same_cu_seqlens_with_causal_and_window_size_carried_into_varlen",
+        # The corollary, and the reason the above had to grow: inside the probe grid a
+        # packed-plus-windowed mask is *byte-identical* to a plain window whenever the
+        # first document outlives the probe. The window paths therefore no longer trust
+        # the corner -- they rebuild the window over the whole sequence and, if it does
+        # not hold, hand the mask to the document locator before refusing. Accepting
+        # the corner used to drop every document boundary silently (measured on MI355:
+        # 0.688 max abs error against the fp32 reference, vs 0.004 bf16 noise).
+        "packed_window_not_flattened_into_plain_window": "window_reverified_over_whole_sequence_then_document_locator",
         # A probe corner that is entirely visible no longer short-circuits to "full":
         # bidirectional packing whose first document exceeds the probe, and bands wider
         # than the probe, look identical there. Fullness is re-verified against mask_mod
@@ -69,8 +80,16 @@ SUPPORT_STATUS: Dict[str, Any] = {
     },
     # Classification (block_mask probe) and score_mod (ALiBi/soft-cap) detection are
     # memoised by object identity (weakref) so reusing the same block_mask / score_mod
-    # across layers & steps skips the ~1-3 ms per-call probe. Pure speedup; identical
-    # results. clear_classification_cache() resets it (tests / cold-cache benchmarks).
+    # across layers & steps skips the cold probe. Pure speedup; identical results.
+    # That probe is not the "~1-3 ms" this comment used to claim: measured on MI355
+    # (gfx950) it is 0.6-1.8 ms for causal and sliding-window shapes but 4.6 ms at
+    # S=1024 rising to 19.2 ms at S=8192 for document packing, whose recognition
+    # verifies the reconstruction exactly over the whole sequence. At S=8192 that is
+    # ~10x the attention kernel it precedes. A warm hit is ~0.3 us.
+    # NOTE: the cache is keyed by object *identity*. Rebuilding block_mask every step
+    # (natural for THD, whose boundaries change every step) never hits it and pays the
+    # cold cost every step, host-side and in front of the kernel.
+    # clear_classification_cache() resets it (tests / cold-cache benchmarks).
     "classification_cache": "memoised_by_block_mask_and_score_mod_object_identity_weakref",
     # Turbo-extension explicit args (superset of the torch signature; both default
     # None so a torch-style call is unchanged and remains a drop-in replacement).
@@ -129,11 +148,16 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # deterministic and sink are never on together (no deterministic dQ accumulation
         # in the sink backward). Caught here so the error names the real culprit.
         "deterministic_with_sink_on_dense_route": "backend_asserts_no_deterministic_dq_accumulation_for_sink",
-        # Packing + sink: the aiter varlen kernels have no sink parameter, and the only
-        # varlen backend that carries one (FlyDSL) requires equal segment lengths. Ragged
-        # documents with a sink therefore raise at the flex layer, naming the constraint,
-        # rather than reaching a "no compatible backend" error deeper down.
-        "sink_with_ragged_document_packing": "aiter_varlen_has_no_sink_and_flydsl_needs_uniform_seglens",
+        # Packing + sink: this is a *wrapper* gap, not a kernel gap, and the difference
+        # matters to whoever goes to close it. On this build aiter's varlen kernels DO
+        # carry a sink on both sides (_flash_attn_varlen_forward has sink_size/sink_ptr,
+        # _flash_attn_varlen_backward has sink/d_sink); what lacks it is Primus-Turbo's
+        # own flash_attn_varlen_func wrapper, which never exposes the parameter. The
+        # other varlen backend that carries one (FlyDSL) requires equal segment lengths.
+        # So ragged documents with a sink raise at the flex layer, naming the constraint,
+        # rather than reaching a "no compatible backend" error deeper down -- and the fix
+        # is to forward sink through the Turbo wrapper, not to write a kernel.
+        "sink_with_ragged_document_packing": "turbo_varlen_wrapper_does_not_forward_aiters_sink_and_flydsl_needs_uniform_seglens",
     },
     # Explicit variable-length / document-packing entry point (THD layout). A
     # superset-free thin wrapper around ``flash_attn_varlen_func``: the caller

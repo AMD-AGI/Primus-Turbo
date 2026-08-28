@@ -912,8 +912,11 @@ def flex_attention_varlen(
     # ``sink`` is threaded only when the caller supplies one, and only after
     # ``require_varlen_sink_support`` confirms this build's ``flash_attn_varlen_func``
     # has somewhere to put it (a ``sink=None`` default is a no-op either way).
-    # ``bias`` is not exposed by this varlen entry, so it is left to the backend
-    # default rather than passed.
+    # ``bias`` is deliberately not passed, and the reason is not "the varlen entry has
+    # no such parameter" -- it does. aiter's _flash_attn_varlen_forward takes ``bias``
+    # while _flash_attn_varlen_backward has none, which is the same fwd-only shape as
+    # logits_soft_cap: wiring it up would give a correct forward and a silently wrong
+    # gradient. Left at the backend default until the backward exists.
     call_kwargs: Dict[str, Any] = dict(
         dropout_p=dropout_p,
         softmax_scale=scale,

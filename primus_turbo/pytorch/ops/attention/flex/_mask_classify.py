@@ -14,7 +14,7 @@ document-causal templates, and verify the match exactly before accepting it.
 Anything that does not match exactly is rejected rather than approximated.
 """
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -91,39 +91,17 @@ def _detect_document_causal_segments(
     return seg_lens
 
 
-def _locate_document_segments(
-    mask_mod: Callable, *, q_len: int, kv_len: int, causal: bool = True
-) -> Optional[list]:
-    """Recover document lengths for a packed mask whose sequence exceeds the probe grid.
+def _recover_document_boundaries(mask_mod: Callable, n: int) -> Optional[Tuple[List[int], torch.Tensor]]:
+    """Read packed-document boundaries off the diagonal and sub-diagonal of ``mask_mod``.
 
-    :func:`_detect_document_causal_segments` only looks at the already-probed
-    ``<= _MASK_PROBE_LIMIT`` corner, so packed sequences longer than that used to raise
-    ``NotImplementedError`` even though the pattern is perfectly expressible. This
-    variant works directly on ``mask_mod`` over the *full* sequence:
+    Two vectorised probes, ``O(S)`` elements, ``O(1)`` python-level ``mask_mod`` calls.
+    Token ``i`` starts a new document iff it may not attend token ``i-1``, and the
+    diagonal must be fully visible. That reading is only a *hypothesis*: nothing here is
+    safe until :func:`_verify_packed_pattern` rebuilds the whole mask from it and
+    compares bit for bit.
 
-    ``causal`` selects which packed pattern to verify against: ``same_doc(q,kv) & (q>=kv)``
-    (autoregressive packing) or plain ``same_doc(q,kv)`` (bidirectional packing, i.e. what
-    diffusion / encoder models pack). Both lower onto the same block-diagonal
-    ``cu_seqlens``; only the ``causal`` flag handed to the varlen kernel differs.
-
-    1. Read the diagonal and the sub-diagonal with two vectorised calls (O(S) elements,
-       O(1) python-level mask_mod invocations). Token ``i`` starts a new document iff it
-       may not attend token ``i-1``; the diagonal must be fully visible.
-    2. **Verify exactly, never by sampling**: reconstruct ``same_doc(q,kv) & (q>=kv)``
-       and compare it row-block by row-block against the real mask (one vectorised call
-       per ``_DOC_VERIFY_CHUNK`` rows, so peak memory stays at a few MB instead of
-       ``S^2``). Any deviation returns ``None`` and the caller raises, exactly as before.
-
-    Guarded by ``_DOC_EXACT_VERIFY_LIMIT``: beyond it the full comparison would cost
-    ``O(S^2)``, so we decline rather than downgrade to sampled verification -- an
-    unverifiable mask must never be routed.
+    Returns ``(seg_lens, doc_id)``, or ``None`` if the shape is not packing at all.
     """
-    if q_len != kv_len:
-        return None
-    n = q_len
-    if n <= 1 or n > _DOC_EXACT_VERIFY_LIMIT:
-        return None
-
     idx = torch.arange(n)
     if not bool(_probe_mask_pairs(mask_mod, idx, idx).all().item()):
         return None  # a hole on the diagonal: not document packing
@@ -147,7 +125,29 @@ def _locate_document_segments(
     for d, s in enumerate(seg_lens):
         doc_id[pos : pos + s] = d
         pos += s
+    return seg_lens, doc_id
 
+
+def _verify_packed_pattern(
+    mask_mod: Callable,
+    *,
+    n: int,
+    doc_id: torch.Tensor,
+    causal: bool,
+    window: Tuple[int, int] = (-1, -1),
+) -> bool:
+    """Compare ``mask_mod`` against a reconstructed packed pattern, exactly.
+
+    The reconstruction is ``same_doc`` intersected with the causal half-plane and/or the
+    ``(left, right)`` diagonal band -- i.e. precisely what ``flash_attn_varlen_func``
+    computes from ``cu_seqlens`` + ``causal`` + ``window_size``, so a match means the
+    kernel reproduces the mask rather than approximates it.
+
+    Compared row-block by row-block (one vectorised call per ``_DOC_VERIFY_CHUNK`` rows)
+    so peak memory stays at a few MB instead of ``S^2``. Never samples: a single
+    differing bit returns ``False`` and the caller refuses to route.
+    """
+    left, right = window
     kv_idx = torch.arange(n).view(1, n)
     for lo in range(0, n, _DOC_VERIFY_CHUNK):
         hi = min(n, lo + _DOC_VERIFY_CHUNK)
@@ -160,11 +160,129 @@ def _locate_document_segments(
                 block = block.broadcast_to((hi - lo, n))
         except Exception:
             block = torch.stack([_probe_mask_row(mask_mod, int(q), n) for q in q_rows])
+        delta = q_idx - kv_idx
         expected = doc_id[q_rows].view(-1, 1) == doc_id.view(1, n)
         if causal:
-            expected = expected & (q_idx >= kv_idx)
+            expected = expected & (delta >= 0)
+        if left >= 0:
+            expected = expected & (delta <= left)
+        if right >= 0:
+            expected = expected & (delta >= -right)
         if not torch.equal(block, expected):
-            return None
+            return False
+    return True
+
+
+def _document_window_candidates(mask_mod: Callable, *, n: int, seg_lens: List[int]) -> List[Tuple[int, int]]:
+    """Guess within-document window edges from two whole rows of the longest document.
+
+    Once a packed sequence outgrows the probe grid the window edge cannot be read off
+    the probed corner -- but it can be read off a full row, and guessing is harmless
+    here because :func:`_verify_packed_pattern` rebuilds the entire mask from the guess
+    before anything is routed.
+
+    Two rows, because one is not enough for both shapes: the *middle* token of the
+    longest document is the only place a bidirectional band shows both of its edges (the
+    last token always reports ``right=0``), while the *last* token is where a causal
+    window has the most room to reach its full extent (the middle token reports
+    ``min(W, offset_into_document)``). A document shorter than the window clips the
+    reading either way; the clipped candidate then fails to verify and we refuse, rather
+    than route a half-sized window and silently drop the rest of the context.
+    """
+    longest = max(range(len(seg_lens)), key=lambda i: seg_lens[i])
+    start = sum(seg_lens[:longest])
+    end = start + seg_lens[longest]
+    out: List[Tuple[int, int]] = []
+    for q_star in dict.fromkeys((start + (end - start) // 2, end - 1)):
+        row = _probe_mask_row(mask_mod, int(q_star), n)
+        visible = row.nonzero().flatten()
+        if visible.numel() == 0:
+            continue
+        left = q_star - int(visible.min().item())
+        right = int(visible.max().item()) - q_star
+        if left < 0 or right < 0:
+            continue
+        if (left, right) not in out:
+            out.append((left, right))
+    return out
+
+
+def _locate_document_blocks(
+    mask_mod: Callable, *, q_len: int, kv_len: int, causal_hint: bool = True
+) -> Optional[Dict[str, Any]]:
+    """Recover packing *and* the within-document window for a sequence past the probe.
+
+    :func:`_detect_document_blocks` recovers both, but only from a *fully* probed mask,
+    so it gives up as soon as ``S > _MASK_PROBE_LIMIT``. Until now the truncated-probe
+    fallback could only recover unwindowed packing and hardcoded ``window_size=(-1, -1)``
+    -- so a long packed sequence with a local window inside each document was reported as
+    an "arbitrary" mask and refused, even though ``flash_attn_varlen_func`` expresses it
+    exactly (``cu_seqlens`` + ``causal`` + ``window_size``, applied per segment).
+
+    Boundaries come from :func:`_recover_document_boundaries`, window edges from
+    :func:`_document_window_candidates`, and every combination is then checked by exact
+    chunked reconstruction. Unbounded candidates are tried before windowed ones so a
+    plain packed mask is never described as a window, and ``causal_hint`` only decides
+    which of the two half-plane variants is tried first -- never which one is accepted.
+
+    Returns ``{"seglens", "causal", "window_size"}`` or ``None``.
+    """
+    if q_len != kv_len:
+        return None
+    n = q_len
+    # Beyond this the full comparison costs O(S^2), so we decline rather than downgrade
+    # to sampled verification -- an unverifiable mask must never be routed.
+    if n <= 1 or n > _DOC_EXACT_VERIFY_LIMIT:
+        return None
+
+    found = _recover_document_boundaries(mask_mod, n)
+    if found is None:
+        return None
+    seg_lens, doc_id = found
+
+    candidates: List[Tuple[bool, Tuple[int, int]]] = [(causal_hint, (-1, -1)), (not causal_hint, (-1, -1))]
+    for left, right in _document_window_candidates(mask_mod, n=n, seg_lens=seg_lens):
+        for causal in (causal_hint, not causal_hint):
+            # A causal window is one-sided by construction: the right edge is the
+            # diagonal, so pass (left, 0) and let the kernel's causal flag own the rest.
+            window = (left, 0) if causal else (left, right)
+            if (causal, window) not in candidates:
+                candidates.append((causal, window))
+
+    for causal, window in candidates:
+        if _verify_packed_pattern(mask_mod, n=n, doc_id=doc_id, causal=causal, window=window):
+            return {"seglens": seg_lens, "causal": causal, "window_size": window}
+    return None
+
+
+def _locate_document_segments(
+    mask_mod: Callable, *, q_len: int, kv_len: int, causal: bool = True
+) -> Optional[list]:
+    """Recover document lengths for an *unwindowed* packed mask that exceeds the probe.
+
+    The narrow special case of :func:`_locate_document_blocks`, kept separate because
+    three callers want exactly one question answered -- "is this plain packing, with the
+    half-plane I already believe in?" -- and must not be handed a window they are not
+    prepared to forward. ``causal`` selects which pattern to verify against:
+    ``same_doc(q,kv) & (q>=kv)`` (autoregressive packing) or plain ``same_doc(q,kv)``
+    (bidirectional packing, i.e. what diffusion / encoder models pack). Both lower onto
+    the same block-diagonal ``cu_seqlens``; only the ``causal`` flag handed to the varlen
+    kernel differs.
+
+    Recognition is by exact reconstruction over the full sequence, never by sampling;
+    anything that deviates returns ``None`` and the caller raises.
+    """
+    if q_len != kv_len:
+        return None
+    n = q_len
+    if n <= 1 or n > _DOC_EXACT_VERIFY_LIMIT:
+        return None
+    found = _recover_document_boundaries(mask_mod, n)
+    if found is None:
+        return None
+    seg_lens, doc_id = found
+    if not _verify_packed_pattern(mask_mod, n=n, doc_id=doc_id, causal=causal):
+        return None
     return seg_lens
 
 
@@ -334,8 +452,12 @@ def _classify_band_mask(
       and compared for exact equality*; any hole, block structure, or asymmetry fails.
     * When the probe did not cover the whole sequence, an edge is only accepted if it
       sits strictly inside the probed grid (so it was actually observed, not clipped)
-      **and** ``mask_mod`` confirms the same edge at a far query position -- a band that
-      is not translation invariant cannot be expressed as one ``window_size``.
+      **and** the band is rebuilt from ``mask_mod`` over the whole sequence and compared
+      bit for bit (four far-position point probes only where that is unaffordable:
+      cross attention, or ``S > _DOC_EXACT_VERIFY_LIMIT``). A band that is not
+      translation invariant cannot be expressed as one ``window_size``, and a corner
+      that merely *looks* like a band -- bidirectionally packed documents with a window
+      inside each -- is handed to the document path instead of being flattened.
     """
     visible_delta = delta[mask]
     if visible_delta.numel() == 0:
@@ -368,22 +490,53 @@ def _classify_band_mask(
                 "the window explicitly via create_block_mask on a shorter probe, or use the "
                 "codegen path."
             )
-        far_q = q_len - 1
-        checks = []
-        if far_q - left >= 0:
-            checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q - left), True))
-        if far_q - left - 1 >= 0:
-            checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q - left - 1), False))
-        if far_q + right < kv_len:
-            checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q + right), True))
-        if far_q + right + 1 < kv_len:
-            checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q + right + 1), False))
-        if any(bool(got) is not want for got, want in checks):
-            raise NotImplementedError(
-                "Turbo flex compat layer does not support this block_mask: the band around the "
-                "diagonal is not translation-invariant over long sequences, so a single "
-                "window_size cannot be determined."
-            )
+        if q_len == kv_len and q_len <= _DOC_EXACT_VERIFY_LIMIT:
+            # Affordable: rebuild the band over the whole sequence and compare bit for
+            # bit. The corner alone is not evidence -- *bidirectionally packed documents
+            # with a window inside each document* reproduce it exactly whenever the
+            # first document outlives the probe, and calling that a plain band would
+            # drop every document boundary and let queries attend across samples for
+            # the entire run, silently. One document spanning everything is exactly
+            # "not packed", so the same verifier answers both questions.
+            single_doc = torch.zeros(q_len, dtype=torch.int64)
+            if not _verify_packed_pattern(
+                mask_mod, n=q_len, doc_id=single_doc, causal=False, window=(left, right)
+            ):
+                blocks = _locate_document_blocks(mask_mod, q_len=q_len, kv_len=kv_len, causal_hint=False)
+                if blocks is not None:
+                    return {
+                        "kind": "document",
+                        "causal": blocks["causal"],
+                        "window_size": blocks["window_size"],
+                        "doc_seglens": blocks["seglens"],
+                    }
+                raise NotImplementedError(
+                    f"Turbo flex compat layer does not support this block_mask: the probed "
+                    f"{q_probe}x{kv_probe} corner is exactly the band -{right} <= q-kv <= {left}, "
+                    f"but that reconstruction does not hold over the whole {q_len}x{kv_len} "
+                    "sequence, and the deviation is not document packing either. Refusing rather "
+                    "than running the corner's band everywhere."
+                )
+        else:
+            # Cross attention, or too long to rebuild. Four point probes at the far end
+            # are all we can afford; they catch a band that is not translation
+            # invariant, and nothing finer.
+            far_q = q_len - 1
+            checks = []
+            if far_q - left >= 0:
+                checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q - left), True))
+            if far_q - left - 1 >= 0:
+                checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q - left - 1), False))
+            if far_q + right < kv_len:
+                checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q + right), True))
+            if far_q + right + 1 < kv_len:
+                checks.append((_call_mask_mod(mask_mod, 0, 0, far_q, far_q + right + 1), False))
+            if any(bool(got) is not want for got, want in checks):
+                raise NotImplementedError(
+                    "Turbo flex compat layer does not support this block_mask: the band around the "
+                    "diagonal is not translation-invariant over long sequences, so a single "
+                    "window_size cannot be determined."
+                )
 
     return {
         "kind": "sliding_window",
@@ -408,17 +561,15 @@ def _classify_document_mask(
     backend exactly like ``document_causal``, but carrying the recovered ``causal`` flag
     and within-document ``window_size``) or ``None``.
 
-    On a truncated probe only the *unwindowed* pattern is recoverable, because the
-    boundaries then come from ``mask_mod`` over the full sequence and are verified
-    against ``same_doc [& causal]``; ``causal_hint`` says which of the two to verify.
-    A window whose edge lies past the probe would be unverifiable there, so it is not
-    guessed at.
+    A truncated probe is not a downgrade: the boundaries, the half-plane *and* the
+    within-document window are then recovered from ``mask_mod`` over the full sequence by
+    :func:`_locate_document_blocks` and verified by exact chunked reconstruction, so a
+    long packed sequence with a local window inside each document is recognised rather
+    than refused. ``causal_hint`` only sets the order candidates are tried in.
     """
     blocks = _detect_document_blocks(mask, q_len=q_len, kv_len=kv_len, q_probe=q_probe, kv_probe=kv_probe)
     if blocks is None and (q_len > q_probe or kv_len > kv_probe) and mask_mod is not None:
-        seglens = _locate_document_segments(mask_mod, q_len=q_len, kv_len=kv_len, causal=causal_hint)
-        if seglens is not None:
-            blocks = {"seglens": seglens, "causal": causal_hint, "window_size": (-1, -1)}
+        blocks = _locate_document_blocks(mask_mod, q_len=q_len, kv_len=kv_len, causal_hint=causal_hint)
     if blocks is None:
         return None
     return {
@@ -478,13 +629,13 @@ def _classify_probed_mask(
         # probe, looks exactly like this. Answering "full" here would silently run dense
         # attention for a config that asked for something else, so confirm against
         # mask_mod over the whole sequence before believing the corner.
-        seglens = _locate_document_segments(mask_mod, q_len=q_len, kv_len=kv_len, causal=False)
-        if seglens is not None:
+        blocks = _locate_document_blocks(mask_mod, q_len=q_len, kv_len=kv_len, causal_hint=False)
+        if blocks is not None:
             return {
                 "kind": "document",
-                "causal": False,
-                "window_size": (-1, -1),
-                "doc_seglens": seglens,
+                "causal": blocks["causal"],
+                "window_size": blocks["window_size"],
+                "doc_seglens": blocks["seglens"],
             }
         if _verify_full_mask(mask_mod, q_len=q_len, kv_len=kv_len):
             return {"kind": "full", "causal": False, "window_size": (-1, -1)}
@@ -569,17 +720,20 @@ def _classify_probed_mask(
                         "causal": True,
                         "window_size": (window, 0),
                     }
-                # Not a window: the other pattern that looks causal in the corner yet
-                # hides the far-left position is document packing whose first document
-                # is longer than the probe grid. Recovered (and exactly verified) from
-                # mask_mod over the full sequence.
-                doc_seglens = _locate_document_segments(mask_mod, q_len=q_len, kv_len=kv_len)
-                if doc_seglens is not None:
+                # Not a plain window: the other patterns that look causal in the corner
+                # yet hide the far-left position are document packing whose first
+                # document is longer than the probe grid, and document packing that also
+                # carries a window inside each document -- for the latter the binary
+                # search above reads the *document* edge, not the window edge, which is
+                # why it could not confirm. Both are recovered (and exactly verified)
+                # from mask_mod over the full sequence.
+                blocks = _locate_document_blocks(mask_mod, q_len=q_len, kv_len=kv_len, causal_hint=True)
+                if blocks is not None:
                     return {
-                        "kind": "document_causal",
-                        "causal": True,
-                        "window_size": (-1, -1),
-                        "doc_seglens": doc_seglens,
+                        "kind": "document",
+                        "causal": blocks["causal"],
+                        "window_size": blocks["window_size"],
+                        "doc_seglens": blocks["seglens"],
                     }
                 raise NotImplementedError(
                     "Turbo flex compat layer detected a probable sliding window but could not confirm "
@@ -623,10 +777,14 @@ def _classify_probed_mask(
         if doc is not None:
             return doc
         raise NotImplementedError(
-            "Turbo flex compat layer does not support this block_mask: the pattern is not standard "
-            "left-window causal (q>=kv) & (q-kv<=W), nor document packing (with or without a "
-            "within-document window); it is an arbitrary/data-dependent mask and requires the "
-            "codegen path."
+            f"Turbo flex compat layer does not support this block_mask: over the probed "
+            f"{q_probe}x{kv_probe} corner of a {q_len}x{kv_len} mask the pattern reproduced neither "
+            "standard left-window causal (q>=kv) & (q-kv<=W) nor document packing (with or without "
+            "a within-document window), and every candidate was checked by exact reconstruction. "
+            "Either it is genuinely arbitrary / data-dependent -- which needs the codegen path -- or "
+            "it is a regular pattern whose defining edge lies past the verification limit "
+            f"({_DOC_EXACT_VERIFY_LIMIT}), in which case it is expressible but not confirmable here. "
+            "Refusing either way: routing an unverified mask would silently train a different model."
         )
 
     if inferred_w >= q_probe - 1 and truncated:
@@ -635,18 +793,47 @@ def _classify_probed_mask(
             "the probe limit; the window size could not be verified."
         )
 
-    # Confirm the window is translation invariant at a far query position too,
-    # so we do not accept a corner-only coincidence on long sequences.
-    if truncated and mask_mod is not None and inferred_w + 1 <= q_len - 1:
-        far_q = q_len - 1
-        inside = _call_mask_mod(mask_mod, 0, 0, far_q, far_q - inferred_w)
-        outside = _call_mask_mod(mask_mod, 0, 0, far_q, far_q - inferred_w - 1)
-        if not (inside and not outside):
-            raise NotImplementedError(
-                "Turbo flex compat layer does not support this block_mask: the window is not "
-                "translation-invariant over long sequences, so a single window size cannot be "
-                "determined."
-            )
+    # The probed corner matched a sliding window -- but on a truncated probe the corner
+    # is not evidence about the rest of the sequence. Document packing with a window
+    # inside each document reproduces the corner *exactly* whenever the first document
+    # outlives the probe, and accepting it as a plain window would drop every document
+    # boundary: queries would attend across documents for the whole run, silently.
+    if truncated and mask_mod is not None:
+        if q_len == kv_len and q_len <= _DOC_EXACT_VERIFY_LIMIT:
+            # Affordable: rebuild (q>=kv)&(q-kv<=W) over the whole sequence and compare
+            # bit for bit. One document spanning everything is exactly "not packed".
+            single_doc = torch.zeros(q_len, dtype=torch.int64)
+            if not _verify_packed_pattern(
+                mask_mod, n=q_len, doc_id=single_doc, causal=True, window=(inferred_w, 0)
+            ):
+                blocks = _locate_document_blocks(mask_mod, q_len=q_len, kv_len=kv_len, causal_hint=True)
+                if blocks is not None:
+                    return {
+                        "kind": "document",
+                        "causal": blocks["causal"],
+                        "window_size": blocks["window_size"],
+                        "doc_seglens": blocks["seglens"],
+                    }
+                raise NotImplementedError(
+                    f"Turbo flex compat layer does not support this block_mask: the probed "
+                    f"{q_probe}x{kv_probe} corner is exactly a left-window causal mask with "
+                    f"W={inferred_w}, but that reconstruction does not hold over the whole "
+                    f"{q_len}x{kv_len} sequence, and the deviation is not document packing "
+                    "either. Refusing rather than running the corner's window everywhere."
+                )
+        elif inferred_w + 1 <= q_len - 1:
+            # q_len != kv_len (cross attention), or too long to rebuild. Two point
+            # probes at the far end are all we can afford; they catch a window that is
+            # not translation invariant, and nothing finer.
+            far_q = q_len - 1
+            inside = _call_mask_mod(mask_mod, 0, 0, far_q, far_q - inferred_w)
+            outside = _call_mask_mod(mask_mod, 0, 0, far_q, far_q - inferred_w - 1)
+            if not (inside and not outside):
+                raise NotImplementedError(
+                    "Turbo flex compat layer does not support this block_mask: the window is not "
+                    "translation-invariant over long sequences, so a single window size cannot be "
+                    "determined."
+                )
 
     return {"kind": "sliding_window_causal", "causal": True, "window_size": (inferred_w, 0)}
 

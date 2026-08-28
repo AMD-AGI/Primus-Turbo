@@ -83,3 +83,26 @@ def _make_bhsd(B, H, S, D, dtype=torch.float16):
 
 def _make_bshd(B=2, S=32, H=4, D=16, dtype=torch.float16):
     return torch.randn(B, S, H, D, dtype=dtype)
+
+
+def _doc_window_block_mask(seg_lens, *, causal=True, left=-1, right=-1):
+    """Packed documents with an optional window *inside* each document.
+
+    ``flash_attn_varlen_func`` applies ``causal`` and ``window_size`` per segment, so
+    this whole family lowers onto one ``cu_seqlens`` call with no approximation. Edges
+    of ``-1`` mean unbounded, matching the kernel's own convention.
+    """
+    document_id = torch.cat([torch.full((s,), i, dtype=torch.int64) for i, s in enumerate(seg_lens)])
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        out = document_id[q_idx] == document_id[kv_idx]
+        delta = q_idx - kv_idx
+        if causal:
+            out = out & (delta >= 0)
+        if left >= 0:
+            out = out & (delta <= left)
+        if right >= 0:
+            out = out & (delta >= -right)
+        return out
+
+    return _DummyBlockMask(mask_mod)
