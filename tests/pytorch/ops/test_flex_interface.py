@@ -492,8 +492,10 @@ def test_flex_causal_document_with_window(capture_varlen_backend):
 
 
 def test_flex_document_sink_with_ragged_lengths_raises(capture_varlen_backend):
-    # Only the FlyDSL varlen backend carries a sink, and it needs uniform segments; the
-    # aiter varlen kernels have no sink parameter at all. Say so instead of dropping it.
+    # On a build whose varlen entry *does* take a sink (which is what
+    # ``capture_varlen_backend`` models, since its fake absorbs **kwargs), ragged
+    # segments are still unsupported: the FlyDSL varlen backend is the one carrying a
+    # sink and it needs uniform lengths. Say so instead of dropping the sink.
     seg = [128, 256]
     total, H, D = 384, 8, 128
     q = _make_bhsd(1, H, total, D)
@@ -1163,3 +1165,97 @@ def test_causal_left_window_with_sink_is_still_allowed(capture_backend):
     flex_attention(q, k, v, block_mask=block_mask, sink=torch.zeros(4))
     assert capture_backend["kwargs"]["causal"] is True
     assert capture_backend["kwargs"]["window_size"] == (4, 0)
+
+
+def _varlen_backend_without_sink(monkeypatch):
+    """Install a varlen entry whose signature has no ``sink``, and count calls.
+
+    ``capture_varlen_backend`` cannot express this: its fake absorbs ``**kwargs``, so
+    the signature probe reports every parameter as supported and a sink sails straight
+    through. That fixture is why the tests below did not exist until a real gfx950 run
+    produced a bare ``TypeError: flash_attn_varlen_func() got an unexpected keyword
+    argument 'sink'`` -- from the document-packing route, which reaches the varlen entry
+    without passing the public ``flex_attention_varlen`` gate.
+    """
+    seen = {"calls": 0}
+
+    def fake(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
+        # No ``sink`` here and none in **kwargs's contract: mirror the real wrapper by
+        # refusing it the way the binding would.
+        seen["calls"] += 1
+        assert "sink" not in kwargs, "the gate let a sink through to a backend without one"
+        return q.clone()
+
+    # Strip **kwargs from what the probe sees: the production wrapper spells its
+    # parameters out, so the probe must find a finite list without ``sink``.
+    def probed(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        *,
+        causal=False,
+        window_size=(-1, -1),
+        dropout_p=0.0,
+        softmax_scale=None,
+        alibi_slopes=None,
+        deterministic=False,
+        return_lse=False,
+    ):
+        return fake(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            window_size=window_size,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=return_lse,
+        )
+
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.ops.attention.flash_attn_interface.flash_attn_varlen_func",
+        probed,
+        raising=True,
+    )
+    return seen
+
+
+@pytest.mark.parametrize("seg", [[128, 128], [128, 256]], ids=["uniform", "ragged"])
+def test_flex_document_sink_raises_when_the_varlen_entry_has_no_sink(monkeypatch, seg):
+    # The equal-length case is the one that escaped: it clears the ragged-length gate
+    # and lands on the packed dispatch, which used to attach ``sink`` unconditionally.
+    seen = _varlen_backend_without_sink(monkeypatch)
+    H, D = 8, 128
+    q = _make_bhsd(1, H, sum(seg), D)
+    sink = torch.zeros(H, dtype=torch.float32)
+    with pytest.raises(NotImplementedError) as exc:
+        flex_attention(q, q.clone(), q.clone(), block_mask=_doc_causal_block_mask(seg), sink=sink)
+    msg = str(exc.value)
+    assert "flash_attn_varlen_func" in msg
+    assert "flex_attention_bshd" in msg
+    # Capability is diagnosed before raggedness: on a build with no sink parameter at
+    # all, padding the documents to a common length would not help, so telling the
+    # caller to do that would send them off on a pointless change.
+    assert "equal document lengths" not in msg
+    assert seen["calls"] == 0
+
+
+def test_flex_document_packing_without_a_sink_still_runs_on_an_older_varlen_entry(monkeypatch):
+    # The gate must be conditional on the caller actually asking for a sink; packing
+    # itself has to keep working against a wrapper that predates the parameter.
+    seen = _varlen_backend_without_sink(monkeypatch)
+    H, D = 8, 128
+    q = _make_bhsd(1, H, 256, D)
+    out = flex_attention(q, q.clone(), q.clone(), block_mask=_doc_causal_block_mask([128, 128]))
+    assert out.shape == (1, H, 256, D)
+    assert seen["calls"] == 1

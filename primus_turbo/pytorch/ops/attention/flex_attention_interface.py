@@ -104,10 +104,10 @@ except Exception:  # pragma: no cover - depends on torch version
     _torch_create_block_mask = None
 
 from .flex._config import _ALIBI_TOL
-from .flex._dispatch import _dispatch_document_varlen
+from .flex._dispatch import _dispatch_document_varlen, require_varlen_sink_support
 from .flex._layout import from_backend_layout, to_backend_layout
 from .flex._mask_classify import _classify_block_mask
-from .flex._routing import _backend_accepts, _dispatch_custom, choose_backend
+from .flex._routing import _dispatch_custom, choose_backend
 from .flex._score_mod import _cached_detect_alibi_slopes, _cached_detect_softcap, _is_identity_score_mod
 from .flex._support_status import SUPPORT_STATUS
 from .flex._validate import (
@@ -571,19 +571,31 @@ def flex_attention(
                 "return_lse (packed LSE does not align with the dense [B,H,S] layout); if you need "
                 "LSE, use the explicit flex_attention_varlen entry point."
             )
-        if has_sink and len(set(mask_cfg["doc_seglens"])) != 1:
-            # The varlen entry only carries a sink on the FlyDSL backend, which requires
-            # uniform segment lengths; with ragged documents the dispatcher finds no
-            # eligible backend and raises a generic "No compatible backend found" from
-            # deep inside kernel selection. The aiter varlen kernels take no sink at all
-            # (VarlenAttnFwdAiterBackend.can_handle returns False for one, which is what
-            # keeps it from being silently dropped). Say so here instead.
-            raise NotImplementedError(
-                "Turbo flex compat layer: a sink combined with document packing requires equal "
-                f"document lengths (only the FlyDSL varlen backend carries a sink), got "
-                f"{sorted(set(mask_cfg['doc_seglens']))}. The aiter varlen kernels have no sink "
-                "parameter. Drop the sink, or pad the documents to a common length."
+        if has_sink:
+            # Order matters. First: can this build's varlen wrapper carry a sink at all?
+            # If not, no arrangement of the documents helps, and blaming their lengths
+            # would send the caller off padding them for nothing. Checked here as well as
+            # at the attach point so the diagnosis stays attached to the block_mask the
+            # caller actually passed.
+            from primus_turbo.pytorch.ops.attention.flash_attn_interface import (
+                flash_attn_varlen_func,
             )
+
+            require_varlen_sink_support(flash_attn_varlen_func)
+            if len(set(mask_cfg["doc_seglens"])) != 1:
+                # Only then: on a build that does forward a sink, ragged segments still
+                # have no eligible backend -- the FlyDSL varlen backend is the one that
+                # carries a sink and it requires uniform lengths, while the aiter varlen
+                # path declines (VarlenAttnFwdAiterBackend.can_handle returns False,
+                # which is what keeps the sink from being silently dropped). Without this
+                # the caller gets a generic "No compatible backend found" from deep
+                # inside kernel selection.
+                raise NotImplementedError(
+                    "Turbo flex compat layer: a sink combined with document packing requires "
+                    "equal document lengths (only the FlyDSL varlen backend carries a sink), "
+                    f"got {sorted(set(mask_cfg['doc_seglens']))}. Drop the sink, or pad the "
+                    "documents to a common length."
+                )
         return _dispatch_document_varlen(
             query,
             key,
@@ -897,11 +909,11 @@ def flex_attention_varlen(
     # not force the heavy backend kernels to load.
     from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_varlen_func
 
-    # ``sink`` is a newer varlen-backend feature: only thread it through when the
-    # caller actually supplies one, so this entry stays compatible with backend
-    # builds whose ``flash_attn_varlen_func`` predates the ``sink`` parameter (a
-    # ``sink=None`` default is a no-op either way). ``bias`` is not exposed by this
-    # varlen entry, so it is left to the backend default rather than passed.
+    # ``sink`` is threaded only when the caller supplies one, and only after
+    # ``require_varlen_sink_support`` confirms this build's ``flash_attn_varlen_func``
+    # has somewhere to put it (a ``sink=None`` default is a no-op either way).
+    # ``bias`` is not exposed by this varlen entry, so it is left to the backend
+    # default rather than passed.
     call_kwargs: Dict[str, Any] = dict(
         dropout_p=dropout_p,
         softmax_scale=scale,
@@ -912,16 +924,7 @@ def flex_attention_varlen(
         return_lse=return_lse,
     )
     if effective_sink is not None:
-        if not _backend_accepts(flash_attn_varlen_func, "sink"):
-            raise NotImplementedError(
-                "Turbo flex varlen entry: an attention sink was supplied, but this "
-                "Primus-Turbo build's flash_attn_varlen_func has no 'sink' parameter, so the "
-                "sink logits cannot reach the packed kernel. Dropping them would change the "
-                "softmax denominator for every query in the batch and silently produce "
-                "different numbers, so this raises instead. Use the dense entries "
-                "(flex_attention / flex_attention_bshd), whose backend does take a sink, or "
-                "upgrade Primus-Turbo."
-            )
+        require_varlen_sink_support(flash_attn_varlen_func)
         call_kwargs["sink"] = effective_sink
 
     return flash_attn_varlen_func(

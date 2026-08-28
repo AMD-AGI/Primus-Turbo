@@ -10,9 +10,39 @@ Kept separate from the routing layer: routing decides *which* backend, this deci
 *how* the recognised document-packed variant is handed to ``flash_attn_varlen_func``.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
+
+from ._routing import _backend_accepts
+
+
+def require_varlen_sink_support(fn: Callable) -> None:
+    """Raise unless this build's varlen entry can actually carry an attention sink.
+
+    Both routes that lower a sink onto packed varlen go through this, so the reason
+    lives in one place.
+
+    The thing being probed is the *wrapper* ``flash_attn_varlen_func``, not whichever
+    kernel it would eventually select. That distinction is the whole point: aiter's own
+    varlen forward and backward do take a sink on recent builds, and the FlyDSL varlen
+    backend takes one for equal-length segments, so reasoning about backends suggests
+    the sink can get through. It cannot, because Turbo's varlen wrapper has no ``sink``
+    parameter to pass it to -- the call dies with a bare ``TypeError`` from the binding
+    before any backend is chosen. Dropping the sink instead is not an option: it changes
+    the softmax denominator of every query and silently produces different numbers.
+    """
+    if _backend_accepts(fn, "sink"):
+        return
+    raise NotImplementedError(
+        "Turbo flex compat layer: an attention sink was supplied together with document "
+        "packing, but this Primus-Turbo build's flash_attn_varlen_func has no 'sink' "
+        "parameter, so the sink logits cannot reach the packed kernel. Dropping them "
+        "would change the softmax denominator for every query and silently produce "
+        "different numbers, so this raises instead. Use the dense entries "
+        "(flex_attention / flex_attention_bshd), whose backend does take a sink, or "
+        "upgrade Primus-Turbo to a build whose varlen entry forwards one."
+    )
 
 
 def _dispatch_document_varlen(
@@ -37,8 +67,9 @@ def _dispatch_document_varlen(
     the mask is already verified by the classifier). They are packed to THD, dispatched
     block-diagonally via ``flash_attn_varlen_func`` -- which honours document boundaries
     through ``cu_seqlens`` rather than attending across them -- and the packed output is
-    unpacked back to bhsd. ``sink`` is threaded only when supplied (newer-backend
-    feature; a no-op default otherwise).
+    unpacked back to bhsd. A ``sink`` is threaded only after
+    :func:`require_varlen_sink_support` confirms the varlen entry has somewhere to put
+    it; builds whose wrapper predates the parameter are rejected, not degraded.
 
     ``causal`` and ``window_size`` are the *within-document* pattern recovered by the
     classifier: the varlen kernel applies them per segment, so bidirectional packing
@@ -77,6 +108,10 @@ def _dispatch_document_varlen(
         return_lse=False,
     )
     if sink is not None:
+        # Enforced here rather than only at the call sites: this is the single point
+        # where a sink is actually attached to the varlen call, so a future caller
+        # cannot route around the check.
+        require_varlen_sink_support(flash_attn_varlen_func)
         call_kwargs["sink"] = sink
 
     out_thd = flash_attn_varlen_func(q_thd, k_thd, v_thd, cu, cu, max_s, max_s, **call_kwargs)
