@@ -252,10 +252,6 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
     # (trans_a, trans_b, trans_c)
     SUPPORTED_LAYOUTS = ((False, True, False),)
 
-    # M / N ride the store's 64-column drop grid; K rounds up to whole 256-blocks inside the
-    # kernel. A K that is not already a multiple of 256 is correct but ~11% slower, because
-    # the fp4 row stride K/2 then misses the 128-byte line -- see gemm_mxfp4_flydsl_kernel's
-    # docstring. Pad K upstream when you can.
     FLYDSL_FP4_MN_MULTIPLE = 64
     FLYDSL_FP4_K_MULTIPLE = 64
 
@@ -303,8 +299,6 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         # Raw E8M0 block scales, 1 byte/elem, [DIM, K//32] (the GEMM wrapper preshuffles
         # them into its lane-contiguous layout).
         def _scale_ok(s, dim):
-            # k here is the row stride's worth; the scale carries the TRUE K, which may be
-            # shorter when the caller allocated its fp4 rows on the 128-byte line.
             return s.ndim == 2 and s.shape[0] == dim and s.shape[1] * 64 <= k * 2 and s.element_size() == 1
 
         supported &= _scale_ok(a_scale_inv, m)

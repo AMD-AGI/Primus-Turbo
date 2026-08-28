@@ -266,10 +266,7 @@ class StoreCPlain:
         return n_valid % (16 * self.n_tiles_b) == 0 if isinstance(n_valid, int) else True
 
     def store(self, c_frag, base_row, base_col, n_valid=None):
-        # n_valid drops whole out-of-range column spans via band SRD num_records (no per-store
-        # mask). That is exact only when n_valid lands on the 16*n_tiles_b column grid, so one
-        # call is wholly in or wholly out. A compile-time n_valid is tested here; a runtime one
-        # cannot be, and the caller owns the guarantee (the dense entry asserts N % 64 == 0).
+        # n_valid drops whole column spans via the band SRD, exact only on the 16*n_tiles_b grid.
         c_rows = self.c_rows
         if n_valid is not None and self._span_grid(n_valid):
             c_rows = arith.select(base_col < fx.Int32(n_valid), c_rows, base_row)
@@ -376,10 +373,7 @@ class StoreCPlain:
         With acc = C^T a lane holds 4 consecutive columns; two swaps make them 8 contiguous."""
         nta, ntb = self.n_tiles_a, self.n_tiles_b
         assert ntb % 2 == 0, "store_tacc_wide pairs N sub-blocks (ntb must be even)"
-        # One call spans 16*n_tiles_b contiguous columns, so an n_valid on that grid leaves
-        # every call wholly in or wholly out: zero the band's row count for the out ones and
-        # the hardware drops their stores. Same trick as ``store`` -- and the only one here,
-        # since a dwordx4 of 8 packed columns has no per-column mask to fall back on.
+        # Same wholly-in-or-out trick as ``store``; a dwordx4 of 8 packed columns has no per-column mask.
         c_rows = self.c_rows
         if n_valid is not None:
             assert self._span_grid(n_valid), "store_tacc_wide needs n_valid on the sub-block grid"
@@ -1653,7 +1647,6 @@ def _build_mxfp4_gemm_kernel(
     BLOCK_M = 256
     BLOCK_N = 256
     BLOCK_K = 256
-    # Host-known M/N fold the decode's divisors and every bound to immediates.
     n_pids = (ceildiv(mn[0], BLOCK_M), ceildiv(mn[1], BLOCK_N)) if mn else None
     # Split-K stores partials into a scratch row band that the host then reduces, so the
     # accumulate belongs to that reduce, not to this store.
@@ -1678,16 +1671,9 @@ def _build_mxfp4_gemm_kernel(
     N_SUB = BLOCK_K // 128
     BPR = BLOCK_K // 2  # packed-fp4 bytes per K-iter row in LDS
     KSTEP = BPR
-    # The operands are NOT K-padded: their rows keep the caller's true stride, so a trailing
-    # block reads past a row's K end into the next row. Those lanes are harmless because the
-    # packed scale for every past-K position is zero on BOTH operands -- E8M0 0 is 2^-127, and
-    # 2^-127 * 2^-127 = 2^-254 underflows fp32 (min denormal 2^-149) to exactly 0. The last
-    # row's overrun leaves the tensor and the SRD's num_records returns 0.
+    # A trailing block reads past a row's K end, which the zero packed scale kills: E8M0 0 squared underflows fp32.
     _KR = K if k_real is None else k_real  # operands' true contraction
-    # The loop covers KI whole 256-K blocks = 2*KI of the 128-K MFMA sub-steps, but the true
-    # contraction only needs ceil(_KR/128) of them. When that is one short, half_k drops the
-    # last sub-step instead of feeding it a block of zeros -- the difference between doing
-    # 3072 K of MFMA for a 2880-K problem and doing 2944.
+    # half_k drops the last sub-step rather than feed it a block of zeros.
     _HALF_K = ceildiv(_KR, 128) == 2 * (K // ksplit // 256) - 1
     # The peel is the only tail phase issuing no g2s, so it is where a store cannot be serialised against DMA.
     _CSTORE = (
@@ -1699,12 +1685,7 @@ def _build_mxfp4_gemm_kernel(
         and (KI % 2 == 0 or _HALF_K)
     )
     n_partial = n_tail != 0
-    # The row stride is whatever the caller ALLOCATED, which need not be the true K's width:
-    # a row of K/2 bytes that is not a multiple of 128 starts mid-line for 3 rows in 4 and
-    # its G2S costs two line requests instead of one, and the only way to avoid that is for
-    # the rows to be spaced on the line. A caller that allocates
-    # [M, ceil256(K)/2] and still writes only K/2 gets that for free -- no copy, no extra
-    # compute, and the bytes past K are killed by the zero scales like any other past-K read.
+    # A row of K/2 bytes off the 128-byte line costs its G2S two requests; the caller's allocation decides that.
     K2 = (_KR // 2) if row_bytes is None else row_bytes
     _AB_SPLIT_STEP = K_loop // 2
     _SC_SPLIT_STEP = KI * (64 * (2 * N_SUB) * 4)
@@ -1714,7 +1695,6 @@ def _build_mxfp4_gemm_kernel(
     N_TILES_BH = LDS_BN_HALF // 32  # 4: wave_n covers 64 N-cols/slice
     # B's g2s permutes source columns so a lane's n-fragments land adjacent and pack into dwordx2.
     _BILV = N_TILES_BH if _CSTORE else 0
-    # N's last block is all padding past its L half, so it runs half the MFMAs off the L half's rows.
     _HALF_N = 0 < n_tail <= LDS_BN_HALF
 
     LDS_ROW_STRIDE = BPR
@@ -1724,7 +1704,6 @@ def _build_mxfp4_gemm_kernel(
     _ROWS_PER_STEP = 64 // (BPR // 16) * (256 // 64)  # n_waves = 256//64 = 4
     N_LDS_STEPS_A = BLOCK_M // _ROWS_PER_STEP
     N_LDS_STEPS_BH = LDS_BN_HALF // _ROWS_PER_STEP
-    # A row starting off the 128-byte line costs its G2S two requests; split parity regions shift it back on.
     _ROWSPLIT = (K2 % 128 == 64) and not coop
     _SK = 64 if _ROWSPLIT else 0
     _NOBUF = 3 if _ROWSPLIT else 2
@@ -1834,11 +1813,7 @@ def _build_mxfp4_gemm_kernel(
             a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, LDS_ROW_STRIDE, swizzle=swizzle)
             b_s2r = S2RLoaderFp4(wave_n, N_TILES_BH, LDS_ROW_STRIDE, swizzle=swizzle)
 
-        # A scale: 8 M-tiles span 2 x 64-row groups (4 tiles each). Packed -> ONE i32
-        # per group. The extent has to be the PRESHUFFLE's group grid, not the loader's:
-        # _mxfp4_grp_from lays A out 128 rows at a time (grp = 2*wi + r_region) and B 256
-        # at a time (the wi%2 block interleave), so a dim that ends mid-group would leave
-        # the tail rows unwritten and read back as another group's scales. 256 covers both.
+        # The extent must be the PRESHUFFLE's group grid, not the loader's, or a mid-group tail reads another group's scales.
         _qm = n_pids[0] * 256 if n_pids else ceildiv_pow2(c_m, 256) * 256
         _qn = n_pids[1] * 256 if n_pids else ceildiv_pow2(c_n, 256) * 256
         sa_s2r = ScaleS2RPacked(A_scale, _qm, K, 4)
@@ -2418,15 +2393,8 @@ def _compile_mxfp4_fused(
     order. ksplit>1 writes K/ksplit partials into a [ksplit*M, N] workspace C (the host sums
     the row bands outside the stub)."""
     K128 = K // 128
-    # A scale row is K_real/32 bytes; when that is not a whole number of dwords the source
-    # has to be read a byte at a time (see _load_sc_dwords). Compile-time so an aligned K
-    # keeps the single dwordx2 load.
+    # A scale row of K_real/32 bytes that is not a whole number of dwords has to be read a byte at a time.
     _sc_row = (K if k_real is None else k_real) // 32
-    # The dwordx2 fast path indexes source rows by K128, i.e. the DESTINATION row stride, and
-    # loads two whole dwords at a time. Both only hold when the source rows already span the
-    # padded extent; anything shorter needs the byte path, whatever its dword alignment.
-    # Widest aligned unit the source row start allows: a row base of sc_row bytes is
-    # 2-aligned for an even sc_row, so 90 (K=2880) halves the loads a plain byte walk needs.
     _su = 2 if _sc_row % 2 == 0 else 1
     gemm_kern, BM, BN, _ks, gemm_value_attrs, _bilv = _build_mxfp4_gemm_kernel(
         K=K,
@@ -2461,11 +2429,6 @@ def _compile_mxfp4_fused(
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
-        # Merge A + B scale preshuffle into ONE launch to drop a kernel launch/gap; grid = ceildiv(dim*K128, FO*BLK), dim*K128 % FO == 0.
-        # Packed extent (dim_*) is 256-rounded to the preshuffle's group grid; the real row
-        # count (rd_*) still bounds the READ, so the surplus rows pack as zero bytes -- E8M0 0
-        # is 2^-127, and the operand rows they scale are themselves OOB-zero, so they add
-        # nothing. This is the same split the grouped wgrad uses.
         qm = ceildiv(c_m, fx.Int32(256)) * fx.Int32(256)
         qn = ceildiv(c_n, fx.Int32(256)) * fx.Int32(256)
         grid_a = ceildiv(qm * fx.Int32(K128), _PGRID)
@@ -2596,13 +2559,9 @@ def _mxfp4_grp_from(wi, r_region, mode):
 
 
 def _load_sc_dwords(rin, row_base, k4, n_sub, sc_row, ok, unit=1):
-    """``n_sub`` packed E8M0 dwords assembled a byte at a time.
-
-    A canonical E8M0 row is K/32 bytes, which is a whole number of dwords only when
-    K % 128 == 0. Otherwise the row base is not dword-aligned (K=2880 -> 90 bytes, so odd
-    rows start 2 mod 4) and a dword load would either fault or take four bytes of the next
-    row. Byte loads have neither problem, and bounding each one at the row's true width
-    gives zero past K -- exactly what the trailing block's scales have to be."""
+    """``n_sub`` packed E8M0 dwords assembled a byte at a time. A canonical row is K/32 bytes,
+    dword-aligned only when K % 128 == 0; otherwise a dword load would fault or reach into the
+    next row. Bounding each byte load at the row's true width also gives the zeros past K."""
     dty, mask_v = (T.i16, 0xFFFF) if unit == 2 else (T.i8, 0xFF)
     words = []
     for w in range_constexpr(n_sub):
@@ -2657,10 +2616,6 @@ def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0, byte_src=False, src_unit=1):
         local_bid = arith.select(is_b, bid - grid_a, bid)
         dim = arith.select(is_b, dim_b, dim_a)
         rd = arith.select(is_b, rd_b, rd_a)
-        # Per-segment source/dest resources (each carries its own num_records bound).
-        # The source is bounded by its OWN row width (sc_row), which is K128*4 only when the
-        # scale rows happen to be a whole number of dwords; the destination is always the
-        # 256-rounded packed extent.
         a_rin = buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=rd_a * sc_row)
         a_rout = buffer_ops.create_buffer_resource(a_out, max_size=False, num_records_bytes=dim_a * K128 * 4)
         b_rin = buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=rd_b * sc_row)
@@ -2711,8 +2666,6 @@ def _get_mxfp4_scale_ws(M, N, K, device):
     to the ScaleS2RPacked extent (dim * K/128 int32); the preshuffle writes it and the GEMM
     reads it in stream order, so same-shape reuse on one stream is safe."""
     K128 = K // 128
-    # 256-rounded: the preshuffle packs whole 128-row (A) / 256-row (B) groups, so an M or N
-    # that ends mid-group still needs the whole trailing group backed by storage.
     qm = (M + 255) // 256 * 256
     qn = (N + 255) // 256 * 256
     key = (M, N, K, device)
@@ -2737,62 +2690,9 @@ def gemm_mxfp4_flydsl_kernel(
     beta: float = 0.0,
     out: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
-    """MXFP4 (per-32-K E8M0 block-scaled) dense GEMM, gfx950 (4-wave whole-loop).
-
-    NT only (trans_a=False, trans_b=True): A [M, K] fp4, B [N, K] fp4, C = a @ b^T.
-    ``a``/``b`` are fp4 (float4_e2m1fn_x2, 2 values/byte) so the K byte-stride is K//2.
-
-    ``a_scale``/``b_scale`` are CANONICAL E8M0 block scales ([M, K/32] / [N, K/32],
-    row-major, as emitted by the generic quant). This wrapper repacks them into the
-    lane-contiguous packed int32 layout the whole-loop reads (VGPR-direct scale path)
-    via a separate FlyDSL preshuffle kernel launched on the same stream right before
-    the GEMM -- so the quant stays generic (no fused scale write). Mirrors the mxfp8
-    GEMM's quant/preshuffle decoupling; ``a`` is always the A operand, ``b`` the B.
-
-    Constraints: M, N, K all multiples of 64. Nothing has to be padded by the caller.
-
-    The whole-loop bare-asm body is an unroll-2 ping-pong that processes K in PAIRS
-    of BLOCK_K=256. An odd number of 256-K blocks (K % 512 == 256) is handled by a
-    single MFMA-only phase-A tail emitted after the hardware loop (see
-    ``call_mxfp4_wholeloop``'s ``ki``/tail path);     the loop runs ``KI//2`` full pairs
-    and the trailing block is accumulated by the tail. K=256 (KI==1) omits the loop
-    entirely and runs only the tail.
-
-    A K that is not a whole number of 256-blocks still runs ceil256(K) of them: the
-    operands keep their true row stride (no host K-pad, no copy), and the scale rows are
-    widened to ceil256(K)/32 with zeros, which is what makes the trailing block's read past
-    a row's K end contribute nothing -- see ``_build_mxfp4_gemm_kernel``'s ``_KR``. Only the
-    scales are widened; the fp4 operands are 16x the bytes and are left untouched.
-
-    What costs -- and it is nothing to do with K itself -- is the fp4 ROW STRIDE missing a
-    128-byte cache line: three rows in four then start mid-line and their G2S splits into two
-    requests. Measured at M=32768, N=5120 with the block count held at 12, so the MFMA work
-    is identical and only the stride phase varies:
-
-        stride 1536  phase  0   0.2753 ms   --
-        stride 1472  phase 64   0.2985 ms   +8.4%
-        stride 1440  phase 32   0.3072 ms  +11.6%
-        stride 1504  phase 96   0.3082 ms  +12.0%
-
-    (Phase 64 fares best because it still lands on a 64-byte sector.)
-
-    The stride is the caller's, though, not K's. This entry takes the true contraction from
-    the SCALE -- always K/32 canonical E8M0 columns -- and the row stride from the fp4
-    tensor's own width. A caller that allocates [M, ceil256(K)/2] and still writes only K/2
-    therefore gets the aligned kernel AT THE TRUE K: no copy, no extra arithmetic, no change
-    to what the quantiser computes, only where it put its rows. Against the same problem
-    fully padded to K=3072, over 25 interleaved rounds, that is a wash --
-
-        QKV fwd +0.6%   QKV dgrad +0.3%   AttnOut fwd +0.5%
-        AttnOut dgrad -0.0%   lm_head fwd -0.0%
-
-    -- and bit-identical to the tight-allocation result. A tight allocation stays correct and
-    simply pays the split-line read.
-
-    ``beta=1.0`` accumulates into ``out`` (``out += a @ b^T``) instead of overwriting it,
-    and therefore requires ``out``. It is incompatible with ``trans_c``, whose transpose
-    is a post-kernel copy.
-    """
+    """MXFP4 dense NT GEMM for gfx950: A [M, K] and B [N, K] fp4, C = a @ b^T, M/N/K on 64.
+    The contraction comes from ``a_scale``/``b_scale`` (canonical E8M0, [dim, K/32]) and the
+    row stride from the fp4 tensors, so a caller may seat its rows on the line with no copy."""
     assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
     assert out_dtype in (torch.bfloat16, torch.float16), "mxfp4 FlyDSL store emits bf16/fp16"
     out_fp16 = out_dtype == torch.float16
@@ -2808,21 +2708,13 @@ def gemm_mxfp4_flydsl_kernel(
 
     M, Kb_a = a.shape
     N, Kb_b = b.shape
-    # The true contraction comes from the SCALE (always K/32 canonical E8M0 columns); the fp4
-    # tensors only fix the row stride. Keeping the two apart lets a caller allocate its fp4
-    # rows on the 128-byte line -- [M, ceil256(K)/2] while still writing K/2 -- and get the
-    # aligned kernel with no copy and no change to what the quantiser computes. A tight
-    # allocation stays correct, it just pays the split-line G2S.
+    # The true contraction comes from the SCALE and only the row stride from the fp4 tensors, so a caller can seat its rows on the line without a copy.
     K = a_scale.shape[1] * 32
     assert b_scale.shape[1] * 32 == K, f"scale K mismatch: {a_scale.shape} vs {b_scale.shape}"
     assert Kb_a == Kb_b, f"row stride mismatch: a {a.shape}, b {b.shape}"
     assert K // 2 <= Kb_a <= (K + 255) // 256 * 128, (
         f"fp4 row stride {Kb_a} B is not between K/2 = {K // 2} and ceil256(K)/2 for K={K}"
     )
-    # K only has to land on 64. The whole-loop still consumes whole 256-K blocks, so the
-    # loop and the packed scale layout run on Kw = ceil256(K); the OPERANDS keep their true
-    # row stride, and the trailing block's read past a row's K end is neutralised by the
-    # zero scales the preshuffle writes there (see _build_mxfp4_gemm_kernel's _KR).
     assert K % 64 == 0, f"K must be a multiple of 64, got {K}"
     # A mid-tile M is already bounded by num_records and the store band; a mid-tile N needs n_tail's column drop.
     assert M % 64 == 0, f"M must be a multiple of 64, got {M}"
@@ -2837,15 +2729,9 @@ def gemm_mxfp4_flydsl_kernel(
     _capturing = torch.cuda.is_current_stream_capturing()
     Kw = (K + 255) // 256 * 256  # loop + packed-scale extent
     _k_real = None if K == Kw else K  # None keeps the aligned shapes' launch key unchanged
-    # None means "the builder's default", which is the TRUE K's width -- so pass the stride
-    # only when the caller allocated something wider, and every tight shape keeps its launch
-    # key, and its ISA, exactly as before.
     _row_b = None if Kb_a == K // 2 else Kb_a
     a_sp, b_sp = _get_mxfp4_scale_ws(M, N, Kw, a.device)
-    # Straight through, no widening: the preshuffle bounds each source read at the row's
-    # true K/32 bytes and zero-fills the packed tail itself.
-    # E8M0 has no memref element type, and a row of K/32 bytes need not be a whole number
-    # of dwords, so the bytes go in as u8 -- the resource bounds are in bytes either way.
+    # E8M0 has no memref element type and a row of K/32 bytes need not be a whole number of dwords, so the bytes go in as u8.
     a_raw = a_scale.contiguous().view(torch.uint8).reshape(-1)
     b_raw = b_scale.contiguous().view(torch.uint8).reshape(-1)
     out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
@@ -2903,8 +2789,7 @@ def gemm_mxfp4_flydsl_kernel(
             row_bytes=_row_b,
             mn=_mxfp4_mn_specialise(M, N),
         )
-        # row_bytes belongs here as much as in the launch key: two allocations of the same
-        # logical shape compile to different kernels, and the artifact must not be shared.
+        # row_bytes must be in the artifact key too: one logical shape, two allocations, two kernels.
         at_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum)
         fused_args = _args_for(target)
         entry = _MXFP4_AT_CACHE.get(at_key)
@@ -2962,12 +2847,7 @@ def gemm_mxfp4_flydsl_kernel(
             return (out if target is None else target).add_(reduced)
         return reduced
 
-    # ── Choose ksplit: cached timed pick > timed autotune.
-    # The autotune times {plain, split+reduce} end-to-end on the real operands and takes the
-    # global min, so split-K is used ONLY where it actually wins and never regresses a shape.
-    # Skipped during graph capture (uses the cached pick).
-    # split-K derives its per-split operand byte offset from the loop extent (_AB_SPLIT_STEP),
-    # which only equals a true K-slice when the operands are not K-short of it.
+    # ksplit is picked by timing {plain, split+reduce} end to end, so it never regresses a shape.
     ks = 1 if K != Kw else _MXFP4_KSPLIT_CACHE.get((M, N, K, _row_b, out_fp16))
     if ks is None:
         cands = _ksplit_candidates(M, N, K)
