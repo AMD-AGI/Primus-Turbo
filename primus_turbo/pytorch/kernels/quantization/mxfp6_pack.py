@@ -30,13 +30,14 @@ the column direction previously came from ``pack(x.t().contiguous())``; profilin
 transpose alone, and removing it makes the dual pack ~2.5x faster.
 
 The fused kernel is bit-exact with AITER's packer in the row direction, which is the
-property that lets it be swapped in freely: AITER's packer is the oracle the A6W6
-assembly was validated against. ``PRIMUS_TURBO_MXFP6_PACKER=aiter`` restores the old path
-for A/B comparison, and is also the automatic fallback on a build whose extension
-predates the fused op.
+property that let it be swapped in: AITER's packer is the oracle the A6W6 assembly was
+validated against. It is now the only packer. There is no runtime switch back, so a run
+cannot end up on the slower path unnoticed; a build that lacks the op reports MXFP6 as
+unsupported through ``check_mxfp6_support`` instead of quietly substituting a different
+one. Comparisons against the old path call ``aiter.quant_mxfp6_gemm`` directly, which is
+the better oracle anyway -- it does not route through the code under test.
 """
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -75,6 +76,12 @@ _MISSING_A6W6_HINT = (
     "an aiter built from a branch containing that PR is required."
 )
 
+_MISSING_PACKER_HINT = (
+    "This Primus-Turbo build has no MXFP6 packer. The packer ops are guarded by "
+    "BUILD_MXFP6_BACKEND, which is only defined when gfx950 is an offload arch, so a "
+    "build configured for other archs cannot pack MXFP6 even when it runs on gfx950."
+)
+
 
 def _ceil(x: int, m: int) -> int:
     return -(-x // m) * m
@@ -86,6 +93,9 @@ def check_mxfp6_support() -> Tuple[bool, str]:
 
     if not is_gfx950():
         return False, "MXFP6 requires gfx950 (MI350/MI355): the A6W6 kernels are gfx950 asm."
+    # The three packer ops share one build guard, so any of them answers for the set.
+    if not hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_dual"):
+        return False, _MISSING_PACKER_HINT
     aiter = get_aiter()
     missing = [a for a in _A6W6_REQUIRED_ATTRS if not hasattr(aiter, a)]
     if missing:
@@ -139,26 +149,6 @@ def _check_input(x: torch.Tensor, block_size: int) -> None:
     )
 
 
-def _use_fused_packer() -> bool:
-    """Whether to use Primus-Turbo's fused packer rather than AITER's row packer.
-
-    Falls back to AITER when the extension predates the fused op, so an older build keeps
-    working instead of failing at the op lookup.
-    """
-    choice = os.environ.get("PRIMUS_TURBO_MXFP6_PACKER", "").strip().lower() or "auto"
-    assert choice in ("auto", "fused", "aiter"), (
-        f"PRIMUS_TURBO_MXFP6_PACKER must be auto, fused or aiter, got {choice!r}"
-    )
-    if choice == "aiter":
-        return False
-    available = hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_dual")
-    assert available or choice != "fused", (
-        "PRIMUS_TURBO_MXFP6_PACKER=fused, but this build has no quantize_mxfp6_dual. "
-        "The kernel is gfx950-only and is compiled in only when gfx950 is an offload arch."
-    )
-    return available
-
-
 def quantize_mxfp6_row(
     x: torch.Tensor, block_size: int = MXFP6_BLOCK_SIZE
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -169,11 +159,8 @@ def quantize_mxfp6_row(
     """
     _assert_supported()
     _check_input(x, block_size)
-    x = x.contiguous()
-    if _use_fused_packer():
-        packed, scale = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6(x, 1)
-        return packed, scale
-    return get_aiter().quant_mxfp6_gemm(x)
+    packed, scale = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6(x.contiguous(), 1)
+    return packed, scale
 
 
 def quantize_mxfp6_col(
@@ -181,16 +168,13 @@ def quantize_mxfp6_col(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pack ``[R, C]`` contracting along ``R`` (the first axis).
 
-    Equivalent to ``quantize_mxfp6_row(x.T)``, but the fused packer reads ``x`` in place
-    rather than materialising the transpose.
+    Equivalent to ``quantize_mxfp6_row(x.T)``, but the packer reads ``x`` in place rather
+    than materialising the transpose.
     """
     _assert_supported()
     _check_input(x, block_size)
-    x = x.contiguous()
-    if _use_fused_packer():
-        packed, scale = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6(x, 0)
-        return packed, scale
-    return get_aiter().quant_mxfp6_gemm(x.t().contiguous())
+    packed, scale = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6(x.contiguous(), 0)
+    return packed, scale
 
 
 def quantize_mxfp6_dual(
@@ -207,13 +191,7 @@ def quantize_mxfp6_dual(
     """
     _assert_supported()
     _check_input(x, block_size)
-    x = x.contiguous()
-    if _use_fused_packer():
-        row_p, row_s, col_p, col_s = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_dual(x)
-        return row_p, row_s, col_p, col_s
-    aiter = get_aiter()
-    row_p, row_s = aiter.quant_mxfp6_gemm(x)
-    col_p, col_s = aiter.quant_mxfp6_gemm(x.t().contiguous())
+    row_p, row_s, col_p, col_s = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_dual(x.contiguous())
     return row_p, row_s, col_p, col_s
 
 
@@ -234,12 +212,11 @@ def mxfp6_apply_prologue(
 ) -> torch.Tensor:
     """Materialise the epilogue that ``quantize_mxfp6_fused_dual`` folds into the pack.
 
-    This is the reference the fused kernel is checked against, and the fallback when the
-    extension has no fused op. Kept in one place so the two cannot drift.
+    This is the reference the fused kernel is checked against, and it is what the model
+    would have computed had the epilogue stayed a separate kernel.
 
-    Deliberately ATen's own GELU rather than a transliteration of the kernel's: as the
-    fallback it should be the operation the model would have run anyway, and as the reference
-    it is only useful if it was written independently of what it is checking.
+    Deliberately ATen's own GELU rather than a transliteration of the kernel's: as a
+    reference it is only useful if it was written independently of what it is checking.
     """
     if mode == MXFP6_PROLOGUE_IDENTITY:
         return x
@@ -297,17 +274,5 @@ def quantize_mxfp6_fused_dual(
     if bias is not None:
         bias = bias.contiguous()
 
-    if _use_fused_packer() and hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_fused_dual"):
-        blobs = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_fused_dual(
-            x, aux, bias, mode, want_col_sum
-        )
-        return tuple(blobs)
-
-    # Fallback: materialise the epilogue and pack that. Same values, more traffic.
-    staged = mxfp6_apply_prologue(x, aux, bias, mode)
-    row_p, row_s, col_p, col_s = quantize_mxfp6_dual(staged, block_size)
-    if not want_col_sum:
-        empty = torch.empty((0, 0), dtype=torch.float32, device=x.device)
-        return row_p, row_s, col_p, col_s, empty
-    # One row, so the caller's .sum(0) is a no-op reshape rather than a special case.
-    return row_p, row_s, col_p, col_s, staged.float().sum(0, keepdim=True)
+    blobs = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_fused_dual(x, aux, bias, mode, want_col_sum)
+    return tuple(blobs)

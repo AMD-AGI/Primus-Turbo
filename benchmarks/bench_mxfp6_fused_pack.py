@@ -20,11 +20,8 @@ Run with: python benchmarks/bench_mxfp6_fused_pack.py
 """
 
 import argparse
-import os
 
 import torch
-
-os.environ.setdefault("PRIMUS_TURBO_MXFP6_PACKER", "fused")
 
 from primus_turbo.pytorch.core.low_precision import (
     MXFP6_PROLOGUE_BIAS_GELU,
