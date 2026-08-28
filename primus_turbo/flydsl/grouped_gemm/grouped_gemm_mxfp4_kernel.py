@@ -1054,6 +1054,9 @@ def _compile_grouped_mxfp4_wgrad_fused(
             fx.Int32(OUT_N),
             k128m,
             grid_a,
+            # Source scale rows here are always a whole number of dwords: the reduction dim is
+            # the token count, so a row is m_total/32 bytes == k128m * 4.
+            k128m * fx.Int32(4),
         ).launch(grid=(grid_a + grid_b, 1, 1), block=(_MXFP4_PRESHUF_BLK, 1, 1), stream=stream)
         gemm_k(a8, b8, C, a_sp, b_sp, GO, m_total, value_attrs=attrs).launch(
             grid=(GRID, 1, 1), block=(256, 1, 1), stream=stream
