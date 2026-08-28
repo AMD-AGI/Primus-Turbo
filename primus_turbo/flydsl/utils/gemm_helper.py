@@ -1980,6 +1980,26 @@ def xcd_remap_pid_blocked(pid, total_pids, num_xcd, blk):
     return mapped if full == total_pids else arith.select(pid < fx.Int32(full), mapped, pid)
 
 
+def xcd_remap_pid_blocked_dyn(pid, total_pids, num_xcd, blk):
+    """``xcd_remap_pid_blocked`` for a ``total_pids`` only known at runtime (a kernel argument,
+    not a folded constant). A separate entry point so the constant callers keep byte-identical
+    ISA: this one cannot take their two Python-level shortcuts -- the `full == 0` bail-out and
+    the `full == total_pids` select-free path -- because both branch on a value that no longer
+    folds, so it always emits the select.
+
+    Same bijection over [0, total_pids) as the constant version wherever that one takes its
+    general path. They differ only for a grid shorter than one num_xcd*blk round (full == 0),
+    where the constant version falls back to ``xcd_remap_pid`` and this one is the identity;
+    still a bijection, and at that size no hand-out spreads work any better."""
+    if num_xcd <= 1 or blk <= 1:
+        return xcd_remap_pid(pid, total_pids, num_xcd)
+    full = (total_pids // (num_xcd * blk)) * (num_xcd * blk)
+    xcd = pid % num_xcd
+    local = pid // num_xcd
+    mapped = ((local // blk) * num_xcd + xcd) * blk + local % blk
+    return arith.select(pid < full, mapped, pid)
+
+
 def _inttoptr_lds(byte_addr):
     """Integer byte address -> !llvm.ptr<3> (LDS). Parsed per call: the type is
     bound to the current MLIRContext and cannot be cached across compiles."""
