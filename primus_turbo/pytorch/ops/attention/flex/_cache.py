@@ -7,8 +7,13 @@
 """Classification / detection caches (perf: avoid re-probing on reuse).
 
 Probing a ``block_mask.mask_mod`` (up to 512x512) and re-running the ALiBi /
-soft-cap ``score_mod`` detectors on *every* call is a fixed ~1-3 ms per-call cost
-that dominates small/medium shapes. In real use the same ``block_mask`` /
+soft-cap ``score_mod`` detectors on *every* call is a per-call cost that dominates
+small and medium shapes. Measured host-side on MI355 (gfx950): 0.6-1.8 ms for the
+causal and sliding-window shapes, but 4.6 ms at S=1024 rising to 19 ms at S=8192
+for document packing, whose recognition verifies the reconstruction exactly over
+the whole sequence instead of only the probed corner -- so the cost is neither
+fixed nor small, and at S=8192 it is ~10x the attention kernel it precedes. A warm
+hit is ~0.3 us, i.e. free. In real use the same ``block_mask`` /
 ``score_mod`` object is reused across layers and steps, so we memoise the
 classification / detection *by object identity* (``weakref.WeakKeyDictionary`` so
 entries vanish when the mask/score_mod is garbage-collected -- no leak, no
@@ -21,17 +26,6 @@ a miss; objects that cannot be weakly referenced simply skip the cache.
 import weakref
 from typing import Any, Tuple
 
-#
-# Probing a ``block_mask.mask_mod`` (up to 512x512) and re-running the ALiBi /
-# soft-cap ``score_mod`` detectors on *every* call is a fixed ~1-3 ms per-call cost
-# that dominates small/medium shapes. In real use the same ``block_mask`` /
-# ``score_mod`` object is reused across layers and steps, so we memoise the
-# classification / detection *by object identity* (``weakref.WeakKeyDictionary`` so
-# entries vanish when the mask/score_mod is garbage-collected -- no leak, no
-# lifetime surprises). This is a pure speedup: a different object re-probes, and a
-# cache entry is exactly what the uncached path would have returned (identical
-# result / error semantics). A sentinel distinguishes a cached ``None`` result from
-# a miss; objects that cannot be weakly referenced simply skip the cache.
 _CACHE_MISS = object()
 
 

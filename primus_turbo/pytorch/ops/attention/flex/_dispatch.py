@@ -75,6 +75,13 @@ def _dispatch_document_varlen(
     classifier: the varlen kernel applies them per segment, so bidirectional packing
     (``causal=False``, what diffusion models use) and packing plus a local window both
     come out of the same call. They default to the autoregressive unwindowed shape.
+
+    The pack/unpack copies are not free, and on this route they are the dominant cost:
+    measured on MI355 (gfx950, B=2 H=32 D=128, bf16) they add 0.09 / 0.21 / 0.33 ms at
+    S=1024 / 4096 / 8192 on top of a varlen kernel taking 0.05 / 0.16 / 0.41 ms -- so
+    roughly a doubling. They are real copies rather than views because bhsd is
+    head-major while THD needs a sequence's tokens adjacent. A caller who already holds
+    THD data should use ``flex_attention_varlen`` and skip this entirely.
     """
     bsz, hq, sq, _ = query.shape
     dv = value.shape[-1]
