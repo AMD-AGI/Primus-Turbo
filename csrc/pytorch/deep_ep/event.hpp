@@ -1,50 +1,44 @@
-/***************************************************************************************************
- * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2025 DeepSeek. All rights reserved.
- *
- * Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
- *
- * See LICENSE for license information.
- **************************************************************************************************/
-
 #pragma once
 
-#include "primus_turbo/macros.h"
 #include <ATen/cuda/CUDAContext.h>
+#include <memory>
 
-namespace primus_turbo::pytorch::deep_ep {
+#include <deep_ep/common/exception.cuh>
+
+namespace deep_ep {
 
 struct EventHandle {
     std::shared_ptr<torch::Event> event;
+    std::vector<std::optional<torch::Tensor>> tensors_to_record;
 
     EventHandle() {
         event = std::make_shared<torch::Event>(torch::kCUDA);
         event->record(at::cuda::getCurrentCUDAStream());
     }
 
-    explicit EventHandle(const c10::cuda::CUDAStream &stream) {
+    explicit EventHandle(const at::cuda::CUDAStream& stream) {
         event = std::make_shared<torch::Event>(torch::kCUDA);
         event->record(stream);
     }
 
-    EventHandle(const EventHandle &other) = default;
+    EventHandle(const EventHandle& other) = default;
 
     void current_stream_wait() const { at::cuda::getCurrentCUDAStream().unwrap().wait(*event); }
 };
 
-inline torch::Event create_event(const c10::cuda::CUDAStream &s) {
+static torch::Event create_event(const at::cuda::CUDAStream& s) {
     auto event = torch::Event(torch::kCUDA);
     event.record(s);
     return event;
 }
 
-inline void stream_wait(const c10::cuda::CUDAStream &s_0, const c10::cuda::CUDAStream &s_1) {
-    PRIMUS_TURBO_CHECK(s_0.id() != s_1.id());
+static void stream_wait(const at::cuda::CUDAStream& s_0, const at::cuda::CUDAStream& s_1) {
+    EP_HOST_ASSERT(s_0.id() != s_1.id());
     s_0.unwrap().wait(create_event(s_1));
 }
 
-inline void stream_wait(const c10::cuda::CUDAStream &s, const EventHandle &event) {
+static void stream_wait(const at::cuda::CUDAStream& s, const EventHandle& event) {
     s.unwrap().wait(*event.event);
 }
 
-} // namespace primus_turbo::pytorch::deep_ep
+}  // namespace deep_ep
