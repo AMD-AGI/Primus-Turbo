@@ -264,6 +264,21 @@ def patch(arm):
         bwd._fuse_blockkv_for = lambda skv, d=64, wl=-1: n
     elif arm.startswith("bq"):  # the q rows per q-loop trip, host planners included
         _rebind_block_q(int(arm[2:]))
+    elif arm == "nofill":  # PRICING ONLY (dQ wrong): the a16 image zeroing off, odo pass kept
+        odo = bwd.build_flash_attn_bwd_odo_module
+        bwd.build_flash_attn_bwd_odo_module = lambda **kw: odo(**{**kw, "fill_img": False})
+    elif arm.startswith("mod:"):  # module-level constants (e.g. mod:_A16_UC=2)
+        for kv in arm[4:].split(","):
+            k, v = kv.split("=")
+            assert hasattr(bwd, k), f"no module constant {k}"
+            setattr(bwd, k, int(v) if v.lstrip("-").isdigit() else v)
+    elif arm.startswith("uq:"):  # the a16 un-permute builder's kwargs (e.g. uq:uc=2)
+        over = {}
+        for kv in arm[3:].split(","):
+            k, v = kv.split("=")
+            over[k] = int(v) if v.lstrip("-").isdigit() else v
+        ub = bwd.build_flash_attn_bwd_dqa16_module
+        bwd.build_flash_attn_bwd_dqa16_module = lambda *a2, **kw: ub(*a2, **{**kw, **over})
     elif arm.startswith("kw:"):
         over = {}
         for kv in arm[3:].split(","):

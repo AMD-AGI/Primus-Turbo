@@ -1263,10 +1263,19 @@ def build_flash_attn_bwd_slotred_module(
 
 
 _A16_BLOCK = 256
-# (batch, q tile, head) units one wave un-permutes; 1 is the measured optimum (this pass is
-# flat in the grid shape and monotone worse in per-wave work).
-_A16_UC = 1
+# (batch, q tile, head) units one wave un-permutes. This pass is pure memory level parallelism
+# and UC is the only knob that raises it, so what it wants is a fixed number of loads in
+# flight per wave -- and a unit is NPAIR = D//32 loads, i.e. HALF as many at D64. 1 was the
+# measured optimum at D128; carrying it to D64 halves the pass's MLP. Swept at D64 on the
+# a16 body against 4: 1 is +0.96%, 2 is +1.0%, 8 is +0.59% of the whole backward wall.
+_A16_UC_D128 = 1
+_A16_UC_D64 = 4
 _DQA16_CACHE: dict = {}
+
+
+def _a16_uc(D):
+    """Un-permute units per wave; see _A16_UC_D64."""
+    return _A16_UC_D128 if D == 128 else _A16_UC_D64
 
 
 def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, sbhd=True, block=_A16_BLOCK, uc=None):
@@ -1278,7 +1287,8 @@ def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, sbhd=True, block=_
 
     so one atomic's 64 lanes cover 256 B (4 cache lines) instead of the deterministic store
     layout's 16 -- that address change is the whole scheme. Recovering dQ is then a pure bit
-    permutation of the flat index, with (BLOCK_Q = 32, so the 16-row tile index is one bit)
+    permutation of the flat index (qtile_g is a GLOBAL 16-row tile index, so this holds for
+    any BLOCK_Q that is a multiple of 32, and NPAIR = D//32 for any head dim)
 
         q = qtile_g//2*32 + b2*16 + (qtile_g&1)*8 + b3*4 + b1*2 + b0   (lane16 = b3 b2 b1 b0)
         d = dpair*32 + w1*16 + kg*4 + w0*2 + half
@@ -1300,7 +1310,7 @@ def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, sbhd=True, block=_
     NPAIR = D // 32
     assert D % 32 == 0 and Sq % 16 == 0
     WPG = block // 64
-    UC = _A16_UC if uc is None else int(uc)
+    UC = _a16_uc(D) if uc is None else int(uc)
     NWAVE = B * (Sq // 16) * Hq // UC
     assert Hq % UC == 0 and NWAVE % WPG == 0, "uc must tile the head axis and the work-group"
     NTILE = Sq // 16
@@ -5084,8 +5094,10 @@ def _fuse_blockkv_for(Skv, D=64, window_left=-1):
 # layout puts an atomic's 64 lanes on 4 cache lines where the store layout's cover 16.
 #
 # It only pays at a WIDE band, which is where a q row takes half as many contributions.
-# BLOCK_KV=256 in turn only fits spill-free at BLOCK_Q=32, and BLOCK_Q=32 needs the dS
-# swizzle granule fix at G3S_SWZ. The three move together; none is a knob on its own.
+# At D128 BLOCK_KV=256 in turn only fits spill-free at BLOCK_Q=32, and BLOCK_Q=32 needs the
+# dS swizzle granule fix at G3S_SWZ; that coupling is a D128 allocation fact, NOT a property
+# of the scheme -- at D64 the accumulators are half the size, BLOCK_KV=256 already builds at
+# BLOCK_Q=64, and carrying BLOCK_Q=32 across costs +27.0% of the wall. See _a16_block_q.
 _DQ_A16 = True
 _A16_BLOCK_Q = 32
 _A16_BLOCK_KV = 256
@@ -5095,6 +5107,15 @@ _A16_BLOCK_KV = 256
 # at exactly one CU fill, so the makespan becomes the longest band instead of the mean load.
 _A16_Q_SPLIT = 2
 _A16_Q_SPLIT_G8 = 4
+
+
+def _a16_block_q(D):
+    """BLOCK_Q on the a16 path. D128-only: the narrow tile is what lets BLOCK_KV=256 allocate
+    spill-free with g3_defer on there. At D64 every accumulator is half the size, g3_defer is
+    off, and BLOCK_KV=256 already builds at BLOCK_Q=64 -- so the narrow tile buys nothing and
+    costs +27.0% of the wall (measured; bq32+nored puts the whole cost in the body, so the
+    fold a16 deletes cannot pay for it). The a16 image layout itself is BLOCK_Q generic."""
+    return _A16_BLOCK_Q if D == 128 else _BWD_BLOCK_Q
 
 
 def _a16_qsplit(Hq, Hkv):
@@ -5113,21 +5134,26 @@ _A16_IMAGE: dict = {}
 def _dq_a16_for(B, Sq, Skv, Hq, Hkv, D, window_left, sbhd, varlen):
     """Whether this shape takes the a16 dQ path.
 
-    Restricted to the dense square full-causal D128 SBHD case the scheme was built and
-    verified for: the image's flat index is a pure bit permutation, so every axis has to be
-    a power of two and the q tile has to divide Sq.
+    Restricted to the dense square full-causal SBHD case the scheme was built and verified
+    for: the image's flat index is a pure bit permutation, so every axis has to be a power of
+    two and the q tile has to divide Sq.
+
+    D64 rides it too, but WITHOUT the BLOCK_Q that D128 carries (see _a16_block_q): the image
+    layout is already head-dim generic -- the body's _g3_a16 tile index is global (DT//2 ==
+    D//32) and the un-permute's q formula is _g3_qrow, affine in any q_start that is a
+    multiple of 32 -- while BLOCK_Q=32 costs +27% of the D64 wall against a fold worth 5.2%.
     """
     return (
         _DQ_A16
-        and D == 128
+        and D in (64, 128)
         and sbhd
         and not varlen
         and window_left < 0
         and Sq == Skv
         and Skv % _A16_BLOCK_KV == 0
-        and Sq % (_A16_BLOCK_Q * _a16_qsplit(Hq, Hkv)) == 0
-        and Hq % _A16_UC == 0
-        and (B * (Sq // 16) * Hq) % (_A16_BLOCK // 64 * _A16_UC) == 0
+        and Sq % (_a16_block_q(D) * _a16_qsplit(Hq, Hkv)) == 0
+        and Hq % _a16_uc(D) == 0
+        and (B * (Sq // 16) * Hq) % (_A16_BLOCK // 64 * _a16_uc(D)) == 0
     )
 
 
@@ -6262,6 +6288,9 @@ def _get_bwd(
             # through a scratch pool of v_accvgpr_mov. The bits are NOT interchangeable --
             # bit1 (dV) builds clean but loses, bit1|bit2 and bit4 (dQ) spill -- so the mask
             # is the screened one. a16-only; every other shape compiles byte-identical.
+            # Re-priced at D64 ON THE a16 BODY, because a16 moved the allocation (the partial
+            # store registers are gone): +0.46% on the folded D64 body, -0.62% here (four
+            # readings, two independent batches, every one below its own control).
             mfma_tie=2 if a16 else 0,
             # The tied dK chain's A operand goes to the A heap too ("=a,a,v,0"): outputs are
             # bit-identical, but the transpose fragment it reads no longer has to be
@@ -6303,7 +6332,7 @@ def _get_bwd(
             # block off each other's split-K partial rows. a16 has no partial rows, so all the
             # rotation has left to buy is keeping them off each other's Q/dO rows, and a
             # narrower one does that. Pairs with _a16_qsplit: re-sweep both if either moves.
-            qdesc_r=2 if a16 else None,
+            qdesc_r=2 if (a16 and D == 128) else None,
             # A windowed band is only BLOCK_KV + W q rows wide, so the default four-wave
             # split gives each wave a single kv tile and a repeated Q/dO fragment read;
             # halving to two waves shares that fragment read across two tiles per wave.
@@ -6311,7 +6340,7 @@ def _get_bwd(
             # Every knob below was independently re-swept on the FQ_PAIR body since its
             # register pressure differs from the 64-row band; verdicts held except
             # g2_half (now a loss) and block_q (now fails the ISA occupancy gate).
-            block_q=_A16_BLOCK_Q if a16 else None,
+            block_q=_a16_block_q(D) if a16 else None,
             g2_half=None,
             g1_ks_outer=None,
             agpr=_DKDV_AGPR,
@@ -6688,9 +6717,9 @@ def flydsl_varlen_backward(
     block_kv = _fuse_blockkv_for(Skv, D, window_left)
     a16 = _dq_a16_for(B, Sq, Skv, Hq, Hkv, D, window_left, sbhd, False)
     if a16:
-        # The three constants move together (see the _DQ_A16 record): the wide band is what
-        # halves the atomic count, BLOCK_Q=32 is what lets it allocate spill-free with
-        # g3_defer on, and _a16_qsplit is what keeps the grid wider than one CU fill.
+        # The wide band is what halves the atomic count and _a16_qsplit is what keeps the
+        # grid wider than one CU fill; BLOCK_Q rides _a16_block_q, which is D-dependent (the
+        # narrow D128 tile is an allocation constraint of that path, not part of the scheme).
         block_kv, q_split = _A16_BLOCK_KV, _a16_qsplit(Hq, Hkv)
     # ceil so a non-aligned Skv keeps its ragged top band (the body ceil-grids kv and
     # masks OOB keys; only the workspace band count was floor).
@@ -6777,6 +6806,12 @@ def flydsl_varlen_backward(
     # FILL_IMG): the zeroing is |dQ| of pure stores, which ride an already-launched
     # read-bound kernel for less than they cost as their own memset dispatch.
     img = _a16_image(B, Sq, Hq, D, q.device, q.dtype) if a16 else None
+    # a16 takes the odo pass whole. Cutting the body on the q_split axis to hide it under
+    # chunk 0 was measured and is NOT taken: one boundary costs the body 0.062 ms (5.360
+    # undivided against 5.422 at two chunks and 5.696 at four), while the pass it hides is
+    # DRAM-bound and only moves its bytes under a body that wants the same fabric -- net
+    # d64_gptoss_b4 +1.2% and d64_b2 +2.5% on the scored ruler. What this pass costs here is
+    # its BYTES, not its position; the lever is the byte stream (see FILL_IMG), not the order.
     if not pipe:
         odo_l(o16, dout.to(q.dtype).reshape(-1), delta.reshape(-1), B, Sq, st, img=img)
     dq = torch.empty_like(q)
