@@ -4,9 +4,6 @@
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
 #include "compiled.cuh"
-// [agent modifed]: new -- `operator[]` below reaches for the coherent accessors,
-// and intranode.cu includes this header first.
-#include "utils.cuh"
 
 // [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
 namespace primus_turbo::deep_ep {
@@ -34,25 +31,7 @@ public:
 
     __device__ __forceinline__ dtype_t* buffer() { return reinterpret_cast<dtype_t*>(ptr); }
 
-    // [agent modifed]: `dtype_t&` -> a proxy. Every `Buffer` addresses the shared
-    // comm buffer, so a bare reference compiles to a plain load/store, which on CDNA
-    // is invisible to the peer at the other end (utils.cuh, `coherent` family).
-    // Routing both directions through the coherent accessors leaves upstream's
-    // `buf[i] = v` and `v = buf[i]` call sites exactly as they are.
-    struct Ref {
-        dtype_t* addr;
-
-        __device__ __forceinline__ operator dtype_t() const {
-            return ld_coherent_sys_global(addr);
-        }
-
-        __device__ __forceinline__ dtype_t operator=(const dtype_t& val) const {
-            st_coherent_sys_global(addr, val);
-            return val;
-        }
-    };
-
-    __device__ __forceinline__ Ref operator[](int idx) { return Ref{buffer() + idx}; }
+    __device__ __forceinline__ dtype_t& operator[](int idx) { return buffer()[idx]; }
 };
 
 template <typename dtype_t, int kNumRanks = 1>

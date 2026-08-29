@@ -254,8 +254,10 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                 recv_rdma_rank_prefix_sum[i] = sum;
             }
             if (num_worst_tokens == 0) {
+                // [agent modifed]: empty spin body -> spin_backoff()   same CDNA starvation
+                // as the intranode flag spins (see arch.cuh)
                 while (ld_volatile_global(moe_recv_rdma_counter_mapped) != -1)
-                    ;
+                    spin_backoff();
                 *moe_recv_rdma_counter_mapped = sum;
             }
         }
@@ -284,7 +286,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             }
             if (num_worst_tokens == 0) {
                 while (ld_volatile_global(moe_recv_counter_mapped) != -1)
-                    ;
+                    spin_backoff();
                 *moe_recv_counter_mapped = sum;
             }
         }
@@ -296,7 +298,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             if (num_worst_tokens == 0) {
                 while (ld_volatile_global(moe_recv_expert_counter_mapped + thread_id) != -1)
-                    ;
+                    spin_backoff();
                 moe_recv_expert_counter_mapped[thread_id] = sum;
             }
         }

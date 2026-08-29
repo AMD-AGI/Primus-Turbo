@@ -3,9 +3,6 @@
 #include "launch.cuh"
 #include "utils.cuh"
 
-// [agent modifed]: new -- Turbo-only cheap-fence switch, see turbo_flags.hpp
-#include <primus_turbo/deep_ep/common/turbo_flags.hpp>
-
 // [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
 namespace primus_turbo::deep_ep {
 
@@ -220,8 +217,7 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-// [agent modifed]: +kUseCheapFence   Turbo-only, picks the tail publish/consume pair
-template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kUseCheapFence>
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            float* recv_x_scales,
                                                            int* recv_src_idx,
@@ -354,21 +350,19 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
             auto start_time = clock64();
-            if (elect_one_sync()) {
-                while (true) {
-                    // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
-                    int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
-                    if (num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens)
-                        break;
+            // [agent modifed]: `elect_one_sync()` -> `lane_id == 0` in the loop head, i.e. the
+            // upstream shape kept verbatim. Hoisting the spin into an `if` puts a `while (true)`
+            // inside divergent control flow, which the structurizer is free to reshape.
+            while (lane_id == 0) {
+                // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
+                int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
+                if (num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens)
+                    break;
 
-                    // Rare cases to loop again
-                    if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
-                        printf("DBGSND rank %d ch %d dst %d tail %d head %d tok %d/%d\n", rank, responsible_channel, responsible_rank,
-                               cached_channel_tail_idx, ld_volatile_global(channel_head_idx.buffer()), static_cast<int>(token_idx),
-                               token_end_idx);
-                        printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
-                        trap();
-                    }
+                // Rare cases to loop again
+                if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
+                    trap();
                 }
             }
             __syncwarp();
@@ -393,11 +387,20 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                     // Copy data
                     auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                     auto shifted_x = x + token_idx * hidden_int4;
-                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
+                    // [agent modifed]: unroll 5 -> 2   the copy stride is kWarpSize * unroll, and
+                    // wave64 doubles it: at unroll 5 the stride (320 int4) exceeds hidden_int4 for
+                    // hidden <= 2048, so the vectorised loop never runs and everything falls into
+                    // the scalar tail. 2 keeps the CUDA stride (160 -> 128) within reach.
+                    // [agent modifed]: st_na_global -> st_na_wave_global   wave-uniform base, keeps the dwordx4
+                    UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_wave_global);
 
                     // Copy source index
+                    // [agent modifed]: plain store -> st_na_global   this and the three metadata
+                    // stores below all write a *peer's* comm buffer, exactly like the payload
+                    // copy above; only the payload went through the hook upstream because on
+                    // NVIDIA a plain store is already peer-visible.
                     if (elect_one_sync())
-                        channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
+                        st_na_global(channel_src_idx_buffers.buffer() + dst_slot_idx, static_cast<int>(token_idx));
 
                     // Copy `topk_idx` and `topk_weights` with transformed index
                     if (lane_id < num_topk) {
@@ -406,12 +409,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                             recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
                         auto idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id);
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
-                        channel_topk_idx_buffers[dst_slot_idx * num_topk + lane_id] = idx_value;
+                        // [agent modifed]: plain store -> st_na_global
+                        st_na_global(channel_topk_idx_buffers.buffer() + dst_slot_idx * num_topk + lane_id, idx_value);
 
                         // Top-k weights
                         auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
                         weight_value = (idx_value >= 0) ? weight_value : 0.0f;
-                        channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = weight_value;
+                        // [agent modifed]: plain store -> st_na_global
+                        st_na_global(channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk + lane_id, weight_value);
                     }
 
                     // Copy `x_scales`
@@ -419,7 +424,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                     // [agent modifed]: 32 -> kWarpSize
                     for (int i = lane_id; i < num_scales; i += kWarpSize) {
                         auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
-                        channel_x_scales_buffers[dst_slot_idx * num_scales + i] = __ldg(x_scales + offset);
+                        // [agent modifed]: plain store -> st_na_global
+                        st_na_global(channel_x_scales_buffers.buffer() + dst_slot_idx * num_scales + i, __ldg(x_scales + offset));
                     }
                 }
 
@@ -432,9 +438,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // [agent modifed]: bar.sync -> sync_barrier   emulated named barrier (arch.cuh)
             sync_barrier(responsible_rank, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and elect_one_sync())
-                // [agent modifed]: +kUseCheapFence   the group-wide barrier above is what makes
-                // the cheap variant safe here: every payload wave has already drained.
-                st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(), cached_channel_tail_idx);
+                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
         }
     } else {
         // Workers for receiving and copying into buffer
@@ -452,19 +456,16 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0;
 
         // Receive channel offset
-        // [agent modifed]: `int a, b;` -> zero-initialised   only lane 0 writes these and every
-        // lane reads them back through the shuffle below. Reading the uninitialised copy is UB,
-        // and LLVM cashes it in by assuming the lane-0 branch was taken for the rest of the
-        // kernel: `lane_id` folds to 0, so each wave copied only int4 slots 0, 64, 128, ...
+        // [agent modifed]: `int a, b;` -> zero-initialised   non-lane-0 reads the uninitialised
+        // copy before the shuffle below, which is UB the AMDGPU backend is free to exploit
         int total_offset = 0, num_tokens_to_recv = 0;
-        // [agent modifed]: `while (lane_id == 0 and (x = ld(..)) == 0);` -> the same spin
-        // hoisted into one `if`. LLVM turns the upstream shape into a wave-uniform loop
-        // whose body is predicated off, so lane 0 never re-loads and the wave hangs.
-        if (elect_one_sync()) {
-            while ((total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
-                ;
-            while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
-                ;
+        // [agent modifed]: empty spin body -> spin_backoff()   an unthrottled system-scope
+        // poll starves the peer's write on CDNA and hangs here forever (see arch.cuh)
+        while (lane_id == 0 and (total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
+            spin_backoff();
+        while (lane_id == 0 and (num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
+            spin_backoff();
+        if (lane_id == 0) {
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
             if (recv_warp_id_in_rank == 0)
                 recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset;
@@ -483,8 +484,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         while (num_tokens_to_recv > 0) {
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by different warps are the same
             while (recv_thread_id_in_rank == 0) {
-                // [agent modifed]: +kUseCheapFence   pairs with the sender store above
-                cached_channel_tail_idx = ld_acquire_sys_global<kUseCheapFence>(channel_tail_idx.buffer());
+                cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
@@ -526,7 +526,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 }
                 __syncwarp();
 #else
-                UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_global, st_na_global);
+                // [agent modifed]: unroll 5 -> 2   same wave64 stride problem as the sender above
+                // [agent modifed]: *_global -> *_wave_global   wave-uniform base, keeps the dwordx4
+                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_wave_global, st_na_wave_global);
 #endif
             }
 
@@ -571,9 +573,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // Exit
             num_tokens_to_recv -= num_recv_tokens;
         }
-        if (num_tokens_to_recv != 0 and recv_thread_id_in_rank == 0)
-            printf("DBGRCV rank %d ch %d src %d left %d head %d\n", rank, responsible_channel, responsible_rank, num_tokens_to_recv,
-                   cached_channel_head_idx);
     }
 
     // Clean unused `recv_topk_idx` as -1
@@ -628,14 +627,9 @@ void dispatch(void* recv_x,
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
 
-    // [agent modifed]: new -- select the cheap-fence instantiation at launch time
-    static const bool use_cheap_fence = is_enable_cheap_fence();
-
-#define DISPATCH_LAUNCH_CASE(ranks)                                             \
-    {                                                                           \
-        auto kernel = use_cheap_fence                                           \
-                          ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true>  \
-                          : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false>; \
+#define DISPATCH_LAUNCH_CASE(ranks)                                      \
+    {                                                                    \
+        auto kernel = dispatch<ranks, kNumThreads, kNumTMABytesPerWarp>; \
         SET_SHARED_MEMORY_FOR_TMA(kernel);                               \
         LAUNCH_KERNEL(&cfg,                                              \
                       kernel,                                            \
@@ -756,8 +750,7 @@ void cached_notify_combine(void** buffer_ptrs,
 #undef CACHED_NOTIFY_COMBINE
 }
 
-// [agent modifed]: +kUseCheapFence   Turbo-only, see the dispatch kernel above
-template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kUseCheapFence>
+template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                                                           float* recv_topk_weights,
                                                           const dtype_t* x,
@@ -853,24 +846,26 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             auto start_time = clock64();
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
-            if (elect_one_sync()) {
-                while (true) {
-                    // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
-                    int num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
-                    if (num_recv_buffer_tokens - num_used_slots >= num_round_tokens)
-                        break;
+            // [agent modifed]: `elect_one_sync()` -> `lane_id == 0` in the loop head, see the
+            // dispatch sender above -- the upstream shape kept verbatim.
+            while (lane_id == 0) {
+                // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
+                int num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
+                if (num_recv_buffer_tokens - num_used_slots >= num_round_tokens)
+                    break;
 
-                    // Rare cases to loop again
-                    if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
-                        printf("DeepEP timeout for combine senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
-                        trap();
-                    }
+                // Rare cases to loop again
+                if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP timeout for combine senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
+                    trap();
                 }
             }
             __syncwarp();
 
             // Send by chunk
-            #pragma unroll
+            // [agent modifed]: `#pragma unroll` -> `unroll 2`   the body holds a copy loop, so a
+            // full unroll of this runtime-bounded loop only bloats the sender's inner code
+            #pragma unroll 2
             for (int i = send_warp_id_in_rank; i < num_round_tokens; i += num_send_warps_per_rank) {
                 // Get an empty slot
                 int dst_slot_idx = (current_channel_tail_idx + i) % num_recv_buffer_tokens;
@@ -878,25 +873,30 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 // Copy data
                 auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                 auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
-                UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
+                // [agent modifed]: unroll 4 -> 2   wave64 doubles the copy stride, so 4 leaves
+                // hidden <= 2048 with a single un-pipelined pass; 2 restores two passes
+                // [agent modifed]: *_global -> *_wave_global   wave-uniform base, keeps the dwordx4
+                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_wave_global, st_na_wave_global);
 
                 // Send source index
+                // [agent modifed]: plain store -> st_na_global   peer buffer, see the dispatch sender
                 if (elect_one_sync())
-                    channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + token_idx + i);
+                    st_na_global(channel_src_idx_buffers.buffer() + dst_slot_idx, __ldg(src_idx + token_idx + i));
 
                 // Send `topk_weights`
+                // [agent modifed]: plain store -> st_na_global
                 if (num_topk > 0 and lane_id < num_topk)
-                    channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] =
-                        __ldg(topk_weights + (token_idx + i) * num_topk + lane_id);
+                    st_na_global(channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk + lane_id,
+                                 __ldg(topk_weights + (token_idx + i) * num_topk + lane_id));
             }
             token_idx += num_round_tokens;
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-            // [agent modifed]: bar.sync -> sync_barrier; +kUseCheapFence on the publish
+            // [agent modifed]: bar.sync -> sync_barrier   emulated named barrier (arch.cuh)
             sync_barrier(send_rank_id, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and elect_one_sync())
-                st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(), current_channel_tail_idx);
+                st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
         }
     } else {
         // Workers for receiving
@@ -940,8 +940,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                     break;
 
                 // Update queue tail
-                // [agent modifed]: +kUseCheapFence
-                channel_tail_idx[lane_id] = ld_acquire_sys_global<kUseCheapFence>(channel_tail_idx_ptr);
+                channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr);
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
@@ -997,14 +996,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 while (any_sync(kFullWarpMask, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
                     // Timeout check
                     if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
-                        if (channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)
-                            printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d, "
-                                   "src = %d, tail = %d\n",
+                        printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n",
                                rank,
                                responsible_channel,
-                               expected_head,
-                               lane_id,
-                               channel_tail_idx[lane_id]);
+                               expected_head);
                         trap();
                     }
                 }
@@ -1151,14 +1146,9 @@ void combine(cudaDataType_t type,
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
 #endif
 
-    // [agent modifed]: new -- select the cheap-fence instantiation at launch time
-    static const bool use_cheap_fence = is_enable_cheap_fence();
-
-#define COMBINE_LAUNCH_CASE(dtype, ranks)                                                  \
-    {                                                                                      \
-        auto kernel = use_cheap_fence                                                      \
-                          ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true>  \
-                          : combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false>; \
+#define COMBINE_LAUNCH_CASE(dtype, ranks)                                      \
+    {                                                                          \
+        auto kernel = combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp>; \
         SET_SHARED_MEMORY_FOR_TMA(kernel);                                     \
         LAUNCH_KERNEL(&cfg,                                                    \
                       kernel,                                                  \

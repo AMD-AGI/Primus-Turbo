@@ -116,55 +116,117 @@ __device__ __forceinline__ void memory_fence_cta() {
 // They are named against upstream's `ld_nc_global` ("non-coherent"), and slot into
 // this file's `<op>_<ordering>_<scope>_global` shape with `coherent` in the
 // ordering slot: strictly weaker than `relaxed`, since no atomicity is implied
-// either -- only the cache modifiers.
+// either -- only the cache modifiers. That is also why they are not atomics: the
+// bits are all the algorithm needs, and asking for ordering on top would emit
+// `buffer_inv` / `buffer_wbl2`, whole-cache operations far more expensive than the
+// point ordering DeepEP wants -- the `s_waitcnt vmcnt(0)` a wave already executes
+// before publishing a flag orders the payload behind it.
 //
-// Relaxed atomics are simply the portable way to ask the compiler for those bits:
-// they lower to exactly the modifiers and nothing else. Acquire/release would add
-// `buffer_inv` / `buffer_wbl2` on top, whole-cache operations far more expensive
-// than the point ordering DeepEP needs -- the `s_waitcnt vmcnt(0)` a wave already
-// executes before publishing a flag orders the payload behind it.
-//
-// Getting these bits right is also what lets the comm buffer stay ordinary cached
+// Getting these bits right is what lets the comm buffer stay ordinary cached
 // memory. An uncached allocation hides a missing modifier, but only for the owner:
 // an IPC mapping does not inherit the owner's MTYPE, so the peer doing the write
 // still lands in its own L2.
-// A HIP atomic tops out at 64 bits, and warns (as an error here) if the type's
-// alignment cannot back the width, so an element is carried as the widest chunk
-// both limits allow: `int4` goes as two dwordx2, `SourceMeta` (8 bytes, 4-aligned)
-// as two dwords. The chunks lower to ordinary vector accesses with the cache
-// modifiers set, so the byte count matches a plain copy and the compiler still
-// tracks vmcnt -- hand-written wide asm would move the same bytes but blind it.
-template <typename dtype_t>
+//
+// There are two flavours, because only one of the two ways to get the bits onto an
+// instruction is universally applicable:
+//
+//   *_coherent_*_global       any pointer. A relaxed system/agent-scope atomic,
+//                             which AMDGPU lowers to exactly the bits and nothing
+//                             else. Capped at 8 bytes -- HIP has no wider
+//                             lock-free type -- so an `int4` splits into two
+//                             dwordx2. Fine for the metadata this moves.
+//   *_coherent_*_wave_global  wave-uniform base pointer only. Rides a buffer
+//                             descriptor (see common/arch.cuh) and keeps the full
+//                             dwordx4, which is what the payload copy needs: the
+//                             8-byte cap alone costs ~55% of dispatch bandwidth.
+//
+// The wave flavour's precondition is load-bearing, not stylistic. The descriptor
+// must sit in SGPRs, so its base is `readfirstlane` of the pointer and every other
+// lane addresses it through a 32-bit unsigned `voffset`. That only holds when all
+// lanes share a base and differ by a non-negative per-lane offset -- true of
+// UNROLLED_WARP_COPY over one token, false of a metadata access where each lane
+// picks a different rank's buffer. Get it wrong and the delta wraps: out-of-range
+// reads return zero, writes vanish, and the descriptor faults.
+//
+// An element is moved as the widest chunk its alignment allows, so the byte count
+// matches a plain copy either way and the compiler still tracks vmcnt.
+template <int kMaxBytes, typename dtype_t>
 struct CoherentChunk {
-    static constexpr size_t kBytes = alignof(dtype_t) < 8 ? alignof(dtype_t) : 8;
-    using type = std::conditional_t<
-        kBytes == 8, uint64_t,
-        std::conditional_t<kBytes == 4, uint32_t,
-                           std::conditional_t<kBytes == 2, uint16_t, uint8_t>>>;
+    static constexpr int kBytes = (kMaxBytes >= 16 and alignof(dtype_t) >= 16) ? 16
+                                  : alignof(dtype_t) >= 8                      ? 8
+                                  : alignof(dtype_t) >= 4                      ? 4
+                                  : alignof(dtype_t) >= 2                      ? 2
+                                                                               : 1;
     static constexpr int kCount = sizeof(dtype_t) / kBytes;
     EP_STATIC_ASSERT(sizeof(dtype_t) % kBytes == 0, "unsupported coherent access layout");
 };
 
+// widest lock-free type per chunk size, for the generic (atomic) flavour
+template <int kBytes>
+struct AtomicChunk {};
+template <>
+struct AtomicChunk<8> {
+    using type = long long;
+};
+template <>
+struct AtomicChunk<4> {
+    using type = int;
+};
+template <>
+struct AtomicChunk<2> {
+    using type = short;
+};
+template <>
+struct AtomicChunk<1> {
+    using type = signed char;
+};
+
 template <int kScope, typename dtype_t>
 __device__ __forceinline__ dtype_t ld_coherent_impl(const dtype_t* ptr) {
-    using chunk_t = typename CoherentChunk<dtype_t>::type;
+    using info    = CoherentChunk<8, dtype_t>;
+    using chunk_t = typename AtomicChunk<info::kBytes>::type;
     dtype_t ret;
     auto    src = reinterpret_cast<const chunk_t*>(ptr);
     auto    dst = reinterpret_cast<chunk_t*>(&ret);
 #pragma unroll
-    for (int i = 0; i < CoherentChunk<dtype_t>::kCount; ++i)
+    for (int i = 0; i < info::kCount; ++i)
         dst[i] = __hip_atomic_load(src + i, __ATOMIC_RELAXED, kScope);
     return ret;
 }
 
 template <int kScope, typename dtype_t>
 __device__ __forceinline__ void st_coherent_impl(const dtype_t* ptr, const dtype_t& val) {
-    using chunk_t = typename CoherentChunk<dtype_t>::type;
+    using info    = CoherentChunk<8, dtype_t>;
+    using chunk_t = typename AtomicChunk<info::kBytes>::type;
     auto src = reinterpret_cast<const chunk_t*>(&val);
     auto dst = reinterpret_cast<chunk_t*>(const_cast<dtype_t*>(ptr));
 #pragma unroll
-    for (int i = 0; i < CoherentChunk<dtype_t>::kCount; ++i)
+    for (int i = 0; i < info::kCount; ++i)
         __hip_atomic_store(dst + i, src[i], __ATOMIC_RELAXED, kScope);
+}
+
+template <int kCPol, typename dtype_t>
+__device__ __forceinline__ dtype_t ld_coherent_wave_impl(const dtype_t* ptr) {
+    constexpr int kBytes = CoherentChunk<16, dtype_t>::kBytes;
+    using chunk_t        = typename BufferChunk<kBytes>::type;
+    dtype_t ret;
+    auto    src = reinterpret_cast<const chunk_t*>(ptr);
+    auto    dst = reinterpret_cast<chunk_t*>(&ret);
+#pragma unroll
+    for (int i = 0; i < CoherentChunk<16, dtype_t>::kCount; ++i)
+        dst[i] = buffer_ld_chunk<kCPol, kBytes>(src + i);
+    return ret;
+}
+
+template <int kCPol, typename dtype_t>
+__device__ __forceinline__ void st_coherent_wave_impl(const dtype_t* ptr, const dtype_t& val) {
+    constexpr int kBytes = CoherentChunk<16, dtype_t>::kBytes;
+    using chunk_t        = typename BufferChunk<kBytes>::type;
+    auto src = reinterpret_cast<const chunk_t*>(&val);
+    auto dst = reinterpret_cast<chunk_t*>(const_cast<dtype_t*>(ptr));
+#pragma unroll
+    for (int i = 0; i < CoherentChunk<16, dtype_t>::kCount; ++i)
+        buffer_st_chunk<kCPol, kBytes>(dst + i, src[i]);
 }
 
 template <typename dtype_t>
@@ -187,6 +249,16 @@ __device__ __forceinline__ void st_coherent_sys_global(const dtype_t* ptr, const
     st_coherent_impl<__HIP_MEMORY_SCOPE_SYSTEM>(ptr, val);
 }
 
+template <typename dtype_t>
+__device__ __forceinline__ dtype_t ld_coherent_sys_wave_global(const dtype_t* ptr) {
+    return ld_coherent_wave_impl<kCPolSys>(ptr);
+}
+
+template <typename dtype_t>
+__device__ __forceinline__ void st_coherent_sys_wave_global(const dtype_t* ptr, const dtype_t& val) {
+    st_coherent_wave_impl<kCPolSys>(ptr, val);
+}
+
 // [agent modifed]: PTX ld/st with explicit ordering -> __hip_atomic_*.
 // Scope map: sys -> SYSTEM, gpu -> AGENT, cta -> WORKGROUP. On AMDGPU a relaxed
 // system-scope access already carries the `sc0 sc1` bits that make it visible
@@ -196,20 +268,33 @@ __device__ __forceinline__ void st_relaxed_sys_global(const int* ptr, int val) {
     __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-__device__ __forceinline__ void st_release_sys_global(const int* ptr, int val) {
-    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+// [agent modifed]: `release` -> s_waitcnt + relaxed. The release lowering adds a
+// `buffer_wbl2` on top of the vmcnt wait, to push the payload out of the sender's L2.
+// Every payload access on this port already carries `sc0 sc1` and never lands in L2
+// (see kCPolSys in common/arch.cuh), so the write-back has nothing left to flush and
+// only the ordering half is real: drain this wave, then publish. Sibling waves are
+// drained by barrier_arrive_fence(), so callers must sync_barrier() the group first.
+template <typename dtype_t>
+__device__ __forceinline__ void st_release_sys_global(const dtype_t* ptr, dtype_t val) {
+    wait_all_vmem();
+    __hip_atomic_store(const_cast<dtype_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
 __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
     __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
 }
 
-__device__ __forceinline__ int ld_acquire_sys_global(const int* ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-
-__device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t* ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+// [agent modifed]: `acquire` -> s_waitcnt + relaxed, the mirror of the store above.
+// The acquire lowering adds a `buffer_inv` so later reads miss the stale L2 copy; the
+// payload reads that follow carry `sc0 sc1` and bypass L2 anyway, so the invalidate is
+// dead weight and the vmcnt wait is what actually orders flag-then-payload.
+template <typename dtype_t>
+__device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t* ptr) {
+    wait_all_vmem();
+    dtype_t ret = __hip_atomic_load(const_cast<dtype_t*>(ptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    return ret;
 }
 
 __device__ __forceinline__ int ld_acquire_global(const int* ptr) {
@@ -277,6 +362,13 @@ __device__ __forceinline__ dtype_t ld_nc_global(const dtype_t* ptr) {
     return ld_coherent_sys_global(ptr);
 }
 
+// [agent modifed]: new -- wave-uniform-base variant of ld_nc_global, for the
+// UNROLLED_WARP_COPY payload path only. Same bits, but keeps the dwordx4.
+template <typename dtype_t>
+__device__ __forceinline__ dtype_t ld_nc_wave_global(const dtype_t* ptr) {
+    return ld_coherent_sys_wave_global(ptr);
+}
+
 // [agent modifed]: st.relaxed.gpu.global -> relaxed agent-scope store
 __device__ __forceinline__ void st_na_relaxed(const uint8_t* ptr, uint8_t val) {
     __hip_atomic_store(const_cast<uint8_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -322,6 +414,12 @@ __device__ __forceinline__ void st_na_release(const uint64_t* ptr, uint64_t val)
 template <typename dtype_t>
 __device__ __forceinline__ void st_na_global(const dtype_t* ptr, const dtype_t& value) {
     st_coherent_sys_global(ptr, value);
+}
+
+// [agent modifed]: new -- wave-uniform-base variant of st_na_global, see above.
+template <typename dtype_t>
+__device__ __forceinline__ void st_na_wave_global(const dtype_t* ptr, const dtype_t& value) {
+    st_coherent_sys_wave_global(ptr, value);
 }
 
 // [agent modifed]: lg2.approx/ex2.approx -> the v_log_f32/v_exp_f32 builtins,
@@ -485,37 +583,6 @@ __forceinline__ __device__ void acquire_lock(int* mutex) {
 __forceinline__ __device__ void release_lock(int* mutex) {
     // To make previous memory operations visible to other threads, we must use `release` for memory semantics
     atomic_exch_cta_release(mutex, 0);
-}
-
-// [agent modifed]: new -- the channel head/tail publish/consume pair.
-// A relaxed system-scope store already carries `sc0 sc1`, so the receiver sees
-// the value without the L2 writeback that `release` would add; what the cheap
-// path drops is coverage, not visibility. `wait_all_vmem` only drains the
-// *calling* wave, so a caller whose payload was written by sibling waves MUST
-// sync_barrier() the group first. kUseCheapFence=false keeps the plain release
-// store, which is the default (see deepep_refactor/AGENT_CONTEXT.md R5).
-template <bool kUseCheapFence, typename dtype_t>
-__device__ __forceinline__ void st_release_sys_global(const dtype_t* ptr, dtype_t val) {
-    if constexpr (kUseCheapFence) {
-        wait_all_vmem();
-        __hip_atomic_store(const_cast<dtype_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    } else {
-        __hip_atomic_store(const_cast<dtype_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-    }
-}
-
-template <bool kUseCheapFence, typename dtype_t>
-__device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t* ptr) {
-    dtype_t ret;
-    if constexpr (kUseCheapFence) {
-        wait_all_vmem();
-        ret = __hip_atomic_load(const_cast<dtype_t*>(ptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    } else {
-        ret = __hip_atomic_load(const_cast<dtype_t*>(ptr), __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-    }
-    return ret;
 }
 
 // Operation functors

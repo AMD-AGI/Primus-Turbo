@@ -66,11 +66,31 @@ __device__ __forceinline__ void wait_all_vmem() {
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
+// CDNA3/4 dropped `s_memtime`, but HIP's clock64() still lowers to it, so every
+// spin-timeout in DeepEP compares against a garbage counter and trips at random
+// (measured: a 200G-cycle budget "expiring" after ~2 ms of real time). Shadow it
+// with the steady 100 MHz counter (`s_memrealtime`); unqualified clock64() calls
+// in the kernels resolve here by namespace lookup, so no call site changes.
+// LEGACY_NUM_TIMEOUT_CYCLES is expressed in these ticks (see compiled.cuh).
+__device__ __forceinline__ int64_t clock64() {
+    return static_cast<int64_t>(wall_clock64());
+}
+
 // CUDA's __nanosleep has no CDNA counterpart. s_sleep backs off in units of
 // roughly 64 clocks and only takes a compile-time constant, so the nanosecond
 // argument is dropped: ~1024 clocks is about the 500 ns DeepEP asks for.
 __device__ __forceinline__ void nanosleep(int ns) {
     __builtin_amdgcn_s_sleep(16);
+}
+
+// Backoff for the flag spins upstream leaves with an empty body. A system-scope
+// load lowers to `sc0 sc1`, which bypasses the caches, so an empty spin polls the
+// fabric back-to-back; with hundreds of waves doing that the peer's XGMI write to
+// the same line is starved and the spin never observes it (measured: hangs on the
+// first dispatch, 100/100 clean with this backoff). Kept separate from nanosleep()
+// so the wait can be retuned per arch without touching upstream call sites.
+__device__ __forceinline__ void spin_backoff() {
+    __builtin_amdgcn_s_sleep(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -176,13 +196,15 @@ __device__ __forceinline__ void sync_threads_global() {
     __syncthreads();
 }
 
-// The arrival fence has to retire this wave's VMEM, not just order its LDS:
-// callers use the barrier to hand a payload written by sibling waves over to
-// one publishing wave, and a workgroup fence leaves those stores in flight on
-// CDNA (all waves share the CU's L1, so LLVM emits no vmcnt wait for it).
+// [agent modifed]: `bar.sync`'s implicit fence -> wait_all_vmem() + __threadfence_block().
+// A workgroup fence emits no vmcnt wait on CDNA (every wave shares the CU's L1), so a
+// sibling wave's payload store could still be in flight when the publishing wave moves
+// the channel tail. The vmcnt wait is what each wave contributes to the handoff: it
+// drains that wave before it votes, so once the barrier releases the whole group's
+// payload has landed and the tail store may go out relaxed (see legacy/utils.cuh).
 __device__ __forceinline__ void barrier_arrive_fence() {
-    __threadfence_block();
     wait_all_vmem();
+    __threadfence_block();
 }
 
 #define sync_barrier_init()               PRIMUS_TURBO_BARRIER_SYNC_INIT()
@@ -201,6 +223,105 @@ __device__ __forceinline__ void barrier_arrive_fence() {
 #else
 #define PRIMUS_TURBO_HAS_ASYNC_COPY 0
 #endif
+
+// ---------------------------------------------------------------------------
+// 5b. Cache-policy bits on a data access
+// ---------------------------------------------------------------------------
+// Upstream spells its cache hints in PTX (`ld.global.nc.L1::no_allocate`,
+// `st.global.L1::no_allocate`) and treats them as pure performance requests: one
+// snooped, GPU-wide L2 makes a plain NVIDIA access coherent with every writer that
+// matters. Neither half holds on CDNA -- L2 is per-XCD and does not snoop xGMI --
+// so on this arch the same hints are what *creates* visibility, and getting them
+// onto the instruction is a correctness requirement, not a tuning knob.
+//
+// On gfx9 they live in the CPol field: `sc0` (1) takes the access past the device,
+// `sc1` (16) past the XCD's L2, `nt` (2) is upstream's streaming hint. gfx11/gfx12
+// spell the same intent as `th:`/`scope:` with a different encoding, hence the
+// branch. The pairing below is the one FlyDSL's mega-MoE EP kernels already run on
+// gfx950 (primus_turbo/flydsl/mega/ep_intranode.py: 18 for same-agent reads,
+// 19 to publish to a peer).
+#if defined(__GFX12__) || defined(__GFX11__)
+#error "deep_ep: CPol encoding for GFX11/GFX12 is not implemented yet"
+#endif
+// [agent modifed]: FlyDSL's 18/19 minus `nt`. Non-temporal is the wrong hint for a
+// buffer the peer reads back immediately, and it costs: with `nt` the small-batch
+// cases sat 3-4.5% under baseline, without it every case is at or above baseline.
+static constexpr int kCPolAgent = 16;      // sc1       -- visible GPU-wide
+static constexpr int kCPolSys   = 1 | 16;  // sc1|sc0   -- visible to peers
+
+// Only a buffer (or flat) op carries CPol, and only a *wave-uniform* descriptor
+// keeps the backend from expanding a divergent base into a readfirstlane waterfall.
+// So the access is rebuilt as `readfirstlane(ptr)` + a per-lane byte offset.
+//
+// That makes the descriptor correct ONLY when the caller's base is wave-uniform and
+// the per-lane delta is non-negative and under 4 GiB -- the first active lane must
+// hold the lowest address. Callers that cannot promise this (a metadata access where
+// each lane picks a different rank's buffer) must not come here; legacy/utils.cuh
+// keeps a second, pointer-agnostic flavour for them.
+//
+// The alternatives were measured and rejected: `volatile` gets the bits but pins an
+// `s_waitcnt vmcnt(0)` after every access, relaxed system-scope atomics cap at 8
+// bytes (halving the copy width), and inline asm gets the bits but leaves the
+// backend blind to vmcnt.
+
+// [agent modifed]: buffer resource word 3 (dst_sel / num_format / data_format).
+// Must be gfx9's DATA_FORMAT=32; leaving it 0 encodes an invalid format and the
+// hardware silently drops every load and store.
+#if defined(__GFX12__) || defined(__GFX11__)
+#error "deep_ep: buffer resource word 3 for GFX11/GFX12 is not implemented yet"
+#endif
+static constexpr int kBufferRsrcWord3 = 0x00020000;
+template <int kBytes> struct BufferChunk;
+template <> struct BufferChunk<16> { using type = int __attribute__((ext_vector_type(4))); };
+template <> struct BufferChunk<8>  { using type = int __attribute__((ext_vector_type(2))); };
+template <> struct BufferChunk<4>  { using type = int; };
+template <> struct BufferChunk<2>  { using type = short; };
+template <> struct BufferChunk<1>  { using type = signed char; };
+
+__device__ __forceinline__ auto make_wave_rsrc(const void* ptr, uint32_t& voffset) {
+    auto     addr = reinterpret_cast<uintptr_t>(ptr);
+    uint32_t lo   = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr));
+    uint32_t hi   = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr >> 32));
+    auto     base = (static_cast<uint64_t>(hi) << 32) | lo;
+    voffset       = static_cast<uint32_t>(addr - base);
+    return __builtin_amdgcn_make_buffer_rsrc(
+        reinterpret_cast<void*>(base), static_cast<int16_t>(0), 0xffffffffu, kBufferRsrcWord3);
+}
+
+template <int kCPol, int kBytes>
+__device__ __forceinline__ typename BufferChunk<kBytes>::type buffer_ld_chunk(const void* ptr) {
+    using chunk_t = typename BufferChunk<kBytes>::type;
+    uint32_t voffset;
+    auto     rsrc = make_wave_rsrc(ptr, voffset);
+    if constexpr (kBytes == 16)
+        return __builtin_amdgcn_raw_buffer_load_b128(rsrc, voffset, 0, kCPol);
+    else if constexpr (kBytes == 8)
+        return __builtin_amdgcn_raw_buffer_load_b64(rsrc, voffset, 0, kCPol);
+    else if constexpr (kBytes == 4)
+        return __builtin_amdgcn_raw_buffer_load_b32(rsrc, voffset, 0, kCPol);
+    else if constexpr (kBytes == 2)
+        return __builtin_amdgcn_raw_buffer_load_b16(rsrc, voffset, 0, kCPol);
+    else
+        return __builtin_amdgcn_raw_buffer_load_b8(rsrc, voffset, 0, kCPol);
+}
+
+template <int kCPol, int kBytes>
+__device__ __forceinline__ void buffer_st_chunk(void* ptr,
+                                                typename BufferChunk<kBytes>::type val) {
+    using chunk_t = typename BufferChunk<kBytes>::type;
+    uint32_t voffset;
+    auto     rsrc = make_wave_rsrc(ptr, voffset);
+    if constexpr (kBytes == 16)
+        __builtin_amdgcn_raw_buffer_store_b128(val, rsrc, voffset, 0, kCPol);
+    else if constexpr (kBytes == 8)
+        __builtin_amdgcn_raw_buffer_store_b64(val, rsrc, voffset, 0, kCPol);
+    else if constexpr (kBytes == 4)
+        __builtin_amdgcn_raw_buffer_store_b32(val, rsrc, voffset, 0, kCPol);
+    else if constexpr (kBytes == 2)
+        __builtin_amdgcn_raw_buffer_store_b16(val, rsrc, voffset, 0, kCPol);
+    else
+        __builtin_amdgcn_raw_buffer_store_b8(val, rsrc, voffset, 0, kCPol);
+}
 
 // ---------------------------------------------------------------------------
 // 6. GPU-initiated RDMA (NVSHMEM IBGDA)

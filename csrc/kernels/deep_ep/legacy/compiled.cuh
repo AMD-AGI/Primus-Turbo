@@ -16,4 +16,6 @@
 #define LEGACY_NUM_WAIT_NANOSECONDS 500
 
 #define LEGACY_NUM_CPU_TIMEOUT_SECS 100
-#define LEGACY_NUM_TIMEOUT_CYCLES 200000000000ull  // 200G cycles ~= 100s
+// [agent modifed]: 200G -> 10G   upstream counts SM clocks; clock64() here is the
+// 100 MHz steady counter (arch.cuh), so keep the same ~100 s budget in its units.
+#define LEGACY_NUM_TIMEOUT_CYCLES 10000000000ull  // 10G ticks @100MHz ~= 100s
