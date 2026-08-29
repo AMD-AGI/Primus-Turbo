@@ -1,8 +1,10 @@
 import torch
+import torch.distributed as dist
 from typing import Any, Optional, Tuple, Callable
 
+# [agent modifed]: deep_ep._C -> the Turbo extension's deep_ep submodule
 # noinspection PyUnresolvedReferences
-from deep_ep._C import EventHandle
+from primus_turbo.pytorch._C.deep_ep import EventHandle
 
 
 class EventOverlap:
@@ -94,3 +96,26 @@ class EventOverlap:
         if self.event is not None:
             self.current_stream_wait(release_handle=self._release_handle_by_call)
         self._release_handle_by_call = False
+
+
+# [agent modifed]: upstream keeps these two in `deep_ep/utils/envs.py`, which is not copied here
+# (it pulls in the NCCL comm handle and the NVML/ibstat probes). Only the two checks the legacy
+# buffer calls are ported, and the NVLink one keeps the Turbo port's no-op body -- xGMI P2P is
+# not queryable through pynvml.
+def check_nvlink_connections(group: dist.ProcessGroup) -> None:
+    """
+    Check NVLink connection between every pair of GPUs.
+
+    Arguments:
+        group: the communication group.
+    """
+    # TODO
+
+
+def check_torch_deterministic() -> None:
+    """
+    Ensure PyTorch deterministic algorithms and fill_uninitialized_memory are not both enabled.
+    When both are on, `torch.empty()` calls an initialization kernel that may overlap with communication streams,
+    causing errors.
+    """
+    assert not (torch.are_deterministic_algorithms_enabled() and torch.utils.deterministic.fill_uninitialized_memory)

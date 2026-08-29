@@ -1,6 +1,7 @@
 #pragma once
 
-#include <deep_ep/common/compiled.cuh>
+// [agent modifed]: include root deep_ep/ -> primus_turbo/deep_ep/
+#include <primus_turbo/deep_ep/common/compiled.cuh>
 
 #define LEGACY_NUM_MAX_NVL_PEERS 8
 #define LEGACY_NUM_MAX_RDMA_PEERS 20

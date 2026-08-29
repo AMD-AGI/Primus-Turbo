@@ -2,7 +2,13 @@
 #include "ibgda_device.cuh"
 #include "launch.cuh"
 
-namespace deep_ep::legacy {
+// [agent modifed]: new -- whole-file arch gate; the low-latency kernels are pure
+// IBGDA. Gated here rather than removed so the diff against upstream stays
+// readable and the path comes back by flipping one macro (arch.cuh).
+#if PRIMUS_TURBO_DEEPEP_HAS_IBGDA
+
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
+namespace primus_turbo::deep_ep {
 
 namespace internode_ll {
 
@@ -1286,4 +1292,6 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 
 }  // namespace internode_ll
 
-}  // namespace deep_ep::legacy
+}  // namespace primus_turbo::deep_ep
+
+#endif  // PRIMUS_TURBO_DEEPEP_HAS_IBGDA

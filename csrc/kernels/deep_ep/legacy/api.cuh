@@ -2,7 +2,8 @@
 
 #include "compiled.cuh"
 
-namespace deep_ep::legacy {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
+namespace primus_turbo::deep_ep {
 
 // Layout kernels
 namespace layout {
@@ -323,4 +324,4 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 
 }  // namespace internode_ll
 
-}  // namespace deep_ep::legacy
+}  // namespace primus_turbo::deep_ep

@@ -1,10 +1,13 @@
 #pragma once
 
-#include <deep_ep/common/exception.cuh>
+// [agent modifed]: include root deep_ep/ -> primus_turbo/deep_ep/
+#include <primus_turbo/deep_ep/common/exception.cuh>
 
-#include "../kernels/legacy/api.cuh"
+// [agent modifed]: the copy keeps upstream's legacy/ layout one level deeper
+#include "../../../kernels/deep_ep/legacy/api.cuh"
 
-namespace deep_ep::legacy {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
+namespace primus_turbo::deep_ep {
 
 template <typename dtype_t>
 dtype_t ceil_div(dtype_t a, dtype_t b) {
@@ -182,9 +185,11 @@ struct LowLatencyLayout {
     }
 };
 
-size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
+// [agent modifed]: `size_t` -> `inline size_t`; upstream compiles this header into exactly one
+// TU, Turbo pulls it in from several through extensions.h.
+inline size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
     auto num_bytes = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes;
     return ((num_bytes + LEGACY_NUM_BUFFER_ALIGNMENT_BYTES) / LEGACY_NUM_BUFFER_ALIGNMENT_BYTES) * LEGACY_NUM_BUFFER_ALIGNMENT_BYTES;
 }
 
-}  // namespace deep_ep
+}  // namespace primus_turbo::deep_ep

@@ -101,9 +101,11 @@
     }                                                      \
     while (false)
 
+// [agent modifed]: CUDA_R_16BF -> HIP_R_16BF. hipify translates this enumerator only in some
+// files, so the spelling is pinned here instead of relying on it.
 #define SWITCH_TYPES(case_macro)                          \
     switch (type) {                                       \
-        case CUDA_R_16BF:                                 \
+        case HIP_R_16BF:                                  \
             case_macro(nv_bfloat16);                      \
         default:                                          \
             EP_HOST_ASSERT(false and "Unsupported type"); \

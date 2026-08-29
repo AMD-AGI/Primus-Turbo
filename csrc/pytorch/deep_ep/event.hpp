@@ -3,9 +3,11 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <memory>
 
-#include <deep_ep/common/exception.cuh>
+// [agent modifed]: include root deep_ep/ -> primus_turbo/deep_ep/
+#include <primus_turbo/deep_ep/common/exception.cuh>
 
-namespace deep_ep {
+// [agent modifed]: deep_ep -> primus_turbo::deep_ep
+namespace primus_turbo::deep_ep {
 
 struct EventHandle {
     std::shared_ptr<torch::Event> event;
@@ -41,4 +43,4 @@ static void stream_wait(const at::cuda::CUDAStream& s, const EventHandle& event)
     s.unwrap().wait(*event.event);
 }
 
-}  // namespace deep_ep
+}  // namespace primus_turbo::deep_ep

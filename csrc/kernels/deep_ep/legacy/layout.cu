@@ -1,9 +1,11 @@
-#include <deep_ep/common/exception.cuh>
+// [agent modifed]: include root deep_ep/ -> primus_turbo/deep_ep/
+#include <primus_turbo/deep_ep/common/exception.cuh>
 
 #include "compiled.cuh"
 #include "launch.cuh"
 
-namespace deep_ep::legacy {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
+namespace primus_turbo::deep_ep {
 
 namespace layout {
 
@@ -151,4 +153,4 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
 
 }  // namespace layout
 
-}  // namespace deep_ep::legacy
+}  // namespace primus_turbo::deep_ep

@@ -2,22 +2,27 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
-#include <cuda_runtime.h>
+// [agent modifed]: cuda_runtime.h -> hip_runtime.h
+#include <hip/hip_runtime.h>
 #include <torch/python.h>
 
 #include <chrono>
 #include <memory>
 
-#include <deep_ep/common/compiled.cuh>
-#include <deep_ep/common/exception.cuh>
+// [agent modifed]: include root deep_ep/ -> primus_turbo/deep_ep/
+#include <primus_turbo/deep_ep/common/compiled.cuh>
+#include <primus_turbo/deep_ep/common/exception.cuh>
 
-#include "../utils/event.hpp"
-#include "../utils/shared_memory.hpp"
-#include "../kernels/legacy/api.cuh"
-#include "../kernels/backend/api.cuh"
+// [agent modifed]: upstream's csrc/utils/ and csrc/kernels/ roots map onto the copy's layout;
+// backend/api.cuh is the cut-down rocSHMEM subset (see the note in that file).
+#include "../event.hpp"
+#include "../shared_memory.hpp"
+#include "../../../kernels/deep_ep/legacy/api.cuh"
+#include "../../../kernels/deep_ep/backend/api.cuh"
 #include "config.hpp"
 
-namespace deep_ep::legacy {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
+namespace primus_turbo::deep_ep {
 
 struct Buffer {
     EP_STATIC_ASSERT(LEGACY_NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
@@ -149,21 +154,23 @@ public:
         CUDA_RUNTIME_CHECK(cudaMalloc(&workspace, LEGACY_NUM_WORKSPACE_BYTES));
         CUDA_RUNTIME_CHECK(cudaMemsetAsync(workspace, 0, LEGACY_NUM_WORKSPACE_BYTES, comm_stream));
 
+        // [agent modifed]: hipHostGetDevicePointer only takes void**, CUDA has a T** template
+        // overload; the three call sites below cast explicitly.
         // MoE counter
         CUDA_RUNTIME_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
-        CUDA_RUNTIME_CHECK(cudaHostGetDevicePointer(&moe_recv_counter_mapped, const_cast<int*>(moe_recv_counter), 0));
+        CUDA_RUNTIME_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_counter_mapped), const_cast<int*>(moe_recv_counter), 0));
         *moe_recv_counter = -1;
 
         // MoE expert-level counter
         CUDA_RUNTIME_CHECK(cudaMallocHost(&moe_recv_expert_counter, sizeof(int) * LEGACY_NUM_MAX_LOCAL_EXPERTS, cudaHostAllocMapped));
-        CUDA_RUNTIME_CHECK(cudaHostGetDevicePointer(&moe_recv_expert_counter_mapped, const_cast<int*>(moe_recv_expert_counter), 0));
+        CUDA_RUNTIME_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_expert_counter_mapped), const_cast<int*>(moe_recv_expert_counter), 0));
         for (int i = 0; i < LEGACY_NUM_MAX_LOCAL_EXPERTS; ++i)
             moe_recv_expert_counter[i] = -1;
 
         // MoE RDMA-level counter
         if (num_rdma_ranks > 0) {
             CUDA_RUNTIME_CHECK(cudaMallocHost(&moe_recv_rdma_counter, sizeof(int), cudaHostAllocMapped));
-            CUDA_RUNTIME_CHECK(cudaHostGetDevicePointer(&moe_recv_rdma_counter_mapped, const_cast<int*>(moe_recv_rdma_counter), 0));
+            CUDA_RUNTIME_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_rdma_counter_mapped), const_cast<int*>(moe_recv_rdma_counter), 0));
             *moe_recv_rdma_counter = -1;
         }
     }
@@ -1428,6 +1435,10 @@ public:
         return {combined_x, combined_topk_weights, event};
     }
 
+// [agent modifed]: the low-latency methods are gated out with the IBGDA kernels they call
+// (arch.cuh 6). Flipping PRIMUS_TURBO_DEEPEP_HAS_IBGDA back on restores this block and its
+// pybind entries below unchanged.
+#if PRIMUS_TURBO_DEEPEP_HAS_IBGDA
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
         EP_HOST_ASSERT(low_latency_mode);
 
@@ -1746,6 +1757,7 @@ public:
         EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
         internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
     }
+#endif  // [agent modifed]: end of the IBGDA-only block
 };
 
 static void register_apis(pybind11::module_& m) {
@@ -1782,13 +1794,17 @@ static void register_apis(pybind11::module_& m) {
         .def("intranode_combine", &Buffer::intranode_combine)
         .def("internode_dispatch", &Buffer::internode_dispatch)
         .def("internode_combine", &Buffer::internode_combine)
+// [agent modifed]: same gate as the methods above
+#if PRIMUS_TURBO_DEEPEP_HAS_IBGDA
         .def("clean_low_latency_buffer", &Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch", &Buffer::low_latency_dispatch)
         .def("low_latency_combine", &Buffer::low_latency_combine)
         .def("low_latency_update_mask_buffer", &Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &Buffer::low_latency_clean_mask_buffer)
-        .def("get_next_low_latency_combine_buffer", &Buffer::get_next_low_latency_combine_buffer);
+        .def("get_next_low_latency_combine_buffer", &Buffer::get_next_low_latency_combine_buffer)
+#endif
+        ;  // [agent modifed]: the trailing `;` moves past the gate
 }
 
-}  // namespace deep_ep::legacy
+}  // namespace primus_turbo::deep_ep

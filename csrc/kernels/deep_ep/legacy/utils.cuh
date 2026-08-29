@@ -1,34 +1,52 @@
 #pragma once
 
-#include <deep_ep/common/compiled.cuh>
-#include <deep_ep/common/exception.cuh>
+#include <primus_turbo/deep_ep/common/compiled.cuh>
+#include <primus_turbo/deep_ep/common/exception.cuh>
 
-#define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                                                     \
-    {                                                                                                                                 \
-        constexpr int kLoopStride = 32 * (UNROLL_FACTOR);                                                                             \
-        typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type unrolled_values[(UNROLL_FACTOR)];                          \
-        auto __src = (SRC);                                                                                                           \
-        auto __dst = (DST);                                                                                                           \
-        for (int __i = (LANE_ID); __i < ((N) / kLoopStride) * kLoopStride; __i += kLoopStride) {                                      \
-            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) unrolled_values[__j] = LD_FUNC(__src + __i + __j * 32); \
-            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) ST_FUNC(__dst + __i + __j * 32, unrolled_values[__j]);  \
-        }                                                                                                                             \
-        {                                                                                                                             \
-            int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID);                                                                  \
-            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) {                                                       \
-                if (__i + __j * 32 < (N)) {                                                                                           \
-                    unrolled_values[__j] = LD_FUNC(__src + __i + __j * 32);                                                           \
-                }                                                                                                                     \
-            }                                                                                                                         \
-            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) {                                                       \
-                if (__i + __j * 32 < (N)) {                                                                                           \
-                    ST_FUNC(__dst + __i + __j * 32, unrolled_values[__j]);                                                            \
-                }                                                                                                                     \
-            }                                                                                                                         \
-        }                                                                                                                             \
+// [agent modifed]: 32 -> kWarpSize   the loop stride is one warp of lanes
+#define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                                                              \
+    {                                                                                                                                         \
+        constexpr int kLoopStride = kWarpSize * (UNROLL_FACTOR);                                                                              \
+        typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type unrolled_values[(UNROLL_FACTOR)];                                  \
+        auto __src = (SRC);                                                                                                                    \
+        auto __dst = (DST);                                                                                                                    \
+        for (int __i = (LANE_ID); __i < ((N) / kLoopStride) * kLoopStride; __i += kLoopStride) {                                              \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) unrolled_values[__j] = LD_FUNC(__src + __i + __j * kWarpSize);  \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) ST_FUNC(__dst + __i + __j * kWarpSize, unrolled_values[__j]);   \
+        }                                                                                                                                     \
+        {                                                                                                                                     \
+            int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID);                                                                          \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) {                                                               \
+                if (__i + __j * kWarpSize < (N)) {                                                                                            \
+                    unrolled_values[__j] = LD_FUNC(__src + __i + __j * kWarpSize);                                                            \
+                }                                                                                                                             \
+            }                                                                                                                                 \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) {                                                               \
+                if (__i + __j * kWarpSize < (N)) {                                                                                            \
+                    ST_FUNC(__dst + __i + __j * kWarpSize, unrolled_values[__j]);                                                             \
+                }                                                                                                                             \
+            }                                                                                                                                 \
+        }                                                                                                                                     \
     }
 
-namespace deep_ep::legacy {
+// [agent modifed]: new -- half-wave variant for the internode paths whose lane
+// assignment is hard-wired to 32 peers and cannot widen to a whole wave64.
+#define UNROLLED_WARP_COPY_EMULATED(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                                                          \
+    {                                                                                                                                              \
+        constexpr int kLoopStride = kEmulatedWarpSize * (UNROLL_FACTOR);                                                                           \
+        typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type unrolled_values[(UNROLL_FACTOR)];                                       \
+        auto __src = (SRC);                                                                                                                         \
+        auto __dst = (DST);                                                                                                                         \
+        for (int __i = (LANE_ID); __i < ((N) / kLoopStride) * kLoopStride; __i += kLoopStride) {                                                   \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) unrolled_values[__j] = LD_FUNC(__src + __i + __j * kEmulatedWarpSize); \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) ST_FUNC(__dst + __i + __j * kEmulatedWarpSize, unrolled_values[__j]);  \
+        }                                                                                                                                          \
+        for (int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID); __i < (N); __i += kEmulatedWarpSize)                                         \
+            ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                                                                                            \
+    }
+
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
+namespace primus_turbo::deep_ep {
 
 template <int kBytes>
 struct VecInt {};
@@ -50,7 +68,8 @@ struct VecInt<8> {
 };
 template <>
 struct VecInt<16> {
-    using vec_t = int4;
+    // [agent modifed]: int4 -> ext_vector_type(4)   __builtin_nontemporal_load rejects HIP vector structs
+    using vec_t = int __attribute__((ext_vector_type(4)));
 };
 
 template <typename FuncT>
@@ -63,368 +82,270 @@ struct PatternVisitor {
 };
 
 __device__ __forceinline__ void trap() {
-    asm("trap;");
+    abort();  // [agent modifed]: asm("trap;") -> abort()
 }
 
+// [agent modifed]: PTX fences -> __threadfence*, the AMDGPU spelling of the same scopes
 __device__ __forceinline__ void memory_fence() {
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
+    __threadfence_system();
 }
 
 __device__ __forceinline__ void memory_fence_gpu() {
-    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+    __threadfence();
 }
 
 __device__ __forceinline__ void memory_fence_cta() {
-    asm volatile("fence.acq_rel.cta;" ::: "memory");
+    __threadfence_block();
 }
 
+// [agent modifed]: new -- the `coherent` access family, upstream has no counterpart.
+//
+// Upstream reaches the shared comm buffer with `ld.global.nc` / `st.global` and
+// leans on NVIDIA's single, GPU-wide, peer-snooped L2: a plain load there is
+// already coherent with every writer that matters. CDNA has neither half of that
+// property. gfx950 splits L2 per XCD, and a peer writing over xGMI never
+// invalidates the reader's copy, so a plain access to memory some *other* agent
+// reads or writes can read a line that is arbitrarily stale.
+//
+// These four spell the one thing the algorithm actually needs there -- visibility,
+// at a stated reach, with no ordering attached:
+//
+//   *_coherent_global      visible across the whole GPU  (`sc1`, bypasses CU L1)
+//   *_coherent_sys_global  visible to peer GPUs as well  (`sc0 sc1`, also L2)
+//
+// They are named against upstream's `ld_nc_global` ("non-coherent"), and slot into
+// this file's `<op>_<ordering>_<scope>_global` shape with `coherent` in the
+// ordering slot: strictly weaker than `relaxed`, since no atomicity is implied
+// either -- only the cache modifiers.
+//
+// Relaxed atomics are simply the portable way to ask the compiler for those bits:
+// they lower to exactly the modifiers and nothing else. Acquire/release would add
+// `buffer_inv` / `buffer_wbl2` on top, whole-cache operations far more expensive
+// than the point ordering DeepEP needs -- the `s_waitcnt vmcnt(0)` a wave already
+// executes before publishing a flag orders the payload behind it.
+//
+// Getting these bits right is also what lets the comm buffer stay ordinary cached
+// memory. An uncached allocation hides a missing modifier, but only for the owner:
+// an IPC mapping does not inherit the owner's MTYPE, so the peer doing the write
+// still lands in its own L2.
+// A HIP atomic tops out at 64 bits, and warns (as an error here) if the type's
+// alignment cannot back the width, so an element is carried as the widest chunk
+// both limits allow: `int4` goes as two dwordx2, `SourceMeta` (8 bytes, 4-aligned)
+// as two dwords. The chunks lower to ordinary vector accesses with the cache
+// modifiers set, so the byte count matches a plain copy and the compiler still
+// tracks vmcnt -- hand-written wide asm would move the same bytes but blind it.
+template <typename dtype_t>
+struct CoherentChunk {
+    static constexpr size_t kBytes = alignof(dtype_t) < 8 ? alignof(dtype_t) : 8;
+    using type = std::conditional_t<
+        kBytes == 8, uint64_t,
+        std::conditional_t<kBytes == 4, uint32_t,
+                           std::conditional_t<kBytes == 2, uint16_t, uint8_t>>>;
+    static constexpr int kCount = sizeof(dtype_t) / kBytes;
+    EP_STATIC_ASSERT(sizeof(dtype_t) % kBytes == 0, "unsupported coherent access layout");
+};
+
+template <int kScope, typename dtype_t>
+__device__ __forceinline__ dtype_t ld_coherent_impl(const dtype_t* ptr) {
+    using chunk_t = typename CoherentChunk<dtype_t>::type;
+    dtype_t ret;
+    auto    src = reinterpret_cast<const chunk_t*>(ptr);
+    auto    dst = reinterpret_cast<chunk_t*>(&ret);
+#pragma unroll
+    for (int i = 0; i < CoherentChunk<dtype_t>::kCount; ++i)
+        dst[i] = __hip_atomic_load(src + i, __ATOMIC_RELAXED, kScope);
+    return ret;
+}
+
+template <int kScope, typename dtype_t>
+__device__ __forceinline__ void st_coherent_impl(const dtype_t* ptr, const dtype_t& val) {
+    using chunk_t = typename CoherentChunk<dtype_t>::type;
+    auto src = reinterpret_cast<const chunk_t*>(&val);
+    auto dst = reinterpret_cast<chunk_t*>(const_cast<dtype_t*>(ptr));
+#pragma unroll
+    for (int i = 0; i < CoherentChunk<dtype_t>::kCount; ++i)
+        __hip_atomic_store(dst + i, src[i], __ATOMIC_RELAXED, kScope);
+}
+
+template <typename dtype_t>
+__device__ __forceinline__ dtype_t ld_coherent_global(const dtype_t* ptr) {
+    return ld_coherent_impl<__HIP_MEMORY_SCOPE_AGENT>(ptr);
+}
+
+template <typename dtype_t>
+__device__ __forceinline__ void st_coherent_global(const dtype_t* ptr, const dtype_t& val) {
+    st_coherent_impl<__HIP_MEMORY_SCOPE_AGENT>(ptr, val);
+}
+
+template <typename dtype_t>
+__device__ __forceinline__ dtype_t ld_coherent_sys_global(const dtype_t* ptr) {
+    return ld_coherent_impl<__HIP_MEMORY_SCOPE_SYSTEM>(ptr);
+}
+
+template <typename dtype_t>
+__device__ __forceinline__ void st_coherent_sys_global(const dtype_t* ptr, const dtype_t& val) {
+    st_coherent_impl<__HIP_MEMORY_SCOPE_SYSTEM>(ptr, val);
+}
+
+// [agent modifed]: PTX ld/st with explicit ordering -> __hip_atomic_*.
+// Scope map: sys -> SYSTEM, gpu -> AGENT, cta -> WORKGROUP. On AMDGPU a relaxed
+// system-scope access already carries the `sc0 sc1` bits that make it visible
+// across ranks; only acquire/release add the L2 writeback/invalidate on top
+// (ARCH_NOTES.md 7), so relaxed is preferred wherever the protocol allows it.
 __device__ __forceinline__ void st_relaxed_sys_global(const int* ptr, int val) {
-    asm volatile("st.relaxed.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ void st_release_sys_global(const int* ptr, int val) {
-    asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
-    asm volatile("st.release.cta.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
 }
 
 __device__ __forceinline__ int ld_acquire_sys_global(const int* ptr) {
-    int ret;
-    asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t* ptr) {
-    uint64_t ret;
-    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ int ld_acquire_global(const int* ptr) {
-    int ret;
-    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int value) {
-    int ret;
-    asm volatile("atom.add.release.sys.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
-    return ret;
+    return __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
-    int ret;
-    asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
-    return ret;
+    return __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ int ld_acquire_cta(const int* ptr) {
-    int ret;
-    asm volatile("ld.acquire.cta.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP);
 }
 
+// [agent modifed]: `L1::no_allocate` has no AMDGPU spelling; agent-scope relaxed
+// is the closest (it bypasses L1 via `sc1`). Used by the IBGDA path only.
 __device__ __forceinline__ uint8_t ld_na_relaxed(const uint8_t* ptr) {
-    uint16_t ret;
-    asm volatile("ld.relaxed.gpu.global.L1::no_allocate.b8 %0, [%1];" : "=h"(ret) : "l"(ptr));
-    return static_cast<uint8_t>(ret);
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ uint16_t ld_na_relaxed(const uint16_t* ptr) {
-    uint16_t ret;
-    asm volatile("ld.relaxed.gpu.global.L1::no_allocate.b16 %0, [%1];" : "=h"(ret) : "l"(ptr));
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ uint32_t ld_na_relaxed(const uint32_t* ptr) {
-    uint32_t ret;
-    asm volatile("ld.relaxed.gpu.global.L1::no_allocate.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ uint64_t ld_na_relaxed(const uint64_t* ptr) {
-    uint64_t ret;
-    asm volatile("ld.relaxed.gpu.global.L1::no_allocate.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-__device__ __forceinline__ int ld_volatile_global(const int* ptr) {
-    int ret;
-    asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
+// [agent modifed]: ld.volatile.global -> relaxed system-scope load. These read
+// flags a peer rank published, so they must carry the full scope bits. The
+// operand stays `volatile` like upstream's: these all sit in flag spin loops,
+// and without it the compiler is free to hoist the load out of the loop.
+__device__ __forceinline__ int ld_volatile_global(const volatile int* ptr) {
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-__device__ __forceinline__ float ld_volatile_global(const float* ptr) {
-    float ret;
-    asm volatile("ld.volatile.global.f32 %0, [%1];" : "=f"(ret) : "l"(ptr));
-    return ret;
+__device__ __forceinline__ float ld_volatile_global(const volatile float* ptr) {
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-__device__ __forceinline__ int64_t ld_volatile_global(const int64_t* ptr) {
-    int64_t ret;
-    asm volatile("ld.volatile.global.s64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
+__device__ __forceinline__ int64_t ld_volatile_global(const volatile int64_t* ptr) {
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-__device__ __forceinline__ int64_t ld_volatile_global(const uint64_t* ptr) {
-    int64_t ret;
-    asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
+__device__ __forceinline__ int64_t ld_volatile_global(const volatile uint64_t* ptr) {
+    return static_cast<int64_t>(__hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
 }
 
-#ifndef DISABLE_AGGRESSIVE_PTX_INSTRS
-#define LD_NC_FUNC "ld.global.nc.L1::no_allocate.L2::256B"
-#else
-#define LD_NC_FUNC "ld.volatile.global"
-#endif
-
-// `ld.global.nc.L1::no_allocate` will be translated into `LDG.E.NA.[width].CONSTANT` in SASS
+// [agent modifed]: `ld.global.nc.L1::no_allocate.L2::256B` -> ld_coherent_sys_global.
+// Every caller reads the comm buffer, which a peer rank wrote; upstream's
+// non-coherent hint is safe there only because one snooped L2 serves the whole
+// NVIDIA GPU. On CDNA the same load would hit a line the writer never
+// invalidated, so the hint inverts into its opposite. One template replaces
+// upstream's per-width PTX specialisations.
 template <typename dtype_t>
 __device__ __forceinline__ dtype_t ld_nc_global(const dtype_t* ptr) {
-    auto ret = ld_nc_global(reinterpret_cast<const typename VecInt<sizeof(dtype_t)>::vec_t*>(ptr));
-    return *reinterpret_cast<dtype_t*>(&ret);
+    return ld_coherent_sys_global(ptr);
 }
 
-template <>
-__device__ __forceinline__ uint8_t ld_nc_global(const uint8_t* ptr) {
-    uint16_t ret;
-    // NOTES: we must use `uint16_t` as inline ASM does not support 8-bit constraint letter (`h` below means unsigned 16-bit)
-    asm volatile(LD_NC_FUNC ".u8 %0, [%1];" : "=h"(ret) : "l"(ptr));
-    return static_cast<uint8_t>(ret);
-}
-
-template <>
-__device__ __forceinline__ int ld_nc_global(const int* ptr) {
-    int ret;
-    asm volatile(LD_NC_FUNC ".s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
-}
-
-template <>
-__device__ __forceinline__ int64_t ld_nc_global(const int64_t* ptr) {
-    int64_t ret;
-    asm volatile(LD_NC_FUNC ".s64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
-}
-
-template <>
-__device__ __forceinline__ float ld_nc_global(const float* ptr) {
-    float ret;
-    asm volatile(LD_NC_FUNC ".f32 %0, [%1];" : "=f"(ret) : "l"(ptr));
-    return ret;
-}
-
-template <>
-__device__ __forceinline__ int2 ld_nc_global(const int2* ptr) {
-    int2 ret;
-    asm volatile(LD_NC_FUNC ".v2.s32 {%0, %1}, [%2];" : "=r"(ret.x), "=r"(ret.y) : "l"(ptr));
-    return ret;
-}
-
-template <>
-__device__ __forceinline__ int4 ld_nc_global(const int4* ptr) {
-    int4 ret;
-    asm volatile(LD_NC_FUNC ".v4.s32 {%0, %1, %2, %3}, [%4];" : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(ptr));
-    return ret;
-}
-
+// [agent modifed]: st.relaxed.gpu.global -> relaxed agent-scope store
 __device__ __forceinline__ void st_na_relaxed(const uint8_t* ptr, uint8_t val) {
-    asm volatile("st.relaxed.gpu.global.L1::no_allocate.b8 [%0], %1;" : : "l"(ptr), "h"(static_cast<uint16_t>(val)));
+    __hip_atomic_store(const_cast<uint8_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ void st_na_relaxed(const uint16_t* ptr, uint16_t val) {
-    asm volatile("st.relaxed.gpu.global.L1::no_allocate.b16 [%0], %1;" : : "l"(ptr), "h"(val));
+    __hip_atomic_store(const_cast<uint16_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ void st_na_relaxed(const uint32_t* ptr, uint32_t val) {
-    asm volatile("st.relaxed.gpu.global.L1::no_allocate.b32 [%0], %1;" : : "l"(ptr), "r"(val));
+    __hip_atomic_store(const_cast<uint32_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ void st_na_relaxed(const int* ptr, int val) {
-    asm volatile("st.relaxed.gpu.global.L1::no_allocate.b32 [%0], %1;" : : "l"(ptr), "r"(val));
+    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ void st_na_relaxed(const int4* ptr, int4 val) {
-    asm volatile("st.relaxed.gpu.global.L1::no_allocate.v4.s32 [%0], {%1, %2, %3, %4};"
-                 :
-                 : "l"(ptr), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w));
+    // [agent modifed]: no 128-bit atomic store on AMDGPU; a plain vector store is
+    // what the PTX lowers to anyway, the `relaxed` here orders nothing extra.
+    *const_cast<int4*>(ptr) = val;
 }
 
 __device__ __forceinline__ void st_na_release(const int* ptr, int val) {
-    asm volatile("st.release.gpu.global.L1::no_allocate.b32 [%0], %1;" : : "l"(ptr), "r"(val));
+    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ void st_na_release(const uint32_t* ptr, uint32_t val) {
-    asm volatile("st.release.gpu.global.L1::no_allocate.b32 [%0], %1;" : : "l"(ptr), "r"(val));
+    __hip_atomic_store(const_cast<uint32_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ void st_na_release(const uint64_t* ptr, uint64_t val) {
-    asm volatile("st.release.gpu.global.L1::no_allocate.b64 [%0], %1;" : : "l"(ptr), "l"(val));
+    __hip_atomic_store(const_cast<uint64_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// `st.global.L1::no_allocate` will be translated into `ST.E.NA.[width]` in SASS
-#ifndef DISABLE_AGGRESSIVE_PTX_INSTRS
-#define ST_NA_FUNC "st.global.L1::no_allocate"
-#else
-#define ST_NA_FUNC "st.global"
-#endif
-
+// [agent modifed]: `st.global.L1::no_allocate` -> st_coherent_sys_global. Upstream's
+// cache hint is a pure performance request -- a plain store is already correct on
+// NVIDIA. It is not on CDNA: most callers here are the dispatch/combine senders
+// writing straight into a *peer's* comm buffer, where a store left in the local L2
+// is never seen. Two callers write a local output tensor instead and pay the
+// bypass for nothing; splitting them is a perf lever to pull once the protocol is
+// green, not a correctness matter.
 template <typename dtype_t>
 __device__ __forceinline__ void st_na_global(const dtype_t* ptr, const dtype_t& value) {
-    st_na_global(reinterpret_cast<const typename VecInt<sizeof(dtype_t)>::vec_t*>(ptr),
-                 *reinterpret_cast<const typename VecInt<sizeof(dtype_t)>::vec_t*>(&value));
+    st_coherent_sys_global(ptr, value);
 }
 
-template <>
-__device__ __forceinline__ void st_na_global(const int* ptr, const int& value) {
-    asm volatile(ST_NA_FUNC ".s32 [%0], %1;" ::"l"(ptr), "r"(value));
-}
-
-template <>
-__device__ __forceinline__ void st_na_global(const int64_t* ptr, const int64_t& value) {
-    asm volatile(ST_NA_FUNC ".s64 [%0], %1;" ::"l"(ptr), "l"(value));
-}
-
-template <>
-__device__ __forceinline__ void st_na_global(const float* ptr, const float& value) {
-    asm volatile(ST_NA_FUNC ".f32 [%0], %1;" ::"l"(ptr), "f"(value));
-}
-
-template <>
-__device__ __forceinline__ void st_na_global(const int4* ptr, const int4& value) {
-    asm volatile(ST_NA_FUNC ".v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
-}
-
+// [agent modifed]: lg2.approx/ex2.approx -> the v_log_f32/v_exp_f32 builtins,
+// which are the same one-instruction approximations. HIP has no __exp2f.
 __device__ __forceinline__ float log2f_approx(const float& x) {
-    float ret;
-    asm volatile("lg2.approx.f32 %0, %1;" : "=f"(ret) : "f"(x));
-    return ret;
+    return __builtin_amdgcn_logf(x);
 }
 
 __device__ __forceinline__ float exp2f_approx(const float& x) {
-    float ret;
-    asm volatile("ex2.approx.f32 %0, %1;" : "=f"(ret) : "f"(x));
-    return ret;
+    return __builtin_amdgcn_exp2f(x);
 }
 
-__forceinline__ __device__ int get_lane_id() {
-    int lane_id;
-    asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
-    return lane_id;
-}
-
+// [agent modifed]: get_lane_id / elect_one_sync / warp primitives live in
+// common/arch.cuh now; `elect.sync` is SM90-only and upstream's fallback below
+// is the branch ROCm takes.
 __device__ __forceinline__ uint32_t elect_one_sync() {
-#ifndef DISABLE_SM90_FEATURES
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n"
-        ".reg .b32 %%rx;\n"
-        ".reg .pred %%px;\n"
-        "      elect.sync %%rx|%%px, %1;\n"
-        "@%%px mov.s32 %0, 1;\n"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xffffffff));
-    return pred;
-#else
     return get_lane_id() == 0;
-#endif
 }
 
-// TMA PTX instructions
-#ifndef DISABLE_SM90_FEATURES
-
-__device__ __forceinline__ void fence_barrier_init() {
-    asm volatile("fence.mbarrier_init.release.cluster; \n" ::);
-}
-
-__device__ __forceinline__ void mbarrier_init(uint64_t* mbar_ptr, uint32_t arrive_count) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::"r"(arrive_count), "r"(mbar_int_ptr));
-}
-
-__device__ __forceinline__ void mbarrier_inval(uint64_t* mbar_ptr) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(mbar_int_ptr));
-}
-
-template <bool kWithMultiStages = false>
-__device__ __forceinline__ void mbarrier_wait(uint64_t* mbar_ptr, uint32_t& phase, int stage_idx = 0) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    const auto wait = kWithMultiStages ? (phase >> stage_idx) & 1 : phase;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred       P1; \n\t"
-        "LAB_WAIT: \n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2; \n\t"
-        "@P1 bra DONE; \n\t"
-        "bra     LAB_WAIT; \n\t"
-        "DONE: \n\t"
-        "}" ::"r"(mbar_int_ptr),
-        "r"(wait),
-        "r"(0x989680));
-    phase ^= kWithMultiStages ? (1 << stage_idx) : 1;
-}
-
-__device__ __forceinline__ void mbarrier_arrive_and_expect_tx(uint64_t* mbar_ptr, int num_bytes) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0; \n\t" ::"r"(num_bytes), "r"(mbar_int_ptr));
-}
-
-__device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar_ptr) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0]; \n\t" ::"r"(mbar_int_ptr));
-}
-
-__device__ __forceinline__ void tma_store_fence() {
-    asm volatile("fence.proxy.async.shared::cta;");
-}
-
-__device__ __forceinline__ void fence_view_async_shared() {
-    asm volatile (
-        "{\n\t"
-        "fence.proxy.async.shared::cta; \n"
-        "}"
-        ::
-        : "memory");
-}
-
-constexpr uint64_t kEvictFirst = 0x12f0000000000000;
-constexpr uint64_t kEvictNormal = 0x1000000000000000;
-
-__device__ __forceinline__ void tma_load_1d(
-    const void* smem_ptr, const void* gmem_ptr, uint64_t* mbar_ptr, int num_bytes, bool evict_first = true) {
-    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
-    auto smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    const auto cache_hint = evict_first ? kEvictFirst : kEvictNormal;
-    asm volatile(
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n" ::"r"(smem_int_ptr),
-        "l"(gmem_ptr),
-        "r"(num_bytes),
-        "r"(mbar_int_ptr),
-        "l"(cache_hint)
-        : "memory");
-}
-
-__device__ __forceinline__ void tma_store_1d(const void* smem_ptr, const void* gmem_ptr, int num_bytes, bool evict_first = true) {
-    auto smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    const auto cache_hint = evict_first ? kEvictFirst : kEvictNormal;
-    asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;\n" ::"l"(gmem_ptr),
-                 "r"(smem_int_ptr),
-                 "r"(num_bytes),
-                 "l"(cache_hint)
-                 : "memory");
-    asm volatile("cp.async.bulk.commit_group;");
-}
-
-template <int N>
-__device__ __forceinline__ void tma_store_wait() {
-    asm volatile("cp.async.bulk.wait_group %0;" ::"n"(N) : "memory");
-}
-
-#endif
+// [agent modifed]: upstream's TMA block (mbarrier_*, tma_load_1d, tma_store_1d)
+// is guarded by DISABLE_SM90_FEATURES, which common/compiled.cuh defines on
+// ROCm. gfx942/gfx950 have no cp.async/mbarrier hardware at all, so the block is
+// dropped rather than stubbed -- an empty shell would only mislead. See
+// PRIMUS_TURBO_HAS_ASYNC_COPY in arch.cuh for where gfx1250 would hook in.
 
 template <typename dtype_t>
 __host__ __device__ constexpr dtype_t ceil_div(dtype_t a, dtype_t b) {
@@ -470,7 +391,8 @@ __device__ __forceinline__ dtype_t broadcast(dtype_t& ptr, int src_lane_idx) {
     int recv_int_values[sizeof(dtype_t) / sizeof(int)];
     #pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
-        recv_int_values[i] = __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
+        // [agent modifed]: __shfl_sync(0xffffffff, ..) -> shfl_sync   32-bit mask is rejected by HIP
+        recv_int_values[i] = shfl_sync(send_int_values[i], src_lane_idx);
     return *reinterpret_cast<dtype_t*>(recv_int_values);
 }
 
@@ -532,7 +454,8 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
     auto start_time = clock64();
     while (true) {
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
-        if (__all_sync(0xffffffff, value <= 0))
+        // [agent modifed]: __all_sync(0xffffffff, ..) -> all_sync(kFullWarpMask, ..)
+        if (all_sync(kFullWarpMask, value <= 0))
             break;
 
         if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
@@ -543,16 +466,14 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
     __syncthreads();
 }
 
+// [agent modifed]: shared-memory CAS/exch PTX -> __hip_atomic_* on the LDS pointer
 __forceinline__ __device__ int atomic_cas_cta_acquire(int* addr, int x, int y) {
-    int ret;
-    asm volatile("atom.acquire.cta.shared::cta.cas.b32 %0, [%1], %2, %3;" : "=r"(ret) : "l"(addr), "r"(x), "r"(y) : "memory");
-    return ret;
+    __hip_atomic_compare_exchange_strong(addr, &x, y, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP);
+    return x;
 }
 
 __forceinline__ __device__ int atomic_exch_cta_release(int* addr, int x) {
-    int ret;
-    asm volatile("atom.release.cta.shared::cta.exch.b32 %0, [%1], %2;" : "=r"(ret) : "l"(addr), "r"(x) : "memory");
-    return ret;
+    return __hip_atomic_exchange(addr, x, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
 }
 
 __forceinline__ __device__ void acquire_lock(int* mutex) {
@@ -564,6 +485,37 @@ __forceinline__ __device__ void acquire_lock(int* mutex) {
 __forceinline__ __device__ void release_lock(int* mutex) {
     // To make previous memory operations visible to other threads, we must use `release` for memory semantics
     atomic_exch_cta_release(mutex, 0);
+}
+
+// [agent modifed]: new -- the channel head/tail publish/consume pair.
+// A relaxed system-scope store already carries `sc0 sc1`, so the receiver sees
+// the value without the L2 writeback that `release` would add; what the cheap
+// path drops is coverage, not visibility. `wait_all_vmem` only drains the
+// *calling* wave, so a caller whose payload was written by sibling waves MUST
+// sync_barrier() the group first. kUseCheapFence=false keeps the plain release
+// store, which is the default (see deepep_refactor/AGENT_CONTEXT.md R5).
+template <bool kUseCheapFence, typename dtype_t>
+__device__ __forceinline__ void st_release_sys_global(const dtype_t* ptr, dtype_t val) {
+    if constexpr (kUseCheapFence) {
+        wait_all_vmem();
+        __hip_atomic_store(const_cast<dtype_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    } else {
+        __hip_atomic_store(const_cast<dtype_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+template <bool kUseCheapFence, typename dtype_t>
+__device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t* ptr) {
+    dtype_t ret;
+    if constexpr (kUseCheapFence) {
+        wait_all_vmem();
+        ret = __hip_atomic_load(const_cast<dtype_t*>(ptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    } else {
+        ret = __hip_atomic_load(const_cast<dtype_t*>(ptr), __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    return ret;
 }
 
 // Operation functors
@@ -591,60 +543,69 @@ struct ReduceOr {
 // Unified reduction function
 template <int kNumLanesPerGroup, bool kIntergroupReduce, typename T, typename Op>
 __forceinline__ __device__ T warp_reduce(T value, Op op) {
-    EP_STATIC_ASSERT(kNumLanesPerGroup == 32 or kNumLanesPerGroup == 16 or kNumLanesPerGroup == 8 or kNumLanesPerGroup == 4 or
-                         kNumLanesPerGroup == 2 or kNumLanesPerGroup == 1,
+    // [agent modifed]: +64   a whole wave is 64 lanes here, so the group size can be too
+    EP_STATIC_ASSERT(kNumLanesPerGroup == 64 or kNumLanesPerGroup == 32 or kNumLanesPerGroup == 16 or kNumLanesPerGroup == 8 or
+                         kNumLanesPerGroup == 4 or kNumLanesPerGroup == 2 or kNumLanesPerGroup == 1,
                      "Invalid number of lanes");
-    constexpr uint32_t mask = 0xffffffff;
+    // [agent modifed]: 0xffffffff -> kFullWarpMask   HIP rejects a 32-bit mask
+    constexpr lane_mask_t mask = kFullWarpMask;
     if constexpr (kIntergroupReduce) {
         if constexpr (kNumLanesPerGroup <= 1)
-            value = op(value, __shfl_xor_sync(mask, value, 1));
+            value = op(value, shfl_xor_sync(value, 1, kWarpSize, mask));
         if constexpr (kNumLanesPerGroup <= 2)
-            value = op(value, __shfl_xor_sync(mask, value, 2));
+            value = op(value, shfl_xor_sync(value, 2, kWarpSize, mask));
         if constexpr (kNumLanesPerGroup <= 4)
-            value = op(value, __shfl_xor_sync(mask, value, 4));
+            value = op(value, shfl_xor_sync(value, 4, kWarpSize, mask));
         if constexpr (kNumLanesPerGroup <= 8)
-            value = op(value, __shfl_xor_sync(mask, value, 8));
+            value = op(value, shfl_xor_sync(value, 8, kWarpSize, mask));
         if constexpr (kNumLanesPerGroup <= 16)
-            value = op(value, __shfl_xor_sync(mask, value, 16));
+            value = op(value, shfl_xor_sync(value, 16, kWarpSize, mask));
+        // [agent modifed]: +1 step   lanes 32..63 exist on wave64
+        if constexpr (kNumLanesPerGroup <= 32 and kWarpSize == 64)
+            value = op(value, shfl_xor_sync(value, 32, kWarpSize, mask));
     } else {
+        // [agent modifed]: +1 step   ditto, for the intra-group direction
+        if constexpr (kNumLanesPerGroup >= 64)
+            value = op(value, shfl_xor_sync(value, 32, kWarpSize, mask));
         if constexpr (kNumLanesPerGroup >= 32)
-            value = op(value, __shfl_xor_sync(mask, value, 16));
+            value = op(value, shfl_xor_sync(value, 16, kWarpSize, mask));
         if constexpr (kNumLanesPerGroup >= 16)
-            value = op(value, __shfl_xor_sync(mask, value, 8));
+            value = op(value, shfl_xor_sync(value, 8, kWarpSize, mask));
         if constexpr (kNumLanesPerGroup >= 8)
-            value = op(value, __shfl_xor_sync(mask, value, 4));
+            value = op(value, shfl_xor_sync(value, 4, kWarpSize, mask));
         if constexpr (kNumLanesPerGroup >= 4)
-            value = op(value, __shfl_xor_sync(mask, value, 2));
+            value = op(value, shfl_xor_sync(value, 2, kWarpSize, mask));
         if constexpr (kNumLanesPerGroup >= 2)
-            value = op(value, __shfl_xor_sync(mask, value, 1));
+            value = op(value, shfl_xor_sync(value, 1, kWarpSize, mask));
     }
     return value;
 }
 
 // Convenience aliases
-template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
+// [agent modifed]: default 32 -> kWarpSize   callers that omit it mean "the whole warp"
+template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_sum(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceSum<T>{});
 }
 
-template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
+template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_max(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceMax<T>{});
 }
 
-template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
+template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_min(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceMin<T>{});
 }
 
-template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
+template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_and(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceAnd<T>{});
 }
 
-template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
+template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_or(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceOr<T>{});
 }
 
-}  // namespace deep_ep::legacy
+}  // namespace primus_turbo::deep_ep
