@@ -904,7 +904,6 @@ class StoreCPerTensorRowN(StoreCPerTensor):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.n_tiles_b % 2 == 0, "the merge pairs adjacent n-fragments"
-        assert self.col_safe, "a merged row run spans two fragments and has no column mask"
         assert not self.trans, "written for the untransposed fragment axes"
         assert self.out_ty is fx.BFloat16, "the row pack is v_cvt_pk_bf16_f32"
         self.merge_row = (self.lane_id // 32) * 8
@@ -916,6 +915,13 @@ class StoreCPerTensorRowN(StoreCPerTensor):
             prev = self.prefetch(base_row, base_col)
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         lane0 = self.merge_row * self.c_cols + base_col + self.merge_col
+        # A lane owns column base_col + p*32 + merge_col on every row of the run, so one compare
+        # per run guards the whole ti sweep where col_safe cannot prove it dead (rows ride the
+        # band SRD). Without it the merge would be limited to block-aligned output widths.
+        run_ok = [
+            None if self.col_safe else (base_col + p * 32 + self.merge_col) < self.c_cols
+            for p in range_constexpr(self.n_tiles_b // 2)
+        ]
         for ti in range_constexpr(self.n_tiles_a):
             vecs = [
                 (Vec(c_frag[self.c_idx_fn(ti, tj)]) * scale)
@@ -948,6 +954,7 @@ class StoreCPerTensorRowN(StoreCPerTensor):
                         pair[e],
                         rsrc,
                         (lane0 + row * self.c_cols) * 2 + p * 64,
+                        mask=run_ok[p],
                         cache_modifier=self.store_aux,
                         offset_is_bytes=True,
                     )

@@ -106,6 +106,11 @@ _NN_E_SCHED = {
     0: ((), (0, 2, 1, 3)),
     4: ((), (0,), (2,), (1,), (3,)),
 }
+# Cache-policy immediate for a row-merged C store (sc0 | nt): keeps write-once output out of L2
+# so the reused operand stays resident. Only ever applied once a store instruction covers a full
+# 64B write grain -- on the scalar half-grain store the same hint is a large regression. See the
+# `_cstore_aux` gate in _compile_grouped_nn and `_store_aux` in _wave4_do_tile_tn.
+_MERGED_STORE_AUX = 3
 
 
 def _load_i32(div, idx):
@@ -208,7 +213,7 @@ def _compile_grouped_nn(
     i64_traverse: bool = False,  # B[K,N] traversal via per-load i64 SRD re-base (lifts G*K*n < 2^32 cap)
     nn_halfn: bool = True,  # skip the all-OOB b1 half (c01/c11 mfma+store) on the last N-block when c_n%BLOCK_N in (0, LDS_BLOCK_N]
     nn_halfn_noload: bool = False,  # (with nn_halfn) also drop the all-OOB b1 g2s loads + s2r; that half body then pays a full vmcnt(0) per K-iter since its halved g2s count makes the graded drain racy
-    cstore_aux: int = 0,  # non-temporal aux for the dx C store (1=GLC bypass-L2): keeps write-once dx out of L2 so the reused weight B stays resident. 0 = default
+    cstore_aux: int = -1,  # cache-policy aux for the dx C store: keeps write-once dx out of L2 so the reused weight B stays resident. -1 = pick from the store width (see _cstore_aux), 0 = default policy
     nn_loop_tr_vmcnt: int = -1,  # steady-state B transpose-read g2s drain hint. -1 = none: the per-K-iter rendezvous below already covers every main-loop LDS read, so an extra vmcnt only throttles g2s
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
     n_stride: int = 0,  # >0: padded N storage pitch for B (rows stored at n_stride, real width fed via N/c_n)
@@ -216,6 +221,7 @@ def _compile_grouped_nn(
     nn_kshear: bool = True,  # K % 128 == 64: fetch A's line-aligned window per row instead of its raw K-block, so no row's 128B load splits a cache line (measured +25.7% TCP_TCC_READ_REQ on dY[M,2880]). Off = legacy split loads
     nn_elgk: bool = True,  # graded drain of the B transpose reads: the b0 stage rides the a0 fragment's compiler-scored wait, the b1 stage drains one tile at a time inside its mfma column. Off = one lgkmcnt(0) per stage with no mfma to cover it
     nn_esplit: int = 4,  # epilogue store schedule, see _NN_E_SCHED: how the tile's four accumulator quadrants are split into barrier-separated store batches. 0 = one 128-store burst after the trailing barrier
+    nn_row_merge: bool = True,  # row-merged C store: pack a lane's row pair, then one v_permlane16_swap_b32 per fragment pair so a store's 32 lanes cover a whole 64B row run instead of 16 lanes covering four 32B ones (write requests halved, store count unchanged)
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
     dglu: bool = False,  # fuse the SwiGLU gradient into the epilogue: read l1, write dl1 [M,2I] and grad_probs partials, so dact never reaches HBM
     glu_i: int = 0,  # activation width I; the GEMM's N already equals it, so no geometry changes (unlike the fwd)
@@ -261,6 +267,13 @@ def _compile_grouped_nn(
     # The split reorders the quadrants of the scalar epilogue; the LDS-staged CShuffle one
     # shares a single staging buffer across them and has to keep the emitted order.
     _esplit = 0 if store_cshuffle else nn_esplit
+    # Row merge needs a bf16 pack and an even fragment count; the per-lane column compare it
+    # keeps when N is not block-aligned costs one v_cmp per run, not one per stored element.
+    _rowmerge = nn_row_merge and not out_fp16 and not store_cshuffle and not dglu and N_TILES_B % 2 == 0
+    # dx is written once and never re-read, so the merged store marks it non-temporal and leaves
+    # L2 to the reused B. The merge is the precondition: at the unmerged 32B write width the same
+    # hint costs +7.9% on N=K=2880, a half-line write that skips L2 having nothing to coalesce with.
+    _cstore_aux = (_MERGED_STORE_AUX if _rowmerge else 0) if cstore_aux < 0 else cstore_aux
     if dglu:
         assert glu_i > 0 and not store_cshuffle and not beta_is_one
         assert N == glu_i, f"dglu needs the GEMM's N to be I, got N={N} I={glu_i}"
@@ -509,7 +522,7 @@ def _compile_grouped_nn(
                     lds.C_lds_shuffle,
                     wave_id,
                     col_safe=_col_safe,
-                    store_aux=cstore_aux,
+                    store_aux=_cstore_aux,
                 )
             elif const_expr(store_cshuffle):
                 store_c = StoreCPerTensorCShuffle(
@@ -527,7 +540,7 @@ def _compile_grouped_nn(
                     beta_is_one=beta_is_one,
                 )
             else:
-                store_c = StoreCPerTensor(
+                store_c = (StoreCPerTensorRowN if _rowmerge else StoreCPerTensor)(
                     A_scale,
                     B_scale,
                     C,
@@ -537,7 +550,7 @@ def _compile_grouped_nn(
                     N_TILES_A,
                     N_TILES_B,
                     _out_ty,
-                    store_aux=cstore_aux,
+                    store_aux=_cstore_aux,
                     col_safe=_col_safe,
                     beta_is_one=beta_is_one,
                 )
@@ -902,7 +915,7 @@ def _compile_grouped_nt(
     store_cshuffle: bool = False,  # True = vectorized 128b CShuffle store_c (LDS-staged); False = scalar buffer_store_short
     sched_schedbar: bool = False,  # True = inner per-mfma s_barrier -> sched_barrier(0) (compile-time fence, no runtime WG sync)
     cs_pipe=None,  # depth-2 cshuffle softpipe; needs persistent+store_cshuffle
-    cstore_aux=None,  # non-temporal aux immediate for the C store (0 = default)
+    cstore_aux: int = -1,  # cache-policy aux for the C store: -1 = pick from the store width (see _cstore_aux), 0 = default policy
     nt_dist2: bool = True,  # True = uniform distance-2 mainloop (A1@k+2 like mx, one wait_barrier/iter, no vmcnt throttle) + runtime half-N padding-quadrant skip. False = legacy A1@k+1 + vmcnt drain
     nt_kshear: bool = True,  # KS % 128 == 64: fetch A's line-aligned window per row instead of its raw K-block, so no row's 128B load splits a cache line. Off = legacy split loads
     nt_pair_n: bool = True,  # permute B_T's rows into LDS so a lane's two n-fragments are adjacent output columns and one dword store replaces both buffer_store_short. Off = per-column scalar store
@@ -985,7 +998,6 @@ def _compile_grouped_nt(
     # shares a single staging buffer across them and has to keep the emitted order.
     _esplit = 0 if store_cshuffle else nt_esplit
     _cshuf_alloc = (2 * _cshuf_n) if _cs_pipe else _cshuf_n
-    _cstore_aux = 0 if cstore_aux is None else int(cstore_aux)
     # A row pitch is KS, so KS%128!=0 straddles every other row's K-block across a cache line
     # (two L1->L2 requests). Fetching each row's enclosing line restores one request/row; the
     # halves then rotate over 3 LDS slots, which needs the CShuffle pool's LDS. Only the dist2
@@ -1012,6 +1024,9 @@ def _compile_grouped_nt(
         and not beta_is_one
         and (_col_safe or _bnd_ntb < N_TILES_B)
     )
+    # Non-temporal only on the paired-column store, which is the one that covers a full 64B write
+    # grain; the per-column fallback and the narrow boundary body keep the default policy.
+    _cstore_aux = (_MERGED_STORE_AUX if _ntpair else 0) if cstore_aux < 0 else cstore_aux
 
     _ss_anns = {
         "A_lds_cur_0": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
@@ -1281,6 +1296,7 @@ def _compile_grouped_nt(
                     N_TILES_B,
                     _out_ty,
                     col_safe=_ntpair or _col_safe,
+                    store_aux=_cstore_aux,
                     beta_is_one=beta_is_one,
                 )
 
@@ -3280,6 +3296,7 @@ def _wave4_do_tile_tn(
     WS=None,
     C_M=None,
     C_N=None,
+    cstore_aux=-1,
 ):
     # Pad-both: A/B stay at padded OUT_M/OUT_N; C is written at the tight C_M/C_N (else padded).
     if C_M is None:
@@ -3415,6 +3432,11 @@ def _wave4_do_tile_tn(
         if (col_safe and not swap_n and _out_ty is fx.BFloat16 and N_TILES_B % 2 == 0)
         else StoreCPerTensor
     )
+    # Non-temporal only on the merged (full-write-grain) store, and only where this tile owns the
+    # final C rows: a deep-K piece can bank into the WS band the reduce pass reads straight back,
+    # and a beta=1 tile re-reads what it wrote. Both want the line to stay in L2.
+    _wide_store = _store_cls is StoreCPerTensorRowN and split_kb0 is None and not beta_is_one
+    _store_aux = (_MERGED_STORE_AUX if _wide_store else 0) if cstore_aux < 0 else cstore_aux
     store_c = _store_cls(
         A_scale,
         B_scale,
@@ -3427,6 +3449,7 @@ def _wave4_do_tile_tn(
         _out_ty,
         trans=swap_n,
         col_safe=col_safe and not swap_n,
+        store_aux=_store_aux,
         c_base=store_base,
         beta_is_one=beta_is_one or fold_band is not None,
         accum_mask=(fx.Int32(band_row) < fx.Int32(0)) if (beta_is_one and split_kb0 is not None) else None,
@@ -3699,6 +3722,7 @@ def _compile_grouped_tn_wgrad_4wave(
     m_real: int = 0,  # >0: real N (hidden) extent; A/B operands stay padded to OUT_M/OUT_N
     n_real: int = 0,  # >0: real K extent; with c_tight, C collapses onto [G, m_real, n_real]
     c_tight: bool = False,  # C output has the real (tight) pitch, not the padded OUT_M/OUT_N
+    cstore_aux: int = -1,  # cache-policy aux for the dW C store: -1 = pick from the store width (see _store_aux), 0 = default policy
     _probe: int = 0,
 ):
     """4-wave (occ=1) grouped TN wgrad dW[g]=A[g]^T@B[g], variable-K per group. 256x256
@@ -3989,6 +4013,7 @@ def _compile_grouped_tn_wgrad_4wave(
                 WS=WS,
                 C_M=_C_M,
                 C_N=_C_N,
+                cstore_aux=cstore_aux,
             )
 
         # The tile id travels as an ARGUMENT and every dynamic branch body holds a CALL only: a
