@@ -50,6 +50,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     S2RLoaderTr,
     StoreCPerTensor,
     StoreCPerTensorCShuffle,
+    StoreCPerTensorQuadN,
     StoreCPerTensorRowN,
     _lane_tbl_count_le,
     _lane_tbl_get,
@@ -64,6 +65,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     compile_with_scratch_out,
     compute_global_swizzle,
     compute_global_swizzle_nn,
+    compute_global_swizzle_pair_n,
     compute_global_swizzle_shear,
     make_fp8_buffer_tensor_rebased,
     make_row_band_resource,
@@ -903,6 +905,7 @@ def _compile_grouped_nt(
     cstore_aux=None,  # non-temporal aux immediate for the C store (0 = default)
     nt_dist2: bool = True,  # True = uniform distance-2 mainloop (A1@k+2 like mx, one wait_barrier/iter, no vmcnt throttle) + runtime half-N padding-quadrant skip. False = legacy A1@k+1 + vmcnt drain
     nt_kshear: bool = True,  # KS % 128 == 64: fetch A's line-aligned window per row instead of its raw K-block, so no row's 128B load splits a cache line. Off = legacy split loads
+    nt_pair_n: bool = True,  # permute B_T's rows into LDS so a lane's two n-fragments are adjacent output columns and one dword store replaces both buffer_store_short. Off = per-column scalar store
     persistent: bool = True,  # True = scf.for tile loop (fixed grid, cap_cu reserves CUs); False = one tile/WG + s_endpgm over-launch guard (full-device default)
     cap_cu: int = -1,  # >0: cap grid to this many WGs (= reserve device CUs for comm-compute overlap). <=0: use the full device CU count.
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
@@ -993,6 +996,22 @@ def _compile_grouped_nt(
     # which would void the partial loop drain. Mode-3 in-place MFMA keeps the accumulators in
     # the arch file with explicit tied live ranges: 232 VGPRs, no spill, no AGPR alloc.
     _asm_mode = ("2" if acc_mode == "agpr" else "3") if agpr_inplace else ("3" if _kshear else None)
+    # A lane's two n-fragments sit 16 output columns apart, so each leaves as its own 2B store:
+    # 32B per fragment row, half the 64B TCP->TCC write grain. Permuting B_T's rows on the way
+    # into LDS makes the pair adjacent columns, so one dword store covers both and the write
+    # requests halve. It is pure g2s addressing -- free on a direct-to-LDS fetch, and the s2r
+    # read side is byte-identical. The full and half bodies write whole 128-column pool spans;
+    # _bnd_ntb < N_TILES_B keeps those in bounds where _col_safe cannot prove it, and the narrow
+    # boundary body has a single column-tile with no pair, so it keeps the unpermuted offsets.
+    _ntpair = (
+        nt_pair_n
+        and nt_dist2
+        and N_TILES_B == 2
+        and not glu
+        and not store_cshuffle
+        and not beta_is_one
+        and (_col_safe or _bnd_ntb < N_TILES_B)
+    )
 
     _ss_anns = {
         "A_lds_cur_0": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
@@ -1173,6 +1192,12 @@ def _compile_grouped_nt(
             else:
                 gl_off_a = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
             gl_off_b = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
+            # Column-paired B rows for the full/half bodies; the narrow one keeps gl_off_b.
+            gl_off_b_p = (
+                compute_global_swizzle_pair_n(lane_id, wave_id, KS, N_LDS_ROUNDS, N_TILES_B * 16)
+                if const_expr(_ntpair)
+                else gl_off_b
+            )
 
             # _asm_mode: None = scored intrinsic MMA, "2" = AGPR in-place, "3" = VGPR in-place.
             mfma = _build_mfma(
@@ -1190,7 +1215,7 @@ def _compile_grouped_nt(
                 if const_expr(_kshear)
                 else a_g2s
             )
-            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+            b_g2s = G2SLoader(b_div, gl_off_b_p, N_LDS_STEPS_B, F8_IR_t, wave_id)
             a_s2r = (
                 S2RLoaderShear(wave_m, N_TILES_A, m_row, KS % BLOCK_K, up=True)
                 if const_expr(_kshear)
@@ -1245,7 +1270,7 @@ def _compile_grouped_nt(
                     beta_is_one=beta_is_one,
                 )
             else:
-                store_c = StoreCPerTensor(
+                store_c = (StoreCPerTensorQuadN if _ntpair else StoreCPerTensor)(
                     A_scale,
                     B_scale,
                     C,
@@ -1255,7 +1280,7 @@ def _compile_grouped_nt(
                     N_TILES_A,
                     N_TILES_B,
                     _out_ty,
-                    col_safe=_col_safe,
+                    col_safe=_ntpair or _col_safe,
                     beta_is_one=beta_is_one,
                 )
 

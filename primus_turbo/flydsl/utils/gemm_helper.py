@@ -227,6 +227,25 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
     return offsets
 
 
+def compute_global_swizzle_pair_n(lane_id, wave_id, K, n_rounds, tile_rows):
+    """compute_global_swizzle(preshuffled=False) with the operand row feeding each LDS row
+    permuted ``16*t + m -> 2*m + t`` inside every ``tile_rows``-row block, so a wave's two
+    n-fragments end up holding adjacent output columns instead of columns 16 apart and the
+    epilogue folds the pair into one dword store (``StoreCPerTensorQuadN``). Only the global
+    source row moves: the LDS row, its XOR bank key and the whole s2r read side are untouched,
+    and a direct-to-LDS g2s takes an arbitrary per-lane global offset for free."""
+    half = tile_rows // 2
+    offsets = []
+    n_waves = fx.block_dim.x // 64
+    for round in range_constexpr(n_rounds):
+        row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
+        col = (lane_id % 8) * 16
+        r, c = swizzle_128(row, col)
+        blk, q = (r // tile_rows) * tile_rows, r % tile_rows
+        offsets.append((blk + (q % half) * 2 + q // half) * K + c)
+    return offsets
+
+
 def compute_global_swizzle_shear(lane_id, wave_id, K, n_rounds, m_row, ksm, up):
     """compute_global_swizzle(preshuffled=False) with every row's 128B fetch snapped to its
     enclosing cache line, for a row pitch whose ``K % 128 == ksm != 0`` (raw K-block straddles
@@ -1084,7 +1103,7 @@ class StoreCPerTensorQuadN(StoreCPerTensorPairN):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        assert self.n_tiles_b in (4, 8), "the interleave folds four or eight n-fragments"
+        assert self.n_tiles_b in (2, 4, 8), "the interleave folds two, four or eight n-fragments"
         assert self.col_safe, "a partial fold has no column mask"
 
     def _row_col(self, ti, i, tj, base_col):
